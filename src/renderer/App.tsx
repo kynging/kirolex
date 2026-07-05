@@ -84,6 +84,10 @@ function saveSettings(settings: Settings) {
   } catch {}
 }
 
+const isMac =
+  typeof navigator !== 'undefined' &&
+  navigator.platform.toUpperCase().includes('MAC');
+
 const App: React.FC = () => {
   const {
     status,
@@ -336,7 +340,8 @@ const App: React.FC = () => {
 
   return (
     <>
-      <div className="app-layout no-toolbar">
+      <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}`}>
+        {isMac && <div className="mac-titlebar" />}
         {!sidebarCollapsed && (
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>
             <Sidebar

@@ -15,6 +15,7 @@
   --input-bg: #2a2a2a;
   --sidebar-width: 240px;
   --toolbar-height: 42px;
+  --mac-titlebar-height: 34px;
 }
 
 * {
@@ -58,6 +59,25 @@ html, body, #root {
 
 .no-drag {
   -webkit-app-region: no-drag;
+}
+
+/* macOS: reserve space for the hiddenInset traffic-light controls */
+.mac-titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--mac-titlebar-height);
+  -webkit-app-region: drag;
+  z-index: 1000;
+}
+
+.app-layout.mac .sidebar {
+  padding-top: var(--mac-titlebar-height);
+}
+
+.app-layout.mac .chat-main {
+  padding-top: var(--mac-titlebar-height);
 }
 
 /* Toolbar */
