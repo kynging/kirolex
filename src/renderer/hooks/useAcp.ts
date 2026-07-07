@@ -151,17 +151,35 @@ export function useAcp() {
     }
   }, [currentSessionId]);
 
-  // Cache messages for current session whenever they change
+  // Cache messages for current session whenever they change.
+  // Debounce localStorage writes to avoid blocking main thread during streaming.
+  const persistTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (currentSessionId && messages.length > 0) {
       messagesCacheRef.current.set(currentSessionId, messages);
-      // Persist to localStorage (keep last 20 sessions max)
-      try {
-        const entries = Array.from(messagesCacheRef.current.entries()).slice(-20);
-        localStorage.setItem('kirolex-messages-cache', JSON.stringify(entries));
-      } catch {}
+      // Debounce: only write to localStorage after 2s of inactivity
+      if (persistTimerRef.current) clearTimeout(persistTimerRef.current);
+      persistTimerRef.current = setTimeout(() => {
+        try {
+          const entries = Array.from(messagesCacheRef.current.entries()).slice(-20);
+          localStorage.setItem('kirolex-messages-cache', JSON.stringify(entries));
+        } catch {}
+      }, 2000);
     }
   }, [messages, currentSessionId]);
+
+  // Flush pending persist on unmount
+  useEffect(() => {
+    return () => {
+      if (persistTimerRef.current) {
+        clearTimeout(persistTimerRef.current);
+        try {
+          const entries = Array.from(messagesCacheRef.current.entries()).slice(-20);
+          localStorage.setItem('kirolex-messages-cache', JSON.stringify(entries));
+        } catch {}
+      }
+    };
+  }, []);
 
   // Persist sessions whenever they change
   useEffect(() => {

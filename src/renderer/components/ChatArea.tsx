@@ -1,4 +1,4 @@
-import React, { useRef, useEffect, useState, useCallback, useMemo } from 'react';
+import React, { useRef, useEffect, useState, useCallback, useMemo, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -45,6 +45,158 @@ const ThrottledMarkdown: React.FC<{ content: string; interval?: number }> = ({ c
     </ReactMarkdown>
   );
 };
+
+// Memoized message item: only re-renders when its own content/streaming state changes
+const MessageItem = memo<{
+  msg: Message;
+  isLastAssistant: boolean;
+  isStreaming: boolean;
+  isLooping: boolean;
+  onLoopSetup: (text: string) => void;
+}>(({ msg, isLastAssistant, isStreaming, isLooping, onLoopSetup }) => (
+  <div className={`message ${msg.role}`}>
+    <div className="message-content">
+      {msg.role === 'user' ? (
+        <p>{msg.content}</p>
+      ) : (
+        <>
+          {isStreaming && isLastAssistant ? (
+            msg.content ? (
+              <div className="streaming-content">
+                <ThrottledMarkdown content={msg.content} interval={150} />
+              </div>
+            ) : null
+          ) : (
+            <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
+              {msg.content}
+            </ReactMarkdown>
+          )}
+        </>
+      )}
+    </div>
+    {msg.role === 'user' && msg.attachments && msg.attachments.length > 0 && (
+      <div className="message-attachments">
+        {msg.attachments.map((file) => (
+          <div key={file.id} className="message-attachment-item" title={file.path}>
+            <span className="message-attachment-icon">
+              {file.path.endsWith('/') || file.path.endsWith('\\') || !file.name.includes('.') ? '📁' : '📄'}
+            </span>
+            <span className="message-attachment-name">{file.name}</span>
+          </div>
+        ))}
+      </div>
+    )}
+    {msg.role === 'user' && !isLooping && msg.content.trim() && (
+      <div className="loop-this-row">
+        <button
+          className="loop-this-btn"
+          onClick={() => onLoopSetup(msg.content)}
+          title="Repeatedly re-send this prompt"
+        >
+          🔁 loop this prompt
+        </button>
+      </div>
+    )}
+  </div>
+));
+
+// Isolated input component: does NOT receive `messages` prop, so it never
+// re-renders due to streaming chunks. This is the primary fix for input lag.
+const ChatInputBox = memo<{
+  isStreaming: boolean;
+  isLooping: boolean;
+  status: 'disconnected' | 'connecting' | 'connected';
+  onSend: (text: string) => void;
+  onCancel: () => void;
+  onQueueCommand: (text: string) => void;
+  onStopLoop: () => void;
+  onDropFiles: (files: AttachedFile[]) => void;
+  attachedFiles: AttachedFile[];
+}>(({ isStreaming, isLooping, status, onSend, onCancel, onQueueCommand, onStopLoop, onDropFiles, attachedFiles }) => {
+  const [input, setInput] = useState('');
+  const [isComposing, setIsComposing] = useState(false);
+  const textareaRef = useRef<HTMLTextAreaElement>(null);
+
+  const handleSend = useCallback(() => {
+    const text = input.trim();
+    if (!text) return;
+    if (text === '/stop') {
+      setInput('');
+      onSend(text);
+      return;
+    }
+    if (isStreaming) return;
+    setInput('');
+    onSend(text);
+  }, [input, isStreaming, onSend]);
+
+  const handleKeyDown = useCallback((e: React.KeyboardEvent) => {
+    if (isComposing || e.nativeEvent.isComposing || e.keyCode === 229) return;
+    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
+      e.preventDefault();
+      const text = input.trim();
+      if (text) {
+        onQueueCommand(text);
+        setInput('');
+      }
+      return;
+    }
+    if (e.key === 'Enter' && !e.shiftKey) {
+      e.preventDefault();
+      handleSend();
+    }
+  }, [isComposing, input, onQueueCommand, handleSend]);
+
+  const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const hasImage = items.some((i) => i.kind === 'file' && i.type.startsWith('image/'));
+    if (!hasImage) return;
+    e.preventDefault();
+    try {
+      const res = await window.kiroApi.saveClipboardImage();
+      if (!res) return;
+      const n = attachedFiles.filter((f) => f.isImage).length + 1;
+      onDropFiles([
+        { id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, name: `Screenshot ${n}`, path: res.path, isImage: true, preview: res.thumbnail },
+      ]);
+    } catch {}
+  }, [attachedFiles, onDropFiles]);
+
+  return (
+    <div className="chat-input-wrapper">
+      <textarea
+        ref={textareaRef}
+        className="chat-input"
+        placeholder={
+          isLooping
+            ? 'looping prompt, click button to stop'
+            : status !== 'connected'
+            ? 'Connecting... (type /stop to force reconnect)'
+            : isStreaming
+            ? 'Generating... (type /stop to force interrupt)'
+            : 'Type a message... (Enter to send, Shift+Enter for newline)'
+        }
+        value={input}
+        onChange={(e) => setInput(e.target.value)}
+        onKeyDown={handleKeyDown}
+        onPaste={handlePaste}
+        onCompositionStart={() => setIsComposing(true)}
+        onCompositionEnd={() => setIsComposing(false)}
+        disabled={isLooping}
+        rows={3}
+      />
+      {(isStreaming || isLooping) && (
+        <button
+          className="stop-btn"
+          onClick={isLooping ? onStopLoop : onCancel}
+          title={isLooping ? 'Stop loop' : 'Stop'}
+        >
+          <span className="stop-btn-square"></span>
+        </button>
+      )}
+    </div>
+  );
+});
 
 interface ChatAreaProps {
   messages: Message[];
@@ -99,9 +251,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onStartLoop,
   onStopLoop,
 }) => {
-  const [input, setInput] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
-  const [isComposing, setIsComposing] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
   const [loopSetup, setLoopSetup] = useState<{ text: string } | null>(null);
   const [loopSeconds, setLoopSeconds] = useState('');
@@ -128,7 +278,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   });
   const [inputCollapsed, setInputCollapsed] = useState(false);
   const messagesEndRef = useRef<HTMLDivElement>(null);
-  const textareaRef = useRef<HTMLTextAreaElement>(null);
   const chatMessagesRef = useRef<HTMLDivElement>(null);
   const dragCounterRef = useRef(0);
   const inputResizingRef = useRef(false);
@@ -196,64 +345,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     document.addEventListener('keydown', handleSelectAll);
     return () => document.removeEventListener('keydown', handleSelectAll);
   }, []);
-
-  const handleKeyDown = (e: React.KeyboardEvent) => {
-    // Don't send during IME composition (e.g. Chinese input method)
-    if (isComposing || e.nativeEvent.isComposing || e.keyCode === 229) return;
-
-    // Ctrl+Enter (or Cmd+Enter) queues the command
-    if (e.key === 'Enter' && (e.ctrlKey || e.metaKey)) {
-      e.preventDefault();
-      const text = input.trim();
-      if (text) {
-        onQueueCommand(text);
-        setInput('');
-      }
-      return;
-    }
-
-    if (e.key === 'Enter' && !e.shiftKey) {
-      e.preventDefault();
-      handleSend();
-    }
-  };
-
-  const handleSend = () => {
-    const text = input.trim();
-    if (!text) return;
-    // /stop has highest priority - always allowed, even during streaming or when disconnected
-    if (text === '/stop') {
-      setInput('');
-      onSend(text);
-      return;
-    }
-    if (isStreaming) return;
-    setInput('');
-    onSend(text);
-  };
-
-  const handleInput = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
-    setInput(e.target.value);
-  };
-
-  // Paste a screenshot/image from the clipboard: save it to a temp file (so the
-  // agent can read it by path) and attach it like a dropped file, with a preview.
-  const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
-    const items = Array.from(e.clipboardData?.items || []);
-    const hasImage = items.some((i) => i.kind === 'file' && i.type.startsWith('image/'));
-    if (!hasImage) return; // let normal text paste proceed
-    e.preventDefault();
-    try {
-      const res = await window.kiroApi.saveClipboardImage();
-      if (!res) return;
-      const n = attachedFiles.filter((f) => f.isImage).length + 1;
-      onDropFiles([
-        { id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, name: `Screenshot ${n}`, path: res.path, isImage: true, preview: res.thumbnail },
-      ]);
-    } catch {
-      // ignore paste failures
-    }
-  }, [attachedFiles, onDropFiles]);
 
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
@@ -334,51 +425,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           </div>
         )}
 
-        {messages.map((msg) => (
-          <div key={msg.id} className={`message ${msg.role}`}>
-            <div className="message-content">
-              {msg.role === 'user' ? (
-                <p>{msg.content}</p>
-              ) : (
-                <>
-                  {isStreaming && msg === messages[messages.length - 1] ? (
-                    msg.content ? (
-                      <div className="streaming-content">
-                        <ThrottledMarkdown content={msg.content} interval={150} />
-                      </div>
-                    ) : null
-                  ) : (
-                    <ReactMarkdown remarkPlugins={[remarkGfm]} rehypePlugins={[rehypeHighlight]}>
-                      {msg.content}
-                    </ReactMarkdown>
-                  )}
-                </>
-              )}
-            </div>
-            {msg.role === 'user' && msg.attachments && msg.attachments.length > 0 && (
-              <div className="message-attachments">
-                {msg.attachments.map((file) => (
-                  <div key={file.id} className="message-attachment-item" title={file.path}>
-                    <span className="message-attachment-icon">
-                      {file.path.endsWith('/') || file.path.endsWith('\\') || !file.name.includes('.') ? '📁' : '📄'}
-                    </span>
-                    <span className="message-attachment-name">{file.name}</span>
-                  </div>
-                ))}
-              </div>
-            )}
-            {msg.role === 'user' && !isLooping && msg.content.trim() && (
-              <div className="loop-this-row">
-                <button
-                  className="loop-this-btn"
-                  onClick={() => { setLoopSeconds(''); setLoopSetup({ text: msg.content }); }}
-                  title="Repeatedly re-send this prompt"
-                >
-                  🔁 loop this prompt
-                </button>
-              </div>
-            )}
-          </div>
+        {messages.map((msg, idx) => (
+          <MessageItem
+            key={msg.id}
+            msg={msg}
+            isLastAssistant={msg.role === 'assistant' && idx === messages.length - 1}
+            isStreaming={isStreaming}
+            isLooping={isLooping}
+            onLoopSetup={(text) => { setLoopSeconds(''); setLoopSetup({ text }); }}
+          />
         ))}
 
         {isStreaming && messages.length > 0 && messages[messages.length - 1]?.role === 'user' && (
@@ -434,38 +489,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
         )}
         <div className="chat-input-area" style={{ height: inputHeight }}>
-        <div className="chat-input-wrapper">
-          <textarea
-            ref={textareaRef}
-            className="chat-input"
-            placeholder={
-              isLooping
-                ? 'looping prompt, click button to stop'
-                : status !== 'connected'
-                ? 'Connecting... (type /stop to force reconnect)'
-                : isStreaming
-                ? 'Generating... (type /stop to force interrupt)'
-                : 'Type a message... (Enter to send, Shift+Enter for newline)'
-            }
-            value={input}
-            onChange={handleInput}
-            onKeyDown={handleKeyDown}
-            onPaste={handlePaste}
-            onCompositionStart={() => setIsComposing(true)}
-            onCompositionEnd={() => setIsComposing(false)}
-            disabled={isLooping}
-            rows={3}
-          />
-          {(isStreaming || isLooping) && (
-            <button
-              className="stop-btn"
-              onClick={isLooping ? onStopLoop : onCancel}
-              title={isLooping ? 'Stop loop' : 'Stop'}
-            >
-              <span className="stop-btn-square"></span>
-            </button>
-          )}
-        </div>
+        <ChatInputBox
+          isStreaming={isStreaming}
+          isLooping={isLooping}
+          status={status}
+          onSend={onSend}
+          onCancel={onCancel}
+          onQueueCommand={onQueueCommand}
+          onStopLoop={onStopLoop}
+          onDropFiles={onDropFiles}
+          attachedFiles={attachedFiles}
+        />
         {/* Model selector and tool status below input */}
         <div className="input-model-row">
           <div className="input-model-left">
