@@ -427,7 +427,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
         {messages.map((msg, idx) => (
           <MessageItem
-            key={msg.id}
+            key={`${currentSessionId ?? 'none'}:${msg.id}:${idx}`}
             msg={msg}
             isLastAssistant={msg.role === 'assistant' && idx === messages.length - 1}
             isStreaming={isStreaming}
