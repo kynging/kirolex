@@ -236,6 +236,25 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     setInput(e.target.value);
   };
 
+  // Paste a screenshot/image from the clipboard: save it to a temp file (so the
+  // agent can read it by path) and attach it like a dropped file, with a preview.
+  const handlePaste = useCallback(async (e: React.ClipboardEvent<HTMLTextAreaElement>) => {
+    const items = Array.from(e.clipboardData?.items || []);
+    const hasImage = items.some((i) => i.kind === 'file' && i.type.startsWith('image/'));
+    if (!hasImage) return; // let normal text paste proceed
+    e.preventDefault();
+    try {
+      const res = await window.kiroApi.saveClipboardImage();
+      if (!res) return;
+      const n = attachedFiles.filter((f) => f.isImage).length + 1;
+      onDropFiles([
+        { id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, name: `Screenshot ${n}`, path: res.path, isImage: true, preview: res.thumbnail },
+      ]);
+    } catch {
+      // ignore paste failures
+    }
+  }, [attachedFiles, onDropFiles]);
+
   const handleDrop = useCallback((e: React.DragEvent) => {
     e.preventDefault();
     dragCounterRef.current = 0;
@@ -389,14 +408,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       </div>
 
       {!inputCollapsed && (
-      <div className="chat-input-area" style={{ height: inputHeight }}>
-        {attachedFiles.length > 0 && (
+      <>
+      {attachedFiles.length > 0 && (
+        <div className="attached-files-bar">
           <div className="attached-files">
             {attachedFiles.map((f) => (
-              <div key={f.id} className="attached-file-chip" title={f.path}>
-                <span className="attached-file-icon">
-                  {f.path.endsWith('/') || f.path.endsWith('\\') || !f.name.includes('.') ? '📁' : '📄'}
-                </span>
+              <div key={f.id} className={`attached-file-chip ${f.isImage ? 'is-image' : ''}`} title={f.path}>
+                {f.isImage && f.preview ? (
+                  <img className="attached-file-thumb" src={f.preview} alt={f.name} />
+                ) : (
+                  <span className="attached-file-icon">
+                    {f.path.endsWith('/') || f.path.endsWith('\\') || !f.name.includes('.') ? '📁' : '📄'}
+                  </span>
+                )}
                 <span className="attached-file-name">{f.name}</span>
                 <button
                   className="attached-file-remove"
@@ -407,7 +431,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </div>
             ))}
           </div>
+        </div>
         )}
+        <div className="chat-input-area" style={{ height: inputHeight }}>
         <div className="chat-input-wrapper">
           <textarea
             ref={textareaRef}
@@ -424,6 +450,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             value={input}
             onChange={handleInput}
             onKeyDown={handleKeyDown}
+            onPaste={handlePaste}
             onCompositionStart={() => setIsComposing(true)}
             onCompositionEnd={() => setIsComposing(false)}
             disabled={isLooping}
@@ -553,6 +580,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           )}
         </div>
       </div>
+      </>
       )}
       {loopSetup && (
         <>

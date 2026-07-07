@@ -20,6 +20,7 @@ declare global {
       listModels: () => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
       getHomeDir: () => Promise<string>;
+      saveClipboardImage: () => Promise<{ path: string; name: string; thumbnail: string } | null>;
       onUpdate: (callback: (data: any) => void) => () => void;
       onError: (callback: (error: any) => void) => () => void;
       onDisconnected: (callback: (data?: any) => void) => () => void;
@@ -47,6 +48,8 @@ export interface AttachedFile {
   id: string;
   name: string;
   path: string;
+  isImage?: boolean;
+  preview?: string; // thumbnail data URL for image attachments
 }
 
 export interface Session {

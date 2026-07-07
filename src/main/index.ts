@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -334,6 +334,16 @@ function showMainWindow() {
 }
 
 app.whenReady().then(() => {
+  // Clear leftover pasted-image temp files from previous runs
+  try {
+    const pastedDir = path.join(os.homedir(), '.kirolex', 'pasted');
+    if (fs.existsSync(pastedDir)) {
+      for (const f of fs.readdirSync(pastedDir)) {
+        try { fs.unlinkSync(path.join(pastedDir, f)); } catch {}
+      }
+    }
+  } catch {}
+
   createTray();
   createSplashWindow();
   createWindow();
@@ -404,6 +414,25 @@ app.whenReady().then(() => {
 
   ipcMain.handle('app:get-home-dir', () => {
     return os.homedir();
+  });
+
+  // Save the current clipboard image to a temp file so it can be attached and
+  // read by the agent (attachments are referenced by file path). Returns the
+  // path, filename, and a small thumbnail data URL for preview.
+  ipcMain.handle('app:save-clipboard-image', () => {
+    try {
+      const img = clipboard.readImage();
+      if (img.isEmpty()) return null;
+      const dir = path.join(os.homedir(), '.kirolex', 'pasted');
+      fs.mkdirSync(dir, { recursive: true });
+      const filePath = path.join(dir, `paste_${Date.now()}.png`);
+      fs.writeFileSync(filePath, img.toPNG());
+      const { width } = img.getSize();
+      const thumb = width > 160 ? img.resize({ width: 160 }) : img;
+      return { path: filePath, name: path.basename(filePath), thumbnail: thumb.toDataURL() };
+    } catch {
+      return null;
+    }
   });
 
   ipcMain.handle('acp:list-models', async () => {
