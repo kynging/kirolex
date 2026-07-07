@@ -367,7 +367,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 ))}
               </div>
             )}
-            {msg.role === 'user' && !isLooping && !isStreaming && msg.content.trim() && (
+            {msg.role === 'user' && !isLooping && msg.content.trim() && (
               <div className="loop-this-row">
                 <button
                   className="loop-this-btn"

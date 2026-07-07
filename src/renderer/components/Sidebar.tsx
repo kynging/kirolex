@@ -27,6 +27,7 @@ interface SidebarProps {
   onNewSession: () => void;
   onSwitchSession: (id: string) => void;
   onDeleteSession: (id: string) => void;
+  onDuplicateSession: (id: string) => void;
   onRenameSession: (id: string, title: string) => void;
   onReorderSessions: (sessions: Session[]) => void;
   onCreateFolder: (name: string) => void;
@@ -132,6 +133,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onNewSession,
   onSwitchSession,
   onDeleteSession,
+  onDuplicateSession,
   onRenameSession,
   onReorderSessions,
   onCreateFolder,
@@ -345,6 +347,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="context-menu-item" onClick={handleRenameStart}>
                 ✏️ Rename
               </div>
+              {contextMenu.type === 'session' && (
+                <div
+                  className="context-menu-item"
+                  onClick={() => {
+                    onDuplicateSession(contextMenu.targetId);
+                    setContextMenu(null);
+                  }}
+                >
+                  📋 Duplicate
+                </div>
+              )}
               {contextMenu.type === 'session' && folders.length > 0 && (
                 <>
                   <div className="context-menu-divider" />

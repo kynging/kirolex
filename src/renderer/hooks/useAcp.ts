@@ -61,6 +61,11 @@ export function useAcp() {
   const contextLinksRef = useRef<Map<string, { sourceId: string; sourceTitle: string; syncedCount: number }[]>>(new Map());
   // Active single-command loops keyed by sessionId
   const loopsRef = useRef<Map<string, { text: string; intervalSec: number; stopped: boolean; timer: ReturnType<typeof setTimeout> | null }>>(new Map());
+  // Duplicated sessions awaiting backend context injection on their first send.
+  // Keyed by the duplicate's pending id -> the source session's message history.
+  // On the first real send, this history is injected as a <hidden> priming block
+  // so the freshly-created kiro-cli session inherits the full conversation context.
+  const duplicateHistoryRef = useRef<Map<string, Message[]>>(new Map());
   const DEFAULT_MODEL = 'claude-opus-4.6';
 
   const persistContextLinks = () => {
@@ -398,6 +403,66 @@ export function useAcp() {
     }
   }, [connect]);
 
+  // Duplicate a session: create a full copy at the same folder level, preserving
+  // all messages and context. The backend kiro-cli session is NOT created yet;
+  // the copied history is injected as a <hidden> priming block on the first send
+  // (reusing the same context-rebuild pattern used for stale sessions), so the
+  // model treats the duplicate as a seamless continuation with full context.
+  const duplicateSession = useCallback((sessionId: string): string | undefined => {
+    const src = sessions.find((s) => s.id === sessionId);
+    if (!src) return undefined;
+
+    const srcMsgs = messagesCacheRef.current.get(sessionId) || [];
+    const newId = `pending_dup_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const copied = srcMsgs.map((m) => ({ ...m }));
+
+    // Copy messages into the duplicate's display cache and persist
+    messagesCacheRef.current.set(newId, copied);
+    try {
+      const entries = Array.from(messagesCacheRef.current.entries()).slice(-20);
+      localStorage.setItem('kirolex-messages-cache', JSON.stringify(entries));
+    } catch {}
+
+    // Stash the history for backend context injection on the first send
+    if (copied.length > 0) {
+      duplicateHistoryRef.current.set(newId, copied);
+    }
+
+    // Copy the per-session model routing
+    const model = sessionModelRef.current.get(sessionId) || DEFAULT_MODEL;
+    sessionModelRef.current.set(newId, model);
+
+    // Copy this session's own usage snapshot for display continuity
+    const srcUsage = usageMapRef.current.get(sessionId);
+    if (srcUsage) usageMapRef.current.set(newId, { ...srcUsage });
+
+    // Copy context-sync links (each restarts its high-water mark at 0 so the
+    // duplicate re-forwards the linked sources' history on its first send)
+    const links = contextLinksRef.current.get(sessionId);
+    if (links && links.length > 0) {
+      contextLinksRef.current.set(newId, links.map((l) => ({ ...l, syncedCount: 0 })));
+      persistContextLinks();
+    }
+
+    // Insert the duplicate right after the source, in the same folder
+    setSessions((prev) => {
+      const dup: Session = {
+        id: newId,
+        title: `dup:${src.title}`,
+        model,
+        folderId: src.folderId ?? null,
+        timestamp: Date.now(),
+      };
+      const idx = prev.findIndex((s) => s.id === sessionId);
+      if (idx === -1) return [dup, ...prev];
+      const next = [...prev];
+      next.splice(idx + 1, 0, dup);
+      return next;
+    });
+
+    return newId;
+  }, [sessions]);
+
   const switchSession = useCallback(async (sessionId: string) => {
     currentSessionRef.current = sessionId; // sync immediately to avoid leaked updates
     setCurrentSessionId(sessionId);
@@ -445,6 +510,9 @@ export function useAcp() {
 
     // If no session or session is pending, create a real one
     if (!sid || sid.startsWith('pending_')) {
+      // Capture the pending id first: a duplicated session stashes its source
+      // history under this id and needs it injected once the real session exists.
+      const pendingId = sid;
       try {
         const result = await window.kiroApi.newSession('~', activeModel);
         sid = result.sessionId;
@@ -464,6 +532,26 @@ export function useAcp() {
       } catch (err: any) {
         setConnectionError(err?.message || 'Failed to create session');
         return;
+      }
+
+      // Duplicated session: inject the copied conversation history into the new
+      // backend session as a single <hidden> priming block so the model has the
+      // full prior context on this very first message.
+      const dupHistory = pendingId ? duplicateHistoryRef.current.get(pendingId) : undefined;
+      if (dupHistory) {
+        duplicateHistoryRef.current.delete(pendingId!);
+        if (dupHistory.length > 0) {
+          const body = dupHistory
+            .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+            .join('\n\n');
+          prompt = [
+            {
+              type: 'text',
+              text: `<hidden>这是一个复制出来的会话，下面是它此前的完整对话历史。请把这些内容当作我们当前对话的已有上下文，在此基础上无缝继续，不要重复或复述这些历史：\n\n${body}</hidden>`,
+            },
+            ...prompt,
+          ];
+        }
       }
     }
 
@@ -607,6 +695,8 @@ export function useAcp() {
 
   const deleteSession = useCallback(async (sessionId: string) => {
     setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+    // Drop any pending duplicate-history awaiting injection for this session
+    duplicateHistoryRef.current.delete(sessionId);
     // Stop any active loop on this session
     const loop = loopsRef.current.get(sessionId);
     if (loop) {
@@ -845,6 +935,7 @@ export function useAcp() {
     disconnect,
     forceStop,
     newSession,
+    duplicateSession,
     switchSession,
     deleteSession,
     renameSession,

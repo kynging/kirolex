@@ -107,6 +107,7 @@ const App: React.FC = () => {
     disconnect,
     forceStop,
     newSession,
+    duplicateSession,
     switchSession,
     deleteSession,
     renameSession,
@@ -161,6 +162,12 @@ const App: React.FC = () => {
     const session = sessions.find((s) => s.id === sessionId);
     setDeleteConfirm({ sessionId, title: session?.title || 'this session' });
   }, [sessions]);
+
+  // Duplicate a session and immediately open the copy so the user can continue.
+  const handleDuplicateSession = useCallback((sessionId: string) => {
+    const newId = duplicateSession(sessionId);
+    if (newId) handleSwitchSession(newId);
+  }, [duplicateSession, handleSwitchSession]);
 
   const confirmDelete = useCallback(() => {
     if (deleteConfirm) {
@@ -362,6 +369,7 @@ const App: React.FC = () => {
               onNewSession={() => newSession(homeDir, selectedModel)}
               onSwitchSession={handleSwitchSession}
               onDeleteSession={handleDeleteSession}
+              onDuplicateSession={handleDuplicateSession}
               onRenameSession={renameSession}
               onReorderSessions={reorderSessions}
               onCreateFolder={createFolder}
