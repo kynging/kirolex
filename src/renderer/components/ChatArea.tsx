@@ -65,6 +65,9 @@ interface ChatAreaProps {
   commandQueue: string[];
   onQueueCommand: (text: string) => void;
   onRemoveQueuedCommand: (index: number) => void;
+  importableSessions: { id: string; title: string }[];
+  contextLinks: { sourceId: string; sourceTitle: string }[];
+  onToggleContextSource: (sourceSessionId: string) => void;
 }
 
 export const ChatArea: React.FC<ChatAreaProps> = ({
@@ -86,11 +89,28 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   commandQueue,
   onQueueCommand,
   onRemoveQueuedCommand,
+  importableSessions,
+  contextLinks,
+  onToggleContextSource,
 }) => {
   const [input, setInput] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
   const [isComposing, setIsComposing] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
+  const [showImportPicker, setShowImportPicker] = useState(false);
+  const [pickerPos, setPickerPos] = useState<{ left: number; bottom: number }>({ left: 0, bottom: 0 });
+  const importBtnRef = useRef<HTMLButtonElement>(null);
+
+  const toggleImportPicker = useCallback(() => {
+    const el = importBtnRef.current;
+    if (el) {
+      const r = el.getBoundingClientRect();
+      // Anchor a fixed-position popup just above the button so it escapes the
+      // overflow:hidden clipping of the chat input / main containers.
+      setPickerPos({ left: r.left, bottom: window.innerHeight - r.top + 8 });
+    }
+    setShowImportPicker((v) => !v);
+  }, []);
   const [inputHeight, setInputHeight] = useState(() => {
     try {
       const saved = localStorage.getItem('kirolex-input-height');
@@ -148,9 +168,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   useEffect(() => {
     const handleSelectAll = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
-        // If focus is in textarea, let default behavior work
-        if (document.activeElement === textareaRef.current) return;
-        
+        // If focus is in any editable element (chat input, a rename field, etc.),
+        // let the browser's default select-all work on that field instead.
+        const el = document.activeElement as HTMLElement | null;
+        if (el && (el.tagName === 'INPUT' || el.tagName === 'TEXTAREA' || el.isContentEditable)) {
+          return;
+        }
+
         e.preventDefault();
         const selection = window.getSelection();
         if (selection && chatMessagesRef.current) {
@@ -412,6 +436,47 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </>
             )}
           </select>
+          <div className="import-context-wrapper">
+            <button
+              ref={importBtnRef}
+              className={`import-context-btn ${contextLinks.length > 0 ? 'active' : ''}`}
+              onClick={toggleImportPicker}
+              title="从其他会话同步上下文"
+              disabled={importableSessions.length === 0}
+            >
+              🛠️ 上下文工程
+            </button>
+            {showImportPicker && (
+              <>
+                <div className="import-picker-overlay" onClick={() => setShowImportPicker(false)} />
+                <div className="import-picker" style={{ left: pickerPos.left, bottom: pickerPos.bottom }}>
+                  <div className="import-picker-header">
+                    <span>选择要同步的上下文</span>
+                  </div>
+                  <div className="import-picker-list">
+                    {importableSessions.length === 0 ? (
+                      <div className="import-picker-empty">没有其他会话可同步</div>
+                    ) : (
+                      importableSessions.map((s) => {
+                        const linked = contextLinks.some((l) => l.sourceId === s.id);
+                        return (
+                          <button
+                            key={s.id}
+                            className={`import-picker-item ${linked ? 'active' : ''}`}
+                            title={s.title}
+                            onClick={() => onToggleContextSource(s.id)}
+                          >
+                            <span className="import-picker-box">{linked ? '☑' : '☐'}</span>
+                            <span className="import-picker-title">{s.title || 'Untitled'}</span>
+                          </button>
+                        );
+                      })
+                    )}
+                  </div>
+                </div>
+              </>
+            )}
+          </div>
           {commandQueue.length > 0 && (
             <div className="queue-indicator-wrapper">
               <button

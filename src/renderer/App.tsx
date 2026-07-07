@@ -118,6 +118,8 @@ const App: React.FC = () => {
     sendMessage,
     cancelStream,
     respondPermission,
+    contextLinks,
+    toggleContextSource,
   } = useAcp();
 
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
@@ -396,6 +398,11 @@ const App: React.FC = () => {
           commandQueue={commandQueue}
           onQueueCommand={handleQueueCommand}
           onRemoveQueuedCommand={handleRemoveQueuedCommand}
+          importableSessions={sessions
+            .filter((s) => s.id !== currentSessionId && !s.id.startsWith('pending_'))
+            .map((s) => ({ id: s.id, title: s.title }))}
+          contextLinks={contextLinks}
+          onToggleContextSource={toggleContextSource}
         />
       </div>
       {permissionRequest && (

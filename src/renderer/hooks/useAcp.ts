@@ -40,7 +40,10 @@ export function useAcp() {
   const [permissionRequest, setPermissionRequest] = useState<PermissionRequest | null>(null);
   const [activeToolCall, setActiveToolCall] = useState<string | null>(null);
   const [usage, setUsage] = useState<{ contextPercent: number; credits: number; turnMs?: number } | null>(null);
-  
+  // Cross-session context sync: the current session's linked sources (0..n).
+  // Persistent per-session; each send injects only each source's NEW messages.
+  const [contextLinks, setContextLinks] = useState<{ sourceId: string; sourceTitle: string }[]>([]);
+
   const currentMessageRef = useRef<string>('');
   const toolCallsRef = useRef<Map<string, ToolCall>>(new Map());
   const currentSessionRef = useRef<string | null>(null);
@@ -50,7 +53,25 @@ export function useAcp() {
   const usageMapRef = useRef<Map<string, { contextPercent: number; credits: number; turnMs?: number }>>(new Map());
   // Maps sessionId -> model, so every call can route to the right kiro-cli process
   const sessionModelRef = useRef<Map<string, string>>(new Map());
+  // Per-target-session context links: targetId -> array of { sourceId, sourceTitle, syncedCount }.
+  // Each source keeps its own high-water mark so every send only forwards that
+  // source's delta (new messages). A target can sync from multiple sources.
+  const contextLinksRef = useRef<Map<string, { sourceId: string; sourceTitle: string; syncedCount: number }[]>>(new Map());
   const DEFAULT_MODEL = 'claude-opus-4.6';
+
+  const persistContextLinks = () => {
+    try {
+      localStorage.setItem(
+        'kirolex-context-links',
+        JSON.stringify(Array.from(contextLinksRef.current.entries()))
+      );
+    } catch {}
+  };
+
+  const refreshContextLinks = (sid: string | null) => {
+    const arr = contextLinksRef.current.get(sid || '') || [];
+    setContextLinks(arr.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })));
+  };
 
   const addStreaming = (sid: string) => {
     if (!sid) return;
@@ -93,6 +114,20 @@ export function useAcp() {
             setMessages(cached);
           }
         }
+      }
+    } catch {}
+    // Load persisted context links and reflect the current session's links
+    try {
+      const savedLinks = localStorage.getItem('kirolex-context-links');
+      if (savedLinks) {
+        const entries: [string, any][] = JSON.parse(savedLinks);
+        // Normalize: earlier versions stored a single object per target
+        const normalized: [string, { sourceId: string; sourceTitle: string; syncedCount: number }[]][] =
+          entries.map(([k, v]) => [k, Array.isArray(v) ? v : [v]]);
+        contextLinksRef.current = new Map(normalized);
+        const lastSid = localStorage.getItem('kirolex-last-session');
+        const arr = lastSid ? contextLinksRef.current.get(lastSid) : undefined;
+        if (arr) setContextLinks(arr.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })));
       }
     } catch {}
   }, []);
@@ -334,6 +369,7 @@ export function useAcp() {
     toolCallsRef.current.clear();
     setUsage(null);
     setActiveToolCall(null);
+    setContextLinks([]);
 
     setSessions((prev) => [
       { id: tempId, title: 'New Chat', model, timestamp: Date.now() },
@@ -363,6 +399,8 @@ export function useAcp() {
     setCurrentSessionId(sessionId);
     currentMessageRef.current = '';
     toolCallsRef.current.clear();
+    // Reflect this session's persistent context-sync links (if any)
+    refreshContextLinks(sessionId);
     // Restore this session's own usage; clear the tool indicator
     setUsage(usageMapRef.current.get(sessionId) || null);
     setActiveToolCall(null);
@@ -422,6 +460,47 @@ export function useAcp() {
       } catch (err: any) {
         setConnectionError(err?.message || 'Failed to create session');
         return;
+      }
+    }
+
+    // Cross-session context sync: if this session is linked to one or more
+    // sources, inject each source's NEW messages (delta since last sync) as a
+    // single <hidden> block. Migrate link key if the id changed (pending -> real).
+    if (currentSessionId && currentSessionId !== sid && contextLinksRef.current.has(currentSessionId)) {
+      const moved = contextLinksRef.current.get(currentSessionId)!;
+      contextLinksRef.current.delete(currentSessionId);
+      contextLinksRef.current.set(sid!, moved);
+      persistContextLinks();
+    }
+    const links = sid ? (contextLinksRef.current.get(sid) || []) : [];
+    if (links.length > 0) {
+      const sections: string[] = [];
+      let changed = false;
+      const updated = links.map((link) => {
+        const srcMsgs = messagesCacheRef.current.get(link.sourceId) || [];
+        const delta = srcMsgs.slice(link.syncedCount);
+        if (delta.length > 0) {
+          const body = delta
+            .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
+            .join('\n\n');
+          sections.push(`【${link.sourceTitle}】\n${body}`);
+          changed = true;
+          return { ...link, syncedCount: srcMsgs.length };
+        }
+        return link;
+      });
+      if (sections.length > 0) {
+        prompt = [
+          {
+            type: 'text',
+            text: `<hidden>下面是我提供给你参考的背景对话记录（来自我之前的几段对话），请把它们当作我们当前对话的已知信息，在回答我接下来的问题时加以利用：\n\n${sections.join('\n\n')}</hidden>`,
+          },
+          ...prompt,
+        ];
+      }
+      if (changed) {
+        contextLinksRef.current.set(sid!, updated);
+        persistContextLinks();
       }
     }
 
@@ -525,6 +604,20 @@ export function useAcp() {
       const entries = Array.from(messagesCacheRef.current.entries()).slice(-20);
       localStorage.setItem('kirolex-messages-cache', JSON.stringify(entries));
     } catch {}
+    // Clean up context links: drop this session's own links and remove it as a
+    // source from any other session (its message cache is now gone).
+    let linksChanged = contextLinksRef.current.delete(sessionId);
+    for (const [target, arr] of contextLinksRef.current) {
+      const filtered = arr.filter((l) => l.sourceId !== sessionId);
+      if (filtered.length !== arr.length) {
+        if (filtered.length > 0) contextLinksRef.current.set(target, filtered);
+        else contextLinksRef.current.delete(target);
+        linksChanged = true;
+      }
+    }
+    if (linksChanged) persistContextLinks();
+    // Refresh the current session's link indicator (a source may have been removed)
+    refreshContextLinks(currentSessionRef.current);
     // Delete session files from disk
     try {
       await window.kiroApi.deleteSession(sessionId);
@@ -592,6 +685,28 @@ export function useAcp() {
     window.kiroApi.connect({ model }).catch(() => {});
   }, []);
 
+  // Toggle a source session in the current session's context-sync set. Adding a
+  // source starts it at syncedCount 0 (first send includes its existing history);
+  // toggling it off removes it. Links are persistent and per-session.
+  const toggleContextSource = useCallback((sourceSessionId: string) => {
+    const target = currentSessionRef.current;
+    if (!target || !sourceSessionId || sourceSessionId === target) return;
+    const arr = contextLinksRef.current.get(target) || [];
+    const exists = arr.some((l) => l.sourceId === sourceSessionId);
+    let next: { sourceId: string; sourceTitle: string; syncedCount: number }[];
+    if (exists) {
+      next = arr.filter((l) => l.sourceId !== sourceSessionId);
+    } else {
+      const sourceTitle =
+        sessions.find((s) => s.id === sourceSessionId)?.title || 'another session';
+      next = [...arr, { sourceId: sourceSessionId, sourceTitle, syncedCount: 0 }];
+    }
+    if (next.length > 0) contextLinksRef.current.set(target, next);
+    else contextLinksRef.current.delete(target);
+    persistContextLinks();
+    setContextLinks(next.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })));
+  }, [sessions]);
+
   const respondPermission = useCallback(async (granted: boolean) => {
     if (permissionRequest) {
       await window.kiroApi.respondPermission(
@@ -635,5 +750,7 @@ export function useAcp() {
     sendMessage,
     cancelStream,
     respondPermission,
+    contextLinks,
+    toggleContextSource,
   };
 }
