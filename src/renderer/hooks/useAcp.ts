@@ -51,6 +51,10 @@ export function useAcp() {
   const currentSessionRef = useRef<string | null>(null);
   const messagesCacheRef = useRef<Map<string, Message[]>>(new Map());
   const streamingIdsRef = useRef<Set<string>>(new Set());
+  // When sessionId is missing from an update, use the last session we prompted
+  // (not the currently viewed session). This prevents stale chunks from a
+  // previous session bleeding into a newly created session.
+  const lastPromptedSessionRef = useRef<string | null>(null);
   // Per-session usage (credits/context), keyed by sessionId
   const usageMapRef = useRef<Map<string, { contextPercent: number; credits: number; turnMs?: number }>>(new Map());
   // Maps sessionId -> model, so every call can route to the right kiro-cli process
@@ -141,7 +145,7 @@ export function useAcp() {
     } catch {}
   }, []);
 
-  // Keep ref in sync with state, persist last session
+  // Keep ref in sync with state, persist last session.
   useEffect(() => {
     currentSessionRef.current = currentSessionId;
     if (currentSessionId) {
@@ -202,15 +206,21 @@ export function useAcp() {
       if (!data?.update) return;
       const { update, sessionId } = data;
 
-      // Only write to the active view if the update's session matches the current one.
-      // Everything else is buffered into that session's cache.
-      const isActiveSession = !sessionId || sessionId === currentSessionRef.current;
+      // Route updates strictly by sessionId. If the backend fails to supply one,
+      // fall back to the last session we prompted (NOT the currently viewed session).
+      // This prevents late-arriving chunks from a previous session bleeding into
+      // a newly created/switched-to session.
+      const targetSid = sessionId || lastPromptedSessionRef.current;
+      if (!targetSid) return; // No session context at all, discard
+      const isActiveSession = targetSid === currentSessionRef.current;
 
       switch (update.sessionUpdate) {
         case 'agent_message_chunk': {
           const text = update.content?.text || '';
 
-          if (isActiveSession) {
+          // Safety: only write to active session if it's actually streaming.
+          // This prevents stale chunks from leaking into a freshly created session.
+          if (isActiveSession && streamingIdsRef.current.has(targetSid)) {
             setMessages((prev) => {
               const last = prev[prev.length - 1];
               // Always append to the last assistant message during streaming
@@ -233,15 +243,15 @@ export function useAcp() {
                 ];
               }
             });
-          } else if (sessionId) {
-            // Buffer message for background session
-            const cached = messagesCacheRef.current.get(sessionId) || [];
+          } else if (targetSid) {
+            // Buffer message for background session (or active session that isn't streaming)
+            const cached = messagesCacheRef.current.get(targetSid) || [];
             const last = cached[cached.length - 1];
             if (last?.role === 'assistant') {
               const updated = [...cached.slice(0, -1), { ...last, content: last.content + text }];
-              messagesCacheRef.current.set(sessionId, updated);
+              messagesCacheRef.current.set(targetSid, updated);
             } else {
-              messagesCacheRef.current.set(sessionId, [
+              messagesCacheRef.current.set(targetSid, [
                 ...cached,
                 { id: update.messageId || `msg_${Date.now()}`, role: 'assistant' as const, content: text, timestamp: Date.now() },
               ]);
@@ -294,20 +304,37 @@ export function useAcp() {
         }
 
         case 'user_message_chunk': {
-          // During session replay
+          // During session replay — only write to live messages if this is
+          // the active session AND we initiated a load for it.
           const text = update.content?.text || '';
-          setMessages((prev) => {
-            const last = prev[prev.length - 1];
+          if (isActiveSession && targetSid === lastPromptedSessionRef.current) {
+            setMessages((prev) => {
+              const last = prev[prev.length - 1];
+              if (last?.role === 'user' && last.id === update.messageId) {
+                return [...prev.slice(0, -1), { ...last, content: last.content + text }];
+              }
+              return [...prev, {
+                id: update.messageId || `user_${Date.now()}`,
+                role: 'user',
+                content: text,
+                timestamp: Date.now(),
+              }];
+            });
+          } else if (targetSid) {
+            // Buffer into the correct session's cache
+            const cached = messagesCacheRef.current.get(targetSid) || [];
+            const last = cached[cached.length - 1];
             if (last?.role === 'user' && last.id === update.messageId) {
-              return [...prev.slice(0, -1), { ...last, content: last.content + text }];
+              messagesCacheRef.current.set(targetSid, [...cached.slice(0, -1), { ...last, content: last.content + text }]);
+            } else {
+              messagesCacheRef.current.set(targetSid, [...cached, {
+                id: update.messageId || `user_${Date.now()}`,
+                role: 'user' as const,
+                content: text,
+                timestamp: Date.now(),
+              }]);
             }
-            return [...prev, {
-              id: update.messageId || `user_${Date.now()}`,
-              role: 'user',
-              content: text,
-              timestamp: Date.now(),
-            }];
-          });
+          }
           break;
         }
 
@@ -352,8 +379,24 @@ export function useAcp() {
             streamingIdsRef.current.delete(sid);
           }
         }
+        // Stop any loops on sessions that use this model (their process is gone)
+        for (const [sid, loop] of loopsRef.current) {
+          if ((sessionModelRef.current.get(sid) || DEFAULT_MODEL) === model) {
+            loop.stopped = true;
+            if (loop.timer) { clearTimeout(loop.timer); loop.timer = null; }
+            loopsRef.current.delete(sid);
+          }
+        }
+        setLoopingIds(Array.from(loopsRef.current.keys()));
       } else {
         streamingIdsRef.current.clear();
+        // All processes gone — stop all loops
+        for (const [, loop] of loopsRef.current) {
+          loop.stopped = true;
+          if (loop.timer) { clearTimeout(loop.timer); loop.timer = null; }
+        }
+        loopsRef.current.clear();
+        setLoopingIds([]);
       }
       setStreamingIds(Array.from(streamingIdsRef.current));
     });
@@ -499,6 +542,7 @@ export function useAcp() {
     // Load from kiro-cli in background (will replay messages via onUpdate)
     if (!cached || cached.length === 0) {
       try {
+        lastPromptedSessionRef.current = sessionId;
         await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId));
       } catch {
         // Session might not be loadable
@@ -615,6 +659,7 @@ export function useAcp() {
     }
 
     addStreaming(sid!);
+    lastPromptedSessionRef.current = sid;
 
     try {
       await window.kiroApi.prompt(sid, prompt, activeModel);
@@ -627,6 +672,7 @@ export function useAcp() {
         // Move streaming marker from the stale id to the new id
         removeStreaming(oldSid);
         addStreaming(sid!);
+        lastPromptedSessionRef.current = sid;
         currentSessionRef.current = sid; // sync immediately
         sessionModelRef.current.set(sid, activeModel);
         setCurrentSessionId(sid);
@@ -847,18 +893,27 @@ export function useAcp() {
     };
     const cached = messagesCacheRef.current.get(sessionId) || [];
     messagesCacheRef.current.set(sessionId, [...cached, userMsg]);
+    // If this session is the currently viewed one, also update the live messages state
+    if (sessionId === currentSessionRef.current) {
+      setMessages((prev) => [...prev, userMsg]);
+    }
     addStreaming(sessionId);
+    lastPromptedSessionRef.current = sessionId;
     try {
       await window.kiroApi.prompt(sessionId, [{ type: 'text', text }], activeModel);
       return true;
     } catch (err: any) {
-      const c = messagesCacheRef.current.get(sessionId) || [];
-      messagesCacheRef.current.set(sessionId, [...c, {
+      const errMsg: Message = {
         id: `err_${Date.now()}`,
         role: 'assistant',
         content: `⚠️ Loop stopped: ${err?.message || 'send failed'}`,
         timestamp: Date.now(),
-      }]);
+      };
+      const c = messagesCacheRef.current.get(sessionId) || [];
+      messagesCacheRef.current.set(sessionId, [...c, errMsg]);
+      if (sessionId === currentSessionRef.current) {
+        setMessages((prev) => [...prev, errMsg]);
+      }
       return false;
     } finally {
       removeStreaming(sessionId);
@@ -867,9 +922,8 @@ export function useAcp() {
 
   // Start looping a prompt on a session: send, wait until the turn ends, then
   // wait intervalSec, then repeat — until stopped. Runs in the background so it
-  // continues even if the user switches away. When looping the CURRENT session
-  // it reuses the exact manual-send path (sendMessage) for identical behavior
-  // (stale-retry + context injection); otherwise it uses a plain background send.
+  // continues even if the user switches away. Always uses sendLoopBackground
+  // which is session-aware and doesn't interfere with the current view state.
   const startLoop = useCallback((sessionId: string, text: string, intervalSec: number) => {
     if (!sessionId || !text.trim()) return;
     const existing = loopsRef.current.get(sessionId);
@@ -879,32 +933,16 @@ export function useAcp() {
     }
     const state = { text, intervalSec: Math.max(0, intervalSec || 0), stopped: false, timer: null as ReturnType<typeof setTimeout> | null };
     loopsRef.current.set(sessionId, state);
-    let currentLoopSid = sessionId;
+    const loopSid = sessionId;
     setLoopingIds(Array.from(loopsRef.current.keys()));
-
-    const migrateKey = (newSid: string) => {
-      if (newSid === currentLoopSid) return;
-      loopsRef.current.delete(currentLoopSid);
-      currentLoopSid = newSid;
-      if (!state.stopped) loopsRef.current.set(currentLoopSid, state);
-      setLoopingIds(Array.from(loopsRef.current.keys()));
-    };
 
     const iterate = async () => {
       if (state.stopped) return;
-      if (currentSessionRef.current === currentLoopSid) {
-        // Identical to a manual send in the current session
-        await sendMessageRef.current([{ type: 'text', text: state.text }], undefined, undefined, modelForSession(currentLoopSid));
-        // sendMessage may recreate a stale session and update currentSessionId
-        const eff = currentSessionRef.current;
-        if (eff) migrateKey(eff);
-      } else {
-        const ok = await sendLoopBackground(currentLoopSid, state.text);
-        if (!ok) {
-          loopsRef.current.delete(currentLoopSid);
-          setLoopingIds(Array.from(loopsRef.current.keys()));
-          return;
-        }
+      const ok = await sendLoopBackground(loopSid, state.text);
+      if (!ok) {
+        loopsRef.current.delete(loopSid);
+        setLoopingIds(Array.from(loopsRef.current.keys()));
+        return;
       }
       if (state.stopped) return;
       state.timer = setTimeout(() => { iterate(); }, state.intervalSec * 1000);
