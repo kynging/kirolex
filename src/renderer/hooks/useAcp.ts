@@ -43,6 +43,8 @@ export function useAcp() {
   // Cross-session context sync: the current session's linked sources (0..n).
   // Persistent per-session; each send injects only each source's NEW messages.
   const [contextLinks, setContextLinks] = useState<{ sourceId: string; sourceTitle: string }[]>([]);
+  // Single-command loop: sessionIds that currently have an active prompt loop.
+  const [loopingIds, setLoopingIds] = useState<string[]>([]);
 
   const currentMessageRef = useRef<string>('');
   const toolCallsRef = useRef<Map<string, ToolCall>>(new Map());
@@ -57,6 +59,8 @@ export function useAcp() {
   // Each source keeps its own high-water mark so every send only forwards that
   // source's delta (new messages). A target can sync from multiple sources.
   const contextLinksRef = useRef<Map<string, { sourceId: string; sourceTitle: string; syncedCount: number }[]>>(new Map());
+  // Active single-command loops keyed by sessionId
+  const loopsRef = useRef<Map<string, { text: string; intervalSec: number; stopped: boolean; timer: ReturnType<typeof setTimeout> | null }>>(new Map());
   const DEFAULT_MODEL = 'claude-opus-4.6';
 
   const persistContextLinks = () => {
@@ -566,6 +570,11 @@ export function useAcp() {
     );
   }, [currentSessionId]);
 
+  // Always-latest ref to sendMessage so the background loop can reuse the exact
+  // same (stale-retry + context-injection) send path as a manual send.
+  const sendMessageRef = useRef(sendMessage);
+  sendMessageRef.current = sendMessage;
+
   const cancelStream = useCallback(async () => {
     if (currentSessionId) {
       await window.kiroApi.cancel(currentSessionId, modelForSession(currentSessionId));
@@ -598,6 +607,14 @@ export function useAcp() {
 
   const deleteSession = useCallback(async (sessionId: string) => {
     setSessions((prev) => prev.filter((s) => s.id !== sessionId));
+    // Stop any active loop on this session
+    const loop = loopsRef.current.get(sessionId);
+    if (loop) {
+      loop.stopped = true;
+      if (loop.timer) clearTimeout(loop.timer);
+      loopsRef.current.delete(sessionId);
+      setLoopingIds(Array.from(loopsRef.current.keys()));
+    }
     // Clear local message cache
     messagesCacheRef.current.delete(sessionId);
     try {
@@ -707,6 +724,98 @@ export function useAcp() {
     setContextLinks(next.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })));
   }, [sessions]);
 
+  // --- Single-command loop -------------------------------------------------
+  // Background send for a loop iteration on a NON-current session. Such a
+  // session was current (and thus warmed up) when the loop started, so a plain
+  // prompt succeeds. The user bubble is buffered into the session cache and the
+  // response streams into it via onUpdate. Returns false on failure.
+  const sendLoopBackground = useCallback(async (sessionId: string, text: string): Promise<boolean> => {
+    const activeModel = modelForSession(sessionId);
+    const userMsg: Message = {
+      id: `user_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+      role: 'user',
+      content: text,
+      timestamp: Date.now(),
+    };
+    const cached = messagesCacheRef.current.get(sessionId) || [];
+    messagesCacheRef.current.set(sessionId, [...cached, userMsg]);
+    addStreaming(sessionId);
+    try {
+      await window.kiroApi.prompt(sessionId, [{ type: 'text', text }], activeModel);
+      return true;
+    } catch (err: any) {
+      const c = messagesCacheRef.current.get(sessionId) || [];
+      messagesCacheRef.current.set(sessionId, [...c, {
+        id: `err_${Date.now()}`,
+        role: 'assistant',
+        content: `⚠️ Loop stopped: ${err?.message || 'send failed'}`,
+        timestamp: Date.now(),
+      }]);
+      return false;
+    } finally {
+      removeStreaming(sessionId);
+    }
+  }, []);
+
+  // Start looping a prompt on a session: send, wait until the turn ends, then
+  // wait intervalSec, then repeat — until stopped. Runs in the background so it
+  // continues even if the user switches away. When looping the CURRENT session
+  // it reuses the exact manual-send path (sendMessage) for identical behavior
+  // (stale-retry + context injection); otherwise it uses a plain background send.
+  const startLoop = useCallback((sessionId: string, text: string, intervalSec: number) => {
+    if (!sessionId || !text.trim()) return;
+    const existing = loopsRef.current.get(sessionId);
+    if (existing) {
+      existing.stopped = true;
+      if (existing.timer) clearTimeout(existing.timer);
+    }
+    const state = { text, intervalSec: Math.max(0, intervalSec || 0), stopped: false, timer: null as ReturnType<typeof setTimeout> | null };
+    loopsRef.current.set(sessionId, state);
+    let currentLoopSid = sessionId;
+    setLoopingIds(Array.from(loopsRef.current.keys()));
+
+    const migrateKey = (newSid: string) => {
+      if (newSid === currentLoopSid) return;
+      loopsRef.current.delete(currentLoopSid);
+      currentLoopSid = newSid;
+      if (!state.stopped) loopsRef.current.set(currentLoopSid, state);
+      setLoopingIds(Array.from(loopsRef.current.keys()));
+    };
+
+    const iterate = async () => {
+      if (state.stopped) return;
+      if (currentSessionRef.current === currentLoopSid) {
+        // Identical to a manual send in the current session
+        await sendMessageRef.current([{ type: 'text', text: state.text }], undefined, undefined, modelForSession(currentLoopSid));
+        // sendMessage may recreate a stale session and update currentSessionId
+        const eff = currentSessionRef.current;
+        if (eff) migrateKey(eff);
+      } else {
+        const ok = await sendLoopBackground(currentLoopSid, state.text);
+        if (!ok) {
+          loopsRef.current.delete(currentLoopSid);
+          setLoopingIds(Array.from(loopsRef.current.keys()));
+          return;
+        }
+      }
+      if (state.stopped) return;
+      state.timer = setTimeout(() => { iterate(); }, state.intervalSec * 1000);
+    };
+    iterate();
+  }, [sendLoopBackground]);
+
+  // Stop a session's loop: halt scheduling AND interrupt the in-flight turn.
+  const stopLoop = useCallback(async (sessionId: string) => {
+    const state = loopsRef.current.get(sessionId);
+    if (!state) return;
+    state.stopped = true;
+    if (state.timer) { clearTimeout(state.timer); state.timer = null; }
+    loopsRef.current.delete(sessionId);
+    setLoopingIds(Array.from(loopsRef.current.keys()));
+    try { await window.kiroApi.cancel(sessionId, modelForSession(sessionId)); } catch {}
+    removeStreaming(sessionId);
+  }, []);
+
   const respondPermission = useCallback(async (granted: boolean) => {
     if (permissionRequest) {
       await window.kiroApi.respondPermission(
@@ -752,5 +861,8 @@ export function useAcp() {
     respondPermission,
     contextLinks,
     toggleContextSource,
+    loopingIds,
+    startLoop,
+    stopLoop,
   };
 }

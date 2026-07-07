@@ -68,6 +68,9 @@ interface ChatAreaProps {
   importableSessions: { id: string; title: string }[];
   contextLinks: { sourceId: string; sourceTitle: string }[];
   onToggleContextSource: (sourceSessionId: string) => void;
+  isLooping: boolean;
+  onStartLoop: (text: string, intervalSec: number) => void;
+  onStopLoop: () => void;
 }
 
 export const ChatArea: React.FC<ChatAreaProps> = ({
@@ -92,11 +95,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   importableSessions,
   contextLinks,
   onToggleContextSource,
+  isLooping,
+  onStartLoop,
+  onStopLoop,
 }) => {
   const [input, setInput] = useState('');
   const [isDragOver, setIsDragOver] = useState(false);
   const [isComposing, setIsComposing] = useState(false);
   const [showQueue, setShowQueue] = useState(false);
+  const [loopSetup, setLoopSetup] = useState<{ text: string } | null>(null);
+  const [loopSeconds, setLoopSeconds] = useState('');
   const [showImportPicker, setShowImportPicker] = useState(false);
   const [pickerPos, setPickerPos] = useState<{ left: number; bottom: number }>({ left: 0, bottom: 0 });
   const importBtnRef = useRef<HTMLButtonElement>(null);
@@ -340,6 +348,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 ))}
               </div>
             )}
+            {msg.role === 'user' && !isLooping && !isStreaming && msg.content.trim() && (
+              <div className="loop-this-row">
+                <button
+                  className="loop-this-btn"
+                  onClick={() => { setLoopSeconds(''); setLoopSetup({ text: msg.content }); }}
+                  title="Repeatedly re-send this prompt"
+                >
+                  🔁 loop this prompt
+                </button>
+              </div>
+            )}
           </div>
         ))}
 
@@ -394,7 +413,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             ref={textareaRef}
             className="chat-input"
             placeholder={
-              status !== 'connected'
+              isLooping
+                ? 'looping prompt, click button to stop'
+                : status !== 'connected'
                 ? 'Connecting... (type /stop to force reconnect)'
                 : isStreaming
                 ? 'Generating... (type /stop to force interrupt)'
@@ -405,10 +426,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             onKeyDown={handleKeyDown}
             onCompositionStart={() => setIsComposing(true)}
             onCompositionEnd={() => setIsComposing(false)}
+            disabled={isLooping}
             rows={3}
           />
-          {isStreaming && (
-            <button className="stop-btn" onClick={onCancel} title="Stop">
+          {(isStreaming || isLooping) && (
+            <button
+              className="stop-btn"
+              onClick={isLooping ? onStopLoop : onCancel}
+              title={isLooping ? 'Stop loop' : 'Stop'}
+            >
               <span className="stop-btn-square"></span>
             </button>
           )}
@@ -441,21 +467,21 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               ref={importBtnRef}
               className={`import-context-btn ${contextLinks.length > 0 ? 'active' : ''}`}
               onClick={toggleImportPicker}
-              title="从其他会话同步上下文"
+              title="Sync context from other sessions"
               disabled={importableSessions.length === 0}
             >
-              🛠️ 上下文工程
+              🛠️ Context Engineering
             </button>
             {showImportPicker && (
               <>
                 <div className="import-picker-overlay" onClick={() => setShowImportPicker(false)} />
                 <div className="import-picker" style={{ left: pickerPos.left, bottom: pickerPos.bottom }}>
                   <div className="import-picker-header">
-                    <span>选择要同步的上下文</span>
+                    <span>Select context to sync</span>
                   </div>
                   <div className="import-picker-list">
                     {importableSessions.length === 0 ? (
-                      <div className="import-picker-empty">没有其他会话可同步</div>
+                      <div className="import-picker-empty">No other sessions available</div>
                     ) : (
                       importableSessions.map((s) => {
                         const linked = contextLinks.some((l) => l.sourceId === s.id);
@@ -484,7 +510,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 onClick={() => setShowQueue((v) => !v)}
                 title="Queued commands"
               >
-                ⏳ 命令等待处理：{commandQueue.length} 个
+                ⏳ Queued: {commandQueue.length}
               </button>
               {showQueue && (
                 <>
@@ -527,6 +553,42 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           )}
         </div>
       </div>
+      )}
+      {loopSetup && (
+        <>
+          <div className="overlay" onClick={() => setLoopSetup(null)} />
+          <div className="loop-dialog">
+            <h3>🔁 Loop this prompt</h3>
+            <div className="loop-dialog-preview">{loopSetup.text}</div>
+            <label className="loop-dialog-field">
+              <span>Interval in seconds (0 = repeat immediately after each response)</span>
+              <input
+                type="text"
+                inputMode="numeric"
+                placeholder="0"
+                autoFocus
+                value={loopSeconds}
+                onChange={(e) => setLoopSeconds(e.target.value.replace(/[^0-9]/g, ''))}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter') {
+                    onStartLoop(loopSetup.text, parseInt(loopSeconds, 10) || 0);
+                    setLoopSetup(null);
+                  } else if (e.key === 'Escape') {
+                    setLoopSetup(null);
+                  }
+                }}
+              />
+            </label>
+            <div className="loop-dialog-actions">
+              <button
+                className="loop-dialog-start"
+                onClick={() => { onStartLoop(loopSetup.text, parseInt(loopSeconds, 10) || 0); setLoopSetup(null); }}
+              >
+                Start Loop
+              </button>
+            </div>
+          </div>
+        </>
       )}
     </div>
   );

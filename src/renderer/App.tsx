@@ -120,6 +120,9 @@ const App: React.FC = () => {
     respondPermission,
     contextLinks,
     toggleContextSource,
+    loopingIds,
+    startLoop,
+    stopLoop,
   } = useAcp();
 
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
@@ -138,12 +141,12 @@ const App: React.FC = () => {
     // Sessions that were streaming before but aren't now = just finished
     const finished = prev.filter((id) => !streamingIds.includes(id));
     for (const fid of finished) {
-      if (fid !== currentSessionId) {
+      if (fid !== currentSessionId && !loopingIds.includes(fid)) {
         setUnreadSessionIds((u) => (u.includes(fid) ? u : [...u, fid]));
       }
     }
     prevStreamingIdsRef.current = streamingIds;
-  }, [streamingIds, currentSessionId]);
+  }, [streamingIds, currentSessionId, loopingIds]);
 
   // Clear unread when user switches to a session
   const handleSwitchSession = useCallback((sessionId: string) => {
@@ -403,6 +406,13 @@ const App: React.FC = () => {
             .map((s) => ({ id: s.id, title: s.title }))}
           contextLinks={contextLinks}
           onToggleContextSource={toggleContextSource}
+          isLooping={currentSessionId !== null && loopingIds.includes(currentSessionId)}
+          onStartLoop={(text, intervalSec) => {
+            if (currentSessionId) startLoop(currentSessionId, text, intervalSec);
+          }}
+          onStopLoop={() => {
+            if (currentSessionId) stopLoop(currentSessionId);
+          }}
         />
       </div>
       {permissionRequest && (

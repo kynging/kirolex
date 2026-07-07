@@ -44,7 +44,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           <div className="settings-item">
             <label className="settings-label">Preview</label>
             <p className="settings-preview" style={{ fontSize: settings.fontSize }}>
-              The quick brown fox jumps over the lazy dog. 你好世界。
+              The quick brown fox jumps over the lazy dog.
             </p>
           </div>
         </div>
