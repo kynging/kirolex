@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -582,6 +582,19 @@ app.whenReady().then(() => {
 
   ipcMain.handle('app:get-home-dir', () => {
     return os.homedir();
+  });
+
+  ipcMain.handle('app:pick-files', async () => {
+    const options = { properties: ['openFile', 'multiSelections'] as Array<'openFile' | 'multiSelections'> };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled) return [];
+    return result.filePaths.map((filePath) => ({
+      path: filePath,
+      name: path.basename(filePath),
+      isImage: /\.(png|jpe?g|gif|webp|bmp|svg)$/i.test(filePath),
+    }));
   });
 
   // Save the current clipboard image to a temp file so it can be attached and

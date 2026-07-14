@@ -1710,3 +1710,297 @@ html, body, #root {
   cursor: pointer;
 }
 .archived-unarchive-btn:hover { opacity: 0.9; }
+
+/* ── Merged right-side composer (WIP visual hierarchy + current controls) ── */
+.chat-input-area {
+  padding: 10px 40px 18px;
+  overflow: visible;
+  gap: 0;
+}
+
+.composer {
+  width: min(88%, 960px);
+  margin: 0 auto;
+  flex: 1;
+  min-height: 76px;
+  display: flex;
+  flex-direction: column;
+  padding: 8px 10px 8px 12px;
+  box-sizing: border-box;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 16px;
+  position: relative;
+  transition: border-color 0.18s ease, box-shadow 0.18s ease, background 0.18s ease;
+}
+
+.composer:focus-within {
+  border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
+  box-shadow: 0 0 0 3px var(--accent-soft);
+  background: color-mix(in srgb, var(--input-bg) 94%, var(--accent) 6%);
+}
+
+.composer-attachments {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+  max-height: 52px;
+  overflow-y: auto;
+  padding: 1px 2px 5px;
+}
+
+.composer-input {
+  width: 100%;
+  flex: 1;
+  min-height: 32px;
+  padding: 5px 5px 3px;
+  box-sizing: border-box;
+  background: transparent;
+  border: none;
+  color: var(--text-primary);
+  font: inherit;
+  font-size: 14px;
+  line-height: 1.5;
+  resize: none;
+  outline: none;
+  user-select: text;
+}
+
+.composer-input::placeholder {
+  color: var(--text-muted);
+}
+
+.composer-toolbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 10px;
+  min-height: 32px;
+  padding: 2px 2px 0;
+}
+
+.composer-controls {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.composer-icon-btn {
+  width: 30px;
+  height: 30px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s;
+}
+
+.composer-icon-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+}
+
+.composer-icon-btn:disabled {
+  opacity: 0.38;
+  cursor: default;
+}
+
+.composer-shortcut {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-muted);
+  font-size: 10px;
+}
+
+.composer-send {
+  width: 32px;
+  height: 32px;
+  flex-shrink: 0;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0;
+  border: none;
+  border-radius: 50%;
+  background: var(--accent);
+  color: #fff;
+  cursor: pointer;
+  transition: filter 0.15s, box-shadow 0.15s, opacity 0.15s;
+}
+
+.composer-send:hover:not(:disabled) {
+  filter: brightness(1.1);
+  box-shadow: 0 3px 12px var(--accent-soft);
+}
+
+.composer-send:disabled {
+  background: var(--bg-tertiary);
+  color: var(--text-muted);
+  cursor: default;
+}
+
+.composer-send.stop {
+  background: var(--error);
+}
+
+.composer-belowbar {
+  width: min(88%, 960px);
+  min-height: 28px;
+  margin: 7px auto 0;
+  padding: 0 4px;
+  box-sizing: border-box;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  flex-shrink: 0;
+}
+
+.composer-belowbar-left,
+.composer-belowbar-right {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+}
+
+.composer-belowbar-right {
+  margin-left: auto;
+  justify-content: flex-end;
+}
+
+.composer-meta-btn {
+  height: 26px;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 0 8px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+
+.composer-meta-btn:hover:not(:disabled) {
+  color: var(--text-primary);
+  background: var(--bg-tertiary);
+  border-color: var(--border);
+}
+
+.composer-meta-btn.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+}
+
+.composer-meta-btn:disabled {
+  opacity: 0.4;
+  cursor: default;
+}
+
+.composer-meta-count {
+  min-width: 16px;
+  height: 16px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  padding: 0 4px;
+  box-sizing: border-box;
+  border-radius: 999px;
+  background: color-mix(in srgb, var(--accent) 22%, transparent);
+  font-size: 9px;
+  font-variant-numeric: tabular-nums;
+}
+
+.composer-select {
+  max-width: 190px;
+  height: 26px;
+  padding: 0 7px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 10px;
+  outline: none;
+  cursor: pointer;
+}
+
+.composer-select:hover,
+.composer-select:focus {
+  background: var(--bg-tertiary);
+  border-color: var(--border);
+}
+
+.composer-tool-status {
+  max-width: 240px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--warning);
+  font-size: 10px;
+}
+
+.composer-usage {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-muted);
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;
+  white-space: nowrap;
+}
+
+.composer-usage-bar {
+  width: 46px;
+  height: 5px;
+  overflow: hidden;
+  border-radius: 999px;
+  background: var(--border);
+}
+
+.composer-usage-fill {
+  display: block;
+  height: 100%;
+  border-radius: inherit;
+  background: var(--accent);
+  transition: width 0.25s ease;
+}
+
+.composer-usage.mid .composer-usage-fill { background: var(--warning); }
+.composer-usage.high .composer-usage-fill { background: var(--error); }
+.composer-usage.mid .composer-usage-label { color: var(--warning); }
+.composer-usage.high .composer-usage-label { color: var(--error); }
+
+.composer-credits {
+  color: var(--text-muted);
+  font-size: 10px;
+  white-space: nowrap;
+}
+
+.archived-composer-banner {
+  width: min(88%, 960px);
+  margin: auto;
+  box-sizing: border-box;
+}
+
+@media (max-width: 900px) {
+  .chat-input-area { padding-left: 18px; padding-right: 18px; }
+  .composer,
+  .composer-belowbar,
+  .archived-composer-banner { width: 100%; }
+  .composer-shortcut,
+  .composer-credits { display: none; }
+  .composer-model-select { max-width: 128px; }
+}

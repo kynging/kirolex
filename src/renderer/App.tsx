@@ -32,6 +32,7 @@ declare global {
       listModels: () => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
       getHomeDir: () => Promise<string>;
+      pickFiles: () => Promise<Array<{ path: string; name: string; isImage: boolean }>>;
       saveClipboardImage: () => Promise<{ path: string; name: string; thumbnail: string } | null>;
       onUpdate: (callback: (data: any) => void) => () => void;
       onError: (callback: (error: any) => void) => () => void;

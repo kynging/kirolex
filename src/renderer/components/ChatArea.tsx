@@ -96,8 +96,9 @@ const ChatInputBox = memo<{
   onCancel: () => void;
   onQueueCommand: (text: string) => void;
   onDropFiles: (files: AttachedFile[]) => void;
+  onRemoveFile: (id: string) => void;
   attachedFiles: AttachedFile[];
-}>(({ isStreaming, status, onSend, onCancel, onQueueCommand, onDropFiles, attachedFiles }) => {
+}>(({ isStreaming, status, onSend, onCancel, onQueueCommand, onDropFiles, onRemoveFile, attachedFiles }) => {
   const [input, setInput] = useState('');
   const [isComposing, setIsComposing] = useState(false);
   const textareaRef = useRef<HTMLTextAreaElement>(null);
@@ -147,17 +148,49 @@ const ChatInputBox = memo<{
     } catch {}
   }, [attachedFiles, onDropFiles]);
 
+  const handleFilePick = useCallback(async () => {
+    try {
+      const files = await window.kiroApi.pickFiles();
+      if (files.length > 0) {
+        onDropFiles(files.map((file) => ({
+          id: `file_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+          name: file.name,
+          path: file.path,
+          isImage: file.isImage,
+        })));
+      }
+    } catch {}
+  }, [onDropFiles]);
+
   return (
-    <div className="chat-input-wrapper">
+    <div className="composer">
+      {attachedFiles.length > 0 && (
+        <div className="composer-attachments">
+          {attachedFiles.map((file) => (
+            <div key={file.id} className={`attached-file-chip ${file.isImage ? 'is-image' : ''}`} title={file.path}>
+              {file.isImage && file.preview ? (
+                <img className="attached-file-thumb" src={file.preview} alt={file.name} />
+              ) : (
+                <span className="attached-file-icon">
+                  {file.path.endsWith('/') || file.path.endsWith('\\') || !file.name.includes('.') ? '📁' : '📄'}
+                </span>
+              )}
+              <span className="attached-file-name">{file.name}</span>
+              <button className="attached-file-remove" onClick={() => onRemoveFile(file.id)} title="Remove attachment">✕</button>
+            </div>
+          ))}
+        </div>
+      )}
+
       <textarea
         ref={textareaRef}
-        className="chat-input"
+        className="composer-input"
         placeholder={
           status !== 'connected'
             ? 'Connecting... (type /stop to force reconnect)'
             : isStreaming
             ? 'Generating... (type /stop to force interrupt)'
-            : 'Type a message... (Enter to send, Shift+Enter for newline)'
+            : 'Type a message...'
         }
         value={input}
         onChange={(e) => setInput(e.target.value)}
@@ -165,17 +198,42 @@ const ChatInputBox = memo<{
         onPaste={handlePaste}
         onCompositionStart={() => setIsComposing(true)}
         onCompositionEnd={() => setIsComposing(false)}
-        rows={3}
+        rows={2}
       />
-      {isStreaming && (
-        <button
-          className="stop-btn"
-          onClick={onCancel}
-          title="Stop"
-        >
-          <span className="stop-btn-square"></span>
-        </button>
-      )}
+
+      <div className="composer-toolbar">
+        <div className="composer-controls">
+          <button
+            className="composer-icon-btn"
+            onClick={handleFilePick}
+            title="Attach files"
+            disabled={status !== 'connected'}
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round">
+              <path d="M21.44 11.05l-9.19 9.19a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />
+            </svg>
+          </button>
+          <span className="composer-shortcut">Enter send · Shift+Enter newline · Ctrl/⌘+Enter queue</span>
+        </div>
+
+        {isStreaming ? (
+          <button className="composer-send stop" onClick={onCancel} title="Stop">
+            <span className="stop-btn-square" />
+          </button>
+        ) : (
+          <button
+            className="composer-send"
+            onClick={handleSend}
+            disabled={!input.trim() || status !== 'connected'}
+            title="Send (Enter)"
+          >
+            <svg width="17" height="17" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.6" strokeLinecap="round" strokeLinejoin="round">
+              <line x1="12" y1="19" x2="12" y2="5" />
+              <polyline points="5 12 12 5 19 12" />
+            </svg>
+          </button>
+        )}
+      </div>
     </div>
   );
 });
@@ -439,165 +497,156 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       </div>
 
       {!inputCollapsed && (
-      <>
-      {attachedFiles.length > 0 && (
-        <div className="attached-files-bar">
-          <div className="attached-files">
-            {attachedFiles.map((f) => (
-              <div key={f.id} className={`attached-file-chip ${f.isImage ? 'is-image' : ''}`} title={f.path}>
-                {f.isImage && f.preview ? (
-                  <img className="attached-file-thumb" src={f.preview} alt={f.name} />
-                ) : (
-                  <span className="attached-file-icon">
-                    {f.path.endsWith('/') || f.path.endsWith('\\') || !f.name.includes('.') ? '📁' : '📄'}
-                  </span>
-                )}
-                <span className="attached-file-name">{f.name}</span>
-                <button
-                  className="attached-file-remove"
-                  onClick={() => onRemoveFile(f.id)}
-                >
-                  ✕
-                </button>
-              </div>
-            ))}
-          </div>
-        </div>
-        )}
         <div className="chat-input-area" style={{ height: inputHeight }}>
-        {isArchived ? (
-          <div className="archived-composer-banner">
-            <span>📥 This chat is archived — unarchive it to continue chatting.</span>
-            {onUnarchive && (
-              <button className="archived-unarchive-btn" onClick={onUnarchive}>♻️ Unarchive</button>
-            )}
-          </div>
-        ) : (
-        <ChatInputBox
-          isStreaming={isStreaming}
-          status={status}
-          onSend={onSend}
-          onCancel={onCancel}
-          onQueueCommand={onQueueCommand}
-          onDropFiles={onDropFiles}
-          attachedFiles={attachedFiles}
-        />
-        )}
-        {/* Model selector and tool status below input */}
-        <div className="input-model-row">
-          <div className="input-model-left">
-          <select
-            className="input-model-select"
-            value={selectedModel}
-            onChange={(e) => onModelChange(e.target.value)}
-          >
-            {models.length > 0 ? (
-              models.map((m) => (
-                <option key={m.model_id} value={m.model_id}>
-                  {m.model_name}
-                </option>
-              ))
-            ) : (
-              <>
-                <option value="auto">auto</option>
-                <option value="claude-opus-4.8">claude-opus-4.8</option>
-                <option value="claude-sonnet-4.6">claude-sonnet-4.6</option>
-                <option value="claude-haiku-4.5">claude-haiku-4.5</option>
-              </>
-            )}
-          </select>
-          <div className="import-context-wrapper">
-            <button
-              ref={importBtnRef}
-              className={`import-context-btn ${contextLinks.length > 0 ? 'active' : ''}`}
-              onClick={toggleImportPicker}
-              title="Sync context from other sessions"
-              disabled={importableSessions.length === 0}
-            >
-              🛠️ Context Engineering
-            </button>
-            {showImportPicker && (
-              <>
-                <div className="import-picker-overlay" onClick={() => setShowImportPicker(false)} />
-                <div className="import-picker" style={{ left: pickerPos.left, bottom: pickerPos.bottom }}>
-                  <div className="import-picker-header">
-                    <span>Select context to sync</span>
-                  </div>
-                  <div className="import-picker-list">
-                    {importableSessions.length === 0 ? (
-                      <div className="import-picker-empty">No other sessions available</div>
-                    ) : (
-                      importableSessions.map((s) => {
-                        const linked = contextLinks.some((l) => l.sourceId === s.id);
-                        return (
-                          <button
-                            key={s.id}
-                            className={`import-picker-item ${linked ? 'active' : ''}`}
-                            title={s.title}
-                            onClick={() => onToggleContextSource(s.id)}
-                          >
-                            <span className="import-picker-box">{linked ? '☑' : '☐'}</span>
-                            <span className="import-picker-title">{s.title || 'Untitled'}</span>
-                          </button>
-                        );
-                      })
-                    )}
-                  </div>
-                </div>
-              </>
-            )}
-          </div>
-          {commandQueue.length > 0 && (
-            <div className="queue-indicator-wrapper">
-              <button
-                className="queue-indicator-btn"
-                onClick={() => setShowQueue((v) => !v)}
-                title="Queued commands"
-              >
-                ⏳ Queued: {commandQueue.length}
-              </button>
-              {showQueue && (
-                <>
-                  <div className="queue-popup-overlay" onClick={() => setShowQueue(false)} />
-                  <div className="queue-popup">
-                    <div className="queue-popup-header">
-                      <span>Queued Commands ({commandQueue.length})</span>
-                      <button className="queue-popup-close" onClick={() => setShowQueue(false)}>✕</button>
-                    </div>
-                    <div className="queue-popup-list">
-                      {commandQueue.map((cmd, i) => (
-                        <div key={i} className="queue-popup-item">
-                          <span className="queue-popup-index">{i + 1}.</span>
-                          <span className="queue-popup-text" title={cmd}>{cmd}</span>
-                          <button
-                            className="queue-popup-remove"
-                            onClick={() => onRemoveQueuedCommand(i)}
-                            title="Remove"
-                          >
-                            ✕
-                          </button>
-                        </div>
-                      ))}
-                    </div>
-                  </div>
-                </>
+          {isArchived ? (
+            <div className="archived-composer-banner">
+              <span>📥 This chat is archived — unarchive it to continue chatting.</span>
+              {onUnarchive && (
+                <button className="archived-unarchive-btn" onClick={onUnarchive}>♻️ Unarchive</button>
               )}
             </div>
-          )}
-          </div>
-          {activeToolCall && (
-            <span className="active-tool-status">
-              ⚙️ {activeToolCall}
-            </span>
-          )}
-          {!activeToolCall && usage && (
-            <span className="usage-info">
-              📊 {usage.credits.toFixed(2)} credits · {usage.contextPercent.toFixed(0)}% context
-            </span>
+          ) : (
+            <>
+              <ChatInputBox
+                isStreaming={isStreaming}
+                status={status}
+                onSend={onSend}
+                onCancel={onCancel}
+                onQueueCommand={onQueueCommand}
+                onDropFiles={onDropFiles}
+                onRemoveFile={onRemoveFile}
+                attachedFiles={attachedFiles}
+              />
+
+              <div className="composer-belowbar">
+                <div className="composer-belowbar-left">
+                  <div className="import-context-wrapper">
+                    <button
+                      ref={importBtnRef}
+                      className={`composer-meta-btn ${contextLinks.length > 0 ? 'active' : ''}`}
+                      onClick={toggleImportPicker}
+                      title="Sync context from other sessions"
+                      disabled={importableSessions.length === 0}
+                    >
+                      🛠️ Context Engineering
+                      {contextLinks.length > 0 && <span className="composer-meta-count">{contextLinks.length}</span>}
+                    </button>
+                    {showImportPicker && (
+                      <>
+                        <div className="import-picker-overlay" onClick={() => setShowImportPicker(false)} />
+                        <div className="import-picker" style={{ left: pickerPos.left, bottom: pickerPos.bottom }}>
+                          <div className="import-picker-header">
+                            <span>Select context to sync</span>
+                          </div>
+                          <div className="import-picker-list">
+                            {importableSessions.length === 0 ? (
+                              <div className="import-picker-empty">No other sessions available</div>
+                            ) : (
+                              importableSessions.map((session) => {
+                                const linked = contextLinks.some((link) => link.sourceId === session.id);
+                                return (
+                                  <button
+                                    key={session.id}
+                                    className={`import-picker-item ${linked ? 'active' : ''}`}
+                                    title={session.title}
+                                    onClick={() => onToggleContextSource(session.id)}
+                                  >
+                                    <span className="import-picker-box">{linked ? '☑' : '☐'}</span>
+                                    <span className="import-picker-title">{session.title || 'Untitled'}</span>
+                                  </button>
+                                );
+                              })
+                            )}
+                          </div>
+                        </div>
+                      </>
+                    )}
+                  </div>
+
+                  {commandQueue.length > 0 && (
+                    <div className="queue-indicator-wrapper">
+                      <button
+                        className="composer-meta-btn active"
+                        onClick={() => setShowQueue((visible) => !visible)}
+                        title="Queued commands"
+                      >
+                        ⏳ Queued
+                        <span className="composer-meta-count">{commandQueue.length}</span>
+                      </button>
+                      {showQueue && (
+                        <>
+                          <div className="queue-popup-overlay" onClick={() => setShowQueue(false)} />
+                          <div className="queue-popup">
+                            <div className="queue-popup-header">
+                              <span>Queued Commands ({commandQueue.length})</span>
+                              <button className="queue-popup-close" onClick={() => setShowQueue(false)}>✕</button>
+                            </div>
+                            <div className="queue-popup-list">
+                              {commandQueue.map((command, index) => (
+                                <div key={index} className="queue-popup-item">
+                                  <span className="queue-popup-index">{index + 1}.</span>
+                                  <span className="queue-popup-text" title={command}>{command}</span>
+                                  <button
+                                    className="queue-popup-remove"
+                                    onClick={() => onRemoveQueuedCommand(index)}
+                                    title="Remove"
+                                  >
+                                    ✕
+                                  </button>
+                                </div>
+                              ))}
+                            </div>
+                          </div>
+                        </>
+                      )}
+                    </div>
+                  )}
+                </div>
+
+                <div className="composer-belowbar-right">
+                  {activeToolCall ? (
+                    <span className="composer-tool-status" title={activeToolCall}>⚙️ {activeToolCall}</span>
+                  ) : usage ? (
+                    <>
+                      <span
+                        className={`composer-usage ${usage.contextPercent >= 80 ? 'high' : usage.contextPercent >= 50 ? 'mid' : ''}`}
+                        title={`Context window used: ${usage.contextPercent.toFixed(1)}%`}
+                      >
+                        <span className="composer-usage-bar">
+                          <span className="composer-usage-fill" style={{ width: `${Math.min(100, Math.max(0, usage.contextPercent))}%` }} />
+                        </span>
+                        <span className="composer-usage-label">{usage.contextPercent.toFixed(0)}%</span>
+                      </span>
+                      <span className="composer-credits">{usage.credits.toFixed(2)} credits</span>
+                    </>
+                  ) : null}
+
+                  <select
+                    className="composer-select composer-model-select"
+                    value={selectedModel}
+                    onChange={(event) => onModelChange(event.target.value)}
+                    title="Model"
+                  >
+                    {models.length > 0 ? (
+                      models.map((model) => (
+                        <option key={model.model_id} value={model.model_id}>
+                          {model.model_name}
+                        </option>
+                      ))
+                    ) : (
+                      <>
+                        <option value="auto">auto</option>
+                        <option value="claude-opus-4.8">claude-opus-4.8</option>
+                        <option value="claude-sonnet-4.6">claude-sonnet-4.6</option>
+                        <option value="claude-haiku-4.5">claude-haiku-4.5</option>
+                      </>
+                    )}
+                  </select>
+                </div>
+              </div>
+            </>
           )}
         </div>
-      </div>
-      </>
       )}
     </div>
   );

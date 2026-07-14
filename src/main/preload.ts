@@ -33,6 +33,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   listModels: () => ipcRenderer.invoke('acp:list-models'),
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
   getHomeDir: () => ipcRenderer.invoke('app:get-home-dir'),
+  pickFiles: () => ipcRenderer.invoke('app:pick-files'),
   saveClipboardImage: () => ipcRenderer.invoke('app:save-clipboard-image'),
   
   // Events
