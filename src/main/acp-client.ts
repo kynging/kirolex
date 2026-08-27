@@ -553,7 +553,11 @@ function pickPermissionOption(
 }
 
 /** POSIX single-quote a value so it is safe to embed in a remote shell command. */
-function shellQuote(value: string): string {
+/** Single-quote a value for a POSIX shell. Exported because the verifier runner
+ *  (loopVerify.ts) has to quote a remote command line the same way this file does —
+ *  two independent quoting rules for the same SSH invocation is how a verifier ends
+ *  up running something subtly different from the agent's own command. */
+export function shellQuote(value: string): string {
   return `'${String(value).replace(/'/g, `'\\''`)}'`;
 }
 
@@ -577,8 +581,14 @@ function buildRemoteKiroCommand(model: string, kiroAgent?: string): string {
  * links after connect, and accept-new avoids a first-connect host-key prompt
  * while still pinning the key thereafter. Values originate from the user's local
  * trusted config; the remote command is passed as a single argument.
+ *
+ * EXPORTED and shared with the loop verifier: a verification command must run on
+ * the same host as the agent it is checking. A verifier that runs on this Mac while
+ * the agent edits files on an EC2 box is inspecting an unrelated filesystem, and
+ * such a loop reports green forever. Sharing this function keeps the "is it remote"
+ * decision identical to the one `AcpClient.connect()` makes.
  */
-function buildSshArgs(remote: RemoteTarget, remoteCommand: string): string[] {
+export function buildSshArgs(remote: RemoteTarget, remoteCommand: string): string[] {
   const args: string[] = [
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',

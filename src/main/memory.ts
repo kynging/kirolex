@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { MEMORY_BACKUPS, type MemoryScope } from './memoryPolicy.ts';
 
 /**
  * Layered memory store (design §6). THREE curated layers on disk, ordered
@@ -20,6 +21,9 @@ import path from 'path';
 
 const baseDir = path.join(os.homedir(), '.kirolex', 'memory');
 const globalPath = path.join(baseDir, 'global.md');
+
+// 阈值和提示词在 `memoryPolicy.ts`（不引 node 内置模块，渲染进程也要用同一份）。
+
 
 function projectDir(projectId: string): string {
   return path.join(baseDir, 'projects', projectId);
@@ -54,6 +58,65 @@ export function ensureMemoryFiles(projectId?: string, sessionId?: string): void 
       if (!fs.existsSync(sp)) fs.writeFileSync(sp, `# Chat-specific memory\n\n`);
     }
   } catch { /* best-effort */ }
+}
+
+/** 一个文件的字节数，不存在就是 0 —— `statSync` 而不是读全文：这个数每轮都要取一次。 */
+function bytesOf(p: string): number {
+  try { return fs.statSync(p).size; } catch { return 0; }
+}
+
+/**
+ * 三层各自的字节数，给横幅用。
+ *
+ * 刻意不返回内容：调用点只需要知道「大不大」，读 74 KB 正文只为了拿一个长度是纯浪费。
+ */
+export function memoryLayerBytes(projectId?: string, sessionId?: string): {
+  global: number; project: number; session: number;
+} {
+  return {
+    global: bytesOf(globalPath),
+    project: projectId ? bytesOf(projectPath(projectId)) : 0,
+    session: sessionId ? bytesOf(sessionPath(sessionId)) : 0,
+  };
+}
+
+/**
+ * 压缩前把某一层记忆备份一份，只留最近 `MEMORY_BACKUPS` 份。
+ *
+ * 为什么必须有：删会话时 `deleteSessionMemory` 是 `fs.rmSync` 直接销毁，不进 trash —— 已经
+ * 真实吃过一次（一条 497 KB 的会话被删，transcript 从 trash 捞回来了，它的 memory 永久没了）。
+ * 而「压缩」是让模型去重写这个文件，比删除更容易悄悄丢东西。`.bak` 不会被读取：三层的读取口
+ * （`globalPath`/`projectPath`/`sessionPath`）都只认确切的文件名。
+ *
+ * 全局层的备份落在 `memory/global.<stamp>.bak`，另两层落在各自的目录里。
+ *
+ * 返回备份路径，没有可备份的（文件不存在/为空）返回 null。
+ */
+export function backupMemoryLayer(
+  scope: MemoryScope,
+  projectId: string | undefined,
+  sessionId: string | undefined,
+  stamp: string,
+): string | null {
+  try {
+    const src = scope === 'global' ? globalPath
+      : scope === 'project' ? (projectId ? projectPath(projectId) : '')
+      : (sessionId ? sessionPath(sessionId) : '');
+    if (!src || bytesOf(src) === 0) return null;
+    const dir = path.dirname(src);
+    // 备份名沿用原文件名做前缀，这样同目录里两层的备份不会互相误删。
+    const stem = path.basename(src, '.md');
+    const dest = path.join(dir, `${stem}.${stamp}.bak`);
+    fs.copyFileSync(src, dest);
+    const stale = fs.readdirSync(dir)
+      .filter((n) => n.startsWith(`${stem}.`) && n.endsWith('.bak'))
+      .sort()                          // 时间戳可排序，字典序即时间序
+      .slice(0, -MEMORY_BACKUPS);      // 留最近 N 份，其余是 stale
+    for (const n of stale) {
+      try { fs.rmSync(path.join(dir, n), { force: true }); } catch { /* best-effort */ }
+    }
+    return dest;
+  } catch { return null; }
 }
 
 /** Delete a project's memory directory (project deletion). */
@@ -144,8 +207,36 @@ export function buildMemoryInjection(projectId?: string, sessionId?: string): st
       'To remember something durable, append a concise bullet (no duplicates) to the matching file with your file tools, then briefly confirm: ' +
       targets.join('  |  ') + '.'
     );
+    /**
+     * 未归属 project 时，把**现有项目的真实名字和确切路径**列出来。
+     *
+     * 实测过一次落空：一条 unassigned 会话按 global.md 里的规则「能判断归属就直接写目标项目文件」
+     * 去写记忆，但注入块里从来没给过项目路径（上面 `if (projectId)` 才 push），于是项目名只能靠猜 ——
+     * 它猜了 `Kirolex`，而真实的项目叫 `Dev`。`~/.kirolex/memory/projects/Kirolex/` 不存在，内容落空，
+     * 而它在回复里说「记忆已更新」。同期 20 条 unassigned 会话里 9 条的 session 记忆还是 24 字节的空壳
+     * （只有那行标题），也就是从建好起一个字都没写进去。
+     *
+     * 列表从磁盘现读：这是「有哪些项目」的事实来源，猜名字之所以会错，就是因为之前没人告诉它答案。
+     * 同时明说「都不匹配就只写 session 层」，堵掉「新建一个目录」这条更糟的出路 —— 新建的目录
+     * KiroLex 永远不会读，等于又落空一次。
+     */
     if (!projectId) {
-      lines.push('(Not assigned to a project — assign it in KiroLex for a project layer.)');
+      let names: string[] = [];
+      try {
+        names = fs.readdirSync(path.join(baseDir, 'projects'), { withFileTypes: true })
+          .filter((e) => e.isDirectory())
+          .map((e) => e.name)
+          .sort();
+      } catch { /* 还没有任何项目 */ }
+      lines.push('');
+      if (names.length) {
+        lines.push('=== NOT ASSIGNED TO A PROJECT — 可选的项目层 ===');
+        lines.push('这条会话没有项目层。如果这些事实明确属于下面某一个项目，写进它的文件并在回复里说明写去了哪：');
+        for (const name of names) lines.push(`  ${name} → ${projectPath(name)}`);
+        lines.push('都不匹配就只写上面的 THIS CHAT 一层。不要新建项目目录 —— 新建的目录不会被读取。');
+      } else {
+        lines.push('(Not assigned to a project, and no project memory exists yet — write to THIS CHAT only.)');
+      }
     }
     return `<hidden>\n${lines.join('\n')}\n</hidden>`;
   } catch {

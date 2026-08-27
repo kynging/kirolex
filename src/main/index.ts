@@ -3,11 +3,21 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFile } from 'child_process';
-import { AcpClient, resolveKiroCli } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd } from './config';
+import * as loopVerify from './loopVerify';
+import * as eventLog from './eventLog';
 import * as store from './sessionStore';
-import { buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, readMemory, writeMemory } from './memory';
+import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
+import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
+import * as loopStore from './loopStore.ts';
+import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec } from './schedule.ts';
+import * as scheduleStore from './scheduleStore.ts';
+import * as projectStore from './projectStore.ts';
+import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
+import type { MemoryScope } from './memoryPolicy.ts';
+import { shouldConsolidate, buildConsolidationPrompt, mergeSessionMemory, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -63,10 +73,9 @@ interface SessionEntry {
   fileChanges: store.StoredToolCall[];
   /** Tool calls the backend has OPENED and not yet closed, by toolCallId.
    *
-   *  Second guard for wedge detection, covering what CPU cannot: a tool that WAITS
-   *  (a slow download, a remote API) burns nothing anywhere in the process tree, so it
-   *  still reads as idle. An open tool call is the protocol stating outright that the
-   *  turn is busy, so it suppresses the interrupt.
+   *  Second guard for wedge detection, and the only one left that is PROTOCOL TRUTH
+   *  rather than a heuristic: an open tool call is the backend stating outright that the
+   *  turn is busy, so it suppresses the interrupt (bounded by TOOL_STALL_MS).
    *
    *  Tracked separately from `fileChanges`, which only records calls that touched
    *  files or ran something and would therefore miss the rest.
@@ -81,14 +90,14 @@ interface SessionEntry {
    *  Refreshed on EVERY update, so a long command that reports intermediate progress
    *  keeps its session protected for as long as it keeps reporting. */
   openToolCalls?: Map<string, { startedAt: number; lastUpdate: number }>;
-  /** whether layered memory has been injected on this executor's first prompt
-   *  (design §6.4) — re-armed each time a fresh executor attaches. */
-  memoryInjected: boolean;
-  /** the projectId used in the last memory injection; re-inject if it changes. */
-  injectedProjectId?: string;
-  /** the exact memory block last injected; re-inject when the content changes
-   *  (so same-project chats pick up each other's memory writes). */
-  lastInjectedMemory?: string;
+  /** kiro's native subagents for THIS chat, as last reported by `_kiro.dev/subagent/list_update`.
+   *  Kept so the left rail can carry a tag for as long as one is still running. */
+  subagents?: SubagentRow[];
+  /* No memory-injection bookkeeping here on purpose: the block goes out on EVERY
+     turn, so there is no "has it been sent yet / has it changed" decision to carry.
+     Three fields used to exist for that decision and were the reason a standing rule
+     was stated once and never repeated. The durable record of what was sent lives in
+     record.json (`lastMemoryInjection`) and in the [memory] log line. */
   /** Set when a session is (re)attached onto a FRESH kiro-cli backend (resume
    *  failed, migrated session, or expired cli session). On the FIRST prompt,
    *  KiroLex rebuilds the full prior context from its OWN durable transcript and
@@ -164,6 +173,10 @@ const sessionClients: Map<string, SessionEntry> = new Map();
 // Serializes model/Agent replacement per session. Renderer locks are UX only;
 // this guard is authoritative against racing IPC calls and background queues.
 const reconfiguringSessions = new Set<string>();
+/** requestId -> when the permission prompt was raised, so the answer can record how
+ *  long the turn was blocked. Lives here (not on the entry) because a permission may
+ *  be answered after a model swap replaced the executor. */
+const permissionWaitStartedAt = new Map<string, number>();
 /** Sessions with an attach (acp:load-session) in flight. kiro-cli owns a session
  *  from ONE process only, so an attach and a model/Agent switch racing on the
  *  same session both try to session/load it and the loser gets a bare
@@ -183,6 +196,35 @@ async function awaitAttachIdle(sessionId: string, timeoutMs = 12000): Promise<vo
   if (attachingSessions.has(sessionId)) {
     throw new Error('会话正在重新连接，请稍候再切换模型/Agent。');
   }
+}
+/** Wait (bounded) for a model/Agent/permission switch on this session to finish.
+ *
+ *  The MIRROR of `awaitAttachIdle`, and it was missing: a switch waited politely
+ *  for an attach, but an attach REJECTED outright while a switch was running
+ *  ("会话正在切换模型/Agent，稍后会自动重连。"). That asymmetry is what surfaced as a
+ *  raw `Error invoking remote method 'acp:load-session'` — and because a send
+ *  attaches on demand, the rejection reached the user's message rather than any
+ *  background task.
+ *
+ *  Waiting is not just cosmetic: a switch ENDS with the session attached again
+ *  (`sessionClients` holds the new executor), so by the time this resolves the
+ *  attach usually has nothing left to do and returns immediately. Rejecting threw
+ *  away a request that was about to become trivially satisfiable.
+ *
+ *  Bounded, and the timeout still throws: a switch that never finishes must not
+ *  turn every later attach into an unbounded hang. 30s covers a cold kiro-cli
+ *  start plus a `session/load`, both of which a switch performs. */
+async function awaitReconfigureIdle(sessionId: string, timeoutMs = 30000): Promise<void> {
+  if (!reconfiguringSessions.has(sessionId)) return;
+  const deadline = Date.now() + timeoutMs;
+  logger.info('session', `attach waiting for model/Agent switch sessionId=${sessionId}`);
+  while (reconfiguringSessions.has(sessionId) && Date.now() < deadline) {
+    await new Promise((r) => setTimeout(r, 200));
+  }
+  if (reconfiguringSessions.has(sessionId)) {
+    throw new Error('会话切换模型/Agent 超过 30 秒仍未完成，暂时无法连接。');
+  }
+  logger.info('session', `attach resuming after model/Agent switch sessionId=${sessionId}`);
 }
 /** Start an executor for `profile`, falling back through MODEL_FALLBACK_ORDER
  *  when the requested model cannot start (unavailable / retired / throttled).
@@ -335,6 +377,53 @@ async function runLiteOneShot(prompt: string, label: string): Promise<string> {
   throw lastError || new Error('No helper model could answer.');
 }
 
+/**
+ * 会话记忆的自动维护 —— 「你在 memory 里加一个 session memory」。
+ *
+ * 三层记忆(全局 ⊕ project ⊕ 这个会话)早就在了,每一轮都注入;缺的是**没人写这一层** —— 它是个手填的
+ * 文本框,而没人会在聊天中途停下来写笔记。所以每一轮结束后判断一次:攒够 CONSOLIDATE_EVERY 条新消息,
+ * 就用和生成标题同一条便宜的一次性调用(`runLiteOneShot`)把最近这段压成几行事实,合并进那个文件。
+ *
+ * 失败一律静默:它是背景工作,不该为一次压缩失败弹任何东西 —— 但必须记日志,否则「记忆怎么没更新」
+ * 就成了不可查的问题。
+ */
+const memoryConsolidating = new Set<string>();
+
+async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
+  if (!isFeatureEnabled('sessionMemory')) return;
+  try {
+    const messages = store.readTranscript(sessionId) || [];
+    const record = store.readRecord(sessionId);
+    if (!record) return;
+    if (!shouldConsolidate({
+      messages: messages.length,
+      consolidatedAt: (record as any).memoryConsolidatedAt || 0,
+      inFlight: memoryConsolidating.has(sessionId),
+    })) return;
+    memoryConsolidating.add(sessionId);
+    const projectId = (record.profile as any)?.projectId || undefined;
+    const existing = readMemory(projectId, sessionId).session || '';
+    /* 只喂最近这一段:更早的已经被上一次压缩吸收进 existing 了,再喂一遍是重复付钱 */
+    const recent = messages
+      .slice(-CONSOLIDATE_EVERY * 2)
+      .map((m: any) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.content || '').slice(0, 800)}`)
+      .join('\n\n');
+    if (!recent.trim()) return;
+    const produced = cleanLiteOutput(await runLiteOneShot(buildConsolidationPrompt(recent, existing), 'session-memory'));
+    const merged = mergeSessionMemory(existing, produced);
+    if (merged && merged !== existing) {
+      writeMemory('session', projectId, sessionId, merged);
+      logger.info('memory', `session ${sessionId}: consolidated at ${messages.length} messages (${merged.length} chars)`);
+    }
+    store.writeRecord({ ...record, memoryConsolidatedAt: messages.length } as any);
+  } catch (err: any) {
+    logger.warn('memory', `session ${sessionId}: consolidation failed (${err?.message || err})`);
+  } finally {
+    memoryConsolidating.delete(sessionId);
+  }
+}
+
+
 /** Cap on the tool OUTPUT kept per tool call in the transcript.
  *
  *  Output was never persisted at all (StoredToolCall.content existed but no writer
@@ -411,7 +500,56 @@ function emitSessionBusy(sessionId: string) {
   const reason = busyReasonFor(sessionId);
   const detail = reason === 'priming' ? sessionClients.get(sessionId)?.primeDetail : undefined;
   mainWindow?.webContents.send('acp:session-busy', { sessionId, reason, detail });
+  /*
+    只要还在报 prime-pending,就确保有一次重建排着 —— 「这次还是没有重试」。
+
+    上一版只在**刚被标记**的那一刻排一次:一个在这段代码存在之前就已经被标成 prime-pending 的会话
+    (或者那次排空因为执行器不在而被跳过的),就永远等不到第二次。这里是每次上报状态都过一遍,而
+    `schedulePrime` 本身是幂等的(已在队列或在跑就直接返回),所以不会堆叠。
+  */
+  if (reason === 'prime-pending') schedulePrime(sessionId);
 }
+
+/**
+ * 欠着的重建要有人去跑 —— 「我的两个会话重启之后为什么检测到会话正忙就不再恢复了」。
+ *
+ * `prime-pending` 是**占用**状态,而且故意没有次数上限:它只在重建完成、你按 Stop、或者你清掉历史时释放。
+ * 可重启之后没有任何东西去**启动**那次重建 —— 主进程只在执行器被换掉(切模型/切 agent)时自动踢一次,
+ * 渲染端的兜底只踢你正打开的那一个。于是后台那几条会话就一直「忙」着,而根本没有活在跑:看着就是
+ * 「检测到正忙,然后再也不恢复」。
+ *
+ * 所以「欠着」这件事本身就去排一次重建。两个限制是必须的,理由都写在原注释里:
+ *   并发 2   启动时十几条会话同时 attach,一起打到模型上会把每一条都拖慢(原来靠渲染端只踢一条来避免)
+ *   间隔     排空之间留一点空隙,让真正的用户操作插得进去
+ */
+const MAX_CONCURRENT_PRIMES = 2;
+const primeWaiting: string[] = [];
+const primeInFlight = new Set<string>();
+
+function drainPrimeQueue(): void {
+  while (primeInFlight.size < MAX_CONCURRENT_PRIMES) {
+    const sessionId = primeWaiting.shift();
+    if (!sessionId) return;
+    const entry = sessionClients.get(sessionId);
+    // 排队期间情况可能已经变了：执行器没了、你放弃了、或者别人已经重建完了
+    if (!entry || entry.primeAbandoned || entry.priming || !entry.needsHistoryPrime) continue;
+    primeInFlight.add(sessionId);
+    logger.info('prime', `auto-start sessionId=${sessionId} (owed rebuild, ${primeWaiting.length} still waiting)`);
+    void primeHistoryNow(sessionId)
+      .catch((err: any) => logger.warn('prime', `auto-start failed sessionId=${sessionId}: ${err?.message || err}`))
+      .finally(() => {
+        primeInFlight.delete(sessionId);
+        setTimeout(drainPrimeQueue, 400);
+      });
+  }
+}
+
+function schedulePrime(sessionId: string): void {
+  if (primeInFlight.has(sessionId) || primeWaiting.includes(sessionId)) return;
+  primeWaiting.push(sessionId);
+  setTimeout(drainPrimeQueue, 300);
+}
+
 
 /** Render one transcript message for history priming. Attachments are carried
  *  as `file:<path>` refs so a fresh backend can RE-READ an image/file the user
@@ -513,11 +651,6 @@ const PRIME_MAX_MODEL_SWAPS = 2;
  *  one that just failed. Cleared when the rebuild finishes or is called off. */
 const primeModelsTried = new Map<string, Set<string>>();
 
-/** Is this backend PROVEN to hold this chat's history? The marker is written only
- *  after a rebuild completed, and it pins both the ACP session id AND the pid --
- *  a successful `session/load` is not evidence, because kiro-cli does not persist
- *  ACP sessions (verified live: an ACP turn writes no row to its own
- *  data.sqlite3, while its `--no-interactive` chats do). */
 function contextEstablished(sessionId: string, entry: SessionEntry): boolean {
   try {
     const rec = store.readRecord(sessionId);
@@ -537,6 +670,24 @@ function markContextOwedIfUnverified(sessionId: string, trigger: string): boolea
   if (!entry) return false;
   if (entry.priming || entry.needsHistoryPrime) return true;
   if (entry.primeAbandoned) return false;                       // user opted out
+  /**
+   * flow 自己的那两种会话不欠重建 —— 「修改 flow 这个会话为什么会需要重建上下文，太荒谬了」。
+   *
+   * 荒谬在于**重放它的历史毫无意义**:
+   *   `skill`(画布/注册那条)  它的全部内容就是一份生成提示词加一份 JSON 结构;而结构的权威副本在注册表里,
+   *                           画布也是从那儿渲染的。后端换了执行器,正确的做法是把结构提示词**再发一次**,
+   *                           不是把几万字的 JSON 一轮一轮重放 —— 那不但贵,还会把上下文塞满。
+   *   `flow-worker`           一步的输入由 run 重新拼出来(`assembleStepPrompt`:起跑输入 + 上游材料 + 指令),
+   *                           所以重跑一步比重放它的历史更准确,也是驱动本来就在做的事。
+   * 而流程主会话(`flow-main`)不在这里:它是你和它商量状态的那条线程,历史有价值,照旧重建。
+   */
+  try {
+    const purpose = store.readRecord(sessionId)?.purpose;
+    if (purpose === 'skill' || purpose === 'flow-worker') {
+      logger.info('prime', `skip rebuild for ${purpose} sessionId=${sessionId} trigger=${trigger} — 它的内容由结构/run 重新产生，重放没有意义`);
+      return false;
+    }
+  } catch { /* 读不到记录就按普通会话处理 */ }
   if (store.transcriptFileSize(sessionId) <= 0) return false;    // nothing to restore
   if (contextEstablished(sessionId, entry)) return false;
   entry.needsHistoryPrime = true;
@@ -551,7 +702,44 @@ function markContextOwedIfUnverified(sessionId: string, trigger: string): boolea
   } catch {}
   logger.info('prime', `unverified backend sessionId=${sessionId} trigger=${trigger} cli=${entry.cliSessionId} pid=${entry.client.pid} establishedFor=${establishedFor} establishedPid=${establishedPid} -> rebuild owed`);
   emitSessionBusy(sessionId);
+  // 欠着就去排一次 —— 占用状态必须伴随真的有活在跑，否则它就是个死锁
+  schedulePrime(sessionId);
   return true;
+}
+
+/** The executor was just REPLACED (model or Agent switch). Decide how this chat's
+ *  context comes back.
+ *
+ *  Both switches end on a brand new kiro-cli process, so `contextEstablished` --
+ *  which pins the pid -- is necessarily false and the new backend really is empty.
+ *  What was wrong was the response: both handlers used to mark the rebuild owed and
+ *  fire `primeHistoryNow` immediately, which
+ *
+ *    1. contradicted `acp:ensure-context`, where the SAME conclusion ("this backend
+ *       is empty") deliberately does nothing in snapshot mode, and
+ *    2. actively FORECLOSED the free path: `!entry.needsHistoryPrime` is one of the
+ *       ride-along preconditions, and marking the debt is the first thing
+ *       `markContextOwedIfUnverified` does -- so switching model turned a zero-cost
+ *       restore into a locked chat plus a dedicated model turn that can fail and
+ *       retry (observed: three rebuild attempts in five minutes, all failing on an
+ *       unavailable model, the chat unusable throughout).
+ *
+ *  In snapshot mode the correct action is NOTHING: the marker already fails, so the
+ *  next message carries the snapshot in the same request, at no extra cost. The
+ *  original justification -- "until the user types, the chat looks connected while
+ *  remembering nothing" -- does not apply, because without a turn there is nothing
+ *  that could answer from an empty context.
+ *
+ *  Verbatim ('full') mode still needs a real rebuild: one turn PER CHUNK cannot
+ *  ride along on a single message. */
+function restoreContextAfterExecutorSwap(sessionId: string, trigger: string): void {
+  if (store.readRecord(sessionId)?.primeMode === 'full') {
+    if (markContextOwedIfUnverified(sessionId, trigger)) {
+      void primeHistoryNow(sessionId).catch(() => {});
+    }
+    return;
+  }
+  logger.info('prime', `context RIDES ALONG after ${trigger} sessionId=${sessionId} — no rebuild turn, chat stays usable`);
 }
 
 /** ONE prompt that restores what actually matters, instead of replaying the whole
@@ -614,16 +802,52 @@ function clearContextEstablished(sessionId: string): void {
   } catch {}
 }
 
+/** The hand-off line the ride-along block must end with, or the model answers the
+ *  restored context instead of the message that follows it. */
+const RIDE_ALONG_HANDOFF = '\n\n---\n\n以上是恢复的上下文。下面是用户这一条新消息，请正常回答它：';
+
+/** Drop the archive header `writeLastInjection` puts on `last-injection.md`.
+ *
+ *  The Snapshot tab shows that file verbatim, so a block edited there arrives with the
+ *  `# …` preamble and its `=====` rule. Those lines would be harmless to send but they
+ *  claim a send time that is no longer true, so they are cut -- and only when the text
+ *  before the rule really is all comments, so a conversation that happens to contain a
+ *  row of `=` is left alone. */
+function stripArchiveHeader(text: string): string {
+  const rule = text.match(/^={10,}\s*$/m);
+  if (!rule || rule.index === undefined) return text;
+  const head = text.slice(0, rule.index);
+  const allComments = head.split('\n').filter((l) => l.trim()).every((l) => l.trimStart().startsWith('#'));
+  if (!allComments) return text;
+  return text.slice(rule.index + rule[0].length).replace(/^\n+/, '');
+}
+
 /** The snapshot, worded to ride along with the user's own message rather than to
  *  be a standalone priming turn (so: no "reply OK", and it explicitly hands off to
  *  the real message that follows it). */
 function buildHistoryRideAlong(sessionId: string): string {
   try {
+    // A HAND-EDITED block wins over the generated one, and is used VERBATIM: what the
+    // user sees in the Snapshot tab is what goes out, which is the only predictable
+    // rule for something they curated themselves.
+    const override = store.readContextOverride(sessionId);
+    if (override) {
+      let text = stripArchiveHeader(override.text).trimEnd();
+      // …with one exception: the hand-off is restored if it was edited away. Without it
+      // the model treats the restored history as the thing to reply to, which shows up
+      // as "Kiro answered a question I did not ask".
+      if (!text.includes('请正常回答它')) {
+        text += RIDE_ALONG_HANDOFF;
+        logger.info('prime', `context override had no hand-off line sessionId=${sessionId} -> appended`);
+      }
+      logger.info('prime', `context OVERRIDE (hand-edited) sessionId=${sessionId} chars=${text.length}`);
+      return text;
+    }
     const stored = store.readTranscript(sessionId)
       .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')));
     const lines = stored.map((m) => historyLine(m));
     if (!lines.join('').trim()) return '';
-    return `${buildSnapshot(sessionId, stored, lines, { rideAlong: true })}\n\n---\n\n以上是恢复的上下文。下面是用户这一条新消息，请正常回答它：`;
+    return `${buildSnapshot(sessionId, stored, lines, { rideAlong: true })}${RIDE_ALONG_HANDOFF}`;
   } catch (err: any) {
     logger.info('prime', `ride-along build FAILED sessionId=${sessionId} err=${err?.message}`);
     return '';
@@ -1194,6 +1418,34 @@ function setUiStateKey(key: string, value: string | null): void {
  *  `lastWorkspaceDir` in ~/.kirolex/config.json (app:get/set-workspace-dir); no
  *  reader or writer for this key remains in src/. */
 const DEAD_UI_STATE_KEYS = new Set(['kirolex-workspace-dir']);
+
+/** Keys whose lifetime is ONE RUN: persisted while the app is up, wiped at boot.
+ *
+ *  kirolex-composer-drafts: half-written prompts, one per chat. They must survive
+ *  anything that happens WITHIN a run -- switching chats, a layout change that
+ *  remounts the composer, a renderer reload from HMR -- which is why they are on disk
+ *  and not in a module variable. They must NOT survive a restart: text you typed
+ *  yesterday, greeting you with no indication of its age, is worse than no text.
+ *
+ *  Clearing them here rather than in the renderer is deliberate: the renderer cannot
+ *  tell a fresh launch from a reload of the same run (both are just a new page), and
+ *  main is the only place that knows the process has just started. */
+const RUN_SCOPED_UI_STATE_KEYS = new Set(['kirolex-composer-drafts']);
+function clearRunScopedUiState(): void {
+  const state = uiState();
+  const dropped = [...RUN_SCOPED_UI_STATE_KEYS].filter((k) => Object.prototype.hasOwnProperty.call(state, k));
+  if (dropped.length === 0) return;
+  for (const k of dropped) delete state[k];
+  try {
+    fs.mkdirSync(path.dirname(UI_STATE_PATH), { recursive: true });
+    const tmp = `${UI_STATE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(state, null, 2));
+    fs.renameSync(tmp, UI_STATE_PATH);
+    logger.info('ui-state', `cleared run-scoped key(s) at boot: ${dropped.join(', ')}`);
+  } catch (err: any) {
+    logger.warn('ui-state', `failed to clear run-scoped key(s): ${err?.message || err}`);
+  }
+}
 function pruneDeadUiStateKeys(): void {
   const state = uiState();
   const dropped = [...DEAD_UI_STATE_KEYS].filter((k) => Object.prototype.hasOwnProperty.call(state, k));
@@ -1219,6 +1471,23 @@ function pruneDeadUiStateKeys(): void {
  *  needed a full `npm run build` + restart even though HMR was right there. An
  *  argv flag behaves identically on every platform and needs no extra dependency. */
 const IS_DEV = process.argv.includes('--dev') || process.env.NODE_ENV === 'development';
+
+/** DEV ONLY: expose Chrome DevTools Protocol on 127.0.0.1:9222.
+ *
+ *  Why it is here at all: several UI defects in split view (a pane appearing to
+ *  re-render when another is clicked, transcripts shifting) can only be settled by
+ *  MEASURING the live window -- which DOM nodes mutate, what the real heights are.
+ *  Without a port there is no way in, and diagnosing by reading code alone produced
+ *  two wrong root causes.
+ *
+ *  SECURITY: an open CDP port is remote-code-execution equivalent for anything that
+ *  can reach it. It is bound to loopback and gated on `--dev`, which a packaged build
+ *  never passes, so it cannot reach a normal install. Do not widen it, do not remove
+ *  the guard, and prefer removing this block once the layout work is done. */
+if (IS_DEV) {
+  app.commandLine.appendSwitch('remote-debugging-port', '9222');
+  app.commandLine.appendSwitch('remote-allow-origins', 'http://localhost:9222');
+}
 const DEV_SERVER_URL = process.env.KIROLEX_DEV_URL || 'http://localhost:5173';
 // Paste blobs referenced by an UNSENT composer draft. Kept on disk (not in the
 // renderer's localStorage) for two reasons: the draft is per-session and must
@@ -1307,9 +1576,9 @@ let MAX_CONCURRENT_SESSIONS = loadExecutorCapOverride() || MAX_CONCURRENT_SESSIO
  *
  *  Two inputs only: an OPEN TOOL CALL (protocol truth — never interrupt) and how long
  *  the turn has been silent (a heuristic). Nothing local can do better; the inference
- *  runs on a remote server, so "slow" and "dead" are locally indistinguishable. Three
- *  OS-level corroborations were tried and measured to be useless — see the watchdog for
- *  the numbers.
+ *  runs on a remote server, so "slow" and "dead" are locally indistinguishable. Several
+ *  OS-level corroborations were tried, measured, and removed as uninformative — the last
+ *  of them was the CPU probe; see the note where it used to be defined.
  *
  *  The threshold is therefore user-tunable, since it is the whole judgement: a turn
  *  whose FIRST token is genuinely slow is indistinguishable from a hung one. Raise it if
@@ -1318,7 +1587,16 @@ let MAX_CONCURRENT_SESSIONS = loadExecutorCapOverride() || MAX_CONCURRENT_SESSIO
  *  consequence is cheap: a turn that produced nothing is auto-resent, and one that
  *  produced a partial reply is left alone for the user to decide. */
 const WATCHDOG_TICK_MS = 30000;             // how often silence is re-checked
-const WEDGE_CONFIRM_SECONDS_DEFAULT = 180;
+/** 10 minutes, raised from 3.
+ *
+ *  180s was chosen while a CPU probe could still postpone the interrupt; with that probe
+ *  gone this number IS the entire policy, and 3 minutes of silence is not enough evidence
+ *  of a hang to spend a turn on. It also put the two signals in the wrong order: the
+ *  advisory notice appears at 5 minutes (QUIET_NOTICE_MS), so at 180s the turn was already
+ *  cut before the user was ever told anything -- the "no tool is running" branch of that
+ *  notice was in practice unreachable. At 600s the notice comes first and carries a
+ *  countdown, and the interrupt only follows if the silence really does continue. */
+const WEDGE_CONFIRM_SECONDS_DEFAULT = 600;
 const WEDGE_CONFIRM_SECONDS_MIN = 30;
 const WEDGE_CONFIRM_SECONDS_MAX = 3600;
 /** Persisted silence threshold in SECONDS. 0 means the user turned the interrupt off;
@@ -1374,122 +1652,22 @@ function saveToolStallSeconds(n: number) {
 }
 let TOOL_STALL_MS = loadToolStallSeconds() * 1000;
 
-/** How long the CPU-progress check watches the executor's process tree, and how
- *  much CPU counts as "working". Both numbers were MEASURED before being trusted,
- *  in the two directions that matter:
- *    - working: PowerShell 5.1 `ConvertFrom-Json` over a 7.6MB file, seen through
- *      an IDLE parent (the shape that got killed) -> +5.281s per 5s window.
- *    - idle floor: eight windows over two live, idle kiro-cli acp executors
- *      (5-pid trees, conhost + MCP children included) -> 0.000s..0.078s.
- *  0.25s (5% of one core) leaves 3x headroom over the worst idle window and sits
- *  21x below the working signal. Getting the floor wrong in the other direction is
- *  the dangerous one: a permanently vetoing check would resurrect the unbounded
- *  hang this whole mechanism exists to stop. One sample costs ~0.5s. */
-const CPU_PROBE_WINDOW_MS = 5000;
-const CPU_PROBE_MIN_SECONDS = 0.25;
-
-/** Ceiling on how long CPU progress may postpone an interrupt, as a multiple of
- *  whichever limit gated the decision (30 min tool-stall default -> up to 90 min of
- *  extra grace, 2h total). A ceiling is MANDATORY, not tidiness: burning CPU and
- *  being hung are not exclusive — a spin-wait pegs a core forever — so an unbounded
- *  veto would restore the very hang the watchdog exists to end. Derived from the
- *  user's own setting so there is no second magic number to discover. */
-const CPU_VETO_MAX_MULTIPLE = 3;
-
-/** Cumulative CPU seconds PER PID for rootPid's whole descendant tree.
+/* The CPU-progress probe that used to live here is GONE, deliberately.
  *
- *  Per-pid, not one summed total, and that is the entire point. A summed tree CPU
- *  is NON-MONOTONIC — when a child exits its accrued time leaves the sum, so the
- *  total DROPS (measured: 3.02 -> 5.72 -> 3.25) and a busy turn reads as an idle
- *  one. Keeping pids separate lets the caller add up only POSITIVE per-pid deltas,
- *  where an exiting child merely drops out of the intersection.
+ * It sampled the executor's process tree and postponed an interrupt while that tree was
+ * burning CPU, on the rule "do not kill a process that is actively computing". It was
+ * measured carefully, and it still could not answer the question that matters: CPU use
+ * proves only that a process is NOT BLOCKED. A spin-wait or a livelock pegs a core
+ * forever, and a turn waiting on remote inference burns none at all -- so the signal was
+ * uninformative in BOTH directions. It also cost a 5s sample plus a full process sweep
+ * (`ps -Ao` / one CIM query) per decision, and it made the timeout non-deterministic:
+ * the same silence could be cut at 3 minutes or at 9, depending on unrelated activity.
  *
- *  An empty map means "could not tell", never "idle": the only consumer uses this
- *  to VETO an interrupt, so absent evidence changes nothing. */
-async function sampleTreeCpu(rootPid: number | undefined): Promise<Map<number, number>> {
-  const perPid = new Map<number, number>();
-  if (!rootPid) return perPid;
-  const { execFile } = require('child_process');
-  const { promisify } = require('util');
-  const run = promisify(execFile);
-  const rows: { pid: number; ppid: number; cpu: number }[] = [];
-  try {
-    if (process.platform === 'win32') {
-      // ONE CIM query carries parentage AND cpu (100-ns units), so there is no
-      // second query to join against. ~0.5s, and only ever run on demand.
-      const { stdout } = await run('powershell.exe', [
-        '-NoProfile', '-NonInteractive', '-Command',
-        "Get-CimInstance Win32_Process | ForEach-Object { '{0} {1} {2}' -f $_.ProcessId,$_.ParentProcessId,($_.KernelModeTime + $_.UserModeTime) }",
-      ], { timeout: 15000, maxBuffer: 8 * 1024 * 1024, windowsHide: true });
-      for (const line of String(stdout).split('\n')) {
-        const f = line.trim().split(/\s+/);
-        if (f.length < 3) continue;
-        const pid = Number(f[0]), ppid = Number(f[1]), ticks = Number(f[2]);
-        if (!Number.isFinite(pid) || !Number.isFinite(ppid) || !Number.isFinite(ticks)) continue;
-        rows.push({ pid, ppid, cpu: ticks / 1e7 });
-      }
-    } else {
-      const { stdout } = await run('ps', ['-Ao', 'pid=,ppid=,time='], { timeout: 15000, maxBuffer: 8 * 1024 * 1024 });
-      for (const line of String(stdout).split('\n')) {
-        const f = line.trim().split(/\s+/);
-        if (f.length < 3) continue;
-        const pid = Number(f[0]), ppid = Number(f[1]);
-        // [dd-]hh:mm:ss — 1s granularity, which is why the window is 5s and not 2s.
-        const parts = f[2].split('-');
-        const clock = (parts.pop() || '').split(':').map(Number);
-        let secs = 0;
-        for (const c of clock) secs = secs * 60 + (Number.isFinite(c) ? c : 0);
-        if (parts.length) secs += Number(parts[0]) * 86400;
-        if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
-        rows.push({ pid, ppid, cpu: secs });
-      }
-    }
-  } catch {
-    return perPid;   // could not tell
-  }
-  const children = new Map<number, number[]>();
-  for (const r of rows) {
-    const list = children.get(r.ppid);
-    if (list) list.push(r.pid); else children.set(r.ppid, [r.pid]);
-  }
-  const cpuOf = new Map(rows.map((r) => [r.pid, r.cpu]));
-  const queue = [rootPid];
-  while (queue.length) {
-    const pid = queue.pop()!;
-    if (perPid.has(pid)) continue;   // cycle guard
-    const cpu = cpuOf.get(pid);
-    if (cpu === undefined) continue;
-    perPid.set(pid, cpu);
-    for (const child of children.get(pid) || []) queue.push(child);
-  }
-  return perPid;
-}
-
-/** Is rootPid's process tree DOING something right now? Two samples one window apart.
- *
- *  Strictly ONE-DIRECTIONAL. `true` means "provably alive, do not interrupt".
- *  `false` means "no evidence either way" and must never be read as "dead" — that
- *  inversion is exactly the mistake that made three earlier CPU-based designs fail,
- *  because a turn doing REMOTE inference burns no local CPU at all.
- *
- *  ACCRUED CPU IS THE ONLY VERDICT. New pids in the tree are counted and logged but
- *  deliberately do NOT vote: there is no evidence they indicate progress, while a
- *  backend that respawned a helper on a timer would veto forever and hand back the
- *  unbounded hang. An unproven signal does not get to disable the timeout. */
-async function treeIsWorking(rootPid: number | undefined): Promise<{ working: boolean; cpuSeconds: number; newPids: number }> {
-  const before = await sampleTreeCpu(rootPid);
-  if (before.size === 0) return { working: false, cpuSeconds: 0, newPids: 0 };
-  await new Promise((r) => setTimeout(r, CPU_PROBE_WINDOW_MS));
-  const after = await sampleTreeCpu(rootPid);
-  let cpuSeconds = 0;
-  let newPids = 0;
-  for (const [pid, cpu] of after) {
-    const prior = before.get(pid);
-    if (prior === undefined) { newPids++; continue; }   // logged only, does not vote
-    if (cpu > prior) cpuSeconds += cpu - prior;
-  }
-  return { working: cpuSeconds >= CPU_PROBE_MIN_SECONDS, cpuSeconds, newPids };
-}
+ * The two bounds are now the whole policy: silence past WEDGE_CONFIRM_MS, or an open tool
+ * call that has stopped reporting for longer than TOOL_STALL_MS. Both are user-visible
+ * settings, and both are deterministic. If a long, genuinely-working command is ever cut
+ * short, the fix is to raise 「工具无进度多久判定卡死」 -- not to infer intent from CPU counters.
+ */
 
 /** USER-SELECTABLE FEATURES.
  *
@@ -1505,10 +1683,13 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   /** Re-render history.md at every turn end so the path handed to the backend
    *  never points at a frozen snapshot. Off = only written when a rebuild runs. */
   historyFileRefresh: true,
-  /** Inject the memory block (preferences/projects/history) into the first prompt. */
+  /** Inject the layered memory block (global ⊕ project ⊕ this chat) into EVERY turn.
+   *  Off = the model never sees the memory files at all. ~1.3k chars per turn. */
   memoryInjection: true,
   /** Generate chat titles with the helper model. */
   smartTitle: true,
+  /** 会话记忆自动维护：一轮结束、攒够新消息就压一次（`sessionMemory.ts`） */
+  sessionMemory: true,
   /** Store a large paste on disk and show a placeholder in the composer. */
   pasteFolding: true,
   /** Draggable dividers between split panes. */
@@ -1656,6 +1837,19 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           // it leaves no trace at all, which is the gap this logging exists to close.
           const took = wasOpen ? ` after=${((Date.now() - wasOpen.startedAt) / 1000).toFixed(1)}s` : '';
           logger.info('tool', `${status} sessionId=${sessionId} id=${toolCallId.slice(-8)}${took} ${label}`);
+          // Same boundaries into the run event log, with the duration attached: a
+          // StoredToolCall has no timestamp at all, so this is the only place a tool
+          // span survives the process.
+          eventLog.appendEvent(sessionId, {
+            ts: Date.now(),
+            type: 'tool_end',
+            turn: entry.currentUserMessageId,
+            toolCallId,
+            title: label,
+            kind: next.kind,
+            status,
+            ms: wasOpen ? Date.now() - wasOpen.startedAt : 0,
+          });
           open.delete(toolCallId);
         } else if (wasOpen) {
           wasOpen.lastUpdate = Date.now();
@@ -1663,6 +1857,14 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           const now = Date.now();
           open.set(toolCallId, { startedAt: now, lastUpdate: now });
           logger.info('tool', `start sessionId=${sessionId} id=${toolCallId.slice(-8)} kind=${next.kind || '-'} ${label}`);
+          eventLog.appendEvent(sessionId, {
+            ts: now,
+            type: 'tool_start',
+            turn: entry.currentUserMessageId,
+            toolCallId,
+            title: label,
+            kind: next.kind,
+          });
         }
         // Record a call when it touched files OR when it RAN something.
         //
@@ -1686,7 +1888,53 @@ function wireSession(sessionId: string, entry: SessionEntry) {
         }
       }
     } catch {}
-    mainWindow?.webContents.send('acp:update', { ...data, sessionId });
+    // WAITING FOR A HUMAN starts here. This is the single most valuable event in the
+    // log: an unanswered permission prompt is the usual reason a turn took 20 minutes,
+    // and it was previously persisted NOWHERE -- after a restart the wait was simply
+    // invisible, so a slow turn and a turn waiting on you looked identical.
+    // (`data.update`, not the `u` above: that one is scoped to the try block.)
+    const pending = data?.update;
+    if (pending?.sessionUpdate === 'permission_request') {
+      const requestKey = String(pending?.requestId ?? '');
+      if (requestKey) permissionWaitStartedAt.set(requestKey, Date.now());
+      eventLog.appendEvent(sessionId, {
+        ts: Date.now(),
+        type: 'permission_request',
+        turn: entry.currentUserMessageId,
+        title: String(pending?.toolCall?.title || pending?.title || pending?.toolName || '需要批准的工具调用').slice(0, 120),
+        detail: requestKey,
+      });
+      logger.info('permission', `asked sessionId=${sessionId} id=${requestKey}`);
+    }
+    /**
+     * NATIVE SUBAGENTS — the roster, and WHOSE session each update really came from.
+     *
+     * Two facts measured with `scripts/acp-probe.mjs` meet here:
+     *
+     *   ① `_kiro.dev/subagent/list_update` is a full roster (name, worker agent, task, status) and it
+     *      repeats until everything reads `terminated`. That is exactly the tag 「如果有subagent在运行
+     *      左侧的会话上也应该有一个tag，直到subagent被关掉」 needs, so it is kept and broadcast rather
+     *      than dropped into the generic `_kiro_internal` channel nothing consumes.
+     *
+     *   ② Most of a delegating turn's notifications DO NOT come from this chat's backend session: each
+     *      subagent has its own ACP session id, and its tool calls and permission requests arrive under
+     *      that id. The line below has to relabel them with the KiroLex id (that is what routes them to
+     *      the right chat), but relabelling used to DESTROY the distinction — a subagent's output became
+     *      indistinguishable from the parent's. `childSessionId` preserves it: present means "a subagent
+     *      did this", and it is the child's real, addressable ACP session.
+     */
+    if (isSubagentListUpdate(data?.update?.method)) {
+      const roster = parseSubagentList(data.update);
+      entry.subagents = mergeSubagentList(entry.subagents, roster);
+      const live = activeSubagents(entry.subagents);
+      logger.info('subagent', `sessionId=${sessionId} roster=${roster.length} 运行中=${live.length}`);
+      mainWindow?.webContents.send('acp:subagents', { sessionId, subagents: entry.subagents });
+    }
+    const originAcpSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
+    const childSessionId = originAcpSessionId && entry.cliSessionId && originAcpSessionId !== entry.cliSessionId
+      ? originAcpSessionId
+      : undefined;
+    mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
   client.on('error', (error: any) => {
     logger.warn('session', `error event sessionId=${sessionId}`, error?.message || error);
@@ -1766,15 +2014,39 @@ function detachExecutor(sessionId: string) {
  *  If every live executor is busy (all mid-turn), we cannot evict and the caller
  *  falls back to rejecting, so a streaming turn is never killed. */
 function ensureExecutorCapacity(excludeId?: string): boolean {
+  /**
+   * 回收谁 —— 先按「回收它的代价」分层,同层内才比最近使用时间。
+   *
+   * 「我要求这个窗口和功能修改不影响其他会话的进行」:正在跑的回合本来就不会被回收(下面 `e.busy` 那一跳),
+   * 可**空闲**会话被回收之后并不是没事 —— 它再连上时后端已经没有这段历史了,于是欠一次重建,变成占用状态,
+   * 它自己排着的消息也要等在重建后面。也就是说 flow 起几个会话,可能让你另一条对话「突然要重建」。
+   *
+   * 所以代价排序:
+   *   0  没有 transcript —— 什么都不欠,回收它等于免费
+   *   1  ride-along —— 上下文搭在下一条消息上,不需要单独一轮
+   *   2  primeMode: 'full' —— 真的要一轮一轮重放,最贵,最后才动
+   * 这不改变「不杀正在跑的」这条硬规则,只是在能选的人里选伤害最小的那个。
+   */
+  const evictionCost = (id: string): number => {
+    try {
+      if (store.transcriptFileSize(id) <= 0) return 0;
+      return store.readRecord(id)?.primeMode === 'full' ? 2 : 1;
+    } catch { return 1; }
+  };
   while (sessionClients.size >= MAX_CONCURRENT_SESSIONS) {
     let victim: string | null = null;
-    let oldest = Infinity;
+    let best: { cost: number; used: number } | null = null;
     for (const [id, e] of sessionClients) {
       if (id === excludeId || e.busy) continue;
-      const t = e.lastUsedAt ?? 0;
-      if (t < oldest) { oldest = t; victim = id; }
+      const candidate = { cost: evictionCost(id), used: e.lastUsedAt ?? 0 };
+      if (!best || candidate.cost < best.cost || (candidate.cost === best.cost && candidate.used < best.used)) {
+        best = candidate;
+        victim = id;
+      }
     }
     if (!victim) return false; // all remaining executors are busy — cannot evict
+    // 记下代价:一条对话「为什么突然要重建」必须查得出来
+    logger.info('executor', `evicting ${victim} for ${excludeId || 'a new session'} (cost=${best?.cost}, idle since ${best?.used})`);
     detachExecutor(victim);
   }
   return true;
@@ -1952,6 +2224,14 @@ function runCli(command: string, timeoutMs: number): Promise<string> {
  *  @param argsLine Everything after the executable, e.g. `chat --list-models --format json`.
  *  @param timeoutMs Hard wall-clock budget, forwarded to runCli.
  */
+/**
+ * SINGLE-FLIGHT 槽位：这两条命令在渲染进程挂载时会被并发发起两次，而每次 spawn 都要付 kiro-cli
+ * 完整启动开销（含加载全部 MCP server）—— 两个一起启就双双超时。实测裸跑 2.6–3.7 秒，应用里却在
+ * 10s/15s 被 kill 了 13 次。合并成一次调用是治因，不是调参。
+ */
+let listModelsInFlight: Promise<any> | null = null;
+let listAgentsInFlight: Promise<string> | null = null;
+
 function runKiroCli(argsLine: string, timeoutMs: number): Promise<string> {
   const bin = resolveKiroCli();
   return runCli(`${bin ? `"${bin}"` : 'kiro-cli'} ${argsLine}`, timeoutMs);
@@ -2210,6 +2490,9 @@ app.whenReady().then(async () => {
   // Immediately after the migration, so a key the sweep might have re-imported is
   // gone before the renderer ever receives its snapshot.
   try { pruneDeadUiStateKeys(); } catch {}
+  // A fresh process means a fresh composer: drafts are kept on disk so they survive a
+  // renderer reload mid-run, and dropped here so they never survive a restart.
+  try { clearRunScopedUiState(); } catch {}
   startupMark('ui-state migration done');
   // Age out trashed chats (30 days). Deliberately after the migration and before
   // anything else touches the sessions tree.
@@ -2305,7 +2588,11 @@ app.whenReady().then(async () => {
         }
       }
       // An unsent draft's blobs are referenced too — deleting them would leave the
-      // composer holding a placeholder that can never expand again.
+      // composer holding a placeholder that can never expand again. Only THIS run's
+      // drafts can matter: composer text is no longer restored across a restart, so
+      // yesterday's entries reference blobs no composer will ever ask for again. They
+      // are cleared below, after the GC has had its look, and the 24h grace above
+      // still protects anything pasted recently.
       for (const blocks of Object.values(loadDraftPastes())) {
         for (const b of (blocks || [])) if (b?.path) referenced.add(path.resolve(b.path));
       }
@@ -2325,6 +2612,18 @@ app.whenReady().then(async () => {
       logger.info('pastes', `GC kept ${kept} referenced/recent blob(s), removed ${removed} orphan(s)`);
     }
   } catch {}
+
+  // Start with no draft paste references. Composer text does not survive a restart any
+  // more, so every entry here belongs to a draft that no longer exists; keeping them
+  // would pin their blobs against the GC forever. The renderer re-registers a session's
+  // blocks as soon as something is pasted in this run.
+  try {
+    const stale = Object.keys(loadDraftPastes()).length;
+    if (stale) {
+      saveDraftPastes({});
+      logger.info('pastes', `dropped draft paste refs for ${stale} chat(s): drafts do not survive a restart`);
+    }
+  } catch { /* best-effort */ }
 
   createTray();
   createSplashWindow();
@@ -2408,7 +2707,7 @@ app.whenReady().then(async () => {
     const client = started.client;
     profile.model = started.model;
     const { sessionId: cliSessionId } = await client.newSession(cliCwd);
-    const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], memoryInjected: false, lastUsedAt: Date.now() };
+    const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now() };
     sessionClients.set(kiroLexId, entry);
     wireSession(kiroLexId, entry);
     // Durable record (design §4), keyed by the KiroLex id; store the cli mapping.
@@ -2421,6 +2720,20 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('acp:prompt', async (_event, sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }) => {
+    /**
+     * 已经删掉的会话不许再发东西进去 —— 否则那一发**会把它复活**。
+     *
+     * `acp:prompt` 一路会走到 `store.appendMessage`，而写 transcript 会把目录重新建出来（记录本来就是
+     * 「第一次 prompt 创建」的）。attach 那两处早就有这道守卫（『Session was deleted; not re-attaching.』），
+     * 唯独发送这条路没有。
+     *
+     * 实测的样子：flow 重置一步 → 那条 worker 被回收进回收站 → **7 秒后**它那一发在途的 prompt 到了 →
+     * 目录重新出现，成了一条没有任何节点引用的孤儿 worker。这就是「很多没用的子会话还在那」的来源之一。
+     */
+    if (deletedSessionIds.has(sessionId)) {
+      logger.warn('prompt', `refused: sessionId=${sessionId} was deleted —— 不再复活它`);
+      throw new Error('这个会话已经被删除了，不再向它发送。');
+    }
     try {
       return await sendPromptOnce(sessionId, prompt, projectId, display, model);
     } catch (err) {
@@ -2468,9 +2781,16 @@ app.whenReady().then(async () => {
         ? { ...block, text: capImageRefsInText(block.text) }
         : block
     ));
-    if (reconfiguringSessions.has(sessionId)) {
-      throw new Error('Wait for the model, Agent, or permission change to finish before sending a message.');
-    }
+    // A model/Agent switch is replacing this session's executor. WAIT for it
+    // rather than rejecting the message: the renderer queues on the pushed
+    // 'reconfiguring' state, but that state travels over IPC, so a send fired in
+    // the same instant as the switch would otherwise be answered with an error on
+    // the user's own message. `entry` is re-read afterwards because the switch
+    // installs a NEW executor for the same session.
+    await awaitReconfigureIdle(sessionId);
+    const afterSwitch = sessionClients.get(sessionId);
+    if (!afterSwitch) throw new Error('Session not connected');
+    entry = afterSwitch;
     // The backend was rebuilt from scratch (resume failed) and its context has NOT
     // been restored yet -> WAIT for the rebuild, then send. Sending now would hand
     // the model an empty conversation, which looked like "Kiro forgot everything it
@@ -2599,6 +2919,52 @@ app.whenReady().then(async () => {
           : {}),
       });
     } catch {}
+    // Inject layered memory (global ⊕ project ⊕ this chat) on EVERY turn.
+    //
+    // It used to go out only when the block's CONTENT changed, which is right for
+    // "background facts" and wrong for the rules people actually put in there. A rule
+    // like 「每次回复的结尾都必须打印本轮最终生成物的完整路径」 has to hold for every
+    // reply, but it was stated once and then never again: measured on one chat, a single
+    // injection at 17:07 followed by 7 turns that carried nothing, at 66.5% context. The
+    // block is also deliberately kept OUT of the transcript and history.md, so nothing
+    // restates it after a compaction either -- once it falls out of the live context it
+    // is simply gone, invisibly.
+    //
+    // Cost is small and bounded: this block is ~1.3k chars (~300 tokens) per turn.
+    // Rebuilt from disk each time, so an edit takes effect on the next message.
+    //
+    // Prepended BEFORE the ride-along snapshot below, which means it ends up AFTER it in
+    // the final array -- i.e. as close to the user's own text as possible. A standing
+    // instruction buried in front of a 19k-char history dump is the position least likely
+    // to be honoured.
+    try {
+      const block = isFeatureEnabled('memoryInjection')
+        ? buildMemoryInjection(effectiveProjectId, sessionId)
+        : '';
+      if (block) {
+        prompt = [{ type: 'text', text: block }, ...prompt];
+        const rec = store.readRecord(sessionId);
+        if (rec) { rec.lastMemoryInjection = { charCount: block.length, at: Date.now() }; store.writeRecord(rec); }
+        // Logged per turn on purpose: without it "was the memory actually delivered?"
+        // could only be answered by reading record.json, and only for the LAST turn.
+        logger.info('memory', `injected sessionId=${sessionId} chars=${block.length} project=${effectiveProjectId || '(none)'}`);
+      }
+    } catch {}
+    /**
+     * 顺路播报三层各自的体积 —— 这是横幅「压缩完自己消失」的依据。
+     *
+     * 放在这里而不是单独轮询：这一轮刚刚把这些文件读过一遍，`statSync` 拿个 size 几乎零成本，
+     * 而且时机天然正确 —— 压缩那一轮结束后的下一轮就会带上新的数字。
+     *
+     * 刻意**不**放在上面那个 try 里：那一块被 `memoryInjection` feature flag 门控，寄生进去
+     * 会让关掉 flag 静默杀死横幅，而且没有任何报错。
+     */
+    try {
+      const bytes = memoryLayerBytes(effectiveProjectId, sessionId);
+      mainWindow?.webContents.send('acp:memory-bytes', {
+        sessionId, projectId: effectiveProjectId || null, ...bytes,
+      });
+    } catch {}
     // DEFERRED PREPEND. The snapshot joins the request only now, AFTER the user
     // message is on disk, for the same reason the memory block does: `promptText`
     // above is derived from `prompt`, so a block prepended earlier is inside the
@@ -2614,24 +2980,6 @@ app.whenReady().then(async () => {
     // old inline path prepended the ENTIRE transcript onto the user's own prompt
     // in one shot -- for a large chat that is 100k+ chars, which either failed or
     // was immediately compacted away.
-    // Inject layered memory (global ⊕ project) on the first prompt AND whenever
-    // the memory CONTENT changes (project switch, or another chat wrote to the
-    // shared file). Rebuilt from disk each prompt; only re-injected when it
-    // differs from the last injection. AFTER persisting the user message so
-    // memory never lands in the transcript.
-    try {
-      const block = isFeatureEnabled('memoryInjection')
-        ? buildMemoryInjection(effectiveProjectId, sessionId)
-        : '';
-      if (block && block !== entry.lastInjectedMemory) {
-        prompt = [{ type: 'text', text: block }, ...prompt];
-        entry.lastInjectedMemory = block;
-        entry.memoryInjected = true;
-        entry.injectedProjectId = effectiveProjectId;
-        const rec = store.readRecord(sessionId);
-        if (rec) { rec.lastMemoryInjection = { charCount: block.length, at: Date.now() }; store.writeRecord(rec); }
-      }
-    } catch {}
     // Archive the context snapshot at the moment it goes out. Without this it existed
     // only on the wire — the log kept a char count and nothing else, so "what
     // background was this session given?" was unanswerable, and unrecoverable once the
@@ -2675,12 +3023,6 @@ app.whenReady().then(async () => {
           let noticeSent = false;
           let interrupting = false;
           let wedgeHandled = false;
-          let probing = false;        // a CPU probe from an earlier tick is in flight
-          let vetoLogged = false;     // one CPU-VETO log line per turn, not per tick
-          let cpuBusy = false;        // last probe found the tree computing, not blocked
-          let cpuVetoLeftMs = 0;      // postponement still available (0 = none)
-          let firstVetoAt = 0;        // when CPU progress first bought this turn time
-          let vetoExhausted = false;  // computing, but the postponement budget ran out
           const watchdog = setInterval(() => {
             const e = sessionClients.get(sessionId);
             if (!e || e !== entry) return;
@@ -2690,6 +3032,11 @@ app.whenReady().then(async () => {
               ? Math.max(...Array.from(e.openToolCalls.values(), (v) => v.lastUpdate))
               : -1;
             const toolIdleFor = freshestToolUpdate >= 0 ? Date.now() - freshestToolUpdate : -1;
+            // The interrupt needs BOTH bounds passed (see the two `return`s below), so
+            // the time left is the LATER of the two -- computed once here because the
+            // notice below has to name which one it came from.
+            const quietLeftMs = WEDGE_CONFIRM_MS - quietFor;
+            const toolLeftMs = toolIdleFor >= 0 ? TOOL_STALL_MS - toolIdleFor : 0;
             if (quietFor > QUIET_NOTICE_MS) {
               // Name the open tool and its idle time: "still running" alone gave no way
               // to tell a working command from one whose completion was never reported.
@@ -2709,25 +3056,27 @@ app.whenReady().then(async () => {
                 quietSeconds: Math.round(quietFor / 1000),
                 openTools: toolIdleFor >= 0 ? e.openToolCalls!.size : 0,
                 toolIdleSeconds: toolIdleFor >= 0 ? Math.round(toolIdleFor / 1000) : 0,
-                // From the CPU probe of the previous tick: lets the UI explain why a
-                // half-hour-silent turn is being left alone, and for how much longer.
-                cpuBusy,
-                cpuVetoLeftSeconds: cpuBusy ? Math.round(cpuVetoLeftMs / 1000) : 0,
                 // null = the interrupt is switched off in Settings, so nothing is
                 // counting down and the UI must not imply otherwise.
                 interruptInSeconds: WEDGE_CONFIRM_MS
-                  ? Math.max(
-                      0,
-                      Math.round(Math.max(
-                        WEDGE_CONFIRM_MS - quietFor,
-                        toolIdleFor >= 0 ? TOOL_STALL_MS - toolIdleFor : 0,
-                      ) / 1000),
-                    )
+                  ? Math.max(0, Math.round(Math.max(quietLeftMs, toolLeftMs) / 1000))
                   : null,
+                // WHICH of the two thresholds the countdown comes from, and its value.
+                //
+                // Without this the UI could only show the remaining time, and the number
+                // looked like a contradiction: with a tool open the countdown is derived
+                // from TOOL_STALL_MS (30 min by default), while Settings prominently
+                // shows the silence threshold (10 min) -- so a notice saying "23 more
+                // minutes" appeared to disagree with the 600 on screen. Both were right;
+                // the interrupt needs BOTH bounds passed, so the later one governs.
+                boundBy: toolLeftMs > quietLeftMs ? 'tool' : 'quiet',
+                boundSeconds: Math.round(
+                  (toolLeftMs > quietLeftMs ? TOOL_STALL_MS : WEDGE_CONFIRM_MS) / 1000,
+                ),
               });
             }
 
-            if (wedgeHandled || interrupting || probing) return;
+            if (wedgeHandled || interrupting) return;
             if (!WEDGE_CONFIRM_MS) return;   // interrupt disabled in Settings
             // PROTOCOL TRUTH, and the only hard fact available: a tool the backend has
             // not closed means the turn is legitimately busy. Long commands (builds,
@@ -2740,103 +3089,34 @@ app.whenReady().then(async () => {
             if (toolIdleFor >= 0 && toolIdleFor < TOOL_STALL_MS) return;
             if (quietFor <= WEDGE_CONFIRM_MS) return;
 
-            // LAST GATE, and it is a POLICY, not a diagnosis. Be precise about what the
-            // OS can actually tell us: accrued CPU proves the tree is NOT BLOCKED. It
-            // does not prove progress — a spin-wait or a livelock burns a whole core
-            // forever, so "computing" and "hung" are not mutually exclusive. What this
-            // buys is the narrower, still worthwhile rule "do not kill a process that is
-            // actively computing", which is what went wrong once: a call 30 minutes
-            // without a protocol update was PowerShell 5.1 parsing a 7.6MB JSON at ~100%
-            // of a core, and it got killed.
-            //
-            // Used in ONE direction only. `working` postpones; NOT working proves nothing
-            // and changes nothing, because a turn awaiting remote inference burns no local
-            // CPU at all — that inversion is what sank three earlier CPU-based designs.
-            //
-            // And BOUNDED, because a veto that can repeat forever is the unbounded hang
-            // this whole watchdog exists to stop, re-entering through a different door
-            // (the openToolCalls suppression made exactly this mistake: 5+ hours). CPU
-            // progress can only ever BUY TIME, never immunity.
-            // Cost is confined to this moment: nothing is sampled until an interrupt is
-            // otherwise due, and a veto is simply re-tested on the next tick.
-            probing = true;
+            // Both bounds have passed, so this turn is wedged. There is deliberately no
+            // third check: the CPU probe that used to postpone here was removed because
+            // it could not distinguish computing from spinning, and made the timeout
+            // non-deterministic. See the note where it used to be defined.
+            wedgeHandled = true;
+            interrupting = true;
+            const staleToolCount = toolIdleFor >= 0 ? e.openToolCalls!.size : 0;
+            const produced = !!(e.assistantBuf || e.fileChanges.length);
+            const quietSeconds = Math.round(quietFor / 1000);
+            const why = staleToolCount
+              ? `${staleToolCount} tool call(s) open but stale for ${Math.round(toolIdleFor / 1000)}s`
+              : 'no open tool call';
+            // Written into the turn's own message (see flushAssistant). Phrased as OUR
+            // timeout firing, not as a backend fault: a measured case had the tool
+            // genuinely still working, so blaming the backend would have been false.
+            const dur = (ms: number) => (ms < 90000 ? `${Math.round(ms / 1000)} 秒` : `${Math.round(ms / 60000)} 分钟`);
+            e.wedgeNote = staleToolCount
+              ? `⚠️ 这一轮被 KiroLex 按超时中断：静默 ${dur(quietFor)}，其中 ${staleToolCount} 个工具调用有 ${dur(toolIdleFor)}没有进度更新（上限 ${Math.round(TOOL_STALL_MS / 60000)} 分钟）。工具本身可能仍在后台继续跑。可在设置「工具无进度多久判定卡死」里调大。`
+              : `⚠️ 这一轮被 KiroLex 按超时中断：静默 ${dur(quietFor)}（上限 ${Math.round(WEDGE_CONFIRM_MS / 60000)} 分钟），没有工具在运行。可在设置「静默多久判定卡死」里调大。`;
+            logger.warn('prompt', `WEDGED sessionId=${sessionId} cli=${entry.cliSessionId} quiet=${quietSeconds}s produced=${produced} -- ${why}, interrupting`);
+            // `produced` is the whole payload the renderer acts on: it decides
+            // auto-resend vs. leaving the partial reply alone. The human-readable
+            // reason travels in wedgeNote instead, inside the turn's own message,
+            // because a floating banner outlives the turn it describes.
+            mainWindow?.webContents.send('acp:turn-wedged', { sessionId, produced });
+
+            // Only the teardown is async now that nothing is probed before deciding.
             void (async () => {
-              let probe = { working: false, cpuSeconds: 0, newPids: 0 };
-              try { probe = await treeIsWorking(entry.client.pid); }
-              catch { /* no evidence; fall through to the interrupt */ }
-              finally { probing = false; }
-
-              // The probe window is 5s of real time, so re-establish every fact.
-              const e2 = sessionClients.get(sessionId);
-              if (!e2 || e2 !== entry) return;
-              if (wedgeHandled || interrupting) return;
-              // MUST be checked because of the await above: the entry object outlives
-              // individual turns, so "same entry" does not mean "same turn". Without
-              // the turn tag a probe still in flight when the turn ended would cancel
-              // whatever ran next. (The synchronous version could not hit this.)
-              if (!e2.busy || e2.turnSeq !== myTurn) return;
-              const quietNow = Date.now() - (e2.lastStreamAt || Date.now());
-              if (quietNow <= WEDGE_CONFIRM_MS) return;   // output resumed mid-probe
-
-              const freshestNow = e2.openToolCalls?.size ? Math.max(...Array.from(e2.openToolCalls.values(), (v) => v.lastUpdate)) : -1;
-              const toolIdleNow = freshestNow >= 0 ? Date.now() - freshestNow : -1;
-              const staleToolCount = toolIdleNow >= 0 ? e2.openToolCalls!.size : 0;
-
-              // The veto's total budget, derived from whichever limit actually gated this
-              // decision, so it scales with the value the user tuned instead of being a
-              // second magic number to discover.
-              const gatingLimit = staleToolCount ? TOOL_STALL_MS : WEDGE_CONFIRM_MS;
-              const vetoBudget = gatingLimit * CPU_VETO_MAX_MULTIPLE;
-              if (probe.working) {
-                if (!firstVetoAt) firstVetoAt = Date.now();
-                const spent = Date.now() - firstVetoAt;
-                if (spent < vetoBudget) {
-                  cpuBusy = true;
-                  cpuVetoLeftMs = vetoBudget - spent;
-                  if (!vetoLogged) {
-                    vetoLogged = true;   // one line per turn, not one per tick
-                    logger.info('prompt', `CPU-VETO sessionId=${sessionId} cli=${e2.cliSessionId} quiet=${Math.round(quietNow / 1000)}s -- tree burned ${probe.cpuSeconds.toFixed(2)}s CPU (+${probe.newPids} new pid(s)) in ${CPU_PROBE_WINDOW_MS / 1000}s: not blocked, postponing up to ${Math.round(vetoBudget / 1000)}s`);
-                  }
-                  return;   // re-tested on the next tick
-                }
-                // Budget spent and STILL burning CPU. This is the spin-wait shape, so the
-                // interrupt goes ahead: computing forever is a hang too.
-                vetoExhausted = true;
-                logger.warn('prompt', `CPU-VETO EXHAUSTED sessionId=${sessionId} cli=${e2.cliSessionId} -- ${Math.round(spent / 1000)}s of postponement used up while still burning CPU (${probe.cpuSeconds.toFixed(2)}s/${CPU_PROBE_WINDOW_MS / 1000}s), interrupting anyway`);
-              }
-              cpuBusy = false;
-              cpuVetoLeftMs = 0;
-
-              wedgeHandled = true;
-              interrupting = true;
-              const produced = !!(e2.assistantBuf || e2.fileChanges.length);
-              const quietSeconds = Math.round(quietNow / 1000);
-              const cpuVerdict = vetoExhausted
-                ? 'still burning CPU but postponement budget spent'
-                : 'no CPU progress';
-              const why = staleToolCount
-                ? `${staleToolCount} tool call(s) open but stale for ${Math.round(toolIdleNow / 1000)}s, ${cpuVerdict}`
-                : `no open tool call, ${cpuVerdict}`;
-              // Written into the turn's own message (see flushAssistant). Phrased as OUR
-              // timeout firing, not as a backend fault: a measured case had the tool
-              // genuinely still working (PowerShell 5.1 parsing a 7.6MB JSON at ~100% of
-              // a core), so blaming the backend would have been false.
-              const dur = (ms: number) => (ms < 90000 ? `${Math.round(ms / 1000)} 秒` : `${Math.round(ms / 60000)} 分钟`);
-              // The two endings differ in what the user should DO about it, so they must
-              // not read the same: "nothing was running" vs "it never stopped computing".
-              const cpuTail = vetoExhausted
-                ? `进程树一直在占用 CPU，已经因此多等了 ${dur(vetoBudget)}，但仍然没有任何输出 —— 空转的死循环同样是挂死，所以还是中断了。`
-                : '中断前复查确认进程树没有在占用 CPU。';
-              e2.wedgeNote = staleToolCount
-                ? `⚠️ 这一轮被 KiroLex 按超时中断：静默 ${dur(quietNow)}，其中 ${staleToolCount} 个工具调用有 ${dur(toolIdleNow)}没有进度更新。${cpuTail}这不是模型或后端报的错 —— 工具本身可能仍在后台继续跑。上限可在设置「工具无进度上限」里调整。`
-                : `⚠️ 这一轮被 KiroLex 按超时中断：静默 ${dur(quietNow)}，没有工具在运行。${cpuTail}阈值可在设置「无响应中断阈值」里调整。`;
-              logger.warn('prompt', `WEDGED sessionId=${sessionId} cli=${entry.cliSessionId} quiet=${quietSeconds}s produced=${produced} -- ${why}, interrupting`);
-              // `produced` is the whole payload the renderer acts on: it decides
-              // auto-resend vs. leaving the partial reply alone. The human-readable
-              // reason travels in wedgeNote instead, inside the turn's own message,
-              // because a floating banner outlives the turn it describes.
-              mainWindow?.webContents.send('acp:turn-wedged', { sessionId, produced });
-
               // Polite first: a cancel notification lets kiro-cli end the turn and
               // report its own stopReason.
               try { await entry.client.cancelPrompt(entry.cliSessionId); } catch { /* pipe may be dead */ }
@@ -2854,6 +3134,22 @@ app.whenReady().then(async () => {
               }
             })();
           }, WATCHDOG_TICK_MS);
+          // RUN EVENT LOG (events.jsonl, see eventLog.ts). Written here rather than
+          // derived from the transcript because the transcript has one timestamp per
+          // MESSAGE: the moment a turn starts and the moment it ends are otherwise
+          // unrecoverable, and so is everything in between.
+          const turnKey = entry.currentUserMessageId || `turn_${Date.now()}`;
+          const turnStartedAt = Date.now();
+          eventLog.appendEvent(sessionId, {
+            ts: turnStartedAt,
+            type: 'prompt_start',
+            turn: turnKey,
+            model: entry.profile.model,
+            // What was actually SENT, memory block and ride-along snapshot included.
+            // The transcript stores only the user's own text, so this is the one
+            // record of how big the real request was.
+            chars: prompt.reduce((sum: number, block: any) => sum + (typeof block?.text === 'string' ? block.text.length : 0), 0),
+          });
           try {
             const result = await entry.client.sendPrompt(entry.cliSessionId, prompt);
             // Our OWN cancel ended this turn. kiro-cli does not always label it
@@ -2876,6 +3172,17 @@ app.whenReady().then(async () => {
             // refusal, ...) is exactly the "reply stopped mid-sentence with no
             // error" case -- it must not look like a normal completion.
             logger.info('prompt', `done sessionId=${sessionId} stopReason=${String(result?.stopReason ?? 'n/a')} produced=${producedOutput}`);
+            eventLog.appendEvent(sessionId, {
+              ts: Date.now(),
+              type: 'prompt_end',
+              turn: turnKey,
+              ms: Date.now() - turnStartedAt,
+              model: entry.profile.model,
+              stopReason: String(result?.stopReason ?? 'n/a'),
+              produced: producedOutput,
+            });
+            // 一轮结束就看看要不要压一次会话记忆 —— 不等它，也不让它影响这一轮的返回
+            void maybeConsolidateSessionMemory(sessionId);
             // Tag the result so the renderer can flag an abnormal end even when
             // kiro-cli reports no stopReason at all (silent empty turn).
             return { ...(result || {}), __kirolex: { produced: producedOutput } };
@@ -2896,8 +3203,23 @@ app.whenReady().then(async () => {
             // to a model swap and the resend succeeds, the success path above
             // re-marks against the new executor.
             if (rideAlong) clearContextEstablished(sessionId);
+            eventLog.appendEvent(sessionId, {
+              ts: Date.now(),
+              type: 'prompt_error',
+              turn: turnKey,
+              ms: Date.now() - turnStartedAt,
+              model: entry.profile.model,
+              detail: String(err?.message || err).slice(0, 300),
+            });
             if (isModelUnavailableError(text) && modelSwaps < MAX_MODEL_SWAPS) {
               modelSwaps++;
+              eventLog.appendEvent(sessionId, {
+                ts: Date.now(),
+                type: 'model_swap',
+                turn: turnKey,
+                model: entry.profile.model,
+                detail: `${entry.profile.model} 不可用，按回退链换模型重发`,
+              });
               const failedModel = entry.profile.model;
               // An unavailable model CONNECTS fine and only fails once a turn runs,
               // so swapSessionModel cannot tell a dead candidate from a live one. It
@@ -2928,6 +3250,41 @@ app.whenReady().then(async () => {
         const e = sessionClients.get(sessionId);
         if (e && e.turnSeq === myTurn) { e.busy = false; e.lastUsedAt = Date.now(); }
         emitSessionBusy(sessionId);
+        /**
+         * 一轮对话结束 —— 如果这条会话正在替某个 flow 节点干活，**在这里**把账记上。
+         *
+         * ## 为什么记账必须在主进程
+         *
+         * 原来这件事只发生在渲染层（那条驱动链已随 flow 移出这一版）。
+         * 那个回调活在窗口的 JS 堆里，窗口一刷新（`Cmd+R`、dev-hot、崩一次）它就没了 —— 而**回复是主进程
+         * 写进 transcript 的**，于是答案在磁盘上、账没记、节点永远停在 `running`。实测丢过一次 35 418 字
+         * 的日历数据（靠 A 那套对账捞回来的）。
+         *
+         * 这一段就是本文件 3560 行那条注释说的原则的落地：「一件必须活过窗口的事，不能写在会跟窗口一起
+         * 死的那一侧」；`acp:prompt` 本来就 owns turn completion。
+         *
+         * ## 为什么不需要新的登记表
+         *
+         * 「这条会话正在替哪个节点干活」磁盘上已经写着了：那个节点是 `running`、`sessionId` 是它、还存了
+         * 实际发出去的 `prompt`。所以直接复用 `reconcileRun` —— 它按 `prompt` 在 transcript 里认领回复
+         * （会话是复用的，只看"最后一条"会认错人）。同一个函数管三件事：这里、打开 run、启动。
+         *
+         * ## 位置的三个讲究
+         *
+         *   1. 在 `busy = false` **之后**：对账见到 busy 会让路（那是 A 的分界：不抢正在飞的那一轮）。
+         *   2. 成功路径上 `flushAssistant`（3272）已经把回复落盘了，所以认领得到。
+         *   3. 出错路径的 `flushAssistant`（3367）在这个 `finally` **之后**才跑，所以这里会判 `failed` ——
+         *      这是对的：一段半截的输出不该被当成这一步的产出。判完就不是 `running` 了，后面那次落盘也
+         *      不会让它被提拔成 `done`。而**出错原本是完全没人管的**：`.then` 不会在 reject 时执行，
+         *      所以以前一次失败的发送同样把节点永久留在 `running` 上。
+         *
+         * 整段包在 try 里：记账再重要也不能让一轮正常的对话失败。
+         */
+        try {
+          const rec = store.readRecord(sessionId) as any;
+        } catch (err: any) {
+          logger.warn('run', `post-turn reconcile skipped for ${sessionId}: ${err?.message || err}`);
+        }
       }
     } catch (err: any) {
       flushAssistant(sessionId); // persist whatever completed before the error
@@ -2969,6 +3326,33 @@ app.whenReady().then(async () => {
       throw err;
     }
   }
+
+  /**
+   * WHAT IS THIS SESSION DOING RIGHT NOW, and what has it produced so far.
+   *
+   * Exists so an interrupted-looking chat can be RECOVERED BY ADOPTION rather than by resending.
+   * A window reload does not stop a turn: this process holds the ACP connection, keeps filling
+   * `assistantBuf`, and flushes the complete text when the turn ends. The renderer had no way to
+   * learn that, so it resent the question and paid for the same answer twice.
+   *
+   * Live state only -- `sessionClients`, never the transcript on disk. A completed turn is
+   * already IN the transcript; the whole point here is the part that is not.
+   */
+  ipcMain.handle('acp:peek-turn', (_event, sessionId: string) => {
+    const entry = sessionId ? sessionClients.get(sessionId) : undefined;
+    // `priming` is a turn KIROLEX issued (a history rebuild), and its output is suppressed
+    // everywhere -- not forwarded, not accumulated, not persisted. Reporting it as live would
+    // be the one way that internal reply could still reach the user's chat.
+    if (!entry || !entry.busy || entry.priming) {
+      return { live: false, messageId: null, text: '', startedAt: null };
+    }
+    return {
+      live: true,
+      messageId: entry.assistantMsgId,
+      text: entry.assistantBuf || '',
+      startedAt: entry.lastUsedAt ?? null,
+    };
+  });
 
   ipcMain.handle('acp:cancel', async (
     _event,
@@ -3098,7 +3482,452 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle('acp:delete-session', async (_event, sessionId: string) => {
+  /** Persist a note the RENDERER produced, as an assistant message.
+   *
+   *  Same reason `acp:persist-steer` exists: a message created in the renderer
+   *  reaches `setMessages` and the in-memory cache but NOT the durable transcript,
+   *  so it dies with the window. The loop's terminal reason is precisely the fact
+   *  that must outlive the run — "why did this loop stop" is unanswerable after a
+   *  restart otherwise, which is the defect this whole feature set is about.
+   *
+   *  Deliberately narrow: assistant role, one short text, no tool calls, and only
+   *  for a session that already exists on disk. It is NOT a general-purpose writer
+   *  for model output — that path stays with `acp:prompt`, which owns turn
+   *  completion and the asymmetric-durability rule. */
+  ipcMain.handle('acp:persist-note', async (_event, sessionId: string, text: string) => {
+    if (!sessionId || !text || !text.trim()) return { ok: false, error: 'no text' };
+    if (!store.readRecord(sessionId)) return { ok: false, error: 'unknown session' };
+    const content = text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
+    try {
+      store.appendMessage(sessionId, {
+        id: `note_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        role: 'assistant',
+        content,
+        ts: Date.now(),
+      });
+      logger.info('loop', `note persisted sessionId=${sessionId} chars=${content.length}`);
+      return { ok: true };
+    } catch (err: any) {
+      logger.warn('loop', `note persist FAILED sessionId=${sessionId} err=${err?.message || err}`);
+      return { ok: false, error: err?.message || 'append failed' };
+    }
+  });
+
+  /** Verifier commands the USER approved by starting a loop, per session.
+   *
+   *  This is the guard that makes `loop:verify` narrower than "run anything":
+   *  verification only accepts a command that is byte-identical to the one
+   *  registered here, so a later call cannot substitute a different one. It matters
+   *  because the whole value of out-of-band verification is that the agent does not
+   *  choose the check — if model output could reach this map, the model could
+   *  propose `true` and maker/checker separation would be gone on round one. */
+  const registeredVerifiers = new Map<string, { command: string; timeoutSec: number }>();
+  /** One verifier per session at a time: a slow check must not be re-entered by the
+   *  next round while it is still running. */
+  const verifiersInFlight = new Set<string>();
+
+  ipcMain.handle('loop:register-verifier', (_event, sessionId: string, command: string, timeoutSec: number) => {
+    if (!sessionId) return { ok: false, error: 'no session' };
+    if (!command || !command.trim()) {
+      registeredVerifiers.delete(sessionId);
+      logger.info('loop', `verifier cleared sessionId=${sessionId}`);
+      return { ok: true, registered: false };
+    }
+    const rejected = loopVerify.rejectRequest(command, timeoutSec);
+    if (rejected) return { ok: false, error: rejected };
+    registeredVerifiers.set(sessionId, { command, timeoutSec });
+    logger.info('loop', `verifier registered sessionId=${sessionId} timeoutSec=${timeoutSec} command=${JSON.stringify(command)}`);
+    return { ok: true, registered: true };
+  });
+
+  /** Run this session's registered verifier once, OUT OF BAND.
+   *
+   *  On the same host as the agent: a remote session's check runs over SSH in the
+   *  remote workdir, because a verifier inspecting the local filesystem while the
+   *  agent edits an EC2 box reports green forever. The remote decision comes from
+   *  the session's own profile, exactly like the executor's. */
+  ipcMain.handle('loop:verify', async (_event, sessionId: string, command: string, timeoutSec: number) => {
+    if (!sessionId) return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: 'no session' };
+    const approved = registeredVerifiers.get(sessionId);
+    if (!approved || approved.command !== command) {
+      // Not an error the user caused: it means something asked to run a command
+      // this session's loop never declared.
+      logger.warn('loop', `verify REFUSED sessionId=${sessionId} — command not registered by a loop start`);
+      return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: '校验命令未经循环设置登记，已拒绝执行' };
+    }
+    const rejected = loopVerify.rejectRequest(command, timeoutSec);
+    if (rejected) return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: rejected };
+    if (verifiersInFlight.has(sessionId)) {
+      return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: '上一次校验尚未结束' };
+    }
+    const record = store.readRecord(sessionId);
+    const profile = record?.profile;
+    const entry = sessionClients.get(sessionId);
+    const remote = profile?.remote?.sshHost ? profile.remote : undefined;
+    // Prefer the LIVE executor's cwd for a local session: that is the directory the
+    // agent is actually working in. Fall back to the profile's resolved session cwd.
+    const cwd = remote
+      ? sessionCwd(profile!, os.homedir())
+      : (entry?.cwd || (profile ? sessionCwd(profile, os.homedir()) : os.homedir()));
+    verifiersInFlight.add(sessionId);
+    try {
+      // The ssh builders come from acp-client, i.e. the executor's own: the check
+      // has to be launched by the same rules as the agent it is checking.
+      const result = await loopVerify.runVerifier(
+        { command, timeoutSec, cwd, remote }, shellEnv, { buildSshArgs, shellQuote });
+      logger.info('loop', `verify sessionId=${sessionId} host=${result.host} cwd=${cwd}`
+        + ` exit=${result.exitCode ?? 'n/a'} ran=${result.ran} ms=${result.durationMs} command=${JSON.stringify(command)}`);
+      return result;
+    } finally {
+      verifiersInFlight.delete(sessionId);
+    }
+  });
+
+  /* ─────────────────────────── SCHEDULED TASKS ───────────────────────────
+   *
+   * Replaces loop mode. The loop re-sent a message and judged each round with a verifier
+   * command, stopping when the check passed -- a coding shape. The real scenarios here
+   * (weekly report, SFDC logging, oncall) are time-triggered: the previous run's result
+   * does not change the next run's action, which is the only test of whether something is
+   * a loop. So there is no goal and no verifier.
+   *
+   * THE TICKER LIVES HERE, not in the renderer, and that is the whole point: "every Monday
+   * 9am" has to fire with no window open. The old loop's `setTimeout` lived in `useAcp`,
+   * so closing the window stopped it.
+   *
+   * EACH RUN IS INDEPENDENT. Nothing from the previous run is injected -- KiroCrew's cron
+   * calls accumulated context "the other half of the bug" (cron.py:204) and shipped a
+   * stateless mode to switch it off, because carrying the last result forward is what makes
+   * a scheduled job report the same thing every morning. */
+  const SCHEDULE_TICK_MS = 20_000;
+  /** Jobs currently mid-run, so a slow turn is never re-entered by the next tick. */
+  const schedulesInFlight = new Set<string>();
+
+  async function runScheduledJob(job: scheduleStore.StoredSchedule): Promise<void> {
+    const { id, state } = job;
+    if (schedulesInFlight.has(id)) return;
+    schedulesInFlight.add(id);
+    try {
+      // CHARGE THE RUN FIRST, and flush it. Recording only on completion means a process
+      // killed mid-run forgets it paid -- the shape of a job that bills a turn per restart.
+      const charged = recordRun(state, Date.now());
+      scheduleStore.writeSchedule(id, charged, os.homedir());
+
+      let failure: string | undefined;
+      try {
+        await sendPromptOnce(state.sessionId, [{ type: 'text', text: state.spec.prompt }], undefined, {
+          messageId: `sched_${id}_${Date.now()}`,
+          displayText: state.spec.prompt,
+        });
+      } catch (err: any) {
+        failure = err?.message || '发送失败';
+      }
+
+      // Re-read: the user may have paused or removed the job during the turn.
+      const latest = scheduleStore.readSchedule(id, os.homedir());
+      if (!latest) return;
+      const settled = { ...latest.state, lastError: failure ?? null };
+      const terminal = scheduleTerminal(settled);
+      const final = terminal ? { ...settled, terminal } : settled;
+      scheduleStore.writeSchedule(id, final, os.homedir());
+      logger.info('schedule', `run id=${id} session=${state.sessionId} runs=${final.runs}/${final.spec.maxRuns}`
+        + ` error=${failure ? JSON.stringify(failure) : 'none'} terminal=${terminal ?? 'none'}`);
+
+      if (terminal) {
+        try {
+          store.appendMessage(state.sessionId, {
+            id: `sched_end_${Date.now()}`,
+            role: 'assistant',
+            content: `⏰ 定时任务结束：${scheduleTerminalLabel(terminal)}\n${describeSchedule(final.spec)} · 共运行 ${final.runs} 次`,
+            ts: Date.now(),
+          });
+        } catch {}
+      }
+      mainWindow?.webContents.send('schedule:changed', { id, state: final });
+    } finally {
+      schedulesInFlight.delete(id);
+    }
+  }
+
+  const scheduleTicker = setInterval(() => {
+    const now = Date.now();
+    for (const job of scheduleStore.listSchedules(os.homedir())) {
+      if (isDue(job.state, now)) void runScheduledJob(job);
+    }
+  }, SCHEDULE_TICK_MS);
+  app.on('before-quit', () => clearInterval(scheduleTicker));
+
+  ipcMain.handle('schedule:create', (_event, sessionId: string, spec: ScheduleSpec) => {
+    if (!sessionId || sessionId.startsWith('pending_')) return { ok: false, error: '请先选择一个已创建的会话' };
+    const problems = validateSchedule(spec);
+    if (problems.length) return { ok: false, error: problems.join('；') };
+    const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const state = newSchedule(sessionId, spec, Date.now());
+    scheduleStore.writeSchedule(id, state, os.homedir());
+    logger.info('schedule', `created id=${id} session=${sessionId} ${describeSchedule(spec)} maxRuns=${spec.maxRuns}`);
+    // Announced like every other mutation: the window that created the job learns of it the
+    // same way as any other, so its banner appears without a reload. The end of a RUN used to
+    // be the only broadcast, which left create/pause/remove invisible until the next reload.
+    mainWindow?.webContents.send('schedule:changed', { id, state });
+    return { ok: true, id, nextRunAt: nextRunAt(state), describe: describeSchedule(spec) };
+  });
+
+  ipcMain.handle('schedule:list', () => scheduleStore.listSchedules(os.homedir()).map((job) => ({
+    id: job.id,
+    sessionId: job.state.sessionId,
+    prompt: job.state.spec.prompt,
+    describe: describeSchedule(job.state.spec),
+    runs: job.state.runs,
+    maxRuns: job.state.spec.maxRuns,
+    paused: job.state.paused,
+    terminal: job.state.terminal,
+    lastRunAt: job.state.lastRunAt,
+    lastError: job.state.lastError,
+    nextRunAt: nextRunAt(job.state),
+  })));
+
+  ipcMain.handle('schedule:pause', (_event, id: string, paused: boolean) => {
+    const job = scheduleStore.readSchedule(id, os.homedir());
+    if (!job) return { ok: false, error: '找不到这个定时任务' };
+    const state = { ...job.state, paused };
+    scheduleStore.writeSchedule(id, state, os.homedir());
+    logger.info('schedule', `${paused ? 'paused' : 'resumed'} id=${id}`);
+    mainWindow?.webContents.send('schedule:changed', { id, state });
+    return { ok: true };
+  });
+
+  ipcMain.handle('schedule:remove', (_event, id: string) => {
+    scheduleStore.removeSchedule(id, os.homedir());
+    logger.info('schedule', `removed id=${id}`);
+    // `state: null` says GONE. The renderer re-reads the list either way, but a payload that
+    // omitted the outcome would make "removed" indistinguishable from "changed somehow".
+    mainWindow?.webContents.send('schedule:changed', { id, state: null });
+    return { ok: true };
+  });
+
+  /* ────────────────────── DURABLE LOOP COUNTER ──────────────────────
+   *
+   * The round counter is owned HERE, not in the window that started the loop. It used
+   * to live in the renderer's `loopsRef`, which meant closing or reloading the window
+   * reset it to zero -- so a loop declared "at most 20 rounds" got a fresh 20 on every
+   * restart, and its budget was not a budget at all.
+   *
+   * The send path is still driven from the renderer (it needs the streaming state and
+   * the message list). What moved is the part that must survive: the count, the budget
+   * decision, and the recorded reason a run ended. */
+  ipcMain.handle('loop:persist', (_event, sessionId: string, run: any) => {
+    if (!sessionId || !run?.spec?.stop) return { ok: false, error: 'no run' };
+    try {
+      loopStore.writeLoop(sessionId, run, os.homedir());
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'persist failed' };
+    }
+  });
+
+  /** Charge a round against the DURABLE counter and checkpoint it before it is sent.
+   *  The renderer must call this instead of counting locally, or the count goes back to
+   *  being per-window. */
+  ipcMain.handle('loop:begin-round', (_event, sessionId: string) => {
+    const result = loopStore.beginRound(sessionId, os.homedir(), Date.now());
+    if (result.run) {
+      logger.info('loop', `round sessionId=${sessionId} iteration=${result.run.iteration}`
+        + `/${result.run.spec.stop.maxIterations} terminal=${result.terminal ?? 'none'}`);
+    }
+    return result;
+  });
+
+  ipcMain.handle('loop:read', (_event, sessionId: string) => loopStore.readLoop(sessionId, os.homedir()));
+  ipcMain.handle('loop:list-live', () => loopStore.listLiveLoops(os.homedir()));
+  ipcMain.handle('loop:clear', (_event, sessionId: string) => {
+    loopStore.clearLoop(sessionId, os.homedir());
+    return { ok: true };
+  });
+
+  /* ─────────────────────────── SKILL FLOWS ───────────────────────────
+   *
+   * A flow is the reliable, step-by-step half of a skill: declared steps, out-of-band
+   * checks, human approval gates, and per-item idempotency for anything that writes to
+   * an external system.
+   *
+   * The DRIVER lives in flowDriver.ts and the DECISIONS in flowRun.ts; this section is
+   * only the wiring — it supplies the three effects the driver cannot perform itself
+   * (send a prompt, run a check, write the record) and exposes them over IPC.
+   *
+   * Runs in flight, so a gate's answer reaches the run that is waiting for it. NOT the
+   * source of truth: that is the file on disk, which is why a run answered after a
+   * restart still works. */
+  const liveFlowRuns = new Map<string, { sessionId: string; flowPath?: string; driving: boolean }>();
+
+  /** Verifier commands a FLOW declared, per run. Same guard as the loop's registry and
+   *  for the same reason: `loop:verify` only executes a command a human put in a file,
+   *  never one that came back from a model. A flow's commands are read from flow.yaml
+   *  at load time and registered here, before any step runs. */
+  const flowVerifiers = new Map<string, Set<string>>();
+
+  /** Run one flow step's check out of band, on the agent's own host. Deliberately built
+   *  on the same `loopVerify` module as the loop: a second copy of the remote/local
+   *  decision is exactly the thing that drifts and silently verifies the wrong host. */
+  async function runFlowVerify(runId: string, sessionId: string, command: string, timeoutSec: number) {
+    const allowed = flowVerifiers.get(runId);
+    if (!allowed?.has(command)) {
+      logger.warn('flow', `verify REFUSED runId=${runId} — command not declared by the flow file`);
+      return { ran: false, exitCode: null, output: '', error: '校验命令不在流程声明中，已拒绝执行' };
+    }
+    const rejected = loopVerify.rejectRequest(command, timeoutSec);
+    if (rejected) return { ran: false, exitCode: null, output: '', error: rejected };
+    const record = store.readRecord(sessionId);
+    const profile = record?.profile;
+    const entry = sessionClients.get(sessionId);
+    const remote = profile?.remote?.sshHost ? profile.remote : undefined;
+    const cwd = remote
+      ? sessionCwd(profile!, os.homedir())
+      : (entry?.cwd || (profile ? sessionCwd(profile, os.homedir()) : os.homedir()));
+    const result = await loopVerify.runVerifier(
+      { command, timeoutSec, cwd, remote }, shellEnv, { buildSshArgs, shellQuote });
+    logger.info('flow', `verify runId=${runId} host=${result.host} exit=${result.exitCode ?? 'n/a'}`
+      + ` ran=${result.ran} ms=${result.durationMs} command=${JSON.stringify(command)}`);
+    return result;
+  }
+
+  /**
+   * RUNS — the instances a project owns. 「只把在运行中的skill归属到project」.
+   *
+   * Main is the single source of truth on purpose: the run canvas opens in its OWN window (the user's
+   * choice), and two windows agreeing about a status is only possible if neither of them owns it. Every
+   * change is broadcast to every window.
+   */
+  /**
+   * 注册表变了就说一声 —— 「flow 应该在第一次生成的时候就保存,这样可以直接通过写文件的方式刷新」。
+   *
+   * 有了它,画布就不必靠内存里那份状态活着:落盘 → 广播 → 界面按文件重画。一份真相,重启也一致。
+   */
+  const broadcastFlowReg = (name: string) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send('flowreg:changed', { name });
+    }
+  };
+
+  const broadcastRun = (project: string, id: string) => {
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send('run:changed', { project, id });
+    }
+  };
+
+  /**
+   * 打开一个 run 的时候对一次账。
+   *
+   * 启动那一遍收拾的是"上次退出时留下的"；这一遍收拾的是"窗口刷新之后那一轮才答完的"—— 主进程没重启，
+   * 所以启动清扫不会再跑，而那一轮完成时已经没有渲染层在等它了。你回来看这个 run 的时候正好是该发现
+   * 它的时候。
+   */
+  /**
+   * 清掉一条会话在后端的活动上下文 —— flow 复用会话时用。
+   *
+   * 「flow 里面确实存在几个步骤在同一个会话里面跑，但这些应该只保留关键信息，否则可能长期跑 flow
+   * 会变得臃肿」。走 kiro-cli 的 `/clear`，和你在输入框里敲它是同一条路：**只清模型那一侧的对话，
+   * 磁盘上的 transcript 不动**，所以这一步之前发生过什么仍然查得到，审计链完整。
+   *
+   * 为什么不是"每步调一次模型压缩"：那要花钱，而且压缩本身会丢东西。而该留的关键信息**已经结构化地
+   * 留在别处了** —— 每一步的产出按 `produces` 进 run 的 `values`，下一步按 `consumes` 拼进自己的提示词。
+   * 赖在会话里的那一份是纯冗余。判据（哪些步骤可以清）见 `flowContext.shouldClearBeforeStep`。
+   *
+   * `display` 不给可见文本：这是流程的内务，不该在你的对话里留下一条"用户说了 /clear"。
+   */
+  ipcMain.handle('acp:clear-context', async (_event, sessionId: string) => {
+    if (!sessionId?.trim()) return { ok: false, error: '没有指定会话' };
+    try {
+      await sendPromptOnce(sessionId, [{ type: 'text', text: '/clear' }], undefined, {
+        messageId: `flow_clear_${Date.now()}`,
+      });
+      logger.info('flow', `cleared context sessionId=${sessionId}`);
+      return { ok: true };
+    } catch (err: any) {
+      // 清不掉不该让这一步跑不了 —— 最坏结果是上下文继续臃肿，而那是可以忍的
+      logger.warn('flow', `clear context failed sessionId=${sessionId}: ${err?.message || err}`);
+      return { ok: false, error: err?.message || 'clear failed' };
+    }
+  });
+
+  /**
+   * project 的工作目录 —— 它的会话都在这儿干活。
+   *
+   * 读:界面要显示当前值。写:先校验(不存在 / 不是目录 / 不是绝对路径都当场说),因为它错了的表现是
+   * 「所有会话都起不来」,那时候人只会看到一条抽象的失败。
+   */
+  ipcMain.handle('project:get-workspace', async (_event, project: string) => ({
+    workspace: projectStore.readProject(os.homedir(), project).workspace || '',
+  }));
+
+  ipcMain.handle('project:set-workspace', async (_event, project: string, workspace: string) => {
+    const why = projectStore.whyNotWorkspace(workspace);
+    if (why) return { ok: false, error: why };
+    projectStore.writeProject(os.homedir(), project, { workspace });
+    logger.info('project', `${project} workspace=${workspace || '(cleared → home)'}`);
+    return { ok: true };
+  });
+
+  /**
+   * OPEN THE CHAT THAT RAN A STEP — from the run window, in the main window.
+   *
+   * A run's steps each execute in their own session, and 「执行状态要在普通对话 UI 里看得见」: the canvas says
+   * WHICH step is running, and the conversation is where you read what it actually said. The run window has no
+   * chat of its own on purpose — there is no single conversation for a whole run.
+   */
+  ipcMain.handle('window:focus-session', async (_event, sessionId: string) => {
+    if (!sessionId?.trim()) return { ok: false, error: '没有会话 id' };
+    if (!mainWindow || mainWindow.isDestroyed()) return { ok: false, error: '主窗口不在' };
+    if (mainWindow.isMinimized()) mainWindow.restore();
+    mainWindow.show();
+    mainWindow.focus();
+    mainWindow.webContents.send('session:focus-request', { sessionId });
+    return { ok: true };
+  });
+
+  /**
+   * THE RUN CANVAS GETS ITS OWN WINDOW — the user's decision, and it needs main to own the state (above).
+   *
+   * Same renderer bundle, different view, chosen by query string: `?view=run`. One window per run, so asking
+   * twice focuses the one already open rather than opening a second copy of the same thing.
+   */
+  const runWindows = new Map<string, BrowserWindow>();
+  ipcMain.handle('window:open-run', async (_event, project: string, id: string) => {
+    const key = `${project}/${id}`;
+    const open = runWindows.get(key);
+    if (open && !open.isDestroyed()) { open.focus(); return { ok: true, focused: true }; }
+    const win = new BrowserWindow({
+      width: 1180,
+      height: 720,
+      minWidth: 640,
+      minHeight: 420,
+      backgroundColor: '#1a1a1a',
+      autoHideMenuBar: true,
+      title: `运行 · ${id}`,
+      webPreferences: {
+        preload: path.join(__dirname, 'preload.js'),
+        contextIsolation: true,
+        nodeIntegration: false,
+      },
+    });
+    runWindows.set(key, win);
+    win.on('closed', () => runWindows.delete(key));
+    const query = `view=run&project=${encodeURIComponent(project)}&run=${encodeURIComponent(id)}`;
+    if (IS_DEV) win.loadURL(`${DEV_SERVER_URL}/?${query}`);
+    else win.loadFile(path.join(__dirname, '../renderer/index.html'), { search: query });
+    logger.info('run', `opened window for ${key}`);
+    return { ok: true };
+  });
+
+  const approvalLocks = new Map<string, Promise<void>>();
+
+  /**
+   * THE ACTUAL DELETE — no guard here on purpose.
+   *
+   * 「这些会话应该删不了才对，都得让 flow 自行处理」：worker 会话属于**那次运行**，不属于侧栏。所以手删被
+   * 拒（上面那道守卫），而 flow 自己的回收（重置一步、删一次运行、删一个 flow 的历史）必须仍然收得掉它
+   * —— 否则「不许手删」就等于「永远删不掉」。守卫放在 IPC 那一层，这个函数是两条路共用的动作。
+   */
+  const purgeSession = async (sessionId: string): Promise<{ ok: boolean; tombstoned?: boolean; error?: string }> => {
     // Kill this chat's executor first (frees a slot, stops the kiro-cli process)
     // so deleting a chat never leaves an orphaned process running.
     //
@@ -3181,20 +4010,165 @@ app.whenReady().then(async () => {
       if (map[sessionId]) { delete map[sessionId]; saveDraftPastes(map); }
     } catch {}
 
+    /**
+     * 告诉窗口这条会话没了 —— 在**唯一的回收入口**上广播，而不是让每个调用方各自记得回传 id。
+     *
+     * 「run 删了之后左侧还是显示有三个空的会话」：`run:remove` 里 `purgeRunSessions` 返回的是**个数**，
+     * 会话 id 从来没回传给渲染层，而渲染层只 forget 了 `cascaded`（锚）—— 于是被真正关掉的 worker
+     * 还留在侧栏，点进去是空的，要到下次启动才消失。
+     *
+     * 补在这里而不是补 `run:remove`：回收的入口有五六处（重置、删 run、删 flow 历史、清扫、手删），
+     * 逐个补一遍，下一个新增的路径又会漏。这条广播在**文件真的移走之后**发，所以它说的是既成事实。
+     *
+     * 即使文件没能完全删掉（下面那个 error 分支）也要广播：那种情况已经立了墓碑、会话对 app 来说
+     * 就是不存在了，留在侧栏才是错的。
+     */
+    for (const win of BrowserWindow.getAllWindows()) {
+      if (!win.isDestroyed()) win.webContents.send('acp:sessions-purged', { sessionIds: [sessionId] });
+    }
     if (error) {
       logger.warn('delete-session', `${sessionId}: files not fully removed (${error}); tombstoned and will retry at next start`);
       return { ok: false, tombstoned: true, error };
     }
     clearSessionTombstone(sessionId); // fully gone — no need to keep the marker
     return { ok: true };
+  };
+
+  /**
+   * 按**会话记录**收掉一个 flow 在一个 project 里的会话 —— 不经过 run 文件。
+   *
+   * 为什么不能只有 `purgeFlowRunSessions`：那个函数遍历 run 去拿 `node.sessionId`，也就是说
+   * **run 是会话的唯一索引**。于是「删运行」如果不先收会话，那些 worker 就再也枚举不到 —— 实测过一次：
+   * 一个 project 里该 flow 的 run 一条不剩，而它的主会话和 3 条 worker 还躺在侧栏里，worker 又被
+   * `acp:delete-session` 无条件拒绝手删，能带走它们的主会话则因为「这个 project 还在用这个 flow」
+   * 而拒删 —— 三方互锁，没有任何入口能收。
+   *
+   * 所以判据换成记录自己带的 `flow` + `projectId`：它不依赖 run 还在不在，因此既是删运行时的正路，
+   * 也能顺手收掉之前已经锁死的那些。
+   *
+   * `includeAnchor` 分开给：删**一条** run 时只该收这条 run 的 worker，主会话还锚着别的运行；只有这个
+   * flow 在这个 project 里一条运行都不剩时，主会话才没有东西可锚。
+   * 结构会话（`skill`／「修改 flow · X」）一律不收 —— 它对着的是**定义**，跟某次运行的存亡无关。
+   */
+  const purgeFlowSessionsByRecord = async (
+    project: string,
+    flow: string,
+    opts: { includeAnchor: boolean; except?: string },
+  ): Promise<string[]> => {
+    const name = (flow || '').trim();
+    const want = (project || '').trim();
+    if (!name) return [];
+    const purged: string[] = [];
+    for (const other of store.listSessions()) {
+      if (opts.except && other.id === opts.except) continue;
+      const purpose = (other as any).purpose;
+      if (purpose !== 'flow-worker' && !(opts.includeAnchor && purpose === 'flow-main')) continue;
+      if ((other.flow || '').trim() !== name) continue;
+      if ((((other as any).profile)?.projectId || '').trim() !== want) continue;
+      try {
+        await purgeSession(other.id);
+        purged.push(other.id);
+      } catch (err: any) {
+        logger.warn('session', `cascade delete failed for ${other.id}: ${err?.message || err}`);
+      }
+    }
+    return purged;
+  };
+
+  ipcMain.handle('acp:delete-session', async (_event, sessionId: string) => {
+    /**
+     * A FLOW'S MAIN SESSION IS NOT DELETABLE — refused HERE, not only in the menu.
+     *
+     * 「这个会话不能被用户手动删掉」/「只能通过 flow 内部的按钮删会话，不能通过左侧的删除会话按钮」。
+     * 菜单把它置灰，但目录是在这里真的消失的，而只写在菜单里的规则离被绕过只差一个快捷键或一条以后新增的
+     * 代码路径。flow 自己的回收走 `purgeSession`（不经过这道守卫），所以「不许手删」不等于「永远删不掉」。
+     */
+    // 这条记录既被下面的守卫用，也被再下面的级联用，所以读一次、共用一份。
+    const rec = store.readRecord(sessionId);
+    {
+      /**
+       * 子会话（`flow-worker` / `skill`）：无条件拒。它们由流程创建、由流程关闭，进度和上下文也由
+       * 流程自己保留；手删一条正在跑某一步的 worker，run 记录里那个 sessionId 就指向一个不存在的
+       * 会话 —— 那一步既不会完成也不会失败。
+       *
+       * 不看「project 还在不在用这个 flow」：worker 属于**某一次运行**，不属于那个使用关系。
+       * 流程自己的回收走 `purgeSession`（见上），所以这条守卫不会挡住它该做的清理。
+       */
+      if (rec?.purpose === 'flow-worker') {
+        const flow = (rec.flow || '').trim();
+        const project = ((rec.profile as any)?.projectId || '').trim();
+        /**
+         * 和主会话**同一套判据**：`!detached && definitionExists && runsLeft > 0`。
+         *
+         * 只有在流程还活着的时候拦才有意义 —— 那时候流程界面能删它。一旦这个 flow 的运行被清空
+         * （或被移出 project、或定义已从库里删掉），流程界面就够不着这条 worker 了，再拦着就是死锁：
+         * 实测磁盘上有 3 条这样的 worker（flow「SFDC activity」的 run 已全部清零），侧栏删不掉、
+         * 流程界面里也不存在。
+         */
+        void project;
+      }
+      if (rec?.purpose === 'flow-main') {
+        const flow = (rec.flow || '').trim();
+        const project = ((rec.profile as any)?.projectId || '').trim();
+      }
+    }
+    /**
+     * 级联：删掉 flow 的锚（主会话 / skill 会话）时，把属于它的 worker 子会话一起删 ——
+     * 「删的时候需要把它所属的子会话也删掉」。
+     *
+     * 为什么必须级联：worker 被禁止手删（上面那道守卫），所以如果删锚不带走它们，它们就成了永远
+     * 删不掉的孤儿 —— 侧栏里躺着一堆属于已经不存在的流程的会话，而唯一能删它们的入口（流程界面）
+     * 也随着锚一起没了。
+     *
+     * 归属的判据是 `flow` + `project`，和已有的 `removeFlowRuns(home, project, flow)` 同一套口径 ——
+     * 记录里没有 parentSessionId，这两个字段是现有的唯一线索。
+     *
+     * 走 `purgeSession` 而不是递归回这个 handler：那样会被 worker 的守卫拒掉。这正是那句注释说的
+     * 「flow 自己的回收走 purgeSession，所以『不许手删』不等于『永远删不掉』」。
+     */
+    const cascaded: string[] = [];
+    if (rec?.purpose === 'flow-main' || rec?.purpose === 'skill') {
+      const flow = (rec.flow || '').trim();
+      const project = ((rec.profile as any)?.projectId || '').trim();
+      if (flow) {
+        for (const other of store.listSessions()) {
+          if (other.id === sessionId) continue;
+          if (other.purpose !== 'flow-worker') continue;
+          if ((other.flow || '').trim() !== flow) continue;
+          if ((((other as any).profile)?.projectId || '').trim() !== project) continue;
+          try {
+            await purgeSession(other.id);
+            cascaded.push(other.id);
+          } catch (err: any) {
+            logger.warn('session', `cascade delete failed for ${other.id}: ${err?.message || err}`);
+          }
+        }
+      }
+      if (cascaded.length) {
+        logger.info('session', `deleting ${rec.purpose} ${sessionId}: cascaded ${cascaded.length} worker session(s) of ${flow}`);
+      }
+    }
+    const result = await purgeSession(sessionId);
+    // `cascaded` 交给渲染层：它是按 id 从列表里摘会话的，不然这些会话要到下次启动才消失。
+    return { ...result, cascaded };
   });
+
 
   // Named kiro-cli agents available to the composer selector. The CLI has no
   // JSON mode for this command, so parse its stable tabular output from both
   // stdout and stderr (some kiro-cli versions write the listing to stderr).
   ipcMain.handle('kiro:list-agents', async () => {
     try {
-      const output = await runKiroCli('agent list 2>&1', 15000);
+      // 和 list-models 同一个病：日志里 `agent list` 也在 15s 反复被 kill，同样是挂载时并发双发。
+      // single-flight + 30s，理由见 `acp:list-models` 那段注释。
+      //
+      // 共享的是**原始输出**而不是解析结果：解析在下面，第二个调用者拿到字符串再自己走同一段解析，
+      // 语义完全一致；如果直接把解析后的对象缓存起来共享，就得把这段解析抽出去，而它只有一个用处。
+      if (!listAgentsInFlight) {
+        listAgentsInFlight = runKiroCli('agent list 2>&1', 30000)
+          .finally(() => { listAgentsInFlight = null; });
+      }
+      const output = await listAgentsInFlight;
       const agents: Array<{
         name: string;
         isDefault: boolean;
@@ -3396,9 +4370,6 @@ app.whenReady().then(async () => {
         assistantBuf: '',
         assistantMsgId: null,
         fileChanges: [],
-        memoryInjected: oldEntry.memoryInjected,
-        injectedProjectId: oldEntry.injectedProjectId,
-        lastInjectedMemory: oldEntry.lastInjectedMemory,
         lastUsedAt: Date.now(),
       };
       sessionClients.set(sessionId, nextEntry);
@@ -3410,12 +4381,10 @@ app.whenReady().then(async () => {
       rec.executorState = 'attached';
       store.writeRecord(rec);
       // A model switch means a NEW kiro-cli process, i.e. a blank backend even
-      // though the session id is unchanged. Mark and rebuild now: the send gate
-      // would also catch it, but only after the user has typed -- and until then
-      // the chat would look connected and idle while remembering nothing.
-      if (markContextOwedIfUnverified(sessionId, 'switch-model')) {
-        void primeHistoryNow(sessionId).catch(() => {});
-      }
+      // though the session id is unchanged. In snapshot mode the snapshot rides
+      // along with the next message (nothing to do here); only verbatim mode owes
+      // a real rebuild. See restoreContextAfterExecutorSwap.
+      restoreContextAfterExecutorSwap(sessionId, 'switch-model');
       return { ok: true, model: normalizedModel };
     } catch (err) {
       try { await client.disconnect(); } catch {}
@@ -3485,7 +4454,6 @@ app.whenReady().then(async () => {
         assistantBuf: '',
         assistantMsgId: null,
         fileChanges: [],
-        memoryInjected: false,
         lastUsedAt: Date.now(),
       };
       sessionClients.set(sessionId, nextEntry);
@@ -3503,10 +4471,11 @@ app.whenReady().then(async () => {
       });
       // Agent switch is even more destructive than a model switch: a brand new
       // process AND a brand new cli session id, so the backend is unquestionably
-      // empty. Rebuild now rather than waiting for the user's next message.
-      if (markContextOwedIfUnverified(sessionId, 'switch-agent')) {
-        void primeHistoryNow(sessionId).catch(() => {});
-      }
+      // empty. That still does not make a dedicated rebuild turn the right answer
+      // in snapshot mode -- the snapshot is built from KiroLex's own transcript, so
+      // it restores a fresh cli session just as well while riding along with the
+      // next message. Same policy as the model switch, deliberately one function.
+      restoreContextAfterExecutorSwap(sessionId, 'switch-agent');
       return { ok: true, kiroAgent: normalizedAgent || '' };
     } catch (err) {
       try { await client.disconnect(); } catch {}
@@ -3698,6 +4667,70 @@ app.whenReady().then(async () => {
     }
   });
 
+  /** Files the viewer currently has open, watched so an edit on disk refreshes it.
+   *
+   *  Watching the PARENT DIRECTORY rather than the file is deliberate: a save is very
+   *  often write-to-temp + rename (editors do it, and so does KiroLex's own atomic
+   *  write), which replaces the inode. `fs.watch` on the file path follows the old
+   *  inode and goes silent after exactly one such save -- the failure mode would be a
+   *  viewer that refreshes once and then never again. A directory watcher sees the
+   *  rename as a `rename` event for the basename, so it keeps working.
+   *
+   *  One watcher per directory, shared by every open file in it, and events are
+   *  debounced: a single save can emit several (`rename` + `change`), and a build can
+   *  rewrite a file many times a second. */
+  const viewerWatchers = new Map<string, fs.FSWatcher>();   // dir -> watcher
+  const viewerFiles = new Map<string, Set<string>>();       // dir -> basenames
+  const viewerDebounce = new Map<string, NodeJS.Timeout>(); // full path -> timer
+
+  function stopViewerWatch(): void {
+    for (const w of viewerWatchers.values()) { try { w.close(); } catch { /* already closed */ } }
+    viewerWatchers.clear();
+    viewerFiles.clear();
+    for (const t of viewerDebounce.values()) clearTimeout(t);
+    viewerDebounce.clear();
+  }
+
+  /** Replace the watched set with exactly these files. Returns how many are watched. */
+  ipcMain.handle('workspace:watch-files', (_event, sessionId: string | null | undefined, paths: string[]) => {
+    stopViewerWatch();
+    const wanted = (Array.isArray(paths) ? paths : []).slice(0, 32);   // the viewer caps tabs
+    for (const raw of wanted) {
+      let full: string;
+      try { full = resolveUserPath(String(raw), sessionId); } catch { continue; }
+      const dir = path.dirname(full);
+      const base = path.basename(full);
+      const names = viewerFiles.get(dir) || new Set<string>();
+      names.add(base);
+      viewerFiles.set(dir, names);
+      if (viewerWatchers.has(dir)) continue;
+      try {
+        const watcher = fs.watch(dir, (_type, changed) => {
+          if (!changed) return;
+          const name = String(changed);
+          if (!viewerFiles.get(dir)?.has(name)) return;   // some other file in the dir
+          const full2 = path.join(dir, name);
+          const prev = viewerDebounce.get(full2);
+          if (prev) clearTimeout(prev);
+          viewerDebounce.set(full2, setTimeout(() => {
+            viewerDebounce.delete(full2);
+            let exists = true;
+            let mtimeMs = 0;
+            try { mtimeMs = fs.statSync(full2).mtimeMs; } catch { exists = false; }
+            mainWindow?.webContents.send('workspace:file-changed', { path: full2, exists, mtimeMs });
+          }, 180));
+        });
+        watcher.on('error', () => { try { watcher.close(); } catch {} viewerWatchers.delete(dir); });
+        viewerWatchers.set(dir, watcher);
+      } catch (err: any) {
+        // An unreadable or deleted directory is not an error worth failing the call
+        // over: the viewer simply does not auto-refresh that file.
+        logger.info('workspace', `watch skipped ${dir}: ${err?.message || err}`);
+      }
+    }
+    return { ok: true, watching: wanted.length, dirs: viewerWatchers.size };
+  });
+
   ipcMain.handle('workspace:download', async (_event, sessionId: string | null | undefined, filePath: string) => {
     filePath = resolveUserPath(filePath, sessionId);
     const stats = fs.statSync(filePath);
@@ -3778,12 +4811,25 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('acp:list-models', async () => {
-    // 10s and non-blocking. This was `execSync` with no timeout and no catch, and
-    // it runs on every renderer load -- the single worst place in the app for a
-    // wedged kiro-cli to reach. On failure the renderer falls back to the model
-    // list cached in ui-state (`kirolex-models`).
-    const result = await runKiroCli('chat --list-models --format json', 10000);
-    return JSON.parse(result);
+    /**
+     * SINGLE-FLIGHT，而且超时给足 —— 两者都是实测逼出来的。
+     *
+     * 现场：日志里 13 次 `timed out after 10000ms (killed)`，而同一时刻在终端裸跑同一条命令只要
+     * 2.6–3.7 秒。关键线索是超时**成对出现**（同一毫秒两条，如 15:35:57.573 / .575）：渲染进程
+     * 挂载时并发发起了两次，每次都要付 kiro-cli 完整启动开销（含加载全部 MCP server），两个一起
+     * 启就超过 10 秒预算。于是永远走 `.catch()`，回退到缓存 —— 而那份缓存早先已被一次退化结果
+     * 写坏（只剩 `auto`），所以「网恢复了却还是显示模型都不可用」。
+     *
+     * single-flight 消掉并发这个直接原因；30s 给 kiro-cli 冷启动留出真实余量（这个调用本来就是
+     * 非阻塞的，等久一点没有代价，拿不到列表才有代价）。成功结果不在这里长期记忆：模型会上下线，
+     * 该由渲染层用 `shouldReplaceModelCache` 决定要不要落盘。
+     */
+    if (!listModelsInFlight) {
+      listModelsInFlight = runKiroCli('chat --list-models --format json', 30000)
+        .then((result) => JSON.parse(result))
+        .finally(() => { listModelsInFlight = null; });
+    }
+    return listModelsInFlight;
   });
 
   ipcMain.handle('acp:get-usage', async () => {
@@ -3803,9 +4849,15 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:generate-title', async (_event, firstUser: string, firstAssistant?: string) => {
     const convo = `User: ${String(firstUser || '').slice(0, 1500)}`
       + (firstAssistant ? `\n\nAssistant: ${String(firstAssistant).slice(0, 1500)}` : '');
-    if (!isFeatureEnabled('smartTitle')) return { ok: false, skipped: true, reason: 'feature disabled' };
+    if (!isFeatureEnabled('smartTitle')) {
+      logger.info('title', 'skipped: smartTitle is off');
+      return { ok: false, skipped: true, reason: 'feature disabled' };
+    }
     const prompt = `Generate a very short chat title (3-6 words) summarizing the topic below. Reply with ONLY the title on a single line — no quotes, no trailing punctuation, no preamble.\n\n${convo}`;
     try {
+      // Logged like `suggestions` next door. This handler used to log NOTHING, on any
+      // branch -- including the silent `{ error: 'empty' }` one -- so "chats stopped
+      // naming themselves" left no trace anywhere and got misdiagnosed twice.
       const stdout = await runLiteOneShot(prompt, 'title');
       const clean = cleanLiteOutput(stdout);
       const lines = clean.split('\n').map((l) => l.trim()).filter(Boolean);
@@ -3819,8 +4871,14 @@ app.whenReady().then(async () => {
         .replace(/[。.、,，]+$/, '')
         .trim()
         .slice(0, 60);
-      return title ? { title } : { error: 'empty' };
+      if (!title) {
+        logger.warn('title', `model answered but no usable title survived cleanup (${clean.length} chars in)`);
+        return { error: 'empty' };
+      }
+      logger.info('title', `generated "${title}"`);
+      return { title };
     } catch (err: any) {
+      logger.warn('title', `failed: ${err?.killed ? 'timeout/killed' : ''} ${err?.message || err}`);
       return { error: err?.message || 'failed' };
     }
   });
@@ -3873,8 +4931,17 @@ app.whenReady().then(async () => {
     }
     // Mutual exclusion with model/Agent/permission switches: both paths do a
     // session/load on the same cliSessionId and kiro-cli allows only one owner.
-    if (reconfiguringSessions.has(sessionId)) {
-      throw new Error('会话正在切换模型/Agent，稍后会自动重连。');
+    // WAIT for the switch instead of rejecting. A switch already waits for an
+    // attach (awaitAttachIdle), and only this direction failed hard -- so a send
+    // that lands while the model is being swapped (the send attaches on demand)
+    // got a raw IPC error on the user's own message. A switch finishes WITH the
+    // session attached, so after the wait this handler almost always returns
+    // immediately with the new executor.
+    await awaitReconfigureIdle(sessionId);
+    // The switch may have been the last thing that touched this session before a
+    // delete landed; re-check rather than attaching a corpse.
+    if (deletedSessionIds.has(sessionId)) {
+      throw new Error('Session was deleted; not re-attaching.');
     }
     // COALESCE concurrent attaches of the SAME session. The main window is now
     // revealed BEFORE the background warm-up finishes, so clicking a session that
@@ -3995,7 +5062,7 @@ app.whenReady().then(async () => {
       if (freshBackend) {
         logger.info('prime', `context owed sessionId=${sessionId} mode=${verbatimOwed ? 'full (rebuild on first use)' : 'snapshot (rides along with the next message)'}`);
       }
-      entry = { client, cliSessionId, profile, cwd: cliCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], memoryInjected: false, lastUsedAt: Date.now(), needsHistoryPrime: verbatimOwed };
+      entry = { client, cliSessionId, profile, cwd: cliCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now(), needsHistoryPrime: verbatimOwed };
       freshBackendResult = verbatimOwed;
       // A delete may have landed during the async connect/resume above. If so,
       // tear the fresh client down and do NOT recreate the record on disk.
@@ -4086,14 +5153,17 @@ app.whenReady().then(async () => {
   ipcMain.handle('acp:set-prime-mode', async (_event, sessionId: string, primeMode: 'snapshot' | 'full') => {
     if (!sessionId) return { ok: false, error: 'no sessionId' };
     try {
-      const rec = store.readRecord(sessionId);
-      if (!rec) return { ok: false, error: 'no record' };
-      rec.primeMode = primeMode === 'full' ? 'full' : 'snapshot';
-      store.writeRecord(rec);
+      /*
+        `patchRecord` 而不是「读-改-写」：这个 IPC 也是在会话刚建出来时被调用的(flow 编辑会话交底那一步),
+        而记录要到**第一次 prompt** 才创建 —— 读-改-写在那个窗口里必然失败,而且是静默的。实测:
+        `purpose LOST … 等了 2s 记录还没出现` 之后 5 秒才有 `prompt received`。
+      */
+      const mode = primeMode === 'full' ? 'full' : 'snapshot';
+      const where = store.patchRecord(sessionId, { primeMode: mode });
       const entry = sessionClients.get(sessionId);
       if (entry) { entry.primeChunks = undefined; entry.primeCursor = 0; }
-      logger.info('prime', `mode set sessionId=${sessionId} primeMode=${rec.primeMode}`);
-      return { ok: true, primeMode: rec.primeMode };
+      logger.info('prime', `mode set sessionId=${sessionId} primeMode=${mode} (${where})`);
+      return { ok: true, primeMode: mode };
     } catch (err: any) {
       return { ok: false, error: err?.message || 'failed' };
     }
@@ -4124,7 +5194,29 @@ app.whenReady().then(async () => {
   ) => {
     const entry = sessionClients.get(sessionId);
     if (!entry) throw new Error('Session not connected');
+    // Close the wait span. Measured from the REQUEST, not from when the dialog was
+    // rendered: the wait the user cares about is the whole time the turn was blocked.
+    const requestKey = String(requestId ?? '');
+    const startedAt = permissionWaitStartedAt.get(requestKey);
+    permissionWaitStartedAt.delete(requestKey);
+    eventLog.appendEvent(sessionId, {
+      ts: Date.now(),
+      type: 'permission_response',
+      turn: entry.currentUserMessageId,
+      optionId,
+      ms: startedAt ? Date.now() - startedAt : 0,
+      detail: requestKey,
+    });
+    if (startedAt) {
+      logger.info('permission', `answered sessionId=${sessionId} option=${optionId} waited=${((Date.now() - startedAt) / 1000).toFixed(1)}s`);
+    }
     return entry.client.respondToPermission(requestId, optionId);
+  });
+
+  /** Read this session's run event log (timeline + event stream views). */
+  ipcMain.handle('acp:read-events', (_event, sessionId: string, limit?: number) => {
+    if (!sessionId) return { events: [], path: '', truncated: false };
+    return eventLog.readEvents(sessionId, Math.min(Math.max(1, Number(limit) || 4000), 20000));
   });
 
   // Write-once project assignment (design §6.4). Allowed only for the
@@ -4398,7 +5490,64 @@ app.whenReady().then(async () => {
       updatedAt: rec.updatedAt,
       archived: !!rec.archived,
       pinned: !!rec.pinned,
+      // 持久化的角色标记：删除保护和「别回收主会话」都要靠它，重启后必须还在
+      ...(rec.purpose ? { purpose: rec.purpose } : null),
+      ...(rec.flow ? { flow: rec.flow } : null),
+      /**
+       * 这条会话跑在哪个 agent 下 —— 记录里一直有（`profile.kiroAgent`），但从来没发给渲染层。
+       *
+       * `Session.kiroAgent` 因此只在你**手动切 agent** 时才有值，别的时候都是 undefined。撞到的后果：
+       * 泳道复用要比 agent（会话的 agent 创建时就定了，换不了），比到的永远是 undefined，于是
+       * 一个配了 agent 的 flow **每一步都另起一条会话** —— 复用被静默禁掉，而没有任何报错。
+       */
+      ...(rec.profile?.kiroAgent ? { kiroAgent: rec.profile.kiroAgent } : null),
     }));
+  });
+
+  /**
+   * 把「这个会话是干什么的」写进记录 —— `flow-main` 的删除保护靠它，所以不能只活在 renderer 内存里。
+   *
+   * **等记录出现再写** —— 实测这个标记从来没写成功过:全部 11 份日志里 `[session] purpose` 出现 0 次,而
+   * `~/.kirolex/sessions/s_1786935225555_jpec0z/record.json` 里 purpose 是空的。原因是调用时机:renderer 在
+   * `newSession` 一返回就标记,那时记录还没落盘,`readRecord` 给 null,这里就 `return { ok:false }` 走了 ——
+   * 而调用方是 `void`,没人看返回值,所以是**静默**丢失。后果一路传到分屏:purpose 没了,「flow 会话不进分屏」
+   * 的判据就失效,自动 seed / 领养那两条效果照样把它塞进格子(改名同理,标题兜底也一起没了)。
+   *
+   * **等不是办法，挂起才是** —— 上一版让这里轮询 2 秒，方向就错了：记录不是「晚一点写」，而是**第一次 prompt
+   * 才创建**。实测同一条会话：`03:53:54 purpose LOST … 等了 2s` → `03:53:59 prompt received`（记录此刻才有）。
+   * 所以改成 `patchRecord`：记录在就直接写，不在就挂起，`createSession` 一建记录立刻应用。
+   */
+  ipcMain.handle('acp:mark-session-purpose', async (_event, sessionId: string, purpose: string, flow?: string) => {
+    if (!sessionId) return { ok: false, error: 'no sessionId' };
+    const patch: Partial<ReturnType<typeof store.readRecord> & object> = {
+      purpose: (purpose || '').trim() || undefined,
+    };
+    if (flow !== undefined) (patch as any).flow = (flow || '').trim() || undefined;
+    const where = store.patchRecord(sessionId, patch as any);
+    logger.info('session', `purpose ${sessionId} = ${(purpose || '').trim() || '(cleared)'}${flow ? ' flow=' + flow : ''} (${where})`);
+    return { ok: true, deferred: where === 'pending' };
+  });
+
+  /**
+   * 会话标题落盘 —— 「这个 project 里面还是有一条没用的 new chat」的一半原因。
+   *
+   * `renameSession` 一直**只改渲染层内存**（`setSessions(... { ...s, title })`），主进程连一个改标题的
+   * IPC 都没有。于是标题一刷新就退回磁盘上的 `New Chat` —— 实测 SFDC 那个 project 下四条会话
+   * （一条主会话 + 三条 worker）在磁盘上**全都叫 `New Chat`**，而侧栏上它们本来显示着步骤名。
+   *
+   * flow 起的会话尤其吃亏：它们的名字是驱动器现取的（`${flow} · ${步骤名}`），而一条没有名字的
+   * 子会话在侧栏里就是"一条没用的 new chat"，你没法判断它属于谁、能不能动。
+   *
+   * 走 `patchRecord`（和 `acp:mark-session-purpose` 一样）：它能处理"记录还没建出来"的情况 ——
+   * flow 的 worker 恰好就是这种，记录是第一次 prompt 才创建的，而改名发生在那之前。
+   */
+  ipcMain.handle('acp:rename-session', async (_event, sessionId: string, title: string) => {
+    if (!sessionId) return { ok: false, error: 'no sessionId' };
+    const next = String(title || '').trim();
+    if (!next) return { ok: false, error: 'empty title' };
+    const where = store.patchRecord(sessionId, { title: next } as any);
+    logger.info('session', `renamed ${sessionId} -> ${JSON.stringify(next)} (${where})`);
+    return { ok: true, deferred: where === 'pending' };
   });
 
   // Persist pin state to the durable record so it survives restart / origin
@@ -4435,13 +5584,49 @@ app.whenReady().then(async () => {
    *  time. Deliberately not re-derived: rebuilding the snapshot now would describe the
    *  current transcript, not the one this session was primed with. */
   ipcMain.handle('acp:read-last-injection', async (_event, sessionId?: string) => {
-    if (!sessionId) return { text: '', at: null, path: null };
+    if (!sessionId) return { text: '', at: null, path: null, override: false, overrideAt: null, overridePath: null };
     const rec = store.readLastInjection(sessionId);
+    // The override is reported alongside, because the Snapshot tab has to say WHICH of
+    // the two will actually be sent next -- an editor that silently shows the archive
+    // while a curated block is in force would be the worst of both.
+    const override = store.readContextOverride(sessionId);
     return {
-      text: rec?.text ?? '',
+      text: override?.text ?? rec?.text ?? '',
       at: rec?.at ?? null,
       path: store.lastInjectionPath(sessionId),
+      override: !!override,
+      overrideAt: override?.at ?? null,
+      overridePath: store.contextOverridePath(sessionId),
+      /** The archive, always -- so "restore the generated one" can show what it will
+       *  go back to without a second round trip. */
+      sentText: rec?.text ?? '',
     };
+  });
+
+  /** Pin a hand-edited context block for this chat. Used verbatim by the next send. */
+  ipcMain.handle('acp:write-context-override', async (_event, sessionId: string, text: string) => {
+    if (!sessionId) return { ok: false, error: 'no sessionId' };
+    try {
+      if (!text.trim()) {
+        // Saving an empty editor means "stop overriding", not "send nothing".
+        const cleared = store.clearContextOverride(sessionId);
+        logger.info('prime', `context override cleared by empty save sessionId=${sessionId} existed=${cleared}`);
+        return { ok: true, override: false };
+      }
+      store.writeContextOverride(sessionId, text);
+      logger.info('prime', `context override SAVED sessionId=${sessionId} chars=${text.length} -> next message sends this instead of the generated snapshot`);
+      return { ok: true, override: true, path: store.contextOverridePath(sessionId) };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || 'failed' };
+    }
+  });
+
+  /** Back to the generated snapshot. */
+  ipcMain.handle('acp:clear-context-override', async (_event, sessionId: string) => {
+    if (!sessionId) return { ok: false, error: 'no sessionId' };
+    const existed = store.clearContextOverride(sessionId);
+    logger.info('prime', `context override removed sessionId=${sessionId} existed=${existed} -> generated snapshot again`);
+    return { ok: true, existed };
   });
 
   ipcMain.handle('acp:read-memory', async (_event, projectId?: string, sessionId?: string) => {
@@ -4449,6 +5634,23 @@ app.whenReady().then(async () => {
   });  ipcMain.handle('acp:write-memory', async (_event, scope: 'global' | 'project' | 'session', projectId: string | undefined, sessionId: string | undefined, content: string) => {
     writeMemory(scope, projectId, sessionId, content);
     return { ok: true };
+  });
+
+  /** 三层体积，按需取一次。给两个时机用：会话切换/启动（打开就能看到横幅），以及
+   *  MemoryDialog 保存之后（你手动清理完立刻消失，不用等下一轮对话）。 */
+  ipcMain.handle('acp:memory-bytes', async (_event, projectId?: string, sessionId?: string) => {
+    return memoryLayerBytes(projectId, sessionId);
+  });
+
+  /** 压缩前备份某一层记忆。时间戳由主进程生成，渲染进程不需要关心命名规则。 */
+  ipcMain.handle('acp:backup-memory', async (
+    _event, scope: MemoryScope, projectId?: string, sessionId?: string,
+  ) => {
+    const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const at = backupMemoryLayer(scope, projectId, sessionId, stamp);
+    if (at) logger.info('memory', `backed up ${scope} -> ${at}`);
+    else logger.warn('memory', `nothing to back up for scope=${scope}`);
+    return { ok: !!at, at };
   });
 });
 
@@ -4505,6 +5707,9 @@ async function migrateUiStateFromFileOrigin(): Promise<void> {
       // The sweep is a blanket `kirolex-*` import, so it would faithfully carry a
       // retired key back in. Filter here as well as pruning after.
       if (DEAD_UI_STATE_KEYS.has(k)) { skipped.push(k); continue; }
+      // Same reason, different lifetime: a run-scoped key must start empty, so the
+      // stale localStorage mirror from the PREVIOUS run must not be carried in.
+      if (RUN_SCOPED_UI_STATE_KEYS.has(k)) { skipped.push(k); continue; }
       if (typeof v === 'string' && v) { setUiStateKey(k, v); n += 1; }
     }
     if (skipped.length) logger.info('ui-state', `skipped retired key(s) during migration: ${skipped.join(', ')}`);

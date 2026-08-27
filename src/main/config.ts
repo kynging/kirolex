@@ -65,15 +65,32 @@ export interface AgentProfile {
   remote?: RemoteTarget;
 }
 
-/** Ordered non-opus fallback chain: KiroLex tries these in order and uses the
- *  first one that actually starts, so an unavailable / throttled / retired model
- *  no longer leaves a chat dead. Opus is deliberately NOT in the chain (cost);
- *  pick it explicitly per session from the model selector when you want it. */
+/** Ordered fallback chain: KiroLex tries these in order and uses the first one
+ *  that actually starts, so an unavailable / throttled / retired model no longer
+ *  leaves a chat dead.
+ *
+ *  NO CLAUDE MODEL IS IN IT, on purpose. It used to lead with `claude-sonnet-5`
+ *  then `claude-sonnet-4.6`, which produced exactly the outcome this chain exists
+ *  to avoid: during a Claude-wide outage (measured 2026-08-10 23:42-23:47 —
+ *  kiro-cli listed NO claude model at all) a chat created on `claude-opus-5`
+ *  silently ended up displaying `claude-sonnet-4.6`, a model nobody had ever
+ *  chosen, reached only after a wasted failed hop on `claude-sonnet-5`. A fallback
+ *  whose first stops share the failure mode of the thing that just failed is not a
+ *  fallback.
+ *
+ *  Exactly three entries, chosen by the user: `gpt-5.6-sol` first (2.40x credits,
+ *  the strongest GPT), `gpt-5.6-terra` next (1.00x, same as `auto`), and
+ *  `deepseek-3.2` last (0.25x) as the final keep-the-chat-alive stop. Nothing else
+ *  is listed — `gpt-5.6-luna` and the minimax/glm models are deliberately absent,
+ *  and if all three of these are down, failing loudly beats silently seating the
+ *  chat on some model that was never asked for.
+ *
+ *  This is a keep-the-chat-alive net, not a model choice: an automatic fallback
+ *  never overwrites `preferredModel`, so the next attach retries what was actually
+ *  picked (see the `preferredModel` note in the attach handler). */
 export const MODEL_FALLBACK_ORDER = [
-  'claude-sonnet-5',
-  'claude-sonnet-4.6',
   'gpt-5.6-sol',
-  'claude-haiku-4.5',
+  'gpt-5.6-terra',
   'deepseek-3.2',
 ];
 
