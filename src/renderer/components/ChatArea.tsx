@@ -2,6 +2,19 @@ import { createPortal } from 'react-dom';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
+import { mdText } from '../mdText';
+// 「这段文字是不是路径」的判据 —— 抽出来是为了能被 node:test 测到（.tsx 跑不了测试）
+import { FILE_TOKEN_RE, PATH_RE } from '../filePaths';
+// 清空上下文那条分界线：默认视图收到它之后，并在原位画出来（判据见那个模块）
+import { sinceLastClear, isClearCommand, clearNoteText } from '../clearBoundary';
+// 这一格自己的会话内搜索：命中算术（纯，可测）+ 高亮（Range/CSS.highlights，不动 DOM）
+import { findLabel, matchOffsets, shouldSearch, stepIndex } from '../paneFind';
+import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHighlight';
+import { useT } from '../hooks/useLang';
+// 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
+import { shouldApplyHandoff } from '../handoffDraft';
+import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
+import { activeSubagents, type SubagentRow } from '../../main/subagents';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
@@ -9,6 +22,12 @@ import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
+// Scheduling replaced loop mode. `schedule.ts` lives under src/main because the DRIVER
+// runs there (a schedule has to fire with no window open); it is pure, so the renderer
+// imports the same module rather than keeping a second copy of the rules.
+import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
+import type { ScheduleSummary } from '../scheduleView';
+import { decidePaste } from '../pasteDecision';
 import { IconAppendMessage, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
@@ -38,7 +57,6 @@ const mdUrlTransform = (url: string) => (/^javascript:/i.test(url) ? '' : url);
 // Inline code that looks like a file path (ends in a known extension) becomes a
 // clickable link that opens the file — covers kiro's file references (usually in
 // `backticks`) and diff paths mentioned in prose.
-const FILE_TOKEN_RE = /^(?:[A-Za-z]:\\[^\n\r\t<>|?*]+|~?\/[^\n\r\t<>|?*]+|[^\/\n\r\t<>|?*]+(?:\/[^\/\n\r\t<>|?*]+)+)\.[A-Za-z0-9]{1,8}$/u;
 const URL_RE = /^(https?:|mailto:|tel:)/i;
 // Open a file path inside KiroLex's own viewer (not the OS default app). App
 // listens for this event and shows the in-app file modal. URLs still go external.
@@ -81,6 +99,7 @@ function usePathExists(path: string): 'pending' | 'yes' | 'no' {
 const FileRef = ({ path, as, className, children }: {
   path: string; as: 'a' | 'code'; className?: string; children: React.ReactNode;
 }) => {
+  const t = useT();
   const exists = usePathExists(path);
   if (exists !== 'yes') {
     // Not (yet) known to exist -> plain, non-clickable text.
@@ -90,7 +109,7 @@ const FileRef = ({ path, as, className, children }: {
   }
   if (as === 'code') {
     return (
-      <code className="md-file-link" title="在 KiroLex 内打开文件" onClick={() => openPathInApp(path)}>
+      <code className="md-file-link" title={t('Open the file inside KiroLex')} onClick={() => openPathInApp(path)}>
         {children}
       </code>
     );
@@ -123,6 +142,16 @@ const MD_COMPONENTS = {
     if (!href) return <span>{children}</span>;
     return <FileRef path={href} as="a">{children}</FileRef>;
   },
+  // A table gets a scrolling wrapper. `table-layout: fixed` divides the pane between
+  // the columns, which keeps a table inside its box but cannot make 5 columns readable
+  // in a 275px split pane -- so the wrapper gives it somewhere to scroll. Without it
+  // the overflow was clipped by the transcript's `overflow-x: hidden` and the data was
+  // simply gone (measured: a 791px table inside a 275px container).
+  table: ({ children, ...props }: any) => (
+    <div className="md-table-scroll">
+      <table {...props}>{children}</table>
+    </div>
+  ),
   // Fenced code blocks had NO copy button -- only user-message blocks and pasted
   // blobs did. A one-line URL in a code fence was therefore unselectable in
   // practice: it overflows horizontally, so dragging to select it scrolls away.
@@ -130,12 +159,17 @@ const MD_COMPONENTS = {
   // <pre> wrapper, where it can read the block's exact source from the code child.
   pre: ({ children, ...props }: any) => {
     const codeEl: any = Array.isArray(children) ? children[0] : children;
-    const kids = codeEl?.props?.children;
-    const text = Array.isArray(kids) ? kids.join('') : String(kids ?? '');
+    /*
+      文本必须**递归**取（`mdText`），不能 `join('')` —— `rehypeHighlight` 把代码切成一堆
+      `<span class="hljs-…">` 元素，join 出来是 `[object Object][object Object]…`，「复制」按钮
+      复制的就是那一坨（用户当成会话报错贴了出来）。空白是普通字符串所以留着，于是缩进看着像真代码。
+    */
+    const text = mdText(codeEl?.props?.children);
     return <MdCodeBlock text={text} preProps={props}>{children}</MdCodeBlock>;
   },
   code: ({ className, children, ...props }: any) => {
-    const raw = Array.isArray(children) ? children.join('') : String(children ?? '');
+    /* 同上：高亮过的行内代码 join 出来是 `[object Object]`，「这是不是文件路径」就判错了 */
+    const raw = mdText(children);
     const isBlock = !!className || raw.includes('\n');
     const text = raw.trim();
     if (!isBlock && FILE_TOKEN_RE.test(text)) {
@@ -192,6 +226,7 @@ const AttachmentThumb: React.FC<{ file: AttachedFile; sessionId: string | null; 
 /** A fenced code block with a hover Copy button. Copies the block's SOURCE, not
  *  the rendered/highlighted DOM, so a long single-line value comes back intact. */
 const MdCodeBlock: React.FC<{ text: string; preProps?: any; children?: React.ReactNode }> = ({ text, preProps, children }) => {
+  const t = useT();
   const [copied, setCopied] = useState(false);
   const copy = () => {
     void navigator.clipboard.writeText(text).then(() => {
@@ -199,12 +234,56 @@ const MdCodeBlock: React.FC<{ text: string; preProps?: any; children?: React.Rea
       setTimeout(() => setCopied(false), 1200);
     }).catch(() => {});
   };
+  /**
+   * **围栏里只有一条路径时，那条路径可点** —— 「我在技术问题这个会话中发现 …md 无法直接超链接打开，为什么」。
+   *
+   * 那次的形状是模型很爱用的写法：
+   *
+   *     已写到：
+   *     ```text
+   *     /Users/keyinan/Downloads/devops-agent-rds-诊断配置指南.md
+   *     ```
+   *
+   * 链接化原来只发生在两处 —— 行内代码（`code` 渲染器 + `FILE_TOKEN_RE`）和散文里的裸路径
+   * （`remarkLinkifyPaths`）。围栏两处都不走，而且**大部分时候这是对的**：围栏里常常是一整段脚本，
+   * 把里面每个路径都染蓝会把代码变成一片链接。
+   *
+   * 所以判据卡得很窄：**整个围栏 trim 之后只有一行，而且那一行整体就是一条路径**。
+   * 一整段脚本不满足（多行），`cd /x && ls` 不满足（那一行不是"整体就是一条路径"）。
+   * 存在性仍然由 `FileRef` 说话：文件不在盘上就是普通文本，绝不给一个点了没反应的链接。
+   *
+   * 「复制」按钮照旧留着 —— 它本来就是为这种情形存在的（长路径在围栏里横向溢出，拖选会把它滚走）。
+   */
+  const lines = text.replace(/\n+$/, '').split('\n');
+  /**
+   * 放宽到"不超过 3 行"是因为「路径 + 一行尺寸说明」同样常见（实测那条就是
+   * `…/诊断配置指南.md` 换行 `529 行 / 19.8 KB`），而它和"只有一条路径"是同一个需求。
+   *
+   * 上限存在的理由是**存在性探测的成本**：判据放开到任意行数的话，一个 500 行的 `find` 输出
+   * 就是 500 次 `pathExists`。3 行接住了实际的写法，又接不住任何"一段输出"。
+   */
+  const pathLines = lines.length <= 3
+    ? lines.map((line) => (FILE_TOKEN_RE.test(line.trim()) ? line.trim() : null))
+    : null;
+  const anyPath = !!pathLines?.some(Boolean);
   return (
     <div className="md-code-wrap">
-      <button type="button" className="md-code-copy" onClick={copy} title="复制这段代码">
-        {copied ? '已复制' : '复制'}
+      <button type="button" className="md-code-copy" onClick={copy} title={t('Copy this code')}>
+        {copied ? t('Copied') : t('Copy')}
       </button>
-      <pre {...preProps}>{children}</pre>
+      <pre {...preProps}>
+        {anyPath && pathLines
+          /* 只换掉"整行就是路径"的那几行，其余行原样 —— 尺寸说明那种行不该变成链接 */
+          ? lines.map((line, i) => (
+            <React.Fragment key={i}>
+              {pathLines[i]
+                ? <FileRef path={pathLines[i] as string} as="code" className="md-file-link">{line}</FileRef>
+                : line}
+              {i < lines.length - 1 ? '\n' : null}
+            </React.Fragment>
+          ))
+          : children}
+      </pre>
     </div>
   );
 };
@@ -212,7 +291,6 @@ const MdCodeBlock: React.FC<{ text: string; preProps?: any; children?: React.Rea
 // Linkify absolute file/dir paths in plain text. Tightened to avoid matching prose
 // like "/update/delete": require a Windows path, a path under a known root, or a
 // path ending in a file extension.
-const PATH_RE = /(?:[A-Za-z]:\\[^\s"'`)]+|\/(?:Users|home|tmp|var|etc|opt|usr|private|Applications|mnt|srv|root)\/[^\n\r\t<>|"'`]*?\.[A-Za-z0-9]{1,8}(?=[\s)"'`,，。；;：]|$)|(?:\/[\p{L}\p{N}._\-]+)+\.[A-Za-z0-9]{1,8})/gu;
 function remarkLinkifyPaths() {
   return (tree: any) => {
     // Cast: this visitor RETURNS a new index to skip the nodes it just spliced in,
@@ -241,12 +319,13 @@ function remarkLinkifyPaths() {
 }
 const MD_REMARK = [remarkGfm, remarkLinkifyPaths];
 
+/* 常量在模块作用域，拿不到 hook —— 所以这里存**英文 key**，翻译发生在渲染点（`t(suggestion)`）。 */
 const PROMPT_SUGGESTIONS = [
-  '解释这个项目是做什么的，整体结构是怎样的',
-  '找出并修复当前目录里的 bug',
-  '为主要模块补充单元测试',
-  '总结最近的 git 改动',
-  '审查这段代码有没有安全问题',
+  'Explain what this project does and how it is structured',
+  'Find and fix bugs in the current directory',
+  'Add unit tests for the main modules',
+  'Summarise the recent git changes',
+  'Review this code for security problems',
 ];
 
 type KiroAgentSource = 'built-in' | 'global' | 'local';
@@ -382,6 +461,47 @@ const PASTE_MIN_CHARS = 1200;
 const PASTE_SINGLE_LINE_MIN_CHARS = 4000;
 /** `[ 粘贴 #1 · 42 行 ]` — the only thing that lands in the message text. */
 const PASTE_PLACEHOLDER_RE = /\[ 粘贴 #(\d+) · (\d+) 行 \]/g;
+
+/**
+ * Scroll ONE container to its bottom.
+ *
+ * Deliberately not `element.scrollIntoView()`: that scrolls EVERY scrollable ancestor,
+ * and `overflow: hidden` does not opt an element out -- a hidden container is still
+ * programmatically scrollable. In split view the chain above a transcript is
+ * `.chat-main` -> `.chat-row` -> `.chat-grid`, all `overflow: hidden` and all shared
+ * with the other panes, so a single sub-pixel overflow anywhere up there let a
+ * scrollIntoView in one pane shift the whole grid -- visible as a flash, with no
+ * scrollbar and no way for the user to put it back. Writing `scrollTop` cannot reach
+ * past the element it is called on.
+ *
+ * The second write on the next frame covers content that settles late (markdown,
+ * highlighting, images): without it the first write lands against a height that then
+ * grows, leaving the view short of the bottom. `stillWanted` guards that second write
+ * so a user who starts scrolling up within that one frame is not yanked back.
+ */
+function scrollContainerToBottom(el: HTMLElement | null, stillWanted: () => boolean = () => true): void {
+  if (!el) return;
+  el.scrollTop = el.scrollHeight;
+  requestAnimationFrame(() => { if (stillWanted()) el.scrollTop = el.scrollHeight; });
+}
+
+/**
+ * Reveal `el` inside its own transcript if it is out of view, moving nothing else.
+ *
+ * `block: 'nearest'` semantics done by hand, for the same reason as above: even
+ * 'nearest' walks the ancestor chain, so revealing a button in one pane could shift
+ * every other pane. The container is resolved from the element, so this is always the
+ * transcript the element actually lives in.
+ */
+function revealInContainer(el: HTMLElement | null): void {
+  const container = el?.closest('.chat-messages') as HTMLElement | null;
+  if (!el || !container) return;
+  const box = el.getBoundingClientRect();
+  const view = container.getBoundingClientRect();
+  if (box.bottom > view.bottom) container.scrollTop += box.bottom - view.bottom;
+  else if (box.top < view.top) container.scrollTop -= view.top - box.top;
+}
+
 function pastePlaceholder(seq: number, lines: number): string {
   return `[ 粘贴 #${seq} · ${lines} 行 ]`;
 }
@@ -458,6 +578,7 @@ function persistDraftPastes(sessionId: string | null, blocks: PastedBlock[]) {
 /** A `[ 粘贴 #N · M 行 ]` placeholder rendered as an expandable block. The body is
  *  read from disk ON DEMAND, so a huge paste costs nothing until you open it. */
 const PastedBlockView = memo<{ block: { seq: number; lines: number; chars: number; path: string } }>(({ block }) => {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const [body, setBody] = useState<string | null>(null);
   const [copied, setCopied] = useState(false);
@@ -490,18 +611,18 @@ const PastedBlockView = memo<{ block: { seq: number; lines: number; chars: numbe
         role="button"
         tabIndex={0}
         onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setOpen((o) => !o); } }}
-        title={open ? '点击收起' : '点击展开粘贴内容'}
+        title={open ? t('Click to collapse') : t('Click to expand the pasted content')}
       >
         <span className="user-code-caret">{open ? '▾' : '▸'}</span>
         <span className="user-code-kind">粘贴 #{block.seq}</span>
         <span className="user-code-meta">{block.lines} 行 · {block.chars} 字符</span>
-        <button type="button" className="user-code-copy" onClick={copy} title="复制">
-          {copied ? '✓ 已复制' : '复制'}
+        <button type="button" className="user-code-copy" onClick={copy} title={t('Copy')}>
+          {copied ? t('✓ Copied') : t('Copy')}
         </button>
       </div>
       {open && (
         <pre className="user-code-body">
-          <code>{missing ? '（粘贴内容已不可用：文件已被删除）' : (body ?? '读取中…')}</code>
+          <code>{missing ? t('(pasted content unavailable: the file was deleted)') : (body ?? '读取中…')}</code>
         </pre>
       )}
     </div>
@@ -540,6 +661,7 @@ const MessageItem = memo<{
   foldThinking: boolean;
   foldTools: boolean;
 }>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools }) => {
+  const t = useT();
   const [copied, setCopied] = useState(false);
   const actionLocked = isLastAssistant && isStreaming;
   // One assistant turn = the consecutive assistant/tool/subagent messages between
@@ -612,7 +734,7 @@ const MessageItem = memo<{
           const open = !isCollapsible || autoExpand || expandedTools.has(p.id);
           const firstLine = isCollapsible ? (p.body.split('\n').find((l) => l.trim()) || '').trim() : '';
           const hasMore = isCollapsible && p.body.trim().length > firstLine.length;
-          const chipLabel = p.variant === 'thinking' ? '💭 思考' : '🔧 工具';
+          const chipLabel = p.variant === 'thinking' ? t('💭 Thinking') : t('🔧 Tools');
           return (
             <div key={p.id} className={`turn-segment${p.variant ? ` variant-${p.variant}` : ''}`}>
               {isCollapsible && !autoExpand ? (
@@ -620,19 +742,19 @@ const MessageItem = memo<{
                   <button
                     className={`msg-variant-badge ${p.variant} as-toggle`}
                     onClick={() => toggleTool(p.id)}
-                    title={open ? '折叠' : '展开'}
+                    title={open ? t('Fold') : t('Expand')}
                   >
                     {open ? '▾' : '▸'} {chipLabel}
                   </button>
                   {!open && (
-                    <span className="tool-collapsed-preview" onClick={() => toggleTool(p.id)} title="展开">
+                    <span className="tool-collapsed-preview" onClick={() => toggleTool(p.id)} title={t('Expand')}>
                       {firstLine}{hasMore ? ' …' : ''}
                     </span>
                   )}
                 </div>
               ) : p.variant && (
                 <span className={`msg-variant-badge ${p.variant}`}>
-                  {p.variant === 'subagent' ? '🤖 子代理' : p.variant === 'thinking' ? '💭 思考' : '🔧 工具'}
+                  {p.variant === 'subagent' ? t('🤖 Subagents') : p.variant === 'thinking' ? t('💭 Thinking') : t('🔧 Tools')}
                 </span>
               )}
               {open && (streamThis ? (
@@ -652,7 +774,10 @@ const MessageItem = memo<{
         {turnFileChanges.length > 0 && (
           <div className="message-turn-panels">
             <FileChangesPanel fileChanges={turnFileChanges} />
-            <CommandsPanel fileChanges={turnFileChanges} />
+            {/* `live` = this turn is the one still running. The panel is open while it
+                runs and closes itself when it ends, so a finished turn does not leave a
+                wall of shell text in the transcript. */}
+            <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} />
           </div>
         )}
       </div>
@@ -798,6 +923,7 @@ function splitProseAndBlock(text: string): { head: string; block: string } {
 // one-line chip (kind + line/char count + Copy); click the chip to expand the
 // raw content in a scrollable <pre>. Copy works whether collapsed or expanded.
 const CollapsibleUserBlock = memo<{ content: string }>(({ content }) => {
+  const t = useT();
   const [open, setOpen] = useState(false);
   const [copied, setCopied] = useState(false);
   const body = content.replace(/\n$/, '');
@@ -840,13 +966,13 @@ const CollapsibleUserBlock = memo<{ content: string }>(({ content }) => {
             setOpen((o) => !o);
           }
         }}
-        title={open ? '点击收起' : '点击展开'}
+        title={open ? t('Click to collapse') : t('Click to expand')}
       >
         <span className="user-code-caret">{open ? '▾' : '▸'}</span>
         <span className="user-code-kind">{kind}</span>
         <span className="user-code-meta">{lineCount} 行 · {body.length} 字符</span>
-        <button type="button" className="user-code-copy" onClick={copy} title="复制">
-          {copied ? '✓ 已复制' : '复制'}
+        <button type="button" className="user-code-copy" onClick={copy} title={t('Copy')}>
+          {copied ? t('✓ Copied') : t('Copy')}
         </button>
       </div>
       {open && (
@@ -875,11 +1001,12 @@ const UserGroupItem = memo<{
    *  message Rerun is intentionally blocked in that state. */
   interrupted?: boolean;
   isLooping: boolean;
-  onLoopSetup: (text: string) => void;
+  onScheduleSetup: (text: string) => void;
   /** Needed to read an image attachment back from disk for its thumbnail. */
   attachmentSessionId?: string | null;
   onOpenAttachment?: (path: string) => void;
-}>(({ base, steers, isStreaming, onRerun, isLooping, onLoopSetup, interrupted, attachmentSessionId, onOpenAttachment }) => {
+}>(({ base, steers, isStreaming, onRerun, isLooping, onScheduleSetup, interrupted, attachmentSessionId, onOpenAttachment }) => {
+  const t = useT();
   const [copied, setCopied] = useState(false);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
@@ -927,13 +1054,13 @@ const UserGroupItem = memo<{
   }, [base.id, draft, onRerun]);
 
   // When edit mode opens, scroll the Rerun/Cancel actions into view so the
-  // button is never left hidden below the fold in a long conversation.
+  // button is never left hidden below the fold in a long conversation. Scrolls THIS
+  // transcript only -- scrollIntoView would also scroll the shared grid above it and
+  // drag the other panes along. See revealInContainer.
   const editActionsRef = useRef<HTMLDivElement>(null);
   useEffect(() => {
     if (!editing) return;
-    requestAnimationFrame(() => {
-      editActionsRef.current?.scrollIntoView({ block: 'nearest', behavior: 'smooth' });
-    });
+    requestAnimationFrame(() => revealInContainer(editActionsRef.current));
   }, [editing]);
 
   return (
@@ -1042,7 +1169,7 @@ const UserGroupItem = memo<{
       </div>
       {editing && (
         <div className="message-edit-actions" ref={editActionsRef}>
-          <button type="button" className="message-edit-btn cancel" onClick={() => setEditing(false)}>取消</button>
+          <button type="button" className="message-edit-btn cancel" onClick={() => setEditing(false)}>{t('Cancel')}</button>
           <button type="button" className="message-edit-btn rerun" onClick={submitRerun} disabled={isLooping || !draft.trim()}>Rerun</button>
         </div>
       )}
@@ -1063,24 +1190,29 @@ const UserGroupItem = memo<{
           {copied ? '✓' : <IconCopy size={14} />}
         </button>
         <button
-          className="message-action-btn loop-message-action"
-          onClick={() => onLoopSetup(combinedText)}
-          disabled={isLooping || isStreaming || !combinedText.trim()}
-          title="循环重发此消息"
-          aria-label="循环重发此消息"
+          className="message-action-btn schedule-message-action"
+          onClick={() => onScheduleSetup(combinedText)}
+          // NOT disabled during a turn. Inherited from the 🔁 loop button, where starting a loop
+          // mid-turn genuinely conflicted (the renderer drove those sends). Creating a SCHEDULE
+          // sends nothing now — it writes one record and main's ticker fires it later — so the
+          // guard only enforced "wait for the reply before you may schedule anything".
+          // Empty text still cannot be scheduled: there would be no prompt to send.
+          disabled={!combinedText.trim()}
+          title={t('Send this message again on a schedule')}
+          aria-label={t('Make it a scheduled job')}
         >
-          🔁
+          ⏰
         </button>
         <button
           className="message-action-btn"
           onClick={beginEdit}
           disabled={isLooping || interrupted}
           title={isLooping
-            ? '循环运行中，请先停止循环'
+            ? t('A loop is running — stop it first')
             : interrupted
-            ? '这一轮已被中断 — 请在下方输入框重新提交，新消息会覆盖被中断的这一轮'
-            : '编辑并重跑'}
-          aria-label="编辑并重跑"
+            ? t('This turn was interrupted — resubmit below; the new message replaces it')
+            : t('Edit and rerun')}
+          aria-label={t('Edit and rerun')}
         >
           <IconEdit size={14} />
         </button>
@@ -1101,6 +1233,7 @@ const QueueStack = memo<{
   /** Whether the whole queue will be sent as ONE merged turn (Settings toggle). */
   mergeQueued: boolean;
 }>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued }) => {
+  const t = useT();
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = useState('');
   if (queuedMessages.length === 0) return null;
@@ -1114,12 +1247,12 @@ const QueueStack = memo<{
           <span
             className={`queue-mode-badge ${mergeQueued ? 'merge' : ''}`}
             title={mergeQueued
-              ? '合并模式：整个队列会作为 1 条消息一次性发出（每批最多 10 条）'
-              : '逐条模式：每次只发队首 1 条，其余继续排队'}
+              ? t('Merged: the whole queue goes out as one message (10 per batch at most)')
+              : t('One by one: only the first is sent, the rest keep queueing')}
           >
             {mergeQueued
-              ? (queuedMessages.length > 1 ? `合并为 1 条发送` : '合并模式')
-              : '逐条发送'}
+              ? (queuedMessages.length > 1 ? t('Send as one message') : t('Merged'))
+              : t('One by one')}
           </span>
           <span>{queuedMessages.length}</span>
         </div>
@@ -1195,31 +1328,31 @@ const QueueStack = memo<{
 });
 
 /* Per-session composer drafts. A half-written prompt belongs to ITS chat -- it
-   must not follow the user into another session. Kept in a module-level map
-   (survives Composer remounts) and mirrored to localStorage so drafts also
-   survive an app restart. */
+   must not follow the user into another session.
+
+   Lifetime is ONE RUN, and that needs both halves:
+     - kept on DISK (ui-state.json), not just in this module, so a draft survives
+       anything that happens within a run -- a layout change that remounts the
+       composer, a renderer reload from HMR, a crashed window;
+     - wiped by MAIN at boot (RUN_SCOPED_UI_STATE_KEYS), so it never survives a
+       restart. Only main can tell a fresh launch from a reload of the same run; to
+       the renderer both look like a new page, which is why this is not done here. */
 const COMPOSER_DRAFTS_KEY = 'kirolex-composer-drafts';
 const composerDrafts: Record<string, string> = (() => {
   try {
-    // Shared store, NOT localStorage: localStorage is origin-scoped and this app has
-    // two renderer origins (file:// normally, http://localhost:5173 in dev), so an
-    // UNSENT draft was silently lost on every switch between `npm start` and
-    // `npm run dev:hot`. This one holds text the user typed, so losing it is worse
-    // than losing a panel width. The key already sat in ui-state.json as a migration
-    // leftover that nothing read.
+    // The shared store, NOT localStorage: that is origin-scoped and this app has two
+    // renderer origins (file:// normally, http://localhost:5173 in dev), so an unsent
+    // draft used to be lost on every switch between `npm start` and `npm run dev:hot`.
     const raw = uiGet(COMPOSER_DRAFTS_KEY);
     const parsed = raw ? JSON.parse(raw) : {};
     return parsed && typeof parsed === 'object' ? parsed : {};
   } catch { return {}; }
 })();
-function persistComposerDrafts() {
-  try { uiSet(COMPOSER_DRAFTS_KEY, JSON.stringify(composerDrafts)); } catch {}
-}
 function stashComposerDraft(sessionId: string | null, text: string) {
   if (!sessionId) return;
   if (text.trim()) composerDrafts[sessionId] = text;
   else delete composerDrafts[sessionId];
-  persistComposerDrafts();
+  try { uiSet(COMPOSER_DRAFTS_KEY, JSON.stringify(composerDrafts)); } catch {}
 }
 
 const ChatInputBox = memo<{
@@ -1239,20 +1372,22 @@ const ChatInputBox = memo<{
   queuedMessages: QueuedMessage[];
   restoredDraft: { id: number; text: string; sessionId?: string } | null;
   restoredInputDraft: { id: number; text: string; sessionId?: string } | null;
+  /** 接完这份交接就调它 —— 交接是一次性的（见 `handoffDraft`），不清就会每次挂载重放一遍 */
+  onConsumeRestoredDraft?: (id: number) => void;
+  onConsumeRestoredInputDraft?: (id: number) => void;
   onCancelQueuedMessage: (queueId: string) => void;
   onEditQueuedMessage: (queueId: string, content: string) => void;
   onMoveQueuedMessage: (queueId: string, direction: -1 | 1) => void;
   commands: SlashCommand[];
-  showSuggestions: boolean;
   suggestions: string[];
   onDropFiles: (files: AttachedFile[]) => void;
   onRemoveFile: (id: string) => void;
   attachedFiles: AttachedFile[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, showSuggestions, suggestions, onDropFiles, onRemoveFile, attachedFiles }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles }) => {
+  const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
   const featureFlags = useFeatureFlags();
-  const [selectedSuggestions, setSelectedSuggestions] = useState<Set<string>>(new Set());
   const [isComposing, setIsComposing] = useState(false);
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = useState('');
@@ -1300,37 +1435,58 @@ const ChatInputBox = memo<{
     textareaRef.current?.focus();
   }, []);
 
+  /** Which chips are picked, DERIVED from the composer text rather than kept in its
+   *  own state: a chip is selected exactly when its text sits on a line of its own in
+   *  the composer. One source of truth, so deleting a line by hand un-highlights its
+   *  chip and nothing can desync. */
+  const selectedSuggestions = useMemo(
+    () => new Set(input.split('\n').map((l) => l.trim()).filter(Boolean)),
+    [input],
+  );
+
   const toggleSuggestion = useCallback((suggestion: string) => {
-    setSelectedSuggestions((current) => {
-      const next = new Set(current);
-      if (next.has(suggestion)) next.delete(suggestion);
-      else next.add(suggestion);
-      setInput(suggestions.filter((prompt) => next.has(prompt)).join('\n'));
-      return next;
+    const pick = suggestion.trim();
+    setInput((prev) => {
+      const lines = prev.split('\n');
+      const at = lines.findIndex((l) => l.trim() === pick);
+      // Second click removes just that line, so picking is reversible.
+      if (at >= 0) {
+        lines.splice(at, 1);
+        return lines.join('\n').replace(/\n{3,}/g, '\n\n').replace(/^\n+/, '');
+      }
+      // APPEND. The old version rebuilt the whole box from the selected set, which
+      // silently threw away anything the user had typed themselves, and made the two
+      // interactions mutually exclusive.
+      const base = prev.replace(/\s+$/, '');
+      return base ? `${base}\n${pick}` : pick;
     });
     textareaRef.current?.focus();
-  }, [suggestions]);
+  }, []);
+
+  /**
+   * 交接过来的文本**取走一次就完** —— 「反复把之前的提示词填入输入框」。
+   *
+   * 两处交接（取消排队的消息 / 上一轮被打断）原来都是"设置一个状态、没人清"，
+   * 于是这个 effect 每次**挂载**都重放一遍：切回这条会话、进出分屏、布局变化 ——
+   * 早已处理完的中断还会一直回来。实测那条会话只被打断过一次，所以"反复"不是反复打断，
+   * 是同一份状态被反复消费。而且它会**盖掉**输入框按会话保留的草稿（你刚打的字）。
+   *
+   * 所以接完就调 `onConsume` 让拥有它的一方清掉（按 id 认，见 `handoffDraft`）。
+   * 归属判断也统一到那个模块：原来两处各写一遍，而其中一处的依赖里还漏了 `sessionId`。
+   */
+  useEffect(() => {
+    if (!shouldApplyHandoff(restoredDraft, sessionId)) return;
+    setInput(restoredDraft!.text);
+    onConsumeRestoredDraft?.(restoredDraft!.id);
+    requestAnimationFrame(() => textareaRef.current?.focus());
+  }, [restoredDraft, sessionId, onConsumeRestoredDraft]);
 
   useEffect(() => {
-    if (!restoredDraft) return;
-    // Same ownership guard as restoredInputDraft: a cancelled queue item belongs
-    // to ONE chat. Without this every visible composer swallowed it, so the text
-    // appeared in other split panes too (verified live).
-    if (restoredDraft.sessionId && restoredDraft.sessionId !== sessionId) return;
-    setInput(restoredDraft.text);
+    if (!shouldApplyHandoff(restoredInputDraft, sessionId)) return;
+    setInput(restoredInputDraft!.text);
+    onConsumeRestoredInputDraft?.(restoredInputDraft!.id);
     requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [restoredDraft, sessionId]);
-
-  // Cancel-restore: the interrupted turn's prompt (incl. same-turn steers) is
-  // pushed back here so the user can edit and resubmit (which overwrites it).
-  useEffect(() => {
-    if (!restoredInputDraft) return;
-    // A restored prompt belongs to ONE chat. Without this guard every visible
-    // composer picked it up, so text from chat A appeared in chat B.
-    if (restoredInputDraft.sessionId && restoredInputDraft.sessionId !== sessionId) return;
-    setInput(restoredInputDraft.text);
-    requestAnimationFrame(() => textareaRef.current?.focus());
-  }, [restoredInputDraft]);
+  }, [restoredInputDraft, sessionId, onConsumeRestoredInputDraft]);
 
   // Attachments alone are a valid message: images/files carry the intent, so an
   // empty text box must NOT block sending when something is attached.
@@ -1339,8 +1495,7 @@ const ChatInputBox = memo<{
   const handleSend = useCallback(() => {
     const text = input.trim();
     if (!text && attachedFiles.length === 0) return;
-    setInput('');
-    setSelectedSuggestions(new Set());
+    setInput('');   // clears the chip highlighting too: selection is derived from this
     if (text === '/stop') {
       onSend(text);
       return;
@@ -1363,8 +1518,7 @@ const ChatInputBox = memo<{
   const handleQueue = useCallback(() => {
     const text = input.trim();
     if (!text && attachedFiles.length === 0) return;
-    setInput('');
-    setSelectedSuggestions(new Set());
+    setInput('');   // clears the chip highlighting too: selection is derived from this
     // The queue card keeps the PLACEHOLDER text (a queued 500-line paste used to
     // render as a wall of text); the blocks ride along so the drain can expand it.
     const own = sessionId ? (draftPastes[sessionId] || []) : [];
@@ -1439,7 +1593,12 @@ const ChatInputBox = memo<{
     // so both must be migrated together on an upgrade.
     const clipFiles = Array.from(e.clipboardData?.files || []) as any[];
     const withPaths = clipFiles.filter((f) => f && typeof f.path === 'string' && f.path);
-    if (withPaths.length) {
+    // What this paste MEANS is decided in `pasteDecision.ts` (pure, tested). The condition used
+    // to live here as `hasImage && !plain`, which silently dropped every image pasted from a
+    // browser / Word / Excel / a chat app, because those put the image AND its alt text on the
+    // clipboard together.
+    const decision = decidePaste({ hasImage, plain, filesWithPaths: withPaths.length });
+    if (decision.kind === 'files') {
       e.preventDefault();
       // Images are capped first: an oversized one poisons the whole conversation,
       // because Bedrock validates EVERY image in the replayed history and rejects
@@ -1464,11 +1623,12 @@ const ChatInputBox = memo<{
       })();
       return;
     }
-    // An image flavour does NOT mean there is no text: copying from Excel, Preview
-    // or a browser puts both on the clipboard. Only take the image path when the
-    // clipboard is image-ONLY, otherwise a failed image save silently ate the text.
-    if (hasImage && !plain) {
-      e.preventDefault();
+    // An image flavour does NOT mean there is no text: copying from Excel, Preview, a browser or
+    // a chat app puts BOTH on the clipboard. Take the image either way — but when text came with
+    // it, do NOT prevent the default: the text then lands the ordinary way, so a failed image
+    // save cannot eat it (which is what the old either/or was protecting against).
+    if (decision.attachImage) {
+      if (decision.preventDefault) e.preventDefault();
       try {
         const res = await window.kiroApi.saveClipboardImage();
         if (!res) return;
@@ -1477,6 +1637,8 @@ const ChatInputBox = memo<{
           { id: `img_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`, name: `Screenshot ${n}`, path: res.path, isImage: true, preview: res.thumbnail },
         ]);
       } catch {}
+      // Returning is safe in the mixed case too: the default was NOT prevented, so the text has
+      // already been inserted by the browser.
       return;
     }
     // LARGE TEXT PASTE -> disk, exactly like a pasted image. Folding is decided by
@@ -1533,16 +1695,24 @@ const ChatInputBox = memo<{
 
   return (
     <>
-      {featureFlags.promptSuggestions !== false && (showSuggestions || input.trim() === '') && !isStreaming && !isLooping && suggestions.length > 0 && (
-        <div className="prompt-suggestions" aria-label="Starter prompts">
+      {/* Stays put while you pick. The gate used to include `input.trim() === ''`, so
+          the strip unmounted the moment the first chip landed in the composer -- which
+          made a multi-select control effectively single-select. The chips are already
+          scoped to the right moment without it: `suggestions` is the static starter set
+          for an empty chat and otherwise only the chips STAMPED for the current turn,
+          so they clear themselves when a new turn begins. */}
+      {featureFlags.promptSuggestions !== false && !isStreaming && !isLooping && suggestions.length > 0 && (
+        <div className="prompt-suggestions" aria-label={t('Starter prompts')}>
           {suggestions.map((suggestion) => (
             <button
               key={suggestion}
-              className={`prompt-chip ${selectedSuggestions.has(suggestion) ? 'selected' : ''}`}
-              onClick={() => toggleSuggestion(suggestion)}
-              title="点击添加这条提示；可以选择多条"
+              /* 提示词既是显示文案也是**真正插入输入框的文字** —— 所以整条走 `t()`：
+                 中文界面插入中文提示。`key` 保留原始英文 key（稳定身份，不随语言变）。 */
+              className={`prompt-chip ${selectedSuggestions.has(t(suggestion).trim()) ? 'selected' : ''}`}
+              onClick={() => toggleSuggestion(t(suggestion))}
+              title={t('Click to add this prompt (pick several); click again to remove. You can keep typing too.')}
             >
-              {suggestion}
+              {t(suggestion)}
             </button>
           ))}
         </div>
@@ -1550,7 +1720,7 @@ const ChatInputBox = memo<{
 
       <div className="composer">
         {cmdMatches.length > 0 && (
-        <div className="slash-command-menu" role="listbox" aria-label="Kiro CLI commands">
+        <div className="slash-command-menu" role="listbox" aria-label={t('Kiro CLI commands')}>
           {cmdMatches.slice(0, 8).map((command, index) => (
             <button
               key={command.name}
@@ -1580,7 +1750,7 @@ const ChatInputBox = memo<{
                 </span>
               )}
               <span className="attached-file-name">{file.name}</span>
-              <button className="attached-file-remove" onClick={() => onRemoveFile(file.id)} title="Remove attachment">✕</button>
+              <button className="attached-file-remove" onClick={() => onRemoveFile(file.id)} title={t('Remove attachment')}>✕</button>
             </div>
           ))}
         </div>
@@ -1591,7 +1761,7 @@ const ChatInputBox = memo<{
         className="composer-input"
         placeholder={
           isLooping
-            ? '正在循环重发消息，点击 Stop 停止'
+            ? t('Looping this message — click Stop to end it')
             : status !== 'connected'
             ? 'Connecting... (type /stop to force reconnect)'
             : isStreaming && queuedMessages.length > 0
@@ -1619,7 +1789,7 @@ const ChatInputBox = memo<{
           <button
             className="composer-icon-btn"
             onClick={handleFilePick}
-            title="Attach files"
+            title={t('Attach files')}
             disabled={isLooping || status !== 'connected'}
           >
             <IconPaperclip />
@@ -1633,15 +1803,15 @@ const ChatInputBox = memo<{
             disabled={isLooping || isStreaming || status !== 'connected'}
             aria-pressed={permissionMode === 'auto-approve'}
             title={permissionMode === 'auto-approve'
-              ? 'Auto-approve all tools (click to require approval)'
-              : 'Ask before each tool (click to auto-approve)'}
+              ? t('Auto-approve all tools (click to require approval)')
+              : t('Ask before each tool (click to auto-approve)')}
           >
             {permissionMode === 'auto-approve' ? (
               <>
                 <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
                   <polygon points="13 2 4 14 11 14 10 22 20 9 13 9" />
                 </svg>
-                Auto
+                {t('Auto')}
               </>
             ) : (
               <>
@@ -1649,7 +1819,7 @@ const ChatInputBox = memo<{
                   <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z" />
                   <polyline points="9 12 11.5 14.5 15.5 10" />
                 </svg>
-                Ask
+                {t('Ask')}
               </>
             )}
           </button>
@@ -1667,19 +1837,31 @@ const ChatInputBox = memo<{
           >
             <IconQueue />
           </button>
+          {/* Two variants, picked by a pane-width container query, rather than one
+              string left to ellipsize: the queue shortcut sits at the TAIL, so
+              truncation eats precisely the hint that matters here. */}
           <span className="composer-shortcut">
-            {isLooping
-              ? '循环运行中 · Stop 停止循环'
-              : isStreaming && queuedMessages.length > 0
-              ? `Enter append to queue tail · Shift+Enter newline · ${MOD_KEY}+Enter new queue item`
-              : isStreaming
-              ? `Enter steer running turn · Shift+Enter newline · ${MOD_KEY}+Enter queue`
-              : `Enter send · Shift+Enter newline · ${MOD_KEY}+Enter queue`}
+            <span className="composer-shortcut-full">
+              {isLooping
+                ? t('Loop running · Stop to end it')
+                : isStreaming && queuedMessages.length > 0
+                ? `Enter append to queue tail · Shift+Enter newline · ${MOD_KEY}+Enter new queue item`
+                : isStreaming
+                ? `Enter steer running turn · Shift+Enter newline · ${MOD_KEY}+Enter queue`
+                : `Enter send · Shift+Enter newline · ${MOD_KEY}+Enter queue`}
+            </span>
+            <span className="composer-shortcut-short">
+              {isLooping
+                ? t('Stop the loop')
+                : isStreaming && queuedMessages.length > 0
+                ? `${MOD_KEY}+Enter new queue item`
+                : `${MOD_KEY}+Enter queue`}
+            </span>
           </span>
         </div>
 
         {isLooping ? (
-          <button className="composer-send stop" onClick={onStopLoop} title="停止循环重发">
+          <button className="composer-send stop" onClick={onStopLoop} title={t('Stop looping')}>
             <span className="stop-btn-square" />
           </button>
         ) : isStreaming && !canSend ? (
@@ -1736,6 +1918,7 @@ const PLAN_STATUS_ICON: Record<string, string> = {
 // Agent execution plan / todo list (ACP `plan` update). Collapsible; shows
 // per-entry status. Only rendered when the session has a plan.
 const PlanPanel = memo<{ plan: PlanEntry[] }>(({ plan }) => {
+  const t = useT();
   const [collapsed, setCollapsed] = useState(false);
   if (!plan.length) return null;
   const done = plan.filter((e) => e.status === 'completed').length;
@@ -1743,19 +1926,28 @@ const PlanPanel = memo<{ plan: PlanEntry[] }>(({ plan }) => {
     <div className="turn-panel plan-panel">
       <button className="turn-panel-head" onClick={() => setCollapsed((c) => !c)}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
-        📋 计划 <span className="turn-panel-count">{done}/{plan.length}</span>
+        {t('📋 Task list')} <span className="turn-panel-count">{done}/{plan.length}</span>
       </button>
       {!collapsed && (
-        <ol className="plan-list">
-          {plan.map((entry, i) => (
-            <li key={i} className={`plan-item status-${entry.status || 'pending'}`}>
+        <ol className="plan-list" aria-label={t('Task list')}>
+          {plan.map((entry, i) => {
+            const current = entry.current === true || entry.status === 'in_progress';
+            return (
+            <li
+              key={i}
+              className={`plan-item status-${entry.status || 'pending'}${current ? ' current' : ''}`}
+              data-task-status={entry.status || 'pending'}
+              aria-current={current ? 'step' : undefined}
+            >
               <span className="plan-item-icon">{PLAN_STATUS_ICON[entry.status || 'pending'] || '○'}</span>
               <span className="plan-item-text">{entry.content}</span>
+              {current && <span className="plan-item-current">current</span>}
               {entry.priority && entry.priority !== 'medium' && (
                 <span className={`plan-item-pri pri-${entry.priority}`}>{entry.priority}</span>
               )}
             </li>
-          ))}
+            );
+          })}
         </ol>
       )}
     </div>
@@ -1776,6 +1968,21 @@ function diffStats(diff: FileDiff): { added: number; removed: number } {
 /** Tool kinds that RUN something. Mirrors RUN_KINDS in the main process. */
 const RUN_KINDS = new Set(['execute', 'run', 'bash', 'shell', 'command', 'terminal']);
 
+/** Drop the backend's live-sounding prefix from a RECORDED command.
+ *
+ *  kiro-cli's tool-call title is literally `Running: <cmd>`, and this panel keeps that
+ *  title verbatim as a historical record -- so a command that finished in 0.2s still
+ *  read as "Running". Next to a timeout notice saying 「没有工具在运行」 that looks like
+ *  the notice is lying, when in fact both were right and only this label was stale. The
+ *  panel heading already says these commands ran; their live state is the badge below. */
+function commandLabel(title: string): string {
+  return String(title || '').replace(/^\s*(?:running|executing|running command)\s*:\s*/i, '');
+}
+/** A tool call is still open unless the backend reported a terminal status. */
+function commandStillRunning(status?: string): boolean {
+  return !!status && status !== 'completed' && status !== 'failed';
+}
+
 /** 「运行的命令」 -- the commands executed this turn.
  *
  *  Separate from 「改动的文件」 on purpose: a command is not a changed file, and the
@@ -1786,8 +1993,30 @@ const RUN_KINDS = new Set(['execute', 'run', 'bash', 'shell', 'command', 'termin
  *  "created a script" and the .pptx appeared to come from nowhere -- the middle link
  *  of the causal chain was missing. This does NOT claim what the command wrote: KiroLex
  *  cannot know that, since a subprocess's writes carry no tool metadata at all. */
-const CommandsPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => {
-  const [collapsed, setCollapsed] = useState(false);
+/** First line of a recorded command, and how many more it has.
+ *
+ *  Commands are frequently multi-line for real (heredocs, `&&` chains split across
+ *  lines), and the panel rendered every line with `white-space: pre-wrap` -- one
+ *  `cat > file <<'EOF'` could push the rest of the turn off screen. */
+function commandFirstLine(title: string): { head: string; more: number } {
+  const text = commandLabel(title);
+  const nl = text.indexOf('\n');
+  if (nl < 0) return { head: text, more: 0 };
+  return { head: text.slice(0, nl), more: text.slice(nl + 1).split('\n').filter((l) => l.trim()).length };
+}
+
+const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean }>(({ fileChanges, live }) => {
+  const t = useT();
+  /** null = follow the turn; a click pins this panel's own choice.
+   *
+   *  Open while the turn is RUNNING (watching commands go by is the point of it) and
+   *  closed once it has finished, which is also how an older turn's panel starts. No
+   *  effect and no ref: the rule is a pure function of `live`, so it cannot get out of
+   *  step with the turn the way a state-syncing effect can. */
+  const [pinned, setPinned] = useState<boolean | null>(null);
+  const collapsed = pinned ?? !live;
+  /** Multi-line commands the user asked to see in full, by tool-call id. */
+  const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   const cmds = useMemo(() => {
     const byId = new Map<string, ToolCall>();
     for (const tc of fileChanges) {
@@ -1796,23 +2025,63 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => {
     return Array.from(byId.values());
   }, [fileChanges]);
   if (!cmds.length) return null;
+  const preview = commandFirstLine(cmds[0].title);
   return (
     <div className="turn-panel commands-panel">
-      <button className="turn-panel-head" onClick={() => setCollapsed((c) => !c)}>
+      <button className="turn-panel-head" onClick={() => setPinned(!collapsed)}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
-        ⚡ 运行的命令 <span className="turn-panel-count">{cmds.length}</span>
+        {/* A span, not a bare text node: as an anonymous flex item it competes with the
+            preview for width and wraps instead of letting the preview clip. */}
+        <span className="turn-panel-label">{t('⚡ Commands run')}</span>
+        <span className="turn-panel-count">{cmds.length}</span>
+        {/* Collapsed is ONE line in total: the first line of the first command, clipped.
+            Enough to recognise what ran without the panel taking over the turn. */}
+        {collapsed && (
+          <span className="commands-preview" title={cmds[0].title}>
+            {preview.head}
+            {cmds.length > 1 ? ` … +${cmds.length - 1}` : ''}
+          </span>
+        )}
       </button>
       {!collapsed && (
         <ul className="files-list">
-          {cmds.map((c) => (
-            <li key={c.toolCallId} className="files-item">
-              <div className="files-item-row">
-                <span className="files-item-kind">{c.kind}</span>
-                <span className="commands-item-title" title={c.title}>{c.title}</span>
-                {c.status === 'failed' && <span className="stat-del">失败</span>}
-              </div>
-            </li>
-          ))}
+          {cmds.map((c) => {
+            const { head, more } = commandFirstLine(c.title);
+            const open = expandedIds.has(c.toolCallId);
+            return (
+              <li key={c.toolCallId} className="files-item">
+                <div className="files-item-row">
+                  <span className="files-item-kind">{c.kind}</span>
+                  {/* First line by default, whole thing on click -- never only a
+                      tooltip: a command is the record of what actually ran, so it has
+                      to stay readable and selectable. */}
+                  <span
+                    className={`commands-item-title${open ? ' full' : ''}`}
+                    title={c.title}
+                  >
+                    {open ? commandLabel(c.title) : head}
+                  </span>
+                  {more > 0 && (
+                    <button
+                      type="button"
+                      className="commands-more"
+                      title={open ? t('Show the first line only') : t('Show the full command')}
+                      onClick={() => setExpandedIds((prev) => {
+                        const next = new Set(prev);
+                        if (next.has(c.toolCallId)) next.delete(c.toolCallId);
+                        else next.add(c.toolCallId);
+                        return next;
+                      })}
+                    >
+                      {open ? t('Collapse') : `+${more} 行`}
+                    </button>
+                  )}
+                  {c.status === 'failed' && <span className="stat-del">{t('Failed')}</span>}
+                  {commandStillRunning(c.status) && <span className="stat-add">{t('Running')}</span>}
+                </div>
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>
@@ -1855,6 +2124,7 @@ const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label
   );
 };
 const FileChangesPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => {
+  const t = useT();
   const [collapsed, setCollapsed] = useState(false);
   const [openPath, setOpenPath] = useState<string | null>(null);
   const files = useMemo(() => {
@@ -1893,7 +2163,7 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => 
     <div className="turn-panel files-panel">
       <button className="turn-panel-head" onClick={() => setCollapsed((c) => !c)}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
-        📝 改动的文件 <span className="turn-panel-count">{files.length}</span>
+        {t('📝 Changed files')} <span className="turn-panel-count">{files.length}</span>
       </button>
       {!collapsed && (
         <ul className="files-list">
@@ -1913,7 +2183,7 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => 
                   )}
                   {f.diff && (
                     <button className="files-item-peek" onClick={() => setOpenPath(expanded ? null : f.path)}>
-                      {expanded ? '收起' : 'diff'}
+                      {expanded ? t('Collapse') : 'diff'}
                     </button>
                   )}
                 </div>
@@ -1949,12 +2219,27 @@ interface ChatAreaProps {
     quietSeconds: number;
     openTools: number;
     toolIdleSeconds: number;
-    cpuBusy: boolean;
-    cpuVetoLeftSeconds: number;
     interruptInSeconds: number | null;
+    boundBy: 'tool' | 'quiet';
+    boundSeconds: number;
   } | null;
   permissionRequest: PermissionRequest | null;
   onRespondPermission: (optionId: string) => Promise<void>;
+  /**
+   * 这条会话当前还在跑的子代理（kiro 的 `use_subagent`）。
+   *
+   * 会话里原来只渲染子代理**说过的话**（`🤖 子代理` 那些折叠块），看不到"现在有几个在跑、各自在干
+   * 什么" —— 而那正是它慢下来时你要的信息。侧栏那个 `🤖 N` 有同一份数据，但只在 tooltip 里。
+   */
+  subagents?: SubagentRow[];
+  /** 需要报警的记忆层，已按 global → project → session 排好序（`memoryPolicy.memoryWarnings`）。
+   *  空数组就是三层都在阈值以内，顶部什么都不显示。 */
+  memoryWarnings: MemoryWarning[];
+  /** 正在压缩的层，形如 `project:Dev`；null 表示空闲。压缩期间三条横幅的按钮都禁用 —— 它们最终都
+   *  是往同一条会话发消息，同时发两条只会互相打断。 */
+  compactingMemoryScope: string | null;
+  onCompactMemory: (scope: MemoryScope) => void;
+  onOpenMemory: () => void;
   usage: { contextPercent: number; credits: number; turnMs?: number } | null;
   plan: PlanEntry[];
   autoFoldThinking: boolean;
@@ -1987,7 +2272,12 @@ interface ChatAreaProps {
   historyLoading: boolean;
   queuedMessages: QueuedMessage[];
   restoredQueueDraft: { id: number; text: string } | null;
+  /** 搜索条开着吗 —— 开着就把整份记录挂上（`findInPage` 只搜已渲染的 DOM，见 App 那段注释）。 */
+  searchOpen?: boolean;
   restoredInputDraft: { id: number; text: string; sessionId?: string } | null;
+  /** 接完这份交接就调它 —— 交接是一次性的（见 `handoffDraft`），不清就会每次挂载重放一遍 */
+  onConsumeRestoredDraft?: (id: number) => void;
+  onConsumeRestoredInputDraft?: (id: number) => void;
   onQueueMessage: (text: string, pastes?: PastedBlock[]) => void;
   onCancelQueuedMessage: (queueId: string) => void;
   onEditQueuedMessage: (queueId: string, content: string) => void;
@@ -1996,7 +2286,26 @@ interface ChatAreaProps {
   contextLinks: { sourceId: string; sourceTitle: string }[];
   onToggleContextSource: (sourceSessionId: string) => void;
   isLooping: boolean;
-  onStartLoop: (text: string, intervalSec: number) => void;
+  /** Create a time-triggered task from this message's text. No goal and no verifier:
+   *  these tasks fire on a clock, and the previous run's result does not change the next
+   *  run's action -- which is the only thing that would make it a loop. */
+  onStartSchedule: (spec: ScheduleSpec) => void;
+  /** This chat's standing schedule, already reduced to one line by `sessionScheduleSummary`.
+   *  Null when there is nothing pending — the banner is then absent, not empty, because an
+   *  empty chip still reads as "scheduled". Liveness and wording are decided in that helper,
+   *  so this component neither filters jobs nor formats a countdown. */
+  scheduleSummary?: ScheduleSummary | null;
+
+  /** The project this chat belongs to, or null when it is unassigned. The flow rail is offered
+   *  ONLY when there is one: a flow is a property of a project, so a "流程" entry on an
+   *  unassigned chat claims something that cannot exist (observed live — the rail appeared on a
+   *  chat in the Unassigned bucket and drew SFDC's flow beside an unrelated conversation). */
+  projectName?: string | null;
+  /** Pause/resume and cancel THIS chat's job. Both relay to main, which owns the record —
+   *  before these existed a job's only exits were its run budget and editing the store. */
+  onPauseSchedule?: (id: string, paused: boolean) => void;
+  onCancelSchedule?: (id: string) => void;
+  /** Stop whatever automation currently owns this session. */
   onStopLoop: () => void;
   /** Split-pane monitor mode: transcript + live indicators + permission bar,
    *  but no composer/queue — you type in the focused pane. */
@@ -2042,6 +2351,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   stall,
   permissionRequest,
   onRespondPermission,
+  subagents = [],
+  memoryWarnings,
+  compactingMemoryScope,
+  onCompactMemory,
+  onOpenMemory,
   usage,
   onManageContext,
   plan,
@@ -2072,7 +2386,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   historyLoading,
   queuedMessages,
   restoredQueueDraft,
+  searchOpen,
   restoredInputDraft,
+  onConsumeRestoredDraft,
+  onConsumeRestoredInputDraft,
   onQueueMessage,
   onCancelQueuedMessage,
   onEditQueuedMessage,
@@ -2081,7 +2398,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   contextLinks,
   onToggleContextSource,
   isLooping,
-  onStartLoop,
+  onStartSchedule,
+  scheduleSummary,
+  projectName,
+  onPauseSchedule,
+  onCancelSchedule,
   onStopLoop,
   readOnly = false,
   paneFocused = true,
@@ -2155,8 +2476,46 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }, 400);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [messages, isStreaming, currentSessionId]);
-  const [loopSetup, setLoopSetup] = useState<{ text: string } | null>(null);
-  const [loopSeconds, setLoopSeconds] = useState('');
+  /** SCHEDULING replaced loop mode. The loop declared a goal and a verifier command and
+   *  iterated until the check passed -- a coding shape. The real scenarios here (weekly
+   *  report, SFDC logging, oncall) are time-triggered: the previous run's result does not
+   *  change the next run's action, which is the only test of whether something is a loop.
+   *  So there is no goal and no verifier here, on purpose. */
+  const [scheduleSetup, setScheduleSetup] = useState<{ text: string } | null>(null);
+  const [schedKind, setSchedKind] = useState<'interval' | 'daily' | 'weekly' | 'once'>('daily');
+  const [schedEvery, setSchedEvery] = useState('60');
+  const [schedTime, setSchedTime] = useState('09:00');
+  const [schedWeekday, setSchedWeekday] = useState('1');
+  const [schedOnceAt, setSchedOnceAt] = useState('');
+  /** A VISIBLE prefill, not a silent fallback: every run costs a model turn, so the
+   *  ceiling is a number the user can see and change. */
+  const [schedMaxRuns, setSchedMaxRuns] = useState(String(DEFAULT_MAX_RUNS));
+  /** Cancelling a job deletes its prompt and trigger, so the banner's 🗑️ arms before it fires.
+   *  The arm expires: a click left behind on a pane you walked away from must not still be
+   *  waiting to delete tomorrow's run. */
+  const [cancelArmed, setCancelArmed] = useState(false);
+  const cancelArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  useEffect(() => () => { if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current); }, []);
+
+  const draftSchedule = useMemo<ScheduleSpec>(() => ({
+    prompt: scheduleSetup?.text || '',
+    kind: schedKind,
+    everySec: schedKind === 'interval' ? (Number.parseInt(schedEvery, 10) || 0) * 60 : 0,
+    atTime: schedKind === 'daily' || schedKind === 'weekly' ? schedTime : undefined,
+    weekday: schedKind === 'weekly' ? Number.parseInt(schedWeekday, 10) : undefined,
+    atEpoch: schedKind === 'once' ? Date.parse(schedOnceAt) : undefined,
+    maxRuns: Number.parseInt(schedMaxRuns, 10) || 0,
+  }), [scheduleSetup, schedKind, schedEvery, schedTime, schedWeekday, schedOnceAt, schedMaxRuns]);
+  const scheduleProblems = useMemo(() => validateSchedule(draftSchedule), [draftSchedule]);
+  /** Stable, because it is handed to a MEMOISED message item.
+   *
+   *  It was an inline arrow, so every render of this component gave all user groups a
+   *  new prop identity and their `memo` bailed out -- meaning each of the (up to 120)
+   *  rendered groups re-rendered on ANY app re-render, including one caused by a chunk
+   *  arriving in a different pane or by clicking another pane. */
+  const openScheduleSetup = useCallback((text: string) => {
+    setScheduleSetup({ text });
+  }, []);
   const [showImportPicker, setShowImportPicker] = useState(false);
   const [pickerPos, setPickerPos] = useState<{ left: number; bottom: number }>({ left: 0, bottom: 0 });
   const importBtnRef = useRef<HTMLButtonElement>(null);
@@ -2332,9 +2691,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     // decision now arrives as a state update, so this handler returns immediately.
     if (hasUnsavedDrafts) {
       setConfirm({
-        title: '未保存的 Agent 配置',
+        title: t('Unsaved agent config'),
         message: '关闭编辑器会丢弃所有未保存的 Agent 配置草稿。\n\n此操作不可恢复。',
-        confirmLabel: '丢弃',
+        confirmLabel: t('Discard'),
         destructive: true,
         onConfirm: discardAgentConfig,
       });
@@ -2412,8 +2771,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return 140;
   });
   const [inputCollapsed, setInputCollapsed] = useState(false);
-  const messagesEndRef = useRef<HTMLDivElement>(null);
+  const t = useT();
   const chatMessagesRef = useRef<HTMLDivElement>(null);
+
+  /*
+    ── 这一格自己的会话内搜索（Cmd+F）─────────────────────────────────────────────
+    「哪个分屏的搜索应该显示在那个分屏中」。所以状态在 ChatArea 里,不在 App 里:
+    每格一份,各算各的计数,互不打断。命中怎么算见 `paneFind.ts`,怎么画见 `findHighlight.ts`。
+  */
+  const [findOpen, setFindOpen] = useState(false);
+  const [findQuery, setFindQuery] = useState('');
+  /** 当前是第几个命中,1 起;0 = 还没定位（或者没有命中）。 */
+  const [findActive, setFindActive] = useState(0);
+  const [findTotal, setFindTotal] = useState(0);
+  const findInputRef = useRef<HTMLInputElement>(null);
+  /** 这一次搜出来的 `Range`,和 `findActive` 一起用。放 ref 里:它不参与渲染。 */
+  const findRangesRef = useRef<Range[]>([]);
+  /**
+   * 高亮注册表里这一格的 key。用**这一格渲染的那条会话**的 id —— 一个会话同时只在一格里显示,
+   * 所以它天然是每格唯一的。名字叫 `currentSessionId` 但在后台格里它就是那一格的会话。
+   */
+  const findKey = currentSessionId || 'no-session';
   // Sticky-bottom autoscroll state: true only while the user is parked at the
   // bottom. Declared before any effect that reads it (dependency arrays are
   // evaluated during render -- a later declaration would hit TDZ).
@@ -2490,20 +2868,32 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     // parked at the bottom. If they scrolled up to read history, incoming
     // messages must NOT yank the view down.
     if (!stickToBottomRef.current) return;
-    messagesEndRef.current?.scrollIntoView({ behavior: 'instant' });
+    // This pane's container only. This ran on EVERY message update, so it was the
+    // most frequent way a streaming turn in one pane could shift the whole grid.
+    scrollContainerToBottom(chatMessagesRef.current, () => stickToBottomRef.current);
   }, [messages]);
 
   // Switching chats always starts at the bottom (freshest turn) and re-arms stick.
   useEffect(() => {
     stickToBottomRef.current = true;
     setShowJumpToBottom(false);
-    requestAnimationFrame(() => messagesEndRef.current?.scrollIntoView({ behavior: 'instant' }));
+    requestAnimationFrame(() => scrollContainerToBottom(chatMessagesRef.current, () => stickToBottomRef.current));
   }, [currentSessionId]);
 
   const jumpToBottom = useCallback(() => {
     stickToBottomRef.current = true;
     setShowJumpToBottom(false);
-    messagesEndRef.current?.scrollIntoView({ behavior: 'smooth' });
+    // Instant, and confined to this transcript. It used to be a SMOOTH
+    // scrollIntoView, which failed in two ways at once:
+    //   - it scrolled the shared ancestors too (.chat-main/.chat-row/.chat-grid are
+    //     all overflow:hidden, which does NOT make them unscrollable), so the other
+    //     panes moved and the grid was left displaced with no scrollbar to undo it;
+    //   - starting from high up in the transcript, the animation's own scroll events
+    //     hit the `scrollTop <= 80` branch below, which loads older groups; the
+    //     layout effect that compensates for prepended content then writes scrollTop,
+    //     and that write CANCELS the in-flight smooth scroll -- so the view stopped
+    //     somewhere in the middle instead of at the latest message.
+    scrollContainerToBottom(chatMessagesRef.current, () => stickToBottomRef.current);
   }, []);
 
   // Ctrl+A only selects chat messages content
@@ -2660,11 +3050,127 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return groups;
   }, [orderedMessages]);
 
-  // Only the last `renderLimit` groups are mounted; older ones load on scroll-up.
-  const visibleGroups = renderGroups.length > renderLimit
-    ? renderGroups.slice(renderGroups.length - renderLimit)
+  /**
+   * 清空过上下文的会话，**默认只显示清空之后的部分** ——
+   * 「技术问题 这个会话 clear 了之后再打开还有历史会话呢」。
+   *
+   * `/clear` 重置的是模型的活动上下文，transcript 刻意不动（那是审计链，也是重启后重建上下文的依据）。
+   * 但重新打开时界面上摆着 183 条**模型已经不记得**的消息、而且一个字都不说 ——
+   * 你看到的和模型知道的不是同一份，这比两个极端都糟。
+   *
+   * 所以默认窗口收到那条分界线上，更早的用**现成的**「加载更早的消息」按钮取回（记录一条没少）。
+   * 判据在 `clearBoundary.sinceLastClear`：认用户自己那条 `/clear`，不认后端那句英文的
+   * `Conversation cleared`（那是后端措辞，哪天改了这条判据就静默失效）。
+   */
+  const afterClear = sinceLastClear(orderedMessages as any);
+  const clearedGroupIndex = afterClear === undefined
+    ? -1
+    : renderGroups.findIndex((g: any) => isClearCommand(g?.base));
+  /** 清空之后有几组。找不到那一组（它被合并进了别人）就退回不干预。 */
+  const groupsSinceClear = clearedGroupIndex >= 0 ? renderGroups.length - clearedGroupIndex : 0;
+  /**
+   * 搜索时**不设窗口**：我们只搜已经挂上的 DOM,窗口挡住的就是搜不到的（自绘高亮和
+   * `findInPage` 在这一点上一样）。清空边界那条收窄也一起让开 —— 否则清空过的会话
+   * 搜不到清空之前的内容。
+   *
+   * 判据是**这一格自己的** `findOpen`,不再是全局那一个:分屏时只有你真的在搜的那一格
+   * 需要付「挂完整棵树」的代价,旁边那格照旧只挂最近 120 组。
+   */
+  const expandForFind = findOpen || !!searchOpen;
+  const windowSize = expandForFind
+    ? renderGroups.length
+    : (groupsSinceClear > 0 ? Math.min(renderLimit, groupsSinceClear) : renderLimit);
+  // Only the last `windowSize` groups are mounted; older ones load on scroll-up.
+  const visibleGroups = renderGroups.length > windowSize
+    ? renderGroups.slice(renderGroups.length - windowSize)
     : renderGroups;
   const hiddenGroupCount = renderGroups.length - visibleGroups.length;
+
+  /**
+   * 重新算这一格的命中。
+   *
+   * 等**两帧**再算,和当年 `findInPage` 那版同一个理由:`findOpen` 变 true 让 `windowSize` 整开,
+   * 而那棵树是下一帧才挂上来的 —— 同一帧里算,搜的还是旧的那 120 组,表现成「第一次搜没结果,
+   * 再敲一个字才对」。
+   *
+   * 依赖里带 `visibleGroups.length`:挂上来多少组会变（展开、加载更早、新消息),变了就得重算,
+   * 否则命中数停在旧的那份上。
+   */
+  useEffect(() => {
+    const root = chatMessagesRef.current;
+    if (!findOpen || !root || !shouldSearch(findQuery)) {
+      findRangesRef.current = [];
+      clearPane(findKey);
+      setFindTotal(0);
+      setFindActive(0);
+      return;
+    }
+    let raf2 = 0;
+    const raf1 = requestAnimationFrame(() => {
+      raf2 = requestAnimationFrame(() => {
+        const el = chatMessagesRef.current;
+        if (!el) return;
+        const offsets = matchOffsets(textOf(el), findQuery);
+        const ranges = rangesIn(el, findQuery, offsets);
+        findRangesRef.current = ranges;
+        setPaneRanges(findKey, ranges);
+        setFindTotal(ranges.length);
+        // 换了词就回到第 1 个;没有命中就没有「当前」
+        const first = ranges.length ? 1 : 0;
+        setFindActive(first);
+        setActive(first ? ranges[0] : null);
+      });
+    });
+    return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
+  }, [findOpen, findQuery, findKey, visibleGroups.length]);
+
+  /** 这一格没了(关掉、换会话)就把它的高亮撤掉 —— 留着会画在别的会话的字上。 */
+  useEffect(() => () => { clearPane(findKey); }, [findKey]);
+
+  /** ↑/↓ 跳到上一个/下一个命中。绕回去的算术在 `stepIndex` 里（可测)。 */
+  const findStep = useCallback((direction: 'next' | 'prev') => {
+    const ranges = findRangesRef.current;
+    if (!ranges.length) return;
+    setFindActive((current) => {
+      const next = stepIndex(current, ranges.length, direction);
+      setActive(ranges[next - 1] || null);
+      return next;
+    });
+  }, []);
+
+  const closeFind = useCallback(() => {
+    setFindOpen(false);
+    setFindQuery('');
+    findRangesRef.current = [];
+    clearPane(findKey);
+    setFindTotal(0);
+    setFindActive(0);
+  }, [findKey]);
+
+  /**
+   * Cmd/Ctrl+F 打开**这一格**的搜索条 —— 只有聚焦的那一格响应,否则一次按键会把每格都打开。
+   *
+   * capture 阶段:composer 的 textarea 和队列卡片各有自己的 keydown,冒泡阶段会被它们先吃掉 ——
+   * 而「在输入框里按 Cmd+F」正是最常用的时刻。
+   */
+  useEffect(() => {
+    if (!paneFocused) return;
+    const onKey = (event: KeyboardEvent) => {
+      if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
+        event.preventDefault();
+        setFindOpen(true);
+        // 已经开着时再按一次 = 选中现有查询词,方便直接改写（编辑器通行行为）
+        setTimeout(() => findInputRef.current?.select(), 0);
+        return;
+      }
+      if (event.key === 'Escape' && findOpen) {
+        event.preventDefault();
+        closeFind();
+      }
+    };
+    window.addEventListener('keydown', onKey, true);
+    return () => window.removeEventListener('keydown', onKey, true);
+  }, [paneFocused, findOpen, closeFind]);
 
   return (
     <div
@@ -2674,6 +3180,42 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       onDragEnter={readOnly ? undefined : handleDragEnter}
       onDragLeave={readOnly ? undefined : handleDragLeave}
     >
+      {/*
+        这一格自己的搜索条 —— 「哪个分屏的搜索应该显示在那个分屏中」。
+
+        `position: absolute` 落在**这一格里**（`.chat-main` 是 `position: relative`),而不是像上一版
+        那样 `position: fixed` 浮在整个窗口的右上角。上一版的两个毛病都出在那个 fixed 上:
+          ① 它属于窗口,所以分屏时说不清它在搜哪一格（而 `findInPage` 也确实在搜全部);
+          ② 实测它被 `.chat-grid`（z-index 1001）整个盖住,点下去落到 `.chat-messages` 上,
+             输入框根本拿不到焦点 —— 看起来就是「搜索没反应」。
+        长在格子里,这两件事都不存在:它跟着格子走,z-index 只需要压住格子内部的东西。
+      */}
+      {findOpen && (
+        <div className="pane-find" role="search">
+          <input
+            ref={findInputRef}
+            className="pane-find-input"
+            autoFocus
+            placeholder={t('Find in this chat…')}
+            value={findQuery}
+            onChange={(e) => setFindQuery(e.target.value)}
+            onKeyDown={(e) => {
+              // stopPropagation 是必须的:否则这个 Enter 冒泡出去会被聊天区当成「发送」
+              if (e.key === 'Enter') {
+                e.preventDefault();
+                e.stopPropagation();
+                findStep(e.shiftKey ? 'prev' : 'next');
+              }
+            }}
+          />
+          <span className="pane-find-count">
+            {findLabel({ query: findQuery, active: findActive, total: findTotal })}
+          </span>
+          <button className="pane-find-btn" onClick={() => findStep('prev')} title={t('Previous (Shift+Enter)')}>↑</button>
+          <button className="pane-find-btn" onClick={() => findStep('next')} title={t('Next (Enter)')}>↓</button>
+          <button className="pane-find-btn" onClick={closeFind} title={t('Close (Esc)')}>✕</button>
+        </div>
+      )}
       {isDragOver && (
         <div className="drop-overlay">
           <div className="drop-overlay-content">
@@ -2689,9 +3231,101 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <button
               className="chat-error-banner-close"
               onClick={onDismissError}
-              title="关闭提示"
-              aria-label="关闭提示"
+              title={t('Dismiss')}
+              aria-label={t('Dismiss')}
             >✕</button>
+          )}
+        </div>
+      )}
+
+      {/*
+        记忆过大的横幅 —— 三层各一条，**放在最上面**。
+
+        为什么要有：注入块每一轮都发，而三层里只有会话层有上限（`MAX_CHARS = 1200`，且只约束自动
+        压缩那条路）。这笔钱之前完全无声，看不见就永远不会去清理 —— 实测某个项目到过 74 KB。
+
+        为什么在顶部而不是 composer 上方：底部那块地方是给「此刻这一轮」的东西的（权限请求、排队、
+        提示词建议），而这是一条要一直挂到你去清理为止的常驻状态。放底部会跟着输入区一起挤压滚动
+        高度，也更容易被当成和当前这轮有关。
+
+        它自己会消失：体积来自每轮注入后的播报 + 切会话/关 MemoryDialog 时的按需重取，所以你压缩完
+        或手动删完横幅就没了 —— 不需要一个「不再提醒」的开关。
+      */}
+      {/*
+        正在跑的子代理 —— 实时，全部结束就自己消失（`activeSubagents` 只算没 terminated 的）。
+        放在顶部这一层的理由和记忆横幅一样：它是"这条会话现在的状态"，不属于某一轮消息。
+      */}
+      {activeSubagents(subagents).length > 0 && (
+        <div className="chat-crew-bar" role="status">
+          <span className="chat-crew-count">🤖 {activeSubagents(subagents).length} 个子代理在跑</span>
+          {activeSubagents(subagents).map((row) => (
+            <span className="chat-crew-item" key={row.name} title={`${row.name}（${row.agentName || '未知 agent'}）`}>
+              <b>{row.name}</b>
+              {row.statusMessage ? <span>{row.statusMessage}</span> : null}
+            </span>
+          ))}
+        </div>
+      )}
+      {memoryWarnings.map((warning) => {
+        const busy = compactingMemoryScope !== null;
+        return (
+          <div className="memory-warn-bar" role="status" key={warning.scope}>
+            <span className="memory-warn-text">
+              ⚠ {warning.label} {formatMemoryBytes(warning.bytes)} — 每轮对话都会完整发送
+            </span>
+            <button
+              className="memory-warn-btn"
+              onClick={() => onCompactMemory(warning.scope)}
+              disabled={busy}
+              title={t('Back it up, then have this chat merge and de-duplicate the memory file (merge only — facts that still hold are kept)')}
+            >
+              {compactingMemoryScope?.startsWith(`${warning.scope}:`) ? t('Compacting…') : t('Compact')}
+            </button>
+            <button className="memory-warn-btn ghost" onClick={onOpenMemory} title={t('Open the memory editor and clean it up yourself')}>
+              {t('View')}
+            </button>
+          </div>
+        );
+      })}
+
+      {/* ABOVE the transcript, not in the composer (where the archive notice lives): a
+          schedule is a standing property of the chat, and it has to be visible while you
+          read history — including when the composer is collapsed. */}
+      {scheduleSummary && (
+        <div
+          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
+          title={scheduleSummary.text}
+        >
+          <span className="schedule-banner-icon">{scheduleSummary.paused ? '⏸️' : '⏰'}</span>
+          <span className="schedule-banner-text">{scheduleSummary.text}</span>
+          {scheduleSummary.next && (
+            <>
+              {/* Pause is REVERSIBLE, so one click. It is also the honest way to stop a job you
+                  might want back — cancelling loses the prompt and the remaining budget. */}
+              <button
+                className="schedule-banner-pause"
+                onClick={() => onPauseSchedule?.(scheduleSummary.next!.id, !scheduleSummary.paused)}
+                title={scheduleSummary.paused ? t('Resume: keep running on the original schedule') : t('Pause: keep the job, stop it firing')}
+              >{scheduleSummary.paused ? t('▶️ Resume') : t('⏸️ Pause')}</button>
+              {/* Cancel is NOT reversible (the prompt and trigger are deleted), so it arms
+                  first. The armed state resets on its own so a forgotten click cannot sit
+                  there waiting to delete a job days later. */}
+              <button
+                className={`schedule-banner-cancel${cancelArmed ? ' armed' : ''}`}
+                onClick={() => {
+                  if (!cancelArmed) {
+                    setCancelArmed(true);
+                    if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current);
+                    cancelArmTimer.current = setTimeout(() => setCancelArmed(false), 4000);
+                    return;
+                  }
+                  if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current);
+                  setCancelArmed(false);
+                  onCancelSchedule?.(scheduleSummary.next!.id);
+                }}
+                title={cancelArmed ? t('Click again to confirm cancellation (cannot be undone)') : t('Cancel this scheduled job')}
+              >{cancelArmed ? t('Confirm cancel?') : t('🗑️ Cancel')}</button>
+            </>
           )}
         </div>
       )}
@@ -2715,7 +3349,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         {messages.length === 0 && historyLoading && (
           <div style={{ textAlign: 'center', marginTop: '20vh', color: 'var(--text-muted)' }}>
             <div className="history-loading-spinner" />
-            <div style={{ marginTop: 14, fontSize: 13 }}>正在加载历史记录…</div>
+            <div style={{ marginTop: 14, fontSize: 13 }}>{t('Loading history…')}</div>
           </div>
         )}
         {messages.length === 0 && !historyLoading && (
@@ -2750,7 +3384,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         )}
 
         {visibleGroups.map((group) => (
-          group.kind === 'user' ? (
+          /*
+            清空那条**画成分界线**，不画成用户气泡：一个写着 `/clear` 的气泡说不出
+            「上面的模型不记得了」，而那正是这条消息在这一页上唯一的意义。
+            两句话都要有：上面的不记得了（否则你以为它记得）、记录还在（否则你以为清空把历史弄丢了）。
+          */
+          group.kind === 'user' && isClearCommand((group as any).base) ? (
+            <div className="chat-clear-line" key={`${currentSessionId ?? 'none'}:${group.base.id}`}>
+              <span>{clearNoteText(hiddenGroupCount)}</span>
+            </div>
+          ) : group.kind === 'user' ? (
             <UserGroupItem
               key={`${currentSessionId ?? 'none'}:${group.base.id}`}
               base={group.base}
@@ -2761,10 +3404,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               onOpenAttachment={openPathInApp}
               interrupted={!!turnInterrupted}
               isLooping={isLooping}
-              onLoopSetup={(text) => {
-                setLoopSeconds('');
-                setLoopSetup({ text });
-              }}
+              onScheduleSetup={openScheduleSetup}
             />
           ) : (
             <MessageItem
@@ -2792,7 +3432,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <div className="agent-activity" title={activeToolCall}>
             <span className="agent-activity-pulse" />
             <span className="agent-activity-text">
-              {/(subagent|sub-agent|子代理|delegate|task\b)/i.test(activeToolCall)
+              {/*
+                `Spawning agent crew` 是 kiro 实际发的 title（探针实测，见 scripts/acp-probe.mjs）——
+                只匹配 subagent / delegate 这些词的话，真正的委派一次都命中不了。
+              */}
+              {/(subagent|sub-agent|子代理|delegate|agent crew|task\b)/i.test(activeToolCall)
                 ? `🤖 子代理运行中 · ${activeToolCall}`
                 : `⚙️ 运行中 · ${activeToolCall}`}
             </span>
@@ -2818,29 +3462,49 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             30s so the elapsed time never freezes. */}
         {isStreaming && stall && (() => {
           const dur = (s: number) => (s < 90 ? `${Math.max(1, Math.round(s))} 秒` : `${Math.round(s / 60)} 分钟`);
+          // ONE line. The only fact the user cannot get from the spinner is WHETHER AND
+          // WHEN this turn will be cut off, so that is the whole sentence. Everything
+          // else the old three-sentence version said -- that long commands legitimately
+          // report nothing, that partial output survives, which setting moves the bound
+          // -- is background for the one time someone wants it, and lives in the tooltip.
+          //
+          // The countdown NAMES its threshold. With a tool call open it is measured
+          // against 「工具无进度多久判定卡死」 (30 min), not the silence threshold shown
+          // first in Settings (10 min) -- so "再 23 分钟" read as a contradiction of the
+          // 600 on that page. Both bounds have to be passed and the later one wins.
+          const bound = stall.boundBy === 'tool'
+            ? `工具无进度多久判定卡死 ${dur(stall.boundSeconds)}`
+            : `静默多久判定卡死 ${dur(stall.boundSeconds)}`;
+          const line = stall.interruptInSeconds === null
+            ? t('The timeout interrupt is off, so it will wait indefinitely.')
+            : stall.interruptInSeconds > 0
+              ? (stall.openTools > 0
+                  ? `${stall.openTools} 个工具仍在运行，再 ${dur(stall.interruptInSeconds)}无进度才会中断（按「${bound}」）。`
+                  : `没有工具在运行，${dur(stall.interruptInSeconds)}后中断（按「${bound}」）。`)
+              : t('About to interrupt this turn…');
+          const tip = [
+            stall.openTools > 0
+              ? `${stall.openTools} 个工具调用已开始但还没有回报结束，最近一次进度更新在 ${dur(stall.toolIdleSeconds)}前。`
+              : t('This turn has produced no output and no tool activity.'),
+            '长命令（构建、测试、解析大文件）本来就是在开始和结束之间什么都不报，所以静默本身不代表卡死。',
+            '中断需要两个条件同时成立：静默超过「静默多久判定卡死」，且没有工具在「工具无进度多久判定卡死」之内报告过进度。',
+            '所以有工具在跑时，实际等待时间是两个阈值里更晚的那个 —— 上面那句括号写的就是当前生效的是哪一个。',
+            '真的中断时，已产出的内容会保留，工具本身可能仍在后台继续跑。按 Stop 可以随时自己结束。',
+          ].join('\n');
           return (
-            <div className="stall-notice" role="status" aria-live="polite">
+            <div className="stall-notice" role="status" aria-live="polite" title={tip}>
               <span className="stall-notice-icon" aria-hidden="true">⏳</span>
               <div className="stall-notice-copy">
-                <strong>{`已 ${dur(stall.quietSeconds)}没有任何输出`}</strong>
-                <span>
-                  {stall.openTools > 0
-                    ? `有 ${stall.openTools} 个工具调用还没有回报结束，已 ${dur(stall.toolIdleSeconds)}没有进度更新。长命令（构建、测试、解析大文件）本来就是这样 —— 实测过一个仍在 95% 占满一个核的例子。`
-                    : '当前没有工具在跑 —— 这一轮既没有输出，也没有工具活动。'}
-                  {stall.cpuBusy
-                    ? ` 已向系统复查过：进程树仍在占用 CPU，说明它在算而不是卡在等待，所以中断被推后 —— 但这只证明没被阻塞，不证明有进展（死循环也一样烧 CPU），所以最多再等 ${dur(stall.cpuVetoLeftSeconds)}。`
-                    : stall.interruptInSeconds === null
-                      ? ' 超时中断已在设置里关闭，所以会一直等下去（按 Stop 可以自己结束）。'
-                      : stall.interruptInSeconds > 0
-                        ? ` 约 ${dur(stall.interruptInSeconds)}后会复查进程是否还在占用 CPU，确认没有才中断；已产出的内容会保留。`
-                        : ' 正在复查进程是否还在占用 CPU…'}
-                </span>
+                <strong>{`已 ${dur(stall.quietSeconds)}没有输出`}</strong>
+                <span>{line}</span>
               </div>
             </div>
           );
         })()}
 
-        <div ref={messagesEndRef} />
+        {/* No end-anchor element: scrolling to the latest message writes this
+            container's scrollTop instead of calling scrollIntoView on an anchor, so
+            nothing outside this pane can be scrolled. See scrollContainerToBottom. */}
       </div>
 
       <div className="jump-to-bottom-anchor">
@@ -2848,10 +3512,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <button
             className="jump-to-bottom-btn"
             onClick={jumpToBottom}
-            title="回到最新消息"
-            aria-label="回到最新消息"
+            title={t('Jump to the latest message')}
+            aria-label={t('Jump to the latest message')}
           >
-            ↓ 最新
+            {t('↓ Latest')}
           </button>
         )}
       </div>
@@ -2867,20 +3531,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       )}
 
       {/* Rendered from turnInterrupted — the SAME persistent state that disables the
-          per-message Rerun buttons. It used to be explained only by `connectionError`,
-          which is cleared in five places while the flag is cleared in two (reconnect
-          and rerun clear the text but not the flag), so the restriction routinely
-          outlived its explanation and the greyed-out button had nothing but a tooltip
-          to justify it. Tying both to one state keeps them from disagreeing. */}
-      {turnInterrupted && (
+          per-message Rerun buttons, so the notice and the restriction cannot
+          disagree. It is deliberately NOT also reported through `connectionError`:
+          that value is app-wide and written in ~20 places, so it outlived this state
+          and left a second, red copy of this message on screen that nothing cleared.
+
+          Hidden while a turn is streaming, because then it would be false: the
+          composer steers the running turn (or queues) and does not overwrite
+          anything -- exactly what the shortcut hint under the input says. The state
+          itself is also retired when a new turn starts, so this only covers the brief
+          window while a cancel is still settling.
+
+          Kept to one line on purpose. The single fact the user cannot guess is that
+          Enter OVERWRITES instead of appending, so that is what the sentence says;
+          the disabled Rerun button explains itself in its own tooltip, and "this
+          notice will disappear by itself" does not need saying -- it just does. */}
+      {turnInterrupted && !isStreaming && (
         <div className="interrupted-bar" role="region" aria-live="polite">
           <span className="interrupted-bar-icon" aria-hidden="true">↩</span>
           <div className="interrupted-bar-copy">
-            <strong>上一轮被中断，还没有被覆盖</strong>
-            <span>
-              在下方输入框提交任意内容即可覆盖并重跑那一轮（被中断的原文已预填，可直接改）。
-              在此之前，消息上的「编辑并重跑」会保持禁用 —— 这是刻意的：被中断的那一轮要用输入框覆盖，而不是逐条重跑。
-            </span>
+            <strong>{t('The previous turn was interrupted')}</strong>
+            <span>{t('The original text is back in the composer. Enter replaces and reruns this turn; it does not send a new message.')}</span>
           </div>
         </div>
       )}
@@ -2970,11 +3641,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 queuedMessages={queuedMessages}
                 restoredDraft={restoredQueueDraft}
                 restoredInputDraft={restoredInputDraft}
+                onConsumeRestoredDraft={onConsumeRestoredDraft}
+                onConsumeRestoredInputDraft={onConsumeRestoredInputDraft}
                 onCancelQueuedMessage={onCancelQueuedMessage}
                 onEditQueuedMessage={onEditQueuedMessage}
                 onMoveQueuedMessage={onMoveQueuedMessage}
                 commands={commands}
-                showSuggestions={messages.length === 0}
                 suggestions={messages.length === 0
                   ? PROMPT_SUGGESTIONS
                   // Stamp must match the current turn, else show nothing: stale chips
@@ -2993,6 +3665,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     className="composer-agent-selector"
                     title="Agent (switching restarts this chat's executor with the selected Kiro agent)"
                   >
+                    {/*
+                      改这个 agent 的配置 —— 按钮就在选它的旁边。「把 kiro 的 agent 配置这个按钮放到会话界面」。
+                      它原来在左侧栏底部那排图标里:选 agent 在这儿、改 agent 在那儿,而那排图标里它和
+                      🧠、⚙️ 挤在一起,看不出改的是「当前这个 agent」。
+                      **改的是全局配置**:agent 定义在 ~/.kiro 下,一份被所有会话共用 —— 所以 title 里明说,
+                      免得看着它在会话里就以为只影响这一个会话。
+                    */}
+                    <button
+                      className="composer-meta-btn composer-agent-config"
+                      onClick={openAgentConfig}
+                      disabled={!currentSessionId || agentConfigLoading}
+                      title={`编辑 ${kiroAgent || 'agent'} 的配置 —— 全局生效（所有会话共用这一份定义）`}
+                      aria-label={t('Edit agent config (global)')}
+                    >
+                      {/* 还是那个机器人图标 —— 它在侧栏用了很久，认的是它，不是一个新的齿轮 */}
+                      <IconRobot size={15} />
+                    </button>
                     {agentConfigLoading && <span className="composer-agent-spinner">⏳</span>}
                     <select
                       className="composer-select composer-agent-select"
@@ -3136,41 +3825,105 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
       )}
 
-      {loopSetup && createPortal(
+      {scheduleSetup && createPortal(
         <>
-          <div className="overlay" onClick={() => setLoopSetup(null)} />
-          <div className="loop-dialog" role="dialog" aria-modal="true" aria-labelledby="loop-dialog-title">
-            <h3 id="loop-dialog-title">🔁 循环重发此消息</h3>
-            <div className="loop-dialog-preview">{loopSetup.text}</div>
-            <label className="loop-dialog-field">
-              <span>间隔秒数，填 0 表示每轮结束后立即重发</span>
-              <input
-                type="text"
-                inputMode="numeric"
-                placeholder="0"
-                autoFocus
-                value={loopSeconds}
-                onChange={(event) => setLoopSeconds(event.target.value.replace(/[^0-9]/g, ''))}
-                onKeyDown={(event) => {
-                  if (event.key === 'Enter') {
-                    onStartLoop(loopSetup.text, Number.parseInt(loopSeconds, 10) || 0);
-                    setLoopSetup(null);
-                  } else if (event.key === 'Escape') {
-                    setLoopSetup(null);
-                  }
-                }}
-              />
-            </label>
+          <div className="overlay" onClick={() => setScheduleSetup(null)} />
+          <div
+            className="loop-dialog"
+            role="dialog"
+            aria-modal="true"
+            aria-labelledby="schedule-dialog-title"
+            onKeyDown={(event) => {
+              if (event.key === 'Escape') { setScheduleSetup(null); return; }
+              if (event.key !== 'Enter' || event.shiftKey) return;
+              if (scheduleProblems.length > 0) return;
+              onStartSchedule(draftSchedule);
+              setScheduleSetup(null);
+            }}
+          >
+            <h3 id="schedule-dialog-title">{t('⏰ Scheduled job')}</h3>
+            <div className="loop-dialog-preview">{scheduleSetup.text}</div>
+            <div className="loop-dialog-level level-0">
+              {describeSchedule(draftSchedule)} · 最多 {draftSchedule.maxRuns} 次
+              <span className="schedule-note">
+                每次都是独立的一次发送，不会把上一次的结果带进下一次 —— 否则定时任务会一直重复报告同一件事。
+              </span>
+            </div>
+
+            <div className="loop-dialog-grid">
+              <label className="loop-dialog-field">
+                <span>{t('Trigger')}</span>
+                <select value={schedKind} onChange={(event) => setSchedKind(event.target.value as any)}>
+                  <option value="daily">{t('Daily at a set time')}</option>
+                  <option value="weekly">{t('Weekly at a set time')}</option>
+                  <option value="interval">{t('Repeat on an interval')}</option>
+                  <option value="once">{t('Once, at a given moment')}</option>
+                </select>
+              </label>
+
+              {schedKind === 'interval' && (
+                <label className="loop-dialog-field">
+                  <span>间隔（分钟，最少 {MIN_INTERVAL_SEC / 60}）</span>
+                  <input
+                    type="text"
+                    inputMode="numeric"
+                    value={schedEvery}
+                    onChange={(event) => setSchedEvery(event.target.value.replace(/[^0-9]/g, ''))}
+                  />
+                </label>
+              )}
+
+              {schedKind === 'weekly' && (
+                <label className="loop-dialog-field">
+                  <span>{t('Day of week')}</span>
+                  <select value={schedWeekday} onChange={(event) => setSchedWeekday(event.target.value)}>
+                    {['日', '一', '二', '三', '四', '五', '六'].map((day, index) => (
+                      <option key={index} value={String(index)}>{`周${day}`}</option>
+                    ))}
+                  </select>
+                </label>
+              )}
+
+              {(schedKind === 'daily' || schedKind === 'weekly') && (
+                <label className="loop-dialog-field">
+                  <span>{t('Time (HH:MM, 24-hour)')}</span>
+                  <input type="text" value={schedTime} onChange={(event) => setSchedTime(event.target.value)} placeholder="09:00" />
+                </label>
+              )}
+
+              {schedKind === 'once' && (
+                <label className="loop-dialog-field">
+                  <span>{t('Trigger moment')}</span>
+                  <input type="datetime-local" value={schedOnceAt} onChange={(event) => setSchedOnceAt(event.target.value)} />
+                </label>
+              )}
+
+              <label className="loop-dialog-field">
+                <span>{t('Maximum number of runs (required)')}</span>
+                <input
+                  type="text"
+                  inputMode="numeric"
+                  value={schedMaxRuns}
+                  onChange={(event) => setSchedMaxRuns(event.target.value.replace(/[^0-9]/g, ''))}
+                />
+              </label>
+            </div>
+
+            {scheduleProblems.length > 0 && (
+              <div className="loop-dialog-problems">{scheduleProblems.join('；')}</div>
+            )}
             <div className="loop-dialog-actions">
-              <button className="loop-dialog-cancel" onClick={() => setLoopSetup(null)}>取消</button>
+              <button className="loop-dialog-cancel" onClick={() => setScheduleSetup(null)}>{t('Cancel')}</button>
               <button
                 className="loop-dialog-start"
+                disabled={scheduleProblems.length > 0}
+                title={scheduleProblems.length > 0 ? scheduleProblems.join('；') : t('Create scheduled job')}
                 onClick={() => {
-                  onStartLoop(loopSetup.text, Number.parseInt(loopSeconds, 10) || 0);
-                  setLoopSetup(null);
+                  onStartSchedule(draftSchedule);
+                  setScheduleSetup(null);
                 }}
               >
-                开始循环
+                {t('Create')}
               </button>
             </div>
           </div>

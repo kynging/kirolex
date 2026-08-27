@@ -1,5 +1,6 @@
 import React, { useEffect, useState } from 'react';
 import type { PermissionRequest } from '../hooks/useAcp';
+import { useT } from '../hooks/useLang';
 
 interface PermissionBarProps {
   request: PermissionRequest;
@@ -10,6 +11,7 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
   request,
   onRespond,
 }) => {
+  const t = useT();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -36,11 +38,11 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
     || request.options.find((option) => option.kind?.startsWith('reject'));
 
   return (
-    <div className="permission-bar" role="region" aria-live="polite" aria-label="Tool permission required">
+    <div className="permission-bar" role="region" aria-live="polite" aria-label={t('Tool permission required')}>
       <div className="permission-bar-main">
         <span className="permission-bar-lock" aria-hidden="true">🔐</span>
         <div className="permission-bar-copy">
-          <strong>{request.toolTitle || 'Tool permission required'}</strong>
+          <strong>{request.toolTitle || t('Tool permission required')}</strong>
           {request.description && request.description !== request.toolTitle && (
             <code title={request.description}>{request.description}</code>
           )}
@@ -48,12 +50,12 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
         <div className="permission-bar-actions">
           {allowOnce && (
             <button disabled={submitting} onClick={() => void respond(allowOnce.optionId)}>
-              ✓ Allow once
+              {`✓ ${t('Allow once')}`}
             </button>
           )}
           {allowAlways && (
             <button disabled={submitting} onClick={() => void respond(allowAlways.optionId)}>
-              ⟲ Always allow
+              {`⟲ ${t('Always allow')}`}
             </button>
           )}
           {reject && (
@@ -62,7 +64,7 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
               disabled={submitting}
               onClick={() => void respond(reject.optionId)}
             >
-              ⊘ Reject
+              {`⊘ ${t('Reject')}`}
             </button>
           )}
         </div>

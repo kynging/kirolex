@@ -12,6 +12,14 @@ export type PaneRow = (string | null)[];
 
 const avg = (xs: number[]): number => (xs.length ? xs.reduce((a, b) => a + b, 0) / xs.length : 1);
 
+/** A stored flex value, or 1 when it is absent or not a usable number.
+ *
+ *  Needed because `carrySplitSizes` returns stored sizes UNTOUCHED on an exact shape
+ *  match, so a corrupted ui-state.json reaches the readers below unvalidated: indexing
+ *  a string `rows` yields a character, and a character in `flexGrow` silently collapses
+ *  a row to nothing. */
+const flexOr1 = (v: unknown): number => (typeof v === 'number' && Number.isFinite(v) && v > 0 ? v : 1);
+
 /**
  * Carry dragged proportions across a layout change instead of discarding them.
  *
@@ -52,56 +60,42 @@ export function carrySplitSizes(
   };
 }
 
-/** One row's cell widths: the panes, plus the trailing empty cell when it has one. */
-export interface RowCells {
-  /** Flex grow per pane, in row order. */
-  paneFlex: number[];
-  /** Flex grow of the trailing empty cell; 0 when the row has none. */
-  emptyFlex: number;
+/**
+ * Flex grow per pane, per row. The panes divide their row BETWEEN THEM: free capacity
+ * to the right of a row is a slim strip of fixed width, not a share of the row.
+ *
+ * Which shape the free space takes is the one design rule here, and it splits on
+ * whether a whole ROW is free or only a CELL:
+ *   - a free CELL in a row that already holds a chat is a SLIM STRIP, so the chat in
+ *     that row uses the full width. Consequence, accepted deliberately: filling that
+ *     cell later halves the pane, and until then the bottom pane's right edge does not
+ *     line up with the divider above it.
+ *   - a free ROW reserves its real height instead (see `emptyRowFlex`), because half a
+ *     window of empty space is what that capacity will actually occupy, and reserving
+ *     it means the next chat lands there without moving the rows above.
+ *
+ * Dragged values are matched by index and inherited from the row above when a row has
+ * none of its own, so a divider dragged in the top row stays lined up below.
+ *
+ * @param rowsOfPanes Rows of pane ids.
+ * @param sizes Dragged sizes to read from, already carried for this layout.
+ * @returns One array of flex-grow values per row, in pane order.
+ */
+export function computePaneFlex(rowsOfPanes: PaneRow[], sizes: SplitSizes | null): number[][] {
+  return rowsOfPanes.map((row, r) => row.map((_, c) => flexOr1(
+    sizes?.cols?.[r]?.[c]
+    ?? (r > 0 ? sizes?.cols?.[r - 1]?.[c] : undefined),
+  )));
 }
 
 /**
- * Per-row cell widths, INCLUDING the trailing empty cell when the row has one.
+ * Free capacity is a slim strip of FIXED size, on both axes -- there is deliberately no
+ * function here that sizes it.
  *
- * The empty slot used to be a fixed 56px sliver, which is what made every added pane
- * shove the existing ones: the thinner the sliver, the more the real panes spread out,
- * so the next pane had that much more to take back. With 3 chats in a 2x2 the bottom
- * pane spanned the whole row and then halved the moment a 4th arrived, and its edge
- * never lined up with the row above it.
- *
- * So an empty slot is a REAL CELL that takes the rest of its row, and its width comes
- * from the ROW ABOVE -- a pane added later therefore lands exactly on the cell the
- * placeholder occupied and nothing else moves. With no row above to copy, the row is
- * split evenly. Own dragged values always win over inherited ones.
- *
- * @param rowsOfPanes Rows of pane ids.
- * @param opts.stripRight True when the LAST row has free capacity to its right.
- * @param opts.splitCols Columns in the chosen grid, e.g. 2 for `2x2`.
- * @param opts.sizes Dragged sizes to read from, already carried for this layout.
+ * A previous version gave a fully empty row a real row's height, so that a chat added
+ * later landed exactly on the placeholder and the rows above it never resized. That is
+ * true, and it was still wrong: with two chats in a 2x2 it turned the bottom half of
+ * the window into an empty box. Reserving space for a chat that is not there costs more
+ * than the alignment it buys, so the panes on screen always get the whole window and
+ * the placeholder stays a hint.
  */
-export function computeRowCells(
-  rowsOfPanes: PaneRow[],
-  opts: { stripRight: boolean; splitCols: number; sizes: SplitSizes | null },
-): RowCells[] {
-  const { stripRight, splitCols, sizes } = opts;
-  return rowsOfPanes.map((row, r) => {
-    const wantsEmpty = stripRight && r === rowsOfPanes.length - 1;
-    const aboveLen = r > 0 ? (rowsOfPanes[r - 1]?.length ?? 0) : 0;
-    // How many grid columns this row spans: match the row above when there is one,
-    // otherwise just the panes plus the single empty cell.
-    const cols = wantsEmpty
-      ? Math.max(row.length + 1, Math.min(splitCols, aboveLen || row.length + 1))
-      : row.length;
-    const flexOf = (c: number): number => (
-      sizes?.cols?.[r]?.[c]
-      ?? (r > 0 ? sizes?.cols?.[r - 1]?.[c] : undefined)
-      ?? 1
-    );
-    let emptyFlex = 0;
-    for (let c = row.length; c < cols; c++) emptyFlex += flexOf(c);
-    return {
-      paneFlex: row.map((_, c) => flexOf(c)),
-      emptyFlex: wantsEmpty ? (emptyFlex || 1) : 0,
-    };
-  });
-}

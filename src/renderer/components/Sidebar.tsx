@@ -1,4 +1,9 @@
+import { projectsToCollapse } from '../projectActivity';
+import { searchSessions } from '../sessionSearch';
+import { placeMenu } from '../menuPlacement';
+import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
 import React, { useState, useRef, useEffect } from 'react';
+import { useT } from '../hooks/useLang';
 import {
   DndContext,
   pointerWithin,
@@ -17,9 +22,42 @@ import {
 } from '@dnd-kit/sortable';
 import { CSS } from '@dnd-kit/utilities';
 import type { Session } from '../App';
-import { IconLogs, IconRobot, IconWorkspaceFolder } from './Icons';
+import type { ScheduleSummary } from '../scheduleView';
+import { IconLogs, IconWorkspaceFolder } from './Icons';
 
 type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
+
+
+/**
+ * A CONTEXT MENU THAT MEASURES ITSELF, then places itself — 「右键菜单仍可能跑出屏幕外」.
+ *
+ * Its height is not knowable in advance: the session menu grows with the project list, and 「Delete」 sits at the
+ * bottom, so overflow costs exactly the items people reach for. So it renders once (invisible, to avoid a visible
+ * jump), measures, and then positions with `placeMenu` — which flips up/left rather than sliding away from the
+ * row that was right-clicked.
+ */
+const Menu: React.FC<{ x: number; y: number; children: React.ReactNode }> = ({ x, y, children }) => {
+  const box = useRef<HTMLDivElement | null>(null);
+  const [place, setPlace] = useState<{ left: number; top: number } | null>(null);
+  useEffect(() => {
+    const el = box.current;
+    if (!el) return;
+    const r = el.getBoundingClientRect();
+    setPlace(placeMenu({
+      x, y, width: r.width, height: r.height,
+      viewportWidth: window.innerWidth, viewportHeight: window.innerHeight,
+    }));
+  }, [x, y]);
+  return (
+    <div
+      ref={box}
+      className="context-menu"
+      style={place ? { left: place.left, top: place.top } : { left: x, top: y, visibility: 'hidden' }}
+    >
+      {children}
+    </div>
+  );
+};
 
 const UNASSIGNED = '__unassigned__';
 const ARCHIVED = '__archived__';
@@ -50,6 +88,20 @@ interface SidebarProps {
   attachedSessionIds: string[];
   busyBySession?: Record<string, string>;  connectingSessionIds: string[];
   unreadSessionIds: string[];
+  /** kiro 原生子代理名单，按会话。左栏那面 tag 就是它 */
+  subagentsBySession?: Record<string, SubagentRow[]>;
+  /**
+   * 注册表里的 flow，用来在 project 菜单里起跑 —— 「我根本没有方法去用新的flow重新跑这个项目」。
+   *
+   * 建 run 原来全 App 只有一个入口：运行页里的「重开一次运行」。也就是说一个还没有 run 的 flow 无法开始，
+   * 而重新导入过的定义（草稿确认之后）也没有地方能用它开一次新的。
+   */
+  /**
+   * 这个 project 有没有开启 flow 管理 —— 「用户如何打开这个功能或关掉这个功能」。
+   *
+   * 之前它是**跑出来的**：只要出现过一次 run，拖会话进来就开始被拒、打开就自动建主会话。你没同意过，
+   * 行为却变了。现在是一个显式开关，关着的时候这一整套（带状、加 flow、主会话、拖入限制）都不出现。
+   */
   executorCap?: number;
   onNewSession: () => void;
   onCreateProject: (name: string) => void;
@@ -59,6 +111,30 @@ interface SidebarProps {
   onRenameProject: (oldName: string, newName: string) => void;
   onDeleteProject: (name: string) => void;
   onSwitchSession: (id: string) => void;
+  /**
+   * Connect a project's sessions — called when a collapsed idle project is opened.
+   *
+   * Idle projects are not warmed at startup any more (`projectActivity`), so the executors they need are
+   * started here: 「等用户点开project再创建连接」.
+   */
+  onWarmProject?: (project: string) => void;
+  /** 这个 project 里有多少次运行 —— 只用来判断「能不能把散落会话拖进来」，不再是一个显示用的 tag。 */
+  /**
+   * 这个 project 现在挂着哪些 flow —— 「哪里选择是什么 flow？」
+   *
+   * 这个答案原来只在运行页那条带状上,而运行页得先有一次运行才打得开:一个刚开了 flow 管理、还没跑过的
+   * project,界面上没有一处说得出它有哪些 flow。配置在这个菜单里,答案也该在这里。
+   */
+  /** 这个 project 的工作目录（显示用）/ 去改它 */
+  projectWorkspace?: (project: string) => string;
+  onSetProjectWorkspace?: (project: string) => void;
+  /**
+   * 这个 flow 在这个 project 里还在用吗 —— 决定它的主会话删不删得动。
+   *
+   * 「保存 run 的主会话，直到 project 不再使用这个 flow」:所以这条判断不能写在侧栏里(它不知道注册表和
+   * 移出名单),由 App 给出。没传就按「还在用」处理,也就是维持原来那条「删不掉」。
+   */
+  flowStillUsed?: (session: { purpose?: string; flow?: string }) => boolean;
   onDeleteSession: (id: string) => void;
   /** Force-rebuild this chat's backend context from the saved transcript. */
   onRebuildContext?: (id: string, mode?: 'snapshot' | 'full') => void;
@@ -68,6 +144,10 @@ interface SidebarProps {
    *  can highlight the visible chats in grid order. */
   splitOrder?: (id: string) => number;
   onToggleSplit?: (id: string) => void;
+  /** This chat's schedule, or null. Same summary its transcript banner shows — the sidebar is
+   *  where you find out a chat you are NOT looking at has a run coming. */
+  scheduleFor?: (id: string) => ScheduleSummary | null;
+  /** Open a project's workspace (the flow surface). */
   onAssignProject: (sessionId: string, projectId: string) => void;
   onMoveSession: (sessionId: string, projectId: string | null) => void;
   onArchiveSession: (sessionId: string, archived: boolean) => void;
@@ -76,8 +156,9 @@ interface SidebarProps {
   onOpenWorkspace: () => void;
   onOpenLogs: () => void;
   onOpenMemory: () => void;
+  /** Register a skill into KiroLex (right-click the skills button). Registration is what makes a
+   *  skill selectable by a project. */
   /** Agent config is a global file, so its trigger lives here, not per chat. */
-  onOpenAgentConfig: () => void;
 }
 
 // Draggable + selectable session row.
@@ -92,7 +173,13 @@ const SessionItem: React.FC<{
   /** 1-based position of this chat in the split grid; 0 = not shown. */
   splitOrder?: number;
   onToggleSplit?: (id: string) => void;
-}> = ({ session, isActive, sessionStatus, busyReason, onSwitch, onContextMenu, onDelete, splitOrder = 0, onToggleSplit }) => {
+  /** The same summary the chat's own banner shows, or null when nothing is pending. */
+  scheduleSummary?: ScheduleSummary | null;
+  /** kiro 原生子代理：这一条上挂多少个还在跑的 —— 「直到subagent被关掉」 */
+  subagents?: SubagentRow[];
+}> = ({ session, isActive, sessionStatus, busyReason, onSwitch, onContextMenu, onDelete, splitOrder = 0, onToggleSplit, scheduleSummary, subagents }) => {
+  const t = useT();
+  const crew = subagentTag(subagents);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: session.id });
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -100,18 +187,18 @@ const SessionItem: React.FC<{
     opacity: isDragging ? 0.5 : 1,
   };
   const dotTitle =
-    busyReason === 'reconfiguring' ? '占用中：正在切换模型 / Agent…'
-    : busyReason === 'attaching' ? '占用中：正在连接 / 重新连接后端…'
-    : busyReason === 'priming' ? '占用中：正在重建历史上下文（会重试到完成；按 Stop 可放弃）'
-    : busyReason === 'prime-pending' ? '占用中：历史上下文缺失，重建即将/正在进行；新消息会排队'
-    : busyReason === 'turn' ? '占用中：回合进行中…'
-    : sessionStatus === 'streaming' ? 'Working…'
-    : sessionStatus === 'connecting' ? 'Connecting…'
-    : sessionStatus === 'unread' ? 'Unread reply'
-    : sessionStatus === 'warm' ? 'Live — ready (background)'
-    : sessionStatus === 'alert' ? 'Not connected — select to activate'
-    : sessionStatus === 'dormant' ? 'Archived — inactive'
-    : 'Live — idle';
+    busyReason === 'reconfiguring' ? t('Busy: switching model / agent…')
+    : busyReason === 'attaching' ? t('Busy: connecting / reconnecting the backend…')
+    : busyReason === 'priming' ? t('Busy: rebuilding history context (retries until done; Stop to abandon)')
+    : busyReason === 'prime-pending' ? t('Busy: history context missing, rebuild imminent; new messages queue')
+    : busyReason === 'turn' ? t('Busy: turn in progress…')
+    : sessionStatus === 'streaming' ? t('Working…')
+    : sessionStatus === 'connecting' ? t('Connecting…')
+    : sessionStatus === 'unread' ? t('Unread reply')
+    : sessionStatus === 'warm' ? t('Live — ready (background)')
+    : sessionStatus === 'alert' ? t('Not connected — select to activate')
+    : sessionStatus === 'dormant' ? t('Archived — inactive')
+    : t('Live — idle');
 
   return (
     <div
@@ -129,10 +216,15 @@ const SessionItem: React.FC<{
       {splitOrder > 0 && (
         <span
           className="session-split-order"
-          title={`分屏第 ${splitOrder} 格 · 右键或该格的 ✕ 可移除`}
+          title={t('Split pane {n} · right-click, or the pane ✕, to remove', { n: splitOrder })}
         >{splitOrder}</span>
       )}
-      {session.pinned && <span className="session-pin" title="Pinned">📌</span>}
+      {session.pinned && <span className="session-pin" title={t('Pinned')}>📌</span>}
+      {/*
+        画布会话那个 🧩 挪到了**右边**那排标记里 —— 「你把 flow 那个 tag 加到会话的右侧，不是左侧」。
+        左边这一段是「这一行本身」的东西（分屏序号、📌、状态灯），而 flow 的身份和 worker 的 tag、子代理计数、
+        定时器一样，都属于右边那排「它现在是什么状态」。
+      */}
       <span className={`session-dot ${sessionStatus}`} title={dotTitle}>
         {sessionStatus === 'streaming' && <><span /><span /><span /></>}
         {/* Rotating arc: unmistakably "work in progress on the history", and not
@@ -142,7 +234,27 @@ const SessionItem: React.FC<{
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {session.title}
       </span>
-      <button className="session-delete-btn" onClick={(e) => onDelete(e, session.id)} title="Delete">
+      {/* The row shows `short` (a countdown, or 已暂停) and carries the full sentence as its
+          tooltip: there is no space here for "每天 09:00 · 3 小时 12 分后 · 已运行 2/20", and a
+          row that showed nothing was the reason a scheduled chat looked ordinary from outside. */}
+      {/*
+        子代理在跑的标记 —— 「如果有subagent在运行左侧的会话上也应该有一个tag，直到subagent被关掉」。
+        计数只算还没 terminated 的那些；名单是 kiro 自己报的（名字 / worker agent / 状态都在 title 里）。
+      */}
+      {crew && (
+        <span className="session-crew" title={`${t('{n} subagent(s) running:', { n: crew.count })}\n${crew.title}`}>
+          🤖 {crew.count}
+        </span>
+      )}
+      {scheduleSummary && (
+        <span
+          className={`session-schedule${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
+          title={scheduleSummary.text}
+        >
+          {scheduleSummary.paused ? '⏸️' : '⏰'} {scheduleSummary.short}
+        </span>
+      )}
+      <button className="session-delete-btn" onClick={(e) => onDelete(e, session.id)} title={t('Delete')}>
         ✕
       </button>
     </div>
@@ -170,7 +282,16 @@ const ProjectGroup: React.FC<{
   onProjectMenu: (e: React.MouseEvent, project: string) => void;
   splitOrder?: (id: string) => number;
   onToggleSplit?: (id: string) => void;
-}> = ({ name, projectKey, isDropTarget, actionable, showCount = true, sessions, collapsed, currentSessionId, statusFor, busyFor, onToggle, onSwitch, onContextMenu, onDelete, onNewChat, onProjectMenu, splitOrder = () => 0, onToggleSplit }) => {
+  /** Looked up per row rather than passed as a map, matching `statusFor`/`busyFor`. */
+  scheduleFor?: (id: string) => ScheduleSummary | null;
+  /** kiro 原生子代理，按会话查 —— 行上那面 tag 就是它，同样是查函数而不是 map */
+  subagentsFor?: (id: string) => SubagentRow[] | undefined;
+  /** Open this project's workspace. NOT `onOpenWorkspace` — that name is already taken by the
+   *  sidebar's FILE workspace button, and two things called the same would be read as one. */
+  /** 这个 project 处于 flow 管理模式吗 —— 头上那个 🧩 就是它（见下面那段注释）。 */
+  /** 这个 project 挂着的那些 flow —— 🧩 旁边那个名字,和 ⋮ 菜单里那一节同源。 */
+}> = ({ name, projectKey, isDropTarget, actionable, showCount = true, sessions, collapsed, currentSessionId, statusFor, busyFor, onToggle, onSwitch, onContextMenu, onDelete, onNewChat, onProjectMenu, splitOrder = () => 0, onToggleSplit, scheduleFor, subagentsFor}) => {
+  const t = useT();
   const { setNodeRef, isOver } = useDroppable({ id: `project:${projectKey}`, disabled: !isDropTarget });
   // Reorder drag lives on a DEDICATED grip, not the whole header: putting the drag
   // listeners on the header itself would swallow the collapse click, the kebab and
@@ -193,7 +314,7 @@ const ProjectGroup: React.FC<{
           <span
             ref={setGripRef}
             className="project-drag-handle"
-            title="拖动以调整项目顺序"
+            title={t('Drag to reorder projects')}
             onClick={(e) => e.stopPropagation()}
             {...gripAttrs}
             {...gripListeners}
@@ -205,21 +326,19 @@ const ProjectGroup: React.FC<{
         <ProjectFolderIcon />
         <span className="folder-name">{name}</span>
         {showCount && <span className="project-count">{sessions.length}</span>}
+        {/*
+          project 行上那个 ▸(打开工作台)去掉了 —— 「project那里不要放那个什么run按钮」。
+          一行里已经有拖拽把手、箭头、图标、计数和 ⋮,再多一个只在有 flow 时才有意义的按钮,谁也看不出它是干什么的。
+          进运行页的路仍然有两条:⋮ 菜单里「这个 project 的 flow」点一条,或者点它某一步的 worker 会话。
+        */}
         {actionable && (
           <>
             <button
               className="project-action-btn"
-              title="Project options"
+              title={t('Project options')}
               onClick={(e) => { e.stopPropagation(); onProjectMenu(e, name); }}
             >
               <KebabIcon />
-            </button>
-            <button
-              className="project-action-btn"
-              title="New chat in project"
-              onClick={(e) => { e.stopPropagation(); onNewChat(name); }}
-            >
-              <PlusSquareIcon />
             </button>
           </>
         )}
@@ -232,7 +351,7 @@ const ProjectGroup: React.FC<{
               onClick={(e) => { e.stopPropagation(); onNewChat(name); }}
             >
               <PlusSquareIcon />
-              <span>New chat in project</span>
+              <span>{t('New chat in project')}</span>
             </div>
           )}
           <SortableContext items={sessions.map((s) => s.id)} strategy={verticalListSortingStrategy}>
@@ -248,6 +367,8 @@ const ProjectGroup: React.FC<{
                 onDelete={(e, id) => { e.stopPropagation(); onDelete(id); }}
                 splitOrder={splitOrder(s.id)}
                 onToggleSplit={onToggleSplit}
+                scheduleSummary={scheduleFor?.(s.id) ?? null}
+                subagents={subagentsFor?.(s.id)}
               />
             ))}
           </SortableContext>
@@ -259,6 +380,9 @@ const ProjectGroup: React.FC<{
 
 export const Sidebar: React.FC<SidebarProps> = ({
   sessions,
+  onWarmProject,
+  projectWorkspace,
+  onSetProjectWorkspace,
   projects,
   currentSessionId,
   status,
@@ -267,6 +391,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   busyBySession,
   connectingSessionIds,
   unreadSessionIds,
+  subagentsBySession,
   executorCap,
   onNewSession,
   onCreateProject,
@@ -281,6 +406,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onTogglePin,
   splitOrder = () => 0,
   onToggleSplit,
+  scheduleFor,
   onAssignProject,
   onMoveSession,
   onArchiveSession,
@@ -289,7 +415,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenWorkspace,
   onOpenLogs,
   onOpenMemory,
-  onOpenAgentConfig,
 }) => {
   const [contextMenu, setContextMenu] = useState<{ x: number; y: number; targetId: string } | null>(null);
   const [renamePopup, setRenamePopup] = useState<{ id: string; value: string } | null>(null);
@@ -297,9 +422,75 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; project: string } | null>(null);
   const [projectRenamePopup, setProjectRenamePopup] = useState<{ project: string } | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
+  const t = useT();
+  /** 为什么刚才那一拖没生效 —— 静默拒绝会被当成「拖不动」 */
+  const [dropRefusal, setDropRefusal] = useState<string | null>(null);
+  /**
+   * 搜会话的查询词。**现在没有入口了**（那个输入框按要求去掉了），所以它恒为空串 ——
+   * 于是 `searchSessions` 恒返回 `idle`，侧栏显示完整列表、折叠规则照旧。
+   * 留着这个变量而不是把过滤代码一并删掉：判据本身是对的，换入口时不必重写。
+   */
+  const [query] = useState('');
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
+  /**
+   * IDLE PROJECTS START COLLAPSED — 「如果7天project没有活动就自动折叠」.
+   *
+   * Computed once, from the sessions present when the sidebar first has them: recomputing would fight the
+   * user, snapping a project they just expanded shut again. Expanding is what connects it.
+   */
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const autoCollapsed = useRef(false);
+  /**
+   * 启动时**只留热的那个 project 展开**，别的全折起来 —— 「把不用的 project 折叠起来断掉会话，省占用」。
+   *
+   * 原来这里按 `idleProjects`（7 天没动过）折，而预热那侧已经收紧到「只热上一个活跃的 project」——
+   * 于是多出一类**展开着但是冷的**：没到 7 天所以不折，但也不预热了，点上去一片灰点。而这个机制的
+   * 不变量本来就是「折起来 = 冷的，展开 = 热的」，两个判据分开那一刻就破了。
+   *
+   * 所以折叠不再自己判时间，直接用 `projectsToCollapse` —— 和 `sessionsToWarm` 同一份答案，
+   * 包括「你落在哪条会话上」这一层（`currentSessionId`，也就是启动时恢复的那条）。
+   */
+  useEffect(() => {
+    if (autoCollapsed.current || sessions.length === 0) return;
+    autoCollapsed.current = true;
+    const cold = projectsToCollapse(sessions, { now: Date.now(), keepId: currentSessionId });
+    if (cold.length) setCollapsed((prev) => new Set([...prev, ...cold]));
+  }, [sessions, currentSessionId]);
+
+  /**
+   * OPENING A PROJECT WARMS IT — 「不折叠的时候就自动预热」，但**只在你把它打开的那一刻**。
+   *
+   * 原来这条是按折叠**状态**跑的：每次启动都会把所有没折叠的 project 各预热一遍。那正好抵消了启动那侧
+   * 的收紧 —— `sessionsToWarm` 现在只热「上一个活跃的 project」，而这里紧接着又把另外几个展开的全热了，
+   * 每个约 0.4 GB。
+   *
+   * 所以第一遍**只登记、不预热**：启动时该热什么已经由 `sessionsToWarm` 决定了，这里没有话说。
+   * 之后任何一个 project 从折叠变成展开（也就是你真的点了它）才预热它整组。
+   * 展开着但冷的那些不会变得到不了 —— 点它里面任一会话就地预热（`warmSession`）。
+   *
+   * 判据是**折叠 → 展开的跃变**，不是「此刻展开着」。
+   *
+   * 不能拿「此刻展开着」当判据然后把它们记成已处理：`setCollapsed` 是异步的，自动折叠那一遍要到下一次
+   * 渲染才生效，所以第一遍看到的 `collapsed` 还是空集 —— 那样**每个** project 都会被记成「已处理」，
+   * 之后你点开一个折叠的它也不会预热了。存上一次的折叠集合，比对出「刚被打开的那个」，就没有这个时序问题。
+   *
+   * `warmed` 保证每个 project 每次运行只热一次，不会在重渲染里变成 spawn 循环。
+   */
+  const warmed = useRef<Set<string>>(new Set());
+  const prevCollapsed = useRef<Set<string> | null>(null);
+  useEffect(() => {
+    if (!onWarmProject || !autoCollapsed.current) return;
+    const prev = prevCollapsed.current;
+    prevCollapsed.current = new Set(collapsed);
+    // 第一次看到折叠状态：启动那侧（`sessionsToWarm`）已经决定了冷热，这里没有话说
+    if (!prev) return;
+    for (const project of prev) {
+      if (collapsed.has(project) || warmed.current.has(project)) continue;
+      warmed.current.add(project);        // 它刚从折叠变成展开 = 你真的点开了它
+      onWarmProject(project);
+    }
+  }, [collapsed, onWarmProject]);
   const newProjectRef = useRef<HTMLInputElement>(null);
 
   const sensors = useSensors(
@@ -424,6 +615,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
     // backend move handler clears the archived flag).
     if (dragged.archived) return;
     if ((dragged.projectId ?? null) === targetProject) return; // no change
+    /**
+     * 挂着 skill 的 project 由流程管理：会话是「主会话 + 每步一个」，拖进来的会话不属于任何一步，
+     * 回收规则看不见它 —— 所以这里直接拒，并把原因说出来而不是静默不动。
+     */
     onMoveSession(sessionId, targetProject);
   };
 
@@ -433,8 +628,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   // Archived sessions are pulled out of the normal groups into their own
   // collapsible section; everything else groups as usual.
-  const activeSessions = sessions.filter((s) => !s.archived);
-  const archivedSessions = sortForDisplay(sessions.filter((s) => s.archived));
+  /**
+   * SEARCH FILTERS WHAT THE GROUPS SEE, and opens the groups that have hits.
+   *
+   * Filtering here rather than inside each group keeps one source of truth for 「什么是命中」 — and the collapse
+   * override matters because most projects are folded (untouched for a week), so a match inside one would
+   * otherwise be invisible and the search would read as 「找不到」.
+   */
+  const search = searchSessions(sessions, query);
+  const visible = search.idle ? sessions : search.hits;
+  const hiddenByQuery = sessions.length - visible.length;
+  /**
+   * 搜索期间全部展开。上一版按「命中落在哪个 project」来决定展开谁，而那个 key 和会话身上的 projectId 并不总是
+   * 同一个字符串 —— 于是「命中 1 个」的那一条留在收起的组里，你看到的是「什么都没找到」。搜索时把折叠这件事
+   * 整个让开，比修一层容易再错的映射稳。
+   */
+  const isCollapsed = (key: string) => (search.idle ? collapsed.has(key) : false);
+
+  const activeSessions = visible.filter((s) => !s.archived);
+  const archivedSessions = sortForDisplay(visible.filter((s) => s.archived));
 
   // Display order = the ORDER OF `projects` (user-adjustable via the header grip),
   // NOT alphabetical. Projects discovered only from session records are appended
@@ -465,17 +677,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
     <div className="sidebar">
       <div className="sidebar-top-btns">
         <button className="new-session-btn no-drag" onClick={onNewSession}>
-          + New Session
+          ＋ {t('New Session')}
         </button>
         <button
           className="new-project-btn no-drag"
           onClick={() => { setCreatingProject(true); setNewProjectName(''); }}
-          title="Create a project"
+          title={t('Create a project')}
         >
-          + New Project
+          ＋ {t('New Project')}
         </button>
       </div>
 
+      {/*
+        侧栏原来在这里有一个「搜会话…」的输入框 —— 「左侧这里不要弄搜索框」，去掉了。
+
+        **只去掉入口，不去掉能力**：过滤那一套（`searchSessions`，一个有测试的纯模块）留着，
+        因为"什么算命中"和"命中的组要自己展开"这两条判据本身是对的，以后要给它换个入口（命令面板、
+        顶栏）时不必重写。`query` 恒为空串 → `search.idle` 恒为真 → 侧栏就是完整列表、折叠照旧生效。
+      */}
+      {/* 拖拽被拒的原因：静默不动会被当成「拖不动」 */}
+      {dropRefusal && (
+        <div className="sb-refusal" onClick={() => setDropRefusal(null)} title={t('Dismiss')}>⚠ {dropRefusal}</div>
+      )}
       <div className="session-list">
         <DndContext
           sensors={sensors}
@@ -492,7 +715,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 ref={newProjectRef}
                 className="session-rename-input"
                 value={newProjectName}
-                placeholder="Project name…"
+                placeholder={t('Project name…')}
                 onChange={(e) => setNewProjectName(e.target.value)}
                 onKeyDown={(e) => {
                   if (e.key === 'Enter') confirmNewProject();
@@ -512,7 +735,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               isDropTarget
               actionable
               sessions={sortForDisplay(activeSessions.filter((s) => s.projectId === pName))}
-              collapsed={collapsed.has(pName)}
+              collapsed={isCollapsed(pName)}
               currentSessionId={currentSessionId}
               statusFor={statusFor}
             busyFor={busyFor}
@@ -521,6 +744,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
               onContextMenu={handleContextMenu}
               splitOrder={splitOrder}
               onToggleSplit={onToggleSplit}
+              scheduleFor={scheduleFor}
+                subagentsFor={(id) => subagentsBySession?.[id]}
               onDelete={onDeleteSession}
               onNewChat={onNewSessionInProject}
               onProjectMenu={handleProjectMenu}
@@ -530,12 +755,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {/* Unassigned bucket — ALWAYS visible (even when empty) as a drop
               target for un-assigning a chat from a project. */}
           <ProjectGroup
-            name="Unassigned"
+            name={t('Unassigned')}
             projectKey={UNASSIGNED}
             isDropTarget
             actionable={false}
             sessions={unassigned}
-            collapsed={collapsed.has(UNASSIGNED)}
+            collapsed={isCollapsed(UNASSIGNED)}
             currentSessionId={currentSessionId}
             statusFor={statusFor}
             busyFor={busyFor}
@@ -544,6 +769,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onContextMenu={handleContextMenu}
             splitOrder={splitOrder}
             onToggleSplit={onToggleSplit}
+            scheduleFor={scheduleFor}
+              subagentsFor={(id) => subagentsBySession?.[id]}
             onDelete={onDeleteSession}
             onNewChat={onNewSessionInProject}
             onProjectMenu={handleProjectMenu}
@@ -552,7 +779,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {/* Archived sessions — ALWAYS visible (even when empty), collapsed by
               default; NOT a drop target. Out of the way, not deleted. */}
           <ProjectGroup
-            name="Archived"
+            name={t('Archived')}
             projectKey={ARCHIVED}
             isDropTarget={false}
             actionable={false}
@@ -567,6 +794,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onContextMenu={handleContextMenu}
             splitOrder={splitOrder}
             onToggleSplit={onToggleSplit}
+            scheduleFor={scheduleFor}
+              subagentsFor={(id) => subagentsBySession?.[id]}
             onDelete={onDeleteSession}
             onNewChat={onNewSessionInProject}
             onProjectMenu={handleProjectMenu}
@@ -589,14 +818,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
         </DndContext>
       </div>
 
-      {/* Session context menu: Rename / Pin-Unpin / Delete */}
+      {/* Session context menu: Rename / Pin-Unpin / Delete （归档的多一条「恢复」，且在最上面） */}
       {contextMenu && ctxSession && (
-        <div className="context-menu" style={{ top: contextMenu.y, left: contextMenu.x }}>
+        <Menu x={contextMenu.x} y={contextMenu.y}>
+          {/*
+            RESTORE, AT THE TOP, and only for an archived chat.
+            归档的会话**不能拖** —— 一次误拖就悄悄解档，所以出口只能是一个明确的动作。它放最上面是因为对一个
+            归档的会话来说，「拿回来」几乎是你打开这个菜单的唯一理由；放回的是 Unassigned 而不是它原来的
+            project：那个 project 可能已经不在了、或者已经挂上 skill 由流程托管，塞回去就成了没人管的会话。
+          */}
+          {ctxSession.archived && (
+            <>
+              <div
+                className="context-menu-item"
+                onClick={() => {
+                  onArchiveSession(ctxSession.id, false);
+                  onMoveSession(ctxSession.id, null);
+                  setContextMenu(null);
+                }}
+              >
+                {`♻️ ${t('Restore to Unassigned')}`}
+              </div>
+              <div className="context-menu-divider" />
+            </>
+          )}
           <div
             className="context-menu-item"
             onClick={() => { setRenamePopup({ id: ctxSession.id, value: ctxSession.title }); setContextMenu(null); }}
           >
-            ✏️ Rename
+            {`✏️ ${t('Rename')}`}
           </div>
           <div
             className="context-menu-item"
@@ -620,9 +870,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
             <div
               className="context-menu-item"
               onClick={() => { onToggleSplit?.(ctxSession.id); setContextMenu(null); }}
-              title="分屏显示这个会话（每个分屏都能独立输入）"
+              title={t('Show this chat in a split pane (each pane has its own composer)')}
             >
-              {splitOrder(ctxSession.id) > 0 ? '⇆ 从分屏移除' : '⇆ 加入分屏'}
+              {splitOrder(ctxSession.id) > 0 ? `⇆ ${t('Remove from split')}` : `⇆ ${t('Add to split')}`}
             </div>
           )}
           {!ctxSession.id.startsWith('pending_') && (
@@ -648,14 +898,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   className="context-menu-item"
                   onClick={() => { onMoveSession(ctxSession.id, null); setContextMenu(null); }}
                 >
-                  ⬜ Unassign
+                  {`⬜ ${t('Unassign')}`}
                 </div>
               )}
               <div
                 className="context-menu-item"
                 onClick={() => { setAssignPopup({ sessionId: ctxSession.id }); setContextMenu(null); }}
               >
-                ＋ New project…
+                {`＋ ${t('New project…')}`}
               </div>
             </>
           )}
@@ -666,7 +916,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className="context-menu-item"
                 onClick={() => { onArchiveSession(ctxSession.id, !ctxSession.archived); setContextMenu(null); }}
               >
-                {ctxSession.archived ? '♻️ Unarchive' : '🗄️ Archive'}
+                {ctxSession.archived ? '♻️ Unarchive（留在原 project）' : '🗄️ Archive'}
               </div>
             </>
           )}
@@ -675,34 +925,61 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="context-menu-item danger"
             onClick={() => { onDeleteSession(ctxSession.id); setContextMenu(null); }}
           >
-            🗑️ Delete
+            {`🗑️ ${t('Delete')}`}
           </div>
-        </div>
+        </Menu>
       )}
 
       {/* Project kebab menu: New chat / Rename / Delete project */}
       {projectMenu && (
-        <div className="context-menu" style={{ top: projectMenu.y, left: projectMenu.x }}>
+        <Menu x={projectMenu.x} y={projectMenu.y}>
           <div
             className="context-menu-item"
             onClick={() => { onNewSessionInProject(projectMenu.project); setProjectMenu(null); }}
           >
-            ＋ New chat in project
+            {`＋ ${t('New chat in project')}`}
           </div>
           <div
             className="context-menu-item"
             onClick={() => { setProjectRenamePopup({ project: projectMenu.project }); setProjectMenu(null); }}
           >
-            ✏️ Rename project
+            {`✏️ ${t('Rename project')}`}
           </div>
+          {/*
+            用某个 flow 在这个 project 里跑一次 —— 这里是唯一的「从零开始一次运行」入口。
+            草稿列出来但点不动：没人核对过的结构不许跑（`whyNotRunnable`），而灰着并说明理由
+            比干脆不显示有用 —— 后者会让人以为重新导入的东西丢了。
+          */}
+          {/*
+            这个 project 在哪个目录里干活 —— 「加到 project 里面不就好了吗」。
+            它管的是**所有**会话的 cwd（不只是 flow 的 worker）：相对路径落在哪、shell 命令在哪跑、
+            写入许可以哪儿为基准。空 = 家目录。
+          */}
+          {onSetProjectWorkspace && (
+            <>
+              <div className="context-menu-divider" />
+              <div
+                className="context-menu-item"
+                title={projectWorkspace?.(projectMenu.project)
+                  ? t('Now at: {dir}', { dir: projectWorkspace(projectMenu.project) })
+                  : t("Now at the home directory — click to point at a repo; this project's chats all work there")}
+                onClick={() => { onSetProjectWorkspace(projectMenu.project); setProjectMenu(null); }}
+              >
+                {`📁 ${t('Working directory')}`}
+                <span className="context-menu-hint">
+                  {projectWorkspace?.(projectMenu.project) || t('(home directory)')}
+                </span>
+              </div>
+            </>
+          )}
           <div className="context-menu-divider" />
           <div
             className="context-menu-item danger"
             onClick={() => { onDeleteProject(projectMenu.project); setProjectMenu(null); }}
           >
-            🗑️ Delete project
+            {`🗑️ ${t('Delete project')}`}
           </div>
-        </div>
+        </Menu>
       )}
 
       {/* Two groups, not one flat row: the action buttons must reflow to a second
@@ -722,31 +999,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <button
             className={`sidebar-settings-btn sidebar-workspace-btn${workspaceOpen ? ' active' : ''}`}
             onClick={onOpenWorkspace}
-            title={workspaceOpen ? 'Close workspace files' : 'Open workspace files'}
-            aria-label={workspaceOpen ? 'Close workspace files' : 'Open workspace files'}
+            title={workspaceOpen ? t('Close workspace files') : t('Open workspace files')}
+            aria-label={workspaceOpen ? t('Close workspace files') : t('Open workspace files')}
             aria-pressed={workspaceOpen}
           >
             <IconWorkspaceFolder size={19} className="sidebar-workspace-icon" />
           </button>
-          <button
-            className="sidebar-settings-btn sidebar-workspace-btn"
-            onClick={onOpenAgentConfig}
-            title="编辑当前 Agent 配置（全局）"
-            aria-label="编辑当前 Agent 配置"
-          >
-            <IconRobot size={17} />
-          </button>
-          <button className="sidebar-settings-btn" onClick={onOpenMemory} title="Memory">
+          {/*
+            Agent 配置那个按钮搬到会话界面里了（就在选 agent 的下拉旁边）——「放到会话界面，不过这个配置是全局的」。
+            放在这排图标里时，它和 🧠、⚙️ 挤在一起，也看不出改的是「当前这个 agent」；而选 agent 本来就在会话那条工具栏上。
+          */}
+          <button className="sidebar-settings-btn" onClick={onOpenMemory} title={t('Memory')}>
             🧠
           </button>
-          <button className="sidebar-settings-btn" onClick={onSettings} title="Settings">
+          <button className="sidebar-settings-btn" onClick={onSettings} title={t('Settings')}>
             ⚙️
           </button>
           <button
             className="sidebar-settings-btn sidebar-workspace-btn"
             onClick={onOpenLogs}
-            title="日志"
-            aria-label="日志"
+            title={t('Logs')}
+            aria-label={t('Logs')}
           >
             <IconLogs size={18} />
           </button>
@@ -758,7 +1031,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <>
           <div className="overlay" onClick={() => setRenamePopup(null)} />
           <div className="rename-popup">
-            <h4>Rename</h4>
+            <h4>{t('Rename')}</h4>
             <input
               autoFocus
               className="rename-popup-input"
@@ -774,7 +1047,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               }}
             />
             <div className="rename-popup-actions">
-              <button className="rename-popup-btn cancel" onClick={() => setRenamePopup(null)}>Cancel</button>
+              <button className="rename-popup-btn cancel" onClick={() => setRenamePopup(null)}>{t('Cancel')}</button>
               <button
                 className="rename-popup-btn confirm"
                 onClick={() => {
@@ -783,7 +1056,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   if (val) onRenameSession(renamePopup.id, val);
                   setRenamePopup(null);
                 }}
-              >OK</button>
+              >{t('OK')}</button>
             </div>
           </div>
         </>
@@ -794,14 +1067,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <>
           <div className="overlay" onClick={() => setAssignPopup(null)} />
           <div className="rename-popup">
-            <h4>Move to new project</h4>
+            <h4>{t('Move to new project')}</h4>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 12px' }}>
               Creates the project and moves this chat into it (its executor resets to the new memory scope).
             </p>
             <input
               autoFocus
               className="rename-popup-input assign-popup-input"
-              placeholder="Project name…"
+              placeholder={t('Project name…')}
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   const val = (e.target as HTMLInputElement).value.trim();
@@ -813,7 +1086,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               }}
             />
             <div className="rename-popup-actions">
-              <button className="rename-popup-btn cancel" onClick={() => setAssignPopup(null)}>Cancel</button>
+              <button className="rename-popup-btn cancel" onClick={() => setAssignPopup(null)}>{t('Cancel')}</button>
               <button
                 className="rename-popup-btn confirm"
                 onClick={() => {
@@ -822,7 +1095,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   if (val) onMoveSession(assignPopup.sessionId, val);
                   setAssignPopup(null);
                 }}
-              >Move</button>
+              >{t('Move')}</button>
             </div>
           </div>
         </>
@@ -833,9 +1106,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
         <>
           <div className="overlay" onClick={() => setProjectRenamePopup(null)} />
           <div className="rename-popup">
-            <h4>Rename project</h4>
+            <h4>{t('Rename project')}</h4>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 12px' }}>
-              Renames the project and relabels all its sessions.
+              {t('Renames the project and relabels all its sessions.')}
             </p>
             <input
               autoFocus
@@ -852,7 +1125,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               }}
             />
             <div className="rename-popup-actions">
-              <button className="rename-popup-btn cancel" onClick={() => setProjectRenamePopup(null)}>Cancel</button>
+              <button className="rename-popup-btn cancel" onClick={() => setProjectRenamePopup(null)}>{t('Cancel')}</button>
               <button
                 className="rename-popup-btn confirm"
                 onClick={() => {
@@ -861,7 +1134,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   if (val) onRenameProject(projectRenamePopup.project, val);
                   setProjectRenamePopup(null);
                 }}
-              >Rename</button>
+              >{t('Rename')}</button>
             </div>
           </div>
         </>

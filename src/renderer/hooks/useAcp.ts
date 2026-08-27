@@ -1,6 +1,38 @@
 import { useState, useCallback, useEffect, useRef } from 'react';
+import { consumeHandoff } from '../handoffDraft';
+import { type SubagentRow } from '../../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
+import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
+import { sessionsToWarm } from '../projectActivity';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
+import {
+  advance,
+  beginIteration,
+  createRun,
+  endWith,
+  levelLabel,
+  nextPromptText,
+  noEvidenceVerdict,
+  shouldReportTerminal,
+  terminalSummary,
+  TOLERATED_RETRY_FLOOR_SEC,
+  validateSpec,
+  verdictFromCommand,
+  type LoopRun,
+  type LoopSpec,
+  type LoopTerminal,
+  type LoopVerdict,
+} from '../loopMachine';
+// Scheduling replaced loop mode. Pure module, shared with main (which owns the ticker)
+// rather than duplicated here, so the rules cannot drift between the two.
+import type { ScheduleSpec } from '../../main/schedule';
+import type { ScheduleView } from '../scheduleView';
+// "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
+// branch either bills a duplicate turn or leaves a question permanently unanswered.
+import { decideTurnRecovery, adoptedMessages, type TurnPeek } from '../turnRecovery';
+
+export type { LoopSpec } from '../loopMachine';
+export type { ScheduleSpec } from '../../main/schedule';
 
 /** Tool kinds that RUN something rather than touch a file. Mirrors RUN_KINDS in the
  *  main process: a command carries neither locations nor diffs, so without this it is
@@ -9,9 +41,15 @@ const RUN_KINDS = new Set(['execute', 'run', 'bash', 'shell', 'command', 'termin
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected';
 
-type LoopState = {
-  text: string;
-  intervalSec: number;
+/** The loop's live driver state, kept SEPARATE from `LoopRun`.
+ *
+ *  `LoopRun` (loopMachine.ts) is the serializable per-round record; the two fields
+ *  here are the ones that can never be written down -- a pending timer handle and
+ *  the flag that stops a scheduled round that is already in flight. They used to sit
+ *  in the same type as the user's declaration (`text`, `intervalSec`), which is why
+ *  the specification could not be stored or reused at all. */
+type LoopHandle = {
+  run: LoopRun;
   stopped: boolean;
   timer: ReturnType<typeof setTimeout> | null;
 };
@@ -44,13 +82,15 @@ export interface TurnStall {
   quietSeconds: number;
   openTools: number;
   toolIdleSeconds: number;
-  /** The OS found the executor's tree burning CPU, so it is computing rather than
-   *  blocked, and the interrupt has been postponed. NOT proof of progress — a
-   *  spin-wait looks identical — hence `cpuVetoLeftSeconds`, after which the
-   *  interrupt fires anyway. */
-  cpuBusy: boolean;
-  cpuVetoLeftSeconds: number;
   interruptInSeconds: number | null;
+  /** Which threshold the countdown is measured against: the tool no-progress limit
+   *  (`'tool'`, the one that governs whenever a tool call is open) or the silence
+   *  threshold (`'quiet'`). Kept so the notice can name the setting it comes from --
+   *  showing only "23 more minutes" next to a Settings page displaying 600 read as a
+   *  contradiction, when in fact both bounds must be passed and the later one wins. */
+  boundBy: 'tool' | 'quiet';
+  /** The value of that threshold, in seconds. */
+  boundSeconds: number;
 }
 
 /** Live view of a session rendered in a split pane (i.e. visible but NOT the
@@ -66,7 +106,25 @@ export interface PaneView {
   contextLinks: { sourceId: string; sourceTitle: string }[];
   /** Live "this turn has stopped producing" state; drives the stall warning. */
   stall: TurnStall | null;
+  /** The agent's plan/todo panel for THIS chat.
+   *
+   *  Mirrored per pane for the same reason as `usage` and `stall`, and here it also
+   *  fixes a visible defect: the panel used to be read from the focused chat's state
+   *  only, so every focus switch MOUNTED it in one pane and UNMOUNTED it in another.
+   *  Both transcripts changed height in the same frame -- the flash seen when clicking
+   *  between panes. A plan belongs to a chat, not to whichever pane has focus. */
+  plan: PlanEntry[];
 }
+
+/** Shared empty plan, so a pane without one keeps a stable identity across renders. */
+const EMPTY_PANE_PLAN: PlanEntry[] = [];
+/** Same, for a chat with no messages cached yet: a fresh [] on every render would make
+ *  the transcript look like new content each time. */
+const EMPTY_PANE_MESSAGES: Message[] = [];
+
+/** Bucket for errors that belong to no chat -- today only the initial backend connect,
+ *  which can fail before any session exists (and therefore before any pane has an id). */
+export const APP_ERROR_KEY = '__app__';
 
 // Extract absolute file paths an ACP tool_call touched (update.locations[].path).
 /** Busy reasons that mean the backend must NOT be given a new message yet.
@@ -218,7 +276,19 @@ function noticeForEmptyTurn(result: any): string | null {
 }
 
 export function useAcp() {  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
-  const [connectionError, setConnectionError] = useState<string | null>(null);
+  /** Error banner text PER CHAT.
+   *
+   *  This used to be one app-wide string. Two things went wrong with that, both seen:
+   *  a failure in chat A was displayed on top of chat B once focus moved (the banner
+   *  followed the focus, not the chat that failed), and because it was rendered only
+   *  for the focused pane, every focus switch mounted the banner in one pane and
+   *  unmounted it in another -- changing both transcripts' heights in the same frame,
+   *  which is the flash seen when clicking between split panes.
+   *
+   *  `APP_ERROR_KEY` covers the failures that belong to no chat at all (the initial
+   *  backend connect, when there is not even a session yet). Anything that happens
+   *  while a chat is focused is attributed to THAT chat instead, so it stays put. */
+  const [errorBySession, setErrorBySession] = useState<Record<string, string>>({});
   const [sessions, setSessions] = useState<Session[]>(() => {
     // Load persisted sessions
     try {
@@ -272,6 +342,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // LIVE though, so for the handful of sessions currently on screen we mirror
   // the same data into state. Non-visible sessions keep the cheap ref-only path.
   const paneSessionIdsRef = useRef<Set<string>>(new Set());
+  /** EVERY chat on screen, focused one included. `paneSessionIdsRef` deliberately holds
+   *  only the non-focused panes, but handing a chat its pane view as focus LEAVES it
+   *  requires knowing it is on screen at all. */
+  const onScreenPaneIdsRef = useRef<Set<string>>(new Set());
+  /** The exact `messages` array the focused pane is currently rendering.
+   *
+   *  Identity, not content, is the point: handing the outgoing pane an equal-but-
+   *  different array is what made every memo bail out and every code block get
+   *  re-highlighted (measured: 554 `code` + 60 `pre` attribute mutations on one focus
+   *  switch, with the message ids identical before and after). */
+  /** 焦点会话正在渲染的那个数组，**连它属于谁一起记** —— 见下面那个 effect 里的理由。 */
+  const focusedMessagesRef = useRef<{ sessionId: string | null; messages: Message[] }>({
+    sessionId: null,
+    messages: EMPTY_PANE_MESSAGES,
+  });
   const [paneViews, setPaneViews] = useState<Record<string, PaneView>>({});
   /** Update one pane's live view. No-op for sessions that are not on screen. */
   const patchPane = useCallback((sid: string | null, patch: Partial<PaneView>) => {
@@ -294,6 +379,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     ? permissionRequests[currentSessionId] || null
     : null;
   const [activeToolCall, setActiveToolCall] = useState<string | null>(null);
+  /**
+   * KIRO'S NATIVE SUBAGENTS, PER CHAT — the roster kiro sends, kept so the left rail can carry a tag
+   * 「直到subagent被关掉」. Not derived from the transcript: subagent activity arrives under the child's
+   * own ACP session id and used to be indistinguishable from the parent's own output.
+   */
+  const [subagents, setSubagents] = useState<Record<string, SubagentRow[]>>({});
   // Human-readable in-flight phase for the VIEWED session (send, backend
   // rebuild, executor attach, awaiting reply). Rendered in the chat so a slow
   // phase is never a silent UI freeze.
@@ -301,11 +392,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const [usage, setUsage] = useState<{ contextPercent: number; credits: number; turnMs?: number } | null>(null);
   // Agent execution plan (ACP `plan` update) for the viewed session. Replaced
   // wholesale on each plan update (ACP resends the full plan each time).
-  const [plan, setPlan] = useState<PlanEntry[]>([]);
+  const [plan, setPlan] = useState<PlanEntry[]>(() => (
+    currentSessionId ? (parseTaskLists(uiGet(TASK_LISTS_KEY))[currentSessionId] || []) : []
+  ));
   // Files the agent touched this turn (ACP tool_call locations + diff content),
   // for the viewed session. Ordered, deduped by path (latest diff wins).
   const [fileChanges, setFileChanges] = useState<ToolCall[]>([]);
   const [commands, setCommands] = useState<SlashCommand[]>([]);
+  /** 每个会话试过几次自动命名。标题由模型写；连着失败三次才退回「首条消息截断」 */
+  const titleTriesRef = useRef<Map<string, number>>(new Map());
   // Cross-session context sync: the current session's linked sources (0..n).
   // Persistent per-session; each send injects only each source's NEW messages.
   const [contextLinks, setContextLinks] = useState<{ sourceId: string; sourceTitle: string }[]>([]);
@@ -315,6 +410,26 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const currentMessageRef = useRef<string>('');
   const toolCallsRef = useRef<Map<string, ToolCall>>(new Map());
   const currentSessionRef = useRef<string | null>(null);
+  /** Attribute an error banner to a chat, or clear it.
+   *
+   *  Falls back to the focused chat when the caller has no id, and only to
+   *  `APP_ERROR_KEY` when there is no chat at all -- so a banner is bound to the chat
+   *  it belongs to and never moves between panes when focus changes. Declared next to
+   *  `currentSessionRef` because it reads it, and before every callback that lists it
+   *  in a dependency array (those arrays are evaluated during render). */
+  const noteError = useCallback((sid: string | null | undefined, message: string | null) => {
+    const key = sid || currentSessionRef.current || APP_ERROR_KEY;
+    setErrorBySession((prev) => {
+      if (!message) {
+        if (!(key in prev)) return prev;              // no-op keeps the object stable
+        const next = { ...prev };
+        delete next[key];
+        return next;
+      }
+      if (prev[key] === message) return prev;
+      return { ...prev, [key]: message };
+    });
+  }, []);
   const messagesCacheRef = useRef<Map<string, Message[]>>(new Map());
   const streamingIdsRef = useRef<Set<string>>(new Set());
   // Identifies the newest prompt for each session. A cancelled older prompt may
@@ -347,8 +462,34 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // Note the old on-disk copy was keyed by kiro-cli's UUID, which no longer maps to
   // anything the UI knows; this one is keyed by the stable KiroLex session id.
   const usageMapRef = useRef<Map<string, { contextPercent: number; credits: number; turnMs?: number }>>(new Map(readUsageMap()));
-  // Per-session agent plan (ACP `plan`), keyed by sessionId.
-  const planMapRef = useRef<Map<string, PlanEntry[]>>(new Map());
+  /**
+   * 上面那个 ref 的**反应式镜像** —— 流程图上每个节点要显示它那条会话的上下文占用
+   * （「再加一个节点记录会话上下文占用情况的功能」），而 ref 变了不会触发重渲染。
+   *
+   * 只在**每一轮结束**时更新一次（`_kiro.dev/metadata` 一轮一条），不是逐 token，所以这份 state
+   * 不会成为渲染负担。ref 保留：发消息那条路上要同步读它，不能等下一次渲染。
+   */
+  const [usageBySession, setUsageBySession] = useState<Record<string, { contextPercent: number; credits: number }>>(
+    () => Object.fromEntries(readUsageMap()),
+  );
+  // Per-session native Task checklist (ACP `plan`), restored from shared on-disk ui-state.
+  const taskListsRef = useRef<TaskLists>(parseTaskLists(uiGet(TASK_LISTS_KEY)));
+  /**
+   * 任务清单变了就 +1 —— 画布上那些节点不是焦点会话，没有别的办法知道它变了。
+   *
+   * 清单本身存在 ref 和 ui-state 里(它按会话存,而且要活过刷新);state 里只放一个计数,所以一次清单更新
+   * 不会把整棵树的 props 换一遍。
+   */
+  const [taskListTick, setTaskListTick] = useState(0);
+  /** 任一会话的任务清单 —— kiro 自己报的那份（ACP `plan`），一步跑了多久、勾到第几条，只有它说得清 */
+  const taskListFor = useCallback(
+    (sessionId?: string | null): PlanEntry[] => (sessionId ? (taskListsRef.current[sessionId] || []) : []),
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [taskListTick],
+  );
+  const planMapRef = useRef<Map<string, PlanEntry[]>>(
+    new Map(Object.entries(taskListsRef.current).map(([sessionId, tasks]) => [sessionId, tasks])),
+  );
   // Per-session file-change tool calls this turn, keyed by sessionId.
   const fileChangesMapRef = useRef<Map<string, ToolCall[]>>(new Map());
   // Helper commands are advertised by each Kiro CLI agent process, not by the model.
@@ -377,8 +518,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // so `steer_consumed` can flip the badge to 'consumed', and turn-end can
   // reconcile any still-un-consumed steers back into the queue (never dropped).
   const pendingSteersRef = useRef<Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]>>(new Map());
-  const loopsRef = useRef<Map<string, LoopState>>(new Map());
-  const DEFAULT_MODEL = 'claude-opus-4.6';
+  const loopsRef = useRef<Map<string, LoopHandle>>(new Map());
+  /** Must equal `DEFAULT_MODEL` in src/main/config.ts.
+   *
+   *  It cannot be imported: main's tsconfig pins `rootDir: ./src/main`, so a shared
+   *  module would move the whole emit layout. It is therefore duplicated and pinned
+   *  by a test (tests/modelFallback.test.ts) instead — because it HAD already
+   *  drifted: this said 'claude-opus-4.6' while main created every session on
+   *  'claude-opus-5', so the selector could show a model no executor was running. */
+  const DEFAULT_MODEL = 'claude-opus-5';
 
   // Always-fresh mirror of sessions for reads inside async callbacks (closures
   // otherwise capture a stale sessions array). Used to resolve a session's
@@ -468,13 +616,82 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Single seam for "a turn is starting", so a stall notice from the previous
     // attempt is retired here rather than lingering over a healthy turn.
     setSessionStall(sid, null);
+    // Same reasoning for the "interrupted, awaiting an overwrite" state, and it is
+    // not just cosmetic. That state means "the next composer submit will truncate
+    // back to that user message and rerun it". Once a new turn is under way that
+    // promise is both untrue and unsafe: untrue because while a turn streams the
+    // composer STEERS (or queues) instead of overwriting, and unsafe because
+    // honouring it later would truncate away the turn that ran in between.
+    //
+    // Without this the state had only one exit -- an overwriting submit -- which
+    // cannot happen while a turn is running, so after an auto-resend or an
+    // auto-recovery the banner sat there permanently contradicting the composer's
+    // own hint line.
+    clearInterrupted(sid);
     addStreaming(sid);
     return token;
   };
+  /**
+   * 自动命名。触发条件只有一条:**名字还是 New Chat**。
+   *
+   * 挂在 `finishStreamingTurn` 上,因为它是**所有**投递路径在 finally 里都会经过的唯一汇合点,
+   * 而且 token 守卫保证一轮只过一次。上一版把这段写在 `sendMessage` 尾部 —— 于是三条投递路径里
+   * 只有「直接发送」那一条会命名:
+   *   第一条消息发进正在 attaching 的新会话 → `handleSendMessage` 转进队列 → 走 `sendQueuedMessage`
+   *   后续消息在turn运行中发出 → 走 `handleSteerMessage`
+   * 这两条都不经过那个尾部,会话就一直顶着 New Chat。实测 s_1787035165637 两轮都干净结束
+   * (`stopReason: end_turn`)却仍未命名,就是这个原因;主进程那半边是好的(同一条 lite 通道的
+   * suggestions 一直在成功,单独复现 title 调用也能拿到正常标题)。
+   *
+   * 生成成功才改名。失败就继续叫 New Chat —— 下一轮还会再试;连 MAX_TITLE_TRIES 次都失败,才退回
+   * 截断首条消息(那时它已经不叫 New Chat,规则自洽)。截断从来不是标题:遇到「帮我看一下这个」
+   * 就等于没有名字,所以它只能是最后手段。
+   */
+  const MAX_TITLE_TRIES = 3;
+  const maybeAutoTitle = (sid: string | null) => {
+    if (!sid) return;
+    const record = sessionsRef.current.find((s) => s.id === sid);
+    if (!record) return;
+    /* flow 自己的会话不参与:它的名字是**结构性**的(「流程主会话 · 周报」/「周报 · 收集素材」),
+       由 KiroLex 给;让模型按第一条提示词起名,只会把它改成一句无意义的摘要,而那第一条恰好是
+       几千字的生成提示词。 */
+    if (record.purpose === 'skill' || record.purpose === 'flow-main' || record.purpose === 'flow-worker') return;
+    if (!/^New Chat\b/.test((record.title || '').trim())) return;
+    const cached = messagesCacheRef.current.get(sid) || [];
+    // 材料用**第一条用户消息**:话题在那儿,不是这一轮说的什么。
+    const firstUser = (cached.find((m) => m.role === 'user' && (m.content || '').trim())?.content || '').trim();
+    if (!firstUser) return;
+    const tries = titleTriesRef.current.get(sid) || 0;
+    if (tries >= MAX_TITLE_TRIES) return;
+    titleTriesRef.current.set(sid, tries + 1);
+    const firstAssistant = cached
+      .filter((m) => m.role === 'assistant' && !m.content.startsWith('💭 ') && !m.content.startsWith('🔧 '))
+      .map((m) => m.content).pop();
+    // 只在它仍然叫 New Chat 时写:这中间你可能已经自己改过名字。
+    const stillNew = () => /^New Chat\b/.test((sessionsRef.current.find((s) => s.id === sid)?.title || '').trim());
+    const fallBackToTruncation = () => {
+      if (tries + 1 < MAX_TITLE_TRIES) return;
+      const truncated = firstUser.slice(0, 40);
+      if (truncated) setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title: truncated } : s)));
+    };
+    window.kiroApi.generateTitle?.(firstUser, firstAssistant).then((r) => {
+      if (!stillNew()) return;
+      if (r?.title) {
+        setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title: r.title! } : s)));
+        titleTriesRef.current.delete(sid);
+        return;
+      }
+      fallBackToTruncation();
+    }).catch(() => {
+      if (stillNew()) fallBackToTruncation();
+    });
+  };
+
   const finishStreamingTurn = (sid: string | null, token: symbol) => {
     if (!sid || activePromptTokenRef.current.get(sid) !== token) return;
     activePromptTokenRef.current.delete(sid);
     removeStreaming(sid);
+    maybeAutoTitle(sid);
   };
 
   const addAttached = (sid: string) => {
@@ -573,6 +790,38 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     setInterruptedSessionIds((prev) => (prev.includes(sid) ? prev.filter((id) => id !== sid) : prev));
   };
 
+  /** Record that this chat's last turn was CUT SHORT, and offer its prompt back.
+   *
+   *  One implementation for all three ways a turn can be cut: the user pressing Stop, the
+   *  executor dying mid-turn, and the watchdog interrupting a silent turn. The third one
+   *  used to do NOTHING here -- `onTurnWedged` returned early whenever the turn had
+   *  produced something -- so a turn KiroLex had just killed was indistinguishable from a
+   *  completed one: no banner, nothing back in the composer, and per-message Rerun still
+   *  offered even though resubmitting in the composer is the documented recovery. The
+   *  wedge note inside the message was the only trace.
+   *
+   *  Anchored to the turn's BASE user message, never a steer: steers are optimistic-only
+   *  in the view and get stripped when un-consumed ones are re-queued, so an overwrite
+   *  target pointing at one fails to resolve.
+   *
+   *  @param prefill Put the prompt back in the composer. False for the auto-resend path,
+   *    where the question is already being retried and text sitting in the box would
+   *    invite sending it twice.
+   */
+  const markTurnInterrupted = (sid: string, opts?: { prefill?: boolean }) => {
+    const msgs = messagesCacheRef.current.get(sid) || [];
+    let idx = -1;
+    for (let i = msgs.length - 1; i >= 0; i--) {
+      if (msgs[i].role === 'user' && !msgs[i].steer) { idx = i; break; }
+    }
+    if (idx < 0) return;
+    markInterrupted(sid, msgs[idx].id);
+    if (opts?.prefill === false) return;
+    if (msgs[idx].content.trim()) {
+      setRestoredInputDraft({ id: Date.now(), text: msgs[idx].content, sessionId: sid });
+    }
+  };
+
   // Sessions already examined for an interrupted turn this run, so recovery runs at
   // most once per chat.
   const recoveryCheckedRef = useRef<Set<string>>(new Set());
@@ -614,6 +863,27 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch {}
     return false;
   };
+  /**
+   * Chats whose CURRENT stream was adopted rather than started here.
+   *
+   * A turn this window sent clears its own `streamingIds` entry when its `acp:prompt` invoke
+   * resolves. An adopted turn was sent by a window that no longer exists, so there is no
+   * promise to await: main's busy event is the only end-of-turn signal, and without honouring
+   * it the chat would stream forever with its composer locked.
+   */
+  const adoptedTurnsRef = useRef<Set<string>>(new Set());
+
+  /** Take over an in-flight turn: show what it has produced, and let its chunks through. */
+  const adoptTurn = (sid: string, peek: TurnPeek) => {
+    adoptedTurnsRef.current.add(sid);
+    addStreaming(sid);
+    // Order matters: streaming FIRST, then paint. The chunk handler drops anything arriving
+    // while the chat is not marked streaming, and a chunk dropped before the seed would leave
+    // a hole that only `acp:assistant-final` could heal.
+    if (peek.text) mutateSessionMessagesRef.current?.(sid, (current) => adoptedMessages(current, peek));
+    setSessionActivity(sid, '⟳ 上一轮仍在运行，已接回它的回复（没有重发）');
+  };
+
   const recoverInterruptedTurn = (sid: string, msgs: Message[], opts?: { assumeCurrent?: boolean }) => {
     if (!sid || sid.startsWith('pending_')) return;
     // Only ever for chats the user can SEE. Doing it for every hydrated session at
@@ -624,9 +894,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     recoveryCheckedRef.current.add(sid);
     // Opt-out lives in Settings ("重启后自动重发未完成的提问"). Read from the persisted
     // settings object: this hook runs outside App's settings state.
+    // Read, but NOT acted on here: returning early made the peek below unreachable, so a live
+    // turn could never be adopted in a window with auto-resend switched off -- and the answer
+    // that window was already paying for stayed invisible. The decision gates the SEND on it.
+    let resendDisabled = false;
     try {
       const raw = uiGet('kirolex-settings');
-      if (raw && JSON.parse(raw)?.recoverInterruptedTurns === false) return;
+      resendDisabled = !!raw && JSON.parse(raw)?.recoverInterruptedTurns === false;
     } catch { /* default: enabled */ }
     if (streamingIdsRef.current.has(sid)) return;      // still running — not interrupted
     if (overwriteTargetRef.current.has(sid)) return;   // already flagged
@@ -667,7 +941,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           const [seenKey, seenCount] = String(record).split('#');
           if (seenKey === key) {
             attempts = Number(seenCount) || 1;
-            if (attempts >= AUTO_RESEND_MAX_ATTEMPTS) return;
+            // NOT an early return any more: a spent budget must still be able to ADOPT a live
+            // turn (that costs nothing). `decideTurnRecovery` stands down on it instead.
           }
         }
       } catch { /* if the guard is unavailable, still only once per run */ }
@@ -691,16 +966,68 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           } catch { /* treat as idle if unknown */ }
           if (!busy && !streamingIdsRef.current.has(sid)) return true;
           // Never overwrite the rebuild's own progress line.
-          if (!isRebuilding(sid)) setSessionActivity(sid, '⏳ 上一轮仍在收尾，稍后自动重发…');
+          // NOT "上一轮仍在收尾" any more: a live turn is adopted before this branch can be
+          // reached, so what is being waited on here is an attach, a history rebuild or a
+          // model/agent switch — never the previous turn.
+          if (!isRebuilding(sid)) setSessionActivity(sid, '⏳ 会话正忙（连接 / 重建中），稍后自动重发…');
           await new Promise((r) => setTimeout(r, 3000));
         }
         return false;
       };
-      if (!(await waitForIdle())) {
-        if (!isRebuilding(sid)) setSessionActivity(sid, null);
-        recoveryCheckedRef.current.delete(sid);   // allow another attempt later
-        return;
+      /**
+       * ADOPT, WAIT, OR RESEND -- asked of main rather than guessed at.
+       *
+       * The old code went straight to `waitForIdle` and then resent. But "the previous turn is
+       * still wrapping up" does not mean the answer was lost: main is still receiving it and
+       * will flush it to the transcript. Resending then buys a second copy of an answer already
+       * being paid for, and can land two replies under one question.
+       *
+       * Two rounds: the first decides on the state as it is now; if that state is a non-turn
+       * occupation (attach, history rebuild) we wait it out and decide ONCE more -- a turn may
+       * have started in the meantime, and it must be adopted rather than raced.
+       */
+      let adopted = false;
+      for (let round = 0; round < 2 && !adopted; round++) {
+        let peek: TurnPeek | null = null;
+        try { peek = (await window.kiroApi.peekTurn?.(sid)) ?? null; } catch { peek = null; }
+        let busyReason: string | null = null;
+        try { busyReason = (await window.kiroApi.getBusyMap?.())?.[sid] ?? null; } catch {}
+
+        const decision = decideTurnRecovery({
+          peek,
+          busyReason,
+          streaming: streamingIdsRef.current.has(sid),
+          cancelled: recoveryCancelledRef.current.has(sid),
+          resendDisabled,
+          attempts,
+          maxAttempts: AUTO_RESEND_MAX_ATTEMPTS,
+        });
+
+        if (decision.action === 'adopt' && peek) {
+          // Take ownership of the running stream: mark the chat streaming so the chunk handler
+          // stops dropping its chunks, and paint what has been produced so far. No resend, and
+          // no attempt charged -- nothing was sent.
+          adoptTurn(sid, peek);
+          adopted = true;
+          break;
+        }
+        if (decision.action === 'stand-down') {
+          if (!isRebuilding(sid)) setSessionActivity(sid, null);
+          recoveryCheckedRef.current.delete(sid);
+          return;
+        }
+        if (decision.action === 'wait') {
+          if (!(await waitForIdle())) {
+            if (!isRebuilding(sid)) setSessionActivity(sid, null);
+            recoveryCheckedRef.current.delete(sid);   // allow another attempt later
+            return;
+          }
+          continue;   // re-decide: the wait may have ended in a turn worth adopting
+        }
+        break;        // 'resend'
       }
+      if (adopted) return;
+
       try { await window.kiroApi.setAutoResent?.(sid, `${key}#${attempts + 1}`); } catch {}
       if (!isRebuilding(sid)) setSessionActivity(sid, '⟳ 上次未完成的这一轮，正在自动重发…');
       try {
@@ -709,7 +1036,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // A real failure IS worth a banner: the question would otherwise sit
         // unanswered with no explanation.
         setSessionActivity(sid, null);
-        setConnectionError(`自动重发失败：${error?.message || error}。可对该消息手动点重跑。`);
+        noteError(sid, `自动重发失败：${error?.message || error}。可对该消息手动点重跑。`);
       }
     })();
   };
@@ -722,21 +1049,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  prompt INTO ANOTHER CHAT. Observed live: a resend for the PPT chat landed in a
    *  different session's transcript. Always pass the session explicitly. */
   const rerunFromMessageRef = useRef<((messageId: string, editedText: string, override?: RerunOverride, targetSid?: string) => Promise<void>) | null>(null);
-
-  const clearLoopState = useCallback((sessionId?: string): boolean => {
-    const targets = sessionId ? [sessionId] : Array.from(loopsRef.current.keys());
-    let cleared = false;
-    for (const sid of targets) {
-      const loop = loopsRef.current.get(sid);
-      if (!loop) continue;
-      loop.stopped = true;
-      if (loop.timer) clearTimeout(loop.timer);
-      loopsRef.current.delete(sid);
-      cleared = true;
-    }
-    if (cleared) setLoopingIds(Array.from(loopsRef.current.keys()));
-    return cleared;
-  }, []);
+  /** Same reason as the ref above: `mutateSessionMessages` is defined below this point. */
+  const mutateSessionMessagesRef = useRef<((sid: string, updater: (msgs: Message[]) => Message[]) => void) | null>(null);
 
   // Mutate a session's messages whether it is the active view (setMessages) or a
   // background session (its localStorage-backed cache). Mirrors the updateSession
@@ -755,6 +1069,78 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       commitBackgroundMessages(sid, updater(cached));
     }
   }, [commitBackgroundMessages]);
+
+  mutateSessionMessagesRef.current = mutateSessionMessages;
+
+  /** Report a finished loop into the chat AND onto disk.
+   *
+   *  Both halves are required. The screen half alone is what the old code had --
+   *  `mutateSessionMessages` only updates `setMessages` and the in-memory cache, so
+   *  the reason a loop ended lived exactly as long as the window did. The durable
+   *  half goes through a dedicated IPC for the same reason steers do: the renderer
+   *  has no other way into the append-only transcript, and that transcript is what
+   *  the context snapshot and history.md are rendered from. */
+  const reportLoopEnd = useCallback((run: LoopRun, terminal: LoopTerminal) => {
+    if (!shouldReportTerminal(terminal)) return;   // the chat itself is gone
+    const text = terminalSummary(run, terminal, Date.now());
+    mutateSessionMessages(run.sessionId, (current) => [
+      ...current,
+      {
+        id: `loop_end_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        role: 'assistant',
+        content: text,
+        timestamp: Date.now(),
+      },
+    ]);
+    void window.kiroApi.persistNote?.(run.sessionId, text).catch(() => {});
+  }, [mutateSessionMessages]);
+
+  /**
+   * End a loop and SAY WHY. Replaces `clearLoopState`.
+   *
+   *  `terminal` is a required positional parameter, deliberately: there were six
+   *  call sites deleting the map entry and the reason with it, so "the user pressed
+   *  Stop", "the send failed" and "the app is shutting down" were indistinguishable
+   *  afterwards. Making the reason a convention that each call site is supposed to
+   *  remember would leave a seventh call site free to default to `aborted`, i.e. to
+   *  record a real failure as a user action. As a required argument, the compiler
+   *  forces every present and future caller to state what happened.
+   *
+   *  Order inside the loop matters: the terminal is written INTO the run before the
+   *  entry is unregistered, so the reported summary is the run's own final state
+   *  rather than something reconstructed after the fact.
+   *
+   *  Passing no session ends every loop -- only correct for teardown, where each
+   *  loop genuinely ends for the same reason.
+   */
+  const endLoop = useCallback((sessionId: string | undefined, terminal: LoopTerminal): boolean => {
+    const targets = sessionId ? [sessionId] : Array.from(loopsRef.current.keys());
+    let ended = false;
+    for (const sid of targets) {
+      const handle = loopsRef.current.get(sid);
+      if (!handle) continue;
+      handle.stopped = true;
+      if (handle.timer) clearTimeout(handle.timer);
+      handle.timer = null;
+      // `endWith` keeps a terminal the state machine already decided (success,
+      // stalled, ...) instead of overwriting it with the caller's guess.
+      handle.run = endWith(handle.run, terminal);
+      loopsRef.current.delete(sid);
+      ended = true;
+      reportLoopEnd(handle.run, handle.run.terminal as LoopTerminal);
+      // Record the ENDING durably before dropping the record, so the reason a run
+      // stopped is not lost with the process that decided it -- then clear it, so a
+      // finished loop does not leave this session looking busy after a restart.
+      void window.kiroApi.loopPersist?.(sid, handle.run)
+        .then(() => window.kiroApi.loopClear?.(sid))
+        .catch(() => {});
+      // Withdraw main's standing approval for this session's verifier command: it
+      // exists only for the duration of a run the user started.
+      void window.kiroApi.loopRegisterVerifier?.(sid, '', 0).catch(() => {});
+    }
+    if (ended) setLoopingIds(Array.from(loopsRef.current.keys()));
+    return ended;
+  }, [reportLoopEnd]);
 
   const attachFileChangeToLatestTurn = useCallback((sid: string, tc: ToolCall, isActive: boolean) => {
     upsertFileChange(sid, tc, isActive);
@@ -1036,11 +1422,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         try { cap = (await window.kiroApi.getExecutorCap()) || EXECUTOR_CAP_FALLBACK; } catch {}
         const limit = Math.max(1, cap - 1); // reserve one slot so "New chat" can attach
         const lastSid = uiGet('kirolex-last-session');
-        const ordered = sessionsRef.current.filter((s) => s && !String(s.id).startsWith('pending_') && !s.archived);
-        // Ordering now only decides WHICH sessions make the cap cut, not who starts
-        // first -- keep the current chat inside the cut.
-        ordered.sort((a, b) => (a.id === lastSid ? -1 : b.id === lastSid ? 1 : 0));
-        toAttach = ordered.slice(0, limit);
+        /**
+         * ONLY THE LAST ACTIVE PROJECT (plus Unassigned, plus the chat being landed on) —
+         * 「默认只预热上一个活跃的project和unassigned中的会话」.
+         *
+         * Each executor is a ~0.4GB kiro-cli process. This loop first warmed everything under the cap, then
+         * everything outside an idle project — which still means one process per LIVE project while you are
+         * reading exactly one of them. Everything else stays visible but cold and attaches on the click
+         * (`warmSession` for a chat, `onWarmProject` for a group), which is 「等用户点开project再创建连接」.
+         */
+        const warmIds = new Set(sessionsToWarm(sessionsRef.current, { now: Date.now(), limit, keepId: lastSid }));
+        toAttach = sessionsRef.current.filter((s) => warmIds.has(s.id));
         toAttach.forEach((s) => { if (!attachedIdsRef.current.has(s.id)) markConnecting(s.id); });
         // Let React paint the hydrated sidebar/transcript before the window shows.
         await new Promise((r) => setTimeout(r, 120));
@@ -1094,6 +1486,18 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       messagesCacheRef.current.set(currentSessionId, messages);
     }
   }, [messages, currentSessionId]);
+  /**
+   * Same array object, reachable synchronously from switchSession —— 但**必须连它属于哪条会话一起记**。
+   *
+   * 这个 ref 在 effect 里更新（提交之后），而 `currentSessionRef.current` 是同步更新的。于是存在一个
+   * 窗口：焦点已经指向 B，这个 ref 里还装着 A 的消息。`switchSession` 在这个窗口里跑的话，会把
+   * A 的消息当成 B 的寄存进 `paneViews[B]` —— 而那处只写一次（`prev[outgoing] ? prev : …`），
+   * 写错就永久钉住。
+   *
+   * 症状是「修改画布下面那个 session 变成了别的会话内容」：画布下面那格是
+   * `renderPane(studioSid, …)`，它不是焦点会话时读的正是 `paneViews[studioSid]`。
+   */
+  useEffect(() => { focusedMessagesRef.current = { sessionId: currentSessionId, messages }; });
 
 
   // Persist sessions whenever they change
@@ -1140,6 +1544,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 // chats reappear in the normal list instead of the Archived group.
                 archived: rec.archived ?? existing.archived,
                 pinned: existing.pinned ?? rec.pinned, // durable pin survives origin/localStorage change
+                /**
+                 * 角色标记也归记录所有 —— 「重启之后 flow 注册的那个 tag 就没有了」。
+                 *
+                 * `purpose` 现在写进记录了(`acp:mark-session-purpose`),但水化时没被读回来:于是重启后
+                 * 那个 🧩 消失、`flow-main` 的删除保护在 renderer 侧也失效。记录说什么就是什么。
+                 */
+                purpose: rec.purpose ?? existing.purpose,
+                flow: rec.flow ?? (existing as any).flow,
+                // agent 也归记录所有：它决定这条会话有哪些工具，而泳道复用要按它判断能不能复用
+                kiroAgent: rec.kiroAgent ?? existing.kiroAgent,
               });
             } else {
               byId.set(rec.id, {
@@ -1149,6 +1563,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 projectId: rec.projectId,
                 archived: rec.archived,
                 pinned: rec.pinned,
+                purpose: rec.purpose,
+                flow: rec.flow,
+                kiroAgent: rec.kiroAgent,
                 timestamp: rec.updatedAt,
               });
             }
@@ -1405,17 +1822,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         case 'plan': {
           // ACP execution plan. kiro-cli resends the full plan on each update,
           // so we replace wholesale. Rendered as a collapsible Plan/Todo panel.
-          const entries: PlanEntry[] = Array.isArray(update.entries)
-            ? update.entries
-                .map((e: any) => ({
-                  content: typeof e?.content === 'string' ? e.content : (e?.content?.text || ''),
-                  priority: e?.priority,
-                  status: e?.status,
-                }))
-                .filter((e: PlanEntry) => !!e.content)
-            : [];
+          const entries: PlanEntry[] = normalizeTaskList(Array.isArray(update.entries) ? update.entries : []);
           planMapRef.current.set(targetSid, entries);
+          taskListsRef.current = updateTaskLists(taskListsRef.current, targetSid, entries);
+          uiSet(TASK_LISTS_KEY, serializeTaskLists(taskListsRef.current));
+          /* 让「不是当前焦点」的界面（画布上的节点）也能跟着重画：清单是每一步进度的唯一实时来源 */
+          setTaskListTick((tick) => tick + 1);
           if (isActiveSession) setPlan(entries);
+          // A pane that is not the focused chat gets it too, so the panel no longer
+          // appears/disappears (and reflows the transcript) on a focus switch.
+          patchPane(targetSid, { plan: entries });
           break;
         }
 
@@ -1505,6 +1921,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             };
             usageMapRef.current.set(sessionId, next);
             writeUsageMap(usageMapRef.current); // durable: see USAGE_MAP_KEY
+            // 图上那些节点靠这份反应式镜像重画（见 usageBySession）
+            setUsageBySession((cur) => ({ ...cur, [sessionId]: { contextPercent: next.contextPercent, credits: next.credits } }));
             // Only update the visible usage if this is the session being viewed
             if (isActiveSession) setUsage(next);
             patchPane(sessionId, { usage: next });
@@ -1623,6 +2041,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // marked streaming), which showed up as a reply cut off mid-sentence while
     // the persisted transcript was complete. Healing here makes the on-screen
     // message match what was actually produced.
+    /** kiro 报的子代理名单：整份替换，最后一份说全都 terminated 了 —— 那一刻 tag 就该消失 */
+    const removeSubagents = window.kiroApi.onSubagents?.(({ sessionId: sid, subagents: rows }) => {
+      if (!sid) return;
+      setSubagents((cur) => ({ ...cur, [sid]: Array.isArray(rows) ? rows : [] }));
+    });
     const removeSessionBusy = window.kiroApi.onSessionBusy?.(({ sessionId: sid, reason, detail }) => {
       if (!sid) return;
       // Mirror the rebuild state so background flows (auto-resend) can avoid
@@ -1660,6 +2083,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             || activityMapRef.current.get(sid)?.includes('历史上下文')) {
           setSessionActivity(sid, null);
         }
+      }
+      // AN ADOPTED TURN ENDS HERE, and nowhere else. This window never held its promise, so
+      // main's "no longer a turn" is the only signal that can release the stream.
+      if (adoptedTurnsRef.current.has(sid) && reason !== 'turn') {
+        adoptedTurnsRef.current.delete(sid);
+        removeStreaming(sid);
+        if (activityMapRef.current.get(sid)?.includes('已接回')) setSessionActivity(sid, null);
       }
       setBusyBySession((prev) => {
         const current = prev[sid] || null;
@@ -1736,9 +2166,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         quietSeconds: data.quietSeconds || 0,
         openTools: data.openTools || 0,
         toolIdleSeconds: data.toolIdleSeconds || 0,
-        cpuBusy: !!data.cpuBusy,
-        cpuVetoLeftSeconds: data.cpuVetoLeftSeconds || 0,
         interruptInSeconds: data.interruptInSeconds ?? null,
+        boundBy: data.boundBy === 'tool' ? 'tool' : 'quiet',
+        boundSeconds: data.boundSeconds || 0,
       });
     });
 
@@ -1748,7 +2178,23 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // anything set here would be a floating notice outliving the turn it describes.
     const removeTurnWedged = window.kiroApi.onTurnWedged?.(({ sessionId: sid, produced }) => {
       if (!sid) return;
-      if (produced) return;   // partial reply exists -> resending would duplicate it
+      if (produced) {
+        // A partial reply exists, so resending would duplicate it -- but the turn was
+        // still CUT SHORT by us, and it used to be left looking completed: no banner, an
+        // empty composer, and per-message Rerun still offered. Mark it and hand the
+        // prompt back so the documented recovery (resubmit, which overwrites the turn)
+        // is available and obvious. Deferred until the turn actually settles: this event
+        // fires the moment main DECIDES, while the stream is still open.
+        void (async () => {
+          const deadline = Date.now() + 60000;
+          while (streamingIdsRef.current.has(sid) && Date.now() < deadline) {
+            await new Promise((r) => setTimeout(r, 300));
+          }
+          if (streamingIdsRef.current.has(sid)) return;   // never settled; leave it alone
+          markTurnInterrupted(sid);
+        })();
+        return;
+      }
       // The auto-resend, by contrast, IS live, so it gets a status line.
       setSessionActivity(sid, '⚠️ 该轮无响应，已中断，正在自动重发…');
 
@@ -1778,27 +2224,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         streamingIdsRef.current.delete(sid);
         removeAttached(sid); // executor gone -> dormant
         clearConnecting(sid);
-        clearLoopState(sid);
+        // BLOCKED, not aborted: the executor died under the loop. Recording this as
+        // a user stop is exactly the "an error read as a success" shape the terminal
+        // exists to prevent -- the chat auto-recovers below, but the loop does not.
+        endLoop(sid, 'blocked');
         // Mid-turn death is an interruption: mark the last user turn so the next
         // submit OVERWRITES it, and (if this is the viewed session) surface an
         // error + restore its prompt to the composer.
         if (wasStreaming) {
-          const msgs = messagesCacheRef.current.get(sid) || [];
-          let idx = -1;
-          for (let i = msgs.length - 1; i >= 0; i--) {
-            // Anchor to the turn's BASE user message, not the last steer: steer
-            // messages are optimistic-only (main never persists them) and get
-            // stripped when un-consumed steers are re-queued -- an overwrite /
-            // rerun target pointing at one then fails to resolve.
-            if (msgs[i].role === 'user' && !msgs[i].steer) { idx = i; break; }
-          }
-          if (idx >= 0) {
-            markInterrupted(sid, msgs[idx].id);
-            if (sid === currentSessionRef.current) {
-              if (msgs[idx].content.trim()) setRestoredInputDraft({ id: Date.now(), text: msgs[idx].content, sessionId: sid });
-              setConnectionError('⚠️ 会话在回合中被中断；下一条消息将覆盖这一轮。');
-            }
-          }
+          // Deliberately NOT also reported through the error banner. One state, one
+          // place: the interrupted bar is derived from the same flag that disables the
+          // per-message Rerun, so the notice and the restriction cannot disagree and
+          // both retire together. Reporting it twice is how a red copy of this message
+          // used to stay on screen after the state itself was gone -- the banner had
+          // its own, longer lifetime.
+          markTurnInterrupted(sid);
         }
         // AUTO-RECOVERY: the executor process is genuinely gone, so bring the
         // session back by itself instead of leaving a dead grey chat that only
@@ -1809,6 +2249,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           setTimeout(() => {
             (async () => {
               if (attachedIdsRef.current.has(sid)) return; // already back
+              /**
+               * 归档的会话不救 —— 归档的语义就是「让它彻底停下来」。
+               *
+               * 这条守卫少了会有一个很具体的后果：`archiveSession` 里的 `removeAttached` 刚把它摘掉，
+               * 紧接着执行器的 disconnected 事件到达，这里就把它 `loadSession` + `addAttached` 拉回来。
+               * 表现是**归档后侧栏那条还是绿的**（注释里写着 attached 才会绿），而且它的 kiro-cli
+               * 进程被重新拉起 —— 归档等于什么都没关掉。
+               */
+              if (sessionsRef.current.find((s) => s.id === sid)?.archived) return;
               try {
                 markConnecting(sid);
                 await window.kiroApi.loadSession(sid, '~', modelForSession(sid));
@@ -1824,7 +2273,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
       } else {
         streamingIdsRef.current.clear();
-        clearLoopState();
+        // Everything went down at once (the whole ACP layer, not one chat). Neither
+        // 'aborted' nor 'blocked' is honest here, which is why 'torn-down' exists.
+        endLoop(undefined, 'torn-down');
         attachedIdsRef.current.clear();
         setAttachedSessionIds([]);
         connectingRef.current.clear();
@@ -1855,6 +2306,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       removeTurnQuiet?.();
       removeTurnWedged?.();
       removeSessionBusy?.();
+      removeSubagents?.();
       removeDisconnected();
       removeSessionReady();
     };
@@ -1862,45 +2314,98 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
   const connect = useCallback(async (model: string) => {
     setStatus('connecting');
-    setConnectionError(null);
+    noteError(null, null);
     try {
       await window.kiroApi.connect({ model });
       setStatus('connected');
     } catch (err: any) {
       setStatus('disconnected');
-      setConnectionError(err?.message || 'Failed to connect');
+      noteError(null, err?.message || 'Failed to connect');
     }
   }, []);
 
+  /** No chat is focused any more, without closing or deleting anything.
+   *
+   *  Needed because "focused chat" and "chat on screen" are the same thing in a
+   *  single-pane layout but NOT in a split: closing the last pane leaves a grid with
+   *  nothing in it, and a chat that is still focused while invisible immediately gets
+   *  adopted back into a slot by the layout effects -- which is exactly why closing
+   *  the last pane used to collapse the split instead of emptying it.
+   *
+   *  Deliberately NOT `switchSession(null)`: that path attaches executors, primes
+   *  context and rewrites the transcript view. Nothing here touches the backend --
+   *  the chats keep running, they are just not on screen. Messages are dropped
+   *  because the focused-pane transcript is not rendered without a focused chat, and
+   *  refocusing re-seeds it from the cache. */
+  const unfocusSession = useCallback(() => {
+    currentSessionRef.current = null;
+    setCurrentSessionId(null);
+    setMessages(EMPTY_PANE_MESSAGES);
+  }, []);
+
   const disconnect = useCallback(async () => {
-    clearLoopState();
+    // The app is disconnecting on purpose; the loops did not fail and were not
+    // stopped on their own merits.
+    endLoop(undefined, 'torn-down');
     await window.kiroApi.disconnect();
     setStatus('disconnected');
     setCurrentSessionId(null);
-  }, [clearLoopState]);
+  }, [endLoop]);
 
-  const newSession = useCallback(async (cwd: string, model: string = DEFAULT_MODEL, projectId?: string) => {
+  /**
+   * `kiroAgent` is a parameter because a run's steps must execute under the skill's agent — 「skill必须搭配agent
+   * 配置」. Its tools live in that agent's MCP servers; created under the default agent the step has none.
+   */
+  const newSession = useCallback(async (
+    cwd: string,
+    model: string = DEFAULT_MODEL,
+    projectId?: string,
+    kiroAgent?: string,
+    /**
+     * 建好之后要不要把焦点切过去。默认切（你点「新对话」就是想立刻用它），但 flow 建子会话时必须
+     * 传 `false` —— 「flow 创建子会话的时候停在主会话这里，不要自动切过去」。
+     *
+     * 为什么这是个参数而不是在调用点切回来：切过去再切回来会经过一次 `setMessages([])`，主会话的
+     * 消息被清空又重新加载，画面闪一下；而且 `currentSessionRef` 中途指向过 worker，任何在这一瞬间
+     * 到达的流式更新都会被记到错的会话上。不切，就没有这一段中间状态。
+     */
+    opts?: { focus?: boolean },
+  ) => {
     await connect(model);
+    const focus = opts?.focus !== false;
 
     // KiroLex-owned session id, stable from creation (never a pending swap).
     // Main maps kiro-cli's backend session id to this id internally.
     const id = `s_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    currentSessionRef.current = id;
     sessionModelRef.current.set(id, model);
-    setCurrentSessionId(id);
-    setMessages([]);
-    currentMessageRef.current = '';
-    toolCallsRef.current.clear();
-    setUsage(null);
-    setPlan([]);
-    setFileChanges([]);
-    setActiveToolCall(null);
-    setContextLinks([]);
+    if (focus) {
+      currentSessionRef.current = id;
+      setCurrentSessionId(id);
+      // 下面这些都是「当前会话」的视图状态，不切焦点就一个都不能动 —— 它们属于你正看着的那条会话。
+      setMessages([]);
+      currentMessageRef.current = '';
+      toolCallsRef.current.clear();
+      setUsage(null);
+      setPlan([]);
+      setFileChanges([]);
+      setActiveToolCall(null);
+      setContextLinks([]);
+    }
 
     if (projectId) setProjects((prev) => (prev.includes(projectId) ? prev : [...prev, projectId]));
 
     setSessions((prev) => [
-      { id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, timestamp: Date.now() },
+      /**
+       * `kiroAgent` 要一起记 —— 它原来只传给主进程，没写进渲染层自己的状态。
+       *
+       * 两个后果：界面上这条会话显示的是**默认 agent**（磁盘上其实是对的）；而 flow 的泳道复用要
+       * 比 agent 才敢复用（会话的 agent 创建时就定了、换不了），比到 `undefined` 就一律不复用 ——
+       * 于是一个配了 agent 的 flow **每步都另起一条会话**，复用被静默禁掉。
+       *
+       * 这是同一个字段的第二处漏填：另一处是 `listDurableSessions` 没把 `profile.kiroAgent` 发出来
+       * （已修）。新建这条路是"从来没写过"，那条是"重启后才丢"——两处都补上才算全。
+       */
+      { id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, kiroAgent, timestamp: Date.now() },
       ...prev,
     ]);
     markConnecting(id); // flash while the executor spawns
@@ -1909,7 +2414,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // this same attach (id is already stable, so no swap — just gate readiness).
     const createPromise = (async (): Promise<string> => {
       try {
-        await window.kiroApi.newSession(id, cwd, model, projectId, undefined, 'auto-approve');
+        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve');
         clearConnecting(id);
         // Per design: a newly created chat auto-connects. The executor is
         // spawned, so mark it attached immediately -> the sidebar dot goes green
@@ -2027,6 +2532,31 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return newId;
   }, [sessions]);
 
+  /** The live view for a chat that is on screen but has no PaneView entry YET.
+   *
+   *  This closes a one-frame hole that was measured, not guessed. `setPaneSessions` runs
+   *  in an EFFECT, so on the render where focus moves away from a chat that chat is
+   *  already `!focused` while `paneViews[sid]` does not exist yet. The pane therefore
+   *  rendered `view?.messages || []` -- an EMPTY conversation -- for one commit: every
+   *  transcript row unmounted, the empty-state block mounted, and the next commit
+   *  re-created all of it as NEW nodes. Measured on the live window: clicking one pane
+   *  produced 0 mutations in the pane clicked and 24 (12 added / 12 removed, 0 surviving
+   *  node objects) in the pane that LOST focus, with nothing at all in a no-click
+   *  control. That teardown/rebuild of every markdown block is the flash.
+   *
+   *  Reading the same refs `setPaneSessions` seeds from also preserves array IDENTITY,
+   *  so the rows are not merely rebuilt cheaply -- they are not re-rendered at all. */
+  const paneFallback = useCallback((sid: string): PaneView => ({
+    messages: messagesCacheRef.current.get(sid) || EMPTY_PANE_MESSAGES,
+    activity: activityMapRef.current.get(sid) || null,
+    activeTool: activeToolMapRef.current.get(sid) || null,
+    usage: usageMapRef.current.get(sid) || null,
+    contextLinks: (contextLinksRef.current.get(sid) || [])
+      .map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })),
+    stall: stallMapRef.current.get(sid) || null,
+    plan: planMapRef.current.get(sid) || EMPTY_PANE_PLAN,
+  }), []);
+
   /** Declare which sessions are visible in split panes (never the focused one).
    *  Seeds each pane's live view from the message cache, and reads the
    *  transcript from disk for a pane that was never opened this run — the same
@@ -2034,6 +2564,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const setPaneSessions = useCallback(async (ids: string[]) => {
     const wanted = ids.filter((id) => !!id && !id.startsWith('pending_'));
     paneSessionIdsRef.current = new Set(wanted);
+    onScreenPaneIdsRef.current = new Set([...wanted, currentSessionRef.current].filter(Boolean) as string[]);
     setPaneViews((prev) => {
       const next: Record<string, PaneView> = {};
       for (const id of wanted) {
@@ -2045,6 +2576,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           contextLinks: (contextLinksRef.current.get(id) || [])
             .map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })),
           stall: stallMapRef.current.get(id) || null,
+          plan: planMapRef.current.get(id) || EMPTY_PANE_PLAN,
         };
       }
       return next;   // panes that went away are dropped, freeing their copy
@@ -2080,6 +2612,45 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   }, [commitBackgroundMessages]);
 
   const switchSession = useCallback(async (sessionId: string) => {
+    // Hand the OUTGOING chat its own pane view BEFORE focus moves, carrying the very
+    // array it is already rendering.
+    //
+    // Two measured problems, one cause -- `setPaneSessions` seeds pane views from an
+    // EFFECT, i.e. a commit too late:
+    //   1. for one commit the outgoing pane had no view at all, so it rendered as an
+    //      EMPTY conversation: every row unmounted and was then re-created as a new
+    //      node (24 mutations, 0 surviving node objects, on a 10-row chat);
+    //   2. once seeded from the cache it got an equal-but-DIFFERENT array, so every
+    //      memo bailed out and highlight.js re-ran over the whole transcript (554
+    //      `code` + 60 `pre` attribute mutations on an 82-row chat), even though the
+    //      message ids before and after were identical.
+    // Seeding here, batched with the focus change, keeps the identity and therefore
+    // costs nothing: the pane simply keeps rendering what it already had.
+    const outgoing = currentSessionRef.current;
+    if (outgoing && outgoing !== sessionId && onScreenPaneIdsRef.current.has(outgoing)) {
+      /**
+       * 只有当这个 ref 里的数组**确实属于 outgoing** 时才寄存它。
+       *
+       * ref 在 effect 里更新（提交之后），`currentSessionRef` 是同步更新的，所以两者会短暂不一致：
+       * 焦点已经是 B，ref 里还是 A 的消息。不检查就会把 A 的对话寄存成 B 的，而下面这个 setPaneViews
+       * **只写一次**（`prev[outgoing] ? prev : …`），一旦写错就永久钉住 —— 那正是「修改画布下面那个
+       * session 变成了别的会话内容」的成因。
+       *
+       * 不匹配时退回 `paneFallback(outgoing)` 自己那份（它按 id 从消息缓存取，天然不会错人）。这样
+       * 最坏情况只是失去「保持数组同一性」这个优化（可能闪一下），而不是显示错误的对话。
+       */
+      const snapshot = focusedMessagesRef.current;
+      const carried = snapshot.sessionId === outgoing ? snapshot.messages : null;
+      paneSessionIdsRef.current.add(outgoing);   // patchPane only writes for known panes
+      setPaneViews((prev) => (prev[outgoing]
+        ? prev
+        : {
+            ...prev,
+            [outgoing]: carried
+              ? { ...paneFallback(outgoing), messages: carried }
+              : paneFallback(outgoing),
+          }));
+    }
     currentSessionRef.current = sessionId; // sync immediately to avoid leaked updates
     setCurrentSessionId(sessionId);
     currentMessageRef.current = '';
@@ -2088,7 +2659,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     refreshContextLinks(sessionId);
     // Restore this session's own usage; clear the tool indicator
     setUsage(usageMapRef.current.get(sessionId) || null);
-    setPlan(planMapRef.current.get(sessionId) || []);
+    // EMPTY_PANE_PLAN, not a fresh []: the pane mirror uses the same shared value, so a
+    // chat without a plan keeps one identity and the switch costs no extra render.
+    setPlan(planMapRef.current.get(sessionId) || EMPTY_PANE_PLAN);
     setFileChanges(fileChangesMapRef.current.get(sessionId) || []);
     setActiveToolCall(activeToolMapRef.current.get(sessionId) || null);
     setActivityStatus(activityMapRef.current.get(sessionId) || null);
@@ -2190,6 +2763,34 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     }
   }, [sessions]);
 
+  /**
+   * 预热一个会话 —— 「为什么我点开一个之前的项目没有自动预热」。
+   *
+   * 侧栏那条规则(展开=热、折叠=冷)一直在跑,坏的是它调用的动作:App 那边只 `loadSession` 了一下,而
+   * `switchSession` 里真正让一个会话变成「活的」需要四件事 —— 标记连接中(点变黄)、loadSession、
+   * **登记 attach**(点变绿,后面的发送才知道它已经连上)、以及 `ensureContext`(让 main 核对后端是不是
+   * 真的还持有这段历史,不持有就重建)。少了后两件,后端可能连上了,而界面上那个点永远不变 —— 看着就是
+   * 「没预热」,而且第一次发消息时才补上那一整套。
+   *
+   * 已经 attach 过的直接跳过,所以它可以被反复调用(侧栏每次展开都会调)。
+   */
+  const warmSession = useCallback(async (sessionId: string) => {
+    const record = sessions.find((s) => s.id === sessionId);
+    if (!record || record.archived || String(sessionId).startsWith('pending_')) return;
+    if (!attachedIdsRef.current.has(sessionId)) {
+      markConnecting(sessionId);
+      try {
+        await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId));
+        addAttached(sessionId);
+      } catch {
+        /* 连不上就让它保持冷的：点开它会再试一次 */
+      } finally {
+        clearConnecting(sessionId);
+      }
+    }
+    void window.kiroApi.ensureContext?.(sessionId).catch(() => {});
+  }, [sessions]);
+
   // Send one loop iteration to a session that is not currently visible.
   // The response continues streaming into that session's cache while the user
   // works elsewhere; the durable transcript remains owned by the main process.
@@ -2277,7 +2878,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       clearInterrupted(sid);
       const textForOverwrite = prompt.find((p) => p.type === 'text' && !String(p.text).startsWith('<hidden>'))?.text || '';
       if (textForOverwrite.trim() && rerunFromMessageRef.current) {
-        setConnectionError(null); // clear the "interrupted" banner on resubmit
+        noteError(sid, null); // clear this chat's banner on resubmit
         await rerunFromMessageRef.current(targetId, textForOverwrite, {
           prompt,
           attachments,
@@ -2381,7 +2982,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ]);
           }
         } catch (err: any) {
-          setConnectionError(err?.message || 'Failed to create session');
+          noteError(sid, err?.message || 'Failed to create session');
           return;
         }
       }
@@ -2495,7 +3096,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     try {
       const res = await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });
       const notice = noticeForStopReason((res as any)?.stopReason, res) || noticeForEmptyTurn(res);
-      if (notice && sid === currentSessionRef.current) setConnectionError(notice);
+      // No focus condition any more: the notice is stored against the chat it
+      // describes, so it shows in that chat's pane whether or not it has focus.
+      if (notice) noteError(sid, notice);
     } catch (err: any) {
       const msg = String(err?.message || '');
       // Session is busy with a long turn / context compaction — NOT a dropped
@@ -2538,75 +3141,136 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // Clear streaming only if no replacement prompt started after this turn.
       finishStreamingTurn(sid, turnToken);
     }
-
-    // Title the new chat from its first message. Set a truncated fallback
-    // immediately, then upgrade to an LLM-generated title in the background —
-    // but only overwrite if the user hasn't manually renamed it in the meantime.
-    const wasNewChat = sessionsRef.current.find((s) => s.id === sid)?.title === 'New Chat';
-    const truncated = textContent.slice(0, 40) || 'New Chat';
-    if (wasNewChat) {
-      setSessions((prev) => prev.map((s) => (s.id === sid && s.title === 'New Chat' ? { ...s, title: truncated } : s)));
-      if (textContent.trim()) {
-        const firstAssistant = (messagesCacheRef.current.get(sid!) || [])
-          .filter((m) => m.role === 'assistant' && !m.content.startsWith('💭 ') && !m.content.startsWith('🔧 '))
-          .map((m) => m.content).pop();
-        window.kiroApi.generateTitle?.(textContent, firstAssistant).then((r) => {
-          if (r?.title) {
-            setSessions((prev) => prev.map((s) => (
-              s.id === sid && (s.title === truncated || s.title === 'New Chat') ? { ...s, title: r.title! } : s
-            )));
-          }
-        }).catch(() => {});
-      }
-    }
   }, [currentSessionId, mutateSessionMessages]);
 
   // Keep background callbacks on the latest send implementation rather than a
   // render-time closure captured when a loop starts.
+  /** 每个会话试过几次自动命名 —— 连着失败三次才退回截断（见 sendMessage 末尾那段） */
   const sendMessageRef = useRef(sendMessage);
   sendMessageRef.current = sendMessage;
 
-  const startLoop = useCallback((sessionId: string, text: string, intervalSec: number) => {
-    const loopText = text.trim();
-    if (!sessionId || !loopText || sessionId.startsWith('pending_')) return;
+  /** Show this round's verdict in the chat WITHOUT persisting it.
+   *
+   *  On purpose: the verdict's durable copy is the next round's prompt, which
+   *  `acp:prompt` writes to the transcript verbatim (see `nextPromptText`). Writing
+   *  it twice would put the same verifier output in the record under two different
+   *  authors. Only the run's TERMINAL is persisted separately, because nothing else
+   *  carries it. */
+  const showVerdict = useCallback((sessionId: string, run: LoopRun, verdict: LoopVerdict) => {
+    if (verdict.noEvidence) return;      // level 0: there is nothing to show
+    const tolerance = Math.max(1, run.spec.stop.maxUnrunnableRounds);
+    const head = verdict.unrunnable
+      // A flake and a broken verifier read the same in the log otherwise, and the
+      // whole point of tolerating one is that the user can tell them apart.
+      ? (run.unrunnableRounds < tolerance
+        ? `⚠️ 第 ${run.iteration} 轮校验无法执行（连续第 ${run.unrunnableRounds}/${tolerance} 次，暂不终止，稍后重试）`
+        : `⛔ 第 ${run.iteration} 轮校验无法执行（连续第 ${run.unrunnableRounds}/${tolerance} 次，已达容错上限）`)
+      : verdict.pass
+        ? `✅ 第 ${run.iteration} 轮校验通过（exit=${verdict.exitCode ?? 0}）`
+        : `❌ 第 ${run.iteration} 轮校验未通过（exit=${verdict.exitCode ?? '?'}）· 输出已回灌到下一轮`;
+    const tail = verdict.output.trim() ? `\n\n\u0060\u0060\u0060\n${verdict.output.trim().slice(0, 1200)}\n\u0060\u0060\u0060` : '';
+    mutateSessionMessages(sessionId, (current) => [
+      ...current,
+      {
+        id: `loop_verdict_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        role: 'assistant',
+        content: `${head}${tail}`,
+        timestamp: Date.now(),
+      },
+    ]);
+  }, [mutateSessionMessages]);
 
-    clearLoopState(sessionId);
-    const state: LoopState = {
-      text: loopText,
-      intervalSec: Math.max(0, Number.isFinite(intervalSec) ? intervalSec : 0),
-      stopped: false,
-      timer: null,
+  /**
+   * THE JOBS MAIN IS HOLDING, mirrored here only so the UI can state them.
+   *
+   * This is a read-only mirror and nothing more: main owns the records and the ticker, and it
+   * announces every change (created / ran / paused / finished) on `schedule:changed`. The
+   * renderer re-asks rather than patching its copy, because a patch would have to re-implement
+   * main's `nextRunAt` arithmetic and would drift the moment either side changed.
+   */
+  const [schedules, setSchedules] = useState<ScheduleView[]>([]);
+  /**
+   * The clock the COUNTDOWN is measured against, advanced on a coarse tick.
+   *
+   * Not a per-second tick: past 60s `countdownText` is minute-grained, so a 1s interval would
+   * re-render every sidebar row (they are memoised precisely to avoid that) to produce the
+   * identical string. 20s matches main's own ticker, so "即将运行" appears within one period of
+   * the run actually starting. This drives DISPLAY only -- it fires nothing.
+   */
+  const [scheduleNow, setScheduleNow] = useState(() => Date.now());
+
+  useEffect(() => {
+    const refresh = () => {
+      void window.kiroApi.scheduleList?.()
+        .then((list) => setSchedules(Array.isArray(list) ? list : []))
+        .catch(() => {});   // no jobs yet, or an older main: an empty banner is the right answer
     };
-    loopsRef.current.set(sessionId, state);
-    setLoopingIds(Array.from(loopsRef.current.keys()));
+    refresh();
+    const off = window.kiroApi.onScheduleChanged?.(refresh);
+    const tick = setInterval(() => setScheduleNow(Date.now()), 20000);
+    return () => { off?.(); clearInterval(tick); };
+  }, []);
 
-    const iterate = async () => {
-      if (state.stopped || loopsRef.current.get(sessionId) !== state) return;
-      const ok = await sendLoopBackground(sessionId, state.text);
-      if (!ok || state.stopped || loopsRef.current.get(sessionId) !== state) {
-        clearLoopState(sessionId);
-        return;
-      }
-      state.timer = setTimeout(() => { void iterate(); }, state.intervalSec * 1000);
-    };
+  /**
+   * Create a TIME-TRIGGERED TASK. Replaces `startLoop`.
+   *
+   * The renderer no longer drives anything: it hands the spec to main, which owns the
+   * ticker and the on-disk record. That move is the point rather than a tidy-up -- the old
+   * loop's `setTimeout` lived here, so "every Monday 9am" stopped existing the moment the
+   * window closed.
+   *
+   * There is no goal and no verifier. Checked against the real scenarios (weekly report,
+   * SFDC logging, oncall), the previous run's result does not change the next run's action,
+   * which is the only test of whether something is a loop rather than a scheduled task.
+   */
+  const createSchedule = useCallback(async (sessionId: string, spec: ScheduleSpec) => {
+    if (!sessionId || sessionId.startsWith('pending_')) return;
+    const result = await window.kiroApi.scheduleCreate?.(sessionId, spec);
+    if (!result?.ok) {
+      // Surfaced rather than swallowed: a mis-set job used to look like a created one.
+      noteError(sessionId, `定时任务未创建：${result?.error || '未知原因'}`);
+      return;
+    }
+    // NOTHING is written to the transcript. Main broadcasts the new job, the banner above this
+    // chat states it (trigger, countdown, run budget) and keeps stating it -- whereas this used
+    // to push a bubble that LOOKED like conversation, was screen-only (so it disappeared on the
+    // next reload) and duplicated what the banner now says permanently.
+  }, []);
 
-    void iterate();
-  }, [clearLoopState, sendLoopBackground]);
+  /**
+   * PAUSE / RESUME a job, and CANCEL one. Both are just relays -- main owns the record.
+   *
+   * There was no way to reach either from the UI: a job's only exits were exhausting its run
+   * budget and editing the store by hand, which for a daily job means it keeps spending turns
+   * until someone finds the file. No optimistic local edit, because main broadcasts the change
+   * and the mirror is re-read from it; patching here as well would be two sources of truth.
+   */
+  const pauseSchedule = useCallback(async (id: string, paused: boolean) => {
+    if (!id) return;
+    try { await window.kiroApi.schedulePause?.(id, paused); } catch {}
+  }, []);
+
+  const cancelSchedule = useCallback(async (id: string) => {
+    if (!id) return;
+    try { await window.kiroApi.scheduleRemove?.(id); } catch {}
+    // The banner disappearing IS the confirmation. A bubble here would be the same mistake the
+    // create note was: UI state dressed as conversation, and screen-only at that.
+  }, []);
 
   const stopLoop = useCallback(async (sessionId: string) => {
-    if (!clearLoopState(sessionId)) return;
+    if (!endLoop(sessionId, 'aborted')) return;
     activePromptTokenRef.current.delete(sessionId);
     try {
       await window.kiroApi.cancel(sessionId, modelForSession(sessionId), true);
     } catch {}
     removeStreaming(sessionId);
-  }, [clearLoopState]);
+  }, [endLoop]);
 
   const rerunFromMessage = useCallback(async (messageId: string, editedText: string, override?: RerunOverride, targetSid?: string) => {
     const sid = targetSid || currentSessionRef.current;
     const text = editedText.trim();
     if (!sid || sid.startsWith('pending_') || !text) {
-      setConnectionError(`重跑未执行：${!sid ? '当前无会话' : sid.startsWith('pending_') ? '会话尚未创建（先发一条消息）' : '编辑内容为空'}`);
+      noteError(sid, `重跑未执行：${!sid ? '当前无会话' : sid.startsWith('pending_') ? '会话尚未创建（先发一条消息）' : '编辑内容为空'}`);
       return;
     }
     // Editing does not touch the running turn. On Rerun submit, if a turn is
@@ -2631,13 +3295,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     }
     if (targetIndex < 0) {
-      setConnectionError('找不到要重跑的消息（该会话没有可重跑的用户消息）。');
+      noteError(sid, '找不到要重跑的消息（该会话没有可重跑的用户消息）。');
       return;
     }
     while (targetIndex > 0 && current[targetIndex].steer) targetIndex--;
     const target = current[targetIndex];
     if (target.role !== 'user') {
-      setConnectionError('重跑未执行：定位到的目标不是用户消息。');
+      noteError(sid, '重跑未执行：定位到的目标不是用户消息。');
       return;
     }
     const retained = current.slice(0, targetIndex).map((message) => ({
@@ -2645,7 +3309,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       attachments: message.attachments?.map((attachment) => ({ ...attachment })),
     }));
 
-    setConnectionError(null);
+    noteError(sid, null);
     // A-mode rerun: REUSE the live backend session — never detach + rebuild.
     // Rewrite KiroLex's durable transcript + view to drop the superseded tail,
     // then send the edited message to the SAME live kiro-cli session. If the
@@ -2728,7 +3392,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch (error: any) {
       messagesCacheRef.current.set(sid, current);
       setMessages(current);
-      setConnectionError(error?.message || '编辑重跑失败。');
+      noteError(sid, error?.message || '编辑重跑失败。');
     }
   }, [sendMessage]);
   // Expose rerunFromMessage to the send path (cancel-overwrite) without a
@@ -2764,7 +3428,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         const storedRetained = toStoredTranscript(retained);
         try { await window.kiroApi.rewriteTranscript(sessionId, storedRetained); } catch {}
         messagesCacheRef.current.set(sessionId, retained);
-        if (sessionId === currentSessionRef.current) { setMessages(retained); setConnectionError(null); }
+        // The banner clear is unconditional (it belongs to this chat); only the
+        // VIEW state is focus-gated, since `messages` is the focused chat's.
+        noteError(sessionId, null);
+        if (sessionId === currentSessionRef.current) setMessages(retained);
       }
     }
 
@@ -2850,7 +3517,7 @@ ${text}`,
     try {
       const res = await window.kiroApi.prompt(sessionId, prompt, activeModel, projectForSession(sessionId), { ...display, attachments });
       const notice = noticeForStopReason((res as any)?.stopReason, res) || noticeForEmptyTurn(res);
-      if (notice && sessionId === currentSessionRef.current) setConnectionError(notice);
+      if (notice) noteError(sessionId, notice);
     } catch (firstError: any) {
       // A busy/reconfiguring rejection is authoritative: never disturb the
       // executor that is still handling the original turn or compaction.
@@ -2899,11 +3566,10 @@ ${text}`,
       throw deliveryError;
     }
 
-    setSessions((prev) => prev.map((candidate) => (
-      candidate.id === sessionId && candidate.title === 'New Chat'
-        ? { ...candidate, title: text.slice(0, 40) || 'New Chat' }
-        : candidate
-    )));
+    // 这里原来立刻把标题改成 `text.slice(0, 40)`。那一句是**有害**的:它让会话不再叫 New Chat,
+    // 于是智能命名的触发条件永远不成立 —— 凡是第一条消息走了队列的会话,都被永久钉在这段截断上
+    // (侧栏里那条「这个是需要kirolex连接到另一个写好的agent作为管理者」就是它的产物)。
+    // 命名统一由 `finishStreamingTurn` → `maybeAutoTitle` 负责,截断只作为连试三次失败后的兜底。
   }, []);
 
   // Stop a turn. `targetSid` is REQUIRED for correctness in split view: this used
@@ -2922,7 +3588,7 @@ ${text}`,
       // composer's loop-specific Stop button. Without this, stopping from anywhere
       // else (/stop, a background pane) cancelled the current iteration and the loop
       // immediately scheduled the next one, so the loop looked unstoppable.
-      clearLoopState(sessionForCancel);
+      endLoop(sessionForCancel, 'aborted');
       await window.kiroApi.cancel(
         sessionForCancel,
         modelForSession(sessionForCancel),
@@ -2932,30 +3598,16 @@ ${text}`,
       // Put the interrupted turn's prompt back in the composer (including any
       // same-turn steers, which are merged into the one user bubble), and mark
       // that user message so the next submit OVERWRITES (reruns) this turn.
-      const sid = sessionForCancel;
-      const msgs = messagesCacheRef.current.get(sid) || [];
-      let idx = -1;
-      for (let i = msgs.length - 1; i >= 0; i--) {
-        // Anchor to the turn's BASE user message, not the last steer: steer
-        // messages are optimistic-only (main never persists them) and get
-        // stripped when un-consumed steers are re-queued -- an overwrite /
-        // rerun target pointing at one then fails to resolve.
-        if (msgs[i].role === 'user' && !msgs[i].steer) { idx = i; break; }
-      }
-      if (idx >= 0) {
-        const interrupted = msgs[idx];
-        markInterrupted(sid, interrupted.id);
-        if (interrupted.content.trim()) {
-          setRestoredInputDraft({ id: Date.now(), text: interrupted.content, sessionId: sid });
-        }
-        setConnectionError('⚠️ 已中断当前回合；下一条消息将覆盖这一轮。');
-      }
+      // The interrupted bar explains this one, from the same flag that disables Rerun --
+      // see the note in the disconnect handler for why not the error banner.
+      markTurnInterrupted(sessionForCancel);
     }
   }, []);
 
   // Force-interrupt everything and reconnect, preserving the current view
   const forceStop = useCallback(async (model: string) => {
-    clearLoopState();
+    // User-initiated, from the force-stop control: an abort, not a teardown.
+    endLoop(undefined, 'aborted');
     // Clear all streaming state immediately
     activePromptTokenRef.current.clear();
     streamingIdsRef.current.clear();
@@ -2974,20 +3626,30 @@ ${text}`,
       setStatus('connected');
     } catch (err: any) {
       setStatus('disconnected');
-      setConnectionError(err?.message || 'Failed to reconnect');
+      noteError(null, err?.message || 'Failed to reconnect');
     }
-  }, [currentSessionId, clearLoopState]);
+  }, [currentSessionId, endLoop]);
 
   const deleteSession = useCallback(async (sessionId: string) => {
     // Abort/clear this session's live state up front so a deleted chat never
     // looks like it is still running (main also disconnects its kiro-cli
     // process via detachExecutor on acp:delete-session).
-    clearLoopState(sessionId);
+    // 'discarded' is the one terminal that is not reported anywhere -- the
+    // transcript it would be written into is being deleted in this same call.
+    endLoop(sessionId, 'discarded');
     removeStreaming(sessionId);
     pendingSteersRef.current.delete(sessionId);
     activePromptTokenRef.current.delete(sessionId);
     attachedIdsRef.current.delete(sessionId);
     connectingRef.current.delete(sessionId);
+    /**
+     * 先记下它在列表里的样子和位置 —— 主进程**可能拒**（flow 的 worker 会话就有一道守卫），
+     * 而拒了之后必须原样放回去。实测的后果：门上「按这个改」重置一步时会去关它的会话，那条会话
+     * 是同泳道共用的，删除被守卫拒了，但界面上它已经消失了 —— 于是下一步复用会话时判定它"不在了"，
+     * 退而用了上一个泳道成员的会话，**拿到的是错的上下文**。
+     */
+    const doomedIndex = sessions.findIndex((s) => s.id === sessionId);
+    const doomedRecord = doomedIndex >= 0 ? sessions[doomedIndex] : null;
     setSessions((prev) => prev.filter((s) => s.id !== sessionId));
     // Drop any pending duplicate-history/project inheritance awaiting
     // materialization for this session.
@@ -2995,6 +3657,9 @@ ${text}`,
     duplicateProjectRef.current.delete(sessionId);
     // Clear local message cache
     messagesCacheRef.current.delete(sessionId);
+    // ...and this chat's error banner: it is keyed by session id, so without this the
+    // map keeps an entry for a chat that can never be shown again.
+    noteError(sessionId, null);
     // Clean up context links: drop this session's own links and remove it as a
     // source from any other session (its message cache is now gone).
     let linksChanged = contextLinksRef.current.delete(sessionId);
@@ -3012,16 +3677,43 @@ ${text}`,
     // Delete session files from disk
     try {
       const res: any = await window.kiroApi.deleteSession(sessionId);
+      /**
+       * 级联删掉的子会话也要从列表里摘掉 —— 主进程删掉 flow 锚（主会话/skill）时会把属于它的
+       * worker 一起删（见 `acp:delete-session` 里那段），但那是**磁盘上**的事：不摘的话界面上
+       * 还留着一排点进去就空的会话，要到下次启动才消失。
+       */
+      const cascaded: string[] = Array.isArray(res?.cascaded) ? res.cascaded : [];
+      if (cascaded.length) {
+        const gone = new Set(cascaded);
+        setSessions((prev) => prev.filter((s) => !gone.has(s.id)));
+        for (const id of cascaded) {
+          removeStreaming(id);
+          attachedIdsRef.current.delete(id);
+          connectingRef.current.delete(id);
+          messagesCacheRef.current.delete(id);
+        }
+      }
       // Never swallow this: a failed disk delete used to leave the chat on disk and
       // it came back at the next start. Main tombstones it so it stays hidden and
       // retries the removal, but the user should know the files are still there.
       if (res && res.ok === false) {
-        setConnectionError(
-          `会话已从列表移除，但磁盘文件暂时无法删除（${res.error || '未知原因'}）。已标记为待删除，下次启动会自动重试。`,
-        );
+        /**
+         * `ok: false` 是**拒绝**，不是"删了但文件还在"。后者主进程返回 `ok: true, tombstoned: true`
+         * （它确实立了墓碑、下次启动重试），而这里原来把两种情况混成一句话，于是被拒时界面会说
+         * 「已标记为待删除，下次启动会自动重试」—— 三重错：没标记、不会重试，而且会话根本没被删。
+         *
+         * 所以要把它**放回原位**。不放回去它就成了一条"界面上不存在、磁盘上活着"的幽灵会话，
+         * 而这个状态会静默地影响别的判断（实测：让 flow 的会话复用挑错了会话）。
+         */
+        if (doomedRecord) {
+          setSessions((prev) => (prev.some((s) => s.id === sessionId)
+            ? prev
+            : [...prev.slice(0, doomedIndex), doomedRecord, ...prev.slice(doomedIndex)]));
+        }
+        noteError(null, `没有删除这个会话：${res.error || '未知原因'}`);
       }
     } catch (error: any) {
-      setConnectionError(`删除会话失败：${error?.message || error}。该会话可能在下次启动时重新出现。`);
+      noteError(null, `删除会话失败：${error?.message || error}。该会话可能在下次启动时重新出现。`);
     }
     if (currentSessionId === sessionId) {
       // Auto-switch to the most recent remaining chat instead of dumping the
@@ -3036,12 +3728,55 @@ ${text}`,
         setMessages([]);
       }
     }
-  }, [currentSessionId, switchSession, clearLoopState]);
+    // `sessions` 进依赖：被拒时要把那条记录原样放回原位，需要读到删之前的列表
+  }, [currentSessionId, switchSession, endLoop, sessions]);
+
+  /**
+   * 把主进程已经收掉的会话从列表里摘掉 —— 磁盘上删了，界面上也得当场没。
+   *
+   * 删运行（`run:remove` / `run:remove-flow-runs`）会级联 purge 那次运行的 worker 与失去锚点的主会话，
+   * 但那是**磁盘上**的事：不摘的话侧栏还留着一排点进去就空的会话，要到下次启动才消失 —— 而「运行都删了
+   * 会话还在」正是这次要修掉的那个症状。和 `deleteSession` 里处理 `cascaded` 的那段同一套清理。
+   */
+  const forgetSessions = useCallback((ids: string[]) => {
+    const gone = new Set((ids || []).filter(Boolean));
+    if (!gone.size) return;
+    setSessions((prev) => prev.filter((s) => !gone.has(s.id)));
+    for (const id of gone) {
+      removeStreaming(id);
+      attachedIdsRef.current.delete(id);
+      connectingRef.current.delete(id);
+      messagesCacheRef.current.delete(id);
+    }
+  }, [removeStreaming]);
+
+  /**
+   * Mark what a chat is FOR (`Session.purpose`) — used for the transient sessions a skill canvas creates.
+   *
+   * In the hook, like `renameSession`: the sessions index lives here and is persisted from here, so a
+   * field set anywhere else would be overwritten by the next state update from this file.
+   */
+  const markSessionPurpose = useCallback((sessionId: string, purpose: Session['purpose'], flow?: string) => {
+    setSessions((prev) => prev.map((s) => (s.id === sessionId ? { ...s, purpose, ...(flow ? { flow } : null) } : s)));
+    // 也写进记录：这个标记撑着「flow 主会话删不掉」和「回收时别碰它」，只活在内存里等于重启就没了
+    void window.kiroApi.markSessionPurpose?.(sessionId, String(purpose || ''), flow);
+  }, []);
 
   const renameSession = useCallback((sessionId: string, title: string) => {
     setSessions((prev) =>
       prev.map((s) => s.id === sessionId ? { ...s, title } : s)
     );
+    /**
+     * **也落盘** —— 原来这里只改内存，于是标题一刷新就退回磁盘上的 `New Chat`。
+     *
+     * 实测 SFDC 那个 project 下四条会话在磁盘上全都叫 `New Chat`，而侧栏上它们显示着步骤名 ——
+     * 两者不一致，重启后你看到的就是一排分不清谁是谁的「New Chat」。flow 起的会话尤其吃亏：
+     * 它们的名字是驱动器现取的（`flow · 步骤名`），不落盘就等于没有名字。
+     *
+     * 不 await：改名失败不该阻塞界面（最坏结果是标题下次重启退回去，和现在一样），
+     * 而主进程那边有日志。
+     */
+    void window.kiroApi.renameSessionOnDisk?.(sessionId, title);
   }, []);
 
   const reorderSessions = useCallback((newSessions: Session[]) => {
@@ -3113,7 +3848,7 @@ ${text}`,
         addAttached(sessionId);
       }
     } catch (err: any) {
-      setConnectionError(err?.message || 'Failed to switch agent');
+      noteError(sessionId, err?.message || 'Failed to switch agent');
     } finally {
       reconfiguringRef.current.delete(sessionId);
       clearConnecting(sessionId);
@@ -3148,7 +3883,7 @@ ${text}`,
       addAttached(sessionId);
       return result.model as string;
     } catch (err: any) {
-      setConnectionError(err?.message || 'Failed to switch model');
+      noteError(sessionId, err?.message || 'Failed to switch model');
       throw err;
     } finally {
       reconfiguringRef.current.delete(sessionId);
@@ -3174,7 +3909,7 @@ ${text}`,
         )));
       }
     } catch (err: any) {
-      setConnectionError(err?.message || 'Failed to change tool permission mode');
+      noteError(sessionId, err?.message || 'Failed to change tool permission mode');
       throw err;
     }
   }, []);
@@ -3257,22 +3992,21 @@ ${text}`,
         if (currentSessionRef.current === sessionId) {
           const next = sessions.find((s) => s.id !== sessionId && !s.archived);
           if (next) {
-            setCurrentSessionId(next.id);
-            if (!attachedIdsRef.current.has(next.id)) {
-              markConnecting(next.id);
-              try {
-                await window.kiroApi.loadSession(next.id, '~', modelForSession(next.id));
-                addAttached(next.id);
-              } catch {
-                /* next interaction will attach */
-              } finally {
-                clearConnecting(next.id);
-              }
-            }
-            // This is a session SWITCH performed without switchSession (the id is
-            // set directly), so the open-a-chat gate never runs for it. Verify it
-            // here or the chat we just landed on looks connected on an empty backend.
-            void window.kiroApi.ensureContext?.(next.id).catch(() => {});
+            /**
+             * 走 `switchSession`，不要自己 `setCurrentSessionId` —— 这是内容串台的根因。
+             *
+             * 实测症状：把 firehose 那条会话归档之后，它的历史出现在了「Run flow validation button
+             * visibility issue」下面。原因是直接设 id 会跳过 `switchSession` 开头那一步 ——
+             * **在焦点移走之前**把旧会话正在渲染的消息数组存进它自己的 paneView。跳过之后，
+             * `currentSessionId` 已经指向新会话，而 hook 里那份 `messages` 还装着被归档会话的消息；
+             * `renderPane` 判定 `sid === currentSessionId` → `focused = true` → 于是把旧消息画在了
+             * 新会话的标题下面。
+             *
+             * 顺带补回来的还有：读磁盘 transcript、`setMessages`、`recoverInterruptedTurn`、以及
+             * 附着执行器 —— 原来那段手写的 loadSession/addAttached/ensureContext 就是在重复
+             * `switchSession` 已经做对的事，而且漏了最关键的第一步。
+             */
+            await switchSession(next.id);
           } else {
             setCurrentSessionId(null);
           }
@@ -3303,7 +4037,7 @@ ${text}`,
     } catch (err) {
       console.error('archiveSession failed:', err);
     }
-  }, [sessions]);
+  }, [sessions, switchSession]);
 
   // Create an (initially empty) project. Sessions join by drag-assign (§6.4).
   const createProject = useCallback((name: string) => {
@@ -3340,6 +4074,12 @@ ${text}`,
     });
     setProjects((prev) => Array.from(new Set(prev.map((p) => (p === oldName ? n : p)))));
     setSessions((prev) => prev.map((s) => (s.projectId === oldName ? { ...s, projectId: n } : s)));
+    /**
+     * The RUNS live under the project's name on disk, so this is a migration, not just a relabel. Without it
+     * the sessions follow the new name while the runs stay behind the old one — the project loses its skill
+     * tag and its flow.
+     */
+    void window.kiroApi.runRenameProject?.(oldName, n).catch(() => {});
   }, [sessions]);
 
   // Delete a PROJECT: fully clear it — delete every member chat, delete the
@@ -3380,7 +4120,11 @@ ${text}`,
     planMapRef.current.delete(sid);
     fileChangesMapRef.current.delete(sid);
     if (sid === currentSessionRef.current) { setPlan([]); setFileChanges([]); }
-  }, []);
+    // The pane mirror is a separate copy: without this a split pane kept showing the
+    // cleared chat's messages and plan panel.
+    patchPane(sid, { messages: [], plan: EMPTY_PANE_PLAN });
+    noteError(sid, null);
+  }, [patchPane, noteError]);
 
   const resetSessionCredits = useCallback((sessionId?: string | null) => {
     const sid = sessionId || currentSessionRef.current;
@@ -3440,8 +4184,9 @@ ${text}`,
 
   return {
     status,
-    connectionError,
-    clearConnectionError: () => setConnectionError(null),
+    errorBySession,
+    /** Dismiss ONE chat's banner. Takes the id because the banner is per chat now. */
+    clearSessionError: (sid?: string | null) => noteError(sid ?? null, null),
     sessions,
     currentSessionId,
     messages,
@@ -3449,6 +4194,23 @@ ${text}`,
     streamingIds,
     attachedSessionIds,
     busyBySession,
+    usageBySession,
+    /**
+     * 某条会话**此刻**的用量读数 —— 读的是权威那份（`usageMapRef`），不是反应式镜像。
+     *
+     * 为什么必须有这个：`usageBySession` 是 state，而镜像它的 ref 是**在渲染期**赋值的
+     * （`usageBySessionRef.current = usageBySession`）。驱动器在 `sendMessage().then(...)` 里读那个镜像，
+     * 而那一刻 React 往往还没为这一轮的 metadata 重渲染 —— 读到的是**上一轮**的值。
+     *
+     * 实测：一步跑完后钉下的 `contextPct` 是 8.179，而权威表里当时已经是 8.3；credits 的增量更直接地
+     * 暴露了这件事 —— 前后两次读到同一个数，算出来的花费是 **0**。
+     *
+     * `usageMapRef` 在收到 metadata 的那一刻就 `.set()` 了（同步，不经过 state），所以从它读永远是最新的。
+     */
+    usageOf: useCallback(
+      (sessionId: string) => usageMapRef.current.get(sessionId),
+      [],
+    ),
     /** Call off a pending/in-flight auto-resend for this chat. `recoveryCancelledRef`
      *  existed but was NEVER written, so an auto-resend could not be stopped at all
      *  -- Stop now routes here. */
@@ -3484,10 +4246,14 @@ ${text}`,
     connectingSessionIds,
     historyLoadingIds,
     paneViews,
+    paneFallback,
     setPaneSessions,
     activeToolCall,
+    subagents,
     usage,
     plan,
+    taskListFor,
+    taskListTick,
     fileChanges,
     activityStatus,
     turnStall,
@@ -3501,8 +4267,12 @@ ${text}`,
     duplicateSession,
     rerunFromMessage,
     switchSession,
+    warmSession,
+    unfocusSession,
     deleteSession,
+    forgetSessions,
     renameSession,
+    markSessionPurpose,
     reorderSessions,
     folders,
     createFolder,
@@ -3534,8 +4304,24 @@ ${text}`,
     contextLinks,
     toggleContextSource,
     loopingIds,
-    startLoop,
+    createSchedule,
+    /** Main's jobs, and the coarse clock the countdown is measured against. Read-only. */
+    schedules,
+    scheduleNow,
+    pauseSchedule,
+    cancelSchedule,
     stopLoop,
     restoredInputDraft,
+    /**
+     * 输入框接走那份交接之后清掉它 —— **按 id 认**（见 `handoffDraft.consumeHandoff`）。
+     *
+     * 不清的后果实测过：这个状态设置一次、永不清空，于是输入框每次挂载都重放一遍
+     * （切回这条会话、进出分屏），早已处理完的中断还会一直回来，还会盖掉你刚打的字。
+     * 按 id 认是为了分屏：同一条会话两个框都接同一份，第二个"清掉"到得晚，不能抹掉更新的那份。
+     */
+    consumeRestoredInputDraft: useCallback(
+      (id: number) => setRestoredInputDraft((cur) => consumeHandoff(cur, id)),
+      [],
+    ),
   };
 }
