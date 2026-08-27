@@ -909,14 +909,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
             </>
           )}
-          {!ctxSession.id.startsWith('pending_') && (
+          {/*
+            归档的会话**只有一个出口**：上面那条「恢复到 Unassigned」。
+
+            这里原来还有一条 `♻️ Unarchive（留在原 project）`，它和上面那段注释直接冲突 ——
+            那段写的是「放回的是 Unassigned 而不是它原来的 project：那个 project 可能已经不在了、
+            或者已经挂上 flow 由流程托管，塞回去就成了没人管的会话」。两个 ♻️ 并排摆着，
+            一个说放回 Unassigned、一个说留在原 project，等于把那个判断又交回给了菜单。
+
+            所以归档时这一项整个不渲染，只在**没归档**时给 Archive。
+          */}
+          {!ctxSession.id.startsWith('pending_') && !ctxSession.archived && (
             <>
               <div className="context-menu-divider" />
               <div
                 className="context-menu-item"
-                onClick={() => { onArchiveSession(ctxSession.id, !ctxSession.archived); setContextMenu(null); }}
+                onClick={() => { onArchiveSession(ctxSession.id, true); setContextMenu(null); }}
               >
-                {ctxSession.archived ? '♻️ Unarchive（留在原 project）' : '🗄️ Archive'}
+                🗄️ Archive
               </div>
             </>
           )}

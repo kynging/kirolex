@@ -230,13 +230,43 @@ async function awaitReconfigureIdle(sessionId: string, timeoutMs = 30000): Promi
  *  when the requested model cannot start (unavailable / retired / throttled).
  *  Returns the live client plus the model that actually worked, so the caller can
  *  persist the effective model instead of a dead one. */
+/**
+ * 这个后端**证实过跑不了**的模型 —— 每次运行重新发现一次。
+ *
+ * ## 为什么必须记
+ *
+ * 关键在下面那段注释说的事实：kiro-cli **只在真跑一轮时**才报模型退役，`connect()` 一定成功。
+ * 于是 `preferredModel` 排在候选第一位时，每条会话都会：连上死模型 → 第一轮报错 →
+ * `swapSessionModel` 杀掉执行器、换模型、重载会话、重发 —— 实测这个窗口 **30 秒**，而且
+ * 期间界面上一点动静都没有（那正是「第二个分屏的会话卡住了」看到的东西）。
+ *
+ * 不记的话每条会话各付一次。实测一次运行里就发生了两遍（两条不同会话，间隔 65 秒），
+ * 而 `claude-opus-5` 压根不在这个 kiro-cli 的清单里（它只有 gpt-5.6-* / deepseek / minimax /
+ * glm / qwen）。
+ *
+ * ## 为什么是**进程级**而不是落盘
+ *
+ * 模型清单会变（升级 kiro-cli、后端上线新模型）。落盘会把一次探测的结论永久钉住，
+ * 而重启一次重新探测的代价只是一次 30 秒 —— 那个代价换来的是「装了新版本就自动恢复」。
+ */
+const modelsKnownDead = new Set<string>();
+
 async function connectWithModelFallback(
   profile: AgentProfile,
   label: string,
 ): Promise<{ client: AcpClient; model: string }> {
-  const candidates: string[] = [profile.preferredModel, profile.model, ...MODEL_FALLBACK_ORDER]
+  const all: string[] = [profile.preferredModel, profile.model, ...MODEL_FALLBACK_ORDER]
     .filter((m): m is string => !!m)
     .filter((m, i, arr) => arr.indexOf(m) === i);
+  /*
+    已知跑不了的排到**最后**而不是删掉：万一它们是唯一剩下的（清单探测错了、或者别的模型
+    也都挂了），还得能试。删掉的话一次误判会让整个会话连不上，那比多等 30 秒糟得多。
+  */
+  const dead = all.filter((m) => modelsKnownDead.has(m));
+  const candidates = dead.length ? [...all.filter((m) => !modelsKnownDead.has(m)), ...dead] : all;
+  if (dead.length) {
+    logger.info('model', `${label}: 跳过本次运行里已证实跑不了的模型（${dead.join(', ')}）—— 它们排到最后`);
+  }
   let lastError: any = null;
   for (const model of candidates) {
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
@@ -285,8 +315,22 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
   const candidates = MODEL_FALLBACK_ORDER.filter((m) => m && m !== failedModel && !exclude?.has(m));
   const cliSessionId = entry.cliSessionId;
   const cwd = entry.cwd;
+  /*
+    换执行器期间**必须报 busy**。
+
+    这一段会杀掉执行器、连一个新的、重载会话、再重发 —— 实测 30 秒。而它一进来就
+    `sessionClients.delete`，于是 `busyReason` 查不到 entry、返回 null：**一轮正在飞的对话
+    在界面上显示为空闲**，没有活动指示、没有任何解释。那就是「第二个分屏的会话卡住了」
+    看到的东西 —— 后端在干活（实测那一轮 47 个事件、4 分 24 秒后正常完成），界面一动不动。
+
+    用已有的 `reconfiguringSessions`：`busyReason` 第一条就查它并返回 `'reconfiguring'`，
+    界面本来就认得这个状态（用户手动换模型走的是同一条）。`finally` 里清，否则一次失败的
+    换模型会把这条会话永久钉在「切换中」——`awaitReconfigureIdle` 会等 30 秒然后抛错。
+  */
+  reconfiguringSessions.add(sessionId);
   sessionClients.delete(sessionId);               // release single-process ownership
   try { await entry.client.disconnect(); } catch {}
+  try {
   for (const model of candidates) {
     const profile: AgentProfile = { ...entry.profile, model };
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
@@ -305,6 +349,12 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       rec.executorState = 'attached';
       store.writeRecord(rec);
       logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`);
+      /*
+        换成功了 = `failedModel` 在这个后端确实跑不了，记下来。不记的话下一条会话再付一次
+        30 秒（实测一次运行里发生了两遍）。只在**换成功**时记：连接失败可能是限流或一时抖动，
+        那种不该被当成「这个模型死了」。
+      */
+      modelsKnownDead.add(failedModel);
       emitSessionModel(sessionId, model);
       return model;
     } catch (err: any) {
@@ -313,6 +363,9 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
     }
   }
   return null;
+  } finally {
+    reconfiguringSessions.delete(sessionId);
+  }
 }
 
 /** Agent used for KiroLex's own background TEXT chores (chat titles, prompt
