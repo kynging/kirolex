@@ -77,7 +77,20 @@ let crashStreak = 0;
 function startElectron() {
   // `--dev` (not NODE_ENV) so the renderer is loaded from Vite: the env-var form
   // this project used before was Windows-only syntax and silently no-op'd here.
-  electron = run('electron', bin('electron'), ['.', '--dev']);
+  //
+  /**
+   * `detached: true` 只为一件事：让这个启动器成为**进程组组长**，这样强杀时能连它下面真正的
+   * Electron 一起杀（`process.kill(-pid)`）。
+   *
+   * 不这么做就会漏进程，实测过：`electron` 这个 child 是 `node .bin/electron` 启动器，
+   * `child.kill('SIGKILL')` 只杀得掉它；SIGKILL 又不可能被转发，于是它下面真正的 Electron 被 init
+   * 收养（`ppid=1`）继续跑着。一次「did not exit in 6s, forcing」漏一个窗口 —— 连改几个 main 侧
+   * 文件之后桌面上就同时躺着三个 KiroLex，其中两个跑的是旧代码，而调试端口被最早那个占着。
+   *
+   * 优雅路径不受影响：SIGTERM 照旧发给启动器，由它转发，main 走 app.quit() 正常释放
+   * kiro-cli 的会话锁。detached 只改变「组」的归属，不改变信号往哪送。
+   */
+  electron = run('electron', bin('electron'), ['.', '--dev'], { detached: true });
   const started = Date.now();
   electron.on('exit', (code, signal) => {
     electron = null;
@@ -140,7 +153,18 @@ function restartElectron(reason) {
   setTimeout(() => {
     if (!alive()) return;
     log('electron', 'did not exit in 6s, forcing');
-    try { child.kill('SIGKILL'); } catch {}
+    /**
+     * 杀**整组**，不是只杀这个 child。
+     *
+     * `child` 是 `node .bin/electron` 启动器；真正的 Electron 是它的子进程。只 SIGKILL 启动器的话
+     * Electron 会被 init 收养并继续跑，于是每一次强杀漏一个孤儿窗口（跑着旧代码，还占着调试端口）。
+     * 启动时给了 `detached: true`，所以它是组长，负号 pid 能覆盖它和它的后代。
+     *
+     * 组杀失败才退回单杀（比如平台不支持负号 pid），至少行为不比原来差。
+     */
+    let groupKilled = false;
+    try { process.kill(-pid, 'SIGKILL'); groupKilled = true; } catch {}
+    if (!groupKilled) { try { child.kill('SIGKILL'); } catch {} }
     setTimeout(() => {
       if (!alive()) return;
       // Unkillable (stuck in a syscall, or not ours any more). Clear the flag so
@@ -237,7 +261,21 @@ function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
   for (const child of owned) { try { child.kill('SIGTERM'); } catch {} }
-  setTimeout(() => process.exit(code), 500);
+  /**
+   * Electron 那个是 detached 的（为了强杀时能整组杀），所以它**不会**因为 dev-hot 退出而自己死。
+   * 上面的 SIGTERM 已经发给启动器、由它转发让 main 走 app.quit()；这里再兜一层：500ms 后如果它还
+   * 活着，整组杀掉。少了这一层，Ctrl-C 之后窗口会留在桌面上，而它的监管进程已经没了 —— 又是一个孤儿，
+   * 只是这次由退出路径产生。
+   */
+  const stray = electron?.pid;
+  setTimeout(() => {
+    if (stray) {
+      try { process.kill(stray, 0); } catch { process.exit(code); return; }
+      log('electron', `still alive after SIGTERM, killing process group ${stray}`);
+      try { process.kill(-stray, 'SIGKILL'); } catch { try { process.kill(stray, 'SIGKILL'); } catch {} }
+    }
+    process.exit(code);
+  }, 500);
 }
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));
