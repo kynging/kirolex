@@ -26,6 +26,7 @@ import * as fs from 'node:fs';
 import * as path from 'node:path';
 
 const MAIN = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
+const CONFIG = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'config.ts'), 'utf8');
 
 /** `swapSessionModel` 的函数体。按结束标记切,不按「往后数 N 个字」—— 那种窗口每加一段注释就失效,
  *  而它失效的方式是假绿（indexOf 找不到返回 -1,断言被跳过）。 */
@@ -93,5 +94,64 @@ describe('死模型只发现一次', () => {
     const at = MAIN.indexOf('const modelsKnownDead');
     // 不许有任何持久化的痕迹
     assert.doesNotMatch(MAIN.slice(at, at + 600), /writeRecord|writeFileSync|uiSet/);
+  });
+});
+
+/**
+ * 记录里的模型是**上一次真跑成一轮**挣来的，不该被「仅仅连上了」盖掉。
+ *
+ * `connectWithModelFallback` 返回的是哪个候选连上了，而连上对已退役的模型永远成立
+ * （kiro-cli 只在真跑一轮时才报退役）。于是 `preferredModel` 抢在记录的模型前面连上时，
+ * attach 会把一个从没成功跑过一轮的模型写成「有效模型」。
+ *
+ * 实测：记录里正确的 `gpt-5.6-sol` 被 `claude-opus-5` 反复盖掉 → 每次重启都从死模型开始 →
+ * 那 30 秒的静默窗口每次运行都要付一次。
+ */
+describe('attach 不许把「只是连上了」写成有效模型', () => {
+  const attachBlock = (): string => {
+    const at = MAIN.indexOf('Persist the model that ACTUALLY started');
+    assert.ok(at > 0, '找不到 attach 里持久化模型那段');
+    return MAIN.slice(at, MAIN.indexOf('store.writeRecord(rec);', at));
+  };
+
+  test('偏好抢先时不写记录', () => {
+    const body = attachBlock();
+    assert.match(body, /const preferenceWonAhead = .*profile\.model === profile\.preferredModel/);
+    assert.match(body, /rec\.profile\.model !== profile\.model && !preferenceWonAhead/);
+  });
+
+  test('真的降级时照旧写 —— 这段代码原来的理由还在（退役模型会拖死启动）', () => {
+    const body = attachBlock();
+    assert.match(body, /rec\.profile\.model = profile\.model;/);
+    assert.match(body, /burns a full initialize timeout/, '原来的理由必须留着，否则以后有人把它整段删了');
+  });
+
+  test('不写的时候要留一条日志 —— 「什么都没发生」是最难查的一种', () => {
+    const body = attachBlock();
+    const other = body.indexOf('} else if (rec.profile.model !== profile.model) {');
+    assert.ok(other > 0, '没有 else 分支');
+    assert.match(body.slice(other), /logger\.info/);
+    assert.match(body.slice(other), /不写进记录/);
+  });
+});
+
+describe('轮次里报出的退役是确定性事实，偏好要丢掉', () => {
+  test('swapSessionModel 换成功时清掉 preferredModel', () => {
+    const body = swapBody();
+    assert.match(body, /preferredModel: undefined/);
+  });
+
+  test('**丢掉而不是改成新模型** —— 把自动选的写成「你偏好的」正是 MODEL_FALLBACK_ORDER 那段要防的', () => {
+    const body = swapBody();
+    assert.doesNotMatch(body, /preferredModel: model\b/);
+    // 那条规则本身还在，只是这里说清了它管的是连接失败、不是轮次里的退役
+    // 那条规则住在 config.ts 的 MODEL_FALLBACK_ORDER 上面
+    assert.match(CONFIG, /never overwrites `preferredModel`/);
+    assert.match(body, /确定性事实/);
+  });
+
+  test('清掉了要在日志里说 —— 否则用户的偏好悄悄没了', () => {
+    const body = swapBody();
+    assert.match(body, /并清掉偏好/);
   });
 });
