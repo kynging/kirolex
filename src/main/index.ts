@@ -332,7 +332,22 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
   try { await entry.client.disconnect(); } catch {}
   try {
   for (const model of candidates) {
-    const profile: AgentProfile = { ...entry.profile, model };
+    /*
+      **偏好一并丢掉。**
+
+      `MODEL_FALLBACK_ORDER` 上面那段写着「自动降级绝不覆盖 `preferredModel`，下次 attach 再试
+      一遍真正被选中的那个」。那条规则对**连接失败**是对的（限流、一时抖动，下次也许就好了），
+      但这里的失败不是那种：走到 `swapSessionModel` 的路径是 `isModelUnavailableError` ——
+      kiro-cli 明说「这个模型不可用，请用 /model 换一个」。那是**确定性事实**，不是抖动。
+
+      留着偏好的代价是实测过的：偏好在下次 attach 抢先连上（连接对死模型永远成功）→ 第一轮
+      再报退役 → 再换一次 → 每次重启都付一遍那 30 秒的静默窗口。
+
+      丢掉而不是改成 `model`：把一个自动选中的模型写成「你偏好的」正是上面那条规则要防的事。
+      丢掉的意思是「你那个偏好在这个后端满足不了，先按记录里能跑的来」——想要回去，在 composer
+      里重新选一次就会重新写上（手动切换同时更新 `model` 和 `preferredModel`）。
+    */
+    const profile: AgentProfile = { ...entry.profile, model, preferredModel: undefined };
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
     try {
       await client.connect();
@@ -348,7 +363,8 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       rec.cliSessionId = cliSessionId;
       rec.executorState = 'attached';
       store.writeRecord(rec);
-      logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`);
+      logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`
+        + `${entry.profile.preferredModel === failedModel ? `（并清掉偏好 '${failedModel}' —— 轮次里报出的退役是确定性事实，留着它每次重启都要再付一次那 30 秒）` : ''}`);
       /*
         换成功了 = `failedModel` 在这个后端确实跑不了，记下来。不记的话下一条会话再付一次
         30 秒（实测一次运行里发生了两遍）。只在**换成功**时记：连接失败可能是限流或一时抖动，
@@ -5128,11 +5144,28 @@ app.whenReady().then(async () => {
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.cliSessionId = cliSessionId;
       rec.executorState = 'attached';
-      // Persist the model that ACTUALLY started. Without this the record keeps
-      // pointing at a retired model (e.g. claude-opus-5), so EVERY later startup
-      // burns a full initialize timeout on it before falling back again — which is
-      // exactly what wedged the splash at "Connecting sessions… (0/N)".
-      if (rec.profile.model !== profile.model) {
+      /*
+        Persist the model that ACTUALLY started. Without this the record keeps
+        pointing at a retired model (e.g. claude-opus-5), so EVERY later startup
+        burns a full initialize timeout on it before falling back again — which is
+        exactly what wedged the splash at "Connecting sessions… (0/N)".
+
+        ── 但「降级」和「偏好抢先」是相反的两件事，不能共用这一次写 ────────────────
+
+        `connectWithModelFallback` 返回的是**哪个候选连上了**，而连上对一个已退役的模型
+        永远成立（见 `isModelUnavailableError` 上面那段：kiro-cli 只在真跑一轮时才报退役）。
+        于是当 `preferredModel` 抢在记录的模型前面连上时，这里会把一个**从没成功跑过一轮**的
+        模型写成「有效模型」，而被它盖掉的那个是上一次真跑成一轮挣来的。
+
+        实测：记录里正确的 `gpt-5.6-sol` 被 `claude-opus-5` 反复盖掉，于是每次重启都从死模型
+        开始 —— 换模型那 30 秒的静默窗口因此每次运行都要付一次（见 `modelsKnownDead`）。
+
+        判据就在手边，300 行那段注释早就写了：偏好抢先时**记录的模型压根没被尝试过**，
+        所以不能声称它不可用。所以只在**真的降级**时写（连上的不是偏好的那个 = 偏好确实失败了，
+        或者压根没设偏好）。
+      */
+      const preferenceWonAhead = !!profile.preferredModel && profile.model === profile.preferredModel;
+      if (rec.profile.model !== profile.model && !preferenceWonAhead) {
         logger.info('model', `attach ${sessionId}: persisting effective model '${profile.model}' (was '${rec.profile.model}', preferred '${profile.preferredModel}')`);
         rec.profile.model = profile.model;
         // Preference is sticky: it is retried first on the next attach.
@@ -5140,6 +5173,9 @@ app.whenReady().then(async () => {
         // Announce it: otherwise the composer selector keeps showing the model the
         // renderer last knew about while the executor runs a different one.
         emitSessionModel(sessionId, profile.model);
+      } else if (rec.profile.model !== profile.model) {
+        logger.info('model', `attach ${sessionId}: 跑在偏好模型 '${profile.model}' 上，但**不写进记录**`
+          + ` —— 记录里的 '${rec.profile.model}' 是上一次真跑成一轮挣来的，而"连上了"什么都不证明`);
       }
       store.writeRecord(rec);
       mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId, projectId: profile.projectId });
