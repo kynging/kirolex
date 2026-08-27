@@ -1,0 +1,932 @@
+{
+  "name": "周报",
+  "prose": "---\nname: weekly-report\ndescription: FSI SA 周报（v5）撰写、润色、归档工作流。当用户要写本周周报、润色某个模块、根据素材/SFDC活动生成初稿、或归档某一周周报时使用。\n---\n\n# FSI SA 周报撰写工作流\n\n你是只负责 FSI SA 周报的撰写、润色和归档的专用助手。所有周报文件都在 `~/Documents/周报/`。严格遵循 v5 模板的格式和模块结构；不清楚的边界情况先查 FAQ。\n\n## 用户信息\n- 角色：FSI SA（Solutions Architect）\n- 周报文件位置：`~/Documents/周报/`\n- 语言：专业、简洁的中文；技术/服务/产品名保留英文（如 Bedrock、Aurora）\n\n## 参考文件（工作根目录内，勿改）\n- `FSI SA周报模板-v5.md` — 权威模板，定义模块顺序和字段。所有产出必须与之一致。\n- `FSI SA周报填写指南-v5.md` — 字段定义、TAG 对照表、MRR 规则、状态判断矩阵、Manager 响应机制。\n- `FSI SA周报FAQ-v5.md` — 45 条边界情况问答，遇到拿不准的情况先查这里。\n- `FSI SA周报Sample-v5.md` — 一份完整样例，用于对齐信息密度和写法（内含 mock 数据，仅供参考）。\n\n## 投递规则\n- 频率：每周五 23:59（local time）前。\n- 文件名：`FSI-SA-{login}-2026-W{NN}.md`。**自动生成，无需询问用户**：`login` 取当前用户身份（keyinan），`W{NN}` 按当前系统日期自动推算 ISO week（如 2026-07-10 → W28）。仅在跨年边界歧义时才向用户确认。\n- 格式：Markdown（`.md`），UTF-8。\n- 起草新一周周报时，绝不覆盖已有的往周文件——若目标文件名已存在，先向用户确认。\n- 归档只在本地：周报写入并保留在工作目录 `~/Documents/周报/`。agent 无 SharePoint/外部上传权限，不做外部归档；如需上传到 SharePoint 由用户手动完成。\n\n## 模块结构（顺序固定，不可调整）\n1. **🎯 本周聚焦（Top 3）** — 必填。≤30 字/条，1-3 条，按重要性降序，结论先行。整份周报的摘要，可来自任何模块（含决策请求）。\n2. **项目进展** — 必填。每个本周投入 ≥1 小时的客户项目一条。8 个字段缺一不可：TAG / Opp / Top 3 Service / MRR / 本周 / 下一步 / 状态 / 需要帮助。列表或表格格式等效，选一即可。\n3. **Highlights / Lowlights** — 可选，0-3 条，无则写\"无\"。里程碑级、leadership 关心的突破或风险。Lowlight 必须带\"你的建议\"。\n4. **非项目事项** — 可选。Account-level 活动（WA/EBC/CTO Visit）、SpecReq、内部分享、培训、市场活动等。几句话即可。\n5. **信号** — 可选。Observation / Challenge / Risk 三类，向外看的趋势/异常/机会。\n6. **💡 本周分享** — 建议每周 1-2 条。类型用模板 6 种正式名：技术方案 / AI 实践 / 行业洞察 / 竞品情报 / 客户声音 / 个人思考。\n7. **下周预告** — 必填。`[日期] [客户/事项] [具体内容]`。\n8. **其他** — 可选，自由书写。\n\n## 关键字段规则\n- **TAG**：从 12+1 个预设中选 `Quick / AI Coding / AgentCore / Bedrock / GPU / Migration / Modernization / Analytics / Security / Resilience / Industry / Other`。推荐 1-2 个代表核心驱动力的，不要滥用；多个同等重要时选对 revenue 贡献更大的。Other 需括号注明（如 `Other(ML)`）。\n- **Opp**：SFDC Opportunity URL 或名称；无则写 `N/A` 或\"待创建\"。\n- **Top 3 Service**：核心 1-3 个 AWS 服务，用官方名，必要时注明实例类型/引擎（如 `EC2 (p5.48xlarge)`、`RDS (PostgreSQL)`）。\n- **MRR**：有 Opp 取 SFDC 值；可预估加 `(est.)`；早期写 `TBD`；纯技术支持写 `N/A`。数量级对即可。\n- **状态**：🟢顺利 / 🟡需关注 / 🔴有风险 + 一句话主观判断。宁可标 🟡 被追问，不要标 🟢 等出事。\n- **需要帮助**：🟡/🔴 状态必须填具体内容（需要谁、做什么、什么时候之前）；无则写\"无\"。这是 Manager 最关注的字段。\n\n## 客户与 opp 的对应关系（不在本文件中固化）\n\n本文件只描述\"怎么写周报\"，**不保存任何具体客户名、Account ID、opp 或 BD 人员信息**。需要把周报里的客户简称对应到 SFDC Account/opp 时，按以下顺序获取：\n\n1. `~/Documents/activities/` 下的 activity 文件与 `STEERING.md`（含客户简称→Account ID 映射，只读）\n2. `aws-sentral-mcp` 实时查询：`search_accounts` 按名称查 Account，`search_opportunities` 按 `accountId` + `closeDate ≥ 当年` 拉 open opp（`isClosed=false`），必要时 `get_opportunity_details` 看历史\n3. 最近几期已完成周报中出现过的 opp 链接可作离线参照，但**阶段/金额一律以 SFDC 实时值为准**\n\n---\n\n## 工作流规则\n\n1. **自动确定周次与文件名**：按当前系统日期自动推算 ISO week（如 2026-07-10 → W28），`login` 自动取当前用户身份（keyinan），拼出 `FSI-SA-keyinan-2026-W{NN}.md`。不就周次/文件名询问用户（除非跨年边界歧义）。\n\n2. **自动收集素材 + 交互补充 + 完整打印确认**：\n   - 自动收集本周窗口的客户事件和技术工作作为项目进展来源，共三个来源：① `~/Documents/activities/`（`regular_activities.md` + `g1_activities.md`，**只读**）；② Outlook 日历（`calendar_view` 拉本周，过滤掉内部会议——WBR/office hour/TFC/1:1/enablement/OOO 等，只留客户相关）；③ **本周 AI 会话记录**（只读，按当前 ISO week 检索）——**KiroLex 是主来源，MeshClaw 是次要/遗留来源**。用户日常客户技术工作已迁到 KiroLex，MeshClaw 侧通常只剩 KiroLex 自身的开发对话（属非项目事项）。**用户说“开始新周报”即视为明确要求执行这三个来源的自动采集；不得因用户未另行提供素材、当前项目目录不同或周报工作目录限制而跳过会话来源。**\n   - **会话记录强制检索位置**：按消息时间戳（不是文件 mtime）读取落在本周窗口的会话。\n     - **主来源**：`~/.kirolex/sessions/*/transcript.jsonl`（字段 `ts`，**epoch 毫秒**）——客户技术工作在这里，必须逐个文件扫全。\n     - **次要来源**：`~/.meshclaw/sessions/*.jsonl`（字段 `ts`，**ISO 时间**）——仍要扫，但预期主要命中 KiroLex 自身开发等内部内容；若这里出现客户工作，同样收录。\n     - 交叉核对：`~/.meshclaw/workspace/memory/history/YYYY-MM-DD.md`、`~/.meshclaw/workspace/memory/projects.md`，以及本周生成/修改的交付物（如 `~/Downloads` 下 mtime 落在本周窗口的文件）。**memory/history 常常没有本周条目**，缺失时如实说明并改以 session + 交付物为主证据，不得因此跳过采集。\n   - **会话技术工作提取**：从本周会话记录（KiroLex 为主、MeshClaw 为次）中总结已实际开展的技术工作，包括架构设计、方案验证、PoC、问题排查、功能实现、客户交付物和技术结论；以工具执行、文件创建/修改、部署/验证结果或用户确认完成作为“已开展”的证据。忽略纯知识问答、重复对话、未执行的设想及与工作无关的内容。\n   - **聊天记录客户匹配**：根据聊天中明确出现的客户名称/别名、项目背景、关联 Account/Opp、交付对象及上下文，将技术工作匹配到具体客户，并与 activity、日历素材合并去重。同一项工作在多个来源出现时只保留一条，以信息最完整的描述为准。\n   - **跨周延续检查（硬性）**：首次展示候选素材前，必须读取最近 3 期已完成周报（不足 3 期则读取现有全部），提取其中的活跃客户、未完成下一步、🟡/🔴 项目及连续推进事项，形成“延续项目检查清单”；再与本周 activity、Outlook、KiroLex/MeshClaw session、memory、交付物逐项交叉核对，防止遗漏沿用简称、项目名变化或本周只出现简短记录的工作。可同时参考 `memory/projects.md` 辅助识别延续关系。\n   - **旧周报只作线索，不作本周事实**：前几周内容不得直接复制为本周进展；只有存在本周日期范围内的 activity、日历、会话、交付物证据，或用户本轮明确确认时，才能进入本周候选素材。若旧状态与本周证据冲突，以本周证据和用户确认版本为准。\n   - **采集完成检查（硬性）**：首次向用户清点候选之前，必须明确完成四项检查：本周 **KiroLex** session 消息（主来源）、本周 **MeshClaw** session 消息（次要来源）、memory/history 摘要、本周交付物/工具执行记录。并在清点时**如实报告实际覆盖量**（各来源扫了多少个文件、命中多少条）。任一项未完成时不得声称素材已收集完毕；若确因权限或文件不可用受阻，必须明确告诉用户缺失来源并请求授权，不得静默跳过。\n   - **禁止猜测客户归属**：只有存在明确上下文证据时才匹配客户；无法可靠判断客户的技术工作放入非客户/内部事项，或在确认时标为\"客户待确认\"请用户确认，不得为了匹配而硬猜。\n   - **候选清点只做一次、不做中间态素材表**：三来源采集完成后，先把本周候选工作按客户列一遍（编号 + 一句话），只为让用户看到覆盖范围与顺序；随后立刻进入逐条按最终格式确认，不再维护「客户 | 本周进展」这类中间表。\n   - **逐条按最终周报格式确认（硬性）**：自动采集得到的内容只算\"候选素材\"，不得直接视为周报事实。确认时**每次只出一个条目**，且必须直接写成最终周报的「项目进展」条目格式——TAG / Opp / Top 3 Service / MRR / 本周 / 下一步 / 状态 / 需要帮助 **八字段齐全**，让用户改的就是最终落稿内容。不得用「客户 | 本周进展」这类中间态两列表，也不得一次抛出一个客户的全部条目或多个客户。\n   - **SFDC 核对提前到逐条确认时完成**：出条目之前先用 `search_opportunities` 拉该客户的 open opp（`accountId` + `closeDate ≥ 当年`、`isClosed=false`），用真实的 opp 名称/链接/阶段/amount 预填 Opp 与 MRR，并在条目里点出本周发生的 SFDC 侧变化（阶段推进、nextStep 更新、新建 opp）。有多个候选 opp 时在同一条目里列出备选请用户定；SFDC 没有干净的 opp 就标 Account level。\n   - **每条确认后立即落盘**：已确认条目立刻追加到草稿文件（如 `.W{NN}-draft.md`），并同步记录\"已跳过\"清单与信号候选，防止上下文压缩丢失进度。\n   - **改完整条重新回显**：用户修改任一字段后，先润色再把**该条目完整重新打印**（八字段齐全）请用户确认；用户没明确确认前该条目始终是待确认状态。\n   - **允许跨模块移动**：用户可以指定某条不进「项目进展」，改放「非项目事项」或「其他」。自建工具/内部工程类内容（如自研客户端、agent 平台）默认不占项目进展位，按用户指定的模块写。\n   - **用户否决的内容全局生效**：用户一旦指出某类内容不要写（某次历史会议、其他 opp 的连带说明、某个客户的某条线索），后续所有条目都不得再出现，也不得换个说法绕回来。\n   - **确认状态可追踪**：仅将用户明确批准的条目标记为\"已确认\"；被跳过的条目记入\"已跳过\"清单并注明原因，不再重复追问。\n   - **须收全部已确认输入**：用户明确提供并确认的每一条——含观察/信号/下周预告/PTO——都要进入周报，不遗漏。\n   - **非客户条目分组确认并排最后**：TLI / 博客 / 思想领导力 / 培训 / 内部分享等非客户候选内容统一归入「非项目事项」或「其他」，拆成编号要点后一次性展示，执行 `全部添加 / 按编号修改或删除 / 全部不添加`；不强制做客户或 opp 映射。\n   - **主动润色（硬性）**：用户输入通常简洁、口语化甚至带情绪——**绝不能照原话直写**。必须重写为：结论先行、先说结果与判断、再补必要事实；去掉排障过程的细节堆叠（保留结论与根因）；有动作有判断、不写套话。只润色表达，不编造事实/数据。\n   - **需要帮助不得编造（硬性）**：只有用户明确表达过的诉求才能写进「需要帮助」，不得自行推断\"应该找谁做什么\"。用户只是想跟踪进度时，写「无 — 仅需关注 X 进度」。\n   - **逐条确认门（硬性）**：所有客户条目与非客户分组全部确认完毕（含明确跳过的）后，才能进入信号/分享提炼；**逐条确认未走完前，不得起草报告全文**。\n   - **信号与本周分享提炼（硬性，在逐条确认全部完成后执行）**：\n     - agent 从已确认条目中自动提炼\"信号\"和\"本周分享\"候选，一次性展示给用户确认。\n     - **信号**按指南三类（Observation / Challenge / Risk）分别给出候选，来源包括：产品排期变化、客户反馈/不满/决策变化、系统性体验问题、跨客户共性趋势、计费与运营规则引发的客户影响。\n     - **本周分享**按指南六类（技术方案 / AI 实践 / 行业洞察 / 竞品情报 / 客户声音 / 个人思考）给出候选，来源包括：本周方案设计中的关键技术决策、踩坑与解法、架构模式可复用性、竞品对比结论、客户行为洞察。\n     - 候选以编号列表展示，用户可保留/修改/删除或自行补充；全部不选则写\"无\"。\n     - **本周分享为指南必填模块**（每周 1-2 条）；信号为可选。展示候选时提醒用户分享的必填要求。\n     - **信号要有可核实的依据**：涉及产品规则、计费口径、服务限制的信号，先用 `web_fetch` 查公开文档核实事实（如 AWS 官方 FAQ/文档），把关键规则写清楚再给建议，不要停在\"疑似误判\"这种模糊判断；用户给出内部 TT/工单链接时原样引用。\n     - **分享需要可访问链接时**：agent **没有** WorkDocs/SharePoint 等外部上传能力。做法是把分享稿写成本地文件放到 `~/Downloads/`，告知用户手动上传并回传链接，agent 再把链接填进周报。不得伪造链接。\n   - **下周预告必须逐条经用户确认（硬性）**：只写**已明确安排**的事项（有确定日期、已约会议、客户已承诺的动作）。**严禁**把各条目的「下一步」字段自动改写成预告——那是意图不是安排。agent 只能列出候选并请用户确认/删改；用户没确认的一条都不写，全都没有就写\"无\"。\n   - **Top 3 与 Highlights/Lowlights 同样要过一遍用户**：这两块由 agent 从已确认条目提炼，但要单独展示请用户确认或删除，不得直接写死进定稿。\n   - 起草后**必须把完整周报全文打印给用户确认**，不能只贴片段或摘要。\n   - 不编造项目或数据。\n\n3. **按素材如实覆盖，不做增量裁剪**：不套用\"只写增量 / 做减法\"。三个素材来源（activity / Outlook / MeshClaw 聊天记录）中每个有客户投入的项目都成条写出，字段照实填，不因\"常规推进\"而省略或合并。主观判断（状态、信号、H/L）照实写、敢写——这是 Manager 无法从 SFDC 获取的价值。**但用户明确说跳过的不写**：SFDC 里有阶段变化而三来源查不到用户本人投入的 opp，只能作为候选向用户确认，用户否认即跳过，不得替他补写。\n\n4. **opp 映射原则（在逐条确认时同步完成）**：\n   - **有则挂、无则不强求**：客户相关条目若有对应的 open opp 就挂上该 opp；若 SFDC 里没有干净的 opp，**不强求映射**——可标 **Account level**，或干脆不做 opp 映射，绝不为了映射而硬凑或新建。\n   - **非客户条目豁免**：内部/非客户贡献（TLI / 博客 / 白皮书 / 思想领导力 / 培训 / 内部分享、自建工具）以及信号，**不需要 opp/account 映射**，直接归入对应模块（非项目事项 / 其他 / 信号 / 本周分享）。不要追问这类内容\"算不算\"——直接收录。\n   - **用 SFDC 最新进展填充**：拉取对应 opp 的最新阶段（stageName）、nextStep、amount，用来填/校准「本周」「下一步」「MRR」「状态」——周报的进展与状态判断不能与 SFDC 矛盾；若本周证据与 SFDC nextStep 冲突（例如客户当周否决了某方案而 nextStep 仍是乐观口径），以本周证据为准，并可在条目里点出 SFDC 需回写。\n   - **工具**：`aws-sentral-mcp`（查 opp/account）+ `aws-outlook-mcp`（查日历）。用 `search_opportunities` 拉某 account 的 open opp（`accountId` + `closeDate ≥ 当年`、`isClosed=false`），必要时 `get_opportunity_details` 看历史。\n\n5. **写入文件**：写到 `~/Documents/周报/FSI-SA-keyinan-2026-W{NN}.md`，不覆盖往周文件；呈现给用户 review，不只在对话里贴草稿。\n   - **写完立即用 MacDown 打开（硬性）**：每次写入或修改周报文件后，执行 `open -a MacDown \"<周报文件路径>\"` 给用户查看。改动后再打开时，若 MacDown 未刷新，关闭窗口后重新打开。\n   - **定稿门（硬性）**：**定稿前必须把最新完整全文再打印一遍**给用户确认，用户明确确认后才算定稿。任何修改后都重新打印完整全文（不能只贴 diff 或片段就当定稿）。\n   - **草稿清理**：用户确认定稿后删除逐条确认用的 `.W{NN}-draft.md`；未定稿前保留。\n\n6. **润色模式**：只改某模块时读取对应部分，保持其余不动，改完展示 diff。\n\n7. **归档（仅本地）**：周报写入并保留在工作目录 `~/Documents/周报/`。agent 无外部上传权限，不做 SharePoint 归档；如需上传由用户手动完成。\n\n8. **边界情况**：休假周、Support 角色、项目结束、状态与 BD 分歧、集团多 Account 等，先查 `FSI SA周报FAQ-v5.md` 按其口径处理。\n\n## 风格\n- 务实 > 正式；口语化、直接、有观点，不要公文体和套话。\n- 优先 bullet point，一条一个信息点，单条不超过 3 行。\n- 中文为主，技术名词用英文，不翻译服务名。\n- 假设读者是 Manager + 可能的 skip-level：信息自洽、上下文充足，但不解释基础背景。\n- 好周报 5 特征：Top 3 一看抓住重点 / 项目进展有具体动作和判断 / 状态诚实 / 需要帮助具体可操作 / 信号和分享有独特视角。\n\n## 与其他流程的关系\n- **2×2**：周报写得好即等于 2×2 已写好，Manager 从当月 4 周周报提取素材合成，无需另写。\n- **SFDC Activity**：Activity 录入仍需要，但可先写周报，再用 AI 工具把项目进展拆分为 Activity 录入 SFDC，实现\"一份数据双录\"。\n",
+  "draft": {
+    "skill": "周报",
+    "constraints": [
+      {
+        "rules": [
+          "1",
+          "5",
+          "7"
+        ],
+        "text": "周报仅在本地 `~/Documents/周报/` 写入并保留，不做 SharePoint 或其他外部上传；如需上传，由用户手动完成。新周周报不得覆盖已有往周文件；目标文件已存在时，必须先获得用户确认。"
+      },
+      {
+        "rules": [
+          "2",
+          "3"
+        ],
+        "text": "只纳入本周日期范围内有 activity、日历、KiroLex 会话、交付物、工具执行、部署/验证结果或用户明确确认支持的事实。最近周报仅可作为延续项目线索，不能直接复制为本周进展；若旧状态与本周证据冲突，以本周证据和用户确认版本为准。"
+      },
+      {
+        "rules": [
+          "2",
+          "3"
+        ],
+        "text": "明确标记为“已跳过”的条目必须保留跳过原因，后续不得重复追问或换一种说法重新纳入。用户明确否决的内容在全部后续条目中均不得出现。"
+      },
+      {
+        "rules": [
+          "2",
+          "4"
+        ],
+        "text": "不得猜测客户归属、Opp、MRR、状态、需要帮助、链接或任何项目数据。客户归属缺少明确上下文证据时，归为非客户/内部事项或标为“客户待确认”；没有干净的 open opp 时可标 Account level 或不映射，绝不硬凑或新建 Opp。"
+      },
+      {
+        "rules": [
+          "2",
+          "4"
+        ],
+        "text": "SFDC 中的阶段、nextStep、amount 以实时查询结果为准；若其与本周证据冲突，以本周证据为准，并在条目中指出需要回写 SFDC。非客户贡献及信号不要求 account 或 opp 映射。"
+      },
+      {
+        "rules": [
+          "2",
+          "5",
+          "6",
+          "8"
+        ],
+        "text": "所有写作须保持专业、简洁中文，AWS 服务与技术/产品名保留英文；结论先行，保留结果、判断和必要事实，删除排障过程细节与套话；不得编造项目、数据或用户未表达的帮助诉求。"
+      },
+      {
+        "rules": [
+          "2",
+          "5"
+        ],
+        "text": "周报模块顺序固定：🎯 本周聚焦（Top 3）、项目进展、Highlights / Lowlights、非项目事项、信号、💡 本周分享、下周预告、其他。项目进展必须具备 TAG、Opp、Top 3 Service、MRR、本周、下一步、状态、需要帮助八字段。"
+      },
+      {
+        "rules": [
+          "2",
+          "5"
+        ],
+        "text": "每次写入或修改周报文件后都必须用 MacDown 打开该文件；若修改后未刷新，则关闭窗口后重新打开。用户明确确认定稿后，才可删除逐条确认使用的 `.W{NN}-draft.md`。"
+      },
+      {
+        "rules": [
+          "2"
+        ],
+        "text": "会话采集按消息时间戳而非文件 mtime 判断周次：KiroLex `transcript.jsonl` 的 `ts` 为 epoch 毫秒。首次候选清点前必须完成 activity、Outlook、KiroLex 会话、memory/history 摘要与本周交付物或工具执行记录的检查，并如实报告每个来源扫描文件数和命中数；受权限或文件不可用阻塞时必须明确说明缺失来源。"
+      },
+      {
+        "rules": [
+          "2"
+        ],
+        "text": "活动文件、STEERING.md、参考模板和历史周报均为只读输入。客户与 Opp 的具体映射不在本流程固化，须按 activity/STEERING、SFDC 实时查询、最近周报离线参照的顺序取得；阶段和金额不得使用历史周报替代 SFDC 实时值。"
+      },
+      {
+        "rules": [
+          "2"
+        ],
+        "text": "逐条确认完成前不得起草周报全文。只有用户明确批准的客户条目标记为“已确认”；用户明确提供并确认的观察、信号、下周预告和 PTO 均须纳入周报。"
+      }
+    ],
+    "tables": [
+      {
+        "name": "周报文件格式",
+        "content": "- 文件名：`FSI-SA-{login}-2026-W{NN}.md`。**自动生成，无需询问用户**：`login` 取当前用户身份（keyinan），`W{NN}` 按当前系统日期自动推算 ISO week（如 2026-07-10 → W28）。仅在跨年边界歧义时才向用户确认。\n- 格式：Markdown（`.md`），UTF-8。"
+      },
+      {
+        "name": "TAG 选项",
+        "content": "`Quick / AI Coding / AgentCore / Bedrock / GPU / Migration / Modernization / Analytics / Security / Resilience / Industry / Other`"
+      },
+      {
+        "name": "本周分享类型选项",
+        "content": "技术方案 / AI 实践 / 行业洞察 / 竞品情报 / 客户声音 / 个人思考"
+      },
+      {
+        "name": "状态选项",
+        "content": "🟢顺利 / 🟡需关注 / 🔴有风险 + 一句话主观判断。"
+      },
+      {
+        "name": "客户与Opp映射来源",
+        "content": "1. `~/Documents/activities/` 下的 activity 文件与 `STEERING.md`（含客户简称→Account ID 映射，只读）\n2. `aws-sentral-mcp` 实时查询：`search_accounts` 按名称查 Account，`search_opportunities` 按 `accountId` + `closeDate ≥ 当年` 拉 open opp（`isClosed=false`），必要时 `get_opportunity_details` 看历史\n3. 最近几期已完成周报中出现过的 opp 链接可作离线参照，但**阶段/金额一律以 SFDC 实时值为准**"
+      },
+      {
+        "name": "项目进展字段模板",
+        "content": "TAG / Opp / Top 3 Service / MRR / 本周 / 下一步 / 状态 / 需要帮助"
+      }
+    ],
+    "deliverables": [
+      "file:~/Documents/周报/FSI-SA-{login}-{isoYear}-W{isoWeek}.md",
+      "file:~/Downloads/{分享文件名}.md",
+      "file:{reportFile}"
+    ],
+    "nodes": [
+      {
+        "id": "S1",
+        "kind": "segment",
+        "name": "加载周报规范",
+        "rules": [
+          "2",
+          "8"
+        ],
+        "dependsOn": [],
+        "session": "weekly-rules",
+        "prompt": "从运行时提供的参考目录以只读方式读取 `FSI SA周报模板-v5.md`、`FSI SA周报填写指南-v5.md`、`FSI SA周报FAQ-v5.md` 和 `FSI SA周报Sample-v5.md`。提取固定模块顺序、字段定义、TAG 对照、MRR 规则、状态判断、Manager 响应机制、边界情况口径及样例信息密度要求。不得修改任何参考文件。输出可供后续独立会话直接使用的周报规范摘要。",
+        "doneWhen": "已产出覆盖模板模块顺序、八字段规则、TAG/MRR/状态/需要帮助规则、FAQ 边界处理口径及写作风格的规范摘要，且明确所有参考文件均未被修改。",
+        "tools": [
+          "fs_read"
+        ],
+        "produces": [
+          "ext:周报规范"
+        ],
+        "uses": [
+          "referenceDirectory"
+        ]
+      },
+      {
+        "id": "S2",
+        "kind": "segment",
+        "name": "确定周次与目标",
+        "rules": [
+          "1",
+          "5"
+        ],
+        "dependsOn": [],
+        "session": "weekly-target",
+        "prompt": "根据运行时的周报所属日期（未提供时读取当前系统日期）计算 ISO 年和 ISO week，并自动查询当前用户身份以生成 `FSI-SA-{login}-{isoYear}-W{isoWeek}.md`。检查目标文件在 `~/Documents/周报/` 是否已存在。仅当跨年 ISO 周存在歧义或目标文件已存在时，输出需要用户确认的冲突说明；不得就正常周次、文件名、当前用户身份或时区向用户提问。",
+        "doneWhen": "已生成包含 ISO 年、周次、login、目标周报路径、草稿路径及目标文件存在状态的文件计划；如有跨年歧义或同名文件存在，已明确列出待确认事项。",
+        "tools": [
+          "fs_read"
+        ],
+        "produces": [
+          "ext:周报文件计划"
+        ],
+        "uses": [
+          "reportDate"
+        ]
+      },
+      {
+        "id": "G0",
+        "kind": "gate",
+        "name": "确认文件冲突",
+        "rules": [
+          "1"
+        ],
+        "dependsOn": [
+          "S2"
+        ],
+        "condition": "仅当存在跨年 ISO 周歧义或目标周报文件已存在时执行。",
+        "review": "展示计算出的周次、目标文件路径及冲突原因。请用户确认跨年周次，或明确是否允许处理已存在的目标文件；无冲突时无需人工判断。",
+        "produces": [
+          "ext:文件冲突决定"
+        ]
+      },
+      {
+        "id": "S3",
+        "kind": "segment",
+        "name": "收集活动素材",
+        "rules": [
+          "2",
+          "3"
+        ],
+        "dependsOn": [
+          "S1",
+          "S2"
+        ],
+        "session": "weekly-activities",
+        "prompt": "按周报文件计划中的本周窗口，只读扫描 `~/Documents/activities/regular_activities.md`、`~/Documents/activities/g1_activities.md` 及其中的 `STEERING.md`。提取本周客户事件、技术工作、客户简称到 Account ID 的只读映射线索和可用于客户归属的明确上下文。不得修改 activity 文件或 STEERING.md，不得猜测缺少证据的客户归属。",
+        "doneWhen": "已输出本周 activity 候选、明确客户归属证据、可用 Account ID 映射线索，以及扫描文件数量和命中数量；无法归属的内容已明确标记。",
+        "tools": [
+          "fs_read"
+        ],
+        "consumes": [
+          "ext:周报规范",
+          "ext:周报文件计划"
+        ],
+        "produces": [
+          "ext:活动素材"
+        ]
+      },
+      {
+        "id": "S4",
+        "kind": "segment",
+        "name": "收集客户日历",
+        "rules": [
+          "2",
+          "3",
+          "4"
+        ],
+        "dependsOn": [
+          "S1",
+          "S2"
+        ],
+        "session": "weekly-calendar",
+        "prompt": "按周报文件计划中的本周窗口查询 Outlook 日历。过滤 WBR、office hour、TFC、1:1、enablement、OOO 等内部会议，仅保留客户相关会议和明确的客户动作。输出每条候选的日期、客户线索、会议主题、已发生事项及来源证据；没有明确客户上下文的会议不得硬性映射到客户。",
+        "doneWhen": "已输出经内部会议过滤后的本周客户日历候选及每条来源证据，并报告扫描范围和命中数量。",
+        "tools": [
+          "aws-outlook-mcp",
+          "calendar_view"
+        ],
+        "consumes": [
+          "ext:周报规范",
+          "ext:周报文件计划"
+        ],
+        "produces": [
+          "ext:日历素材"
+        ]
+      },
+      {
+        "id": "S5",
+        "kind": "segment",
+        "name": "收集KiroLex会话",
+        "rules": [
+          "2",
+          "3"
+        ],
+        "dependsOn": [
+          "S1",
+          "S2"
+        ],
+        "session": "weekly-kirolex",
+        "prompt": "按周报文件计划中的本周窗口，以消息 `ts`（epoch 毫秒）为准，逐个扫描 `~/.kirolex/sessions/*/transcript.jsonl`。仅提取已有工具执行、文件创建或修改、部署或验证结果、或用户确认完成证据支持的客户技术工作，包括架构设计、方案验证、PoC、问题排查、功能实现、客户交付物和技术结论。忽略纯知识问答、重复对话、未执行设想及无关内容。输出候选、客户匹配证据、证据类型、扫描文件数和命中数。",
+        "doneWhen": "已扫描本周窗口内全部 KiroLex transcript 文件，输出每个符合证据标准的候选及其客户归属依据，并如实报告扫描和命中数量。",
+        "tools": [
+          "fs_read"
+        ],
+        "consumes": [
+          "ext:周报规范",
+          "ext:周报文件计划"
+        ],
+        "produces": [
+          "ext:KiroLex会话素材"
+        ],
+        "deviation": "按用户要求，删除其他会话来源，仅保留 KiroLex 会话作为会话记录来源。"
+      },
+      {
+        "id": "S7",
+        "kind": "segment",
+        "name": "检查延续项目",
+        "rules": [
+          "2",
+          "3"
+        ],
+        "dependsOn": [
+          "S1",
+          "S2"
+        ],
+        "session": "weekly-continuity",
+        "prompt": "只读读取最近 3 期已完成周报；不足 3 期时读取现有全部。提取活跃客户、未完成下一步、🟡/🔴 项目和连续推进事项，形成延续项目检查清单。该清单仅用于后续与本周 activity、日历、KiroLex 会话、memory 和交付物交叉核对，不得将旧周报内容直接作为本周事实。",
+        "doneWhen": "已产出延续项目检查清单，并为每项标明来自哪一期历史周报、可用于识别的客户简称或项目线索，以及“不可直接作为本周事实”的限制。",
+        "tools": [
+          "fs_read"
+        ],
+        "consumes": [
+          "ext:周报规范",
+          "ext:周报文件计划"
+        ],
+        "produces": [
+          "ext:延续项目检查清单"
+        ]
+      },
+      {
+        "id": "S8",
+        "kind": "segment",
+        "name": "合并候选并清点",
+        "rules": [
+          "2",
+          "3"
+        ],
+        "dependsOn": [
+          "G0",
+          "S3",
+          "S4",
+          "S5",
+          "S7"
+        ],
+        "session": "weekly-reconcile",
+        "prompt": "合并活动、客户日历、KiroLex 会话、memory/history、本周交付物和延续项目检查清单。逐项交叉核对延续项目，按明确客户证据合并去重；同一工作跨来源出现时仅保留信息最完整的描述。旧周报只能提供线索，缺少本周证据的内容不得纳入。首次向用户展示前，按客户列出编号和一句话候选，并单列非客户/内部事项与客户待确认事项；报告 activity、Outlook、KiroLex、memory/history 与交付物/工具记录的实际覆盖量。此步骤只展示一次候选清点，不能创建“客户｜本周进展”中间表。",
+        "doneWhen": "已产出一次性候选清点、去重结果、客户与非客户分类、客户归属证据、各来源强制检查覆盖量及延续项目交叉核对结果；未完成任一强制检查时已明确报告阻塞而非声称采集完成。",
+        "consumes": [
+          "ext:周报规范",
+          "ext:周报文件计划",
+          "ext:文件冲突决定",
+          "ext:活动素材",
+          "ext:日历素材",
+          "ext:KiroLex会话素材",
+          "ext:延续项目检查清单"
+        ],
+        "produces": [
+          "ext:客户候选清单",
+          "ext:非客户候选清单"
+        ],
+        "deviation": "按用户要求，候选汇总不再接收或引用其他会话来源的素材、记忆或交付物证据。"
+      },
+      {
+        "id": "S9",
+        "kind": "segment",
+        "name": "预填客户条目",
+        "rules": [
+          "2",
+          "4"
+        ],
+        "dependsOn": [
+          "S8"
+        ],
+        "session": "weekly-client",
+        "fanoutOver": "每个客户候选条目",
+        "fanoutFrom": "ext:客户候选清单",
+        "prompt": "针对一个客户候选条目，先根据 activity/STEERING 中的线索或实时 `search_accounts` 查找 Account；再用 `search_opportunities` 按 accountId、`closeDate ≥ 当年`、`isClosed=false` 查询 open opp，必要时用 `get_opportunity_details` 查看历史。以实时 stageName、nextStep、amount 校准条目。随后将候选直接改写为最终「项目进展」格式，必须完整包含 TAG、Opp、Top 3 Service、MRR、本周、下一步、状态、需要帮助八字段。存在多个候选 Opp 时在同一条目列出备选供用户选择；没有干净 Opp 时标 Account level。不得虚构帮助诉求，用户仅表达跟踪意图时写“无 — 仅需关注 X 进度”。",
+        "doneWhen": "已为该客户候选形成八字段完整的最终格式条目，附带 SFDC 实时依据、可选 Opp 或 Account level 说明，并明确本周证据与 SFDC 记录的任何冲突。",
+        "tools": [
+          "aws-sentral-mcp",
+          "search_accounts",
+          "search_opportunities",
+          "get_opportunity_details"
+        ],
+        "consumes": [
+          "ext:客户候选清单"
+        ],
+        "produces": [
+          "ext:待确认客户条目"
+        ],
+        "deviation": "与 S10 共用 `weekly-client` 会话，按 fanout 项逐客户实例化：同一客户的 SFDC 查询结果和条目版本在确认前后保持在同一上下文，避免重复查询与二次交接；不同客户仍各自独立并行。"
+      },
+      {
+        "id": "G1",
+        "kind": "gate",
+        "name": "确认客户条目",
+        "rules": [
+          "2",
+          "3",
+          "4"
+        ],
+        "dependsOn": [
+          "S9"
+        ],
+        "review": "逐条展示八字段完整的最终项目进展条目、SFDC 实时依据和可选 Opp。请用户明确批准、修改、改放非项目事项/其他，或跳过并说明原因；用户修改任一字段时，要求以八字段完整条目重新回显后再确认。",
+        "produces": [
+          "ext:客户条目确认决定"
+        ],
+        "deviation": "原文要求每次只展示一个条目；为避免会话媒介造成非业务串行，所有彼此独立的客户条目可在不同会话中并行等待各自确认，且每个确认仍仅对应一个完整条目。"
+      },
+      {
+        "id": "S10",
+        "kind": "segment",
+        "name": "记录客户确认",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "G1"
+        ],
+        "session": "weekly-client",
+        "fanoutOver": "每个客户条目的确认决定",
+        "fanoutFrom": "ext:客户条目确认决定",
+        "prompt": "处理一个客户条目的用户确认决定：仅把明确批准的版本标记为已确认；用户要求修改的版本必须以完整八字段确认结果为准；用户要求跳过时记录跳过原因并标记不得重复追问；用户要求移出项目进展时转交为非客户候选。同步提取该条中可供后续信号和本周分享使用的已确认事实，但不得起草全文。",
+        "doneWhen": "已输出该条目的已确认内容或明确跳过记录，包含用户修改结果、模块移动结果及可复用的信号/分享事实；未确认内容未被标记为已确认。",
+        "consumes": [
+          "ext:待确认客户条目",
+          "ext:客户条目确认决定"
+        ],
+        "produces": [
+          "ext:单条确认结果"
+        ],
+        "deviation": "原文要求每条确认后立刻追加同一草稿文件。为保证相互独立的条目可并行处理且避免多个会话并发写同一文件，确认结果先保存在运行时交接产物中，再由汇总步骤一次写入原文要求的草稿文件。同时与 S9 共用按客户实例化的 `weekly-client` 会话，复用该客户的预填上下文。"
+      },
+      {
+        "id": "S11",
+        "kind": "segment",
+        "name": "汇总客户确认",
+        "rules": [
+          "2",
+          "5"
+        ],
+        "dependsOn": [
+          "S10"
+        ],
+        "session": "weekly-client-merge",
+        "prompt": "汇总所有客户条目的确认结果，形成已确认客户条目、已跳过清单及信号/分享候选事实。将已确认客户条目和已跳过清单写入周报文件计划中的 `.W{NN}-draft.md` 草稿文件，使用 UTF-8 Markdown；写入后立即用 MacDown 打开草稿文件。不得把未确认条目写入草稿。",
+        "doneWhen": "草稿文件已包含全部已确认客户条目和带原因的已跳过清单，且已在 MacDown 打开；同时已输出可供后续提炼使用的已确认客户事实。",
+        "tools": [
+          "fs_write",
+          "shell"
+        ],
+        "consumes": [
+          "ext:周报文件计划",
+          "ext:单条确认结果"
+        ],
+        "writes": [
+          "file:~/Documents/周报/.W{isoWeek}-draft.md"
+        ],
+        "produces": [
+          "ext:已确认客户内容",
+          "ext:已跳过清单",
+          "file:~/Documents/周报/.W{isoWeek}-draft.md"
+        ],
+        "deviation": "与 S12 共用 `weekly-client-merge` 会话，但不与后续写草稿的节点共用会话：`.W{NN}-draft.md` 须真实落盘以防上下文压缩丢失进度，其内容需跨会话交给 S13、S21、S22 使用。"
+      },
+      {
+        "id": "S12",
+        "kind": "segment",
+        "name": "整理非客户分组",
+        "rules": [
+          "2",
+          "4"
+        ],
+        "dependsOn": [
+          "S11"
+        ],
+        "session": "weekly-client-merge",
+        "prompt": "将非客户候选、客户条目中用户指定移出的内容，以及 TLI、博客、思想领导力、培训、内部分享、自建工具等内部贡献归入「非项目事项」或「其他」。拆成编号要点，一次性呈现为“全部添加 / 按编号修改或删除 / 全部不添加”的分组确认材料。不得强制客户或 Opp 映射。",
+        "doneWhen": "已输出按模块归类、带编号且可一次性确认的非客户分组，不含任何强制 account 或 Opp 映射。",
+        "consumes": [
+          "ext:非客户候选清单",
+          "ext:单条确认结果",
+          "ext:已确认客户内容"
+        ],
+        "produces": [
+          "ext:待确认非客户分组"
+        ],
+        "deviation": "与 S11 共用 `weekly-client-merge` 会话：该步骤在 S11 之后强制串行，可直接复用已确认客户内容的上下文，且本身不写入任何文件。"
+      },
+      {
+        "id": "G2",
+        "kind": "gate",
+        "name": "确认非客户分组",
+        "rules": [
+          "2",
+          "4"
+        ],
+        "dependsOn": [
+          "S12"
+        ],
+        "review": "展示编号后的非客户事项和建议模块。请用户选择全部添加、按编号修改或删除，或全部不添加。",
+        "produces": [
+          "ext:非客户分组确认决定"
+        ]
+      },
+      {
+        "id": "S13",
+        "kind": "segment",
+        "name": "记录非客户确认",
+        "rules": [
+          "2",
+          "5"
+        ],
+        "dependsOn": [
+          "G2"
+        ],
+        "session": "weekly-nonclient-decision",
+        "prompt": "依据用户对非客户分组的确认决定，生成仅含已批准内容的「非项目事项」和「其他」内容。将其追加到 `.W{NN}-draft.md`，保留之前已确认客户条目与跳过记录；写入后立即用 MacDown 打开草稿文件。不得纳入被删除、被拒绝或未确认的事项。",
+        "doneWhen": "已确认的非客户内容已写入草稿并在 MacDown 打开，同时输出可供报告编排使用的已确认非客户内容。",
+        "tools": [
+          "fs_write",
+          "shell"
+        ],
+        "consumes": [
+          "ext:周报文件计划",
+          "file:~/Documents/周报/.W{isoWeek}-draft.md",
+          "ext:待确认非客户分组",
+          "ext:非客户分组确认决定",
+          "ext:已跳过清单"
+        ],
+        "writes": [
+          "file:~/Documents/周报/.W{isoWeek}-draft.md"
+        ],
+        "produces": [
+          "ext:已确认非客户内容",
+          "file:~/Documents/周报/.W{isoWeek}-draft.md"
+        ],
+        "deviation": "独立 `weekly-nonclient-decision` 会话：该节点读取 S11 落盘的草稿并追加写入，草稿内容还需跨会话交给编排与定稿节点，故不与其他写草稿的节点共用会话。"
+      },
+      {
+        "id": "S14",
+        "kind": "segment",
+        "name": "提炼信号与分享",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S11",
+          "S13"
+        ],
+        "session": "weekly-insights",
+        "prompt": "仅从已确认客户和非客户内容中提炼「信号」与「💡 本周分享」候选。信号按 Observation、Challenge、Risk 三类分别列出；本周分享按技术方案、AI 实践、行业洞察、竞品情报、客户声音、个人思考六类列出，并提醒用户本周分享建议每周 1-2 条。涉及产品规则、计费口径或服务限制的信号，先用公开 AWS 文档核实关键规则并写清依据和建议；用户给出的内部 TT/工单链接须原样引用。不得将未确认内容或无依据推测作为信号。",
+        "doneWhen": "已输出带编号的信号与本周分享候选，信号按三类分类、分享按六类分类；涉及公开规则的候选已包含可核实依据，且没有编造链接或未确认事实。",
+        "tools": [
+          "web_fetch"
+        ],
+        "consumes": [
+          "ext:周报规范",
+          "ext:已确认客户内容",
+          "ext:已确认非客户内容"
+        ],
+        "produces": [
+          "ext:待确认信号与分享"
+        ],
+        "deviation": "与 S17、S20 共用 `weekly-insights` 会话：候选→确认记录→本地分享稿本就强制串行且同属一个主题，核实过的公开文档依据和分享正文可在同一上下文复用。"
+      },
+      {
+        "id": "G3",
+        "kind": "gate",
+        "name": "确认信号与分享",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S14"
+        ],
+        "review": "展示按类别编号的信号和本周分享候选、核实依据及分享必填提醒。请用户保留、修改、删除或补充；全部不选时确认写“无”。如分享需要可访问链接，请确认需要生成本地分享稿并由用户手动上传后回传链接。",
+        "produces": [
+          "ext:信号与分享确认决定"
+        ]
+      },
+      {
+        "id": "S15",
+        "kind": "segment",
+        "name": "整理下周预告",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S11",
+          "S13"
+        ],
+        "session": "weekly-next-week",
+        "prompt": "仅从已确认材料中提取已有确定日期、已约会议或客户已承诺动作的下周事项，生成 `[日期] [客户/事项] [具体内容]` 格式的编号候选。不得把项目条目的“下一步”自动改写为下周预告；缺少明确安排的事项不得列入。",
+        "doneWhen": "已输出仅含明确安排的、带编号的下周预告候选；没有合格候选时已明确输出“无”。",
+        "consumes": [
+          "ext:已确认客户内容",
+          "ext:已确认非客户内容"
+        ],
+        "produces": [
+          "ext:待确认下周预告"
+        ],
+        "deviation": "与 S18 共用 `weekly-next-week` 会话：同一批候选的生成与确认记录强制串行，合并后无需重新载入候选上下文；与信号、Top 3 两条分支仍并行。"
+      },
+      {
+        "id": "G4",
+        "kind": "gate",
+        "name": "确认下周预告",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S15"
+        ],
+        "review": "逐条展示下周预告候选。请用户确认、修改或删除；用户未明确确认的条目不得写入周报。",
+        "produces": [
+          "ext:下周预告确认决定"
+        ]
+      },
+      {
+        "id": "S16",
+        "kind": "segment",
+        "name": "提炼Top3与亮点",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S11",
+          "S13"
+        ],
+        "session": "weekly-summary",
+        "prompt": "仅从已确认内容中提炼「🎯 本周聚焦（Top 3）」和「Highlights / Lowlights」候选。Top 3 必须为 1-3 条、每条不超过 30 字、按重要性降序且结论先行。Highlights / Lowlights 最多 3 条，无则写“无”；每个 Lowlight 必须包含“你的建议”。不得把未确认内容写入候选。",
+        "doneWhen": "已输出符合数量、长度和排序规则的 Top 3 候选，以及最多 3 条、每个 Lowlight 含建议的 Highlights / Lowlights 候选。",
+        "consumes": [
+          "ext:已确认客户内容",
+          "ext:已确认非客户内容"
+        ],
+        "produces": [
+          "ext:待确认Top3与亮点"
+        ],
+        "deviation": "与 S19 共用 `weekly-summary` 会话：候选与确认记录强制串行，字数、排序、Lowlight 建议等规则校验在同一上下文内连续执行更可靠。"
+      },
+      {
+        "id": "G5",
+        "kind": "gate",
+        "name": "确认Top3与亮点",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S16"
+        ],
+        "review": "展示 Top 3 与 Highlights / Lowlights 候选。请用户确认、修改或删除；未获得明确确认的候选不得写入定稿。",
+        "produces": [
+          "ext:Top3与亮点确认决定"
+        ]
+      },
+      {
+        "id": "S17",
+        "kind": "segment",
+        "name": "记录信号与分享",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "G3"
+        ],
+        "session": "weekly-insights",
+        "prompt": "依据用户确认决定整理最终信号和本周分享内容。全部不选时按用户决定写“无”。若用户要求分享链接，仅保留用户已确认的本地分享稿需求和待回传链接状态；不得伪造 WorkDocs、SharePoint 或其他外部链接。",
+        "doneWhen": "已输出仅含用户确认内容的信号与本周分享，或明确“无”；需要链接的分享已标明待生成本地文件和待用户回传链接。",
+        "consumes": [
+          "ext:待确认信号与分享",
+          "ext:信号与分享确认决定"
+        ],
+        "produces": [
+          "ext:已确认信号与分享"
+        ],
+        "deviation": "并入 `weekly-insights` 会话，复用 S14 的候选与核实依据上下文。"
+      },
+      {
+        "id": "S18",
+        "kind": "segment",
+        "name": "记录下周预告",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "G4"
+        ],
+        "session": "weekly-next-week",
+        "prompt": "依据用户确认决定整理最终「下周预告」。只保留明确确认的事项并使用 `[日期] [客户/事项] [具体内容]` 格式；没有确认事项时输出“无”。",
+        "doneWhen": "已输出仅含用户确认事项的下周预告，或明确输出“无”。",
+        "consumes": [
+          "ext:待确认下周预告",
+          "ext:下周预告确认决定"
+        ],
+        "produces": [
+          "ext:已确认下周预告"
+        ],
+        "deviation": "并入 `weekly-next-week` 会话，复用 S15 的候选上下文。"
+      },
+      {
+        "id": "S19",
+        "kind": "segment",
+        "name": "记录Top3与亮点",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "G5"
+        ],
+        "session": "weekly-summary",
+        "prompt": "依据用户确认决定整理最终 Top 3 与 Highlights / Lowlights。只保留明确确认版本；Highlights / Lowlights 无内容时写“无”，且任何保留的 Lowlight 必须含“你的建议”。",
+        "doneWhen": "已输出仅含用户确认的 Top 3 与 Highlights / Lowlights，且持续满足 Top 3 数量和长度、Lowlight 建议要求。",
+        "consumes": [
+          "ext:待确认Top3与亮点",
+          "ext:Top3与亮点确认决定"
+        ],
+        "produces": [
+          "ext:已确认Top3与亮点"
+        ],
+        "deviation": "并入 `weekly-summary` 会话，复用 S16 的候选上下文。"
+      },
+      {
+        "id": "S20",
+        "kind": "segment",
+        "name": "生成分享本地稿",
+        "rules": [
+          "2"
+        ],
+        "dependsOn": [
+          "S17"
+        ],
+        "session": "weekly-insights",
+        "prompt": "如用户确认的本周分享需要可访问链接，将分享稿写为 UTF-8 Markdown 本地文件到用户指定目录（未指定时为 `~/Downloads`）。告知用户需手动上传至其可用平台并回传链接；不得上传到外部系统，不得伪造链接。若没有需要链接的分享，输出“不需要本地分享稿”。",
+        "doneWhen": "每个需要链接的已确认分享均已生成本地 Markdown 文件，文件路径已返回，且明确标注为等待用户手动上传和回传链接；没有需要链接的分享时已明确输出无需生成；未生成任何伪造外部链接。",
+        "tools": [
+          "fs_write"
+        ],
+        "consumes": [
+          "ext:已确认信号与分享"
+        ],
+        "writes": [
+          "file:~/Downloads/{分享文件名}.md"
+        ],
+        "produces": [
+          "file:~/Downloads/{分享文件名}.md",
+          "ext:分享链接状态"
+        ],
+        "uses": [
+          "shareOutputDirectory"
+        ],
+        "deviation": "并入 `weekly-insights` 会话：分享正文已在该会话内确认，直接落盘无需跨会话传递内容；该文件是交给用户手动上传的最终产物，不是会话内中间态。"
+      },
+      {
+        "id": "S21",
+        "kind": "segment",
+        "name": "编排完整草稿",
+        "rules": [
+          "2",
+          "5"
+        ],
+        "dependsOn": [
+          "S11",
+          "S13",
+          "S17",
+          "S18",
+          "S19",
+          "S20"
+        ],
+        "session": "weekly-full-draft",
+        "prompt": "依据 v5 模板和全部已确认内容编排完整周报，模块顺序严格为：🎯 本周聚焦（Top 3）、项目进展、Highlights / Lowlights、非项目事项、信号、💡 本周分享、下周预告、其他。项目进展必须保留八字段；可选模块无内容时按规范处理；须收录所有用户明确提供并确认的输入。将完整草稿写入 `.W{NN}-draft.md`，覆盖该草稿的临时确认记录但不得写入最终周报文件；写入后立即用 MacDown 打开草稿，并完整输出全文供用户审阅。",
+        "doneWhen": "草稿文件包含符合 v5 固定模块顺序和字段规则的完整周报全文，所有内容均可追溯到已确认输入，已在 MacDown 打开，且完整全文已可供用户审阅。",
+        "tools": [
+          "fs_write",
+          "shell"
+        ],
+        "consumes": [
+          "ext:周报规范",
+          "ext:周报文件计划",
+          "ext:已确认客户内容",
+          "ext:已确认非客户内容",
+          "ext:已确认信号与分享",
+          "ext:已确认下周预告",
+          "ext:已确认Top3与亮点",
+          "ext:分享链接状态"
+        ],
+        "writes": [
+          "file:~/Documents/周报/.W{isoWeek}-draft.md"
+        ],
+        "produces": [
+          "file:~/Documents/周报/.W{isoWeek}-draft.md",
+          "ext:完整周报草稿"
+        ],
+        "deviation": "独立 `weekly-full-draft` 会话：覆盖写出的完整草稿须作为跨会话产物交给定稿节点读取与删除，故不与前序写草稿的节点或定稿节点共用会话。"
+      },
+      {
+        "id": "G6",
+        "kind": "gate",
+        "name": "确认周报定稿",
+        "rules": [
+          "2",
+          "5"
+        ],
+        "dependsOn": [
+          "S21"
+        ],
+        "review": "展示最新完整周报全文，而非摘要、片段或 diff。请用户明确确认定稿；如需任何修改，必须在修改后再次展示完整全文并重新确认。",
+        "produces": [
+          "ext:定稿确认决定"
+        ]
+      },
+      {
+        "id": "S22",
+        "kind": "segment",
+        "name": "写入周报定稿",
+        "rules": [
+          "5",
+          "7"
+        ],
+        "dependsOn": [
+          "G6"
+        ],
+        "session": "weekly-finalize",
+        "prompt": "仅在收到用户明确的定稿确认后，将已确认的完整草稿写入周报文件计划中的最终周报路径。写入后立即用 MacDown 打开最终文件；删除 `.W{NN}-draft.md` 草稿文件。周报仅保留在本地，不执行任何 SharePoint 或其他外部上传。",
+        "doneWhen": "最终周报 Markdown 文件已写入预定本地路径并在 MacDown 打开，草稿文件已删除，且未执行任何外部上传。",
+        "tools": [
+          "fs_write",
+          "shell"
+        ],
+        "consumes": [
+          "ext:周报文件计划",
+          "file:~/Documents/周报/.W{isoWeek}-draft.md",
+          "ext:完整周报草稿",
+          "ext:定稿确认决定"
+        ],
+        "writes": [
+          "file:~/Documents/周报/FSI-SA-{login}-{isoYear}-W{isoWeek}.md",
+          "file:~/Documents/周报/.W{isoWeek}-draft.md"
+        ],
+        "produces": [
+          "file:~/Documents/周报/FSI-SA-{login}-{isoYear}-W{isoWeek}.md"
+        ],
+        "deviation": "独立 `weekly-finalize` 会话：定稿写入与草稿删除依据 S21 跨会话交付的落盘草稿执行，草稿文件因此必须真实存在。"
+      },
+      {
+        "id": "S23",
+        "kind": "segment",
+        "name": "读取局部润色目标",
+        "rules": [
+          "6",
+          "8"
+        ],
+        "dependsOn": [
+          "S1"
+        ],
+        "session": "weekly-polish",
+        "condition": "仅在用户要求润色某个模块时执行。",
+        "prompt": "读取用户指定的现有周报文件及其指定模块，保留其余模块不变。结合周报规范和 FAQ 确定该模块的边界与写作要求；只输出待润色模块的原文、适用规范和可执行的修改范围。",
+        "doneWhen": "已读取目标文件的指定模块，明确保持不变的其余内容，并输出符合规范的润色范围。",
+        "tools": [
+          "fs_read"
+        ],
+        "consumes": [
+          "ext:周报规范"
+        ],
+        "produces": [
+          "ext:局部润色上下文"
+        ],
+        "uses": [
+          "reportFile",
+          "moduleScope"
+        ],
+        "deviation": "与 S24 共用 `weekly-polish` 会话：读取原文与写回同一模块必须串行，同一上下文可保证“其余模块不变”的对照基准来自刚读到的原文。"
+      },
+      {
+        "id": "S24",
+        "kind": "segment",
+        "name": "执行局部润色",
+        "rules": [
+          "6"
+        ],
+        "dependsOn": [
+          "S23"
+        ],
+        "session": "weekly-polish",
+        "condition": "仅在用户要求润色某个模块时执行。",
+        "prompt": "仅修改指定周报模块，保持其他模块原文不变。将表达润色为结论先行、结果与判断优先、去除排障细节堆叠和套话的专业简洁中文；不得编造事实、数据或帮助诉求。写回原周报文件后立即用 MacDown 打开，并展示该模块的 diff。",
+        "doneWhen": "指定模块已按规范更新，其他模块未改变，已在 MacDown 打开修改后的文件，且已输出该模块的可核对 diff。",
+        "tools": [
+          "fs_write",
+          "shell"
+        ],
+        "consumes": [
+          "ext:局部润色上下文"
+        ],
+        "writes": [
+          "file:{reportFile}"
+        ],
+        "produces": [
+          "file:{reportFile}"
+        ],
+        "deviation": "并入 `weekly-polish` 会话，diff 直接基于同会话内读到的原文生成；写回的周报文件是最终产物，不是会话内中间态。"
+      },
+      {
+        "id": "S25",
+        "kind": "segment",
+        "name": "核对本地归档",
+        "rules": [
+          "7"
+        ],
+        "dependsOn": [],
+        "session": "weekly-archive",
+        "condition": "仅在用户要求归档某一周周报时执行。",
+        "prompt": "读取用户指定的周报文件，核对其位于本地周报工作目录且文件可访问。归档仅表示在本地保留该周报；不得上传至 SharePoint 或任何外部系统。若用户需要外部上传，只说明应由用户手动完成。",
+        "doneWhen": "已报告指定周报文件是否存在于本地、是否可访问，以及未执行任何外部上传。",
+        "tools": [
+          "fs_read",
+          "fs_write"
+        ],
+        "writes": [
+          "file:{reportFile}"
+        ],
+        "produces": [
+          "file:{reportFile}"
+        ],
+        "uses": [
+          "reportFile"
+        ],
+        "deviation": "保留独立 `weekly-archive` 会话：该节点为条件触发、无依赖的独立核对动作，与主流程无共享上下文可复用。"
+      }
+    ],
+    "inputs": [
+      {
+        "id": "referenceDirectory",
+        "label": "周报参考文件目录",
+        "description": "包含 v5 模板、填写指南、FAQ 和 Sample 文件的目录。",
+        "required": true,
+        "multiline": false
+      },
+      {
+        "id": "reportDate",
+        "label": "周报所属日期",
+        "description": "用于计算 ISO 周；留空时按当前系统日期处理。",
+        "required": false,
+        "multiline": false,
+        "default": "当前系统日期"
+      },
+      {
+        "id": "shareOutputDirectory",
+        "label": "分享稿输出目录",
+        "description": "本地分享稿保存位置；未指定时使用 `~/Downloads`。",
+        "required": false,
+        "multiline": false,
+        "default": "~/Downloads"
+      },
+      {
+        "id": "reportFile",
+        "label": "待润色周报文件",
+        "description": "需要局部润色的现有 Markdown 周报路径。",
+        "required": true,
+        "multiline": false
+      },
+      {
+        "id": "moduleScope",
+        "label": "待润色模块",
+        "description": "例如“项目进展”“信号”或“本周分享”。",
+        "required": true,
+        "multiline": false
+      }
+    ]
+  },
+  "fingerprint": "a5bb3d",
+  "source": "周报",
+  "status": "draft",
+  "createdAt": 1786937172316
+}

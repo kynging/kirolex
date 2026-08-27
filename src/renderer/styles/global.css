@@ -6,6 +6,23 @@
   --text-primary: #e8e8e8;
   --text-secondary: #a0a0a0;
   --text-muted: #666;
+  /*
+    以下四个**一直在被使用，却从来没有定义过** —— 「文字有的紫色有的灰的，你也没修好」。
+
+    `color: var(--text-tertiary)` 这条声明在变量不存在时是**无效声明**，于是那处文字退回继承父元素的颜色：
+    父级是白的地方它就是白，父级是紫的地方(门名、会话胶囊那些 accent 色的容器)它就是紫。所以第三级的次要
+    文字没有统一的颜色，而是各自跟着上一层跑 —— 这就是「有的紫有的灰」。实测证据：用户画布里一个 `.fg-dep`
+    胶囊的 computed color 是 `rgb(232,232,232)`，正好是 `--text-primary`，不是它自己那条规则想给的灰。
+    用了 65 次，无一处带 fallback。
+
+    值不是新造的：第三级灰跟 `--text-muted` 同一档（#666，两者语义相同，历史上就是两个名字）。
+    `--accent-soft` 全部用在 focus 光圈和浅底(9 处)，所以是 accent 的低透明度版本；`--border-strong` 是
+    比 `--border` 更实的一档；`--text` 只在一处当色块背景用，明显是 `--text-primary` 的手误。
+  */
+  --text-tertiary: #666;
+  --accent-soft: rgba(124, 111, 224, 0.22);
+  --border-strong: #4a4a4a;
+  --text: #e8e8e8;
   --border: #333;
   --accent: #7c6fe0;
   --accent-hover: #6b5fd4;
@@ -73,11 +90,19 @@ button, input, select, textarea {
 }
 
 /* macOS: reserve space for the hiddenInset traffic-light controls */
+/*
+  拖动区只占**左边那一段** —— 「右上角确认注册现在点不了而且右边没有关闭这个会话的按钮」。
+
+  它原来是一条 left:0 right:0、z-index:1000 的固定覆盖层:凡是画在窗口顶部 34px 里的东西全被它吃掉点击 ——
+  实测「确认注册」和它右边那个 ✕ 上面压着的正是 .mac-titlebar。按钮既没消失也没禁用,只是点不到,所以看起来
+  像「没有关闭按钮」。
+  红绿灯在左上角,拖窗口的手感来自左侧空白:所以拖动区收到左边 240px，右边整段还给界面。
+*/
 .mac-titlebar {
   position: fixed;
   top: 0;
   left: 0;
-  right: 0;
+  width: 240px;
   height: var(--mac-titlebar-height);
   -webkit-app-region: drag;
   z-index: 1000;
@@ -254,6 +279,58 @@ button, input, select, textarea {
   font-size: 9px;
   flex-shrink: 0;
   opacity: 0.8;
+}
+
+/* Next-run badge on a chat's row. Sits between the title and the ✕, and never shrinks the
+   title away: the countdown is short by construction (scheduleView keeps it minute-grained,
+   and past a day it becomes a date). */
+/* 这一行在为哪个 flow 干活：状态用左边一条细杠表示，比整块染色安静 */
+.session-flow {
+  flex-shrink: 0; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 9px; padding: 1px 5px 1px 4px; border-radius: 999px;
+  border-left: 2px solid var(--border); background: var(--bg-secondary); color: var(--text-tertiary);
+}
+.session-flow.running { border-left-color: #7c6fe0; color: var(--text-secondary); }
+.session-flow.done { border-left-color: #4a9d5f; }
+.session-flow.failed, .session-flow.rejected { border-left-color: #ef5350; color: var(--text-secondary); }
+.session-flow.skipped { opacity: .6; }
+/* 画布会话（临时的，注册完自动关）：和 worker 的 tag 同形，颜色更淡 —— 它不在跑任何东西 */
+.session-flow.skill { border-left-color: rgba(124,111,224,.5); color: var(--text-tertiary); }
+
+/* 子代理在跑：kiro 报的名单里还没 terminated 的个数，全部结束就消失 */
+.session-crew {
+  flex-shrink: 0;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(124,111,224,0.18);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+.session-schedule {
+  flex-shrink: 0;
+  max-width: 92px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 10px;
+  font-variant-numeric: tabular-nums;   /* a ticking countdown must not shift the row */
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(124, 111, 224, 0.14);
+  color: var(--accent);
+  border: 1px solid rgba(124, 111, 224, 0.28);
+}
+.session-schedule.paused {
+  background: rgba(128, 128, 128, 0.12);
+  color: var(--text-muted);
+  border-color: var(--border);
+}
+/* A job that failed last run must not read the same as a healthy one. */
+.session-schedule.failing {
+  background: rgba(239, 83, 80, 0.12);
+  color: var(--error);
+  border-color: rgba(239, 83, 80, 0.32);
 }
 
 /* Floating drag overlay (follows the cursor while dragging a session) */
@@ -1079,9 +1156,9 @@ button, input, select, textarea {
   user-select: none;
 }
 
-/* The add slot as a REAL CELL (it now takes the empty cell's own width, inherited
-   from the row above, instead of a fixed sliver). Wide enough for normal text, and
-   the divider element in front of it already draws the boundary. */
+/* The add slot as a REAL BAND rather than a fixed sliver: used for a fully empty ROW,
+   which takes the height a row of chats would have (inline flex-grow decides the
+   share). A free CELL beside a chat deliberately stays the sliver above. */
 .chat-pane-add.cell {
   flex: 0 1 0;
   border-left: none;
@@ -1566,6 +1643,9 @@ button, input, select, textarea {
   color: #6cb6ff !important;
   cursor: pointer;
   text-decoration: none;
+  /* The widest single offender measured: 444px inside a 275px parent. A file path is
+     exactly the shape that never breaks on its own. */
+  overflow-wrap: anywhere;
 }
 .md-file-link:hover {
   text-decoration: underline;
@@ -1588,6 +1668,18 @@ button, input, select, textarea {
   background: color-mix(in srgb, #d4a05a 5%, transparent);
   border-radius: 0 8px 8px 0;
 }
+/* 清空上下文那条分界线 —— 「clear 了之后再打开还有历史会话呢」。
+   `/clear` 重置的是模型的活动上下文，transcript 刻意保留（审计链 + 重启后重建上下文的依据），
+   于是重新打开时界面上摆着一堆模型已经不记得的消息。这条线把那件事说出来。
+   画成一条线而不是一个气泡：气泡说不出「上面的不记得了」，而那是这条消息在这一页上唯一的意义。 */
+.chat-clear-line {
+  display: flex; align-items: center; gap: 8px; margin: 14px 0; color: var(--text-tertiary); font-size: 10px;
+}
+.chat-clear-line::before, .chat-clear-line::after {
+  content: ''; flex: 1; height: 1px; background: var(--border);
+}
+.chat-clear-line > span { flex: none; white-space: nowrap; }
+
 .load-older-btn {
   display: block;
   margin: 6px auto 14px;
@@ -1620,6 +1712,12 @@ button, input, select, textarea {
   border-radius: 4px;
   font-size: 0.9em;
   font-family: var(--mono-font);
+  /* `anywhere`, not `break-word`: an inline path or identifier is ONE unbreakable word,
+     so the default `overflow-wrap: normal` finds no break opportunity and lets it run
+     past the pane (measured: 415px past a 275px parent). `anywhere` also lets the
+     element's min-content width shrink, which `break-word` does not -- that difference
+     is what keeps a long token from widening the flex/table box that holds it. */
+  overflow-wrap: anywhere;
 }
 
 .message.assistant .message-content pre {
@@ -1669,11 +1767,37 @@ button, input, select, textarea {
   border-radius: 0 6px 6px 0;
 }
 
+/* A table must be BOUNDED, not merely asked to be 100% wide.
+   `width: 100%` under the default `table-layout: auto` does not constrain anything:
+   auto layout sizes columns to their content first and honours the declared width only
+   if it can. Measured in a 2x1 split (pane ~446px), a 4-column table rendered 791px
+   wide inside a 275px container -- 516px of it past the box, hidden by the
+   transcript's `overflow-x: hidden` and therefore simply missing. */
 .message.assistant .message-content table {
   border-collapse: collapse;
   margin: 12px 0;
   width: 100%;
+  max-width: 100%;
+  /* Fixed layout makes the declared width authoritative, so columns divide the pane
+     instead of the pane growing to fit the columns. */
+  table-layout: fixed;
   font-size: 13px;
+}
+
+/* Escape hatch for a table that genuinely cannot be readable at pane width (5 columns
+   in 275px). react-markdown emits a bare <table>, so the wrapper is added in
+   ChatArea's markdown components map. Scrolling inside its own box is the only option
+   that neither clips the data nor puts a scrollbar under the whole transcript. */
+.message.assistant .message-content .md-table-scroll {
+  max-width: 100%;
+  overflow-x: auto;
+  /* The table inside is allowed its natural width again; the wrapper is what clips. */
+  margin: 12px 0;
+}
+.message.assistant .message-content .md-table-scroll > table {
+  margin: 0;
+  /* Enough width to stay legible when scrolled, without forcing it on a narrow pane. */
+  min-width: min(100%, 420px);
 }
 
 .message.assistant .message-content th,
@@ -1681,6 +1805,9 @@ button, input, select, textarea {
   border: 1px solid var(--border);
   padding: 8px 12px;
   text-align: left;
+  /* A long token in a narrow fixed column has no break opportunity of its own, and
+     `table-layout: fixed` would otherwise let it paint straight over the next cell. */
+  overflow-wrap: anywhere;
 }
 
 .message.assistant .message-content th {
@@ -1820,16 +1947,67 @@ button, input, select, textarea {
   white-space: nowrap;
 }
 
-/* Chat error banner: surfaces connectionError even when the chat has messages
-   (the empty-state placeholder shows it otherwise). */
-.activity-status-text {
-  display: inline-block;
-  margin-left: 8px;
+/* Standing schedule notice, above the transcript. Aligned with the error banner's gutters so
+   the two stack cleanly when a scheduled chat is also showing an error. Quiet on purpose: it
+   is a persistent fact about the chat, not an event. */
+.schedule-banner {
+  margin: 10px 48px 0;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: rgba(124, 111, 224, 0.10);
+  border: 1px solid rgba(124, 111, 224, 0.26);
+  color: var(--accent);
   font-size: 12px;
-  color: var(--text-secondary);
-  vertical-align: middle;
+  line-height: 1.5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.schedule-banner-text {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;   /* full sentence lives in the title attribute */
+  font-variant-numeric: tabular-nums;
+}
+/* The banner's own controls. Quiet by default — this bar is read far more often than acted on. */
+.schedule-banner-pause,
+.schedule-banner-cancel {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+.schedule-banner-pause:hover,
+.schedule-banner-cancel:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
+/* Armed cancel must not look like the same button it was a moment ago: the next click deletes. */
+.schedule-banner-cancel.armed {
+  opacity: 1;
+  color: var(--error);
+  border-color: rgba(239, 83, 80, 0.55);
+  background: rgba(239, 83, 80, 0.14);
+  font-weight: 600;
 }
 
+.schedule-banner.paused {
+  background: rgba(128, 128, 128, 0.10);
+  border-color: var(--border);
+  color: var(--text-muted);
+}
+.schedule-banner.failing {
+  background: rgba(239, 83, 80, 0.10);
+  border-color: rgba(239, 83, 80, 0.30);
+  color: var(--error);
+}
+
+/* Chat error banner: surfaces connectionError even when the chat has messages
+   (the empty-state placeholder shows it otherwise). */
 .chat-error-banner {
   margin: 10px 48px 0;
   padding: 8px 12px;
@@ -1885,9 +2063,15 @@ button, input, select, textarea {
   font-weight: 600;
   cursor: pointer;
   text-align: left;
+  /* The header is ONE line. Without this the label is an anonymous flex item with
+     `white-space: normal`, so when the collapsed preview competes for width the browser
+     shrinks the LABEL and wraps it character by character -- measured: a 30px header
+     became 58px. Only the preview may shrink, and it clips instead of wrapping. */
+  white-space: nowrap;
 }
 .turn-panel-head:hover { color: var(--text-primary); }
 .turn-panel-caret { width: 10px; display: inline-block; color: var(--text-muted); }
+.turn-panel-label { flex: 0 0 auto; }
 .turn-panel-count {
   font-variant-numeric: tabular-nums;
   color: var(--text-muted);
@@ -2971,6 +3155,116 @@ button, input, select, textarea {
   color: var(--text-muted);
   font-size: 13px;
 }
+
+/*
+  ── 每一格自己的搜索条（Cmd+F）─────────────────────────────────────────────────
+  「哪个分屏的搜索应该显示在那个分屏中」。所以它 `position: absolute` 落在 `.chat-main` 里,
+  不再是上一版那条 `position: fixed` 的窗口级搜索条。
+
+  上一版两个毛病都出在 fixed 上,而且是实测出来的:
+    ① 它属于窗口,分屏时说不清在搜哪一格（底下的 `findInPage` 也确实在搜全部);
+    ② `elementsFromPoint` 打在它正中间,栈自上而下是
+       chat-messages → chat-main → chat-pane → chat-row → chat-grid(z=1001) → find-bar(z=60)
+       —— 画出来了、可见、位置也对,但整个聊天网格盖在它上面,点它落到 `.chat-messages` 上,
+       输入框拿不到焦点,于是「搜索无法运行」。
+  长在格子里两件事都不存在:它跟着格子走,z-index 只要压住格子内部的东西（分割手柄是 4)。
+*/
+.pane-find {
+  position: absolute;
+  top: 8px;
+  right: 12px;
+  z-index: 20;
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  padding: 5px 7px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, .45);
+}
+.pane-find-input {
+  width: 170px;
+  font: inherit;
+  font-size: 12px;
+  padding: 3px 6px;
+  border: 1px solid var(--border);
+  border-radius: 5px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+}
+.pane-find-input:focus { outline: none; border-color: var(--accent); }
+/* 定宽 + 右对齐：计数从 1/9 变成 10/99 时按钮不许跟着左右跳。 */
+.pane-find-count {
+  min-width: 46px;
+  text-align: right;
+  font-size: 10px;
+  color: var(--text-tertiary);
+  font-variant-numeric: tabular-nums;
+}
+.pane-find-btn {
+  flex: none;
+  font: inherit;
+  font-size: 11px;
+  line-height: 1;
+  padding: 3px 5px;
+  border: 1px solid transparent;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-secondary);
+  cursor: pointer;
+}
+.pane-find-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+/*
+  命中的高亮。用 CSS Custom Highlight API —— 名字必须在这里写死（`::highlight()` 不接受变量）,
+  所以只有两层:全部命中 + 当前那一个。按格子分开是用 `Range` 归属做到的,见 `findHighlight.ts`。
+
+  只设 background/color:`::highlight()` 能改的属性本来就很少（不含 border、padding、box-shadow),
+  写了也不生效,写上去只会让人以为可以那样调。
+*/
+::highlight(kirolex-find) {
+  background-color: rgba(214, 158, 46, .32);
+  color: inherit;
+}
+::highlight(kirolex-find-active) {
+  background-color: #d69e2e;
+  color: #1a1a1a;
+}
+
+/* 记忆过大的横幅，三层各一条，挂在聊天区**最上面**。一条细的、不抢戏但看得见的线：它会常驻到
+   你真的去清理为止，所以不能做成刺眼的告警条。`flex: none` 是必须的 —— 聊天区是 flex 列，
+   不写的话它会跟着被压缩/拉伸，并且吃掉消息列表的滚动高度。 */
+.memory-warn-bar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin: 6px 8px 0;
+  padding: 5px 9px;
+  border: 1px solid rgba(214, 158, 46, .38);
+  border-radius: 6px;
+  background: rgba(214, 158, 46, .09);
+  font-size: 11px;
+  color: var(--text-secondary);
+}
+/* 文案先被压缩，按钮永不被挤出去 —— min-width:0 才允许它省略号收缩（同 .composer-shortcut）。 */
+.memory-warn-text { flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.memory-warn-btn {
+  flex: none;
+  font: inherit;
+  font-size: 10px;
+  padding: 2px 8px;
+  border-radius: 4px;
+  border: 1px solid rgba(214, 158, 46, .5);
+  background: rgba(214, 158, 46, .16);
+  color: var(--text-primary);
+  cursor: pointer;
+}
+.memory-warn-btn:hover:not(:disabled) { background: rgba(214, 158, 46, .28); }
+.memory-warn-btn:disabled { opacity: .5; cursor: default; }
+.memory-warn-btn.ghost { background: transparent; border-color: var(--border); color: var(--text-muted); }
+.memory-warn-btn.ghost:hover { color: var(--text-secondary); }
 .archived-unarchive-btn {
   background: var(--accent);
   color: #fff;
@@ -3266,12 +3560,21 @@ button, input, select, textarea {
 }
 
 .composer-shortcut {
+  /* A nowrap span's min-content IS the whole line, so without min-width:0 it refuses
+     to shrink and pushes the send button out instead of ellipsizing. Same treatment
+     as .composer-tool-status above. */
+  min-width: 0;
+  flex: 0 1 auto;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
   color: var(--text-muted);
   font-size: 10px;
 }
+
+/* Narrow panes get the short form instead of the full line -- see the container
+   queries below and the two spans in ChatArea's composer toolbar. */
+.composer-shortcut-short { display: none; }
 
 .composer-send {
   width: 32px;
@@ -3385,7 +3688,6 @@ button, input, select, textarea {
   .prompt-suggestions,
   .composer-belowbar,
   .archived-composer-banner { width: 100%; }
-  .composer-shortcut,
   .composer-credits { display: none; }
   .composer-model-select { max-width: 132px; }
 }
@@ -3395,6 +3697,14 @@ button, input, select, textarea {
   .composer-agent-select { max-width: 112px; }
   .composer-model-select { max-width: 116px; }
   .composer-tool-status { max-width: 130px; }
+  /* Swap the hint for its short form rather than hiding or ellipsizing it. 900px was
+     inherited from the window-width @media rule, but a SPLIT PANE is routinely
+     400-700px (1200px window - 240px sidebar, halved = ~476px), so every pane lost
+     the hint -- including the `MOD+Enter queue` half, the one shortcut here that
+     nothing else in the UI teaches. Ellipsis is no good either: it clips the tail,
+     which is exactly that half. */
+  .composer-shortcut-full { display: none; }
+  .composer-shortcut-short { display: inline; }
 }
 
 @container pane (max-width: 560px) {
@@ -3403,6 +3713,12 @@ button, input, select, textarea {
   .composer-usage-label { display: none; }     /* keep the context bar itself */
   .composer-tool-status { max-width: 96px; }
   .composer-belowbar { gap: 6px; }
+}
+
+/* Below this even the short form crowds the buttons it sits next to, so it goes. A
+   2x2 split only reaches here on a small window. */
+@container pane (max-width: 380px) {
+  .composer-shortcut { display: none; }
 }
 
 .composer-belowbar-left,
@@ -3657,7 +3973,9 @@ button, input, select, textarea {
   .prompt-suggestions,
   .composer-belowbar,
   .archived-composer-banner { width: 100%; }
-  .composer-shortcut,
+  /* .composer-shortcut is deliberately NOT hidden here: a <900px window means the
+     pane is also <900px, so the container queries above already picked the short
+     form. Hiding it by window width on top of that just brought the bug back. */
   .composer-credits { display: none; }
   .composer-model-select { max-width: 128px; }
 }
@@ -4238,6 +4556,24 @@ button, input, select, textarea {
   font-size: 11px;
 }
 
+/* 文件浏览界面的筛选框 —— 「浏览文件的界面也要单独有搜索功能」。
+   它不浮动、就占一行:这里过滤的是**列出什么**（会改变下面的列表长度),不像聊天里那条搜索条
+   是临时叠在内容上找词。一个会改变列表的控件浮在列表上面会遮住它刚筛出来的东西。 */
+.ws-search { display: flex; align-items: center; gap: 4px; padding: 6px 10px 4px; }
+.ws-search-input {
+  flex: 1; min-width: 0; font: inherit; font-size: 11px; padding: 4px 8px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-primary); color: var(--text-primary);
+}
+.ws-search-input:focus { outline: none; border-color: var(--accent); }
+.ws-search-x {
+  background: none; border: none; color: var(--text-muted);
+  cursor: pointer; font-size: 11px; padding: 0 2px;
+}
+.ws-search-x:hover { color: var(--text-primary); }
+/* 「筛出几个 / 共几个」。查了没命中时这一行是唯一的说明,所以它不能省。 */
+.ws-search-note { padding: 0 10px 4px; font-size: 9px; color: var(--text-tertiary); }
+
 .workspace-path-text {
   flex: 1;
   overflow: hidden;
@@ -4485,7 +4821,7 @@ button, input, select, textarea {
   top: 50%;
   left: 50%;
   transform: translate(-50%, -50%);
-  width: min(480px, 90vw);
+  width: min(560px, 92vw);
   padding: 22px;
   z-index: 2000;
   background: var(--bg-secondary);
@@ -4518,7 +4854,7 @@ button, input, select, textarea {
   display: flex;
   flex-direction: column;
   gap: 7px;
-  margin-bottom: 20px;
+  margin-bottom: 14px;
   color: var(--text-secondary);
   font-size: 13px;
 }
@@ -4536,6 +4872,71 @@ button, input, select, textarea {
 .loop-dialog-field input:focus {
   border-color: var(--accent);
   box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+/* Four fields now fit in here, so the dialog is wider and the vertical rhythm is
+   tighter than the single-input version it grew out of. */
+.loop-dialog-row {
+  display: flex;
+  gap: 12px;
+}
+
+.loop-dialog-row .loop-dialog-field { flex: 1 1 0; min-width: 0; }
+
+/* States the verification level BEFORE the loop is started: at L0 nothing can judge
+   whether the goal was met, and that has to be visible rather than inferable. */
+.loop-dialog-level {
+  margin-bottom: 14px;
+  padding: 8px 10px;
+  border-radius: 6px;
+  color: var(--text-secondary);
+  background: var(--bg-tertiary);
+  font-size: 12px;
+  line-height: 1.5;
+}
+
+.loop-dialog-level.level-0 {
+  color: #d8a657;
+  background: rgba(216, 166, 87, 0.10);
+}
+
+.loop-dialog-problems {
+  margin-bottom: 12px;
+  color: #e06c75;
+  font-size: 12px;
+}
+
+/* Same look as the inputs it sits between: the level is one field among the others,
+   not a mode switch. */
+.loop-dialog-select {
+  padding: 8px 10px;
+  color: var(--text-primary);
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  outline: none;
+  font: inherit;
+  font-size: 13px;
+}
+
+.loop-dialog-select:focus {
+  border-color: var(--accent);
+  box-shadow: 0 0 0 3px var(--accent-soft);
+}
+
+.loop-dialog-select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.loop-dialog-field input:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.loop-dialog-start:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
 }
 
 .loop-dialog-actions {
@@ -4748,5 +5149,2346 @@ button, input, select, textarea {
   font-size: 12px;
   color: var(--text-secondary, #a8b3c4);
   overflow-wrap: anywhere;
-  white-space: pre-wrap;
+  /* First line only by default (the component passes just that line), so a long or
+     multi-line command cannot make the panel taller than the answer it belongs to.
+     `.full` is the expanded form and keeps every line and its indentation. */
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  /* Takes the rest of the row and clips THERE, rather than widening the row: without
+     both of these a flex item never ellipsizes, it just pushes its siblings out. */
+  flex: 1 1 auto;
+  min-width: 0;
 }
+
+.commands-item-title.full {
+  white-space: pre-wrap;
+  overflow: visible;
+  text-overflow: clip;
+}
+
+/* The one line shown while the panel is collapsed. Sits in the header row, so it must
+   shrink rather than push the count out of view. */
+.commands-preview {
+  font-family: var(--mono-font, ui-monospace, SFMono-Regular, Menlo, monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  min-width: 0;
+  flex: 1 1 auto;
+  text-align: left;
+}
+
+.commands-more {
+  flex: 0 0 auto;
+  padding: 0 5px;
+  font-size: 10px;
+  line-height: 16px;
+  color: var(--text-muted);
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  cursor: pointer;
+}
+.commands-more:hover { color: var(--text-primary); border-color: var(--accent); }
+/* The skill panel's own frame.
+   It used to share a selector list with the run-timeline dialog, and when that dialog was taken
+   out of this branch the shared block went with it — including this panel's z-index, so it
+   rendered BEHIND .overlay (1999) and every click closed it. Its stacking is stated here alone
+   for that reason; tests/dialogStacking.test.ts pins it. */
+.skill-dialog {
+  position: fixed;
+  top: 50%;
+  left: 50%;
+  transform: translate(-50%, -50%);
+  z-index: 2000;
+  width: min(880px, 94vw);
+  max-height: 84vh;
+  display: flex;
+  flex-direction: column;
+  gap: 12px;
+  padding: 18px;
+  background: var(--bg-secondary);
+  border: 1px solid var(--border);
+  border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0, 0, 0, 0.5);
+}
+.skill-dialog-head { display: flex; align-items: baseline; gap: 12px; }
+.skill-dialog-title { font-size: 14px; font-weight: 600; }
+.skill-dialog-sub { flex: 1; min-width: 0; font-size: 12px; color: var(--text-secondary); overflow-wrap: anywhere; }
+.skill-dialog-close {
+  background: none; border: none; color: var(--text-secondary);
+  cursor: pointer; font-size: 14px; padding: 2px 6px; border-radius: 4px;
+}
+.skill-dialog-close:hover { background: var(--bg-hover); color: var(--text-primary); }
+
+.skill-dialog-bar { display: flex; gap: 8px; }
+.skill-dialog-path {
+  flex: 1; min-width: 0; padding: 6px 10px; font-size: 12px;
+  font-family: var(--mono-font); color: var(--text-primary);
+  background: var(--bg-primary); border: 1px solid var(--border); border-radius: 6px;
+}
+.skill-dialog-bar button {
+  padding: 6px 12px; font-size: 12px; cursor: pointer;
+  color: var(--text-primary); background: var(--bg-tertiary);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.skill-dialog-bar button:hover:not(:disabled) { background: var(--bg-hover); }
+.skill-dialog-bar button:disabled { opacity: 0.5; cursor: default; }
+
+.skill-dialog-errors {
+  padding: 10px 12px; font-size: 12px; border-radius: 8px;
+  color: #ffb4a2; background: color-mix(in srgb, #f85149 12%, transparent);
+  border: 1px solid color-mix(in srgb, #f85149 40%, transparent);
+}
+.skill-dialog-errors-head { font-weight: 600; margin-bottom: 6px; }
+.skill-dialog-error { margin-top: 3px; overflow-wrap: anywhere; }
+.skill-dialog-error code { font-family: var(--mono-font); opacity: 0.85; }
+
+.skill-dialog-body { flex: 1; min-height: 0; display: flex; gap: 14px; }
+.skill-graph {
+  flex: 1; min-width: 0; overflow: auto; display: flex; gap: 10px;
+  padding: 12px; background: var(--bg-primary);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.skill-graph-empty {
+  margin: auto; text-align: center; font-size: 12px; line-height: 1.9;
+  color: var(--text-secondary);
+}
+.skill-graph-empty code { font-family: var(--mono-font); font-size: 11px; }
+
+/* One column per dependency depth. */
+.skill-lane { display: flex; flex-direction: column; gap: 8px; min-width: 210px; }
+.skill-lane-label {
+  font-size: 10px; text-transform: uppercase; letter-spacing: 0.06em;
+  color: var(--text-muted); padding-left: 2px;
+}
+.skill-node-wrap { display: flex; flex-direction: column; gap: 6px; }
+.skill-node {
+  display: flex; flex-direction: column; gap: 6px; align-items: stretch;
+  text-align: left; padding: 9px 10px; cursor: pointer;
+  color: var(--text-primary); background: var(--bg-secondary);
+  border: 1px solid var(--border); border-left-width: 3px; border-radius: 7px;
+}
+.skill-node:hover { background: var(--bg-hover); }
+.skill-node.selected { border-color: #7c6cff; box-shadow: 0 0 0 1px #7c6cff inset; }
+.skill-node.nested { margin-left: 14px; background: var(--bg-tertiary); }
+.skill-node-head { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.skill-node-icon { font-size: 11px; color: var(--text-secondary); flex: none; }
+.skill-node-title { font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
+.skill-node-badges { display: flex; flex-wrap: wrap; gap: 4px; }
+.skill-badge {
+  font-size: 10px; padding: 1px 6px; border-radius: 4px;
+  background: var(--bg-tertiary); color: var(--text-secondary);
+  overflow-wrap: anywhere;
+}
+.skill-badge.verify { color: #7ee787; background: color-mix(in srgb, #7ee787 14%, transparent); }
+/* "No out-of-band check" has to be VISIBLE: on a diagram, silence reads as checked. */
+.skill-badge.unverified { color: #f0b72f; background: color-mix(in srgb, #f0b72f 14%, transparent); }
+.skill-badge.write { color: #ff9492; background: color-mix(in srgb, #f85149 14%, transparent); }
+.skill-badge.fan { color: #6cb6ff; background: color-mix(in srgb, #6cb6ff 14%, transparent); }
+.skill-badge.produces { color: #c58af9; background: color-mix(in srgb, #c58af9 12%, transparent); }
+.skill-node-status { font-size: 10px; color: var(--text-muted); }
+
+/* Kind = the left accent; status = the status line's colour. Two different questions,
+   so they must not share one channel. */
+.skill-node.kind-approval { border-left-color: #f0b72f; }
+.skill-node.kind-forEach { border-left-color: #6cb6ff; }
+.skill-node.kind-prompt { border-left-color: var(--border); }
+.skill-node-status.status-done { color: #7ee787; }
+.skill-node-status.status-failed,
+.skill-node-status.status-rejected { color: #ff9492; }
+.skill-node-status.status-running,
+.skill-node-status.status-verifying { color: #6cb6ff; }
+.skill-node-status.status-awaiting-approval { color: #f0b72f; font-weight: 600; }
+.skill-node.status-awaiting-approval {
+  border-color: #f0b72f;
+  background: color-mix(in srgb, #f0b72f 10%, transparent);
+}
+.skill-node.status-done { border-color: color-mix(in srgb, #7ee787 40%, var(--border)); }
+.skill-node.status-failed { border-color: color-mix(in srgb, #f85149 45%, var(--border)); }
+
+.skill-side {
+  width: 320px; flex: none; overflow-y: auto;
+  display: flex; flex-direction: column; gap: 10px;
+}
+.skill-side-section {
+  padding: 10px 12px; background: var(--bg-primary);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+.skill-side-head { font-size: 11px; font-weight: 600; color: var(--text-secondary); margin-bottom: 8px; }
+.skill-side-empty { font-size: 11px; color: var(--text-muted); }
+.skill-run {
+  display: flex; flex-direction: column; gap: 2px; width: 100%;
+  text-align: left; padding: 7px 8px; margin-bottom: 4px; cursor: pointer;
+  color: var(--text-primary); background: var(--bg-secondary);
+  border: 1px solid var(--border); border-radius: 6px;
+}
+.skill-run:hover { background: var(--bg-hover); }
+.skill-run.selected { border-color: #7c6cff; }
+.skill-run.waiting { border-color: #f0b72f; }
+.skill-run-name { font-size: 12px; }
+.skill-run-summary { font-size: 10px; color: var(--text-muted); overflow-wrap: anywhere; }
+
+.skill-gate {
+  border-color: color-mix(in srgb, #f0b72f 50%, var(--border));
+  background: color-mix(in srgb, #f0b72f 8%, transparent);
+}
+.skill-gate-question {
+  font-size: 12px; line-height: 1.6; white-space: pre-wrap;
+  max-height: 180px; overflow-y: auto; overflow-wrap: anywhere;
+}
+.skill-gate-actions { display: flex; gap: 8px; margin-top: 10px; }
+.skill-gate-actions button {
+  flex: 1; padding: 7px 10px; font-size: 12px; cursor: pointer;
+  border-radius: 6px; border: 1px solid var(--border);
+}
+.skill-gate-approve { color: #fff; background: #2ea043; border-color: #2ea043 !important; }
+.skill-gate-approve:hover:not(:disabled) { background: #3fb950; }
+.skill-gate-reject { color: var(--text-primary); background: var(--bg-tertiary); }
+.skill-gate-reject:hover:not(:disabled) { background: var(--bg-hover); }
+.skill-gate-actions button:disabled { opacity: 0.5; cursor: default; }
+.skill-gate-hint { margin-top: 8px; font-size: 10px; line-height: 1.6; color: var(--text-secondary); }
+
+.skill-detail { display: grid; grid-template-columns: auto 1fr; gap: 4px 10px; margin: 0; font-size: 11px; }
+.skill-detail dt { color: var(--text-muted); }
+.skill-detail dd { margin: 0; overflow-wrap: anywhere; }
+.skill-detail dd code { font-family: var(--mono-font); font-size: 10px; }
+.skill-detail-warn { color: #f0b72f; }
+.skill-detail-error {
+  margin-top: 8px; padding: 8px; font-size: 11px; line-height: 1.6; border-radius: 6px;
+  color: #ffb4a2; background: color-mix(in srgb, #f85149 10%, transparent);
+  overflow-wrap: anywhere;
+}
+.skill-side-note { font-size: 11px; color: var(--text-secondary); padding: 0 2px; }
+.skill-dialog-foot { font-size: 10px; color: var(--text-muted); line-height: 1.6; }
+
+/* Skill panel: left = installed skills, right = the selected skill's rules/tables/source. */
+.skill-side-left { width: 260px; }
+.skill-main {
+  flex: 1; min-width: 0; overflow-y: auto; display: flex; flex-direction: column; gap: 10px;
+  padding: 12px; background: var(--bg-primary);
+  border: 1px solid var(--border); border-radius: 8px;
+}
+/* The trigger is the entire interface between a skill and the model, and is otherwise
+   invisible — so it gets its own block rather than a line in a details list. */
+.skill-trigger {
+  padding: 9px 11px; border-radius: 7px;
+  background: color-mix(in srgb, #6cb6ff 8%, transparent);
+  border: 1px solid color-mix(in srgb, #6cb6ff 35%, var(--border));
+}
+.skill-trigger-label { font-size: 10px; color: var(--text-muted); margin-bottom: 4px; }
+.skill-trigger-text { font-size: 12px; line-height: 1.6; overflow-wrap: anywhere; }
+
+.skill-tabs { display: flex; align-items: center; gap: 6px; }
+.skill-tabs-spacer { flex: 1; }
+.skill-tab {
+  padding: 4px 10px; font-size: 11px; cursor: pointer; border-radius: 6px;
+  color: var(--text-secondary); background: var(--bg-tertiary); border: 1px solid var(--border);
+}
+.skill-tab:hover { background: var(--bg-hover); }
+.skill-tab.active { color: var(--text-primary); border-color: #7c6cff; }
+.skill-badge.pause { color: #f0b72f; background: color-mix(in srgb, #f0b72f 14%, transparent); }
+
+.skill-rules { display: flex; flex-direction: column; gap: 6px; }
+.skill-rule {
+  display: flex; gap: 9px; padding: 8px 10px; border-radius: 7px;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-left-width: 3px;
+}
+.skill-rule.interactive { border-left-color: #f0b72f; }
+.skill-rule.writes { border-left-color: #f85149; }
+.skill-rule:not(.interactive):not(.writes) { border-left-color: var(--border); }
+.skill-rule-num {
+  flex: none; width: 22px; height: 22px; display: flex; align-items: center; justify-content: center;
+  font-size: 11px; font-variant-numeric: tabular-nums; border-radius: 5px;
+  color: var(--text-secondary); background: var(--bg-tertiary);
+}
+.skill-rule-main { min-width: 0; }
+.skill-rule-label { font-size: 12px; font-weight: 600; display: flex; align-items: center; gap: 6px; flex-wrap: wrap; }
+.skill-rule-text { margin-top: 3px; font-size: 11px; line-height: 1.65; color: var(--text-secondary); overflow-wrap: anywhere; }
+.skill-rules-note {
+  margin-top: 4px; padding: 8px 10px; font-size: 10px; line-height: 1.6; border-radius: 6px;
+  color: #f0b72f; background: color-mix(in srgb, #f0b72f 9%, transparent);
+}
+
+.skill-tables { display: flex; flex-direction: column; gap: 12px; }
+.skill-table-caption { font-size: 11px; color: var(--text-secondary); margin-bottom: 4px; }
+.skill-table-scroll { max-width: 100%; overflow-x: auto; }
+.skill-table-scroll table { border-collapse: collapse; font-size: 11px; }
+.skill-table-scroll th, .skill-table-scroll td {
+  border: 1px solid var(--border); padding: 5px 9px; text-align: left; white-space: nowrap;
+}
+.skill-table-scroll th { background: var(--bg-tertiary); font-weight: 600; }
+
+.skill-source-path { font-size: 10px; color: var(--text-muted); margin-bottom: 6px; }
+.skill-source pre {
+  margin: 0; padding: 11px; font-size: 11px; line-height: 1.6;
+  font-family: var(--mono-font); white-space: pre-wrap; overflow-wrap: anywhere;
+  background: #0d1117; border: 1px solid var(--border); border-radius: 7px;
+}
+.skill-provenance { background: var(--bg-primary); }
+.skill-provenance-body { font-size: 10px; line-height: 1.7; color: var(--text-secondary); }
+
+/* ─────────────────────── FLOW RAIL (project skill 流程) ───────────────────────
+   The subject of this surface is WHO IS WAITING FOR WHOM, so the gates are the loud
+   element and the segments are quiet. An unanswered gate is a thick accented seam
+   carrying its wait time; an answered one collapses to a hairline. Evidence strength
+   is drawn in the LINE (solid = we can check it, dashed = an external system merely
+   said OK) and never in colour — green for "SFDC returned success" would claim proof
+   this app does not have.
+   Absolutely positioned inside .chat-main (already position:relative) so the pane's
+   own column layout — and the composer in particular — is untouched. */
+.flow-rail {
+  position: absolute;
+  top: 0;
+  right: 0;
+  bottom: 0;
+  width: 300px;
+  z-index: 5;                      /* above the transcript, below every dialog */
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  padding: 10px 12px 16px;
+  overflow-y: auto;
+  background: var(--bg-secondary);
+  border-left: 1px solid var(--border);
+  font-size: 12px;
+  font-variant-numeric: tabular-nums;   /* counters and waits must not shift the layout */
+}
+/* The transcript keeps its full width when the rail is closed; when open it yields. */
+.chat-main.flow-rail-open .chat-messages { padding-right: 312px; }
+
+.flow-rail-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 6px; }
+.flow-rail-title { font-size: 13px; font-weight: 600; }
+.flow-rail-flow { font-size: 11px; color: var(--text-muted); }
+.flow-rail-fp { font-size: 10px; color: var(--text-muted); letter-spacing: 0.04em; }
+.flow-rail-close {
+  margin-left: auto; background: none; border: none; cursor: pointer;
+  color: var(--text-muted); font-size: 12px; padding: 2px 4px;
+}
+.flow-rail-close:hover { color: var(--text-primary); }
+.flow-rail-mock {
+  align-self: flex-start; margin-bottom: 8px; padding: 2px 7px;
+  font-size: 10px; border-radius: 999px; cursor: pointer;
+  background: rgba(124, 111, 224, 0.12); color: var(--accent);
+  border: 1px dashed rgba(124, 111, 224, 0.4);
+}
+.flow-rail-empty { color: var(--text-muted); line-height: 1.7; padding: 10px 2px; }
+.flow-rail-list { list-style: none; margin: 0; padding: 0; }
+
+/* ── segments ── */
+.flow-seg { padding: 7px 0 7px 10px; border-left: 2px solid var(--border); }
+.flow-seg.done { border-left-color: rgba(124, 111, 224, 0.35); }
+.flow-seg.active { border-left-color: var(--accent); }
+/* A step the run has not reached is NOT a checkbox: with the model in control it is not a
+   promise, so it is drawn as absence rather than as a to-do. */
+.flow-seg.pending { opacity: 0.45; }
+.flow-seg-head { display: flex; align-items: baseline; gap: 8px; }
+.flow-seg-name { font-weight: 500; }
+.flow-seg.active .flow-seg-name { color: var(--accent); }
+.flow-seg-rules { margin-left: auto; font-size: 10px; color: var(--text-muted); letter-spacing: 0.03em; }
+.flow-seg-loop { display: flex; align-items: center; gap: 7px; margin-top: 5px; }
+.flow-dots { display: inline-flex; gap: 3px; }
+.flow-dots i { width: 5px; height: 5px; border-radius: 50%; background: var(--border); }
+.flow-dots i.on { background: var(--accent); }
+.flow-seg-count { font-size: 10px; color: var(--text-muted); }
+.flow-evidence { display: flex; align-items: center; gap: 6px; margin-top: 5px; font-size: 10px; color: var(--text-muted); }
+.flow-evidence i { width: 16px; height: 0; flex: none; }
+.flow-evidence.verified i { border-top: 1px solid var(--text-muted); }
+.flow-evidence.claimed i { border-top: 1px dashed var(--text-muted); }
+
+/* ── gates: the seam ── */
+.flow-seam { list-style: none; margin: 6px 0; }
+.flow-seam.answered {
+  display: flex; align-items: center; gap: 8px;
+  padding-top: 6px; border-top: 1px solid var(--border);   /* settled = hairline */
+  font-size: 11px; color: var(--text-muted);
+}
+.flow-seam.answered .flow-seam-when { margin-left: auto; }
+.flow-seam.pending { padding: 6px 0 0; border-top: 1px dashed var(--border); font-size: 11px; color: var(--text-muted); opacity: 0.5; }
+
+/* Unanswered: the one element allowed to be loud. */
+.flow-seam.waiting { margin: 10px 0; }
+.flow-seam-bar {
+  display: flex; align-items: center; gap: 8px;
+  padding: 6px 9px; border-radius: 6px 6px 0 0;
+  background: rgba(124, 111, 224, 0.18);
+  border: 1px solid rgba(124, 111, 224, 0.45);
+  border-bottom: none;
+  color: var(--accent); font-weight: 600;
+  animation: flow-seam-settle 200ms ease-out;
+}
+.flow-seam-wait { margin-left: auto; font-weight: 500; }
+@keyframes flow-seam-settle { from { transform: translateY(-3px); opacity: 0; } to { transform: none; opacity: 1; } }
+@media (prefers-reduced-motion: reduce) { .flow-seam-bar { animation: none; } }
+
+.flow-seam-card {
+  padding: 9px; border-radius: 0 0 6px 6px;
+  background: var(--bg-primary);
+  border: 1px solid rgba(124, 111, 224, 0.45);
+  border-top: none;
+}
+.flow-seam-ask { line-height: 1.6; margin-bottom: 7px; }
+.flow-seam-quote {
+  display: block; margin-bottom: 9px; padding: 0;
+  background: none; border: none; cursor: pointer;
+  color: var(--accent); font-size: 11px; text-align: left;
+}
+.flow-seam-actions { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.flow-seam-ok, .flow-seam-no {
+  padding: 3px 11px; border-radius: 6px; cursor: pointer; font-size: 11px;
+  border: 1px solid var(--border); background: transparent; color: inherit;
+}
+.flow-seam-ok { border-color: rgba(124, 111, 224, 0.55); color: var(--accent); }
+.flow-seam-ok:hover { background: rgba(124, 111, 224, 0.14); }
+.flow-seam-no:hover { background: rgba(239, 83, 80, 0.12); color: var(--error); border-color: rgba(239, 83, 80, 0.4); }
+.flow-seam-or { font-size: 10px; color: var(--text-muted); }
+
+/* ─────────────────── PROJECT WORKSPACE（流程即输入界面）───────────────────
+   The flow takes the window and the current step takes most of it: 12 events × 3
+   questions is a table, and choosing a row is a click. The transcript is a drawer,
+   not the default entry point. Reuses the app's own tokens throughout. */
+.pw-shell {
+  /* EMBEDDED, not an overlay: it takes the main area and leaves the sidebar alone, so
+     switching projects/chats keeps working. A surface that covers the app is a different app. */
+  flex: 1; min-width: 0; min-height: 0;
+  display: flex; flex-direction: column;
+  background: var(--bg-primary); color: var(--text-primary);
+  font-size: 13px; font-variant-numeric: tabular-nums;
+}
+/* 上：图或子任务详情。下：真实对话。 */
+.pw-upper { flex: 1 1 60%; min-height: 0; overflow-y: auto; padding: 16px 22px 24px; }
+.pw-lower {
+  flex: 0 0 40%; min-height: 220px; display: flex; min-width: 0;
+  border-top: 1px solid var(--border);
+}
+.pw-crumb { background: none; border: none; color: var(--accent); cursor: pointer; font: inherit; font-weight: 600; padding: 0; }
+.pw-crumb:disabled { color: var(--text-primary); cursor: default; }
+.pw-crumb-sep { color: var(--text-muted); }
+.pw-crumb-here { font-weight: 600; }
+.pw-not-now { font-size: 11px; color: var(--warning); }
+.pw-hint { font-size: 11px; color: var(--text-muted); }
+
+/* ── 总流程图：一行 = 可以同时进行 ── */
+.pw-map { display: flex; flex-direction: column; gap: 10px; }
+.pw-map-row { display: flex; align-items: stretch; gap: 10px; }
+.pw-map-row.parallel { padding-left: 4px; border-left: 2px solid rgba(124, 111, 224, 0.35); }
+.pw-map-tag { flex: none; align-self: center; font-size: 10px; color: var(--accent); width: 52px; }
+.pw-card {
+  flex: 1 1 0; min-width: 0; text-align: left; cursor: pointer;
+  display: flex; flex-direction: column; gap: 4px;
+  padding: 11px 13px; border-radius: 9px; font: inherit; color: inherit;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+}
+.pw-card:hover { border-color: rgba(124, 111, 224, 0.45); }
+.pw-card.done, .pw-card.answered { opacity: 0.62; }
+.pw-card.pending { opacity: 0.45; border-style: dashed; }
+.pw-card.now { border-color: var(--accent); background: rgba(124, 111, 224, 0.10); }
+.pw-card.gate { flex-basis: 100%; background: rgba(124, 111, 224, 0.06); }
+.pw-card.gate.waiting { background: rgba(124, 111, 224, 0.18); border-color: var(--accent); }
+.pw-card-name { font-weight: 600; }
+.pw-card-meta { display: flex; gap: 10px; font-size: 10px; color: var(--text-muted); flex-wrap: wrap; }
+.pw-card-wait { color: var(--accent); font-weight: 600; }
+.pw-card-inner { font-size: 10px; color: var(--accent); }
+.pw-card-evi { font-size: 10px; color: var(--text-muted); }
+.pw-detail { }
+.pw-head {
+  display: flex; align-items: baseline; gap: 10px;
+  padding: 12px 16px; border-bottom: 1px solid var(--border);
+}
+.pw-project { font-size: 15px; font-weight: 600; }
+.pw-flow { color: var(--text-secondary); }
+.pw-fp { font-size: 10px; color: var(--text-muted); letter-spacing: 0.04em; }
+.pw-mock {
+  font-size: 10px; padding: 1px 7px; border-radius: 999px;
+  color: var(--accent); background: rgba(124, 111, 224, 0.12);
+  border: 1px dashed rgba(124, 111, 224, 0.4);
+}
+.pw-close { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 14px; }
+.pw-close:hover { color: var(--text-primary); }
+
+.pw-body { flex: 1; min-height: 0; display: flex; }
+
+/* ── the spine: orientation + jumping, not the work itself ── */
+.pw-spine {
+  width: 230px; flex: none; padding: 14px 12px; overflow-y: auto;
+  border-right: 1px solid var(--border); background: var(--bg-secondary);
+  display: flex; flex-direction: column; gap: 2px;
+}
+.pw-node {
+  width: 100%; text-align: left; background: none; border: none; color: inherit;
+  font: inherit; cursor: pointer;
+  display: flex; align-items: baseline; gap: 7px;
+  padding: 7px 9px; border-radius: 6px; border-left: 2px solid transparent;
+}
+.pw-node.segment.done, .pw-node.gate.answered { color: var(--text-muted); border-left-color: rgba(124, 111, 224, 0.3); }
+.pw-node.segment.active { background: rgba(124, 111, 224, 0.12); border-left-color: var(--accent); color: var(--accent); font-weight: 600; }
+.pw-node.gate.waiting { background: rgba(124, 111, 224, 0.18); border-left-color: var(--accent); color: var(--accent); font-weight: 600; }
+.pw-node.pending { opacity: 0.45; }
+.pw-node-name { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pw-node-count, .pw-node-wait { font-size: 10px; }
+.pw-node-wait { color: var(--accent); }
+.pw-node-ok { font-size: 10px; color: var(--text-muted); }
+.pw-drawers { margin-top: auto; padding-top: 12px; display: flex; gap: 8px; }
+.pw-drawers button {
+  padding: 3px 9px; font-size: 11px; border-radius: 6px; cursor: pointer;
+  background: transparent; border: 1px solid var(--border); color: var(--text-secondary);
+}
+.pw-drawers button.on { border-color: var(--accent); color: var(--accent); }
+
+/* ── the work area ── */
+.pw-work { flex: 1; min-width: 0; overflow-y: auto; padding: 20px 26px 40px; }
+.pw-work-head { display: flex; align-items: baseline; gap: 12px; margin-bottom: 14px; }
+.pw-work-head h2 { font-size: 16px; font-weight: 600; margin: 0; }
+.pw-progress { font-size: 11px; color: var(--text-muted); }
+.pw-idle { color: var(--text-muted); padding: 30px 0; }
+
+.pw-event {
+  display: flex; align-items: baseline; gap: 12px; flex-wrap: wrap;
+  padding: 10px 12px; margin-bottom: 16px; border-radius: 8px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+}
+.pw-event-title { font-weight: 600; }
+.pw-event-when, .pw-event-account { font-size: 11px; color: var(--text-muted); }
+
+.pw-section-label { font-size: 11px; color: var(--text-muted); margin-bottom: 6px; }
+.pw-choices { list-style: none; margin: 0 0 16px; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.pw-choice {
+  display: flex; align-items: baseline; gap: 9px; cursor: pointer;
+  padding: 7px 10px; border-radius: 6px; border: 1px solid transparent;
+}
+.pw-choice:hover { background: var(--bg-hover); }
+.pw-choice.sel { border-color: rgba(124, 111, 224, 0.5); background: rgba(124, 111, 224, 0.10); }
+.pw-choice-name { flex: 1; min-width: 0; }
+/* R17's annotation is never decoration: it is the thing that prevents double-logging. */
+.pw-choice-note { font-size: 11px; color: var(--text-muted); }
+.pw-tag { font-size: 10px; padding: 1px 6px; border-radius: 999px; }
+.pw-tag.g1 { color: var(--accent); background: rgba(124, 111, 224, 0.14); }
+.pw-tag.rec { color: var(--warning); background: rgba(255, 152, 0, 0.14); }
+
+.pw-fields { display: flex; gap: 16px; margin-bottom: 18px; }
+.pw-fields label { display: flex; align-items: center; gap: 8px; font-size: 12px; color: var(--text-secondary); }
+.pw-fields select { padding: 4px 8px; border-radius: 6px; background: var(--bg-secondary); color: inherit; border: 1px solid var(--border); }
+
+.pw-actions { display: flex; align-items: center; gap: 10px; margin-bottom: 22px; }
+.pw-primary {
+  padding: 6px 16px; border-radius: 7px; cursor: pointer; font-weight: 600;
+  background: var(--accent); color: #fff; border: 1px solid var(--accent);
+}
+.pw-ghost { padding: 6px 14px; border-radius: 7px; cursor: pointer; background: transparent; color: inherit; border: 1px solid var(--border); }
+.pw-link { background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; }
+
+.pw-done { list-style: none; margin: 0; padding: 12px 0 0; border-top: 1px solid var(--border); }
+.pw-done li { display: flex; gap: 12px; padding: 4px 2px; font-size: 12px; color: var(--text-muted); }
+.pw-done li.decided .pw-done-outcome { color: var(--text-secondary); }
+.pw-done li.now { color: var(--accent); font-weight: 600; }
+.pw-done-title { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+/* ── drawer: free text still has a home, just not the default one ── */
+.pw-drawer { width: 340px; flex: none; border-left: 1px solid var(--border); background: var(--bg-secondary); display: flex; flex-direction: column; }
+.pw-drawer header { display: flex; align-items: center; padding: 10px 12px; border-bottom: 1px solid var(--border); font-weight: 600; }
+.pw-drawer header button { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; }
+.pw-drawer-body { padding: 12px; color: var(--text-muted); line-height: 1.7; }
+
+.pw-gate-ask { line-height: 1.7; margin-bottom: 14px; }
+.pw-quote { margin-bottom: 18px; border: 1px solid var(--border); border-radius: 8px; overflow: hidden; }
+.pw-quote-head { padding: 6px 10px; font-size: 11px; color: var(--text-muted); background: var(--bg-secondary); border-bottom: 1px solid var(--border); }
+.pw-quote pre { margin: 0; padding: 10px; font-size: 11px; line-height: 1.6; overflow-x: auto; }
+
+/* ── 段内的波次：一行 = 可以同时进行 ── */
+.pw-waves { margin-bottom: 18px; display: flex; flex-direction: column; gap: 6px; }
+.pw-wave { display: flex; align-items: flex-start; gap: 10px; }
+.pw-wave-tag { flex: none; width: 54px; padding-top: 7px; font-size: 10px; color: var(--accent); text-align: right; }
+.pw-wave-row { flex: 1; min-width: 0; display: flex; gap: 8px; flex-wrap: wrap; }
+.pw-substep {
+  flex: 0 1 260px; max-width: 320px; min-width: 0; display: flex; flex-direction: column; gap: 2px;
+  padding: 8px 10px; border-radius: 7px; font-size: 12px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+}
+.pw-substep.done { opacity: 0.6; }
+.pw-substep.running { border-color: rgba(124, 111, 224, 0.5); background: rgba(124, 111, 224, 0.08); }
+.pw-substep.todo { opacity: 0.42; border-style: dashed; }
+.pw-substep-id { font-size: 10px; color: var(--text-muted); letter-spacing: 0.04em; }
+.pw-substep-name { }
+.pw-substep-note { font-size: 10px; color: var(--text-muted); }
+.pw-waves-error { margin-bottom: 16px; padding: 10px; border-radius: 7px; color: var(--error); background: rgba(239, 83, 80, 0.10); border: 1px solid rgba(239, 83, 80, 0.3); font-size: 12px; }
+
+.pw-node.shown { outline: 1px solid rgba(124, 111, 224, 0.55); }
+.pw-viewing {
+  display: flex; align-items: center; gap: 10px; margin-bottom: 14px;
+  padding: 7px 11px; border-radius: 7px; font-size: 12px;
+  background: rgba(255, 152, 0, 0.10); border: 1px solid rgba(255, 152, 0, 0.3); color: var(--warning);
+}
+.pw-viewing button { margin-left: auto; background: none; border: none; color: var(--accent); cursor: pointer; font-size: 12px; }
+
+.pw-substep-session { font-size: 10px; color: var(--accent); }
+
+/* ── 阶段之间的箭头：汇聚和扇出画得不一样 ── */
+.pw-arrow { display: flex; flex-direction: column; align-items: center; gap: 0; height: 22px; margin-left: 52px; }
+.pw-arrow-line { flex: 1; width: 1px; background: var(--border); }
+.pw-arrow-head { font-size: 9px; line-height: 1; color: var(--border); margin-top: -3px; }
+.pw-arrow.split .pw-arrow-line, .pw-arrow.join .pw-arrow-line { width: 2px; background: rgba(124, 111, 224, 0.45); }
+.pw-arrow.split .pw-arrow-head, .pw-arrow.join .pw-arrow-head { color: rgba(124, 111, 224, 0.75); }
+
+/* ── 卡片：头可点（就地展开），体里装执行 ── */
+.pw-card { padding: 0; overflow: hidden; }
+.pw-card-head {
+  width: 100%; text-align: left; cursor: pointer; font: inherit; color: inherit;
+  background: none; border: none; padding: 11px 13px;
+  display: flex; flex-direction: column; gap: 4px; position: relative;
+}
+.pw-card-chev { position: absolute; right: 11px; top: 11px; font-size: 10px; color: var(--text-muted); }
+.pw-card.open { border-color: rgba(124, 111, 224, 0.5); }
+.pw-card-body { padding: 0 13px 13px; border-top: 1px solid var(--border); padding-top: 11px; }
+.pw-open-detail { margin-top: 10px; background: none; border: none; color: var(--accent); cursor: pointer; font-size: 11px; padding: 0; }
+.pw-idle-sm { font-size: 11px; color: var(--text-muted); }
+/* 与 skill 原文的偏离必须说出来，否则面板就在悄悄改你的 skill */
+.pw-deviation {
+  margin-bottom: 10px; padding: 7px 10px; border-radius: 6px; font-size: 11px; line-height: 1.6;
+  color: var(--warning); background: rgba(255, 152, 0, 0.10); border: 1px solid rgba(255, 152, 0, 0.3);
+}
+
+/* ── 扇出：N 条同时在跑的车道 ── */
+.pw-fan-sum { display: flex; gap: 12px; font-size: 11px; margin-bottom: 8px; color: var(--text-muted); }
+.pw-fan-sum .ok { color: var(--text-secondary); }
+.pw-fan-sum .ready { color: var(--accent); font-weight: 600; }
+.pw-fan-sum .pre { color: var(--warning); }
+.pw-fan-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(190px, 1fr)); gap: 6px; }
+.pw-lane {
+  display: flex; flex-direction: column; gap: 2px; min-width: 0;
+  padding: 7px 9px; border-radius: 6px; font-size: 11px;
+  background: var(--bg-primary); border: 1px solid var(--border);
+}
+.pw-lane.decided { opacity: 0.6; }
+.pw-lane.ready { border-color: rgba(124, 111, 224, 0.5); background: rgba(124, 111, 224, 0.08); }
+.pw-lane.prefetching { border-style: dashed; opacity: 0.7; }
+.pw-lane-title { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pw-lane-meta { color: var(--text-secondary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pw-lane-foot { display: flex; gap: 8px; font-size: 10px; color: var(--text-muted); }
+.pw-lane-session { color: var(--accent); }
+
+/* ─────────────────── 注册 skill 到 KiroLex ───────────────────
+   三步一屏：来源 → 让模型改写 → 核对并冻结。确认按钮在校验通过前是禁用的，
+   因为一个没人核对过的结构被当成 skill 画出来，正是这一步要防的事。 */
+.sr-overlay { position: fixed; inset: 0; z-index: 2050; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
+.sr-dialog {
+  /* Above .overlay(1999) even though it sits inside its own scrim: tests/dialogStacking.test.ts
+     sweeps every dialog for this, because the two panels that shipped without it rendered behind
+     the scrim and every click closed them. */
+  z-index: 2051;
+  width: min(1100px, 94vw); max-height: 88vh; display: flex; flex-direction: column;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5); font-size: 12px;
+}
+.sr-head { display: flex; align-items: baseline; gap: 10px; padding: 13px 16px; border-bottom: 1px solid var(--border); }
+.sr-title { font-size: 14px; font-weight: 600; }
+.sr-sub { color: var(--text-muted); font-size: 11px; }
+.sr-close { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; }
+/*
+  两列,不是三列 —— 「右边也不要留那么多空白」。这里原来是 `1fr 1fr 1fr`,而对话框只有两步:
+  第三列一直空着,占掉整个宽度的三分之一。第一步要放原文(一大块可编辑文本),所以它宽;
+  第二步是一句话加一个按钮,给它够用就行。
+*/
+.sr-body { flex: 1; min-height: 0; overflow-y: auto; display: grid; grid-template-columns: minmax(0, 2fr) minmax(0, 1fr); gap: 0; }
+.sr-step { padding: 14px 16px; border-right: 1px solid var(--border); display: flex; flex-direction: column; gap: 9px; min-width: 0; }
+/* 原文框吃掉第一列剩下的高度:它是这一步的主体,不该是个小条 */
+.sr-step .sr-prose { flex: 1; min-height: 180px; }
+/* 两个选项:选中的那一行浮出来,未选的安静 */
+/* 两个槽:附件列表 + 手写框。附件是 chip,各带一个 ✕ */
+.sr-slot { display: flex; flex-direction: column; gap: 5px; }
+.sr-slot-grow { flex: 1; min-height: 0; }
+.sr-slot-head { display: flex; align-items: center; gap: 8px; font-size: 10px; color: var(--text-tertiary); }
+.sr-slot-head .sr-ghost { padding: 2px 8px; font-size: 10px; }
+.sr-attach-list { display: flex; flex-wrap: wrap; gap: 5px; }
+.sr-attach { display: inline-flex; align-items: center; gap: 5px; max-width: 100%; font-size: 10px;
+  padding: 3px 5px 3px 7px; border-radius: 6px; border: 1px solid var(--border); background: var(--bg-primary);
+  color: var(--text-secondary); }
+.sr-attach-x { border: none; background: none; cursor: pointer; color: var(--text-muted); font-size: 9px; padding: 0 2px; }
+.sr-attach-x:hover { color: #ef5350; }
+.sr-choice { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; cursor: pointer;
+  padding: 5px 7px; border-radius: 6px; border: 1px solid transparent; }
+.sr-choice.on { border-color: rgba(124,111,224,.45); background: rgba(124,111,224,.08); }
+.sr-choice-main { font-size: 11px; color: var(--text-primary); }
+.sr-choice .sr-node-meta { flex: 1 0 100%; margin-left: 22px; }
+.sr-step:last-child { border-right: none; }
+.sr-step-head { font-weight: 600; }
+.sr-step-head b { display: inline-block; width: 17px; height: 17px; line-height: 17px; text-align: center; border-radius: 50%; background: var(--accent); color: #fff; font-size: 10px; margin-right: 7px; }
+.sr-sources { display: flex; flex-direction: column; gap: 5px; }
+.sr-sources label { display: flex; align-items: center; gap: 7px; cursor: pointer; }
+.sr-name { display: flex; align-items: center; gap: 8px; }
+.sr-name input { flex: 1; min-width: 0; padding: 4px 8px; border-radius: 6px; background: var(--bg-primary); color: inherit; border: 1px solid var(--border); }
+.sr-prose, .sr-reply {
+  flex: 1; min-height: 160px; resize: vertical; padding: 8px; border-radius: 7px;
+  background: var(--bg-primary); color: inherit; border: 1px solid var(--border);
+  font-family: ui-monospace, SFMono-Regular, Menlo, monospace; font-size: 11px; line-height: 1.55;
+}
+.sr-req { font-size: 11px; color: var(--text-secondary); line-height: 1.6; }
+/* 这一行是承诺，不是装饰：注册期不碰任何东西，执行期每次调用都要批准 */
+.sr-safe { font-size: 11px; line-height: 1.6; padding: 7px 9px; border-radius: 6px; color: var(--accent); background: rgba(124,111,224,0.10); border: 1px solid rgba(124,111,224,0.28); }
+.sr-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; }
+.sr-primary { padding: 5px 13px; border-radius: 7px; cursor: pointer; font-weight: 600; background: var(--accent); color: #fff; border: 1px solid var(--accent); }
+.sr-primary:disabled { opacity: 0.45; cursor: default; }
+.sr-ghost { padding: 5px 12px; border-radius: 7px; cursor: pointer; background: transparent; color: inherit; border: 1px solid var(--border); }
+.sr-ghost:disabled { opacity: 0.45; cursor: default; }
+.sr-problems { padding: 8px 10px; border-radius: 7px; font-size: 11px; line-height: 1.7; color: var(--error); background: rgba(239,83,80,0.10); border: 1px solid rgba(239,83,80,0.3); }
+.sr-fp { font-size: 10px; color: var(--text-muted); }
+.sr-map { display: flex; flex-direction: column; gap: 5px; }
+.sr-row { display: flex; gap: 6px; }
+.sr-row.parallel { padding-left: 4px; border-left: 2px solid rgba(124,111,224,0.4); }
+.sr-tag { flex: none; align-self: center; font-size: 10px; color: var(--accent); width: 46px; }
+.sr-node { flex: 1 1 0; min-width: 0; display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-radius: 6px; background: var(--bg-primary); border: 1px solid var(--border); }
+.sr-node.gate { background: rgba(124,111,224,0.10); border-color: rgba(124,111,224,0.35); }
+.sr-node-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sr-node-meta { font-size: 10px; color: var(--text-muted); }
+.sr-registered { font-size: 10px; color: var(--text-muted); }
+
+.pw-lane-idx { font-size: 10px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+
+/* ── 注册条：会话右侧的竖条，不是模态、也不是压在 transcript 上面的横幅 ──
+   横幅版把对话往下推，而结构图和错误列表需要纵向空间；竖条给了空间，又不挡住输入框
+   —— 改写是要一边看一边跟模型说话的。 */
+.rb-bar {
+  position: absolute; top: 0; right: 0; bottom: 0; width: 360px; z-index: 6;
+  display: flex; flex-direction: column; overflow-y: auto;
+  background: var(--bg-secondary); border-left: 1px solid var(--border);
+  font-size: 12px;
+}
+.chat-main.rb-open .chat-messages { padding-right: 372px; }
+.rb-head { display: flex; align-items: center; gap: 9px; padding: 7px 11px; }
+.rb-tag { font-size: 10px; padding: 1px 7px; border-radius: 999px; background: var(--accent); color: #fff; }
+.rb-hint { color: var(--text-muted); font-size: 11px; }
+.rb-link { margin-left: auto; background: none; border: none; color: var(--accent); cursor: pointer; font-size: 11px; }
+.rb-head .rb-link + .rb-link { margin-left: 0; }
+.rb-body { padding: 0 11px 11px; display: flex; flex-direction: column; gap: 8px; }
+.rb-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rb-primary { padding: 4px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; background: var(--accent); color: #fff; border: 1px solid var(--accent); }
+.rb-primary:disabled { opacity: 0.45; cursor: default; }
+.rb-ghost { padding: 4px 11px; border-radius: 6px; cursor: pointer; background: transparent; color: inherit; border: 1px solid var(--border); }
+.rb-note { font-size: 11px; color: var(--text-muted); }
+.rb-problems { padding: 8px 10px; border-radius: 6px; color: var(--error); background: rgba(239,83,80,0.10); border: 1px solid rgba(239,83,80,0.3); line-height: 1.7; }
+.rb-fix { color: var(--text-secondary); margin-top: 5px; }
+.rb-sum { font-size: 11px; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.rb-map { display: flex; flex-direction: column; gap: 5px; }
+.rb-row { display: flex; gap: 6px; }
+.rb-row.parallel { padding-left: 4px; border-left: 2px solid rgba(124,111,224,0.45); }
+.rb-rowtag { flex: none; align-self: center; width: 48px; font-size: 10px; color: var(--accent); }
+.rb-node { flex: 1 1 0; min-width: 0; padding: 6px 8px; border-radius: 6px; background: var(--bg-primary); border: 1px solid var(--border); display: flex; flex-direction: column; gap: 2px; }
+.rb-node.gate { background: rgba(124,111,224,0.10); border-color: rgba(124,111,224,0.35); }
+.rb-node-name { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rb-node-meta { font-size: 10px; color: var(--text-muted); }
+
+.sr-file { display: flex; align-items: center; gap: 7px; flex-wrap: wrap; }
+.sr-file .sr-ghost { padding: 3px 10px; font-size: 11px; }
+
+/* ── 会话泳道：区分「一个会话顺序做两件事」和「两个会话并行」 ── */
+.rb-lanes { display: flex; flex-direction: column; gap: 3px; }
+.rb-lanes-head { font-size: 11px; color: var(--text-muted); margin-bottom: 2px; }
+.rb-lane { display: flex; align-items: baseline; gap: 7px; padding: 4px 7px; border-radius: 5px; background: var(--bg-primary); border: 1px solid var(--border); }
+.rb-lane.seq { border-color: rgba(255, 152, 0, 0.4); background: rgba(255, 152, 0, 0.06); }
+.rb-lane-name { flex: none; min-width: 62px; font-size: 10px; color: var(--accent); font-weight: 600; }
+.rb-lane-tasks { flex: 1; min-width: 0; font-size: 11px; }
+.rb-arrow { color: var(--warning); }
+.rb-lane-tag { flex: none; font-size: 9px; padding: 0 5px; border-radius: 999px; color: var(--warning); background: rgba(255,152,0,0.14); }
+
+/* ── 泳道图：行=会话，列=波次，门=竖屏障 ── */
+.sw-wrap { overflow-x: auto; padding-bottom: 6px; }
+.sw-grid { display: grid; gap: 6px; align-items: stretch; min-width: max-content; }
+.sw-corner { grid-column: 1; grid-row: 1; }
+.sw-colhead { font-size: 10px; color: var(--text-muted); text-align: center; align-self: center; }
+.sw-lanehead {
+  font-size: 10px; color: var(--accent); font-weight: 600; align-self: center;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; padding-right: 6px;
+}
+.sw-cell {
+  display: flex; flex-direction: column; gap: 2px; text-align: left; cursor: pointer;
+  padding: 7px 9px; border-radius: 7px; font: inherit; color: inherit;
+  background: var(--bg-primary); border: 1px solid var(--border); min-width: 0;
+}
+.sw-cell:hover { border-color: rgba(124,111,224,0.5); }
+.sw-cell.done { opacity: 0.6; }
+.sw-cell.running { border-color: var(--accent); background: rgba(124,111,224,0.10); }
+.sw-cell.waiting { border-color: var(--warning); background: rgba(255,152,0,0.10); }
+.sw-cell.todo { opacity: 0.5; border-style: dashed; }
+.sw-cell-name { font-weight: 600; font-size: 11px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sw-cell-meta { font-size: 9px; color: var(--text-muted); }
+.sw-fan { color: var(--accent); }
+.sw-cont { align-self: flex-start; font-size: 9px; padding: 0 4px; border-radius: 3px; background: rgba(255,152,0,0.18); color: var(--warning); }
+.sw-barrier {
+  display: flex; align-items: center; justify-content: center; cursor: pointer;
+  border-radius: 7px; background: rgba(124,111,224,0.14); border: 1px solid rgba(124,111,224,0.45);
+}
+.sw-barrier-label { font-size: 10px; font-weight: 600; color: var(--accent); writing-mode: vertical-rl; letter-spacing: 0.08em; }
+.sw-error { padding: 8px 10px; border-radius: 6px; font-size: 11px; color: var(--error); background: rgba(239,83,80,0.10); border: 1px solid rgba(239,83,80,0.3); }
+.sw-empty { font-size: 11px; color: var(--text-muted); }
+
+.rb-maphead { display: flex; align-items: baseline; gap: 8px; font-size: 11px; color: var(--text-muted); }
+.rb-maphead .rb-link { margin-left: auto; }
+.sw-overlay { position: fixed; inset: 0; z-index: 2200; background: rgba(0,0,0,0.55); display: flex; align-items: center; justify-content: center; }
+.sw-modal {
+  z-index: 2201; width: min(1500px, 96vw); max-height: 88vh; overflow: auto;
+  padding: 14px 16px; border-radius: 12px; background: var(--bg-secondary); border: 1px solid var(--border);
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5);
+}
+.sw-modal header { display: flex; align-items: baseline; gap: 12px; margin-bottom: 12px; font-size: 12px; }
+.sw-modal header span { color: var(--text-muted); font-size: 11px; }
+.sw-modal header button { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; }
+
+/* ─────────────────── FLOW GRAPH（React Flow + dagre）───────────────────
+   状态用小圆点而不是整卡染色（Temporal 的做法：一眼看出「此刻在发生什么」，
+   而整卡染色会把画布变成热力图、盖掉结构）。阶段用带标题的分区块（n8n 的做法：
+   「打开任何节点之前就能读完整条管线」）。 */
+.fg-wrap { position: relative; width: 100%; height: 100%; min-height: 420px; }
+.fg-wrap .react-flow__attribution { display: none; }
+.fg-error { padding: 10px; border-radius: 7px; font-size: 11px; color: var(--error); background: rgba(239,83,80,0.10); border: 1px solid rgba(239,83,80,0.3); }
+/* 运行入口属于图：它同时列出并高亮这次点击会先启动的节点，避免一个脱离上下文的页头按钮。 */
+.fg-run-launch {
+  position: absolute; top: 10px; left: 10px; z-index: 60; max-width: min(520px, calc(100% - 20px));
+  display: flex; align-items: center; gap: 8px; padding: 7px 9px; border-radius: 9px;
+  background: color-mix(in srgb, var(--bg-secondary) 92%, transparent); border: 1px solid rgba(124,111,224,.55);
+  box-shadow: 0 8px 24px rgba(0,0,0,.38); backdrop-filter: blur(6px);
+}
+.fg-run-button {
+  flex: none; font: inherit; font-size: 11px; font-weight: 700; padding: 5px 11px; border-radius: 6px; cursor: pointer;
+  background: var(--accent); color: #fff; border: 1px solid color-mix(in srgb, var(--accent) 70%, white);
+}
+.fg-run-button:hover:not(:disabled) { filter: brightness(1.12); }
+.fg-run-button:disabled { cursor: not-allowed; opacity: .42; }
+.fg-run-launch > span { min-width: 0; font-size: 10px; line-height: 1.4; overflow-wrap: anywhere; }
+.fg-run-launch > span.ready { color: var(--text-primary); }
+.fg-run-launch > span.blocked { color: #e8cf94; }
+.fg-node.willrun {
+  border-color: rgba(124,111,224,.9); background: rgba(124,111,224,.2);
+  box-shadow: 0 0 0 3px rgba(124,111,224,.28), 0 0 22px rgba(124,111,224,.28);
+}
+.fg-trigger { flex: none; font-size: 8px; font-weight: 700; color: #d8d0ff; white-space: nowrap; }
+
+
+.fg-node {
+  width: 176px; box-sizing: border-box; padding: 8px 10px; border-radius: 9px;
+  background: var(--bg-secondary); border: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 4px; cursor: pointer;
+}
+.fg-node:hover { border-color: rgba(124,111,224,0.5); }
+/* 输入/输出端点不是装饰：标签常显、命中区加大，定义视图里可从输出拖到输入建立依赖。 */
+.react-flow__handle.fg-port {
+  width: 13px; height: 13px; box-sizing: border-box; z-index: 8;
+  border: 2px solid var(--bg-primary); box-shadow: 0 0 0 2px currentColor, 0 2px 8px rgba(0,0,0,.45);
+  cursor: crosshair; transition: box-shadow .12s ease, filter .12s ease;
+}
+.react-flow__handle.fg-port.input { color: #7db5ff; background: #3978c7; }
+.react-flow__handle.fg-port.output { color: #7bd68f; background: #3f9955; }
+/*
+  端点钉在卡片**上沿下 16px**，不是卡高的 50% —— 「第一行的节点没有对齐，导致连接也无法对齐」。
+
+  React Flow 自己的 `.react-flow__handle-left` 是 `top: 50%`，而这些卡片没有固定高度：多一行工具胶囊就高
+  17px，名字折成两行又高十几px。于是同一行的两张卡即使上沿严丝合缝，端点也差着几像素，一条交接线只能斜
+  着走或者拐两下。16px 正对标题那一行（padding 8 + 一行 12px 名字的一半），所以它同时是「这张卡的入口在
+  哪」这个问题的答案。布局那边（flowRows）让同一行共用行顶 y —— 两头合起来，同一行的连线就是直线。
+
+  `.fg-node` 这条 position: relative 是**对齐的一部分**，不是装饰：门早就是 relative 的（它的详情面板要往
+  右开），于是门的端点从门自己的 padding box 起算、步骤的端点从外层 .react-flow__node 起算，两者差了一层
+  1px 边框 —— 实测门的端点比同一行的步骤低 1px，连线在门前后各拐一个 1px 的台阶。两种卡都以自己为参照，
+  这个差就没有了。
+*/
+.fg-node { position: relative; }
+.fg-node > .react-flow__handle.fg-port,
+.fg-gate > .react-flow__handle.fg-port { top: 16px; }
+.react-flow__handle.fg-port::after {
+  position: absolute; top: 50%; transform: translateY(-50%); pointer-events: none;
+  padding: 1px 4px; border-radius: 4px; font-size: 8px; line-height: 1.35; font-weight: 700;
+  color: currentColor; background: var(--bg-primary); border: 1px solid currentColor;
+  box-shadow: 0 2px 7px rgba(0,0,0,.35); white-space: nowrap;
+}
+/*
+  端点标签只在「能连线 + 鼠标悬停」时出现 —— 「有的上游之类把确认门挡住了」。
+  它原来是常显的,而门只有 108px 宽:一个常显的「上游」浮标就足以压住旁边那道门的名字。
+  端点本身仍然常显(它是连线的抓手),被隐藏的只是那两个字。
+*/
+.react-flow__handle.fg-port.input::after { content: '上游'; right: 15px; opacity: 0; transition: opacity .1s ease; }
+.react-flow__handle.fg-port.output::after { content: '产出'; left: 15px; opacity: 0; transition: opacity .1s ease; }
+.react-flow__handle.fg-port.connectable:hover::after { opacity: 1; }
+/* 门上永远不显示这两个字:门只有一个入口一个出口,不需要标注,而它没有那个宽度 */
+.fg-gate .react-flow__handle.fg-port::after { content: none; }
+.react-flow__handle.fg-port.connectable:hover,
+.react-flow__handle.fg-port.connectable:focus-visible {
+  filter: brightness(1.25); box-shadow: 0 0 0 3px currentColor, 0 0 15px currentColor;
+}
+.react-flow__handle.fg-port.readonly { cursor: default; opacity: .82; }
+
+/* 工具胶囊:可点,点开的那个高亮。
+   说明必须是**浮层**,不能挂在胶囊行里 —— 「那些mcp和工具调用点开还是根本看不到内容」。
+   胶囊行原来是 `height: 13px; overflow: hidden; flex-wrap: nowrap`(卡高由布局预先保留),而这块说明写的是
+   `flex: 1 0 100%; margin-top: 4px` —— 指望靠 flex 换行排到胶囊下面。父容器不换行、限高、还裁溢出,于是它
+   进了 DOM 却一个像素都露不出来:点是点开了,看不见的是内容。前几轮一直在修事件(nopan/nodrag),事件早就通了。
+   现在胶囊行**会换行**了(高度由 `depRows.ts` 与布局同源预留),但这块说明照旧是 absolute:它是浮层,不该把
+   卡片撑高,也不该参与那排胶囊的换行。containing block 是 `.fg-node`(relative),不受行高影响 ——
+   和节点详情 `.fg-panel` 同一个路子。 */
+.fg-dep { cursor: pointer; }
+.fg-dep.open { border-color: rgba(124,111,224,.75); background: rgba(124,111,224,.14); }
+.fg-dep.more { cursor: default; }
+.fg-dep-detail { position: absolute; top: calc(100% + 4px); left: 0; z-index: 30;
+  width: 264px; max-width: 92vw; padding: 6px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-primary); font-size: 9px; line-height: 1.5;
+  box-shadow: 0 6px 18px rgba(0,0,0,.42); }
+/*
+  说明本身必须是**实底**的 —— 「不应该是透明的」。
+
+  背景色本来就是不透明的 `--bg-primary`，透明感来自两处：① 它被下面那张卡盖住，而卡的状态底色是半透明
+  （`.failed` = `rgba(239,83,80,.16)`）→ 说明的字从卡里透出来（真因是排序，已由 `nodeZ` 抬起这张卡修掉）；
+  ② `.fg-node.todo` 整块 `opacity: .72`，而 opacity 会连子树一起淡化，弹出层躲不掉。所以开着说明时这张卡
+  不再淡化（`.fg-node.todo.showtool`，写在 todo 那条之后才压得住）：你正在读它，它就不是「远处那些还没跑的步骤」之一。
+*/
+.fg-dep-detail-head { display: flex; align-items: center; gap: 6px; margin-bottom: 3px; font-size: 10px; }
+.fg-dep-role { padding: 0 4px; border-radius: 3px; font-weight: 700; }
+.fg-dep-role.read { background: rgba(61,148,231,.18); color: #7db5ff; }
+.fg-dep-role.write { background: rgba(239,83,80,.18); color: #ef5350; }
+.fg-dep-kind { color: var(--text-tertiary); }
+.fg-dep-line { color: var(--text-secondary); }
+.fg-dep-line.dim { color: var(--text-tertiary); }
+
+.fg-row { display: flex; align-items: center; gap: 7px; min-width: 0; }
+.fg-dot { width: 7px; height: 7px; border-radius: 50%; flex: none; background: var(--border); }
+.fg-dot.done { background: #4a9d5f; }
+.fg-dot.running { background: var(--accent); box-shadow: 0 0 0 3px rgba(124,111,224,0.22); }
+.fg-dot.waiting { background: var(--warning); box-shadow: 0 0 0 3px rgba(255,152,0,0.22); }
+.fg-dot.todo { background: transparent; border: 1px solid var(--border); }
+.fg-name { flex: 1; min-width: 0; font-size: 12px; font-weight: 600; line-height: 1.2; overflow: hidden;
+  display: -webkit-box; -webkit-line-clamp: 2; -webkit-box-orient: vertical; word-break: break-all; }
+.fg-badge { flex: none; font-size: 9px; padding: 0 5px; border-radius: 999px; background: rgba(124,111,224,0.16); color: var(--accent); }
+.fg-sub { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.fg-chip { font-size: 9px; padding: 0 5px; border-radius: 3px; background: var(--bg-primary); color: var(--accent); border: 1px solid var(--border); }
+.fg-rules { font-size: 9px; color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+
+.fg-gate {
+  /* 宽度按内容走(108 只是下限):门里的字必须完整显示,不折不截 */
+  width: max-content; min-width: 108px; max-width: 200px; box-sizing: border-box; padding: 6px 8px; border-radius: 9px;
+  display: flex; flex-direction: row; align-items: center; gap: 4px; cursor: pointer;
+  background: rgba(124,111,224,0.14); border: 1px solid rgba(124,111,224,0.5);
+}
+.fg-gate.waiting { background: rgba(255,152,0,0.16); border-color: rgba(255,152,0,0.55); }
+.fg-gate-icon { font-size: 11px; }
+.fg-gate-name { font-size: 11px; font-weight: 600; color: var(--accent); line-height: 1.3;
+  white-space: nowrap; }
+.fg-gate.waiting .fg-gate-name { color: var(--warning); }
+
+.fg-phase {
+  width: 100%; height: 100%; box-sizing: border-box;
+  border: 1px dashed var(--border); border-radius: 12px;
+  background: rgba(255,255,255,0.02);
+}
+.fg-phase-title { position: absolute; top: 5px; left: 12px; font-size: 10px; color: var(--text-muted); letter-spacing: 0.06em; }
+
+/*
+  连线要看得见 —— 「整个图都没连线」。
+
+  它原来是 `var(--border)`(#333) 1.4px:23 列的 flow 一打开缩放就被夹在 0.7,那是一条 1px 的深灰线画在
+  近黑的底上,和背景网点分不开。现在的颜色和 FlowGraph 里的 `EDGE_STROKE` 是同一个值（箭头 marker 只能
+  从 JS 传颜色，两处必须一致，测试盯着）。
+*/
+/*
+  线宽按缩放**反向补偿** —— 「一缩放又不见了」的根因。
+
+  线宽原来是 1.6 个用户单位,跟着画布的 CSS transform 一起缩:缩到 0.15（23 列的图想看全就是这个量级）时
+  只剩 0.24px,抗锯齿后和背景同色。实测：在 0.15 下取每条线中点的屏幕坐标去采样，像素是纯背景 (26,26,26)。
+
+  先试过 `vector-effect: non-scaling-stroke`，**没用**：Chromium 只考虑 SVG 内部的变换，不管祖先上的 CSS
+  transform（实测计算值确实是 non-scaling-stroke，线照旧不见）。所以用 `--fg-zoom` 直接除回去 —— 那个变量
+  本来就是详情面板用来抵消缩放的，写在 .fg-wrap 上、只在缩放变化时更新。
+  箭头跟着一起：React Flow 的 marker 默认 `markerUnits="strokeWidth"`，线宽补偿后箭头也保持屏幕尺寸。
+*/
+.react-flow__edge.fg-edge .react-flow__edge-path {
+  stroke: rgba(146,156,184,0.62);
+  /*
+    `max()` 是保险：如果 `--fg-zoom` 因为任何原因没写上或写歪了，线宽也不会掉到 1.6px 以下。
+    「屏幕上一条线也看不见」的代价太大，不值得为了精确而让它有机会归零。
+  */
+  stroke-width: max(1.6px, calc(1.6px / var(--fg-zoom, 1)));
+}
+/*
+  连线那一层必须有**真实的绘制边界** —— 「我一拖这个界面连线就又不见了」的根因。
+
+  React Flow v12 把每条边都放进一个自己的 `<svg>`，而那些 svg 和外面的 `.react-flow__edges` 都是
+  `position:absolute` 且**没有宽高**（实测 0×0），全靠 `overflow: visible` 把线画到盒子外面。静止时能画；
+  但视口一平移（合成层 transform），0×0 的绘制边界让 Chromium 判定这一层无需重绘 —— 节点是普通 div 所以
+  还在，线整层消失，直到某个操作强制整帧重绘才回来。实测：拖动后截图 51 条线一条不剩；把每个 svg 的盒子
+  撑到覆盖整张图，同样拖动后全部回来。
+
+  尺寸从 `--fg-graph-w/h` 来（FlowGraph 布局算完后写在 .fg-wrap 上，一次布局一次，不是每帧）。线仍然靠
+  overflow 画，语义不变，只是这一层不再是退化的 0×0。
+*/
+.fg-wrap .react-flow__edges,
+.fg-wrap .react-flow__edges > svg {
+  width: var(--fg-graph-w, 100%);
+  height: var(--fg-graph-h, 100%);
+}
+.react-flow__edge.fg-edge.barrier .react-flow__edge-path { stroke: rgba(124,111,224,0.55); stroke-width: 1.8; }
+.react-flow__minimap { background: var(--bg-secondary) !important; }
+.react-flow__controls button { background: var(--bg-secondary); border-color: var(--border); fill: var(--text-secondary); }
+.sw-modal-canvas { height: 72vh; min-height: 420px; }
+
+/* ── 节点检查器：画布上的输入面 ── */
+.fi-panel {
+  width: 330px; flex: none; padding: 12px; overflow-y: auto;
+  background: var(--bg-secondary); border-left: 1px solid var(--border);
+  display: flex; flex-direction: column; gap: 9px; font-size: 12px;
+}
+.fi-panel header { display: flex; align-items: center; gap: 8px; }
+.fi-kind { font-size: 10px; padding: 1px 7px; border-radius: 999px; background: rgba(124,111,224,0.16); color: var(--accent); }
+.fi-panel header button { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; }
+.fi-panel label { display: flex; flex-direction: column; gap: 3px; font-size: 10px; color: var(--text-muted); }
+.fi-panel input, .fi-panel textarea {
+  padding: 5px 7px; border-radius: 6px; font-size: 11px; color: var(--text-primary);
+  background: var(--bg-primary); border: 1px solid var(--border); font-family: inherit;
+}
+.fi-panel textarea { resize: vertical; line-height: 1.55; }
+.fi-two { display: flex; gap: 8px; }
+.fi-two label { flex: 1; min-width: 0; }
+.sw-modal-body { display: flex; height: 72vh; min-height: 420px; gap: 0; }
+.sw-modal-body .fg-wrap { flex: 1; min-width: 0; }
+.rb-edited { font-size: 10px; color: var(--warning); }
+
+/* ─────────────────── FLOW STUDIO：左导航 / 中画布 / 右 review / 下主对话 ───────────────────
+   不是弹窗：这里的工作是「对话 + 编辑」，弹窗两样都容不下。占主区，侧栏和会话切换照旧。 */
+.fs-shell { flex: 1; min-width: 0; min-height: 0; display: flex; flex-direction: column; background: var(--bg-primary); }
+.fs-head { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.fs-fp { font-size: 10px; color: var(--text-muted); }
+.fs-ok { font-size: 10px; color: #4a9d5f; }
+.fs-bad { font-size: 10px; color: var(--error); }
+.fs-confirm { margin-left: auto; padding: 4px 12px; border-radius: 6px; cursor: pointer; font-weight: 600; background: var(--accent); color: #fff; border: 1px solid var(--accent); font-size: 11px; }
+.fs-confirm:disabled { opacity: 0.4; cursor: default; }
+.fs-close { background: none; border: none; color: var(--text-muted); cursor: pointer; }
+.fs-head .fs-confirm + .fs-close { margin-left: 0; }
+
+.fs-body { flex: 1 1 auto; min-height: 0; display: flex; }
+.fs-left { width: 186px; flex: none; overflow-y: auto; padding: 10px 8px; border-right: 1px solid var(--border); background: var(--bg-secondary); }
+.fs-phase { margin-bottom: 10px; }
+.fs-phase-label { font-size: 9px; color: var(--text-muted); letter-spacing: 0.06em; padding: 0 4px 3px; }
+.fs-item {
+  display: block; width: 100%; text-align: left; cursor: pointer; font: inherit; font-size: 11px;
+  padding: 4px 7px; border-radius: 5px; background: none; border: 1px solid transparent; color: inherit;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+}
+.fs-item:hover { background: var(--bg-hover); }
+.fs-item.on { border-color: rgba(124,111,224,0.5); background: rgba(124,111,224,0.12); color: var(--accent); }
+.fs-item.gate { color: var(--accent); }
+
+/* 画布整块压在下面那半边（对话、文件列表）之上：点开的详情面板会长出画布的边界，
+   而同级里后画的元素本来就盖在前面的上面 —— 面板下半截被 .files-item-row 盖住就是这么来的 */
+.fs-canvas { flex: 1; min-width: 0; position: relative; z-index: 3; }
+/*
+  画布那块**不许比它的格子高** —— 「画布和下方对话框的这个overlay问题」。
+
+  `.fg-wrap` 写着 `min-height: 420px`（当年画布独占主区域时的遗产，运行视图 6299 行早就为同一个原因
+  覆盖过一次）。而这里的高度是 `100 - 对话%`：对话记着 62% 时画布只有 358px，于是 React Flow 那张画面
+  连点阵和 +/−/⛶ 一起**多长出 62px**，越过分隔条盖在对话上（`.fs-canvas` 是 `overflow: visible` + z-index 3）。
+  这也是「拖不动」的原因：那 6px 的分隔条被这块多出来的画面整条盖住，`elementFromPoint` 在它中点上拿到的
+  是 `.fg-wrap` —— 手柄在，只是碰不到。
+*/
+.fs-canvas .fg-wrap { min-height: 0; height: 100%; }
+.fs-artifacts { padding: 12px; overflow-y: auto; display: flex; flex-direction: column; gap: 7px; font-size: 11px; }
+.fs-art-head { font-size: 11px; font-weight: 600; }
+.fs-art { display: flex; flex-direction: column; gap: 2px; padding: 6px 8px; border-radius: 6px; background: var(--bg-primary); border: 1px solid var(--border); }
+.fs-art-ref { font-size: 10px; font-family: ui-monospace, Menlo, monospace; overflow-wrap: anywhere; }
+/* 文件产物可核对，外部系统只能相信 —— 两者不能长得一样 */
+.fs-art-ref.file { color: var(--text-primary); }
+.fs-art-ref.ext { color: var(--text-muted); font-style: italic; }
+.fs-art-by { font-size: 9px; color: var(--text-muted); }
+.fs-problems { padding: 7px 9px; border-radius: 6px; color: var(--error); background: rgba(239,83,80,0.10); border: 1px solid rgba(239,83,80,0.3); line-height: 1.6; }
+.fs-hint { font-size: 10px; color: var(--text-muted); }
+
+/* 可拖的分隔条:够宽好抓,但视觉上只是一条线。
+   z-index 要高于画布那块（3）——详情面板仍然故意长出画布边界，那是它该做的，但它不该顺手把这条手柄盖住 */
+.fs-split { flex: none; height: 6px; cursor: row-resize; background: transparent; position: relative; z-index: 4; }
+.fs-split::after { content: ''; position: absolute; left: 0; right: 0; top: 2px; height: 1px; background: var(--border); }
+.fs-split:hover::after { background: rgba(124,111,224,.7); height: 2px; }
+.fs-bottom { flex: 0 0 38%; min-height: 120px; display: flex; flex-direction: column; min-width: 0; border-top: 1px solid var(--border); }
+.fs-bottom > *:not(.fs-bottom-label) { flex: 1; min-height: 0; display: flex; min-width: 0; }
+
+/* ── Skill 浏览器 ── */
+.sb-overlay { position: fixed; inset: 0; z-index: 2060; background: rgba(0,0,0,0.5); display: flex; align-items: center; justify-content: center; }
+.sb-dialog {
+  z-index: 2061; width: min(760px, 92vw); max-height: 86vh; overflow-y: auto;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 12px;
+  box-shadow: 0 20px 60px rgba(0,0,0,0.5); font-size: 12px;
+}
+.sb-dialog header { display: flex; align-items: center; gap: 10px; padding: 12px 15px; border-bottom: 1px solid var(--border); }
+.sb-primary { margin-left: auto; padding: 4px 11px; border-radius: 6px; cursor: pointer; font-size: 11px; font-weight: 600; background: var(--accent); color: #fff; border: 1px solid var(--accent); }
+.sb-close { background: none; border: none; color: var(--text-muted); cursor: pointer; }
+.sb-dialog section { padding: 10px 15px; }
+.sb-sec { font-size: 10px; color: var(--text-muted); letter-spacing: 0.05em; margin-bottom: 7px; }
+.sb-empty { color: var(--text-muted); padding: 6px 0; }
+.sb-row { display: flex; flex-direction: column; gap: 3px; padding: 8px 10px; margin-bottom: 6px; border-radius: 7px; background: var(--bg-primary); border: 1px solid var(--border); }
+.sb-main { display: flex; align-items: center; gap: 8px; }
+.sb-name { font-weight: 600; }
+.sb-status { font-size: 9px; padding: 1px 6px; border-radius: 999px; }
+.sb-status.confirmed { background: rgba(74,157,95,0.16); color: #4a9d5f; }
+.sb-status.draft { background: rgba(255,152,0,0.16); color: var(--warning); }
+.sb-fp { font-size: 9px; color: var(--text-muted); font-family: ui-monospace, Menlo, monospace; }
+.sb-meta { font-size: 10px; color: var(--text-muted); overflow-wrap: anywhere; }
+.sb-acts { display: flex; gap: 7px; margin-top: 3px; }
+.sb-acts button { padding: 3px 9px; border-radius: 5px; cursor: pointer; font-size: 10px; background: transparent; color: inherit; border: 1px solid var(--border); }
+.sb-acts .sb-danger:hover { color: var(--error); border-color: rgba(239,83,80,0.4); }
+/* kiro 的 SKILL.md 就地改：浏览的地方就是能改的地方 */
+.sb-edit { grid-column: 1 / -1; margin: 6px 0 2px; display: flex; flex-direction: column; gap: 6px; }
+.sb-edit textarea { width: 100%; box-sizing: border-box; min-height: 260px; font: inherit; font-size: 11px;
+  line-height: 1.6; padding: 8px 9px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg-primary); color: var(--text-primary); resize: vertical; }
+.sb-edit-acts { display: flex; align-items: center; gap: 8px; }
+.sb-edit-path { flex: 1; min-width: 0; font-size: 9px; color: var(--text-tertiary); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.sb-edit-acts button { padding: 3px 9px; border-radius: 5px; cursor: pointer; font-size: 10px; background: transparent; color: inherit; border: 1px solid var(--border); }
+.sb-edit-acts button:disabled { opacity: .4; cursor: default; }
+/* 从 kiro 内置那一行进来的:文件已经定了,不再问「哪个文件」 */
+.session-purpose { flex: none; font-size: 9px; opacity: .75; }
+.sr-preset { font-size: 10px; color: var(--text-secondary); line-height: 1.7; margin-bottom: 6px; }
+.sr-preset code { font-size: 10px; background: var(--bg-primary); padding: 1px 5px; border-radius: 3px; }
+.sr-preset .sr-node-meta { display: block; }
+/* 这份原文是 kiro 内置的还是 KiroLex 自己的 —— 由路径推出来，不问人 */
+.sr-origin { font-size: 9px; padding: 0 5px; border-radius: 3px; border: 1px solid var(--border); color: var(--text-tertiary); }
+.sr-origin.kiro { border-color: #6f5a2f; color: #d8bd80; }
+.sr-origin.kirolex { border-color: #4a5c8a; color: #a8bde0; }
+.fs-plain.want { border-color: rgba(124,111,224,0.55); color: var(--accent); }
+.sb-note { margin: 0 15px 10px; padding: 5px 9px; border-radius: 6px; font-size: 10px;
+  background: rgba(124,111,224,0.12); color: var(--accent); border: 1px solid rgba(124,111,224,0.35); }
+.sb-dialog footer { padding: 10px 15px 14px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-muted); line-height: 1.8; }
+.sb-dialog footer code { background: var(--bg-primary); padding: 1px 5px; border-radius: 3px; }
+.fs-plain { padding: 3px 9px; border-radius: 5px; cursor: pointer; font-size: 10px; background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
+
+/* 点开只是「打开详情」：卡片本身一点都不变大 —— 详情是浮在画布上的面板，
+   而布局给每张卡只留了 NODE_H，卡片一长就会长进同列下面那几张里 */
+.fg-node.open { box-shadow: 0 6px 22px rgba(0,0,0,.35); }
+.fg-more { margin-left: auto; font-size: 8px; opacity: .5; }
+.fg-node:hover .fg-more { opacity: .9; }
+.fg-edit { margin-top: 5px; display: flex; flex-direction: column; gap: 4px; }
+.fg-edit label { display: flex; flex-direction: column; gap: 2px; font-size: 9px; color: var(--text-tertiary); }
+.fg-edit textarea, .fg-edit input { font: inherit; font-size: 10px; padding: 3px 4px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); resize: vertical; }
+
+/* 产物是图上的节点，产出/消费成为可以顺着走的连线 */
+.fg-art { width: 148px; height: 30px; box-sizing: border-box; padding: 4px 7px; border-radius: 11px; font-size: 9px; display: flex; gap: 5px;
+  align-items: center; justify-content: center; border: 1px dashed var(--border); background: var(--bg-secondary); }
+.fg-art.file { border-color: #3f6f4a; color: #9fd0a8; }
+.fg-art.ext { border-color: #6f5a2f; color: #d8bd80; }
+.fg-art-ref { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.fg-art-warn { flex: none; font-size: 8px; opacity: .75; }
+.fs-problems { position: absolute; left: 10px; bottom: 10px; max-width: 46%; max-height: 28px; overflow: hidden; cursor: pointer;
+  padding: 6px 8px; border-radius: 6px; font-size: 10px; line-height: 1.5;
+  background: rgba(60,20,20,.9); color: #f0b4b4; border: 1px solid #6b2b2b; }
+/* 卡面上的两个事实：这一步会写外部（要人批准）、这一步等输入（没填不能开跑） */
+.fg-write { flex: none; font-size: 8px; padding: 0 3px; border-radius: 3px; background: #6b2b2b; color: #ffd9d9; }
+.fg-need { flex: none; font-size: 8px; padding: 0 3px; border-radius: 3px; background: #2f4a6b; color: #cfe4ff; }
+.fg-meta { font-size: 8px; line-height: 1.4; color: var(--text-tertiary); }
+.fg-meta.warn { color: #d8bd80; }
+
+/* 输入是开跑前的一张表单，落在画布上而不是聊天里 */
+.fs-plain.want { border-color: #6b5a2b; color: #e8cf94; }
+.fs-inputs { position: absolute; top: 10px; left: 10px; width: 330px; max-height: 62%; overflow-y: auto;
+  padding: 9px 10px; border-radius: 8px; background: var(--bg-secondary); border: 1px solid var(--border);
+  box-shadow: 0 8px 24px rgba(0,0,0,.35); z-index: 6; }
+.fs-in-head { font-size: 10px; color: var(--text-secondary); margin-bottom: 7px; }
+.fs-in { display: flex; flex-direction: column; gap: 2px; margin-bottom: 7px; }
+.fs-in-key { font-size: 10px; color: var(--text-primary); }
+.fs-in textarea { font: inherit; font-size: 11px; line-height: 1.5; min-height: 66px; padding: 5px 7px; border-radius: 5px; resize: vertical;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); }
+.fs-in-who { font-size: 8px; color: var(--text-tertiary); }
+.fs-in-warn { font-size: 10px; color: #f0b4b4; }
+.fs-problems.open { max-height: 42%; overflow-y: auto; }
+.fs-bad { cursor: pointer; }
+.fs-bottom-label { flex: none; padding: 3px 10px; font-size: 9px; color: var(--text-tertiary);
+  border-bottom: 1px solid var(--border); background: var(--bg-secondary); }
+/* 左栏放画布画不出来的：会话泳道、横切约束、数据表 */
+.fs-lane { margin-bottom: 8px; }
+.fs-lane-head { display: flex; align-items: center; gap: 5px; font-size: 10px; color: var(--text-secondary);
+  padding: 2px 4px; }
+.fs-seq { font-size: 8px; padding: 0 3px; border-radius: 3px; background: var(--bg-tertiary); color: var(--text-tertiary); }
+.fs-cons { font-size: 9px; line-height: 1.5; color: var(--text-secondary); padding: 4px 6px; margin-bottom: 4px;
+  border-left: 2px solid var(--border); }
+.fs-cons.warn { color: #d8bd80; border-left-color: #6b5a2b; }
+.fs-cons-rules { display: block; font-size: 8px; color: var(--text-tertiary); }
+.fs-table { font-size: 9px; margin-bottom: 4px; }
+.fs-table summary { cursor: pointer; color: var(--text-secondary); padding: 2px 4px; }
+.fs-table pre { margin: 3px 0 0; padding: 4px; font-size: 8px; line-height: 1.4; overflow-x: auto;
+  background: var(--bg-primary); border-radius: 4px; color: var(--text-tertiary); }
+.fg-art.lost { border-color: #6b2b2b; border-style: dashed; color: #f0b4b4; }
+/* 门是横贯所有泳道的栅栏：竖条 + 竖排文字，位置本身表示「谁都过不去」 */
+/*
+  门是一根竖条 —— 「我的意思是说纵向够长就行了，不是说横向一定要一行显示所有文字」。
+  所以形状不变(竖排、30px 宽),要变的只有一件事:**纵向要够放完文字,不截断**。
+*/
+.fg-gate.bar {
+  /*
+    min-width / max-width 必须一起复位 —— 基础 .fg-gate 为横排卡片留了 min-width: 108px,
+    而 min-width 赢过 width:30px:门于是被撑到 108 宽,塞在 30px 的节点框里向右溢出 78px。
+    「门非常宽」和「门贴着右边节点」是同一个 bug 的两个症状。
+  */
+  width: 30px; min-width: 0; max-width: none; padding: 6px 3px; flex-direction: column; justify-content: flex-start; gap: 5px;
+  border-radius: 6px; align-items: center; }
+/* 门里的字要完整显示 —— 「门的大小至少要能完整显示里面的文字，不要折叠」 */
+.fg-gate.bar .fg-gate-name { writing-mode: vertical-rl; text-orientation: mixed; font-size: 10px;
+  overflow: visible; white-space: nowrap; }
+.fg-gate.bar .fg-gate-icon { writing-mode: horizontal-tb; }
+
+/* 门开着也还是那道竖墙。它的详情往右边开 —— 墙有一列那么高，
+   面板若照卡片那样开在「下面」，就落到墙脚以下、屏幕外面去了 */
+.fg-gate { position: relative; }
+.fg-gate .fg-panel { top: 6px; left: calc(100% + 8px); }
+
+.fs-wait { font-size: 10px; color: var(--text-tertiary); }
+.fs-cons-why { margin-top: 2px; font-size: 8px; color: var(--text-tertiary); }
+/* 注册过程里的一行提示：解析失败、正在提取结构 —— 不是面板，只是不让它无声无息 */
+.reg-note { position: fixed; top: 8px; left: 50%; transform: translateX(-50%); z-index: 9000;
+  max-width: 62%; padding: 5px 12px; border-radius: 6px; font-size: 11px; cursor: pointer;
+  background: #33291a; color: #e8cf94; border: 1px solid #6b5a2b; box-shadow: 0 4px 14px rgba(0,0,0,.4); }
+/* 点开的详情：浮在画布上的面板，不再挤布局；宽到能读完一段提示词。
+   压别的节点靠的是节点自己的 z-index（flowStacking.ts）—— 卡片上写 z-index
+   跨不出自己那层 wrapper，只是看着像生效 */
+/* 反向缩放写在组件的内联 transform 里 —— 那条 translate 会整条盖掉 CSS 的声明,见 DetailPanel 注释 */
+/*
+  面板别那么长 —— 「现在看节点的窗口还是太长了」。
+  `58vh` 在 1080 的屏上是 620px，一个提示词加读入/产出/工具三块清单就能撑满，面板于是从卡片一直垂到屏幕底，
+  盖掉它下面那一整行节点。收到 `42vh`（≈450px）：一屏内还是能读完提示词，超出的部分它自己滚，
+  而且旁边的图始终露得出来 —— 点空白关闭（`onPaneClick`）也才有意义。
+*/
+.fg-panel { position: absolute; top: calc(100% + 6px); left: -2px; width: 460px; max-height: 42vh; overflow-y: auto;
+  padding: 10px 12px 12px; border-radius: 9px; background: var(--bg-secondary); border: 1px solid var(--border);
+  box-shadow: 0 14px 40px rgba(0,0,0,.5); cursor: default; text-align: left; }
+/*
+  标题条(含右上角那个 ✕)钉在顶上 —— 「点开节点后右上角关闭按钮应该是固定的」。
+  面板自己 overflow-y: auto:一个提示词九行、再加读入/产出/工具三块清单,面板一滚,✕ 就跟着标题一起滚出
+  视野 —— 想关得先滚回顶部。sticky 只吃一点顶部空间,还得自带底色,否则内容会从它下面透出来。
+*/
+.fg-panel-head { display: flex; align-items: baseline; gap: 8px; margin-bottom: 9px;
+  position: sticky; top: -10px; z-index: 4; background: var(--bg-secondary);
+  padding: 10px 0 7px; margin-top: -10px; border-bottom: 1px solid var(--border); }
+.fg-panel-head .fg-panel-x { position: sticky; right: 0; }
+/* 节点详情只分成定义与运行信息；依赖由图上的连线表达，不再重复做“上游/输出”区。 */
+.fg-panel-step { width: 860px; }
+.fg-panel-columns { display: grid; grid-template-columns: minmax(0, 1.05fr) minmax(340px, .95fr); gap: 12px; align-items: start; }
+.fg-panel-columns.definition-only { grid-template-columns: minmax(0, 1fr); }
+.fg-panel-definition, .fg-panel-data {
+  min-width: 0; padding: 9px; border-radius: 7px; border: 1px solid var(--border); background: color-mix(in srgb, var(--bg-primary) 72%, transparent);
+}
+.fg-panel-data { border-color: rgba(91,151,224,.42); }
+.fg-panel-section-title {
+  margin-bottom: 8px; padding-bottom: 5px; border-bottom: 1px solid var(--border);
+  font-size: 10px; font-weight: 700; letter-spacing: .06em; color: var(--text-secondary);
+}
+.fg-panel-section-title.input { color: #7db5ff; border-bottom-color: rgba(91,151,224,.42); }
+.fg-panel-section-title.output { margin-top: 10px; color: #7bd68f; border-bottom-color: rgba(74,157,95,.42); }
+.fg-panel-columns .fg-field:last-child { margin-bottom: 0; }
+
+.fg-panel-head b { font-size: 13px; }
+.fg-panel-head span { font-size: 10px; color: var(--text-tertiary); }
+.fg-panel-x { margin-left: auto; background: none; border: none; color: var(--text-tertiary); cursor: pointer; font-size: 12px; }
+.fg-field { display: block; margin-bottom: 9px; }
+.fg-label { display: block; font-size: 10px; color: var(--text-tertiary); margin-bottom: 3px; }
+.fg-field textarea, .fg-field input { width: 100%; box-sizing: border-box; font: inherit; font-size: 11px;
+  line-height: 1.5; padding: 6px 7px; border-radius: 6px; border: 1px solid var(--border);
+  background: var(--bg-primary); color: var(--text-primary); resize: vertical; }
+.fg-read { font-size: 11px; line-height: 1.5; color: var(--text-secondary); }
+.fg-read.dim { color: var(--text-tertiary); }
+.fg-read.warn { color: #e8cf94; }
+.fg-two { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.fg-write, .fg-need { flex: none; font-size: 9px; padding: 0 4px; border-radius: 3px; }
+/* 这一步伸到外面碰什么 —— 「对外部文件和 mcp 之类的依赖在这个图里体现不出来」 */
+/* 换行,行数与卡片预留的高度同源（`depRows.ts`）—— 原来是 nowrap + 裁掉,于是第三个工具起在卡面上不存在。
+   高度不写死:写死就等于又回到「多出来的行被裁掉」;预留那边估宽取上界,所以真实行数不会超过预留。 */
+.fg-deps { display: flex; flex-wrap: wrap; gap: 3px; row-gap: 3px; margin-top: 1px; min-height: 14px; }
+.fg-dep { font-size: 8px; line-height: 1.5; padding: 0 4px; border-radius: 3px; max-width: 100%;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; border: 1px dashed var(--border); color: var(--text-tertiary); }
+.fg-dep.file { border-color: #3f6f4a; color: #9fd0a8; }
+.fg-dep.ext, .fg-dep.external { border-color: #6f5a2f; color: #d8bd80; }
+.fg-dep.mcp { border-color: #4a5c8a; color: #a8bde0; }
+.fg-dep.more { border-style: solid; }
+/* 同一个会话顺序做的几步：一条粗的同色线,比十二种色相管用 */
+.react-flow__edge.same-session path { stroke-dasharray: none; }
+/* 同一个会话顺序做第几件事 */
+.fg-seq-i { font-style: normal; opacity: .65; }
+/* 流程外面来的东西：没有任何步骤产出它 */
+.fg-art-warn.ext-in { color: #a8bde0; }
+.fg-art-warn.file { color: #9fd0a8; }
+/* 图例：色块 = 会话，和画布同一个色相来源（flowColors.ts） */
+.fs-swatch { display: inline-block; width: 8px; height: 8px; border-radius: 2px; margin-right: 5px; flex: none; }
+.fs-shape { font-size: 9px; line-height: 1.5; color: var(--text-tertiary); padding: 0 4px 6px; }
+/* 面板右下角拖拽改大小：用原生 resize，把手只是让它看得出来可以拖 */
+/* 大小由我们自己的拖拽写在 style 上（原生 resize 在缩放过的画布里根本不动，实测过） */
+.fg-panel { min-width: 300px; max-width: 900px; overflow: auto; }
+.fg-grip { position: absolute; right: 1px; bottom: 1px; width: 16px; height: 16px; cursor: nwse-resize; z-index: 2;
+  background: linear-gradient(135deg, transparent 45%, var(--text-tertiary) 45%, var(--text-tertiary) 55%, transparent 55%,
+    transparent 70%, var(--text-tertiary) 70%, var(--text-tertiary) 80%, transparent 80%); opacity: .5; }
+
+/* ─────────────────── 运行画布（独立窗口）───────────────────
+   主进程是 run 状态的唯一来源，这个窗口只订阅和显示 —— 两个窗口要对得上，就不能各存一份。 */
+.rw-shell { display: flex; flex-direction: column; height: 100vh; background: var(--bg-primary); color: var(--text-primary); }
+.rw-head { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; flex-wrap: wrap; }
+.rw-chip { font-size: 10px; padding: 0 6px; border-radius: 3px; background: var(--bg-secondary); color: var(--accent); border: 1px solid var(--border); }
+.rw-fp { font-size: 9px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.rw-progress { font-size: 10px; color: var(--text-secondary); }
+.rw-shape { font-size: 9px; color: var(--text-tertiary); margin-left: auto; }
+.rw-body { flex: 1; min-height: 0; position: relative; }
+.rw-foot { padding: 7px 14px; border-top: 1px solid var(--border); font-size: 10px; color: var(--text-tertiary); }
+.rw-error { padding: 18px; font-size: 12px; color: var(--error); }
+/* 一次运行没有「一个对话」：每步各自一个会话，所以这里列的是「哪一步在哪个会话里跑」 */
+.rw-sessions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 7px 14px; border-top: 1px solid var(--border); }
+.rw-sessions-label { font-size: 9px; color: var(--text-tertiary); margin-right: 2px; }
+.rw-session { font: inherit; font-size: 10px; padding: 2px 8px; border-radius: 5px; cursor: pointer;
+  background: var(--bg-secondary); color: var(--text-secondary); border: 1px solid var(--border); }
+.rw-session:hover { border-color: rgba(124,111,224,0.5); color: var(--text-primary); }
+.rw-session i { font-style: normal; font-size: 9px; color: var(--text-tertiary); margin-left: 4px; }
+.rw-session.running { border-color: rgba(124,111,224,0.6); color: var(--accent); }
+.rw-session.done { border-color: #3f6f4a; }
+
+/* ─────────────────── 运行视图（主窗口里的一整页）───────────────────
+   左 project 的步骤 / 右流程图 / 下面选中那一步的对话。对话是应用自己的 pane，
+   所以「执行状态在普通对话 UI 里看得见」不需要第二套聊天实现。 */
+/* 主区域是 flex 行：不写 flex/min-width 的话这一整页会被挤成内容宽度 ——
+   实测画布容器只剩 188px（出现对话后 104px），看起来就像「图只占了左半」 */
+.rv-shell { flex: 1 1 auto; min-width: 0; width: 100%; display: flex; flex-direction: column; height: 100%; min-height: 0; }
+.rv-head { display: flex; align-items: center; gap: 10px; padding: 9px 14px; border-bottom: 1px solid var(--border); font-size: 12px; }
+.rv-chip { font-size: 10px; padding: 0 6px; border-radius: 3px; background: var(--bg-secondary); color: var(--accent); border: 1px solid var(--border); }
+.rv-fp { font-size: 9px; color: var(--text-tertiary); font-variant-numeric: tabular-nums; }
+.rv-progress { font-size: 10px; color: var(--text-secondary); }
+.rv-close { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; }
+/* 图占上面一半、对话占下面一半，两边都给下限 —— 之前图固定 60%，中间又插了「要你给的输入」和
+   「等你批准」两条，对话被挤到只剩一条缝，输入框直接看不见了。
+   比例现在可拖（`.rv-split`），所以 flex-basis 由内联样式给，这里只留兜底和下限 */
+.rv-body { flex: 1 1 50%; min-height: 200px; display: flex; }
+/* 和画布那条同一份实现（`paneSplit.ts`），样式也照抄 `.fs-split`：手柄要在画布之上，否则被它盖住就拖不动 */
+.rv-split { flex: none; height: 6px; cursor: row-resize; background: transparent; position: relative; z-index: 4; }
+.rv-split::after { content: ''; position: absolute; left: 0; right: 0; top: 2px; height: 1px; background: var(--border); }
+.rv-split:hover::after { background: rgba(124,111,224,.7); height: 2px; }
+.rv-left { width: 196px; flex: none; overflow-y: auto; padding: 8px; border-right: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-label { font-size: 9px; line-height: 1.5; color: var(--text-tertiary); padding: 0 4px 6px; }
+.rv-step { display: block; width: 100%; text-align: left; font: inherit; font-size: 11px; cursor: pointer;
+  padding: 4px 7px; border-radius: 5px; background: none; border: 1px solid transparent; color: inherit; }
+.rv-step:hover { background: var(--bg-hover); }
+.rv-step.on { border-color: rgba(124,111,224,0.5); background: rgba(124,111,224,0.12); }
+.rv-step.ready .rv-step-meta { color: var(--warning); }
+.rv-step.running .rv-step-meta { color: var(--accent); }
+.rv-step.done .rv-step-meta { color: #4a9d5f; }
+.rv-step-name { display: block; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-step-meta { display: block; font-size: 8px; color: var(--text-tertiary); }
+/* 那条 scroll bar 就是这么来的：.fg-wrap 写着 min-height: 420px（当年它独占主区域），
+   而运行视图里这块只有 325px —— 内容比容器高，于是出现一条谁也不需要的滚动条 */
+/* 兄弟 skill 仍在补写外部数据：提醒这次读到的「最新」并不完整，但不阻止用户继续。 */
+.rv-source-warning {
+  flex: none; padding: 6px 14px; font-size: 10px; line-height: 1.55; color: #e8cf94;
+  background: rgba(255,152,0,0.10); border-bottom: 1px solid rgba(255,152,0,0.35);
+}
+.rv-canvas { flex: 1; min-width: 0; position: relative; z-index: 3; overflow: hidden; }
+.rv-canvas .fg-wrap { min-height: 0; height: 100%; }
+/*
+  跑完后的成功、失败和反馈统一从画布右边打开。入口收起时只占一条窄边，打开后才给内容宽度；
+  它和节点详情是兄弟，不受 React Flow 的缩放、裁剪和 z-index 影响。
+*/
+.rv-results-toggle {
+  flex: none; width: 48px; display: flex; flex-direction: column; align-items: center; justify-content: center; gap: 6px;
+  border: 0; border-left: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary);
+  font: inherit; font-size: 10px; cursor: pointer; writing-mode: vertical-rl; letter-spacing: .08em;
+}
+.rv-results-toggle:hover { color: var(--accent); background: var(--bg-hover); }
+.rv-results-toggle b { min-width: 18px; padding: 2px 1px; border-radius: 999px; background: rgba(124,111,224,.16);
+  color: var(--accent); font-size: 9px; text-align: center; writing-mode: horizontal-tb; letter-spacing: 0; }
+/* 等你处理的件数：红的，和「一共几条结果」那个紫的分开 —— 两个数回答的是不同问题 */
+.rv-results-hot { color: var(--accent); }
+.rv-results-attention { min-width: 18px; padding: 2px 1px; border-radius: 999px; font-style: normal;
+  background: rgba(239,83,80,.18); color: #ef8b88; font-size: 9px; font-weight: 700; text-align: center;
+  writing-mode: horizontal-tb; letter-spacing: 0; }
+/* 宽度由内联 style 给（可拖，存在 ui-state），这里只留兜底和收缩下限 */
+.rv-results-panel {
+  /* 没有 max-width：上限由 `clampResultsWidth` 按窗口宽度算（见 RunView.tsx）。
+     这里原来写着 `max-width: 760px`，而 JS 那边也夹 760 —— 两道上限，改一处等于没改，
+     而 CSS 那道会**静默**盖掉行内宽度，表现成"拖了但拖不动"。 */
+  flex: 0 0 400px; min-width: 260px; display: flex; flex-direction: column; position: relative; z-index: 4;
+  border-left: 1px solid var(--border); background: var(--bg-primary); overflow: hidden;
+}
+/* 拖宽的手柄：贴在左边缘，比画布高一层，否则点不到 */
+.rv-results-grip { position: absolute; left: 0; top: 0; bottom: 0; width: 6px; cursor: col-resize; z-index: 6; background: transparent; }
+.rv-results-grip::after { content: ''; position: absolute; top: 0; bottom: 0; left: 2px; width: 1px; background: var(--border); }
+.rv-results-grip:hover::after { background: rgba(124,111,224,.7); width: 2px; }
+.rv-results-head { flex: none; display: flex; align-items: center; gap: 7px; padding: 9px 10px;
+  border-bottom: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-results-head b { font-size: 11px; }
+.rv-results-head span { font-size: 9px; color: var(--text-tertiary); }
+.rv-results-head button { margin-left: auto; border: 0; background: none; color: var(--text-tertiary); font: inherit; cursor: pointer; }
+/* 这次运行的账 —— 「可以看到 token 的使用是否经济、流程是否优化了」。
+   默认折叠：它是**事后**看的东西，而这块面板平时回答的是"现在要我做什么"。 */
+.rv-cost { flex: none; margin: 0 0 6px; padding: 6px 8px; border-radius: 6px;
+  background: var(--bg-primary); border: 1px solid var(--border); }
+.rv-cost > summary { display: flex; align-items: center; gap: 6px; cursor: pointer; font-size: 10px;
+  color: var(--text-tertiary); list-style: none; }
+.rv-cost > summary::-webkit-details-marker { display: none; }
+.rv-cost > summary::before { content: '▸'; font-size: 8px; }
+.rv-cost[open] > summary::before { content: '▾'; }
+.rv-cost > summary b { margin-left: auto; color: var(--text-secondary); font-variant-numeric: tabular-nums; }
+.rv-cost > summary em { font-style: normal; color: var(--text-tertiary); }
+.rv-cost-meta { margin: 5px 0 4px; font-size: 9px; line-height: 1.5; color: var(--text-tertiary); }
+.rv-cost-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+.rv-cost-list li { display: grid; grid-template-columns: 1fr auto 46px 52px; gap: 6px; align-items: center;
+  font-size: 9px; color: var(--text-tertiary); }
+.rv-cost-list li.heavy .rv-cost-num { color: var(--warn, #d29922); font-weight: 600; }
+.rv-cost-name { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-cost-num { font-variant-numeric: tabular-nums; color: var(--text-secondary); }
+/* 条形给份额，数字给精确值 —— 瞄一眼就知道钱花在哪一步 */
+.rv-cost-bar { height: 4px; border-radius: 2px; background: var(--bg-hover); overflow: hidden; }
+.rv-cost-bar i { display: block; height: 100%; background: var(--accent); }
+.rv-cost-list li.heavy .rv-cost-bar i { background: var(--warn, #d29922); }
+.rv-cost-carry { text-align: right; font-variant-numeric: tabular-nums; }
+
+.rv-results-list { min-height: 0; overflow-y: auto; padding: 7px; display: flex; flex-direction: column; gap: 6px; }
+/* 卡片**不许被压缩** —— 「全屏还是不能 scroll」的真正原因。
+   列向 flex 的子项默认 `flex-shrink: 1`：空间不够时它把卡片的**盒子**压小，而里面的内容照原样溢出到
+   盒子外面。于是 `scrollHeight` 跟着盒子一起变小、和 `clientHeight` 相等 —— 滚动区认为无事可滚，
+   而内容其实已经跑到面板下面被 `overflow: hidden` 裁掉了。
+   实测（面板压到 300px 高）：修之前 `scrollHeight === clientHeight === 261`，内容最深处在 1072，
+   也就是有 772px 看不见且滚不到；`flex: none` 之后 `scrollHeight` 变成 1729，滚得到底，
+   最深处回到 300（面板底边）。
+   写在这里而不是只写在 `.full` 上：收窄的面板同样是列向 flex，同样会被压。 */
+.rv-results-list > * { flex: none; }
+.rv-results-empty { padding: 12px 9px; font-size: 10px; line-height: 1.55; color: var(--text-tertiary); }
+.rv-result { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; background: var(--bg-secondary); }
+.rv-result.done { border-color: rgba(74,157,95,.42); }
+.rv-result.failed { border-color: rgba(239,83,80,.48); }
+/* 图上正选中的那一步：右边这条要认得出来，否则两边对不上号 */
+.rv-result.picked { box-shadow: 0 0 0 1px rgba(124,111,224,.55); }
+.rv-result.picked > .rv-result-row { background: rgba(124,111,224,.10); }
+.rv-result-row { width: 100%; display: flex; align-items: center; gap: 7px; padding: 7px 8px; border: 0;
+  background: transparent; color: var(--text-primary); font: inherit; font-size: 10px; text-align: left; cursor: pointer; }
+.rv-result-row:hover { background: var(--bg-hover); }
+.rv-result-caret { flex: none; width: 9px; color: var(--text-tertiary); font-size: 9px; }
+.rv-result-row b { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-result-status { flex: none; font-size: 9px; }
+.rv-result.done .rv-result-status { color: #7bd68f; }
+.rv-result.failed .rv-result-status { color: #ef8b88; }
+.rv-result-detail { padding: 0 8px 9px; display: flex; flex-direction: column; gap: 8px; font-size: 10px; }
+.rv-result-error { padding: 7px; border-radius: 6px; background: rgba(239,83,80,.07); color: #efb0ad; }
+.rv-result-error strong { display: block; font-size: 10px; line-height: 1.5; }
+.rv-result-why { margin-top: 6px; display: flex; flex-direction: column; gap: 3px; color: var(--text-secondary); font-size: 9px; line-height: 1.5; }
+.rv-result-why-title { color: #ef8b88; font-weight: 700; }
+.rv-result-why > div { display: flex; gap: 6px; }
+.rv-result-why > div > b { flex: 0 0 68px; color: var(--text-tertiary); font-weight: 400; }
+.rv-result-why .dim { color: var(--text-tertiary); }
+/* ── 让内容缩得下去，而不是把面板撑破 ─────────────────────────────────────
+   「我要的那些功能你都添加了吗，现在还看不到」—— 功能在 DOM 里，但被挤出了可视区。
+
+   实测的链条：面板 550px → 卡 535 → `.rv-result-why > div` 517 → **`.rv-result-output` 929**。
+   它是 flex 子项而 `min-width` 默认是 `auto`，于是**拒绝缩到内容宽度以下**，一路把表格顶出去；
+   `.rt-wrap` 的 `overflow: auto` 因此永远不触发（容器自己就是内容宽），最右那列（逐行的 ✕）
+   落在 x=1269，而面板右边缘在 910 —— 整列在视野外，点不到。
+
+   `min-width: 0` 在整条链上少一处就断在那一处，所以三层都要写。 */
+.rv-result-outputs { display: flex; flex-direction: column; gap: 6px; min-width: 0; }
+.rv-result-output { min-width: 0; }
+.rv-result-why > div { min-width: 0; }
+.rv-result-output > span { display: block; margin-bottom: 3px; color: var(--text-tertiary); font-size: 9px;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 文件产出的出处：正文是从磁盘读来的（`file:` 的产出不进 run values），读不到时也在这行说清 —— 
+   一片空白既可能是"文件是空的"也可能是"路径算错了"，那两件事要能分开。 */
+.rv-result-file-note { display: block; margin: 0 0 4px; color: var(--text-tertiary); font-size: 9px; font-style: normal;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-result-output pre { margin: 0; max-height: 220px; overflow: auto; padding: 7px; border-radius: 5px;
+  background: var(--bg-primary); color: var(--text-secondary); font: 10px/1.5 ui-monospace, SFMono-Regular, Menlo, monospace; white-space: pre-wrap; word-break: break-word; }
+.rv-result-file, .rv-result-no-output { padding: 6px 7px; border-radius: 5px; background: var(--bg-primary); color: var(--text-secondary); line-height: 1.5; }
+.rv-result-file-link { width: 100%; display: flex; align-items: center; gap: 7px; padding: 6px 7px; border-radius: 5px;
+  border: 1px solid rgba(74,157,95,.42); background: var(--bg-primary); color: #9fd0a8; font: inherit; font-size: 9px;
+  text-align: left; cursor: pointer; }
+.rv-result-file-link:hover { border-color: rgba(74,157,95,.75); background: rgba(74,157,95,.08); }
+.rv-result-file-link > span { flex: none; color: #7bd68f; }
+.rv-result-file-link > b { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-weight: 500; }
+.rv-result-actions { display: flex; flex-wrap: wrap; gap: 5px; }
+.rv-result-action { padding: 3px 8px; border-radius: 5px; border: 1px solid var(--border);
+  background: transparent; color: var(--text-secondary); font: inherit; font-size: 9px; cursor: pointer; }
+.rv-result-action:hover { color: var(--accent); border-color: rgba(124,111,224,.55); }
+.rv-result-action.skip:hover { color: #e8cf94; border-color: rgba(255,152,0,.55); }
+.rv-result-feedback { display: flex; flex-direction: column; gap: 5px; padding-top: 8px; border-top: 1px solid var(--border); }
+.rv-result-feedback label { color: var(--text-secondary); font-size: 9px; }
+.rv-result-feedback textarea { width: 100%; box-sizing: border-box; min-height: 58px; resize: vertical; padding: 6px 7px;
+  border: 1px solid var(--border); border-radius: 5px; background: var(--bg-primary); color: var(--text-primary); font: inherit; font-size: 10px; line-height: 1.5; }
+.rv-result-feedback button { align-self: flex-end; padding: 4px 10px; border-radius: 5px; border: 1px solid var(--accent);
+  background: var(--accent); color: #fff; font: inherit; font-size: 9px; font-weight: 600; cursor: pointer; }
+/* 下限从 280 降到 120：比例由分隔条的 12%–80% 夹住，min-height 再大就会在小窗口里把拖动吃掉 */
+.rv-chat { flex: 1 1 50%; min-height: 120px; border-top: 1px solid var(--border); display: flex; flex-direction: column; overflow: hidden; }
+/* 里面就是应用自己的 chat pane：它得能撑满这块，否则消息区和输入框各自算高度就会算飞 */
+/* 直接给高度而不是只给 flex：pane 内部自己是 flex 列，父级只给 flex 的话它会按内容算高度 ——
+   实测消息区只剩 48px，而这一块有 326px */
+.rv-chat > * { flex: 1 1 auto; min-height: 0; height: 100%; }
+.rv-hint { padding: 12px 14px; font-size: 10px; color: var(--text-tertiary); }
+.rv-error { padding: 18px; font-size: 12px; color: var(--error); display: flex; flex-direction: column;
+  align-items: flex-start; gap: 10px; }
+/* 报错也得有出路：run 不存在时刷新没用（id 从 ui-state 读回来），关掉必须按得到 */
+.rv-error-out { font-family: inherit; font-size: 11px; padding: 4px 10px; border-radius: 4px; cursor: pointer;
+  background: transparent; border: 1px solid var(--border); color: var(--text-secondary); }
+.rv-error-out:hover { color: var(--text-primary); border-color: var(--error); }
+/* project 挂着的 skill：由它的 run 推出来，在跑的时候更亮 */
+/* 用 flow 管理的 project 上那个 🧩 —— 「如果启用了 flow project 上面应该有个 tag」。
+   很淡：它是**状态**不是动作，一行里已经有把手、箭头、图标、名字、计数和 ⋮。
+   不给 hover 效果、不可点：能做的事都在 ⋮ 菜单里，一个点了没反应的东西比没有更差。 */
+.project-flow-tag { flex: none; font-size: 9px; line-height: 1; opacity: .75; cursor: default;
+  display: inline-flex; align-items: center; gap: 1px; }
+/* flow 名：截断而不是换行 —— 侧栏那一行本来就窄，而截断的名字仍然比一个数字有信息量 */
+.project-flow-name { font-style: normal; font-size: 8px; color: var(--text-tertiary);
+  max-width: 72px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.project-skill-tag { cursor: pointer; background: transparent; font-family: inherit; line-height: 1.6; flex: none; max-width: 96px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 8px; padding: 0 4px; border-radius: 3px; color: var(--text-tertiary); border: 1px solid var(--border); }
+.project-skill-tag:hover { color: var(--text-primary); border-color: rgba(124,111,224,0.6); }
+/* 左栏两段：步骤解释图，会话才是真正说话的地方 */
+.rv-sec { display: flex; align-items: center; gap: 6px; font-size: 9px; color: var(--text-muted);
+  letter-spacing: 0.06em; padding: 8px 4px 3px; }
+.rv-new { margin-left: auto; background: none; border: 1px solid var(--border); color: var(--text-secondary);
+  border-radius: 4px; cursor: pointer; font-size: 10px; line-height: 1; padding: 1px 5px; }
+.rv-new:hover { color: var(--accent); border-color: rgba(124,111,224,0.5); }
+.rv-ses { display: block; width: 100%; text-align: left; font: inherit; font-size: 11px; cursor: pointer;
+  padding: 3px 7px; border-radius: 5px; background: none; border: 1px solid transparent; color: inherit;
+  overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-ses:hover { background: var(--bg-hover); }
+.rv-ses.on { border-color: rgba(124,111,224,0.5); background: rgba(124,111,224,0.12); color: var(--accent); }
+.rv-ses.running { color: var(--accent); }
+/* 等你批准的东西就摆在图旁边：一个步骤等人和一个步骤跑得慢，在界面上必须长得不一样 */
+.rv-perms { border-top: 1px solid rgba(255,152,0,0.4); background: rgba(255,152,0,0.08); padding: 6px 14px; display: flex; flex-direction: column; gap: 5px; }
+.rv-perm { display: flex; align-items: center; gap: 8px; font-size: 11px; }
+.rv-perm-step { font-weight: 600; color: var(--warning); }
+.rv-perm-what { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+.rv-perm-yes, .rv-perm-no { font: inherit; font-size: 10px; padding: 2px 10px; border-radius: 5px; cursor: pointer; background: transparent; border: 1px solid var(--border); color: inherit; }
+.rv-perm-yes { border-color: rgba(124,111,224,0.6); color: var(--accent); }
+.rv-perm-no:hover { border-color: rgba(239,83,80,0.5); color: var(--error); }
+.rv-perm-yes:disabled, .rv-perm-no:disabled { opacity: .4; cursor: default; }
+/* 拖拽被拒的原因：静默不动会被当成「拖不动」 */
+.sb-refusal { margin: 6px 8px; padding: 5px 8px; border-radius: 6px; font-size: 10px; line-height: 1.5; cursor: pointer;
+  background: rgba(255,152,0,0.12); color: #e8cf94; border: 1px solid rgba(255,152,0,0.4); }
+/* 就绪那几步要你给的输入：填在图旁边，不在某个对话里 —— 对话里给的东西流程判断不出「给过没给过」 */
+.rv-needs { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 6px 14px;
+  border-top: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-needs-label { font-size: 9px; color: var(--text-tertiary); }
+.rv-need { display: flex; align-items: center; gap: 5px; font-size: 10px; }
+.rv-need-key { color: var(--text-secondary); max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.rv-need textarea { font: inherit; font-size: 10px; line-height: 1.45; padding: 4px 6px; border-radius: 4px; width: 260px; min-height: 42px; resize: vertical;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); }
+.rv-run { font: inherit; font-size: 10px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  background: var(--accent); color: #fff; border: 1px solid var(--accent); font-weight: 600; }
+/* 开始参数：点「运行」才弹的窗，一个 skill 一条、可折叠 —— 不常驻在页面上占地方 */
+/* 2000/2001：全局 .overlay 是 1999，低于它的弹窗会被自己的背板盖住（tests/dialogStacking 就是为此存在的） */
+.rv-start-overlay { position: fixed; inset: 0; z-index: 2000; display: flex; align-items: center;
+  justify-content: center; background: rgba(0,0,0,0.42); }
+.rv-start-dialog { z-index: 2001; width: 520px; max-width: 92vw; max-height: 82vh; display: flex; flex-direction: column;
+  border-radius: 10px; border: 1px solid var(--border); background: var(--bg-primary);
+  box-shadow: 0 18px 48px rgba(0,0,0,0.34); overflow: hidden; }
+.rv-start-dialog > header { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border-bottom: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-start-dialog > header b { font-size: 12px; }
+.rv-start-sub { font-size: 9px; color: var(--text-tertiary); }
+.rv-start-x { margin-left: auto; background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 11px; }
+.rv-start-rows { overflow-y: auto; padding: 6px; display: flex; flex-direction: column; gap: 4px; }
+.rv-start-row { border: 1px solid var(--border); border-radius: 7px; overflow: hidden; }
+.rv-start-row.current { border-color: rgba(124,111,224,0.45); }
+.rv-start-row-head { width: 100%; display: flex; align-items: center; gap: 7px; padding: 7px 9px;
+  background: var(--bg-secondary); border: none; cursor: pointer; color: var(--text-primary); font: inherit; text-align: left; }
+.rv-start-row-head b { font-size: 11px; }
+.rv-start-caret { font-size: 9px; color: var(--text-tertiary); width: 9px; }
+.rv-start-tag { font-size: 8px; padding: 1px 5px; border-radius: 999px;
+  background: rgba(124,111,224,0.16); color: var(--text-secondary); }
+.rv-start-row-sub { margin-left: auto; font-size: 9px; color: var(--text-tertiary); }
+.rv-start-fields { display: flex; flex-direction: column; gap: 8px; padding: 9px 10px 11px; }
+.rv-start-field { display: flex; flex-direction: column; gap: 3px; font-size: 10px; }
+.rv-start-label { color: var(--text-secondary); display: flex; align-items: center; gap: 6px; }
+.rv-start-optional { font-size: 9px; color: var(--text-tertiary); }
+.rv-start-field.blank .rv-start-label { color: var(--text-primary); }
+.rv-start-field.blank input, .rv-start-field.blank textarea, .rv-start-field.blank select {
+  border-color: rgba(224,138,111,0.55); }
+.rv-start-field input, .rv-start-field textarea, .rv-start-field select { font: inherit; font-size: 10px;
+  line-height: 1.45; padding: 5px 7px; border-radius: 4px; resize: vertical;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); }
+.rv-start-row-acts { display: flex; justify-content: flex-end; }
+.rv-start-go { font: inherit; font-size: 10px; font-weight: 600; padding: 4px 12px; border-radius: 6px;
+  cursor: pointer; background: var(--accent); color: #fff; border: 1px solid var(--accent); }
+.rv-start-go:disabled { opacity: 0.45; cursor: not-allowed; }
+.rv-start-note { font-size: 9px; color: var(--text-tertiary); }
+/* 带状末尾的「＋ 加 flow」：虚线，和实心的 flow 块区分开 —— 它不是一个 flow，是一个动作 */
+.rv-add-flow-wrap { position: relative; flex: none; align-self: center; }
+.rv-add-flow { appearance: none; font: inherit; font-size: 10px; padding: 6px 10px; border-radius: 7px;
+  cursor: pointer; border: 1px dashed var(--border); background: transparent; color: var(--text-secondary); }
+.rv-add-flow:hover { border-color: rgba(124,111,224,.55); color: var(--text-primary); }
+.rv-add-flow-menu { position: absolute; z-index: 30; top: calc(100% + 4px); left: 0; min-width: 230px;
+  display: flex; flex-direction: column; padding: 4px; border-radius: 8px;
+  border: 1px solid var(--border); background: var(--bg-primary); box-shadow: 0 10px 28px rgba(0,0,0,.34); }
+.rv-add-flow-empty { padding: 6px 8px; font-size: 9px; color: var(--text-tertiary); }
+.rv-add-flow-item { appearance: none; display: flex; flex-direction: column; align-items: flex-start; gap: 1px;
+  padding: 5px 8px; border: none; border-radius: 6px; background: transparent; cursor: pointer;
+  font: inherit; font-size: 10px; color: var(--text-primary); text-align: left; }
+.rv-add-flow-item:hover { background: var(--bg-secondary); }
+.rv-add-flow-item.blocked { cursor: default; color: var(--text-tertiary); }
+.rv-add-flow-item.blocked:hover { background: transparent; }
+.rv-add-flow-why { font-size: 9px; color: var(--text-tertiary); }
+/* 移出：默认几乎看不见，hover 到那一块才浮出来 —— 它是破坏性的，不该抢注意力 */
+/*
+  标签部分：外层那块从 button 改成 div 之后（见 RunView 里那段注释：disabled 的 button 会吞掉 ✕ 的点击），
+  可点的「切到这个 flow」落到这个内层按钮上，外观完全透传给外层。
+*/
+.rv-stage-open { appearance: none; -webkit-appearance: none; flex: 1 1 auto; min-width: 0;
+  display: flex; justify-content: space-between; align-items: center; gap: 8px;
+  padding: 0; border: 0; background: none; font: inherit; color: inherit; text-align: left; cursor: inherit; }
+.rv-project-stage.switchable .rv-stage-open { cursor: pointer; }
+.rv-stage-remove { appearance: none; -webkit-appearance: none; border: 0; background: none; font: inherit;
+  flex: none; margin-left: 2px; padding: 0 3px; border-radius: 4px; font-size: 9px;
+  color: transparent; cursor: pointer; }
+.rv-project-stage:hover .rv-stage-remove { color: var(--text-tertiary); }
+.rv-stage-remove:hover { background: rgba(239,83,80,.18); color: #ef5350 !important; }
+.rv-remove-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px;
+  border-bottom: 1px solid var(--border); background: rgba(239,83,80,.08); font-size: 10px; }
+.rv-remove-flow b { font-size: 10px; }
+.rv-remove-flow span { color: var(--text-secondary); }
+.rv-remove-flow button { font: inherit; font-size: 10px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-secondary); }
+.rv-remove-flow button.rv-remove-go { margin-left: auto; border-color: #ef5350; background: rgba(239,83,80,.16); color: #ef5350; }
+/* Flow 面板：就地改名那一行 —— 和配置行同一套间距，不做成弹窗（改名是编辑，不是决定） */
+.sb-rename { display: flex; align-items: center; gap: 8px; margin-top: 6px; font-size: 10px; }
+.sb-rename input { flex: 1 1 200px; min-width: 0; font: inherit; font-size: 10px; padding: 3px 7px;
+  border-radius: 6px; border: 1px solid var(--border-strong); background: var(--bg-primary); color: var(--text-primary); }
+.sb-rename-note { color: var(--text-tertiary); }
+.sb-rename button { font: inherit; font-size: 10px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-secondary); }
+.sb-rename button:disabled { opacity: .5; cursor: default; }
+
+/* Flow 面板里的配置行 */
+.sb-config { display: flex; align-items: center; gap: 8px; margin-top: 4px; font-size: 10px; }
+.sb-config-label { color: var(--text-tertiary); }
+.sb-config select { font: inherit; font-size: 10px; padding: 3px 6px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-primary); }
+.sb-config-why { font-size: 9px; color: #e08a6f; }
+/* 「这次运行用的是旧结构」—— 不是错误，是一句必须说出口的事实 */
+.rv-stale-def { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 7px 14px;
+  border-bottom: 1px solid var(--border); background: rgba(224,186,111,0.10); font-size: 10px; }
+.rv-stale-def b { font-size: 10px; }
+.rv-stale-def span { color: var(--text-secondary); }
+.rv-stale-def code { font-size: 9px; padding: 0 3px; border-radius: 3px; background: var(--bg-secondary); }
+.rv-stale-def .rv-stale-how { color: var(--text-primary); }
+.rv-stale-def button { margin-left: auto; }
+/* project 菜单里的分组标题和不可点的项 */
+.context-menu-label { padding: 4px 10px 2px; font-size: 9px; color: var(--text-tertiary); }
+.context-menu-item.disabled { opacity: .5; cursor: default; }
+.context-menu-item.disabled:hover { background: transparent; }
+.context-menu-hint { display: block; font-size: 9px; color: var(--text-tertiary); }
+/* 项目里的 flow：能切的那块要看得出可点，当前那块不该像按钮 */
+.rv-add-error { font-size: 10px; color: #e08a6f; }
+.rv-add { font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  border: 1px dashed var(--border); background: transparent; color: var(--text-secondary); }
+.rv-add:hover { border-color: rgba(124,111,224,0.55); color: var(--text-primary); }
+.rv-drift { font-size: 9px; padding: 1px 6px; border-radius: 999px;
+  background: rgba(224,186,111,0.16); color: var(--text-secondary); }
+/* 重置整次运行：破坏性，所以默认低调，且点它只是打开确认条 */
+.rv-reset { font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--text-secondary); }
+/* 标题行上的 flow 级操作入口。和 `.rv-add`/`.rv-reset` 完全同一套尺寸 —— 它原来没有样式，
+   在一排紧凑按钮里顶着浏览器默认外观，又大又突兀。 */
+.rv-flow-actions { font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--text-secondary); }
+.rv-flow-actions:hover { border-color: rgba(124,111,224,.5); color: var(--text-primary); }
+.rv-reset:hover:not(:disabled) { border-color: rgba(239,83,80,.5); color: #ef8b88; }
+.rv-reset:disabled { opacity: .4; cursor: default; }
+.rv-reset-run { display: flex; flex-wrap: wrap; align-items: center; gap: 8px; padding: 8px 14px;
+  border-bottom: 1px solid var(--border); background: rgba(239,83,80,.08); font-size: 10px; }
+.rv-reset-run b { font-size: 10px; }
+.rv-reset-run span { flex: 1 1 260px; min-width: 0; color: var(--text-secondary); line-height: 1.55; }
+.rv-reset-run button { font: inherit; font-size: 10px; padding: 3px 10px; border-radius: 6px; cursor: pointer;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-secondary); }
+.rv-reset-run button.rv-reset-go { border-color: #ef5350; background: rgba(239,83,80,.16); color: #ef5350; }
+.rv-add-dialog { z-index: 2001; width: 460px; max-width: 92vw; max-height: 82vh; display: flex; flex-direction: column;
+  border-radius: 10px; border: 1px solid var(--border); background: var(--bg-primary);
+  box-shadow: 0 18px 48px rgba(0,0,0,0.34); overflow: hidden; }
+.rv-add-dialog > header { display: flex; align-items: center; gap: 8px; padding: 10px 12px;
+  border-bottom: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-add-dialog > header b { font-size: 12px; }
+.rv-add-dialog > footer { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-top: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-add-dialog > footer button { font: inherit; font-size: 10px; padding: 3px 10px; border-radius: 6px;
+  cursor: pointer; border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-secondary); }
+.rv-add-dialog > footer button.rv-start-go { border-color: var(--accent); background: var(--accent); color: #fff; }
+.rv-add-dialog > footer .rv-start-note { margin-right: auto; }
+/* 后加的节点：虚线边框 + 角标，一眼区分「核对过的」和「运行中加的」 */
+.fg-node.added { border-style: dashed; border-color: rgba(224,186,111,0.75); }
+.fg-added { font-size: 8px; padding: 0 4px; border-radius: 999px;
+  background: rgba(224,186,111,0.18); color: var(--text-secondary); }
+.rv-start-dialog > footer { display: flex; align-items: center; gap: 8px; padding: 8px 12px;
+  border-top: 1px solid var(--border); background: var(--bg-secondary); }
+.rv-start-dialog > footer button { font: inherit; font-size: 10px; padding: 3px 10px; border-radius: 6px;
+  cursor: pointer; margin-left: auto; border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-secondary); }
+/* 会话搜索：标题和 project 名都算命中，命中的组自己展开 */
+.sb-search { display: flex; align-items: center; gap: 4px; padding: 6px 8px 2px; }
+.sb-search input { flex: 1; min-width: 0; font: inherit; font-size: 11px; padding: 4px 8px; border-radius: 6px;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); }
+.sb-search input:focus { outline: none; border-color: rgba(124,111,224,0.55); }
+.sb-search-x { background: none; border: none; color: var(--text-muted); cursor: pointer; font-size: 11px; padding: 0 2px; }
+.sb-search-note { padding: 2px 10px 4px; font-size: 9px; color: var(--text-tertiary); }
+/* 当前停在哪一步：光圈 + 头部一句话。状态点回答「这一步怎么了」，光圈回答「我该看哪」 */
+.fg-node.current, .fg-gate.current { box-shadow: 0 0 0 2px var(--accent), 0 6px 18px rgba(124,111,224,.28); }
+.rv-now { font-size: 10px; color: var(--accent); font-weight: 600; }
+
+/* macOS 上那条 34px 的标题栏是 `position: fixed; z-index: 1000` 的拖窗区，侧栏靠 padding-top 让开它。
+   这一页当初没让 —— 于是头部滑到了它下面：按钮的中心点 elementFromPoint 返回 .mac-titlebar，用 JS 点得到、
+   用鼠标点不到（「运行点不动」）。让开，而不是去和拖窗区抢 z-index：抢赢了就变成拖不动窗口。 */
+.app-layout.mac .rv-shell { padding-top: var(--mac-titlebar-height); }
+/* 列头 = 批次：同一列就是同时跑。「2 步并行（2 个会话）」把并行和会话数一次说清 */
+/*
+  列头一种颜色，那一种是 accent 紫 —— 「文字有的紫色有的灰的」→「列头颜色不应该都是紫色吗」。
+  原来 `.fg-wave.parallel` 紫、其余灰，一排列头里「第 3 批 · 4 步并行」紫、「第 4 批 · 1 步」灰。
+  统一的方向是**紫**（列头是这张图的结构标注，属于同一类信息）；并行与否文案里已经写了
+  （「4 步并行（4 个会话）」对「1 步」），只用字重再强调一下，不再靠颜色分。
+*/
+.fg-wave { font-size: 8px; color: var(--accent); letter-spacing: .04em; white-space: nowrap; padding: 0 2px; }
+.fg-wave.parallel { font-weight: 700; }
+/* 当前一批：实光圈。下一批：虚线圈 —— 「现在在哪」和「接下来是什么」是两个问题，两种圈 */
+.fg-node.upnext, .fg-gate.upnext { outline: 1px dashed rgba(124,111,224,.75); outline-offset: 2px; }
+.rv-next { font-size: 10px; color: var(--text-secondary); }
+.rv-plain { font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
+.rv-plain:hover { color: var(--text-primary); border-color: rgba(124,111,224,0.5); }
+/* 节点详情里的输入与重跑：修正发生在声明了这个需求的那一步旁边，而不是一条全局的横条上 */
+.fg-need-row { display: flex; flex-direction: column; align-items: stretch; gap: 4px; font-size: 10px; margin-bottom: 9px; }
+.fg-need-row > span { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-secondary); }
+.fg-need-row textarea { width: 100%; min-height: 64px; font: inherit; font-size: 10px; line-height: 1.5; padding: 5px 7px; border-radius: 4px;
+  border: 1px solid var(--border); background: var(--bg-primary); color: var(--text-primary); }
+.fg-rerun { font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 6px; cursor: pointer;
+  background: transparent; color: var(--text-secondary); border: 1px solid var(--border); }
+.fg-rerun:hover { color: var(--accent); border-color: rgba(124,111,224,0.55); }
+/* 收起按钮浮在对话右上角：一条横栏会吃掉本来就不够的对话高度 */
+.rv-chat { position: relative; }
+.rv-chat-fold { position: absolute; top: 4px; right: 8px; z-index: 5; font: inherit; font-size: 14px; font-weight: 300; line-height: 1;
+  width: 20px; height: 20px; padding: 0; border-radius: 3px; cursor: pointer; background: transparent; color: var(--text-tertiary);
+  border: none; opacity: .45; }
+.rv-chat:hover .rv-chat-fold { opacity: .58; background: transparent; }
+/* 收起后原地留一条缝：点它展开。折叠不是消失 */
+.rv-chat-strip { flex: none; width: 100%; text-align: left; font: inherit; font-size: 10px; cursor: pointer;
+  padding: 5px 12px; background: var(--bg-secondary); color: var(--text-tertiary);
+  border: none; border-top: 1px solid var(--border); }
+.rv-chat-strip:hover { color: var(--accent); }
+.rv-chat-fold:hover { color: var(--text-secondary); opacity: .85; }
+/* 失败之后告诉你出路在哪：原来头部把「运行」藏掉、又不说能做什么，看着像卡死 */
+.rv-stuck { padding: 5px 14px; font-size: 10px; line-height: 1.6; color: #e8cf94;
+  background: rgba(255,152,0,0.10); border-top: 1px solid rgba(255,152,0,0.35); }
+/* ── 节点状态用整卡背景说话 ────────────────────────────────────────
+   「流程节点应该有背景颜色显示节点状态…这个需要变得更显眼」。
+   原来状态只在那个 7px 的小圆点上（Temporal 的做法：点告诉你「此刻在发生什么」，整卡染色会盖掉结构）——
+   但那是给一张**已经跑完、四十个节点**的图设计的。运行中的图上同时只有一两步在动，这时候「哪几步在跑、哪一步
+   炸了」比结构更要紧，所以染色，只是压得很浅、并且把左边那道会话色条留着。 */
+/* ── 正在跑：必须一眼看出来 ──────────────────────────────────────────────
+   「一个在跑的节点图上看不出来他是在跑还是怎么了，你应该把图上的状态做得更明显一些」
+
+   原来 running 只是一点紫色底 + 边框，而 `current` / `upnext` / `willrun` 也各有一层浅色底 ——
+   四种静态样式互相之间根本分不出来。
+
+   动效是唯一不会被误认成静态状态的信号：静态的浅色底可以是"轮到它了"、"待跑"、"高亮"，
+   而**在动**只可能是"正在进行"。所以给它两样动的东西：呼吸的外发光，和顶边一条来回扫的进度条。 */
+.fg-node.running, .fg-gate.running {
+  background: rgba(124,111,224,0.18);
+  border-color: var(--accent);
+  animation: fg-run-breathe 1.6s ease-in-out infinite;
+}
+@keyframes fg-run-breathe {
+  0%, 100% { box-shadow: 0 0 0 0 rgba(124,111,224,0.45); }
+  50%      { box-shadow: 0 0 0 5px rgba(124,111,224,0.10); }
+}
+/* 顶边那条扫来扫去的线 —— 它说的是"还在动"，而不是"进度到了百分之几"（我们并不知道进度）。
+
+   动的是 `background-position` 而不是 `transform`：后者会把那条线**推到节点外面**，而 `.fg-node`
+   只有 `position: relative`、没有 `overflow: hidden`（给它加上会连带裁掉展开后的详情面板）。
+   动背景位置的话一切都留在元素框内，不依赖任何裁剪。用 ::after 是为了不和已有的 ::before 打架。 */
+.fg-node.running::after {
+  content: ''; position: absolute; left: 0; right: 0; top: 0; height: 2px;
+  background: linear-gradient(90deg, transparent, var(--accent), transparent);
+  background-size: 55% 100%; background-repeat: no-repeat;
+  animation: fg-run-sweep 1.4s linear infinite;
+  pointer-events: none;
+}
+@keyframes fg-run-sweep {
+  0%   { background-position: -60% 0; }
+  100% { background-position: 160% 0; }
+}
+/* 跑了多久。等宽数字，免得每秒跳动时整行宽度跟着抖。 */
+.fg-elapsed {
+  flex: none; margin-left: auto; font-size: 10px; font-variant-numeric: tabular-nums;
+  padding: 1px 5px; border-radius: 999px;
+  background: var(--accent); color: #fff; white-space: nowrap;
+}
+/* 超过 5 分钟换成警示色 —— 「在跑」和「卡住了」的区别只有时间说得出来 */
+.fg-elapsed.slow { background: var(--warning); color: #1a1a1a; }
+/* 这一步那条会话吃了多少上下文 —— **画成一个环**，「弄成饼更好一点？现在看着不太明显」。
+   一个 9px 的百分比数字要读完才知道多少；一个环的填充比例是**瞄一眼**就有的量。
+   实现用 `conic-gradient`：没有 SVG、没有额外 DOM，而且百分比直接就是角度。
+   数字留着摆在环旁边（环给量级，数字给精确值），只是不再是唯一的信息载体。 */
+.fg-ctx {
+  flex: none; margin-left: 4px; display: inline-flex; align-items: center; gap: 3px;
+  font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  color: var(--text-tertiary);
+}
+.fg-ctx-dial {
+  width: 11px; height: 11px; border-radius: 50%; flex: none;
+  /* --pct 由行内 style 给（0–100）。剩余部分用很淡的底色，所以"几乎空"和"没有这个环"看得出区别 */
+  background: conic-gradient(var(--ctx-fill, var(--text-tertiary)) calc(var(--pct, 0) * 1%),
+                             rgba(127,127,127,.22) 0);
+  box-shadow: inset 0 0 0 1px rgba(127,127,127,.28);
+}
+.fg-elapsed + .fg-ctx { margin-left: 4px; }
+/* 这一步花了多少 —— 和耗时、上下文并排，三格说的是同一件事的三个侧面：这一步的代价。
+   `heavy` 是"这次运行里最贵的那几步之一"：判据在 `runCost` 里（能测），这里只负责画得显眼一点。 */
+.fg-cost {
+  flex: none; margin-left: 4px; font-size: 9px; font-variant-numeric: tabular-nums; white-space: nowrap;
+  color: var(--text-tertiary);
+}
+.fg-cost.heavy { color: var(--warn, #d29922); font-weight: 600; }
+
+.fg-ctx:first-child, .fg-chip + .fg-ctx { margin-left: auto; }
+.fg-ctx.mid { color: #d9a34a; --ctx-fill: #d9a34a; }
+.fg-ctx.high { color: var(--error); --ctx-fill: var(--error); font-weight: 600; }
+/* 动效跟随系统设置关掉 —— 但颜色和计时留着，信息不能只靠动画承载 */
+@media (prefers-reduced-motion: reduce) {
+  .fg-node.running, .fg-gate.running { animation: none; box-shadow: 0 0 0 2px rgba(124,111,224,0.45); }
+  .fg-node.running::after { animation: none; opacity: .7; }
+}
+.fg-node.done { background: rgba(74,157,95,0.14); border-color: rgba(74,157,95,0.5); }
+.fg-node.done .fg-name { color: #9fd0a8; }
+.fg-node.failed, .fg-gate.failed { background: rgba(239,83,80,0.16); border-color: rgba(239,83,80,0.6); }
+.fg-node.failed .fg-name { color: #f0b4b4; }
+/* 等你的：门在等人拍板、段在等输入 —— 同一种「球在你这边」的黄 */
+.fg-node.waiting, .fg-gate.waiting { background: rgba(255,152,0,0.16); border-color: rgba(255,152,0,0.6); }
+.fg-node.waiting .fg-name, .fg-gate.waiting .fg-gate-name { color: #e8cf94; }
+/* 还没轮到的：不染色，也不该抢注意力 */
+.fg-node.todo { opacity: .72; }
+/* 但开着工具说明时不淡化 —— opacity 会连弹出层一起淡化，而你正在读它（另一半见 .fg-dep-detail 那段） */
+.fg-node.todo.showtool { opacity: 1; }
+.fg-acts { display: flex; flex-wrap: wrap; gap: 6px; }
+
+/* Acceptance A: visible port labels use separate vertical tracks so upstream/output never collide. */
+.react-flow__handle.fg-port.input::after { content: '上游'; right: 15px; top: -6px; }
+.react-flow__handle.fg-port.output::after { content: '产出'; left: 15px; top: calc(100% + 6px); }
+.fg-panel-step { width: 900px; }
+.fg-panel-columns { grid-template-columns: minmax(360px, .9fr) minmax(420px, 1.1fr); }
+.fg-runtime-region { padding: 8px; margin-bottom: 10px; border: 1px solid var(--border); border-radius: 7px; }
+.fg-runtime-region:last-child { margin-bottom: 0; }
+.fg-runtime-region.parameters { border-color: rgba(124,111,224,.45); }
+.fg-panel-section-title.parameters { color: #c6bfff; border-bottom-color: rgba(124,111,224,.45); }
+.fg-need-row small, .fs-in-desc { color: var(--text-tertiary); font-size: 9px; line-height: 1.4; }
+.fg-need-row textarea { width: 100%; min-width: 360px; min-height: 88px; box-sizing: border-box; }
+.fg-need-row input, .fg-need-row select,
+.fs-in input, .fs-in select, .rv-need input, .rv-need select {
+  width: 100%; box-sizing: border-box; font: inherit; color: var(--text-primary);
+  background: var(--bg-primary); border: 1px solid var(--border); border-radius: 5px; padding: 5px 7px;
+}
+
+/* 通用产物预览仍会用到；运行结果本身已迁到右侧 `.rv-result-output pre`。 */
+.fg-value { margin: 0; padding: 6px 7px; max-height: 200px; overflow: auto; font-size: 10px; line-height: 1.5;
+  background: var(--bg-primary); border-radius: 5px; color: var(--text-secondary); white-space: pre-wrap; }
+
+/* Project Skills are sibling work items. The row is a status overview, never an execution pipeline. */
+.rv-project-pipeline {
+  flex: none; display: flex; align-items: stretch; gap: 8px; padding: 8px 14px;
+  background: var(--bg-secondary); border-bottom: 1px solid var(--border);
+}
+.rv-project-parallel-label {
+  flex: none; align-self: center; color: var(--text-tertiary); font-size: 10px; white-space: nowrap;
+}
+/*
+  这一块是 <button> 而不是 <div>（要能点着切 flow）。所以第一件事是把原生按钮外观按掉：
+  没有 `appearance: none` + 显式 background 的话，macOS 会在深色界面里画一个浅灰按钮 —— 那就是「太丑」的来源，
+  不是配色问题而是没重置控件样式。状态只用一个小圆点表示，颜色沿用画布上那套（done 绿 / running 紫 / failed 红）。
+*/
+.rv-project-stage {
+  appearance: none; -webkit-appearance: none;
+  flex: 0 1 220px; min-width: 0; display: flex; justify-content: space-between; gap: 8px;
+  align-items: center; padding: 7px 10px; border-radius: 7px;
+  border: 1px solid var(--border); background: var(--bg-primary);
+  font: inherit; font-size: 10px; color: var(--text-secondary); text-align: left;
+  cursor: default; transition: background .12s ease, border-color .12s ease;
+}
+.rv-project-stage:disabled { opacity: 1; color: var(--text-secondary); }
+.rv-project-stage.switchable { cursor: pointer; }
+.rv-project-stage.switchable:hover { background: var(--bg-secondary); border-color: rgba(124,111,224,.5); color: var(--text-primary); }
+.rv-project-stage.switchable:active { transform: translateY(0.5px); }
+.rv-project-stage.current {
+  border-color: rgba(124,111,224,.7); background: rgba(124,111,224,.10); color: var(--text-primary);
+}
+.rv-project-stage b { font-weight: 600; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+/* 状态：一个圆点 + 一句中文，不再是 in_progress 这种生枚举 */
+/* 会话顶部那条"子代理在跑"。和记忆横幅同一层同一形制，但用中性色 —— 它是进行中的状态，不是警告。
+   `flex: none` 同理：聊天区是 flex 列，不写它会吃掉消息列表的滚动高度。 */
+.chat-crew-bar {
+  flex: none; display: flex; align-items: center; gap: 8px; flex-wrap: wrap;
+  margin: 6px 8px 0; padding: 4px 9px;
+  border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-secondary); font-size: 10px; color: var(--text-secondary);
+}
+.chat-crew-count { flex: none; font-weight: 600; }
+/* 每个子代理一枚：名字实、状态淡。名字不许换行，状态可以被挤掉 —— 名字才是你要找的那个。 */
+.chat-crew-item { flex: 0 1 auto; min-width: 0; display: inline-flex; align-items: baseline; gap: 4px; }
+.chat-crew-item b { flex: none; white-space: nowrap; color: var(--text-primary); font-weight: 500; }
+.chat-crew-item span { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--text-tertiary); }
+
+/* 当前选中会话碰过的节点。**只描边不填色** —— 节点的填色已经归状态用了（done/failed/running），
+   再叠一层底色会让"这是什么状态"和"这是谁跑的"打架。正在用的实线且更亮，跑过的虚线。 */
+.fg-node.sess-current { box-shadow: 0 0 0 2px rgba(124,111,224,.85); }
+.fg-node.sess-past { box-shadow: 0 0 0 1px rgba(124,111,224,.45); }
+.fg-node.sess-past::after {
+  content: '跑过'; position: absolute; top: -7px; right: 6px;
+  font-size: 8px; padding: 0 4px; border-radius: 3px;
+  background: var(--bg-secondary); color: var(--text-tertiary); border: 1px solid var(--border);
+}
+
+/* 收起状态节点上的重跑入口。默认很淡，hover 卡片时才显出来 —— 它是每个跑过的节点都有的动作，
+   常亮会让整张图变成按钮墙。 */
+/* 节点上的运行/重跑按钮：**常驻**，不是 hover 才浮出来。
+   原来它 `opacity: 0` 到 hover 才显形 —— 于是"这个节点能不能重跑"必须靠鼠标一个个扫过去才知道，
+   而这恰恰是看图时最想一眼扫到的信息。带文字也是为了这个：一个光秃秃的 ↺ 得先猜它是什么。 */
+.fg-node-act {
+  margin-left: auto; flex: none; font: inherit; font-size: 10px; font-weight: 600; line-height: 1;
+  padding: 3px 7px; border-radius: 5px; cursor: pointer; white-space: nowrap;
+  border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary);
+  transition: background .12s, border-color .12s, color .12s;
+}
+.fg-node-act:focus-visible { outline: 2px solid var(--accent); outline-offset: 1px; }
+/* 「运行」是把还没做的事推进一步 —— 用主色，它是这个节点上唯一能做的动作。 */
+.fg-act-run { background: var(--accent); border-color: var(--accent); color: #fff; }
+.fg-act-run:hover { filter: brightness(1.08); background: var(--accent); color: #fff; }
+/* 「重跑」用琥珀色（`--warning`）。
+   一开始做成了描边 + hover 才变色，实测在一张画着十几个节点的图上根本扫不到 —— 而这是常用动作。
+   为什么不跟「运行」共用主色：两者在同一张图上并存（跑过的挂 ↺、没跑的挂 ▶），同色就等于把
+   "推进"和"推翻"画成一件事。
+   为什么不用红（`--error`）：红在这个界面里是删除。重跑不删任何东西 —— 产出留档、transcript 留着，
+   它只是让这一步再算一次。琥珀正好是"这会作废一份已有结果，想清楚再点"。 */
+.fg-act-rerun {
+  background: var(--warning); border-color: var(--warning);
+  color: #1a1a1a;   /* 琥珀底上用深色字 —— 白字在 #ff9800 上对比度不够 */
+}
+.fg-act-rerun:hover { filter: brightness(1.12); background: var(--warning); color: #1a1a1a; }
+
+/* 门的三个出口：竖排分组。它们是**互斥的决定**，而其中两个各自带输入（一段意见 / 一个节点），
+   挤成一行在 400px 宽的面板里既看不清归属也点不准。 */
+.rv-gate-decide { display: flex; flex-direction: column; gap: 10px; margin-top: 10px; }
+/* 通过是主操作：单独一行、通宽、实心。另两个是次操作，描边。 */
+.rv-gate-pass {
+  width: 100%; font: inherit; font-size: 11px; font-weight: 600; padding: 6px 10px;
+  border-radius: 6px; cursor: pointer;
+  background: var(--accent); color: #fff; border: 1px solid var(--accent);
+}
+.rv-gate-pass:hover { filter: brightness(1.08); }
+.rv-gate-group {
+  display: flex; flex-direction: column; gap: 5px;
+  padding: 8px; border: 1px solid var(--border); border-radius: 6px;
+  background: var(--bg-secondary);
+}
+.rv-gate-group-label { font-size: 9px; color: var(--text-tertiary); }
+/* 「按照 comment 修改」/「打回重做」发的是什么、后果是什么 —— 摊开写在按钮上方。
+   「按这个改这里不需要输入框，输入完全来自上面的 comment」：那个 textarea 连同它的样式一起去掉了。 */
+.rv-gate-sending { font-size: 9px; line-height: 1.6; color: var(--text-tertiary); }
+.rv-gate-sending b { color: var(--text-secondary); font-weight: 600; }
+/* 一行一个控件（下拉一行、按钮一行）—— 和上面那一组同一个形状。
+   下拉吃满整行（`min-width: 0` 才允许它收缩）；按钮那一行靠 flex 自然左对齐。 */
+.rv-gate-row { display: flex; align-items: center; gap: 6px; }
+.rv-gate-select {
+  flex: 1 1 auto; min-width: 0; font: inherit; font-size: 11px; padding: 4px 6px;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--bg-primary); color: var(--text-primary);
+}
+.rv-gate-secondary {
+  flex: none; font: inherit; font-size: 10px; padding: 4px 9px; border-radius: 5px; cursor: pointer;
+  border: 1px solid var(--border); background: transparent; color: var(--text-secondary);
+}
+.rv-gate-secondary:hover:not(:disabled) { border-color: rgba(124,111,224,.5); color: var(--text-primary); }
+.rv-gate-secondary:disabled { opacity: .4; cursor: default; }
+/* 门要审什么：定义里写明的那段话，比正文更显眼一点（它是这张卡的主题） */
+.rv-gate-review {
+  font-size: 11px; line-height: 1.6; color: var(--text-primary);
+  padding: 7px 8px; border-radius: 5px;
+  background: rgba(214,158,46,.09); border: 1px solid rgba(214,158,46,.32);
+}
+
+/* 「这个 flow 一条运行都没有」的落地页。复用 `.rv-shell`/`.rv-head` 的外壳，所以这里只管正文区。 */
+/* 收紧过：原来 18px/12px 的留白让这一小块看着像个空页面。它只有一句话和一个按钮，不需要那么大。 */
+.rv-no-runs-body {
+  flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column;
+  align-items: flex-start; gap: 8px; padding: 12px 14px;
+  font-size: 11px; color: var(--text-secondary); line-height: 1.6;
+}
+.rv-no-runs-body p { margin: 0; max-width: 58ch; }
+
+/* 运行的时间戳。`tabular-nums` 是必须的：等宽数字让一排 chip 的宽度一致，否则 11 和 08 不一样宽，
+   整条带状会随时间参差不齐。它比状态更淡 —— 它是背景信息，不是要你先读的东西。 */
+.rv-stage-when {
+  flex: none; font-size: 9px; color: var(--text-muted, #777);
+  font-variant-numeric: tabular-nums; white-space: nowrap;
+}
+.rv-stage-status { flex: none; display: inline-flex; align-items: center; gap: 4px; font-size: 9px; color: var(--text-tertiary); }
+.rv-stage-status::before {
+  content: ''; width: 5px; height: 5px; border-radius: 50%; background: var(--text-muted, #777);
+}
+.rv-project-stage.completed .rv-stage-status::before { background: #4a9d5f; }
+/* 真的在跑：紫点 + 呼吸。「它要是没在跑就不是运行中」—— 动的那个点只有真在动的时候才该有 */
+.rv-project-stage.running .rv-stage-status::before { background: #7c6fe0; animation: rv-stage-pulse 1.6s ease-in-out infinite; }
+@keyframes rv-stage-pulse { 0%, 100% { opacity: 1; } 50% { opacity: .35; } }
+/* 等你：琥珀色，和「有事要你做」那套颜色一致；它是静止的 —— 没有东西在动 */
+.rv-project-stage.waiting .rv-stage-status::before { background: #d9a34a; }
+.rv-project-stage.waiting .rv-stage-status { color: #d9a34a; }
+.rv-project-stage.failed .rv-stage-status::before { background: #ef5350; }
+.rv-project-stage.failed { border-color: rgba(239,83,80,.45); }
+.rv-need-description { font-size: 9px; color: var(--text-tertiary); }
+
+/* Acceptance D: the persisted native Task checklist visibly marks its current item. */
+.plan-item.current { margin: 0 -5px; padding: 3px 5px; border-radius: 5px; background: rgba(124,111,224,.12); }
+.plan-item-current {
+  flex: none; padding: 0 5px; border-radius: 999px; font-size: 9px; font-weight: 700;
+  color: var(--accent); border: 1px solid rgba(124,111,224,.45); text-transform: lowercase;
+}
+
+/*
+  详情面板里的交接和工具清单 —— 「输入是啥产出是啥工具调用都是啥完全不能点开看」。
+  一行一条,行本身是按钮:点开印这一条的来龙去脉(来自谁/给谁/这个工具在这一步是读还是写)。
+  「没人接」的那条单独标出来:读入没人产 = 起跑参数或者是个洞,产出没人读 = 交付物或者白做。
+*/
+.fg-hand { margin-top: 10px; }
+.fg-hand-row { border: 1px solid var(--border-subtle, rgba(255,255,255,.09)); border-radius: 6px; margin-bottom: 4px; overflow: hidden; }
+.fg-hand-row.open { border-color: rgba(124,111,224,.5); }
+.fg-hand-row.orphan { border-color: rgba(255,152,0,.45); }
+.fg-hand-head { width: 100%; display: flex; align-items: center; gap: 6px; padding: 4px 7px;
+  background: none; border: none; cursor: pointer; text-align: left; color: var(--text-secondary); font-size: 10px; }
+.fg-hand-head:hover { background: rgba(124,111,224,.1); }
+.fg-hand-caret { color: var(--text-tertiary); font-size: 9px; }
+.fg-hand-ref { flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono, ui-monospace, monospace); color: var(--text-primary); }
+.fg-hand-who { color: var(--text-tertiary); font-size: 9px; white-space: nowrap; }
+.fg-hand-row.orphan .fg-hand-who { color: var(--warning); }
+.fg-hand-body { padding: 5px 8px 7px 20px; font-size: 10px; line-height: 1.5; color: var(--text-secondary);
+  border-top: 1px solid rgba(255,255,255,.06); }
+.fg-hand-empty { font-size: 10px; color: var(--text-tertiary); padding: 2px 0 6px; }
+
+/*
+  「定义已删除」的那一格 —— 带状是从 run 推出来的,而删 flow 删的是注册表:留下的这一格是历史,不是配置。
+  灰掉 + 虚线边,和「还没跑」区分开;✕ 仍然可用,那是把它从这个 project 移出的地方。
+*/
+.rv-project-stage.gone { opacity: .55; border-style: dashed; }
+.rv-project-stage.gone b { text-decoration: line-through; }
+.rv-project-stage.gone .rv-stage-status { color: var(--warning); }
+
+/* 菜单行末尾那个移出 ✕ —— 和会话行上的删除同一套手感：平时淡，悬停才红 */
+.context-menu-item .context-menu-x { margin-left: auto; padding: 0 2px; color: var(--text-tertiary);
+  font-size: 11px; cursor: pointer; border-radius: 3px; }
+.context-menu-item .context-menu-x:hover { color: var(--danger, #ef5350); background: rgba(239,83,80,.12); }
+
+/* 流程主会话的 tag：和 worker 那面同形不同色 —— 它不跑步骤，是这个 flow 的那条线程 */
+.session-flow.main { background: rgba(124,111,224,.14); border-color: rgba(124,111,224,.45); color: var(--accent); }
+/* 左置的那份：身份标签，排在标题前面。比右排的状态 tag 宽一点，flow 名不该被截成两个字 */
+.session-flow.lead { margin-right: 4px; max-width: 132px; }
+/* worker 的身份 tag：比主会话淡一档 —— 主会话是这个 flow 在这个 project 的那条线程，worker 只是它的一步 */
+.session-flow.worker { border-color: rgba(124,111,224,.3); color: var(--text-tertiary); }
+
+
+/* 注册对话框里那两栏「步骤跑在哪」—— 和名称同一格，因为它们都是这个 flow 的属性 */
+.sr-config { display: flex; gap: 10px; margin-top: 8px; }
+.sr-config label { flex: 1; min-width: 0; display: flex; flex-direction: column; gap: 3px;
+  font-size: 10px; color: var(--text-tertiary); }
+.sr-config select { font-size: 11px; padding: 3px 5px; }
+
+/*
+  「待你输入」是按钮，气泡里才是输入框 —— 「需要输入的话单独点那个 待你输入 按钮，不是在节点输入的」。
+  节点详情是定义（做什么、判据、工具）；每次运行都不同的输入不该塞在那里。
+*/
+.fg-need-wrap { position: relative; display: inline-flex; }
+.fg-need { cursor: pointer; }
+.fg-need.open { outline: 1px solid var(--accent); outline-offset: 1px; }
+.fg-need.filled { color: #7bd68f; border-color: rgba(74,157,95,.5); }
+.fg-need-pop { position: absolute; top: calc(100% + 5px); left: 0; z-index: 12; width: 300px; max-height: 320px;
+  overflow-y: auto; padding: 8px 10px 10px; border-radius: 8px; background: var(--bg-secondary);
+  border: 1px solid var(--border); box-shadow: 0 12px 32px rgba(0,0,0,.45); cursor: default; text-align: left; }
+.fg-need-pop-head { display: flex; align-items: center; font-size: 10px; color: var(--text-tertiary);
+  margin-bottom: 7px; }
+
+/* 工具展开的三行：目标 / 原话 / 闸门判定 —— 都是这一次调用的事，不是类别话 */
+.fg-tool-line { display: flex; flex-wrap: wrap; gap: 4px; align-items: baseline; margin-bottom: 3px; }
+.fg-tool-line b { font-size: 9px; color: var(--text-tertiary); font-weight: 600; }
+.fg-tool-line code { font-size: 9px; padding: 0 4px; border-radius: 3px; background: rgba(255,255,255,.06);
+  color: var(--text-primary); }
+.fg-tool-line.quote { display: block; color: var(--text-secondary); font-style: italic; }
+.fg-tool-line.verdict { display: block; color: #7bd68f; }
+.fg-tool-line.verdict.bad { color: var(--warning); }
+
+/*
+  门线：虚线、门的颜色 —— 「这他妈到底是过门还是不过门」。
+  实线 = 声明的交接；虚线从门出来 = 这一步没有声明依赖它，但门是墙，要等它放行。
+*/
+.react-flow__edge.fg-edge.blocked .react-flow__edge-path {
+  stroke: rgba(124,111,224,.5); stroke-width: 1.4; stroke-dasharray: 5 4;
+}
+.react-flow__edge.fg-edge.blocked .react-flow__edge-text { fill: var(--accent); font-size: 8px; }
+
+/* Agent 配置按钮：贴着选 agent 的下拉，同一件事的两个动作放在一起（改的是全局那份定义） */
+.composer-agent-config { display: inline-flex; align-items: center; padding: 0 4px; line-height: 1; opacity: .75; }
+.composer-agent-config:hover:not(:disabled) { opacity: 1; color: var(--accent); }
+
+
+/* 这一步自己报的待办（kiro 的 ACP plan）：勾掉的淡、正在做的高亮 —— 「这一步为什么跑了八分钟」的答案 */
+.fg-runtime-region.tasks { margin-bottom: 8px; }
+.fg-task { display: flex; gap: 5px; align-items: baseline; font-size: 10px; line-height: 1.5;
+  color: var(--text-secondary); }
+.fg-task-mark { flex: none; width: 10px; color: var(--text-tertiary); }
+.fg-task.completed { color: var(--text-tertiary); text-decoration: line-through; }
+.fg-task.completed .fg-task-mark { color: #7bd68f; }
+.fg-task.in_progress, .fg-task.current { color: var(--text-primary); }
+.fg-task.in_progress .fg-task-mark { color: var(--accent); }
+.fg-task-text { min-width: 0; }
+
+/* ── 产出里那张表 ──────────────────────────────────────────────────────────
+   门卡里原来是个 `<pre>`：一堵 3300 字的文字墙，藏着一张 27 行的表，而你在门上要做的事
+   恰恰是逐行核对。这里把它渲染成真的表，并且每一格可点可改。
+
+   面板只有 400px 宽而表有 5 列，所以：横向可滚（不是压字号硬塞，5 号字读不了）、
+   表头吸顶（滚到第 20 行还得知道哪列是「建议文件」）。 */
+/* `min-width: 0` 是这里的关键，不是可选的美化。
+   没有它，flex 子项**不肯缩到内容宽度以下**，于是 `.rt-wrap` 自己长到表格那么宽（实测 929px，
+   而面板只有 550px），它内部的 `overflow: auto` 就永远不触发 —— 表格整体溢出到面板外面，
+   而最右边那列（`登记`，就是逐行的 ✕）落在 x=1269，面板右边缘在 910：**整列在视野外，点不到**。
+   这就是「我要的那些功能你都添加了吗，现在还看不到」的直接原因：功能在 DOM 里，但被挤出了可视区。 */
+.rt-root { display: flex; flex-direction: column; gap: 8px; min-width: 0; }
+/* 表格前后的散文照原样留着 —— 那段"上游要求用正文辅助判断这一点做不到"说的是这张表的可信度 */
+.rt-prose, .rt-plain {
+  margin: 0; white-space: pre-wrap; word-break: break-word;
+  font: inherit; font-size: 11px; line-height: 1.6; color: var(--text-secondary);
+}
+.rt-wrap {
+  overflow: auto; max-height: 420px; max-width: 100%;
+  border: 1px solid var(--border); border-radius: 6px; background: var(--bg-primary);
+}
+.rt-table { border-collapse: collapse; font-size: 11px; line-height: 1.5; width: max-content; min-width: 100%; }
+.rt-table th, .rt-table td {
+  border-bottom: 1px solid var(--border); border-right: 1px solid var(--border);
+  padding: 4px 7px; text-align: left; vertical-align: top; max-width: 260px; word-break: break-word;
+}
+.rt-table th:last-child, .rt-table td:last-child { border-right: none; }
+.rt-table thead th {
+  position: sticky; top: 0; z-index: 1;
+  background: var(--bg-secondary); color: var(--text-primary); font-weight: 600; white-space: nowrap;
+}
+.rt-row:hover td { background: var(--bg-hover); }
+/* 可点的格子要看得出可点，但 27 行 × 5 列都加边框会让整张表变成网格噪音 —— 只在 hover 时提示 */
+.rt-cell { cursor: text; }
+.rt-cell:hover { outline: 1px dashed var(--border); outline-offset: -1px; }
+/* 改过的格子：原值划掉留着 —— 「我把它从什么改成了什么」是复核自己改动时唯一要看的东西 */
+.rt-cell.changed { background: color-mix(in srgb, var(--accent) 10%, transparent); }
+.rt-was { opacity: .5; }
+.rt-row.changed td:first-child { box-shadow: inset 2px 0 0 var(--accent); }
+.rt-cell-editing { padding: 2px 3px; }
+.rt-cell-input {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 11px;
+  padding: 2px 4px; border: 1px solid var(--accent); border-radius: 3px;
+  background: var(--bg-primary); color: var(--text-primary);
+}
+.rt-why-row td { background: color-mix(in srgb, var(--accent) 5%, transparent); padding: 3px 7px; }
+.rt-why {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 10px;
+  padding: 3px 5px; border: 1px solid var(--border); border-radius: 4px;
+  background: var(--bg-primary); color: var(--text-primary);
+}
+.rt-why::placeholder { color: var(--text-tertiary); }
+/* 单元格里的行内代码 —— 模型用它标命中的关键词（`Kiro`、`bedrock`），原样显示就是把反引号摆出来 */
+.rt-table code {
+  font-family: var(--font-mono, ui-monospace, monospace); font-size: 10px;
+  padding: 0 3px; border-radius: 3px; background: var(--bg-secondary);
+}
+
+/* 节点展开后那块产出正文。
+
+   **不设自己的高度和滚动** —— 「这个结果窗口没有 scroll」。第一版给了它 `max-height: 260px; overflow: auto`，
+   而它待的 `.fg-panel` 只有 42vh 高、也自带滚动：滚轮动的是里面那个小框，不是你想滚的面板。
+   嵌套滚动在感觉上就是"滚不动"。现在内容进面板那一个滚动区，而"太长"由默认折起来解决（见 OutputSection）。 */
+.fg-output-body {
+  border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px; background: var(--bg-primary);
+}
+/* 折叠头：它是个按钮，但要长得和旁边那几个 section 标题一样 */
+.fg-output-toggle {
+  display: flex; align-items: center; gap: 5px; width: 100%;
+  border: 0; background: none; padding: 0; font: inherit; text-align: left; cursor: pointer;
+}
+/* 表格在这里也不该自带滚动条 —— 同一个理由：面板已经有一个滚动区了 */
+.fg-output-body .rt-wrap { max-height: none; }
+
+/* ── 记录说在跑，其实没人在驱动它 ────────────────────────────────────────
+   「子会话都没在运行但图上显示在跑，很显然他们都没有同步关系」
+
+   这不是"跑得慢"，所以**不能**沿用 running 那套动效 —— 动效说的是"还在动"，而它没有。
+   动效全部撤掉、换成静止的琥珀色描边：静止本身就是信息。 */
+.fg-node.running.stalled, .fg-gate.running.stalled {
+  animation: none;
+  background: color-mix(in srgb, var(--warning) 12%, transparent);
+  border-color: var(--warning);
+  box-shadow: none;
+}
+/* 那条扫光条必须停 —— 它在假装还有进度 */
+.fg-node.running.stalled::after { animation: none; content: none; }
+.fg-elapsed.stuck { background: var(--warning); color: #1a1a1a; }
+
+/* 逐行取舍：「不登记」那一列。
+   「通过」不占按钮 —— 默认就是通过，给 27 行各摆一个勾是在收一笔没有信息量的税。 */
+/* 登记那一列**钉在右边**。
+   表比面板宽是常态（5 列中文 + 长句子），横滚之后最右列就跑出去了 —— 而它恰好是逐行操作的入口。
+   和表头 `position: sticky` 钉在上边是同一个手法：滚到第 20 行还要知道哪列是「建议文件」，
+   横滚到中间也还要点得到「不登记」。 */
+.rt-act-col {
+  width: 34px; text-align: center;
+  position: sticky; right: 0; z-index: 2;
+  background: var(--bg-primary);
+  border-left: 1px solid var(--border);
+}
+/* 表头那一格要压在数据格之上（它同时钉上边和右边，两个方向的 sticky 要更高一层） */
+.rt-table thead th.rt-act-col { z-index: 3; background: var(--bg-secondary); }
+.rt-row:hover td.rt-act-col { background: var(--bg-hover); }
+/* 登记（默认）= 绿色实心点。一列 27 个灰色空心圈读起来像"还没决定"，而它其实是"这一条会进结果"——
+   默认状态也是一个决定，就该看得出来是肯定的那一侧。 */
+.rt-drop {
+  font: inherit; font-size: 11px; line-height: 1; cursor: pointer;
+  width: 20px; height: 20px; border-radius: 999px;
+  border: 1px solid color-mix(in srgb, var(--success) 45%, var(--border));
+  background: var(--bg-secondary); color: var(--success);
+}
+/* hover 预告的是**按下去会变成什么**（不登记），所以这里转红，而不是把绿色加深 */
+.rt-drop:hover { border-color: var(--error); color: var(--error); }
+.rt-drop.on { background: var(--error); border-color: var(--error); color: #fff; }
+.rt-drop.on:hover { filter: brightness(1.1); }
+/* 被排除的行整行划掉 —— 它还在表里给你复核，但不会进结果 */
+.rt-row.dropped td { opacity: .45; text-decoration: line-through; }
+.rt-row.dropped td.rt-act-col { opacity: 1; text-decoration: none; }
+
+/* 「有步骤要读写工作目录之外的文件」那条横幅。复用 rv-stale-def 的排版，只换成警示色 ——
+   它和「这次运行用的是旧结构」是同一类东西：跑之前就该知道的事。 */
+.rv-path-warn { border-color: color-mix(in srgb, var(--warning) 55%, var(--border)); }
+.rv-path-warn b { color: var(--warning); }
+.rv-path-list { margin: 4px 0 0; padding-left: 18px; font-size: 10px; line-height: 1.6; color: var(--text-secondary); }
+
+/* 逐段正文反馈。
+   「除了表格之外，每一段输出的文字我也要有反馈的地方」——
+   表格能逐行改因为它有行列，而产出里同样重要的东西常常在散文里（那段"上游要求用正文辅助判断
+   这一点做不到"是整张表可信度的前提）。 */
+.rt-block { position: relative; padding-right: 46px; }   /* 两个按钮：💬 和 ✕ */
+/* 💬 常驻但很淡：一段产出常有五六段文字，每段一个亮按钮就成了噪音 */
+.rt-note-btn {
+  position: absolute; right: 0; top: 0; width: 20px; height: 20px; padding: 0;
+  font-size: 11px; line-height: 1; cursor: pointer; border-radius: 4px;
+  border: 1px solid transparent; background: none; color: var(--text-tertiary); opacity: .5;
+}
+.rt-note-btn:hover { opacity: 1; border-color: var(--border); background: var(--bg-hover); }
+/* 写过意见的段落：左边一道竖线 —— 收起输入框之后也看得出哪几段被评过 */
+.rt-block.noted { border-left: 2px solid var(--accent); padding-left: 7px; }
+.rt-block.noted .rt-note-btn { opacity: 1; color: var(--accent); }
+/* 段落删除 —— 「有的段落根本没啥用也应该删」。和 💬 一样淡，摆在它右边。
+   摆在最右是因为它是**破坏性**的那个：手滑点到的成本不对称，离常用的那个远一点。 */
+.rt-block-drop {
+  position: absolute; right: 22px; top: 0; width: 20px; height: 20px; padding: 0;
+  font-size: 10px; line-height: 1; cursor: pointer; border-radius: 4px;
+  border: 1px solid transparent; background: none; color: var(--text-tertiary); opacity: .5;
+}
+.rt-block-drop:hover { opacity: 1; border-color: var(--error); color: var(--error); background: var(--bg-hover); }
+.rt-block-drop.on { opacity: 1; color: var(--error); border-color: var(--error); }
+/* 「✎ 改这一段的正文」—— 第四种段落操作，摆在 💬(right:0) 和 ✕(right:22) 左边那个位置。
+   和 💬 的区别是**谁动手**：💬 是"你重做这一段"，✎ 是"我改好了，照这个往下走" ——
+   通过这道门时只有 ✎ 会进下游，💬 不会。AI-DLC 填 [Answer]: 靠的就是它。 */
+.rt-block-edit {
+  position: absolute; right: 44px; top: 0; width: 20px; height: 20px; padding: 0;
+  font-size: 11px; line-height: 1; cursor: pointer; border-radius: 4px;
+  border: 1px solid transparent; background: none; color: var(--text-tertiary); opacity: .5;
+}
+.rt-block-edit:hover { opacity: 1; border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
+/* 改写过的段落：左边一道竖线（和写过意见的那种同一种语言），但**实线更亮** ——
+   它比意见更硬：意见是请求，这个已经是产出的一部分了。 */
+.rt-block.edited { border-left: 2px solid var(--success, #3fb950); padding-left: 7px; }
+.rt-edit-brief .rt-note-brief-mark { color: var(--success, #3fb950); }
+/* 删掉的段落**留在原位划掉**，不是直接消失：消失了你就不知道自己删了什么、也点不回来 */
+.rt-block.dropped .rt-prose { opacity: .38; text-decoration: line-through; text-decoration-color: var(--error); }
+.rt-block.dropped { border-left: 2px solid var(--error); padding-left: 7px; }
+/* 「＋ 加一段」—— 摆在整份产出最下面。前面那三样（改格子 / 删段 / 提意见）只能处置模型写出来的东西，
+   这个是唯一能**加**东西的入口：周报这类成稿常常缺一件只有人知道的事。 */
+.rt-adds { display: flex; flex-direction: column; gap: 6px; margin-top: 8px;
+  padding-top: 8px; border-top: 1px dashed var(--border); }
+.rt-add { position: relative; padding-right: 24px; }
+.rt-add-btn {
+  align-self: flex-start; font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 5px;
+  cursor: pointer; background: transparent; border: 1px dashed var(--border); color: var(--text-tertiary);
+}
+.rt-add-btn:hover { border-color: var(--accent); border-style: solid; color: var(--accent); }
+/* 意见框：草稿 + 确认/取消 —— 「comment 框应该加确认和取消按钮确认了就缩短」。
+   动作行右对齐、字很小：它是这块里最不需要抢注意力的部分，正文和输入框才是。 */
+.rt-note-box { margin-top: 5px; }
+.rt-note-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 5px; }
+.rt-note-ok, .rt-note-cancel {
+  font: inherit; font-size: 10px; line-height: 1; cursor: pointer; border-radius: 4px; padding: 4px 10px;
+}
+/* 确认是主动作，但也只给一道描边 —— 一个实心按钮在一段正文旁边太重 */
+.rt-note-ok { border: 1px solid var(--accent); background: transparent; color: var(--accent); }
+.rt-note-ok:hover { background: var(--accent); color: #fff; }
+/* 取消连边框都不要：它是退路，不该和确认长得一样重 */
+.rt-note-cancel { border: 0; background: none; color: var(--text-tertiary); padding: 4px 2px; }
+.rt-note-cancel:hover { color: var(--text-primary); }
+
+/* 收起之后那一行摘要 —— 只留一道竖线的话，你不点开就不知道这一段写了什么、也不知道存下来了没有。
+   **一行，超出省略**：它的作用是"确认自己写过"，不是重读全文（全文在 title 里，点开就能改）。 */
+.rt-note-brief {
+  display: flex; align-items: baseline; gap: 5px; width: 100%; margin-top: 4px;
+  font: inherit; font-size: 10px; line-height: 1.5; text-align: left; cursor: pointer;
+  border: 0; background: none; padding: 0; color: var(--accent);
+}
+.rt-note-brief-mark { flex: none; opacity: .75; font-size: 9px; }
+.rt-note-brief-text {
+  flex: 1 1 auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  color: var(--text-secondary);
+}
+.rt-note-brief:hover .rt-note-brief-text { color: var(--text-primary); }
+.rt-note {
+  /* 默认高一些 —— 「把 comment 的默认长度调长一点」。
+     这里写的常常是整段替换内容（G1 那七个字段一条条写下来就有七行），两行的框让人一边写一边滚，
+     而滚上去就看不见自己前面写的。`rows` 是初值，`min-height` 保底（有些情况下浏览器按行高算得更矮），
+     `resize: vertical` 允许再拉。 */
+  min-height: 170px;
+  width: 100%; box-sizing: border-box; resize: vertical; margin-top: 4px;
+  font: inherit; font-size: 10px; line-height: 1.5; padding: 4px 6px;
+  border: 1px solid var(--border); border-radius: 5px;
+  background: var(--bg-primary); color: var(--text-primary);
+}
+.rt-note::placeholder { color: var(--text-tertiary); }
+
+/* 右栏铺满 —— 「占满除了左侧栏的地方」。
+   `.rv-shell` 本身就是"左侧栏以外的那块"，所以铺满 = 盖住它。用 absolute + inset 而不是把画布宽度改成 0：
+   后者会让 ReactFlow 在一个 0 宽容器里重算布局，回来时节点位置全乱（那是它自己会记的东西）。 */
+.rv-shell { position: relative; }
+.rv-results-panel.full {
+  position: absolute; inset: 0; z-index: 8;
+  flex-basis: auto; min-width: 0; border-left: 0;
+}
+/* 铺满时**取消表格的内部限高** —— 「全屏模式下不能 scroll」。
+   平时每张表限高 420px 在自己内部滚（面板只有 400–900px 宽高有限，那是对的）；但铺满之后面板有
+   1080px 高，三张限高的表把内容总高压在可视范围内，外层于是没有可滚的余量，而滚轮落在表格上动的是
+   里面那个框 —— 嵌套滚动在感觉上就是"滚不动"。铺满时让表格自然展开，由面板那一个滚动区负责。
+   和节点详情里那块产出正文是同一条道理：一个滚动区，不是两个。 */
+.rv-results-panel.full .rt-wrap { max-height: none; }
+/* 表头仍然吸顶 —— 现在吸的是面板那个滚动区，滚到第 20 行照样看得见列名 */
+.rv-results-panel.full .rt-table thead th { position: sticky; top: 0; }
+/* 铺满/还原按钮：和收起那个 ✕ 一样低调，它不是主操作 */
+.rv-results-full {
+  margin-left: auto; border: 0; background: none; padding: 0 2px;
+  color: var(--text-tertiary); font: inherit; cursor: pointer; line-height: 1;
+}
+.rv-results-full:hover { color: var(--accent); }
+.rv-results-full[aria-pressed="true"] { color: var(--accent); }
+/* 头部那个 ✕ 原来靠 `margin-left: auto` 顶到右边；现在铺满按钮占了那个位置，✕ 只留一点间距 */
+.rv-results-head .rv-results-full + button { margin-left: 6px; }
+
+/* 有合法取值集的格子：平时带一个淡 ▾，不点进去也知道它可选。
+   「账号和建议文件那两个理应能让我选择的」——上一版用 `<input list>` + `<datalist>`，那不是选择器
+   （要先打字才冒提示），而且只在编辑态才存在，所以看起来就是"选不了"。
+   没有取值集的列什么标记都不给：一个点了只能自己打字的按钮比没有按钮更让人失望。 */
+.rt-cell.pickable { padding-right: 16px; position: relative; cursor: pointer; }
+.rt-pick-mark {
+  position: absolute; right: 4px; top: 50%; transform: translateY(-50%);
+  font-size: 9px; color: var(--text-tertiary); pointer-events: none;
+}
+.rt-cell.pickable:hover .rt-pick-mark { color: var(--accent); }
+.rt-cell-select {
+  width: 100%; box-sizing: border-box; font: inherit; font-size: 11px;
+  padding: 2px 4px; border: 1px solid var(--accent); border-radius: 3px;
+  background: var(--bg-primary); color: var(--text-primary);
+}
+
