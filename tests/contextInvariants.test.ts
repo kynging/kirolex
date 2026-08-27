@@ -153,3 +153,45 @@ describe('a consumed steer reaches the durable transcript', () => {
     assert.equal(calls, 1, 'persistSteer is called from more than one place — steers would be duplicated');
   });
 });
+
+describe('replacing the executor does not cost a rebuild turn in snapshot mode', () => {
+  test('both switches go through one shared decision, not their own copy', () => {
+    // There were two copies of the same wrong policy (model + Agent), and a third
+    // place -- acp:ensure-context -- with the RIGHT one. Collapsing the two onto one
+    // function is what keeps them from drifting apart again.
+    assert.match(main, /function restoreContextAfterExecutorSwap\(sessionId: string, trigger: string\)/);
+    assert.match(main, /restoreContextAfterExecutorSwap\(sessionId, 'switch-model'\)/);
+    assert.match(main, /restoreContextAfterExecutorSwap\(sessionId, 'switch-agent'\)/);
+  });
+
+  test('neither switch marks the debt or primes directly any more', () => {
+    // The bug was not "an extra turn": `!entry.needsHistoryPrime` is a ride-along
+    // PRECONDITION, and marking the debt is the first thing markContextOwedIfUnverified
+    // does -- so doing it here foreclosed the zero-cost path and forced the locked,
+    // failure-prone rebuild instead.
+    for (const trigger of ['switch-model', 'switch-agent']) {
+      assert.equal(
+        main.includes(`markContextOwedIfUnverified(sessionId, '${trigger}')`),
+        false,
+        `${trigger} still marks the rebuild owed directly; it must go through restoreContextAfterExecutorSwap`,
+      );
+    }
+  });
+
+  test('only verbatim mode still rebuilds after a swap', () => {
+    // 'full' is one turn PER CHUNK by definition, so it cannot ride along on a single
+    // message and keeps the real rebuild.
+    const body = main.slice(main.indexOf('function restoreContextAfterExecutorSwap'));
+    const fn = body.slice(0, body.indexOf('\n}\n') + 3);
+    assert.match(fn, /primeMode === 'full'/);
+    assert.match(fn, /primeHistoryNow\(sessionId\)/);
+    // …and the snapshot branch does nothing but log.
+    assert.match(fn, /context RIDES ALONG after/);
+  });
+
+  test('the ride-along precondition this depended on is still in place', () => {
+    // If `needsHistoryPrime` ever stops gating the ride-along, the reasoning above
+    // (and the fix) no longer holds.
+    assert.match(main, /const rideAlong = isFeatureEnabled\('rideAlongContext'\)[\s\S]{0,400}?!entry\.needsHistoryPrime/);
+  });
+});
