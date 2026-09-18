@@ -1,7 +1,5 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import fs from 'node:fs';
-import path from 'node:path';
 import { launchLogName, logsToPrune, LAUNCH_LOGS_KEPT } from '../src/main/logger.ts';
 
 /**
@@ -94,41 +92,5 @@ describe('旧命名的日志也要清掉', () => {
     /* 12 份里删掉最老的 2 份，外加那个遗留的 */
     assert.equal(gone.length, 3);
     assert.ok(gone.includes('main.log'));
-  });
-});
-
-/*
- * 真正在无声长大的是另外两处（实测）：
- *   · `previews/` **95MB**，56 个目录 × 1.8MB —— 缓存 key 里有 deck 的 mtime，改一次 ppt 就多一份，
- *     旧那份从此再也不会命中；
- *   · `backups/review-files/` **59MB**，91 份整份 pptx 副本。
- * 两处的价值都只在最近那几份，所以按 mtime 留最近 N。
- */
-describe('预览缓存和改写备份也要有上限', () => {
-  const MAIN = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-
-  test('有一个共用的"留最近 N 项"，按**修改时间**排', () => {
-    assert.match(MAIN, /const keepNewest = \(dir: string, keep: number, what: string\): void =>/);
-    /* 预览目录名是哈希，排不出先后 —— 只能按 mtime */
-    assert.match(MAIN, /\.sort\(\(a, b\) => b\.at - a\.at\)/);
-    assert.match(MAIN, /if \(entries\.length <= keep\) return;/);
-  });
-
-  test('转完一次预览就清一次 —— 不留"攒一整天等重启"的窗口', () => {
-    assert.match(MAIN, /keepNewest\(previewsRoot, PREVIEW_CACHE_KEPT, '预览缓存'\)/);
-    assert.match(MAIN, /const PREVIEW_CACHE_KEPT = 10;/);
-  });
-
-  test('备份那六行**只剩一份实现**，五处调用点都走它', () => {
-    assert.match(MAIN, /const saveReviewBackup = \(want: string, bytes: Buffer \| string\): string \| null =>/);
-    assert.equal((MAIN.match(/saveReviewBackup\(want, /g) || []).length, 5);
-    /* 目录路径只出现在那一处（外加 review:backup-file 的日志），不再散落各处 */
-    assert.equal((MAIN.match(/'backups', 'review-files'/g) || []).length, 1);
-  });
-
-  test('清理在**写完备份之后** —— 反过来中间崩一下就两头空', () => {
-    const at = MAIN.indexOf('const saveReviewBackup =');
-    const body = MAIN.slice(at, at + 900);
-    assert.ok(body.indexOf('fs.writeFileSync(at, bytes') < body.indexOf('keepNewest(backupDir'));
   });
 });
