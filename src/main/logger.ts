@@ -39,10 +39,29 @@ export function launchLogName(startedAt: number, seq = 0): string {
 
 const LAUNCH_LOG = /^main-\d{8}-\d{6}(-\d+)?\.log$/;
 
-/** Which files to delete, oldest first. Only launch logs are candidates — `dev-hot.log` is not ours. */
+/**
+ * **旧命名方案的遗留** —— 「你看下 kirolex 是不是堆积了很多陈旧日志」。
+ *
+ * 这套一次启动一份文件之前，日志是一个不断长的 `main.log`，满 2MB 轮转成 `main.log.1`。
+ * 换方案时没人管那两个文件 —— 而 `LAUNCH_LOG` 那条正则匹配不上它们，于是它们**永远不会被清**。
+ * 实测：`main.log` 912K（8月27日）+ `main.log.1` 2.0MB（8月12日）= 日志总量的 **85%**，
+ * 而它们记的是一个多月前那些早就不成立的代码路径。
+ *
+ * 它们不可能是"这次启动"的文件（这次的名字一定带时间戳），所以看到就删，不用留一份。
+ */
+const LEGACY_LOG = /^main\.log(\.\d+)?$/;
+
+/**
+ * Which files to delete, oldest first.
+ *
+ * 两类：**这套命名的**留最近 `keep` 份；**旧命名的遗留**（见 `LEGACY_LOG`）一律删。
+ * `dev-hot.log` 不动 —— 那是 `scripts/dev-hot.mjs` 写的，不是这个 logger 的东西，
+ * 由别人的生命周期管着（而它只有 92K）。
+ */
 export function logsToPrune(files: string[], keep: number = LAUNCH_LOGS_KEPT): string[] {
   const mine = files.filter((f) => LAUNCH_LOG.test(f)).sort();
-  return mine.length <= keep ? [] : mine.slice(0, mine.length - keep);
+  const stale = mine.length <= keep ? [] : mine.slice(0, mine.length - keep);
+  return [...stale, ...files.filter((f) => LEGACY_LOG.test(f))];
 }
 
 /** This launch's file. Chosen once, at load: the launch has exactly one start time. */
