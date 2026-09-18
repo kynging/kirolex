@@ -82,7 +82,9 @@ describe('死模型只发现一次', () => {
 
   test('已知死掉的排到**最后**而不是删掉 —— 一次误判不该让会话连不上', () => {
     const at = MAIN.indexOf('async function connectWithModelFallback(');
-    const body = MAIN.slice(at, MAIN.indexOf('\n}', MAIN.indexOf('No usable model', at)));
+    /* 切到函数末尾那个 throw —— 原来按 `'No usable model'` 找，而那句话已经换成
+       "kiro-cli 起不来（试过 N 个模型都失败）"（见 modelList 那组：每个候选都失败不是模型的问题） */
+    const body = MAIN.slice(at, MAIN.indexOf('\n}', MAIN.indexOf('throw new Error(looksAuth', at)));
     assert.match(body, /const dead = all\.filter\(\(m\) => modelsKnownDead\.has\(m\)\)/);
     assert.match(body, /\.\.\.all\.filter\(\(m\) => !modelsKnownDead\.has\(m\)\), \.\.\.dead/);
     assert.doesNotMatch(body, /candidates = all\.filter\(\(m\) => !modelsKnownDead/,
