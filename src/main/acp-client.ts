@@ -165,7 +165,20 @@ export class AcpClient extends EventEmitter {
 
       this.process.on('close', (code) => {
         this.emit('disconnected', { code });
-        this.rejectAllPending(new Error(`Process exited with code ${code}`));
+        /*
+          **`code 0` 要说成"退出了"，不是"失败了"** ——「重连会话好像也会被当作失败处理？」
+
+          实测那一串：`disconnected … busy=true` → `[prompt] error … Process exited with code 0`
+          → `resume attempt 2 succeeded` → 消息被重发、上下文随行。也就是说这一轮**最终是成好的**，
+          而中间那句以 `error` 的身份进了界面。`code 0` 是**正常退出**（kiro-cli 自己收摊了），
+          把它和 code 1 那种真崩溃说成同一件事，只会让人以为自己的这一轮坏了。
+
+          仍然 reject（那些在飞的请求确实等不到回答了），只是把话说准：谁看见这条消息，
+          都该往"重连"想，而不是往"我的输入有问题"想。
+        */
+        this.rejectAllPending(new Error(code === 0
+          ? '执行器已退出（正常退出，code 0）—— KiroLex 会自动重连并重发这一轮。'
+          : `Process exited with code ${code}`));
       });
 
       this.process.on('error', (err) => {
