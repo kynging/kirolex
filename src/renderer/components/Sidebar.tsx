@@ -1,4 +1,5 @@
 import { projectsToCollapse } from '../projectActivity';
+import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { searchSessions } from '../sessionSearch';
 import { placeMenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
@@ -441,6 +442,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
    */
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
   const autoCollapsed = useRef(false);
+  /** kiro trace 日志开着吗（见下面那个 ⚑）—— 跟着 `kirolex:features-changed` 刷新 */
+  const [traceOn, setTraceOn] = useState(kiroTraceOn());
+  useEffect(() => {
+    const sync = () => setTraceOn(kiroTraceOn());
+    sync();
+    window.addEventListener('kirolex:features-changed', sync);
+    /* 开屏时 features 还没取回来，等一拍再读一次 */
+    const t = setTimeout(sync, 1500);
+    return () => { window.removeEventListener('kirolex:features-changed', sync); clearTimeout(t); };
+  }, []);
   /**
    * 启动时**只留热的那个 project 展开**，别的全折起来 —— 「把不用的 project 折叠起来断掉会话，省占用」。
    *
@@ -1033,6 +1044,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             <IconLogs size={18} />
           </button>
+          {/*
+            **trace 开着就必须看得见** ——「配置中未发现人为启用特殊日志级别」。
+
+            那个开关不在 kiro 的配置里（在 `~/.kirolex/kiro-trace`），所以查 kiro 一定查不到；
+            而它一开就是每天十几 GB —— 实测一个执行器攥着 7.86 GB 的 kiro-chat.log。
+            一个悄无声息、代价按 GB 计的开关，忘了关就是磁盘被填满，所以这里常驻一个红点，点一下就关。
+          */}
+          {traceOn && (
+            <button
+              className="sidebar-settings-btn sidebar-trace-on"
+              title={'kiro-cli trace 日志**开着** —— 每天十几 GB。点一下关掉（下一次起执行器生效）'}
+              aria-label="kiro trace 日志开着，点一下关掉"
+              onClick={() => { void setKiroTrace(false).then((on) => setTraceOn(on)); }}
+            >
+              ⚑
+            </button>
+          )}
         </div>
       </div>
 

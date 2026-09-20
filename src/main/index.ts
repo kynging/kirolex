@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFile } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd } from './config';
 import * as loopVerify from './loopVerify';
@@ -18,6 +18,11 @@ import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
 import { shouldConsolidate, buildConsolidationPrompt, mergeSessionMemory, CONSOLIDATE_EVERY } from './sessionMemory.ts';
+import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
+import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
+import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry.ts';
+import { cliErrorContext, kiroCliLogPath, trimHugeCliLogs } from './kiroCliLog.ts';
+import { writeFailureBundle } from './failureBundle.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -90,6 +95,26 @@ interface SessionEntry {
    *  Refreshed on EVERY update, so a long command that reports intermediate progress
    *  keeps its session protected for as long as it keeps reporting. */
   openToolCalls?: Map<string, { startedAt: number; lastUpdate: number }>;
+  /**
+   * **这一轮后端开过几个工具调用** —— 自动重试的安全闸（见 `promptRetry`）。
+   *
+   * `fileChanges` 不能用来回答这个问题：它只记"动过文件/跑过命令"的那些，一轮里纯读取和
+   * 查询类的调用不进去；`openToolCalls` 也不行，它只留还没关闭的。而"这一轮跑过工具吗"
+   * 恰恰是决定能不能闭眼重发的那个事实 —— 实测挂掉的那一轮里有 `aws ssm send-command`，
+   * 重发一次就是再执行一遍。所以单独数，每轮开始清零，`tool_call`（不含 update）时 +1。
+   */
+  toolsThisTurn?: number;
+  /**
+   * **这一轮最大的一次工具输出有多少字符**（未裁剪的原始长度）——「好像 curl 那个大 json 的时候断掉了」。
+   *
+   * kiro-cli 把工具输出放在 `tool_call_update` 的 content 里，KiroLex 自己存盘时会裁
+   * （`clampToolOutput`），但**发给模型的那一份是 kiro-cli 自己攥着的、没裁**。所以一轮里
+   * 冒出一个几百 KB 的 JSON 时，后端最后答的是 `EmptyResponse` / `Internal error` ——
+   * 而界面上只有一句"生成不出回答"，看不出是被哪一步撑死的。
+   *
+   * 记原始长度就是为了把这句话说出来。只在这一轮失败时才用它。
+   */
+  maxToolOutputThisTurn?: number;
   /** kiro's native subagents for THIS chat, as last reported by `_kiro.dev/subagent/list_update`.
    *  Kept so the left rail can carry a tag for as long as one is still running. */
   subagents?: SubagentRow[];
@@ -293,6 +318,9 @@ async function connectWithModelFallback(
  *  "The model 'X' is not available. Please use '/model' ...". So model health
  *  CANNOT be established at connect time alone -- this matcher is what lets the
  *  prompt path fall back instead of dead-ending on every send. */
+/* 传输层瞬时错误的判据在 `transientError.ts`（纯的、要给 `promptRetry` 复用）。 */
+export const isTransientTransportError = isTransientTransportErrorImpl;
+
 function isModelUnavailableError(text: string): boolean {
   return /model\s+'[^']+'\s+is not available/i.test(text) || /use\s+'\/model'\s+to select a different model/i.test(text);
 }
@@ -516,7 +544,23 @@ function clampToolOutput(text: string): string {
   return text.slice(0, TOOL_OUTPUT_HEAD) + marker + text.slice(-TOOL_OUTPUT_TAIL);
 }
 
-/** Text an ACP tool call reported, across ALL of its content blocks.
+/**
+ * **"这一轮里最大的一次工具输出"那句提示** ——「好像 curl 那个大 json 的时候断掉了」。
+ *
+ * 实测那条会话：一轮里 109 个工具调用、里面有整段 `aws ec2 describe-*` 的 JSON，最后后端回
+ * `EmptyResponse`（模型自己在日志里读到的原话），而界面上只有一句"生成不出回答"。
+ * 发给模型的那一份输出是 kiro-cli 攥着的、没裁过，所以这个数字是唯一能指向原因的东西。
+ *
+ * 阈值 20000 字符：低于这个量的输出不值得提，提了只会变成每条错误后面的一句废话。
+ */
+function bigOutputHint(maxChars?: number): string {
+  const n = Number(maxChars) || 0;
+  if (n < 20000) return '';
+  return `（其中最大的一次输出 ${Math.round(n / 1000)}K 字符 —— 后端很可能是在这上面答不出来的，`
+    + '下次给那条命令加上 `--query` / `| head` 把输出截小）';
+}
+
+/** Text an ACP tool call reported
  *  The renderer's live path reads only block [0]; joining every block means a
  *  reopened chat cannot show less than the live one did. */
 function extractToolOutput(blocks: unknown): string {
@@ -647,6 +691,46 @@ const RUN_KINDS = new Set(['execute', 'run', 'bash', 'shell', 'command', 'termin
 /** Tool-call kinds seen with neither locations nor diffs, logged once each. This is
  *  the missing evidence: it tells us what kiro-cli really calls a command. */
 const unobservedToolKinds = new Set<string>();
+/**
+ * **哪些消息能发给模型** ——「这他妈什么玩意，为什么按照会话发出去了」。
+ *
+ * 两类要挡住：
+ *   · 思考流水（`💭 `）—— 它是过程，不是内容；
+ *   · **KiroLex 自己说的话**（`kirolex: true`）：「⚠️ 这条会话现在跑在 gpt-5.6-sol 上」
+ *     「♻️ 已经换成新的后端会话」「⏳ 已排队」。它们是对**你**说的，原来以 `role: 'user'` 落进
+ *     transcript，而快照和 history.md 都是从 transcript 建的 —— 于是模型下一轮真的读到
+ *     "我现在跑在 gpt-5.6-sol 上"，还当成你的指令。
+ *
+ * 三条发给模型的路径（history.md、ride-along 快照、逐段重建）共用这一个判据 ——
+ * 分开写必然漏掉一条，而漏掉的那条就是模型看到它的那条。
+ */
+function modelFacing(m: { role: string; content: string; kirolex?: true }): boolean {
+  if (m.kirolex) return false;
+  if (legacyKirolexNote(m)) return false;
+  return !(m.role === 'assistant' && String(m.content || '').startsWith('💭 '));
+}
+
+/**
+ * **`kirolex` 标记之前写下的那些**，按开头认出来 —— 光加标记只管未来，而历史里已经躺着一堆：
+ * 实测一条会话里 4 条（三次「♻️ 后端连着…」加一句被当成回复存下来的 `⚠️ Error invoking…`），
+ * 它们每一轮都跟着快照发给模型。
+ *
+ * 判据故意窄：**这几句固定开头**，不是"以 emoji 开头就算"。后者会把你自己写的
+ * 「⚠️ 这个接口别动」也吃掉，而那是真的对话内容 —— 宁可漏掉一条旧噪音，不能吃掉你说的话。
+ */
+const LEGACY_NOTE_OPENINGS = [
+  '♻️ 后端连着',
+  '♻️ 这条会话的后端会话 id',
+  '⚠️ 这条会话现在跑在',
+  '⏳ 已排队：',
+  '🔀 后端连着',
+  "⚠️ Error invoking remote method 'acp:",
+];
+function legacyKirolexNote(m: { content: string }): boolean {
+  const t = String(m.content || '').trim();
+  return LEGACY_NOTE_OPENINGS.some((head) => t.startsWith(head));
+}
+
 function historyLine(m: {
   role: string;
   content: string;
@@ -832,7 +916,7 @@ function restoreContextAfterExecutorSwap(sessionId: string, trigger: string): vo
 function renderHistoryFile(sessionId: string): { path: string; count: number } | null {
   try {
     const stored = store.readTranscript(sessionId)
-      .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')));
+      .filter(modelFacing);
     const lines = stored.map((m) => historyLine(m));
     if (!lines.join('').trim()) return null;
     const path = store.writeHistoryFile(
@@ -913,7 +997,7 @@ function buildHistoryRideAlong(sessionId: string): string {
       return text;
     }
     const stored = store.readTranscript(sessionId)
-      .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')));
+      .filter(modelFacing);
     const lines = stored.map((m) => historyLine(m));
     if (!lines.join('').trim()) return '';
     return `${buildSnapshot(sessionId, stored, lines, { rideAlong: true })}${RIDE_ALONG_HANDOFF}`;
@@ -1076,7 +1160,7 @@ async function primeHistoryNow(
   let lines: string[];
   try {
     stored = store.readTranscript(sessionId)
-      .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')));
+      .filter(modelFacing);
     lines = stored.map((m) => historyLine(m));
   } catch (err: any) {
     logger.info('prime', `read transcript FAILED sessionId=${sessionId} err=${err?.message}`);
@@ -1252,14 +1336,34 @@ async function primeHistoryNow(
   return run;
 }
 
-/** Race a session/load against a wall clock. Without this a wedged load (stale *  cliSessionId that keeps streaming and resetting the idle timer) never
- *  settles, so the reconfiguring flag is never cleared and EVERY later switch
- *  fails with "Another model, Agent, or permission change is still in progress." */
-function withLoadTimeout<T>(p: Promise<T>, ms = 12000): Promise<T> {
+/**
+ * **一次 `session/load` 最多等多久** ——「❌ Error invoking remote method 'acp:switch-model':
+ * Error: session/load 超时（12s 无响应）」。
+ *
+ * 这个闸的目的是防**卡死**（一个 stale `cliSessionId` 不停流、把空闲计时器一直顶住，于是
+ * `reconfiguring` 标记永远不清，之后每一次切换都答「Another model, Agent, or permission change
+ * is still in progress.」）—— 它**不是**性能预算。原来的 12s 把这两件事混在一起了。
+ *
+ * 实测（2026-09-18 07:59 / 08:00，同一条会话连着两次失败）：切模型要起一个**冷的** kiro-cli，
+ * 而同一时刻常规 attach 的 `session/load` 用了 **32 秒**（07:59:37 → 08:00:09 `resume ok`）。
+ * 也就是说 12s 根本不够 —— 于是新执行器超时、回滚旧执行器又超时，会话被留在"没连着"的状态，
+ * 而界面上只看到一句没头没尾的超时。45s 仍然是有界的（卡死照样会被打断），但把正常的冷启动放进去了。
+ */
+const LOAD_TIMEOUT_MS = 45000;
+function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session/load'): Promise<T> {
+  const t0 = Date.now();
+  let timer: NodeJS.Timeout | undefined;
   return Promise.race([
-    p,
-    new Promise<T>((_, reject) => setTimeout(() => reject(new Error(`session/load 超时（${ms / 1000}s 无响应）`)), ms)),
-  ]);
+    /* 实际耗时进日志 —— 下次要调这个数字时得有依据，而不是再猜一个 */
+    p.then((v) => {
+      const took = Date.now() - t0;
+      if (took > 8000) logger.info('load', `${what} 用了 ${(took / 1000).toFixed(1)}s（上限 ${ms / 1000}s）`);
+      return v;
+    }),
+    new Promise<T>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`${what} 超时（${ms / 1000}s 无响应）`)), ms);
+    }),
+  ]).finally(() => { if (timer) clearTimeout(timer); });
 }
 // Sessions deleted during this runtime. Guards against a concurrent/in-flight
 // acp:load-session (e.g. startup eager-attach) racing a delete and RECREATING the
@@ -1779,6 +1883,59 @@ function loadFeatureFlags(): Record<string, boolean> {
   } catch {}
   return out;
 }
+/**
+ * 某个**后端 session** 上连着失败了几次 ——「无法继续执行，总是断」。
+ *
+ * 键是 `cliSessionId`（不是 KiroLex 的会话 id）：要判的是"这段后端对话是不是坏了"，而重建会换掉
+ * 这个 id —— 换完计数自然从零开始，正好。成功一轮就清零：连续性是这个判据的全部内容。
+ *
+ * 实测那条会话：一次 `write` 工具失败之后，每次发送都回 `Kiro failed to generate a response`，
+ * 8 秒一次连着 6 次，pid 从头到尾没变 —— 而原来的重建判据只认 pid 不一致，所以永远不触发。
+ */
+const cliFailStreak = new Map<string, number>();
+/**
+ * **这条会话上一次换后端会话是什么时候** ——「我他妈说的是最近那几次 workshop 的」。
+ *
+ * 查到底的结论：那几次不是这条对话的问题。kiro-cli 自己存的会话状态里，换出来的新会话
+ * 上下文只占 3.82% / 3.85%（几乎是空的）照样连着失败，而最后好了的那个反而是最大的 9.11%；
+ * 失败按时间聚堆（07:30–07:54 十三失败一成功，07:55 之后九成功一失败），kiro-cli 日志里
+ * 全是 `err=EmptyResponse`。换会话对这种故障没用 —— 判据见 `staleVerdict` 里的 `lastRecreateAgoMs`。
+ */
+const cliRecreatedAt = new Map<string, number>();
+/**
+ * **这条会话连着几次被后端拒绝生成**（`Internal error` / `EmptyResponse` 那一族）——
+ * 「首先换成 sol 没好。是我后来换成 kiro-cli 才好了。」「这个问题很严重必须修好」。
+ *
+ * 和 `cliFailStreak` 的区别是**键**：那个按后端 session 记，而换会话会把它清零 ——
+ * 于是"换了三个后端会话、每个都失败两次"在它眼里永远只是 2，永远推不出"该换模型了"。
+ * 这个按 KiroLex 会话记，跨换会话累计，成功一轮清零。
+ */
+const bareFailStreak = new Map<string, number>();
+
+function noteInSession(sessionId: string, body: string): boolean {
+  const sid = String(sessionId || '').trim();
+  const text = String(body || '').trim();
+  if (!sid || !text) return false;
+  const messageId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_note`;
+  try {
+    /**
+     * **标成 KiroLex 自己说的话** ——「这他妈什么玩意，为什么按照会话发出去了」。
+     *
+     * 这些是对**你**说的（换模型了、换后端会话了、排队了），原来以 `role: 'user'` 落盘，
+     * 而快照 / history.md / 逐段重建都是从 transcript 建的 —— 模型下一轮真的读到
+     * 「⚠️ 这条会话现在跑在 gpt-5.6-sol 上」并当成你的指令。
+     *
+     * 界面照旧显示（可见性是这些话存在的理由），但每一条发给模型的路径都跳过它（`modelFacing`）。
+     */
+    store.appendMessage(sid, { id: messageId, role: 'user', content: text, ts: Date.now(), kirolex: true });
+    refreshHistoryFile(sid);
+    mainWindow?.webContents.send('acp:user-message', {
+      sessionId: sid, messageId, content: text, ts: Date.now(), kirolex: true,
+    });
+    return true;
+  } catch { return false; }
+}
+
 function isFeatureEnabled(key: keyof typeof FEATURE_DEFAULTS | string): boolean {
   const flags = loadFeatureFlags();
   return flags[key] !== false;
@@ -1860,6 +2017,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       }
       if (u?.sessionUpdate === 'tool_call' || u?.sessionUpdate === 'tool_call_update') {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
+        /* 只数新开的调用（不数 update）—— 这是"这一轮动过东西没有"的依据，见 `toolsThisTurn`。 */
+        if (u?.sessionUpdate === 'tool_call') entry.toolsThisTurn = (entry.toolsThisTurn || 0) + 1;
         const previous = entry.fileChanges.find((change) => change.toolCallId === toolCallId);
         const locations: string[] = Array.from(new Set<string>(
           (Array.isArray(u?.locations) ? u.locations : [])
@@ -1877,6 +2036,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
         // A later update carrying no output must not erase what an earlier one
         // reported, hence the fallback to `previous`.
         const output = extractToolOutput(u?.content);
+        /* 原始长度（裁剪之前）—— 见 `maxToolOutputThisTurn`：失败时要能说出是被哪一步撑死的 */
+        if (output.length > (entry.maxToolOutputThisTurn || 0)) entry.maxToolOutputThisTurn = output.length;
         const next: store.StoredToolCall = {
           toolCallId,
           title: u?.title || previous?.title || 'Tool call',
@@ -2565,6 +2726,36 @@ app.whenReady().then(async () => {
   startupMark('ui-state migration done');
   // Age out trashed chats (30 days). Deliberately after the migration and before
   // anything else touches the sessions tree.
+  /**
+   * **kiro-cli 那几个日志超限就就地截断** ——「这些进程仍持有已经删除的 kiro-chat.log、lsp.log，
+   * 共占 21.72GB」。
+   *
+   * kiro-cli 自己不轮转它们（实测一个执行器就攥着 7.86 GB + 5.60 GB），而 KiroLex 只管自己那份。
+   * 判据和"为什么是截断不是删除"都在 `trimHugeCliLogs` 里 —— 删掉的话正在写它的进程会把空间
+   * 一直攥到退出为止，那就是这次 21.72 GB 的成因。
+   *
+   * 放在起执行器**之前**：这时候还没有人持着新 fd，截断最干净。
+   */
+  const trimCliLogsNow = (why: string) => {
+    try {
+      const trim = trimHugeCliLogs();
+      if (trim.trimmed.length) {
+        logger.warn('logs', `kiro-cli 日志超限已就地截断（${why}），回收 ${(trim.freed / 2 ** 30).toFixed(2)} GB：`
+          + trim.trimmed.map((f) => `${f.name} ${(f.bytes / 2 ** 30).toFixed(2)}GB`).join('、'));
+      }
+    } catch {}
+  };
+  trimCliLogsNow('启动');
+  /**
+   * **每半小时再扫一次** ——「一次启动检查兜不住」。
+   *
+   * 实测这台机器上 app 能连着跑 24 小时以上，而 `lsp.log` 在那段时间里长到 5.6 GB ——
+   * 只在启动时看一眼，等于把上限交给"你多久重启一次"。半小时一次：日志再怎么长也就多那半小时的量，
+   * 而截断本身是一次 `truncate`（不读内容、不复制），代价可以忽略。
+   */
+  setInterval(() => trimCliLogsNow('定时'), 30 * 60 * 1000).unref?.();
+  // Age out trashed chats (30 days). Deliberately after the migration and before
+  // anything else touches the sessions tree.
   try { pruneSessionTrash(); } catch {}
   startupMark('trash pruned');
   // No executors survive a restart — reset any stale live executorState so the
@@ -2831,7 +3022,7 @@ app.whenReady().then(async () => {
 
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
-  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }, _model?: string): Promise<any> {
+  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }, _model?: string, attempt = 0): Promise<any> {
     // `let`, not `const`: a mid-flight model swap (retired model) replaces this
     // session's executor, and the rest of the turn must continue on the new one.
     let entry = sessionClients.get(sessionId);
@@ -2958,7 +3149,14 @@ app.whenReady().then(async () => {
     // Persist the user message the instant it is sent (asymmetric durability, §7).
     const userMessageId = display?.messageId || `u_${Date.now()}`;
     entry.currentUserMessageId = userMessageId;
-    try {
+    /**
+     * **自动重发的那几次不能再落一遍盘** —— `appendMessage` 是无条件追加（见 sessionStore），
+     * 所以重发一次 transcript 里就多一条同样的用户消息；而 ride-along 快照正是从 transcript 建的，
+     * 于是"重试了 3 次"会变成"同一个问题在历史里问了 4 遍"。`attempt > 0` 时这条已经在盘上了。
+     */
+    if (attempt > 0) {
+      /* 这一条早就在盘上了（见上面）—— 什么都不做 */
+    } else try {
       const promptText = Array.isArray(prompt)
         ? prompt.map((p: any) => (typeof p === 'string' ? p : p?.text || '')).join('')
         : String(prompt ?? '');
@@ -3075,6 +3273,9 @@ app.whenReady().then(async () => {
         // silence (so a genuinely hung turn is visible) and let the turn run.
         const QUIET_NOTICE_MS = 300000;   // 5 min of silence -> inform, do not act
         let modelSwaps = 0;
+        /* 空响应换模型**一轮最多一次** —— 真的整段时间都在返空响应时，把回退链全走一遍
+           就是几分钟的静默；换一次够了，剩下的交给退避重发和那句说明。 */
+        let emptySwaps = 0;
         // Every model already proven dead THIS turn. Without carrying this across
         // swaps the chain ping-pongs between the first two entries and never
         // reaches a working one (see the swap call below).
@@ -3088,6 +3289,8 @@ app.whenReady().then(async () => {
           // Stale entries from a previous turn would otherwise suppress detection
           // forever: a turn killed mid-tool never sends the closing update.
           entry.openToolCalls?.clear();
+          entry.toolsThisTurn = 0;       // 这一轮的工具计数从零开始（自动重试的安全闸）
+          entry.maxToolOutputThisTurn = 0;
           entry.wedgeNote = undefined;   // never let one turn's note reach another
           let noticeSent = false;
           let interrupting = false;
@@ -3225,6 +3428,9 @@ app.whenReady().then(async () => {
             // A turn now ends ONLY because kiro-cli ended it or because the user
             // pressed Stop. There is no automatic cancel/retry any more, so any
             // stopReason we see is the backend's own verdict and is reported as-is.
+            /* 这一轮成了 —— 那条后端对话是好的，两个连续失败计数都清零 */
+            if (entry.cliSessionId) cliFailStreak.delete(entry.cliSessionId);
+            bareFailStreak.delete(sessionId);
             const producedOutput = !!(entry.assistantBuf || entry.fileChanges.length);
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             // The request was accepted and answered, so the snapshot it carried IS
@@ -3280,6 +3486,54 @@ app.whenReady().then(async () => {
               model: entry.profile.model,
               detail: String(err?.message || err).slice(0, 300),
             });
+            /**
+             * **连着被拒绝生成 → 换模型重发**，用的是 model-unavailable 那条路同一套机器
+             * （杀执行器、换模型、重载会话、`acp:turn-restart`、原样重发）。
+             *
+             * 为什么要有这一条：实测那 25 分钟里，换后端会话换了三个都没用（新会话上下文只占
+             * 3.8% 照样失败），而人自己换个别的跑法就好了 —— 也就是说这种故障要动的是**模型**，
+             * 不是会话。原来只有 kiro-cli 明说"这个模型不可用"才会换，而它对空响应从来不这么说。
+             *
+             * 两道闸：
+             *   · `bareFailStreak >= POISONED_AFTER` —— 单次 Internal error 太常见，换模型是有代价的
+             *     （~30 秒静默窗口，还会换掉你选的模型）；
+             *   · **这一轮什么都没产出** —— 跑过工具的轮子换模型重发等于把副作用再做一遍。
+             */
+            const bareStreak = bareFailStreak.get(sessionId) || 0;
+            const producedThisTurn = !!entry.assistantBuf || (entry.toolsThisTurn || 0) > 0;
+            if (isBareInternalError(text) && bareStreak >= POISONED_AFTER && !producedThisTurn
+                && emptySwaps < 1 && modelSwaps < MAX_MODEL_SWAPS) {
+              modelSwaps++;
+              emptySwaps++;
+              const failedModel = entry.profile.model;
+              triedModels.add(failedModel);
+              eventLog.appendEvent(sessionId, {
+                ts: Date.now(),
+                type: 'model_swap',
+                turn: turnKey,
+                model: failedModel,
+                detail: `后端连着 ${bareStreak + 1} 次拒绝生成（空响应），换模型重发`,
+              });
+              const swapped = await swapSessionModel(sessionId, failedModel, `prompt ${sessionId} 空响应`, triedModels);
+              if (swapped) {
+                const next = sessionClients.get(sessionId);
+                if (next) {
+                  logger.warn('prompt', `连着 ${bareStreak + 1} 次空响应，模型 '${failedModel}' → '${swapped}' 重发 sessionId=${sessionId}`);
+                  noteInSession(sessionId, `🔀 后端连着 ${bareStreak + 1} 次拒绝为这一轮生成回答（kiro-cli 日志里是 `
+                    + `\`EmptyResponse\`，流开了但一个 token 都没发）。换后端会话对这种情况没用`
+                    + `（实测换三个都失败），所以这次换的是模型：${failedModel} → ${swapped}，原话原样重发。`);
+                  entry = next;
+                  entry.busy = true;
+                  entry.turnSeq = myTurn;
+                  entry.assistantBuf = '';
+                  entry.assistantMsgId = null;
+                  entry.fileChanges = [];
+                  entry.toolsThisTurn = 0;
+                  mainWindow?.webContents.send('acp:turn-restart', { sessionId });
+                  continue;
+                }
+              }
+            }
             if (isModelUnavailableError(text) && modelSwaps < MAX_MODEL_SWAPS) {
               modelSwaps++;
               eventLog.appendEvent(sessionId, {
@@ -3363,7 +3617,39 @@ app.whenReady().then(async () => {
       // diagnosable, and enrich the thrown message when it's the bare form.
       let detail = '';
       try { detail = err?.data ? ` — ${typeof err.data === 'string' ? err.data : JSON.stringify(err.data)}` : ''; } catch {}
-      logger.warn('prompt', `error sessionId=${sessionId} cli=${entry.cliSessionId}: ${err?.message || err}${detail}`);
+      /* 这一轮的规模跟着错误一起进日志 —— 「好像 curl 那个大 json 的时候断掉了」这种判断
+         原来只能靠人去翻 tool 行数。 */
+      logger.warn('prompt', `error sessionId=${sessionId} cli=${entry.cliSessionId}`
+        + ` 工具=${entry.toolsThisTurn || 0} 最大工具输出=${entry.maxToolOutputThisTurn || 0}字符`
+        + `: ${err?.message || err}${detail}`);
+      /**
+       * **去 kiro-cli 自己的日志里拿那句真话** ——「还是不知道为什么会断」。
+       *
+       * ACP 上回来的是万能包装（`Internal error — Kiro failed to generate a response`），
+       * 而同一秒 kiro-cli 的日志里写的是 `err=EmptyResponse` / `dispatch failure` /
+       * `ValidationException` —— 五种完全不同的病，在界面上长得一模一样。判据在 `kiroCliLog`。
+       */
+      const cliWhy = cliErrorContext();
+      if (cliWhy) logger.warn('prompt', `kiro-cli 那边的原因 sessionId=${sessionId}: ${cliWhy}`);
+      /**
+       * **把这一刻整包留下来** —— 见 `failureBundle`。查到最后卡在"同一时间同一模型，
+       * kiro-cli 里好的、KiroLex 里不好"，而故障不能按需复现；下一次犯的时候要能对着差异看，
+       * 而不是再猜一轮。同一条会话 1 分钟内只落一包、每条只留最近 5 包。
+       */
+      const bundle = writeFailureBundle({
+        sessionId,
+        cliSessionId: entry.cliSessionId,
+        promptText: (prompt || []).map((b: any) => (typeof b === 'string' ? b : b?.text || '')).join(''),
+        error: `${err?.message || err}${detail}`,
+        model: entry.profile.model,
+        pid: entry.client.pid,
+        toolsThisTurn: entry.toolsThisTurn || 0,
+        maxToolOutput: entry.maxToolOutputThisTurn || 0,
+        cliLogPath: kiroCliLogPath(),
+        /* trace 开着的时候日志涨得极快，多抄一些才盖得住这一次请求 */
+        cliLogTailBytes: kiroTraceEnabled() ? 8 * 1024 * 1024 : undefined,
+      });
+      if (bundle) logger.info('prompt', `失败现场已存档 sessionId=${sessionId} -> ${bundle}`);
       // kiro-cli refuses a second session/prompt while one is still running.
       // That is NOT a dead session: the earlier turn is alive in the backend
       // (often mid context-compaction). Say so plainly instead of leaking a raw
@@ -3388,10 +3674,132 @@ app.whenReady().then(async () => {
       // cannot be intercepted at all -- tool calls arrive as a `session/update`
       // NOTIFICATION (no response to veto) and KiroLex declares `capabilities: {}` so
       // reads never route through it. For that case the error is reported as-is.
+      /* 这条后端对话又坏了一次 —— 连着到阈值就当它毒了（判据在 `staleVerdict`） */
+      const failKey = entry.cliSessionId || '';
+      const streak = (cliFailStreak.get(failKey) || 0) + 1;
+      if (failKey) cliFailStreak.set(failKey, streak);
+      /* 跨换会话累计的那一份 —— 换模型的判据要用它（见 bareFailStreak） */
+      if (isBareInternalError(`${err?.message || ''}${detail}`)) {
+        bareFailStreak.set(sessionId, (bareFailStreak.get(sessionId) || 0) + 1);
+      }
+      const verdict = staleVerdict({
+        error: `${err?.message || ''}${detail}`,
+        contextPid: store.readRecord(sessionId)?.contextEstablishedPid,
+        clientPid: entry.client.pid,
+        /**
+         * **预算是 `MAX_AUTO_RETRIES` 次，不是一次** ——「你难道不能让它自动重试吗，挂了你他妈也不管啊」。
+         *
+         * 实测那条会话要换**三个**后端会话才通（9a74213c → f45ba8b6 → a9085b1c，最后
+         * `produced=true`）。原来这里是 `alreadyRetried: retriedStale`，一次用户发送只肯自救一次，
+         * 于是"换三次"被摊到三次手动重发上 —— 人看到的就是"总是断，也没人管"。
+         */
+        alreadyRetried: attempt >= MAX_AUTO_RETRIES,
+        consecutiveFailures: streak,
+        /* 刚换过一个几乎空的新会话又是同一个错 → 别再换（见 cliRecreatedAt） */
+        lastRecreateAgoMs: cliRecreatedAt.has(sessionId) ? Date.now() - cliRecreatedAt.get(sessionId)! : undefined,
+      });
+      const errText = `${err?.message || ''}${detail}`;
+      /**
+       * **这一轮到底能不能自己重发** —— 判据在 `promptRetry`（纯的、有测试）。
+       * 三条恢复路径（换会话、传输层抖动、后端笼统 Internal error）全部共用它，
+       * 所以"已经跑过工具就不重发"这条硬闸不可能只在其中一条上生效。
+       */
+      const plan = planRetry({
+        error: errText,
+        attempt,
+        producedText: !!entry.assistantBuf,
+        toolsRan: entry.toolsThisTurn || 0,
+      });
+      if (verdict === 'recreate') {
+        let made: { sessionId: string } | null = null;
+        try {
+          const oldId = entry.cliSessionId;
+          /* 和 attach 那边同一个来源 —— cwd 不一致的话新会话会落在别的目录上 */
+          const cwd = entry.cwd || sessionCwd(entry.profile, os.homedir());
+          made = await entry.client.newSession(cwd);
+          entry.cliSessionId = made.sessionId;
+          const rec2 = store.readRecord(sessionId);
+          if (rec2) { rec2.cliSessionId = made.sessionId; store.writeRecord(rec2); }
+          /* 新会话里当然什么都没有 —— 清掉"已建立"，让上下文跟着这一次重发带过去 */
+          clearContextEstablished(sessionId);
+          markContextOwedIfUnverified(sessionId, 'stale-session-recreate');
+          /* 换完 id，那条旧对话的失败计数就没意义了 */
+          cliFailStreak.delete(oldId);
+          cliRecreatedAt.set(sessionId, Date.now());
+          const poisoned = streak >= POISONED_AFTER;
+          const note = poisoned
+            ? `后端连着 ${streak} 次拒绝为这段对话生成回答（${String(err?.message || '').slice(0, 60)}）——`
+              + `pid 没变，所以不是"会话过期"，是这段历史本身后端咽不下去（常见成因：某次工具调用的结果）。`
+              + `已经换成新的后端会话（${made.sessionId.slice(0, 8)}…）并把上下文带过去；磁盘上的对话记录一条都没动。`
+            : staleRecoveryNote(oldId, made.sessionId,
+              store.readRecord(sessionId)?.contextEstablishedPid ?? 0, entry.client.pid ?? 0);
+          logger.warn('prompt', `${poisoned ? 'poisoned' : 'stale'} cli session recreated sessionId=${sessionId}: ${note}`);
+          /*
+            **在会话里说一句** —— 不说的话你看到的是"前几条都失败、这一条突然成了"，
+            而中间换过后端会话这件事解释了为什么。只在"毒了"这条路上说：pid 不一致那条是常规现象
+            （kiro-cli 不持久化 ACP 会话），每次都播报只会变成噪音。
+          */
+          if (poisoned) {
+            noteInSession(sessionId, `♻️ ${note}`);
+          }
+        } catch (again: any) {
+          /* 换会话本身失败了（连不上进程之类）—— 照实报原来那个错，不是这里的新错。 */
+          logger.warn('prompt', `stale recreate FAILED sessionId=${sessionId}: ${again?.message || again}`);
+          made = null;
+        }
+        /**
+         * **换完会话要不要顺手重发** —— 这是"自动重试"和"自动重做副作用"的分界线。
+         *
+         * 这一轮已经跑过工具（或者已经流出过文字）时**只换会话、不重发**：后端会话换新的，
+         * 下一条消息就落在干净的后端上，点一下重跑就能继续；而闭眼重发会把那 13 个
+         * `aws ssm send-command` 再跑一遍。什么都没产出时才重发 —— 那时重发是幂等的。
+         */
+        if (made && !plan.retry && (plan.reason === 'side-effects' || plan.reason === 'produced')) {
+          logger.warn('prompt', `换了新后端会话但不重发 sessionId=${sessionId}: `
+            + `这一轮已产出（文字=${!!entry.assistantBuf} 工具=${entry.toolsThisTurn || 0} `
+            + `最大工具输出=${entry.maxToolOutputThisTurn || 0} 字符），重发会重复副作用`);
+          throw new Error(`${errText}\n\n`
+            + `（这一轮已经跑了 ${entry.toolsThisTurn || 0} 个工具调用${bigOutputHint(entry.maxToolOutputThisTurn)}，`
+            + '重发会把它们再执行一遍，所以 KiroLex 只换了新的后端会话'
+            + `（${made.sessionId.slice(0, 8)}…）、没有自动重发。点重跑或者再发一条就会落在新会话上。）`
+            + (cliWhy ? `\n\n${cliWhy}` : ''));
+        }
+        if (made && plan.retry) {
+          await new Promise((r) => setTimeout(r, plan.delayMs));
+          logger.info('prompt', `换完后端会话自动重发 sessionId=${sessionId} attempt=${attempt + 1}/${MAX_AUTO_RETRIES}`);
+          return await sendPromptOnce(sessionId, prompt, projectId, display, _model, attempt + 1);
+        }
+      }
+      /**
+       * **自己重发** —— 「你难道不能让它自动重试吗，挂了你他妈也不管啊」。
+       *
+       * 两类错走这一条：传输层抖动（`dispatch failure`，实测一条会话上 9 次、6 次挤在 20 秒内）和
+       * kiro-cli 的笼统 `Internal error`（"生成不出回答"）。两者的共同点是**重发有可能就好**，
+       * 而原来两者都是把原话甩到界面上、等人再发一遍。
+       *
+       * 闸全在 `planRetry` 里（`producedText` / `toolsRan` / 预算），所以这里只剩"发"。
+       * 递增间隔：瞬时故障立刻重试还是同一个结果。
+       */
+      if (plan.retry) {
+        logger.warn('prompt', `自动重发 ${attempt + 1}/${MAX_AUTO_RETRIES}（等 ${plan.delayMs}ms）`
+          + ` sessionId=${sessionId}: ${errText.slice(0, 120)}`);
+        await new Promise((r) => setTimeout(r, plan.delayMs));
+        return await sendPromptOnce(sessionId, prompt, projectId, display, _model, attempt + 1);
+      }
+      /* 预算用光了：说清试过几次 —— 不然看着像"它就是不行"，而实际上已经试了 4 次。 */
+      if (plan.reason === 'budget') {
+        logger.warn('prompt', `自动重发用光预算（${attempt} 次）sessionId=${sessionId}: ${errText.slice(0, 160)}`);
+        const why = cliWhy ? `\n\n${cliWhy}` : '';
+        throw new Error(isTransientTransportError(errText)
+          ? `连不上后端（${errText.slice(0, 120)}）—— KiroLex 自己重发了 ${attempt} 次都失败。检查网络/VPN 后再发一次。${why}`
+          : retriesExhaustedNote(errText, attempt) + why);
+      }
       if (/^internal error$/i.test(String(err?.message || '')) && detail) {
-        const e2: any = new Error(`${err.message}${detail}`);
+        const e2: any = new Error(`${err.message}${detail}${cliWhy ? `\n\n${cliWhy}` : ''}`);
         throw e2;
       }
+      /* 报出去之前把 kiro-cli 那句真话带上 —— 光一句 Internal error 谁也不知道该干什么 */
+      if (cliWhy && isBareInternalError(errText)) throw new Error(`${errText}\n\n${cliWhy}`);
       throw err;
     }
   }
@@ -4421,6 +4829,15 @@ app.whenReady().then(async () => {
       } catch (restoreError) {
         logger.warn('switch-model', `failed to restore previous executor sessionId=${sessionId}`, restoreError);
         try { await previous.disconnect(); } catch {}
+        /*
+          **回滚也失败了 → 把盘上的状态说成实话** —— 实测这条路走过两次（07:59、08:00），
+          而记录里还写着 `attached`：于是界面以为它连着，下一次发送答的是「Session not connected」。
+          写成 detached 之后走的是常规的"没连着 → 连上"那条路（`ensureAttached` / 点一下会话），
+          那条路本来就是可靠的。
+        */
+        const rec = store.readRecord(sessionId);
+        if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
+        emitSessionBusy(sessionId);
       }
     };
 
@@ -5660,7 +6077,32 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:get-features', () => ({
     flags: loadFeatureFlags(),
     defaults: { ...FEATURE_DEFAULTS },
-  }));  ipcMain.handle('app:set-feature', (_event, key: string, enabled: boolean) => {
+    /**
+     * **kiro-cli 的 trace 日志开着吗** —— 「配置中未发现人为启用特殊日志级别」。
+     *
+     * 那个开关不在 kiro 的配置里，而在 KiroLex 侧（`~/.kirolex/kiro-trace`），所以查 kiro 的配置
+     * 一定查不到；而它一开就是每秒几十 KB、一天十几 GB。开着的时候界面上原来**一个字都没有** ——
+     * 一个悄无声息、代价按 GB 计的开关，忘了关就是磁盘被填满。所以状态跟着这份 payload 一起给出去，
+     * 侧栏挂一个显眼的标记（`kiroTrace`）。
+     */
+    kiroTrace: kiroTraceEnabled(),
+  }));
+  /** 开/关 kiro-cli 的 trace 日志（标记文件；下一次起执行器生效）。 */
+  ipcMain.handle('app:set-kiro-trace', (_event, enabled: boolean) => {
+    const file = path.join(os.homedir(), '.kirolex', 'kiro-trace');
+    try {
+      if (enabled) {
+        fs.mkdirSync(path.dirname(file), { recursive: true });
+        fs.writeFileSync(file, '');
+      } else {
+        fs.rmSync(file, { force: true });
+      }
+      logger.warn('logs', `kiro-cli trace 日志 -> ${enabled ? '开' : '关'}（下一次起执行器生效）`);
+      return { ok: true, kiroTrace: kiroTraceEnabled() };
+    } catch (err: any) {
+      return { ok: false, error: String(err?.message || err) };
+    }
+  });  ipcMain.handle('app:set-feature', (_event, key: string, enabled: boolean) => {
     if (!key || !(key in FEATURE_DEFAULTS)) return { ok: false, error: `unknown feature: ${key}` };
     return { ok: true, flags: saveFeatureFlag(key, !!enabled) };
   });

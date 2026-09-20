@@ -1,6 +1,8 @@
 import { spawn, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
+import * as os from 'os';
+import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
 
 interface JsonRpcRequest {
@@ -38,6 +40,15 @@ const STEER_DISCRIMINANTS = new Set([
  *  generous enough to survive a cold start with several executors booting at
  *  once (MCP server loading). */
 const INITIALIZE_TIMEOUT_MS = 45000;
+
+/**
+ * kiro-cli 的 trace 日志开关（默认关）——「必须修好」那条路上唯一能拿到 HTTP 层证据的东西。
+ * 见下面 spawn 处那段注释。文件方式存在的理由：不用从终端带环境变量启动 app。
+ */
+export function kiroTraceEnabled(env: NodeJS.ProcessEnv = process.env, home = os.homedir()): boolean {
+  if (/^(1|true|on|yes)$/i.test(String(env.KIROLEX_KIRO_TRACE || ''))) return true;
+  try { return fs.existsSync(path.join(home, '.kirolex', 'kiro-trace')); } catch { return false; }
+}
 
 /** Where kiro-cli might live, most specific first. */
 export function kiroCliCandidates(): string[] {
@@ -146,9 +157,24 @@ export class AcpClient extends EventEmitter {
         // an allow option immediately when session/request_permission arrives.
       }
 
+      /**
+       * **可选：让 kiro-cli 记 trace 级日志** ——「这个问题很严重必须修好」。
+       *
+       * 查这次那几十次"断"最后卡在一件事上：ACP 上只能看到一句 `Internal error`，而请求体是
+       * kiro-cli 拼的、KiroLex 连不到。实测 `KIRO_LOG_LEVEL=trace` 之后它会把整条
+       * `CodeWhispererStreaming.GenerateAssistantResponse` 的往返记下来（HTTP 状态、响应头、
+       * 请求 id、`received response from service` 那一行），也就是**能拿去找 Kiro 团队的东西**。
+       *
+       * 默认关：trace 一次运行能写几 MB。两种打开方式，都不用改代码 ——
+       *   · 环境变量 `KIROLEX_KIRO_TRACE=1`
+       *   · 或者 `touch ~/.kirolex/kiro-trace`（下一次起执行器就生效，不必从终端启动 app）
+       * 关掉就把那个文件删掉。开着的时候 `failureBundle` 会多抄一段日志（见那边的 tailBytes）。
+       */
+      const env = { ...this.env };
+      if (kiroTraceEnabled()) env.KIRO_LOG_LEVEL = 'trace';
       this.process = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
-        env: this.env,
+        env,
       });
 
       this.process.stdout!.on('data', (data: Buffer) => {

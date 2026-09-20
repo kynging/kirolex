@@ -10,14 +10,36 @@ import { useEffect, useState } from 'react';
  */
 let cache: Record<string, boolean> = {};
 let loaded = false;
+/**
+ * **kiro-cli 的 trace 日志开着吗** —— 和 flags 一起从主进程拿（`app:get-features`）。
+ *
+ * 它不是 feature flag（不住在 config.json 的 `features` 里，而是一个标记文件），但它是这套里
+ * **唯一代价按 GB 计**的开关：开一天十几 GB，而原来界面上一个字都没有。所以跟着同一份 payload 走，
+ * 侧栏据此挂一个显眼的标记。
+ */
+let traceOn = false;
 
 async function refresh(): Promise<Record<string, boolean>> {
   try {
     const res = await window.kiroApi.getFeatures?.();
     if (res?.flags) cache = res.flags;
+    traceOn = !!(res as any)?.kiroTrace;
   } catch {}
   loaded = true;
   return cache;
+}
+
+/** kiro-cli trace 日志的当前状态（读的是上一次 refresh 拿到的那份）。 */
+export function kiroTraceOn(): boolean { return traceOn; }
+
+/** 关掉它，并立刻刷新本地那份状态。 */
+export async function setKiroTrace(enabled: boolean): Promise<boolean> {
+  try {
+    const res: any = await (window.kiroApi as any).setKiroTrace?.(enabled);
+    if (res?.ok) traceOn = !!res.kiroTrace;
+  } catch {}
+  window.dispatchEvent(new CustomEvent('kirolex:features-changed'));
+  return traceOn;
 }
 
 /** Imperative read. Unknown/unloaded keys are ON, matching main's defaults, so a

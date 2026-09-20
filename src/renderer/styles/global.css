@@ -7492,3 +7492,9 @@ button, input, select, textarea {
   background: var(--bg-primary); color: var(--text-primary);
 }
 
+/* trace 日志开着时侧栏那个红旗 —— 一个代价按 GB 计的开关不许悄无声息 */
+.sidebar-settings-btn.sidebar-trace-on {
+  color: var(--error); border-color: color-mix(in srgb, var(--error) 55%, transparent);
+  background: color-mix(in srgb, var(--error) 14%, transparent);
+}
+.sidebar-settings-btn.sidebar-trace-on:hover { background: color-mix(in srgb, var(--error) 26%, transparent); }
