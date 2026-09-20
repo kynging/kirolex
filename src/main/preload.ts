@@ -273,6 +273,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  requests, and the check covers the whole conversation history). */
   prepareImageAttachment: (filePath: string) => ipcRenderer.invoke('app:prepare-image-attachment', filePath),
   getFeatures: () => ipcRenderer.invoke('app:get-features'),
+  /** 开/关 kiro-cli 的 trace 日志 —— 一个代价按 GB 计的开关，界面上必须看得见（见 `app:get-features`） */
+  setKiroTrace: (enabled: boolean) => ipcRenderer.invoke('app:set-kiro-trace', enabled),
   setFeature: (key: string, enabled: boolean) => ipcRenderer.invoke('app:set-feature', key, enabled),
   setExecutorCap: (n: number) => ipcRenderer.invoke('app:set-executor-cap', n),
   /** Silence threshold, in seconds, before a protocol-silent turn is treated as wedged

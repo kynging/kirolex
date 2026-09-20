@@ -54,6 +54,19 @@ export interface StoredMessage {
   /** Pasted text blobs shown as `[ 粘贴 #N · M 行 ]` placeholders in `content`.
    *  The bytes live in ~/.kirolex/pastes; this is the ONLY record of where. */
   pastes?: { seq: number; lines: number; chars: number; path: string }[];
+  /**
+   * **这条是 KiroLex 自己说的话，不是对话** ——「这他妈什么玩意，为什么按照会话发出去了」。
+   *
+   * 「⚠️ 这条会话现在跑在 gpt-5.6-sol 上」「♻️ 已经换成新的后端会话」「⏳ 已排队」这些都是
+   * KiroLex 对**你**说的，原来却以 `role: 'user'` 落进 transcript —— 于是：
+   *   · 看起来像你自己说的话；
+   *   · 而且**真的会发给模型**：ride-along 快照和 history.md 都是从 transcript 建的，
+   *     模型下一轮就读到"我现在跑在 gpt-5.6-sol 上"当成你的指令。
+   *
+   * 标上这个之后，界面照旧显示（那是你要的可见性），但每一条**发给模型**的路径都跳过它
+   * （`historyLine` 那侧的过滤，见 `readTranscript` 的调用点）。
+   */
+  kirolex?: true;
   // additive: future fields (model, etc.) may be appended safely
 }
 

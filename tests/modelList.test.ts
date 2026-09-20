@@ -1,6 +1,9 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import { concreteModels, shouldReplaceModelCache } from '../src/renderer/modelList.ts';
+/* 这两个在下面几个 describe 里读源码用 —— 上一次裁测试时把 import 一起裁掉了（`fsSync is not defined`） */
+import fsSync from 'node:fs';
+import pathSync from 'node:path';
 
 /** 实测抓到的两份 payload：一份是断网期间的退化结果，一份是正常结果。 */
 const DEGRADED = [{ model_name: 'auto', model_id: 'auto', context_window_tokens: 200_000 }];

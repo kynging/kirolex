@@ -20,7 +20,7 @@ import hljs from 'highlight.js';
 import { SettingsDialog } from './components/SettingsDialog';
 import { MemoryDialog } from './components/MemoryDialog';
 import { compactMemoryPrompt, memoryWarnings, type MemoryScope } from '../main/memoryPolicy';
-import { MODEL_LIST_WARMUP_DELAY_MS, shouldReplaceModelCache } from './modelList';
+import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache } from './modelList';
 import { SkillDialog } from './components/SkillDialog';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { IconClose, IconLogs } from './components/Icons';
@@ -717,7 +717,38 @@ const App: React.FC = () => {
     () => models.map((model: any) => String(model.model_id || model.id || model)).filter(Boolean),
     [models],
   );
-  const [kiroAgents, setKiroAgents] = useState<Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>>([]);
+  const [kiroAgents, setKiroAgents] = useState<Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>>(() => {
+    try {
+      const cached = JSON.parse(uiGet(AGENTS_CACHE_KEY) || '[]');
+      return Array.isArray(cached) ? cached : [];
+    } catch { return []; }
+  });
+  const refreshAgents = useCallback(async () => {
+    try {
+      const data = await window.kiroApi.listKiroAgents();
+      if (!data?.agents?.length) return;
+      setKiroAgents(data.agents);
+      try { uiSet(AGENTS_CACHE_KEY, JSON.stringify(data.agents)); } catch {}
+    } catch { /* 保留现有那份（内存里的或缓存里的） */ }
+  }, []);
+
+  /**
+   * **空了就自己再去拉** —— 那次超时之后原来没有任何东西会重试。
+   *
+   * 只在**列表是空的**时候拉：那正是坏掉的那个状态（缓存也没有 = 第一次启动就撞上超时）。
+   * 不无条件跟着 focus 拉是因为每次都要 spawn 一个 kiro-cli，而模型列表已经占了那一次 ——
+   * 两个都跟着 focus 走，等于把启动风暴搬到每次切窗口。
+   */
+  useEffect(() => {
+    if (kiroAgents.length) return;
+    const again = () => { void refreshAgents(); };
+    window.addEventListener('focus', again);
+    window.addEventListener('online', again);
+    return () => {
+      window.removeEventListener('focus', again);
+      window.removeEventListener('online', again);
+    };
+  }, [kiroAgents.length, refreshAgents]);
   // Per-session, NOT global: switching the model/Agent on one chat must never
   // grey out the selectors of another chat you switch to.
   const [switchingAgentIds, setSwitchingAgentIds] = useState<string[]>([]);
@@ -2061,11 +2092,8 @@ const App: React.FC = () => {
        */
       const warmupDelay = setTimeout(() => {
         void refreshModels();
-        window.kiroApi.listKiroAgents().then((data) => {
-          // 空列表不收：`agent list` 超时时这里原来是 `setKiroAgents([])`，直接把 agent 下拉清空 ——
-          // 和模型列表被写坏是同一个病（用「拿不到」覆盖「本来有」）。
-          if (data.agents?.length) setKiroAgents(data.agents);
-        }).catch(() => { /* 保留上一次的列表，不清空 */ });
+        /* agent 列表走同一条路（`refreshAgents`：空列表不收 + 落盘）—— 不再各写一遍 */
+        void refreshAgents();
       }, MODEL_LIST_WARMUP_DELAY_MS);
 
       // Auto-connect
