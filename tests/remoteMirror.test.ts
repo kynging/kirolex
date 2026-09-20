@@ -369,3 +369,33 @@ describe('真机同步（默认跳过）', { skip: RHOST ? false : '没给 KIROL
     await realIo.run('ssh', [...opts, RHOST!, `rm -rf ${remoteDir}`], 60_000);
   });
 });
+
+/*
+ * 实测（起一条真的远程会话、让它在远端写一个文件）抓到的 bug：文件落在
+ * `<workdir>/s_<sessionId>-<hash>/` 里，而同步的是 `<workdir>/<项目>-<hash>/` ——
+ * 那个文件永远回不到本地，界面上看起来就是"模型说做了，本地什么都没有"。
+ *
+ * 根因：新建会话那条路把**每会话的临时目录**当 cwd（`sessionCwd(profile, sessionDir)`），
+ * 而 attach 那条用的是项目目录。本地会话无所谓（都在本机），远程会话就成了两个不同的镜像。
+ */
+describe('远程会话的 cwd = 项目镜像（不是会话目录的镜像）', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('新建会话：远程用项目目录，本地保持原样', () => {
+    assert.match(M, /const cliCwd = profile\.remote\?\.sshHost\s*\n\s*\? sessionCwd\(profile, resolvedCwd\)\s*\n\s*: sessionCwd\(profile, sessionDir\);/);
+  });
+
+  test('attach 那条本来就是项目目录 —— 两条路对远程必须一致', () => {
+    assert.match(M, /const cliCwd = sessionCwd\(profile, resolvedCwd\);/);
+  });
+
+  test('登记同步用的也是项目目录（否则 cwd 和镜像还是两回事）', () => {
+    assert.match(M, /registerRemoteSync\(kiroLexId, profile, resolvedCwd\)/);
+    assert.match(M, /registerRemoteSync\(sessionId, profile, resolvedCwd\)/);
+  });
+
+  test('会话目录另有自己的镜像位置，和项目镜像不会重名', () => {
+    assert.notEqual(sessionMirrorDir('/wd', 's_1'), mirrorDirFor('/wd', '/anything/s_1'));
+    assert.match(sessionMirrorDir('/wd', 's_1'), /\.kirolex-sessions/);
+  });
+});

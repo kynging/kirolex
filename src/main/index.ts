@@ -3118,7 +3118,19 @@ app.whenReady().then(async () => {
     };
     // Remote sessions run kiro-cli on the remote host, so its working directory
     // must be a REMOTE path, not the local per-session scratch dir.
-    const cliCwd = sessionCwd(profile, sessionDir);
+    /*
+      **远程会话的 cwd 必须是「项目镜像」，不是「会话目录的镜像」** —— 实测踩到：
+      让远端写一个文件，文件落在了 `<workdir>/s_<id>-<hash>/`（会话目录的镜像）里，
+      而同步的是 `<workdir>/<项目>-<hash>/`，于是那个文件**永远回不到本地**，
+      界面上看起来就是"模型说做了，本地什么都没有"。
+
+      根因是这两条路本来就不一致：新建这条传 `sessionDir`（每会话的临时目录），attach 那条传
+      `resolvedCwd`（真正的项目目录）。本地会话无所谓（两者都在本机、都能写），远程会话就成了
+      两个不同的镜像。所以远程这一路显式用项目目录，**本地那一路一个字节都不动**。
+    */
+    const cliCwd = profile.remote?.sshHost
+      ? sessionCwd(profile, resolvedCwd)
+      : sessionCwd(profile, sessionDir);
     // Model fallback: use the first candidate that actually starts, and persist
     // the effective model so the session isn't stuck pointing at a dead one.
     /* 远程会话：起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
