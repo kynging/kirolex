@@ -6435,6 +6435,34 @@ app.whenReady().then(async () => {
     });
   });
 
+  /**
+   * **用 Finder 选私钥** ——「我是需要能到 finder 里面去找到密钥文件而不是还得自己写路径」。
+   *
+   * 手写路径的代价不是麻烦，是**错了看不出来**：路径少一个字母，表现是 SSH 认证失败，
+   * 跟"机器没开"、"安全组没放行"长得一模一样。
+   *
+   * `showHiddenFiles`：密钥通常在 `~/.ssh` 里，而那是个隐藏目录 —— 不给这个选项，
+   * 对话框打开之后你在 Finder 里根本看不到它。默认目录也直接指到 `~/.ssh`。
+   */
+  ipcMain.handle('remote:pick-key', async () => {
+    const sshDir = path.join(os.homedir(), '.ssh');
+    const options = {
+      title: '选择 SSH 私钥',
+      defaultPath: fs.existsSync(sshDir) ? sshDir : os.homedir(),
+      properties: ['openFile', 'showHiddenFiles', 'dontAddToRecent'] as Array<'openFile' | 'showHiddenFiles' | 'dontAddToRecent'>,
+      /* `.pem` 单列一项（EC2 给的就是它），但保留"所有文件"—— `id_rsa` 这类根本没有后缀 */
+      filters: [
+        { name: '私钥', extensions: ['pem', 'key', 'cer'] },
+        { name: '所有文件', extensions: ['*'] },
+      ],
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return { path: '' };
+    return { path: result.filePaths[0] };
+  });
+
   ipcMain.handle('remote:test', async (_event, input: RemoteTargetInput) => {
     const why = validateTarget(input);
     if (why) return { ok: false, code: 'invalid', message: why };

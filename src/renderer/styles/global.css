@@ -7597,3 +7597,24 @@ button, input, select, textarea {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* 私钥那一行：路径 + 「选择密钥…」。路径长了省略中间靠左的部分（尾巴才是文件名）。 */
+.remote-key {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+}
+.remote-key-path {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  direction: rtl;          /* 省略号落在**左边**：文件名比目录更值得看 */
+  text-align: left;
+  font-family: var(--mono-font);
+  font-size: 10px;
+  color: var(--text-secondary);
+}
+.remote-key-path.empty { color: var(--text-muted); font-family: inherit; font-size: 11px; direction: ltr; }

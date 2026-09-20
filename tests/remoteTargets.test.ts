@@ -396,7 +396,7 @@ describe('一键装齐远端依赖', () => {
 
   test('接线：按钮在设置里，且只有你按才会跑（没有自动触发）', () => {
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
-    assert.match(RS, />\{installing === r\.sshHost \? '安装中…' : '安装依赖'\}</);
+    assert.match(RS, />\{installing \? '安装中…' : '安装依赖'\}</);
     assert.match(RS, /remoteBootstrap\?\.\(/);
     assert.match(RS, /className="remote-log"/, '输出要看得见');
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
@@ -484,5 +484,48 @@ describe('web search MCP 带到远端的 claude code', () => {
     /* 用**最后一处**：头部注释里也提到了这个 URL，从那儿切看不到兜底那几行 */
     const at = SH2.lastIndexOf('claude.ai/install.sh');
     assert.match(SH2.slice(at, at + 900), /npm_i '@anthropic-ai\/claude-code' claude/, '装不上要能退回 npm');
+  });
+});
+
+/*
+ * 「为什么不把远程机器弄成一个下拉列表」+「我是需要能到 finder 里面去找到密钥文件而不是还得自己写路径」。
+ */
+describe('远端机器那一块的形状', () => {
+  const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+  const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+
+  test('下拉选机器，而不是一行一台各带四个按钮', () => {
+    assert.match(RS, /<select/);
+    assert.match(RS, /\+ 添加一台机器…/);
+    /* 上一版每行四个按钮，实测只有 43–63px 宽，机器一多就是一片按钮 */
+    assert.equal(/className="remote-row"/.test(RS), false, '行式列表已经换掉了');
+    /* 同一时刻只在编辑一台，所以动作按钮只有一组 */
+    assert.equal((RS.match(/onClick=\{\(\) => void test\(\)\}/g) || []).length, 1);
+  });
+
+  test('密钥用 Finder 选，不让人手写路径', () => {
+    assert.match(RS, /remotePickKey\?\.\(\)/);
+    assert.match(RS, /选择密钥…/);
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('remote:pick-key'");
+    assert.ok(at > 0, '主进程要有这个 IPC');
+    const body = M.slice(at, at + 1500);
+    /* 密钥通常在 ~/.ssh —— 那是隐藏目录，不给 showHiddenFiles 的话对话框里根本看不到 */
+    assert.match(body, /showHiddenFiles/);
+    assert.match(body, /\.ssh/);
+    assert.match(body, /'pem'/, 'EC2 给的就是 .pem');
+    assert.match(body, /extensions: \['\*'\]/, 'id_rsa 这类没有后缀，必须能选到');
+    const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
+    assert.match(P, /remotePickKey:/);
+  });
+
+  test('路径太长时省略号落在左边 —— 尾巴（文件名）才是要看的', () => {
+    const at = CSS.indexOf('.remote-key-path {');
+    assert.ok(at > 0);
+    assert.match(CSS.slice(at, CSS.indexOf('}', at)), /direction: rtl/);
+  });
+
+  test('还能清掉选中的密钥（留空 = 用 ssh 自己的配置）', () => {
+    assert.match(RS, /identityFile: '' \}\)/);
   });
 });

@@ -352,6 +352,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('remote:bootstrap-output', handler);
     return () => ipcRenderer.removeListener('remote:bootstrap-output', handler);
   },
+  /** 用 Finder 选私钥（默认开在 ~/.ssh，并显示隐藏文件 —— 否则那个目录根本看不到）。 */
+  remotePickKey: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-key'),
   /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */
   remoteTest: (input: { sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
     ipcRenderer.invoke('remote:test', input),
