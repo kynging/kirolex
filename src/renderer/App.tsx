@@ -3,6 +3,7 @@ import { type SubagentRow } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
 import { normalizeLang, type Lang } from './i18n';
 import { LangProvider, useT } from './hooks/useLang';
+import { useRemoteTargets } from './hooks/useRemoteTargets';
 import { carrySplitSizes, computePaneFlex, SplitSizes } from './splitLayout';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
@@ -42,7 +43,15 @@ declare global {
         projectId?: string,
         kiroAgent?: string,
         permissionMode?: 'auto-approve' | 'ask',
+        /** 这条会话跑在哪台机器上（不传 = 本地）。见 docs/DESIGN_remote_sessions.md。 */
+        remoteId?: string,
       ) => Promise<{ sessionId: string }>;
+      /** 可选的远端列表；`enabled: false` 时界面完全不显示目标选择。 */
+      remoteTargets?: () => Promise<{ enabled: boolean; targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string }[] }>;
+      /** 这条会话当前的同步状态（挂载时问一次）。 */
+      remoteStatus?: (sessionId: string) => Promise<RemoteSyncStatus | null>;
+      /** 同步状态变了。`stale` = 本地不是最新的。 */
+      onRemoteSync?: (cb: (s: RemoteSyncStatus) => void) => () => void;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
       persistNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
@@ -341,6 +350,15 @@ export interface QueuedMessage {
   restored?: boolean;
 }
 
+/** 远程会话的同步状态（`docs/DESIGN_remote_sessions.md`）。 */
+export interface RemoteSyncStatus {
+  sessionId: string;
+  state: 'idle' | 'pushing' | 'pulling' | 'stale' | 'conflict';
+  hostLabel: string;
+  conflicts?: string[];
+  error?: string;
+}
+
 export interface Session {
   id: string;
   title: string;
@@ -371,6 +389,13 @@ export interface Session {
   purpose?: 'skill' | 'main' | 'flow-main' | 'flow-worker';
   /** `flow-main` 属于哪个 flow。标题是给人看的,这个才是身份 */
   flow?: string;
+  /**
+   * **这条会话跑在哪台机器上**（`undefined` = 本地）。给人看的短名字，不是整串 `user@host`。
+   *
+   * 侧栏常驻一个徽标：任何时候都不该去猜"这一轮是在哪台机器上跑的"
+   * （`docs/DESIGN_remote_sessions.md`）。
+   */
+  remoteHost?: string;
   /** User-archived: hidden from the main list into a collapsible Archived group. */
   archived?: boolean;
   folderId?: string | null; // legacy — retained for back-compat, no longer surfaced
@@ -1573,6 +1598,12 @@ const App: React.FC = () => {
   const [dontAskDelete, setDontAskDelete] = useState(false);
   // New Chat dialog: choose project at creation.
   const [showNewChat, setShowNewChat] = useState(false);
+  /**
+   * **新建会话时选哪台机器**（空 = 本地）。远程会话见 `docs/DESIGN_remote_sessions.md`：
+   * 粒度在会话这一层，所以这个选择只在新建时做一次；`remoteTargets.enabled` 为假时整块不显示。
+   */
+  const [newChatRemoteId, setNewChatRemoteId] = useState('');
+  const remoteTargets = useRemoteTargets();
   const [newChatProject, setNewChatProject] = useState<string>(''); // '' = none, '__new__' = create
   const [newChatNewProjectName, setNewChatNewProjectName] = useState('');
 
@@ -1996,7 +2027,10 @@ const App: React.FC = () => {
     const proj = newChatProject === '__new__'
       ? (newChatNewProjectName.trim() || undefined)
       : (newChatProject || undefined);
-    void cwdFor(proj).then((cwd) => newSession(cwd, selectedModel, proj));
+    const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);
+    void cwdFor(proj).then((cwd) => newSession(cwd, selectedModel, proj, undefined, {
+      remoteId: target?.id, remoteLabel: target?.label,
+    }));
     setShowNewChat(false);
     setNewChatProject('');
     setNewChatNewProjectName('');
@@ -3445,6 +3479,35 @@ const App: React.FC = () => {
                 onKeyDown={(e) => { if (e.key === 'Enter') handleCreateChat(); }}
                 style={{ marginBottom: 12 }}
               />
+            )}
+            {/*
+              **在哪台机器上跑**（远程会话，`docs/DESIGN_remote_sessions.md`）。
+              只有配了远端且 feature flag 开着才出现 —— 显示一个选了会报错的选项比不显示糟。
+              默认本地：远程是个明确的选择，不该因为配置里有一台机器就悄悄改变默认行为。
+            */}
+            {remoteTargets.enabled && remoteTargets.targets.length > 0 && (
+              <>
+                <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
+                  在哪台机器上跑
+                </label>
+                <select
+                  className="rename-popup-input"
+                  value={newChatRemoteId}
+                  onChange={(e) => setNewChatRemoteId(e.target.value)}
+                  style={{ marginBottom: 6 }}
+                >
+                  <option value="">本地（这台 Mac）</option>
+                  {remoteTargets.targets.map((t) => (
+                    <option key={t.id} value={t.id}>{`🌐 ${t.label}`}</option>
+                  ))}
+                </select>
+                {newChatRemoteId && (
+                  <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
+                    文件仍然存在本地 —— 每一轮前后自动同步镜像。远端不做构建/测试/预览，
+                    也不要和本地会话同时改同一个项目。
+                  </p>
+                )}
+              </>
             )}
             <div className="actions">
               <button className="btn deny" onClick={() => setShowNewChat(false)}>Cancel</button>

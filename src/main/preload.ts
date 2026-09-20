@@ -30,6 +30,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     projectId?: string,
     kiroAgent?: string,
     permissionMode: 'auto-approve' | 'ask' = 'auto-approve',
+    /** 这条会话跑在哪台机器上（`undefined` = 本地）。见 docs/DESIGN_remote_sessions.md。 */
+    remoteId?: string,
   ) => ipcRenderer.invoke(
     'acp:new-session',
     kiroLexId,
@@ -38,6 +40,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     projectId,
     kiroAgent,
     permissionMode,
+    remoteId,
   ),
   loadSession: (sessionId: string, cwd: string, model: string) => ipcRenderer.invoke('acp:load-session', sessionId, cwd, model),
   primeHistory: (sessionId: string, force?: boolean) =>
@@ -326,7 +329,20 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('workspace:file-changed', handler);
     return () => ipcRenderer.removeListener('workspace:file-changed', handler);
   },
-  
+
+  /* ---------------------------------------------------- 远程会话（远端执行） */
+  /** 可选的远端列表。flag 关着时 `enabled: false` + 空列表 → 界面完全不显示目标选择。 */
+  remoteTargets: (): Promise<{ enabled: boolean; targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string }[] }> =>
+    ipcRenderer.invoke('app:remote-targets'),
+  /** 这条会话当前的同步状态（挂载时问一次 —— 只靠事件会丢掉挂载之前发生的）。 */
+  remoteStatus: (sessionId: string) => ipcRenderer.invoke('remote:status', sessionId),
+  /** 同步状态变了。`stale` = 本地不是最新的，`conflict` = 两边都改过同一个文件。 */
+  onRemoteSync: (callback: (s: { sessionId: string; state: 'idle' | 'pushing' | 'pulling' | 'stale' | 'conflict'; hostLabel: string; conflicts?: string[]; error?: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('remote:sync', handler);
+    return () => ipcRenderer.removeListener('remote:sync', handler);
+  },
+
   // Events
   onUpdate: (callback: (data: any) => void) => {
     const handler = (_event: any, data: any) => callback(data);

@@ -30,7 +30,7 @@ const REAL_ITEMIZE = [
   '<f.st.... never-sent-up.txt',
 ].join('\n');
 
-const remote = { enabled: true, sshHost: 'ec2-user@1.2.3.4', sshPort: 22, remoteWorkdir: '/home/ec2-user/kirolex-mirror' } as any;
+const remote = { sshHost: 'ec2-user@1.2.3.4', sshPort: 22, remoteWorkdir: '/home/ec2-user/kirolex-mirror' } as any;
 const SSHC = 'ssh -i /k.pem -o BatchMode=yes';
 
 describe('镜像路径', () => {

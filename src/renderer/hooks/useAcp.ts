@@ -2369,7 +2369,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
      * 消息被清空又重新加载，画面闪一下；而且 `currentSessionRef` 中途指向过 worker，任何在这一瞬间
      * 到达的流式更新都会被记到错的会话上。不切，就没有这一段中间状态。
      */
-    opts?: { focus?: boolean },
+    opts?: {
+      focus?: boolean;
+      /**
+       * **这条会话跑在哪台机器上**（不传 = 本地）。按会话选，不是全局开关 ——
+       * 会话 A 本地、会话 B 远程要能同时跑（`docs/DESIGN_remote_sessions.md`）。
+       */
+      remoteId?: string;
+      /** 徽标上显示的短名字（`remoteTargets` 给的 label）。 */
+      remoteLabel?: string;
+    },
   ) => {
     await connect(model);
     const focus = opts?.focus !== false;
@@ -2405,7 +2414,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
        * 这是同一个字段的第二处漏填：另一处是 `listDurableSessions` 没把 `profile.kiroAgent` 发出来
        * （已修）。新建这条路是"从来没写过"，那条是"重启后才丢"——两处都补上才算全。
        */
-      { id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, kiroAgent, timestamp: Date.now() },
+      {
+        id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, kiroAgent, timestamp: Date.now(),
+        /* 徽标当场就要有：等下一次 hydrate 才出现的话，你刚建的远程会话看起来像本地的 */
+        ...(opts?.remoteId ? { remoteHost: opts.remoteLabel || opts.remoteId } : null),
+      },
       ...prev,
     ]);
     markConnecting(id); // flash while the executor spawns
@@ -2414,7 +2427,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // this same attach (id is already stable, so no swap — just gate readiness).
     const createPromise = (async (): Promise<string> => {
       try {
-        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve');
+        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId);
         clearConnecting(id);
         // Per design: a newly created chat auto-connects. The executor is
         // spawned, so mark it attached immediately -> the sidebar dot goes green

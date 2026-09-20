@@ -5,7 +5,7 @@ import os from 'os';
 import { execSync, execFile } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd, defaultRemoteWorkdir, type RemoteTarget } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -27,6 +27,7 @@ import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
+import { listRemoteTargets, findRemoteTarget, deriveLabel as deriveRemoteLabel } from './remoteTargets.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -1384,6 +1385,8 @@ const diagHost = (remote?: RemoteTarget): HostOps => hostFor(remote, { buildSshA
 const remoteSync = new RemoteSyncManager({
   note: (sessionId, text) => { noteInSession(sessionId, text); },
   log: (level, message) => logger[level]('remote', message),
+  /* 同步状态给界面：`stale`（本地不是最新的）和 `conflict` 必须看得见，不能只写在日志里 */
+  onStatus: (status) => { mainWindow?.webContents.send('remote:sync', status); },
 });
 
 /**
@@ -3083,6 +3086,14 @@ app.whenReady().then(async () => {
     projectId?: string,
     kiroAgent?: string,
     permissionMode: 'auto-approve' | 'ask' = 'auto-approve',
+    /**
+     * **这条会话在哪台机器上跑** —— `undefined` = 本地（默认）。
+     *
+     * 按会话选，不是全局开关（`docs/DESIGN_remote_sessions.md` 「混用」）：这样会话 A 本地、
+     * 会话 B 远程可以同时跑，而"共存"正是这个功能的要求之一。选定之后存进 profile，
+     * 重启后 attach 从记录里读回同一台机器。
+     */
+    remoteId?: string,
   ) => {
     if (!ensureExecutorCapacity()) {
       throw new Error('All live sessions are busy; cannot start another right now.');
@@ -3090,10 +3101,17 @@ app.whenReady().then(async () => {
     const sessionDir = getSessionDir(kiroLexId);
     const resolvedCwd = cwd === '~' ? os.homedir() : cwd;
     const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
-    // A remote-enabled active agent (see ~/.kirolex/config.json) makes this
-    // session's executor spawn kiro-cli over SSH; otherwise it stays local.
-    /* feature flag 关着的时候一条远程会话都建不起来 —— 主路上那几句同步代码就是死代码 */
-    const remote = isFeatureEnabled('remoteSessions') ? loadActiveRemoteTarget(KIROLEX_CONFIG_PATH) : undefined;
+    /*
+      feature flag 关着的时候一条远程会话都建不起来 —— 主路上那几句同步代码就是死代码。
+      老配置里的 `agents[].remote`（全局开关）不再自动生效：它只会作为一个**可选目标**
+      出现在列表里（`remoteTargets`），选不选由这一次新建决定。
+    */
+    const remote = isFeatureEnabled('remoteSessions')
+      ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId)
+      : undefined;
+    if (remoteId && !remote) {
+      throw new Error(`找不到远端目标 ${remoteId}（配置里的 remotes 变了？）—— 没有猜一台机器，这条会话没有建。`);
+    }
     const profile: AgentProfile = {
       model: model || DEFAULT_MODEL,
       // Set at creation, NOT left undefined. An absent preference used to be
@@ -6206,6 +6224,13 @@ app.whenReady().then(async () => {
        * 一个配了 agent 的 flow **每一步都另起一条会话** —— 复用被静默禁掉，而没有任何报错。
        */
       ...(rec.profile?.kiroAgent ? { kiroAgent: rec.profile.kiroAgent } : null),
+      /**
+       * **这条会话跑在哪台机器上** —— 远程会话（`docs/DESIGN_remote_sessions.md`）。
+       *
+       * 侧栏要常驻一个徽标：任何时候都不该去猜"这一轮是在哪台机器上跑的"。发的是**给人看的名字**
+       * （不是整串 `user@host`），因为徽标的位置只有几个字。
+       */
+      ...(rec.profile?.remote?.sshHost ? { remoteHost: deriveRemoteLabel(rec.profile.remote.sshHost) } : null),
     }));
   });
 
@@ -6273,6 +6298,24 @@ app.whenReady().then(async () => {
 
   /** User-selectable features. Reading is cheap and uncached on purpose, so the
    *  Settings panel and every call site always agree on the live value. */
+  /**
+   * **可选的远端有哪些**（`docs/DESIGN_remote_sessions.md`）。
+   *
+   * flag 关着就返回空列表 —— 界面据此**完全不显示**目标选择，而不是显示一个选了会报错的选项。
+   */
+  ipcMain.handle('app:remote-targets', () => {
+    if (!isFeatureEnabled('remoteSessions')) return { enabled: false, targets: [] };
+    return {
+      enabled: true,
+      targets: listRemoteTargets(KIROLEX_CONFIG_PATH).map((t) => ({
+        id: t.id, label: t.label, sshHost: t.sshHost, remoteWorkdir: t.remoteWorkdir,
+      })),
+    };
+  });
+
+  /** 这条会话当前的同步状态（界面重新挂载时问一次 —— 只靠事件会丢掉挂载之前的状态）。 */
+  ipcMain.handle('remote:status', (_event, sessionId: string) => remoteSync.statusOf(sessionId) || null);
+
   ipcMain.handle('app:get-features', () => ({
     flags: loadFeatureFlags(),
     defaults: { ...FEATURE_DEFAULTS },

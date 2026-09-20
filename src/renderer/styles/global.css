@@ -307,6 +307,26 @@ button, input, select, textarea {
   color: var(--text-secondary);
   white-space: nowrap;
 }
+/* 远程会话的机器徽标。和 .session-crew 同一套形状，换一个色相 —— 它说的是"在别的机器上"，
+   不是"有东西在跑"，两件事在一排标记里必须一眼分得开。 */
+.session-remote {
+  flex-shrink: 0;
+  max-width: 96px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  font-size: 9px;
+  padding: 1px 5px;
+  border-radius: 999px;
+  background: rgba(64,160,220,0.18);
+  color: var(--text-secondary);
+  white-space: nowrap;
+}
+/* `stale` / `conflict`：本地那份可能不是最新的。这一个必须比"在同步"显眼得多 ——
+   它的后果是你对着旧内容下结论，而不是等一会儿就好。 */
+.session-remote.session-remote-warn {
+  background: rgba(220,120,60,0.22);
+  color: var(--error, #e0703c);
+}
 .session-schedule {
   flex-shrink: 0;
   max-width: 92px;

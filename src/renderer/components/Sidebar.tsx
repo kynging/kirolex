@@ -1,5 +1,6 @@
 import { projectsToCollapse } from '../projectActivity';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
+import { syncBadgeSuffix, syncBadgeTitle, useRemoteSyncFor } from '../hooks/useRemoteSync';
 import { searchSessions } from '../sessionSearch';
 import { placeMenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
@@ -181,6 +182,8 @@ const SessionItem: React.FC<{
 }> = ({ session, isActive, sessionStatus, busyReason, onSwitch, onContextMenu, onDelete, splitOrder = 0, onToggleSplit, scheduleSummary, subagents }) => {
   const t = useT();
   const crew = subagentTag(subagents);
+  /* 远程会话：这一刻在推/在拉/本地是旧的 —— 见 `useRemoteSync` 为什么走 context */
+  const remoteSync = useRemoteSyncFor(session.id, !!session.remoteHost);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: session.id });
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -242,6 +245,19 @@ const SessionItem: React.FC<{
         子代理在跑的标记 —— 「如果有subagent在运行左侧的会话上也应该有一个tag，直到subagent被关掉」。
         计数只算还没 terminated 的那些；名单是 kiro 自己报的（名字 / worker agent / 状态都在 title 里）。
       */}
+      {/*
+        **这一行跑在哪台机器上** —— 远程会话（`docs/DESIGN_remote_sessions.md`）。
+        和 flow 的 tag、子代理计数一样放在右边那排「它现在是什么状态」里。
+        常驻：任何时候都不该去猜这一轮是在哪台机器上跑的 —— 猜错的代价是对着另一台机器的文件下结论。
+      */}
+      {session.remoteHost && (
+        <span
+          className={`session-remote${remoteSync && (remoteSync.state === 'stale' || remoteSync.state === 'conflict') ? ' session-remote-warn' : ''}`}
+          title={syncBadgeTitle(session.remoteHost, remoteSync)}
+        >
+          🌐 {session.remoteHost}{syncBadgeSuffix(remoteSync?.state)}
+        </span>
+      )}
       {crew && (
         <span className="session-crew" title={`${t('{n} subagent(s) running:', { n: crew.count })}\n${crew.title}`}>
           🤖 {crew.count}

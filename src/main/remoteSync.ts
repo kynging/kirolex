@@ -39,10 +39,30 @@ export interface SyncTarget {
   hostLabel: string;
 }
 
+/**
+ * 界面上要显示的同步状态。
+ *
+ * `stale` 是这里面最要紧的一个：**本地不是最新的**。不把它显出来，人就会对着旧文件 review，
+ * 而那些建议再被送回模型就变成一串谁都对不上的修改。
+ */
+export type SyncState = 'idle' | 'pushing' | 'pulling' | 'stale' | 'conflict';
+
+export interface SyncStatus {
+  sessionId: string;
+  state: SyncState;
+  hostLabel: string;
+  /** `conflict` 时有值：哪些文件两边都改过。 */
+  conflicts?: string[];
+  /** `stale` 时有值：为什么没取回来。 */
+  error?: string;
+}
+
 export interface SyncDeps {
   /** 在会话里说一句（`kirolex: true`，不发给模型）。 */
   note(sessionId: string, text: string): void;
   log(level: 'info' | 'warn', message: string): void;
+  /** 状态变了告诉界面（同一个状态不重复发）。 */
+  onStatus?(status: SyncStatus): void;
   /** 防抖用；注入是为了测试里不真的等 800ms。 */
   schedule?(fn: () => void, ms: number): void;
 }
@@ -78,6 +98,8 @@ export class RemoteSyncManager {
   private debounced = new Set<string>();
   /** 拉失败留下的债：本地**不是**最新的，必须让人知道。 */
   private owed = new Set<string>();
+  /** 最近一次发给界面的状态（去重 + 重新挂载时能问）。 */
+  private last = new Map<string, SyncStatus>();
   private deps: SyncDeps;
 
   constructor(deps: SyncDeps) {
@@ -92,6 +114,7 @@ export class RemoteSyncManager {
     this.targets.delete(sessionId);
     this.chain.delete(sessionId);
     this.owed.delete(sessionId);
+    this.last.delete(sessionId);
   }
 
   isRemote(sessionId: string): boolean {
@@ -101,6 +124,30 @@ export class RemoteSyncManager {
   /** 本地是不是欠着一次拉（界面上要看得见）。 */
   hasUnpulled(sessionId: string): boolean {
     return this.owed.has(sessionId);
+  }
+
+  /** 当前状态（界面重新挂载时要能问一次，不能只靠事件）。 */
+  statusOf(sessionId: string): SyncStatus | undefined {
+    const t = this.targets.get(sessionId);
+    if (!t) return undefined;
+    return this.last.get(sessionId) || { sessionId, state: 'idle', hostLabel: t.hostLabel };
+  }
+
+  private emit(sessionId: string, state: SyncState, extra: Partial<SyncStatus> = {}): void {
+    const t = this.targets.get(sessionId);
+    if (!t) return;
+    const status: SyncStatus = { sessionId, state, hostLabel: t.hostLabel, ...extra };
+    const prev = this.last.get(sessionId);
+    /*
+      **同一个状态连着来两次只发一次**。这里挡的是"界面闪"，不是"少报一次失败"：
+      拉失败之后再试一次又失败，中间会经过 `pulling`，所以那两次 `stale` 都会发出去 ——
+      那不是重复，是"又试了一次还是不行"，人需要看到它。
+    */
+    if (prev && prev.state === status.state
+      && (prev.conflicts || []).join() === (status.conflicts || []).join()
+      && prev.error === status.error) return;
+    this.last.set(sessionId, status);
+    this.deps.onStatus?.(status);
   }
 
   /** 串进这条会话的链里 —— 保证同一条会话的同步一次一个。 */
@@ -119,6 +166,7 @@ export class RemoteSyncManager {
     const t = this.targets.get(sessionId);
     if (!t) return;
     await this.serial(sessionId, async () => {
+      this.emit(sessionId, 'pushing');
       const results: [string, PushResult][] = [];
       results.push(['项目', await t.project.push()]);
       if (t.session) results.push(['会话目录', await t.session.push()]);
@@ -135,6 +183,7 @@ export class RemoteSyncManager {
         );
       }
       const ms = results.reduce((a, [, r]) => a + r.ms, 0);
+      this.emit(sessionId, 'idle');
       this.deps.log('info', `remote push ok sessionId=${sessionId} host=${t.hostLabel} ${ms}ms`);
     });
   }
@@ -172,9 +221,11 @@ export class RemoteSyncManager {
   private async pullOnce(sessionId: string, why: string, quiet = false): Promise<PullResult> {
     const t = this.targets.get(sessionId);
     if (!t) return { ok: true, changed: [], conflicts: [], ms: 0 };
+    this.emit(sessionId, 'pulling');
     const r = await t.project.pull();
     if (!r.ok) {
       this.owed.add(sessionId);
+      this.emit(sessionId, 'stale', { error: r.error });
       this.deps.log('warn', `remote pull FAILED sessionId=${sessionId} (${why}): ${r.error}`);
       /* 静默的那条路（防抖）也要说 —— "本地不是最新的"是绝对不能沉默的一件事 */
       this.deps.note(sessionId, `⚠️ 远端（${t.hostLabel}）有改动没取回来：${r.error || '同步失败'}。`
@@ -182,6 +233,7 @@ export class RemoteSyncManager {
       return r;
     }
     this.owed.delete(sessionId);
+    this.emit(sessionId, r.conflicts.length ? 'conflict' : 'idle', r.conflicts.length ? { conflicts: r.conflicts } : {});
     if (r.conflicts.length) {
       /* 冲突必须说，而且要说清"你的那份没被动" —— 否则人第一反应是"我的修改被覆盖了" */
       this.deps.note(sessionId, `⚠️ 这些文件你和远端都改过，**本地那份没有动**，远端那份放在旁边了：`
