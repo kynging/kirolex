@@ -7561,3 +7561,20 @@ button, input, select, textarea {
 .remote-row-actions .settings-btn,
 .remote-form .settings-btn { font-size: 11px; padding: 3px 8px; }
 .remote-form .settings-hint { margin: 0; }
+
+/* 安装脚本的实时输出。固定高度 + 自动滚到底：正在跑的那几行才是人想看的，
+   而让它无限长会把整个设置面板顶开。 */
+.remote-log {
+  max-height: 180px;
+  overflow: auto;
+  margin: 6px 0 0;
+  padding: 8px;
+  border-radius: 6px;
+  background: var(--bg-tertiary, rgba(0,0,0,0.25));
+  color: var(--text-secondary);
+  font-family: var(--mono-font);
+  font-size: 10px;
+  line-height: 1.45;
+  white-space: pre-wrap;
+  word-break: break-word;
+}

@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { execSync, execFile } from 'child_process';
+import { execSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type RemoteTarget } from './config';
@@ -6341,6 +6341,81 @@ app.whenReady().then(async () => {
    * 这是那三句话该出现的地方：连不上（网络/密钥）、缺 rsync/git（跑一次预置脚本）、
    * 没登录（去远端 `kiro-cli login`）。在这里看到，比建完会话才发现好得多。
    */
+  /**
+   * **一个按钮把远端装齐** —— 「我让你加一个按钮给这台远程机器跑个脚本装 kiro-cli claude code codex
+   * 还有其他依赖项」。
+   *
+   * 做法：把 `scripts/remote-bootstrap.sh` 推上去（`cat | bash -s` 而不是 scp —— 少一次往返，
+   * 也不在对方磁盘上留文件），然后**边跑边把输出发给界面**。装东西可能要几分钟（kiro-cli 那个包
+   * 几百 MB），中间一个字都不给看的话，人只会以为卡死了。
+   *
+   * 这是"在别人机器上装东西"，所以它只在**你按下按钮**时发生：没有任何自动触发的路径。
+   */
+  ipcMain.handle('remote:bootstrap', async (event, input: RemoteTargetInput & { force?: boolean }) => {
+    const why = validateTarget(input);
+    if (why) return { ok: false, error: why };
+    const target = {
+      sshHost: String(input.sshHost).trim(),
+      sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
+      identityFile: input.identityFile ? String(input.identityFile).replace(/^~(?=\/|$)/, os.homedir()) : undefined,
+    } as RemoteTarget;
+    /* 脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里 */
+    const candidates = [
+      path.join(app.getAppPath(), 'scripts', 'remote-bootstrap.sh'),
+      path.join(process.resourcesPath || '', 'scripts', 'remote-bootstrap.sh'),
+      path.join(__dirname, '..', '..', 'scripts', 'remote-bootstrap.sh'),
+    ];
+    const scriptPath = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+    if (!scriptPath) return { ok: false, error: '找不到 remote-bootstrap.sh（应该在 app 的 scripts/ 下）' };
+    const script = fs.readFileSync(scriptPath, 'utf-8');
+
+    const send = (chunk: string) => {
+      try { event.sender.send('remote:bootstrap-output', { sshHost: target.sshHost, chunk }); } catch {}
+    };
+    /*
+      **脚本落到远端的临时文件再跑，不用 `bash -s`** —— 实测踩过：脚本从 stdin 进去的时候，
+      脚本里任何**读 stdin 的命令**都会把剩下的脚本吃掉。`claude-code-acp --version` 就是这种
+      （它是个 stdio 上的 ACP 服务），于是自检那一整段从来没跑过，而退出码还是 0 ——
+      "看起来成功了，其实少做了一半"。落成文件之后 stdin 是干净的，跑完就删。
+    */
+    const remoteTmp = `/tmp/kirolex-bootstrap-${Date.now()}.sh`;
+    const args = buildSshArgs(
+      target,
+      `cat > ${remoteTmp} && FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
+    );
+    logger.info('remote', `bootstrap 开始 ${target.sshHost}${input.force ? '（强制重装）' : ''}`);
+    return await new Promise<{ ok: boolean; code: number | null; error?: string }>((resolve) => {
+      const child = spawn('ssh', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      let tail = '';
+      const onData = (b: Buffer) => {
+        const t = b.toString('utf-8');
+        tail = (tail + t).slice(-4000);
+        send(t);
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      /* 脚本从 stdin 进去：不在对方磁盘上留文件，也少一次 scp 往返 */
+      child.stdin.write(script);
+      child.stdin.end();
+      /* 15 分钟：kiro-cli 那个 zip 几百 MB，npm 装三个包也要几分钟 */
+      const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch {} }, 15 * 60 * 1000);
+      child.on('error', (err) => {
+        clearTimeout(killer);
+        resolve({ ok: false, code: null, error: err?.message || 'ssh 起不来' });
+      });
+      child.on('close', (code) => {
+        clearTimeout(killer);
+        logger.info('remote', `bootstrap 结束 ${target.sshHost} code=${code}`);
+        resolve({
+          ok: code === 0,
+          code,
+          /* 失败时把最后一段输出带回去：自检那几行就在里面，比一句 exit 1 有用得多 */
+          error: code === 0 ? undefined : (tail.trim().split('\n').slice(-6).join('\n') || `退出码 ${code}`),
+        });
+      });
+    });
+  });
+
   ipcMain.handle('remote:test', async (_event, input: RemoteTargetInput) => {
     const why = validateTarget(input);
     if (why) return { ok: false, code: 'invalid', message: why };

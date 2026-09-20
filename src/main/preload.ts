@@ -341,6 +341,17 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('remote:save', input),
   /** 从可选列表里删掉一台（正在用它的会话不受影响 —— 目标存在各自的 profile 里）。 */
   remoteDelete: (id: string) => ipcRenderer.invoke('remote:delete', id),
+  /**
+   * **一键把远端装齐**：kiro-cli / claude code / codex / rsync / git / node。
+   * 输出边跑边从 `onRemoteBootstrapOutput` 出来（装东西要几分钟，不给看就像卡死）。
+   */
+  remoteBootstrap: (input: { sshHost: string; sshPort?: number; identityFile?: string; force?: boolean }) =>
+    ipcRenderer.invoke('remote:bootstrap', input),
+  onRemoteBootstrapOutput: (callback: (d: { sshHost: string; chunk: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('remote:bootstrap-output', handler);
+    return () => ipcRenderer.removeListener('remote:bootstrap-output', handler);
+  },
   /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */
   remoteTest: (input: { sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
     ipcRenderer.invoke('remote:test', input),

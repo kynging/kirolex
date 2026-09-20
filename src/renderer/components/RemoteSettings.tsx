@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 
 /**
  * **在界面上配一台远端机器** ——「界面上甚至没有配置远程EC2的地方」。
@@ -30,6 +30,22 @@ export const RemoteSettings: React.FC = () => {
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  /** 安装脚本的实时输出。装东西要几分钟（kiro-cli 那个包几百 MB），一个字不给看就像卡死了。 */
+  const [log, setLog] = useState<string>('');
+  const [installing, setInstalling] = useState<string | null>(null);
+  const logRef = useRef<HTMLPreElement | null>(null);
+
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onRemoteBootstrapOutput?.((d: { chunk: string }) => {
+      setLog((prev) => `${prev}${d.chunk}`.slice(-20000));
+    });
+    return () => { try { off?.(); } catch { /* preload 可能已经没了 */ } };
+  }, []);
+
+  /* 输出滚到底 —— 正在跑的那几行才是人想看的 */
+  useEffect(() => {
+    if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
+  }, [log]);
 
   const reload = async (): Promise<void> => {
     const r = await (window as any).kiroApi?.remoteTargets?.();
@@ -57,6 +73,20 @@ export const RemoteSettings: React.FC = () => {
     setBusy(false);
     if (!r?.ok) setResult({ ok: false, text: r?.error || '删除失败' });
     await reload();
+  };
+
+  /**
+   * **一键装齐**：kiro-cli / claude code / codex / node / rsync / git。
+   *
+   * 这是在**别人的机器上装东西**，所以只在你按下按钮时发生，没有任何自动触发的路径。
+   */
+  const bootstrap = async (input: Draft, force = false): Promise<void> => {
+    setResult(null);
+    setLog('');
+    setInstalling(input.sshHost);
+    const r = await (window as any).kiroApi?.remoteBootstrap?.({ ...input, force });
+    setInstalling(null);
+    setResult({ ok: !!r?.ok, text: r?.ok ? '装好了 —— 下面是自检输出。' : (r?.error || '安装失败') });
   };
 
   const test = async (input: Draft): Promise<void> => {
@@ -90,7 +120,13 @@ export const RemoteSettings: React.FC = () => {
             {r.remoteWorkdir && <span className="remote-row-dir">{r.remoteWorkdir}</span>}
           </div>
           <div className="remote-row-actions">
-            <button className="settings-btn" disabled={busy} onClick={() => void test(r as Draft)}>测试连接</button>
+            <button className="settings-btn" disabled={busy || !!installing} onClick={() => void test(r as Draft)}>测试连接</button>
+            <button
+              className="settings-btn"
+              disabled={busy || !!installing}
+              title="在这台机器上装 kiro-cli / claude code / codex / node / rsync / git（幂等，已装的跳过）"
+              onClick={() => void bootstrap(r as Draft)}
+            >{installing === r.sshHost ? '安装中…' : '安装依赖'}</button>
             <button className="settings-btn" disabled={busy} onClick={() => { setResult(null); setDraft({ ...EMPTY, ...r }); }}>编辑</button>
             <button className="settings-btn" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
           </div>
@@ -131,7 +167,13 @@ export const RemoteSettings: React.FC = () => {
             onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
           />
           <div className="remote-row-actions">
-            <button className="settings-btn" disabled={busy || !draft.sshHost.trim()} onClick={() => void test(draft)}>测试连接</button>
+            <button className="settings-btn" disabled={busy || !!installing || !draft.sshHost.trim()} onClick={() => void test(draft)}>测试连接</button>
+            <button
+              className="settings-btn"
+              disabled={busy || !!installing || !draft.sshHost.trim()}
+              title="先保存再装也行；这里直接装是为了新机器一次配好"
+              onClick={() => void bootstrap(draft)}
+            >{installing ? '安装中…' : '安装依赖'}</button>
             <button className="settings-btn primary" disabled={busy || !draft.sshHost.trim()} onClick={() => void save()}>保存</button>
             <button className="settings-btn" disabled={busy} onClick={() => { setDraft(null); setResult(null); }}>取消</button>
           </div>
@@ -143,6 +185,12 @@ export const RemoteSettings: React.FC = () => {
       )}
 
       {busy && <p className="settings-hint">正在连…（最多等 30 秒）</p>}
+      {installing && (
+        <p className="settings-hint">
+          正在 {installing} 上装依赖…（kiro-cli 的包有几百 MB，npm 还要装三个包，几分钟是正常的）
+        </p>
+      )}
+      {log && <pre ref={logRef} className="remote-log">{log}</pre>}
       {result && (
         <p className="settings-hint" style={{ color: result.ok ? 'var(--success, #4caf50)' : 'var(--error)', whiteSpace: 'pre-wrap' }}>
           {result.ok ? '✓ ' : '✗ '}{result.text}

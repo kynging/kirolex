@@ -314,3 +314,82 @@ describe('在界面上加/改/删一台远端', () => {
     assert.match(body, /judgePreflight\(/);
   });
 });
+
+/*
+ * 「我让你加一个按钮给这台远程机器跑个脚本装 kiro-cli claude code codex 还有其他依赖项」。
+ *
+ * 装法不是猜的 —— 是从那台机器上实测出来的：bash 历史里就是
+ *   curl … desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip
+ * 解出来是 `kirocli/{install.sh,bin/}`，install.sh 把三个二进制装进 ~/.local/bin 再跑
+ * `kiro-cli setup`（参数透传，所以给 --no-confirm）；claude-code / codex 是 fnm 下的 npm 全局包。
+ */
+describe('一键装齐远端依赖', () => {
+  const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+
+  test('脚本装的是这几样：kiro-cli / claude code / codex / node / rsync / git', () => {
+    assert.match(SH, /kirocli-x86_64-linux\.zip/);
+    assert.match(SH, /kirocli-aarch64-linux\.zip/, 'arm 的机器也要能装');
+    assert.match(SH, /install\.sh' --no-confirm|install\.sh" --no-confirm/);
+    assert.match(SH, /@anthropic-ai\/claude-code/);
+    assert.match(SH, /@openai\/codex/);
+    assert.match(SH, /@zed-industries\/claude-code-acp/, 'KiroLex 走 ACP，claude code 要靠它当执行器');
+    for (const b of ['rsync', 'git', 'unzip']) assert.ok(SH.includes(b), `缺 ${b}`);
+    assert.match(SH, /fnm/, 'claude-code/codex 是 npm 包，发行版自带的 node 往往太老');
+  });
+
+  test('幂等：已装的跳过，FORCE=1 才重装', () => {
+    assert.match(SH, /FORCE="\$\{FORCE:-0\}"/);
+    assert.match(SH, /have "\$name" && \[ "\$FORCE" != "1" \]/);
+  });
+
+  test('**不装**远程会话不需要的东西，也不替你登录', () => {
+    /* 判据要看**装的动作**，不是看有没有提到这个词 —— 注释里就写着"不装 LibreOffice" */
+    const installs = SH.split('\n').filter((l) => /^\s*(sudo\s+)?(dnf|yum|apt-get|npm)\s/.test(l));
+    const joined = installs.join('\n');
+    assert.equal(/libreoffice|soffice/i.test(joined), false, '预览/PPT 留在本地');
+    assert.equal(/npm\s+(ci|install)(?!\s+-g)/.test(joined), false, '不装项目依赖（只装全局工具）');
+    /* 登录只**提示**，绝不代跑：脚本里不许出现一句真的 `kiro-cli login` 调用 */
+    assert.equal(/^\s*kiro-cli login/m.test(SH), false, '不替你登录');
+    assert.match(SH, /没登录/);
+  });
+
+  test('缺 kiro-cli/rsync/git 要算失败 —— 少了它们远程会话根本跑不起来', () => {
+    assert.match(SH, /kiro-cli\|rsync\|git\) rc=1/);
+  });
+
+  test('接线：IPC 边跑边把输出发给界面（几分钟不给看就像卡死）', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
+    assert.match(M, /ipcMain\.handle\('remote:bootstrap'/);
+    assert.match(M, /event\.sender\.send\('remote:bootstrap-output'/);
+    /*
+      **落到远端临时文件再跑，不用 `bash -s`** —— 实测踩过：脚本从 stdin 进去时，脚本里任何读
+      stdin 的命令都会把剩下的脚本吃掉（`claude-code-acp --version` 就是这种），于是自检整段
+      没跑而退出码还是 0。这条断言就是防它回来的。
+    */
+    assert.match(M, /cat > \$\{remoteTmp\} && FORCE=/);
+    assert.match(M, /rm -f \$\{remoteTmp\}/, '跑完要删，不在对方磁盘上留东西');
+    assert.equal(/bash -s`\)/.test(M), false, 'bash -s 那条路不许回来');
+    assert.match(M, /child\.stdin\.write\(script\)/);
+    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    assert.match(SH2, /--version <\/dev\/null/, '版本探测要隔断 stdin（双重保险）');
+    assert.match(P, /remoteBootstrap:/);
+    assert.match(P, /onRemoteBootstrapOutput:/);
+  });
+
+  test('接线：按钮在设置里，且只有你按才会跑（没有自动触发）', () => {
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.match(RS, />\{installing === r\.sshHost \? '安装中…' : '安装依赖'\}</);
+    assert.match(RS, /remoteBootstrap\?\.\(/);
+    assert.match(RS, /className="remote-log"/, '输出要看得见');
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    /* 主进程里只有这一个调用点，且是 IPC handler —— 不许有任何自动路径 */
+    assert.equal((M.match(/remote:bootstrap'/g) || []).length, 1);
+  });
+
+  test('超时够长 —— kiro-cli 的包几百 MB，npm 还要装三个', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('remote:bootstrap'");
+    assert.match(M.slice(at, at + 3000), /15 \* 60 \* 1000/);
+  });
+});
