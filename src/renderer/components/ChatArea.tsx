@@ -19,6 +19,7 @@ import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
+import { isKirolexNote } from '../../main/kirolexNote.ts';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
@@ -2456,6 +2457,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     suggestionsForRef.current = key;
     const recent = messages
       .slice(-6)
+      /* KiroLex 自己对你说的话不算对话内容（判据和主进程共用一处，见 `main/kirolexNote`）——
+         漏掉的后果实测过：追问建议是照着「⚠️ 这条会话现在跑在 gpt-5.6-sol 上」生成的。 */
+      .filter((m) => !isKirolexNote(m as any))
       .filter((m) => !m.content.startsWith('💭 ') && !m.content.startsWith('🔧 '))
       .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 800)}`)
       .join('\n\n');

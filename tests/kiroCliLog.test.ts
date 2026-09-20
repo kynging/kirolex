@@ -201,17 +201,69 @@ describe('KiroLex 自己说的话不许发给模型', () => {
     assert.match(M, /sessionId: sid, messageId, content: text, ts: Date\.now\(\), kirolex: true,/);
   });
 
-  test('**三条发给模型的路径共用一个判据** —— 分开写必然漏掉一条，而漏掉的那条就是模型看到它的那条', () => {
-    assert.equal((M.match(/\.filter\(modelFacing\)/g) || []).length, 3);
-    assert.match(M, /function modelFacing\(m: \{ role: string; content: string; kirolex\?: true \}\): boolean \{/);
+  /*
+   * 「这个还没修啊」—— 第一次只接在三条路上（ride-along、history.md、逐段重建），而实测今天的
+   * 日志里它又出去了：
+   *   [suggestions] … Based on the conversation below … User: ⚠️ 这条会话现在跑在 gpt-5.6-sol 上…
+   * 漏的是**追问建议**和**会话记忆压缩**。上一版的测试恰恰把"三条"钉成了正确答案 ——
+   * 所以这里改成：判据本身有行为测试，每一条喂模型的路各自被点名。
+   */
+  test('判据是共享的一处（`kirolexNote`），主进程和渲染进程 import 同一个函数', () => {
+    assert.match(M, /from '\.\/kirolexNote\.ts'/);
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    assert.match(CA, /import \{ isKirolexNote \} from '\.\.\/\.\.\/main\/kirolexNote\.ts'/);
+    /* 判据不许再留一份在 index.ts 里 —— 两份"同一个判断"就是这次漏掉的原因 */
+    assert.equal(/const LEGACY_NOTE_OPENINGS = \[/.test(M), false);
   });
 
-  test('标记之前写下的那些按固定开头认出来，判据要窄', () => {
-    assert.match(M, /const LEGACY_NOTE_OPENINGS = \[/);
-    for (const head of ['♻️ 后端连着', '⚠️ 这条会话现在跑在', '⏳ 已排队：', '🔀 后端连着']) {
-      assert.ok(M.includes(head), `缺 ${head}`);
+  test('**每一条喂给模型的路都被点名**，不是数个数', () => {
+    /* ① ride-along 快照 ② history.md ③ 逐段重建 —— 都是 historyLine 那一侧 */
+    assert.ok((M.match(/\.filter\(modelFacing\)/g) || []).length >= 4, '至少四处：三条历史 + 会话记忆');
+    /* ④ 会话记忆压缩：这一条最要紧 —— 压进去之后每一轮都注入，临时通知变成永久上下文 */
+    const mem = M.indexOf('async function maybeConsolidateSessionMemory');
+    const memBody = M.slice(mem, M.indexOf('memoryConsolidating.delete', mem));
+    assert.match(memBody, /\.filter\(modelFacing\)/, '记忆压缩没过滤 = 通知被写进 memory');
+    /* ⑤ 追问建议：主进程在真正发出去的那一处再挡一次，不依赖渲染进程 */
+    const sug = M.indexOf("ipcMain.handle('app:generate-suggestions'");
+    assert.match(M.slice(sug, sug + 900), /stripKirolexNotes\(String\(recentConvo \|\| ''\)\)/);
+  });
+});
+
+describe('这条判据本身的行为（src/main/kirolexNote.ts）', () => {
+  test('标记过的、和标记之前那些固定开头的，都算 KiroLex 自己的话', async () => {
+    const { isKirolexNote, KIROLEX_NOTE_OPENINGS } = await import('../src/main/kirolexNote.ts');
+    assert.equal(isKirolexNote({ content: '随便一句', kirolex: true }), true);
+    for (const head of KIROLEX_NOTE_OPENINGS) {
+      assert.equal(isKirolexNote({ content: `${head}……` }), true, head);
     }
-    /* 不能写成"以 emoji 开头就算" —— 那会吃掉你自己写的「⚠️ 这个接口别动」 */
-    assert.match(M, /宁可漏掉一条旧噪音，不能吃掉你说的话/);
+    assert.ok(KIROLEX_NOTE_OPENINGS.includes('⚠️ 这条会话现在跑在'), '日志里泄漏的就是这一句');
+  });
+
+  test('**你自己写的 ⚠️ 不能被吃掉** —— 判据要窄', async () => {
+    const { isKirolexNote, modelFacing } = await import('../src/main/kirolexNote.ts');
+    assert.equal(isKirolexNote({ content: '⚠️ 这个接口别动' }), false);
+    assert.equal(modelFacing({ role: 'user', content: '⚠️ 这个接口别动' }), true);
+  });
+
+  test('助手的 💭 思考行照旧不发（搬过来的时候语义不许变）', async () => {
+    const { modelFacing } = await import('../src/main/kirolexNote.ts');
+    assert.equal(modelFacing({ role: 'assistant', content: '💭 想一下' }), false);
+    assert.equal(modelFacing({ role: 'assistant', content: '正常回复' }), true);
+    assert.equal(modelFacing({ role: 'user', content: '⚠️ 这条会话现在跑在 gpt 上' }), false);
+  });
+
+  test('拼好的对话文本里整段删掉 —— 用的是日志里那一段真实内容', async () => {
+    const { stripKirolexNotes } = await import('../src/main/kirolexNote.ts');
+    const convo = [
+      'User: 可以',
+      'Assistant: 开始。先把源卷填成 GiB 级的真实语料',
+      'User: ⚠️ 这条会话现在跑在 gpt-5.6-sol 上 —— 你选的 claude-opus-5 这次起不来（KiroLex 按候选顺序退到了下一个）。\n它回来之后，在模型选择器里再点一次就会重试它。',
+      'Assistant: 收到，知道了——这轮是 gpt-5.6-sol。',
+    ].join('\n\n');
+    const out = stripKirolexNotes(convo);
+    assert.equal(/这条会话现在跑在/.test(out), false, '这一句就是泄漏出去的那句');
+    assert.match(out, /GiB 级的真实语料/, '真正的对话必须一个字不少');
+    /* 模型照着它答的那句留着 —— 删的是 KiroLex 说的，不是模型说的 */
+    assert.match(out, /收到，知道了/);
   });
 });

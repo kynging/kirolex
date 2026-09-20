@@ -28,6 +28,7 @@ import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMir
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { listRemoteTargets, findRemoteTarget, deriveLabel as deriveRemoteLabel } from './remoteTargets.ts';
+import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -514,6 +515,12 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
     /* 只喂最近这一段:更早的已经被上一次压缩吸收进 existing 了,再喂一遍是重复付钱 */
     const recent = messages
       .slice(-CONSOLIDATE_EVERY * 2)
+      /*
+        **KiroLex 自己的通知不能进记忆** —— 这一条比别处都要紧：记忆是压缩完永久留着、
+        而且每一轮都注入的。一句「⚠️ 这条会话现在跑在 gpt-5.6-sol 上」被压进去，
+        之后每一轮模型都会读到它，一句临时通知就变成了长期上下文。判据见 `kirolexNote`。
+      */
+      .filter(modelFacing)
       .map((m: any) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.content || '').slice(0, 800)}`)
       .join('\n\n');
     if (!recent.trim()) return;
@@ -715,32 +722,16 @@ const unobservedToolKinds = new Set<string>();
  * 三条发给模型的路径（history.md、ride-along 快照、逐段重建）共用这一个判据 ——
  * 分开写必然漏掉一条，而漏掉的那条就是模型看到它的那条。
  */
-function modelFacing(m: { role: string; content: string; kirolex?: true }): boolean {
-  if (m.kirolex) return false;
-  if (legacyKirolexNote(m)) return false;
-  return !(m.role === 'assistant' && String(m.content || '').startsWith('💭 '));
-}
-
-/**
- * **`kirolex` 标记之前写下的那些**，按开头认出来 —— 光加标记只管未来，而历史里已经躺着一堆：
- * 实测一条会话里 4 条（三次「♻️ 后端连着…」加一句被当成回复存下来的 `⚠️ Error invoking…`），
- * 它们每一轮都跟着快照发给模型。
+/*
+ * **判据搬到了 `src/main/kirolexNote.ts`** ——「这个还没修啊」。
  *
- * 判据故意窄：**这几句固定开头**，不是"以 emoji 开头就算"。后者会把你自己写的
- * 「⚠️ 这个接口别动」也吃掉，而那是真的对话内容 —— 宁可漏掉一条旧噪音，不能吃掉你说的话。
+ * 第一次只接在三条路上（ride-along 快照、`history.md`、逐段重建），而实测今天的日志里它又出去了：
+ * `[suggestions] … Based on the conversation below … User: ⚠️ 这条会话现在跑在 gpt-5.6-sol 上…`。
+ * 漏的是**追问建议**和**会话记忆压缩**两条 —— 后者把这句话压进 memory，然后每一轮都注入，
+ * 一句临时通知变成了永久上下文。
+ *
+ * 判据散在一处、调用点散在五处，漏掉是必然的。所以它现在是主进程和渲染进程共用的同一个函数。
  */
-const LEGACY_NOTE_OPENINGS = [
-  '♻️ 后端连着',
-  '♻️ 这条会话的后端会话 id',
-  '⚠️ 这条会话现在跑在',
-  '⏳ 已排队：',
-  '🔀 后端连着',
-  "⚠️ Error invoking remote method 'acp:",
-];
-function legacyKirolexNote(m: { content: string }): boolean {
-  const t = String(m.content || '').trim();
-  return LEGACY_NOTE_OPENINGS.some((head) => t.startsWith(head));
-}
 
 function historyLine(m: {
   role: string;
@@ -5586,7 +5577,12 @@ app.whenReady().then(async () => {
   // produce a few short follow-up prompts the user is likely to want next. One-
   // shot kiro-cli via execFile (args array — the convo text can't shell-inject).
   ipcMain.handle('app:generate-suggestions', async (_event, recentConvo: string) => {
-    const convo = String(recentConvo || '').slice(0, 4000);
+    /*
+      **在发出去的这一处再挡一次** —— 实测泄漏就是从这条路出去的：
+      `[suggestions] … Based on the conversation below … User: ⚠️ 这条会话现在跑在 gpt-5.6-sol 上…`。
+      上游（渲染进程）也会过滤，但这里不能依赖它：再多一个调用点，漏的就是那一个。
+    */
+    const convo = stripKirolexNotes(String(recentConvo || '')).slice(0, 4000);
     if (!convo.trim()) return { suggestions: [] };
     const prompt = `Based on the conversation below, propose 3 short follow-up prompts the user might send next. Each must be a concrete, actionable next step in the SAME language as the conversation, max 12 words, no numbering, no quotes. Reply with ONLY the 3 prompts, one per line.\n\n${convo}`;
     try {
