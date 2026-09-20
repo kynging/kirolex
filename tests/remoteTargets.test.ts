@@ -224,3 +224,93 @@ describe('接线：渲染进程', () => {
     assert.match(SB, /useRemoteSyncFor\(session\.id, !!session\.remoteHost\)/);
   });
 });
+
+/*
+ * 「界面上甚至没有配置远程EC2的地方」—— 功能做出来了却只能手改 config.json，等于没有入口。
+ */
+describe('在界面上加/改/删一台远端', () => {
+  async function fixtureCfg(initial: any = {}): Promise<string> {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'rtw-'));
+    const f = path.join(dir, 'config.json');
+    fs.writeFileSync(f, JSON.stringify(initial, null, 2));
+    return f;
+  }
+
+  test('存一条：只动 remotes，配置里别的东西**原样保留**', async () => {
+    const { saveRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    const f = await fixtureCfg({
+      agents: [{ id: 'a1', remote: { sshHost: 'u@old' } }],
+      features: { remoteSessions: true },
+      activeAgentId: 'a1',
+    });
+    const saved = saveRemoteTarget(f, { label: 'Tokyo EC2', sshHost: 'ec2-user@1.2.3.4', identityFile: '~/k.pem' });
+    const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+    assert.equal(cfg.activeAgentId, 'a1', '别的键一个都不能丢');
+    assert.equal(cfg.features.remoteSessions, true);
+    assert.equal(cfg.agents.length, 1, '老形状不改写');
+    assert.equal(cfg.remotes.length, 1);
+    assert.equal(cfg.remotes[0].label, 'Tokyo EC2');
+    assert.equal(saved.id, 'tokyo-ec2', 'id 可读，不是时间戳');
+    /* `~` 存原样（配置里更可读），读的时候才展开 */
+    assert.equal(cfg.remotes[0].identityFile, '~/k.pem');
+    assert.match(saved.identityFile!, /^\//, '读出来的是展开后的绝对路径');
+  });
+
+  test('同名再存一条 id 不撞；带 id 是改而不是新增', async () => {
+    const { saveRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    const f = await fixtureCfg();
+    const a = saveRemoteTarget(f, { label: 'box', sshHost: 'u@h1' });
+    const b = saveRemoteTarget(f, { label: 'box', sshHost: 'u@h2' });
+    assert.equal(a.id, 'box');
+    assert.equal(b.id, 'box-2');
+    saveRemoteTarget(f, { id: 'box', label: 'box', sshHost: 'u@h1', remoteWorkdir: '/home/u/m' });
+    const cfg = JSON.parse(fs.readFileSync(f, 'utf8'));
+    assert.equal(cfg.remotes.length, 2, '带 id 是改，不该变成第三条');
+    assert.equal(cfg.remotes.find((r: any) => r.id === 'box').remoteWorkdir, '/home/u/m');
+  });
+
+  test('删一条；老 agents[].remote 那条删不掉要说清原因', async () => {
+    const { saveRemoteTarget, deleteRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    const f = await fixtureCfg({ agents: [{ id: 'a1', remote: { sshHost: 'u@old' } }] });
+    saveRemoteTarget(f, { label: 'x', sshHost: 'u@h' });
+    assert.equal(deleteRemoteTarget(f, 'x'), true);
+    assert.equal(deleteRemoteTarget(f, 'a1'), false, '它不在可编辑的列表里');
+    assert.equal(JSON.parse(fs.readFileSync(f, 'utf8')).agents.length, 1, '删不动也不能把老配置搞坏');
+  });
+
+  test('校验：空地址、带空格、端口越界、相对工作目录，各有一句话', async () => {
+    const { validateTarget } = await import('../src/main/remoteTargets.ts');
+    assert.match(validateTarget({ sshHost: '' })!, /不能为空/);
+    assert.match(validateTarget({ sshHost: 'u@h x' })!, /空格/);
+    assert.match(validateTarget({ sshHost: 'u@h', sshPort: 0 })!, /1–65535/);
+    /* 相对路径会落在登录 shell 的当前目录上 —— "看起来能用，但镜像跑到了别处" */
+    assert.match(validateTarget({ sshHost: 'u@h', remoteWorkdir: 'mirror' })!, /绝对路径/);
+    assert.equal(validateTarget({ sshHost: 'u@h' }), null);
+    assert.equal(validateTarget({ sshHost: 'u@h', sshPort: 22, remoteWorkdir: '~/m' }), null);
+  });
+
+  test('写的是原子写 —— 这是用户唯一的配置文件', async () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteTargets.ts'), 'utf8');
+    assert.match(src, /fs\.renameSync\(tmp, configPath\)/);
+  });
+
+  test('接线：三个 IPC + preload + 设置里那一块', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
+    const SD = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
+    for (const ch of ["'remote:save'", "'remote:delete'", "'remote:test'"]) {
+      assert.ok(M.includes(ch), `缺 ${ch}`);
+    }
+    assert.match(P, /remoteSave:/);
+    assert.match(P, /remoteTest:/);
+    assert.match(SD, /<RemoteSettings \/>/);
+  });
+
+  test('「测试连接」用的是**同一个**预检判据，不是另写一套', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('remote:test'");
+    const body = M.slice(at, at + 1600);
+    assert.match(body, /preflightScript\(\)/);
+    assert.match(body, /judgePreflight\(/);
+  });
+});

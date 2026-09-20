@@ -7518,3 +7518,46 @@ button, input, select, textarea {
   background: color-mix(in srgb, var(--error) 14%, transparent);
 }
 .sidebar-settings-btn.sidebar-trace-on:hover { background: color-mix(in srgb, var(--error) 26%, transparent); }
+
+/* 远端机器列表（设置 → 远端机器）。一行一台：名字 + 地址 + 镜像目录，右边是操作。
+   「测试连接」放在每一行上而不是只在编辑态里 —— 配好之后最常做的事就是"它现在还连得上吗"。 */
+.remote-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  padding: 6px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+.remote-row-main { display: flex; flex-direction: column; gap: 2px; min-width: 0; }
+.remote-row-label { font-size: 12px; }
+.remote-row-host,
+.remote-row-dir {
+  font-size: 10px;
+  color: var(--text-muted);
+  font-family: var(--mono-font);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.remote-row-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.remote-form {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 8px;
+  border: 1px dashed var(--border);
+  border-radius: 6px;
+  margin-bottom: 6px;
+}
+
+/* 「保存」是这一组里的主操作，要能一眼认出来（其余是测试/取消/删除）。 */
+.settings-btn.primary {
+  border-color: var(--accent, #7c6fe0);
+  color: var(--accent, #7c6fe0);
+}
+.remote-row-actions .settings-btn,
+.remote-form .settings-btn { font-size: 11px; padding: 3px 8px; }
+.remote-form .settings-hint { margin: 0; }

@@ -27,7 +27,7 @@ import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
-import { listRemoteTargets, findRemoteTarget, deriveLabel as deriveRemoteLabel } from './remoteTargets.ts';
+import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, deriveLabel as deriveRemoteLabel, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
@@ -6311,6 +6311,57 @@ app.whenReady().then(async () => {
 
   /** 这条会话当前的同步状态（界面重新挂载时问一次 —— 只靠事件会丢掉挂载之前的状态）。 */
   ipcMain.handle('remote:status', (_event, sessionId: string) => remoteSync.statusOf(sessionId) || null);
+
+  /*
+    **在界面上加/改/删一台远端** ——「界面上甚至没有配置远程EC2的地方」。
+    功能做出来了却只能手改 config.json，等于没有入口。写的时候只动 `remotes` 这一个键，
+    而且是原子写（这是用户唯一的配置文件）。
+  */
+  ipcMain.handle('remote:save', (_event, input: RemoteTargetInput) => {
+    try {
+      const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, input);
+      logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})`);
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, remoteWorkdir: saved.remoteWorkdir } };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || '保存失败' };
+    }
+  });
+
+  ipcMain.handle('remote:delete', (_event, id: string) => {
+    /* 正在用这台机器的会话不受影响：它们的 remote 存在自己的 profile 里（按会话固定），
+       删掉只是让它不再出现在"新建会话"的列表里。 */
+    const gone = deleteRemoteTarget(KIROLEX_CONFIG_PATH, id);
+    logger.info('remote', `删除远端 ${id} -> ${gone ? 'ok' : '不在列表里（可能是老 agents[].remote）'}`);
+    return { ok: gone, error: gone ? undefined : '这一条不在可编辑的列表里（来自旧配置 agents[].remote，请手动删除）' };
+  });
+
+  /**
+   * **测试连接** —— 把 `remotePreflight` 的判定直接给人看。
+   *
+   * 这是那三句话该出现的地方：连不上（网络/密钥）、缺 rsync/git（跑一次预置脚本）、
+   * 没登录（去远端 `kiro-cli login`）。在这里看到，比建完会话才发现好得多。
+   */
+  ipcMain.handle('remote:test', async (_event, input: RemoteTargetInput) => {
+    const why = validateTarget(input);
+    if (why) return { ok: false, code: 'invalid', message: why };
+    const target = {
+      sshHost: String(input.sshHost).trim(),
+      sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
+      identityFile: input.identityFile ? String(input.identityFile).replace(/^~(?=\/|$)/, os.homedir()) : undefined,
+      remoteWorkdir: input.remoteWorkdir || undefined,
+    } as RemoteTarget;
+    const args = buildSshArgs(target, `bash -lc ${shellQuote(preflightScript())}`);
+    const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
+        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || ''),
+      }));
+    });
+    const verdict = judgePreflight(out.code, out.stdout, out.stderr, target);
+    logger.info('remote', `test ${target.sshHost}: ${verdict.code}`);
+    return { ok: verdict.code === 'ok', code: verdict.code, message: verdict.message, missing: verdict.missing };
+  });
 
   ipcMain.handle('app:get-features', () => ({
     flags: loadFeatureFlags(),

@@ -100,3 +100,101 @@ export function findRemoteTarget(configPath: string, id: string | undefined, hom
   if (!id) return undefined;
   return listRemoteTargets(configPath, home).find((t) => t.id === id);
 }
+
+/* ------------------------------------------------------ 写：界面上能加/改/删 */
+
+/**
+ * **界面上得能配一台机器** ——「界面上甚至没有配置远程EC2的地方」。
+ *
+ * 原来只能手改 `~/.kirolex/config.json`：功能做出来了，但没有入口，等于没有。
+ *
+ * 写回去的规则：
+ *   · 只动 `remotes` 这一个键，配置里别的东西**原样保留**（这份文件里还有 agents、features…）
+ *   · 先写临时文件再 rename —— 这是用户唯一的配置文件，写一半被中断就等于把它弄坏了
+ *   · 老形状 `agents[].remote` **不改写**：它照旧被读出来当一个可选目标，但编辑动的是新列表
+ */
+export interface RemoteTargetInput {
+  id?: string;
+  label?: string;
+  sshHost: string;
+  sshPort?: number;
+  identityFile?: string;
+  remoteWorkdir?: string;
+}
+
+/** 新建时的 id：按 label/host 生成一个稳定的可读 id（不用时间戳 —— 那种 id 在配置文件里没法认）。 */
+export function newTargetId(input: RemoteTargetInput, taken: string[] = []): string {
+  const base = (input.label || deriveLabel(input.sshHost) || 'remote')
+    .toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '') || 'remote';
+  if (!taken.includes(base)) return base;
+  for (let i = 2; i < 100; i += 1) {
+    if (!taken.includes(`${base}-${i}`)) return `${base}-${i}`;
+  }
+  return `${base}-${Date.now()}`;
+}
+
+/** 校验一条输入。返回一句给人看的错误，或者 `null` = 可以存。 */
+export function validateTarget(input: RemoteTargetInput): string | null {
+  const host = String(input?.sshHost || '').trim();
+  if (!host) return 'SSH 地址不能为空（形如 `ec2-user@1.2.3.4`）。';
+  if (/\s/.test(host)) return 'SSH 地址里不能有空格。';
+  const port = input.sshPort === undefined || input.sshPort === null || (input.sshPort as any) === '' ? 22 : Number(input.sshPort);
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) return '端口要是 1–65535 之间的数字。';
+  if (input.remoteWorkdir && !String(input.remoteWorkdir).startsWith('/') && !String(input.remoteWorkdir).startsWith('~')) {
+    /* 相对路径会落在登录 shell 的当前目录上 —— 那是"看起来能用，但镜像跑到了别处" */
+    return '远端工作目录要写绝对路径（`/home/ec2-user/kirolex-mirror`）。';
+  }
+  return null;
+}
+
+function readConfigObject(configPath: string): any {
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'));
+    return raw && typeof raw === 'object' ? raw : {};
+  } catch {
+    return {};
+  }
+}
+
+function writeConfigObject(configPath: string, cfg: any): void {
+  /* 原子写：这是用户唯一的配置文件，写一半被打断就等于弄坏它 */
+  const tmp = `${configPath}.tmp-${process.pid}`;
+  fs.mkdirSync(path.dirname(configPath), { recursive: true });
+  fs.writeFileSync(tmp, `${JSON.stringify(cfg, null, 2)}\n`);
+  fs.renameSync(tmp, configPath);
+}
+
+/** 存一条（有 id 就是改，没有就是新建）。返回存下来的那一条。 */
+export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, home = os.homedir()): RemoteTargetEntry {
+  const why = validateTarget(input);
+  if (why) throw new Error(why);
+  const cfg = readConfigObject(configPath);
+  const list: any[] = Array.isArray(cfg.remotes) ? cfg.remotes.slice() : [];
+  const id = input.id || newTargetId(input, list.map((r) => String(r?.id || '')));
+  const row = {
+    id,
+    label: String(input.label || '').trim() || deriveLabel(input.sshHost),
+    sshHost: String(input.sshHost).trim(),
+    sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
+    /* `~` **不在这里展开**：配置里留着 `~/k.pem` 更可读，读的时候才展开（`expandHome`） */
+    identityFile: String(input.identityFile || '').trim() || undefined,
+    remoteWorkdir: String(input.remoteWorkdir || '').trim() || undefined,
+  };
+  const at = list.findIndex((r) => String(r?.id || '') === id);
+  if (at >= 0) list[at] = { ...list[at], ...row };
+  else list.push(row);
+  cfg.remotes = list;
+  writeConfigObject(configPath, cfg);
+  return normalize(row, id, home)!;
+}
+
+/** 删一条。删不掉（id 不在新列表里）时返回 false —— 老 `agents[].remote` 那条不在这里管。 */
+export function deleteRemoteTarget(configPath: string, id: string): boolean {
+  const cfg = readConfigObject(configPath);
+  const list: any[] = Array.isArray(cfg.remotes) ? cfg.remotes : [];
+  const next = list.filter((r) => String(r?.id || '') !== id);
+  if (next.length === list.length) return false;
+  cfg.remotes = next;
+  writeConfigObject(configPath, cfg);
+  return true;
+}

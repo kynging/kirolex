@@ -336,6 +336,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('app:remote-targets'),
   /** 这条会话当前的同步状态（挂载时问一次 —— 只靠事件会丢掉挂载之前发生的）。 */
   remoteStatus: (sessionId: string) => ipcRenderer.invoke('remote:status', sessionId),
+  /** 加/改一台远端（只动 config.json 的 `remotes`，原子写）。 */
+  remoteSave: (input: { id?: string; label?: string; sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
+    ipcRenderer.invoke('remote:save', input),
+  /** 从可选列表里删掉一台（正在用它的会话不受影响 —— 目标存在各自的 profile 里）。 */
+  remoteDelete: (id: string) => ipcRenderer.invoke('remote:delete', id),
+  /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */
+  remoteTest: (input: { sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
+    ipcRenderer.invoke('remote:test', input),
   /** 同步状态变了。`stale` = 本地不是最新的，`conflict` = 两边都改过同一个文件。 */
   onRemoteSync: (callback: (s: { sessionId: string; state: 'idle' | 'pushing' | 'pulling' | 'stale' | 'conflict'; hostLabel: string; conflicts?: string[]; error?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

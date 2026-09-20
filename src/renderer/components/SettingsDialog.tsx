@@ -1,4 +1,5 @@
 import { LANG_OPTIONS, normalizeLang } from '../i18n';
+import { RemoteSettings } from './RemoteSettings';
 import { useT } from '../hooks/useLang';
 import React from 'react';
 import { useEffect, useState } from 'react';
@@ -485,6 +486,12 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           </div>
 
           <div className="settings-col">
+            {/*
+              远端机器的配置入口 ——「界面上甚至没有配置远程EC2的地方」。
+              放在功能开关**上面**：先有机器，才有得选；而 remoteSessions 那个开关就在下面一格，
+              两者挨着，关着的时候这一块会直接说清"配了也不会出现在新建对话里"。
+            */}
+            <RemoteSettings />
             <div className="settings-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
               <label className="settings-label">{t('Feature switches (take effect immediately, no restart)')}</label>
               {SWITCH_GROUPS.map((group) => {
