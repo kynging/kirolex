@@ -22,6 +22,8 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import type { HostOps } from './hostOps.ts';
+import { kiroCliLogPath } from './kiroCliLog.ts';
 
 export const KEEP_PER_SESSION = 5;
 export const COOLDOWN_MS = 60_000;
@@ -36,8 +38,11 @@ export interface BundleInput {
   pid?: number;
   toolsThisTurn?: number;
   maxToolOutput?: number;
-  /** kiro-cli 日志的路径，注入进来是为了可测。 */
-  cliLogPath: string;
+  /**
+   * 从**哪台机器**抄这些证据。远程会话里 kiro-cli 的日志和会话都在远端，
+   * 用本地的 fs 去抄只会抄到一包空的（那比没有更糟：看起来像"抄到了，但什么都没有"）。
+   */
+  host: HostOps;
   /** kiro-cli 开了 trace 时日志涨得极快，512KB 可能只盖住一秒 —— 那时多抄一些。 */
   cliLogTailBytes?: number;
   home?: string;
@@ -56,7 +61,7 @@ export function prunable(dirs: string[], keep = KEEP_PER_SESSION): string[] {
 const lastWrite = new Map<string, number>();
 
 /** 落一包。返回目录路径；被冷却挡下或写不成功时返回 null（诊断永远不能让发送失败）。 */
-export function writeFailureBundle(input: BundleInput): string | null {
+export async function writeFailureBundle(input: BundleInput): Promise<string | null> {
   const now = input.now ?? Date.now();
   const prev = lastWrite.get(input.sessionId) || 0;
   if (now - prev < COOLDOWN_MS) return null;
@@ -77,13 +82,15 @@ export function writeFailureBundle(input: BundleInput): string | null {
       promptChars: (input.promptText || '').length,
       error: String(input.error || '').slice(0, 2000),
     }, null, 2));
-    /* kiro-cli 自己那份会话（状态 + 历史）—— 这是唯一能看到"后端手里是什么"的东西 */
+    /* kiro-cli 自己那份会话（状态 + 历史）—— 这是唯一能看到"后端手里是什么"的东西。
+       路径挂在**跑 kiro-cli 那台机器**的 HOME 下，所以 home 从 host 问，不是 os.homedir()。 */
     if (input.cliSessionId) {
-      const base = path.join(input.home ?? os.homedir(), '.kiro', 'sessions', 'cli', input.cliSessionId);
-      copyIfExists(base + '.json', path.join(dir, 'cli-session.json'));
-      copyTail(base + '.jsonl', path.join(dir, 'cli-session.jsonl'), 2 * 1024 * 1024);
+      const base = path.join(await input.host.home(), '.kiro', 'sessions', 'cli', input.cliSessionId);
+      await save(input.host, base + '.json', path.join(dir, 'cli-session.json'), 8 * 1024 * 1024, 'all');
+      await save(input.host, base + '.jsonl', path.join(dir, 'cli-session.jsonl'), 2 * 1024 * 1024, 'tail');
     }
-    copyTail(input.cliLogPath, path.join(dir, 'kiro-log.txt'), input.cliLogTailBytes ?? 512 * 1024);
+    const logPath = kiroCliLogPath(await input.host.tmpdir());
+    await save(input.host, logPath, path.join(dir, 'kiro-log.txt'), input.cliLogTailBytes ?? 512 * 1024, 'tail');
     /* 只留最近几包 */
     const parent = path.join(bundleRoot(input.home), input.sessionId);
     const kids = fs.readdirSync(parent).filter((d) => !d.startsWith('.'));
@@ -96,21 +103,17 @@ export function writeFailureBundle(input: BundleInput): string | null {
   }
 }
 
-function copyIfExists(from: string, to: string): void {
-  try { fs.copyFileSync(from, to); } catch { /* 没有就算了 */ }
-}
-
-function copyTail(from: string, to: string, bytes: number): void {
+/**
+ * 从 `host` 上抄一份到本地（`all` = 整个文件，`tail` = 只要尾部 `bytes` 字节）。
+ *
+ * **读不到就一个文件都不写** —— 远端没有的东西如果落成一个空文件，事后看起来像"抄到了但是空的"，
+ * 那比缺一份糟得多（会让人对着一个空文件找原因）。
+ */
+async function save(host: HostOps, from: string, to: string, bytes: number, how: 'all' | 'tail'): Promise<void> {
   try {
-    const fd = fs.openSync(from, 'r');
-    try {
-      const size = fs.fstatSync(fd).size;
-      const start = Math.max(0, size - bytes);
-      const len = size - start;
-      const b = Buffer.alloc(len);
-      fs.readSync(fd, b, 0, len, start);
-      fs.writeFileSync(to, b);
-    } finally { fs.closeSync(fd); }
+    const text = how === 'all' ? await host.readAll(from, bytes) : await host.readTail(from, bytes);
+    if (text === null || text === '') return;
+    fs.writeFileSync(to, text);
   } catch { /* 没有就算了 */ }
 }
 

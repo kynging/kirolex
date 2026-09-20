@@ -6,6 +6,7 @@ import path from 'node:path';
 import {
   writeFailureBundle, prunable, bundleRoot, KEEP_PER_SESSION, COOLDOWN_MS, _resetCooldown,
 } from '../src/main/failureBundle.ts';
+import { LocalHost } from '../src/main/hostOps.ts';
 
 /*
  * 「这个问题很严重必须修好」+「是我后来换成 kiro-cli 才好了」。
@@ -14,28 +15,35 @@ import {
  * 只有一句 `Internal error`（请求体是 kiro-cli 拼的）。故障又不能按需复现：那 25 分钟过去之后，
  * 同样的 ACP 路径 + opus-5 + 16KB 注入一次就过。所以失败当场把现场落盘，下次对着差异看。
  */
-function fixture(): { home: string; cliLog: string } {
+function fixture(): { home: string; host: LocalHost } {
   const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fb-home-'));
-  const cliLog = path.join(home, 'kiro-chat.log');
-  fs.writeFileSync(cliLog, 'ERROR agent::agent: response stream encountered an error err=EmptyResponse\n');
-  return { home, cliLog };
+  fs.mkdirSync(path.join(home, 'kiro-log'), { recursive: true });
+  fs.writeFileSync(
+    path.join(home, 'kiro-log', 'kiro-chat.log'),
+    'ERROR agent::agent: response stream encountered an error err=EmptyResponse\n',
+  );
+  /* 证据从**哪台机器**抄 —— 本地会话是 LocalHost，远程会话是 SshHost（同一个接口） */
+  return { home, host: new LocalHost({ TMPDIR: home, HOME: home } as any) };
 }
 
+/** 那台机器上什么都没有（远程会话读不到 / 本机清理过）。 */
+const emptyHost = () => new LocalHost({ TMPDIR: '/nope', HOME: '/nope' } as any);
+
 describe('失败现场存档', () => {
-  test('四样东西都在：发出去的原文、kiro-cli 自己的会话、它的日志、元信息', () => {
+  test('四样东西都在：发出去的原文、kiro-cli 自己的会话、它的日志、元信息', async () => {
     _resetCooldown();
-    const { home, cliLog } = fixture();
+    const { home, host } = fixture();
     /* kiro-cli 存的那份会话（这次才发现它是存盘的） */
     const cliDir = path.join(home, '.kiro', 'sessions', 'cli');
     fs.mkdirSync(cliDir, { recursive: true });
     fs.writeFileSync(path.join(cliDir, 'abc.json'), '{"session_state":{"rts_model_state":{"context_usage_percentage":3.82}}}');
     fs.writeFileSync(path.join(cliDir, 'abc.jsonl'), '{"kind":"Prompt"}\n{"kind":"AssistantMessage"}\n');
 
-    const dir = writeFailureBundle({
+    const dir = await writeFailureBundle({
       sessionId: 's_1', cliSessionId: 'abc', promptText: '快照 + memory + 我的问题',
       error: 'Internal error — Kiro failed to generate a response',
       model: 'claude-opus-5', pid: 31257, toolsThisTurn: 13, maxToolOutput: 42000,
-      cliLogPath: cliLog, home,
+      host, home,
     });
     assert.ok(dir, '应该落盘');
     const got = fs.readdirSync(dir!).sort();
@@ -50,23 +58,23 @@ describe('失败现场存档', () => {
     assert.match(fs.readFileSync(path.join(dir!, 'cli-session.json'), 'utf8'), /context_usage_percentage/);
   });
 
-  test('缺文件不报错 —— 诊断永远不能让发送失败', () => {
+  test('缺文件不报错 —— 诊断永远不能让发送失败', async () => {
     _resetCooldown();
     const { home } = fixture();
-    const dir = writeFailureBundle({
+    const dir = await writeFailureBundle({
       sessionId: 's_2', cliSessionId: 'nope', promptText: 'x', error: 'e',
-      cliLogPath: '/nope/kiro.log', home,
+      host: emptyHost(), home,
     });
     assert.ok(dir);
     assert.deepEqual(fs.readdirSync(dir!).sort(), ['meta.json', 'prompt.txt']);
   });
 
-  test('同一条会话冷却期内不重复落盘 —— 连着失败 6 次不该写 6 份一样的', () => {
+  test('同一条会话冷却期内不重复落盘 —— 连着失败 6 次不该写 6 份一样的', async () => {
     _resetCooldown();
-    const { home, cliLog } = fixture();
-    const a = writeFailureBundle({ sessionId: 's_3', promptText: 'x', error: 'e', cliLogPath: cliLog, home, now: 1_000_000 });
-    const b = writeFailureBundle({ sessionId: 's_3', promptText: 'x', error: 'e', cliLogPath: cliLog, home, now: 1_000_000 + COOLDOWN_MS - 1 });
-    const c = writeFailureBundle({ sessionId: 's_3', promptText: 'x', error: 'e', cliLogPath: cliLog, home, now: 1_000_000 + COOLDOWN_MS + 1 });
+    const { home, host } = fixture();
+    const a = await writeFailureBundle({ sessionId: 's_3', promptText: 'x', error: 'e', host, home, now: 1_000_000 });
+    const b = await writeFailureBundle({ sessionId: 's_3', promptText: 'x', error: 'e', host, home, now: 1_000_000 + COOLDOWN_MS - 1 });
+    const c = await writeFailureBundle({ sessionId: 's_3', promptText: 'x', error: 'e', host, home, now: 1_000_000 + COOLDOWN_MS + 1 });
     assert.ok(a); assert.equal(b, null); assert.ok(c);
   });
 
@@ -86,12 +94,12 @@ describe('接线（src/main/index.ts）', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
   test('发送失败时落一包，并把路径写进日志', () => {
-    assert.match(M, /const bundle = writeFailureBundle\(\{/);
+    assert.match(M, /const bundle = await writeFailureBundle\(\{/);
     assert.match(M, /失败现场已存档/);
   });
 
   test('存的是**这一轮实际发出去的**文本（含随行快照 + memory）', () => {
-    const at = M.indexOf('const bundle = writeFailureBundle({');
+    const at = M.indexOf('const bundle = await writeFailureBundle({');
     assert.match(M.slice(at, at + 600), /promptText: \(prompt \|\| \[\]\)\.map/);
   });
 });

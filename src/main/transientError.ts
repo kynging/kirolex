@@ -12,6 +12,28 @@
  * 单独一个文件（而不是留在 `index.ts` 里）：重试判据 `promptRetry` 要用它，而 `index.ts` 里有
  * electron —— 纯判据必须能在测试里直接 import。
  */
+/**
+ * **SSH 自己掉线的退出码是 255** —— 远程会话（`docs/DESIGN_remote_sessions.md`）里的执行器是
+ * `ssh -T … kiro-cli acp`，所以"连接断了"会以**进程退出**的形式出现，而不是一句错误文本。
+ *
+ * 这个区别很要紧：本地的判据是「`code 0` 是正常退出，其他都是崩溃」。照搬到远程会话上，
+ * 一次网络抖动（255）就会被当成"后端会话坏了"，于是去重建会话 —— 而重建对掉线毫无用处，
+ * 只会把那条对话在后端的历史白扔一次（这一点在 `EmptyResponse` 那次已经付过学费了）。
+ *
+ * 255 是 ssh 的专用出口：远端命令自己的退出码 ssh 会原样透传，只有 ssh 这一层出问题
+ * （连不上、认证失败、连接中断）才给 255。所以它可以放心地归到"传输层瞬时错误、可以自动重发"。
+ */
+export const SSH_TRANSPORT_EXIT = 255;
+
+export function isSshTransportExit(code: number | null | undefined): boolean {
+  return code === SSH_TRANSPORT_EXIT;
+}
+
+/** 远端执行器退出时给的话。文本里带 `connection closed`，让下面的判据认得出它可重试。 */
+export function sshDropMessage(code: number | null | undefined): string {
+  return `SSH connection closed（ssh exit ${code}）—— 远端执行器的连接断了，KiroLex 会按退避自动重发这一轮。`;
+}
+
 export function isTransientTransportError(text: string): boolean {
   const t = String(text || '');
   return /dispatch failure/i.test(t)

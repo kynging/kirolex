@@ -7,6 +7,15 @@ import {
   kiroCliLogPath, stripAnsi, readTailErrors, explainCliError,
   logsToTrim, trimHugeCliLogs, CLI_LOG_MAX_BYTES,
 } from '../src/main/kiroCliLog.ts';
+import { LocalHost } from '../src/main/hostOps.ts';
+
+/** 日志在 `<TMPDIR>/kiro-log/kiro-chat.log`；`HostOps` 负责"读哪台机器"。 */
+function logFixture(lines: string[]): { host: LocalHost; dir: string } {
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klog-'));
+  fs.mkdirSync(path.join(dir, 'kiro-log'), { recursive: true });
+  fs.writeFileSync(path.join(dir, 'kiro-log', 'kiro-chat.log'), lines.join('\n'));
+  return { host: new LocalHost({ TMPDIR: dir } as any), dir };
+}
 
 /*
  * 「还是不知道为什么会断」。
@@ -19,32 +28,31 @@ import {
 const REAL = '\x1b[2m2026-09-18T07:52:41.683695Z\x1b[0m \x1b[31mERROR\x1b[0m \x1b[2magent::agent\x1b[0m\x1b[2m:\x1b[0m \x1b[2m2937:\x1b[0m response stream encountered an error \x1b[3merr\x1b[0m\x1b[2m=\x1b[0mEmptyResponse loop_id=AgentLoopId { agent_id: 1 }';
 
 describe('捞 kiro-cli 自己的日志', () => {
-  test('路径跟着 TMPDIR —— kiro-cli 就写在那儿', () => {
-    const p = kiroCliLogPath({ TMPDIR: '/tmp/x' } as any);
-    assert.equal(p, path.join('/tmp/x', 'kiro-log', 'kiro-chat.log'));
+  test('路径跟着那台机器的 TMPDIR —— kiro-cli 就写在那儿', () => {
+    assert.equal(kiroCliLogPath('/tmp/x'), path.join('/tmp/x', 'kiro-log', 'kiro-chat.log'));
+    /* 远程会话里这个 tmpdir 是**远端**问回来的，所以它必须是参数，不能再读 process.env */
+    assert.equal(kiroCliLogPath('/tmp'), path.join('/tmp', 'kiro-log', 'kiro-chat.log'));
   });
 
   test('ANSI 必须脱掉，否则一行都匹配不上（实测日志是带色的）', () => {
     assert.match(stripAnsi(REAL), /^2026-09-18T07:52:41\.683695Z ERROR agent::agent: 2937: response stream/);
   });
 
-  test('只取时间窗内的 ERROR/WARN，行号被吃掉', () => {
-    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klog-'));
-    const f = path.join(dir, 'kiro-chat.log');
+  test('只取时间窗内的 ERROR/WARN，行号被吃掉', async () => {
     const now = Date.parse('2026-09-18T07:52:45.000Z');
-    fs.writeFileSync(f, [
+    const { host } = logFixture([
       '2026-09-18T01:00:00.000Z ERROR agent::agent: 1: 很久以前的错，不该出现',
       REAL,
       '2026-09-18T07:52:42.000000Z INFO agent::agent: 2: info 不要',
-    ].join('\n'));
-    const rows = readTailErrors(f, 30_000, now);
+    ]);
+    const rows = await readTailErrors(host, 30_000, now);
     assert.equal(rows.length, 1);
     assert.equal(rows[0].target, 'agent::agent');
     assert.match(rows[0].message, /^response stream encountered an error err=EmptyResponse/);
   });
 
-  test('文件不存在时返回空 —— 诊断永远不能让发送失败', () => {
-    assert.deepEqual(readTailErrors('/nope/kiro-chat.log', 30_000), []);
+  test('文件不存在时返回空 —— 诊断永远不能让发送失败', async () => {
+    assert.deepEqual(await readTailErrors(new LocalHost({ TMPDIR: '/nope' } as any), 30_000), []);
   });
 });
 
@@ -110,19 +118,24 @@ describe('kiro-cli 的日志超限就就地截断', () => {
   });
 
   test('**截断，不是删除** —— 删掉的话持着 fd 的进程会把空间攥到退出为止（这就是那 21.72GB）', () => {
-    const src = fs.readFileSync(path.join(process.cwd(), 'src/main/kiroCliLog.ts'), 'utf8');
-    assert.match(src, /fs\.truncateSync\(full, 0\);/);
-    assert.equal(/unlinkSync|rmSync/.test(src), false, '这里一个删除都不许有');
-    assert.match(src, /空间当场回收/);
+    /* 真正动手的那一层搬到了 hostOps（远端也要能截），判据本身没变 */
+    const host = fs.readFileSync(path.join(process.cwd(), 'src/main/hostOps.ts'), 'utf8');
+    assert.match(host, /fs\.truncateSync\(file, 0\);/, '本地：truncate');
+    assert.match(host, /truncate -s 0/, '远端：同样是截断');
+    const log = fs.readFileSync(path.join(process.cwd(), 'src/main/kiroCliLog.ts'), 'utf8');
+    for (const [name, src] of [['hostOps.ts', host], ['kiroCliLog.ts', log]] as const) {
+      assert.equal(/unlinkSync|rmSync|\brm -/.test(src), false, `${name} 里一个删除都不许有`);
+    }
+    assert.match(host, /空间攥到退出为止|空间一直攥着/);
   });
 
-  test('真的会把大文件截掉，并报出回收了多少', () => {
+  test('真的会把大文件截掉，并报出回收了多少', async () => {
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'klog2-'));
     fs.mkdirSync(path.join(dir, 'kiro-log'), { recursive: true });
     const big = path.join(dir, 'kiro-log', 'lsp.log');
     fs.writeFileSync(big, Buffer.alloc(3000));
     fs.writeFileSync(path.join(dir, 'kiro-log', 'mcp.log'), 'x');
-    const res = trimHugeCliLogs(1000, { TMPDIR: dir } as any);
+    const res = await trimHugeCliLogs(new LocalHost({ TMPDIR: dir } as any), 1000);
     assert.deepEqual(res.trimmed.map((f) => f.name), ['lsp.log']);
     assert.equal(res.freed, 3000);
     assert.equal(fs.statSync(big).size, 0);
@@ -131,7 +144,9 @@ describe('kiro-cli 的日志超限就就地截断', () => {
 
   test('启动时跑一次，在起执行器之前（那时没人持着新 fd）', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /const trim = trimHugeCliLogs\(\);/);
+    assert.match(M, /const trim = await trimHugeCliLogs\(host\);/);
+    /* 等它做完再往下 —— 不等的话"没人持着新 fd"这个前提就没了 */
+    assert.match(M, /await trimCliLogsNow\('启动'\);/);
     assert.match(M, /kiro-cli 日志超限已就地截断（\$\{why\}），回收/);
     assert.ok(
       M.indexOf("trimCliLogsNow('启动');") < M.indexOf("startupMark('attach: first loadSession'"),
@@ -149,7 +164,7 @@ describe('定时再扫一次；trace 开着必须看得见', () => {
   const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useFeatureFlags.ts'), 'utf8');
 
   test('每半小时再截一次 —— 只在启动时看一眼等于把上限交给"你多久重启一次"', () => {
-    assert.match(M, /setInterval\(\(\) => trimCliLogsNow\('定时'\), 30 \* 60 \* 1000\)\.unref\?\.\(\);/);
+    assert.match(M, /setInterval\(\(\) => \{ void trimCliLogsNow\('定时'\); \}, 30 \* 60 \* 1000\)\.unref\?\.\(\);/);
     assert.match(M, /trimCliLogsNow\('启动'\);/);
   });
 

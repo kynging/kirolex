@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
+import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -202,9 +203,16 @@ export class AcpClient extends EventEmitter {
           仍然 reject（那些在飞的请求确实等不到回答了），只是把话说准：谁看见这条消息，
           都该往"重连"想，而不是往"我的输入有问题"想。
         */
+        /*
+          远程执行器多一种形状：`ssh` 这一层断了会给 **255**（远端命令自己的退出码 ssh 原样透传）。
+          那是掉线，不是"这条对话在后端坏了" —— 说成后者会让恢复逻辑去重建会话，而重建对掉线
+          毫无用处，只会把后端那段历史白扔一次。判据在 `transientError.ts`。
+        */
         this.rejectAllPending(new Error(code === 0
           ? '执行器已退出（正常退出，code 0）—— KiroLex 会自动重连并重发这一轮。'
-          : `Process exited with code ${code}`));
+          : this.remote?.sshHost && isSshTransportExit(code)
+            ? sshDropMessage(code)
+            : `Process exited with code ${code}`));
       });
 
       this.process.on('error', (err) => {

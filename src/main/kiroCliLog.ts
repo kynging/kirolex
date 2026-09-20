@@ -17,16 +17,25 @@
  * **把 kiro-cli 那一行捞出来，贴到用户看得见的地方。**
  *
  * 为什么不改成让 kiro-cli 说清楚：那是它的包装层，不在 KiroLex 里；而这条日志是它**已经**写下的。
+ *
+ * ## 日志在哪台机器上
+ *
+ * 远程会话（`docs/DESIGN_remote_sessions.md`）里 kiro-cli 跑在另一台机器上，这份日志也就在那边。
+ * 所以"读哪台机器"交给 `HostOps`，判据和措辞一个字不变 —— 否则远程会话上界面又只剩一句
+ * `Internal error`，这个模块整个白做。
  */
 
-import fs from 'fs';
-import os from 'os';
 import path from 'path';
+import type { HostOps } from './hostOps.ts';
 
-/** kiro-cli 把 chat 日志写在 TMPDIR 下（实测 macOS：`$TMPDIR/kiro-log/kiro-chat.log`）。 */
-export function kiroCliLogPath(env: NodeJS.ProcessEnv = process.env): string {
-  const tmp = env.TMPDIR || os.tmpdir();
-  return path.join(tmp, 'kiro-log', 'kiro-chat.log');
+/** kiro-cli 把 chat 日志写在 TMPDIR 下（实测 macOS 和 AL2023 都是 `$TMPDIR/kiro-log/kiro-chat.log`）。 */
+export function kiroCliLogPath(tmpdir: string): string {
+  return path.join(tmpdir, 'kiro-log', 'kiro-chat.log');
+}
+
+/** 那台机器上这份日志的完整路径。 */
+export async function kiroCliLogPathOn(host: HostOps): Promise<string> {
+  return kiroCliLogPath(await host.tmpdir());
 }
 
 /** 日志带 ANSI 颜色（`ERROR` 是红的），不脱掉的话任何匹配都会漏。 */
@@ -43,25 +52,10 @@ export interface CliLogLine {
 }
 
 /** 只读文件**尾部**：这个文件实测 5MB 起，而我们要的是刚刚那几行。 */
-const TAIL_BYTES = 256 * 1024;
+export const TAIL_BYTES = 256 * 1024;
 
-export function readTailErrors(file: string, sinceMs: number, now = Date.now()): CliLogLine[] {
-  let buf = '';
-  try {
-    const fd = fs.openSync(file, 'r');
-    try {
-      const size = fs.fstatSync(fd).size;
-      const start = Math.max(0, size - TAIL_BYTES);
-      const len = size - start;
-      const b = Buffer.alloc(len);
-      fs.readSync(fd, b, 0, len, start);
-      buf = b.toString('utf8');
-    } finally {
-      fs.closeSync(fd);
-    }
-  } catch {
-    return [];   // 没有这个文件（换过平台/清理过）就当没有 —— 诊断永远不能让发送失败
-  }
+/** 纯解析：一段日志文本里时间窗内的 ERROR/WARN。读文件的事在 `HostOps` 那一层。 */
+export function parseTailErrors(buf: string, sinceMs: number, now = Date.now()): CliLogLine[] {
   const out: CliLogLine[] = [];
   for (const raw of buf.split('\n')) {
     const line = stripAnsi(raw);
@@ -72,6 +66,12 @@ export function readTailErrors(file: string, sinceMs: number, now = Date.now()):
     out.push({ ts, level: m[2], target: m[3].replace(/:$/, ''), message: m[4].trim() });
   }
   return out;
+}
+
+/** 读那台机器上的 kiro-cli 日志尾部并解析。读不到就是空 —— 诊断永远不能让发送失败。 */
+export async function readTailErrors(host: HostOps, sinceMs: number, now = Date.now()): Promise<CliLogLine[]> {
+  const text = await host.readTail(await kiroCliLogPathOn(host), TAIL_BYTES);
+  return parseTailErrors(text, sinceMs, now);
 }
 
 /**
@@ -111,9 +111,13 @@ export function explainCliError(lines: CliLogLine[]): string {
   return `kiro-cli 的日志里是：${t.slice(0, 160)}`;
 }
 
-/** 一步到位：这次失败前后 `windowMs` 内 kiro-cli 自己记了什么。 */
-export function cliErrorContext(windowMs = 30_000, now = Date.now(), env = process.env): string {
-  return explainCliError(readTailErrors(kiroCliLogPath(env), windowMs, now));
+/**
+ * 一步到位：这次失败前后 `windowMs` 内 kiro-cli 自己记了什么。
+ *
+ * `host` 决定读哪台机器 —— 远程会话必须读远端那份，否则这里永远是空字符串。
+ */
+export async function cliErrorContext(host: HostOps, windowMs = 30_000, now = Date.now()): Promise<string> {
+  return explainCliError(await readTailErrors(host, windowMs, now));
 }
 
 /**
@@ -145,31 +149,25 @@ export function logsToTrim(
     .map((f) => f.name);
 }
 
-/** 扫一遍 kiro-cli 的日志目录，超限的**就地截断**。返回清掉了多少字节。 */
-export function trimHugeCliLogs(maxBytes: number = CLI_LOG_MAX_BYTES, env: NodeJS.ProcessEnv = process.env): {
+/**
+ * 扫一遍 kiro-cli 的日志目录，超限的**就地截断**。返回清掉了多少字节。
+ *
+ * 远端也要管：那台机器上同样是 kiro-cli 在不轮转地写，同样会把盘塞满，而且更没人看着它。
+ */
+export async function trimHugeCliLogs(host: HostOps, maxBytes: number = CLI_LOG_MAX_BYTES): Promise<{
   trimmed: { name: string; bytes: number }[];
   freed: number;
-} {
+}> {
   const out: { name: string; bytes: number }[] = [];
   let freed = 0;
-  try {
-    const dir = path.dirname(kiroCliLogPath(env));
-    const entries = fs.readdirSync(dir).filter((n) => n.endsWith('.log'));
-    const sized = entries.map((name) => {
-      let bytes = 0;
-      try { bytes = fs.statSync(path.join(dir, name)).size; } catch {}
-      return { name, bytes };
-    });
-    for (const name of logsToTrim(sized, maxBytes)) {
-      const full = path.join(dir, name);
-      const before = sized.find((f) => f.name === name)?.bytes || 0;
-      try {
-        /* 就地截断 —— 删掉的话正在写它的进程会把空间一直攥着（见上面那段） */
-        fs.truncateSync(full, 0);
-        out.push({ name, bytes: before });
-        freed += before;
-      } catch {}
-    }
-  } catch {}
+  const dir = path.dirname(await kiroCliLogPathOn(host));
+  const sized = await host.listSizes(dir, '.log');
+  for (const name of logsToTrim(sized, maxBytes)) {
+    const before = sized.find((f) => f.name === name)?.bytes || 0;
+    /* 就地截断 —— 删掉的话正在写它的进程会把空间一直攥着（见上面那段） */
+    await host.truncate(path.join(dir, name));
+    out.push({ name, bytes: before });
+    freed += before;
+  }
   return { trimmed: out, freed };
 }

@@ -5,7 +5,7 @@ import os from 'os';
 import { execSync, execFile } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -21,8 +21,9 @@ import { shouldConsolidate, buildConsolidationPrompt, mergeSessionMemory, CONSOL
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry.ts';
-import { cliErrorContext, kiroCliLogPath, trimHugeCliLogs } from './kiroCliLog.ts';
+import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
+import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -379,7 +380,7 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
     try {
       await client.connect();
-      await withLoadTimeout(client.loadSession(cliSessionId, cwd));
+      await withLoadTimeout(client.loadSession(cliSessionId, cwd), loadTimeoutFor(profile.remote));
       const next: SessionEntry = {
         ...entry, client, profile, lastUsedAt: Date.now(),
         assistantBuf: '', assistantMsgId: null, fileChanges: [],
@@ -1348,7 +1349,19 @@ async function primeHistoryNow(
  * 而同一时刻常规 attach 的 `session/load` 用了 **32 秒**（07:59:37 → 08:00:09 `resume ok`）。
  * 也就是说 12s 根本不够 —— 于是新执行器超时、回滚旧执行器又超时，会话被留在"没连着"的状态，
  * 而界面上只看到一句没头没尾的超时。45s 仍然是有界的（卡死照样会被打断），但把正常的冷启动放进去了。
+ *
+ * 远程会话的上限是另一个数字（`loadTimeoutFor`）：SSH 握手 + 远端冷启动都要算进去，
+ * 拿本地这个 45s 去量远端，只会把"慢一点"判成"起不来"，然后去做完全没必要的重建。
  */
+/**
+ * **取证读哪台机器** —— 远程会话里 kiro-cli 的日志和会话都在远端（`docs/DESIGN_remote_sessions.md`）。
+ *
+ * `hostFor` 拿到 `undefined` 就是本地，所以本地路径的行为一个字节都没变；SSH 那一侧复用
+ * `buildSshArgs`/`shellQuote`，和 `connect()`、`loopVerify` 是同一个决策 —— 三处各写一遍
+ * 迟早会分叉，而分叉的那一处就是连不上又说不清为什么的那一处。
+ */
+const diagHost = (remote?: RemoteTarget): HostOps => hostFor(remote, { buildSshArgs, shellQuote });
+
 const LOAD_TIMEOUT_MS = 45000;
 function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session/load'): Promise<T> {
   const t0 = Date.now();
@@ -2736,16 +2749,17 @@ app.whenReady().then(async () => {
    *
    * 放在起执行器**之前**：这时候还没有人持着新 fd，截断最干净。
    */
-  const trimCliLogsNow = (why: string) => {
+  const trimCliLogsNow = async (why: string, host: HostOps = diagHost()) => {
     try {
-      const trim = trimHugeCliLogs();
+      const trim = await trimHugeCliLogs(host);
       if (trim.trimmed.length) {
         logger.warn('logs', `kiro-cli 日志超限已就地截断（${why}），回收 ${(trim.freed / 2 ** 30).toFixed(2)} GB：`
           + trim.trimmed.map((f) => `${f.name} ${(f.bytes / 2 ** 30).toFixed(2)}GB`).join('、'));
       }
     } catch {}
   };
-  trimCliLogsNow('启动');
+  /* 等它做完再往下：这一步的全部意义是"在还没人持着新 fd 的时候截断"，不等就没有这个性质了 */
+  await trimCliLogsNow('启动');
   /**
    * **每半小时再扫一次** ——「一次启动检查兜不住」。
    *
@@ -2753,7 +2767,7 @@ app.whenReady().then(async () => {
    * 只在启动时看一眼，等于把上限交给"你多久重启一次"。半小时一次：日志再怎么长也就多那半小时的量，
    * 而截断本身是一次 `truncate`（不读内容、不复制），代价可以忽略。
    */
-  setInterval(() => trimCliLogsNow('定时'), 30 * 60 * 1000).unref?.();
+  setInterval(() => { void trimCliLogsNow('定时'); }, 30 * 60 * 1000).unref?.();
   // Age out trashed chats (30 days). Deliberately after the migration and before
   // anything else touches the sessions tree.
   try { pruneSessionTrash(); } catch {}
@@ -3629,14 +3643,14 @@ app.whenReady().then(async () => {
        * 而同一秒 kiro-cli 的日志里写的是 `err=EmptyResponse` / `dispatch failure` /
        * `ValidationException` —— 五种完全不同的病，在界面上长得一模一样。判据在 `kiroCliLog`。
        */
-      const cliWhy = cliErrorContext();
+      const cliWhy = await cliErrorContext(diagHost(entry.profile.remote));
       if (cliWhy) logger.warn('prompt', `kiro-cli 那边的原因 sessionId=${sessionId}: ${cliWhy}`);
       /**
        * **把这一刻整包留下来** —— 见 `failureBundle`。查到最后卡在"同一时间同一模型，
        * kiro-cli 里好的、KiroLex 里不好"，而故障不能按需复现；下一次犯的时候要能对着差异看，
        * 而不是再猜一轮。同一条会话 1 分钟内只落一包、每条只留最近 5 包。
        */
-      const bundle = writeFailureBundle({
+      const bundle = await writeFailureBundle({
         sessionId,
         cliSessionId: entry.cliSessionId,
         promptText: (prompt || []).map((b: any) => (typeof b === 'string' ? b : b?.text || '')).join(''),
@@ -3645,7 +3659,8 @@ app.whenReady().then(async () => {
         pid: entry.client.pid,
         toolsThisTurn: entry.toolsThisTurn || 0,
         maxToolOutput: entry.maxToolOutputThisTurn || 0,
-        cliLogPath: kiroCliLogPath(),
+        /* 证据从**跑 kiro-cli 那台机器**上抄（远程会话就是远端那份，否则整包都是空的） */
+        host: diagHost(entry.profile.remote),
         /* trace 开着的时候日志涨得极快，多抄一些才盖得住这一次请求 */
         cliLogTailBytes: kiroTraceEnabled() ? 8 * 1024 * 1024 : undefined,
       });
@@ -4819,7 +4834,7 @@ app.whenReady().then(async () => {
       );
       try {
         await previous.connect();
-        await withLoadTimeout(previous.loadSession(cliSessionId, cwd));
+        await withLoadTimeout(previous.loadSession(cliSessionId, cwd), loadTimeoutFor(oldEntry.profile.remote));
         const restored: SessionEntry = {
           ...oldEntry, client: previous, lastUsedAt: Date.now(),
           assistantBuf: '', assistantMsgId: null, fileChanges: [],
@@ -4847,7 +4862,7 @@ app.whenReady().then(async () => {
     const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
     try {
       await client.connect();
-      await withLoadTimeout(client.loadSession(cliSessionId, cwd));
+      await withLoadTimeout(client.loadSession(cliSessionId, cwd), loadTimeoutFor(profile.remote));
       const nextEntry: SessionEntry = {
         client,
         cliSessionId,
