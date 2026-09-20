@@ -7553,13 +7553,32 @@ button, input, select, textarea {
   margin-bottom: 6px;
 }
 
-/* 「保存」是这一组里的主操作，要能一眼认出来（其余是测试/取消/删除）。 */
-.settings-btn.primary {
+/*
+  **远端机器那一块的按钮是文字按钮，不能复用 `.settings-btn`** —— 那个是 28×28 的图标按钮
+  （width/height 写死、font-size 16px）。实测拿它装「+ 添加一台远端机器」时，按钮被压成 28×28、
+  文字整个挤出去：「按钮和字体彻底乱了」就是这个。
+*/
+.remote-btn {
+  padding: 4px 10px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  color: var(--text-primary);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+}
+.remote-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  border-color: var(--accent);
+}
+.remote-btn:disabled { opacity: 0.5; cursor: default; }
+/* 主操作（安装依赖 / 保存）要能一眼认出来 */
+.remote-btn-primary {
   border-color: var(--accent, #7c6fe0);
   color: var(--accent, #7c6fe0);
 }
-.remote-row-actions .settings-btn,
-.remote-form .settings-btn { font-size: 11px; padding: 3px 8px; }
 .remote-form .settings-hint { margin: 0; }
 
 /* 安装脚本的实时输出。固定高度 + 自动滚到底：正在跑的那几行才是人想看的，

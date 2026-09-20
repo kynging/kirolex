@@ -205,7 +205,7 @@ describe('接线：渲染进程', () => {
 
   test('新建对话框里有目标选择，且**默认本地**', () => {
     assert.match(A, /remoteTargets\.enabled && remoteTargets\.targets\.length > 0/);
-    assert.match(A, /<option value="">本地（这台 Mac）<\/option>/);
+    assert.match(A, /<option value="">本地<\/option>/);
     assert.match(A, /useState\(''\);\s*\n\s*const remoteTargets = useRemoteTargets\(\);/);
   });
 
@@ -375,6 +375,23 @@ describe('一键装齐远端依赖', () => {
     assert.match(SH2, /--version <\/dev\/null/, '版本探测要隔断 stdin（双重保险）');
     assert.match(P, /remoteBootstrap:/);
     assert.match(P, /onRemoteBootstrapOutput:/);
+  });
+
+  test('按钮**不能**复用 `.settings-btn` —— 那是 28×28 的图标按钮，文字会被挤爆', () => {
+    /*
+      实测踩过：「+ 添加一台远端机器」被渲染成 28×28（`.settings-btn` 把 width/height 写死、
+      font-size 16px），字整个挤出去 ——「按钮和字体彻底乱了」。文字按钮得有自己的类。
+    */
+    const RS0 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.equal(/className="settings-btn/.test(RS0), false, '这一块里不许再用图标按钮的类');
+    assert.match(RS0, /className="remote-btn/);
+    const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+    const at = CSS.indexOf('.remote-btn {');
+    assert.ok(at > 0, '.remote-btn 要有样式');
+    const block = CSS.slice(at, CSS.indexOf('}', at));
+    /* 注意别把 `line-height` 当成 `height` —— 判据要贴着属性名的开头 */
+    assert.equal(/(^|[\s;{])(width|height)\s*:/.test(block), false, '文字按钮不能写死尺寸');
+    assert.match(block, /padding:/);
   });
 
   test('接线：按钮在设置里，且只有你按才会跑（没有自动触发）', () => {

@@ -103,6 +103,9 @@ export const RemoteSettings: React.FC = () => {
       <p className="settings-hint" style={{ marginTop: 0 }}>
         在这里配好之后，<b>新建对话</b>时可以选让这条会话的 kiro-cli 跑在那台机器上。
         文件始终存在本地 —— 每一轮前后自动同步镜像。远端不做构建/测试/预览。
+        <br />每台机器右边有两个按钮：<b>安装依赖</b>（在那台机器上装 kiro-cli / claude code /
+        codex / node / rsync / git，以及 kiro-cli 默认 agent 的 web search MCP）和
+        <b>测试连接</b>（查工具、登录、连通）。
       </p>
       {!enabled && (
         <p className="settings-hint" style={{ color: 'var(--error)' }}>
@@ -120,15 +123,15 @@ export const RemoteSettings: React.FC = () => {
             {r.remoteWorkdir && <span className="remote-row-dir">{r.remoteWorkdir}</span>}
           </div>
           <div className="remote-row-actions">
-            <button className="settings-btn" disabled={busy || !!installing} onClick={() => void test(r as Draft)}>测试连接</button>
+            <button className="remote-btn" disabled={busy || !!installing} onClick={() => void test(r as Draft)}>测试连接</button>
             <button
-              className="settings-btn"
+              className="remote-btn remote-btn-primary"
               disabled={busy || !!installing}
-              title="在这台机器上装 kiro-cli / claude code / codex / node / rsync / git（幂等，已装的跳过）"
+              title="在这台机器上装 kiro-cli / claude code / codex / node / rsync / git + web search MCP（幂等，已装的跳过）"
               onClick={() => void bootstrap(r as Draft)}
             >{installing === r.sshHost ? '安装中…' : '安装依赖'}</button>
-            <button className="settings-btn" disabled={busy} onClick={() => { setResult(null); setDraft({ ...EMPTY, ...r }); }}>编辑</button>
-            <button className="settings-btn" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
+            <button className="remote-btn" disabled={busy} onClick={() => { setResult(null); setDraft({ ...EMPTY, ...r }); }}>编辑</button>
+            <button className="remote-btn" disabled={busy} onClick={() => void remove(r.id)}>删除</button>
           </div>
         </div>
       ))}
@@ -167,19 +170,19 @@ export const RemoteSettings: React.FC = () => {
             onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
           />
           <div className="remote-row-actions">
-            <button className="settings-btn" disabled={busy || !!installing || !draft.sshHost.trim()} onClick={() => void test(draft)}>测试连接</button>
+            <button className="remote-btn" disabled={busy || !!installing || !draft.sshHost.trim()} onClick={() => void test(draft)}>测试连接</button>
             <button
-              className="settings-btn"
+              className="remote-btn"
               disabled={busy || !!installing || !draft.sshHost.trim()}
               title="先保存再装也行；这里直接装是为了新机器一次配好"
               onClick={() => void bootstrap(draft)}
             >{installing ? '安装中…' : '安装依赖'}</button>
-            <button className="settings-btn primary" disabled={busy || !draft.sshHost.trim()} onClick={() => void save()}>保存</button>
-            <button className="settings-btn" disabled={busy} onClick={() => { setDraft(null); setResult(null); }}>取消</button>
+            <button className="remote-btn remote-btn-primary" disabled={busy || !draft.sshHost.trim()} onClick={() => void save()}>保存</button>
+            <button className="remote-btn" disabled={busy} onClick={() => { setDraft(null); setResult(null); }}>取消</button>
           </div>
         </div>
       ) : (
-        <button className="settings-btn" disabled={busy} onClick={() => { setResult(null); setDraft({ ...EMPTY }); }}>
+        <button className="remote-btn" disabled={busy} onClick={() => { setResult(null); setDraft({ ...EMPTY }); }}>
           + 添加一台远端机器
         </button>
       )}

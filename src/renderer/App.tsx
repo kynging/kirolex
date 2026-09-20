@@ -3496,7 +3496,7 @@ const App: React.FC = () => {
                   onChange={(e) => setNewChatRemoteId(e.target.value)}
                   style={{ marginBottom: 6 }}
                 >
-                  <option value="">本地（这台 Mac）</option>
+                  <option value="">本地</option>
                   {remoteTargets.targets.map((t) => (
                     <option key={t.id} value={t.id}>{`🌐 ${t.label}`}</option>
                   ))}
