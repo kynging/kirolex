@@ -1,6 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { mirrorDirFor } from './remoteMirror.ts';
 
 /**
  * A session's execution profile. An executor process is bound to (model, host);
@@ -188,12 +189,18 @@ export function defaultRemoteWorkdir(sshHost: string): string {
 
 /**
  * The working directory kiro-cli's session should use for this profile:
- *  - remote profile → the target's remoteWorkdir (or a derived default),
+ *  - remote profile → **this local directory's mirror** under the target's remoteWorkdir,
  *  - local profile  → the provided local default (a per-session scratch dir).
+ *
+ * 远程那一路**不是** `remoteWorkdir` 本身，而是 `remoteWorkdir/<本地目录的镜像>`
+ * （`docs/DESIGN_remote_sessions.md`）：远端执行器只能看见远端的文件系统（实测 kiro-cli 不用
+ * ACP 的客户端 fs 能力，声明了也 0 回调），所以文件靠 rsync 镜像过去，而 agent 的 cwd 必须正是
+ * 那份镜像。直接用 remoteWorkdir 会让所有项目挤在同一个目录里互相覆盖。
  */
 export function sessionCwd(profile: AgentProfile, localDefault: string): string {
   if (profile.remote?.sshHost) {
-    return profile.remote.remoteWorkdir || defaultRemoteWorkdir(profile.remote.sshHost);
+    const wd = profile.remote.remoteWorkdir || defaultRemoteWorkdir(profile.remote.sshHost);
+    return mirrorDirFor(wd, localDefault);
   }
   return localDefault;
 }

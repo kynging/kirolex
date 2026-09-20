@@ -5,7 +5,7 @@ import os from 'os';
 import { execSync, execFile } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd, type RemoteTarget } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, loadActiveRemoteTarget, sessionCwd, defaultRemoteWorkdir, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -24,6 +24,9 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
+import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin } from './remoteMirror.ts';
+import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
+import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -71,6 +74,12 @@ interface SessionEntry {
   profile: AgentProfile;
   /** Working directory used when creating/loading replacement executors. */
   cwd: string;
+  /**
+   * **本地那个目录** —— 远程会话里 `cwd` 是远端镜像的路径，而镜像、冲突判定、同项目并发都要
+   * 按本地目录算（`docs/DESIGN_remote_sessions.md`：本地是唯一真相）。本地会话里它和 `cwd` 相同，
+   * 所以不设也不会错 —— 但设上之后就不用在每个用点再判一次"这是远程吗"。
+   */
+  localDir?: string;
   /** accumulates the in-flight assistant response; flushed to the durable
    *  store only when the turn completes (asymmetric durability, §7). */
   assistantBuf: string;
@@ -737,12 +746,16 @@ function historyLine(m: {
   content: string;
   attachments?: { name: string; path: string }[];
   toolCalls?: { title?: string; kind?: string; status?: string; locations?: string[] }[];
-}): string {
+}, forExecutor: (p: string) => string = (p) => p): string {
   const who = m.role === 'user' ? 'User' : 'Assistant';
   // Every historical attachment is re-emitted here on EVERY turn, so an oversized
   // image referenced once keeps failing every later request in the chat. Resolve
   // each one to a copy within the backend's dimension limit -- see safeImageRef.
-  const refs = (m.attachments || []).filter((a) => a?.path).map((a) => `file:${safeImageRef(a.path)}`);
+  //
+  // `forExecutor` 把路径换成**执行器那一侧看得见的**路径：远程会话里 kiro-cli 在另一台机器上，
+  // 发一个本地绝对路径过去，它只会读不到 —— 而读不到附件的表现是"模型装作没看见图"，
+  // 完全不像一个路径问题。映射规则见 `executorPathMapper`。
+  const refs = (m.attachments || []).filter((a) => a?.path).map((a) => `file:${forExecutor(safeImageRef(a.path))}`);
   const tail = refs.length
     ? `\n[本条消息附带的文件/图片，需要时可直接读取]\n${refs.join('\n')}`
     : '';
@@ -918,7 +931,7 @@ function renderHistoryFile(sessionId: string): { path: string; count: number } |
   try {
     const stored = store.readTranscript(sessionId)
       .filter(modelFacing);
-    const lines = stored.map((m) => historyLine(m));
+    const lines = stored.map((m) => historyLine(m, executorPathMapper(sessionId)));
     if (!lines.join('').trim()) return null;
     const path = store.writeHistoryFile(
       sessionId,
@@ -999,7 +1012,7 @@ function buildHistoryRideAlong(sessionId: string): string {
     }
     const stored = store.readTranscript(sessionId)
       .filter(modelFacing);
-    const lines = stored.map((m) => historyLine(m));
+    const lines = stored.map((m) => historyLine(m, executorPathMapper(sessionId)));
     if (!lines.join('').trim()) return '';
     return `${buildSnapshot(sessionId, stored, lines, { rideAlong: true })}${RIDE_ALONG_HANDOFF}`;
   } catch (err: any) {
@@ -1162,7 +1175,7 @@ async function primeHistoryNow(
   try {
     stored = store.readTranscript(sessionId)
       .filter(modelFacing);
-    lines = stored.map((m) => historyLine(m));
+    lines = stored.map((m) => historyLine(m, executorPathMapper(sessionId)));
   } catch (err: any) {
     logger.info('prime', `read transcript FAILED sessionId=${sessionId} err=${err?.message}`);
     return { ok: false, error: 'read transcript failed' };
@@ -1361,6 +1374,109 @@ async function primeHistoryNow(
  * 迟早会分叉，而分叉的那一处就是连不上又说不清为什么的那一处。
  */
 const diagHost = (remote?: RemoteTarget): HostOps => hostFor(remote, { buildSshArgs, shellQuote });
+
+/**
+ * **远程会话的同步编排** —— 规则和理由都在 `remoteSync` / `docs/DESIGN_remote_sessions.md`。
+ *
+ * 本地会话从不注册进来，所以这里加的每一行对本地路径都是死代码 —— 这是故意的：
+ * 「远程要能和本地共存」，共存的前提是本地那条路一个字节都没变。
+ */
+const remoteSync = new RemoteSyncManager({
+  note: (sessionId, text) => { noteInSession(sessionId, text); },
+  log: (level, message) => logger[level]('remote', message),
+});
+
+/**
+ * 给这条远程会话建好两份镜像并登记：项目目录（agent 的 cwd）和会话目录
+ * （`history.md`、附件 —— 它在项目目录之外，不单独推的话远端的 `file:` 引用会指向不存在的路径）。
+ */
+function registerRemoteSync(sessionId: string, profile: AgentProfile, localProjectDir: string): void {
+  const remote = profile.remote;
+  if (!remote?.sshHost) return;
+  const sshCommand = sshCommandFor(remote, buildSshArgs);
+  const workdir = remote.remoteWorkdir || defaultRemoteWorkdir(remote.sshHost);
+  remoteSync.register({
+    sessionId,
+    hostLabel: remote.sshHost,
+    project: new RemoteMirror({
+      remote, sshCommand,
+      localDir: localProjectDir,
+      remoteDir: mirrorDirFor(workdir, localProjectDir),
+    }),
+    session: new RemoteMirror({
+      remote, sshCommand,
+      localDir: getSessionDir(sessionId),
+      remoteDir: sessionMirrorDir(workdir, sessionId),
+    }),
+  });
+}
+
+/**
+ * **本地路径 → 执行器看得见的路径**（远程会话专用；本地会话返回原样）。
+ *
+ * 三种情况，第三种是最容易漏的：
+ *   1. 在会话目录里（粘贴的图片、`history.md`）→ 会话目录的镜像
+ *   2. 在项目目录里 → 项目镜像
+ *   3. **都不在**（你从别处挑的文件）→ 先拷进会话目录，这样它跟着会话镜像一起过去。
+ *      不拷的话发出去的是一个远端不存在的路径，而表现是"模型装作没看见附件"。
+ */
+function executorPathMapper(sessionId: string): (p: string) => string {
+  const entry = sessionClients.get(sessionId);
+  const remote = entry?.profile.remote;
+  if (!remote?.sshHost) return (p) => p;
+  const workdir = remote.remoteWorkdir || defaultRemoteWorkdir(remote.sshHost);
+  const sessionDir = getSessionDir(sessionId);
+  const sessionMirror = sessionMirrorDir(workdir, sessionId);
+  const localProject = entry ? localProjectDirOf(sessionId, entry) : sessionDir;
+  const projectMirror = mirrorDirFor(workdir, localProject);
+  return (p: string): string => {
+    if (!p || !path.isAbsolute(p)) return p;
+    const inSession = mapIntoMirror(sessionDir, sessionMirror, p);
+    if (inSession !== p) return inSession;
+    const inProject = mapIntoMirror(localProject, projectMirror, p);
+    if (inProject !== p) return inProject;
+    /* 第三种：拷进会话目录（幂等 —— 同名同大小就不重复拷） */
+    try {
+      const dir = path.join(sessionDir, 'remote-attachments');
+      fs.mkdirSync(dir, { recursive: true });
+      const dest = path.join(dir, path.basename(p));
+      const src = fs.statSync(p);
+      let need = true;
+      try { need = fs.statSync(dest).size !== src.size; } catch {}
+      if (need) fs.copyFileSync(p, dest);
+      return posixJoin(sessionMirror, 'remote-attachments', path.basename(p));
+    } catch {
+      /* 拷不过去就原样返回：远端读不到，但至少不会静静地指向一个错的地方 */
+      return p;
+    }
+  };
+}
+
+/** 这条会话在**本地**的工作目录（远程会话的 `cwd` 是远端镜像路径，不能拿来当本地目录用）。 */
+function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
+  if (entry.localDir) return entry.localDir;
+  return entry.profile.remote?.sshHost ? getSessionDir(sessionId) : entry.cwd;
+}
+
+/**
+ * 起远程执行器之前问清三件事（工具、登录、连通）。
+ *
+ * 不问的代价不是"少一条提示"：没装 rsync → 推送失败 → 界面上是"这一轮没发出去"；
+ * 远端没登录 → 执行器起得来但每一轮都空回 —— 看起来就是那个查了一整天的 `EmptyResponse`。
+ */
+async function remotePreflight(remote: RemoteTarget): Promise<void> {
+  const args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
+  const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+    execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
+      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+      stdout: String(stdout || ''),
+      stderr: String(stderr || ''),
+    }));
+  });
+  const verdict = judgePreflight(out.code, out.stdout, out.stderr, remote);
+  logger.info('remote', `preflight ${remote.sshHost}: ${verdict.code} — ${verdict.message}`);
+  if (verdict.code !== 'ok') throw new Error(verdict.message);
+}
 
 const LOAD_TIMEOUT_MS = 45000;
 function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session/load'): Promise<T> {
@@ -1876,6 +1992,14 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   smartTitle: true,
   /** 会话记忆自动维护：一轮结束、攒够新消息就压一次（`sessionMemory.ts`） */
   sessionMemory: true,
+  /**
+   * **远程会话**：把这条会话的 kiro-cli 跑在另一台机器上，文件仍以本地为准（rsync 镜像）。
+   * 见 `docs/DESIGN_remote_sessions.md`。
+   *
+   * 默认**关**：它改的是"发送前先推、失败就不发"这条主路，而这个开关关着的时候
+   * 一条远程会话都建不起来，主路上那几句就是死代码 —— 这样它能跟着 PR 一起进去而不改变任何现有行为。
+   */
+  remoteSessions: false,
   /** Store a large paste on disk and show a placeholder in the composer. */
   pasteFolding: true,
   /** Draggable dividers between split panes. */
@@ -2032,6 +2156,13 @@ function wireSession(sessionId: string, entry: SessionEntry) {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
         /* 只数新开的调用（不数 update）—— 这是"这一轮动过东西没有"的依据，见 `toolsThisTurn`。 */
         if (u?.sessionUpdate === 'tool_call') entry.toolsThisTurn = (entry.toolsThisTurn || 0) + 1;
+        /*
+          远程会话：这一步可能在远端写了文件 —— 防抖拉一次（不等它）。这是让 gate / file review
+          在一轮**进行中**就看得到改动的那一半；只在一轮结束时拉的话，界面会一直显示上一版。
+        */
+        if (remoteSync.isRemote(sessionId) && toolMayHaveWritten(u?.title || u?.kind, u?.rawInput)) {
+          remoteSync.pullSoon(sessionId);
+        }
         const previous = entry.fileChanges.find((change) => change.toolCallId === toolCallId);
         const locations: string[] = Array.from(new Set<string>(
           (Array.isArray(u?.locations) ? u.locations : [])
@@ -2247,6 +2378,8 @@ function detachExecutor(sessionId: string) {
   try { entry.client.disconnect(); } catch { /* process may already be gone */ }
   const rec = store.readRecord(sessionId);
   if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
+  /* 执行器没了，这条会话的镜像也不该再被同步（它的 remote/localDir 都跟着执行器走） */
+  remoteSync.forget(sessionId);
   mainWindow?.webContents.send('acp:disconnected', { sessionId });
 }
 
@@ -2959,7 +3092,8 @@ app.whenReady().then(async () => {
     const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
     // A remote-enabled active agent (see ~/.kirolex/config.json) makes this
     // session's executor spawn kiro-cli over SSH; otherwise it stays local.
-    const remote = loadActiveRemoteTarget(KIROLEX_CONFIG_PATH);
+    /* feature flag 关着的时候一条远程会话都建不起来 —— 主路上那几句同步代码就是死代码 */
+    const remote = isFeatureEnabled('remoteSessions') ? loadActiveRemoteTarget(KIROLEX_CONFIG_PATH) : undefined;
     const profile: AgentProfile = {
       model: model || DEFAULT_MODEL,
       // Set at creation, NOT left undefined. An absent preference used to be
@@ -2977,12 +3111,16 @@ app.whenReady().then(async () => {
     const cliCwd = sessionCwd(profile, sessionDir);
     // Model fallback: use the first candidate that actually starts, and persist
     // the effective model so the session isn't stuck pointing at a dead one.
+    /* 远程会话：起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
+    if (profile.remote?.sshHost) await remotePreflight(profile.remote);
     const started = await connectWithModelFallback(profile, 'new-session');
     const client = started.client;
     profile.model = started.model;
     const { sessionId: cliSessionId } = await client.newSession(cliCwd);
-    const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now() };
+    const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, localDir: resolvedCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now() };
     sessionClients.set(kiroLexId, entry);
+    /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
+    registerRemoteSync(kiroLexId, profile, resolvedCwd);
     wireSession(kiroLexId, entry);
     // Durable record (design §4), keyed by the KiroLex id; store the cli mapping.
     const rec = store.createSession(kiroLexId, profile);
@@ -3436,6 +3574,28 @@ app.whenReady().then(async () => {
             // record of how big the real request was.
             chars: prompt.reduce((sum: number, block: any) => sum + (typeof block?.text === 'string' ? block.text.length : 0), 0),
           });
+          /*
+            **远程会话：把本地推上去，推不动就不发这一轮**（`docs/DESIGN_remote_sessions.md`）。
+
+            顺序是先挡并发、再推：同一个项目上另一条会话正在跑一轮时，两边都在写同一份真相
+            （本地那条直接写，远程那条靠 pull 写），而挡在推后面等于已经把镜像改了。
+            本地会话在 `remoteSync` 里没有登记，这两句是死代码 —— 共存的前提是本地一个字节不变。
+          */
+          if (remoteSync.isRemote(sessionId)) {
+            const peer = busyPeer(
+              Array.from(sessionClients.entries()).map(([sid, e]) => ({
+                sessionId: sid, localDir: localProjectDirOf(sid, e), busy: !!e.busy,
+              })),
+              { sessionId, localDir: localProjectDirOf(sessionId, entry) },
+            );
+            if (peer) {
+              throw new Error(
+                `这一轮没有发送：同一个项目上还有一条会话（${peer}）正在跑。两条会话同时改同一份文件会互相覆盖，`
+                + `所以先不发。等那一轮结束后再发一次即可（你的消息还在）。`,
+              );
+            }
+            await remoteSync.beforeTurn(sessionId);
+          }
           try {
             const result = await entry.client.sendPrompt(entry.cliSessionId, prompt);
             // Our OWN cancel ended this turn. kiro-cli does not always label it
@@ -3445,6 +3605,12 @@ app.whenReady().then(async () => {
             /* 这一轮成了 —— 那条后端对话是好的，两个连续失败计数都清零 */
             if (entry.cliSessionId) cliFailStreak.delete(entry.cliSessionId);
             bareFailStreak.delete(sessionId);
+            /*
+              远程会话：把远端这一轮改的文件取回来。**在 review / diff 能被打开之前**，
+              因为本地是唯一真相，而 review 读的就是本地文件。拉失败不抛（这一轮已经成了），
+              但会留一个"远端有未取回的改动"并在会话里说一句 —— 绝不让人以为本地是新的。
+            */
+            await remoteSync.afterTurn(sessionId);
             const producedOutput = !!(entry.assistantBuf || entry.fileChanges.length);
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             // The request was accepted and answered, so the snapshot it carried IS
@@ -5115,7 +5281,21 @@ app.whenReady().then(async () => {
     return { path: target, parent: path.dirname(target), entries };
   });
 
-  ipcMain.handle('workspace:read', (_event, sessionId: string | null | undefined, filePath: string) => {
+  ipcMain.handle('workspace:read', async (_event, sessionId: string | null | undefined, filePath: string) => {
+    /*
+      **远程会话：读之前先把远端的改动拉回来**（`docs/DESIGN_remote_sessions.md` 第 4 个同步点）。
+
+      review / diff / gate 读的都是这条路，而它们读的是**本地**文件（本地是唯一真相）。
+      拉不回来就拒绝读：拿上一版做 review 比不做更糟 —— 你会对着旧内容提建议，而那些建议
+      再被送回模型，就变成一串谁都对不上的修改。
+    */
+    if (sessionId && remoteSync.isRemote(sessionId)) {
+      const fresh = await remoteSync.pullNow(sessionId);
+      if (!fresh) {
+        throw new Error('远端的改动没能取回来，本地这份可能不是最新的 —— 先不显示，避免你对着旧内容做 review。'
+          + '连接恢复后再打开一次即可。');
+      }
+    }
     // No session required: see workspaceBase. The session, when present, only
     // decides what a relative path is relative to.
     filePath = resolveUserPath(filePath, sessionId);
@@ -5493,6 +5673,8 @@ app.whenReady().then(async () => {
       // For a remote session the executor's working directory is a REMOTE path,
       // not the local `cwd` the renderer passed in.
       const cliCwd = sessionCwd(profile, resolvedCwd);
+      /* 远程会话：起执行器之前先问清工具/登录/连通（见 `remotePreflight`） */
+      if (profile.remote?.sshHost) await remotePreflight(profile.remote);
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`);
       const client = started.client;
       profile.model = started.model;
@@ -5563,7 +5745,7 @@ app.whenReady().then(async () => {
       if (freshBackend) {
         logger.info('prime', `context owed sessionId=${sessionId} mode=${verbatimOwed ? 'full (rebuild on first use)' : 'snapshot (rides along with the next message)'}`);
       }
-      entry = { client, cliSessionId, profile, cwd: cliCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now(), needsHistoryPrime: verbatimOwed };
+      entry = { client, cliSessionId, profile, cwd: cliCwd, localDir: resolvedCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now(), needsHistoryPrime: verbatimOwed };
       freshBackendResult = verbatimOwed;
       // A delete may have landed during the async connect/resume above. If so,
       // tear the fresh client down and do NOT recreate the record on disk.
@@ -5572,6 +5754,8 @@ app.whenReady().then(async () => {
         throw new Error('Session was deleted during attach; aborted.');
       }
       sessionClients.set(sessionId, entry);
+      /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
+      registerRemoteSync(sessionId, profile, resolvedCwd);
       wireSession(sessionId, entry);
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.cliSessionId = cliSessionId;
