@@ -7,8 +7,11 @@
 #   · 系统包       rsync git unzip tar（rsync 是镜像同步的命脉，没有它这功能整个不成立）
 #   · Node（fnm）  claude-code / codex 都是 npm 包，没有 node 就装不上
 #   · kiro-cli     从 desktop-release 取对应架构的 zip，跑它自带的 install.sh
-#   · claude-code  @anthropic-ai/claude-code（顺带 @zed-industries/claude-code-acp，ACP 后端要它）
-#   · codex        @openai/codex
+#   · claude-code  官方安装脚本 https://claude.ai/install.sh（顺带 @zed-industries/claude-code-acp，
+#                  ACP 后端要它；官方脚本装的是原生二进制，不依赖 node）
+#   · codex        @openai/codex（官方发布在 npm）
+#   · uv + mcp-proxy-for-aws + 把 kiro-cli 默认 agent 的 web search MCP 装进 claude code
+#     （端点由 KiroLex 从本机实际在跑的那份配置里读出来，用 WEBSEARCH_MCP_URL 传进来 —— 不写死）
 #
 # KiroLex 的设置界面上有一个按钮直接跑它（「安装依赖」），也可以自己来：
 #   scp scripts/remote-bootstrap.sh <host>:~/ && ssh <host> 'bash ~/remote-bootstrap.sh'
@@ -129,10 +132,70 @@ npm_i() {
   say "→ npm i -g $pkg"
   npm install -g "$pkg" >/dev/null 2>&1 || { note_fail "$pkg 装不上"; return 1; }
 }
-npm_i '@anthropic-ai/claude-code' claude
+# claude code 用**官方安装脚本**（原生二进制，不依赖 node）；装不上再退回 npm。
+# 实测这台机器上 https://claude.ai/install.sh 取到的就是官方 bash 安装器。
+if have claude && [ "$FORCE" != "1" ]; then
+  say "→ claude 已在 ($(claude --version </dev/null 2>/dev/null | head -1))"
+else
+  say "→ 官方安装脚本 https://claude.ai/install.sh"
+  if curl -fsSL https://claude.ai/install.sh 2>/dev/null | bash >/dev/null 2>&1; then
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+  have claude || npm_i '@anthropic-ai/claude-code' claude
+fi
 npm_i '@openai/codex' codex
 # ACP 适配层：KiroLex 走 ACP，claude code 要靠它才能当执行器
 npm_i '@zed-industries/claude-code-acp' claude-code-acp
+
+# ------------------------------------------- web search MCP（给 claude code）
+#
+# kiro-cli 的内置 agent 挂着一个 `agentcore-websearch`（mcp-proxy-for-aws 代理一个 SigV4 的
+# AgentCore 网关）。这一段把**同一套配置**装进这台机器的 claude code 里。
+#
+# 端点不写死在脚本里：它是这个账号自己的网关地址，写进仓库既是泄漏、换账号之后又会悄悄失效。
+# 由 KiroLex 从本机实际在跑的那份配置里读出来，用 WEBSEARCH_MCP_URL 传进来；没传就跳过。
+#
+# **不抄 `--profile default`**：本机是那么配的，而这台机器走的是实例角色 —— 照抄过去只会让它
+# 一启动就找不到 profile。
+step "web search MCP（装进 claude code）"
+WEBSEARCH_MCP_URL="${WEBSEARCH_MCP_URL:-}"
+WEBSEARCH_MCP_SERVICE="${WEBSEARCH_MCP_SERVICE:-bedrock-agentcore}"
+WEBSEARCH_MCP_REGION="${WEBSEARCH_MCP_REGION:-us-east-1}"
+WEBSEARCH_MCP_NAME="${WEBSEARCH_MCP_NAME:-agentcore-websearch}"
+
+if [ -z "$WEBSEARCH_MCP_URL" ]; then
+  say "→ 跳过：没拿到端点（KiroLex 从本机 kiro-cli 的实际调用里读它；本机那条 MCP 没在跑时读不到）"
+elif ! have claude; then
+  say "→ 跳过：这台机器上没有 claude"
+else
+  # uv 用**官方安装脚本**；mcp-proxy-for-aws 是个 python 工具，uv tool 装完就在 ~/.local/bin 里
+  if ! have uv; then
+    say "→ 官方安装脚本 https://astral.sh/uv/install.sh"
+    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh >/dev/null 2>&1
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+  if have uv && { ! have mcp-proxy-for-aws || [ "$FORCE" = "1" ]; }; then
+    say "→ uv tool install mcp-proxy-for-aws"
+    uv tool install --force mcp-proxy-for-aws >/dev/null 2>&1 || note_fail "mcp-proxy-for-aws 装不上"
+    export PATH="$HOME/.local/bin:$PATH"
+  fi
+  if have mcp-proxy-for-aws; then
+    # 幂等：已经登记过就先删再加（改了端点也能生效）
+    if claude mcp list </dev/null 2>/dev/null | grep -q "$WEBSEARCH_MCP_NAME"; then
+      claude mcp remove --scope user "$WEBSEARCH_MCP_NAME" </dev/null >/dev/null 2>&1 || true
+    fi
+    say "→ claude mcp add $WEBSEARCH_MCP_NAME"
+    if claude mcp add --scope user "$WEBSEARCH_MCP_NAME" -- \
+        mcp-proxy-for-aws "$WEBSEARCH_MCP_URL" \
+        --service "$WEBSEARCH_MCP_SERVICE" --region "$WEBSEARCH_MCP_REGION" </dev/null >/dev/null 2>&1; then
+      say "  已登记（走这台机器自己的 AWS 凭证签名：实例角色或 ~/.aws）"
+    else
+      note_fail "claude mcp add 失败"
+    fi
+  else
+    note_fail "没有 mcp-proxy-for-aws，装不了 web search MCP"
+  fi
+fi
 
 # ---------------------------------------------------------------- 自检
 step "自检"
@@ -147,6 +210,14 @@ for b in kiro-cli rsync git unzip node npm claude codex claude-code-acp; do
     esac
   fi
 done
+
+if have claude; then
+  if claude mcp list </dev/null 2>/dev/null | grep -q "${WEBSEARCH_MCP_NAME:-agentcore-websearch}"; then
+    say "web search MCP : 已登记到 claude code"
+  else
+    say "web search MCP : 没有（端点没传进来，或者 claude 不在）"
+  fi
+fi
 
 if have kiro-cli; then
   if kiro-cli whoami </dev/null >/dev/null 2>&1; then

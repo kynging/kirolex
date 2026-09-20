@@ -232,6 +232,15 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
         </div>
 
         <div className="settings-body">
+          {/*
+            **远端机器放在最上面** ——「我还是没有找到配置远程服务器的地方」。
+
+            上一版把它放在第二栏、字体和语言之间（实测量出来在 470px 处，要往下看才看得见）——
+            技术上"有"，实际上找不到。这是整个设置里唯一一个**会连到另一台机器**的东西，
+            而且是当前正在做的功能，所以它排在字体前面：找不到的入口等于没有入口。
+          */}
+          <RemoteSettings />
+
           <div className="settings-item settings-item-wide">
             <label className="settings-label">{t(t('Preview'))}</label>
             <p
@@ -486,12 +495,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           </div>
 
           <div className="settings-col">
-            {/*
-              远端机器的配置入口 ——「界面上甚至没有配置远程EC2的地方」。
-              放在功能开关**上面**：先有机器，才有得选；而 remoteSessions 那个开关就在下面一格，
-              两者挨着，关着的时候这一块会直接说清"配了也不会出现在新建对话里"。
-            */}
-            <RemoteSettings />
             <div className="settings-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
               <label className="settings-label">{t('Feature switches (take effect immediately, no restart)')}</label>
               {SWITCH_GROUPS.map((group) => {

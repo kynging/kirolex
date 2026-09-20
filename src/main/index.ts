@@ -27,6 +27,7 @@ import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
+import { pickWebSearch } from './webSearchMcp.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, deriveLabel as deriveRemoteLabel, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
@@ -6379,9 +6380,27 @@ app.whenReady().then(async () => {
       "看起来成功了，其实少做了一半"。落成文件之后 stdin 是干净的，跑完就删。
     */
     const remoteTmp = `/tmp/kirolex-bootstrap-${Date.now()}.sh`;
+    /*
+      **把本机 kiro-cli 默认 agent 的 web search MCP 也带过去** ——「把这个 mcp 也装到这个
+      claude code 上面」。端点是这个账号自己的网关地址，所以**不写进脚本**：从本机实际在跑的那份
+      配置里读（`webSearchMcp`，理由在那个模块里），读不到就让脚本跳过并说清原因。
+    */
+    let mcpEnv = '';
+    try {
+      const ps = execSync('ps -ax -o command=', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+      const found = pickWebSearch(ps.split('\n'));
+      if (found) {
+        mcpEnv = `WEBSEARCH_MCP_URL=${shellQuote(found.url)} `
+          + `WEBSEARCH_MCP_SERVICE=${shellQuote(found.service || 'bedrock-agentcore')} `
+          + `WEBSEARCH_MCP_REGION=${shellQuote(found.region || 'us-east-1')} `;
+        logger.info('remote', `bootstrap 会带上 web search MCP（${found.url.slice(0, 48)}…）`);
+      } else {
+        logger.info('remote', 'bootstrap 没找到本机的 web search MCP —— 那一步会被跳过');
+      }
+    } catch { /* 读不到就跳过，绝不猜一个地址 */ }
     const args = buildSshArgs(
       target,
-      `cat > ${remoteTmp} && FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
+      `cat > ${remoteTmp} && ${mcpEnv}FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
     );
     logger.info('remote', `bootstrap 开始 ${target.sshHost}${input.force ? '（强制重装）' : ''}`);
     return await new Promise<{ ok: boolean; code: number | null; error?: string }>((resolve) => {

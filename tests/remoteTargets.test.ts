@@ -367,7 +367,7 @@ describe('一键装齐远端依赖', () => {
       stdin 的命令都会把剩下的脚本吃掉（`claude-code-acp --version` 就是这种），于是自检整段
       没跑而退出码还是 0。这条断言就是防它回来的。
     */
-    assert.match(M, /cat > \$\{remoteTmp\} && FORCE=/);
+    assert.match(M, /cat > \$\{remoteTmp\} && \$\{mcpEnv\}FORCE=/);
     assert.match(M, /rm -f \$\{remoteTmp\}/, '跑完要删，不在对方磁盘上留东西');
     assert.equal(/bash -s`\)/.test(M), false, 'bash -s 那条路不许回来');
     assert.match(M, /child\.stdin\.write\(script\)/);
@@ -390,6 +390,82 @@ describe('一键装齐远端依赖', () => {
   test('超时够长 —— kiro-cli 的包几百 MB，npm 还要装三个', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf("ipcMain.handle('remote:bootstrap'");
-    assert.match(M.slice(at, at + 3000), /15 \* 60 \* 1000/);
+    assert.match(M.slice(at, at + 6000), /15 \* 60 \* 1000/);
+  });
+});
+
+/*
+ * 「你先看一下 kiro-cli 默认 agent 的 web search mcp，把这个 mcp 也装到这个 claude code 上面」。
+ *
+ * 实测到的那条（本机 `kiro-cli mcp list` 里 kiro_default 挂的 `agentcore-websearch`）：
+ *   mcp-proxy-for-aws https://websearch-…gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
+ *     --service bedrock-agentcore --region us-east-1 --profile default
+ */
+describe('web search MCP 带到远端的 claude code', () => {
+  const REAL_PS = '/Users/k/.local/share/uv/tools/mcp-proxy-for-aws/bin/python /Users/k/.local/bin/mcp-proxy-for-aws '
+    + 'https://websearch-gw-0hx6kh9cho.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp '
+    + '--service bedrock-agentcore --region us-east-1 --profile default';
+
+  test('从实际在跑的命令行里读出端点/服务/区域', async () => {
+    const { parseProxyCommand } = await import('../src/main/webSearchMcp.ts');
+    const m = parseProxyCommand(REAL_PS)!;
+    assert.match(m.url, /^https:\/\/websearch-.*\/mcp$/);
+    assert.equal(m.service, 'bedrock-agentcore');
+    assert.equal(m.region, 'us-east-1');
+  });
+
+  test('不是这个代理的进程一律不认', async () => {
+    const { parseProxyCommand } = await import('../src/main/webSearchMcp.ts');
+    assert.equal(parseProxyCommand('node /some/other/thing --region us-east-1'), null);
+    assert.equal(parseProxyCommand('mcp-proxy-for-aws --help'), null, '没有端点就不算');
+    assert.equal(parseProxyCommand(''), null);
+  });
+
+  test('有多个代理时挑 websearch 那个', async () => {
+    const { pickWebSearch } = await import('../src/main/webSearchMcp.ts');
+    const lines = [
+      'python mcp-proxy-for-aws https://other-gw.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp --service bedrock-agentcore',
+      REAL_PS,
+    ];
+    assert.match(pickWebSearch(lines)!.url, /websearch-gw-0hx6kh9cho/);
+    assert.equal(pickWebSearch([]), null, '读不到就是 null —— 绝不猜一个地址');
+  });
+
+  test('**不抄 --profile** —— 远端走实例角色，那台机器上没有名叫 default 的 profile', async () => {
+    const { claudeMcpAddArgs, parseProxyCommand } = await import('../src/main/webSearchMcp.ts');
+    const args = claudeMcpAddArgs('agentcore-websearch', parseProxyCommand(REAL_PS)!);
+    assert.equal(args.includes('--profile'), false, '照抄过去只会让它一启动就找不到 profile');
+    assert.deepEqual(args.slice(0, 6), ['mcp', 'add', '--scope', 'user', 'agentcore-websearch', '--']);
+    assert.ok(args.includes('--service') && args.includes('bedrock-agentcore'));
+  });
+
+  test('端点**不写进脚本/仓库** —— 它是这个账号自己的网关地址', () => {
+    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const WS = fs.readFileSync(path.join(process.cwd(), 'src/main/webSearchMcp.ts'), 'utf8');
+    for (const [name, src] of [['脚本', SH2], ['index.ts', M], ['webSearchMcp.ts', WS]] as const) {
+      assert.equal(/websearch-gw-[a-z0-9]{6,}/.test(src), false, `${name} 里不许出现真实网关 id`);
+    }
+    /* 靠环境变量传进来，没传就跳过 */
+    assert.match(SH2, /WEBSEARCH_MCP_URL="\$\{WEBSEARCH_MCP_URL:-\}"/);
+    assert.match(SH2, /跳过：没拿到端点/);
+    assert.match(M, /WEBSEARCH_MCP_URL=\$\{shellQuote\(found\.url\)\}/);
+  });
+
+  test('脚本里用 claude mcp add --scope user，且幂等（先删再加）', () => {
+    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    assert.match(SH2, /claude mcp add --scope user/);
+    assert.match(SH2, /claude mcp remove --scope user/);
+    /* mcp-proxy-for-aws 是 python 工具：uv 用**官方**安装脚本 */
+    assert.match(SH2, /astral\.sh\/uv\/install\.sh/);
+    assert.match(SH2, /uv tool install --force mcp-proxy-for-aws/);
+  });
+
+  test('claude code 换成官方安装脚本（原生二进制，不依赖 node），npm 兜底', () => {
+    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    assert.match(SH2, /claude\.ai\/install\.sh/);
+    /* 用**最后一处**：头部注释里也提到了这个 URL，从那儿切看不到兜底那几行 */
+    const at = SH2.lastIndexOf('claude.ai/install.sh');
+    assert.match(SH2.slice(at, at + 900), /npm_i '@anthropic-ai\/claude-code' claude/, '装不上要能退回 npm');
   });
 });
