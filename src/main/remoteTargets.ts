@@ -198,3 +198,20 @@ export function deleteRemoteTarget(configPath: string, id: string): boolean {
   writeConfigObject(configPath, cfg);
   return true;
 }
+
+/**
+ * **给人看的名字，而不是 IP** ——「右边那个 tag 不要显示 ip，显示 profile 名字，比如 aws-tokyo」。
+ *
+ * 按 `sshHost` 反查配置里的 `label`。为什么是"反查"而不是把名字存进会话的 profile：
+ *   · 已有的会话里没有这个字段，存字段就得做迁移；反查对老会话一样有效。
+ *   · 名字是**会改的**（你在设置里改一次，所有会话上的徽标就该跟着变）。存下来的那份会变成旧名字，
+ *     而"两个地方显示的名字不一样"比显示 IP 更让人怀疑自己看错了。
+ *
+ * 配置里找不到（那台机器被删了、或者会话比配置老）就退回 host —— 宁可显示 IP，不要空着。
+ */
+export function labelForHost(configPath: string, sshHost: string | undefined, home = os.homedir()): string {
+  const host = String(sshHost || '').trim();
+  if (!host) return '';
+  const hit = listRemoteTargets(configPath, home).find((t) => t.sshHost === host);
+  return hit?.label || deriveLabel(host);
+}

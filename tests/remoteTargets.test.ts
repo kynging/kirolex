@@ -194,7 +194,8 @@ describe('接线：主进程', () => {
   });
 
   test('侧栏要的 host 跟着会话列表一起发出去', () => {
-    assert.match(M, /remoteHost: deriveRemoteLabel\(rec\.profile\.remote\.sshHost\)/);
+    /* 显示的是配置里的名字（`aws-tokyo`），不是 IP —— 见下面那个 describe */
+    assert.match(M, /remoteHost: labelForHost\(KIROLEX_CONFIG_PATH, rec\.profile\.remote\.sshHost\)/);
   });
 });
 
@@ -593,5 +594,43 @@ describe('工具调用要标出跑在哪台机器上', () => {
     const b = CSS.slice(CSS.indexOf('.turn-panel-remote {'), CSS.indexOf('}', CSS.indexOf('.turn-panel-remote {')));
     assert.match(a, /rgba\(64,160,220/);
     assert.match(b, /rgba\(64,160,220/);
+  });
+});
+
+/*
+ * 「右边那个 tag 不要显示 ip，显示 profile 名字，比如 aws-tokyo」。
+ */
+describe('徽标显示配置里的名字，不是 IP', () => {
+  test('按 sshHost 反查 label；找不到才退回 host', async () => {
+    const { labelForHost, saveRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lbl-'));
+    const f = path.join(dir, 'config.json');
+    fs.writeFileSync(f, '{}');
+    saveRemoteTarget(f, { label: 'aws-tokyo', sshHost: 'ec2-user@1.2.3.4' });
+    assert.equal(labelForHost(f, 'ec2-user@1.2.3.4'), 'aws-tokyo');
+    /* 配置里没有这台（删了、或者会话比配置老）—— 宁可显示 IP，不要空着 */
+    assert.equal(labelForHost(f, 'ec2-user@9.9.9.9'), '9.9.9.9');
+    assert.equal(labelForHost(f, ''), '');
+  });
+
+  test('**反查而不是存进 profile** —— 改了名字要立刻生效，且老会话也认', async () => {
+    const { labelForHost, saveRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'lbl2-'));
+    const f = path.join(dir, 'config.json');
+    fs.writeFileSync(f, '{}');
+    const saved = saveRemoteTarget(f, { label: 'tokyo-ec2', sshHost: 'u@h' });
+    assert.equal(labelForHost(f, 'u@h'), 'tokyo-ec2');
+    saveRemoteTarget(f, { id: saved.id, label: 'aws-tokyo', sshHost: 'u@h' });
+    assert.equal(labelForHost(f, 'u@h'), 'aws-tokyo', '改名之后徽标要跟着变');
+  });
+
+  test('接线：侧栏那份和同步状态里的 hostLabel 都走它', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /remoteHost: labelForHost\(KIROLEX_CONFIG_PATH, rec\.profile\.remote\.sshHost\)/);
+    assert.match(M, /hostLabel: labelForHost\(KIROLEX_CONFIG_PATH, remote\.sshHost\) \|\| remote\.sshHost,/);
+    /* 连接/预检那些消息照旧用 sshHost —— 那些话讲的是"连到哪儿"，IP 才是有用的 */
+    const PF = fs.readFileSync(path.join(process.cwd(), 'src/main/remotePreflight.ts'), 'utf8');
+    assert.match(PF, /连不上 \$\{host\}/);
+    assert.match(PF, /const host = remote\.sshHost/);
   });
 });

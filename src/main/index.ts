@@ -28,7 +28,7 @@ import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMir
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
-import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, deriveLabel as deriveRemoteLabel, type RemoteTargetInput } from './remoteTargets.ts';
+import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
@@ -1392,7 +1392,8 @@ function registerRemoteSync(sessionId: string, profile: AgentProfile, localProje
   const workdir = remote.remoteWorkdir || defaultRemoteWorkdir(remote.sshHost);
   remoteSync.register({
     sessionId,
-    hostLabel: remote.sshHost,
+    /* 给人看的名字（设置里那个 label），不是 IP —— 徽标、会话里的提示都用它 */
+    hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
     project: new RemoteMirror({
       remote, sshCommand,
       localDir: localProjectDir,
@@ -6239,7 +6240,9 @@ app.whenReady().then(async () => {
        * 侧栏要常驻一个徽标：任何时候都不该去猜"这一轮是在哪台机器上跑的"。发的是**给人看的名字**
        * （不是整串 `user@host`），因为徽标的位置只有几个字。
        */
-      ...(rec.profile?.remote?.sshHost ? { remoteHost: deriveRemoteLabel(rec.profile.remote.sshHost) } : null),
+      ...(rec.profile?.remote?.sshHost
+        ? { remoteHost: labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) }
+        : null),
     }));
   });
 
