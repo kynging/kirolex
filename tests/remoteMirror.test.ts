@@ -452,11 +452,23 @@ describe('不许把家目录/半个磁盘当镜像', () => {
     assert.equal(cmds.filter((c) => c[0] === 'rsync').length, 0, '不许有任何 rsync');
   });
 
-  test('接线：建会话和重新 attach 两条路都挡', () => {
+  test('接线：建会话**硬拒绝**，重新 attach **退回本地**（不能把会话变成死结）', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     assert.equal((M.match(/mirrorRefusal\(resolvedCwd, os\.homedir\(\)\)/g) || []).length, 2);
+    /* 新建：那时还没有历史，明确报错比悄悄换目标好 */
     assert.match(M, /这条远程会话没有建立：/);
-    assert.match(M, /这条远程会话没有重新连上：/);
+    /*
+      attach：原来也是抛错，结果那条已存在的会话**再也打不开了** —— 有历史、界面上没有出路，
+      每次点开只弹同一句错误（实测踩到）。闸门要挡的是"把凭据推到远端"，不是"让这条对话消失"。
+    */
+    assert.equal(/这条远程会话没有重新连上：/.test(M), false, '这条死路不许再有');
+    const at = M.indexOf('目录不能做镜像');
+    assert.ok(at > 0);
+    const body = M.slice(at - 900, at + 900);
+    assert.match(body, /profile\.remote = undefined;/);
+    assert.match(body, /rec0\.profile\.remote = undefined;/, '记录也要改，否则下次又走这条路');
+    assert.match(body, /已改回\*\*本地运行\*\*/, '要说清发生了什么');
+    assert.match(body, /对话内容一条都没动/);
   });
 });
 

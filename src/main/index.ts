@@ -5736,11 +5736,34 @@ app.whenReady().then(async () => {
       // For a remote session the executor's working directory is a REMOTE path,
       // not the local `cwd` the renderer passed in.
       const cliCwd = sessionCwd(profile, resolvedCwd);
-      /* 远程会话：先挡住"家目录当项目"（见 `mirrorRefusal`），再问清工具/登录/连通 */
+      /*
+        **重新连接时不许把这条会话变成死结** —— 实测踩到：家目录闸门（`mirrorRefusal`）原来在这里
+        直接抛错，于是那条已经存在的远程会话**再也打不开了** —— 它有历史、界面上却没有任何出路，
+        每次点开只弹一句同样的错误。
+
+        闸门要挡的是"把凭据推到远端"，不是"让这条对话消失"。所以这里**退回本地**：
+        清掉 `remote`（连记录一起改，否则下次又走这条路）、在会话里说清为什么，然后照常 attach。
+        本地是唯一真相，这条对话的全部内容都在本地 —— 退回本地不丢任何东西。
+
+        建**新**会话那一步仍然是硬拒绝：那时候还没有任何历史，明确报错比悄悄换目标好。
+      */
       if (profile.remote?.sshHost) {
         const refusal = mirrorRefusal(resolvedCwd, os.homedir());
-        if (refusal) throw new Error(`这条远程会话没有重新连上：${refusal}`);
-        await remotePreflight(profile.remote);
+        if (refusal) {
+          logger.warn('remote', `attach ${sessionId}: 目录不能做镜像（${refusal}）—— 这条会话退回本地`);
+          const host = profile.remote.sshHost;
+          profile.remote = undefined;
+          const rec0 = store.readRecord(sessionId);
+          if (rec0?.profile) {
+            rec0.profile.remote = undefined;
+            store.writeRecord(rec0);
+          }
+          noteInSession(sessionId, `⚠️ 这条会话已改回**本地运行**（原来指向 ${host}）。`
+            + `原因：${refusal}\n对话内容一条都没动 —— 本地一直是唯一真相。`
+            + `想在远端跑的话，在一个具体的项目目录里新建一条远程会话。`);
+        } else {
+          await remotePreflight(profile.remote);
+        }
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`);
       const client = started.client;
