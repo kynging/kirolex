@@ -26,7 +26,9 @@ describe('the commands panel folds itself when the turn ends', () => {
     // A click pins THIS panel's choice and stops the automatic rule fighting the user.
     assert.match(body, /onClick=\{\(\) => setPinned\(!collapsed\)\}/);
     // `live` must mean "this turn is the running one", not "some turn is running".
-    assert.match(src, /<CommandsPanel fileChanges=\{turnFileChanges\} live=\{isStreaming && isLastAssistant\} \/>/);
+    /* 只钉 `live=` 那一段，别把整行 JSX 写死 —— 后来加 `remoteHost`（工具跑在哪台机器上）
+       就把这条测试撞坏了，而它想守的其实只有 live 的含义。 */
+    assert.match(src, /<CommandsPanel fileChanges=\{turnFileChanges\} live=\{isStreaming && isLastAssistant\}/);
   });
 
   test('collapsed shows exactly one line: the first line of the first command', () => {

@@ -559,3 +559,39 @@ describe('侧栏那个 🌐 徽标真的到得了界面', () => {
     assert.match(SB, /是这条会话的\*\*身份\*\*/);
   });
 });
+
+/*
+ * 「这个是咋调用的？看起来工具调用是在本地？」
+ *
+ * 实测那条记录：`Running: printf '%s %s\n' "$(hostname)" "$(pwd)" > REMOTE-PROOF.txt && …`，
+ * 相对路径、`locations: None` —— 和本地执行长得一模一样。而它确实跑在东京那台 EC2 上
+ * （那条命令自己的输出是 `ip-10-0-4-14.ap-northeast-1.compute.internal`）。
+ * 一条 `rm` 落在哪台机器上不该靠猜，所以回合面板上要标出来。
+ */
+describe('工具调用要标出跑在哪台机器上', () => {
+  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+  const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+
+  test('「运行的命令」和「改动的文件」两个面板都带 🌐 host', () => {
+    assert.equal((CA.match(/className="turn-panel-remote"/g) || []).length, 2);
+    assert.match(CA, /const CommandsPanel = memo<\{ fileChanges: ToolCall\[\]; live\?: boolean; remoteHost\?: string \}>/);
+    assert.match(CA, /const FileChangesPanel = memo<\{ fileChanges: ToolCall\[\]; remoteHost\?: string \}>/);
+  });
+
+  test('host 从同步状态里取 —— 本地会话没有状态，所以有值就是远程', () => {
+    assert.match(CA, /const remoteStatus = useRemoteSyncFor\(currentSessionId \|\| undefined, true\);/);
+    /* 去掉 user@：那一段不区分机器，而面板很窄 */
+    assert.match(CA, /hostLabel\?\.replace\(\/\^\[\^@\]\*@\/, ''\)/);
+  });
+
+  test('文件面板要说清"远端改的、打开的是本地那一份"', () => {
+    assert.match(CA, /在 \$\{remoteHost\} 上改的；这里打开的是已同步回本地的那一份/);
+  });
+
+  test('样式和侧栏那个 🌐 同一个色相 —— 看到一次就认得', () => {
+    const a = CSS.slice(CSS.indexOf('.session-remote {'), CSS.indexOf('}', CSS.indexOf('.session-remote {')));
+    const b = CSS.slice(CSS.indexOf('.turn-panel-remote {'), CSS.indexOf('}', CSS.indexOf('.turn-panel-remote {')));
+    assert.match(a, /rgba\(64,160,220/);
+    assert.match(b, /rgba\(64,160,220/);
+  });
+});

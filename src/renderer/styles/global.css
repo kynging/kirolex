@@ -7618,3 +7618,16 @@ button, input, select, textarea {
   color: var(--text-secondary);
 }
 .remote-key-path.empty { color: var(--text-muted); font-family: inherit; font-size: 11px; direction: ltr; }
+
+/* 「这一轮的工具跑在哪台机器上」—— 挂在回合面板标题上。和侧栏那个 🌐 同一个色相，
+   看到一次就认得：蓝 = 在别的机器上。 */
+.turn-panel-remote {
+  flex-shrink: 0;
+  margin-left: auto;
+  padding: 0 6px;
+  border-radius: 999px;
+  background: rgba(64,160,220,0.18);
+  color: var(--text-secondary);
+  font-size: 9px;
+  white-space: nowrap;
+}

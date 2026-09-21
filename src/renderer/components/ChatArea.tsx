@@ -20,6 +20,7 @@ import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
+import { useRemoteSyncFor } from '../hooks/useRemoteSync';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
@@ -661,7 +662,16 @@ const MessageItem = memo<{
   onFork: (messageId: string) => void;
   foldThinking: boolean;
   foldTools: boolean;
-}>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools }) => {
+  /**
+   * **这一轮的工具跑在哪台机器上**（远程会话才有值）——「看起来工具调用是在本地？」
+   *
+   * 实测那条记录长这样：`Running: printf … > REMOTE-PROOF.txt`，相对路径、没有 locations ——
+   * 和本地执行长得一模一样。而它其实跑在东京那台 EC2 上（那条命令自己的输出是
+   * `ip-10-0-4-14.ap-northeast-1.compute.internal`）。一条 `rm` 在哪台机器上跑，
+   * 必须一眼看得出来，不能靠推。
+   */
+  remoteHost?: string;
+}>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools, remoteHost }) => {
   const t = useT();
   const [copied, setCopied] = useState(false);
   const actionLocked = isLastAssistant && isStreaming;
@@ -774,11 +784,11 @@ const MessageItem = memo<{
         })}
         {turnFileChanges.length > 0 && (
           <div className="message-turn-panels">
-            <FileChangesPanel fileChanges={turnFileChanges} />
+            <FileChangesPanel fileChanges={turnFileChanges} remoteHost={remoteHost} />
             {/* `live` = this turn is the one still running. The panel is open while it
                 runs and closes itself when it ends, so a finished turn does not leave a
                 wall of shell text in the transcript. */}
-            <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} />
+            <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} remoteHost={remoteHost} />
           </div>
         )}
       </div>
@@ -2006,7 +2016,7 @@ function commandFirstLine(title: string): { head: string; more: number } {
   return { head: text.slice(0, nl), more: text.slice(nl + 1).split('\n').filter((l) => l.trim()).length };
 }
 
-const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean }>(({ fileChanges, live }) => {
+const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost?: string }>(({ fileChanges, live, remoteHost }) => {
   const t = useT();
   /** null = follow the turn; a click pins this panel's own choice.
    *
@@ -2035,6 +2045,13 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean }>(({ fileC
             preview for width and wraps instead of letting the preview clip. */}
         <span className="turn-panel-label">{t('⚡ Commands run')}</span>
         <span className="turn-panel-count">{cmds.length}</span>
+        {/* **这些命令是在哪台机器上跑的** —— 记录里只有 `Running: <cmd>`，相对路径，
+            跟本地执行分不出来。一条 rm 落在哪台机器上不该靠猜。 */}
+        {remoteHost && (
+          <span className="turn-panel-remote" title={`这些命令跑在 ${remoteHost} 上（不是你的 Mac）`}>
+            🌐 {remoteHost}
+          </span>
+        )}
         {/* Collapsed is ONE line in total: the first line of the first command, clipped.
             Enough to recognise what ran without the panel taking over the turn. */}
         {collapsed && (
@@ -2124,7 +2141,7 @@ const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label
     </span>
   );
 };
-const FileChangesPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => {
+const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(({ fileChanges, remoteHost }) => {
   const t = useT();
   const [collapsed, setCollapsed] = useState(false);
   const [openPath, setOpenPath] = useState<string | null>(null);
@@ -2165,6 +2182,13 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => 
       <button className="turn-panel-head" onClick={() => setCollapsed((c) => !c)}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
         {t('📝 Changed files')} <span className="turn-panel-count">{files.length}</span>
+        {/* 远程会话：改是在远端改的，但这里点开的是**本地**那一份（镜像已经同步回来了）。
+            两件事都要说清，否则"远端改的"和"我打开的是哪一份"会被混成一件事。 */}
+        {remoteHost && (
+          <span className="turn-panel-remote" title={`在 ${remoteHost} 上改的；这里打开的是已同步回本地的那一份`}>
+            🌐 {remoteHost}
+          </span>
+        )}
       </button>
       {!collapsed && (
         <ul className="files-list">
@@ -2408,6 +2432,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   readOnly = false,
   paneFocused = true,
 }) => {
+  /**
+   * **这条会话跑在哪台机器上** ——「看起来工具调用是在本地？」。
+   *
+   * 工具调用的记录里只有 `Running: <cmd>`（相对路径、没有 locations），和本地执行分不出来。
+   * 状态里带着 hostLabel，而本地会话根本没有状态 —— 所以这个值有就是远程、没有就是本地。
+   * 显示时去掉 `user@`：那一段不是用来区分机器的，而侧栏/面板都很窄。
+   */
+  const remoteStatus = useRemoteSyncFor(currentSessionId || undefined, true);
+  const remoteHostLabel = remoteStatus?.hostLabel?.replace(/^[^@]*@/, '');
   const [isDragOver, setIsDragOver] = useState(false);
   // Conversation-aware prompt suggestions: regenerate a few contextual follow-up
   // prompts each time a turn finishes, so the chips reflect the current chat
@@ -3412,6 +3445,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             />
           ) : (
             <MessageItem
+              remoteHost={remoteHostLabel}
               key={`${currentSessionId ?? 'none'}:${group.segments[group.segments.length - 1].id}`}
               segments={group.segments}
               questionContent={group.question}
