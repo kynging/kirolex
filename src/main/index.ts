@@ -28,6 +28,7 @@ import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMir
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
+import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
@@ -6506,6 +6507,21 @@ app.whenReady().then(async () => {
       claude code 上面」。端点是这个账号自己的网关地址，所以**不写进脚本**：从本机实际在跑的那份
       配置里读（`webSearchMcp`，理由在那个模块里），读不到就让脚本跳过并说清原因。
     */
+    /*
+      **登录参数也从本机读**（和 MCP 端点同一个道理）：远端没有浏览器，走 device flow 需要
+      `--identity-provider` 和 `--region`，而这两个值是这个账号自己的，不写进仓库。
+      本机已经登录，`kiro-cli whoami` 的输出里就有（start URL + profile ARN 里的 region）。
+    */
+    let loginEnvStr = '';
+    try {
+      const cli = resolveKiroCli();
+      if (!cli) throw new Error('本机找不到 kiro-cli');
+      const who = execSync(`${shellQuote(cli)} whoami`, { encoding: 'utf8', timeout: 20_000 });
+      const env = loginEnv(parseWhoami(who));
+      loginEnvStr = Object.entries(env).map(([k, v]) => `${k}=${shellQuote(v)} `).join('');
+      if (loginEnvStr) logger.info('remote', `bootstrap 会带上登录参数（${env.KIRO_LOGIN_PROVIDER}）`);
+      else logger.info('remote', 'bootstrap 没读到本机的登录参数 —— 远端没登录时只会提示');
+    } catch { /* 读不到就只提示，不猜 */ }
     let mcpEnv = '';
     try {
       const ps = execSync('ps -ax -o command=', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
@@ -6521,7 +6537,7 @@ app.whenReady().then(async () => {
     } catch { /* 读不到就跳过，绝不猜一个地址 */ }
     const args = buildSshArgs(
       target,
-      `cat > ${remoteTmp} && ${mcpEnv}FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
+      `cat > ${remoteTmp} && ${loginEnvStr}${mcpEnv}FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
     );
     logger.info('remote', `bootstrap 开始 ${target.sshHost}${input.force ? '（强制重装）' : ''}`);
     return await new Promise<{ ok: boolean; code: number | null; error?: string }>((resolve) => {

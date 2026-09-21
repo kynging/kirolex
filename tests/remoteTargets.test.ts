@@ -368,7 +368,7 @@ describe('一键装齐远端依赖', () => {
       stdin 的命令都会把剩下的脚本吃掉（`claude-code-acp --version` 就是这种），于是自检整段
       没跑而退出码还是 0。这条断言就是防它回来的。
     */
-    assert.match(M, /cat > \$\{remoteTmp\} && \$\{mcpEnv\}FORCE=/);
+    assert.match(M, /cat > \$\{remoteTmp\} && \$\{loginEnvStr\}\$\{mcpEnv\}FORCE=/);
     assert.match(M, /rm -f \$\{remoteTmp\}/, '跑完要删，不在对方磁盘上留东西');
     assert.equal(/bash -s`\)/.test(M), false, 'bash -s 那条路不许回来');
     assert.match(M, /child\.stdin\.write\(script\)/);
@@ -823,5 +823,54 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
       assert.ok(RS.includes(`label="${label}"`), `缺标签 ${label}`);
     }
     assert.match(RS, /const Field: React\.FC</);
+  });
+});
+
+/*
+ * 「如果远程需要登录 kiro 怎么办呢」+「你记得在脚本里加 kiro 登录流程哈」。
+ *
+ * 远端没有浏览器，所以走 `--use-device-flow`：打印 URL + code，授权在**你自己的浏览器**里完成。
+ * 参数（start URL / region）是这个账号自己的，不写进仓库 —— 从本机已登录的状态里读，传给脚本。
+ */
+describe('远端 kiro 登录', () => {
+  test('从本机 whoami 的输出里读出 start URL 和 region', async () => {
+    const { parseWhoami } = await import('../src/main/kiroLogin.ts');
+    /* 实测的输出形状 */
+    const out = [
+      'Logged in with IAM Identity Center (https://d-95675c11dc.awsapps.com/start)',
+      'Email: someone@example.com',
+      '',
+      'Profile:',
+      'QDefaultProfile',
+      'arn:aws:codewhisperer:us-east-1:843493563478:profile/YD3ARYRUKXQP',
+    ].join('\n');
+    const h = parseWhoami(out);
+    assert.equal(h.identityProvider, 'https://d-95675c11dc.awsapps.com/start');
+    /* region 只能从那条 ARN 里拿 —— `kiro-cli settings all` 里没有 */
+    assert.equal(h.region, 'us-east-1');
+  });
+
+  test('读不到就**不猜** —— 环境变量空着，脚本只提示', async () => {
+    const { parseWhoami, loginEnv } = await import('../src/main/kiroLogin.ts');
+    assert.deepEqual(loginEnv(parseWhoami('Not logged in')), {});
+    assert.deepEqual(loginEnv({ region: 'us-east-1' }), {}, '只有 region 没有 provider 也不算');
+    assert.deepEqual(loginEnv({ identityProvider: 'https://x/start' }), { KIRO_LOGIN_PROVIDER: 'https://x/start' });
+  });
+
+  test('脚本里有登录这一步：device flow、已登录就跳过、失败要说清下一步', () => {
+    const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    assert.match(SH, /step "kiro-cli 登录"/);
+    assert.match(SH, /--use-device-flow/);
+    assert.match(SH, /kiro-cli whoami <\/dev\/null >\/dev\/null 2>&1; then/, '已登录要跳过');
+    assert.match(SH, /KIRO_LOGIN_PROVIDER/);
+    /* 端点不写死在仓库里 */
+    assert.equal(/awsapps\.com\/start/.test(SH), false);
+    assert.match(SH, /自己 ssh 上去跑 kiro-cli login/, '读不到参数时要给人一条明确的出路');
+  });
+
+  test('接线：bootstrap 把登录参数一起传过去', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /loginEnv\(parseWhoami\(who\)\)/);
+    assert.match(M, /\$\{loginEnvStr\}\$\{mcpEnv\}FORCE=/);
   });
 });

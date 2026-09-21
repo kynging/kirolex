@@ -10,6 +10,7 @@
 #   · claude-code  官方安装脚本 https://claude.ai/install.sh（顺带 @zed-industries/claude-code-acp，
 #                  ACP 后端要它；官方脚本装的是原生二进制，不依赖 node）
 #   · codex        @openai/codex（官方发布在 npm）
+#   · kiro-cli 登录（device flow —— 这台机器没有浏览器，所以打印 URL + code，你在本机浏览器里完成）
 #   · uv + mcp-proxy-for-aws + 把 kiro-cli 默认 agent 的 web search MCP 装进 claude code
 #     （端点由 KiroLex 从本机实际在跑的那份配置里读出来，用 WEBSEARCH_MCP_URL 传进来 —— 不写死）
 #
@@ -19,8 +20,8 @@
 # 故意**不**做的事：
 #   · 不装 LibreOffice / 不装项目依赖（node_modules）/ 不跑构建 —— 远程会话不做构建、测试、预览。
 #     那些活在本地做（文件本来就在本地），而 node_modules 里的原生二进制跨平台根本不能用。
-#   · 不写任何凭据、不替你登录 —— 登录要你自己在这台机器上跑 `kiro-cli login`。
-#     脚本只负责**告诉你**没登录（这个症状最坑：执行器起得来、但每一轮都空回）。
+#   · 不写任何凭据。登录**不是**代你输密码：走的是 device flow —— 授权动作始终在你自己的浏览器里，
+#     脚本只负责把那个 URL 和 code 打出来（没登录这个症状最坑：执行器起得来、但每一轮都空回）。
 #   · 已经装好的东西默认跳过。想强制重装：`FORCE=1 bash remote-bootstrap.sh`
 set -u
 
@@ -146,6 +147,35 @@ fi
 npm_i '@openai/codex' codex
 # ACP 适配层：KiroLex 走 ACP，claude code 要靠它才能当执行器
 npm_i '@zed-industries/claude-code-acp' claude-code-acp
+
+# ---------------------------------------------------------------- kiro 登录
+#
+# 这台机器没有浏览器，所以用 `--use-device-flow`：它打印一个 URL + 一串 code，你在**本机**
+# 浏览器里完成授权，这条命令随即返回。参数由 KiroLex 从本机已登录的那份状态里读出来传进来
+# （`KIRO_LOGIN_PROVIDER` / `KIRO_LOGIN_REGION`），**不写死在脚本里** —— 那是这个账号自己的地址。
+#
+# 没登录这个症状最坑：执行器起得来、每一轮都空回，看起来像服务端在返空响应。
+step "kiro-cli 登录"
+if ! have kiro-cli; then
+  say "→ 跳过：这台机器上还没有 kiro-cli"
+elif kiro-cli whoami </dev/null >/dev/null 2>&1; then
+  say "→ 已登录  $(kiro-cli whoami </dev/null 2>/dev/null | head -1)"
+elif [ -n "${KIRO_LOGIN_PROVIDER:-}" ]; then
+  say "→ 没登录。用 device flow 登录（授权在**你自己的浏览器**里完成）："
+  say "   provider ${KIRO_LOGIN_PROVIDER}${KIRO_LOGIN_REGION:+  region ${KIRO_LOGIN_REGION}}"
+  say "   下面会打印一个链接和一串 code —— 打开链接、输入 code，这里就会继续。"
+  # shellcheck disable=SC2086
+  if kiro-cli login --license pro --use-device-flow \
+      --identity-provider "$KIRO_LOGIN_PROVIDER" \
+      ${KIRO_LOGIN_REGION:+--region "$KIRO_LOGIN_REGION"} </dev/null 2>&1; then
+    say "→ 登录完成  $(kiro-cli whoami </dev/null 2>/dev/null | head -1)"
+  else
+    note_fail "登录没完成（超时或被取消）。可以再点一次「安装依赖」，或者自己 ssh 上去跑 kiro-cli login"
+  fi
+else
+  note_fail "没登录，而且 KiroLex 没能从本机读出登录参数（provider/region）——"
+  say "   请 ssh 到这台机器手动跑一次：kiro-cli login --license pro --use-device-flow"
+fi
 
 # ------------------------------------------- web search MCP（给 claude code）
 #
