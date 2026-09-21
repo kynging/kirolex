@@ -6414,8 +6414,19 @@ app.whenReady().then(async () => {
     if (!isFeatureEnabled('remoteSessions')) return { enabled: false, targets: [] };
     return {
       enabled: true,
+      /*
+        **字段要发全** ——「我为什么选了密钥不生效」。这里原来只发 id/label/sshHost/remoteWorkdir，
+        漏了 `identityFile` 和 `sshPort`：于是设置界面永远显示"没有选私钥"（明明配置里有），
+        而自动保存又会把这份**缺字段**的草稿写回去 —— 等于每次编辑都在悄悄抹掉密钥和端口。
+        投影列白名单的代价就是这个：漏一个字段不是少显示一行，是把它删掉。
+      */
       targets: listRemoteTargets(KIROLEX_CONFIG_PATH).map((t) => ({
-        id: t.id, label: t.label, sshHost: t.sshHost, remoteWorkdir: t.remoteWorkdir,
+        id: t.id,
+        label: t.label,
+        sshHost: t.sshHost,
+        sshPort: t.sshPort,
+        identityFile: t.identityFile,
+        remoteWorkdir: t.remoteWorkdir,
       })),
     };
   });

@@ -35,6 +35,25 @@ type Draft = Partial<RemoteRow> & { sshHost: string };
 const NEW = '__new__';
 const EMPTY: Draft = { sshHost: '', label: '', sshPort: 22, identityFile: '', remoteWorkdir: '' };
 
+/**
+ * 一行「标签 + 输入框」。
+ *
+ * **标签必须常驻** ——「那个远程界面的三个 input 没有名字，根本不知道啥是啥」：
+ * 只靠 placeholder 的话，一打字提示就消失了，回头再看这几个框就全是裸字符串
+ * （`ec2-user@1.2.3.4` 和 `/home/ec2-user/kirolex-mirror` 谁是谁全靠猜）。
+ * placeholder 留着当**例子**，标签回答"这是什么"。
+ */
+const Field: React.FC<{
+  label: string;
+  hint?: string;
+  children: React.ReactNode;
+}> = ({ label, hint, children }) => (
+  <div className="remote-field">
+    <label className="remote-field-label" title={hint}>{label}</label>
+    <div className="remote-field-control">{children}</div>
+  </div>
+);
+
 export const RemoteSettings: React.FC = () => {
   const [rows, setRows] = useState<RemoteRow[]>([]);
   const [enabled, setEnabled] = useState(false);
@@ -47,6 +66,23 @@ export const RemoteSettings: React.FC = () => {
   /** 安装脚本的实时输出。装东西要几分钟（kiro-cli 那个包几百 MB），一个字不给看就像卡死了。 */
   const [log, setLog] = useState('');
   const logRef = useRef<HTMLPreElement | null>(null);
+  /**
+   * **没有保存按钮，改完自动存** ——「那个 ssh 配置中不需要保存按钮，所有变化自动保存」。
+   *
+   * 三件事要一起做对，否则自动保存会变成麻烦：
+   *   · **防抖**：不能每敲一个字母写一次 `config.json`（那是原子写，一次一个 rename）。
+   *   · **签名比对**：选中另一台机器时 `draft` 也会变，但那不是"你改了什么" —— 不比对的话
+   *     打开设置就会无意义地写一遍盘。
+   *   · **拿到 id 之后要认领它**：新建那条第一次存完会得到一个 id，之后的编辑必须是"改这一条"
+   *     而不是"再插一条"，否则你改个名字就多出来一台机器。
+   */
+  const savedSig = useRef('');
+  const [saving, setSaving] = useState(false);
+
+  /** 一条目标的可比较签名（只含真正会被存下去的字段）。 */
+  const sig = (d: Draft | null): string => (d
+    ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.remoteWorkdir || ''])
+    : '');
 
   const reload = async (keep?: string): Promise<void> => {
     const r = await (window as any).kiroApi?.remoteTargets?.();
@@ -55,8 +91,10 @@ export const RemoteSettings: React.FC = () => {
     setEnabled(!!r?.enabled);
     /* 默认选中第一台：打开设置就看到它的配置，而不是一个空下拉 */
     const next = keep && list.some((x) => x.id === keep) ? keep : (list[0]?.id || NEW);
+    const d = next === NEW ? { ...EMPTY } : { ...EMPTY, ...list.find((x) => x.id === next) };
     setPicked(next);
-    setDraft(next === NEW ? { ...EMPTY } : { ...EMPTY, ...list.find((x) => x.id === next) });
+    setDraft(d);
+    savedSig.current = sig(d);   // 打开设置不该写盘
   };
 
   useEffect(() => { void reload(); }, []);
@@ -73,26 +111,43 @@ export const RemoteSettings: React.FC = () => {
     if (logRef.current) logRef.current.scrollTop = logRef.current.scrollHeight;
   }, [log]);
 
+  /* 自动保存。`sshHost` 还空着的时候什么都不做 —— 那不是"一台机器"，存下去只会得到一条废配置。 */
+  useEffect(() => {
+    if (!draft || !draft.sshHost.trim()) return;
+    const mine = sig(draft);
+    if (mine === savedSig.current) return;
+    const timer = setTimeout(async () => {
+      setSaving(true);
+      const r = await (window as any).kiroApi?.remoteSave?.(draft);
+      setSaving(false);
+      if (!r?.ok) { setResult({ ok: false, text: r?.error || '保存失败' }); return; }
+      setResult(null);
+      const saved = r.target as RemoteRow;
+      savedSig.current = sig({ ...draft, id: saved.id });
+      /* 就地更新列表，**不走 reload()** —— reload 会重置 draft/picked，正在打字时会把光标和内容打断 */
+      setRows((prev) => (prev.some((x) => x.id === saved.id)
+        ? prev.map((x) => (x.id === saved.id ? saved : x))
+        : [...prev, saved]));
+      if (!draft.id) {
+        /* 新建那条落地了：认领这个 id，之后的编辑是"改它"而不是"再插一条" */
+        setDraft((d) => (d ? { ...d, id: saved.id } : d));
+        setPicked(saved.id);
+      }
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [draft]);
+
   const pick = (id: string): void => {
     setResult(null);
     setPicked(id);
-    setDraft(id === NEW ? { ...EMPTY } : { ...EMPTY, ...rows.find((x) => x.id === id) });
+    const d = id === NEW ? { ...EMPTY } : { ...EMPTY, ...rows.find((x) => x.id === id) };
+    setDraft(d);
+    savedSig.current = sig(d);   // 只是切了一台机器，不是改了什么
   };
 
   const pickKey = async (): Promise<void> => {
     const r = await (window as any).kiroApi?.remotePickKey?.();
     if (r?.path && draft) setDraft({ ...draft, identityFile: r.path });
-  };
-
-  const save = async (): Promise<void> => {
-    if (!draft) return;
-    setBusy(true);
-    setResult(null);
-    const r = await (window as any).kiroApi?.remoteSave?.(draft);
-    setBusy(false);
-    if (!r?.ok) { setResult({ ok: false, text: r?.error || '保存失败' }); return; }
-    setResult({ ok: true, text: '已保存' });
-    await reload(r.target?.id);
   };
 
   const remove = async (): Promise<void> => {
@@ -159,25 +214,32 @@ export const RemoteSettings: React.FC = () => {
 
       {draft && (
         <div className="remote-form">
-          <input
-            className="settings-input"
-            placeholder="名字（徽标上显示的，例如 tokyo-ec2）"
-            value={draft.label || ''}
-            onChange={(e) => setDraft({ ...draft, label: e.target.value })}
-          />
-          <input
-            className="settings-input"
-            placeholder="SSH 地址，例如 ec2-user@1.2.3.4"
-            value={draft.sshHost}
-            onChange={(e) => setDraft({ ...draft, sshHost: e.target.value })}
-          />
-          <input
-            className="settings-input"
-            placeholder="端口（默认 22）"
-            value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
-            onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
-          />
+          <Field label="名字" hint="侧栏徽标和新建对话的下拉里显示的就是这个名字">
+            <input
+              className="settings-input"
+              placeholder="例如 aws-tokyo"
+              value={draft.label || ''}
+              onChange={(e) => setDraft({ ...draft, label: e.target.value })}
+            />
+          </Field>
+          <Field label="SSH 地址" hint="用户名@主机，和你平时 ssh 用的一样">
+            <input
+              className="settings-input"
+              placeholder="例如 ec2-user@1.2.3.4"
+              value={draft.sshHost}
+              onChange={(e) => setDraft({ ...draft, sshHost: e.target.value })}
+            />
+          </Field>
+          <Field label="端口" hint="不填就是 22">
+            <input
+              className="settings-input"
+              placeholder="22"
+              value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
+              onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
+            />
+          </Field>
           {/* 密钥用 Finder 选 —— 手写路径错一个字母，表现是"认证失败"，跟机器没开长得一样 */}
+          <Field label="私钥" hint="留空 = 用 ssh 自己的配置（~/.ssh/config、ssh-agent）">
           <div className="remote-key">
             <span className={`remote-key-path${draft.identityFile ? '' : ' empty'}`} title={draft.identityFile || ''}>
               🔑 {draft.identityFile || '没有选私钥（可选 —— 留空就用 ssh 自己的配置）'}
@@ -187,12 +249,15 @@ export const RemoteSettings: React.FC = () => {
               <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>清除</button>
             )}
           </div>
-          <input
-            className="settings-input"
-            placeholder="远端工作目录（镜像放哪，例如 /home/ec2-user/kirolex-mirror）"
-            value={draft.remoteWorkdir || ''}
-            onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
-          />
+          </Field>
+          <Field label="远端目录" hint="项目镜像放在那台机器的哪里（每个本地项目一个子目录）">
+            <input
+              className="settings-input"
+              placeholder="例如 /home/ec2-user/kirolex-mirror"
+              value={draft.remoteWorkdir || ''}
+              onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
+            />
+          </Field>
           <div className="remote-row-actions">
             <button className="remote-btn" disabled={locked || !canAct} onClick={() => void test()}>测试连接</button>
             <button
@@ -201,12 +266,15 @@ export const RemoteSettings: React.FC = () => {
               title="在这台机器上装 kiro-cli / claude code / codex / node / rsync / git，以及 kiro-cli 默认 agent 的 web search MCP（幂等，已装的跳过）"
               onClick={() => void bootstrap()}
             >{installing ? '安装中…' : '安装依赖'}</button>
-            <button className="remote-btn remote-btn-primary" disabled={locked || !canAct} onClick={() => void save()}>保存</button>
             {draft.id && <button className="remote-btn" disabled={locked} onClick={() => void remove()}>删除</button>}
           </div>
         </div>
       )}
 
+      {/* 没有保存按钮，所以要有一句"存了没"—— 否则人不知道改动算不算数 */}
+      {draft?.sshHost.trim() && (
+        <p className="settings-hint">{saving ? '正在保存…' : '改动自动保存'}</p>
+      )}
       {busy && <p className="settings-hint">正在连…（最多等 30 秒）</p>}
       {installing && (
         <p className="settings-hint">

@@ -171,18 +171,37 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
   const cfg = readConfigObject(configPath);
   const list: any[] = Array.isArray(cfg.remotes) ? cfg.remotes.slice() : [];
   const id = input.id || newTargetId(input, list.map((r) => String(r?.id || '')));
+  const at = list.findIndex((r) => String(r?.id || '') === id);
+  const old = at >= 0 ? list[at] : undefined;
+  /*
+    **"界面没给的字段"和"界面要求清空"是两回事** ——「我为什么选了密钥不生效」。
+
+    第一版把缺省的字段当成新值写回去（`identityFile` 变 undefined、`sshPort` 变默认 22），
+    于是界面每次编辑都在悄悄抹掉密钥、把端口改回 22 —— 而界面之所以没给这两个字段，
+    是因为发给它的列表里本来就漏了它们（见 `app:remote-targets` 那段注释）。
+
+    所以规则是：**键在 input 里才动它**，默认值只在新建时用；传空串 = 明确清除。
+  */
+  const has = (k: keyof RemoteTargetInput): boolean =>
+    Object.prototype.hasOwnProperty.call(input, k) && (input as any)[k] !== undefined;
+  const sshHost = String(input.sshHost).trim();
+  const port = Number((input as any).sshPort);
   const row = {
     id,
-    label: String(input.label || '').trim() || deriveLabel(input.sshHost),
-    sshHost: String(input.sshHost).trim(),
-    sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
+    label: (has('label') && String(input.label).trim())
+      ? String(input.label).trim()
+      : (old?.label || deriveLabel(sshHost)),
+    sshHost,
+    sshPort: has('sshPort') && Number.isFinite(port) && port > 0 ? port : (old?.sshPort ?? 22),
     /* `~` **不在这里展开**：配置里留着 `~/k.pem` 更可读，读的时候才展开（`expandHome`） */
-    identityFile: String(input.identityFile || '').trim() || undefined,
-    remoteWorkdir: String(input.remoteWorkdir || '').trim() || undefined,
+    identityFile: has('identityFile')
+      ? (String(input.identityFile).trim() || undefined)
+      : old?.identityFile,
+    remoteWorkdir: has('remoteWorkdir')
+      ? (String(input.remoteWorkdir).trim() || undefined)
+      : old?.remoteWorkdir,
   };
-  const at = list.findIndex((r) => String(r?.id || '') === id);
-  if (at >= 0) list[at] = { ...list[at], ...row };
-  else list.push(row);
+  if (at >= 0) list[at] = row; else list.push(row);
   cfg.remotes = list;
   writeConfigObject(configPath, cfg);
   return normalize(row, id, home)!;

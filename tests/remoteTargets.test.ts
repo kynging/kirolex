@@ -733,3 +733,95 @@ describe('右键菜单：那条说的是"去哪儿"，不是"从哪儿走"', () 
     assert.match(SB.slice(at - 320, at), /onMoveSession\(ctxSession\.id, null\)/);
   });
 });
+
+/*
+ * 「那个 ssh 配置中不需要保存按钮，所有变化自动保存」。
+ */
+describe('远端配置自动保存（没有保存按钮）', () => {
+  const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+
+  test('保存按钮没了，改动走防抖自动存', () => {
+    assert.equal(/>保存</.test(RS), false, '按钮不许再有');
+    assert.match(RS, /setTimeout\(async \(\) => \{[\s\S]{0,400}remoteSave/);
+    assert.match(RS, /\}, 600\);/, '防抖：不能每敲一个字母写一次 config.json');
+  });
+
+  test('**空 sshHost 不存** —— 那不是一台机器，存下去只会得到一条废配置', () => {
+    assert.match(RS, /if \(!draft \|\| !draft\.sshHost\.trim\(\)\) return;/);
+  });
+
+  test('**签名比对** —— 只是切换/打开时不该写盘', () => {
+    assert.match(RS, /if \(mine === savedSig\.current\) return;/);
+    /* 加载和切换两处都要对齐签名，否则打开设置就写一遍 */
+    assert.equal((RS.match(/savedSig\.current = sig\(d\)/g) || []).length, 2);
+  });
+
+  test('**新建那条存完要认领 id** —— 否则改个名字就多出来一台机器', () => {
+    const at = RS.indexOf('if (!draft.id) {');
+    assert.ok(at > 0);
+    const body = RS.slice(at, at + 400);
+    assert.match(body, /setDraft\(\(d\) => \(d \? \{ \.\.\.d, id: saved\.id \} : d\)\)/);
+    assert.match(body, /setPicked\(saved\.id\)/);
+  });
+
+  test('存完就地更新列表，**不走 reload** —— reload 会打断正在打字的输入', () => {
+    assert.match(RS, /setRows\(\(prev\) => \(prev\.some\(\(x\) => x\.id === saved\.id\)/);
+    const at = RS.indexOf('const saved = r.target as RemoteRow;');
+    assert.equal(/await reload\(/.test(RS.slice(at, at + 700)), false);
+  });
+
+  test('要有一句"存了没" —— 没有按钮时人得知道改动算不算数', () => {
+    assert.match(RS, /saving \? '正在保存…' : '改动自动保存'/);
+  });
+});
+
+/*
+ * 「我为什么选了密钥不生效」—— 两个 bug 叠在一起：
+ *   ① `app:remote-targets` 的投影只发了 id/label/sshHost/remoteWorkdir，**漏了 identityFile 和
+ *      sshPort**，所以设置界面永远显示"没有选私钥"（配置里明明有）。
+ *   ② 自动保存又把这份缺字段的草稿写回去，而 `{...old, ...row}` 会用 `undefined` 盖掉原值、
+ *      JSON 再把它丢掉 —— 等于每次编辑都在悄悄删掉密钥和端口。
+ */
+describe('私钥/端口不能在来回传的路上丢掉', () => {
+  test('IPC 要把这两个字段发出去', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf('targets: listRemoteTargets(KIROLEX_CONFIG_PATH).map');
+    assert.ok(at > 0);
+    const body = M.slice(at, at + 400);
+    assert.match(body, /identityFile: t\.identityFile/);
+    assert.match(body, /sshPort: t\.sshPort/);
+  });
+
+  test('**没给的字段保持原值**，而不是被 undefined 抹掉', async () => {
+    const { saveRemoteTarget, listRemoteTargets } = await import('../src/main/remoteTargets.ts');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'keep-'));
+    const f = path.join(dir, 'config.json');
+    fs.writeFileSync(f, '{}');
+    saveRemoteTarget(f, { label: 'tokyo', sshHost: 'u@h', sshPort: 2222, identityFile: '/k.pem', remoteWorkdir: '/w' });
+    /* 界面只改了名字（别的字段没带过来）—— 密钥/端口/目录都必须还在 */
+    saveRemoteTarget(f, { id: 'tokyo', label: 'aws-tokyo', sshHost: 'u@h' });
+    const [t] = listRemoteTargets(f);
+    assert.equal(t.label, 'aws-tokyo');
+    assert.equal(t.identityFile, '/k.pem', '密钥不许丢');
+    assert.equal(t.sshPort, 2222, '端口不许丢');
+    assert.equal(t.remoteWorkdir, '/w');
+  });
+
+  test('**显式清空**还是要能清掉（传空串 = 明确的清除）', async () => {
+    const { saveRemoteTarget, listRemoteTargets } = await import('../src/main/remoteTargets.ts');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'clr-'));
+    const f = path.join(dir, 'config.json');
+    fs.writeFileSync(f, '{}');
+    saveRemoteTarget(f, { label: 'x', sshHost: 'u@h', identityFile: '/k.pem' });
+    saveRemoteTarget(f, { id: 'x', label: 'x', sshHost: 'u@h', identityFile: '' });
+    assert.equal(listRemoteTargets(f)[0].identityFile, undefined);
+  });
+
+  test('输入框都有常驻标签 —— placeholder 一打字就没了', () => {
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    for (const label of ['名字', 'SSH 地址', '端口', '私钥', '远端目录']) {
+      assert.ok(RS.includes(`label="${label}"`), `缺标签 ${label}`);
+    }
+    assert.match(RS, /const Field: React\.FC</);
+  });
+});

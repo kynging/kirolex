@@ -7631,3 +7631,21 @@ button, input, select, textarea {
   font-size: 9px;
   white-space: nowrap;
 }
+
+/* 远端配置的「标签 + 输入框」。标签固定一列，眼睛扫下来就知道每一格是什么 ——
+   只靠 placeholder 的话一打字就没了。 */
+.remote-field {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+.remote-field-label {
+  flex: 0 0 68px;
+  font-size: 11px;
+  color: var(--text-muted);
+  text-align: right;
+  cursor: help;
+}
+.remote-field-control { flex: 1 1 auto; min-width: 0; }
+.remote-field-control .settings-input { width: 100%; }
