@@ -91,6 +91,23 @@ export const SENSITIVE_EXCLUDES = [
   'id_ed25519*',
 ];
 
+/**
+ * **会话目录只推模型真的要读的那部分**。
+ *
+ * 会话目录（`~/.kirolex/sessions/<id>/`）里除了 `history.md` 和附件，还有 KiroLex 自己的状态：
+ * `transcript.jsonl`、`record.json`、`events.jsonl`、`last-injection.md`。实测这些都被推到了远端 ——
+ * 模型一个都用不上（它读的是 `history.md` 和 `file:` 引用的附件），而 `record.json` 里还带着这台
+ * 远端的配置（sshHost、私钥路径）。不需要的东西不该出现在另一台机器上。
+ */
+export const SESSION_DIR_EXCLUDES = [
+  'transcript.jsonl',
+  'record.json',
+  'events.jsonl',
+  'last-injection.md',
+  'loop.json',
+  'memory.md',
+];
+
 /** 一棵树大到这个程度就不是"一个项目"了 —— 实测家目录是 49064 个文件 / 2.6 GB。 */
 export const MAX_MIRROR_FILES = 20000;
 export const MAX_MIRROR_BYTES = 1024 * 1024 * 1024;

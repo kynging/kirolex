@@ -24,9 +24,10 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal } from './remoteMirror.ts';
+import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal, DEFAULT_EXCLUDES, SESSION_DIR_EXCLUDES } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
+import { remoteContextBlock } from './remoteContext.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
@@ -1403,6 +1404,8 @@ function registerRemoteSync(sessionId: string, profile: AgentProfile, localProje
       remote, sshCommand,
       localDir: getSessionDir(sessionId),
       remoteDir: sessionMirrorDir(workdir, sessionId),
+      /* 只推模型要读的（history.md + 附件）—— 其余是 KiroLex 自己的状态，见 `SESSION_DIR_EXCLUDES` */
+      excludes: [...DEFAULT_EXCLUDES, ...SESSION_DIR_EXCLUDES],
     }),
   });
 }
@@ -1446,6 +1449,24 @@ function executorPathMapper(sessionId: string): (p: string) => string {
       return p;
     }
   };
+}
+
+/**
+ * 这条会话要注入的「运行环境：远程」说明（本地会话返回空串）。
+ *
+ * 路径两边都给：远端那份是 `entry.cwd`（就是镜像），本地那份是 `entry.localDir`。
+ * 它们本来就是同一个项目的两个名字，而模型只有被明确告知才会做这个换算。
+ */
+function remoteContextFor(sessionId: string, entry: SessionEntry): string {
+  const remote = entry.profile.remote;
+  if (!remote?.sshHost) return '';
+  const workdir = remote.remoteWorkdir || defaultRemoteWorkdir(remote.sshHost);
+  return remoteContextBlock({
+    hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
+    remoteDir: entry.cwd,
+    localDir: localProjectDirOf(sessionId, entry),
+    sessionDir: sessionMirrorDir(workdir, sessionId),
+  });
 }
 
 /** 这条会话在**本地**的工作目录（远程会话的 `cwd` 是远端镜像路径，不能拿来当本地目录用）。 */
@@ -3406,6 +3427,18 @@ app.whenReady().then(async () => {
     // the final array -- i.e. as close to the user's own text as possible. A standing
     // instruction buried in front of a 19k-char history dump is the position least likely
     // to be honoured.
+    /*
+      **远程会话：先告诉它自己在哪台机器上** ——「你是不是应该给他一些提示词告诉他本地和远程目录的区别」。
+      不说的话它会拿对话里的 `/Users/...` 去搜（那个路径在远端不存在），把"搜不到"当成"没有这个东西"。
+      和 memory 块同一个位置注入：越靠近用户那句话越可能被遵守。
+    */
+    try {
+      const rc = remoteContextFor(sessionId, entry);
+      if (rc) {
+        prompt = [{ type: 'text', text: rc }, ...prompt];
+        logger.info('remote', `注入运行环境说明 sessionId=${sessionId} chars=${rc.length}`);
+      }
+    } catch {}
     try {
       const block = isFeatureEnabled('memoryInjection')
         ? buildMemoryInjection(effectiveProjectId, sessionId)

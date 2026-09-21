@@ -658,3 +658,56 @@ describe('dev 下加载失败要自己重来，不能留白屏', () => {
     assert.match(M, /attempt <= 30 && mainWindow && !mainWindow\.isDestroyed\(\)/);
   });
 });
+
+/*
+ * 「为什么远程会话的搜索是在本地的，你是不是应该给他一些提示词告诉他本地和远程目录的区别」。
+ *
+ * 设计文档里写了要给远程会话注入这段说明，实现时漏了 —— 于是模型完全不知道自己在别人的机器上：
+ * 它会拿对话里出现的 `/Users/...` 去搜（那个路径在远端不存在），把"搜不到"当成"这个东西没有"。
+ */
+describe('远程会话要告诉模型它在哪台机器上', () => {
+  test('说清三件事：我在哪、项目在哪、本地那个路径在这儿不存在', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({
+      hostLabel: 'aws-tokyo',
+      remoteDir: '/home/ec2-user/kirolex-mirror/blog-1234abcd',
+      localDir: '/Users/k/code/blog',
+      sessionDir: '/home/ec2-user/kirolex-mirror/.kirolex-sessions/s_1',
+    });
+    assert.match(b, /\[运行环境：远程\]/);
+    assert.match(b, /aws-tokyo/);
+    assert.match(b, /\/home\/ec2-user\/kirolex-mirror\/blog-1234abcd/);
+    /* 最关键的一条：本地路径在这台机器上**不存在**，而且给出换算方法 */
+    assert.match(b, /那个路径在这台机器上不存在/);
+    assert.match(b, /\/Users\/k\/code\/blog\/x\/y.*blog-1234abcd\/x\/y/s);
+    assert.match(b, /"搜不到"不等于"这个东西没有"/);
+  });
+
+  test('还要说清：文件以本地为准、不要在远端构建/预览', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l' });
+    assert.match(b, /以用户本地那份为准/);
+    assert.match(b, /不会丢/, '不说这句它会自己往回拷');
+    assert.match(b, /node_modules/);
+    assert.match(b, /LibreOffice/);
+  });
+
+  test('缺 host 或缺远端目录就**不注入** —— 半截的说明比不说更糟', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    assert.equal(remoteContextBlock({ hostLabel: '', remoteDir: '/r', localDir: '/l' }), '');
+    assert.equal(remoteContextBlock({ hostLabel: 'h', remoteDir: '', localDir: '/l' }), '');
+  });
+
+  test('接线：每轮都注入，位置在 memory 块前面（= 最终数组里更靠近用户那句话）', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /const rc = remoteContextFor\(sessionId, entry\);/);
+    assert.match(M, /prompt = \[\{ type: 'text', text: rc \}, \.\.\.prompt\];/);
+    assert.ok(
+      M.indexOf('const rc = remoteContextFor(sessionId, entry);') < M.indexOf('buildMemoryInjection(effectiveProjectId, sessionId)'),
+      '先注入它，memory 块再压在它上面 —— 顺序决定谁更靠近用户那句话',
+    );
+    /* 两个路径都来自会话自己的记录，不是猜的 */
+    assert.match(M, /remoteDir: entry\.cwd,/);
+    assert.match(M, /localDir: localProjectDirOf\(sessionId, entry\),/);
+  });
+});
