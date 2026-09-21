@@ -874,3 +874,35 @@ describe('远端 kiro 登录', () => {
     assert.match(M, /\$\{loginEnvStr\}\$\{mcpEnv\}FORCE=/);
   });
 });
+
+/*
+ * 「ppt 需要的那些库啥的它都在脚本里了吗」→ 之前不在，现在加了。
+ *
+ * 为什么要装：生成 .pptx/.xlsx 的做法是 agent **写个 python 脚本再跑它**，而远程会话里那个脚本
+ * 跑在远端 —— 缺库就是"脚本写好了跑不起来"，它会花一轮时间自己去装。
+ * 为什么仍然**不**装 LibreOffice：预览/转 PDF 在本地做（同步回来之后读本地那份），远端一次都用不到。
+ */
+describe('脚本里的 python 库（pptx/xlsx）', () => {
+  const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+
+  test('装 python-pptx / openpyxl / pandas', () => {
+    assert.match(SH, /step "python 库（生成 pptx\/xlsx 用）"/);
+    for (const p of ['python-pptx', 'openpyxl', 'pandas']) assert.ok(SH.includes(p), `缺 ${p}`);
+    assert.match(SH, /python3 -m pip install -q/);
+  });
+
+  test('**先 import 试一遍再装** —— 那台机器的 anaconda 自带 pandas/openpyxl，重复装是白花时间', () => {
+    assert.match(SH, /python3 -c "import \$mod"/);
+    assert.match(SH, /\[ "\$FORCE" != "1" \]/, 'FORCE=1 才强制重装');
+  });
+
+  test('仍然不装 LibreOffice —— 预览在本地做', () => {
+    const installs = SH.split('\n').filter((l) => /^\s*(sudo\s+)?(dnf|yum|apt-get|npm|python3 -m pip)\s/.test(l));
+    assert.equal(/libreoffice|soffice/i.test(installs.join('\n')), false);
+  });
+
+  test('自检里报一行，装不上要能看出来', () => {
+    assert.match(SH, /say "python 库       :\$mods"/);
+    assert.match(SH, /mods="\$mods ✗\$mod"/);
+  });
+});

@@ -11,6 +11,8 @@
 #                  ACP 后端要它；官方脚本装的是原生二进制，不依赖 node）
 #   · codex        @openai/codex（官方发布在 npm）
 #   · kiro-cli 登录（device flow —— 这台机器没有浏览器，所以打印 URL + code，你在本机浏览器里完成）
+#   · python 库   python-pptx / openpyxl / pandas —— 生成 .pptx / .xlsx 的脚本是 agent 写完在
+#                  **远端**跑的，那边缺库就会失败（预览仍然在本地做，所以不装 LibreOffice）
 #   · uv + mcp-proxy-for-aws + 把 kiro-cli 默认 agent 的 web search MCP 装进 claude code
 #     （端点由 KiroLex 从本机实际在跑的那份配置里读出来，用 WEBSEARCH_MCP_URL 传进来 —— 不写死）
 #
@@ -148,6 +150,42 @@ npm_i '@openai/codex' codex
 # ACP 适配层：KiroLex 走 ACP，claude code 要靠它才能当执行器
 npm_i '@zed-industries/claude-code-acp' claude-code-acp
 
+# ------------------------------------------------------------ python 库
+#
+# 为什么要装：生成 .pptx / .xlsx 的做法是 agent **写一个 python 脚本再跑它**，而在远程会话里
+# 那个脚本跑在这台机器上 —— 缺库就是"脚本写好了、跑不起来"，而它会花一轮时间自己去装。
+#
+# 为什么**不**装 LibreOffice：预览/转 PDF 是 KiroLex 在本地做的（文件同步回本地之后读那一份），
+# 远端一次都用不到，而它有几百 MB。
+#
+# 先 import 试一遍再装：这台机器上 anaconda 自带 pandas/openpyxl，重复装是白花时间。
+step "python 库（生成 pptx/xlsx 用）"
+if ! have python3; then
+  note_fail "没有 python3 —— 生成 .pptx/.xlsx 的脚本会跑不起来"
+else
+  say "→ python3 $(python3 -V 2>&1 | awk '{print $2}')  $(command -v python3)"
+  need=""
+  for mod_pkg in "pptx:python-pptx" "openpyxl:openpyxl" "pandas:pandas"; do
+    mod="${mod_pkg%%:*}"; pkg="${mod_pkg##*:}"
+    if python3 -c "import $mod" </dev/null >/dev/null 2>&1 && [ "$FORCE" != "1" ]; then
+      say "  $pkg 已在"
+    else
+      need="$need $pkg"
+    fi
+  done
+  if [ -n "$need" ]; then
+    say "→ pip install$need"
+    # shellcheck disable=SC2086
+    python3 -m pip install -q $need </dev/null >/dev/null 2>&1 \
+      || python3 -m pip install -q --user $need </dev/null >/dev/null 2>&1 \
+      || note_fail "pip 装不上：$need"
+    for mod_pkg in "pptx:python-pptx" "openpyxl:openpyxl" "pandas:pandas"; do
+      mod="${mod_pkg%%:*}"; pkg="${mod_pkg##*:}"
+      python3 -c "import $mod" </dev/null >/dev/null 2>&1 || say "  ✗ $pkg 还是导入不了"
+    done
+  fi
+fi
+
 # ---------------------------------------------------------------- kiro 登录
 #
 # 这台机器没有浏览器，所以用 `--use-device-flow`：它打印一个 URL + 一串 code，你在**本机**
@@ -240,6 +278,14 @@ for b in kiro-cli rsync git unzip node npm claude codex claude-code-acp; do
     esac
   fi
 done
+
+if have python3; then
+  mods=""
+  for mod in pptx openpyxl pandas; do
+    python3 -c "import $mod" </dev/null >/dev/null 2>&1 && mods="$mods $mod" || mods="$mods ✗$mod"
+  done
+  say "python 库       :$mods"
+fi
 
 if have claude; then
   if claude mcp list </dev/null 2>/dev/null | grep -q "${WEBSEARCH_MCP_NAME:-agentcore-websearch}"; then
