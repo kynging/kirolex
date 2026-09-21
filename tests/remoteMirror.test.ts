@@ -459,3 +459,37 @@ describe('不许把家目录/半个磁盘当镜像', () => {
     assert.match(M, /这条远程会话没有重新连上：/);
   });
 });
+
+/*
+ * 实测踩到：界面上那句错误是
+ *   `项目镜像没同步上去（** WARNING: connection is not using a post-quantum key exchange algorithm.）`
+ * —— SSH 的后量子告警每次都在、而且是 stderr 的**第一行**，于是"取第一行"报出来的是一句
+ * 和失败毫无关系的话，真原因被丢掉了。同一个坑在 remotePreflight 里挡过一次，这里漏了。
+ */
+describe('rsync 的错误要说真话', () => {
+  test('挡掉后量子告警，取真正的那一行', async () => {
+    const { rsyncError } = await import('../src/main/remoteMirror.ts');
+    const stderr = [
+      '** WARNING: connection is not using a post-quantum key exchange algorithm.',
+      '** This session may be vulnerable to "store now, decrypt later" attacks.',
+      '** The server may need to be upgraded. See https://openssh.com/pq.html',
+      'rsync: connection unexpectedly closed (0 bytes received so far)',
+    ].join('\n');
+    const msg = rsyncError(stderr, 12);
+    assert.match(msg, /connection unexpectedly closed/);
+    assert.equal(/post-quantum/.test(msg), false, '这条告警和失败无关，认它就是在说谎');
+  });
+
+  test('**退出码永远带上** —— 事后定位全靠它（23=部分文件失败，255=ssh 断了）', async () => {
+    const { rsyncError } = await import('../src/main/remoteMirror.ts');
+    assert.match(rsyncError('', 255), /rsync exit 255/);
+    assert.match(rsyncError('** WARNING: post-quantum whatever', 23), /rsync exit 23/);
+    assert.match(rsyncError('some real failure', 12), /some real failure（rsync exit 12）/);
+  });
+
+  test('三处失败出口都走它', () => {
+    const RM = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteMirror.ts'), 'utf8');
+    assert.equal((RM.match(/rsyncError\(/g) || []).length, 4, '定义 1 处 + 用 3 处');
+    assert.equal(/firstLine\(/.test(RM), false, '老的"取第一行"不许留下');
+  });
+});

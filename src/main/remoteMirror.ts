@@ -341,14 +341,15 @@ export interface RunResult {
 }
 
 export interface MirrorIo {
-  run(file: string, args: string[], timeoutMs: number): Promise<RunResult>;
+  /** `signal`：给"停止"用 —— 一次同步可能跑几分钟，人按 Stop 时它必须真的停下来。 */
+  run(file: string, args: string[], timeoutMs: number, signal?: AbortSignal): Promise<RunResult>;
 }
 
 /** 真跑 rsync 的那一层（注入进来是为了能不碰网络做测试）。 */
 export const realIo: MirrorIo = {
-  run(file, args, timeoutMs) {
+  run(file, args, timeoutMs, signal) {
     return new Promise((resolve) => {
-      execFile(file, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8' },
+      execFile(file, args, { timeout: timeoutMs, maxBuffer: 64 * 1024 * 1024, encoding: 'utf8', signal },
         (err: any, stdout, stderr) => resolve({
           code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
           stdout: String(stdout || ''),
@@ -387,6 +388,8 @@ export class RemoteMirror {
   private sshCommand: string;
   /** 最近一次推送时的本地快照 —— 冲突判定的另一半。 */
   private lastPush?: Snapshot;
+  /** 正在跑的那次同步 —— 「停止」要能真的把 rsync 掐掉，而不只是让界面显示已停止。 */
+  private inFlight?: AbortController;
 
   constructor(opts: {
     remote: RemoteTarget;
@@ -402,6 +405,23 @@ export class RemoteMirror {
     this.sshCommand = opts.sshCommand;
     this.io = opts.io || realIo;
     this.excludes = opts.excludes || DEFAULT_EXCLUDES;
+  }
+
+  /** 掐掉正在跑的那次同步（没有在跑时什么都不做）。 */
+  cancel(): void {
+    try { this.inFlight?.abort(); } catch { /* 已经结束了 */ }
+    this.inFlight = undefined;
+  }
+
+  /** 跑一条命令，并把它登记成"正在跑的那一个"，这样 `cancel()` 掐得到。 */
+  private async runCancellable(file: string, args: string[], timeoutMs: number): Promise<RunResult> {
+    const ac = new AbortController();
+    this.inFlight = ac;
+    try {
+      return await this.io.run(file, args, timeoutMs, ac.signal);
+    } finally {
+      if (this.inFlight === ac) this.inFlight = undefined;
+    }
   }
 
   private spec(extra: Partial<SyncSpec> = {}): SyncSpec {
@@ -437,11 +457,11 @@ export class RemoteMirror {
     /* 目标目录可能还不存在：rsync 会自己建最后一级，但父目录要在 */
     await this.io.run('ssh', [...this.sshOptsForPlainSsh(), this.remote.sshHost || '',
       `mkdir -p ${shq(this.remoteDir)}`], 60_000);
-    const r = await this.io.run('rsync', pushArgs(this.spec()), SYNC_TIMEOUT_MS);
+    const r = await this.runCancellable('rsync', pushArgs(this.spec()), SYNC_TIMEOUT_MS);
     this.lastPush = snapshot;
     return {
       ok: r.code === 0,
-      error: r.code === 0 ? undefined : firstLine(r.stderr) || `rsync exit ${r.code}`,
+      error: r.code === 0 ? undefined : rsyncError(r.stderr, r.code),
       snapshot,
       ms: Date.now() - t0,
     };
@@ -453,17 +473,17 @@ export class RemoteMirror {
    */
   async pull(): Promise<PullResult> {
     const t0 = Date.now();
-    const dry = await this.io.run('rsync', pullArgs(this.spec({ dryRun: true })), SYNC_TIMEOUT_MS);
+    const dry = await this.runCancellable('rsync', pullArgs(this.spec({ dryRun: true })), SYNC_TIMEOUT_MS);
     if (dry.code !== 0) {
-      return { ok: false, error: firstLine(dry.stderr) || `rsync --dry-run exit ${dry.code}`, changed: [], conflicts: [], ms: Date.now() - t0 };
+      return { ok: false, error: rsyncError(dry.stderr, dry.code), changed: [], conflicts: [], ms: Date.now() - t0 };
     }
     const incoming = parseIncoming(dry.stdout);
     const changed = this.lastPush ? locallyChanged(this.lastPush, snapshotDir(this.localDir, this.excludes)) : [];
     const conflicts = conflictsBetween(incoming, changed);
 
-    const real = await this.io.run('rsync', pullArgs(this.spec({ skip: conflicts })), SYNC_TIMEOUT_MS);
+    const real = await this.runCancellable('rsync', pullArgs(this.spec({ skip: conflicts })), SYNC_TIMEOUT_MS);
     if (real.code !== 0) {
-      return { ok: false, error: firstLine(real.stderr) || `rsync exit ${real.code}`, changed: [], conflicts, ms: Date.now() - t0 };
+      return { ok: false, error: rsyncError(real.stderr, real.code), changed: [], conflicts, ms: Date.now() - t0 };
     }
     for (const rel of conflicts) {
       /* 一个文件一条命令：冲突本来就少（单人单机），换来的是路径完全明确、不需要临时目录 */
@@ -490,8 +510,24 @@ export class RemoteMirror {
   }
 }
 
-function firstLine(s: string): string {
-  return String(s || '').split('\n').map((l) => l.trim()).filter(Boolean)[0] || '';
+/**
+ * rsync 失败时那句给人看的话。
+ *
+ * **必须挡掉 SSH 的后量子告警**：它每次都在、而且是 stderr 的**第一行**，所以原来那句
+ * "取第一行"报出来的是
+ *   `项目镜像没同步上去（** WARNING: connection is not using a post-quantum key exchange algorithm.）`
+ * —— 一句和失败毫无关系的话，而真正的原因被丢掉了（实测踩到，查了一圈才发现）。
+ * 同一个坑在 `remotePreflight` 里已经挡过一次，这里漏了。
+ */
+export function rsyncError(stderr: string, code: number | null): string {
+  const noise = /post-quantum|store now, decrypt later|openssh\.com|^\*\*/;
+  const real = String(stderr || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !noise.test(l))[0];
+  /* 退出码**永远**带上：rsync 的退出码是可查的（23 = 部分文件传不了，255 = ssh 断了），
+     而"只有一句话、没有码"在事后根本没法定位。 */
+  return real ? `${real}（rsync exit ${code}）` : `rsync exit ${code}`;
 }
 
 function shq(s: string): string {

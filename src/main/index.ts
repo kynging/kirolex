@@ -4053,6 +4053,12 @@ app.whenReady().then(async () => {
   ) => {
     const entry = sessionClients.get(sessionId);
     if (!entry) return { idle: true };
+    /*
+      **Stop 也要把正在跑的同步掐掉** ——「为啥远程会话一直没有响应」那次，卡住的不是模型，
+      是一个还在跑的 rsync（上限 10 分钟）。不掐它，按了 Stop 也得干等到它自己结束 ——
+      那等于 Stop 没用。放在最前面：这一步不依赖后端状态，而且越早停越好。
+    */
+    remoteSync.cancel(sessionId);
     // Stop DURING a rebuild = the user opting out of the rebuild. Earlier this was
     // refused outright, which left them with no way to stop anything at all (Stop
     // became a no-op and even a pending auto-resend could not be called off). A

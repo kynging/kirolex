@@ -22,11 +22,25 @@ import type { PullResult, PushResult } from './remoteMirror.ts';
 /** 防抖窗口：工具连着写十个文件时只拉一次。 */
 export const PULL_DEBOUNCE_MS = 800;
 
+/**
+ * **同步慢到这个程度就要在会话里说话** ——「为啥远程会话一直没有响应」。
+ *
+ * 实测那次：推送跑了 3 分钟还没完（家目录，2.6 GB），而聊天里**一个字都没有** ——
+ * 侧栏那个 ↑ 太小、也说不出"在等什么、等了多久"。人只能得出"它挂了"这个结论。
+ *
+ * 15 秒是按正常情况选的：一个普通项目的增量推送实测 10 秒上下（第一次全量），
+ * 所以 15 秒之后还没完 = 确实不正常，值得占一行。之后每 30 秒续报一次，让人知道它还活着。
+ */
+export const SLOW_SYNC_NOTICE_MS = 15_000;
+export const SLOW_SYNC_REPEAT_MS = 30_000;
+
 export interface MirrorLike {
   readonly localDir: string;
   readonly remoteDir: string;
   push(): Promise<PushResult>;
   pull(): Promise<PullResult>;
+  /** 掐掉正在跑的那次同步（Stop 要能真的停下来，而不只是界面显示停了）。 */
+  cancel?(): void;
 }
 
 export interface SyncTarget {
@@ -65,6 +79,9 @@ export interface SyncDeps {
   onStatus?(status: SyncStatus): void;
   /** 防抖用；注入是为了测试里不真的等 800ms。 */
   schedule?(fn: () => void, ms: number): void;
+  /** 周期性提示用（注入是为了测试里不真的等 15 秒）。返回一个"取消"函数。 */
+  interval?(fn: () => void, ms: number): () => void;
+  now?(): number;
 }
 
 export interface SessionBusyInfo {
@@ -150,6 +167,48 @@ export class RemoteSyncManager {
     this.deps.onStatus?.(status);
   }
 
+  /**
+   * 同步超过 `SLOW_SYNC_NOTICE_MS` 就在会话里说一句，之后每 `SLOW_SYNC_REPEAT_MS` 续报。
+   * 返回"停止提示"的函数（同步一结束就调它）。
+   */
+  private startSlowNotice(sessionId: string, hostLabel: string, what: string): () => void {
+    const started = (this.deps.now || Date.now)();
+    const every = this.deps.interval
+      || ((fn: () => void, ms: number) => { const h = setInterval(fn, ms); h.unref?.(); return () => clearInterval(h); });
+    /*
+      定时器按**一个**周期跑（15s），说不说话由"距上次说话多久"决定 ——
+      第一句在 15s，之后每 30s 一句。用两个 setInterval 去换周期只会多一处状态要对齐。
+    */
+    let lastSaid = 0;
+    const stop = every(() => {
+      const now = (this.deps.now || Date.now)();
+      const secs = Math.round((now - started) / 1000);
+      if (!lastSaid) {
+        lastSaid = now;
+        this.deps.note(sessionId, `⏳ 正在${what} ${hostLabel}（已 ${secs}s）——`
+          + `这一轮要等同步完才会发出去。想停可以直接按 Stop。`);
+        return;
+      }
+      if (now - lastSaid < SLOW_SYNC_REPEAT_MS) return;
+      lastSaid = now;
+      this.deps.note(sessionId, `⏳ 还在${what} ${hostLabel}（已 ${secs}s）。`);
+    }, SLOW_SYNC_NOTICE_MS);
+    return stop;
+  }
+
+  /**
+   * **停止**：把正在跑的同步掐掉。
+   *
+   * 不掐的话按了 Stop 也要等 rsync 自己跑完（上限 10 分钟）—— 那等于 Stop 没用。
+   */
+  cancel(sessionId: string): void {
+    const t = this.targets.get(sessionId);
+    if (!t) return;
+    t.project.cancel?.();
+    t.session?.cancel?.();
+    this.deps.log('info', `remote sync 已停止 sessionId=${sessionId}`);
+  }
+
   /** 串进这条会话的链里 —— 保证同一条会话的同步一次一个。 */
   private serial<T>(sessionId: string, fn: () => Promise<T>): Promise<T> {
     const prev = this.chain.get(sessionId) || Promise.resolve();
@@ -167,9 +226,15 @@ export class RemoteSyncManager {
     if (!t) return;
     await this.serial(sessionId, async () => {
       this.emit(sessionId, 'pushing');
+      /* 慢了就说话 —— 见 `SLOW_SYNC_NOTICE_MS`。说完之后每 30 秒续报，让人知道它还活着。 */
+      const stopNotice = this.startSlowNotice(sessionId, t.hostLabel, '把本地推到');
       const results: [string, PushResult][] = [];
-      results.push(['项目', await t.project.push()]);
-      if (t.session) results.push(['会话目录', await t.session.push()]);
+      try {
+        results.push(['项目', await t.project.push()]);
+        if (t.session) results.push(['会话目录', await t.session.push()]);
+      } finally {
+        stopNotice();
+      }
       const bad = results.find(([, r]) => !r.ok);
       if (bad) {
         const [what, r] = bad;
@@ -222,7 +287,13 @@ export class RemoteSyncManager {
     const t = this.targets.get(sessionId);
     if (!t) return { ok: true, changed: [], conflicts: [], ms: 0 };
     this.emit(sessionId, 'pulling');
-    const r = await t.project.pull();
+    const stopNotice = this.startSlowNotice(sessionId, t.hostLabel, '从远端取回改动');
+    let r: PullResult;
+    try {
+      r = await t.project.pull();
+    } finally {
+      stopNotice();
+    }
     if (!r.ok) {
       this.owed.add(sessionId);
       this.emit(sessionId, 'stale', { error: r.error });

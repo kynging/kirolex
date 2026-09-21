@@ -4,6 +4,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   RemoteSyncManager, busyPeer, toolMayHaveWritten, PULL_DEBOUNCE_MS,
+  SLOW_SYNC_NOTICE_MS, SLOW_SYNC_REPEAT_MS,
   type MirrorLike, type SyncDeps,
 } from '../src/main/remoteSync.ts';
 import type { PullResult, PushResult } from '../src/main/remoteMirror.ts';
@@ -273,5 +274,103 @@ describe('接线（src/main/index.ts）', () => {
     assert.match(M, /busyPeer\(/);
     const guard = M.indexOf('busyPeer(');
     assert.ok(guard > 0 && guard < M.indexOf('await remoteSync.beforeTurn(sessionId);'));
+  });
+});
+
+/*
+ * 「为啥远程会话一直没有响应」—— 实测那次：推送跑了 3 分钟还没完（家目录 2.6 GB），
+ * 而聊天里**一个字都没有**。侧栏那个 ↑ 太小、也说不出"在等什么、等了多久"。
+ */
+describe('同步慢了要在会话里说话，而且 Stop 要掐得动', () => {
+  function slowHarness(pushMs: number) {
+    const notes: string[] = [];
+    let fire: (() => void) | null = null;
+    let cancelled = false;
+    let t = 0;
+    const mgr = new RemoteSyncManager({
+      note: (_s, text) => notes.push(text),
+      log: () => {},
+      interval: (fn) => { fire = fn; return () => { fire = null; }; },
+      now: () => t,
+    });
+    let done: (() => void) | null = null;
+    const project: any = {
+      localDir: '/l', remoteDir: '/r',
+      push: () => new Promise((res) => { done = () => res({ ok: true, snapshot: {}, ms: pushMs }); }),
+      pull: async () => ({ ok: true, changed: [], conflicts: [], ms: 1 }),
+      cancel: () => { cancelled = true; done?.(); },
+    };
+    mgr.register({ sessionId: 's1', project, hostLabel: 'aws-tokyo' });
+    return {
+      mgr, notes, project,
+      tick: (ms: number) => { t += ms; fire?.(); },
+      finish: () => done?.(),
+      wasCancelled: () => cancelled,
+    };
+  }
+
+  /* `beforeTurn` 是异步的：要先让出一次微任务，它才真的调到 push / 注册好定时器。
+     少了这一步，`tick()` 打在空气上（定时器还没注册），而 `cancel()` 也掐不到任何东西。 */
+  const settle = () => new Promise((r) => setImmediate(r));
+
+  test('第一句在 15 秒，说清在等什么、等了多久、怎么停', async () => {
+    const h = slowHarness(60_000);
+    const p = h.mgr.beforeTurn('s1');
+    await settle();
+    h.tick(SLOW_SYNC_NOTICE_MS);
+    assert.equal(h.notes.length, 1);
+    assert.match(h.notes[0], /正在把本地推到 aws-tokyo（已 15s）/);
+    assert.match(h.notes[0], /按 Stop/, '不告诉人怎么停，等于让人干等');
+    h.finish();
+    await p;
+  });
+
+  test('之后每 30 秒续报一次 —— 让人知道它还活着', async () => {
+    const h = slowHarness(60_000);
+    const p = h.mgr.beforeTurn('s1');
+    await settle();
+    h.tick(SLOW_SYNC_NOTICE_MS);            // 第一句
+    h.tick(SLOW_SYNC_NOTICE_MS);            // 才过 15s，不该说
+    assert.equal(h.notes.length, 1, `说了 ${h.notes.length} 句`);
+    h.tick(SLOW_SYNC_NOTICE_MS);            // 累计 30s，续报
+    assert.equal(h.notes.length, 2);
+    assert.match(h.notes[1], /还在把本地推到 aws-tokyo（已 45s）/);
+    h.finish();
+    await p;
+  });
+
+  test('**同步快就一句话都不说** —— 正常的一轮不该被提示刷屏', async () => {
+    const h = slowHarness(1);
+    const p = h.mgr.beforeTurn('s1');
+    await settle();
+    h.finish();
+    await p;
+    assert.deepEqual(h.notes, []);
+  });
+
+  test('Stop 真的把 rsync 掐掉（不掐就得等它自己跑完，上限 10 分钟）', async () => {
+    const h = slowHarness(60_000);
+    const p = h.mgr.beforeTurn('s1');
+    await settle();
+    h.mgr.cancel('s1');
+    await p;
+    assert.equal(h.wasCancelled(), true);
+  });
+
+  test('接线：acp:cancel 一进来就先掐同步', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('acp:cancel'");
+    const body = M.slice(at, at + 1400);
+    assert.match(body, /remoteSync\.cancel\(sessionId\);/);
+    /* 要在别的分支之前 —— 那些分支会 return，掐同步就轮不到了 */
+    assert.ok(body.indexOf('remoteSync.cancel(sessionId);') < body.indexOf('if (entry.priming)'));
+  });
+
+  test('rsync 的子进程真的接了 AbortSignal（否则 cancel 只是改了个标志位）', () => {
+    const RM = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteMirror.ts'), 'utf8');
+    assert.match(RM, /encoding: 'utf8', signal \}/);
+    assert.match(RM, /this\.inFlight\?\.abort\(\)/);
+    /* 三次 rsync（推、dry-run、正式拉）都要走可中断那条 */
+    assert.equal((RM.match(/runCancellable\('rsync'/g) || []).length, 3);
   });
 });
