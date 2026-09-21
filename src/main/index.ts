@@ -1787,6 +1787,8 @@ if (IS_DEV) {
   app.commandLine.appendSwitch('remote-allow-origins', 'http://localhost:9222');
 }
 const DEV_SERVER_URL = process.env.KIROLEX_DEV_URL || 'http://localhost:5173';
+/** 重新加载 dev server（`did-fail-load` 用）。只在 dev 下装上。 */
+let reloadDevServer: ((attempt: number) => void) | null = null;
 // Paste blobs referenced by an UNSENT composer draft. Kept on disk (not in the
 // renderer's localStorage) for two reasons: the draft is per-session and must
 // survive a restart, and the boot GC has to see these paths — otherwise a blob
@@ -2673,7 +2675,20 @@ function createWindow() {
   mainWindow.webContents.on('did-start-loading', () => startupMark('renderer: did-start-loading'));
   mainWindow.webContents.on('dom-ready', () => startupMark('renderer: dom-ready'));
   mainWindow.webContents.on('did-finish-load', () => startupMark('renderer: did-finish-load'));
-  mainWindow.webContents.on('did-fail-load', (_e, code, desc) => startupMark('renderer: did-fail-load', `code=${code} ${desc}`));
+  /**
+   * **加载失败要自己重来，不能留一个白屏** ——「现在根本看不到东西」。
+   *
+   * 原来这里只记一行日志，而重试只发生在**启动**那一次（`loadDevServer` 的 promise 被 reject）。
+   * 于是 Vite 一重启（它自己会 restart，比如多出一个 html 入口时），窗口那一瞬间加载失败，
+   * 之后**没有任何人再加载它** —— 实测的表现就是：Vite 好着（5173 返回 200），
+   * 而窗口里连 `#root` 都没有、标题退化成 `localhost:5173`。人看到的是"整个 app 没了"。
+   */
+  mainWindow.webContents.on('did-fail-load', (_e, code, desc, _url, isMainFrame) => {
+    startupMark('renderer: did-fail-load', `code=${code} ${desc}`);
+    if (!IS_DEV || !isMainFrame) return;
+    logger.warn('app', `renderer 加载失败（${code} ${desc}）—— 重新加载 ${DEV_SERVER_URL}`);
+    reloadDevServer?.(1);
+  });
 
   if (IS_DEV) {
     // Vite dev server = renderer HMR: editing src/renderer/** takes effect in
@@ -2688,6 +2703,8 @@ function createWindow() {
         }
       });
     };
+    /* 同一条重试逻辑给 `did-fail-load` 用（Vite 重启后的白屏走这条） */
+    reloadDevServer = (attempt: number) => { setTimeout(() => loadDevServer(attempt), 400); };
     loadDevServer();
     // DevTools no longer auto-opens in dev; opt in with KIROLEX_DEVTOOLS=1.
     if (process.env.KIROLEX_DEVTOOLS === '1') {

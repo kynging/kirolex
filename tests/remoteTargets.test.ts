@@ -634,3 +634,27 @@ describe('徽标显示配置里的名字，不是 IP', () => {
     assert.match(PF, /const host = remote\.sshHost/);
   });
 });
+
+/*
+ * 「现在根本看不到东西」—— Vite 自己重启（多一个 html 入口就会）的那一瞬间窗口加载失败，
+ * 而重试只发生在**启动**那一次，于是之后没人再加载它：Vite 好着（5173 返回 200），
+ * 窗口里连 `#root` 都没有、标题退化成 `localhost:5173`，看起来就是整个 app 没了。
+ */
+describe('dev 下加载失败要自己重来，不能留白屏', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('did-fail-load 会触发重新加载（原来只记一行日志）', () => {
+    const at = M.indexOf("on('did-fail-load'");
+    assert.ok(at > 0);
+    const body = M.slice(at, at + 700);
+    assert.match(body, /reloadDevServer\?\.\(1\)/);
+    /* 只管主框架：子框架/图片加载失败不该触发整页重载 */
+    assert.match(body, /if \(!IS_DEV \|\| !isMainFrame\) return;/);
+  });
+
+  test('和启动时那条重试是**同一条**逻辑，不是另写一份', () => {
+    assert.match(M, /reloadDevServer = \(attempt: number\) => \{ setTimeout\(\(\) => loadDevServer\(attempt\), 400\); \};/);
+    /* 上限还在（别把"重试"变成无限刷新） */
+    assert.match(M, /attempt <= 30 && mainWindow && !mainWindow\.isDestroyed\(\)/);
+  });
+});
