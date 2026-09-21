@@ -711,3 +711,25 @@ describe('远程会话要告诉模型它在哪台机器上', () => {
     assert.match(M, /localDir: localProjectDirOf\(sessionId, entry\),/);
   });
 });
+
+/*
+ * 「现在怎么有个移出项目的按钮，那个改成移到 unassigned 不就好吗」。
+ *
+ * 那个按钮的**动作本来就是**移到未分组（`onMoveSession(id, null)`）—— 错的只是文案：
+ * 「移出项目」听起来像把会话从项目里拿走、甚至删掉，而它其实只是换到「未分组」那一组。
+ */
+describe('右键菜单：那条说的是"去哪儿"，不是"从哪儿走"', () => {
+  test('文案是「移到未分组」，和「恢复到未分组」同一个去处', () => {
+    const I = fs.readFileSync(path.join(process.cwd(), 'src/renderer/i18n.ts'), 'utf8');
+    assert.match(I, /'Unassign': '移到未分组'/);
+    assert.match(I, /'Restore to Unassigned': '恢复到未分组'/);
+    assert.equal(/'Unassign': '移出项目'/.test(I), false);
+  });
+
+  test('动作没动：还是 onMoveSession(id, null)', () => {
+    const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+    const at = SB.indexOf("t('Unassign')");
+    assert.ok(at > 0);
+    assert.match(SB.slice(at - 320, at), /onMoveSession\(ctxSession\.id, null\)/);
+  });
+});

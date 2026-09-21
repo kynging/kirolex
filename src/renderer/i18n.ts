@@ -60,7 +60,9 @@ const ZH: Record<string, string> = {
   'Rebuild context': '重建上下文',
   'Open workspace files': '打开工作区文件',
   'Close workspace files': '关闭工作区文件',
-  'Unassign': '移出项目',
+  /* 「移出项目」听起来像把会话从项目里拿走（甚至删掉），而这个动作其实是**移到未分组**那一组里去 ——
+     和上面那条「恢复到未分组」是同一个去处。文案要说去哪儿，不是说从哪儿走。 */
+  'Unassign': '移到未分组',
   'New project…': '新建项目…',
   'Renames the project and relabels all its sessions.': '重命名项目，并同步改掉它所有会话的标签。',
   'Memory': '记忆',
