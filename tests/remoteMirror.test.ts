@@ -64,7 +64,9 @@ describe('rsync 参数', () => {
     const a = pushArgs(spec as any);
     assert.ok(a.includes('--delete'));
     assert.deepEqual(a.slice(-2), ['/l/proj/', 'ec2-user@1.2.3.4:/r/proj/']);
-    assert.equal(a.filter((x) => x === '--exclude').length, DEFAULT_EXCLUDES.length);
+    /* 默认排除 + 永远排除的凭据项（`SENSITIVE_EXCLUDES`，见"不许把家目录当镜像"那一组） */
+    assert.ok(a.filter((x) => x === '--exclude').length > DEFAULT_EXCLUDES.length);
+    for (const p of DEFAULT_EXCLUDES) assert.ok(a.includes(p), `缺 ${p}`);
   });
 
   test('拉**不带** --delete —— 你这一轮新建的本地文件不该因为远端没有就消失', () => {
@@ -397,5 +399,63 @@ describe('远程会话的 cwd = 项目镜像（不是会话目录的镜像）', 
   test('会话目录另有自己的镜像位置，和项目镜像不会重名', () => {
     assert.notEqual(sessionMirrorDir('/wd', 's_1'), mirrorDirFor('/wd', '/anything/s_1'));
     assert.match(sessionMirrorDir('/wd', 's_1'), /\.kirolex-sessions/);
+  });
+});
+
+/*
+ * **真实事故**：一条 cwd 是 `~` 的远程会话把整个家目录推到了远端 ——
+ * 2.6 GB / 49064 个文件，其中 `.aws/credentials`、`.aws/config`、`.aws/sso/cache`
+ * 和**连那台机器用的私钥本身**（`*.pem`）都在里面。这两道闸就是为它加的。
+ */
+describe('不许把家目录/半个磁盘当镜像', () => {
+  test('家目录本身、家目录的上级、根目录，一律拒绝', async () => {
+    const { mirrorRefusal } = await import('../src/main/remoteMirror.ts');
+    assert.match(mirrorRefusal('/Users/k', '/Users/k')!, /家目录/);
+    assert.match(mirrorRefusal('/Users/k/', '/Users/k')!, /家目录/, '末尾斜杠不该绕过它');
+    assert.match(mirrorRefusal('/Users', '/Users/k')!, /包含你的家目录/);
+    assert.match(mirrorRefusal('/', '/Users/k')!, /根目录/);
+    assert.equal(mirrorRefusal('/Users/k/code/blog', '/Users/k'), null, '正常项目要放行');
+  });
+
+  test('文件数/体积超限也拒绝 —— 那是"半个磁盘"，不是一个项目', async () => {
+    const { mirrorRefusal, MAX_MIRROR_FILES, MAX_MIRROR_BYTES } = await import('../src/main/remoteMirror.ts');
+    const ok = { files: 500, bytes: 10 * 1024 * 1024 };
+    assert.equal(mirrorRefusal('/Users/k/p', '/Users/k', ok), null);
+    assert.match(mirrorRefusal('/Users/k/p', '/Users/k', { ...ok, files: MAX_MIRROR_FILES + 1 })!, /个文件/);
+    assert.match(mirrorRefusal('/Users/k/p', '/Users/k', { ...ok, bytes: MAX_MIRROR_BYTES + 1 })!, /GB/);
+    /* 实测那次就是 49064 个文件 / 2.6 GB */
+    assert.ok(49064 > MAX_MIRROR_FILES && 2.6 * 2 ** 30 > MAX_MIRROR_BYTES);
+  });
+
+  test('凭据**永远**排除，调用方给自定义排除列表也去不掉', async () => {
+    const { pushArgs, pullArgs, SENSITIVE_EXCLUDES } = await import('../src/main/remoteMirror.ts');
+    const spec = { remote, localDir: '/l', remoteDir: '/r', sshCommand: SSHC, excludes: ['foo/'] } as any;
+    for (const args of [pushArgs(spec), pullArgs(spec)]) {
+      for (const pat of ['.aws/', '.ssh/', '*.pem', '.kirolex/']) {
+        assert.ok(args.includes(pat), `${pat} 必须在排除里`);
+      }
+      assert.ok(args.includes('foo/'), '自定义的那些也还在');
+    }
+    assert.ok(SENSITIVE_EXCLUDES.includes('.aws/'));
+    /* `.env` 不在里面：那是项目自己的配置，agent 经常真的需要 */
+    assert.equal(SENSITIVE_EXCLUDES.includes('.env'), false);
+  });
+
+  test('push 在跑 rsync **之前**就拒绝（一个字节都不传）', async () => {
+    const { RemoteMirror } = await import('../src/main/remoteMirror.ts');
+    const cmds: string[][] = [];
+    const io = { async run(file: string, args: string[]) { cmds.push([file, ...args]); return { code: 0, stdout: '', stderr: '' }; } };
+    const m = new RemoteMirror({ remote, localDir: os.homedir(), remoteDir: '/r/p', sshCommand: SSHC, io });
+    const r = await m.push();
+    assert.equal(r.ok, false);
+    assert.match(r.error!, /家目录/);
+    assert.equal(cmds.filter((c) => c[0] === 'rsync').length, 0, '不许有任何 rsync');
+  });
+
+  test('接线：建会话和重新 attach 两条路都挡', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.equal((M.match(/mirrorRefusal\(resolvedCwd, os\.homedir\(\)\)/g) || []).length, 2);
+    assert.match(M, /这条远程会话没有建立：/);
+    assert.match(M, /这条远程会话没有重新连上：/);
   });
 });

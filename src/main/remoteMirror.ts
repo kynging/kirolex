@@ -39,6 +39,7 @@
 import { execFile } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import type { RemoteTarget } from './config';
 
@@ -62,6 +63,75 @@ export const DEFAULT_EXCLUDES = [
   '*.log',
   '.DS_Store',
 ];
+
+/**
+ * **永远不同步的东西（凭据）** —— 实测真的发生过：一条 cwd 是 `~` 的远程会话把整个家目录推了上去，
+ * 2.6 GB / 49064 个文件，里面有 `.aws/credentials`、`.aws/sso/cache`，以及**连那台机器用的私钥本身**
+ * （`kyn-key-tokyo.pem`）。
+ *
+ * 这一层和"项目目录不该是家目录"（`mirrorRefusal`）是两道闸，都要有：
+ * 判断错了目录时凭据不该跟着走，而项目里偶然放了一把 key 时也不该被搬到另一台机器上。
+ *
+ * 注意**不包括** `.env`：那是项目自己的配置，agent 经常真的需要它，而它本来就在这个项目里。
+ * 这里挡的是"不属于这个项目、但恰好在同一棵树下"的凭据。
+ */
+export const SENSITIVE_EXCLUDES = [
+  '.ssh/',
+  '.aws/',
+  '.gnupg/',
+  '.kube/',
+  '.docker/',
+  '.config/gcloud/',
+  '.kirolex/',
+  '.netrc',
+  '.git-credentials',
+  '*.pem',
+  'id_rsa*',
+  'id_ecdsa*',
+  'id_ed25519*',
+];
+
+/** 一棵树大到这个程度就不是"一个项目"了 —— 实测家目录是 49064 个文件 / 2.6 GB。 */
+export const MAX_MIRROR_FILES = 20000;
+export const MAX_MIRROR_BYTES = 1024 * 1024 * 1024;
+
+/**
+ * **这个目录能不能当镜像根** —— 返回一句拒绝的理由，或者 `null` = 可以。
+ *
+ * 为什么要这道闸：同步的目录来自会话的 cwd，而 `~` 起的会话的 cwd 就是家目录。推上去的不只是
+ * "很多文件"，而是**凭据 + 十年攒下来的东西**，而且 `--delete` 还会按本地的样子去清远端。
+ */
+export function mirrorRefusal(
+  localDir: string,
+  home: string,
+  stats?: { files: number; bytes: number },
+): string | null {
+  /* 根目录不能去尾斜杠 —— `path.resolve('/')` 就是 `/`，一去就变成空串，然后"根目录"这条判据永远不触发 */
+  const norm = (p: string): string => {
+    const r = path.resolve(p || '');
+    return r === '/' ? '/' : r.replace(/\/+$/, '');
+  };
+  const dir = localDir ? norm(localDir) : '';
+  const h = norm(home || '');
+  if (!dir) return '没有给出要同步的目录。';
+  if (dir === '/') return '不能把根目录当项目同步。';
+  if (dir === h) {
+    return '远程会话不能把**家目录**当项目 —— 那会把 `~/.aws`、私钥这类东西一起推到远端机器上。'
+      + '请在一个具体的项目目录里开远程会话。';
+  }
+  if (h.startsWith(`${dir}/`)) {
+    return `要同步的目录（${dir}）包含你的家目录 —— 太大而且带凭据。请选一个具体的项目目录。`;
+  }
+  if (stats && stats.files > MAX_MIRROR_FILES) {
+    return `这个目录有 ${stats.files} 个文件（上限 ${MAX_MIRROR_FILES}）—— 不像一个项目。`
+      + '要么换个更小的目录，要么在排除列表里加上占大头的那些。';
+  }
+  if (stats && stats.bytes > MAX_MIRROR_BYTES) {
+    return `这个目录有 ${(stats.bytes / 2 ** 30).toFixed(1)} GB（上限 ${(MAX_MIRROR_BYTES / 2 ** 30).toFixed(0)} GB）——`
+      + '同步一次要很久，而且每一轮都要扫一遍。请换个更小的目录或者补排除项。';
+  }
+  return null;
+}
 
 /** 一次全量同步的上限。第一次推一个大仓库可能真的要几分钟，不能拿秒级超时去卡它。 */
 export const SYNC_TIMEOUT_MS = 10 * 60 * 1000;
@@ -155,7 +225,8 @@ export function pullArgs(spec: SyncSpec): string[] {
 }
 
 function commonArgs(spec: SyncSpec): string[] {
-  const ex = spec.excludes ?? DEFAULT_EXCLUDES;
+  /* 敏感项**永远**并进去：调用方给了自定义排除列表也不能把它们去掉 */
+  const ex = [...new Set([...(spec.excludes ?? DEFAULT_EXCLUDES), ...SENSITIVE_EXCLUDES])];
   return [
     '-e', spec.sshCommand,
     ...ex.flatMap((p) => ['--exclude', p]),
@@ -230,6 +301,14 @@ export function snapshotDir(dir: string, excludes: string[] = DEFAULT_EXCLUDES):
   };
   walk(dir, '');
   return out;
+}
+
+/** 快照里有多少文件、多少字节（闸门用）。 */
+export function snapshotStats(snap: Snapshot): { files: number; bytes: number } {
+  let bytes = 0;
+  const keys = Object.keys(snap || {});
+  for (const k of keys) bytes += Number(String(snap[k]).split(':')[0]) || 0;
+  return { files: keys.length, bytes };
 }
 
 /** 自推送以来本地变过（或新增）的文件。删掉的不算 —— 拉不会把它变回来（没有 `--delete`）。 */
@@ -342,7 +421,19 @@ export class RemoteMirror {
    */
   async push(): Promise<PushResult> {
     const t0 = Date.now();
+    /*
+      **两步过闸，顺序有讲究**：
+        ① 先看路径（家目录 / 根目录）—— 这一步不碰磁盘。放在扫快照之前，因为扫家目录本身就要几十秒
+           （实测 49064 个文件扫了 52 秒），而结论早就定了：不传。
+        ② 再扫快照，然后看大小。
+      实测过一次把整个家目录推上去的事故（`.aws/credentials` 和私钥都在里面），所以这两道闸
+      都在 rsync **之前**。
+    */
+    const pathRefusal = mirrorRefusal(this.localDir, os.homedir());
+    if (pathRefusal) return { ok: false, error: pathRefusal, snapshot: {}, ms: Date.now() - t0 };
     const snapshot = snapshotDir(this.localDir, this.excludes);
+    const refusal = mirrorRefusal(this.localDir, os.homedir(), snapshotStats(snapshot));
+    if (refusal) return { ok: false, error: refusal, snapshot, ms: Date.now() - t0 };
     /* 目标目录可能还不存在：rsync 会自己建最后一级，但父目录要在 */
     await this.io.run('ssh', [...this.sshOptsForPlainSsh(), this.remote.sshHost || '',
       `mkdir -p ${shq(this.remoteDir)}`], 60_000);

@@ -24,7 +24,7 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin } from './remoteMirror.ts';
+import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
@@ -3134,8 +3134,18 @@ app.whenReady().then(async () => {
       : sessionCwd(profile, sessionDir);
     // Model fallback: use the first candidate that actually starts, and persist
     // the effective model so the session isn't stuck pointing at a dead one.
-    /* 远程会话：起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
-    if (profile.remote?.sshHost) await remotePreflight(profile.remote);
+    /*
+      **远程会话不许把家目录当项目** —— 实测的事故：一条 cwd 是 `~` 的远程会话把整个家目录
+      推上了远端，2.6 GB / 49064 个文件，里面有 `.aws/credentials`、`.aws/sso/cache`，
+      以及连那台机器用的私钥本身。挡在**建会话**这一步，因为等到第一次推送才报错时，
+      那一轮已经等了几分钟、而且人根本不知道在等什么。
+    */
+    if (profile.remote?.sshHost) {
+      const refusal = mirrorRefusal(resolvedCwd, os.homedir());
+      if (refusal) throw new Error(`这条远程会话没有建立：${refusal}`);
+      /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
+      await remotePreflight(profile.remote);
+    }
     const started = await connectWithModelFallback(profile, 'new-session');
     const client = started.client;
     profile.model = started.model;
@@ -5701,8 +5711,12 @@ app.whenReady().then(async () => {
       // For a remote session the executor's working directory is a REMOTE path,
       // not the local `cwd` the renderer passed in.
       const cliCwd = sessionCwd(profile, resolvedCwd);
-      /* 远程会话：起执行器之前先问清工具/登录/连通（见 `remotePreflight`） */
-      if (profile.remote?.sshHost) await remotePreflight(profile.remote);
+      /* 远程会话：先挡住"家目录当项目"（见 `mirrorRefusal`），再问清工具/登录/连通 */
+      if (profile.remote?.sshHost) {
+        const refusal = mirrorRefusal(resolvedCwd, os.homedir());
+        if (refusal) throw new Error(`这条远程会话没有重新连上：${refusal}`);
+        await remotePreflight(profile.remote);
+      }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`);
       const client = started.client;
       profile.model = started.model;
