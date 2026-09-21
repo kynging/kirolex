@@ -493,3 +493,28 @@ describe('rsync 的错误要说真话', () => {
     assert.equal(/firstLine\(/.test(RM), false, '老的"取第一行"不许留下');
   });
 });
+
+/*
+ * **孤儿 rsync**：实测 KiroLex 被杀之后，正在跑的 rsync 没死 —— 被 launchd 收养（`ppid=1`），
+ * 继续把 6.1 GB 家目录推上远端（17 把 .pem 私钥 + .aws/credentials 又回去了一遍），
+ * 没有任何人会读它的结果，而它把上行带宽吃光，于是别的会话看起来"也挂了"。
+ */
+describe('同步进程不许活过 KiroLex', () => {
+  test('rsync 自己带 I/O 超时 —— 兜底：没人管的时候它自己会退', async () => {
+    const { pushArgs, pullArgs, RSYNC_IO_TIMEOUT_SEC } = await import('../src/main/remoteMirror.ts');
+    const spec = { remote, localDir: '/l', remoteDir: '/r', sshCommand: SSHC } as any;
+    for (const args of [pushArgs(spec), pullArgs(spec)]) {
+      assert.ok(args.includes(`--timeout=${RSYNC_IO_TIMEOUT_SEC}`), '推和拉都要带');
+    }
+    assert.equal(RSYNC_IO_TIMEOUT_SEC, 300);
+  });
+
+  test('退出前主动掐掉所有会话的同步', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteSync.ts'), 'utf8');
+    assert.match(RS, /cancelAll\(\): void \{/);
+    const at = M.indexOf("app.on('before-quit'");
+    assert.ok(at > 0);
+    assert.match(M.slice(at, at + 600), /remoteSync\.cancelAll\(\)/);
+  });
+});

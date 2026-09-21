@@ -196,10 +196,19 @@ export class RemoteSyncManager {
     return stop;
   }
 
+  /** 退出前把**所有**会话正在跑的同步掐掉（见 `cancel` 里那段孤儿进程的账）。 */
+  cancelAll(): void {
+    for (const sessionId of Array.from(this.targets.keys())) this.cancel(sessionId);
+  }
+
   /**
    * **停止**：把正在跑的同步掐掉。
    *
    * 不掐的话按了 Stop 也要等 rsync 自己跑完（上限 10 分钟）—— 那等于 Stop 没用。
+   *
+   * 更要紧的是**退出**时也得掐（`cancelAll`）：实测 KiroLex 被杀之后正在跑的 rsync 没死，
+   * 被 launchd 收养（`ppid=1`）继续推了 6.1 GB —— 没人会读它的结果，而它把上行吃光，
+   * 于是别的会话看起来"也挂了"。
    */
   cancel(sessionId: string): void {
     const t = this.targets.get(sessionId);

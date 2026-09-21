@@ -4353,6 +4353,8 @@ app.whenReady().then(async () => {
     }
   }, SCHEDULE_TICK_MS);
   app.on('before-quit', () => clearInterval(scheduleTicker));
+  /* 正在跑的同步要跟着死 —— 不掐的话它会被 launchd 收养（ppid=1）继续推，没人读结果还吃光上行 */
+  try { remoteSync.cancelAll(); } catch {}
 
   ipcMain.handle('schedule:create', (_event, sessionId: string, spec: ScheduleSpec) => {
     if (!sessionId || sessionId.startsWith('pending_')) return { ok: false, error: '请先选择一个已创建的会话' };

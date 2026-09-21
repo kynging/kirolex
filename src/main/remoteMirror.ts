@@ -224,11 +224,22 @@ export function pullArgs(spec: SyncSpec): string[] {
   ];
 }
 
+/**
+ * **rsync 自己的 I/O 超时** —— 实测的事故：KiroLex 被杀掉之后，正在跑的 rsync **没死**
+ * （父进程一走它就被 launchd 收养，`ppid=1`），继续把 6.1 GB 推了上去，
+ * 而且没有任何人会读它的结果。它还顺手把上行带宽吃光，于是别的会话看起来"也挂了"。
+ *
+ * `--timeout` 是最后一道兜底：没人喂它数据/它推不动的时候自己退出，而不是永远跑下去。
+ * 主动那一道在 `app.before-quit` 里（退出前掐掉所有在跑的同步）。
+ */
+export const RSYNC_IO_TIMEOUT_SEC = 300;
+
 function commonArgs(spec: SyncSpec): string[] {
   /* 敏感项**永远**并进去：调用方给了自定义排除列表也不能把它们去掉 */
   const ex = [...new Set([...(spec.excludes ?? DEFAULT_EXCLUDES), ...SENSITIVE_EXCLUDES])];
   return [
     '-e', spec.sshCommand,
+    `--timeout=${RSYNC_IO_TIMEOUT_SEC}`,
     ...ex.flatMap((p) => ['--exclude', p]),
     /* 冲突文件这一次不许被覆盖；`/` 开头 = 只匹配同步根下的这一条，不是"任何同名文件" */
     ...(spec.skip || []).flatMap((p) => ['--exclude', `/${p}`]),
