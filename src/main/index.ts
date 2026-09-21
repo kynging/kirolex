@@ -24,11 +24,12 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal, DEFAULT_EXCLUDES, SESSION_DIR_EXCLUDES } from './remoteMirror.ts';
+import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal, rsyncError, DEFAULT_EXCLUDES, SESSION_DIR_EXCLUDES } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
+import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents } from './kiroAgents.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
@@ -1470,6 +1471,55 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
   });
 }
 
+/**
+ * **把 agent 配置推到远端，并验一遍** ——「agent 配置是不是得同步给远程 kiro？要不然切不过去？」
+ *
+ * 会切不过去，而且是**静默**的：实测远端用一个它没有的 agent 起 ACP 照样成功、照样答 initialize，
+ * 只是 `mcpCapabilities.http` 从 true 变 false —— 它退回了默认 agent。于是这条会话看着是好的，
+ * 而 system prompt / 工具白名单 / MCP 全没了，产出是另一个 agent 干的。
+ *
+ * 所以：推过去 → 验存在 → 不存在就**拒绝启动**（宁可不跑，也不要拿错的 agent 跑）。
+ * MCP 命令缺了不拒绝（那是降级，不是换了个 agent），但要在会话里说清缺哪个。
+ */
+async function syncKiroAgent(sessionId: string, remote: RemoteTarget, agent?: string): Promise<void> {
+  const sshCommand = sshCommandFor(remote, buildSshArgs);
+  const opts = sshCommand.split(' ').slice(1);
+  /* 先建目录再推 —— 远端可能根本没有 ~/.kiro/agents */
+  await new Promise<void>((resolve) => {
+    execFile('ssh', [...opts, remote.sshHost || '', 'mkdir -p ~/.kiro/agents'], { timeout: 60_000 }, () => resolve());
+  });
+  const args = agentSyncArgs(remote.sshHost || '', sshCommand);
+  const rsyncOut = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
+    execFile('rsync', args, { timeout: 120_000, encoding: 'utf8' }, (err: any, _o, stderr) => resolve({
+      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stderr: String(stderr || ''),
+    }));
+  });
+  if (rsyncOut.code !== 0) {
+    logger.warn('remote', `agent 配置没推上去（${rsyncError(rsyncOut.stderr, rsyncOut.code)}）`);
+  } else {
+    logger.info('remote', `agent 配置已同步到 ${remote.sshHost}（${localAgents().length} 个）`);
+  }
+  if (!agent) return;
+  /* 验一遍：这个 agent 在不在，它要的 MCP 命令哪些不在 */
+  const script = agentCheckScript(agent, mcpCommandsOf(agent));
+  const out = await new Promise<string>((resolve) => {
+    execFile('ssh', [...opts, remote.sshHost || '', `bash -lc ${shellQuote(script)}`],
+      { timeout: 60_000, encoding: 'utf8' }, (_e, stdout) => resolve(String(stdout || '')));
+  });
+  const check = parseAgentCheck(out);
+  if (!check.present) {
+    throw new Error(`远端 ${remote.sshHost} 上没有 agent「${agent}」，而且同步也没成功。`
+      + `不能就这么跑 —— kiro-cli 会悄悄退回默认 agent（不报错），产出就是另一个 agent 干的。`);
+  }
+  if (check.missingCommands.length) {
+    /* 这是降级不是换 agent，所以不拦；但必须说出来 —— 否则"这个 agent 的工具怎么不工作"无从查 */
+    noteInSession(sessionId, `⚠️ agent「${agent}」的这些 MCP 命令在 ${remote.sshHost} 上没有：`
+      + `${check.missingCommands.map((c) => `\`${c}\``).join('、')}。`
+      + `kiro-cli 不会报错，只会少掉这些工具 —— 需要的话在那台机器上装好再重开这条会话。`);
+    logger.warn('remote', `agent ${agent} 缺 MCP 命令：${check.missingCommands.join(', ')}`);
+  }
+}
+
 /** 这条会话在**本地**的工作目录（远程会话的 `cwd` 是远端镜像路径，不能拿来当本地目录用）。 */
 function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
   if (entry.localDir) return entry.localDir;
@@ -1482,7 +1532,7 @@ function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: s
  * 不问的代价不是"少一条提示"：没装 rsync → 推送失败 → 界面上是"这一轮没发出去"；
  * 远端没登录 → 执行器起得来但每一轮都空回 —— 看起来就是那个查了一整天的 `EmptyResponse`。
  */
-async function remotePreflight(remote: RemoteTarget): Promise<void> {
+async function remotePreflight(remote: RemoteTarget): Promise<string[]> {
   const args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
   const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
     execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
@@ -1494,6 +1544,27 @@ async function remotePreflight(remote: RemoteTarget): Promise<void> {
   const verdict = judgePreflight(out.code, out.stdout, out.stderr, remote);
   logger.info('remote', `preflight ${remote.sshHost}: ${verdict.code} — ${verdict.message}`);
   if (verdict.code !== 'ok') throw new Error(verdict.message);
+  return verdict.models || [];
+}
+
+/**
+ * **这条会话要用的模型，远端真的有吗** ——「模型列表其实也完全不一样，你看看能不能行」。
+ *
+ * 实测这两台机器上一样（各 19 个），但没验过就等于赌：远端要是个旧版少了那个模型，
+ * kiro-cli **静默退回**（日志里见过 `Available models: auto`），于是这一轮是另一个模型答的。
+ *
+ * 处理方式和本机"模型退役"那条路一致：按 `MODEL_FALLBACK_ORDER` 挑一个远端真有的，
+ * 并在会话里说一句 —— 而不是拦住不让跑（拦住的代价比换一个大），也不是闷着换（那就是我们在治的病）。
+ * 列表问不到（空数组）时什么都不做：没依据的判断比不判断糟。
+ */
+function pickRemoteModel(sessionId: string, wanted: string, models: string[], host: string): string {
+  if (!models.length || models.includes(wanted)) return wanted;
+  const fallback = MODEL_FALLBACK_ORDER.find((m) => models.includes(m)) || models.find((m) => m !== 'auto') || 'auto';
+  noteInSession(sessionId, `⚠️ ${host} 上没有模型「${wanted}」，这条会话改用「${fallback}」。`
+    + `（远端可用：${models.slice(0, 8).join('、')}${models.length > 8 ? '…' : ''}）`
+    + `kiro-cli 对这种情况是静默退回默认模型的，所以这里明说一句。`);
+  logger.warn('remote', `模型 ${wanted} 在 ${host} 上没有 -> 用 ${fallback}`);
+  return fallback;
 }
 
 const LOAD_TIMEOUT_MS = 45000;
@@ -3183,7 +3254,10 @@ app.whenReady().then(async () => {
       const refusal = mirrorRefusal(resolvedCwd, os.homedir());
       if (refusal) throw new Error(`这条远程会话没有建立：${refusal}`);
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
-      await remotePreflight(profile.remote);
+      const remoteModels = await remotePreflight(profile.remote);
+      profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
+      /* agent 配置必须先过去，否则远端会**静默**退回默认 agent（见 `syncKiroAgent`） */
+      await syncKiroAgent(kiroLexId, profile.remote, profile.kiroAgent);
     }
     const started = await connectWithModelFallback(profile, 'new-session');
     const client = started.client;
@@ -5796,7 +5870,9 @@ app.whenReady().then(async () => {
             + `原因：${refusal}\n对话内容一条都没动 —— 本地一直是唯一真相。`
             + `想在远端跑的话，在一个具体的项目目录里新建一条远程会话。`);
         } else {
-          await remotePreflight(profile.remote);
+          const remoteModels = await remotePreflight(profile.remote);
+          profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
+          await syncKiroAgent(sessionId, profile.remote, profile.kiroAgent);
         }
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`);

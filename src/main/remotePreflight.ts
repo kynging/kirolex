@@ -14,6 +14,8 @@ export type PreflightCode = 'ok' | 'unreachable' | 'missing-tools' | 'not-logged
 
 export interface Preflight {
   code: PreflightCode;
+  /** 远端**实际**支持的模型（问不到时为空数组 —— 那时不该拦，只是没验成）。 */
+  models?: string[];
   /** 给人看的一句话：说清是什么问题、下一步干什么。 */
   message: string;
   /** 缺了哪些命令（`missing-tools` 时有值）。 */
@@ -24,12 +26,27 @@ export interface Preflight {
 /** 远端要有的东西。构建链不在里面 —— 远程会话不做构建/测试。 */
 export const REQUIRED_TOOLS = ['kiro-cli', 'rsync', 'git'];
 
-/** 一条命令问清三件事：哪些工具在、有没有登录。 */
+/**
+ * **顺带把远端的模型列表问出来** ——「模型列表其实也完全不一样，你看看能不能行」。
+ *
+ * 实测这两台机器上是一样的（各 19 个，同为 kiro-cli 1.27.0、同一个 Identity Center），
+ * 但 KiroLex 从来没验过这件事，而**验不验的差别不是"提示语"**：远端要是个旧版、少了你选的那个模型，
+ * kiro-cli 会静默退回（日志里见过 `Model 'gpt-5.6-terra' does not exist. Available models: auto`），
+ * 于是这一轮是另一个模型答的，而界面上什么都不说。
+ *
+ * 拿列表的方式是"故意传一个不存在的模型"：它在**参数校验**这一步就报错并把可用列表打出来，
+ * 不会真的调模型、不花额度。kiro-cli 没有专门的 `model list` 子命令，这是唯一的路。
+ */
+export const MODEL_PROBE = '__kirolex_probe__';
+
+/** 一条命令问清四件事：哪些工具在、有没有登录、远端有哪些模型。 */
 export function preflightScript(tools: string[] = REQUIRED_TOOLS): string {
   return [
     `for b in ${tools.join(' ')}; do command -v "$b" >/dev/null 2>&1 && echo "HAVE $b" || echo "MISS $b"; done`,
     /* `whoami` 的输出形状不保证，所以只看它成不成 —— 未登录时 kiro-cli 是非零退出 */
     'if command -v kiro-cli >/dev/null 2>&1; then kiro-cli whoami >/dev/null 2>&1 && echo "AUTH ok" || echo "AUTH no"; fi',
+    /* 模型列表：参数校验就会失败，不会真的调模型 */
+    `if command -v kiro-cli >/dev/null 2>&1; then kiro-cli chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1; fi`,
   ].join('; ');
 }
 
@@ -73,7 +90,21 @@ export function judgePreflight(
         + `没登录的话执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。`,
     };
   }
-  return { code: 'ok', message: `${host}：kiro-cli 已登录，rsync/git 都在。` };
+  const models = parseModels(out);
+  return {
+    code: 'ok',
+    models,
+    message: `${host}：kiro-cli 已登录，rsync/git 都在${models.length ? `，${models.length} 个可用模型` : ''}。`,
+  };
+}
+
+/** 从预检输出里把模型列表解析出来（ANSI 要脱掉：那一行是 kiro-cli 的错误输出，带色）。 */
+export function parseModels(stdout: string): string[] {
+  // eslint-disable-next-line no-control-regex
+  const clean = String(stdout || '').replace(/\x1b\[[0-9;]*m/g, '');
+  const line = /Available models:(.*)$/m.exec(clean)?.[1];
+  if (!line) return [];
+  return line.split(',').map((x) => x.trim()).filter(Boolean);
 }
 
 function firstLine(s: string): string {

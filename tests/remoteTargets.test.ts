@@ -906,3 +906,89 @@ describe('脚本里的 python 库（pptx/xlsx）', () => {
     assert.match(SH, /mods="\$mods ✗\$mod"/);
   });
 });
+
+/*
+ * 「还有什么 agent 配置之类的是不是得同步给远程 kiro？要不然切不过去？」——
+ * 会切不过去，而且**是静默的**。实测：远端用一个它没有的 agent 起 ACP
+ * （`kiro-cli acp --agent weekly-report`）照样启动、照样正常答 initialize，唯一区别是
+ * `mcpCapabilities.http` 从 true 变 false —— 它悄悄退回默认 agent，system prompt / 工具白名单 /
+ * MCP 全没了，而界面上一个字都不说。
+ *
+ * 两边的 agent 实测就是两套：本机 weekly-report / sfdc-* / rds-dba / ai-dlc / amzn-builder…，
+ * 远端只有四个老的 kirolex-*。
+ */
+describe('agent 配置要同步到远端，并且验一遍', () => {
+  test('推 agent 的 rsync：只推 *.json，**不带 --delete**（远端有它自己的 agent）', async () => {
+    const { agentSyncArgs, REMOTE_AGENTS_DIR } = await import('../src/main/kiroAgents.ts');
+    const a = agentSyncArgs('u@h', 'ssh -i /k.pem', '/home/me');
+    assert.equal(a.includes('--delete'), false, '实测远端有四个 kirolex-*，不能清掉别人的');
+    assert.deepEqual(a.slice(-2), ['/home/me/.kiro/agents/', `u@h:${REMOTE_AGENTS_DIR}/`]);
+    const i = a.indexOf('--include');
+    assert.equal(a[i + 1], '*.json');
+    assert.ok(a.includes('--exclude') && a[a.indexOf('--exclude') + 1] === '*');
+  });
+
+  test('从 agent 配置里挑出它依赖的 MCP 命令', async () => {
+    const { mcpCommands } = await import('../src/main/kiroAgents.ts');
+    /* 实测本机 kiro_default 那条：mcp-proxy-for-aws 代理一个 AgentCore 网关 */
+    assert.deepEqual(mcpCommands({
+      mcpServers: {
+        'agentcore-websearch': { command: '/Users/k/.local/bin/mcp-proxy-for-aws', args: ['https://x/mcp'] },
+        playwright: { command: 'npx', args: ['-y', '@playwright/mcp'] },
+      },
+    }).sort(), ['/Users/k/.local/bin/mcp-proxy-for-aws', 'npx']);
+    assert.deepEqual(mcpCommands({}), []);
+    assert.deepEqual(mcpCommands(null), []);
+  });
+
+  test('远端检查一条命令问完：agent 在不在 + 哪些 MCP 命令不在', async () => {
+    const { agentCheckScript, parseAgentCheck } = await import('../src/main/kiroAgents.ts');
+    const script = agentCheckScript('weekly-report', ['builder-mcp', 'npx']);
+    assert.match(script, /test -f ~\/\.kiro\/agents\/weekly-report\.json && echo AGENT_OK \|\| echo AGENT_MISSING/);
+    assert.match(script, /command -v "builder-mcp"/);
+    assert.deepEqual(parseAgentCheck('AGENT_OK\nMISSING builder-mcp'), { present: true, missingCommands: ['builder-mcp'] });
+    assert.deepEqual(parseAgentCheck('AGENT_MISSING'), { present: false, missingCommands: [] });
+  });
+
+  test('接线：**agent 不在就拒绝启动**（静默跑错 agent 比不跑糟），MCP 缺了只提示', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /async function syncKiroAgent\(/);
+    assert.match(M, /上没有 agent「\$\{agent\}」/);
+    assert.match(M, /会悄悄退回默认 agent（不报错）/);
+    /* 缺 MCP 命令不拦，但要说 */
+    assert.match(M, /的这些 MCP 命令在 \$\{remote\.sshHost\} 上没有/);
+    /* 两条路（新建 / attach）都要同步 */
+    assert.equal((M.match(/await syncKiroAgent\(/g) || []).length, 2);
+  });
+});
+
+/*
+ * 「模型列表其实也完全不一样，你看看能不能行」——
+ * 实测这两台机器上是**一样的**（各 19 个，同为 kiro-cli 1.27.0、同一个 Identity Center）。
+ * 但没验过就等于赌：远端是旧版、少了你选的模型时，kiro-cli 静默退回
+ * （日志里见过 `Model 'gpt-5.6-terra' does not exist. Available models: auto`）。
+ */
+describe('远端的模型列表要验', () => {
+  test('预检顺带把列表问出来（传一个不存在的模型 —— 参数校验就失败，不花额度）', async () => {
+    const { preflightScript, MODEL_PROBE, parseModels, judgePreflight } = await import('../src/main/remotePreflight.ts');
+    assert.match(preflightScript(), new RegExp(`kiro-cli chat --model ${MODEL_PROBE} --no-interactive`));
+    assert.match(preflightScript(), /Available models:/);
+    /* 实测输出带 ANSI，要脱掉 */
+    const raw = 'HAVE kiro-cli\nHAVE rsync\nHAVE git\nAUTH ok\n\u001b[0merror: Model \'x\' does not exist. Available models: auto, claude-opus-5, gpt-5.6-sol';
+    assert.deepEqual(parseModels(raw), ['auto', 'claude-opus-5', 'gpt-5.6-sol']);
+    const v = judgePreflight(0, raw, '', { sshHost: 'u@h' } as any);
+    assert.equal(v.code, 'ok');
+    assert.deepEqual(v.models, ['auto', 'claude-opus-5', 'gpt-5.6-sol']);
+    assert.match(v.message, /3 个可用模型/);
+  });
+
+  test('接线：远端没有那个模型就按 fallback 换一个，并**说出来**', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /function pickRemoteModel\(/);
+    assert.match(M, /MODEL_FALLBACK_ORDER\.find\(\(m\) => models\.includes\(m\)\)/);
+    assert.match(M, /上没有模型「\$\{wanted\}」/);
+    /* 列表问不到时什么都不做 —— 没依据的判断比不判断糟 */
+    assert.match(M, /if \(!models\.length \|\| models\.includes\(wanted\)\) return wanted;/);
+    assert.equal((M.match(/pickRemoteModel\(/g) || []).length, 3, '定义 1 处 + 新建/attach 两处');
+  });
+});
