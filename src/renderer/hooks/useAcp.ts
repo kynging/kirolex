@@ -1554,6 +1554,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 flow: rec.flow ?? (existing as any).flow,
                 // agent 也归记录所有：它决定这条会话有哪些工具，而泳道复用要按它判断能不能复用
                 kiroAgent: rec.kiroAgent ?? existing.kiroAgent,
+                /**
+                 * **这条会话跑在哪台机器上**也归记录所有 —— 和上面 `purpose`/`kiroAgent` 是同一个坑。
+                 *
+                 * 这个合并是按**白名单**抄字段的，没列进来的一律丢掉。实测：主进程确实发了
+                 * `remoteHost`，而侧栏那个 🌐 徽标从来没出现过 —— 因为它在这一步被丢了。
+                 */
+                remoteHost: rec.remoteHost ?? (existing as any).remoteHost,
               });
             } else {
               byId.set(rec.id, {
@@ -1566,6 +1573,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 purpose: rec.purpose,
                 flow: rec.flow,
                 kiroAgent: rec.kiroAgent,
+                remoteHost: rec.remoteHost,
                 timestamp: rec.updatedAt,
               });
             }

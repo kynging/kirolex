@@ -529,3 +529,33 @@ describe('远端机器那一块的形状', () => {
     assert.match(RS, /identityFile: '' \}\)/);
   });
 });
+
+/*
+ * 「我看不到」+「把 remote 的会话的 tag 放到右侧」。
+ *
+ * 看不到的原因有两个，都是实测出来的：
+ *   ① 水化那一步按**白名单**抄字段，`remoteHost` 没列进去 —— 主进程确实发了，渲染层丢了。
+ *      这和代码里已经记过两次的坑是同一个（`purpose` 重启后 🧩 消失、`kiroAgent` 没发出来）。
+ *   ② 那两条测试会话在一个**折叠的项目分组**里（`kx-ui`），展开才看得见。
+ */
+describe('侧栏那个 🌐 徽标真的到得了界面', () => {
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+  const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+
+  test('水化的**两条分支**都要带上 remoteHost（白名单少一个字段就等于没这个功能）', () => {
+    assert.match(HK, /remoteHost: rec\.remoteHost \?\? \(existing as any\)\.remoteHost,/, '已有的会话');
+    assert.match(HK, /remoteHost: rec\.remoteHost,\s*\n\s*timestamp: rec\.updatedAt,/, '新从磁盘读到的会话');
+  });
+
+  test('徽标在右侧那排的**最末**，紧挨删除按钮', () => {
+    const at = SB.indexOf('{session.remoteHost && (');
+    const del = SB.indexOf('className="session-delete-btn"');
+    assert.ok(at > 0 && del > at, '顺序：… → 🌐 → ✕');
+    /* 中间不许再插别的 tag */
+    assert.equal(/session-(crew|schedule)/.test(SB.slice(at, del)), false);
+  });
+
+  test('它和"此刻在发生什么"分开：身份固定，状态会来会走', () => {
+    assert.match(SB, /是这条会话的\*\*身份\*\*/);
+  });
+});

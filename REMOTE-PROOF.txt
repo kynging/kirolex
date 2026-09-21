@@ -1,0 +1,1 @@
+ip-10-0-4-14.ap-northeast-1.compute.internal /home/ec2-user/kirolex-mirror/kx-ui-ee825604

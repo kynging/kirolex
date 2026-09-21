@@ -245,19 +245,6 @@ const SessionItem: React.FC<{
         子代理在跑的标记 —— 「如果有subagent在运行左侧的会话上也应该有一个tag，直到subagent被关掉」。
         计数只算还没 terminated 的那些；名单是 kiro 自己报的（名字 / worker agent / 状态都在 title 里）。
       */}
-      {/*
-        **这一行跑在哪台机器上** —— 远程会话（`docs/DESIGN_remote_sessions.md`）。
-        和 flow 的 tag、子代理计数一样放在右边那排「它现在是什么状态」里。
-        常驻：任何时候都不该去猜这一轮是在哪台机器上跑的 —— 猜错的代价是对着另一台机器的文件下结论。
-      */}
-      {session.remoteHost && (
-        <span
-          className={`session-remote${remoteSync && (remoteSync.state === 'stale' || remoteSync.state === 'conflict') ? ' session-remote-warn' : ''}`}
-          title={syncBadgeTitle(session.remoteHost, remoteSync)}
-        >
-          🌐 {session.remoteHost}{syncBadgeSuffix(remoteSync?.state)}
-        </span>
-      )}
       {crew && (
         <span className="session-crew" title={`${t('{n} subagent(s) running:', { n: crew.count })}\n${crew.title}`}>
           🤖 {crew.count}
@@ -269,6 +256,21 @@ const SessionItem: React.FC<{
           title={scheduleSummary.text}
         >
           {scheduleSummary.paused ? '⏸️' : '⏰'} {scheduleSummary.short}
+        </span>
+      )}
+      {/*
+        **这一行跑在哪台机器上** —— 远程会话（`docs/DESIGN_remote_sessions.md`）。
+        放在右边那排的**最末**（紧挨删除按钮）——「把 remote 的会话的 tag 放到右侧」。
+        它和子代理计数、定时器不同：那两个是"此刻在发生什么"，会来会走；而"这条会话跑在哪台机器上"
+        是这条会话的**身份**，从建立到删除都不变。所以给它一个固定的位置，眼睛每次都往同一处看。
+        常驻：任何时候都不该去猜这一轮在哪台机器上跑 —— 猜错的代价是对着另一台机器的文件下结论。
+      */}
+      {session.remoteHost && (
+        <span
+          className={`session-remote${remoteSync && (remoteSync.state === 'stale' || remoteSync.state === 'conflict') ? ' session-remote-warn' : ''}`}
+          title={syncBadgeTitle(session.remoteHost, remoteSync)}
+        >
+          🌐 {session.remoteHost}{syncBadgeSuffix(remoteSync?.state)}
         </span>
       )}
       <button className="session-delete-btn" onClick={(e) => onDelete(e, session.id)} title={t('Delete')}>
