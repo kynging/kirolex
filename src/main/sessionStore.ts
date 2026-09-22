@@ -88,6 +88,18 @@ export interface SessionRecord {
    *  KiroLex owns `id` (dir key); this maps to the backend session for resume.
    *  Absent on legacy records where id WAS the kiro-cli id (treat id as fallback). */
   cliSessionId?: string;
+  /**
+   * **这条会话的本地工作目录**。
+   *
+   * 记录里原来**没有**这个字段，而渲染层 attach 时三处都硬写 `'~'`
+   * （`loadSession(id, '~', model)`）—— 于是每次重新连接，主进程看到的目录都是家目录。
+   * 本地会话无所谓（它的 cwd 本来就是每会话的临时目录），但远程会话是致命的：
+   * 镜像目录按这个算，结果每次 re-attach 都把**整个家目录**当项目推上远端
+   * （实测两次，5.1 GB / 6.1 GB，凭据在内），而"家目录不能做镜像"那道闸又会把它降级成本地会话。
+   *
+   * 所以目录必须**存在记录里**、以记录为准 —— 渲染层传什么都不该决定一条已存在会话的工作目录。
+   */
+  localDir?: string;
   /** Memory injection bookkeeping (design §6.4). */
   lastMemoryInjection?: { charCount: number; at: number };
   /** Runtime lifecycle; on load, live states are treated as detached. */

@@ -462,9 +462,11 @@ describe('不许把家目录/半个磁盘当镜像', () => {
       每次点开只弹同一句错误（实测踩到）。闸门要挡的是"把凭据推到远端"，不是"让这条对话消失"。
     */
     assert.equal(/这条远程会话没有重新连上：/.test(M), false, '这条死路不许再有');
-    const at = M.indexOf('目录不能做镜像');
+    /* 锚在**代码**那一行上：这几个字在附近的注释里也出现（踩过一次 —— indexOf 命中了注释） */
+    const at = M.indexOf('logger.warn(\'remote\', `attach ${sessionId}: 目录不能做镜像');
     assert.ok(at > 0);
-    const body = M.slice(at - 900, at + 900);
+    /* 窗口给宽些：这一段的注释反复加长过，窄窗口会被注释挤出去（踩过两次） */
+    const body = M.slice(Math.max(0, at - 2000), at + 2000);
     assert.match(body, /profile\.remote = undefined;/);
     assert.match(body, /rec0\.profile\.remote = undefined;/, '记录也要改，否则下次又走这条路');
     assert.match(body, /已改回\*\*本地运行\*\*/, '要说清发生了什么');
@@ -528,5 +530,40 @@ describe('同步进程不许活过 KiroLex', () => {
     const at = M.indexOf("app.on('before-quit'");
     assert.ok(at > 0);
     assert.match(M.slice(at, at + 600), /remoteSync\.cancelAll\(\)/);
+  });
+});
+
+/*
+ * 「那个机器不可能有模型可用性问题，为什么会话不是远程的？」—— 查出来的根因不在模型，
+ * 在**工作目录**：渲染层三处 attach 都硬写 `'~'`（`loadSession(id, '~', model)`），
+ * 所以主进程每次重连看到的都是家目录。
+ *
+ * 后果是双重的，而且两条都发生过：
+ *   ① 镜像目录按它算 → 每次 re-attach 把**整个家目录**推上远端（实测 5.1 GB / 6.1 GB，
+ *      `.aws/credentials` 和 17 把 .pem 在内）；
+ *   ② "家目录不能做镜像"那道闸接着把会话降级成本地 → "我建的远程会话怎么变本地了"。
+ */
+describe('会话的工作目录以记录为准，不是渲染层传的 `~`', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const ST = fs.readFileSync(path.join(process.cwd(), 'src/main/sessionStore.ts'), 'utf8');
+
+  test('记录里有 localDir 这个字段（原来根本没存过工作目录）', () => {
+    assert.match(ST, /localDir\?: string;/);
+    assert.match(ST, /渲染层 attach 时三处都硬写/);
+  });
+
+  test('新建时写进记录', () => {
+    assert.match(M, /rec\.localDir = resolvedCwd;/);
+  });
+
+  test('attach 时**以记录为准**，渲染层给的只作兜底', () => {
+    assert.match(M, /const resolvedCwd = store\.readRecord\(sessionId\)\?\.localDir \|\| askedCwd;/);
+    /* 老会话第一次 attach 之后补写，下次就不靠渲染层 */
+    assert.match(M, /if \(!rec\.localDir\) rec\.localDir = resolvedCwd;/);
+  });
+
+  test('渲染层那三处 `~` 还在（本地会话靠它，不能顺手改动）—— 所以主进程必须自己兜住', () => {
+    const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+    assert.ok((HK.match(/loadSession\([^,]+, '~'/g) || []).length >= 3);
   });
 });

@@ -3272,6 +3272,9 @@ app.whenReady().then(async () => {
     const rec = store.createSession(kiroLexId, profile);
     rec.cliSessionId = cliSessionId;
     rec.executorState = 'attached';
+    /* **本地工作目录进记录** —— 渲染层 attach 时传的是 `'~'`（三处硬写），
+       以它为准的话每次重连都会把家目录当项目（远程会话就是把整个家目录推上远端）。见 `localDir`。 */
+    rec.localDir = resolvedCwd;
     store.writeRecord(rec);
     mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId: kiroLexId, projectId: profile.projectId });
     return { sessionId: kiroLexId };
@@ -5774,7 +5777,19 @@ app.whenReady().then(async () => {
   let firstAttachMarked = false;
   ipcMain.handle('acp:load-session', async (_event, sessionId: string, cwd: string, model: string) => {
     if (!firstAttachMarked) { firstAttachMarked = true; startupMark('attach: first loadSession', `sessionId=${sessionId}`); }
-    const resolvedCwd = cwd === '~' ? os.homedir() : cwd;
+    const askedCwd = cwd === '~' ? os.homedir() : cwd;
+    /*
+      **一条已存在会话的工作目录，以记录为准** ——「为什么会话不是远程的？」查出来的根因。
+
+      渲染层三处 attach 都硬写 `'~'`（`loadSession(id, '~', model)`），所以这里收到的 `cwd`
+      对**任何**会话都是家目录。本地会话无所谓（它的 cwd 本来就是每会话的临时目录），
+      远程会话则是双重灾难：镜像目录按它算 —— 于是每次 re-attach 都把整个家目录推上远端
+      （实测两次，5.1 GB / 6.1 GB，`.aws/credentials` 和 17 把 .pem 都在里面）；
+      而"家目录不能做镜像"那道闸接着把这条会话降级成本地 —— 看起来就是"我建的远程会话怎么变本地了"。
+
+      记录里存了 `localDir` 就用它；没有（老会话）才退回渲染层给的那个。
+    */
+    const resolvedCwd = store.readRecord(sessionId)?.localDir || askedCwd;
     // Never re-attach (and thus recreate the record.json of) a session the user
     // deleted this runtime — prevents a racing startup eager-attach from
     // resurrecting a just-closed chat.
@@ -5960,6 +5975,8 @@ app.whenReady().then(async () => {
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.cliSessionId = cliSessionId;
       rec.executorState = 'attached';
+      /* 老会话第一次 attach 之后也把目录记下来，下一次就不用再靠渲染层传 */
+      if (!rec.localDir) rec.localDir = resolvedCwd;
       /*
         Persist the model that ACTUALLY started. Without this the record keeps
         pointing at a retired model (e.g. claude-opus-5), so EVERY later startup
