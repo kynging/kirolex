@@ -3500,6 +3500,17 @@ app.whenReady().then(async () => {
     let entry = sessionClients.get(sessionId);
     if (!entry) throw new Error('Session not connected');
     logger.info('prompt', `received sessionId=${sessionId} cli=${entry.cliSessionId} busy=${entry.busy}`);
+    /*
+      **你自己写的那段文字** —— 摆渡只看它，别看注入进去的东西（`userPromptText`）。
+
+      实测的账：这一轮往 `prompt` 前面还要塞 memory、运行环境说明、以及 19k 字符的历史快照，
+      而摆渡原来扫的是**拼完之后**的全文。于是 memory 里写着的 `~/Downloads`、历史里出现过的
+      `星辰证券-需求理解纪要-v0.2.md` 全被当成"你这一轮提到的文件"——一条消息刷出 20 条提示、
+      还真的搬了 7 个文件过去。摆渡的全部前提是"**你自己**写出来的路径"，所以在任何注入之前取。
+    */
+    const userPromptText = (prompt || [])
+      .map((b: any) => (typeof b?.text === 'string' ? b.text : ''))
+      .join('\n');
     // EVERY outgoing `file:` reference is resolved to a within-limits copy here.
     // This is the one place all send paths converge -- fresh send, auto-resend,
     // rerun, overwrite, queue drain -- and it is the only reason capping works at
@@ -3928,8 +3939,7 @@ app.whenReady().then(async () => {
             */
             const bridgeDir = localProjectDirOf(sessionId, entry);
             const remoteRoot = entry.cwd;
-            const text = (prompt || []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join('\n');
-            const wanted = mentionedPaths(text).filter((f) => !f.startsWith(`${bridgeDir}/`));
+            const wanted = mentionedPaths(userPromptText).filter((f) => !f.startsWith(`${bridgeDir}/`));
             if (wanted.length) {
               const res = stageFiles(bridgeDir, wanted);
               if (res.staged.length) {
@@ -4019,6 +4029,14 @@ app.whenReady().then(async () => {
             // Surface WHY the turn ended. A non-end_turn reason (max_tokens,
             // refusal, ...) is exactly the "reply stopped mid-sentence with no
             // error" case -- it must not look like a normal completion.
+            /*
+              **收尾时把最后那半行也当成一整行处理** ——「远程调用本地工具」实测踩到的：
+              标记按整行解析（半行会把 URL 截成另一个仍然合法的地址），而模型的回复
+              **最后一行通常没有换行符** —— 实测那一轮的整个回复就是一行
+              `KIROLEX-LOCAL: open https://…`，于是它一直躺在缓冲里，谁都没执行。
+              补一个 `\n` 就是"这一行收完了"。
+            */
+            if (entry.profile.remote?.sshHost) runLocalActions(sessionId, entry, '\n');
             logger.info('prompt', `done sessionId=${sessionId} stopReason=${String(result?.stopReason ?? 'n/a')} produced=${producedOutput}`);
             eventLog.appendEvent(sessionId, {
               ts: Date.now(),

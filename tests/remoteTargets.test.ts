@@ -1444,3 +1444,51 @@ describe('切回本地之后 🌐 必须消失', () => {
     assert.match(HK, /asked\.current\.delete\(s\.sessionId\);/);
   });
 });
+
+/*
+ * 「确保远程 session 在 archive 和恢复的时候也带远程 tag，不要恢复就变成本地的」。
+ *
+ * 实测（CDP 驱动真实例）：归档再恢复之后记录里 `remoteHost=tokyo-ec2`、`localDir` 也没变，
+ * 恢复时的 attach 会把镜像重新登记上（`remoteStatus` 回 `hostLabel: tokyo-ec2`）。
+ * 这一组把"为什么它是对的"钉住 —— 归档这条路碰的东西越少越好。
+ */
+describe('归档 / 恢复不许把远程会话变成本地的', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+
+  test('归档只动 archived 和 projectId —— **不碰 profile.remote**', () => {
+    const at = M.indexOf("ipcMain.handle('acp:archive-session'");
+    const body = M.slice(at, at + 700);
+    assert.ok(at > 0);
+    assert.match(body, /rec\.archived = !!archived;/);
+    assert.match(body, /if \(archived\) rec\.profile\.projectId = undefined;/);
+    assert.equal(/profile\.remote/.test(body), false, '归档不该碰运行位置');
+  });
+
+  test('记录里有远端就发 remoteHost —— 归档与否都一样（侧栏归档组里也要有徽标）', () => {
+    const at = M.indexOf('...(rec.profile?.remote?.sshHost');
+    const arch = M.indexOf('archived: !!rec.archived,');
+    assert.ok(at > 0 && arch > 0, '两个字段都在同一份投影里');
+    /* 投影里没有任何"归档就不发"的条件 */
+    assert.equal(/archived \?[^\n]*remoteHost/.test(M), false);
+  });
+
+  test('恢复时的 attach 报**这条会话真正的工作目录**，不再硬写 `~`', () => {
+    /* 硬写 `'~'` 不是一个选择，是"我不知道"—— 那次据此把整个家目录（含 .aws/credentials
+       和 17 把私钥）推上远端就是这么来的。主进程以记录为准堵住了它，但渲染层继续
+       声称家目录仍然是个随时会被谁再信一次的谎。 */
+    assert.match(HK, /const attachCwdFor = \(sid: string\): string =>/);
+    assert.match(HK, /sessionsRef\.current\.find\(\(s\) => s\.id === sid\)\?\.localDir \|\| '~'/);
+    assert.equal(/loadSession\((sessionId|sid|s\.id), '~'/.test(HK), false, '不许再有硬写的 ~');
+    /* 恢复那条路要真的 attach（否则它顶着红点坐着，镜像也没登记） */
+    const at = HK.indexOf('const archiveSession = useCallback');
+    const body = HK.slice(at, at + 2600);
+    assert.match(body, /await window\.kiroApi\.loadSession\(sessionId, attachCwdFor\(sessionId\)/);
+  });
+
+  test('归档只改 archived/projectId，渲染层那份状态里 remoteHost 留着', () => {
+    const at = HK.indexOf('const archiveSession = useCallback');
+    const body = HK.slice(at, at + 400);
+    assert.match(body, /\{ \.\.\.s, archived, \.\.\.\(archived \? \{ projectId: undefined \} : \{\}\) \}/);
+  });
+});

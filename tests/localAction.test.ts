@@ -99,3 +99,31 @@ describe('接线：边流边认，额度守住，每次都说出来', () => {
     assert.match(M, /但没打开：\$\{err\?\.message \|\| err\}/);
   });
 });
+
+/*
+ * 实测（远程会话真跑了一轮）暴露的两个真 bug —— 都不是解析的问题，是**接线**的问题。
+ */
+describe('实测踩到的两个坑', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('**回复最后一行没有换行符** —— 收尾必须把缓冲里那半行当成一整行处理', () => {
+    /* 实测：整个回复就是一行 `KIROLEX-LOCAL: open https://…`，没有 \n，
+       于是它一直躺在 localLineBuf 里，一轮都结束了也没人执行。 */
+    assert.match(M, /if \(entry\.profile\.remote\?\.sshHost\) runLocalActions\(sessionId, entry, '\\n'\);/);
+    const flush = M.indexOf("runLocalActions(sessionId, entry, '\\n')");
+    const done = M.indexOf("logger.info('prompt', `done sessionId=");
+    assert.ok(flush > 0 && done > flush, '要在这一轮判定结束之前冲一次');
+  });
+
+  test('摆渡只看**你自己写的那段文字**，不看注入进去的 memory / 历史快照', () => {
+    /* 实测：拼完的 prompt 里还有 memory + 运行环境说明 + 19k 字符历史快照，
+       于是 memory 里的 `~/Downloads`、历史里的文件名全被当成"这一轮提到的文件"
+       —— 一条消息刷出 20 条提示，还真的搬了 7 个文件过去。 */
+    assert.match(M, /const userPromptText = \(prompt \|\| \[\]\)/);
+    assert.match(M, /mentionedPaths\(userPromptText\)/);
+    /* 取值必须在任何注入**之前**（注入都是往 prompt 前面塞） */
+    const snap = M.indexOf('const userPromptText =');
+    const inject = M.indexOf('注入运行环境说明');
+    assert.ok(snap > 0 && inject > snap, 'userPromptText 要在注入之前取');
+  });
+});

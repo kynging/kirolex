@@ -127,7 +127,8 @@ describe('接线', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
   test('发送前摆渡 + 把消息里的路径改写成远端那一份', () => {
-    assert.match(M, /const wanted = mentionedPaths\(text\)/);
+    /* 扫的是**你自己写的那段文字**，不是拼完注入之后的全文（见 tests/localAction.test.ts） */
+    assert.match(M, /const wanted = mentionedPaths\(userPromptText\)/);
     assert.match(M, /const res = stageFiles\(bridgeDir, wanted\);/);
     assert.match(M, /t = t\.split\(local\)\.join\(remote\);/);
     /* 拒绝的也要说出来 —— 默默不带过去最糟。但**合成一条**：状态行一次只显示一句，

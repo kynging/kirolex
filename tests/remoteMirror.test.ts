@@ -575,9 +575,14 @@ describe('会话的工作目录以记录为准，不是渲染层传的 `~`', () 
     assert.match(M, /if \(!rec\.localDir && cwd !== '~'\) rec\.localDir = askedCwd;/);
   });
 
-  test('渲染层那三处 `~` 还在（本地会话靠它，不能顺手改动）—— 所以主进程必须自己兜住', () => {
+  test('渲染层现在照实报目录了，但主进程**仍然**要自己兜住（记录为准）', () => {
+    /* 那十几处硬写的 `'~'` 已经换成 `attachCwdFor`（知道就报真的，不知道才 `'~'`）——
+       见 tests/remoteTargets.test.ts「归档 / 恢复不许把远程会话变成本地的」。
+       但这里这条判据不变：**记录是权威**。渲染层报什么都不该决定一条已存在会话的工作目录，
+       否则任何一个漏改的调用点都能把家目录重新变成"项目"。 */
     const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
-    assert.ok((HK.match(/loadSession\([^,]+, '~'/g) || []).length >= 3);
+    assert.equal(/loadSession\([^,]+, '~'/.test(HK), false, '不该再有硬写的 ~');
+    assert.match(M, /let resolvedCwd = store\.readRecord\(sessionId\)\?\.localDir \|\| askedCwd;/);
   });
 });
 

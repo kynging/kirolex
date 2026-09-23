@@ -537,6 +537,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     sid ? sessionsRef.current.find((s) => s.id === sid)?.projectId : undefined;
   const permissionModeForSession = (sid: string | null): 'auto-approve' | 'ask' =>
     sid ? (sessionsRef.current.find((s) => s.id === sid)?.permissionMode || 'auto-approve') : 'auto-approve';
+  /**
+   * **attach 时报这条会话真正的工作目录**，不知道才退回 `'~'`。
+   *
+   * 这里原来**每一处**都硬写 `'~'`（十几处），而那不是一个选择，是"我不知道"。代价实测过一次：
+   * 一条远程会话据此把整个家目录当项目推上了远端 —— 2.6→6.1 GB，里面有 `.aws/credentials`
+   * 和 17 把私钥。主进程后来以记录里的 `localDir` 为准（`SessionRecord.localDir`）把这条路堵住了，
+   * 但渲染层继续声称"家目录"仍然是个随时会被谁再信一次的谎。现在会话状态里有 `localDir`
+   * （侧栏、会话界面那个 📂 都在用），所以照实说。
+   */
+  const attachCwdFor = (sid: string): string =>
+    sessionsRef.current.find((s) => s.id === sid)?.localDir || '~';
 
   // Record/merge a file-touching tool call into a session's file-change list.
   // Deduped by toolCallId (a tool_call then its tool_call_update refer to the
@@ -1472,7 +1483,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         toAttach.map(async (s) => {
           if (cancelled || attachedIdsRef.current.has(s.id)) { clearConnecting(s.id); return; }
           try {
-            await window.kiroApi.loadSession(s.id, '~', modelForSession(s.id));
+            await window.kiroApi.loadSession(s.id, attachCwdFor(s.id), modelForSession(s.id));
             addAttached(s.id);
           } catch {
             // best-effort: cap reached, connect failure, or unloadable session.
@@ -2306,7 +2317,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               if (sessionsRef.current.find((s) => s.id === sid)?.archived) return;
               try {
                 markConnecting(sid);
-                await window.kiroApi.loadSession(sid, '~', modelForSession(sid));
+                await window.kiroApi.loadSession(sid, attachCwdFor(sid), modelForSession(sid));
                 addAttached(sid);
                 if (sid === currentSessionRef.current) setSessionActivity(sid, null);
               } catch {
@@ -2790,7 +2801,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         lastPromptedSessionRef.current = sessionId;
         markConnecting(sessionId); // flash while the executor attaches
         setSessionActivity(sessionId, '正在连接会话…');
-        const res = await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId));
+        const res = await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
         addAttached(sessionId);
         // Deliberately NOT rebuilding here on res.freshBackend. This path runs for
         // EVERY warmed chat at boot, so it burned a model turn per chat the user
@@ -2839,7 +2850,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (!attachedIdsRef.current.has(sessionId)) {
       markConnecting(sessionId);
       try {
-        await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId));
+        await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
         addAttached(sessionId);
       } catch {
         /* 连不上就让它保持冷的：点开它会再试一次 */
@@ -2886,7 +2897,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (!attachedIdsRef.current.has(sessionId)) {
         markConnecting(sessionId);
         try {
-          await window.kiroApi.loadSession(sessionId, '~', activeModel);
+          await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), activeModel);
           addAttached(sessionId);
         } finally {
           clearConnecting(sessionId);
@@ -3174,7 +3185,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // (main resumes its kiro-cli session; the KiroLex id stays stable) and retry once.
         try {
           setSessionActivity(sid, '正在重新连接会话…');
-          await window.kiroApi.loadSession(sid, '~', activeModel);
+          await window.kiroApi.loadSession(sid, attachCwdFor(sid), activeModel);
           setSessionActivity(sid, '已重连，重新发送…');
           await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });
         } catch (retryErr: any) {
@@ -3555,7 +3566,7 @@ ${text}`,
     if (!attachedIdsRef.current.has(sessionId)) {
       markConnecting(sessionId);
       try {
-        await window.kiroApi.loadSession(sessionId, '~', activeModel);
+        await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), activeModel);
         addAttached(sessionId);
       } finally {
         clearConnecting(sessionId);
@@ -3590,7 +3601,7 @@ ${text}`,
         deliveryError = firstError;
       } else {
         try {
-          await window.kiroApi.loadSession(sessionId, '~', activeModel);
+          await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), activeModel);
           addAttached(sessionId);
           await window.kiroApi.prompt(sessionId, prompt, activeModel, projectForSession(sessionId), { ...display, attachments });
         } catch (retryError: any) {
@@ -3895,7 +3906,7 @@ ${text}`,
       // "Session not connected"): if this session isn't attached yet, attach it
       // first, then perform the agent switch.
       if (!attachedIdsRef.current.has(sessionId)) {
-        try { await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId)); addAttached(sessionId); } catch {}
+        try { await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId)); addAttached(sessionId); } catch {}
       }
       const result = await window.kiroApi.switchKiroAgent(sessionId, kiroAgent);
       if (result?.ok) {
@@ -3925,7 +3936,7 @@ ${text}`,
       // Wait for the backend to be connected before switching the model: attach
       // the session first if it isn't live yet, then switch.
       if (!attachedIdsRef.current.has(sessionId)) {
-        try { await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId)); addAttached(sessionId); } catch {}
+        try { await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId)); addAttached(sessionId); } catch {}
       }
       const result = await window.kiroApi.switchModel(sessionId, model);
       // Only the BACKEND decides what is in effect. A non-ok result used to leave
@@ -4014,7 +4025,7 @@ ${text}`,
       // send. Best-effort — if reconnect fails, the next send re-attaches.
       markConnecting(sessionId);
       try {
-        await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId));
+        await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
         addAttached(sessionId);
       } catch {
         /* stays dormant; next send will attach */
@@ -4076,7 +4087,7 @@ ${text}`,
         if (!attachedIdsRef.current.has(sessionId)) {
           markConnecting(sessionId);
           try {
-            await window.kiroApi.loadSession(sessionId, '~', modelForSession(sessionId));
+            await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
             addAttached(sessionId);
           } catch {
             /* next select/send will attach */
@@ -4291,7 +4302,7 @@ ${text}`,
       if (mode) { try { await window.kiroApi.setPrimeMode?.(sid, mode); } catch {} }
       if (!attachedIdsRef.current.has(sid)) {
         try {
-          await window.kiroApi.loadSession(sid, '~', modelForSession(sid));
+          await window.kiroApi.loadSession(sid, attachCwdFor(sid), modelForSession(sid));
           addAttached(sid);
         } catch (err: any) {
           return { ok: false, error: err?.message || 'attach failed' };
