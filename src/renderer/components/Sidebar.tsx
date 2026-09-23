@@ -358,7 +358,12 @@ const ProjectGroup: React.FC<{
         className={`project-header ${isOver && isDropTarget ? 'folder-drop-target' : ''} ${gripDragging ? 'project-header-dragging' : ''}`}
         onClick={() => onToggle(projectKey)}
       >
-        {actionable && (
+        {/*
+          **拖拽把手那一格永远占位** ——「右边的数字应该和 project 的数字对齐」。
+          未分组/已归档没有把手（它们不能重排），原来是整块不渲染，于是这两行比 project 行少一截左缩进，
+          右边的计数也就跟着错开一格。现在没有把手时留一个同宽的空位。
+        */}
+        {actionable ? (
           <span
             ref={setGripRef}
             className="project-drag-handle"
@@ -369,9 +374,16 @@ const ProjectGroup: React.FC<{
           >
             ⋮⋮
           </span>
+        ) : (
+          <span className="project-drag-handle project-drag-handle-placeholder" aria-hidden />
         )}
         <span className="folder-arrow">{collapsed ? '▶' : '▼'}</span>
-        <ProjectFolderIcon />
+        {/*
+          **未分组不要文件夹图标** ——「我觉得未分组不要那个文件夹的 icon 了」：
+          它不是一个文件夹，是"还没归进任何文件夹"的那一堆。图标那一格照样留着，
+          否则名字和右边的计数又会比 project 行错开。
+        */}
+        {actionable ? <ProjectFolderIcon /> : <span className="folder-icon-placeholder" aria-hidden />}
         <span className="folder-name">{name}</span>
         {showCount && <span className="project-count">{sessions.length}</span>}
         {/*
@@ -391,6 +403,32 @@ const ProjectGroup: React.FC<{
           </>
         )}
       </div>
+      {/*
+        **在跑的会话不许被折叠藏起来** ——「那个 AI 的会话还在跑但是左侧没有了」/「为什么 dev 是折叠的」。
+        实测：它被移进 `Dev`，而 `Dev` 是折叠的 —— 一条正在流式输出的会话就这么从侧栏消失了，
+        而"它还在跑"恰恰是你最需要看到它的时候。折叠状态照旧（那是你的选择），
+        但**正在跑的那几条照样渲染出来**。
+      */}
+      {collapsed && sessions.some((s) => statusFor(s.id) === 'streaming' || statusFor(s.id) === 'rebuilding') && (
+        <div className="folder-children folder-children-running">
+          {sessions.filter((s) => statusFor(s.id) === 'streaming' || statusFor(s.id) === 'rebuilding').map((s) => (
+            <SessionItem
+              key={s.id}
+              session={s}
+              isActive={s.id === currentSessionId}
+              sessionStatus={statusFor(s.id)}
+              busyReason={busyFor(s.id)}
+              onSwitch={onSwitch}
+              onContextMenu={onContextMenu}
+              onDelete={(e, id) => { e.stopPropagation(); onDelete(id); }}
+              splitOrder={splitOrder(s.id)}
+              onToggleSplit={onToggleSplit}
+              scheduleSummary={scheduleFor?.(s.id) ?? null}
+              subagents={subagentsFor?.(s.id)}
+            />
+          ))}
+        </div>
+      )}
       {!collapsed && (
         <div className="folder-children">
           {actionable && (

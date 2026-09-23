@@ -1026,9 +1026,13 @@ describe('切换一条已有会话的机器', () => {
   const at = M.indexOf("ipcMain.handle('acp:set-remote-target'");
   const body = M.slice(at, at + 6000);
 
-  test('有一轮在跑就拒绝 —— 切换会把执行器连根拔掉', () => {
+  test('**右键菜单优先于正在跑的任务**：照切，只是明确说那一轮被打断了', () => {
     assert.ok(at > 0, 'IPC 要存在');
-    assert.match(body, /if \(oldEntry\?\.busy\) throw new Error\('这一轮还在跑/);
+    /* 上一版在 busy 时直接拒绝 —— 一条长回合跑着时什么都改不了，而那正是你想改设置的时候 */
+    assert.equal(/throw new Error\('这一轮还在跑 —— 等它结束再切换机器/.test(body), false);
+    assert.match(body, /const interrupted = !!oldEntry\?\.busy;/);
+    assert.match(body, /切换打断了正在跑的那一轮/);
+    assert.match(body, /已产出的内容都在/);
   });
 
   test('**切回本地之前先把远端改动拉干净**，拉不回来就不切', () => {
@@ -1219,16 +1223,15 @@ describe('KiroLex 的提示走状态行；换项目不许杀掉正在跑的一�
     assert.match(HK, /useEffect\(\(\) => \{ setNotice\(null\); \}, \[sessionId\]\);/);
   });
 
-  test('换项目：一轮在跑就拒绝（它会重置执行器，把那一轮连根拔掉）', () => {
+  test('换项目：**不拦**，但一轮在跑时不能在中间 detach（推迟到本轮结束）', () => {
+    /* 这条一开始写成"busy 就拒绝"，而那让人在最想整理侧栏的时候什么都动不了 ——
+       「这些右键菜单应该优先级大于正在跑的任务」。判据改成：记录立刻改，重置推迟。 */
     const at = M.indexOf("ipcMain.handle('acp:move-session'");
-    const body = M.slice(at, at + 1200);
-    assert.match(body, /if \(sessionClients\.get\(sessionId\)\?\.busy\) \{/);
-    assert.match(body, /等它结束再换项目/);
-    /* 拒绝要在写记录和 detach 之前。按**调用**锚 —— `detachExecutor` 这个词在上面的注释里也出现
-       （这个坑今天已经踩过两次：indexOf 命中注释而不是代码）。 */
-    const guard = body.indexOf("sessionClients.get(sessionId)?.busy");
-    assert.ok(guard > 0 && guard < body.indexOf('store.writeRecord('));
-    assert.ok(guard < body.indexOf('detachExecutor(sessionId);'));
+    const body = M.slice(at, at + 2000);
+    assert.match(body, /const busy = !!sessionClients\.get\(sessionId\)\?\.busy;/);
+    assert.match(body, /pendingProjectReset\.add\(sessionId\);/);
+    /* 记录要在"要不要 detach"之前就写掉 —— 分组必须马上就对 */
+    assert.ok(body.indexOf('store.writeRecord(') < body.indexOf('if (busy) {'));
   });
 });
 
@@ -1250,5 +1253,57 @@ describe('项目 id 不能从会话目录推出来', () => {
     assert.equal((M.match(/derivedProjectFor\(/g) || []).length, 3, '定义 1 处 + 两条路');
     assert.equal(/const derived = resolvedCwd === os\.homedir\(\) \? undefined : deriveProjectId\(resolvedCwd\)/.test(M), false,
       '旧判据不许留下 —— 它只挡家目录，会话目录照样会被推成项目');
+  });
+});
+
+/*
+ * 「为什么还是移动不了」的最后一环：水化时**渲染层的旧值优先于磁盘**
+ * （`existing.projectId ?? rec.projectId`）。换项目是先写盘再更新界面，所以磁盘永远是较新的那一份；
+ * 旧值优先的结果是每次水化又把它盖回那个以会话 id 命名的假项目。
+ */
+describe('换项目之后磁盘说了算', () => {
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+
+  test('水化时 projectId **完全**以记录为准，连"未分组"也是', () => {
+    /*
+      两版都错过：
+        ① `existing.projectId ?? rec.projectId` —— 渲染层旧值优先，换完项目一水化就被盖回去；
+        ② `rec.projectId ?? existing.projectId` —— 只在记录**有值**时生效，而"未分组"在记录里是
+           字段不存在，于是又退回旧值（实测：磁盘已是未分组，侧栏还在 Dev）。
+      换项目是先写盘再更新界面，所以直接用磁盘那一份，包括 undefined。
+    */
+    assert.match(HK, /projectId: rec\.projectId,/);
+    assert.equal(/projectId: (existing\.projectId \?\? rec\.projectId|rec\.projectId \?\? existing\.projectId)/.test(HK), false);
+  });
+
+  test('别的字段照旧保留渲染层的值（这里只改 projectId 这一项）', () => {
+    /* 例如 archived / pinned 的合并语义没动 —— 它们不是"先写盘再更新界面"的那类动作 */
+    assert.match(HK, /archived: rec\.archived \?\? existing\.archived,/);
+    assert.match(HK, /pinned: existing\.pinned \?\? rec\.pinned,/);
+  });
+});
+
+/*
+ * 「这些右键菜单应该优先级大于正在跑的任务」+「那个 AI 的会话还在跑但是左侧没有了」。
+ */
+describe('右键菜单不被正在跑的任务挡住；在跑的会话不许被折叠藏起来', () => {
+  test('换项目：busy 时**照改**，只把执行器重置推迟到本轮结束', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('acp:move-session'");
+    const body = M.slice(at, at + 2000);
+    assert.equal(/throw new Error\('这一轮还在跑 —— 等它结束再换项目/.test(body), false, '不许再拦');
+    assert.match(body, /pendingProjectReset\.add\(sessionId\);/);
+    assert.match(body, /deferredReset: true/);
+    /* 欠下的重置要在本轮结束时真的执行 */
+    assert.match(M, /if \(pendingProjectReset\.delete\(sessionId\)\) \{/);
+    assert.match(M, /本轮结束，执行下推的执行器重置/);
+  });
+
+  test('折叠的分组里，正在跑的那几条照样渲染', () => {
+    const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+    assert.match(SB, /\{collapsed && sessions\.some\(\(s\) => statusFor\(s\.id\) === 'streaming' \|\| statusFor\(s\.id\) === 'rebuilding'\)/);
+    assert.match(SB, /folder-children-running/);
+    /* 折叠状态本身不动 —— 那是用户的选择 */
+    assert.match(SB, /折叠状态照旧（那是你的选择）/);
   });
 });

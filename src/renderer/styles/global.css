@@ -7707,3 +7707,21 @@ button, input, select, textarea {
   padding: 2px 4px;
 }
 .session-notice-close:hover { color: var(--text-primary); }
+
+/* 未分组/已归档没有拖拽把手、也不该有文件夹图标，但**那两格要占位** ——
+   不占位的话这两行比 project 行少一截左缩进，右边的计数也跟着错开一格
+   （「右边的数字应该和 project 的数字对齐」）。 */
+.project-drag-handle-placeholder { cursor: default; }
+.folder-icon-placeholder {
+  flex-shrink: 0;
+  display: inline-block;
+  width: 14px;
+  height: 14px;
+}
+
+/* 折叠的分组里，正在跑的那几条照样显示（见 Sidebar 里那段注释）。
+   左边一条竖线表示"这是折叠分组里冒出来的一条"，而不是分组真的展开了。 */
+.folder-children-running {
+  border-left: 2px solid rgba(64,160,220,0.45);
+  margin-left: 10px;
+}

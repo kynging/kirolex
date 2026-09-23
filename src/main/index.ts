@@ -2185,6 +2185,11 @@ function loadFeatureFlags(): Record<string, boolean> {
  * 实测那条会话：一次 `write` 工具失败之后，每次发送都回 `Kiro failed to generate a response`，
  * 8 秒一次连着 6 次，pid 从头到尾没变 —— 而原来的重建判据只认 pid 不一致，所以永远不触发。
  */
+/**
+ * 换项目时这一轮还在跑 → 重置执行器推迟到本轮结束（见 `acp:move-session`）。
+ * 不推迟就得在一轮中间 detach，把正在跑的那一轮连根拔掉；而拒绝换项目又让人在最想整理的时候动不了。
+ */
+const pendingProjectReset = new Set<string>();
 const cliFailStreak = new Map<string, number>();
 /**
  * **这条会话上一次换后端会话是什么时候** ——「我他妈说的是最近那几次 workshop 的」。
@@ -3847,6 +3852,11 @@ app.whenReady().then(async () => {
               因为本地是唯一真相，而 review 读的就是本地文件。拉失败不抛（这一轮已经成了），
               但会留一个"远端有未取回的改动"并在会话里说一句 —— 绝不让人以为本地是新的。
             */
+            /* 换项目时欠下的执行器重置，在这里消化（那时它正忙，不能 detach） */
+            if (pendingProjectReset.delete(sessionId)) {
+              logger.info('session', `本轮结束，执行下推的执行器重置 sessionId=${sessionId}`);
+              detachExecutor(sessionId);
+            }
             /*
               **一轮里没写过文件就不拉** ——「这个任务纯原创，不需要拉东西到本地」。
               纯生成的任务（写文案、答问题）产出就在回复里，远端一个文件都没动，而一次拉是两趟 SSH
@@ -5243,7 +5253,14 @@ app.whenReady().then(async () => {
     localDir?: string,
   ) => {
     const oldEntry = sessionClients.get(sessionId);
-    if (oldEntry?.busy) throw new Error('这一轮还在跑 —— 等它结束再切换机器（切换会把执行器换掉，正在跑的那一轮会丢）。');
+    /*
+      **右键菜单优先于正在跑的任务** ——「这些右键菜单应该优先级大于正在跑的任务」。
+
+      换机器必然换执行器，所以那一轮确实会断。上一版为此直接拒绝，结果一条长回合跑着的时候
+      什么都做不了 —— 而那正是你想改设置的时候。现在照做，只是**明确告诉你那一轮被打断了**：
+      对话内容一条不丢（transcript 已经落盘），断掉的只是这一轮还没产出的部分。
+    */
+    const interrupted = !!oldEntry?.busy;
     if (reconfiguringSessions.has(sessionId)) throw new Error('上一次切换还没完成，稍等。');
 
     const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
@@ -5358,7 +5375,8 @@ app.whenReady().then(async () => {
 
         const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
         sessionNotice(sessionId, `🔀 这条会话从现在开始跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
-          + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`);
+          + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`
+          + (interrupted ? `\n（切换打断了正在跑的那一轮 —— 已产出的内容都在，未完成的那部分没了，需要的话重发一次。）` : ''));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
         mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
         return { ok: true, remoteHost: hostLabelOf(target) };
@@ -6428,14 +6446,28 @@ app.whenReady().then(async () => {
       控制台里是 `Wait for the active turn … to finish`）。
       说清楚比悄悄杀掉一轮好 —— 那一轮的产出没了是不可逆的。
     */
-    if (sessionClients.get(sessionId)?.busy) {
-      throw new Error('这一轮还在跑 —— 等它结束再换项目（换项目会重置执行器，正在跑的那一轮会丢）。');
-    }
+    /*
+      **换项目只是改个标签，不该被一轮跑着的对话卡住** ——「为什么远程 session 换不了 project」。
+
+      上一版在 busy 时直接拒绝（因为 `detachExecutor` 无条件、会把那一轮连根拔掉），结果一条长回合
+      跑着的时候就完全动不了 —— 而那正是你最想整理侧栏的时候。
+      现在：**记录立刻改**（分组马上就对），只把"重置执行器"这一步推迟到这一轮结束。
+      代价是这一轮剩下的部分仍用旧的 memory scope —— 它已经跑了一半，换 scope 反而更怪。
+    */
+    const busy = !!sessionClients.get(sessionId)?.busy;
     const rec = store.readRecord(sessionId);
     if (rec) {
       rec.profile.projectId = projectId ?? undefined;
       rec.archived = false; // moving a chat brings it out of the archive
       store.writeRecord(rec);
+    }
+    if (busy) {
+      /* 这一轮结束再重置：`pendingProjectReset` 由 prompt 的收尾去消化 */
+      pendingProjectReset.add(sessionId);
+      sessionNotice(sessionId, `📁 项目已改为**${projectId || '未分组'}**。这一轮还在跑，`
+        + `所以执行器（memory scope）会在它结束之后再重置 —— 这一轮剩下的部分仍用原来的范围。`);
+      logger.info('session', `移动项目 sessionId=${sessionId} -> ${projectId || '(未分组)'}（执行器重置推迟到本轮结束）`);
+      return { sessionId, projectId: projectId ?? null, deferredReset: true };
     }
     detachExecutor(sessionId); // executor reset -> fresh memory scope on re-attach
     return { sessionId, projectId: projectId ?? null };

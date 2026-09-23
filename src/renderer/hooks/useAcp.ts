@@ -1550,7 +1550,23 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 ...existing,
                 title: existing.title || rec.title || 'New Chat',
                 timestamp: existing.timestamp || rec.updatedAt,
-                projectId: existing.projectId ?? rec.projectId,
+                /*
+                  **磁盘说了算** ——「为什么还是移动不了」的最后一环：这里原来是
+                  `existing.projectId ?? rec.projectId`，也就是渲染层里的旧值优先。于是换项目之后
+                  （主进程已经把 `Dev` 写进记录）水化时又被内存里的旧值盖回去 —— 实测侧栏一直把它
+                  放在那个以会话 id 命名的假项目里，看起来就是"怎么移都移不动"。
+                  换项目这个动作本来就是先写盘再更新界面，所以磁盘永远是较新的那一份。
+                */
+                /*
+                  **磁盘完全说了算，连"未分组"也是** ——「放屁，渲染里面还在 dev 呢」。
+
+                  上一版写成 `rec.projectId ?? existing.projectId`，只在记录里**有值**时生效；
+                  而"未分组"在记录里是**字段不存在**，于是又退回渲染层那个旧值（实测：磁盘已经是
+                  未分组了，侧栏还把它放在 Dev 里）。`??` 表达不了"磁盘说它没有项目"这件事。
+
+                  换项目本来就是先写盘再更新界面，所以这里直接用磁盘那一份 —— 包括 undefined。
+                */
+                projectId: rec.projectId,
                 // The durable record OWNS the model, like archive/pin state below.
                 // Preferring the localStorage copy meant a stale, origin-scoped
                 // value kept being sent as the attach model long after the record
