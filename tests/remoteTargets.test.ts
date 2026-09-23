@@ -1190,3 +1190,44 @@ describe('本地记录不推到远端', () => {
     assert.match(b, /附件在 `\/r\/\.kirolex-sessions\/s1`/);
   });
 });
+
+/*
+ * 「你自己写的那个提示什么的不要中断弄回对话框」+「为什么远程 session 换不了 project」。
+ */
+describe('KiroLex 的提示走状态行；换项目不许杀掉正在跑的一轮', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+
+  test('提示只发事件、**不写进 transcript**', () => {
+    assert.match(M, /function sessionNotice\(sessionId: string, text: string\): void \{/);
+    assert.match(M, /mainWindow\?\.webContents\.send\('session:notice'/);
+    /* 远程那几处（同步进度/冲突、agent 缺 MCP、模型降级、换机器、退回本地）都改走它了 */
+    assert.ok((M.match(/sessionNotice\(/g) || []).length >= 6);
+    /* 而"KiroLex 说的话不许发给模型"那条判据还在（历史里已经写进去的那些照旧要过滤） */
+    assert.match(M, /\.filter\(modelFacing\)/);
+  });
+
+  test('界面上在**输入框上方**，能关、会自己消失（⚠️ 留久一点）', async () => {
+    assert.match(CA, /\{sessionNotice && \(/);
+    assert.ok(CA.indexOf('className={`session-notice') < CA.indexOf('<ChatInputBox'), '要在输入框上面');
+    const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useSessionNotice.ts'), 'utf8');
+    assert.match(HK, /const FADE_MS = 12_000;/);
+    assert.match(HK, /const WARN_MS = 45_000;/);
+    /* 只显示当前会话的 —— 别的会话的进度不该盖住你正在看的 */
+    assert.match(HK, /d\.sessionId !== sessionId/);
+    /* 换会话要清掉，否则上一条的提示看起来像这条的 */
+    assert.match(HK, /useEffect\(\(\) => \{ setNotice\(null\); \}, \[sessionId\]\);/);
+  });
+
+  test('换项目：一轮在跑就拒绝（它会重置执行器，把那一轮连根拔掉）', () => {
+    const at = M.indexOf("ipcMain.handle('acp:move-session'");
+    const body = M.slice(at, at + 1200);
+    assert.match(body, /if \(sessionClients\.get\(sessionId\)\?\.busy\) \{/);
+    assert.match(body, /等它结束再换项目/);
+    /* 拒绝要在写记录和 detach 之前。按**调用**锚 —— `detachExecutor` 这个词在上面的注释里也出现
+       （这个坑今天已经踩过两次：indexOf 命中注释而不是代码）。 */
+    const guard = body.indexOf("sessionClients.get(sessionId)?.busy");
+    assert.ok(guard > 0 && guard < body.indexOf('store.writeRecord('));
+    assert.ok(guard < body.indexOf('detachExecutor(sessionId);'));
+  });
+});

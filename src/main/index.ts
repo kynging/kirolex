@@ -1384,8 +1384,24 @@ const diagHost = (remote?: RemoteTarget): HostOps => hostFor(remote, { buildSshA
  * 本地会话从不注册进来，所以这里加的每一行对本地路径都是死代码 —— 这是故意的：
  * 「远程要能和本地共存」，共存的前提是本地那条路一个字节都没变。
  */
+/**
+ * **KiroLex 自己的提示走状态行，不进对话** ——「你自己写的那个提示什么的不要中断弄回对话框」。
+ *
+ * 这些话（⏳ 正在推/拉、⚠️ 本地不是最新的/有冲突、🔀 换了机器）是**对你说的**，不是对话内容：
+ * 写进 transcript 的代价有三样 —— 打断对话的读法、把 transcript 撑大（远程会话里它每轮都要推）、
+ * 以及"KiroLex 说的话别发给模型"那条规则要一直靠过滤兜着（那个坑今天已经踩过一次）。
+ *
+ * 所以它们只发事件，界面显示在输入框上方、自己会消失。
+ */
+function sessionNotice(sessionId: string, text: string): void {
+  try {
+    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now() });
+  } catch { /* 提示永远不能让主流程失败 */ }
+  logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
+}
+
 const remoteSync = new RemoteSyncManager({
-  note: (sessionId, text) => { noteInSession(sessionId, text); },
+  note: (sessionId, text) => { sessionNotice(sessionId, text); },
   log: (level, message) => logger[level]('remote', message),
   /* 同步状态给界面：`stale`（本地不是最新的）和 `conflict` 必须看得见，不能只写在日志里 */
   onStatus: (status) => { mainWindow?.webContents.send('remote:sync', status); },
@@ -1529,7 +1545,7 @@ async function syncKiroAgent(sessionId: string, remote: RemoteTarget, agent?: st
   }
   if (check.missingCommands.length) {
     /* 这是降级不是换 agent，所以不拦；但必须说出来 —— 否则"这个 agent 的工具怎么不工作"无从查 */
-    noteInSession(sessionId, `⚠️ agent「${agent}」的这些 MCP 命令在 ${remote.sshHost} 上没有：`
+    sessionNotice(sessionId, `⚠️ agent「${agent}」的这些 MCP 命令在 ${remote.sshHost} 上没有：`
       + `${check.missingCommands.map((c) => `\`${c}\``).join('、')}。`
       + `kiro-cli 不会报错，只会少掉这些工具 —— 需要的话在那台机器上装好再重开这条会话。`);
     logger.warn('remote', `agent ${agent} 缺 MCP 命令：${check.missingCommands.join(', ')}`);
@@ -1592,7 +1608,7 @@ async function remotePreflight(remote: RemoteTarget): Promise<string[]> {
 function pickRemoteModel(sessionId: string, wanted: string, models: string[], host: string): string {
   if (!models.length || models.includes(wanted)) return wanted;
   const fallback = MODEL_FALLBACK_ORDER.find((m) => models.includes(m)) || models.find((m) => m !== 'auto') || 'auto';
-  noteInSession(sessionId, `⚠️ ${host} 上没有模型「${wanted}」，这条会话改用「${fallback}」。`
+  sessionNotice(sessionId, `⚠️ ${host} 上没有模型「${wanted}」，这条会话改用「${fallback}」。`
     + `（远端可用：${models.slice(0, 8).join('、')}${models.length > 8 ? '…' : ''}）`
     + `kiro-cli 对这种情况是静默退回默认模型的，所以这里明说一句。`);
   logger.warn('remote', `模型 ${wanted} 在 ${host} 上没有 -> 用 ${fallback}`);
@@ -5270,7 +5286,7 @@ app.whenReady().then(async () => {
       store.writeRecord(rec);
       remoteSync.forget(sessionId);
       const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
-      noteInSession(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
+      sessionNotice(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
         + `它现在没有连着，所以没有执行器要换；对话一条都没动。`);
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
       mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
@@ -5324,7 +5340,7 @@ app.whenReady().then(async () => {
         restoreContextAfterExecutorSwap(sessionId, 'switch-remote-target');
 
         const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
-        noteInSession(sessionId, `🔀 这条会话从现在开始跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
+        sessionNotice(sessionId, `🔀 这条会话从现在开始跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
           + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`);
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
         mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
@@ -6085,7 +6101,7 @@ app.whenReady().then(async () => {
             rec0.profile.remote = undefined;
             store.writeRecord(rec0);
           }
-          noteInSession(sessionId, `⚠️ 这条会话已改回**本地运行**（原来指向 ${host}）。`
+          sessionNotice(sessionId, `⚠️ 这条会话已改回**本地运行**（原来指向 ${host}）。`
             + `原因：${refusal}\n对话内容一条都没动 —— 本地一直是唯一真相。`
             + `想在远端跑的话，在一个具体的项目目录里新建一条远程会话。`);
         } else {
@@ -6388,6 +6404,16 @@ app.whenReady().then(async () => {
   // so the conversation is preserved. Unlike assign-project this is not
   // write-once — it is an explicit user move.
   ipcMain.handle('acp:move-session', async (_event, sessionId: string, projectId: string | null) => {
+    /*
+      **一轮在跑的时候不许换项目** ——「为什么远程 session 换不了 project」。
+      换项目要重置执行器（换 memory scope），而 `detachExecutor` 是无条件的：跑着的那一轮会被
+      连根拔掉，界面上的表现就是"点了没反应 / 换不了"（实测那条会话当时正有一轮在跑，
+      控制台里是 `Wait for the active turn … to finish`）。
+      说清楚比悄悄杀掉一轮好 —— 那一轮的产出没了是不可逆的。
+    */
+    if (sessionClients.get(sessionId)?.busy) {
+      throw new Error('这一轮还在跑 —— 等它结束再换项目（换项目会重置执行器，正在跑的那一轮会丢）。');
+    }
     const rec = store.readRecord(sessionId);
     if (rec) {
       rec.profile.projectId = projectId ?? undefined;

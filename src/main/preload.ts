@@ -358,6 +358,17 @@ contextBridge.exposeInMainWorld('kiroApi', {
    */
   setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string) =>
     ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir),
+  /**
+   * **KiroLex 自己对你说的一句话**（推/拉进度、冲突、换机器…）。
+   *
+   * 这些不进 transcript：它们不是对话内容，写进去会打断对话的读法、把 transcript 撑大
+   * （远程会话每轮都要推它），还得靠"别发给模型"那条过滤一直兜着。界面显示在输入框上方、自动消失。
+   */
+  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('session:notice', handler);
+    return () => ipcRenderer.removeListener('session:notice', handler);
+  },
   /** 选一个项目目录（切到远端时用）。 */
   remotePickDir: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-dir'),
   /**

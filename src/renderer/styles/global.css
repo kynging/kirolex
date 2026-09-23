@@ -7675,3 +7675,35 @@ button, input, select, textarea {
   box-shadow: 0 8px 24px rgba(0, 0, 0, 0.4);
   z-index: 3001;
 }
+
+/* KiroLex 自己对你说的那一句：输入框上方一条窄带，不进对话。
+   `⚠️` 那类换色 —— 它影响你接下来的判断（"本地不是最新的，先别 review"）。 */
+.session-notice {
+  display: flex;
+  align-items: flex-start;
+  gap: 8px;
+  margin: 0 12px 6px;
+  padding: 6px 10px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: rgba(64,160,220,0.10);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.5;
+}
+.session-notice.warn {
+  background: rgba(220,120,60,0.14);
+  border-color: rgba(220,120,60,0.45);
+}
+.session-notice-text { flex: 1 1 auto; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.session-notice-close {
+  flex-shrink: 0;
+  background: none;
+  border: 0;
+  color: var(--text-muted);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 1;
+  padding: 2px 4px;
+}
+.session-notice-close:hover { color: var(--text-primary); }

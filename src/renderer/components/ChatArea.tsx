@@ -21,6 +21,7 @@ import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { useRemoteSyncFor } from '../hooks/useRemoteSync';
+import { useSessionNotice } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
@@ -2458,6 +2459,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * 状态里带着 hostLabel，而本地会话根本没有状态 —— 所以这个值有就是远程、没有就是本地。
    * 显示时去掉 `user@`：那一段不是用来区分机器的，而侧栏/面板都很窄。
    */
+  const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
   const remoteStatus = useRemoteSyncFor(currentSessionId || undefined, true);
   const remoteHostLabel = remoteStatus?.hostLabel?.replace(/^[^@]*@/, '');
   const [isDragOver, setIsDragOver] = useState(false);
@@ -3681,6 +3683,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   request={permissionRequest}
                   onRespond={onRespondPermission}
                 />
+              )}
+              {/*
+                **KiroLex 自己对你说的那一句**（⏳ 正在推/拉、⚠️ 本地不是最新的、🔀 换了机器）。
+                在输入框**上方**、不进对话：它不是对话内容，写进 transcript 会打断读法、
+                把 transcript 撑大（远程会话每轮都要推它），还得靠"别发给模型"那条过滤一直兜着。
+                自己会消失（⚠️ 留久一点，它影响你接下来的判断）。
+              */}
+              {sessionNotice && (
+                <div className={`session-notice${/⚠️/.test(sessionNotice.text) ? ' warn' : ''}`}>
+                  <span className="session-notice-text">{sessionNotice.text}</span>
+                  <button className="session-notice-close" onClick={dismissNotice} title="关掉">✕</button>
+                </div>
               )}
               <ChatInputBox
                 sessionId={currentSessionId}
