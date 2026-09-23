@@ -370,7 +370,11 @@ describe('同步慢了要在会话里说话，而且 Stop 要掐得动', () => {
     const RM = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteMirror.ts'), 'utf8');
     assert.match(RM, /encoding: 'utf8', signal \}/);
     assert.match(RM, /this\.inFlight\?\.abort\(\)/);
-    /* 三次 rsync（推、dry-run、正式拉）都要走可中断那条 */
-    assert.equal((RM.match(/runCancellable\('rsync'/g) || []).length, 3);
+    /* **每一次** rsync 都要走可中断那条（推 / dry-run / 正式拉 / 本地没改时的快路径）——
+       钉数量会随出口增加而撞，所以钉的是"没有一处漏掉" */
+    const all = (RM.match(/'rsync',\s*(push|pull)Args/g) || []).length;
+    const cancellable = (RM.match(/runCancellable\('rsync'/g) || []).length;
+    assert.equal(cancellable, all, `${all} 处 rsync，只有 ${cancellable} 处可中断`);
+    assert.ok(all >= 4);
   });
 });

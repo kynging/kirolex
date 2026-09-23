@@ -587,19 +587,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * 直接在这里拿列表、在这里调 IPC：这个动作只有右键菜单用，从 App 一层层传 prop 只会多两处
    * 可以漏掉的地方（`remoteHost` 那次就是在水化的白名单里漏掉的）。
    *
-   * 目录的处理顺序是刻意的：**先让主进程用记录里的目录试**，只有它说"没有目录"时才弹选择框 ——
-   * 已经有项目目录的会话不该每次都被问一遍。
+   * **不问目录**：有项目的会话镜像它的项目目录，没项目的镜像它自己的会话目录（和本地那条路一样）——
+   * "必须先指定一个项目目录"是上一版加错的要求，把"必须镜像点什么"和"必须有个项目"混成了一件事。
    */
   const remoteTargets = useRemoteTargets().targets;
   const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
     const api = (window as any).kiroApi;
     if (!api?.setRemoteTarget) return;
-    let r = await api.setRemoteTarget(sessionId, remoteId).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
-    if (!r?.ok && remoteId && /项目目录/.test(String(r?.error || ''))) {
-      const picked = await api.remotePickDir?.();
-      if (!picked?.path) return;   // 取消了就什么都不做
-      r = await api.setRemoteTarget(sessionId, remoteId, picked.path).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
-    }
+    const r = await api.setRemoteTarget(sessionId, remoteId)
+      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */
     if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '切换失败'));
   };

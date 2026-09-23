@@ -121,6 +121,13 @@ interface SessionEntry {
    */
   toolsThisTurn?: number;
   /**
+   * **这一轮有没有工具可能写过文件**（只远程会话用）。
+   *
+   * 纯生成的任务（写文案、答问题）远端一个文件都没动，而一次拉是两趟 SSH 往返、实测 5–7 秒 ——
+   * 没必要挂在每一轮的尾巴上。判据用的就是防抖拉那个（判宽不判窄：疑似写过就拉）。
+   */
+  remoteWroteThisTurn?: boolean;
+  /**
    * **这一轮最大的一次工具输出有多少字符**（未裁剪的原始长度）——「好像 curl 那个大 json 的时候断掉了」。
    *
    * kiro-cli 把工具输出放在 `tool_call_update` 的 content 里，KiroLex 自己存盘时会裁
@@ -2252,6 +2259,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           在一轮**进行中**就看得到改动的那一半；只在一轮结束时拉的话，界面会一直显示上一版。
         */
         if (remoteSync.isRemote(sessionId) && toolMayHaveWritten(u?.title || u?.kind, u?.rawInput)) {
+          entry.remoteWroteThisTurn = true;
           remoteSync.pullSoon(sessionId);
         }
         const previous = entry.fileChanges.find((change) => change.toolCallId === toolCallId);
@@ -3202,7 +3210,7 @@ app.whenReady().then(async () => {
       throw new Error('All live sessions are busy; cannot start another right now.');
     }
     const sessionDir = getSessionDir(kiroLexId);
-    const resolvedCwd = cwd === '~' ? os.homedir() : cwd;
+    let resolvedCwd = cwd === '~' ? os.homedir() : cwd;
     const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
     /*
       feature flag 关着的时候一条远程会话都建不起来 —— 主路上那几句同步代码就是死代码。
@@ -3251,6 +3259,14 @@ app.whenReady().then(async () => {
       那一轮已经等了几分钟、而且人根本不知道在等什么。
     */
     if (profile.remote?.sshHost) {
+      /*
+        没归项目的会话，本地 cwd 就是它自己的会话目录 —— 远程照办（镜像那一份就够，
+        history.md 和附件本来就在里面）。所以"家目录"在这里不是错误，只是"没有项目"的表现形式。
+      */
+      if (resolvedCwd === os.homedir()) {
+        resolvedCwd = sessionDir;
+        logger.info('remote', `新建远程会话没有项目目录 -> 镜像会话目录 ${sessionDir}`);
+      }
       const refusal = mirrorRefusal(resolvedCwd, os.homedir());
       if (refusal) throw new Error(`这条远程会话没有建立：${refusal}`);
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
@@ -3603,6 +3619,7 @@ app.whenReady().then(async () => {
           // forever: a turn killed mid-tool never sends the closing update.
           entry.openToolCalls?.clear();
           entry.toolsThisTurn = 0;       // 这一轮的工具计数从零开始（自动重试的安全闸）
+          entry.remoteWroteThisTurn = false;   // 远程：这一轮有没有工具写过文件（决定收尾要不要拉）
           entry.maxToolOutputThisTurn = 0;
           entry.wedgeNote = undefined;   // never let one turn's note reach another
           let noticeSent = false;
@@ -3771,7 +3788,17 @@ app.whenReady().then(async () => {
               因为本地是唯一真相，而 review 读的就是本地文件。拉失败不抛（这一轮已经成了），
               但会留一个"远端有未取回的改动"并在会话里说一句 —— 绝不让人以为本地是新的。
             */
-            await remoteSync.afterTurn(sessionId);
+            /*
+              **一轮里没写过文件就不拉** ——「这个任务纯原创，不需要拉东西到本地」。
+              纯生成的任务（写文案、答问题）产出就在回复里，远端一个文件都没动，而一次拉是两趟 SSH
+              往返（dry-run + 正式拉），实测 5–7 秒 —— 白加在每一轮的尾巴上。
+              判据就是防抖拉用的那个（`toolMayHaveWritten`，判宽不判窄）：只要疑似写过就照旧拉。
+            */
+            if (entry.remoteWroteThisTurn) {
+              await remoteSync.afterTurn(sessionId);
+            } else if (remoteSync.isRemote(sessionId)) {
+              logger.info('remote', `这一轮没有工具写文件，跳过收尾同步 sessionId=${sessionId}`);
+            }
             const producedOutput = !!(entry.assistantBuf || entry.fileChanges.length);
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             // The request was accepted and answered, so the snapshot it carried IS
@@ -5177,11 +5204,20 @@ app.whenReady().then(async () => {
       }
     }
 
-    const nextLocalDir = target
-      ? (localDir || store.readRecord(sessionId)?.localDir || oldEntry.localDir || '')
-      : (localDir || store.readRecord(sessionId)?.localDir || oldEntry.localDir || getSessionDir(sessionId));
+    /*
+      **没有项目目录不是问题** ——「为什么还需要什么具体项目目录啊」。
+
+      本地那条没归项目的会话，cwd 用的就是它自己的会话目录（`~/.kirolex/sessions/<id>/`）。
+      远程没有任何理由多要一个目录：镜像同一个东西就行（它本来就在推 —— history.md 和附件都在里面）。
+      上一版在这里要求"必须指定一个项目目录"，那是我把"必须镜像点什么"和"必须有个项目"混成了一件事。
+
+      家目录那道闸仍然要过 —— 只有一种情况会撞上它：目录真的是家目录（渲染层传 `'~'` 的那条老路）。
+    */
+    const nextLocalDir = localDir
+      || store.readRecord(sessionId)?.localDir
+      || oldEntry.localDir
+      || getSessionDir(sessionId);
     if (target) {
-      if (!nextLocalDir) throw new Error('这条会话还没有项目目录 —— 切到远端要先指定一个（远端要镜像的就是它）。');
       const refusal = mirrorRefusal(nextLocalDir, os.homedir());
       if (refusal) throw new Error(refusal);
     }
@@ -5900,7 +5936,7 @@ app.whenReady().then(async () => {
 
       记录里存了 `localDir` 就用它；没有（老会话）才退回渲染层给的那个。
     */
-    const resolvedCwd = store.readRecord(sessionId)?.localDir || askedCwd;
+    let resolvedCwd = store.readRecord(sessionId)?.localDir || askedCwd;
     // Never re-attach (and thus recreate the record.json of) a session the user
     // deleted this runtime — prevents a racing startup eager-attach from
     // resurrecting a just-closed chat.
@@ -5982,6 +6018,8 @@ app.whenReady().then(async () => {
         建**新**会话那一步仍然是硬拒绝：那时候还没有任何历史，明确报错比悄悄换目标好。
       */
       if (profile.remote?.sshHost) {
+        /* 没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录，和本地那条路一致 */
+        if (resolvedCwd === os.homedir()) resolvedCwd = getSessionDir(sessionId);
         const refusal = mirrorRefusal(resolvedCwd, os.homedir());
         if (refusal) {
           logger.warn('remote', `attach ${sessionId}: 目录不能做镜像（${refusal}）—— 这条会话退回本地`);

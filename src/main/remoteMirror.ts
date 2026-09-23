@@ -501,13 +501,30 @@ export class RemoteMirror {
    */
   async pull(): Promise<PullResult> {
     const t0 = Date.now();
+    /*
+      **本地没改过 → 不可能有冲突 → 省掉那趟 dry-run。**
+      冲突的定义是"两边都改了同一个文件"，所以本地这半边只要没动过，结论就已经定了。
+      一趟 rsync 就是一次 SSH 握手（实测拉一次 5–7 秒，两趟就是双倍），而"这一轮什么都没改"
+      恰恰是最常见的情况 —— 纯生成的任务一个文件都不动。
+    */
+    const changedBefore = this.lastPush
+      ? locallyChanged(this.lastPush, snapshotDir(this.localDir, this.excludes))
+      : [];
+    if (!changedBefore.length) {
+      const only = await this.runCancellable('rsync', pullArgs(this.spec()), SYNC_TIMEOUT_MS);
+      if (only.code !== 0) {
+        return { ok: false, error: rsyncError(only.stderr, only.code), changed: [], conflicts: [], ms: Date.now() - t0 };
+      }
+      this.lastPush = snapshotDir(this.localDir, this.excludes);
+      /* 没有 dry-run 就不知道**具体**哪些文件被写了 —— 这个信息只用来写日志，不值一趟往返 */
+      return { ok: true, changed: [], conflicts: [], ms: Date.now() - t0 };
+    }
     const dry = await this.runCancellable('rsync', pullArgs(this.spec({ dryRun: true })), SYNC_TIMEOUT_MS);
     if (dry.code !== 0) {
       return { ok: false, error: rsyncError(dry.stderr, dry.code), changed: [], conflicts: [], ms: Date.now() - t0 };
     }
     const incoming = parseIncoming(dry.stdout);
-    const changed = this.lastPush ? locallyChanged(this.lastPush, snapshotDir(this.localDir, this.excludes)) : [];
-    const conflicts = conflictsBetween(incoming, changed);
+    const conflicts = conflictsBetween(incoming, changedBefore);
 
     const real = await this.runCancellable('rsync', pullArgs(this.spec({ skip: conflicts })), SYNC_TIMEOUT_MS);
     if (real.code !== 0) {

@@ -231,14 +231,16 @@ describe('RemoteMirror：拉 + 冲突分流', () => {
     assert.equal(fs.readFileSync(path.join(dir, 'c.txt'), 'utf8'), 'keep-LOCAL', '你的版本一个字都不能动');
   });
 
-  test('没冲突时不做多余的事', async () => {
+  test('没冲突时不做多余的事（本地没改过时连 dry-run 都省了）', async () => {
     const dir = setup();
     const { io, cmds } = fakeIo((c) => (c.includes('--dry-run') ? { stdout: '>f.st.... a.txt' } : {}));
     const m = new RemoteMirror({ remote, localDir: dir, remoteDir: '/r/p', sshCommand: SSHC, io });
     await m.push();
     const r = await m.pull();
     assert.deepEqual(r.conflicts, []);
-    assert.deepEqual(r.changed, ['a.txt']);
+    /* 快路径：没 dry-run 就不知道**具体**哪些文件被写了，而那个信息只用来写日志，不值一趟 SSH */
+    assert.deepEqual(r.changed, []);
+    assert.equal(cmds.filter((c) => c.includes('--dry-run')).length, 0);
     assert.equal(cmds.filter((c) => c.some((x) => x.endsWith('.remote'))).length, 0);
   });
 
@@ -267,10 +269,15 @@ describe('RemoteMirror：拉 + 冲突分流', () => {
     const dir = setup();
     const { io, cmds } = fakeIo((c) => (c.includes('--dry-run') ? { code: 255, stderr: 'ssh: connect timeout' } : {}));
     const m = new RemoteMirror({ remote, localDir: dir, remoteDir: '/r/p', sshCommand: SSHC, io });
+    await m.push();
+    /* **先造一个本地改动**：没有本地改动时走的是快路径（不 dry-run），那条路测的是别的事 */
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'changed locally');
     const r = await m.pull();
     assert.equal(r.ok, false);
     assert.match(r.error!, /connect timeout/);
-    assert.equal(cmds.filter((c) => c[0] === 'rsync').length, 1, '只有那次 dry-run');
+    const pulls = cmds.filter((c) => c[0] === 'rsync' && c[c.length - 2] === 'ec2-user@1.2.3.4:/r/p/');
+    assert.equal(pulls.length, 1, '只有那次 dry-run，没有真的拉');
+    assert.ok(pulls[0].includes('--dry-run'));
   });
 
   test('一次同步的上限够一个大仓库第一次全量推', () => {
@@ -503,8 +510,9 @@ describe('rsync 的错误要说真话', () => {
 
   test('三处失败出口都走它', () => {
     const RM = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteMirror.ts'), 'utf8');
-    assert.equal((RM.match(/rsyncError\(/g) || []).length, 4, '定义 1 处 + 用 3 处');
-    assert.equal(/firstLine\(/.test(RM), false, '老的"取第一行"不许留下');
+    /* 数量会随出口增加（快路径又多了一个），钉的是"**每个**失败出口都走它" */
+    assert.ok((RM.match(/rsyncError\(/g) || []).length >= 5);
+    assert.equal(/error: firstLine\(/.test(RM), false, '老的"取第一行"不许留下');
   });
 });
 
@@ -557,7 +565,8 @@ describe('会话的工作目录以记录为准，不是渲染层传的 `~`', () 
   });
 
   test('attach 时**以记录为准**，渲染层给的只作兜底', () => {
-    assert.match(M, /const resolvedCwd = store\.readRecord\(sessionId\)\?\.localDir \|\| askedCwd;/);
+    /* `let` 不是 `const`：没项目的会话后面还会把它换成会话目录（见"没有项目目录不是问题"） */
+    assert.match(M, /let resolvedCwd = store\.readRecord\(sessionId\)\?\.localDir \|\| askedCwd;/);
     /*
       老会话补写，但**只在渲染层给了具体目录时**才写：`'~'` 是它的默认值，不是这条会话的目录。
       上一版把它当真存了下来 —— 实测一次重启就给 6 条会话钉上 `/Users/keyinan`，
@@ -569,5 +578,50 @@ describe('会话的工作目录以记录为准，不是渲染层传的 `~`', () 
   test('渲染层那三处 `~` 还在（本地会话靠它，不能顺手改动）—— 所以主进程必须自己兜住', () => {
     const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
     assert.ok((HK.match(/loadSession\([^,]+, '~'/g) || []).length >= 3);
+  });
+});
+
+/*
+ * 「这个任务纯原创，不需要拉东西到本地」—— 两处省掉不必要的往返。
+ */
+describe('不该拉的时候别拉', () => {
+  test('本地没改过 → 不可能有冲突 → 省掉那趟 dry-run（一趟 SSH 握手）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nopull-'));
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+    const cmds: string[][] = [];
+    const io = { async run(file: string, args: string[]) { cmds.push([file, ...args]); return { code: 0, stdout: '', stderr: '' }; } };
+    const m = new RemoteMirror({ remote, localDir: dir, remoteDir: '/r/p', sshCommand: SSHC, io });
+    await m.push();
+    const r = await m.pull();
+    assert.equal(r.ok, true);
+    assert.equal(cmds.filter((c) => c.includes('--dry-run')).length, 0, '本地没动过，不需要试跑');
+    assert.equal(cmds.filter((c) => c[0] === 'rsync' && !c.includes('--dry-run')).length, 2, '推 1 次 + 拉 1 次');
+  });
+
+  test('本地改过就照旧先 dry-run（冲突判定的另一半靠它）', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'nopull2-'));
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'x');
+    const cmds: string[][] = [];
+    const io = {
+      async run(file: string, args: string[]) {
+        cmds.push([file, ...args]);
+        return { code: 0, stdout: args.includes('--dry-run') ? '>f.st.... a.txt' : '', stderr: '' };
+      },
+    };
+    const m = new RemoteMirror({ remote, localDir: dir, remoteDir: '/r/p', sshCommand: SSHC, io });
+    await m.push();
+    fs.writeFileSync(path.join(dir, 'a.txt'), 'changed locally');
+    const r = await m.pull();
+    assert.equal(cmds.filter((c) => c.includes('--dry-run')).length, 1);
+    assert.deepEqual(r.conflicts, ['a.txt'], '两边都改了 → 还是要挡住');
+  });
+
+  test('接线：一轮里没有工具写文件就跳过收尾同步', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /entry\.remoteWroteThisTurn = true;/);
+    assert.match(M, /if \(entry\.remoteWroteThisTurn\) \{\s*\n\s*await remoteSync\.afterTurn\(sessionId\);/);
+    assert.match(M, /这一轮没有工具写文件，跳过收尾同步/);
+    /* 每轮开始要清零，否则上一轮的结论会一直生效 */
+    assert.match(M, /entry\.remoteWroteThisTurn = false;/);
   });
 });

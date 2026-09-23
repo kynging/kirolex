@@ -1036,9 +1036,17 @@ describe('切换一条已有会话的机器', () => {
     assert.match(body, /先不切回本地 —— 切了那份工作就留在那台机器上了/);
   });
 
-  test('切到远端要有具体目录，且照样过家目录那道闸', () => {
-    assert.match(body, /还没有项目目录 —— 切到远端要先指定一个/);
+  test('**没有项目目录不是问题** —— 镜像它自己的会话目录，和本地那条路一样', () => {
+    /* 上一版在这里要求"必须指定一个项目目录"，那是把"必须镜像点什么"和"必须有个项目"混成了一件事 */
+    assert.equal(/还没有项目目录 —— 切到远端要先指定一个/.test(body), false, '这个要求不该再有');
+    assert.match(body, /\|\| getSessionDir\(sessionId\);/);
+    /* 家目录那道闸还在 —— 只有"目录真的是家目录"时才撞上 */
     assert.match(body, /const refusal = mirrorRefusal\(nextLocalDir, os\.homedir\(\)\);/);
+  });
+
+  test('新建 / attach 两条路也一样：没项目就用会话目录，不是拒绝', () => {
+    assert.match(M, /新建远程会话没有项目目录 -> 镜像会话目录/);
+    assert.match(M, /没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录/);
   });
 
   test('换机器 = 换进程：起新后端会话 + 逐段重建 + 镜像登记跟着走', () => {
@@ -1063,9 +1071,8 @@ describe('切换一条已有会话的机器', () => {
     assert.match(SB, /\.filter\(\(tg\) => tg\.label !== ctxSession\.remoteHost\)/);
   });
 
-  test('目录：**先让主进程用记录里的试**，只有它说没有目录才弹选择框', () => {
-    assert.match(SB, /if \(!r\?\.ok && remoteId && \/项目目录\/\.test\(String\(r\?\.error \|\| ''\)\)\)/);
-    assert.match(SB, /remotePickDir\?\.\(\)/);
+  test('界面上**不问目录**（那个要求已经去掉了），失败要让人看见', () => {
+    assert.equal(/remotePickDir/.test(SB), false, '不该再弹目录选择');
     /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
     assert.match(SB, /window\.alert\(String\(r\?\.error/);
   });
