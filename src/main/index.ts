@@ -3895,12 +3895,14 @@ app.whenReady().then(async () => {
                 挨个顶掉（实测一条消息刷出 20 条 ⚠️）。三条以上只说数量：这一栏是一行字，
                 真正要紧的是"有东西没带过去"这件事，逐条清单在日志里。
               */
-              if (res.refused.length) {
-                const head = res.refused.slice(0, 3)
+              for (const r of res.refused) logger.info('remote', `没摆渡 ${r.local}：${r.why}`);
+              /* `quiet` 的那些（凭据 / KiroLex 自己的记录）只进日志 —— 见 `StageResult.refused` */
+              const loud = res.refused.filter((r) => !r.quiet);
+              if (loud.length) {
+                const head = loud.slice(0, 3)
                   .map((r) => `\`${path.basename(r.local)}\`（${r.why}）`).join('、');
                 sessionNotice(sessionId, `⚠️ 这些提到的东西没带到远端：${head}`
-                  + (res.refused.length > 3 ? `，等 ${res.refused.length} 个` : ''));
-                for (const r of res.refused) logger.info('remote', `没摆渡 ${r.local}：${r.why}`);
+                  + (loud.length > 3 ? `，等 ${loud.length} 个` : ''));
               }
             }
             const peer = busyPeer(

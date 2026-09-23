@@ -65,6 +65,10 @@ describe('把你提到的本地文件摆渡过去', () => {
     assert.match(why, /太大/);
     assert.match(why, /不整目录搬/);
     assert.match(why, /凭据/);
+    /* 凭据那一条是 `quiet`：进日志、**不在界面上说** —— 规则定死了，说了你也做不了什么，
+       而你通常只是在**聊**这些路径。太大/整目录那些是你真想用这个文件，所以要说。 */
+    const quiet = res.refused.filter((r) => r.quiet).map((r) => path.basename(r.local));
+    assert.deepEqual(quiet, ['credentials']);
     /* 不存在的路径当作"没提"，不报错也不记账 */
     assert.equal(readManifest(work).length, 1);
   });
@@ -129,6 +133,8 @@ describe('接线', () => {
     /* 拒绝的也要说出来 —— 默默不带过去最糟。但**合成一条**：状态行一次只显示一句，
        一条一提示等于把前面那些挨个顶掉（实测一条消息刷出 20 条 ⚠️）。 */
     assert.match(M, /这些提到的东西没带到远端/);
+    /* 而"凭据/KiroLex 自己的记录"那一类**连提示都不给**（`quiet`）——「怎么老有什么凭证不带过去之类的提示」 */
+    assert.match(M, /const loud = res\.refused\.filter\(\(r\) => !r\.quiet\);/);
     assert.equal(/for \(const r of res\.refused\) \{\s*\n\s*sessionNotice/.test(M), false, '不许一条一条提示');
     assert.match(M, /for \(const r of res\.refused\) logger\.info/, '逐条要留在日志里');
   });

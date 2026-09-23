@@ -125,8 +125,16 @@ export function writeManifest(localDir: string, entries: BridgeEntry[]): void {
 export interface StageResult {
   /** 这一轮新摆渡/刷新过的条目。 */
   staged: BridgeEntry[];
-  /** 拒绝了的路径 + 原因（要告诉人，不能默默不管）。 */
-  refused: { local: string; why: string }[];
+  /**
+   * 拒绝了的路径 + 原因。
+   *
+   * `quiet` = **只进日志，不打扰你** ——「怎么老有什么凭证不带过去之类的提示」。
+   * 凭据和 KiroLex 自己的记录属于这一类：它们永远不会被摆渡，这是定死的规则，
+   * 提示既改变不了什么、也不需要你做任何事 —— 而你只是在**聊**这些路径
+   * （实测那 20 条里大半是 `~/.kirolex/memory/...`）。
+   * 提示留给"你确实想让它用这个文件、而我没带过去"：太大、拷不动、你指的是一整个目录。
+   */
+  refused: { local: string; why: string; quiet?: boolean }[];
 }
 
 /**
@@ -134,7 +142,7 @@ export interface StageResult {
  */
 export function stageFiles(localDir: string, paths: string[]): StageResult {
   const staged: BridgeEntry[] = [];
-  const refused: { local: string; why: string }[] = [];
+  const refused: StageResult['refused'] = [];
   const existing = new Map(readManifest(localDir).map((e) => [e.local, e]));
   for (const p of paths) {
     const abs = path.resolve(p);
@@ -147,7 +155,11 @@ export function stageFiles(localDir: string, paths: string[]): StageResult {
     */
     let st: fs.Stats;
     try { st = fs.statSync(abs); } catch { continue; }                      // 不存在就当没提
-    if (bridgeRefused(abs)) { refused.push({ local: abs, why: 'KiroLex 自己的记录和凭据类路径不摆渡' }); continue; }
+    /* 凭据 / KiroLex 自己的记录：**不提示**（`quiet`）—— 规则是定死的，说了你也做不了什么 */
+    if (bridgeRefused(abs)) {
+      refused.push({ local: abs, why: 'KiroLex 自己的记录和凭据类路径不摆渡', quiet: true });
+      continue;
+    }
     if (st.isDirectory()) { refused.push({ local: abs, why: '只摆渡单个文件，不整目录搬' }); continue; }
     if (st.size > MAX_BRIDGE_BYTES) {
       refused.push({ local: abs, why: `太大（${(st.size / 1048576).toFixed(1)} MB）` });
