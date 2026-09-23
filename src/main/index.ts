@@ -1434,11 +1434,18 @@ function registerRemoteSync(sessionId: string, profile: AgentProfile, localProje
       excludes: rootIsSessionDir ? [...DEFAULT_EXCLUDES, ...SESSION_DIR_EXCLUDES] : undefined,
       pullNever: rootIsSessionDir ? PULL_NEVER : [],
     }),
-    session: new RemoteMirror({
+    /*
+      **没有项目时不要推两遍** ——「一直在从远端下载啥啊」/ 推送 21 秒的真正原因。
+
+      镜像根是会话目录时，"项目镜像"和"会话镜像"镜的是**同一个本地目录**，只是落到远端两个不同的
+      路径 —— 于是每一轮推两遍、四次 SSH 握手。实测：app 里 21 秒，而手动推同一份只要 5.9 秒。
+      这种情况下会话镜像没有任何存在理由（附件就在那一份里），所以直接不建。
+    */
+    session: rootIsSessionDir ? undefined : new RemoteMirror({
       remote, sshCommand,
       localDir: getSessionDir(sessionId),
       remoteDir: sessionMirrorDir(workdir, sessionId),
-      /* 只推模型要读的（history.md + 附件）—— 其余是 KiroLex 自己的状态，见 `SESSION_DIR_EXCLUDES` */
+      /* 只推模型要读的（附件）—— 其余是 KiroLex 自己的状态，见 `SESSION_DIR_EXCLUDES` */
       excludes: [...DEFAULT_EXCLUDES, ...SESSION_DIR_EXCLUDES],
     }),
   });
@@ -2321,7 +2328,17 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           远程会话：这一步可能在远端写了文件 —— 防抖拉一次（不等它）。这是让 gate / file review
           在一轮**进行中**就看得到改动的那一半；只在一轮结束时拉的话，界面会一直显示上一版。
         */
-        if (remoteSync.isRemote(sessionId) && toolMayHaveWritten(u?.title || u?.kind, u?.rawInput)) {
+        /*
+          **先看协议事实，再看标题** ——「一直在从远端下载啥啊」：每轮收尾都拉一次、而且"改了 0 个文件"。
+          原因是判据只看标题，而这条会话在跑网页搜索/知识库查询（`Searching the web`、
+          `Querying knowledge base`），标题里带 search/fetch 就被判成"可能写过文件"。
+          `locations`/`diffs` 是后端**明说**动过哪些文件的地方 —— 有它就一定拉；没有它再退回标题判断，
+          而纯读类的标题（search/grep/list…）本来就被排除。
+        */
+        const touchedFiles = (Array.isArray(u?.locations) && u.locations.length > 0)
+          || (Array.isArray(u?.content) && u.content.some((c: any) => c?.type === 'diff'));
+        if (remoteSync.isRemote(sessionId)
+          && (touchedFiles || toolMayHaveWritten(u?.title || u?.kind, u?.rawInput))) {
           entry.remoteWroteThisTurn = true;
           remoteSync.pullSoon(sessionId);
         }
@@ -5269,7 +5286,13 @@ app.whenReady().then(async () => {
     if (!oldEntry && !rec0) throw new Error('找不到这条会话的记录。');
     const currentRemote = oldEntry?.profile.remote?.sshHost || rec0?.profile?.remote?.sshHost || '';
     const wasRemote = !!currentRemote;
-    if ((target?.sshHost || '') === currentRemote) return { ok: true, unchanged: true };
+    /*
+      目标没变**而且目录也没变**才算没变化 —— 只改工作目录（「📂 工作目录…」）走的是同一个入口，
+      短路写成只看目标的话那条路会被当成 no-op 直接返回（实测差点这么发出去）。
+    */
+    const dirChanged = !!localDir
+      && localDir !== (store.readRecord(sessionId)?.localDir || oldEntry?.localDir || '');
+    if ((target?.sshHost || '') === currentRemote && !dirChanged) return { ok: true, unchanged: true };
 
     /* 切回本地：先把远端的改动拉回来，拉不回来就别切 */
     if (wasRemote && !target) {

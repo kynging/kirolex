@@ -1082,8 +1082,15 @@ describe('切换一条已有会话的机器', () => {
     assert.match(CSS, /\.context-submenu-panel \{[^}]*left: 100%/s);
   });
 
-  test('界面上**不问目录**（那个要求已经去掉了），失败要让人看见', () => {
-    assert.equal(/remotePickDir/.test(SB), false, '不该再弹目录选择');
+  test('切换时**不强制**问目录（目录另有一条明确入口），失败要让人看见', () => {
+    /* 切换那条路不许弹目录选择 —— 那个强制要求你否过一次；
+       但"选工作目录"作为**单独一条菜单项**是需要的（远端只能看见被镜像的那个目录）。 */
+    /* 只切 `onSetTarget` 自己的函数体 —— `onPickWorkdir`（它**应该**用 remotePickDir）就紧跟在后面 */
+    const at = SB.indexOf('const onSetTarget');
+    const end = SB.indexOf('const onPickWorkdir');
+    assert.ok(at > 0 && end > at);
+    assert.equal(/remotePickDir/.test(SB.slice(at, end)), false, '切换那条路不该弹目录');
+    assert.match(SB, /📂 工作目录…/, '但要有单独的一条');
     /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
     assert.match(SB, /window\.alert\(String\(r\?\.error/);
   });
@@ -1305,5 +1312,38 @@ describe('右键菜单不被正在跑的任务挡住；在跑的会话不许被�
     assert.match(SB, /folder-children-running/);
     /* 折叠状态本身不动 —— 那是用户的选择 */
     assert.match(SB, /折叠状态照旧（那是你的选择）/);
+  });
+});
+
+/*
+ * 「远程会话为什么访问不了本地的文件」+「一直在从远端下载啥啊」。
+ */
+describe('工作目录 / 不要推两遍', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+
+  test('镜像根就是会话目录时**不再建第二份镜像**（那是推 21 秒的真正原因）', () => {
+    assert.match(M, /session: rootIsSessionDir \? undefined : new RemoteMirror\(\{/);
+    /* 实测：app 里推 21 秒，手动推同一份 5.9 秒 —— 差的就是第二遍 + 多两次 SSH 握手 */
+    assert.match(M, /手动推同一份只要 5\.9 秒/);
+  });
+
+  test('收尾要不要拉：**先看协议事实**（locations/diffs），再退回标题判断', () => {
+    assert.match(M, /const touchedFiles = \(Array\.isArray\(u\?\.locations\) && u\.locations\.length > 0\)/);
+    assert.match(M, /\(touchedFiles \|\| toolMayHaveWritten\(/);
+    /* 起因：网页搜索/知识库查询的标题带 search/fetch，被判成"可能写过文件"，于是每轮白拉一次 */
+    assert.match(M, /Querying knowledge base/);
+  });
+
+  test('右键里有「📂 工作目录…」，且只在远程会话上出现', () => {
+    assert.match(SB, /📂 工作目录…/);
+    assert.match(SB, /const onPickWorkdir = async \(sessionId: string\): Promise<void> => \{/);
+    const at = SB.indexOf('📂 工作目录…');
+    assert.match(SB.slice(at - 400, at), /ctxSession\.remoteHost && \(/, '本地会话不需要这一条');
+  });
+
+  test('只换目录也算变化 —— 短路不能只看目标', () => {
+    assert.match(M, /const dirChanged = !!localDir/);
+    assert.match(M, /if \(\(target\?\.sshHost \|\| ''\) === currentRemote && !dirChanged\) return \{ ok: true, unchanged: true \};/);
   });
 });
