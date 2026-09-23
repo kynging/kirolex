@@ -2293,6 +2293,10 @@ interface ChatAreaProps {
   onResetCredits: () => void;
   commands: SlashCommand[];
   onModelChange: (model: string) => void;
+  /** 这条会话在哪棵树上干活（记录为准）。远程会话显示的仍是**本地**那个路径。 */
+  workdir?: string;
+  /** 换工作目录（Finder 选目录 → 换执行器）。 */
+  onPickWorkdir?: () => void;
   kiroAgent: string;
   kiroAgents: KiroAgentOption[];
   switchingAgent: boolean;
@@ -2409,6 +2413,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   autoFoldTools,
   commands,
   onModelChange,
+  workdir,
+  onPickWorkdir,
   kiroAgent,
   kiroAgents,
   switchingAgent,
@@ -2462,6 +2468,24 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
   const remoteStatus = useRemoteSyncFor(currentSessionId || undefined, true);
   const remoteHostLabel = remoteStatus?.hostLabel?.replace(/^[^@]*@/, '');
+  /**
+   * **工作目录那一格的字** —— 显示 basename：这一排很窄，完整路径放 title。
+   *
+   * 没归项目的会话，工作目录就是它自己的会话目录（`~/.kirolex/sessions/<id>`）——
+   * 那个 id 当名字没有任何信息量，所以直接说「会话目录」，并在 title 里说清它读不到别处的文件。
+   */
+  const inSessionDir = !!workdir && /\/\.kirolex\/sessions\//.test(workdir);
+  const workdirLabel = !workdir
+    ? '工作目录…'
+    : (inSessionDir ? '会话目录' : (workdir.split('/').filter(Boolean).pop() || workdir));
+  const workdirTitle = `工作目录：${workdir || '（还没定 —— 点这里选一个）'}`
+    + (remoteHostLabel
+      ? `\n${remoteHostLabel} 上只看得见这棵树（每一轮前后自动同步镜像），别处的文件它读不到。`
+      : '')
+    + (inSessionDir
+      ? '\n这是这条会话自己的目录 —— 选一个项目目录，它就能读写那棵树。'
+      : '')
+    + '\n点这里换一个目录（会换执行器：正在跑的那一轮会被打断，已产出的内容都在）。';
   const [isDragOver, setIsDragOver] = useState(false);
   // Conversation-aware prompt suggestions: regenerate a few contextual follow-up
   // prompts each time a turn finishes, so the chips reflect the current chat
@@ -3822,6 +3846,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       document.body,
                     )}
                   </div>
+
+                  {/*
+                    **工作目录就摆在这儿** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
+
+                    它是个**常驻事实**，不是一次性动作：这条会话读写哪棵树，决定了它看得见什么。
+                    远程会话尤其 —— 远端只看得见被镜像的那一个目录（实测 kiro-cli 不用 ACP 的客户端
+                    fs 能力，声明了也 0 回调），而「远程会话为什么访问不了本地的文件」那次之所以
+                    只能靠猜，就是因为这个值当时**在界面上根本不存在**：藏在右键菜单里的东西既显示
+                    不出当前值、也提示不了这件事存在。
+
+                    **不在跑的时候禁用**：换目录会换执行器（那一轮会断），但这正是你想改它的时候
+                    ——「这些右键菜单应该优先级大于正在跑的任务」。而且点它先弹 Finder，误触也停得下来。
+                  */}
+                  <button
+                    className="composer-meta-btn composer-workdir"
+                    onClick={() => onPickWorkdir?.()}
+                    disabled={!currentSessionId || !onPickWorkdir}
+                    title={workdirTitle}
+                  >
+                    📂 <span className="composer-meta-label">{workdirLabel}</span>
+                  </button>
                 </div>
 
                 <div className="composer-belowbar-right">

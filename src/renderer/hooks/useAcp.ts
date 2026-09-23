@@ -1304,10 +1304,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 界面停在旧值上，直到下一次整页水化。
    */
   useEffect(() => {
-    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null }) => {
+    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
       if (!d?.sessionId) return;
       setSessions((prev) => prev.map((s) => (s.id === d.sessionId
-        ? { ...s, remoteHost: d.remoteHost || undefined }
+        /* 工作目录也在这个事件里 —— 会话界面上那个 📂 显示的就是它，换完必须当场变 */
+        ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir }
         : s)));
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
@@ -1595,6 +1596,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                  * `remoteHost`，而侧栏那个 🌐 徽标从来没出现过 —— 因为它在这一步被丢了。
                  */
                 remoteHost: rec.remoteHost ?? (existing as any).remoteHost,
+                /* 工作目录同理：白名单里不列就会被丢掉，而会话界面上那个 📂 显示的就是它 */
+                localDir: rec.localDir ?? (existing as any).localDir,
               });
             } else {
               byId.set(rec.id, {
@@ -1608,6 +1611,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 flow: rec.flow,
                 kiroAgent: rec.kiroAgent,
                 remoteHost: rec.remoteHost,
+                localDir: rec.localDir,
                 timestamp: rec.updatedAt,
               });
             }

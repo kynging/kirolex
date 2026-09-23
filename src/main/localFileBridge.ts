@@ -105,10 +105,20 @@ export function readManifest(localDir: string): BridgeEntry[] {
   }
 }
 
+/**
+ * 写账本。**内容没变就不写** ——「有报错，有些文件两端都改过」。
+ *
+ * 原来每次拉完都无条件重写一遍，于是这个文件的 mtime 每一轮都变。它在镜像里，所以下一次
+ * 同步就成了"两边都改过" → 每轮一个 `manifest.json.remote`（实测 20 分钟报了 20 次）。
+ * 现在它既不过河（`MIRROR_PRIVATE`）也不做无意义的写入 —— 两道都要有：
+ * 无谓的写盘本身也会让"这一轮有没有改东西"这个判断变脏。
+ */
 export function writeManifest(localDir: string, entries: BridgeEntry[]): void {
   try {
+    const next = JSON.stringify(entries, null, 2);
+    try { if (fs.readFileSync(manifestPath(localDir), 'utf-8') === next) return; } catch { /* 还没有 */ }
     fs.mkdirSync(path.dirname(manifestPath(localDir)), { recursive: true });
-    fs.writeFileSync(manifestPath(localDir), JSON.stringify(entries, null, 2));
+    fs.writeFileSync(manifestPath(localDir), next);
   } catch { /* 账本写不下去时下面那步会跳过写回 —— 不写回比写错地方好 */ }
 }
 
@@ -129,9 +139,15 @@ export function stageFiles(localDir: string, paths: string[]): StageResult {
   for (const p of paths) {
     const abs = path.resolve(p);
     if (abs.startsWith(`${path.resolve(localDir)}${path.sep}`)) continue;   // 已经在镜像里
-    if (bridgeRefused(abs)) { refused.push({ local: abs, why: '凭据类路径不摆渡' }); continue; }
+    /*
+      **先看在不在，再谈拒绝** —— 顺序反了的代价实测就在日志里：一条**讲**路径的消息
+      （`~/.kirolex/memory/projects/<项目名>` 这种模板）换来 20 条 ⚠️，每条都在解释一个
+      根本不存在的文件为什么没被摆渡。不存在的路径只是"一段看起来像路径的文字"，
+      不该产生任何提示；提示要留给"你确实指了一个文件、而我没带过去"。
+    */
     let st: fs.Stats;
     try { st = fs.statSync(abs); } catch { continue; }                      // 不存在就当没提
+    if (bridgeRefused(abs)) { refused.push({ local: abs, why: 'KiroLex 自己的记录和凭据类路径不摆渡' }); continue; }
     if (st.isDirectory()) { refused.push({ local: abs, why: '只摆渡单个文件，不整目录搬' }); continue; }
     if (st.size > MAX_BRIDGE_BYTES) {
       refused.push({ local: abs, why: `太大（${(st.size / 1048576).toFixed(1)} MB）` });

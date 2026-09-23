@@ -359,6 +359,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
   setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string) =>
     ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir),
   /**
+   * **只换工作目录，机器不变** —— 会话界面上那个 📂。
+   *
+   * 不复用 `setRemoteTarget`：那个要 `remoteId`，而渲染层手里只有 label，按 label 反查一旦查不到
+   * 就会传 `null` 过去 —— 那是"切回本地"。改个目录顺手把会话切下远端，属于改完很久才发现的错。
+   */
+  setWorkdir: (sessionId: string, dir: string) =>
+    ipcRenderer.invoke('acp:set-workdir', sessionId, dir),
+  /**
    * **KiroLex 自己对你说的一句话**（推/拉进度、冲突、换机器…）。
    *
    * 这些不进 transcript：它们不是对话内容，写进去会打断对话的读法、把 transcript 撑大
@@ -377,7 +385,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 徽标和右键菜单里那句「运行位置：…」用的是**同一份**会话状态，不听这个事件的话两处都会停在旧值上
    * —— 实测就是这样：切完了，但侧栏没徽标、菜单还写着"本地"。
    */
-  onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null }) => void) => {
+  onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:targets-changed', handler);
     return () => ipcRenderer.removeListener('session:targets-changed', handler);

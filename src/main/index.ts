@@ -3890,8 +3890,17 @@ app.whenReady().then(async () => {
                   + `（它改完会自动写回原处）`);
                 logger.info('remote', `摆渡 ${res.staged.length} 个本地文件 sessionId=${sessionId}`);
               }
-              for (const r of res.refused) {
-                sessionNotice(sessionId, `⚠️ \`${r.local}\` 没有带过去：${r.why}。`);
+              /*
+                拒绝的**合成一条** —— 状态行一次只显示一句，一条一提示的写法等于把前面那些
+                挨个顶掉（实测一条消息刷出 20 条 ⚠️）。三条以上只说数量：这一栏是一行字，
+                真正要紧的是"有东西没带过去"这件事，逐条清单在日志里。
+              */
+              if (res.refused.length) {
+                const head = res.refused.slice(0, 3)
+                  .map((r) => `\`${path.basename(r.local)}\`（${r.why}）`).join('、');
+                sessionNotice(sessionId, `⚠️ 这些提到的东西没带到远端：${head}`
+                  + (res.refused.length > 3 ? `，等 ${res.refused.length} 个` : ''));
+                for (const r of res.refused) logger.info('remote', `没摆渡 ${r.local}：${r.why}`);
               }
             }
             const peer = busyPeer(
@@ -5316,12 +5325,18 @@ app.whenReady().then(async () => {
    *   · 切到远程之前要有一个**具体的项目目录**：没有目录没法做镜像，而拿家目录顶上就是
    *     把凭据推上去（那笔账见 `mirrorRefusal`）。
    */
-  ipcMain.handle('acp:set-remote-target', async (
-    _event,
+  /**
+   * 换机器 / 换工作目录共用的那一段机械。
+   *
+   * 收的是一个 `RemoteTarget`（不是 id）：只改目录那条路不该再去配置里按 label 反查一遍 ——
+   * 查不到时反查会得到 `undefined`，而"没有目标"的意思是**切回本地**。只想换个目录、
+   * 顺手把会话从远端切了下来，是那种改完很久才发现的错。
+   */
+  const applySessionTarget = async (
     sessionId: string,
-    remoteId: string | null,
+    target: RemoteTarget | undefined,
     localDir?: string,
-  ) => {
+  ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
     const oldEntry = sessionClients.get(sessionId);
     /*
       **右键菜单优先于正在跑的任务** ——「这些右键菜单应该优先级大于正在跑的任务」。
@@ -5333,8 +5348,6 @@ app.whenReady().then(async () => {
     const interrupted = !!oldEntry?.busy;
     if (reconfiguringSessions.has(sessionId)) throw new Error('上一次切换还没完成，稍等。');
 
-    const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
-    if (remoteId && !target) throw new Error(`找不到远端目标 ${remoteId}（设置里删掉了？）—— 没有猜一台机器。`);
     const rec0 = store.readRecord(sessionId);
     if (!oldEntry && !rec0) throw new Error('找不到这条会话的记录。');
     const currentRemote = oldEntry?.profile.remote?.sshHost || rec0?.profile?.remote?.sshHost || '';
@@ -5399,7 +5412,7 @@ app.whenReady().then(async () => {
       sessionNotice(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
         + `它现在没有连着，所以没有执行器要换；对话一条都没动。`);
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
-      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
+      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
       return { ok: true, remoteHost: hostLabelOf(target), cold: true };
     }
 
@@ -5454,7 +5467,7 @@ app.whenReady().then(async () => {
           + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`
           + (interrupted ? `\n（切换打断了正在跑的那一轮 —— 已产出的内容都在，未完成的那部分没了，需要的话重发一次。）` : ''));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
-        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
+        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
         return { ok: true, remoteHost: hostLabelOf(target) };
       } catch (err) {
         try { await client.disconnect(); } catch {}
@@ -5464,6 +5477,33 @@ app.whenReady().then(async () => {
       reconfiguringSessions.delete(sessionId);
       emitSessionBusy(sessionId);
     }
+  };
+
+  ipcMain.handle('acp:set-remote-target', async (
+    _event,
+    sessionId: string,
+    remoteId: string | null,
+    localDir?: string,
+  ) => {
+    const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
+    if (remoteId && !target) throw new Error(`找不到远端目标 ${remoteId}（设置里删掉了？）—— 没有猜一台机器。`);
+    return applySessionTarget(sessionId, target, localDir);
+  });
+
+  /**
+   * **只换工作目录，机器不变** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
+   *
+   * 单独一个入口，因为这是一个**独立的问题**：远端（以及本地那条没归项目的会话）只看得见
+   * 被镜像的那一个目录，所以"它读哪棵树"和"它跑在哪台机器上"是两件事。
+   *
+   * 当前的机器从**记录/执行器**里拿（`profile.remote` 存的就是整份目标），不让渲染层参与 ——
+   * 渲染层只有 label，按 label 反查一旦查不到就会退化成"切回本地"。
+   */
+  ipcMain.handle('acp:set-workdir', async (_event, sessionId: string, dir: string) => {
+    if (!dir || !path.isAbsolute(dir)) throw new Error('工作目录要写绝对路径。');
+    const current = sessionClients.get(sessionId)?.profile.remote
+      || store.readRecord(sessionId)?.profile?.remote;
+    return applySessionTarget(sessionId, current?.sshHost ? current : undefined, dir);
   });
 
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
@@ -6792,6 +6832,14 @@ app.whenReady().then(async () => {
       ...(rec.profile?.remote?.sshHost
         ? { remoteHost: labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) }
         : null),
+      /**
+       * **这条会话在哪棵树上干活** ——「工作目录这个东西放到右侧会话」。
+       *
+       * 会话界面上要常驻显示它，所以它必须跟着会话状态一起过来。记录里一直有
+       * （`SessionRecord.localDir`，磁盘为准），只是从来没发给渲染层 —— 而"它读哪个目录"
+       * 恰恰是远程会话最容易搞错的一件事（远端只看得见被镜像的那一个目录）。
+       */
+      ...(rec.localDir ? { localDir: rec.localDir } : null),
     }));
   });
 

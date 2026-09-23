@@ -3872,6 +3872,15 @@ button, input, select, textarea {
   cursor: default;
 }
 
+/* 工作目录那一格。目录名可以很长（`kirolex-remote-experiments`），而这一排的宽度是抢的 ——
+   给它一个上限 + 省略号，完整路径在 title 里。窄到 720px 时上面那条规则会只留下 📂 图标。 */
+.composer-workdir { max-width: 170px; }
+.composer-workdir .composer-meta-label {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
 .composer-meta-count {
   min-width: 16px;
   height: 16px;

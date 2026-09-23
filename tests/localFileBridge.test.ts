@@ -5,7 +5,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   mentionedPaths, stagedRel, stageFiles, writeBack, readManifest,
-  bridgeRefused, BRIDGE_DIR, MAX_BRIDGE_BYTES,
+  bridgeRefused, BRIDGE_DIR, MAX_BRIDGE_BYTES, writeManifest, manifestPath,
 } from '../src/main/localFileBridge.ts';
 
 /*
@@ -49,12 +49,15 @@ describe('把你提到的本地文件摆渡过去', () => {
     const src = tmp();
     fs.writeFileSync(path.join(src, 'a.md'), 'hello');
     fs.writeFileSync(path.join(src, 'big.bin'), Buffer.alloc(MAX_BRIDGE_BYTES + 1));
+    /* 凭据那一条要**真的存在**才有意义：不存在的路径一律当"没提"（见下面那条） */
+    fs.mkdirSync(path.join(src, '.aws'), { recursive: true });
+    fs.writeFileSync(path.join(src, '.aws', 'credentials'), 'x');
     const res = stageFiles(work, [
       path.join(src, 'a.md'),
       path.join(src, 'big.bin'),
       src,                                  // 目录
       path.join(src, 'nope.md'),            // 不存在
-      '/Users/k/.aws/credentials',          // 凭据
+      path.join(src, '.aws', 'credentials'), // 凭据
     ]);
     assert.deepEqual(res.staged.map((e) => path.basename(e.local)), ['a.md']);
     assert.equal(fs.readFileSync(path.join(work, res.staged[0].rel), 'utf8'), 'hello');
@@ -64,6 +67,19 @@ describe('把你提到的本地文件摆渡过去', () => {
     assert.match(why, /凭据/);
     /* 不存在的路径当作"没提"，不报错也不记账 */
     assert.equal(readManifest(work).length, 1);
+  });
+
+  test('**不存在的路径一句提示都不给** —— 讲路径的消息不是在让我搬文件', () => {
+    /* 实测：一条说明 `~/.kirolex/memory/projects/<项目名>/memory.md` 这类模板的消息，
+       换来 20 条 ⚠️，每条都在解释一个根本不存在的文件为什么没被摆渡。
+       判断顺序因此是 **先看在不在，再谈拒不拒绝**：提示只留给"你确实指了一个文件、而我没带过去"。 */
+    const work = tmp();
+    const res = stageFiles(work, [
+      '/Users/keyinan/.kirolex/memory/projects/<项目名',   // 模板，不存在
+      '/Users/keyinan/.aws/credentials-does-not-exist',    // 凭据形状，但不存在
+    ]);
+    assert.deepEqual(res.staged, []);
+    assert.deepEqual(res.refused, [], `不该有提示：${JSON.stringify(res.refused)}`);
   });
 
   test('已经在镜像里的文件不用摆渡', () => {
@@ -110,8 +126,11 @@ describe('接线', () => {
     assert.match(M, /const wanted = mentionedPaths\(text\)/);
     assert.match(M, /const res = stageFiles\(bridgeDir, wanted\);/);
     assert.match(M, /t = t\.split\(local\)\.join\(remote\);/);
-    /* 拒绝的也要说出来 —— 默默不带过去最糟 */
-    assert.match(M, /没有带过去：\$\{r\.why\}/);
+    /* 拒绝的也要说出来 —— 默默不带过去最糟。但**合成一条**：状态行一次只显示一句，
+       一条一提示等于把前面那些挨个顶掉（实测一条消息刷出 20 条 ⚠️）。 */
+    assert.match(M, /这些提到的东西没带到远端/);
+    assert.equal(/for \(const r of res\.refused\) \{\s*\n\s*sessionNotice/.test(M), false, '不许一条一条提示');
+    assert.match(M, /for \(const r of res\.refused\) logger\.info/, '逐条要留在日志里');
   });
 
   test('拉完写回原处（这是"能改本地文件"的另一半）', () => {
@@ -125,5 +144,55 @@ describe('接线', () => {
     const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r/proj', localDir: '/l' });
     assert.match(b, /_kirolex-local/);
     assert.match(b, /写回用户机器上的原处/);
+  });
+});
+
+/*
+ * 「有报错，有些文件两端都改过」/「怎么有 manifest 一直报错呢」—— 实测 07:45–07:57 每 20 秒一条
+ * `_kirolex-local/manifest.json` 的冲突提示，本地还被塞了 `manifest.json.remote`。
+ *
+ * 根因和 `history.md` 那次一字不差：**本地独占写的文件躺在被同步的树里**。
+ * `writeBack` 每次拉完都重写账本 → 它和远端那份不一致 → 下一次拉 rsync 要覆盖它（incoming）
+ * → 它同时又在"自推送以来本地变过"里 → 判成冲突。两道都要修：不过河，且不做无谓的写入。
+ */
+describe('摆渡的账本不过河、也不白写', () => {
+  test('`_kirolex-local/manifest.json` 两个方向都排除，而且是**锚在根上**的那一条', async () => {
+    const { MIRROR_PRIVATE, pushArgs, pullArgs, isExcluded } = await import('../src/main/remoteMirror.ts');
+    assert.deepEqual(MIRROR_PRIVATE, ['/_kirolex-local/manifest.json']);
+    const spec = {
+      remote: { sshHost: 'h' } as any,
+      localDir: '/l', remoteDir: '/r', sshCommand: 'ssh',
+    };
+    for (const args of [pushArgs(spec), pullArgs(spec)]) {
+      assert.ok(args.includes('/_kirolex-local/manifest.json'), `缺排除：${args.join(' ')}`);
+    }
+    /* 锚在根上 —— 前端项目里 `manifest.json` 是个真文件，不能顺手把它也排掉 */
+    assert.equal(isExcluded('_kirolex-local/manifest.json', MIRROR_PRIVATE), true);
+    assert.equal(isExcluded('public/manifest.json', MIRROR_PRIVATE), false, '别处的同名文件不许被排除');
+    /* 摆渡的**文件本身**照旧过河（那才是这个功能的全部意义） */
+    assert.equal(isExcluded('_kirolex-local/ab12cd34/notes.md', MIRROR_PRIVATE), false);
+  });
+
+  test('快照也要排除它 —— rsync 不传、快照却算它一个文件，就等于每轮都"本地改过"', async () => {
+    const { RemoteMirror, MIRROR_PRIVATE } = await import('../src/main/remoteMirror.ts');
+    const m = new RemoteMirror({
+      remote: { sshHost: 'h' } as any, localDir: '/l', remoteDir: '/r', sshCommand: 'ssh',
+    });
+    assert.ok(MIRROR_PRIVATE.every((p) => (m as any).excludes.includes(p)), '构造时就并进去');
+  });
+
+  test('账本内容没变就不写盘（mtime 每轮都动就够让同步判脏了）', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'ledger-'));
+    const f = path.join(dir, 'a.txt');
+    fs.writeFileSync(f, 'v1');
+    const entries = [{ local: f, rel: '_kirolex-local/x/a.txt', hash: 'h', localHash: 'h' }];
+    writeManifest(dir, entries);
+    const before = fs.statSync(manifestPath(dir)).mtimeMs;
+    /* 同样的内容再写一次：文件不该被动过 */
+    writeManifest(dir, entries);
+    assert.equal(fs.statSync(manifestPath(dir)).mtimeMs, before);
+    /* 内容真变了当然要写 */
+    writeManifest(dir, [...entries, { local: '/x/b.txt', rel: '_kirolex-local/y/b.txt', hash: 'h2', localHash: 'h2' }]);
+    assert.equal(readManifest(dir).length, 2);
   });
 });

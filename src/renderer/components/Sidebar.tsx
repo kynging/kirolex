@@ -666,22 +666,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
     if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '切换失败'));
   };
 
-  /**
-   * 给这条会话选一个**工作目录** ——「远程会话为什么访问不了本地的文件」。
-   *
-   * 远端只能看见被镜像的那个目录，而没归项目的会话镜像的是它自己的会话目录 —— 所以它读不到
-   * `~/Downloads` 或某个仓库里的文件。选完目录之后那棵树就归它管（每轮前后同步）。
-   * 走的是同一个 `setRemoteTarget`：目标不变、只换目录。
-   */
-  const onPickWorkdir = async (sessionId: string): Promise<void> => {
-    const api = (window as any).kiroApi;
-    const picked = await api?.remotePickDir?.();
-    if (!picked?.path) return;
-    const target = remoteTargets.find((t) => t.label === sessions.find((x) => x.id === sessionId)?.remoteHost);
-    const r = await api.setRemoteTarget(sessionId, target?.id ?? null, picked.path)
-      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
-    if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '设置工作目录失败'));
-  };
+  /*
+    选工作目录**不在侧栏了** —— 它在会话界面（`ChatArea` 的 `composer-workdir` / `App.pickWorkdir`）。
+    顺带去掉的还有这里那条按 label 反查目标的代码：它查不到就会给主进程传 `null`，
+    而 `null` 的意思是"切回本地" —— 只想换个目录，结果把会话从远端切了下来。
+    现在主进程用记录里的 `profile.remote` 保证"机器不变"（`acp:set-workdir`）。
+  */
 
   const handleContextMenu = (e: React.MouseEvent, targetId: string) => {
     e.preventDefault();
@@ -1065,22 +1055,12 @@ export const Sidebar: React.FC<SidebarProps> = ({
                       </div>
                     ))}
                     {/*
-                      **工作目录** ——「远程会话为什么访问不了本地的文件」。
-                      远端只能看见**被镜像的那个目录**（实测 kiro-cli 不用 ACP 的客户端 fs 能力，
-                      声明了也 0 回调）。一条没归项目的会话镜像的是它自己的会话目录 ——
-                      于是它确实看不到 `~/Downloads` 或某个仓库里的东西。
-                      这里给一条明确的出口：选一个目录，那棵树就归它管。
-                      （不在切换时**强制**问 —— 那个要求你已经否过一次。）
+                      **工作目录不在这儿** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
+                      它在会话界面输入框下面那一排（`ChatArea` 的 `composer-workdir`）：那是个常驻事实
+                      （这条会话读写哪棵树），菜单里既显示不出当前值、也提示不了这件事存在 ——
+                      而「远程会话为什么访问不了本地的文件」那次之所以只能靠猜，就是因为它当时不可见。
+                      这里只剩"在哪台机器上跑"这一个问题。
                     */}
-                    {ctxSession.remoteHost && (
-                      <div
-                        className="context-menu-item"
-                        onClick={() => { void onPickWorkdir?.(ctxSession.id); setContextMenu(null); }}
-                        title="远端只能看见被镜像的那个目录。选一个项目目录，它就能读写那棵树里的文件。"
-                      >
-                        {'　📂 工作目录…'}
-                      </div>
-                    )}
                   </Submenu>
                   <div className="context-menu-divider" />
                 </>

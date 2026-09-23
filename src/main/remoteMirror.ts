@@ -42,6 +42,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { RemoteTarget } from './config';
+import { BRIDGE_DIR } from './localFileBridge.ts';
 
 /**
  * 默认不同步什么。
@@ -140,6 +141,22 @@ export const PULL_NEVER = [
   'memory.md',
   'loop.json',
 ];
+
+/**
+ * **KiroLex 自己的账本不过河** ——「有报错，有些文件两端都改过」。
+ *
+ * 摆渡用的清单（`_kirolex-local/manifest.json`）躺在镜像里，而它是**本地写的**：每次拉完
+ * `writeBack` 都会重写一遍。于是和 `history.md` 那次一模一样的死循环 ——
+ * 本地重写 → 和远端那份不一致 → 下一次拉时 rsync 要覆盖它（"incoming"）→ 它又在
+ * "自推送以来本地变过"里 → **判成冲突**，每一轮多一个 `manifest.json.remote`。
+ * 实测：20 分钟里报了 20 次（07:45–07:52 每 20 秒一条）。
+ *
+ * 它对远端**毫无用处**（模型读的是暂存目录里的文件本身），所以两个方向都不传，
+ * 而且从本地快照里也去掉 —— 不然它照样会被算成"本地改动"。
+ * 注意路径以 `/` 开头：只匹配镜像根下的这一个文件，而不是任何叫 `manifest.json` 的东西
+ * （前端项目里那可是个真文件）。
+ */
+export const MIRROR_PRIVATE = [`/${BRIDGE_DIR}/manifest.json`];
 
 /** 一棵树大到这个程度就不是"一个项目"了 —— 实测家目录是 49064 个文件 / 2.6 GB。 */
 export const MAX_MIRROR_FILES = 20000;
@@ -289,8 +306,8 @@ export function pullArgs(spec: SyncSpec): string[] {
 export const RSYNC_IO_TIMEOUT_SEC = 300;
 
 function commonArgs(spec: SyncSpec): string[] {
-  /* 敏感项**永远**并进去：调用方给了自定义排除列表也不能把它们去掉 */
-  const ex = [...new Set([...(spec.excludes ?? DEFAULT_EXCLUDES), ...SENSITIVE_EXCLUDES])];
+  /* 敏感项和 KiroLex 自己的账本**永远**并进去：调用方给了自定义排除列表也不能把它们去掉 */
+  const ex = [...new Set([...(spec.excludes ?? DEFAULT_EXCLUDES), ...SENSITIVE_EXCLUDES, ...MIRROR_PRIVATE])];
   return [
     '-e', spec.sshCommand,
     `--timeout=${RSYNC_IO_TIMEOUT_SEC}`,
@@ -326,11 +343,20 @@ export function parseIncoming(out: string): string[] {
 /** 相对路径 → `size:mtimeMs`。只用来回答"这个文件自推送以来变过没有"。 */
 export type Snapshot = Record<string, string>;
 
-/** 排除判据：支持 `dir/`、`*.ext`、以及原样的名字。和 rsync 的规则对齐到够用为止。 */
+/** 排除判据：支持 `dir/`、`*.ext`、`/anchored/path`、以及原样的名字。和 rsync 的规则对齐到够用为止。 */
 export function isExcluded(rel: string, excludes: string[] = DEFAULT_EXCLUDES): boolean {
   const parts = rel.split('/');
   for (const raw of excludes) {
     const p = raw.replace(/^\/+/, '');
+    /*
+      `/` 开头 = **锚在同步根上的那一条路径**（rsync 的语义）。
+      少了这一支的后果不是"少排一个"，而是判据和 rsync **不一致**：rsync 不传它、
+      而本地快照仍然把它算成一个文件，于是它每次都出现在"本地变过"里（见 `MIRROR_PRIVATE`）。
+    */
+    if (raw.startsWith('/') && p.includes('/')) {
+      if (rel === p || rel.startsWith(`${p}/`)) return true;
+      continue;
+    }
     if (p.endsWith('/')) {
       const dir = p.slice(0, -1);
       if (parts.slice(0, -1).includes(dir)) return true;
@@ -473,7 +499,9 @@ export class RemoteMirror {
     this.remoteDir = opts.remoteDir;
     this.sshCommand = opts.sshCommand;
     this.io = opts.io || realIo;
-    this.excludes = opts.excludes || DEFAULT_EXCLUDES;
+    /* 账本也从**快照**里去掉 —— rsync 不传它，快照却把它算一个文件的话，
+       它每一轮都会出现在"自推送以来本地变过"里，然后每一轮都被判成冲突。 */
+    this.excludes = [...new Set([...(opts.excludes || DEFAULT_EXCLUDES), ...MIRROR_PRIVATE])];
     this.pullNever = opts.pullNever || [];
   }
 

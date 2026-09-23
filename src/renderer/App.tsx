@@ -55,8 +55,11 @@ declare global {
       /** 把一条已有会话切到另一台机器（`remoteId` 传 null = 本地）。 */
       setRemoteTarget?: (sessionId: string, remoteId: string | null, localDir?: string) =>
         Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
-      /** 某条会话的运行位置变了 —— 徽标和右键菜单那句话都靠它更新。 */
-      onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null }) => void) => () => void;
+      /** 只换工作目录，机器不变（会话界面上那个 📂）。 */
+      setWorkdir?: (sessionId: string, dir: string) =>
+        Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
+      /** 某条会话的运行位置/工作目录变了 —— 徽标、菜单那句话、会话里那个 📂 都靠它更新。 */
+      onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => () => void;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
       persistNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
@@ -401,6 +404,13 @@ export interface Session {
    * （`docs/DESIGN_remote_sessions.md`）。
    */
   remoteHost?: string;
+  /**
+   * **这条会话在哪棵树上干活**（记录为准；没归项目的会话是它自己的会话目录）。
+   *
+   * 会话界面上常驻显示它 ——「工作目录这个东西放到右侧会话」。远程会话尤其需要：远端只看得见
+   * 被镜像的那一个目录，所以"它读哪棵树"不该是要靠猜的事。
+   */
+  localDir?: string;
   /** User-archived: hidden from the main list into a collapsible Archived group. */
   archived?: boolean;
   folderId?: string | null; // legacy — retained for back-compat, no longer surfaced
@@ -2904,6 +2914,27 @@ const App: React.FC = () => {
     return entry;
   }, []);
 
+  /**
+   * **给这条会话换工作目录** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
+   *
+   * 它属于会话界面而不是右键菜单：这是一个**常驻事实**（它在哪棵树上干活），远程会话尤其 ——
+   * 远端只看得见被镜像的那一个目录，而"看不到我的文件"那次就是因为这件事只能靠猜。
+   * 藏在右键菜单里的东西既看不见当前值、也提示不了这件事存在。
+   *
+   * 走 `setWorkdir` 而不是 `setRemoteTarget`：机器不变这件事由主进程按记录保证，渲染层不参与
+   * （它手里只有 label，反查不到就会传 null 过去 —— 那是"切回本地"）。
+   */
+  const pickWorkdir = async (sid: string | null): Promise<void> => {
+    if (!sid) return;
+    const api = (window as any).kiroApi;
+    const picked = await api?.remotePickDir?.();
+    if (!picked?.path) return;
+    const r = await api?.setWorkdir?.(sid, picked.path)
+      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    /* 失败要让人看见：这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
+    if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '设置工作目录失败'));
+  };
+
   const renderPane = (sid: string | null, wantFocused: boolean, withHeader: boolean, paneStyle?: React.CSSProperties) => {
     /**
      * 「聚焦」这件事只能由 `currentSessionId` 说了算 —— 「这个会话里为什么会出现 flow 会话的内容」。
@@ -2978,6 +3009,9 @@ const App: React.FC = () => {
         onResetCredits={() => setUsageActionConfirm('resetCredits')}
         commands={focused ? commands : EMPTY_COMMANDS}
         onModelChange={(model) => { void handleModelChange(model, sid || undefined); }}
+        /* 这条会话在哪棵树上干活 —— 常驻显示在输入框下面那一排，点它换目录 */
+        workdir={session?.localDir}
+        onPickWorkdir={() => { void pickWorkdir(sid); }}
         kiroAgent={session?.kiroAgent || selectedKiroAgent}
         kiroAgents={kiroAgents}
         switchingAgent={focused && switchingAgent}

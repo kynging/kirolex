@@ -545,7 +545,9 @@ describe('侧栏那个 🌐 徽标真的到得了界面', () => {
 
   test('水化的**两条分支**都要带上 remoteHost（白名单少一个字段就等于没这个功能）', () => {
     assert.match(HK, /remoteHost: rec\.remoteHost \?\? \(existing as any\)\.remoteHost,/, '已有的会话');
-    assert.match(HK, /remoteHost: rec\.remoteHost,\s*\n\s*timestamp: rec\.updatedAt,/, '新从磁盘读到的会话');
+    assert.match(HK, /remoteHost: rec\.remoteHost,\s*\n\s*localDir: rec\.localDir,/, '新从磁盘读到的会话');
+    /* 工作目录是同一个白名单里的第二个字段（会话界面上那个 📂 显示的就是它）—— 漏一个就等于没这个功能 */
+    assert.match(HK, /localDir: rec\.localDir \?\? \(existing as any\)\.localDir,/, '已有的会话的工作目录');
   });
 
   test('徽标在右侧那排的**最末**，紧挨删除按钮', () => {
@@ -1023,7 +1025,9 @@ describe('两个创建入口都要带上远端目标', () => {
 describe('切换一条已有会话的机器', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
-  const at = M.indexOf("ipcMain.handle('acp:set-remote-target'");
+  /* 锚在**那段机械**上，不是 IPC 名字上：换机器和只换目录现在共用它（`applySessionTarget`），
+     两个 IPC 都只剩几行解析参数 —— 锚在 IPC 上会切到一段几乎空的代码，然后每条断言都"过了"。 */
+  const at = M.indexOf('const applySessionTarget = async (');
   const body = M.slice(at, at + 6000);
 
   test('**右键菜单优先于正在跑的任务**：照切，只是明确说那一轮被打断了', () => {
@@ -1082,15 +1086,10 @@ describe('切换一条已有会话的机器', () => {
     assert.match(CSS, /\.context-submenu-panel \{[^}]*left: 100%/s);
   });
 
-  test('切换时**不强制**问目录（目录另有一条明确入口），失败要让人看见', () => {
-    /* 切换那条路不许弹目录选择 —— 那个强制要求你否过一次；
-       但"选工作目录"作为**单独一条菜单项**是需要的（远端只能看见被镜像的那个目录）。 */
-    /* 只切 `onSetTarget` 自己的函数体 —— `onPickWorkdir`（它**应该**用 remotePickDir）就紧跟在后面 */
-    const at = SB.indexOf('const onSetTarget');
-    const end = SB.indexOf('const onPickWorkdir');
-    assert.ok(at > 0 && end > at);
-    assert.equal(/remotePickDir/.test(SB.slice(at, end)), false, '切换那条路不该弹目录');
-    assert.match(SB, /📂 工作目录…/, '但要有单独的一条');
+  test('切换时**不强制**问目录（目录是会话界面上一个独立的东西），失败要让人看见', () => {
+    /* 切换那条路不许弹目录选择 —— 那个强制要求你否过一次。
+       现在侧栏**整个**不碰目录了（见下面「工作目录在会话界面」那一组）。 */
+    assert.equal(/remotePickDir/.test(SB), false, '侧栏不该再弹目录选择');
     /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
     assert.match(SB, /window\.alert\(String\(r\?\.error/);
   });
@@ -1121,7 +1120,7 @@ describe('“没有项目目录”只有一种处理方式', () => {
  */
 describe('换机器：没连上也能切；切完界面要跟着变', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-  const at = M.indexOf("ipcMain.handle('acp:set-remote-target'");
+  const at = M.indexOf('const applySessionTarget = async (');
   const body = M.slice(at, at + 8000);
 
   test('**没连上不再拒绝** —— 执行器是下次打开时按记录起的，要求"先连上"是多余的门槛', () => {
@@ -1137,17 +1136,19 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     assert.match(body, /registerRemoteSync\(sessionId, coldProfile,/);
   });
 
-  test('两条路都把新位置发给界面（事件里带 remoteHost）', () => {
-    assert.equal((body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\) \}/g) || []).length, 2);
+  test('两条路都把新位置发给界面（事件里带 remoteHost + 工作目录）', () => {
+    /* 工作目录也在事件里：会话界面上那个 📂 显示的就是它，换完必须当场变 */
+    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir \}/g) || [];
+    assert.equal(sent.length, 2, `只有 ${sent.length} 处发了完整的新位置`);
   });
 
   test('渲染层**真的在听**这个事件（上一版发了但没人听 —— 徽标和菜单都停在旧值）', () => {
     const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
     const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
     assert.match(P, /onTargetsChanged:/);
-    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null \}\)/);
-    /* 徽标和右键菜单那句话看的是同一份状态，所以改一处就够 */
-    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined \}/);
+    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; localDir\?: string \}\)/);
+    /* 徽标、右键菜单那句话、会话界面上那个 📂 看的是同一份状态，所以改一处就够 */
+    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, localDir: d\.localDir \|\| s\.localDir \}/);
   });
 });
 
@@ -1335,15 +1336,76 @@ describe('工作目录 / 不要推两遍', () => {
     assert.match(M, /Querying knowledge base/);
   });
 
-  test('右键里有「📂 工作目录…」，且只在远程会话上出现', () => {
-    assert.match(SB, /📂 工作目录…/);
-    assert.match(SB, /const onPickWorkdir = async \(sessionId: string\): Promise<void> => \{/);
-    const at = SB.indexOf('📂 工作目录…');
-    assert.match(SB.slice(at - 400, at), /ctxSession\.remoteHost && \(/, '本地会话不需要这一条');
+  test('工作目录**不在右键菜单里**了 —— 它在会话界面', () => {
+    /* 「工作目录这个东西放到右侧会话，不要放在右键菜单」：它是个常驻事实（这条会话读写哪棵树），
+       菜单里既显示不出当前值、也提示不了这件事存在 —— 而「远程会话为什么访问不了本地的文件」
+       那次之所以只能靠猜，就是因为它当时在界面上根本不存在。 */
+    assert.equal(/📂 工作目录…/.test(SB), false, '菜单里不该再有这一条');
+    assert.equal(/onPickWorkdir/.test(SB), false, '侧栏也不该再有这个动作');
   });
 
   test('只换目录也算变化 —— 短路不能只看目标', () => {
     assert.match(M, /const dirChanged = !!localDir/);
     assert.match(M, /if \(\(target\?\.sshHost \|\| ''\) === currentRemote && !dirChanged\) return \{ ok: true, unchanged: true \};/);
+  });
+});
+
+/*
+ * 「工作目录这个东西放到右侧会话，不要放在右键菜单」。
+ *
+ * 为什么这个位置是对的：它是个**常驻事实**（这条会话读写哪棵树），而远端只看得见被镜像的那一个
+ * 目录 —— 「远程会话为什么访问不了本地的文件」那次之所以只能靠猜，就是因为这个值在界面上
+ * 根本不存在。菜单项既显示不出当前值，也提示不了这件事存在。
+ */
+describe('工作目录在会话界面上', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
+  const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+
+  test('输入框下面那一排有一格 📂，显示当前目录、点它换', () => {
+    assert.match(CA, /className="composer-meta-btn composer-workdir"/);
+    assert.match(CA, /onClick=\{\(\) => onPickWorkdir\?\.\(\)\}/);
+    /* 在**左**那一组里（右边那一组是"此刻在发生什么" + 模型） */
+    const left = CA.indexOf('composer-belowbar-left');
+    const right = CA.indexOf('composer-belowbar-right');
+    const at = CA.indexOf('composer-meta-btn composer-workdir');
+    assert.ok(left > 0 && at > left && at < right, '它属于左边那一组');
+    /* 完整路径在 title 里 —— 这一排很窄，格子里只放 basename */
+    assert.match(CA, /const workdirTitle = `工作目录：\$\{workdir \|\| '（还没定 —— 点这里选一个）'\}`/);
+  });
+
+  test('没归项目的会话说「会话目录」，不是那个没有信息量的 session id', () => {
+    assert.match(CA, /const inSessionDir = !!workdir && \/\\\/\\\.kirolex\\\/sessions\\\/\/\.test\(workdir\)/);
+    assert.match(CA, /inSessionDir \? '会话目录'/);
+    /* 并且要说清它读不到别处的文件 —— 这才是人下一步要做的判断 */
+    assert.match(CA, /选一个项目目录，它就能读写那棵树/);
+  });
+
+  test('值来自会话状态（记录为准），不是渲染层猜的', () => {
+    assert.match(M, /\.\.\.\(rec\.localDir \? \{ localDir: rec\.localDir \} : null\),/, '主进程要发');
+    assert.match(A, /workdir=\{session\?\.localDir\}/, '每一格用它自己那条会话的目录');
+    assert.match(A, /localDir\?: string;/);
+  });
+
+  test('**只换目录不许动机器** —— 单独一个 IPC，当前目标由主进程从记录里取', () => {
+    assert.match(P, /setWorkdir: \(sessionId: string, dir: string\) =>/);
+    assert.match(M, /ipcMain\.handle\('acp:set-workdir', async \(_event, sessionId: string, dir: string\) => \{/);
+    /* 关键的一行：机器从记录/执行器来。渲染层手里只有 label，按 label 反查一旦查不到就会传 null，
+       而 null 的意思是"切回本地" —— 只想换个目录，结果把会话从远端切了下来。 */
+    assert.match(M, /const current = sessionClients\.get\(sessionId\)\?\.profile\.remote/);
+    assert.match(M, /applySessionTarget\(sessionId, current\?\.sshHost \? current : undefined, dir\)/);
+    /* 渲染层这条路也不许再碰 setRemoteTarget */
+    const at = A.indexOf('const pickWorkdir');
+    const body = A.slice(at, at + 700);
+    assert.ok(at > 0);
+    assert.match(body, /api\?\.setWorkdir\?\.\(sid, picked\.path\)/);
+    assert.equal(/setRemoteTarget/.test(body), false, '换目录不该走换机器那个入口');
+  });
+
+  test('两个 IPC 共用同一段机械（不是把那 140 行抄两遍）', () => {
+    assert.match(M, /const applySessionTarget = async \(/);
+    assert.equal((M.match(/const applySessionTarget = async \(/g) || []).length, 1);
+    assert.match(M, /return applySessionTarget\(sessionId, target, localDir\);/);
   });
 });
