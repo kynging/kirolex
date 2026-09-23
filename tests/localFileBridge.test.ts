@@ -211,7 +211,8 @@ describe('远程会话要让人看页面：把 URL 说出来', () => {
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
     const b = remoteContextBlock({ hostLabel: 'tokyo-ec2', remoteDir: '/r/proj', localDir: '/l' });
     assert.match(b, /浏览器在\*\*他自己的机器\*\*上/);
-    assert.match(b, /把 URL 单独写成一行/);
+    /* 怎么让用户看到：走标记通道（细节和边界在 tests/localAction.test.ts） */
+    assert.match(b, /KIROLEX-LOCAL: open <http/);
     /* 只在远端 localhost 上监听的服务用户打不开 —— 这一条不说，它会给出一个点了没反应的链接 */
     assert.match(b, /localhost 上监听的服务他打不开/);
   });

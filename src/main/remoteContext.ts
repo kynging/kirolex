@@ -13,6 +13,8 @@
  * 这段话每轮都注入（几百字符），和 memory 块同一个位置：越靠近用户那句话越可能被遵守。
  */
 
+import { localActionHelp } from './localAction.ts';
+
 export interface RemoteContextInput {
   /** 给人看的机器名（设置里的 label）。 */
   hostLabel: string;
@@ -62,9 +64,9 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       公网地址（CloudFront / API Gateway 这类）用户能直接打开；只监听远端 localhost 的端口它打不开，
       那种情况要说清是哪个端口，让用户自己决定要不要转发。
     */
-    '· 用户的浏览器在**他自己的机器**上，不在这里。要让他看页面，就把 URL 单独写成一行 —— '
-      + 'KiroLex 会把它变成可点的链接，点开是他本地的浏览器。你不要试图在这台机器上开浏览器。'
+    '· 用户的浏览器在**他自己的机器**上，不在这里。'
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
+    localActionHelp(),
     '· 这台机器上**没有** `node_modules`、构建产物（它们不同步：原生依赖跨平台不能用），'
       + '也没有 LibreOffice。需要构建、跑测试、做预览/PPT 时，说出来让用户在本地做，不要在这里装依赖。',
   ].filter(Boolean).join('\n');

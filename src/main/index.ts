@@ -28,6 +28,7 @@ import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMir
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
+import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { mentionedPaths, stageFiles, writeBack } from './localFileBridge.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents } from './kiroAgents.ts';
@@ -128,6 +129,17 @@ interface SessionEntry {
    * 没必要挂在每一轮的尾巴上。判据用的就是防抖拉那个（判宽不判窄：疑似写过就拉）。
    */
   remoteWroteThisTurn?: boolean;
+  /**
+   * **远程会话的「在你机器上做一件事」通道**（见 `localAction.ts`）。
+   *
+   * `localLineBuf`：流式文本要**按整行**解析 —— 半行会把 URL 截成两半，而截半的地址可能仍然
+   * 合法（`https://x.com/a` 之于 `https://x.com/admin/delete`），那就成了"开了一个它没说的地址"。
+   * `localActionsThisTurn` / `openedLocally`：一轮最多两个、同一个地址一条会话只开一次 ——
+   * 防的是它**热心**（每验证一次弹一个标签页），不是恶意。
+   */
+  localLineBuf?: string;
+  localActionsThisTurn?: number;
+  openedLocally?: Set<string>;
   /**
    * **这一轮最大的一次工具输出有多少字符**（未裁剪的原始长度）——「好像 curl 那个大 json 的时候断掉了」。
    *
@@ -1514,6 +1526,44 @@ function executorPathMapper(sessionId: string): (p: string) => string {
 }
 
 /**
+ * **执行远程会话要求的本地动作** ——「那个本地工具调用的问题你能不能想想办法」。
+ *
+ * 唯一的动作是"在**你的**浏览器里打开一个 http(s) 地址"（边界和理由都在 `localAction.ts`）。
+ * 这里只负责三件事：按整行喂给解析器、守住额度、以及**每次都说出来** ——
+ * 你的机器上凭空弹出一个窗口，必须能对上是谁要求的。
+ */
+function runLocalActions(sessionId: string, entry: SessionEntry, chunk: string): void {
+  if (!chunk) return;
+  /* 整行才解析：半行可能把一个 URL 截成另一个仍然合法的地址 */
+  const buf = `${entry.localLineBuf || ''}${chunk}`;
+  const lines = buf.split('\n');
+  entry.localLineBuf = lines.pop() || '';
+  for (const line of lines) {
+    if (!line.includes(LOCAL_MARKER)) continue;
+    const { actions, rejected } = parseLocalActions(line);
+    for (const r of rejected) {
+      sessionNotice(sessionId, `⚠️ 它想让你这台机器做一件我不认的事：\`${r.raw.slice(0, 120)}\` —— ${r.why}。`);
+    }
+    for (const a of actions) {
+      if (entry.openedLocally?.has(a.target)) continue;   // 同一个地址一条会话只开一次
+      if ((entry.localActionsThisTurn || 0) >= MAX_LOCAL_ACTIONS_PER_TURN) {
+        sessionNotice(sessionId, `⚠️ 这一轮它已经要求打开 ${MAX_LOCAL_ACTIONS_PER_TURN} 个页面了，`
+          + `剩下的没开（\`${a.target}\`）—— 链接就在上面，需要的话点它。`);
+        return;
+      }
+      entry.localActionsThisTurn = (entry.localActionsThisTurn || 0) + 1;
+      (entry.openedLocally ||= new Set()).add(a.target);
+      const host = remoteSync.statusOf(sessionId)?.hostLabel || '远端';
+      void shell.openExternal(a.target).then(
+        () => sessionNotice(sessionId, `🌐 已在**你的**浏览器里打开 \`${a.target}\`（${host} 上的它要求的）。`),
+        (err: any) => sessionNotice(sessionId, `⚠️ 它要求打开 \`${a.target}\`，但没打开：${err?.message || err}`),
+      );
+      logger.info('remote', `本地动作 open ${a.target} sessionId=${sessionId}`);
+    }
+  }
+}
+
+/**
  * 这条会话要注入的「运行环境：远程」说明（本地会话返回空串）。
  *
  * 路径两边都给：远端那份是 `entry.cwd`（就是镜像），本地那份是 `entry.localDir`。
@@ -2340,6 +2390,9 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       if (u?.sessionUpdate === 'agent_message_chunk') {
         entry.assistantBuf += u?.content?.text || '';
         if (!entry.assistantMsgId) entry.assistantMsgId = u?.messageId || `a_${Date.now()}`;
+        /* 远程会话：它可能在这几行里要求"在用户机器上打开某个页面"—— 边流边认，别等到一轮结束
+           （一轮可能还要跑几分钟，而"让我看看进度"的价值就在于**现在**看） */
+        if (entry.profile.remote?.sshHost) runLocalActions(sessionId, entry, u?.content?.text || '');
       }
       if (u?.sessionUpdate === 'tool_call' || u?.sessionUpdate === 'tool_call_update') {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
@@ -3722,6 +3775,8 @@ app.whenReady().then(async () => {
           entry.openToolCalls?.clear();
           entry.toolsThisTurn = 0;       // 这一轮的工具计数从零开始（自动重试的安全闸）
           entry.remoteWroteThisTurn = false;   // 远程：这一轮有没有工具写过文件（决定收尾要不要拉）
+          entry.localActionsThisTurn = 0;      // 「在你机器上打开」的额度按轮给（见 localAction.ts）
+          entry.localLineBuf = '';             // 上一轮的半行不能拼到这一轮的第一行上
           entry.maxToolOutputThisTurn = 0;
           entry.wedgeNote = undefined;   // never let one turn's note reach another
           let noticeSent = false;
