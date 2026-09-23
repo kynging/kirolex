@@ -28,6 +28,7 @@ import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMir
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
+import { mentionedPaths, stageFiles, writeBack } from './localFileBridge.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents } from './kiroAgents.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
@@ -1405,6 +1406,26 @@ const remoteSync = new RemoteSyncManager({
   log: (level, message) => logger[level]('remote', message),
   /* 同步状态给界面：`stale`（本地不是最新的）和 `conflict` 必须看得见，不能只写在日志里 */
   onStatus: (status) => { mainWindow?.webContents.send('remote:sync', status); },
+  /**
+   * 拉完把**摆渡进来的本地文件**写回原处 ——「给远程会话也加上读和修改本地文件的能力」。
+   * 远端只能看见镜像，所以你提到的那些本地文件是被拷进镜像再改的；改完必须送回原地，
+   * 否则"它说改好了，而你打开文件什么都没变"。
+   */
+  afterPull: (sessionId) => {
+    const entry = sessionClients.get(sessionId);
+    const dir = entry ? localProjectDirOf(sessionId, entry) : store.readRecord(sessionId)?.localDir;
+    if (!dir) return;
+    const r = writeBack(dir);
+    if (r.written.length) {
+      sessionNotice(sessionId, `📝 远端改过的这些文件已经写回原处：`
+        + r.written.map((f) => `\`${f}\``).join('、'));
+      logger.info('remote', `摆渡文件写回 ${r.written.length} 个 sessionId=${sessionId}`);
+    }
+    if (r.conflicts.length) {
+      sessionNotice(sessionId, `⚠️ 这些文件你和远端都改过，**本地那份没有动**，远端那份放在旁边了：`
+        + r.conflicts.map((f) => `\`${f}.remote\``).join('、'));
+    }
+  },
 });
 
 /**
@@ -3841,6 +3862,38 @@ app.whenReady().then(async () => {
             本地会话在 `remoteSync` 里没有登记，这两句是死代码 —— 共存的前提是本地一个字节不变。
           */
           if (remoteSync.isRemote(sessionId)) {
+            /*
+              **你提到的本地文件，摆渡进镜像再把路径改写成远端那一份**
+              ——「给远程会话也加上读和修改本地文件的能力啊」。
+
+              远端只能看见被镜像的那个目录（实测 kiro-cli 不用 ACP 的客户端 fs 能力），所以
+              `~/Downloads/x.md` 这种路径在它那儿根本不存在，而"读不到"会被它当成"没有这个东西"。
+              只摆渡**你自己写出来的绝对路径** —— 不扫目录、不猜：悄悄把一棵树搬过去正是这个功能
+              最危险的走法（那笔账见 `mirrorRefusal`）。改完之后由 `afterPull` 写回原处。
+            */
+            const bridgeDir = localProjectDirOf(sessionId, entry);
+            const remoteRoot = entry.cwd;
+            const text = (prompt || []).map((b: any) => (typeof b?.text === 'string' ? b.text : '')).join('\n');
+            const wanted = mentionedPaths(text).filter((f) => !f.startsWith(`${bridgeDir}/`));
+            if (wanted.length) {
+              const res = stageFiles(bridgeDir, wanted);
+              if (res.staged.length) {
+                const map = new Map(res.staged.map((e) => [e.local, posixJoin(remoteRoot, e.rel)]));
+                prompt = (prompt || []).map((b: any) => {
+                  if (!b || b.type !== 'text' || typeof b.text !== 'string') return b;
+                  let t = b.text;
+                  for (const [local, remote] of map) t = t.split(local).join(remote);
+                  return { ...b, text: t };
+                });
+                sessionNotice(sessionId, `📎 这些本地文件已经带到 ${remoteSync.statusOf(sessionId)?.hostLabel || '远端'}：`
+                  + res.staged.map((e) => `\`${path.basename(e.local)}\``).join('、')
+                  + `（它改完会自动写回原处）`);
+                logger.info('remote', `摆渡 ${res.staged.length} 个本地文件 sessionId=${sessionId}`);
+              }
+              for (const r of res.refused) {
+                sessionNotice(sessionId, `⚠️ \`${r.local}\` 没有带过去：${r.why}。`);
+              }
+            }
             const peer = busyPeer(
               Array.from(sessionClients.entries()).map(([sid, e]) => ({
                 sessionId: sid, localDir: localProjectDirOf(sid, e), busy: !!e.busy,

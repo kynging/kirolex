@@ -48,6 +48,12 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       + `这台机器上没有 history.md / transcript.jsonl 之类的文件，别去找。` : '',
     '· 文件**以用户本地那份为准**：每一轮开始前本地会同步到这里，你改完之后会同步回去。'
       + '所以你写的东西不会丢，也不需要自己往回拷。',
+    /*
+      摆渡目录 —— 用户在消息里提到的、**镜像之外**的本地文件会被拷到这里，消息里的路径也已经
+      改写成这里的路径。不说清的话它会困惑："他让我改 ~/Downloads/x.md，可这个路径不存在"。
+    */
+    `· 用户提到的、这个目录之外的本地文件会被放到 \`${input.remoteDir}/_kirolex-local/\` 下，`
+      + '消息里的路径已经替换成那儿的路径了。你直接改那份，KiroLex 会把它写回用户机器上的原处。',
     '· 这台机器上**没有** `node_modules`、构建产物（它们不同步：原生依赖跨平台不能用），'
       + '也没有 LibreOffice。需要构建、跑测试、做预览/PPT 时，说出来让用户在本地做，不要在这里装依赖。',
   ].filter(Boolean).join('\n');

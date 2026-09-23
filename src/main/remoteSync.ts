@@ -77,6 +77,11 @@ export interface SyncDeps {
   log(level: 'info' | 'warn', message: string): void;
   /** 状态变了告诉界面（同一个状态不重复发）。 */
   onStatus?(status: SyncStatus): void;
+  /**
+   * 一次**成功的拉**之后（用来把摆渡进来的本地文件写回原处，见 `localFileBridge`）。
+   * 放在这里而不是 `RemoteMirror` 里：写回是"镜像之外"的事，镜像只管两个目录之间的同步。
+   */
+  afterPull?(sessionId: string): void;
   /** 防抖用；注入是为了测试里不真的等 800ms。 */
   schedule?(fn: () => void, ms: number): void;
   /** 周期性提示用（注入是为了测试里不真的等 15 秒）。返回一个"取消"函数。 */
@@ -313,6 +318,8 @@ export class RemoteSyncManager {
       return r;
     }
     this.owed.delete(sessionId);
+    /* 摆渡进来的本地文件写回原处（远端改过的那些）—— 见 `localFileBridge.writeBack` */
+    try { this.deps.afterPull?.(sessionId); } catch { /* 写回失败不该影响这次拉的结论 */ }
     this.emit(sessionId, r.conflicts.length ? 'conflict' : 'idle', r.conflicts.length ? { conflicts: r.conflicts } : {});
     if (r.conflicts.length) {
       /* 冲突必须说，而且要说清"你的那份没被动" —— 否则人第一反应是"我的修改被覆盖了" */
