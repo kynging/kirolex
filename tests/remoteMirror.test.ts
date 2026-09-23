@@ -558,8 +558,12 @@ describe('会话的工作目录以记录为准，不是渲染层传的 `~`', () 
 
   test('attach 时**以记录为准**，渲染层给的只作兜底', () => {
     assert.match(M, /const resolvedCwd = store\.readRecord\(sessionId\)\?\.localDir \|\| askedCwd;/);
-    /* 老会话第一次 attach 之后补写，下次就不靠渲染层 */
-    assert.match(M, /if \(!rec\.localDir\) rec\.localDir = resolvedCwd;/);
+    /*
+      老会话补写，但**只在渲染层给了具体目录时**才写：`'~'` 是它的默认值，不是这条会话的目录。
+      上一版把它当真存了下来 —— 实测一次重启就给 6 条会话钉上 `/Users/keyinan`，
+      而那个值正好会触发"家目录不能做镜像"。
+    */
+    assert.match(M, /if \(!rec\.localDir && cwd !== '~'\) rec\.localDir = askedCwd;/);
   });
 
   test('渲染层那三处 `~` 还在（本地会话靠它，不能顺手改动）—— 所以主进程必须自己兜住', () => {

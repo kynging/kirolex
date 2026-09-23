@@ -5975,8 +5975,13 @@ app.whenReady().then(async () => {
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.cliSessionId = cliSessionId;
       rec.executorState = 'attached';
-      /* 老会话第一次 attach 之后也把目录记下来，下一次就不用再靠渲染层传 */
-      if (!rec.localDir) rec.localDir = resolvedCwd;
+      /*
+        老会话补写目录，但**只在渲染层给了具体目录时**才写。
+        `'~'` 是它的默认值、不是这条会话的目录 —— 把它当真存下来等于给每条会话钉上"家目录"，
+        而那正好会触发"家目录不能做镜像"（实测：上一版这么写，一次重启就给 6 条会话写上了
+        `/Users/keyinan`）。宁可留空、下次再说。
+      */
+      if (!rec.localDir && cwd !== '~') rec.localDir = askedCwd;
       /*
         Persist the model that ACTUALLY started. Without this the record keeps
         pointing at a retired model (e.g. claude-opus-5), so EVERY later startup
