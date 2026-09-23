@@ -360,6 +360,17 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir),
   /** 选一个项目目录（切到远端时用）。 */
   remotePickDir: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-dir'),
+  /**
+   * 某条会话的运行位置变了（换机器）。
+   *
+   * 徽标和右键菜单里那句「运行位置：…」用的是**同一份**会话状态，不听这个事件的话两处都会停在旧值上
+   * —— 实测就是这样：切完了，但侧栏没徽标、菜单还写着"本地"。
+   */
+  onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('session:targets-changed', handler);
+    return () => ipcRenderer.removeListener('session:targets-changed', handler);
+  },
   /** 用 Finder 选私钥（默认开在 ~/.ssh，并显示隐藏文件 —— 否则那个目录根本看不到）。 */
   remotePickKey: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-key'),
   /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */

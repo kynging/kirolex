@@ -5201,19 +5201,27 @@ app.whenReady().then(async () => {
     localDir?: string,
   ) => {
     const oldEntry = sessionClients.get(sessionId);
-    if (!oldEntry) throw new Error('这条会话还没连上，先打开它再切换。');
-    if (oldEntry.busy) throw new Error('这一轮还在跑 —— 等它结束再切换机器（切换会把执行器换掉，正在跑的那一轮会丢）。');
+    if (oldEntry?.busy) throw new Error('这一轮还在跑 —— 等它结束再切换机器（切换会把执行器换掉，正在跑的那一轮会丢）。');
     if (reconfiguringSessions.has(sessionId)) throw new Error('上一次切换还没完成，稍等。');
 
     const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
     if (remoteId && !target) throw new Error(`找不到远端目标 ${remoteId}（设置里删掉了？）—— 没有猜一台机器。`);
-    const wasRemote = !!oldEntry.profile.remote?.sshHost;
-    if (!!target === wasRemote && (target?.sshHost || '') === (oldEntry.profile.remote?.sshHost || '')) {
-      return { ok: true, unchanged: true };
-    }
+    const rec0 = store.readRecord(sessionId);
+    if (!oldEntry && !rec0) throw new Error('找不到这条会话的记录。');
+    const currentRemote = oldEntry?.profile.remote?.sshHost || rec0?.profile?.remote?.sshHost || '';
+    const wasRemote = !!currentRemote;
+    if ((target?.sshHost || '') === currentRemote) return { ok: true, unchanged: true };
 
     /* 切回本地：先把远端的改动拉回来，拉不回来就别切 */
     if (wasRemote && !target) {
+      /*
+        没连上的会话也要先拉 —— 规则不能因为"执行器没起来"就松掉：远端那份工作照样在那台机器上。
+        镜像本身不需要执行器（它只要 remote + 两个目录），所以临时登记一下、拉完再说。
+      */
+      if (!remoteSync.isRemote(sessionId)) {
+        const coldProfile = (oldEntry?.profile || rec0!.profile) as AgentProfile;
+        registerRemoteSync(sessionId, coldProfile, localDirOrSessionDir(sessionId, rec0?.localDir || oldEntry?.localDir));
+      }
       const fresh = await remoteSync.pullNow(sessionId);
       if (!fresh) {
         throw new Error('远端还有改动没取回来，先不切回本地 —— 切了那份工作就留在那台机器上了。'
@@ -5232,11 +5240,32 @@ app.whenReady().then(async () => {
     */
     const nextLocalDir = localDirOrSessionDir(
       sessionId,
-      localDir || store.readRecord(sessionId)?.localDir || oldEntry.localDir,
+      localDir || rec0?.localDir || oldEntry?.localDir,
     );
     if (target) {
       const refusal = mirrorRefusal(nextLocalDir, os.homedir());
       if (refusal) throw new Error(refusal);
+    }
+
+    const hostLabelOf = (t?: RemoteTarget): string | null =>
+      (t ? (labelForHost(KIROLEX_CONFIG_PATH, t.sshHost) || t.sshHost || null) : null);
+
+    /*
+      **没连上的会话：只改记录就够** ——「会话还没连上也应该能切远程切 project 啊」。
+      执行器是下次打开时按记录起的，所以这时候没有任何东西要换；要求"先连上"纯属多余的门槛。
+    */
+    if (!oldEntry) {
+      const rec = rec0!;
+      rec.profile = { ...rec.profile, remote: target ? { ...target } : undefined } as AgentProfile;
+      rec.localDir = nextLocalDir;
+      store.writeRecord(rec);
+      remoteSync.forget(sessionId);
+      const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
+      noteInSession(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
+        + `它现在没有连着，所以没有执行器要换；对话一条都没动。`);
+      logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
+      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
+      return { ok: true, remoteHost: hostLabelOf(target), cold: true };
     }
 
     await awaitAttachIdle(sessionId);
@@ -5285,12 +5314,12 @@ app.whenReady().then(async () => {
         markContextOwedIfUnverified(sessionId, 'switch-remote-target');
         restoreContextAfterExecutorSwap(sessionId, 'switch-remote-target');
 
-        const where = target ? `远端 ${labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost}` : '本地';
+        const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
         noteInSession(sessionId, `🔀 这条会话从现在开始跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
           + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`);
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
-        mainWindow?.webContents.send('session:targets-changed', { sessionId });
-        return { ok: true, remoteHost: target ? (labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost) : null };
+        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target) });
+        return { ok: true, remoteHost: hostLabelOf(target) };
       } catch (err) {
         try { await client.disconnect(); } catch {}
         throw err;

@@ -52,6 +52,11 @@ declare global {
       remoteStatus?: (sessionId: string) => Promise<RemoteSyncStatus | null>;
       /** 同步状态变了。`stale` = 本地不是最新的。 */
       onRemoteSync?: (cb: (s: RemoteSyncStatus) => void) => () => void;
+      /** 把一条已有会话切到另一台机器（`remoteId` 传 null = 本地）。 */
+      setRemoteTarget?: (sessionId: string, remoteId: string | null, localDir?: string) =>
+        Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
+      /** 某条会话的运行位置变了 —— 徽标和右键菜单那句话都靠它更新。 */
+      onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null }) => void) => () => void;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
       persistNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;

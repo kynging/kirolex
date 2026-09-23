@@ -1295,6 +1295,24 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     }
   }, []);
 
+  /**
+   * **换机器之后把这条会话的位置改过来** ——「切了之后会话也没有远程 tag」+
+   * 「切了之后那个右键菜单里为什么不变」。
+   *
+   * 两处看的是**同一份**会话状态（侧栏徽标 `session.remoteHost`、右键菜单里那句「运行位置：…」），
+   * 而主进程那边虽然发了 `session:targets-changed`，渲染层从来没人听 —— 于是切完了，
+   * 界面停在旧值上，直到下一次整页水化。
+   */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null }) => {
+      if (!d?.sessionId) return;
+      setSessions((prev) => prev.map((s) => (s.id === d.sessionId
+        ? { ...s, remoteHost: d.remoteHost || undefined }
+        : s)));
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
   // Load messages cache from localStorage on init and restore last session messages
   useEffect(() => {
     // Message bodies are NO LONGER mirrored into localStorage. That cache had

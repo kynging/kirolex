@@ -1028,11 +1028,12 @@ describe('切换一条已有会话的机器', () => {
 
   test('有一轮在跑就拒绝 —— 切换会把执行器连根拔掉', () => {
     assert.ok(at > 0, 'IPC 要存在');
-    assert.match(body, /if \(oldEntry\.busy\) throw new Error\('这一轮还在跑/);
+    assert.match(body, /if \(oldEntry\?\.busy\) throw new Error\('这一轮还在跑/);
   });
 
   test('**切回本地之前先把远端改动拉干净**，拉不回来就不切', () => {
-    assert.match(body, /if \(wasRemote && !target\) \{\s*\n\s*const fresh = await remoteSync\.pullNow\(sessionId\);/);
+    assert.match(body, /if \(wasRemote && !target\) \{/);
+    assert.match(body, /const fresh = await remoteSync\.pullNow\(sessionId\);/);
     assert.match(body, /先不切回本地 —— 切了那份工作就留在那台机器上了/);
   });
 
@@ -1098,6 +1099,43 @@ describe('“没有项目目录”只有一种处理方式', () => {
   });
 
   test('三条路（新建 / attach / 换机器）都走它 —— 上一版只有两条走，第三条就撞了那句拒绝', () => {
-    assert.equal((M.match(/localDirOrSessionDir\(/g) || []).length, 4, '定义 1 处 + 三条路');
+    /* 数量随出口增加（冷路径切回本地也要算目录），钉的是"每条路都走它" */
+    assert.ok((M.match(/localDirOrSessionDir\(/g) || []).length >= 4, '定义 1 处 + 新建/attach/换机器');
+  });
+});
+
+/*
+ * 「会话还没连上也应该能切远程切 project 啊」+「切了之后会话也没有远程 tag」+
+ * 「切了之后那个右键菜单里为什么不变」—— 三件，两个 bug。
+ */
+describe('换机器：没连上也能切；切完界面要跟着变', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const at = M.indexOf("ipcMain.handle('acp:set-remote-target'");
+  const body = M.slice(at, at + 8000);
+
+  test('**没连上不再拒绝** —— 执行器是下次打开时按记录起的，要求"先连上"是多余的门槛', () => {
+    assert.equal(/这条会话还没连上，先打开它再切换/.test(M), false, '这道门槛不许再有');
+    assert.match(body, /if \(!oldEntry\) \{/);
+    assert.match(body, /这条会话下次打开会跑在\*\*\$\{where\}\*\*上/);
+    /* 冷路径只改记录 */
+    assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*store\.writeRecord\(rec\);/);
+  });
+
+  test('冷路径切回本地**照样先拉** —— 规则不能因为"没连上"就松掉', () => {
+    assert.match(body, /if \(!remoteSync\.isRemote\(sessionId\)\) \{\s*\n\s*const coldProfile/);
+    assert.match(body, /registerRemoteSync\(sessionId, coldProfile,/);
+  });
+
+  test('两条路都把新位置发给界面（事件里带 remoteHost）', () => {
+    assert.equal((body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\) \}/g) || []).length, 2);
+  });
+
+  test('渲染层**真的在听**这个事件（上一版发了但没人听 —— 徽标和菜单都停在旧值）', () => {
+    const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
+    const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+    assert.match(P, /onTargetsChanged:/);
+    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null \}\)/);
+    /* 徽标和右键菜单那句话看的是同一份状态，所以改一处就够 */
+    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined \}/);
   });
 });
