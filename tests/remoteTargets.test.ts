@@ -1231,3 +1231,24 @@ describe('KiroLex 的提示走状态行；换项目不许杀掉正在跑的一�
     assert.ok(guard < body.indexOf('detachExecutor(sessionId);'));
   });
 });
+
+/*
+ * 「为什么还是移动不了」/「草为什么远程 session 换不了 project」—— 真凶不是移动那条路：
+ * 侧栏里出现了一个**以会话 id 命名的假项目**（实测分组名 `s_1790128678028_da1rhi`）。
+ * 因为没归项目的远程会话镜像根是它自己的会话目录，而项目 id 是从目录名推出来的 ——
+ * 于是每次 attach 都把它塞回那个假项目，你移到别处、下次连上又回来。
+ */
+describe('项目 id 不能从会话目录推出来', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('会话目录 / `~/.kirolex` 下的任何目录都不算项目', () => {
+    assert.match(M, /function derivedProjectFor\(sessionId: string, dir: string\): string \| undefined \{/);
+    assert.match(M, /if \(d === getSessionDir\(sessionId\) \|\| d\.startsWith\(path\.join\(os\.homedir\(\), '\.kirolex'\)\)\) return undefined;/);
+  });
+
+  test('新建和 attach 两条路都走它（旧判据只挡了家目录）', () => {
+    assert.equal((M.match(/derivedProjectFor\(/g) || []).length, 3, '定义 1 处 + 两条路');
+    assert.equal(/const derived = resolvedCwd === os\.homedir\(\) \? undefined : deriveProjectId\(resolvedCwd\)/.test(M), false,
+      '旧判据不许留下 —— 它只挡家目录，会话目录照样会被推成项目');
+  });
+});

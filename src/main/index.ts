@@ -1553,6 +1553,23 @@ async function syncKiroAgent(sessionId: string, remote: RemoteTarget, agent?: st
 }
 
 /**
+ * **项目 id 不能从会话目录推出来** ——「为什么还是移动不了」。
+ *
+ * 一条没归项目的远程会话，镜像根是它自己的会话目录（`~/.kirolex/sessions/<id>/`）。
+ * 而 `deriveProjectId` 取的是目录名 —— 于是它推出来的"项目"就是**会话 id 本身**：
+ * 实测侧栏里真的出现了一个叫 `s_1790128678028_da1rhi` 的分组，那条会话每次 attach 都被塞回去，
+ * 你把它移到别处、下次连上又回来，表现就是"怎么移都移不动"。
+ *
+ * `~/.kirolex` 下的任何目录都不是项目：那是 KiroLex 自己的数据目录。
+ */
+function derivedProjectFor(sessionId: string, dir: string): string | undefined {
+  const d = String(dir || '');
+  if (!d || d === os.homedir()) return undefined;
+  if (d === getSessionDir(sessionId) || d.startsWith(path.join(os.homedir(), '.kirolex'))) return undefined;
+  return deriveProjectId(d);
+}
+
+/**
  * **"没有项目目录"的统一说法** ——「现在显示不能把家目录推到远程服务器」。
  *
  * 空字符串和家目录是**同一件事**：都表示"这条会话没有项目目录"。家目录之所以会出现，
@@ -3252,7 +3269,7 @@ app.whenReady().then(async () => {
     }
     const sessionDir = getSessionDir(kiroLexId);
     let resolvedCwd = cwd === '~' ? os.homedir() : cwd;
-    const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
+    const derived = derivedProjectFor(kiroLexId, resolvedCwd);
     /*
       feature flag 关着的时候一条远程会话都建不起来 —— 主路上那几句同步代码就是死代码。
       老配置里的 `agents[].remote`（全局开关）不再自动生效：它只会作为一个**可选目标**
@@ -6055,7 +6072,7 @@ app.whenReady().then(async () => {
       if (!existing) {
         throw new Error('该会话在磁盘上不存在（可能已被删除），不再重建。');
       }
-      const derived = resolvedCwd === os.homedir() ? undefined : deriveProjectId(resolvedCwd);
+      const derived = derivedProjectFor(sessionId, resolvedCwd);
       const projectId = existing?.profile.projectId ?? derived;
       const profile: AgentProfile = {
         model: model || existing?.profile.model || DEFAULT_MODEL,
