@@ -199,8 +199,17 @@ export function defaultRemoteWorkdir(sshHost: string): string {
  */
 export function sessionCwd(profile: AgentProfile, localDefault: string): string {
   if (profile.remote?.sshHost) {
+    /*
+      **远端不再放项目的副本** ——「要不把镜像去掉，我们尝试一下给远程配一些能调用本地 MCP 的能力？」
+
+      用户的文件留在他自己机器上，远端那条会话通过反向隧道调本地工具去读写
+      （`localMcp.ts` / `remoteLocalTools.ts`）。所以远端的 cwd 只是一个**草稿目录**：
+      它自己要落个临时文件时有地方放，而不是"项目在这里"。
+      一条会话一个目录 —— 共用一个的话两条会话的临时文件会互相覆盖。
+    */
     const wd = profile.remote.remoteWorkdir || defaultRemoteWorkdir(profile.remote.sshHost);
-    return mirrorDirFor(wd, localDefault);
+    const tag = mirrorDirFor(wd, localDefault).split('/').pop() || 'session';
+    return `${wd.replace(/\/+$/, '')}/scratch/${tag}`;
   }
   return localDefault;
 }

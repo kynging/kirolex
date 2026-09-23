@@ -1,4 +1,4 @@
-import { spawn, ChildProcess } from 'child_process';
+import { spawn, execFile, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -95,6 +95,9 @@ export class AcpClient extends EventEmitter {
   private buffer = '';
   private env: Record<string, string>;
   private remote?: RemoteTarget;
+  private localTools?: { remotePort: number; localPort: number; agentOverride: string };
+  /** 远端那个 kiro-cli 的 PID（它自己报的）—— 断开时要把它杀掉，见 `KIROLEX_PID`。 */
+  remotePid?: number;
 
   constructor(
     model: string,
@@ -102,10 +105,21 @@ export class AcpClient extends EventEmitter {
     kiroAgent?: string,
     permissionMode: PermissionMode = 'auto-approve',
     remote?: RemoteTarget,
+    /**
+     * **本地工具通道**（`localMcp.ts`）——「给远程配一些能调用本地 MCP 的能力」。
+     *
+     * `remoteForward`：`ssh -R <远端端口>:127.0.0.1:<本地端口>`，让远端的 kiro-cli 能敲到
+     * 跑在你 Mac 上的那个 MCP server。
+     * `agentOverride`：那条会话专用的 agent 名字 —— MCP 的 URL 里带着会话 token，所以配置**必须**
+     * 一条会话一份（共用一份的话服务端分不出是谁在调，也就不知道 cwd 是哪个目录）。
+     * 它只影响这次启动，不写进记录（记录里仍然是你选的那个 agent）。
+     */
+    localTools?: { remotePort: number; localPort: number; agentOverride: string },
   ) {
     super();
     this.model = model;
     this.kiroAgent = kiroAgent;
+    this.localTools = localTools;
     this.permissionMode = permissionMode;
     this.env = env || (process.env as Record<string, string>);
     this.remote = remote;
@@ -128,7 +142,11 @@ export class AcpClient extends EventEmitter {
         // rest of this client is unchanged. The remote kiro-cli operates on the
         // remote filesystem and loads the remote host's own MCP/agent config.
         command = 'ssh';
-        args = buildSshArgs(this.remote, buildRemoteKiroCommand(this.model, this.kiroAgent));
+        args = buildSshArgs(
+          this.remote,
+          buildRemoteKiroCommand(this.model, this.localTools?.agentOverride || this.kiroAgent),
+          this.localTools ? { remotePort: this.localTools.remotePort, localPort: this.localTools.localPort } : undefined,
+        );
       } else {
         // Local executor: search for the kiro-cli binary on this machine.
         const possiblePaths = kiroCliCandidates();
@@ -185,6 +203,9 @@ export class AcpClient extends EventEmitter {
 
       this.process.stderr!.on('data', (data: Buffer) => {
         const msg = data.toString('utf-8').trim();
+        /* 远端自报的 PID：记下来，断开时要杀它（见 buildRemoteKiroCommand 那段） */
+        const pid = parseRemotePid(msg);
+        if (pid) this.remotePid = pid;
         if (msg) {
           this.emit('error', { type: 'stderr', message: msg });
         }
@@ -264,6 +285,20 @@ export class AcpClient extends EventEmitter {
       if (outcome === 'timeout') {
         try { proc.kill(); } catch { /* already gone */ }
       }
+    }
+    /*
+      **远端那个进程要单独杀** —— 杀掉本地的 ssh 并不会带走它（实测那台 EC2 上攒了 85 个孤儿
+      kiro-cli，最老的 2 天 23 小时），而它一直占着那条 kiro-cli 会话的锁：下一次 attach 或者
+      换模型就报「Session is active in another process」，然后一连串 `Session not connected`。
+      不等结果、也不管失败：这是收尾动作，卡在这儿会把"换模型"变成"界面卡住"。
+    */
+    if (this.remote?.sshHost && this.remotePid) {
+      const pid = this.remotePid;
+      this.remotePid = undefined;
+      try {
+        execFile('ssh', [...buildSshArgs(this.remote, `kill -TERM ${pid} 2>/dev/null || true`)],
+          { timeout: 15_000 }, () => {});
+      } catch { /* 收尾失败不该影响断开本身 */ }
     }
     this.rejectAllPending(new Error('Disconnected'));
   }
@@ -614,10 +649,32 @@ export function shellQuote(value: string): string {
  * kiro-cli's default install dir (~/.local/bin). The session working directory
  * is supplied later via ACP `session/new` cwd, so no `cd` is needed here.
  */
+/**
+ * 远端要跑的那条命令。
+ *
+ * **先把 PID 报出来再 exec** ——「Session is active in another process (PID 1272360)」。
+ * 实测那台 EC2 上堆了 **85 个**孤儿 kiro-cli（最老的跑了 2 天 23 小时）：ssh 这边死掉之后，
+ * 远端那个进程**不会**跟着退（没有 PTY，它也不在读到 EOF 时退出），于是它一直占着那条
+ * kiro-cli 会话的锁。下一次 attach / 换模型就撞上"会话在另一个进程里"，然后表现成
+ * 一连串 `Session not connected` —— 看起来就是"这条会话串了/坏了"。
+ *
+ * `$$` 是那个 bash 的 PID，而 `exec` 之后 kiro-cli **就是同一个 PID**，所以这一行报出来的
+ * 就是要杀的那个。走 stderr：stdout 是 ACP 的协议流，掺一个字节进去就毁了它。
+ */
 function buildRemoteKiroCommand(model: string, kiroAgent?: string): string {
   let cli = `kiro-cli acp --model ${shellQuote(model)}`;
   if (kiroAgent) cli += ` --agent ${shellQuote(kiroAgent)}`;
-  return `bash -lc ${shellQuote(`exec ${cli}`)}`;
+  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; exec ${cli}`)}`;
+}
+
+/** 远端 kiro-cli 自报 PID 用的前缀（stderr 上的一行）。 */
+export const REMOTE_PID_MARKER = 'KIROLEX_REMOTE_PID';
+
+/** 从 stderr 里认出那一行。认不出返回 undefined —— 杀不掉比杀错好。 */
+export function parseRemotePid(chunk: string): number | undefined {
+  const m = new RegExp(`${REMOTE_PID_MARKER}\\s+(\\d+)`).exec(String(chunk || ''));
+  const pid = m ? Number(m[1]) : NaN;
+  return Number.isFinite(pid) && pid > 1 ? pid : undefined;
 }
 
 /**
@@ -635,7 +692,19 @@ function buildRemoteKiroCommand(model: string, kiroAgent?: string): string {
  * such a loop reports green forever. Sharing this function keeps the "is it remote"
  * decision identical to the one `AcpClient.connect()` makes.
  */
-export function buildSshArgs(remote: RemoteTarget, remoteCommand: string): string[] {
+export function buildSshArgs(
+  remote: RemoteTarget,
+  remoteCommand: string,
+  /**
+   * 反向隧道：远端的 `127.0.0.1:remotePort` 通到你 Mac 上的 `127.0.0.1:localPort`
+   * —— 本地工具通道就走它（`localMcp.ts`）。
+   *
+   * `ExitOnForwardFailure=yes` 是**故意**的：端口占用时宁可连不上，也不要起一个
+   * "看起来好了、其实没有本地工具"的执行器 —— 那种降级是静默的，而模型会把
+   * "工具调不通"解释成"这个文件不存在"。
+   */
+  forward?: { remotePort: number; localPort: number },
+): string[] {
   const args: string[] = [
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',
@@ -643,6 +712,10 @@ export function buildSshArgs(remote: RemoteTarget, remoteCommand: string): strin
     '-o', 'ServerAliveCountMax=3',
     '-o', 'StrictHostKeyChecking=accept-new',
   ];
+  if (forward) {
+    args.push('-o', 'ExitOnForwardFailure=yes');
+    args.push('-R', `127.0.0.1:${forward.remotePort}:127.0.0.1:${forward.localPort}`);
+  }
   if (remote.identityFile) args.push('-i', remote.identityFile);
   if (remote.sshPort && remote.sshPort !== 22) args.push('-p', String(remote.sshPort));
   args.push(remote.sshHost, remoteCommand);

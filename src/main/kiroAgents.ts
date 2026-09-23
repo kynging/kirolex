@@ -42,6 +42,21 @@ export function localAgents(home = os.homedir()): string[] {
 }
 
 /**
+ * 一个 agent 的原始 JSON。
+ *
+ * 给"那条会话专用的 agent"当底子用（`remoteLocalTools.buildSessionAgent`）——
+ * 必须是**原样**的一份：kiro-cli 对这个文件严格校验，而它的 prompt / 工具白名单 / 别的 MCP
+ * 少掉任何一样，产出就是另一个 agent 干的。
+ */
+export function localAgentJson(agent: string, home = os.homedir()): any | null {
+  try {
+    return JSON.parse(fs.readFileSync(path.join(agentsDir(home), `${agent}.json`), 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
  * 从一份 agent 配置里挑出它依赖的 MCP **命令名**。
  *
  * 只要命令本身（`builder-mcp`、`npx`、绝对路径的那种取 basename 之外还保留原样），

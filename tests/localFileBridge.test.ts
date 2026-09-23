@@ -146,11 +146,24 @@ describe('接线', () => {
     assert.match(M, /已经写回原处/);
   });
 
-  test('注入里要告诉模型摆渡目录在哪 —— 否则它会以为那个路径不存在', async () => {
+  test('**摆渡这条路已经休眠了** —— 镜像去掉之后它没有落脚点，注入里也不该再提', async () => {
+    /*
+      「要不把镜像去掉，我们尝试一下给远程配一些能调用本地 MCP 的能力？」
+
+      摆渡的前提是"有一个会被同步的目录"：把你提到的文件拷进镜像 → 它改那一份 → 拉回来写回原处。
+      镜像没了（`registerRemoteSync` 是空壳）之后这条路无处落脚，而它要解决的问题
+      由 `local_read` / `local_write` 直接解决了 —— 那是真工具、有返回值，也不需要复制文件。
+
+      代码留着不删（这一笔够大了），但 `remoteSync.isRemote()` 永远是 false，所以
+      发送路径上那一段整块不会执行。注入里更不能提：指向一个不存在的目录比不说更糟。
+    */
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
     const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r/proj', localDir: '/l' });
-    assert.match(b, /_kirolex-local/);
-    assert.match(b, /写回用户机器上的原处/);
+    assert.equal(/_kirolex-local/.test(b), false, '注入里不该再提摆渡目录');
+    assert.match(b, /local_read/, '取而代之的是直连用户机器的那组工具');
+    /* 发送路径上那一段仍然被 isRemote 门着 —— 空壳登记让它永远不满足 */
+    assert.match(M, /if \(remoteSync\.isRemote\(sessionId\)\) \{/);
+    assert.match(M, /function registerRemoteSync\(_sessionId: string/);
   });
 });
 

@@ -29,9 +29,14 @@ import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
+import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import {
+  allocateRemotePort, buildSessionAgent, localToolsHelp, mcpUrl,
+  removeAgentScript, sessionAgentName, writeAgentScript,
+} from './remoteLocalTools.ts';
 import { mentionedPaths, stageFiles, writeBack } from './localFileBridge.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents } from './kiroAgents.ts';
+import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents, localAgentJson } from './kiroAgents.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
@@ -315,6 +320,8 @@ const modelsKnownDead = new Set<string>();
 async function connectWithModelFallback(
   profile: AgentProfile,
   label: string,
+  /** 远程会话的本地工具通道（`ensureLocalTools` 的结果）。本地会话是 undefined。 */
+  localTools?: { remotePort: number; localPort: number; agentOverride: string },
 ): Promise<{ client: AcpClient; model: string }> {
   const all: string[] = [profile.preferredModel, profile.model, ...MODEL_FALLBACK_ORDER]
     .filter((m): m is string => !!m)
@@ -330,7 +337,7 @@ async function connectWithModelFallback(
   }
   let lastError: any = null;
   for (const model of candidates) {
-    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
+    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
     try {
       await client.connect();
       if (model !== profile.model) {
@@ -412,7 +419,9 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       里重新选一次就会重新写上（手动切换同时更新 `model` 和 `preferredModel`）。
     */
     const profile: AgentProfile = { ...entry.profile, model, preferredModel: undefined };
-    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
+    /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
+    const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, entry));
+    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
     try {
       await client.connect();
       await withLoadTimeout(client.loadSession(cliSessionId, cwd), loadTimeoutFor(profile.remote));
@@ -1413,6 +1422,81 @@ function sessionNotice(sessionId: string, text: string): void {
   logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
 
+/**
+ * **本地工具通道** ——「把镜像去掉，给远程配一些能调用本地 MCP 的能力」。
+ *
+ * 一个 MCP server（只听 127.0.0.1），每条远程会话一个 token + 一个远端端口。
+ * server 懒启动：没有远程会话的时候不开端口。
+ */
+let localMcpServer: LocalMcpServer | undefined;
+const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string }>();
+
+/**
+ * 给这条远程会话备好本地工具：登记 token、分配远端端口、在远端写下那条会话专用的 agent。
+ *
+ * 失败就返回 `undefined` 并说出来 —— **不静默降级**：没有本地工具的远程会话根本读不到用户的
+ * 文件，而它会把"读不到"解释成"这个东西不存在"。
+ */
+async function ensureLocalTools(
+  sessionId: string,
+  profile: AgentProfile,
+  localDir: string,
+): Promise<{ remotePort: number; localPort: number; agentOverride: string } | undefined> {
+  const remote = profile.remote;
+  if (!remote?.sshHost) return undefined;
+  try {
+    if (!localMcpServer) {
+      localMcpServer = await startLocalMcp({
+        log: (level, message) => logger[level]('localmcp', message),
+        notice: (sid, text) => sessionNotice(sid, text),
+      });
+    }
+    const agentOverride = sessionAgentName(sessionId);
+    const token = localMcpServer.register({ sessionId, workdir: localDir });
+    const urlPath = localMcpServer.urlPathFor(sessionId) || `/mcp/${token}`;
+    /* 端口只需避开 KiroLex 自己已经分出去的那些 —— 真撞上远端别的服务时 ssh 会直接连不上
+       （`ExitOnForwardFailure=yes`），那是明确的失败，不是"起来了但没有工具" */
+    const used = [...localToolsBySession.values()].filter((v) => v).map((v) => v.remotePort);
+    const remotePort = localToolsBySession.get(sessionId)?.remotePort ?? allocateRemotePort(used);
+    /* 那条会话专用的 agent：拷你选的那个（prompt / 工具 / 别的 MCP 都不能少），只加这一条 MCP */
+    const base = profile.kiroAgent ? (localAgentJson(profile.kiroAgent) || {}) : {};
+    const agentJson = buildSessionAgent(base, {
+      name: agentOverride,
+      url: mcpUrl(remotePort, urlPath),
+    });
+    await writeRemoteFile(remote, writeAgentScript(agentOverride), JSON.stringify(agentJson, null, 2));
+    const spec = { remotePort, localPort: localMcpServer.port(), agentOverride };
+    localToolsBySession.set(sessionId, spec);
+    logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
+    return spec;
+  } catch (err: any) {
+    sessionNotice(sessionId, `⚠️ 本地工具通道没起来：${err?.message || err}。`
+      + `这条远程会话读不到你机器上的文件 —— 先别让它改东西。`);
+    logger.warn('localmcp', `准备失败 sessionId=${sessionId}: ${err?.message || err}`);
+    return undefined;
+  }
+}
+
+/** 会话的执行器没了：作废 token、放开端口、把远端那份临时 agent 删掉。 */
+function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
+  const spec = localToolsBySession.get(sessionId);
+  localToolsBySession.delete(sessionId);
+  localMcpServer?.forget(sessionId);
+  if (spec && remote?.sshHost) {
+    /* 不等结果：收尾动作卡住会让"换模型"看起来像界面挂了 */
+    void writeRemoteFile(remote, removeAgentScript(spec.agentOverride), '').catch(() => {});
+  }
+}
+
+/** 在远端跑一条 shell 命令，内容从 stdin 送进去（JSON 走命令行是引号地狱）。 */
+function writeRemoteFile(remote: RemoteTarget, script: string, stdin: string): Promise<void> {
+  return new Promise((resolve, reject) => {
+    const args = [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)];
+    const child = execFile('ssh', args, { timeout: 60_000 }, (err) => (err ? reject(err) : resolve()));
+    try { child.stdin?.end(stdin); } catch { /* 命令已经退了 */ }
+  });
+}
+
 const remoteSync = new RemoteSyncManager({
   note: (sessionId, text) => { sessionNotice(sessionId, text); },
   log: (level, message) => logger[level]('remote', message),
@@ -1441,10 +1525,25 @@ const remoteSync = new RemoteSyncManager({
 });
 
 /**
- * 给这条远程会话建好两份镜像并登记：项目目录（agent 的 cwd）和会话目录
- * （`history.md`、附件 —— 它在项目目录之外，不单独推的话远端的 `file:` 引用会指向不存在的路径）。
+ * **镜像已经不用了** ——「要不把镜像去掉，我们尝试一下给远程配一些能调用本地 MCP 的能力？」
+ *
+ * 远程会话现在通过反向隧道调你机器上的工具（`localMcp.ts` / `remoteLocalTools.ts`）：
+ * 文件一份都不复制，远端的 cwd 只是个草稿目录（`sessionCwd`）。
+ *
+ * 这个函数保留成**空壳**而不是把 25 处调用点一起删掉：`remoteSync.isRemote()` 因此永远是 false，
+ * 于是推/拉/摆渡/冲突判定/状态徽标那整条路自动全部休眠 —— 一处改动换来"镜像彻底不参与"，
+ * 比同时改 25 处安全得多。那几个模块（`remoteMirror` / `remoteSync` / `localFileBridge`）
+ * 等这条路在真实任务上跑稳之后单独一笔删掉。
+ *
+ * 顺带一起没了的还有 `mirrorRefusal` 那道闸（家目录不能当项目）—— 它防的是"把家目录推上远端"，
+ * 而现在没有任何东西被推走，那道闸只会拦住一条本来完全正常的会话。
  */
-function registerRemoteSync(sessionId: string, profile: AgentProfile, localProjectDir: string): void {
+function registerRemoteSync(_sessionId: string, _profile: AgentProfile, _localProjectDir: string): void {
+  /* 空壳 —— 见上面那段。 */
+}
+
+/** 旧的镜像登记（暂时留着，等清理那一笔一起删）。 */
+function registerRemoteSyncLegacy(sessionId: string, profile: AgentProfile, localProjectDir: string): void {
   const remote = profile.remote;
   if (!remote?.sshHost) return;
   const sshCommand = sshCommandFor(remote, buildSshArgs);
@@ -2633,6 +2732,12 @@ function detachExecutor(sessionId: string) {
   if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
   /* 执行器没了，这条会话的镜像也不该再被同步（它的 remote/localDir 都跟着执行器走） */
   remoteSync.forget(sessionId);
+  /*
+    **本地工具通道也要收掉**：token 立刻作废（远端那条 ssh 已经没了，隧道也就没了，
+    但 token 留着就等于一把还能用的钥匙），远端那份临时 agent 顺手删掉，
+    否则远端的 `~/.kiro/agents` 会按会话数量一直长。
+  */
+  releaseLocalTools(sessionId, entry.profile.remote);
   mainWindow?.webContents.send('acp:disconnected', { sessionId });
 }
 
@@ -3422,15 +3527,17 @@ app.whenReady().then(async () => {
         logger.info('remote', `新建远程会话没有项目目录 -> 镜像会话目录 ${normalized}`);
         resolvedCwd = normalized;
       }
-      const refusal = mirrorRefusal(resolvedCwd, os.homedir());
-      if (refusal) throw new Error(`这条远程会话没有建立：${refusal}`);
+      /* 镜像没了，家目录那道闸也就没有意义（没有任何东西会被推走）—— 见 `registerRemoteSync` */
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
       const remoteModels = await remotePreflight(profile.remote);
       profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
       /* agent 配置必须先过去，否则远端会**静默**退回默认 agent（见 `syncKiroAgent`） */
       await syncKiroAgent(kiroLexId, profile.remote, profile.kiroAgent);
     }
-    const started = await connectWithModelFallback(profile, 'new-session');
+    const startLocalTools = profile.remote?.sshHost
+      ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
+      : undefined;
+    const started = await connectWithModelFallback(profile, 'new-session', startLocalTools);
     const client = started.client;
     profile.model = started.model;
     const { sessionId: cliSessionId } = await client.newSession(cliCwd);
@@ -5465,10 +5572,7 @@ app.whenReady().then(async () => {
       sessionId,
       localDir || rec0?.localDir || oldEntry?.localDir,
     );
-    if (target) {
-      const refusal = mirrorRefusal(nextLocalDir, os.homedir());
-      if (refusal) throw new Error(refusal);
-    }
+    /* 家目录那道闸随镜像一起去掉了 —— 见 `registerRemoteSync` */
 
     const hostLabelOf = (t?: RemoteTarget): string | null =>
       (t ? (labelForHost(KIROLEX_CONFIG_PATH, t.sshHost) || t.sshHost || null) : null);
@@ -5503,7 +5607,8 @@ app.whenReady().then(async () => {
       }
       /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
       const cliCwd = sessionCwd(profile, nextLocalDir);
-      const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
+      const localTools = await ensureLocalTools(sessionId, profile, nextLocalDir);
+      const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
       try {
         await client.connect();
         const made = await withLoadTimeout(client.newSession(cliCwd), loadTimeoutFor(profile.remote), 'session/new');
@@ -5638,7 +5743,9 @@ app.whenReady().then(async () => {
     sessionClients.delete(sessionId); // release the slot + ownership claim
     try { await oldEntry.client.disconnect(); } catch {}
 
-    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
+    /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
+    const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
+    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
     try {
       await client.connect();
       await withLoadTimeout(client.loadSession(cliSessionId, cwd), loadTimeoutFor(profile.remote));
@@ -5722,7 +5829,9 @@ app.whenReady().then(async () => {
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
     const profile: AgentProfile = { ...oldEntry.profile, kiroAgent: normalizedAgent };
-    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
+    /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
+    const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
+    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
     try {
       await client.connect();
       const created = await client.newSession(oldEntry.cwd);
@@ -6314,29 +6423,21 @@ app.whenReady().then(async () => {
 
         建**新**会话那一步仍然是硬拒绝：那时候还没有任何历史，明确报错比悄悄换目标好。
       */
+      let localTools: { remotePort: number; localPort: number; agentOverride: string } | undefined;
       if (profile.remote?.sshHost) {
         /* 没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录，和本地那条路一致 */
         resolvedCwd = localDirOrSessionDir(sessionId, resolvedCwd);
-        const refusal = mirrorRefusal(resolvedCwd, os.homedir());
-        if (refusal) {
-          logger.warn('remote', `attach ${sessionId}: 目录不能做镜像（${refusal}）—— 这条会话退回本地`);
-          const host = profile.remote.sshHost;
-          profile.remote = undefined;
-          const rec0 = store.readRecord(sessionId);
-          if (rec0?.profile) {
-            rec0.profile.remote = undefined;
-            store.writeRecord(rec0);
-          }
-          sessionNotice(sessionId, `⚠️ 这条会话已改回**本地运行**（原来指向 ${host}）。`
-            + `原因：${refusal}\n对话内容一条都没动 —— 本地一直是唯一真相。`
-            + `想在远端跑的话，在一个具体的项目目录里新建一条远程会话。`);
-        } else {
-          const remoteModels = await remotePreflight(profile.remote);
-          profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
-          await syncKiroAgent(sessionId, profile.remote, profile.kiroAgent);
-        }
+        /*
+          家目录那道闸（`mirrorRefusal`）连同镜像一起去掉了：没有任何东西会被推到远端，
+          所以"这个目录能不能当镜像根"这个问题不存在了。它原来还有一条**退回本地**的分支
+          （那是为了不让一条已存在的远程会话变成死结），现在也不需要了。
+        */
+        const remoteModels = await remotePreflight(profile.remote);
+        profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
+        await syncKiroAgent(sessionId, profile.remote, profile.kiroAgent);
+        localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
-      const started = await connectWithModelFallback(profile, `attach ${sessionId}`);
+      const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools);
       const client = started.client;
       profile.model = started.model;
       // Resume the mapped kiro-cli session; fall back to id (legacy records where

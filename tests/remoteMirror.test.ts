@@ -459,25 +459,16 @@ describe('不许把家目录/半个磁盘当镜像', () => {
     assert.equal(cmds.filter((c) => c[0] === 'rsync').length, 0, '不许有任何 rsync');
   });
 
-  test('接线：建会话**硬拒绝**，重新 attach **退回本地**（不能把会话变成死结）', () => {
-    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.equal((M.match(/mirrorRefusal\(resolvedCwd, os\.homedir\(\)\)/g) || []).length, 2);
-    /* 新建：那时还没有历史，明确报错比悄悄换目标好 */
-    assert.match(M, /这条远程会话没有建立：/);
+  test('接线：**这道闸已经不接在会话路径上了**（镜像去掉之后它没有对象可防）', () => {
     /*
-      attach：原来也是抛错，结果那条已存在的会话**再也打不开了** —— 有历史、界面上没有出路，
-      每次点开只弹同一句错误（实测踩到）。闸门要挡的是"把凭据推到远端"，不是"让这条对话消失"。
+      `mirrorRefusal` 这个函数本身留着（它记着那笔账：一条 cwd 是 `~` 的远程会话把 2.6 GB
+      家目录连 `.aws/credentials` 和 17 把私钥一起推上了远端），单测也留着 ——
+      但**没有任何东西会被推走**了（`registerRemoteSync` 现在是空壳），所以把它接在
+      新建/attach/换目标那三条路上只会拦住一条本来完全正常的会话。
     */
-    assert.equal(/这条远程会话没有重新连上：/.test(M), false, '这条死路不许再有');
-    /* 锚在**代码**那一行上：这几个字在附近的注释里也出现（踩过一次 —— indexOf 命中了注释） */
-    const at = M.indexOf('logger.warn(\'remote\', `attach ${sessionId}: 目录不能做镜像');
-    assert.ok(at > 0);
-    /* 窗口给宽些：这一段的注释反复加长过，窄窗口会被注释挤出去（踩过两次） */
-    const body = M.slice(Math.max(0, at - 2000), at + 2000);
-    assert.match(body, /profile\.remote = undefined;/);
-    assert.match(body, /rec0\.profile\.remote = undefined;/, '记录也要改，否则下次又走这条路');
-    assert.match(body, /已改回\*\*本地运行\*\*/, '要说清发生了什么');
-    assert.match(body, /对话内容一条都没动/);
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.equal((M.match(/mirrorRefusal\(resolvedCwd, os\.homedir\(\)\)/g) || []).length, 0);
+    assert.match(M, /function registerRemoteSync\(_sessionId: string/, '镜像登记是空壳');
   });
 });
 

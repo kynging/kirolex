@@ -671,30 +671,36 @@ describe('dev 下加载失败要自己重来，不能留白屏', () => {
  * 它会拿对话里出现的 `/Users/...` 去搜（那个路径在远端不存在），把"搜不到"当成"这个东西没有"。
  */
 describe('远程会话要告诉模型它在哪台机器上', () => {
-  test('说清三件事：我在哪、项目在哪、本地那个路径在这儿不存在', async () => {
+  test('说清三件事：我在哪、用户的文件在他那台机器上、以及用哪组工具去碰', async () => {
+    /* **镜像去掉之后这段话变了**（「把镜像去掉，给远程配一些能调用本地 MCP 的能力」）：
+       原来说的是"本地路径要换算成远端镜像路径"，现在没有镜像 —— 要说的是
+       "项目根本不在你这台机器上，用 local_* 工具直连用户那边"。 */
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
     const b = remoteContextBlock({
       hostLabel: 'aws-tokyo',
-      remoteDir: '/home/ec2-user/kirolex-mirror/blog-1234abcd',
+      remoteDir: '/home/ec2-user/kirolex-mirror/scratch/blog-1234abcd',
       localDir: '/Users/k/code/blog',
-      sessionDir: '/home/ec2-user/kirolex-mirror/.kirolex-sessions/s_1',
     });
     assert.match(b, /\[运行环境：远程\]/);
     assert.match(b, /aws-tokyo/);
-    assert.match(b, /\/home\/ec2-user\/kirolex-mirror\/blog-1234abcd/);
-    /* 最关键的一条：本地路径在这台机器上**不存在**，而且给出换算方法 */
-    assert.match(b, /那个路径在这台机器上不存在/);
-    assert.match(b, /\/Users\/k\/code\/blog\/x\/y.*blog-1234abcd\/x\/y/s);
-    assert.match(b, /"搜不到"不等于"这个东西没有"/);
+    /* 最关键的一条：文件在用户那台机器上，而且给出工具名 */
+    assert.match(b, /用户的文件在他自己那台机器上，不在这里/);
+    assert.match(b, /local_read/);
+    assert.match(b, /\/Users\/k\/code\/blog/);
+    /* 远端那个目录只是草稿 —— 不说清它会把产出留在那儿 */
+    assert.match(b, /草稿目录/);
+    assert.match(b, /local_write/);
+    /* 换算那一套不该再出现（没有镜像可换算） */
+    assert.equal(/那个路径在这台机器上不存在/.test(b), false);
   });
 
-  test('还要说清：文件以本地为准、不要在远端构建/预览', async () => {
+  test('还要说清：构建和测试去**用户机器**上跑（以前是"别在远端构建"）', async () => {
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
     const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l' });
-    assert.match(b, /以用户本地那份为准/);
-    assert.match(b, /不会丢/, '不说这句它会自己往回拷');
+    /* 以前只能说"说出来让用户自己在本地做"——现在它自己能做，因为 local_bash 就在用户机器上 */
+    assert.match(b, /local_bash/);
     assert.match(b, /node_modules/);
-    assert.match(b, /LibreOffice/);
+    assert.equal(/以用户本地那份为准/.test(b), false, '同步那套说法已经不成立');
   });
 
   test('缺 host 或缺远端目录就**不注入** —— 半截的说明比不说更糟', async () => {
@@ -1048,12 +1054,13 @@ describe('切换一条已有会话的机器', () => {
     assert.match(body, /先不切回本地 —— 切了那份工作就留在那台机器上了/);
   });
 
-  test('**没有项目目录不是问题** —— 镜像它自己的会话目录，和本地那条路一样', () => {
+  test('**没有项目目录不是问题**，而且家目录那道闸也随镜像一起去掉了', () => {
     /* 上一版在这里要求"必须指定一个项目目录"，那是把"必须镜像点什么"和"必须有个项目"混成了一件事 */
     assert.equal(/还没有项目目录 —— 切到远端要先指定一个/.test(body), false, '这个要求不该再有');
     assert.match(body, /const nextLocalDir = localDirOrSessionDir\(/);
-    /* 家目录那道闸还在 —— 只有"目录真的是家目录"时才撞上 */
-    assert.match(body, /const refusal = mirrorRefusal\(nextLocalDir, os\.homedir\(\)\);/);
+    /* `mirrorRefusal` 防的是"把家目录推上远端"。没有镜像 = 没有任何东西被推走 =
+       那道闸只会拦住一条本来正常的会话。 */
+    assert.equal(/mirrorRefusal\(nextLocalDir/.test(body), false, '闸门跟着镜像一起走');
   });
 
   test('新建 / attach 两条路也一样：没项目就用会话目录，不是拒绝', () => {
@@ -1198,11 +1205,11 @@ describe('本地记录不推到远端', () => {
 
   test('**注入里不能再提 history.md 的路径** —— 指向一个不存在的文件比不说更糟', async () => {
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
-    const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l', sessionDir: '/r/.kirolex-sessions/s1' });
+    const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l' });
     assert.match(b, /对话历史\*\*随消息带给你\*\*/);
     assert.match(b, /这台机器上没有 history\.md/);
-    /* 附件还在那儿（它们是真的推过去的） */
-    assert.match(b, /附件在 `\/r\/\.kirolex-sessions\/s1`/);
+    /* 附件也不在这台机器上了（镜像去掉之后什么都不推）—— 要说清去哪读 */
+    assert.match(b, /用 `local_read` 去读/);
   });
 });
 
