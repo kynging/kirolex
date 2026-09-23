@@ -992,3 +992,24 @@ describe('远端的模型列表要验', () => {
     assert.equal((M.match(/pickRemoteModel\(/g) || []).length, 3, '定义 1 处 + 新建/attach 两处');
   });
 });
+
+/*
+ * 「为什么新的那个远程 session 没有 tag、似乎是本地 session」——
+ * 创建入口有**两个**，而上一版只给「New Chat 对话框」接了目标：项目里的
+ * 「＋ 在此项目中新建会话」一个字都没传，于是从那儿建出来的永远是本地会话（也就没有徽标）。
+ */
+describe('两个创建入口都要带上远端目标', () => {
+  const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+
+  test('对话框和"在此项目中新建会话"都传 remoteId', () => {
+    assert.equal((A.match(/remoteId: target\?\.id, remoteLabel: target\?\.label,/g) || []).length, 2);
+  });
+
+  test('没选过目标时照旧是本地 —— 不能因为配了一台机器就悄悄变远程', () => {
+    const at = A.indexOf('const handleNewSessionInProject');
+    const body = A.slice(at, at + 900);
+    assert.match(body, /remoteTargets\.targets\.find\(\(t\) => t\.id === newChatRemoteId\)/);
+    /* 找不到就是 undefined → newSession 收到 undefined → 本地 */
+    assert.match(body, /remoteId: target\?\.id/);
+  });
+});

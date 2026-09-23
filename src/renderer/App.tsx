@@ -2016,10 +2016,22 @@ const App: React.FC = () => {
     setDeleteConfirm({ sessionId, title: session?.title || 'this session' });
   }, [sessions, skipDeleteConfirm, deleteSession]);
 
-  // Create a new chat directly inside a project (created already assigned).
+  /**
+   * Create a new chat directly inside a project (created already assigned).
+   *
+   * **这条路也要带上远端目标** ——「为什么新的那个远程 session 没有 tag、似乎是本地 session」：
+   * 创建入口有两个，而上一版只给「New Chat 对话框」接了目标，项目里的「＋ 在此项目中新建会话」
+   * 一个字都没传 —— 于是从那儿建出来的永远是本地会话，界面上也就没有徽标。
+   *
+   * 沿用对话框里选的那台机器：那是"你上一次明确选的目标"，比默默退回本地更符合预期；
+   * 没选过（`newChatRemoteId` 为空）时它就是本地，行为和以前一样。
+   */
   const handleNewSessionInProject = useCallback((project: string) => {
-    void cwdFor(project).then((cwd) => newSession(cwd, selectedModel, project));
-  }, [newSession, homeDir, selectedModel]);
+    const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);
+    void cwdFor(project).then((cwd) => newSession(cwd, selectedModel, project, undefined, {
+      remoteId: target?.id, remoteLabel: target?.label,
+    }));
+  }, [newSession, homeDir, selectedModel, remoteTargets.targets, newChatRemoteId]);
 
   // Create a chat from the New Chat dialog, assigning the chosen project (if any)
   // at creation.
