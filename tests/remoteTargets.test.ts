@@ -957,8 +957,8 @@ describe('agent 配置要同步到远端，并且验一遍', () => {
     assert.match(M, /会悄悄退回默认 agent（不报错）/);
     /* 缺 MCP 命令不拦，但要说 */
     assert.match(M, /的这些 MCP 命令在 \$\{remote\.sshHost\} 上没有/);
-    /* 两条路（新建 / attach）都要同步 */
-    assert.equal((M.match(/await syncKiroAgent\(/g) || []).length, 2);
+    /* 每一条会起远程执行器的路都要同步：新建 / attach / 换机器 */
+    assert.ok((M.match(/await syncKiroAgent\(/g) || []).length >= 3);
   });
 });
 
@@ -989,7 +989,8 @@ describe('远端的模型列表要验', () => {
     assert.match(M, /上没有模型「\$\{wanted\}」/);
     /* 列表问不到时什么都不做 —— 没依据的判断比不判断糟 */
     assert.match(M, /if \(!models\.length \|\| models\.includes\(wanted\)\) return wanted;/);
-    assert.equal((M.match(/pickRemoteModel\(/g) || []).length, 3, '定义 1 处 + 新建/attach 两处');
+    /* 数量会随功能增加（换机器那条路也要验），所以只钉"每条起远程执行器的路都验过" */
+    assert.ok((M.match(/pickRemoteModel\(/g) || []).length >= 4, '定义 1 处 + 新建/attach/换机器');
   });
 });
 
@@ -1011,5 +1012,61 @@ describe('两个创建入口都要带上远端目标', () => {
     assert.match(body, /remoteTargets\.targets\.find\(\(t\) => t\.id === newChatRemoteId\)/);
     /* 找不到就是 undefined → newSession 收到 undefined → 本地 */
     assert.match(body, /remoteId: target\?\.id/);
+  });
+});
+
+/*
+ * 「AI角色扮演这个应该是远程的」+「好，反正你赶紧修复」——
+ * 一条**已有**会话要能改成在远端跑，而不是"只能重新建一条"（重建会把这条对话在后端的历史扔掉）。
+ * 设计里定的就是这条路（`docs/DESIGN_remote_sessions.md`「中途切换」）：换执行器 + 逐段重建。
+ */
+describe('切换一条已有会话的机器', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+  const at = M.indexOf("ipcMain.handle('acp:set-remote-target'");
+  const body = M.slice(at, at + 6000);
+
+  test('有一轮在跑就拒绝 —— 切换会把执行器连根拔掉', () => {
+    assert.ok(at > 0, 'IPC 要存在');
+    assert.match(body, /if \(oldEntry\.busy\) throw new Error\('这一轮还在跑/);
+  });
+
+  test('**切回本地之前先把远端改动拉干净**，拉不回来就不切', () => {
+    assert.match(body, /if \(wasRemote && !target\) \{\s*\n\s*const fresh = await remoteSync\.pullNow\(sessionId\);/);
+    assert.match(body, /先不切回本地 —— 切了那份工作就留在那台机器上了/);
+  });
+
+  test('切到远端要有具体目录，且照样过家目录那道闸', () => {
+    assert.match(body, /还没有项目目录 —— 切到远端要先指定一个/);
+    assert.match(body, /const refusal = mirrorRefusal\(nextLocalDir, os\.homedir\(\)\);/);
+  });
+
+  test('换机器 = 换进程：起新后端会话 + 逐段重建 + 镜像登记跟着走', () => {
+    assert.match(body, /await withLoadTimeout\(client\.newSession\(cliCwd\), loadTimeoutFor\(profile\.remote\), 'session\/new'\)/);
+    assert.match(body, /markContextOwedIfUnverified\(sessionId, 'switch-remote-target'\)/);
+    assert.match(body, /remoteSync\.forget\(sessionId\);\s*\n\s*if \(target\) registerRemoteSync\(sessionId, profile, nextLocalDir\);/);
+    /* 目录和目标都要落盘，否则下次 attach 又回到老样子 */
+    assert.match(body, /rec\.localDir = nextLocalDir;/);
+    assert.match(body, /rec\.profile = profile;/);
+  });
+
+  test('要在会话里说清换到哪、以及"对话一条都没动"', () => {
+    assert.match(body, /这条会话从现在开始跑在\*\*\$\{where\}\*\*上/);
+    assert.match(body, /之前的对话一条都没动/);
+  });
+
+  test('右键菜单里有这两条，且只在配了远端时出现', () => {
+    assert.match(SB, /改回本地运行/);
+    assert.match(SB, /改到 \$\{tg\.label\} 上运行/);
+    assert.match(SB, /\{remoteTargets\.length > 0 && \(/);
+    /* 已经在那台机器上的目标不再列一遍 */
+    assert.match(SB, /\.filter\(\(tg\) => tg\.label !== ctxSession\.remoteHost\)/);
+  });
+
+  test('目录：**先让主进程用记录里的试**，只有它说没有目录才弹选择框', () => {
+    assert.match(SB, /if \(!r\?\.ok && remoteId && \/项目目录\/\.test\(String\(r\?\.error \|\| ''\)\)\)/);
+    assert.match(SB, /remotePickDir\?\.\(\)/);
+    /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
+    assert.match(SB, /window\.alert\(String\(r\?\.error/);
   });
 });

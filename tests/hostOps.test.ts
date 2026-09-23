@@ -169,8 +169,11 @@ describe('起执行器的超时按机器分', () => {
 
   test('接线：三个 loadSession 都按会话的 remote 取上限', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    const hits = M.match(/withLoadTimeout\([^)]*\), loadTimeoutFor\(/g) || [];
-    assert.equal(hits.length, 3, `只有 ${hits.length} 处带上了 host 相关的上限`);
+    /* 数量会随功能增加（换机器那条路又多了一处），所以钉的是"**每一处** withLoadTimeout 都带上限" */
+    const all = M.match(/withLoadTimeout\(/g) || [];
+    const withTimeout = M.match(/withLoadTimeout\([\s\S]{0,120}?loadTimeoutFor\(/g) || [];
+    assert.equal(withTimeout.length, all.length, `${all.length} 处 withLoadTimeout，只有 ${withTimeout.length} 处带了 host 上限`);
+    assert.ok(all.length >= 4);
   });
 });
 

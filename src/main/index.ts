@@ -5137,6 +5137,117 @@ app.whenReady().then(async () => {
   // A model is bound at kiro-cli process launch. Replace the executor while
   // loading the SAME ACP session so conversation context survives and the new
   // model applies to the next prompt. The old executor stays live on failure.
+  /**
+   * **把一条已有会话切到另一台机器（或切回本地）** ——「AI角色扮演这个应该是远程的」。
+   *
+   * 设计里定的就是这条路（`docs/DESIGN_remote_sessions.md`「中途切换」）：换执行器 + 逐段重建，
+   * 和换模型走同一套机械（kiro-cli 的后端会话跟进程绑定，换机器必然换进程）。
+   *
+   * 三件事的顺序是**故意**的：
+   *   · 有一轮在跑就拒绝 —— 切换会把执行器连根拔掉，那一轮的产出会凭空消失。
+   *   · **切回本地之前先把远端的改动拉干净**：不拉就等于把远端那份工作永久留在那台机器上，
+   *     而本地是唯一真相 —— 这一步失败就中止切换（宁可不切，也不丢东西）。
+   *   · 切到远程之前要有一个**具体的项目目录**：没有目录没法做镜像，而拿家目录顶上就是
+   *     把凭据推上去（那笔账见 `mirrorRefusal`）。
+   */
+  ipcMain.handle('acp:set-remote-target', async (
+    _event,
+    sessionId: string,
+    remoteId: string | null,
+    localDir?: string,
+  ) => {
+    const oldEntry = sessionClients.get(sessionId);
+    if (!oldEntry) throw new Error('这条会话还没连上，先打开它再切换。');
+    if (oldEntry.busy) throw new Error('这一轮还在跑 —— 等它结束再切换机器（切换会把执行器换掉，正在跑的那一轮会丢）。');
+    if (reconfiguringSessions.has(sessionId)) throw new Error('上一次切换还没完成，稍等。');
+
+    const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
+    if (remoteId && !target) throw new Error(`找不到远端目标 ${remoteId}（设置里删掉了？）—— 没有猜一台机器。`);
+    const wasRemote = !!oldEntry.profile.remote?.sshHost;
+    if (!!target === wasRemote && (target?.sshHost || '') === (oldEntry.profile.remote?.sshHost || '')) {
+      return { ok: true, unchanged: true };
+    }
+
+    /* 切回本地：先把远端的改动拉回来，拉不回来就别切 */
+    if (wasRemote && !target) {
+      const fresh = await remoteSync.pullNow(sessionId);
+      if (!fresh) {
+        throw new Error('远端还有改动没取回来，先不切回本地 —— 切了那份工作就留在那台机器上了。'
+          + '等连接恢复、或者手动同步之后再试。');
+      }
+    }
+
+    const nextLocalDir = target
+      ? (localDir || store.readRecord(sessionId)?.localDir || oldEntry.localDir || '')
+      : (localDir || store.readRecord(sessionId)?.localDir || oldEntry.localDir || getSessionDir(sessionId));
+    if (target) {
+      if (!nextLocalDir) throw new Error('这条会话还没有项目目录 —— 切到远端要先指定一个（远端要镜像的就是它）。');
+      const refusal = mirrorRefusal(nextLocalDir, os.homedir());
+      if (refusal) throw new Error(refusal);
+    }
+
+    await awaitAttachIdle(sessionId);
+    reconfiguringSessions.add(sessionId);
+    emitSessionBusy(sessionId);
+    const profile: AgentProfile = { ...oldEntry.profile, remote: target ? { ...target } : undefined };
+    try {
+      if (target) {
+        const models = await remotePreflight(profile.remote!);
+        profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
+        await syncKiroAgent(sessionId, profile.remote!, profile.kiroAgent);
+      }
+      /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
+      const cliCwd = sessionCwd(profile, nextLocalDir);
+      const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote);
+      try {
+        await client.connect();
+        const made = await withLoadTimeout(client.newSession(cliCwd), loadTimeoutFor(profile.remote), 'session/new');
+        const nextEntry: SessionEntry = {
+          ...oldEntry,
+          client,
+          cliSessionId: made.sessionId,
+          profile,
+          cwd: cliCwd,
+          localDir: nextLocalDir,
+          assistantBuf: '',
+          assistantMsgId: null,
+          fileChanges: [],
+          lastUsedAt: Date.now(),
+          busy: false,
+        };
+        try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
+        sessionClients.set(sessionId, nextEntry);
+        wireSession(sessionId, nextEntry);
+        /* 镜像登记跟着走：切远程要登记，切本地要注销 */
+        remoteSync.forget(sessionId);
+        if (target) registerRemoteSync(sessionId, profile, nextLocalDir);
+
+        const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
+        rec.profile = profile;
+        rec.cliSessionId = made.sessionId;
+        rec.localDir = nextLocalDir;
+        rec.executorState = 'attached';
+        store.writeRecord(rec);
+        clearContextEstablished(sessionId);
+        markContextOwedIfUnverified(sessionId, 'switch-remote-target');
+        restoreContextAfterExecutorSwap(sessionId, 'switch-remote-target');
+
+        const where = target ? `远端 ${labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost}` : '本地';
+        noteInSession(sessionId, `🔀 这条会话从现在开始跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
+          + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`);
+        logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
+        mainWindow?.webContents.send('session:targets-changed', { sessionId });
+        return { ok: true, remoteHost: target ? (labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost) : null };
+      } catch (err) {
+        try { await client.disconnect(); } catch {}
+        throw err;
+      }
+    } finally {
+      reconfiguringSessions.delete(sessionId);
+      emitSessionBusy(sessionId);
+    }
+  });
+
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
     const oldEntry = sessionClients.get(sessionId);
     if (!oldEntry) throw new Error('Session not connected');
@@ -6679,6 +6790,19 @@ app.whenReady().then(async () => {
    * `showHiddenFiles`：密钥通常在 `~/.ssh` 里，而那是个隐藏目录 —— 不给这个选项，
    * 对话框打开之后你在 Finder 里根本看不到它。默认目录也直接指到 `~/.ssh`。
    */
+  /** 选一个项目目录（切到远端时要指定要镜像的那个目录）。 */
+  ipcMain.handle('remote:pick-dir', async () => {
+    const options = {
+      title: '选择要在远端镜像的项目目录',
+      properties: ['openDirectory', 'createDirectory'] as Array<'openDirectory' | 'createDirectory'>,
+    };
+    const result = mainWindow
+      ? await dialog.showOpenDialog(mainWindow, options)
+      : await dialog.showOpenDialog(options);
+    if (result.canceled || !result.filePaths[0]) return { path: '' };
+    return { path: result.filePaths[0] };
+  });
+
   ipcMain.handle('remote:pick-key', async () => {
     const sshDir = path.join(os.homedir(), '.ssh');
     const options = {

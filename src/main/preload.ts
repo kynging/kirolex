@@ -352,6 +352,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('remote:bootstrap-output', handler);
     return () => ipcRenderer.removeListener('remote:bootstrap-output', handler);
   },
+  /**
+   * **把一条已有会话切到另一台机器（或切回本地）**。`remoteId` 传 null = 本地。
+   * 切到远端时要给项目目录（没给就用记录里的那个；都没有会报错 —— 远端要镜像的就是它）。
+   */
+  setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string) =>
+    ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir),
+  /** 选一个项目目录（切到远端时用）。 */
+  remotePickDir: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-dir'),
   /** 用 Finder 选私钥（默认开在 ~/.ssh，并显示隐藏文件 —— 否则那个目录根本看不到）。 */
   remotePickKey: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-key'),
   /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */

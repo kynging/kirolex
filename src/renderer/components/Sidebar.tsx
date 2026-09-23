@@ -1,6 +1,7 @@
 import { projectsToCollapse } from '../projectActivity';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { syncBadgeSuffix, syncBadgeTitle, useRemoteSyncFor } from '../hooks/useRemoteSync';
+import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions } from '../sessionSearch';
 import { placeMenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
@@ -580,6 +581,29 @@ export const Sidebar: React.FC<SidebarProps> = ({
     return 'dormant';
   };
 
+  /**
+   * **换机器** ——「AI角色扮演这个应该是远程的」。
+   *
+   * 直接在这里拿列表、在这里调 IPC：这个动作只有右键菜单用，从 App 一层层传 prop 只会多两处
+   * 可以漏掉的地方（`remoteHost` 那次就是在水化的白名单里漏掉的）。
+   *
+   * 目录的处理顺序是刻意的：**先让主进程用记录里的目录试**，只有它说"没有目录"时才弹选择框 ——
+   * 已经有项目目录的会话不该每次都被问一遍。
+   */
+  const remoteTargets = useRemoteTargets().targets;
+  const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
+    const api = (window as any).kiroApi;
+    if (!api?.setRemoteTarget) return;
+    let r = await api.setRemoteTarget(sessionId, remoteId).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    if (!r?.ok && remoteId && /项目目录/.test(String(r?.error || ''))) {
+      const picked = await api.remotePickDir?.();
+      if (!picked?.path) return;   // 取消了就什么都不做
+      r = await api.setRemoteTarget(sessionId, remoteId, picked.path).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    }
+    /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */
+    if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '切换失败'));
+  };
+
   const handleContextMenu = (e: React.MouseEvent, targetId: string) => {
     e.preventDefault();
     setContextMenu({ x: e.clientX, y: e.clientY, targetId });
@@ -929,6 +953,38 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 >
                   {`⬜ ${t('Unassign')}`}
                 </div>
+              )}
+              {/*
+                **换机器** ——「AI角色扮演这个应该是远程的」：一条已有会话应该能改成在远端跑，
+                而不是"只能重新建一条"（重建会把这条对话在后端的历史扔掉）。
+                只在配了远端、且 feature flag 开着时出现（`remoteTargets`）。
+              */}
+              {remoteTargets.length > 0 && (
+                <>
+                  <div className="context-menu-divider" />
+                  {ctxSession.remoteHost && (
+                    <div
+                      className="context-menu-item"
+                      onClick={() => { void onSetTarget?.(ctxSession.id, null); setContextMenu(null); }}
+                      title="切回本地跑。切之前会先把远端的改动取回来 —— 取不回来就不切。"
+                    >
+                      {'💻 改回本地运行'}
+                    </div>
+                  )}
+                  {remoteTargets
+                    .filter((tg) => tg.label !== ctxSession.remoteHost)
+                    .map((tg) => (
+                      <div
+                        key={tg.id}
+                        className="context-menu-item"
+                        onClick={() => { void onSetTarget?.(ctxSession.id, tg.id); setContextMenu(null); }}
+                        title={`把这条会话改成在 ${tg.sshHost} 上跑（文件仍在本地，每轮前后同步镜像）`}
+                      >
+                        {`🌐 改到 ${tg.label} 上运行`}
+                      </div>
+                    ))}
+                  <div className="context-menu-divider" />
+                </>
               )}
               <div
                 className="context-menu-item"
