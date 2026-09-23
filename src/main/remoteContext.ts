@@ -39,7 +39,13 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     localDir ? `· 同一个项目在用户本地是 \`${localDir}\` —— **那个路径在这台机器上不存在**。`
       + `对话里出现 \`${localDir}/x/y\` 这类路径时，你要找的是 \`${remoteDir}/x/y\`；`
       + `直接拿本地路径去搜会搜不到，而"搜不到"不等于"这个东西没有"。` : '',
-    input.sessionDir ? `· 这条会话的附件和 history.md 在 \`${input.sessionDir}\`。` : '',
+    /*
+      只提**附件**：`history.md` 那些本地记录不再推到远端（每轮重写、实测 79 KB+827 KB，
+      每轮整份重传）。对话历史是随这条消息带过来的，所以明确告诉它别去找那个文件 ——
+      指向一个不存在的路径，它会把"读不到"当成"没有历史"。
+    */
+    input.sessionDir ? `· 这条会话的附件在 \`${input.sessionDir}\`；对话历史**随消息带给你**，`
+      + `这台机器上没有 history.md / transcript.jsonl 之类的文件，别去找。` : '',
     '· 文件**以用户本地那份为准**：每一轮开始前本地会同步到这里，你改完之后会同步回去。'
       + '所以你写的东西不会丢，也不需要自己往回拷。',
     '· 这台机器上**没有** `node_modules`、构建产物（它们不同步：原生依赖跨平台不能用），'

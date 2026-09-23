@@ -46,6 +46,25 @@ const MOD_KEY =
 // paths open in the OS (via app:open-external). Applied to every markdown render.
 // Format a model's context window token count for the selector: 1000000 -> "1M",
 // 272000 -> "272k". Keeps one decimal only when it isn't a whole million.
+/**
+ * 价格乘数 —— 「在模型列表里面把价格乘数也加进去」/「模型的乘数怎么不见了」。
+ *
+ * 后端本来就给（`rate_multiplier`，实测 opus-5 = 2.2、sonnet-5 = 1.3、auto = 1.0），
+ * 只是列表里没显示 —— 于是"换个模型"这件事的**代价**在做决定的地方看不见，
+ * 而这是这一格里唯一会花钱的选择。
+ *
+ * `1.0` 也照样显示：不显示就分不出"一倍"和"这个模型没给数据"，而那正是你想知道的。
+ * 拿不到（老后端、字段缺失）才留空。
+ *
+ * （这一段在 `standard` 上一度不见了 —— 是我那次手工 backport 漏掉的，不是被谁删了。）
+ */
+function fmtRate(multiplier: unknown): string {
+  const n = Number(multiplier);
+  if (!Number.isFinite(n) || n <= 0) return '';
+  /* 2 → `2×`，1.3 → `1.3×`：整数不写小数点，省一个字符（那一行本来就窄） */
+  return `${Number.isInteger(n) ? n : n.toFixed(1)}×`;
+}
+
 function fmtContextWindow(tokens: number): string {
   if (!Number.isFinite(tokens) || tokens <= 0) return '';
   if (tokens >= 1_000_000) {
@@ -3848,6 +3867,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         {models.map((model) => (
                           <option key={model.model_id} value={model.model_id}>
                             {model.model_name}{model.context_window_tokens ? ` · ${fmtContextWindow(model.context_window_tokens)}` : ''}
+                            {/* 价格乘数 —— 换模型是这一格里唯一会花钱的选择，代价该摆在做决定的地方 */}
+                            {fmtRate((model as any).rate_multiplier) ? ` · ${fmtRate((model as any).rate_multiplier)}` : ''}
                           </option>
                         ))}
                       </>

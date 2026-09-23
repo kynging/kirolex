@@ -100,6 +100,18 @@ export const SENSITIVE_EXCLUDES = [
  * 远端的配置（sshHost、私钥路径）。不需要的东西不该出现在另一台机器上。
  */
 export const SESSION_DIR_EXCLUDES = [
+  /*
+    **`history.md` 也不推了** ——「把 history 那些文件不要再推了，那些纯粹是本地记录」。
+
+    它原来是推的，理由是"模型要读"。但远程会话的上下文走的是**随消息带过去的快照**
+    （ride-along，日志里的 `context RIDE-ALONG`），那份文件只是一条可选的读取路径；
+    而它每一轮都被重写、实测 79 KB（`transcript.jsonl` 更是 827 KB），每轮整份重传 ——
+    推送 21.5 秒里很大一块就是它们。
+
+    代价是模型不能再去读那个文件，所以注入的那段说明里**不能再提它的路径**
+    （`remoteContext`：指向一个不存在的文件，会让它把"读不到"当成"没有历史"）。
+  */
+  'history.md',
   'transcript.jsonl',
   'record.json',
   'events.jsonl',

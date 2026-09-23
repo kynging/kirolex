@@ -1139,3 +1139,54 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined \}/);
   });
 });
+
+/*
+ * 「模型的乘数怎么不见了」—— 它在 `feature/flow` 上有，`standard` 上没有：
+ * 是我那次手工 backport 漏掉的（不是被谁删了）。后端本来就给这个字段，实测：
+ *   {"model_name":"claude-opus-5", …, "rate_multiplier":2.2, "rate_unit":"Credit"}
+ *   {"model_name":"auto",          …, "rate_multiplier":1.0}
+ */
+describe('模型列表显示价格乘数', () => {
+  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+
+  test('列表里每一项都带乘数', () => {
+    assert.match(CA, /function fmtRate\(multiplier: unknown\): string \{/);
+    assert.match(CA, /fmtRate\(\(model as any\)\.rate_multiplier\)/);
+  });
+
+  test('`1.0` 也要显示 —— 不显示就分不出"一倍"和"没给数据"', () => {
+    const at = CA.indexOf('function fmtRate');
+    const body = CA.slice(at, at + 400);
+    /* 只在拿不到/非正数时留空 */
+    assert.match(body, /if \(!Number\.isFinite\(n\) \|\| n <= 0\) return '';/);
+    assert.equal(/n === 1/.test(body), false, '不许把 1 当成"不用显示"');
+    /* 整数不写小数点（那一行本来就窄） */
+    assert.match(body, /Number\.isInteger\(n\) \? n : n\.toFixed\(1\)/);
+  });
+});
+
+/*
+ * 「把 history 那些文件不要再推了，那些纯粹是本地记录」。
+ */
+describe('本地记录不推到远端', () => {
+  test('history.md / transcript.jsonl / events.jsonl 都在排除里', async () => {
+    const { SESSION_DIR_EXCLUDES } = await import('../src/main/remoteMirror.ts');
+    for (const f of ['history.md', 'transcript.jsonl', 'events.jsonl', 'record.json']) {
+      assert.ok(SESSION_DIR_EXCLUDES.includes(f), `缺 ${f}`);
+    }
+  });
+
+  test('镜像根是会话目录时，**推**也带上这些排除（不只是拉）', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /excludes: rootIsSessionDir \? \[\.\.\.DEFAULT_EXCLUDES, \.\.\.SESSION_DIR_EXCLUDES\] : undefined,/);
+  });
+
+  test('**注入里不能再提 history.md 的路径** —— 指向一个不存在的文件比不说更糟', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l', sessionDir: '/r/.kirolex-sessions/s1' });
+    assert.match(b, /对话历史\*\*随消息带给你\*\*/);
+    assert.match(b, /这台机器上没有 history\.md/);
+    /* 附件还在那儿（它们是真的推过去的） */
+    assert.match(b, /附件在 `\/r\/\.kirolex-sessions\/s1`/);
+  });
+});

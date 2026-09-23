@@ -1414,6 +1414,8 @@ function registerRemoteSync(sessionId: string, profile: AgentProfile, localProje
       remote, sshCommand,
       localDir: localProjectDir,
       remoteDir: mirrorDirFor(workdir, localProjectDir),
+      /* 镜像根是会话目录时，KiroLex 自己的记录（history.md / transcript.jsonl / …）连推都不推 */
+      excludes: rootIsSessionDir ? [...DEFAULT_EXCLUDES, ...SESSION_DIR_EXCLUDES] : undefined,
       pullNever: rootIsSessionDir ? PULL_NEVER : [],
     }),
     session: new RemoteMirror({
