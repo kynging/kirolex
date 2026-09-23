@@ -133,10 +133,17 @@ export class RemoteSyncManager {
   }
 
   forget(sessionId: string): void {
+    const was = this.targets.get(sessionId);
     this.targets.delete(sessionId);
     this.chain.delete(sessionId);
     this.owed.delete(sessionId);
     this.last.delete(sessionId);
+    /*
+      **要告诉界面它不再是远程的** ——「命令调用那里即使切成本地也有远程的 tag」。
+      这里忘掉的只是主进程这一份；渲染层那份状态是按 sessionId 缓存的事件流，没人通知就一直
+      留着最后那条（里面带着 hostLabel）。空 hostLabel = "这条会话已经不是远程的了"。
+    */
+    if (was) this.deps.onStatus?.({ sessionId, state: 'idle', hostLabel: '' });
   }
 
   isRemote(sessionId: string): boolean {

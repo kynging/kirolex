@@ -581,10 +581,13 @@ describe('工具调用要标出跑在哪台机器上', () => {
     assert.match(CA, /const FileChangesPanel = memo<\{ fileChanges: ToolCall\[\]; remoteHost\?: string \}>/);
   });
 
-  test('host 从同步状态里取 —— 本地会话没有状态，所以有值就是远程', () => {
-    assert.match(CA, /const remoteStatus = useRemoteSyncFor\(currentSessionId \|\| undefined, true\);/);
+  test('host 取自**会话状态**（`session.remoteHost`），不是同步状态', () => {
+    /* 原来读的是同步状态里的 hostLabel。那是"此刻在推/在拉"，不是身份 —— 切回本地时
+       主进程只是 forget 掉目标，渲染层那份缓存还留着最后一次的 hostLabel，于是本地会话
+       的命令面板上继续挂着 🌐（见「切回本地之后 🌐 必须消失」那一组）。 */
+    assert.match(CA, /const remoteHostLabel = remoteHost \? remoteHost\.replace/);
     /* 去掉 user@：那一段不区分机器，而面板很窄 */
-    assert.match(CA, /hostLabel\?\.replace\(\/\^\[\^@\]\*@\/, ''\)/);
+    assert.match(CA, /replace\(\/\^\[\^@\]\*@\/, ''\)/);
   });
 
   test('文件面板要说清"远端改的、打开的是本地那一份"', () => {
@@ -1407,5 +1410,37 @@ describe('工作目录在会话界面上', () => {
     assert.match(M, /const applySessionTarget = async \(/);
     assert.equal((M.match(/const applySessionTarget = async \(/g) || []).length, 1);
     assert.match(M, /return applySessionTarget\(sessionId, target, localDir\);/);
+  });
+});
+
+/*
+ * 「命令调用那里即使切成本地也有远程的 tag」。
+ *
+ * 两处都错，而且是同一个根因：**把"跑在哪台机器上"这个身份，读成了"同步状态"**。
+ * 切回本地时主进程只是 `remoteSync.forget(sessionId)` —— 渲染层那份按 sessionId 缓存的状态
+ * 没人通知，最后那条（带 hostLabel）就永远留着，于是本地会话的命令面板上继续挂着 🌐。
+ */
+describe('切回本地之后 🌐 必须消失', () => {
+  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+  const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+  const RS = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteSync.ts'), 'utf8');
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useRemoteSync.ts'), 'utf8');
+
+  test('身份取自**会话状态**，不是同步状态（侧栏徽标一直是对的，因为它就这么取）', () => {
+    assert.match(CA, /const remoteHostLabel = remoteHost \? remoteHost\.replace\(\/\^\[\^@\]\*@\/, ''\) : undefined;/);
+    assert.match(A, /remoteHost=\{session\?\.remoteHost\}/);
+    /* 同步状态不再参与"是不是远程"的判断 */
+    assert.equal(/useRemoteSyncFor\(currentSessionId \|\| undefined, true\)/.test(CA), false);
+  });
+
+  test('主进程忘掉目标时要**通知界面**（空 hostLabel = 不再是远程的）', () => {
+    assert.match(RS, /if \(was\) this\.deps\.onStatus\?\.\(\{ sessionId, state: 'idle', hostLabel: '' \}\);/);
+  });
+
+  test('渲染层收到这条就**删**掉那份状态，不是存一条空的', () => {
+    assert.match(HK, /if \(!s\.hostLabel\) \{/);
+    assert.match(HK, /delete next\[s\.sessionId\];/);
+    /* 再切回远程要能重新问一次（ask 每条会话只问一次） */
+    assert.match(HK, /asked\.current\.delete\(s\.sessionId\);/);
   });
 });

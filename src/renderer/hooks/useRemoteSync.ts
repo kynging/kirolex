@@ -24,6 +24,19 @@ export const RemoteSyncProvider: React.FC<{ children: React.ReactNode }> = ({ ch
   useEffect(() => {
     const off = (window as any).kiroApi?.onRemoteSync?.((s: RemoteSyncStatus) => {
       if (!s?.sessionId) return;
+      /* 空 hostLabel = 这条会话不再是远程的（`remoteSync.forget`）——**删掉**而不是存一条空的：
+         留着的话"这条会话有没有同步状态"就永远是真，而那正是切回本地后 🌐 还挂着的原因。 */
+      if (!s.hostLabel) {
+        /* 再切回远程时要能重新问一次状态（`ask` 每条会话只问一次） */
+        asked.current.delete(s.sessionId);
+        setMap((prev) => {
+          if (!prev[s.sessionId]) return prev;
+          const next = { ...prev };
+          delete next[s.sessionId];
+          return next;
+        });
+        return;
+      }
       setMap((prev) => ({ ...prev, [s.sessionId]: s }));
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };

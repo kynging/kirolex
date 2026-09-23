@@ -20,7 +20,7 @@ import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
-import { useRemoteSyncFor } from '../hooks/useRemoteSync';
+
 import { useSessionNotice } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
@@ -2293,6 +2293,11 @@ interface ChatAreaProps {
   onResetCredits: () => void;
   commands: SlashCommand[];
   onModelChange: (model: string) => void;
+  /**
+   * 这条会话跑在哪台机器上（`undefined` = 本地）。给人看的短名字，和侧栏那个徽标同一个值 ——
+   * 命令/文件面板要标出机器，而这件事必须跟着**会话状态**走，不能跟着同步状态走。
+   */
+  remoteHost?: string;
   /** 这条会话在哪棵树上干活（记录为准）。远程会话显示的仍是**本地**那个路径。 */
   workdir?: string;
   /** 换工作目录（Finder 选目录 → 换执行器）。 */
@@ -2413,6 +2418,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   autoFoldTools,
   commands,
   onModelChange,
+  remoteHost,
   workdir,
   onPickWorkdir,
   kiroAgent,
@@ -2461,13 +2467,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   /**
    * **这条会话跑在哪台机器上** ——「看起来工具调用是在本地？」。
    *
-   * 工具调用的记录里只有 `Running: <cmd>`（相对路径、没有 locations），和本地执行分不出来。
-   * 状态里带着 hostLabel，而本地会话根本没有状态 —— 所以这个值有就是远程、没有就是本地。
-   * 显示时去掉 `user@`：那一段不是用来区分机器的，而侧栏/面板都很窄。
+   * 工具调用的记录里只有 `Running: <cmd>`（相对路径、没有 locations），和本地执行分不出来，
+   * 所以命令/文件面板上要标出机器。显示时去掉 `user@`：那一段不是用来区分机器的，而面板很窄。
+   *
+   * **身份取自会话状态（`session.remoteHost`），不是同步状态** ——「命令调用那里即使切成本地
+   * 也有远程的 tag」。同步状态是"此刻在推/在拉"，它按 sessionId 缓存在渲染层，而切回本地时
+   * 主进程只是把目标忘掉（`remoteSync.forget`）—— 渲染层那份**留着最后一次的 hostLabel**，
+   * 于是本地会话顶着 🌐 继续跑。侧栏那个徽标一直是对的，因为它看的就是 `session.remoteHost`。
    */
   const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
-  const remoteStatus = useRemoteSyncFor(currentSessionId || undefined, true);
-  const remoteHostLabel = remoteStatus?.hostLabel?.replace(/^[^@]*@/, '');
+  const remoteHostLabel = remoteHost ? remoteHost.replace(/^[^@]*@/, '') : undefined;
   /**
    * **工作目录那一格的字** —— 显示 basename：这一排很窄，完整路径放 title。
    *

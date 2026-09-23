@@ -3009,6 +3009,9 @@ const App: React.FC = () => {
         onResetCredits={() => setUsageActionConfirm('resetCredits')}
         commands={focused ? commands : EMPTY_COMMANDS}
         onModelChange={(model) => { void handleModelChange(model, sid || undefined); }}
+        /* 跑在哪台机器上 —— 命令/文件面板上那个 🌐 用的就是它（和侧栏徽标同一份事实：
+           跟着会话状态走。跟着同步状态走的那一版，切回本地之后 🌐 还挂着）。 */
+        remoteHost={session?.remoteHost}
         /* 这条会话在哪棵树上干活 —— 常驻显示在输入框下面那一排，点它换目录 */
         workdir={session?.localDir}
         onPickWorkdir={() => { void pickWorkdir(sid); }}
