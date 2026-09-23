@@ -332,8 +332,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
 
   /* ---------------------------------------------------- 远程会话（远端执行） */
   /** 可选的远端列表。flag 关着时 `enabled: false` + 空列表 → 界面完全不显示目标选择。 */
-  remoteTargets: (): Promise<{ enabled: boolean; targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string }[] }> =>
-    ipcRenderer.invoke('app:remote-targets'),
+  remoteTargets: (): Promise<{
+    enabled: boolean;
+    targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string; bins?: { kiro?: string; claude?: string; codex?: string } }[];
+    localBins?: { kiro?: string; claude?: string; codex?: string };
+  }> => ipcRenderer.invoke('app:remote-targets'),
   /** 这条会话当前的同步状态（挂载时问一次 —— 只靠事件会丢掉挂载之前发生的）。 */
   remoteStatus: (sessionId: string) => ipcRenderer.invoke('remote:status', sessionId),
   /** 加/改一台远端（只动 config.json 的 `remotes`，原子写）。 */
@@ -377,6 +380,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('session:notice', handler);
     return () => ipcRenderer.removeListener('session:notice', handler);
   },
+  /**
+   * 存**本机**那三个 CLI 的启动命令（kiro / claude / codex）。
+   * 空 = 用默认。远端那份跟着各自的机器配置走（`remoteSave` 里的 `bins`）。
+   */
+  localSaveBins: (bins: { kiro?: string; claude?: string; codex?: string }) =>
+    ipcRenderer.invoke('local:save-bins', bins),
   /** 选一个项目目录（切到远端时用）。 */
   remotePickDir: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-dir'),
   /**

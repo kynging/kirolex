@@ -16,6 +16,29 @@ import { mirrorDirFor } from './remoteMirror.ts';
 export type PermissionMode = 'auto-approve' | 'ask';
 
 /** Where and how to reach a remote kiro-cli executor over SSH. */
+/**
+ * **每台机器上那三个 CLI 怎么起** ——「不管是本地还是远程必须要配置 kiro、claude、codex 的
+ * 启动命令，是默认 kiro 还是某个路径下的」。
+ *
+ * 空 / 不填 = **用默认**（`kiro-cli`：本地按 `kiroCliCandidates()` 找，远端按 PATH）。
+ * 填了就用你给的那个（可以是绝对路径，也可以是 PATH 里的另一个名字）。
+ *
+ * 为什么必须可配：同一台机器上完全可能有两个 kiro-cli（一个装在 `~/.local/bin`、一个是
+ * 你自己 build 的），而"跑的到底是哪一个"决定了模型列表、agent 支持、MCP 行为 ——
+ * 猜错了的表现是"远端少了几个模型 / agent 没生效"，而那种问题查半天都看不出根因。
+ *
+ * `claude` / `codex` 现在**只存不用**：KiroLex 还只起 kiro-cli。先把配置面留出来，
+ * 加执行器的时候不用再动一遍配置格式和界面。
+ */
+export interface ExecutorBins {
+  /** kiro-cli 的命令或绝对路径。空 = 默认。 */
+  kiro?: string;
+  /** claude code 的命令或绝对路径（暂未使用）。 */
+  claude?: string;
+  /** codex 的命令或绝对路径（暂未使用）。 */
+  codex?: string;
+}
+
 export interface RemoteTarget {
   /** SSH destination, e.g. "ec2-user@10.0.0.1" (may include the user). */
   sshHost: string;
@@ -25,6 +48,8 @@ export interface RemoteTarget {
   identityFile?: string;
   /** Working directory kiro-cli uses on the remote host (session cwd). */
   remoteWorkdir?: string;
+  /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
+  bins?: ExecutorBins;
 }
 
 export interface AgentProfile {

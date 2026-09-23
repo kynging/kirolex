@@ -21,6 +21,12 @@ import React, { useEffect, useRef, useState } from 'react';
  * 连不上（网络/密钥/安全组）、缺 rsync/git（一键装）、没登录（去那台机器 `kiro-cli login`）。
  * 最后一种最坑：执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。
  */
+export interface ExecBins {
+  kiro?: string;
+  claude?: string;
+  codex?: string;
+}
+
 export interface RemoteRow {
   id: string;
   label: string;
@@ -28,11 +34,20 @@ export interface RemoteRow {
   sshPort?: number;
   identityFile?: string;
   remoteWorkdir?: string;
+  /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
+  bins?: ExecBins;
 }
 
 type Draft = Partial<RemoteRow> & { sshHost: string };
 
 const NEW = '__new__';
+/**
+ * **本机也是一台"机器"** ——「不管是本地还是远程必须要配置 kiro、claude、codex 的启动命令」。
+ *
+ * 它在同一个下拉里（不是单独开一块）：这三个字段问的是同一个问题 ——"这台机器上那几个 CLI
+ * 在哪、叫什么"。本机没有 SSH 地址/端口/密钥/远端目录，所以只显示那三个启动命令。
+ */
+const LOCAL = '__local__';
 const EMPTY: Draft = { sshHost: '', label: '', sshPort: 22, identityFile: '', remoteWorkdir: '' };
 
 /**
@@ -54,11 +69,51 @@ const Field: React.FC<{
   </div>
 );
 
+/**
+ * 三个 CLI 的启动命令。本机和每台远端机器**用同一组字段** —— 问的是同一个问题。
+ *
+ * `claude` / `codex` 现在只存不用（KiroLex 还只起 kiro-cli），所以标签上明说"暂未使用"：
+ * 一个填了却不生效的输入框，比没有这个输入框更让人怀疑配置是假的。
+ */
+const BinFields: React.FC<{ bins: ExecBins; onChange: (b: ExecBins) => void }> = ({ bins, onChange }) => (
+  <>
+    <Field label="kiro 启动命令" hint="留空 = 默认（kiro-cli）。可填绝对路径，或 PATH 里的另一个名字">
+      <input
+        className="settings-input"
+        placeholder="默认：kiro-cli"
+        value={bins.kiro || ''}
+        onChange={(e) => onChange({ ...bins, kiro: e.target.value })}
+      />
+    </Field>
+    <Field label="claude 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先存着">
+      <input
+        className="settings-input"
+        placeholder="默认：claude"
+        value={bins.claude || ''}
+        onChange={(e) => onChange({ ...bins, claude: e.target.value })}
+      />
+    </Field>
+    <Field label="codex 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先存着">
+      <input
+        className="settings-input"
+        placeholder="默认：codex"
+        value={bins.codex || ''}
+        onChange={(e) => onChange({ ...bins, codex: e.target.value })}
+      />
+    </Field>
+  </>
+);
+
 export const RemoteSettings: React.FC = () => {
   const [rows, setRows] = useState<RemoteRow[]>([]);
   const [enabled, setEnabled] = useState(false);
+  /** 本机那三个启动命令（和远端同样的字段，只是没有 SSH 那几项）。 */
+  const [local, setLocal] = useState<ExecBins>({});
+  const savedLocalSig = useRef('');
   /** 选中的机器 id；`__new__` = 正在加一台；空 = 一台都没有。 */
   const [picked, setPicked] = useState('');
+  /** 选中的是"本机"那一项 —— 只显示三个启动命令（没有 SSH 地址/密钥/远端目录）。 */
+  const localOnly = picked === LOCAL;
   const [draft, setDraft] = useState<Draft | null>(null);
   const [busy, setBusy] = useState(false);
   const [installing, setInstalling] = useState(false);
@@ -81,7 +136,8 @@ export const RemoteSettings: React.FC = () => {
 
   /** 一条目标的可比较签名（只含真正会被存下去的字段）。 */
   const sig = (d: Draft | null): string => (d
-    ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.remoteWorkdir || ''])
+    ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.remoteWorkdir || '',
+      d.bins?.kiro || '', d.bins?.claude || '', d.bins?.codex || ''])
     : '');
 
   const reload = async (keep?: string): Promise<void> => {
@@ -89,6 +145,9 @@ export const RemoteSettings: React.FC = () => {
     const list: RemoteRow[] = Array.isArray(r?.targets) ? r.targets : [];
     setRows(list);
     setEnabled(!!r?.enabled);
+    const lb: ExecBins = { ...(r?.localBins || {}) };
+    setLocal(lb);
+    savedLocalSig.current = JSON.stringify([lb.kiro || '', lb.claude || '', lb.codex || '']);
     /* 默认选中第一台：打开设置就看到它的配置，而不是一个空下拉 */
     const next = keep && list.some((x) => x.id === keep) ? keep : (list[0]?.id || NEW);
     const d = next === NEW ? { ...EMPTY } : { ...EMPTY, ...list.find((x) => x.id === next) };
@@ -137,9 +196,25 @@ export const RemoteSettings: React.FC = () => {
     return () => clearTimeout(timer);
   }, [draft]);
 
+  /* 本机那三个命令也自动保存（和远端同一套规则：防抖 + 签名比对） */
+  useEffect(() => {
+    const mine = JSON.stringify([local.kiro || '', local.claude || '', local.codex || '']);
+    if (mine === savedLocalSig.current) return;
+    const timer = setTimeout(async () => {
+      setSaving(true);
+      const r = await (window as any).kiroApi?.localSaveBins?.(local);
+      setSaving(false);
+      if (!r?.ok) { setResult({ ok: false, text: r?.error || '保存失败' }); return; }
+      setResult(null);
+      savedLocalSig.current = mine;
+    }, 600);
+    return () => clearTimeout(timer);
+  }, [local]);
+
   const pick = (id: string): void => {
     setResult(null);
     setPicked(id);
+    if (id === LOCAL) { setDraft(null); return; }
     const d = id === NEW ? { ...EMPTY } : { ...EMPTY, ...rows.find((x) => x.id === id) };
     setDraft(d);
     savedSig.current = sig(d);   // 只是切了一台机器，不是改了什么
@@ -206,13 +281,29 @@ export const RemoteSettings: React.FC = () => {
         onChange={(e) => pick(e.target.value)}
         style={{ marginBottom: 8, width: '100%' }}
       >
+        <option value={LOCAL}>💻 本机（这台 Mac）</option>
         {rows.map((r) => (
           <option key={r.id} value={r.id}>{`🌐 ${r.label} — ${r.sshHost}`}</option>
         ))}
         <option value={NEW}>+ 添加一台机器…</option>
       </select>
 
-      {draft && (
+      {/*
+        **本机那一项** ——「不管是本地还是远程必须要配置 kiro、claude、codex 的启动命令，
+        是默认 kiro 还是某个路径下的」。三个字段问的是同一个问题（这台机器上那几个 CLI 在哪），
+        所以和远端机器共用一个下拉，只是本机没有 SSH 地址/端口/密钥/远端目录。
+      */}
+      {localOnly && (
+        <div className="remote-form">
+          <p className="settings-hint" style={{ marginTop: 0 }}>
+            留空就是<b>默认</b>（kiro-cli 按常见安装位置找）。填绝对路径，或者 PATH 里的另一个名字 ——
+            这台机器上可能装着两个 kiro-cli，而"跑的是哪一个"决定了模型列表、agent 和 MCP 的行为。
+          </p>
+          <BinFields bins={local} onChange={setLocal} />
+        </div>
+      )}
+
+      {!localOnly && draft && (
         <div className="remote-form">
           <Field label="名字" hint="侧栏徽标和新建对话的下拉里显示的就是这个名字">
             <input
@@ -258,6 +349,8 @@ export const RemoteSettings: React.FC = () => {
               onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
             />
           </Field>
+          {/* 这台远端机器上那三个 CLI 怎么起（空 = 用 PATH 上的默认） */}
+          <BinFields bins={draft.bins || {}} onChange={(bins) => setDraft({ ...draft, bins })} />
           <div className="remote-row-actions">
             <button className="remote-btn" disabled={locked || !canAct} onClick={() => void test()}>测试连接</button>
             <button
@@ -272,7 +365,7 @@ export const RemoteSettings: React.FC = () => {
       )}
 
       {/* 没有保存按钮，所以要有一句"存了没"—— 否则人不知道改动算不算数 */}
-      {draft?.sshHost.trim() && (
+      {(localOnly || draft?.sshHost.trim()) && (
         <p className="settings-hint">{saving ? '正在保存…' : '改动自动保存'}</p>
       )}
       {busy && <p className="settings-hint">正在连…（最多等 30 秒）</p>}

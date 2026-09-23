@@ -52,8 +52,24 @@ export function kiroTraceEnabled(env: NodeJS.ProcessEnv = process.env, home = os
 }
 
 /** Where kiro-cli might live, most specific first. */
+/**
+ * **配置里指定的那个 kiro-cli** ——「不管是本地还是远程必须要配置 kiro、claude、codex 的启动命令」。
+ *
+ * 一个模块级的值而不是往五个调用点各传一遍参数：`resolveKiroCli()` 被执行器、模型列表、
+ * agent 列表、usage 面板共用，而"跑的到底是哪一个 kiro-cli"在这几处**必须一致** ——
+ * 不一致的表现是"聊天能用，但模型列表少了几个"，那种问题查半天看不出根因。
+ * 主进程在启动和改配置时设置它（`localBins`）。
+ */
+let configuredKiroBin: string | undefined;
+
+export function setLocalKiroBin(bin?: string): void {
+  configuredKiroBin = (bin || '').trim() || undefined;
+}
+
 export function kiroCliCandidates(): string[] {
   return [
+    /* 配置里指定的优先 —— 它是你明确的选择，比"按固定顺序猜"更可信 */
+    configuredKiroBin,
     process.env.KIRO_CLI_PATH,
     // Windows
     `${process.env.LOCALAPPDATA}\\Kiro-Cli\\kiro-cli.exe`,
@@ -79,6 +95,9 @@ export function kiroCliCandidates(): string[] {
  *  agent list and usage panel all fail. One resolver for both paths. */
 export function resolveKiroCli(): string | null {
   for (const p of kiroCliCandidates()) {
+    /* **裸命令名直接用**：配置里可以填 `kiro-cli-dev` 这种 PATH 上的名字，
+       而 `existsSync('kiro-cli-dev')` 当然是 false —— 按文件判断会把它悄悄丢掉。 */
+    if (!p.includes('/') && !p.includes('\\')) return p;
     try { if (fs.existsSync(p)) return p; } catch { /* unreadable candidate */ }
   }
   return null;
@@ -144,7 +163,7 @@ export class AcpClient extends EventEmitter {
         command = 'ssh';
         args = buildSshArgs(
           this.remote,
-          buildRemoteKiroCommand(this.model, this.localTools?.agentOverride || this.kiroAgent),
+          buildRemoteKiroCommand(this.model, this.localTools?.agentOverride || this.kiroAgent, this.remote.bins?.kiro),
           this.localTools ? { remotePort: this.localTools.remotePort, localPort: this.localTools.localPort } : undefined,
         );
       } else {
@@ -661,8 +680,10 @@ export function shellQuote(value: string): string {
  * `$$` 是那个 bash 的 PID，而 `exec` 之后 kiro-cli **就是同一个 PID**，所以这一行报出来的
  * 就是要杀的那个。走 stderr：stdout 是 ACP 的协议流，掺一个字节进去就毁了它。
  */
-function buildRemoteKiroCommand(model: string, kiroAgent?: string): string {
-  let cli = `kiro-cli acp --model ${shellQuote(model)}`;
+function buildRemoteKiroCommand(model: string, kiroAgent?: string, bin?: string): string {
+  /* 远端那台机器上 kiro-cli 叫什么、在哪，由那台机器自己的配置说（`RemoteTarget.bins.kiro`）；
+     没配就用 PATH 上的 `kiro-cli` */
+  let cli = `${shellQuote((bin || '').trim() || 'kiro-cli')} acp --model ${shellQuote(model)}`;
   if (kiroAgent) cli += ` --agent ${shellQuote(kiroAgent)}`;
   return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; exec ${cli}`)}`;
 }

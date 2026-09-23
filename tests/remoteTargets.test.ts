@@ -1499,3 +1499,89 @@ describe('归档 / 恢复不许把远程会话变成本地的', () => {
     assert.match(body, /\{ \.\.\.s, archived, \.\.\.\(archived \? \{ projectId: undefined \} : \{\}\) \}/);
   });
 });
+
+/*
+ * 「配置里每一个配置，不管是本地还是远程必须要配置 kiro、claude、codex 的启动命令，
+ *   是默认 kiro 还是某个路径下的。另两个现在还没加，但后续要加入」。
+ *
+ * 为什么这件事非做不可：同一台机器上完全可能有两个 kiro-cli（装的那个 + 自己 build 的），
+ * 而"跑的是哪一个"决定了模型列表、agent 支持和 MCP 行为 —— 猜错的表现是"远端少了几个模型"
+ * 或"agent 没生效"，那种问题查半天看不出根因。
+ */
+describe('每台机器（含本机）都能配三个 CLI 的启动命令', () => {
+  const tmpCfg = (obj: any): string => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'bins-'));
+    const p = path.join(dir, 'config.json');
+    fs.writeFileSync(p, JSON.stringify(obj, null, 2));
+    return p;
+  };
+
+  test('空值 = "用默认"，而不是"用空命令启动"', async () => {
+    const { normalizeBins } = await import('../src/main/remoteTargets.ts');
+    assert.equal(normalizeBins({ kiro: '  ', claude: '', codex: undefined }), undefined, '全空就别写这个键');
+    assert.deepEqual(normalizeBins({ kiro: ' /opt/kiro-cli ' }), { kiro: '/opt/kiro-cli', claude: undefined, codex: undefined });
+  });
+
+  test('远端那份跟着机器走，读得出来也存得回去（而且不会被别的编辑抹掉）', async () => {
+    const { listRemoteTargets, saveRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    const cfg = tmpCfg({ remotes: [{ id: 'tokyo', sshHost: 'ec2-user@1.2.3.4', bins: { kiro: '/opt/kiro-cli' } }] });
+    assert.deepEqual(listRemoteTargets(cfg)[0].bins, { kiro: '/opt/kiro-cli', claude: undefined, codex: undefined });
+    /* 只改 label 的那次保存**不许**把 bins 抹掉 —— 和密钥那次是同一个坑（「我为什么选了密钥不生效」） */
+    saveRemoteTarget(cfg, { id: 'tokyo', sshHost: 'ec2-user@1.2.3.4', label: '东京' });
+    assert.equal(listRemoteTargets(cfg)[0].bins?.kiro, '/opt/kiro-cli');
+    /* 明确传空 = 清掉（回到默认） */
+    saveRemoteTarget(cfg, { id: 'tokyo', sshHost: 'ec2-user@1.2.3.4', bins: { kiro: '' } });
+    assert.equal(listRemoteTargets(cfg)[0].bins, undefined);
+  });
+
+  test('本机那份存在 `localBins`，只动这一个键', async () => {
+    const { localBins, saveLocalBins } = await import('../src/main/remoteTargets.ts');
+    const cfg = tmpCfg({ features: { remoteSessions: true }, remotes: [] });
+    assert.equal(localBins(cfg), undefined);
+    saveLocalBins(cfg, { kiro: '/usr/local/bin/kiro-cli', codex: 'codex-dev' });
+    assert.deepEqual(localBins(cfg), { kiro: '/usr/local/bin/kiro-cli', claude: undefined, codex: 'codex-dev' });
+    /* 配置里别的东西一个字都不能动 */
+    assert.deepEqual(JSON.parse(fs.readFileSync(cfg, 'utf8')).features, { remoteSessions: true });
+    saveLocalBins(cfg, {});
+    assert.equal(JSON.parse(fs.readFileSync(cfg, 'utf8')).localBins, undefined, '全空就把这个键删掉');
+  });
+
+  test('本机：配置里那个**优先于**按固定顺序猜，而且裸命令名不能被 existsSync 丢掉', async () => {
+    const { kiroCliCandidates, resolveKiroCli, setLocalKiroBin } = await import('../src/main/acp-client.ts');
+    setLocalKiroBin('kiro-cli-dev');
+    try {
+      assert.equal(kiroCliCandidates()[0], 'kiro-cli-dev', '配置里的排第一');
+      /* 裸命令名（PATH 上的另一个名字）`existsSync` 必然 false —— 按文件判断会把它悄悄丢掉 */
+      assert.equal(resolveKiroCli(), 'kiro-cli-dev');
+    } finally {
+      setLocalKiroBin(undefined);
+    }
+  });
+
+  test('远端：启动命令用那台机器配的（没配才用 PATH 上的 kiro-cli）', () => {
+    const A = fs.readFileSync(path.join(process.cwd(), 'src/main/acp-client.ts'), 'utf8');
+    assert.match(A, /function buildRemoteKiroCommand\(model: string, kiroAgent\?: string, bin\?: string\)/);
+    assert.match(A, /\$\{shellQuote\(\(bin \|\| ''\)\.trim\(\) \|\| 'kiro-cli'\)\}/);
+    assert.match(A, /this\.remote\.bins\?\.kiro/);
+  });
+
+  test('接线：投影/保存都带 bins（漏一个字段 = 自动保存把它抹掉），启动时就应用本机那份', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /bins: t\.bins,/);
+    assert.match(M, /localBins: localBins\(KIROLEX_CONFIG_PATH\),/);
+    assert.match(M, /ipcMain\.handle\('local:save-bins'/);
+    /* 存完立刻生效，否则"改了配置没反应"会让人以为这个配置项是假的 */
+    assert.match(M, /setLocalKiroBin\(saved\?\.kiro\);/);
+    assert.match(M, /setLocalKiroBin\(localBins\(KIROLEX_CONFIG_PATH\)\?\.kiro\);/);
+  });
+
+  test('界面：本机和远端**共用同一组字段**，都在同一个下拉里', () => {
+    const R = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.match(R, /const BinFields: React\.FC</);
+    assert.match(R, /<option value=\{LOCAL\}>💻 本机（这台 Mac）<\/option>/);
+    /* 两处都用它 —— 各写一遍迟早分叉 */
+    assert.equal((R.match(/<BinFields /g) || []).length, 2);
+    /* claude/codex 现在只存不用，标签上要明说 —— 填了不生效比没有这个框更让人怀疑配置是假的 */
+    assert.match(R, /claude 启动命令（暂未使用）/);
+  });
+});

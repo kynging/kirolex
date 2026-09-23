@@ -21,7 +21,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import type { RemoteTarget } from './config';
+import type { ExecutorBins, RemoteTarget } from './config';
 
 export interface RemoteTargetEntry extends RemoteTarget {
   /** 稳定 id：存进会话的 profile，重启后靠它找回同一台机器。 */
@@ -56,7 +56,45 @@ function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntr
     sshPort: Number.isFinite(port) && port > 0 ? port : 22,
     identityFile: expandHome(typeof raw?.identityFile === 'string' ? raw.identityFile : undefined, home),
     remoteWorkdir: typeof raw?.remoteWorkdir === 'string' && raw.remoteWorkdir.trim() ? raw.remoteWorkdir.trim() : undefined,
+    bins: normalizeBins(raw?.bins),
   };
+}
+
+/**
+ * 三个 CLI 的启动命令。**空串当成"没配"**（= 用默认）——
+ * 界面上清空一个输入框的意思是"回到默认"，不是"用空命令启动"。
+ * 全都没配时返回 `undefined`，这样配置文件里不会多出一个空对象。
+ */
+export function normalizeBins(raw: any): ExecutorBins | undefined {
+  const pick = (v: any): string | undefined => {
+    const t = typeof v === 'string' ? v.trim() : '';
+    return t || undefined;
+  };
+  const out: ExecutorBins = { kiro: pick(raw?.kiro), claude: pick(raw?.claude), codex: pick(raw?.codex) };
+  return (out.kiro || out.claude || out.codex) ? out : undefined;
+}
+
+/**
+ * **本机那份**（和远端一样的三个字段）。
+ *
+ * 本地为什么也要配：这台 Mac 上就有两个 kiro-cli（`~/.local/bin` 那个和自己 build 的），
+ * 而 `kiroCliCandidates()` 是按固定顺序猜的 —— 猜中哪个你看不出来。
+ */
+export function localBins(configPath: string): ExecutorBins | undefined {
+  try {
+    return normalizeBins(JSON.parse(fs.readFileSync(configPath, 'utf-8'))?.localBins);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 存本机那份（只动 `localBins` 这一个键；空值 = 回到默认）。 */
+export function saveLocalBins(configPath: string, bins: ExecutorBins): ExecutorBins | undefined {
+  const cfg = readConfigObject(configPath);
+  const next = normalizeBins(bins);
+  if (next) cfg.localBins = next; else delete cfg.localBins;
+  writeConfigObject(configPath, cfg);
+  return next;
 }
 
 /**
@@ -120,6 +158,8 @@ export interface RemoteTargetInput {
   sshPort?: number;
   identityFile?: string;
   remoteWorkdir?: string;
+  /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
+  bins?: ExecutorBins;
 }
 
 /** 新建时的 id：按 label/host 生成一个稳定的可读 id（不用时间戳 —— 那种 id 在配置文件里没法认）。 */
@@ -200,6 +240,8 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
     remoteWorkdir: has('remoteWorkdir')
       ? (String(input.remoteWorkdir).trim() || undefined)
       : old?.remoteWorkdir,
+    /* 和上面几个字段同一条规则：界面没给就不动（否则每次编辑都在悄悄抹掉它） */
+    bins: has('bins') ? normalizeBins(input.bins) : normalizeBins(old?.bins),
   };
   if (at >= 0) list[at] = row; else list.push(row);
   cfg.remotes = list;

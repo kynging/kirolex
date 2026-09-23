@@ -3,9 +3,9 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFile, spawn } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type RemoteTarget } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -38,7 +38,7 @@ import { mentionedPaths, stageFiles, writeBack } from './localFileBridge.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents, localAgentJson } from './kiroAgents.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
-import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, type RemoteTargetInput } from './remoteTargets.ts';
+import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
@@ -1848,6 +1848,14 @@ const MAX_CONCURRENT_SESSIONS_AUTO = computeExecutorCap();
 // User-configurable cap: persisted override in ~/.kirolex/config.json wins over
 // the auto-sized value. 0/undefined = auto. Clamped to a sane range.
 const KIROLEX_CONFIG_PATH = path.join(os.homedir(), '.kirolex', 'config.json');
+
+/*
+  **配置里指定的 kiro-cli 从进程一开始就生效** ——「不管是本地还是远程必须要配置启动命令」。
+
+  不在这里设的话，第一次用到它的是执行器，而模型列表/agent 列表/usage 那几处各自 resolve
+  一遍 —— 于是"跑的是哪一个 kiro-cli"在同一个进程里都可能不一致。
+*/
+setLocalKiroBin(localBins(KIROLEX_CONFIG_PATH)?.kiro);
 
 /** ONE shared copy of the renderer's UI state (project groups, split layout,
  *  settings, panel widths…).
@@ -7105,8 +7113,29 @@ app.whenReady().then(async () => {
         sshPort: t.sshPort,
         identityFile: t.identityFile,
         remoteWorkdir: t.remoteWorkdir,
+        /* 三个 CLI 的启动命令 —— 漏发一个字段 = 自动保存把它抹掉（见上面那段） */
+        bins: t.bins,
       })),
+      /** 本机那份（和远端同样三个字段）——「不管是本地还是远程必须要配置」。 */
+      localBins: localBins(KIROLEX_CONFIG_PATH),
     };
+  });
+
+  /**
+   * 存本机那三个启动命令。
+   *
+   * 存完**立刻生效**（`setLocalKiroBin`）：不设的话要重启才算数，而"改了配置没反应"
+   * 会让人以为配置项是假的。已经起着的执行器不动 —— 它绑在那个进程上，下次起才换。
+   */
+  ipcMain.handle('local:save-bins', (_event, bins: ExecutorBins) => {
+    try {
+      const saved = saveLocalBins(KIROLEX_CONFIG_PATH, bins || {});
+      setLocalKiroBin(saved?.kiro);
+      logger.info('app', `本机启动命令：kiro=${saved?.kiro || '(默认)'} claude=${saved?.claude || '(默认)'} codex=${saved?.codex || '(默认)'}`);
+      return { ok: true, bins: saved };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || '保存失败' };
+    }
   });
 
   /** 这条会话当前的同步状态（界面重新挂载时问一次 —— 只靠事件会丢掉挂载之前的状态）。 */
@@ -7121,7 +7150,7 @@ app.whenReady().then(async () => {
     try {
       const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, input);
       logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})`);
-      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, remoteWorkdir: saved.remoteWorkdir } };
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins } };
     } catch (err: any) {
       return { ok: false, error: err?.message || '保存失败' };
     }
