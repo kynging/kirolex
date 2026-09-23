@@ -39,6 +39,34 @@ type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' 
  * jump), measures, and then positions with `placeMenu` — which flips up/left rather than sliding away from the
  * row that was right-clicked.
  */
+/**
+ * 右键菜单里的**子菜单**（悬浮展开到右侧）——「那个按钮应该变成切换 session，右侧展开可以选本地、
+ * 远程服务器之类的」。
+ *
+ * 为什么值得做成子菜单而不是继续平铺：平铺的时候每台机器占一行，和「归到哪个项目」那一堆 🏷️
+ * 混在一起，菜单越长越难扫；而"这条会话在哪台机器上跑"是**一个**问题、多个互斥选项 ——
+ * 一行加一个展开箭头正好表达这件事，当前在哪儿也能用 ✓ 一眼看出来。
+ *
+ * 展开方向固定向右、用 CSS 定位（`left: 100%`）：这个菜单本身已经被 `placeMenu` 摆在视口内了，
+ * 子菜单跟着它走就行 —— 再写一套边界计算只会多一处会算错的地方。
+ */
+const Submenu: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => {
+  const [open, setOpen] = useState(false);
+  return (
+    <div
+      className={`context-menu-item context-submenu${open ? ' open' : ''}`}
+      onMouseEnter={() => setOpen(true)}
+      onMouseLeave={() => setOpen(false)}
+      /* 点父项不该关掉整个菜单：它只是个入口 */
+      onClick={(e) => { e.stopPropagation(); setOpen((v) => !v); }}
+    >
+      <span className="context-submenu-label">{label}</span>
+      <span className="context-submenu-caret">›</span>
+      {open && <div className="context-submenu-panel">{children}</div>}
+    </div>
+  );
+};
+
 const Menu: React.FC<{ x: number; y: number; children: React.ReactNode }> = ({ x, y, children }) => {
   const box = useRef<HTMLDivElement | null>(null);
   const [place, setPlace] = useState<{ left: number; top: number } | null>(null);
@@ -958,27 +986,30 @@ export const Sidebar: React.FC<SidebarProps> = ({
               {remoteTargets.length > 0 && (
                 <>
                   <div className="context-menu-divider" />
-                  {ctxSession.remoteHost && (
+                  {/*
+                    **一个入口、右侧展开**：这是"这条会话在哪台机器上跑"这**一个**问题，
+                    多个互斥选项；平铺的话每台机器占一行，和下面那堆 🏷️ 项目混在一起越来越难扫。
+                    当前在哪儿用 ✓ 标出来。
+                  */}
+                  <Submenu label={`${ctxSession.remoteHost ? '🌐' : '💻'} 运行位置：${ctxSession.remoteHost || '本地'}`}>
                     <div
                       className="context-menu-item"
                       onClick={() => { void onSetTarget?.(ctxSession.id, null); setContextMenu(null); }}
                       title="切回本地跑。切之前会先把远端的改动取回来 —— 取不回来就不切。"
                     >
-                      {'💻 改回本地运行'}
+                      {`${ctxSession.remoteHost ? '　' : '✓ '}💻 本地`}
                     </div>
-                  )}
-                  {remoteTargets
-                    .filter((tg) => tg.label !== ctxSession.remoteHost)
-                    .map((tg) => (
+                    {remoteTargets.map((tg) => (
                       <div
                         key={tg.id}
                         className="context-menu-item"
                         onClick={() => { void onSetTarget?.(ctxSession.id, tg.id); setContextMenu(null); }}
-                        title={`把这条会话改成在 ${tg.sshHost} 上跑（文件仍在本地，每轮前后同步镜像）`}
+                        title={`在 ${tg.sshHost} 上跑（文件仍在本地，每轮前后同步镜像）`}
                       >
-                        {`🌐 改到 ${tg.label} 上运行`}
+                        {`${ctxSession.remoteHost === tg.label ? '✓ ' : '　'}🌐 ${tg.label}`}
                       </div>
                     ))}
+                  </Submenu>
                   <div className="context-menu-divider" />
                 </>
               )}

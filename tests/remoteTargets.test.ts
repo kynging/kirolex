@@ -1039,7 +1039,7 @@ describe('切换一条已有会话的机器', () => {
   test('**没有项目目录不是问题** —— 镜像它自己的会话目录，和本地那条路一样', () => {
     /* 上一版在这里要求"必须指定一个项目目录"，那是把"必须镜像点什么"和"必须有个项目"混成了一件事 */
     assert.equal(/还没有项目目录 —— 切到远端要先指定一个/.test(body), false, '这个要求不该再有');
-    assert.match(body, /\|\| getSessionDir\(sessionId\);/);
+    assert.match(body, /const nextLocalDir = localDirOrSessionDir\(/);
     /* 家目录那道闸还在 —— 只有"目录真的是家目录"时才撞上 */
     assert.match(body, /const refusal = mirrorRefusal\(nextLocalDir, os\.homedir\(\)\);/);
   });
@@ -1063,17 +1063,41 @@ describe('切换一条已有会话的机器', () => {
     assert.match(body, /之前的对话一条都没动/);
   });
 
-  test('右键菜单里有这两条，且只在配了远端时出现', () => {
-    assert.match(SB, /改回本地运行/);
-    assert.match(SB, /改到 \$\{tg\.label\} 上运行/);
+  test('右键菜单是**一个入口、右侧展开**（本地 / 各远端），当前位置打 ✓', () => {
+    /* 上一版是平铺：每台机器占一行，和下面那堆 🏷️ 项目混在一起，菜单越长越难扫。
+       「这条会话在哪台机器上跑」是一个问题、多个互斥选项 —— 子菜单才是它的形状。 */
+    assert.match(SB, /const Submenu: React\.FC</);
+    assert.match(SB, /运行位置：\$\{ctxSession\.remoteHost \|\| '本地'\}/);
     assert.match(SB, /\{remoteTargets\.length > 0 && \(/);
-    /* 已经在那台机器上的目标不再列一遍 */
-    assert.match(SB, /\.filter\(\(tg\) => tg\.label !== ctxSession\.remoteHost\)/);
+    /* 当前在哪儿要能一眼看出来 */
+    assert.match(SB, /ctxSession\.remoteHost \? '　' : '✓ '/);
+    assert.match(SB, /ctxSession\.remoteHost === tg\.label \? '✓ ' : '　'/);
+    /* 展开方向靠 CSS，不再写第二套边界计算 */
+    const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+    assert.match(CSS, /\.context-submenu-panel \{[^}]*left: 100%/s);
   });
 
   test('界面上**不问目录**（那个要求已经去掉了），失败要让人看见', () => {
     assert.equal(/remotePickDir/.test(SB), false, '不该再弹目录选择');
     /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
     assert.match(SB, /window\.alert\(String\(r\?\.error/);
+  });
+});
+
+/*
+ * 「现在显示不能把家目录推到远程服务器」—— 那条拒绝出现在**你根本没选过家目录**的时候：
+ * 老会话的 `localDir` 是渲染层那三处硬写的 `'~'` 留下的（见 `SessionRecord.localDir`）。
+ * 空目录和家目录是同一件事 —— 都表示"这条会话没有项目目录"，都该退回会话目录。
+ */
+describe('“没有项目目录”只有一种处理方式', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('空 / 家目录统一退回会话目录（一个函数，不是三份判断）', () => {
+    assert.match(M, /function localDirOrSessionDir\(sessionId: string, candidate\?: string\): string \{/);
+    assert.match(M, /if \(!dir \|\| dir === os\.homedir\(\)\.replace\(\/\\\/\+\$\/, ''\)\) return getSessionDir\(sessionId\);/);
+  });
+
+  test('三条路（新建 / attach / 换机器）都走它 —— 上一版只有两条走，第三条就撞了那句拒绝', () => {
+    assert.equal((M.match(/localDirOrSessionDir\(/g) || []).length, 4, '定义 1 处 + 三条路');
   });
 });

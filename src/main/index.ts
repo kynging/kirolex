@@ -1527,6 +1527,22 @@ async function syncKiroAgent(sessionId: string, remote: RemoteTarget, agent?: st
   }
 }
 
+/**
+ * **"没有项目目录"的统一说法** ——「现在显示不能把家目录推到远程服务器」。
+ *
+ * 空字符串和家目录是**同一件事**：都表示"这条会话没有项目目录"。家目录之所以会出现，
+ * 是因为渲染层 attach 时三处都硬写 `'~'`（见 `SessionRecord.localDir`），它从来不是一个真实选择。
+ *
+ * 上一版把这两种情况分开处理（空 → 用会话目录；家目录 → 报错"不能把家目录推到远端"），
+ * 于是从老会话切到远端时就撞上那句拒绝 —— 而人根本没选过家目录。统一到这里：
+ * 两种都退回**会话目录**（本地那条路的 cwd 本来就是它）。
+ */
+function localDirOrSessionDir(sessionId: string, candidate?: string): string {
+  const dir = String(candidate || '').replace(/\/+$/, '');
+  if (!dir || dir === os.homedir().replace(/\/+$/, '')) return getSessionDir(sessionId);
+  return dir;
+}
+
 /** 这条会话在**本地**的工作目录（远程会话的 `cwd` 是远端镜像路径，不能拿来当本地目录用）。 */
 function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
   if (entry.localDir) return entry.localDir;
@@ -3263,9 +3279,10 @@ app.whenReady().then(async () => {
         没归项目的会话，本地 cwd 就是它自己的会话目录 —— 远程照办（镜像那一份就够，
         history.md 和附件本来就在里面）。所以"家目录"在这里不是错误，只是"没有项目"的表现形式。
       */
-      if (resolvedCwd === os.homedir()) {
-        resolvedCwd = sessionDir;
-        logger.info('remote', `新建远程会话没有项目目录 -> 镜像会话目录 ${sessionDir}`);
+      const normalized = localDirOrSessionDir(kiroLexId, resolvedCwd);
+      if (normalized !== resolvedCwd) {
+        logger.info('remote', `新建远程会话没有项目目录 -> 镜像会话目录 ${normalized}`);
+        resolvedCwd = normalized;
       }
       const refusal = mirrorRefusal(resolvedCwd, os.homedir());
       if (refusal) throw new Error(`这条远程会话没有建立：${refusal}`);
@@ -5213,10 +5230,10 @@ app.whenReady().then(async () => {
 
       家目录那道闸仍然要过 —— 只有一种情况会撞上它：目录真的是家目录（渲染层传 `'~'` 的那条老路）。
     */
-    const nextLocalDir = localDir
-      || store.readRecord(sessionId)?.localDir
-      || oldEntry.localDir
-      || getSessionDir(sessionId);
+    const nextLocalDir = localDirOrSessionDir(
+      sessionId,
+      localDir || store.readRecord(sessionId)?.localDir || oldEntry.localDir,
+    );
     if (target) {
       const refusal = mirrorRefusal(nextLocalDir, os.homedir());
       if (refusal) throw new Error(refusal);
@@ -6019,7 +6036,7 @@ app.whenReady().then(async () => {
       */
       if (profile.remote?.sshHost) {
         /* 没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录，和本地那条路一致 */
-        if (resolvedCwd === os.homedir()) resolvedCwd = getSessionDir(sessionId);
+        resolvedCwd = localDirOrSessionDir(sessionId, resolvedCwd);
         const refusal = mirrorRefusal(resolvedCwd, os.homedir());
         if (refusal) {
           logger.warn('remote', `attach ${sessionId}: 目录不能做镜像（${refusal}）—— 这条会话退回本地`);
