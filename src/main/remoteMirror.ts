@@ -108,6 +108,27 @@ export const SESSION_DIR_EXCLUDES = [
   'memory.md',
 ];
 
+/**
+ * **KiroLex 自己写的那几个文件，方向是单向的** ——「远程服务器怎么是红的」。
+ *
+ * 会话没有项目目录时，镜像的根就是它自己的会话目录，而那里面躺着 KiroLex 每一轮都会重写的东西：
+ * `history.md`（每轮刷新）、`transcript.jsonl`、`events.jsonl`、`record.json`。
+ * 于是"自推送以来本地变过的文件"永远非空、远端那份也永远不同 —— **每次拉都报冲突**
+ * （实测：`冲突 3`，徽标一直是警告色，而且本地被塞了一堆 `.remote` 文件）。
+ *
+ * 但它们不是真的冲突：这些文件**只由本地产生**，远端那份只是给模型读的副本。
+ * 所以规则是不对称的 —— 推上去（模型要读 `history.md`），但**永远不拉回来**。
+ */
+export const PULL_NEVER = [
+  'history.md',
+  'transcript.jsonl',
+  'events.jsonl',
+  'record.json',
+  'last-injection.md',
+  'memory.md',
+  'loop.json',
+];
+
 /** 一棵树大到这个程度就不是"一个项目"了 —— 实测家目录是 49064 个文件 / 2.6 GB。 */
 export const MAX_MIRROR_FILES = 20000;
 export const MAX_MIRROR_BYTES = 1024 * 1024 * 1024;
@@ -216,6 +237,8 @@ export interface SyncSpec {
   dryRun?: boolean;
   /** 这一次额外排除的相对路径（冲突文件：不能让它覆盖你的本地版本）。 */
   skip?: string[];
+  /** 只在**拉**的时候排除（`PULL_NEVER`：本地说了算的那几个文件）。 */
+  pullOnly?: string[];
   sshCommand: string;
 }
 
@@ -235,6 +258,8 @@ export function pullArgs(spec: SyncSpec): string[] {
   return [
     '-a',
     ...(spec.dryRun ? ['--dry-run', '--itemize-changes', '--out-format=%i %n'] : []),
+    /* 单向文件：推得上去、永远不拉回来（见 `PULL_NEVER`） */
+    ...(spec.pullOnly || []).flatMap((p) => ['--exclude', p]),
     ...commonArgs(spec),
     `${spec.remote.sshHost}:${trailSlash(spec.remoteDir)}`,
     `${trailSlash(spec.localDir)}`,
@@ -413,6 +438,8 @@ export class RemoteMirror {
   private remote: RemoteTarget;
   private io: MirrorIo;
   private excludes: string[];
+  /** 拉的时候额外排除（本地说了算的那几个文件）。 */
+  private pullNever: string[];
   private sshCommand: string;
   /** 最近一次推送时的本地快照 —— 冲突判定的另一半。 */
   private lastPush?: Snapshot;
@@ -426,6 +453,8 @@ export class RemoteMirror {
     sshCommand: string;
     io?: MirrorIo;
     excludes?: string[];
+    /** 只在拉的时候排除（默认空；会话目录当镜像根时传 `PULL_NEVER`）。 */
+    pullNever?: string[];
   }) {
     this.remote = opts.remote;
     this.localDir = opts.localDir;
@@ -433,6 +462,7 @@ export class RemoteMirror {
     this.sshCommand = opts.sshCommand;
     this.io = opts.io || realIo;
     this.excludes = opts.excludes || DEFAULT_EXCLUDES;
+    this.pullNever = opts.pullNever || [];
   }
 
   /** 掐掉正在跑的那次同步（没有在跑时什么都不做）。 */
@@ -459,6 +489,7 @@ export class RemoteMirror {
       remoteDir: this.remoteDir,
       excludes: this.excludes,
       sshCommand: this.sshCommand,
+      pullOnly: this.pullNever,
       ...extra,
     };
   }
@@ -507,9 +538,10 @@ export class RemoteMirror {
       一趟 rsync 就是一次 SSH 握手（实测拉一次 5–7 秒，两趟就是双倍），而"这一轮什么都没改"
       恰恰是最常见的情况 —— 纯生成的任务一个文件都不动。
     */
-    const changedBefore = this.lastPush
+    /* 单向文件不算"本地改动"：它们每轮都变，算进去的话快路径永远用不上、还会天天报冲突 */
+    const changedBefore = (this.lastPush
       ? locallyChanged(this.lastPush, snapshotDir(this.localDir, this.excludes))
-      : [];
+      : []).filter((rel) => !this.pullNever.includes(rel.split('/').pop() || rel));
     if (!changedBefore.length) {
       const only = await this.runCancellable('rsync', pullArgs(this.spec()), SYNC_TIMEOUT_MS);
       if (only.code !== 0) {

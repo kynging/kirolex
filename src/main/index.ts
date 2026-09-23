@@ -24,7 +24,7 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal, rsyncError, DEFAULT_EXCLUDES, SESSION_DIR_EXCLUDES } from './remoteMirror.ts';
+import { RemoteMirror, mirrorDirFor, sessionMirrorDir, sshCommandFor, mapIntoMirror, posixJoin, mirrorRefusal, rsyncError, DEFAULT_EXCLUDES, SESSION_DIR_EXCLUDES, PULL_NEVER } from './remoteMirror.ts';
 import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts';
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
@@ -1400,6 +1400,12 @@ function registerRemoteSync(sessionId: string, profile: AgentProfile, localProje
   if (!remote?.sshHost) return;
   const sshCommand = sshCommandFor(remote, buildSshArgs);
   const workdir = remote.remoteWorkdir || defaultRemoteWorkdir(remote.sshHost);
+  /*
+    镜像根就是会话目录时（这条会话没有项目），那里面躺着 KiroLex 每轮都重写的
+    `history.md` / `transcript.jsonl` / `events.jsonl` —— 不把它们设成单向的话**每次拉都报冲突**
+    （实测 `冲突 3`，徽标一直是警告色，本地还被塞了一堆 `.remote`）。见 `PULL_NEVER`。
+  */
+  const rootIsSessionDir = localProjectDir === getSessionDir(sessionId);
   remoteSync.register({
     sessionId,
     /* 给人看的名字（设置里那个 label），不是 IP —— 徽标、会话里的提示都用它 */
@@ -1408,6 +1414,7 @@ function registerRemoteSync(sessionId: string, profile: AgentProfile, localProje
       remote, sshCommand,
       localDir: localProjectDir,
       remoteDir: mirrorDirFor(workdir, localProjectDir),
+      pullNever: rootIsSessionDir ? PULL_NEVER : [],
     }),
     session: new RemoteMirror({
       remote, sshCommand,

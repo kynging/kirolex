@@ -625,3 +625,47 @@ describe('不该拉的时候别拉', () => {
     assert.match(M, /entry\.remoteWroteThisTurn = false;/);
   });
 });
+
+/*
+ * 「远程服务器怎么是红的」—— 徽标是警告色，因为**每一次拉都报冲突**（实测 `冲突 3`）。
+ * 那三个"冲突"是 `history.md` / `transcript.jsonl` / `events.jsonl` —— KiroLex 自己每轮都在写它们，
+ * 所以"本地变过"永远成立、远端那份也永远不同。它们不是冲突：只由本地产生，远端那份只是给模型读的。
+ */
+describe('KiroLex 自己写的文件是单向的（推上去，永不拉回）', () => {
+  test('拉的参数里排除它们，推的参数里**不**排除（模型要读 history.md）', async () => {
+    const { pullArgs, pushArgs, PULL_NEVER } = await import('../src/main/remoteMirror.ts');
+    const spec = { remote, localDir: '/l', remoteDir: '/r', sshCommand: SSHC, pullOnly: PULL_NEVER } as any;
+    const pull = pullArgs(spec);
+    for (const f of ['history.md', 'transcript.jsonl', 'events.jsonl']) {
+      assert.ok(pull.includes(f), `拉的时候要排除 ${f}`);
+    }
+    const push = pushArgs(spec);
+    assert.equal(push.includes('history.md'), false, '推的时候不能排除 —— 模型读的就是它');
+  });
+
+  test('这几个文件不算"本地改动" —— 算进去的话快路径永远用不上、还天天报冲突', async () => {
+    const { RemoteMirror, PULL_NEVER } = await import('../src/main/remoteMirror.ts');
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'oneway-'));
+    fs.writeFileSync(path.join(dir, 'history.md'), 'v1');
+    fs.writeFileSync(path.join(dir, 'real.txt'), 'x');
+    const cmds: string[][] = [];
+    const io = {
+      async run(file: string, args: string[]) {
+        cmds.push([file, ...args]);
+        return { code: 0, stdout: args.includes('--dry-run') ? '>f.st.... history.md' : '', stderr: '' };
+      },
+    };
+    const m = new RemoteMirror({ remote, localDir: dir, remoteDir: '/r/p', sshCommand: SSHC, io, pullNever: PULL_NEVER });
+    await m.push();
+    fs.writeFileSync(path.join(dir, 'history.md'), 'v2 —— 每一轮都会被重写');
+    const r = await m.pull();
+    assert.deepEqual(r.conflicts, [], 'history.md 变了不该算冲突');
+    assert.equal(cmds.filter((c) => c.includes('--dry-run')).length, 0, '它不算本地改动 → 快路径照旧生效');
+  });
+
+  test('接线：只有"镜像根 = 会话目录"时才开这个单向规则', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /const rootIsSessionDir = localProjectDir === getSessionDir\(sessionId\);/);
+    assert.match(M, /pullNever: rootIsSessionDir \? PULL_NEVER : \[\],/);
+  });
+});
