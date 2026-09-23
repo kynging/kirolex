@@ -202,3 +202,22 @@ describe('摆渡的账本不过河、也不白写', () => {
     assert.equal(readManifest(dir).length, 2);
   });
 });
+
+/*
+ * 「想办法让它打开本地的 chrome 我看看进度」—— 浏览器在用户那边，远端只能 curl。
+ */
+describe('远程会话要让人看页面：把 URL 说出来', () => {
+  test('注入里说清"浏览器在用户机器上"，以及 localhost 那种情况', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'tokyo-ec2', remoteDir: '/r/proj', localDir: '/l' });
+    assert.match(b, /浏览器在\*\*他自己的机器\*\*上/);
+    assert.match(b, /把 URL 单独写成一行/);
+    /* 只在远端 localhost 上监听的服务用户打不开 —— 这一条不说，它会给出一个点了没反应的链接 */
+    assert.match(b, /localhost 上监听的服务他打不开/);
+  });
+
+  test('点链接开的是**本地**浏览器（这条路早就有，只是模型不知道）', () => {
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    assert.match(CA, /window\.kiroApi\.openExternal\?\.\(href\)/);
+  });
+});

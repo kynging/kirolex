@@ -54,6 +54,17 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     */
     `· 用户提到的、这个目录之外的本地文件会被放到 \`${input.remoteDir}/_kirolex-local/\` 下，`
       + '消息里的路径已经替换成那儿的路径了。你直接改那份，KiroLex 会把它写回用户机器上的原处。',
+    /*
+      **浏览器在用户那边** ——「想办法让它打开本地的 chrome 我看看进度」。
+      它在远端只能 `curl`，而用户要看的是**页面**。远端没有图形界面，`open`/`xdg-open` 在那儿
+      要么不存在要么开在一台没人看的机器上；而 KiroLex 的 transcript 会把 URL 变成可点的链接，
+      点开用的就是用户自己机器上的浏览器（`shell.openExternal`）。所以规则很简单：把 URL 说出来。
+      公网地址（CloudFront / API Gateway 这类）用户能直接打开；只监听远端 localhost 的端口它打不开，
+      那种情况要说清是哪个端口，让用户自己决定要不要转发。
+    */
+    '· 用户的浏览器在**他自己的机器**上，不在这里。要让他看页面，就把 URL 单独写成一行 —— '
+      + 'KiroLex 会把它变成可点的链接，点开是他本地的浏览器。你不要试图在这台机器上开浏览器。'
+      + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
     '· 这台机器上**没有** `node_modules`、构建产物（它们不同步：原生依赖跨平台不能用），'
       + '也没有 LibreOffice。需要构建、跑测试、做预览/PPT 时，说出来让用户在本地做，不要在这里装依赖。',
   ].filter(Boolean).join('\n');
