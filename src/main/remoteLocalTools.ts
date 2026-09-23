@@ -61,9 +61,11 @@ export function mcpUrl(remotePort: number, urlPath: string): string {
  * `base` 是你选的那个 agent 的原始 JSON（没有就给 `{}`）—— 它的字段原样保留，
  * 只改 `name`、并把这一条 MCP 并进 `mcpServers`。
  *
- * `tools`：kiro-cli 的 `tools` 是**白名单**。base 里写了具体清单的话，不把新 MCP 加进去
- * 就等于工具在但调不动 —— 而那种失败是静默的（模型只会说"没有这个工具"）。
- * base 里没写 `tools` 时不加：那表示"全都允许"，写一个清单反而会把别的工具关掉。
+ * `tools`：kiro-cli 的 `tools` 是**白名单**，而且**缺这个字段等于一个都不给**（实测：
+ * 不写它的时候远端那条会话回的是"我手上没有任何可调用的工具"，连 fs_read 都没有，
+ * 而隧道其实是通的）。所以两种情况都要显式处理：
+ *   · base 写了具体清单 → 把这条 MCP 加进去（不加就是"工具在但调不动"，而且失败是静默的）
+ *   · base 没写 → 显式写 `["*"]`（全部内置 + 全部 MCP），而不是跟着它一起不写
  */
 export function buildSessionAgent(base: any, opts: { name: string; url: string }): any {
   const src = (base && typeof base === 'object') ? base : {};
@@ -77,6 +79,14 @@ export function buildSessionAgent(base: any, opts: { name: string; url: string }
   const entry = `@${MCP_SERVER_NAME}`;
   if (Array.isArray(src.tools) && !src.tools.includes('*') && !src.tools.includes(entry)) {
     out.tools = [...src.tools, entry];
+  } else if (!Array.isArray(src.tools)) {
+    /*
+      **没有 `tools` 字段 = 一个工具都没有** —— 实测出来的：生成的 agent 里不写它，
+      远端那条会话回的是「我手上没有任何可调用的工具」（连 fs_read 都没有），
+      而反向隧道其实是通的（从远端 curl 那个 URL 能正常拿到 tools/list）。
+      所以"照抄默认行为"必须**显式**写成 `["*"]`：全部内置工具 + 全部 MCP。
+    */
+    out.tools = ['*'];
   }
   /* 本机工具**不要每次都问一遍**：这条通道是你明确开的，而一轮里它可能调十几次 ——
      每次弹一个确认框的话这个功能没法用。留痕在会话状态行上（`localMcp` 里每次写/跑都报）。 */

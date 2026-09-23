@@ -235,9 +235,12 @@ describe('接线层：agent 配置一条会话一份，端口不撞', () => {
     assert.ok(out.allowedTools.includes(`@${MCP_SERVER_NAME}`));
   });
 
-  test('base 里没写 tools 就**不要**写一个清单进去（那表示"全都允许"）', () => {
+  test('base 里没写 tools 就**显式写 `["*"]`** —— 不写等于一个工具都没有（实测）', () => {
+    /* 实测：生成的 agent 不带 `tools` 时，远端那条会话回的是"我手上没有任何可调用的工具"
+       （连 fs_read 都没有），而隧道其实是通的（从远端 curl 那个 URL 能拿到 tools/list）。
+       kiro-cli 把"没有这个字段"当成空白名单，所以"照抄默认行为"必须显式说出来。 */
     const out = buildSessionAgent({ prompt: 'p' }, { name: 'n', url: 'u' });
-    assert.equal(out.tools, undefined);
+    assert.deepEqual(out.tools, ['*']);
     assert.deepEqual(out.allowedTools, [`@${MCP_SERVER_NAME}`]);
   });
 
@@ -308,5 +311,28 @@ describe('接线：隧道、会话专用 agent、以及远端进程的收尾', (
       '/Users/k/code/blog',
     );
     assert.match(cwd, /\/home\/x\/kirolex-mirror\/scratch\//);
+  });
+});
+
+/*
+ * 实测（重启之后两条远程会话并行 attach）：两边都拿到了远端端口 **39100**。
+ * 而 `ExitOnForwardFailure=yes` 的意思是第二条 ssh 直接起不来 —— 一条会话就这么打不开，
+ * 日志上却只是"本地工具已备好"两次，看不出哪里错了。
+ */
+describe('端口分配不能有竞态', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('算完端口**立刻**占住（写 map），再去做需要 await 的事', () => {
+    /* 锚在 `writeRemoteFile(remote, \`mkdir -p ` 上：那一步现在顺手把远端草稿目录也建了
+       （镜像去掉之后没人再创建它，而 cwd 指向不存在的目录会让那一轮的 shell 落在 /tmp） */
+    const at = M.indexOf('const remotePort = localToolsBySession.get(sessionId)?.remotePort ?? allocateRemotePort(used);');
+    assert.ok(at > 0);
+    const after = M.slice(at, at + 400);
+    /* 下一行就得是"占住" —— 中间插任何 await 都会让并行的两条会话拿到同一个端口 */
+    assert.match(after, /^const remotePort[^\n]*\n\s*localToolsBySession\.set\(sessionId, \{ remotePort,/m);
+    /* 那次写远端 agent 文件的 await 必须在占住**之后** */
+    const reserve = M.indexOf('localToolsBySession.set(sessionId, { remotePort,');
+    const write = M.indexOf('await writeRemoteFile(remote, `mkdir -p ');
+    assert.ok(reserve > 0 && write > reserve, '先占端口，再写远端文件');
   });
 });

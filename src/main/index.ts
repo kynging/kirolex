@@ -1454,17 +1454,31 @@ async function ensureLocalTools(
     const agentOverride = sessionAgentName(sessionId);
     const token = localMcpServer.register({ sessionId, workdir: localDir });
     const urlPath = localMcpServer.urlPathFor(sessionId) || `/mcp/${token}`;
-    /* 端口只需避开 KiroLex 自己已经分出去的那些 —— 真撞上远端别的服务时 ssh 会直接连不上
-       （`ExitOnForwardFailure=yes`），那是明确的失败，不是"起来了但没有工具" */
-    const used = [...localToolsBySession.values()].filter((v) => v).map((v) => v.remotePort);
+    /*
+      **端口要在任何 await 之前就占住** —— 实测：启动时两条远程会话并行 attach，两边都在
+      "分配"和"登记"之间 await 了一次（去远端写 agent 文件），于是**两条会话拿到同一个
+      39100**。而 `ExitOnForwardFailure=yes` 的意思是第二条 ssh 直接起不来 ——
+      一条会话就这么打不开了，而日志上看只是"本地工具已备好"两次。
+
+      所以顺序是：算出端口 → **立刻**写进 map（同步，占住它）→ 再去做需要等待的事。
+    */
+    const used = [...localToolsBySession.values()].map((v) => v.remotePort);
     const remotePort = localToolsBySession.get(sessionId)?.remotePort ?? allocateRemotePort(used);
+    localToolsBySession.set(sessionId, { remotePort, localPort: localMcpServer.port(), agentOverride });
     /* 那条会话专用的 agent：拷你选的那个（prompt / 工具 / 别的 MCP 都不能少），只加这一条 MCP */
     const base = profile.kiroAgent ? (localAgentJson(profile.kiroAgent) || {}) : {};
     const agentJson = buildSessionAgent(base, {
       name: agentOverride,
       url: mcpUrl(remotePort, urlPath),
     });
-    await writeRemoteFile(remote, writeAgentScript(agentOverride), JSON.stringify(agentJson, null, 2));
+    /*
+      **远端那个草稿目录要先建出来** —— 实测：`sessionCwd` 给的是
+      `<workdir>/scratch/<id>`，而镜像去掉之后**没有任何东西再去创建它**（以前是 rsync 顺手建的）。
+      于是 `session/new` 的 cwd 指向一个不存在的目录：kiro-cli 起来了，但那一轮里它的 shell
+      工具 pwd 落在 `/tmp`，而模型看到"说好的目录不存在"就开始怀疑整套接线。
+    */
+    await writeRemoteFile(remote, `mkdir -p ${shellQuote(sessionCwd(profile, localDir))} && ${writeAgentScript(agentOverride)}`,
+      JSON.stringify(agentJson, null, 2));
     const spec = { remotePort, localPort: localMcpServer.port(), agentOverride };
     localToolsBySession.set(sessionId, spec);
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
@@ -4848,6 +4862,16 @@ app.whenReady().then(async () => {
   app.on('before-quit', () => clearInterval(scheduleTicker));
   /* 正在跑的同步要跟着死 —— 不掐的话它会被 launchd 收养（ppid=1）继续推，没人读结果还吃光上行 */
   try { remoteSync.cancelAll(); } catch {}
+  /*
+    **退出时也要收掉远端的执行器** —— 实测同一条会话在远端留了两个 kiro-cli：
+    杀掉 KiroLex 只杀掉本地的 ssh，远端那个进程照样活着并占着会话锁，
+    下次启动就撞上「Session is active in another process」。
+    `disconnect()` 里那条 `kill -TERM <远端 PID>` 只在正常断开时跑，所以这里补一遍。
+  */
+  for (const [sid, e] of sessionClients) {
+    if (e.profile.remote?.sshHost) { try { void e.client.disconnect(); } catch { /* 退出路径不抛 */ } }
+    void sid;
+  }
 
   ipcMain.handle('schedule:create', (_event, sessionId: string, spec: ScheduleSpec) => {
     if (!sessionId || sessionId.startsWith('pending_')) return { ok: false, error: '请先选择一个已创建的会话' };
