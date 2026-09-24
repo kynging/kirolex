@@ -65,6 +65,22 @@ export interface AgentProfile {
    *  reinstated automatically as soon as it is available again. */
   preferredModel?: string;
 
+  /**
+   * **`model` 是在哪台机器上挣来的** —— `'local'` 或那台机器的 sshHost。
+   *
+   * 上面那段说 `model` 是"有效模型"，持久化它是为了开机不再付一次死模型的超时。但那是一个
+   * **按机器**成立的事实，而以前没记是哪台：实测把 26 条会话批量切到远端之后，一条在本机
+   * 被降级成 `deepseek-3.2` 的会话，到了远端还在跑 deepseek —— 而那台机器上
+   * `claude-opus-5` 是好的（用户：「为什么切到远程 default 到 deepseek 了」）。
+   *
+   * 更糟的是降级那一步会**清掉 `preferredModel`**（见 `swapSessionModel`：留着它每次重启都要
+   * 再付一次那 30 秒），于是换了机器之后连"你原本想用什么"都没了 —— 一次本机的临时不可用
+   * 变成了跨机器的永久降级。
+   *
+   * 所以：机器不匹配时**不采信** `model`，回到 `preferredModel`（没有就默认）。
+   */
+  modelEarnedOn?: string;
+
   /** Tool permission behavior. Undefined legacy records retain the historical
    * auto-approve behavior. KiroLex handles permission requests client-side so
    * this mode can switch between Auto and Ask without replacing the executor. */

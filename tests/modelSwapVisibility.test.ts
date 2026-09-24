@@ -64,20 +64,26 @@ describe('换执行器期间必须报 busy', () => {
   });
 });
 
-describe('死模型只发现一次', () => {
-  test('换成功之后把 failedModel 记进 modelsKnownDead', () => {
+/*
+ * 「为什么切到远程 default 到 deepseek 了」之后这一组多了一条约束：**按机器分**。
+ * 一个模型在这台机器上跑不了，不代表在别的机器上跑不了 —— 实测本机出口 IP 被地域过滤、
+ * Claude 全系不可用，而同一个账号在东京那台 EC2 上全都好。共用一个 Set 的话，一条本地会话
+ * 就能把 Claude 从所有远程会话手里拿走，而那正是远程会话存在的理由。
+ */
+describe('死模型只发现一次，而且按机器分', () => {
+  test('换成功之后把 failedModel 记进**那台机器**名下', () => {
     const body = swapBody();
     const ok = body.indexOf("unavailable at prompt time -> switched to");
     assert.ok(ok > 0);
-    assert.match(body.slice(ok, ok + 700), /modelsKnownDead\.add\(failedModel\)/);
+    assert.match(body.slice(ok, ok + 700), /deadModelsFor\(machineKeyOf\(entry\.profile\)\)\.add\(failedModel\)/);
   });
 
   test('**只在换成功时记** —— 连接失败可能是限流，那不等于模型死了', () => {
     const body = swapBody();
-    const addAt = body.indexOf('modelsKnownDead.add(failedModel)');
+    const addAt = body.indexOf('.add(failedModel)');
     const catchAt = body.indexOf('} catch (err: any) {', addAt);
     assert.ok(addAt > 0 && catchAt > addAt, '记录必须在 try 的成功路径上，不在 catch 里');
-    assert.doesNotMatch(body.slice(catchAt), /modelsKnownDead\.add/);
+    assert.doesNotMatch(body.slice(catchAt), /\.add\(failedModel\)/);
   });
 
   test('已知死掉的排到**最后**而不是删掉 —— 一次误判不该让会话连不上', () => {
@@ -90,8 +96,8 @@ describe('死模型只发现一次', () => {
   });
 
   test('**进程级，不落盘** —— 模型清单会变，装了新版本重启就该自动恢复', () => {
-    assert.match(MAIN, /const modelsKnownDead = new Set<string>\(\);/);
-    const at = MAIN.indexOf('const modelsKnownDead');
+    assert.match(MAIN, /const modelsKnownDeadBy = new Map<string, Set<string>>\(\);/);
+    const at = MAIN.indexOf('const modelsKnownDeadBy');
     // 不许有任何持久化的痕迹
     assert.doesNotMatch(MAIN.slice(at, at + 600), /writeRecord|writeFileSync|uiSet/);
   });

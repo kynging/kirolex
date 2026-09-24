@@ -314,7 +314,23 @@ async function awaitReconfigureIdle(sessionId: string, timeoutMs = 30000): Promi
  * 模型清单会变（升级 kiro-cli、后端上线新模型）。落盘会把一次探测的结论永久钉住，
  * 而重启一次重新探测的代价只是一次 30 秒 —— 那个代价换来的是「装了新版本就自动恢复」。
  */
-const modelsKnownDead = new Set<string>();
+/** 这条会话跑在哪台机器上 —— 模型可用性、启动命令、agent 都是按这个分的。 */
+function machineKeyOf(profile: { remote?: { sshHost?: string } }): string {
+  return profile.remote?.sshHost || 'local';
+}
+
+/*
+  **按机器分** —— 一个模型在这台机器上跑不了，不代表在别的机器上跑不了。实测就是这样：
+  这台 Mac 的出口 IP 被地域过滤，Claude 全系不可用；而同一个账号在东京那台 EC2 上全都好。
+  共用一个 Set 的话，一条本地会话把 `claude-opus-5` 标成死的，所有远程会话都会把它排到最后
+  —— 于是远程会话也用不上 Claude，而那恰恰是远程会话存在的理由。
+*/
+const modelsKnownDeadBy = new Map<string, Set<string>>();
+function deadModelsFor(machine: string): Set<string> {
+  let set = modelsKnownDeadBy.get(machine);
+  if (!set) { set = new Set<string>(); modelsKnownDeadBy.set(machine, set); }
+  return set;
+}
 
 /**
  * **本机 kiro-cli 自己报的模型清单** —— 一次运行只问一次。
@@ -356,7 +372,27 @@ async function connectWithModelFallback(
   /** 有它才能在会话里说一句"你选的模型这台机器上没有"。没有就只进日志。 */
   sessionId?: string,
 ): Promise<{ client: AcpClient; model: string }> {
-  const all: string[] = [profile.preferredModel, profile.model, ...MODEL_FALLBACK_ORDER]
+  const machine = machineKeyOf(profile);
+  const modelsKnownDead = deadModelsFor(machine);
+  /*
+    **别采信在另一台机器上挣来的模型** —— `modelEarnedOn` 那段注释里那个实测：
+    一条在本机被降级成 deepseek 的会话，切到远端之后还在跑 deepseek。
+  */
+  /*
+    **没有这个字段的老记录也不采信** —— 这次的 26 条就全是这种（它们在本机被降级成
+    deepseek / gpt-5.6-sol，字段是这一版才加的）。按"就当是这台挣的"处理等于让这个 bug
+    在既有会话上继续活着，而它的表现正是用户看到的那个。
+
+    代价很小：不采信只是让候选回到 `preferredModel`（attach 时没有就用默认），
+    而"本机没有 Claude"现在是先问清单**立刻**知道的事，不再是等一轮失败的 30 秒。
+  */
+  const earnedHere = !!profile.modelEarnedOn && profile.modelEarnedOn === machine;
+  const earned = earnedHere ? profile.model : undefined;
+  if (!earnedHere && profile.model) {
+    logger.info('model', `${label}: 记录里的 '${profile.model}' 不是在 ${machine} 上挣来的`
+      + `（记着 ${profile.modelEarnedOn || '没记'}）—— 不采信它，回到偏好模型`);
+  }
+  const all: string[] = [profile.preferredModel, earned, ...MODEL_FALLBACK_ORDER]
     .filter((m): m is string => !!m)
     .filter((m, i, arr) => arr.indexOf(m) === i);
   /*
@@ -510,7 +546,10 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       丢掉的意思是「你那个偏好在这个后端满足不了，先按记录里能跑的来」——想要回去，在 composer
       里重新选一次就会重新写上（手动切换同时更新 `model` 和 `preferredModel`）。
     */
-    const profile: AgentProfile = { ...entry.profile, model, preferredModel: undefined };
+    /* 记下是**哪台机器**挣的：换机器之后这条降级就不该再生效（见 `modelEarnedOn`） */
+    const profile: AgentProfile = {
+      ...entry.profile, model, preferredModel: undefined, modelEarnedOn: machineKeyOf(entry.profile),
+    };
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, entry));
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
@@ -535,7 +574,8 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
         30 秒（实测一次运行里发生了两遍）。只在**换成功**时记：连接失败可能是限流或一时抖动，
         那种不该被当成「这个模型死了」。
       */
-      modelsKnownDead.add(failedModel);
+      /* 记到**这台机器**名下 —— 同一个模型在另一台机器上可能是好的（见 `modelsKnownDeadBy`） */
+      deadModelsFor(machineKeyOf(entry.profile)).add(failedModel);
       emitSessionModel(sessionId, model);
       return model;
     } catch (err: any) {
@@ -5730,7 +5770,11 @@ app.whenReady().then(async () => {
     emitSessionBusy(sessionId);
     // An EXPLICIT user choice also becomes the new preference (retried first on
     // later attaches), unlike an automatic fallback which leaves it untouched.
-    const profile: AgentProfile = { ...oldEntry.profile, model: normalizedModel, preferredModel: normalizedModel };
+    const profile: AgentProfile = {
+      ...oldEntry.profile, model: normalizedModel, preferredModel: normalizedModel,
+      /* 手动选的也记机器：它同时进了 `preferredModel`，所以换机器时仍然会先试它 */
+      modelEarnedOn: machineKeyOf(oldEntry.profile),
+    };
     const cliSessionId = oldEntry.cliSessionId;
     const cwd = oldEntry.cwd;
     // kiro-cli enforces single-process ownership of a session: session/load on an
@@ -6460,6 +6504,8 @@ app.whenReady().then(async () => {
         // created as 'claude-opus-5'). An explicit user switch is the only thing
         // that sets a preference — see acp:switch-model.
         preferredModel: existing?.profile.preferredModel || DEFAULT_MODEL,
+        /* 带着走，否则每次 attach 都当成"没记"，那这个字段就白加了 */
+        modelEarnedOn: existing?.profile.modelEarnedOn,
         permissionMode: existing?.profile.permissionMode || 'auto-approve',
         projectId,
         kiroAgent: existing?.profile.kiroAgent,
@@ -6609,6 +6655,8 @@ app.whenReady().then(async () => {
       if (rec.profile.model !== profile.model && !preferenceWonAhead) {
         logger.info('model', `attach ${sessionId}: persisting effective model '${profile.model}' (was '${rec.profile.model}', preferred '${profile.preferredModel}')`);
         rec.profile.model = profile.model;
+        /* 记下是哪台机器挣的 —— 换机器之后这条就不该再生效（见 `modelEarnedOn`） */
+        rec.profile.modelEarnedOn = machineKeyOf(profile);
         // Preference is sticky: it is retried first on the next attach.
         rec.profile.preferredModel = profile.preferredModel;
         // Announce it: otherwise the composer selector keeps showing the model the
@@ -6617,6 +6665,13 @@ app.whenReady().then(async () => {
       } else if (rec.profile.model !== profile.model) {
         logger.info('model', `attach ${sessionId}: 跑在偏好模型 '${profile.model}' 上，但**不写进记录**`
           + ` —— 记录里的 '${rec.profile.model}' 是上一次真跑成一轮挣来的，而"连上了"什么都不证明`);
+        /*
+          **不写记录，但必须告诉界面** —— 「为什么切到远程 default 到 deepseek 了」里被看见的
+          就是这一格：执行器跑的是 `claude-opus-5`，而下拉显示记录里那个 `deepseek-3.2`。
+          不写盘是对的（"连上了"证明不了那个模型能跑完一轮），但**显示错的模型**是另一回事：
+          人会照着下拉去判断这条会话在用什么，然后基于错的前提做决定（比如以为远端也没有 Claude）。
+        */
+        emitSessionModel(sessionId, profile.model);
       }
       store.writeRecord(rec);
       mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId, projectId: profile.projectId });

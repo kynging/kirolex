@@ -148,3 +148,68 @@ describe('模型可用性：清单、挑选、钉进 agent', () => {
     assert.match(M, /这次不做可用性判断/);
   });
 });
+
+/*
+ * 「为什么切到远程 default 到 deepseek 了，搞毛啊」——**模型的可用性是按机器的，而代码当时不分机器**。
+ *
+ * 两处都踩了同一件事：
+ *
+ * 1. `record.profile.model` 是"上一次真跑成一轮挣来的有效模型"，持久化它是为了开机不再付一次
+ *    死模型的超时。但没记是**哪台机器**挣的 —— 于是一条在本机被降级成 `deepseek-3.2` 的会话
+ *    切到远端之后还在跑 deepseek，而那台机器上 `claude-opus-5` 是好的。
+ *    更糟的是降级那一步会**清掉 `preferredModel`**（留着它每次重启都要再付 30 秒），
+ *    于是换机器之后连"你原本想用什么"都没了：一次本机的临时不可用变成跨机器的永久降级。
+ *
+ * 2. `modelsKnownDead` 是一个**全进程共用**的 Set。一条本地会话把 `claude-opus-5` 标成死的，
+ *    所有远程会话都会把它排到最后 —— 而"远端能跑 Claude"恰恰是远程会话存在的理由。
+ *
+ * 这两条都不是理论问题：本机出口 IP 被地域过滤（Claude 全系不可用），远端同一个账号全都好，
+ * 所以"按机器分"在这台机器上是每天都在发生的事。
+ */
+describe('模型可用性按机器分', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const C = fs.readFileSync(path.join(process.cwd(), 'src/main/config.ts'), 'utf8');
+
+  test('已知跑不了的模型按机器记，不是一个全局 Set', () => {
+    assert.match(M, /const modelsKnownDeadBy = new Map<string, Set<string>>\(\)/);
+    assert.match(M, /function deadModelsFor\(machine: string\): Set<string>/);
+    assert.match(M, /const modelsKnownDead = deadModelsFor\(machine\)/);
+    /* 降级成功那一处也要记到**那台**机器名下 */
+    assert.match(M, /deadModelsFor\(machineKeyOf\(entry\.profile\)\)\.add\(failedModel\)/);
+    /* 不许再有全局的那个 */
+    assert.equal(/const modelsKnownDead = new Set<string>\(\)/.test(M), false);
+  });
+
+  test('机器 key：本地是 `local`，远程是 sshHost', () => {
+    assert.match(M, /function machineKeyOf\(profile: \{ remote\?: \{ sshHost\?: string \} \}\): string \{\s*\n\s*return profile\.remote\?\.sshHost \|\| 'local';/);
+  });
+
+  test('"挣来的模型"记机器；机器不对就不采信，回到偏好', () => {
+    assert.match(C, /modelEarnedOn\?: string;/);
+    assert.match(M, /const earnedHere = !!profile\.modelEarnedOn && profile\.modelEarnedOn === machine;/);
+    assert.match(M, /const earned = earnedHere \? profile\.model : undefined;/);
+    assert.match(M, /\[profile\.preferredModel, earned, \.\.\.MODEL_FALLBACK_ORDER\]/);
+  });
+
+  test('老记录（没有这个字段）也不采信 —— 否则 bug 在既有会话上继续活着', () => {
+    /* 这次批量切的 26 条全是这种：在本机被降级过，而字段是这一版才加的 */
+    assert.match(M, /没有这个字段的老记录也不采信/);
+    assert.match(M, /不采信它，回到偏好模型/);
+  });
+
+  test('不写记录也要把真实模型告诉界面 —— 被看见的就是那一格', () => {
+    /* 执行器跑 claude-opus-5、下拉显示记录里的 deepseek-3.2 —— 人会照着下拉判断，
+       然后基于错的前提做决定（"原来远端也没有 Claude"）。 */
+    const at = M.indexOf('跑在偏好模型');
+    assert.ok(at > 0);
+    assert.match(M.slice(at, at + 700), /emitSessionModel\(sessionId, profile\.model\);/);
+  });
+
+  test('三个写入点都盖上机器：降级、attach 持久化、手动切换', () => {
+    assert.match(M, /preferredModel: undefined, modelEarnedOn: machineKeyOf\(entry\.profile\)/);
+    assert.match(M, /rec\.profile\.modelEarnedOn = machineKeyOf\(profile\);/);
+    assert.match(M, /modelEarnedOn: machineKeyOf\(oldEntry\.profile\)/);
+    /* attach 构造 profile 时要带着走，否则每次 attach 都当成"没记" */
+    assert.match(M, /modelEarnedOn: existing\?\.profile\.modelEarnedOn,/);
+  });
+});
