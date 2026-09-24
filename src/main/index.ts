@@ -6047,6 +6047,16 @@ app.whenReady().then(async () => {
     }
   });
 
+  /** 本机那份（single-flight —— 理由在 handler 里那段注释）。 */
+  const listModelsLocal = (): Promise<any> => {
+    if (!listModelsInFlight) {
+      listModelsInFlight = runKiroCli('chat --list-models --format json', 30000)
+        .then((result) => JSON.parse(result))
+        .finally(() => { listModelsInFlight = null; });
+    }
+    return listModelsInFlight;
+  };
+
   ipcMain.handle('acp:list-models', async (_event, machine?: string) => {
     /*
       **模型列表按机器分** ——「确认下右侧界面远程会话显示的是远程的 agent 和模型」。
@@ -6069,9 +6079,19 @@ app.whenReady().then(async () => {
         .catch((err) => { throw new Error(`问不到 ${target.sshHost} 的模型列表：${err?.message || err}`); });
       const ids = parseModels(out);
       if (!ids.length) throw new Error(`${target.sshHost} 没有报出模型列表（kiro-cli 版本不认这个探测？）`);
-      /* 远端只给得出 id（那条错误信息里就只有 id）—— 名字用 id，乘数留空：
-         宁可少显示一个乘数，也不要把本机那份的乘数贴到另一台机器的模型上。 */
-      return { models: ids.map((id) => ({ model_id: id, model_name: id })) };
+      /*
+        远端只给得出 **id**：那台机器的 kiro-cli（实测 1.27.0）连 `--list-models` 都不认
+        （`error: unexpected argument '--list-models'`），所以唯一的来源就是上面那条参数校验的
+        错误信息，而它只列 id。
+        
+        **名字/上下文窗口/乘数从本机那份补上** —— 我先前的说法（"不跨机器借用"）是错的：
+        机器决定的是**有哪些模型**（版本不同、集合不同），而"claude-opus-5 的计费倍率是 2.2、
+        上下文窗口多大"是**模型自己的属性**，不随机器变。本机不认识的 id 就留裸的 —— 
+        那种情况下少一点信息，总好过编一个。
+      */
+      const localList: any[] = await listModelsLocal().then((d) => d?.models || []).catch(() => []);
+      const byId = new Map(localList.map((m: any) => [m.model_id, m]));
+      return { models: ids.map((id) => ({ ...(byId.get(id) || {}), model_id: id, model_name: byId.get(id)?.model_name || id })) };
     }
     /**
      * SINGLE-FLIGHT，而且超时给足 —— 两者都是实测逼出来的。
@@ -6086,12 +6106,7 @@ app.whenReady().then(async () => {
      * 非阻塞的，等久一点没有代价，拿不到列表才有代价）。成功结果不在这里长期记忆：模型会上下线，
      * 该由渲染层用 `shouldReplaceModelCache` 决定要不要落盘。
      */
-    if (!listModelsInFlight) {
-      listModelsInFlight = runKiroCli('chat --list-models --format json', 30000)
-        .then((result) => JSON.parse(result))
-        .finally(() => { listModelsInFlight = null; });
-    }
-    return listModelsInFlight;
+    return listModelsLocal();
   });
 
   ipcMain.handle('acp:get-usage', async () => {

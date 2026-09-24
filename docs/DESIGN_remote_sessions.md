@@ -1,23 +1,21 @@
 # 远程会话（Remote Sessions）设计
 
-状态：设计稿，待实现。分支：先在 `standard` 上做，再 cherry-pick 到 `feature/flow`。
+状态：**已实现并在用**（`standard` 分支）。`feature/flow` 还没有这套东西 —— 那边跑的是旧的
+"全局一个远端目标"设计，而两个 app 共用 `~/.kirolex`，所以**别同时用两个 build**
+（实测：flow 那个 app 会把一条会话的 `profile.remote` 改回去，看起来就是"会话串了"）。
 
 ## 一句话
 
-**执行在远端，文件在本地。** 一条会话的 kiro-cli 跑在你自己的另一台机器上，而它读写的那份代码始终以
-本地磁盘为准 —— KiroLex 负责在两边之间搬文件，并保证远端看到的永远是你刚刚看到的那份。
-远程会话和本地会话**同时存在**，一条一条地选，不是一个全局开关。
+**执行在远端，文件在你这台机器上，一个字节都不复制。** 一条会话的 kiro-cli 跑在你自己的另一台机器上，
+而它读写文件、跑命令，靠的是一条反向隧道调回**你机器上**的一组工具（`local_read` / `local_write` /
+`local_glob` / `local_grep` / `local_git` / `local_bash`）。远程会话和本地会话同时存在，一条一条地选。
 
-## 为什么不能更简单
-
-先说三个被实测否掉的"更省事的办法"，否则下面的复杂度看起来是凭空加的。
+## 为什么是这个形状
 
 ### 1. 让远端的 kiro-cli 回头读本地文件 —— 做不到
 
-ACP 协议里客户端可以声明 `fs.readTextFile / fs.writeTextFile` 能力，让 agent 把文件读写**回调给客户端**。
-如果 kiro-cli 支持，那"执行在远端、文件在本地"就是天生的：远端进程读的其实是你 Mac 上的文件。
-
-实测（客户端声明了 fs 能力，然后让它读一个本地文件）：
+ACP 协议里客户端可以声明 `fs.readTextFile / fs.writeTextFile`，让 agent 把文件读写**回调给客户端**。
+如果 kiro-cli 支持，"执行在远端、文件在本地"就是天生的。实测（声明了 fs 能力，然后让它读一个文件）：
 
 ```
 initialize → agentCapabilities: {loadSession, promptCapabilities, mcpCapabilities, sessionCapabilities, auth}
@@ -25,193 +23,155 @@ initialize → agentCapabilities: {loadSession, promptCapabilities, mcpCapabilit
 客户端被回调读文件次数: 0    写: 0
 ```
 
-它**自己**读了文件，一次都没回调客户端；`agentCapabilities` 里也没有 fs。也就是说：远端的执行器
-只能看见远端的文件系统。这一条把"代理文件访问"整条路线否掉了，剩下的只能是**镜像 + 同步**。
+它**自己**读了文件，一次都没回调客户端，`agentCapabilities` 里也没有 fs。**这条事实是整套设计的地基**：
+远端那个进程只能看见远端的文件系统。
 
-### 2. 反向挂载（远端 sshfs 挂本地）—— 代价和风险都更大
+### 2. 但它认 HTTP 的 MCP server —— 这就是那扇门
 
-需要本机开 sshd + 反向隧道，远端装 FUSE；而 agent 动不动就 grep 整个仓库，每次 open/stat 都是一个
-网络往返。rsync 是一次批量往返，形状简单得多，出错也看得见。
-
-### 3. 把 node_modules 一起同步 —— 是**错的**，不只是慢
-
-本地 617MB 的 `node_modules` 里有 darwin 的原生二进制，拷到 Linux 上不能用。所以远程会话**不做构建和测试**
-（见「明确不做的事」）。`.git` 只有 9.9MB，同步它是划算的 —— 没有 `.git`，agent 的 `git status/diff/log`
-全废，它会当场开始瞎猜。
-
-## 实测到的远端事实
-
-目标机（`ec2-user@99.83.165.184`，用户自己的 EC2）：
-
-| 事实 | 值 | 对设计的影响 |
-|---|---|---|
-| OS | Amazon Linux 2023, x86_64 | POSIX 引号规则；`bash -lc` 可用 |
-| kiro-cli | `~/.local/bin/kiro-cli`，**已登录**（IAM Identity Center） | 认证不用 KiroLex 管，但要在连接时**验一次**并给人话 |
-| rsync | 3.4.0 / protocol 32；本机是 openrsync/29 | 实测**双向都通**（推上去、再拉回来能带回远端新建的文件） |
-| git / python3 | 有 | agent 的常规工具可用 |
-| LibreOffice | 没有（也不需要） | 预览 / PPT 留在本地 —— 文件本来就在本地 |
-| 规格 | 2 vCPU / 3GB | 重活别放远端；它的价值是"另一台机器的 kiro-cli"，不是算力 |
-
-## 架构
+`kiro-cli mcp add --url` 说明它支持 HTTP 传输的 MCP。而 MCP 是**它主动去调**的东西 ——
+所以只要那个 URL 通到你机器上，它的"工具"就落在你机器上执行。ssh 本来就能开反向隧道，于是：
 
 ```
-┌────────────────── 本地（唯一真相）──────────────────┐        ┌──────── 远端（一次性镜像）────────┐
-│ ~/code/myproj                     ← 你编辑 / review │        │ <remoteWorkdir>/<projectId>       │
-│ ~/.kirolex/sessions/<id>/         ← transcript、    │  push  │   ← kiro-cli 的 cwd               │
-│     history.md、附件                                │ ─────► │ <remoteWorkdir>/.kirolex-sessions/│
-│                                                     │        │     <id>/  ← history.md、附件     │
-│ review / diff / PPT / 预览（全部本地）              │ ◄───── │ kiro-cli acp（ssh -T 起）         │
-└─────────────────────────────────────────────────────┘  pull  └───────────────────────────────────┘
+你的 Mac：localMcp.ts，只听 127.0.0.1 的一个随机端口
+          ssh -R 127.0.0.1:<远端端口>:127.0.0.1:<本地端口>   ← 执行器本来就是 ssh 起的
+远端：    那条会话专用的 agent JSON 里一条 { "type": "http", "url": "http://127.0.0.1:<远端端口>/mcp/<token>" }
 ```
 
-- **本地永远是真相。** 镜像随时可以删掉重建；任何"只存在于远端"的状态都是 bug。
-- **执行器**就是现在的 `AcpClient`，只是 `spawn` 的是 `ssh -T … kiro-cli acp …`（脚手架已在：
-  `buildSshArgs` / `buildRemoteKiroCommand` / `config.RemoteTarget` / `profile.remote`）。
-- **agent 的 bash 工具跑在远端** —— 这不是选择，kiro-cli 在哪就在哪。所以远端镜像必须"能读能写能 git"。
+远端不需要装任何东西（连 rsync 都不需要），文件也不用搬。实测通过：远端那台 EC2 上的 kiro-cli
+读到了只存在于本机的 `marker.txt`，`hostname` 回的是这台 Mac 的名字。
 
-### 三个同步点（跟着一轮对话的生命周期）
+### 3. 反向挂载（远端 sshfs 挂本地）—— 代价更大
 
-| 时机 | 方向 | 失败时怎么办 |
-|---|---|---|
-| `session/prompt` **发出之前** | 本地 → 远端（`rsync -a --delete`） | **不发这一轮**，报错。宁可不跑，也不能让模型读着旧文件干活 |
-| 一轮结束（`stopReason`） | 远端 → 本地 | 标记「远端有未取回的改动」并重试；绝不让人以为本地是新的 |
-| 工具调用里出现写文件（防抖 ~800ms） | 远端 → 本地 | 同上，但静默重试 —— 这是让 review/gate 看起来是"活的"的那一半 |
-| 打开 file review / diff 之前 | 远端 → 本地（按需，阻塞渲染） | 报错并拒绝渲染 —— 拿旧文件做 review 比不做更糟 |
+需要本机开 sshd + 远端装 FUSE；而 agent 动不动 grep 整个仓库，每次 open/stat 都是一个网络往返。
+MCP 这条路可以把"grep 整个仓库"做成**一次**调用（在你机器上跑完只回结果），形状好得多。
 
-排除清单（默认，按项目可改）：`node_modules/`、`build/`、`dist/`、`.venv/`、`__pycache__/`、`*.log`、
-`.DS_Store`。`.git/` **包含**。
+## 184 毫秒决定了工具的粒度
 
-### 冲突：只在这一种情况下发生，也只处理这一种
+实测到那台东京机器的 RTT 是 **184 ms**。所以工具**必须粗**：
 
-单人单机，冲突窗口只有一个：**一轮正在远端跑的时候你改了同一个文件**。
+* `local_read` 一次收**多个**路径（工具描述里明写，不然它会一个一个读）
+* `local_grep` / `local_glob` / `local_git` 在**你机器上**跑完，只回结果
+* `local_bash` 给它一条完整命令，而不是让它拼十次
 
-push 的时候给每个文件记一份 `(mtime, size)` 快照；pull 的时候如果某个文件**本地变了**（和快照不一致）
-**且远端也变了** —— 不覆盖，把远端那份写成 `foo.ts.remote`，并在会话里说一句。不搞三方合并。
+做成"一次一个文件"的话，一轮 50 次读就是 9 秒纯延迟 —— 比它取代的那套镜像更慢。
 
-### 五个"本地假设"必须改掉
+## 边界：说实话，不做安全剧场
 
-这五处是现在代码里写死了"kiro-cli 在本机"的地方，不改掉的话远程会话会安静地给出错答案：
+工具面里有 `local_bash`（用户明确选的），所以**这条通道等于那台远端机器在你 Mac 上有一个 shell**。
+既然如此，再给读写加路径牢笼就是自欺 —— 能跑 bash 就能 `cat` 任何东西。真正起作用的是三条：
 
-1. **附件路径**：`historyLine` 发的是 `file:<本地绝对路径>`。加一个 `pathForExecutor(p)` 做本地↔镜像映射，
-   附件引用和 `session/new { cwd }` 都走它。
-2. **session 目录**：`history.md` 写在 `~/.kirolex/sessions/<id>/`，在项目目录**之外** —— 要单独镜像到
-   `<remoteWorkdir>/.kirolex-sessions/<id>/`。
-3. **诊断读的是本机路径**：`cliErrorContext` / `trimHugeCliLogs` / `writeFailureBundle` 读的是
-   `$TMPDIR/kiro-log` 和 `~/.kiro/sessions/cli`。远程会话要读**远端**的那几份，否则
-   "为什么会断"这套刚建好的取证能力在远程会话上全是空的。
-4. **退出码语义**：本地 `code 0 = 正常退出`；ssh 掉线是 **255**。255 要归到
-   `isTransientTransportError`（可自动重试），**不能**判成"后端会话毒了"去重建会话。
-5. **超时**：`LOAD_TIMEOUT_MS = 45s` 是按本地 spawn 估的。远端要加上 SSH 握手，按 host 分：本地 45s，远端 90s。
+1. **只听 loopback**，而且只能顺着**那条 ssh** 的反向隧道进来；
+2. **URL 里带 token**（`mcp add` 没有 `--headers`，所以只能放路径）—— 一条会话一个，会话结束即失效；
+   EC2 上任何有 shell 的东西都能敲 `127.0.0.1:<端口>`，token 是那一层的锁；
+3. **每一次写文件 / 跑命令都在会话状态行上说出来**。看得见比拦得住更重要 ——
+   拦得住的清单总能被绕过，而看不见的操作你连事后都查不出来。
 
-### 模块边界
+## 那条会话专用的 agent
 
-新增三个纯模块（都能不碰 SSH 做单测）：
+kiro-cli 只认**它自己机器上** `~/.kiro/agents/` 里的 agent，而 MCP 的 URL 里带着会话 token，
+所以配置**必须一条会话一份**（共用一份就分不出是谁在调、也就不知道 cwd 是哪个目录）。
+KiroLex 每次起远程执行器时在远端拼一份 `kirolex-local-<会话>.json`，`--agent` 指定它，断开时删掉。
 
-- `src/main/hostOps.ts` —— `HostOps { exec, readTail, stat, truncate, home, tmpdir }`，两个实现
-  `LocalHost`（就是现在的 `fs`/`child_process`）和 `SshHost`（复用 `buildSshArgs`，和 `loopVerify` 同一条决策）。
-  `kiroCliLog.ts` / `failureBundle.ts` 改成接 `HostOps`，本地行为一个字节都不变（现有测试照旧过）。
-- `src/main/remoteMirror.ts` —— 纯函数：排除清单、rsync 参数、快照比较、冲突判定、镜像路径推导。
-  真正跑 rsync 的那层薄薄一个 `syncPush/syncPull`。
-- `src/main/remoteTargets.ts` —— 配置读取：`remotes: [{id, label, sshHost, sshPort, identityFile, remoteWorkdir}]`，
-  并**兼容读**老的 `agents[].remote`（现在配置里就是这个形状，`enabled: false`）。
+**底子按名字在远端解析**：
+* 远端有同名的 `<agent>.json` → 拿**它**做底子（它的 prompt / MCP / resources 都是那台机器上成立的东西），
+  只并上一条 `kirolex-local`；
+* 没有 → 用默认 agent，**并在会话里说一句**。悄悄换一个 agent 是这条路上最贵的静默失败：
+  产出是另一个 agent 干的，而界面一个字都不会说。
 
-### 混用：粒度在「会话」这一层
+`tools` 是白名单，而且**缺这个字段等于一个工具都不给**（实测：不写它的时候远端回
+"我手上没有任何可调用的工具"，连 fs_read 都没有，而隧道其实是通的）。所以要么把 `@kirolex-local`
+并进它原来的清单，要么显式写 `["*"]`。
 
-先把四个层级分清，否则"共存"这个词会被理解成做不到的那一层：
+**本机那些 agent 不再同步过去**：推过去的 JSON 没人读，而拷 `mcpServers` 是**有害**的 ——
+那些命令是本机路径（`/opt/homebrew/bin/node`、`~/.local/bin/mcp-proxy-for-aws`），远端没有，
+kiro-cli 不报错、只静默少掉这些工具。安装脚本同样不碰 `~/.kiro`。
 
-| 层级 | 含义 | 结论 |
-|---|---|---|
-| ① 全局开关 | 一个时刻只能全本地或全远程（现在脚手架就是这样：`activeAgentId` 上的 `remote.enabled`） | **不要** |
-| ② 按会话选 | 会话 A 本地、会话 B 远程，同时跑 | **这就是要做的** |
-| ③ 会话内混用（模型的工具一半本地一半远端） | 执行器是一个 kiro-cli 进程、工具调用是通知，KiroLex 拦不住也改不了它落在哪台机器 | **做不到** |
-| ④ KiroLex 自己的动作留本地 | review / 预览 / PPT / flow 节点 / `loopVerify` 的 shell 全在本地 | **默认如此** |
+## 每台机器的启动命令（含本机）
 
-所以能给的是 **②+④**：一条会话整体选一台机器，KiroLex 自己干的活永远在本地。
+设置 → 🖥 机器：本机和每台远端在同一个下拉里，各自配 kiro / claude / codex 的启动命令
+（`claude`/`codex` 目前只检测和记录，KiroLex 还只起 kiro-cli）。
 
-`profile.remote` 已经是按会话存的，但现在的值来自全局 `activeAgentId` —— 那是个模式开关。改法很小：
-**新建会话时选目标**（本地 / `<host label>`，默认本地），存进这条会话的 profile，之后不再看全局。
+* **自动检测**：一段 shell 在那台机器上把候选逐个试一遍，**本机 `bash -lc`、远端走 ssh 用同一段**。
+  每个候选都真的 `--version` 跑一遍 —— **找到文件 ≠ 能跑**。每次探测都 `< /dev/null`（有的 CLI
+  读 stdin，实测 `claude-code-acp` 就是，不给 EOF 会挂住），去重按 `readlink -f` 的真实文件
+  （`/opt/homebrew/bin/claude` 和 `~/.local/bin/claude` 是同一个 `claude.exe`）。
+* **验证工具身份**：跑起来还不够。实测 PATH 上的 `kiro` 是 **Kiro IDE 的 CLI**（`--version` 回 `0.12.333`），
+  和 kiro-cli 是两个东西 —— 所以每个工具带一条 `verify` 正则，不像它就标 ✗ 并说清它报的是什么。
+* **记住成功过的**：执行器每次连上就把那条命令写进 `binHistory`（机器 → 工具 → 最近 5 条），
+  检测时排最前面并标 `★`。一个真的起过会话的命令比"文件在这儿"可信得多。
+* **没配就不起**：设置里没有那台机器的 kiro 启动命令时，执行器**直接拒绝启动**并说清去哪儿点什么。
+  这台机器上就有两个 kiro-cli，而猜错不会报错 —— 表现是"模型列表少几个"、"agent 没生效"。
+  远端那份**按 sshHost 现查配置**，不看会话记录里的快照（记录存的是建会话那一刻的目标）。
 
-- 侧栏和会话头部给远程会话一个 host 徽标 —— 任何时候都不该猜"这一轮是在哪台机器上跑的"。
-- 同步状态（推/拉中、有未取回的改动、有冲突）显示在会话头部。
-- `loadActiveRemoteTarget` 退化成"新建会话时的默认值来源"，不再影响已存在的会话。
+## 模型列表按机器分
 
-### 中途切换本地↔远程：允许，走换模型那条路
+两台机器的 kiro-cli 版本不同（实测本机 2.23.1、东京 1.27.0），模型集就不同。远程会话去问**那台机器**：
+故意传一个不存在的模型，kiro-cli 在参数校验就会把可用列表打出来（不真调模型、不花额度）。
+东京那台连 `--list-models` 都不认，所以远端只拿得到一串 id —— 名字/上下文窗口/乘数按 id 从本机那份补上
+（机器决定**有哪些**模型，而"倍率 2.2"是模型自己的属性）。
 
-一条已建好的会话可以改目标。kiro-cli 的后端会话跟进程绑定，换机器等于换执行器，所以复用已有的
-**换执行器 + 逐段重建**（换模型走的就是这条），外加一次全量同步：
+启动时 `pickRemoteModel` 仍然会把选中的模型换成那台机器真有的一个，并在会话里说一句 ——
+kiro-cli 对不存在的模型是**静默退回**（日志里见过 `Model 'gpt-5.6-terra' does not exist. Available models: auto`）。
 
-1. 停掉当前执行器（有在跑的一轮就先拒绝切换，不打断）
-2. 切到远程：全量 push；切回本地：先把远端的改动 pull 干净**再**断开，否则那些改动就丢在远端了
-3. 新执行器 + 逐段重建历史
-4. 在会话里说一句「这条会话从现在开始跑在 `<host>` 上」—— 且这句话标 `kirolex: true`，不发给模型
+## 让它开你的浏览器：`KIROLEX-LOCAL: open <url>`
 
-### 同一个项目上的并发：拒绝并说明
+远端没有图形界面，它在那儿 `open` 一个 URL 最好的结果是什么都没发生。所以它可以在回复里写一行
+`KIROLEX-LOCAL: open https://…`，KiroLex（跑在你机器上）认这一行并用 `shell.openExternal` 打开。
 
-②带来一个真的危险：一条本地会话直接写本地文件，一条远程会话靠 pull 写本地文件 —— 两边改的是同一份真相。
-mtime 快照那条冲突判定碰巧能盖住一半（它不管改的人是你还是另一条会话），但两条会话**同时跑一轮**时仍会互相覆盖。
+边界：**只有 `open` 一个动词**（能跑命令的通道等于把那台机器的权限接到你的 Mac 上，那是另一件事）；
+**只收 http(s)**（别的 scheme 在 macOS 上是应用启动器）；**按整行解析**（半行会把 URL 截成另一个
+仍然合法的地址）；一轮最多两个、同一地址只开一次，每次都在状态行说明。
 
-规则：**同一个项目，同一时刻只允许一条会话在跑一轮。** 远程那条在 push 之前检查，发现同项目还有别的会话
-在跑就**不发这一轮**，并说清是哪一条挡住的。不排队 —— 一轮可能跑很久，排队看起来就是卡住了。
+## 远端那台机器需要什么
 
-### review / 预览 / PPT
+**只有 kiro-cli**（`REQUIRED_TOOLS`）。`git` 不需要（那个仓库不在远端，`local_git` 查的是你机器上那份）、
+`rsync` 不需要（没有任何东西要同步了）。
 
-不动。它们读的是本地文件，而本地是真相 —— 只要 pull 在渲染之前发生（上面第 4 个同步点）就自然是对的。
-远端没有 LibreOffice，也不需要有。
-
-### 远程会话要告诉模型的话
-
-远程会话的上下文里加一句（否则它会试着 `npm test` 然后困惑）：
-
-> 你在远端机器上。`node_modules/` 和构建产物没有同步；需要构建、跑测试或做预览时说出来，由本地执行。
-
-### 远端预置：一个 bootstrap 脚本
-
-远端的依赖由一个预置脚本装齐，而不是让 KiroLex 现场判断环境、也不是让人照文档手敲。
-
-`scripts/remote-bootstrap.sh` —— 幂等，可反复跑，只做三件事：
-
-1. 装 `rsync`、`git`（AL2023 用 `dnf`；发行版判断失败就明确报错退出，不猜）
-2. 确认 `kiro-cli` 在 `PATH` 里，没有就装
-3. 打印一份自检：三个命令的版本 + `kiro-cli whoami` 的结果
-
-**不装 LibreOffice / node_modules / 构建链** —— 远程会话不做那些事（见「明确不做的事」）。
-脚本里不写任何凭据，登录仍然是人在远端跑一次 `kiro-cli login`（脚本只负责**告诉你**没登录）。
-
-### 连接时的检查（失败要给人话，不是挂着）
-
-起执行器之前串一次：`ssh <opts> <host> 'kiro-cli whoami && command -v rsync git'`，
-对应三句明确的错误：
-
-| 查出来的 | 说什么 |
-|---|---|
-| 连不上 | 网络 / 密钥 / 安全组，带上实际的 ssh 报错 |
-| 缺 rsync 或 git | **在远端跑一次 `remote-bootstrap.sh`**，并给出推送这个脚本的那条命令 |
-| 没登录 | 去远端 `kiro-cli login`（KiroLex 不代跑登录） |
-
-脚本的存在让这里能给出"跑这一条就好了"，而不是一串手动安装步骤。KiroLex 自己**不自动跑**
-bootstrap —— 在别人的机器上装东西要由人点头。
+* 远端的 cwd 是 `<remoteWorkdir>/scratch/<会话>` —— 一个**草稿目录**（它自己要落临时文件时有地方放），
+  KiroLex 在起执行器前 `mkdir -p` 它。不是"项目在这里"。
+* 断开时要**杀掉远端那个 kiro-cli**：ssh 这边死了它不会跟着退（无 PTY、也不在 stdin EOF 时退出），
+  会一直占着那条 kiro-cli 会话的锁 —— 实测那台 EC2 上攒了 **85 个**孤儿，最老的 2 天 23 小时，
+  然后下一次 attach 报 `Session is active in another process (PID …)` 并连锁出一串
+  `Session not connected`。做法：远端命令先 `echo KIROLEX_REMOTE_PID $$ >&2` 再 `exec`
+  （exec 之后 PID 不变），断开时按那个 PID `kill -TERM`；`before-quit` 也补一遍。
+* 隧道端口**每次起执行器都换一个**：换 agent / 换模型是"先起新执行器、成功了再关旧的"，
+  复用同一个端口会撞上还没退出的旧 ssh —— `ExitOnForwardFailure=yes` 让它直接失败（ssh exit 255），
+  看起来像掉线，其实必然发生、重试也必然再撞。
 
 ## 明确不做的事
 
-- 远程会话**不做构建、不跑测试、不做预览/PPT**（原生依赖 + 没有 LibreOffice + 2 vCPU）。
-- 不做三方合并、不做 git 层面的同步（rsync 搬文件，git 历史照旧在文件里）。
-- 不支持 Windows 远端；不支持多用户共享同一个 `remoteWorkdir`。
-- 不把本地会话改成"也走镜像"—— 本地路径一行都不动。
-- 不做**会话内**混用（层级③，协议上做不到）；不做同项目并发（拒绝，不排队）。
-- KiroLex 不自动在远端跑安装脚本 —— 在别人的机器上装东西要由人点头。
+* **不做安全沙箱**。见「边界」那一节：有 `local_bash` 的前提下，路径牢笼只是剧场。
+* **不转发本机的 MCP**（playwright / drawio / computer-use…）。现在远端那条会话的 `playwright` 如果存在，
+  跑的是**远端**的浏览器。要让它驱动你的浏览器，正确做法是把本机那个 stdio MCP 代理到同一条隧道上
+  （`/mcp/<token>/<name>`），判据现成：**凡是命令指向本机路径、远端没有的 MCP 就该转发而不是拷**。
+  没做。
+* **不在远端装项目依赖 / 不跑构建**。构建和测试用 `local_bash` 在**你机器**上跑 —— 那里才有你的
+  `node_modules` 和工具链。
+* **不替你登录**。bootstrap 走 device flow：授权动作始终在你自己的浏览器里。
 
-## 分阶段
+## 这版之前是「镜像 + 同步」—— 为什么换掉
 
-1. `hostOps` + 诊断/超时/退出码按 host 分流（**无可见变化**，纯铺路）。
-2. `remoteMirror` + 三个同步点 + 路径映射 + 连接检查 → 远程会话真的能用。
-3. UI：按会话选目标、host 徽标、同步状态、冲突提示。
-4. cherry-pick 到 `feature/flow`。
+第一版的形状是：rsync 把项目推到远端一份镜像，每轮前后同步，冲突落成 `<file>.remote`。
+它能用，但账单是实测出来的：
 
-feature flag `remoteSessions`（默认关），这样 `standard` 可以带着它提 PR 而不改变任何现有行为。
+| 事实 | 数字 |
+|---|---|
+| 一条 cwd 是 `~` 的会话把家目录推上远端 | 2.6 → 6.1 GB，含 `.aws/credentials`、`.aws/sso/cache`、17 把 `.pem` |
+| 同一个目录被当成"项目镜像 + 会话镜像"推两遍 | app 里 21 秒，手动推同一份 5.9 秒 |
+| 纯生成的一轮也在收尾拉一次 | 5–7 秒，只因为判据是标题匹配而"网页搜索"的标题里有 search |
+| KiroLex 自己写的文件躺在被同步的树里 | `manifest.json` 每 20 秒报一次冲突，本地被塞满 `.remote` |
+| KiroLex 被杀之后 rsync 不死 | 被 launchd 收养（ppid=1），继续推 6.1 GB 并吃光上行 |
+
+这些不是没修好 —— 每一条都修了。换掉是因为**它们全都源自同一件事：多了一份副本**，
+而副本一旦存在就要回答"哪一份是真的、什么时候同步、冲突怎么办"。本地 MCP 那条路把这个问题
+整个消掉了：只有一份文件，就在你机器上。
 
 ## 测试
 
-- 纯模块单测：排除清单、rsync 参数、快照/冲突判定、255 归类、镜像路径推导、配置兼容读。
-- 接线断言（本项目惯例）：三个同步点各自接在哪、push 失败不发 prompt、pull 失败必须留下标记。
-- 一个**默认跳过**的集成测试，给了 `KIROLEX_TEST_REMOTE=<host>` 才跑：建临时项目 → push → 远端改文件 →
-  pull → 验证内容和冲突分支。
+* `tests/localMcp.test.ts` —— 工具本身（多文件读、截断说明在开头、bash 留痕、git 只读子命令）、
+  MCP 协议（initialize / tools/list / 通知不回包 / HTTP 404 与 token）、接线（隧道参数、端口竞态、
+  远端 agent 按名字解析 —— 那段合并程序用临时 HOME **真跑一遍**）。
+* `tests/binDetect.test.ts` —— 探测脚本（`< /dev/null`、去重、`verify`）、历史合并、设置分页与文案、
+  "没配就不起"那道门。
+* `tests/remoteTargets.test.ts` —— 配置读写（"键在 input 里才动它"）、界面接线、bootstrap 脚本的判据。
+* `tests/localAction.test.ts` —— `KIROLEX-LOCAL` 通道的边界与两个实测踩到的接线 bug。

@@ -401,8 +401,14 @@ describe('模型列表按机器分', () => {
     assert.match(M, /问不到 \$\{target\.sshHost\} 的模型列表/);
   });
 
-  test('乘数**不跨机器借用** —— 少显示一个乘数，好过把本机的贴到另一台机器的模型上', () => {
-    assert.match(M, /ids\.map\(\(id\) => \(\{ model_id: id, model_name: id \}\)\)/);
+  test('名字/窗口/乘数从本机那份**补上**（集合归机器，属性归模型）', () => {
+    /* 实测：东京那台 kiro-cli 1.27.0 连 `--list-models` 都不认
+       （`error: unexpected argument '--list-models'`），所以远端唯一拿得到的就是一串 id。
+       而"claude-opus-5 的倍率是 2.2"是**模型自己的属性**、不随机器变 —— 机器决定的只是
+       "有哪些模型"。所以按 id 从本机那份补；本机不认识的 id 留裸的（少点信息好过编一个）。 */
+    assert.match(M, /const byId = new Map\(localList\.map/);
+    assert.match(M, /\.\.\.\(byId\.get\(id\) \|\| \{\}\), model_id: id/);
+    assert.match(M, /model_name: byId\.get\(id\)\?\.model_name \|\| id/);
   });
 
   test('渲染层：每一格按它自己那条会话所在的机器取列表，缓存 key 带机器', () => {
