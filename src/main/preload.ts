@@ -337,8 +337,6 @@ contextBridge.exposeInMainWorld('kiroApi', {
     targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string; bins?: { kiro?: string; claude?: string; codex?: string } }[];
     localBins?: { kiro?: string; claude?: string; codex?: string };
   }> => ipcRenderer.invoke('app:remote-targets'),
-  /** 这条会话当前的同步状态（挂载时问一次 —— 只靠事件会丢掉挂载之前发生的）。 */
-  remoteStatus: (sessionId: string) => ipcRenderer.invoke('remote:status', sessionId),
   /** 加/改一台远端（只动 config.json 的 `remotes`，原子写）。 */
   remoteSave: (input: { id?: string; label?: string; sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
     ipcRenderer.invoke('remote:save', input),
@@ -416,12 +414,6 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */
   remoteTest: (input: { sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
     ipcRenderer.invoke('remote:test', input),
-  /** 同步状态变了。`stale` = 本地不是最新的，`conflict` = 两边都改过同一个文件。 */
-  onRemoteSync: (callback: (s: { sessionId: string; state: 'idle' | 'pushing' | 'pulling' | 'stale' | 'conflict'; hostLabel: string; conflicts?: string[]; error?: string }) => void) => {
-    const handler = (_event: any, data: any) => callback(data);
-    ipcRenderer.on('remote:sync', handler);
-    return () => ipcRenderer.removeListener('remote:sync', handler);
-  },
 
   // Events
   onUpdate: (callback: (data: any) => void) => {

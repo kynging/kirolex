@@ -48,10 +48,6 @@ declare global {
       ) => Promise<{ sessionId: string }>;
       /** 可选的远端列表；`enabled: false` 时界面完全不显示目标选择。 */
       remoteTargets?: () => Promise<{ enabled: boolean; targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string }[] }>;
-      /** 这条会话当前的同步状态（挂载时问一次）。 */
-      remoteStatus?: (sessionId: string) => Promise<RemoteSyncStatus | null>;
-      /** 同步状态变了。`stale` = 本地不是最新的。 */
-      onRemoteSync?: (cb: (s: RemoteSyncStatus) => void) => () => void;
       /** 把一条已有会话切到另一台机器（`remoteId` 传 null = 本地）。 */
       setRemoteTarget?: (sessionId: string, remoteId: string | null, localDir?: string) =>
         Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
@@ -359,14 +355,6 @@ export interface QueuedMessage {
 }
 
 /** 远程会话的同步状态（`docs/DESIGN_remote_sessions.md`）。 */
-export interface RemoteSyncStatus {
-  sessionId: string;
-  state: 'idle' | 'pushing' | 'pulling' | 'stale' | 'conflict';
-  hostLabel: string;
-  conflicts?: string[];
-  error?: string;
-}
-
 export interface Session {
   id: string;
   title: string;

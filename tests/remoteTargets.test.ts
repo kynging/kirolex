@@ -4,8 +4,6 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { parseRemoteTargets, listRemoteTargets, findRemoteTarget, deriveLabel, expandHome } from '../src/main/remoteTargets.ts';
-import { RemoteSyncManager, type SyncStatus, type MirrorLike } from '../src/main/remoteSync.ts';
-import type { PullResult } from '../src/main/remoteMirror.ts';
 
 /*
  * 「混用粒度按会话选」。所以配置给的是一个**列表**，而不是一个全局开关 ——
@@ -81,90 +79,6 @@ describe('可选远端的解析', () => {
   });
 });
 
-/*
- * 状态要显出来，否则 `stale`（本地不是最新的）就只存在于日志里 —— 而那正是最不能沉默的一件事。
- */
-describe('同步状态推给界面', () => {
-  function mgr(pull: () => Promise<PullResult>) {
-    const seen: SyncStatus[] = [];
-    const m = new RemoteSyncManager({
-      note: () => {}, log: () => {}, onStatus: (s) => seen.push(s), schedule: (fn) => fn(),
-    });
-    const project: MirrorLike = {
-      localDir: '/l', remoteDir: '/r',
-      push: async () => ({ ok: true, snapshot: {}, ms: 1 }),
-      pull,
-    };
-    m.register({ sessionId: 's1', project, hostLabel: 'tokyo' });
-    return { m, seen };
-  }
-
-  test('推/拉/空闲依次报出来', async () => {
-    const { m, seen } = mgr(async () => ({ ok: true, changed: ['a'], conflicts: [], ms: 1 }));
-    await m.beforeTurn('s1');
-    await m.afterTurn('s1');
-    assert.deepEqual(seen.map((s) => s.state), ['pushing', 'idle', 'pulling', 'idle']);
-    assert.equal(seen[0].hostLabel, 'tokyo');
-  });
-
-  test('拉失败报 stale + 原因 —— 界面靠它显警告色', async () => {
-    const { m, seen } = mgr(async () => ({ ok: false, error: 'ssh timeout', changed: [], conflicts: [], ms: 1 }));
-    await m.afterTurn('s1');
-    const last = seen[seen.length - 1];
-    assert.equal(last.state, 'stale');
-    assert.match(last.error!, /ssh timeout/);
-    assert.equal(m.hasUnpulled('s1'), true);
-  });
-
-  test('冲突报 conflict + 文件清单', async () => {
-    const { m, seen } = mgr(async () => ({ ok: true, changed: [], conflicts: ['src/a.ts'], ms: 1 }));
-    await m.afterTurn('s1');
-    const last = seen[seen.length - 1];
-    assert.equal(last.state, 'conflict');
-    assert.deepEqual(last.conflicts, ['src/a.ts']);
-  });
-
-  test('一轮里工具写十次文件只拉一次 —— 所以状态也只闪一次（防抖在 pullSoon 里）', async () => {
-    const seen: SyncStatus[] = [];
-    let pending: (() => void) | null = null;
-    const m = new RemoteSyncManager({
-      note: () => {}, log: () => {}, onStatus: (s) => seen.push(s), schedule: (fn) => { pending = fn; },
-    });
-    m.register({
-      sessionId: 's1', hostLabel: 'tokyo',
-      project: {
-        localDir: '/l', remoteDir: '/r',
-        push: async () => ({ ok: true, snapshot: {}, ms: 1 }),
-        pull: async () => ({ ok: true, changed: [], conflicts: [], ms: 1 }),
-      },
-    });
-    for (let i = 0; i < 10; i += 1) m.pullSoon('s1');
-    (pending as any)?.();
-    await new Promise((r) => setImmediate(r));
-    assert.deepEqual(seen.map((s) => s.state), ['pulling', 'idle']);
-  });
-
-  test('再试一次又失败要**再报一次** —— 那不是重复，是"又试了一次还是不行"', async () => {
-    const { m, seen } = mgr(async () => ({ ok: false, error: '一样的错', changed: [], conflicts: [], ms: 1 }));
-    await m.afterTurn('s1');
-    await m.afterTurn('s1');
-    assert.deepEqual(seen.map((s) => s.state), ['pulling', 'stale', 'pulling', 'stale']);
-  });
-
-  test('statusOf 能被问到（界面重新挂载时只靠事件会丢状态）', async () => {
-    const { m } = mgr(async () => ({ ok: false, error: 'x', changed: [], conflicts: [], ms: 1 }));
-    assert.equal(m.statusOf('s1')?.state, 'idle', '还没同步过就是 idle');
-    await m.afterTurn('s1');
-    assert.equal(m.statusOf('s1')?.state, 'stale');
-    assert.equal(m.statusOf('本地会话'), undefined);
-  });
-
-  test('注销之后不再报状态，也问不到', () => {
-    const { m } = mgr(async () => ({ ok: true, changed: [], conflicts: [], ms: 1 }));
-    m.forget('s1');
-    assert.equal(m.statusOf('s1'), undefined);
-  });
-});
 
 describe('接线：主进程', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
@@ -185,12 +99,12 @@ describe('接线：主进程', () => {
     assert.match(M, /找不到远端目标/);
   });
 
-  test('状态既能订阅也能查', () => {
-    assert.match(M, /mainWindow\?\.webContents\.send\('remote:sync', status\)/);
-    assert.match(M, /ipcMain\.handle\('remote:status'/);
-    assert.match(P, /onRemoteSync:/);
-    assert.match(P, /remoteStatus:/);
+  test('机器列表能查（那套"同步状态"的订阅/查询随镜像一起删掉了）', () => {
     assert.match(P, /remoteTargets:/);
+    /* `remote:sync` / `remote:status` 是镜像时代的东西：现在远端没有副本，
+       也就没有"在推/在拉/本地是旧的"这回事 */
+    assert.equal(/remote:sync/.test(M), false);
+    assert.equal(/ipcMain\.handle\('remote:status'/.test(M), false);
   });
 
   test('侧栏要的 host 跟着会话列表一起发出去', () => {
@@ -214,15 +128,14 @@ describe('接线：渲染进程', () => {
     assert.match(A, /remoteId: target\?\.id, remoteLabel: target\?\.label,/);
   });
 
-  test('侧栏每行常驻机器徽标，warn 状态另一个样式', () => {
+  test('侧栏每行常驻机器徽标（只说身份，不再有同步状态那一档）', () => {
     assert.match(SB, /session\.remoteHost && \(/);
-    assert.match(SB, /session-remote-warn/);
-    assert.match(SB, /syncBadgeTitle\(session\.remoteHost, remoteSync\)/);
-  });
-
-  test('状态走 context（会话行有多个渲染点，逐层传 prop 迟早漏一个）', () => {
-    assert.match(MAIN, /<RemoteSyncProvider>/);
-    assert.match(SB, /useRemoteSyncFor\(session\.id, !!session\.remoteHost\)/);
+    assert.match(SB, /className="session-remote"/);
+    assert.match(SB, /🌐 \{session\.remoteHost\}/);
+    /* 那套按 sessionId 缓存的同步状态（以及它的 warn 样式、context provider）随镜像一起删了 */
+    assert.equal(/session-remote-warn/.test(SB), false);
+    assert.equal(/useRemoteSyncFor/.test(SB), false);
+    assert.equal(/RemoteSyncProvider/.test(MAIN), false);
   });
 });
 
@@ -1054,11 +967,6 @@ describe('切换一条已有会话的机器', () => {
     assert.match(body, /已产出的内容都在/);
   });
 
-  test('**切回本地之前先把远端改动拉干净**，拉不回来就不切', () => {
-    assert.match(body, /if \(wasRemote && !target\) \{/);
-    assert.match(body, /const fresh = await remoteSync\.pullNow\(sessionId\);/);
-    assert.match(body, /先不切回本地 —— 切了那份工作就留在那台机器上了/);
-  });
 
   test('**没有项目目录不是问题**，而且家目录那道闸也随镜像一起去掉了', () => {
     /* 上一版在这里要求"必须指定一个项目目录"，那是把"必须镜像点什么"和"必须有个项目"混成了一件事 */
@@ -1074,10 +982,9 @@ describe('切换一条已有会话的机器', () => {
     assert.match(M, /没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录/);
   });
 
-  test('换机器 = 换进程：起新后端会话 + 逐段重建 + 镜像登记跟着走', () => {
+  test('换机器 = 换进程：起新后端会话 + 逐段重建', () => {
     assert.match(body, /await withLoadTimeout\(client\.newSession\(cliCwd\), loadTimeoutFor\(profile\.remote\), 'session\/new'\)/);
     assert.match(body, /markContextOwedIfUnverified\(sessionId, 'switch-remote-target'\)/);
-    assert.match(body, /remoteSync\.forget\(sessionId\);\s*\n\s*if \(target\) registerRemoteSync\(sessionId, profile, nextLocalDir\);/);
     /* 目录和目标都要落盘，否则下次 attach 又回到老样子 */
     assert.match(body, /rec\.localDir = nextLocalDir;/);
     assert.match(body, /rec\.profile = profile;/);
@@ -1147,10 +1054,6 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*store\.writeRecord\(rec\);/);
   });
 
-  test('冷路径切回本地**照样先拉** —— 规则不能因为"没连上"就松掉', () => {
-    assert.match(body, /if \(!remoteSync\.isRemote\(sessionId\)\) \{\s*\n\s*const coldProfile/);
-    assert.match(body, /registerRemoteSync\(sessionId, coldProfile,/);
-  });
 
   test('两条路都把新位置发给界面（事件里带 remoteHost + 工作目录）', () => {
     /* 工作目录也在事件里：会话界面上那个 📂 显示的就是它，换完必须当场变 */
@@ -1193,31 +1096,6 @@ describe('模型列表显示价格乘数', () => {
   });
 });
 
-/*
- * 「把 history 那些文件不要再推了，那些纯粹是本地记录」。
- */
-describe('本地记录不推到远端', () => {
-  test('history.md / transcript.jsonl / events.jsonl 都在排除里', async () => {
-    const { SESSION_DIR_EXCLUDES } = await import('../src/main/remoteMirror.ts');
-    for (const f of ['history.md', 'transcript.jsonl', 'events.jsonl', 'record.json']) {
-      assert.ok(SESSION_DIR_EXCLUDES.includes(f), `缺 ${f}`);
-    }
-  });
-
-  test('镜像根是会话目录时，**推**也带上这些排除（不只是拉）', () => {
-    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /excludes: rootIsSessionDir \? \[\.\.\.DEFAULT_EXCLUDES, \.\.\.SESSION_DIR_EXCLUDES\] : undefined,/);
-  });
-
-  test('**注入里不能再提 history.md 的路径** —— 指向一个不存在的文件比不说更糟', async () => {
-    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
-    const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l' });
-    assert.match(b, /对话历史\*\*随消息带给你\*\*/);
-    assert.match(b, /这台机器上没有 history\.md/);
-    /* 附件也不在这台机器上了（镜像去掉之后什么都不推）—— 要说清去哪读 */
-    assert.match(b, /用 `local_read` 去读/);
-  });
-});
 
 /*
  * 「你自己写的那个提示什么的不要中断弄回对话框」+「为什么远程 session 换不了 project」。
@@ -1339,18 +1217,13 @@ describe('工作目录 / 不要推两遍', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
 
-  test('镜像根就是会话目录时**不再建第二份镜像**（那是推 21 秒的真正原因）', () => {
-    assert.match(M, /session: rootIsSessionDir \? undefined : new RemoteMirror\(\{/);
-    /* 实测：app 里推 21 秒，手动推同一份 5.9 秒 —— 差的就是第二遍 + 多两次 SSH 握手 */
-    assert.match(M, /手动推同一份只要 5\.9 秒/);
-  });
-
-  test('收尾要不要拉：**先看协议事实**（locations/diffs），再退回标题判断', () => {
-    assert.match(M, /const touchedFiles = \(Array\.isArray\(u\?\.locations\) && u\.locations\.length > 0\)/);
-    assert.match(M, /\(touchedFiles \|\| toolMayHaveWritten\(/);
-    /* 起因：网页搜索/知识库查询的标题带 search/fetch，被判成"可能写过文件"，于是每轮白拉一次 */
-    assert.match(M, /Querying knowledge base/);
-  });
+  /*
+    这里原来还有两条关于**推几遍 / 收尾要不要拉**的断言（「一直在从远端下载啥啊」那一串）。
+    镜像整个删掉之后它们连题目都不存在了：远端没有副本，没有推、也没有拉。
+    那两次调查留下的事实仍然值钱，所以记在这儿而不是悄悄消失：
+      · 同一个本地目录被当成"项目镜像 + 会话镜像"推了两遍 —— app 里 21 秒，手动推同一份 5.9 秒；
+      · 纯生成的一轮也在收尾拉一次（5–7 秒），只因为判据是标题匹配，而"网页搜索"的标题里有 search。
+  */
 
   test('工作目录**不在右键菜单里**了 —— 它在会话界面', () => {
     /* 「工作目录这个东西放到右侧会话，不要放在右键菜单」：它是个常驻事实（这条会话读写哪棵树），
@@ -1426,37 +1299,6 @@ describe('工作目录在会话界面上', () => {
   });
 });
 
-/*
- * 「命令调用那里即使切成本地也有远程的 tag」。
- *
- * 两处都错，而且是同一个根因：**把"跑在哪台机器上"这个身份，读成了"同步状态"**。
- * 切回本地时主进程只是 `remoteSync.forget(sessionId)` —— 渲染层那份按 sessionId 缓存的状态
- * 没人通知，最后那条（带 hostLabel）就永远留着，于是本地会话的命令面板上继续挂着 🌐。
- */
-describe('切回本地之后 🌐 必须消失', () => {
-  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
-  const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
-  const RS = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteSync.ts'), 'utf8');
-  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useRemoteSync.ts'), 'utf8');
-
-  test('身份取自**会话状态**，不是同步状态（侧栏徽标一直是对的，因为它就这么取）', () => {
-    assert.match(CA, /const remoteHostLabel = remoteHost \? remoteHost\.replace\(\/\^\[\^@\]\*@\/, ''\) : undefined;/);
-    assert.match(A, /remoteHost=\{session\?\.remoteHost\}/);
-    /* 同步状态不再参与"是不是远程"的判断 */
-    assert.equal(/useRemoteSyncFor\(currentSessionId \|\| undefined, true\)/.test(CA), false);
-  });
-
-  test('主进程忘掉目标时要**通知界面**（空 hostLabel = 不再是远程的）', () => {
-    assert.match(RS, /if \(was\) this\.deps\.onStatus\?\.\(\{ sessionId, state: 'idle', hostLabel: '' \}\);/);
-  });
-
-  test('渲染层收到这条就**删**掉那份状态，不是存一条空的', () => {
-    assert.match(HK, /if \(!s\.hostLabel\) \{/);
-    assert.match(HK, /delete next\[s\.sessionId\];/);
-    /* 再切回远程要能重新问一次（ask 每条会话只问一次） */
-    assert.match(HK, /asked\.current\.delete\(s\.sessionId\);/);
-  });
-});
 
 /*
  * 「确保远程 session 在 archive 和恢复的时候也带远程 tag，不要恢复就变成本地的」。

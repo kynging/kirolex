@@ -303,8 +303,16 @@ describe('接线：隧道、会话专用 agent、以及远端进程的收尾', (
     assert.match(A, /kill -TERM \$\{pid\} 2>\/dev\/null \|\| true/);
   });
 
-  test('镜像不再登记（这就是"把镜像去掉"那一下），远端 cwd 只是草稿目录', async () => {
-    assert.match(M, /function registerRemoteSync\(_sessionId: string/);
+  test('镜像那一整套**已经从代码里删掉了**，远端 cwd 只是草稿目录', async () => {
+    /* 上一版是把 `registerRemoteSync` 留成空壳（一处改动让 25 处调用点自动休眠），
+       等这条路在真实任务上跑通之后才真删。现在删了：三个模块、它们的测试、
+       渲染层那套同步徽标/状态、以及 `remote:status` / `remote:sync` 两条 IPC。 */
+    for (const gone of ['registerRemoteSync', 'remoteSync.', 'mirrorRefusal', 'stageFiles(', 'RemoteMirror']) {
+      assert.equal(M.includes(gone), false, `main 里还留着 ${gone}`);
+    }
+    for (const f of ['remoteMirror.ts', 'remoteSync.ts', 'localFileBridge.ts']) {
+      assert.equal(fs.existsSync(path.join(process.cwd(), 'src/main', f)), false, `${f} 还在`);
+    }
     const { sessionCwd } = await import('../src/main/config.ts');
     const cwd = sessionCwd(
       { model: 'm', remote: { enabled: true, sshHost: 'h', remoteWorkdir: '/home/x/kirolex-mirror' } } as any,

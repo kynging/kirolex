@@ -1,6 +1,5 @@
 import { projectsToCollapse } from '../projectActivity';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
-import { syncBadgeSuffix, syncBadgeTitle, useRemoteSyncFor } from '../hooks/useRemoteSync';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions } from '../sessionSearch';
 import { placeMenu } from '../menuPlacement';
@@ -211,8 +210,6 @@ const SessionItem: React.FC<{
 }> = ({ session, isActive, sessionStatus, busyReason, onSwitch, onContextMenu, onDelete, splitOrder = 0, onToggleSplit, scheduleSummary, subagents }) => {
   const t = useT();
   const crew = subagentTag(subagents);
-  /* 远程会话：这一刻在推/在拉/本地是旧的 —— 见 `useRemoteSync` 为什么走 context */
-  const remoteSync = useRemoteSyncFor(session.id, !!session.remoteHost);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: session.id });
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -296,10 +293,11 @@ const SessionItem: React.FC<{
       */}
       {session.remoteHost && (
         <span
-          className={`session-remote${remoteSync && (remoteSync.state === 'stale' || remoteSync.state === 'conflict') ? ' session-remote-warn' : ''}`}
-          title={syncBadgeTitle(session.remoteHost, remoteSync)}
+          className="session-remote"
+          title={`这条会话的 kiro-cli 跑在 ${session.remoteHost} 上；文件仍然在你这台机器上 ——`
+            + `它通过一条反向隧道调本地工具来读写（不复制文件）。`}
         >
-          🌐 {session.remoteHost}{syncBadgeSuffix(remoteSync?.state)}
+          🌐 {session.remoteHost}
         </span>
       )}
       <button className="session-delete-btn" onClick={(e) => onDelete(e, session.id)} title={t('Delete')}>

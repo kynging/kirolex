@@ -2470,10 +2470,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * 工具调用的记录里只有 `Running: <cmd>`（相对路径、没有 locations），和本地执行分不出来，
    * 所以命令/文件面板上要标出机器。显示时去掉 `user@`：那一段不是用来区分机器的，而面板很窄。
    *
-   * **身份取自会话状态（`session.remoteHost`），不是同步状态** ——「命令调用那里即使切成本地
-   * 也有远程的 tag」。同步状态是"此刻在推/在拉"，它按 sessionId 缓存在渲染层，而切回本地时
-   * 主进程只是把目标忘掉（`remoteSync.forget`）—— 渲染层那份**留着最后一次的 hostLabel**，
-   * 于是本地会话顶着 🌐 继续跑。侧栏那个徽标一直是对的，因为它看的就是 `session.remoteHost`。
+   * **身份取自会话状态（`session.remoteHost`）** ——「命令调用那里即使切成本地也有远程的 tag」。
+   * 它原来读的是同步状态（"此刻在推/在拉"）里的 hostLabel，那份按 sessionId 缓存在渲染层，
+   * 切回本地时没人清它，于是本地会话顶着 🌐 继续跑。侧栏那个徽标一直是对的，因为它看的就是
+   * `session.remoteHost` —— 现在两处看同一份事实（那套同步状态已经随镜像一起删掉了）。
    */
   const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
   const remoteHostLabel = remoteHost ? remoteHost.replace(/^[^@]*@/, '') : undefined;

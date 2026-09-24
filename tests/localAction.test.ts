@@ -101,7 +101,10 @@ describe('接线：边流边认，额度守住，每次都说出来', () => {
 });
 
 /*
- * 实测（远程会话真跑了一轮）暴露的两个真 bug —— 都不是解析的问题，是**接线**的问题。
+ * 实测（远程会话真跑了一轮）暴露的接线 bug。
+ *
+ * 原来这里还有一条"摆渡只看你自己写的那段文字"——那是镜像时代的东西（把你提到的文件拷进镜像），
+ * 镜像和 `localFileBridge` 已经整个删掉了（远端直接用 `local_read` 读你机器上那一份）。
  */
 describe('实测踩到的两个坑', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
@@ -115,15 +118,4 @@ describe('实测踩到的两个坑', () => {
     assert.ok(flush > 0 && done > flush, '要在这一轮判定结束之前冲一次');
   });
 
-  test('摆渡只看**你自己写的那段文字**，不看注入进去的 memory / 历史快照', () => {
-    /* 实测：拼完的 prompt 里还有 memory + 运行环境说明 + 19k 字符历史快照，
-       于是 memory 里的 `~/Downloads`、历史里的文件名全被当成"这一轮提到的文件"
-       —— 一条消息刷出 20 条提示，还真的搬了 7 个文件过去。 */
-    assert.match(M, /const userPromptText = \(prompt \|\| \[\]\)/);
-    assert.match(M, /mentionedPaths\(userPromptText\)/);
-    /* 取值必须在任何注入**之前**（注入都是往 prompt 前面塞） */
-    const snap = M.indexOf('const userPromptText =');
-    const inject = M.indexOf('注入运行环境说明');
-    assert.ok(snap > 0 && inject > snap, 'userPromptText 要在注入之前取');
-  });
 });

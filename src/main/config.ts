@@ -1,7 +1,7 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { mirrorDirFor } from './remoteMirror.ts';
+import crypto from 'crypto';
 
 /**
  * A session's execution profile. An executor process is bound to (model, host);
@@ -233,8 +233,11 @@ export function sessionCwd(profile: AgentProfile, localDefault: string): string 
       一条会话一个目录 —— 共用一个的话两条会话的临时文件会互相覆盖。
     */
     const wd = profile.remote.remoteWorkdir || defaultRemoteWorkdir(profile.remote.sshHost);
-    const tag = mirrorDirFor(wd, localDefault).split('/').pop() || 'session';
-    return `${wd.replace(/\/+$/, '')}/scratch/${tag}`;
+    /* 名字里带一段**本地目录的哈希**：`~/code/blog` 和 `~/work/blog` 的 basename 一样，
+       只用 basename 会把两条会话的草稿目录叠在一起。 */
+    const base = (localDefault.split('/').filter(Boolean).pop() || 'session').replace(/[^\w.@-]+/g, '_');
+    const h = crypto.createHash('sha1').update(localDefault).digest('hex').slice(0, 8);
+    return `${wd.replace(/\/+$/, '')}/scratch/${base}-${h}`;
   }
   return localDefault;
 }

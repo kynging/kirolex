@@ -2,7 +2,6 @@ import React from 'react';
 import ReactDOM from 'react-dom/client';
 import App from './App';
 import { ErrorBoundary } from './components/ErrorBoundary';
-import { RemoteSyncProvider } from './hooks/useRemoteSync';
 import './styles/global.css';
 
 /*
@@ -12,10 +11,7 @@ import './styles/global.css';
 ReactDOM.createRoot(document.getElementById('root')!).render(
   <React.StrictMode>
     <ErrorBoundary>
-      {/* 远程会话的同步状态（按 sessionId 索引，全局一份）—— 见 `useRemoteSync` */}
-      <RemoteSyncProvider>
-        <App />
-      </RemoteSyncProvider>
+      <App />
     </ErrorBoundary>
   </React.StrictMode>
 );

@@ -18,6 +18,7 @@
  */
 
 import fs from 'fs';
+import type { RemoteTarget } from './config';
 import os from 'os';
 import path from 'path';
 
@@ -121,4 +122,39 @@ export function parseAgentCheck(stdout: string): AgentCheck {
     present: /AGENT_OK/.test(s),
     missingCommands: [...s.matchAll(/^MISSING (.+)$/gm)].map((m) => m[1].trim()),
   };
+}
+
+/* ------------------------------------------------- rsync / ssh 的两个小工具
+
+   它们原来在 `remoteMirror.ts` 里。镜像整个删掉之后（远程会话改成调用户机器上的工具，
+   见 `localMcp.ts`），**还在用 rsync 的只剩下 agent 配置这一条路**，所以这两个函数跟着搬过来，
+   而不是为它们留一个空模块。                                                             */
+
+/** `rsync -e` 那一串：和执行器、`loopVerify` 用的是同一套 SSH 选项。 */
+export function sshCommandFor(remote: RemoteTarget, buildSshArgs: (r: RemoteTarget, cmd: string) => string[]): string {
+  /* 借 buildSshArgs 拿到选项，再把末尾的 host 和远端命令去掉 —— rsync 自己会接上 host。
+     这样 SSH 选项只有一个来源：三处各写一遍，迟早分叉，而分叉的那处就是"连不上又说不清为什么"。 */
+  const args = buildSshArgs(remote, '\u0000CMD\u0000');
+  const cut = args.findIndex((a) => a === '\u0000CMD\u0000');
+  const opts = (cut >= 0 ? args.slice(0, cut) : args).filter((a) => a !== remote.sshHost);
+  return ['ssh', ...opts].join(' ');
+}
+
+/**
+ * rsync 失败时那句给人看的话。
+ *
+ * **必须挡掉 SSH 的后量子告警**：它每次都在、而且是 stderr 的**第一行**，所以"取第一行"
+ * 报出来的是一句和失败毫无关系的话，真正的原因被丢掉了（实测踩到，查了一圈才发现）。
+ * 退出码**永远**带上：rsync 的退出码是可查的（23 = 部分文件传不了，255 = ssh 断了），
+ * 而"只有一句话、没有码"在事后根本没法定位。
+ */
+export function rsyncError(stderr: string, code: number | null): string {
+  const noise = /post-quantum|store now, decrypt later|openssh\.com|^\*\*/;
+  const real = String(stderr || '')
+    .split('\n')
+    .map((l) => l.trim())
+    .filter((l) => l && !noise.test(l))[0];
+  /* 退出码**永远**带上：rsync 的退出码是可查的（23 = 部分文件传不了，255 = ssh 断了），
+     而"只有一句话、没有码"在事后根本没法定位。 */
+  return real ? `${real}（rsync exit ${code}）` : `rsync exit ${code}`;
 }
