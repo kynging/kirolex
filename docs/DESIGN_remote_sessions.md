@@ -113,6 +113,24 @@ kiro-cli 不报错、只静默少掉这些工具。安装脚本同样不碰 `~/.
 启动时 `pickRemoteModel` 仍然会把选中的模型换成那台机器真有的一个，并在会话里说一句 ——
 kiro-cli 对不存在的模型是**静默退回**（日志里见过 `Model 'gpt-5.6-terra' does not exist. Available models: auto`）。
 
+**这个差别能有多大**（2026-09-24 实测，同一个 IdC 账号、同一个 `profile/YD3ARYRUKXQP`）：
+
+| 机器 | kiro-cli | 清单 |
+|---|---|---|
+| 东京那台 | 1.27.0 | 19 个，含 `claude-opus-5` / `claude-sonnet-5` / `claude-opus-4.x`… |
+| 这台 Mac | 2.23.1 | 8 个，**一个 Claude 都没有**（`gpt-5.6-*`、`deepseek-3.2`、`minimax-*`、`glm-5`、`qwen3-coder-next`），连 `auto` 都没有 |
+
+所以"模型没了"不是额度、不是权限，是**客户端版本**决定的。本机这条路上因此多做一件事：
+起执行器前先问一次 `chat --list-models`（不花额度、几秒），把清单里没有的直接记进
+`modelsKnownDead` —— 否则每个新进程都要先付一轮失败才发现，实测那一轮 **30 秒**，
+而且期间界面上一点动静都没有。
+
+顺带查出来的第二件事：**`--model` 在 `chat --no-interactive` 上是空操作**。它一律先打一行
+`[warn] failed to set model 'X': Method not found`，然后用别的模型跑（传不存在的名字也不报错）。
+真正说话的是 **agent JSON 里的 `model` 字段**。KiroLex 的标题 / 建议 / 会话记忆压缩都走
+`kirolex-lite` 这个 agent，而那份文件当时钉着 `claude-haiku-4.5` —— 于是这三件事**全都**失败，
+而且改设置里的"辅助模型"完全没用。现在每次调用前把选中的模型钉进那份 agent（一样就不写盘）。
+
 ## 让它开你的浏览器：`KIROLEX-LOCAL: open <url>`
 
 远端没有图形界面，它在那儿 `open` 一个 URL 最好的结果是什么都没发生。所以它可以在回复里写一行

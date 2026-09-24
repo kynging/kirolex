@@ -5,6 +5,7 @@ import os from 'os';
 import { execSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
+import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
@@ -315,6 +316,38 @@ async function awaitReconfigureIdle(sessionId: string, timeoutMs = 30000): Promi
  */
 const modelsKnownDead = new Set<string>();
 
+/**
+ * **本机 kiro-cli 自己报的模型清单** —— 一次运行只问一次。
+ *
+ * 为什么值得问：上面那段说的"每条会话先付一轮 30 秒失败"完全可以免掉 —— `chat --list-models`
+ * 不花额度、不调模型，两三秒就回来，而它正好回答那一轮失败要发现的事。实测这一版
+ * （2.23.1）清单里**一个 Claude 都没有**，而 `DEFAULT_MODEL` 是 `claude-opus-5`，
+ * 也就是每条新会话都在付那一轮。
+ *
+ * 失败时返回空数组，而**不缓存空**：探测本身可能是暂时坏的（超时、二进制还没配），
+ * 把"没探到"钉成"什么模型都没有"会让所有判断失去依据。空数组的含义是"这次没依据"，
+ * 下游一律按不做处理。
+ */
+let localModelIdsCache: string[] | null = null;
+let localModelIdsInFlight: Promise<string[]> | null = null;
+async function localModelIds(): Promise<string[]> {
+  if (localModelIdsCache) return localModelIdsCache;
+  if (!localModelIdsInFlight) {
+    localModelIdsInFlight = runKiroCli('chat --list-models --format json', 30000)
+      .then((out) => {
+        const ids = parseModelList(out);
+        if (ids.length) localModelIdsCache = ids;
+        return ids;
+      })
+      .catch((err: any) => {
+        logger.warn('model', `问不到本机模型清单：${err?.message || err}（这次不做可用性判断）`);
+        return [];
+      })
+      .finally(() => { localModelIdsInFlight = null; });
+  }
+  return localModelIdsInFlight;
+}
+
 async function connectWithModelFallback(
   profile: AgentProfile,
   label: string,
@@ -328,6 +361,28 @@ async function connectWithModelFallback(
     已知跑不了的排到**最后**而不是删掉：万一它们是唯一剩下的（清单探测错了、或者别的模型
     也都挂了），还得能试。删掉的话一次误判会让整个会话连不上，那比多等 30 秒糟得多。
   */
+  /*
+    **先问清单，别用一轮失败去发现** —— 本机那条路上这一步能省掉整整 30 秒。
+
+    kiro-cli 只在真跑一轮时才报模型退役（`connect()` 一定成功），所以上面那套
+    "失败 → 换模型 → 重载 → 重发"是必要的兜底；但它不必是**发现**手段。
+    `chat --list-models` 不花额度、几秒就回，实测这一版清单里一个 Claude 都没有，
+    而默认模型就是 `claude-opus-5`。
+
+    远程会话不走这儿：那台机器的清单由 `pickRemoteModel` 按 preflight 的结果判断。
+    清单问不到（空数组）时什么都不做 —— 没依据的判断比不判断糟。
+  */
+  if (!profile.remote?.sshHost) {
+    const available = await localModelIds();
+    if (available.length) {
+      for (const m of all) {
+        if (!available.includes(m) && !modelsKnownDead.has(m)) {
+          modelsKnownDead.add(m);
+          logger.info('model', `${label}: 本机 kiro-cli 的清单里没有 ${m}（清单：${available.join(', ')}）—— 不必等它跑一轮才知道`);
+        }
+      }
+    }
+  }
   const dead = all.filter((m) => modelsKnownDead.has(m));
   const candidates = dead.length ? [...all.filter((m) => !modelsKnownDead.has(m)), ...dead] : all;
   if (dead.length) {
@@ -500,10 +555,43 @@ async function runLiteOneShot(prompt: string, label: string): Promise<string> {
   const run = promisify(execFile);
   const opts = { env: shellEnv, timeout: 60000, maxBuffer: 1024 * 1024 };
   const { model, fallback } = loadHelperModels();
-  const models = [model, fallback].filter((m, i, arr) => !!m && arr.indexOf(m) === i);
+  let models = [model, fallback].filter((m, i, arr) => !!m && arr.indexOf(m) === i);
+  /*
+    **先按本机真实清单筛一遍** —— 否则这个循环只是把同一个失败付两遍（每次最多 60 秒）。
+    清单问不到就原样保留：没依据的时候照旧试，慢总比不做好。
+  */
+  const available = await localModelIds();
+  if (available.length) {
+    const usable = models.filter((m) => available.includes(m));
+    if (!usable.length) {
+      /* 两个都退役了：挑一个清单里真有的，并说清是谁替了谁 —— 悄悄换掉才是那个查了很久的病 */
+      const picked = pickAvailableModel(models[0] || '', available, MODEL_FALLBACK_ORDER);
+      logger.warn(label, `设置里的辅助模型（${models.join('、')}）在本机 kiro-cli 上都没有 -> 用 ${picked}`
+        + `（清单：${available.join(', ')}）`);
+      models = [picked];
+    } else {
+      models = usable;
+    }
+  }
   let lastError: any = null;
   for (const m of models) {
     for (const withAgent of [true, false]) {
+      /*
+        **`--model` 在 `chat --no-interactive` 上是空操作** —— 实测：它一律先打一行
+        `[warn] failed to set model 'X': Method not found`，然后用别的模型跑（传不存在的
+        名字也一样不报错）。真正说话的是 **agent JSON 里的 `model` 字段**。
+
+        所以设置里那个"辅助模型"以前从来没生效过：`kirolex-lite.json` 当时钉着
+        `claude-haiku-4.5`，而这一版 kiro-cli 的清单里一个 Claude 都没有 ——
+        于是标题、建议、会话记忆压缩**全都**失败，而且怎么改设置都没用。
+
+        `--model` 仍然传着：别的版本上它是管用的，而多传一个被忽略的参数不花任何代价。
+      */
+      if (withAgent) {
+        const pinned = pinAgentModel(LITE_AGENT, m);
+        if (pinned.changed) logger.info(label, `把 ${LITE_AGENT} 的模型钉成 ${m}（--model 在这一版上不生效）`);
+        else if (pinned.reason) logger.warn(label, `钉不进 ${LITE_AGENT}：${pinned.reason}`);
+      }
       const args = withAgent
         ? ['chat', '--no-interactive', '--agent', LITE_AGENT, '--model', m, prompt]
         : ['chat', '--no-interactive', '--model', m, prompt];
