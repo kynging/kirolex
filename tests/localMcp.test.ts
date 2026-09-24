@@ -677,3 +677,50 @@ describe('别拿历史里的结论判断自己有没有工具', () => {
     assert.ok(b.indexOf('local_read') < b.indexOf('看你这一轮的工具清单'));
   });
 });
+
+/*
+ * 「在远程会话中记得默认是在远程做，除非文件在本地或提示词中用户让在本地操作」。
+ *
+ * 上一版把天平压到了反面（"构建、跑测试、git 提交这些事用 `local_bash`"）。那是从"文件在用户
+ * 机器上"直接推出来的，但推过头了：装依赖、下载、解压、跑网络请求、起长任务，这些**没有理由**
+ * 回到用户的笔记本上跑 —— 那台远端机器就是为此存在的，而每一次 `local_bash` 都要过一遍
+ * 184ms 的隧道。
+ *
+ * 所以判据是**文件在哪**，不是"哪台机器更亲"：要动的文件在他那边就用 `local_*`，别的默认在远端做。
+ */
+describe('远程会话默认在远端干活', () => {
+  test('明说默认在这台机器上做，并点出那几类事', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r/scratch', localDir: '/l' });
+    assert.match(b, /\*\*默认在这台机器上做\*\*/);
+    assert.match(b, /装依赖/);
+    assert.match(b, /别把这些搬回用户的笔记本/);
+    /* 工作区就是它的 cwd —— 以前这句话把 cwd 说成"草稿目录、项目不在这里"，
+       读起来像"这台机器没什么用" */
+    assert.match(b, /\/r\/scratch` 就是你的工作区/);
+  });
+
+  test('三个例外写清楚：文件在他那边 / 在他的工程上构建 / 他明说在本地', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r', localDir: '/l' });
+    assert.match(b, /什么时候回到用户机器/);
+    assert.match(b, /① 要读或改的文件在他那边/);
+    assert.match(b, /② 要在\*\*他的仓库\/工程\*\*上跑构建、测试、git/);
+    assert.match(b, /③ 他明说了"在本地\/在我机器上"做/);
+  });
+
+  test('不再说"构建测试一律用 local_bash" —— 那句话和默认相反', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r', localDir: '/l' });
+    assert.equal(/构建、跑测试、git 提交这些事用 `local_bash`/.test(b), false);
+    assert.equal(/这台机器上装依赖没有意义/.test(b), false);
+    /* 取而代之：限定在"他的工程"上，并且明确无关的事在远端做 */
+    assert.match(b, /与他的工程无关的事（装个工具、拉个数据、跑个脚本）就在这台机器上做/);
+  });
+
+  test('工具清单那段也不再说"跑构建和测试都用这些工具"', () => {
+    const help = localToolsHelp('/Users/me/proj');
+    assert.equal(/跑构建和测试都用这些工具/.test(help), false);
+    assert.match(help, /默认仍然在你这台机器上干活/);
+  });
+});
