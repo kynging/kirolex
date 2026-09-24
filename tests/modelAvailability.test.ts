@@ -9,10 +9,16 @@ import { parseModelList, pickAvailableModel, pinAgentModel } from '../src/main/m
  * 「claude-opus-5 is not available 这条你要不要查」→ 查了，是**两件独立的事**叠在一起，
  * 而且都是静默的。两条都是实测出来的，不是读代码读出来的：
  *
- * 1. `kiro-cli 2.23.1 chat --list-models` 的清单里**一个 Claude 都没有**
+ * 1. 这台 Mac 的 `chat --list-models` 里**一个 Claude 都没有**
  *    （`gpt-5.6-sol/terra/luna`、`deepseek-3.2`、`minimax-*`、`glm-5`、`qwen3-coder-next`，
- *    连 `auto` 都没有），而同一个账号在远端 1.27.0 上有 19 个、`claude-opus-5` 正常出话。
- *    所以不是额度、不是权限，是客户端版本决定的清单。
+ *    连 `auto` 都没有），而**同一个账号**在东京那台 EC2 上 19 个全在、`claude-opus-5` 正常出话。
+ *
+ *    我第一版归因成"客户端版本"，**那是错的**（用户：「opus5 没退役啊」）。真正的原因是
+ *    **出口 IP 的地域过滤**：这台 Mac 出口是 CN / AS4837（联通），那台 EC2 在 JP；
+ *    缺的正好是 10 个 Claude + `auto`（19 − 11 = 8），一个不多一个不少。
+ *    版本无关有两条证据：远端 2.24.0（比本机 2.23.1 **新**）照样 19 个全在；
+ *    并且有人直接探 `ListAvailableModels`、伪装 appVersion 2.12.0→2.23.0，每次都是 19 个。
+ *    官方也把 Claude 标成 Active、没有任何退役记录。
  *
  * 2. `chat --no-interactive --model X` 是**空操作**：一律先打
  *    `[warn] failed to set model 'X': Method not found` 再用别的模型跑。
@@ -107,6 +113,34 @@ describe('模型可用性：清单、挑选、钉进 agent', () => {
     assert.match(M, /modelsKnownDead\.add\(m\);/);
     /* 远程走 pickRemoteModel（那台机器的清单来自 preflight），不混在一起 */
     assert.match(M, /远程会话不走这儿/);
+  });
+
+  /*
+   * 「opus5 没退役啊」→ 对，是我说错了。查到底是**出口 IP 的地域过滤**：
+   *   · 同一个账号：东京那台 EC2（出口 JP）19 个模型全在、claude-opus-5 正常出话；
+   *     这台 Mac（出口 CN / AS4837 联通）只有 8 个 —— 缺的正好是 10 个 Claude + `auto`。
+   *   · 和版本无关：有人直接探 `ListAvailableModels`，伪装 appVersion 2.12.0→2.23.0 每次都是 19 个；
+   *     我也实测过远端 2.24.0（比本机 2.23.1 还新）照样 19 个全在。
+   *   · Kiro 官方把 Claude 标成 Active、没有任何退役记录；已知 issue 里唯一确认过根因的那条
+   *     就是"企业网络出口落在不支持的地区，Auto 和 Claude 一起消失"。
+   *
+   * 所以这在这台机器上是**长期状态**，那就必须在会话里说出来：界面写着 claude-opus-5、
+   * 实际跑 gpt-5.6-sol，而唯一的痕迹在日志里 —— 那是最难发现的一类错。
+   */
+  test('本机换了模型要在会话里说一句，并且给出那个签名成立时的原因', () => {
+    assert.match(M, /const wanted = profile\.preferredModel \|\| profile\.model;/);
+    assert.match(M, /if \(sessionId && wanted && !available\.includes\(wanted\)\)/);
+    /* 判据是那个签名：一个 Claude 都没有、`auto` 也没有 */
+    assert.match(M, /const geoFiltered = !available\.some\(\(m\) => m\.startsWith\('claude-'\)\) && !available\.includes\('auto'\)/);
+    assert.match(M, /出口 IP 的地域过滤/);
+    assert.match(M, /换 kiro-cli 版本没用/);
+    /* 签名不成立时不许乱归因 —— 归错因比不归因贵，人会照着错方向查 */
+    assert.match(M, /不乱归因/);
+  });
+
+  test('两个调用点都把 sessionId 传进去了（不传就只进日志）', () => {
+    assert.match(M, /connectWithModelFallback\(profile, 'new-session', startLocalTools, kiroLexId\)/);
+    assert.match(M, /connectWithModelFallback\(profile, `attach \$\{sessionId\}`, localTools, sessionId\)/);
   });
 
   test('清单探测失败不缓存空值 —— 空是"这次没依据"', () => {

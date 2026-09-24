@@ -353,6 +353,8 @@ async function connectWithModelFallback(
   label: string,
   /** 远程会话的本地工具通道（`ensureLocalTools` 的结果）。本地会话是 undefined。 */
   localTools?: { remotePort: number; localPort: number; agentOverride: string },
+  /** 有它才能在会话里说一句"你选的模型这台机器上没有"。没有就只进日志。 */
+  sessionId?: string,
 ): Promise<{ client: AcpClient; model: string }> {
   const all: string[] = [profile.preferredModel, profile.model, ...MODEL_FALLBACK_ORDER]
     .filter((m): m is string => !!m)
@@ -380,6 +382,29 @@ async function connectWithModelFallback(
           modelsKnownDead.add(m);
           logger.info('model', `${label}: 本机 kiro-cli 的清单里没有 ${m}（清单：${available.join(', ')}）—— 不必等它跑一轮才知道`);
         }
+      }
+      /*
+        **换了模型就得说一句** —— 远程那条路（`pickRemoteModel`）本来就在说，本地这条以前不说：
+        界面上写着 claude-opus-5，实际跑的是 gpt-5.6-sol，而唯一的痕迹在日志里。
+
+        顺便把原因说出来，因为它是**查了一整轮才定下来的**、而且在这台机器上是长期状态：
+        出口 IP 落在 Anthropic 不支持的地区时，Kiro 会把 Claude **连同 `auto`** 一起从清单里过滤掉
+        （实测这台 Mac 出口是 CN / AS4837，19 个模型只剩 8 个，缺的正好是 10 个 Claude + `auto`；
+        同一个账号在东京那台 EC2 上 19 个全在）。和 kiro-cli 版本无关 —— 有人直接探过
+        `ListAvailableModels`，伪装 appVersion 2.12.0→2.23.0 每次都是 19 个。
+
+        判据就用那个签名：清单里**一个 Claude 都没有、也没有 `auto`**。不满足时只说"没有这个模型"，
+        不乱归因 —— 归错因比不归因贵，人会照着错方向查。
+      */
+      const wanted = profile.preferredModel || profile.model;
+      if (sessionId && wanted && !available.includes(wanted)) {
+        const geoFiltered = !available.some((m) => m.startsWith('claude-')) && !available.includes('auto');
+        sessionNotice(sessionId, `⚠️ 本机 kiro-cli 的模型清单里没有「${wanted}」，这条会话会用清单里有的一个。`
+          + `（本机可用：${available.slice(0, 8).join('、')}${available.length > 8 ? '…' : ''}）`
+          + (geoFiltered
+            ? `\n清单里 Claude 系列和 \`auto\` 整体消失，通常是**出口 IP 的地域过滤**（Anthropic 的模型分地区）——`
+              + `换 kiro-cli 版本没用。要用 Claude 就把这条会话切到远端机器上。`
+            : ''));
       }
     }
   }
@@ -3596,7 +3621,7 @@ app.whenReady().then(async () => {
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
       : undefined;
-    const started = await connectWithModelFallback(profile, 'new-session', startLocalTools);
+    const started = await connectWithModelFallback(profile, 'new-session', startLocalTools, kiroLexId);
     const client = started.client;
     profile.model = started.model;
     const { sessionId: cliSessionId } = await client.newSession(cliCwd);
@@ -6469,7 +6494,7 @@ app.whenReady().then(async () => {
         profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
-      const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools);
+      const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId);
       const client = started.client;
       profile.model = started.model;
       // Resume the mapped kiro-cli session; fall back to id (legacy records where
