@@ -743,34 +743,24 @@ describe('远端 kiro 登录', () => {
 });
 
 /*
- * 「ppt 需要的那些库啥的它都在脚本里了吗」→ 之前不在，现在加了。
- *
- * 为什么要装：生成 .pptx/.xlsx 的做法是 agent **写个 python 脚本再跑它**，而远程会话里那个脚本
- * 跑在远端 —— 缺库就是"脚本写好了跑不起来"，它会花一轮时间自己去装。
- * 为什么仍然**不**装 LibreOffice：预览/转 PDF 在本地做（同步回来之后读本地那份），远端一次都用不到。
+ * 「ppt 需要的那些库啥的它都在脚本里了吗」→ 当时加了（python-pptx / openpyxl / pandas），
+ * 现在又去掉了：那是**镜像时代**的需求 —— 生成 .pptx 的脚本跑在远端、产出留在远端镜像里，
+ * 所以远端得有那些库。现在产出必须落在用户机器上，而脚本本来就用 `local_bash` 在**他机器**上跑
+ * （那里有他的 python 环境）。在远端装一套没人用的库，只是让"装依赖"这一步更慢、更容易失败。
  */
-describe('脚本里的 python 库（pptx/xlsx）', () => {
+describe('脚本不再装远端用不到的东西', () => {
   const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
 
-  test('装 python-pptx / openpyxl / pandas', () => {
-    assert.match(SH, /step "python 库（生成 pptx\/xlsx 用）"/);
-    for (const p of ['python-pptx', 'openpyxl', 'pandas']) assert.ok(SH.includes(p), `缺 ${p}`);
-    assert.match(SH, /python3 -m pip install -q/);
+  test('python 库那一步整个去掉了（产出落在用户机器上）', () => {
+    assert.equal(/python-pptx|openpyxl/.test(SH), false);
+    assert.equal(/python 库/.test(SH), false);
   });
 
-  test('**先 import 试一遍再装** —— 那台机器的 anaconda 自带 pandas/openpyxl，重复装是白花时间', () => {
-    assert.match(SH, /python3 -c "import \$mod"/);
-    assert.match(SH, /\[ "\$FORCE" != "1" \]/, 'FORCE=1 才强制重装');
-  });
-
-  test('仍然不装 LibreOffice —— 预览在本地做', () => {
+  test('仍然不装 LibreOffice，也不装项目依赖', () => {
     const installs = SH.split('\n').filter((l) => /^\s*(sudo\s+)?(dnf|yum|apt-get|npm|python3 -m pip)\s/.test(l));
-    assert.equal(/libreoffice|soffice/i.test(installs.join('\n')), false);
-  });
-
-  test('自检里报一行，装不上要能看出来', () => {
-    assert.match(SH, /say "python 库       :\$mods"/);
-    assert.match(SH, /mods="\$mods ✗\$mod"/);
+    const joined = installs.join('\n');
+    assert.equal(/libreoffice|soffice/i.test(joined), false);
+    assert.equal(/npm\s+(ci|install)(?!\s+-g)/.test(joined), false);
   });
 });
 
@@ -810,7 +800,7 @@ describe('远端不再有"同步过去的"配置', () => {
     assert.equal(/\.kiro\/agents/.test(SH), false, '不许碰 agent 目录');
     /* 装的东西还在：kiro-cli / node / claude / codex / python 库 */
     assert.match(SH, /kiro-cli/);
-    assert.match(SH, /python-pptx/);
+    assert.match(SH, /@openai\/codex/);
     /* rsync 不再是它要装的系统包（没人用了） */
     assert.equal(/for b in rsync/.test(SH), false);
   });

@@ -141,13 +141,42 @@ kiro-cli 对不存在的模型是**静默退回**（日志里见过 `Model 'gpt-
 ## 明确不做的事
 
 * **不做安全沙箱**。见「边界」那一节：有 `local_bash` 的前提下，路径牢笼只是剧场。
-* **不转发本机的 MCP**（playwright / drawio / computer-use…）。现在远端那条会话的 `playwright` 如果存在，
-  跑的是**远端**的浏览器。要让它驱动你的浏览器，正确做法是把本机那个 stdio MCP 代理到同一条隧道上
-  （`/mcp/<token>/<name>`），判据现成：**凡是命令指向本机路径、远端没有的 MCP 就该转发而不是拷**。
-  没做。
+* **不给"要不要转发某个 MCP"一个开关**。转发是自动的（见下一节）：判据成立就转发。
+  想让远端用它自己那台的浏览器时，没有地方能说"这一条别转发" —— 目前的出路是在那台机器的
+  同名 agent 里自己配一个。
+* **没有 computer-use**。`local_bash` 已经是粗糙版（`screencapture` 截图 + `osascript` 点按都在你机器上跑），
+  真要闭环得在本机装一个 computer-use 的 MCP —— 装上之后**自动就被转发**，不需要改代码。
 * **不在远端装项目依赖 / 不跑构建**。构建和测试用 `local_bash` 在**你机器**上跑 —— 那里才有你的
   `node_modules` 和工具链。
 * **不替你登录**。bootstrap 走 device flow：授权动作始终在你自己的浏览器里。
+
+## 把本机的 MCP 转发过去（playwright 等）
+
+远程会话的 agent 里如果有 `playwright`，它跑的是**远端**那台机器的浏览器 —— 没有显示器，
+而且就算有你也看不见它点了什么。这些 MCP 是 stdio 的，所以 KiroLex 在本机把它们起起来，
+在**同一条隧道**上多开一个路径 `/mcp/<token>/<名字>`，把 JSON-RPC **原样**转发。
+远端的 kiro-cli 看到的就是一个普通 HTTP MCP，而 `browser_click` 落在你的机器上。
+
+实测（远端 curl 那个 URL）：`initialize` 回的是 `serverInfo: Playwright 1.64.0`（跑在 Mac 上），
+`browser_navigate https://example.com` 回 `Page Title: Example Domain`，本机 Chrome 进程 +1。
+
+**原样转发**而不是自己包一层工具：那些 server 的工具清单 / schema / 行为都由它们自己说，
+包一层就得跟着它们的版本走，而转发连它们的 `initialize` 响应都不用看懂。
+
+挑谁转发（`forwardMcp.ts`）：
+* 命令是**本机路径**的 —— 远端必然起不来，而 kiro-cli 对这种不报错、只静默少工具。
+* **按名字**该在本机跑的（`playwright` / `drawio` / `pencil`）—— `npx` 远端也有，但它拉起的是
+  远端那台的浏览器。这是语义问题，命令行里看不出来，所以只能白名单。
+* `type: http` 的不转发（远端自己能连同一个地址）；`disabled` 的跳过。
+
+**只看这条会话所选 agent 的那份定义**。所以跑默认 agent（没有具体 agent 名）的会话**什么都不转发** ——
+要 playwright 就得选一个配了它的 agent。
+
+生命周期：**懒启动**（没人调就不起浏览器）；会话作废 / 换 agent / 退出都跟着杀掉；子进程挂了下一次
+调用重起，pending 的请求收到明确错误而不是永远挂着；单次调用上限 180 秒（`browser_navigate` 要等页面）。
+
+注入里必须说"这些工具作用在**用户那台**机器上"：不说它会以为在自己机器上点浏览器，
+而那是最难发现的一类错 —— 截图回来的是另一台机器的屏幕。
 
 ## 这版之前是「镜像 + 同步」—— 为什么换掉
 
