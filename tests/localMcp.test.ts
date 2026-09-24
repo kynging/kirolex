@@ -724,3 +724,58 @@ describe('远程会话默认在远端干活', () => {
     assert.match(help, /默认仍然在你这台机器上干活/);
   });
 });
+
+/*
+ * 「清理远程 agent 你清了没有」——**硬杀的时候没人清**。
+ *
+ * 正常断开会删掉自己那一份（`removeAgentScript`），`before-quit` 也补一遍。但 KiroLex 被 SIGKILL /
+ * `pkill` / 崩溃 / 拔电结束时两条都不走，`kirolex-local-<会话>.json` 就全留在远端 ——
+ * 而每一份里带着**那一次**的隧道端口和 token，端口每次启动都换，所以留下的是一份指向死端口的配置。
+ *
+ * 这次实测就是这么来的：我自己用 `pkill` 重启了好几轮 app。
+ */
+describe('远端会话 agent 的孤儿清理', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('按"多久没动过"扫，不按"谁还活着"', async () => {
+    const { sweepAgentsScript, STALE_AGENT_MINUTES } = await import('../src/main/remoteLocalTools.ts');
+    const sh = sweepAgentsScript();
+    assert.match(sh, /find ~\/\.kiro\/agents -maxdepth 1 -name 'kirolex-local-\*\.json'/);
+    assert.ok(sh.includes(`-mmin +${STALE_AGENT_MINUTES}`), sh);
+    assert.match(sh, /-print -delete/);
+    /*
+      为什么不用"活着的名单"：启动早期那份名单是**空的**（执行器还没起来）——
+      按空名单删等于把所有配置都删掉；而"现在没有远程会话就跳过"又会让孤儿永远留着。
+    */
+    assert.equal(/-not -name/.test(sh), false);
+  });
+
+  test('只碰自己生成的那些文件', async () => {
+    const { sweepAgentsScript, SESSION_AGENT_PREFIX } = await import('../src/main/remoteLocalTools.ts');
+    const sh = sweepAgentsScript();
+    assert.ok(sh.includes(`${SESSION_AGENT_PREFIX}*.json`));
+    /* `maxdepth 1` —— 别递归进那个 `agents-retired-*` 备份目录 */
+    assert.match(sh, /-maxdepth 1/);
+  });
+
+  test('阈值留了余量：另一个 KiroLex 正开着时不许误删它的', async () => {
+    const { STALE_AGENT_MINUTES } = await import('../src/main/remoteLocalTools.ts');
+    /* 活着的那些每次起执行器都会被重写，所以永远是新的；12 小时对孤儿足够、对活的绝对安全 */
+    assert.ok(STALE_AGENT_MINUTES >= 60, '太短会误删正在被另一个实例用的');
+  });
+
+  test('窗口出来之后扫，而且不 await（别让启动等一个 ssh 往返）', () => {
+    const at = M.indexOf("ipcMain.handle('acp:reveal'");
+    assert.ok(at > 0);
+    assert.match(M.slice(at, at + 700), /void sweepRemoteSessionAgents\(\);/);
+  });
+
+  test('扫失败只记日志 —— 这是清垃圾，不该拦住任何会话', () => {
+    const at = M.indexOf('async function sweepRemoteSessionAgents');
+    const body = M.slice(at, M.indexOf('\n}', M.indexOf('catch (err: any)', at)));
+    assert.match(body, /只是清垃圾，不影响会话/);
+    assert.equal(/throw/.test(body), false);
+    /* 每台机器都扫一遍 */
+    assert.match(body, /for \(const target of listRemoteTargets\(KIROLEX_CONFIG_PATH\)\)/);
+  });
+});

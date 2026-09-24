@@ -148,6 +148,31 @@ export function removeAgentScript(name: string): string {
   return `rm -f ~/.kiro/agents/${name}.json`;
 }
 
+/** 扫掉多久没动过的会话 agent 才算孤儿。 */
+export const STALE_AGENT_MINUTES = 12 * 60;
+
+/**
+ * **扫掉上一次留下的会话 agent** ——「清理远程 agent 你清了没有」。
+ *
+ * 正常断开会删掉自己那一份（`removeAgentScript`），`before-quit` 也补一遍。但 KiroLex 被**硬杀**时
+ * （崩溃、`pkill`、拔电）两条都不走，于是 `kirolex-local-<会话>.json` 全留在远端。它们不只是垃圾：
+ * 每一份里带着**那一次**的隧道端口和 token，而端口每次启动都换 —— 留下的是一份指向死端口的配置。
+ *
+ * 判据是**多久没动过**，不是"谁还活着"：
+ *
+ * · 活着的那些每次起执行器都会被重写，所以永远是新的；孤儿只会越来越旧（进程那边实测过
+ *   同一个形状：那台机器上攒了 85 个孤儿 kiro-cli，最老的 2 天 23 小时）。
+ * · 不用"活着的名单"是因为它在启动早期是**空的**（执行器还没起来）—— 那时按名单删等于
+ *   把所有配置都删掉；而按"现在没有远程会话"就跳过，又会让孤儿永远留着。
+ * · 不拿本机的时钟去比：`-mmin` 是相对**远端自己**的 now，跨机器的时钟偏移进不来。
+ * · 12 小时这个阈值留给"另一个 KiroLex 正开着"的情况：它那些文件也在被不断重写，所以不会被误删。
+ */
+export function sweepAgentsScript(minutes = STALE_AGENT_MINUTES): string {
+  return `find ~/.kiro/agents -maxdepth 1 -name '${SESSION_AGENT_PREFIX}*.json'`
+    + ` -mmin +${Math.max(1, Math.floor(minutes))} -print -delete 2>/dev/null | wc -l`;
+}
+
+
 /**
  * 注入里那段说明。
  *

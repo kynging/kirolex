@@ -35,6 +35,7 @@ import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
+  sweepAgentsScript, STALE_AGENT_MINUTES,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
@@ -1691,6 +1692,25 @@ async function ensureLocalTools(
       + `这条远程会话读不到你机器上的文件 —— 先别让它改东西。`);
     logger.warn('localmcp', `准备失败 sessionId=${sessionId}: ${err?.message || err}`);
     return undefined;
+  }
+}
+
+/**
+ * **开机扫一遍远端留下的会话 agent** ——「清理远程 agent 你清了没有」。
+ *
+ * 一台机器扫一次，失败只记日志：这是清垃圾，不该拦住任何会话。
+ * 判据和阈值在 `sweepAgentsScript` 那段注释里（按"多久没动过"，不按"谁还活着"）。
+ */
+async function sweepRemoteSessionAgents(): Promise<void> {
+  for (const target of listRemoteTargets(KIROLEX_CONFIG_PATH)) {
+    if (!target.sshHost) continue;
+    try {
+      const out = await runRemoteCapture(target, sweepAgentsScript());
+      const n = Number(String(out).trim().split(/\s+/).pop());
+      if (n > 0) logger.info('localmcp', `${target.sshHost}: 扫掉 ${n} 个上次留下的会话 agent（超过 ${STALE_AGENT_MINUTES / 60} 小时没动过）`);
+    } catch (err: any) {
+      logger.info('localmcp', `${target.sshHost}: 扫会话 agent 没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
+    }
   }
 }
 
@@ -3565,6 +3585,11 @@ app.whenReady().then(async () => {
   ipcMain.handle('acp:reveal', async () => {
     startupMark('reveal: window shown (hydrate + eager-attach finished)');
     showMainWindow();
+    /*
+      **窗口出来之后再扫**，而且不 await：扫远端垃圾要开 ssh，放在启动路径上等于让窗口
+      多等一个网络往返 —— 而这件事一分钟后做和现在做没有任何区别。
+    */
+    void sweepRemoteSessionAgents();
     return { revealed: true };
   });
 
