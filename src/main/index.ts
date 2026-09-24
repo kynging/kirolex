@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFile, spawn } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, kiroBinProblem } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -1924,6 +1924,13 @@ const KIROLEX_CONFIG_PATH = path.join(os.homedir(), '.kirolex', 'config.json');
   一遍 —— 于是"跑的是哪一个 kiro-cli"在同一个进程里都可能不一致。
 */
 setLocalKiroBin(localBins(KIROLEX_CONFIG_PATH)?.kiro);
+/*
+  远端那台机器的启动命令**按 sshHost 现查配置**，不看会话记录里那份快照 ——
+  记录里存的是建会话那一刻的目标，后来配的 `bins` 到不了已有的会话（实测：配置里 tokyo
+  有 `bins.kiro`，而那几条老会话全部报"还没有设置…"）。和 `labelForHost` 同一条教训。
+*/
+setRemoteBinResolver((sshHost) => listRemoteTargets(KIROLEX_CONFIG_PATH)
+  .find((t) => t.sshHost === sshHost)?.bins?.kiro);
 
 /** ONE shared copy of the renderer's UI state (project groups, split layout,
  *  settings, panel widths…).

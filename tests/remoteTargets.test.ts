@@ -1564,11 +1564,15 @@ describe('每台机器（含本机）都能配三个 CLI 的启动命令', () =>
     }
   });
 
-  test('远端：启动命令用那台机器配的（没配才用 PATH 上的 kiro-cli）', () => {
+  test('远端：启动命令用那台机器配的，而且**按 sshHost 现查配置**（没配就不起）', () => {
     const A = fs.readFileSync(path.join(process.cwd(), 'src/main/acp-client.ts'), 'utf8');
-    assert.match(A, /function buildRemoteKiroCommand\(model: string, kiroAgent\?: string, bin\?: string\)/);
-    assert.match(A, /\$\{shellQuote\(\(bin \|\| ''\)\.trim\(\) \|\| 'kiro-cli'\)\}/);
-    assert.match(A, /this\.remote\.bins\?\.kiro/);
+    /* `bin` 是必填 —— 留一个可选参数 + 兜底等于在代码里留一句"我们会猜" */
+    assert.match(A, /function buildRemoteKiroCommand\(model: string, kiroAgent: string \| undefined, bin: string\)/);
+    /* 现查：记录里存的是建会话那一刻的快照，后来配的东西到不了已有的会话（实测踩到） */
+    assert.match(A, /export function remoteKiroBin\(remote: RemoteTarget\)/);
+    assert.match(A, /const remoteBin = remoteKiroBin\(this\.remote\) \|\| '';/);
+    /* 兜底那个 `|| 'kiro-cli'` 没了 —— 没配就拒绝，不猜 */
+    assert.equal(/\|\| 'kiro-cli'\)\}/.test(A), false);
   });
 
   test('接线：投影/保存都带 bins（漏一个字段 = 自动保存把它抹掉），启动时就应用本机那份', () => {

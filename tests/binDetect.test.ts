@@ -322,7 +322,8 @@ describe('没配启动命令就不许起连接', () => {
   test('执行器起之前就拦住（本地和远端各一处）', () => {
     assert.match(A, /const problem = kiroBinProblem\(\);\s*\n\s*if \(problem\) \{ reject\(new Error\(problem\)\); return; \}/);
     /* 远端：那台机器没配也不起，而且错误里要带上是哪台机器 */
-    assert.match(A, /const remoteBin = \(this\.remote\.bins\?\.kiro \|\| ''\)\.trim\(\);/);
+    /* 启动命令按 sshHost 现查配置（见下面那一组）—— 记录里那份快照只是兜底 */
+    assert.match(A, /const remoteBin = remoteKiroBin\(this\.remote\) \|\| '';/);
     assert.match(A, /还没有设置 \$\{this\.remote\.sshHost\} 上的 kiro 启动命令/);
     /* 不许再有 `|| 'kiro-cli'` 这种兜底 */
     assert.equal(/bins\?\.kiro \|\| 'kiro-cli'/.test(A), false);
@@ -358,5 +359,37 @@ describe('测试连接不问模型列表', () => {
   test('`git` 不再是远端的必需品（镜像没了，那个仓库也不在远端）', async () => {
     const { REQUIRED_TOOLS } = await import('../src/main/remotePreflight.ts');
     assert.deepEqual(REQUIRED_TOOLS, ['kiro-cli', 'rsync']);
+  });
+});
+
+/*
+ * 实测（重启之后）：配置里 tokyo 明明有 `bins.kiro`，而那几条老会话全部报"还没有设置…"。
+ * 根因是会话记录里存的是**建会话那一刻**的目标快照（`rec.profile.remote = {...target}`），
+ * 后来在设置里配的东西永远到不了已有的会话 —— 和 `labelForHost` 是同一条教训：
+ * **会变的东西不要存进会话，按 host 反查。**
+ */
+describe('远端启动命令按 sshHost 现查配置，不看记录里的快照', () => {
+  test('配置里有就用配置里的（记录里那份是旧的）', async () => {
+    const { remoteKiroBin, setRemoteBinResolver } = await import('../src/main/acp-client.ts');
+    setRemoteBinResolver((host) => (host === 'ec2-user@1.2.3.4' ? '/home/ec2-user/.local/bin/kiro-cli' : undefined));
+    try {
+      /* 记录里那份**没有** bins（老会话），照样要能起来 */
+      assert.equal(remoteKiroBin({ sshHost: 'ec2-user@1.2.3.4' } as any), '/home/ec2-user/.local/bin/kiro-cli');
+      /* 记录里有一份旧的 —— 也以配置为准 */
+      assert.equal(remoteKiroBin({ sshHost: 'ec2-user@1.2.3.4', bins: { kiro: 'kiro-cli' } } as any),
+        '/home/ec2-user/.local/bin/kiro-cli');
+      /* 配置里这台机器被删了 → 退回记录里那份（宁可用旧的，也不要把一条会话彻底堵死） */
+      assert.equal(remoteKiroBin({ sshHost: 'other@host', bins: { kiro: 'kiro-cli' } } as any), 'kiro-cli');
+      /* 两边都没有 = 不许起（`connect` 会拒绝） */
+      assert.equal(remoteKiroBin({ sshHost: 'other@host' } as any), undefined);
+    } finally {
+      setRemoteBinResolver(undefined);
+    }
+  });
+
+  test('主进程在启动时就注入那个查询', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /setRemoteBinResolver\(\(sshHost\) => listRemoteTargets\(KIROLEX_CONFIG_PATH\)/);
+    assert.match(M, /\.find\(\(t\) => t\.sshHost === sshHost\)\?\.bins\?\.kiro\);/);
   });
 });

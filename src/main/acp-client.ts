@@ -67,6 +67,29 @@ export function setLocalKiroBin(bin?: string): void {
 }
 
 /**
+ * **远端那台机器的启动命令按 sshHost 现查** ——「所有的会话必须用 setting 里面设置的
+ * 本地或远程 agent 起任务」。
+ *
+ * 为什么不能用会话记录里那一份：记录里存的是**建会话那一刻**的目标快照
+ * （`rec.profile.remote = {...target}`），所以后来在设置里配的 `bins` 永远到不了已有的会话 ——
+ * 实测就是这样：配置里 tokyo 明明有 `bins.kiro`，而那几条老会话全部报"还没有设置…"。
+ *
+ * 和 `labelForHost` 是同一条教训：**会变的东西不要存进会话，按 host 反查**。
+ * 主进程在启动时注入这个查询（它才有配置文件的访问权）。
+ */
+let remoteBinResolver: ((sshHost: string) => string | undefined) | undefined;
+
+export function setRemoteBinResolver(fn?: (sshHost: string) => string | undefined): void {
+  remoteBinResolver = fn;
+}
+
+/** 这台远端机器该用哪条命令：先看配置（现查），再退回记录里那份快照。 */
+export function remoteKiroBin(remote: RemoteTarget): string | undefined {
+  const live = remote.sshHost ? remoteBinResolver?.(remote.sshHost) : undefined;
+  return (live || '').trim() || (remote.bins?.kiro || '').trim() || undefined;
+}
+
+/**
  * **没配就不起** ——「所有的会话必须用 setting 里面设置的本地或远程 agent 起任务，
  * 如果设置是空的不应该起任何连接」。
  *
@@ -185,7 +208,7 @@ export class AcpClient extends EventEmitter {
         // rest of this client is unchanged. The remote kiro-cli operates on the
         // remote filesystem and loads the remote host's own MCP/agent config.
         command = 'ssh';
-        const remoteBin = (this.remote.bins?.kiro || '').trim();
+        const remoteBin = remoteKiroBin(this.remote) || '';
         if (!remoteBin) {
           reject(new Error(`还没有设置 ${this.remote.sshHost} 上的 kiro 启动命令。`
             + '打开 设置 → 🖥 机器 → 选中这台机器，点「自动检测这台机器上的三个工具」——'
@@ -716,10 +739,10 @@ export function shellQuote(value: string): string {
  * `$$` 是那个 bash 的 PID，而 `exec` 之后 kiro-cli **就是同一个 PID**，所以这一行报出来的
  * 就是要杀的那个。走 stderr：stdout 是 ACP 的协议流，掺一个字节进去就毁了它。
  */
-function buildRemoteKiroCommand(model: string, kiroAgent?: string, bin?: string): string {
-  /* 远端那台机器上 kiro-cli 叫什么、在哪，由那台机器自己的配置说（`RemoteTarget.bins.kiro`）；
-     没配就用 PATH 上的 `kiro-cli` */
-  let cli = `${shellQuote((bin || '').trim() || 'kiro-cli')} acp --model ${shellQuote(model)}`;
+function buildRemoteKiroCommand(model: string, kiroAgent: string | undefined, bin: string): string {
+  /* `bin` 是**必填**的：调用点（`connect`）在它为空时就已经拒绝启动了（`remoteKiroBin`）。
+     这里留一个 `|| 'kiro-cli'` 兜底等于在代码里留一句"我们会猜"，而那正是要去掉的行为。 */
+  let cli = `${shellQuote(bin)} acp --model ${shellQuote(model)}`;
   if (kiroAgent) cli += ` --agent ${shellQuote(kiroAgent)}`;
   return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; exec ${cli}`)}`;
 }
