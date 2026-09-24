@@ -6,6 +6,7 @@ import { execSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
+import { parseAgentList } from './kiroAgentList.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
@@ -33,7 +34,7 @@ import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
-  remoteAgentScript, removeAgentScript, sessionAgentName,
+  remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
@@ -5396,8 +5397,29 @@ app.whenReady().then(async () => {
   // Named kiro-cli agents available to the composer selector. The CLI has no
   // JSON mode for this command, so parse its stable tabular output from both
   // stdout and stderr (some kiro-cli versions write the listing to stderr).
-  ipcMain.handle('kiro:list-agents', async () => {
+  ipcMain.handle('kiro:list-agents', async (_event, machine?: string) => {
     try {
+      /*
+        **agent 列表也按机器分** ——「对远程会话，那个机器人按钮显示的还是本地的 agent 列表，
+        不是远程的」。
+
+        和模型清单同一个病（`acp:list-models`）：kiro-cli 只认**它自己机器上** `~/.kiro/agents/`
+        里的 agent，所以一条远程会话能用的是**那台**机器上的那几个。拿本机的列表给它选，
+        选中的名字在远端不存在 —— 而那条路是有兜底的（`remoteAgentScript` 会退回默认 agent
+        并在会话里说一句），也就是说下拉在骗你、而且结果是静默换了个 agent。
+
+        列表里要滤掉 KiroLex 自己生成的 `kirolex-local-<会话>` —— 那是每条远程会话的私有配置
+        （URL 里带着它的 token），选它等于把两条会话的工具通道接到一起。
+      */
+      if (machine && machine !== 'local') {
+        const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+        if (!target?.sshHost) throw new Error(`找不到这台机器（${machine}）—— 设置里删掉了？`);
+        const bin = remoteKiroBin(target);
+        if (!bin) throw new Error(`还没有设置 ${target.sshHost} 上的 kiro 启动命令（设置 → 🖥 机器）。`);
+        const out = await runRemoteCapture(target, `${shellQuote(bin)} agent list 2>&1`)
+          .catch((err) => { throw new Error(`问不到 ${target.sshHost} 的 agent 列表：${err?.message || err}`); });
+        return { agents: parseAgentList(out).filter((a) => !a.name.startsWith(SESSION_AGENT_PREFIX)) };
+      }
       // 和 list-models 同一个病：日志里 `agent list` 也在 15s 反复被 kill，同样是挂载时并发双发。
       // single-flight + 30s，理由见 `acp:list-models` 那段注释。
       //
@@ -5408,31 +5430,7 @@ app.whenReady().then(async () => {
           .finally(() => { listAgentsInFlight = null; });
       }
       const output = await listAgentsInFlight;
-      const agents: Array<{
-        name: string;
-        isDefault: boolean;
-        source: 'built-in' | 'global' | 'local';
-      }> = [];
-      for (const raw of output.split('\n')) {
-        const line = raw.replace(/\x1b\[[0-9;]*m/g, '');
-        const match = line.match(/^(\*)?\s+([A-Za-z0-9_.\-]+)\s{2,}(\(Built-in\)|Global|Local)(?:\s|$)/);
-        if (match) {
-          const source = match[3] === '(Built-in)'
-            ? 'built-in'
-            : match[3].toLowerCase() as 'global' | 'local';
-          agents.push({ name: match[2], isDefault: !!match[1], source });
-        }
-      }
-      const builtInOrder = ['kiro_default', 'kiro_help', 'kiro_planner'];
-      agents.sort((left, right) => {
-        const leftRank = builtInOrder.indexOf(left.name);
-        const rightRank = builtInOrder.indexOf(right.name);
-        if (leftRank >= 0 && rightRank >= 0) return leftRank - rightRank;
-        if (leftRank >= 0) return -1;
-        if (rightRank >= 0) return 1;
-        return 0;
-      });
-      return { agents };
+      return { agents: parseAgentList(output) };
     } catch (err: any) {
       return { agents: [], error: err?.message || String(err) };
     }

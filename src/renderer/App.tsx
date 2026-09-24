@@ -154,7 +154,7 @@ declare global {
       rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }>) => Promise<{ ok: boolean }>;
       listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean }[]>;
       listSessions: () => Promise<any>;
-      listKiroAgents: () => Promise<{ agents: Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>; error?: string }>;
+      listKiroAgents: (machine?: string) => Promise<{ agents: Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>; error?: string }>;
       openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => Promise<{ opened: boolean; path?: string; content?: string; error?: string }>;
       saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => Promise<{ saved: boolean; path?: string; error?: string }>;
       switchKiroAgent: (sessionId: string, agentName: string) => Promise<{ ok: boolean; kiroAgent: string }>;
@@ -758,14 +758,28 @@ const App: React.FC = () => {
       return Array.isArray(cached) ? cached : [];
     } catch { return []; }
   });
-  const refreshAgents = useCallback(async () => {
+  /**
+   * **agent 列表按机器分** ——「对远程会话，那个机器人按钮显示的还是本地的 agent 列表，不是远程的」。
+   *
+   * kiro-cli 只认**它自己机器上** `~/.kiro/agents/` 里的 agent。拿本机那份给远程会话选，
+   * 选中的名字在远端不存在 —— 而那条路有兜底（会退回默认 agent 并在会话里说一句），
+   * 于是表现是"下拉里明明有，选了却静默换成了别的"。和模型清单同一个形状（`modelsByMachine`）。
+   */
+  const [agentsByMachine, setAgentsByMachine] = useState<Record<string, Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>>>({});
+  const askedAgents = useRef(new Set<string>());
+
+  const refreshAgents = useCallback(async (machine = 'local') => {
+    const key = `${AGENTS_CACHE_KEY}${machine === 'local' ? '' : `:${machine}`}`;
     try {
-      const data = await window.kiroApi.listKiroAgents();
+      const data = await window.kiroApi.listKiroAgents(machine === 'local' ? undefined : machine);
       if (!data?.agents?.length) return;
-      setKiroAgents(data.agents);
-      try { uiSet(AGENTS_CACHE_KEY, JSON.stringify(data.agents)); } catch {}
+      setAgentsByMachine((prev) => ({ ...prev, [machine]: data.agents }));
+      if (machine === 'local') setKiroAgents(data.agents);
+      try { uiSet(key, JSON.stringify(data.agents)); } catch {}
     } catch { /* 保留现有那份（内存里的或缓存里的） */ }
   }, []);
+
+
 
   /**
    * **空了就自己再去拉** —— 那次超时之后原来没有任何东西会重试。
@@ -2145,6 +2159,26 @@ const App: React.FC = () => {
     return modelsByMachine[machine] || models;
   }, [models, modelsByMachine, refreshModels, remoteTargets.targets]);
 
+  /**
+   * 这条会话该显示哪台机器的 agent。远端那台**问一次就够**；问不到时退回本机那份 ——
+   * 空下拉比"可能多几个"更糟（那时你连当前 agent 都看不见）。
+   */
+  const agentsFor = useCallback((session: Session | null): Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }> => {
+    const host = session?.remoteHost;
+    if (!host) return kiroAgents;
+    const machine = remoteTargets.targets.find((t) => t.label === host)?.id;
+    if (!machine) return kiroAgents;
+    if (!askedAgents.current.has(machine)) {
+      askedAgents.current.add(machine);
+      try {
+        const cached = JSON.parse(uiGet(`${AGENTS_CACHE_KEY}:${machine}`) || '[]');
+        if (Array.isArray(cached) && cached.length) setAgentsByMachine((prev) => ({ ...prev, [machine]: cached }));
+      } catch {}
+      void refreshAgents(machine);
+    }
+    return agentsByMachine[machine] || kiroAgents;
+  }, [kiroAgents, agentsByMachine, refreshAgents, remoteTargets.targets]);
+
   /*
     Cmd+F、命中计数、高亮、以及「搜索时把渲染窗口整开」这一整套都搬进 `ChatArea` 了 ——
     一格一份。App 这里原来那几个 effect（发 `findInPage`、收 `found-in-page`、全局 Esc）
@@ -3072,7 +3106,7 @@ const App: React.FC = () => {
         onRemoveWorkdir={(d: string) => { void removeWorkdir(sid, d); }}
         onPickWorkdir={() => { void pickWorkdir(sid); }}
         kiroAgent={session?.kiroAgent || selectedKiroAgent}
-        kiroAgents={kiroAgents}
+        kiroAgents={agentsFor(session)}
         switchingAgent={focused && switchingAgent}
         switchingModel={focused && switchingModel}
         permissionMode={session?.permissionMode || 'auto-approve'}

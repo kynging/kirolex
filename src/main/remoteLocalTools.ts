@@ -45,9 +45,17 @@ export function allocateRemotePort(used: Iterable<number>): number {
   throw new Error(`没有空闲的远端端口了（${REMOTE_PORT_BASE}–${REMOTE_PORT_BASE + REMOTE_PORT_SPAN}）。`);
 }
 
+/**
+ * 那条会话专用 agent 的名字前缀。
+ *
+ * 单独拿出来是因为 agent 列表要**按它过滤**：这些是 KiroLex 每条远程会话私有的配置
+ * （URL 里带着那条会话的 token），出现在下拉里的话，选中它等于把两条会话的工具通道接到一起。
+ */
+export const SESSION_AGENT_PREFIX = 'kirolex-local-';
+
 /** 那条会话专用 agent 的名字。 */
 export function sessionAgentName(sessionId: string): string {
-  return `kirolex-local-${String(sessionId).replace(/[^\w.-]+/g, '_').slice(-24)}`;
+  return `${SESSION_AGENT_PREFIX}${String(sessionId).replace(/[^\w.-]+/g, '_').slice(-24)}`;
 }
 
 /** 远端 MCP 的 URL（token 在路径里 —— 见文件头）。 */

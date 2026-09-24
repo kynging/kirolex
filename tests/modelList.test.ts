@@ -79,7 +79,10 @@ describe('agent 列表也要落盘，而且拉不到会重试', () => {
     const fn = APP2.slice(APP2.indexOf('const refreshAgents = useCallback'));
     const body = fn.slice(0, fn.indexOf('}, []);'));
     assert.match(body, /if \(!data\?\.agents\?\.length\) return;/);
-    assert.match(body, /uiSet\(AGENTS_CACHE_KEY, JSON\.stringify\(data\.agents\)\)/);
+    /* 缓存键按机器分（远端那份单独存）——「机器人按钮显示的还是本地的 agent 列表」那次的修法：
+       两台机器的 `~/.kiro/agents/` 是两套东西，共用一个键会让后问到的那台盖掉前一台。 */
+    assert.match(body, /const key = `\$\{AGENTS_CACHE_KEY\}\$\{machine === 'local' \? '' : `:\$\{machine\}`\}`/);
+    assert.match(body, /uiSet\(key, JSON\.stringify\(data\.agents\)\)/);
   });
 
   test('**空了才重试** —— 不无条件跟着 focus 拉（每次都要 spawn 一个 kiro-cli）', () => {

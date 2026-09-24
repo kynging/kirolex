@@ -51,7 +51,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
   setPrimeMode: (sessionId: string, primeMode: 'snapshot' | 'full') =>
     ipcRenderer.invoke('acp:set-prime-mode', sessionId, primeMode),
   listSessions: () => ipcRenderer.invoke('acp:list-sessions'),
-  listKiroAgents: () => ipcRenderer.invoke('kiro:list-agents'),
+  /**
+   * 命名 agent 列表。**要传机器**：远程会话能用的是**那台**机器上 `~/.kiro/agents/` 里的那几个
+   * （kiro-cli 只认它自己机器上的）。不传 = 本机。
+   */
+  listKiroAgents: (machine?: string) => ipcRenderer.invoke('kiro:list-agents', machine),
   openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => ipcRenderer.invoke('kiro:open-agent-config', sessionId, agentName, source),
   saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => ipcRenderer.invoke('kiro:save-agent-config', sessionId, agentName, source, content),
   switchKiroAgent: (sessionId: string, agentName: string) => ipcRenderer.invoke('acp:switch-kiro-agent', sessionId, agentName),
