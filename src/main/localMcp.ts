@@ -37,7 +37,7 @@
  * "它以为自己在哪" 一致，否则它写出来的文件会散落在你想不到的地方。
  */
 
-import { execFile } from 'child_process';
+import { execFile, spawn, type ChildProcess } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
@@ -303,11 +303,132 @@ export async function handleRpc(
   }
 }
 
+/* --------------------------------------------- 把本机的 MCP 转发给远端会话 */
+
+/**
+ * **本机那些 MCP 也该给远端用** ——「那操作本地的 playwright 和 compute use 呢」。
+ *
+ * 问题：远程会话的 agent 里如果有 `playwright`，它跑的是**远端**那台机器的浏览器（没有显示器、
+ * 也不是你在看的那个）。而你要的显然是"点我这台机器上的浏览器"。
+ *
+ * 做法和 `local_*` 完全一样，只是多一层：那些 MCP 是 **stdio** 的，所以 KiroLex 在本机把它们
+ * 起起来，然后在同一个 HTTP 端点上多开一个路径 `/mcp/<token>/<名字>`，把 JSON-RPC 原样转发。
+ * 远端的 kiro-cli 看到的就是一个普通的 HTTP MCP server，而它的工具（`browser_click`…）
+ * 落在**你的**机器上执行。
+ *
+ * 为什么是"原样转发"而不是自己包一层工具：那些 server 的工具清单、schema、行为都由它们自己说，
+ * 包一层就等于要跟着它们的版本走 —— 而转发连它们的 `initialize` 响应都不用看懂。
+ */
+export interface ProxySpec {
+  /** MCP 的名字（远端 agent 配置里也用这个名字）。 */
+  name: string;
+  command: string;
+  args?: string[];
+  env?: Record<string, string>;
+}
+
+/** 一个被代理的 stdio MCP：懒启动、按 id 配对、会话结束时杀掉。 */
+class StdioProxy {
+  private spec: ProxySpec;
+  private log: LocalMcpDeps['log'];
+  private child: ChildProcess | null = null;
+  private buf = '';
+  private pending = new Map<string | number, (msg: any) => void>();
+
+  constructor(spec: ProxySpec, log: LocalMcpDeps['log']) {
+    this.spec = spec;
+    this.log = log;
+  }
+
+  private ensure(): ChildProcess {
+    if (this.child && !this.child.killed && this.child.exitCode === null) return this.child;
+    /*
+      **懒启动**：这些 server 很重（playwright 会拉起一个浏览器），没人调就不该起。
+      `env` 合并进当前环境：那些 server 常常靠 PATH / HOME 找自己的东西。
+    */
+    const child = spawn(this.spec.command, this.spec.args || [], {
+      stdio: ['pipe', 'pipe', 'pipe'],
+      env: { ...process.env, ...(this.spec.env || {}) },
+    });
+    this.child = child;
+    child.stdout?.on('data', (d: Buffer) => {
+      this.buf += d.toString('utf-8');
+      let i: number;
+      while ((i = this.buf.indexOf('\n')) >= 0) {
+        const line = this.buf.slice(0, i).trim();
+        this.buf = this.buf.slice(i + 1);
+        if (!line) continue;
+        let msg: any;
+        try { msg = JSON.parse(line); } catch { continue; }
+        /* 对不上 id 的是它主动推的通知 —— 我们没有地方送，丢掉（不能当成某个请求的答复） */
+        const resolve = msg?.id !== undefined ? this.pending.get(msg.id) : undefined;
+        if (resolve) { this.pending.delete(msg.id); resolve(msg); }
+      }
+    });
+    child.stderr?.on('data', (d: Buffer) => {
+      const t = d.toString('utf-8').trim();
+      if (t) this.log('info', `[${this.spec.name}] ${t.slice(0, 300)}`);
+    });
+    child.on('close', (code) => {
+      this.log('warn', `[${this.spec.name}] 退了（code ${code}）—— 下一次调用会重新起它`);
+      for (const [, r] of this.pending) r({ jsonrpc: '2.0', error: { code: -32000, message: `${this.spec.name} 退出了（code ${code}）` } });
+      this.pending.clear();
+      this.child = null;
+      this.buf = '';
+    });
+    this.log('info', `[${this.spec.name}] 起在本机：${this.spec.command} ${(this.spec.args || []).join(' ')}`);
+    return child;
+  }
+
+  /** 转发一条 JSON-RPC。通知（没有 id）不等回复。 */
+  call(msg: any, timeoutMs = PROXY_TIMEOUT_MS): Promise<any | null> {
+    const child = this.ensure();
+    const line = `${JSON.stringify(msg)}\n`;
+    if (msg?.id === undefined) {
+      try { child.stdin?.write(line); } catch { /* 它刚退了；下一次调用会重起 */ }
+      return Promise.resolve(null);
+    }
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        if (!this.pending.has(msg.id)) return;
+        this.pending.delete(msg.id);
+        resolve({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: `${this.spec.name} 超时（${timeoutMs}ms 没回）` } });
+      }, timeoutMs);
+      this.pending.set(msg.id, (answer) => { clearTimeout(timer); resolve(answer); });
+      try { child.stdin?.write(line); } catch {
+        clearTimeout(timer);
+        this.pending.delete(msg.id);
+        resolve({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: `写不进 ${this.spec.name} 的 stdin` } });
+      }
+    });
+  }
+
+  stop(): void {
+    const c = this.child;
+    this.child = null;
+    try { c?.stdin?.end(); } catch {}
+    try { c?.kill(); } catch {}
+  }
+}
+
+/**
+ * 被代理的 MCP 一次调用的上限。
+ *
+ * 比 `local_bash` 宽得多：`browser_navigate` 要等页面加载、`browser_click` 可能触发跳转，
+ * 而超时在这里的代价是"远端以为这个工具坏了"。
+ */
+export const PROXY_TIMEOUT_MS = 180_000;
+
 /* ------------------------------------------------------------ HTTP 服务 */
 
 export interface LocalMcpServer {
   /** 实际监听的本地端口（只在 127.0.0.1 上）。 */
   port(): number;
+  /**
+   * 这条会话要转发哪些本机 MCP。每个会一个 `/mcp/<token>/<名字>` 端点。
+   * 重复调用会把上一批停掉 —— 换 agent 时转发的集合可能变。
+   */
+  setProxies(sessionId: string, specs: ProxySpec[]): void;
   /** 登记一条会话，拿到它的 token（URL 里用）。 */
   register(session: LocalMcpSession): string;
   /** 会话没了就作废它的 token。 */
@@ -323,15 +444,26 @@ export function newToken(): string {
 
 export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpServer> {
   const sessions = new Map<string, LocalMcpSession>();   // token -> session
+  /** `<sessionId>\0<名字>` -> 那个被代理的本机 MCP。 */
+  const proxies = new Map<string, StdioProxy>();
+  const stopProxies = (sessionId: string): void => {
+    for (const [k, v] of proxies) {
+      if (k.startsWith(`${sessionId}\u0000`)) { v.stop(); proxies.delete(k); }
+    }
+  };
   const server = http.createServer((req, res) => {
     const url = new URL(req.url || '/', 'http://127.0.0.1');
-    const m = /^\/mcp\/([0-9a-f]{32})$/.exec(url.pathname);
+    /* `/mcp/<token>` = KiroLex 自己那组工具；`/mcp/<token>/<名字>` = 转发本机那个 MCP */
+    const m = /^\/mcp\/([0-9a-f]{32})(?:\/([\w.-]{1,40}))?$/.exec(url.pathname);
     if (!m || !sessions.has(m[1])) {
       /* 不说为什么：能敲到这个端口的东西不该从错误消息里学到 token 的形状 */
       res.writeHead(404).end();
       return;
     }
     const session = sessions.get(m[1])!;
+    const proxyName = m[2];
+    const proxy = proxyName ? proxies.get(`${session.sessionId}\u0000${proxyName}`) : undefined;
+    if (proxyName && !proxy) { res.writeHead(404).end(); return; }
     if (req.method === 'GET') {
       /* 有些客户端会开一条 SSE 通道等服务端主动推。我们没有要推的东西，但也不能报错 —— 挂着即可。 */
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -348,9 +480,11 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
         return;
       }
       try {
+        /* 转发的那些：**原样**送进本机那个 server，把它的答复原样送回 —— 中间不解释语义 */
+        const route = (one: any): Promise<any | null> => (proxy ? proxy.call(one) : handleRpc(one, session, deps));
         const out = Array.isArray(msg)
-          ? (await Promise.all(msg.map((one) => handleRpc(one, session, deps)))).filter(Boolean)
-          : await handleRpc(msg, session, deps);
+          ? (await Promise.all(msg.map(route))).filter(Boolean)
+          : await route(msg);
         if (out === null || (Array.isArray(out) && out.length === 0)) { res.writeHead(202).end(); return; }
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
       } catch (err: any) {
@@ -375,14 +509,27 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
           sessions.set(token, session);
           return token;
         },
+        setProxies(sessionId, specs) {
+          stopProxies(sessionId);
+          for (const spec of specs) {
+            if (!spec?.name || !spec?.command) continue;
+            proxies.set(`${sessionId}\u0000${spec.name}`, new StdioProxy(spec, deps.log));
+          }
+        },
         forget(sessionId) {
           for (const [t, s] of sessions) if (s.sessionId === sessionId) sessions.delete(t);
+          /* 会话没了，那个浏览器也不该继续开着 */
+          stopProxies(sessionId);
         },
         urlPathFor(sessionId) {
           for (const [t, s] of sessions) if (s.sessionId === sessionId) return `/mcp/${t}`;
           return undefined;
         },
-        stop() { try { server.close(); } catch {} },
+        stop() {
+          for (const [, v] of proxies) v.stop();
+          proxies.clear();
+          try { server.close(); } catch {}
+        },
       });
     });
   });

@@ -29,6 +29,7 @@ import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
   remoteAgentScript, removeAgentScript, sessionAgentName,
@@ -1435,7 +1436,7 @@ function sessionNotice(sessionId: string, text: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string }>();
+const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[] }>();
 
 /**
  * 给这条远程会话备好本地工具：登记 token、分配远端端口、在远端写下那条会话专用的 agent。
@@ -1447,7 +1448,7 @@ async function ensureLocalTools(
   sessionId: string,
   profile: AgentProfile,
   localDir: string,
-): Promise<{ remotePort: number; localPort: number; agentOverride: string } | undefined> {
+): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[] } | undefined> {
   const remote = profile.remote;
   if (!remote?.sshHost) return undefined;
   try {
@@ -1492,8 +1493,19 @@ async function ensureLocalTools(
       （见 `remoteAgentScript`）。退到默认时**必须说出来** —— 悄悄换一个 agent 是这条路上
       最贵的静默失败：产出是另一个 agent 干的，而界面一个字都不会说。
     */
+    /*
+      **本机那些 MCP 转发过去** ——「那操作本地的 playwright 和 compute use 呢」。
+      判据在 `forwardMcp`：命令是本机路径的（远端必然起不来、而且是静默少工具），
+      以及按名字就该在本机跑的（`playwright` —— 远端那台没有你在看的那个浏览器）。
+    */
+    const forwardable = profile.kiroAgent ? forwardableFrom(localAgentJson(profile.kiroAgent)) : [];
+    localMcpServer.setProxies(sessionId, forwardable);
+    const forwarded = forwardable.map((f) => ({ name: f.name, url: `${mcpUrl(remotePort, urlPath)}/${f.name}` }));
     const agentOut = await runRemoteCapture(remote,
-      remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath)));
+      remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath), forwarded));
+    if (forwarded.length) {
+      logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${forwarded.map((f) => f.name).join(', ')}`);
+    }
     const usedBase = parseAgentBase(agentOut);
     if (profile.kiroAgent && usedBase === 'default') {
       sessionNotice(sessionId, `⚠️ ${remote.sshHost} 上没有 agent「${profile.kiroAgent}」，`
@@ -1502,7 +1514,10 @@ async function ensureLocalTools(
     } else if (usedBase && usedBase !== 'default') {
       logger.info('localmcp', `远端用它自己的 agent「${usedBase}」做底子 sessionId=${sessionId}`);
     }
-    const spec = { remotePort, localPort: localMcpServer.port(), agentOverride };
+    const spec = {
+      remotePort, localPort: localMcpServer.port(), agentOverride,
+      forwarded: forwarded.map((f) => f.name),
+    };
     localToolsBySession.set(sessionId, spec);
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
     return spec;
@@ -1642,6 +1657,8 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
     remoteDir: entry.cwd,
     localDir: localProjectDirOf(sessionId, entry),
+    /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
+    forwarded: localToolsBySession.get(sessionId)?.forwarded,
   });
 }
 

@@ -419,3 +419,138 @@ describe('模型列表按机器分', () => {
     assert.match(A, /return modelsByMachine\[machine\] \|\| models;/);
   });
 });
+
+/*
+ * 「那操作本地的 playwright 和 compute use 呢」→「都做」。
+ *
+ * 远程会话的 agent 里如果有 `playwright`，它跑的是**远端**那台机器的浏览器（没有显示器，
+ * 你也看不见它点了什么）。而这些 MCP 是 stdio 的，所以 KiroLex 在本机把它们起起来，
+ * 在同一条隧道上多开一个路径 `/mcp/<token>/<名字>` 原样转发 JSON-RPC。
+ */
+describe('把本机的 MCP 转发给远端会话', () => {
+  test('挑谁转发：命令是本机路径的（远端必然起不来），以及按名字就该在本机跑的', async () => {
+    const { forwardableFrom, isLocalPathCommand, FORWARD_BY_NAME } = await import('../src/main/forwardMcp.ts');
+    const picked = forwardableFrom({
+      mcpServers: {
+        /* 本机绝对路径 —— 远端没有这个文件，kiro-cli 不报错、只静默少工具（实测那句
+           「agent aws-agent 缺 MCP 命令：/opt/homebrew/bin/node」） */
+        drawio: { command: '/opt/homebrew/bin/node', args: ['x.js'] },
+        /* 名字白名单：`npx` 远端也有，但它拉起的是**远端**的浏览器 —— 语义问题，命令行里看不出来 */
+        playwright: { command: 'npx', args: ['@playwright/mcp@latest'] },
+        /* 远端自己也能连同一个地址，没有转发的理由 */
+        remote_http: { type: 'http', url: 'https://example.com/mcp' },
+        /* 你自己关掉的 */
+        off: { command: '/usr/local/bin/x', disabled: true },
+        /* 远端自己装了的通用命令：留给远端跑 */
+        builder: { command: 'builder-mcp' },
+      },
+    });
+    assert.deepEqual(picked.map((p) => p.name).sort(), ['drawio', 'playwright']);
+    assert.deepEqual(picked.find((p) => p.name === 'playwright')!.args, ['@playwright/mcp@latest']);
+    assert.equal(isLocalPathCommand('~/x'), true);
+    assert.equal(isLocalPathCommand('npx'), false);
+    assert.ok(FORWARD_BY_NAME.includes('playwright'));
+  });
+
+  test('读不到那份 agent 定义就**不转发**（不猜）', async () => {
+    const { forwardableFrom, localAgentJson } = await import('../src/main/forwardMcp.ts');
+    assert.equal(localAgentJson('这个-agent-不存在'), null);
+    assert.deepEqual(forwardableFrom(null), []);
+    assert.deepEqual(forwardableFrom({}), []);
+  });
+
+  test('**原样转发**：JSON-RPC 进出都不解释语义，id 配对，通知不等回复', async () => {
+    /* 用一个假的 stdio MCP（echo 一个 tools/list）验证整条路：HTTP → 子进程 stdin → stdout → HTTP */
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'fakemcp-'));
+    const fake = path.join(dir, 'fake.js');
+    fs.writeFileSync(fake, [
+      'let buf = "";',
+      'process.stdin.on("data", (d) => {',
+      '  buf += d;',
+      '  let i;',
+      '  while ((i = buf.indexOf("\\n")) >= 0) {',
+      '    const line = buf.slice(0, i); buf = buf.slice(i + 1);',
+      '    if (!line.trim()) continue;',
+      '    const m = JSON.parse(line);',
+      '    if (m.id === undefined) { continue; }',
+      '    process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: m.id, result: { echoed: m.method } }) + "\\n");',
+      '  }',
+      '});',
+    ].join('\n'));
+    const server = await startLocalMcp(deps);
+    try {
+      const token = server.register({ sessionId: 's1', workdir: dir });
+      server.setProxies('s1', [{ name: 'fake', command: process.execPath, args: [fake] }]);
+      const url = `http://127.0.0.1:${server.port()}/mcp/${token}/fake`;
+      const res = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 7, method: 'tools/list' }),
+      });
+      assert.equal(res.status, 200);
+      const body: any = await res.json();
+      assert.equal(body.id, 7, 'id 必须配对回来');
+      assert.deepEqual(body.result, { echoed: 'tools/list' }, '它的答复原样送回，不做任何解释');
+
+      /* 通知：不等回复，回 202 */
+      const note = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', method: 'notifications/initialized' }),
+      });
+      assert.equal(note.status, 202);
+
+      /* 没登记过的名字 → 404（不许泄露"有哪些名字"） */
+      const nope = await fetch(`http://127.0.0.1:${server.port()}/mcp/${token}/nope`, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
+      });
+      assert.equal(nope.status, 404);
+
+      /* 会话作废 → 那个子进程也该停（浏览器不能继续开着） */
+      server.forget('s1');
+      const after = await fetch(url, {
+        method: 'POST', headers: { 'content-type': 'application/json' },
+        body: JSON.stringify({ jsonrpc: '2.0', id: 8, method: 'tools/list' }),
+      });
+      assert.equal(after.status, 404);
+    } finally {
+      server.stop();
+    }
+  });
+
+  test('远端那份 agent 里要有这些转发项，`tools` 白名单也要带上它们', () => {
+    const sc = remoteAgentScript('kirolex-local-s1', 'aws-agent', 'http://127.0.0.1:39100/mcp/tok',
+      [{ name: 'playwright', url: 'http://127.0.0.1:39100/mcp/tok/playwright' }]);
+    assert.match(sc, /KX_FWD='\{"playwright":"http:\/\/127\.0\.0\.1:39100\/mcp\/tok\/playwright"\}'/);
+    const prog = sc.slice(sc.indexOf("python3 -c '") + 12, sc.length - 1);
+    assert.match(prog, /for fname, furl in json\.loads\(os\.environ\.get\("KX_FWD", "\{\}"\)\)\.items\(\)/);
+    /* 白名单里没有 `@playwright` 就是"工具在但调不动"，而且失败是静默的 */
+    assert.match(prog, /tags = \[tag\] \+ \["@" \+ k for k in json\.loads/);
+  });
+
+  test('那段合并程序真跑一遍：转发项进了 mcpServers 和两个白名单', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fwdhome-'));
+    fs.mkdirSync(path.join(home, '.kiro', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.kiro', 'agents', 'a.json'), JSON.stringify({
+      tools: ['fs_read'], allowedTools: ['fs_read'],
+    }));
+    const sc = remoteAgentScript('out', 'a', 'http://127.0.0.1:1/mcp/t',
+      [{ name: 'playwright', url: 'http://127.0.0.1:1/mcp/t/playwright' }]);
+    execFileSync('bash', ['-lc', sc], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
+    const j = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'out.json'), 'utf8'));
+    assert.deepEqual(Object.keys(j.mcpServers).sort(), [MCP_SERVER_NAME, 'playwright'].sort());
+    assert.deepEqual(j.tools, ['fs_read', `@${MCP_SERVER_NAME}`, '@playwright']);
+    assert.deepEqual(j.allowedTools, ['fs_read', `@${MCP_SERVER_NAME}`, '@playwright']);
+  });
+
+  test('接线：按会话登记代理，并在注入里说清"这些作用在用户机器上"', async () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /localMcpServer\.setProxies\(sessionId, forwardable\);/);
+    assert.match(M, /const forwardable = profile\.kiroAgent \? forwardableFrom\(localAgentJson\(profile\.kiroAgent\)\) : \[\];/);
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l', forwarded: ['playwright'] });
+    assert.match(b, /作用在用户那台机器上/);
+    assert.match(b, /playwright/);
+    /* 没有转发时不要凭空多一句 */
+    assert.equal(/作用在用户那台机器上/.test(remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l' })), false);
+  });
+});

@@ -16,6 +16,7 @@
 
 import { localActionHelp } from './localAction.ts';
 import { localToolsHelp } from './remoteLocalTools.ts';
+import { forwardHelp } from './forwardMcp.ts';
 
 export interface RemoteContextInput {
   /** 给人看的机器名（设置里的 label）。 */
@@ -26,6 +27,13 @@ export interface RemoteContextInput {
   localDir: string;
   /** 兼容旧调用点（镜像时代的会话目录），现在不再出现在注入里。 */
   sessionDir?: string;
+  /**
+   * 从用户机器**转发**过来的那些 MCP 的名字（`playwright` 之类）。
+   *
+   * 必须说出来：不说的话它会以为这些工具作用在自己这台机器上 —— 而"我以为我在自己机器上
+   * 点浏览器"是最难看出来的一类错（截图回来的是另一台机器的屏幕）。
+   */
+  forwarded?: string[];
 }
 
 /**
@@ -64,6 +72,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     '· 用户的浏览器在**他自己的机器**上，不在这里。'
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
     localActionHelp(),
+    forwardHelp(input.forwarded || []),
     '· 构建、跑测试、git 提交这些事用 `local_bash`（在**用户机器**上跑，那里才有他的 `node_modules`、'
       + '工具链和仓库）。这台机器上装依赖没有意义 —— 项目不在这儿。',
   ].filter(Boolean).join('\n');

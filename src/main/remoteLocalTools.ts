@@ -73,7 +73,13 @@ export function mcpUrl(remotePort: number, urlPath: string): string {
  * 命令行：agent 名和 URL 都会进 shell，拼字符串迟早在引号上出事。程序里一个单引号都不用，
  * 这样它整段可以安全地待在 `'…'` 里。
  */
-export function remoteAgentScript(sessionAgent: string, baseAgent: string | undefined, url: string): string {
+export function remoteAgentScript(
+  sessionAgent: string,
+  baseAgent: string | undefined,
+  url: string,
+  /** 额外要并进去的 MCP（从本机转发过来的那些）：名字 → 它在远端要敲的 URL。 */
+  forwarded: Array<{ name: string; url: string }> = [],
+): string {
   const program = [
     'import json, os',
     'h = os.path.expanduser("~/.kiro/agents")',
@@ -94,21 +100,27 @@ export function remoteAgentScript(sessionAgent: string, baseAgent: string | unde
     /* 远端那份自己的 MCP **要留着** —— 它们的命令在那台机器上是真的 */
     'cfg["mcpServers"] = dict(src.get("mcpServers") or {})',
     'cfg["mcpServers"][name] = {"type": "http", "url": url}',
+    /* 从本机转发过来的那些（`/mcp/<token>/<名字>`）—— 和上面那条同一个形状 */
+    'for fname, furl in json.loads(os.environ.get("KX_FWD", "{}")).items():',
+    '    cfg["mcpServers"][fname] = {"type": "http", "url": furl}',
     'for k in ("prompt", "model", "resources", "hooks", "toolsSettings", "includeMcpJson", "useLegacyMcpJson"):',
     '    if k in src: cfg[k] = src[k]',
     'tools = src.get("tools")',
+    'tags = [tag] + ["@" + k for k in json.loads(os.environ.get("KX_FWD", "{}")).keys()]',
     'if isinstance(tools, list):',
-    '    cfg["tools"] = tools if ("*" in tools or tag in tools) else (tools + [tag])',
+    /* 白名单里要有它们，否则"工具在但调不动"（而且失败是静默的） */
+    '    cfg["tools"] = tools if "*" in tools else (tools + [t for t in tags if t not in tools])',
     'else:',
     /* 缺 `tools` 字段 = 一个工具都不给（实测：远端回"我手上没有任何可调用的工具"） */
     '    cfg["tools"] = ["*"]',
-    'allowed = src.get("allowedTools") or []',
-    'cfg["allowedTools"] = allowed if tag in allowed else (list(allowed) + [tag])',
+    'allowed = list(src.get("allowedTools") or [])',
+    'cfg["allowedTools"] = allowed + [t for t in tags if t not in allowed]',
     'os.makedirs(h, exist_ok=True)',
     'open(os.path.join(h, out + ".json"), "w").write(json.dumps(cfg, indent=2))',
     'print("KX_AGENT " + (found or "default"))',
   ].join('\n');
-  const env = `KX_OUT=${shq(sessionAgent)} KX_URL=${shq(url)} KX_BASE=${shq(baseAgent || '')}`;
+  const fwd = JSON.stringify(Object.fromEntries(forwarded.map((f) => [f.name, f.url])));
+  const env = `KX_OUT=${shq(sessionAgent)} KX_URL=${shq(url)} KX_BASE=${shq(baseAgent || '')} KX_FWD=${shq(fwd)}`;
   return `mkdir -p ~/.kiro/agents && ${env} python3 -c '${program}'`;
 }
 
