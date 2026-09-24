@@ -52,7 +52,7 @@ declare global {
       setRemoteTarget?: (sessionId: string, remoteId: string | null, localDir?: string) =>
         Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
       /** 只换工作目录，机器不变（会话界面上那个 📂）。 */
-      setWorkdir?: (sessionId: string, dir: string) =>
+      setWorkdir?: (sessionId: string, dir: string | string[]) =>
         Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
       /** 某条会话的运行位置/工作目录变了 —— 徽标、菜单那句话、会话里那个 📂 都靠它更新。 */
       onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => () => void;
@@ -399,6 +399,13 @@ export interface Session {
    * 被镜像的那一个目录，所以"它读哪棵树"不该是要靠猜的事。
    */
   localDir?: string;
+  /**
+   * **其余选中的目录**（`localDir` 是第一个，不重复放在这里）——「应该可以设置多个」。
+   *
+   * 输入框下面那排 📂 一格一个目录：这件事不能只存在于记录里，因为"它能动哪几棵树"是
+   * 每一轮都在生效的事实，看不见就只能靠猜（远程会话读不到文件那次就是这么来的）。
+   */
+  localDirs?: string[];
   /** User-archived: hidden from the main list into a collapsible Archived group. */
   archived?: boolean;
   folderId?: string | null; // legacy — retained for back-compat, no longer surfaced
@@ -2946,15 +2953,39 @@ const App: React.FC = () => {
    * 走 `setWorkdir` 而不是 `setRemoteTarget`：机器不变这件事由主进程按记录保证，渲染层不参与
    * （它手里只有 label，反查不到就会传 null 过去 —— 那是"切回本地"）。
    */
-  const pickWorkdir = async (sid: string | null): Promise<void> => {
-    if (!sid) return;
+  const applyWorkdirs = async (sid: string, dirs: string | string[]): Promise<void> => {
     const api = (window as any).kiroApi;
-    const picked = await api?.remotePickDir?.();
-    if (!picked?.path) return;
-    const r = await api?.setWorkdir?.(sid, picked.path)
+    const r = await api?.setWorkdir?.(sid, dirs)
       .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
     if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '设置工作目录失败'));
+  };
+
+  /** 换**主目录**（`local_bash` 的 cwd）。附加目录不动 —— 所以传字符串而不是数组。 */
+  const pickWorkdir = async (sid: string | null): Promise<void> => {
+    if (!sid) return;
+    const picked = await (window as any).kiroApi?.remotePickDir?.();
+    if (!picked?.path) return;
+    await applyWorkdirs(sid, picked.path);
+  };
+
+  /** 再加一个目录。整份清单一起发（第一个仍是主目录）。 */
+  const addWorkdir = async (sid: string | null): Promise<void> => {
+    if (!sid) return;
+    const picked = await (window as any).kiroApi?.remotePickDir?.();
+    if (!picked?.path) return;
+    const cur = sessions.find((x) => x.id === sid);
+    const list = [cur?.localDir || '', ...(cur?.localDirs || []), picked.path].filter(Boolean);
+    if (!cur?.localDir) { await applyWorkdirs(sid, picked.path); return; }
+    await applyWorkdirs(sid, Array.from(new Set(list)));
+  };
+
+  /** 去掉一个附加目录。主目录去不掉（它是 cwd）—— 要换主目录点第一格。 */
+  const removeWorkdir = async (sid: string | null, dir: string): Promise<void> => {
+    if (!sid || !dir) return;
+    const cur = sessions.find((x) => x.id === sid);
+    if (!cur?.localDir || dir === cur.localDir) return;
+    await applyWorkdirs(sid, [cur.localDir, ...(cur.localDirs || []).filter((d) => d !== dir)]);
   };
 
   const renderPane = (sid: string | null, wantFocused: boolean, withHeader: boolean, paneStyle?: React.CSSProperties) => {
@@ -3036,6 +3067,9 @@ const App: React.FC = () => {
         remoteHost={session?.remoteHost}
         /* 这条会话在哪棵树上干活 —— 常驻显示在输入框下面那一排，点它换目录 */
         workdir={session?.localDir}
+        workdirs={session?.localDir ? [session.localDir, ...(session.localDirs || [])] : []}
+        onAddWorkdir={() => { void addWorkdir(sid); }}
+        onRemoveWorkdir={(d: string) => { void removeWorkdir(sid, d); }}
         onPickWorkdir={() => { void pickWorkdir(sid); }}
         kiroAgent={session?.kiroAgent || selectedKiroAgent}
         kiroAgents={kiroAgents}

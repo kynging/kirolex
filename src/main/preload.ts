@@ -368,8 +368,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *
    * 不复用 `setRemoteTarget`：那个要 `remoteId`，而渲染层手里只有 label，按 label 反查一旦查不到
    * 就会传 `null` 过去 —— 那是"切回本地"。改个目录顺手把会话切下远端，属于改完很久才发现的错。
+   *
+   * **给数组 = 整份清单**（第一个是主目录，也就是 `local_bash` 的 cwd）；给字符串 = 只换主目录，
+   * 其余目录留着不动。两种都要有：换主目录和增删附加目录是两个不同的动作。
    */
-  setWorkdir: (sessionId: string, dir: string) =>
+  setWorkdir: (sessionId: string, dir: string | string[]) =>
     ipcRenderer.invoke('acp:set-workdir', sessionId, dir),
   /**
    * **KiroLex 自己对你说的一句话**（推/拉进度、冲突、换机器…）。

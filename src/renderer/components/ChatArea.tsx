@@ -2300,8 +2300,17 @@ interface ChatAreaProps {
   remoteHost?: string;
   /** 这条会话在哪棵树上干活（记录为准）。远程会话显示的仍是**本地**那个路径。 */
   workdir?: string;
-  /** 换工作目录（Finder 选目录 → 换执行器）。 */
+  /**
+   * 这条会话**选中的全部目录**（第一个是主目录）——「应该可以设置多个，页面下面的文件夹
+   * 直接显示哪几个文件夹被选中就行了」。空数组 = 还没定。
+   */
+  workdirs?: string[];
+  /** 换**主目录**（Finder 选目录 → 换执行器）。 */
   onPickWorkdir?: () => void;
+  /** 再加一个目录。 */
+  onAddWorkdir?: () => void;
+  /** 去掉一个附加目录（主目录去不掉 —— 它是 `local_bash` 的 cwd）。 */
+  onRemoveWorkdir?: (dir: string) => void;
   kiroAgent: string;
   kiroAgents: KiroAgentOption[];
   switchingAgent: boolean;
@@ -2421,6 +2430,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   remoteHost,
   workdir,
   onPickWorkdir,
+  workdirs,
+  onAddWorkdir,
+  onRemoveWorkdir,
   kiroAgent,
   kiroAgents,
   switchingAgent,
@@ -2484,12 +2496,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * 那个 id 当名字没有任何信息量，所以直接说「会话目录」，并在 title 里说清它读不到别处的文件。
    */
   const inSessionDir = !!workdir && /\/\.kirolex\/sessions\//.test(workdir);
-  const workdirLabel = !workdir
-    ? '工作目录…'
-    : (inSessionDir ? '会话目录' : (workdir.split('/').filter(Boolean).pop() || workdir));
+  /** 一格上的字：basename（会话目录那种 id 没有信息量，直接说「会话目录」）。 */
+  const dirLabel = (d: string): string => (/\/\.kirolex\/sessions\//.test(d)
+    ? '会话目录'
+    : (d.split('/').filter(Boolean).pop() || d));
+  const workdirLabel = !workdir ? '工作目录…' : dirLabel(workdir);
+  /* 主目录排第一。`workdirs` 没传（老调用点）就退回单个目录，不至于一格都不显示。 */
+  const dirList = (workdirs && workdirs.length ? workdirs : (workdir ? [workdir] : []));
   const workdirTitle = `工作目录：${workdir || '（还没定 —— 点这里选一个）'}`
     + (remoteHostLabel
-      ? `\n${remoteHostLabel} 上只看得见这棵树（每一轮前后自动同步镜像），别处的文件它读不到。`
+      /* 镜像没了：远端根本没有副本，它是通过反向隧道读**你机器上**这一份（`localMcp.ts`） */
+      ? `\n${remoteHostLabel} 上的那个进程通过隧道读**你机器上**这几棵树（没有副本、不同步）。`
       : '')
     + (inSessionDir
       ? '\n这是这条会话自己的目录 —— 选一个项目目录，它就能读写那棵树。'
@@ -3868,14 +3885,50 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     **不在跑的时候禁用**：换目录会换执行器（那一轮会断），但这正是你想改它的时候
                     ——「这些右键菜单应该优先级大于正在跑的任务」。而且点它先弹 Finder，误触也停得下来。
                   */}
-                  <button
-                    className="composer-meta-btn composer-workdir"
-                    onClick={() => onPickWorkdir?.()}
-                    disabled={!currentSessionId || !onPickWorkdir}
-                    title={workdirTitle}
-                  >
-                    📂 <span className="composer-meta-label">{workdirLabel}</span>
-                  </button>
+                  {/*
+                    **一格一个目录** ——「页面下面的文件夹直接显示哪几个文件夹被选中就行了」。
+
+                    第一格是主目录（`local_bash` 的 cwd、相对路径的基准），点它 = 换主目录；
+                    后面几格右边有个 ✕ = 去掉那一个；最后一个 ＋ = 再加一个。
+                    主目录没有 ✕：去掉 cwd 就得同时指定新的 cwd，那是"换"而不是"删"。
+                  */}
+                  {dirList.length === 0 ? (
+                    <button
+                      className="composer-meta-btn composer-workdir"
+                      onClick={() => onPickWorkdir?.()}
+                      disabled={!currentSessionId || !onPickWorkdir}
+                      title={workdirTitle}
+                    >
+                      📂 <span className="composer-meta-label">工作目录…</span>
+                    </button>
+                  ) : dirList.map((d, i) => (
+                    <span key={d} className="composer-workdir-chip">
+                      <button
+                        className="composer-meta-btn composer-workdir"
+                        onClick={() => (i === 0 ? onPickWorkdir?.() : undefined)}
+                        disabled={!currentSessionId || (i === 0 && !onPickWorkdir)}
+                        title={i === 0 ? workdirTitle : `${d}\n（附加目录：local_glob / local_grep 不指定目录时也会搜它）`}
+                      >
+                        📂 <span className="composer-meta-label">{dirLabel(d)}</span>
+                      </button>
+                      {i > 0 && onRemoveWorkdir ? (
+                        <button
+                          className="composer-workdir-x"
+                          onClick={() => onRemoveWorkdir(d)}
+                          disabled={!currentSessionId}
+                          title={`不再让这条会话动 ${d}`}
+                        >✕</button>
+                      ) : null}
+                    </span>
+                  ))}
+                  {dirList.length > 0 && onAddWorkdir ? (
+                    <button
+                      className="composer-meta-btn composer-workdir-add"
+                      onClick={() => onAddWorkdir()}
+                      disabled={!currentSessionId}
+                      title="再加一个目录 —— 这条会话就能同时动这几棵树"
+                    >＋</button>
+                  ) : null}
                 </div>
 
                 <div className="composer-belowbar-right">

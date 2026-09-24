@@ -90,6 +90,8 @@ interface SessionEntry {
    * 所以不设也不会错 —— 但设上之后就不用在每个用点再判一次"这是远程吗"。
    */
   localDir?: string;
+  /** 这条会话选中的**其余**目录（`localDir` 是第一个，不重复放在这里）。 */
+  localDirs?: string[];
   /** accumulates the in-flight assistant response; flushed to the durable
    *  store only when the turn completes (asymmetric durability, §7). */
   assistantBuf: string;
@@ -1459,7 +1461,16 @@ async function ensureLocalTools(
       });
     }
     const agentOverride = sessionAgentName(sessionId);
-    const token = localMcpServer.register({ sessionId, workdir: localDir });
+    /*
+      **额外目录从记录里现查**，而不是当参数一路传下来：`ensureLocalTools` 有 6 个调用点
+      （新建 / attach / 换目标 / 换 agent / 换模型 / 换权限），漏传一个的表现是"那条会话
+      突然只搜第一个目录了" —— 不报错，只是搜不全。记录是真相，就在这里读它。
+    */
+    const extra = store.readRecord(sessionId)?.localDirs || [];
+    const dirs = [localDir, ...extra]
+      .map((d) => String(d || '').replace(/\/+$/, ''))
+      .filter((d, i, a) => d && a.indexOf(d) === i);
+    const token = localMcpServer.register({ sessionId, workdir: localDir, dirs });
     const urlPath = localMcpServer.urlPathFor(sessionId) || `/mcp/${token}`;
     /*
       **端口要在任何 await 之前就占住** —— 实测：启动时两条远程会话并行 attach，两边都在
@@ -1657,6 +1668,7 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
     remoteDir: entry.cwd,
     localDir: localProjectDirOf(sessionId, entry),
+    localDirs: localDirsOf(sessionId, entry),
     /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
   });
@@ -1700,6 +1712,19 @@ function localDirOrSessionDir(sessionId: string, candidate?: string): string {
 function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
   if (entry.localDir) return entry.localDir;
   return entry.profile.remote?.sshHost ? getSessionDir(sessionId) : entry.cwd;
+}
+
+/**
+ * 这条会话**能动的全部目录**，主目录排第一 ——「会话目录应该可以设置多个」。
+ *
+ * 去重并去掉空串：重复的目录会让 `local_grep` 把同一棵树搜两遍（结果翻倍，看起来像匹配变多了），
+ * 而空串传给 `find` 会被当成当前目录 —— 两种都不报错，所以只能在这里挡住。
+ */
+function localDirsOf(sessionId: string, entry: { localDir?: string; localDirs?: string[]; cwd: string; profile: AgentProfile }): string[] {
+  const primary = localProjectDirOf(sessionId, entry);
+  return [primary, ...(entry.localDirs || [])]
+    .map((d) => String(d || '').replace(/\/+$/, ''))
+    .filter((d, i, a) => d && a.indexOf(d) === i);
 }
 
 /**
@@ -5395,6 +5420,12 @@ app.whenReady().then(async () => {
     sessionId: string,
     target: RemoteTarget | undefined,
     localDir?: string,
+    /**
+     * **其余目录** ——「会话目录应该可以设置多个」。`undefined` = 不改（换机器那条路不该顺手
+     * 把目录清单清空）；`[]` = 明确只留主目录。这两件事必须分得开，否则"换个远端"会静默
+     * 丢掉用户选的另外几个目录，而界面上要过一会儿才看出来。
+     */
+    extraDirs?: string[],
   ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
     const oldEntry = sessionClients.get(sessionId);
     /*
@@ -5417,7 +5448,10 @@ app.whenReady().then(async () => {
     */
     const dirChanged = !!localDir
       && localDir !== (store.readRecord(sessionId)?.localDir || oldEntry?.localDir || '');
-    if ((target?.sshHost || '') === currentRemote && !dirChanged) return { ok: true, unchanged: true };
+    /* 清单变了也算变化：只加/删一个附加目录时主目录没动，短路写成只看主目录会把这次改动吞掉 */
+    const listChanged = !!extraDirs
+      && extraDirs.join('\u0000') !== (rec0?.localDirs || oldEntry?.localDirs || []).join('\u0000');
+    if ((target?.sshHost || '') === currentRemote && !dirChanged && !listChanged) return { ok: true, unchanged: true };
 
     /*
       **切回本地不再需要"先把远端的改动拉回来"** —— 镜像没了（见 `localMcp.ts`）：远端从来没有
@@ -5438,6 +5472,10 @@ app.whenReady().then(async () => {
       sessionId,
       localDir || rec0?.localDir || oldEntry?.localDir,
     );
+    /* 主目录不重复出现在清单里（`localDirsOf` 会把它排第一） */
+    const nextExtraDirs = (extraDirs ?? rec0?.localDirs ?? oldEntry?.localDirs ?? [])
+      .map((d) => String(d || '').replace(/\/+$/, ''))
+      .filter((d, i, a) => d && d !== nextLocalDir && a.indexOf(d) === i);
     /* 家目录那道闸随镜像一起去掉了：没有东西会被推走 */
 
     const hostLabelOf = (t?: RemoteTarget): string | null =>
@@ -5451,12 +5489,13 @@ app.whenReady().then(async () => {
       const rec = rec0!;
       rec.profile = { ...rec.profile, remote: target ? { ...target } : undefined } as AgentProfile;
       rec.localDir = nextLocalDir;
+      rec.localDirs = nextExtraDirs;
       store.writeRecord(rec);
       const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
       sessionNotice(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
         + `它现在没有连着，所以没有执行器要换；对话一条都没动。`);
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
-      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
+      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir, localDirs: nextExtraDirs });
       return { ok: true, remoteHost: hostLabelOf(target), cold: true };
     }
 
@@ -5483,6 +5522,7 @@ app.whenReady().then(async () => {
           profile,
           cwd: cliCwd,
           localDir: nextLocalDir,
+          localDirs: nextExtraDirs,
           assistantBuf: '',
           assistantMsgId: null,
           fileChanges: [],
@@ -5497,6 +5537,7 @@ app.whenReady().then(async () => {
         rec.profile = profile;
         rec.cliSessionId = made.sessionId;
         rec.localDir = nextLocalDir;
+        rec.localDirs = nextExtraDirs;
         rec.executorState = 'attached';
         store.writeRecord(rec);
         clearContextEstablished(sessionId);
@@ -5508,7 +5549,7 @@ app.whenReady().then(async () => {
           + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`
           + (interrupted ? `\n（切换打断了正在跑的那一轮 —— 已产出的内容都在，未完成的那部分没了，需要的话重发一次。）` : ''));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
-        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
+        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir, localDirs: nextExtraDirs });
         return { ok: true, remoteHost: hostLabelOf(target) };
       } catch (err) {
         try { await client.disconnect(); } catch {}
@@ -5540,11 +5581,24 @@ app.whenReady().then(async () => {
    * 当前的机器从**记录/执行器**里拿（`profile.remote` 存的就是整份目标），不让渲染层参与 ——
    * 渲染层只有 label，按 label 反查一旦查不到就会退化成"切回本地"。
    */
-  ipcMain.handle('acp:set-workdir', async (_event, sessionId: string, dir: string) => {
-    if (!dir || !path.isAbsolute(dir)) throw new Error('工作目录要写绝对路径。');
+  /*
+    **收一个数组**（第一个是主目录）——「会话目录那个功能不对，应该可以设置多个」。
+    仍然接受单个字符串：那是"只换主目录、别动其余的"，`extraDirs` 传 `undefined` 表达
+    「不改清单」—— 和传 `[]`（明确只留主目录）是两件不同的事。
+  */
+  ipcMain.handle('acp:set-workdir', async (_event, sessionId: string, dir: string | string[]) => {
+    const list = (Array.isArray(dir) ? dir : [dir]).map((d) => String(d || '').trim()).filter(Boolean);
+    if (!list.length) throw new Error('至少要给一个目录。');
+    const bad = list.find((d) => !path.isAbsolute(d));
+    if (bad) throw new Error(`工作目录要写绝对路径（\`${bad}\` 不是）。`);
     const current = sessionClients.get(sessionId)?.profile.remote
       || store.readRecord(sessionId)?.profile?.remote;
-    return applySessionTarget(sessionId, current?.sshHost ? current : undefined, dir);
+    return applySessionTarget(
+      sessionId,
+      current?.sshHost ? current : undefined,
+      list[0],
+      Array.isArray(dir) ? list.slice(1) : undefined,
+    );
   });
 
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
@@ -6905,6 +6959,8 @@ app.whenReady().then(async () => {
        * 恰恰是远程会话最容易搞错的一件事（远端只看得见被镜像的那一个目录）。
        */
       ...(rec.localDir ? { localDir: rec.localDir } : null),
+      /* 附加目录也要过来：会话界面下面那排 📂 显示的就是它（不列进来会被白名单丢掉） */
+      ...(rec.localDirs?.length ? { localDirs: rec.localDirs } : null),
     }));
   });
 

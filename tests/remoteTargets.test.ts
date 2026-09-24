@@ -965,13 +965,15 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     assert.match(body, /if \(!oldEntry\) \{/);
     assert.match(body, /这条会话下次打开会跑在\*\*\$\{where\}\*\*上/);
     /* 冷路径只改记录 */
-    assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*store\.writeRecord\(rec\);/);
+    assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*rec\.localDirs = nextExtraDirs;\s*\n\s*store\.writeRecord\(rec\);/);
   });
 
 
   test('两条路都把新位置发给界面（事件里带 remoteHost + 工作目录）', () => {
     /* 工作目录也在事件里：会话界面上那个 📂 显示的就是它，换完必须当场变 */
-    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir \}/g) || [];
+    /* 目录**清单**也在事件里：加/删一个附加目录之后那一排 📂 必须当场变，
+       否则要等下一次会话列表刷新才看得见 —— 看起来就是"点了没反应"。 */
+    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir, localDirs: nextExtraDirs \}/g) || [];
     assert.equal(sent.length, 2, `只有 ${sent.length} 处发了完整的新位置`);
   });
 
@@ -979,9 +981,9 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
     const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
     assert.match(P, /onTargetsChanged:/);
-    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; localDir\?: string \}\)/);
+    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; localDir\?: string; localDirs\?: string\[\] \}\)/);
     /* 徽标、右键菜单那句话、会话界面上那个 📂 看的是同一份状态，所以改一处就够 */
-    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, localDir: d\.localDir \|\| s\.localDir \}/);
+    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, localDir: d\.localDir \|\| s\.localDir, localDirs: d\.localDirs \?\? s\.localDirs \}/);
   });
 });
 
@@ -1149,7 +1151,10 @@ describe('工作目录 / 不要推两遍', () => {
 
   test('只换目录也算变化 —— 短路不能只看目标', () => {
     assert.match(M, /const dirChanged = !!localDir/);
-    assert.match(M, /if \(\(target\?\.sshHost \|\| ''\) === currentRemote && !dirChanged\) return \{ ok: true, unchanged: true \};/);
+    /* 清单变了同样算：加/删一个附加目录时主目录没动，只看主目录会把这次改动整个吞掉
+       —— 表现是"点了没反应"，而记录和界面还都是旧的。 */
+    assert.match(M, /const listChanged = !!extraDirs/);
+    assert.match(M, /=== currentRemote && !dirChanged && !listChanged\) return \{ ok: true, unchanged: true \};/);
   });
 });
 
@@ -1180,7 +1185,9 @@ describe('工作目录在会话界面上', () => {
 
   test('没归项目的会话说「会话目录」，不是那个没有信息量的 session id', () => {
     assert.match(CA, /const inSessionDir = !!workdir && \/\\\/\\\.kirolex\\\/sessions\\\/\/\.test\(workdir\)/);
-    assert.match(CA, /inSessionDir \? '会话目录'/);
+    /* 每一格都要走同一个判断 —— 附加目录也可能是某条会话的目录 */
+    assert.match(CA, /const dirLabel = \(d: string\): string =>/);
+    assert.match(CA, /\? '会话目录'/);
     /* 并且要说清它读不到别处的文件 —— 这才是人下一步要做的判断 */
     assert.match(CA, /选一个项目目录，它就能读写那棵树/);
   });
@@ -1192,17 +1199,17 @@ describe('工作目录在会话界面上', () => {
   });
 
   test('**只换目录不许动机器** —— 单独一个 IPC，当前目标由主进程从记录里取', () => {
-    assert.match(P, /setWorkdir: \(sessionId: string, dir: string\) =>/);
-    assert.match(M, /ipcMain\.handle\('acp:set-workdir', async \(_event, sessionId: string, dir: string\) => \{/);
+    assert.match(P, /setWorkdir: \(sessionId: string, dir: string \| string\[\]\) =>/);
+    assert.match(M, /ipcMain\.handle\('acp:set-workdir', async \(_event, sessionId: string, dir: string \| string\[\]\) => \{/);
     /* 关键的一行：机器从记录/执行器来。渲染层手里只有 label，按 label 反查一旦查不到就会传 null，
        而 null 的意思是"切回本地" —— 只想换个目录，结果把会话从远端切了下来。 */
     assert.match(M, /const current = sessionClients\.get\(sessionId\)\?\.profile\.remote/);
-    assert.match(M, /applySessionTarget\(sessionId, current\?\.sshHost \? current : undefined, dir\)/);
+    assert.match(M, /current\?\.sshHost \? current : undefined,/);
     /* 渲染层这条路也不许再碰 setRemoteTarget */
     const at = A.indexOf('const pickWorkdir');
     const body = A.slice(at, at + 700);
     assert.ok(at > 0);
-    assert.match(body, /api\?\.setWorkdir\?\.\(sid, picked\.path\)/);
+    assert.match(body, /applyWorkdirs\(sid, picked\.path\)/);
     assert.equal(/setRemoteTarget/.test(body), false, '换目录不该走换机器那个入口');
   });
 
@@ -1210,6 +1217,8 @@ describe('工作目录在会话界面上', () => {
     assert.match(M, /const applySessionTarget = async \(/);
     assert.equal((M.match(/const applySessionTarget = async \(/g) || []).length, 1);
     assert.match(M, /return applySessionTarget\(sessionId, target, localDir\);/);
+    /* 换目录那条路多传一个 `extraDirs`，但仍然是同一段机械 */
+    assert.match(M, /Array\.isArray\(dir\) \? list\.slice\(1\) : undefined,/);
   });
 });
 

@@ -147,10 +147,19 @@ export function removeAgentScript(name: string): string {
  * 而"找不到"会被它解释成"这个东西不存在"，然后基于错误结论往下做 —— 这是远程会话里
  * 最贵的一类错，之前已经踩过一次（`remoteContext`）。
  */
-export function localToolsHelp(localDir: string): string {
+export function localToolsHelp(localDir: string | string[]): string {
+  /* 多目录 ——「会话目录应该可以设置多个」。第一个是 cwd（相对路径和 `local_bash` 以它为准），
+     其余也要**列出来**：不列的话它只会在第一个里找，然后把"没找到"当成"没有这个东西"。 */
+  const dirs = (Array.isArray(localDir) ? localDir : [localDir]).filter((d) => String(d || '').trim());
+  const primary = dirs[0] || '';
+  const rest = dirs.slice(1);
   return `· **用户的文件在他自己那台机器上，不在这里。** 你有一组直连他机器的工具`
-    + `（\`local_read\` / \`local_write\` / \`local_glob\` / \`local_grep\` / \`local_git\` / \`local_bash\`）——`
-    + `工作目录是 \`${localDir}\`（那是**他机器上**的路径）。`
+    + `（\`local_read\` / \`local_write\` / \`local_glob\` / \`local_git\` / \`local_grep\` / \`local_bash\`）——`
+    + `工作目录是 \`${primary}\`（那是**他机器上**的路径）`
+    + (rest.length
+      ? `，这条会话还带着另外 ${rest.length} 个目录：${rest.map((d) => `\`${d}\``).join('、')}`
+        + `（\`local_glob\` / \`local_grep\` 不指定目录时会把**这几棵树一起**搜掉）。`
+      : '。')
     + `读文件、改文件、跑构建和测试都用这些工具，不要在这台机器上找他的项目。`
     + `每次往返大约 200 毫秒，所以 \`local_read\` 一次把要读的文件都给上，别一个一个读。`;
 }

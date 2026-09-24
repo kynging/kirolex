@@ -1315,11 +1315,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 界面停在旧值上，直到下一次整页水化。
    */
   useEffect(() => {
-    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
+    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string; localDirs?: string[] }) => {
       if (!d?.sessionId) return;
       setSessions((prev) => prev.map((s) => (s.id === d.sessionId
         /* 工作目录也在这个事件里 —— 会话界面上那个 📂 显示的就是它，换完必须当场变 */
-        ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir }
+        ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir, localDirs: d.localDirs ?? s.localDirs }
         : s)));
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
@@ -1609,6 +1609,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 remoteHost: rec.remoteHost ?? (existing as any).remoteHost,
                 /* 工作目录同理：白名单里不列就会被丢掉，而会话界面上那个 📂 显示的就是它 */
                 localDir: rec.localDir ?? (existing as any).localDir,
+                /* 附加目录同理 —— 下面那排 📂 一格一个目录 */
+                localDirs: rec.localDirs ?? (existing as any).localDirs,
               });
             } else {
               byId.set(rec.id, {
@@ -1623,6 +1625,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 kiroAgent: rec.kiroAgent,
                 remoteHost: rec.remoteHost,
                 localDir: rec.localDir,
+                localDirs: rec.localDirs,
                 timestamp: rec.updatedAt,
               });
             }

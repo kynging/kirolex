@@ -5,7 +5,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  handleRpc, callTool, toolDefs, startLocalMcp, newToken,
+  handleRpc, callTool, toolDefs, startLocalMcp, newToken, sessionRoots,
   GIT_READONLY, MAX_READ_BYTES, MCP_PROTOCOL_VERSION,
 } from '../src/main/localMcp.ts';
 import {
@@ -552,5 +552,128 @@ describe('把本机的 MCP 转发给远端会话', () => {
     assert.match(b, /playwright/);
     /* 没有转发时不要凭空多一句 */
     assert.equal(/作用在用户那台机器上/.test(remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l' })), false);
+  });
+});
+
+/*
+ * 「会话目录那个功能不对，应该可以设置多个，页面下面的文件夹直接显示哪几个文件夹被选中就行了」。
+ *
+ * 一个目录的时候这件事看不出来，多目录之后漏搜是**静默**的：`local_grep` 只搜第一棵树，
+ * 回一句"没有匹配"，而模型会把它读成"这个东西不存在"然后往下推。所以默认范围必须是全部。
+ */
+describe('会话可以选多个目录', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+  const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+
+  test('不填就等于只有主目录（老会话不受影响）', () => {
+    assert.deepEqual(sessionRoots({ sessionId: 's', workdir: '/a' }), ['/a']);
+    assert.deepEqual(sessionRoots({ sessionId: 's', workdir: '/a', dirs: [] }), ['/a']);
+    /* 空串会被 `find` 当成当前目录 —— 不报错，所以只能在这里挡掉 */
+    assert.deepEqual(sessionRoots({ sessionId: 's', workdir: '/a', dirs: ['/a', ' '] }), ['/a']);
+  });
+
+  test('`local_grep` / `local_glob` 不指定目录时搜**全部**（一次调用，不是每个目录一次）', async () => {
+    const base = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-multidir-'));
+    const one = path.join(base, 'one');
+    const two = path.join(base, 'two');
+    fs.mkdirSync(one); fs.mkdirSync(two);
+    fs.writeFileSync(path.join(one, 'a.txt'), 'needle here\n');
+    fs.writeFileSync(path.join(two, 'b.txt'), 'needle there\n');
+    const deps = { log: () => {}, notice: () => {} };
+    const session = { sessionId: 's', workdir: one, dirs: [one, two] };
+
+    const grep = await callTool('local_grep', { query: 'needle' }, session, deps);
+    const gtext = grep.content[0].text;
+    assert.match(gtext, /a\.txt/);
+    assert.match(gtext, /b\.txt/, '第二棵树也要搜到 —— 漏掉它是静默的');
+
+    const glob = await callTool('local_glob', { pattern: '*.txt' }, session, deps);
+    const btext = glob.content[0].text;
+    assert.match(btext, /a\.txt/);
+    assert.match(btext, /b\.txt/);
+
+    /* 指定了 `dir` 就只搜那一个 —— 模型要缩小范围时得说得通 */
+    const only = await callTool('local_grep', { query: 'needle', dir: two }, session, deps);
+    assert.equal(/a\.txt/.test(only.content[0].text), false);
+    fs.rmSync(base, { recursive: true, force: true });
+  });
+
+  test('注入里把那几个目录列出来，并说清默认搜全部', () => {
+    const help = localToolsHelp(['/Users/me/proj', '/Users/me/other']);
+    assert.match(help, /\/Users\/me\/proj/);
+    assert.match(help, /\/Users\/me\/other/, '不列出来它只会在第一个里找');
+    assert.match(help, /这几棵树一起/);
+    /* 单个目录时不要凭空多一句"另外 0 个目录" */
+    assert.equal(/另外/.test(localToolsHelp('/Users/me/proj')), false);
+  });
+
+  test('附加目录从**记录**里现查，不靠 6 个调用点各传一遍', () => {
+    /* 漏传一个的表现是"那条会话突然只搜第一个目录了" —— 不报错，只是搜不全 */
+    assert.match(M, /const extra = store\.readRecord\(sessionId\)\?\.localDirs \|\| \[\];/);
+    assert.match(M, /localMcpServer\.register\(\{ sessionId, workdir: localDir, dirs \}\)/);
+    /* 注入那一份也要是全的 */
+    assert.match(M, /localDirs: localDirsOf\(sessionId, entry\),/);
+  });
+
+  test('`undefined` = 不改清单，`[]` = 只留主目录（换机器不该顺手清空）', () => {
+    assert.match(M, /Array\.isArray\(dir\) \? list\.slice\(1\) : undefined,/);
+    assert.match(M, /extraDirs \?\? rec0\?\.localDirs \?\? oldEntry\?\.localDirs \?\? \[\]/);
+    /* 主目录不重复出现在清单里（`localDirsOf` 会把它排第一） */
+    assert.match(M, /\.filter\(\(d, i, a\) => d && d !== nextLocalDir && a\.indexOf\(d\) === i\)/);
+  });
+
+  test('输入框下面一格一个目录：点第一格换主目录、✕ 去掉附加的、＋ 再加一个', () => {
+    assert.match(CA, /dirList\.map\(\(d, i\) =>/);
+    assert.match(CA, /onClick=\{\(\) => \(i === 0 \? onPickWorkdir\?\.\(\) : undefined\)\}/);
+    assert.match(CA, /i > 0 && onRemoveWorkdir/, '主目录没有 ✕ —— 去掉 cwd 是"换"不是"删"');
+    assert.match(CA, /composer-workdir-add/);
+    /* 老调用点没传 `workdirs` 时退回单个目录，不至于一格都不显示 */
+    assert.match(CA, /workdirs && workdirs\.length \? workdirs : \(workdir \? \[workdir\] : \[\]\)/);
+  });
+
+  test('渲染层：加是整份清单一起发，删只摘掉那一个', () => {
+    assert.match(A, /const addWorkdir = async/);
+    assert.match(A, /Array\.from\(new Set\(list\)\)/, '选到已经在里面的目录不该重复一条');
+    assert.match(A, /const removeWorkdir = async/);
+    assert.match(A, /if \(!cur\?\.localDir \|\| dir === cur\.localDir\) return;/, '主目录删不掉');
+    assert.match(A, /workdirs=\{session\?\.localDir \? \[session\.localDir, \.\.\.\(session\.localDirs \|\| \[\]\)\] : \[\]\}/);
+  });
+});
+
+/*
+ * 「我让 agent 测本地 playwright 它找不到」——**工具都在，它没看**。
+ *
+ * 实测那条远程会话（`kirolex-local-s_mc_1_…`）：远端 curl 那个 URL，`kirolex-local` 和
+ * `playwright` 两个 endpoint 都回了正常的 `initialize`（`serverInfo: Playwright 1.64.0`）；
+ * 用同一份 agent、同一个模型单独跑一次 ACP，工具清单里 `browser_*`（20 个）和
+ * `local_read/write/grep` 全都在。而 app 里那条会话连着三轮回答"我拿不到这些工具"，
+ * **一次调用都没试**。
+ *
+ * 原因在随消息带过去的那几万字符里：历史和 memory 全是**镜像时代**的记录 ——
+ * "我在 /home/ec2-user/kirolex-mirror"、"你的 /Users/... 路径都不存在"、
+ * "5 个调用有 4 个被路径校验拦掉"。它信了历史，没看工具清单。
+ *
+ * 这类错最贵的地方是它**看起来像故障**：用户以为转发断了，于是去查隧道、查 MCP、重启 ——
+ * 而那一层全是好的。所以注入必须显式地把旧结论作废。
+ */
+describe('别拿历史里的结论判断自己有没有工具', () => {
+  test('注入里明说：看这一轮的工具清单，镜像时代那些话不成立', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r', localDir: '/l' });
+    assert.match(b, /看你这一轮的工具清单/);
+    assert.match(b, /不要根据对话历史推断/);
+    /* 把历史里那几句原话点出来 —— 泛泛说"历史可能过时"它认不出来指的是哪几句 */
+    assert.match(b, /镜像目录/);
+    assert.match(b, /路径校验/);
+    assert.match(b, /现在不成立/);
+    /* 并且给出比"回一句我没有这个工具"更便宜的做法 */
+    assert.match(b, /直接调一次就知道了/);
+  });
+
+  test('这句话在**转发说明之后**（先说有什么，再说别信历史）', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const b = remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r', localDir: '/l' });
+    assert.ok(b.indexOf('local_read') < b.indexOf('看你这一轮的工具清单'));
   });
 });

@@ -23,8 +23,10 @@ export interface RemoteContextInput {
   hostLabel: string;
   /** 远端那份项目镜像的绝对路径（agent 的 cwd）。 */
   remoteDir: string;
-  /** 用户机器上的工作目录 —— `local_*` 工具的相对路径以它为准。 */
+  /** 用户机器上的主目录 —— `local_*` 工具的相对路径以它为准。 */
   localDir: string;
+  /** 这条会话选中的**全部**目录（含 `localDir`，它排第一）。不给就等于只有主目录。 */
+  localDirs?: string[];
   /** 兼容旧调用点（镜像时代的会话目录），现在不再出现在注入里。 */
   sessionDir?: string;
   /**
@@ -43,6 +45,10 @@ export function remoteContextBlock(input: RemoteContextInput): string {
   const host = String(input?.hostLabel || '').trim();
   const remoteDir = String(input?.remoteDir || '').trim();
   const localDir = String(input?.localDir || '').trim();
+  /* 主目录排第一（去重、去空）——「会话目录应该可以设置多个」。 */
+  const dirs = [localDir, ...(input?.localDirs || [])]
+    .map((d) => String(d || '').trim())
+    .filter((d, i, a) => d && a.indexOf(d) === i);
   if (!host || !remoteDir) return '';
   return [
     '[运行环境：远程]',
@@ -52,7 +58,22 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       用户的项目在他自己机器上，这条会话通过反向隧道调本地工具去读写它。
       所以这里要说的不再是"路径要换算"，而是"用那组工具"。
     */
-    localDir ? localToolsHelp(localDir) : '',
+    localDir ? localToolsHelp(dirs) : '',
+    /*
+      **别拿历史里的结论判断自己有没有工具** —— 这条是实测出来的（用户：「我让 agent 测本地
+      playwright 它找不到」）。那条会话的工具清单里 `browser_*` / `local_*` 全都在（同一份 agent
+      配置、同一个模型，用 ACP 单独探一遍全都列得出来），但它连着三轮回答"我拿不到这些工具"，
+      而且**一次调用都没试**。原因是随消息带过来的那 5 万字符历史和 memory 全是**镜像时代**的：
+      里面写着"我在 /home/ec2-user/kirolex-mirror"、"你的 /Users/... 路径都不存在"、
+      "5 个调用有 4 个被路径校验拦掉"。它信了历史，没看工具清单。
+
+      这类错最贵的地方在于它**看起来像故障**：用户以为转发断了，于是去查隧道、查 MCP、重启 ——
+      而那一层全是好的。所以这句话必须显式地把旧结论作废。
+    */
+    '· **你有哪些工具，看你这一轮的工具清单，不要根据对话历史推断。**'
+      + '历史里凡是说"我在镜像目录里"、"你的 `/Users/...` 路径不存在"、"被路径校验拦掉"的，'
+      + '都是旧架构（rsync 镜像）留下的记录，**现在不成立**。要确认某个工具在不在，直接调一次就知道了 ——'
+      + '比在回复里说"我拿不到这个工具"便宜得多，也不会让用户跑去排查一条其实是好的隧道。',
     /*
       历史是随消息带过来的（ride-along），远端不存在 history.md —— 明确说一句，
       否则它会去找那个文件，然后把"读不到"当成"没有历史"。

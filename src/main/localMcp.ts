@@ -61,8 +61,24 @@ export const BASH_TIMEOUT_MS = 120_000;
 
 export interface LocalMcpSession {
   sessionId: string;
-  /** 这条会话在本地的工作目录 —— 所有相对路径、`local_bash` 的 cwd 都以它为准。 */
+  /** 主目录 —— 相对路径和 `local_bash` 的 cwd 以它为准。 */
   workdir: string;
+  /**
+   * **这条会话能动的所有目录**（含 `workdir`，它排第一）——「会话目录应该可以设置多个」。
+   *
+   * 只影响 `local_glob` / `local_grep` 不指定 `dir` 时搜哪儿：搜**全部**，而不是只搜主目录。
+   * 一个目录的时候这件事看不出来；多目录之后"在我的项目里找 X"会静默漏掉后面几棵树 ——
+   * 而"搜了没搜到"和"根本没搜那儿"在回复里长得一模一样。
+   *
+   * 不填 / 空数组等于 `[workdir]`。这**不是**权限边界（绝对路径照样能读，见文件头「边界」）。
+   */
+  dirs?: string[];
+}
+
+/** 这条会话默认搜索的那几棵树（至少一个：主目录）。 */
+export function sessionRoots(session: LocalMcpSession): string[] {
+  const list = (session.dirs || []).filter((d) => typeof d === 'string' && d.trim());
+  return list.length ? list : [session.workdir];
 }
 
 export interface LocalMcpDeps {
@@ -103,21 +119,23 @@ export function toolDefs(): Array<{ name: string; description: string; inputSche
     },
     {
       name: 'local_glob',
-      description: '在用户本机上按通配符找文件（在本地跑完，只回结果）。例如 `src/**/*.ts`。',
+      description: '在用户本机上按通配符找文件（在本地跑完，只回结果）。例如 `src/**/*.ts`。'
+        + '不给 `dir` 就搜这条会话的**全部**目录。',
       inputSchema: {
         type: 'object',
-        properties: { pattern: { type: 'string' }, dir: { type: 'string', description: '起始目录，默认工作目录' } },
+        properties: { pattern: { type: 'string' }, dir: { type: 'string', description: '起始目录；不给则搜会话的所有目录' } },
         required: ['pattern'],
       },
     },
     {
       name: 'local_grep',
-      description: '在用户本机上搜内容（ripgrep，没有就退回 grep -rn）。在本地跑完，只回匹配行。',
+      description: '在用户本机上搜内容（ripgrep，没有就退回 grep -rn）。在本地跑完，只回匹配行。'
+        + '不给 `dir` 就搜这条会话的**全部**目录。',
       inputSchema: {
         type: 'object',
         properties: {
           query: { type: 'string' },
-          dir: { type: 'string' },
+          dir: { type: 'string', description: '不给则搜会话的所有目录' },
           glob: { type: 'string', description: '只搜匹配这个通配符的文件' },
         },
         required: ['query'],
@@ -225,22 +243,24 @@ export async function callTool(
       return text(`已写入 ${f}（${Buffer.byteLength(String(args?.content ?? ''))} 字节）`);
     }
     case 'local_glob': {
-      const dir = args?.dir ? abs(String(args.dir)) : cwd;
+      /* 不指定目录 = 搜全部。`find` 本来就收多个起点，所以多目录仍然是**一次**调用
+         —— 184ms 的往返下，"每个目录搜一次"会把粒度打回镜像那版的形状。 */
+      const roots = args?.dir ? [abs(String(args.dir))] : sessionRoots(session);
       const pattern = String(args?.pattern || '*');
       // `find` 一定在；`-path` 能表达 `src/**/*.ts` 这种写法
       // （这里用行注释：`**/*` 里的 `*/` 会把块注释提前关掉 —— 那一下让 tsc 失败、dev:main 起不来）
       const spec = pattern.includes('/') ? ['-path', `*${pattern.replace(/\*\*/g, '*')}`] : ['-name', pattern];
-      const r = await run('find', [dir, '-type', 'f', ...spec, '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.git/*'], cwd, 30_000);
+      const r = await run('find', [...roots, '-type', 'f', ...spec, '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.git/*'], cwd, 30_000);
       return text(r.out.trim() || '（没有匹配的文件）');
     }
     case 'local_grep': {
-      const dir = args?.dir ? abs(String(args.dir)) : cwd;
+      const roots = args?.dir ? [abs(String(args.dir))] : sessionRoots(session);
       const q = String(args?.query || '');
       if (!q) return text('local_grep 需要 query', true);
-      const rg = await run('rg', ['-n', '--no-heading', ...(args?.glob ? ['-g', String(args.glob)] : []), '--', q, dir], cwd, 60_000);
+      const rg = await run('rg', ['-n', '--no-heading', ...(args?.glob ? ['-g', String(args.glob)] : []), '--', q, ...roots], cwd, 60_000);
       /* `spawnFailed` = 没装 ripgrep（不是"没搜到"）—— 那就退回 grep，见 `run` 那段 */
       if (!rg.spawnFailed && (rg.code === 0 || rg.code === 1)) return text(rg.out.trim() || '（没有匹配）');
-      const g = await run('grep', ['-rn', '--exclude-dir=node_modules', '--exclude-dir=.git', '--', q, dir], cwd, 60_000);
+      const g = await run('grep', ['-rn', '--exclude-dir=node_modules', '--exclude-dir=.git', '--', q, ...roots], cwd, 60_000);
       return text(g.out.trim() || '（没有匹配）');
     }
     case 'local_git': {
