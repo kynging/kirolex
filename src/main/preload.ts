@@ -386,6 +386,18 @@ contextBridge.exposeInMainWorld('kiroApi', {
    */
   localSaveBins: (bins: { kiro?: string; claude?: string; codex?: string }) =>
     ipcRenderer.invoke('local:save-bins', bins),
+  /**
+   * **自动检测那三个工具**（`machine` = `'local'` 或某台远端的 id）。
+   * 返回每个工具的候选：命令、版本、能不能起来、以及"以前起过"（历史里有）。
+   */
+  binsDetect: (machine: string): Promise<{
+    ok: boolean;
+    error?: string;
+    tools?: Record<'kiro' | 'claude' | 'codex', Array<{ command: string; version?: string; ok: boolean; error?: string; known?: boolean }>>;
+  }> => ipcRenderer.invoke('bins:detect', machine),
+  /** 测一条命令能不能起来。 */
+  binsTest: (machine: string, command: string): Promise<{ ok: boolean; version?: string; error?: string }> =>
+    ipcRenderer.invoke('bins:test', machine, command),
   /** 选一个项目目录（切到远端时用）。 */
   remotePickDir: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-dir'),
   /**

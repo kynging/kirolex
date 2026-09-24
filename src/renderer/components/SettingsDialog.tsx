@@ -95,6 +95,21 @@ const SWITCHES: Array<{
     help: '开：删除会话前弹确认框。关：点了就删——删除现在会移到 ~/.kirolex/trash 保留 30 天，但仍建议保持开启。' },
 ];
 
+/**
+ * 设置的分页 ——「配置里东西太多了，你可以分几个不同的 tab」+「这些内容单独弄一个 setting tab」。
+ *
+ * 按**你来这儿要干什么**分，不是按字段类型分。顺序就是使用频率的反面：机器那一页是当前
+ * 在做的事（而且是唯一会连到另一台机器的一页），放第一个；开关那一列本来就占满一屏，独占一页。
+ */
+type SettingsTab = 'machines' | 'appearance' | 'session' | 'switches';
+
+const TABS: Array<{ id: SettingsTab; label: string }> = [
+  { id: 'machines', label: '🖥 机器' },
+  { id: 'appearance', label: '🎨 外观' },
+  { id: 'session', label: '💬 会话' },
+  { id: 'switches', label: '🧪 开关' },
+];
+
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   settings,
   onChange,
@@ -104,6 +119,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
 }) => {
   const t = useT();
   // Executor cap (max concurrent connected sessions). 0/'' in the input = auto.
+  /* 打开时停在「机器」那一页 —— 那是当前在配的东西；不记住上次选的哪一页（多一份状态，
+     换来的只是"上次我在哪"，而每次打开设置的理由通常都不一样）。 */
+  const [tab, setTab] = useState<SettingsTab>('machines');
   const [capInfo, setCapInfo] = useState<{ cap: number; auto: number; overridden: boolean } | null>(null);
   const [capInput, setCapInput] = useState('');
   // Wedge-interrupt threshold in seconds. '' while loading, '0' = never interrupt.
@@ -228,19 +246,42 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
       <div className="settings-dialog">
         <div className="settings-header">
           <h3>{t(t('⚙️ Settings'))}</h3>
+          {/*
+            **分页** ——「配置里东西太多了，你可以分几个不同的 tab」。
+
+            一屏塞十二项的代价不是"长"，是**找不到**：上一版为了让远端机器那一块能被看见，
+            只能把它硬提到最上面（「我还是没有找到配置远程服务器的地方」）—— 那是在跟布局较劲，
+            而不是解决问题。分页之后每一页只回答一件事，顺序也不再是稀缺资源。
+
+            分法按**你来这儿要干什么**，不是按字段类型：
+              · 机器 —— 在哪台机器上跑、那几个 CLI 怎么起（唯一会连到别的机器的一页）
+              · 外观 —— 语言、字体、字号
+              · 会话 —— 分屏、并发、卡死判定、辅助模型
+              · 开关 —— 功能开关（它本来就是一整列，独占一页正好）
+          */}
+          <div className="settings-tabs" role="tablist">
+            {TABS.map((tb) => (
+              <button
+                key={tb.id}
+                role="tab"
+                aria-selected={tab === tb.id}
+                className={`settings-tab${tab === tb.id ? ' active' : ''}`}
+                onClick={() => setTab(tb.id)}
+              >{tb.label}</button>
+            ))}
+          </div>
           <button className="settings-close" onClick={onClose}>✕</button>
         </div>
 
-        <div className="settings-body">
+        <div className={`settings-body settings-body-${tab}`}>
           {/*
-            **远端机器放在最上面** ——「我还是没有找到配置远程服务器的地方」。
-
-            上一版把它放在第二栏、字体和语言之间（实测量出来在 470px 处，要往下看才看得见）——
-            技术上"有"，实际上找不到。这是整个设置里唯一一个**会连到另一台机器**的东西，
-            而且是当前正在做的功能，所以它排在字体前面：找不到的入口等于没有入口。
+            机器那一页。上一版为了让它能被看见，只能把它硬排在字体前面
+            （「我还是没有找到配置远程服务器的地方」）—— 那是在跟布局较劲。
+            分页之后它自己一页，顺序不再是稀缺资源。
           */}
-          <RemoteSettings />
+          {tab === 'machines' && <RemoteSettings />}
 
+          {tab === 'appearance' && (
           <div className="settings-item settings-item-wide">
             <label className="settings-label">{t(t('Preview'))}</label>
             <p
@@ -259,7 +300,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               const answer = 42; // 代码字体预览
             </p>
           </div>
+          )}
 
+          {tab === 'appearance' && (
           <div className="settings-item settings-item-wide">
             <label className="settings-label">{t(t('Font (text)'))}</label>
             <div className="settings-control">
@@ -285,7 +328,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               onChange={(e) => onChange({ ...settings, fontFamily: e.target.value })}
             />
           </div>
+          )}
 
+          {tab === 'appearance' && (
           <div className="settings-item settings-item-wide">
             <label className="settings-label">{t(t('Font (code)'))}</label>
             <div className="settings-control">
@@ -311,14 +356,17 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               onChange={(e) => onChange({ ...settings, monoFontFamily: e.target.value })}
             />
           </div>
+          )}
 
           {/* Two explicit columns: the switch list is TALL, and with grid
               auto-placement it landed in whichever column had room, next to
               unrelated selects and leaving half the dialog empty. Left column =
               everything else, right column = the switches, nothing interleaved. */}
+          {/* 外观那一页：语言 + 字号（字体和预览在上面，同一页） */}
+          {tab === 'appearance' && (
           <div className="settings-col">
             {/*
-              界面语言。放在左栏第一项：它是**改变其余所有文案**的那一个开关，
+              界面语言。放在这一页第一项：它是**改变其余所有文案**的那一个开关，
               藏在下面等于让人先看半屏自己看不懂的字再找到它。
             */}
             <div className="settings-item">
@@ -355,7 +403,12 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               </div>
             </div>
 
+          </div>
+          )}
 
+          {/* 会话那一页：分屏、并发、卡死判定、辅助模型 —— 都是「会话怎么跑」的旋钮 */}
+          {tab === 'session' && (
+          <div className="settings-col">
             <div className="settings-item">
               <label className="settings-label">{t('Split grid (click a chat in the sidebar to add it; every pane has its own composer)')}</label>
               <div className="settings-control">
@@ -493,7 +546,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 them apply to the next operation with no restart; grouping is by what
                 the switch affects, not by which file holds it. */}
           </div>
+          )}
 
+          {tab === 'switches' && (
           <div className="settings-col">
             <div className="settings-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>
               <label className="settings-label">{t('Feature switches (take effect immediately, no restart)')}</label>
@@ -528,6 +583,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               })}
             </div>
           </div>
+          )}
         </div>
       </div>
     </>

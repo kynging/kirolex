@@ -22,6 +22,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { ExecutorBins, RemoteTarget } from './config';
+import { rememberBin, type BinHistoryMap, type ToolId } from './binDetect.ts';
 
 export interface RemoteTargetEntry extends RemoteTarget {
   /** 稳定 id：存进会话的 profile，重启后靠它找回同一台机器。 */
@@ -86,6 +87,37 @@ export function localBins(configPath: string): ExecutorBins | undefined {
   } catch {
     return undefined;
   }
+}
+
+/**
+ * **哪条命令曾经真的起过** ——「记住历史成功的启动命令或位置」。
+ *
+ * 存在配置里的 `binHistory`：机器 key（本机是 `local`，远端用 target id）→ 工具 → 命令列表，
+ * 最近的在前。执行器每次成功启动都写一次（`rememberBinSuccess`）。
+ *
+ * 为什么值得单独存一份：一个**真的起来过**的命令比任何检测结果都可信 —— 检测只能说
+ * "这个文件在、`--version` 能跑"，而起一条 ACP 会话要的比那多（登录、agent、MCP）。
+ */
+export function binHistory(configPath: string): BinHistoryMap {
+  try {
+    const raw = JSON.parse(fs.readFileSync(configPath, 'utf-8'))?.binHistory;
+    return (raw && typeof raw === 'object') ? raw as BinHistoryMap : {};
+  } catch {
+    return {};
+  }
+}
+
+/**
+ * 记一条成功启动。**同一条命令重复调用不写盘** —— 这个函数在每次 attach 都会被调到，
+ * 而无谓的写盘会让配置文件的 mtime 一直变（`manifest.json` 那次的教训）。
+ */
+export function rememberBinSuccess(configPath: string, machine: string, tool: ToolId, command: string): void {
+  const cur = binHistory(configPath);
+  const next = rememberBin(cur, machine, tool, command);
+  if (JSON.stringify(next) === JSON.stringify(cur)) return;
+  const cfg = readConfigObject(configPath);
+  cfg.binHistory = next;
+  writeConfigObject(configPath, cfg);
 }
 
 /** 存本机那份（只动 `localBins` 这一个键；空值 = 回到默认）。 */

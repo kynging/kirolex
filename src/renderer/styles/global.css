@@ -7734,3 +7734,77 @@ button, input, select, textarea {
   border-left: 2px solid rgba(64,160,220,0.45);
   margin-left: 10px;
 }
+
+/* 启动命令那一行：输入框 + 「测试」，以及检测到/记住的候选。
+   候选做成可点的小块（不是下拉）：一眼能看到"有几个、哪个能跑、哪个以前起过"——
+   下拉会把这三件事藏起来，而这三件正是你要做判断的依据。 */
+.bin-row {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.bin-row .settings-input { flex: 1 1 auto; min-width: 0; }
+
+.bin-candidates {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px;
+  margin-top: 4px;
+}
+.bin-candidate {
+  max-width: 100%;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 2px 7px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-family: var(--font-mono, monospace);
+  cursor: pointer;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.bin-candidate:hover { color: var(--text-primary); border-color: var(--accent); }
+.bin-candidate.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+}
+/* 跑不起来的那些**留在列表里**但压暗：藏起来的话"它昨天还好好的"就没法看出来 */
+.bin-candidate.bad { opacity: 0.55; text-decoration: line-through; }
+.bin-ver { color: var(--text-muted); font-size: 9px; }
+
+/* 设置的分页 ——「配置里东西太多了，你可以分几个不同的 tab」。
+   标签栏放在标题那一行里（不是单独一行）：设置面板的高度是稀缺的，而四个标签
+   横着排完全放得下。标题 · 标签 · ✕ 三者之间用 margin-right:auto 把标签推到中间。 */
+.settings-tabs {
+  display: flex;
+  gap: 4px;
+  margin: 0 auto 0 16px;
+  flex-wrap: wrap;
+}
+.settings-tab {
+  padding: 3px 10px;
+  border: 1px solid transparent;
+  border-radius: 7px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+  white-space: nowrap;
+  transition: color 0.15s, background 0.15s, border-color 0.15s;
+}
+.settings-tab:hover { color: var(--text-primary); background: var(--bg-tertiary); }
+.settings-tab.active {
+  color: var(--accent);
+  background: var(--accent-soft);
+  border-color: color-mix(in srgb, var(--accent) 46%, transparent);
+}
+
+/* 机器那一页只有一栏（远端配置本身就是竖着排的一组字段），所以不要两栏网格 ——
+   两栏会把那一组字段劈成左右两半，读起来是断的。 */
+.settings-body-machines { grid-template-columns: 1fr; }

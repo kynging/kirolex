@@ -23,8 +23,14 @@ export interface Preflight {
   raw?: string;
 }
 
-/** 远端要有的东西。构建链不在里面 —— 远程会话不做构建/测试。 */
-export const REQUIRED_TOOLS = ['kiro-cli', 'rsync', 'git'];
+/**
+ * 远端要有的东西。
+ *
+ * **`git` 去掉了**：镜像没有了之后远端根本没有那个仓库（文件留在用户机器上，靠 `local_git`
+ * 回去查）—— 还拦着"远端没装 git"就是拿一个用不到的依赖挡住一条本来能跑的会话。
+ * `rsync` 留着：agent 配置还是 rsync 推过去的（`agentSyncArgs`）。
+ */
+export const REQUIRED_TOOLS = ['kiro-cli', 'rsync'];
 
 /**
  * **顺带把远端的模型列表问出来** ——「模型列表其实也完全不一样，你看看能不能行」。
@@ -39,15 +45,25 @@ export const REQUIRED_TOOLS = ['kiro-cli', 'rsync', 'git'];
  */
 export const MODEL_PROBE = '__kirolex_probe__';
 
-/** 一条命令问清四件事：哪些工具在、有没有登录、远端有哪些模型。 */
-export function preflightScript(tools: string[] = REQUIRED_TOOLS): string {
-  return [
+/**
+ * 一条命令问清：哪些工具在、有没有登录、（可选）远端有哪些模型。
+ *
+ * **`models: false` 时不问模型** ——「测试连接那里不必检测 kiro 模型」。
+ * 那一步要起一次 `kiro-cli chat`（哪怕只走到参数校验），是这条探测里最慢的一段；
+ * 而"这台机器连得上吗"和"它支持哪些模型"是两个问题：按连接测试来说，模型列表既不改变结论、
+ * 又让你多等几秒。起会话那条路仍然要问（`pickRemoteModel` 靠它，否则模型不对会**静默**退回）。
+ */
+export function preflightScript(tools: string[] = REQUIRED_TOOLS, opts: { models?: boolean } = {}): string {
+  const lines = [
     `for b in ${tools.join(' ')}; do command -v "$b" >/dev/null 2>&1 && echo "HAVE $b" || echo "MISS $b"; done`,
     /* `whoami` 的输出形状不保证，所以只看它成不成 —— 未登录时 kiro-cli 是非零退出 */
     'if command -v kiro-cli >/dev/null 2>&1; then kiro-cli whoami >/dev/null 2>&1 && echo "AUTH ok" || echo "AUTH no"; fi',
+  ];
+  if (opts.models !== false) {
     /* 模型列表：参数校验就会失败，不会真的调模型 */
-    `if command -v kiro-cli >/dev/null 2>&1; then kiro-cli chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1; fi`,
-  ].join('; ');
+    lines.push(`if command -v kiro-cli >/dev/null 2>&1; then kiro-cli chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1; fi`);
+  }
+  return lines.join('; ');
 }
 
 /**
@@ -94,7 +110,7 @@ export function judgePreflight(
   return {
     code: 'ok',
     models,
-    message: `${host}：kiro-cli 已登录，rsync/git 都在${models.length ? `，${models.length} 个可用模型` : ''}。`,
+    message: `${host}：kiro-cli 已登录，rsync 也在${models.length ? `，${models.length} 个可用模型` : ''}。`,
   };
 }
 

@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFile, spawn } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, kiroBinProblem } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -29,6 +29,7 @@ import { RemoteSyncManager, busyPeer, toolMayHaveWritten } from './remoteSync.ts
 import { judgePreflight, preflightScript } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
+import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import {
   allocateRemotePort, buildSessionAgent, localToolsHelp, mcpUrl,
@@ -38,7 +39,7 @@ import { mentionedPaths, stageFiles, writeBack } from './localFileBridge.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents, localAgentJson } from './kiroAgents.ts';
 import { pickWebSearch } from './webSearchMcp.ts';
-import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, type RemoteTargetInput } from './remoteTargets.ts';
+import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
@@ -336,6 +337,19 @@ async function connectWithModelFallback(
     logger.info('model', `${label}: 跳过本次运行里已证实跑不了的模型（${dead.join(', ')}）—— 它们排到最后`);
   }
   let lastError: any = null;
+  /*
+    连上了就把那条命令记进历史 —— 「记住历史成功的启动命令或位置」。
+    放在**连接成功**之后而不是"配置保存"时：配置里那条可能是错的，而这里是事实。
+    `rememberBinSuccess` 自己会在没变化时跳过写盘。
+  */
+  const remember = (client: AcpClient): void => {
+    const machine = profile.remote?.sshHost
+      ? (listRemoteTargets(KIROLEX_CONFIG_PATH).find((t) => t.sshHost === profile.remote?.sshHost)?.id || profile.remote.sshHost)
+      : 'local';
+    if (client.launchedWith) {
+      try { rememberBinSuccess(KIROLEX_CONFIG_PATH, machine, 'kiro' as ToolId, client.launchedWith); } catch { /* 记不住不该影响连接 */ }
+    }
+  };
   for (const model of candidates) {
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
     try {
@@ -346,6 +360,7 @@ async function connectWithModelFallback(
         // attempted. Don't claim profile.model was unavailable.
         logger.warn('model', `${label}: started on '${model}' (record model '${profile.model}', preferred '${profile.preferredModel || '-'}')`);
       }
+      remember(client);
       return { client, model };
     } catch (err: any) {
       lastError = err;
@@ -496,7 +511,10 @@ async function runLiteOneShot(prompt: string, label: string): Promise<string> {
         ? ['chat', '--no-interactive', '--agent', LITE_AGENT, '--model', m, prompt]
         : ['chat', '--no-interactive', '--model', m, prompt];
       try {
-        const { stdout } = await run(resolveKiroCli() || 'kiro-cli', args, opts);
+        /* 辅助模型（标题/建议）也走设置里那个二进制 —— 不许悄悄退回一个裸名字 */
+        const helperProblem = kiroBinProblem();
+        if (helperProblem) throw new Error(helperProblem);
+        const { stdout } = await run(resolveKiroCli()!, args, opts);
         if (m !== models[0]) {
           logger.warn(label, `helper model '${models[0]}' unusable -> answered with fallback '${m}'`);
         }
@@ -1500,6 +1518,42 @@ function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
     /* 不等结果：收尾动作卡住会让"换模型"看起来像界面挂了 */
     void writeRemoteFile(remote, removeAgentScript(spec.agentOverride), '').catch(() => {});
   }
+}
+
+/**
+ * 跑一段探测脚本。`machine` 是 `local` 或配置里的 target id。
+ *
+ * 两条路**共用同一段脚本**（见 `binDetect`）：本机 `bash -lc`，远端 ssh + `bash -lc`。
+ * 脚本走 `-c` 而不是 stdin：探测脚本自己会 `< /dev/null` 掉每个被测命令的 stdin，
+ * 而用 `bash -s` 把脚本喂进 stdin 的话，第一个读 stdin 的命令就会把剩下的脚本吞掉
+ * （实测踩过：那次 `claude-code-acp --version` 吃掉了自检部分，然后整段"成功"退出）。
+ */
+function runProbe(machine: string, script: string): Promise<string> {
+  const timeout = 120_000;
+  if (!machine || machine === 'local') {
+    return new Promise((resolve, reject) => {
+      execFile('bash', ['-lc', script], { timeout, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 },
+        (err, stdout, stderr) => {
+          /* 探测脚本自己**不会**非零退出（`set +e` + 每个分支都 echo），所以非零 = 真的跑不了 */
+          if (err && !String(stdout || '').includes('KX_BIN')) reject(new Error(String(stderr || err.message).split('\n')[0]));
+          else resolve(String(stdout || ''));
+        });
+    });
+  }
+  const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+  if (!target?.sshHost) return Promise.reject(new Error(`找不到这台机器（${machine}）—— 设置里删掉了？`));
+  return new Promise((resolve, reject) => {
+    execFile('ssh', [...buildSshArgs(target, `bash -lc ${shellQuote(script)}`)],
+      { timeout, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+        if (err && !String(stdout || '').includes('KX_BIN')) {
+          /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
+          const real = String(stderr || err.message).split('\n')
+            .map((l) => l.trim())
+            .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*/.test(l))[0];
+          reject(new Error(real || `ssh 退出码 ${(err as any).code}`));
+        } else resolve(String(stdout || ''));
+      });
+  });
 }
 
 /** 在远端跑一条 shell 命令，内容从 stdin 送进去（JSON 走命令行是引号地狱）。 */
@@ -2989,8 +3043,14 @@ let listModelsInFlight: Promise<any> | null = null;
 let listAgentsInFlight: Promise<string> | null = null;
 
 function runKiroCli(argsLine: string, timeoutMs: number): Promise<string> {
-  const bin = resolveKiroCli();
-  return runCli(`${bin ? `"${bin}"` : 'kiro-cli'} ${argsLine}`, timeoutMs);
+  /*
+    **设置里没配就不跑** ——「所有的会话必须用 setting 里面设置的本地或远程 agent 起任务，
+    如果设置是空的不应该起任何连接」。这里是模型列表 / agent 列表 / usage 那几条路，
+    它们必须和执行器**用同一个二进制**：不一致的表现是"聊天能用，但模型列表少几个"。
+  */
+  const problem = kiroBinProblem();
+  if (problem) return Promise.reject(new Error(problem));
+  return runCli(`"${resolveKiroCli()}" ${argsLine}`, timeoutMs);
 }
 
 // Each session gets its own directory to avoid cwd collision
@@ -7146,6 +7206,41 @@ app.whenReady().then(async () => {
   });
 
   /**
+   * **自动检测那三个工具**（本机或某台远端）——「分别自动检测位置和启动命令、
+   * 自动检测是否能正常启动、记住历史成功的启动命令」。
+   *
+   * 同一段脚本两台机器共用：本机 `bash -lc`，远端走 ssh。一份判据不会分叉 ——
+   * 而"本地判一套、远端判另一套"正是那种查不出来的差异。
+   */
+  ipcMain.handle('bins:detect', async (_event, machine: string) => {
+    try {
+      const out = await runProbe(machine, detectScript());
+      const found = parseDetect(out);
+      const hist = binHistory(KIROLEX_CONFIG_PATH)[machine] || {};
+      /* 历史排前面并打上 known —— 一个真的起过会话的命令比"文件在这儿"可信得多 */
+      const merged = {
+        kiro: mergeHistory(found.kiro, hist.kiro),
+        claude: mergeHistory(found.claude, hist.claude),
+        codex: mergeHistory(found.codex, hist.codex),
+      };
+      logger.info('bins', `检测 ${machine}：kiro=${merged.kiro.length} claude=${merged.claude.length} codex=${merged.codex.length}`);
+      return { ok: true, tools: merged };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /** 测一条命令能不能起来（界面上那个「测试」）。 */
+  ipcMain.handle('bins:test', async (_event, machine: string, command: string) => {
+    if (!command?.trim()) return { ok: false, error: '没有给命令' };
+    try {
+      return parseTest(await runProbe(machine, testScript(command.trim())));
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /**
    * 存本机那三个启动命令。
    *
    * 存完**立刻生效**（`setLocalKiroBin`）：不设的话要重启才算数，而"改了配置没反应"
@@ -7352,7 +7447,8 @@ app.whenReady().then(async () => {
       identityFile: input.identityFile ? String(input.identityFile).replace(/^~(?=\/|$)/, os.homedir()) : undefined,
       remoteWorkdir: input.remoteWorkdir || undefined,
     } as RemoteTarget;
-    const args = buildSshArgs(target, `bash -lc ${shellQuote(preflightScript())}`);
+    /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */
+    const args = buildSshArgs(target, `bash -lc ${shellQuote(preflightScript(undefined, { models: false }))}`);
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,

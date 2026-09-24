@@ -311,7 +311,10 @@ describe('在界面上加/改/删一台远端', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf("ipcMain.handle('remote:test'");
     const body = M.slice(at, at + 1600);
-    assert.match(body, /preflightScript\(\)/);
+    /* 同一个 `preflightScript` / `judgePreflight`，只是**不问模型列表**
+       （「测试连接那里不必检测 kiro 模型」）—— 那一步要起一次 `kiro-cli chat`，是最慢的一段，
+       而它不改变"连不连得上"这个结论。 */
+    assert.match(body, /preflightScript\(undefined, \{ models: false \}\)/);
     assert.match(body, /judgePreflight\(/);
   });
 });
@@ -500,8 +503,11 @@ describe('远端机器那一块的形状', () => {
     assert.match(RS, /\+ 添加一台机器…/);
     /* 上一版每行四个按钮，实测只有 43–63px 宽，机器一多就是一片按钮 */
     assert.equal(/className="remote-row"/.test(RS), false, '行式列表已经换掉了');
-    /* 同一时刻只在编辑一台，所以动作按钮只有一组 */
-    assert.equal((RS.match(/onClick=\{\(\) => void test\(\)\}/g) || []).length, 1);
+    /* 同一时刻只在编辑一台，所以**机器级**的动作按钮只有一组（测试连接 / 安装依赖 / 删除）。
+       每个工具自己那个「测试」是另一件事 —— 它问的是"这条命令能不能起来"，不是"这台机器连不连得上"。 */
+    assert.equal((RS.match(/>测试连接</g) || []).length, 1);
+    assert.equal((RS.match(/>安装依赖</g) || []).length, 0, '安装依赖那个按钮带状态文案');
+    assert.match(RS, /\{installing \? '安装中…' : '安装依赖'\}/);
   });
 
   test('密钥用 Finder 选，不让人手写路径', () => {

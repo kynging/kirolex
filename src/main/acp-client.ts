@@ -66,10 +66,27 @@ export function setLocalKiroBin(bin?: string): void {
   configuredKiroBin = (bin || '').trim() || undefined;
 }
 
+/**
+ * **没配就不起** ——「所有的会话必须用 setting 里面设置的本地或远程 agent 起任务，
+ * 如果设置是空的不应该起任何连接」。
+ *
+ * 为什么这是对的：猜出来的那个二进制**可能不是你要用的那个**（这台机器上就有两个
+ * ——`kiro-cli 2.23.1` 和 Kiro IDE 的 `kiro 0.12.333`），而猜错的表现不是报错，是
+ * "模型列表少几个"、"agent 没生效"这类查半天看不出根因的事。设置是唯一的真相，
+ * 空的时候宁可明确拒绝，也不要悄悄换一个。
+ *
+ * 返回一句话 = 不能起；`null` = 可以。
+ */
+export function kiroBinProblem(): string | null {
+  if (configuredKiroBin) return null;
+  return '还没有设置**本机**的 kiro 启动命令。打开 设置 → 🖥 机器 → 💻 本机，'
+    + '点「自动检测这台机器上的三个工具」，或者手填一个路径 —— 没有这个设置 KiroLex 不会去猜一个二进制。';
+}
+
 export function kiroCliCandidates(): string[] {
+  /* 配了就**只用**它：不再往下试那串猜测路径（见 `kiroBinProblem`） */
+  if (configuredKiroBin) return [configuredKiroBin];
   return [
-    /* 配置里指定的优先 —— 它是你明确的选择，比"按固定顺序猜"更可信 */
-    configuredKiroBin,
     process.env.KIRO_CLI_PATH,
     // Windows
     `${process.env.LOCALAPPDATA}\\Kiro-Cli\\kiro-cli.exe`,
@@ -117,6 +134,13 @@ export class AcpClient extends EventEmitter {
   private localTools?: { remotePort: number; localPort: number; agentOverride: string };
   /** 远端那个 kiro-cli 的 PID（它自己报的）—— 断开时要把它杀掉，见 `KIROLEX_PID`。 */
   remotePid?: number;
+  /**
+   * **这次真的用哪条命令起来的** ——「记住历史成功的启动命令或位置」。
+   *
+   * 本机是 `resolveKiroCli()` 挑中的那个路径，远端是那台机器配的（或 `kiro-cli`）。
+   * 主进程在连接成功后把它记进历史 —— 一个真的起过会话的命令比任何检测结果都可信。
+   */
+  launchedWith?: string;
 
   constructor(
     model: string,
@@ -161,12 +185,23 @@ export class AcpClient extends EventEmitter {
         // rest of this client is unchanged. The remote kiro-cli operates on the
         // remote filesystem and loads the remote host's own MCP/agent config.
         command = 'ssh';
+        const remoteBin = (this.remote.bins?.kiro || '').trim();
+        if (!remoteBin) {
+          reject(new Error(`还没有设置 ${this.remote.sshHost} 上的 kiro 启动命令。`
+            + '打开 设置 → 🖥 机器 → 选中这台机器，点「自动检测这台机器上的三个工具」——'
+            + '没有这个设置 KiroLex 不会去猜远端的二进制（猜错的表现是"起来了但行为不对"）。'));
+          return;
+        }
+        this.launchedWith = remoteBin;
         args = buildSshArgs(
           this.remote,
-          buildRemoteKiroCommand(this.model, this.localTools?.agentOverride || this.kiroAgent, this.remote.bins?.kiro),
+          buildRemoteKiroCommand(this.model, this.localTools?.agentOverride || this.kiroAgent, remoteBin),
           this.localTools ? { remotePort: this.localTools.remotePort, localPort: this.localTools.localPort } : undefined,
         );
       } else {
+        /* 没配就不起（见 `kiroBinProblem`）—— 这条会话根本不该有一个"猜出来的"执行器 */
+        const problem = kiroBinProblem();
+        if (problem) { reject(new Error(problem)); return; }
         // Local executor: search for the kiro-cli binary on this machine.
         const possiblePaths = kiroCliCandidates();
 
@@ -186,6 +221,7 @@ export class AcpClient extends EventEmitter {
         }
 
         command = cliPath;
+        this.launchedWith = cliPath;
         args = ['acp'];
         if (this.kiroAgent) args.push('--agent', this.kiroAgent);
         args.push('--model', this.model);

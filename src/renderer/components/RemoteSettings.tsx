@@ -21,6 +21,16 @@ import React, { useEffect, useRef, useState } from 'react';
  * 连不上（网络/密钥/安全组）、缺 rsync/git（一键装）、没登录（去那台机器 `kiro-cli login`）。
  * 最后一种最坑：执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。
  */
+/** 检测到 / 记住的一个候选启动命令。 */
+export interface BinCandidate {
+  command: string;
+  version?: string;
+  ok: boolean;
+  error?: string;
+  /** 以前真的起过一条会话（历史里有）。 */
+  known?: boolean;
+}
+
 export interface ExecBins {
   kiro?: string;
   claude?: string;
@@ -75,34 +85,133 @@ const Field: React.FC<{
  * `claude` / `codex` 现在只存不用（KiroLex 还只起 kiro-cli），所以标签上明说"暂未使用"：
  * 一个填了却不生效的输入框，比没有这个输入框更让人怀疑配置是假的。
  */
-const BinFields: React.FC<{ bins: ExecBins; onChange: (b: ExecBins) => void }> = ({ bins, onChange }) => (
-  <>
-    <Field label="kiro 启动命令" hint="留空 = 默认（kiro-cli）。可填绝对路径，或 PATH 里的另一个名字">
-      <input
-        className="settings-input"
-        placeholder="默认：kiro-cli"
-        value={bins.kiro || ''}
-        onChange={(e) => onChange({ ...bins, kiro: e.target.value })}
-      />
+/** 一个工具：输入框 + 检测到/记住的候选 + 「测试」。 */
+const BinRow: React.FC<{
+  label: string;
+  hint: string;
+  placeholder: string;
+  /** 这一栏空着时实际会用的命令 —— 「测试」按钮测的就是它。 */
+  fallback: string;
+  value: string;
+  machine: string;
+  candidates?: BinCandidate[];
+  onChange: (v: string) => void;
+}> = ({ label, hint, placeholder, fallback, value, machine, candidates, onChange }) => {
+  const [testing, setTesting] = useState(false);
+  const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
+  const test = async (): Promise<void> => {
+    /* 空着就测那个工具的内置命令名（`fallback`）—— 以前这里从 placeholder 里抠字符串，
+       而 placeholder 现在不写"默认：xxx"了（「不要显示默认」），抠不出来就等于测了个空命令。 */
+    const cmd = (value || fallback).trim();
+    setTesting(true);
+    setResult(null);
+    const r = await (window as any).kiroApi?.binsTest?.(machine, cmd);
+    setTesting(false);
+    setResult({ ok: !!r?.ok, text: r?.ok ? (r.version || '能起来') : (r?.error || '起不来') });
+  };
+  return (
+    <Field label={label} hint={hint}>
+      <div className="bin-row">
+        <input
+          className="settings-input"
+          placeholder={placeholder}
+          spellCheck={false}
+          value={value}
+          onChange={(e) => onChange(e.target.value)}
+        />
+        <button className="remote-btn" disabled={testing} onClick={() => void test()}>
+          {testing ? '测试中…' : '测试'}
+        </button>
+      </div>
+      {/*
+        检测到的 + **记住的**（`known`）。历史排在前面 —— 一个真的起过会话的命令比"文件在这儿"
+        可信得多。历史里那条现在跑不起来也要显示：不显示你会以为它从没存在过，
+        而"它昨天还好好的"本身就是线索。
+      */}
+      {!!candidates?.length && (
+        <div className="bin-candidates">
+          {candidates.map((c) => (
+            <button
+              key={c.command}
+              className={`bin-candidate${c.ok ? '' : ' bad'}${value === c.command ? ' active' : ''}`}
+              title={c.ok ? (c.version || '能起来') : (c.error || '起不来')}
+              onClick={() => onChange(c.command)}
+            >
+              {c.ok ? '✓' : '✗'} {c.known ? '★ ' : ''}{c.command}
+              {c.version ? <span className="bin-ver">{c.version}</span> : null}
+            </button>
+          ))}
+        </div>
+      )}
+      {result && (
+        <p className="settings-hint" style={{ color: result.ok ? 'var(--success, #4caf50)' : 'var(--error)', margin: '2px 0 0' }}>
+          {result.ok ? '✓ ' : '✗ '}{result.text}
+        </p>
+      )}
     </Field>
-    <Field label="claude 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先存着">
-      <input
-        className="settings-input"
-        placeholder="默认：claude"
-        value={bins.claude || ''}
-        onChange={(e) => onChange({ ...bins, claude: e.target.value })}
+  );
+};
+
+/**
+ * 三个 CLI 的启动命令。本机和每台远端机器**用同一组字段** —— 问的是同一个问题。
+ *
+ * 「自动检测」把三个工具在这台机器上的候选一次问清（同一段脚本，本机 `bash -lc`、
+ * 远端走 ssh），每条都真的 `--version` 跑一遍 —— **找到文件 ≠ 能跑**。
+ * `★` = 以前真的起过一条会话（历史）。
+ *
+ * `claude` / `codex` 现在只检测和记录（KiroLex 还只起 kiro-cli），标签上明说"暂未使用"：
+ * 一个填了却不生效的输入框，比没有这个输入框更让人怀疑配置是假的。
+ */
+const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecBins) => void }> = ({ bins, machine, onChange }) => {
+  const [found, setFound] = useState<Record<string, BinCandidate[]> | null>(null);
+  const [detecting, setDetecting] = useState(false);
+  const [err, setErr] = useState('');
+  /* 换机器就把上一台的结果丢掉 —— 拿 A 机器的候选去填 B 机器是最糟的一种"帮忙" */
+  useEffect(() => { setFound(null); setErr(''); }, [machine]);
+  const detect = async (): Promise<void> => {
+    setDetecting(true);
+    setErr('');
+    const r = await (window as any).kiroApi?.binsDetect?.(machine);
+    setDetecting(false);
+    if (!r?.ok) { setErr(r?.error || '检测失败'); return; }
+    setFound(r.tools || {});
+    /* **不自动改你的配置**：只有那一栏是空的（= 用默认）时才替你填上第一个能跑的 ——
+       已经填了东西就不动，那是你的选择。 */
+    const pick = (t: 'kiro' | 'claude' | 'codex'): string | undefined =>
+      (r.tools?.[t] || []).find((c: BinCandidate) => c.ok)?.command;
+    const next: ExecBins = { ...bins };
+    let changed = false;
+    for (const t of ['kiro', 'claude', 'codex'] as const) {
+      if (!next[t]) { const p = pick(t); if (p) { next[t] = p; changed = true; } }
+    }
+    if (changed) onChange(next);
+  };
+  return (
+    <>
+      <div className="remote-row-actions" style={{ marginTop: 2 }}>
+        <button className="remote-btn" disabled={detecting} onClick={() => void detect()}>
+          {detecting ? '检测中…' : '自动检测这台机器上的三个工具'}
+        </button>
+        {err && <span className="settings-hint" style={{ color: 'var(--error)' }}>{err}</span>}
+      </div>
+      <BinRow
+        label="kiro 启动命令" hint="留空 = 用 PATH 上的 kiro-cli。可填绝对路径，或另一个名字"
+        placeholder="kiro-cli" fallback="kiro-cli" value={bins.kiro || ''} machine={machine}
+        candidates={found?.kiro} onChange={(kiro) => onChange({ ...bins, kiro })}
       />
-    </Field>
-    <Field label="codex 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先存着">
-      <input
-        className="settings-input"
-        placeholder="默认：codex"
-        value={bins.codex || ''}
-        onChange={(e) => onChange({ ...bins, codex: e.target.value })}
+      <BinRow
+        label="claude 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先检测并存着"
+        placeholder="claude" fallback="claude" value={bins.claude || ''} machine={machine}
+        candidates={found?.claude} onChange={(claude) => onChange({ ...bins, claude })}
       />
-    </Field>
-  </>
-);
+      <BinRow
+        label="codex 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先检测并存着"
+        placeholder="codex" fallback="codex" value={bins.codex || ''} machine={machine}
+        candidates={found?.codex} onChange={(codex) => onChange({ ...bins, codex })}
+      />
+    </>
+  );
+};
 
 export const RemoteSettings: React.FC = () => {
   const [rows, setRows] = useState<RemoteRow[]>([]);
@@ -263,10 +372,17 @@ export const RemoteSettings: React.FC = () => {
 
   return (
     <div className="settings-item settings-item-wide">
-      <label className="settings-label">远端机器（远程会话）</label>
+      {/*
+        标题不再叫「远端机器（远程会话）」——「这个标题不应该叫远端机器（远程会话）了」。
+        这一页现在管的是**所有**机器（含本机）以及每台机器上那几个 CLI 怎么起，
+        而"远程会话"只是其中一个用途。下面那句说明同样改了：镜像已经没有了
+        （见 `registerRemoteSync`），文件留在你机器上、远端那条会话靠 `local_*` 工具回来读写。
+      */}
+      <label className="settings-label">机器与启动命令</label>
       <p className="settings-hint" style={{ marginTop: 0 }}>
-        配好之后，<b>新建对话</b>时可以选让那条会话的 kiro-cli 跑在这台机器上。文件始终存在本地 ——
-        每一轮前后自动同步镜像；远端不做构建/测试/预览。
+        每台机器上 kiro / claude / codex 分别用哪个命令启动，可以自动检测、逐个测试。
+        配了远端机器之后，<b>新建对话</b>或右键「运行位置」就能让某条会话的 kiro-cli 跑在那台机器上 ——
+        <b>文件不会被复制过去</b>：它通过一条反向隧道调回你这台机器上的工具来读写。
       </p>
       {!enabled && (
         <p className="settings-hint" style={{ color: 'var(--error)' }}>
@@ -296,10 +412,11 @@ export const RemoteSettings: React.FC = () => {
       {localOnly && (
         <div className="remote-form">
           <p className="settings-hint" style={{ marginTop: 0 }}>
-            留空就是<b>默认</b>（kiro-cli 按常见安装位置找）。填绝对路径，或者 PATH 里的另一个名字 ——
-            这台机器上可能装着两个 kiro-cli，而"跑的是哪一个"决定了模型列表、agent 和 MCP 的行为。
+            留空 = 按常见安装位置自己找。填绝对路径或另一个名字都行 —— 这台机器上可能装着两个
+            kiro-cli，而"跑的是哪一个"决定了模型列表、agent 和 MCP 的行为。
+            <b>★</b> = 以前真的起过一条会话；<b>✗</b> = 找到了但起不来（或者不是这个工具）。
           </p>
-          <BinFields bins={local} onChange={setLocal} />
+          <BinFields bins={local} machine="local" onChange={setLocal} />
         </div>
       )}
 
@@ -349,8 +466,13 @@ export const RemoteSettings: React.FC = () => {
               onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
             />
           </Field>
-          {/* 这台远端机器上那三个 CLI 怎么起（空 = 用 PATH 上的默认） */}
-          <BinFields bins={draft.bins || {}} onChange={(bins) => setDraft({ ...draft, bins })} />
+          {/*
+            **机器级的动作排在工具之前** ——「测试连接那几个按钮应该在上面，连接能行才能测试工具」。
+
+            顺序就是依赖顺序：连不上的话"检测/测试那三个工具"根本无从谈起（它们都要走这条 ssh）。
+            按这个顺序排，失败也会按这个顺序暴露 —— 你先看到"连不上"，而不是先看到三个都 ✗
+            然后去怀疑是不是路径写错了。
+          */}
           <div className="remote-row-actions">
             <button className="remote-btn" disabled={locked || !canAct} onClick={() => void test()}>测试连接</button>
             <button
@@ -361,6 +483,8 @@ export const RemoteSettings: React.FC = () => {
             >{installing ? '安装中…' : '安装依赖'}</button>
             {draft.id && <button className="remote-btn" disabled={locked} onClick={() => void remove()}>删除</button>}
           </div>
+          {/* 这台远端机器上那三个 CLI 怎么起（空 = 用 PATH 上的那个） */}
+          <BinFields bins={draft.bins || {}} machine={draft.id || ''} onChange={(bins) => setDraft({ ...draft, bins })} />
         </div>
       )}
 
