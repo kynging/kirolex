@@ -34,8 +34,7 @@ import {
   removeAgentScript, sessionAgentName, writeAgentScript,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { agentSyncArgs, agentCheckScript, parseAgentCheck, mcpCommandsOf, localAgents, localAgentJson, sshCommandFor, rsyncError } from './kiroAgents.ts';
-import { pickWebSearch } from './webSearchMcp.ts';
+import { localAgentJson } from './kiroAgents.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
@@ -1614,54 +1613,6 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
   });
 }
 
-/**
- * **把 agent 配置推到远端，并验一遍** ——「agent 配置是不是得同步给远程 kiro？要不然切不过去？」
- *
- * 会切不过去，而且是**静默**的：实测远端用一个它没有的 agent 起 ACP 照样成功、照样答 initialize，
- * 只是 `mcpCapabilities.http` 从 true 变 false —— 它退回了默认 agent。于是这条会话看着是好的，
- * 而 system prompt / 工具白名单 / MCP 全没了，产出是另一个 agent 干的。
- *
- * 所以：推过去 → 验存在 → 不存在就**拒绝启动**（宁可不跑，也不要拿错的 agent 跑）。
- * MCP 命令缺了不拒绝（那是降级，不是换了个 agent），但要在会话里说清缺哪个。
- */
-async function syncKiroAgent(sessionId: string, remote: RemoteTarget, agent?: string): Promise<void> {
-  const sshCommand = sshCommandFor(remote, buildSshArgs);
-  const opts = sshCommand.split(' ').slice(1);
-  /* 先建目录再推 —— 远端可能根本没有 ~/.kiro/agents */
-  await new Promise<void>((resolve) => {
-    execFile('ssh', [...opts, remote.sshHost || '', 'mkdir -p ~/.kiro/agents'], { timeout: 60_000 }, () => resolve());
-  });
-  const args = agentSyncArgs(remote.sshHost || '', sshCommand);
-  const rsyncOut = await new Promise<{ code: number | null; stderr: string }>((resolve) => {
-    execFile('rsync', args, { timeout: 120_000, encoding: 'utf8' }, (err: any, _o, stderr) => resolve({
-      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stderr: String(stderr || ''),
-    }));
-  });
-  if (rsyncOut.code !== 0) {
-    logger.warn('remote', `agent 配置没推上去（${rsyncError(rsyncOut.stderr, rsyncOut.code)}）`);
-  } else {
-    logger.info('remote', `agent 配置已同步到 ${remote.sshHost}（${localAgents().length} 个）`);
-  }
-  if (!agent) return;
-  /* 验一遍：这个 agent 在不在，它要的 MCP 命令哪些不在 */
-  const script = agentCheckScript(agent, mcpCommandsOf(agent));
-  const out = await new Promise<string>((resolve) => {
-    execFile('ssh', [...opts, remote.sshHost || '', `bash -lc ${shellQuote(script)}`],
-      { timeout: 60_000, encoding: 'utf8' }, (_e, stdout) => resolve(String(stdout || '')));
-  });
-  const check = parseAgentCheck(out);
-  if (!check.present) {
-    throw new Error(`远端 ${remote.sshHost} 上没有 agent「${agent}」，而且同步也没成功。`
-      + `不能就这么跑 —— kiro-cli 会悄悄退回默认 agent（不报错），产出就是另一个 agent 干的。`);
-  }
-  if (check.missingCommands.length) {
-    /* 这是降级不是换 agent，所以不拦；但必须说出来 —— 否则"这个 agent 的工具怎么不工作"无从查 */
-    sessionNotice(sessionId, `⚠️ agent「${agent}」的这些 MCP 命令在 ${remote.sshHost} 上没有：`
-      + `${check.missingCommands.map((c) => `\`${c}\``).join('、')}。`
-      + `kiro-cli 不会报错，只会少掉这些工具 —— 需要的话在那台机器上装好再重开这条会话。`);
-    logger.warn('remote', `agent ${agent} 缺 MCP 命令：${check.missingCommands.join(', ')}`);
-  }
-}
 
 /**
  * **项目 id 不能从会话目录推出来** ——「为什么还是移动不了」。
@@ -3479,8 +3430,6 @@ app.whenReady().then(async () => {
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
       const remoteModels = await remotePreflight(profile.remote);
       profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
-      /* agent 配置必须先过去，否则远端会**静默**退回默认 agent（见 `syncKiroAgent`） */
-      await syncKiroAgent(kiroLexId, profile.remote, profile.kiroAgent);
     }
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
@@ -5470,7 +5419,6 @@ app.whenReady().then(async () => {
       if (target) {
         const models = await remotePreflight(profile.remote!);
         profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
-        await syncKiroAgent(sessionId, profile.remote!, profile.kiroAgent);
       }
       /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
       const cliCwd = sessionCwd(profile, nextLocalDir);
@@ -6288,7 +6236,6 @@ app.whenReady().then(async () => {
         */
         const remoteModels = await remotePreflight(profile.remote);
         profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
-        await syncKiroAgent(sessionId, profile.remote, profile.kiroAgent);
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools);
@@ -7090,7 +7037,6 @@ app.whenReady().then(async () => {
     /*
       **把本机 kiro-cli 默认 agent 的 web search MCP 也带过去** ——「把这个 mcp 也装到这个
       claude code 上面」。端点是这个账号自己的网关地址，所以**不写进脚本**：从本机实际在跑的那份
-      配置里读（`webSearchMcp`，理由在那个模块里），读不到就让脚本跳过并说清原因。
     */
     /*
       **登录参数也从本机读**（和 MCP 端点同一个道理）：远端没有浏览器，走 device flow 需要
@@ -7107,22 +7053,9 @@ app.whenReady().then(async () => {
       if (loginEnvStr) logger.info('remote', `bootstrap 会带上登录参数（${env.KIRO_LOGIN_PROVIDER}）`);
       else logger.info('remote', 'bootstrap 没读到本机的登录参数 —— 远端没登录时只会提示');
     } catch { /* 读不到就只提示，不猜 */ }
-    let mcpEnv = '';
-    try {
-      const ps = execSync('ps -ax -o command=', { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
-      const found = pickWebSearch(ps.split('\n'));
-      if (found) {
-        mcpEnv = `WEBSEARCH_MCP_URL=${shellQuote(found.url)} `
-          + `WEBSEARCH_MCP_SERVICE=${shellQuote(found.service || 'bedrock-agentcore')} `
-          + `WEBSEARCH_MCP_REGION=${shellQuote(found.region || 'us-east-1')} `;
-        logger.info('remote', `bootstrap 会带上 web search MCP（${found.url.slice(0, 48)}…）`);
-      } else {
-        logger.info('remote', 'bootstrap 没找到本机的 web search MCP —— 那一步会被跳过');
-      }
-    } catch { /* 读不到就跳过，绝不猜一个地址 */ }
     const args = buildSshArgs(
       target,
-      `cat > ${remoteTmp} && ${loginEnvStr}${mcpEnv}FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
+      `cat > ${remoteTmp} && ${loginEnvStr}FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
     );
     logger.info('remote', `bootstrap 开始 ${target.sshHost}${input.force ? '（强制重装）' : ''}`);
     return await new Promise<{ ok: boolean; code: number | null; error?: string }>((resolve) => {

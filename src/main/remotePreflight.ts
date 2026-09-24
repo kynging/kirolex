@@ -24,13 +24,13 @@ export interface Preflight {
 }
 
 /**
- * 远端要有的东西。
+ * 远端要有的东西 —— **只剩 kiro-cli 一个**。
  *
- * **`git` 去掉了**：镜像没有了之后远端根本没有那个仓库（文件留在用户机器上，靠 `local_git`
- * 回去查）—— 还拦着"远端没装 git"就是拿一个用不到的依赖挡住一条本来能跑的会话。
- * `rsync` 留着：agent 配置还是 rsync 推过去的（`agentSyncArgs`）。
+ * `git` 随镜像一起去掉（远端没有那个仓库，`local_git` 查的是用户机器上那一份）；
+ * `rsync` 随 agent 同步一起去掉（agent 配置现在是**生成**一份写过去，不再推本机那一堆）。
+ * 多列一个用不到的依赖，代价是拿它挡住一条本来能跑的会话。
  */
-export const REQUIRED_TOOLS = ['kiro-cli', 'rsync'];
+export const REQUIRED_TOOLS = ['kiro-cli'];
 
 /**
  * **顺带把远端的模型列表问出来** ——「模型列表其实也完全不一样，你看看能不能行」。
@@ -110,7 +110,7 @@ export function judgePreflight(
   return {
     code: 'ok',
     models,
-    message: `${host}：kiro-cli 已登录，rsync 也在${models.length ? `，${models.length} 个可用模型` : ''}。`,
+    message: `${host}：kiro-cli 在，也登录了${models.length ? `，${models.length} 个可用模型` : ''}。`,
   };
 }
 

@@ -356,9 +356,9 @@ describe('测试连接不问模型列表', () => {
     assert.match(M, /preflightScript\(undefined, \{ models: false \}\)/);
   });
 
-  test('`git` 不再是远端的必需品（镜像没了，那个仓库也不在远端）', async () => {
+  test('远端的必需品只剩 kiro-cli（`git` 随镜像走，`rsync` 随 agent 同步走）', async () => {
     const { REQUIRED_TOOLS } = await import('../src/main/remotePreflight.ts');
-    assert.deepEqual(REQUIRED_TOOLS, ['kiro-cli', 'rsync']);
+    assert.deepEqual(REQUIRED_TOOLS, ['kiro-cli']);
   });
 });
 

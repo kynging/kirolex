@@ -4,17 +4,20 @@
 #
 # 幂等，可以反复跑。装齐远端跑一条会话需要的东西，然后打印一份自检：
 #
-#   · 系统包       rsync git unzip tar（rsync 是镜像同步的命脉，没有它这功能整个不成立）
+#   · 系统包       git unzip tar（装 kiro-cli 的 zip 要它们）
 #   · Node（fnm）  claude-code / codex 都是 npm 包，没有 node 就装不上
 #   · kiro-cli     从 desktop-release 取对应架构的 zip，跑它自带的 install.sh
 #   · claude-code  官方安装脚本 https://claude.ai/install.sh（顺带 @zed-industries/claude-code-acp，
 #                  ACP 后端要它；官方脚本装的是原生二进制，不依赖 node）
 #   · codex        @openai/codex（官方发布在 npm）
 #   · kiro-cli 登录（device flow —— 这台机器没有浏览器，所以打印 URL + code，你在本机浏览器里完成）
-#   · python 库   python-pptx / openpyxl / pandas —— 生成 .pptx / .xlsx 的脚本是 agent 写完在
-#                  **远端**跑的，那边缺库就会失败（预览仍然在本地做，所以不装 LibreOffice）
-#   · uv + mcp-proxy-for-aws + 把 kiro-cli 默认 agent 的 web search MCP 装进 claude code
-#     （端点由 KiroLex 从本机实际在跑的那份配置里读出来，用 WEBSEARCH_MCP_URL 传进来 —— 不写死）
+#   · python 库   python-pptx / openpyxl / pandas（远端偶尔要就地跑个生成脚本）
+#
+# 故意**不**碰 kiro-cli 的配置：不写 agent、不登记 MCP、不动 ~/.kiro。
+# 远端那条会话用的 agent 是 KiroLex **每次启动时生成**的一份（只有一条 `kirolex-local` MCP，
+# 见 `remoteLocalTools.buildSessionAgent`）—— 脚本再往 ~/.kiro 里写东西，只会变成一份
+# 没人读、又会让人以为"配置在那儿"的垃圾。要给远端配和本地不一样的东西时，
+# 那也该是显式的一份远端配置，而不是安装脚本顺手塞的。
 #
 # KiroLex 的设置界面上有一个按钮直接跑它（「安装依赖」），也可以自己来：
 #   scp scripts/remote-bootstrap.sh <host>:~/ && ssh <host> 'bash ~/remote-bootstrap.sh'
@@ -38,7 +41,7 @@ rc=0
 note_fail() { say "✗ $*"; rc=1; }
 
 # ---------------------------------------------------------------- 系统包
-step "系统包（rsync / git / unzip / tar）"
+step "系统包（git / unzip / tar）"
 PKG=""
 if have dnf; then PKG="dnf"
 elif have yum; then PKG="yum"
@@ -60,7 +63,7 @@ install_pkg() {
   have "$name" || { note_fail "$name 装不上（权限？源？）"; return 1; }
 }
 
-for b in rsync git unzip tar; do install_pkg "$b"; done
+for b in git unzip tar; do install_pkg "$b"; done
 
 # ---------------------------------------------------------------- Node
 # claude-code 和 codex 都是 npm 包。用 fnm 而不是系统 nodejs：发行版自带的往往太老，
@@ -215,66 +218,16 @@ else
   say "   请 ssh 到这台机器手动跑一次：kiro-cli login --license pro --use-device-flow"
 fi
 
-# ------------------------------------------- web search MCP（给 claude code）
-#
-# kiro-cli 的内置 agent 挂着一个 `agentcore-websearch`（mcp-proxy-for-aws 代理一个 SigV4 的
-# AgentCore 网关）。这一段把**同一套配置**装进这台机器的 claude code 里。
-#
-# 端点不写死在脚本里：它是这个账号自己的网关地址，写进仓库既是泄漏、换账号之后又会悄悄失效。
-# 由 KiroLex 从本机实际在跑的那份配置里读出来，用 WEBSEARCH_MCP_URL 传进来；没传就跳过。
-#
-# **不抄 `--profile default`**：本机是那么配的，而这台机器走的是实例角色 —— 照抄过去只会让它
-# 一启动就找不到 profile。
-step "web search MCP（装进 claude code）"
-WEBSEARCH_MCP_URL="${WEBSEARCH_MCP_URL:-}"
-WEBSEARCH_MCP_SERVICE="${WEBSEARCH_MCP_SERVICE:-bedrock-agentcore}"
-WEBSEARCH_MCP_REGION="${WEBSEARCH_MCP_REGION:-us-east-1}"
-WEBSEARCH_MCP_NAME="${WEBSEARCH_MCP_NAME:-agentcore-websearch}"
-
-if [ -z "$WEBSEARCH_MCP_URL" ]; then
-  say "→ 跳过：没拿到端点（KiroLex 从本机 kiro-cli 的实际调用里读它；本机那条 MCP 没在跑时读不到）"
-elif ! have claude; then
-  say "→ 跳过：这台机器上没有 claude"
-else
-  # uv 用**官方安装脚本**；mcp-proxy-for-aws 是个 python 工具，uv tool 装完就在 ~/.local/bin 里
-  if ! have uv; then
-    say "→ 官方安装脚本 https://astral.sh/uv/install.sh"
-    curl -LsSf https://astral.sh/uv/install.sh 2>/dev/null | sh >/dev/null 2>&1
-    export PATH="$HOME/.local/bin:$PATH"
-  fi
-  if have uv && { ! have mcp-proxy-for-aws || [ "$FORCE" = "1" ]; }; then
-    say "→ uv tool install mcp-proxy-for-aws"
-    uv tool install --force mcp-proxy-for-aws >/dev/null 2>&1 || note_fail "mcp-proxy-for-aws 装不上"
-    export PATH="$HOME/.local/bin:$PATH"
-  fi
-  if have mcp-proxy-for-aws; then
-    # 幂等：已经登记过就先删再加（改了端点也能生效）
-    if claude mcp list </dev/null 2>/dev/null | grep -q "$WEBSEARCH_MCP_NAME"; then
-      claude mcp remove --scope user "$WEBSEARCH_MCP_NAME" </dev/null >/dev/null 2>&1 || true
-    fi
-    say "→ claude mcp add $WEBSEARCH_MCP_NAME"
-    if claude mcp add --scope user "$WEBSEARCH_MCP_NAME" -- \
-        mcp-proxy-for-aws "$WEBSEARCH_MCP_URL" \
-        --service "$WEBSEARCH_MCP_SERVICE" --region "$WEBSEARCH_MCP_REGION" </dev/null >/dev/null 2>&1; then
-      say "  已登记（走这台机器自己的 AWS 凭证签名：实例角色或 ~/.aws）"
-    else
-      note_fail "claude mcp add 失败"
-    fi
-  else
-    note_fail "没有 mcp-proxy-for-aws，装不了 web search MCP"
-  fi
-fi
-
 # ---------------------------------------------------------------- 自检
 step "自检"
 say "uname   : $(uname -srm)"
-for b in kiro-cli rsync git unzip node npm claude codex claude-code-acp; do
+for b in kiro-cli git unzip node npm claude codex claude-code-acp; do
   if have "$b"; then
     say "$(printf '%-16s' "$b"): $(command -v "$b")  $("$b" --version </dev/null 2>/dev/null | head -1)"
   else
     say "$(printf '%-16s' "$b"): 缺"
     case "$b" in
-      kiro-cli|rsync|git) rc=1 ;;   # 这三个缺了远程会话根本跑不起来
+      kiro-cli) rc=1 ;;   # 只有它是硬依赖：远程会话就是在远端跑一个 kiro-cli
     esac
   fi
 done
@@ -285,14 +238,6 @@ if have python3; then
     python3 -c "import $mod" </dev/null >/dev/null 2>&1 && mods="$mods $mod" || mods="$mods ✗$mod"
   done
   say "python 库       :$mods"
-fi
-
-if have claude; then
-  if claude mcp list </dev/null 2>/dev/null | grep -q "${WEBSEARCH_MCP_NAME:-agentcore-websearch}"; then
-    say "web search MCP : 已登记到 claude code"
-  else
-    say "web search MCP : 没有（端点没传进来，或者 claude 不在）"
-  fi
 fi
 
 if have kiro-cli; then

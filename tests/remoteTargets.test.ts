@@ -243,14 +243,16 @@ describe('在界面上加/改/删一台远端', () => {
 describe('一键装齐远端依赖', () => {
   const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
 
-  test('脚本装的是这几样：kiro-cli / claude code / codex / node / rsync / git', () => {
+  test('脚本装的是这几样：kiro-cli / claude code / codex / node / git / unzip', () => {
     assert.match(SH, /kirocli-x86_64-linux\.zip/);
     assert.match(SH, /kirocli-aarch64-linux\.zip/, 'arm 的机器也要能装');
     assert.match(SH, /install\.sh' --no-confirm|install\.sh" --no-confirm/);
     assert.match(SH, /@anthropic-ai\/claude-code/);
     assert.match(SH, /@openai\/codex/);
     assert.match(SH, /@zed-industries\/claude-code-acp/, 'KiroLex 走 ACP，claude code 要靠它当执行器');
-    for (const b of ['rsync', 'git', 'unzip']) assert.ok(SH.includes(b), `缺 ${b}`);
+    for (const b of ['git', 'unzip']) assert.ok(SH.includes(b), `缺 ${b}`);
+    /* rsync 不再装：镜像和 agent 同步都没了，远端没有任何东西用它 */
+    assert.equal(/for b in rsync/.test(SH), false);
     assert.match(SH, /fnm/, 'claude-code/codex 是 npm 包，发行版自带的 node 往往太老');
   });
 
@@ -270,8 +272,10 @@ describe('一键装齐远端依赖', () => {
     assert.match(SH, /没登录/);
   });
 
-  test('缺 kiro-cli/rsync/git 要算失败 —— 少了它们远程会话根本跑不起来', () => {
-    assert.match(SH, /kiro-cli\|rsync\|git\) rc=1/);
+  test('只有缺 kiro-cli 才算失败 —— 远程会话就是在远端跑一个它', () => {
+    assert.match(SH, /kiro-cli\) rc=1/);
+    /* 以前 rsync/git 缺了也算失败：那是镜像时代的依赖，现在拿它们挡人就纯属误伤 */
+    assert.equal(/rsync\|git\) rc=1/.test(SH), false);
   });
 
   test('接线：IPC 边跑边把输出发给界面（几分钟不给看就像卡死）', () => {
@@ -284,7 +288,7 @@ describe('一键装齐远端依赖', () => {
       stdin 的命令都会把剩下的脚本吃掉（`claude-code-acp --version` 就是这种），于是自检整段
       没跑而退出码还是 0。这条断言就是防它回来的。
     */
-    assert.match(M, /cat > \$\{remoteTmp\} && \$\{loginEnvStr\}\$\{mcpEnv\}FORCE=/);
+    assert.match(M, /cat > \$\{remoteTmp\} && \$\{loginEnvStr\}FORCE=/);
     assert.match(M, /rm -f \$\{remoteTmp\}/, '跑完要删，不在对方磁盘上留东西');
     assert.equal(/bash -s`\)/.test(M), false, 'bash -s 那条路不许回来');
     assert.match(M, /child\.stdin\.write\(script\)/);
@@ -329,80 +333,13 @@ describe('一键装齐远端依赖', () => {
 });
 
 /*
- * 「你先看一下 kiro-cli 默认 agent 的 web search mcp，把这个 mcp 也装到这个 claude code 上面」。
+ * 这里原来有一组"把 kiro-cli 默认 agent 的 web search MCP 装进远端 claude code"的测试
+ * （连同 `webSearchMcp.ts`：从本机 `ps` 里读出那个 SigV4 网关地址，再 `claude mcp add`）。
  *
- * 实测到的那条（本机 `kiro-cli mcp list` 里 kiro_default 挂的 `agentcore-websearch`）：
- *   mcp-proxy-for-aws https://websearch-…gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp
- *     --service bedrock-agentcore --region us-east-1 --profile default
+ * 整套去掉了 ——「脚本里也不要加那些什么配置 kiro-cli 自定义配置之类的信息」。安装脚本只装东西，
+ * 不往 `~/.kiro` 里写配置：远端那条会话用的 agent 是 KiroLex 每次生成的一份（只有一条
+ * `kirolex-local`），脚本塞进去的配置没人读，却会让人以为"配置在那儿"。
  */
-describe('web search MCP 带到远端的 claude code', () => {
-  const REAL_PS = '/Users/k/.local/share/uv/tools/mcp-proxy-for-aws/bin/python /Users/k/.local/bin/mcp-proxy-for-aws '
-    + 'https://websearch-gw-0hx6kh9cho.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp '
-    + '--service bedrock-agentcore --region us-east-1 --profile default';
-
-  test('从实际在跑的命令行里读出端点/服务/区域', async () => {
-    const { parseProxyCommand } = await import('../src/main/webSearchMcp.ts');
-    const m = parseProxyCommand(REAL_PS)!;
-    assert.match(m.url, /^https:\/\/websearch-.*\/mcp$/);
-    assert.equal(m.service, 'bedrock-agentcore');
-    assert.equal(m.region, 'us-east-1');
-  });
-
-  test('不是这个代理的进程一律不认', async () => {
-    const { parseProxyCommand } = await import('../src/main/webSearchMcp.ts');
-    assert.equal(parseProxyCommand('node /some/other/thing --region us-east-1'), null);
-    assert.equal(parseProxyCommand('mcp-proxy-for-aws --help'), null, '没有端点就不算');
-    assert.equal(parseProxyCommand(''), null);
-  });
-
-  test('有多个代理时挑 websearch 那个', async () => {
-    const { pickWebSearch } = await import('../src/main/webSearchMcp.ts');
-    const lines = [
-      'python mcp-proxy-for-aws https://other-gw.gateway.bedrock-agentcore.us-east-1.amazonaws.com/mcp --service bedrock-agentcore',
-      REAL_PS,
-    ];
-    assert.match(pickWebSearch(lines)!.url, /websearch-gw-0hx6kh9cho/);
-    assert.equal(pickWebSearch([]), null, '读不到就是 null —— 绝不猜一个地址');
-  });
-
-  test('**不抄 --profile** —— 远端走实例角色，那台机器上没有名叫 default 的 profile', async () => {
-    const { claudeMcpAddArgs, parseProxyCommand } = await import('../src/main/webSearchMcp.ts');
-    const args = claudeMcpAddArgs('agentcore-websearch', parseProxyCommand(REAL_PS)!);
-    assert.equal(args.includes('--profile'), false, '照抄过去只会让它一启动就找不到 profile');
-    assert.deepEqual(args.slice(0, 6), ['mcp', 'add', '--scope', 'user', 'agentcore-websearch', '--']);
-    assert.ok(args.includes('--service') && args.includes('bedrock-agentcore'));
-  });
-
-  test('端点**不写进脚本/仓库** —— 它是这个账号自己的网关地址', () => {
-    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
-    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    const WS = fs.readFileSync(path.join(process.cwd(), 'src/main/webSearchMcp.ts'), 'utf8');
-    for (const [name, src] of [['脚本', SH2], ['index.ts', M], ['webSearchMcp.ts', WS]] as const) {
-      assert.equal(/websearch-gw-[a-z0-9]{6,}/.test(src), false, `${name} 里不许出现真实网关 id`);
-    }
-    /* 靠环境变量传进来，没传就跳过 */
-    assert.match(SH2, /WEBSEARCH_MCP_URL="\$\{WEBSEARCH_MCP_URL:-\}"/);
-    assert.match(SH2, /跳过：没拿到端点/);
-    assert.match(M, /WEBSEARCH_MCP_URL=\$\{shellQuote\(found\.url\)\}/);
-  });
-
-  test('脚本里用 claude mcp add --scope user，且幂等（先删再加）', () => {
-    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
-    assert.match(SH2, /claude mcp add --scope user/);
-    assert.match(SH2, /claude mcp remove --scope user/);
-    /* mcp-proxy-for-aws 是 python 工具：uv 用**官方**安装脚本 */
-    assert.match(SH2, /astral\.sh\/uv\/install\.sh/);
-    assert.match(SH2, /uv tool install --force mcp-proxy-for-aws/);
-  });
-
-  test('claude code 换成官方安装脚本（原生二进制，不依赖 node），npm 兜底', () => {
-    const SH2 = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
-    assert.match(SH2, /claude\.ai\/install\.sh/);
-    /* 用**最后一处**：头部注释里也提到了这个 URL，从那儿切看不到兜底那几行 */
-    const at = SH2.lastIndexOf('claude.ai/install.sh');
-    assert.match(SH2.slice(at, at + 900), /npm_i '@anthropic-ai\/claude-code' claude/, '装不上要能退回 npm');
-  });
-});
 
 /*
  * 「为什么不把远程机器弄成一个下拉列表」+「我是需要能到 finder 里面去找到密钥文件而不是还得自己写路径」。
@@ -801,7 +738,7 @@ describe('远端 kiro 登录', () => {
   test('接线：bootstrap 把登录参数一起传过去', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     assert.match(M, /loginEnv\(parseWhoami\(who\)\)/);
-    assert.match(M, /\$\{loginEnvStr\}\$\{mcpEnv\}FORCE=/);
+    assert.match(M, /\$\{loginEnvStr\}FORCE=/);
   });
 });
 
@@ -838,57 +775,40 @@ describe('脚本里的 python 库（pptx/xlsx）', () => {
 });
 
 /*
- * 「还有什么 agent 配置之类的是不是得同步给远程 kiro？要不然切不过去？」——
- * 会切不过去，而且**是静默的**。实测：远端用一个它没有的 agent 起 ACP
- * （`kiro-cli acp --agent weekly-report`）照样启动、照样正常答 initialize，唯一区别是
- * `mcpCapabilities.http` 从 true 变 false —— 它悄悄退回默认 agent，system prompt / 工具白名单 /
- * MCP 全没了，而界面上一个字都不说。
+ * 「你把远程 kiro 的那些 agent 啥的清理一下，包括 mcp 啥的应该都不需要了。
+ *   到时候直接让远程配置一些和本地不一样的」。
  *
- * 两边的 agent 实测就是两套：本机 weekly-report / sfdc-* / rds-dba / ai-dlc / amzn-builder…，
- * 远端只有四个老的 kirolex-*。
+ * 这里原来有一组"同步 agent 到远端 + 去远端验一遍"的测试。整套机制去掉了，原因实测过：
+ *   · 推过去的那些 JSON **没人读** —— 远端用的是 KiroLex 每次生成的 `kirolex-local-<会话>.json`；
+ *   · 拷 `mcpServers` 是**有害**的：命令是本机路径，远端没有，kiro-cli 不报错、只静默少工具；
+ *   · `resources: file:///Users/...` 每次启动都打 `File URI not found`。
+ * 生成那一份的判据在 tests/localMcp.test.ts（`buildSessionAgent`：按白名单挑字段）。
  */
-describe('agent 配置要同步到远端，并且验一遍', () => {
-  test('推 agent 的 rsync：只推 *.json，**不带 --delete**（远端有它自己的 agent）', async () => {
-    const { agentSyncArgs, REMOTE_AGENTS_DIR } = await import('../src/main/kiroAgents.ts');
-    const a = agentSyncArgs('u@h', 'ssh -i /k.pem', '/home/me');
-    assert.equal(a.includes('--delete'), false, '实测远端有四个 kirolex-*，不能清掉别人的');
-    assert.deepEqual(a.slice(-2), ['/home/me/.kiro/agents/', `u@h:${REMOTE_AGENTS_DIR}/`]);
-    const i = a.indexOf('--include');
-    assert.equal(a[i + 1], '*.json');
-    assert.ok(a.includes('--exclude') && a[a.indexOf('--exclude') + 1] === '*');
+describe('远端不再有"同步过去的"配置', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('没有 rsync 推 agent 这一步了，连远端的 rsync 依赖都跟着去掉', async () => {
+    assert.equal(/syncKiroAgent/.test(M), false);
+    assert.equal(/agentSyncArgs/.test(M), false);
+    const { REQUIRED_TOOLS } = await import('../src/main/remotePreflight.ts');
+    assert.deepEqual(REQUIRED_TOOLS, ['kiro-cli'], '远端只需要 kiro-cli');
   });
 
-  test('从 agent 配置里挑出它依赖的 MCP 命令', async () => {
-    const { mcpCommands } = await import('../src/main/kiroAgents.ts');
-    /* 实测本机 kiro_default 那条：mcp-proxy-for-aws 代理一个 AgentCore 网关 */
-    assert.deepEqual(mcpCommands({
-      mcpServers: {
-        'agentcore-websearch': { command: '/Users/k/.local/bin/mcp-proxy-for-aws', args: ['https://x/mcp'] },
-        playwright: { command: 'npx', args: ['-y', '@playwright/mcp'] },
-      },
-    }).sort(), ['/Users/k/.local/bin/mcp-proxy-for-aws', 'npx']);
-    assert.deepEqual(mcpCommands({}), []);
-    assert.deepEqual(mcpCommands(null), []);
+  test('本机这边只剩"读定义"（生成远端那一份用）', async () => {
+    const m = await import('../src/main/kiroAgents.ts');
+    assert.deepEqual(Object.keys(m).sort(), ['agentsDir', 'localAgents', 'localAgentJson'].sort());
   });
 
-  test('远端检查一条命令问完：agent 在不在 + 哪些 MCP 命令不在', async () => {
-    const { agentCheckScript, parseAgentCheck } = await import('../src/main/kiroAgents.ts');
-    const script = agentCheckScript('weekly-report', ['builder-mcp', 'npx']);
-    assert.match(script, /test -f ~\/\.kiro\/agents\/weekly-report\.json && echo AGENT_OK \|\| echo AGENT_MISSING/);
-    assert.match(script, /command -v "builder-mcp"/);
-    assert.deepEqual(parseAgentCheck('AGENT_OK\nMISSING builder-mcp'), { present: true, missingCommands: ['builder-mcp'] });
-    assert.deepEqual(parseAgentCheck('AGENT_MISSING'), { present: false, missingCommands: [] });
-  });
-
-  test('接线：**agent 不在就拒绝启动**（静默跑错 agent 比不跑糟），MCP 缺了只提示', () => {
-    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /async function syncKiroAgent\(/);
-    assert.match(M, /上没有 agent「\$\{agent\}」/);
-    assert.match(M, /会悄悄退回默认 agent（不报错）/);
-    /* 缺 MCP 命令不拦，但要说 */
-    assert.match(M, /的这些 MCP 命令在 \$\{remote\.sshHost\} 上没有/);
-    /* 每一条会起远程执行器的路都要同步：新建 / attach / 换机器 */
-    assert.ok((M.match(/await syncKiroAgent\(/g) || []).length >= 3);
+  test('安装脚本也不再往 ~/.kiro 里写东西', () => {
+    const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    assert.equal(/claude mcp add/.test(SH), false, '不再登记 MCP');
+    assert.equal(/WEBSEARCH_MCP_URL/.test(SH), false);
+    assert.equal(/\.kiro\/agents/.test(SH), false, '不许碰 agent 目录');
+    /* 装的东西还在：kiro-cli / node / claude / codex / python 库 */
+    assert.match(SH, /kiro-cli/);
+    assert.match(SH, /python-pptx/);
+    /* rsync 不再是它要装的系统包（没人用了） */
+    assert.equal(/for b in rsync/.test(SH), false);
   });
 });
 

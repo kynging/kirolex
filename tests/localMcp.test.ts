@@ -214,25 +214,36 @@ describe('HTTP 那一层：只听 loopback，认 token，不泄露形状', () =>
 });
 
 describe('接线层：agent 配置一条会话一份，端口不撞', () => {
-  test('**拷你选的那个 agent**，只加这一条 MCP —— 少任何一样，产出就是另一个 agent 干的', () => {
+  test('**按白名单挑字段**：带走人格，丢掉那些在远端根本不成立的东西', () => {
+    /* 「你把远程 kiro 的那些 agent 啥的清理一下，包括 mcp 啥的应该都不需要了」。
+       以前是整份拷过去 + 并上这条 MCP。问题是拷过去的东西在远端**不成立**：
+       MCP 的命令是本机路径（kiro-cli 不报错，只静默少工具）、`resources` 是本机 file:// 
+       （每次启动打 File URI not found）、`includeMcpJson` 会把远端那台机器的全局 MCP 拉进来。 */
     const base = {
       name: 'aws-agent',
       prompt: '你是一个 AWS 专家',
-      mcpServers: { existing: { command: 'uv', args: ['x'] } },
-      tools: ['fs_read', '@existing'],
-      allowedTools: ['fs_read'],
-      resources: ['file://x'],
+      model: 'claude-opus-5',
+      mcpServers: { drawio: { command: '/opt/homebrew/bin/node' }, playwright: { command: 'npx' } },
+      resources: ['file:///Users/k/x.md'],
+      hooks: { onStart: 'echo hi' },
+      includeMcpJson: true,
+      tools: ['fs_read', '@drawio'],
+      allowedTools: ['fs_read', '@playwright'],
     };
     const out = buildSessionAgent(base, { name: 'kirolex-local-s1', url: 'http://127.0.0.1:39100/mcp/abc' });
+    /* 带走的：名字、人格、钉住的模型 */
     assert.equal(out.name, 'kirolex-local-s1');
-    assert.equal(out.prompt, base.prompt, 'prompt 不能丢');
-    assert.deepEqual(out.resources, base.resources);
-    assert.ok(out.mcpServers.existing, '原来的 MCP 不能丢');
-    assert.deepEqual(out.mcpServers[MCP_SERVER_NAME], { type: 'http', url: 'http://127.0.0.1:39100/mcp/abc' });
-    /* `tools` 是白名单：不把新 MCP 加进去等于工具在但调不动，而且失败是静默的 */
-    assert.ok(out.tools.includes(`@${MCP_SERVER_NAME}`));
-    /* 别每次都问 —— 一轮可能调十几次；留痕在状态行上 */
-    assert.ok(out.allowedTools.includes(`@${MCP_SERVER_NAME}`));
+    assert.equal(out.prompt, base.prompt);
+    assert.equal(out.model, 'claude-opus-5');
+    /* 唯一一条 MCP 就是本地工具 */
+    assert.deepEqual(Object.keys(out.mcpServers), [MCP_SERVER_NAME]);
+    /* 丢掉的那些一个都不许漏过去 */
+    for (const gone of ['resources', 'hooks', 'includeMcpJson', 'useLegacyMcpJson']) {
+      assert.equal(gone in out, false, `${gone} 不该带过去`);
+    }
+    /* `tools` 白名单：内置工具留着，指向别的 MCP 的 `@xxx` 去掉（那些 MCP 已经不在了） */
+    assert.deepEqual(out.tools, ['fs_read', `@${MCP_SERVER_NAME}`]);
+    assert.deepEqual(out.allowedTools, ['fs_read', `@${MCP_SERVER_NAME}`]);
   });
 
   test('base 里没写 tools 就**显式写 `["*"]`** —— 不写等于一个工具都没有（实测）', () => {
