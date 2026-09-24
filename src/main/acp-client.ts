@@ -155,6 +155,8 @@ export class AcpClient extends EventEmitter {
   private env: Record<string, string>;
   private remote?: RemoteTarget;
   private localTools?: { remotePort: number; localPort: number; agentOverride: string };
+  /** 最近一点 stderr —— ssh 退出码 255 的**原因**在里面（见 stderr 处理那一段）。 */
+  private lastStderr = '';
   /** 远端那个 kiro-cli 的 PID（它自己报的）—— 断开时要把它杀掉，见 `KIROLEX_PID`。 */
   remotePid?: number;
   /**
@@ -281,6 +283,9 @@ export class AcpClient extends EventEmitter {
 
       this.process.stderr!.on('data', (data: Buffer) => {
         const msg = data.toString('utf-8').trim();
+        /* 留着最后一点 stderr：ssh 退出码 255 只说"连接没了"，**原因**在这里面
+           （典型的一条：`Warning: remote port forwarding failed for listen port 39100`）。 */
+        if (msg) this.lastStderr = `${this.lastStderr}\n${msg}`.slice(-2000);
         /* 远端自报的 PID：记下来，断开时要杀它（见 buildRemoteKiroCommand 那段） */
         const pid = parseRemotePid(msg);
         if (pid) this.remotePid = pid;
@@ -310,7 +315,7 @@ export class AcpClient extends EventEmitter {
         this.rejectAllPending(new Error(code === 0
           ? '执行器已退出（正常退出，code 0）—— KiroLex 会自动重连并重发这一轮。'
           : this.remote?.sshHost && isSshTransportExit(code)
-            ? sshDropMessage(code)
+            ? sshDropMessage(code, this.lastStderr)
             : `Process exited with code ${code}`));
       });
 

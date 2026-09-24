@@ -29,8 +29,20 @@ export function isSshTransportExit(code: number | null | undefined): boolean {
   return code === SSH_TRANSPORT_EXIT;
 }
 
-/** 远端执行器退出时给的话。文本里带 `connection closed`，让下面的判据认得出它可重试。 */
-export function sshDropMessage(code: number | null | undefined): string {
+/**
+ * 远端执行器退出时给的话。文本里带 `connection closed`，让下面的判据认得出它可重试。
+ *
+ * **`stderr` 里有原因就说原因** —— 退出码 255 只说"连接没了"，而实测最容易撞上的那一种
+ * 根本不是掉线：`Warning: remote port forwarding failed for listen port 39100`
+ * （换 agent 时新 ssh 去绑旧 ssh 还占着的那个端口）。只报"SSH 连接断了"会把人引到网络上去查，
+ * 而那句 warning 就在手边。
+ */
+export function sshDropMessage(code: number | null | undefined, stderr = ''): string {
+  const fwd = /remote port forwarding failed for listen port (\d+)/i.exec(String(stderr || ''));
+  if (fwd) {
+    return `SSH connection closed（ssh exit ${code}）：远端端口 ${fwd[1]} 被占用，本地工具的隧道没建起来。`
+      + `KiroLex 会换一个端口重试 —— 要是反复出现，那台机器上可能有上次留下的 kiro-cli 还占着它。`;
+  }
   return `SSH connection closed（ssh exit ${code}）—— 远端执行器的连接断了，KiroLex 会按退避自动重发这一轮。`;
 }
 

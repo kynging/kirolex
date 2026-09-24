@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFile, spawn } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -24,17 +24,16 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { judgePreflight, preflightScript } from './remotePreflight.ts';
+import { judgePreflight, preflightScript, MODEL_PROBE, parseModels } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import {
-  allocateRemotePort, buildSessionAgent, localToolsHelp, mcpUrl,
-  removeAgentScript, sessionAgentName, writeAgentScript,
+  allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
+  remoteAgentScript, removeAgentScript, sessionAgentName,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { localAgentJson } from './kiroAgents.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
@@ -1469,23 +1468,40 @@ async function ensureLocalTools(
 
       所以顺序是：算出端口 → **立刻**写进 map（同步，占住它）→ 再去做需要等待的事。
     */
+    /*
+      **每次起执行器都换一个新端口** ——「Error invoking remote method 'acp:switch-kiro-agent':
+      ssh exit 255」就是这条：换 agent / 换模型是**先起新执行器、成功了再关旧的**（那是故意的，
+      失败时不丢会话），而上一版复用了这条会话原来那个端口 —— 新 ssh 去绑 39100 时旧 ssh 还占着，
+      `ExitOnForwardFailure=yes` 于是让它直接失败。
+
+      看起来像"SSH 掉线"，其实是必然发生、而且重试也必然再撞（同一个端口）。
+      所以这里把**自己当前那个**也算进"已占用"，永远拿一个新的。旧端口在旧执行器退出后自然回到池子里。
+    */
     const used = [...localToolsBySession.values()].map((v) => v.remotePort);
-    const remotePort = localToolsBySession.get(sessionId)?.remotePort ?? allocateRemotePort(used);
+    const remotePort = allocateRemotePort(used);
     localToolsBySession.set(sessionId, { remotePort, localPort: localMcpServer.port(), agentOverride });
-    /* 那条会话专用的 agent：拷你选的那个（prompt / 工具 / 别的 MCP 都不能少），只加这一条 MCP */
-    const base = profile.kiroAgent ? (localAgentJson(profile.kiroAgent) || {}) : {};
-    const agentJson = buildSessionAgent(base, {
-      name: agentOverride,
-      url: mcpUrl(remotePort, urlPath),
-    });
     /*
       **远端那个草稿目录要先建出来** —— 实测：`sessionCwd` 给的是
       `<workdir>/scratch/<id>`，而镜像去掉之后**没有任何东西再去创建它**（以前是 rsync 顺手建的）。
       于是 `session/new` 的 cwd 指向一个不存在的目录：kiro-cli 起来了，但那一轮里它的 shell
       工具 pwd 落在 `/tmp`，而模型看到"说好的目录不存在"就开始怀疑整套接线。
     */
-    await writeRemoteFile(remote, `mkdir -p ${shellQuote(sessionCwd(profile, localDir))} && ${writeAgentScript(agentOverride)}`,
-      JSON.stringify(agentJson, null, 2));
+    await writeRemoteFile(remote, `mkdir -p ${shellQuote(sessionCwd(profile, localDir))}`, '');
+    /*
+      **那条会话专用的 agent 在远端拼**：有同名的就拿远端那一份做底子，没有就用默认
+      （见 `remoteAgentScript`）。退到默认时**必须说出来** —— 悄悄换一个 agent 是这条路上
+      最贵的静默失败：产出是另一个 agent 干的，而界面一个字都不会说。
+    */
+    const agentOut = await runRemoteCapture(remote,
+      remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath)));
+    const usedBase = parseAgentBase(agentOut);
+    if (profile.kiroAgent && usedBase === 'default') {
+      sessionNotice(sessionId, `⚠️ ${remote.sshHost} 上没有 agent「${profile.kiroAgent}」，`
+        + `这条会话用**默认 agent** + 你本机的工具。要它按那个 agent 跑，在那台机器上建一份同名配置。`);
+      logger.warn('localmcp', `远端没有 agent ${profile.kiroAgent}，退到默认 sessionId=${sessionId}`);
+    } else if (usedBase && usedBase !== 'default') {
+      logger.info('localmcp', `远端用它自己的 agent「${usedBase}」做底子 sessionId=${sessionId}`);
+    }
     const spec = { remotePort, localPort: localMcpServer.port(), agentOverride };
     localToolsBySession.set(sessionId, spec);
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
@@ -1540,6 +1556,22 @@ function runProbe(machine: string, script: string): Promise<string> {
             .map((l) => l.trim())
             .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*/.test(l))[0];
           reject(new Error(real || `ssh 退出码 ${(err as any).code}`));
+        } else resolve(String(stdout || ''));
+      });
+  });
+}
+
+/** 在远端跑一条命令并**拿回 stdout**（`writeRemoteFile` 丢掉输出）。 */
+function runRemoteCapture(remote: RemoteTarget, script: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
+      { timeout: 60_000, encoding: 'utf8' },
+      (err, stdout, stderr) => {
+        if (err && !String(stdout || '')) {
+          /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
+          const real = String(stderr || err.message).split('\n').map((l) => l.trim())
+            .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*/.test(l))[0];
+          reject(new Error(real || String(err.message)));
         } else resolve(String(stdout || ''));
       });
   });
@@ -6015,7 +6047,32 @@ app.whenReady().then(async () => {
     }
   });
 
-  ipcMain.handle('acp:list-models', async () => {
+  ipcMain.handle('acp:list-models', async (_event, machine?: string) => {
+    /*
+      **模型列表按机器分** ——「确认下右侧界面远程会话显示的是远程的 agent 和模型」。
+
+      以前只有一份：跑本机 kiro-cli，所有会话共用。而两台机器的 kiro-cli 版本不一样
+      （实测本机 2.23.1、东京 1.27.0），于是下拉里完全可能有远端没有的模型 ——
+      启动那一刻 `pickRemoteModel` 会替换成可用的并在会话里说一句，也就是不会静默跑错，
+      但下拉在骗你。远程会话就去问**那台机器**。
+
+      远端那边用的是同一个探测（`preflightScript` 里那段：故意传一个不存在的模型，
+      kiro-cli 在参数校验就会把可用列表打出来 —— 不真调模型、不花额度）。
+    */
+    if (machine && machine !== 'local') {
+      const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+      if (!target?.sshHost) throw new Error(`找不到这台机器（${machine}）—— 设置里删掉了？`);
+      const bin = remoteKiroBin(target);
+      if (!bin) throw new Error(`还没有设置 ${target.sshHost} 上的 kiro 启动命令（设置 → 🖥 机器）。`);
+      const out = await runRemoteCapture(target,
+        `${shellQuote(bin)} chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1`)
+        .catch((err) => { throw new Error(`问不到 ${target.sshHost} 的模型列表：${err?.message || err}`); });
+      const ids = parseModels(out);
+      if (!ids.length) throw new Error(`${target.sshHost} 没有报出模型列表（kiro-cli 版本不认这个探测？）`);
+      /* 远端只给得出 id（那条错误信息里就只有 id）—— 名字用 id，乘数留空：
+         宁可少显示一个乘数，也不要把本机那份的乘数贴到另一台机器的模型上。 */
+      return { models: ids.map((id) => ({ model_id: id, model_name: id })) };
+    }
     /**
      * SINGLE-FLIGHT，而且超时给足 —— 两者都是实测逼出来的。
      *

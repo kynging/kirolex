@@ -56,61 +56,72 @@ export function mcpUrl(remotePort: number, urlPath: string): string {
 }
 
 /**
- * 生成那条会话专用的 agent JSON。
+ * **那条会话专用 agent 是在远端拼出来的** ——「切换远程的时候，对面不会有同样的 agent 配置，
+ * 这时候如果有同名的 agent 就用同名的，没有就切回默认的」。
  *
- * **按白名单挑字段，不是整份拷过去** ——「你把远程 kiro 的那些 agent 啥的清理一下，
- * 包括 mcp 啥的应该都不需要了」。
+ * 上一版是拿**本机**那份定义内联过去。那是错的方向：你要的是"远端自己配一些和本地不一样的"，
+ * 而本机那份里的 MCP 命令、`resources` 路径在远端根本不成立（实测：`/opt/homebrew/bin/node`
+ * 不存在 → kiro-cli 静默少工具；`file:///Users/...` → 每次启动打 `File URI not found`）。
  *
- * 带过去的只有"让这条会话像你选的那个 agent"所必需的东西：`prompt` / `tools` / `allowedTools`
- * （以及 `model`，如果那个 agent 钉了一个）。**刻意丢掉**的是：
+ * 所以规则是**在远端解析**：
+ *   · 远端有同名的 `<agent>.json` → 拿**它**做底子（它的 prompt / MCP / resources 都是那台机器上
+ *     成立的东西），只并上这一条 `kirolex-local`。
+ *   · 没有 → 用默认 agent（只有 `kirolex-local`），并且**在会话里说一句** ——
+ *     悄悄换一个 agent 是这条路上最贵的静默失败（产出是另一个 agent 干的，界面一个字不说）。
  *
- *   · `mcpServers` —— 本机那些 MCP 的命令是本机路径（`/opt/homebrew/bin/node`、
- *     `~/.local/bin/mcp-proxy-for-aws`…），在远端**不存在**。拷过去不是"多一点工具"，
- *     而是 kiro-cli 静默少掉这些工具（它不报错）。真要用本机的 MCP，正确做法是把它**转发**过去
- *     （和 `local_*` 走同一条反向隧道），那是另一件事。
- *   · `resources` / `hooks` —— 同理：`file:///Users/...` 在远端打不开，实测每次启动都打
- *     `File URI not found`。
- *   · `includeMcpJson` / `useLegacyMcpJson` —— 它们会把**远端那台机器**的全局 mcp.json 拉进来，
- *     那是一组你没选过的工具。
- *
- * 结果是这份配置**只由 KiroLex 说了算**：一条 `kirolex-local` 加上你选的那个 agent 的人格。
- * 以后要给远端配一些和本地不一样的东西时，那也应该是显式的一份远端配置，而不是靠拷本机的。
- *
- * `tools`：kiro-cli 的 `tools` 是**白名单**，而且**缺这个字段等于一个都不给**（实测：
- * 不写它的时候远端那条会话回的是"我手上没有任何可调用的工具"，连 fs_read 都没有，
- * 而隧道其实是通的）。所以 base 没写时要显式写 `["*"]`。
+ * 合并动作只能在远端做（底子文件在那儿），所以这里返回一段脚本。参数走**环境变量**而不是拼进
+ * 命令行：agent 名和 URL 都会进 shell，拼字符串迟早在引号上出事。程序里一个单引号都不用，
+ * 这样它整段可以安全地待在 `'…'` 里。
  */
-export function buildSessionAgent(base: any, opts: { name: string; url: string }): any {
-  const src = (base && typeof base === 'object') ? base : {};
-  const entry = `@${MCP_SERVER_NAME}`;
-  const out: any = {
-    name: opts.name,
-    description: typeof src.description === 'string' && src.description
-      ? src.description
-      : 'KiroLex：这条远程会话 + 用户本机的工具',
-    /* 这条会话专用的本地工具 —— 唯一一条 MCP */
-    mcpServers: { [MCP_SERVER_NAME]: { type: 'http', url: opts.url } },
-  };
-  if (typeof src.prompt === 'string' && src.prompt.trim()) out.prompt = src.prompt;
-  if (typeof src.model === 'string' && src.model.trim()) out.model = src.model;
-  out.tools = (Array.isArray(src.tools) && !src.tools.includes('*'))
-    ? [...src.tools.filter((t: any) => typeof t === 'string' && !t.startsWith('@')), entry]
-    : ['*'];
-  /* 本机工具**不要每次都问一遍**：这条通道是你明确开的，而一轮里它可能调十几次 ——
-     每次弹一个确认框的话这个功能没法用。留痕在会话状态行上（`localMcp` 里每次写/跑都报）。 */
-  out.allowedTools = [
-    ...(Array.isArray(src.allowedTools)
-      ? src.allowedTools.filter((t: any) => typeof t === 'string' && !t.startsWith('@'))
-      : []),
-    entry,
-  ];
-  return out;
+export function remoteAgentScript(sessionAgent: string, baseAgent: string | undefined, url: string): string {
+  const program = [
+    'import json, os',
+    'h = os.path.expanduser("~/.kiro/agents")',
+    'base = os.environ.get("KX_BASE", "")',
+    'out = os.environ["KX_OUT"]',
+    'url = os.environ["KX_URL"]',
+    'name = "' + MCP_SERVER_NAME + '"',
+    'tag = "@" + name',
+    'src = {}',
+    'found = ""',
+    'if base:',
+    '    try:',
+    '        src = json.load(open(os.path.join(h, base + ".json")))',
+    '        found = base',
+    '    except Exception:',
+    '        src = {}',
+    'cfg = {"name": out, "description": "KiroLex: remote session + local tools"}',
+    /* 远端那份自己的 MCP **要留着** —— 它们的命令在那台机器上是真的 */
+    'cfg["mcpServers"] = dict(src.get("mcpServers") or {})',
+    'cfg["mcpServers"][name] = {"type": "http", "url": url}',
+    'for k in ("prompt", "model", "resources", "hooks", "toolsSettings", "includeMcpJson", "useLegacyMcpJson"):',
+    '    if k in src: cfg[k] = src[k]',
+    'tools = src.get("tools")',
+    'if isinstance(tools, list):',
+    '    cfg["tools"] = tools if ("*" in tools or tag in tools) else (tools + [tag])',
+    'else:',
+    /* 缺 `tools` 字段 = 一个工具都不给（实测：远端回"我手上没有任何可调用的工具"） */
+    '    cfg["tools"] = ["*"]',
+    'allowed = src.get("allowedTools") or []',
+    'cfg["allowedTools"] = allowed if tag in allowed else (list(allowed) + [tag])',
+    'os.makedirs(h, exist_ok=True)',
+    'open(os.path.join(h, out + ".json"), "w").write(json.dumps(cfg, indent=2))',
+    'print("KX_AGENT " + (found or "default"))',
+  ].join('\n');
+  const env = `KX_OUT=${shq(sessionAgent)} KX_URL=${shq(url)} KX_BASE=${shq(baseAgent || '')}`;
+  return `mkdir -p ~/.kiro/agents && ${env} python3 -c '${program}'`;
 }
 
-/** 在远端写下这份 agent（内容走 stdin —— 命令行里塞 JSON 是自找的引号地狱）。 */
-export function writeAgentScript(name: string): string {
-  return `mkdir -p ~/.kiro/agents && cat > ~/.kiro/agents/${name}.json`;
+/** 解析上面那段脚本的输出：用的是哪个底子（`default` = 远端没有同名 agent）。 */
+export function parseAgentBase(out: string): string {
+  const m = /KX_AGENT\s+(\S+)/.exec(String(out || ''));
+  return m ? m[1] : '';
 }
+
+function shq(s: string): string {
+  return `'${String(s).replace(/'/g, `'\\''`)}'`;
+}
+
 
 /** 断开时把它删掉 —— 不删的话远端会慢慢堆满每条会话的临时 agent。 */
 export function removeAgentScript(name: string): string {

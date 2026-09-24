@@ -207,7 +207,7 @@ declare global {
        *  message, which is also how it is rendered. */
       persistSteer?: (sessionId: string, text: string, messageId?: string) => Promise<{ ok: boolean; merged?: boolean; error?: string }>;
       respondPermission: (requestId: number | string, optionId: string, sessionId: string) => Promise<void>;
-      listModels: () => Promise<any>;
+      listModels: (machine?: string) => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
       generateTitle: (firstUser: string, firstAssistant?: string) => Promise<{ title?: string; error?: string }>;
       generateSuggestions: (recentConvo: string) => Promise<{ suggestions: string[]; error?: string }>;
@@ -2086,23 +2086,57 @@ const App: React.FC = () => {
    *   ② 失败不是终点。原来这段只在挂载时跑一次，所以「网恢复」应用根本不知道，只能等下次刷新。
    *      下面的 effect 会在 `online` 和窗口重新聚焦时再调一次。
    */
-  const refreshModels = useCallback(async () => {
+  /**
+   * **模型列表按机器分** ——「确认下右侧界面远程会话显示的是远程的 agent 和模型」。
+   *
+   * 以前只有一份（本机那台的），所有会话的下拉共用它。而两台机器的 kiro-cli 版本不一样
+   * （实测本机 2.23.1、东京 1.27.0），于是远程会话的下拉里会有那台机器**没有**的模型 ——
+   * 启动那一刻 `pickRemoteModel` 会替换成可用的并在会话里说一句（不会静默跑错），
+   * 但下拉本身在骗你。
+   *
+   * 缓存 key 带机器（`kirolex-models:<机器>`）：这是"哪台机器上有什么"，混在一起就是错的。
+   */
+  const [modelsByMachine, setModelsByMachine] = useState<Record<string, any[]>>({});
+  const askedModels = useRef(new Set<string>());
+
+  const refreshModels = useCallback(async (machine = 'local') => {
+    const key = `kirolex-models${machine === 'local' ? '' : `:${machine}`}`;
     let cached: any[] = [];
-    try { cached = JSON.parse(uiGet('kirolex-models') || '[]'); } catch {}
+    try { cached = JSON.parse(uiGet(key) || '[]'); } catch {}
+    const apply = (list: any[]): void => {
+      setModelsByMachine((prev) => ({ ...prev, [machine]: list }));
+      if (machine === 'local') setModels(list);
+    };
     try {
-      const data = await window.kiroApi.listModels();
+      const data = await window.kiroApi.listModels(machine === 'local' ? undefined : machine);
       const next = data?.models || [];
       if (shouldReplaceModelCache(next, cached)) {
-        setModels(next);
-        try { uiSet('kirolex-models', JSON.stringify(next)); } catch {}
+        apply(next);
+        try { uiSet(key, JSON.stringify(next)); } catch {}
       } else if (cached.length) {
         // 新结果不可信：继续显示缓存，并且把缓存留在盘上等下一次重试。
-        setModels(cached);
+        apply(cached);
       }
     } catch {
-      if (cached.length) setModels(cached);
+      if (cached.length) apply(cached);
     }
   }, []);
+
+  /**
+   * 这条会话该显示哪台机器的模型。远端那台**问一次就够**（列表不会一分钟变一次），
+   * 问不到时退回本机那份 —— 空下拉比"可能多几个"更糟（那时你连当前模型都看不见）。
+   */
+  const modelsFor = useCallback((session: Session | null): any[] => {
+    const host = session?.remoteHost;
+    if (!host) return models;
+    const machine = remoteTargets.targets.find((t) => t.label === host)?.id;
+    if (!machine) return models;
+    if (!askedModels.current.has(machine)) {
+      askedModels.current.add(machine);
+      void refreshModels(machine);
+    }
+    return modelsByMachine[machine] || models;
+  }, [models, modelsByMachine, refreshModels, remoteTargets.targets]);
 
   /*
     Cmd+F、命中计数、高亮、以及「搜索时把渲染窗口整开」这一整套都搬进 `ChatArea` 了 ——
@@ -2979,7 +3013,7 @@ const App: React.FC = () => {
         onDismissError={() => clearSessionError(sid)}
         turnInterrupted={!!sid && interruptedSessionIds.includes(sid)}
         attachedFiles={attachedFor(sid)}
-        models={models}
+        models={modelsFor(session)}
         selectedModel={paneModel}
         activeToolCall={focused ? activeToolCall : (view?.activeTool || null)}
         activityStatus={focused ? activityStatus : (view?.activity || null)}

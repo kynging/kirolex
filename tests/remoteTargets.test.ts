@@ -794,9 +794,13 @@ describe('远端不再有"同步过去的"配置', () => {
     assert.deepEqual(REQUIRED_TOOLS, ['kiro-cli'], '远端只需要 kiro-cli');
   });
 
-  test('本机这边只剩"读定义"（生成远端那一份用）', async () => {
-    const m = await import('../src/main/kiroAgents.ts');
-    assert.deepEqual(Object.keys(m).sort(), ['agentsDir', 'localAgents', 'localAgentJson'].sort());
+  test('本机这边**连读定义都不需要了** —— agent 在远端按名字解析', async () => {
+    /* 「切换远程的时候，对面不会有同样的 agent 配置，这时候如果有同名的 agent 就用同名的，
+       没有就切回默认的」：底子文件在远端，所以合并动作也在远端做（`remoteAgentScript`）。
+       于是 `kiroAgents.ts`（读本机 ~/.kiro/agents）整个不需要了。 */
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.equal(/kiroAgents/.test(M), false);
+    assert.equal(fs.existsSync(path.join(process.cwd(), 'src/main/kiroAgents.ts')), false);
   });
 
   test('安装脚本也不再往 ~/.kiro 里写东西', () => {

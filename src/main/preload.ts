@@ -259,7 +259,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
   },
   
   // Models
-  listModels: () => ipcRenderer.invoke('acp:list-models'),
+  /**
+   * 某台机器上能用的模型。`machine` 省略 / `'local'` = 本机；否则是设置里那台远端的 id。
+   * 远程会话必须问**它自己那台机器** —— 两边 kiro-cli 版本不同，模型集就不同。
+   */
+  listModels: (machine?: string) => ipcRenderer.invoke('acp:list-models', machine),
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
   generateTitle: (firstUser: string, firstAssistant?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant),
   generateSuggestions: (recentConvo: string) => ipcRenderer.invoke('app:generate-suggestions', recentConvo),

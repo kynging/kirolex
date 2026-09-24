@@ -1,5 +1,6 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
+import { execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
@@ -8,8 +9,8 @@ import {
   GIT_READONLY, MAX_READ_BYTES, MCP_PROTOCOL_VERSION,
 } from '../src/main/localMcp.ts';
 import {
-  allocateRemotePort, buildSessionAgent, localToolsHelp, mcpUrl,
-  sessionAgentName, writeAgentScript, removeAgentScript,
+  allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, remoteAgentScript,
+  sessionAgentName, removeAgentScript,
   MCP_SERVER_NAME, REMOTE_PORT_BASE,
 } from '../src/main/remoteLocalTools.ts';
 
@@ -214,50 +215,60 @@ describe('HTTP 那一层：只听 loopback，认 token，不泄露形状', () =>
 });
 
 describe('接线层：agent 配置一条会话一份，端口不撞', () => {
-  test('**按白名单挑字段**：带走人格，丢掉那些在远端根本不成立的东西', () => {
-    /* 「你把远程 kiro 的那些 agent 啥的清理一下，包括 mcp 啥的应该都不需要了」。
-       以前是整份拷过去 + 并上这条 MCP。问题是拷过去的东西在远端**不成立**：
-       MCP 的命令是本机路径（kiro-cli 不报错，只静默少工具）、`resources` 是本机 file:// 
-       （每次启动打 File URI not found）、`includeMcpJson` 会把远端那台机器的全局 MCP 拉进来。 */
-    const base = {
-      name: 'aws-agent',
-      prompt: '你是一个 AWS 专家',
-      model: 'claude-opus-5',
-      mcpServers: { drawio: { command: '/opt/homebrew/bin/node' }, playwright: { command: 'npx' } },
-      resources: ['file:///Users/k/x.md'],
-      hooks: { onStart: 'echo hi' },
-      includeMcpJson: true,
-      tools: ['fs_read', '@drawio'],
-      allowedTools: ['fs_read', '@playwright'],
+  test('**agent 在远端按名字解析**：有同名用远端那份，没有就退默认', () => {
+    /* 「切换远程的时候，对面不会有同样的 agent 配置，这时候如果有同名的 agent 就用同名的，
+       没有就切回默认的」。所以合并动作在**远端**做（底子文件在那儿）：
+       拿远端那份 `<agent>.json` 当底子、只并上一条 `kirolex-local`。
+       上一版是把**本机**那份内联过去 —— 方向错了：本机那份里的 MCP 命令和 `resources` 路径
+       在远端根本不成立（`/opt/homebrew/bin/node` 不存在 → 静默少工具）。 */
+    const sc = remoteAgentScript('kirolex-local-s1', 'aws-agent', 'http://127.0.0.1:39100/mcp/tok');
+    /* 参数走环境变量，不拼进命令行 —— agent 名和 URL 都会进 shell */
+    assert.match(sc, /KX_OUT='kirolex-local-s1'/);
+    assert.match(sc, /KX_BASE='aws-agent'/);
+    assert.match(sc, /KX_URL='http:\/\/127\.0\.0\.1:39100\/mcp\/tok'/);
+    /* 程序里一个单引号都不能有（它整段待在 '…' 里面） */
+    const prog = sc.slice(sc.indexOf("python3 -c '") + 12, sc.length - 1);
+    assert.equal(prog.includes("'"), false, 'python 程序里不许出现单引号');
+    /* 远端那份自己的 MCP 要留着（它们的命令在那台机器上是真的），只并上我们这一条 */
+    assert.match(prog, /cfg\["mcpServers"\] = dict\(src\.get\("mcpServers"\) or \{\}\)/);
+    assert.match(prog, /cfg\["mcpServers"\]\[name\] = \{"type": "http", "url": url\}/);
+    /* 读不到就当默认，并把用了哪个底子报出来 */
+    assert.match(prog, /print\("KX_AGENT " \+ \(found or "default"\)\)/);
+    assert.equal(parseAgentBase('KX_AGENT aws-agent'), 'aws-agent');
+    assert.equal(parseAgentBase('KX_AGENT default'), 'default');
+    assert.equal(parseAgentBase('什么都没有'), '');
+  });
+
+  test('那段合并程序**真的能跑**（用临时 HOME 跑一遍，拼错一个引号就会在这里露出来）', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agenthome-'));
+    fs.mkdirSync(path.join(home, '.kiro', 'agents'), { recursive: true });
+    fs.writeFileSync(path.join(home, '.kiro', 'agents', 'aws-agent.json'), JSON.stringify({
+      name: 'aws-agent', prompt: '你是 AWS 专家',
+      mcpServers: { local_only: { command: '/usr/bin/true' } },
+      tools: ['fs_read'], allowedTools: ['fs_read'],
+    }));
+    const run = (base: string): any => {
+      const sc = remoteAgentScript('kirolex-local-s1', base, 'http://127.0.0.1:39100/mcp/tok');
+      const out = execFileSync('bash', ['-lc', sc], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
+      return {
+        base: parseAgentBase(out),
+        json: JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'kirolex-local-s1.json'), 'utf8')),
+      };
     };
-    const out = buildSessionAgent(base, { name: 'kirolex-local-s1', url: 'http://127.0.0.1:39100/mcp/abc' });
-    /* 带走的：名字、人格、钉住的模型 */
-    assert.equal(out.name, 'kirolex-local-s1');
-    assert.equal(out.prompt, base.prompt);
-    assert.equal(out.model, 'claude-opus-5');
-    /* 唯一一条 MCP 就是本地工具 */
-    assert.deepEqual(Object.keys(out.mcpServers), [MCP_SERVER_NAME]);
-    /* 丢掉的那些一个都不许漏过去 */
-    for (const gone of ['resources', 'hooks', 'includeMcpJson', 'useLegacyMcpJson']) {
-      assert.equal(gone in out, false, `${gone} 不该带过去`);
-    }
-    /* `tools` 白名单：内置工具留着，指向别的 MCP 的 `@xxx` 去掉（那些 MCP 已经不在了） */
-    assert.deepEqual(out.tools, ['fs_read', `@${MCP_SERVER_NAME}`]);
-    assert.deepEqual(out.allowedTools, ['fs_read', `@${MCP_SERVER_NAME}`]);
-  });
-
-  test('base 里没写 tools 就**显式写 `["*"]`** —— 不写等于一个工具都没有（实测）', () => {
-    /* 实测：生成的 agent 不带 `tools` 时，远端那条会话回的是"我手上没有任何可调用的工具"
-       （连 fs_read 都没有），而隧道其实是通的（从远端 curl 那个 URL 能拿到 tools/list）。
-       kiro-cli 把"没有这个字段"当成空白名单，所以"照抄默认行为"必须显式说出来。 */
-    const out = buildSessionAgent({ prompt: 'p' }, { name: 'n', url: 'u' });
-    assert.deepEqual(out.tools, ['*']);
-    assert.deepEqual(out.allowedTools, [`@${MCP_SERVER_NAME}`]);
-  });
-
-  test('`tools: ["*"]` 也不动它', () => {
-    const out = buildSessionAgent({ tools: ['*'] }, { name: 'n', url: 'u' });
-    assert.deepEqual(out.tools, ['*']);
+    /* ① 远端有同名的 → 用它做底子 */
+    const hit = run('aws-agent');
+    assert.equal(hit.base, 'aws-agent');
+    assert.equal(hit.json.prompt, '你是 AWS 专家');
+    assert.deepEqual(Object.keys(hit.json.mcpServers).sort(), ['local_only', MCP_SERVER_NAME].sort());
+    assert.deepEqual(hit.json.tools, ['fs_read', `@${MCP_SERVER_NAME}`]);
+    assert.deepEqual(hit.json.allowedTools, ['fs_read', `@${MCP_SERVER_NAME}`]);
+    /* ② 远端没有 → 默认 agent + 只有本地工具，而且 tools 必须显式 `["*"]`
+          （缺这个字段等于一个工具都不给 —— 实测过） */
+    const miss = run('nope-agent');
+    assert.equal(miss.base, 'default');
+    assert.deepEqual(Object.keys(miss.json.mcpServers), [MCP_SERVER_NAME]);
+    assert.deepEqual(miss.json.tools, ['*']);
+    assert.equal('prompt' in miss.json, false);
   });
 
   test('端口按会话分，不撞已经分出去的', () => {
@@ -271,8 +282,7 @@ describe('接线层：agent 配置一条会话一份，端口不撞', () => {
     assert.equal(mcpUrl(39100, '/mcp/tok'), 'http://127.0.0.1:39100/mcp/tok');
   });
 
-  test('远端那份临时 agent 要能写、也要能删（不删远端会按会话数长满）', () => {
-    assert.match(writeAgentScript('a'), /mkdir -p ~\/\.kiro\/agents && cat > ~\/\.kiro\/agents\/a\.json/);
+  test('远端那份临时 agent 要能删（不删远端会按会话数长满）', () => {
     assert.match(removeAgentScript('a'), /rm -f ~\/\.kiro\/agents\/a\.json/);
   });
 
@@ -344,14 +354,62 @@ describe('端口分配不能有竞态', () => {
   test('算完端口**立刻**占住（写 map），再去做需要 await 的事', () => {
     /* 锚在 `writeRemoteFile(remote, \`mkdir -p ` 上：那一步现在顺手把远端草稿目录也建了
        （镜像去掉之后没人再创建它，而 cwd 指向不存在的目录会让那一轮的 shell 落在 /tmp） */
-    const at = M.indexOf('const remotePort = localToolsBySession.get(sessionId)?.remotePort ?? allocateRemotePort(used);');
+    const at = M.indexOf('const remotePort = allocateRemotePort(used);');
     assert.ok(at > 0);
     const after = M.slice(at, at + 400);
     /* 下一行就得是"占住" —— 中间插任何 await 都会让并行的两条会话拿到同一个端口 */
     assert.match(after, /^const remotePort[^\n]*\n\s*localToolsBySession\.set\(sessionId, \{ remotePort,/m);
+    /* 而且**不复用自己原来那个**：换 agent / 换模型是先起新执行器再关旧的，复用就会撞上
+       还没退出的旧 ssh（`ExitOnForwardFailure=yes` → ssh exit 255，看起来像"掉线"）。 */
+    assert.match(M, /const remotePort = allocateRemotePort\(used\);/);
+    assert.equal(/localToolsBySession\.get\(sessionId\)\?\.remotePort \?\?/.test(M), false);
     /* 那次写远端 agent 文件的 await 必须在占住**之后** */
     const reserve = M.indexOf('localToolsBySession.set(sessionId, { remotePort,');
     const write = M.indexOf('await writeRemoteFile(remote, `mkdir -p ');
     assert.ok(reserve > 0 && write > reserve, '先占端口，再写远端文件');
+  });
+});
+
+/*
+ * 「确认下右侧界面远程会话显示的是远程的 agent 和模型」。
+ *
+ * agent 那半边是对的（远端那份由 `remoteAgentScript` 按名字解析），模型那半边原来在骗人：
+ * 只有一份列表、跑的是**本机** kiro-cli，而两台机器版本不同（实测本机 2.23.1、东京 1.27.0），
+ * 于是下拉里会有远端没有的模型。启动那一刻 `pickRemoteModel` 会替换并在会话里说一句，
+ * 所以不会静默跑错 —— 但下拉该说真话。
+ */
+describe('模型列表按机器分', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+  const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
+
+  test('IPC 收 machine：本机照旧，远端去问那台机器', () => {
+    assert.match(M, /ipcMain\.handle\('acp:list-models', async \(_event, machine\?: string\) => \{/);
+    assert.match(M, /if \(machine && machine !== 'local'\) \{/);
+    /* 用的是同一个探测：故意传一个不存在的模型，kiro-cli 在参数校验就把可用列表打出来
+       —— 不真调模型、不花额度 */
+    assert.match(M, /chat --model \$\{MODEL_PROBE\}/);
+    assert.match(M, /const ids = parseModels\(out\);/);
+    /* 启动命令也得是那台机器配的（不猜） */
+    assert.match(M, /const bin = remoteKiroBin\(target\);/);
+    assert.match(P, /listModels: \(machine\?: string\)/);
+  });
+
+  test('问不到就**报错**，不要假装成"只有 auto"', () => {
+    /* 那份退化结果曾经被写进缓存，于是"网恢复了却还是显示模型都不可用" */
+    assert.match(M, /没有报出模型列表/);
+    assert.match(M, /问不到 \$\{target\.sshHost\} 的模型列表/);
+  });
+
+  test('乘数**不跨机器借用** —— 少显示一个乘数，好过把本机的贴到另一台机器的模型上', () => {
+    assert.match(M, /ids\.map\(\(id\) => \(\{ model_id: id, model_name: id \}\)\)/);
+  });
+
+  test('渲染层：每一格按它自己那条会话所在的机器取列表，缓存 key 带机器', () => {
+    assert.match(A, /models=\{modelsFor\(session\)\}/);
+    assert.match(A, /const key = `kirolex-models\$\{machine === 'local' \? '' : `:\$\{machine\}`\}`;/);
+    /* 远端那台问一次就够；问不到退回本机那份 —— 空下拉比"可能多几个"更糟 */
+    assert.match(A, /if \(!askedModels\.current\.has\(machine\)\)/);
+    assert.match(A, /return modelsByMachine\[machine\] \|\| models;/);
   });
 });
