@@ -1178,23 +1178,37 @@ describe('工作目录在会话界面上', () => {
 
   test('输入框下面那一排有一格 📂，显示当前目录、点它换', () => {
     assert.match(CA, /className="composer-meta-btn composer-workdir"/);
-    assert.match(CA, /onClick=\{\(\) => onPickWorkdir\?\.\(\)\}/);
+    assert.match(CA, /i === 0 \? onPickWorkdir\?\.\(\) : undefined/);
     /* 在**左**那一组里（右边那一组是"此刻在发生什么" + 模型） */
     const left = CA.indexOf('composer-belowbar-left');
     const right = CA.indexOf('composer-belowbar-right');
     const at = CA.indexOf('composer-meta-btn composer-workdir');
     assert.ok(left > 0 && at > left && at < right, '它属于左边那一组');
     /* 完整路径在 title 里 —— 这一排很窄，格子里只放 basename */
-    assert.match(CA, /const workdirTitle = `工作目录：\$\{workdir \|\| '（还没定 —— 点这里选一个）'\}`/);
+    assert.match(CA, /const workdirTitle = `工作目录：\$\{\(!workdir \|\| inSessionDir\) \? '（还没定 —— 点 ＋ 选一个）' : workdir\}`/);
   });
 
-  test('没归项目的会话说「会话目录」，不是那个没有信息量的 session id', () => {
-    assert.match(CA, /const inSessionDir = !!workdir && \/\\\/\\\.kirolex\\\/sessions\\\/\/\.test\(workdir\)/);
-    /* 每一格都要走同一个判断 —— 附加目录也可能是某条会话的目录 */
-    assert.match(CA, /const dirLabel = \(d: string\): string =>/);
-    assert.match(CA, /\? '会话目录'/);
-    /* 并且要说清它读不到别处的文件 —— 这才是人下一步要做的判断 */
-    assert.match(CA, /选一个项目目录，它就能读写那棵树/);
+  /*
+   * 「我都说了那个按钮不要叫会话目录，就显示实际的工作目录就行，没有就不显示」。
+   *
+   * `~/.kirolex/sessions/<id>` 是没归项目的会话的兜底 cwd —— KiroLex 自己的数据目录，
+   * 里面没有用户的代码。把它当"工作目录"显示是在骗人，标成「会话目录」只是把这个谎换了个说法：
+   * 那一格看起来像"已经有工作目录了"，而实际上这条会话什么项目都没连上。
+   */
+  test('会话自己那个目录**不显示** —— 它不是工作目录', () => {
+    assert.match(CA, /const isSessionDir = \(d: string\): boolean =>/);
+    /* 从这一排里滤掉，而不是换个名字 */
+    assert.match(CA, /\.filter\(\(d\) => d && !isSessionDir\(d\)\)/);
+    assert.equal(/'会话目录'/.test(CA), false, '这个名字不许再出现');
+    /* basename 就是 basename，没有特例 */
+    assert.match(CA, /const dirLabel = \(d: string\): string => \(d\.split\('\/'\)\.filter\(Boolean\)\.pop\(\) \|\| d\)/);
+  });
+
+  test('一个真目录都没有时只留那个 ＋（"不显示"指别显示假的当前值）', () => {
+    assert.match(CA, /dirList\.length \? onAddWorkdir\?\.\(\) : onPickWorkdir\?\.\(\)/);
+    assert.match(CA, /选一个工作目录 —— 这条会话现在没有/);
+    /* 不许再有那个占位格 */
+    assert.equal(/'工作目录…'/.test(CA), false);
   });
 
   test('值来自会话状态（记录为准），不是渲染层猜的', () => {

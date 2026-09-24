@@ -2495,21 +2495,26 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * 没归项目的会话，工作目录就是它自己的会话目录（`~/.kirolex/sessions/<id>`）——
    * 那个 id 当名字没有任何信息量，所以直接说「会话目录」，并在 title 里说清它读不到别处的文件。
    */
-  const inSessionDir = !!workdir && /\/\.kirolex\/sessions\//.test(workdir);
-  /** 一格上的字：basename（会话目录那种 id 没有信息量，直接说「会话目录」）。 */
-  const dirLabel = (d: string): string => (/\/\.kirolex\/sessions\//.test(d)
-    ? '会话目录'
-    : (d.split('/').filter(Boolean).pop() || d));
-  const workdirLabel = !workdir ? '工作目录…' : dirLabel(workdir);
+  /**
+   * **会话自己的目录不算工作目录** ——「那个按钮不要叫会话目录，就显示实际的工作目录就行，
+   * 没有就不显示」。
+   *
+   * `~/.kirolex/sessions/<id>` 是没归项目的会话的兜底 cwd（KiroLex 自己的数据目录）。
+   * 它当"工作目录"显示是在骗人：那棵树里没有用户的代码，标成「会话目录」也只是把这个谎
+   * 换了个说法。所以直接从这一排里滤掉 —— 没有真目录就一格都不显示，只留那个 ＋。
+   */
+  const isSessionDir = (d: string): boolean => /\/\.kirolex\/sessions\//.test(d);
+  const inSessionDir = !!workdir && isSessionDir(workdir);
+  /** 一格上的字：basename。这一排很窄，完整路径放 title。 */
+  const dirLabel = (d: string): string => (d.split('/').filter(Boolean).pop() || d);
+  const workdirLabel = !workdir || inSessionDir ? '' : dirLabel(workdir);
   /* 主目录排第一。`workdirs` 没传（老调用点）就退回单个目录，不至于一格都不显示。 */
-  const dirList = (workdirs && workdirs.length ? workdirs : (workdir ? [workdir] : []));
-  const workdirTitle = `工作目录：${workdir || '（还没定 —— 点这里选一个）'}`
+  const dirList = (workdirs && workdirs.length ? workdirs : (workdir ? [workdir] : []))
+    .filter((d) => d && !isSessionDir(d));
+  const workdirTitle = `工作目录：${(!workdir || inSessionDir) ? '（还没定 —— 点 ＋ 选一个）' : workdir}`
     + (remoteHostLabel
       /* 镜像没了：远端根本没有副本，它是通过反向隧道读**你机器上**这一份（`localMcp.ts`） */
       ? `\n${remoteHostLabel} 上的那个进程通过隧道读**你机器上**这几棵树（没有副本、不同步）。`
-      : '')
-    + (inSessionDir
-      ? '\n这是这条会话自己的目录 —— 选一个项目目录，它就能读写那棵树。'
       : '')
     + '\n点这里换一个目录（会换执行器：正在跑的那一轮会被打断，已产出的内容都在）。';
   const [isDragOver, setIsDragOver] = useState(false);
@@ -3892,16 +3897,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     后面几格右边有个 ✕ = 去掉那一个；最后一个 ＋ = 再加一个。
                     主目录没有 ✕：去掉 cwd 就得同时指定新的 cwd，那是"换"而不是"删"。
                   */}
-                  {dirList.length === 0 ? (
-                    <button
-                      className="composer-meta-btn composer-workdir"
-                      onClick={() => onPickWorkdir?.()}
-                      disabled={!currentSessionId || !onPickWorkdir}
-                      title={workdirTitle}
-                    >
-                      📂 <span className="composer-meta-label">工作目录…</span>
-                    </button>
-                  ) : dirList.map((d, i) => (
+                  {dirList.map((d, i) => (
                     <span key={d} className="composer-workdir-chip">
                       <button
                         className="composer-meta-btn composer-workdir"
@@ -3921,13 +3917,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       ) : null}
                     </span>
                   ))}
-                  {dirList.length > 0 && onAddWorkdir ? (
+                  {/*
+                    没有任何真目录时只剩这个 ＋（点它选一个）—— 「没有就不显示」指的是
+                    别显示一个假的当前值，而不是把"能选目录"这件事也藏掉。
+                  */}
+                  {onAddWorkdir || onPickWorkdir ? (
                     <button
                       className="composer-meta-btn composer-workdir-add"
-                      onClick={() => onAddWorkdir()}
+                      onClick={() => (dirList.length ? onAddWorkdir?.() : onPickWorkdir?.())}
                       disabled={!currentSessionId}
-                      title="再加一个目录 —— 这条会话就能同时动这几棵树"
-                    >＋</button>
+                      title={dirList.length
+                        ? '再加一个目录 —— 这条会话就能同时动这几棵树'
+                        : '选一个工作目录 —— 这条会话现在没有'}
+                    >{dirList.length ? '＋' : '📂 ＋'}</button>
                   ) : null}
                 </div>
 
