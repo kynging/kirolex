@@ -7,10 +7,11 @@ import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, 
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
+import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
 import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
-  maskKeyId, machineTag, trashDirFor,
+  maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
 } from './s3Sync.ts';
 import { S3Creds, S3Error, putObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
@@ -2614,6 +2615,8 @@ function decryptSecret(cipher?: string): string {
 }
 
 const KIROLEX_HOME = path.join(os.homedir(), '.kirolex');
+/** 模型元数据缓存（倍率 / 上下文窗口）—— 见 `modelMeta.ts`。 */
+const MODEL_META_PATH = path.join(KIROLEX_HOME, 'model-meta.json');
 const S3_STATE_PATH = path.join(KIROLEX_HOME, 's3-sync-state.json');
 
 function loadSyncConfig(): SyncConfig {
@@ -2655,6 +2658,15 @@ function syncCredsOrProblem(): { creds?: S3Creds; problem?: string } {
 
 let syncRunning = false;
 let syncTimer: NodeJS.Timeout | null = null;
+/**
+ * **连续失败之后退避**（参考 Tabby 那个云同步插件：`improved retry behavior after repeated failures`）。
+ *
+ * 不退避的表现：桶名写错之后，每 30 分钟准时失败一次，日志里堆一模一样的报错 ——
+ * 而"它一直在重试"本身没有价值，错的东西重试一百次还是错的。手动点「立即同步」**不受退避限制**：
+ * 那是人明确要求的，而且人刚改完配置想马上验证。
+ */
+let syncFailures = 0;
+let syncNextAllowedAt = 0;
 let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string } | null = null;
 
 /**
@@ -2663,8 +2675,27 @@ let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: num
  * **串行、可重入保护**：定时器和"立即同步"按钮都会调它，两个同时跑会把状态文件写花。
  * 失败不抛 —— 备份是背景工作，但**必须留下摘要**，否则"同步没生效"是个不可查的问题。
  */
+/** 这一轮的 catalog 条目 —— 冲突检测和最终写 catalog 用的是同一份，不能算两遍。 */
+function catalogEntriesFor(sessions: Array<{ id: string; title?: string; updatedAt?: number }>, machine: string): CatalogEntry[] {
+  const now = Date.now();
+  return sessions.map((r) => ({
+    id: r.id,
+    title: r.title || 'New Chat',
+    updatedAt: r.updatedAt || 0,
+    bytes: SESSION_FILES.reduce((sum, f) => {
+      try { return sum + fs.statSync(path.join(KIROLEX_HOME, 'sessions', r.id, f)).size; } catch { return sum; }
+    }, 0),
+    from: machine,
+    syncedAt: now,
+  }));
+}
+
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: '上一轮还在跑' };
+  if (reason === '定时' && Date.now() < syncNextAllowedAt) {
+    logger.info('s3', `跳过这一次定时同步（连续失败 ${syncFailures} 次，退避到 ${new Date(syncNextAllowedAt).toLocaleTimeString()}）`);
+    return { ok: false, uploaded: 0, skipped: 0, error: '退避中' };
+  }
   const { creds, problem } = syncCredsOrProblem();
   if (problem) return { ok: false, uploaded: 0, skipped: 0, error: problem };
   syncRunning = true;
@@ -2676,6 +2707,26 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     const sessions = store.listSessions();
     const ids = sessions.map((r) => r.id);
     const plan = planUpload(KIROLEX_HOME, ids, state);
+    const thisMachine = machineTag(os.hostname());
+    /*
+      **先看桶里有没有别人动过同一条会话**（参考 Tabby 插件的 `conflict detection` +
+      `safe conflict backups`）。catalog 要在上传**之前**读：读晚了就已经盖掉对方了。
+    */
+    const oldRaw0 = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+    let oldCatalog: Catalog | null = null;
+    try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
+    const freshEntries = catalogEntriesFor(sessions, thisMachine);
+    const conflicts = detectConflicts(oldCatalog, freshEntries, thisMachine);
+    const conflictIds = new Set(conflicts.map((c) => c.id));
+    if (conflictIds.size) {
+      /*
+        冲突时**照样把本机这份传上去**，但传到旁路 key —— 两台机器的时钟不一定一致，
+        "谁的时间晚谁赢"会悄悄丢掉一整条对话。让人自己决定留哪份。
+      */
+      logger.warn('s3', `${conflictIds.size} 条会话在桶里被别的机器更新过（${conflicts.map((c) => `${c.id}@${c.from}`).join('、')}）`
+        + ` —— 本机这份传到 conflicts/ 下，不盖对方的`);
+      mainWindow?.webContents.send('s3:conflicts', conflicts);
+    }
     logger.info('s3', `同步开始（${reason}）：${plan.upload.length} 个要传、${plan.skippedUnchanged} 个没变`
       + `${plan.skippedTooBig.length ? `、${plan.skippedTooBig.length} 个太大跳过` : ''}`
       + ` bucket=${cfg.bucket} key=${maskKeyId(cfg.accessKeyId)}`);
@@ -2687,29 +2738,29 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       let body: Buffer;
       let st: fs.Stats;
       try { body = fs.readFileSync(abs); st = fs.statSync(abs); } catch { continue; }
-      await putObject(creds!, keyFor(cfg.prefix, rel), body, contentTypeFor(rel));
+      const owner = rel.startsWith(`sessions${path.sep}`) ? rel.split(path.sep)[1] : '';
+      const key = owner && conflictIds.has(owner)
+        ? conflictKeyFor(cfg.prefix, owner, thisMachine, rel)
+        : keyFor(cfg.prefix, rel);
+      await putObject(creds!, key, body, contentTypeFor(rel));
       state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
       uploaded += 1;
       bytes += body.length;
     }
-    /* catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西 */
-    const fresh: CatalogEntry[] = sessions.map((r) => ({
-      id: r.id,
-      title: r.title || 'New Chat',
-      updatedAt: r.updatedAt || 0,
-      bytes: SESSION_FILES.reduce((sum, f) => {
-        try { return sum + fs.statSync(path.join(KIROLEX_HOME, 'sessions', r.id, f)).size; } catch { return sum; }
-      }, 0),
-      from: machineTag(os.hostname()),
-      syncedAt: Date.now(),
-    }));
-    const oldRaw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
-    let oldCatalog: Catalog | null = null;
-    try { oldCatalog = oldRaw ? JSON.parse(oldRaw.toString('utf-8')) : null; } catch { oldCatalog = null; }
-    const merged = mergeCatalog(oldCatalog, fresh);
+    /*
+      catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西。
+      **冲突的那几条不进 catalog** —— 它们传到了 conflicts/ 下，让 catalog 指向它们
+      等于把"可恢复"这件事说错了。
+    */
+    const merged = mergeCatalog(oldCatalog, freshEntries.filter((e) => !conflictIds.has(e.id)));
     await putObject(creds!, catalogKey(cfg.prefix), Buffer.from(JSON.stringify(merged, null, 2)), 'application/json');
     writeState(S3_STATE_PATH, state);
-    lastSyncSummary = { at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes };
+    syncFailures = 0;
+    syncNextAllowedAt = 0;
+    lastSyncSummary = {
+      at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
+      ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
+    };
     logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`);
     mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
     return { ok: true, uploaded, skipped: plan.skippedUnchanged };
@@ -2718,8 +2769,12 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     const message = `${err?.message || err}${hint}`;
     /* 部分成功也把 state 写下来：已经传上去的下次不必再传 */
     writeState(S3_STATE_PATH, state);
+    syncFailures += 1;
+    const minutes = Math.max(5, Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES);
+    syncNextAllowedAt = Date.now() + minutes * 60_000 * backoffMultiplier(syncFailures);
     lastSyncSummary = { at: Date.now(), uploaded, skipped: 0, bytes, error: message };
-    logger.warn('s3', `同步失败（${reason}）：${message}`);
+    logger.warn('s3', `同步失败（${reason}，连续第 ${syncFailures} 次）：${message}`
+      + ` —— 下一次定时同步不早于 ${new Date(syncNextAllowedAt).toLocaleTimeString()}`);
     mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
     return { ok: false, uploaded, skipped: 0, error: message };
   } finally {
@@ -6643,9 +6698,20 @@ app.whenReady().then(async () => {
         上下文窗口多大"是**模型自己的属性**，不随机器变。本机不认识的 id 就留裸的 —— 
         那种情况下少一点信息，总好过编一个。
       */
+      /*
+        **元数据三层兜底** ——「这个远程会话为什么又看不到模型乘数了」。
+
+        远端只给得出一串 id（1.27.0 没有 `--list-models`），名字/倍率/上下文窗口一直是按 id
+        从本机那份补的。本机出口被地域过滤之后清单里一个 Claude 都没有，于是补不到东西、
+        `· 2.2x` 就消失了。现在：实时清单 → 持久缓存 → 内置快照（见 `modelMeta.ts`）。
+      */
       const localList: any[] = await listModelsLocal().then((d) => d?.models || []).catch(() => []);
-      const byId = new Map(localList.map((m: any) => [m.model_id, m]));
-      return { models: ids.map((id) => ({ ...(byId.get(id) || {}), model_id: id, model_name: byId.get(id)?.model_name || id })) };
+      const live: Record<string, any> = {};
+      for (const m of localList) if (m?.model_id) live[m.model_id] = m;
+      const cache = readMetaCache(MODEL_META_PATH);
+      /* 顺手把这次拿到的真实元数据记下来 —— "某台机器暂时不报它"不该等于"这个模型的属性丢了" */
+      if (mergeMeta(cache, localList)) writeMetaCache(MODEL_META_PATH, cache);
+      return { models: enrichModels(ids, live, cache) };
     }
     /**
      * SINGLE-FLIGHT，而且超时给足 —— 两者都是实测逼出来的。
@@ -6978,8 +7044,22 @@ app.whenReady().then(async () => {
         或者压根没设偏好）。
       */
       const preferenceWonAhead = !!profile.preferredModel && profile.model === profile.preferredModel;
-      if (rec.profile.model !== profile.model && !preferenceWonAhead) {
-        logger.info('model', `attach ${sessionId}: persisting effective model '${profile.model}' (was '${rec.profile.model}', preferred '${profile.preferredModel}')`);
+      /*
+        **但"别盖掉记录里那个"只在记录里那个是在这台机器上挣来的时候才成立** ——
+        「为什么远程会话又退回到 deepseek 了」。
+
+        那条会话的记录是 `deepseek-3.2`（在**本机**被降级挣来的），切到远端之后执行器真的跑在
+        `claude-opus-5` 上，但这一支拒绝写记录 —— 于是记录永远和现实不一致，而下游每一次
+        从磁盘 hydrate 都会把界面和"下次 attach 用哪个模型"重新拉回 deepseek
+        （`useAcp` 里那句 `sessionModelRef.current.set(rec.id, rec.model)`）。表现就是"又退回去了"。
+
+        原来那条守卫保护的是**这台机器上真跑成一轮挣来的**模型，那是对的。而另一台机器挣来的
+        对这台机器没有任何证明力 —— 替换它不叫"盖掉事实"，叫"换掉一条不适用的记录"。
+      */
+      const earnedOnThisMachine = (rec.profile as any).modelEarnedOn === machineKeyOf(profile);
+      if (rec.profile.model !== profile.model && (!preferenceWonAhead || !earnedOnThisMachine)) {
+        logger.info('model', `attach ${sessionId}: persisting effective model '${profile.model}' (was '${rec.profile.model}', preferred '${profile.preferredModel}')`
+          + (!earnedOnThisMachine ? ` —— 旧值不是在 ${machineKeyOf(profile)} 上挣来的，留着它每次 hydrate 都会把界面拉回去` : ''));
         rec.profile.model = profile.model;
         /* 记下是哪台机器挣的 —— 换机器之后这条就不该再生效（见 `modelEarnedOn`） */
         rec.profile.modelEarnedOn = machineKeyOf(profile);

@@ -163,6 +163,55 @@ export function contentTypeFor(rel: string): string {
   return 'application/octet-stream';
 }
 
+/**
+ * **另一台机器是不是也在动同一条会话** ——（参考 Tabby 那个云同步插件 v1.8.0 的
+ * `Improved conflict detection, safe conflict backups`）。
+ *
+ * 判据：远端那条 catalog 条目**来自别的机器**，而且它的 `updatedAt` 比本机这条新。
+ * 这时本机这一轮上传会把对方更新的内容盖掉 —— 而 S3 没有版本控制的话那是不可逆的。
+ *
+ * 为什么不用"谁的时间晚谁赢"：两台机器的时钟不一定一致，而"悄悄丢掉另一台的对话"
+ * 是这类同步里最贵的失败。所以冲突时**照样把本机这份传上去**（否则本机的改动也没了），
+ * 但传到一个**旁路 key**，并在界面上说出来 —— 让人自己决定留哪份。
+ *
+ * 同一台机器的旧条目不算冲突（那就是我们自己上一轮传的）。
+ */
+export function detectConflicts(
+  remote: Catalog | null,
+  fresh: CatalogEntry[],
+  thisMachine: string,
+): CatalogEntry[] {
+  const byId = new Map((remote?.entries || []).map((e) => [e.id, e]));
+  const out: CatalogEntry[] = [];
+  for (const mine of fresh) {
+    const theirs = byId.get(mine.id);
+    if (!theirs) continue;
+    if ((theirs.from || '') === thisMachine) continue;        // 自己上一轮传的
+    if (!theirs.from) continue;                              // 老条目没记来源，不当冲突
+    if ((theirs.updatedAt || 0) > (mine.updatedAt || 0)) out.push(theirs);
+  }
+  return out;
+}
+
+/** 冲突时本机那份放哪儿 —— 旁路 key，不盖对方的。 */
+export function conflictKeyFor(prefix: string | undefined, sessionId: string, machine: string, rel: string): string {
+  return `${joinPrefix(prefix)}${LAYOUT}/conflicts/${sessionId}/${machine}/${rel.split(path.sep).join('/')}`;
+}
+
+/**
+ * **连续失败之后退避** ——（同样参考那个插件：`improved retry behavior after repeated failures`）。
+ *
+ * 不退避的表现：桶名写错之后，每 30 分钟准时失败一次，日志里堆一模一样的报错，而"它一直在重试"
+ * 这件事本身没有任何价值 —— 错的东西重试一百次还是错的。退避到最多 8 倍间隔，
+ * 成功一次就清零。
+ */
+export const MAX_BACKOFF_MULTIPLIER = 8;
+
+export function backoffMultiplier(consecutiveFailures: number): number {
+  if (consecutiveFailures <= 0) return 1;
+  return Math.min(MAX_BACKOFF_MULTIPLIER, 2 ** Math.min(consecutiveFailures, 3));
+}
+
 /** 把新的 catalog 条目并进旧的（同 id 用**新的**那条），按更新时间倒序。 */
 export function mergeCatalog(old: Catalog | null, fresh: CatalogEntry[]): Catalog {
   const byId = new Map<string, CatalogEntry>();

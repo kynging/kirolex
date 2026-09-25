@@ -805,6 +805,22 @@ const App: React.FC = () => {
   const switchingAgent = !!currentSessionId && switchingAgentIds.includes(currentSessionId);
   const switchingModel = !!currentSessionId && switchingModelIds.includes(currentSessionId);
   const [showSettings, setShowSettings] = useState(false);
+  /** 打开设置时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。 */
+  const [settingsTab, setSettingsTab] = useState<'machines' | 'backup' | undefined>(undefined);
+  /**
+   * 上一次备份的结果 —— 侧栏那个 ☁️ 用它上色和写 title。
+   *
+   * 主进程每跑完一轮就推一次（`s3:sync-done`），启动时再问一次 —— 否则刚打开的那段时间
+   * 按钮是灰的，看起来像"没配过"，而实际上只是这一次运行还没同步过。
+   */
+  const [backupState, setBackupState] = useState<{ at: number; uploaded: number; error?: string } | null>(null);
+  useEffect(() => {
+    const api = (window as any).kiroApi;
+    let alive = true;
+    void api?.getS3Config?.().then((c: any) => { if (alive && c?.last) setBackupState(c.last); }).catch(() => {});
+    const off = api?.onS3SyncDone?.((d: any) => setBackupState(d || null));
+    return () => { alive = false; try { off?.(); } catch {} };
+  }, []);
   const [executorCap, setExecutorCap] = useState<number>(0);
   useEffect(() => {
     window.kiroApi.getExecutorCap?.().then((n) => { if (n) setExecutorCap(n); }).catch(() => {});
@@ -3294,7 +3310,9 @@ const App: React.FC = () => {
               onAssignProject={assignProject}
               onMoveSession={moveSession}
               onArchiveSession={archiveSession}
-              onSettings={() => setShowSettings(true)}
+              onSettings={() => { setSettingsTab(undefined); setShowSettings(true); }}
+              onOpenBackup={() => { setSettingsTab('backup'); setShowSettings(true); }}
+              backupState={backupState}
               workspaceOpen={showWorkspace}
               onOpenWorkspace={() => setShowWorkspace((visible) => !visible)}
               onOpenLogs={() => void handleOpenLogs()}
@@ -3583,6 +3601,7 @@ const App: React.FC = () => {
       </div>
       {showSettings && (
         <SettingsDialog
+          initialTab={settingsTab}
           settings={settings}
           onChange={handleSettingsChange}
           onClose={() => setShowSettings(false)}

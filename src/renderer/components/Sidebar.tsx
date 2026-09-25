@@ -182,6 +182,16 @@ interface SidebarProps {
   onMoveSession: (sessionId: string, projectId: string | null) => void;
   onArchiveSession: (sessionId: string, archived: boolean) => void;
   onSettings: () => void;
+  /**
+   * 打开 ☁️ 备份那一页 ——「这个同步应该在左侧下方有一个入口按钮」。
+   *
+   * 和 ⚙️ 分开一个按钮，而不是"进设置自己找"：备份是一件**有状态**的事（上次什么时候成的、
+   * 失败了没有），而藏在四层菜单后面的状态等于没有状态。Tabby 那个云同步插件同样把它
+   * 放在工具栏上（v1.8.0 的 changelog：`Added toolbar and command-palette actions for syncing`）。
+   */
+  onOpenBackup: () => void;
+  /** 上一次同步的结果 —— 给这个按钮上色和写 title 用。 */
+  backupState?: { at: number; uploaded: number; error?: string } | null;
   workspaceOpen: boolean;
   onOpenWorkspace: () => void;
   onOpenLogs: () => void;
@@ -495,6 +505,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onMoveSession,
   onArchiveSession,
   onSettings,
+  onOpenBackup,
+  backupState,
   workspaceOpen,
   onOpenWorkspace,
   onOpenLogs,
@@ -1186,6 +1198,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </button>
           <button className="sidebar-settings-btn" onClick={onSettings} title={t('Settings')}>
             ⚙️
+          </button>
+          {/*
+            **备份入口 + 状态指示是同一个按钮** —— 它要能回答"备份在跑吗、上次成了吗"。
+            没配过（`backupState` 为空）时是灰的：那和"配过但失败了"必须看得出区别，
+            否则"我以为它在备份"是最贵的一种误解 —— 等你需要恢复时才发现从来没传上去过。
+          */}
+          <button
+            className={`sidebar-settings-btn sidebar-backup-btn${backupState?.error ? ' bad' : backupState ? ' ok' : ''}`}
+            onClick={onOpenBackup}
+            title={backupState?.error
+              ? `备份上次失败了（${new Date(backupState.at).toLocaleString()}）：${backupState.error.split('\n')[0]}`
+              : backupState
+                ? `上次备份：${new Date(backupState.at).toLocaleString()} · 传了 ${backupState.uploaded} 个文件`
+                : '备份到 S3（还没配 —— 点这里配）'}
+            aria-label="备份"
+          >
+            ☁️
           </button>
           <button
             className="sidebar-settings-btn sidebar-workspace-btn"

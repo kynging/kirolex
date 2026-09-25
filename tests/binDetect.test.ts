@@ -233,7 +233,10 @@ describe('设置分页 + 文案', () => {
     assert.ok(decl, '没有 SettingsTab 声明');
     const ids = Array.from(decl![1].matchAll(/'([a-z]+)'/g)).map((m) => m[1]);
     assert.equal(ids[0], 'machines', '机器排第一');
-    assert.match(D, /useState<SettingsTab>\('machines'\)/);
+    /* 默认页仍然是机器，只是现在可以被 `initialTab` 指定 ——
+       侧栏那个 ☁️ 要直接落到备份页（「这个同步应该在左侧下方有一个入口按钮」）。 */
+    assert.match(D, /useState<SettingsTab>\(initialTab \|\| 'machines'\)/);
+    assert.match(D, /initialTab\?: SettingsTab;/);
     assert.match(D, /\{tab === 'machines' && <RemoteSettings \/>\}/);
     for (const id of ids.slice(1)) {
       assert.ok(

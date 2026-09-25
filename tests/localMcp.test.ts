@@ -406,9 +406,11 @@ describe('模型列表按机器分', () => {
        （`error: unexpected argument '--list-models'`），所以远端唯一拿得到的就是一串 id。
        而"claude-opus-5 的倍率是 2.2"是**模型自己的属性**、不随机器变 —— 机器决定的只是
        "有哪些模型"。所以按 id 从本机那份补；本机不认识的 id 留裸的（少点信息好过编一个）。 */
-    assert.match(M, /const byId = new Map\(localList\.map/);
-    assert.match(M, /\.\.\.\(byId\.get\(id\) \|\| \{\}\), model_id: id/);
-    assert.match(M, /model_name: byId\.get\(id\)\?\.model_name \|\| id/);
+    /* **后来又多了一层**（「为什么又看不到模型乘数了」）：本机出口被地域过滤之后清单里一个
+       Claude 都没有，于是"从本机那份补"补不到东西。现在是三层、实时的永远赢：
+       实时清单 → 持久缓存 → 内置快照（`modelMeta.ts`）。补不到仍然留裸的 —— 不编数字。 */
+    assert.match(M, /return \{ models: enrichModels\(ids, live, cache\) \};/);
+    assert.match(M, /readMetaCache\(MODEL_META_PATH\)/);
   });
 
   test('渲染层：每一格按它自己那条会话所在的机器取列表，缓存 key 带机器', () => {

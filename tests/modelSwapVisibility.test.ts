@@ -120,10 +120,17 @@ describe('attach 不许把「只是连上了」写成有效模型', () => {
     return MAIN.slice(at, MAIN.indexOf('store.writeRecord(rec);', at));
   };
 
-  test('偏好抢先时不写记录', () => {
+  test('偏好抢先时不写记录 —— **但只保护本机挣来的那个**', () => {
     const body = attachBlock();
     assert.match(body, /const preferenceWonAhead = .*profile\.model === profile\.preferredModel/);
-    assert.match(body, /rec\.profile\.model !== profile\.model && !preferenceWonAhead/);
+    /*
+      「为什么远程会话又退回到 deepseek 了」：那条会话的记录是在**本机**被降级挣来的
+      `deepseek-3.2`，切到远端之后执行器真的跑 `claude-opus-5`，而这一支拒绝写记录 ——
+      于是记录永远和现实不一致，每次从磁盘 hydrate 都把界面和"下次用哪个模型"拉回 deepseek。
+      另一台机器挣来的值对这台机器没有证明力，替换它不叫"盖掉事实"。
+    */
+    assert.match(body, /const earnedOnThisMachine = .*modelEarnedOn === machineKeyOf\(profile\)/);
+    assert.match(body, /rec\.profile\.model !== profile\.model && \(!preferenceWonAhead \|\| !earnedOnThisMachine\)/);
   });
 
   test('真的降级时照旧写 —— 这段代码原来的理由还在（退役模型会拖死启动）', () => {

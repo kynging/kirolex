@@ -6,7 +6,11 @@ import { S3BackupSettings } from './S3BackupSettings.tsx';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
 
+type SettingsTab = 'machines' | 'appearance' | 'session' | 'backup' | 'switches';
+
 interface SettingsDialogProps {
+  /** 打开时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。不传 = 机器页。 */
+  initialTab?: SettingsTab;
   settings: Settings;
   onChange: (settings: Settings) => void;
   onClose: () => void;
@@ -102,7 +106,6 @@ const SWITCHES: Array<{
  * 按**你来这儿要干什么**分，不是按字段类型分。顺序就是使用频率的反面：机器那一页是当前
  * 在做的事（而且是唯一会连到另一台机器的一页），放第一个；开关那一列本来就占满一屏，独占一页。
  */
-type SettingsTab = 'machines' | 'appearance' | 'session' | 'backup' | 'switches';
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: 'machines', label: '🖥 机器' },
@@ -113,6 +116,7 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
 ];
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
+  initialTab,
   settings,
   onChange,
   onClose,
@@ -123,7 +127,11 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   // Executor cap (max concurrent connected sessions). 0/'' in the input = auto.
   /* 打开时停在「机器」那一页 —— 那是当前在配的东西；不记住上次选的哪一页（多一份状态，
      换来的只是"上次我在哪"，而每次打开设置的理由通常都不一样）。 */
-  const [tab, setTab] = useState<SettingsTab>('machines');
+  /*
+    **打开时停在哪一页可以被指定** —— 侧栏那个 ☁️ 按钮要直接落到备份页。
+    不传就还是机器页（那是最常改的一页）。
+  */
+  const [tab, setTab] = useState<SettingsTab>(initialTab || 'machines');
   const [capInfo, setCapInfo] = useState<{ cap: number; auto: number; overridden: boolean } | null>(null);
   const [capInput, setCapInput] = useState('');
   // Wedge-interrupt threshold in seconds. '' while loading, '0' = never interrupt.

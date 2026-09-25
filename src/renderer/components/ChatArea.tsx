@@ -3988,7 +3988,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           </option>
                         ) : null}
                         {models.map((model) => (
-                          <option key={model.model_id} value={model.model_id}>
+                          <option
+                            key={model.model_id}
+                            value={model.model_id}
+                            /*
+                              **数字是哪来的要能查** ——「为什么又看不到模型乘数了」那次的根因是
+                              远端只给 id、而本机清单里没有那个模型（地域过滤），于是倍率补不上。
+                              现在有缓存和内置快照兜底（`modelMeta.ts`），但快照可能过期 ——
+                              所以非实时的那几条在 title 里说一句，而不是让 `2.2x` 看起来永远权威。
+                            */
+                            title={(model as any).metaFrom && (model as any).metaFrom !== 'live' && (model as any).metaFrom !== 'none'
+                              ? `${model.model_id}（倍率/窗口来自${(model as any).metaFrom === 'cache' ? '本机缓存' : '内置快照'}，不是这台机器这一刻报的）`
+                              : model.model_id}
+                          >
                             {model.model_name}{model.context_window_tokens ? ` · ${fmtContextWindow(model.context_window_tokens)}` : ''}
                             {/* 价格乘数 —— 换模型是这一格里唯一会花钱的选择，代价该摆在做决定的地方 */}
                             {fmtRate((model as any).rate_multiplier) ? ` · ${fmtRate((model as any).rate_multiplier)}` : ''}

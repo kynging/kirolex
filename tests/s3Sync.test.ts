@@ -8,8 +8,10 @@ import { parseS3ErrorCode, hintFor } from '../src/main/s3Client.ts';
 import {
   planUpload, keyFor, relFor, walk, contentTypeFor, mergeCatalog, joinPrefix, catalogKey,
   readState, writeState, maskKeyId, trashDirFor,
+  detectConflicts, conflictKeyFor, backoffMultiplier, MAX_BACKOFF_MULTIPLIER,
   SESSION_FILES, SHARED_DIRS, MAX_FILE_BYTES, LAYOUT, DEFAULT_INTERVAL_MINUTES,
 } from '../src/main/s3Sync.ts';
+import type { CatalogEntry } from '../src/main/s3Sync.ts';
 
 /*
  * 「加一个定时向 S3 同步的功能，然后用户可以选择哪个会话恢复回本地，S3 认证用 AKSK」。
@@ -291,7 +293,12 @@ describe('接线', () => {
   test('catalog **最后**传：它是恢复的唯一入口，先传会指向还没上传完的东西', () => {
     const at = M.indexOf('async function runS3Sync');
     const body = M.slice(at, M.indexOf('rescheduleS3Sync', at));
-    assert.ok(body.indexOf('for (const rel of plan.upload)') < body.indexOf('catalogKey('), 'catalog 要排在文件之后');
+    /* **写** catalog 在文件之后。注意现在 catalog 还会被**先读一次**（冲突检测要在覆盖之前
+       知道桶里是什么），所以判据是 `putObject(... catalogKey` 的位置，不是 `catalogKey(` 的位置。 */
+    assert.ok(
+      body.indexOf('for (const rel of plan.upload)') < body.indexOf('putObject(creds!, catalogKey('),
+      '写 catalog 要排在文件之后',
+    );
   });
 
   test('同步不可重入（定时器和按钮会同时点）', () => {
@@ -347,5 +354,69 @@ describe('接线', () => {
     assert.match(UI, /trash/);
     /* secret 框平时是空的，空 = 不改 */
     assert.match(UI, /留空 = 不改/);
+  });
+});
+
+/*
+ * 从 Tabby 那个云同步插件（`niceit/tabby-cloud-sync-settings` v1.8.0）借来的两条 ——
+ * 它的 changelog 里写着 `Improved conflict detection, safe conflict backups, synchronization
+ * pausing, and local snapshot recovery` 和 `improved retry behavior after repeated failures`。
+ * 这两条都是我们原来没有的，而且都是"错了不报错、只会安静丢数据 / 安静刷日志"的那类。
+ */
+describe('冲突检测与失败退避（借 Tabby 的做法）', () => {
+  const mine = (over: Partial<CatalogEntry> = {}): CatalogEntry =>
+    ({ id: 's1', title: 'A', updatedAt: 100, bytes: 1, syncedAt: 1, ...over } as CatalogEntry);
+
+  test('别的机器更新得更晚 → 算冲突', () => {
+    const remote = { version: 1 as const, entries: [mine({ updatedAt: 200, from: 'other-mac' })] };
+    const c = detectConflicts(remote, [mine({ updatedAt: 100, from: 'me' })], 'me');
+    assert.deepEqual(c.map((e) => e.id), ['s1']);
+  });
+
+  test('自己上一轮传的不算冲突', () => {
+    const remote = { version: 1 as const, entries: [mine({ updatedAt: 200, from: 'me' })] };
+    assert.deepEqual(detectConflicts(remote, [mine({ updatedAt: 100, from: 'me' })], 'me'), []);
+  });
+
+  test('本机更新更晚 → 不算冲突（正常的往前推进）', () => {
+    const remote = { version: 1 as const, entries: [mine({ updatedAt: 50, from: 'other-mac' })] };
+    assert.deepEqual(detectConflicts(remote, [mine({ updatedAt: 100, from: 'me' })], 'me'), []);
+  });
+
+  test('老条目没记来源 → 不当冲突（否则第一次升级后全都变冲突）', () => {
+    const remote = { version: 1 as const, entries: [mine({ updatedAt: 200, from: undefined })] };
+    assert.deepEqual(detectConflicts(remote, [mine({ updatedAt: 100, from: 'me' })], 'me'), []);
+  });
+
+  test('冲突时本机那份走旁路 key，不盖对方的', () => {
+    const k = conflictKeyFor('kirolex', 's1', 'me', path.join('sessions', 's1', 'record.json'));
+    assert.equal(k, `kirolex/${LAYOUT}/conflicts/s1/me/sessions/s1/record.json`);
+    /* 正常 key 和冲突 key 必须不同 —— 相同就等于没做这件事 */
+    assert.notEqual(k, keyFor('kirolex', path.join('sessions', 's1', 'record.json')));
+  });
+
+  test('退避：翻倍、有上限、成功清零', () => {
+    assert.equal(backoffMultiplier(0), 1);
+    assert.equal(backoffMultiplier(1), 2);
+    assert.equal(backoffMultiplier(2), 4);
+    assert.equal(backoffMultiplier(3), 8);
+    /* 有上限：桶名写错不该退避到几天后才重试一次 */
+    assert.equal(backoffMultiplier(99), MAX_BACKOFF_MULTIPLIER);
+  });
+
+  test('接线：手动点「立即同步」不受退避限制', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    /* 人刚改完配置想马上验证 —— 让他等 4 小时是荒谬的 */
+    assert.match(M, /if \(reason === '定时' && Date\.now\(\) < syncNextAllowedAt\)/);
+    assert.match(M, /syncFailures = 0;\s*\n\s*syncNextAllowedAt = 0;/);
+  });
+
+  test('接线：catalog 在上传**之前**读 —— 读晚了已经盖掉对方了', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf('async function runS3Sync');
+    const body = M.slice(at, M.indexOf('rescheduleS3Sync', at));
+    assert.ok(body.indexOf('detectConflicts(') < body.indexOf('for (const rel of plan.upload)'));
+    /* 冲突的那几条不进 catalog：它们在 conflicts/ 下，让 catalog 指向它们就是把"可恢复"说错了 */
+    assert.match(body, /freshEntries\.filter\(\(e\) => !conflictIds\.has\(e\.id\)\)/);
   });
 });

@@ -7846,3 +7846,25 @@ button, input, select, textarea {
   font-size: 12px;
   line-height: 1.5;
 }
+
+/*
+  侧栏那个 ☁️ 备份按钮 —— 入口兼状态指示。
+  没配过是默认灰（和"配过但失败"必须看得出区别：把两者画成一样，
+  会让人以为在备份，而等到需要恢复时才发现从来没传上去过）。
+*/
+.sidebar-backup-btn.ok { filter: none; opacity: 1; }
+.sidebar-backup-btn.bad {
+  /* 失败用红点标出来，而不是只改 title —— title 要 hover 才看得到 */
+  position: relative;
+}
+.sidebar-backup-btn.bad::after {
+  content: '';
+  position: absolute;
+  top: 2px;
+  right: 2px;
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--danger, #e05252);
+}
+.sidebar-backup-btn:not(.ok):not(.bad) { opacity: 0.55; }
