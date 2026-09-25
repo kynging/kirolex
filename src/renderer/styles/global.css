@@ -7836,3 +7836,13 @@ button, input, select, textarea {
 /* 机器那一页只有一栏（远端配置本身就是竖着排的一组字段），所以不要两栏网格 ——
    两栏会把那一组字段劈成左右两半，读起来是断的。 */
 .settings-body-machines { grid-template-columns: 1fr; }
+
+/*
+  ☁️ 备份那一页的告警块 —— 复用 settings 的排版，只把颜色换成危险色。
+  用在两处：没有 keychain（不能存 secret）、以及上一次同步失败的原文。
+*/
+.settings-warn {
+  color: var(--danger, #e05252);
+  font-size: 12px;
+  line-height: 1.5;
+}

@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -7,6 +7,12 @@ import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, 
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
+import {
+  SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
+  planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
+  maskKeyId, machineTag, trashDirFor,
+} from './s3Sync.ts';
+import { S3Creds, S3Error, putObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
@@ -2583,6 +2589,154 @@ function saveFeatureFlag(key: string, enabled: boolean): Record<string, boolean>
  *  persisted in ~/.kirolex/config.json. */
 const DEFAULT_HELPER_MODEL = 'claude-sonnet-5';
 const DEFAULT_HELPER_FALLBACK_MODEL = 'gpt-5.6-terra';
+/* ---------------------------------------------------------------- S3 备份 */
+
+/**
+ * **AKSK 的 secret 不落明文** —— 这是 ARCC 那条规矩在本机上的等价做法。
+ *
+ * ARCC 这次没查到（`arcc` CLI 报 Midway 401，属于环境没登录，不是"没有这条规矩"），
+ * 所以按标准做法办：secret 用 Electron `safeStorage` 加密后再写进 `config.json`
+ * （macOS 上落在 Keychain 保护的密钥下），日志里只出现 access key 的后 4 位。
+ *
+ * `safeStorage` 不可用时（某些 Linux 桌面环境没有 keyring）**拒绝保存**，而不是退回明文：
+ * "我帮你存了"和"我把你的密钥明文写进了一个 JSON"之间，用户有权知道是哪一个。
+ */
+function encryptSecret(plain: string): string {
+  if (!safeStorage.isEncryptionAvailable()) {
+    throw new Error('这台机器上没有可用的加密存储（keychain / keyring）—— 拒绝把 secret 明文写进配置。');
+  }
+  return safeStorage.encryptString(plain).toString('base64');
+}
+
+function decryptSecret(cipher?: string): string {
+  if (!cipher) return '';
+  try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { return ''; }
+}
+
+const KIROLEX_HOME = path.join(os.homedir(), '.kirolex');
+const S3_STATE_PATH = path.join(KIROLEX_HOME, 's3-sync-state.json');
+
+function loadSyncConfig(): SyncConfig {
+  try {
+    const cfg = JSON.parse(fs.readFileSync(KIROLEX_CONFIG_PATH, 'utf-8'));
+    return (cfg?.s3Sync && typeof cfg.s3Sync === 'object') ? cfg.s3Sync as SyncConfig : {};
+  } catch { return {}; }
+}
+
+function saveSyncConfig(next: SyncConfig): void {
+  let cfg: any = {};
+  try { cfg = JSON.parse(fs.readFileSync(KIROLEX_CONFIG_PATH, 'utf-8')); } catch {}
+  cfg.s3Sync = next;
+  try { fs.mkdirSync(path.dirname(KIROLEX_CONFIG_PATH), { recursive: true }); } catch {}
+  fs.writeFileSync(KIROLEX_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+
+/** 配好了没有 —— 缺哪一项就说哪一项（"同步没生效"必须能查）。 */
+function syncCredsOrProblem(): { creds?: S3Creds; problem?: string } {
+  const cfg = loadSyncConfig();
+  const missing = [
+    !cfg.bucket && 'bucket',
+    !cfg.region && 'region',
+    !cfg.accessKeyId && 'Access Key ID',
+    !cfg.secretCipher && 'Secret Access Key',
+  ].filter(Boolean) as string[];
+  if (missing.length) return { problem: `S3 备份还没配好：缺 ${missing.join('、')}（设置 → ☁️ 备份）。` };
+  const secretAccessKey = decryptSecret(cfg.secretCipher);
+  if (!secretAccessKey) {
+    return { problem: 'S3 的 secret 解不开了 —— keychain 里那把密钥变了（换过机器/重装过？）。重新填一次。' };
+  }
+  return {
+    creds: {
+      accessKeyId: cfg.accessKeyId!, secretAccessKey,
+      region: cfg.region!, bucket: cfg.bucket!, endpoint: cfg.endpoint,
+    },
+  };
+}
+
+let syncRunning = false;
+let syncTimer: NodeJS.Timeout | null = null;
+let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string } | null = null;
+
+/**
+ * 跑一轮同步。
+ *
+ * **串行、可重入保护**：定时器和"立即同步"按钮都会调它，两个同时跑会把状态文件写花。
+ * 失败不抛 —— 备份是背景工作，但**必须留下摘要**，否则"同步没生效"是个不可查的问题。
+ */
+async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string }> {
+  if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: '上一轮还在跑' };
+  const { creds, problem } = syncCredsOrProblem();
+  if (problem) return { ok: false, uploaded: 0, skipped: 0, error: problem };
+  syncRunning = true;
+  const cfg = loadSyncConfig();
+  const state = readState(S3_STATE_PATH);
+  let uploaded = 0;
+  let bytes = 0;
+  try {
+    const sessions = store.listSessions();
+    const ids = sessions.map((r) => r.id);
+    const plan = planUpload(KIROLEX_HOME, ids, state);
+    logger.info('s3', `同步开始（${reason}）：${plan.upload.length} 个要传、${plan.skippedUnchanged} 个没变`
+      + `${plan.skippedTooBig.length ? `、${plan.skippedTooBig.length} 个太大跳过` : ''}`
+      + ` bucket=${cfg.bucket} key=${maskKeyId(cfg.accessKeyId)}`);
+    for (const rel of plan.skippedTooBig) {
+      logger.warn('s3', `跳过（超过 ${MAX_FILE_BYTES / 1024 / 1024}MB）：${rel}`);
+    }
+    for (const rel of plan.upload) {
+      const abs = path.join(KIROLEX_HOME, rel);
+      let body: Buffer;
+      let st: fs.Stats;
+      try { body = fs.readFileSync(abs); st = fs.statSync(abs); } catch { continue; }
+      await putObject(creds!, keyFor(cfg.prefix, rel), body, contentTypeFor(rel));
+      state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
+      uploaded += 1;
+      bytes += body.length;
+    }
+    /* catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西 */
+    const fresh: CatalogEntry[] = sessions.map((r) => ({
+      id: r.id,
+      title: r.title || 'New Chat',
+      updatedAt: r.updatedAt || 0,
+      bytes: SESSION_FILES.reduce((sum, f) => {
+        try { return sum + fs.statSync(path.join(KIROLEX_HOME, 'sessions', r.id, f)).size; } catch { return sum; }
+      }, 0),
+      from: machineTag(os.hostname()),
+      syncedAt: Date.now(),
+    }));
+    const oldRaw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+    let oldCatalog: Catalog | null = null;
+    try { oldCatalog = oldRaw ? JSON.parse(oldRaw.toString('utf-8')) : null; } catch { oldCatalog = null; }
+    const merged = mergeCatalog(oldCatalog, fresh);
+    await putObject(creds!, catalogKey(cfg.prefix), Buffer.from(JSON.stringify(merged, null, 2)), 'application/json');
+    writeState(S3_STATE_PATH, state);
+    lastSyncSummary = { at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes };
+    logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`);
+    mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
+    return { ok: true, uploaded, skipped: plan.skippedUnchanged };
+  } catch (err: any) {
+    const hint = err instanceof S3Error ? `\n${err.hint}` : '';
+    const message = `${err?.message || err}${hint}`;
+    /* 部分成功也把 state 写下来：已经传上去的下次不必再传 */
+    writeState(S3_STATE_PATH, state);
+    lastSyncSummary = { at: Date.now(), uploaded, skipped: 0, bytes, error: message };
+    logger.warn('s3', `同步失败（${reason}）：${message}`);
+    mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
+    return { ok: false, uploaded, skipped: 0, error: message };
+  } finally {
+    syncRunning = false;
+  }
+}
+
+/** 按配置重排定时器。关掉时清掉 —— 留着一个不干活的定时器只会让人以为它在跑。 */
+function rescheduleS3Sync(): void {
+  if (syncTimer) { clearInterval(syncTimer); syncTimer = null; }
+  const cfg = loadSyncConfig();
+  if (!cfg.enabled) { logger.info('s3', '定时同步：关'); return; }
+  const minutes = Math.max(5, Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES);
+  syncTimer = setInterval(() => { void runS3Sync('定时'); }, minutes * 60_000);
+  logger.info('s3', `定时同步：每 ${minutes} 分钟一次`);
+}
+
 function loadHelperModels(): { model: string; fallback: string } {
   try {
     const cfg = JSON.parse(fs.readFileSync(KIROLEX_CONFIG_PATH, 'utf-8'));
@@ -3582,6 +3736,140 @@ app.whenReady().then(async () => {
 
   // Reveal the main window only after the renderer explicitly reports that
   // hydration, initial transcript restore, and eager attach are complete.
+  /* ------------------------------------------------------------ S3 备份 IPC */
+
+  ipcMain.handle('s3:get-config', async () => {
+    const cfg = loadSyncConfig();
+    /* **secret 一个字节都不回渲染层** —— 它只需要知道"填过了"。回去一次就多一个泄漏面。 */
+    return {
+      enabled: !!cfg.enabled,
+      bucket: cfg.bucket || '',
+      region: cfg.region || '',
+      prefix: cfg.prefix || '',
+      endpoint: cfg.endpoint || '',
+      intervalMinutes: Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES,
+      accessKeyId: cfg.accessKeyId || '',
+      hasSecret: !!cfg.secretCipher,
+      encryptionAvailable: safeStorage.isEncryptionAvailable(),
+      last: lastSyncSummary,
+    };
+  });
+
+  ipcMain.handle('s3:save-config', async (_event, input: any) => {
+    const cur = loadSyncConfig();
+    const next: SyncConfig = {
+      ...cur,
+      /*
+        **键在 input 里才动它** —— 和机器配置那边同一条规矩：漏传一个字段不该等于"清空它"。
+        secret 尤其：不传 = 不改（界面上那个框平时是空的，因为我们从不回传明文）。
+      */
+      ...(input?.enabled !== undefined ? { enabled: !!input.enabled } : null),
+      ...(input?.bucket !== undefined ? { bucket: String(input.bucket).trim() } : null),
+      ...(input?.region !== undefined ? { region: String(input.region).trim() } : null),
+      ...(input?.prefix !== undefined ? { prefix: String(input.prefix).trim() } : null),
+      ...(input?.endpoint !== undefined ? { endpoint: String(input.endpoint).trim() } : null),
+      ...(input?.intervalMinutes !== undefined ? { intervalMinutes: Math.max(5, Number(input.intervalMinutes) || DEFAULT_INTERVAL_MINUTES) } : null),
+      ...(input?.accessKeyId !== undefined ? { accessKeyId: String(input.accessKeyId).trim() } : null),
+    };
+    if (typeof input?.secretAccessKey === 'string' && input.secretAccessKey.trim()) {
+      next.secretCipher = encryptSecret(input.secretAccessKey.trim());
+    }
+    if (input?.clearSecret) delete next.secretCipher;
+    saveSyncConfig(next);
+    rescheduleS3Sync();
+    logger.info('s3', `配置已保存 bucket=${next.bucket} region=${next.region} key=${maskKeyId(next.accessKeyId)}`
+      + ` 定时=${next.enabled ? `${next.intervalMinutes}分钟` : '关'}`);
+    return { ok: true };
+  });
+
+  /**
+   * 测连通：写一个小对象再读回来。
+   *
+   * 为什么要**写**而不是只 LIST：备份的动作是 PutObject，而 `s3:ListBucket` 和 `s3:PutObject`
+   * 是两条独立的权限 —— 只列成功的话，人会以为配好了，然后在第一次定时同步时才发现不能写。
+   */
+  ipcMain.handle('s3:test', async () => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    const cfg = loadSyncConfig();
+    const key = `${keyFor(cfg.prefix, '.kirolex-write-test')}`;
+    const stamp = new Date().toISOString();
+    try {
+      await putObject(creds!, key, Buffer.from(stamp), 'text/plain');
+      const back = await getObject(creds!, key);
+      if (back.toString('utf-8') !== stamp) return { ok: false, error: '写进去又读回来的内容不一致 —— 桶上可能有改写内容的策略。' };
+      return { ok: true, message: `可读可写（${cfg.bucket} / ${cfg.region}）` };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    }
+  });
+
+  ipcMain.handle('s3:sync-now', async () => runS3Sync('手动'));
+
+  /** 恢复列表：一次 GET 拿到 catalog，不 LIST 整个桶。 */
+  ipcMain.handle('s3:list-backups', async () => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { entries: [], error: problem };
+    const cfg = loadSyncConfig();
+    try {
+      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+      if (!raw) return { entries: [], error: '这个桶里还没有备份（先同步一次）。' };
+      const catalog = JSON.parse(raw.toString('utf-8')) as Catalog;
+      const local = new Set(store.listSessions().map((r) => r.id));
+      return {
+        entries: (catalog.entries || []).map((e) => ({ ...e, existsLocally: local.has(e.id) })),
+      };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { entries: [], error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    }
+  });
+
+  /**
+   * 把一条会话恢复回本地。**覆盖同 id**（用户选的），但覆盖前先挪进 trash。
+   *
+   * 不恢复正在连着的那条：它的执行器手上握着 transcript，覆盖文件只会让内存和磁盘打架。
+   */
+  ipcMain.handle('s3:restore', async (_event, sessionId: string) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: '会话 id 不合法。' };
+    if (sessionClients.has(sessionId)) {
+      return { ok: false, error: '这条会话正连着 —— 先关掉它（侧栏右键 → 断开）再恢复，否则内存里那份会把恢复的内容盖回去。' };
+    }
+    const cfg = loadSyncConfig();
+    try {
+      const prefix = `${keyFor(cfg.prefix, path.join('sessions', sessionId))}/`;
+      const objects = await listObjects(creds!, prefix);
+      if (!objects.length) return { ok: false, error: `桶里没有 ${sessionId} 的文件。` };
+
+      /* 覆盖之前先把本地那份挪走 —— "选了覆盖"不等于"愿意丢掉" */
+      const localDir = path.join(KIROLEX_HOME, 'sessions', sessionId);
+      let backedUp: string | null = null;
+      if (fs.existsSync(localDir)) {
+        backedUp = trashDirFor(KIROLEX_HOME, sessionId);
+        fs.mkdirSync(path.dirname(backedUp), { recursive: true });
+        fs.cpSync(localDir, backedUp, { recursive: true });
+      }
+
+      let restored = 0;
+      for (const obj of objects) {
+        const rel = relFor(cfg.prefix, obj.key);
+        if (!rel) continue;                                  // 不属于这个布局 / 含 `..`
+        const abs = path.join(KIROLEX_HOME, rel);
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, await getObject(creds!, obj.key));
+        restored += 1;
+      }
+      logger.info('s3', `恢复 ${sessionId}：${restored} 个文件${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
+      return { ok: true, restored, backedUp };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    }
+  });
+
   ipcMain.handle('acp:reveal', async () => {
     startupMark('reveal: window shown (hydrate + eager-attach finished)');
     showMainWindow();
@@ -3590,6 +3878,21 @@ app.whenReady().then(async () => {
       多等一个网络往返 —— 而这件事一分钟后做和现在做没有任何区别。
     */
     void sweepRemoteSessionAgents();
+    /* 定时同步的时钟从窗口出来那一刻开始走（启动路径上不该多一次网络往返） */
+    rescheduleS3Sync();
+    /*
+      **启动后补一轮**，而不是退出前。
+
+      `before-quit` 是同步回调 —— 在那里 await 一次上传会被直接丢掉；要真等就得
+      `preventDefault()` 然后让窗口挂在那儿等一个网络往返，而用户点退出时看到 app 卡住
+      比"下次启动补上"糟得多。更重要的是：**崩溃和被 kill 根本不会走 before-quit**，
+      而那正是最需要补的两种情况。启动后补一轮对这三种都有效。
+
+      60 秒之后再跑：那时 attach 风暴已经过去，不和会话抢网络和 CPU。
+    */
+    if (loadSyncConfig().enabled) {
+      setTimeout(() => { void runS3Sync('启动后补一轮'); }, 60_000);
+    }
     return { revealed: true };
   });
 

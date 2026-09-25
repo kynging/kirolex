@@ -225,14 +225,25 @@ describe('设置分页 + 文案', () => {
   const R = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
   const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
 
-  test('四页，机器**单独一页**而且是打开时停的那一页', () => {
-    assert.match(D, /type SettingsTab = 'machines' \| 'appearance' \| 'session' \| 'switches';/);
+  test('机器**单独一页**而且是打开时停的那一页；每一页都接上了', () => {
+    /* 页数会长（备份那一页是「定时向 S3 同步」加的），所以不写死数量 —— 只钉住
+       "机器是第一页、是默认页"，以及**每一个**声明出来的 tab 都真的接了内容：
+       少接一页的表现是"点了那个标签一片空白"，而那种 bug 没有任何报错。 */
+    const decl = D.match(/type SettingsTab = ([^;]+);/);
+    assert.ok(decl, '没有 SettingsTab 声明');
+    const ids = Array.from(decl![1].matchAll(/'([a-z]+)'/g)).map((m) => m[1]);
+    assert.equal(ids[0], 'machines', '机器排第一');
     assert.match(D, /useState<SettingsTab>\('machines'\)/);
     assert.match(D, /\{tab === 'machines' && <RemoteSettings \/>\}/);
-    /* 每一页都要有东西 —— 少接一页的表现是"点了那个标签一片空白" */
-    for (const id of ['appearance', 'session', 'switches']) {
-      assert.ok(D.includes(`{tab === '${id}' && (`), `${id} 这一页没接上`);
+    for (const id of ids.slice(1)) {
+      assert.ok(
+        D.includes(`{tab === '${id}' && (`) || D.includes(`{tab === '${id}' && <`),
+        `${id} 这一页没接上`,
+      );
     }
+    /* 标签栏里的条目数要和声明对得上 —— 声明了没进 TABS 就是点不到 */
+    const tabs = Array.from(D.matchAll(/\{ id: '([a-z]+)', label:/g)).map((m) => m[1]);
+    assert.deepEqual(tabs, ids, 'TABS 和 SettingsTab 声明不一致');
   });
 
   test('分页之后不再需要"把它硬提到最上面"那种布局较劲', () => {

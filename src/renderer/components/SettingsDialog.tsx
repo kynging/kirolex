@@ -2,6 +2,7 @@ import { LANG_OPTIONS, normalizeLang } from '../i18n';
 import { RemoteSettings } from './RemoteSettings';
 import { useT } from '../hooks/useLang';
 import React from 'react';
+import { S3BackupSettings } from './S3BackupSettings.tsx';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
 
@@ -101,12 +102,13 @@ const SWITCHES: Array<{
  * 按**你来这儿要干什么**分，不是按字段类型分。顺序就是使用频率的反面：机器那一页是当前
  * 在做的事（而且是唯一会连到另一台机器的一页），放第一个；开关那一列本来就占满一屏，独占一页。
  */
-type SettingsTab = 'machines' | 'appearance' | 'session' | 'switches';
+type SettingsTab = 'machines' | 'appearance' | 'session' | 'backup' | 'switches';
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: 'machines', label: '🖥 机器' },
   { id: 'appearance', label: '🎨 外观' },
   { id: 'session', label: '💬 会话' },
+  { id: 'backup', label: '☁️ 备份' },
   { id: 'switches', label: '🧪 开关' },
 ];
 
@@ -547,6 +549,8 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 the switch affects, not by which file holds it. */}
           </div>
           )}
+
+          {tab === 'backup' && <S3BackupSettings />}
 
           {tab === 'switches' && (
           <div className="settings-col">

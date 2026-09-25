@@ -56,6 +56,26 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * （kiro-cli 只认它自己机器上的）。不传 = 本机。
    */
   listKiroAgents: (machine?: string) => ipcRenderer.invoke('kiro:list-agents', machine),
+
+  /* ----------------------------------------------------------- S3 备份 */
+  /**
+   * **secret 只往一个方向走** —— `getS3Config` 回的是 `hasSecret: boolean`，从不回明文。
+   * 回一次就多一个泄漏面（渲染进程、devtools、任何一个 console.log 都够）。
+   */
+  getS3Config: () => ipcRenderer.invoke('s3:get-config'),
+  /** 不传 `secretAccessKey` = 不改它（界面上那个框平时是空的）。 */
+  saveS3Config: (input: any) => ipcRenderer.invoke('s3:save-config', input),
+  /** 测连通：真写一个小对象再读回来 —— ListBucket 通不代表 PutObject 通。 */
+  testS3: () => ipcRenderer.invoke('s3:test'),
+  syncS3Now: () => ipcRenderer.invoke('s3:sync-now'),
+  listS3Backups: () => ipcRenderer.invoke('s3:list-backups'),
+  /** 恢复一条会话（覆盖同 id，覆盖前本地那份会被挪进 trash）。 */
+  restoreS3Session: (sessionId: string) => ipcRenderer.invoke('s3:restore', sessionId),
+  onS3SyncDone: (cb: (d: any) => void) => {
+    const h = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('s3:sync-done', h);
+    return () => ipcRenderer.removeListener('s3:sync-done', h);
+  },
   openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => ipcRenderer.invoke('kiro:open-agent-config', sessionId, agentName, source),
   saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => ipcRenderer.invoke('kiro:save-agent-config', sessionId, agentName, source, content),
   switchKiroAgent: (sessionId: string, agentName: string) => ipcRenderer.invoke('acp:switch-kiro-agent', sessionId, agentName),
