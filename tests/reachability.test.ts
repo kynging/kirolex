@@ -153,3 +153,34 @@ describe('每台远端机器的并发上限', () => {
     assert.match(M, /\(entry\.profile\.remote\?\.sshHost \|\| ''\) === host/);
   });
 });
+
+/*
+ * 「修好了之后起一个新的远程会话测试下」的前置：**这道闸原来在并行 attach 时形同不存在**。
+ *
+ * 实测：上限算出来是 6，而重启那一轮起了 **8 个**执行器。因为每条会话都在
+ * `sessionClients.set(...)` 之前做检查，中间还要 await preflight / ensureLocalTools / connect ——
+ * 于是它们各自都看到"还没满"。和当初两条会话抢到同一个远端端口是同一个形状：
+ * **占位必须在任何 await 之前同步完成。**
+ */
+describe('并发起会话时上限不能被绕过', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('占位是同步的，而且计数把"正在起"的算进去', () => {
+    assert.match(M, /const remoteStarting = new Map<string, \{ host: string; at: number \}>\(\);/);
+    /* 同步 set —— 在 makeRoomOnRemote 里，任何 await 之前 */
+    assert.match(M, /if \(excludeId\) remoteStarting\.set\(excludeId, \{ host, at: Date\.now\(\) \}\);/);
+    assert.match(M, /if \(id !== excludeId && slot\.host === host\) n \+= 1;/);
+  });
+
+  test('注册成功就放 —— 所有起执行器的路都过 `wireSession`', () => {
+    const at = M.indexOf('function wireSession(sessionId: string, entry: SessionEntry)');
+    assert.ok(at > 0);
+    assert.match(M.slice(at, at + 500), /releaseRemoteSlot\(sessionId\);/);
+  });
+
+  test('占位会过期 —— 漏放要能自愈', () => {
+    /* 起执行器有好几条失败路径，逐条塞 finally 只要漏一条，那台机器就被永久占掉一个名额 */
+    assert.match(M, /const REMOTE_SLOT_TTL_MS = 120_000;/);
+    assert.match(M, /if \(now - slot\.at > REMOTE_SLOT_TTL_MS\) \{ remoteStarting\.delete\(id\); continue; \}/);
+  });
+});

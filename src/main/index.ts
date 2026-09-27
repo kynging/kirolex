@@ -1732,6 +1732,15 @@ async function sweepRemoteSessionAgents(): Promise<void> {
   }
 }
 
+/**
+ * 那条会话的"正在起"占位可以放了 —— 起成了（已经进 `sessionClients`）或者起失败了都要放。
+ *
+ * 漏放的后果是那台机器的名额被永久占掉一个，而且看不出来 —— 所以每条路（成功、抛错）都要走到。
+ */
+function releaseRemoteSlot(sessionId: string): void {
+  remoteStarting.delete(sessionId);
+}
+
 /** 会话的执行器没了：作废 token、放开端口、把远端那份临时 agent 删掉。 */
 function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
   const spec = localToolsBySession.get(sessionId);
@@ -1964,8 +1973,31 @@ function remoteExecutorCount(host: string, excludeId?: string): number {
     if (id === excludeId) continue;
     if ((entry.profile.remote?.sshHost || '') === host) n += 1;
   }
+  /*
+    **加上"正在起、还没注册"的那些** —— 否则这道闸在并行 attach 时形同不存在。
+    实测：上限算出来是 6，而启动那一轮起了 **8 个**执行器 —— 因为每条会话都在
+    `sessionClients.set(...)` 之前就做了检查（中间还要 await preflight、ensureLocalTools、connect），
+    于是它们各自都看到"还没满"。和当初两条会话抢到同一个远端端口是同一个形状：
+    **占位必须在任何 await 之前同步完成**。
+  */
+  const now = Date.now();
+  for (const [id, slot] of remoteStarting) {
+    if (now - slot.at > REMOTE_SLOT_TTL_MS) { remoteStarting.delete(id); continue; }
+    if (id !== excludeId && slot.host === host) n += 1;
+  }
   return n;
 }
+
+/**
+ * 正在起、还没进 `sessionClients` 的那些远程执行器。
+ *
+ * 带时间戳、**会过期**：释放的正路是"注册成功就放"（`wireSession`），但起执行器有好几条失败路径
+ * （preflight 抛、`ensureLocalTools` 返回 undefined、connect 抛…），逐条塞 `finally` 只要漏一条，
+ * 那台机器就被永久占掉一个名额、而且看不出来。过期让漏放自愈：超时的占位一律不算。
+ * 2 分钟 —— 比任何一次正常启动都长（实测最慢那条 attach 约 20 秒）。
+ */
+const REMOTE_SLOT_TTL_MS = 120_000;
+const remoteStarting = new Map<string, { host: string; at: number }>();
 
 /**
  * **那台机器满了就先腾一条** ——「远程能承受多少个远程 session？这个有限制吧」。
@@ -1979,6 +2011,11 @@ function remoteExecutorCount(host: string, excludeId?: string): number {
  */
 function makeRoomOnRemote(host: string, excludeId?: string): void {
   const cap = remoteCaps.get(host) || 0;
+  /*
+    **先占位，再腾地方** —— 占位是同步的（见 `remoteExecutorCount` 那段）。
+    没探到规格也要占：`releaseRemoteSlot` 无条件清，所以占了不会漏。
+  */
+  if (excludeId) remoteStarting.set(excludeId, { host, at: Date.now() });
   if (!cap) return;
   while (remoteExecutorCount(host, excludeId) >= cap) {
     let victim: string | null = null;
@@ -2947,6 +2984,11 @@ function saveHelperModels(model: string, fallback: string) {
 
 /** Wire a freshly-created client's events, routing everything by sessionId. */
 function wireSession(sessionId: string, entry: SessionEntry) {
+  /*
+    **执行器注册好了，占位可以放** —— 从这一刻起它被 `sessionClients` 真正数到，
+    占位再留着就是重复计数。所有起执行器的路（新建 / attach / 换机器 / 换模型）都过这里。
+  */
+  releaseRemoteSlot(sessionId);
   const { client } = entry;
   client.on('update', (data: any) => {
     // A background history-priming turn's output must never surface: don't
