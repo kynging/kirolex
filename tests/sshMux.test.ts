@@ -206,22 +206,41 @@ describe('ssh 连接复用', () => {
 
   test('开机扫垃圾认得出遗留的 master —— 它命令行里没有 agent 名', () => {
     /*
-      master 是 `ssh -N`，不带 `--agent`，所以 `kirolex-local-<owner>-` 这个判据抓不到它。
+      master 是 `ssh -N`，不带 `--agent`，所以 `kirolex-local-` 这个判据抓不到它。
       漏掉的后果不是"多一个进程"：那条 ssh 还连着，远端的 sshd 和 kiro-cli 也就都还活着 ——
       这正是那条把 EC2 压死的累积链的第一环。
     */
-    const marker = muxMarker('ca7bbd');
-    assert.ok(marker.includes(MUX_DIR));
-    assert.ok(marker.includes('ca7bbd'));
     const line = `ssh -N -o ControlPath=/var/folders/x/T/${MUX_DIR}/ca7bbd-1a2b3c4d -R 127.0.0.1:39100:127.0.0.1:5 u@h`;
-    assert.ok(line.includes(marker));
-    /* 别人那份 KiroLex 的 master 不该被我们杀 —— 会带走它所有会话的工具通道 */
-    assert.equal(line.includes(muxMarker('ffffff')), false);
+    assert.ok(line.includes(`${MUX_DIR}/`));
+    /* `muxMarker` 带 owner，给的是"哪条是我起的"这种需要区分归属的地方用 */
+    assert.ok(muxMarker('ca7bbd').startsWith(`${MUX_DIR}/`));
 
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /!line\.includes\(OWNED_AGENT_PREFIX\) && !line\.includes\(muxMarker\(OWNER\)\)/);
+    assert.match(M, /!line\.includes\(SESSION_AGENT_PREFIX\) && !line\.includes\(`\$\{MUX_DIR\}\/`\)/);
     /* 退出时也要关掉：留着就是下一次启动要扫的垃圾 */
     assert.match(M, /sshMux\.closeAll\(\)/);
+  });
+
+  test('本机这一轮**不**按 owner 过滤 —— owner 在同一台 Mac 上分不出两份 KiroLex', () => {
+    /*
+      owner 是 `主机名 + 用户名` 的 hash：standard 和 flow 跑在同一台 Mac 上时它完全一样。
+      而本机 `ps` 里只有这台 Mac 自己的进程，所以按 owner 过滤什么都分不出来，只会漏 ——
+      实测这次启动时留着 4 条 PPID==1 的 ssh，名字是改 owner **之前**生成的
+      `kirolex-local-s_…`，一条都没被认出来，而那台 EC2 当时正在报 banner exchange 超时。
+
+      分得清归属的是 PPID：别人那份活着的 ssh 挂在它自己的 Electron 底下（PPID≠1）；
+      PPID==1 的那些谁的父进程都没了，不属于任何人。
+    */
+    const legacy = "ssh -o BatchMode=yes -R 127.0.0.1:39104:127.0.0.1:63000 u@h bash -lc 'kiro-cli acp --agent kirolex-local-s_1789629414597_kqrsee'";
+    assert.ok(legacy.includes('kirolex-local-'), '老名字也得认出来');
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf('function sweepStrayLocalSsh');
+    const body = M.slice(at, at + 1400);
+    assert.equal(/OWNED_AGENT_PREFIX/.test(body), false, '本机这一轮不按 owner 过滤');
+    assert.match(body, /Number\(m\[2\]\) !== 1/, 'PPID==1 才是判据');
+    /* 远端那一轮**照旧**按 owner —— 那台机器是好几台笔记本共用的 */
+    assert.match(M, /sweepAgentsScript\(OWNER\)/);
+    assert.match(M, /orphanSweepScript\(OWNER\)/);
   });
 
   test('最后一条会话走了才关 —— 而且关之前再确认一次', () => {

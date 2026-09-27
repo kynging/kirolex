@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import { execSync, execFileSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
-import { SshMux, muxKey, muxMarker } from './sshMux';
+import { SshMux, muxKey, MUX_DIR } from './sshMux';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
@@ -1716,12 +1716,25 @@ async function ensureLocalTools(
  * → 那些 ssh 还连着 → 远端的 sshd 和 `kiro-cli acp` 也就都还活着。所以远端那边查 PPID==1
  * 一个孤儿都看不到（它们的父进程好好地在），而进程却在不停累积 —— 之前一次清出 85 个就是这么来的。
  *
- * 判据同样是 **PPID == 1**：活着的 ssh 挂在当前这个 Electron 底下；被收养的才是上一条命留下的。
- * 再加上命令行里必须带**自己那台**的印记 —— 不碰用户自己开的 ssh，也不碰别人那份 KiroLex 的：
- *   · 执行器那些带 `kirolex-local-<owner>-…`（我们自己拼的 agent 名）；
+ * 判据是 **PPID == 1**：活着的 ssh 挂在某个 Electron 底下；被收养的才是上一条命留下的。
+ * 再加上命令行里得有 KiroLex 的印记，这样不碰用户自己开的 ssh：
+ *   · 执行器那些带 `kirolex-local-…`（我们拼的 agent 名）；
  *   · 复用连接那条（`ssh -N`）命令行里没有 agent 名，认的是 `ControlPath` 里的
- *     `kirolex-mux/<owner>-` —— 漏掉它的话每次重启都留一条连着的 ssh，
+ *     `kirolex-mux/` —— 漏掉它的话每次重启都留一条连着的 ssh，
  *     而那正是这段注释里那条累积链的第一环。
+ *
+ * ## 这一轮**不**按 owner 过滤（跟远端那一轮不一样）
+ *
+ * owner 是 `主机名 + 用户名` 的 hash，为的是"一台远端被好几台笔记本用"时别删别人的东西。
+ * 但本机这一轮的 `ps` 里只有**这台 Mac 自己**的进程 —— 而同一台 Mac 上的两份 KiroLex
+ * （standard 和 flow）主机名和用户名完全一样，owner 也就一样，按它过滤什么都分不出来。
+ *
+ * 真正分得清的是 PPID：别人那份**活着**的 ssh 挂在它自己的 Electron 底下，PPID 不是 1。
+ * 而 PPID==1 的那些谁的父进程都没了 —— 它不属于任何人，只是还连着远端、还养着那边的执行器。
+ *
+ * 按 owner 过滤反而会漏：实测这次启动时留着 4 条 PPID==1 的 ssh，名字是**改 owner 之前**
+ * 生成的 `kirolex-local-s_…`，于是一条都没被认出来 —— 而那台 EC2 当时正好又在报
+ * `banner exchange` 超时。漏掉的代价就是那个。
  *
  * 杀本机这一端就够：远端那个 kiro-cli 失去 sshd 之后会被 reparent 到 1，
  * 下一次 `orphanSweepScript` 顺手收掉（或者它自己退出）。
@@ -1731,7 +1744,7 @@ function sweepStrayLocalSsh(): void {
     const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     const victims: number[] = [];
     for (const line of out.split('\n')) {
-      if (!line.includes(OWNED_AGENT_PREFIX) && !line.includes(muxMarker(OWNER))) continue;
+      if (!line.includes(SESSION_AGENT_PREFIX) && !line.includes(`${MUX_DIR}/`)) continue;
       const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
       if (!m) continue;
       if (Number(m[2]) !== 1) continue;             // 挂在当前 app 底下的是活的

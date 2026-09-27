@@ -872,7 +872,13 @@ describe('本机遗留的 ssh 客户端（远端累积的源头）', () => {
     const body = M.slice(at, M.indexOf('\n}', M.indexOf('杀掉 ${victims.length}', at)));
     assert.match(body, /if \(Number\(m\[2\]\) !== 1\) continue;/, '挂在当前 app 底下的是活的');
     assert.ok(body.includes(')ssh\\s/.test(m[3])'), '只杀 ssh 客户端');
-    assert.match(body, /line\.includes\(OWNED_AGENT_PREFIX\)/, '只碰自己那台留下的 ssh');
+    /*
+      本机这一轮按**共用**前缀，不按 owner：`ps` 里只有这台 Mac 的进程，而同一台 Mac 上的
+      两份 KiroLex（standard / flow）owner 完全一样 —— 按它过滤分不出归属，只会漏掉
+      改 owner 之前留下的那些（实测漏了 4 条，而那台 EC2 正因此被养着）。
+      分得清的是 PPID==1：那些谁的父进程都没了。
+    */
+    assert.match(body, /line\.includes\(SESSION_AGENT_PREFIX\)/, '老名字也要认出来');
     assert.match(body, /process\.kill\(pid, 'SIGTERM'\)/);
   });
 
@@ -943,10 +949,11 @@ describe('只管自己创建的会话', () => {
     assert.match(RL, /FNV-1a/);
   });
 
-  test('主进程算一次、全程用它；本机那轮 ssh 也按它过滤', () => {
+  test('主进程算一次、全程用它（远端那两轮按它过滤）', () => {
     assert.match(M, /const OWNER = ownerTag\(os\.hostname\(\), os\.userInfo\(\)\.username\);/);
     assert.match(M, /const OWNED_AGENT_PREFIX = ownedAgentPrefix\(OWNER\);/);
-    assert.match(M, /line\.includes\(OWNED_AGENT_PREFIX\)/);
+    /* 本机那轮 ssh **不**按它过滤，理由见 `sweepStrayLocalSsh` 上面那段 */
+    assert.match(M, /sweepAgentsScript\(OWNER\)/);
     assert.match(M, /sessionAgentName\(sessionId, OWNER\)/);
   });
 
