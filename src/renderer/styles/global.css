@@ -7872,3 +7872,126 @@ button, input, select, textarea {
   background: var(--danger, #e05252);
 }
 .sidebar-backup-btn:not(.ok):not(.bad) { opacity: 0.55; }
+
+/*
+  **☁️ 备份弹窗** ——「那个备份界面不应该在设置里面。而且这个界面现在是乱的」。
+
+  那个"乱"是两件事叠出来的，都记在这里免得再犯：
+
+  1. **按钮用了 `.settings-btn`**，而那是 28×28 的**图标**按钮（width/height 写死）。
+     「测连通（真写一个小对象）」被压成 28px 宽、一个字一行竖着排，而且盖在下面的说明文字上。
+     机器页踩过同一个坑（见 `.remote-btn` 上面那段）—— 文字按钮一律 `.remote-btn`。
+  2. **塞在 `.settings-body` 的一格里**，那是两列网格，单列实测只有 341px。
+     这一页是"6 个字段 + 一张可恢复列表"，撑不开，最下面「从备份恢复」整段被切掉。
+
+  所以这一页自己一个弹窗、单列纵向排、标签定宽对齐，列表独立滚动。
+*/
+.backup-body {
+  padding: 16px 20px 20px;
+  flex: 1 1 auto;
+  overflow-y: auto;
+  overflow-x: hidden;
+  display: flex;
+  flex-direction: column;
+  gap: 18px;
+}
+.backup-body::-webkit-scrollbar { width: 12px; }
+.backup-body::-webkit-scrollbar-track { background: transparent; }
+.backup-body::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.backup-section {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  min-width: 0;
+}
+.backup-section-title {
+  margin: 0;
+  font-size: 12px;
+  font-weight: 600;
+  color: var(--text-muted);
+  text-transform: none;
+  letter-spacing: 0.02em;
+}
+/* 说明性的整行文字：不参与下面那套"标签 + 控件"的对齐 */
+.backup-note { margin: 0; font-size: 11px; line-height: 1.5; }
+
+/*
+  一行字段。标签定宽 → 6 个输入框左边缘是齐的（原来每行标签宽度各不相同，
+  输入框像阶梯一样错开，那也是"乱"的一部分）。
+*/
+.backup-field {
+  display: grid;
+  grid-template-columns: 104px minmax(0, 1fr);
+  align-items: center;
+  gap: 4px 10px;
+}
+.backup-field-label {
+  font-size: 12px;
+  color: var(--text-secondary, var(--text-muted));
+  text-align: right;
+  /* 标签本身不许换行 —— 换行会把整行的高度顶起来，看起来就是参差不齐 */
+  white-space: nowrap;
+}
+.backup-field-control {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+}
+/* 输入框占满剩下的宽度；`min-width: 0` 才不会把网格撑宽 */
+.backup-field-control .settings-input { flex: 1 1 auto; min-width: 0; }
+/* 字段下面那句说明对齐到控件那一列 */
+.backup-field-hint { grid-column: 2; }
+
+/* 按钮行：一律 `.remote-btn`（nowrap），挤不下就换行，而不是把按钮压扁 */
+.backup-actions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 8px;
+}
+.backup-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+.backup-interval { width: 72px; flex: 0 0 auto; }
+
+/*
+  可恢复列表自己滚。放在外层一起滚的话，列表长了之后上面那张表单会被推得很远,
+  而这两块是要对照看的（"配好了吗"和"桶里有什么"）。
+*/
+.backup-list {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-height: 240px;
+  overflow-y: auto;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 6px;
+}
+.backup-list-row {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  min-width: 0;
+}
+.backup-list-name {
+  font-size: 12px;
+  color: var(--text-primary);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  min-width: 0;
+}
+
+/* 窄窗口：标签跑到控件上面，而不是把控件挤成一条 */
+@media (max-width: 520px) {
+  .backup-field { grid-template-columns: minmax(0, 1fr); }
+  .backup-field-label { text-align: left; }
+  .backup-field-hint { grid-column: 1; }
+}

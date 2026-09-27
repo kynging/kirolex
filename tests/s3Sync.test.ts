@@ -260,7 +260,8 @@ describe('状态文件与杂项', () => {
 describe('接线', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
-  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/S3BackupSettings.tsx'), 'utf8');
+  /* 备份那一页搬出设置了，自己一个弹窗 ——「那个备份界面不应该在设置里面」 */
+  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
 
   test('secret 用 safeStorage 加密，没有 keychain 就**拒绝保存**而不是退回明文', () => {
     assert.match(M, /safeStorage\.encryptString/);
@@ -418,5 +419,101 @@ describe('冲突检测与失败退避（借 Tabby 的做法）', () => {
     assert.ok(body.indexOf('detectConflicts(') < body.indexOf('for (const rel of plan.upload)'));
     /* 冲突的那几条不进 catalog：它们在 conflicts/ 下，让 catalog 指向它们就是把"可恢复"说错了 */
     assert.match(body, /freshEntries\.filter\(\(e\) => !conflictIds\.has\(e\.id\)\)/);
+  });
+});
+
+/*
+ * 「那个备份界面不应该在设置里面。而且这个界面现在是乱的」。
+ *
+ * 那个"乱"是两件事叠出来的，两条都锚住免得再犯：
+ *
+ * 1. **按钮用了 `.settings-btn`**，而那是 28×28 的**图标**按钮（width/height 写死、
+ *    font-size 16px）。「测连通（真写一个小对象）」被压成 28px 宽、一个字一行竖着排下来,
+ *    而且盖在下面那段说明文字上。机器页踩过同一个坑，CSS 里 `.remote-btn` 上面那段注释
+ *    就是为它写的 —— 文字按钮一律用 `.remote-btn`（它有 `white-space: nowrap`）。
+ * 2. **塞在 `.settings-body` 的一格里**，那是两列网格，实测单列只有 **341px**。
+ *    这一页是"6 个字段 + 一张可恢复列表"，撑不开：`scrollHeight > clientHeight`,
+ *    最下面「从备份恢复」整段被切掉。
+ *
+ * 搬出设置的理由不只是"挤"：设置里的东西是**配一次就不用再看**的，而备份是**有状态、
+ * 要回来看**的（上次什么时候成的、桶里有哪些能恢复）。侧栏那颗 ☁️ 已经在当状态指示了。
+ */
+describe('备份界面：自己一个弹窗，按钮别再被压成一个字', () => {
+  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+  const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+  const SD = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
+  const APP = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+
+  test('不在设置里了 —— tab 和引用都拿掉', () => {
+    assert.equal(/S3BackupSettings/.test(SD), false);
+    assert.equal(/'backup'/.test(SD), false, "SettingsTab 里不该还有 'backup'");
+    assert.equal(fs.existsSync(path.join(process.cwd(), 'src/renderer/components/S3BackupSettings.tsx')), false,
+      '旧组件删掉了，否则两份界面会慢慢长歪');
+  });
+
+  test('侧栏那颗 ☁️ 直接开这个弹窗，不再绕设置', () => {
+    assert.match(APP, /onOpenBackup=\{\(\) => setShowBackup\(true\)\}/);
+    assert.match(APP, /\{showBackup && <BackupDialog onClose=\{\(\) => setShowBackup\(false\)\} \/>\}/);
+  });
+
+  test('**一个 `.settings-btn` 都不许有** —— 它是 28×28 图标按钮，会把文字压成竖排', () => {
+    /* 只看真正用到的 class（文件头那段注释里会提到它，那是在解释为什么不能用） */
+    assert.equal(/className="[^"]*settings-btn/.test(UI), false);
+    /* 文字按钮一律 remote-btn */
+    assert.ok((UI.match(/className="remote-btn/g) || []).length >= 4);
+    /* 而 `.remote-btn` 必须是 nowrap —— 这才是"不会被压成一个字"的那一半 */
+    const at = CSS.indexOf('.remote-btn {');
+    assert.ok(at > 0);
+    assert.match(CSS.slice(at, at + 400), /white-space: nowrap;/);
+  });
+
+  test('不复用 `.settings-body`（两列网格）—— 这一页是单列', () => {
+    assert.equal(/className="[^"]*(settings-col|settings-body)/.test(UI), false);
+    assert.match(UI, /className="backup-body"/);
+    const at = CSS.indexOf('.backup-body {');
+    assert.ok(at > 0, 'backup-body 的样式要在');
+    const body = CSS.slice(at, at + 300);
+    assert.match(body, /flex-direction: column;/);
+    /* 自己滚：外层不滚的话内容一多就被切掉，那正是原来那个 bug */
+    assert.match(body, /overflow-y: auto;/);
+  });
+
+  test('字段标签定宽对齐 —— 原来每行宽度不同，输入框像阶梯一样错开', () => {
+    const at = CSS.indexOf('.backup-field {');
+    assert.ok(at > 0);
+    assert.match(CSS.slice(at, at + 260), /grid-template-columns: 104px minmax\(0, 1fr\);/);
+    /* 标签不换行，否则行高被顶起来，看起来就是参差不齐 */
+    const la = CSS.indexOf('.backup-field-label {');
+    assert.match(CSS.slice(la, la + 260), /white-space: nowrap;/);
+  });
+
+  test('按钮行挤不下要换行，而不是把按钮压扁', () => {
+    const at = CSS.indexOf('.backup-actions {');
+    assert.ok(at > 0);
+    assert.match(CSS.slice(at, at + 200), /flex-wrap: wrap;/);
+  });
+
+  test('列表独立滚动，而且长标题省略号而不是把按钮挤出去', () => {
+    const at = CSS.indexOf('.backup-list {');
+    assert.match(CSS.slice(at, at + 300), /max-height: 240px;[\s\S]*overflow-y: auto;/);
+    const na = CSS.indexOf('.backup-list-name {');
+    assert.match(CSS.slice(na, na + 260), /text-overflow: ellipsis;/);
+  });
+
+  test('原来那几条行为一条没丢', () => {
+    /* 覆盖前问一句、说清挪进 trash；secret 留空 = 不改 */
+    assert.match(UI, /window\.confirm/);
+    assert.match(UI, /覆盖/);
+    assert.match(UI, /trash/);
+    assert.match(UI, /留空 = 不改/);
+    /* 测连通仍然是真写一个对象 */
+    assert.match(UI, /测连通（真写一个小对象）/);
+    /* 没有 keychain 就不让填 secret */
+    assert.match(UI, /disabled=\{!cfg\.encryptionAvailable\}/);
+  });
+
+  test('Esc 能关 —— 和别的弹窗一致', () => {
+    assert.match(UI, /e\.key === 'Escape'/);
+    assert.match(UI, /<div className="overlay" onClick=\{onClose\} \/>/);
   });
 });

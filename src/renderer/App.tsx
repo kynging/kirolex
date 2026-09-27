@@ -19,6 +19,7 @@ import { ChatArea, MarkdownView, expandPastes } from './components/ChatArea';
 import type { PastedBlock } from './components/ChatArea';
 import hljs from 'highlight.js';
 import { SettingsDialog } from './components/SettingsDialog';
+import { BackupDialog } from './components/BackupDialog.tsx';
 import { MemoryDialog } from './components/MemoryDialog';
 import { compactMemoryPrompt, memoryWarnings, type MemoryScope } from '../main/memoryPolicy';
 import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache } from './modelList';
@@ -812,8 +813,10 @@ const App: React.FC = () => {
   const switchingAgent = !!currentSessionId && switchingAgentIds.includes(currentSessionId);
   const switchingModel = !!currentSessionId && switchingModelIds.includes(currentSessionId);
   const [showSettings, setShowSettings] = useState(false);
+  /* ☁️ 备份自己一个弹窗（侧栏那颗 ☁️ 直接开它）—— 它是有状态、要回来看的东西，不是设置 */
+  const [showBackup, setShowBackup] = useState(false);
   /** 打开设置时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。 */
-  const [settingsTab, setSettingsTab] = useState<'machines' | 'backup' | undefined>(undefined);
+  const [settingsTab, setSettingsTab] = useState<'machines' | undefined>(undefined);
   /**
    * 上一次备份的结果 —— 侧栏那个 ☁️ 用它上色和写 title。
    *
@@ -3363,7 +3366,8 @@ const App: React.FC = () => {
               onMoveSession={moveSession}
               onArchiveSession={archiveSession}
               onSettings={() => { setSettingsTab(undefined); setShowSettings(true); }}
-              onOpenBackup={() => { setSettingsTab('backup'); setShowSettings(true); }}
+              /* 备份自己一个弹窗 ——「那个备份界面不应该在设置里面」（它是有状态、要回来看的东西） */
+              onOpenBackup={() => setShowBackup(true)}
               backupState={backupState}
               workspaceOpen={showWorkspace}
               onOpenWorkspace={() => setShowWorkspace((visible) => !visible)}
@@ -3651,6 +3655,7 @@ const App: React.FC = () => {
           </div>
         )}
       </div>
+      {showBackup && <BackupDialog onClose={() => setShowBackup(false)} />}
       {showSettings && (
         <SettingsDialog
           initialTab={settingsTab}
