@@ -1,4 +1,5 @@
 import { LANG_OPTIONS, normalizeLang } from '../i18n';
+import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
 import { useT } from '../hooks/useLang';
 import React from 'react';
@@ -574,16 +575,15 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                           <span className="settings-switch-label" title={sw.help}>
                             {t(sw.label)}
                           </span>
-                          <label style={{ display: 'flex', alignItems: 'center', gap: 8, cursor: 'pointer', flex: '0 0 auto' }}
-                                 title={sw.help}>
-                            <input
-                              type="checkbox"
-                              checked={on}
-                              disabled={featureBusy === sw.key}
-                              onChange={(event) => setSwitchValue(sw.key, sw.store, event.target.checked)}
-                            />
-                            <span className="settings-value">{on ? 'On' : 'Off'}</span>
-                          </label>
+                          {/* 开关做成按钮 ——「开关应该改成按钮形式」（见 ToggleButton 那段） */}
+                          <ToggleButton
+                            on={on}
+                            labels={['On', 'Off']}
+                            ariaLabel={t(sw.label)}
+                            title={sw.help}
+                            disabled={featureBusy === sw.key}
+                            onChange={(next) => setSwitchValue(sw.key, sw.store, next)}
+                          />
                         </div>
                       );
                     })}

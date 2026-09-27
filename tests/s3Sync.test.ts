@@ -517,3 +517,67 @@ describe('备份界面：自己一个弹窗，按钮别再被压成一个字', (
     assert.match(UI, /<div className="overlay" onClick=\{onClose\} \/>/);
   });
 });
+
+/*
+ * 「开关应该改成按钮形式」。
+ *
+ * 原来两处（备份那页的「定时同步」、设置里的「⚡ 开关」那一栏）都是**原生 checkbox** +
+ * 一个「开/关」文字：
+ *
+ *   · 和这个界面里别的东西不是一套 —— 其余全是按钮，中间夹一个系统画的白方块；
+ *   · 那个方块只有 13px，真正好点的是外面那个 `<label>`，而"label 也能点"看不出来；
+ *   · 勾没勾在暗色背景上对比度很低，而「开」「关」两个字宽度差不多 —— 扫一眼扫不出状态。
+ *
+ * 所以状态用**两个**通道说（填充色 + 文字，外加一个小圆点），整块都能点。
+ * 用真 `<button>` 是为了白拿键盘支持 —— 原来只有焦点落在那个 13px 方块上才能切。
+ */
+describe('开关做成按钮', () => {
+  const TB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ToggleButton.tsx'), 'utf8');
+  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+  const SD = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
+  const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+
+  test('两处的原生 checkbox 都没了', () => {
+    assert.equal(/type="checkbox"/.test(UI), false, '备份那页');
+    assert.equal(/type="checkbox"/.test(SD), false, '设置的「⚡ 开关」那一栏');
+    assert.match(UI, /<ToggleButton/);
+    assert.match(SD, /<ToggleButton/);
+  });
+
+  test('是真的 `<button>`，而且对读屏仍然是一个开关', () => {
+    assert.match(TB, /type="button"/);
+    assert.match(TB, /role="switch"/);
+    assert.match(TB, /aria-checked=\{on\}/);
+    /* 真 button 才有 Space / Enter，所以焦点框也要看得见 */
+    assert.match(CSS, /\.toggle-btn:focus-visible \{/);
+  });
+
+  test('状态不止换一个字 —— 颜色和形状都要变', () => {
+    const at = CSS.indexOf('.toggle-btn.on {');
+    assert.ok(at > 0);
+    const body = CSS.slice(at, at + 320);
+    /* 开的时候是**填充**，不只是换个字色 */
+    assert.match(body, /background: color-mix/);
+    assert.match(body, /border-color: var\(--accent/);
+    /* 小圆点：给颜色之外再来一个通道（有人分不清这两种颜色） */
+    assert.match(CSS, /\.toggle-btn\.on \.toggle-dot \{ background: var\(--accent/);
+    assert.match(TB, /className="toggle-dot"/);
+  });
+
+  test('胶囊形，和方形的 `.remote-btn` 分得开', () => {
+    /* 那些是"做一件事"，这个是"一个状态" —— 形状上要能区分 */
+    const at = CSS.indexOf('.toggle-btn {');
+    assert.match(CSS.slice(at, at + 420), /border-radius: 999px;/);
+  });
+
+  test('备份那颗带上下文（开着/关着，点一下会怎样）', () => {
+    assert.match(UI, /定时同步开着 —— 点一下关掉/);
+    assert.match(UI, /ariaLabel="定时同步"/);
+  });
+
+  test('设置那栏还是 On/Off（那一页本来就是英文）', () => {
+    assert.match(SD, /labels=\{\['On', 'Off'\]\}/);
+    /* busy 时不让点，否则连点会和正在写的那次打架 */
+    assert.match(SD, /disabled=\{featureBusy === sw\.key\}/);
+  });
+});

@@ -38,6 +38,7 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
+import { ToggleButton } from './ToggleButton.tsx';
 
 interface Backup {
   id: string;
@@ -248,11 +249,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
               <section className="backup-section">
                 <h4 className="backup-section-title">定时同步</h4>
                 <div className="backup-actions">
-                  <label className="backup-toggle">
-                    <input type="checkbox" checked={cfg.enabled}
-                           onChange={(e) => { patch({ enabled: e.target.checked }); void save({ enabled: e.target.checked }); }} />
-                    <span className="settings-value">{cfg.enabled ? '开' : '关'}</span>
-                  </label>
+                  <ToggleButton
+                    on={cfg.enabled}
+                    ariaLabel="定时同步"
+                    title={cfg.enabled ? '定时同步开着 —— 点一下关掉' : '定时同步关着 —— 点一下打开'}
+                    onChange={(next) => { patch({ enabled: next }); void save({ enabled: next }); }}
+                  />
                   <input className="settings-input backup-interval" type="number" min={5}
                          value={cfg.intervalMinutes}
                          onChange={(e) => patch({ intervalMinutes: Number(e.target.value) })}

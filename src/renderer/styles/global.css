@@ -7956,7 +7956,7 @@ button, input, select, textarea {
   flex-wrap: wrap;
   gap: 8px;
 }
-.backup-toggle { display: flex; align-items: center; gap: 6px; cursor: pointer; }
+/* `.backup-toggle` 没了：那个 checkbox 换成了 `.toggle-btn`（「开关应该改成按钮形式」） */
 .backup-interval { width: 72px; flex: 0 0 auto; }
 
 /*
@@ -7994,4 +7994,54 @@ button, input, select, textarea {
   .backup-field { grid-template-columns: minmax(0, 1fr); }
   .backup-field-label { text-align: left; }
   .backup-field-hint { grid-column: 1; }
+}
+
+/*
+  **开关按钮** ——「开关应该改成按钮形式」。
+
+  原来是原生 checkbox + 一个「开/关」文字：和这个界面里别的东西（全是按钮）不是一套，
+  13px 的方块在暗色背景上勾没勾很难看清，而「开」「关」两个字宽度又差不多 —— 扫一眼扫不出状态。
+
+  所以状态用**两个**通道说：填充色 + 文字，再加一个小圆点（有人分不清这两种颜色）。
+  整块都能点，不再依赖"其实外面那个 label 也能点"这种看不出来的事。
+*/
+.toggle-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 4px 12px 4px 9px;
+  background: var(--bg-tertiary);
+  border: 1px solid var(--border);
+  /* 胶囊形：和方形的 `.remote-btn` 区分开 —— 那些是"做一件事"，这个是"一个状态" */
+  border-radius: 999px;
+  color: var(--text-muted);
+  font-size: 11px;
+  line-height: 1.4;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.12s, border-color 0.12s, color 0.12s;
+}
+.toggle-btn:hover:not(:disabled) { border-color: var(--accent, #7c6fe0); }
+.toggle-btn:disabled { opacity: 0.5; cursor: default; }
+
+.toggle-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 999px;
+  background: var(--text-muted);
+  flex: 0 0 auto;
+}
+
+/* 开：填充 + 亮字 + 亮点。不是"只换一个字" */
+.toggle-btn.on {
+  background: color-mix(in srgb, var(--accent, #7c6fe0) 18%, transparent);
+  border-color: var(--accent, #7c6fe0);
+  color: var(--accent, #7c6fe0);
+}
+.toggle-btn.on .toggle-dot { background: var(--accent, #7c6fe0); }
+
+/* 键盘焦点要看得见 —— 换成真 button 就是为了能用键盘切 */
+.toggle-btn:focus-visible {
+  outline: 2px solid var(--accent, #7c6fe0);
+  outline-offset: 2px;
 }
