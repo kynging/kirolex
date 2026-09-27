@@ -8131,3 +8131,66 @@ button, input, select, textarea {
   /* `--success` 是主题变量（29 行），别在这儿又写一个近似的绿 */
   color: var(--success);
 }
+
+/*
+  ☁️ 备份那个弹窗的两个 tab（同步 / 恢复）——「云那里分同步和恢复两个tab好了」。
+  复用 `.memory-tab`：同一个弹窗里的 tab 长得一样才不会让人以为是两种不同的东西。
+*/
+.backup-tabs {
+  display: flex;
+  gap: 6px;
+  padding: 8px 20px 0;
+  flex: 0 0 auto;
+}
+
+/*
+  同步那一页：一行一个项目 + 一个「同步 / 不同步」的开关 ——「你得按 project 整理，
+  有些project可以选择不同步」。粒度是项目而不是会话：一摊活要么整摊备份要么整摊不备份,
+  "这个项目里只备份三条"基本不是真实需求。
+*/
+.backup-proj-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  min-width: 0;
+  padding: 6px 7px;
+  border-radius: 5px;
+}
+.backup-proj-row:hover { background: var(--bg-hover); }
+
+/*
+  恢复那一页按项目分组。组头可以收起来 —— 33 条会话平铺时"这条是哪摊活的"要靠标题猜,
+  而收起无关的那几摊比滚动找快得多。
+*/
+.backup-group { display: flex; flex-direction: column; }
+.backup-group + .backup-group { margin-top: 6px; }
+.backup-group-head {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 4px 7px;
+  position: sticky;
+  top: 0;
+  /* 粘在顶上：滚到一半时"我现在看的是哪个项目"不该需要往上翻 */
+  background: var(--bg-secondary, var(--bg-tertiary));
+  z-index: 1;
+  border-radius: 5px;
+}
+.backup-group-toggle {
+  background: none;
+  border: none;
+  padding: 0;
+  color: var(--text-primary);
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  text-align: left;
+}
+.backup-group-toggle:hover { color: var(--accent); }
+/* 组内的行缩进一点，和组头分得开 */
+.backup-group .backup-restore-row { margin-left: 10px; }

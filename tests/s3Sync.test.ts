@@ -378,7 +378,8 @@ describe('接线', () => {
 
   test('界面：覆盖前要确认，并且说清挪进 trash', () => {
     assert.match(UI, /window\.confirm/);
-    assert.match(UI, /覆盖/);
+    /* 本地已有的那些现在是**合并**（不是覆盖），所以措辞跟着改了 */
+    assert.match(UI, /合并/);
     assert.match(UI, /trash/);
     /* secret 框平时是空的，空 = 不改 */
     assert.match(CONF, /留空 = 不改/);   /* secret 在配置那一页 */
@@ -475,21 +476,22 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
 
   test('云按钮那一页**没有任何配置** —— 它只管恢复', () => {
     for (const f of ['label="Bucket"', 'label="Region"', 'label="Access Key ID"',
-      'label="Secret"', 'saveS3Config', 'testS3', 'syncS3Now', 'intervalMinutes']) {
+      'label="Secret"', 'testS3', 'intervalMinutes']) {
       assert.equal(UI.includes(f), false, `恢复页不该有 ${f}`);
     }
     assert.match(APP, /onOpenBackup=\{\(\) => setShowBackup\(true\)\}/);
   });
 
   test('打开就列，不用先点一下', () => {
-    /* 这一页存在的唯一目的就是看这张表，那一下点击是纯多余动作 */
-    assert.match(UI, /useEffect\(\(\) => \{ void load\(\); \}, \[load\]\);/);
+    /* 切到「恢复」那个 tab 就去拉，不用再点一次「列出桶里的会话」 */
+    assert.match(UI, /if \(tab === 'restore' && !entries\) void loadBackups\(\);/);
     assert.match(UI, /listS3Backups/);
   });
 
   test('多选 + 一颗恢复按钮 + 全选', () => {
     assert.match(UI, /const \[picked, setPicked\] = useState<Set<string>>/);
-    assert.match(UI, /const toggleAll = /);
+    /* 现在是按组全选（「你得按 project 整理」），不是一个全局「全选」 */
+    assert.match(UI, /const toggleGroup = /);
     assert.match(UI, /恢复选中的/);
     /* 一条一条恢复：并发会同时写 trash 和 sessions，而失败要说清是哪一条 */
     assert.match(UI, /for \(const e of chosen\)/);
@@ -499,7 +501,7 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
   test('**一次**确认，而且把要覆盖的那几条点名', () => {
     /* 逐条确认的问题不是慢，是每次长得一样 —— 点到第五次就不看了，而其中可能有一条是覆盖 */
     assert.equal((UI.match(/window\.confirm/g) || []).length, 1);
-    assert.match(UI, /overwriting\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
+    assert.match(UI, /merging\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
     /* 本地已有的那些现在是**合并**（见下面那个 describe），不是覆盖 */
     /* 原生 confirm 不认 markdown，所以这里用「」而不是 ** */
     assert.match(UI, /会和本地那份「合并」/);
@@ -761,14 +763,14 @@ describe('两处显示上的收口', () => {
     assert.match(CONF3, /\/没删掉\/\.test\(String\(r\.message \|\| ''\)\)/);
   });
 
-  test('恢复那一页标题上写清是哪个桶', () => {
+  test('标题上写清是哪个桶', () => {
     /* 配置搬去设置之后这一页一个桶名都不显示，"我在从哪儿恢复"没地方看，像是配置丢了 */
     assert.match(UI3, /className="backup-where"/);
     assert.match(UI3, /\{where\.bucket\}\{where\.region \? ` \/ \$\{where\.region\}` : ''\}/);
     /* 还没配桶时也要说，而且指路到设置 */
     assert.match(UI3, /还没配桶（设置 → ☁️ 备份）/);
-    /* 只读 —— 这一页的职责仍然只是恢复，不许在这儿改配置 */
-    assert.equal(/saveS3Config/.test(UI3), false);
+    /* 凭据仍然只在设置里改 —— 这一页的 saveS3Config 只用来存"哪些项目不同步" */
+    assert.equal(/bucket: cfg\.bucket/.test(UI3), false);
   });
 });
 
@@ -820,5 +822,146 @@ describe('配置页只留有信息量的文字', () => {
 
   test('"上一次同步"那行状态也留着 —— 它回答"备份到底在不在跑"', () => {
     assert.match(shown, /上一次：/);
+  });
+});
+
+/*
+ * 「这个界面不行，你得按 project 整理，有些project可以选择不同步」
+ * 「云那里分同步和恢复两个tab好了」。
+ *
+ * 粒度是**项目**而不是会话：一摊活要么整摊备份要么整摊不备份，"这个项目里只备份三条会话"
+ * 基本不是真实需求。所以分组不只是排版 —— 它和"不同步"那个开关是同一个粒度。
+ */
+describe('按项目整理 + 同步/恢复两个 tab', () => {
+  const M5 = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const UI5 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+  const CSS5 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+
+  test('存"排除"而不是"包含" —— 新建的项目默认跟着备份', async () => {
+    /*
+      存包含列表的话，每建一个项目都要记得回来勾一次，而漏勾的表现是"它一直没被备份"——
+      那件事只有等你需要恢复时才会发现。
+    */
+    const S = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Sync.ts'), 'utf8');
+    assert.match(S, /excludeProjects\?: string\[\];/);
+    assert.equal(/includeProjects/.test(S), false);
+  });
+
+  test('项目来自 `profile.projectId`，不从目录名推', () => {
+    /*
+      从目录名推的话，一条没归项目的远程会话会推出一个叫 `s_179…` 的"项目"——
+      侧栏那个"怎么移都移不动"的 bug 就是这么来的。
+    */
+    assert.match(M5, /function projectOf\([\s\S]{0,260}profile as any\)\?\.projectId/);
+    const at = M5.indexOf('function projectOf(');
+    assert.equal(/deriveProjectId/.test(M5.slice(at, at + 400)), false);
+  });
+
+  test('同步时按项目筛，而且说出跳过了多少条', () => {
+    const at = M5.indexOf('async function runS3Sync');
+    const body = M5.slice(at, at + 2600);
+    assert.match(body, /const sessions = allSessions\.filter\(\(r\) => !projectExcluded\(cfg, projectOf\(r\)\)\);/);
+    /* "少备份了一些东西"必须能解释，否则那是静默的数据缺失 */
+    assert.match(body, /跳过 \$\{excludedCount\} 条会话/);
+  });
+
+  test('筛在枚举会话的地方，不塞进 planUpload', () => {
+    /* `planUpload` 只认"路径 + 上次的状态"，把项目概念塞进去会让它同时对两件事负责 */
+    const S = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Sync.ts'), 'utf8');
+    assert.equal(/excludeProjects/.test(S.slice(S.indexOf('export function planUpload'), S.indexOf('export function walk'))), false);
+  });
+
+  test('排除是"停止继续备份"，不是"删掉备份"', () => {
+    /*
+      已经传上去的还在桶里 —— `mergeCatalog` 会把老条目并进来，所以它们照旧可以恢复。
+      界面上要说出来，否则"关了它怎么还在列表里"看起来像开关没生效。
+    */
+    assert.match(UI5, /停止继续备份<\/b>，不是删掉已有备份/);
+    const S = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Sync.ts'), 'utf8');
+    assert.match(S, /已经传上去的不会被删/);
+  });
+
+  test('catalog 带上 project —— 分组不该变成几十次下载', () => {
+    /* 恢复列表是一次 GET 拿整张 catalog 的；为了分组去逐个下 record.json 等于把 1 次请求变成 N 次 */
+    assert.match(M5, /project: projectOf\(r\) \|\| undefined,/);
+    const S = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Sync.ts'), 'utf8');
+    assert.match(S, /project\?: string;/);
+  });
+
+  test('项目清单从会话记录现算，空项目不出现', () => {
+    const at = M5.indexOf("ipcMain.handle('s3:projects'");
+    assert.ok(at > 0);
+    const body = M5.slice(at, at + 1800);
+    /* 这一页要回答的是"同步会覆盖到哪些东西"，那取决于会话实际归在哪 */
+    assert.match(body, /for \(const rec of store\.listSessions\(\)\)/);
+    /* 未分组排最后，其余按最近动过排 —— 你要找的通常是刚用过的那个 */
+    assert.match(body, /\(a\.project \? 0 : 1\) - \(b\.project \? 0 : 1\)/);
+  });
+
+  test('存进配置时去重、只收字符串', () => {
+    const at = M5.indexOf("ipcMain.handle('s3:save-config'");
+    const body = M5.slice(at, at + 3000);
+    /* 混进一个数字就是一条永不命中的规则（它要和 projectId 做 includes 比较） */
+    assert.match(body, /filter\(\(v\): v is string => typeof v === 'string'\)/);
+    assert.match(body, /filter\(\(v, i, a\) => a\.indexOf\(v\) === i\)/);
+  });
+
+  test('两个 tab，而且恢复那张表是切过去才拉', () => {
+    assert.match(UI5, /useState<'sync' \| 'restore'>\('sync'\)/);
+    assert.match(UI5, /className="backup-tabs"/);
+    /* 列表是一次网络请求，只开同步 tab 的人不该付这个钱 */
+    assert.match(UI5, /if \(tab === 'restore' && !entries\) void loadBackups\(\);/);
+    /* tab 上带计数：不点进去也知道有多少 */
+    assert.match(UI5, /同步\{projects \? ` \(\$\{syncingCount\}\/\$\{projects\.length\}\)` : ''\}/);
+  });
+
+  test('恢复那页按项目分组、组头粘顶、能收起、能整组勾', () => {
+    assert.match(UI5, /const groups = useMemo/);
+    /* 「未分组」整组排最后 */
+    assert.match(UI5, /a\[0\] === '未分组' \? 1 : -1/);
+    assert.match(UI5, /const toggleGroup = /);
+    assert.match(UI5, /选整组/);
+    /* 滚到一半时"我在看哪个项目"不该需要往上翻 */
+    const at = CSS5.indexOf('.backup-group-head {');
+    assert.ok(at > 0);
+    assert.match(CSS5.slice(at, at + 320), /position: sticky;/);
+  });
+
+  test('整组勾也不会把"正连着"的带上', () => {
+    /* 那些恢复会被主进程拒 —— 夹在一堆成功里最容易被漏掉 */
+    assert.match(UI5, /const ids = rows\.filter\(\(e\) => !e\.attached\)\.map\(\(e\) => e\.id\);/);
+  });
+
+  test('同步完把恢复那张表作废 —— 桶里的东西变了', () => {
+    assert.match(UI5, /setEntries\(null\);/);
+  });
+
+  test('未分组要有个名字，否则它是一行空白', () => {
+    assert.match(UI5, /const projectLabel = \(p\?: string\): string => \(p && p\.trim\(\) \? p : '未分组'\)/);
+  });
+});
+
+/*
+ * 老 catalog 没有 `project` 字段（那是这一版才加的）—— 升级之前传上去的备份如果全挤在
+ * 「未分组」里，"按 project 整理"就等于没生效。对还在本地的那些会话，项目归属可以直接从
+ * 本地记录补上。
+ */
+describe('老 catalog 的项目归属从本地记录补', () => {
+  const M6 = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('catalog 里有就用 catalog 的，没有才回退到本地', () => {
+    const at = M6.indexOf("ipcMain.handle('s3:list-backups'");
+    const body = M6.slice(at, at + 2400);
+    /* 顺序要求：桶里那份是权威的（它记的是"备份时属于哪个项目"） */
+    assert.match(body, /project: e\.project \|\| projectById\.get\(e\.id\) \|\| undefined,/);
+    assert.match(body, /const projectById = new Map\(localRecs\.map\(\(r\) => \[r\.id, projectOf\(r\)\]\)\);/);
+    /* 本地记录只读一遍 —— existsLocally 和这个补齐共用它 */
+    assert.equal((body.match(/store\.listSessions\(\)/g) || []).length, 1);
+  });
+
+  test('两边都不知道就留空 —— 那是诚实的', () => {
+    /* 本地已经删掉的那些补不了，留空 → 未分组。编一个项目名比空着糟 */
+    const at = M6.indexOf("ipcMain.handle('s3:list-backups'");
+    assert.match(M6.slice(at, at + 2400), /本地已经没有的那些补不了，留空/);
   });
 });

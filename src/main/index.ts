@@ -2981,11 +2981,38 @@ let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: num
  * 失败不抛 —— 备份是背景工作，但**必须留下摘要**，否则"同步没生效"是个不可查的问题。
  */
 /** 这一轮的 catalog 条目 —— 冲突检测和最终写 catalog 用的是同一份，不能算两遍。 */
-function catalogEntriesFor(sessions: Array<{ id: string; title?: string; updatedAt?: number }>, machine: string): CatalogEntry[] {
+/**
+ * 这条会话属于哪个项目。没归项目的返回空串（界面上是「未分组」）。
+ *
+ * 取 `profile.projectId` —— 那是唯一的真相。**不要**从会话目录名去推：
+ * 一条没归项目的远程会话，目录名就是会话 id 本身，于是会推出一个叫 `s_179…` 的"项目"
+ * （侧栏那个 bug 就是这么来的，见 `deriveProjectId` 上面那段）。
+ */
+function projectOf(rec: { profile?: any } | null | undefined): string {
+  const id = (rec?.profile as any)?.projectId;
+  return typeof id === 'string' ? id.trim() : '';
+}
+
+/**
+ * 这个项目要不要同步 ——「有些project可以选择不同步」。
+ *
+ * 空串（未分组）也能被排除，它在列表里就是一个普通的组。
+ */
+function projectExcluded(cfg: SyncConfig, project: string): boolean {
+  const list = Array.isArray(cfg.excludeProjects) ? cfg.excludeProjects : [];
+  return list.includes(project);
+}
+
+function catalogEntriesFor(
+  sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any }>,
+  machine: string,
+): CatalogEntry[] {
   const now = Date.now();
   return sessions.map((r) => ({
     id: r.id,
     title: r.title || 'New Chat',
+    /* 分组用 —— 恢复列表是一次 GET 拿整张 catalog，不该为了分组再去下几十个 record.json */
+    project: projectOf(r) || undefined,
     updatedAt: r.updatedAt || 0,
     bytes: SESSION_FILES.reduce((sum, f) => {
       try { return sum + fs.statSync(path.join(KIROLEX_HOME, 'sessions', r.id, f)).size; } catch { return sum; }
@@ -3009,7 +3036,18 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
   let uploaded = 0;
   let bytes = 0;
   try {
-    const sessions = store.listSessions();
+    /*
+      **按项目筛一遍** ——「有些project可以选择不同步」。筛在这里（枚举会话的地方）
+      而不是 `planUpload` 里面：那个函数只认"路径 + 上次的状态"，把项目概念塞进去
+      会让它同时对两件事负责。
+    */
+    const allSessions = store.listSessions();
+    const sessions = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)));
+    const excludedCount = allSessions.length - sessions.length;
+    if (excludedCount) {
+      logger.info('s3', `跳过 ${excludedCount} 条会话（它们的项目设成了不同步：`
+        + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、')}）`);
+    }
     const ids = sessions.map((r) => r.id);
     const plan = planUpload(KIROLEX_HOME, ids, state);
     const thisMachine = machineTag(os.hostname());
@@ -4129,6 +4167,17 @@ app.whenReady().then(async () => {
       ...(input?.prefix !== undefined ? { prefix: String(input.prefix).trim() } : null),
       ...(input?.endpoint !== undefined ? { endpoint: String(input.endpoint).trim() } : null),
       ...(input?.intervalMinutes !== undefined ? { intervalMinutes: Math.max(5, Number(input.intervalMinutes) || DEFAULT_INTERVAL_MINUTES) } : null),
+      /*
+        **不同步的项目** ——「有些project可以选择不同步」。去重并只收字符串：
+        这张表会被用来和 `projectId` 做 `includes` 比较，混进一个数字就是一条永不命中的规则。
+      */
+      ...(Array.isArray(input?.excludeProjects)
+        ? {
+          excludeProjects: (input.excludeProjects as unknown[])
+            .filter((v): v is string => typeof v === 'string')
+            .filter((v, i, a) => a.indexOf(v) === i),
+        }
+        : null),
       ...(input?.accessKeyId !== undefined ? { accessKeyId: String(input.accessKeyId).trim() } : null),
     };
     if (typeof input?.secretAccessKey === 'string' && input.secretAccessKey.trim()) {
@@ -4183,6 +4232,34 @@ app.whenReady().then(async () => {
   ipcMain.handle('s3:sync-now', async () => runS3Sync('手动'));
 
   /** 恢复列表：一次 GET 拿到 catalog，不 LIST 整个桶。 */
+  /**
+   * **有哪些项目、各有多少条会话、哪些不同步** ——「你得按 project 整理，
+   * 有些project可以选择不同步」。
+   *
+   * 从**会话记录**现算，而不是读 ui-state 里那串项目名：这一页要回答的是
+   * "同步会覆盖到哪些东西"，而那取决于会话实际归在哪个项目下。
+   * 一个空项目（有名字、没会话）在这里不出现 —— 它没有任何东西要同步。
+   */
+  ipcMain.handle('s3:projects', () => {
+    const cfg = loadSyncConfig();
+    const byProject = new Map<string, { sessions: number; bytes: number; updatedAt: number }>();
+    for (const rec of store.listSessions()) {
+      const key = projectOf(rec);
+      const cur = byProject.get(key) || { sessions: 0, bytes: 0, updatedAt: 0 };
+      cur.sessions += 1;
+      cur.updatedAt = Math.max(cur.updatedAt, rec.updatedAt || 0);
+      for (const f of SESSION_FILES) {
+        try { cur.bytes += fs.statSync(path.join(KIROLEX_HOME, 'sessions', rec.id, f)).size; } catch { /* 少一个文件不算错 */ }
+      }
+      byProject.set(key, cur);
+    }
+    const projects = [...byProject.entries()]
+      .map(([project, v]) => ({ project, ...v, excluded: projectExcluded(cfg, project) }))
+      /* 未分组排最后，其余按最近动过的排 —— 你要找的通常是刚用过的那个 */
+      .sort((a, b) => (a.project ? 0 : 1) - (b.project ? 0 : 1) || b.updatedAt - a.updatedAt);
+    return { projects, excludeProjects: cfg.excludeProjects || [] };
+  });
+
   ipcMain.handle('s3:list-backups', async () => {
     const { creds, problem } = syncCredsOrProblem();
     if (problem) return { entries: [], error: problem };
@@ -4191,7 +4268,15 @@ app.whenReady().then(async () => {
       const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
       if (!raw) return { entries: [], error: '这个桶里还没有备份（先同步一次）。' };
       const catalog = JSON.parse(raw.toString('utf-8')) as Catalog;
-      const local = new Set(store.listSessions().map((r) => r.id));
+      const localRecs = store.listSessions();
+      const local = new Set(localRecs.map((r) => r.id));
+      /*
+        **老 catalog 没有 `project` 字段** —— 那是这一版才加的。对还在本地的那些会话,
+        项目归属可以直接从本地记录补上，于是升级之前传上去的备份也能正确分组
+        （否则 33 条全挤在「未分组」里，而"按 project 整理"就等于没生效）。
+        本地已经没有的那些补不了，留空 → 未分组，这是诚实的：我们确实不知道它属于哪摊。
+      */
+      const projectById = new Map(localRecs.map((r) => [r.id, projectOf(r)]));
       /*
         **正连着的那些也标出来** —— 恢复它们会被拒（内存里那份会把恢复的内容盖回去，
         见 `s3:restore`）。在列表里就说清，比让人勾上、点了恢复、再收到一句拒绝好：
@@ -4200,6 +4285,7 @@ app.whenReady().then(async () => {
       return {
         entries: (catalog.entries || []).map((e) => ({
           ...e,
+          project: e.project || projectById.get(e.id) || undefined,
           existsLocally: local.has(e.id),
           attached: sessionClients.has(e.id),
         })),

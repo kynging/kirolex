@@ -54,6 +54,17 @@ export interface SyncConfig {
   /** key 前缀，例如 `kirolex`。空 = 直接放桶根。 */
   prefix?: string;
   intervalMinutes?: number;
+  /**
+   * **不同步的那些项目** ——「有些project可以选择不同步」。
+   *
+   * 存"排除"而不是"包含"：新建的项目默认**跟着同步**。存包含列表的话，
+   * 每建一个项目都要记得回来勾一次，而漏勾的表现是"它一直没被备份"——
+   * 而那件事只有等你需要恢复时才会发现。
+   *
+   * 已经传上去的不会被删：这是**停止继续备份**，不是"把备份删掉"。
+   * 那些条目还留在 catalog 里、照旧可以恢复 —— catalog 描述的是桶里有什么，不是策略。
+   */
+  excludeProjects?: string[];
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;
@@ -82,6 +93,14 @@ export function catalogKey(prefix?: string): string {
 export interface CatalogEntry {
   id: string;
   title: string;
+  /**
+   * 这条会话属于哪个项目（`record.profile.projectId`）——「你得按 project 整理」。
+   *
+   * 记在 catalog 里而不是恢复时去读每份 record：恢复列表是一次 GET 拿到整张 catalog 的,
+   * 为了分组去逐个下载 record.json 等于把一次请求变成几十次。
+   * 老的 catalog 没有这个字段 → 归到"未分组"。
+   */
+  project?: string;
   updatedAt: number;
   /** 这条会话备份了多少字节（给人一个"是不是完整"的感觉）。 */
   bytes: number;

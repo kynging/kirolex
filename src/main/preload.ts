@@ -69,6 +69,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
   testS3: () => ipcRenderer.invoke('s3:test'),
   syncS3Now: () => ipcRenderer.invoke('s3:sync-now'),
   listS3Backups: () => ipcRenderer.invoke('s3:list-backups'),
+  /**
+   * 有哪些项目、各多少条会话、哪些设成了不同步（「你得按 project 整理，有些project可以选择不同步」）。
+   * 从会话记录现算 —— 这一页要回答的是"同步会覆盖到哪些东西"。
+   */
+  s3Projects: (): Promise<{
+    projects: Array<{ project: string; sessions: number; bytes: number; updatedAt: number; excluded: boolean }>;
+    excludeProjects: string[];
+  }> => ipcRenderer.invoke('s3:projects'),
   /** 恢复一条会话（覆盖同 id，覆盖前本地那份会被挪进 trash）。 */
   restoreS3Session: (sessionId: string) => ipcRenderer.invoke('s3:restore', sessionId),
   onS3SyncDone: (cb: (d: any) => void) => {
