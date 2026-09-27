@@ -2089,7 +2089,37 @@ const remoteSpecsLogged = new Set<string>();
  * `force` 给"人点了重连"那条路：熔断挡的是启动时 20 条会话同时 attach 的瞬间并发，
  * 不是明确的人类意图。
  */
-async function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
+/**
+ * **同一台机器同时只探一次** —— 熔断器挡不住的那半边。
+ *
+ * 熔断器是在**整段探测失败之后**才记的（下面那句 `reachability.fail`），而"整段"含
+ * 3 次尝试、每次 30 秒超时。所以 7 条会话在同一毫秒进来时，谁都还没失败过，
+ * `recentFailure` 对谁都是空的 —— 于是 **7 × 3 = 21 次**并发握手同时打出去。
+ *
+ * 实测就是这样：日志里 21 条一模一样的 `banner exchange` 超时，时间戳挤在一秒内。
+ * 而 sshd 的 `MaxStartups` 默认 `10:30:100` 数的正是"连上了还没认证完"的连接，
+ * 每个失败的尝试还会占着那个槽直到 `LoginGraceTime`（默认 120 秒）——
+ * 也就是说**重试本身把队列撑满了**，然后所有人都超时，然后再重试。
+ *
+ * 所以在熔断器**前面**再加一层：这台机器已经有一次探测在路上，就等它的结论。
+ * 连 `force` 也一起等 —— 手动点重连要的是"现在的答案"，而在路上那次正是现在的答案。
+ */
+const preflightInFlight = new Map<string, Promise<string[]>>();
+
+function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
+  const host = remote.sshHost || '';
+  const running = preflightInFlight.get(host);
+  if (running) {
+    logger.info('remote', `preflight ${host}: 已经有一次在路上了 —— 等它的结论`
+      + `（并发探测会把 sshd 的 MaxStartups 队列撑满，那正是"连不上"的成因之一）`);
+    return running;
+  }
+  const p = runPreflight(remote, opts).finally(() => { preflightInFlight.delete(host); });
+  preflightInFlight.set(host, p);
+  return p;
+}
+
+async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
   const host = remote.sshHost || '';
   if (!opts?.force) {
     const recent = reachability.recentFailure(host);

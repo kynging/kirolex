@@ -64,7 +64,9 @@ describe('接线', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
   test('preflight 用上了重试和熔断', () => {
-    const at = M.indexOf('async function remotePreflight(');
+    /* 真正去连的那段现在叫 `runPreflight`：`remotePreflight` 只负责"同一台机器同时只探一次"
+       （见下面那个 describe —— 熔断器挡不住同一瞬间的并发） */
+    const at = M.indexOf('async function runPreflight(');
     const body = M.slice(at, M.indexOf('\n}', M.indexOf('reachability.fail(host', at)));
     assert.match(body, /reachability\.recentFailure\(host\)/);
     assert.match(body, /for \(let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS/);
@@ -124,5 +126,49 @@ describe('那台机器的规格只用来告知，不设上限', () => {
     const { parseSpecs, REMOTE_MB_PER_SESSION } = await import('../src/main/remotePreflight.ts');
     assert.deepEqual(parseSpecs('CPUS 2\nMEMMB 3839'), { cpus: 2, memMB: 3839 });
     assert.equal(REMOTE_MB_PER_SESSION, 155);
+  });
+});
+
+/*
+ * **熔断器挡不住的那半边** —— 实测 2026-09-27：日志里 21 条一模一样的
+ * `Connection timed out during banner exchange`，时间戳全挤在一秒内。
+ *
+ * 为什么熔断器没起作用：它是在**整段探测失败之后**才记的，而"整段"含 3 次尝试、
+ * 每次 30 秒超时。7 条会话在同一毫秒进来时谁都还没失败过，`recentFailure` 对谁都是空的,
+ * 于是 7 × 3 = 21 次并发握手一起打出去。
+ *
+ * 而 sshd 的 `MaxStartups` 默认 `10:30:100` 数的正是"连上了还没认证完"的连接，失败的尝试
+ * 还占着槽直到 `LoginGraceTime`（默认 120 秒）—— 也就是**重试自己把队列撑满了**，
+ * 然后所有人超时，然后再重试。这是那台 EC2 连不上的直接成因之一。
+ */
+describe('同一台机器同时只探一次', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('已经有一次在路上就等它，不再自己发一轮', () => {
+    assert.match(M, /const preflightInFlight = new Map<string, Promise<string\[\]>>\(\);/);
+    const at = M.indexOf('function remotePreflight(');
+    const body = M.slice(at, at + 900);
+    assert.match(body, /const running = preflightInFlight\.get\(host\);/);
+    assert.match(body, /if \(running\) \{[\s\S]{0,300}return running;/);
+    /* 完成后必须从表里删掉 —— 不删的话第一次失败的结论会被永久复用 */
+    assert.match(body, /\.finally\(\(\) => \{ preflightInFlight\.delete\(host\); \}\)/);
+  });
+
+  test('`force` 也一起等 —— 在路上那次就是"现在的答案"', () => {
+    const at = M.indexOf('function remotePreflight(');
+    const body = M.slice(at, at + 900);
+    /* 合并在 force 判断**之前**：否则手动连点重连照样能压出一串并发握手 */
+    const merge = body.indexOf('return running;');
+    const force = body.indexOf('opts?.force');
+    assert.ok(merge > 0 && (force === -1 || merge < force), 'force 不能绕过合并');
+  });
+
+  test('熔断器那一层还在（两层各管一段时间）', () => {
+    /* 合并管的是"同一瞬间"，熔断管的是"刚刚失败过的 20 秒" —— 少哪层都会漏 */
+    const at = M.indexOf('async function runPreflight(');
+    assert.ok(at > 0, 'runPreflight 是真正去连的那段');
+    const body = M.slice(at, at + 700);
+    assert.match(body, /reachability\.recentFailure\(host\)/);
+    assert.match(M, /reachability\.fail\(host, verdict\.message\)/);
   });
 });
