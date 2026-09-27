@@ -837,3 +837,44 @@ describe('远端孤儿执行器进程（打爆机器的那个）', () => {
     assert.equal(/throw/.test(body), false);
   });
 });
+
+/*
+ * **整条"打爆远程机器"链条的源头在本机** ——「为什么会打爆远程机器」的最后一块。
+ *
+ * 实测：KiroLex 被 `pkill` / 崩溃结束后，macOS 把它的 ssh 子进程**收养给 launchd**（不发 SIGHUP）——
+ * 本机查到 7 个 `ssh … kirolex-local-…` 的 PPID 都是 1，而当前 Electron 是另一个 pid。
+ * 那些 ssh 还连着，所以远端的 sshd 和 `kiro-cli acp` 也都还活着 ——
+ * 于是**远端那边按 PPID==1 一个孤儿都查不到**（它们的父进程好好地在），进程却在不停累积。
+ * 之前一次在那台机器上清出 85 个，就是这么攒起来的。
+ *
+ * 所以两端都要扫，而且**先扫本机**：远端那些失去 sshd 之后才会被 reparent 到 1，
+ * 远端那一轮才认得出来。
+ */
+describe('本机遗留的 ssh 客户端（远端累积的源头）', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('判据：PPID==1 + 是 ssh + 命令行带我们的 agent 前缀', () => {
+    const at = M.indexOf('function sweepStrayLocalSsh');
+    const body = M.slice(at, M.indexOf('\n}', M.indexOf('杀掉 ${victims.length}', at)));
+    assert.match(body, /if \(Number\(m\[2\]\) !== 1\) continue;/, '挂在当前 app 底下的是活的');
+    assert.ok(body.includes(')ssh\\s/.test(m[3])'), '只杀 ssh 客户端');
+    assert.match(body, /line\.includes\(SESSION_AGENT_PREFIX\)/, '不碰用户自己开的 ssh');
+    assert.match(body, /process\.kill\(pid, 'SIGTERM'\)/);
+  });
+
+  test('**先本机、后远端** —— 顺序反了远端那一轮什么都查不到', () => {
+    const at = M.indexOf('async function sweepRemoteSessionAgents');
+    const body = M.slice(at, at + 900);
+    assert.match(body, /sweepStrayLocalSsh\(\);/);
+    assert.ok(body.indexOf('sweepStrayLocalSsh()') < body.indexOf('orphanSweepScript'),
+      '本机那一步要排在远端之前');
+  });
+
+  test('清掉要 warn，而且失败不抛（仍然是清垃圾）', () => {
+    const at = M.indexOf('function sweepStrayLocalSsh');
+    const body = M.slice(at, M.indexOf('\n}\n', at));
+    assert.match(body, /logger\.warn\('remote'/);
+    assert.match(body, /它们被 launchd 收养之后还连着远端/);
+    assert.equal(/throw/.test(body), false);
+  });
+});

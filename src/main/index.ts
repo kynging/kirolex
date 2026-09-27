@@ -2,7 +2,7 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { execSync, execFile, spawn } from 'child_process';
+import { execSync, execFileSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
@@ -1709,7 +1709,46 @@ async function ensureLocalTools(
  * 一台机器扫一次，失败只记日志：这是清垃圾，不该拦住任何会话。
  * 判据和阈值在 `sweepAgentsScript` 那段注释里（按"多久没动过"，不按"谁还活着"）。
  */
+/**
+ * **杀掉本机遗留的 ssh 客户端** —— 整条"打爆远程机器"的链条的**源头**就在这儿。
+ *
+ * 实测链条：KiroLex 被 `pkill` / 崩溃结束 → macOS 把它的 ssh 子进程**收养给 launchd**（不发 SIGHUP）
+ * → 那些 ssh 还连着 → 远端的 sshd 和 `kiro-cli acp` 也就都还活着。所以远端那边查 PPID==1
+ * 一个孤儿都看不到（它们的父进程好好地在），而进程却在不停累积 —— 之前一次清出 85 个就是这么来的。
+ *
+ * 判据同样是 **PPID == 1**：活着的 ssh 挂在当前这个 Electron 底下；被收养的才是上一条命留下的。
+ * 再加上命令行里必须有 `kirolex-local-`（那是我们自己拼的 agent 名）—— 不碰用户自己开的 ssh。
+ *
+ * 杀本机这一端就够：远端那个 kiro-cli 失去 sshd 之后会被 reparent 到 1，
+ * 下一次 `orphanSweepScript` 顺手收掉（或者它自己退出）。
+ */
+function sweepStrayLocalSsh(): void {
+  try {
+    const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const victims: number[] = [];
+    for (const line of out.split('\n')) {
+      if (!line.includes(SESSION_AGENT_PREFIX)) continue;
+      const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
+      if (!m) continue;
+      if (Number(m[2]) !== 1) continue;             // 挂在当前 app 底下的是活的
+      if (!/(^|\/)ssh\s/.test(m[3])) continue;       // 只杀 ssh 客户端
+      victims.push(Number(m[1]));
+    }
+    for (const pid of victims) {
+      try { process.kill(pid, 'SIGTERM'); } catch { /* 已经走了 */ }
+    }
+    if (victims.length) {
+      logger.warn('remote', `杀掉 ${victims.length} 个上一次留下的 ssh 客户端（pid ${victims.join(', ')}）——`
+        + `它们被 launchd 收养之后还连着远端，远端那些执行器也就一直活着`);
+    }
+  } catch (err: any) {
+    logger.info('remote', `扫本机遗留 ssh 没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
+  }
+}
+
 async function sweepRemoteSessionAgents(): Promise<void> {
+  /* 先杀本机这一端：远端那些失去 sshd 之后才会变成 PPID==1，下面那一轮才认得出来 */
+  sweepStrayLocalSsh();
   for (const target of listRemoteTargets(KIROLEX_CONFIG_PATH)) {
     if (!target.sshHost) continue;
     try {
