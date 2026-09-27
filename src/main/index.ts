@@ -7,6 +7,7 @@ import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, 
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
+import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } from './reachability.ts';
 import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
 import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
@@ -1914,19 +1915,51 @@ function localDirsOf(sessionId: string, entry: { localDir?: string; localDirs?: 
  * 不问的代价不是"少一条提示"：没装 rsync → 推送失败 → 界面上是"这一轮没发出去"；
  * 远端没登录 → 执行器起得来但每一轮都空回 —— 看起来就是那个查了一整天的 `EmptyResponse`。
  */
-async function remotePreflight(remote: RemoteTarget): Promise<string[]> {
+const reachability = new Breaker();
+
+/**
+ * **退避重试 + 整机级熔断** ——「有重试机制吗」：原来没有，一次不成就抛。
+ *
+ * 判据和理由都在 `reachability.ts`。这里只把它接上：
+ *   · 这台机器刚被判定连不上（熔断窗口内）→ 直接复用那个结论，**不再碰 sshd**；
+ *   · 连接层面的失败退避重试（实测那种 `banner exchange` 超时常常是 `MaxStartups` 的滑动窗口，
+ *     几秒内自愈）；结论确定的失败（密钥不对、没装 kiro-cli）**不重试** —— 那只是把同一句
+ *     错误说三遍，还让人多等 4 秒。
+ *
+ * `force` 给"人点了重连"那条路：熔断挡的是启动时 20 条会话同时 attach 的瞬间并发，
+ * 不是明确的人类意图。
+ */
+async function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
+  const host = remote.sshHost || '';
+  if (!opts?.force) {
+    const recent = reachability.recentFailure(host);
+    if (recent) {
+      logger.info('remote', `preflight ${host}: 跳过（${BREAKER_MS / 1000}s 内刚判定连不上）—— 复用上次结论`);
+      throw new Error(recent);
+    }
+  }
   const args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
-  const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-    execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
-      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
-      stdout: String(stdout || ''),
-      stderr: String(stderr || ''),
-    }));
-  });
-  const verdict = judgePreflight(out.code, out.stdout, out.stderr, remote);
-  logger.info('remote', `preflight ${remote.sshHost}: ${verdict.code} — ${verdict.message}`);
-  if (verdict.code !== 'ok') throw new Error(verdict.message);
-  return verdict.models || [];
+  let verdict = { code: 'unreachable', message: `连不上 ${host}` } as ReturnType<typeof judgePreflight>;
+  for (let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt += 1) {
+    const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
+        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+        stdout: String(stdout || ''),
+        stderr: String(stderr || ''),
+      }));
+    });
+    verdict = judgePreflight(out.code, out.stdout, out.stderr, remote);
+    logger.info('remote', `preflight ${host}: ${verdict.code} — ${verdict.message}`
+      + (attempt > 1 ? `（第 ${attempt}/${PREFLIGHT_ATTEMPTS} 次）` : ''));
+    if (verdict.code === 'ok') { reachability.ok(host); return verdict.models || []; }
+    if (!worthRetrying(verdict.message) || attempt === PREFLIGHT_ATTEMPTS) break;
+    const wait = backoffMs(attempt);
+    logger.info('remote', `preflight ${host}: ${wait}ms 后再试一次（这类失败常在几秒内自愈）`);
+    await new Promise((r) => setTimeout(r, wait));
+  }
+  /* 记进熔断器：紧接着的那些会话直接复用，别把 sshd 压得更死 */
+  reachability.fail(host, verdict.message);
+  throw new Error(verdict.message);
 }
 
 /**
@@ -7869,6 +7902,13 @@ app.whenReady().then(async () => {
       }));
     });
     const verdict = judgePreflight(out.code, out.stdout, out.stderr, target);
+    /*
+      **「测试连接」通了就把熔断清掉** —— 否则你刚点完"通了"，紧接着打开会话还要空等一个
+      20 秒的窗口（熔断记的是"刚才连不上"，而你手里这次探测正是更新的证据）。
+      这条路自己拼 ssh、不走 `remotePreflight`，所以它天生不被熔断挡住 —— 那也是对的：
+      熔断挡的是启动时一堆会话的瞬间并发，不是明确的人类意图。
+    */
+    if (verdict.code === 'ok') reachability.ok(target.sshHost || '');
     logger.info('remote', `test ${target.sshHost}: ${verdict.code}`);
     return { ok: verdict.code === 'ok', code: verdict.code, message: verdict.message, missing: verdict.missing };
   });
