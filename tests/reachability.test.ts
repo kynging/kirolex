@@ -72,7 +72,8 @@ describe('接线', () => {
     /* 成功那一支现在还顺路记下那台机器的规格（算并发上限用）—— 所以不再是一行 */
     assert.match(body, /reachability\.ok\(host\);/);
     assert.match(body, /return verdict\.models \|\| \[\];/);
-    assert.match(body, /remoteCaps\.set\(host, cap\)/);
+    /* 成功那一支还顺路把规格报一次给人看（只是告知，不设上限 —— 见下面那个 describe） */
+    assert.match(body, /remoteSpecsLogged/);
     assert.match(body, /reachability\.fail\(host, verdict\.message\)/);
   });
 
@@ -92,95 +93,36 @@ describe('接线', () => {
 });
 
 /*
- * 「远程能承受多少个远程 session？这个有限制吧」—— 有，而且实测撞过。
+ * 「远程能承受多少个远程 session？这个有限制吧」→ 实测量出来了，但**没有做成上限**。
+ * 「谁让你加上限了，你应该加的是垃圾清理和重复利用」。
  *
- * 那台 t3.medium（2 vCPU / 3.8 GB）上，一条会话是**两个**进程：
- *   `kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ **155 MB**
- * 6 条 = 941 MB RSS、load 3.86；并行 attach 还撞出过 `ssh exit 255`（sshd 的 `MaxStartups`）。
- * 内存上看能塞 15 条以上，但 2 vCPU 先顶不住。
+ * 量到的数字留着（它是判断"贵不贵"的依据）：那台 t3.medium（2 vCPU / 3.8 GB）上一条远程会话是
+ * **两个**进程 —— `kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ **155 MB**；
+ * 6 条 = 941 MB RSS、load 3.86。
  *
- * 而本机那道闸（`MAX_CONCURRENT_SESSIONS`，`computeExecutorCap`）算的是**你这台笔记本**的
- * RAM/CPU —— 它允许 16 条的时候，远端那台早趴了。所以上限必须按**那台机器**算。
+ * 我一度把它做成了硬上限，那是错的：满了就赶走一条，而被赶走的立刻被后台 attach 拉回来 ——
+ * 实测日志里 `断开 nc0s4j` → 5 秒后 `断开 kqrsee` → …，而用户那条**新建**的会话卡在中间等了
+ * **46 秒**；期间它还没进 `sessionClients`，所以点模型下拉直接报 `Session not connected`。
+ * 拦着人开会话解决不了浪费，只是把浪费换成了等待。真正该做的是**不浪费**：
+ * 孤儿清理（本机 ssh + 远端进程，两端都扫）和执行器复用。
  */
-describe('每台远端机器的并发上限', () => {
+describe('那台机器的规格只用来告知，不设上限', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
-  test('按那台机器的 CPU 和内存算，取小的那个', async () => {
-    const { remoteExecutorCap, REMOTE_MB_PER_SESSION } = await import('../src/main/remotePreflight.ts');
-    /* 实测那台：2 vCPU / 3839 MB → 6（和它当时真在跑的 6 条吻合） */
-    assert.equal(remoteExecutorCap(2, 3839), 6);
-    /* 内存管够但核少 → CPU 说话；核多内存大 → 夹在上限 12 */
-    assert.equal(remoteExecutorCap(2, 64000), 6);
-    assert.equal(remoteExecutorCap(8, 32000), 12);
-    /* 小机器也至少给 2 —— 只能跑 1 条的远程会话没有意义 */
-    assert.equal(remoteExecutorCap(1, 512), 2);
-    assert.equal(REMOTE_MB_PER_SESSION, 155);
+  test('规格报一次给人看，而且明说不设上限', () => {
+    assert.match(M, /只是告知，不设上限/);
+    assert.match(M, /remoteSpecsLogged/);
   });
 
-  test('规格拿不到就**不限制** —— 没依据的上限会无缘无故赶走你的会话', async () => {
-    const { remoteExecutorCap, parseSpecs } = await import('../src/main/remotePreflight.ts');
-    assert.equal(remoteExecutorCap(0, 0), 0);
-    assert.equal(remoteExecutorCap(2, 0), 0);
+  test('那套上限机械整个不在了', () => {
+    for (const gone of ['makeRoomOnRemote', 'remoteExecutorCount', 'remoteStarting', 'remoteCaps', 'releaseRemoteSlot']) {
+      assert.equal(M.includes(gone), false, `${gone} 应该已经删掉`);
+    }
+  });
+
+  test('规格解析还留着 —— 它是"一条会话多贵"的依据', async () => {
+    const { parseSpecs, REMOTE_MB_PER_SESSION } = await import('../src/main/remotePreflight.ts');
     assert.deepEqual(parseSpecs('CPUS 2\nMEMMB 3839'), { cpus: 2, memMB: 3839 });
-    assert.deepEqual(parseSpecs('什么都没有'), { cpus: 0, memMB: 0 });
-    /* 0 要当"没依据"，不是"0 核 0 内存" */
-    assert.deepEqual(parseSpecs('CPUS 0\nMEMMB 0'), { cpus: 0, memMB: 0 });
-  });
-
-  test('规格顺着已有的 preflight 报回来，不为它单开一次 ssh', async () => {
-    const { preflightScript } = await import('../src/main/remotePreflight.ts');
-    const sh = preflightScript();
-    assert.match(sh, /echo "CPUS \$\(nproc/);
-    assert.match(sh, /MemTotal/);
-  });
-
-  test('满了先断开最久没用的；都在忙就让它超一条', () => {
-    const at = M.indexOf('function makeRoomOnRemote');
-    const body = M.slice(at, M.indexOf('\n}', M.indexOf('detachExecutor(victim)', at)));
-    assert.match(body, /if \(!cap\) return;/, '没探到规格就不限制');
-    assert.match(body, /if \(id === excludeId \|\| entry\.busy\) continue;/, '不许动正在跑的');
-    assert.match(body, /这次让它超一条/);
-    assert.match(body, /detachExecutor\(victim\)/);
-  });
-
-  test('三条起执行器的路都过这道闸（新建 / attach / 换机器）', () => {
-    assert.equal((M.match(/makeRoomOnRemote\(/g) || []).length, 4, '一处定义 + 三处调用');
-  });
-
-  test('数的是按 sshHost 的执行器，不是 ssh 进程', () => {
-    /* 换模型/换 agent 那一瞬会同时存在新旧两个执行器（先起新的再关旧的），数进程会误判超额 */
-    assert.match(M, /function remoteExecutorCount\(host: string, excludeId\?: string\): number/);
-    assert.match(M, /\(entry\.profile\.remote\?\.sshHost \|\| ''\) === host/);
-  });
-});
-
-/*
- * 「修好了之后起一个新的远程会话测试下」的前置：**这道闸原来在并行 attach 时形同不存在**。
- *
- * 实测：上限算出来是 6，而重启那一轮起了 **8 个**执行器。因为每条会话都在
- * `sessionClients.set(...)` 之前做检查，中间还要 await preflight / ensureLocalTools / connect ——
- * 于是它们各自都看到"还没满"。和当初两条会话抢到同一个远端端口是同一个形状：
- * **占位必须在任何 await 之前同步完成。**
- */
-describe('并发起会话时上限不能被绕过', () => {
-  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-
-  test('占位是同步的，而且计数把"正在起"的算进去', () => {
-    assert.match(M, /const remoteStarting = new Map<string, \{ host: string; at: number \}>\(\);/);
-    /* 同步 set —— 在 makeRoomOnRemote 里，任何 await 之前 */
-    assert.match(M, /if \(excludeId\) remoteStarting\.set\(excludeId, \{ host, at: Date\.now\(\) \}\);/);
-    assert.match(M, /if \(id !== excludeId && slot\.host === host\) n \+= 1;/);
-  });
-
-  test('注册成功就放 —— 所有起执行器的路都过 `wireSession`', () => {
-    const at = M.indexOf('function wireSession(sessionId: string, entry: SessionEntry)');
-    assert.ok(at > 0);
-    assert.match(M.slice(at, at + 500), /releaseRemoteSlot\(sessionId\);/);
-  });
-
-  test('占位会过期 —— 漏放要能自愈', () => {
-    /* 起执行器有好几条失败路径，逐条塞 finally 只要漏一条，那台机器就被永久占掉一个名额 */
-    assert.match(M, /const REMOTE_SLOT_TTL_MS = 120_000;/);
-    assert.match(M, /if \(now - slot\.at > REMOTE_SLOT_TTL_MS\) \{ remoteStarting\.delete\(id\); continue; \}/);
+    assert.equal(REMOTE_MB_PER_SESSION, 155);
   });
 });

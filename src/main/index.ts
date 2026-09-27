@@ -1771,14 +1771,6 @@ async function sweepRemoteSessionAgents(): Promise<void> {
   }
 }
 
-/**
- * 那条会话的"正在起"占位可以放了 —— 起成了（已经进 `sessionClients`）或者起失败了都要放。
- *
- * 漏放的后果是那台机器的名额被永久占掉一个，而且看不出来 —— 所以每条路（成功、抛错）都要走到。
- */
-function releaseRemoteSlot(sessionId: string): void {
-  remoteStarting.delete(sessionId);
-}
 
 /** 会话的执行器没了：作废 token、放开端口、把远端那份临时 agent 删掉。 */
 function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
@@ -1992,88 +1984,10 @@ function localDirsOf(sessionId: string, entry: { localDir?: string; localDirs?: 
  */
 const reachability = new Breaker();
 
-/**
- * 每台远端机器能同时扛几条会话 —— preflight 报回规格之后算出来的（见 `remoteExecutorCap`）。
- *
- * 没有条目 = 还没探到规格 → **不限制**。没依据的上限比没有上限糟：
- * 它会在一台好机器上无缘无故赶走你的会话。
- */
-const remoteCaps = new Map<string, number>();
+/** 哪几台机器的规格已经报过了 —— 同一条信息不必每次 attach 都刷一遍。 */
+const remoteSpecsLogged = new Set<string>();
 
 /**
- * 这台机器上已经有几条活着的执行器。
- *
- * 按 `profile.remote.sshHost` 数，而不是数 ssh 进程：换模型/换 agent 那一瞬间会同时存在
- * 新旧两个执行器（先起新的、成功了再关旧的），数进程会把那一瞬当成超额。
- */
-function remoteExecutorCount(host: string, excludeId?: string): number {
-  let n = 0;
-  for (const [id, entry] of sessionClients) {
-    if (id === excludeId) continue;
-    if ((entry.profile.remote?.sshHost || '') === host) n += 1;
-  }
-  /*
-    **加上"正在起、还没注册"的那些** —— 否则这道闸在并行 attach 时形同不存在。
-    实测：上限算出来是 6，而启动那一轮起了 **8 个**执行器 —— 因为每条会话都在
-    `sessionClients.set(...)` 之前就做了检查（中间还要 await preflight、ensureLocalTools、connect），
-    于是它们各自都看到"还没满"。和当初两条会话抢到同一个远端端口是同一个形状：
-    **占位必须在任何 await 之前同步完成**。
-  */
-  const now = Date.now();
-  for (const [id, slot] of remoteStarting) {
-    if (now - slot.at > REMOTE_SLOT_TTL_MS) { remoteStarting.delete(id); continue; }
-    if (id !== excludeId && slot.host === host) n += 1;
-  }
-  return n;
-}
-
-/**
- * 正在起、还没进 `sessionClients` 的那些远程执行器。
- *
- * 带时间戳、**会过期**：释放的正路是"注册成功就放"（`wireSession`），但起执行器有好几条失败路径
- * （preflight 抛、`ensureLocalTools` 返回 undefined、connect 抛…），逐条塞 `finally` 只要漏一条，
- * 那台机器就被永久占掉一个名额、而且看不出来。过期让漏放自愈：超时的占位一律不算。
- * 2 分钟 —— 比任何一次正常启动都长（实测最慢那条 attach 约 20 秒）。
- */
-const REMOTE_SLOT_TTL_MS = 120_000;
-const remoteStarting = new Map<string, { host: string; at: number }>();
-
-/**
- * **那台机器满了就先腾一条** ——「远程能承受多少个远程 session？这个有限制吧」。
- *
- * 和本机那道闸（`MAX_CONCURRENT_SESSIONS`）是两件事：本机那道按你这台笔记本的 RAM/CPU 算，
- * 而远端那台是 2 vCPU / 3.8 GB 的 t3.medium —— 本机允许 16 条的时候它早就趴了
- * （实测：6 条 941 MB、load 3.86，并行 attach 还撞出 `ssh exit 255`）。
- *
- * 腾的规则和本机一致：只动**空闲**的，优先代价小的（`detachExecutor` 之后下次打开会重连）。
- * 腾不出来（都在忙）就让它超一条 —— 拒绝一条你正要用的会话，比让那台机器多扛 155 MB 糟。
- */
-function makeRoomOnRemote(host: string, excludeId?: string): void {
-  const cap = remoteCaps.get(host) || 0;
-  /*
-    **先占位，再腾地方** —— 占位是同步的（见 `remoteExecutorCount` 那段）。
-    没探到规格也要占：`releaseRemoteSlot` 无条件清，所以占了不会漏。
-  */
-  if (excludeId) remoteStarting.set(excludeId, { host, at: Date.now() });
-  if (!cap) return;
-  while (remoteExecutorCount(host, excludeId) >= cap) {
-    let victim: string | null = null;
-    let oldest = Number.POSITIVE_INFINITY;
-    for (const [id, entry] of sessionClients) {
-      if (id === excludeId || entry.busy) continue;
-      if ((entry.profile.remote?.sshHost || '') !== host) continue;
-      const used = entry.lastUsedAt ?? 0;
-      if (used < oldest) { oldest = used; victim = id; }
-    }
-    if (!victim) {
-      logger.info('remote', `${host} 上已有 ${remoteExecutorCount(host, excludeId)} 条（上限 ${cap}），`
-        + `但都在忙 —— 这次让它超一条（拒绝你正要用的会话更糟）`);
-      return;
-    }
-    logger.info('remote', `${host} 上到上限 ${cap} 条了，先断开最久没用的 ${victim} 腾位置（下次打开会自己重连）`);
-    detachExecutor(victim);
-  }
-}
 
 /**
  * **退避重试 + 整机级熔断** ——「有重试机制吗」：原来没有，一次不成就抛。
@@ -2116,14 +2030,15 @@ async function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean })
         而不是按本机（`computeExecutorCap` 算的是本机 RAM/CPU）。判据和实测数字见
         `remoteExecutorCap`。
       */
-      if (verdict.cpus && verdict.memMB) {
-        const cap = remoteExecutorCap(verdict.cpus, verdict.memMB);
-        const prev = remoteCaps.get(host);
-        remoteCaps.set(host, cap);
-        if (prev !== cap) {
-          logger.info('remote', `${host}: ${verdict.cpus} vCPU / ${verdict.memMB} MB → 同时最多 ${cap} 条远程会话`
-            + `（一条会话 2 个进程 ≈ ${REMOTE_MB_PER_SESSION} MB）`);
-        }
+      /*
+        规格**只报一次给人看**，不拿它设上限 —— 上限是我一度加错的东西：它引发"赶走-又回来"的
+        循环（实测：新建一条会话等了 46 秒，期间点模型下拉直接报 `Session not connected`）。
+        要治的是浪费（孤儿清理 + 复用），不是拦着你开会话。
+      */
+      if (verdict.cpus && verdict.memMB && !remoteSpecsLogged.has(host)) {
+        remoteSpecsLogged.add(host);
+        logger.info('remote', `${host}: ${verdict.cpus} vCPU / ${verdict.memMB} MB`
+          + `（一条远程会话 2 个进程 ≈ ${REMOTE_MB_PER_SESSION} MB —— 只是告知，不设上限）`);
       }
       return verdict.models || [];
     }
@@ -3023,11 +2938,6 @@ function saveHelperModels(model: string, fallback: string) {
 
 /** Wire a freshly-created client's events, routing everything by sessionId. */
 function wireSession(sessionId: string, entry: SessionEntry) {
-  /*
-    **执行器注册好了，占位可以放** —— 从这一刻起它被 `sessionClients` 真正数到，
-    占位再留着就是重复计数。所有起执行器的路（新建 / attach / 换机器 / 换模型）都过这里。
-  */
-  releaseRemoteSlot(sessionId);
   const { client } = entry;
   client.on('update', (data: any) => {
     // A background history-priming turn's output must never surface: don't
@@ -4188,6 +4098,12 @@ app.whenReady().then(async () => {
      */
     remoteId?: string,
   ) => {
+    /*
+      **渲染层到底传了没有** ——「新会话就没有远程 tag」查了两轮都没抓到：`kirolex-new-chat-remote`
+      明明是 `tokyo`，而 `[model] new-session` 报的机器却是 `local`。两种可能（渲染层没传 / 传了但
+      这边没认）要查的地方完全不同，而这一行就把它们分开。留着不删：这条路以后还会被改。
+    */
+    logger.info('remote', `new-session ${kiroLexId}: remoteId=${remoteId ?? '(没传)'} project=${projectId || '(无)'} model=${model}`);
     if (!ensureExecutorCapacity()) {
       throw new Error('All live sessions are busy; cannot start another right now.');
     }
@@ -4254,8 +4170,6 @@ app.whenReady().then(async () => {
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
       const remoteModels = await remotePreflight(profile.remote);
       profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
-      /* 那台机器满了先腾一条 —— 见 `makeRoomOnRemote`（和本机那道闸是两件事） */
-      makeRoomOnRemote(profile.remote.sshHost || '', kiroLexId);
     }
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
@@ -6256,8 +6170,6 @@ app.whenReady().then(async () => {
       if (target) {
         const models = await remotePreflight(profile.remote!);
         profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
-        /* 切到这台机器上也要看它满没满 */
-        makeRoomOnRemote(profile.remote!.sshHost || '', sessionId);
       }
       /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
       const cliCwd = sessionCwd(profile, nextLocalDir);
@@ -7147,8 +7059,6 @@ app.whenReady().then(async () => {
         */
         const remoteModels = await remotePreflight(profile.remote);
         profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
-        /* 那台机器满了先腾一条（见 `makeRoomOnRemote`）—— 启动时一堆会话同时 attach 就是靠这道闸压住的 */
-        makeRoomOnRemote(profile.remote.sshHost || '', sessionId);
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId);
