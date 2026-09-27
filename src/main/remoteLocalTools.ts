@@ -53,9 +53,43 @@ export function allocateRemotePort(used: Iterable<number>): number {
  */
 export const SESSION_AGENT_PREFIX = 'kirolex-local-';
 
+/**
+ * **这台机器的 KiroLex 的身份** ——「你需要确保 kirolex 只管理自己创建的 session」。
+ *
+ * 一台远端机器可以同时被**好几台**笔记本上的 KiroLex 用（这正是远程会话的用法之一）。
+ * 而清理用的判据原来只看 `kirolex-local-` 这个前缀 —— 那是"所有 KiroLex"的前缀，不是"我的"：
+ *   · agent 文件那一轮按"12 小时没动过"删，可能删掉**另一台笔记本上还活着**的那条会话的配置；
+ *   · 孤儿进程那一轮会去杀别人家的进程 —— 即便那确实是垃圾，也不是我们该管的。
+ *
+ * 所以名字里带上一个稳定的 owner：`主机名 + 用户名` 的短 hash。稳定（不随重启变）才能收掉
+ * **自己上一次**留下的东西；带了它就不会碰别人的。
+ *
+ * 只取 6 位十六进制：名字要短（它会进 agent 文件名、URL 和 `ps` 的命令行），而 6 位对"区分几台
+ * 笔记本"这个用途足够 —— 撞了的后果也只是多扫一台自己人的机器。
+ */
+export function ownerTag(hostname: string, user: string): string {
+  /*
+    自带一个 FNV-1a，而不是 `require('crypto')` —— 这个模块**一个 import 都没有**（它只拼字符串），
+    而为了 6 位 hash 给它引进 node 内建会让它从"纯函数集合"变成"要跑在主进程里的东西"。
+    这里不需要密码学强度：它只是给几台笔记本起个互不相同的短名字。
+  */
+  let h = 0x811c9dc5;
+  const input = `${hostname}\u0000${user}`;
+  for (let i = 0; i < input.length; i += 1) {
+    h ^= input.charCodeAt(i);
+    h = Math.imul(h, 0x01000193) >>> 0;
+  }
+  return h.toString(16).padStart(8, '0').slice(0, 6);
+}
+
+/** 只属于**这台机器**的会话 agent 前缀 —— 清理一律按它过滤。 */
+export function ownedAgentPrefix(owner: string): string {
+  return `${SESSION_AGENT_PREFIX}${owner}-`;
+}
+
 /** 那条会话专用 agent 的名字。 */
-export function sessionAgentName(sessionId: string): string {
-  return `${SESSION_AGENT_PREFIX}${String(sessionId).replace(/[^\w.-]+/g, '_').slice(-24)}`;
+export function sessionAgentName(sessionId: string, owner: string): string {
+  return `${ownedAgentPrefix(owner)}${String(sessionId).replace(/[^\w.-]+/g, '_').slice(-24)}`;
 }
 
 /** 远端 MCP 的 URL（token 在路径里 —— 见文件头）。 */
@@ -171,7 +205,7 @@ export function removeAgentScript(name: string): string {
  *
  * 连同 `kirolex-local-` 前缀一起判：这台机器上可能还有别人手动起的 kiro-cli，那不是我们的事。
  */
-export function orphanSweepScript(): string {
+export function orphanSweepScript(owner: string): string {
   /*
     **不落盘** —— 第一版把 pid 列表写进 `/tmp/.kirolex-orphans` 再读回来，后台安全审查指出那是
     可预测的临时文件名：那台机器上任何一个本地用户都能先把它做成指向别处的 symlink，
@@ -181,7 +215,7 @@ export function orphanSweepScript(): string {
     `ps -eo ppid=,pid=,args=`：只看 PPID 为 1、且 args 里带我们前缀的那些。
   */
   return [
-    `pids=$(ps -eo ppid=,pid=,args= | awk '$1==1 && index($0, "${SESSION_AGENT_PREFIX}")>0 {print $2}')`,
+    `pids=$(ps -eo ppid=,pid=,args= | awk '$1==1 && index($0, "${ownedAgentPrefix(owner)}")>0 {print $2}')`,
     /* `grep -c .` 而不是 `wc -l`：空字符串在 `echo` 之后仍是一行，`wc -l` 会数成 1 */
     '; n=$(printf "%s" "$pids" | grep -c . || true)',
     '; [ "${n:-0}" -gt 0 ] && printf "%s\\n" $pids | xargs -r kill -TERM 2>/dev/null',
@@ -214,8 +248,8 @@ export const STALE_AGENT_MINUTES = 12 * 60;
  * · 不拿本机的时钟去比：`-mmin` 是相对**远端自己**的 now，跨机器的时钟偏移进不来。
  * · 12 小时这个阈值留给"另一个 KiroLex 正开着"的情况：它那些文件也在被不断重写，所以不会被误删。
  */
-export function sweepAgentsScript(minutes = STALE_AGENT_MINUTES): string {
-  return `find ~/.kiro/agents -maxdepth 1 -name '${SESSION_AGENT_PREFIX}*.json'`
+export function sweepAgentsScript(owner: string, minutes = STALE_AGENT_MINUTES): string {
+  return `find ~/.kiro/agents -maxdepth 1 -name '${ownedAgentPrefix(owner)}*.json'`
     + ` -mmin +${Math.max(1, Math.floor(minutes))} -print -delete 2>/dev/null | wc -l`;
 }
 

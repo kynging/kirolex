@@ -740,9 +740,11 @@ describe('远端会话 agent 的孤儿清理', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
   test('按"多久没动过"扫，不按"谁还活着"', async () => {
-    const { sweepAgentsScript, STALE_AGENT_MINUTES } = await import('../src/main/remoteLocalTools.ts');
-    const sh = sweepAgentsScript();
-    assert.match(sh, /find ~\/\.kiro\/agents -maxdepth 1 -name 'kirolex-local-\*\.json'/);
+    const { sweepAgentsScript, STALE_AGENT_MINUTES, ownedAgentPrefix } = await import('../src/main/remoteLocalTools.ts');
+    /* owner 是必填 ——「确保 kirolex 只管理自己创建的 session」：默认值会静默用错身份 */
+    const sh = sweepAgentsScript('ca7bbd');
+    assert.ok(sh.includes(ownedAgentPrefix('ca7bbd')), '只扫自己那台留下的');
+    assert.match(sh, /find ~\/\.kiro\/agents -maxdepth 1 -name 'kirolex-local-ca7bbd-\*\.json'/);
     assert.ok(sh.includes(`-mmin +${STALE_AGENT_MINUTES}`), sh);
     assert.match(sh, /-print -delete/);
     /*
@@ -753,9 +755,11 @@ describe('远端会话 agent 的孤儿清理', () => {
   });
 
   test('只碰自己生成的那些文件', async () => {
-    const { sweepAgentsScript, SESSION_AGENT_PREFIX } = await import('../src/main/remoteLocalTools.ts');
-    const sh = sweepAgentsScript();
-    assert.ok(sh.includes(`${SESSION_AGENT_PREFIX}*.json`));
+    const { sweepAgentsScript, ownedAgentPrefix } = await import('../src/main/remoteLocalTools.ts');
+    const sh = sweepAgentsScript('ca7bbd');
+    /* 按**自己那台**的前缀过滤：一台远端可以同时被好几台笔记本用，
+       而这一轮是按"12 小时没动过"删的 —— 用共用前缀会删掉别人家还活着的那条会话的配置 */
+    assert.ok(sh.includes(`${ownedAgentPrefix('ca7bbd')}*.json`));
     /* `maxdepth 1` —— 别递归进那个 `agents-retired-*` 备份目录 */
     assert.match(sh, /-maxdepth 1/);
   });
@@ -810,10 +814,11 @@ describe('远端孤儿执行器进程（打爆机器的那个）', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
   test('判据是 PPID==1 + 我们自己的 agent 前缀', async () => {
-    const { orphanSweepScript, SESSION_AGENT_PREFIX } = await import('../src/main/remoteLocalTools.ts');
-    const sh = orphanSweepScript();
+    const { orphanSweepScript, ownedAgentPrefix } = await import('../src/main/remoteLocalTools.ts');
+    const sh = orphanSweepScript('ca7bbd');
     assert.match(sh, /\$1==1/, 'PPID 必须是 1 —— 活着的挂在 sshd 底下');
-    assert.ok(sh.includes(SESSION_AGENT_PREFIX), '只碰我们生成的那些（机器上可能有别人手动起的 kiro-cli）');
+    /* 只碰**自己**那台留下的：一台远端可以同时被好几台笔记本用，别人家的进程不是我们该管的 */
+    assert.ok(sh.includes(ownedAgentPrefix('ca7bbd')), '只碰自己生成的那些');
     assert.match(sh, /kill -TERM/, 'TERM 不是 KILL —— 给它机会自己收尾');
     /* 不按 etime 猜：一个刚起 3 秒的执行器和一个 3 天的孤儿，差别在父进程而不在年龄 */
     assert.equal(/etime|-mmin/.test(sh), false);
@@ -831,7 +836,7 @@ describe('远端孤儿执行器进程（打爆机器的那个）', () => {
   test('开机跟着 agent 那一遍一起扫，而且杀到人时要 warn（不是 info）', () => {
     const at = M.indexOf('async function sweepRemoteSessionAgents');
     const body = M.slice(at, M.indexOf('\n}', M.indexOf('catch (err: any)', at)));
-    assert.match(body, /parseOrphanSweep\(await runRemoteCapture\(target, orphanSweepScript\(\)\)\)/);
+    assert.match(body, /parseOrphanSweep\(await runRemoteCapture\(target, orphanSweepScript\(OWNER\)\)\)/);
     assert.match(body, /logger\.warn\('localmcp', `\$\{target\.sshHost\}: 杀掉 \$\{orphans\} 个孤儿执行器进程/);
     /* 失败照旧只记日志 —— 这仍然是清垃圾，不该拦住任何会话 */
     assert.equal(/throw/.test(body), false);
@@ -858,7 +863,7 @@ describe('本机遗留的 ssh 客户端（远端累积的源头）', () => {
     const body = M.slice(at, M.indexOf('\n}', M.indexOf('杀掉 ${victims.length}', at)));
     assert.match(body, /if \(Number\(m\[2\]\) !== 1\) continue;/, '挂在当前 app 底下的是活的');
     assert.ok(body.includes(')ssh\\s/.test(m[3])'), '只杀 ssh 客户端');
-    assert.match(body, /line\.includes\(SESSION_AGENT_PREFIX\)/, '不碰用户自己开的 ssh');
+    assert.match(body, /line\.includes\(OWNED_AGENT_PREFIX\)/, '只碰自己那台留下的 ssh');
     assert.match(body, /process\.kill\(pid, 'SIGTERM'\)/);
   });
 
@@ -876,5 +881,71 @@ describe('本机遗留的 ssh 客户端（远端累积的源头）', () => {
     assert.match(body, /logger\.warn\('remote'/);
     assert.match(body, /它们被 launchd 收养之后还连着远端/);
     assert.equal(/throw/.test(body), false);
+  });
+});
+
+/*
+ * 「另外你需要确保 kirolex 只管理自己创建的 session」。
+ *
+ * 一台远端机器可以同时被**好几台**笔记本上的 KiroLex 用（这正是远程会话的用法之一）。
+ * 而清理的判据原来只看 `kirolex-local-` —— 那是**所有** KiroLex 共用的前缀，不是"我的"：
+ *
+ *   · agent 文件那一轮按"12 小时没动过"删 → 会删掉另一台笔记本上**还活着**的那条会话的配置，
+ *     而那条会话的 MCP 通道就地断掉，对面完全不知道发生了什么；
+ *   · 孤儿进程那一轮会去杀别人家的进程 —— 即便那确实是垃圾，也不是我们该管的。
+ *
+ * 所以名字里带一个稳定的 owner（主机名 + 用户名的短 hash）：稳定才能收掉**自己上一次**留下的东西，
+ * 带了它就不会碰别人的。
+ */
+describe('只管自己创建的会话', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('owner 是稳定的、不同机器不同', async () => {
+    const { ownerTag } = await import('../src/main/remoteLocalTools.ts');
+    assert.equal(ownerTag('mac-a', 'keyinan'), ownerTag('mac-a', 'keyinan'), '同一台要稳定');
+    assert.notEqual(ownerTag('mac-a', 'keyinan'), ownerTag('mac-b', 'keyinan'));
+    assert.notEqual(ownerTag('mac-a', 'keyinan'), ownerTag('mac-a', 'bob'));
+    assert.match(ownerTag('mac-a', 'keyinan'), /^[0-9a-f]{6}$/);
+  });
+
+  test('agent 名字带 owner，清理按它过滤', async () => {
+    const { sessionAgentName, ownedAgentPrefix, orphanSweepScript, sweepAgentsScript } =
+      await import('../src/main/remoteLocalTools.ts');
+    const mine = ownedAgentPrefix('aaaaaa');
+    assert.ok(sessionAgentName('s_1', 'aaaaaa').startsWith(mine));
+    /* 两个清理脚本都只认自己那台 */
+    assert.ok(orphanSweepScript('aaaaaa').includes(mine));
+    assert.ok(sweepAgentsScript('aaaaaa').includes(mine));
+    /* 别人的前缀不该出现 */
+    assert.equal(orphanSweepScript('aaaaaa').includes(ownedAgentPrefix('bbbbbb')), false);
+  });
+
+  test('owner 是**必填**参数 —— 默认值会静默用错身份', () => {
+    const RL = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteLocalTools.ts'), 'utf8');
+    assert.match(RL, /export function orphanSweepScript\(owner: string\)/);
+    assert.match(RL, /export function sweepAgentsScript\(owner: string, minutes = STALE_AGENT_MINUTES\)/);
+    assert.match(RL, /export function sessionAgentName\(sessionId: string, owner: string\)/);
+  });
+
+  test('这个模块仍然没有任何 import（它只拼字符串）', () => {
+    const RL = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteLocalTools.ts'), 'utf8');
+    /* 所以 owner 的 hash 是自带的 FNV-1a，宿主信息由调用方传进来 */
+    assert.equal(/^import /m.test(RL), false);
+    assert.match(RL, /FNV-1a/);
+  });
+
+  test('主进程算一次、全程用它；本机那轮 ssh 也按它过滤', () => {
+    assert.match(M, /const OWNER = ownerTag\(os\.hostname\(\), os\.userInfo\(\)\.username\);/);
+    assert.match(M, /const OWNED_AGENT_PREFIX = ownedAgentPrefix\(OWNER\);/);
+    assert.match(M, /line\.includes\(OWNED_AGENT_PREFIX\)/);
+    assert.match(M, /sessionAgentName\(sessionId, OWNER\)/);
+  });
+
+  test('**显示**那一侧仍然用共用前缀 —— 别人家的 agent 对你同样不可选', () => {
+    /* "只管自己的"管的是删和杀，不是显示：那些 URL 里带着别人那条会话的 token */
+    const at = M.indexOf("ipcMain.handle('kiro:list-agents'");
+    const body = M.slice(at, at + 2600);
+    assert.match(body, /startsWith\(SESSION_AGENT_PREFIX\)/);
+    assert.match(body, /管的是\*\*删和杀\*\*，不是显示/);
   });
 });

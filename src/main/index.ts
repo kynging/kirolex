@@ -44,6 +44,7 @@ import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
   sweepAgentsScript, STALE_AGENT_MINUTES, orphanSweepScript, parseOrphanSweep,
+  ownerTag, ownedAgentPrefix,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
@@ -1623,7 +1624,7 @@ async function ensureLocalTools(
         notice: (sid, text) => sessionNotice(sid, text),
       });
     }
-    const agentOverride = sessionAgentName(sessionId);
+    const agentOverride = sessionAgentName(sessionId, OWNER);
     /*
       **额外目录从记录里现查**，而不是当参数一路传下来：`ensureLocalTools` 有 6 个调用点
       （新建 / attach / 换目标 / 换 agent / 换模型 / 换权限），漏传一个的表现是"那条会话
@@ -1727,7 +1728,7 @@ function sweepStrayLocalSsh(): void {
     const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     const victims: number[] = [];
     for (const line of out.split('\n')) {
-      if (!line.includes(SESSION_AGENT_PREFIX)) continue;
+      if (!line.includes(OWNED_AGENT_PREFIX)) continue;
       const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
       if (!m) continue;
       if (Number(m[2]) !== 1) continue;             // 挂在当前 app 底下的是活的
@@ -1752,7 +1753,7 @@ async function sweepRemoteSessionAgents(): Promise<void> {
   for (const target of listRemoteTargets(KIROLEX_CONFIG_PATH)) {
     if (!target.sshHost) continue;
     try {
-      const out = await runRemoteCapture(target, sweepAgentsScript());
+      const out = await runRemoteCapture(target, sweepAgentsScript(OWNER));
       const n = Number(String(out).trim().split(/\s+/).pop());
       if (n > 0) logger.info('localmcp', `${target.sshHost}: 扫掉 ${n} 个上次留下的会话 agent（超过 ${STALE_AGENT_MINUTES / 60} 小时没动过）`);
       /*
@@ -1761,7 +1762,7 @@ async function sweepRemoteSessionAgents(): Promise<void> {
         最后 sshd 和 SSM 都饿死，只能从 EC2 API 强制 stop/start 救回来。
         判据是 PPID==1（见 `orphanSweepScript`）—— 在真机上验过：活着的 12 个 PPID 全不是 1。
       */
-      const orphans = parseOrphanSweep(await runRemoteCapture(target, orphanSweepScript()));
+      const orphans = parseOrphanSweep(await runRemoteCapture(target, orphanSweepScript(OWNER)));
       if (orphans > 0) {
         logger.warn('localmcp', `${target.sshHost}: 杀掉 ${orphans} 个孤儿执行器进程（上次 KiroLex 没能正常退出）`);
       }
@@ -1983,6 +1984,18 @@ function localDirsOf(sessionId: string, entry: { localDir?: string; localDirs?: 
  * 远端没登录 → 执行器起得来但每一轮都空回 —— 看起来就是那个查了一整天的 `EmptyResponse`。
  */
 const reachability = new Breaker();
+
+/**
+ * **这台机器的 KiroLex 的身份** ——「你需要确保 kirolex 只管理自己创建的 session」。
+ *
+ * 一台远端机器可以同时被好几台笔记本上的 KiroLex 用，而清理的判据原来只看 `kirolex-local-`
+ * 这个**所有** KiroLex 共用的前缀 —— 那意味着 agent 文件那一轮（按"12 小时没动过"删）可能删掉
+ * 另一台笔记本上**还活着**的那条会话的配置，孤儿进程那一轮也会去动别人家的进程。
+ *
+ * 算一次、全程用它：会话 agent 的名字、两个清理脚本的过滤器都带上它。
+ */
+const OWNER = ownerTag(os.hostname(), os.userInfo().username);
+const OWNED_AGENT_PREFIX = ownedAgentPrefix(OWNER);
 
 /** 哪几台机器的规格已经报过了 —— 同一条信息不必每次 attach 都刷一遍。 */
 const remoteSpecsLogged = new Set<string>();
@@ -5930,6 +5943,11 @@ app.whenReady().then(async () => {
         if (!bin) throw new Error(`还没有设置 ${target.sshHost} 上的 kiro 启动命令（设置 → 🖥 机器）。`);
         const out = await runRemoteCapture(target, `${shellQuote(bin)} agent list 2>&1`)
           .catch((err) => { throw new Error(`问不到 ${target.sshHost} 的 agent 列表：${err?.message || err}`); });
+        /*
+          这里用**共用**前缀而不是 `OWNED_AGENT_PREFIX`：下拉要隐藏所有 KiroLex 生成的会话 agent，
+          包括别台笔记本留下的 —— 它们对你同样不可选（URL 里带着别人那条会话的 token）。
+          "只管自己的"那条规矩管的是**删和杀**，不是显示。
+        */
         return { agents: parseAgentList(out).filter((a) => !a.name.startsWith(SESSION_AGENT_PREFIX)) };
       }
       // 和 list-models 同一个病：日志里 `agent list` 也在 15s 反复被 kill，同样是挂载时并发双发。
