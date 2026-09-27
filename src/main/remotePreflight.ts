@@ -20,6 +20,8 @@ export interface Preflight {
   cpus?: number;
   /** 那台机器的总内存 MB（拿不到是 0）。 */
   memMB?: number;
+  /** 那台机器上 kiro-cli 的版本（`2.24.1` 这种）。问不到就没有这个字段。 */
+  kiroVersion?: string;
   /** 给人看的一句话：说清是什么问题、下一步干什么。 */
   message: string;
   /** 缺了哪些命令（`missing-tools` 时有值）。 */
@@ -72,6 +74,15 @@ export function preflightScript(tools: string[] = REQUIRED_TOOLS, opts: { models
     */
     'echo "CPUS $(nproc 2>/dev/null || echo 0)"',
     'echo "MEMMB $(awk \'/MemTotal/{printf "%d", $2/1024}\' /proc/meminfo 2>/dev/null || echo 0)"',
+    /*
+      **顺路报一下它的 kiro-cli 版本** ——「怎么控制远端的版本呢，远端应该也定期更新一下」。
+      不报的代价是实测出来的：那台机器停在 **1.27.0**，而本机已经 2.24.1 —— 差一个大版本。
+      1.27.0 连 `--list-models` 都没有，所以它的模型清单只能"故意传一个错模型、从参数校验的
+      报错里抠 id"，倍率只能拿本机那份去补；而本机清单被地域过滤（一个 Claude 都没有），
+      于是 `claude-opus-5.5` 就彻底没有倍率 —— 用户看到的就是那个。
+      这一行几乎不花时间，而且顺着已有的探测走，不值得为它单开一次 ssh。
+    */
+    'echo "KVER $(kiro-cli --version 2>/dev/null | head -1 | grep -oE \'[0-9]+\\.[0-9]+\\.[0-9]+\' | head -1)"',
   ];
   if (opts.models !== false) {
     /* 模型列表：参数校验就会失败，不会真的调模型 */
@@ -127,8 +138,36 @@ export function judgePreflight(
     models,
     cpus,
     memMB,
+    kiroVersion: parseKiroVersion(out),
     message: `${host}：kiro-cli 在，也登录了${models.length ? `，${models.length} 个可用模型` : ''}。`,
   };
+}
+
+/**
+ * 那台机器上 kiro-cli 的版本（`KVER 2.24.1`）。问不到返回 undefined ——
+ * 「没问到」和「旧」必须分开：拿不到版本时**不该**提醒人去更新。
+ */
+export function parseKiroVersion(stdout: string): string | undefined {
+  const m = /^KVER\s+(\d+\.\d+\.\d+)\s*$/m.exec(String(stdout || ''));
+  return m ? m[1] : undefined;
+}
+
+/**
+ * **a 比 b 旧吗** —— 逐段比数字，不做字符串比较。
+ *
+ * 字符串比较会说 `1.27.0` > `2.24.1`（'2' < '1' 为假、但 '1'<'2' 让 1.27 排在前面是巧合，
+ * 而 `1.9.0` vs `1.27.0` 就直接错了：'9' > '2'）。这两个版本恰好是实测遇到的那一对。
+ */
+export function isOlderVersion(a?: string, b?: string): boolean {
+  if (!a || !b) return false;          // 有一边不知道就不下结论
+  const pa = a.split('.').map(Number);
+  const pb = b.split('.').map(Number);
+  for (let i = 0; i < Math.max(pa.length, pb.length); i += 1) {
+    const x = pa[i] || 0;
+    const y = pb[i] || 0;
+    if (x !== y) return x < y;
+  }
+  return false;
 }
 
 /** 那台机器的规格（`CPUS n` / `MEMMB n`）。拿不到给 0 —— 0 的含义是"没依据"，下游据此不做判断。 */

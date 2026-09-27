@@ -427,6 +427,23 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 测一条命令能不能起来。 */
   binsTest: (machine: string, command: string): Promise<{ ok: boolean; version?: string; error?: string }> =>
     ipcRenderer.invoke('bins:test', machine, command),
+  /**
+   * **两边的 kiro-cli 各是什么版本**。`remote` 是 undefined 时表示"还没探过那台机器",
+   * 而那**不等于**旧 —— 界面别在那种情况下显示"落后"。
+   */
+  kiroVersions: (machine?: string): Promise<{
+    ok: boolean; error?: string; local?: string; remote?: string; outdated?: boolean;
+  }> => ipcRenderer.invoke('kiro:versions', machine),
+  /**
+   * **更新某台机器上的 kiro-cli**（`'local'` 或某台远端的 id —— 两边一视同仁）。
+   *
+   * 有会话连着时第一次返回 `needsConfirm` 和"有几条在用"，人看过之后再带 `force` 调一次:
+   * 那个二进制是那台机器上**所有**执行器共用的，换掉之后下一次重连/换模型就是新版本。
+   */
+  kiroUpdate: (machine: string, force?: boolean): Promise<{
+    ok: boolean; error?: string; needsConfirm?: boolean; inUse?: number;
+    from?: string; to?: string; changed?: boolean; log?: string;
+  }> => ipcRenderer.invoke('kiro:update', machine, force),
   /** 选一个项目目录（切到远端时用）。 */
   remotePickDir: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-dir'),
   /**

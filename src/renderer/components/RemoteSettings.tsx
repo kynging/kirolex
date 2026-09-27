@@ -1,4 +1,4 @@
-import React, { useEffect, useRef, useState } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 
 /**
  * **在界面上配一台远端机器** ——「界面上甚至没有配置远程EC2的地方」。
@@ -162,6 +162,77 @@ const BinRow: React.FC<{
  * `claude` / `codex` 现在只检测和记录（KiroLex 还只起 kiro-cli），标签上明说"暂未使用"：
  * 一个填了却不生效的输入框，比没有这个输入框更让人怀疑配置是假的。
  */
+/**
+ * **两边的 kiro-cli 各是什么版本，落后了就说出来** ——「怎么控制远端的版本呢，
+ * 远端应该也定期更新一下。本地现在是什么版本？」。
+ *
+ * 版本差不是"数字不一样"这么轻。实测远端停在 **1.27.0**、本机 **2.24.1**，而 1.27.0
+ * **没有** `--list-models` —— 于是那台机器的模型清单只能靠"故意传个错模型、从参数校验的报错里
+ * 抠 id"，倍率只能拿本机那份去补；而本机清单被地域过滤（一个 Claude 都没有），
+ * `claude-opus-5.5` 就彻底没有倍率。更新到 2.24.1 之后它自己报 2.00x，问题当场消失。
+ *
+ * 为什么**不**定时自动更新：那个二进制是这台机器上**所有**执行器共用的，换掉之后下一次
+ * 重连/换模型就是新版本，而新版本可能改行为（这一轮好几个 bug 就是这两个版本的差异带出来的）。
+ * 所以这里只报 + 给一个按钮；有会话连着时第一次点会先告诉你有几条在用。
+ *
+ * `remote` 拿不到时显示"没探过"而不是"落后" —— 「不知道」和「旧」是两回事。
+ *
+ * 本机那一行不显示"落后"：没有第二个数字可比。它是不是最新的只有 `update` 本身知道 ——
+ * 所以那颗按钮跑完会说"已经是最新的（2.24.1）"或者"已更新：A → B"。
+ */
+const KiroVersionRow: React.FC<{ machine: string }> = ({ machine }) => {
+  const [info, setInfo] = useState<{ local?: string; remote?: string; outdated?: boolean } | null>(null);
+  const [busy, setBusy] = useState(false);
+  const [msg, setMsg] = useState<{ bad?: boolean; text: string } | null>(null);
+  /** 有会话连着时第一次点只是警告；再点一次才真更新。 */
+  const [confirming, setConfirming] = useState(false);
+
+  const load = useCallback(async () => {
+    const r = await (window as any).kiroApi?.kiroVersions?.(machine);
+    if (r?.ok) setInfo({ local: r.local, remote: r.remote, outdated: r.outdated });
+  }, [machine]);
+  useEffect(() => { setInfo(null); setMsg(null); setConfirming(false); void load(); }, [load]);
+
+  const update = async (): Promise<void> => {
+    setBusy(true); setMsg(null);
+    try {
+      const r = await (window as any).kiroApi?.kiroUpdate?.(machine, confirming);
+      if (r?.needsConfirm) { setConfirming(true); setMsg({ bad: true, text: r.error }); return; }
+      setConfirming(false);
+      if (!r?.ok) { setMsg({ bad: true, text: r?.error || '更新失败' }); return; }
+      setMsg({
+        text: r.changed ? `已更新：${r.from} → ${r.to}。` : `已经是最新的（${r.to || r.from || '?'}）。`,
+      });
+      await load();
+    } finally { setBusy(false); }
+  };
+
+  if (!info) return null;
+  return (
+    <div className="remote-row-actions" style={{ marginTop: 2, flexWrap: 'wrap', gap: 8 }}>
+      <span className="settings-hint">
+        {machine === 'local' ? (
+          <>kiro-cli：<b>{info.local || '?'}</b></>
+        ) : (
+          <>
+            kiro-cli：本机 <b>{info.local || '?'}</b>
+            {' · '}这台机器 <b>{info.remote || '（还没探过）'}</b>
+            {info.outdated && <span style={{ color: 'var(--error)' }}> —— 落后了</span>}
+          </>
+        )}
+      </span>
+      <button className="remote-btn" disabled={busy} onClick={() => void update()}>
+        {busy ? '更新中…'
+          : confirming ? '确认更新（会影响在用的会话）'
+            : machine === 'local' ? '更新本机的 kiro-cli' : '更新那台机器的 kiro-cli'}
+      </button>
+      {msg && (
+        <span className="settings-hint" style={msg.bad ? { color: 'var(--error)' } : undefined}>{msg.text}</span>
+      )}
+    </div>
+  );
+};
+
 const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecBins) => void }> = ({ bins, machine, onChange }) => {
   const [found, setFound] = useState<Record<string, BinCandidate[]> | null>(null);
   const [detecting, setDetecting] = useState(false);
@@ -188,6 +259,7 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
   };
   return (
     <>
+      <KiroVersionRow machine={machine} />
       <div className="remote-row-actions" style={{ marginTop: 2 }}>
         <button className="remote-btn" disabled={detecting} onClick={() => void detect()}>
           {detecting ? '检测中…' : '自动检测这台机器上的三个工具'}

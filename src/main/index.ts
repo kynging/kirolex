@@ -6,7 +6,7 @@ import { execSync, execFileSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { SshMux, muxKey, MUX_DIR } from './sshMux';
 import { rewriteImagePaths } from './imagePaths';
-import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
+import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
 import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } from './reachability.ts';
 import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
@@ -35,7 +35,7 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION } from './remotePreflight.ts';
+import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
@@ -1896,10 +1896,11 @@ function runProbe(machine: string, script: string): Promise<string> {
 }
 
 /** 在远端跑一条命令并**拿回 stdout**（`writeRemoteFile` 丢掉输出）。 */
-function runRemoteCapture(remote: RemoteTarget, script: string): Promise<string> {
+function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
-      { timeout: 60_000, encoding: 'utf8' },
+      /* 默认 60 秒够所有探测用；`kiro-cli update` 要下一个几十 MB 的二进制，调用方会放宽 */
+      { timeout: timeoutMs, encoding: 'utf8' },
       (err, stdout, stderr) => {
         if (err && !String(stdout || '')) {
           /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
@@ -2102,6 +2103,24 @@ setMuxSocketResolver((remote) => (remote?.sshHost ? sshMux.liveSocketFor(remote)
 
 /** 哪几台机器的规格已经报过了 —— 同一条信息不必每次 attach 都刷一遍。 */
 const remoteSpecsLogged = new Set<string>();
+/** 每台机器最近一次报的 kiro-cli 版本（preflight 顺路带回来的）。 */
+const remoteKiroVersions = new Map<string, string>();
+/** "落后了"这句话一台机器只说一次 —— 每条会话都说一遍等于把它变成噪音。 */
+const remoteVersionWarned = new Set<string>();
+
+/**
+ * 本机 kiro-cli 的版本。问一次就缓存 —— 它在一次运行里不会变（真更新了也要重启 app）。
+ */
+let localKiroVersionCache: string | undefined;
+async function localKiroVersion(): Promise<string | undefined> {
+  if (localKiroVersionCache) return localKiroVersionCache;
+  try {
+    const out = await runKiroCli('--version', 15_000);
+    const m = /(\d+\.\d+\.\d+)/.exec(String(out || ''));
+    localKiroVersionCache = m ? m[1] : undefined;
+  } catch { /* 问不到就不下"落后"的结论 */ }
+  return localKiroVersionCache;
+}
 
 /**
 
@@ -2181,6 +2200,22 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
         循环（实测：新建一条会话等了 46 秒，期间点模型下拉直接报 `Session not connected`）。
         要治的是浪费（孤儿清理 + 复用），不是拦着你开会话。
       */
+      /*
+        **版本对比** ——「怎么控制远端的版本呢，远端应该也定期更新一下」。
+        只报，不自己动手：换掉那个二进制会影响这台机器上**所有**会话，而且新版本可能改行为
+        （这一轮好几个 bug 就是 1.27.0 和 2.24.1 的差异带出来的）。什么时候更新是人的决定。
+        `remoteKiroVersions` 存着给设置页看（那里有「更新」按钮）。
+      */
+      if (verdict.kiroVersion) {
+        remoteKiroVersions.set(host, verdict.kiroVersion);
+        const mine = await localKiroVersion();
+        if (isOlderVersion(verdict.kiroVersion, mine) && !remoteVersionWarned.has(host)) {
+          remoteVersionWarned.add(host);
+          logger.warn('remote', `${host} 上的 kiro-cli 是 ${verdict.kiroVersion}，本机是 ${mine} —— 落后了。`
+            + `旧版本缺的东西是实打实的（1.27.0 连 \`--list-models\` 都没有，所以模型倍率只能靠猜）。`
+            + `设置 → 🖥 机器 里有「更新那台机器的 kiro-cli」。`);
+        }
+      }
       if (verdict.cpus && verdict.memMB && !remoteSpecsLogged.has(host)) {
         remoteSpecsLogged.add(host);
         logger.info('remote', `${host}: ${verdict.cpus} vCPU / ${verdict.memMB} MB`
@@ -6977,6 +7012,31 @@ app.whenReady().then(async () => {
       if (!target?.sshHost) throw new Error(`找不到这台机器（${machine}）—— 设置里删掉了？`);
       const bin = remoteKiroBin(target);
       if (!bin) throw new Error(`还没有设置 ${target.sshHost} 上的 kiro 启动命令（设置 → 🖥 机器）。`);
+    /*
+      **先问那台机器自己要完整清单** —— 2.24.1 起远端的 kiro-cli 认
+      `chat --list-models --format json`，回的是和本机**一模一样**的结构
+      （`model_id` / `model_name` / `rate_multiplier` / `context_window_tokens`）。
+
+      这比下面那条"故意传一个不存在的模型、从参数校验的报错里抠 id"强的地方不是少一次调用，
+      而是**倍率终于来自真正提供这些模型的那台机器**：实测远端更新到 2.24.1 之后
+      `claude-opus-5.5` 报的是 2.00x，而那个数字本机给不出来（本机清单被地域过滤，
+      一个 Claude 都没有，内置兜底表里也没有 5.5）—— 也就是用户看到的"没有乘数"。
+
+      旧的探测留着做兜底：远端可能还是老版本（这条路上见过 1.27.0，它连 `--list-models`
+      都不认）。顺序是"能问就问，问不到才猜"。
+    */
+      const jsonOut = await runRemoteCapture(target,
+        `${shellQuote(bin)} chat --list-models --format json 2>/dev/null || true`).catch(() => '');
+      const remoteList = parseModelListJson(jsonOut);
+      if (remoteList.length) {
+        /* 真实元数据进缓存 —— 它是按 model_id 存的，所以本机那边的显示也跟着修好了 */
+        const cache0 = readMetaCache(MODEL_META_PATH);
+        if (mergeMeta(cache0, remoteList)) writeMetaCache(MODEL_META_PATH, cache0);
+        const liveRemote: Record<string, any> = {};
+        for (const m of remoteList) if (m?.model_id) liveRemote[m.model_id] = m;
+        logger.info('model', `${target.sshHost}: 自己报出了 ${remoteList.length} 个模型（带倍率）`);
+        return { models: enrichModels(remoteList.map((m) => m.model_id!), liveRemote, cache0) };
+      }
       const out = await runRemoteCapture(target,
         `${shellQuote(bin)} chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1`)
         .catch((err) => { throw new Error(`问不到 ${target.sshHost} 的模型列表：${err?.message || err}`); });
@@ -8142,6 +8202,98 @@ app.whenReady().then(async () => {
       : await dialog.showOpenDialog(options);
     if (result.canceled || !result.filePaths[0]) return { path: '' };
     return { path: result.filePaths[0] };
+  });
+
+  /**
+   * **两边的 kiro-cli 各是什么版本** ——「怎么控制远端的版本呢？本地现在是什么版本？」。
+   *
+   * 版本差不是"数字不一样"这么轻：实测远端停在 1.27.0、本机 2.24.1，而 1.27.0 **没有**
+   * `--list-models`，所以那台机器的模型清单只能靠"故意传个错模型、从参数校验的报错里抠 id",
+   * 倍率只能拿本机那份去补 —— 本机清单又被地域过滤（一个 Claude 都没有），
+   * 于是 `claude-opus-5.5` 彻底没有倍率。更新到 2.24.1 之后它自己就报 2.00x 了。
+   *
+   * 远端那个值取 preflight 顺路带回来的（不额外开一次 ssh）；没探过就是 undefined，
+   * 而 `undefined` 的含义是"不知道"，不是"旧"—— 界面据此不该显示"落后"。
+   */
+  ipcMain.handle('kiro:versions', async (_event, machine?: string) => {
+    const local = await localKiroVersion();
+    if (!machine || machine === 'local') return { ok: true, local };
+    const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+    if (!target?.sshHost) return { ok: false, error: `找不到这台机器（${machine}）` };
+    const remote = remoteKiroVersions.get(target.sshHost);
+    return { ok: true, local, remote, outdated: isOlderVersion(remote, local) };
+  });
+
+  /**
+   * **更新那台机器上的 kiro-cli**（`kiro-cli update -y`）。
+   *
+   * 两件事是刻意的：
+   *
+   * 1. **有会话连着就先说清，不偷偷换**。那个二进制被这台机器上**所有**执行器握着 ——
+   *    换掉之后正在跑的不会当场死，但下一次 attach / 换模型就是新版本了，而新版本可能改行为。
+   *    所以默认拦住并说出有几条会话在用；`force` 只在人看过那句话之后才会传过来。
+   * 2. **报出前后两个版本号**。"更新成功了"这句话本身不含信息 —— 实测有价值的正是
+   *    `1.27.0 → 2.24.1` 这一对（它解释了为什么倍率突然有了）。
+   */
+  ipcMain.handle('kiro:update', async (_event, machine: string, force?: boolean) => {
+    const pick = (t: string): string | undefined => /(\d+\.\d+\.\d+)/.exec(String(t || ''))?.[1];
+    const local = !machine || machine === 'local';
+
+    /*
+      **本机那条也一样要拦** ——「本地的版本你也帮忙看一下，做个类似的功能」。
+      本机的二进制被本地会话的执行器握着，而且 KiroLex 自己问模型清单 / agent 列表
+      也在跑它。所以判据一样：有几条在用就说几条，人确认过再换。
+    */
+    const inUse = local
+      ? [...sessionClients.values()].filter((e) => !e.profile.remote?.sshHost).length
+      : 0;
+    let target: RemoteTarget | undefined;
+    let bin = '';
+    if (!local) {
+      target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+      if (!target?.sshHost) return { ok: false, error: `找不到这台机器（${machine}）` };
+      bin = remoteKiroBin(target) || '';
+      if (!bin) return { ok: false, error: `还没有设置 ${target.sshHost} 上的 kiro 启动命令。` };
+    }
+    const remoteInUse = target
+      ? [...sessionClients.values()].filter((e) => e.profile.remote?.sshHost === target!.sshHost).length
+      : 0;
+    const busy = local ? inUse : remoteInUse;
+    if (busy && !force) {
+      return {
+        ok: false, needsConfirm: true, inUse: busy,
+        error: `${local ? '本机' : target!.sshHost} 上还有 ${busy} 条会话连着。`
+          + `更新会把它们正在用的那个二进制换掉 —— 正在跑的那一轮不会当场死，`
+          + `但下一次重连/换模型就是新版本了，而新版本可能改行为。要继续就再点一次。`,
+      };
+    }
+    try {
+      let from: string | undefined;
+      let to: string | undefined;
+      let log = '';
+      if (local) {
+        from = await localKiroVersion();
+        /* `-y`：非交互。超时给足 —— 它要下载一个几十 MB 的二进制 */
+        log = String(await runKiroCli('update -y', 600_000)).trim().slice(-1200);
+        /* 缓存必须失效，否则界面上还是旧的那个号 */
+        localKiroVersionCache = undefined;
+        to = await localKiroVersion();
+        logger.info('remote', `本机 kiro-cli ${from || '?'} → ${to || '?'}`);
+      } else {
+        const before = await runRemoteCapture(target!, `${shellQuote(bin)} --version 2>&1 | head -1`).catch(() => '');
+        log = String(await runRemoteCapture(target!, `${shellQuote(bin)} update -y 2>&1 | tail -20`, 600_000)).trim().slice(-1200);
+        const after = await runRemoteCapture(target!, `${shellQuote(bin)} --version 2>&1 | head -1`).catch(() => '');
+        from = pick(before);
+        to = pick(after);
+        if (to) remoteKiroVersions.set(target!.sshHost, to);
+        /* 版本变了就把"落后"那句话的记忆清掉，否则下次还会提醒 */
+        if (to && !isOlderVersion(to, await localKiroVersion())) remoteVersionWarned.delete(target!.sshHost);
+        logger.info('remote', `${target!.sshHost}: kiro-cli ${from || '?'} → ${to || '?'}`);
+      }
+      return { ok: true, from, to, changed: !!from && !!to && from !== to, log };
+    } catch (err: any) {
+      return { ok: false, error: `更新失败：${err?.message || err}` };
+    }
   });
 
   ipcMain.handle('remote:test', async (_event, input: RemoteTargetInput) => {

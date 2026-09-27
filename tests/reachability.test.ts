@@ -172,3 +172,105 @@ describe('同一台机器同时只探一次', () => {
     assert.match(M, /reachability\.fail\(host, verdict\.message\)/);
   });
 });
+
+/*
+ * 「怎么控制远端的版本呢，远端应该也定期更新一下。本地现在是什么版本？」
+ * 「本地的版本你也帮忙看一下，做个类似的功能」。
+ *
+ * 版本差不是"数字不一样"这么轻。实测：远端停在 **1.27.0**、本机 **2.24.1** —— 差一个大版本，
+ * 而 1.27.0 **没有** `--list-models`。于是那台机器的模型清单只能靠"故意传个错模型、
+ * 从参数校验的报错里抠 id"，倍率只能拿本机那份去补；而本机清单被地域过滤（一个 Claude 都没有），
+ * `claude-opus-5.5` 就彻底没有倍率 —— 那正是用户看到的"没有乘数"。
+ * 远端更新到 2.24.1 之后它自己报 2.00x，问题当场消失。
+ */
+describe('kiro-cli 版本：报出来，更新交给人', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('版本比较逐段比数字 —— 字符串比较会说 1.27.0 比 2.24.1 新', async () => {
+    const { isOlderVersion } = await import('../src/main/remotePreflight.ts');
+    assert.equal(isOlderVersion('1.27.0', '2.24.1'), true, '这就是实测遇到的那一对');
+    assert.equal(isOlderVersion('2.24.1', '1.27.0'), false);
+    assert.equal(isOlderVersion('2.24.1', '2.24.1'), false);
+    /* 段内必须按数字比：'9' > '2' 会让 1.9.0 看起来比 1.27.0 新 */
+    assert.equal(isOlderVersion('1.9.0', '1.27.0'), true);
+    assert.equal(isOlderVersion('2.24', '2.24.1'), true, '缺的段当 0');
+    /* **有一边不知道就不下结论** —— "没探过"不等于"旧" */
+    assert.equal(isOlderVersion(undefined, '2.24.1'), false);
+    assert.equal(isOlderVersion('1.0.0', undefined), false);
+  });
+
+  test('preflight 顺路带回远端版本，不额外开一次 ssh', async () => {
+    const { preflightScript, parseKiroVersion } = await import('../src/main/remotePreflight.ts');
+    assert.match(preflightScript(), /KVER /);
+    assert.equal(parseKiroVersion('CPUS 2\nKVER 2.24.1\nMEMMB 3839'), '2.24.1');
+    /* 问不到时是 undefined，而不是某个"看起来很旧"的默认值 */
+    assert.equal(parseKiroVersion('CPUS 2\nKVER \n'), undefined);
+    assert.equal(parseKiroVersion(''), undefined);
+  });
+
+  test('"落后了"一台机器只说一次', () => {
+    assert.match(M, /const remoteVersionWarned = new Set<string>\(\);/);
+    assert.match(M, /remoteVersionWarned\.has\(host\)/);
+    /* 更新之后要把记忆清掉，否则修好了还在提醒 */
+    assert.match(M, /remoteVersionWarned\.delete\(target!\.sshHost\)/);
+  });
+
+  test('**不**自动更新 —— 那个二进制是整台机器共用的', () => {
+    /* 定时自动换掉它 = 版本在你不知道的时候变了，而行为变了的话排查起点会很远 */
+    assert.equal(/setInterval[^;]{0,200}update -y/.test(M), false);
+    const at = M.indexOf("ipcMain.handle('kiro:update'");
+    assert.ok(at > 0);
+    const body = M.slice(at, at + 3200);
+    /* 有会话连着时先说清有几条在用，人再点一次才真更新 */
+    assert.match(body, /needsConfirm: true, inUse: busy/);
+    assert.match(body, /if \(busy && !force\)/);
+    /* 报出前后两个版本号 —— "更新成功了"这句话本身不含信息 */
+    assert.match(body, /changed: !!from && !!to && from !== to/);
+  });
+
+  test('本机和远端一视同仁（本机那条也要拦、缓存也要失效）', () => {
+    const at = M.indexOf("ipcMain.handle('kiro:update'");
+    const body = M.slice(at, at + 3200);
+    /* 本机在用的判据是"没有 remote 的那些会话" */
+    assert.match(body, /filter\(\(e\) => !e\.profile\.remote\?\.sshHost\)\.length/);
+    /* 更新完必须让版本缓存失效，否则界面上还是旧号 */
+    assert.match(body, /localKiroVersionCache = undefined;/);
+    assert.match(body, /await runKiroCli\('update -y', 600_000\)/);
+  });
+
+  test('本机版本问一次就缓存（一次运行里它不会变）', () => {
+    assert.match(M, /let localKiroVersionCache: string \| undefined;/);
+    const at = M.indexOf('async function localKiroVersion()');
+    const body = M.slice(at, at + 500);
+    assert.match(body, /if \(localKiroVersionCache\) return localKiroVersionCache;/);
+  });
+
+  test('远端能自己报清单时就用它的 —— 倍率该来自提供模型的那台机器', async () => {
+    const { parseModelListJson } = await import('../src/main/modelAvailability.ts');
+    /* 2.24.1 起远端和本机是同一个结构 */
+    const real = '{"models":[{"model_name":"claude-opus-5.5","model_id":"claude-opus-5.5",'
+      + '"context_window_tokens":1000000,"rate_multiplier":2.0,"rate_unit":"Credit"}]}';
+    const parsed = parseModelListJson(real);
+    assert.equal(parsed.length, 1);
+    assert.equal(parsed[0].rate_multiplier, 2);
+    /* 前面混了 login shell 的噪音也要能读 */
+    assert.equal(parseModelListJson(`warning: something\n${real}`).length, 1);
+    /* 读不出来返回空数组 → 调用方退回旧探测，而不是"版本旧一点就列不出模型" */
+    assert.deepEqual(parseModelListJson('error: unexpected argument'), []);
+    assert.deepEqual(parseModelListJson(''), []);
+    /* 没有 model_id 的条目不要 —— 它进了缓存就是把"没信息"固化成"信息是空的" */
+    assert.deepEqual(parseModelListJson('{"models":[{"model_name":"x"}]}'), []);
+
+    const at = M.indexOf("ipcMain.handle('acp:list-models'");
+    const body = M.slice(at, at + 4000);
+    assert.match(body, /chat --list-models --format json 2>\/dev\/null \|\| true/);
+    /* 顺序：能问就问，问不到才退回那条"从报错里抠 id" */
+    assert.ok(body.indexOf('parseModelListJson') < body.indexOf('MODEL_PROBE'));
+  });
+
+  test('opus 5.5 的兜底倍率是抄来的真数字', async () => {
+    const { FALLBACK_META } = await import('../src/main/modelMeta.ts');
+    /* 2026-09-27 远端更新到 2.24.1 之后那份真实清单里报的就是 2.00x */
+    assert.equal(FALLBACK_META['claude-opus-5.5']?.rate_multiplier, 2);
+  });
+});

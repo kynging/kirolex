@@ -58,6 +58,31 @@ export function parseModelList(raw: string): string[] {
  * **清单为空时原样返回** —— 没探到清单的时候"换一个"是没有依据的猜测，
  * 而既有的那套（真跑一轮失败再降级）还在，最坏只是慢。
  */
+/**
+ * **`chat --list-models --format json` 的输出** —— 2.24.1 起本机和远端是**同一个结构**。
+ *
+ * 为什么要单独解析而不是复用"从参数校验的报错里抠 id"那条路：那条只给得出 id。而倍率和
+ * 上下文窗口只有这里有 —— 而且是**提供这些模型的那台机器**报的，不用拿本机那份去猜
+ * （本机出口被地域过滤时它一个 Claude 都没有，`claude-opus-5.5` 就只能空着，
+ * 那正是用户看到的"没有乘数"）。
+ *
+ * 宽容一点：拿不到就返回空数组，让调用方退回旧探测。这里抛异常等于"远端版本旧一点就列不出模型"。
+ */
+export function parseModelListJson(raw: string): Array<{
+  model_id?: string; model_name?: string; rate_multiplier?: number;
+  context_window_tokens?: number; description?: string;
+}> {
+  const text = String(raw || '').trim();
+  if (!text) return [];
+  /* 输出前面可能混着 shell 的噪音（login shell 的 banner 之类）—— 从第一个 `{` 开始读 */
+  const at = text.indexOf('{');
+  if (at < 0) return [];
+  let data: any;
+  try { data = JSON.parse(text.slice(at)); } catch { return []; }
+  const list = Array.isArray(data?.models) ? data.models : Array.isArray(data) ? data : [];
+  return list.filter((m: any) => m && typeof m.model_id === 'string' && m.model_id.trim());
+}
+
 export function pickAvailableModel(wanted: string, available: string[], order: string[]): string {
   if (!available.length) return wanted;
   if (available.includes(wanted)) return wanted;

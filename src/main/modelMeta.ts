@@ -42,6 +42,9 @@ export interface ModelMeta {
  */
 export const FALLBACK_META: Record<string, ModelMeta> = {
   auto: { rate_multiplier: 1, context_window_tokens: 1_000_000 },
+  /* 2026-09-27 从**远端**更新到 2.24.1 之后那份真实清单里抄的（它报 2.00x）——
+     这个 id 出现得比上面那份快照晚，所以之前一直是"没有乘数"（`metaFrom: 'none'`）。 */
+  'claude-opus-5.5': { rate_multiplier: 2, context_window_tokens: 1_000_000 },
   'claude-opus-5': { rate_multiplier: 2.2, context_window_tokens: 1_000_000 },
   'claude-sonnet-5': { rate_multiplier: 1.3, context_window_tokens: 1_000_000 },
   'claude-opus-4.8': { rate_multiplier: 2.2, context_window_tokens: 1_000_000 },
