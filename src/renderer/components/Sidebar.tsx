@@ -117,6 +117,13 @@ interface SidebarProps {
   streamingSessionIds: string[];
   attachedSessionIds: string[];
   busyBySession?: Record<string, string>;  connectingSessionIds: string[];
+  /**
+   * **试过、连不上的那些** ——「如果连不上不应该是红色吗」。
+   *
+   * 和"还没连"必须分开：没打开过的会话是灰的（那是正常状态），而**失败过**的要显眼。
+   * 那台机器连不上时每条远程会话都是灰的，和"还没打开"长得一样，只能翻日志才知道坏了。
+   */
+  failedSessionIds?: string[];
   unreadSessionIds: string[];
   /** kiro 原生子代理名单，按会话。左栏那面 tag 就是它 */
   subagentsBySession?: Record<string, SubagentRow[]>;
@@ -484,6 +491,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   attachedSessionIds,
   busyBySession,
   connectingSessionIds,
+  failedSessionIds,
   unreadSessionIds,
   subagentsBySession,
   executorCap,
@@ -642,6 +650,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
     if (busy === 'turn') return 'streaming';
     if (busy === 'reconfiguring' || busy === 'attaching') return 'connecting';
     if (connectingSessionIds.includes(id)) return 'connecting';
+    /*
+      **连不上 → 红**（在 unread/dormant 之前判）。下面那段注释说的"还没 attach 不该报警"仍然成立 ——
+      这里判的不是"没连"，是"连过、失败了"（`failedSessionIds` 只在真的抛错时才加，成功就摘）。
+    */
+    if (failedSessionIds?.includes(id)) return 'alert';
     if (unreadSessionIds.includes(id)) return 'unread';
     const attached = attachedSessionIds.includes(id);
     if (id === currentSessionId && attached) return 'idle';   // focused + live

@@ -653,12 +653,16 @@ button, input, select, textarea {
   opacity: 0.55;
 }
 
-/* Alert = no live executor (and not archived): not warmed up, select to activate. */
+/* Alert = 试过但连不上（"还没连"是 dormant 的灰，两者必须分开）. */
 .session-item .session-dot.alert {
   width: 7px;
   height: 7px;
-  background: #f0883e;
-  box-shadow: 0 0 0 2px rgba(240, 136, 62, 0.25);
+  /*
+    **红，不是橙** ——「如果连不上不应该是红色吗」。这个状态的含义从"还没预热"改成了
+    「**试过、连不上**」（判据见 `statusFor`）—— 那是坏消息，而橙色读起来像"稍等一下"。
+  */
+  background: #e05252;
+  box-shadow: 0 0 0 2px rgba(224, 82, 82, 0.28);
 }
 
 /* Rebuilding history = the chat is LOCKED and owes/replays its context. Must

@@ -1426,3 +1426,50 @@ describe('远程会话建失败不许静默变本地', () => {
     assert.ok(HK.indexOf('const intendedRemoteRef') < HK.indexOf('intendedRemoteRef.current.set'));
   });
 });
+
+/*
+ * 「另外如果连不上不应该是红色吗」。
+ *
+ * 侧栏原来只有两种：绿（连着）和灰（没连）。而 `statusFor` 里明写着"还没 attach 是正常的，
+ * 不该显示成 alert" —— 那条规则本身是对的：一条没打开过的会话理应是灰的。
+ *
+ * 缺的是第三种：**试过、失败了**。那台 EC2 连不上的时候（`Connection timed out during banner
+ * exchange`）每条远程会话都是灰的，和"还没打开"长得一模一样 —— 你只能翻日志才知道它坏了。
+ */
+describe('连不上要显眼', () => {
+  const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+  const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+
+  test('只有**真的失败过**才算 —— 成功就摘掉', () => {
+    assert.match(HK, /const markFailed = \(sid: string \| null\) =>/);
+    assert.match(HK, /const clearFailed = \(sid: string \| null\) =>/);
+    /* attach 成功立刻摘：否则一次抖动之后它会一直红着 */
+    assert.match(HK, /addAttached\(s\.id\);\s*\n\s*clearFailed\(s\.id\);/);
+    /* 建会话失败也算 */
+    assert.match(HK, /markFailed\(id\);\s*\n\s*const why = String/);
+  });
+
+  test('`statusFor` 在 dormant 之前返回 alert，而且判的是"失败过"不是"没连"', () => {
+    assert.match(SB, /if \(failedSessionIds\?\.includes\(id\)\) return 'alert';/);
+    const alertAt = SB.indexOf("return 'alert';");
+    const dormantAt = SB.lastIndexOf("return 'dormant';");
+    assert.ok(alertAt > 0 && alertAt < dormantAt, 'alert 要排在 dormant 兜底之前');
+    /* 原来那条规则要留着 —— 没打开过的会话仍然是灰的 */
+    assert.match(SB, /pending_'\)\) return 'dormant'/);
+  });
+
+  test('颜色是红的（橙色读起来像"稍等一下"）', () => {
+    const at = CSS.indexOf('.session-item .session-dot.alert {');
+    const body = CSS.slice(at, at + 420);
+    assert.match(body, /background: #e05252;/);
+    assert.equal(/#f0883e/.test(body), false, '不许再是橙色');
+  });
+
+  test('接线：hook 导出、App 传下去', () => {
+    const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+    assert.match(HK, /\n    failedSessionIds,/);
+    assert.match(A, /failedSessionIds=\{failedSessionIds\}/);
+    assert.match(SB, /failedSessionIds\?: string\[\];/);
+  });
+});

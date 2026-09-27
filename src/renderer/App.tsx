@@ -637,6 +637,7 @@ const App: React.FC = () => {
     cancelAutoResend,
     interruptedSessionIds,
     connectingSessionIds,
+    failedSessionIds,
     historyLoadingIds,
     paneViews,
     paneFallback,
@@ -3276,6 +3277,7 @@ const App: React.FC = () => {
               attachedSessionIds={attachedSessionIds}
               busyBySession={busyBySession}
               connectingSessionIds={connectingSessionIds}
+              failedSessionIds={failedSessionIds}
               unreadSessionIds={unreadSessionIds}
               subagentsBySession={subagents}
               /* 先问名字再建 —— 建完才问就得再改一次，而"这次跑的是什么"通常在你点它之前就知道了 */

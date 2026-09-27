@@ -329,6 +329,29 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // Session IDs whose executor is currently ATTACHING (spawn/connect in flight).
   // Drives the "connecting" flash dot.
   const [connectingSessionIds, setConnectingSessionIds] = useState<string[]>([]);
+  /**
+   * **连过、而且连不上的那些** ——「如果连不上不应该是红色吗」。
+   *
+   * 侧栏原来只有"绿（连着）"和"灰（还没连）"两种，而 `statusFor` 里明写着"还没 attach 是正常的，
+   * 不该显示成 alert"。那条规则本身对：一条没打开过的会话理应是灰的。
+   *
+   * 缺的是第三种：**试过、失败了**。那台 EC2 连不上的时候（`Connection timed out during banner
+   * exchange`），每条远程会话都是灰的 —— 和"还没打开"一模一样，于是你只能靠翻日志才知道它坏了。
+   * 所以只有**真的失败过**才进这个集合；attach 成功、或者开始跑一轮，就从里面摘掉。
+   */
+  const failedRef = useRef<Set<string>>(new Set());
+  const [failedSessionIds, setFailedSessionIds] = useState<string[]>([]);
+  const markFailed = (sid: string | null) => {
+    if (!sid) return;
+    if (!failedRef.current.has(sid)) {
+      failedRef.current.add(sid);
+      setFailedSessionIds(Array.from(failedRef.current));
+    }
+  };
+  const clearFailed = (sid: string | null) => {
+    if (!sid) return;
+    if (failedRef.current.delete(sid)) setFailedSessionIds(Array.from(failedRef.current));
+  };
   // Sessions whose history is being read from disk. Rendered as a loading state so
   // a cold chat never flashes an empty/"no messages" view before the transcript
   // lands (message bodies are not mirrored into localStorage any more).
@@ -1485,9 +1508,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           try {
             await window.kiroApi.loadSession(s.id, attachCwdFor(s.id), modelForSession(s.id));
             addAttached(s.id);
+            clearFailed(s.id);
           } catch {
-            // best-effort: cap reached, connect failure, or unloadable session.
-            // The chat stays dormant (grey) and attaches on click/send.
+            /*
+              **失败要看得出来** ——「如果连不上不应该是红色吗」。原来这里什么都不做，
+              会话留在灰色（和"还没打开"一模一样），于是那台机器连不上时你只能翻日志才知道。
+              注意"到上限了"也会走到这里 —— 那不算坏，但表现一样是"这条现在用不了"，
+              标出来比装作正常好；attach 成功会立刻摘掉。
+            */
+            markFailed(s.id);
           } finally {
             clearConnecting(s.id);
           }
@@ -2514,6 +2543,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           接着你一发消息，另一条路会**再建一次**，那条路不带 remote —— 于是它变成本地会话。
           「这个新会话怎么还变成了本地的了」就是这么来的，而屏幕上从头到尾没有一个字提示出错。
         */
+        markFailed(id);
         const why = String(err?.message || err);
         mutateSessionMessages(id, (cur) => [...cur, {
           id: `msg_${Date.now()}`,
@@ -4350,6 +4380,7 @@ ${text}`,
     },
     interruptedSessionIds,
     connectingSessionIds,
+    failedSessionIds,
     historyLoadingIds,
     paneViews,
     paneFallback,
