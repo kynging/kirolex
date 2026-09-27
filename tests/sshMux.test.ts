@@ -314,3 +314,106 @@ describe('本地 MCP server 只起一个', () => {
     assert.match(M, /localPort: \(\) => localMcpServer\?\.port\(\) \|\| 0,/);
   });
 });
+
+/*
+ * **杀执行器要杀整棵树** ——「❌ Error invoking remote method 'acp:switch-model':
+ * Error: Session not connected 现在怎么 opus 5 也无法切换过去」。
+ *
+ * 远端是两层：`kiro-cli`（报出来的那个 `$$`）→ `kiro-cli-chat`（**真正握着会话锁的是它**；
+ * `acp --help` 的 usage 行也写着 `kiro-cli-chat acp`，说明 kiro-cli 只是个启动器）。
+ *
+ * 只杀父进程 → 子进程被 reparent 到 1 继续活着 → 锁还在它手上 → 紧接着那次 `session/load`
+ * 撞上"会话在另一个进程里"，ACP 上只报一句 `Internal error`。而换模型那条路是
+ * "杀旧的 → 起新的 → 新的 load 失败 → 回滚也 load 失败"，最后这条会话一个执行器都没有，
+ * 之后每次换模型都是 `Session not connected`。
+ *
+ * 实测：用户连试三次换模型，远端就多三个 PPID==1 的 `kiro-cli-chat`（etime 5:32 / 2:50 / 2:40）。
+ * 顺带确认了模型本身没问题 —— 在那台机器上直接 `kiro-cli chat --model claude-opus-5.5`
+ * 秒回 OK（0.23 credits），而且 `acp --help` 里 `--model` 一字没变（远端是 1.27.0）。
+ */
+describe('断开时杀掉整棵远端进程树', () => {
+  test('先收子孙再收父进程，而且每一步都不许让整句失败', async () => {
+    const { remoteKillTree } = await import('../src/main/acp-client.ts');
+    const sh = remoteKillTree(4242);
+    assert.match(sh, /pgrep -P 4242/, '先找出它的子进程');
+    assert.match(sh, /kill -TERM \$g/, '子进程要杀');
+    assert.match(sh, /kill -TERM \$gg/, '孙子也杀（漏一层就是又一个握着锁的孤儿）');
+    assert.match(sh, /kill -TERM 4242/, '最后才是父进程');
+    /* 顺序要求：父进程死在子进程之后 —— 反过来的话子进程在被杀之前就已经 reparent 了 */
+    assert.ok(sh.indexOf('kill -TERM $g') < sh.lastIndexOf('kill -TERM 4242'));
+    /* `|| true`：某一步"它已经自己走了"不该让后面几步不执行 */
+    assert.ok((sh.match(/\|\| true/g) || []).length >= 3);
+  });
+
+  test('**不**用进程组 —— sshd 不保证给这条命令一个独立的组', async () => {
+    const { remoteKillTree } = await import('../src/main/acp-client.ts');
+    const sh = remoteKillTree(7);
+    /* `kill -- -<pgid>` 打偏会连着这条连接上别的东西一起杀 */
+    assert.equal(/kill\s+--?\s*-\d/.test(sh), false);
+    assert.equal(/pgid/.test(sh), false);
+  });
+
+  test('断开那一支用的就是它', () => {
+    const A = fs.readFileSync(path.join(process.cwd(), 'src/main/acp-client.ts'), 'utf8');
+    assert.match(A, /buildSshArgs\(this\.remote, remoteKillTree\(pid\)\)/);
+    /*
+      老写法（在**调用点**直接拼一句只杀父进程的 kill）不该还在。
+      注意不能光搜 `kill -TERM ${pid}` —— `remoteKillTree` 自己最后一行就是它（那是对的，
+      它在杀完子孙之后才收父进程）。要查的是调用点有没有绕过这个函数。
+    */
+    assert.equal(/buildSshArgs\(this\.remote, `kill/.test(A), false);
+  });
+
+  test('换模型必须先放锁再加载 —— 所以"先起新的"这条路走不通，得靠杀干净', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('acp:switch-model'");
+    const body = M.slice(at, at + 3000);
+    /* kiro-cli 的会话是单进程独占的：同一个 cliSessionId 不可能同时被两个进程 load */
+    assert.match(body, /Session is active in another process/);
+    /* 没连着的时候要说清怎么走出去，而不是一句 Session not connected */
+    assert.match(body, /点一下这条会话（或者直接发一条消息）会自动重连/);
+  });
+});
+
+/*
+ * 「我让它找一个纯远程的项目但它总是在本地找」。
+ *
+ * 没有本地工程时 `localProjectDirOf` 会退回 KiroLex 自己的会话目录
+ * （`~/.kirolex/sessions/<id>/`，里面只有 record.json / transcript.jsonl / history.md），
+ * 而注入里那套"他的仓库和工具链在他机器上、构建测试 git 用 local_bash"照样发了出去 ——
+ * 对一个纯远程的工程这些话是**反的**，于是它拿 `local_grep` 去搜那个会话目录，
+ * 搜不到就回"找不到这个项目"。
+ */
+describe('纯远程工程：别把它往本机引', () => {
+  test('没有本地工程时不讲那套"他的文件在他机器上"', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const noProject = remoteContextBlock({
+      hostLabel: 'tokyo', remoteDir: '/home/ec2-user/work', localDir: '/Users/k/.kirolex/sessions/s_1',
+      hasLocalProject: false,
+    });
+    assert.match(noProject, /这条会话没有本地工程/);
+    assert.match(noProject, /别拿 `local_glob` \/ `local_grep` 去搜用户的 Mac/);
+    /* 那两条会把人引到错的机器上的规则必须消失 */
+    assert.equal(/在\*\*他的工程\*\*上跑构建/.test(noProject), false);
+    assert.equal(/工具链都在那边/.test(noProject), false);
+    /* 但 local_* 本身还在 —— 用户指名的路径、交回产出都要用它 */
+    assert.match(noProject, /local_write/);
+  });
+
+  test('有本地工程时照旧', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const withProject = remoteContextBlock({
+      hostLabel: 'tokyo', remoteDir: '/home/ec2-user/work', localDir: '/Users/k/git/proj',
+      hasLocalProject: true,
+    });
+    assert.match(withProject, /用户的文件在他自己那台机器上/);
+    assert.match(withProject, /在\*\*他的工程\*\*上跑构建/);
+    assert.equal(/这条会话没有本地工程/.test(withProject), false);
+  });
+
+  test('这件事显式传，不从"localDir 有没有值"推', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    /* `localDir` 永远有值（退回会话目录），所以推不出来 */
+    assert.match(M, /hasLocalProject: !!entry\.localDir,/);
+  });
+});

@@ -27,6 +27,18 @@ export interface RemoteContextInput {
   localDir: string;
   /** 这条会话选中的**全部**目录（含 `localDir`，它排第一）。不给就等于只有主目录。 */
   localDirs?: string[];
+  /**
+   * **用户在他机器上真有一个工程吗** ——「我让它找一个纯远程的项目但它总是在本地找」。
+   *
+   * 没有本地工程时 `localDir` 并不是空的：它退回成 KiroLex 自己的会话目录
+   * （`~/.kirolex/sessions/<id>/`，里面只有 record.json / transcript.jsonl / history.md）。
+   * 于是下面那些"他的仓库和工具链在他机器上、构建测试 git 用 local_bash"的话照样注进去了 ——
+   * 而对一个**纯远程**的工程，这些话是反的：它会拿着 `local_grep` 去搜那个会话目录，
+   * 搜不到就说"找不到这个项目"。
+   *
+   * 所以这件事要显式传进来，不能从"`localDir` 有没有值"推。
+   */
+  hasLocalProject?: boolean;
   /** 兼容旧调用点（镜像时代的会话目录），现在不再出现在注入里。 */
   sessionDir?: string;
   /**
@@ -58,7 +70,20 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       用户的项目在他自己机器上，这条会话通过反向隧道调本地工具去读写它。
       所以这里要说的不再是"路径要换算"，而是"用那组工具"。
     */
-    localDir ? localToolsHelp(dirs) : '',
+    /*
+      有本地工程才讲那一套"他的文件在他机器上"。没有的话讲反了比不讲糟：
+      见 `hasLocalProject` 上面那段。
+    */
+    (localDir && input.hasLocalProject !== false) ? localToolsHelp(dirs) : '',
+    input.hasLocalProject === false
+      ? `· **这条会话没有本地工程** —— 用户没给它挑本机目录，所以"项目"就在**你这台机器上**`
+        + `（当前目录 \`${remoteDir}\`）。要找文件、找代码、跑命令，都在这里找，`
+        + `**别拿 \`local_glob\` / \`local_grep\` 去搜用户的 Mac** —— 那边没有这个工程，`
+        + `而 \`local_*\` 的默认目录只是 KiroLex 存这条会话记录的文件夹（里面只有 record.json / `
+        + `transcript.jsonl / history.md），在那儿搜什么都搜不到。`
+        + `\`local_*\` 留着是为了两件事：用户**明确指给你**的本机路径（他会把路径写出来），`
+        + `以及把最终产出用 \`local_write\` 交回他机器上。`
+      : '',
     /*
       **别拿历史里的结论判断自己有没有工具** —— 这条是实测出来的（用户：「我让 agent 测本地
       playwright 它找不到」）。那条会话的工具清单里 `browser_*` / `local_*` 全都在（同一份 agent
@@ -79,7 +104,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       否则它会去找那个文件，然后把"读不到"当成"没有历史"。
     */
     '· 对话历史**随消息带给你**，这台机器上没有 history.md / transcript.jsonl 之类的文件，别去找；'
-      + '用户提到的附件和文件都在他机器上，用 `local_read` 去读。',
+      + '用户提到的**附件**在他机器上，用 `local_read` 去读（他会给出路径）。',
     /*
       **默认在这台机器上干活** ——「在远程会话中记得默认是在远程做，除非文件在本地或提示词中
       用户让在本地操作」。
@@ -94,10 +119,14 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     */
     `· **默认在这台机器上做**：跑命令、装依赖、下载、解压、访问网络、落临时文件 ——`
       + `当前目录 \`${remoteDir}\` 就是你的工作区。这台机器就是给你干活用的，别把这些搬回用户的笔记本。`,
-    '· **什么时候回到用户机器**：① 要读或改的文件在他那边（`local_read` / `local_write`）；'
-      + '② 要在**他的仓库/工程**上跑构建、测试、git —— 文件和工具链都在那边（`local_bash`）；'
-      + '③ 他明说了"在本地/在我机器上"做。'
-      + '其余情况在这里做就行；他要的最终产出用 `local_write` 交回去。',
+    input.hasLocalProject === false
+      ? '· **什么时候回到用户机器**：只有两种 —— ① 他把某个本机路径明确写给你；'
+        + '② 他明说了"在本地/在我机器上"做。其余一律在这里做，'
+        + '产出用 `local_write` 交回去。'
+      : '· **什么时候回到用户机器**：① 要读或改的文件在他那边（`local_read` / `local_write`）；'
+        + '② 要在**他的仓库/工程**上跑构建、测试、git —— 文件和工具链都在那边（`local_bash`）；'
+        + '③ 他明说了"在本地/在我机器上"做。'
+        + '其余情况在这里做就行；他要的最终产出用 `local_write` 交回去。',
     /*
       **浏览器在用户那边** ——「想办法让它打开本地的 chrome 我看看进度」。
       它在远端只能 `curl`，而用户要看的是**页面**。远端没有图形界面，`open`/`xdg-open` 在那儿
@@ -110,8 +139,10 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
     localActionHelp(),
     forwardHelp(input.forwarded || []),
-    '· 在**他的工程**上跑构建 / 测试 / git 要用 `local_bash` —— 那里才有他的 `node_modules`、'
-      + '工具链和仓库；把他的项目拷到这台机器上重装一遍是在做无用功。'
-      + '而与他的工程无关的事（装个工具、拉个数据、跑个脚本）就在这台机器上做。',
+    /* 这条只在**他那边真有工程**时成立；没有的话它会把人往错的机器上引 */
+    input.hasLocalProject === false ? ''
+      : '· 在**他的工程**上跑构建 / 测试 / git 要用 `local_bash` —— 那里才有他的 `node_modules`、'
+        + '工具链和仓库；把他的项目拷到这台机器上重装一遍是在做无用功。'
+        + '而与他的工程无关的事（装个工具、拉个数据、跑个脚本）就在这台机器上做。',
   ].filter(Boolean).join('\n');
 }

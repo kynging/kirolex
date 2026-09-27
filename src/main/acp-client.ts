@@ -379,7 +379,7 @@ export class AcpClient extends EventEmitter {
       const pid = this.remotePid;
       this.remotePid = undefined;
       try {
-        execFile('ssh', [...buildSshArgs(this.remote, `kill -TERM ${pid} 2>/dev/null || true`)],
+        execFile('ssh', [...buildSshArgs(this.remote, remoteKillTree(pid))],
           { timeout: 15_000 }, () => {});
       } catch { /* 收尾失败不该影响断开本身 */ }
     }
@@ -750,6 +750,42 @@ function buildRemoteKiroCommand(model: string, kiroAgent: string | undefined, bi
   let cli = `${shellQuote(bin)} acp --model ${shellQuote(model)}`;
   if (kiroAgent) cli += ` --agent ${shellQuote(kiroAgent)}`;
   return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; exec ${cli}`)}`;
+}
+
+/**
+ * **杀掉那条执行器的整棵树，不是只杀报上来的那个 PID** ——
+ * 「❌ Error invoking remote method 'acp:switch-model': Error: Session not connected」。
+ *
+ * 远端的进程结构是两层：
+ *
+ * ```
+ * kiro-cli （就是 `buildRemoteKiroCommand` 报出来的那个 $$）
+ *   └── kiro-cli-chat   ← 真正握着那条 kiro-cli 会话锁的是**它**
+ * ```
+ *
+ * 只杀父进程的后果不是"少收一个进程"：`kiro-cli-chat` 被 reparent 到 1 之后**继续活着**，
+ * 锁还在它手上。于是紧接着那次 `session/load` 撞上"会话在另一个进程里"，
+ * 而 ACP 上只报一句 `Internal error` —— 换模型那条路是"杀旧的 → 起新的 → 新的 load 失败 →
+ * 回滚也 load 失败"，最后这条会话一个执行器都没有，之后每次换模型都报 `Session not connected`。
+ *
+ * 实测：用户连着试了三次换模型，远端就多了三个 PPID==1 的 `kiro-cli-chat`
+ * （etime 5:32 / 2:50 / 2:40），而 12 个正常进程之外恰好多出这些。这也是把那台 EC2
+ * 压到 CPU 100% 的同一个泄漏 —— 只不过开机那一遍孤儿清理会收掉，所以之前只在**运行中**表现出来。
+ *
+ * 为什么不用进程组（`kill -- -<pgid>`）：sshd 起这条命令时不保证给它一个独立的进程组，
+ * 打偏的话会连着这条连接上别的东西一起杀。所以这里**显式地**先收子进程再收父进程，
+ * 范围是确定的。`|| true` 让每一步都不至于因为"它已经自己走了"而让整句失败。
+ */
+export function remoteKillTree(pid: number): string {
+  /* 两层就够：实测树深就是 2（kiro-cli → kiro-cli-chat）。多写一层是为了"孙子"那种情况，
+     代价只是一句 pgrep —— 而漏掉一层的代价是又一个握着锁的孤儿。 */
+  return [
+    `for g in $(pgrep -P ${pid} 2>/dev/null); do`,
+    `  for gg in $(pgrep -P $g 2>/dev/null); do kill -TERM $gg 2>/dev/null || true; done;`,
+    `  kill -TERM $g 2>/dev/null || true;`,
+    `done;`,
+    `kill -TERM ${pid} 2>/dev/null || true`,
+  ].join(' ');
 }
 
 /** 远端 kiro-cli 自报 PID 用的前缀（stderr 上的一行）。 */

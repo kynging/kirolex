@@ -1994,6 +1994,12 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     remoteDir: entry.cwd,
     localDir: localProjectDirOf(sessionId, entry),
     localDirs: localDirsOf(sessionId, entry),
+    /*
+      **他那边到底有没有工程** ——「我让它找一个纯远程的项目但它总是在本地找」。
+      `entry.localDir` 没有值时 `localProjectDirOf` 会退回 KiroLex 自己的会话目录，
+      那不是"他的工程"，而注入里那些"用 local_bash 跑他的构建"的话会把它引到错的机器上。
+    */
+    hasLocalProject: !!entry.localDir,
     /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
   });
@@ -6411,7 +6417,15 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
     const oldEntry = sessionClients.get(sessionId);
-    if (!oldEntry) throw new Error('Session not connected');
+    /*
+      **说清怎么走出去** —— 实测用户连着撞了三次：换模型失败之后这条会话是 detached 的
+      （回滚那支会把盘上的状态写成实话），于是再点模型下拉就只有一句 `Session not connected`,
+      而它没有告诉任何人下一步该干什么。重连那条路本来就是可靠的 —— 说出来就行。
+    */
+    if (!oldEntry) {
+      throw new Error('这条会话现在没有连着执行器，所以还不能换模型。'
+        + '点一下这条会话（或者直接发一条消息）会自动重连，连上之后再换。');
+    }
     if (oldEntry.busy) throw new Error('Wait for the current response to finish before switching models.');
     if (reconfiguringSessions.has(sessionId)) throw new Error('Another model, Agent, or permission change is still in progress.');
 
@@ -6455,6 +6469,12 @@ app.whenReady().then(async () => {
       } catch (restoreError) {
         logger.warn('switch-model', `failed to restore previous executor sessionId=${sessionId}`, restoreError);
         try { await previous.disconnect(); } catch {}
+        /*
+          **在会话里说一句** —— 只写日志的话用户看到的是"模型没换成，然后这条会话不能用了",
+          而原因（那条 kiro-cli 会话的锁还被上一个进程握着）只有日志里有。
+        */
+        sessionNotice(sessionId, `⚠️ 换模型失败，而且回滚也没成功 —— 这条会话现在没连着执行器。`
+          + `点一下它会自动重连（重连走的是常规那条路，是可靠的）。`);
         /*
           **回滚也失败了 → 把盘上的状态说成实话** —— 实测这条路走过两次（07:59、08:00），
           而记录里还写着 `attached`：于是界面以为它连着，下一次发送答的是「Session not connected」。

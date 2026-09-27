@@ -748,6 +748,12 @@ const App: React.FC = () => {
     catch { return 'claude-opus-5'; }
   });
   const [models, setModels] = useState<any[]>([]);
+  /**
+   * 每台机器一份模型清单（`kirolex-models:<机器>`）—— 详见下面 `refreshModels` 上面那段。
+   * 声明放在这里是因为 `modelForNewChat`（新会话选模型）在那之前就要读它。
+   */
+  const [modelsByMachine, setModelsByMachine] = useState<Record<string, any[]>>({});
+  const askedModels = useRef(new Set<string>());
   /** 型号清单（字符串）—— 注册对话框、Flow 面板、画布的节点详情共用同一份，都是下拉 */
   const modelNames = useMemo(
     () => models.map((model: any) => String(model.model_id || model.id || model)).filter(Boolean),
@@ -2083,12 +2089,41 @@ const App: React.FC = () => {
    * 沿用对话框里选的那台机器：那是"你上一次明确选的目标"，比默默退回本地更符合预期；
    * 没选过（`newChatRemoteId` 为空）时它就是本地，行为和以前一样。
    */
+  /**
+   * **新会话用哪个模型** ——「为什么新远程的默认模型是 gpt？第一顺位应该是 claude opus 5」。
+   *
+   * 原来直接把 `selectedModel` 传下去。而 `selectedModel` 跟着**你正在看的那条会话**走
+   * （下面那个 effect 会把它设成当条会话的模型）—— 所以只要你刚才看的那条会话被降级成
+   * gpt-5.6-sol（本机出口 IP 被地域过滤，本机清单里一个 Claude 都没有，历史上好几条会话
+   * 就是这么降下来的），点「新建」出来的就是 gpt，哪怕这条新会话去的是一台**有** Claude 的远端。
+   *
+   * 所以新会话的模型按两件事定：
+   *   ① 你**明确选过**的那个（`kirolex-last-model` 只在手动切换时写，见 handleModelChange）；
+   *      没有就用 opus 5（= 主进程的 DEFAULT_MODEL）；
+   *   ② 拿**目标机器**的清单去验 —— 不是本机的。远端那台的清单里有 Claude，本机的没有，
+   *      用错一份的表现正是这个 bug。
+   *
+   * 清单问不到（还没探过那台机器）时就直接用候选第一个：那时候没有依据说它不可用，
+   * 而主进程起会话时还会再验一遍（`pickRemoteModel`），不会静默跑错。
+   */
+  const modelForNewChat = useCallback((targetId?: string): string => {
+    let wanted = 'claude-opus-5';   // 必须等于主进程的 DEFAULT_MODEL
+    try { wanted = uiGet('kirolex-last-model') || wanted; } catch {}
+    /* 兜底链和主进程的 MODEL_FALLBACK_ORDER 一致 */
+    const candidates = [wanted, 'claude-opus-5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'deepseek-3.2']
+      .filter((m, i, a) => m && a.indexOf(m) === i);
+    const list = targetId ? (modelsByMachine[targetId] || []) : models;
+    if (!list.length) return candidates[0];
+    const ids = new Set(list.map((m: any) => m?.model_id).filter(Boolean));
+    return candidates.find((m) => ids.has(m)) || candidates[0];
+  }, [models, modelsByMachine]);
+
   const handleNewSessionInProject = useCallback((project: string) => {
     const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);
-    void cwdFor(project).then((cwd) => newSession(cwd, selectedModel, project, undefined, {
+    void cwdFor(project).then((cwd) => newSession(cwd, modelForNewChat(target?.id), project, undefined, {
       remoteId: target?.id, remoteLabel: target?.label,
     }));
-  }, [newSession, homeDir, selectedModel, remoteTargets.targets, newChatRemoteId]);
+  }, [newSession, homeDir, modelForNewChat, remoteTargets.targets, newChatRemoteId]);
 
   // Create a chat from the New Chat dialog, assigning the chosen project (if any)
   // at creation.
@@ -2097,13 +2132,13 @@ const App: React.FC = () => {
       ? (newChatNewProjectName.trim() || undefined)
       : (newChatProject || undefined);
     const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);
-    void cwdFor(proj).then((cwd) => newSession(cwd, selectedModel, proj, undefined, {
+    void cwdFor(proj).then((cwd) => newSession(cwd, modelForNewChat(target?.id), proj, undefined, {
       remoteId: target?.id, remoteLabel: target?.label,
     }));
     setShowNewChat(false);
     setNewChatProject('');
     setNewChatNewProjectName('');
-  }, [newChatProject, newChatNewProjectName, newSession, homeDir, selectedModel]);
+  }, [newChatProject, newChatNewProjectName, newSession, homeDir, modelForNewChat, remoteTargets.targets, newChatRemoteId]);
 
   const confirmDelete = useCallback(() => {
     if (deleteConfirm) {
@@ -2150,8 +2185,7 @@ const App: React.FC = () => {
    *
    * 缓存 key 带机器（`kirolex-models:<机器>`）：这是"哪台机器上有什么"，混在一起就是错的。
    */
-  const [modelsByMachine, setModelsByMachine] = useState<Record<string, any[]>>({});
-  const askedModels = useRef(new Set<string>());
+  /* 声明挪到了 `models` 旁边 —— `modelForNewChat` 在这之前就要读它 */
 
   const refreshModels = useCallback(async (machine = 'local') => {
     const key = `kirolex-models${machine === 'local' ? '' : `:${machine}`}`;
