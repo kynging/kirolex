@@ -148,6 +148,47 @@ export function removeAgentScript(name: string): string {
   return `rm -f ~/.kiro/agents/${name}.json`;
 }
 
+/**
+ * **扫掉远端的孤儿执行器进程** ——「为什么会打爆远程机器，这个 bug 应该修一下」。
+ *
+ * ## 它是怎么打爆的（实测）
+ *
+ * 那台 t3.medium 从 2026-09-25 17:26 UTC 起 CPU 钉在 96%+ 再没下来，`NetworkOut` 恒为 0，
+ * 而 `VolumeReadOps` 是 **46,240/小时**、写只有 1.17 —— 只读不写的死循环。最后 sshd 都排不到
+ * CPU，ssh 停在 banner 交换（TCP 握手成功、用户态永远没机会回那句 banner），SSM Agent 同样饿死，
+ * 只能从 EC2 API 强制 stop/start 才救回来。CPU 是 `unlimited` 模式，所以没有任何限流兜底。
+ *
+ * 源头是**孤儿累积**：远端的 `kiro-cli acp` 不跟着 ssh 退出（无 PTY、也不在 stdin EOF 时退），
+ * 而 KiroLex 被 SIGKILL / 崩溃 / 拔电结束时，`disconnect()` 里那条 `kill -TERM <远端 PID>` 和
+ * `before-quit` 都不会跑。之前在那台机器上一次清出 **85 个**，最老的 2 天 23 小时 ——
+ * 每条会话是 2 个进程（`kiro-cli` + `kiro-cli-chat`），也就是 40 多条会话的残留在同时扫盘。
+ *
+ * ## 判据：PPID == 1
+ *
+ * 活着的执行器一定挂在它那条 sshd 底下（实测 PPID = 11933 / 12181 …）；ssh 一死，它被
+ * reparent 到 **PID 1**。所以"PPID 是 1 且命令行里带我们的 agent 前缀"就是精确的孤儿特征 ——
+ * 不用靠 etime 猜，也不可能误杀一个正在服务的执行器（那个有 sshd 父进程）。
+ *
+ * 连同 `kirolex-local-` 前缀一起判：这台机器上可能还有别人手动起的 kiro-cli，那不是我们的事。
+ */
+export function orphanSweepScript(): string {
+  /* `ps -eo ppid=,pid=,args=`：只看 PPID 为 1、且 args 里带我们前缀的那些 */
+  return [
+    `ps -eo ppid=,pid=,args= | awk '$1==1 && index($0, "${SESSION_AGENT_PREFIX}")>0 {print $2}'`,
+    '> /tmp/.kirolex-orphans || true',
+    '; n=$(wc -l < /tmp/.kirolex-orphans | tr -d " ")',
+    '; [ "$n" -gt 0 ] && xargs -r kill -TERM < /tmp/.kirolex-orphans 2>/dev/null',
+    '; rm -f /tmp/.kirolex-orphans',
+    '; echo "KIROLEX_ORPHANS ${n:-0}"',
+  ].join(' ');
+}
+
+/** `orphanSweepScript` 的输出里那个数字。认不出来返回 0 —— 清垃圾的统计不值得抛错。 */
+export function parseOrphanSweep(out: string): number {
+  const m = /KIROLEX_ORPHANS\s+(\d+)/.exec(String(out || ''));
+  return m ? Number(m[1]) : 0;
+}
+
 /** 扫掉多久没动过的会话 agent 才算孤儿。 */
 export const STALE_AGENT_MINUTES = 12 * 60;
 

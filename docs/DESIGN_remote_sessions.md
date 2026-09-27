@@ -165,6 +165,15 @@ kiro-cli 对不存在的模型是**静默退回**（日志里见过 `Model 'gpt-
   然后下一次 attach 报 `Session is active in another process (PID …)` 并连锁出一串
   `Session not connected`。做法：远端命令先 `echo KIROLEX_REMOTE_PID $$ >&2` 再 `exec`
   （exec 之后 PID 不变），断开时按那个 PID `kill -TERM`；`before-quit` 也补一遍。
+* **孤儿会把那台机器打爆** —— 不是"多几个进程"那种脏，是实测把一台 t3.medium 钉死了：
+  2026-09-25 17:26 UTC 起 CPU 96%+ 再没下来，`NetworkOut` 恒为 0，`VolumeReadOps` **46,240/小时**
+  而写只有 1.17（只读不写的死循环）。最后 sshd 排不到 CPU，ssh 停在
+  `Connection timed out during banner exchange`（TCP 握手成功、用户态永远回不了那句 banner），
+  SSM Agent 同样饿死 —— 只能从 EC2 API `stop --force` 再 `start` 救回来。
+  `CpuCredits: unlimited` 意味着连限流都不会兜一下：它能一直烧，还一直计费加价。
+  所以开机要扫**进程**（不只是那些 agent JSON），判据是 **PPID == 1**：活着的执行器挂在它那条
+  sshd 底下（真机实测 12 个进程 PPID 全不是 1），ssh 一死才被 reparent 到 1。
+  不按 etime 猜 —— 刚起 3 秒的执行器和 3 天的孤儿，差别在父进程而不在年龄。
 * 隧道端口**每次起执行器都换一个**：换 agent / 换模型是"先起新执行器、成功了再关旧的"，
   复用同一个端口会撞上还没退出的旧 ssh —— `ExitOnForwardFailure=yes` 让它直接失败（ssh exit 255），
   看起来像掉线，其实必然发生、重试也必然再撞。

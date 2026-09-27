@@ -43,7 +43,7 @@ import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
-  sweepAgentsScript, STALE_AGENT_MINUTES,
+  sweepAgentsScript, STALE_AGENT_MINUTES, orphanSweepScript, parseOrphanSweep,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
@@ -1716,6 +1716,16 @@ async function sweepRemoteSessionAgents(): Promise<void> {
       const out = await runRemoteCapture(target, sweepAgentsScript());
       const n = Number(String(out).trim().split(/\s+/).pop());
       if (n > 0) logger.info('localmcp', `${target.sshHost}: 扫掉 ${n} 个上次留下的会话 agent（超过 ${STALE_AGENT_MINUTES / 60} 小时没动过）`);
+      /*
+        **孤儿进程也要扫** ——「为什么会打爆远程机器」。agent 文件只是垃圾，孤儿**进程**是病因：
+        实测那台 t3.medium 被它们扫盘扫到 CPU 100%、`VolumeReadOps` 46,240/小时、网络归零，
+        最后 sshd 和 SSM 都饿死，只能从 EC2 API 强制 stop/start 救回来。
+        判据是 PPID==1（见 `orphanSweepScript`）—— 在真机上验过：活着的 12 个 PPID 全不是 1。
+      */
+      const orphans = parseOrphanSweep(await runRemoteCapture(target, orphanSweepScript()));
+      if (orphans > 0) {
+        logger.warn('localmcp', `${target.sshHost}: 杀掉 ${orphans} 个孤儿执行器进程（上次 KiroLex 没能正常退出）`);
+      }
     } catch (err: any) {
       logger.info('localmcp', `${target.sshHost}: 扫会话 agent 没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
     }

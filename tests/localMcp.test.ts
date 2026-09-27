@@ -781,3 +781,59 @@ describe('远端会话 agent 的孤儿清理', () => {
     assert.match(body, /for \(const target of listRemoteTargets\(KIROLEX_CONFIG_PATH\)\)/);
   });
 });
+
+/*
+ * 「为什么会打爆远程机器，这个 bug 应该修一下」。
+ *
+ * ## 它是怎么打爆的（全是实测数字）
+ *
+ * 那台 t3.medium 从 2026-09-25 17:26 UTC 起 CPU 钉在 96%+ 再没下来，`NetworkOut` 恒为 **0**，
+ * `VolumeReadOps` **46,240/小时**而写只有 1.17 —— 只读不写的死循环。最后 sshd 都排不到 CPU：
+ * ssh 停在 `Connection timed out during banner exchange`（TCP 握手成功、用户态永远没机会回 banner），
+ * SSM Agent 同样饿死（`ConnectionLost`），只能从 EC2 API 强制 stop/start 才救回来。
+ * `CpuCredits: unlimited`，所以连限流都不会兜一下 —— 它能一直烧，还一直计费加价。
+ *
+ * ## 源头：孤儿累积
+ *
+ * 远端的 `kiro-cli acp` **不跟着 ssh 退出**（无 PTY、也不在 stdin EOF 时退）。正常断开时
+ * `disconnect()` 会 `kill -TERM <远端 PID>`，`before-quit` 再补一遍 —— 但 KiroLex 被 SIGKILL /
+ * 崩溃 / 拔电结束时两条都不跑。之前在那台机器上一次清出 **85 个**，最老的 2 天 23 小时；
+ * 每条会话是 2 个进程（`kiro-cli` + `kiro-cli-chat`），也就是 40 多条会话的残留同时在扫盘。
+ *
+ * ## 判据：PPID == 1（不是 etime 猜）
+ *
+ * 真机实测：活着的执行器挂在它那条 sshd 底下（PPID = 11933 / 12181 / …，12 个进程全不是 1），
+ * ssh 一死就被 reparent 到 PID 1。所以"PPID 是 1 且命令行带我们的 agent 前缀"是精确特征 ——
+ * 不可能误杀一个正在服务的执行器。
+ */
+describe('远端孤儿执行器进程（打爆机器的那个）', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('判据是 PPID==1 + 我们自己的 agent 前缀', async () => {
+    const { orphanSweepScript, SESSION_AGENT_PREFIX } = await import('../src/main/remoteLocalTools.ts');
+    const sh = orphanSweepScript();
+    assert.match(sh, /\$1==1/, 'PPID 必须是 1 —— 活着的挂在 sshd 底下');
+    assert.ok(sh.includes(SESSION_AGENT_PREFIX), '只碰我们生成的那些（机器上可能有别人手动起的 kiro-cli）');
+    assert.match(sh, /kill -TERM/, 'TERM 不是 KILL —— 给它机会自己收尾');
+    /* 不按 etime 猜：一个刚起 3 秒的执行器和一个 3 天的孤儿，差别在父进程而不在年龄 */
+    assert.equal(/etime|-mmin/.test(sh), false);
+  });
+
+  test('数出来多少个 —— "清了几个"必须能看见', async () => {
+    const { parseOrphanSweep } = await import('../src/main/remoteLocalTools.ts');
+    assert.equal(parseOrphanSweep('KIROLEX_ORPHANS 7'), 7);
+    assert.equal(parseOrphanSweep('KIROLEX_ORPHANS 0'), 0);
+    /* 认不出来当 0 —— 清垃圾的统计不值得抛错 */
+    assert.equal(parseOrphanSweep('乱七八糟'), 0);
+    assert.equal(parseOrphanSweep(''), 0);
+  });
+
+  test('开机跟着 agent 那一遍一起扫，而且杀到人时要 warn（不是 info）', () => {
+    const at = M.indexOf('async function sweepRemoteSessionAgents');
+    const body = M.slice(at, M.indexOf('\n}', M.indexOf('catch (err: any)', at)));
+    assert.match(body, /parseOrphanSweep\(await runRemoteCapture\(target, orphanSweepScript\(\)\)\)/);
+    assert.match(body, /logger\.warn\('localmcp', `\$\{target\.sshHost\}: 杀掉 \$\{orphans\} 个孤儿执行器进程/);
+    /* 失败照旧只记日志 —— 这仍然是清垃圾，不该拦住任何会话 */
+    assert.equal(/throw/.test(body), false);
+  });
+});
