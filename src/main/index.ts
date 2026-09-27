@@ -1606,6 +1606,33 @@ let localMcpServer: LocalMcpServer | undefined;
 const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[] }>();
 
 /**
+ * **只起一个** MCP server ——「重复利用」顺手挖出来的一个真 bug。
+ *
+ * 原来是 `if (!localMcpServer) localMcpServer = await startLocalMcp(...)`。那个 `await`
+ * 前面没有任何闸门，而 `ensureLocalTools` 是**7 条会话同时**进来的：七条都看到
+ * `undefined`，于是**起了七个 HTTP server**（实测 61713–61719 全在 listen），
+ * 而变量最后只剩最后那一个。前六条会话的 token 登记在**变量已经不指向的那些 server** 上。
+ *
+ * 为什么以前没露出来：以前一条会话一个远端端口、一条隧道，各自通向"自己那次"起的那个
+ * server —— 每条会话都恰好能找到自己的 token，七个 server 只是白占端口。
+ * 共用一条隧道之后它立刻致命：隧道通向最后那个 server，于是**六条会话的工具全 404**，
+ * 而且是静默的（模型只会说"这个文件不存在"）。
+ *
+ * 和刚修的端口竞态、preflight 风暴是同一个病：**await 前面少一道"已经有人在做了"的闸门**。
+ */
+let localMcpStarting: Promise<LocalMcpServer> | undefined;
+function ensureLocalMcpServer(): Promise<LocalMcpServer> {
+  if (localMcpServer) return Promise.resolve(localMcpServer);
+  if (localMcpStarting) return localMcpStarting;
+  localMcpStarting = startLocalMcp({
+    log: (level, message) => logger[level]('localmcp', message),
+    notice: (sid, text) => sessionNotice(sid, text),
+  }).then((srv) => { localMcpServer = srv; return srv; })
+    .finally(() => { localMcpStarting = undefined; });
+  return localMcpStarting;
+}
+
+/**
  * 给这条远程会话备好本地工具：登记 token、分配远端端口、在远端写下那条会话专用的 agent。
  *
  * 失败就返回 `undefined` 并说出来 —— **不静默降级**：没有本地工具的远程会话根本读不到用户的
@@ -1619,12 +1646,7 @@ async function ensureLocalTools(
   const remote = profile.remote;
   if (!remote?.sshHost) return undefined;
   try {
-    if (!localMcpServer) {
-      localMcpServer = await startLocalMcp({
-        log: (level, message) => logger[level]('localmcp', message),
-        notice: (sid, text) => sessionNotice(sid, text),
-      });
-    }
+    const server = await ensureLocalMcpServer();
     const agentOverride = sessionAgentName(sessionId, OWNER);
     /*
       **额外目录从记录里现查**，而不是当参数一路传下来：`ensureLocalTools` 有 6 个调用点
@@ -1635,8 +1657,8 @@ async function ensureLocalTools(
     const dirs = [localDir, ...extra]
       .map((d) => String(d || '').replace(/\/+$/, ''))
       .filter((d, i, a) => d && a.indexOf(d) === i);
-    const token = localMcpServer.register({ sessionId, workdir: localDir, dirs });
-    const urlPath = localMcpServer.urlPathFor(sessionId) || `/mcp/${token}`;
+    const token = server.register({ sessionId, workdir: localDir, dirs });
+    const urlPath = server.urlPathFor(sessionId) || `/mcp/${token}`;
     /*
       **端口归机器，不归会话** ——「重复利用」。
 
@@ -1654,7 +1676,7 @@ async function ensureLocalTools(
     */
     const mux = await sshMux.ensure(remote);
     const remotePort = mux.remotePort;
-    localToolsBySession.set(sessionId, { remotePort, localPort: localMcpServer.port(), agentOverride });
+    localToolsBySession.set(sessionId, { remotePort, localPort: server.port(), agentOverride });
     /*
       **远端那个草稿目录要先建出来** —— 实测：`sessionCwd` 给的是
       `<workdir>/scratch/<id>`，而镜像去掉之后**没有任何东西再去创建它**（以前是 rsync 顺手建的）。
@@ -1673,7 +1695,7 @@ async function ensureLocalTools(
       以及按名字就该在本机跑的（`playwright` —— 远端那台没有你在看的那个浏览器）。
     */
     const forwardable = profile.kiroAgent ? forwardableFrom(localAgentJson(profile.kiroAgent)) : [];
-    localMcpServer.setProxies(sessionId, forwardable);
+    server.setProxies(sessionId, forwardable);
     const forwarded = forwardable.map((f) => ({ name: f.name, url: `${mcpUrl(remotePort, urlPath)}/${f.name}` }));
     const agentOut = await runRemoteCapture(remote,
       remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath), forwarded));
@@ -1689,7 +1711,7 @@ async function ensureLocalTools(
       logger.info('localmcp', `远端用它自己的 agent「${usedBase}」做底子 sessionId=${sessionId}`);
     }
     const spec = {
-      remotePort, localPort: localMcpServer.port(), agentOverride,
+      remotePort, localPort: server.port(), agentOverride,
       forwarded: forwarded.map((f) => f.name),
     };
     localToolsBySession.set(sessionId, spec);

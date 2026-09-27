@@ -555,7 +555,9 @@ describe('把本机的 MCP 转发给远端会话', () => {
 
   test('接线：按会话登记代理，并在注入里说清"这些作用在用户机器上"', async () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /localMcpServer\.setProxies\(sessionId, forwardable\);/);
+    /* 取的是 `ensureLocalMcpServer()` 拿回来的那**一个** server —— 见 tests/sshMux.test.ts
+       里「本地 MCP server 只起一个」：读模块变量的话并发启动时会读到被覆盖的那个 */
+    assert.match(M, /server\.setProxies\(sessionId, forwardable\);/);
     assert.match(M, /const forwardable = profile\.kiroAgent \? forwardableFrom\(localAgentJson\(profile\.kiroAgent\)\) : \[\];/);
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
     const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l', forwarded: ['playwright'] });
@@ -622,7 +624,7 @@ describe('会话可以选多个目录', () => {
   test('附加目录从**记录**里现查，不靠 6 个调用点各传一遍', () => {
     /* 漏传一个的表现是"那条会话突然只搜第一个目录了" —— 不报错，只是搜不全 */
     assert.match(M, /const extra = store\.readRecord\(sessionId\)\?\.localDirs \|\| \[\];/);
-    assert.match(M, /localMcpServer\.register\(\{ sessionId, workdir: localDir, dirs \}\)/);
+    assert.match(M, /server\.register\(\{ sessionId, workdir: localDir, dirs \}\)/);
     /* 注入那一份也要是全的 */
     assert.match(M, /localDirs: localDirsOf\(sessionId, entry\),/);
   });

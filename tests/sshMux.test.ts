@@ -269,3 +269,48 @@ describe('ssh 连接复用', () => {
     assert.equal(/allocateRemotePort\(used\)/.test(body), false, '不再按会话分配端口');
   });
 });
+
+/*
+ * **只起一个 MCP server** —— 做「重复利用」时挖出来的一个真 bug（而且是它先存在、复用把它照出来）。
+ *
+ * 原来：`if (!localMcpServer) localMcpServer = await startLocalMcp(...)`。那个 `await` 前面
+ * 没有闸门，而 `ensureLocalTools` 是 7 条会话**同时**进来的 —— 七条都看到 `undefined`，
+ * 于是起了**七个** HTTP server（实测 `lsof` 里 61713–61719 全在 listen），变量只剩最后一个。
+ * 前六条会话的 token 登记在变量已经不指向的那些 server 上。
+ *
+ * 以前不致命：一条会话一条隧道，各自通向"自己那次"起的 server，七个 server 只是白占端口。
+ * 共用一条隧道之后立刻致命 —— 隧道通向最后那个，**六条会话的工具全 404**，而且静默
+ * （实测：7 个 token 里 6 个 404，只有最后登记的那条 200）。模型那边的表现是"这个文件不存在"。
+ *
+ * 和端口竞态、preflight 风暴同一个病：await 前面少一道"已经有人在做了"的闸门。
+ */
+describe('本地 MCP server 只起一个', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('并发进来时复用同一个启动 promise', () => {
+    assert.match(M, /let localMcpStarting: Promise<LocalMcpServer> \| undefined;/);
+    const at = M.indexOf('function ensureLocalMcpServer()');
+    assert.ok(at > 0);
+    const body = M.slice(at, at + 700);
+    /* 三条分支：已经有了 / 正在起 / 自己起 —— 少中间那条就是七个 server */
+    assert.match(body, /if \(localMcpServer\) return Promise\.resolve\(localMcpServer\);/);
+    assert.match(body, /if \(localMcpStarting\) return localMcpStarting;/);
+    assert.match(body, /\.finally\(\(\) => \{ localMcpStarting = undefined; \}\)/);
+  });
+
+  test('`ensureLocalTools` 里不再有裸的 `if (!localMcpServer) await`', () => {
+    const at = M.indexOf('async function ensureLocalTools');
+    const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
+    assert.equal(/if \(!localMcpServer\)/.test(body), false);
+    assert.match(body, /const server = await ensureLocalMcpServer\(\);/);
+    /* 注册和端口都取**这一个** server，不要再读那个可能被覆盖的模块变量 */
+    assert.match(body, /server\.register\(\{ sessionId, workdir: localDir, dirs \}\)/);
+    assert.match(body, /localPort: server\.port\(\)/);
+    assert.equal(/localMcpServer\.(register|port|setProxies|urlPathFor)/.test(body), false);
+  });
+
+  test('隧道的本地端口取的就是那一个 server', () => {
+    /* mux 的 `localPort()` 和会话注册用的必须是同一个 server —— 不然隧道通向一个空的注册表 */
+    assert.match(M, /localPort: \(\) => localMcpServer\?\.port\(\) \|\| 0,/);
+  });
+});
