@@ -735,3 +735,90 @@ describe('中国区：域名后缀不一样', () => {
     assert.match(C, /err\?\.code === 'ENOTFOUND' \|\| err\?\.code === 'EAI_AGAIN'/);
   });
 });
+
+/*
+ * 「测联通ok的话显示个绿色和✅就行了，不用显示什么可读可写」
+ * 「为什么现在桶的配置消失了，这个应该一直在的」。
+ */
+describe('两处显示上的收口', () => {
+  const CONF3 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
+  const UI3 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+  const CSS3 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+
+  test('测连通成功只给一个 ✅，而且是绿的', () => {
+    /*
+      "可读可写（桶 / 区）"那句里没有一个字是人还不知道的：桶和区就在上面两栏里，
+      而"可读可写"正是这颗按钮的定义。
+    */
+    assert.match(CONF3, /\? \(leftover \|\| '✅'\)/);
+    /* 成功不再和普通说明共用灰色 —— 否则"成了"和"这是一段解释"长得一样 */
+    assert.match(CONF3, /msg\.kind === 'bad' \? 'settings-warn' : 'backup-ok'/);
+    assert.match(CSS3, /\.backup-ok \{[\s\S]{0,140}color: var\(--success\);/);
+  });
+
+  test('但"测试对象没删掉"要原样说出来 —— 那是新信息，不是复述', () => {
+    /* 那种情况下桶里真留了个东西，而且可能意味着这个 key 没有 DeleteObject */
+    assert.match(CONF3, /\/没删掉\/\.test\(String\(r\.message \|\| ''\)\)/);
+  });
+
+  test('恢复那一页标题上写清是哪个桶', () => {
+    /* 配置搬去设置之后这一页一个桶名都不显示，"我在从哪儿恢复"没地方看，像是配置丢了 */
+    assert.match(UI3, /className="backup-where"/);
+    assert.match(UI3, /\{where\.bucket\}\{where\.region \? ` \/ \$\{where\.region\}` : ''\}/);
+    /* 还没配桶时也要说，而且指路到设置 */
+    assert.match(UI3, /还没配桶（设置 → ☁️ 备份）/);
+    /* 只读 —— 这一页的职责仍然只是恢复，不许在这儿改配置 */
+    assert.equal(/saveS3Config/.test(UI3), false);
+  });
+});
+
+/*
+ * 「这一页中没用的文字描述都删掉」。
+ *
+ * 砍掉的是实现说明："备份了什么（逐项列一遍）"、"按大小和修改时间跳过没变的"、
+ * "启动 60 秒后补一轮 / 退出前那一下做不了"、"用系统 keychain 加密"、
+ * "桶里的 key 都加这个前缀"。它们的共同点是：看完也不会改变你在这一页的任何一个动作。
+ *
+ * 留下的每一条都要能说出"看了它会做什么不一样的事"。
+ */
+describe('配置页只留有信息量的文字', () => {
+  const CONF4 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
+  /** 只看 JSX 里真会显示出来的文字，不看注释。 */
+  const shown = CONF4.split('\n').filter((l) => !/^\s*(\/\*|\*|\/\/|\{\/\*)/.test(l)).join('\n');
+
+  test('那几段实现说明不在了', () => {
+    for (const gone of [
+      '按大小和修改时间跳过没变的',
+      '启动 60 秒后会补一轮',
+      '崩溃和被强杀根本不会走退出回调',
+      '用系统 keychain 加密后才写进配置',
+      '桶里的 key 都加这个前缀',
+      'record / transcript / history',
+    ]) {
+      assert.equal(shown.includes(gone), false, `"${gone}" 应该删掉了`);
+    }
+  });
+
+  test('留下的两句各有理由', () => {
+    /* ① 凭据会不会被传上去，是个真问题 */
+    assert.match(shown, /不含 <code>config\.json<\/code> 和日志/);
+    /* ② 不说的话人会在这一页找恢复 */
+    assert.match(shown, /恢复在侧栏那颗/);
+  });
+
+  test('Secret 那条只留"需要哪些权限"——那是你真要去授的东西', () => {
+    assert.match(shown, /需要 s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject。/);
+    /* DeleteObject 要在里面：测连通现在写完会删掉那个对象 */
+    assert.match(shown, /DeleteObject/);
+  });
+
+  test('但没有 keychain 那条**警告**要留着 —— 它解释了为什么 Secret 那栏是灰的', () => {
+    /* 警告不是描述：它只在真有问题时出现，而且解释了一个当场看得见的现象 */
+    assert.match(CONF4, /没有可用的加密存储（keychain \/ keyring）/);
+    assert.match(CONF4, /disabled=\{!cfg\.encryptionAvailable\}/);
+  });
+
+  test('"上一次同步"那行状态也留着 —— 它回答"备份到底在不在跑"', () => {
+    assert.match(shown, /上一次：/);
+  });
+});

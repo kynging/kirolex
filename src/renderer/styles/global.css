@@ -8109,3 +8109,25 @@ button, input, select, textarea {
   outline: 2px solid var(--accent, #7c6fe0);
   outline-offset: 2px;
 }
+
+/*
+  恢复那一页标题旁边的「哪个桶」——「为什么现在桶的配置消失了，这个应该一直在的」。
+  配置搬进设置之后这一页一个桶名都不显示，于是"我在从哪儿恢复"没地方看，像是配置丢了。
+  只读：改还是去设置，这一页的职责仍然只是恢复。
+*/
+.backup-where {
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--text-muted);
+  margin-left: 2px;
+}
+
+/*
+  成功那条消息用绿色 ——「测联通ok的话显示个绿色和✅就行了」。
+  原来成功和普通说明共用 `.settings-hint`（灰的），于是"成了"和"这是一段解释"长得一样,
+  人得把那行字读完才知道是哪一种。
+*/
+.backup-ok {
+  /* `--success` 是主题变量（29 行），别在这儿又写一个近似的绿 */
+  color: var(--success);
+}

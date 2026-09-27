@@ -50,6 +50,12 @@ const when = (ms?: number): string => (ms ? new Date(ms).toLocaleString() : '—
 const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+  /*
+    **标题上写清是哪个桶** ——「为什么现在桶的配置消失了」。配置搬去设置之后，这一页
+    一个桶名都不显示，于是"我在从哪儿恢复"这件事没地方看，看起来就像配置丢了。
+    只读地显示，改还是去设置 —— 这一页的职责仍然只是恢复。
+  */
+  const [where, setWhere] = useState<{ bucket?: string; region?: string } | null>(null);
   const [entries, setEntries] = useState<Backup[] | null>(null);
   const [err, setErr] = useState('');
   const [picked, setPicked] = useState<Set<string>>(new Set());
@@ -72,6 +78,15 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
   /* 打开就列 —— 这一页存在的唯一目的就是看这张表 */
   useEffect(() => { void load(); }, [load]);
+
+  useEffect(() => {
+    void (async () => {
+      try {
+        const cfg = await api()?.getS3Config?.();
+        setWhere({ bucket: cfg?.bucket, region: cfg?.region });
+      } catch { /* 拿不到就只显示标题 */ }
+    })();
+  }, []);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') onClose(); };
@@ -146,7 +161,15 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       <div className="overlay" onClick={onClose} />
       <div className="settings-dialog backup-dialog" style={{ width: 'min(680px, 94vw)', height: 'min(78vh, 760px)' }}>
         <div className="settings-header">
-          <h3>☁️ 从备份恢复</h3>
+          <h3>
+            ☁️ 从备份恢复
+            {where?.bucket && (
+              <span className="backup-where"> · {where.bucket}{where.region ? ` / ${where.region}` : ''}</span>
+            )}
+            {where && !where.bucket && (
+              <span className="backup-where"> · 还没配桶（设置 → ☁️ 备份）</span>
+            )}
+          </h3>
           <button className="settings-close" onClick={onClose}>✕</button>
         </div>
 
@@ -206,9 +229,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
           {!!entries?.length && (
             <div className="settings-hint backup-note">
-              本地已有的那些会<b>合并</b>（消息按 id 去重、按时间排序，<code>history.md</code> 重建）；
-              合并前本地那份会挪到 <code>~/.kirolex/trash/</code>，不会真的丢。
-              恢复完重启 KiroLex 才会出现在会话列表里。
+              本地已有的会合并，合并前那份挪进 <code>~/.kirolex/trash/</code>。恢复完要重启 KiroLex。
             </div>
           )}
         </div>

@@ -106,9 +106,20 @@ export const BackupSettings: React.FC = () => {
     try {
       const r = what === 'test' ? await api()?.testS3?.() : await api()?.syncS3Now?.();
       if (r?.ok) {
+        /*
+          **通了就一个 ✅** ——「测联通ok的话显示个绿色和✅就行了，不用显示什么可读可写」。
+          "可读可写（桶 / 区）"那句话里没有一个字是你还不知道的：桶和区就在上面那两栏里，
+          而"可读可写"正是这颗按钮的定义。成了的时候人只需要一眼看到"成了"。
+
+          唯一例外是**测试对象没删掉**那种（`leftover`）：那时桶里真留了个东西，
+          必须原样说出来 —— 那是个新信息，不是复述。
+        */
+        const leftover = what === 'test' && /没删掉/.test(String(r.message || '')) ? String(r.message) : '';
         setMsg({
           kind: 'ok',
-          text: what === 'test' ? (r.message || '通了。') : `传了 ${r.uploaded} 个文件，${r.skipped} 个没变。`,
+          text: what === 'test'
+            ? (leftover || '✅')
+            : `传了 ${r.uploaded} 个文件，${r.skipped} 个没变。`,
         });
       } else setMsg({ kind: 'bad', text: String(r?.error || '失败') });
       await load();
@@ -128,12 +139,15 @@ export const BackupSettings: React.FC = () => {
         </div>
       )}
 
+      {/*
+        **只留还有信息量的那两句** ——「这一页中没用的文字描述都删掉」。
+        砍掉的是"备份了什么、跳过没变的文件、启动 60 秒补一轮"那一堆 —— 那些是实现说明,
+        看完也不会改变你在这一页的任何一个动作。
+        留下的两句各有理由：① 不上传 `config.json`（凭据会不会被传上去是个真问题）；
+        ② 恢复在别的地方（否则人会在这一页找恢复）。
+      */}
       <div className="settings-hint backup-note">
-        备份的是<b>会话本体</b>（record / transcript / history）、<b>记忆层</b>、
-        以及<b>附件和粘贴的图片</b>。不含 <code>config.json</code>（里面是这台机器的路径和远端主机），
-        也不含日志和预览这些本地产物。
-        <br />
-        恢复在侧栏那颗 <b>☁️</b> 里 —— 那里列的是桶里已经备份的会话。
+        只传会话、记忆层和附件，不含 <code>config.json</code> 和日志。恢复在侧栏那颗 <b>☁️</b>。
       </div>
 
       <Field label="Bucket">
@@ -150,7 +164,7 @@ export const BackupSettings: React.FC = () => {
       </Field>
       <Field
         label="Secret"
-        hint="用系统 keychain 加密后才写进配置，界面和日志里都只出现 Access Key 的后 4 位。这个 key 需要对该 bucket 的 s3:PutObject / s3:GetObject / s3:ListBucket。"
+        hint="需要 s3:PutObject / GetObject / ListBucket / DeleteObject。"
       >
         <input className="settings-input" type="password" value={secret}
                placeholder={cfg.hasSecret ? '已保存（留空 = 不改）' : '填一次，之后不再显示'}
@@ -165,7 +179,7 @@ export const BackupSettings: React.FC = () => {
       </Field>
       {/* 唯一可选的那个，所以标在**标签**上而不是塞进 placeholder ——
           placeholder 一填东西就消失了，而"这栏可以不填"是一直成立的事 */}
-      <Field label="Key 前缀（可选）" hint="桶里的 key 都加这个前缀；留空 = 直接放桶根。">
+      <Field label="Key 前缀（可选）">
         <input className="settings-input" value={cfg.prefix}
                onChange={(e) => patch({ prefix: e.target.value })} onBlur={() => void save()} />
       </Field>
@@ -195,10 +209,6 @@ export const BackupSettings: React.FC = () => {
           ))}
         </select>
       </Field>
-      <div className="settings-hint backup-note">
-        只传变化过的文件（按大小和修改时间跳过没变的）。启动 60 秒后会补一轮 ——
-        退出前那一下做不了：崩溃和被强杀根本不会走退出回调，而那正是最需要补的两种情况。
-      </div>
 
       {cfg.last && (
         <div className="settings-value backup-note">
@@ -210,7 +220,7 @@ export const BackupSettings: React.FC = () => {
         <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{cfg.last.error}</div>
       )}
       {msg && (
-        <div className={`backup-note ${msg.kind === 'bad' ? 'settings-warn' : 'settings-hint'}`}
+        <div className={`backup-note ${msg.kind === 'bad' ? 'settings-warn' : 'backup-ok'}`}
              style={{ whiteSpace: 'pre-wrap' }}>{msg.text}</div>
       )}
     </div>
