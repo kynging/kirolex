@@ -3093,7 +3093,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               这个参数原来压根没传：于是上一次远程建失败之后，这条兜底路把它建成了本地会话。
               远程会话**不许悄悄变本地** —— 连不上就该失败，而不是换一台机器把活干了。
             */
-            (pendingId && intendedRemoteRef.current.get(pendingId)) || undefined,
+            /*
+              没记过就用**新会话的默认机器**（`kirolex-new-chat-remote`，见 App 里那段）——
+              「为什么新会话又变成本地了」：这条路原来只看 `intendedRemoteRef`，而一个从侧栏
+              直接开出来的 pending 会话从没经过 `createSession`，那张表里自然没有它 → 建成本地。
+            */
+            (pendingId && intendedRemoteRef.current.get(pendingId))
+              || (() => { try { return uiGet('kirolex-new-chat-remote') || undefined; } catch { return undefined; } })(),
           );
           const prevId = sid;
           sid = newId;

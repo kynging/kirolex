@@ -69,7 +69,10 @@ describe('接线', () => {
     assert.match(body, /reachability\.recentFailure\(host\)/);
     assert.match(body, /for \(let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS/);
     assert.match(body, /if \(!worthRetrying\(verdict\.message\) \|\| attempt === PREFLIGHT_ATTEMPTS\) break;/);
-    assert.match(body, /reachability\.ok\(host\); return verdict\.models/);
+    /* 成功那一支现在还顺路记下那台机器的规格（算并发上限用）—— 所以不再是一行 */
+    assert.match(body, /reachability\.ok\(host\);/);
+    assert.match(body, /return verdict\.models \|\| \[\];/);
+    assert.match(body, /remoteCaps\.set\(host, cap\)/);
     assert.match(body, /reachability\.fail\(host, verdict\.message\)/);
   });
 
@@ -85,5 +88,68 @@ describe('接线', () => {
   test('`force` 留给"人明确要重连"那条路', () => {
     assert.match(M, /opts\?: \{ force\?: boolean \}/);
     assert.match(M, /if \(!opts\?\.force\) \{/);
+  });
+});
+
+/*
+ * 「远程能承受多少个远程 session？这个有限制吧」—— 有，而且实测撞过。
+ *
+ * 那台 t3.medium（2 vCPU / 3.8 GB）上，一条会话是**两个**进程：
+ *   `kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ **155 MB**
+ * 6 条 = 941 MB RSS、load 3.86；并行 attach 还撞出过 `ssh exit 255`（sshd 的 `MaxStartups`）。
+ * 内存上看能塞 15 条以上，但 2 vCPU 先顶不住。
+ *
+ * 而本机那道闸（`MAX_CONCURRENT_SESSIONS`，`computeExecutorCap`）算的是**你这台笔记本**的
+ * RAM/CPU —— 它允许 16 条的时候，远端那台早趴了。所以上限必须按**那台机器**算。
+ */
+describe('每台远端机器的并发上限', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+
+  test('按那台机器的 CPU 和内存算，取小的那个', async () => {
+    const { remoteExecutorCap, REMOTE_MB_PER_SESSION } = await import('../src/main/remotePreflight.ts');
+    /* 实测那台：2 vCPU / 3839 MB → 6（和它当时真在跑的 6 条吻合） */
+    assert.equal(remoteExecutorCap(2, 3839), 6);
+    /* 内存管够但核少 → CPU 说话；核多内存大 → 夹在上限 12 */
+    assert.equal(remoteExecutorCap(2, 64000), 6);
+    assert.equal(remoteExecutorCap(8, 32000), 12);
+    /* 小机器也至少给 2 —— 只能跑 1 条的远程会话没有意义 */
+    assert.equal(remoteExecutorCap(1, 512), 2);
+    assert.equal(REMOTE_MB_PER_SESSION, 155);
+  });
+
+  test('规格拿不到就**不限制** —— 没依据的上限会无缘无故赶走你的会话', async () => {
+    const { remoteExecutorCap, parseSpecs } = await import('../src/main/remotePreflight.ts');
+    assert.equal(remoteExecutorCap(0, 0), 0);
+    assert.equal(remoteExecutorCap(2, 0), 0);
+    assert.deepEqual(parseSpecs('CPUS 2\nMEMMB 3839'), { cpus: 2, memMB: 3839 });
+    assert.deepEqual(parseSpecs('什么都没有'), { cpus: 0, memMB: 0 });
+    /* 0 要当"没依据"，不是"0 核 0 内存" */
+    assert.deepEqual(parseSpecs('CPUS 0\nMEMMB 0'), { cpus: 0, memMB: 0 });
+  });
+
+  test('规格顺着已有的 preflight 报回来，不为它单开一次 ssh', async () => {
+    const { preflightScript } = await import('../src/main/remotePreflight.ts');
+    const sh = preflightScript();
+    assert.match(sh, /echo "CPUS \$\(nproc/);
+    assert.match(sh, /MemTotal/);
+  });
+
+  test('满了先断开最久没用的；都在忙就让它超一条', () => {
+    const at = M.indexOf('function makeRoomOnRemote');
+    const body = M.slice(at, M.indexOf('\n}', M.indexOf('detachExecutor(victim)', at)));
+    assert.match(body, /if \(!cap\) return;/, '没探到规格就不限制');
+    assert.match(body, /if \(id === excludeId \|\| entry\.busy\) continue;/, '不许动正在跑的');
+    assert.match(body, /这次让它超一条/);
+    assert.match(body, /detachExecutor\(victim\)/);
+  });
+
+  test('三条起执行器的路都过这道闸（新建 / attach / 换机器）', () => {
+    assert.equal((M.match(/makeRoomOnRemote\(/g) || []).length, 4, '一处定义 + 三处调用');
+  });
+
+  test('数的是按 sshHost 的执行器，不是 ssh 进程', () => {
+    /* 换模型/换 agent 那一瞬会同时存在新旧两个执行器（先起新的再关旧的），数进程会误判超额 */
+    assert.match(M, /function remoteExecutorCount\(host: string, excludeId\?: string\): number/);
+    assert.match(M, /\(entry\.profile\.remote\?\.sshHost \|\| ''\) === host/);
   });
 });

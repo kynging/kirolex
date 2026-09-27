@@ -34,7 +34,7 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { judgePreflight, preflightScript, MODEL_PROBE, parseModels } from './remotePreflight.ts';
+import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
@@ -1945,6 +1945,61 @@ function localDirsOf(sessionId: string, entry: { localDir?: string; localDirs?: 
 const reachability = new Breaker();
 
 /**
+ * 每台远端机器能同时扛几条会话 —— preflight 报回规格之后算出来的（见 `remoteExecutorCap`）。
+ *
+ * 没有条目 = 还没探到规格 → **不限制**。没依据的上限比没有上限糟：
+ * 它会在一台好机器上无缘无故赶走你的会话。
+ */
+const remoteCaps = new Map<string, number>();
+
+/**
+ * 这台机器上已经有几条活着的执行器。
+ *
+ * 按 `profile.remote.sshHost` 数，而不是数 ssh 进程：换模型/换 agent 那一瞬间会同时存在
+ * 新旧两个执行器（先起新的、成功了再关旧的），数进程会把那一瞬当成超额。
+ */
+function remoteExecutorCount(host: string, excludeId?: string): number {
+  let n = 0;
+  for (const [id, entry] of sessionClients) {
+    if (id === excludeId) continue;
+    if ((entry.profile.remote?.sshHost || '') === host) n += 1;
+  }
+  return n;
+}
+
+/**
+ * **那台机器满了就先腾一条** ——「远程能承受多少个远程 session？这个有限制吧」。
+ *
+ * 和本机那道闸（`MAX_CONCURRENT_SESSIONS`）是两件事：本机那道按你这台笔记本的 RAM/CPU 算，
+ * 而远端那台是 2 vCPU / 3.8 GB 的 t3.medium —— 本机允许 16 条的时候它早就趴了
+ * （实测：6 条 941 MB、load 3.86，并行 attach 还撞出 `ssh exit 255`）。
+ *
+ * 腾的规则和本机一致：只动**空闲**的，优先代价小的（`detachExecutor` 之后下次打开会重连）。
+ * 腾不出来（都在忙）就让它超一条 —— 拒绝一条你正要用的会话，比让那台机器多扛 155 MB 糟。
+ */
+function makeRoomOnRemote(host: string, excludeId?: string): void {
+  const cap = remoteCaps.get(host) || 0;
+  if (!cap) return;
+  while (remoteExecutorCount(host, excludeId) >= cap) {
+    let victim: string | null = null;
+    let oldest = Number.POSITIVE_INFINITY;
+    for (const [id, entry] of sessionClients) {
+      if (id === excludeId || entry.busy) continue;
+      if ((entry.profile.remote?.sshHost || '') !== host) continue;
+      const used = entry.lastUsedAt ?? 0;
+      if (used < oldest) { oldest = used; victim = id; }
+    }
+    if (!victim) {
+      logger.info('remote', `${host} 上已有 ${remoteExecutorCount(host, excludeId)} 条（上限 ${cap}），`
+        + `但都在忙 —— 这次让它超一条（拒绝你正要用的会话更糟）`);
+      return;
+    }
+    logger.info('remote', `${host} 上到上限 ${cap} 条了，先断开最久没用的 ${victim} 腾位置（下次打开会自己重连）`);
+    detachExecutor(victim);
+  }
+}
+
+/**
  * **退避重试 + 整机级熔断** ——「有重试机制吗」：原来没有，一次不成就抛。
  *
  * 判据和理由都在 `reachability.ts`。这里只把它接上：
@@ -1978,7 +2033,24 @@ async function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean })
     verdict = judgePreflight(out.code, out.stdout, out.stderr, remote);
     logger.info('remote', `preflight ${host}: ${verdict.code} — ${verdict.message}`
       + (attempt > 1 ? `（第 ${attempt}/${PREFLIGHT_ATTEMPTS} 次）` : ''));
-    if (verdict.code === 'ok') { reachability.ok(host); return verdict.models || []; }
+    if (verdict.code === 'ok') {
+      reachability.ok(host);
+      /*
+        **记下那台机器的规格** ——「远程能承受多少个远程 session」。上限按**它**算，
+        而不是按本机（`computeExecutorCap` 算的是本机 RAM/CPU）。判据和实测数字见
+        `remoteExecutorCap`。
+      */
+      if (verdict.cpus && verdict.memMB) {
+        const cap = remoteExecutorCap(verdict.cpus, verdict.memMB);
+        const prev = remoteCaps.get(host);
+        remoteCaps.set(host, cap);
+        if (prev !== cap) {
+          logger.info('remote', `${host}: ${verdict.cpus} vCPU / ${verdict.memMB} MB → 同时最多 ${cap} 条远程会话`
+            + `（一条会话 2 个进程 ≈ ${REMOTE_MB_PER_SESSION} MB）`);
+        }
+      }
+      return verdict.models || [];
+    }
     if (!worthRetrying(verdict.message) || attempt === PREFLIGHT_ATTEMPTS) break;
     const wait = backoffMs(attempt);
     logger.info('remote', `preflight ${host}: ${wait}ms 后再试一次（这类失败常在几秒内自愈）`);
@@ -4101,6 +4173,8 @@ app.whenReady().then(async () => {
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
       const remoteModels = await remotePreflight(profile.remote);
       profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
+      /* 那台机器满了先腾一条 —— 见 `makeRoomOnRemote`（和本机那道闸是两件事） */
+      makeRoomOnRemote(profile.remote.sshHost || '', kiroLexId);
     }
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
@@ -6101,6 +6175,8 @@ app.whenReady().then(async () => {
       if (target) {
         const models = await remotePreflight(profile.remote!);
         profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
+        /* 切到这台机器上也要看它满没满 */
+        makeRoomOnRemote(profile.remote!.sshHost || '', sessionId);
       }
       /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
       const cliCwd = sessionCwd(profile, nextLocalDir);
@@ -6990,6 +7066,8 @@ app.whenReady().then(async () => {
         */
         const remoteModels = await remotePreflight(profile.remote);
         profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
+        /* 那台机器满了先腾一条（见 `makeRoomOnRemote`）—— 启动时一堆会话同时 attach 就是靠这道闸压住的 */
+        makeRoomOnRemote(profile.remote.sshHost || '', sessionId);
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId);

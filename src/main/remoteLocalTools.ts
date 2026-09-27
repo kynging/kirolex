@@ -172,13 +172,19 @@ export function removeAgentScript(name: string): string {
  * 连同 `kirolex-local-` 前缀一起判：这台机器上可能还有别人手动起的 kiro-cli，那不是我们的事。
  */
 export function orphanSweepScript(): string {
-  /* `ps -eo ppid=,pid=,args=`：只看 PPID 为 1、且 args 里带我们前缀的那些 */
+  /*
+    **不落盘** —— 第一版把 pid 列表写进 `/tmp/.kirolex-orphans` 再读回来，后台安全审查指出那是
+    可预测的临时文件名：那台机器上任何一个本地用户都能先把它做成指向别处的 symlink，
+    于是我们的重定向去写了别人的文件（TOCTOU + symlink）。而这里压根不需要文件 ——
+    一个变量就够，顺带少两次磁盘往返。
+
+    `ps -eo ppid=,pid=,args=`：只看 PPID 为 1、且 args 里带我们前缀的那些。
+  */
   return [
-    `ps -eo ppid=,pid=,args= | awk '$1==1 && index($0, "${SESSION_AGENT_PREFIX}")>0 {print $2}'`,
-    '> /tmp/.kirolex-orphans || true',
-    '; n=$(wc -l < /tmp/.kirolex-orphans | tr -d " ")',
-    '; [ "$n" -gt 0 ] && xargs -r kill -TERM < /tmp/.kirolex-orphans 2>/dev/null',
-    '; rm -f /tmp/.kirolex-orphans',
+    `pids=$(ps -eo ppid=,pid=,args= | awk '$1==1 && index($0, "${SESSION_AGENT_PREFIX}")>0 {print $2}')`,
+    /* `grep -c .` 而不是 `wc -l`：空字符串在 `echo` 之后仍是一行，`wc -l` 会数成 1 */
+    '; n=$(printf "%s" "$pids" | grep -c . || true)',
+    '; [ "${n:-0}" -gt 0 ] && printf "%s\\n" $pids | xargs -r kill -TERM 2>/dev/null',
     '; echo "KIROLEX_ORPHANS ${n:-0}"',
   ].join(' ');
 }

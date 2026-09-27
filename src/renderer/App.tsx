@@ -1643,7 +1643,23 @@ const App: React.FC = () => {
    * **新建会话时选哪台机器**（空 = 本地）。远程会话见 `docs/DESIGN_remote_sessions.md`：
    * 粒度在会话这一层，所以这个选择只在新建时做一次；`remoteTargets.enabled` 为假时整块不显示。
    */
-  const [newChatRemoteId, setNewChatRemoteId] = useState('');
+  /**
+   * **新会话默认跑在哪台机器上** ——「新建的会话应该刚开始就有远程 tag」
+   * 「为什么新会话又变成本地了」。
+   *
+   * 这个值原来每次启动都是 `''`（= 本地），而两个创建入口（New Chat 对话框、项目里的 ＋）都读它 ——
+   * 于是**每次重启之后建的第一批会话都是本地的**，哪怕你上一次明确选了东京。你看到的
+   * "又变成本地了"就是这个：不是它被改回去了，是它从来没被记住。
+   *
+   * 记在 ui-state 里（`kirolex-new-chat-remote`）：跟着**你上一次明确的选择**走。
+   * 那台机器连不上时新会话会明确失败 —— 那是对的，远程会话不许悄悄变本地（见 `intendedRemoteRef`）。
+   */
+  const [newChatRemoteId, setNewChatRemoteId] = useState(() => {
+    try { return uiGet('kirolex-new-chat-remote') || ''; } catch { return ''; }
+  });
+  useEffect(() => {
+    try { uiSet('kirolex-new-chat-remote', newChatRemoteId); } catch {}
+  }, [newChatRemoteId]);
   const remoteTargets = useRemoteTargets();
   const [newChatProject, setNewChatProject] = useState<string>(''); // '' = none, '__new__' = create
   const [newChatNewProjectName, setNewChatNewProjectName] = useState('');

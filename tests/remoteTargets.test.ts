@@ -118,10 +118,21 @@ describe('接线：渲染进程', () => {
   const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
   const MAIN = fs.readFileSync(path.join(process.cwd(), 'src/renderer/main.tsx'), 'utf8');
 
-  test('新建对话框里有目标选择，且**默认本地**', () => {
+  test('新建对话框里有目标选择，而且**记住你上一次选的那台**', () => {
     assert.match(A, /remoteTargets\.enabled && remoteTargets\.targets\.length > 0/);
     assert.match(A, /<option value="">本地<\/option>/);
-    assert.match(A, /useState\(''\);\s*\n\s*const remoteTargets = useRemoteTargets\(\);/);
+    /*
+      **不再每次启动都退回本地** ——「新建的会话应该刚开始就有远程 tag」
+      「为什么新会话又变成本地了」。
+      这个值原来是 `useState('')`，于是每次重启后建的第一批会话都是本地的，哪怕你上一次
+      明确选了东京 —— 你看到的"又变成本地"不是它被改回去了，是它从来没被记住。
+      落在 ui-state 里，跟着你上一次明确的选择走；没选过仍然是本地（`|| ''`）。
+    */
+    assert.match(A, /uiGet\('kirolex-new-chat-remote'\) \|\| ''/);
+    assert.match(A, /uiSet\('kirolex-new-chat-remote', newChatRemoteId\)/);
+    /* 兜底那条建会话的路也要认这个默认（从侧栏直接开的 pending 会话没经过 createSession） */
+    const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+    assert.match(HK, /uiGet\('kirolex-new-chat-remote'\) \|\| undefined/);
   });
 
   test('创建时把选中的目标传下去', () => {

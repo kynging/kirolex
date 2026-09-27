@@ -16,6 +16,10 @@ export interface Preflight {
   code: PreflightCode;
   /** 远端**实际**支持的模型（问不到时为空数组 —— 那时不该拦，只是没验成）。 */
   models?: string[];
+  /** 那台机器的 vCPU 数（拿不到是 0 —— 那时不做上限判断，见 `remoteExecutorCap`）。 */
+  cpus?: number;
+  /** 那台机器的总内存 MB（拿不到是 0）。 */
+  memMB?: number;
   /** 给人看的一句话：说清是什么问题、下一步干什么。 */
   message: string;
   /** 缺了哪些命令（`missing-tools` 时有值）。 */
@@ -58,6 +62,16 @@ export function preflightScript(tools: string[] = REQUIRED_TOOLS, opts: { models
     `for b in ${tools.join(' ')}; do command -v "$b" >/dev/null 2>&1 && echo "HAVE $b" || echo "MISS $b"; done`,
     /* `whoami` 的输出形状不保证，所以只看它成不成 —— 未登录时 kiro-cli 是非零退出 */
     'if command -v kiro-cli >/dev/null 2>&1; then kiro-cli whoami >/dev/null 2>&1 && echo "AUTH ok" || echo "AUTH no"; fi',
+    /*
+      **顺路把这台机器的规格报回来** ——「远程能承受多少个远程 session？这个有限制吧」。
+      有限制，而且实测撞过：那台 t3.medium（2 vCPU / 3.8 GB）上一条会话是**两个**进程
+      （`kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ 155 MB），6 条就占 941 MB，
+      load 冲到 3.86；并行 attach 时还会撞出 `ssh exit 255`（sshd 的 MaxStartups）。
+      所以上限要按**那台机器**算，而不是按本机的 RAM/CPU（现有的 `computeExecutorCap` 算的是本机）。
+      这两行几乎不花时间，而且顺着已有的探测走 —— 不值得为它单开一次 ssh。
+    */
+    'echo "CPUS $(nproc 2>/dev/null || echo 0)"',
+    'echo "MEMMB $(awk \'/MemTotal/{printf "%d", $2/1024}\' /proc/meminfo 2>/dev/null || echo 0)"',
   ];
   if (opts.models !== false) {
     /* 模型列表：参数校验就会失败，不会真的调模型 */
@@ -107,11 +121,47 @@ export function judgePreflight(
     };
   }
   const models = parseModels(out);
+  const { cpus, memMB } = parseSpecs(out);
   return {
     code: 'ok',
     models,
+    cpus,
+    memMB,
     message: `${host}：kiro-cli 在，也登录了${models.length ? `，${models.length} 个可用模型` : ''}。`,
   };
+}
+
+/** 那台机器的规格（`CPUS n` / `MEMMB n`）。拿不到给 0 —— 0 的含义是"没依据"，下游据此不做判断。 */
+export function parseSpecs(stdout: string): { cpus: number; memMB: number } {
+  const out = String(stdout || '');
+  const n = (re: RegExp): number => {
+    const v = Number(re.exec(out)?.[1]);
+    return Number.isFinite(v) && v > 0 ? v : 0;
+  };
+  return { cpus: n(/^CPUS (\d+)/m), memMB: n(/^MEMMB (\d+)/m) };
+}
+
+/**
+ * **那台机器能同时扛几条远程会话** ——「远程能承受多少个远程 session？这个有限制吧」。
+ *
+ * 实测（那台 t3.medium，2 vCPU / 3.8 GB）：一条会话是**两个**进程 ——
+ * `kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ **155 MB**；6 条占 941 MB RSS，
+ * load 冲到 3.86。内存上看能塞 15 条以上，但 2 vCPU 先顶不住，而并行 attach 还会撞出
+ * `ssh exit 255`（sshd 的 `MaxStartups`）—— 这一晚实测出现过。
+ *
+ * 所以两条线一起卡：内存按 155 MB/条、只用**一半**总内存（那台机器上还有别的东西，
+ * 而且 kiro-cli 的峰值远高于静息值）；CPU 按每核 3 条。取小的那个，夹在 [2, 12]。
+ *
+ * 规格拿不到（0）时返回 0 = **不做限制** —— 没依据的上限比没有上限糟：它会在一台好机器上
+ * 无缘无故赶走你的会话。
+ */
+export const REMOTE_MB_PER_SESSION = 155;
+
+export function remoteExecutorCap(cpus: number, memMB: number): number {
+  if (!cpus || !memMB) return 0;
+  const byMem = Math.floor((memMB * 0.5) / REMOTE_MB_PER_SESSION);
+  const byCpu = cpus * 3;
+  return Math.max(2, Math.min(12, byMem, byCpu));
 }
 
 /** 从预检输出里把模型列表解析出来（ANSI 要脱掉：那一行是 kiro-cli 的错误输出，带色）。 */
