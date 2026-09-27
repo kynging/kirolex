@@ -500,7 +500,9 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     /* 逐条确认的问题不是慢，是每次长得一样 —— 点到第五次就不看了，而其中可能有一条是覆盖 */
     assert.equal((UI.match(/window\.confirm/g) || []).length, 1);
     assert.match(UI, /overwriting\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
-    assert.match(UI, /会被覆盖/);
+    /* 本地已有的那些现在是**合并**（见下面那个 describe），不是覆盖 */
+    /* 原生 confirm 不认 markdown，所以这里用「」而不是 ** */
+    assert.match(UI, /会和本地那份「合并」/);
     assert.match(UI, /不会真的丢/);
   });
 
@@ -513,9 +515,10 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     assert.match(M, /attached: sessionClients\.has\(e\.id\)/);
   });
 
-  test('三种状态各有一个标，"哪几条会覆盖"要看得见', () => {
+  test('三种状态各有一个标，"哪几条会动到本地"要看得见', () => {
     assert.match(UI, /backup-tag warn">正连着/);
-    assert.match(UI, /backup-tag over">会覆盖本地/);
+    /* 本地已有的那些是**合并**（见下面那个 describe），所以这个标也跟着改了 */
+    assert.match(UI, /backup-tag over">会合并/);
     assert.match(UI, /backup-tag new">本地没有/);
     /* 覆盖那个是这一页唯一有破坏性的，颜色要区分开 */
     assert.match(CSS, /\.backup-tag\.over \{[\s\S]{0,160}--warning/);
@@ -562,5 +565,173 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
   test('侧栏那颗 ☁️ 的 tooltip 说清点开是恢复', () => {
     const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
     assert.match(SB, /从备份恢复/);
+  });
+});
+
+/*
+ * 「另外备份是不是应该有合并的功能」→ 选了「真合并进同一条」。
+ *
+ * 为什么这件事**可以**做对：`transcript.jsonl` 是 append-only 的事件流，每行一个 JSON、
+ * 每条带 `id` 和 `ts` —— 所以"按 id 去重、按 ts 排序"是精确答案，不是启发式。
+ * `history.md` 是渲染产物（重建即可），只有 `record.json` 需要一条策略。
+ */
+describe('合并：桶里那份并进本地那条', () => {
+  test('按 id 去重、按 ts 排序，本地的一条不丢', async () => {
+    const { mergeTranscripts } = await import('../src/main/transcriptMerge.ts');
+    const line = (id: string, ts: number, content = id) => JSON.stringify({ id, ts, role: 'user', content });
+    const local = [line('a', 100), line('b', 300)].join('\n') + '\n';
+    const remote = [line('b', 300), line('c', 200)].join('\n') + '\n';
+    const r = mergeTranscripts(local, remote);
+    const ids = r.text.trim().split('\n').map((l) => JSON.parse(l).id);
+    assert.deepEqual(ids, ['a', 'c', 'b'], '按 ts 排序：100 < 200 < 300');
+    assert.equal(r.added, 1, '只有 c 是新的');
+    assert.equal(r.kept, 2);
+    assert.equal(r.clashed, 0, 'b 两边一模一样，不算冲突');
+  });
+
+  test('同 id 不同内容 → **保留本地**，但要数出来', async () => {
+    const { mergeTranscripts } = await import('../src/main/transcriptMerge.ts');
+    const mine = JSON.stringify({ id: 'x', ts: 1, content: '我的' });
+    const theirs = JSON.stringify({ id: 'x', ts: 1, content: '别人的' });
+    const r = mergeTranscripts(`${mine}\n`, `${theirs}\n`);
+    /* 悄悄用远端的覆盖掉用户眼前看到的内容是这里面最坏的结果 */
+    assert.match(r.text, /我的/);
+    assert.equal(/别人的/.test(r.text), false);
+    assert.equal(r.clashed, 1, '"合并完少了一条"必须能解释');
+  });
+
+  test('在**原始行**上合并 —— 折叠后的视图会丢掉 mergeIntoMessageId 事件', async () => {
+    const { mergeTranscripts, parseRawEvents } = await import('../src/main/transcriptMerge.ts');
+    /*
+      `readTranscript()` 会把这种事件折叠进它指向的那条用户消息里。在折叠后的视图上合并,
+      这些事件就消失了 —— 合并回去的 transcript 少掉几段用户实际发过的内容，
+      而且看不出来（文件完整、能解析、只是内容少了）。
+    */
+    const base = JSON.stringify({ id: 'u1', ts: 1, role: 'user', content: '第一段' });
+    const patch = JSON.stringify({ id: 'u1b', ts: 2, role: 'user', content: '第二段', mergeIntoMessageId: 'u1' });
+    const r = mergeTranscripts('', `${base}\n${patch}\n`);
+    assert.equal(parseRawEvents(r.text).length, 2, '两条事件都要在');
+    assert.match(r.text, /mergeIntoMessageId/);
+    /* 而且那条 patch 必须排在它的目标之后 */
+    assert.ok(r.text.indexOf('"u1"') < r.text.indexOf('u1b'));
+  });
+
+  test('原始行**原样保留**，不重新序列化', async () => {
+    const { mergeTranscripts } = await import('../src/main/transcriptMerge.ts');
+    /* re-stringify 会改字段顺序，也会让将来新增、这一版还不认识的字段承担风险 */
+    const weird = '{"ts":5,"id":"z","未来字段":1,"content":"x"}';
+    const r = mergeTranscripts('', `${weird}\n`);
+    assert.equal(r.text.trim(), weird);
+  });
+
+  test('坏行和缺 id 的行丢掉，不让整份合并失败', async () => {
+    const { mergeTranscripts } = await import('../src/main/transcriptMerge.ts');
+    const good = JSON.stringify({ id: 'a', ts: 1 });
+    const r = mergeTranscripts(`${good}\n{"ts":2`, '{"ts":3,"content":"没有 id"}\n');
+    assert.equal(r.text.trim(), good, '末尾被截断的半行、以及没有 id 的行都丢掉');
+  });
+
+  test('record.json：新的赢，但 createdAt 取更早、数组取并集、cliSessionId 保留本地', async () => {
+    const { mergeRecords } = await import('../src/main/transcriptMerge.ts');
+    const local = {
+      id: 's', title: '本地标题', updatedAt: 200, createdAt: 50,
+      localDirs: ['/a'], cliSessionId: 'local-cli', executorState: 'attached',
+    };
+    const remote = {
+      id: 's', title: '远端标题', updatedAt: 300, createdAt: 10,
+      localDirs: ['/b'], cliSessionId: 'remote-cli', executorState: 'attached',
+    };
+    const out = mergeRecords(local, remote);
+    assert.equal(out.title, '远端标题', 'updatedAt 大的赢');
+    assert.equal(out.createdAt, 10, '开始时间不随谁后改一次而变');
+    assert.deepEqual(out.localDirs.sort(), ['/a', '/b'], '两台机器各加过的目录都要留');
+    /* 抄另一台的 cliSessionId 会让下一次 attach 去 load 一个这里不存在的 session */
+    assert.equal(out.cliSessionId, 'local-cli');
+    assert.equal(out.executorState, 'detached', '刚合并完，谁也没连着');
+    assert.ok(out.updatedAt >= 300);
+  });
+
+  test('一边缺就直接用另一边', async () => {
+    const { mergeRecords } = await import('../src/main/transcriptMerge.ts');
+    assert.deepEqual(mergeRecords(null, { id: 'x' }), { id: 'x' });
+    assert.deepEqual(mergeRecords({ id: 'y' }, null), { id: 'y' });
+  });
+
+  test('接线：合并前挪 trash、history.md 重建而不是照抄', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('s3:restore'");
+    const body = M.slice(at, at + 4200);
+    /* 合并是个算法，算法会有 bug —— "选了合并"不等于"愿意拿这条会话赌一次" */
+    assert.match(body, /backedUp = trashDirFor\(KIROLEX_HOME, sessionId\)/);
+    assert.match(body, /mergeTranscripts\(mine, body\.toString\('utf-8'\)\)/);
+    assert.match(body, /mergeRecords\(mine, theirs\)/);
+    /* history.md 照抄远端那份 = 界面上的历史比 transcript 少一半，而且没有任何报错 */
+    assert.match(body, /if \(existed && base === 'history\.md'\) continue;/);
+    assert.match(body, /if \(merged\) refreshHistoryFile\(sessionId\);/);
+    /* 本地没有这条时是纯恢复，没什么可合的 */
+    assert.match(body, /const existed = fs\.existsSync\(localDir\);/);
+  });
+
+  test('界面上那个标改成「会合并」，并说清它不合模型的上下文', () => {
+    const UI2 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+    assert.match(UI2, /backup-tag over">会合并/);
+    assert.equal(/会覆盖本地/.test(UI2), false);
+    /* 这是合并唯一的硬边界，必须在确认框里说 */
+    assert.match(UI2, /模型自己那套上下文在跑过它的那台机器上，不会一起合并/);
+  });
+});
+
+/*
+ * 「getaddrinfo ENOTFOUND kyn-files.s3.cn-northwest-1.amazonaws.com」
+ * 「中国区的url之类和海外不一样哦，你应该对 cn-north-1 和 cn-northwest-1 分开处理」。
+ *
+ * AWS 中国是独立分区（`aws-cn`），域名后缀是 `.amazonaws.com.cn`。少这个 `.cn` 的表现就是
+ * DNS 根本解析不出来 —— 而那条报错长得像断网，不像"域名拼错了"。
+ */
+describe('中国区：域名后缀不一样', () => {
+  test('cn-north-1 / cn-northwest-1 走 .amazonaws.com.cn', async () => {
+    const { hostFor, s3Suffix, isChinaRegion } = await import('../src/main/s3Client.ts');
+    assert.equal(isChinaRegion('cn-northwest-1'), true);
+    assert.equal(isChinaRegion('cn-north-1'), true);
+    assert.equal(isChinaRegion('CN-NORTH-1'), true, '大小写不该影响它');
+    assert.equal(isChinaRegion('ap-northeast-1'), false);
+    assert.equal(isChinaRegion(undefined), false);
+    assert.equal(s3Suffix('cn-north-1'), 'amazonaws.com.cn');
+    assert.equal(s3Suffix('us-east-1'), 'amazonaws.com');
+
+    const creds = (region: string): any => ({ bucket: 'kyn-files', region, accessKeyId: 'a', secretAccessKey: 'b' });
+    /* 用户实测撞上的就是这一条 */
+    assert.equal(hostFor(creds('cn-northwest-1')), 'kyn-files.s3.cn-northwest-1.amazonaws.com.cn');
+    assert.equal(hostFor(creds('cn-north-1')), 'kyn-files.s3.cn-north-1.amazonaws.com.cn');
+    assert.equal(hostFor(creds('ap-northeast-1')), 'kyn-files.s3.ap-northeast-1.amazonaws.com');
+  });
+
+  test('判据是 `cn-` 前缀，不是把两个区名写死', async () => {
+    const C = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Client.ts'), 'utf8');
+    /* 这是分区的规则而不是这两个区的特例（将来加区也是 cn- 开头） */
+    assert.match(C, /\/\^cn-\/\.test/);
+  });
+
+  test('手填的 endpoint 优先 —— 那是用户明确指定的', async () => {
+    const { hostFor } = await import('../src/main/s3Client.ts');
+    assert.equal(
+      hostFor({ bucket: 'b', region: 'cn-north-1', endpoint: 'https://s3.example.com/' } as any),
+      's3.example.com',
+    );
+  });
+
+  test('DNS 失败给一句能照着改的提示，而不是原样抛 ENOTFOUND', async () => {
+    const { dnsHint } = await import('../src/main/s3Client.ts');
+    const cn = dnsHint({ bucket: 'kyn-files', region: 'cn-northwest-1' } as any, 'kyn-files.s3.cn-northwest-1.amazonaws.com.cn');
+    assert.match(cn, /一般不是网络问题/);
+    assert.match(cn, /kyn-files/);
+    assert.match(cn, /amazonaws\.com\.cn/);
+    /* 海外区要点名"这桶是不是在中国区" —— 那是唯一一个看起来完全正常的错法 */
+    const oversea = dnsHint({ bucket: 'b', region: 'us-east-1' } as any, 'b.s3.us-east-1.amazonaws.com');
+    assert.match(oversea, /cn-north-1/);
+    assert.match(oversea, /cn-northwest-1/);
+
+    const C = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Client.ts'), 'utf8');
+    assert.match(C, /err\?\.code === 'ENOTFOUND' \|\| err\?\.code === 'EAI_AGAIN'/);
   });
 });

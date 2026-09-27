@@ -20,7 +20,12 @@
  * ## 三种行不能长得一样
  *
  * · **本地没有** → 纯新增，没有风险；
- * · **本地已有** → 恢复会**覆盖**（覆盖前挪进 `~/.kirolex/trash/`，但那是"能找回"，不是"没发生"）；
+ * · **本地已有** → **合并**（「备份是不是应该有合并的功能」）：transcript 按 id 去重、
+ *   按 ts 排序并进本地那条，`history.md` 重建。合并前本地那份照旧挪进 `~/.kirolex/trash/` ——
+ *   合并是个算法，而算法会有 bug。
+ *   **要说清它的边界**：合并修好的是"人看的那份记录"，不是"模型的上下文"——
+ *   模型记的是 kiro-cli 自己那套 session（在跑过它的那台机器上），合进来的那半段
+ *   只能靠随消息带的快照进到模型眼里。
  * · **正连着** → 主进程会直接拒（内存里那份会把恢复的内容盖回去）。这种**不给勾** ——
  *   让人勾上、点了、再收到一句拒绝是最差的：多选恢复时那一条会夹在一堆成功里被漏掉。
  */
@@ -98,9 +103,10 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     const lines = [
       `要恢复 ${chosen.length} 条会话。`,
       ...(overwriting.length
-        ? ['', `其中 ${overwriting.length} 条本地已经有了，会被覆盖：`,
+        ? ['', `其中 ${overwriting.length} 条本地已经有了，会和本地那份「合并」（按消息 id 去重、按时间排序）：`,
           ...overwriting.map((e) => `  · ${e.title || e.id}`),
-          '', '（覆盖前那几份会挪到 ~/.kirolex/trash/，不会真的丢。）']
+          '', '（合并前那几份会挪到 ~/.kirolex/trash/，不会真的丢。）',
+          '注意：合并的是聊天记录本身；模型自己那套上下文在跑过它的那台机器上，不会一起合并。']
         : ['', '本地都没有这几条，纯新增。']),
       '', '继续？',
     ];
@@ -114,7 +120,10 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     for (const e of chosen) {
       try {
         const r = await api()?.restoreS3Session?.(e.id);
-        if (r?.ok) { ok.push(e.title || e.id); files += Number(r.restored) || 0; }
+        if (r?.ok) {
+          ok.push(`${e.title || e.id}${r.merged ? `（并进 ${r.merged.added} 条${r.merged.clashed ? `，${r.merged.clashed} 条同 id 保留本地` : ''}）` : ''}`);
+          files += Number(r.restored) || 0;
+        }
         else bad.push(`${e.title || e.id}：${r?.error || '失败'}`);
       } catch (x: any) {
         bad.push(`${e.title || e.id}：${x?.message || x}`);
@@ -126,7 +135,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setMsg({
       kind: bad.length ? 'bad' : 'ok',
       text: [
-        ok.length ? `已恢复 ${ok.length} 条（${files} 个文件）。重启 KiroLex 后它们会出现在列表里。` : '',
+        ok.length ? `已处理 ${ok.length} 条（${files} 个文件）：\n${ok.map((x) => `  · ${x}`).join('\n')}\n重启 KiroLex 后它们会出现在列表里。` : '',
         bad.length ? `有 ${bad.length} 条没成：\n${bad.join('\n')}` : '',
       ].filter(Boolean).join('\n'),
     });
@@ -154,7 +163,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
               {busy === 'restore' ? '恢复中…' : `恢复选中的${chosen.length ? ` ${chosen.length} 条` : ''}`}
             </button>
             {!!overwriting.length && (
-              <span className="settings-hint">其中 {overwriting.length} 条会覆盖本地</span>
+              <span className="settings-hint">其中 {overwriting.length} 条会和本地合并</span>
             )}
           </div>
 
@@ -187,7 +196,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                   {e.attached
                     ? <span className="backup-tag warn">正连着</span>
                     : e.existsLocally
-                      ? <span className="backup-tag over">会覆盖本地</span>
+                      ? <span className="backup-tag over">会合并</span>
                       : <span className="backup-tag new">本地没有</span>}
                   <span className="backup-restore-meta">{kb(e.bytes)} · {when(e.updatedAt)}</span>
                 </label>
@@ -197,7 +206,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
           {!!entries?.length && (
             <div className="settings-hint backup-note">
-              覆盖前本地那份会挪到 <code>~/.kirolex/trash/</code>，不会真的丢。
+              本地已有的那些会<b>合并</b>（消息按 id 去重、按时间排序，<code>history.md</code> 重建）；
+              合并前本地那份会挪到 <code>~/.kirolex/trash/</code>，不会真的丢。
               恢复完重启 KiroLex 才会出现在会话列表里。
             </div>
           )}

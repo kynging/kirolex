@@ -15,6 +15,7 @@ import {
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
 } from './s3Sync.ts';
+import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -4227,26 +4228,70 @@ app.whenReady().then(async () => {
       const objects = await listObjects(creds!, prefix);
       if (!objects.length) return { ok: false, error: `桶里没有 ${sessionId} 的文件。` };
 
-      /* 覆盖之前先把本地那份挪走 —— "选了覆盖"不等于"愿意丢掉" */
       const localDir = path.join(KIROLEX_HOME, 'sessions', sessionId);
+      const existed = fs.existsSync(localDir);
+      /*
+        **动手之前先把本地那份挪走** —— 合并也一样：合并是个算法，算法会有 bug，
+        而"选了合并"不等于"愿意拿这条会话赌一次"。挪进 trash 的代价只是一点磁盘。
+      */
       let backedUp: string | null = null;
-      if (fs.existsSync(localDir)) {
+      if (existed) {
         backedUp = trashDirFor(KIROLEX_HOME, sessionId);
         fs.mkdirSync(path.dirname(backedUp), { recursive: true });
         fs.cpSync(localDir, backedUp, { recursive: true });
       }
 
+      /*
+        **本地已经有这条 → 合并，而不是覆盖** ——「备份是不是应该有合并的功能」。
+
+        判据在 `transcriptMerge.ts`：transcript 是 append-only 的事件流、每条带 id 和 ts，
+        所以"按 id 去重、按 ts 排序"是精确答案而不是猜。本地没有这条时就是纯恢复。
+      */
+      let merged: { added: number; clashed: number } | undefined;
       let restored = 0;
       for (const obj of objects) {
         const rel = relFor(cfg.prefix, obj.key);
         if (!rel) continue;                                  // 不属于这个布局 / 含 `..`
         const abs = path.join(KIROLEX_HOME, rel);
+        const body = await getObject(creds!, obj.key);
+        const base = path.basename(rel);
+
+        if (existed && base === 'transcript.jsonl') {
+          const mine = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : '';
+          const r = mergeTranscripts(mine, body.toString('utf-8'));
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, r.text);
+          merged = { added: r.added, clashed: r.clashed };
+          restored += 1;
+          continue;
+        }
+        if (existed && base === 'record.json') {
+          let mine: any;
+          try { mine = JSON.parse(fs.readFileSync(abs, 'utf-8')); } catch { mine = undefined; }
+          let theirs: any;
+          try { theirs = JSON.parse(body.toString('utf-8')); } catch { theirs = undefined; }
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, JSON.stringify(mergeRecords(mine, theirs), null, 2));
+          restored += 1;
+          continue;
+        }
+        /*
+          合并完 `history.md` 是**过期**的（它是 transcript 的渲染产物）。所以合并那条路上
+          不要把远端那份写下来 —— 下面从合并后的 transcript 重建。直接抄过来的表现是
+          "界面上的历史比 transcript 少一半"，而且没有任何报错。
+        */
+        if (existed && base === 'history.md') continue;
+
         fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, await getObject(creds!, obj.key));
+        fs.writeFileSync(abs, body);
         restored += 1;
       }
-      logger.info('s3', `恢复 ${sessionId}：${restored} 个文件${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
-      return { ok: true, restored, backedUp };
+      /* 合并之后重建 history.md —— 它是渲染产物，不是数据 */
+      if (merged) refreshHistoryFile(sessionId);
+      logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
+        + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
+        + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
+      return { ok: true, restored, backedUp, merged };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };

@@ -63,10 +63,59 @@ export function hintFor(status: number, code: string, xml = ''): string {
   return '';
 }
 
-function hostFor(creds: S3Creds): string {
+/**
+ * **中国区的域名后缀不一样** ——「getaddrinfo ENOTFOUND kyn-files.s3.cn-northwest-1.amazonaws.com」
+ * 「中国区的url之类和海外不一样哦，你应该对 cn-north-1 和 cn-northwest-1 分开处理」。
+ *
+ * AWS 中国是**独立分区**（`aws-cn`），域名后缀是 `.amazonaws.com.cn`：
+ *
+ *   · `cn-north-1`（北京）     → `<bucket>.s3.cn-north-1.amazonaws.com.cn`
+ *   · `cn-northwest-1`（宁夏） → `<bucket>.s3.cn-northwest-1.amazonaws.com.cn`
+ *
+ * 少这个 `.cn` 的表现正是用户看到的那条：DNS 根本解析不出来（`ENOTFOUND`），
+ * 而那条报错长得像"网络有问题"，不像"域名拼错了"——所以下面 `hintFor` 那边也要认这个错。
+ *
+ * 判据用 `cn-` 前缀而不是把两个区名写死：这是分区的规则，不是这两个区的特例
+ * （将来加区也是 `cn-` 开头）。签名那边不用改 —— `aws-cn` 的 SigV4 scope 仍然是
+ * `<region>/s3/aws4_request`，和主分区同一个形状。
+ */
+export function isChinaRegion(region?: string): boolean {
+  return /^cn-/.test(String(region || '').trim().toLowerCase());
+}
+
+/** 这个区的 S3 域名后缀。 */
+export function s3Suffix(region?: string): string {
+  return isChinaRegion(region) ? 'amazonaws.com.cn' : 'amazonaws.com';
+}
+
+/**
+ * DNS 解析不了时给一句**能照着改**的提示。
+ *
+ * 三种可能，按"改起来最便宜"排：桶名拼错 → 区写错 → 中国区/海外的后缀混了。
+ * 最后这一条要点名，因为它是唯一一个"看起来完全正常"的错法。
+ */
+export function dnsHint(creds: S3Creds, host: string): string {
+  const parts = [
+    `解析不出这个域名，所以还没到 AWS 就断了 —— 一般不是网络问题，是下面三个之一：`,
+    `· bucket 名拼错了（现在是 \`${creds.bucket || '(空)'}\`）；`,
+    `· region 写错了（现在是 \`${creds.region || '(空)'}\`）；`,
+  ];
+  if (isChinaRegion(creds.region)) {
+    parts.push(`· 中国区（\`aws-cn\` 分区）的域名后缀是 \`.amazonaws.com.cn\` —— `
+      + `KiroLex 已经按这个拼了（\`${host}\`），如果你在「Key 前缀」旁边那个 endpoint 里`
+      + `手填过地址，检查一下它是不是漏了 \`.cn\`。`);
+  } else {
+    parts.push(`· 如果这个桶在**中国区**（北京 \`cn-north-1\` / 宁夏 \`cn-northwest-1\`），`
+      + `region 必须填成那两个之一 —— 中国区是独立分区，域名后缀是 \`.amazonaws.com.cn\`，`
+      + `填成海外的区就会拼出一个不存在的域名。`);
+  }
+  return parts.join('\n');
+}
+
+export function hostFor(creds: S3Creds): string {
   if (creds.endpoint) return creds.endpoint.replace(/^https?:\/\//, '').replace(/\/+$/, '');
   /* us-east-1 也用带 region 的 host：它同样有效，而少一条分支就少一个只在某个区触发的 bug */
-  return `${creds.bucket}.s3.${creds.region}.amazonaws.com`;
+  return `${creds.bucket}.s3.${creds.region}.${s3Suffix(creds.region)}`;
 }
 
 interface RawResult { status: number; body: Buffer; headers: Record<string, string | string[] | undefined> }
@@ -100,7 +149,19 @@ function request(
       res.on('end', () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks), headers: res.headers }));
     });
     req.on('timeout', () => { req.destroy(new Error(`S3 请求超过 ${timeoutMs / 1000}s 没响应`)); });
-    req.on('error', reject);
+    /*
+      **DNS 失败要说清它不是"网络坏了"** —— 实测用户拿到的是
+      `getaddrinfo ENOTFOUND kyn-files.s3.cn-northwest-1.amazonaws.com`，
+      而那句话看起来像断网，其实是**域名拼不出来**：桶名错、区写错，或者中国区少了 `.cn`。
+      原样抛给界面的代价是人跑去查网络，而问题在配置的三个字里。
+    */
+    req.on('error', (err: any) => {
+      if (err?.code === 'ENOTFOUND' || err?.code === 'EAI_AGAIN') {
+        reject(new S3Error(0, err.code, `连不上 ${host}（${err.code}）`, dnsHint(creds, host)));
+        return;
+      }
+      reject(err);
+    });
     if (payload.length) req.write(payload);
     req.end();
   });
