@@ -1379,3 +1379,50 @@ describe('每台机器（含本机）都能配三个 CLI 的启动命令', () =>
     assert.match(R, /claude 启动命令（暂未使用）/);
   });
 });
+
+/*
+ * 「创建新远程 session 的时候仍会报模型不可用…然后不知道怎么就变成 claude 5 不可用了」
+ * +「这个新会话怎么还变成了本地的了，WTF」——**两个症状，一个原因。**
+ *
+ * 实测那次远端 EC2 是连不上的（`nc 22` 通、ping 85ms 0 丢包，但 ssh
+ * `Connection timed out during banner exchange` —— TCP 握手成功而 sshd 连 banner 都发不出来）。
+ * 于是：
+ *
+ *   1. `createSession` 里 `newSession` 抛错，而那个 `catch` **只 clearConnecting**、把异常吞掉，
+ *      promise 照样 resolve —— 界面上那条会话看着像建好了，徽标还挂着远端的名字，执行器却不存在，
+ *      而屏幕上从头到尾没有一个字提示出错；
+ *   2. 你接着发消息，`sendMessage` 那条兜底路**再建一次**，而它压根没传 remoteId ——
+ *      于是这条你明确建成远程的会话变成了本地的；
+ *   3. 本地清单里一个 Claude 都没有（出口 IP 地域过滤），所以紧接着就是「claude-opus-5 不可用」。
+ *
+ * 远程会话**不许悄悄变本地**：连不上就该失败，而不是换一台机器把活干了。
+ */
+describe('远程会话建失败不许静默变本地', () => {
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+
+  test('建失败要抛出去，并在会话里说一句', () => {
+    const at = HK.indexOf('const createPromise = (async (): Promise<string> =>');
+    assert.ok(at > 0);
+    const body = HK.slice(at, at + 2600);
+    assert.match(body, /⚠️ 这条会话没连上：/);
+    assert.match(body, /throw err;/, '吞掉异常 = 上层以为建成功了');
+    /* 光 clearConnecting 不算处理 */
+    assert.equal(/\} catch \{\s*\n\s*clearConnecting\(id\);\s*\n\s*\} finally/.test(body), false);
+  });
+
+  test('兜底那条建会话的路要带上本来那台机器', () => {
+    const at = HK.indexOf('if (!sid || sid.startsWith(\'pending_\')) {', HK.indexOf('const pendingId = sid;'));
+    assert.ok(at > 0);
+    const body = HK.slice(at, at + 1600);
+    assert.match(body, /intendedRemoteRef\.current\.get\(pendingId\)/);
+    assert.match(body, /远程会话\*\*不许悄悄变本地\*\*/);
+  });
+
+  test('记的是配置里的 id，不是给人看的 label', () => {
+    /* `remoteHost` 是 label，按 label 反查一旦查不到就会传 undefined —— 那又是"变成本地" */
+    assert.match(HK, /const intendedRemoteRef = useRef<Map<string, string>>\(new Map\(\)\);/);
+    assert.match(HK, /if \(opts\?\.remoteId\) intendedRemoteRef\.current\.set\(id, opts\.remoteId\);/);
+    /* 声明必须在使用之前（同一个组件体里，读起来不该像 TDZ） */
+    assert.ok(HK.indexOf('const intendedRemoteRef') < HK.indexOf('intendedRemoteRef.current.set'));
+  });
+});

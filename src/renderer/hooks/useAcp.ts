@@ -2416,6 +2416,18 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * `kiroAgent` is a parameter because a run's steps must execute under the skill's agent — 「skill必须搭配agent
    * 配置」. Its tools live in that agent's MCP servers; created under the default agent the step has none.
    */
+  /**
+   * **这条会话本来要跑在哪台机器上** ——「这个新会话怎么还变成了本地的了，WTF」。
+   *
+   * 建会话失败之后（比如远端连不上），发消息那条路会**再建一次**，而它原来不带 `remoteId` ——
+   * 于是一条你明确建成远程的会话静默变成本地的，接着本地没有 Claude，你看到的是
+   * 「claude-opus-5 不可用」。两个症状，一个原因。
+   *
+   * 记在这里而不是从 `sessions` 里读 `remoteHost`：那个字段是**给人看的 label**，
+   * 而 IPC 要的是配置里的 id，按 label 反查一旦查不到就会传 `undefined` —— 那又是"变成本地"。
+   */
+  const intendedRemoteRef = useRef<Map<string, string>>(new Map());
+
   const newSession = useCallback(async (
     cwd: string,
     model: string = DEFAULT_MODEL,
@@ -2485,6 +2497,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
     // Register the in-flight creation so a send before connect finishes awaits
     // this same attach (id is already stable, so no swap — just gate readiness).
+    if (opts?.remoteId) intendedRemoteRef.current.set(id, opts.remoteId);
     const createPromise = (async (): Promise<string> => {
       try {
         await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId);
@@ -2493,8 +2506,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // spawned, so mark it attached immediately -> the sidebar dot goes green
         // right away (no lazy "dormant until first message" state).
         addAttached(id);
-      } catch {
+      } catch (err: any) {
         clearConnecting(id);
+        /*
+          **失败要说出来** —— 原来这里只 `clearConnecting`，异常被吞掉、promise 照样 resolve，
+          于是界面上那条会话看着像建好了（徽标还挂着远端的名字），而执行器根本不存在。
+          接着你一发消息，另一条路会**再建一次**，那条路不带 remote —— 于是它变成本地会话。
+          「这个新会话怎么还变成了本地的了」就是这么来的，而屏幕上从头到尾没有一个字提示出错。
+        */
+        const why = String(err?.message || err);
+        mutateSessionMessages(id, (cur) => [...cur, {
+          id: `msg_${Date.now()}`,
+          role: 'kirolex' as any,
+          content: `⚠️ 这条会话没连上：${why}`,
+          timestamp: Date.now(),
+        } as Message]);
+        throw err;                       // 让 await 这个 promise 的那一侧知道它失败了
       } finally {
         creatingRef.current.delete(id);
       }
@@ -3031,6 +3058,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             pendingProjectId,
             undefined,
             permissionModeForSession(pendingId),
+            /*
+              **本来要跑在哪台机器上就还是那台** ——「这个新会话怎么还变成了本地的了，WTF」。
+              这个参数原来压根没传：于是上一次远程建失败之后，这条兜底路把它建成了本地会话。
+              远程会话**不许悄悄变本地** —— 连不上就该失败，而不是换一台机器把活干了。
+            */
+            (pendingId && intendedRemoteRef.current.get(pendingId)) || undefined,
           );
           const prevId = sid;
           sid = newId;
