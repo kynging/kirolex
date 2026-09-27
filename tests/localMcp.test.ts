@@ -347,26 +347,35 @@ describe('接线：隧道、会话专用 agent、以及远端进程的收尾', (
  * 实测（重启之后两条远程会话并行 attach）：两边都拿到了远端端口 **39100**。
  * 而 `ExitOnForwardFailure=yes` 的意思是第二条 ssh 直接起不来 —— 一条会话就这么打不开，
  * 日志上却只是"本地工具已备好"两次，看不出哪里错了。
+ *
+ * **这个竞态现在从根上没有了**（「重复利用」）：端口不再是会话的东西，而是**机器**的 ——
+ * 一台机器一条隧道、一个端口，所有会话共用它，各自用 URL 里的 token 区分。抢不起来。
+ *
+ * 所以这一组的判据换了：不再是"算完立刻占住"（那是在抢的前提下才需要的纪律），
+ * 而是"根本不按会话分配"。序列化那一层挪到了 `sshMux` 的 `starting` 表上 ——
+ * 三条会话同时 attach 只起一个 master，那条在 `tests/sshMux.test.ts` 里测。
  */
-describe('端口分配不能有竞态', () => {
+describe('端口不按会话分配（竞态从根上消掉）', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
-  test('算完端口**立刻**占住（写 map），再去做需要 await 的事', () => {
-    /* 锚在 `writeRemoteFile(remote, \`mkdir -p ` 上：那一步现在顺手把远端草稿目录也建了
-       （镜像去掉之后没人再创建它，而 cwd 指向不存在的目录会让那一轮的 shell 落在 /tmp） */
-    const at = M.indexOf('const remotePort = allocateRemotePort(used);');
+  test('端口来自那台机器的复用连接，不是每条会话算一个', () => {
+    const at = M.indexOf('async function ensureLocalTools');
     assert.ok(at > 0);
-    const after = M.slice(at, at + 400);
-    /* 下一行就得是"占住" —— 中间插任何 await 都会让并行的两条会话拿到同一个端口 */
-    assert.match(after, /^const remotePort[^\n]*\n\s*localToolsBySession\.set\(sessionId, \{ remotePort,/m);
-    /* 而且**不复用自己原来那个**：换 agent / 换模型是先起新执行器再关旧的，复用就会撞上
-       还没退出的旧 ssh（`ExitOnForwardFailure=yes` → ssh exit 255，看起来像"掉线"）。 */
-    assert.match(M, /const remotePort = allocateRemotePort\(used\);/);
+    const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
+    assert.match(body, /const mux = await sshMux\.ensure\(remote\);/);
+    assert.match(body, /const remotePort = mux\.remotePort;/);
+    /* 老写法的两个痕迹都不该还在 */
+    assert.equal(/allocateRemotePort\(used\)/.test(body), false);
     assert.equal(/localToolsBySession\.get\(sessionId\)\?\.remotePort \?\?/.test(M), false);
-    /* 那次写远端 agent 文件的 await 必须在占住**之后** */
-    const reserve = M.indexOf('localToolsBySession.set(sessionId, { remotePort,');
-    const write = M.indexOf('await writeRemoteFile(remote, `mkdir -p ');
-    assert.ok(reserve > 0 && write > reserve, '先占端口，再写远端文件');
+  });
+
+  test('拿到端口之后才去写远端那些文件', () => {
+    /* 顺序仍然要求：`mkdir -p` 和那份临时 agent 的 URL 里都带着这个端口 */
+    const at = M.indexOf('async function ensureLocalTools');
+    const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
+    const got = body.indexOf('const remotePort = mux.remotePort;');
+    const write = body.indexOf('await writeRemoteFile(remote, `mkdir -p ');
+    assert.ok(got > 0 && write > got, '先拿到端口，再写远端文件');
   });
 });
 

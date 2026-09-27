@@ -3,7 +3,8 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFileSync, execFile, spawn } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
+import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
+import { SshMux, muxKey, muxMarker } from './sshMux';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
@@ -1637,24 +1638,22 @@ async function ensureLocalTools(
     const token = localMcpServer.register({ sessionId, workdir: localDir, dirs });
     const urlPath = localMcpServer.urlPathFor(sessionId) || `/mcp/${token}`;
     /*
-      **端口要在任何 await 之前就占住** —— 实测：启动时两条远程会话并行 attach，两边都在
-      "分配"和"登记"之间 await 了一次（去远端写 agent 文件），于是**两条会话拿到同一个
-      39100**。而 `ExitOnForwardFailure=yes` 的意思是第二条 ssh 直接起不来 ——
-      一条会话就这么打不开了，而日志上看只是"本地工具已备好"两次。
+      **端口归机器，不归会话** ——「重复利用」。
 
-      所以顺序是：算出端口 → **立刻**写进 map（同步，占住它）→ 再去做需要等待的事。
-    */
-    /*
-      **每次起执行器都换一个新端口** ——「Error invoking remote method 'acp:switch-kiro-agent':
-      ssh exit 255」就是这条：换 agent / 换模型是**先起新执行器、成功了再关旧的**（那是故意的，
-      失败时不丢会话），而上一版复用了这条会话原来那个端口 —— 新 ssh 去绑 39100 时旧 ssh 还占着，
-      `ExitOnForwardFailure=yes` 于是让它直接失败。
+      以前是一条会话一个远端端口、一条 ssh 一个 `-R`，于是有两个必然的麻烦：
 
-      看起来像"SSH 掉线"，其实是必然发生、而且重试也必然再撞（同一个端口）。
-      所以这里把**自己当前那个**也算进"已占用"，永远拿一个新的。旧端口在旧执行器退出后自然回到池子里。
+        · 并发分配要抢：启动时两条会话并行 attach，都在"分配"和"登记"之间 await 了一次，
+          于是拿到同一个 39100，而 `ExitOnForwardFailure=yes` 让第二条 ssh 直接起不来；
+        · 换 agent / 换模型必须换端口：那条路是**先起新执行器、成功了再关旧的**（故意的，
+          失败时不丢会话），新 ssh 去绑旧端口时旧 ssh 还占着 —— 看起来像"SSH 掉线"，
+          其实是必然发生而且重试必然再撞。
+
+      两个麻烦同一个根：端口被当成了会话的东西。而它唯一的工作是"能连到本机那个 MCP server",
+      分辨会话的是 URL 里的 token。所以现在一台机器一条隧道、一个端口，所有会话共用它 ——
+      抢不起来，也不用换。
     */
-    const used = [...localToolsBySession.values()].map((v) => v.remotePort);
-    const remotePort = allocateRemotePort(used);
+    const mux = await sshMux.ensure(remote);
+    const remotePort = mux.remotePort;
     localToolsBySession.set(sessionId, { remotePort, localPort: localMcpServer.port(), agentOverride });
     /*
       **远端那个草稿目录要先建出来** —— 实测：`sessionCwd` 给的是
@@ -1718,7 +1717,11 @@ async function ensureLocalTools(
  * 一个孤儿都看不到（它们的父进程好好地在），而进程却在不停累积 —— 之前一次清出 85 个就是这么来的。
  *
  * 判据同样是 **PPID == 1**：活着的 ssh 挂在当前这个 Electron 底下；被收养的才是上一条命留下的。
- * 再加上命令行里必须有 `kirolex-local-`（那是我们自己拼的 agent 名）—— 不碰用户自己开的 ssh。
+ * 再加上命令行里必须带**自己那台**的印记 —— 不碰用户自己开的 ssh，也不碰别人那份 KiroLex 的：
+ *   · 执行器那些带 `kirolex-local-<owner>-…`（我们自己拼的 agent 名）；
+ *   · 复用连接那条（`ssh -N`）命令行里没有 agent 名，认的是 `ControlPath` 里的
+ *     `kirolex-mux/<owner>-` —— 漏掉它的话每次重启都留一条连着的 ssh，
+ *     而那正是这段注释里那条累积链的第一环。
  *
  * 杀本机这一端就够：远端那个 kiro-cli 失去 sshd 之后会被 reparent 到 1，
  * 下一次 `orphanSweepScript` 顺手收掉（或者它自己退出）。
@@ -1728,7 +1731,7 @@ function sweepStrayLocalSsh(): void {
     const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     const victims: number[] = [];
     for (const line of out.split('\n')) {
-      if (!line.includes(OWNED_AGENT_PREFIX)) continue;
+      if (!line.includes(OWNED_AGENT_PREFIX) && !line.includes(muxMarker(OWNER))) continue;
       const m = /^\s*(\d+)\s+(\d+)\s+(.*)$/.exec(line);
       if (!m) continue;
       if (Number(m[2]) !== 1) continue;             // 挂在当前 app 底下的是活的
@@ -1781,7 +1784,44 @@ function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
   if (spec && remote?.sshHost) {
     /* 不等结果：收尾动作卡住会让"换模型"看起来像界面挂了 */
     void writeRemoteFile(remote, removeAgentScript(spec.agentOverride), '').catch(() => {});
+    /*
+      **最后一条会话走了才关那条复用连接** —— 它是这台机器上所有会话共用的，
+      跟着任意一条会话退出就会把别人的工具通道一起带走。
+
+      注意这个删除动作要在**上面那句 writeRemoteFile 之后**判断：那句还要用这条连接。
+      它是 fire-and-forget 的，所以连接在它发出去之后才关 —— 关早了的表现是
+      远端那份临时 agent 删不掉，也就是我们刚修好的那种垃圾。
+    */
+    if (!hasSessionOn(remote)) {
+      /*
+        **等一下再关** —— 上面那句 `writeRemoteFile` 是 fire-and-forget 的，而它走的正是
+        这条连接。关早了的表现是远端那份临时 agent 删不掉，也就是我们刚修好的那种垃圾。
+
+        到点再确认一次：这几秒里完全可能又在这台机器上开了一条会话。
+      */
+      setTimeout(() => {
+        if (hasSessionOn(remote)) return;
+        const key = muxKey(remote.sshHost, remote.sshPort);
+        if (!sshMux.liveSocketFor(remote)) return;
+        logger.info('sshmux', `${key} 上已经没有会话了，关掉那条复用连接`);
+        sshMux.close(key);
+      }, 5_000);
+    }
   }
+}
+
+/**
+ * 这台机器上还有别的远程会话吗（那条复用连接该不该留着）。
+ *
+ * 判据取**活着的执行器**（`sessionClients`）而不是记录：记录里那些"配了远端但没连上"的会话
+ * 没有占用连接，把它们算进来的话这条连接永远关不掉 —— 而它是一条开着的 ssh。
+ */
+function hasSessionOn(remote: RemoteTarget): boolean {
+  for (const entry of sessionClients.values()) {
+    const r = entry.profile.remote;
+    if (r?.sshHost === remote.sshHost && (r?.sshPort || 22) === (remote.sshPort || 22)) return true;
+  }
+  return false;
 }
 
 /**
@@ -1996,6 +2036,28 @@ const reachability = new Breaker();
  */
 const OWNER = ownerTag(os.hostname(), os.userInfo().username);
 const OWNED_AGENT_PREFIX = ownedAgentPrefix(OWNER);
+
+/**
+ * **一台机器一条 ssh、一个反向隧道** ——「你应该加的是垃圾清理和重复利用」的后半截。
+ *
+ * 远端端口不再属于任何一条会话（见 `sshMux.ts` 开头）：它唯一的工作是"能连到本机那个 MCP
+ * server"，而"你是哪条会话"靠 URL 里的 token 区分 —— 所以一个端口 + N 个 token 就够。
+ *
+ * `usedRemotePorts` 收的是**已经建起来的那些机器**的端口：两台远端机器各要一条隧道，
+ * 它们的远端端口互不相干（各自的 127.0.0.1），沿用 `allocateRemotePort` 只是让日志里
+ * 一眼能分清哪条隧道是哪台机器的。
+ */
+const sshMux: SshMux = new SshMux({
+  log: (level, message) => logger[level]('sshmux', message),
+  localPort: () => localMcpServer?.port() || 0,
+  usedRemotePorts: (): number[] => sshMux.keys()
+    .map((k: string) => sshMux.remotePortFor(k))
+    .filter((port): port is number => typeof port === 'number'),
+  allocateRemotePort,
+  owner: OWNER,
+});
+/* 每条 ssh 都先问一句"这台机器有没有现成的连接" —— 有就当 channel 走，没有照旧建新的 */
+setMuxSocketResolver((remote) => (remote?.sshHost ? sshMux.liveSocketFor(remote) : undefined));
 
 /** 哪几台机器的规格已经报过了 —— 同一条信息不必每次 attach 都刷一遍。 */
 const remoteSpecsLogged = new Set<string>();
@@ -8214,6 +8276,12 @@ app.on('before-quit', () => {
     try { entry.client.disconnect(); } catch {}
   }
   sessionClients.clear();
+  /*
+    **那些复用连接也关掉** —— 每台机器一条 `ssh -N`，是我们自己起的进程。留着的话它们会被
+    launchd 收养（PPID 变 1），也就是下一次启动要扫的垃圾 —— 而那正是那台 EC2 被压死的
+    累积链的第一环（见 `sweepStrayLocalSsh`）。
+  */
+  try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ }
 });
 
 /** Turn a supervisor's SIGTERM into a REAL app quit.

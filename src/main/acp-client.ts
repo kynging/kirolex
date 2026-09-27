@@ -777,6 +777,18 @@ export function parseRemotePid(chunk: string): number | undefined {
  * such a loop reports green forever. Sharing this function keeps the "is it remote"
  * decision identical to the one `AcpClient.connect()` makes.
  */
+/**
+ * **这台机器有没有一条能复用的连接** ——「重复利用」。
+ *
+ * 由 `sshMux` 注入，而且**只在它刚探活过**的时候返回 socket（见那边的 `liveSocketFor`）。
+ * 返回 `undefined` 时这里照原样建一条新连接 —— 那些在 mux 建立**之前**就要跑的路径
+ * （preflight、自动检测）本来就得自己连。
+ */
+let muxSocketResolver: ((remote: RemoteTarget) => string | undefined) | undefined;
+export function setMuxSocketResolver(fn?: (remote: RemoteTarget) => string | undefined): void {
+  muxSocketResolver = fn;
+}
+
 export function buildSshArgs(
   remote: RemoteTarget,
   remoteCommand: string,
@@ -787,9 +799,35 @@ export function buildSshArgs(
    * `ExitOnForwardFailure=yes` 是**故意**的：端口占用时宁可连不上，也不要起一个
    * "看起来好了、其实没有本地工具"的执行器 —— 那种降级是静默的，而模型会把
    * "工具调不通"解释成"这个文件不存在"。
+   *
+   * 走复用连接时**不传这个**：隧道归 master（`sshMux.ts`），一台机器一条，
+   * 所有会话共用那一个远端端口、各自用自己的 token。
    */
   forward?: { remotePort: number; localPort: number },
 ): string[] {
+  /*
+    **能复用就复用** ——「你应该加的是垃圾清理和重复利用」。
+
+    ssh 原生支持在一条连接上开多个 channel。复用之后 N 条会话只做**一次**握手：
+    不再占 `MaxStartups` 的槽（默认 10:30:100），而那个槽位耗尽正是那台 EC2
+    `Connection timed out during banner exchange` 的直接成因 —— 开机时 20 条会话
+    ×最多 3 次重试 = 60 次并发握手。
+  */
+  const socket = muxSocketResolver?.(remote);
+  if (socket) {
+    return [
+      '-o', 'BatchMode=yes',
+      /*
+        `ControlMaster=no` 是关键：不加的话这条 ssh 会在 master 不在时**自己变成 master**，
+        而它是带命令的 —— 命令一结束连接就没了，于是隧道被一条会话的退出带走，
+        别的会话"突然读不到文件了"。宁可直接失败：那时候该做的是把 master 拉起来。
+      */
+      '-o', 'ControlMaster=no',
+      '-o', `ControlPath=${socket}`,
+      /* `-i` / `-p` / `-R` 都是**建连接**时才有意义的，走已有连接时全都不带 */
+      remote.sshHost, remoteCommand,
+    ];
+  }
   const args: string[] = [
     '-o', 'BatchMode=yes',
     '-o', 'ConnectTimeout=10',
