@@ -1824,6 +1824,23 @@ function runLocalActions(sessionId: string, entry: SessionEntry, chunk: string):
           + `剩下的没开（\`${a.target}\`）—— 链接就在上面，需要的话点它。`);
         return;
       }
+      /*
+        **调用点再检一次 scheme** —— 后台安全审查提的那条（模型可控的 `openExternal`）。
+        `parseLocalActions` 已经只放 http(s) 过（见 `localAction.ts`），这是**第二道**：
+        两处离得远，将来有人放宽解析器、或者多一条别的路往这里送 action，就会静默变成
+        "任意 scheme 交给 macOS 的应用启动器" —— 而那一类错是不可逆的。
+
+        **没有**加"屏蔽 localhost / 私网"和每次弹窗：这条通道能做的事（让你的浏览器打开一个地址）
+        严格弱于同一条会话已经拿到的 `local_bash`（用户明确选的，能在他机器上跑任何命令）。
+        有 shell 的前提下给 URL 加网段牢笼，正是设计文档里「不做安全剧场」那条要防的；
+        而 `http://localhost:3000` 恰好是主要用例 —— agent 在**用户机器上**起了 dev server 让他看。
+      */
+      const scheme = (() => { try { return new URL(a.target).protocol; } catch { return ''; } })();
+      if (scheme !== 'http:' && scheme !== 'https:') {
+        noteInSession(sessionId, `⚠️ 拒绝在本机打开 \`${String(a.target).slice(0, 120)}\` —— 只允许 http/https。`);
+        logger.warn('localaction', `拒绝非 http(s) 目标 sessionId=${sessionId} scheme=${scheme || '(解析不了)'}`);
+        continue;
+      }
       entry.localActionsThisTurn = (entry.localActionsThisTurn || 0) + 1;
       (entry.openedLocally ||= new Set()).add(a.target);
       const host = labelForHost(KIROLEX_CONFIG_PATH, entry.profile.remote?.sshHost) || '远端';
