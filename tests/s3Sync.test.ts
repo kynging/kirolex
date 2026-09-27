@@ -260,7 +260,11 @@ describe('状态文件与杂项', () => {
 describe('接线', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
-  /* 备份那一页搬出设置了，自己一个弹窗 ——「那个备份界面不应该在设置里面」 */
+  /*
+    两个界面：**配置**在设置里（`BackupSettings`），**恢复**在侧栏那颗 ☁️（`BackupDialog`）——
+    「这个备份的配置放回设置中…这个云按钮只保留恢复」。
+  */
+  const CONF = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
   const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
 
   test('secret 用 safeStorage 加密，没有 keychain 就**拒绝保存**而不是退回明文', () => {
@@ -280,15 +284,38 @@ describe('接线', () => {
     assert.match(body, /input\?\.clearSecret/);
   });
 
-  test('测连通是真的**写**一个对象 —— ListBucket 通不代表 PutObject 通', () => {
+  test('测连通是真的**写**一个对象，而且写完删掉', () => {
     const at = M.indexOf("ipcMain.handle('s3:test'");
     /* 判据那段注释在 handle **上面**，所以往前也要看 */
-    const body = M.slice(at - 900, at + 1400);
+    const body = M.slice(at - 900, at + 2200);
     assert.match(body, /putObject/);
     assert.match(body, /getObject/);
     assert.match(body, /是两条独立的权限/);
     /* 写进去再读回来对比 —— 桶上可能有改写内容的策略 */
     assert.match(body, /内容不一致/);
+    /*
+      「测试应该是写完然后删除」—— 留着那个 `.kirolex-write-test` 是往用户桶里扔垃圾，
+      桶开了版本控制的话每次测还会攒一个版本。
+    */
+    assert.match(body, /await deleteObject\(creds!, key\);/);
+    /* 但删不掉**不算测试失败**：要证明的"能读能写"已经成立了。只是必须说出来。 */
+    assert.match(body, /leftover = /);
+    assert.match(body, /没有 s3:DeleteObject/);
+    assert.ok(body.indexOf('const back = await getObject') < body.indexOf('await deleteObject'),
+      '先验证内容，再删 —— 反过来就没东西可读了');
+  });
+
+  test('S3 的 DELETE 对不存在的 key 也算成功（幂等清理）', async () => {
+    const C = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Client.ts'), 'utf8');
+    assert.match(C, /export async function deleteObject/);
+    /* 204 就是成功，所以 `check` 直接用；重复调用不会变成错误 */
+    assert.match(C, /request\(creds, 'DELETE', `\/\$\{key\}`/);
+  });
+
+  test('按钮上不再写"真写一个小对象" —— 它不留痕迹了，那句是噪音', () => {
+    const CONF2 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
+    assert.equal(/测连通（真写一个小对象）/.test(CONF2), false);
+    assert.match(CONF2, /'测连通'/);
   });
 
   test('catalog **最后**传：它是恢复的唯一入口，先传会指向还没上传完的东西', () => {
@@ -354,7 +381,7 @@ describe('接线', () => {
     assert.match(UI, /覆盖/);
     assert.match(UI, /trash/);
     /* secret 框平时是空的，空 = 不改 */
-    assert.match(UI, /留空 = 不改/);
+    assert.match(CONF, /留空 = 不改/);   /* secret 在配置那一页 */
   });
 });
 
@@ -422,162 +449,118 @@ describe('冲突检测与失败退避（借 Tabby 的做法）', () => {
   });
 });
 
+
 /*
- * 「那个备份界面不应该在设置里面。而且这个界面现在是乱的」。
+ * 「这个备份的配置放回设置中。我的意思是这个云按钮只保留恢复，这个界面应该展示所有已经备份的
+ * 会话，然后留一个多选/恢复按钮即可」。
  *
- * 那个"乱"是两件事叠出来的，两条都锚住免得再犯：
- *
- * 1. **按钮用了 `.settings-btn`**，而那是 28×28 的**图标**按钮（width/height 写死、
- *    font-size 16px）。「测连通（真写一个小对象）」被压成 28px 宽、一个字一行竖着排下来,
- *    而且盖在下面那段说明文字上。机器页踩过同一个坑，CSS 里 `.remote-btn` 上面那段注释
- *    就是为它写的 —— 文字按钮一律用 `.remote-btn`（它有 `white-space: nowrap`）。
- * 2. **塞在 `.settings-body` 的一格里**，那是两列网格，实测单列只有 **341px**。
- *    这一页是"6 个字段 + 一张可恢复列表"，撑不开：`scrollHeight > clientHeight`,
- *    最下面「从备份恢复」整段被切掉。
- *
- * 搬出设置的理由不只是"挤"：设置里的东西是**配一次就不用再看**的，而备份是**有状态、
- * 要回来看**的（上次什么时候成的、桶里有哪些能恢复）。侧栏那颗 ☁️ 已经在当状态指示了。
+ * 分工：**配置**在 设置 → ☁️ 备份（配一次就不用再看）；**恢复**在侧栏那颗 ☁️
+ * （平时要回来看的那件事：桶里有哪些、要捞哪几条）。
  */
-describe('备份界面：自己一个弹窗，按钮别再被压成一个字', () => {
+describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
+  const CONF = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
   const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
-  const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
   const SD = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
   const APP = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
-
-  test('不在设置里了 —— tab 和引用都拿掉', () => {
-    assert.equal(/S3BackupSettings/.test(SD), false);
-    assert.equal(/'backup'/.test(SD), false, "SettingsTab 里不该还有 'backup'");
-    assert.equal(fs.existsSync(path.join(process.cwd(), 'src/renderer/components/S3BackupSettings.tsx')), false,
-      '旧组件删掉了，否则两份界面会慢慢长歪');
-  });
-
-  test('侧栏那颗 ☁️ 直接开这个弹窗，不再绕设置', () => {
-    assert.match(APP, /onOpenBackup=\{\(\) => setShowBackup\(true\)\}/);
-    assert.match(APP, /\{showBackup && <BackupDialog onClose=\{\(\) => setShowBackup\(false\)\} \/>\}/);
-  });
-
-  test('**一个 `.settings-btn` 都不许有** —— 它是 28×28 图标按钮，会把文字压成竖排', () => {
-    /* 只看真正用到的 class（文件头那段注释里会提到它，那是在解释为什么不能用） */
-    assert.equal(/className="[^"]*settings-btn/.test(UI), false);
-    /* 文字按钮一律 remote-btn */
-    assert.ok((UI.match(/className="remote-btn/g) || []).length >= 4);
-    /* 而 `.remote-btn` 必须是 nowrap —— 这才是"不会被压成一个字"的那一半 */
-    const at = CSS.indexOf('.remote-btn {');
-    assert.ok(at > 0);
-    assert.match(CSS.slice(at, at + 400), /white-space: nowrap;/);
-  });
-
-  test('不复用 `.settings-body`（两列网格）—— 这一页是单列', () => {
-    assert.equal(/className="[^"]*(settings-col|settings-body)/.test(UI), false);
-    assert.match(UI, /className="backup-body"/);
-    const at = CSS.indexOf('.backup-body {');
-    assert.ok(at > 0, 'backup-body 的样式要在');
-    const body = CSS.slice(at, at + 300);
-    assert.match(body, /flex-direction: column;/);
-    /* 自己滚：外层不滚的话内容一多就被切掉，那正是原来那个 bug */
-    assert.match(body, /overflow-y: auto;/);
-  });
-
-  test('字段标签定宽对齐 —— 原来每行宽度不同，输入框像阶梯一样错开', () => {
-    const at = CSS.indexOf('.backup-field {');
-    assert.ok(at > 0);
-    assert.match(CSS.slice(at, at + 260), /grid-template-columns: 104px minmax\(0, 1fr\);/);
-    /* 标签不换行，否则行高被顶起来，看起来就是参差不齐 */
-    const la = CSS.indexOf('.backup-field-label {');
-    assert.match(CSS.slice(la, la + 260), /white-space: nowrap;/);
-  });
-
-  test('按钮行挤不下要换行，而不是把按钮压扁', () => {
-    const at = CSS.indexOf('.backup-actions {');
-    assert.ok(at > 0);
-    assert.match(CSS.slice(at, at + 200), /flex-wrap: wrap;/);
-  });
-
-  test('列表独立滚动，而且长标题省略号而不是把按钮挤出去', () => {
-    const at = CSS.indexOf('.backup-list {');
-    assert.match(CSS.slice(at, at + 300), /max-height: 240px;[\s\S]*overflow-y: auto;/);
-    const na = CSS.indexOf('.backup-list-name {');
-    assert.match(CSS.slice(na, na + 260), /text-overflow: ellipsis;/);
-  });
-
-  test('原来那几条行为一条没丢', () => {
-    /* 覆盖前问一句、说清挪进 trash；secret 留空 = 不改 */
-    assert.match(UI, /window\.confirm/);
-    assert.match(UI, /覆盖/);
-    assert.match(UI, /trash/);
-    assert.match(UI, /留空 = 不改/);
-    /* 测连通仍然是真写一个对象 */
-    assert.match(UI, /测连通（真写一个小对象）/);
-    /* 没有 keychain 就不让填 secret */
-    assert.match(UI, /disabled=\{!cfg\.encryptionAvailable\}/);
-  });
-
-  test('Esc 能关 —— 和别的弹窗一致', () => {
-    assert.match(UI, /e\.key === 'Escape'/);
-    assert.match(UI, /<div className="overlay" onClick=\{onClose\} \/>/);
-  });
-});
-
-/*
- * 「开关应该改成按钮形式」。
- *
- * 原来两处（备份那页的「定时同步」、设置里的「⚡ 开关」那一栏）都是**原生 checkbox** +
- * 一个「开/关」文字：
- *
- *   · 和这个界面里别的东西不是一套 —— 其余全是按钮，中间夹一个系统画的白方块；
- *   · 那个方块只有 13px，真正好点的是外面那个 `<label>`，而"label 也能点"看不出来；
- *   · 勾没勾在暗色背景上对比度很低，而「开」「关」两个字宽度差不多 —— 扫一眼扫不出状态。
- *
- * 所以状态用**两个**通道说（填充色 + 文字，外加一个小圆点），整块都能点。
- * 用真 `<button>` 是为了白拿键盘支持 —— 原来只有焦点落在那个 13px 方块上才能切。
- */
-describe('开关做成按钮', () => {
-  const TB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ToggleButton.tsx'), 'utf8');
-  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
-  const SD = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
   const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
 
-  test('两处的原生 checkbox 都没了', () => {
-    assert.equal(/type="checkbox"/.test(UI), false, '备份那页');
-    assert.equal(/type="checkbox"/.test(SD), false, '设置的「⚡ 开关」那一栏');
-    assert.match(UI, /<ToggleButton/);
-    assert.match(SD, /<ToggleButton/);
+  test('配置回到设置里', () => {
+    assert.match(SD, /\{ id: 'backup', label: '☁️ 备份' \}/);
+    assert.match(SD, /\{tab === 'backup' && <BackupSettings \/>\}/);
+    /* 桶 / 凭据 / 定时都在那一页 */
+    for (const f of ['label="Bucket"', 'label="Region"', 'label="Access Key ID"', 'label="Secret"', '定时同步']) {
+      assert.ok(CONF.includes(f), `配置页要有 ${f}`);
+    }
   });
 
-  test('是真的 `<button>`，而且对读屏仍然是一个开关', () => {
-    assert.match(TB, /type="button"/);
-    assert.match(TB, /role="switch"/);
-    assert.match(TB, /aria-checked=\{on\}/);
-    /* 真 button 才有 Space / Enter，所以焦点框也要看得见 */
-    assert.match(CSS, /\.toggle-btn:focus-visible \{/);
+  test('云按钮那一页**没有任何配置** —— 它只管恢复', () => {
+    for (const f of ['label="Bucket"', 'label="Region"', 'label="Access Key ID"',
+      'label="Secret"', 'saveS3Config', 'testS3', 'syncS3Now', 'intervalMinutes']) {
+      assert.equal(UI.includes(f), false, `恢复页不该有 ${f}`);
+    }
+    assert.match(APP, /onOpenBackup=\{\(\) => setShowBackup\(true\)\}/);
   });
 
-  test('状态不止换一个字 —— 颜色和形状都要变', () => {
-    const at = CSS.indexOf('.toggle-btn.on {');
+  test('打开就列，不用先点一下', () => {
+    /* 这一页存在的唯一目的就是看这张表，那一下点击是纯多余动作 */
+    assert.match(UI, /useEffect\(\(\) => \{ void load\(\); \}, \[load\]\);/);
+    assert.match(UI, /listS3Backups/);
+  });
+
+  test('多选 + 一颗恢复按钮 + 全选', () => {
+    assert.match(UI, /const \[picked, setPicked\] = useState<Set<string>>/);
+    assert.match(UI, /const toggleAll = /);
+    assert.match(UI, /恢复选中的/);
+    /* 一条一条恢复：并发会同时写 trash 和 sessions，而失败要说清是哪一条 */
+    assert.match(UI, /for \(const e of chosen\)/);
+    assert.match(UI, /bad\.push\(`\$\{e\.title \|\| e\.id\}：/);
+  });
+
+  test('**一次**确认，而且把要覆盖的那几条点名', () => {
+    /* 逐条确认的问题不是慢，是每次长得一样 —— 点到第五次就不看了，而其中可能有一条是覆盖 */
+    assert.equal((UI.match(/window\.confirm/g) || []).length, 1);
+    assert.match(UI, /overwriting\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
+    assert.match(UI, /会被覆盖/);
+    assert.match(UI, /不会真的丢/);
+  });
+
+  test('正连着的不给勾 —— 主进程会拒，让人勾上再被拒是最差的', () => {
+    assert.match(UI, /disabled=\{!!e\.attached \|\| !!busy\}/);
+    /* 能勾的集合里就没有它们，所以"全选"也不会把它们带上 */
+    assert.match(UI, /\(entries \|\| \[\]\)\.filter\(\(e\) => !e\.attached\)/);
+    /* 这个标记是主进程给的（它才知道谁连着） */
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    assert.match(M, /attached: sessionClients\.has\(e\.id\)/);
+  });
+
+  test('三种状态各有一个标，"哪几条会覆盖"要看得见', () => {
+    assert.match(UI, /backup-tag warn">正连着/);
+    assert.match(UI, /backup-tag over">会覆盖本地/);
+    assert.match(UI, /backup-tag new">本地没有/);
+    /* 覆盖那个是这一页唯一有破坏性的，颜色要区分开 */
+    assert.match(CSS, /\.backup-tag\.over \{[\s\S]{0,160}--warning/);
+  });
+
+  test('整行可点（label），列表自己滚', () => {
+    /* 不是只能点那个 13px 的方块 */
+    assert.match(UI, /<label\s+key=\{e\.id\}/);
+    const at = CSS.indexOf('.backup-restore-list {');
     assert.ok(at > 0);
-    const body = CSS.slice(at, at + 320);
-    /* 开的时候是**填充**，不只是换个字色 */
-    assert.match(body, /background: color-mix/);
-    assert.match(body, /border-color: var\(--accent/);
-    /* 小圆点：给颜色之外再来一个通道（有人分不清这两种颜色） */
-    assert.match(CSS, /\.toggle-btn\.on \.toggle-dot \{ background: var\(--accent/);
-    assert.match(TB, /className="toggle-dot"/);
+    assert.match(CSS.slice(at, at + 260), /overflow-y: auto;/);
   });
 
-  test('胶囊形，和方形的 `.remote-btn` 分得开', () => {
-    /* 那些是"做一件事"，这个是"一个状态" —— 形状上要能区分 */
-    const at = CSS.indexOf('.toggle-btn {');
-    assert.match(CSS.slice(at, at + 420), /border-radius: 999px;/);
+  test('间隔那几个选项在一个 `.ts` 里 —— 单测跑不了 .tsx', async () => {
+    /* node 的 type-stripping 不认 `.tsx`（ERR_UNKNOWN_FILE_EXTENSION） */
+    const { INTERVAL_CHOICES, intervalChoices, intervalLabel } =
+      await import('../src/renderer/backupIntervals.ts');
+    assert.equal(Math.min(...INTERVAL_CHOICES), 5, '不要比 5 分钟更频繁');
+    assert.ok(INTERVAL_CHOICES.length <= 6, '"留几个选项就行"');
+    assert.equal(intervalLabel(5), '5 分钟');
+    assert.equal(intervalLabel(60), '1 小时');
+    assert.equal(intervalLabel(1440), '1 天');
+    /* 手改成 45 也要列出来，否则 select 显示空白、随手一选就把它改掉 */
+    assert.deepEqual(intervalChoices(45), [5, 15, 30, 45, 60, 360, 1440]);
+    /* 低于 5 的不收：主进程会钳掉，列出来等于承诺一个做不到的间隔 */
+    assert.deepEqual(intervalChoices(1), [...INTERVAL_CHOICES]);
   });
 
-  test('备份那颗带上下文（开着/关着，点一下会怎样）', () => {
-    assert.match(UI, /定时同步开着 —— 点一下关掉/);
-    assert.match(UI, /ariaLabel="定时同步"/);
+  test('配置页：不放示例值、Key 前缀标可选且排最后、region 在 ak 前面', () => {
+    for (const fake of ['my-kirolex-backup', 'ap-northeast-1', 'AKIA…', 'kirolex（可留空）']) {
+      assert.equal(CONF.includes(`placeholder="${fake}"`), false, `${fake} 不该当 placeholder`);
+    }
+    assert.match(CONF, /label="Key 前缀（可选）"/);
+    const idx = (x: string): number => CONF.indexOf(x);
+    assert.ok(idx('label="Bucket"') < idx('label="Region"'));
+    assert.ok(idx('label="Region"') < idx('label="Access Key ID"'), 'region 放在 ak 前面');
+    assert.ok(idx('label="Access Key ID"') < idx('label="Secret"'));
+    assert.ok(idx('label="Secret"') < idx('label="Key 前缀（可选）"'), '可选的那个放最后');
+    /* 间隔是下拉，不是能敲任意数字的输入框 */
+    assert.equal(/type="number"/.test(CONF), false);
+    assert.match(CONF, /<select className="settings-select backup-interval"/);
   });
 
-  test('设置那栏还是 On/Off（那一页本来就是英文）', () => {
-    assert.match(SD, /labels=\{\['On', 'Off'\]\}/);
-    /* busy 时不让点，否则连点会和正在写的那次打架 */
-    assert.match(SD, /disabled=\{featureBusy === sw\.key\}/);
+  test('侧栏那颗 ☁️ 的 tooltip 说清点开是恢复', () => {
+    const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
+    assert.match(SB, /从备份恢复/);
   });
 });

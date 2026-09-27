@@ -816,7 +816,7 @@ const App: React.FC = () => {
   /* ☁️ 备份自己一个弹窗（侧栏那颗 ☁️ 直接开它）—— 它是有状态、要回来看的东西，不是设置 */
   const [showBackup, setShowBackup] = useState(false);
   /** 打开设置时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。 */
-  const [settingsTab, setSettingsTab] = useState<'machines' | undefined>(undefined);
+  const [settingsTab, setSettingsTab] = useState<'machines' | 'backup' | undefined>(undefined);
   /**
    * 上一次备份的结果 —— 侧栏那个 ☁️ 用它上色和写 title。
    *
@@ -3366,7 +3366,10 @@ const App: React.FC = () => {
               onMoveSession={moveSession}
               onArchiveSession={archiveSession}
               onSettings={() => { setSettingsTab(undefined); setShowSettings(true); }}
-              /* 备份自己一个弹窗 ——「那个备份界面不应该在设置里面」（它是有状态、要回来看的东西） */
+              /*
+                ☁️ 只管**恢复** ——「这个云按钮只保留恢复，这个界面应该展示所有已经备份的会话，
+                然后留一个多选/恢复按钮即可」。配置回到 设置 → ☁️ 备份。
+              */
               onOpenBackup={() => setShowBackup(true)}
               backupState={backupState}
               workspaceOpen={showWorkspace}

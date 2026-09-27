@@ -1,4 +1,5 @@
 import { LANG_OPTIONS, normalizeLang } from '../i18n';
+import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
 import { useT } from '../hooks/useLang';
@@ -6,7 +7,7 @@ import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
 
-type SettingsTab = 'machines' | 'appearance' | 'session' | 'switches';
+type SettingsTab = 'machines' | 'appearance' | 'session' | 'backup' | 'switches';
 
 interface SettingsDialogProps {
   /** 打开时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。不传 = 机器页。 */
@@ -111,6 +112,8 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: 'machines', label: '🖥 机器' },
   { id: 'appearance', label: '🎨 外观' },
   { id: 'session', label: '💬 会话' },
+  /* 备份的**配置**在这儿；「桶里有哪些、恢复哪几条」在侧栏那颗 ☁️ 里 */
+  { id: 'backup', label: '☁️ 备份' },
   { id: 'switches', label: '🧪 开关' },
 ];
 
@@ -558,6 +561,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           )}
 
 
+          {tab === 'backup' && <BackupSettings />}
           {tab === 'switches' && (
           <div className="settings-col">
             <div className="settings-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>

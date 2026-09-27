@@ -190,7 +190,8 @@ interface SidebarProps {
   onArchiveSession: (sessionId: string, archived: boolean) => void;
   onSettings: () => void;
   /**
-   * 打开 ☁️ 备份那一页 ——「这个同步应该在左侧下方有一个入口按钮」。
+   * 打开 ☁️「从备份恢复」——「这个同步应该在左侧下方有一个入口按钮」，
+   * 而「这个云按钮只保留恢复」：配置在 设置 → ☁️ 备份。
    *
    * 和 ⚙️ 分开一个按钮，而不是"进设置自己找"：备份是一件**有状态**的事（上次什么时候成的、
    * 失败了没有），而藏在四层菜单后面的状态等于没有状态。Tabby 那个云同步插件同样把它
@@ -1222,9 +1223,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onClick={onOpenBackup}
             title={backupState?.error
               ? `备份上次失败了（${new Date(backupState.at).toLocaleString()}）：${backupState.error.split('\n')[0]}`
+                + `\n点开是「从备份恢复」；配置在 设置 → ☁️ 备份`
               : backupState
                 ? `上次备份：${new Date(backupState.at).toLocaleString()} · 传了 ${backupState.uploaded} 个文件`
-                : '备份到 S3（还没配 —— 点这里配）'}
+                  + `\n点开是「从备份恢复」`
+                : '从备份恢复会话（还没配 —— 去 设置 → ☁️ 备份）'}
             aria-label="备份"
           >
             ☁️

@@ -7957,35 +7957,99 @@ button, input, select, textarea {
   gap: 8px;
 }
 /* `.backup-toggle` 没了：那个 checkbox 换成了 `.toggle-btn`（「开关应该改成按钮形式」） */
-.backup-interval { width: 72px; flex: 0 0 auto; }
+/* 下拉，不是数字输入框（「时间留几个选项就行」）—— 宽度够放「1 小时」这种 */
+.backup-interval { width: auto; min-width: 92px; flex: 0 0 auto; }
 
 /*
   可恢复列表自己滚。放在外层一起滚的话，列表长了之后上面那张表单会被推得很远,
   而这两块是要对照看的（"配好了吗"和"桶里有什么"）。
 */
-.backup-list {
+/*
+  **可恢复的会话列表**（多选）——「这个界面应该展示所有已经备份的会话，然后留一个
+  多选/恢复按钮即可」。
+
+  整行是 `<label>`：点哪儿都能勾，而不是只能点那个 13px 的方块。
+  三种状态各有一个标签（本地没有 / 会覆盖本地 / 正连着），因为"哪几条会覆盖"
+  必须看得见 —— 多选一次性恢复的时候没人会逐条去想。
+*/
+.backup-restore-list {
   display: flex;
   flex-direction: column;
-  gap: 4px;
-  max-height: 240px;
+  /* 这一页的主体就是它，所以吃掉剩下的高度并自己滚 */
+  flex: 1 1 auto;
+  min-height: 120px;
   overflow-y: auto;
   border: 1px solid var(--border);
   border-radius: 6px;
-  padding: 6px;
+  padding: 4px;
 }
-.backup-list-row {
+.backup-restore-list::-webkit-scrollbar { width: 12px; }
+.backup-restore-list::-webkit-scrollbar-track { background: transparent; }
+.backup-restore-list::-webkit-scrollbar-thumb {
+  background: var(--border);
+  border-radius: 6px;
+  border: 3px solid transparent;
+  background-clip: content-box;
+}
+
+.backup-restore-row {
   display: flex;
   align-items: center;
-  justify-content: space-between;
   gap: 8px;
   min-width: 0;
+  padding: 5px 7px;
+  border-radius: 5px;
+  cursor: pointer;
 }
-.backup-list-name {
+.backup-restore-row:hover:not(.disabled) { background: var(--bg-hover); }
+.backup-restore-row.picked { background: color-mix(in srgb, var(--accent, #7c6fe0) 12%, transparent); }
+/* 正连着的：恢复会被主进程拒，所以连勾都不给 —— 灰掉并说明原因（title 里） */
+.backup-restore-row.disabled { opacity: 0.5; cursor: default; }
+
+.backup-restore-title {
   font-size: 12px;
   color: var(--text-primary);
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  /* 标签和大小/时间要留得住位置，所以标题是唯一会被压缩的那一段 */
+  flex: 1 1 auto;
+  min-width: 0;
+}
+.backup-restore-meta {
+  font-size: 10px;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+
+/* 三个状态标 —— 颜色之外还有文字，别只靠颜色说话 */
+.backup-tag {
+  font-size: 10px;
+  line-height: 1.5;
+  padding: 0 6px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex: 0 0 auto;
+}
+.backup-tag.new { color: var(--text-muted); }
+/* 会覆盖：这是这一页里唯一有破坏性的那种，要显眼 */
+.backup-tag.over {
+  color: var(--warning, #d9a23b);
+  border-color: color-mix(in srgb, var(--warning, #d9a23b) 55%, transparent);
+}
+.backup-tag.warn {
+  color: var(--error, #d9534f);
+  border-color: color-mix(in srgb, var(--error, #d9534f) 55%, transparent);
+}
+
+/* 配置那一页（设置里）：纵向排，和这一页共用 `.backup-field` 那套对齐 */
+.backup-config {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
   min-width: 0;
 }
 

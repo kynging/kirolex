@@ -121,6 +121,16 @@ export async function getObject(creds: S3Creds, key: string): Promise<Buffer> {
   return check(await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0)), `下载 ${key}`).body;
 }
 
+/**
+ * 删一个对象 ——「测试应该是写完然后删除」。
+ *
+ * S3 的 DELETE 对**不存在的 key** 也回 204，所以这个函数在"本来就没有"时也算成功 ——
+ * 这正是幂等清理想要的语义（重复调用不会变成错误）。
+ */
+export async function deleteObject(creds: S3Creds, key: string): Promise<void> {
+  check(await request(creds, 'DELETE', `/${key}`, {}, Buffer.alloc(0)), `删除 ${key}`);
+}
+
 /** 对象不存在时返回 `null`（而不是抛）—— "还没有"是正常状态，不是错误。 */
 export async function getObjectIfExists(creds: S3Creds, key: string): Promise<Buffer | null> {
   const r = await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0));

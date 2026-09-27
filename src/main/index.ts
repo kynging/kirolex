@@ -15,7 +15,7 @@ import {
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
 } from './s3Sync.ts';
-import { S3Creds, S3Error, putObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
+import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
@@ -4157,7 +4157,22 @@ app.whenReady().then(async () => {
       await putObject(creds!, key, Buffer.from(stamp), 'text/plain');
       const back = await getObject(creds!, key);
       if (back.toString('utf-8') !== stamp) return { ok: false, error: '写进去又读回来的内容不一致 —— 桶上可能有改写内容的策略。' };
-      return { ok: true, message: `可读可写（${cfg.bucket} / ${cfg.region}）` };
+      /*
+        **写完就删掉** ——「测试应该是写完然后删除」。留着那个 `.kirolex-write-test`
+        是往用户桶里扔垃圾，而且每次测都会覆盖它 —— 桶开了版本控制的话还会攒一堆版本。
+
+        删不掉**不算测试失败**：这条测试要证明的是"能读能写"，而那两件事已经成立了。
+        但必须**说出来** —— 桶里留了个对象、以及"这个 key 没有 DeleteObject 权限"
+        都是用户该知道的事（后者会让以后的清理动作也失败）。
+      */
+      let leftover = '';
+      try {
+        await deleteObject(creds!, key);
+      } catch (delErr: any) {
+        leftover = `（测试对象没删掉：${delErr?.message || delErr} —— 桶里留了 ${key}，`
+          + `这个 key 可能没有 s3:DeleteObject）`;
+      }
+      return { ok: true, message: `可读可写（${cfg.bucket} / ${cfg.region}）${leftover}` };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
@@ -4176,8 +4191,17 @@ app.whenReady().then(async () => {
       if (!raw) return { entries: [], error: '这个桶里还没有备份（先同步一次）。' };
       const catalog = JSON.parse(raw.toString('utf-8')) as Catalog;
       const local = new Set(store.listSessions().map((r) => r.id));
+      /*
+        **正连着的那些也标出来** —— 恢复它们会被拒（内存里那份会把恢复的内容盖回去，
+        见 `s3:restore`）。在列表里就说清，比让人勾上、点了恢复、再收到一句拒绝好：
+        多选恢复的时候那一条会夹在一堆成功里，很容易被漏掉。
+      */
       return {
-        entries: (catalog.entries || []).map((e) => ({ ...e, existsLocally: local.has(e.id) })),
+        entries: (catalog.entries || []).map((e) => ({
+          ...e,
+          existsLocally: local.has(e.id),
+          attached: sessionClients.has(e.id),
+        })),
       };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
