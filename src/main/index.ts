@@ -2141,10 +2141,21 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     localDirs: localDirsOf(sessionId, entry),
     /*
       **他那边到底有没有工程** ——「我让它找一个纯远程的项目但它总是在本地找」。
-      `entry.localDir` 没有值时 `localProjectDirOf` 会退回 KiroLex 自己的会话目录，
-      那不是"他的工程"，而注入里那些"用 local_bash 跑他的构建"的话会把它引到错的机器上。
+
+      判据**不能只看 `entry.localDir` 有没有值** —— 这是上一版的错，实测撞到了：
+      那条没归项目的远程会话记录里 `localDir` 就是
+      `~/.kirolex/sessions/<id>`（会话草稿目录本身被持久化进去了），
+      于是 `!!entry.localDir` 是 true，注入里那套"他的仓库和工具链在他机器上、
+      构建测试用 local_bash"照样发了出去 —— 而那条会话根本没有本地工程。
+
+      所以要**排除草稿目录**：它是 KiroLex 自己存 record / transcript / history 的地方，
+      不是任何人的工程。
+
+      主进程这边**不用**渲染层那个按形状匹配的 `isSessionScratchDir`：它知道确切路径,
+      所以直接和 `getSessionDir(sessionId)` 比 —— 精确判断比正则可靠
+      （而且省掉一份会慢慢长歪的重复实现）。
     */
-    hasLocalProject: !!entry.localDir,
+    hasLocalProject: localProjectDirOf(sessionId, entry) !== getSessionDir(sessionId),
     /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
   });

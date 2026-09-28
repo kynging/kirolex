@@ -414,10 +414,21 @@ describe('纯远程工程：别把它往本机引', () => {
     assert.equal(/这条会话没有本地工程/.test(withProject), false);
   });
 
-  test('这件事显式传，不从"localDir 有没有值"推', () => {
+  test('判据要排除草稿目录 —— 只看"localDir 有没有值"是错的', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    /* `localDir` 永远有值（退回会话目录），所以推不出来 */
-    assert.match(M, /hasLocalProject: !!entry\.localDir,/);
+    /*
+      **上一版这条是错的**，而且实测撞到了（用户：「为什么现在有远程会话在你本机跑了 xx 的提示」）：
+      那条没归项目的远程会话记录里 `localDir` 就是 `~/.kirolex/sessions/<id>` ——
+      **草稿目录本身被持久化进去了**。于是 `!!entry.localDir` 是 true，注入里那套
+      "他的仓库和工具链在他机器上、构建测试用 local_bash"照样发了出去，
+      而那条会话根本没有本地工程。表现就是它一直往用户的 Mac 上跑命令。
+
+      主进程知道确切路径，所以直接和 `getSessionDir(sessionId)` 比 —— 精确判断比正则可靠,
+      也省掉一份会慢慢长歪的重复实现（渲染层那个 `isSessionScratchDir` 是按形状匹配的,
+      它没有 sessionId 可用）。
+    */
+    assert.match(M, /hasLocalProject: localProjectDirOf\(sessionId, entry\) !== getSessionDir\(sessionId\),/);
+    assert.equal(/hasLocalProject: !!entry\.localDir,/.test(M), false, '那个只看有没有值的写法不该还在');
   });
 });
 
