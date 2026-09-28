@@ -306,8 +306,24 @@ export function writeSessionMarks(file: string, marks: SessionSyncMarks): void {
 export function sessionSyncState(
   mark: SessionSyncMark | undefined,
   localUpdatedAt: number,
+  /**
+   * 文件状态表里有没有这条会话的记录 —— 也就是"**传过**，但不知道是什么时候"。
+   *
+   * 这个参数不是可选的锦上添花，它挡的是两个必然会出现的错报：
+   *
+   * 1. **增量同步会跳过没变的文件**，于是一条内容没动过的会话永远不会再进
+   *    `touchedSessions`，也就永远拿不到 mark —— 没有这个兜底的话它会被一直说成"没备份过",
+   *    而它其实躺在桶里好好的；
+   * 2. **这张 mark 表是后加的**，存量会话一个 mark 都没有。升级之后满屏"没备份过"
+   *    会让人以为备份从来没工作过，然后去点「立即同步」—— 而那一轮只会跳过它们，
+   *    界面一个字都不变。
+   *
+   * 所以"传过但时间不明"要能表达出来：`synced` + `at: 0`，界面上说"已同步（时间未知）"。
+   * 编一个时间比说"不知道"糟 —— 那会让人拿一个假时间去判断备份新不新。
+   */
+  uploadedBefore = false,
 ): 'never' | 'pending' | 'synced' {
-  if (!mark || !mark.at) return 'never';
+  if (!mark || !mark.at) return uploadedBefore ? 'synced' : 'never';
   return (Number(localUpdatedAt) || 0) > (Number(mark.updatedAt) || 0) ? 'pending' : 'synced';
 }
 

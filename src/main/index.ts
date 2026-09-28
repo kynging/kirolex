@@ -4318,6 +4318,16 @@ app.whenReady().then(async () => {
   ipcMain.handle('s3:projects', () => {
     const cfg = loadSyncConfig();
     const marks = readSessionMarks(S3_MARKS_PATH);
+    /*
+      **哪些会话"传过但不知道什么时候"** —— 文件状态表里有它的路径就算传过。
+      两个必然的错报要靠它挡住：增量同步跳过没变的文件（那些会话永远进不了 mark 表）,
+      以及 mark 表是后加的（存量会话一个都没有）。见 `sessionSyncState` 那段。
+    */
+    const uploadedIds = new Set<string>();
+    for (const rel of Object.keys(readState(S3_STATE_PATH))) {
+      const sid = sessionIdOfRel(rel);
+      if (sid) uploadedIds.add(sid);
+    }
     interface Row { project: string; sessions: any[]; bytes: number; updatedAt: number }
     const byProject = new Map<string, Row>();
     for (const rec of store.listSessions()) {
@@ -4339,7 +4349,7 @@ app.whenReady().then(async () => {
         updatedAt: rec.updatedAt || 0,
         bytes,
         syncedAt: marks[rec.id]?.at || 0,
-        state: sessionSyncState(marks[rec.id], rec.updatedAt || 0),
+        state: sessionSyncState(marks[rec.id], rec.updatedAt || 0, uploadedIds.has(rec.id)),
       });
       byProject.set(key, cur);
     }

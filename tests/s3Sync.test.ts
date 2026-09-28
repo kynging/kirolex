@@ -892,7 +892,8 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
   test('项目清单从会话记录现算，空项目不出现', () => {
     const at = M5.indexOf("ipcMain.handle('s3:projects'");
     assert.ok(at > 0);
-    const body = M5.slice(at, at + 1800);
+    /* 窗口要够大 —— 这一段里有好几段解释为什么这么算的注释 */
+    const body = M5.slice(at, M5.indexOf("ipcMain.handle('s3:list-backups'"));
     /* 这一页要回答的是"同步会覆盖到哪些东西"，那取决于会话实际归在哪 */
     assert.match(body, /for \(const rec of store\.listSessions\(\)\)/);
     /* 未分组排最后，其余按最近动过排 —— 你要找的通常是刚用过的那个 */
@@ -968,5 +969,89 @@ describe('老 catalog 的项目归属从本地记录补', () => {
     /* 本地已经删掉的那些补不了，留空 → 未分组。编一个项目名比空着糟 */
     const at = M6.indexOf("ipcMain.handle('s3:list-backups'");
     assert.match(M6.slice(at, at + 2400), /本地已经没有的那些补不了，留空/);
+  });
+});
+
+/*
+ * 「每一个会话同步应该有最新同步到什么时间」。
+ *
+ * catalog 里的 `syncedAt` 回答不了这个问题：它每一轮给**所有**条目盖同一个 `now`，
+ * 说的是"catalog 什么时候写的"。一条一周没动过的会话文件根本没重传，
+ * 但它的 `syncedAt` 每 30 分钟还是往前跳。
+ */
+describe('每条会话的最新同步时间', () => {
+  test('从没传过 / 有改动待同步 / 已同步', async () => {
+    const { sessionSyncState } = await import('../src/main/s3Sync.ts');
+    assert.equal(sessionSyncState(undefined, 100), 'never');
+    /* 本地 updatedAt 比上传那一刻记下的新 → 有改动还没备份 */
+    assert.equal(sessionSyncState({ at: 5, updatedAt: 100 }, 200), 'pending');
+    assert.equal(sessionSyncState({ at: 5, updatedAt: 200 }, 200), 'synced');
+    /* `at` 为 0 的坏记录当成没传过 —— 那个字段是"什么时候传的"，0 不是一个时间 */
+    assert.equal(sessionSyncState({ at: 0, updatedAt: 999 }, 1), 'never');
+  });
+
+  test('"传过但时间不明"必须能表达 —— 否则会满屏误报"没备份过"', async () => {
+    const { sessionSyncState } = await import('../src/main/s3Sync.ts');
+    /*
+      两个必然出现的错报：
+      ① 增量同步跳过没变的文件 → 那些会话永远进不了 mark 表；
+      ② mark 表是后加的 → 存量会话一个 mark 都没有。
+      没有这个兜底的话它们会被一直说成"没备份过"，而它们其实躺在桶里好好的，
+      而且点「立即同步」也不会变（那一轮只会跳过它们）。
+    */
+    assert.equal(sessionSyncState(undefined, 100, true), 'synced');
+    assert.equal(sessionSyncState(undefined, 100, false), 'never');
+    /* 有 mark 时以 mark 为准 —— 它更精确 */
+    assert.equal(sessionSyncState({ at: 5, updatedAt: 1 }, 100, true), 'pending');
+  });
+
+  test('从上传路径认会话 id', async () => {
+    const { sessionIdOfRel } = await import('../src/main/s3Sync.ts');
+    assert.equal(sessionIdOfRel('sessions/s_1/transcript.jsonl'), 's_1');
+    assert.equal(sessionIdOfRel(`sessions${path.sep}s_2${path.sep}record.json`), 's_2');
+    /* 不是会话文件的（记忆层、附件）返回空 —— 它们不属于任何一条会话 */
+    assert.equal(sessionIdOfRel('memory/global.md'), '');
+    assert.equal(sessionIdOfRel('attachments/x.png'), '');
+    assert.equal(sessionIdOfRel(''), '');
+  });
+
+  test('只给这一轮真的传过文件的会话更新时间', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf('async function runS3Sync');
+    /* 到函数尾（`rescheduleS3Sync` 是紧跟其后的那个）—— 中间有几段长注释 */
+    const body = M.slice(at, M.indexOf('function rescheduleS3Sync', at));
+    assert.match(body, /const touchedSessions = new Set<string>\(\);/);
+    assert.match(body, /if \(sid\) touchedSessions\.add\(sid\);/);
+    /* 给所有会话盖一个 now 就又回到 catalog 那个毛病了 */
+    assert.match(body, /if \(touchedSessions\.size\) \{/);
+    /* `updatedAt` 一起记 —— 之后本地再动过就能算出"有改动还没备份" */
+    assert.match(body, /marks\[id\] = \{ at: now, updatedAt: byId\.get\(id\)\?\.updatedAt \|\| 0 \}/);
+  });
+
+  test('界面上"时间未知"和"没备份过"要分开说', () => {
+    const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+    /* 编一个时间比说"不知道"糟 —— 假时间会被拿去判断备份新不新 */
+    assert.match(UI, /x\.state === 'synced' \? '已同步（时间未知）' : '—'/);
+    assert.match(UI, /没备份过/);
+    assert.match(UI, /有改动待同步/);
+    /* 收起时组头也要能看出"这摊有几条没同步" */
+    assert.match(UI, /\$\{behind\} 条待同步/);
+  });
+
+  test('删掉一个项目的备份要连状态表和 mark 表一起清', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf("ipcMain.handle('s3:delete-project'");
+    assert.ok(at > 0);
+    const body = M.slice(at, at + 4200);
+    /*
+      不清状态表的话，下一轮同步会认为"这些文件没变、跳过"——
+      于是删掉的备份**再也不会被重新传上去**。
+    */
+    assert.match(body, /if \(sid && goneIds\.has\(sid\)\) delete state\[rel\];/);
+    assert.match(body, /for \(const id of goneIds\) delete marks\[id\];/);
+    /* catalog 最后写：先写的话中途失败会留下一个指向已删对象的 catalog */
+    assert.ok(body.indexOf('await deleteObject') < body.indexOf('putObject(creds!, catalogKey'));
+    /* 两道确认：界面弹一次，IPC 层还要求原样传回项目名（防手滑点到别的行） */
+    assert.match(body, /if \(confirm !== project\) return \{ ok: false/);
   });
 });

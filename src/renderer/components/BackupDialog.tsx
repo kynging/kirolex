@@ -345,7 +345,14 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                 ? <span className="backup-tag over">有改动待同步</span>
                                 : <span className="backup-tag new">已同步</span>}
                             <span className="backup-restore-meta">
-                              {x.syncedAt ? `同步于 ${when(x.syncedAt)}` : '—'}
+                              {/*
+                                `synced` 但没有时间 = 传过、但那次上传发生在这张表存在之前
+                                （或者之后每轮都因为"没变"被跳过）。说"时间未知"而不是编一个 ——
+                                假时间会被拿去判断备份新不新。
+                              */}
+                              {x.syncedAt
+                                ? `同步于 ${when(x.syncedAt)}`
+                                : x.state === 'synced' ? '已同步（时间未知）' : '—'}
                             </span>
                           </div>
                         ))}
