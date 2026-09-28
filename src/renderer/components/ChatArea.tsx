@@ -35,6 +35,7 @@ import { decidePaste } from '../pasteDecision';
 import { IconAppendMessage, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
+import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
 import { visit } from 'unist-util-visit';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
@@ -1415,7 +1416,14 @@ const ChatInputBox = memo<{
   onDropFiles: (files: AttachedFile[]) => void;
   onRemoveFile: (id: string) => void;
   attachedFiles: AttachedFile[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles }) => {
+  /**
+   * 模型在最后那条回复里列出来的选项（`choiceChips.ts` 认的）。
+   *
+   * kiro-cli 没有"问用户一个带选项的问题"这种协议方法（翻过二进制里所有方法名，
+   * 只有 `session/request_permission`），所以这些只能从回复文字里认。
+   */
+  choiceChips: ChoiceChip[];
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips }) => {
   const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
@@ -1733,6 +1741,31 @@ const ChatInputBox = memo<{
           scoped to the right moment without it: `suggestions` is the static starter set
           for an empty chat and otherwise only the chips STAMPED for the current turn,
           so they clear themselves when a new turn begins. */}
+      {/*
+        **模型列出来的选项** ——「有一些问题会给用户提问并提供多个选项，这个怎么处理的」。
+
+        kiro-cli 没有这种协议（只有工具授权那个 `session/request_permission`），所以模型
+        只能把选项写进文字里。这一排就是把那几项变成可点的 —— 点一下**填进输入框，不发送**:
+        这类回答最常见的形状是"2，但用 TypeScript"，自动发会把补一句的机会拿掉;
+        而万一认错了，填进去还能删，发出去就收不回。
+
+        判据在 `choiceChips.ts`（保守：要有问号或冒号、要 ≥2 项、每项要短、不在代码块里）。
+      */}
+      {!isStreaming && !isLooping && choiceChips.length > 0 && (
+        <div className="prompt-suggestions" aria-label="回复里的选项">
+          {choiceChips.map((chip) => (
+            <button
+              key={chip.value}
+              className="prompt-chip choice-chip"
+              onClick={() => setInput((prev) => (prev.trim() ? `${prev.replace(/\s+$/, '')} ${chip.value}` : chip.value))}
+              title="点一下填进输入框（不会直接发送）—— 你还能再补一句"
+            >
+              {chip.label}
+            </button>
+          ))}
+        </div>
+      )}
+
       {featureFlags.promptSuggestions !== false && !isStreaming && !isLooping && suggestions.length > 0 && (
         <div className="prompt-suggestions" aria-label={t('Starter prompts')}>
           {suggestions.map((suggestion) => (
@@ -2477,6 +2510,24 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   readOnly = false,
   paneFocused = true,
 }) => {
+  /*
+    **模型列出来的选项**（只认最后一条助手消息）——「有一些问题会给用户提问并提供多个选项」。
+
+    只看最后一条、而且只在这一轮结束之后：流式过程中那份文字是半截的，
+    编号列表会一项一项冒出来，片也就跟着闪 —— 那比没有更烦。
+    判据在 `choiceChips.ts`。
+  */
+  const choiceChips = React.useMemo<ChoiceChip[]>(() => {
+    if (isStreaming) return [];
+    for (let i = messages.length - 1; i >= 0; i -= 1) {
+      const msg = messages[i];
+      if (msg.role === 'user') return [];        // 最后说话的是你 → 没有待答的问题
+      if (msg.role !== 'assistant') continue;    // 工具/子代理那些跳过
+      return extractChoiceChips(String(msg.content || ''));
+    }
+    return [];
+  }, [messages, isStreaming]);
+
   /**
    * **这条会话跑在哪台机器上** ——「看起来工具调用是在本地？」。
    *
@@ -3755,6 +3806,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 </div>
               )}
               <ChatInputBox
+                choiceChips={choiceChips}
                 sessionId={currentSessionId}
                 isStreaming={isStreaming}
                 isLooping={isLooping}

@@ -262,3 +262,79 @@ describe('提示语和换行', () => {
     assert.match(G, /\* text=auto eol=lf/);
   });
 });
+
+/*
+ * 「有一些问题会给用户提问并提供多个选项，这个怎么处理的」。
+ *
+ * kiro-cli 的 ACP 里**没有**这种方法 —— 翻过那个二进制里所有方法名，会向客户端要答案的
+ * 只有 `session/request_permission`（工具授权），`session/request_user_input` / `ask` /
+ * `choice` 这类一个都没有。所以模型想让你选，只能把选项写进回复文字里。
+ *
+ * 也就是说这里没有任何结构化信息，只能从 markdown 认 —— 而"认"必然误判，
+ * 所以每一条判据都在挡一种具体的误判。
+ */
+describe('模型列出来的选项变成可点的片', () => {
+  test('问号或冒号 + 至少两项编号 → 认', async () => {
+    const { extractChoiceChips } = await import('../src/renderer/choiceChips.ts');
+    assert.equal(extractChoiceChips('你想用哪种方式？\n\n1. 直接改\n2. 先出方案\n3. 我自己来').length, 3);
+    assert.equal(extractChoiceChips('有三个选择：\n1. A\n2. B').length, 2);
+    /* 字母、`)`、`、`、前面带 `-` 的都要认 —— 模型的写法不统一 */
+    assert.equal(extractChoiceChips('选哪个？\nA) 保留\nB) 覆盖').length, 2);
+    assert.equal(extractChoiceChips('怎么做？\n- 1. 快的\n- 2. 稳的').length, 2);
+    /* 空行不打断：`1.\n\n2.` 是常见写法 */
+    assert.equal(extractChoiceChips('选？\n1. a\n\n2. b').length, 2);
+  });
+
+  test('没有"在问你"的信号 → 不显示', async () => {
+    const { extractChoiceChips } = await import('../src/renderer/choiceChips.ts');
+    /* "我做了三件事" 那种说明变成按钮会让人以为要选一个 */
+    assert.deepEqual(extractChoiceChips('我做了三件事\n1. 改了 a\n2. 改了 b'), []);
+  });
+
+  test('代码块里的编号 → 不显示（最容易误判的一类）', async () => {
+    const { extractChoiceChips } = await import('../src/renderer/choiceChips.ts');
+    assert.deepEqual(extractChoiceChips('看这段？\n```\n1. foo\n2. bar\n```'), []);
+    assert.deepEqual(extractChoiceChips('看这段？\n~~~\n1. foo\n2. bar\n~~~'), []);
+  });
+
+  test('一项 / 太长 / 太多 都不显示', async () => {
+    const { extractChoiceChips, MAX_ITEM_CHARS, MAX_CHIPS } = await import('../src/renderer/choiceChips.ts');
+    assert.deepEqual(extractChoiceChips('要不要？\n1. 好'), [], '一项不叫选项');
+    assert.deepEqual(extractChoiceChips(`选？\n1. ${'x'.repeat(MAX_ITEM_CHARS + 1)}\n2. y`), [],
+      '长段落的编号列表是文档，不是菜单');
+    const many = Array.from({ length: MAX_CHIPS + 1 }, (_, i) => `${i + 1}. o${i}`).join('\n');
+    assert.deepEqual(extractChoiceChips(`选？\n${many}`), [], '更多的话几乎肯定是清单');
+  });
+
+  test('一条消息里有多段列表时取**最后**那段', async () => {
+    const { extractChoiceChips } = await import('../src/renderer/choiceChips.ts');
+    /* 常见形状：先复述一遍做过的事，最后才问你 */
+    const chips = extractChoiceChips('先说明：\n1. 旧的\n2. 旧的2\n\n那么你选哪个？\n1. 新A\n2. 新B');
+    assert.deepEqual(chips.map((c) => c.value), ['新A', '新B']);
+  });
+
+  test('点了**填进输入框，不发送**', () => {
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    /*
+      这类回答最常见的形状是"2，但用 TypeScript"—— 自动发会把补一句的机会拿掉。
+      而万一认错了，填进去还能删，发出去就收不回。
+    */
+    assert.match(CA, /onClick=\{\(\) => setInput\(\(prev\) =>/);
+    assert.match(CA, /不会直接发送/);
+    /* 流式过程中不显示：那份文字是半截的，片会一项一项闪出来 */
+    assert.match(CA, /\{!isStreaming && !isLooping && choiceChips\.length > 0 && \(/);
+    /* 最后说话的是用户 → 没有待答的问题 */
+    assert.match(CA, /if \(msg\.role === 'user'\) return \[\];/);
+  });
+
+  test('这是唯一的办法 —— 协议里确实没有这种方法', () => {
+    /*
+      锚住这个事实：如果哪天 kiro-cli 真加了 `session/request_user_input`，
+      这条测试不会失败（它不该失败），但那段注释会提醒下一个人先去看协议，
+      而不是继续往正则里堆判据。
+    */
+    const C = fs.readFileSync(path.join(process.cwd(), 'src/renderer/choiceChips.ts'), 'utf8');
+    assert.match(C, /kiro-cli 的 ACP 里\*\*没有\*\*"问用户一个带选项的问题"这种方法/);
+    assert.match(C, /session\/request_permission/);
+  });
+});

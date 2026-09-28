@@ -8198,3 +8198,18 @@ button, input, select, textarea {
 /* 「删除备份」——删云上那份，不动本地。危险动作用红字标出来，别和别的按钮一个样。 */
 .backup-del { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, transparent); }
 .backup-del:hover:not(:disabled) { border-color: var(--error); background: color-mix(in srgb, var(--error) 12%, transparent); }
+
+/*
+  模型在回复里列出来的选项 ——「有一些问题会给用户提问并提供多个选项，这个怎么处理的」。
+  复用 `.prompt-chip` 的形状（同一排位置、同一种交互），但用虚线边框区分开:
+  starter prompts 是我们准备的，这些是**模型刚问你的** —— 两者不该看起来一样。
+*/
+.prompt-chip.choice-chip {
+  border-style: dashed;
+  border-color: color-mix(in srgb, var(--accent, #7c6fe0) 45%, transparent);
+  color: var(--text-primary);
+}
+.prompt-chip.choice-chip:hover {
+  border-style: solid;
+  border-color: var(--accent, #7c6fe0);
+}
