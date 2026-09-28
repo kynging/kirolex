@@ -497,10 +497,27 @@ class StdioProxy {
       **懒启动**：这些 server 很重（playwright 会拉起一个浏览器），没人调就不该起。
       `env` 合并进当前环境：那些 server 常常靠 PATH / HOME 找自己的东西。
     */
-    const child = spawn(this.spec.command, this.spec.args || [], {
-      stdio: ['pipe', 'pipe', 'pipe'],
-      env: { ...process.env, ...(this.spec.env || {}) },
-    });
+    /*
+      **Windows 上 `npx` / `uvx` 是 `.cmd` shim，`spawn` 直接执行不了**
+      ——「看一下有没有 windows 上不能跑的东西」。`spawn('npx', …)` 在 Windows 上
+      得到 EINVAL / ENOENT，于是**所有转发过去的 MCP 都起不来**，
+      而远端那边只会表现成"这个工具不存在"。
+
+      判据：Windows + 命令不是一个带后缀的可执行文件（`.exe`/`.com`）→ 走 shell。
+      走 shell 时命令要加引号（路径里有空格是常态：`C:\Program Files\…`）。
+      非 Windows 一律不走 shell —— 那边不需要，而走 shell 会把参数里的特殊字符变成语法。
+    */
+    const winShim = process.platform === 'win32' && !/\.(exe|com)$/i.test(this.spec.command);
+    const child = spawn(
+      winShim ? `"${this.spec.command}"` : this.spec.command,
+      this.spec.args || [],
+      {
+        stdio: ['pipe', 'pipe', 'pipe'],
+        env: { ...process.env, ...(this.spec.env || {}) },
+        shell: winShim,
+        windowsHide: true,
+      },
+    );
     this.child = child;
     child.stdout?.on('data', (d: Buffer) => {
       this.buf += d.toString('utf-8');

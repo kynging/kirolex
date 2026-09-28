@@ -43,10 +43,24 @@ export function localAgentJson(agent: string, home = os.homedir()): any | null {
   }
 }
 
-/** 命令是不是一个**本机路径**（绝对路径 / `~` 开头）。这种在远端必然不存在。 */
+/**
+ * 命令是不是一个**本机路径**（绝对路径 / `~` 开头）。这种在远端必然不存在，所以要转发。
+ *
+ * **Windows 的绝对路径也算** ——「看一下有没有 windows 上不能跑的东西」。
+ * 原来只认 `/` 和 `~`，于是 `C:\Users\k\node.exe` 被判成"不是本机路径"、
+ * 于是**不转发** —— 而这正是这个模块头警告的那种失败：静默少工具。
+ * 远端那台 Linux 上当然没有 `C:\…`，所以漏判的代价是那个 MCP 根本起不来，
+ * 而模型只会说"我没有这个工具"。
+ *
+ * 认三种形状：POSIX 绝对路径、`~`、Windows 的 `C:\` / `C:/` / UNC（`\\server\share`）。
+ */
 export function isLocalPathCommand(command: string): boolean {
   const c = String(command || '').trim();
-  return c.startsWith('/') || c.startsWith('~');
+  if (!c) return false;
+  if (c.startsWith('/') || c.startsWith('~')) return true;
+  if (/^[A-Za-z]:[\\/]/.test(c)) return true;          // C:\… 或 C:/…
+  if (c.startsWith('\\\\')) return true;                   // UNC：\\server\share\…
+  return false;
 }
 
 /**

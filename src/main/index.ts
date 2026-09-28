@@ -50,7 +50,7 @@ import {
   ownerTag, ownedAgentPrefix,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
+import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
@@ -1809,6 +1809,20 @@ async function ensureLocalTools(
  * 下一次 `orphanSweepScript` 顺手收掉（或者它自己退出）。
  */
 function sweepStrayLocalSsh(): void {
+  /*
+    **Windows 上 `ps` 和 PPID==1 两个都不成立** ——「看一下有没有 windows 上不能跑的东西」。
+
+    没有 `ps`（execFileSync 直接 ENOENT，被下面的 catch 吞掉），而 Windows 也没有
+    "孤儿 reparent 到 PID 1"这个约定 —— 所以这一轮在 Windows 上是彻底的 no-op,
+    泄漏的 ssh 会一直累积。而这**正是压死那台 EC2 的那条链的第一环**：
+    本机 ssh 还连着 → 远端 sshd 和 kiro-cli 也就都还活着 → 越堆越多。
+
+    Windows 上换成 `wmic` 的等价查询（pid / 父 pid / 完整命令行），判据从 "PPID==1"
+    换成 "**父进程已经不在了**"——那是同一个意思的可移植说法：
+    Unix 上父进程死了会 reparent 到 1，Windows 上 pid 直接变成一个不存在的进程。
+    （Unix 上不改判据：PPID==1 更便宜，而且那条路是实测过的。）
+  */
+  if (process.platform === 'win32') { sweepStrayLocalSshWindows(); return; }
   try {
     const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
     const victims: number[] = [];
@@ -1826,6 +1840,66 @@ function sweepStrayLocalSsh(): void {
     if (victims.length) {
       logger.warn('remote', `杀掉 ${victims.length} 个上一次留下的 ssh 客户端（pid ${victims.join(', ')}）——`
         + `它们被 launchd 收养之后还连着远端，远端那些执行器也就一直活着`);
+    }
+  } catch (err: any) {
+    logger.info('remote', `扫本机遗留 ssh 没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
+  }
+}
+
+/**
+ * Windows 版的"杀掉遗留的 ssh 客户端"。
+ *
+ * `ps` 不存在，所以用 PowerShell 的 CIM 查询拿 `ProcessId` / `ParentProcessId` /
+ * `CommandLine` —— `wmic` 在新版 Windows 上已经被标记淘汰了，`Get-CimInstance` 是替代。
+ *
+ * 判据和 Unix 那边是**同一个意思**，只是换了说法：Unix 上父进程死了会 reparent 到 PID 1,
+ * 所以 `PPID==1` 就是"没人管了"；Windows 上 pid 不会被重新挂，父 pid 只是指向一个
+ * 已经不存在的进程 —— 所以判据是"**父进程不在活着的 pid 集合里**"。
+ *
+ * 同样要带 KiroLex 的印记（agent 名或 `kirolex-mux/`），这样不碰用户自己开的 ssh。
+ */
+function sweepStrayLocalSshWindows(): void {
+  try {
+    const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'ssh.exe\'" | '
+      + 'ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)" }';
+    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+    });
+    const rows: Array<{ pid: number; ppid: number; cmd: string }> = [];
+    for (const line of String(out).split(/\r?\n/)) {
+      const parts = line.split('\t');
+      if (parts.length < 3) continue;
+      const pid = Number(parts[0]);
+      const ppid = Number(parts[1]);
+      if (!Number.isFinite(pid) || !Number.isFinite(ppid)) continue;
+      rows.push({ pid, ppid, cmd: parts.slice(2).join('\t') });
+    }
+    /* 所有活着的 ssh.exe 的 pid —— 用来判断"父进程还在不在"。父进程可能不是 ssh，
+       所以这里只能判断"父 pid 不在我们看到的任何进程里"时才算孤儿，于是再查一次全量 pid。 */
+    const alive = new Set<number>();
+    try {
+      const all = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+        'Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId }'], {
+        encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, windowsHide: true,
+      });
+      for (const l of String(all).split(/\r?\n/)) {
+        const n = Number(l.trim());
+        if (Number.isFinite(n)) alive.add(n);
+      }
+    } catch { return; }              // 拿不到全量 pid 就**什么都不杀** —— 宁可漏，不可错杀
+
+    const victims: number[] = [];
+    for (const r of rows) {
+      if (!r.cmd.includes(SESSION_AGENT_PREFIX) && !r.cmd.includes(`${MUX_DIR}/`)) continue;
+      if (alive.has(r.ppid)) continue;              // 父进程还在 → 这条是活的
+      victims.push(r.pid);
+    }
+    for (const pid of victims) {
+      try { process.kill(pid, 'SIGTERM'); } catch { /* 已经走了 */ }
+    }
+    if (victims.length) {
+      logger.warn('remote', `杀掉 ${victims.length} 个上一次留下的 ssh 客户端（pid ${victims.join(', ')}）——`
+        + `它们的父进程已经没了，但还连着远端，远端那些执行器也就一直活着`);
     }
   } catch (err: any) {
     logger.info('remote', `扫本机遗留 ssh 没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
@@ -8504,7 +8578,7 @@ app.whenReady().then(async () => {
     const target = {
       sshHost: String(input.sshHost).trim(),
       sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
-      identityFile: input.identityFile ? String(input.identityFile).replace(/^~(?=\/|$)/, os.homedir()) : undefined,
+      identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
     } as RemoteTarget;
     /* 脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里 */
     const candidates = [
@@ -8539,7 +8613,17 @@ app.whenReady().then(async () => {
     try {
       const cli = resolveKiroCli();
       if (!cli) throw new Error('本机找不到 kiro-cli');
-      const who = execSync(`${shellQuote(cli)} whoami`, { encoding: 'utf8', timeout: 20_000 });
+      /*
+        **不要用 `shellQuote` 走 shell** ——「看一下有没有 windows 上不能跑的东西」。
+        `shellQuote` 包的是 POSIX 单引号，而 `execSync` 在 Windows 上走 cmd.exe ——
+        那边 `'…'` 不是引号，于是命令变成字面的 `'C:\…\kiro-cli.exe' whoami` 然后失败。
+        失败被下面的 catch 吞掉，表现是 bootstrap **静默丢掉登录参数**，
+        远端装好了却没登录，而日志里只有一句"没读到本机的登录参数"。
+
+        `execFileSync` 不经过 shell：参数按数组传，两个平台都不需要引号。
+        （下面那个 `loginEnvStr` 仍然用 `shellQuote` —— 它是拼给**远端 bash** 的，那是对的。）
+      */
+      const who = execFileSync(cli, ['whoami'], { encoding: 'utf8', timeout: 20_000 });
       const env = loginEnv(parseWhoami(who));
       loginEnvStr = Object.entries(env).map(([k, v]) => `${k}=${shellQuote(v)} `).join('');
       if (loginEnvStr) logger.info('remote', `bootstrap 会带上登录参数（${env.KIRO_LOGIN_PROVIDER}）`);
@@ -8721,7 +8805,7 @@ app.whenReady().then(async () => {
     const target = {
       sshHost: String(input.sshHost).trim(),
       sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
-      identityFile: input.identityFile ? String(input.identityFile).replace(/^~(?=\/|$)/, os.homedir()) : undefined,
+      identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
       remoteWorkdir: input.remoteWorkdir || undefined,
     } as RemoteTarget;
     /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */

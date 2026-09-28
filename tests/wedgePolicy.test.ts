@@ -23,9 +23,18 @@ describe('the wedge watchdog does not consult the CPU', () => {
     for (const gone of ['sampleTreeCpu', 'treeIsWorking', 'CPU_PROBE', 'CPU_VETO', 'cpuBusy', 'vetoExhausted']) {
       assert.equal(main.includes(gone), false, `${gone} is back: the interrupt must stay deterministic`);
     }
-    // The `ps -Ao` / CIM sweep that fed it is gone with it.
+    // The `ps -Ao` sweep that fed it is gone with it.
     assert.equal(main.includes("'ps', ['-Ao'"), false);
-    assert.equal(main.includes('Get-CimInstance Win32_Process'), false);
+    /*
+      What must stay gone is CPU *measurement*, not the process-listing API itself.
+      `Get-CimInstance Win32_Process` is now used for something unrelated: the Windows
+      half of the startup sweep that kills ssh clients whose parent is gone
+      (`sweepStrayLocalSshWindows` -- on Unix that is `ps` + PPID==1). Banning the
+      string would ban that too, so the assertion names the CPU fields instead.
+    */
+    for (const cpuField of ['PercentProcessorTime', 'KernelModeTime', 'UserModeTime', 'TotalProcessorTime']) {
+      assert.equal(main.includes(cpuField), false, `${cpuField} is back: the interrupt must not consult the CPU`);
+    }
   });
 
   test('the removal is explained where the code used to be', () => {

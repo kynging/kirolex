@@ -1,8 +1,12 @@
 # Windows 上跑不起来的东西
 
 2026-09-28 全量审计（`src/main/`、`src/renderer/`、`scripts/`）的结论。
-**第 1–5 条已修**（2026-09-28）。剩下的是 COSMETIC 和一条不是代码 bug 的 Windows 风险,
-以及几个只影响开发机的 dev 脚本 —— 都列在下面并标了原因。
+**第 1–5 节全部已修**（2026-09-28）。剩下的只有：
+· 第 6 节 —— Windows 上 `SIGTERM` 不触发（只在 dev supervisor 下有意义，已注明）、
+  两个写死了某台 Mac 路径的 dev 探针脚本；
+· 第 7 节 —— 一条不是代码 bug 的 Windows 风险（AV / 索引器占着文件会让 rename 失败）;
+· `config.ts:254` 的草稿目录名（`C_Users_x_proj`，纯 cosmetic，有 SHA1 后缀保证唯一）;
+· `sshMux.ts` 的 `mode: 0o700`（Windows 上复用已禁用，这条现在 moot）。
 
 ## 先说已经是对的那些
 
@@ -85,12 +89,12 @@ false，`net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` �
 | 位置 | 后果 |
 |---|---|
 | `src/main/localMcp.ts` | ✅ `find` / `grep` / `bash` 三条都有了 Windows 分支：`globNative` / `grepNative`（用 Node 走目录树，跳过 node_modules / .git，有 2 万个文件的上限，二进制文件按有没有 NUL 跳过），`local_bash` 换成 `%ComSpec% /d /s /c`。ripgrep 仍然优先（Windows 上也常有）。**这些工具跑在用户那台机器上**，所以 Windows 用户一开远程会话就会碰到，而模型会把"工具报错"解释成"这个东西不存在" |
-| `src/main/localMcp.ts:369` | `spawn` 不带 `shell: true` → `npx` / `uvx` 这类 `.cmd` shim 起不来，转发的 MCP 静默少工具 |
-| `src/main/forwardMcp.ts:49` | 用 `startsWith('/')` 判断"这是本机命令"→ `C:\…\node.exe` 被判成不是本机的，于是**静默不转发**（正是那个模块头警告的那种静默丢工具） |
-| `src/main/index.ts:8431` | `execSync` 里用 `shellQuote` 的 POSIX 单引号 → cmd.exe 不认，`remote:bootstrap` 静默丢掉登录环境 |
-| `src/main/index.ts:1768-1779` | 孤儿 ssh 清理靠 `ps -eo` + PPID==1 → Windows 上两个都不成立，泄漏的 ssh 会累积 |
-| `src/main/sshMux.ts:259` | `mode: 0o700` 在 Windows 上被静默忽略（没有 ACL） |
-| `src/main/index.ts:8396,8613`、`src/main/remoteTargets.ts:37` | `~\.ssh\id_rsa` 不展开（正则要求 `~/`） |
+| `src/main/localMcp.ts` | ✅ Windows + 命令不带 `.exe`/`.com` 后缀 → `shell: true` 并给命令加引号（路径带空格是常态）。不修的话 `npx` / `uvx` 这类 `.cmd` shim 全起不来，转发过去的 MCP 静默少工具 |
+| `src/main/forwardMcp.ts` | ✅ `isLocalPathCommand` 现在也认 `C:\` / `C:/` / UNC（`\\server\share`）。不修的话 `C:\…\node.exe` 被判成不是本机路径 → **静默不转发**，而远端那台 Linux 上当然没有 `C:\…` |
+| `src/main/index.ts` | ✅ 那句 `whoami` 改成 `execFileSync`（不经过 shell，两个平台都不需要引号）。原来 `shellQuote` 包的是 POSIX 单引号，cmd.exe 不认 → bootstrap **静默丢掉登录参数**，远端装好了却没登录 |
+| `src/main/index.ts` | ✅ 加了 `sweepStrayLocalSshWindows`：用 `Get-CimInstance Win32_Process` 拿 pid / 父 pid / 命令行，判据从 "PPID==1" 换成"**父进程不在活着的 pid 集合里**"（同一个意思的可移植说法）。拿不到全量 pid 就什么都不杀 —— 宁可漏，不可错杀。不修的话这一轮在 Windows 上是彻底 no-op，而**这正是压死那台 EC2 的链条的第一环** |
+| `src/main/sshMux.ts:259` | `mode: 0o700` 被忽略 —— **moot**：Windows 上复用已经禁用了（第 1 条），那个目录根本不会被建 |
+| `src/main/remoteTargets.ts` | ✅ `expandHome` 两种分隔符都认（`~` 后面必须紧跟分隔符或结尾 —— 否则 `~user/x` 会被错展开）。index.ts 里那两处重复实现删掉，改成复用它 |
 | `src/main/config.ts:254` | 草稿目录名变成 `C_Users_x_proj` |
 
 ## 6. dev flow

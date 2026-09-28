@@ -35,7 +35,15 @@ export interface RemoteTargetEntry extends RemoteTarget {
 export function expandHome(p: string | undefined, home = os.homedir()): string | undefined {
   if (!p) return undefined;
   if (p === '~') return home;
-  if (p.startsWith('~/')) return path.join(home, p.slice(2));
+  /*
+    **两种分隔符都认** ——「看一下有没有 windows 上不能跑的东西」。
+    原来只认 `~/`，于是 Windows 上填 `~\.ssh\id_rsa` 不会被展开 ——
+    ssh 拿到一个字面的 `~` 目录，然后报"找不到密钥"，而那句话看不出问题在 `~` 上。
+
+    `~` 后面必须**紧跟分隔符或者就是结尾**：否则 `~user/x`（POSIX 里"别人的家目录"）
+    会被展开成 `<我的家目录>user/x`，那是另一个错。
+  */
+  if (/^~[\\/]/.test(p)) return path.join(home, p.slice(2));
   return p;
 }
 
