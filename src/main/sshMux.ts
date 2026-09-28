@@ -47,6 +47,29 @@ import net from 'net';
 import os from 'os';
 import path from 'path';
 
+/**
+ * **Windows 上没有这条路** ——「看一下有没有 windows 上不能跑的东西」。
+ *
+ * Win32-OpenSSH **根本没有实现连接多路复用**：`ControlMaster` / `ControlPath` 它不认。
+ * 而这个模块的探活是 unix domain socket 形状的（`statSync().isSocket()` +
+ * `net.connect(<文件路径>)`，后者在 Windows 上要的是 `\\.\pipe\…` 命名管道），
+ * 所以那两个判断在 Windows 上**永远是 false**。
+ *
+ * 连起来的后果是致命的：`ensureLocalTools` 会 `await sshMux.ensure()`，于是它等满 12 秒、
+ * 抛「复用连接没建起来」——**每一条远程会话都起不来**。这是我加复用时引入的回归
+ * （复用之前每条会话自己一条 ssh、自己一个 `-R` 端口，在 Windows 上是好的）。
+ *
+ * 所以这里明确地"不支持"而不是"试试看"：Windows 上 `supported()` 返回 false，
+ * 调用方走回**每条会话自己一条连接**那条老路。那条路在 Windows 上一直能用，
+ * 只是没有复用带来的好处（sshd 握手次数、端口数）——而那是性能，不是功能。
+ *
+ * 判据用 `process.platform`，不是"试一次看看行不行"：试的代价是每条会话 12 秒,
+ * 而答案是平台决定的、不会变。
+ */
+export function muxSupported(platform: string = process.platform): boolean {
+  return platform !== 'win32';
+}
+
 /** 一台机器的标识 —— host + 端口（同一台机器的不同端口是不同的 sshd）。 */
 export function muxKey(sshHost: string, sshPort?: number): string {
   return `${String(sshHost || '').trim()}:${sshPort || 22}`;
@@ -241,6 +264,12 @@ export class SshMux {
    * 表现是"只有第一条会话有工具"。
    */
   async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string }): Promise<MuxEntry> {
+    /*
+      **Windows 上直接说"没有"** —— 见 `muxSupported`。抛出去而不是返回 undefined:
+      调用方要据此走"每条会话自己一条连接"那条路，而一个 undefined 很容易被当成
+      "还没建好、等一下再看"。
+    */
+    if (!muxSupported()) throw new Error('MUX_UNSUPPORTED');
     const key = muxKey(target.sshHost, target.sshPort);
     const live = this.entries.get(key);
     if (live && !live.proc.killed && live.proc.exitCode === null && await probeSocket(live.socket)) return live;

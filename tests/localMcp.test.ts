@@ -358,14 +358,13 @@ describe('接线：隧道、会话专用 agent、以及远端进程的收尾', (
 describe('端口不按会话分配（竞态从根上消掉）', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
-  test('端口来自那台机器的复用连接，不是每条会话算一个', () => {
+  test('支持复用的平台上，端口来自那台机器的复用连接', () => {
     const at = M.indexOf('async function ensureLocalTools');
     assert.ok(at > 0);
     const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
-    assert.match(body, /const mux = await sshMux\.ensure\(remote\);/);
-    assert.match(body, /const remotePort = mux\.remotePort;/);
-    /* 老写法的两个痕迹都不该还在 */
-    assert.equal(/allocateRemotePort\(used\)/.test(body), false);
+    assert.match(body, /if \(muxSupported\(\)\) \{/);
+    assert.match(body, /remotePort = \(await sshMux\.ensure\(remote\)\)\.remotePort;/);
+    /* 那个"复用自己上一次那个端口"的老写法不该还在（它会撞上还没退出的旧 ssh） */
     assert.equal(/localToolsBySession\.get\(sessionId\)\?\.remotePort \?\?/.test(M), false);
   });
 
@@ -373,9 +372,9 @@ describe('端口不按会话分配（竞态从根上消掉）', () => {
     /* 顺序仍然要求：`mkdir -p` 和那份临时 agent 的 URL 里都带着这个端口 */
     const at = M.indexOf('async function ensureLocalTools');
     const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
-    const got = body.indexOf('const remotePort = mux.remotePort;');
+    const got = body.indexOf('localToolsBySession.set(sessionId, { remotePort,');
     const write = body.indexOf('await writeRemoteFile(remote, `mkdir -p ');
-    assert.ok(got > 0 && write > got, '先拿到端口，再写远端文件');
+    assert.ok(got > 0 && write > got, '先定下端口，再写远端文件');
   });
 });
 

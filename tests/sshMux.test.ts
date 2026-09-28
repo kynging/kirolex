@@ -254,7 +254,7 @@ describe('ssh 连接复用', () => {
     assert.match(M, /function hasSessionOn[\s\S]{0,400}sessionClients\.values\(\)/);
   });
 
-  test('端口不再是会话的东西 —— 换 agent / 换模型不用换端口', () => {
+  test('支持复用时端口归机器 —— 换 agent / 换模型不用换端口', () => {
     /*
       老 bug：换 agent 是**先起新执行器、成功了再关旧的**（故意的，失败时不丢会话），
       而新 ssh 去绑这条会话原来那个端口时旧 ssh 还占着，`ExitOnForwardFailure=yes`
@@ -264,9 +264,12 @@ describe('ssh 连接复用', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf('async function ensureLocalTools');
     const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
-    assert.match(body, /const mux = await sshMux\.ensure\(remote\);/);
-    assert.match(body, /const remotePort = mux\.remotePort;/);
-    assert.equal(/allocateRemotePort\(used\)/.test(body), false, '不再按会话分配端口');
+    assert.match(body, /remotePort = \(await sshMux\.ensure\(remote\)\)\.remotePort;/);
+    /*
+      **Windows 上仍然是按会话分**（那儿没有连接复用，见「Windows：复用不可用时…」那一组）,
+      所以 `allocateRemotePort` 还在 —— 它在回退那一支里。这一条只断言"支持复用时走复用"。
+    */
+    assert.match(body, /if \(muxSupported\(\)\) \{/);
   });
 });
 
@@ -415,5 +418,66 @@ describe('纯远程工程：别把它往本机引', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     /* `localDir` 永远有值（退回会话目录），所以推不出来 */
     assert.match(M, /hasLocalProject: !!entry\.localDir,/);
+  });
+});
+
+/*
+ * **Windows 上没有连接复用这条路** ——「看一下有没有 windows 上不能跑的东西」。
+ *
+ * Win32-OpenSSH 根本没实现多路复用（`ControlMaster` / `ControlPath` 它不认），而这个模块的
+ * 探活是 unix domain socket 形状的：`statSync().isSocket()` 在 Windows 上永远 false，
+ * `net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` 命名管道。
+ *
+ * 连起来的后果是致命的：`ensureLocalTools` 会 await `sshMux.ensure()`，于是每条远程会话
+ * 等满 12 秒然后抛「复用连接没建起来」——**一条都起不来**。这是加复用时引入的回归
+ * （复用之前每条会话自己一条 ssh、自己一个 `-R` 端口，在 Windows 上是好的）。
+ */
+describe('Windows：复用不可用时回到每会话一条隧道', () => {
+  test('平台判据是 process.platform，不是"试一次看看"', async () => {
+    const { muxSupported } = await import('../src/main/sshMux.ts');
+    assert.equal(muxSupported('win32'), false);
+    assert.equal(muxSupported('darwin'), true);
+    assert.equal(muxSupported('linux'), true);
+    /* 试的代价是每条会话 12 秒，而答案是平台决定的、不会变 */
+    const S = fs.readFileSync(path.join(process.cwd(), 'src/main/sshMux.ts'), 'utf8');
+    assert.match(S, /platform !== 'win32'/);
+  });
+
+  test('`ensure` 在不支持的平台上明确抛错，而不是返回 undefined', async () => {
+    const S = fs.readFileSync(path.join(process.cwd(), 'src/main/sshMux.ts'), 'utf8');
+    /* undefined 很容易被当成"还没建好、等一下再看" */
+    assert.match(S, /if \(!muxSupported\(\)\) throw new Error\('MUX_UNSUPPORTED'\);/);
+  });
+
+  test('接线：不支持就自己分端口，ssh 自己带 -R（也就是复用之前的行为）', () => {
+    const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const at = M.indexOf('async function ensureLocalTools');
+    const body = M.slice(at, M.indexOf('function sweepStrayLocalSsh'));
+    assert.match(body, /if \(muxSupported\(\)\) \{/);
+    assert.match(body, /remotePort = \(await sshMux\.ensure\(remote\)\)\.remotePort;/);
+    /* 回退那支：按会话分端口，并且把自己当前那个也算进"已占用" */
+    assert.match(body, /remotePort = allocateRemotePort\(used\);/);
+    assert.match(body, /const used = \[\.\.\.localToolsBySession\.values\(\)\]\.map\(\(v\) => v\.remotePort\);/);
+    /* 这句话一次就够 —— 每条会话都说一遍是噪音 */
+    assert.match(M, /let muxWarned = false;/);
+  });
+
+  test('回退时 `buildSshArgs` 必须走带 -R 的那一支', async () => {
+    const { buildSshArgs, setMuxSocketResolver } = await import('../src/main/acp-client.ts');
+    try {
+      /* 没有复用连接 → resolver 返回 undefined → 老路（自己建连接 + 自己的隧道） */
+      setMuxSocketResolver(() => undefined);
+      const args = buildSshArgs(
+        { sshHost: 'u@h', identityFile: '/k.pem' } as any,
+        'kiro-cli acp',
+        { remotePort: 39100, localPort: 51234 },
+      );
+      assert.ok(args.includes('-R'));
+      assert.ok(args.includes('127.0.0.1:39100:127.0.0.1:51234'));
+      assert.ok(args.includes('ExitOnForwardFailure=yes'));
+      assert.equal(args.some((a) => String(a).includes('ControlPath')), false);
+    } finally {
+      setMuxSocketResolver(undefined);
+    }
   });
 });

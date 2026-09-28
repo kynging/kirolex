@@ -4,7 +4,7 @@ import fs from 'fs';
 import os from 'os';
 import { execSync, execFileSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
-import { SshMux, muxKey, MUX_DIR } from './sshMux';
+import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
@@ -1676,8 +1676,29 @@ async function ensureLocalTools(
       分辨会话的是 URL 里的 token。所以现在一台机器一条隧道、一个端口，所有会话共用它 ——
       抢不起来，也不用换。
     */
-    const mux = await sshMux.ensure(remote);
-    const remotePort = mux.remotePort;
+    /*
+      **复用不可用时回到"每条会话自己一条隧道"** ——「看一下有没有 windows 上不能跑的东西」。
+
+      Win32-OpenSSH 没有实现连接多路复用（`ControlMaster` 它不认），而这个模块的探活是
+      unix socket 形状的 —— 所以在 Windows 上复用**永远建不起来**。原来这里直接 await，
+      于是每条远程会话等满 12 秒然后失败：这是我加复用时引入的回归。
+
+      回退那条路就是复用之前的行为：自己分一个远端端口、ssh 自己带 `-R`。
+      少了复用的好处（少握手、少端口），但功能是全的 —— 而那正是取舍该有的样子。
+    */
+    let remotePort: number;
+    if (muxSupported()) {
+      remotePort = (await sshMux.ensure(remote)).remotePort;
+    } else {
+      /* 按会话分端口：把**自己当前那个**也算进"已占用"，避免"先起新的再关旧的"时撞上自己 */
+      const used = [...localToolsBySession.values()].map((v) => v.remotePort);
+      remotePort = allocateRemotePort(used);
+      if (!muxWarned) {
+        muxWarned = true;
+        logger.info('sshmux', `这个平台（${process.platform}）的 ssh 不支持连接复用 ——`
+          + `每条远程会话各用一条 ssh 和一个远端端口（功能一样，只是少了复用的好处）`);
+      }
+    }
     localToolsBySession.set(sessionId, { remotePort, localPort: server.port(), agentOverride });
     /*
       **远端那个草稿目录要先建出来** —— 实测：`sessionCwd` 给的是
@@ -2100,6 +2121,8 @@ const sshMux: SshMux = new SshMux({
   allocateRemotePort,
   owner: OWNER,
 });
+/** 「这个平台不支持复用」只说一次 —— 每条会话都说一遍就是噪音。 */
+let muxWarned = false;
 /* 每条 ssh 都先问一句"这台机器有没有现成的连接" —— 有就当 channel 走，没有照旧建新的 */
 setMuxSocketResolver((remote) => (remote?.sshHost ? sshMux.liveSocketFor(remote) : undefined));
 
