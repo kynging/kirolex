@@ -488,10 +488,10 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     assert.match(UI, /listS3Backups/);
   });
 
-  test('多选 + 一颗恢复按钮 + 全选', () => {
+  test('多选 + 一颗恢复按钮', () => {
     assert.match(UI, /const \[picked, setPicked\] = useState<Set<string>>/);
-    /* 现在是按组全选（「你得按 project 整理」），不是一个全局「全选」 */
-    assert.match(UI, /const toggleGroup = /);
+    /* 「选整组」那颗按钮删了（「选整组那个按钮是干毛线」）—— 要多选逐行勾就够了 */
+    assert.equal(/toggleGroup/.test(UI), false);
     assert.match(UI, /恢复选中的/);
     /* 一条一条恢复：并发会同时写 trash 和 sessions，而失败要说清是哪一条 */
     assert.match(UI, /for \(const e of chosen\)/);
@@ -500,7 +500,8 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
 
   test('**一次**确认，而且把要覆盖的那几条点名', () => {
     /* 逐条确认的问题不是慢，是每次长得一样 —— 点到第五次就不看了，而其中可能有一条是覆盖 */
-    assert.equal((UI.match(/window\.confirm/g) || []).length, 1);
+    /* 恢复那一页只确认一次；同步那一页删备份还有一次（那是另一个动作） */
+    assert.equal((UI.match(/window\.confirm/g) || []).length, 2);
     assert.match(UI, /merging\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
     /* 本地已有的那些现在是**合并**（见下面那个 describe），不是覆盖 */
     /* 原生 confirm 不认 markdown，所以这里用「」而不是 ** */
@@ -510,7 +511,7 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
 
   test('正连着的不给勾 —— 主进程会拒，让人勾上再被拒是最差的', () => {
     assert.match(UI, /disabled=\{!!e\.attached \|\| !!busy\}/);
-    /* 能勾的集合里就没有它们，所以"全选"也不会把它们带上 */
+    /* 能勾的集合里就没有它们 */
     assert.match(UI, /\(entries \|\| \[\]\)\.filter\(\(e\) => !e\.attached\)/);
     /* 这个标记是主进程给的（它才知道谁连着） */
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
@@ -915,21 +916,25 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
     assert.match(UI5, /同步\{projects \? ` \(\$\{syncingCount\}\/\$\{projects\.length\}\)` : ''\}/);
   });
 
-  test('恢复那页按项目分组、组头粘顶、能收起、能整组勾', () => {
+  test('恢复那页按项目分组、组头粘顶、能收起', () => {
     assert.match(UI5, /const groups = useMemo/);
     /* 「未分组」整组排最后 */
     assert.match(UI5, /a\[0\] === '未分组' \? 1 : -1/);
-    assert.match(UI5, /const toggleGroup = /);
-    assert.match(UI5, /选整组/);
+    /*
+      「选整组」删掉了 —— 恢复整个项目不是常见动作，而那颗按钮占的位置最容易误点。
+      只看真会渲染出来的部分：文件头那段注释里会提到它（在解释为什么删的）。
+    */
+    assert.equal(/>\s*\{allOn \? '取消整组' : '选整组'\}/.test(UI5), false);
+    assert.equal(/toggleGroup/.test(UI5), false);
     /* 滚到一半时"我在看哪个项目"不该需要往上翻 */
     const at = CSS5.indexOf('.backup-group-head {');
     assert.ok(at > 0);
     assert.match(CSS5.slice(at, at + 320), /position: sticky;/);
   });
 
-  test('整组勾也不会把"正连着"的带上', () => {
+  test('"正连着"的那些连勾都不给', () => {
     /* 那些恢复会被主进程拒 —— 夹在一堆成功里最容易被漏掉 */
-    assert.match(UI5, /const ids = rows\.filter\(\(e\) => !e\.attached\)\.map\(\(e\) => e\.id\);/);
+    assert.match(UI5, /disabled=\{!!e\.attached \|\| !!busy\}/);
   });
 
   test('同步完把恢复那张表作废 —— 桶里的东西变了', () => {

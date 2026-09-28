@@ -19,10 +19,25 @@ import { Breaker, backoffMs, worthRetrying, BREAKER_MS, PREFLIGHT_ATTEMPTS } fro
 describe('连不上：退避重试 + 整机熔断', () => {
   test('退避是指数的，而且总时长压在启动路径能忍的范围内', () => {
     assert.equal(backoffMs(1), 800);
-    assert.equal(backoffMs(2), 3_200);
+    assert.equal(backoffMs(2), 2_000);
+    assert.equal(backoffMs(3), 5_000);
+    assert.equal(backoffMs(4), 10_000);
+    /* 超出表尾夹在最后一档 */
+    assert.equal(backoffMs(99), 10_000);
     /* 三次尝试、两段等待 —— 最坏多等 4 秒 */
-    assert.equal(PREFLIGHT_ATTEMPTS, 3);
-    assert.ok(backoffMs(1) + backoffMs(2) <= 5_000);
+    /*
+      3 → 5 ——「给这个远程会话多加一些重试吧」。原来不敢加是因为并发探测会撑满 sshd 的
+      `MaxStartups`；那条修了（同一台机器同时只有一个探测在路上），所以 5 次是**一个**
+      探测者的 5 次顺序连接，不是 35 次并发。
+    */
+    assert.equal(PREFLIGHT_ATTEMPTS, 5);
+    /*
+      总时长从 ~4 秒拉到 ~18 秒 ——「给这个远程会话多加一些重试吧」。
+      拉长是刻意的：sshd 压力下的 `MaxStartups` 是滑动窗口、`LoginGraceTime` 默认 120 秒,
+      隔 3 秒再试等于还在同一个拥塞窗口里。而这段等待只在**真的连不上**时发生。
+    */
+    const total = [1, 2, 3, 4].reduce((sum, n) => sum + backoffMs(n), 0);
+    assert.ok(total > 5_000 && total <= 20_000, `总退避 ${total}ms`);
   });
 
   test('只重试"可能自愈"的失败', () => {
@@ -125,7 +140,12 @@ describe('那台机器的规格只用来告知，不设上限', () => {
   test('规格解析还留着 —— 它是"一条会话多贵"的依据', async () => {
     const { parseSpecs, REMOTE_MB_PER_SESSION } = await import('../src/main/remotePreflight.ts');
     assert.deepEqual(parseSpecs('CPUS 2\nMEMMB 3839'), { cpus: 2, memMB: 3839 });
-    assert.equal(REMOTE_MB_PER_SESSION, 155);
+    /*
+      155 → 350：kiro-cli 2.24.1 之后 `kiro-cli-chat` 从 104–114 MB 涨到 275–322 MB
+      （2026-09-28 实测 6 条会话占 2100 MB）。按老数字算余量会得出"还能开 15 条",
+      而 3.8 GB 的机器其实开到 10 条就吃干。
+    */
+    assert.equal(REMOTE_MB_PER_SESSION, 350);
   });
 });
 

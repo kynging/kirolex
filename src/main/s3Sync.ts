@@ -253,6 +253,70 @@ export function trashDirFor(root: string, sessionId: string, now = new Date()): 
   return path.join(root, 'trash', `restore-${stamp}`, sessionId);
 }
 
+/**
+ * **每条会话最后一次真的传上去是什么时候** ——「每一个会话同步应该有最新同步到什么时间」。
+ *
+ * 为什么不能拿 catalog 里的 `syncedAt` 回答这个问题：那个字段是**每一轮**给所有条目盖同一个
+ * `now`（见 `catalogEntriesFor`），它说的是"catalog 是什么时候写的"。一条一周没动过的会话
+ * 文件根本没有重传，但它的 `syncedAt` 每 30 分钟还是会往前跳 ——
+ * 拿它当"最新同步时间"会让人以为刚刚备份过，而实际上那份内容是一周前上去的。
+ *
+ * 也不能拿文件状态表（`路径 → {size, mtimeMs}`）回答：那里面记的是**本地文件**的大小和改动时间,
+ * 和"什么时候上传的"是两件事。
+ *
+ * 所以单独记一张表：会话 id → { 上传时间, 当时的 updatedAt }。存 `updatedAt` 是为了能算出
+ * **有没有还没传上去的改动** —— "上次同步是两天前"和"有两天的改动没备份"是完全不同的两句话,
+ * 而后者才是人需要采取行动的那一句。
+ *
+ * 单独一个文件（不是塞进 `s3-sync-state.json`）：那个文件是扁平的 `路径 → 状态`，
+ * 改形状要迁移，而迁移失败的表现是"下一轮全量重传"。
+ */
+export interface SessionSyncMark {
+  /** 这条会话最后一次有文件被上传的时刻。 */
+  at: number;
+  /** 上传那一刻它的 `record.updatedAt` —— 用来判断之后有没有新改动。 */
+  updatedAt: number;
+}
+export type SessionSyncMarks = Record<string, SessionSyncMark>;
+
+export function readSessionMarks(file: string): SessionSyncMarks {
+  try {
+    const d = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return (d && typeof d === 'object') ? d as SessionSyncMarks : {};
+  } catch { return {}; }
+}
+
+export function writeSessionMarks(file: string, marks: SessionSyncMarks): void {
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(file, JSON.stringify(marks));
+  } catch { /* 写不进去只是下次少一点信息，不值得报错 */ }
+}
+
+/**
+ * 这条会话现在是什么同步状态。
+ *
+ * · 没记过 → `never`（从没传上去过）；
+ * · 本地 `updatedAt` 比上传时记下的那个新 → `pending`（有改动还没备份）；
+ * · 否则 → `synced`。
+ *
+ * 判据用 `updatedAt` 而不是比文件 mtime：`record.json` 每次 `writeRecord` 都会动
+ * （哪怕内容没变），拿 mtime 判断会把"刚 attach 了一次"也算成"有改动没备份"。
+ */
+export function sessionSyncState(
+  mark: SessionSyncMark | undefined,
+  localUpdatedAt: number,
+): 'never' | 'pending' | 'synced' {
+  if (!mark || !mark.at) return 'never';
+  return (Number(localUpdatedAt) || 0) > (Number(mark.updatedAt) || 0) ? 'pending' : 'synced';
+}
+
+/** 从上传的相对路径里认出会话 id（`sessions/<id>/…`）。不是会话文件就返回空。 */
+export function sessionIdOfRel(rel: string): string {
+  const parts = String(rel || '').split(/[\\/]/);
+  return parts[0] === 'sessions' && parts[1] ? parts[1] : '';
+}
+
 /** 状态文件读写 —— 坏了就当空（备份不该因为一个状态文件坏掉而停）。 */
 export function readState(file: string): SyncState {
   try {

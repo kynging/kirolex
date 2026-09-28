@@ -169,7 +169,8 @@ describe('同一段后端对话连着坏两次 = 毒了，要重建', () => {
      所以这个上限不能是"一次"，而是自动重试的预算。 */
   test('接线上给的是**预算**而不是"重建过没有"', () => {
     const M2 = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M2, /alreadyRetried: attempt >= MAX_AUTO_RETRIES,/);
+    /* 预算现在按"是不是远程"取（远程 5 次、本机 3 次 —— 见 maxRetriesFor） */
+    assert.match(M2, /alreadyRetried: attempt >= maxRetriesFor\(!!entry\.profile\.remote\?\.sshHost\),/);
   });
 });
 

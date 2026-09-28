@@ -36,6 +36,24 @@ import { isBareInternalError } from './staleSession.ts';
 /** 一次用户发送里，KiroLex 最多自己重发几次。3 次 —— 实测"换三个后端会话才通"是真实发生过的上限。 */
 export const MAX_AUTO_RETRIES = 3;
 
+/**
+ * **远程会话给更多次** ——「给这个远程会话多加一些重试吧」。
+ *
+ * 远程那条路上多了一整段会抖的东西：ssh 连接、反向隧道、那台机器的 sshd 和它的内存。
+ * 实测（2026-09-28）一次 `ssh` 直接超时、30 秒后完全正常 —— 这类失败**重发就好**,
+ * 而本机会话根本没有这一段。
+ *
+ * 所以远程 5 次、本机 3 次。不是"远程更不可靠所以多试几次"这种含糊的理由：
+ * 是远程的失败**分布**不一样（瞬时抖动占比高），而对瞬时抖动来说，
+ * 多等一轮的代价远小于让用户自己发现"这一轮没发出去"。
+ */
+export const MAX_AUTO_RETRIES_REMOTE = 5;
+
+/** 这条会话最多自己重发几次。 */
+export function maxRetriesFor(remote: boolean): number {
+  return remote ? MAX_AUTO_RETRIES_REMOTE : MAX_AUTO_RETRIES;
+}
+
 export interface RetryInput {
   /** 后端回的错误文本（已经拼上 detail）。 */
   error: string;
@@ -45,6 +63,12 @@ export interface RetryInput {
   producedText: boolean;
   /** 这一轮后端开过几个工具调用。>0 表示可能已经产生副作用。 */
   toolsRan: number;
+  /**
+   * 这是条远程会话吗 ——「给这个远程会话多加一些重试吧」。
+   * 只影响**预算**（5 次 vs 3 次），不影响"这个错该不该重发"那几条判断。
+   * 不传就当本机，也就是保持原来的行为。
+   */
+  remote?: boolean;
 }
 
 export interface RetryPlan {
@@ -55,9 +79,16 @@ export interface RetryPlan {
   reason?: 'produced' | 'side-effects' | 'not-retryable' | 'budget';
 }
 
-/** 第 n 次重发前等多久：1.2s → 3s → 8s。 */
+/**
+ * 第 n 次重发前等多久：1.2s → 3s → 8s → 15s → 25s。
+ *
+ * 后两档是给远程加的（`MAX_AUTO_RETRIES_REMOTE`）。拉这么长是因为远程那边值得等的东西
+ * 是"机器缓过来"——sshd 的拥塞窗口、一次 GC、别的会话刚跑完一轮把内存放掉。
+ * 隔 3 秒再试等于还在同一个坑里。
+ */
 export function retryDelayMs(attempt: number): number {
-  return [1200, 3000, 8000][Math.min(Math.max(attempt, 0), 2)];
+  const table = [1200, 3000, 8000, 15000, 25000];
+  return table[Math.min(Math.max(attempt, 0), table.length - 1)];
 }
 
 /** 这个错本身属于"重发有可能好"的那一类吗。 */
@@ -72,7 +103,7 @@ export function planRetry(input: RetryInput): RetryPlan {
   if (input.producedText) return { retry: false, delayMs: 0, reason: 'produced' };
   if ((input.toolsRan || 0) > 0) return { retry: false, delayMs: 0, reason: 'side-effects' };
   if (!isRetryableSendError(input.error)) return { retry: false, delayMs: 0, reason: 'not-retryable' };
-  if (input.attempt >= MAX_AUTO_RETRIES) return { retry: false, delayMs: 0, reason: 'budget' };
+  if (input.attempt >= maxRetriesFor(!!input.remote)) return { retry: false, delayMs: 0, reason: 'budget' };
   return { retry: true, delayMs: retryDelayMs(input.attempt) };
 }
 

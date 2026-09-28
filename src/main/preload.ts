@@ -74,9 +74,23 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 从会话记录现算 —— 这一页要回答的是"同步会覆盖到哪些东西"。
    */
   s3Projects: (): Promise<{
-    projects: Array<{ project: string; sessions: number; bytes: number; updatedAt: number; excluded: boolean }>;
+    projects: Array<{
+      project: string; bytes: number; updatedAt: number; excluded: boolean;
+      /** 这个项目下每条会话的同步状态（`state`: never / pending / synced）。 */
+      sessions: Array<{
+        id: string; title: string; updatedAt: number; bytes: number;
+        syncedAt: number; state: 'never' | 'pending' | 'synced';
+      }>;
+    }>;
     excludeProjects: string[];
   }> => ipcRenderer.invoke('s3:projects'),
+  /**
+   * **删掉一个项目在桶里的备份**（不动本地）。不可逆，所以 `confirm` 必须原样是项目名 ——
+   * 界面弹过一次确认，这一层再要一次是防"手滑点到别的项目那一行"。
+   */
+  s3DeleteProject: (project: string, confirm: string): Promise<{
+    ok: boolean; error?: string; sessions?: number; deleted?: number; failed?: string[];
+  }> => ipcRenderer.invoke('s3:delete-project', project, confirm),
   /** 恢复一条会话（覆盖同 id，覆盖前本地那份会被挪进 trash）。 */
   restoreS3Session: (sessionId: string) => ipcRenderer.invoke('s3:restore', sessionId),
   onS3SyncDone: (cb: (d: any) => void) => {

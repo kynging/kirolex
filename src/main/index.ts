@@ -14,6 +14,7 @@ import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
@@ -32,11 +33,11 @@ import type { MemoryScope } from './memoryPolicy.ts';
 import { shouldConsolidate, buildConsolidationPrompt, mergeSessionMemory, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
-import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES } from './promptRetry.ts';
+import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, isOlderVersion } from './remotePreflight.ts';
+import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
@@ -2108,6 +2109,8 @@ const remoteSpecsLogged = new Set<string>();
 const remoteKiroVersions = new Map<string, string>();
 /** "落后了"这句话一台机器只说一次 —— 每条会话都说一遍等于把它变成噪音。 */
 const remoteVersionWarned = new Set<string>();
+/** 每台机器最近一次报过"内存快满"的时刻 —— 10 分钟内不重复说（每条会话 attach 都报就是噪音）。 */
+const remoteMemWarned = new Map<string, number>();
 
 /**
  * 本机 kiro-cli 的版本。问一次就缓存 —— 它在一次运行里不会变（真更新了也要重启 app）。
@@ -2215,6 +2218,30 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
           logger.warn('remote', `${host} 上的 kiro-cli 是 ${verdict.kiroVersion}，本机是 ${mine} —— 落后了。`
             + `旧版本缺的东西是实打实的（1.27.0 连 \`--list-models\` 都没有，所以模型倍率只能靠猜）。`
             + `设置 → 🖥 机器 里有「更新那台机器的 kiro-cli」。`);
+        }
+      }
+      /*
+        **内存快到顶时说一句** ——「我又开了几条会话，这个远程机器能处理吗，没有又卡挂了吧」。
+
+        这是告知，**不是上限**（上限那套机械删掉了，它引发过"赶走-又回来"的循环）。
+        但不说也不行：实测 2.24.1 之后一条会话要 ~350 MB（1.27.0 时是 155），
+        3.8 GB 的机器开到 10 条就吃干，而**没有 swap** 的机器吃干是 OOM killer
+        直接杀掉正在跑的那一轮 —— 不是变慢。那种失败看起来像"会话莫名消失"。
+
+        每次 preflight 都判断（不像规格那样只报一次）：余量是会变的，
+        而"现在还能不能再开一条"正是你要问的那件事。但同一台机器 10 分钟内只说一次，
+        否则每条会话 attach 都报一遍就成了噪音。
+      */
+      if (verdict.memAvailMB) {
+        const room = remoteHeadroom(verdict.memAvailMB);
+        const last = remoteMemWarned.get(host) || 0;
+        if (verdict.memAvailMB < REMOTE_LOW_MEM_MB && Date.now() - last > 10 * 60_000) {
+          remoteMemWarned.set(host, Date.now());
+          logger.warn('remote', `${host} 内存快满了：可用 ${verdict.memAvailMB} MB，`
+            + `一条会话大约要 ${REMOTE_MB_PER_SESSION} MB —— 大概还能开 ${Math.max(0, room)} 条。`
+            + (verdict.swapMB
+              ? `（有 ${verdict.swapMB} MB swap，吃紧时会变慢而不是被杀）`
+              : `**这台机器没有 swap**，吃干的表现是 OOM killer 直接杀掉正在跑的那一轮，不是变慢。`));
         }
       }
       if (verdict.cpus && verdict.memMB && !remoteSpecsLogged.has(host)) {
@@ -2923,6 +2950,8 @@ const KIROLEX_HOME = path.join(os.homedir(), '.kirolex');
 /** 模型元数据缓存（倍率 / 上下文窗口）—— 见 `modelMeta.ts`。 */
 const MODEL_META_PATH = path.join(KIROLEX_HOME, 'model-meta.json');
 const S3_STATE_PATH = path.join(KIROLEX_HOME, 's3-sync-state.json');
+/** 每条会话最后一次真的上传是什么时候（见 `readSessionMarks` 那段）。 */
+const S3_MARKS_PATH = path.join(KIROLEX_HOME, 's3-session-sync.json');
 
 function loadSyncConfig(): SyncConfig {
   try {
@@ -3033,6 +3062,9 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
   syncRunning = true;
   const cfg = loadSyncConfig();
   const state = readState(S3_STATE_PATH);
+  const marks = readSessionMarks(S3_MARKS_PATH);
+  /** 这一轮真的传了文件的那些会话 —— 只给它们更新"最后同步时间"。 */
+  const touchedSessions = new Set<string>();
   let uploaded = 0;
   let bytes = 0;
   try {
@@ -3089,6 +3121,13 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
       uploaded += 1;
       bytes += body.length;
+      /*
+        **记下这条会话是什么时候真的传上去的** ——「每一个会话同步应该有最新同步到什么时间」。
+        不能用 catalog 的 `syncedAt` 回答：那个每一轮给所有条目盖同一个 now，
+        一条一周没动过的会话也会被说成"刚刚同步过"（见 `readSessionMarks` 那段）。
+      */
+      const sid = sessionIdOfRel(rel);
+      if (sid) touchedSessions.add(sid);
     }
     /*
       catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西。
@@ -3098,6 +3137,19 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     const merged = mergeCatalog(oldCatalog, freshEntries.filter((e) => !conflictIds.has(e.id)));
     await putObject(creds!, catalogKey(cfg.prefix), Buffer.from(JSON.stringify(merged, null, 2)), 'application/json');
     writeState(S3_STATE_PATH, state);
+    /*
+      **只更新这一轮真的传过的那些**。给所有会话盖一个 now 就又回到 catalog 那个毛病了：
+      "最后同步时间"会变成"最后跑过一轮的时间"，而那两句话的区别正是这张表存在的理由。
+      `updatedAt` 一起记下来 —— 之后本地再动过就能算出"有改动还没备份"。
+    */
+    if (touchedSessions.size) {
+      const now = Date.now();
+      const byId = new Map(sessions.map((r) => [r.id, r]));
+      for (const id of touchedSessions) {
+        marks[id] = { at: now, updatedAt: byId.get(id)?.updatedAt || 0 };
+      }
+      writeSessionMarks(S3_MARKS_PATH, marks);
+    }
     syncFailures = 0;
     syncNextAllowedAt = 0;
     lastSyncSummary = {
@@ -4242,19 +4294,39 @@ app.whenReady().then(async () => {
    */
   ipcMain.handle('s3:projects', () => {
     const cfg = loadSyncConfig();
-    const byProject = new Map<string, { sessions: number; bytes: number; updatedAt: number }>();
+    const marks = readSessionMarks(S3_MARKS_PATH);
+    interface Row { project: string; sessions: any[]; bytes: number; updatedAt: number }
+    const byProject = new Map<string, Row>();
     for (const rec of store.listSessions()) {
       const key = projectOf(rec);
-      const cur = byProject.get(key) || { sessions: 0, bytes: 0, updatedAt: 0 };
-      cur.sessions += 1;
+      const cur = byProject.get(key) || { project: key, sessions: [], bytes: 0, updatedAt: 0 };
       cur.updatedAt = Math.max(cur.updatedAt, rec.updatedAt || 0);
+      let bytes = 0;
       for (const f of SESSION_FILES) {
-        try { cur.bytes += fs.statSync(path.join(KIROLEX_HOME, 'sessions', rec.id, f)).size; } catch { /* 少一个文件不算错 */ }
+        try { bytes += fs.statSync(path.join(KIROLEX_HOME, 'sessions', rec.id, f)).size; } catch { /* 少一个文件不算错 */ }
       }
+      cur.bytes += bytes;
+      /*
+        **每条会话的同步状态** ——「每一个会话同步应该有最新同步到什么时间」。
+        三种：从没传过 / 有改动还没备份 / 已同步。判据见 `sessionSyncState`。
+      */
+      cur.sessions.push({
+        id: rec.id,
+        title: rec.title || 'New Chat',
+        updatedAt: rec.updatedAt || 0,
+        bytes,
+        syncedAt: marks[rec.id]?.at || 0,
+        state: sessionSyncState(marks[rec.id], rec.updatedAt || 0),
+      });
       byProject.set(key, cur);
     }
-    const projects = [...byProject.entries()]
-      .map(([project, v]) => ({ project, ...v, excluded: projectExcluded(cfg, project) }))
+    const projects = [...byProject.values()]
+      .map((v) => ({
+        ...v,
+        /* 组内也按最近动过排 —— 和恢复那一页一致 */
+        sessions: v.sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
+        excluded: projectExcluded(cfg, v.project),
+      }))
       /* 未分组排最后，其余按最近动过的排 —— 你要找的通常是刚用过的那个 */
       .sort((a, b) => (a.project ? 0 : 1) - (b.project ? 0 : 1) || b.updatedAt - a.updatedAt);
     return { projects, excludeProjects: cfg.excludeProjects || [] };
@@ -4293,6 +4365,87 @@ app.whenReady().then(async () => {
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { entries: [], error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    }
+  });
+
+  /**
+   * **把一个项目在桶里的备份删掉** ——「同步这里没有删除按钮」。
+   *
+   * 和「不同步」是两件不同的事，两个都要有：
+   *
+   *   · 不同步 = 以后不再往上传，已经传的**还在**（那是一份可用的历史备份）；
+   *   · 删除   = 把桶里那些对象删掉，腾出空间 / 真的不想让它留在云上。
+   *
+   * ## 这是不可逆的，所以
+   *
+   * S3 上删了就没了（除非桶开了版本控制，而我们不知道也不该假设）。所以：
+   *
+   * 1. **要求调用方把 project 名原样传回来**（`confirm` 参数）——
+   *    界面那边已经弹过一次确认，这一层再要一次是防"手滑点到别的项目那一行"；
+   * 2. **catalog 里对应的条目一起删掉**，否则恢复列表还会列出已经不存在的备份,
+   *    而点下去只会得到一句"桶里没有它的文件"；
+   * 3. **本地一个字都不动** —— 这是删云上的备份，不是删会话。说清这件事很重要:
+   *    "删除备份"和"删除会话"只差两个字，而后者不可挽回。
+   */
+  ipcMain.handle('s3:delete-project', async (_event, project: string, confirm?: string) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    if (typeof project !== 'string') return { ok: false, error: '项目名不合法。' };
+    if (confirm !== project) return { ok: false, error: '没确认 —— 要删哪个项目得原样传回来。' };
+    const cfg = loadSyncConfig();
+    try {
+      /*
+        **桶里有哪些会话属于这个项目**：catalog 是权威的（它记的是"备份时属于哪个项目"）。
+        本地记录只用来补 catalog 里缺 project 的老条目 —— 和恢复列表同一条规则。
+      */
+      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+      if (!raw) return { ok: false, error: '桶里还没有 catalog（没同步过）。' };
+      let catalog: Catalog;
+      try { catalog = JSON.parse(raw.toString('utf-8')) as Catalog; } catch { return { ok: false, error: 'catalog 读不出来。' }; }
+      const projectById = new Map(store.listSessions().map((r) => [r.id, projectOf(r)]));
+      const mine = (catalog.entries || []).filter((e) => (e.project || projectById.get(e.id) || '') === project);
+      if (!mine.length) return { ok: false, error: `桶里没有属于「${project || '未分组'}」的备份。` };
+
+      let deleted = 0;
+      const failed: string[] = [];
+      for (const e of mine) {
+        const prefix = `${keyFor(cfg.prefix, path.join('sessions', e.id))}/`;
+        const objects = await listObjects(creds!, prefix);
+        for (const obj of objects) {
+          try { await deleteObject(creds!, obj.key); deleted += 1; }
+          catch (err: any) { failed.push(`${obj.key}：${err?.message || err}`); }
+        }
+      }
+      /*
+        catalog 最后写：先写的话中途失败会留下一个"指向已删对象"的 catalog，
+        而那比"多列了几条还在的"更糟 —— 点恢复只会得到一句看不懂的错误。
+      */
+      const goneIds = new Set(mine.map((e) => e.id));
+      const nextCatalog: Catalog = {
+        version: 1,
+        entries: (catalog.entries || []).filter((e) => !goneIds.has(e.id)),
+      };
+      await putObject(creds!, catalogKey(cfg.prefix), Buffer.from(JSON.stringify(nextCatalog, null, 2)), 'application/json');
+      /*
+        **本地那张"传过什么"的状态表也要清掉这几条** —— 不清的话下一轮同步会认为
+        "这些文件没变、跳过"，于是删掉的备份**再也不会被重新传上去**。
+      */
+      const state = readState(S3_STATE_PATH);
+      for (const rel of Object.keys(state)) {
+        const sid = sessionIdOfRel(rel);
+        if (sid && goneIds.has(sid)) delete state[rel];
+      }
+      writeState(S3_STATE_PATH, state);
+      const marks = readSessionMarks(S3_MARKS_PATH);
+      for (const id of goneIds) delete marks[id];
+      writeSessionMarks(S3_MARKS_PATH, marks);
+
+      logger.warn('s3', `删掉了「${project || '未分组'}」在桶里的备份：${mine.length} 条会话 / ${deleted} 个对象`
+        + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地一个字都没动）`);
+      return { ok: true, sessions: mine.length, deleted, failed };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
     }
   });
 
@@ -5288,7 +5441,8 @@ app.whenReady().then(async () => {
          * `produced=true`）。原来这里是 `alreadyRetried: retriedStale`，一次用户发送只肯自救一次，
          * 于是"换三次"被摊到三次手动重发上 —— 人看到的就是"总是断，也没人管"。
          */
-        alreadyRetried: attempt >= MAX_AUTO_RETRIES,
+        /* 远程那条路多给两次 —— 它多了 ssh / 隧道 / 那台机器这一整段会抖的东西（见 maxRetriesFor） */
+        alreadyRetried: attempt >= maxRetriesFor(!!entry.profile.remote?.sshHost),
         consecutiveFailures: streak,
         /* 刚换过一个几乎空的新会话又是同一个错 → 别再换（见 cliRecreatedAt） */
         lastRecreateAgoMs: cliRecreatedAt.has(sessionId) ? Date.now() - cliRecreatedAt.get(sessionId)! : undefined,
@@ -5304,6 +5458,8 @@ app.whenReady().then(async () => {
         attempt,
         producedText: !!entry.assistantBuf,
         toolsRan: entry.toolsThisTurn || 0,
+        /* 远程多给两次 —— 它多了 ssh / 隧道 / 那台机器这一整段会抖的东西 */
+        remote: !!entry.profile.remote?.sshHost,
       });
       if (verdict === 'recreate') {
         let made: { sessionId: string } | null = null;
@@ -5361,7 +5517,8 @@ app.whenReady().then(async () => {
         }
         if (made && plan.retry) {
           await new Promise((r) => setTimeout(r, plan.delayMs));
-          logger.info('prompt', `换完后端会话自动重发 sessionId=${sessionId} attempt=${attempt + 1}/${MAX_AUTO_RETRIES}`);
+          logger.info('prompt', `换完后端会话自动重发 sessionId=${sessionId}`
+            + ` attempt=${attempt + 1}/${maxRetriesFor(!!entry.profile.remote?.sshHost)}`);
           return await sendPromptOnce(sessionId, prompt, projectId, display, _model, attempt + 1);
         }
       }
@@ -5376,7 +5533,7 @@ app.whenReady().then(async () => {
        * 递增间隔：瞬时故障立刻重试还是同一个结果。
        */
       if (plan.retry) {
-        logger.warn('prompt', `自动重发 ${attempt + 1}/${MAX_AUTO_RETRIES}（等 ${plan.delayMs}ms）`
+        logger.warn('prompt', `自动重发 ${attempt + 1}/${maxRetriesFor(!!entry.profile.remote?.sshHost)}（等 ${plan.delayMs}ms）`
           + ` sessionId=${sessionId}: ${errText.slice(0, 120)}`);
         await new Promise((r) => setTimeout(r, plan.delayMs));
         return await sendPromptOnce(sessionId, prompt, projectId, display, _model, attempt + 1);

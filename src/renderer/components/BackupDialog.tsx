@@ -40,9 +40,19 @@ interface Backup {
   attached?: boolean;
 }
 
+interface SessionRow {
+  id: string;
+  title: string;
+  updatedAt: number;
+  bytes: number;
+  /** 最后一次**真的传上去**是什么时候（0 = 从没传过）。 */
+  syncedAt: number;
+  state: 'never' | 'pending' | 'synced';
+}
+
 interface ProjectRow {
   project: string;
-  sessions: number;
+  sessions: SessionRow[];
   bytes: number;
   updatedAt: number;
   excluded: boolean;
@@ -64,6 +74,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   /* --- 同步 tab --- */
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [excluded, setExcluded] = useState<string[]>([]);
+  /* 默认收起：一上来看的是"哪些项目在备份"，展开才是"这个项目里每条会话什么时候同步的" */
+  const [openProjects, setOpenProjects] = useState<Set<string>>(new Set());
 
   /* --- 恢复 tab --- */
   const [entries, setEntries] = useState<Backup[] | null>(null);
@@ -123,6 +135,42 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     }
   };
 
+  /**
+   * **删掉一个项目在桶里的备份** ——「同步这里没有删除按钮」。
+   *
+   * 这是不可逆的（S3 删了就没了，我们不知道桶有没有开版本控制），所以确认框里
+   * 把三件事都说出来：删几条、删的是**云上**的、本地一个字都不动。
+   * 最后那句最重要 —— "删除备份"和"删除会话"只差两个字。
+   */
+  const deleteProject = async (project: string): Promise<void> => {
+    const row = (projects || []).find((p) => p.project === project);
+    const n = row?.sessions.length || 0;
+    const name = projectLabel(project);
+    if (!window.confirm([
+      `把「${name}」在桶里的备份删掉？`,
+      '',
+      `涉及 ${n} 条会话（${kb(row?.bytes || 0)}）。`,
+      '删的是**云上那份**，本地会话一个字都不动。',
+      'S3 上删掉就找不回来了（除非这个桶开了版本控制）。',
+      '',
+      '继续？',
+    ].join('\n'))) return;
+    setBusy(`del:${project}`); setMsg(null);
+    try {
+      const r = await api()?.s3DeleteProject?.(project, project);
+      if (r?.ok) {
+        setMsg({
+          kind: r.failed?.length ? 'bad' : 'ok',
+          text: `已删掉「${name}」的备份：${r.sessions} 条会话 / ${r.deleted} 个对象。`
+            + (r.failed?.length ? `\n有 ${r.failed.length} 个没删掉：\n${r.failed.join('\n')}` : ''),
+        });
+      } else setMsg({ kind: 'bad', text: String(r?.error || '删除失败') });
+      await loadProjects();
+      /* 桶里的东西变了，恢复那张表要重新拉 */
+      setEntries(null);
+    } finally { setBusy(null); }
+  };
+
   const syncNow = async (): Promise<void> => {
     setBusy('sync'); setMsg(null);
     try {
@@ -130,6 +178,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       if (r?.ok) setMsg({ kind: 'ok', text: `传了 ${r.uploaded} 个文件，${r.skipped} 个没变。` });
       else setMsg({ kind: 'bad', text: String(r?.error || '失败') });
       await loadConfig();
+      /* 同步时间变了，项目那张表也要重新算 */
+      await loadProjects();
       /* 同步过后桶里的东西变了，恢复那张表要重新拉 */
       setEntries(null);
     } finally { setBusy(null); }
@@ -161,17 +211,6 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     if (next.has(id)) next.delete(id); else next.add(id);
     return next;
   });
-
-  /** 整组勾/取消 —— 恢复往往也是按摊来的。 */
-  const toggleGroup = (rows: Backup[]): void => {
-    const ids = rows.filter((e) => !e.attached).map((e) => e.id);
-    const allOn = ids.length > 0 && ids.every((id) => picked.has(id));
-    setPicked((prev) => {
-      const next = new Set(prev);
-      for (const id of ids) { if (allOn) next.delete(id); else next.add(id); }
-      return next;
-    });
-  };
 
   const restore = async (): Promise<void> => {
     if (!chosen.length) return;
@@ -267,19 +306,52 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 <div className="settings-hint backup-note">还没有会话。</div>
               ) : (
                 <div className="backup-restore-list">
-                  {projects.map((p) => (
-                    <div key={p.project || '__none__'} className="backup-proj-row">
-                      <span className="backup-restore-title">{projectLabel(p.project)}</span>
-                      <span className="backup-restore-meta">{p.sessions} 条 · {kb(p.bytes)}</span>
-                      <ToggleButton
-                        on={!p.excluded}
-                        labels={['同步', '不同步']}
-                        ariaLabel={`${projectLabel(p.project)} 是否同步`}
-                        disabled={!!busy}
-                        onChange={(next) => void toggleProject(p.project, next)}
-                      />
-                    </div>
-                  ))}
+                  {projects.map((p) => {
+                    const shut = !openProjects.has(p.project);
+                    /* 这个项目里有几条还没备份 —— 收起来的时候也要看得见 */
+                    const behind = p.sessions.filter((x) => x.state !== 'synced').length;
+                    return (
+                      <div key={p.project || '__none__'} className="backup-group">
+                        <div className="backup-proj-row">
+                          <button className="backup-group-toggle" onClick={() => setOpenProjects((prev) => {
+                            const next = new Set(prev);
+                            if (next.has(p.project)) next.delete(p.project); else next.add(p.project);
+                            return next;
+                          })}>{shut ? '▸' : '▾'} {projectLabel(p.project)}</button>
+                          <span className="backup-restore-meta">
+                            {p.sessions.length} 条 · {kb(p.bytes)}
+                            {behind ? ` · ${behind} 条待同步` : ''}
+                          </span>
+                          <ToggleButton
+                            on={!p.excluded}
+                            labels={['同步', '不同步']}
+                            ariaLabel={`${projectLabel(p.project)} 是否同步`}
+                            disabled={!!busy}
+                            onChange={(next) => void toggleProject(p.project, next)}
+                          />
+                          {/* 删云上的备份，不动本地 —— 和「不同步」是两件事 */}
+                          <button className="remote-btn backup-del" disabled={!!busy}
+                                  title="删掉这个项目在桶里的备份（不动本地会话）"
+                                  onClick={() => void deleteProject(p.project)}>
+                            {busy === `del:${p.project}` ? '删除中…' : '删除备份'}
+                          </button>
+                        </div>
+                        {!shut && p.sessions.map((x) => (
+                          <div key={x.id} className="backup-restore-row" title={x.id}>
+                            <span className="backup-restore-title">{x.title}</span>
+                            {x.state === 'never'
+                              ? <span className="backup-tag warn">没备份过</span>
+                              : x.state === 'pending'
+                                ? <span className="backup-tag over">有改动待同步</span>
+                                : <span className="backup-tag new">已同步</span>}
+                            <span className="backup-restore-meta">
+                              {x.syncedAt ? `同步于 ${when(x.syncedAt)}` : '—'}
+                            </span>
+                          </div>
+                        ))}
+                      </div>
+                    );
+                  })}
                 </div>
               )}
               <div className="settings-hint backup-note">
@@ -313,11 +385,15 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
               {!!groups.length && (
                 <div className="backup-restore-list">
                   {groups.map(([name, rows]) => {
-                    const ids = rows.filter((e) => !e.attached).map((e) => e.id);
-                    const allOn = ids.length > 0 && ids.every((id) => picked.has(id));
                     const shut = collapsed.has(name);
                     return (
                       <div key={name} className="backup-group">
+                        {/*
+                          组头只做两件事：说清这是哪一摊、能收起来。
+                          原来这里还有一颗「选整组」——「选整组那个按钮是干毛线，删掉吧」：
+                          恢复整个项目不是常见动作（你通常是在找某一条），而那颗按钮占的位置
+                          刚好在"要不要点它"最容易犹豫的地方。要多选，逐行勾就够了。
+                        */}
                         <div className="backup-group-head">
                           <button className="backup-group-toggle" onClick={() => setCollapsed((prev) => {
                             const next = new Set(prev);
@@ -325,9 +401,6 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             return next;
                           })}>{shut ? '▸' : '▾'} {name}</button>
                           <span className="backup-restore-meta">{rows.length} 条</span>
-                          {/* 恢复往往也是按摊来的，所以整组勾比逐条勾常用 */}
-                          <button className="remote-btn" disabled={!ids.length || !!busy}
-                                  onClick={() => toggleGroup(rows)}>{allOn ? '取消整组' : '选整组'}</button>
                         </div>
                         {!shut && rows.map((e) => (
                           <label

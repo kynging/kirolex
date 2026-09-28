@@ -49,7 +49,10 @@ describe('一轮挂了要不要自己重发', () => {
 
   test('间隔递增：瞬时故障立刻重试还是同一个结果', () => {
     assert.deepEqual([0, 1, 2].map(retryDelayMs), [1200, 3000, 8000]);
-    assert.equal(retryDelayMs(99), 8000);
+    /* 后两档是给远程加的（远程预算 5 次）—— 远程值得等的是"机器缓过来" */
+    assert.deepEqual([3, 4].map(retryDelayMs), [15000, 25000]);
+    /* 超出表尾夹在最后一档（现在是 25s，加了远程那两档之后） */
+    assert.equal(retryDelayMs(99), 25000);
   });
 });
 

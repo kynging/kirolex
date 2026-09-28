@@ -20,6 +20,10 @@ export interface Preflight {
   cpus?: number;
   /** 那台机器的总内存 MB（拿不到是 0）。 */
   memMB?: number;
+  /** **可用**内存 MB（`MemAvailable`，拿不到是 0）—— 判断"还能再开几条"用这个。 */
+  memAvailMB?: number;
+  /** swap 总量 MB。0 = 没有 swap，那时内存吃干是 OOM 杀进程而不是变慢。 */
+  swapMB?: number;
   /** 那台机器上 kiro-cli 的版本（`2.24.1` 这种）。问不到就没有这个字段。 */
   kiroVersion?: string;
   /** 给人看的一句话：说清是什么问题、下一步干什么。 */
@@ -74,6 +78,14 @@ export function preflightScript(tools: string[] = REQUIRED_TOOLS, opts: { models
     */
     'echo "CPUS $(nproc 2>/dev/null || echo 0)"',
     'echo "MEMMB $(awk \'/MemTotal/{printf "%d", $2/1024}\' /proc/meminfo 2>/dev/null || echo 0)"',
+    /*
+      **可用内存**（不是 free）——「我又开了几条会话，这个远程机器能处理吗」。
+      `MemAvailable` 才是"还能给新进程用多少"：`MemFree` 会因为 page cache 显得很小,
+      拿它判断会天天误报。
+    */
+    'echo "MEMAVAIL $(awk \'/MemAvailable/{printf "%d", $2/1024}\' /proc/meminfo 2>/dev/null || echo 0)"',
+    /* 有没有 swap —— 没有的话内存吃干是 OOM 杀进程，不是变慢，这件事要说出来 */
+    'echo "SWAPMB $(awk \'/SwapTotal/{printf "%d", $2/1024}\' /proc/meminfo 2>/dev/null || echo 0)"',
     /*
       **顺路报一下它的 kiro-cli 版本** ——「怎么控制远端的版本呢，远端应该也定期更新一下」。
       不报的代价是实测出来的：那台机器停在 **1.27.0**，而本机已经 2.24.1 —— 差一个大版本。
@@ -139,8 +151,22 @@ export function judgePreflight(
     cpus,
     memMB,
     kiroVersion: parseKiroVersion(out),
+    memAvailMB: parseMemAvail(out),
+    swapMB: parseSwap(out),
     message: `${host}：kiro-cli 在，也登录了${models.length ? `，${models.length} 个可用模型` : ''}。`,
   };
+}
+
+/** 可用内存 MB（`MEMAVAIL n`）。拿不到给 0 —— 0 的含义是"没依据"，下游据此不下结论。 */
+export function parseMemAvail(stdout: string): number {
+  const v = Number(/^MEMAVAIL (\d+)/m.exec(String(stdout || ''))?.[1]);
+  return Number.isFinite(v) && v > 0 ? v : 0;
+}
+
+/** swap 总量 MB（`SWAPMB n`）。0 既可能是"没有 swap"也可能是"问不到"，调用方只在有内存数时用它。 */
+export function parseSwap(stdout: string): number {
+  const v = Number(/^SWAPMB (\d+)/m.exec(String(stdout || ''))?.[1]);
+  return Number.isFinite(v) && v >= 0 ? v : 0;
 }
 
 /**
@@ -183,18 +209,43 @@ export function parseSpecs(stdout: string): { cpus: number; memMB: number } {
 /**
  * **那台机器能同时扛几条远程会话** ——「远程能承受多少个远程 session？这个有限制吧」。
  *
- * 实测（那台 t3.medium，2 vCPU / 3.8 GB）：一条会话是**两个**进程 ——
- * `kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ **155 MB**；6 条占 941 MB RSS，
- * load 冲到 3.86。内存上看能塞 15 条以上，但 2 vCPU 先顶不住，而并行 attach 还会撞出
- * `ssh exit 255`（sshd 的 `MaxStartups`）—— 这一晚实测出现过。
+ * 实测（那台 t3.medium，2 vCPU / 3.8 GB）：一条会话是**两个**进程。
  *
- * 所以两条线一起卡：内存按 155 MB/条、只用**一半**总内存（那台机器上还有别的东西，
+ * 这个数字**跟着 kiro-cli 的版本变**，所以要记清是哪一版量的：
+ *
+ *   · 1.27.0：`kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ **155 MB**；
+ *   · 2.24.1：`kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ **275–322 MB** ≈ **350 MB**
+ *     （2026-09-28 实测：6 条会话占 2100 MB，和 `free -m` 的 used 对得上）。
+ *
+ * **翻了差不多三倍**。按老数字算余量会得出"还能开 15 条"，而实际上 3.8 GB 的机器
+ * 开到 10 条就把内存吃干了 —— 而那台机器当时没有 swap，吃干的表现是 OOM killer
+ * 直接杀掉正在跑的那一轮，不是变慢。
+ *
+ * 6 条时 load 曾冲到 3.86（2 vCPU）。并行 attach 还会撞出 `ssh exit 255`
+ * （sshd 的 `MaxStartups`）—— 那条已经修了（一台机器一条复用连接 + preflight 合并）。
+ *
+ * 所以两条线一起卡：内存按 `REMOTE_MB_PER_SESSION`/条、只用**一半**总内存（那台机器上还有别的东西，
  * 而且 kiro-cli 的峰值远高于静息值）；CPU 按每核 3 条。取小的那个，夹在 [2, 12]。
  *
  * 规格拿不到（0）时返回 0 = **不做限制** —— 没依据的上限比没有上限糟：它会在一台好机器上
  * 无缘无故赶走你的会话。
  */
-export const REMOTE_MB_PER_SESSION = 155;
+export const REMOTE_MB_PER_SESSION = 350;
+
+/**
+ * **可用内存低于这个数就该说一句了** ——「我又开了几条会话，这个远程机器能处理吗，
+ * 没有又卡挂了吧」。
+ *
+ * 取两条会话的量：一条的余量太晚（你已经在开第 N 条了），三条又太早（天天报）。
+ * 这是**告知**，不是上限 —— 上限那套机械已经删掉了（它引发过"赶走-又回来"的循环）。
+ */
+export const REMOTE_LOW_MEM_MB = REMOTE_MB_PER_SESSION * 2;
+
+/** 按可用内存还能开几条（拿不到内存数时返回 -1 = 不知道，别乱说）。 */
+export function remoteHeadroom(availMB: number): number {
+  if (!availMB || availMB <= 0) return -1;
+  return Math.floor(availMB / REMOTE_MB_PER_SESSION);
+}
 
 export function remoteExecutorCap(cpus: number, memMB: number): number {
   if (!cpus || !memMB) return 0;
