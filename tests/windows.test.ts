@@ -338,3 +338,78 @@ describe('模型列出来的选项变成可点的片', () => {
     assert.match(C, /session\/request_permission/);
   });
 });
+
+/*
+ * 「你建一个会话测试一下呢？cli 里面是会有选项的」——测了，结论是**选项在 ACP 上全是纯文本**。
+ *
+ * 直接驱动 `kiro-cli acp` 抓原始 JSON-RPC（2.24.1）：
+ *
+ *   · 让模型"给三个方案等我选" → 只有 `session/update / agent_message_chunk`,
+ *     `stopReason: end_turn`，**零个 REQUEST**；
+ *   · `/model`（终端里是上下键 picker）→ 回来是纯文本列表，当前那个用 `→` 标;
+ *   · `/agent` → 同样是纯文本，还会把每个 agent 的整段 description 都刷出来;
+ *   · `initialize` 回的 `agentCapabilities` 里 `sessionCapabilities: {}`、`auth: {}`,
+ *     没有任何"能问用户"的能力位。
+ *
+ * 所以 picker 是 TUI 的东西，ACP 不带它。而 KiroLex 本来就有真正的模型/agent 下拉 ——
+ * 把这两条命令发给 kiro-cli 只会得到最差的那个版本，还占掉一轮。
+ */
+describe('`/model` `/agent` 走 KiroLex 自己的下拉', () => {
+  test('只认"整条输入就是这个命令"', async () => {
+    const { slashIntent } = await import('../src/renderer/slashPicker.ts');
+    assert.deepEqual(slashIntent('/model'), { kind: 'model', arg: '' });
+    assert.deepEqual(slashIntent('/model gpt-5.6-sol'), { kind: 'model', arg: 'gpt-5.6-sol' });
+    assert.deepEqual(slashIntent('/AGENT kiro_default'), { kind: 'agent', arg: 'kiro_default' });
+    /* 出现在句子中间时那是在**讨论**它，不是在用它 */
+    assert.equal(slashIntent('帮我看看 /model 是什么'), null);
+    assert.equal(slashIntent('/models'), null);
+    assert.equal(slashIntent(''), null);
+  });
+
+  test('参数匹配：精确 → 唯一前缀 → 多义就**不猜**', async () => {
+    const { resolveChoice } = await import('../src/renderer/slashPicker.ts');
+    const opts = ['auto', 'claude-opus-5', 'claude-opus-5.5', 'gpt-5.6-sol'];
+    assert.equal(resolveChoice('GPT-5.6-SOL', opts).exact, 'gpt-5.6-sol', '大小写不敏感');
+    assert.equal(resolveChoice('gpt', opts).exact, 'gpt-5.6-sol', '唯一前缀可以');
+    /* 换错模型要等到账单或者输出风格变了才会被发现 —— 所以多义时报候选，不挑一个 */
+    assert.equal(resolveChoice('claude', opts).exact, undefined);
+    assert.equal(resolveChoice('claude', opts).matches.length, 2);
+    assert.equal(resolveChoice('nope', opts).matches.length, 0);
+  });
+
+  test('接在发送路径上，不再发给 kiro-cli', () => {
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    assert.match(CA, /const intent = slashIntent\(text\);\s*\n\s*if \(intent\) \{ onSlashPicker\(intent\); return; \}/);
+    /* `/stop` 仍然透传 —— 那条是真的要发给 kiro-cli */
+    assert.match(CA, /if \(text === '\/stop'\) \{\s*\n\s*onSend\(text\);/);
+  });
+
+  test('没参数就把原生下拉弹开；有参数走 KiroLex 自己的切换', () => {
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    assert.match(CA, /\(el as any\)\.showPicker\?\.\(\)/);
+    /* showPicker 在非用户手势时会抛 —— 兜底 focus，至少人知道该看哪儿 */
+    assert.match(CA, /catch \{ el\.focus\(\); \}/);
+    /*
+      带参数**不能**让 kiro-cli 内部换：它不通知 KiroLex，下拉里显示的还是旧的。
+      KiroLex 换模型走"重起执行器 + 改 agent JSON"那条路，两边状态才对得上。
+    */
+    assert.match(CA, /if \(isModel\) onModelChange\(exact\); else onKiroAgentChange\(exact\);/);
+    /* 对不上时说清，并指回下拉 */
+    assert.match(CA, /setLocalNotice\(matches\.length/);
+    assert.match(CA, /会把下拉打开/);
+  });
+
+  test('那句本地提示和主进程那条共用同一个位置，换会话清掉', () => {
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    /* 同一类东西（KiroLex 自己对你说的）不该有两个落点 */
+    assert.match(CA, /\{localNotice && \(\s*\n\s*<div className="session-notice">/);
+    assert.match(CA, /React\.useEffect\(\(\) => \{ setLocalNotice\(null\); \}, \[currentSessionId\]\);/);
+  });
+
+  test('`/model` 的纯文本输出不会被选项片误认', async () => {
+    const { extractChoiceChips } = await import('../src/renderer/choiceChips.ts');
+    /* 真实形状（实测抓到的）：没有编号，而且不是提问 */
+    const out = 'Available models:\n\n  auto (auto)\n  gpt-5.6-sol (gpt-5.6-sol)\n→ gpt-5.6-luna (gpt-5.6-luna)';
+    assert.deepEqual(extractChoiceChips(out), []);
+  });
+});

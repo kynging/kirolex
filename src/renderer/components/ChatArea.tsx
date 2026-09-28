@@ -36,6 +36,7 @@ import { IconAppendMessage, IconCopy, IconEdit, IconFork, IconPaperclip, IconQue
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
+import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts';
 import { visit } from 'unist-util-visit';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
@@ -1416,6 +1417,8 @@ const ChatInputBox = memo<{
   onDropFiles: (files: AttachedFile[]) => void;
   onRemoveFile: (id: string) => void;
   attachedFiles: AttachedFile[];
+  /** `/model` / `/agent` 接下来自己处理（见 `slashPicker.ts`）。 */
+  onSlashPicker: (intent: SlashIntent) => void;
   /**
    * 模型在最后那条回复里列出来的选项（`choiceChips.ts` 认的）。
    *
@@ -1423,7 +1426,7 @@ const ChatInputBox = memo<{
    * 只有 `session/request_permission`），所以这些只能从回复文字里认。
    */
   choiceChips: ChoiceChip[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
@@ -1540,6 +1543,20 @@ const ChatInputBox = memo<{
       onSend(text);
       return;
     }
+    /*
+      **`/model` 和 `/agent` 接下来自己处理** ——「cli 里面是会有选项的」。
+
+      实测：终端里那两条是上下键选的 picker，但**ACP 不带 picker** —— 发过去回来的是
+      一堆纯文本（`/agent` 还会把每个 agent 的整段 description 都刷出来），
+      零个结构化选项。而 KiroLex 本来就有真正的模型/agent 下拉。
+      所以发给 kiro-cli 只会得到最差的那个版本，还占掉一轮。
+
+      带参数的也接（`/model gpt-5.6-sol`）：让 kiro-cli 内部换模型的话它**不告诉 KiroLex**,
+      下拉里显示的还是旧的。KiroLex 换模型走的是"重起执行器 + 改 agent JSON"那条路,
+      两边状态才对得上。判据和参数匹配在 `slashPicker.ts`。
+    */
+    const intent = slashIntent(text);
+    if (intent) { onSlashPicker(intent); return; }
     const own = sessionId ? (draftPastes[sessionId] || []) : [];
     // Only blocks the text still references travel with the message; hydrate their
     // content so a draft restored after a restart still expands for the model.
@@ -1553,7 +1570,7 @@ const ChatInputBox = memo<{
       if (isStreaming) onSteer(text, pastes);
       else onSend(text, pastes);
     });
-  }, [input, isStreaming, onSend, onSteer, attachedFiles, sessionId]);
+  }, [input, isStreaming, onSend, onSteer, attachedFiles, sessionId, onSlashPicker]);
 
   const handleQueue = useCallback(() => {
     const text = input.trim();
@@ -2510,6 +2527,48 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   readOnly = false,
   paneFocused = true,
 }) => {
+  /*
+    **`/model` / `/agent` 打开自己的下拉** ——「cli 里面是会有选项的」（而 ACP 不带 picker,
+    见 `slashPicker.ts`）。`showPicker()` 是浏览器给原生 `<select>` 的标准接口;
+    它在少数情况下会抛（不是用户手势触发时），所以兜底成 focus —— 至少人知道该看哪儿。
+  */
+  /*
+    **本地那一句**（`/model xyz` 对不上时说的话）。和主进程发过来的 `sessionNotice`
+    共用同一个位置 —— 同一类东西（KiroLex 自己对你说的）不该有两个落点。
+    自己不消失：它是对你刚才那次输入的回答，看完手动关掉。
+  */
+  const [localNotice, setLocalNotice] = React.useState<string | null>(null);
+  /* 换会话就清掉 —— 那句话是对上一条会话里你那次输入的回答 */
+  React.useEffect(() => { setLocalNotice(null); }, [currentSessionId]);
+
+  const modelSelectRef = React.useRef<HTMLSelectElement | null>(null);
+  const agentSelectRef = React.useRef<HTMLSelectElement | null>(null);
+  const handleSlashPicker = React.useCallback((intent: SlashIntent) => {
+    const isModel = intent.kind === 'model';
+    const el = isModel ? modelSelectRef.current : agentSelectRef.current;
+    const options = isModel
+      ? models.map((m: any) => String(m?.model_id || m)).filter(Boolean)
+      : kiroAgents.map((a) => a.name);
+
+    /* 没给参数 → 直接把下拉弹开 */
+    if (!intent.arg) {
+      if (!el) return;
+      try { (el as any).showPicker?.(); } catch { el.focus(); }
+      el.focus();
+      return;
+    }
+    /*
+      给了参数 → 走 KiroLex 自己那条切换路径。**不猜**：前缀命中多个时把候选说出来 ——
+      换错模型这件事要等到账单或者输出风格变了才会被发现。
+    */
+    const { exact, matches } = resolveChoice(intent.arg, options);
+    if (exact) { if (isModel) onModelChange(exact); else onKiroAgentChange(exact); return; }
+    const what = isModel ? '模型' : 'agent';
+    setLocalNotice(matches.length
+      ? `「${intent.arg}」对上了 ${matches.length} 个${what}：${matches.join('、')} —— 说全一点，或者直接打 /${intent.kind} 从下拉里选。`
+      : `没有叫「${intent.arg}」的${what}。打 /${intent.kind}（不带参数）会把下拉打开。`);
+  }, [models, kiroAgents, onModelChange, onKiroAgentChange]);
+
   /*
     **模型列出来的选项**（只认最后一条助手消息）——「有一些问题会给用户提问并提供多个选项」。
 
@@ -3799,6 +3858,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 把 transcript 撑大（远程会话每轮都要推它），还得靠"别发给模型"那条过滤一直兜着。
                 自己会消失（⚠️ 留久一点，它影响你接下来的判断）。
               */}
+              {localNotice && (
+                <div className="session-notice">
+                  <span className="session-notice-text">{localNotice}</span>
+                  <button className="session-notice-close" onClick={() => setLocalNotice(null)} title="关掉">✕</button>
+                </div>
+              )}
               {sessionNotice && (
                 <div className={`session-notice${/⚠️/.test(sessionNotice.text) ? ' warn' : ''}`}>
                   <span className="session-notice-text">{sessionNotice.text}</span>
@@ -3807,6 +3872,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               )}
               <ChatInputBox
                 choiceChips={choiceChips}
+                onSlashPicker={handleSlashPicker}
                 sessionId={currentSessionId}
                 isStreaming={isStreaming}
                 isLooping={isLooping}
@@ -3865,6 +3931,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     </button>
                     {agentConfigLoading && <span className="composer-agent-spinner">⏳</span>}
                     <select
+                      ref={agentSelectRef}
                       className="composer-select composer-agent-select"
                       value={kiroAgent}
                       onChange={(event) => onKiroAgentChange(event.target.value)}
@@ -4018,6 +4085,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   ) : null}
 
                   <select
+                    ref={modelSelectRef}
                     className="composer-select composer-model-select"
                     value={selectedModel}
                     onChange={(event) => onModelChange(event.target.value)}
