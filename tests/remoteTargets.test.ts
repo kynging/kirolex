@@ -1207,12 +1207,14 @@ describe('工作目录在会话界面上', () => {
    * 那一格看起来像"已经有工作目录了"，而实际上这条会话什么项目都没连上。
    */
   test('会话自己那个目录**不显示** —— 它不是工作目录', () => {
-    assert.match(CA, /const isSessionDir = \(d: string\): boolean =>/);
+    /* 判据挪到 `pathBits.ts` 了（要同时认 `\` —— Windows 上那个目录是反斜杠的） */
+    assert.match(CA, /const isSessionDir = isSessionScratchDir;/);
     /* 从这一排里滤掉，而不是换个名字 */
     assert.match(CA, /\.filter\(\(d\) => d && !isSessionDir\(d\)\)/);
     assert.equal(/'会话目录'/.test(CA), false, '这个名字不许再出现');
     /* basename 就是 basename，没有特例 */
-    assert.match(CA, /const dirLabel = \(d: string\): string => \(d\.split\('\/'\)\.filter\(Boolean\)\.pop\(\) \|\| d\)/);
+    /* basename 也挪到 `pathBits.ts` 了 —— `split('/')` 在 Windows 路径上回的是整条路径 */
+    assert.match(CA, /const dirLabel = baseName;/);
   });
 
   test('一个真目录都没有时只留那个 ＋（"不显示"指别显示假的当前值）', () => {

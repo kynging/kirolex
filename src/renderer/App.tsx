@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
+import { baseName } from './pathBits.ts';
 import { type SubagentRow } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
 import { normalizeLang, type Lang } from './i18n';
@@ -523,7 +524,7 @@ const SYSTEM_APP_EXTS = new Set([
 ]);
 
 function needsSystemApp(p: string): boolean {
-  const name = p.split('/').pop() || p;
+  const name = baseName(p);
   const dot = name.lastIndexOf('.');
   if (dot <= 0) return false;
   return SYSTEM_APP_EXTS.has(name.slice(dot + 1).toLowerCase());
@@ -554,7 +555,9 @@ const VIEWER_LANGS: Record<string, string> = {
 };
 
 function viewerLangFor(p: string): string | null {
-  const name = String(p || '').trim().split('/').pop() || '';
+  /* 用 `baseName`：Windows 路径上 `split('/')` 回的是整条路径，
+     于是 `^dockerfile$` / `^makefile$` 永远匹配不上（那两种文件丢高亮） */
+  const name = baseName(String(p || '').trim());
   if (/^dockerfile$/i.test(name)) return 'dockerfile';
   if (/^(makefile)$/i.test(name)) return 'makefile';
   const ext = (name.includes('.') ? name.split('.').pop() || '' : '').toLowerCase();
@@ -3531,7 +3534,7 @@ const App: React.FC = () => {
             <div className="settings-header">
               <h3 title={fileViewer?.path} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
                 <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {fileViewer ? (fileViewer.path.split('/').pop() || fileViewer.path) : 'Loading…'}
+                  {fileViewer ? (baseName(fileViewer.path) || fileViewer.path) : 'Loading…'}
                 </span>
                 {/* Say it rather than showing a stale copy as if it were current. */}
                 {fileViewer?.gone && (
@@ -3590,7 +3593,7 @@ const App: React.FC = () => {
                     onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeFileTab(tab.id); } }}
                   >
                     <span className="file-tab-name">
-                      {tab.gone ? '⚠ ' : tab.stale ? '• ' : ''}{tab.path.split('/').pop() || tab.path}
+                      {tab.gone ? '⚠ ' : tab.stale ? '• ' : ''}{baseName(tab.path) || tab.path}
                     </span>
                     <button
                       type="button"
@@ -3618,7 +3621,7 @@ const App: React.FC = () => {
                   <div className="workspace-viewer-path" title={fileViewer.path}>{fileViewer.path}</div>
                   {fileViewer.image && fileViewer.dataUrl ? (
                     <div className="workspace-image-wrap">
-                      <img className="workspace-image" src={fileViewer.dataUrl} alt={fileViewer.path.split('/').pop() || 'image'} />
+                      <img className="workspace-image" src={fileViewer.dataUrl} alt={baseName(fileViewer.path) || 'image'} />
                     </div>
                   ) : fileViewer.binary ? (
                     <div className="workspace-binary-hint">

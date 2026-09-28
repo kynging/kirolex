@@ -227,20 +227,26 @@ export class AcpClient extends EventEmitter {
         /* 没配就不起（见 `kiroBinProblem`）—— 这条会话根本不该有一个"猜出来的"执行器 */
         const problem = kiroBinProblem();
         if (problem) { reject(new Error(problem)); return; }
-        // Local executor: search for the kiro-cli binary on this machine.
-        const possiblePaths = kiroCliCandidates();
+        /*
+          **用同一个解析器** ——「看一下有没有 windows 上不能跑的东西」。
 
-        let cliPath: string | null = null;
-        for (const p of possiblePaths) {
-          if (fs.existsSync(p)) {
-            cliPath = p;
-            break;
-          }
-        }
+          这里原来自己写了一遍"挨个 `fs.existsSync`"，于是**裸命令名会被悄悄丢掉**：
+          配置里填 `kiro-cli` 或 `kiro-cli-dev`（PATH 上的名字）时 `existsSync` 当然是 false,
+          用户看到的是"kiro-cli not found"，而那个名字明明能跑。
 
+          Windows 上这件事最疼：磁盘上的名字总是带 `.exe`，人很自然会填 `kiro-cli`,
+          然后被拒 —— 而设置里的自动检测在 Windows 上又是死的（见 `detectLocal`),
+          于是**没有任何一条路能把它配好**。
+
+          `resolveKiroCli()` 本来就处理了这两种情况（裸名字直接用、带分隔符的才查文件），
+          而且它的注释已经写着"一个解析器给两条路"—— 这里没照做是个疏漏。
+        */
+        const cliPath = resolveKiroCli();
         if (!cliPath) {
           reject(new Error(
-            `kiro-cli not found. Searched:\n${possiblePaths.join('\n')}\n\nPlease install kiro-cli or set KIRO_CLI_PATH environment variable.`
+            `kiro-cli 找不到。试过这些：\n${kiroCliCandidates().join('\n')}\n\n`
+            + `在 设置 → 🖥 机器 → 💻 本机 里填一个路径，或者设 KIRO_CLI_PATH。`
+            + `（可以填 PATH 上的裸名字，不必是绝对路径。）`,
           ));
           return;
         }

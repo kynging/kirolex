@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import { joinPath } from '../pathBits.ts';
 import { filterEntries, filterNote } from '../workspaceFilter';
 import { useT } from '../hooks/useLang';
 import {
@@ -106,9 +107,9 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({ sessionId, onClo
 
   const openEntry = useCallback((entry: WorkspaceEntry) => {
     if (!listing) return;
-    const fullPath = listing.path.endsWith('/')
-      ? `${listing.path}${entry.name}`
-      : `${listing.path}/${entry.name}`;
+    /* 沿用当前路径的分隔符 —— 一律用 `/` 的话 Windows 上会拼出
+       `C:\Users\k/sub`，而且每进一层就多混一个斜杠（见 `pathBits.ts`） */
+    const fullPath = joinPath(listing.path, entry.name);
     if (entry.isDir) {
       /*
         进目录就**清掉过滤词**。留着它的话新目录一开就是过滤后的样子 —— 而你刚换了地方,

@@ -1,7 +1,8 @@
 # Windows 上跑不起来的东西
 
 2026-09-28 全量审计（`src/main/`、`src/renderer/`、`scripts/`）的结论。
-**只修了第 1 条**（它是加 ssh 复用时引入的回归），其余按用户决定先记下来。
+**第 1–5 条已修**（2026-09-28）。剩下的是 COSMETIC 和一条不是代码 bug 的 Windows 风险,
+以及几个只影响开发机的 dev 脚本 —— 都列在下面并标了原因。
 
 ## 先说已经是对的那些
 
@@ -37,7 +38,7 @@ false，`net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` �
 **修法**：`muxSupported()` 按 `process.platform` 判，Windows 上回退到"每条会话自己一条隧道"
 （= 复用之前的行为）。少了复用的好处（少握手、少端口），但功能是全的。
 
-## 2. 本机工具探测（BLOCKING，未修）
+## 2. ✅ 已修：本机工具探测（BLOCKING）
 
 - `src/main/index.ts:1876` — `runProbe` 的本机那一半走 `execFile('bash', ['-lc', script])`
 - `src/main/binDetect.ts:28-67` — 候选名只有 `kiro-cli` / `claude` / `codex`（没有 `.exe`），
@@ -49,16 +50,24 @@ false，`net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` �
 而 `kiroBinProblem()`（`acp-client.ts:104`）在配好之前**拒绝起任何会话** ——
 也就是 Windows 上的首次使用没有出路，只能手填，而手填又容易撞上第 3 条。
 
-修法方向：Windows 分支用 `where.exe` / PowerShell，候选加 `%LOCALAPPDATA%` 和 `.exe`。
+**修法**：Windows 上不走 shell，用 Node 自己探（`detectWindows`）——
+遍历 `PATH` × `PATHEXT`（`.exe` / `.cmd` 都认，npm 装的工具是 `.cmd` shim）、
+展开 `%LOCALAPPDATA%` 这类候选、每个真的跑一次 `--version` 并用 `verify` 校验输出、
+按解析后的真实路径去重。没有把那段 POSIX 脚本翻译成 PowerShell ——
+那意味着维护两份同样的逻辑，而它们会慢慢长歪。远端那一半照旧走脚本（远端是 Linux）。
+「测试」那颗按钮同理，而且会先在 PATH 上解析一次裸名字。
 
-## 3. 配置值必须是存在的文件（BLOCKING，未修）
+## 3. ✅ 已修：配置值必须是存在的文件（BLOCKING）
 
 `src/main/acp-client.ts:236-247` — `connect()` 取第一个 `fs.existsSync(p)` 通过的候选。
 所以填裸名字 `kiro-cli`（或没带 `.exe` 的路径）直接被拒，即便 `resolveKiroCli()`
 （`:137`）本来是允许走 PATH 的。这个本地/设置的不一致在 Windows 上最疼 ——
 那边磁盘上的名字总是带 `.exe`。
 
-## 4. Windows 用户真会碰到的（DEGRADED，未修）
+**修法**：`connect()` 改成调 `resolveKiroCli()`（它本来就处理裸名字），
+不再自己写一遍 existsSync 循环。那个函数的注释早就写着"一个解析器给两条路"。
+
+## 4. ✅ 已修：Windows 用户真会碰到的（DEGRADED）
 
 | 位置 | 后果 |
 |---|---|
@@ -71,11 +80,11 @@ false，`net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` �
 | `src/main/index.ts:3522` | 单实例锁的错误信息叫用户去跑 `pkill` —— 而这正是 app 拒绝启动时显示的那句 |
 | `src/main/projectStore.ts:71` | 校验信息说"要写绝对路径（从 / 开始）" |
 
-## 5. 只影响远程路径（被第 1 条挡住之前都碰不到）
+## 5. 远程路径上的（第 1 条修好之后这些就会被碰到，所以也修了）
 
 | 位置 | 后果 |
 |---|---|
-| `src/main/localMcp.ts:253,260,263,283` | `find` / `rg` / `grep` / `bash -lc` → `local_glob`、`local_grep`、`local_bash` 全死 |
+| `src/main/localMcp.ts` | ✅ `find` / `grep` / `bash` 三条都有了 Windows 分支：`globNative` / `grepNative`（用 Node 走目录树，跳过 node_modules / .git，有 2 万个文件的上限，二进制文件按有没有 NUL 跳过），`local_bash` 换成 `%ComSpec% /d /s /c`。ripgrep 仍然优先（Windows 上也常有）。**这些工具跑在用户那台机器上**，所以 Windows 用户一开远程会话就会碰到，而模型会把"工具报错"解释成"这个东西不存在" |
 | `src/main/localMcp.ts:369` | `spawn` 不带 `shell: true` → `npx` / `uvx` 这类 `.cmd` shim 起不来，转发的 MCP 静默少工具 |
 | `src/main/forwardMcp.ts:49` | 用 `startsWith('/')` 判断"这是本机命令"→ `C:\…\node.exe` 被判成不是本机的，于是**静默不转发**（正是那个模块头警告的那种静默丢工具） |
 | `src/main/index.ts:8431` | `execSync` 里用 `shellQuote` 的 POSIX 单引号 → cmd.exe 不认，`remote:bootstrap` 静默丢掉登录环境 |
@@ -86,9 +95,10 @@ false，`net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` �
 
 ## 6. dev flow
 
-- 仓库没有 `.gitattributes`。Windows clone 会把 `scripts/remote-bootstrap.sh` 变成 CRLF，
-  而 `index.ts:8386` 把它读出来管道给远端 bash → `$'\r': command not found`。
-  打包的 `.exe` 不受影响（electron-builder 装的是构建机上的产物）。
+- ✅ 已加 `.gitattributes`（`* text=auto eol=lf` + `*.sh` / `*.mjs` 显式 `eol=lf`）。
+  不加的话 Windows clone 会把 `scripts/remote-bootstrap.sh` 变成 CRLF，
+  而 `index.ts` 把它读出来管道给远端 bash → `$'\r': command not found`，
+  而那条错误看不出跟换行有关。打包的 `.exe` 不受影响（装的是构建机上的产物）。
 - `src/main/index.ts:8840` — `SIGTERM` 在 Windows 上不会触发，所以"退出时释放 kiro-cli
   会话锁"那条不生效。只在 dev supervisor 下有意义，`scripts/dev-hot.mjs:135` 已注明。
 - `scripts/acp-probe.mjs:33,41`、`scripts/steer-smoke.mjs:33` — 写死了某台 Mac 的路径。

@@ -1,4 +1,5 @@
 import { createPortal } from 'react-dom';
+import { baseName, isSessionScratchDir } from '../pathBits.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
 import ReactMarkdown from 'react-markdown';
@@ -2503,10 +2504,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * 它当"工作目录"显示是在骗人：那棵树里没有用户的代码，标成「会话目录」也只是把这个谎
    * 换了个说法。所以直接从这一排里滤掉 —— 没有真目录就一格都不显示，只留那个 ＋。
    */
-  const isSessionDir = (d: string): boolean => /\/\.kirolex\/sessions\//.test(d);
+  /* 两个判断都要认 `\` —— Windows 上那个目录是 `C:\Users\k\.kirolex\sessions\…`，
+     只认 `/` 的话它会被当成"真的工作目录"显示出来（见 `pathBits.ts`） */
+  const isSessionDir = isSessionScratchDir;
   const inSessionDir = !!workdir && isSessionDir(workdir);
   /** 一格上的字：basename。这一排很窄，完整路径放 title。 */
-  const dirLabel = (d: string): string => (d.split('/').filter(Boolean).pop() || d);
+  const dirLabel = baseName;
   const workdirLabel = !workdir || inSessionDir ? '' : dirLabel(workdir);
   /* 主目录排第一。`workdirs` 没传（老调用点）就退回单个目录，不至于一格都不显示。 */
   const dirList = (workdirs && workdirs.length ? workdirs : (workdir ? [workdir] : []))

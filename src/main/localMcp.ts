@@ -75,6 +75,110 @@ export interface LocalMcpSession {
   dirs?: string[];
 }
 
+/* ------------------------------------------- Windows：没有 find / grep 时自己走 */
+
+/** 走目录树时一律跳过的那些 —— 和 `find` 那条命令里的 `-not -path` 对齐。 */
+const SKIP_DIRS = new Set(['node_modules', '.git']);
+
+/** 一次遍历最多看多少个文件。没有上限的话一棵大树能把主进程卡住几十秒。 */
+export const NATIVE_WALK_LIMIT = 20_000;
+
+/** 递归列文件（相对/绝对都行，返回绝对路径）。 */
+export function walkFiles(roots: string[], limit = NATIVE_WALK_LIMIT): string[] {
+  const out: string[] = [];
+  const stack = [...roots];
+  while (stack.length && out.length < limit) {
+    const dir = stack.pop()!;
+    let entries: fs.Dirent[];
+    try { entries = fs.readdirSync(dir, { withFileTypes: true }); } catch { continue; }
+    for (const e of entries) {
+      if (e.isDirectory()) {
+        if (SKIP_DIRS.has(e.name)) continue;
+        stack.push(path.join(dir, e.name));
+      } else if (e.isFile()) {
+        out.push(path.join(dir, e.name));
+        if (out.length >= limit) break;
+      }
+    }
+  }
+  return out;
+}
+
+/**
+ * 把 `*.ts` 这种 glob 变成一个正则（也支持带目录的，例如 `src` 下所有 `.ts`）。
+ *
+ * 这段说明刻意不写出那个双星加斜杠的形状 —— 它里面的 `*` 加 `/` 会把块注释**提前关掉**
+ * （这个文件里 `local_glob` 那儿已经因为同一件事栽过一次）。
+ *
+ * 只支持 `*` 和 `**`（那是这个工具面里实际会用到的）。`*` 不跨分隔符、`**` 跨 ——
+ * 和 `find -path` 那条命令的行为对齐。分隔符两种都认：Windows 上路径是 `\`,
+ * 而模型写出来的 pattern 几乎总是 `/`。
+ */
+export function globToRegExp(pattern: string): RegExp {
+  const esc = (t: string): string => t.replace(/[.+^${}()|[\]\\]/g, '\\$&');
+  /** 分隔符：两种都认（Windows 上路径是反斜杠，而 pattern 几乎总是正斜杠）。 */
+  const SEP = '[\\\\/]';
+  const isSep = (c?: string): boolean => c === '/' || c === '\\';
+  let out = '';
+  for (let i = 0; i < pattern.length; i += 1) {
+    const c = pattern[i];
+    /*
+      **`/**\/` 当成一个整体：零个或多个目录** —— 实测错过一次。
+      分开处理（分隔符 → 双星 → 分隔符）会让前后那两个分隔符都变成必需的，于是
+      `src` + 双星 + `/*.ts` 只命中 `src/sub/a.ts`，**漏掉 `src/a.ts`** ——
+      而 glob 的通例是"零个或多个"。表现是"明明有这个文件，搜不到"，
+      那是这个工具最不该有的失败。
+    */
+    if (isSep(c) && pattern[i + 1] === '*' && pattern[i + 2] === '*' && isSep(pattern[i + 3])) {
+      out += `${SEP}(?:.*${SEP})?`;
+      i += 3;
+      continue;
+    }
+    if (c === '*' && pattern[i + 1] === '*') { out += '.*'; i += 1; continue; }
+    if (c === '*') { out += `[^\\\\/]*`; continue; }
+    if (c === '?') { out += `[^\\\\/]`; continue; }
+    if (isSep(c)) { out += SEP; continue; }
+    out += esc(c);
+  }
+  // 不带分隔符的 pattern 只匹配文件名（`*.ts`）；带分隔符的匹配路径尾部
+  return new RegExp(`${/[\\/]/.test(pattern) ? SEP : '^'}${out}$`);
+}
+
+/** `local_glob` 的 Windows 实现。 */
+export function globNative(roots: string[], pattern: string): string[] {
+  const re = globToRegExp(pattern);
+  const hasSep = /[\\/]/.test(pattern);
+  return walkFiles(roots).filter((f) => re.test(hasSep ? f : path.basename(f)));
+}
+
+/**
+ * `local_grep` 的 Windows 兜底（ripgrep 不在时）。
+ *
+ * 输出格式对齐 `grep -rn`：`路径:行号:内容`。二进制文件跳过（有 NUL 就当二进制）——
+ * 不跳的话一个 .png 能吐出几千行乱码，把这一轮的上下文吃光。
+ */
+export function grepNative(roots: string[], query: string, glob?: string, maxHits = 500): string[] {
+  const re = glob ? globToRegExp(glob) : null;
+  const hasSep = glob ? /[\\/]/.test(glob) : false;
+  const out: string[] = [];
+  for (const f of walkFiles(roots)) {
+    if (re && !re.test(hasSep ? f : path.basename(f))) continue;
+    let body: string;
+    try {
+      const buf = fs.readFileSync(f);
+      if (buf.includes(0)) continue;                 // 二进制
+      body = buf.toString('utf-8');
+    } catch { continue; }
+    const lines = body.split(/\r?\n/);
+    for (let i = 0; i < lines.length; i += 1) {
+      if (!lines[i].includes(query)) continue;
+      out.push(`${f}:${i + 1}:${lines[i]}`);
+      if (out.length >= maxHits) return out;
+    }
+  }
+  return out;
+}
+
 /** 这条会话默认搜索的那几棵树（至少一个：主目录）。 */
 export function sessionRoots(session: LocalMcpSession): string[] {
   const list = (session.dirs || []).filter((d) => typeof d === 'string' && d.trim());
@@ -249,6 +353,17 @@ export async function callTool(
       const pattern = String(args?.pattern || '*');
       // `find` 一定在；`-path` 能表达 `src/**/*.ts` 这种写法
       // （这里用行注释：`**/*` 里的 `*/` 会把块注释提前关掉 —— 那一下让 tsc 失败、dev:main 起不来）
+      /*
+        **Windows 上没有 `find`** ——「看一下有没有 windows 上不能跑的东西」→「都修」。
+        这些工具跑在**用户那台机器**上（远端通过反向隧道调过来），所以 Windows 用户一开
+        远程会话就会碰到：`local_glob` / `local_grep` / `local_bash` 全都是 ENOENT,
+        而模型会把"工具报错"解释成"这个东西不存在"。
+        用 Node 自己走一遍目录树，行为和那条 `find` 对齐（含 node_modules / .git 的排除）。
+      */
+      if (process.platform === 'win32') {
+        const hits = globNative(roots, pattern);
+        return text(hits.length ? hits.join('\n') : '（没有匹配的文件）');
+      }
       const spec = pattern.includes('/') ? ['-path', `*${pattern.replace(/\*\*/g, '*')}`] : ['-name', pattern];
       const r = await run('find', [...roots, '-type', 'f', ...spec, '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.git/*'], cwd, 30_000);
       return text(r.out.trim() || '（没有匹配的文件）');
@@ -260,6 +375,14 @@ export async function callTool(
       const rg = await run('rg', ['-n', '--no-heading', ...(args?.glob ? ['-g', String(args.glob)] : []), '--', q, ...roots], cwd, 60_000);
       /* `spawnFailed` = 没装 ripgrep（不是"没搜到"）—— 那就退回 grep，见 `run` 那段 */
       if (!rg.spawnFailed && (rg.code === 0 || rg.code === 1)) return text(rg.out.trim() || '（没有匹配）');
+      /*
+        ripgrep 没有时的兜底。Windows 上没有 `grep`，所以那边用 Node 自己搜 ——
+        慢一些，但"慢"和"这个工具根本不工作"不是一个量级的问题。
+      */
+      if (process.platform === 'win32') {
+        const hits = grepNative(roots, q, args?.glob ? String(args.glob) : undefined);
+        return text(hits.length ? hits.join('\n') : '（没有匹配）');
+      }
       const g = await run('grep', ['-rn', '--exclude-dir=node_modules', '--exclude-dir=.git', '--', q, ...roots], cwd, 60_000);
       return text(g.out.trim() || '（没有匹配）');
     }
@@ -280,7 +403,15 @@ export async function callTool(
       /* 留痕：跑在**你**机器上的命令，你必须看得见（截断到一行长度，全文在日志里） */
       deps.notice(session.sessionId, `⌨️ 远端那条会话在你本机跑了：\`${command.replace(/\s+/g, ' ').slice(0, 120)}\``);
       deps.log('info', `local_bash sessionId=${session.sessionId} cwd=${cwd} cmd=${command.replace(/\s+/g, ' ').slice(0, 400)}`);
-      const r = await run('bash', ['-lc', command], cwd, timeoutMs);
+      /*
+        **Windows 上没有 `bash`** —— 换成 `%ComSpec% /d /s /c`（`loopVerify.ts` 里
+        已经是这个写法，这里跟它一致）。注意这意味着模型写的命令要是 **cmd 语法**:
+        那件事在注入里说过（「运行环境」那段会说清这是哪台机器），而这里的替代方案是
+        "这个工具完全不可用"，那更糟。
+      */
+      const r = process.platform === 'win32'
+        ? await run(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command], cwd, timeoutMs)
+        : await run('bash', ['-lc', command], cwd, timeoutMs);
       return text(`[exit ${r.code}]\n${r.out.trim()}`);
     }
     default:

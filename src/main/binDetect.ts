@@ -17,6 +17,9 @@
  * 本机用 `bash -lc`，远端用同一段脚本走 ssh —— 一份判据，两台机器，不会分叉。
  */
 
+import fs from 'fs';
+import path from 'path';
+
 /** 支持的三个工具。`claude` / `codex` 目前只检测和记录，KiroLex 还只起 kiro-cli。 */
 export type ToolId = 'kiro' | 'claude' | 'codex';
 
@@ -28,6 +31,13 @@ export interface ToolSpec {
   names: string[];
   /** 可能的绝对路径（`~` 会在脚本里展开成 `$HOME`）。 */
   paths: string[];
+  /**
+   * Windows 上的候选路径（`%LOCALAPPDATA%` 这类）。
+   *
+   * **单独一个字段**，不混进 `paths`：那个数组会被拼进 POSIX 脚本
+   * （`[ -x "C:\..." ]`），混进去就是给远端和 macOS 生成一堆永远不成立的判断。
+   */
+  winPaths?: string[];
   /** 取版本用的参数。 */
   versionArg: string;
   /**
@@ -44,6 +54,12 @@ export const TOOLS: ToolSpec[] = [
     label: 'kiro-cli',
     names: ['kiro-cli', 'kiro'],
     paths: ['~/.local/bin/kiro-cli', '/usr/local/bin/kiro-cli', '/opt/homebrew/bin/kiro-cli', '~/.toolbox/bin/kiro-cli'],
+    /* 装 kiro-cli 的三个常见位置（和 `kiroCliCandidates()` 保持一致） */
+    winPaths: [
+      '%LOCALAPPDATA%\\Kiro-Cli\\kiro-cli.exe',
+      '%LOCALAPPDATA%\\Programs\\kiro-cli\\kiro-cli.exe',
+      '%APPDATA%\\kiro-cli\\kiro-cli.exe',
+    ],
     versionArg: '--version',
     verify: /kiro[-_ ]?cli/i,
   },
@@ -52,6 +68,7 @@ export const TOOLS: ToolSpec[] = [
     label: 'claude code',
     names: ['claude', 'claude-code-acp'],
     paths: ['~/.claude/local/claude', '~/.local/bin/claude', '/usr/local/bin/claude', '/opt/homebrew/bin/claude'],
+    winPaths: ['%APPDATA%\\npm\\claude.cmd', '%LOCALAPPDATA%\\Programs\\claude\\claude.exe'],
     versionArg: '--version',
     /* `claude-code-acp --version` 只打一个版本号，没有名字 —— 所以这里放宽到"有版本号就算" */
     verify: /claude|^\s*v?\d+\.\d+/i,
@@ -61,6 +78,7 @@ export const TOOLS: ToolSpec[] = [
     label: 'codex',
     names: ['codex'],
     paths: ['~/.local/bin/codex', '/usr/local/bin/codex', '/opt/homebrew/bin/codex'],
+    winPaths: ['%APPDATA%\\npm\\codex.cmd', '%LOCALAPPDATA%\\Programs\\codex\\codex.exe'],
     versionArg: '--version',
     verify: /codex|^\s*v?\d+\.\d+/i,
   },
@@ -252,4 +270,141 @@ export function mergeHistory(found: BinCandidate[], history: string[] = []): Bin
   }
   for (const c of found) if (left.has(c.command)) out.push(c);
   return out;
+}
+
+/* --------------------------------------------- Windows：用 Node 自己探，不走 shell */
+
+/**
+ * **Windows 上的本机探测** ——「看一下有没有 windows 上不能跑的东西」→「都修」。
+ *
+ * `detectScript()` 是一段 POSIX shell（`command -v`、`$(...)`、`case…esac`、`readlink -f`），
+ * 而本机那一半原来是 `execFile('bash', ['-lc', script])` —— Windows 上没有 `bash`，
+ * 于是设置里「自动检测这台机器上的三个工具」和「测试」两颗按钮都是 ENOENT。
+ * 而 `kiroBinProblem()` 在配好之前**拒绝起任何会话**，所以那两颗按钮死掉等于
+ * Windows 上的首次使用没有出路。
+ *
+ * 这里**不去把那段脚本翻译成 PowerShell**：翻译一段 30 行的 shell 意味着维护两份同样的逻辑，
+ * 而它们会慢慢长歪。用 Node 做同一件事更短、也更容易说对：
+ *
+ *   · PATH 上的名字 → 遍历 `PATH` × `PATHEXT`（Windows 上 `kiro-cli` 的真实文件叫
+ *     `kiro-cli.exe`，而 `.cmd` / `.bat` 也要认 —— npm 装的工具就是 `.cmd` shim）；
+ *   · 绝对路径候选 → 展开 `%LOCALAPPDATA%` 这类变量再看文件在不在；
+ *   · 每个候选真的跑一次 `--version`，用 `verify` 校验输出（名字像不代表是它 ——
+ *     PATH 上的 `kiro` 是 Kiro IDE 的 CLI，和 kiro-cli 完全两个东西）；
+ *   · 按**解析后的真实路径**去重，理由和 shell 那边一样：同一个文件出现两次就毁掉了
+ *     这个列表的意义（"到底该选哪个"）。
+ *
+ * 这个实现其实在任何平台都能跑，但**只在 Windows 上用**：POSIX 那条脚本路径是实测过的
+ * （`bash -lc` 会带上用户 `.zshrc` 里的 PATH），换掉它是不必要的风险。
+ */
+export function windowsPathExts(env: NodeJS.ProcessEnv = process.env): string[] {
+  const raw = String(env.PATHEXT || '.COM;.EXE;.BAT;.CMD');
+  const exts = raw.split(';').map((e) => e.trim().toLowerCase()).filter(Boolean);
+  /* 空串放第一个：配置里可能填的就是一个**已经带后缀**的名字（`kiro-cli.exe`） */
+  return ['', ...exts.filter((e, i, a) => a.indexOf(e) === i)];
+}
+
+/** 展开 `%VAR%`。展不开的（变量没设）返回空串 —— 调用方据此丢掉这个候选。 */
+export function expandWinVars(p: string, env: NodeJS.ProcessEnv = process.env): string {
+  let missing = false;
+  const out = String(p || '').replace(/%([^%]+)%/g, (_m, name) => {
+    const v = env[name] || env[String(name).toUpperCase()];
+    if (!v) { missing = true; return ''; }
+    return v;
+  });
+  return missing ? '' : out;
+}
+
+/**
+ * 在 PATH 上找一个名字的所有可执行文件。返回绝对路径列表（按 PATH 顺序）。
+ *
+ * 不用 `where.exe`：它对"名字里带连字符"和引号的处理有惊喜，而这件事用 `fs` 就能说清。
+ */
+export function whichAll(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } },
+): string[] {
+  /*
+    **分隔符写死 `;`，不用 `path.delimiter`** —— 这个函数只在 Windows 上用，而 Windows 的
+    PATH 分隔符就是 `;`。用 `path.delimiter` 的话它在 macOS 上是 `:`，于是这段逻辑
+    在 macOS 上（也就是单测里）根本走不通 —— 一个只能在目标平台上验证的函数等于没测。
+    反过来也不能按 `:` 拆：Windows 的路径里本来就有 `:`（`C:\…`）。
+  */
+  const dirs = String(env.PATH || env.Path || '').split(';').filter(Boolean);
+  const exts = windowsPathExts(env);
+  const out: string[] = [];
+  for (const dir of dirs) {
+    for (const ext of exts) {
+      /*
+        **用 `\` 拼，不用 `path.join`** —— 同一个理由（见上面那段分隔符的注释）：
+        `path.join` 是跟着**当前**平台走的，在 macOS 上它会拼出 `C:\bin/kiro-cli.exe`,
+        于是这个只在 Windows 上跑的函数在单测里永远返回空数组。
+      */
+      const base = dir.replace(/^"|"$/g, '').replace(/[\\/]+$/, '');
+      const full = `${base}\\${name}${ext}`;
+      if (exists(full) && !out.includes(full)) out.push(full);
+    }
+  }
+  return out;
+}
+
+/** 一次 `--version` 的结果。 */
+export interface ProbeOne { ok: boolean; first: string }
+
+/**
+ * Windows 上探一遍三个工具。`run` 可注入，便于测试。
+ *
+ * 失败的候选**也报**（`ok: false` + 原因）：「文件在但跑不起来」和「没装」是两件不同的事，
+ * 而前者通常意味着装坏了或者少了运行库 —— 不说的话人会以为没装，然后再装一遍。
+ */
+export async function detectWindows(
+  run: (cmd: string, arg: string) => Promise<ProbeOne>,
+  tools: ToolSpec[] = TOOLS,
+  env: NodeJS.ProcessEnv = process.env,
+  realpath: (p: string) => string = (p) => { try { return fs.realpathSync(p); } catch { return p; } },
+  /*
+    **文件存在性也注入** —— 不然这个函数在 macOS 上没法测：`C:\bin\kiro-cli.exe`
+    在这台机器上当然不存在，于是候选一个都攒不出来，测的就只是"空数组等于空数组"。
+    而这段逻辑（PATHEXT 展开、去重、verify 校验）恰恰是最需要被测的部分。
+  */
+  isFile: (p: string) => boolean = (p) => { try { return fs.statSync(p).isFile(); } catch { return false; } },
+): Promise<DetectResult> {
+  const res: DetectResult = { kiro: [], claude: [], codex: [] };
+  for (const t of tools) {
+    const seen = new Set<string>();
+    /** 候选：`{ 要填进配置的命令, 实际去跑的文件 }` */
+    const cands: Array<{ command: string; file: string }> = [];
+    /* PATH 上的名字排前面 —— 那是"用户平时用的那个" */
+    for (const n of t.names) {
+      for (const file of whichAll(n, env, isFile)) cands.push({ command: n, file });
+    }
+    for (const raw of t.winPaths || []) {
+      const file = expandWinVars(raw, env);
+      if (!file) continue;                                  // 变量没设 → 这个候选不存在
+      if (!isFile(file)) continue;
+      cands.push({ command: file, file });
+    }
+    for (const c of cands) {
+      const canon = realpath(c.file);
+      if (seen.has(canon)) continue;                        // 同一个文件只报一次
+      seen.add(canon);
+      let probe: ProbeOne;
+      try { probe = await run(c.file, t.versionArg); } catch (err: any) {
+        probe = { ok: false, first: String(err?.message || err) };
+      }
+      /* 跑起来了但输出不像这个工具 → 当成**不可用**并说出来（假阳性比没检测到糟） */
+      const looksRight = t.verify.test(probe.first || '');
+      res[t.id].push({
+        command: c.command,
+        real: canon,
+        version: probe.ok && looksRight ? (probe.first || '').slice(0, 120) : undefined,
+        ok: probe.ok && looksRight,
+        error: probe.ok
+          ? (looksRight ? undefined : `版本输出不像 ${t.label}：${(probe.first || '').slice(0, 80)}`)
+          : (probe.first || '跑不起来').slice(0, 160),
+      });
+    }
+  }
+  return res;
 }

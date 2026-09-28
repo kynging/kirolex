@@ -68,7 +68,12 @@ export function writeProject(home: string, project: string, config: ProjectConfi
 export function whyNotWorkspace(dir: string): string | null {
   const want = String(dir || '').trim();
   if (!want) return null;                                  // 空 = 用家目录，合法
-  if (!path.isAbsolute(want)) return '要写绝对路径（从 / 开始）';
+  /* 别在提示里写死 `/` —— Windows 上绝对路径长 `C:\…` 那样，照着那句话改只会更错 */
+  if (!path.isAbsolute(want)) {
+    return process.platform === 'win32'
+      ? '要写绝对路径（像 C:\\Users\\你\\项目）'
+      : '要写绝对路径（从 / 开始）';
+  }
   try {
     if (!fs.statSync(want).isDirectory()) return '这不是一个目录';
   } catch { return '这个目录不存在'; }

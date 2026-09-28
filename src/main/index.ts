@@ -40,7 +40,7 @@ import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
-import { detectScript, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
+import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
@@ -329,6 +329,30 @@ async function awaitReconfigureIdle(sessionId: string, timeoutMs = 30000): Promi
  * 而重启一次重新探测的代价只是一次 30 秒 —— 那个代价换来的是「装了新版本就自动恢复」。
  */
 /** 这条会话跑在哪台机器上 —— 模型可用性、启动命令、agent 都是按这个分的。 */
+/**
+ * **`file://` URL → 本机路径** ——「看一下有没有 windows 上不能跑的东西」。
+ *
+ * 原来四处各写一遍 `replace(/^file:\/\//, '')`。在 macOS 上那是对的
+ * （`file:///Users/k/a.txt` → `/Users/k/a.txt`），在 Windows 上是错的：
+ * `file:///C:/Users/k/a.txt` 剥完剩 `/C:/Users/k/a.txt` —— `path.isAbsolute` 接受它,
+ * 而 `fs.statSync` 拒绝。表现是"从聊天里点一个文件打不开"，而错误信息里那条路径
+ * 看起来完全正常（只是前面多一个斜杠）。
+ *
+ * 顺手也解 percent-encoding：`file://` URL 里空格是 `%20`，而那是真会出现的
+ * （macOS 上带空格的文件名很常见）。解不开就用原样 —— 一个畸形的 URL 不该让整个操作抛。
+ *
+ * 不是 `file://` 的原样返回（去掉首尾空白）：调用方传进来的通常就是一个裸路径。
+ */
+export function stripFileUrl(input: unknown): string {
+  const raw = String(input ?? '').trim();
+  if (!/^file:\/\//i.test(raw)) return raw;
+  let p = raw.replace(/^file:\/\/[^/]*/i, '');     // 顺带吃掉 `localhost` 这种 authority
+  try { p = decodeURIComponent(p); } catch { /* 畸形的编码：用原样 */ }
+  /* Windows：`/C:/Users/…` → `C:/Users/…`（盘符前那个斜杠是 URL 的，不是路径的） */
+  if (/^\/[A-Za-z]:/.test(p)) p = p.slice(1);
+  return p;
+}
+
 function machineKeyOf(profile: { remote?: { sshHost?: string } }): string {
   return profile.remote?.sshHost || 'local';
 }
@@ -1890,6 +1914,29 @@ function hasSessionOn(remote: RemoteTarget): boolean {
  * 而用 `bash -s` 把脚本喂进 stdin 的话，第一个读 stdin 的命令就会把剩下的脚本吞掉
  * （实测踩过：那次 `claude-code-acp --version` 吃掉了自检部分，然后整段"成功"退出）。
  */
+/**
+ * 跑一次 `<cmd> --version` 并把第一行带回来 —— 给 `detectWindows` 用。
+ *
+ * `execFile` 不走 shell：命令是一个**绝对路径**（`detectWindows` 已经在 PATH 上解析过了），
+ * 走 shell 只会引入引号问题（cmd.exe 不认 POSIX 单引号）。
+ * `.cmd` / `.bat` 是例外 —— 那些 Windows 上必须由 cmd.exe 解释，所以单独给 `shell: true`。
+ */
+function probeOneLocal(cmd: string, arg: string): Promise<{ ok: boolean; first: string }> {
+  /* npm 装的工具在 Windows 上是 `.cmd` shim，`execFile` 直接执行不了 */
+  const needsShell = /\.(cmd|bat)$/i.test(cmd);
+  return new Promise((resolve) => {
+    execFile(needsShell ? `"${cmd}"` : cmd, [arg], {
+      timeout: PROBE_TIMEOUT_SEC * 1000,
+      encoding: 'utf8',
+      shell: needsShell,
+      windowsHide: true,
+    }, (err, stdout, stderr) => {
+      const first = String(stdout || stderr || '').split(/\r?\n/)[0]?.trim() || '';
+      resolve({ ok: !err, first: first || (err ? String(err.message) : '') });
+    });
+  });
+}
+
 function runProbe(machine: string, script: string): Promise<string> {
   const timeout = 120_000;
   if (!machine || machine === 'local') {
@@ -3567,8 +3614,12 @@ if (!gotSingleInstanceLock) {
   // session whose window never rendered) holds the lock, so every relaunch died
   // instantly with nothing but `main process starting` in the log. Naming it is the
   // difference between a 30-second fix and a hunt.
+  /* 收拾办法按平台给 —— 这是 app 拒绝启动时唯一的一句话，叫 Windows 用户去跑 `pkill` 没用 */
+  const howToKill = process.platform === 'win32'
+    ? '任务管理器里结束 KiroLex / electron，或者 `taskkill /F /IM electron.exe`'
+    : '退掉它（Cmd-Q）或者 `pkill -f "kirolex/node_modules/electron"`';
   logger.info('app', 'another KiroLex instance already holds the single-instance lock -> exiting. '
-    + 'If no window is visible, that instance is stale: quit it (Cmd-Q) or `pkill -f "kirolex/node_modules/electron"`.');
+    + `If no window is visible, that instance is stale: ${howToKill}.`);
   app.exit(EXIT_CODE_ALREADY_RUNNING);
 } else {
   app.on('second-instance', () => {
@@ -7033,7 +7084,7 @@ app.whenReady().then(async () => {
         // Resolve the SAME way app:path-exists / workspace:read do, so a relative
         // or ~-prefixed path handed over from chat still points at the real file
         // instead of being resolved against the app process cwd.
-        let p = String(target).trim().replace(/^file:\/\//, '');
+        let p = stripFileUrl(target);
         if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
         if (!path.isAbsolute(p)) {
           const entry = sessionId ? sessionClients.get(sessionId) : undefined;
@@ -7059,7 +7110,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:image-data-url', (_event, filePath: string) => {
     try {
       if (!filePath) return null;
-      let p = String(filePath).trim().replace(/^file:\/\//, '');
+      let p = stripFileUrl(filePath);
       if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
       if (!path.isAbsolute(p)) p = path.resolve(os.homedir(), p);
       const mime = IMAGE_MIME_BY_EXT[path.extname(p).toLowerCase()];
@@ -7078,7 +7129,7 @@ app.whenReady().then(async () => {
       if (!filePath) return false;
       const entry = sessionId ? sessionClients.get(sessionId) : undefined;
       if (entry?.profile.remote?.sshHost) return true;
-      let p = filePath.trim().replace(/^file:\/\//, '');
+      let p = stripFileUrl(filePath);
       if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
       if (!path.isAbsolute(p)) {
         const base = entry?.cwd || os.homedir();
@@ -7112,7 +7163,7 @@ app.whenReady().then(async () => {
 
   /** Expand `file://` and `~`, then resolve relatives against workspaceBase. */
   function resolveUserPath(filePath: string, sessionId?: string | null): string {
-    let p = String(filePath).trim().replace(/^file:\/\//, '');
+    let p = stripFileUrl(filePath);
     if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
     if (!path.isAbsolute(p)) p = path.resolve(workspaceBase(sessionId), p);
     return p;
@@ -8340,8 +8391,17 @@ app.whenReady().then(async () => {
    */
   ipcMain.handle('bins:detect', async (_event, machine: string) => {
     try {
-      const out = await runProbe(machine, detectScript());
-      const found = parseDetect(out);
+      /*
+        **Windows 上的本机探测走 Node，不走 shell** —— `detectScript()` 是一段 POSIX shell,
+        而 Windows 上没有 `bash`，原来这里直接 ENOENT：设置里那颗「自动检测」按钮是死的,
+        而 `kiroBinProblem()` 在配好之前拒绝起任何会话 —— 也就是没有出路。见 `detectWindows`。
+
+        远端那一半照旧走脚本（远端是 Linux），所以判据是"**本机**且在 Windows 上"。
+      */
+      const localWin = (!machine || machine === 'local') && process.platform === 'win32';
+      const found = localWin
+        ? await detectWindows(probeOneLocal)
+        : parseDetect(await runProbe(machine, detectScript()));
       const hist = binHistory(KIROLEX_CONFIG_PATH)[machine] || {};
       /* 历史排前面并打上 known —— 一个真的起过会话的命令比"文件在这儿"可信得多 */
       const merged = {
@@ -8360,6 +8420,20 @@ app.whenReady().then(async () => {
   ipcMain.handle('bins:test', async (_event, machine: string, command: string) => {
     if (!command?.trim()) return { ok: false, error: '没有给命令' };
     try {
+      /*
+        本机 + Windows：和「自动检测」同一个理由 —— `testScript()` 是 POSIX shell。
+        这里多一步：填进来的可能是**裸名字**（`kiro-cli`），所以先在 PATH 上解析一次;
+        解析不到就原样试（可能是个绝对路径，也可能确实不存在 —— 那时报错本身就是答案）。
+      */
+      if ((!machine || machine === 'local') && process.platform === 'win32') {
+        const raw = command.trim();
+        const onPath = raw.includes('/') || raw.includes('\\') ? [] : whichAll(raw);
+        const target = onPath[0] || raw;
+        const r = await probeOneLocal(target, '--version');
+        return r.ok
+          ? { ok: true, version: r.first.slice(0, 160) }
+          : { ok: false, error: r.first.slice(0, 160) || '跑不起来' };
+      }
       return parseTest(await runProbe(machine, testScript(command.trim())));
     } catch (err: any) {
       return { ok: false, error: err?.message || String(err) };
