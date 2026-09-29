@@ -97,8 +97,30 @@ export function preflightScript(tools: string[] = REQUIRED_TOOLS, opts: { models
     'echo "KVER $(kiro-cli --version 2>/dev/null | head -1 | grep -oE \'[0-9]+\\.[0-9]+\\.[0-9]+\' | head -1)"',
   ];
   if (opts.models !== false) {
-    /* 模型列表：参数校验就会失败，不会真的调模型 */
-    lines.push(`if command -v kiro-cli >/dev/null 2>&1; then kiro-cli chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1; fi`);
+    /*
+      **先用 `--list-models`，它现在有了** —— 上面那段注释写"kiro-cli 没有专门的
+      model list 子命令"，那是 1.27.0 时的事，已经过期。
+
+      为什么必须换：那个"故意传错模型"的办法在 2.24.1/2.25.0 上**已经不работает**，
+      而且坏得很难看 —— 它不再在参数校验处报错，而是
+        `[warn] failed to set model '__kirolex_probe__': Method not found`
+      然后**用默认模型真跑了一轮对话**。后果两条：
+        · 模型列表恒为空（`Available models:` 那行再也不出现），于是远端模型选择器没有选项，
+          而 `pickRemoteModel` 靠它挡"模型不存在时的静默退回"——那道保护也就没了；
+        · 每次带模型的预检都白烧一次模型调用（`gpt-5.6-sol` 是 4.40x）。
+
+      `--format json` 比按列切稳，而且顺带拿到倍率和上下文长度（原来倍率只能拿本机那份补，
+      而本机清单被地域过滤，一个 Claude 都没有 —— 那正是"claude-opus-5.5 没有倍率"的来源）。
+
+      老版本兜底仍然留着：`--list-models` 失败（旧版没这个参数）才退回去传错模型。
+      顺序不能反 —— 反了就是每次都先烧一轮。
+    */
+    lines.push(
+      'if command -v kiro-cli >/dev/null 2>&1; then'
+      + ' m="$(kiro-cli chat --list-models --format json 2>/dev/null)";'
+      + ' if [ -n "$m" ]; then echo "MODELSJSON $m";'
+      + ` else kiro-cli chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1; fi; fi`,
+    );
   }
   return lines.join('; ');
 }
@@ -254,13 +276,57 @@ export function remoteExecutorCap(cpus: number, memMB: number): number {
   return Math.max(2, Math.min(12, byMem, byCpu));
 }
 
-/** 从预检输出里把模型列表解析出来（ANSI 要脱掉：那一行是 kiro-cli 的错误输出，带色）。 */
+/**
+ * 从预检输出里把模型列表解析出来。
+ *
+ * 两种来源：`--list-models --format json`（新版，首选），和老那条"传错模型、从报错里抠"
+ * 的输出（旧版兜底）。ANSI 要脱掉 —— 老那条是 kiro-cli 的错误输出，带色。
+ */
 export function parseModels(stdout: string): string[] {
   // eslint-disable-next-line no-control-regex
   const clean = String(stdout || '').replace(/\x1b\[[0-9;]*m/g, '');
+  const json = /^MODELSJSON (.*)$/m.exec(clean)?.[1];
+  if (json) {
+    try {
+      const arr = JSON.parse(json)?.models;
+      if (Array.isArray(arr)) {
+        /* `model_id` 才是传给 `--model` 的那个名字；`model_name` 只是显示用的 */
+        const ids = arr.map((m: any) => String(m?.model_id || m?.model_name || '').trim()).filter(Boolean);
+        if (ids.length) return ids;
+      }
+    } catch { /* JSON 坏了就往下走老那条 —— 有一份能用总比空列表好 */ }
+  }
   const line = /Available models:(.*)$/m.exec(clean)?.[1];
   if (!line) return [];
   return line.split(',').map((x) => x.trim()).filter(Boolean);
+}
+
+/**
+ * 模型的倍率/上下文长度（只有 `--list-models --format json` 那条路有）。
+ * 拿不到就返回空 —— **不要拿本机那份去补**：本机清单按出口 IP 做地域过滤
+ * （这台 Mac 上一个 Claude 都没有），补出来的会是错的或者干脆缺。
+ */
+export function parseModelMeta(stdout: string): Record<string, { rate?: number; context?: number }> {
+  // eslint-disable-next-line no-control-regex
+  const clean = String(stdout || '').replace(/\x1b\[[0-9;]*m/g, '');
+  const json = /^MODELSJSON (.*)$/m.exec(clean)?.[1];
+  if (!json) return {};
+  try {
+    const arr = JSON.parse(json)?.models;
+    if (!Array.isArray(arr)) return {};
+    const out: Record<string, { rate?: number; context?: number }> = {};
+    for (const m of arr) {
+      const id = String(m?.model_id || m?.model_name || '').trim();
+      if (!id) continue;
+      const rate = Number(m?.rate_multiplier);
+      const context = Number(m?.context_window_tokens);
+      out[id] = {
+        ...(Number.isFinite(rate) ? { rate } : {}),
+        ...(Number.isFinite(context) ? { context } : {}),
+      };
+    }
+    return out;
+  } catch { return {}; }
 }
 
 function firstLine(s: string): string {
