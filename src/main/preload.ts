@@ -388,7 +388,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     localBins?: { kiro?: string; claude?: string; codex?: string };
   }> => ipcRenderer.invoke('app:remote-targets'),
   /** 加/改一台远端（只动 config.json 的 `remotes`，原子写）。 */
-  remoteSave: (input: { id?: string; label?: string; sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
+  remoteSave: (input: { id?: string; label?: string; sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; remoteWorkdir?: string }) =>
     ipcRenderer.invoke('remote:save', input),
   /** 从可选列表里删掉一台（正在用它的会话不受影响 —— 目标存在各自的 profile 里）。 */
   remoteDelete: (id: string) => ipcRenderer.invoke('remote:delete', id),
@@ -396,7 +396,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * **一键把远端装齐**：kiro-cli / claude code / codex / rsync / git / node。
    * 输出边跑边从 `onRemoteBootstrapOutput` 出来（装东西要几分钟，不给看就像卡死）。
    */
-  remoteBootstrap: (input: { sshHost: string; sshPort?: number; identityFile?: string; force?: boolean }) =>
+  remoteBootstrap: (input: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; force?: boolean }) =>
     ipcRenderer.invoke('remote:bootstrap', input),
   onRemoteBootstrapOutput: (callback: (d: { sshHost: string; chunk: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
@@ -482,7 +482,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 用 Finder 选私钥（默认开在 ~/.ssh，并显示隐藏文件 —— 否则那个目录根本看不到）。 */
   remotePickKey: (): Promise<{ path: string }> => ipcRenderer.invoke('remote:pick-key'),
   /** 测试连接：工具装齐了吗、登录了吗、连得上吗。三种情况三句话。 */
-  remoteTest: (input: { sshHost: string; sshPort?: number; identityFile?: string; remoteWorkdir?: string }) =>
+  remoteTest: (input: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; remoteWorkdir?: string }) =>
     ipcRenderer.invoke('remote:test', input),
 
   // Events

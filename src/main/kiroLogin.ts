@@ -34,6 +34,16 @@ export interface KiroLoginHints {
 export function parseWhoami(text: string): KiroLoginHints {
   const s = String(text || '');
   const url = /(https:\/\/[^\s)]+\/start)/.exec(s)?.[1];
+  /*
+    **这个 region 不是 Identity Center 的区** —— 它是 profile ARN 的区
+    （`arn:aws:codewhisperer:us-east-1:…` = CodeWhisperer profile 所在的区）。
+    实测这两者可以不一样：那份 ARN 写 us-east-1，而 IdC 实例在 ap-northeast-1，
+    拿 ARN 的区去 `kiro-cli login` 会 `InvalidRequestException`。
+
+    `whoami` 的输出里**没有** IdC 的区，所以这里只能给出一个线索。
+    `scripts/remote-bootstrap.sh` 把它当候选列表的第一个，不对就往下试 ——
+    错的区会秒失败，代价只是多两秒。
+  */
   const region = /arn:aws:[a-z0-9-]+:([a-z0-9-]+):/.exec(s)?.[1];
   return { identityProvider: url, region };
 }

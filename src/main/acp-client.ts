@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
+import { proxyArgs } from './sshProxy.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 
 interface JsonRpcRequest {
@@ -883,6 +884,10 @@ export function buildSshArgs(
   }
   if (remote.identityFile) args.push('-i', remote.identityFile);
   if (remote.sshPort && remote.sshPort !== 22) args.push('-p', String(remote.sshPort));
+  /*
+    跳板要在**建连接**的这一路上（复用路径上面已经 return 了 —— 走已有连接时那一跳早就跳过了）。
+  */
+  args.push(...proxyArgs(remote));
   args.push(remote.sshHost, remoteCommand);
   return args;
 }

@@ -42,6 +42,7 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
+import { proxyArgs } from './sshProxy.ts';
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -122,6 +123,7 @@ export function masterArgs(opts: {
   sshHost: string;
   sshPort?: number;
   identityFile?: string;
+  proxyJump?: string;
   socket: string;
   remotePort: number;
   localPort: number;
@@ -141,6 +143,8 @@ export function masterArgs(opts: {
   ];
   if (opts.identityFile) args.push('-i', opts.identityFile);
   if (opts.sshPort && opts.sshPort !== 22) args.push('-p', String(opts.sshPort));
+  /* master 是**唯一**真正建连接的那条，跳板必须在它身上 */
+  args.push(...proxyArgs({ proxyJump: opts.proxyJump, identityFile: opts.identityFile }));
   args.push(opts.sshHost);
   return args;
 }
@@ -263,7 +267,7 @@ export class SshMux {
    * 会话会各起一个 master，而第 2 个开始全部因为 socket 已存在而失败，
    * 表现是"只有第一条会话有工具"。
    */
-  async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string }): Promise<MuxEntry> {
+  async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }): Promise<MuxEntry> {
     /*
       **Windows 上直接说"没有"** —— 见 `muxSupported`。抛出去而不是返回 undefined:
       调用方要据此走"每条会话自己一条连接"那条路，而一个 undefined 很容易被当成
@@ -280,7 +284,7 @@ export class SshMux {
     return p;
   }
 
-  private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string }): Promise<MuxEntry> {
+  private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }): Promise<MuxEntry> {
     /* 上一次留下的：进程记录先清掉，僵尸 socket 也删 —— 否则 master 会因为"文件已存在"直接退 */
     const old = this.entries.get(key);
     if (old) { try { old.proc.kill(); } catch { /* 已经没了 */ } this.entries.delete(key); }

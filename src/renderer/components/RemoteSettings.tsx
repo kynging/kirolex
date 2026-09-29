@@ -43,6 +43,8 @@ export interface RemoteRow {
   sshHost: string;
   sshPort?: number;
   identityFile?: string;
+  /** 跳板机（`user@host` 或 `user@host:port`）。目标在私有子网时填。 */
+  proxyJump?: string;
   remoteWorkdir?: string;
   /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
   bins?: ExecBins;
@@ -58,7 +60,7 @@ const NEW = '__new__';
  * 在哪、叫什么"。本机没有 SSH 地址/端口/密钥/远端目录，所以只显示那三个启动命令。
  */
 const LOCAL = '__local__';
-const EMPTY: Draft = { sshHost: '', label: '', sshPort: 22, identityFile: '', remoteWorkdir: '' };
+const EMPTY: Draft = { sshHost: '', label: '', sshPort: 22, identityFile: '', proxyJump: '', remoteWorkdir: '' };
 
 /**
  * 一行「标签 + 输入框」。
@@ -317,7 +319,7 @@ export const RemoteSettings: React.FC = () => {
 
   /** 一条目标的可比较签名（只含真正会被存下去的字段）。 */
   const sig = (d: Draft | null): string => (d
-    ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.remoteWorkdir || '',
+    ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.proxyJump || '', d.remoteWorkdir || '',
       d.bins?.kiro || '', d.bins?.claude || '', d.bins?.codex || ''])
     : '');
 
@@ -529,6 +531,14 @@ export const RemoteSettings: React.FC = () => {
               <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>清除</button>
             )}
           </div>
+          </Field>
+          <Field label="跳板机" hint="留空 = 直连。目标在私有子网、只能借另一台进去时填；用的是上面那把私钥">
+            <input
+              className="settings-input"
+              placeholder="例如 ec2-user@1.2.3.4 或 ec2-user@1.2.3.4:2222"
+              value={draft.proxyJump || ''}
+              onChange={(e) => setDraft({ ...draft, proxyJump: e.target.value })}
+            />
           </Field>
           <Field label="远端目录" hint="项目镜像放在那台机器的哪里（每个本地项目一个子目录）">
             <input

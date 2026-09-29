@@ -64,6 +64,7 @@ function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntr
     sshHost,
     sshPort: Number.isFinite(port) && port > 0 ? port : 22,
     identityFile: expandHome(typeof raw?.identityFile === 'string' ? raw.identityFile : undefined, home),
+    proxyJump: typeof raw?.proxyJump === 'string' && raw.proxyJump.trim() ? raw.proxyJump.trim() : undefined,
     remoteWorkdir: typeof raw?.remoteWorkdir === 'string' && raw.remoteWorkdir.trim() ? raw.remoteWorkdir.trim() : undefined,
     bins: normalizeBins(raw?.bins),
   };
@@ -197,6 +198,7 @@ export interface RemoteTargetInput {
   sshHost: string;
   sshPort?: number;
   identityFile?: string;
+  proxyJump?: string;
   remoteWorkdir?: string;
   /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
   bins?: ExecutorBins;
@@ -220,6 +222,8 @@ export function validateTarget(input: RemoteTargetInput): string | null {
   if (/\s/.test(host)) return 'SSH 地址里不能有空格。';
   const port = input.sshPort === undefined || input.sshPort === null || (input.sshPort as any) === '' ? 22 : Number(input.sshPort);
   if (!Number.isFinite(port) || port <= 0 || port > 65535) return '端口要是 1–65535 之间的数字。';
+  const jump = String(input?.proxyJump || '').trim();
+  if (jump && /\s/.test(jump)) return '跳板地址里不能有空格（形如 `ec2-user@1.2.3.4` 或 `ec2-user@1.2.3.4:2222`）。';
   if (input.remoteWorkdir && !String(input.remoteWorkdir).startsWith('/') && !String(input.remoteWorkdir).startsWith('~')) {
     /* 相对路径会落在登录 shell 的当前目录上 —— 那是"看起来能用，但镜像跑到了别处" */
     return '远端工作目录要写绝对路径（`/home/ec2-user/kirolex-mirror`）。';
@@ -280,6 +284,10 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
     remoteWorkdir: has('remoteWorkdir')
       ? (String(input.remoteWorkdir).trim() || undefined)
       : old?.remoteWorkdir,
+    /* 同一条规则：界面没给就不动 */
+    proxyJump: has('proxyJump')
+      ? (String(input.proxyJump).trim() || undefined)
+      : old?.proxyJump,
     /* 和上面几个字段同一条规则：界面没给就不动（否则每次编辑都在悄悄抹掉它） */
     bins: has('bins') ? normalizeBins(input.bins) : normalizeBins(old?.bins),
   };

@@ -8458,6 +8458,7 @@ app.whenReady().then(async () => {
         sshHost: t.sshHost,
         sshPort: t.sshPort,
         identityFile: t.identityFile,
+        proxyJump: t.proxyJump,
         remoteWorkdir: t.remoteWorkdir,
         /* 三个 CLI 的启动命令 —— 漏发一个字段 = 自动保存把它抹掉（见上面那段） */
         bins: t.bins,
@@ -8553,7 +8554,7 @@ app.whenReady().then(async () => {
     try {
       const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, input);
       logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})`);
-      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins } };
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins } };
     } catch (err: any) {
       return { ok: false, error: err?.message || '保存失败' };
     }
@@ -8590,6 +8591,7 @@ app.whenReady().then(async () => {
       sshHost: String(input.sshHost).trim(),
       sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
       identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
+      proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
     } as RemoteTarget;
     /* 脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里 */
     const candidates = [
@@ -8817,6 +8819,7 @@ app.whenReady().then(async () => {
       sshHost: String(input.sshHost).trim(),
       sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
       identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
+      proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
       remoteWorkdir: input.remoteWorkdir || undefined,
     } as RemoteTarget;
     /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */

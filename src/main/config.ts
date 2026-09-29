@@ -46,6 +46,12 @@ export interface RemoteTarget {
   sshPort?: number;
   /** Absolute path to a private key passed to `ssh -i`. */
   identityFile?: string;
+  /**
+   * 跳板机（`user@host` 或 `user@host:port`）。目标在私有子网、只能借另一台进去时填。
+   * 见 `sshProxy.ts` —— 用的是 `ProxyCommand` 而不是 `-o ProxyJump=`，因为后者
+   * 那一跳拿不到 `identityFile`。
+   */
+  proxyJump?: string;
   /** Working directory kiro-cli uses on the remote host (session cwd). */
   remoteWorkdir?: string;
   /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */

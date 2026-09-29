@@ -103,9 +103,28 @@ if have kiro-cli && [ "$FORCE" != "1" ]; then
   say "→ kiro-cli 已在 $(kiro-cli --version 2>/dev/null | head -1)"
 else
   arch="$(uname -m)"
+  #
+  # **glibc 版本也要看，不只是架构** —— 在 AL2023 arm64 上踩过。
+  #
+  # `kirocli-aarch64-linux.zip` 是给 glibc >= 2.39 的系统编的，而 AL2023 是 2.34：
+  # install.sh 会打印
+  #   `This release built for a GNU system with glibc 2.39 or newer, try installing the musl version`
+  # 然后 **exit 0** —— 所以"装没装上"只能靠后面 `have kiro-cli` 发现，
+  # 原来的脚本就是这样静默失败的（日志里只有一句"kiro-cli 没装上"，看不出是 libc 的事）。
+  #
+  # musl 版是静态链接的，哪个 glibc 都能跑。所以判据是：**glibc 不够新就用 musl**。
+  # x86_64 留着 glibc 版（那台老机器一直在用，别无谓换）。
+  libc_ok=1
+  libc_ver="$(ldd --version 2>/dev/null | head -1 | grep -oE '[0-9]+\.[0-9]+' | head -1)"
+  if [ -n "$libc_ver" ]; then
+    # 2.39 起才够；`sort -V` 比手写数字比较稳（2.9 vs 2.39 那种坑）
+    [ "$(printf '%s\n' "$libc_ver" 2.39 | sort -V | head -1)" = "2.39" ] || libc_ok=0
+  fi
   case "$arch" in
     x86_64|amd64) zip_name="kirocli-x86_64-linux.zip" ;;
-    aarch64|arm64) zip_name="kirocli-aarch64-linux.zip" ;;
+    aarch64|arm64)
+      if [ "$libc_ok" = "1" ]; then zip_name="kirocli-aarch64-linux.zip"
+      else zip_name="kirocli-aarch64-linux-musl.zip"; say "→ glibc $libc_ver < 2.39，用 musl 版"; fi ;;
     *) zip_name="" ;;
   esac
   if [ -z "$zip_name" ]; then
@@ -116,7 +135,10 @@ else
     if curl --proto '=https' --tlsv1.2 -sSf "$KIRO_RELEASE_BASE/$zip_name" -o "$tmp/kirocli.zip"; then
       say "→ 解包并安装（install.sh → ~/.local/bin）"
       if unzip -q -o "$tmp/kirocli.zip" -d "$tmp"; then
-        sh "$tmp/kirocli/install.sh" --no-confirm >/dev/null 2>&1 || true
+        # 不要把 install.sh 的输出丢掉：它**成功和失败都 exit 0**，
+        # 唯一的线索就在 stdout 里（上面那条 glibc 提示就是这么被吞掉的）。
+        inst="$(sh "$tmp/kirocli/install.sh" --no-confirm 2>&1)" || true
+        printf '%s\n' "$inst" | grep -iE 'error|glibc|musl' | head -3 | while IFS= read -r l; do say "   $l"; done
       fi
     else
       note_fail "下载失败（这台机器连不上 $KIRO_RELEASE_BASE？）"
@@ -168,10 +190,49 @@ elif [ -n "${KIRO_LOGIN_PROVIDER:-}" ]; then
   say "→ 没登录。用 device flow 登录（授权在**你自己的浏览器**里完成）："
   say "   provider ${KIRO_LOGIN_PROVIDER}${KIRO_LOGIN_REGION:+  region ${KIRO_LOGIN_REGION}}"
   say "   下面会打印一个链接和一串 code —— 打开链接、输入 code，这里就会继续。"
-  # shellcheck disable=SC2086
-  if kiro-cli login --license pro --use-device-flow \
-      --identity-provider "$KIRO_LOGIN_PROVIDER" \
-      ${KIRO_LOGIN_REGION:+--region "$KIRO_LOGIN_REGION"} </dev/null 2>&1; then
+  #
+  # **`--identity-provider` / `--region` 这两个参数不生效** —— 在 kiro-cli 2.25.0 上实测。
+  # 不管有没有传，它照样交互式追问 Start URL 和 Region。而且：
+  #
+  #   · 没有 TTY 时，那两个追问拿到**空串**（它自己会 warn `called input while stdout is
+  #     not a terminal`），于是 region="" → `region must be a valid host label`。
+  #     这就是原来这条命令 100% 失败的原因，而报错完全看不出是"追问没人答"。
+  #   · 所以必须给它一个真 pty（`script -qc`），再把答案从 stdin 喂进去。
+  #   · pty 上 stdin/stdout 是同一个终端，程序会读到自己的回显 → 值被拼两遍
+  #     （`us-east-1us-east-1`）。所以先 `stty -echo`。
+  #
+  # Region 是 **Identity Center 实例所在的区**，不是 profile ARN 里那个区
+  # （那份 ARN 写着 us-east-1，而 IdC 在 ap-northeast-1 —— 用 us-east-1 会
+  # `InvalidRequestException`）。所以 KiroLex 传进来的 `KIRO_LOGIN_REGION` 要是 IdC 的区。
+  #
+  # **region 只能试** —— 它是 Identity Center 实例所在的区，而本机没有任何可靠来源：
+  # `kiro-cli whoami` 只给 profile ARN 的区（`arn:aws:codewhisperer:us-east-1`），
+  # 那是 CodeWhisperer profile 的区，**不是** IdC 的区。拿它去登录会
+  # `InvalidRequestException`（实测：IdC 在 ap-northeast-1，ARN 写着 us-east-1）。
+  #
+  # 所以按候选逐个试：区不对时 `StartDeviceAuthorization` 会**秒失败**，
+  # 对的那个才会打印 URL + code 然后阻塞等你授权。KiroLex 传进来的那个排第一
+  # （它至少是个线索），后面跟上常见的几个。
+  login_in="$(mktemp)"
+  logged_in=0
+  for reg in ${KIRO_LOGIN_REGION:-} ap-northeast-1 us-east-1 us-west-2 eu-west-1; do
+    kiro-cli whoami </dev/null >/dev/null 2>&1 && { logged_in=1; break; }
+    printf '%s\n%s\n' "$KIRO_LOGIN_PROVIDER" "$reg" > "$login_in"
+    #
+    # 必须给真 pty，而且要先关回显：
+    #   · 没 TTY 时那两个追问拿到空串（它自己 warn `called input while stdout is not
+    #     a terminal`）→ region="" → `must be a valid host label`。原来 100% 失败就是这个。
+    #   · pty 上 stdin/stdout 是同一个终端，程序会读到自己的回显 → 值被拼两遍
+    #     （`us-east-1us-east-1`）。所以 `stty -echo`。
+    # `--identity-provider` / `--region` 这两个参数在 2.25.0 上**不生效**，照样会追问。
+    script -qc "stty -echo; kiro-cli login --license pro --use-device-flow" /dev/null < "$login_in" 2>&1 \
+      | tr -d '\r' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g;s/[▰▱]//g;s/Logging in\.\.\.//g' \
+      | grep -vE '^[[:space:]]*$' || true
+    kiro-cli whoami </dev/null >/dev/null 2>&1 && { logged_in=1; break; }
+    say "   region $reg 不对，换一个再试"
+  done
+  rm -f "$login_in"
+  if [ "$logged_in" = "1" ]; then
     say "→ 登录完成  $(kiro-cli whoami </dev/null 2>/dev/null | head -1)"
   else
     note_fail "登录没完成（超时或被取消）。可以再点一次「安装依赖」，或者自己 ssh 上去跑 kiro-cli login"
