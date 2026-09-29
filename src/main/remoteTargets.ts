@@ -23,6 +23,7 @@ import os from 'os';
 import path from 'path';
 import type { ExecutorBins, RemoteTarget } from './config';
 import { rememberBin, type BinHistoryMap, type ToolId } from './binDetect.ts';
+import { validJump } from './sshProxy.ts';
 
 export interface RemoteTargetEntry extends RemoteTarget {
   /** 稳定 id：存进会话的 profile，重启后靠它找回同一台机器。 */
@@ -223,7 +224,11 @@ export function validateTarget(input: RemoteTargetInput): string | null {
   const port = input.sshPort === undefined || input.sshPort === null || (input.sshPort as any) === '' ? 22 : Number(input.sshPort);
   if (!Number.isFinite(port) || port <= 0 || port > 65535) return '端口要是 1–65535 之间的数字。';
   const jump = String(input?.proxyJump || '').trim();
-  if (jump && /\s/.test(jump)) return '跳板地址里不能有空格（形如 `ec2-user@1.2.3.4` 或 `ec2-user@1.2.3.4:2222`）。';
+  /*
+    白名单 —— 这个值会被拼进 `ProxyCommand`，而那串东西是交给 shell 跑的
+    （见 `sshProxy.ts`）。只拦空格是不够的：`;` / `$(…)` / 反引号都能过。
+  */
+  if (jump && !validJump(jump)) return '跳板地址只能是 `用户@主机` 或 `用户@主机:端口`（字母、数字、`@ . - _ :` 和 IPv6 的方括号）。';
   if (input.remoteWorkdir && !String(input.remoteWorkdir).startsWith('/') && !String(input.remoteWorkdir).startsWith('~')) {
     /* 相对路径会落在登录 shell 的当前目录上 —— 那是"看起来能用，但镜像跑到了别处" */
     return '远端工作目录要写绝对路径（`/home/ec2-user/kirolex-mirror`）。';

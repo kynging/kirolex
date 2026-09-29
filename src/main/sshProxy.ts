@@ -49,15 +49,39 @@ export function splitJump(jump: string): { dest: string; port?: number } {
  * `identityFile` 是**目标机器**的密钥，这里也给跳板用 —— 绝大多数情况两跳同一把钥匙
  * （同一个 keypair 启的机器）。不是的话再加字段，不要现在猜。
  */
+/**
+ * 一个跳板地址**长得**对不对：`user@host`、`host:port`、`[v6]:port`。
+ *
+ * 这是白名单而不是黑名单：拼进 `ProxyCommand` 的东西最终由 shell 解释，
+ * 而"列出所有危险字符"这件事历史上没人做对过。主机名/用户名本来也只需要这几类字符。
+ */
+export function validJump(jump: string): boolean {
+  return /^[A-Za-z0-9._@:[\]-]+$/.test(String(jump || ''));
+}
+
 export function proxyArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile'>): string[] {
   const jump = String(remote.proxyJump || '').trim();
   if (!jump) return [];
+  /*
+    **形状不对就当没配跳板**（而不是抛）：这条路上抛异常等于让一条会话起不来，
+    而界面在保存时就已经拦过一次（`validateTarget`）—— 这里是第二道，
+    针对的是"配置从别处回来"的情况。
+  */
+  if (!validJump(jump)) return [];
   const { dest, port } = splitJump(jump);
   if (!dest) return [];
   const parts = ['ssh', '-o', 'BatchMode=yes', '-o', 'StrictHostKeyChecking=accept-new'];
   if (remote.identityFile) parts.push('-i', shq(remote.identityFile));
   if (port && port !== 22) parts.push('-p', String(port));
-  /* `-W %h:%p` = 把 stdio 直接接到目标的 host:port 上，跳板上不用装任何东西 */
-  parts.push('-W', '%h:%p', dest);
+  /*
+    **`dest` 也要包引号** —— 这整个字符串是交给 `/bin/sh -c` 跑的，所以它里面的
+    任何东西都是 shell 代码。`validateTarget` 只拦了空格，`;` / `$(…)` / 反引号 / `|`
+    都能过 —— 一个 `h;curl …` 就是在这台笔记本上执行命令。
+
+    配置不是"纯本地可信输入"：`config.json` 会走 S3 备份/恢复（`s3Sync.ts`），
+    也就是说它可以从别处回来。所以这里按不可信处理。
+    （`%h:%p` 是 ssh 自己的占位符，必须留在引号外面，否则它不会被替换。）
+  */
+  parts.push('-W', '%h:%p', shq(dest));
   return ['-o', `ProxyCommand=${parts.join(' ')}`];
 }
