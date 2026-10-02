@@ -1266,12 +1266,28 @@ describe('归档 / 恢复不许把远程会话变成本地的', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
 
-  test('归档只动 archived 和 projectId —— **不碰 profile.remote**', () => {
+  test('归档只动 archived —— 不碰 projectId、更不碰 profile.remote', () => {
     const at = M.indexOf("ipcMain.handle('acp:archive-session'");
-    const body = M.slice(at, at + 700);
+    /*
+      **按"到下一个 handler"截断，并剥掉注释**。两件事都必要：
+        · 这个 handler 现在带一长段注释（解释为什么不再抹 projectId），固定 700 字符
+          全被注释吃掉，断言会在注释里找东西；
+        · 放大窗口又会跨进下一个 handler（`acp:delete-project-memory` 里就有 projectId），
+          于是"归档碰了项目绑定"这条会假阳性。
+    */
+    const rest = M.slice(at + 20);
+    const end = rest.indexOf('ipcMain.handle(');
+    const body = (end > 0 ? rest.slice(0, end) : rest).replace(/\/\*[\s\S]*?\*\//g, '');
     assert.ok(at > 0);
     assert.match(body, /rec\.archived = !!archived;/);
-    assert.match(body, /if \(archived\) rec\.profile\.projectId = undefined;/);
+    /*
+      **projectId 也不许碰了** —— 原来这里是 `if (archived) … = undefined`，
+      而这条断言当时只是顺手记下了那个行为。它的代价是：备份界面按项目分组时所有归档
+      会话掉进「未分组」，取消归档也回不到原项目，而且不可逆（没有第二处记着这个对应
+      关系，`localDir` 同时被清）。那个"归档期间不带项目记忆"的保证现在是 prompt
+      路径上的显式守卫（见 `archiveKeepsProject.test.ts`）。
+    */
+    assert.equal(/projectId/.test(body), false, '归档不该碰项目绑定');
     assert.equal(/profile\.remote/.test(body), false, '归档不该碰运行位置');
   });
 

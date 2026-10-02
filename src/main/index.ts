@@ -4867,6 +4867,19 @@ app.whenReady().then(async () => {
       logger.warn('prompt', `refused: sessionId=${sessionId} was deleted —— 不再复活它`);
       throw new Error('这个会话已经被删除了，不再向它发送。');
     }
+    /*
+      **归档的会话不接消息** —— 这道守卫本来是隐含的（界面把输入框换成了横幅），
+      而 `acp:archive-session` 靠抹掉 `projectId` 来保证"归档期间不带项目记忆"。
+      现在那个字段留着了（它是备份界面分组的依据），所以这条不变量必须**显式**写在这里：
+      归档 = 彻底停下来，包括不注入它那个项目的记忆。
+
+      放在 `sendPrompt` 的入口而不是算 `effectiveProjectId` 的地方：真正要保证的是
+      "归档会话不产生任何一轮"，只挡记忆等于让它用空项目继续聊。
+    */
+    if (store.readRecord(sessionId)?.archived) {
+      logger.warn('prompt', `refused: sessionId=${sessionId} 已归档 —— 归档的语义是彻底停下来`);
+      throw new Error('这个会话已经归档了。取消归档之后才能继续聊。');
+    }
     try {
       return await sendPromptOnce(sessionId, prompt, projectId, display, model);
     } catch (err) {
@@ -8217,9 +8230,22 @@ app.whenReady().then(async () => {
     const rec = store.readRecord(sessionId);
     if (rec) {
       rec.archived = !!archived;
-      // Archiving detaches the chat from its project: it carries no project
-      // memory while archived, and unarchive returns it to the Unassigned bucket.
-      if (archived) rec.profile.projectId = undefined;
+      /*
+        **归档不再抹掉项目绑定** ——「可是你现在所有的 archive 会话都显示在未分组中」。
+
+        原来这里是 `if (archived) rec.profile.projectId = undefined`，理由写的是
+        "归档期间不带项目记忆"。那个理由**已经被别的守卫满足了**：归档会话发不了消息
+        （ChatArea 把输入框换成「unarchive it to continue chatting」横幅，而 `acp:prompt`
+        下面也会拒），而项目记忆只在 prompt 时注入 —— 所以抹这个字段防不住任何事。
+
+        它的代价却是实打实的两条：
+          · 备份界面按项目分组时，**所有**归档会话都掉进「未分组」；
+          · 取消归档回不到原来的项目（老注释自己写着 returns it to the Unassigned
+            bucket）—— 那不是设计，那是绑定被销毁之后唯一还能做的事。
+
+        而且这个代价是**不可逆**的：记录里没有别的地方记着这个对应关系，`localDir`
+        同时也被清掉了。实测 14 条历史归档会话里只有 2 条能从两个月前的记录备份里找回来。
+      */
       store.writeRecord(rec);
     }
     if (archived) detachExecutor(sessionId); // give the warm slot back
