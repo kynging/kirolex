@@ -2269,6 +2269,54 @@ const App: React.FC = () => {
     };
   }, [refreshModels]);
 
+  /**
+   * **网络回来之后把看得见的那几条会话接回来** ——「我看到现在远程会话断了，为什么没有自动刷新」。
+   *
+   * ## 为什么原来不会自己回来
+   *
+   * `disconnected` 事件上**有**自动恢复（`useAcp` 里那段 `AUTO-RECOVERY`），但它只试**一次**
+   * （600ms 后，8s 节流），失败就按注释说的 `stay dormant`，等用户下一次发消息。
+   * 实测那次：笔记本的 VPN 掉线 → `ssh: connect to host … Network is unreachable`
+   * → 那一次重试也连不上 → 然后 2.5 小时里**没有任何东西再试**，界面一直是断开的灰点。
+   *
+   * 上面那个 effect 已经在 `online`/`focus` 上重新拉模型列表了 —— 缺的正是同一个时机下
+   * 把执行器也接回来。网络恢复是**事件**，不是需要轮询的状态，所以这里不加定时器。
+   *
+   * ## 为什么只接 `panes`（看得见的那几条），不接全部
+   *
+   * 现在有 31 条远程会话。全部拉起来 = 31 次 ssh 握手砸向 sshd 的 `MaxStartups`（10:30:100）,
+   * 而那个队列被撑满正是"连不上"的成因之一（已经为此加过 `preflightInFlight` 和连接复用）。
+   * 看不见的那些保持冷的没有代价：点开它们本来就会 `warmSession`。
+   *
+   * `warmSession` 自己就是幂等的（已 attach / 归档 / `pending_` 一律跳过），所以这里不需要
+   * 再判一遍"该不该接"—— 判两遍就是两份会不一致的真相。
+   */
+  /* 监听器要读"触发那一刻看得见哪几条"，所以用 ref 而不是把 `panes` 放进依赖 */
+  const panesRef = useRef<string[]>([]);
+  panesRef.current = panes;
+  const lastRewarmRef = useRef(0);
+  useEffect(() => {
+    const rewarm = () => {
+      /*
+        **节流 5 秒** —— `focus` 在切窗口时很密（点一下 Dock、切回来、再点一下），
+        每次都去 attach 等于把启动风暴搬到每次切窗口上。`online` 也会连着来好几次。
+      */
+      if (Date.now() - lastRewarmRef.current < 5_000) return;
+      lastRewarmRef.current = Date.now();
+      for (const id of panesRef.current) void warmSession(id);
+    };
+    window.addEventListener('online', rewarm);
+    window.addEventListener('focus', rewarm);
+    return () => {
+      window.removeEventListener('online', rewarm);
+      window.removeEventListener('focus', rewarm);
+    };
+    /*
+      依赖里**不放 `panes`** —— 它每次分屏变化都是新数组，放进来会让监听器反复摘挂。
+      用一个 ref 读当前值：监听器要的是"触发那一刻看得见哪几条"，不是挂载时的那一份。
+    */
+  }, [warmSession]);
+
   useEffect(() => {
     if (window.kiroApi) {
       window.kiroApi.getHomeDir().then(setHomeDir).catch(() => {});
