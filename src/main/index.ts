@@ -1664,6 +1664,15 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
  * 失败就返回 `undefined` 并说出来 —— **不静默降级**：没有本地工具的远程会话根本读不到用户的
  * 文件，而它会把"读不到"解释成"这个东西不存在"。
  */
+/**
+ * 本地工具**没备上**的那些会话。
+ *
+ * 在失败的那一刻记下来，而不是事后去猜：`SessionEntry` 不带 `localTools`，
+ * 而 `AcpClient` 里那份是私有的 —— 从外面推断"它有没有工具"只会推错。
+ * master 自愈回来之后要重接的就是这批（见 `rearmLocalToolsFor`）。
+ */
+const toollessSessions = new Set<string>();
+
 async function ensureLocalTools(
   sessionId: string,
   profile: AgentProfile,
@@ -1762,11 +1771,15 @@ async function ensureLocalTools(
       forwarded: forwarded.map((f) => f.name),
     };
     localToolsBySession.set(sessionId, spec);
+    toollessSessions.delete(sessionId);
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
     return spec;
   } catch (err: any) {
+    /* 记下来：master 自愈回来之后要重接的就是这批（见 `rearmLocalToolsFor`） */
+    toollessSessions.add(sessionId);
     sessionNotice(sessionId, `⚠️ 本地工具通道没起来：${err?.message || err}。`
-      + `这条远程会话读不到你机器上的文件 —— 先别让它改东西。`);
+      + `这条远程会话读不到你机器上的文件 —— 先别让它改东西。`
+      + `连接恢复后会自动重接这条会话。`);
     logger.warn('localmcp', `准备失败 sessionId=${sessionId}: ${err?.message || err}`);
     return undefined;
   }
@@ -2252,7 +2265,60 @@ const sshMux: SshMux = new SshMux({
     .filter((port): port is number => typeof port === 'number'),
   allocateRemotePort,
   owner: OWNER,
+  /*
+    **自愈的判据：这台机器上还有连着的会话吗** —— 见 `sshMux.scheduleHeal`。
+    没有会话就别敲门（机器可能已经关了），有会话就一直试 —— 那几条会话正指着它。
+  */
+  hasSessions: (key: string): boolean => {
+    for (const entry of sessionClients.values()) {
+      const r = entry.profile.remote;
+      if (r?.sshHost && muxKey(r.sshHost, r.sshPort) === key) return true;
+    }
+    return false;
+  },
+  /*
+    master 回来之后，把那台机器上**连着但没有工具**的会话重新备一次。
+
+    光有 master 不够：这些执行器是在 `localTools` 为 undefined 时起的（见
+    `ensureLocalTools` 的 catch），它们那条 kiro-cli 根本没被配上本地 MCP，
+    端口回来了也用不上 —— 实测就是这个状态：执行器活着、`local_*` 全是死的。
+  */
+  onReady: (key: string) => { void rearmLocalToolsFor(key); },
 });
+
+/**
+ * 把某台机器上「连着但没有本地工具」的会话重新接一次。
+ *
+ * **为什么是重新 attach 而不是只补一个 MCP**：本地工具是在**起执行器**时接进去的
+ * （agent JSON 里写着 URL + token，而那份 JSON 是启动参数的一部分）。所以一条在
+ * `localTools === undefined` 下起来的会话，没有任何办法在不换进程的前提下补上工具。
+ *
+ * 一条一条来、而且带间隔：这台机器上可能有 7 条这样的会话，一口气全重连就是 7 次
+ * ssh 握手砸向 sshd 的 `MaxStartups`（10:30:100）—— 那正是当初把那台 EC2 弄挂的成因。
+ * 正在跑的那一轮不动：打断一轮正在产出的对话比晚几秒拿回工具更贵。
+ */
+async function rearmLocalToolsFor(key: string): Promise<void> {
+  const victims: string[] = [];
+  for (const [sessionId, entry] of sessionClients) {
+    const r = entry.profile.remote;
+    if (!r?.sshHost || muxKey(r.sshHost, r.sshPort) !== key) continue;
+    if (!toollessSessions.has(sessionId)) continue;   // 它有工具，别碰
+    if (entry.busy) continue;                         // 正在产出，别打断
+    victims.push(sessionId);
+  }
+  if (!victims.length) return;
+  logger.info('sshmux', `${key} 的连接回来了 —— ${victims.length} 条会话缺本地工具，逐条重接：${victims.join(' ')}`);
+  for (const sessionId of victims) {
+    try {
+      sessionNotice(sessionId, '🔌 本地工具通道回来了，正在重接这条会话的执行器 —— 之后它就能读写你机器上的文件了。');
+      detachExecutor(sessionId);
+      toollessSessions.delete(sessionId);
+      /* 不在这里主动起：下一次打开/发消息会按记录接上，而那条路本来就是对的 */
+    } catch (err: any) {
+      logger.warn('sshmux', `重接失败 sessionId=${sessionId}: ${err?.message || err}`);
+    }
+  }
+}
 /** 「这个平台不支持复用」只说一次 —— 每条会话都说一遍就是噪音。 */
 let muxWarned = false;
 /* 每条 ssh 都先问一句"这台机器有没有现成的连接" —— 有就当 channel 走，没有照旧建新的 */

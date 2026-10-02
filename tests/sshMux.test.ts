@@ -130,6 +130,9 @@ describe('ssh 连接复用', () => {
       usedRemotePorts: () => [],
       allocateRemotePort: () => 39100,
       owner: 'ca7bbd',
+      /* 自愈的判据（必填 —— 漏传就等于悄悄关掉自愈）。这里报「没有会话」，
+         所以这些用例不会因为重建而多出一次 spawn。 */
+      hasSessions: () => false,
       spawnSsh: (args) => {
         spawned.push(args);
         /* 假装 ssh：把 socket 建出来（真 master 做的就是这件事） */
@@ -164,6 +167,9 @@ describe('ssh 连接复用', () => {
       usedRemotePorts: () => [],
       allocateRemotePort: () => 39100,
       owner: 'ca7bbd',
+      /* 自愈的判据（必填 —— 漏传就等于悄悄关掉自愈）。这里报「没有会话」，
+         所以这些用例不会因为重建而多出一次 spawn。 */
+      hasSessions: () => false,
       spawnSsh: (args) => {
         const p = String(args.find((a) => a.startsWith('ControlPath=')) || '').slice('ControlPath='.length);
         const srv = listenOn(p);

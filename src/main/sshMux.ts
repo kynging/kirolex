@@ -207,6 +207,12 @@ export interface MuxEntry {
   stderr: string;
 }
 
+/**
+ * 自愈的退避表（毫秒）。前密后疏：网络抖一下几秒就好，机器真没了不该每 2 秒敲门。
+ * 到顶之后保持 60 秒一次，**不放弃** —— 见 `scheduleHeal`。
+ */
+export const HEAL_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
+
 export interface MuxDeps {
   log(level: 'info' | 'warn', message: string): void;
   /** 本地 MCP server 的端口（懒启动，所以现取）。 */
@@ -216,6 +222,27 @@ export interface MuxDeps {
   allocateRemotePort(used: Iterable<number>): number;
   owner: string;
   spawnSsh?(args: string[]): ChildProcess;
+  /**
+   * 这台机器上还有会话吗 —— 自愈的**唯一**判据（见 `scheduleHeal`）。
+   *
+   * 没有它的话只有两个选择：永远重连（机器关了也在那敲门），或者永不重连
+   * （就是实测撞到的那个：master 以 255 退出之后没有东西再试，7 条会话一直挂在
+   * "没有本地工具"的状态上）。
+   */
+  hasSessions(key: string): boolean;
+  /**
+   * master 重新建好了。调用方据此把那台机器上"连着但没有工具"的会话重新备一次 ——
+   * 光把 master 拉回来**不够**：执行器是在 `localTools` 为 undefined 时起的，
+   * 它那条 kiro-cli 根本没被配上本地 MCP，端口回来了也用不上。
+   */
+  onReady?(key: string): void;
+  /**
+   * 等 socket 出现的上限（毫秒，默认 12 秒）。
+   *
+   * 做成可注入的**只为测试**：真机上这个值要够大（跨洋 ssh 握手 + 跳板两跳），
+   * 而测试里没有真 socket，照 12 秒等就是让整个测试套慢 12 秒。
+   */
+  socketWaitMs?: number;
 }
 
 /**
@@ -228,6 +255,13 @@ export interface MuxDeps {
 export class SshMux {
   private entries = new Map<string, MuxEntry>();
   private starting = new Map<string, Promise<MuxEntry>>();
+  /** 希望活着的那些机器 —— `close()` 把它摘掉，自愈只对这里面的生效。 */
+  private wanted = new Set<string>();
+  /** 正在排的自愈定时器 + 已经试了几次（退避用）。 */
+  private healTimers = new Map<string, NodeJS.Timeout>();
+  private healAttempts = new Map<string, number>();
+  /** 最后一次用过的目标（自愈时要用同一把钥匙、同一个跳板）。 */
+  private lastTarget = new Map<string, { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }>();
   private deps: MuxDeps;
   private dir: string;
 
@@ -279,9 +313,55 @@ export class SshMux {
     if (live && !live.proc.killed && live.proc.exitCode === null && await probeSocket(live.socket)) return live;
     const pending = this.starting.get(key);
     if (pending) return pending;
+    /* 记下"这台机器该有一条连接"——自愈只对 wanted 的生效 */
+    this.wanted.add(key);
+    this.lastTarget.set(key, { ...target });
     const p = this.start(key, target).finally(() => { this.starting.delete(key); });
     this.starting.set(key, p);
     return p;
+  }
+
+  /**
+   * **master 死了要自己回来** ——「远程会话现在碰不到你机器上的文件」。
+   *
+   * 实测那次：3 小时里 master 以 `code=255` 退了 7 次（触发源是笔记本的 VPN 在抖），
+   * 最后一次之后**没有任何东西再试** —— 原来那句日志写的是"会话会在下一次调用工具时重连"，
+   * 可是那条路只在**新的 attach** 上走，已经连着的会话不会再调 `ensure()`。
+   * 于是 7 条会话一直挂在"执行器活着、本地工具是死的"状态上。
+   *
+   * 退避表是刻意前密后疏：网络抖一下通常几秒就好，而机器真没了就不该每 2 秒敲一次门。
+   * 到顶之后保持 60 秒一次 —— **不放弃**，因为"机器还有会话"这个判据本身就意味着
+   * 用户还要用它；放弃等于把那几条会话永久留在没有工具的状态。
+   */
+  private scheduleHeal(key: string): void {
+    if (!this.wanted.has(key)) return;              // 已经 close 过了
+    if (this.healTimers.has(key)) return;           // 已经排了
+    if (!this.deps.hasSessions(key)) {
+      /* 没有会话就不敲门。等下一次 attach 自然会 `ensure()` */
+      this.wanted.delete(key);
+      this.healAttempts.delete(key);
+      return;
+    }
+    const n = this.healAttempts.get(key) || 0;
+    const delay = HEAL_BACKOFF_MS[Math.min(n, HEAL_BACKOFF_MS.length - 1)];
+    this.healAttempts.set(key, n + 1);
+    const t = setTimeout(() => {
+      this.healTimers.delete(key);
+      if (!this.wanted.has(key) || !this.deps.hasSessions(key)) return;
+      const target = this.lastTarget.get(key);
+      if (!target) return;
+      this.deps.log('info', `${key} 尝试重建复用连接（第 ${n + 1} 次）`);
+      void this.ensure(target).then(
+        () => { /* ensure 成功时会清掉退避计数并通知调用方 */ },
+        (err: any) => {
+          this.deps.log('warn', `${key} 重建失败：${err?.message || err}`);
+          this.scheduleHeal(key);
+        },
+      );
+    }, delay);
+    /* `unref` 是必须的：否则这个定时器会让 Electron 的退出挂住 */
+    t.unref?.();
+    this.healTimers.set(key, t);
   }
 
   private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }): Promise<MuxEntry> {
@@ -312,25 +392,50 @@ export class SshMux {
         静默的话表现是"模型说文件不存在"，而那是这条路上最贵的误导。
       */
       if (this.entries.get(key) === entry) this.entries.delete(key);
+      /*
+        原来这里写的是"会话会在下一次调用工具时重连"，那句话**不是实话**：重连只发生在
+        新的 attach 上，已经连着的会话不会再调 `ensure()`。实测后果是 7 条会话一直挂在
+        "执行器活着、本地工具是死的"状态上。所以现在自己排重建。
+      */
       this.deps.log('warn', `${key} 的复用连接退出了（code=${code}）——`
-        + `这台机器上的会话会在下一次调用工具时重连。${entry.stderr.trim() ? ` 最后的输出：${entry.stderr.trim()}` : ''}`);
+        + `这台机器上的会话暂时读不到你机器上的文件，正在排重建。`
+        + `${entry.stderr.trim() ? ` 最后的输出：${entry.stderr.trim()}` : ''}`);
       clearStaleSocket(socket);
+      this.scheduleHeal(key);
     });
 
     /* 等 socket 真的出现 —— 进程起来了不等于连接建好了，而 client 要的是**连接** */
-    const ok = await waitFor(() => probeSocket(socket), 12_000);
+    const ok = await waitFor(() => probeSocket(socket), this.deps.socketWaitMs ?? 12_000);
     if (!ok) {
       try { proc.kill(); } catch { /* 已经没了 */ }
+      /*
+        **建不起来也要排重建** —— 这正是实测撞到的那个口子：14:19 那次 12 秒等超时之后
+        没有任何东西再试（当时网络还在抖），于是会话永久没有工具。
+      */
+      this.scheduleHeal(key);
       throw new Error(`${key} 的复用连接没建起来。${entry.stderr.trim() || '（ssh 没有输出）'}`);
     }
     this.entries.set(key, entry);
+    this.healAttempts.delete(key);          // 建好了，退避从头算
     this.deps.log('info', `${key} 复用连接已建立：远端 ${remotePort} → 本地 ${localPort}`
       + `（这台机器上的会话共用这一条，各自用自己的 token）`);
+    /*
+      **光把 master 拉回来不够**：执行器是在 `localTools` 为 undefined 时起的，
+      它那条 kiro-cli 没被配上本地 MCP，端口回来了也用不上。所以要通知调用方
+      去把"连着但没有工具"的会话重新备一次。
+    */
+    try { this.deps.onReady?.(key); } catch { /* 通知失败不该影响连接本身 */ }
     return entry;
   }
 
   /** 关掉某台机器的复用连接（那台机器上已经没有会话了）。 */
   close(key: string): void {
+    /* 先摘 wanted 再杀进程：顺序反了的话 exit 处理会给一台已经不要的机器排重建 */
+    this.wanted.delete(key);
+    this.healAttempts.delete(key);
+    this.lastTarget.delete(key);
+    const t = this.healTimers.get(key);
+    if (t) { clearTimeout(t); this.healTimers.delete(key); }
     const e = this.entries.get(key);
     if (!e) return;
     this.entries.delete(key);
@@ -340,7 +445,12 @@ export class SshMux {
 
   /** 退出时全关 —— 留着的话就是下一次启动要扫的垃圾。 */
   closeAll(): void {
-    for (const key of [...this.entries.keys()]) this.close(key);
+    /*
+      **要并上 `wanted`**：一台正在排重建、但还没有 entry 的机器不在 `entries` 里，
+      只遍历 entries 会把它的定时器留下来 —— 退出时那个 `unref` 过的定时器不挡退出，
+      但在"关掉所有连接"之后又把一条连接拉起来，那是个说不通的状态。
+    */
+    for (const key of new Set([...this.entries.keys(), ...this.wanted])) this.close(key);
   }
 
   keys(): string[] { return [...this.entries.keys()]; }
