@@ -694,7 +694,28 @@ export class AcpClient extends EventEmitter {
         },
       });
     } else {
-      // Auto-approve unknown requests
+      /*
+        **代用户回答之前必须先说出来**。
+
+        这里原来一句注释 `Auto-approve unknown requests` 就把任何不认识的请求回成 `{}`。
+        今天只有 `session/request_permission` 会向客户端要答案（翻过那个二进制里所有方法名，
+        `session/request_user_input` / `ask` / `choice` 一个都没有），所以这条分支现在走不到。
+
+        但它是个**静默**的兜底：kiro-cli 哪天加了一种"问用户"的请求，KiroLex 会替用户答一个
+        空对象，而用户、日志、界面三处都看不到发生过这件事 —— 那一轮就是按一个没人给过的
+        答案继续跑的。
+
+        仍然回 `{}`（不回会让那一轮挂住等超时，那更糟），但走 `error` 这条已有的通道说出来：
+        它既进日志、也发到界面（见 index.ts 的 `client.on('error')`）。出现一次就该按
+        真正的语义去处理它，而不是继续猜。
+      */
+      this.emit('error', {
+        type: 'unknown-request',
+        message: `kiro-cli 发来一个 KiroLex 不认识的请求 \`${method}\`，已回空对象 {} —— `
+          + `如果它是在"问你"，那这一轮是按一个没人给过的答案继续跑的。请把这条报给 KiroLex。`,
+        method,
+        params,
+      });
       this.send({ jsonrpc: '2.0', id, result: {} });
     }
   }
