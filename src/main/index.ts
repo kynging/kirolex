@@ -5115,7 +5115,8 @@ app.whenReady().then(async () => {
     } catch {}
     try {
       const block = isFeatureEnabled('memoryInjection')
-        ? buildMemoryInjection(effectiveProjectId, sessionId)
+        /* 远程会话的 memory 文件在**用户机器**上，只有 `local_write` 到得了（见 memory.ts） */
+        ? buildMemoryInjection(effectiveProjectId, sessionId, { remote: !!entry.profile.remote?.sshHost })
         : '';
       if (block) {
         prompt = [{ type: 'text', text: block }, ...prompt];

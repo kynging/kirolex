@@ -176,7 +176,24 @@ export function writeMemory(
  * global → project → session (least → most specific), with a precedence note.
  * Always returns a block (even when empty) so the agent learns where to write.
  */
-export function buildMemoryInjection(projectId?: string, sessionId?: string): string | null {
+/**
+ * `remote` = 这条会话的执行器跑在**另一台机器**上。
+ *
+ * 这个参数不是装饰 ——「kirolex 说它无法编辑本地的 memory 文件？为什么」就是缺了它：
+ * 下面给出的路径永远是**这台 Mac** 的（`baseDir` 取的是 `os.homedir()`，而 main 进程
+ * 跑在 Mac 上），而原来那句写法指引说的是 "with your file tools"。远程会话的 "file tools"
+ * 是 kiro-cli 自己的，作用在远端那台机器上 —— 那里既没有 `/Users/<你>/.kirolex/memory`
+ * 也没有 `~/.kirolex`（实测两个都 `No such file or directory`）。
+ *
+ * 而且 `remoteContext.ts` 注入的运行环境说明明确告诉它「默认在你这台机器上干活」，
+ * 所以这两段注入是**互相矛盾**的：模型按环境说明走，就必然撞到一个不存在的路径。
+ * 远端那条会话要碰用户机器上的文件，只有 `local_read` / `local_write` 这一条路。
+ */
+export function buildMemoryInjection(
+  projectId?: string,
+  sessionId?: string,
+  opts: { remote?: boolean } = {},
+): string | null {
   try {
     ensureMemoryFiles(projectId, sessionId);
     const g = readIfExists(globalPath);
@@ -203,9 +220,19 @@ export function buildMemoryInjection(projectId?: string, sessionId?: string): st
     const targets: string[] = [`global → ${globalPath}`];
     if (projectId) targets.push(`this project → ${projectPath(projectId)}`);
     if (sessionId) targets.push(`this chat only → ${sessionPath(sessionId)}`);
+    /*
+      **工具名要跟着会话跑在哪变** —— 见 `buildMemoryInjection` 的注释。
+      远程：这些路径在**用户那台机器**上，只有 `local_write` 到得了；
+      本地：就是普通的文件工具。
+    */
     lines.push(
-      'To remember something durable, append a concise bullet (no duplicates) to the matching file with your file tools, then briefly confirm: ' +
-      targets.join('  |  ') + '.'
+      opts.remote
+        ? 'To remember something durable, append a concise bullet (no duplicates) to the matching file, then briefly confirm. '
+          + '**These paths are on the USER\'s machine, not this host** — read them with `local_read` and append with `local_write` '
+          + '(your own file tools cannot see them). Targets: '
+          + targets.join('  |  ') + '.'
+        : 'To remember something durable, append a concise bullet (no duplicates) to the matching file with your file tools, then briefly confirm: '
+          + targets.join('  |  ') + '.',
     );
     /**
      * 未归属 project 时，把**现有项目的真实名字和确切路径**列出来。

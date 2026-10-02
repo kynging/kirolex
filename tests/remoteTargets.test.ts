@@ -585,8 +585,15 @@ describe('远程会话要告诉模型它在哪台机器上', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     assert.match(M, /const rc = remoteContextFor\(sessionId, entry\);/);
     assert.match(M, /prompt = \[\{ type: 'text', text: rc \}, \.\.\.prompt\];/);
+    /*
+      **按调用名定位，不按完整实参定位**：`buildMemoryInjection` 现在还要传
+      `{ remote }`（远程会话的 memory 文件在用户机器上，只有 `local_write` 到得了），
+      写死实参会让这条在加参数时假失败 —— 而它要守的是**顺序**，跟实参无关。
+    */
+    const memAt = M.indexOf('buildMemoryInjection(effectiveProjectId, sessionId');
+    assert.ok(memAt > 0, '找不到 memory 注入的调用');
     assert.ok(
-      M.indexOf('const rc = remoteContextFor(sessionId, entry);') < M.indexOf('buildMemoryInjection(effectiveProjectId, sessionId)'),
+      M.indexOf('const rc = remoteContextFor(sessionId, entry);') < memAt,
       '先注入它，memory 块再压在它上面 —— 顺序决定谁更靠近用户那句话',
     );
     /* 两个路径都来自会话自己的记录，不是猜的 */
