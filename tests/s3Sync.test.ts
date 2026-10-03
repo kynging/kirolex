@@ -342,11 +342,17 @@ describe('接线', () => {
     assert.match(body.slice(catchAt), /writeState\(S3_STATE_PATH, state\)/);
   });
 
-  test('正连着的会话不许恢复（内存里那份会把它盖回去）', () => {
+  test('连着的先自动断开再恢复；只有正在跑一轮的才拒', () => {
+    /*
+      「恢复的未分组里面怎么有这么多正连着」—— 启动预热会把未分组整组拉起来，
+      原来一律拒、要人手动去断开。现在恢复是合并，断开之后执行器不再写盘，安全。
+      正在跑的那一轮还没落盘，那种才拒。
+    */
     const at = M.indexOf("ipcMain.handle('s3:restore'");
-    const body = M.slice(at, at + 2400);
-    assert.match(body, /sessionClients\.has\(sessionId\)/);
-    assert.match(body, /先关掉它/);
+    const body = M.slice(at, at + 3200);
+    assert.match(body, /if \(live\?\.busy\)/);
+    assert.match(body, /detachExecutor\(sessionId\)/);
+    assert.ok(body.indexOf('live?.busy') < body.indexOf('detachExecutor(sessionId)'), '先判 busy 再断开');
     /* 会话 id 来自渲染层，要当输入校验（它会被拼进文件路径） */
     assert.ok(body.includes('会话 id 不合法'), '缺 id 校验');
     assert.ok(body.includes('w.-]+$'), '缺白名单正则');
@@ -509,17 +515,16 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     assert.match(UI, /不会真的丢/);
   });
 
-  test('正连着的不给勾 —— 主进程会拒，让人勾上再被拒是最差的', () => {
-    assert.match(UI, /disabled=\{!!e\.attached \|\| !!busy\}/);
-    /* 能勾的集合里就没有它们 */
-    assert.match(UI, /\(entries \|\| \[\]\)\.filter\(\(e\) => !e\.attached\)/);
-    /* 这个标记是主进程给的（它才知道谁连着） */
+  test('正在跑的不给勾 —— 主进程会拒，让人勾上再被拒是最差的', () => {
+    assert.match(UI, /disabled=\{!!e\.busy \|\| !!busy\}/);
+    assert.match(UI, /\(entries \|\| \[\]\)\.filter\(\(e\) => !e\.busy\)/);
+    /* 这个标记是主进程给的（它才知道谁在跑） */
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /attached: sessionClients\.has\(e\.id\)/);
+    assert.match(M, /busy: !!sessionClients\.get\(e\.id\)\?\.busy/);
   });
 
   test('三种状态各有一个标，"哪几条会动到本地"要看得见', () => {
-    assert.match(UI, /backup-tag warn">正连着/);
+    assert.match(UI, /backup-tag warn">正在跑/);
     /* 本地已有的那些是**合并**（见下面那个 describe），所以这个标也跟着改了 */
     assert.match(UI, /backup-tag over">会合并/);
     assert.match(UI, /backup-tag new">本地没有/);
@@ -933,9 +938,9 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
     assert.match(CSS5.slice(at, at + 320), /position: sticky;/);
   });
 
-  test('"正连着"的那些连勾都不给', () => {
+  test('"正在跑"的那些连勾都不给', () => {
     /* 那些恢复会被主进程拒 —— 夹在一堆成功里最容易被漏掉 */
-    assert.match(UI5, /disabled=\{!!e\.attached \|\| !!busy\}/);
+    assert.match(UI5, /disabled=\{!!e\.busy \|\| !!busy\}/);
   });
 
   test('同步完把恢复那张表作废 —— 桶里的东西变了', () => {

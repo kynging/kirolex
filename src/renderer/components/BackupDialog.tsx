@@ -36,8 +36,8 @@ interface Backup {
   /** 属于哪个项目（老 catalog 没有这个字段 → 未分组）。 */
   project?: string;
   existsLocally?: boolean;
-  /** 正连着执行器 —— 恢复会被拒，所以不给勾。 */
-  attached?: boolean;
+  /** 正在跑一轮 —— 恢复会被拒（那一轮还没落盘），所以不给勾。连着但空闲的会自动先断开。 */
+  busy?: boolean;
 }
 
 interface SessionRow {
@@ -106,7 +106,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       setEntries(list);
       if (r?.error) setErr(String(r.error));
       /* 列表换了就把勾掉的收一收 —— 留着一个已经不在表里的 id，到恢复时才发现它没了 */
-      setPicked((prev) => new Set([...prev].filter((id) => list.some((e) => e.id === id && !e.attached))));
+      setPicked((prev) => new Set([...prev].filter((id) => list.some((e) => e.id === id && !e.busy))));
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally { setBusy(null); }
@@ -202,7 +202,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     });
   }, [entries]);
 
-  const selectable = useMemo(() => (entries || []).filter((e) => !e.attached), [entries]);
+  const selectable = useMemo(() => (entries || []).filter((e) => !e.busy), [entries]);
   const chosen = useMemo(() => selectable.filter((e) => picked.has(e.id)), [selectable, picked]);
   const merging = useMemo(() => chosen.filter((e) => e.existsLocally), [chosen]);
 
@@ -412,16 +412,16 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                         {!shut && rows.map((e) => (
                           <label
                             key={e.id}
-                            className={`backup-restore-row${e.attached ? ' disabled' : ''}${picked.has(e.id) ? ' picked' : ''}`}
-                            title={e.attached
-                              ? '这条会话正连着 —— 先断开它（侧栏右键 → 断开）才能恢复，否则内存里那份会把恢复的内容盖回去'
+                            className={`backup-restore-row${e.busy ? ' disabled' : ''}${picked.has(e.id) ? ' picked' : ''}`}
+                            title={e.busy
+                              ? '这条会话正在跑一轮 —— 等它跑完再恢复，不然这一轮还没落盘的内容会丢'
                               : `${e.id}\n备份于 ${when(e.syncedAt)}${e.from ? `（来自 ${e.from}）` : ''}`}
                           >
-                            <input type="checkbox" checked={picked.has(e.id)} disabled={!!e.attached || !!busy}
+                            <input type="checkbox" checked={picked.has(e.id)} disabled={!!e.busy || !!busy}
                                    onChange={() => toggle(e.id)} />
                             <span className="backup-restore-title">{e.title || e.id}</span>
-                            {e.attached
-                              ? <span className="backup-tag warn">正连着</span>
+                            {e.busy
+                              ? <span className="backup-tag warn">正在跑</span>
                               : e.existsLocally
                                 ? <span className="backup-tag over">会合并</span>
                                 : <span className="backup-tag new">本地没有</span>}

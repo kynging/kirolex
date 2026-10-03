@@ -5,6 +5,10 @@ import os from 'os';
 import { execSync, execFileSync, execFile, spawn } from 'child_process';
 import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
+import {
+  CATEGORIES as KIRO_CONFIG_CATEGORIES, categorySpec, LocalKiroConfig, pickEntries, validateContent,
+  remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath,
+} from './kiroConfig';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
@@ -4650,7 +4654,12 @@ app.whenReady().then(async () => {
           ...e,
           project: e.project || projectById.get(e.id) || undefined,
           existsLocally: local.has(e.id),
-          attached: sessionClients.has(e.id),
+          /*
+            只把**正在跑一轮**的标出来 ——「恢复的未分组里面怎么有这么多正连着」。
+            原来标的是"有执行器"，而启动预热会把未分组整组拉起来，于是一大片都显示正连着、
+            都不给勾。现在恢复会自己先断开（见 `s3:restore`），真正不能动的只剩正在产出的那几条。
+          */
+          busy: !!sessionClients.get(e.id)?.busy,
         })),
       };
     } catch (err: any) {
@@ -4749,8 +4758,19 @@ app.whenReady().then(async () => {
     const { creds, problem } = syncCredsOrProblem();
     if (problem) return { ok: false, error: problem };
     if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: '会话 id 不合法。' };
-    if (sessionClients.has(sessionId)) {
-      return { ok: false, error: '这条会话正连着 —— 先关掉它（侧栏右键 → 断开）再恢复，否则内存里那份会把恢复的内容盖回去。' };
+    /*
+      **连着的先断开，不再让人手动去断** —— 恢复现在是合并（同 id 去重、按时间排），
+      断开之后执行器手上那份不会再写盘，合并完下次打开按记录重新接上。
+      只有**正在跑一轮**的才拒：那一轮的产出还没落盘，这时候断开会把它弄丢。
+    */
+    const live = sessionClients.get(sessionId);
+    if (live?.busy) {
+      return { ok: false, error: '这条会话正在跑一轮 —— 等它跑完再恢复，不然这一轮还没落盘的内容会丢。' };
+    }
+    if (live) {
+      logger.info('s3', `恢复前先断开 sessionId=${sessionId}（它连着执行器，内存里那份会把恢复的内容盖回去）`);
+      detachExecutor(sessionId);
+      mainWindow?.webContents.send('session:detached-for-restore', { sessionId });
     }
     const cfg = loadSyncConfig();
     try {
@@ -6803,6 +6823,88 @@ app.whenReady().then(async () => {
       ? { path: configPath }
       : { error: `No ${source || 'local or global'} configuration file was found for ${agentName}.` };
   };
+
+  /*
+    **机器人按钮的其余几个 tab**（MCP / Steering / Prompts / Skills / Powers / Settings）——
+    见 `kiroConfig.ts`。
+
+    **跟着会话所在的机器走**：远程会话的执行器读的是那台机器上的 `~/.kiro`，在这台 Mac 上改
+    等于什么都没改（而且看起来改成功了 —— 最难查的那种）。没有会话时按本机。
+  */
+  const kiroConfigTargetFor = (sessionId?: string): RemoteTarget | undefined => {
+    if (!sessionId) return undefined;
+    const r = sessionClients.get(sessionId)?.profile.remote || store.readRecord(sessionId)?.profile?.remote;
+    return r?.sshHost ? r : undefined;
+  };
+  const kiroConfigWhere = (t?: RemoteTarget): string =>
+    (t ? (labelForHost(KIROLEX_CONFIG_PATH, t.sshHost) || t.sshHost) : '本机');
+
+  ipcMain.handle('kiro:config-categories', () =>
+    /* RegExp 过不了 IPC，渲染层也用不到它 */
+    KIRO_CONFIG_CATEGORIES.map(({ match: _m, ...rest }) => rest));
+
+  ipcMain.handle('kiro:config-list', async (_event, sessionId: string | undefined, category: string) => {
+    const spec = categorySpec(category);
+    if (!spec) return { ok: false, error: `不认识的类别 ${category}` };
+    const target = kiroConfigTargetFor(sessionId);
+    try {
+      if (!target) return { ok: true, where: kiroConfigWhere(), entries: new LocalKiroConfig(os.homedir()).list(spec) };
+      const out = await runRemoteCapture(target, remoteListScript(spec, shellQuote), 30_000);
+      const lines = String(out || '').split('\n').filter(Boolean);
+      const entries = spec.kind === 'single'
+        ? lines.slice(0, 1).map((l) => ({ name: spec.file!, size: Number(l.split('\t')[1]) }))
+        : pickEntries(spec, lines);
+      return { ok: true, where: kiroConfigWhere(target), entries };
+    } catch (err: any) {
+      return { ok: false, where: kiroConfigWhere(target), error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('kiro:config-read', async (_event, sessionId: string | undefined, category: string, name?: string) => {
+    const spec = categorySpec(category);
+    if (!spec) return { ok: false, error: `不认识的类别 ${category}` };
+    const target = kiroConfigTargetFor(sessionId);
+    try {
+      if (!target) {
+        const r = new LocalKiroConfig(os.homedir()).read(spec, name);
+        return 'error' in r ? { ok: false, error: r.error } : { ok: true, ...r, where: kiroConfigWhere() };
+      }
+      const rel = relPath(spec, name);
+      if (!rel) return { ok: false, error: '名字不合规。' };
+      const got = parseRemoteRead(await runRemoteCapture(target, remoteReadScript(rel, shellQuote), 30_000));
+      return {
+        ok: true, path: `~/${rel}`, where: kiroConfigWhere(target), exists: got.exists,
+        content: got.exists ? got.content : (spec.json ? '{}\n' : ''),
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  ipcMain.handle('kiro:config-write', async (
+    _event, sessionId: string | undefined, category: string, name: string | undefined, content: string,
+  ) => {
+    const spec = categorySpec(category);
+    if (!spec) return { ok: false, error: `不认识的类别 ${category}` };
+    const why = validateContent(spec, String(content ?? ''));
+    if (why) return { ok: false, error: why };
+    const target = kiroConfigTargetFor(sessionId);
+    try {
+      if (!target) {
+        const r = new LocalKiroConfig(os.homedir()).write(spec, name, String(content));
+        if ('error' in r) return { ok: false, error: r.error };
+        logger.info('kiro-config', `本机 ${spec.id} 已保存 ${r.path}`);
+        return { ok: true, path: r.path };
+      }
+      const rel = relPath(spec, name);
+      if (!rel) return { ok: false, error: '名字不合规。' };
+      await writeRemoteFile(target, remoteWriteScript(rel, shellQuote), Buffer.from(String(content), 'utf-8').toString('base64'));
+      logger.info('kiro-config', `${target.sshHost} ${spec.id} 已保存 ~/${rel}`);
+      return { ok: true, path: `~/${rel}` };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
 
   ipcMain.handle('kiro:open-agent-config', async (
     _event,
