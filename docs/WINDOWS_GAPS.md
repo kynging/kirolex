@@ -105,7 +105,7 @@ false，`net.connect(<文件路径>)` 在 Windows 上要的是 `\\.\pipe\…` �
   而那条错误看不出跟换行有关。打包的 `.exe` 不受影响（装的是构建机上的产物）。
 - `src/main/index.ts:8840` — `SIGTERM` 在 Windows 上不会触发，所以"退出时释放 kiro-cli
   会话锁"那条不生效。只在 dev supervisor 下有意义，`scripts/dev-hot.mjs:135` 已注明。
-- `scripts/acp-probe.mjs:33,41`、`scripts/steer-smoke.mjs:33` — 写死了某台 Mac 的路径。
+- ✅ 已修：`scripts/acp-probe.mjs` 原来写死了某台 Mac 的路径，改成和 `steer-smoke.mjs` 同一套候选查找（`KIRO_CLI_PATH` → `~/.local/bin` → … → PATH），PATH 拼接用 `path.delimiter`。
 
 ## 7. 一条不是代码 bug 的 Windows 风险
 

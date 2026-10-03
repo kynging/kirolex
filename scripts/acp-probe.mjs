@@ -27,6 +27,8 @@
  */
 import { spawn } from 'node:child_process';
 import fs from 'node:fs';
+import os from 'node:os';
+import path from 'node:path';
 
 const AGENT = process.env.PROBE_AGENT || 'probe-parent';
 const MODEL = process.env.PROBE_MODEL || 'claude-sonnet-5';
@@ -38,9 +40,22 @@ const rec = (dir, obj) => {
   fs.appendFileSync(LOG, line + '\n');
 };
 
-const proc = spawn('/Users/keyinan/.local/bin/kiro-cli', ['acp', '--agent', AGENT, '--model', MODEL], {
+/* 和 steer-smoke.mjs 同一个找法 —— 原来写死了某台 Mac 的绝对路径，换一台机器就跑不起来 */
+function kiroCli() {
+  const candidates = [
+    process.env.KIRO_CLI_PATH,
+    path.join(os.homedir(), '.local/bin/kiro-cli'),
+    path.join(os.homedir(), '.toolbox/bin/kiro-cli'),
+    '/usr/local/bin/kiro-cli',
+    '/opt/homebrew/bin/kiro-cli',
+  ].filter(Boolean);
+  for (const c of candidates) { try { if (fs.statSync(c).isFile()) return c; } catch { /* 下一个 */ } }
+  return 'kiro-cli';   // 交给 PATH
+}
+
+const proc = spawn(kiroCli(), ['acp', '--agent', AGENT, '--model', MODEL], {
   stdio: ['pipe', 'pipe', 'pipe'],
-  env: { ...process.env, PATH: `${process.env.PATH}:/Users/keyinan/.local/bin` },
+  env: { ...process.env, PATH: `${process.env.PATH}${path.delimiter}${path.join(os.homedir(), '.local/bin')}` },
 });
 
 let nextId = 1;

@@ -243,6 +243,37 @@ else
 fi
 
 # ---------------------------------------------------------------- 自检
+# ---------------------------------------------------- sshd 回收死连接
+#
+# 默认 `ClientAliveInterval 0` = sshd **从不**探测客户端还在不在。客户端那头断了
+# （笔记本 VPN 掉线、合盖睡眠）而 TCP 没收到 FIN 时，sshd-session 和它下面所有的
+# kiro-cli 会一直挂着 —— 实测一次挂了 7.5 小时、14 个进程（7 条会话 × 2），
+# 而 KiroLex 自己的远端清理只扫 PPID==1 的孤儿，这种父进程还活着的扫不到。
+# 老那台 EC2 被拖到 CPU 100%、sshd 握手超时，就是这类垃圾越积越多。
+#
+# 30 秒探一次、连续 4 次没回就断 = 2 分钟内回收，子进程随之收到 SIGHUP。
+# 先 `sshd -t` 再 reload：配置写坏了就还原，reload 不断现有连接。
+step "sshd 回收死连接"
+F=/etc/ssh/sshd_config.d/60-kirolex.conf
+if sudo -n true 2>/dev/null; then
+  if sudo grep -qs '^ClientAliveInterval' "$F"; then
+    say "→ 已配置（$F）"
+  else
+    sudo cp -a "$F" /tmp/60-kirolex.conf.bak 2>/dev/null || sudo rm -f /tmp/60-kirolex.conf.bak
+    printf '%s\n' '# KiroLex：让 sshd 自己发现已经死掉的客户端（见 remote-bootstrap.sh）' \
+      'ClientAliveInterval 30' 'ClientAliveCountMax 4' | sudo tee -a "$F" >/dev/null
+    if sudo sshd -t 2>/dev/null; then
+      sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || true
+      say "→ 已开：30 秒探一次，2 分钟内回收死连接"
+    else
+      if [ -f /tmp/60-kirolex.conf.bak ]; then sudo cp -a /tmp/60-kirolex.conf.bak "$F"; else sudo rm -f "$F"; fi
+      note_fail "sshd 配置校验没过，已还原 —— 死连接不会被自动回收"
+    fi
+  fi
+else
+  say "→ 跳过：没有免密 sudo。建议手动加 ClientAliveInterval 30 / ClientAliveCountMax 4"
+fi
+
 step "自检"
 say "uname   : $(uname -srm)"
 for b in kiro-cli git unzip node npm claude codex claude-code-acp; do
