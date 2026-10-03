@@ -76,3 +76,16 @@ test('远程脚本：路径包单引号，内容走 base64', () => {
   assert.deepEqual(parseRemoteRead(out), { exists: true, content: '中文 ✓' });
   assert.deepEqual(parseRemoteRead('EXISTS 0\n'), { exists: false, content: '' });
 });
+
+test('Agents tab 也跟着会话的机器走 —— 远程会话不能改本机那份', () => {
+  /* 原来永远读写本机 ~/.kiro/agents：在远程会话里改了、显示保存成功，远端什么都没变 */
+  const M = fs.readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
+  for (const ch of ['kiro:open-agent-config', 'kiro:save-agent-config']) {
+    const at = M.indexOf(`ipcMain.handle('${ch}'`);
+    const body = M.slice(at, at + 2500);
+    assert.match(body, /const remoteT = kiroConfigTargetFor\(sessionId\);/, `${ch} 没有远程分支`);
+    assert.ok(body.indexOf('remoteT') < body.indexOf('resolveKiroAgentConfigPath'), `${ch}：远程分支要在本机解析之前`);
+  }
+  /* 远端找文件之前名字已过白名单 —— 它被拼进 shell */
+  assert.match(M, /remoteAgentFindScript = \(agentName: string\)/);
+});

@@ -6836,6 +6836,16 @@ app.whenReady().then(async () => {
     const r = sessionClients.get(sessionId)?.profile.remote || store.readRecord(sessionId)?.profile?.remote;
     return r?.sshHost ? r : undefined;
   };
+  /**
+   * 在远端 `~/.kiro/agents` 里找某个 agent 的文件：先 `<名字>.json`，找不到再按 JSON 里的
+   * `"name"` 字段找（AIM 装的那些文件名带包前缀）—— 和本机 `resolveKiroAgentConfigPath` 同一个找法。
+   * 输出 `PATH <相对家目录的路径>` + base64 内容。名字调用前已过 `[A-Za-z0-9_.-]` 白名单。
+   */
+  const remoteAgentFindScript = (agentName: string): string => [
+    `n=${shellQuote(agentName)}; d="$HOME/.kiro/agents"; f="$d/$n.json"`,
+    `[ -f "$f" ] || f=$(grep -lE "\"name\"[[:space:]]*:[[:space:]]*\"$n\"" "$d"/*.json 2>/dev/null | head -1)`,
+    'if [ -n "$f" ] && [ -f "$f" ]; then echo "PATH ${f#"$HOME"/}"; base64 -w0 < "$f"; echo; else echo NOTFOUND; fi',
+  ].join('; ');
   const kiroConfigWhere = (t?: RemoteTarget): string =>
     (t ? (labelForHost(KIROLEX_CONFIG_PATH, t.sshHost) || t.sshHost) : '本机');
 
@@ -6912,6 +6922,25 @@ app.whenReady().then(async () => {
     agentName: string,
     source?: 'built-in' | 'global' | 'local',
   ) => {
+    /*
+      **远程会话改远端那份** —— 和其余几个 tab 一致（见 `kiroConfigTargetFor`）。
+      原来这里永远读写本机 `~/.kiro/agents`，而远程会话的执行器用的是那台机器上的 agent：
+      在这里改了、看着保存成功了，远端什么都没变。
+    */
+    const remoteT = kiroConfigTargetFor(sessionId);
+    if (remoteT) {
+      if (!/^[A-Za-z0-9_.-]+$/.test(agentName)) return { opened: false, error: 'Invalid Agent name.' };
+      if (source === 'built-in') return { opened: false, error: `${agentName} 是内置的，不能改。` };
+      try {
+        const got = await runRemoteCapture(remoteT, remoteAgentFindScript(agentName), 30_000);
+        const m = /^PATH (.+)$/m.exec(got);
+        if (!m) return { opened: false, error: `${kiroConfigWhere(remoteT)} 上没有 ${agentName} 的配置文件（~/.kiro/agents）。` };
+        const body = got.slice(got.indexOf(m[0]) + m[0].length).trim();
+        return { opened: true, path: `${kiroConfigWhere(remoteT)}:~/${m[1]}`, content: Buffer.from(body, 'base64').toString('utf-8') };
+      } catch (err: any) {
+        return { opened: false, error: err?.message || String(err) };
+      }
+    }
     const resolved = resolveKiroAgentConfigPath(sessionId, agentName, source);
     if (!resolved.path) return { opened: false, error: resolved.error };
 
@@ -6943,6 +6972,20 @@ app.whenReady().then(async () => {
       return { saved: false, error: 'Agent configuration must be a JSON object.' };
     }
 
+    const remoteT = kiroConfigTargetFor(sessionId);
+    if (remoteT) {
+      if (!/^[A-Za-z0-9_.-]+$/.test(agentName) || source === 'built-in') return { saved: false, error: '这个 agent 不能改。' };
+      try {
+        const got = await runRemoteCapture(remoteT, remoteAgentFindScript(agentName), 30_000);
+        const m = /^PATH (\.kiro\/agents\/[^\n/]+\.json)$/m.exec(got);
+        if (!m) return { saved: false, error: `${kiroConfigWhere(remoteT)} 上找不到 ${agentName} 的配置文件。` };
+        await writeRemoteFile(remoteT, remoteWriteScript(m[1], shellQuote), Buffer.from(content, 'utf-8').toString('base64'));
+        logger.info('kiro-config', `${remoteT.sshHost} agent ${agentName} 已保存 ~/${m[1]}`);
+        return { saved: true, path: `${kiroConfigWhere(remoteT)}:~/${m[1]}` };
+      } catch (err: any) {
+        return { saved: false, error: err?.message || String(err) };
+      }
+    }
     const resolved = resolveKiroAgentConfigPath(sessionId, agentName, source);
     if (!resolved.path) return { saved: false, error: resolved.error };
 
