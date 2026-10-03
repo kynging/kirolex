@@ -47,6 +47,7 @@ import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
   sweepAgentsScript, STALE_AGENT_MINUTES, orphanSweepScript, parseOrphanSweep,
+  staleExecutorSweepScript, parseStaleSweep,
   ownerTag, ownedAgentPrefix,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
@@ -1934,16 +1935,66 @@ async function sweepRemoteSessionAgents(): Promise<void> {
         最后 sshd 和 SSM 都饿死，只能从 EC2 API 强制 stop/start 救回来。
         判据是 PPID==1（见 `orphanSweepScript`）—— 在真机上验过：活着的 12 个 PPID 全不是 1。
       */
-      const orphans = parseOrphanSweep(await runRemoteCapture(target, orphanSweepScript(OWNER)));
-      if (orphans > 0) {
-        logger.warn('localmcp', `${target.sshHost}: 杀掉 ${orphans} 个孤儿执行器进程（上次 KiroLex 没能正常退出）`);
-      }
+      await sweepRemoteExecutors(target, '启动');
     } catch (err: any) {
       logger.info('localmcp', `${target.sshHost}: 扫会话 agent 没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
     }
   }
 }
 
+
+/**
+ * 这台机器上**我此刻持有**的执行器 —— 第二道清理的保留名单（见 `staleExecutorSweepScript`）。
+ *
+ * 有 `remotePid` 的按 pid 留；还没拿到 pid 的（刚 spawn）、正在 attach / 换模型的，按会话整条跳过。
+ * 宁可多留：漏留一条的代价是把一条正在用的会话杀掉，多留一条的代价是晚一轮再清。
+ */
+function heldExecutorsOn(target: RemoteTarget): { pids: number[]; sessions: string[] } {
+  const pids: number[] = [];
+  const sessions = new Set<string>([...attachingSessions, ...reconfiguringSessions, ...attachInFlight.keys()]);
+  for (const [sessionId, entry] of sessionClients) {
+    const r = entry.profile.remote;
+    if (!r?.sshHost || r.sshHost !== target.sshHost || (r.sshPort || 22) !== (target.sshPort || 22)) continue;
+    const pid = (entry.client as any).remotePid as number | undefined;
+    if (pid) pids.push(pid); else sessions.add(sessionId);
+  }
+  return { pids, sessions: [...sessions] };
+}
+
+/**
+ * **远端执行器两道清理** ——「你应该让 kirolex 去清理和检查远端孤儿」。
+ *
+ *   1. PPID==1（`orphanSweepScript`）：本机 ssh 死了、远端 sshd 也跟着走了的那种；
+ *   2. 带我标签但**我没持有**（`staleExecutorSweepScript`）：本机那头死了、远端 sshd 没察觉的那种
+ *      —— 实测挂了 7.5 小时、14 个进程，第 1 道一个都认不出来。
+ *
+ * 原来只在启动时跑一次，所以一次网络抖动留下的垃圾要等到下次重启才清。现在三个时机：
+ * 启动、每 `REMOTE_SWEEP_MS` 一轮（只对**正有会话**的机器）、以及复用连接重连回来的那一刻
+ * （死连接留下的旧进程正是在那时候变成"没人持有"）。
+ */
+async function sweepRemoteExecutors(target: RemoteTarget, why: string): Promise<void> {
+  try {
+    const orphans = parseOrphanSweep(await runRemoteCapture(target, orphanSweepScript(OWNER)));
+    if (orphans > 0) {
+      logger.warn('localmcp', `${target.sshHost}: 杀掉 ${orphans} 个孤儿执行器进程（父进程已没了，${why}）`);
+    }
+    const stale = parseStaleSweep(await runRemoteCapture(target, staleExecutorSweepScript(OWNER, heldExecutorsOn(target))));
+    if (stale > 0) {
+      logger.warn('localmcp', `${target.sshHost}: 杀掉 ${stale} 个没人持有的执行器（带本机标签但不是这个 KiroLex 正连着的，${why}）`);
+    }
+  } catch (err: any) {
+    logger.info('localmcp', `${target.sshHost}: 远端执行器清理没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
+  }
+}
+
+/** 定期清理的间隔。10 分钟：死连接在 sshd 那边最多挂 2 分钟（ClientAlive），这一轮是兜底。 */
+const REMOTE_SWEEP_MS = 10 * 60_000;
+setInterval(() => {
+  for (const target of listRemoteTargets(KIROLEX_CONFIG_PATH)) {
+    /* 只扫正在用的机器：没会话的那台可能已经关了，定时去敲门只会攒一堆超时 */
+    if (target.sshHost && hasSessionOn(target)) void sweepRemoteExecutors(target, '定时');
+  }
+}, REMOTE_SWEEP_MS).unref?.();
 
 /** 会话的执行器没了：作废 token、放开端口、把远端那份临时 agent 删掉。 */
 function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
@@ -2283,7 +2334,12 @@ const sshMux: SshMux = new SshMux({
     `ensureLocalTools` 的 catch），它们那条 kiro-cli 根本没被配上本地 MCP，
     端口回来了也用不上 —— 实测就是这个状态：执行器活着、`local_*` 全是死的。
   */
-  onReady: (key: string) => { void rearmLocalToolsFor(key); },
+  onReady: (key: string) => {
+    void rearmLocalToolsFor(key);
+    /* 连接刚断过：死连接下面那批执行器现在没人持有了，顺手收掉 */
+    const target = listRemoteTargets(KIROLEX_CONFIG_PATH).find((t) => t.sshHost && muxKey(t.sshHost, t.sshPort) === key);
+    if (target) setTimeout(() => { void sweepRemoteExecutors(target, '连接恢复后'); }, 30_000).unref?.();
+  },
 });
 
 /**

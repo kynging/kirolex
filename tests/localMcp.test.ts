@@ -844,8 +844,11 @@ describe('远端孤儿执行器进程（打爆机器的那个）', () => {
   });
 
   test('开机跟着 agent 那一遍一起扫，而且杀到人时要 warn（不是 info）', () => {
-    const at = M.indexOf('async function sweepRemoteSessionAgents');
-    const body = M.slice(at, M.indexOf('\n}', M.indexOf('catch (err: any)', at)));
+    /* 两道清理挪进了 sweepRemoteExecutors（启动 / 定时 / 连接恢复后共用），启动那轮调它 */
+    const at0 = M.indexOf('async function sweepRemoteSessionAgents');
+    assert.match(M.slice(at0, at0 + 2000), /await sweepRemoteExecutors\(target, '启动'\)/);
+    const at = M.indexOf('async function sweepRemoteExecutors');
+    const body = M.slice(at, M.indexOf('\n}', at));
     assert.match(body, /parseOrphanSweep\(await runRemoteCapture\(target, orphanSweepScript\(OWNER\)\)\)/);
     assert.match(body, /logger\.warn\('localmcp', `\$\{target\.sshHost\}: 杀掉 \$\{orphans\} 个孤儿执行器进程/);
     /* 失败照旧只记日志 —— 这仍然是清垃圾，不该拦住任何会话 */

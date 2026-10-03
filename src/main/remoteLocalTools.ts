@@ -223,6 +223,60 @@ export function orphanSweepScript(owner: string): string {
   ].join(' ');
 }
 
+/**
+ * **第二道：我此刻没持有的、带我标签的执行器** ——「你应该让 kirolex 去清理和检查远端孤儿」。
+ *
+ * `orphanSweepScript` 的判据是 PPID==1，它漏掉一类实测撞到的：**本机那头死了、远端那头没察觉**。
+ * 笔记本 VPN 抖断 → TCP 没收到 FIN → 远端的 `sshd-session` 还活着（sshd 默认
+ * `ClientAliveInterval 0`，从不探测）→ 它下面的 kiro-cli 父进程不是 1。实测一次挂了 7.5 小时、
+ * 14 个进程，而本机那时一条 ssh 都没有。
+ *
+ * ## 为什么"我没持有"就能杀
+ *
+ * owner 是本机 hostname+用户名的哈希（`ownerTag`），而 KiroLex 有单实例锁 —— **同一个 owner
+ * 在世上只可能有这一个 KiroLex**。所以一个带我标签的执行器，要么是我现在持有的那条
+ * （它的 pid 在 `keepPids` 里），要么谁都不持有。别的笔记本的执行器带的是别的标签，碰不到。
+ *
+ * ## 年龄只防竞态，不是判据
+ *
+ * 一条刚 spawn 的执行器在 `remotePid` 回来之前还不在 `keepPids` 里 —— 没有年龄下限的话
+ * 扫描撞上 attach 那几秒就会把它杀掉。`skipSessions` 是同一件事的另一半：正在 attach /
+ * 换模型的那几条会话，整条跳过。
+ *
+ * sessionId 进脚本之前必须过白名单 —— 它被拼进 shell 的 `case` 模式里。
+ */
+export function staleExecutorSweepScript(
+  owner: string,
+  keep: { pids: number[]; sessions: string[] },
+  minAgeSec = 120,
+): string {
+  const pfx = ownedAgentPrefix(owner);
+  const pids = keep.pids.filter((p) => Number.isInteger(p) && p > 1);
+  const sessions = keep.sessions.filter((sid) => /^[A-Za-z0-9_-]+$/.test(sid));
+  const age = Math.max(30, Math.floor(minAgeSec));
+  return [
+    `keep=" ${pids.join(' ')} "; skip=" ${sessions.join(' ')} "; pfx='${pfx}'; n=0`,
+    /*
+      只认**顶层**那个 `kiro-cli acp`（args 的第一个词正是 `kiro-cli`）：`kiro-cli-chat` 是它的子进程，
+      跟着父进程一起收；单独扫子进程会把一条活会话的 chat 杀掉而留下父进程。
+    */
+    `; for p in $(ps -eo pid=,etimes=,args= | awk -v pfx="$pfx" -v age=${age} '($3=="kiro-cli" || $3 ~ "/kiro-cli$") && $4=="acp" && $2>=age && index($0,pfx)>0 {print $1}'); do`,
+    '  case "$keep" in *" $p "*) continue;; esac;',
+    '  sid=$(ps -o args= -p "$p" 2>/dev/null | grep -oE "${pfx}[A-Za-z0-9_-]+" | head -1); sid=${sid#"$pfx"};',
+    '  case "$skip" in *" $sid "*) continue;; esac;',
+    '  for c in $(pgrep -P "$p" 2>/dev/null); do kill -TERM "$c" 2>/dev/null; done;',
+    '  kill -TERM "$p" 2>/dev/null && n=$((n+1));',
+    'done',
+    '; echo "KIROLEX_STALE $n"',
+  ].join(' ');
+}
+
+/** `staleExecutorSweepScript` 输出里那个数字。 */
+export function parseStaleSweep(out: string): number {
+  const m = /KIROLEX_STALE\s+(\d+)/.exec(String(out || ''));
+  return m ? Number(m[1]) : 0;
+}
+
 /** `orphanSweepScript` 的输出里那个数字。认不出来返回 0 —— 清垃圾的统计不值得抛错。 */
 export function parseOrphanSweep(out: string): number {
   const m = /KIROLEX_ORPHANS\s+(\d+)/.exec(String(out || ''));
