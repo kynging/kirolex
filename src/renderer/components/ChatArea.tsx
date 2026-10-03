@@ -2905,28 +2905,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     setAgentConfigStatus(null);
   }, []);
 
+  /**
+   * **关闭 = 丢弃所有未保存的草稿，直接关** ——「如果 unsaved 不能直接 close，应该抛弃所有变更然后 close」。
+   *
+   * 原来有未保存草稿时会弹一个确认框挡住关闭。但"关"这个动作本身就是在说"不要了"：
+   * 想留就按保存，保存按钮就在旁边。多一道确认只是让最常见的那条路（改两下看看、不满意、关掉）
+   * 每次都多点一下。草稿只在内存里、从没写过盘，所以丢掉它不会碰到任何已存的配置。
+   */
   const closeAgentConfig = useCallback(() => {
-    const draftsWithCurrent = agentConfigEditor
-      ? { ...agentConfigDrafts, [agentConfigEditor.agentName]: agentConfigEditor }
-      : agentConfigDrafts;
-    const hasUnsavedDrafts = Object.values(draftsWithCurrent).some((draft) => (
-      !draft.error && draft.content !== draft.initialContent
-    ));
-    // Asked through the in-app dialog instead of window.confirm, which blocks the
-    // renderer's main thread until the OS modal resolves (see ConfirmDialog). The
-    // decision now arrives as a state update, so this handler returns immediately.
-    if (hasUnsavedDrafts) {
-      setConfirm({
-        title: t('Unsaved agent config'),
-        message: '关闭编辑器会丢弃所有未保存的 Agent 配置草稿。\n\n此操作不可恢复。',
-        confirmLabel: t('Discard'),
-        destructive: true,
-        onConfirm: discardAgentConfig,
-      });
-      return;
-    }
     discardAgentConfig();
-  }, [agentConfigEditor, agentConfigDrafts, discardAgentConfig]);
+  }, [discardAgentConfig]);
 
   const saveAgentConfig = useCallback(async () => {
     if (
