@@ -8277,3 +8277,7 @@ button, input, select, textarea {
 .agent-config-editor-dialog .kiro-config-workspace .agent-config-agent-list { overflow-x: hidden; }
 /* Markdown 不是代码：换行比横向滚动好读 */
 .agent-config-editor-dialog .agent-config-editor-textarea.kiro-config-prose { white-space: pre-wrap; overflow-x: hidden; }
+
+/* 删除备份的第二次点击：变成红色，说明这一下是真的删 */
+.remote-btn.remote-btn-danger { background: var(--error); border-color: var(--error); color: #fff; }
+.remote-btn.remote-btn-danger:hover:not(:disabled) { filter: brightness(1.08); }

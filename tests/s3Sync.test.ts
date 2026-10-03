@@ -1048,14 +1048,18 @@ describe('每条会话的最新同步时间', () => {
     const at = M.indexOf("ipcMain.handle('s3:delete-project'");
     assert.ok(at > 0);
     const body = M.slice(at, at + 4200);
+    /* 删对象 / 写 catalog / 清状态表这三步挪进了 deleteBackupsOf（删会话的入口也用它） */
+    assert.match(body, /await deleteBackupsOf\(creds!, cfg\.prefix, catalog,/);
+    const h = M.indexOf('async function deleteBackupsOf(');
+    const helper = M.slice(h, M.indexOf('\n}\n', h));
     /*
       不清状态表的话，下一轮同步会认为"这些文件没变、跳过"——
       于是删掉的备份**再也不会被重新传上去**。
     */
-    assert.match(body, /if \(sid && goneIds\.has\(sid\)\) delete state\[rel\];/);
-    assert.match(body, /for \(const id of goneIds\) delete marks\[id\];/);
+    assert.match(helper, /if \(sid && goneIds\.has\(sid\)\) delete state\[rel\];/);
+    assert.match(helper, /for \(const id of goneIds\) delete marks\[id\];/);
     /* catalog 最后写：先写的话中途失败会留下一个指向已删对象的 catalog */
-    assert.ok(body.indexOf('await deleteObject') < body.indexOf('putObject(creds!, catalogKey'));
+    assert.ok(helper.indexOf('await deleteObject') < helper.indexOf('putObject(creds, catalogKey'));
     /* 两道确认：界面弹一次，IPC 层还要求原样传回项目名（防手滑点到别的行） */
     assert.match(body, /if \(confirm !== project\) return \{ ok: false/);
   });

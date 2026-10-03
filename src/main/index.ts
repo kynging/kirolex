@@ -3332,6 +3332,44 @@ function catalogEntriesFor(
   }));
 }
 
+/**
+ * 删掉桶里若干条会话的备份（对象 + catalog 条目），并清掉本地"传过什么"的记录。
+ * `s3:delete-project` 和 `s3:delete-sessions` 共用 —— 顺序和理由见下面每一步。
+ */
+async function deleteBackupsOf(
+  creds: any, prefix: string | undefined, catalog: Catalog, goneIds: Set<string>,
+): Promise<{ deleted: number; failed: string[] }> {
+  let deleted = 0;
+  const failed: string[] = [];
+  for (const id of goneIds) {
+    const pfx = `${keyFor(prefix, path.join('sessions', id))}/`;
+    for (const obj of await listObjects(creds, pfx)) {
+      try { await deleteObject(creds, obj.key); deleted += 1; }
+      catch (err: any) { failed.push(`${obj.key}：${err?.message || err}`); }
+    }
+  }
+  /*
+    catalog 最后写：先写的话中途失败会留下一个"指向已删对象"的 catalog，
+    而那比"多列了几条还在的"更糟 —— 点恢复只会得到一句看不懂的错误。
+  */
+  const nextCatalog: Catalog = { version: 1, entries: (catalog.entries || []).filter((e) => !goneIds.has(e.id)) };
+  await putObject(creds, catalogKey(prefix), Buffer.from(JSON.stringify(nextCatalog, null, 2)), 'application/json');
+  /*
+    **本地那张"传过什么"的状态表也要清掉这几条** —— 不清的话下一轮同步会认为
+    "这些文件没变、跳过"，于是本地还在的那些**再也不会被重新传上去**。
+  */
+  const state = readState(S3_STATE_PATH);
+  for (const rel of Object.keys(state)) {
+    const sid = sessionIdOfRel(rel);
+    if (sid && goneIds.has(sid)) delete state[rel];
+  }
+  writeState(S3_STATE_PATH, state);
+  const marks = readSessionMarks(S3_MARKS_PATH);
+  for (const id of goneIds) delete marks[id];
+  writeSessionMarks(S3_MARKS_PATH, marks);
+  return { deleted, failed };
+}
+
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: '上一轮还在跑' };
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
@@ -4706,43 +4744,46 @@ app.whenReady().then(async () => {
       const mine = (catalog.entries || []).filter((e) => (e.project || projectById.get(e.id) || '') === project);
       if (!mine.length) return { ok: false, error: `桶里没有属于「${project || '未分组'}」的备份。` };
 
-      let deleted = 0;
-      const failed: string[] = [];
-      for (const e of mine) {
-        const prefix = `${keyFor(cfg.prefix, path.join('sessions', e.id))}/`;
-        const objects = await listObjects(creds!, prefix);
-        for (const obj of objects) {
-          try { await deleteObject(creds!, obj.key); deleted += 1; }
-          catch (err: any) { failed.push(`${obj.key}：${err?.message || err}`); }
-        }
-      }
-      /*
-        catalog 最后写：先写的话中途失败会留下一个"指向已删对象"的 catalog，
-        而那比"多列了几条还在的"更糟 —— 点恢复只会得到一句看不懂的错误。
-      */
-      const goneIds = new Set(mine.map((e) => e.id));
-      const nextCatalog: Catalog = {
-        version: 1,
-        entries: (catalog.entries || []).filter((e) => !goneIds.has(e.id)),
-      };
-      await putObject(creds!, catalogKey(cfg.prefix), Buffer.from(JSON.stringify(nextCatalog, null, 2)), 'application/json');
-      /*
-        **本地那张"传过什么"的状态表也要清掉这几条** —— 不清的话下一轮同步会认为
-        "这些文件没变、跳过"，于是删掉的备份**再也不会被重新传上去**。
-      */
-      const state = readState(S3_STATE_PATH);
-      for (const rel of Object.keys(state)) {
-        const sid = sessionIdOfRel(rel);
-        if (sid && goneIds.has(sid)) delete state[rel];
-      }
-      writeState(S3_STATE_PATH, state);
-      const marks = readSessionMarks(S3_MARKS_PATH);
-      for (const id of goneIds) delete marks[id];
-      writeSessionMarks(S3_MARKS_PATH, marks);
-
+      const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, catalog, new Set(mine.map((e) => e.id)));
       logger.warn('s3', `删掉了「${project || '未分组'}」在桶里的备份：${mine.length} 条会话 / ${deleted} 个对象`
         + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地一个字都没动）`);
       return { ok: true, sessions: mine.length, deleted, failed };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    }
+  });
+
+  /**
+   * **删掉某几条会话在桶里的备份** ——「远程会话恢复中需要有一个删除按钮，现在这里面有好多
+   * New Chat 之类没用的会话」。
+   *
+   * 那些没用的大多是**本地早就删了、桶里还留着**的：同步只往上传，从不删桶里的东西，
+   * 所以本地删过的会话会一直挂在恢复列表里。
+   *
+   * 只删备份，本地一个字不动。本地还在的那几条，下一轮同步会再传上去（状态表已清）——
+   * 那是诚实的结果：要它彻底消失，得在侧栏把本地那条也删掉。界面上会把这几条单独说出来。
+   */
+  ipcMain.handle('s3:delete-sessions', async (_event, ids: string[]) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id));
+    if (!want.length) return { ok: false, error: '没选会话。' };
+    const cfg = loadSyncConfig();
+    try {
+      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+      if (!raw) return { ok: false, error: '桶里还没有 catalog（没同步过）。' };
+      let catalog: Catalog;
+      try { catalog = JSON.parse(raw.toString('utf-8')) as Catalog; } catch { return { ok: false, error: 'catalog 读不出来。' }; }
+      const inBucket = new Set((catalog.entries || []).map((e) => e.id));
+      const gone = new Set(want.filter((id) => inBucket.has(id)));
+      if (!gone.size) return { ok: false, error: '选的这些桶里已经没有了。' };
+      const local = new Set(store.listSessions().map((r) => r.id));
+      const willReturn = [...gone].filter((id) => local.has(id));
+      const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, catalog, gone);
+      logger.warn('s3', `删掉了 ${gone.size} 条会话的备份 / ${deleted} 个对象`
+        + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地没动；其中 ${willReturn.length} 条本地还在，下次同步会再传）`);
+      return { ok: true, sessions: gone.size, deleted, failed, willReturn };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };

@@ -212,6 +212,36 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     return next;
   });
 
+  /*
+    **删除所选的备份** ——「恢复中需要有一个删除按钮，现在这里面有好多 New Chat 之类没用的会话」。
+    两次点击确认（第一次变成「确认删除 N 条」）：桶里删了就回不来，而 app 里的系统确认框
+    会卡住渲染线程。只删桶里那份，本地一个字不动。
+  */
+  const [armDelete, setArmDelete] = useState(false);
+  useEffect(() => { setArmDelete(false); }, [picked]);
+  const stillLocal = useMemo(() => chosen.filter((e) => e.existsLocally), [chosen]);
+  const removeBackups = async (): Promise<void> => {
+    if (!chosen.length) return;
+    if (!armDelete) { setArmDelete(true); return; }
+    setArmDelete(false);
+    setBusy('delete'); setMsg(null);
+    try {
+      const r = await api()?.deleteS3Sessions?.(chosen.map((e) => e.id));
+      if (!r?.ok) { setMsg({ kind: 'bad', text: r?.error || '没删掉' }); return; }
+      const back = Array.isArray(r.willReturn) ? r.willReturn.length : 0;
+      setMsg({
+        kind: r.failed?.length ? 'bad' : 'ok',
+        text: `删掉了 ${r.sessions} 条会话的备份。`
+          + (back ? ` 其中 ${back} 条本地还在，下次同步会再传上去 —— 要它彻底消失，在侧栏把本地那条也删掉。` : '')
+          + (r.failed?.length ? `\n${r.failed.length} 个对象没删掉：${r.failed.slice(0, 3).join('；')}` : ''),
+      });
+      setPicked(new Set());
+      await loadBackups();
+    } catch (x: any) {
+      setMsg({ kind: 'bad', text: String(x?.message || x) });
+    } finally { setBusy(null); }
+  };
+
   const restore = async (): Promise<void> => {
     if (!chosen.length) return;
     const lines = [
@@ -378,7 +408,21 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                         onClick={() => void restore()}>
                   {busy === 'restore' ? '恢复中…' : `恢复选中的${chosen.length ? ` ${chosen.length} 条` : ''}`}
                 </button>
-                {!!merging.length && (
+                <button
+                  className={`remote-btn${armDelete ? ' remote-btn-danger' : ''}`}
+                  disabled={!!busy || !chosen.length}
+                  onClick={() => void removeBackups()}
+                  onBlur={() => setArmDelete(false)}
+                  title="只删桶里的备份，本地不动"
+                >
+                  {busy === 'delete' ? '删除中…'
+                    : armDelete ? `确认删除 ${chosen.length} 条备份`
+                    : `删除选中的${chosen.length ? ` ${chosen.length} 条` : ''}`}
+                </button>
+                {armDelete && !!stillLocal.length && (
+                  <span className="settings-hint">其中 {stillLocal.length} 条本地还在，下次同步会再传上去</span>
+                )}
+                {!armDelete && !!merging.length && (
                   <span className="settings-hint">其中 {merging.length} 条会和本地合并</span>
                 )}
               </div>
