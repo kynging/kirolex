@@ -56,6 +56,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * （kiro-cli 只认它自己机器上的）。不传 = 本机。
    */
   listKiroAgents: (machine?: string) => ipcRenderer.invoke('kiro:list-agents', machine),
+  /* 机器人按钮的其余 tab —— 跟着会话所在的机器（见 index.ts 的 kiro:config-*） */
+  kiroConfigCategories: () => ipcRenderer.invoke('kiro:config-categories'),
+  kiroConfigList: (sessionId: string | undefined, category: string) => ipcRenderer.invoke('kiro:config-list', sessionId, category),
+  kiroConfigRead: (sessionId: string | undefined, category: string, name?: string) => ipcRenderer.invoke('kiro:config-read', sessionId, category, name),
+  kiroConfigWrite: (sessionId: string | undefined, category: string, name: string | undefined, content: string) =>
+    ipcRenderer.invoke('kiro:config-write', sessionId, category, name, content),
 
   /* ----------------------------------------------------------- S3 备份 */
   /**

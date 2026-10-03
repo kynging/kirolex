@@ -2,6 +2,7 @@ import { createPortal } from 'react-dom';
 import { baseName, isSessionScratchDir } from '../pathBits.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
+import { KiroConfigPanel, type KiroConfigCategory } from './KiroConfigPanel';
 import ReactMarkdown from 'react-markdown';
 import { mdText } from '../mdText';
 // 「这段文字是不是路径」的判据 —— 抽出来是为了能被 node:test 测到（.tsx 跑不了测试）
@@ -2749,6 +2750,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const agentConfigLineNumbersRef = useRef<HTMLDivElement>(null);
 
   const [agentConfigEditor, setAgentConfigEditor] = useState<AgentConfigEditorState | null>(null);
+  /* 机器人面板的 tab：'agents' 是原来那个编辑器，其余的见 KiroConfigPanel */
+  const [agentConfigTab, setAgentConfigTab] = useState<string>('agents');
+  const [agentConfigFilter, setAgentConfigFilter] = useState('');
+  const [kiroConfigCats, setKiroConfigCats] = useState<KiroConfigCategory[]>([]);
   const [agentConfigDrafts, setAgentConfigDrafts] = useState<Record<string, AgentConfigEditorState>>({});
   const [agentConfigLoading, setAgentConfigLoading] = useState(false);
   const [agentConfigSaving, setAgentConfigSaving] = useState(false);
@@ -2898,8 +2903,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return () => window.removeEventListener('kirolex:open-agent-config', handler);
   }, [openAgentConfig, paneFocused, readOnly]);
 
+  /* tab 清单从 main 拿（那边是唯一定义），面板第一次打开时拉一次 */
+  useEffect(() => {
+    if (!agentConfigEditor || kiroConfigCats.length) return;
+    void (window as any).kiroApi?.kiroConfigCategories?.().then((c: KiroConfigCategory[]) => {
+      if (Array.isArray(c)) setKiroConfigCats(c);
+    }).catch(() => {});
+  }, [agentConfigEditor, kiroConfigCats.length]);
+
   /** Drop the Agent-config editor and every draft in it. */
   const discardAgentConfig = useCallback(() => {
+    setAgentConfigTab('agents');
     setAgentConfigEditor(null);
     setAgentConfigDrafts({});
     setAgentConfigStatus(null);
@@ -4252,39 +4266,58 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </div>
               <button className="settings-close" onClick={closeAgentConfig} aria-label="Close">✕</button>
             </div>
+            <div className="kiro-config-tabs" role="tablist">
+              {[{ id: 'agents', label: 'Agents' }, ...kiroConfigCats].map((c) => (
+                <button
+                  key={c.id}
+                  role="tab"
+                  aria-selected={agentConfigTab === c.id}
+                  className={`kiro-config-tab ${agentConfigTab === c.id ? 'active' : ''}`}
+                  onClick={() => setAgentConfigTab(c.id)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+            {agentConfigTab === 'agents' ? (<>
             <div className="agent-config-editor-workspace">
               <aside className="agent-config-agent-list" aria-label="Kiro Agents">
-                <div className="agent-config-agent-list-header">
-                  All Agents <span>{agentConfigAgents.length}</span>
-                </div>
-                {agentConfigAgents.map((agent) => {
-                  const draft = agentConfigDrafts[agent.name];
-                  const hasUnsavedDraft = !!draft &&
-                    !draft.error &&
-                    draft.content !== draft.initialContent;
+                <input
+                  className="agent-config-filter"
+                  placeholder={`筛选 ${agentConfigAgents.length} 个 agent`}
+                  value={agentConfigFilter}
+                  onChange={(ev) => setAgentConfigFilter(ev.target.value)}
+                />
+                {/* 按来源分组：能改的（全局 / 本地）在前，内置的只能看，放最后 */}
+                {(['global', 'local', 'built-in'] as const).map((src) => {
+                  const q = agentConfigFilter.trim().toLowerCase();
+                  const group = agentConfigAgents.filter((a) => (a.source || 'global') === src
+                    && (!q || a.name.toLowerCase().includes(q)));
+                  if (!group.length) return null;
                   return (
-                    <button
-                      key={agent.name}
-                      className={`agent-config-agent-item ${agentConfigEditor.agentName === agent.name ? 'active' : ''}`}
-                      onClick={() => void loadAgentConfig(agent.name)}
-                      disabled={agentConfigLoading}
-                      title={agent.source === 'built-in'
-                        ? `${agent.name} is built in and cannot be edited`
-                        : hasUnsavedDraft
-                        ? `${agent.name} has an unsaved in-memory draft`
-                        : `Edit ${agent.name}`}
-                    >
-                      <span className="agent-config-agent-name">
-                        {agent.source === 'built-in' ? '🔒' : '🤖'} {agent.name}
-                      </span>
-                      <span className="agent-config-agent-badges">
-                        {hasUnsavedDraft && <span className="unsaved">Unsaved</span>}
-                        {agent.isDefault && <span className="default">Default</span>}
-                        <span>{agent.source === 'built-in'
-                          ? 'Built-in'
-                          : agent.source === 'global' ? 'Global' : 'Local'}</span>
-                      </span>
-                    </button>
+                    <div key={src} className="agent-config-group">
+                      <div className="agent-config-group-head">
+                        {src === 'built-in' ? '内置（只读）' : src === 'global' ? '全局' : '本项目'}
+                        <span>{group.length}</span>
+                      </div>
+                      {group.map((agent) => {
+                        const draft = agentConfigDrafts[agent.name];
+                        const hasUnsavedDraft = !!draft && !draft.error && draft.content !== draft.initialContent;
+                        return (
+                          <button
+                            key={agent.name}
+                            className={`agent-config-row ${agentConfigEditor.agentName === agent.name ? 'active' : ''} ${src === 'built-in' ? 'readonly' : ''}`}
+                            onClick={() => void loadAgentConfig(agent.name)}
+                            disabled={agentConfigLoading}
+                            title={src === 'built-in' ? `${agent.name} 是内置的，不能改` : agent.name}
+                          >
+                            <span className="agent-config-row-name">{agent.name}</span>
+                            {hasUnsavedDraft && <span className="agent-config-row-dirty" title="有未保存的改动" />}
+                            {agent.isDefault && <span className="agent-config-row-default">默认</span>}
+                          </button>
+                        );
+                      })}
+                    </div>
                   );
                 })}
               </aside>
@@ -4302,9 +4335,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 {agentConfigLoading ? (
                   <div className="agent-config-editor-message">Loading configuration…</div>
                 ) : agentConfigEditor.error ? (
-                  <div className="agent-config-editor-message error">
-                    <IconRobot size={22} />
-                    <strong>This Agent cannot be edited</strong>
+                  <div className="agent-config-readonly-note">
+                    <strong>这个 agent 不能在这里改</strong>
                     <span>{agentConfigEditor.error}</span>
                   </div>
                 ) : (
@@ -4408,6 +4440,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 {agentConfigSaving ? 'Saving…' : 'Save'}
               </button>
             </div>
+            </>) : (() => {
+              const cat = kiroConfigCats.find((c) => c.id === agentConfigTab);
+              /* key = 类别：换 tab 就换一个实例，上一个 tab 的草稿随之丢掉（关闭即丢弃那条规则） */
+              return cat
+                ? <KiroConfigPanel key={cat.id} sessionId={currentSessionId || undefined} category={cat} onClose={closeAgentConfig} />
+                : null;
+            })()}
           </div>
         </>,
         document.body,
