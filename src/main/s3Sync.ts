@@ -84,7 +84,17 @@ export interface SyncConfig {
 }
 
 /** 状态文件里一条记录。 */
-export interface FileState { size: number; mtimeMs: number }
+export interface FileState {
+  size: number;
+  mtimeMs: number;
+  /**
+   * 记忆文件专用：上一次同步时**桶里那份**是什么样（S3 的 LastModified 毫秒 + 大小）。
+   * 没有它就分不清"桶里那份是别的机器改的"还是"就是我自己上次传的" —— 而那正是
+   * "谁新用谁"要回答的问题。`remoteAt` 为 0 = 刚传上去、还没从列表里读到服务器时间（见 `decideMemory`）。
+   */
+  remoteAt?: number;
+  remoteSize?: number;
+}
 export type SyncState = Record<string, FileState>;
 
 /** 目录里那条会话在 S3 上的 key 前缀。 */
@@ -184,6 +194,44 @@ export function memoryRelsFor(root: string, sessionIds: string[], projects: stri
  * 所以"本地的原样保留，备份里有而本地没有的行按原顺序补在后面"是不丢东西的那个答案：
  * 本机后来教的不会被一份旧备份盖掉，备份里有的也都回来了。比较按去掉首尾空白的整行，空行不算。
  */
+/**
+ * **记忆怎么同步：谁新用谁，本机第一次先拉** ——「记忆不必合并，只要自己的是最新的就可以上传。
+ * 第一次同步的时候确保先拉而不是传空的就行」。
+ *
+ * 实测撞过的那件事：Windows 是新装的，记忆文件是刚建出来的空壳，mtime 是"现在" —— 按文件时间比，
+ * 它们比桶里 Mac 传的真记忆**更新**，于是一同步就把 22 KB 的 Dev 记忆盖成了 23 字节。
+ * 所以"新"不能按 mtime 跟桶比，要按"**自上次同步以来谁动过**"：
+ *
+ *   · 本机从没同步过这一份（`last` 为空）：桶里有就**拉**；桶里没有才传。
+ *   · 只有本机动过 → 传；只有桶里动过（别的机器传的）→ 拉。
+ *   · 两边都动过 → 时间新的那边赢（本机 mtime 对桶的 LastModified）。
+ *   · 都没动 → 什么都不做。
+ *
+ * "桶里动过"的判据：记着上次看到的 LastModified 就比它；刚传完还没读到（`remoteAt` 为 0）就比大小 ——
+ * 不拿本机时钟去比服务器时钟，两边差一秒就会把自己刚传的当成"别人改的"再拉回来。
+ */
+export function decideMemory(
+  local: { size: number; mtimeMs: number } | undefined,
+  remote: { size: number; at: number } | undefined,
+  last: FileState | undefined,
+): 'pull' | 'upload' | 'none' {
+  if (!last) {
+    if (remote) return 'pull';
+    return local ? 'upload' : 'none';
+  }
+  if (!local && !remote) return 'none';
+  if (!local) return 'pull';                       // 本机被删了但桶里有：拉回来（删记忆该在界面里删，不是靠同步）
+  const localChanged = local.size !== last.size || Math.floor(local.mtimeMs) !== last.mtimeMs;
+  if (!remote) return 'upload';                    // 桶里没有（被删了 / 新桶）：传
+  const remoteChanged = last.remoteAt
+    ? remote.at > last.remoteAt
+    : remote.size !== (last.remoteSize ?? last.size);
+  if (localChanged && !remoteChanged) return 'upload';
+  if (!localChanged && remoteChanged) return 'pull';
+  if (localChanged && remoteChanged) return local.mtimeMs >= remote.at ? 'upload' : 'pull';
+  return 'none';
+}
+
 /**
  * 项目记忆在 mark 表里的键。和会话 id 共用一张表（`s3-session-sync.json`）——
  * 加 `memory:` 前缀，会话 id 永远不会以它开头，所以不会撞。

@@ -450,7 +450,10 @@ describe('冲突检测与失败退避（借 Tabby 的做法）', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf('async function runS3Sync');
     const body = M.slice(at, M.indexOf('rescheduleS3Sync', at));
-    assert.ok(body.indexOf('detectConflicts(') < body.indexOf('for (const rel of plan.upload)'));
+    /* 上传循环现在遍历 uploadList（记忆从 plan.upload 里拿出来单独决定之后的那份） */
+    const loop = body.indexOf('for (const rel of uploadList)');
+    assert.ok(loop > 0, '找不到上传循环');
+    assert.ok(body.indexOf('detectConflicts(') < loop);
     /* 冲突的那几条不进 catalog：它们在 conflicts/ 下，让 catalog 指向它们就是把"可恢复"说错了 */
     assert.match(body, /freshEntries\.filter\(\(e\) => !conflictIds\.has\(e\.id\)\)/);
   });

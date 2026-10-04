@@ -1,46 +1,57 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
-import { mergeMemoryText, projectMemoryMarkKey } from '../src/main/s3Sync.ts';
+import { decideMemory, projectMemoryMarkKey } from '../src/main/s3Sync.ts';
 
 /*
-  **记忆上传前先合并桶里那份** —— 实测：Windows 首次同步把 Mac 上 22 KB 的 Dev 记忆、5 KB 的 Blog
-  记忆在桶里盖成了 23/24 字节的空壳。会话有冲突检测，记忆没有，上传是"谁最后传谁赢"。
+  **记忆：谁新用谁，本机第一次先拉** ——「记忆不必合并，只要自己的是最新的就可以上传。
+  第一次同步的时候确保先拉而不是传空的就行」。
+  实测撞过：Windows 新装，记忆是刚建的空壳（mtime = 现在），一同步就把桶里 22 KB 的 Dev 记忆盖成 23 字节。
 */
 const M = fs.readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
+const T0 = 1_700_000_000_000;
 
-test('空壳 + 真内容 → 真内容一行不少', () => {
-  const shell = '# Project memory\n';
-  const real = '# Project memory\n\n- 用 brazil-build\n- 别动 prod\n';
-  const merged = mergeMemoryText(shell, real);
-  assert.ok(merged.includes('用 brazil-build') && merged.includes('别动 prod'));
-  /* 反过来（本地是真内容）也不丢 */
-  assert.equal(mergeMemoryText(real, shell), real);
+test('本机第一次同步：桶里有就拉 —— 哪怕本机的 mtime 更新（那正是空壳的样子）', () => {
+  const shell = { size: 23, mtimeMs: T0 + 9_999_999 };      // 新装，刚建出来
+  const real = { size: 22042, at: T0 };
+  assert.equal(decideMemory(shell, real, undefined), 'pull');
+  /* 桶里没有才传 */
+  assert.equal(decideMemory(shell, undefined, undefined), 'upload');
 });
 
-test('上传循环：记忆先读桶里那份、合并、写回本地，再传', () => {
-  const at = M.indexOf('for (const rel of plan.upload)');
-  const body = M.slice(at, at + 4000);
-  const get = body.indexOf('getObjectIfExists(creds!, key)');
-  const merge = body.indexOf('mergeMemoryText(localText');
-  const put = body.indexOf('await putObject(creds!, key, body');
-  assert.ok(get > 0 && merge > get && put > merge, '顺序必须是 读桶 → 合并 → 传');
-  assert.match(body, /fs\.renameSync\(tmp, abs\)/, '合并结果要写回本地（原子写）');
-  /* 读不到桶里那份就跳过这一个 —— 盖掉一份读不到的记忆正是要防的事 */
-  assert.match(body.slice(merge, put), /continue;/);
+test('只有本机动过 → 传；只有桶里动过 → 拉；都没动 → 不动', () => {
+  const last = { size: 100, mtimeMs: T0, remoteAt: T0 + 5, remoteSize: 100 };
+  assert.equal(decideMemory({ size: 120, mtimeMs: T0 + 60_000 }, { size: 100, at: T0 + 5 }, last), 'upload');
+  assert.equal(decideMemory({ size: 100, mtimeMs: T0 }, { size: 130, at: T0 + 90_000 }, last), 'pull');
+  assert.equal(decideMemory({ size: 100, mtimeMs: T0 }, { size: 100, at: T0 + 5 }, last), 'none');
 });
 
-test('项目记忆的 mark 键不会和会话 id 撞', () => {
+test('两边都动过 → 时间新的那边赢', () => {
+  const last = { size: 100, mtimeMs: T0, remoteAt: T0 + 5, remoteSize: 100 };
+  assert.equal(decideMemory({ size: 110, mtimeMs: T0 + 200_000 }, { size: 130, at: T0 + 100_000 }, last), 'upload');
+  assert.equal(decideMemory({ size: 110, mtimeMs: T0 + 100_000 }, { size: 130, at: T0 + 200_000 }, last), 'pull');
+});
+
+test('刚传完还没读到服务器时间时按大小判 —— 不拿本机时钟比服务器时钟', () => {
+  /* remoteAt=0：上一轮刚传。桶里那份 LastModified 必然比本机 mtime 晚，按时间比会把自己刚传的当成别人改的 */
+  const justUploaded = { size: 100, mtimeMs: T0, remoteAt: 0, remoteSize: 100 };
+  assert.equal(decideMemory({ size: 100, mtimeMs: T0 }, { size: 100, at: T0 + 3_000 }, justUploaded), 'none');
+  /* 大小变了才算别人改过 */
+  assert.equal(decideMemory({ size: 100, mtimeMs: T0 }, { size: 140, at: T0 + 3_000 }, justUploaded), 'pull');
+});
+
+test('接线：不再合并；读不到桶里列表就一份记忆都不传', () => {
+  assert.equal(/mergeMemoryText\(localText/.test(M), false, '同步路径上不该再有合并');
+  assert.match(M, /const action = decideMemory\(local, remote, state\[rel\]\);/);
+  assert.match(M, /if \(memListed\) \{/);
+  assert.match(M, /\.\.\.plan\.upload\.filter\(\(r\) => !isMemoryRel\(r\)\),\s*\.\.\.memUpload,/);
+  /* 拉之前把被换掉的那份挪进 trash */
+  assert.match(M, /memory-pull-\$\{Date\.now\(\)\}/);
+});
+
+test('项目记忆的 mark 键不会和会话 id 撞；两页都显示记忆状态', () => {
   assert.equal(projectMemoryMarkKey('Dev'), 'memory:projects/Dev');
-  assert.equal(projectMemoryMarkKey('Dev').startsWith('s_'), false);
-});
-
-test('两页都显示项目记忆的状态', () => {
   const UI = fs.readFileSync(new URL('../src/renderer/components/BackupDialog.tsx', import.meta.url), 'utf8');
-  assert.match(UI, /记忆 \{memSize\(p\.memory\.bytes\)\}/, '同步页');
-  assert.match(UI, /bucketMemory\[proj\]/, '恢复页');
-  /* 空壳要一眼看得出来 —— kb() 会把 23 B 写成 1 KB */
-  assert.match(UI, /EMPTY_MEMORY_BYTES/);
-  assert.match(M, /memory: memoryOf\(v\.project\)/);
-  assert.match(M, /memoryByProject,/);
+  assert.match(UI, /记忆 \{memSize\(p\.memory\.bytes\)\}/);
+  assert.match(UI, /bucketMemory\[proj\]/);
 });
