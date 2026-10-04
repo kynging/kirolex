@@ -20,7 +20,12 @@ const DEV_HOT = fs.readFileSync(
 
 describe('强杀走进程组', () => {
   test('electron 以 detached 启动 —— 不这样它就不是组长，负号 pid 无从下手', () => {
-    assert.match(DEV_HOT, /bin\('electron'\), \['\.', '--dev'\], \{ detached: true \}/);
+    assert.match(DEV_HOT, /runTool\('electron', \['\.', '--dev'\], \{ detached: true \}\)/);
+  });
+
+  test('Windows 不经 .cmd shim 起子进程 —— 新版 Node 对 .cmd 直接 spawn EINVAL', () => {
+    assert.match(DEV_HOT, /function tool\(name\)/);
+    assert.doesNotMatch(DEV_HOT, /\brun\('(vite|tsc|electron)', bin\(/);
   });
 
   test('升级路径杀的是组，不是单个 child', () => {

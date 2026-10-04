@@ -29,7 +29,29 @@ const root = path.resolve(path.dirname(fileURLToPath(import.meta.url)), '..');
  *  spawning the bare name fails with EACCES/ENOENT and `npm run dev:hot` never
  *  starts. */
 const bin = (name) => path.join(root, 'node_modules', '.bin', process.platform === 'win32' ? `${name}.cmd` : name);
+
+/** How to start a tool: `[command, leadingArgs]`.
+ *
+ *  Windows does NOT go through the `.cmd` shim: since the CVE-2024-27980 fix (Node
+ *  18.20.2 / 20.12.2 and later) `spawn()` refuses `.cmd`/`.bat` without `shell: true`
+ *  and throws `spawn EINVAL` synchronously, so `npm run dev:hot` died on the first
+ *  line. `shell: true` would put every argument through cmd.exe quoting, so instead
+ *  run the tool's own entry point with this Node, and Electron as the real
+ *  `electron.exe` -- which also means killing the child kills Electron itself rather
+ *  than a launcher in front of it. */
+const ENTRY = { vite: ['vite', 'bin', 'vite.js'], tsc: ['typescript', 'bin', 'tsc'] };
+function tool(name) {
+  if (process.platform !== 'win32') return [bin(name), []];
+  if (name === 'electron') {
+    const dir = path.join(root, 'node_modules', 'electron');
+    return [path.join(dir, 'dist', fs.readFileSync(path.join(dir, 'path.txt'), 'utf8').trim()), []];
+  }
+  return [process.execPath, [path.join(root, 'node_modules', ...ENTRY[name])]];
+}
+const runTool = (name, args, opts) => { const [cmd, pre] = tool(name); return run(name, cmd, [...pre, ...args], opts); };
 const MAIN_OUT = path.join(root, 'dist', 'main');
+/** Windows-only graceful-quit channel; must match DEV_QUIT_REQUEST in src/main/index.ts. */
+const DEV_QUIT_REQUEST = path.join(os.homedir(), '.kirolex', 'dev-quit-request');
 /** Matches the main process's exit code for "another instance owns the lock". */
 const EXIT_ALREADY_RUNNING = 42;
 const DEV_PORT = Number(process.env.KIROLEX_DEV_PORT || 5173);
@@ -62,11 +84,11 @@ function run(name, cmd, args, opts = {}) {
 
 // ---------------------------------------------------------------- renderer (HMR)
 log('vite', 'starting renderer dev server (HMR) on :5173');
-run('vite', bin('vite'), []);
+runTool('vite', []);
 
 // ------------------------------------------------------------ main (tsc --watch)
 log('tsc', 'watching src/main for changes');
-run('tsc', bin('tsc'), ['-p', 'tsconfig.main.json', '--watch', '--preserveWatchOutput']);
+runTool('tsc', ['-p', 'tsconfig.main.json', '--watch', '--preserveWatchOutput']);
 
 // ---------------------------------------------------------------------- electron
 let electron = null;
@@ -90,12 +112,19 @@ function startElectron() {
    * 优雅路径不受影响：SIGTERM 照旧发给启动器，由它转发，main 走 app.quit() 正常释放
    * kiro-cli 的会话锁。detached 只改变「组」的归属，不改变信号往哪送。
    */
-  electron = run('electron', bin('electron'), ['.', '--dev'], { detached: true });
+  electron = runTool('electron', ['.', '--dev'], { detached: true });
   const started = Date.now();
   electron.on('exit', (code, signal) => {
     electron = null;
     if (shuttingDown) return;
-    if (restarting) { restarting = false; startElectron(); return; }
+    if (restarting) {
+      restarting = false;
+      // Windows: the old instance's network-service process outlives the main one by
+      // a moment and still holds the --dev CDP port (9222), so an immediate relaunch
+      // came up with no debug port at all. A short pause lets it go.
+      setTimeout(startElectron, process.platform === 'win32' ? 1500 : 0);
+      return;
+    }
     // 42 = another instance owns the single-instance lock. Retrying can never
     // succeed, and doing so silently is how a stale instance turned into "the app
     // will not start". Name it and stop.
@@ -132,13 +161,18 @@ function restartElectron(reason) {
   // stale session lock behind and the next session/load fails with
   // "Session is active in another process (PID n)".
   //
-  // KNOWN LIMITATION on Windows: there are no POSIX signals, so Node implements
-  // kill() as an immediate TerminateProcess -- main never runs app.quit() and the
-  // kiro-cli children are orphaned with their session locks still held. A hot
-  // restart there therefore costs the session locks until those processes are
-  // reaped. Fixing it needs an explicit "please quit" IPC/window message instead of
-  // a signal; not done, and it only affects `dev:hot`, not a normal launch.
-  electron.kill('SIGTERM');
+  // Windows has no POSIX signals: Node implements kill() as an immediate
+  // TerminateProcess, so main would never run app.quit() and the kiro-cli children
+  // would be orphaned with their session locks held -- every local chat then fails
+  // `session/load` after the relaunch. So there the request goes through a FILE that
+  // main polls under --dev (DEV_QUIT_REQUEST in src/main/index.ts); the escalation
+  // below is still the backstop if main does not exit.
+  if (process.platform === 'win32') {
+    try { fs.writeFileSync(DEV_QUIT_REQUEST, String(Date.now())); }
+    catch (err) { log('electron', `could not write quit request (${err.message}) -- killing instead`); electron.kill('SIGTERM'); }
+  } else {
+    electron.kill('SIGTERM');
+  }
   const child = electron;
   const pid = child.pid;
   // Escalation must test whether the process is STILL ALIVE, not `child.killed`:
@@ -206,7 +240,18 @@ function turnInFlight() {
     // "running" forever (396 received vs 219 done in a real log), so EVERY
     // main-process rebuild was deferred the full 10 minutes for turns that had
     // already failed minutes or hours earlier.
-    const log = path.join(os.homedir(), '.kirolex', 'logs', 'main.log');
+    // main writes ONE FILE PER LAUNCH now (`main-<YYYYMMDD-HHMMSS>.log`, see
+    // src/main/logger.ts); this still read the old `main.log`, which no longer
+    // exists -- so the catch below answered "nothing running" every time and a
+    // main-process rebuild restarted Electron in the middle of a turn. The running
+    // Electron's file is the newest one (by mtime: a same-second `-1` suffix sorts
+    // BEFORE the plain name).
+    const dir = path.join(os.homedir(), '.kirolex', 'logs');
+    const log = fs.readdirSync(dir)
+      .filter((f) => /^main-\d{8}-\d{6}(-\d+)?\.log$/.test(f))
+      .map((f) => path.join(dir, f))
+      .sort((a, b) => fs.statSync(b).mtimeMs - fs.statSync(a).mtimeMs)[0];
+    if (!log) return null;
     const size = fs.statSync(log).size;
     const start = Math.max(0, size - 200_000);
     const fd = fs.openSync(log, 'r');
@@ -225,16 +270,31 @@ function turnInFlight() {
   } catch { return null; }
 }
 
-async function restartWhenIdle(reason) {
-  for (let waited = 0; waited <= 600; waited += 5) {
+/** A restart already waiting for the turn to end. Every recompile used to start its
+ *  OWN waiting loop: a turn that ran 8 minutes while main was edited three times
+ *  had three loops polling side by side, and each would fire its own restart once
+ *  the turn ended -- the second one killing the freshly started Electron. Later
+ *  changes just ride the pending one (the restart loads whatever is on disk then). */
+let pendingRestart = null;
+function restartWhenIdle(reason) {
+  if (pendingRestart) { log('electron', `also changed: ${reason} -- folded into the pending restart`); return pendingRestart; }
+  pendingRestart = waitIdleThenRestart(reason).finally(() => { pendingRestart = null; });
+  return pendingRestart;
+}
+
+/** No time cap any more. It used to restart anyway after 10 minutes -- which is exactly
+ *  the case this supervisor exists for: a chat editing KiroLex itself runs long turns,
+ *  and the forced restart cut two of them off mid-task (the resend then started the
+ *  task over). A turn that never ends is caught by main's own WEDGED detection; a
+ *  rebuild can wait for it. */
+async function waitIdleThenRestart(reason) {
+  for (let waited = 0; ; waited += 5) {
     const busy = turnInFlight();
     if (!busy) { restartElectron(reason); return; }
     if (waited === 0) log('electron', `main changed but a turn is running (${busy.join(', ')}) -- deferring restart until it finishes`);
     if (waited && waited % 60 === 0) log('electron', `still waiting for ${busy.join(', ')} (${waited}s)`);
     await new Promise((r) => setTimeout(r, 5000));
   }
-  log('electron', 'turn still running after 10 min -- restarting anyway');
-  restartElectron(reason);
 }
 
 function watchMainOutput() {
@@ -260,7 +320,11 @@ function watchMainOutput() {
 function shutdown(code) {
   if (shuttingDown) return;
   shuttingDown = true;
-  for (const child of owned) { try { child.kill('SIGTERM'); } catch {} }
+  /* Windows：kill 就是 TerminateProcess，Electron 来不及释放 kiro-cli 的会话锁 —— 先走退出请求文件，
+     给它几秒正常退出（见 restartElectron），下面那层兜底仍然在。 */
+  const win = process.platform === 'win32' && !!electron;
+  if (win) { try { fs.writeFileSync(DEV_QUIT_REQUEST, String(Date.now())); } catch {} }
+  for (const child of owned) { if (win && child === electron) continue; try { child.kill('SIGTERM'); } catch {} }
   /**
    * Electron 那个是 detached 的（为了强杀时能整组杀），所以它**不会**因为 dev-hot 退出而自己死。
    * 上面的 SIGTERM 已经发给启动器、由它转发让 main 走 app.quit()；这里再兜一层：500ms 后如果它还
@@ -275,7 +339,7 @@ function shutdown(code) {
       try { process.kill(-stray, 'SIGKILL'); } catch { try { process.kill(stray, 'SIGKILL'); } catch {} }
     }
     process.exit(code);
-  }, 500);
+  }, win ? 6000 : 500);
 }
 process.on('SIGINT', () => shutdown(0));
 process.on('SIGTERM', () => shutdown(0));

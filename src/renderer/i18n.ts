@@ -289,10 +289,6 @@ const ZH: Record<string, string> = {
   'Font (text)': '字体（正文）',
   'Font (code)': '字体（代码）',
   'Custom…': '自定义…',
-  "A custom font stack, e.g. 'PingFang SC', 'Segoe UI', sans-serif":
-    "自定义字体栈，例如 'PingFang SC', 'Segoe UI', sans-serif",
-  "A custom mono font stack, e.g. 'JetBrains Mono', Menlo, monospace":
-    "自定义等宽字体栈，例如 'JetBrains Mono', Menlo, monospace",
   '1 × 1 (no split)': '1 x 1（不分屏）',
   '1 row × 2 cols (side by side)': '1 行 x 2 列（左右）',
   '2 rows × 1 col (stacked)': '2 行 x 1 列（上下）',

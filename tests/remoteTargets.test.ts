@@ -17,7 +17,8 @@ describe('可选远端的解析', () => {
     assert.equal(t.id, 'tokyo');
     assert.equal(t.label, 'tokyo-ec2');
     assert.equal(t.sshPort, 22);
-    assert.equal(t.identityFile, '/home/me/k.pem', '配置里写 ~ 的人不该因此连不上');
+    /* 用本机的分隔符拼（identityFile 是给本机 ssh 读的）：Windows 上是 `\home\me\k.pem` */
+    assert.equal(t.identityFile, path.join('/home/me', 'k.pem'), '配置里写 ~ 的人不该因此连不上');
   });
 
   test('**兼容读**老的 agents[].remote —— 用户配置里现在就是这个形状', () => {
@@ -89,10 +90,28 @@ describe('接线：主进程', () => {
     assert.equal(/loadActiveRemoteTarget\(/.test(M), false, '全局开关那条路必须断掉，否则"共存"是假的');
   });
 
-  test('flag 关着时列表是空的 —— 界面据此完全不显示目标选择', () => {
+  test('flag 关着：设置页照样看得到已配的机器，新建会话那边看不到、主进程也不建', () => {
     const at = M.indexOf("ipcMain.handle('app:remote-targets'");
     assert.ok(at > 0);
-    assert.match(M.slice(at, at + 400), /if \(!isFeatureEnabled\('remoteSessions'\)\) return \{ enabled: false, targets: \[\] \};/);
+    const body = M.slice(at, at + 900);
+    /* 原来关着就回空列表，设置页于是永远看不到刚存的那台，人就一次次重加（实测攒了 4 条同 IP） */
+    assert.doesNotMatch(body, /return \{ enabled: false, targets: \[\] \}/);
+    assert.match(body, /enabled: isFeatureEnabled\('remoteSessions'\),/);
+    /* 新建会话的选项只在开着时给 */
+    const hook = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useRemoteTargets.ts'), 'utf8');
+    assert.match(hook, /targets: r\.enabled && Array\.isArray\(r\.targets\) \? r\.targets : \[\]/);
+    /* 真正的闸在主进程：关着时 new-session 不认 remoteId */
+    assert.match(M, /const remote = isFeatureEnabled\('remoteSessions'\)\s*\? findRemoteTarget\(KIROLEX_CONFIG_PATH, remoteId\)/);
+  });
+
+  test('远程会话默认开；新建对话的机器列表随设置页的增删就地刷新，不用重启', () => {
+    /* 「为什么加了远程机器还没有切换到远程会话的选项」 */
+    assert.match(M, /^\s*remoteSessions: true,$/m);
+    const hook = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useRemoteTargets.ts'), 'utf8');
+    assert.match(hook, /window\.addEventListener\(REMOTE_TARGETS_CHANGED, load\);/);
+    assert.match(hook, /window\.addEventListener\('focus', load\);/);
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.equal((RS.match(/notifyRemoteTargetsChanged\(\)/g) || []).length, 2, '存和删都要通知');
   });
 
   test('找不到那个 id 就不建会话（**不猜**一台机器）', () => {
@@ -178,7 +197,7 @@ describe('在界面上加/改/删一台远端', () => {
     assert.equal(saved.id, 'tokyo-ec2', 'id 可读，不是时间戳');
     /* `~` 存原样（配置里更可读），读的时候才展开 */
     assert.equal(cfg.remotes[0].identityFile, '~/k.pem');
-    assert.match(saved.identityFile!, /^\//, '读出来的是展开后的绝对路径');
+    assert.ok(path.isAbsolute(saved.identityFile!), '读出来的是展开后的绝对路径');   // Windows 上是 C:\…，不以 / 开头
   });
 
   test('同名再存一条 id 不撞；带 id 是改而不是新增', async () => {
@@ -260,7 +279,10 @@ describe('一键装齐远端依赖', () => {
     assert.match(SH, /install\.sh' --no-confirm|install\.sh" --no-confirm/);
     assert.match(SH, /@anthropic-ai\/claude-code/);
     assert.match(SH, /@openai\/codex/);
-    assert.match(SH, /@zed-industries\/claude-code-acp/, 'KiroLex 走 ACP，claude code 要靠它当执行器');
+    /* KiroLex 走 ACP：远端 Claude Code / Codex 会话起的就是这两个命令（engines.ts 的 REMOTE_ADAPTER_BIN） */
+    assert.match(SH, /npm_i '@agentclientprotocol\/claude-agent-acp' claude-agent-acp/);
+    assert.match(SH, /npm_i '@agentclientprotocol\/codex-acp' codex-acp/);
+    assert.doesNotMatch(SH, /^npm_i '@zed-industries/m, '改名停更的老包不再装');
     for (const b of ['git', 'unzip']) assert.ok(SH.includes(b), `缺 ${b}`);
     /* rsync 不再装：镜像和 agent 同步都没了，远端没有任何东西用它 */
     assert.equal(/for b in rsync/.test(SH), false);
@@ -328,7 +350,7 @@ describe('一键装齐远端依赖', () => {
 
   test('接线：按钮在设置里，且只有你按才会跑（没有自动触发）', () => {
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
-    assert.match(RS, />\{installing \? '安装中…' : '安装依赖'\}</);
+    assert.match(RS, />\{installing \? '安装中…' : '安装 AI 工具'\}</);
     assert.match(RS, /remoteBootstrap\?\.\(/);
     assert.match(RS, /className="remote-log"/, '输出要看得见');
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
@@ -364,11 +386,11 @@ describe('远端机器那一块的形状', () => {
     assert.match(RS, /\+ 添加一台机器…/);
     /* 上一版每行四个按钮，实测只有 43–63px 宽，机器一多就是一片按钮 */
     assert.equal(/className="remote-row"/.test(RS), false, '行式列表已经换掉了');
-    /* 同一时刻只在编辑一台，所以**机器级**的动作按钮只有一组（测试连接 / 安装依赖 / 删除）。
+    /* 同一时刻只在编辑一台，所以**机器级**的动作按钮只有一组（测试连接 / 安装 AI 工具 / 删除）。
        每个工具自己那个「测试」是另一件事 —— 它问的是"这条命令能不能起来"，不是"这台机器连不连得上"。 */
     assert.equal((RS.match(/>测试连接</g) || []).length, 1);
-    assert.equal((RS.match(/>安装依赖</g) || []).length, 0, '安装依赖那个按钮带状态文案');
-    assert.match(RS, /\{installing \? '安装中…' : '安装依赖'\}/);
+    assert.equal((RS.match(/>安装 AI 工具</g) || []).length, 0, '安装 AI 工具那个按钮带状态文案');
+    assert.match(RS, /\{installing \? '安装中…' : '安装 AI 工具'\}/);
   });
 
   test('密钥用 Finder 选，不让人手写路径', () => {
@@ -418,11 +440,32 @@ describe('侧栏那个 🌐 徽标真的到得了界面', () => {
   });
 
   test('徽标在右侧那排的**最末**，紧挨删除按钮', () => {
-    const at = SB.indexOf('{session.remoteHost && (');
+    /* 切换中那个 ⏳ 版本和真 tag 是同一格（见 Sidebar 的 pendingTargets） */
+    const at = SB.indexOf('{pendingTarget !== undefined ? (');
     const del = SB.indexOf('className="session-delete-btn"');
     assert.ok(at > 0 && del > at, '顺序：… → 🌐 → ✕');
     /* 中间不许再插别的 tag */
     assert.equal(/session-(crew|schedule)/.test(SB.slice(at, del)), false);
+  });
+
+  test('同一组里拖动能调顺序，而且重启后还在', () => {
+    /* 「现在拖拽会话不能调整其前后顺序，这个不对」 */
+    assert.match(SB, /onReorderSessions\?\.\(arrayMove\(sessions, from, to\)\);/);
+    assert.doesNotMatch(SB, /if \(\(dragged\.projectId \?\? null\) === targetProject\) return; \/\/ no change/);
+    const app = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+    assert.match(app, /onReorderSessions=\{reorderSessions\}/);
+    /* 水化不再把整份列表按时间重排 —— 只有新冒出来的按时间放最前 */
+    const hook = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+    assert.match(hook, /\.\.\.kept\.filter\(\(s\) => known\.has\(s\.id\)\),/);
+  });
+
+  test('点了「运行位置」立刻挂上 ⏳ tag，结束（成功或失败）就撤掉', () => {
+    /* 「点切换了之后没有立刻打上 tag」：真 tag 要等远端探完、执行器起完才来 */
+    const at = SB.indexOf('const onSetTarget = async');
+    const body = SB.slice(at, at + 900);
+    assert.ok(body.indexOf('setPendingTarget(sessionId, remoteId ?') < body.indexOf('api.setRemoteTarget(sessionId, remoteId)'), '先挂 tag 再等 IPC');
+    assert.match(body, /\.finally\(\(\) => setPendingTarget\(sessionId, undefined\)\)/);
+    assert.match(SB, /⏳ \{pendingTarget \|\| '本地'\}/);
   });
 
   test('它和"此刻在发生什么"分开：身份固定，状态会来会走', () => {
@@ -637,7 +680,8 @@ describe('远端配置自动保存（没有保存按钮）', () => {
   });
 
   test('**空 sshHost 不存** —— 那不是一台机器，存下去只会得到一条废配置', () => {
-    assert.match(RS, /if \(!draft \|\| !draft\.sshHost\.trim\(\)\) return;/);
+    /* 用户名单独一栏之后，"只填了用户名"（sshHost = "user@"）也算空 */
+    assert.match(RS, /if \(!draft \|\| !splitSshHost\(draft\.sshHost\)\.host\.trim\(\)\) return;/);
   });
 
   test('**签名比对** —— 只是切换/打开时不该写盘', () => {
@@ -647,11 +691,9 @@ describe('远端配置自动保存（没有保存按钮）', () => {
   });
 
   test('**新建那条存完要认领 id** —— 否则改个名字就多出来一台机器', () => {
-    const at = RS.indexOf('if (!draft.id) {');
-    assert.ok(at > 0);
-    const body = RS.slice(at, at + 400);
-    assert.match(body, /setDraft\(\(d\) => \(d \? \{ \.\.\.d, id: saved\.id \} : d\)\)/);
-    assert.match(body, /setPicked\(saved\.id\)/);
+    /* 每次存完都认领（顺带把「清除密码」这个待办清掉），第一次存完还要把下拉切到它 */
+    assert.match(RS, /setDraft\(\(d\) => \(d \? \{ \.\.\.d, id: saved\.id, clearPassword: false, hasPassword: saved\.hasPassword \} : d\)\);/);
+    assert.match(RS, /if \(!draft\.id\) setPicked\(saved\.id\);/);
   });
 
   test('存完就地更新列表，**不走 reload** —— reload 会打断正在打字的输入', () => {
@@ -709,10 +751,111 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
 
   test('输入框都有常驻标签 —— placeholder 一打字就没了', () => {
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
-    for (const label of ['名字', 'SSH 地址', '端口', '私钥', '远端目录']) {
+    for (const label of ['名称', 'IP 地址', '用户名', '端口', '私钥', '工作目录']) {
       assert.ok(RS.includes(`label="${label}"`), `缺标签 ${label}`);
     }
     assert.match(RS, /const Field: React\.FC</);
+  });
+
+  test('要填的框都不放示例 placeholder ——「不要加示例」', () => {
+    const read = (f: string): string => fs.readFileSync(path.join(process.cwd(), 'src/renderer/components', f), 'utf8');
+    /* 灰字示例扫一眼分不出"没填"和"填的就是这个"；空输入框本身就说明"没填" */
+    assert.equal(/placeholder=/.test(read('RemoteSettings.tsx')), false, '机器设置');
+    assert.equal(/placeholder=\{t\("A custom (mono )?font stack/.test(read('SettingsDialog.tsx')), false, '自定义字体');
+    assert.equal(/placeholder="09:00"/.test(read('ChatArea.tsx')), false, '定时任务的时间');
+    for (const f of ['RemoteSettings.tsx', 'SettingsDialog.tsx', 'ChatArea.tsx', 'BackupSettings.tsx', 'KiroConfigPanel.tsx']) {
+      assert.equal(/placeholder=[^\n]*(例如|比如|e\.g\.)/.test(read(f)), false, `${f} 里还有示例 placeholder`);
+    }
+  });
+
+  test('打开设置默认显示：没有远端 = 本机，有就是最近编辑的那台，而不是「添加一台」', async () => {
+    const { defaultPick, LOCAL } = await import('../src/renderer/remotePick.ts');
+    assert.equal(defaultPick([]), LOCAL);
+    assert.equal(defaultPick([{ id: 'a', editedAt: 5 }, { id: 'b', editedAt: 9 }, { id: 'c', editedAt: 1 }]), 'b');
+    assert.equal(defaultPick([{ id: 'a' }, { id: 'b' }]), 'b', '老配置没有 editedAt：最近加的那台');
+    /* 设置页真的用它，而不是原来那句「第一台，没有就新建」 */
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.match(RS, /: defaultPick\(list\);/);
+    assert.doesNotMatch(RS, /list\[0\]\?\.id \|\| NEW/);
+  });
+
+  test('存一条会盖上 editedAt，读回来还在', async () => {
+    const { saveRemoteTarget, listRemoteTargets } = await import('../src/main/remoteTargets.ts');
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'edited-')), 'config.json');
+    fs.writeFileSync(f, '{}');
+    const before = Date.now();
+    saveRemoteTarget(f, { label: 'x', sshHost: 'u@h' });
+    const [t] = listRemoteTargets(f);
+    assert.ok((t.editedAt || 0) >= before);
+  });
+
+  test('界面上没有跳板机 ——「不要它」', () => {
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.equal(RS.includes('label="跳板机"'), false);
+  });
+
+  test('工作目录留空 = 那台机器上的 ~/kirolex（写成绝对路径：用的地方会加引号，引号里的 ~ 不展开）', async () => {
+    const { defaultRemoteWorkdir, sessionCwd } = await import('../src/main/config.ts');
+    assert.equal(defaultRemoteWorkdir('ec2-user@1.2.3.4'), '/home/ec2-user/kirolex');
+    assert.equal(defaultRemoteWorkdir('root@h'), '/root/kirolex');
+    const cwd = sessionCwd({ model: 'm', remote: { enabled: true, sshHost: 'ec2-user@h' } } as any, '/Users/me/blog');
+    assert.match(cwd, /^\/home\/ec2-user\/kirolex\/scratch\/blog-[0-9a-f]{8}$/);
+  });
+
+  test('同 IP 的重复项留**最近编辑的**那条，按旧 id 也能找到它', async () => {
+    const { listRemoteTargets, findRemoteTarget } = await import('../src/main/remoteTargets.ts');
+    /* 实测的那份 config.json：同一台机器被重加了四次，带私钥的是后面几条 */
+    const f = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'dup-')), 'config.json');
+    fs.writeFileSync(f, JSON.stringify({ remotes: [
+      { id: 'aws-tokyo', label: 'aws-tokyo', sshHost: '99.83.165.184', sshPort: 22 },
+      { id: 'aws-tokyo-2', label: 'aws-tokyo', sshHost: '99.83.165.184', sshPort: 22, identityFile: '/k.pem', editedAt: 100 },
+      { id: 'aws-tokyo-3', label: 'aws-tokyo', sshHost: '99.83.165.184', sshPort: 22, editedAt: 200 },
+      { id: 'aws-tokyo-4', label: 'aws-tokyo', sshHost: '99.83.165.184', sshPort: 22, identityFile: '/k.pem', editedAt: 300 },
+    ] }));
+    const list = listRemoteTargets(f);
+    assert.equal(list.length, 1);
+    assert.equal(list[0].id, 'aws-tokyo-4');
+    assert.equal(list[0].identityFile, '/k.pem', '选过的私钥不能被一条更早的空项盖住');
+    assert.equal(findRemoteTarget(f, 'aws-tokyo')?.id, 'aws-tokyo-4', '会话里记着被去重掉的 id 也要能连上');
+    assert.equal(findRemoteTarget(f, 'nope'), undefined);
+  });
+
+  test('界面填进去的 ~/kirolex 也要展开 —— 引号里的 ~ 是一个叫 ~ 的目录', async () => {
+    const { resolveRemoteWorkdir, sessionCwd } = await import('../src/main/config.ts');
+    assert.equal(resolveRemoteWorkdir('~/kirolex', 'ec2-user@h'), '/home/ec2-user/kirolex');
+    assert.equal(resolveRemoteWorkdir('~', 'root@h'), '/root');
+    assert.equal(resolveRemoteWorkdir('/data/kx', 'ec2-user@h'), '/data/kx', '绝对路径原样');
+    assert.equal(resolveRemoteWorkdir(undefined, 'u@h'), '/home/u/kirolex', '没填 = 默认');
+    /* 用户名留空：ssh 用本机用户名登录，家目录也按它算 */
+    assert.equal(resolveRemoteWorkdir('~/kirolex', 'h', 'kyn06'), '/home/kyn06/kirolex');
+    assert.equal(resolveRemoteWorkdir('~/kirolex', 'h', ''), '~/kirolex', '连本机用户名都不知道才原样');
+    const cwd = sessionCwd({ model: 'm', remote: { enabled: true, sshHost: 'ec2-user@h', remoteWorkdir: '~/kirolex' } } as any, '/Users/me/blog');
+    assert.match(cwd, /^\/home\/ec2-user\/kirolex\/scratch\//);
+  });
+
+  test('用户名单独一栏，存下去仍然是 用户名@IP', async () => {
+    const { splitSshHost, joinSshHost, DEFAULT_WORKDIR } = await import('../src/renderer/remotePick.ts');
+    assert.deepEqual(splitSshHost('ec2-user@1.2.3.4'), { user: 'ec2-user', host: '1.2.3.4' });
+    assert.deepEqual(splitSshHost('1.2.3.4'), { user: '', host: '1.2.3.4' });
+    assert.equal(joinSshHost('ec2-user', '1.2.3.4'), 'ec2-user@1.2.3.4');
+    assert.equal(joinSshHost('', '1.2.3.4'), '1.2.3.4');
+    assert.equal(DEFAULT_WORKDIR, '~/kirolex');
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.ok(RS.includes('label="用户名"'));
+    /* 只填了用户名（sshHost = "user@"）不算一台机器，不许自动保存 */
+    assert.match(RS, /if \(!draft \|\| !splitSshHost\(draft\.sshHost\)\.host\.trim\(\)\) return;/);
+    assert.match(RS, /remoteWorkdir: DEFAULT_WORKDIR \}/, '新机器的工作目录直接填上默认值');
+  });
+
+  test('「安装 AI 工具」要先测试连接通过，改了连接参数就得重测', async () => {
+    const { connectionKey } = await import('../src/renderer/remotePick.ts');
+    const a = { sshHost: 'u@h', sshPort: 22 };
+    assert.equal(connectionKey(a), connectionKey({ ...a, id: 'x' } as any), '拿到 id 不算改了连接');
+    assert.notEqual(connectionKey(a), connectionKey({ ...a, sshHost: 'v@h' }));
+    assert.notEqual(connectionKey(a), connectionKey({ ...a, identityFile: '/k.pem' }));
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.match(RS, /disabled=\{locked \|\| !canAct \|\| !connVerified\}/);
+    assert.match(RS, /setTestedOk\(r\?\.ok \? tested : ''\)/);
   });
 });
 
@@ -951,7 +1094,9 @@ describe('切换一条已有会话的机器', () => {
        现在侧栏**整个**不碰目录了（见下面「工作目录在会话界面」那一组）。 */
     assert.equal(/remotePickDir/.test(SB), false, '侧栏不该再弹目录选择');
     /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
-    assert.match(SB, /window\.alert\(String\(r\?\.error/);
+    /* 不用 window.alert —— 它是模态的，弹着的时候整个界面都停住；换成不阻塞的提示条 */
+    assert.match(SB, /showToast\(`✗ 切换运行位置失败：/);
+    assert.doesNotMatch(SB, /window\.alert\(/);
   });
 });
 
@@ -988,15 +1133,13 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     assert.match(body, /if \(!oldEntry\) \{/);
     assert.match(body, /这条会话下次打开会跑在\*\*\$\{where\}\*\*上/);
     /* 冷路径只改记录 */
-    assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*rec\.localDirs = nextExtraDirs;\s*\n\s*store\.writeRecord\(rec\);/);
+    assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*store\.writeRecord\(rec\);/);
   });
 
 
   test('两条路都把新位置发给界面（事件里带 remoteHost + 工作目录）', () => {
-    /* 工作目录也在事件里：会话界面上那个 📂 显示的就是它，换完必须当场变 */
-    /* 目录**清单**也在事件里：加/删一个附加目录之后那一排 📂 必须当场变，
-       否则要等下一次会话列表刷新才看得见 —— 看起来就是"点了没反应"。 */
-    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir, localDirs: nextExtraDirs \}/g) || [];
+    /* 工作目录也在事件里：切远端时可以顺带换目录，记录和界面要一起变 */
+    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir \}/g) || [];
     assert.equal(sent.length, 2, `只有 ${sent.length} 处发了完整的新位置`);
   });
 
@@ -1004,9 +1147,9 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
     const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
     assert.match(P, /onTargetsChanged:/);
-    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; localDir\?: string; localDirs\?: string\[\] \}\)/);
-    /* 徽标、右键菜单那句话、会话界面上那个 📂 看的是同一份状态，所以改一处就够 */
-    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, localDir: d\.localDir \|\| s\.localDir, localDirs: d\.localDirs \?\? s\.localDirs \}/);
+    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; localDir\?: string \}\)/);
+    /* 徽标和右键菜单那句话看的是同一份状态，所以改一处就够 */
+    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, localDir: d\.localDir \|\| s\.localDir \}/);
   });
 });
 
@@ -1174,10 +1317,7 @@ describe('工作目录 / 不要推两遍', () => {
 
   test('只换目录也算变化 —— 短路不能只看目标', () => {
     assert.match(M, /const dirChanged = !!localDir/);
-    /* 清单变了同样算：加/删一个附加目录时主目录没动，只看主目录会把这次改动整个吞掉
-       —— 表现是"点了没反应"，而记录和界面还都是旧的。 */
-    assert.match(M, /const listChanged = !!extraDirs/);
-    assert.match(M, /=== currentRemote && !dirChanged && !listChanged\) return \{ ok: true, unchanged: true \};/);
+    assert.match(M, /=== currentRemote && !dirChanged\) return \{ ok: true, unchanged: true \};/);
   });
 });
 
@@ -1194,70 +1334,24 @@ describe('工作目录在会话界面上', () => {
   const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
   const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
 
-  test('输入框下面那一排有一格 📂，显示当前目录、点它换', () => {
-    assert.match(CA, /className="composer-meta-btn composer-workdir"/);
-    assert.match(CA, /i === 0 \? onPickWorkdir\?\.\(\) : undefined/);
-    /* 在**左**那一组里（右边那一组是"此刻在发生什么" + 模型） */
-    const left = CA.indexOf('composer-belowbar-left');
-    const right = CA.indexOf('composer-belowbar-right');
-    const at = CA.indexOf('composer-meta-btn composer-workdir');
-    assert.ok(left > 0 && at > left && at < right, '它属于左边那一组');
-    /* 完整路径在 title 里 —— 这一排很窄，格子里只放 basename */
-    assert.match(CA, /const workdirTitle = `工作目录：\$\{\(!workdir \|\| inSessionDir\) \? '（还没定 —— 点 ＋ 选一个）' : workdir\}`/);
+  /* 「把会话这里的工作目录功能删了」→「把这个功能移除了得了」：界面那一格和主进程那条 IPC 都没了 */
+  test('会话界面上没有 📂 工作目录那一格', () => {
+    assert.doesNotMatch(CA, /composer-meta-btn composer-workdir/);
+    assert.doesNotMatch(CA, /const workdirTitle =/);
+    assert.doesNotMatch(A, /workdir=\{session\?\.localDir\}/);
+    /* 记录里的工作目录照样水化（主进程还在发、远程会话的 cwd 仍以它为准） */
+    assert.match(M, /\.\.\.\(rec\.localDir \? \{ localDir: rec\.localDir \} : null\),/);
   });
 
-  /*
-   * 「我都说了那个按钮不要叫会话目录，就显示实际的工作目录就行，没有就不显示」。
-   *
-   * `~/.kirolex/sessions/<id>` 是没归项目的会话的兜底 cwd —— KiroLex 自己的数据目录，
-   * 里面没有用户的代码。把它当"工作目录"显示是在骗人，标成「会话目录」只是把这个谎换了个说法：
-   * 那一格看起来像"已经有工作目录了"，而实际上这条会话什么项目都没连上。
-   */
-  test('会话自己那个目录**不显示** —— 它不是工作目录', () => {
-    /* 判据挪到 `pathBits.ts` 了（要同时认 `\` —— Windows 上那个目录是反斜杠的） */
-    assert.match(CA, /const isSessionDir = isSessionScratchDir;/);
-    /* 从这一排里滤掉，而不是换个名字 */
-    assert.match(CA, /\.filter\(\(d\) => d && !isSessionDir\(d\)\)/);
-    assert.equal(/'会话目录'/.test(CA), false, '这个名字不许再出现');
-    /* basename 就是 basename，没有特例 */
-    /* basename 也挪到 `pathBits.ts` 了 —— `split('/')` 在 Windows 路径上回的是整条路径 */
-    assert.match(CA, /const dirLabel = baseName;/);
+  test('没有单独换目录的 IPC 了', () => {
+    assert.doesNotMatch(P, /setWorkdir/);
+    assert.doesNotMatch(M, /acp:set-workdir/);
   });
 
-  test('一个真目录都没有时只留那个 ＋（"不显示"指别显示假的当前值）', () => {
-    assert.match(CA, /dirList\.length \? onAddWorkdir\?\.\(\) : onPickWorkdir\?\.\(\)/);
-    assert.match(CA, /选一个工作目录 —— 这条会话现在没有/);
-    /* 不许再有那个占位格 */
-    assert.equal(/'工作目录…'/.test(CA), false);
-  });
-
-  test('值来自会话状态（记录为准），不是渲染层猜的', () => {
-    assert.match(M, /\.\.\.\(rec\.localDir \? \{ localDir: rec\.localDir \} : null\),/, '主进程要发');
-    assert.match(A, /workdir=\{session\?\.localDir\}/, '每一格用它自己那条会话的目录');
-    assert.match(A, /localDir\?: string;/);
-  });
-
-  test('**只换目录不许动机器** —— 单独一个 IPC，当前目标由主进程从记录里取', () => {
-    assert.match(P, /setWorkdir: \(sessionId: string, dir: string \| string\[\]\) =>/);
-    assert.match(M, /ipcMain\.handle\('acp:set-workdir', async \(_event, sessionId: string, dir: string \| string\[\]\) => \{/);
-    /* 关键的一行：机器从记录/执行器来。渲染层手里只有 label，按 label 反查一旦查不到就会传 null，
-       而 null 的意思是"切回本地" —— 只想换个目录，结果把会话从远端切了下来。 */
-    assert.match(M, /const current = sessionClients\.get\(sessionId\)\?\.profile\.remote/);
-    assert.match(M, /current\?\.sshHost \? current : undefined,/);
-    /* 渲染层这条路也不许再碰 setRemoteTarget */
-    const at = A.indexOf('const pickWorkdir');
-    const body = A.slice(at, at + 700);
-    assert.ok(at > 0);
-    assert.match(body, /applyWorkdirs\(sid, picked\.path\)/);
-    assert.equal(/setRemoteTarget/.test(body), false, '换目录不该走换机器那个入口');
-  });
-
-  test('两个 IPC 共用同一段机械（不是把那 140 行抄两遍）', () => {
+  test('切机器只有一段机械，目录跟着切远端那一步走', () => {
     assert.match(M, /const applySessionTarget = async \(/);
     assert.equal((M.match(/const applySessionTarget = async \(/g) || []).length, 1);
     assert.match(M, /return applySessionTarget\(sessionId, target, localDir\);/);
-    /* 换目录那条路多传一个 `extraDirs`，但仍然是同一段机械 */
-    assert.match(M, /Array\.isArray\(dir\) \? list\.slice\(1\) : undefined,/);
   });
 });
 
@@ -1408,7 +1502,7 @@ describe('每台机器（含本机）都能配三个 CLI 的启动命令', () =>
   test('界面：本机和远端**共用同一组字段**，都在同一个下拉里', () => {
     const R = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
     assert.match(R, /const BinFields: React\.FC</);
-    assert.match(R, /<option value=\{LOCAL\}>💻 本机（这台 Mac）<\/option>/);
+    assert.match(R, /<option value=\{LOCAL\}>💻 本机（这台电脑）<\/option>/);
     /* 两处都用它 —— 各写一遍迟早分叉 */
     assert.equal((R.match(/<BinFields /g) || []).length, 2);
     /* claude/codex 现在只存不用，标签上要明说 —— 填了不生效比没有这个框更让人怀疑配置是假的 */

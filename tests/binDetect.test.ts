@@ -204,10 +204,12 @@ describe('接线：检测两台机器共用一段脚本；成功启动才记历�
     assert.deepEqual(binHistory(cfg).local!.kiro, ['/bin/kiro-cli']);
   });
 
-  test('界面：一个「自动检测」按钮 + 每个工具一个「测试」，候选点一下就填进去', () => {
+  test('界面：一个「自动检测」按钮，候选点一下就填进去；每行**没有**「测试」按钮', () => {
     assert.match(R, /自动检测这台机器上的三个工具/);
     assert.match(R, /binsDetect\?\.\(machine\)/);
-    assert.match(R, /binsTest\?\.\(machine, cmd\)/);
+    /* 「启动命令右侧就不要那几个测试按钮了吧」 */
+    assert.doesNotMatch(R, /binsTest\?\./);
+    assert.doesNotMatch(R, /'测试中…' : '测试'/);
     assert.match(R, /onClick=\{\(\) => onChange\(c\.command\)\}/);
     /* **不自动覆盖你已经填的**：只有空着（= 用默认）才替你填第一个能跑的 */
     assert.match(R, /if \(!next\[t\]\) \{ const p = pick\(t\); if \(p\) \{ next\[t\] = p; changed = true; \} \}/);
@@ -225,17 +227,22 @@ describe('设置分页 + 文案', () => {
   const R = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
   const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
 
-  test('机器**单独一页**而且是打开时停的那一页；每一页都接上了', () => {
+  test('机器**单独一页**；外观是第一页、默认页，机器和备份排最后；每一页都接上了', () => {
     /* 页数会长（备份那一页是「定时向 S3 同步」加的），所以不写死数量 —— 只钉住
        "机器是第一页、是默认页"，以及**每一个**声明出来的 tab 都真的接了内容：
        少接一页的表现是"点了那个标签一片空白"，而那种 bug 没有任何报错。 */
     const decl = D.match(/type SettingsTab = ([^;]+);/);
     assert.ok(decl, '没有 SettingsTab 声明');
     const ids = Array.from(decl![1].matchAll(/'([a-z]+)'/g)).map((m) => m[1]);
-    assert.equal(ids[0], 'machines', '机器排第一');
-    /* 默认页仍然是机器，只是现在可以被 `initialTab` 指定 ——
+    /* 「第一个 tab 应该是外观然后是会话，远程和备份应该放在最后」 */
+    const order = Array.from(D.slice(D.indexOf('const TABS'), D.indexOf('];', D.indexOf('const TABS'))).matchAll(/id: '([a-z]+)'/g)).map((m) => m[1]);
+    assert.deepEqual(order.slice(0, 2), ['appearance', 'session']);
+    /* 登录不在设置里了：在会话左下角那个机器人面板里（Claude Code / Codex 会话） */
+    assert.deepEqual(order.slice(-2), ['machines', 'backup']);
+    assert.deepEqual([...order].sort(), [...ids].sort(), '声明的每一页都在标签栏里');
+    /* 默认页是外观；仍然可以被 `initialTab` 指定 ——
        侧栏那个 ☁️ 要直接落到备份页（「这个同步应该在左侧下方有一个入口按钮」）。 */
-    assert.match(D, /useState<SettingsTab>\(initialTab \|\| 'machines'\)/);
+    assert.match(D, /useState<SettingsTab>\(initialTab \|\| 'appearance'\)/);
     assert.match(D, /initialTab\?: SettingsTab;/);
     assert.match(D, /\{tab === 'machines' && <RemoteSettings \/>\}/);
     for (const id of ids.slice(1)) {
@@ -266,11 +273,11 @@ describe('设置分页 + 文案', () => {
     assert.match(R, /文件不会被复制过去/);
   });
 
-  test('**不显示"默认：xxx"** —— placeholder 就是那个命令本身', () => {
+  test('**不显示"默认：xxx"，也不放示例 placeholder** —— 空着就是空着', () => {
     assert.equal(/placeholder="默认：/.test(R), false);
-    assert.match(R, /placeholder="kiro-cli" fallback="kiro-cli"/);
-    /* 「测试」按钮空着时测的是 fallback，不是从 placeholder 里抠字符串 */
-    assert.match(R, /const cmd = \(value \|\| fallback\)\.trim\(\);/);
+    assert.equal(/placeholder=/.test(R), false, '「不要加示例」');
+    /* 空着就是 PATH 上的默认名 —— 执行器那一侧决定（这里没有按钮再去"测默认"了） */
+    assert.doesNotMatch(R, /fallback=/);
   });
 
   test('标签栏有样式，而且机器那一页是单栏（两栏会把一组字段劈成两半）', () => {
@@ -285,7 +292,7 @@ describe('设置分页 + 文案', () => {
 describe('远端那一块的顺序 = 依赖顺序', () => {
   const R = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
 
-  test('机器级动作（测试连接/安装依赖/删除）排在三个工具字段**之前**', () => {
+  test('机器级动作（测试连接/安装 AI 工具/删除）排在三个工具字段**之前**', () => {
     /* 连不上的话"检测/测试那三个工具"无从谈起 —— 它们都要走这条 ssh。
        按依赖顺序排，失败也按这个顺序暴露：先看到"连不上"，而不是先看到三个 ✗
        然后去怀疑路径写错了。 */

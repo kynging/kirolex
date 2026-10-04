@@ -65,6 +65,11 @@ export interface SyncConfig {
    * 那些条目还留在 catalog 里、照旧可以恢复 —— catalog 描述的是桶里有什么，不是策略。
    */
   excludeProjects?: string[];
+  /**
+   * **不同步的会话**（按会话 id）——「我现在还是不能选择是否备份会话」。和项目那张表同一个口径：
+   * 存"排除"，新会话默认跟着同步；已经传上去的不删，只是不再继续传。
+   */
+  excludeSessions?: string[];
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;
@@ -122,6 +127,13 @@ export function planUpload(
   root: string,
   sessionIds: string[],
   state: SyncState,
+  /**
+   * **记忆跟着会话 / 项目走** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
+   * 给了这个参数，`memory/` 就不再整棵传：只传 `global.md`、**要备份的**项目那几份、**要备份的**会话那几份。
+   * 以前整棵传的结果是：设成不同步的项目（和它下面的会话）的记忆照样上了桶。
+   * 不给 = 老行为（整棵传），只为了老调用方。
+   */
+  memory?: { projects: string[] },
 ): { upload: string[]; skippedUnchanged: number; skippedTooBig: string[] } {
   const upload: string[] = [];
   const skippedTooBig: string[] = [];
@@ -138,8 +150,42 @@ export function planUpload(
   };
 
   for (const id of sessionIds) for (const f of SESSION_FILES) consider(path.join('sessions', id, f));
-  for (const dir of SHARED_DIRS) for (const rel of walk(root, dir)) consider(rel);
+  if (memory) {
+    for (const rel of memoryRelsFor(root, sessionIds, memory.projects)) consider(rel);
+    for (const dir of SHARED_DIRS) if (dir !== 'memory') for (const rel of walk(root, dir)) consider(rel);
+  } else {
+    for (const dir of SHARED_DIRS) for (const rel of walk(root, dir)) consider(rel);
+  }
   return { upload, skippedUnchanged, skippedTooBig };
+}
+
+/** 只属于这几条会话、这几个项目的记忆文件（加上全局那一份）。项目 / 会话 id 里带路径分隔符的不认。 */
+export function memoryRelsFor(root: string, sessionIds: string[], projects: string[]): string[] {
+  const safe = (x: string): boolean => !!x && !/[\\/]|\.\./.test(x);
+  return [
+    ...walk(root, 'memory').filter((rel) => path.dirname(rel) === 'memory'),
+    ...projects.filter(safe).flatMap((p) => walk(root, path.join('memory', 'projects', p))),
+    ...sessionIds.filter(safe).flatMap((id) => walk(root, path.join('memory', 'sessions', id))),
+  ];
+}
+
+/**
+ * **恢复记忆 = 合并，不是覆盖** —— 记忆是一行一条的 markdown（「append a concise bullet」），
+ * 所以"本地的原样保留，备份里有而本地没有的行按原顺序补在后面"是不丢东西的那个答案：
+ * 本机后来教的不会被一份旧备份盖掉，备份里有的也都回来了。比较按去掉首尾空白的整行，空行不算。
+ */
+export function mergeMemoryText(local: string, backup: string): string {
+  if (!local.trim()) return backup;
+  const have = new Set(local.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
+  const extra: string[] = [];
+  for (const l of backup.split(/\r?\n/)) {
+    const k = l.trim();
+    if (!k || have.has(k)) continue;
+    have.add(k);
+    extra.push(l);
+  }
+  if (!extra.length) return local;
+  return `${local.replace(/\s*$/, '')}\n${extra.join('\n')}\n`;
 }
 
 /** 相对路径递归列举。目录不存在就当空 —— 没有 `pasted/` 不是错误。 */

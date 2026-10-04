@@ -186,7 +186,46 @@ type RerunOverride = { prompt?: any[]; attachments?: any[]; pastes?: any[]; disp
 /** How many times an interrupted prompt may be auto-resent before KiroLex stops
  *  trying. More than one, because the resend's OWN turn can be interrupted too;
  *  bounded, because every attempt costs credits. */
-const AUTO_RESEND_MAX_ATTEMPTS = 2;
+const AUTO_RESEND_MAX_ATTEMPTS = 10;
+/**
+ * 「因为非人工原因中断的会话你应该加自动重试发送，重试次数默认是 10，可以在 setting 中调整」。
+ * 设置里的 `autoRetryMax`（会话那一页）；读持久化的 settings，因为这个 hook 拿不到 App 的 settings 状态。
+ * 0 = 不自动重发（等同于关掉「中断后自动重发」）。
+ */
+function autoRetryMax(): number {
+  try {
+    const raw = uiGet('kirolex-settings');
+    const n = raw ? Number(JSON.parse(raw)?.autoRetryMax) : NaN;
+    return Number.isFinite(n) && n >= 0 ? Math.min(50, Math.floor(n)) : AUTO_RESEND_MAX_ATTEMPTS;
+  } catch { return AUTO_RESEND_MAX_ATTEMPTS; }
+}
+
+const PENDING_STEERS_KEY = 'kirolex-pending-steers';
+/** 每次改动都把自己写进 ui-state 的 Map（只存会被放回队列的那两样：文字和附件）。 */
+class PersistedSteerMap extends Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]> {
+  set(key: string, value: { msgId: string; content: string; attachments: AttachedFile[] }[]): this {
+    super.set(key, value); this.save(); return this;
+  }
+  delete(key: string): boolean { const r = super.delete(key); this.save(); return r; }
+  clear(): void { super.clear(); this.save(); }
+  private save(): void {
+    try {
+      const out: Record<string, { content: string; attachments: AttachedFile[] }[]> = {};
+      for (const [k, list] of this) out[k] = list.map((s) => ({ content: s.content, attachments: s.attachments || [] }));
+      uiSet(PENDING_STEERS_KEY, JSON.stringify(out));
+    } catch { /* 写不进去就只在内存里，和以前一样 */ }
+  }
+}
+
+/** 一轮里**已经被模型吃进去的** steer —— 重发、重跑、塞回输入框时都要跟着基础那条一起走，
+ *  否则「steer 的内容不会被重试、rerun 或者恢复」。还没被吃的那些不在这里：它们在轮末回到队列。 */
+export function withConsumedSteers(msgs: Message[], baseIndex: number): string {
+  const parts = [msgs[baseIndex]?.content || ''];
+  for (let j = baseIndex + 1; j < msgs.length && msgs[j].role === 'user' && msgs[j].steer; j++) {
+    if (msgs[j].steer === 'consumed' && msgs[j].content.trim()) parts.push(msgs[j].content);
+  }
+  return parts.filter((p) => p.trim()).join('\n');
+}
 
 /** Per-session usage, persisted so the context gauge is not blank until the next
  *  turn. Stored as entries (not an object) to keep session ids opaque. */
@@ -214,13 +253,25 @@ function writeUsageMap(map: Map<string, UsageEntry>): void {
  *  once. Measured on a real boot: two `list-durable-sessions` requests 5.2s apart,
  *  i.e. ~5s of the 13.6s to a visible window spent recomputing a discarded answer.
  *  Sharing the promise keeps the cancel semantics exactly as they were and only
- *  removes the duplicated disk work. */
+ *  removes the duplicated disk work.
+ *
+ *  ...but only for a few seconds, NOT for the life of the window. Under dev:hot a
+ *  code edit re-mounts this hook without reloading the page, and the hydrate merge
+ *  ADDS every disk record the sidebar lacks -- so a listing cached at boot brought
+ *  back a chat deleted after boot (a red, unconnectable "New Chat" whose directory
+ *  was already in trash/). The StrictMode double mount is milliseconds apart; a
+ *  remount after an edit is seconds to minutes later and must see the disk as it is. */
+const DURABLE_LIST_SHARE_MS = 3000;
 let durableSessionsOnce: Promise<any[]> | null = null;
 function listDurableSessionsOnce(): Promise<any[]> {
   if (!durableSessionsOnce) {
-    durableSessionsOnce = Promise.resolve(window.kiroApi?.listDurableSessions?.() ?? [])
+    const p = Promise.resolve(window.kiroApi?.listDurableSessions?.() ?? [])
       .then((rows) => (Array.isArray(rows) ? rows : []))
       .catch(() => []);
+    durableSessionsOnce = p;
+    void p.finally(() => setTimeout(() => {
+      if (durableSessionsOnce === p) durableSessionsOnce = null;
+    }, DURABLE_LIST_SHARE_MS));
   }
   return durableSessionsOnce;
 }
@@ -540,7 +591,23 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // agent, keyed by sessionId. Each entry keeps its optimistic user-message id
   // so `steer_consumed` can flip the badge to 'consumed', and turn-end can
   // reconcile any still-un-consumed steers back into the queue (never dropped).
-  const pendingSteersRef = useRef<Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]>>(new Map());
+  /*
+    **没被吃的 steer 落盘** ——「steer 的内容和 queue 似乎不会被重试、rerun 或者恢复」。原来只在内存里：
+    渲染层一重载或 app 一重启，还没被模型吃进去的 steer 就没了（既不在记录里，也没回到队列）。
+    现在每次变动都写进 ui-state；启动时上一次留下的那些作为排队消息放回各自会话（见 takeOrphanSteers）。
+    先读后写：上一次的那份要在第一次保存之前取走。
+  */
+  const orphanSteersRef = useRef<Record<string, { content: string; attachments: AttachedFile[] }[]> | null>(null);
+  if (orphanSteersRef.current === null) {
+    try { orphanSteersRef.current = JSON.parse(uiGet(PENDING_STEERS_KEY) || '{}') || {}; } catch { orphanSteersRef.current = {}; }
+  }
+  const pendingSteersRef = useRef<Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]>>(new PersistedSteerMap());
+  /** 上一次运行留下、没被吃的 steer（每个会话一组）。只给一次：App 启动时把它们放进队列。 */
+  const takeOrphanSteers = useCallback((): Record<string, { content: string; attachments: AttachedFile[] }[]> => {
+    const out = orphanSteersRef.current || {};
+    orphanSteersRef.current = {};
+    return out;
+  }, []);
   const loopsRef = useRef<Map<string, LoopHandle>>(new Map());
   /** Must equal `DEFAULT_MODEL` in src/main/config.ts.
    *
@@ -851,8 +918,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (idx < 0) return;
     markInterrupted(sid, msgs[idx].id);
     if (opts?.prefill === false) return;
-    if (msgs[idx].content.trim()) {
-      setRestoredInputDraft({ id: Date.now(), text: msgs[idx].content, sessionId: sid });
+    /* 连同这一轮已经吃进去的 steer 一起放回去（原来只放基础那条，steer 跟着被覆盖掉了） */
+    const text = withConsumedSteers(msgs, idx);
+    if (text.trim()) {
+      setRestoredInputDraft({ id: Date.now(), text, sessionId: sid });
     }
   };
 
@@ -867,6 +936,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  only once per run. */
   /** Sessions whose pending auto-resend should stop waiting (e.g. user took over). */
   const recoveryCancelledRef = useRef<Set<string>>(new Set());
+  /**
+   * 正在自动重发（或等重连之后重发）的会话。App 的队列在这期间**不发** —— 否则排着的那条会
+   * 抢在重发前面落进记录，没答的问题从此被它顶掉（「queue 似乎不会被重试、rerun 或者恢复」）。
+   * 是 state 不是只有 ref：结束时要让队列那个 effect 重新跑一次。
+   */
+  const recoveringRef = useRef<Set<string>>(new Set());
+  const [recoveringIds, setRecoveringIds] = useState<string[]>([]);
+  const markRecovering = (sid: string, on: boolean): void => {
+    if (on) recoveringRef.current.add(sid); else recoveringRef.current.delete(sid);
+    setRecoveringIds(Array.from(recoveringRef.current));
+  };
   /** Sessions we already asked main to rebuild, so the backstop fires once. */
   const primeKickedRef = useRef<Set<string>>(new Set());
   /** Live mirror of which sessions are in a history-rebuild state. Background
@@ -918,7 +998,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     setSessionActivity(sid, '⟳ 上一轮仍在运行，已接回它的回复（没有重发）');
   };
 
-  const recoverInterruptedTurn = (sid: string, msgs: Message[], opts?: { assumeCurrent?: boolean }) => {
+  const recoverInterruptedTurn = (sid: string, msgs: Message[], opts?: {
+    assumeCurrent?: boolean;
+    /** 已知这一轮被**非人为**打断（执行器死了）：哪怕已经吐出半截回复也重跑这一轮。 */
+    interrupted?: boolean;
+  }) => {
     if (!sid || sid.startsWith('pending_')) return;
     // Only ever for chats the user can SEE. Doing it for every hydrated session at
     // startup would fire a dozen billable turns at once. Not marking it checked here
@@ -944,6 +1028,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // turn completed.
     let i = msgs.length - 1;
     while (i >= 0 && msgs[i].role === 'assistant' && msgs[i].content.startsWith('💭 ')) i--;
+    /* 中途死掉的那一轮可能已经吐了半截回复：那不是"答完了"，重跑这一轮（rerun 会把半截覆盖掉） */
+    if (opts?.interrupted) while (i >= 0 && msgs[i].role === 'assistant') i--;
     if (i < 0) return;
     if (msgs[i].role !== 'user') {
       // Answered. Clear this chat's resend ledger entry: it exists only to stop a
@@ -952,15 +1038,24 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       void window.kiroApi.setAutoResent?.(sid, '');
       return;
     }
-    // Anchor to the turn's BASE user message: steers are not persisted.
+    // Anchor to the turn's BASE user message (steers are merged into it on disk, separate in memory).
     let base = i;
     while (base > 0 && msgs[base].steer) base--;
     const target = msgs[base];
     if (target.role !== 'user' || !target.content.trim()) return;
+    /* 重发的是**基础那条 + 这一轮已经吃进去的 steer**（原来只发基础那条，steer 就丢了） */
+    const resendText = withConsumedSteers(msgs, base);
+    /* 这期间队列不许抢着发 —— 否则排队那条会落在没答的问题后面，把它永远顶掉 */
+    markRecovering(sid, true);
     // Fire-and-forget. Progress shows as the session's activity line, NOT an error
     // banner — nothing failed here.
     void (async () => {
-      const key = autoResendKey(target.content);
+     try {
+      /*
+        计数按**基础那条的第一行**算：重发会建一条新的用户消息（id 变了），而重启后 steer 又会并进
+        content（全文变了）—— 按这两样算，次数每次都清零，10 次的上限就永远到不了。第一行两种情况下都不变。
+      */
+      const key = autoResendKey(target.content.split('\n')[0]);
       let attempts = 0;
       try {
         // Durable de-dup, but COUNTED. It used to store the bare key and refuse
@@ -1032,9 +1127,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           busyReason,
           streaming: streamingIdsRef.current.has(sid),
           cancelled: recoveryCancelledRef.current.has(sid),
-          resendDisabled,
+          resendDisabled: resendDisabled || autoRetryMax() === 0,
           attempts,
-          maxAttempts: AUTO_RESEND_MAX_ATTEMPTS,
+          maxAttempts: autoRetryMax(),
         });
 
         if (decision.action === 'adopt' && peek) {
@@ -1063,15 +1158,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (adopted) return;
 
       try { await window.kiroApi.setAutoResent?.(sid, `${key}#${attempts + 1}`); } catch {}
-      if (!isRebuilding(sid)) setSessionActivity(sid, '⟳ 上次未完成的这一轮，正在自动重发…');
+      if (!isRebuilding(sid)) setSessionActivity(sid, `⟳ 上次未完成的这一轮，正在自动重发…（第 ${attempts + 1}/${autoRetryMax()} 次）`);
+      /* 重试之间退避一下：执行器刚死就立刻重发，多半撞上同一个原因 */
+      if (attempts > 0) await new Promise((r) => setTimeout(r, Math.min(30_000, 2000 * attempts)));
+      if (recoveryCancelledRef.current.has(sid)) { setSessionActivity(sid, null); return; }
       try {
-        await rerunFromMessageRef.current?.(target.id, target.content, undefined, sid);
+        await rerunFromMessageRef.current?.(target.id, resendText, undefined, sid);
       } catch (error: any) {
         // A real failure IS worth a banner: the question would otherwise sit
         // unanswered with no explanation.
         setSessionActivity(sid, null);
         noteError(sid, `自动重发失败：${error?.message || error}。可对该消息手动点重跑。`);
       }
+     } finally {
+      markRecovering(sid, false);
+     }
     })();
   };
   // Ref to rerunFromMessage (defined later) so the send path can invoke the
@@ -1338,11 +1439,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 界面停在旧值上，直到下一次整页水化。
    */
   useEffect(() => {
-    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string; localDirs?: string[] }) => {
+    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
       if (!d?.sessionId) return;
       setSessions((prev) => prev.map((s) => (s.id === d.sessionId
         /* 工作目录也在这个事件里 —— 会话界面上那个 📂 显示的就是它，换完必须当场变 */
-        ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir, localDirs: d.localDirs ?? s.localDirs }
+        ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir }
+        : s)));
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
+  /* 换了引擎（「现有会话也能切换 agent 运行类型」）：侧栏 tag、模型/agent 下拉都看 `session.engine`，当场改 */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onEngineChanged?.((d: { sessionId: string; engine: 'kiro' | 'claude' | 'codex' }) => {
+      if (!d?.sessionId) return;
+      setSessions((prev) => prev.map((s) => (s.id === d.sessionId
+        ? { ...s, engine: d.engine === 'kiro' ? undefined : d.engine }
         : s)));
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
@@ -1566,12 +1678,14 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // On mount we merge any disk record that the local index is missing, so
   // sessions can never silently "disappear". localStorage keeps ownership of the
   // richer, renderer-only fields (projectId/folderId/pinned/model/permissionMode).
-  useEffect(() => {
-    let cancelled = false;
-    (async () => {
+  /**
+   * 从磁盘把侧栏对一遍（见下面那段水化的说明）。挂载时跑一次；**恢复备份之后再跑一次** ——
+   * 「我尝试恢复但没有生效」：恢复只写了磁盘，侧栏要重启才看得见那几条（连同它们的项目）。
+   */
+  const hydrateFromDisk = useCallback(async (isCancelled: () => boolean = () => false): Promise<void> => {
       try {
         const disk = await listDurableSessionsOnce();
-        if (cancelled || !Array.isArray(disk)) return;
+        if (isCancelled() || !Array.isArray(disk)) return;
         const diskIds = new Set(disk.map((r: any) => r?.id).filter(Boolean));
         // sessionModelRef is what gets SENT as the attach model. It is seeded once
         // on mount from the (possibly stale) localStorage list, so refresh it from
@@ -1629,6 +1743,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 flow: rec.flow ?? (existing as any).flow,
                 // agent 也归记录所有：它决定这条会话有哪些工具，而泳道复用要按它判断能不能复用
                 kiroAgent: rec.kiroAgent ?? existing.kiroAgent,
+                /* 引擎归记录所有（白名单 —— 不列就被丢掉，Claude/Codex 会话一重启就显示成 kiro） */
+                engine: rec.engine ?? (existing as any).engine,
                 /**
                  * **这条会话跑在哪台机器上**也归记录所有 —— 和上面 `purpose`/`kiroAgent` 是同一个坑。
                  *
@@ -1638,8 +1754,6 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 remoteHost: rec.remoteHost ?? (existing as any).remoteHost,
                 /* 工作目录同理：白名单里不列就会被丢掉，而会话界面上那个 📂 显示的就是它 */
                 localDir: rec.localDir ?? (existing as any).localDir,
-                /* 附加目录同理 —— 下面那排 📂 一格一个目录 */
-                localDirs: rec.localDirs ?? (existing as any).localDirs,
               });
             } else {
               byId.set(rec.id, {
@@ -1652,21 +1766,30 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 purpose: rec.purpose,
                 flow: rec.flow,
                 kiroAgent: rec.kiroAgent,
+                engine: rec.engine,
                 remoteHost: rec.remoteHost,
                 localDir: rec.localDir,
-                localDirs: rec.localDirs,
                 timestamp: rec.updatedAt,
               });
             }
           }
-          return Array.from(byId.values())
-            // DISK IS AUTHORITATIVE. This merge used to be a pure union, so a chat
-            // that localStorage still listed but the disk no longer had (deleted,
-            // then the removal or the index write did not land) was resurrected on
-            // every start. Keep only what disk knows about, plus not-yet-persisted
-            // pending/new chats.
-            .filter((s) => diskIds.has(s.id) || String(s.id).startsWith('pending_'))
-            .sort((a, b) => b.timestamp - a.timestamp);
+          // DISK IS AUTHORITATIVE. This merge used to be a pure union, so a chat
+          // that localStorage still listed but the disk no longer had (deleted,
+          // then the removal or the index write did not land) was resurrected on
+          // every start. Keep only what disk knows about, plus not-yet-persisted
+          // pending/new chats.
+          const kept = Array.from(byId.values())
+            .filter((s) => diskIds.has(s.id) || String(s.id).startsWith('pending_'));
+          /*
+            **保留你拖出来的顺序** ——「拖拽会话不能调整其前后顺序」。这里原来对整份列表按时间排序，
+            于是拖好的顺序一重启就没了。现在：已经在列表里的保持原来的先后（那就是你排的），
+            只有磁盘上新冒出来、列表里还没有的，按时间放在最前面。
+          */
+          const known = new Set(prev.map((s) => s.id));
+          return [
+            ...kept.filter((s) => !known.has(s.id)).sort((a, b) => b.timestamp - a.timestamp),
+            ...kept.filter((s) => known.has(s.id)),
+          ];
         });
         // Rebuild the projects list from disk projectIds so restored projects
         // (e.g. test/test2) reappear as groups instead of collapsing to Unassigned.
@@ -1682,7 +1805,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         hydratedRef.current = true;
         setHydrated(true);
       }
-    })();
+  }, []);
+  const hydrateFromDiskRef = useRef(hydrateFromDisk);
+  hydrateFromDiskRef.current = hydrateFromDisk;
+
+  useEffect(() => {
+    let cancelled = false;
+    void hydrateFromDisk(() => cancelled);
     return () => { cancelled = true; };
   }, []);
 
@@ -1994,7 +2123,20 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
 
         case 'usage_update': {
-          // Standard ACP usage update (may not be sent by kiro-cli)
+          /*
+            标准 ACP 的用量（kiro-cli 不发，它走 `_kiro.dev/metadata`）。Claude Code / Codex 的适配器
+            每轮都发 `{ used, size }`（上下文已用 token / 窗口大小）—— 正好喂给同一个上下文百分比。
+            它们没有 kiro 的 credits，所以 credits 原样保留（一直是 0）。
+          */
+          if (sessionId && typeof update.used === 'number' && typeof update.size === 'number' && update.size > 0) {
+            const prev = usageMapRef.current.get(sessionId);
+            const next = { contextPercent: (update.used / update.size) * 100, credits: prev?.credits || 0, turnMs: prev?.turnMs };
+            usageMapRef.current.set(sessionId, next);
+            writeUsageMap(usageMapRef.current);
+            setUsageBySession((cur) => ({ ...cur, [sessionId]: { contextPercent: next.contextPercent, credits: next.credits } }));
+            if (isActiveSession) setUsage(next);
+            patchPane(sessionId, { usage: next });
+          }
           break;
         }
 
@@ -2320,7 +2462,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // Mid-turn death is an interruption: mark the last user turn so the next
         // submit OVERWRITES it, and (if this is the viewed session) surface an
         // error + restore its prompt to the composer.
-        if (wasStreaming) {
+        /*
+          **不是你停的就自动重发** ——「因为非人工原因中断的会话你应该加自动重试发送」。
+          原来执行器死在一轮中间只做 `markTurnInterrupted`：既不重发，还把这一轮标成"下一条覆盖它"，
+          于是排在队列里的那条一发出去就把没答完的问题连同它的 steer 一起从记录里抹掉了。
+          现在：你按过停止（`recoveryCancelledRef`）才走老路；否则等下面重连上就按重试预算重发这一轮，
+          这期间队列先别发。
+        */
+        const autoRecover = wasStreaming && !recoveryCancelledRef.current.has(sid)
+          && autoRetryMax() > 0 && !loopsRef.current.has(sid);
+        if (wasStreaming && !autoRecover) {
           // Deliberately NOT also reported through the error banner. One state, one
           // place: the interrupted bar is derived from the same flag that disables the
           // per-message Rerun, so the notice and the restriction cannot disagree and
@@ -2328,6 +2479,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // used to stay on screen after the state itself was gone -- the banner had
           // its own, longer lifetime.
           markTurnInterrupted(sid);
+        }
+        if (autoRecover) {
+          markRecovering(sid, true);
+          setSessionActivity(sid, '⟳ 执行器中途断了，重连后自动重发这一轮…');
         }
         // AUTO-RECOVERY: the executor process is genuinely gone, so bring the
         // session back by itself instead of leaving a dead grey chat that only
@@ -2352,10 +2507,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 await window.kiroApi.loadSession(sid, attachCwdFor(sid), modelForSession(sid));
                 addAttached(sid);
                 if (sid === currentSessionRef.current) setSessionActivity(sid, null);
+                if (autoRecover) {
+                  recoveryCheckedRef.current.delete(sid);
+                  recoverInterruptedTurn(sid, messagesCacheRef.current.get(sid) || [], { assumeCurrent: true, interrupted: true });
+                }
               } catch {
                 // Still down -- stay dormant; the next send retries as before.
+                /* 重连都没成：退回老路（标成被打断、把问题放回输入框），别让它悄悄卡着 */
+                if (autoRecover) markTurnInterrupted(sid);
               } finally {
                 clearConnecting(sid);
+                if (autoRecover) markRecovering(sid, false);
               }
             })();
           }, 600);
@@ -2456,6 +2618,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 而 IPC 要的是配置里的 id，按 label 反查一旦查不到就会传 `undefined` —— 那又是"变成本地"。
    */
   const intendedRemoteRef = useRef<Map<string, string>>(new Map());
+  /** 同上，引擎：兜底重建那条路也不许把 Claude/Codex 会话悄悄建成 kiro。 */
+  const intendedEngineRef = useRef<Map<string, string>>(new Map());
 
   const newSession = useCallback(async (
     cwd: string,
@@ -2479,6 +2643,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       remoteId?: string;
       /** 徽标上显示的短名字（`remoteTargets` 给的 label）。 */
       remoteLabel?: string;
+      /** 哪个引擎（Claude Code / Codex）；不传 = kiro。 */
+      engine?: 'kiro' | 'claude' | 'codex';
     },
   ) => {
     await connect(model);
@@ -2519,6 +2685,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, kiroAgent, timestamp: Date.now(),
         /* 徽标当场就要有：等下一次 hydrate 才出现的话，你刚建的远程会话看起来像本地的 */
         ...(opts?.remoteId ? { remoteHost: opts.remoteLabel || opts.remoteId } : null),
+        ...(opts?.engine && opts.engine !== 'kiro' ? { engine: opts.engine } : null),
       },
       ...prev,
     ]);
@@ -2527,9 +2694,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Register the in-flight creation so a send before connect finishes awaits
     // this same attach (id is already stable, so no swap — just gate readiness).
     if (opts?.remoteId) intendedRemoteRef.current.set(id, opts.remoteId);
+    if (opts?.engine && opts.engine !== 'kiro') intendedEngineRef.current.set(id, opts.engine);
     const createPromise = (async (): Promise<string> => {
       try {
-        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId);
+        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId, opts?.engine);
         clearConnecting(id);
         // Per design: a newly created chat auto-connects. The executor is
         // spawned, so mark it attached immediately -> the sidebar dot goes green
@@ -2920,6 +3088,29 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     }
     void window.kiroApi.ensureContext?.(sessionId).catch(() => {});
   }, [sessions]);
+  const warmSessionRef = useRef(warmSession);
+  warmSessionRef.current = warmSession;
+
+  /**
+   * **恢复之后立刻出现、立刻连上** ——「恢复了之后的会话应该被立刻连接，为什么没有连接」。
+   * 备份页恢复完发 `kirolex:sessions-restored`：先从磁盘把侧栏对一遍（新冒出来的会话和它的项目
+   * 就出现了），等这一轮状态落定，再逐条预热（和侧栏展开一个项目时走的是同一个动作）。
+   */
+  useEffect(() => {
+    const onRestored = (e: Event): void => {
+      const ids: string[] = Array.isArray((e as CustomEvent).detail?.ids) ? (e as CustomEvent).detail.ids : [];
+      void (async () => {
+        await hydrateFromDiskRef.current();
+        /* setSessions 是异步落定的：warmSession 读的是 sessions，等它看得见新条目 */
+        for (let i = 0; i < 20 && ids.some((id) => !sessionsRef.current.some((x) => x.id === id)); i++) {
+          await new Promise((r) => setTimeout(r, 100));
+        }
+        for (const id of ids) void warmSessionRef.current(id);
+      })();
+    };
+    window.addEventListener('kirolex:sessions-restored', onRestored);
+    return () => window.removeEventListener('kirolex:sessions-restored', onRestored);
+  }, []);
 
   // Send one loop iteration to a session that is not currently visible.
   // The response continues streaming into that session's cache while the user
@@ -3100,6 +3291,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             */
             (pendingId && intendedRemoteRef.current.get(pendingId))
               || (() => { try { return uiGet('kirolex-new-chat-remote') || undefined; } catch { return undefined; } })(),
+            (pendingId && intendedEngineRef.current.get(pendingId)) || undefined,
           );
           const prevId = sid;
           sid = newId;
@@ -3231,6 +3423,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     }
 
     const turnToken = beginStreamingTurn(sid!);
+    /* 你又发了一条：之前按过的「停止」不再代表"别替我重试"（原来那个标记一直留到重建上下文为止） */
+    recoveryCancelledRef.current.delete(sid!);
     addAttached(sid!); // first use -> live
     lastPromptedSessionRef.current = sid;
     setSessionActivity(sid, '已发送，等待 Kiro 响应…');
@@ -3255,7 +3449,19 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       } else {
         // Not attached (dormant/reopened this run) -> attach the SAME session
         // (main resumes its kiro-cli session; the KiroLex id stays stable) and retry once.
+        /*
+          **执行器死在这一轮中间**（"Process exited" / "Disconnected"）：交给断线那条恢复（onDisconnected →
+          recoverInterruptedTurn）去重发 —— 它走 rerun，先把记录截回去再发。这里再顺手重发一次的话，
+          两条路叠在一起：实测记录里那个问题出现了两遍（这条路不重写记录）。
+          这条内联重试只留给它本来的用途：给一条还没连上的会话发消息。
+        */
+        if (/Process exited|Disconnected/i.test(msg) && autoRetryMax() > 0 && !recoveryCancelledRef.current.has(sid!)) {
+          setSessionActivity(sid, '⟳ 执行器中途断了，重连后自动重发这一轮…');
+          return;
+        }
         try {
+          /* 你刚按了停止就别替你重连重发 */
+          if (recoveryCancelledRef.current.has(sid!)) throw err;
           setSessionActivity(sid, '正在重新连接会话…');
           await window.kiroApi.loadSession(sid, attachCwdFor(sid), activeModel);
           setSessionActivity(sid, '已重连，重新发送…');
@@ -3466,7 +3672,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const storedRetained = toStoredTranscript(retained);
       await window.kiroApi.rewriteTranscript(sid, storedRetained);
 
-      pendingSteersRef.current.delete(sid);
+      /*
+        **还没被吃的 steer 不扔** —— 原来这里直接 `delete`，于是重跑（包括自动重发）把它们丢了。
+        留着它们：这一轮结束时 App 的轮末对账（takeUnconsumedSteers）会把它们原样放回队列头。
+      */
       currentMessageRef.current = '';
       toolCallsRef.current.clear();
 
@@ -4353,6 +4562,10 @@ ${text}`,
       (sessionId: string) => usageMapRef.current.get(sessionId),
       [],
     ),
+    /** 上一次运行没被吃掉的 steer（只给一次）。 */
+    takeOrphanSteers,
+    /** 正在自动重发的会话 —— App 的队列在这期间不发。 */
+    recoveringIds,
     /** Call off a pending/in-flight auto-resend for this chat. `recoveryCancelledRef`
      *  existed but was NEVER written, so an auto-resend could not be stopped at all
      *  -- Stop now routes here. */

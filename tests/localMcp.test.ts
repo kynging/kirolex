@@ -25,6 +25,12 @@ import {
  */
 function tmp(): string { return fs.mkdtempSync(path.join(os.tmpdir(), 'lmcp-')); }
 const deps = { log: () => {}, notice: () => {} };
+/*
+  `remoteAgentScript` 是跑在**远端 Linux** 上的 bash + python3。拿本机 bash 跑它当冒烟测试只在 POSIX 上
+  站得住：Windows 上一般没有 `python3`（Git Bash 里 command not found），而且 python 的 `expanduser`
+  在 Windows 上认 USERPROFILE 不认 HOME —— 就算有 python，也会写进**真的** `~/.kiro/agents`。
+*/
+const REMOTE_SCRIPT = { skip: process.platform === 'win32' && '远端脚本（bash + python3 + HOME）只在 POSIX 上能本机冒烟' };
 
 describe('工具本身：在你机器上干活，一次给够', () => {
   test('local_read 收**多个**路径 —— 粗粒度是这个设计的前提，不是顺手', async () => {
@@ -68,15 +74,15 @@ describe('工具本身：在你机器上干活，一次给够', () => {
     assert.match(said[0], /改了你本机的/);
   });
 
-  test('local_bash 在工作目录里跑，并且**每一条命令都留痕**', async () => {
+  test('local_bash 在工作目录里跑；留痕进日志，**不**往会话里插提示', async () => {
     const dir = tmp();
     const said: string[] = [];
     const r = await callTool('local_bash', { command: 'pwd && echo marker' },
       { sessionId: 's1', workdir: dir }, { log: () => {}, notice: (_s, t) => said.push(t) });
     assert.match(r.content[0].text, /marker/);
     assert.match(r.content[0].text, /exit 0/);
-    assert.equal(said.length, 1);
-    assert.match(said[0], /在你本机跑了/);
+    /* 「那个远程会话在本机跑了啥提示好像没啥用？」—— 一个任务几十条命令就是几十句噪音 */
+    assert.equal(said.length, 0);
     /*
       **不做安全剧场**：工具面里有 bash（这是明确选的），所以给读写加路径牢笼是自欺 ——
       能跑 bash 就能 cat 任何东西。真正起作用的是 loopback + token + 每次留痕。
@@ -239,7 +245,7 @@ describe('接线层：agent 配置一条会话一份，端口不撞', () => {
     assert.equal(parseAgentBase('什么都没有'), '');
   });
 
-  test('那段合并程序**真的能跑**（用临时 HOME 跑一遍，拼错一个引号就会在这里露出来）', () => {
+  test('那段合并程序**真的能跑**（用临时 HOME 跑一遍，拼错一个引号就会在这里露出来）', REMOTE_SCRIPT, () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'agenthome-'));
     fs.mkdirSync(path.join(home, '.kiro', 'agents'), { recursive: true });
     fs.writeFileSync(path.join(home, '.kiro', 'agents', 'aws-agent.json'), JSON.stringify({
@@ -537,7 +543,7 @@ describe('把本机的 MCP 转发给远端会话', () => {
     assert.match(prog, /tags = \[tag\] \+ \["@" \+ k for k in json\.loads/);
   });
 
-  test('那段合并程序真跑一遍：转发项进了 mcpServers 和两个白名单', () => {
+  test('那段合并程序真跑一遍：转发项进了 mcpServers 和两个白名单', REMOTE_SCRIPT, () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fwdhome-'));
     fs.mkdirSync(path.join(home, '.kiro', 'agents'), { recursive: true });
     fs.writeFileSync(path.join(home, '.kiro', 'agents', 'a.json'), JSON.stringify({
@@ -620,36 +626,13 @@ describe('会话可以选多个目录', () => {
     assert.equal(/另外/.test(localToolsHelp('/Users/me/proj')), false);
   });
 
-  test('附加目录从**记录**里现查，不靠 6 个调用点各传一遍', () => {
-    /* 漏传一个的表现是"那条会话突然只搜第一个目录了" —— 不报错，只是搜不全 */
-    assert.match(M, /const extra = store\.readRecord\(sessionId\)\?\.localDirs \|\| \[\];/);
-    assert.match(M, /server\.register\(\{ sessionId, workdir: localDir, dirs \}\)/);
-    /* 注入那一份也要是全的 */
-    assert.match(M, /localDirs: localDirsOf\(sessionId, entry\),/);
-  });
-
-  test('`undefined` = 不改清单，`[]` = 只留主目录（换机器不该顺手清空）', () => {
-    assert.match(M, /Array\.isArray\(dir\) \? list\.slice\(1\) : undefined,/);
-    assert.match(M, /extraDirs \?\? rec0\?\.localDirs \?\? oldEntry\?\.localDirs \?\? \[\]/);
-    /* 主目录不重复出现在清单里（`localDirsOf` 会把它排第一） */
-    assert.match(M, /\.filter\(\(d, i, a\) => d && d !== nextLocalDir && a\.indexOf\(d\) === i\)/);
-  });
-
-  test('输入框下面一格一个目录：点第一格换主目录、✕ 去掉附加的、＋ 再加一个', () => {
-    assert.match(CA, /dirList\.map\(\(d, i\) =>/);
-    assert.match(CA, /onClick=\{\(\) => \(i === 0 \? onPickWorkdir\?\.\(\) : undefined\)\}/);
-    assert.match(CA, /i > 0 && onRemoveWorkdir/, '主目录没有 ✕ —— 去掉 cwd 是"换"不是"删"');
-    assert.match(CA, /composer-workdir-add/);
-    /* 老调用点没传 `workdirs` 时退回单个目录，不至于一格都不显示 */
-    assert.match(CA, /workdirs && workdirs\.length \? workdirs : \(workdir \? \[workdir\] : \[\]\)/);
-  });
-
-  test('渲染层：加是整份清单一起发，删只摘掉那一个', () => {
-    assert.match(A, /const addWorkdir = async/);
-    assert.match(A, /Array\.from\(new Set\(list\)\)/, '选到已经在里面的目录不该重复一条');
-    assert.match(A, /const removeWorkdir = async/);
-    assert.match(A, /if \(!cur\?\.localDir \|\| dir === cur\.localDir\) return;/, '主目录删不掉');
-    assert.match(A, /workdirs=\{session\?\.localDir \? \[session\.localDir, \.\.\.\(session\.localDirs \|\| \[\]\)\] : \[\]\}/);
+  test('会话工作目录功能整个删了 ——「把这个功能移除了得了」', () => {
+    /* 只剩一个主目录（建会话 / 切远端时定下的那个）：没有附加目录，也没有单独换目录的 IPC。
+       local_* 的多根搜索（sessionRoots / dirs）还在，但主进程不再喂它别的目录。 */
+    assert.doesNotMatch(M, /localDirs|extraDirs|acp:set-workdir/);
+    assert.match(M, /server\.register\(\{ sessionId, workdir: localDir \}\)/);
+    assert.doesNotMatch(CA, /dirList\.map|composer-workdir|onPickWorkdir|onAddWorkdir|onRemoveWorkdir/);
+    assert.doesNotMatch(A, /const (addWorkdir|removeWorkdir|pickWorkdir) = async|workdirs=\{|setWorkdir|localDirs/);
   });
 });
 

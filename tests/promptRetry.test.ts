@@ -189,9 +189,15 @@ describe('连着被拒绝生成 → 换模型重发', () => {
  */
 describe('主进程必须真的能编译', () => {
   test('tsc -p tsconfig.main.json 干净通过', () => {
-    const { status, stdout, stderr } = spawnSync('npx', ['tsc', '-p', 'tsconfig.main.json', '--noEmit'], {
+    /*
+      直接用 node 跑 typescript 自带的 tsc 入口，不经 `npx`：Windows 上 `npx` 是个 `.cmd` shim，
+      不开 shell 的 spawnSync 根本起不来（status 为 null，看起来像"编译失败"，其实一行都没编）。
+    */
+    const tsc = path.join(process.cwd(), 'node_modules', 'typescript', 'bin', 'tsc');
+    const { status, stdout, stderr, error } = spawnSync(process.execPath, [tsc, '-p', 'tsconfig.main.json', '--noEmit'], {
       cwd: process.cwd(), encoding: 'utf8', timeout: 180_000,
     });
+    assert.equal(error, undefined, `tsc 没起来：${error}`);
     assert.equal(status, 0, `主进程编译失败：\n${stdout}\n${stderr}`);
   });
 });

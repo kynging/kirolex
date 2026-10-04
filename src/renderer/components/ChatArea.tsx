@@ -1,8 +1,8 @@
 import { createPortal } from 'react-dom';
-import { baseName, isSessionScratchDir } from '../pathBits.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
 import { KiroConfigPanel, type KiroConfigCategory } from './KiroConfigPanel';
+import { EngineLoginPane } from './LoginSettings.tsx';
 import ReactMarkdown from 'react-markdown';
 import { mdText } from '../mdText';
 // 「这段文字是不是路径」的判据 —— 抽出来是为了能被 node:test 测到（.tsx 跑不了测试）
@@ -33,7 +33,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
 import type { ScheduleSummary } from '../scheduleView';
 import { decidePaste } from '../pasteDecision';
-import { IconAppendMessage, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
+import { IconAppendMessage, IconClaudeSpark, IconCodexPrompt, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
@@ -1399,6 +1399,11 @@ const ChatInputBox = memo<{
   busyReason?: string | null;
   permissionMode: 'auto-approve' | 'ask';
   onPermissionModeChange: (mode: 'auto-approve' | 'ask') => void;
+  /**
+   * Claude Code / Codex：那颗 Auto/Ask 按钮换成它们自己的权限模式 ——「claude code 那个就不应该叫 auto 了啊，
+   * 默认是 bypass 就好」。给了就显示下拉，不给就是 kiro 的 Auto/Ask。
+   */
+  engineMode?: { current: string; options: Array<{ value: string; name: string }>; busy: boolean; onChange: (value: string) => void } | null;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteer: (text: string, pastes?: PastedBlock[]) => void;
   onCancel: () => void;
@@ -1427,7 +1432,7 @@ const ChatInputBox = memo<{
    * 只有 `session/request_permission`），所以这些只能从回复文字里认。
    */
   choiceChips: ChoiceChip[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
@@ -1877,6 +1882,20 @@ const ChatInputBox = memo<{
           >
             <IconPaperclip />
           </button>
+          {engineMode ? (
+            <select
+              className={`composer-mode composer-mode-select ${engineModeTone(engineMode.current)}`}
+              value={engineMode.current}
+              onChange={(e) => engineMode.onChange(e.target.value)}
+              disabled={isLooping || isStreaming || status !== 'connected' || engineMode.busy || !engineMode.options.length}
+              title="权限模式（这个引擎自己的）：要不要先问你再动手"
+              aria-label="Permission mode"
+            >
+              {engineMode.options.length
+                ? engineMode.options.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)
+                : <option value="">…</option>}
+            </select>
+          ) : (
           <button
             type="button"
             className={`composer-mode ${permissionMode === 'auto-approve' ? 'yolo' : ''}`}
@@ -1906,6 +1925,7 @@ const ChatInputBox = memo<{
               </>
             )}
           </button>
+          )}
           {/* Deliberately NOT disabled on empty content, only on states the user can
               actually reason about (looping / not connected). A button greyed out
               purely because the composer is empty explains nothing, and it read as
@@ -2350,19 +2370,8 @@ interface ChatAreaProps {
    * 命令/文件面板要标出机器，而这件事必须跟着**会话状态**走，不能跟着同步状态走。
    */
   remoteHost?: string;
-  /** 这条会话在哪棵树上干活（记录为准）。远程会话显示的仍是**本地**那个路径。 */
-  workdir?: string;
-  /**
-   * 这条会话**选中的全部目录**（第一个是主目录）——「应该可以设置多个，页面下面的文件夹
-   * 直接显示哪几个文件夹被选中就行了」。空数组 = 还没定。
-   */
-  workdirs?: string[];
-  /** 换**主目录**（Finder 选目录 → 换执行器）。 */
-  onPickWorkdir?: () => void;
-  /** 再加一个目录。 */
-  onAddWorkdir?: () => void;
-  /** 去掉一个附加目录（主目录去不掉 —— 它是 `local_bash` 的 cwd）。 */
-  onRemoveWorkdir?: (dir: string) => void;
+  /** 哪个引擎跑这条会话；undefined = kiro。 */
+  engine?: 'kiro' | 'claude' | 'codex';
   kiroAgent: string;
   kiroAgents: KiroAgentOption[];
   switchingAgent: boolean;
@@ -2451,6 +2460,16 @@ function cacheSuggestions(key: string, list: string[]) {
   }
 }
 
+/**
+ * 权限模式的颜色 —— 按"放手的程度"分三档：全放（bypass / full access）用强调色，和 kiro 的 Auto 一样；
+ * 半放（自动批编辑 / 自动审 / 能写工作区）用暖色；要问 / 只读 / 只做计划用默认的灰。
+ */
+function engineModeTone(mode: string): string {
+  if (/^(bypassPermissions|agent-full-access)$/.test(mode)) return 'yolo';
+  if (/^(acceptEdits|auto|agent|workspace-write)$/.test(mode)) return 'semi';
+  return '';
+}
+
 export const ChatArea: React.FC<ChatAreaProps> = ({
   messages,
   isStreaming,
@@ -2480,11 +2499,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   commands,
   onModelChange,
   remoteHost,
-  workdir,
-  onPickWorkdir,
-  workdirs,
-  onAddWorkdir,
-  onRemoveWorkdir,
+  engine,
   kiroAgent,
   kiroAgents,
   switchingAgent,
@@ -2601,36 +2616,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    */
   const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
   const remoteHostLabel = remoteHost ? remoteHost.replace(/^[^@]*@/, '') : undefined;
-  /**
-   * **工作目录那一格的字** —— 显示 basename：这一排很窄，完整路径放 title。
-   *
-   * 没归项目的会话，工作目录就是它自己的会话目录（`~/.kirolex/sessions/<id>`）——
-   * 那个 id 当名字没有任何信息量，所以直接说「会话目录」，并在 title 里说清它读不到别处的文件。
-   */
-  /**
-   * **会话自己的目录不算工作目录** ——「那个按钮不要叫会话目录，就显示实际的工作目录就行，
-   * 没有就不显示」。
-   *
-   * `~/.kirolex/sessions/<id>` 是没归项目的会话的兜底 cwd（KiroLex 自己的数据目录）。
-   * 它当"工作目录"显示是在骗人：那棵树里没有用户的代码，标成「会话目录」也只是把这个谎
-   * 换了个说法。所以直接从这一排里滤掉 —— 没有真目录就一格都不显示，只留那个 ＋。
-   */
-  /* 两个判断都要认 `\` —— Windows 上那个目录是 `C:\Users\k\.kirolex\sessions\…`，
-     只认 `/` 的话它会被当成"真的工作目录"显示出来（见 `pathBits.ts`） */
-  const isSessionDir = isSessionScratchDir;
-  const inSessionDir = !!workdir && isSessionDir(workdir);
-  /** 一格上的字：basename。这一排很窄，完整路径放 title。 */
-  const dirLabel = baseName;
-  const workdirLabel = !workdir || inSessionDir ? '' : dirLabel(workdir);
-  /* 主目录排第一。`workdirs` 没传（老调用点）就退回单个目录，不至于一格都不显示。 */
-  const dirList = (workdirs && workdirs.length ? workdirs : (workdir ? [workdir] : []))
-    .filter((d) => d && !isSessionDir(d));
-  const workdirTitle = `工作目录：${(!workdir || inSessionDir) ? '（还没定 —— 点 ＋ 选一个）' : workdir}`
-    + (remoteHostLabel
-      /* 镜像没了：远端根本没有副本，它是通过反向隧道读**你机器上**这一份（`localMcp.ts`） */
-      ? `\n${remoteHostLabel} 上的那个进程通过隧道读**你机器上**这几棵树（没有副本、不同步）。`
-      : '')
-    + '\n点这里换一个目录（会换执行器：正在跑的那一轮会被打断，已产出的内容都在）。';
+  const nonKiro = !!engine && engine !== 'kiro';
+  const engineLabel = engine === 'claude' ? 'Claude Code' : engine === 'codex' ? 'Codex' : 'Kiro';
   const [isDragOver, setIsDragOver] = useState(false);
   // Conversation-aware prompt suggestions: regenerate a few contextual follow-up
   // prompts each time a turn finishes, so the chips reflect the current chat
@@ -2754,6 +2741,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [agentConfigTab, setAgentConfigTab] = useState<string>('agents');
   const [agentConfigFilter, setAgentConfigFilter] = useState('');
   const [kiroConfigCats, setKiroConfigCats] = useState<KiroConfigCategory[]>([]);
+  /** Claude Code / Codex 会话的机器人面板（它们没有 kiro 的 agent，tab 是「🔑 登录」+ 它们自己的配置文件）。 */
+  const [engineConfigOpen, setEngineConfigOpen] = useState(false);
+  const [engineConfigTab, setEngineConfigTab] = useState<string>('login');
+  const [engineConfigCats, setEngineConfigCats] = useState<KiroConfigCategory[]>([]);
   const [agentConfigDrafts, setAgentConfigDrafts] = useState<Record<string, AgentConfigEditorState>>({});
   const [agentConfigLoading, setAgentConfigLoading] = useState(false);
   const [agentConfigSaving, setAgentConfigSaving] = useState(false);
@@ -2902,6 +2893,50 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     window.addEventListener('kirolex:open-agent-config', handler);
     return () => window.removeEventListener('kirolex:open-agent-config', handler);
   }, [openAgentConfig, paneFocused, readOnly]);
+
+  /*
+    **Claude Code / Codex 的模型下拉** ——「右侧的选模型为什么没有」。清单是适配器自己给的
+    （session/new 的 configOptions 里那个 model），连上 / 换完之后 main 推一次 `session:engine-models`。
+  */
+  type EngineSelect = { current: string; options: Array<{ value: string; name: string }> };
+  /** 模型清单（`current`/`options`）+ effort + 权限模式 —— 三样都来自适配器的 configOptions。 */
+  const [engineModels, setEngineModels] = useState<(EngineSelect & { effort?: EngineSelect | null; mode?: EngineSelect | null }) | null>(null);
+  const [engineModelBusy, setEngineModelBusy] = useState(false);
+  const [engineModelErr, setEngineModelErr] = useState('');
+  useEffect(() => {
+    setEngineModels(null); setEngineModelErr('');
+    if (!nonKiro || !currentSessionId) return;
+    const api = (window as any).kiroApi;
+    const off = api?.onEngineModels?.((d: any) => {
+      if (d?.sessionId === currentSessionId) setEngineModels(d);
+    });
+    void api?.engineModels?.(currentSessionId).then((d: any) => { if (d) setEngineModels(d); }).catch(() => {});
+    return () => { try { off?.(); } catch { /* 卸载 */ } };
+  }, [nonKiro, currentSessionId, engine, status]);
+  const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
+  const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode', value: string): Promise<void> => {
+    if (!currentSessionId) return;
+    setEngineModelBusy(true); setEngineModelErr('');
+    try {
+      const api = (window as any).kiroApi;
+      const d = category === 'model'
+        ? await api.setEngineModel(currentSessionId, value)
+        : await api.setEngineOption(currentSessionId, category, value);
+      if (d) setEngineModels(d);
+    } catch (err: any) {
+      setEngineModelErr(String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
+    } finally {
+      setEngineModelBusy(false);
+    }
+  };
+
+  /* Claude Code / Codex 面板的 tab：按这条会话的引擎从 main 拿（换了引擎就重新拿） */
+  useEffect(() => {
+    if (!engineConfigOpen || !nonKiro) return;
+    void (window as any).kiroApi?.kiroConfigCategories?.(engine).then((c: KiroConfigCategory[]) => {
+      if (Array.isArray(c)) setEngineConfigCats(c);
+    }).catch(() => {});
+  }, [engineConfigOpen, nonKiro, engine]);
 
   /* tab 清单从 main 拿（那边是唯一定义），面板第一次打开时拉一次 */
   useEffect(() => {
@@ -3882,6 +3917,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 sessionConnected={sessionConnected}
                 permissionMode={permissionMode}
                 onPermissionModeChange={onPermissionModeChange}
+                engineMode={nonKiro ? {
+                  current: engineModels?.mode?.current || '',
+                  options: engineModels?.mode?.options || [],
+                  busy: engineModelBusy,
+                  onChange: (v) => void onEngineOptionChange('mode', v),
+                } : null}
                 onSend={onSend}
                 onSteer={onSteerMessage}
                 onCancel={onCancel}
@@ -3910,47 +3951,83 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <div className="composer-belowbar">
                 <div className="composer-belowbar-left">
 
+                  {/* kiro 的 agent 只对 Kiro 会话有意义；Claude Code / Codex 会话在这儿显示引擎名 */}
+                  {nonKiro ? (
+                    <div className="composer-agent-selector">
+                      {/*
+                        **Claude Code / Codex 也有这个机器人** ——「claude code 和 codex 左下角也得有一个类似的图标啊，
+                        要不然怎么打开登录」。点开是它自己的配置（~/.claude / ~/.codex，跟着会话的机器走）和「🔑 登录」。
+                      */}
+                      <button
+                        className="composer-meta-btn composer-agent-config"
+                        onClick={() => { setEngineConfigTab('login'); setEngineConfigOpen(true); }}
+                        disabled={!currentSessionId}
+                        title={`${engineLabel} 的配置和登录（这条会话跑的那台机器上的）`}
+                        aria-label={`${engineLabel} config`}
+                      >
+                        {/* 不用机器人 —— 那是 kiro 的（「左下角不应该再用那个机器人的图标了」） */}
+                        {engine === 'claude' ? <IconClaudeSpark size={15} /> : <IconCodexPrompt size={15} />}
+                      </button>
+                      {/*
+                        **effort** ——「配置按钮右边的那个 claude code 难道不应该改成什么其他的配置选项吗」→「改成 effort 吧」。
+                        引擎是谁看左边那个图标就知道了（悬停有字）。
+                      */}
+                      <select
+                        className="composer-select composer-effort-select"
+                        value={engineModels?.effort?.current || ''}
+                        onChange={(event) => void onEngineOptionChange('thought_level', event.target.value)}
+                        disabled={!currentSessionId || !engineModels?.effort?.options.length || isStreaming || isLooping || engineModelBusy || status !== 'connected'}
+                        title={`${engineLabel} 的 effort（想多久）`}
+                        aria-label="Effort"
+                      >
+                        {engineModels?.effort?.options.length
+                          ? engineModels.effort.options.map((o) => <option key={o.value} value={o.value}>{`Effort · ${o.name}`}</option>)
+                          : <option value="">Effort</option>}
+                      </select>
+                    </div>
+                  ) : (
                   <div
-                    className="composer-agent-selector"
-                    title="Agent (switching restarts this chat's executor with the selected Kiro agent)"
-                  >
-                    {/*
-                      改这个 agent 的配置 —— 按钮就在选它的旁边。「把 kiro 的 agent 配置这个按钮放到会话界面」。
-                      它原来在左侧栏底部那排图标里:选 agent 在这儿、改 agent 在那儿,而那排图标里它和
-                      🧠、⚙️ 挤在一起,看不出改的是「当前这个 agent」。
-                      **改的是全局配置**:agent 定义在 ~/.kiro 下,一份被所有会话共用 —— 所以 title 里明说,
-                      免得看着它在会话里就以为只影响这一个会话。
-                    */}
-                    <button
-                      className="composer-meta-btn composer-agent-config"
-                      onClick={openAgentConfig}
-                      disabled={!currentSessionId || agentConfigLoading}
-                      title={`编辑 ${kiroAgent || 'agent'} 的配置 —— 全局生效（所有会话共用这一份定义）`}
-                      aria-label={t('Edit agent config (global)')}
+                      className="composer-agent-selector"
+                      title="Agent (switching restarts this chat's executor with the selected Kiro agent)"
                     >
-                      {/* 还是那个机器人图标 —— 它在侧栏用了很久，认的是它，不是一个新的齿轮 */}
-                      <IconRobot size={15} />
-                    </button>
-                    {agentConfigLoading && <span className="composer-agent-spinner">⏳</span>}
-                    <select
-                      ref={agentSelectRef}
-                      className="composer-select composer-agent-select"
-                      value={kiroAgent}
-                      onChange={(event) => onKiroAgentChange(event.target.value)}
-                      disabled={!currentSessionId || isStreaming || isLooping || switchingAgent || status !== 'connected'}
-                      aria-label="Agent"
-                    >
-                      {kiroAgent && !kiroAgents.some((agent) => agent.name === kiroAgent) && (
-                        <option value={kiroAgent}>{kiroAgent}</option>
-                      )}
-                      {kiroAgents.map((agent) => (
-                        <option key={agent.name} value={agent.name}>
-                          {agent.name}{agent.isDefault ? ' (default)' : ''}
-                        </option>
-                      ))}
-                    </select>
-                    {switchingAgent && <span className="composer-agent-spinner">⏳</span>}
-                  </div>
+                      {/*
+                        改这个 agent 的配置 —— 按钮就在选它的旁边。「把 kiro 的 agent 配置这个按钮放到会话界面」。
+                        它原来在左侧栏底部那排图标里:选 agent 在这儿、改 agent 在那儿,而那排图标里它和
+                        🧠、⚙️ 挤在一起,看不出改的是「当前这个 agent」。
+                        **改的是全局配置**:agent 定义在 ~/.kiro 下,一份被所有会话共用 —— 所以 title 里明说,
+                        免得看着它在会话里就以为只影响这一个会话。
+                      */}
+                      <button
+                        className="composer-meta-btn composer-agent-config"
+                        onClick={openAgentConfig}
+                        disabled={!currentSessionId || agentConfigLoading}
+                        title={`编辑 ${kiroAgent || 'agent'} 的配置 —— 全局生效（所有会话共用这一份定义）`}
+                        aria-label={t('Edit agent config (global)')}
+                      >
+                        {/* 还是那个机器人图标 —— 它在侧栏用了很久，认的是它，不是一个新的齿轮 */}
+                        <IconRobot size={15} />
+                      </button>
+                      {agentConfigLoading && <span className="composer-agent-spinner">⏳</span>}
+                      <select
+                        ref={agentSelectRef}
+                        className="composer-select composer-agent-select"
+                        value={kiroAgent}
+                        onChange={(event) => onKiroAgentChange(event.target.value)}
+                        disabled={!currentSessionId || isStreaming || isLooping || switchingAgent || status !== 'connected'}
+                        aria-label="Agent"
+                      >
+                        {kiroAgent && !kiroAgents.some((agent) => agent.name === kiroAgent) && (
+                          <option value={kiroAgent}>{kiroAgent}</option>
+                        )}
+                        {kiroAgents.map((agent) => (
+                          <option key={agent.name} value={agent.name}>
+                            {agent.name}{agent.isDefault ? ' (default)' : ''}
+                          </option>
+                        ))}
+                      </select>
+                      {switchingAgent && <span className="composer-agent-spinner">⏳</span>}
+                    </div>
+                  )}
 
                   <div className="import-context-wrapper">
                     <button
@@ -4002,59 +4079,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     )}
                   </div>
 
-                  {/*
-                    **工作目录就摆在这儿** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
-
-                    它是个**常驻事实**，不是一次性动作：这条会话读写哪棵树，决定了它看得见什么。
-                    远程会话尤其 —— 远端只看得见被镜像的那一个目录（实测 kiro-cli 不用 ACP 的客户端
-                    fs 能力，声明了也 0 回调），而「远程会话为什么访问不了本地的文件」那次之所以
-                    只能靠猜，就是因为这个值当时**在界面上根本不存在**：藏在右键菜单里的东西既显示
-                    不出当前值、也提示不了这件事存在。
-
-                    **不在跑的时候禁用**：换目录会换执行器（那一轮会断），但这正是你想改它的时候
-                    ——「这些右键菜单应该优先级大于正在跑的任务」。而且点它先弹 Finder，误触也停得下来。
-                  */}
-                  {/*
-                    **一格一个目录** ——「页面下面的文件夹直接显示哪几个文件夹被选中就行了」。
-
-                    第一格是主目录（`local_bash` 的 cwd、相对路径的基准），点它 = 换主目录；
-                    后面几格右边有个 ✕ = 去掉那一个；最后一个 ＋ = 再加一个。
-                    主目录没有 ✕：去掉 cwd 就得同时指定新的 cwd，那是"换"而不是"删"。
-                  */}
-                  {dirList.map((d, i) => (
-                    <span key={d} className="composer-workdir-chip">
-                      <button
-                        className="composer-meta-btn composer-workdir"
-                        onClick={() => (i === 0 ? onPickWorkdir?.() : undefined)}
-                        disabled={!currentSessionId || (i === 0 && !onPickWorkdir)}
-                        title={i === 0 ? workdirTitle : `${d}\n（附加目录：local_glob / local_grep 不指定目录时也会搜它）`}
-                      >
-                        📂 <span className="composer-meta-label">{dirLabel(d)}</span>
-                      </button>
-                      {i > 0 && onRemoveWorkdir ? (
-                        <button
-                          className="composer-workdir-x"
-                          onClick={() => onRemoveWorkdir(d)}
-                          disabled={!currentSessionId}
-                          title={`不再让这条会话动 ${d}`}
-                        >✕</button>
-                      ) : null}
-                    </span>
-                  ))}
-                  {/*
-                    没有任何真目录时只剩这个 ＋（点它选一个）—— 「没有就不显示」指的是
-                    别显示一个假的当前值，而不是把"能选目录"这件事也藏掉。
-                  */}
-                  {onAddWorkdir || onPickWorkdir ? (
-                    <button
-                      className="composer-meta-btn composer-workdir-add"
-                      onClick={() => (dirList.length ? onAddWorkdir?.() : onPickWorkdir?.())}
-                      disabled={!currentSessionId}
-                      title={dirList.length
-                        ? '再加一个目录 —— 这条会话就能同时动这几棵树'
-                        : '选一个工作目录 —— 这条会话现在没有'}
-                    >{dirList.length ? '＋' : '📂 ＋'}</button>
-                  ) : null}
                 </div>
 
                 <div className="composer-belowbar-right">
@@ -4086,57 +4110,81 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     </>
                   ) : null}
 
+                  {/* 模型清单是 kiro 的；另外两家用它们自己 CLI 配的模型 */}
+                  {!nonKiro && (
                   <select
-                    ref={modelSelectRef}
-                    className="composer-select composer-model-select"
-                    value={selectedModel}
-                    onChange={(event) => onModelChange(event.target.value)}
-                    disabled={!currentSessionId || isStreaming || isLooping || switchingModel || status !== 'connected'}
-                    title={isStreaming
-                      ? 'Wait for the current response to finish before switching models'
-                      : switchingModel
-                      ? 'Wait for the current model change to finish'
-                      : 'Model'}
-                  >
-                    {models.length > 0 ? (
-                      <>
-                        {/* The executor binds --model at spawn, so a session can hold a
-                            model this account cannot use (a retired id, or a stale
-                            hardcoded default). A <select> whose value matches no option
-                            silently shows the FIRST one, so the composer claimed
-                            "gpt-5.6-sol" while the request actually ran
-                            "claude-sonnet-4.6" and failed. Surfacing the real value as a
-                            non-selectable option keeps the selector honest. */}
-                        {selectedModel && !models.some((model) => model.model_id === selectedModel) ? (
-                          <option value={selectedModel} disabled>
-                            {selectedModel} · unavailable
-                          </option>
-                        ) : null}
-                        {models.map((model) => (
-                          <option
-                            key={model.model_id}
-                            value={model.model_id}
-                            /*
-                              **数字是哪来的要能查** ——「为什么又看不到模型乘数了」那次的根因是
-                              远端只给 id、而本机清单里没有那个模型（地域过滤），于是倍率补不上。
-                              现在有缓存和内置快照兜底（`modelMeta.ts`），但快照可能过期 ——
-                              所以非实时的那几条在 title 里说一句，而不是让 `2.2x` 看起来永远权威。
-                            */
-                            title={(model as any).metaFrom && (model as any).metaFrom !== 'live' && (model as any).metaFrom !== 'none'
-                              ? `${model.model_id}（倍率/窗口来自${(model as any).metaFrom === 'cache' ? '本机缓存' : '内置快照'}，不是这台机器这一刻报的）`
-                              : model.model_id}
-                          >
-                            {model.model_name}{model.context_window_tokens ? ` · ${fmtContextWindow(model.context_window_tokens)}` : ''}
-                            {/* 价格乘数 —— 换模型是这一格里唯一会花钱的选择，代价该摆在做决定的地方 */}
-                            {fmtRate((model as any).rate_multiplier) ? ` · ${fmtRate((model as any).rate_multiplier)}` : ''}
-                          </option>
-                        ))}
-                      </>
-                    ) : (
-                      <option value={selectedModel || 'auto'}>{selectedModel || 'auto'}</option>
-                    )}
-                  </select>
-                  {switchingModel && <span className="composer-agent-spinner">⏳</span>}
+                      ref={modelSelectRef}
+                      className="composer-select composer-model-select"
+                      value={selectedModel}
+                      onChange={(event) => onModelChange(event.target.value)}
+                      disabled={!currentSessionId || isStreaming || isLooping || switchingModel || status !== 'connected'}
+                      title={isStreaming
+                        ? 'Wait for the current response to finish before switching models'
+                        : switchingModel
+                        ? 'Wait for the current model change to finish'
+                        : 'Model'}
+                    >
+                      {models.length > 0 ? (
+                        <>
+                          {/* The executor binds --model at spawn, so a session can hold a
+                              model this account cannot use (a retired id, or a stale
+                              hardcoded default). A <select> whose value matches no option
+                              silently shows the FIRST one, so the composer claimed
+                              "gpt-5.6-sol" while the request actually ran
+                              "claude-sonnet-4.6" and failed. Surfacing the real value as a
+                              non-selectable option keeps the selector honest. */}
+                          {selectedModel && !models.some((model) => model.model_id === selectedModel) ? (
+                            <option value={selectedModel} disabled>
+                              {selectedModel} · unavailable
+                            </option>
+                          ) : null}
+                          {models.map((model) => (
+                            <option
+                              key={model.model_id}
+                              value={model.model_id}
+                              /*
+                                **数字是哪来的要能查** ——「为什么又看不到模型乘数了」那次的根因是
+                                远端只给 id、而本机清单里没有那个模型（地域过滤），于是倍率补不上。
+                                现在有缓存和内置快照兜底（`modelMeta.ts`），但快照可能过期 ——
+                                所以非实时的那几条在 title 里说一句，而不是让 `2.2x` 看起来永远权威。
+                              */
+                              title={(model as any).metaFrom && (model as any).metaFrom !== 'live' && (model as any).metaFrom !== 'none'
+                                ? `${model.model_id}（倍率/窗口来自${(model as any).metaFrom === 'cache' ? '本机缓存' : '内置快照'}，不是这台机器这一刻报的）`
+                                : model.model_id}
+                            >
+                              {model.model_name}{model.context_window_tokens ? ` · ${fmtContextWindow(model.context_window_tokens)}` : ''}
+                              {/* 价格乘数 —— 换模型是这一格里唯一会花钱的选择，代价该摆在做决定的地方 */}
+                              {fmtRate((model as any).rate_multiplier) ? ` · ${fmtRate((model as any).rate_multiplier)}` : ''}
+                            </option>
+                          ))}
+                        </>
+                      ) : (
+                        <option value={selectedModel || 'auto'}>{selectedModel || 'auto'}</option>
+                      )}
+                    </select>
+                  )}
+                  {nonKiro && (
+                    <select
+                      className="composer-select composer-model-select"
+                      value={engineModels?.current || ''}
+                      onChange={(event) => void onEngineModelChange(event.target.value)}
+                      disabled={!currentSessionId || !engineModels?.options.length || isStreaming || isLooping || engineModelBusy || status !== 'connected'}
+                      title={engineModelErr ? `✗ ${engineModelErr}` : isStreaming ? '等这一轮回复完再换模型' : `${engineLabel} 的模型`}
+                    >
+                      {engineModels?.options.length ? (
+                        <>
+                          {engineModels.current && !engineModels.options.some((o) => o.value === engineModels.current) ? (
+                            <option value={engineModels.current} disabled>{engineModels.current}</option>
+                          ) : null}
+                          {engineModels.options.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)}
+                        </>
+                      ) : (
+                        <option value="">{status === 'connected' ? '默认模型' : '连接中…'}</option>
+                      )}
+                    </select>
+                  )}
+                  {(switchingModel || engineModelBusy) && <span className="composer-agent-spinner">⏳</span>}
+                  {engineModelErr && <span className="composer-engine-err" title={engineModelErr}>✗</span>}
                 </div>
               </div>
             </>
@@ -4206,7 +4254,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               {(schedKind === 'daily' || schedKind === 'weekly') && (
                 <label className="loop-dialog-field">
                   <span>{t('Time (HH:MM, 24-hour)')}</span>
-                  <input type="text" value={schedTime} onChange={(event) => setSchedTime(event.target.value)} placeholder="09:00" />
+                  <input type="text" value={schedTime} onChange={(event) => setSchedTime(event.target.value)} />
                 </label>
               )}
 
@@ -4447,6 +4495,42 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 ? <KiroConfigPanel key={cat.id} sessionId={currentSessionId || undefined} category={cat} onClose={closeAgentConfig} />
                 : null;
             })()}
+          </div>
+        </>,
+        document.body,
+      )}
+      {engineConfigOpen && nonKiro && currentSessionId && createPortal(
+        <>
+          <div className="overlay" onClick={() => setEngineConfigOpen(false)} />
+          <div className="agent-config-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="engine-config-title">
+            <div className="settings-header">
+              <div className="agent-config-editor-title">
+                {engine === 'claude' ? <IconClaudeSpark size={17} /> : <IconCodexPrompt size={17} />}
+                <h3 id="engine-config-title">{engineLabel} 配置</h3>
+              </div>
+              <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label="Close">✕</button>
+            </div>
+            <div className="kiro-config-tabs" role="tablist">
+              {[{ id: 'login', label: '🔑 登录' }, ...engineConfigCats].map((c) => (
+                <button
+                  key={c.id}
+                  role="tab"
+                  aria-selected={engineConfigTab === c.id}
+                  className={`kiro-config-tab ${engineConfigTab === c.id ? 'active' : ''}`}
+                  onClick={() => setEngineConfigTab(c.id)}
+                >
+                  {c.label}
+                </button>
+              ))}
+            </div>
+            {engineConfigTab === 'login'
+              ? <EngineLoginPane sessionId={currentSessionId} tool={engine as 'claude' | 'codex'} />
+              : (() => {
+                const cat = engineConfigCats.find((c) => c.id === engineConfigTab);
+                return cat
+                  ? <KiroConfigPanel key={cat.id} sessionId={currentSessionId} category={cat} onClose={() => setEngineConfigOpen(false)} />
+                  : null;
+              })()}
           </div>
         </>,
         document.body,

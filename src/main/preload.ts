@@ -32,6 +32,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     permissionMode: 'auto-approve' | 'ask' = 'auto-approve',
     /** 这条会话跑在哪台机器上（`undefined` = 本地）。见 docs/DESIGN_remote_sessions.md。 */
     remoteId?: string,
+    /** 哪个引擎：'kiro'（默认）/ 'claude' / 'codex'。见 src/main/engines.ts。 */
+    engine?: string,
   ) => ipcRenderer.invoke(
     'acp:new-session',
     kiroLexId,
@@ -41,6 +43,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     kiroAgent,
     permissionMode,
     remoteId,
+    engine,
   ),
   loadSession: (sessionId: string, cwd: string, model: string) => ipcRenderer.invoke('acp:load-session', sessionId, cwd, model),
   primeHistory: (sessionId: string, force?: boolean) =>
@@ -57,7 +60,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
    */
   listKiroAgents: (machine?: string) => ipcRenderer.invoke('kiro:list-agents', machine),
   /* 机器人按钮的其余 tab —— 跟着会话所在的机器（见 index.ts 的 kiro:config-*） */
-  kiroConfigCategories: () => ipcRenderer.invoke('kiro:config-categories'),
+  /** 机器人面板的 tab；按引擎（不传 = kiro）。 */
+  kiroConfigCategories: (engine?: string) => ipcRenderer.invoke('kiro:config-categories', engine),
   kiroConfigList: (sessionId: string | undefined, category: string) => ipcRenderer.invoke('kiro:config-list', sessionId, category),
   kiroConfigRead: (sessionId: string | undefined, category: string, name?: string) => ipcRenderer.invoke('kiro:config-read', sessionId, category, name),
   kiroConfigWrite: (sessionId: string | undefined, category: string, name: string | undefined, content: string) =>
@@ -87,9 +91,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
       sessions: Array<{
         id: string; title: string; updatedAt: number; bytes: number;
         syncedAt: number; state: 'never' | 'pending' | 'synced';
+        /** 这条会话单独设成了不同步。 */
+        excluded?: boolean;
       }>;
     }>;
     excludeProjects: string[];
+    excludeSessions?: string[];
   }> => ipcRenderer.invoke('s3:projects'),
   /**
    * **删掉一个项目在桶里的备份**（不动本地）。不可逆，所以 `confirm` 必须原样是项目名 ——
@@ -109,6 +116,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
   saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => ipcRenderer.invoke('kiro:save-agent-config', sessionId, agentName, source, content),
   switchKiroAgent: (sessionId: string, agentName: string) => ipcRenderer.invoke('acp:switch-kiro-agent', sessionId, agentName),
   switchModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:switch-model', sessionId, model),
+  engineModels: (sessionId: string) => ipcRenderer.invoke('acp:engine-models', sessionId),
+  setEngineModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:set-engine-model', sessionId, model),
+  setEngineOption: (sessionId: string, category: 'thought_level' | 'mode', value: string) => ipcRenderer.invoke('acp:set-engine-option', sessionId, category, value),
+  onEngineModels: (cb: (d: { sessionId: string; current: string; options: Array<{ value: string; name: string }>; effort?: any; mode?: any }) => void) => {
+    const handler = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('session:engine-models', handler);
+    return () => ipcRenderer.removeListener('session:engine-models', handler);
+  },
   switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') =>
     ipcRenderer.invoke('acp:switch-permission-mode', sessionId, permissionMode),
   readTranscript: (sessionId: string) => ipcRenderer.invoke('acp:read-transcript', sessionId),
@@ -417,17 +432,6 @@ contextBridge.exposeInMainWorld('kiroApi', {
   setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string) =>
     ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir),
   /**
-   * **只换工作目录，机器不变** —— 会话界面上那个 📂。
-   *
-   * 不复用 `setRemoteTarget`：那个要 `remoteId`，而渲染层手里只有 label，按 label 反查一旦查不到
-   * 就会传 `null` 过去 —— 那是"切回本地"。改个目录顺手把会话切下远端，属于改完很久才发现的错。
-   *
-   * **给数组 = 整份清单**（第一个是主目录，也就是 `local_bash` 的 cwd）；给字符串 = 只换主目录，
-   * 其余目录留着不动。两种都要有：换主目录和增删附加目录是两个不同的动作。
-   */
-  setWorkdir: (sessionId: string, dir: string | string[]) =>
-    ipcRenderer.invoke('acp:set-workdir', sessionId, dir),
-  /**
    * **KiroLex 自己对你说的一句话**（推/拉进度、冲突、换机器…）。
    *
    * 这些不进 transcript：它们不是对话内容，写进去会打断对话的读法、把 transcript 撑大
@@ -442,6 +446,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 存**本机**那三个 CLI 的启动命令（kiro / claude / codex）。
    * 空 = 用默认。远端那份跟着各自的机器配置走（`remoteSave` 里的 `bins`）。
    */
+  /** 本机工作目录（没归项目的本地会话在这里干活；默认 `~/kirolex`）。 */
+  localSaveWorkdir: (dir: string) => ipcRenderer.invoke('local:save-workdir', dir),
   localSaveBins: (bins: { kiro?: string; claude?: string; codex?: string }) =>
     ipcRenderer.invoke('local:save-bins', bins),
   /**
@@ -481,6 +487,31 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 徽标和右键菜单里那句「运行位置：…」用的是**同一份**会话状态，不听这个事件的话两处都会停在旧值上
    * —— 实测就是这样：切完了，但侧栏没徽标、菜单还写着"本地"。
    */
+  /** 🔑 登录：远端机器上 Claude Code / Codex 的登录状态 / 写网关配置 / 官方账号登录。 */
+  aiLoginStatus: (machine: string) => ipcRenderer.invoke('ai-login:status', machine),
+  aiLoginApply: (machine: string, input: any) => ipcRenderer.invoke('ai-login:apply', machine, input),
+  /** 本机那份配置变成编辑器文本（「拷入本机配置」）；只读本机，不写任何地方。 */
+  aiLoginLocalConfig: (tool: 'claude' | 'codex') => ipcRenderer.invoke('ai-login:local-config', tool),
+  aiLoginRun: (machine: string, tool: 'claude' | 'codex', opts?: { console?: boolean }) => ipcRenderer.invoke('ai-login:run', machine, tool, opts),
+  aiLoginInput: (runId: string, line: string) => ipcRenderer.invoke('ai-login:input', runId, line),
+  aiLoginCancel: (runId: string) => ipcRenderer.invoke('ai-login:cancel', runId),
+  onAiLoginOutput: (callback: (d: { runId: string; chunk: string }) => void) => {
+    const handler = (_event: any, d: any) => callback(d);
+    ipcRenderer.on('ai-login:output', handler);
+    return () => ipcRenderer.removeListener('ai-login:output', handler);
+  },
+  onAiLoginExit: (callback: (d: { runId: string; code: number | null }) => void) => {
+    const handler = (_event: any, d: any) => callback(d);
+    ipcRenderer.on('ai-login:exit', handler);
+    return () => ipcRenderer.removeListener('ai-login:exit', handler);
+  },
+  /** 给已有的会话换引擎（kiro / claude / codex）。没连着的只改记录。 */
+  switchEngine: (sessionId: string, engine: string) => ipcRenderer.invoke('acp:switch-engine', sessionId, engine),
+  onEngineChanged: (callback: (d: { sessionId: string; engine: 'kiro' | 'claude' | 'codex' }) => void) => {
+    const handler = (_event: any, d: any) => callback(d);
+    ipcRenderer.on('session:engine-changed', handler);
+    return () => ipcRenderer.removeListener('session:engine-changed', handler);
+  },
   onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:targets-changed', handler);

@@ -16,6 +16,26 @@ export const IconRobot: React.FC<IconProps> = ({ size = 16, className }) => (
   </svg>
 );
 
+/**
+ * Claude Code / Codex 会话左下角那颗按钮的图标 ——「claude code 和 codex 应该和 kiro-cli 在界面上有所区别，
+ * 至少左下角不应该再用那个机器人的图标了」。机器人留给 kiro；Claude Code 是一朵放射状的星芒（它 logo 的那个意思），
+ * Codex 是一个终端提示符 `>_`。线宽、圆角和机器人那颗一致，放在同一排里不突兀。
+ */
+export const IconClaudeSpark: React.FC<IconProps> = ({ size = 16, className }) => (
+  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true">
+    <path d="M12 3.5v5.5M12 15v5.5M3.5 12H9M15 12h5.5M6 6l3.9 3.9M14.1 14.1L18 18M18 6l-3.9 3.9M9.9 14.1L6 18" />
+    <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
+  </svg>
+);
+
+export const IconCodexPrompt: React.FC<IconProps> = ({ size = 16, className }) => (
+  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+    <rect x="3" y="4.5" width="18" height="15" rx="3.5" />
+    <path d="M7.5 9.5l3 2.5-3 2.5" />
+    <path d="M12.5 15h4" />
+  </svg>
+);
+
 export const IconPaperclip: React.FC<IconProps> = ({ size = 17, className }) => (
   <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
     <path d="M21.44 11.05 12.25 20.24a6 6 0 0 1-8.49-8.49l9.19-9.19a4 4 0 0 1 5.66 5.66l-9.2 9.19a2 2 0 0 1-2.83-2.83l8.49-8.48" />

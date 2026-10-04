@@ -56,6 +56,8 @@ export interface RemoteTarget {
   remoteWorkdir?: string;
   /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
   bins?: ExecutorBins;
+  /** SSH 密码，`safeStorage` 加密后的 base64（见 sshAuth.ts）。没有 = 只用密钥/ssh 自己的配置。 */
+  passwordCipher?: string;
 }
 
 export interface AgentProfile {
@@ -95,6 +97,17 @@ export interface AgentProfile {
   /** Named kiro-cli agent launched via `kiro-cli acp --agent <name>`.
    * Undefined means kiro-cli's built-in default agent. */
   kiroAgent?: string;
+
+  /** 哪个引擎跑这条会话：kiro（默认，老记录里没有这个字段）/ claude / codex。见 `engines.ts`。 */
+  engine?: 'kiro' | 'claude' | 'codex';
+  /** Claude Code / Codex 会话里手动选的模型（按引擎分开记：换引擎不会把 claude 的模型名塞给 codex）。
+   *  每次连上之后重新设一次 —— 适配器进程是新的，它只记得自己 CLI 的默认值。 */
+  engineModels?: { claude?: string; codex?: string };
+  /** 同上，effort（`thought_level`）和权限模式（`mode`）—— 顶上那颗按钮在这两家就是 mode 下拉。 */
+  engineOptions?: {
+    claude?: { thought_level?: string; mode?: string };
+    codex?: { thought_level?: string; mode?: string };
+  };
 
   /**
    * Project identity for the layered memory store. WRITE-ONCE:
@@ -222,16 +235,37 @@ export function loadActiveRemoteTarget(configPath: string): RemoteTarget | undef
 }
 
 /**
- * Default working directory for a remote target that omits `remoteWorkdir`.
- * Derives the login user from an "user@host" sshHost and returns that user's
- * conventional Linux home (`/root` for root, `/home/<user>` otherwise). Falls
- * back to "~" when no user is present, which the remote login shell expands.
+ * Default working directory for a remote target that omits `remoteWorkdir`: `~/kirolex`
+ * on that machine (「远端目录默认就变成 ~/kirolex」) —— its own directory rather than the bare
+ * home, so KiroLex's scratch dirs don't land among the user's files.
+ * Spelled as an absolute path derived from the "user@host" login user (`/root` for root,
+ * `/home/<user>` otherwise), because the path is shell-quoted where it is used and a quoted
+ * `~` is never expanded. Falls back to "~/kirolex" when no user is present.
  */
+function safeLocalUser(): string {
+  try { return os.userInfo().username || ''; } catch { return ''; }
+}
+
 export function defaultRemoteWorkdir(sshHost: string): string {
-  const user = sshHost.includes('@') ? sshHost.split('@')[0].trim() : '';
-  if (!user) return '~';
-  if (user === 'root') return '/root';
-  return `/home/${user}`;
+  return resolveRemoteWorkdir('~/kirolex', sshHost);
+}
+
+/**
+ * The remote workdir actually used: a configured value, with a leading `~` turned into
+ * the login user's home. The settings page now FILLS the field with `~/kirolex`
+ * (「工作目录不是让你填成默认 ~/kirolex 之类的吗」), and the path is shell-quoted
+ * everywhere it is used, where `~` is never expanded -- so it is expanded here, from the
+ * "user@host" login user (`/root` for root, `/home/<user>` otherwise). With no user in
+ * the address ssh logs in as THIS machine's user (「用户名留空 = 用本机的用户名」), so
+ * that name is used; only if even that is unknown is the value returned unchanged.
+ */
+export function resolveRemoteWorkdir(workdir: string | undefined, sshHost: string, localUser = safeLocalUser()): string {
+  const wd = (workdir || '').trim() || '~/kirolex';
+  if (wd !== '~' && !wd.startsWith('~/')) return wd;
+  const user = (sshHost.includes('@') ? sshHost.slice(0, sshHost.lastIndexOf('@')).trim() : '') || localUser;
+  if (!user) return wd;
+  const home = user === 'root' ? '/root' : `/home/${user}`;
+  return wd === '~' ? home : `${home}/${wd.slice(2)}`;
 }
 
 /**
@@ -254,7 +288,7 @@ export function sessionCwd(profile: AgentProfile, localDefault: string): string 
       它自己要落个临时文件时有地方放，而不是"项目在这里"。
       一条会话一个目录 —— 共用一个的话两条会话的临时文件会互相覆盖。
     */
-    const wd = profile.remote.remoteWorkdir || defaultRemoteWorkdir(profile.remote.sshHost);
+    const wd = resolveRemoteWorkdir(profile.remote.remoteWorkdir, profile.remote.sshHost);
     /* 名字里带一段**本地目录的哈希**：`~/code/blog` 和 `~/work/blog` 的 basename 一样，
        只用 basename 会把两条会话的草稿目录叠在一起。 */
     const base = (localDefault.split('/').filter(Boolean).pop() || 'session').replace(/[^\w.@-]+/g, '_');

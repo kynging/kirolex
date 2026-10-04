@@ -1,7 +1,19 @@
 import assert from 'node:assert/strict';
 import test from 'node:test';
 import fs from 'node:fs';
-import { buildMemoryInjection } from '../src/main/memory.ts';
+import os from 'node:os';
+import path from 'node:path';
+
+/*
+  `buildMemoryInjection` 会顺手 `ensureMemoryFiles` —— 用真 HOME 跑就会在 `~/.kirolex/memory/projects/`
+  下面留一个 `__t_proj`。`baseDir` 在模块加载时就取 `os.homedir()` 定死了，所以必须**先**换 HOME
+  （Windows 上 `os.homedir()` 认的是 USERPROFILE）再动态 import。
+*/
+const fakeHome = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-memhome-'));
+process.env.HOME = fakeHome;
+process.env.USERPROFILE = fakeHome;
+const { buildMemoryInjection } = await import('../src/main/memory.ts');
+test.after(() => fs.rmSync(fakeHome, { recursive: true, force: true }));
 
 /*
   **远程会话要被告知用 `local_write`** ——「kirolex 说它无法编辑本地的 memory 文件？为什么」。
@@ -41,7 +53,9 @@ test('本地：保持原样，不要凭空要求一个本地会话去用 local_w
 test('两种情况都要给出完整路径 —— 猜项目名是另一个已经踩过的坑', () => {
   for (const remote of [true, false]) {
     const g = guidance(remote);
-    assert.match(g, /global → \S*\.kirolex\/memory\/global\.md/);
+    /* 分隔符跟着本机走：Windows 上是反斜杠 */
+    assert.match(g, /global → \S*\.kirolex[\\/]memory[\\/]global\.md/);
+    assert.ok(g.includes(fakeHome), '路径应落在临时 HOME 里，而不是真的 ~/.kirolex');
     assert.match(g, /__t_proj/);
   }
 });

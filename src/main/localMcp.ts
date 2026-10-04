@@ -273,6 +273,39 @@ export function toolDefs(): Array<{ name: string; description: string; inputSche
 /** `local_git` 允许的子命令 —— 写操作走 `local_bash`（那条路是你明确要的，留痕即可）。 */
 export const GIT_READONLY = ['status', 'diff', 'log', 'show', 'branch', 'rev-parse', 'ls-files', 'blame'];
 
+/**
+ * **cmd.exe 的参数要原样给** —— Node 在 Windows 上按 MSVC 规则给参数加引号、把 `"` 转成 `\"`，
+ * 而 cmd.exe 不认 `\"`：`findstr /C:"a b"` 到它手里就成了 `/C:\"a` 和 `b\"`，
+ * `bash -c "..."` 报 unexpected EOF（这条会话里实测撞到）。所以整条命令包一层引号、
+ * 配合 `/s`（cmd 只剥掉最外层那一对）和 `windowsVerbatimArguments` 原样交出去。
+ */
+export function cmdShellArgs(command: string): string[] {
+  return ['/d', '/s', '/c', `"${command}"`];
+}
+
+/** `branch` 的写操作开关 —— 子命令名是只读的不等于参数也是。 */
+const GIT_BRANCH_WRITES = /^(-[dDmMcCfu]|--(delete|move|copy|force|set-upstream-to|unset-upstream|edit-description|track|no-track)(=|$))/;
+
+/**
+ * 只读子命令上的**写参数**：`branch -D x` 删分支、`branch x` 建分支、`diff/log --output=f` 写任意文件、
+ * `--ext-diff` / `--textconv` 跑配置里的外部程序。这些都绕过了"写操作走 local_bash 留痕"那条规矩。
+ * 返回一句原因，或 null = 可以跑。
+ */
+export function gitArgsProblem(argv: string[]): string | null {
+  const [sub, ...rest] = argv;
+  if (!GIT_READONLY.includes(sub)) return `只跑只读子命令（${GIT_READONLY.join('/')}）`;
+  for (const a of rest) {
+    if (/^--(output|ext-diff|textconv)(=|$)/.test(a) || a === '-o') return `${a} 会写文件或跑外部程序`;
+  }
+  if (sub === 'branch') {
+    const w = rest.find((a) => GIT_BRANCH_WRITES.test(a));
+    if (w) return `branch ${w} 是写操作`;
+    const listing = rest.some((a) => /^(-l|--list|-a|--all|-r|--remotes|--contains|--no-contains|--merged|--no-merged|--points-at)$/.test(a));
+    if (!listing && rest.some((a) => !a.startsWith('-'))) return 'branch <名字> 会新建分支';
+  }
+  return null;
+}
+
 function clip(s: string, max = MAX_OUTPUT_BYTES): string {
   const b = Buffer.from(s, 'utf8');
   if (b.length <= max) return s;
@@ -291,9 +324,9 @@ function text(t: string, isError = false): ToolResult {
  * 于是 `local_grep` 把"这台机器上没装 ripgrep"读成了"没有匹配"，直接返回"（没有匹配）"
  * 而根本没去试 grep（单测里抓到的）。"没搜到"和"没法搜"必须分得开。
  */
-function run(file: string, args: string[], cwd: string, timeoutMs: number): Promise<{ code: number | null; out: string; spawnFailed?: boolean }> {
+function run(file: string, args: string[], cwd: string, timeoutMs: number, verbatim = false): Promise<{ code: number | null; out: string; spawnFailed?: boolean }> {
   return new Promise((resolve) => {
-    execFile(file, args, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8' },
+    execFile(file, args, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8', windowsVerbatimArguments: verbatim, windowsHide: true },
       (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
         spawnFailed: !!err && typeof err.code === 'string',
@@ -389,9 +422,10 @@ export async function callTool(
     case 'local_git': {
       const argv: string[] = Array.isArray(args?.args) ? args.args.map(String) : [];
       if (!argv.length) return text('local_git 需要 args', true);
-      if (!GIT_READONLY.includes(argv[0])) {
-        return text(`local_git 只跑只读子命令（${GIT_READONLY.join('/')}）。要提交、切分支这类事用 local_bash —— `
-          + '那条路会在用户的会话里留痕。', true);
+      const problem = gitArgsProblem(argv);
+      if (problem) {
+        return text(`local_git 拒绝：${problem}。要提交、切分支、写文件这类事用 local_bash —— `
+          + '那条路会留痕。', true);
       }
       const r = await run('git', argv, cwd, 60_000);
       return text(r.out.trim() || '（没有输出）');
@@ -400,8 +434,11 @@ export async function callTool(
       const command = String(args?.command || '');
       if (!command) return text('local_bash 需要 command', true);
       const timeoutMs = Number(args?.timeoutMs) > 0 ? Number(args.timeoutMs) : BASH_TIMEOUT_MS;
-      /* 留痕：跑在**你**机器上的命令，你必须看得见（截断到一行长度，全文在日志里） */
-      deps.notice(session.sessionId, `⌨️ 远端那条会话在你本机跑了：\`${command.replace(/\s+/g, ' ').slice(0, 120)}\``);
+      /*
+        留痕**只进日志，不进会话** ——「那个远程会话在本机跑了啥提示好像没啥用？」。原来每一条都往
+        会话里插一句「⌨️ 远端那条会话在你本机跑了：…」，一个任务跑几十条命令就是几十句噪音，
+        把真正的回复挤得看不见。全文照旧记在 main.log 里（下面这行）。
+      */
       deps.log('info', `local_bash sessionId=${session.sessionId} cwd=${cwd} cmd=${command.replace(/\s+/g, ' ').slice(0, 400)}`);
       /*
         **Windows 上没有 `bash`** —— 换成 `%ComSpec% /d /s /c`（`loopVerify.ts` 里
@@ -410,7 +447,7 @@ export async function callTool(
         "这个工具完全不可用"，那更糟。
       */
       const r = process.platform === 'win32'
-        ? await run(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', command], cwd, timeoutMs)
+        ? await run(process.env.ComSpec || 'cmd.exe', cmdShellArgs(command), cwd, timeoutMs, true)
         : await run('bash', ['-lc', command], cwd, timeoutMs);
       return text(`[exit ${r.code}]\n${r.out.trim()}`);
     }

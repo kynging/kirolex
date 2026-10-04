@@ -4,6 +4,7 @@ import * as fs from 'node:fs';
 import * as os from 'node:os';
 import * as path from 'node:path';
 import { execFileSync } from 'node:child_process';
+import { pathToFileURL } from 'node:url';
 
 /**
  * unassigned 会话必须被告知**有哪些项目、路径是什么**，否则它只能猜。
@@ -15,17 +16,18 @@ import { execFileSync } from 'node:child_process';
  * `memory.ts` 在模块加载时就从 `os.homedir()` 算出 baseDir，所以这里在**子进程**里跑，把 HOME 指到
  * 临时目录 —— 既能测真实的磁盘行为，又不会在用户的 `~/.kirolex` 里留下探针垃圾。
  */
-const here = path.dirname(new URL(import.meta.url).pathname);
+const here = import.meta.dirname;
 let home = '';
 
 function inject(projectId: string | undefined, sessionId: string): string {
   const script = `
-    const m = await import(${JSON.stringify(path.join(here, '..', 'src', 'main', 'memory.ts'))});
+    const m = await import(${JSON.stringify(pathToFileURL(path.join(here, '..', 'src', 'main', 'memory.ts')).href)});
     process.stdout.write(m.buildMemoryInjection(${projectId === undefined ? 'undefined' : JSON.stringify(projectId)}, ${JSON.stringify(sessionId)}) || '');
   `;
   return execFileSync(process.execPath, ['--input-type=module', '-e', script], {
     encoding: 'utf-8',
-    env: { ...process.env, HOME: home },
+    // os.homedir() reads USERPROFILE on Windows, HOME elsewhere.
+    env: { ...process.env, HOME: home, USERPROFILE: home },
   });
 }
 
@@ -51,9 +53,9 @@ describe('unassigned 会话的注入块', () => {
 
   test('给的是确切路径 —— 猜错名字就是因为之前没人给过路径', () => {
     const out = inject(undefined, 's_probe');
-    assert.match(out, /projects\/Dev\/memory\.md/);
+    assert.match(out, /projects[\\/]Dev[\\/]memory\.md/);
     // 带空格的项目名也要原样给出，不能被截断
-    assert.match(out, /projects\/SFDC Activity\/memory\.md/);
+    assert.match(out, /projects[\\/]SFDC Activity[\\/]memory\.md/);
   });
 
   test('明说都不匹配时只写 session 层，并禁止新建目录', () => {

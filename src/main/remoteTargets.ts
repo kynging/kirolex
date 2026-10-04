@@ -30,6 +30,8 @@ export interface RemoteTargetEntry extends RemoteTarget {
   id: string;
   /** 界面上显示的名字（徽标、选择器）。 */
   label: string;
+  /** 最后一次在设置里存它的时间（ms）。打开设置时默认显示最近编辑的那台；老配置里没有。 */
+  editedAt?: number;
 }
 
 /** `~` 要展开 —— 配置里写 `~/k.pem` 的人不该因此连不上。 */
@@ -58,6 +60,7 @@ export function deriveLabel(sshHost: string): string {
 function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntry | undefined {
   const sshHost = typeof raw?.sshHost === 'string' ? raw.sshHost.trim() : '';
   if (!sshHost) return undefined;   // 没有 host 就不是一个能用的目标，不要放进列表
+  if (sshHost.startsWith('-')) return undefined;   // 会被 ssh 当成选项 —— 配置可能是从 S3 恢复回来的，按不可信处理
   const port = Number(raw?.sshPort);
   return {
     id: String(raw?.id || fallbackId),
@@ -68,6 +71,8 @@ function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntr
     proxyJump: typeof raw?.proxyJump === 'string' && raw.proxyJump.trim() ? raw.proxyJump.trim() : undefined,
     remoteWorkdir: typeof raw?.remoteWorkdir === 'string' && raw.remoteWorkdir.trim() ? raw.remoteWorkdir.trim() : undefined,
     bins: normalizeBins(raw?.bins),
+    passwordCipher: typeof raw?.passwordCipher === 'string' && raw.passwordCipher ? raw.passwordCipher : undefined,
+    editedAt: Number.isFinite(Number(raw?.editedAt)) && Number(raw?.editedAt) > 0 ? Number(raw.editedAt) : undefined,
   };
 }
 
@@ -131,6 +136,33 @@ export function rememberBinSuccess(configPath: string, machine: string, tool: To
 }
 
 /** 存本机那份（只动 `localBins` 这一个键；空值 = 回到默认）。 */
+/**
+ * **本机的工作目录** ——「本机应该有工作目录这个功能，默认是用户目录下的 kirolex」。
+ *
+ * 没归项目的本地会话就在这个目录里干活（归了项目的用项目自己的目录）。原来它们的 cwd 是
+ * 每会话的 `~/.kirolex/sessions/<id>`（KiroLex 自己的数据目录，里面没有你的东西），而且新建和
+ * 重连给的还不是同一个目录 —— 对 Claude Code 这种按目录存会话的引擎，重连就找不回会话了。
+ * 存的是你写的样子（`~/kirolex`），用的时候展开。
+ */
+export const DEFAULT_LOCAL_WORKDIR = '~/kirolex';
+export function localWorkdir(configPath: string, home = os.homedir()): string {
+  let raw = '';
+  try { raw = String(JSON.parse(fs.readFileSync(configPath, 'utf-8'))?.localWorkdir || '').trim(); } catch { /* 没配就是默认 */ }
+  return expandHome(raw || DEFAULT_LOCAL_WORKDIR, home) || path.join(home, 'kirolex');
+}
+/** 设置页显示的那个值（没展开的）。 */
+export function localWorkdirSetting(configPath: string): string {
+  try { return String(JSON.parse(fs.readFileSync(configPath, 'utf-8'))?.localWorkdir || '').trim() || DEFAULT_LOCAL_WORKDIR; } catch { return DEFAULT_LOCAL_WORKDIR; }
+}
+export function saveLocalWorkdir(configPath: string, dir: string): string {
+  const v = String(dir || '').trim();
+  if (v && !path.isAbsolute(v) && !/^~([\/]|$)/.test(v)) throw new Error('工作目录要写绝对路径（或以 ~ 开头）。');
+  const cfg = readConfigObject(configPath);
+  if (v && v !== DEFAULT_LOCAL_WORKDIR) cfg.localWorkdir = v; else delete cfg.localWorkdir;
+  writeConfigObject(configPath, cfg);
+  return v || DEFAULT_LOCAL_WORKDIR;
+}
+
 export function saveLocalBins(configPath: string, bins: ExecutorBins): ExecutorBins | undefined {
   const cfg = readConfigObject(configPath);
   const next = normalizeBins(bins);
@@ -147,16 +179,24 @@ export function saveLocalBins(configPath: string, bins: ExecutorBins): ExecutorB
  */
 export function parseRemoteTargets(cfg: any, home = os.homedir()): RemoteTargetEntry[] {
   const out: RemoteTargetEntry[] = [];
-  const seen = new Set<string>();
-  const add = (t?: RemoteTargetEntry): void => {
+  const seen = new Map<string, number>();
+  /*
+    同一个 host:port 只留一条 —— 但留**最近编辑的那条**，不是最早的那条。
+
+    设置页曾经看不到已存的机器（开关关着时列表回空），人就一次次重加，攒出
+    aws-tokyo / -2 / -3 / -4 四条同 IP。按"先到先得"去重，留下的是最早那条 **没有私钥** 的，
+    后来选了密钥的那几条全被藏起来 —— 看起来就是"选了密钥不生效"。`newer` 只给新列表用；
+    老形状 `agents[].remote` 排在后面、也没有 editedAt，照旧不会顶掉新列表里的同一台。
+  */
+  const add = (t?: RemoteTargetEntry, newer = false): void => {
     if (!t) return;
     const key = `${t.sshHost}:${t.sshPort}`;
-    if (seen.has(key)) return;
-    seen.add(key);
-    out.push(t);
+    const at = seen.get(key);
+    if (at === undefined) { seen.set(key, out.length); out.push(t); return; }
+    if (newer && (t.editedAt || 0) >= (out[at].editedAt || 0)) out[at] = t;
   };
   const list = Array.isArray(cfg?.remotes) ? cfg.remotes : [];
-  list.forEach((raw: any, i: number) => add(normalize(raw, `remote${i + 1}`, home)));
+  list.forEach((raw: any, i: number) => add(normalize(raw, `remote${i + 1}`, home), true));
   /* 兼容读老形状。`enabled: false` 照样收 —— 那个字段原来的意思是"全局开关关着"，
      而现在选不选由会话决定，所以它不再能决定一台机器要不要出现在列表里。 */
   const agents = Array.isArray(cfg?.agents) ? cfg.agents : [];
@@ -178,7 +218,18 @@ export function listRemoteTargets(configPath: string, home = os.homedir()): Remo
 /** 按 id 找；找不到返回 undefined（调用方据此退回本地，而不是猜一台机器）。 */
 export function findRemoteTarget(configPath: string, id: string | undefined, home = os.homedir()): RemoteTargetEntry | undefined {
   if (!id) return undefined;
-  return listRemoteTargets(configPath, home).find((t) => t.id === id);
+  const list = listRemoteTargets(configPath, home);
+  const hit = list.find((t) => t.id === id);
+  if (hit) return hit;
+  /* 被去重掉的那几条（同 host:port 的重复项）：会话里记的可能正是它们的 id —— 认到留下来的那条 */
+  try {
+    const raw = (JSON.parse(fs.readFileSync(configPath, 'utf-8'))?.remotes || []).find((r: any) => String(r?.id || '') === id);
+    if (!raw?.sshHost) return undefined;
+    const port = Number(raw.sshPort) > 0 ? Number(raw.sshPort) : 22;
+    return list.find((t) => t.sshHost === String(raw.sshHost).trim() && t.sshPort === port);
+  } catch {
+    return undefined;
+  }
 }
 
 /* ------------------------------------------------------ 写：界面上能加/改/删 */
@@ -203,6 +254,8 @@ export interface RemoteTargetInput {
   remoteWorkdir?: string;
   /** 这台机器上三个 CLI 的启动命令（空 = 默认）。 */
   bins?: ExecutorBins;
+  /** 已加密的密码；主进程在 `remote:save` 里把界面给的明文加密后放这里。空串 = 清除。 */
+  passwordCipher?: string;
 }
 
 /** 新建时的 id：按 label/host 生成一个稳定的可读 id（不用时间戳 —— 那种 id 在配置文件里没法认）。 */
@@ -219,8 +272,10 @@ export function newTargetId(input: RemoteTargetInput, taken: string[] = []): str
 /** 校验一条输入。返回一句给人看的错误，或者 `null` = 可以存。 */
 export function validateTarget(input: RemoteTargetInput): string | null {
   const host = String(input?.sshHost || '').trim();
-  if (!host) return 'SSH 地址不能为空（形如 `ec2-user@1.2.3.4`）。';
-  if (/\s/.test(host)) return 'SSH 地址里不能有空格。';
+  if (!host) return 'IP 地址不能为空。';
+  if (/\s/.test(host)) return 'IP 地址里不能有空格。';
+  /* 以 `-` 开头会被 ssh 当成选项（`-oProxyCommand=…` = 在本机执行命令），见 sshProxy.ts unsafeSshHost */
+  if (host.startsWith('-')) return 'IP 地址不能以 `-` 开头。';
   const port = input.sshPort === undefined || input.sshPort === null || (input.sshPort as any) === '' ? 22 : Number(input.sshPort);
   if (!Number.isFinite(port) || port <= 0 || port > 65535) return '端口要是 1–65535 之间的数字。';
   const jump = String(input?.proxyJump || '').trim();
@@ -231,7 +286,7 @@ export function validateTarget(input: RemoteTargetInput): string | null {
   if (jump && !validJump(jump)) return '跳板地址只能是 `用户@主机` 或 `用户@主机:端口`（字母、数字、`@ . - _ :` 和 IPv6 的方括号）。';
   if (input.remoteWorkdir && !String(input.remoteWorkdir).startsWith('/') && !String(input.remoteWorkdir).startsWith('~')) {
     /* 相对路径会落在登录 shell 的当前目录上 —— 那是"看起来能用，但镜像跑到了别处" */
-    return '远端工作目录要写绝对路径（`/home/ec2-user/kirolex-mirror`）。';
+    return '工作目录要写绝对路径（以 `/` 或 `~` 开头）。';
   }
   return null;
 }
@@ -295,6 +350,9 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
       : old?.proxyJump,
     /* 和上面几个字段同一条规则：界面没给就不动（否则每次编辑都在悄悄抹掉它） */
     bins: has('bins') ? normalizeBins(input.bins) : normalizeBins(old?.bins),
+    /* 同一条规则：没给就不动（界面拿不到密文，所以它永远"没给"，除非你改了或清了密码） */
+    passwordCipher: has('passwordCipher') ? (String(input.passwordCipher) || undefined) : old?.passwordCipher,
+    editedAt: Date.now(),
   };
   if (at >= 0) list[at] = row; else list.push(row);
   cfg.remotes = list;

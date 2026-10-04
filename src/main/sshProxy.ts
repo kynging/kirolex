@@ -56,7 +56,21 @@ export function splitJump(jump: string): { dest: string; port?: number } {
  * 而"列出所有危险字符"这件事历史上没人做对过。主机名/用户名本来也只需要这几类字符。
  */
 export function validJump(jump: string): boolean {
-  return /^[A-Za-z0-9._@:[\]-]+$/.test(String(jump || ''));
+  /* 开头不许是 `-`：`-W` 后面那个参数会被跳板那条 ssh 当成选项 */
+  return /^[A-Za-z0-9._@:[\]][A-Za-z0-9._@:[\]-]*$/.test(String(jump || ''));
+}
+
+/**
+ * **sshHost 不许以 `-` 开头** —— 它是 ssh 的一个位置参数，`-oProxyCommand=calc.exe`
+ * 这种值没有空格、能过 `validateTarget` 原来的检查，然后被 ssh 当成**选项**解析，
+ * 也就是在这台机器上执行任意命令。配置会走 S3 备份/恢复回来（见上面 proxyArgs 的说明），
+ * 会话记录里也存着一份 remote 快照，所以拼参数的地方再拦一次，不只靠保存时的校验。
+ */
+export function unsafeSshHost(host: string | undefined): boolean {
+  return /^\s*-/.test(String(host || ''));
+}
+export function assertSafeSshHost(host: string | undefined): void {
+  if (unsafeSshHost(host)) throw new Error(`SSH 地址不能以 \`-\` 开头（${String(host).slice(0, 40)}）—— 拒绝拼进 ssh 命令。`);
 }
 
 export function proxyArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile'>): string[] {

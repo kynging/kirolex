@@ -29,6 +29,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { RemoteTarget } from './config';
+import { sshEnv } from './sshAuth.ts';
 
 export interface FileSize {
   name: string;
@@ -160,6 +161,7 @@ export class SshHost implements HostOps {
     return new Promise((resolve) => {
       try {
         execFile('ssh', args, {
+          env: sshEnv(this.remote),
           timeout: this.timeoutMs,
           maxBuffer: 16 * 1024 * 1024,
           encoding: 'utf8',

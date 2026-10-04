@@ -122,7 +122,8 @@ describe('kiro-cli trace 开关（默认关）', () => {
 
   test('起执行器时才把 KIRO_LOG_LEVEL 塞进去，不污染 KiroLex 自己的环境', async () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src/main/acp-client.ts'), 'utf8');
-    assert.match(src, /const env = \{ \.\.\.this\.env \};\s*\n\s*if \(kiroTraceEnabled\(\)\) env\.KIRO_LOG_LEVEL = 'trace';/);
+    /* 远端那一路先叠上 ssh 的密码环境（sshEnv 返回的也是一份新对象）—— 照样不碰 this.env / process.env */
+    assert.match(src, /const env = this\.remote\?\.sshHost \? sshEnv\(this\.remote, this\.env\) : \{ \.\.\.this\.env \};\s*\n\s*if \(this\.engine === 'kiro' && kiroTraceEnabled\(\)\) env\.KIRO_LOG_LEVEL = 'trace';/);
   });
 
   test('开着 trace 时存档多抄日志 —— 512KB 可能只盖住一秒', () => {

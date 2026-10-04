@@ -73,7 +73,7 @@ export function preflightScript(tools: string[] = REQUIRED_TOOLS, opts: { models
       有限制，而且实测撞过：那台 t3.medium（2 vCPU / 3.8 GB）上一条会话是**两个**进程
       （`kiro-cli` ≈ 48 MB + `kiro-cli-chat` ≈ 104–114 MB ≈ 155 MB），6 条就占 941 MB，
       load 冲到 3.86；并行 attach 时还会撞出 `ssh exit 255`（sshd 的 MaxStartups）。
-      所以上限要按**那台机器**算，而不是按本机的 RAM/CPU（现有的 `computeExecutorCap` 算的是本机）。
+      所以上限要按**那台机器**算，而不是按本机的默认值（`DEFAULT_EXECUTOR_CAP`）。
       这两行几乎不花时间，而且顺着已有的探测走 —— 不值得为它单开一次 ssh。
     */
     'echo "CPUS $(nproc 2>/dev/null || echo 0)"',

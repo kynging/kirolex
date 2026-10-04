@@ -27,6 +27,7 @@ import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache }
 import { SkillDialog } from './components/SkillDialog';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { IconClose, IconLogs } from './components/Icons';
+import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 
@@ -47,14 +48,13 @@ declare global {
         permissionMode?: 'auto-approve' | 'ask',
         /** 这条会话跑在哪台机器上（不传 = 本地）。见 docs/DESIGN_remote_sessions.md。 */
         remoteId?: string,
+        /** 哪个引擎：kiro（默认）/ claude / codex。 */
+        engine?: string,
       ) => Promise<{ sessionId: string }>;
       /** 可选的远端列表；`enabled: false` 时界面完全不显示目标选择。 */
       remoteTargets?: () => Promise<{ enabled: boolean; targets: { id: string; label: string; sshHost: string; remoteWorkdir?: string }[] }>;
       /** 把一条已有会话切到另一台机器（`remoteId` 传 null = 本地）。 */
       setRemoteTarget?: (sessionId: string, remoteId: string | null, localDir?: string) =>
-        Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
-      /** 只换工作目录，机器不变（会话界面上那个 📂）。 */
-      setWorkdir?: (sessionId: string, dir: string | string[]) =>
         Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
       /** 某条会话的运行位置/工作目录变了 —— 徽标、菜单那句话、会话里那个 📂 都靠它更新。 */
       onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => () => void;
@@ -363,6 +363,8 @@ export interface Session {
   model: string;
   /** Named kiro-cli agent for this session. Undefined = kiro_default. */
   kiroAgent?: string;
+  /** 哪个引擎跑这条会话。Undefined = kiro（所有老会话）。 */
+  engine?: 'kiro' | 'claude' | 'codex';
   /** Tool approvals for this session. Undefined legacy sessions default to Bypass. */
   permissionMode?: 'auto-approve' | 'ask';
   /** Write-once memory-scoping label (design §4/§6.4). Undefined = unassigned. */
@@ -401,13 +403,6 @@ export interface Session {
    * 被镜像的那一个目录，所以"它读哪棵树"不该是要靠猜的事。
    */
   localDir?: string;
-  /**
-   * **其余选中的目录**（`localDir` 是第一个，不重复放在这里）——「应该可以设置多个」。
-   *
-   * 输入框下面那排 📂 一格一个目录：这件事不能只存在于记录里，因为"它能动哪几棵树"是
-   * 每一轮都在生效的事实，看不见就只能靠猜（远程会话读不到文件那次就是这么来的）。
-   */
-  localDirs?: string[];
   /** User-archived: hidden from the main list into a collapsible Archived group. */
   archived?: boolean;
   folderId?: string | null; // legacy — retained for back-compat, no longer surfaced
@@ -430,6 +425,8 @@ export interface Settings {
   mergeQueuedMessages: boolean;
   /** After a restart, automatically RESEND an unanswered prompt when its chat is opened. */
   recoverInterruptedTurns: boolean;
+  /** 被非人为原因打断（执行器死了、重启、看门狗）的那一轮最多自动重发几次。0 = 不重发。默认 10。 */
+  autoRetryMax?: number;
   /** Auto-fold 💭 thinking segments once thinking finishes (default on). */
   autoFoldThinking: boolean;
   /** Auto-fold 🔧 tool segments once the tool call finishes (default on). */
@@ -457,7 +454,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 14, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -639,6 +636,8 @@ const App: React.FC = () => {
     usageOf,
     rebuildContext,
     cancelAutoResend,
+    takeOrphanSteers,
+    recoveringIds,
     interruptedSessionIds,
     connectingSessionIds,
     failedSessionIds,
@@ -675,6 +674,7 @@ const App: React.FC = () => {
     changeSessionPermissionMode,
     assignProject,
     moveSession,
+    reorderSessions,
     archiveSession,
     projects,
     createProject,
@@ -1672,6 +1672,19 @@ const App: React.FC = () => {
   useEffect(() => {
     try { uiSet('kirolex-new-chat-remote', newChatRemoteId); } catch {}
   }, [newChatRemoteId]);
+  /**
+   * **用哪个 AI 跑新会话** ——「加 claude code 和 codex 支持，模式参考现有的 kirolex 会话模式」。
+   * 和机器一样记住上一次的选择。Claude Code / Codex 先只在本机跑（远程那条路是按 kiro 写的）。
+   */
+  const [newChatEngine, setNewChatEngine] = useState<'kiro' | 'claude' | 'codex'>(() => {
+    try {
+      const v = uiGet('kirolex-new-chat-engine');
+      return v === 'claude' || v === 'codex' ? v : 'kiro';
+    } catch { return 'kiro'; }
+  });
+  useEffect(() => {
+    try { uiSet('kirolex-new-chat-engine', newChatEngine); } catch {}
+  }, [newChatEngine]);
   const remoteTargets = useRemoteTargets();
   const [newChatProject, setNewChatProject] = useState<string>(''); // '' = none, '__new__' = create
   const [newChatNewProjectName, setNewChatNewProjectName] = useState('');
@@ -2127,9 +2140,9 @@ const App: React.FC = () => {
   const handleNewSessionInProject = useCallback((project: string) => {
     const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);
     void cwdFor(project).then((cwd) => newSession(cwd, modelForNewChat(target?.id), project, undefined, {
-      remoteId: target?.id, remoteLabel: target?.label,
+      remoteId: target?.id, remoteLabel: target?.label, engine: newChatEngine,
     }));
-  }, [newSession, homeDir, modelForNewChat, remoteTargets.targets, newChatRemoteId]);
+  }, [newSession, homeDir, modelForNewChat, remoteTargets.targets, newChatRemoteId, newChatEngine]);
 
   // Create a chat from the New Chat dialog, assigning the chosen project (if any)
   // at creation.
@@ -2139,12 +2152,12 @@ const App: React.FC = () => {
       : (newChatProject || undefined);
     const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);
     void cwdFor(proj).then((cwd) => newSession(cwd, modelForNewChat(target?.id), proj, undefined, {
-      remoteId: target?.id, remoteLabel: target?.label,
+      remoteId: target?.id, remoteLabel: target?.label, engine: newChatEngine,
     }));
     setShowNewChat(false);
     setNewChatProject('');
     setNewChatNewProjectName('');
-  }, [newChatProject, newChatNewProjectName, newSession, homeDir, modelForNewChat, remoteTargets.targets, newChatRemoteId]);
+  }, [newChatProject, newChatNewProjectName, newSession, homeDir, modelForNewChat, remoteTargets.targets, newChatRemoteId, newChatEngine]);
 
   const confirmDelete = useCallback(() => {
     if (deleteConfirm) {
@@ -2535,6 +2548,8 @@ const App: React.FC = () => {
       // follow-up after the reconnect. Ordinary queues are preserved (KiroLex
       // "Stop keeps the queue" rule) — we only drop un-consumed steers.
       discardUnconsumedSteers();
+      /* 这是**你**停的：它会断开所有执行器，正在跑的那几条都不许被"中断自动重发"拉回去 */
+      for (const id of new Set([...streamingIds, ...(currentSessionId ? [currentSessionId] : [])])) cancelAutoResend(id);
       await forceStop(selectedModel);
       sendMessage([{ type: 'text', text: '/stop' }], '🔄 Force interrupted and reconnected.');
       return;
@@ -2595,7 +2610,7 @@ const App: React.FC = () => {
       // focused -- see its own comment on why that is wrong in split view.
       sid || undefined,
     );
-  }, [attachedFor, clearAttachments, focusSession, sendMessage, currentSessionId, forceStop, selectedModel, discardUnconsumedSteers, clearConversation, busyBySession, loopingIds]);
+  }, [attachedFor, clearAttachments, focusSession, sendMessage, currentSessionId, forceStop, selectedModel, discardUnconsumedSteers, clearConversation, busyBySession, loopingIds, streamingIds, cancelAutoResend]);
 
   // Explicit user Stop (composer stop button). Discard this session's un-consumed
   // steers FIRST so the turn-end reconcile finds nothing to re-queue (no phantom
@@ -2692,6 +2707,32 @@ const App: React.FC = () => {
   // lost — it becomes a normal queued item that drains next on the idle session.
   // Kept separate from the unread effect so it can reference the queue state
   // declared just above (no forward reference), and uses its own transition ref.
+  /* 上一次运行没被吃掉的 steer：作为排队消息放回各自会话的队列头（标成 restored，和恢复的队列一样） */
+  const orphanSteersTakenRef = useRef(false);
+  useEffect(() => {
+    if (orphanSteersTakenRef.current) return;
+    orphanSteersTakenRef.current = true;
+    const orphans = takeOrphanSteers();
+    const sids = Object.keys(orphans).filter((sid) => orphans[sid]?.length);
+    if (!sids.length) return;
+    setQueuesBySession((current) => {
+      const next = { ...current };
+      for (const sid of sids) {
+        next[sid] = [
+          ...orphans[sid].map((s) => ({
+            id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            content: s.content,
+            attachments: s.attachments || [],
+            createdAt: Date.now(),
+            restored: true,
+          })),
+          ...(current[sid] || []),
+        ];
+      }
+      return next;
+    });
+  }, [takeOrphanSteers]);
+
   const prevSteerStreamingRef = useRef<string[]>([]);
   useEffect(() => {
     const prev = prevSteerStreamingRef.current;
@@ -2898,6 +2939,8 @@ const App: React.FC = () => {
         // this drain would fire and slip a queued message between two loop turns.
         loopingIds.includes(sessionId) ||
         queueSendingRef.current.has(sessionId) ||
+        /* 正在自动重发被打断的那一轮：等它发出去，排队的跟在后面（否则会把没答的问题顶掉） */
+        recoveringIds.includes(sessionId) ||
         (sessionId === currentSessionId && (
           switchingModel || switchingAgent
         )) ||
@@ -2964,6 +3007,7 @@ const App: React.FC = () => {
     currentSessionId,
     switchingModel,
     switchingAgent,
+    recoveringIds,
   ]);
 
   // Drop queues whose sessions were deleted or archived.
@@ -3098,50 +3142,6 @@ const App: React.FC = () => {
     return entry;
   }, []);
 
-  /**
-   * **给这条会话换工作目录** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
-   *
-   * 它属于会话界面而不是右键菜单：这是一个**常驻事实**（它在哪棵树上干活），远程会话尤其 ——
-   * 远端只看得见被镜像的那一个目录，而"看不到我的文件"那次就是因为这件事只能靠猜。
-   * 藏在右键菜单里的东西既看不见当前值、也提示不了这件事存在。
-   *
-   * 走 `setWorkdir` 而不是 `setRemoteTarget`：机器不变这件事由主进程按记录保证，渲染层不参与
-   * （它手里只有 label，反查不到就会传 null 过去 —— 那是"切回本地"）。
-   */
-  const applyWorkdirs = async (sid: string, dirs: string | string[]): Promise<void> => {
-    const api = (window as any).kiroApi;
-    const r = await api?.setWorkdir?.(sid, dirs)
-      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
-    /* 失败要让人看见：这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
-    if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '设置工作目录失败'));
-  };
-
-  /** 换**主目录**（`local_bash` 的 cwd）。附加目录不动 —— 所以传字符串而不是数组。 */
-  const pickWorkdir = async (sid: string | null): Promise<void> => {
-    if (!sid) return;
-    const picked = await (window as any).kiroApi?.remotePickDir?.();
-    if (!picked?.path) return;
-    await applyWorkdirs(sid, picked.path);
-  };
-
-  /** 再加一个目录。整份清单一起发（第一个仍是主目录）。 */
-  const addWorkdir = async (sid: string | null): Promise<void> => {
-    if (!sid) return;
-    const picked = await (window as any).kiroApi?.remotePickDir?.();
-    if (!picked?.path) return;
-    const cur = sessions.find((x) => x.id === sid);
-    const list = [cur?.localDir || '', ...(cur?.localDirs || []), picked.path].filter(Boolean);
-    if (!cur?.localDir) { await applyWorkdirs(sid, picked.path); return; }
-    await applyWorkdirs(sid, Array.from(new Set(list)));
-  };
-
-  /** 去掉一个附加目录。主目录去不掉（它是 cwd）—— 要换主目录点第一格。 */
-  const removeWorkdir = async (sid: string | null, dir: string): Promise<void> => {
-    if (!sid || !dir) return;
-    const cur = sessions.find((x) => x.id === sid);
-    if (!cur?.localDir || dir === cur.localDir) return;
-    await applyWorkdirs(sid, [cur.localDir, ...(cur.localDirs || []).filter((d) => d !== dir)]);
-  };
 
   const renderPane = (sid: string | null, wantFocused: boolean, withHeader: boolean, paneStyle?: React.CSSProperties) => {
     /**
@@ -3221,12 +3221,8 @@ const App: React.FC = () => {
            跟着会话状态走。跟着同步状态走的那一版，切回本地之后 🌐 还挂着）。 */
         remoteHost={session?.remoteHost}
         /* 这条会话在哪棵树上干活 —— 常驻显示在输入框下面那一排，点它换目录 */
-        workdir={session?.localDir}
-        workdirs={session?.localDir ? [session.localDir, ...(session.localDirs || [])] : []}
-        onAddWorkdir={() => { void addWorkdir(sid); }}
-        onRemoveWorkdir={(d: string) => { void removeWorkdir(sid, d); }}
-        onPickWorkdir={() => { void pickWorkdir(sid); }}
         kiroAgent={session?.kiroAgent || selectedKiroAgent}
+        engine={session?.engine}
         kiroAgents={agentsFor(session)}
         switchingAgent={focused && switchingAgent}
         switchingModel={focused && switchingModel}
@@ -3367,6 +3363,7 @@ const App: React.FC = () => {
       {/* One line, because 「什么都没出现」 is the one thing a registration must never do silently. */}
       <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}`}>
         {isMac && <div className="mac-titlebar" />}
+        <Toasts />
         {!sidebarCollapsed && (
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>
             <Sidebar
@@ -3415,6 +3412,7 @@ const App: React.FC = () => {
               scheduleFor={scheduleSummaryFor}
               onAssignProject={assignProject}
               onMoveSession={moveSession}
+              onReorderSessions={reorderSessions}
               onArchiveSession={archiveSession}
               onSettings={() => { setSettingsTab(undefined); setShowSettings(true); }}
               /*
@@ -3456,7 +3454,7 @@ const App: React.FC = () => {
                   );
                   if (next === null) return;
                   const res = await window.kiroApi.projectSetWorkspace?.(project, next.trim());
-                  if (!res?.ok) { window.alert(`设不上：${res?.error || t('unknown reason')}`); return; }
+                  if (!res?.ok) { showToast(`设不上：${res?.error || t('unknown reason')}`); return; }
                   projectCwdCache.current.delete(project);
                   setProjectWorkspaces((cur) => ({ ...cur, [project]: next.trim() }));
                 })();
@@ -3759,6 +3757,24 @@ const App: React.FC = () => {
               只有配了远端且 feature flag 开着才出现 —— 显示一个选了会报错的选项比不显示糟。
               默认本地：远程是个明确的选择，不该因为配置里有一台机器就悄悄改变默认行为。
             */}
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
+              用哪个 AI
+            </label>
+            <select
+              className="rename-popup-input"
+              value={newChatEngine}
+              onChange={(e) => setNewChatEngine(e.target.value as 'kiro' | 'claude' | 'codex')}
+              style={{ marginBottom: 12 }}
+            >
+              <option value="kiro">Kiro</option>
+              <option value="claude">Claude Code</option>
+              <option value="codex">Codex</option>
+            </select>
+            {newChatEngine !== 'kiro' && (
+              <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: -6, marginBottom: 12, lineHeight: 1.5 }}>
+                用 {newChatEngine === 'claude' ? 'Claude Code' : 'Codex'} 自己的登录和默认模型；选远端机器的话，那台机器上要装好它的 ACP 适配器（设置 → 机器 →「安装 AI 工具」）并登录过。
+              </p>
+            )}
             {remoteTargets.enabled && remoteTargets.targets.length > 0 && (
               <>
                 <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
@@ -3777,8 +3793,7 @@ const App: React.FC = () => {
                 </select>
                 {newChatRemoteId && (
                   <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
-                    文件仍然存在本地 —— 每一轮前后自动同步镜像。远端不做构建/测试/预览，
-                    也不要和本地会话同时改同一个项目。
+                    文件仍然在本地 —— 远端那个 kiro-cli 通过隧道读写你这台机器上的文件（不复制）。
                   </p>
                 )}
               </>

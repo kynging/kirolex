@@ -32,6 +32,7 @@
 
 import { execFile } from 'child_process';
 import type { RemoteTarget } from './config';
+import { sshEnv } from './sshAuth.ts';
 
 /** The SSH argument builders, INJECTED rather than imported.
  *
@@ -97,7 +98,8 @@ export function buildVerifierArgv(req: VerifyRequest, ssh: SshTools): { file: st
   }
   if (process.platform === 'win32') {
     const shell = process.env.ComSpec || 'cmd.exe';
-    return { file: shell, args: ['/d', '/s', '/c', req.command], cwd: req.cwd };
+    /* 整条包引号 + windowsVerbatimArguments（见 runVerifier）：Node 的 \" 转义 cmd.exe 不认 */
+    return { file: shell, args: ['/d', '/s', '/c', `"${req.command}"`], cwd: req.cwd };
   }
   return { file: '/bin/sh', args: ['-lc', req.command], cwd: req.cwd };
 }
@@ -118,9 +120,17 @@ export function buildVerifierArgv(req: VerifyRequest, ssh: SshTools): { file: st
  * we handed it counts as "never ran" — and it must be the FIRST thing the shell said, or
  * a passing check that merely prints those words would be misread as absent.
  */
-export function shellCouldNotFindCommand(exitCode: number, output: string): boolean {
-  if (exitCode !== 127 && exitCode !== 126) return false;
+export function shellCouldNotFindCommand(exitCode: number, output: string, command?: string): boolean {
   const head = String(output ?? '').trim().split('\n')[0] || '';
+  // cmd.exe exits 1 (9009 as %ERRORLEVEL%) and its message is LOCALIZED and written in
+  // the OEM code page, so on a Chinese Windows it arrives as mojibake and neither the
+  // code nor the English text below matches. What survives every locale is the shape:
+  // the complaint opens with the command token in single quotes, `'x' ...`.
+  if ((exitCode === 1 || exitCode === 9009) && command) {
+    const token = firstCmdToken(command);
+    if (token && head.startsWith(`'${token}'`)) return true;
+  }
+  if (exitCode !== 127 && exitCode !== 126) return false;
   // `sh: <cmd>: command not found`, `bash: line 1: <cmd>: No such file or directory`,
   // and the 126 permission case -- all of which name the command before the reason.
   if (/(?:^|:\s)(?:command not found|not found|No such file or directory|Permission denied|cannot execute)/i.test(head)) {
@@ -129,6 +139,16 @@ export function shellCouldNotFindCommand(exitCode: number, output: string): bool
   // cmd.exe puts the command FIRST, quoted: `'x' is not recognized as an internal or
   // external command, operable program or batch file.`
   return /is not recognized as an internal or external command/i.test(head);
+}
+
+/** The program name cmd.exe would look up: a quoted path, or up to the first blank/operator. */
+function firstCmdToken(command: string): string {
+  const s = command.trimStart();
+  if (s.startsWith('"')) {
+    const end = s.indexOf('"', 1);
+    return end > 1 ? s.slice(1, end) : '';
+  }
+  return s.match(/^[^\s&|<>()^]+/)?.[0] ?? '';
 }
 
 export function truncateOutput(text: string, limit = MAX_VERIFIER_OUTPUT): string {
@@ -159,7 +179,7 @@ export function runVerifier(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: Ssh
   return new Promise<VerifyResult>((resolve) => {
     execFile(file, args, {
       encoding: 'utf-8',
-      env,
+      env: req.remote?.sshHost ? sshEnv(req.remote, env) : env,
       cwd,
       timeout: Math.round(req.timeoutSec * 1000),
       killSignal: 'SIGKILL',
@@ -168,6 +188,7 @@ export function runVerifier(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: Ssh
       // explicit shell; letting Node build a command string as well would
       // reintroduce the interpolation this avoids.
       windowsHide: true,
+      windowsVerbatimArguments: host === 'local' && process.platform === 'win32',
     }, (err: any, stdout, stderr) => {
       const durationMs = Date.now() - startedAt;
       // Both streams: a failing test run puts the useful part on stdout, a missing
@@ -186,7 +207,7 @@ export function runVerifier(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: Ssh
         return;
       }
       if (typeof err.code === 'number') {
-        if (shellCouldNotFindCommand(err.code, output)) {
+        if (shellCouldNotFindCommand(err.code, output, host === 'local' && process.platform === 'win32' ? req.command : undefined)) {
           // The shell could not find or execute the command we handed it: the check
           // never happened. Reporting this as a failing check would let a typo in the
           // verifier command burn a loop's entire round budget.

@@ -48,6 +48,8 @@ interface SessionRow {
   /** 最后一次**真的传上去**是什么时候（0 = 从没传过）。 */
   syncedAt: number;
   state: 'never' | 'pending' | 'synced';
+  /** 这条会话单独设成了不同步。 */
+  excluded?: boolean;
 }
 
 interface ProjectRow {
@@ -74,6 +76,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   /* --- 同步 tab --- */
   const [projects, setProjects] = useState<ProjectRow[] | null>(null);
   const [excluded, setExcluded] = useState<string[]>([]);
+  /** 单独设成不同步的会话 id。 */
+  const [excludedSessions, setExcludedSessions] = useState<string[]>([]);
   /* 默认收起：一上来看的是"哪些项目在备份"，展开才是"这个项目里每条会话什么时候同步的" */
   const [openProjects, setOpenProjects] = useState<Set<string>>(new Set());
 
@@ -95,6 +99,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       const r = await api()?.s3Projects?.();
       setProjects(r?.projects || []);
       setExcluded(r?.excludeProjects || []);
+      setExcludedSessions(r?.excludeSessions || []);
     } catch { setProjects([]); }
   }, []);
 
@@ -122,6 +127,24 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     return () => window.removeEventListener('keydown', onKey);
   }, [onClose]);
 
+  /**
+   * 改**一条会话**的"要不要同步" ——「我现在还是不能选择是否备份会话」。和项目那个开关同一套：
+   * 立刻存盘、存的是排除表、关掉不删已有备份。
+   */
+  const toggleSession = async (id: string, sync: boolean): Promise<void> => {
+    const next = sync ? excludedSessions.filter((x) => x !== id) : [...excludedSessions, id];
+    setExcludedSessions(next);
+    setProjects((prev) => (prev || []).map((p) => ({
+      ...p, sessions: p.sessions.map((x) => (x.id === id ? { ...x, excluded: !sync } : x)),
+    })));
+    try {
+      await api()?.saveS3Config?.({ excludeSessions: next });
+    } catch (e: any) {
+      setMsg({ kind: 'bad', text: String(e?.message || e) });
+      await loadProjects();
+    }
+  };
+
   /** 改一个项目的"要不要同步"。立刻存盘 —— 这一页没有"保存"按钮。 */
   const toggleProject = async (project: string, sync: boolean): Promise<void> => {
     const next = sync ? excluded.filter((p) => p !== project) : [...excluded, project];
@@ -142,14 +165,15 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
    * 把三件事都说出来：删几条、删的是**云上**的、本地一个字都不动。
    * 最后那句最重要 —— "删除备份"和"删除会话"只差两个字。
    */
-  const deleteProject = async (project: string): Promise<void> => {
+  const deleteProject = async (project: string, count?: number): Promise<void> => {
     const row = (projects || []).find((p) => p.project === project);
-    const n = row?.sessions.length || 0;
+    /* 从「恢复」那页点的：数的是**桶里**这一组有几条（本地那张表可能早就没有它们了） */
+    const n = count ?? (row?.sessions.length || 0);
     const name = projectLabel(project);
     if (!window.confirm([
       `把「${name}」在桶里的备份删掉？`,
       '',
-      `涉及 ${n} 条会话（${kb(row?.bytes || 0)}）。`,
+      `涉及 ${n} 条会话${row ? `（本地 ${kb(row.bytes || 0)}）` : ''}。`,
       '删的是**云上那份**，本地会话一个字都不动。',
       'S3 上删掉就找不回来了（除非这个桶开了版本控制）。',
       '',
@@ -259,12 +283,14 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setBusy('restore'); setMsg(null);
     const ok: string[] = [];
     const bad: string[] = [];
+    const restoredIds: string[] = [];
     let files = 0;
     /* 一条一条来：并发恢复会同时写 trash 和 sessions，而失败要能说清是**哪一条** */
     for (const e of chosen) {
       try {
         const r = await api()?.restoreS3Session?.(e.id);
         if (r?.ok) {
+          restoredIds.push(e.id);
           ok.push(`${e.title || e.id}${r.merged ? `（并进 ${r.merged.added} 条${r.merged.clashed ? `，${r.merged.clashed} 条同 id 保留本地` : ''}）` : ''}`);
           files += Number(r.restored) || 0;
         } else bad.push(`${e.title || e.id}：${r?.error || '失败'}`);
@@ -274,11 +300,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     }
     setBusy(null);
     setPicked(new Set());
+    /* 侧栏立刻对一遍磁盘 + 把这几条连上（不用重启） */
+    if (restoredIds.length) window.dispatchEvent(new CustomEvent('kirolex:sessions-restored', { detail: { ids: restoredIds } }));
     await loadBackups();
     setMsg({
       kind: bad.length ? 'bad' : 'ok',
       text: [
-        ok.length ? `已处理 ${ok.length} 条（${files} 个文件）：\n${ok.map((x) => `  · ${x}`).join('\n')}\n重启 KiroLex 后它们会出现在列表里。` : '',
+        ok.length ? `已处理 ${ok.length} 条（${files} 个文件）：\n${ok.map((x) => `  · ${x}`).join('\n')}\n已经放回侧栏、正在连接（在本机跑 —— 要跑远端，右键「运行位置」选一台）。` : '',
         bad.length ? `有 ${bad.length} 条没成：\n${bad.join('\n')}` : '',
       ].filter(Boolean).join('\n'),
     });
@@ -359,12 +387,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             disabled={!!busy}
                             onChange={(next) => void toggleProject(p.project, next)}
                           />
-                          {/* 删云上的备份，不动本地 —— 和「不同步」是两件事 */}
-                          <button className="remote-btn backup-del" disabled={!!busy}
-                                  title="删掉这个项目在桶里的备份（不动本地会话）"
-                                  onClick={() => void deleteProject(p.project)}>
-                            {busy === `del:${p.project}` ? '删除中…' : '删除备份'}
-                          </button>
+                          {/* 「删除备份」在「恢复」那一页 ——「这个删除备份的按钮不应该在备份这个界面，而是恢复界面」：
+                              这一页管"以后传不传"，删桶里已有的是另一件事，挨着开关放太容易点错 */}
                         </div>
                         {!shut && p.sessions.map((x) => (
                           <div key={x.id} className="backup-restore-row" title={x.id}>
@@ -374,6 +398,14 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               : x.state === 'pending'
                                 ? <span className="backup-tag over">有改动待同步</span>
                                 : <span className="backup-tag new">已同步</span>}
+                            {/* 单条会话也能关 ——「我现在还是不能选择是否备份会话」。项目关着时整组都不传，这里就不给按 */}
+                            <ToggleButton
+                              on={!p.excluded && !x.excluded}
+                              labels={['同步', '不同步']}
+                              ariaLabel={`${x.title} 是否同步`}
+                              disabled={!!busy || p.excluded}
+                              onChange={(next) => void toggleSession(x.id, next)}
+                            />
                             <span className="backup-restore-meta">
                               {/*
                                 `synced` 但没有时间 = 传过、但那次上传发生在这张表存在之前
@@ -392,8 +424,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 </div>
               )}
               <div className="settings-hint backup-note">
-                关掉一个项目是<b>停止继续备份</b>，不是删掉已有备份 —— 之前传上去的还在桶里，
-                恢复那一页照旧能看到、能捞回来。
+                关掉一个项目或一条会话是<b>停止继续备份</b>，不是删掉已有备份 —— 之前传上去的还在桶里，
+                恢复那一页照旧能看到、能捞回来（要删也在那一页）。
               </div>
             </>
           )}
@@ -452,6 +484,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             return next;
                           })}>{shut ? '▸' : '▾'} {name}</button>
                           <span className="backup-restore-meta">{rows.length} 条</span>
+                          {/* 整组删云上的备份（不动本地）—— 从「同步」那页挪过来的 */}
+                          <button className="remote-btn backup-del" disabled={!!busy}
+                                  title="删掉这一组在桶里的备份（不动本地会话）"
+                                  onClick={() => void deleteProject(rows[0]?.project || '', rows.length)}>
+                            {busy === `del:${rows[0]?.project || ''}` ? '删除中…' : '删除备份'}
+                          </button>
                         </div>
                         {!shut && rows.map((e) => (
                           <label

@@ -44,20 +44,25 @@ function bodyOf(text: string, needle: string): string {
   throw new Error(`unbalanced braces after ${needle}`);
 }
 
+/** How the command appears as its single argv element. On Windows `buildVerifierArgv`
+ *  wraps it in one pair of quotes for `cmd /s /c` + windowsVerbatimArguments (Node's
+ *  `\"` escaping is not understood by cmd.exe) — still ONE element, never spliced. */
+const asArg = (c: string) => (process.platform === 'win32' ? `"${c}"` : c);
+
 describe('the verifier runs out of band, as one argv element', () => {
   test('a local check runs through a login shell, command not concatenated', () => {
     const { file, args, cwd } = buildVerifierArgv({ command: 'npm test', timeoutSec: 60, cwd: '/tmp/work' }, SSH);
     assert.equal(file === '/bin/sh' || /cmd\.exe$/i.test(file), true);
     // The whole point: the command is ONE argument. Nothing is assembled into a
     // shell string, so there is no interpolation point.
-    assert.ok(args.includes('npm test'));
+    assert.ok(args.includes(asArg('npm test')));
     assert.equal(cwd, '/tmp/work');
   });
 
   test('a command with shell metacharacters is still a single argument', () => {
     const nasty = `echo "a b"; rm -rf $HOME && true`;
     const { args } = buildVerifierArgv({ command: nasty, timeoutSec: 60, cwd: '/tmp' }, SSH);
-    assert.equal(args.filter((a) => a === nasty).length, 1);
+    assert.equal(args.filter((a) => a === asArg(nasty)).length, 1);
   });
 
   test('a remote session is checked ON THE REMOTE HOST, in the agent workdir', () => {
@@ -80,7 +85,9 @@ describe('the verifier runs out of band, as one argv element', () => {
     assert.equal(remoteCmd, `bash -lc 'cd '\\''/home/ec2-user/work'\\'' && npm test'`);
   });
 
-  test('the nested quoting survives a real shell, with a space in the path', () => {
+  const POSIX_ONLY = { skip: process.platform === 'win32' && 'needs /bin/sh; cmd.exe is covered below' };
+
+  test('the nested quoting survives a real shell, with a space in the path', POSIX_ONLY, () => {
     // The remote line is built by two rounds of quoting, so "it looks right" is not
     // evidence. Run the exact string a login shell would receive.
     const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kx loop '));   // space on purpose
@@ -97,7 +104,7 @@ describe('the verifier runs out of band, as one argv element', () => {
     }
   });
 
-  test('exit codes decide, and a missing binary is "could not run"', async () => {
+  test('exit codes decide, and a missing binary is "could not run"', POSIX_ONLY, async () => {
     // The distinction the loop depends on: a non-zero exit is a failing CHECK, while
     // a verifier that never started is `blocked`.
     const pass = await runVerifier({ command: 'echo fine', timeoutSec: 10, cwd: os.tmpdir() }, process.env, SSH);
@@ -142,6 +149,31 @@ describe('the verifier runs out of band, as one argv element', () => {
     const slow = await runVerifier({ command: 'sleep 5', timeoutSec: 1, cwd: os.tmpdir() }, process.env, SSH);
     assert.deepEqual([slow.ran, slow.timedOut], [false, true]);
     assert.match(String(slow.error), /1 秒/);
+  });
+
+  test('cmd.exe: exit codes decide, and a missing binary is "could not run" in any locale', { skip: process.platform !== 'win32' }, async () => {
+    // cmd.exe exits 1 for an unknown command and words the complaint in the UI language
+    // and the OEM code page -- on a Chinese Windows it is mojibake by the time we read it.
+    const pass = await runVerifier({ command: 'echo fine', timeoutSec: 10, cwd: os.tmpdir() }, process.env, SSH);
+    assert.deepEqual([pass.ran, pass.exitCode, pass.host], [true, 0, 'local']);
+    const fail = await runVerifier({ command: 'echo boom 1>&2 & exit 3', timeoutSec: 10, cwd: os.tmpdir() }, process.env, SSH);
+    assert.deepEqual([fail.ran, fail.exitCode], [true, 3]);
+    assert.match(fail.output, /boom/);
+    const missing = await runVerifier({ command: 'kx-no-such-binary-9271 --flag', timeoutSec: 10, cwd: os.tmpdir() }, process.env, SSH);
+    assert.equal(missing.ran, false);
+    assert.equal(missing.exitCode, null);
+    // A check that ran and then failed is still a verdict, even with exit code 1.
+    const spoke = await runVerifier({ command: 'echo checked 3 files & exit 1', timeoutSec: 10, cwd: os.tmpdir() }, process.env, SSH);
+    assert.deepEqual([spoke.ran, spoke.exitCode], [true, 1]);
+  });
+
+  test('the cmd.exe classifier keys on the quoted command token, not the localized text', () => {
+    const zh = "'npm-typo' ²»ÊÇÄÚ";   // GBK「不是内」read as UTF-8
+    assert.equal(shellCouldNotFindCommand(1, zh, 'npm-typo test'), true);
+    assert.equal(shellCouldNotFindCommand(9009, zh, 'npm-typo&&echo x'), true);
+    assert.equal(shellCouldNotFindCommand(1, zh, 'npm test'), false);
+    assert.equal(shellCouldNotFindCommand(1, zh), false);      // no command: POSIX rules only
+    assert.equal(shellCouldNotFindCommand(1, "checked\n'npm-typo' x", 'npm-typo'), false);
   });
 
   test('the missing-checker classifier looks at the code AND the first line', () => {

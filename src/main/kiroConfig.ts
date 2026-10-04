@@ -22,12 +22,20 @@
 import fs from 'fs';
 import path from 'path';
 
-export type KiroConfigCategory = 'mcp' | 'steering' | 'prompts' | 'skills' | 'powers' | 'settings';
+/** kiro 的六类 + Claude Code / Codex 各自的那几类（id 带引擎前缀，三家放在一张表里不撞名）。 */
+export type KiroConfigCategory = 'mcp' | 'steering' | 'prompts' | 'skills' | 'powers' | 'settings' | string;
 
 export interface CategorySpec {
   id: KiroConfigCategory;
   /** tab 上显示的字 */
   label: string;
+  /**
+   * 哪个引擎的配置 —— 「claude code 和 codex 左下角也得有一个类似的图标」：机器人面板按会话的引擎给 tab。
+   * 不写 = kiro。
+   */
+  engine?: 'kiro' | 'claude' | 'codex';
+  /** 家目录下的哪个目录（`.kiro` / `.claude` / `.codex`）；不写 = `.kiro`。 */
+  base?: string;
   /** 相对 `~/.kiro` 的根 */
   root: string;
   /**
@@ -50,6 +58,12 @@ export interface CategorySpec {
   ext?: string;
   /** 一句话说明，显示在 tab 里 */
   hint: string;
+  /**
+   * Claude Code：插件里带的那一类（`~/.claude/plugins/cache/<市场>/<插件>/<版本>/<这个目录>/…`）也列进来，只读。
+   * 「claude code 的配置什么都拿不到」—— 两台机器的 `~/.claude/{agents,commands,skills}` 都是空的，
+   * 你在用的 skill / 命令 / 子代理全是插件带的（superpowers 那些）。
+   */
+  pluginDir?: 'skills' | 'commands' | 'agents';
 }
 
 export const CATEGORIES: CategorySpec[] = [
@@ -81,6 +95,69 @@ export const CATEGORIES: CategorySpec[] = [
     hint: 'kiro-cli settings（默认模型、autoApprove、MCP 超时…）。和 `kiro-cli settings <键> <值>` 是同一个文件。',
   },
 ];
+
+/*
+ * Claude Code / Codex 的配置 —— 和 kiro 那六类同一套"列表 + 读 + 写"，只是根在 `~/.claude` / `~/.codex`。
+ * 只列"改了就生效、改错了也只坏这一项"的文件。Claude 的 MCP 在 `~/.claude.json` 里，那份同时存着每个项目的
+ * 状态、很大，手改容易把别的弄坏，所以先不放进来（用 `claude mcp add` 改）。
+ */
+CATEGORIES.push(
+  {
+    id: 'claude-settings', engine: 'claude', base: '.claude', label: 'Settings', root: '', kind: 'single', file: 'settings.json', json: true,
+    hint: 'Claude Code 的用户设置（env 里是网关地址和 key、permissions、model…）。远程会话改的是那台机器上的这份。',
+  },
+  {
+    id: 'claude-memory', engine: 'claude', base: '.claude', label: 'CLAUDE.md', root: '', kind: 'single', file: 'CLAUDE.md',
+    hint: '用户级的常驻说明：每个会话都会读它（和 kiro 的 Steering 一个用途）。',
+  },
+  {
+    id: 'claude-agents', engine: 'claude', base: '.claude', label: 'Agents', root: 'agents', kind: 'list', match: /\.md$/i, depth: 1,
+    creatable: true, ext: '.md', pluginDir: 'agents',
+    hint: '子代理定义（每个一份 .md，开头是 YAML front matter）。标着插件名的是插件带的，只读。',
+  },
+  {
+    id: 'claude-commands', engine: 'claude', base: '.claude', label: 'Commands', root: 'commands', kind: 'list', match: /\.md$/i, depth: 2,
+    creatable: true, ext: '.md', pluginDir: 'commands',
+    hint: '自定义斜杠命令：文件名就是命令名（/名字）。标着插件名的是插件带的（/插件:名字），只读。',
+  },
+  {
+    id: 'claude-skills', engine: 'claude', base: '.claude', label: 'Skills', root: 'skills', kind: 'list', match: /^[^/]+\/SKILL\.md$/, depth: 2,
+    pluginDir: 'skills',
+    hint: '每个 skill 的 SKILL.md（同目录下的脚本/参考文件不在这里改）。标着插件名的是插件带的，只读。',
+  },
+  {
+    id: 'claude-plugins', engine: 'claude', base: '.claude', label: 'Plugins', root: 'plugins', kind: 'single', file: 'installed_plugins.json',
+    json: true, readOnly: true,
+    hint: '装了哪些插件（由 Claude Code 管理，这里只看）。装 / 卸用 `claude plugin install|uninstall`；开关在 Settings 的 enabledPlugins。',
+  },
+  {
+    id: 'codex-config', engine: 'codex', base: '.codex', label: 'config.toml', root: '', kind: 'single', file: 'config.toml',
+    hint: 'Codex 的配置（model、model_provider、[model_providers.*]、MCP、sandbox…）。是 TOML，不是 JSON。',
+  },
+  {
+    id: 'codex-agents', engine: 'codex', base: '.codex', label: 'AGENTS.md', root: '', kind: 'single', file: 'AGENTS.md',
+    hint: '用户级的常驻说明：每个会话都会读它。',
+  },
+  {
+    id: 'codex-prompts', engine: 'codex', base: '.codex', label: 'Prompts', root: 'prompts', kind: 'list', match: /\.md$/i, depth: 1,
+    creatable: true, ext: '.md',
+    hint: '自定义提示词：文件名就是命令名（/prompts:名字）。',
+  },
+  {
+    id: 'codex-skills', engine: 'codex', base: '.codex', label: 'Skills', root: 'skills', kind: 'list', match: /^[^/]+\/SKILL\.md$/, depth: 2,
+    hint: '每个 skill 的 SKILL.md。',
+  },
+);
+
+/** 某个引擎的那几类（机器人面板的 tab）。 */
+export function categoriesFor(engine: 'kiro' | 'claude' | 'codex' = 'kiro'): CategorySpec[] {
+  return CATEGORIES.filter((c) => (c.engine || 'kiro') === engine);
+}
+
+/** 相对家目录的根：`.kiro/steering`、`.claude`（单文件直接放在 base 下时 root 是空的）。 */
+export function rootRel(spec: CategorySpec): string {
+  return [spec.base || '.kiro', spec.root].filter(Boolean).join('/');
+}
 
 export function categorySpec(id: string): CategorySpec | undefined {
   return CATEGORIES.find((c) => c.id === id);
@@ -115,7 +192,11 @@ export function within(root: string, child: string): boolean {
  * single 类忽略 `name`；list 类的名字必须符合 `match`。
  */
 export function entryPath(home: string, spec: CategorySpec, name?: string): string | null {
-  const root = `${home.replace(/\/+$/, '')}/.kiro/${spec.root}`;
+  if (spec.pluginDir && isPluginName(name)) {
+    const rel = cleanPluginRel(spec, String(name).slice(PLUGIN_PREFIX.length));
+    return rel ? `${home.replace(/\/+$/, '')}/${PLUGIN_CACHE_REL}/${rel}` : null;
+  }
+  const root = `${home.replace(/\/+$/, '')}/${rootRel(spec)}`;
   if (spec.kind === 'single') return `${root}/${spec.file}`;
   const clean = cleanName(name || '');
   if (!clean || !spec.match?.test(clean)) return null;
@@ -138,7 +219,69 @@ export function validateContent(spec: CategorySpec, content: string): string | n
   return null;
 }
 
-export interface ConfigEntry { name: string; size: number }
+export interface ConfigEntry {
+  name: string;
+  size: number;
+  /** 列表里显示的字（插件条目是「插件 · 名字」）；不给就由界面按路径算 */
+  label?: string;
+  /** 这一条只读（插件带的） */
+  readOnly?: boolean;
+}
+
+/* ------------------------------------------------------------------ 插件带的条目（Claude Code） */
+
+/** 插件条目的名字：`@plugin/<市场>/<插件>/<版本>/<子路径>`（相对 `~/.claude/plugins/cache`）。 */
+export const PLUGIN_PREFIX = '@plugin/';
+export const PLUGIN_CACHE_REL = '.claude/plugins/cache';
+const PLUGIN_MATCH: Record<NonNullable<CategorySpec['pluginDir']>, RegExp> = {
+  skills: /^[^/]+\/[^/]+\/[^/]+\/skills\/[^/]+\/SKILL\.md$/,
+  commands: /^[^/]+\/[^/]+\/[^/]+\/commands\/(?:[^/]+\/)?[^/]+\.md$/,
+  agents: /^[^/]+\/[^/]+\/[^/]+\/agents\/[^/]+\.md$/,
+};
+
+export function isPluginName(name?: string): boolean {
+  return String(name || '').startsWith(PLUGIN_PREFIX);
+}
+
+/** 插件 cache 下的一个相对路径是否合规（逐段过白名单、不许 `..`），并且是这一类的文件。 */
+function cleanPluginRel(spec: CategorySpec, rel: string): string | null {
+  if (!spec.pluginDir) return null;
+  const parts = String(rel || '').replace(/\\/g, '/').split('/').filter(Boolean);
+  if (parts.length < 5 || parts.length > 7) return null;
+  for (const p of parts) if (!SEGMENT.test(p) || p.startsWith('.')) return null;
+  const clean = parts.join('/');
+  return PLUGIN_MATCH[spec.pluginDir].test(clean) ? clean : null;
+}
+
+/**
+ * 从 cache 里的"相对路径\t大小\tmtime"挑出这一类的插件条目。
+ * **一个插件只取一个版本** —— cache 里旧版本不会被清掉（同一个插件可以并排放着几个版本），
+ * 全列出来就是一排重名的。取文件最新的那个版本：更新插件就是往里放一个新版本目录。
+ */
+export function pickPluginEntries(spec: CategorySpec, lines: string[]): ConfigEntry[] {
+  const rows: Array<{ rel: string; size: number; mtime: number; plugin: string; version: string }> = [];
+  for (const line of lines) {
+    const [rel, size, mtime] = line.split('\t');
+    const clean = cleanPluginRel(spec, rel || '');
+    if (!clean) continue;
+    const [market, plugin, version] = clean.split('/');
+    rows.push({ rel: clean, size: Number(size) || 0, mtime: Number(mtime) || 0, plugin: `${market}/${plugin}`, version });
+  }
+  const newest = new Map<string, { version: string; mtime: number }>();
+  for (const r of rows) {
+    const cur = newest.get(r.plugin);
+    if (!cur || r.mtime > cur.mtime) newest.set(r.plugin, { version: r.version, mtime: r.mtime });
+  }
+  return rows
+    .filter((r) => newest.get(r.plugin)?.version === r.version)
+    .map((r) => {
+      const parts = r.rel.split('/');
+      const tail = parts.slice(4);            // `<skills|commands|agents>/` 之后那一截
+      const shown = spec.pluginDir === 'skills' ? tail[0] : tail.join('/').replace(/\.md$/i, '');
+      return { name: PLUGIN_PREFIX + r.rel, size: r.size, label: `${parts[1]} · ${shown}`, readOnly: true };
+    })
+    .sort((a, b) => a.label.localeCompare(b.label));
+}
 
 /**
  * 从一份"相对路径\t大小"的列表里挑出这一类的文件 —— 本地和远程共用这一段，
@@ -156,6 +299,11 @@ export function pickEntries(spec: CategorySpec, lines: string[]): ConfigEntry[] 
   return out.sort((a, b) => a.name.localeCompare(b.name));
 }
 
+/** 插件带的条目不许写 —— 插件一更新就会被它自己的版本盖回去，改了也白改。 */
+export function pluginWriteError(name?: string): string | null {
+  return isPluginName(name) ? '这是插件带的，只读（改它会在插件更新时被盖掉）。要改就在 Skills / Commands / Agents 里建一份自己的同名文件。' : null;
+}
+
 /* ------------------------------------------------------------------ 本机 */
 
 /** 本机那一份：直接 fs。 */
@@ -169,7 +317,7 @@ export class LocalKiroConfig {
       const p = entryPath(this.home, spec)!;
       try { return [{ name: spec.file!, size: fs.statSync(p).size }]; } catch { return [{ name: spec.file!, size: -1 }]; }
     }
-    const root = path.join(this.home, '.kiro', spec.root);
+    const root = path.join(this.home, ...rootRel(spec).split('/'));
     const lines: string[] = [];
     const walk = (dir: string, rel: string, depth: number) => {
       if (depth > (spec.depth || 1)) return;
@@ -184,7 +332,32 @@ export class LocalKiroConfig {
       }
     };
     walk(root, '', 1);
-    return pickEntries(spec, lines);
+    return [...pickEntries(spec, lines), ...this.pluginEntries(spec)];
+  }
+
+  /** 插件 cache 里这一类的文件（`<市场>/<插件>/<版本>/<类>/…`，最多 7 层）。 */
+  private pluginEntries(spec: CategorySpec): ConfigEntry[] {
+    if (!spec.pluginDir) return [];
+    const root = path.join(this.home, ...PLUGIN_CACHE_REL.split('/'));
+    const lines: string[] = [];
+    const walk = (dir: string, rel: string, depth: number) => {
+      if (depth > 7) return;
+      let ents: fs.Dirent[];
+      try { ents = fs.readdirSync(dir, { withFileTypes: true }); } catch { return; }
+      for (const e of ents) {
+        if (e.name.startsWith('.') || e.name === 'node_modules') continue;
+        const r = rel ? `${rel}/${e.name}` : e.name;
+        /* 第 4 层必须就是这一类的目录 —— 不然会把整个插件（脚本、测试、文档）都走一遍 */
+        if (depth === 4 && e.name !== spec.pluginDir) continue;
+        const abs = path.join(dir, e.name);
+        if (e.isDirectory()) walk(abs, r, depth + 1);
+        else if (e.isFile() && depth >= 5) {
+          try { const st = fs.statSync(abs); lines.push(`${r}\t${st.size}\t${Math.floor(st.mtimeMs / 1000)}`); } catch { /* 刚被删 */ }
+        }
+      }
+    };
+    walk(root, '', 1);
+    return pickPluginEntries(spec, lines);
   }
 
   read(spec: CategorySpec, name?: string): { path: string; content: string; exists: boolean } | { error: string } {
@@ -197,7 +370,7 @@ export class LocalKiroConfig {
   }
 
   write(spec: CategorySpec, name: string | undefined, content: string): { path: string } | { error: string } {
-    const why = validateContent(spec, content);
+    const why = validateContent(spec, content) || pluginWriteError(name);
     if (why) return { error: why };
     const p = entryPath(this.home, spec, name);
     if (!p) return { error: '名字不合规。' };
@@ -227,10 +400,25 @@ export class LocalKiroConfig {
 
 export function remoteListScript(spec: CategorySpec, q: (s: string) => string): string {
   if (spec.kind === 'single') {
-    const rel = `.kiro/${spec.root}/${spec.file}`;
+    const rel = `${rootRel(spec)}/${spec.file}`;
     return `f="$HOME"/${q(rel)}; if [ -f "$f" ]; then printf '%s\\t%s\\n' ${q(spec.file!)} "$(wc -c < "$f" | tr -d ' ')"; else printf '%s\\t-1\\n' ${q(spec.file!)}; fi`;
   }
-  return `d="$HOME"/${q(`.kiro/${spec.root}`)}; [ -d "$d" ] && cd "$d" && find . -maxdepth ${spec.depth || 1} -type f -not -name '.*' -printf '%P\\t%s\\n' 2>/dev/null; true`;
+  const own = `( d="$HOME"/${q(rootRel(spec))}; [ -d "$d" ] && cd "$d" && find . -maxdepth ${spec.depth || 1} -type f -not -name '.*' -printf '%P\\t%s\\n' 2>/dev/null; true )`;
+  if (!spec.pluginDir) return own;
+  /* 插件那一段和自己的在**同一次** ssh 里列出来（这台机器上一次 ssh 就是几秒），中间用一行分隔 */
+  return `${own}; echo ${q(PLUGIN_SPLIT)}; ( c="$HOME"/${q(PLUGIN_CACHE_REL)}; [ -d "$c" ] && cd "$c" && find . -mindepth 5 -maxdepth 7 -path ${q(`./*/*/*/${spec.pluginDir}/*`)} -type f -name '*.md' -printf '%P\\t%s\\t%T@\\n' 2>/dev/null; true )`;
+}
+
+/** 远程列表输出里"自己的"和"插件的"之间那一行。 */
+export const PLUGIN_SPLIT = '--KIROLEX-PLUGINS--';
+
+/** 拆 `remoteListScript` 的输出：前一段是自己的（`pickEntries`），后一段是插件的。 */
+export function parseRemoteList(spec: CategorySpec, out: string): ConfigEntry[] {
+  const lines = String(out || '').split('\n').map((l) => l.replace(/\r$/, '')).filter(Boolean);
+  const at = lines.indexOf(PLUGIN_SPLIT);
+  const own = at >= 0 ? lines.slice(0, at) : lines;
+  const plug = at >= 0 ? lines.slice(at + 1) : [];
+  return [...pickEntries(spec, own), ...pickPluginEntries(spec, plug)];
 }
 
 /** 远程读：先打一行 `EXISTS 0|1`，再是 base64 的内容。 */

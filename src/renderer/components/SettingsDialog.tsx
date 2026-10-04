@@ -7,7 +7,7 @@ import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
 
-type SettingsTab = 'machines' | 'appearance' | 'session' | 'backup' | 'switches';
+type SettingsTab = 'appearance' | 'session' | 'switches' | 'machines' | 'backup';
 
 interface SettingsDialogProps {
   /** 打开时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。不传 = 机器页。 */
@@ -74,7 +74,7 @@ const SWITCHES: Array<{
     help: '开：每一轮都带上 ~/.kirolex/memory 的内容（约 1.3k 字符），所以「每次回复都要…」这类规则每轮都成立。关：模型完全看不到这些背景。' },
   { key: 'recoverInterruptedTurns', store: 'settings', group: '上下文与历史',
     label: 'Resend an unanswered prompt after a restart',
-    help: '开：打开某会话时，若上次运行最后一轮没收到回复，自动截断并重发那一轮（会消耗额度），每次运行每会话最多一次。关：那一轮就留在原处，由你决定要不要重发。' },
+    help: '开：不是你停的中断（执行器中途断了、重启、看门狗）之后，自动重发那一轮（连同它已经吃进去的 steer；会消耗额度），最多重发「自动重试次数」那么多次，你按了停止就不重发。关：那一轮就留在原处，由你决定要不要重发。' },
   { key: 'pasteFolding', store: 'feature', group: '对话与输入',
     label: 'Fold large pastes to disk',
     help: '开：很长的粘贴内容存到 ~/.kirolex/pastes 并在输入框显示占位符（单行需超过 4000 字符才折叠）。关：粘贴内容一律直接进输入框。' },
@@ -104,17 +104,18 @@ const SWITCHES: Array<{
 /**
  * 设置的分页 ——「配置里东西太多了，你可以分几个不同的 tab」+「这些内容单独弄一个 setting tab」。
  *
- * 按**你来这儿要干什么**分，不是按字段类型分。顺序就是使用频率的反面：机器那一页是当前
- * 在做的事（而且是唯一会连到另一台机器的一页），放第一个；开关那一列本来就占满一屏，独占一页。
+ * 按**你来这儿要干什么**分，不是按字段类型分。顺序 ——「第一个 tab 应该是外观然后是会话，
+ * 远程和备份应该放在最后」：外观 → 会话 → 开关 → 机器 → 备份，打开设置默认是外观。
+ * 从侧栏 ☁️ / 远端报错点进来的仍然直接落在机器或备份那一页（`initialTab`）。
  */
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
-  { id: 'machines', label: '🖥 机器' },
   { id: 'appearance', label: '🎨 外观' },
   { id: 'session', label: '💬 会话' },
+  { id: 'switches', label: '🧪 开关' },
+  { id: 'machines', label: '🖥 机器' },
   /* 备份的**配置**在这儿；「桶里有哪些、恢复哪几条」在侧栏那颗 ☁️ 里 */
   { id: 'backup', label: '☁️ 备份' },
-  { id: 'switches', label: '🧪 开关' },
 ];
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
@@ -133,7 +134,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
     **打开时停在哪一页可以被指定** —— 侧栏那个 ☁️ 按钮要直接落到备份页。
     不传就还是机器页（那是最常改的一页）。
   */
-  const [tab, setTab] = useState<SettingsTab>(initialTab || 'machines');
+  const [tab, setTab] = useState<SettingsTab>(initialTab || 'appearance');
   const [capInfo, setCapInfo] = useState<{ cap: number; auto: number; overridden: boolean } | null>(null);
   const [capInput, setCapInput] = useState('');
   // Wedge-interrupt threshold in seconds. '' while loading, '0' = never interrupt.
@@ -335,7 +336,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             </div>
             <input
               className="settings-input"
-              placeholder={t("A custom font stack, e.g. 'PingFang SC', 'Segoe UI', sans-serif")}
               value={settings.fontFamily}
               onChange={(e) => onChange({ ...settings, fontFamily: e.target.value })}
             />
@@ -363,7 +363,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             </div>
             <input
               className="settings-input"
-              placeholder={t("A custom mono font stack, e.g. 'JetBrains Mono', Menlo, monospace")}
               value={settings.monoFontFamily}
               onChange={(e) => onChange({ ...settings, monoFontFamily: e.target.value })}
             />
@@ -421,6 +420,18 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           {/* 会话那一页：分屏、并发、卡死判定、辅助模型 —— 都是「会话怎么跑」的旋钮 */}
           {tab === 'session' && (
           <div className="settings-col">
+            {/* 「重试次数默认是 10，可以在 setting 中调整」 */}
+            <div className="settings-item">
+              <label className="settings-label">自动重试次数（非人为中断）</label>
+              <div className="settings-control">
+                <button className="settings-btn"
+                  onClick={() => onChange({ ...settings, autoRetryMax: Math.max(0, (settings.autoRetryMax ?? 10) - 1) })}>−</button>
+                <span className="settings-value">{settings.autoRetryMax ?? 10} 次</span>
+                <button className="settings-btn"
+                  onClick={() => onChange({ ...settings, autoRetryMax: Math.min(50, (settings.autoRetryMax ?? 10) + 1) })}>＋</button>
+              </div>
+              <p className="settings-hint">执行器中途断了、重启、看门狗打断之后，自动把那一轮再发一次，最多这么多次（重试之间会退避）。0 = 不自动重发。你按了停止的不算。</p>
+            </div>
             <div className="settings-item">
               <label className="settings-label">{t('Split grid (click a chat in the sidebar to add it; every pane has its own composer)')}</label>
               <div className="settings-control">

@@ -100,14 +100,6 @@ export interface SessionRecord {
    * 所以目录必须**存在记录里**、以记录为准 —— 渲染层传什么都不该决定一条已存在会话的工作目录。
    */
   localDir?: string;
-  /**
-   * **这条会话能动的所有目录** ——「会话目录那个功能不对，应该可以设置多个」。
-   *
-   * `localDir` 是其中**第一个**（`local_bash` 的 cwd、相对路径的基准），留着不动是为了
-   * 一大片既有逻辑不用跟着改；`localDirs` 是给模型看的那张清单，也是 `local_glob` / `local_grep`
-   * 不指定目录时搜的范围。空 / 不存在时就等于只有 `localDir` 一个。
-   */
-  localDirs?: string[];
   /** Memory injection bookkeeping (design §6.4). */
   lastMemoryInjection?: { charCount: number; at: number };
   /** Runtime lifecycle; on load, live states are treated as detached. */

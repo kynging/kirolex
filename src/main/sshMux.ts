@@ -42,7 +42,8 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { proxyArgs } from './sshProxy.ts';
+import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
+import { batchModeFor, sshEnv } from './sshAuth.ts';
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -124,13 +125,15 @@ export function masterArgs(opts: {
   sshPort?: number;
   identityFile?: string;
   proxyJump?: string;
+  passwordCipher?: string;
   socket: string;
   remotePort: number;
   localPort: number;
 }): string[] {
+  assertSafeSshHost(opts.sshHost);
   const args = [
     '-N',
-    '-o', 'BatchMode=yes',
+    '-o', batchModeFor(opts),
     '-o', 'ConnectTimeout=10',
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
@@ -141,6 +144,8 @@ export function masterArgs(opts: {
     '-o', `ControlPath=${opts.socket}`,
     '-R', `127.0.0.1:${opts.remotePort}:127.0.0.1:${opts.localPort}`,
   ];
+  /* 和 buildSshArgs 同一条：密码错了就失败，别让 askpass 用同一个答案被问三次 */
+  if (opts.passwordCipher) args.push('-o', 'NumberOfPasswordPrompts=1');
   if (opts.identityFile) args.push('-i', opts.identityFile);
   if (opts.sshPort && opts.sshPort !== 22) args.push('-p', String(opts.sshPort));
   /* master 是**唯一**真正建连接的那条，跳板必须在它身上 */
@@ -301,7 +306,7 @@ export class SshMux {
    * 会话会各起一个 master，而第 2 个开始全部因为 socket 已存在而失败，
    * 表现是"只有第一条会话有工具"。
    */
-  async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }): Promise<MuxEntry> {
+  async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<MuxEntry> {
     /*
       **Windows 上直接说"没有"** —— 见 `muxSupported`。抛出去而不是返回 undefined:
       调用方要据此走"每条会话自己一条连接"那条路，而一个 undefined 很容易被当成
@@ -364,7 +369,7 @@ export class SshMux {
     this.healTimers.set(key, t);
   }
 
-  private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }): Promise<MuxEntry> {
+  private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<MuxEntry> {
     /* 上一次留下的：进程记录先清掉，僵尸 socket 也删 —— 否则 master 会因为"文件已存在"直接退 */
     const old = this.entries.get(key);
     if (old) { try { old.proc.kill(); } catch { /* 已经没了 */ } this.entries.delete(key); }
@@ -380,7 +385,7 @@ export class SshMux {
     const remotePort = this.deps.allocateRemotePort(this.deps.usedRemotePorts());
     const localPort = this.deps.localPort();
     const args = masterArgs({ ...target, socket, remotePort, localPort });
-    const proc = (this.deps.spawnSsh || ((a: string[]) => spawn('ssh', a, { stdio: ['ignore', 'pipe', 'pipe'] })))(args);
+    const proc = (this.deps.spawnSsh || ((a: string[]) => spawn('ssh', a, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv(target) })))(args);
     const entry: MuxEntry = { key, socket, remotePort, localPort, proc, stderr: '' };
     proc.stderr?.on('data', (d: Buffer) => {
       const s = d.toString('utf-8').trim();

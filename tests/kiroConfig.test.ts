@@ -4,19 +4,30 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  CATEGORIES, categorySpec, cleanName, entryPath, validateContent, pickEntries,
+  CATEGORIES, categoriesFor, categorySpec, cleanName, entryPath, validateContent, pickEntries,
   LocalKiroConfig, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath,
 } from '../src/main/kiroConfig.ts';
 
 /* 机器人按钮的其余 tab。名字来自渲染层、远程那条会拼进 shell —— 路径安全是这里最要紧的。 */
 
 test('六个类别都在，单文件的有 file，列表的有 match', () => {
-  assert.deepEqual(CATEGORIES.map((c) => c.id), ['mcp', 'steering', 'prompts', 'skills', 'powers', 'settings']);
+  /* kiro 的还是那六个（按引擎取：Claude Code / Codex 的在同一张表里，见下面那条） */
+  assert.deepEqual(categoriesFor('kiro').map((c) => c.id), ['mcp', 'steering', 'prompts', 'skills', 'powers', 'settings']);
   for (const c of CATEGORIES) {
     if (c.kind === 'single') assert.ok(c.file, c.id);
     else assert.ok(c.match, c.id);
   }
   assert.equal(categorySpec('powers')!.readOnly, true, 'Powers 由 kiro-cli 管理，只读');
+});
+
+test('Claude Code / Codex 也有自己的那几类，路径在各自的家目录下 ——「claude code 和 codex 左下角也得有一个类似的图标」', () => {
+  assert.deepEqual(categoriesFor('claude').map((c) => c.label), ['Settings', 'CLAUDE.md', 'Agents', 'Commands', 'Skills', 'Plugins']);
+  assert.deepEqual(categoriesFor('codex').map((c) => c.label), ['config.toml', 'AGENTS.md', 'Prompts', 'Skills']);
+  assert.equal(entryPath('/home/u', categorySpec('claude-settings')!), '/home/u/.claude/settings.json');
+  assert.equal(entryPath('/home/u', categorySpec('codex-config')!), '/home/u/.codex/config.toml');
+  assert.equal(entryPath('/home/u', categorySpec('claude-agents')!, 'reviewer.md'), '/home/u/.claude/agents/reviewer.md');
+  assert.equal(entryPath('/home/u', categorySpec('claude-agents')!, '../x.md'), null);
+  assert.equal(categorySpec('codex-config')!.json, undefined, 'config.toml 不是 JSON，不按 JSON 校验');
 });
 
 test('名字：拒绝一切能跳出根目录的写法', () => {

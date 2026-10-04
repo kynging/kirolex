@@ -42,6 +42,14 @@ function listenOn(p: string): net.Server {
 }
 after(() => { for (const s of servers) { try { s.close(); } catch { /* 已经关了 */ } } });
 
+/*
+  上面那个 `listenOn` 起的是**文件路径上的** unix socket，探活也按 `isSocket()` 判 —— Windows 上
+  `net.listen(<文件路径>)` 要的是 `\\.\pipe\…` 命名管道，`isSocket()` 永远 false。而 Win32-OpenSSH
+  本来就不支持 ControlMaster，产品代码在那里走 `muxSupported()` 的回退（见文件末尾那一组），
+  所以这几条只在 POSIX 上有意义。
+*/
+const UNIX_SOCKETS = { skip: process.platform === 'win32' && 'unix socket + ControlMaster 是 POSIX 才有的；Windows 走 muxSupported() 回退' };
+
 describe('ssh 连接复用', () => {
   test('一台机器一个 key，端口不同算不同机器', () => {
     assert.equal(muxKey('ec2-user@1.2.3.4'), 'ec2-user@1.2.3.4:22');
@@ -101,7 +109,7 @@ describe('ssh 连接复用', () => {
     assert.equal(args[args.length - 1], 'echo hi');
   });
 
-  test('僵尸 socket：文件在但没人 listen —— 要能认出来并删掉', async () => {
+  test('僵尸 socket：文件在但没人 listen —— 要能认出来并删掉', UNIX_SOCKETS, async () => {
     const dir = tmpDir();
     const p = path.join(dir, 's');
     assert.equal(await probeSocket(p), false, '文件都没有');
@@ -121,7 +129,7 @@ describe('ssh 连接复用', () => {
     assert.equal(socketExists(p), false);
   });
 
-  test('并发 ensure 只起一个 master —— 否则只有第一条会话有工具', async () => {
+  test('并发 ensure 只起一个 master —— 否则只有第一条会话有工具', UNIX_SOCKETS, async () => {
     const dir = tmpDir();
     const spawned: string[][] = [];
     const mux = new SshMux({
@@ -158,7 +166,7 @@ describe('ssh 连接复用', () => {
     mux.closeAll();
   });
 
-  test('master 死了 liveSocketFor 立刻返回 undefined —— 宁可明确失败，不要静默降级', async () => {
+  test('master 死了 liveSocketFor 立刻返回 undefined —— 宁可明确失败，不要静默降级', UNIX_SOCKETS, async () => {
     const dir = tmpDir();
     let fake: any;
     const mux = new SshMux({
@@ -313,7 +321,7 @@ describe('本地 MCP server 只起一个', () => {
     assert.equal(/if \(!localMcpServer\)/.test(body), false);
     assert.match(body, /const server = await ensureLocalMcpServer\(\);/);
     /* 注册和端口都取**这一个** server，不要再读那个可能被覆盖的模块变量 */
-    assert.match(body, /server\.register\(\{ sessionId, workdir: localDir, dirs \}\)/);
+    assert.match(body, /server\.register\(\{ sessionId, workdir: localDir \}\)/);
     assert.match(body, /localPort: server\.port\(\)/);
     assert.equal(/localMcpServer\.(register|port|setProxies|urlPathFor)/.test(body), false);
   });
@@ -474,7 +482,9 @@ describe('Windows：复用不可用时回到每会话一条隧道', () => {
     assert.match(body, /remotePort = \(await sshMux\.ensure\(remote\)\)\.remotePort;/);
     /* 回退那支：按会话分端口，并且把自己当前那个也算进"已占用" */
     assert.match(body, /remotePort = allocateRemotePort\(used\);/);
-    assert.match(body, /const used = \[\.\.\.localToolsBySession\.values\(\)\]\.map\(\(v\) => v\.remotePort\);/);
+    assert.match(body, /const used = \[\s*\.\.\.\[\.\.\.localToolsBySession\.values\(\)\]\.map\(\(v\) => v\.remotePort\),/);
+    /* 还活着的旧 ssh 占着的也算（两条会话同时换引擎时撞过） */
+    assert.match(body, /\.\.\.\[\.\.\.sessionClients\.values\(\)\]\.map\(\(e\) => e\.client\.forwardedRemotePort\)/);
     /* 这句话一次就够 —— 每条会话都说一遍是噪音 */
     assert.match(M, /let muxWarned = false;/);
   });

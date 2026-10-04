@@ -25,8 +25,6 @@ export interface RemoteContextInput {
   remoteDir: string;
   /** 用户机器上的主目录 —— `local_*` 工具的相对路径以它为准。 */
   localDir: string;
-  /** 这条会话选中的**全部**目录（含 `localDir`，它排第一）。不给就等于只有主目录。 */
-  localDirs?: string[];
   /**
    * **用户在他机器上真有一个工程吗** ——「我让它找一个纯远程的项目但它总是在本地找」。
    *
@@ -57,10 +55,6 @@ export function remoteContextBlock(input: RemoteContextInput): string {
   const host = String(input?.hostLabel || '').trim();
   const remoteDir = String(input?.remoteDir || '').trim();
   const localDir = String(input?.localDir || '').trim();
-  /* 主目录排第一（去重、去空）——「会话目录应该可以设置多个」。 */
-  const dirs = [localDir, ...(input?.localDirs || [])]
-    .map((d) => String(d || '').trim())
-    .filter((d, i, a) => d && a.indexOf(d) === i);
   if (!host || !remoteDir) return '';
   return [
     '[运行环境：远程]',
@@ -74,7 +68,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       有本地工程才讲那一套"他的文件在他机器上"。没有的话讲反了比不讲糟：
       见 `hasLocalProject` 上面那段。
     */
-    (localDir && input.hasLocalProject !== false) ? localToolsHelp(dirs) : '',
+    (localDir && input.hasLocalProject !== false) ? localToolsHelp(localDir) : '',
     input.hasLocalProject === false
       ? `· **这条会话没有本地工程** —— 用户没给它挑本机目录，所以"项目"就在**你这台机器上**`
         + `（当前目录 \`${remoteDir}\`）。要找文件、找代码、跑命令，都在这里找，`

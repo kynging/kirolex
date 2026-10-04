@@ -23,7 +23,8 @@ export interface KiroConfigCategory {
   hint: string;
 }
 
-interface Entry { name: string; size: number }
+/** `label` / `readOnly`：插件带的条目（Claude Code）—— 显示「插件 · 名字」，只读。 */
+interface Entry { name: string; size: number; label?: string; readOnly?: boolean }
 
 const api = () => (window as any).kiroApi;
 
@@ -57,7 +58,9 @@ export const KiroConfigPanel: React.FC<{
   const [content, setContent] = useState('');
   const [initial, setInitial] = useState('');
   const [exists, setExists] = useState(true);
-  const [loading, setLoading] = useState(false);
+  /* 一开始就是"读取中"：远程那边一次 ssh 要好几秒，在这之前显示一个空编辑器 + 「✓ Valid JSON」
+     看起来就是「什么都拿不到」 */
+  const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ text: string; ok: boolean } | null>(null);
   const [newName, setNewName] = useState<string | null>(null);
@@ -67,6 +70,7 @@ export const KiroConfigPanel: React.FC<{
     try {
       const r = await api().kiroConfigRead(sessionId, category.id, name);
       if (!r?.ok) { setStatus({ text: r?.error || '读不到', ok: false }); return; }
+      if (r.where) setWhere(r.where);
       setSelected(name); setPath(r.path || ''); setContent(r.content || ''); setInitial(r.content || '');
       setExists(r.exists !== false);
     } finally { setLoading(false); }
@@ -74,14 +78,20 @@ export const KiroConfigPanel: React.FC<{
 
   const refresh = useCallback(async (pick?: string) => {
     setListError(null);
-    const r = await api().kiroConfigList(sessionId, category.id);
+    /* 单文件的 tab 不用先列：直接读那一个（远程会话省一次 ssh） */
+    if (category.kind === 'single') {
+      if (category.file) setEntries([{ name: category.file, size: 0 }]);
+      await open(undefined);
+      return;
+    }
+    setLoading(true);
+    const r = await api().kiroConfigList(sessionId, category.id).finally(() => setLoading(false));
     setWhere(r?.where || '');
     if (!r?.ok) { setListError(r?.error || '列不出来'); setEntries([]); return; }
     const list: Entry[] = r.entries || [];
     setEntries(list);
-    /* single 类直接打开那一个；list 类打开刚建的那个，或者第一个 */
-    if (category.kind === 'single') void open(undefined);
-    else if (pick) void open(pick);
+    /* 打开刚建的那个，或者第一个 */
+    if (pick) void open(pick);
     else if (list.length) void open(list[0].name);
     else { setSelected(undefined); setContent(''); setInitial(''); setPath(''); }
   }, [sessionId, category.id, category.kind, open]);
@@ -94,7 +104,8 @@ export const KiroConfigPanel: React.FC<{
     [category.json, content],
   );
   const dirty = content !== initial;
-  const canEdit = !category.readOnly && (category.kind === 'single' || !!selected);
+  const selectedEntry = entries.find((e) => e.name === selected);
+  const canEdit = !category.readOnly && !selectedEntry?.readOnly && (category.kind === 'single' || !!selected);
 
   const save = useCallback(async () => {
     if (!canEdit || invalid || saving || (!dirty && exists)) return;
@@ -137,21 +148,21 @@ export const KiroConfigPanel: React.FC<{
             const slash = e.name.lastIndexOf('/');
             const dir = slash >= 0 ? e.name.slice(0, slash) : '';
             const base = slash >= 0 ? e.name.slice(slash + 1) : e.name;
-            const shown = category.id === 'skills' ? dir || base : base;
+            const shown = e.label || (/skills$/.test(category.id) ? dir || base : base);
             return (
               <button
                 key={e.name}
-                className={`agent-config-row ${(category.kind === 'single' || selected === e.name) ? 'active' : ''} ${category.readOnly ? 'readonly' : ''}`}
+                className={`agent-config-row ${(category.kind === 'single' || selected === e.name) ? 'active' : ''} ${category.readOnly || e.readOnly ? 'readonly' : ''}`}
                 onClick={() => category.kind === 'list' && void open(e.name)}
                 disabled={loading}
                 title={e.name}
               >
                 <span className="agent-config-row-name">
                   {shown}
-                  {dir && category.id !== 'skills' && <span className="kiro-config-row-dir"> {dir}</span>}
+                  {dir && !e.label && !/skills$/.test(category.id) && <span className="kiro-config-row-dir"> {dir}</span>}
                 </span>
                 {selected === e.name && dirty && <span className="agent-config-row-dirty" title="有未保存的改动" />}
-                <span className="kiro-config-row-size">{e.size < 0 ? '还没有' : e.size < 1024 ? `${e.size} B` : `${(e.size / 1024).toFixed(1)} KB`}</span>
+                <span className="kiro-config-row-size">{category.kind === 'single' && !e.size ? '' : e.size < 0 ? '还没有' : e.size < 1024 ? `${e.size} B` : `${(e.size / 1024).toFixed(1)} KB`}</span>
               </button>
             );
           })}
@@ -176,7 +187,8 @@ export const KiroConfigPanel: React.FC<{
 
         <div className="agent-config-editor-body">
           <div className="agent-config-editor-selection">
-            <strong>{category.kind === 'single' ? category.file : (selected || '（选一个）')}</strong>
+            <strong>{category.kind === 'single' ? category.file : (selectedEntry?.label || selected || '（选一个）')}</strong>
+            {selectedEntry?.readOnly && <span className="kiro-config-ro-tag">插件 · 只读</span>}
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">{category.hint}{!exists && ' · 这个文件还不存在，保存就会建出来。'}</div>

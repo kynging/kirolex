@@ -4,7 +4,9 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
-import { proxyArgs } from './sshProxy.ts';
+import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
+import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
+import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, resolveAdapter, type Engine } from './engines.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 
 interface JsonRpcRequest {
@@ -144,6 +146,10 @@ export function resolveKiroCli(): string | null {
   return null;
 }
 
+/** Claude Code / Codex 在 configOptions 里给的那几类下拉（ACP 的 category）。 */
+export type EngineOptionCategory = 'model' | 'thought_level' | 'mode';
+export interface EngineSelect { current: string; options: Array<{ value: string; name: string }> }
+
 export class AcpClient extends EventEmitter {
   private process: ChildProcess | null = null;
   private nextId = 0;
@@ -155,7 +161,7 @@ export class AcpClient extends EventEmitter {
   private buffer = '';
   private env: Record<string, string>;
   private remote?: RemoteTarget;
-  private localTools?: { remotePort: number; localPort: number; agentOverride: string };
+  private localTools?: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] };
   /** 最近一点 stderr —— ssh 退出码 255 的**原因**在里面（见 stderr 处理那一段）。 */
   private lastStderr = '';
   /** 远端那个 kiro-cli 的 PID（它自己报的）—— 断开时要把它杀掉，见 `KIROLEX_PID`。 */
@@ -167,6 +173,8 @@ export class AcpClient extends EventEmitter {
    * 主进程在连接成功后把它记进历史 —— 一个真的起过会话的命令比任何检测结果都可信。
    */
   launchedWith?: string;
+  /** 哪个引擎（kiro / claude / codex）。见 `engines.ts`：只有起进程那一步和 kiro 专有的扩展不同。 */
+  readonly engine: Engine;
 
   constructor(
     model: string,
@@ -183,13 +191,24 @@ export class AcpClient extends EventEmitter {
      * 一条会话一份（共用一份的话服务端分不出是谁在调，也就不知道 cwd 是哪个目录）。
      * 它只影响这次启动，不写进记录（记录里仍然是你选的那个 agent）。
      */
-    localTools?: { remotePort: number; localPort: number; agentOverride: string },
+    localTools?: {
+      remotePort: number; localPort: number; agentOverride: string;
+      /** 非 kiro 引擎：本地工具通道直接作为 ACP 的 `mcpServers` 交给 session/new / load（kiro 走 agent JSON）。 */
+      mcpServers?: any[];
+    },
+    engine: Engine = 'kiro',
   ) {
     super();
+    this.engine = engine;
     this.model = model;
     this.kiroAgent = kiroAgent;
     this.localTools = localTools;
-    this.permissionMode = permissionMode;
+    /*
+      **Claude Code / Codex：问不问由它们自己的 mode 决定**（上面那颗按钮在这两家是 mode 下拉）。
+      KiroLex 这一层要是还"自动批准"，选了 Manual 也照样一路放行 —— 所以这里永远原样转给人看。
+      bypass / full access 这类 mode 下它们根本不会来问。
+    */
+    this.permissionMode = engine === 'kiro' ? permissionMode : 'ask';
     this.env = env || (process.env as Record<string, string>);
     this.remote = remote;
     // A client can receive stderr (e.g. SSH warnings) BEFORE the owner attaches
@@ -204,8 +223,41 @@ export class AcpClient extends EventEmitter {
     return new Promise((resolve, reject) => {
       let command: string;
       let args: string[];
+      /** 适配器要叠的环境（`ELECTRON_RUN_AS_NODE`）。kiro 那条路是空的。 */
+      let extraEnv: Record<string, string> = {};
 
-      if (this.remote?.sshHost) {
+      if (this.engine !== 'kiro') {
+        /*
+          **Claude Code / Codex**：起它们的 ACP 适配器（`engines.ts`）。没有 `--agent` / `--model`
+          这些 kiro 的启动参数 —— 模型用那个 CLI 自己配的默认值，登录也沿用它自己的。
+          远程先不做：远端那条路（ssh + 反向隧道 + 每会话 agent 配置）全是按 kiro 写的。
+        */
+        if (this.remote?.sshHost) {
+          /*
+            **远端照样起适配器** ——「为什么 remote 不行？只要 remote 也安装 ACP 不就行了吗」。
+            ssh 透明地传 stdio，和 kiro-cli 那条路一样；不同的只有那条命令（没有 --model/--agent），
+            以及本地工具通道走 `mcpServers` 而不是 kiro 的 agent 文件（见 newSession）。
+            命令名是适配器装出来的那个（`安装 AI 工具` 装的就是它），走 `bash -lc` 拿到登录 shell 的 PATH。
+          */
+          command = 'ssh';
+          const bin = REMOTE_ADAPTER_BIN[this.engine];
+          this.launchedWith = bin;
+          args = buildSshArgs(
+            this.remote,
+            buildRemoteAdapterCommand(bin),
+            this.localTools ? { remotePort: this.localTools.remotePort, localPort: this.localTools.localPort } : undefined,
+          );
+        } else try {
+          const a = resolveAdapter(this.engine, this.env as NodeJS.ProcessEnv);
+          command = a.command;
+          args = a.args;
+          extraEnv = a.env;
+          this.launchedWith = a.args[0] || a.command;
+        } catch (err) {
+          reject(err);
+          return;
+        }
+      } else if (this.remote?.sshHost) {
         // Remote executor: run `kiro-cli acp` on the remote host over SSH. ACP is
         // line-delimited JSON-RPC on stdio, which SSH pipes transparently, so the
         // rest of this client is unchanged. The remote kiro-cli operates on the
@@ -276,11 +328,14 @@ export class AcpClient extends EventEmitter {
        *   · 或者 `touch ~/.kirolex/kiro-trace`（下一次起执行器就生效，不必从终端启动 app）
        * 关掉就把那个文件删掉。开着的时候 `failureBundle` 会多抄一段日志（见那边的 tailBytes）。
        */
-      const env = { ...this.env };
-      if (kiroTraceEnabled()) env.KIRO_LOG_LEVEL = 'trace';
+      /* 远端：给 ssh 带上密码（没配密码时 sshEnv 原样返回） */
+      const env = this.remote?.sshHost ? sshEnv(this.remote, this.env) : { ...this.env };
+      if (this.engine === 'kiro' && kiroTraceEnabled()) env.KIRO_LOG_LEVEL = 'trace';
+      Object.assign(env, extraEnv);
       this.process = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env,
+        windowsHide: true,
       });
 
       this.process.stdout!.on('data', (data: Buffer) => {
@@ -387,7 +442,7 @@ export class AcpClient extends EventEmitter {
       this.remotePid = undefined;
       try {
         execFile('ssh', [...buildSshArgs(this.remote, remoteKillTree(pid))],
-          { timeout: 15_000 }, () => {});
+          { timeout: 15_000, env: sshEnv(this.remote) }, () => {});
       } catch { /* 收尾失败不该影响断开本身 */ }
     }
     this.rejectAllPending(new Error('Disconnected'));
@@ -399,6 +454,7 @@ export class AcpClient extends EventEmitter {
    * --trust-all-tools so both Auto and Ask remain reversible at runtime.
    */
   setPermissionMode(mode: PermissionMode) {
+    if (this.engine !== 'kiro') return;   // 见构造函数：那两家按它们自己的 mode
     this.permissionMode = mode;
   }
 
@@ -406,19 +462,72 @@ export class AcpClient extends EventEmitter {
     return this.permissionMode;
   }
 
+  /** kiro 的工具来自它的 agent 文件（远程会话那份由 KiroLex 每会话生成），所以给它的永远是空表；
+   *  Claude Code / Codex 没有那种文件，远程会话的本地工具通道就在这里交给它们。 */
+  /** 这个执行器的 ssh 用 `-R` 占着的那个远端端口（没有就 undefined）—— 分端口时要避开它。 */
+  get forwardedRemotePort(): number | undefined {
+    return this.localTools?.remotePort;
+  }
+
+  private get mcpServers(): any[] {
+    return this.engine !== 'kiro' ? (this.localTools?.mcpServers || []) : [];
+  }
+
   async newSession(cwd: string): Promise<{ sessionId: string }> {
-    return this.sendRequest('session/new', {
+    const r = await this.sendRequest('session/new', {
       cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServers,
     });
+    this.noteConfigOptions(r?.configOptions);
+    return r;
   }
 
   async loadSession(sessionId: string, cwd: string): Promise<any> {
-    return this.sendRequest('session/load', {
+    const r = await this.sendRequest('session/load', {
       sessionId,
       cwd,
-      mcpServers: [],
+      mcpServers: this.mcpServers,
     });
+    this.noteConfigOptions(r?.configOptions);
+    return r;
+  }
+
+  /**
+   * Claude Code / Codex 的模型清单 ——「右侧的选模型为什么没有」。两个适配器都在 session/new（/load）
+   * 的 `configOptions` 里给一个 `id: 'model'` 的 select，切换走 `session/set_config_option`（实测两边都认）。
+   */
+  private configOptions: any[] = [];
+  private noteConfigOptions(opts: unknown): void {
+    if (Array.isArray(opts)) this.configOptions = opts;
+  }
+  /**
+   * 一类下拉的清单（`model` / `thought_level` …，按 ACP 的 category 认，id 两家不一样：
+   * Claude Code 的 effort 叫 `effort`，Codex 叫 `reasoning_effort`）。没有就是 null。
+   */
+  selectOptions(category: EngineOptionCategory): EngineSelect | null {
+    const o = this.findOption(category);
+    if (!o || !Array.isArray(o.options)) return null;
+    return {
+      current: String(o.currentValue ?? ''),
+      options: o.options.map((x: any) => ({ value: String(x.value ?? x.id ?? ''), name: String(x.name ?? x.value ?? '') }))
+        .filter((x: { value: string }) => x.value),
+    };
+  }
+  get modelOptions(): EngineSelect | null {
+    return this.selectOptions('model');
+  }
+  /** 设一类的值。返回的 configOptions 整份记下来 —— 换模型时 effort 的可选值可能跟着变。 */
+  async setSelectOption(sessionId: string, category: EngineOptionCategory, value: string): Promise<void> {
+    const o = this.findOption(category);
+    if (!o) throw new Error(`这个引擎没有给出 ${category === 'model' ? '模型清单' : category === 'mode' ? '权限模式' : 'effort 选项'}`);
+    const r = await this.sendRequest('session/set_config_option', { sessionId, configId: o.id, value });
+    this.noteConfigOptions(r?.configOptions);
+  }
+  async setModelOption(sessionId: string, value: string): Promise<void> {
+    return this.setSelectOption(sessionId, 'model', value);
+  }
+  private findOption(category: EngineOptionCategory): any {
+    return this.configOptions.find((x) => x?.category === category) || this.configOptions.find((x) => x?.id === category);
   }
 
   async sendPrompt(sessionId: string, prompt: any[]): Promise<any> {
@@ -487,7 +596,8 @@ export class AcpClient extends EventEmitter {
    * false `steered` result so a message is never dropped.
    */
   get supportsSteer(): boolean {
-    return true;
+    /* `_session/steer` 是 kiro-cli 的扩展；适配器那两家没有（会回 -32601，消息就丢了） */
+    return this.engine === 'kiro';
   }
 
   /** OS pid of the kiro-cli child, or undefined once it has exited. Used to bind
@@ -772,6 +882,11 @@ export function shellQuote(value: string): string {
  * `$$` 是那个 bash 的 PID，而 `exec` 之后 kiro-cli **就是同一个 PID**，所以这一行报出来的
  * 就是要杀的那个。走 stderr：stdout 是 ACP 的协议流，掺一个字节进去就毁了它。
  */
+/** 远端起 Claude Code / Codex 的 ACP 适配器：和 kiro 那条一样先报 PID（`remoteKillTree` 靠它收尸）。 */
+export function buildRemoteAdapterCommand(bin: string): string {
+  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; exec ${shellQuote(bin)}`)}`;
+}
+
 function buildRemoteKiroCommand(model: string, kiroAgent: string | undefined, bin: string): string {
   /* `bin` 是**必填**的：调用点（`connect`）在它为空时就已经拒绝启动了（`remoteKiroBin`）。
      这里留一个 `|| 'kiro-cli'` 兜底等于在代码里留一句"我们会猜"，而那正是要去掉的行为。 */
@@ -877,10 +992,11 @@ export function buildSshArgs(
     `Connection timed out during banner exchange` 的直接成因 —— 开机时 20 条会话
     ×最多 3 次重试 = 60 次并发握手。
   */
+  assertSafeSshHost(remote.sshHost);
   const socket = muxSocketResolver?.(remote);
   if (socket) {
     return [
-      '-o', 'BatchMode=yes',
+      '-o', batchModeFor(remote),
       /*
         `ControlMaster=no` 是关键：不加的话这条 ssh 会在 master 不在时**自己变成 master**，
         而它是带命令的 —— 命令一结束连接就没了，于是隧道被一条会话的退出带走，
@@ -893,12 +1009,14 @@ export function buildSshArgs(
     ];
   }
   const args: string[] = [
-    '-o', 'BatchMode=yes',
+    '-o', batchModeFor(remote),
     '-o', 'ConnectTimeout=10',
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
     '-o', 'StrictHostKeyChecking=accept-new',
   ];
+  /* 密码错了就失败，不要在后台反复问（askpass 每次都给同一个答案，问三次也是白问） */
+  if (hasPassword(remote)) args.push('-o', 'NumberOfPasswordPrompts=1');
   if (forward) {
     args.push('-o', 'ExitOnForwardFailure=yes');
     args.push('-R', `127.0.0.1:${forward.remotePort}:127.0.0.1:${forward.localPort}`);

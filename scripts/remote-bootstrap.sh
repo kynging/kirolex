@@ -7,7 +7,7 @@
 #   · 系统包       git unzip tar（装 kiro-cli 的 zip 要它们）
 #   · Node（fnm）  claude-code / codex 都是 npm 包，没有 node 就装不上
 #   · kiro-cli     从 desktop-release 取对应架构的 zip，跑它自带的 install.sh
-#   · claude-code  官方安装脚本 https://claude.ai/install.sh（顺带 @zed-industries/claude-code-acp，
+#   · claude-code  官方安装脚本 https://claude.ai/install.sh（顺带 ACP 适配器 @agentclientprotocol/claude-agent-acp，
 #                  ACP 后端要它；官方脚本装的是原生二进制，不依赖 node）
 #   · codex        @openai/codex（官方发布在 npm）
 #   · kiro-cli 登录（device flow —— 这台机器没有浏览器，所以打印 URL + code，你在本机浏览器里完成）
@@ -76,21 +76,54 @@ load_fnm() {
 }
 load_fnm
 
-if have node; then
-  say "→ node 已在 $(node -v)"
-else
-  if ! have fnm && [ ! -x "$HOME/.local/share/fnm/fnm" ]; then
-    say "→ 装 fnm"
-    curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$HOME/.local/share/fnm" >/dev/null 2>&1
+# **最新的 LTS** ——「把脚本改成运行最新的 LTS 版本 node」。不写死大版本：问 fnm 现在的 LTS 是哪一个，
+# 不是它就装上并设成默认（已经有一个老的 node 也一样升 —— 系统自带的、或者以前装的 22）。
+# 拿不到远端版本列表（离线 / 被墙）时退回 `--lts`，再不行就沿用现有的 node，不因为这一步把整个安装弄挂。
+if ! have fnm && [ ! -x "$HOME/.local/share/fnm/fnm" ]; then
+  say "→ 装 fnm"
+  curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$HOME/.local/share/fnm" >/dev/null 2>&1
+fi
+load_fnm
+FNM="$HOME/.local/share/fnm/fnm"; [ -x "$FNM" ] || FNM="$(command -v fnm 2>/dev/null || true)"
+if [ -n "$FNM" ]; then
+  LTS="$("$FNM" ls-remote --lts 2>/dev/null | tail -1 | awk '{print $1}')"
+  CUR="$(node -v 2>/dev/null || true)"
+  if [ -n "$LTS" ] && [ "$CUR" = "$LTS" ]; then
+    say "→ node 已是最新 LTS（$CUR）"
+  elif [ -n "$LTS" ]; then
+    say "→ 装 node $LTS（最新 LTS）${CUR:+，原来是 $CUR}"
+    "$FNM" install "$LTS" >/dev/null 2>&1 && "$FNM" default "$LTS" >/dev/null 2>&1 || note_fail "node $LTS 没装上"
+  else
+    say "→ 问不到 LTS 列表，按 --lts 装"
+    "$FNM" install --lts >/dev/null 2>&1 && "$FNM" default lts-latest >/dev/null 2>&1 || true
   fi
   load_fnm
-  if have fnm || [ -x "$HOME/.local/share/fnm/fnm" ]; then
-    say "→ 装 node 22（LTS）"
-    "${HOME}/.local/share/fnm/fnm" install 22 >/dev/null 2>&1 || fnm install 22 >/dev/null 2>&1
-    "${HOME}/.local/share/fnm/fnm" default 22 >/dev/null 2>&1 || fnm default 22 >/dev/null 2>&1
-    load_fnm
-  fi
-  have node || note_fail "node 没装上 —— claude-code / codex 都要它"
+fi
+if have node; then say "→ 现在用的 node：$(node -v)（$(command -v node)）"; else note_fail "node 没装上 —— claude-code / codex 都要它"; fi
+
+# ------------------------------------------- 以后的登录 shell 也要找得到 node / npm 全局命令
+# KiroLex 起远程会话用的是 `ssh … bash -lc '<命令>'`：一个**非交互的登录 shell**。fnm 是用 --skip-shell
+# 装的（不改 shell 配置），所以不补这一步的话，那个登录 shell 里既没有 node，也没有 npm -g 装出来的
+# claude-agent-acp / codex-acp —— 适配器装上了，KiroLex 却报"那台机器上没有适配器"（它们的 shebang 还要 node）。
+# 写一份 ~/.kirolex-env.sh，从登录 shell 读的那个文件里 source 它：`bash -l` 只读 ~/.bash_profile、
+# ~/.bash_login、~/.profile 里**第一个存在的**；~/.bashrc 在 Ubuntu 上对非交互 shell 会提前 return，靠不住。
+step "PATH（给以后的登录 shell）"
+ENVF="$HOME/.kirolex-env.sh"
+cat > "$ENVF" <<'ENVEOF'
+# KiroLex：让 `bash -lc` 里起的远程会话找得到 node 和 npm 全局命令（remote-bootstrap.sh 写的，可以重跑）
+export PATH="$HOME/.local/bin:$PATH"
+if [ -x "$HOME/.local/share/fnm/fnm" ]; then eval "$("$HOME/.local/share/fnm/fnm" env --shell bash)" 2>/dev/null; fi
+ENVEOF
+PF=""
+for f in "$HOME/.bash_profile" "$HOME/.bash_login" "$HOME/.profile"; do
+  if [ -f "$f" ]; then PF="$f"; break; fi
+done
+[ -n "$PF" ] || PF="$HOME/.profile"
+if grep -qs 'kirolex-env.sh' "$PF"; then
+  say "→ 已在 $PF"
+else
+  printf '\n# KiroLex（remote-bootstrap.sh）\n[ -f "$HOME/.kirolex-env.sh" ] && . "$HOME/.kirolex-env.sh"\n' >> "$PF"
+  say "→ 写进 $PF"
 fi
 
 # ---------------------------------------------------------------- kiro-cli
@@ -156,6 +189,13 @@ npm_i() {
   # 而脚本若是从 stdin 喂进来的，它就会把剩下的脚本吃掉 —— 实测过，自检整段没跑而退出码还是 0。
   if have "$bin" && [ "$FORCE" != "1" ]; then say "→ $bin 已在 ($("$bin" --version </dev/null 2>/dev/null | head -1))"; return 0; fi
   if ! have npm; then note_fail "没有 npm，装不了 $pkg"; return 1; fi
+  # 系统自带的 node：全局目录要 root，`npm -g` 会 EACCES。改装到 ~/.local（bin 落在 ~/.local/bin，
+  # 上面那份 ~/.kirolex-env.sh 已经把它放进以后登录 shell 的 PATH）。
+  if [ ! -w "$(npm root -g 2>/dev/null)" ]; then
+    npm config set prefix "$HOME/.local" >/dev/null 2>&1
+    export PATH="$HOME/.local/bin:$PATH"
+    say "→ npm 全局目录不可写，改装到 ~/.local"
+  fi
   say "→ npm i -g $pkg"
   npm install -g "$pkg" >/dev/null 2>&1 || { note_fail "$pkg 装不上"; return 1; }
 }
@@ -171,8 +211,10 @@ else
   have claude || npm_i '@anthropic-ai/claude-code' claude
 fi
 npm_i '@openai/codex' codex
-# ACP 适配层：KiroLex 走 ACP，claude code 要靠它才能当执行器
-npm_i '@zed-industries/claude-code-acp' claude-code-acp
+# ACP 适配层：KiroLex 走 ACP，Claude Code / Codex 要靠它们才能当执行器（engines.ts 的 REMOTE_ADAPTER_BIN）。
+# 原来装的是 @zed-industries/claude-code-acp —— 那个包已经改名停更，KiroLex 起的是下面这两个命令。
+npm_i '@agentclientprotocol/claude-agent-acp' claude-agent-acp
+npm_i '@agentclientprotocol/codex-acp' codex-acp
 
 # ---------------------------------------------------------------- kiro 登录
 #
@@ -276,7 +318,7 @@ fi
 
 step "自检"
 say "uname   : $(uname -srm)"
-for b in kiro-cli git unzip node npm claude codex claude-code-acp; do
+for b in kiro-cli git unzip node npm claude codex claude-agent-acp codex-acp; do
   if have "$b"; then
     say "$(printf '%-16s' "$b"): $(command -v "$b")  $("$b" --version </dev/null 2>/dev/null | head -1)"
   else
@@ -284,6 +326,15 @@ for b in kiro-cli git unzip node npm claude codex claude-code-acp; do
     case "$b" in
       kiro-cli) rc=1 ;;   # 只有它是硬依赖：远程会话就是在远端跑一个 kiro-cli
     esac
+  fi
+done
+
+# KiroLex 是用一个**新的登录 shell** 起适配器的（`bash -lc`）—— 在这里找得到不算数，要在那种 shell 里找得到
+for b in claude-agent-acp codex-acp; do
+  if bash -lc "command -v $b" </dev/null >/dev/null 2>&1; then
+    say "$(printf '%-16s' "$b") : 登录 shell 里找得到（Claude Code / Codex 远程会话能起）"
+  else
+    say "$(printf '%-16s' "$b") : **登录 shell 里找不到** —— 这台机器跑不了对应引擎的远程会话"
   fi
 done
 
@@ -299,7 +350,8 @@ fi
 
 say ""
 if [ "$rc" -eq 0 ]; then
-  say "✓ 这台机器可以跑远程会话了。文件仍然存在你本地，KiroLex 会在每一轮前后同步镜像。"
+  say "✓ 这台机器可以跑远程会话了。文件仍然在你本地 —— 远端通过隧道读写你这台机器上的文件（不复制）。"
+  say "  Claude Code / Codex 的远程会话还要在这台机器上登录过它们（\`claude\` 跑一次登录、\`codex login\`）。"
 else
   say "✗ 还差上面标 ✗ / 缺 / 没登录 的那几项。"
 fi

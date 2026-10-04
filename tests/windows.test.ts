@@ -186,7 +186,10 @@ describe('本地工具在 Windows 上不能是 ENOENT', () => {
     assert.match(L, /if \(process\.platform === 'win32'\) \{\s*const hits = globNative/);
     assert.match(L, /if \(process\.platform === 'win32'\) \{\s*const hits = grepNative/);
     assert.match(L, /process\.env\.ComSpec \|\| 'cmd\.exe'/);
-    assert.match(L, /\['\/d', '\/s', '\/c', command\]/);
+    /* 整条命令包一层引号 + windowsVerbatimArguments 原样交给 cmd —— Node 的 `\"` 转义 cmd.exe 不认 */
+    assert.match(L, /export function cmdShellArgs\(command: string\): string\[\] \{\s*return \['\/d', '\/s', '\/c', `"\$\{command\}"`\];/);
+    assert.match(L, /run\(process\.env\.ComSpec \|\| 'cmd\.exe', cmdShellArgs\(command\), cwd, timeoutMs, true\)/);
+    assert.match(L, /windowsVerbatimArguments: verbatim/);
   });
 
   test('glob：`*` 不跨分隔符，`**/` 可以是零层目录', async () => {
@@ -234,7 +237,8 @@ describe('本地工具在 Windows 上不能是 ENOENT', () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), 'bin-'));
     fs.writeFileSync(path.join(root, 'a.bin'), Buffer.from([0x68, 0x00, 0x69]));  // 含 NUL
     fs.writeFileSync(path.join(root, 'b.txt'), 'hi');
-    assert.deepEqual(grepNative([root], 'h').map((x) => path.basename(x.split(':')[0])), ['b.txt']);
+    /* 输出是 `路径:行号:内容`，从**尾巴**剥 —— 按第一个 `:` 切会切在 Windows 盘符 `C:` 上 */
+    assert.deepEqual(grepNative([root], 'h').map((x) => path.basename(x.replace(/:\d+:.*$/s, ''))), ['b.txt']);
     fs.rmSync(root, { recursive: true, force: true });
   });
 });

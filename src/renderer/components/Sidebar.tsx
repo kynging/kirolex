@@ -4,7 +4,7 @@ import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions } from '../sessionSearch';
 import { placeMenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
-import React, { useState, useRef, useEffect } from 'react';
+import React, { useState, useRef, useEffect, useReducer } from 'react';
 import { useT } from '../hooks/useLang';
 import {
   DndContext,
@@ -19,6 +19,7 @@ import {
 } from '@dnd-kit/core';
 import {
   SortableContext,
+  arrayMove,
   useSortable,
   verticalListSortingStrategy,
 } from '@dnd-kit/sortable';
@@ -26,6 +27,7 @@ import { CSS } from '@dnd-kit/utilities';
 import type { Session } from '../App';
 import type { ScheduleSummary } from '../scheduleView';
 import { IconLogs, IconWorkspaceFolder } from './Icons';
+import { showToast } from './Toasts';
 
 type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
 
@@ -187,6 +189,8 @@ interface SidebarProps {
   /** Open a project's workspace (the flow surface). */
   onAssignProject: (sessionId: string, projectId: string) => void;
   onMoveSession: (sessionId: string, projectId: string | null) => void;
+  /** 同一组里拖动 = 调前后顺序（整份列表换成新顺序，持久化在 ui-state 里）。 */
+  onReorderSessions?: (sessions: Session[]) => void;
   onArchiveSession: (sessionId: string, archived: boolean) => void;
   onSettings: () => void;
   /**
@@ -209,6 +213,33 @@ interface SidebarProps {
   /** Agent config is a global file, so its trigger lives here, not per chat. */
 }
 
+/**
+ * **点了「运行位置」就立刻打上 tag** ——「点切换了之后没有立刻打上 tag」。
+ *
+ * 连着的会话换机器要先探远端、在那台机器上起 kiro-cli、建一条新的后端会话，十几秒到一分钟；
+ * 真正的 `remoteHost` 要等这些都做完、主进程发 `session:targets-changed` 才变。那之前侧栏毫无
+ * 反应，看起来就是"点了没用"。所以点下去那一刻先挂一个 ⏳ 版本的 tag，结束（成功或失败）就撤掉：
+ * 成功时真 tag 已经由那个事件换上，失败时回到原样并弹出原因。
+ *
+ * 放在模块级而不是层层传 prop：会话行在好几层分组组件下面，这个状态只有这里写、只有行读。
+ */
+const ENGINE_NAMES: Record<'kiro' | 'claude' | 'codex', string> = { kiro: 'Kiro', claude: 'Claude Code', codex: 'Codex' };
+const pendingTargets = new Map<string, string | null>();
+const PENDING_TARGET_EVT = 'kirolex:pending-target';
+function setPendingTarget(sessionId: string, label: string | null | undefined): void {
+  if (label === undefined) pendingTargets.delete(sessionId); else pendingTargets.set(sessionId, label);
+  window.dispatchEvent(new Event(PENDING_TARGET_EVT));
+}
+/** `undefined` = 没在切；`null` = 正在切回本地；字符串 = 正在切去那台机器。 */
+function usePendingTarget(sessionId: string): string | null | undefined {
+  const [, bump] = useReducer((x: number) => x + 1, 0);
+  useEffect(() => {
+    window.addEventListener(PENDING_TARGET_EVT, bump);
+    return () => window.removeEventListener(PENDING_TARGET_EVT, bump);
+  }, []);
+  return pendingTargets.has(sessionId) ? pendingTargets.get(sessionId) : undefined;
+}
+
 // Draggable + selectable session row.
 const SessionItem: React.FC<{
   session: Session;
@@ -228,6 +259,7 @@ const SessionItem: React.FC<{
 }> = ({ session, isActive, sessionStatus, busyReason, onSwitch, onContextMenu, onDelete, splitOrder = 0, onToggleSplit, scheduleSummary, subagents }) => {
   const t = useT();
   const crew = subagentTag(subagents);
+  const pendingTarget = usePendingTarget(session.id);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: session.id });
   const style = {
     transform: CSS.Transform.toString(transform),
@@ -309,7 +341,12 @@ const SessionItem: React.FC<{
         是这条会话的**身份**，从建立到删除都不变。所以给它一个固定的位置，眼睛每次都往同一处看。
         常驻：任何时候都不该去猜这一轮在哪台机器上跑 —— 猜错的代价是对着另一台机器的文件下结论。
       */}
-      {session.remoteHost && (
+      {/* 不挂引擎 tag ——「左侧会话框不要显示 claude 这个 tag，你应该显示的仍然是远程 tag」。引擎在会话界面左下角看 */}
+      {pendingTarget !== undefined ? (
+        <span className="session-remote session-remote-switching" title="正在切换运行位置…">
+          ⏳ {pendingTarget || '本地'}
+        </span>
+      ) : session.remoteHost && (
         <span
           className="session-remote"
           title={`这条会话的 kiro-cli 跑在 ${session.remoteHost} 上；文件仍然在你这台机器上 ——`
@@ -512,6 +549,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   scheduleFor,
   onAssignProject,
   onMoveSession,
+  onReorderSessions,
   onArchiveSession,
   onSettings,
   onOpenBackup,
@@ -681,21 +719,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * "必须先指定一个项目目录"是上一版加错的要求，把"必须镜像点什么"和"必须有个项目"混成了一件事。
    */
   const remoteTargets = useRemoteTargets().targets;
+  /** 换引擎（kiro / Claude Code / Codex）。失败要说出来 —— 它会换执行器，静悄悄失败只会被当成"点了没反应"。 */
+  const onSetEngine = async (sessionId: string, engine: 'kiro' | 'claude' | 'codex'): Promise<void> => {
+    const api = (window as any).kiroApi;
+    if (!api?.switchEngine) return;
+    const r = await api.switchEngine(sessionId, engine).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    if (!r?.ok) showToast(`✗ 切换引擎失败：${String(r?.error || '原因不明').replace(/^Error invoking remote method '[^']+': (Error: )?/, '')}`);
+  };
   const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
     const api = (window as any).kiroApi;
     if (!api?.setRemoteTarget) return;
+    setPendingTarget(sessionId, remoteId ? (remoteTargets.find((t) => t.id === remoteId)?.label || remoteId) : null);
     const r = await api.setRemoteTarget(sessionId, remoteId)
-      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }))
+      .finally(() => setPendingTarget(sessionId, undefined));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */
-    if (!r?.ok && !r?.unchanged) window.alert(String(r?.error || '切换失败'));
+    if (!r?.ok && !r?.unchanged) showToast(`✗ 切换运行位置失败：${String(r?.error || '原因不明').replace(/^Error invoking remote method '[^']+': (Error: )?/, '')}`);
   };
 
-  /*
-    选工作目录**不在侧栏了** —— 它在会话界面（`ChatArea` 的 `composer-workdir` / `App.pickWorkdir`）。
-    顺带去掉的还有这里那条按 label 反查目标的代码：它查不到就会给主进程传 `null`，
-    而 `null` 的意思是"切回本地" —— 只想换个目录，结果把会话从远端切了下来。
-    现在主进程用记录里的 `profile.remote` 保证"机器不变"（`acp:set-workdir`）。
-  */
 
   const handleContextMenu = (e: React.MouseEvent, targetId: string) => {
     e.preventDefault();
@@ -760,7 +801,19 @@ export const Sidebar: React.FC<SidebarProps> = ({
     // Unarchive action; a stray drag must never silently unarchive it (the
     // backend move handler clears the archived flag).
     if (dragged.archived) return;
-    if ((dragged.projectId ?? null) === targetProject) return; // no change
+    if ((dragged.projectId ?? null) === targetProject) {
+      /*
+        **同一组里拖 = 调顺序** ——「现在拖拽会话不能调整其前后顺序，这个不对」。
+        这里原来直接 `return`（"没换项目 = 没变化"），于是组内拖动放下就弹回原位。
+        只在落到**另一条会话**上时才动：落在组头上没有"放在谁前面"可言。
+      */
+      if (overId === sessionId || overId.startsWith('project:')) return;
+      const from = sessions.findIndex((x) => x.id === sessionId);
+      const to = sessions.findIndex((x) => x.id === overId);
+      if (from < 0 || to < 0) return;
+      onReorderSessions?.(arrayMove(sessions, from, to));
+      return;
+    }
     /**
      * 挂着 skill 的 project 由流程管理：会话是「主会话 + 每步一个」，拖进来的会话不属于任何一步，
      * 回收规则看不见它 —— 所以这里直接拒，并把原因说出来而不是静默不动。
@@ -1048,6 +1101,23 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 </div>
               )}
               {/*
+                **换引擎** ——「我还需要现有会话也能切换 agent 运行类型」。和「运行位置」一样：
+                连着就换执行器（对话不动，上下文随下一条消息带过去），没连着就只改记录。
+              */}
+              <div className="context-menu-divider" />
+              <Submenu label={`🤖 运行引擎：${ENGINE_NAMES[ctxSession.engine || 'kiro']}`}>
+                {(['kiro', 'claude', 'codex'] as const).map((eng) => (
+                  <div
+                    key={eng}
+                    className="context-menu-item"
+                    onClick={() => { void onSetEngine(ctxSession.id, eng); setContextMenu(null); }}
+                    title={eng === 'kiro' ? '用 kiro-cli 跑（kiro 的模型和 agent）' : `用 ${ENGINE_NAMES[eng]} 跑（它自己的登录和默认模型）`}
+                  >
+                    {`${(ctxSession.engine || 'kiro') === eng ? '✓ ' : '　'}${ENGINE_NAMES[eng]}`}
+                  </div>
+                ))}
+              </Submenu>
+              {/*
                 **换机器** ——「AI角色扮演这个应该是远程的」：一条已有会话应该能改成在远端跑，
                 而不是"只能重新建一条"（重建会把这条对话在后端的历史扔掉）。
                 只在配了远端、且 feature flag 开着时出现（`remoteTargets`）。
@@ -1078,13 +1148,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
                         {`${ctxSession.remoteHost === tg.label ? '✓ ' : '　'}🌐 ${tg.label}`}
                       </div>
                     ))}
-                    {/*
-                      **工作目录不在这儿** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
-                      它在会话界面输入框下面那一排（`ChatArea` 的 `composer-workdir`）：那是个常驻事实
-                      （这条会话读写哪棵树），菜单里既显示不出当前值、也提示不了这件事存在 ——
-                      而「远程会话为什么访问不了本地的文件」那次之所以只能靠猜，就是因为它当时不可见。
-                      这里只剩"在哪台机器上跑"这一个问题。
-                    */}
                   </Submenu>
                   <div className="context-menu-divider" />
                 </>

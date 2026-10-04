@@ -643,16 +643,16 @@ describe('合并：桶里那份并进本地那条', () => {
     const { mergeRecords } = await import('../src/main/transcriptMerge.ts');
     const local = {
       id: 's', title: '本地标题', updatedAt: 200, createdAt: 50,
-      localDirs: ['/a'], cliSessionId: 'local-cli', executorState: 'attached',
+      tags: ['/a'], cliSessionId: 'local-cli', executorState: 'attached',
     };
     const remote = {
       id: 's', title: '远端标题', updatedAt: 300, createdAt: 10,
-      localDirs: ['/b'], cliSessionId: 'remote-cli', executorState: 'attached',
+      tags: ['/b'], cliSessionId: 'remote-cli', executorState: 'attached',
     };
     const out = mergeRecords(local, remote);
     assert.equal(out.title, '远端标题', 'updatedAt 大的赢');
     assert.equal(out.createdAt, 10, '开始时间不随谁后改一次而变');
-    assert.deepEqual(out.localDirs.sort(), ['/a', '/b'], '两台机器各加过的目录都要留');
+    assert.deepEqual(out.tags.sort(), ['/a', '/b'], '两台机器各加过的标签都要留');
     /* 抄另一台的 cliSessionId 会让下一次 attach 去 load 一个这里不存在的 session */
     assert.equal(out.cliSessionId, 'local-cli');
     assert.equal(out.executorState, 'detached', '刚合并完，谁也没连着');
@@ -866,7 +866,8 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
   test('同步时按项目筛，而且说出跳过了多少条', () => {
     const at = M5.indexOf('async function runS3Sync');
     const body = M5.slice(at, at + 2600);
-    assert.match(body, /const sessions = allSessions\.filter\(\(r\) => !projectExcluded\(cfg, projectOf\(r\)\)\);/);
+    /* 先按项目、再按单条会话（「我是说单独会话级别的同步与否」） */
+    assert.match(body, /const sessions = allSessions\.filter\(\(r\) => !projectExcluded\(cfg, projectOf\(r\)\) && !sessionExcluded\(cfg, r\.id\)\);/);
     /* "少备份了一些东西"必须能解释，否则那是静默的数据缺失 */
     assert.match(body, /跳过 \$\{excludedCount\} 条会话/);
   });
@@ -1062,5 +1063,56 @@ describe('每条会话的最新同步时间', () => {
     assert.ok(helper.indexOf('await deleteObject') < helper.indexOf('putObject(creds, catalogKey'));
     /* 两道确认：界面弹一次，IPC 层还要求原样传回项目名（防手滑点到别的行） */
     assert.match(body, /if \(confirm !== project\) return \{ ok: false/);
+  });
+});
+
+describe('单条会话的同步与否 ——「我是说单独会话级别的同步与否」', () => {
+  const MI = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+
+  test('排除表按会话 id 存、能存能读，界面每行一个开关', () => {
+    assert.match(MI, /function sessionExcluded\(cfg: SyncConfig, sessionId: string\): boolean/);
+    assert.match(MI, /excludeSessions: \(input\.excludeSessions as unknown\[\]\)/);
+    assert.match(MI, /excluded: sessionExcluded\(cfg, rec\.id\),/);
+    assert.match(UI, /onChange=\{\(next\) => void toggleSession\(x\.id, next\)\}/);
+    assert.match(UI, /saveS3Config\?\.\(\{ excludeSessions: next \}\)/);
+    /* 项目关着时整组都不传，单条的开关就不给按（按了也没意义） */
+    assert.match(UI, /disabled=\{!!busy \|\| p\.excluded\}/);
+  });
+
+  test('「删除备份」在恢复那一页，不在同步那一页', () => {
+    const syncAt = UI.indexOf("{tab === 'sync' && (");
+    const restoreAt = UI.indexOf("{tab === 'restore' && (");
+    const syncPart = UI.slice(syncAt, restoreAt);
+    assert.doesNotMatch(syncPart, /deleteProject\(/);
+    assert.match(UI.slice(restoreAt), /onClick=\{\(\) => void deleteProject\(rows\[0\]\?\.project \|\| '', rows\.length\)\}/);
+  });
+});
+
+describe('恢复 ——「我尝试恢复但没有生效」', () => {
+  const MI = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
+  const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+  const at = MI.indexOf("ipcMain.handle('s3:restore'");
+  const body = MI.slice(at, MI.indexOf("ipcMain.handle('acp:reveal'", at));
+
+  test('记忆跟着回来：会话 / 项目 / 全局三份都拉，一律合并（细节见 memoryBackup.test.ts）', () => {
+    assert.match(body, /path\.join\('memory', 'sessions', sessionId\)/);
+    assert.match(body, /path\.join\('memory', 'projects', project\)/);
+    assert.match(body, /mergeMemoryText\(local, body\.toString\('utf-8'\)\)/);
+    assert.doesNotMatch(body, /overwrite: true/, '会话记忆不再直接覆盖');
+  });
+
+  test('新恢复的默认在本机跑（远端那份是备份它的那台机器的配置）；墓碑清掉', () => {
+    assert.match(body, /if \(!existed && recAfter\?\.profile\?\.remote\) \{\s*delete recAfter\.profile\.remote;/);
+    assert.match(body, /clearSessionTombstone\(sessionId\);/);
+  });
+
+  test('不用重启：恢复完侧栏对一遍磁盘，并把那几条连上', () => {
+    assert.match(UI, /new CustomEvent\('kirolex:sessions-restored', \{ detail: \{ ids: restoredIds \} \}\)/);
+    assert.doesNotMatch(UI, /重启 KiroLex 后它们会出现在列表里/);
+    assert.match(HK, /window\.addEventListener\('kirolex:sessions-restored', onRestored\);/);
+    assert.match(HK, /await hydrateFromDiskRef\.current\(\);/);
+    assert.match(HK, /for \(const id of ids\) void warmSessionRef\.current\(id\);/);
   });
 });

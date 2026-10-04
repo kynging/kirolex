@@ -2,12 +2,15 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
-import { execSync, execFileSync, execFile, spawn } from 'child_process';
-import { AcpClient, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
+import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
+import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
+import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
+import { ADAPTER_PACKAGE, ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf } from './engines.ts';
+import { applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
 import {
-  CATEGORIES as KIRO_CONFIG_CATEGORIES, categorySpec, LocalKiroConfig, pickEntries, validateContent,
-  remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath,
+  CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
+  remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
 } from './kiroConfig';
 import { rewriteImagePaths } from './imagePaths';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
@@ -18,11 +21,11 @@ import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
-  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, defaultRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, resolveRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -55,7 +58,7 @@ import {
   ownerTag, ownedAgentPrefix,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
+import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { logger } from './logger';
 
@@ -110,8 +113,6 @@ interface SessionEntry {
    * 所以不设也不会错 —— 但设上之后就不用在每个用点再判一次"这是远程吗"。
    */
   localDir?: string;
-  /** 这条会话选中的**其余**目录（`localDir` 是第一个，不重复放在这里）。 */
-  localDirs?: string[];
   /** accumulates the in-flight assistant response; flushed to the durable
    *  store only when the turn completes (asymmetric durability, §7). */
   assistantBuf: string;
@@ -415,6 +416,18 @@ async function connectWithModelFallback(
   /** 有它才能在会话里说一句"你选的模型这台机器上没有"。没有就只进日志。 */
   sessionId?: string,
 ): Promise<{ client: AcpClient; model: string }> {
+  /*
+    **Claude Code / Codex 不走这套降级** —— 下面的模型清单、"哪个模型在这台机器上挣来的"、
+    降级顺序、记住成功的 kiro 启动命令，全都是 kiro 的东西。另外两家用它们自己 CLI 配的默认模型，
+    起一次就行；起不来就把原因（多半是"没装适配器"）原样交出去。
+  */
+  const engine = engineOf(profile);
+  if (engine !== 'kiro') {
+    const client = new AcpClient(profile.model, shellEnv, undefined, profile.permissionMode, profile.remote, localTools, engine);
+    await client.connect();
+    logger.info('engine', `${label}: ${ENGINE_LABEL[engine]} 适配器起来了（${client.launchedWith || '?'}）`);
+    return { client, model: profile.model };
+  }
   const machine = machineKeyOf(profile);
   const modelsKnownDead = deadModelsFor(machine);
   /*
@@ -507,7 +520,7 @@ async function connectWithModelFallback(
     }
   };
   for (const model of candidates) {
-    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
+    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
       if (model !== profile.model) {
@@ -595,7 +608,7 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
     };
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, entry));
-    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
+    const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
       await withLoadTimeout(client.loadSession(cliSessionId, cwd), loadTimeoutFor(profile.remote));
@@ -1634,7 +1647,7 @@ function sessionNotice(sessionId: string, text: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[] }>();
+const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; mcpServers?: any[] }>();
 
 /**
  * **只起一个** MCP server ——「重复利用」顺手挖出来的一个真 bug。
@@ -1682,22 +1695,13 @@ async function ensureLocalTools(
   sessionId: string,
   profile: AgentProfile,
   localDir: string,
-): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[] } | undefined> {
+): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; mcpServers?: any[] } | undefined> {
   const remote = profile.remote;
   if (!remote?.sshHost) return undefined;
   try {
     const server = await ensureLocalMcpServer();
     const agentOverride = sessionAgentName(sessionId, OWNER);
-    /*
-      **额外目录从记录里现查**，而不是当参数一路传下来：`ensureLocalTools` 有 6 个调用点
-      （新建 / attach / 换目标 / 换 agent / 换模型 / 换权限），漏传一个的表现是"那条会话
-      突然只搜第一个目录了" —— 不报错，只是搜不全。记录是真相，就在这里读它。
-    */
-    const extra = store.readRecord(sessionId)?.localDirs || [];
-    const dirs = [localDir, ...extra]
-      .map((d) => String(d || '').replace(/\/+$/, ''))
-      .filter((d, i, a) => d && a.indexOf(d) === i);
-    const token = server.register({ sessionId, workdir: localDir, dirs });
+    const token = server.register({ sessionId, workdir: localDir });
     const urlPath = server.urlPathFor(sessionId) || `/mcp/${token}`;
     /*
       **端口归机器，不归会话** ——「重复利用」。
@@ -1729,7 +1733,15 @@ async function ensureLocalTools(
       remotePort = (await sshMux.ensure(remote)).remotePort;
     } else {
       /* 按会话分端口：把**自己当前那个**也算进"已占用"，避免"先起新的再关旧的"时撞上自己 */
-      const used = [...localToolsBySession.values()].map((v) => v.remotePort);
+      /*
+        **还活着的 ssh 占着的端口也算** —— 实测：两条会话前后两秒各切到 Claude Code，第一条把自己那格
+        从 39101 改成 39102（表里 39101 就"空"了），可它旧的 ssh 要等新的连上才关、还占着 39101；
+        第二条于是又分到 39101，`ExitOnForwardFailure=yes` 让它的 ssh 当场退出 →「连不上远程」。
+      */
+      const used = [
+        ...[...localToolsBySession.values()].map((v) => v.remotePort),
+        ...[...sessionClients.values()].map((e) => e.client.forwardedRemotePort).filter((p): p is number => typeof p === 'number'),
+      ];
       remotePort = allocateRemotePort(used);
       if (!muxWarned) {
         muxWarned = true;
@@ -1755,6 +1767,19 @@ async function ensureLocalTools(
       判据在 `forwardMcp`：命令是本机路径的（远端必然起不来、而且是静默少工具），
       以及按名字就该在本机跑的（`playwright` —— 远端那台没有你在看的那个浏览器）。
     */
+    /*
+      **Claude Code / Codex：同一条隧道，换一种交法** —— 它们没有 kiro 的 agent 文件，
+      ACP 本身就有 `mcpServers`（两个适配器都声明了 `mcpCapabilities.http`）。所以不往远端写
+      agent JSON，直接把那个带 token 的 URL 作为一个 http MCP 交给 session/new / load。
+    */
+    if (engineOf(profile) !== 'kiro') {
+      const mcp = { type: 'http', name: 'kirolex-local', url: mcpUrl(remotePort, urlPath), headers: [] };
+      const spec = { remotePort, localPort: server.port(), agentOverride, forwarded: [] as string[], mcpServers: [mcp] };
+      localToolsBySession.set(sessionId, spec);
+      toollessSessions.delete(sessionId);
+      logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
+      return spec;
+    }
     const forwardable = profile.kiroAgent ? forwardableFrom(localAgentJson(profile.kiroAgent)) : [];
     server.setProxies(sessionId, forwardable);
     const forwarded = forwardable.map((f) => ({ name: f.name, url: `${mcpUrl(remotePort, urlPath)}/${f.name}` }));
@@ -2095,7 +2120,7 @@ function runProbe(machine: string, script: string): Promise<string> {
   if (!target?.sshHost) return Promise.reject(new Error(`找不到这台机器（${machine}）—— 设置里删掉了？`));
   return new Promise((resolve, reject) => {
     execFile('ssh', [...buildSshArgs(target, `bash -lc ${shellQuote(script)}`)],
-      { timeout, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 }, (err, stdout, stderr) => {
+      { timeout, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, env: sshEnv(target) }, (err, stdout, stderr) => {
         if (err && !String(stdout || '').includes('KX_BIN')) {
           /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
           const real = String(stderr || err.message).split('\n')
@@ -2112,7 +2137,7 @@ function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_0
   return new Promise((resolve, reject) => {
     execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
       /* 默认 60 秒够所有探测用；`kiro-cli update` 要下一个几十 MB 的二进制，调用方会放宽 */
-      { timeout: timeoutMs, encoding: 'utf8' },
+      { timeout: timeoutMs, encoding: 'utf8', env: sshEnv(remote) },
       (err, stdout, stderr) => {
         if (err && !String(stdout || '')) {
           /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
@@ -2128,7 +2153,7 @@ function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_0
 function writeRemoteFile(remote: RemoteTarget, script: string, stdin: string): Promise<void> {
   return new Promise((resolve, reject) => {
     const args = [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)];
-    const child = execFile('ssh', args, { timeout: 60_000 }, (err) => (err ? reject(err) : resolve()));
+    const child = execFile('ssh', args, { timeout: 60_000, env: sshEnv(remote) }, (err) => (err ? reject(err) : resolve()));
     try { child.stdin?.end(stdin); } catch { /* 命令已经退了 */ }
   });
 }
@@ -2201,12 +2226,11 @@ function runLocalActions(sessionId: string, entry: SessionEntry, chunk: string):
 function remoteContextFor(sessionId: string, entry: SessionEntry): string {
   const remote = entry.profile.remote;
   if (!remote?.sshHost) return '';
-  const workdir = remote.remoteWorkdir || defaultRemoteWorkdir(remote.sshHost);
+  const workdir = resolveRemoteWorkdir(remote.remoteWorkdir, remote.sshHost);
   return remoteContextBlock({
     hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
     remoteDir: entry.cwd,
     localDir: localProjectDirOf(sessionId, entry),
-    localDirs: localDirsOf(sessionId, entry),
     /*
       **他那边到底有没有工程** ——「我让它找一个纯远程的项目但它总是在本地找」。
 
@@ -2267,19 +2291,6 @@ function localDirOrSessionDir(sessionId: string, candidate?: string): string {
 function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
   if (entry.localDir) return entry.localDir;
   return entry.profile.remote?.sshHost ? getSessionDir(sessionId) : entry.cwd;
-}
-
-/**
- * 这条会话**能动的全部目录**，主目录排第一 ——「会话目录应该可以设置多个」。
- *
- * 去重并去掉空串：重复的目录会让 `local_grep` 把同一棵树搜两遍（结果翻倍，看起来像匹配变多了），
- * 而空串传给 `find` 会被当成当前目录 —— 两种都不报错，所以只能在这里挡住。
- */
-function localDirsOf(sessionId: string, entry: { localDir?: string; localDirs?: string[]; cwd: string; profile: AgentProfile }): string[] {
-  const primary = localProjectDirOf(sessionId, entry);
-  return [primary, ...(entry.localDirs || [])]
-    .map((d) => String(d || '').replace(/\/+$/, ''))
-    .filter((d, i, a) => d && a.indexOf(d) === i);
 }
 
 /**
@@ -2438,6 +2449,45 @@ async function localKiroVersion(): Promise<string | undefined> {
  */
 const preflightInFlight = new Map<string, Promise<string[]>>();
 
+/**
+ * **本地会话在哪个目录里干活** ——「本机应该有工作目录这个功能，默认是用户目录下的 kirolex」。
+ *
+ * 归了项目的会话用项目自己的目录；没归项目的（渲染层给的是家目录 / 什么都没给 / 老记录里存的
+ * 每会话目录 `~/.kirolex/sessions/<id>`）一律用**本机工作目录**（设置 → 机器 → 本机，默认 `~/kirolex`）。
+ *
+ * 新建和重连**都走这一个函数**：原来新建给的是每会话目录、重连给的是记录里的家目录，两次不是
+ * 同一个地方。kiro 不在乎（它每次都重建上下文），但 Claude Code 是按目录存会话的 —— 重连换了目录
+ * 就找不回原来那段对话。
+ */
+function localCwdFor(sessionId: string, dir?: string): string {
+  const d = String(dir || '').trim();
+  const same = (a: string, b: string): boolean => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
+  if (d && !same(d, os.homedir()) && !same(d, getSessionDir(sessionId))) return d;
+  const wd = localWorkdir(KIROLEX_CONFIG_PATH);
+  try { fs.mkdirSync(wd, { recursive: true }); } catch { /* 建不了就让执行器自己报 cwd 不存在 */ }
+  return wd;
+}
+
+/**
+ * Claude Code / Codex 的远端检查：只问那台机器上**有没有适配器**。kiro 那套 preflight 查的是
+ * kiro-cli、kiro 登录和 kiro 的模型清单，对另外两家全都不相干（而且会因为"没有 kiro-cli"误拒）。
+ * 不在就说清楚怎么装 —— 否则失败会伪装成"ssh 断了"。
+ */
+async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'codex'): Promise<void> {
+  const bin = REMOTE_ADAPTER_BIN[engine];
+  let out = '';
+  try {
+    out = await runRemoteCapture(remote, `command -v ${bin} >/dev/null 2>&1 && echo KX_HAVE || echo KX_MISSING`, 30_000);
+  } catch (err: any) {
+    throw new Error(`连不上 ${remote.sshHost}：${err?.message || err}`);
+  }
+  if (!out.includes('KX_HAVE')) {
+    throw new Error(`${remote.sshHost} 上没有 ${ENGINE_LABEL[engine]} 的 ACP 适配器（${bin}）。`
+      + `设置 → 🖥 机器 → 选中这台机器 →「安装 AI 工具」会装上它（${ADAPTER_PACKAGE[engine]}）；`
+      + `另外那台机器上要登录过 ${ENGINE_LABEL[engine]}。`);
+  }
+}
+
 function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
   const host = remote.sshHost || '';
   const running = preflightInFlight.get(host);
@@ -2464,7 +2514,7 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
   let verdict = { code: 'unreachable', message: `连不上 ${host}` } as ReturnType<typeof judgePreflight>;
   for (let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt += 1) {
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
+      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(remote) }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
         stdout: String(stdout || ''),
         stderr: String(stderr || ''),
@@ -2477,7 +2527,7 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
       reachability.ok(host);
       /*
         **记下那台机器的规格** ——「远程能承受多少个远程 session」。上限按**它**算，
-        而不是按本机（`computeExecutorCap` 算的是本机 RAM/CPU）。判据和实测数字见
+        而不是按本机的默认值（`DEFAULT_EXECUTOR_CAP`）。判据和实测数字见
         `remoteExecutorCap`。
       */
       /*
@@ -2498,7 +2548,7 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
           remoteVersionWarned.add(host);
           logger.warn('remote', `${host} 上的 kiro-cli 是 ${verdict.kiroVersion}，本机是 ${mine} —— 落后了。`
             + `旧版本缺的东西是实打实的（1.27.0 连 \`--list-models\` 都没有，所以模型倍率只能靠猜）。`
-            + `设置 → 🖥 机器 里有「更新那台机器的 kiro-cli」。`);
+            + `设置 → 🖥 机器 → 那台机器 →「安装 AI 工具」会顺带更新它。`);
         }
       }
       /*
@@ -2585,19 +2635,12 @@ function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session
 // restart the dir is gone so hydrate never re-adds it.
 const deletedSessionIds = new Set<string>();
 // Soft cap on ATTACHED executors (design §8). Dormant sessions are unbounded.
-// Auto-sized from host resources (like MeshClaw's compute_max_subagents): each
-// kiro-cli executor is a heavy process (~0.4GB), so bound by BOTH a memory
-// budget (~half of total RAM) and CPU count, clamped to a sane [4, 16] range.
-function computeExecutorCap(): number {
-  const cpus = os.cpus()?.length || 4;
-  const totalGB = os.totalmem() / 2 ** 30;
-  const PER_EXEC_GB = 0.4;   // rough per-executor footprint
-  const RAM_BUDGET = 0.5;    // use up to ~50% of total RAM for warm executors
-  const memCap = Math.floor((totalGB * RAM_BUDGET) / PER_EXEC_GB);
-  const cpuCap = cpus * 2;   // up to 2 executors per core
-  return Math.max(4, Math.min(16, memCap, cpuCap));
-}
-const MAX_CONCURRENT_SESSIONS_AUTO = computeExecutorCap();
+// Default is a fixed 10 (「默认会话数设为 10」). It used to be auto-sized from RAM/CPU
+// into [4, 16], which on most machines simply meant 16 -- more kiro-cli processes
+// (~0.4GB each) than anyone keeps busy. `executorCap` in ~/.kirolex/config.json
+// still overrides it.
+const DEFAULT_EXECUTOR_CAP = 10;
+const MAX_CONCURRENT_SESSIONS_AUTO = DEFAULT_EXECUTOR_CAP;
 // User-configurable cap: persisted override in ~/.kirolex/config.json wins over
 // the auto-sized value. 0/undefined = auto. Clamped to a sane range.
 const KIROLEX_CONFIG_PATH = path.join(os.homedir(), '.kirolex', 'config.json');
@@ -3094,13 +3137,14 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   /** 会话记忆自动维护：一轮结束、攒够新消息就压一次（`sessionMemory.ts`） */
   sessionMemory: true,
   /**
-   * **远程会话**：把这条会话的 kiro-cli 跑在另一台机器上，文件仍以本地为准（rsync 镜像）。
-   * 见 `docs/DESIGN_remote_sessions.md`。
+   * **远程会话**：把这条会话的 kiro-cli 跑在另一台机器上，文件留在本机、通过反向隧道读写
+   * （`localMcp.ts`）。见 `docs/DESIGN_remote_sessions.md`。
    *
-   * 默认**关**：它改的是"发送前先推、失败就不发"这条主路，而这个开关关着的时候
-   * 一条远程会话都建不起来，主路上那几句就是死代码 —— 这样它能跟着 PR 一起进去而不改变任何现有行为。
+   * 默认**开** ——「为什么加了远程机器还没有切换到远程会话的选项」。原来默认关，理由是它改了
+   * "发送前先 rsync 推镜像"那条主路；镜像早就去掉了，剩下的效果只是：你在设置里配好一台机器，
+   * 新建对话里却永远看不到它。配一台机器本身就是选择要用它；一台没配时这个开关什么也不改变。
    */
-  remoteSessions: false,
+  remoteSessions: true,
   /** Store a large paste on disk and show a placeholder in the composer. */
   pasteFolding: true,
   /** Draggable dividers between split panes. */
@@ -3227,6 +3271,28 @@ function decryptSecret(cipher?: string): string {
   try { return safeStorage.decryptString(Buffer.from(cipher, 'base64')); } catch { return ''; }
 }
 
+/* SSH 密码和 S3 secret 同一套加解密（sshAuth.ts 拿不到 safeStorage，由这里注入） */
+setPasswordDecryptor((cipher) => decryptSecret(cipher));
+
+/**
+ * 界面送来的密码字段 → 要存的密文。明文**只活在这一次调用里**。
+ *   · `clearPassword: true` → 清掉（空串）
+ *   · `password` 非空 → 加密（没有加密存储时 encryptSecret 会抛，拒绝明文落盘）
+ *   · 都没有 → `{}`：不动已存的那份（界面拿不到密文，所以"没给"是常态）
+ */
+function passwordFields(input: any): { passwordCipher?: string } {
+  if (input?.clearPassword) return { passwordCipher: '' };
+  const plain = typeof input?.password === 'string' ? input.password : '';
+  return plain ? { passwordCipher: encryptSecret(plain) } : {};
+}
+
+/** 测试连接 / 安装时要用的密文：刚输入的优先，否则用这台机器已存的。 */
+function passwordCipherForUse(input: any): string | undefined {
+  const f = passwordFields(input);
+  if (f.passwordCipher !== undefined) return f.passwordCipher || undefined;
+  return input?.id ? findRemoteTarget(KIROLEX_CONFIG_PATH, String(input.id))?.passwordCipher : undefined;
+}
+
 const KIROLEX_HOME = path.join(os.homedir(), '.kirolex');
 /** 模型元数据缓存（倍率 / 上下文窗口）—— 见 `modelMeta.ts`。 */
 const MODEL_META_PATH = path.join(KIROLEX_HOME, 'model-meta.json');
@@ -3313,6 +3379,11 @@ function projectExcluded(cfg: SyncConfig, project: string): boolean {
   return list.includes(project);
 }
 
+/** 这条会话要不要同步 ——「我现在还是不能选择是否备份会话」。项目关着的话整组都不传，这里是再细一层。 */
+function sessionExcluded(cfg: SyncConfig, sessionId: string): boolean {
+  return Array.isArray(cfg.excludeSessions) && cfg.excludeSessions.includes(sessionId);
+}
+
 function catalogEntriesFor(
   sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any }>,
   machine: string,
@@ -3370,6 +3441,11 @@ async function deleteBackupsOf(
   return { deleted, failed };
 }
 
+/** 一个目录下的子目录名（没有这个目录就是空）。 */
+function walkDirs(dir: string): string[] {
+  try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; }
+}
+
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: '上一轮还在跑' };
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
@@ -3393,14 +3469,20 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       会让它同时对两件事负责。
     */
     const allSessions = store.listSessions();
-    const sessions = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)));
+    const sessions = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)) && !sessionExcluded(cfg, r.id));
     const excludedCount = allSessions.length - sessions.length;
     if (excludedCount) {
-      logger.info('s3', `跳过 ${excludedCount} 条会话（它们的项目设成了不同步：`
-        + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、')}）`);
+      logger.info('s3', `跳过 ${excludedCount} 条会话（项目设成了不同步：`
+        + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、') || '无'}；单独设成不同步的会话 ${(cfg.excludeSessions || []).length} 条）`);
     }
     const ids = sessions.map((r) => r.id);
-    const plan = planUpload(KIROLEX_HOME, ids, state);
+    /*
+      **记忆按同一个口径筛** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
+      项目：本地所有有记忆的项目里，没被设成不同步的那些（一个项目底下暂时没有会话，它的记忆也该在）。
+    */
+    const memoryProjects = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'))
+      .filter((p) => !projectExcluded(cfg, p));
+    const plan = planUpload(KIROLEX_HOME, ids, state, { projects: memoryProjects });
     const thisMachine = machineTag(os.hostname());
     /*
       **先看桶里有没有别人动过同一条会话**（参考 Tabby 插件的 `conflict detection` +
@@ -3528,8 +3610,58 @@ function saveHelperModels(model: string, fallback: string) {
 }
 
 /** Wire a freshly-created client's events, routing everything by sessionId. */
+/**
+ * **Claude Code / Codex 的模型** ——「右侧的选模型为什么没有」。清单来自适配器自己（session/new / load 的
+ * `configOptions`），这里只负责：连上之后把这条会话记着的那个设回去，再把清单推给界面。
+ */
+function engineModelsPayload(sessionId: string, entry: SessionEntry) {
+  return {
+    sessionId,
+    ...(entry.client.modelOptions || { current: '', options: [] }),
+    /* 「改成 effort 吧」—— 原来显示引擎名的那一格 */
+    effort: entry.client.selectOptions('thought_level'),
+    /* 「claude code 那个就不应该叫 auto 了」—— 顶上那颗按钮在这两家是它们自己的权限模式 */
+    mode: entry.client.selectOptions('mode'),
+  };
+}
+
+/**
+ * **没选过权限模式时用哪个** ——「默认是 bypass 就好」。只给 Claude Code 定：它的适配器起来时报什么取决于
+ * 那台机器的 settings（`permissions.defaultMode`），而 KiroLex 里 kiro 会话默认就是自动批准，两边该一致。
+ * Codex 的那几档同时管着沙箱（read-only / workspace-write …），不替人选，用它自己的默认。
+ */
+const DEFAULT_ENGINE_MODE: Partial<Record<'claude' | 'codex', string>> = { claude: 'bypassPermissions' };
+
+/** 这条会话记着的那几个值（模型 / effort / 模式），按"先模型后 effort"的顺序 —— 换模型可能会换掉 effort 的可选值。 */
+function wantedEngineOptions(profile: AgentProfile): Array<[EngineOptionCategory, string]> {
+  const engine = engineOf(profile);
+  if (engine === 'kiro') return [];
+  const saved = profile.engineOptions?.[engine] || {};
+  const out: Array<[EngineOptionCategory, string]> = [];
+  const model = profile.engineModels?.[engine];
+  if (model) out.push(['model', model]);
+  if (saved.thought_level) out.push(['thought_level', saved.thought_level]);
+  const mode = saved.mode || DEFAULT_ENGINE_MODE[engine];
+  if (mode) out.push(['mode', mode]);
+  return out;
+}
+
+async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise<void> {
+  const engine = engineOf(entry.profile);
+  if (engine === 'kiro') return;
+  for (const [cat, want] of wantedEngineOptions(entry.profile)) {
+    const opts = entry.client.selectOptions(cat);
+    if (!opts || opts.current === want || !opts.options.some((o) => o.value === want)) continue;
+    try { await entry.client.setSelectOption(entry.cliSessionId, cat, want); } catch (err) {
+      logger.warn('engine-model', `重设 ${ENGINE_LABEL[engine]} ${cat}=${want} 失败 sessionId=${sessionId}`, err);
+    }
+  }
+  if (sessionClients.get(sessionId) === entry) mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
+}
+
 function wireSession(sessionId: string, entry: SessionEntry) {
   const { client } = entry;
+  void applyEngineModel(sessionId, entry);
   client.on('update', (data: any) => {
     // A background history-priming turn's output must never surface: don't
     // forward to the UI, accumulate, or persist it.
@@ -4553,6 +4685,14 @@ app.whenReady().then(async () => {
             .filter((v, i, a) => a.indexOf(v) === i),
         }
         : null),
+      /* 不同步的会话：同一套清洗（只收非空字符串、去重） */
+      ...(Array.isArray(input?.excludeSessions)
+        ? {
+          excludeSessions: (input.excludeSessions as unknown[])
+            .filter((v): v is string => typeof v === 'string' && !!v)
+            .filter((v, i, a) => a.indexOf(v) === i),
+        }
+        : null),
       ...(input?.accessKeyId !== undefined ? { accessKeyId: String(input.accessKeyId).trim() } : null),
     };
     if (typeof input?.secretAccessKey === 'string' && input.secretAccessKey.trim()) {
@@ -4650,6 +4790,7 @@ app.whenReady().then(async () => {
         bytes,
         syncedAt: marks[rec.id]?.at || 0,
         state: sessionSyncState(marks[rec.id], rec.updatedAt || 0, uploadedIds.has(rec.id)),
+        excluded: sessionExcluded(cfg, rec.id),
       });
       byProject.set(key, cur);
     }
@@ -4662,7 +4803,7 @@ app.whenReady().then(async () => {
       }))
       /* 未分组排最后，其余按最近动过的排 —— 你要找的通常是刚用过的那个 */
       .sort((a, b) => (a.project ? 0 : 1) - (b.project ? 0 : 1) || b.updatedAt - a.updatedAt);
-    return { projects, excludeProjects: cfg.excludeProjects || [] };
+    return { projects, excludeProjects: cfg.excludeProjects || [], excludeSessions: cfg.excludeSessions || [] };
   });
 
   ipcMain.handle('s3:list-backups', async () => {
@@ -4879,10 +5020,79 @@ app.whenReady().then(async () => {
       }
       /* 合并之后重建 history.md —— 它是渲染产物，不是数据 */
       if (merged) refreshHistoryFile(sessionId);
+
+      const recordPath = path.join(localDir, 'record.json');
+      let recAfter: any;
+      try { recAfter = JSON.parse(fs.readFileSync(recordPath, 'utf-8')); } catch { recAfter = undefined; }
+
+      /*
+        **记忆跟着会话回来** ——「你看看是不是连 memory 一起被备份了」。备份时 `memory/**` 整个传了，
+        恢复却只拉了 `sessions/<id>/`，于是恢复回来的会话"忘了你教过它的事"。
+          · 这条会话自己的记忆：直接恢复（只属于它）。
+          · 它所在项目的记忆：本地**没有**才拉 —— 本地有的那份多半更新，不盖。
+      */
+      /*
+        后来定成 ——「恢复也增加这些，就默认自带不必在界面上有单独入口」：
+          · 会话记忆、项目记忆、全局记忆都跟着回来，**一律合并**（`mergeMemoryText`：本地原样保留，
+            备份里多出来的行补在后面）。以前会话那份是直接覆盖的 —— 本机后来教它的会被一份旧备份盖掉；
+            项目那份本地有就不拉 —— 备份里多的那几条就回不来。
+          · `.bak` 之类的别的文件：本地没有才写。
+          · 动之前把本地那几份记忆也挪进同一个 trash 目录。
+      */
+      let memoryFiles = 0;
+      const project = typeof recAfter?.profile?.projectId === 'string' ? recAfter.profile.projectId : '';
+      const memTrash = path.join(backedUp || trashDirFor(KIROLEX_HOME, sessionId), '__memory');
+      const memPrefixes = [
+        `${keyFor(cfg.prefix, path.join('memory', 'sessions', sessionId))}/`,
+        ...(project && !/[\\/]|\.\./.test(project) ? [`${keyFor(cfg.prefix, path.join('memory', 'projects', project))}/`] : []),
+        keyFor(cfg.prefix, path.join('memory', 'global.md')),
+      ];
+      for (const pfx of memPrefixes) {
+        for (const obj of await listObjects(creds!, pfx)) {
+          const rel = relFor(cfg.prefix, obj.key);
+          if (!rel) continue;
+          if (pfx.endsWith('.md') && obj.key !== pfx) continue;   // global.md 那个前缀别带出 global.md.xxx
+          const abs = path.join(KIROLEX_HOME, rel);
+          const body = await getObject(creds!, obj.key);
+          const local = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : null;
+          let next: string | Buffer | null;
+          if (local === null) next = body;
+          else if (rel.endsWith('.md')) {
+            const m = mergeMemoryText(local, body.toString('utf-8'));
+            next = m === local ? null : m;
+          } else next = null;                                     // 本地已有的 .bak 等不动
+          if (next === null) continue;
+          if (local !== null) {
+            const dest = path.join(memTrash, rel);
+            fs.mkdirSync(path.dirname(dest), { recursive: true });
+            fs.copyFileSync(abs, dest);
+          }
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          fs.writeFileSync(abs, next);
+          memoryFiles += 1;
+        }
+      }
+
+      /*
+        **恢复回来默认在本机跑** ——「恢复的会话应该默认在本地，不应该弄到一个本机可能不知道的远程 host 上」。
+        记录里那份 `profile.remote` 是**备份它的那台机器**的配置（主机、密钥路径都是那边的），在这台
+        机器上多半连不上。要跑远端的话右键「运行位置」选一台这台机器认识的。合并那条路本地记录说了算，不动。
+      */
+      let madeLocal = false;
+      if (!existed && recAfter?.profile?.remote) {
+        delete recAfter.profile.remote;
+        fs.writeFileSync(recordPath, JSON.stringify(recAfter, null, 2));
+        madeLocal = true;
+      }
+      /* 以前在这台机器上删过它的话，墓碑会让它在水化时继续隐身 —— 恢复就是要它回来 */
+      clearSessionTombstone(sessionId);
+      deletedSessionIds.delete(sessionId);
+
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
+        + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}`
         + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
-      return { ok: true, restored, backedUp, merged };
+      return { ok: true, restored, backedUp, merged, memoryFiles, madeLocal, projectId: project || undefined };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
@@ -4938,7 +5148,10 @@ app.whenReady().then(async () => {
      * 重启后 attach 从记录里读回同一台机器。
      */
     remoteId?: string,
+    /** 哪个引擎跑这条会话（`engines.ts`）；不传 = kiro，和所有老调用点一样。 */
+    engineArg?: string,
   ) => {
+    const engine = engineOf({ engine: engineArg });
     /*
       **渲染层到底传了没有** ——「新会话就没有远程 tag」查了两轮都没抓到：`kirolex-new-chat-remote`
       明明是 `tokyo`，而 `[model] new-session` 报的机器却是 `local`。两种可能（渲染层没传 / 传了但
@@ -4962,17 +5175,20 @@ app.whenReady().then(async () => {
     if (remoteId && !remote) {
       throw new Error(`找不到远端目标 ${remoteId}（配置里的 remotes 变了？）—— 没有猜一台机器，这条会话没有建。`);
     }
+    /* kiro 的模型 id 对另外两家没有意义：它们用自己 CLI 配的默认模型，记录里写个占位 */
+    const engineModel = engine === 'kiro' ? (model || DEFAULT_MODEL) : 'default';
     const profile: AgentProfile = {
-      model: model || DEFAULT_MODEL,
+      model: engineModel,
       // Set at creation, NOT left undefined. An absent preference used to be
       // back-filled on the next attach from profile.model — which by then may
       // already be an automatic fallback, laundering a model the user never chose
       // into their "preferred" one permanently.
-      preferredModel: model || DEFAULT_MODEL,
+      preferredModel: engineModel,
       permissionMode: permissionMode === 'ask' ? 'ask' : 'auto-approve',
       projectId: projectId ?? derived,
-      kiroAgent: kiroAgent || undefined,
+      kiroAgent: engine === 'kiro' ? (kiroAgent || undefined) : undefined,
       remote,
+      ...(engine !== 'kiro' ? { engine } : {}),
     };
     // Remote sessions run kiro-cli on the remote host, so its working directory
     // must be a REMOTE path, not the local per-session scratch dir.
@@ -4986,9 +5202,8 @@ app.whenReady().then(async () => {
       `resolvedCwd`（真正的项目目录）。本地会话无所谓（两者都在本机、都能写），远程会话就成了
       两个不同的镜像。所以远程这一路显式用项目目录，**本地那一路一个字节都不动**。
     */
-    const cliCwd = profile.remote?.sshHost
-      ? sessionCwd(profile, resolvedCwd)
-      : sessionCwd(profile, sessionDir);
+    /* 本地：项目目录，没项目就是本机工作目录（`localCwdFor`）—— 和重连那条路给同一个目录 */
+    if (!profile.remote?.sshHost) resolvedCwd = localCwdFor(kiroLexId, resolvedCwd);
     // Model fallback: use the first candidate that actually starts, and persist
     // the effective model so the session isn't stuck pointing at a dead one.
     /*
@@ -5009,16 +5224,37 @@ app.whenReady().then(async () => {
       }
       /* 没有任何东西会被推到远端了，所以「这个目录能不能当镜像根」那道闸不存在了 */
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
-      const remoteModels = await remotePreflight(profile.remote);
-      profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
+      if (engineOf(profile) !== 'kiro') {
+        await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+      } else {
+        const remoteModels = await remotePreflight(profile.remote);
+        profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
+      }
     }
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
       : undefined;
+    /*
+      **远端 cwd 要在 `resolvedCwd` 定下来之后再算** —— 实测：它原来算在上面那段"没有项目目录 → 用会话目录"
+      **之前**，于是 session/new 拿到的是按家目录算的 `scratch/C__Users_…-<hash>`，而 `ensureLocalTools`
+      建出来的是按会话目录算的那个。kiro-cli 不在乎 cwd 在不在，Claude Code 的适配器在 validate-cwd 就拒了 ——
+      表现是新建的远程 Claude Code 会话一直"连接中"。
+    */
+    const cliCwd = profile.remote?.sshHost
+      ? sessionCwd(profile, resolvedCwd)
+      : resolvedCwd;
     const started = await connectWithModelFallback(profile, 'new-session', startLocalTools, kiroLexId);
     const client = started.client;
     profile.model = started.model;
-    const { sessionId: cliSessionId } = await client.newSession(cliCwd);
+    let cliSessionId: string;
+    try {
+      cliSessionId = (await client.newSession(cliCwd)).sessionId;
+    } catch (err) {
+      /* 起来了的执行器要收掉 —— 不收的话它在那台机器上一直空跑着 */
+      try { await client.disconnect(); } catch { /* 已经没了 */ }
+      logger.warn('session', `new-session 失败 sessionId=${kiroLexId} engine=${ENGINE_LABEL[engine]} cwd=${cliCwd}`, err);
+      throw err;
+    }
     const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, localDir: resolvedCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now() };
     sessionClients.set(kiroLexId, entry);
     /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
@@ -6890,9 +7126,9 @@ app.whenReady().then(async () => {
   const kiroConfigWhere = (t?: RemoteTarget): string =>
     (t ? (labelForHost(KIROLEX_CONFIG_PATH, t.sshHost) || t.sshHost) : '本机');
 
-  ipcMain.handle('kiro:config-categories', () =>
-    /* RegExp 过不了 IPC，渲染层也用不到它 */
-    KIRO_CONFIG_CATEGORIES.map(({ match: _m, ...rest }) => rest));
+  ipcMain.handle('kiro:config-categories', (_event, engine?: string) =>
+    /* RegExp 过不了 IPC，渲染层也用不到它。按会话的引擎给 tab（不传 = kiro，和原来一样） */
+    kiroCategoriesFor(engineOf({ engine })).map(({ match: _m, ...rest }) => rest));
 
   ipcMain.handle('kiro:config-list', async (_event, sessionId: string | undefined, category: string) => {
     const spec = categorySpec(category);
@@ -6904,7 +7140,7 @@ app.whenReady().then(async () => {
       const lines = String(out || '').split('\n').filter(Boolean);
       const entries = spec.kind === 'single'
         ? lines.slice(0, 1).map((l) => ({ name: spec.file!, size: Number(l.split('\t')[1]) }))
-        : pickEntries(spec, lines);
+        : parseRemoteList(spec, String(out || ''));
       return { ok: true, where: kiroConfigWhere(target), entries };
     } catch (err: any) {
       return { ok: false, where: kiroConfigWhere(target), error: err?.message || String(err) };
@@ -6937,7 +7173,7 @@ app.whenReady().then(async () => {
   ) => {
     const spec = categorySpec(category);
     if (!spec) return { ok: false, error: `不认识的类别 ${category}` };
-    const why = validateContent(spec, String(content ?? ''));
+    const why = validateContent(spec, String(content ?? '')) || pluginWriteError(name);
     if (why) return { ok: false, error: why };
     const target = kiroConfigTargetFor(sessionId);
     try {
@@ -7072,12 +7308,6 @@ app.whenReady().then(async () => {
     sessionId: string,
     target: RemoteTarget | undefined,
     localDir?: string,
-    /**
-     * **其余目录** ——「会话目录应该可以设置多个」。`undefined` = 不改（换机器那条路不该顺手
-     * 把目录清单清空）；`[]` = 明确只留主目录。这两件事必须分得开，否则"换个远端"会静默
-     * 丢掉用户选的另外几个目录，而界面上要过一会儿才看出来。
-     */
-    extraDirs?: string[],
   ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
     const oldEntry = sessionClients.get(sessionId);
     /*
@@ -7095,15 +7325,12 @@ app.whenReady().then(async () => {
     const currentRemote = oldEntry?.profile.remote?.sshHost || rec0?.profile?.remote?.sshHost || '';
     const wasRemote = !!currentRemote;
     /*
-      目标没变**而且目录也没变**才算没变化 —— 只改工作目录（「📂 工作目录…」）走的是同一个入口，
-      短路写成只看目标的话那条路会被当成 no-op 直接返回（实测差点这么发出去）。
+      目标没变**而且目录也没变**才算没变化 —— 切机器时可以顺带给一个新的本地目录，
+      短路写成只看目标的话那次改动会被当成 no-op 吞掉。
     */
     const dirChanged = !!localDir
       && localDir !== (store.readRecord(sessionId)?.localDir || oldEntry?.localDir || '');
-    /* 清单变了也算变化：只加/删一个附加目录时主目录没动，短路写成只看主目录会把这次改动吞掉 */
-    const listChanged = !!extraDirs
-      && extraDirs.join('\u0000') !== (rec0?.localDirs || oldEntry?.localDirs || []).join('\u0000');
-    if ((target?.sshHost || '') === currentRemote && !dirChanged && !listChanged) return { ok: true, unchanged: true };
+    if ((target?.sshHost || '') === currentRemote && !dirChanged) return { ok: true, unchanged: true };
 
     /*
       **切回本地不再需要"先把远端的改动拉回来"** —— 镜像没了（见 `localMcp.ts`）：远端从来没有
@@ -7124,10 +7351,6 @@ app.whenReady().then(async () => {
       sessionId,
       localDir || rec0?.localDir || oldEntry?.localDir,
     );
-    /* 主目录不重复出现在清单里（`localDirsOf` 会把它排第一） */
-    const nextExtraDirs = (extraDirs ?? rec0?.localDirs ?? oldEntry?.localDirs ?? [])
-      .map((d) => String(d || '').replace(/\/+$/, ''))
-      .filter((d, i, a) => d && d !== nextLocalDir && a.indexOf(d) === i);
     /* 家目录那道闸随镜像一起去掉了：没有东西会被推走 */
 
     const hostLabelOf = (t?: RemoteTarget): string | null =>
@@ -7141,13 +7364,12 @@ app.whenReady().then(async () => {
       const rec = rec0!;
       rec.profile = { ...rec.profile, remote: target ? { ...target } : undefined } as AgentProfile;
       rec.localDir = nextLocalDir;
-      rec.localDirs = nextExtraDirs;
       store.writeRecord(rec);
       const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
       sessionNotice(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
         + `它现在没有连着，所以没有执行器要换；对话一条都没动。`);
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
-      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir, localDirs: nextExtraDirs });
+      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
       return { ok: true, remoteHost: hostLabelOf(target), cold: true };
     }
 
@@ -7157,13 +7379,17 @@ app.whenReady().then(async () => {
     const profile: AgentProfile = { ...oldEntry.profile, remote: target ? { ...target } : undefined };
     try {
       if (target) {
-        const models = await remotePreflight(profile.remote!);
-        profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
+        if (engineOf(profile) !== 'kiro') {
+          await remoteAdapterCheck(profile.remote!, engineOf(profile) as 'claude' | 'codex');
+        } else {
+          const models = await remotePreflight(profile.remote!);
+          profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
+        }
       }
       /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
       const cliCwd = sessionCwd(profile, nextLocalDir);
       const localTools = await ensureLocalTools(sessionId, profile, nextLocalDir);
-      const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
+      const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
       try {
         await client.connect();
         const made = await withLoadTimeout(client.newSession(cliCwd), loadTimeoutFor(profile.remote), 'session/new');
@@ -7174,7 +7400,6 @@ app.whenReady().then(async () => {
           profile,
           cwd: cliCwd,
           localDir: nextLocalDir,
-          localDirs: nextExtraDirs,
           assistantBuf: '',
           assistantMsgId: null,
           fileChanges: [],
@@ -7189,7 +7414,6 @@ app.whenReady().then(async () => {
         rec.profile = profile;
         rec.cliSessionId = made.sessionId;
         rec.localDir = nextLocalDir;
-        rec.localDirs = nextExtraDirs;
         rec.executorState = 'attached';
         store.writeRecord(rec);
         clearContextEstablished(sessionId);
@@ -7201,7 +7425,7 @@ app.whenReady().then(async () => {
           + `后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`
           + (interrupted ? `\n（切换打断了正在跑的那一轮 —— 已产出的内容都在，未完成的那部分没了，需要的话重发一次。）` : ''));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
-        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir, localDirs: nextExtraDirs });
+        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
         return { ok: true, remoteHost: hostLabelOf(target) };
       } catch (err) {
         try { await client.disconnect(); } catch {}
@@ -7224,37 +7448,46 @@ app.whenReady().then(async () => {
     return applySessionTarget(sessionId, target, localDir);
   });
 
+  ipcMain.handle('acp:engine-models', (_event, sessionId: string) => {
+    const entry = sessionClients.get(sessionId);
+    return entry && engineOf(entry.profile) !== 'kiro' ? engineModelsPayload(sessionId, entry) : null;
+  });
+
   /**
-   * **只换工作目录，机器不变** ——「工作目录这个东西放到右侧会话，不要放在右键菜单」。
-   *
-   * 单独一个入口，因为这是一个**独立的问题**：远端（以及本地那条没归项目的会话）只看得见
-   * 被镜像的那一个目录，所以"它读哪棵树"和"它跑在哪台机器上"是两件事。
-   *
-   * 当前的机器从**记录/执行器**里拿（`profile.remote` 存的就是整份目标），不让渲染层参与 ——
-   * 渲染层只有 label，按 label 反查一旦查不到就会退化成"切回本地"。
+   * Claude Code / Codex 换模型 / effort / 权限模式：同一个进程里 `session/set_config_option` 就行，
+   * 不用像 kiro 那样换执行器。选了就记在会话上，下次连上（`applyEngineModel`）设回去。
    */
-  /*
-    **收一个数组**（第一个是主目录）——「会话目录那个功能不对，应该可以设置多个」。
-    仍然接受单个字符串：那是"只换主目录、别动其余的"，`extraDirs` 传 `undefined` 表达
-    「不改清单」—— 和传 `[]`（明确只留主目录）是两件不同的事。
-  */
-  ipcMain.handle('acp:set-workdir', async (_event, sessionId: string, dir: string | string[]) => {
-    const list = (Array.isArray(dir) ? dir : [dir]).map((d) => String(d || '').trim()).filter(Boolean);
-    if (!list.length) throw new Error('至少要给一个目录。');
-    const bad = list.find((d) => !path.isAbsolute(d));
-    if (bad) throw new Error(`工作目录要写绝对路径（\`${bad}\` 不是）。`);
-    const current = sessionClients.get(sessionId)?.profile.remote
-      || store.readRecord(sessionId)?.profile?.remote;
-    return applySessionTarget(
-      sessionId,
-      current?.sshHost ? current : undefined,
-      list[0],
-      Array.isArray(dir) ? list.slice(1) : undefined,
-    );
+  const setEngineOption = async (sessionId: string, category: EngineOptionCategory, value: string) => {
+    const entry = sessionClients.get(sessionId);
+    if (!entry) throw new Error('这条会话现在没有连着，连上之后再换（点一下它或发一条消息就会重连）。');
+    const engine = engineOf(entry.profile);
+    if (engine === 'kiro') throw new Error('kiro 会话不走这条路');
+    if (entry.busy) throw new Error('等这一轮回复完再换。');
+    await entry.client.setSelectOption(entry.cliSessionId, category, value);
+    entry.profile = category === 'model'
+      ? { ...entry.profile, engineModels: { ...entry.profile.engineModels, [engine]: value } }
+      : {
+        ...entry.profile,
+        engineOptions: { ...entry.profile.engineOptions, [engine]: { ...entry.profile.engineOptions?.[engine], [category]: value } },
+      };
+    const rec = store.readRecord(sessionId);
+    if (rec) { rec.profile = entry.profile; store.writeRecord(rec); }
+    const payload = engineModelsPayload(sessionId, entry);
+    mainWindow?.webContents.send('session:engine-models', payload);
+    return payload;
+  };
+  ipcMain.handle('acp:set-engine-model', (_event, sessionId: string, model: string) => setEngineOption(sessionId, 'model', model));
+  ipcMain.handle('acp:set-engine-option', (_event, sessionId: string, category: string, value: string) => {
+    if (category !== 'thought_level' && category !== 'mode') throw new Error(`不认识的选项 ${category}`);
+    return setEngineOption(sessionId, category, value);
   });
 
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
     const oldEntry = sessionClients.get(sessionId);
+    /* 模型下拉是 kiro 的清单；Claude Code / Codex 用它们自己 CLI 配的模型（界面上也不显示这个下拉） */
+    if (oldEntry && engineOf(oldEntry.profile) !== 'kiro') {
+      throw new Error(`${ENGINE_LABEL[engineOf(oldEntry.profile)]} 会话的模型在它自己的 CLI 里配，这里还不能切。`);
+    }
     /*
       **说清怎么走出去** —— 实测用户连着撞了三次：换模型失败之后这条会话是 detached 的
       （回滚那支会把盘上的状态写成实话），于是再点模型下拉就只有一句 `Session not connected`,
@@ -7293,7 +7526,7 @@ app.whenReady().then(async () => {
     const restoreOldExecutor = async () => {
       const previous = new AcpClient(
         oldEntry.profile.model, shellEnv, oldEntry.profile.kiroAgent,
-        oldEntry.profile.permissionMode, oldEntry.profile.remote,
+        oldEntry.profile.permissionMode, oldEntry.profile.remote, undefined, engineOf(oldEntry.profile),
       );
       try {
         await previous.connect();
@@ -7330,7 +7563,7 @@ app.whenReady().then(async () => {
 
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
-    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
+    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
       await withLoadTimeout(client.loadSession(cliSessionId, cwd), loadTimeoutFor(profile.remote));
@@ -7402,6 +7635,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('acp:switch-kiro-agent', async (_event, sessionId: string, agentName: string) => {
     const oldEntry = sessionClients.get(sessionId);
     if (!oldEntry) throw new Error('Session not connected');
+    if (engineOf(oldEntry.profile) !== 'kiro') throw new Error('kiro agent 只对 Kiro 会话有用。');
     if (oldEntry.busy) throw new Error('Wait for the current response to finish before switching agents.');
     if (reconfiguringSessions.has(sessionId)) throw new Error('Another model, Agent, or permission change is still in progress.');
 
@@ -7416,7 +7650,7 @@ app.whenReady().then(async () => {
     const profile: AgentProfile = { ...oldEntry.profile, kiroAgent: normalizedAgent };
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
-    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools);
+    const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
       const created = await client.newSession(oldEntry.cwd);
@@ -7458,6 +7692,234 @@ app.whenReady().then(async () => {
       reconfiguringSessions.delete(sessionId);
       emitSessionBusy(sessionId);
     }
+  });
+
+  /**
+   * **给已有的会话换引擎** ——「我还需要现有会话也能切换 agent 运行类型」。
+   *
+   * 和换机器 / 换 kiro agent 同一套机械：先起新的、再断旧的，后端会话是新的，上下文从 KiroLex
+   * 自己的记录重建（随下一条消息带过去）。对话一条都不动。没连着的会话只改记录 —— 下次打开时
+   * 按新引擎起（和「运行位置」那条路一样，「没连上也应该能切」）。
+   */
+  ipcMain.handle('acp:switch-engine', async (_event, sessionId: string, engineArg: string) => {
+    const engine = engineOf({ engine: engineArg });
+    const label = ENGINE_LABEL[engine];
+    const oldEntry = sessionClients.get(sessionId);
+    const rec0 = store.readRecord(sessionId);
+    const before = engineOf(oldEntry?.profile || rec0?.profile);
+    if (before === engine) return { ok: true, unchanged: true, engine };
+    /* kiro 的模型 id / agent 对另外两家没意义；切回 kiro 时用你选过的偏好模型 */
+    const reshape = (p: AgentProfile): AgentProfile => {
+      const next: AgentProfile = { ...p };
+      if (engine === 'kiro') {
+        delete (next as any).engine;
+        const pref = p.preferredModel && p.preferredModel !== 'default' ? p.preferredModel : DEFAULT_MODEL;
+        next.model = pref;
+        next.preferredModel = pref;
+        next.modelEarnedOn = undefined;
+      } else {
+        (next as any).engine = engine;
+        next.model = 'default';
+        next.kiroAgent = undefined;
+      }
+      return next;
+    };
+
+    if (!oldEntry) {
+      if (!rec0) throw new Error('找不到这条会话的记录。');
+      rec0.profile = reshape(rec0.profile);
+      store.writeRecord(rec0);
+      sessionNotice(sessionId, `🤖 这条会话下次打开会由 **${label}** 来跑。它现在没有连着，所以没有执行器要换；对话一条都没动。`);
+      mainWindow?.webContents.send('session:engine-changed', { sessionId, engine });
+      logger.info('engine', `切换引擎（未连接）sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`);
+      return { ok: true, engine, cold: true };
+    }
+    if (oldEntry.busy) throw new Error('这一轮还在跑 —— 等它结束再换引擎。');
+    if (reconfiguringSessions.has(sessionId)) throw new Error('另一个切换（模型 / agent / 机器）还没做完。');
+
+    await awaitAttachIdle(sessionId);
+    reconfiguringSessions.add(sessionId);
+    emitSessionBusy(sessionId);
+    const profile = reshape(oldEntry.profile);
+    let client: AcpClient | undefined;
+    try {
+      if (profile.remote?.sshHost) {
+        if (engine !== 'kiro') await remoteAdapterCheck(profile.remote, engine);
+        else {
+          const models = await remotePreflight(profile.remote);
+          profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote.sshHost || '');
+        }
+      }
+      const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
+      const started = await connectWithModelFallback(profile, 'switch-engine', localTools, sessionId);
+      client = started.client;
+      profile.model = started.model;
+      const created = await client.newSession(oldEntry.cwd);
+      const nextEntry: SessionEntry = {
+        ...oldEntry,
+        client,
+        cliSessionId: created.sessionId,
+        profile,
+        assistantBuf: '',
+        assistantMsgId: null,
+        fileChanges: [],
+        lastUsedAt: Date.now(),
+        busy: false,
+      };
+      try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
+      sessionClients.set(sessionId, nextEntry);
+      wireSession(sessionId, nextEntry);
+
+      const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
+      rec.profile = profile;
+      rec.cliSessionId = created.sessionId;
+      rec.executorState = 'attached';
+      store.writeRecord(rec);
+      clearContextEstablished(sessionId);
+      markContextOwedIfUnverified(sessionId, 'switch-engine');
+      restoreContextAfterExecutorSwap(sessionId, 'switch-engine');
+      sessionNotice(sessionId, `🤖 这条会话从现在开始由 **${label}** 来跑。后端会话是新的，上下文会随下一条消息带过去；之前的对话一条都没动。`);
+      mainWindow?.webContents.send('session:engine-changed', { sessionId, engine });
+      logger.info('engine', `切换引擎 sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`);
+      return { ok: true, engine };
+    } catch (err) {
+      if (client) { try { await client.disconnect(); } catch {} }
+      logger.warn('engine', `切换引擎失败 sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`, err);
+      throw err;
+    } finally {
+      reconfiguringSessions.delete(sessionId);
+      emitSessionBusy(sessionId);
+    }
+  });
+
+  /**
+   * **🔑 登录** —— Claude Code / Codex 在**远端机器上**的登录（「不要在当前电脑登录，要在远程机器上打开登录」）。
+   * 只对远端：本机的登录是你自己在这台电脑上配好的，这一页不碰它。三种方式见 `aiLogin.ts`。
+   */
+  const aiLoginTarget = (machine: string): RemoteTarget => {
+    /*
+      机器人面板里那一页传的是**会话 id**（「放到右侧会话框的左下角那个机器人图案中」）：登录给这条会话跑的那台机器。
+      本机的会话不在这里登录 ——「不要在当前电脑登录」。
+    */
+    if (/^s_/.test(machine)) {
+      const r = kiroConfigTargetFor(machine);
+      if (!r) throw new Error('这条会话在本机跑 —— 本机的 Claude Code / Codex 登录是你自己在这台电脑上配的，这里不碰。要在远端登录，先右键「运行位置」把会话切到那台机器。');
+      return r;
+    }
+    const t = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+    if (!t?.sshHost) throw new Error(`找不到这台机器（${machine}）—— 设置里删掉了？`);
+    return t;
+  };
+  const SEP = 'KX_LOGIN_SEP_7f3a';
+
+  /** 状态：一次 ssh 问齐。只回状态和网关主机名 —— 密钥读到主进程为止，不出去。 */
+  ipcMain.handle('ai-login:status', async (_event, machine: string) => {
+    try {
+      const remote = aiLoginTarget(machine);
+      const out = await runRemoteCapture(remote, [
+        /* 「装没装」和「登没登」分开判：`codex login status` 没登录时退出码非 0，用 `&& … ||` 会被当成"没装" */
+        'if command -v claude >/dev/null 2>&1; then claude auth status --json </dev/null 2>&1; else echo KX_NO_CLAUDE; fi',
+        `echo ${SEP}`,
+        'if command -v codex >/dev/null 2>&1; then codex login status </dev/null 2>&1; else echo KX_NO_CODEX; fi',
+        `echo ${SEP}`,
+        'cat ~/.claude/settings.json 2>/dev/null || true',
+        `echo ${SEP}`,
+        'cat ~/.codex/config.toml 2>/dev/null || true',
+      ].join('; '), 45_000);
+      const [claudeOut, codexOut, settings, toml] = out.split(SEP).map((x) => x.trim());
+      const gw = pickClaudeEnv(settings || '').ANTHROPIC_BASE_URL;
+      return {
+        ok: true,
+        claude: parseClaudeStatus(claudeOut || '', gw),
+        codex: parseCodexStatus(codexOut || '', codexGateway(toml || '')),
+      };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /**
+   * **「拷入本机配置」**：把这台电脑上那份变成编辑器里的文本（`aiLogin.ts` 的 claudeEditorText / codexEditorText）。
+   * 只读本机文件、不写任何地方；你在编辑器里看一眼、改一改，点「写到那台机器上」才会动远端。
+   */
+  ipcMain.handle('ai-login:local-config', (_event, tool: 'claude' | 'codex') => {
+    const read = (...rel: string[]): string => { try { return fs.readFileSync(path.join(os.homedir(), ...rel), 'utf-8'); } catch { return ''; } };
+    return tool === 'claude'
+      ? { ok: true, text: claudeEditorText(read('.claude', 'settings.json')) }
+      : { ok: true, text: codexEditorText(read('.codex', 'config.toml')) };
+  });
+
+  /**
+   * **把编辑器里的配置写到那台机器上** ——「手动填写」就是那个编辑器。
+   * Claude Code：JSON（env 的键值）→ 合并进那台机器的 ~/.claude/settings.json 的 `env`；
+   * Codex：TOML 片段（顶层 model / model_provider + 一个 [model_providers.<id>] 段）→ 合并进 ~/.codex/config.toml。
+   * 写之前把原文件备份成 `.kirolex-bak`；只改这几项，其余逐字保留（见 aiLogin.ts）。
+   */
+  ipcMain.handle('ai-login:apply', async (_event, machine: string, input: { tool: 'claude' | 'codex'; text: string }) => {
+    try {
+      const remote = aiLoginTarget(machine);
+      const writeTo = async (file: string, content: string): Promise<void> => {
+        const dir = file.slice(0, file.lastIndexOf('/'));
+        await writeRemoteFile(remote,
+          `mkdir -p ${dir} && { [ -f ${file} ] && cp -p ${file} ${file}.kirolex-bak || true; } && cat > ${file} && chmod 600 ${file}`,
+          content);
+      };
+      if (input.tool === 'claude') {
+        const env = parseClaudeEditor(String(input.text || ''));
+        const existing = await runRemoteCapture(remote, 'cat ~/.claude/settings.json 2>/dev/null || true', 30_000);
+        await writeTo('~/.claude/settings.json', mergeClaudeSettings(existing, env));
+        logger.info('ai-login', `Claude Code 配置写到 ${remote.sshHost}（${Object.keys(env).join('/')}）`);
+      } else {
+        const provider = parseCodexEditor(String(input.text || ''));
+        const existing = await runRemoteCapture(remote, 'cat ~/.codex/config.toml 2>/dev/null || true', 30_000);
+        await writeTo('~/.codex/config.toml', applyCodexProvider(existing, provider));
+        logger.info('ai-login', `Codex 配置写到 ${remote.sshHost}（provider=${provider.id}）`);
+      }
+      return { ok: true };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /**
+   * **官方账号登录**：在那台机器上跑 `claude auth login` / `codex login --device-auth`，输出原样推给界面
+   * （里面有授权网址和验证码），界面上那颗「在浏览器打开」用这台电脑的浏览器打开它（「那还是就在当前设备打开浏览器吧」），
+   * Claude 那条还要把浏览器给的 code 贴回去（`ai-login:input`）。命令本身跑在**远端**：登录落在那台机器上。
+   */
+  const loginRuns = new Map<string, ChildProcess>();
+  ipcMain.handle('ai-login:run', async (_event, machine: string, tool: 'claude' | 'codex', opts?: { console?: boolean }) => {
+    try {
+      const remote = aiLoginTarget(machine);
+      const cmd = tool === 'claude' ? `claude auth login${opts?.console ? ' --console' : ''}` : 'codex login --device-auth';
+      const runId = `login_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      const child = spawn('ssh', buildSshArgs(remote, `bash -lc ${shellQuote(cmd)}`), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
+      loginRuns.set(runId, child);
+      /* ANSI 颜色/光标码去掉 —— 界面上是一段纯文本 */
+      const clean = (b: Buffer): string => b.toString('utf-8').replace(/\x1b\[[0-9;?]*[A-Za-z]/g, '');
+      const push = (chunk: string): void => { mainWindow?.webContents.send('ai-login:output', { runId, chunk }); };
+      child.stdout?.on('data', (b: Buffer) => push(clean(b)));
+      child.stderr?.on('data', (b: Buffer) => push(clean(b)));
+      child.on('exit', (code) => {
+        loginRuns.delete(runId);
+        mainWindow?.webContents.send('ai-login:exit', { runId, code });
+        logger.info('ai-login', `${tool} 官方登录（${remote.sshHost}）结束 code=${code}`);
+      });
+      logger.info('ai-login', `${tool} 官方登录开始（${remote.sshHost}）：${cmd}`);
+      return { ok: true, runId };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+  ipcMain.handle('ai-login:input', (_event, runId: string, line: string) => {
+    const child = loginRuns.get(runId);
+    if (!child?.stdin) return { ok: false, error: '这次登录已经结束了。' };
+    child.stdin.write(`${String(line).trim()}\n`);
+    return { ok: true };
+  });
+  ipcMain.handle('ai-login:cancel', (_event, runId: string) => {
+    const child = loginRuns.get(runId);
+    if (child) { try { child.kill(); } catch { /* 已经走了 */ } }
+    return { ok: true };
   });
 
   ipcMain.handle('app:get-home-dir', () => {
@@ -8061,7 +8523,13 @@ app.whenReady().then(async () => {
         // Persisted remote target survives restarts; a remote session re-attaches
         // over SSH exactly as it was created.
         remote: existing?.profile.remote,
+        /* 引擎也归记录所有 —— 这里是白名单，漏了它的话 Claude/Codex 会话一重启就变回 kiro */
+        ...(existing?.profile.engine ? { engine: existing.profile.engine } : {}),
+        /* 同一张白名单：漏了的话手选的模型 / effort / 模式一重连就丢（实测：选了 sonnet，重启后回到 opus） */
+        ...(existing?.profile.engineModels ? { engineModels: existing.profile.engineModels } : {}),
+        ...(existing?.profile.engineOptions ? { engineOptions: existing.profile.engineOptions } : {}),
       };
+      if (!profile.remote?.sshHost) resolvedCwd = localCwdFor(sessionId, resolvedCwd);
       // For a remote session the executor's working directory is a REMOTE path,
       // not the local `cwd` the renderer passed in.
       const cliCwd = sessionCwd(profile, resolvedCwd);
@@ -8085,8 +8553,12 @@ app.whenReady().then(async () => {
           所以"这个目录能不能当镜像根"这个问题不存在了。它原来还有一条**退回本地**的分支
           （那是为了不让一条已存在的远程会话变成死结），现在也不需要了。
         */
-        const remoteModels = await remotePreflight(profile.remote);
-        profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
+        if (engineOf(profile) !== 'kiro') {
+          await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+        } else {
+          const remoteModels = await remotePreflight(profile.remote);
+          profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
+        }
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId);
@@ -8117,10 +8589,21 @@ app.whenReady().then(async () => {
           ),
         ]);
       };
-      try {
+      /*
+        **没聊过的 Claude Code / Codex 会话不去 resume** —— 实测 claude-agent-acp 只在第一条消息之后才把会话
+        写盘，于是一条只建了没用过的会话每次连上都是 `Resource not found`，日志里一次"resume 失败 + 重试 +
+        放弃"。那里本来就什么都没有：直接起一条新的，也不欠重建。
+      */
+      const skipResume = engineOf(profile) !== 'kiro' && historyBytes === 0;
+      if (skipResume) {
+        cliSessionId = (await client.newSession(cliCwd)).sessionId;
+        logger.info('attach', `${ENGINE_LABEL[engineOf(profile)]} 会话还没聊过，不 resume，直接新起 sessionId=${sessionId} cli=${cliSessionId}`);
+      } else try {
         try {
           await tryResume();
         } catch (first: any) {
+          /* `Resource not found` 是确定的答案（那边就是没有这条），重试一次只是再等一遍 */
+          if (/Resource not found/i.test(String(first?.message || ''))) throw first;
           logger.info('attach', `resume attempt 1 failed sessionId=${sessionId} cli=${cliSessionId} bytes=${historyBytes} budget=${RESUME_TIMEOUT_MS}ms err=${first?.message}`);
           await tryResume();
           logger.info('attach', `resume attempt 2 succeeded sessionId=${sessionId} cli=${cliSessionId}`);
@@ -8686,6 +9169,8 @@ app.whenReady().then(async () => {
        * 一个配了 agent 的 flow **每一步都另起一条会话** —— 复用被静默禁掉，而没有任何报错。
        */
       ...(rec.profile?.kiroAgent ? { kiroAgent: rec.profile.kiroAgent } : null),
+      /* 哪个引擎（Claude Code / Codex）—— 侧栏 tag 和"藏掉 kiro 的模型/agent 下拉"都靠它 */
+      ...(rec.profile?.engine ? { engine: rec.profile.engine } : null),
       /**
        * **这条会话跑在哪台机器上** —— 远程会话（`docs/DESIGN_remote_sessions.md`）。
        *
@@ -8703,8 +9188,6 @@ app.whenReady().then(async () => {
        * 恰恰是远程会话最容易搞错的一件事（远端只看得见被镜像的那一个目录）。
        */
       ...(rec.localDir ? { localDir: rec.localDir } : null),
-      /* 附加目录也要过来：会话界面下面那排 📂 显示的就是它（不列进来会被白名单丢掉） */
-      ...(rec.localDirs?.length ? { localDirs: rec.localDirs } : null),
     }));
   });
 
@@ -8778,9 +9261,14 @@ app.whenReady().then(async () => {
    * flag 关着就返回空列表 —— 界面据此**完全不显示**目标选择，而不是显示一个选了会报错的选项。
    */
   ipcMain.handle('app:remote-targets', () => {
-    if (!isFeatureEnabled('remoteSessions')) return { enabled: false, targets: [] };
+    /*
+      **开关关着也要把已配的机器发出去** —— 原来这里直接回空列表，而「存」照样能存：于是设置页
+      永远看不到你刚加的那台，每次回来都是一张空表，再加一次 —— 实测 config.json 里攒了
+      aws-tokyo、aws-tokyo-2、-3、-4 四条同一个 IP。`enabled` 照旧带着，"能不能新建远程会话"
+      由调用方看它（useRemoteTargets 关着时自己当空列表）。
+    */
     return {
-      enabled: true,
+      enabled: isFeatureEnabled('remoteSessions'),
       /*
         **字段要发全** ——「我为什么选了密钥不生效」。这里原来只发 id/label/sshHost/remoteWorkdir，
         漏了 `identityFile` 和 `sshPort`：于是设置界面永远显示"没有选私钥"（明明配置里有），
@@ -8797,9 +9285,15 @@ app.whenReady().then(async () => {
         remoteWorkdir: t.remoteWorkdir,
         /* 三个 CLI 的启动命令 —— 漏发一个字段 = 自动保存把它抹掉（见上面那段） */
         bins: t.bins,
+        /* 设置页靠它决定默认显示哪一台（最近编辑的） */
+        editedAt: t.editedAt,
+        /* 密码只说"有没有"，密文和明文都不出主进程 */
+        hasPassword: !!t.passwordCipher,
       })),
       /** 本机那份（和远端同样三个字段）——「不管是本地还是远程必须要配置」。 */
       localBins: localBins(KIROLEX_CONFIG_PATH),
+      /** 本机工作目录（没展开的写法，默认 `~/kirolex`）—— 没归项目的本地会话在这里干活。 */
+      localWorkdir: localWorkdirSetting(KIROLEX_CONFIG_PATH),
     };
   });
 
@@ -8867,6 +9361,17 @@ app.whenReady().then(async () => {
    * 存完**立刻生效**（`setLocalKiroBin`）：不设的话要重启才算数，而"改了配置没反应"
    * 会让人以为配置项是假的。已经起着的执行器不动 —— 它绑在那个进程上，下次起才换。
    */
+  /** 本机工作目录。新会话立刻用它；已经连着的会话下次重连才换（换目录 = 换执行器，不在这里偷偷做）。 */
+  ipcMain.handle('local:save-workdir', (_event, dir: string) => {
+    try {
+      const saved = saveLocalWorkdir(KIROLEX_CONFIG_PATH, dir);
+      logger.info('app', `本机工作目录：${saved}`);
+      return { ok: true, dir: saved };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || '保存失败' };
+    }
+  });
+
   ipcMain.handle('local:save-bins', (_event, bins: ExecutorBins) => {
     try {
       const saved = saveLocalBins(KIROLEX_CONFIG_PATH, bins || {});
@@ -8887,9 +9392,11 @@ app.whenReady().then(async () => {
   */
   ipcMain.handle('remote:save', (_event, input: RemoteTargetInput) => {
     try {
-      const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, input);
-      logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})`);
-      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins } };
+      /* 明文密码不往下传：saveRemoteTarget 只见密文 */
+      const { password: _pw, clearPassword: _clr, ...rest } = input as any;
+      const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, { ...rest, ...passwordFields(input) });
+      logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})${saved.passwordCipher ? '，带密码' : ''}`);
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher } };
     } catch (err: any) {
       return { ok: false, error: err?.message || '保存失败' };
     }
@@ -8927,6 +9434,7 @@ app.whenReady().then(async () => {
       sshPort: Number(input.sshPort) > 0 ? Number(input.sshPort) : 22,
       identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
       proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
+      passwordCipher: passwordCipherForUse(input),
     } as RemoteTarget;
     /* 脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里 */
     const candidates = [
@@ -8983,7 +9491,7 @@ app.whenReady().then(async () => {
     );
     logger.info('remote', `bootstrap 开始 ${target.sshHost}${input.force ? '（强制重装）' : ''}`);
     return await new Promise<{ ok: boolean; code: number | null; error?: string }>((resolve) => {
-      const child = spawn('ssh', args, { stdio: ['pipe', 'pipe', 'pipe'] });
+      const child = spawn('ssh', args, { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(target) });
       let tail = '';
       const onData = (b: Buffer) => {
         const t = b.toString('utf-8');
@@ -9156,11 +9664,12 @@ app.whenReady().then(async () => {
       identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
       proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
       remoteWorkdir: input.remoteWorkdir || undefined,
+      passwordCipher: passwordCipherForUse(input),
     } as RemoteTarget;
     /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */
     const args = buildSshArgs(target, `bash -lc ${shellQuote(preflightScript(undefined, { models: false }))}`);
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
+      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
         stdout: String(stdout || ''),
         stderr: String(stderr || ''),
@@ -9388,6 +9897,26 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
     // Backstop: if quit stalls (a busy turn, a hung child), leave anyway.
     setTimeout(() => process.exit(0), 5000);
   });
+}
+
+/** The same graceful quit, asked for by FILE -- because Windows has no signals.
+ *
+ *  There `kill('SIGTERM')` is an immediate TerminateProcess: the handler above never
+ *  runs, the kiro-cli children are orphaned with their session locks held, and after
+ *  the supervisor's relaunch every local chat fails `session/load` with "Session is
+ *  active in another process". So under `--dev` on win32 the supervisor (scripts/
+ *  dev-hot.mjs) drops this file instead and main quits itself. Polled rather than
+ *  fs.watch'ed: watch on Windows drops events for files created right after start. */
+const DEV_QUIT_REQUEST = path.join(os.homedir(), '.kirolex', 'dev-quit-request');
+if (IS_DEV && process.platform === 'win32') {
+  try { fs.rmSync(DEV_QUIT_REQUEST, { force: true }); } catch { /* 没有就算了 */ }
+  setInterval(() => {
+    if (!fs.existsSync(DEV_QUIT_REQUEST)) return;
+    try { fs.rmSync(DEV_QUIT_REQUEST, { force: true }); } catch { /* 下面照样退 */ }
+    logger.info('app', 'dev quit request received -> graceful quit (releasing kiro-cli sessions)');
+    try { app.quit(); } catch { process.exit(0); }
+    setTimeout(() => process.exit(0), 5000);
+  }, 500).unref();
 }
 
 app.on('window-all-closed', () => {

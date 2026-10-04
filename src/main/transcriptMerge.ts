@@ -102,7 +102,7 @@ export function mergeTranscripts(localText: string, remoteText: string): MergeRe
  * 但两件事例外：
  *
  * · `createdAt` 取**更早**的那个 —— 这条会话是什么时候开始的，不随谁后改一次而变；
- * · 数组型的（`localDirs`、`tags` 之类）取**并集** —— 两台机器各加过一个目录时，
+ * · 数组型的（`tags` 之类）取**并集** —— 两台机器各加过一个标签时，
  *   按"新的赢"会把另一台那个丢掉，而那是用户明确加过的东西。
  *
  * `cliSessionId` / `executorState` 一律**保留本地的**：它们指向的是**这台机器上**那个后端会话,
@@ -120,7 +120,7 @@ export function mergeRecords(local: any, remote: any): any {
   const createdB = Number(remote.createdAt) || 0;
   if (createdA && createdB) out.createdAt = Math.min(createdA, createdB);
 
-  for (const key of ['localDirs', 'tags']) {
+  for (const key of ['tags']) {
     const a = Array.isArray(local[key]) ? local[key] : [];
     const b = Array.isArray(remote[key]) ? remote[key] : [];
     const union = [...a, ...b].filter((v, i, arr) => arr.indexOf(v) === i);
