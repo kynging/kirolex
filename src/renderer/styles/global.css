@@ -8303,3 +8303,10 @@ button, input, select, textarea {
 .composer-mode-select option { color: var(--text-primary); background: var(--bg-secondary, #1e1e22); }
 /* 原来显示引擎名的那一格，现在是 effort */
 .composer-effort-select { max-width: 120px; }
+
+/* 备份/恢复页上的项目记忆状态：和会话的三种状态同色，空壳单独标红 */
+.backup-mem { font-size: 11.5px; padding: 1px 7px; border-radius: 4px; white-space: nowrap; border: 1px solid var(--border); color: var(--text-secondary); }
+.backup-mem.synced { color: var(--success); border-color: color-mix(in srgb, var(--success) 40%, transparent); }
+.backup-mem.pending { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 40%, transparent); }
+.backup-mem.never { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, transparent); }
+.backup-mem.muted { color: var(--text-muted); }

@@ -21,7 +21,7 @@ import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
-  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
@@ -3579,6 +3579,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     for (const rel of plan.skippedTooBig) {
       logger.warn('s3', `跳过（超过 ${MAX_FILE_BYTES / 1024 / 1024}MB）：${rel}`);
     }
+    let memoryMerged = 0;
+    const touchedProjectMemory = new Map<string, number>();
     for (const rel of plan.upload) {
       const abs = path.join(KIROLEX_HOME, rel);
       let body: Buffer;
@@ -3588,6 +3590,38 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       const key = owner && conflictIds.has(owner)
         ? conflictKeyFor(cfg.prefix, owner, thisMachine, rel)
         : keyFor(cfg.prefix, rel);
+      /*
+        **记忆先合并再传** ——「memory 是否能正常同步到 S3」。
+
+        实测撞过：Windows 那台是全新安装，它的项目记忆几乎是空壳（23–24 字节），一同步就把
+        Mac 上 22 KB 的 Dev 记忆、5 KB 的 Blog 记忆在桶里盖掉了 —— 会话有冲突检测，记忆没有，
+        而上传是"谁最后传谁赢"，不看内容。
+
+        记忆是一行一条的追加式笔记，所以合并就是并集（`mergeMemoryText`，和恢复那边同一个规则：
+        本地原样保留、只补桶里多出来的那些行）。合并结果**先写回本地**再上传 —— 这样本地也拿到了
+        另一台机器写的那些，两边收敛到同一份，而不是互相覆盖。
+      */
+      if (rel.startsWith(`memory${path.sep}`) && rel.endsWith('.md')) {
+        try {
+          const remote = await getObjectIfExists(creds!, key);
+          if (remote) {
+            const localText = body.toString('utf-8');
+            const merged = mergeMemoryText(localText, remote.toString('utf-8'));
+            if (merged !== localText) {
+              const tmp = `${abs}.kirolex-${process.pid}.tmp`;
+              fs.writeFileSync(tmp, merged);
+              fs.renameSync(tmp, abs);
+              body = Buffer.from(merged, 'utf-8');
+              st = fs.statSync(abs);
+              memoryMerged += 1;
+            }
+          }
+        } catch (err: any) {
+          /* 读不到桶里那份就**不传**：盖掉一份读不到的记忆，正是这段要防的事 */
+          logger.warn('s3', `记忆 ${rel} 合并前读桶里那份失败，这一轮先不传它：${err?.message || err}`);
+          continue;
+        }
+      }
       await putObject(creds!, key, body, contentTypeFor(rel));
       state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
       uploaded += 1;
@@ -3599,6 +3633,9 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       */
       const sid = sessionIdOfRel(rel);
       if (sid) touchedSessions.add(sid);
+      /* 项目记忆也记一笔「什么时候真的传上去的」—— 备份/恢复界面的项目行要显示它 */
+      const pm = /^memory[\\/]projects[\\/]([^\\/]+)[\\/]memory\.md$/.exec(rel);
+      if (pm) touchedProjectMemory.set(pm[1], Math.floor(st.mtimeMs));
     }
     /*
       catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西。
@@ -3613,6 +3650,11 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       "最后同步时间"会变成"最后跑过一轮的时间"，而那两句话的区别正是这张表存在的理由。
       `updatedAt` 一起记下来 —— 之后本地再动过就能算出"有改动还没备份"。
     */
+    if (touchedProjectMemory.size) {
+      const now = Date.now();
+      for (const [proj, mtime] of touchedProjectMemory) marks[projectMemoryMarkKey(proj)] = { at: now, updatedAt: mtime };
+      writeSessionMarks(S3_MARKS_PATH, marks);
+    }
     if (touchedSessions.size) {
       const now = Date.now();
       const byId = new Map(sessions.map((r) => [r.id, r]));
@@ -3627,7 +3669,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
       ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
     };
-    logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`);
+    logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`
+      + `${memoryMerged ? `（其中 ${memoryMerged} 份记忆先并进了另一台机器写的内容）` : ''}`);
     mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
     return { ok: true, uploaded, skipped: plan.skippedUnchanged };
   } catch (err: any) {
@@ -4864,12 +4907,39 @@ app.whenReady().then(async () => {
       });
       byProject.set(key, cur);
     }
+    /*
+      **项目记忆的同步状态** ——「project 上面也得显示到底 project memory 是否同步了、最新时间是什么时候」。
+      判据和会话那一套同一个（`sessionSyncState`）：mark 表里有就用它（精确到哪一刻传的），
+      没有但文件状态表里有 = "传过但时间不明"，都没有 = 没传过。本地改动时间取文件 mtime。
+    */
+    const fileState = readState(S3_STATE_PATH);
+    const memoryOf = (project: string) => {
+      if (!project) return undefined;           // 未分组没有项目记忆
+      const rel = path.join('memory', 'projects', project, 'memory.md');
+      let st: fs.Stats | undefined;
+      try { st = fs.statSync(path.join(KIROLEX_HOME, rel)); } catch { /* 还没有记忆文件 */ }
+      if (!st) return { exists: false, bytes: 0, updatedAt: 0, syncedAt: 0, state: 'never' as const };
+      const mark = marks[projectMemoryMarkKey(project)];
+      const mtime = Math.floor(st.mtimeMs);
+      /* 状态表里的 mtime 和现在一样 = 传上去的就是这一版 */
+      const sameAsUploaded = fileState[rel]?.mtimeMs === mtime && fileState[rel]?.size === st.size;
+      return {
+        exists: true,
+        bytes: st.size,
+        updatedAt: mtime,
+        syncedAt: mark?.at || 0,
+        state: mark
+          ? sessionSyncState(mark, mtime)
+          : (sameAsUploaded ? 'synced' as const : (fileState[rel] ? 'pending' as const : 'never' as const)),
+      };
+    };
     const projects = [...byProject.values()]
       .map((v) => ({
         ...v,
         /* 组内也按最近动过排 —— 和恢复那一页一致 */
         sessions: v.sessions.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0)),
         excluded: projectExcluded(cfg, v.project),
+        memory: memoryOf(v.project),
       }))
       /* 未分组排最后，其余按最近动过的排 —— 你要找的通常是刚用过的那个 */
       .sort((a, b) => (a.project ? 0 : 1) - (b.project ? 0 : 1) || b.updatedAt - a.updatedAt);
@@ -4898,7 +4968,21 @@ app.whenReady().then(async () => {
         见 `s3:restore`）。在列表里就说清，比让人勾上、点了恢复、再收到一句拒绝好：
         多选恢复的时候那一条会夹在一堆成功里，很容易被漏掉。
       */
+      /*
+        **桶里每个项目的记忆是什么时候、多大** —— 恢复页的项目组头要显示它（「project memory 是否同步了、
+        最新时间」）。一次 list 拿全，不按项目逐个查。大小一起给：空壳（二十几字节）一眼就能看出来，
+        那正是 Windows 首次同步把真记忆盖掉时桶里的样子。
+      */
+      const memoryByProject: Record<string, { bytes: number; lastModified: string }> = {};
+      try {
+        const mpfx = `${keyFor(cfg.prefix, path.join('memory', 'projects'))}/`;
+        for (const o of await listObjects(creds!, mpfx)) {
+          const m = /^([^/]+)\/memory\.md$/.exec(o.key.slice(mpfx.length));
+          if (m) memoryByProject[m[1]] = { bytes: o.size, lastModified: o.lastModified };
+        }
+      } catch { /* 列不出来就不显示，不挡恢复 */ }
       return {
+        memoryByProject,
         entries: (catalog.entries || []).map((e) => ({
           ...e,
           project: e.project || projectById.get(e.id) || undefined,

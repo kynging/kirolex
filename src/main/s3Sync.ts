@@ -184,6 +184,14 @@ export function memoryRelsFor(root: string, sessionIds: string[], projects: stri
  * 所以"本地的原样保留，备份里有而本地没有的行按原顺序补在后面"是不丢东西的那个答案：
  * 本机后来教的不会被一份旧备份盖掉，备份里有的也都回来了。比较按去掉首尾空白的整行，空行不算。
  */
+/**
+ * 项目记忆在 mark 表里的键。和会话 id 共用一张表（`s3-session-sync.json`）——
+ * 加 `memory:` 前缀，会话 id 永远不会以它开头，所以不会撞。
+ */
+export function projectMemoryMarkKey(project: string): string {
+  return `memory:projects/${project}`;
+}
+
 export function mergeMemoryText(local: string, backup: string): string {
   if (!local.trim()) return backup;
   const have = new Set(local.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));

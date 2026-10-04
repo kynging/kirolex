@@ -58,7 +58,17 @@ interface ProjectRow {
   bytes: number;
   updatedAt: number;
   excluded: boolean;
+  /** 这个项目的记忆文件（未分组没有）。状态判据和会话同一套。 */
+  memory?: { exists: boolean; bytes: number; updatedAt: number; syncedAt: number; state: 'never' | 'pending' | 'synced' };
 }
+
+/**
+ * 记忆的大小：字节级，因为空壳（二十几字节，只有标题那一行）和真内容的差别
+ * 正是这里要让人一眼看出来的东西 —— `kb()` 会把 23 B 和 900 B 都写成 1 KB。
+ */
+const memSize = (n: number): string => (n < 1024 ? `${n} B` : kb(n));
+/** 小于这个就当它是空壳：只有一行标题、一条记忆都没有。 */
+const EMPTY_MEMORY_BYTES = 64;
 
 const api = (): any => (window as any).kiroApi;
 
@@ -83,6 +93,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
   /* --- 恢复 tab --- */
   const [entries, setEntries] = useState<Backup[] | null>(null);
+  /** 桶里每个项目的记忆（大小 + 最后修改）—— 恢复页组头显示 */
+  const [bucketMemory, setBucketMemory] = useState<Record<string, { bytes: number; lastModified: string }>>({});
   const [err, setErr] = useState('');
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
@@ -109,6 +121,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       const r = await api()?.listS3Backups?.();
       const list: Backup[] = r?.entries || [];
       setEntries(list);
+      setBucketMemory(r?.memoryByProject || {});
       if (r?.error) setErr(String(r.error));
       /* 列表换了就把勾掉的收一收 —— 留着一个已经不在表里的 id，到恢复时才发现它没了 */
       setPicked((prev) => new Set([...prev].filter((id) => list.some((e) => e.id === id && !e.busy))));
@@ -380,6 +393,19 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             {p.sessions.length} 条 · {kb(p.bytes)}
                             {behind ? ` · ${behind} 条待同步` : ''}
                           </span>
+                          {/* 项目记忆 ——「project 上面也得显示到底 project memory 是否同步了、最新时间是什么时候」 */}
+                          {p.memory && (
+                            !p.memory.exists
+                              ? <span className="backup-mem muted" title="这个项目还没有记忆文件">记忆：还没有</span>
+                              : <span
+                                  className={`backup-mem ${p.memory.state}`}
+                                  title={`~/.kirolex/memory/projects/${p.project}/memory.md\n本地最后修改 ${when(p.memory.updatedAt)}`}
+                                >
+                                  记忆 {memSize(p.memory.bytes)} · {p.memory.state === 'synced'
+                                    ? (p.memory.syncedAt ? `已同步 ${when(p.memory.syncedAt)}` : '已同步（时间未知）')
+                                    : p.memory.state === 'pending' ? '有改动待同步' : '没备份过'}
+                                </span>
+                          )}
                           <ToggleButton
                             on={!p.excluded}
                             labels={['同步', '不同步']}
@@ -484,6 +510,21 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             return next;
                           })}>{shut ? '▸' : '▾'} {name}</button>
                           <span className="backup-restore-meta">{rows.length} 条</span>
+                          {(() => {
+                            const proj = rows[0]?.project || '';
+                            if (!proj) return null;             // 未分组没有项目记忆
+                            const m = bucketMemory[proj];
+                            if (!m) return <span className="backup-mem never" title="桶里没有这个项目的记忆">记忆：桶里没有</span>;
+                            const empty = m.bytes < EMPTY_MEMORY_BYTES;
+                            return (
+                              <span
+                                className={`backup-mem ${empty ? 'never' : 'synced'}`}
+                                title={empty ? '桶里这份几乎是空的（只有标题）—— 恢复时会和本地合并，不会盖掉本地' : '恢复会话时会和本地这个项目的记忆合并'}
+                              >
+                                记忆 {memSize(m.bytes)}{empty ? '（空）' : ''} · {new Date(m.lastModified).toLocaleString()}
+                              </span>
+                            );
+                          })()}
                           {/* 整组删云上的备份（不动本地）—— 从「同步」那页挪过来的 */}
                           <button className="remote-btn backup-del" disabled={!!busy}
                                   title="删掉这一组在桶里的备份（不动本地会话）"
