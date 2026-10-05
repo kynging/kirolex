@@ -57,3 +57,20 @@ describe('退出路径也不许留下窗口', () => {
     assert.match(body, /process\.kill\(stray, 0\)/);
   });
 });
+
+test('刚重启完撞上 42（旧实例还没放锁）是重试，不是把监管进程也关掉', () => {
+  const S = fs.readFileSync(path.join(process.cwd(), 'scripts/dev-hot.mjs'), 'utf8');
+  assert.match(S, /if \(code === EXIT_ALREADY_RUNNING && Date\.now\(\) - lastRestartAt < RESTART_LOCK_GRACE_MS\) \{/);
+  assert.match(S, /restarting = true;\n  lastRestartAt = Date\.now\(\);/);
+});
+
+test('孤儿占着锁：先再请它退出，还不走就按进程树杀；重试只有一条链', () => {
+  const S = fs.readFileSync(path.join(process.cwd(), 'scripts/dev-hot.mjs'), 'utf8');
+  assert.match(S, /if \(lockRetries >= 4\) killStrayElectrons\(\);/);
+  assert.match(S, /execFileSync\('taskkill', \['\/PID', String\(pid\), '\/T', '\/F'\]/);
+  assert.match(S, /if \(pendingStart\) clearTimeout\(pendingStart\);/);
+  assert.match(S, /function startElectron\(\) \{\n  if \(electron\) return;/);
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  /* main 只清自己起来之前的退出请求 —— 不然刚起就被要求退出的那一次会被它自己吞掉 */
+  assert.match(M, /if \(fs\.statSync\(DEV_QUIT_REQUEST\)\.mtimeMs < startedAt\) fs\.rmSync\(DEV_QUIT_REQUEST, \{ force: true \}\);/);
+});

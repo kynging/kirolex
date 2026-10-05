@@ -40,6 +40,15 @@ export interface RemoteContextInput {
   /** 兼容旧调用点（镜像时代的会话目录），现在不再出现在注入里。 */
   sessionDir?: string;
   /**
+   * 用户机器上**这条会话自己的文件夹**（`~/.kirolex/sessions/<id>/files/`）—— `local_*` 的默认目录，
+   * 中间产物 / 生成物放这里，跟着会话一起备份、恢复、删除。
+   */
+  filesDir?: string;
+  /** 项目设的工作目录（他机器上的工程）—— cwd 不在那儿，所以要单独说出路径。 */
+  projectDir?: string;
+  /** `filesDir` 以前用过的路径（会话从别的机器恢复过来）—— 历史里写的是这些，要告诉它就是现在那个。 */
+  movedFrom?: string[];
+  /**
    * 从用户机器**转发**过来的那些 MCP 的名字（`playwright` 之类）。
    *
    * 必须说出来：不说的话它会以为这些工具作用在自己这台机器上 —— 而"我以为我在自己机器上
@@ -73,10 +82,21 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       ? `· **这条会话没有本地工程** —— 用户没给它挑本机目录，所以"项目"就在**你这台机器上**`
         + `（当前目录 \`${remoteDir}\`）。要找文件、找代码、跑命令，都在这里找，`
         + `**别拿 \`local_glob\` / \`local_grep\` 去搜用户的 Mac** —— 那边没有这个工程，`
-        + `而 \`local_*\` 的默认目录只是 KiroLex 存这条会话记录的文件夹（里面只有 record.json / `
-        + `transcript.jsonl / history.md），在那儿搜什么都搜不到。`
+        + `\`local_*\` 的默认目录是这条会话在他机器上的文件夹${input.filesDir ? `（\`${input.filesDir}\`）` : ''}，`
+        + `里面只有这条会话自己的产出，不是工程。`
         + `\`local_*\` 留着是为了两件事：用户**明确指给你**的本机路径（他会把路径写出来），`
-        + `以及把最终产出用 \`local_write\` 交回他机器上。`
+        + `以及把最终产出用 \`local_write\` 交回他机器上（默认就放进那个文件夹）。`
+      : '',
+    /* 有本地工程时也要说：产出不该落进他的仓库，而是这条会话自己的文件夹 */
+    input.hasLocalProject !== false && input.filesDir
+      ? `· 中间产物和生成的文件交回他机器时放进这条会话的文件夹 \`${input.filesDir}\`（\`local_*\` 的相对路径就是相对它的），`
+        + `它跟着这条会话一起备份、恢复、删除。`
+        + (input.projectDir ? `他的工程在他机器上的 \`${input.projectDir}\` —— 工程里的文件用这个绝对路径去读写。` : '')
+      : '',
+    /* 两种情况（有没有本地工程）都要说：路径变了是会话被搬过，跟工程无关 */
+    input.filesDir && input.movedFrom?.length
+      ? `· 这条会话是从别处恢复/搬过来的：对话历史和 memory 里出现的 ${input.movedFrom.map((d) => `\`${d}\``).join('、')}`
+        + ` 就是 \`${input.filesDir}\` 以前的路径 —— 那些文件现在都在新路径下，用 \`local_*\` 按新路径找。`
       : '',
     /*
       **别拿历史里的结论判断自己有没有工具** —— 这条是实测出来的（用户：「我让 agent 测本地

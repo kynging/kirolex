@@ -19,9 +19,9 @@ import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } fro
 import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
 import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
-  planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState,
+  planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
-  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
@@ -2230,7 +2230,11 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
   return remoteContextBlock({
     hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
     remoteDir: entry.cwd,
+    /* `local_*` 真正的工作目录（会话的 files/）；项目目录另外说（`projectDir`） */
     localDir: localProjectDirOf(sessionId, entry),
+    filesDir: sessionFilesDir(sessionId),
+    projectDir: projectWorkspaceFor(entry.profile),
+    movedFrom: previousFilesDirs(sessionId),
     /*
       **他那边到底有没有工程** ——「我让它找一个纯远程的项目但它总是在本地找」。
 
@@ -2247,7 +2251,7 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
       所以直接和 `getSessionDir(sessionId)` 比 —— 精确判断比正则可靠
       （而且省掉一份会慢慢长歪的重复实现）。
     */
-    hasLocalProject: localProjectDirOf(sessionId, entry) !== getSessionDir(sessionId),
+    hasLocalProject: !!projectWorkspaceFor(entry.profile),
     /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
   });
@@ -2281,16 +2285,84 @@ function derivedProjectFor(sessionId: string, dir: string): string | undefined {
  * 于是从老会话切到远端时就撞上那句拒绝 —— 而人根本没选过家目录。统一到这里：
  * 两种都退回**会话目录**（本地那条路的 cwd 本来就是它）。
  */
-function localDirOrSessionDir(sessionId: string, candidate?: string): string {
-  const dir = String(candidate || '').replace(/\/+$/, '');
-  if (!dir || dir === os.homedir().replace(/\/+$/, '')) return getSessionDir(sessionId);
+function localDirOrSessionDir(sessionId: string, _candidate?: string): string {
+  /*
+    **不看传进来的目录** ——「这个 folder 通常不是 code repo，而是一些中间产物或生成物。code repo 一般会在
+    其他 folder。我认为这个 folder 完全不应该动」：换项目、进出未分组、换机器，这条会话的文件夹都不变。
+    项目设了工作目录的，那个目录作为"项目在哪"告诉模型（见 `workdirNoteFor`），不再拿来当 cwd。
+  */
+  return sessionFilesDir(sessionId);
+}
+
+/** 项目设的工作目录（「设置工作目录」）—— 没归项目 / 没设就是空。 */
+function projectWorkspaceFor(profile: AgentProfile): string {
+  const project = String(profile.projectId || '').trim();
+  if (!project) return '';
+  try { return String(projectStore.readProject(os.homedir(), project).workspace || '').trim(); } catch { return ''; }
+}
+
+/**
+ * 每一轮告诉模型"文件放哪、项目在哪"。cwd 固定是会话的 files/ 之后，项目目录只能靠这一句让它知道 ——
+ * 不说的话它会在 files/ 里找项目代码，然后把"没找到"当成"没有"。远程会话这件事由 `remoteContextFor` 说。
+ */
+function workdirNoteFor(sessionId: string, entry: SessionEntry): string {
+  if (entry.profile.remote?.sshHost) return '';
+  const files = sessionFilesDir(sessionId);
+  const ws = projectWorkspaceFor(entry.profile);
+  return [
+    `[文件位置] 当前目录是这条会话自己的文件夹 \`${files}\`：中间产物、生成的文件默认放这里`
+      + '（它跟着这条会话一起备份、恢复、删除）。',
+    ws ? `这个项目的目录在 \`${ws}\` —— 要读写项目里的东西，用这个绝对路径。` : '',
+    movedFilesNote(previousFilesDirs(sessionId)),
+  ].filter(Boolean).join('');
+}
+
+/**
+ * **这条会话的 files/ 以前在哪些路径上**（不含现在这个）——「如果 chat 被恢复到了另一个机器路径变了怎么办」。
+ *
+ * 现在的路径每次按这台机器现算，永远对；会错的是对话历史和 memory 里写死的旧路径（"存到了
+ * `C:\Users\…\files\out.csv`"），恢复到 Mac 上之后模型会照着历史去那儿找。所以每次都对一遍：
+ * 现在的路径不在记录里就记上；以前记过的别的路径原样返回，由调用方告诉模型"那就是这个文件夹"。
+ * 合并两份备份时这张表取并集（`mergeRecords`），两台机器各自用过的都在。
+ */
+function previousFilesDirs(sessionId: string): string[] {
+  const current = sessionFilesDir(sessionId);
+  const same = (a: string, b: string): boolean => a.replace(/[\\/]+$/, '').toLowerCase() === b.replace(/[\\/]+$/, '').toLowerCase();
+  const rec = store.readRecord(sessionId);
+  if (!rec) return [];
+  const seen = Array.isArray(rec.filesDirs) ? rec.filesDirs.filter((d) => typeof d === 'string' && d) : [];
+  if (!seen.some((d) => same(d, current))) {
+    rec.filesDirs = [...seen, current];
+    store.writeRecord(rec);
+    if (seen.length) logger.info('session', `files/ 路径变了 sessionId=${sessionId}：${seen.join(' | ')} -> ${current}`);
+  }
+  return seen.filter((d) => !same(d, current));
+}
+
+function movedFilesNote(previous: string[]): string {
+  if (!previous.length) return '';
+  return ` 注意：这条会话是从别处恢复/搬过来的，对话历史和 memory 里出现的 ${previous.map((d) => `\`${d}\``).join('、')}`
+    + ' 就是这个文件夹以前的路径 —— 那些文件现在都在上面这个新路径下，按新路径找，别去旧路径。';
+}
+
+/**
+ * **会话生成的文件默认放在会话自己的目录里** ——「当前会话生成的文件应该默认在会话目录下的一个单独文件夹」+
+ * 「这样这个文件夹也可以和会话的内容一起被同步、恢复、或者删除」。
+ *
+ * `~/.kirolex/sessions/<id>/files/`：和 record / transcript 同一个目录（删会话、进回收站、备份、恢复都是
+ * 按这个目录走的），但单独一层 —— 不然模型写的文件和 KiroLex 自己的 record.json 混在一起。
+ * 以前本地会话默认是共用的 `~/kirolex`（所有会话的文件堆在一起，删会话也不跟着走），
+ * 远程会话的本地工具直接写进会话目录本身。
+ */
+function sessionFilesDir(sessionId: string): string {
+  const dir = path.join(getSessionDir(sessionId), SESSION_FILES_DIR);
+  try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 建不了就让执行器自己报 cwd 不存在 */ }
   return dir;
 }
 
-/** 这条会话在**本地**的工作目录（远程会话的 `cwd` 是远端镜像路径，不能拿来当本地目录用）。 */
-function localProjectDirOf(sessionId: string, entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
-  if (entry.localDir) return entry.localDir;
-  return entry.profile.remote?.sshHost ? getSessionDir(sessionId) : entry.cwd;
+/** 这条会话在**本地**的工作目录 —— 固定是它的 files/（见 `localDirOrSessionDir`）。 */
+function localProjectDirOf(sessionId: string, _entry: { localDir?: string; cwd: string; profile: AgentProfile }): string {
+  return sessionFilesDir(sessionId);
 }
 
 /**
@@ -2452,20 +2524,18 @@ const preflightInFlight = new Map<string, Promise<string[]>>();
 /**
  * **本地会话在哪个目录里干活** ——「本机应该有工作目录这个功能，默认是用户目录下的 kirolex」。
  *
- * 归了项目的会话用项目自己的目录；没归项目的（渲染层给的是家目录 / 什么都没给 / 老记录里存的
- * 每会话目录 `~/.kirolex/sessions/<id>`）一律用**本机工作目录**（设置 → 机器 → 本机，默认 `~/kirolex`）。
+ * 项目设了工作目录的用那个目录；其余的（渲染层给的是家目录 / 什么都没给 / 老记录里存的会话目录或 `~/kirolex`）
+ * 一律用**会话自己的 files/**（见 `sessionFilesDir`）—— 后来改的：「当前会话生成的文件应该默认在会话目录下的
+ * 一个单独文件夹」。老会话第一次换过来时 Claude Code 那边按目录找不到原来的后端会话，会新起一条，
+ * 上下文照常随下一条消息带过去（和换机器一样）。
  *
  * 新建和重连**都走这一个函数**：原来新建给的是每会话目录、重连给的是记录里的家目录，两次不是
  * 同一个地方。kiro 不在乎（它每次都重建上下文），但 Claude Code 是按目录存会话的 —— 重连换了目录
  * 就找不回原来那段对话。
  */
 function localCwdFor(sessionId: string, dir?: string): string {
-  const d = String(dir || '').trim();
-  const same = (a: string, b: string): boolean => path.resolve(a).toLowerCase() === path.resolve(b).toLowerCase();
-  if (d && !same(d, os.homedir()) && !same(d, getSessionDir(sessionId))) return d;
-  const wd = localWorkdir(KIROLEX_CONFIG_PATH);
-  try { fs.mkdirSync(wd, { recursive: true }); } catch { /* 建不了就让执行器自己报 cwd 不存在 */ }
-  return wd;
+  /* 本地会话和远程会话的本地那一侧用同一条规则 */
+  return localDirOrSessionDir(sessionId, dir);
 }
 
 /**
@@ -3395,7 +3465,7 @@ function catalogEntriesFor(
     /* 分组用 —— 恢复列表是一次 GET 拿整张 catalog，不该为了分组再去下几十个 record.json */
     project: projectOf(r) || undefined,
     updatedAt: r.updatedAt || 0,
-    bytes: SESSION_FILES.reduce((sum, f) => {
+    bytes: [...SESSION_FILES, ...walk(path.join(KIROLEX_HOME, 'sessions', r.id), SESSION_FILES_DIR)].reduce((sum, f) => {
       try { return sum + fs.statSync(path.join(KIROLEX_HOME, 'sessions', r.id, f)).size; } catch { return sum; }
     }, 0),
     from: machine,
@@ -5525,6 +5595,10 @@ app.whenReady().then(async () => {
       不说的话它会拿对话里的 `/Users/...` 去搜（那个路径在远端不存在），把"搜不到"当成"没有这个东西"。
       和 memory 块同一个位置注入：越靠近用户那句话越可能被遵守。
     */
+    try {
+      const note = workdirNoteFor(sessionId, entry);
+      if (note) prompt = [{ type: 'text', text: note }, ...prompt];
+    } catch {}
     try {
       const rc = remoteContextFor(sessionId, entry);
       if (rc) {
@@ -9909,7 +9983,15 @@ for (const sig of ['SIGTERM', 'SIGINT'] as const) {
  *  fs.watch'ed: watch on Windows drops events for files created right after start. */
 const DEV_QUIT_REQUEST = path.join(os.homedir(), '.kirolex', 'dev-quit-request');
 if (IS_DEV && process.platform === 'win32') {
-  try { fs.rmSync(DEV_QUIT_REQUEST, { force: true }); } catch { /* 没有就算了 */ }
+  /*
+    **只清"我起来之前"的那份** —— 实测的竞态：刚启动两秒就又触发一次重启，监管进程写了退出请求，
+    而这个进程那时还没走到这里，一上来就把它当成陈旧的删了 —— 于是它永远等不到退出请求，
+    成了占着单实例锁的孤儿，之后每一次重启都撞「another instance is running」。
+  */
+  try {
+    const startedAt = Date.now() - process.uptime() * 1000;
+    if (fs.statSync(DEV_QUIT_REQUEST).mtimeMs < startedAt) fs.rmSync(DEV_QUIT_REQUEST, { force: true });
+  } catch { /* 没有就算了 */ }
   setInterval(() => {
     if (!fs.existsSync(DEV_QUIT_REQUEST)) return;
     try { fs.rmSync(DEV_QUIT_REQUEST, { force: true }); } catch { /* 下面照样退 */ }

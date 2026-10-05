@@ -1108,9 +1108,14 @@ describe('切换一条已有会话的机器', () => {
 describe('“没有项目目录”只有一种处理方式', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
-  test('空 / 家目录统一退回会话目录（一个函数，不是三份判断）', () => {
-    assert.match(M, /function localDirOrSessionDir\(sessionId: string, candidate\?: string\): string \{/);
-    assert.match(M, /if \(!dir \|\| dir === os\.homedir\(\)\.replace\(\/\\\/\+\$\/, ''\)\) return getSessionDir\(sessionId\);/);
+  test('一个函数决定目录 —— 后来定成「这个 folder 完全不应该动」：永远是会话的 files/', () => {
+    assert.match(M, /function localDirOrSessionDir\(sessionId: string, _candidate\?: string\): string \{/);
+    assert.match(M, /\n  return sessionFilesDir\(sessionId\);\n\}/);
+    assert.match(M, /const dir = path\.join\(getSessionDir\(sessionId\), SESSION_FILES_DIR\);/);
+    /* 本地那条路也走它，不再落到共用的 ~/kirolex */
+    assert.match(M, /function localCwdFor\(sessionId: string, dir\?: string\): string \{[\s\S]{0,120}return localDirOrSessionDir\(sessionId, dir\);/);
+    /* 项目目录不当 cwd，每一轮告诉模型它在哪 */
+    assert.match(M, /const note = workdirNoteFor\(sessionId, entry\);/);
   });
 
   test('三条路（新建 / attach / 换机器）都走它 —— 上一版只有两条走，第三条就撞了那句拒绝', () => {

@@ -74,3 +74,43 @@ describe('恢复：记忆合并，不覆盖', () => {
     assert.match(body, /fs\.copyFileSync\(abs, dest\);/);
   });
 });
+
+describe('会话自己的 files/ 跟着会话备份', () => {
+  test('同步时整棵传；别的会话的不传', () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kxfiles-'));
+    const put = (rel: string): void => { fs.mkdirSync(path.dirname(path.join(root, rel)), { recursive: true }); fs.writeFileSync(path.join(root, rel), 'x'); };
+    put('sessions/s_in/record.json');
+    put('sessions/s_in/files/out.csv');
+    put('sessions/s_in/files/sub/chart.png');
+    put('sessions/s_out/files/secret.txt');
+    const { upload } = planUpload(root, ['s_in'], {}, { projects: [] });
+    assert.ok(upload.includes(path.join('sessions', 's_in', 'files', 'out.csv')));
+    assert.ok(upload.includes(path.join('sessions', 's_in', 'files', 'sub', 'chart.png')));
+    assert.equal(upload.some((r) => r.includes('s_out')), false);
+    fs.rmSync(root, { recursive: true, force: true });
+  });
+});
+
+describe('恢复到另一台机器、路径变了', () => {
+  test('合并两份记录时 files/ 用过的路径取并集', async () => {
+    const { mergeRecords } = await import('../src/main/transcriptMerge.ts');
+    const out = mergeRecords(
+      { updatedAt: 2, filesDirs: ['/Users/me/.kirolex/sessions/s/files'] },
+      { updatedAt: 1, filesDirs: ['C:\Users\me\.kirolex\sessions\s\files'] },
+    );
+    assert.deepEqual(out.filesDirs, ['/Users/me/.kirolex/sessions/s/files', 'C:\Users\me\.kirolex\sessions\s\files']);
+  });
+  test('远程说明里把旧路径指向新路径', async () => {
+    const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
+    const t = remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r', localDir: '/new/files', filesDir: '/new/files', hasLocalProject: false, movedFrom: ['C:\old\files'] });
+    assert.match(t, /C:\old\files/);
+    assert.match(t, /就是 `\/new\/files` 以前的路径/);
+    assert.doesNotMatch(remoteContextBlock({ hostLabel: 'tokyo', remoteDir: '/r', localDir: '/n', filesDir: '/n', hasLocalProject: false }), /以前的路径/);
+  });
+  test('接线：本地每一轮的说明、远程说明都带上旧路径；没变过就什么都不说', () => {
+    const M = fs.readFileSync('src/main/index.ts', 'utf8');
+    assert.match(M, /movedFilesNote\(previousFilesDirs\(sessionId\)\),/);
+    assert.match(M, /movedFrom: previousFilesDirs\(sessionId\),/);
+    assert.match(M, /if \(!previous\.length\) return '';/);
+  });
+});

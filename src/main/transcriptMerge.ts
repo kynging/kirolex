@@ -120,7 +120,8 @@ export function mergeRecords(local: any, remote: any): any {
   const createdB = Number(remote.createdAt) || 0;
   if (createdA && createdB) out.createdAt = Math.min(createdA, createdB);
 
-  for (const key of ['tags']) {
+  /* `filesDirs`：两台机器各自用过的路径都要留着（见 SessionRecord.filesDirs） */
+  for (const key of ['tags', 'filesDirs']) {
     const a = Array.isArray(local[key]) ? local[key] : [];
     const b = Array.isArray(remote[key]) ? remote[key] : [];
     const union = [...a, ...b].filter((v, i, arr) => arr.indexOf(v) === i);

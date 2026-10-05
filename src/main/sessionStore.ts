@@ -100,6 +100,12 @@ export interface SessionRecord {
    * 所以目录必须**存在记录里**、以记录为准 —— 渲染层传什么都不该决定一条已存在会话的工作目录。
    */
   localDir?: string;
+  /**
+   * 这条会话的 files/ **用过的所有绝对路径** ——「如果 chat 被恢复到了另一个机器路径变了怎么办」。
+   * 路径本身每次按这台机器现算（不会错），但对话历史和 memory 里写死的是**当时那台机器**的路径；
+   * 记下来，路径一变就在每一轮的说明里告诉模型"历史里那个旧路径就是现在这个文件夹"。
+   */
+  filesDirs?: string[];
   /** Memory injection bookkeeping (design §6.4). */
   lastMemoryInjection?: { charCount: number; at: number };
   /** Runtime lifecycle; on load, live states are treated as detached. */

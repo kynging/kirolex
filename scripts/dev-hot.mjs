@@ -14,7 +14,7 @@
  * Why a supervisor at all: only a process OUTSIDE Electron can bring Electron back
  * after it exits. Nothing here needs an extra dependency.
  */
-import { spawn } from 'node:child_process';
+import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import crypto from 'node:crypto';
@@ -95,8 +95,44 @@ let electron = null;
 let restarting = false;
 let shuttingDown = false;
 let crashStreak = 0;
+/** 上一次重启的时刻 + 这之后多久里的 42 算"旧实例还没放锁"（见 exit 处理） */
+let lastRestartAt = 0;
+let lockRetries = 0;
+const RESTART_LOCK_GRACE_MS = 60_000;
+
+/**
+ * **只有一个"待启动"** —— 实测两条重试链并行（每条各自 setTimeout 一次 startElectron），
+ * 日志里 retry 7、8 隔一秒、9、10 又隔一秒，两个新实例抢同一把锁。
+ */
+let pendingStart = null;
+function scheduleStart(wait) {
+  if (pendingStart) clearTimeout(pendingStart);
+  pendingStart = setTimeout(() => { pendingStart = null; if (!shuttingDown) startElectron(); }, wait);
+}
+
+/**
+ * 杀掉不是我们 child 的那些 KiroLex Electron（主进程，命令行里有这个仓库路径 + `--dev`、没有 `--type=`）。
+ * `taskkill /T` 连它的子进程（GPU / 网络服务 / 渲染）一起 —— 单实例锁在主进程手里，只有它死了锁才放。
+ */
+function killStrayElectrons() {
+  if (process.platform !== 'win32') return;
+  const mine = electron?.pid;
+  const ps = `Get-CimInstance Win32_Process -Filter "Name='electron.exe'" | `
+    + `? { $_.CommandLine -like '*${root.replace(/'/g, "''")}*' -and $_.CommandLine -like '*--dev*' -and $_.CommandLine -notlike '*--type=*' } | `
+    + `% { $_.ProcessId }`;
+  let pids = [];
+  try {
+    pids = execFileSync('powershell.exe', ['-NoProfile', '-Command', ps], { encoding: 'utf8', windowsHide: true })
+      .split(/\s+/).map(Number).filter((p) => p && p !== mine);
+  } catch (err) { log('electron', `could not list stray Electron processes (${err.message})`); return; }
+  for (const pid of pids) {
+    log('electron', `killing stray KiroLex Electron ${pid} (it holds the single-instance lock)`);
+    try { execFileSync('taskkill', ['/PID', String(pid), '/T', '/F'], { windowsHide: true, stdio: 'ignore' }); } catch {}
+  }
+}
 
 function startElectron() {
+  if (electron) return;   // 已经有一个在跑（或刚起）—— 第二个只会撞单实例锁
   // `--dev` (not NODE_ENV) so the renderer is loaded from Vite: the env-var form
   // this project used before was Windows-only syntax and silently no-op'd here.
   //
@@ -122,12 +158,32 @@ function startElectron() {
       // Windows: the old instance's network-service process outlives the main one by
       // a moment and still holds the --dev CDP port (9222), so an immediate relaunch
       // came up with no debug port at all. A short pause lets it go.
-      setTimeout(startElectron, process.platform === 'win32' ? 1500 : 0);
+      scheduleStart(process.platform === 'win32' ? 1500 : 0);
       return;
     }
     // 42 = another instance owns the single-instance lock. Retrying can never
     // succeed, and doing so silently is how a stale instance turned into "the app
     // will not start". Name it and stop.
+    /*
+      **刚重启完撞上 42 不是"另一个实例"，是旧的那个还没把锁放掉** —— 实测（Windows）：旧 main 退出了、
+      1.5 秒后新的起来，单实例锁还在旧进程手里没释放完，于是新的退出 42、监管进程跟着 shutdown ——
+      结果是 KiroLex **整个没了**，直到有人手动再起一次。重启之后的这一段时间里退避重试；
+      过了这段时间还 42，才是真的有别的实例。
+    */
+    if (code === EXIT_ALREADY_RUNNING && Date.now() - lastRestartAt < RESTART_LOCK_GRACE_MS) {
+      lockRetries += 1;
+      const wait = Math.min(5000, 1000 * lockRetries);
+      log('electron', `previous instance still holds the single-instance lock (retry ${lockRetries}, in ${wait}ms)`);
+      /*
+        **占着锁的多半是个孤儿**（不是我们的 child 了 —— 实测它一直不放，60 秒退避白等）。
+        先再写一次退出请求让它体面地走（它会关掉 kiro-cli 的 stdin、放掉会话锁）；
+        过了 10 秒还在，就按进程树强杀 —— 不然 KiroLex 永远起不来。
+      */
+      if (lockRetries === 1) { try { fs.writeFileSync(DEV_QUIT_REQUEST, String(Date.now())); } catch {} }
+      if (lockRetries >= 4) killStrayElectrons();
+      scheduleStart(wait);
+      return;
+    }
     if (code === EXIT_ALREADY_RUNNING) {
       log('electron', 'another KiroLex instance is already running, so this one exited.');
       log('electron', 'Quit it first (Cmd-Q), or: pkill -f "kirolex/node_modules/electron"');
@@ -140,7 +196,7 @@ function startElectron() {
       crashStreak += 1;
       const wait = Math.min(15000, 1000 * crashStreak);
       log('electron', `exited fast (code=${code} signal=${signal}) -- main code likely broken. Waiting ${wait}ms; save a fix to retry.`);
-      setTimeout(() => { if (!shuttingDown) startElectron(); }, wait);
+      scheduleStart(wait);
       return;
     }
     crashStreak = 0;
@@ -155,6 +211,8 @@ function restartElectron(reason) {
   if (shuttingDown || restarting) return;
   if (!electron) { startElectron(); return; }
   restarting = true;
+  lastRestartAt = Date.now();
+  lockRetries = 0;
   log('electron', `restarting: ${reason}`);
   // SIGTERM, not SIGKILL: main turns it into app.quit(), which closes each
   // kiro-cli's stdin so it exits 0 and RELEASES its session. A hard kill leaves a

@@ -38,6 +38,13 @@ export const LAYOUT = 'v1';
 /** 一条会话恢复回来必须有的那几个文件。顺序无关，但**只有这几个**。 */
 export const SESSION_FILES = ['record.json', 'transcript.jsonl', 'history.md'];
 
+/**
+ * 会话生成的文件放在 `sessions/<id>/<这个目录>/` 下 ——「这样这个文件夹也可以和会话的内容一起被同步、
+ * 恢复、或者删除」。整棵跟着会话传（单个文件仍受 `MAX_FILE_BYTES` 限制）；恢复是按 `sessions/<id>/` 前缀拉的，
+ * 删会话 / 删备份也是按这个前缀，所以它自动跟着走。
+ */
+export const SESSION_FILES_DIR = 'files';
+
 /** 整体同步的那几棵树（相对 `~/.kirolex`）。 */
 export const SHARED_DIRS = ['memory', 'attachments', 'pasted'];
 
@@ -149,7 +156,10 @@ export function planUpload(
     upload.push(rel);
   };
 
-  for (const id of sessionIds) for (const f of SESSION_FILES) consider(path.join('sessions', id, f));
+  for (const id of sessionIds) {
+    for (const f of SESSION_FILES) consider(path.join('sessions', id, f));
+    for (const rel of walk(root, path.join('sessions', id, SESSION_FILES_DIR))) consider(rel);
+  }
   if (memory) {
     for (const rel of memoryRelsFor(root, sessionIds, memory.projects)) consider(rel);
     for (const dir of SHARED_DIRS) if (dir !== 'memory') for (const rel of walk(root, dir)) consider(rel);

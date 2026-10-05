@@ -441,7 +441,8 @@ describe('纯远程工程：别把它往本机引', () => {
       也省掉一份会慢慢长歪的重复实现（渲染层那个 `isSessionScratchDir` 是按形状匹配的,
       它没有 sessionId 可用）。
     */
-    assert.match(M, /hasLocalProject: localProjectDirOf\(sessionId, entry\) !== getSessionDir\(sessionId\),/);
+    /* 后来 cwd 固定成会话的 files/，"有没有本地工程"就只看项目设没设工作目录 */
+    assert.match(M, /hasLocalProject: !!projectWorkspaceFor\(entry\.profile\),/);
     assert.equal(/hasLocalProject: !!entry\.localDir,/.test(M), false, '那个只看有没有值的写法不该还在');
   });
 });
