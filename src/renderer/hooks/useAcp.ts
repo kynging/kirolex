@@ -1438,6 +1438,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 而主进程那边虽然发了 `session:targets-changed`，渲染层从来没人听 —— 于是切完了，
    * 界面停在旧值上，直到下一次整页水化。
    */
+  /* switchSession 定义在下面，这个监听要在挂载时就装上 —— 用 ref 拿它的最新版本 */
+  const switchSessionRef = useRef<((id: string) => Promise<void>) | null>(null);
+  /*
+    **同步时自动合并了别的机器的消息** —— 磁盘上的 transcript 变了，界面缓存那份是旧的。
+    扔掉缓存；正在看的那条立刻按磁盘重读（switchSession 在没缓存时就是从 transcript 读）。
+  */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onSessionHistoryChanged?.((d: { sessionId: string }) => {
+      if (!d?.sessionId) return;
+      messagesCacheRef.current.delete(d.sessionId);
+      removeAttached(d.sessionId);
+      if (currentSessionRef.current === d.sessionId) void switchSessionRef.current?.(d.sessionId);
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
   useEffect(() => {
     const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
       if (!d?.sessionId) return;
@@ -3060,6 +3076,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       void window.kiroApi.ensureContext?.(sessionId).catch(() => {});
     }
   }, [sessions]);
+  switchSessionRef.current = switchSession;
 
   /**
    * 预热一个会话 —— 「为什么我点开一个之前的项目没有自动预热」。

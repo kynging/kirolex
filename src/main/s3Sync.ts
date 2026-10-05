@@ -378,6 +378,11 @@ export function detectConflicts(
   return out;
 }
 
+/** 某条会话在 conflicts/ 下的前缀（以本机为准时要一起清掉）。 */
+export function conflictPrefixFor(prefix: string | undefined, sessionId: string): string {
+  return `${joinPrefix(prefix)}${LAYOUT}/conflicts/${sessionId}/`;
+}
+
 /** 冲突时本机那份放哪儿 —— 旁路 key，不盖对方的。 */
 export function conflictKeyFor(prefix: string | undefined, sessionId: string, machine: string, rel: string): string {
   return `${joinPrefix(prefix)}${LAYOUT}/conflicts/${sessionId}/${machine}/${rel.split(path.sep).join('/')}`;

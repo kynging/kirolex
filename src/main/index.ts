@@ -21,7 +21,7 @@ import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
-  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
   decideMemory, memoryRelsFor,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
@@ -3475,6 +3475,96 @@ function catalogEntriesFor(
 }
 
 /**
+ * **冲突时自动合并** ——「这个不对，很显然应该自动合并」。
+ *
+ * 原来判成冲突（桶里那份是别的机器传的、而且更新）就把本机这份传到 conflicts/ 旁路、等人来处理，
+ * 而界面上没有处理它的地方 —— 于是每一轮都报同一句"被别的机器更新过"，永远不收敛。
+ *
+ * transcript 是 append-only 的事件流、每条带 id 和 ts，按 id 去重 + 按 ts 排序就是精确的并集
+ * （`mergeTranscripts`，和恢复同一个函数）；record 取 updatedAt 新的那份、数组取并集（`mergeRecords`）。
+ * 桶里有而本地没有的 files/ 文件拉下来；两边都有的以本地为准（下面会正常传上去）。
+ * 动之前把本地那两份挪进 trash。history.md 是渲染产物，不拉，由调用方从合并后的 transcript 重建。
+ */
+async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, sessionId: string): Promise<{ added: number; pulledFiles: number }> {
+  const sdir = getSessionDir(sessionId);
+  const tAbs = path.join(sdir, 'transcript.jsonl');
+  const rAbs = path.join(sdir, 'record.json');
+  const tKey = keyFor(prefix, path.join('sessions', sessionId, 'transcript.jsonl'));
+  const rKey = keyFor(prefix, path.join('sessions', sessionId, 'record.json'));
+  const [rt, rr] = await Promise.all([getObjectIfExists(creds, tKey), getObjectIfExists(creds, rKey)]);
+  const bak = trashDirFor(KIROLEX_HOME, sessionId);
+  fs.mkdirSync(bak, { recursive: true });
+  for (const f of [tAbs, rAbs]) { try { fs.copyFileSync(f, path.join(bak, `before-merge-${path.basename(f)}`)); } catch { /* 本地没有 */ } }
+  let added = 0;
+  if (rt) {
+    const mine = fs.existsSync(tAbs) ? fs.readFileSync(tAbs, 'utf-8') : '';
+    const r = mergeTranscripts(mine, rt.toString('utf-8'));
+    if (r.text !== mine) { const tmp = `${tAbs}.kirolex-${process.pid}.tmp`; fs.writeFileSync(tmp, r.text); fs.renameSync(tmp, tAbs); }
+    added = r.added;
+  }
+  if (rr) {
+    let mine: any; let theirs: any;
+    try { mine = JSON.parse(fs.readFileSync(rAbs, 'utf-8')); } catch { mine = undefined; }
+    try { theirs = JSON.parse(rr.toString('utf-8')); } catch { theirs = undefined; }
+    const merged = mergeRecords(mine, theirs);
+    /* 合并之后这一份就是"最新"的：updatedAt 取两边的较大者，不然下一轮又被判成冲突 */
+    merged.updatedAt = Math.max(Number(mine?.updatedAt) || 0, Number(theirs?.updatedAt) || 0, Date.now());
+    const tmp = `${rAbs}.kirolex-${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(merged, null, 2)); fs.renameSync(tmp, rAbs);
+  }
+  let pulledFiles = 0;
+  const fpfx = `${keyFor(prefix, path.join('sessions', sessionId, SESSION_FILES_DIR))}/`;
+  for (const o of await listObjects(creds, fpfx)) {
+    const rel = relFor(prefix, o.key);
+    if (!rel) continue;
+    const abs = path.join(KIROLEX_HOME, rel);
+    if (fs.existsSync(abs)) continue;
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    fs.writeFileSync(abs, await getObject(creds, o.key));
+    pulledFiles += 1;
+  }
+  try { refreshHistoryFile(sessionId); } catch { /* 下次打开时会重建 */ }
+  return { added, pulledFiles };
+}
+
+/**
+ * **以本机为准**：删掉桶里这条会话的全部对象（含 conflicts/ 旁路），再把本机这份整条传上去，
+ * catalog 里这一条的来源改成本机 ——「先删掉 windows 那里上传的版本重新弄 mac 版上去」。
+ */
+async function keepLocalSession(creds: S3Creds, prefix: string | undefined, sessionId: string, thisMachine: string): Promise<{ deleted: number; uploaded: number }> {
+  let deleted = 0;
+  for (const pfx of [`${keyFor(prefix, path.join('sessions', sessionId))}/`, conflictPrefixFor(prefix, sessionId)]) {
+    for (const o of await listObjects(creds, pfx)) { await deleteObject(creds, o.key); deleted += 1; }
+  }
+  const rels = [
+    ...SESSION_FILES.map((f) => path.join('sessions', sessionId, f)),
+    ...walkSessionFiles(KIROLEX_HOME, path.join('sessions', sessionId, SESSION_FILES_DIR)),
+  ].filter((rel) => { try { return fs.statSync(path.join(KIROLEX_HOME, rel)).isFile(); } catch { return false; } });
+  const state = readState(S3_STATE_PATH);
+  let uploaded = 0;
+  for (const rel of rels) {
+    const abs = path.join(KIROLEX_HOME, rel);
+    const st = fs.statSync(abs);
+    if (st.size > MAX_FILE_BYTES) continue;
+    await putObject(creds, keyFor(prefix, rel), fs.readFileSync(abs), contentTypeFor(rel));
+    state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
+    uploaded += 1;
+  }
+  writeState(S3_STATE_PATH, state);
+  /* catalog：这一条换成本机的 —— 不换的话下一轮还是"别的机器传的、更新"，又判冲突 */
+  const raw = await getObjectIfExists(creds, catalogKey(prefix));
+  let catalog: Catalog = { version: 1, entries: [] };
+  try { if (raw) catalog = JSON.parse(raw.toString('utf-8')); } catch { /* 坏了就当空的 */ }
+  const rec = store.readRecord(sessionId);
+  const fresh = rec ? catalogEntriesFor([rec], thisMachine) : [];
+  const next: Catalog = { version: 1, entries: [...(catalog.entries || []).filter((e) => e.id !== sessionId), ...fresh] };
+  await putObject(creds, catalogKey(prefix), Buffer.from(JSON.stringify(next, null, 2)), 'application/json');
+  const marks = readSessionMarks(S3_MARKS_PATH);
+  marks[sessionId] = { at: Date.now(), updatedAt: rec?.updatedAt || 0 };
+  writeSessionMarks(S3_MARKS_PATH, marks);
+  return { deleted, uploaded };
+}
+
+/**
  * 删掉桶里若干条会话的备份（对象 + catalog 条目），并清掉本地"传过什么"的记录。
  * `s3:delete-project` 和 `s3:delete-sessions` 共用 —— 顺序和理由见下面每一步。
  */
@@ -3567,17 +3657,43 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     const oldRaw0 = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
     let oldCatalog: Catalog | null = null;
     try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
-    const freshEntries = catalogEntriesFor(sessions, thisMachine);
+    let freshEntries = catalogEntriesFor(sessions, thisMachine);
     const conflicts = detectConflicts(oldCatalog, freshEntries, thisMachine);
-    const conflictIds = new Set(conflicts.map((c) => c.id));
+    /*
+      **冲突自动合并** ——「这个不对，很显然应该自动合并」（见 `mergeBucketSession`）。
+      合并完本地那份就是两边的并集，照常传上去。只有两种情况退回旁路（conflicts/）：
+      正在跑一轮的（产出还没落盘，这时候动 transcript 会丢东西，下一轮再合），和合并出错的。
+    */
+    const conflictIds = new Set<string>();
+    const mergedIds: string[] = [];
+    for (const c of conflicts) {
+      const live = sessionClients.get(c.id);
+      if (live?.busy) { conflictIds.add(c.id); continue; }
+      try {
+        if (live) detachExecutor(c.id);              // 执行器手上那份不能再写盘，下次打开按合并后的记录重新接上
+        const r = await mergeBucketSession(creds!, cfg.prefix, c.id);
+        mergedIds.push(c.id);
+        logger.info('s3', `自动合并 ${c.id}（桶里那份来自 ${c.from}）：并进 ${r.added} 条消息${r.pulledFiles ? `、拉下 ${r.pulledFiles} 个文件` : ''}`);
+        mainWindow?.webContents.send('session:history-changed', { sessionId: c.id });
+      } catch (err: any) {
+        conflictIds.add(c.id);
+        logger.warn('s3', `自动合并 ${c.id} 失败，这一轮本机这份传到 conflicts/：${err?.message || err}`);
+      }
+    }
+    if (mergedIds.length) {
+      /* 合并改了本地的 record/transcript：这几条要重新传，catalog 条目也按合并后的记录来 */
+      for (const id of mergedIds) {
+        for (const f of SESSION_FILES) {
+          const rel = path.join('sessions', id, f);
+          if (!plan.upload.includes(rel) && fs.existsSync(path.join(KIROLEX_HOME, rel))) plan.upload.push(rel);
+        }
+      }
+      const reread = new Map(mergedIds.map((id) => [id, store.readRecord(id)]));
+      freshEntries = catalogEntriesFor(sessions.map((r) => reread.get(r.id) || r), thisMachine);
+    }
     if (conflictIds.size) {
-      /*
-        冲突时**照样把本机这份传上去**，但传到旁路 key —— 两台机器的时钟不一定一致，
-        "谁的时间晚谁赢"会悄悄丢掉一整条对话。让人自己决定留哪份。
-      */
-      logger.warn('s3', `${conflictIds.size} 条会话在桶里被别的机器更新过（${conflicts.map((c) => `${c.id}@${c.from}`).join('、')}）`
-        + ` —— 本机这份传到 conflicts/ 下，不盖对方的`);
-      mainWindow?.webContents.send('s3:conflicts', conflicts);
+      logger.warn('s3', `${conflictIds.size} 条会话这一轮没合并（${[...conflictIds].join('、')}）—— 本机这份传到 conflicts/，下一轮再合`);
+      mainWindow?.webContents.send('s3:conflicts', conflicts.filter((c) => conflictIds.has(c.id)));
     }
     logger.info('s3', `同步开始（${reason}）：${plan.upload.length} 个要传、${plan.skippedUnchanged} 个没变`
       + `${plan.skippedTooBig.length ? `、${plan.skippedTooBig.length} 个太大跳过` : ''}`
@@ -5111,6 +5227,31 @@ app.whenReady().then(async () => {
    * 只删备份，本地一个字不动。本地还在的那几条，下一轮同步会再传上去（状态表已清）——
    * 那是诚实的结果：要它彻底消失，得在侧栏把本地那条也删掉。界面上会把这几条单独说出来。
    */
+  /**
+   * **以本机为准** —— 删掉桶里这几条会话的全部对象（含 conflicts/），把本机这份整条传上去
+   * （见 `keepLocalSession`）。「先删掉 windows 那里上传的版本重新弄 mac 版上去」。
+   */
+  ipcMain.handle('s3:keep-local', async (_event, ids: string[]) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id) && store.readRecord(id));
+    if (!want.length) return { ok: false, error: '没选会话，或者本机没有这几条。' };
+    const cfg = loadSyncConfig();
+    const thisMachine = machineTag(os.hostname());
+    const done: Array<{ id: string; deleted: number; uploaded: number }> = [];
+    try {
+      for (const id of want) {
+        const r = await keepLocalSession(creds!, cfg.prefix, id, thisMachine);
+        done.push({ id, ...r });
+        logger.warn('s3', `以本机为准 ${id}：删掉桶里 ${r.deleted} 个对象，传上本机 ${r.uploaded} 个文件`);
+      }
+      return { ok: true, done };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, done, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    }
+  });
+
   ipcMain.handle('s3:delete-sessions', async (_event, ids: string[]) => {
     const { creds, problem } = syncCredsOrProblem();
     if (problem) return { ok: false, error: problem };

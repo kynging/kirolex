@@ -80,6 +80,13 @@ contextBridge.exposeInMainWorld('kiroApi', {
   syncS3Now: () => ipcRenderer.invoke('s3:sync-now'),
   listS3Backups: () => ipcRenderer.invoke('s3:list-backups'),
   deleteS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:delete-sessions', ids),
+  keepLocalS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:keep-local', ids),
+  /** 同步时自动合并改了这条会话的 transcript —— 界面缓存要扔掉重读 */
+  onSessionHistoryChanged: (callback: (d: { sessionId: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('session:history-changed', handler);
+    return () => ipcRenderer.removeListener('session:history-changed', handler);
+  },
   /**
    * 有哪些项目、各多少条会话、哪些设成了不同步（「你得按 project 整理，有些project可以选择不同步」）。
    * 从会话记录现算 —— 这一页要回答的是"同步会覆盖到哪些东西"。
