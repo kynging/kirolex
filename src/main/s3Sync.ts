@@ -52,7 +52,11 @@ export const SHARED_DIRS = ['memory', 'attachments', 'pasted'];
 export const DEFAULT_INTERVAL_MINUTES = 30;
 
 /** 单个文件上限 —— 超了跳过并说一句。备份不该被一个巨大的粘贴图拖死。 */
-export const MAX_FILE_BYTES = 32 * 1024 * 1024;
+/*
+  200MB ——「32MB 的限制可能太低了」。会话 files/ 现在是工作目录，pptx / pdf / 录音这类真产出
+  常常过 32MB。压缩包和安装包另有一道按扩展名的排除（见 `isArchiveFile`），不靠这个上限挡。
+*/
+export const MAX_FILE_BYTES = 200 * 1024 * 1024;
 
 export interface SyncConfig {
   enabled?: boolean;
@@ -168,7 +172,7 @@ export function planUpload(
 
   for (const id of sessionIds) {
     for (const f of SESSION_FILES) consider(path.join('sessions', id, f));
-    for (const rel of walk(root, path.join('sessions', id, SESSION_FILES_DIR))) consider(rel);
+    for (const rel of walkSessionFiles(root, path.join('sessions', id, SESSION_FILES_DIR))) consider(rel);
   }
   if (memory) {
     for (const rel of memoryRelsFor(root, sessionIds, memory.projects)) consider(rel);
@@ -252,6 +256,56 @@ export function mergeMemoryText(local: string, backup: string): string {
   }
   if (!extra.length) return local;
   return `${local.replace(/\s*$/, '')}\n${extra.join('\n')}\n`;
+}
+
+/**
+ * **会话 files/ 里不同步的依赖目录** ——「S3 里只存代码」。
+ *
+ * files/ 现在是会话的工作目录，模型会在里面 `pip install -t build/`、`npm install`、建 venv。
+ * 实测把旧的 Downloads 输出搬进来之后，三条会话的 files/ 是 1.4G / 689M / 99M、合计九万个文件，
+ * 去掉依赖之后只剩几十个 —— 全是可以重新装出来的东西，传上去只会把同步拖死。
+ *
+ * 按**内容**认依赖目录，不按名字猜：`build/` 有时是依赖（`pip install -t build`），有时是产出。
+ *   · 名字是公认的依赖/缓存目录；
+ *   · 或者里面有 `pyvenv.cfg`（venv）；
+ *   · 或者里面有 `*.dist-info`（`pip install -t` 装出来的）；
+ *   · 或者里面有 `.git`（clone 下来的代码仓库，正本在 git 远端）。
+ * 点开头的（`.venv` / `.git`）`walk` 本来就跳过。
+ */
+const DEP_DIR_NAMES = new Set(['node_modules', '__pycache__', 'site-packages', 'venv', 'cdk.out', 'bower_components']);
+export function isDependencyDir(abs: string, name: string): boolean {
+  if (DEP_DIR_NAMES.has(name)) return true;
+  let kids: string[];
+  try { kids = fs.readdirSync(abs); } catch { return false; }
+  /* 带 .git 的是 clone 下来的代码仓库 ——「code repo 和大块东西不用动」：它在 git 远端有正本，不进备份 */
+  return kids.includes('.git') || kids.includes('pyvenv.cfg') || kids.some((k) => k.endsWith('.dist-info'));
+}
+
+/**
+ * 压缩包 / 安装包不进备份 ——「提到 200MB，但 .zip/.pkg 这类安装包和压缩包不传」。
+ * 会话里的这类文件几乎都是部署产物（打包的 Lambda、下载的 AWS CLI 安装器），能重新生成或重新下载。
+ * 只对会话 files/ 生效：attachments/ 里的是用户自己贴进来的，照常同步。
+ */
+const ARCHIVE_EXT = /\.(zip|pkg|dmg|msi|exe|deb|rpm|iso|tar|tgz|gz|bz2|xz|7z|rar|whl|jar|war)$/i;
+export function isArchiveFile(name: string): boolean {
+  return ARCHIVE_EXT.test(name);
+}
+
+/** 会话 files/ 的列举：和 `walk` 一样，但跳过依赖目录（见 `isDependencyDir`）和压缩包/安装包。 */
+export function walkSessionFiles(root: string, rel: string): string[] {
+  const abs = path.join(root, rel);
+  let entries: fs.Dirent[];
+  try { entries = fs.readdirSync(abs, { withFileTypes: true }); } catch { return []; }
+  const out: string[] = [];
+  for (const e of entries) {
+    if (e.name.startsWith('.')) continue;
+    const childRel = path.join(rel, e.name);
+    if (e.isDirectory()) {
+      if (isDependencyDir(path.join(abs, e.name), e.name)) continue;
+      out.push(...walkSessionFiles(root, childRel));
+    } else if (!isArchiveFile(e.name)) out.push(childRel);
+  }
+  return out;
 }
 
 /** 相对路径递归列举。目录不存在就当空 —— 没有 `pasted/` 不是错误。 */

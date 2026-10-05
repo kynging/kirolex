@@ -21,7 +21,7 @@ import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
-  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles,
   decideMemory, memoryRelsFor,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
@@ -3466,7 +3466,7 @@ function catalogEntriesFor(
     /* 分组用 —— 恢复列表是一次 GET 拿整张 catalog，不该为了分组再去下几十个 record.json */
     project: projectOf(r) || undefined,
     updatedAt: r.updatedAt || 0,
-    bytes: [...SESSION_FILES, ...walk(path.join(KIROLEX_HOME, 'sessions', r.id), SESSION_FILES_DIR)].reduce((sum, f) => {
+    bytes: [...SESSION_FILES, ...walkSessionFiles(path.join(KIROLEX_HOME, 'sessions', r.id), SESSION_FILES_DIR)].reduce((sum, f) => {
       try { return sum + fs.statSync(path.join(KIROLEX_HOME, 'sessions', r.id, f)).size; } catch { return sum; }
     }, 0),
     from: machine,
