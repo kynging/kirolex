@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
-  lineBlocks, reviewPrompt, hasFeedback, dropSpan, headingLevel, displayGroups, mdLine, isRuleLine,
+  pageBlocks, lineBlocks, reviewPrompt, hasFeedback, dropSpan, headingLevel, displayGroups, mdLine, isRuleLine,
   spanRange, sliceLines, spliceLines,
 } from '../src/renderer/reviewBlocks.ts';
 
@@ -93,9 +93,42 @@ describe('提交出去的那条提示词', () => {
     assert.match(out, /请\*\*就地改这一份文件\*\*（\/tmp\/a b\/中文 名字\.md），不要另存成新文件/);
   });
 
-  test('没有 deck 那几节 —— 这条分支只有文本', () => {
+  test('文本文件不带 deck 那几节（讲稿 / 允许动结构）—— 那是 deck 才有的开关', () => {
     const out = reviewPrompt({ path, blocks: lines(3), comments: { 1: 'x' } });
     assert.doesNotMatch(out, /演讲者备注|结构可以改|加页/);
+  });
+});
+
+describe('deck：逐页', () => {
+  test('页码从 1 开始；页数拿不到就没有块', () => {
+    const b = pageBlocks(2);
+    assert.deepEqual(b.map((x) => x.index), [1, 2]);
+    assert.equal(b[0].kind, 'page');
+    for (const bad of [null, undefined, 0, -1, 2.5]) assert.deepEqual(pageBlocks(bad as any), []);
+  });
+
+  test('锚点措辞跟着块的类型 —— 页', () => {
+    const out = reviewPrompt({ path: '/a.pptx', blocks: pageBlocks(14), comments: { 2: '太挤' } });
+    assert.match(out, /^\/a\.pptx 逐页意见（共 14 页）：$/m);
+    assert.match(out, /- 第 2 页：太挤/);
+    assert.match(out, /（其余 13 页无意见）/);
+  });
+
+  test('版面意见和讲稿意见分两节；整页删掉时不再带它的讲稿意见', () => {
+    const blocks = pageBlocks(5);
+    const out = reviewPrompt({ path: '/a.pptx', blocks, comments: { 2: '这页图太密' }, noteComments: { 2: '别提竞品', 5: 'x' }, dropped: { 5: true } });
+    assert.match(out, /逐页意见（幻灯片本身）/);
+    assert.match(out, /演讲者备注的意见（notes，不是幻灯片上的字）/);
+    assert.match(out, /- 第 2 页备注：别提竞品/);
+    assert.doesNotMatch(out, /第 5 页备注/);
+    assert.ok(hasFeedback({ path: '/a.pptx', blocks, noteComments: { 3: '太长' } }), '只有讲稿意见也能提交');
+  });
+
+  test('`deckRework` 明说可以动结构但保住母版；`notesFinal` 明说别动讲稿', () => {
+    const out = reviewPrompt({ path: '/a.pptx', blocks: pageBlocks(3), comments: { 1: 'x' }, deckRework: true, notesFinal: true });
+    assert.match(out, /结构可以改/);
+    assert.match(out, /母版、主题配色、版式和现有图片保留/);
+    assert.match(out, /不要修改 notes 的内容/);
   });
 });
 

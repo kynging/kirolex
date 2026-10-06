@@ -61,7 +61,14 @@ import {
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
-import { parseRevised, reviseInSessionPrompt, replyUsable } from './reviseBlock.ts';
+import { parseRevised, reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
+import {
+  SOFFICE_BUNDLE_PATHS, SOFFICE_PATH_NAMES, pickConverter, sofficeBinary, pathProbeCommand, firstProbeHit,
+  installConverterCmd, noConverterWhy, pythonCandidates, PPTX_PROBE_SCRIPT, pythonEnv, noPythonPptxWhy,
+  previewKey, needsConversion, isPreviewable, canEditDeck, NOTES_SCRIPT, WRITE_NOTE_SCRIPT, SLIDE_TEXT_SCRIPT,
+  SLIDE_OPS_SCRIPT, WRITE_SLIDE_TEXT_SCRIPT, parseSlideRuns, parseWriteNote, parseNotesResult,
+} from './deckPreview.ts';
+import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -9380,6 +9387,36 @@ app.whenReady().then(async () => {
   });
 
   /**
+   * 发一轮给这条会话，**等这一轮成功收尾的那份完整回复** —— 侧栏 review 的两条「✓ 确认」（文本一块 /
+   * deck 一页）共用这一份，等待者的挂、摘、超时只写一遍。调用方已经排好队、挂回来、等到空闲。
+   *
+   *   · 兜底超时 8 分钟：等不到就报错**并把等待者摘掉** —— 留着它的话，这条会话下一轮正常对话的回复
+   *     会被当成这次改写的结果；
+   *   · 这一发走完了却没兑付 = 这一轮不是正常收尾（被取消、出错后没重发成、priming 吃掉了）——
+   *     那条路上 flush 的是半截输出，不能拿去写盘（见 `askWaiters`）。
+   */
+  const askOnce = (sessionId: string, prompt: string, displayText: string): Promise<{ text: string; stopReason: string; wedged: boolean }> =>
+    new Promise((resolve, reject) => {
+      const timer = setTimeout(() => {
+        askWaiters.delete(sessionId);
+        reject(new Error('等了 8 分钟没等到回复'));
+      }, 8 * 60 * 1000);
+      askWaiters.set(sessionId, { resolve, timer });
+      /** 还挂着的是**这一次**的等待者就摘掉 —— 返回摘没摘 */
+      const drop = (): boolean => {
+        const w = askWaiters.get(sessionId);
+        if (w && w.timer === timer) { askWaiters.delete(sessionId); clearTimeout(w.timer); return true; }
+        return false;
+      };
+      sendPromptOnce(sessionId, [{ type: 'text', text: prompt }], undefined, { displayText }).then(() => {
+        if (drop()) reject(new Error('这一轮没有正常结束（被取消或没有回复）'));
+      }, (err: any) => {
+        drop();
+        reject(err);
+      });
+    });
+
+  /**
    * 侧栏 review 的改写 —— **在打开这份文件的那条会话里做**（「否则新的 session 缺少必要的上下文」）。
    *
    * 判据（提示词、输出清洗、"改不了"的记号、什么样的回复能写盘）在 `reviseBlock.ts`，纯的、有测试。
@@ -9423,39 +9460,11 @@ app.whenReady().then(async () => {
       });
       const started = Date.now();
       try {
-        const reply = await new Promise<{ text: string; stopReason: string; wedged: boolean }>((resolve, reject) => {
-          /*
-            兜底超时：整份重写实测几十秒到几分钟。等不到就报错**并把等待者摘掉** ——
-            留着它的话，这条会话下一轮正常对话的回复会被当成这次改写的结果。
-          */
-          const timer = setTimeout(() => {
-            askWaiters.delete(sessionId);
-            reject(new Error('等了 8 分钟没等到回复'));
-          }, 8 * 60 * 1000);
-          askWaiters.set(sessionId, { resolve, timer });
-          /** 还挂着的是**这一次**的等待者就摘掉 —— 返回摘没摘 */
-          const drop = (): boolean => {
-            const w = askWaiters.get(sessionId);
-            if (w && w.timer === timer) { askWaiters.delete(sessionId); clearTimeout(w.timer); return true; }
-            return false;
-          };
-          sendPromptOnce(
-            sessionId,
-            [{ type: 'text', text: prompt }],
-            undefined,
-            /* 位置写进显示文本 —— 回头翻会话要看得出这条是说哪一处的 */
-            { displayText: input?.label ? `【改写 · ${input.label}】${note}` : `【改写】${note}` },
-          ).then(() => {
-            /*
-              这一发走完了却没兑付 = 这一轮不是正常收尾（被取消、出错后没重发成、priming 吃掉了）——
-              那条路上 flush 的是半截输出，不能拿去写盘。
-            */
-            if (drop()) reject(new Error('这一轮没有正常结束（被取消或没有回复）'));
-          }, (err: any) => {
-            drop();
-            reject(err);
-          });
-        });
+        const reply = await askOnce(
+          sessionId, prompt,
+          /* 位置写进显示文本 —— 回头翻会话要看得出这条是说哪一处的 */
+          input?.label ? `【改写 · ${input.label}】${note}` : `【改写】${note}`,
+        );
         const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
         if (!usable.ok) {
           logger.warn('revise', `in-session ${sessionId}: ${usable.why}`);
@@ -9473,6 +9482,436 @@ app.whenReady().then(async () => {
         return { ok: false, error: String(err?.message || err) };
       }
     }
+  });
+
+  /* ───────────────── 侧栏文件预览：PDF / deck（`.pptx` 等先转成 PDF）─────────────────
+   *
+   * 从 feature/flow 搬过来。判据全在 `deckPreview.ts`（纯的、有测试）：转换器在哪儿找、缓存 key 怎么算、
+   * 那几段 python-pptx 脚本、输出怎么解析。这里只负责探测、spawn、缓存、闸门。
+   *
+   * 闸门和文本那侧（`review:write-file`）同一套：路径按**标签页主人会话**解析（`resolveUserPath`），
+   * 写的只许是这条会话读过的（`reviewTarget`），写前二进制备份、备份不成不写。
+   */
+
+  /** 一次 LibreOffice 转换最多等多久。冷启动（第一次建 profile）在 Windows 上实测要慢不少，给足。 */
+  const PREVIEW_TIMEOUT_MS = 180_000;
+  /** 预览缓存留多少份。key 里有 deck 的 mtime，改一次就多一份，而旧那份再也不会命中。 */
+  const PREVIEW_CACHE_KEPT = 10;
+  const previewsRoot = path.join(os.homedir(), '.kirolex', 'previews');
+
+  /** 一个目录里只留按 mtime 最新的 N 项 —— 预览缓存用（备份那边在 `saveReviewBackup` 里自己清）。 */
+  const keepNewestIn = (dir: string, keep: number, what: string): void => {
+    try {
+      const old = fs.readdirSync(dir)
+        .map((n) => { const full = path.join(dir, n); try { return { full, t: fs.statSync(full).mtimeMs }; } catch { return null; } })
+        .filter((e): e is { full: string; t: number } => !!e)
+        .sort((a, b) => b.t - a.t)
+        .slice(keep);
+      for (const e of old) { try { fs.rmSync(e.full, { recursive: true, force: true }); } catch { /* 下次再说 */ } }
+      if (old.length) logger.info('prune', `${what}: 清掉 ${old.length} 份，留最近 ${keep} 份`);
+    } catch { /* 目录不存在就什么都不做 */ }
+  };
+
+  /**
+   * 能跑 python-pptx 的那个解释器 —— **只缓存找到了的结果**。
+   *
+   * 候选按平台给（`pythonCandidates`：Windows 上是 `python` / `py -3`，没有 `python3`）。没找到不缓存：
+   * 你照提示 `pip install python-pptx` 之后，下一次打开就该能用，而不是要重启 KiroLex。
+   */
+  let pythonPptx: { cmd: string; args: string[] } | null = null;
+  const findPythonPptx = async (): Promise<{ cmd: string; args: string[] } | null> => {
+    if (pythonPptx) return pythonPptx;
+    for (const c of pythonCandidates(process.platform)) {
+      const ok = await new Promise<boolean>((resolve) => {
+        execFile(c.cmd, [...c.args, '-c', PPTX_PROBE_SCRIPT],
+          { timeout: 15_000, env: pythonEnv(process.env) as NodeJS.ProcessEnv, windowsHide: true },
+          (err, stdout) => resolve(!err && String(stdout || '').includes('ok')));
+      });
+      if (ok) { pythonPptx = c; logger.info('deck', `python-pptx via ${c.cmd} ${c.args.join(' ')}`.trim()); return c; }
+    }
+    return null;
+  };
+  /** 没有 python-pptx 时抛的那个错 —— 调用方据此把 `noPythonPptxWhy` 原样给界面，而不是一句 ENOENT。 */
+  class NoPythonPptx extends Error {}
+  /** 跑一段 python-pptx 脚本，文本走 stdin（讲稿动辄六百字、带引号换行，塞进 argv 迟早翻车）。 */
+  const runPy = async (script: string, args: string[], stdin = ''): Promise<string> => {
+    const py = await findPythonPptx();
+    if (!py) throw new NoPythonPptx(noPythonPptxWhy(process.platform));
+    return new Promise((resolve, reject) => {
+      const child = execFile(py.cmd, [...py.args, '-c', script, ...args],
+        { timeout: 60_000, maxBuffer: 4 * 1024 * 1024, env: pythonEnv(process.env) as NodeJS.ProcessEnv, windowsHide: true },
+        (err, stdout) => (err ? reject(err) : resolve(String(stdout || ''))));
+      child.stdin?.end(stdin, 'utf-8');
+    });
+  };
+  const pyError = (err: any): string => String(err?.message || err).slice(0, 300);
+
+  /**
+   * 这台机器上的 LibreOffice —— PATH（Windows 用 `where`，别处 `command -v`）优先，其次固定安装位置。
+   * 每次现找（几十毫秒）：装完回来点刷新就该能用，不能要求重启。
+   */
+  const findSoffice = (): { bin: string | null; looked: string[] } => {
+    const looked: string[] = [];
+    for (const name of SOFFICE_PATH_NAMES) {
+      looked.push(`PATH 上的 ${name}（${process.platform === 'win32' ? 'where' : 'command -v'}）`);
+      try {
+        const out = execSync(pathProbeCommand(name, process.platform), { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+        const hit = firstProbeHit(String(out || ''));
+        if (hit) return { bin: sofficeBinary(hit, (p) => fs.existsSync(p)), looked };
+      } catch { /* 没找到 —— `where` 找不到时退出码非零 */ }
+    }
+    looked.push(...SOFFICE_BUNDLE_PATHS);
+    return { bin: sofficeBinary(null, (p) => fs.existsSync(p)), looked };
+  };
+
+  /**
+   * 同一份 deck 只转一次 —— 见 `convertOnce` 文件头。dev 下 StrictMode 把 effect 跑两遍、
+   * 加上"读不到就 force 重转"那条退路，同一瞬间要两次很常见，而 LibreOffice 是单实例的。
+   */
+  const deckConversions = new ConvertOnce<{ ok: boolean; pdf?: string; why?: string }>();
+
+  /** 这份 PDF 的内容指纹 —— 渲染那侧靠它判断"要不要重新交给 pdf.js"（比路径可靠：缓存 key 每次都变）。 */
+  const pdfStamp = (p: string): string | null => {
+    try {
+      const { createHash } = require('crypto');
+      return createHash('sha1').update(fs.readFileSync(p)).digest('hex').slice(0, 16);
+    } catch { return null; }
+  };
+  const sha16 = (t: string): string => {
+    const { createHash } = require('crypto');
+    return createHash('sha1').update(t).digest('hex').slice(0, 16);
+  };
+
+  /**
+   * `.pptx` / `.docx`… → **一个 PDF**；`.pdf` 直接返回它自己（**不需要 LibreOffice**）。
+   *
+   * 返回的 `pdf` 是主进程这边的路径，渲染层拿它去 `preview:pdf-bytes` 换字节 —— 渲染层自己取不到 `file://`。
+   * 讲稿（`notes`）可降级：没有 python-pptx 时是 `null` 外加一句 `notesWhy`，预览照样能看。
+   */
+  ipcMain.handle('preview:deck', async (_event, sessionId: string | null | undefined, rawPath: string, force?: boolean) => {
+    if (!String(rawPath || '').trim()) return { ok: false, why: '没有指定文件' };
+    let file: string;
+    try { file = resolveUserPath(String(rawPath), sessionId); } catch (e: any) { return { ok: false, why: String(e?.message || e) }; }
+    if (!isPreviewable(file)) return { ok: false, why: `这种文件不走这条预览：${path.basename(file)}` };
+    let stat: fs.Stats;
+    try { stat = fs.statSync(file); } catch { return { ok: false, why: `读不到这个文件：${file}` }; }
+    /* 预览本身就是"读过" —— 和 workspace:read 一样记在这条会话名下（写回的闸看这个） */
+    markReviewed(sessionId, file);
+    const editable = canEditDeck(file);
+
+    if (!needsConversion(file)) {
+      return { ok: true, pdf: file, pages: null, notes: null, pdfHash: pdfStamp(file), editable: false };
+    }
+
+    /* 讲稿先抽 —— 下面两条返回路径都要用它。抽不到不算失败，只是不显示那一列（并说清为什么） */
+    let notes: string[] | null = null;
+    let notesWhy: string | undefined;
+    if (editable) {
+      try {
+        notes = parseNotesResult(await runPy(NOTES_SCRIPT, [file]))?.notes ?? null;
+      } catch (err: any) {
+        notesWhy = err instanceof NoPythonPptx ? err.message : `读不出讲稿：${pyError(err)}`;
+      }
+    }
+
+    const key = previewKey({ path: file, mtimeMs: stat.mtimeMs, size: stat.size }, sha16);
+    const outDir = path.join(previewsRoot, key);
+    const cached = path.join(outDir, 'deck.pdf');
+    /* 缓存命中的条件是**这个 PDF 真的能读**（非空、首字节读得到），不是"目录里有个同名文件" */
+    const usable = (pdf: string): boolean => {
+      try {
+        if (fs.statSync(pdf).size <= 0) return false;
+        const fd = fs.openSync(pdf, 'r');
+        try { return fs.readSync(fd, Buffer.alloc(1), 0, 1, 0) === 1; } finally { fs.closeSync(fd); }
+      } catch { return false; }
+    };
+    const done = (pdf: string) => ({
+      ok: true, pdf, pages: null, notes, pdfHash: pdfStamp(pdf), editable,
+      ...(notesWhy ? { notesWhy } : null),
+    });
+    if (fs.existsSync(cached) && !force && usable(cached)) {
+      logger.info('preview', `cache hit ${file} key=${key}`);
+      return done(cached);
+    }
+    if (fs.existsSync(outDir)) {
+      logger.warn('preview', `stale cache dropped ${outDir} (force=${!!force})`);
+      fs.rmSync(outDir, { recursive: true, force: true });
+    }
+
+    const { bin: soffice, looked } = findSoffice();
+    if (!pickConverter({ soffice: !!soffice }) || !soffice) {
+      logger.warn('preview', `no converter for ${file} (looked: ${looked.join(' | ')})`);
+      /* `install` 单独给 —— 界面配一个一键复制，而不是让人从一段话里选中命令 */
+      return {
+        ok: false,
+        why: noConverterWhy({ platform: process.platform, looked, ext: path.extname(file) }),
+        install: installConverterCmd(process.platform),
+        noConverter: true,
+      };
+    }
+
+    /*
+      转到**临时目录再原子改名**：中途失败或超时留下的是半个 PDF，下一次会被当成缓存命中。
+      同一个 key 只转一次：并发的第二个请求**等**这一次的结果（见 `ConvertOnce`）。
+    */
+    const outcome = await deckConversions.run(key, async () => {
+      const stage = `${outDir}.partial-${Date.now()}`;
+      fs.mkdirSync(stage, { recursive: true });
+      try {
+        /* 自己那份 LO profile —— 不跟用户自己开着的 LibreOffice 抢默认 profile（见 `convertOnce`） */
+        const profile = path.join(os.homedir(), '.kirolex', LO_PROFILE_DIR);
+        fs.mkdirSync(profile, { recursive: true });
+        await new Promise<void>((resolve, reject) => {
+          execFile(soffice, [
+            userInstallationArg(profile),
+            '--headless', '--convert-to', 'pdf', '--outdir', stage, file,
+          ], { timeout: PREVIEW_TIMEOUT_MS, windowsHide: true }, (err) => (err ? reject(err) : resolve()));
+        });
+        const made = fs.readdirSync(stage).find((n) => /\.pdf$/i.test(n));
+        if (!made) throw new Error(`${soffice} 跑完了但没产出 PDF`);
+        fs.renameSync(path.join(stage, made), path.join(stage, 'deck.pdf'));
+        fs.rmSync(outDir, { recursive: true, force: true });
+        fs.renameSync(stage, outDir);
+        logger.info('preview', `converted ${file} via ${soffice} key=${key}`);
+        keepNewestIn(previewsRoot, PREVIEW_CACHE_KEPT, '预览缓存');
+        return { ok: true, pdf: cached };
+      } catch (err: any) {
+        fs.rmSync(stage, { recursive: true, force: true });
+        const why = err?.killed || /timed? ?out/i.test(String(err?.message || ''))
+          ? `转 PDF 超时（${PREVIEW_TIMEOUT_MS / 1000}s）—— 可以用顶栏「↗ 打开文件」交给系统应用`
+          : `转 PDF 失败：${String(err?.message || err).slice(0, 200)}`;
+        logger.warn('preview', `${file}: ${why}`);
+        return { ok: false, why };
+      }
+    });
+    if (!outcome.ok || !outcome.pdf) return { ok: false, why: outcome.why };
+    return done(outcome.pdf);
+  });
+
+  /**
+   * 把一个 PDF 的字节交给渲染层 —— **`file://` 在渲染层取不到**（dev 下 origin 是 `http://localhost:5173`，
+   * Chromium 不许它加载 `file://` 子资源，`fetch` 直接 `Failed to fetch`）。base64 和图片那条 `dataUrl` 同一个形状。
+   *
+   * 只给两种路径：我们自己的预览缓存（`~/.kirolex/previews` 下面），或者**这条会话读过的** `.pdf`。
+   * 不凭渲染进程说它想读哪儿 —— 这条通道能把盘上任何一个 PDF 的字节读出去。
+   */
+  ipcMain.handle('preview:pdf-bytes', async (_event, sessionId: string | null | undefined, rawPath: string) => {
+    let file: string;
+    try { file = resolveUserPath(String(rawPath || ''), sessionId); } catch { return { ok: false, why: '路径不对' }; }
+    if (!/\.pdf$/i.test(file)) return { ok: false, why: '只接受 .pdf 路径' };
+    const rel = path.relative(previewsRoot, file);
+    const inCache = !!rel && !rel.startsWith('..') && !path.isAbsolute(rel);
+    if (!inCache && !wasReviewed(sessionId, file)) {
+      logger.warn('preview', `refused pdf bytes: ${file} (session=${sessionId || '(none)'})`);
+      return { ok: false, why: '这个 PDF 不是这条会话的标签页打开过的' };
+    }
+    try {
+      const buf = fs.readFileSync(file);
+      return { ok: true, base64: buf.toString('base64'), bytes: buf.length };
+    } catch (err: any) {
+      return { ok: false, why: `读不到这个 PDF：${String(err?.message || err).slice(0, 160)}` };
+    }
+  });
+
+  /** deck 写盘那几条共用的闸：会话 + 路径 → 要写的那个 `.pptx`（解析、读过、只认 `.pptx`、页码）。 */
+  const deckTarget = (sessionId: string | null | undefined, filePath: string, page: number):
+    { ok: true; want: string; at: number } | { ok: false; error: string } => {
+    const t = reviewTarget(sessionId, filePath);
+    if (!t.ok) return t;
+    if (!canEditDeck(t.want)) return { ok: false, error: '只有 .pptx 能这么改（.ppt / .odp / 文档类只能预览和整体提交）' };
+    const at = Number(page);
+    if (!Number.isInteger(at) || at < 1) return { ok: false, error: '页码不对' };
+    return { ok: true, want: t.want, at };
+  };
+  /** 写前二进制备份；拷不成返回那句错误（调用方据此**不写**）。 */
+  const backupDeck = (want: string): string | null => {
+    try {
+      if (!saveReviewBackup(want, fs.readFileSync(want))) {
+        return '写前备份失败 —— 没有可回滚的副本，所以这次不改。检查 ~/.kirolex/backups 能不能写。';
+      }
+      return null;
+    } catch (e: any) { return String(e?.message || e); }
+  };
+
+  /**
+   * WRITE ONE SLIDE'S SPEAKER NOTES —— **一页一个 XML part，不重导整份**（见 `WRITE_NOTE_SCRIPT`）。
+   *
+   * 写完把所有页的备注重抽一遍返回 —— 界面要的是磁盘上那一份。顺手把已经转好的 PDF **搬到新 key 下面**：
+   * 改讲稿必然改 mtime（缓存 key 失效），而讲稿根本不进 PDF；这次改动是我们做的，我们清楚只有讲稿变了。
+   */
+  ipcMain.handle('deck:write-note', async (_event, sessionId: string | null | undefined, filePath: string, page: number, text: string) => {
+    const g = deckTarget(sessionId, filePath, page);
+    if (!g.ok) return g;
+    const { want, at } = g;
+    try {
+      const beforeStat = fs.statSync(want);
+      const bad = backupDeck(want);
+      if (bad) return { ok: false, error: bad };
+      const parsed = parseWriteNote(await runPy(WRITE_NOTE_SCRIPT, [want, String(at)], String(text ?? '')));
+      if (!parsed.ok) {
+        logger.warn('deck', `note write failed: ${parsed.error}`);
+        return { ok: false, error: parsed.error };
+      }
+      try {
+        const oldKey = previewKey({ path: want, mtimeMs: beforeStat.mtimeMs, size: beforeStat.size }, sha16);
+        const st2 = fs.statSync(want);
+        const newKey = previewKey({ path: want, mtimeMs: st2.mtimeMs, size: st2.size }, sha16);
+        const from = path.join(previewsRoot, oldKey);
+        const to = path.join(previewsRoot, newKey);
+        if (oldKey !== newKey && fs.existsSync(path.join(from, 'deck.pdf')) && !fs.existsSync(path.join(to, 'deck.pdf'))) {
+          fs.mkdirSync(to, { recursive: true });
+          /* 搬，不是拷 —— 旧 key 再也不会被查到，拷一份就是留一个死文件。跨设备 rename 失败才退回拷 */
+          try { fs.renameSync(path.join(from, 'deck.pdf'), path.join(to, 'deck.pdf')); } catch {
+            fs.copyFileSync(path.join(from, 'deck.pdf'), path.join(to, 'deck.pdf'));
+          }
+          try { fs.rmdirSync(from); } catch { /* 里面还有别的东西就留着 */ }
+          logger.info('deck', `carried preview cache ${oldKey} -> ${newKey} (notes-only edit)`);
+        }
+      } catch (err: any) {
+        logger.info('deck', `preview cache carry skipped: ${err?.message || err}`);
+      }
+      logger.info('deck', `wrote notes of page ${at} in ${path.basename(want)} (${String(text ?? '').length} chars)`);
+      return { ok: true, notes: parsed.notes };
+    } catch (error: any) {
+      return { ok: false, error: error instanceof NoPythonPptx ? error.message : pyError(error) };
+    }
+  });
+
+  /**
+   * 写一页幻灯片上的文字 —— 按 run 地址逐个替换，格式一个字节不动（见 `WRITE_SLIDE_TEXT_SCRIPT`）。
+   * 普通函数，因为两个入口都要用它：`deck:write-slide-text`（渲染进程直接写）和 `deck:revise-slide-text`。
+   * 调用方已经过了 `deckTarget` 那道闸。
+   */
+  const writeSlideText = async (want: string, at: number, edits: Array<{ at: string; text: string }>): Promise<any> => {
+    const rows = (Array.isArray(edits) ? edits : [])
+      .filter((e) => e && typeof e.at === 'string' && /^\d+\.\d+\.\d+$/.test(e.at) && typeof e.text === 'string');
+    if (!rows.length) return { ok: false, error: '没有可写的改动（地址要形如 `2.0.0`）' };
+    /* 换行会把 stdin 那一行切断（一行一条 `地址<TAB>文本`）—— 换成空格，别把它写成两条 */
+    const payload = rows.map((e) => `${e.at}\t${e.text.replace(/[\r\n]+/g, ' ')}`).join('\n');
+    try {
+      const bad = backupDeck(want);
+      if (bad) return { ok: false, error: bad };
+      const parsed = parseSlideRuns(await runPy(WRITE_SLIDE_TEXT_SCRIPT, [want, String(at)], payload));
+      if (!parsed.ok) {
+        logger.warn('deck', `slide text write failed: ${parsed.error}`);
+        return { ok: false, error: parsed.error };
+      }
+      logger.info('deck', `wrote ${parsed.changed} run(s) on page ${at} of ${path.basename(want)}`);
+      return { ok: true, runs: parsed.runs, changed: parsed.changed ?? rows.length };
+    } catch (error: any) {
+      return { ok: false, error: error instanceof NoPythonPptx ? error.message : pyError(error) };
+    }
+  };
+
+  /**
+   * **动版面**：删框 / 加框 / 挪框 / 改字号 / 改项目符号 / 改层级（见 `SLIDE_OPS_SCRIPT`）。
+   * 和 `writeSlideText` 并排而不是合并：那条一个字节都不多动，这条会改结构 —— 但闸和备份是同一套。
+   */
+  const writeSlideOps = async (want: string, at: number, ops: any[]): Promise<any> => {
+    const rows = (Array.isArray(ops) ? ops : []).filter((o) => o && typeof o.op === 'string');
+    if (!rows.length) return { ok: false, error: '没有可执行的版面指令' };
+    try {
+      const bad = backupDeck(want);
+      if (bad) return { ok: false, error: bad };
+      const parsed = parseSlideRuns(await runPy(SLIDE_OPS_SCRIPT, [want, String(at)], rows.map((o) => JSON.stringify(o)).join('\n')));
+      if (!parsed.ok) {
+        logger.warn('deck', `slide ops failed: ${parsed.error}`);
+        return { ok: false, error: parsed.error };
+      }
+      logger.info('deck', `slide ops: ${parsed.changed ?? rows.length} 条生效 on page ${at} of ${path.basename(want)}`);
+      return { ok: true, runs: parsed.runs, changed: parsed.changed ?? rows.length };
+    } catch (error: any) {
+      return { ok: false, error: error instanceof NoPythonPptx ? error.message : pyError(error) };
+    }
+  };
+
+  /**
+   * 一步做完：**问那条会话这一页的文字该怎么改，然后自己写进去** —— 「现在就做一个工具吧」。
+   *
+   * 一次往返（模型只出 `地址<TAB>新文本` 和几条版面指令），落盘由 python-pptx 按地址做 ——
+   * 格式一个字节不动。对照：让它自己写 python-pptx 代码时实测九次往返、四分多钟，工具只占 6 秒。
+   * **文字先改，版面后动**：版面一动形状下标就全变了，而文字那条用的是按下标的地址。
+   */
+  ipcMain.handle('deck:revise-slide-text', async (_event, input: {
+    sessionId: string; filePath: string; page: number; note: string;
+  }) => {
+    const sid = String(input?.sessionId || '').trim();
+    const note = String(input?.note || '').trim();
+    if (!sid) return { ok: false, error: '这份文件没有归属会话 —— 没地方问' };
+    if (!note) return { ok: false, error: '没有意见' };
+    const g = deckTarget(sid, String(input?.filePath || ''), Number(input?.page));
+    if (!g.ok) return g;
+    const { want, at: page } = g;
+    if (!(await findPythonPptx())) return { ok: false, error: noPythonPptxWhy(process.platform) };
+    return enqueueRevise(sid, async () => {
+      await ensureAttached(sid);
+      if (!sessionClients.get(sid)) return { ok: false, error: '这条会话连不上 —— 点一下它让它连上再试' };
+      const stillBusy = await waitIdle(sid, 20 * 60 * 1000);
+      if (stillBusy) return { ok: false, error: `等了 20 分钟这条会话还在忙（${stillBusy}）` };
+      if (askWaiters.has(sid)) return { ok: false, error: '这条会话上已经有一次改写在等回复' };
+      try {
+        /* 先把这一页现有的文字读出来 —— 模型要按地址回，就得先看见地址 */
+        const cur = parseSlideRuns(await runPy(SLIDE_TEXT_SCRIPT, [want, String(page)]));
+        if (!cur.ok) return { ok: false, error: cur.error };
+        if (!cur.runs.length && !cur.shapes?.length) return { ok: false, error: '这一页没有可改的文字（可能只有图）' };
+        const prompt = reviseSlideTextPrompt({
+          runs: cur.runs, note, page, path: want,
+          ...(cur.shapes?.length ? { shapes: cur.shapes } : null),
+          ...(cur.page ? { pageW: cur.page.w, pageH: cur.page.h } : null),
+        });
+        const started = Date.now();
+        const reply = await askOnce(sid, prompt, `【改写 · ${path.basename(want)} 第 ${page} 页版面文字】${note}`);
+        const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
+        if (!usable.ok) return { ok: false, error: usable.why };
+        const got = parseSlideEdits(reply.text);
+        if (!got.edits.length && !got.ops.length) {
+          /* 一条都没解析出来时把它回的原话记下来 —— 否则这个失败查不了 */
+          if (!got.cannot) logger.warn('deck', `slide text: 一条都没解析出来 (page ${page})，它回的是：\n${String(reply.text).slice(0, 600)}`);
+          return { ok: false, ...(got.cannot ? { cannot: got.cannot } : { error: '它没有给出可用的改动行' }) };
+        }
+        logger.info('deck', `slide: ${got.edits.length} 处文字 + ${got.ops.length} 条版面指令 for page ${page}`
+          + ` in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        let changed = 0;
+        if (got.edits.length) {
+          const wroteText = await writeSlideText(want, page, got.edits);
+          if (!wroteText?.ok) return wroteText;
+          changed += Number(wroteText.changed) || 0;
+        }
+        if (got.ops.length) {
+          const wroteOps = await writeSlideOps(want, page, got.ops);
+          if (!wroteOps?.ok) {
+            /* 文字已经改进去了就不算全败 —— 说清哪一半没成 */
+            return got.edits.length
+              ? { ok: true, changed, partial: `版面那几条没做成：${wroteOps.error}` }
+              : wroteOps;
+          }
+          changed += Number(wroteOps.changed) || 0;
+        }
+        return { ok: true, changed };
+      } catch (err: any) {
+        logger.warn('deck', `slide text revise failed: ${err?.message || err}`);
+        return { ok: false, error: err instanceof NoPythonPptx ? err.message : String(err?.message || err) };
+      }
+    }, `${path.basename(want)} 第 ${page} 页版面文字`);
+  });
+
+  ipcMain.handle('deck:read-slide-text', async (_event, sessionId: string | null | undefined, filePath: string, page: number) => {
+    const g = deckTarget(sessionId, filePath, page);
+    if (!g.ok) return g;
+    try {
+      const parsed = parseSlideRuns(await runPy(SLIDE_TEXT_SCRIPT, [g.want, String(g.at)]));
+      return parsed.ok ? { ok: true, runs: parsed.runs } : { ok: false, error: parsed.error };
+    } catch (error: any) {
+      return { ok: false, error: error instanceof NoPythonPptx ? error.message : pyError(error) };
+    }
+  });
+
+  ipcMain.handle('deck:write-slide-text', async (
+    _event, sessionId: string | null | undefined, filePath: string, page: number, edits: Array<{ at: string; text: string }>,
+  ) => {
+    const g = deckTarget(sessionId, filePath, page);
+    if (!g.ok) return g;
+    return writeSlideText(g.want, g.at, edits);
   });
 
   /** Manual rebuild. `force` also covers the case a successful session/load

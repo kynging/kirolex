@@ -8444,3 +8444,142 @@ button, input, select, textarea {
 .rv-review-submit .rv-gate-pass:disabled { opacity: .4; cursor: default; filter: none; }
 .rv-review-sent { margin: 0; font-size: 10px; line-height: 1.6; color: var(--accent); }
 .rv-review-warn { margin: 0; font-size: 10px; line-height: 1.6; color: var(--error); }
+
+/* ── 侧栏文件预览：PDF / deck（`ReviewPane` 的 deck 那一半 + `PdfView`）──────────────────────────
+   从 feature/flow 原样搬过来；后面那几条是这条分支自己加的（定位覆盖、没有 LibreOffice 时的说明）。 */
+.rv-review-loading, .rv-review-why {
+  font-size: 12px; line-height: 1.7; color: var(--text-secondary); white-space: pre-wrap;
+}
+.rv-review-blocked { gap: 12px; align-items: flex-start; }
+.rv-review-pagecell.dropped .rv-review-anchor {
+  text-decoration: line-through; text-decoration-color: var(--error); opacity: .6;
+}
+.rv-review-anchor { font-size: 10px; color: var(--text-tertiary); letter-spacing: .02em; }
+.rv-pdf-below { width: 100%; }
+.rv-zoom-tools { width: 100%; margin-top: 10px; display: flex; flex-direction: column; gap: 6px; }
+.rv-page-tools { display: flex; align-items: center; gap: 6px; padding: 4px 0 0; }
+.rv-page-tools-hint { font-size: 9px; color: var(--text-tertiary); }
+.rv-page-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.rt-block-drop.rv-drop-page {
+  width: auto; height: 20px; padding: 0 7px; white-space: nowrap; font-size: 10px;
+  opacity: .6; pointer-events: auto;
+}
+.rt-block-drop.rv-drop-page:hover { opacity: 1; border-color: var(--error); color: var(--error); }
+.rt-block-drop.rv-drop-page.on { opacity: 1; color: var(--error); border-color: var(--error); }
+.rv-review-pagerow {
+  list-style: none; margin: 0; padding: 0;
+  display: flex; flex-wrap: wrap; gap: 6px;
+}
+.rv-review-pagecell {
+  position: relative; padding: 4px 8px; min-width: 96px;
+  border: 1px solid var(--border); border-radius: 5px; background: var(--bg-tertiary);
+}
+.rv-review-pagecell.dropped { border-color: var(--error); opacity: .7; }
+.rv-review-pdf {
+  flex: 1 1 auto; width: 100%; min-height: 420px; border: 1px solid var(--border);
+  border-radius: 6px; background: var(--bg-tertiary);
+  display: flex; flex-direction: column;
+}
+.rv-review:has(.rv-review-pdf) { overflow: hidden; height: 100%; }
+.rv-pdf-row {
+  display: flex; gap: 10px; align-items: flex-start; flex: 0 0 auto;
+}
+.rv-pdf-cell {
+  flex: 1 1 auto; min-width: 0; position: relative;
+  display: flex; flex-direction: column;
+}
+.rv-pdf-cell > .rv-page-tools { margin-top: auto; }
+.rv-pdf-side {
+  flex: 0 0 var(--rv-side-w, clamp(240px, 34%, 460px));
+  align-self: stretch;
+  /* 备注的入口现在是那个带边框格子的**兄弟**（「不要让 comment 按钮在 note 框内」）——
+     所以这一栏自己排：格子占满上面，入口那一行压在最下面，和页底下那个齐平 */
+  display: flex; flex-direction: column;
+}
+.rv-pdf-side > .rv-review-pagecell { flex: 1 1 auto; }
+.rv-pdf-side > .rv-page-tools { margin-top: auto; }
+.rv-pdf-grip {
+  flex: none; width: 6px; margin: -4px -3px; align-self: stretch;
+  cursor: col-resize; background: transparent;
+  position: relative; z-index: 3; isolation: isolate;
+  transition: background .12s;
+}
+.rv-pdf-pages:has(.rv-pdf-grip:hover) .rv-pdf-grip,
+.rv-pdf-grip:hover { background: color-mix(in srgb, var(--accent) 55%, transparent); }
+body.rv-col-resizing { cursor: col-resize; user-select: none; }
+body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
+.rv-review-note {
+  font-size: 11px; line-height: 1.65; color: var(--text-secondary);
+  white-space: pre-wrap;
+}
+.rv-review-note.empty { color: var(--text-tertiary); font-style: italic; }
+.rv-pdf { display: flex; flex-direction: column; min-height: 0; flex: 1 1 auto; overflow: hidden; }
+.rv-pdf-pages {
+  flex: 1 1 auto; min-height: 0; overflow-y: auto; overflow-x: hidden;
+  display: flex; flex-direction: column; gap: 8px;
+}
+.rv-pdf-page { display: block; border-radius: 4px; background: #fff; }
+.rv-pdf-progress { margin: 0 0 6px; font-size: 11px; color: var(--text-tertiary); }
+.rv-pdf-mark {
+  position: absolute; top: 6px; right: 6px; z-index: 2;
+  display: flex; gap: 4px; align-items: center; pointer-events: auto;
+}
+.rv-pdf-mark-note, .rv-pdf-mark-drop {
+  font-size: 10px; line-height: 1; padding: 3px 6px; border-radius: 999px;
+  /* 半透明底 + 描边：底下是幻灯片，什么颜色都可能，没有底的话字会糊在图上 */
+  background: rgba(0, 0, 0, .62); border: 1px solid var(--accent);
+  color: var(--accent); white-space: nowrap;
+}
+.rv-pdf-mark-note { cursor: pointer; }
+.rv-pdf-mark-note:hover { background: rgba(0, 0, 0, .82); }
+.rv-pdf-mark-drop { border-color: var(--error); color: var(--error); }
+.rv-review-pagecell .rv-note-tools { position: static; }
+.rv-pdf-side { display: flex; }
+.rv-review-pagecell { flex: 1 1 auto; display: flex; flex-direction: column; min-width: 0; }
+.rv-page-tools-hint b { font-weight: 600; color: var(--text-secondary); }
+.rv-pdf-mark-note.note { border-color: var(--warning, #d09a3c); color: var(--warning, #d09a3c); }
+.rv-pdf-page-why {
+  margin: 2px 0 0; font-size: 10px; color: var(--error);
+  background: rgba(0, 0, 0, .5); padding: 3px 6px; border-radius: 4px;
+}
+.rv-zoom {
+  position: absolute; inset: 0; z-index: 30;
+  display: flex; flex-direction: column; gap: 8px;
+  background: rgba(0, 0, 0, .82); padding: 10px;
+}
+.rv-zoom-bar { display: flex; align-items: center; gap: 6px; flex: 0 0 auto; }
+.rv-zoom-bar .btn { padding: 2px 8px; font-size: 12px; }
+.rv-zoom-at { font-size: 11px; color: var(--text-secondary); min-width: 62px; text-align: center; }
+.rv-zoom-gap { flex: 1 1 auto; }
+.rv-zoom-body { flex: 1 1 auto; min-height: 0; overflow: auto; text-align: center; }
+.rv-zoom-page { display: block; margin: 0 auto; background: #fff; border-radius: 4px; }
+.rv-zoom-note {
+  margin: 10px auto 0; max-width: 900px; text-align: left;
+  font-size: 12px; line-height: 1.7; color: var(--text-secondary); white-space: pre-wrap;
+}
+.rv-pdf-cell { cursor: zoom-in; }
+.rv-pdf-cell:focus-visible { outline: 1px solid var(--accent); outline-offset: 2px; }
+
+/*
+  页底下 / 讲稿底下那一行里的 💬 和「✕ 删掉这一页」**在流里**，不是绝对定位 —— 上面文本那侧把
+   .rv-review .rt-note-btn 钉成了贴着那一行右上角的 absolute；在 deck 那侧它会跑到幻灯片的右上角去。
+*/
+.rv-review .rv-page-tools .rt-note-btn,
+.rv-review .rv-page-tools .rt-block-drop,
+.rv-review .rt-block-drop.rv-drop-page { position: static; opacity: .8; }
+.rv-review .rt-block-drop.rv-drop-page { width: auto; padding: 0 7px; white-space: nowrap; }
+/*
+  **给 PDF 一块确定的高度** —— 页在 .rv-pdf-pages 里自己滚，放大浮层（.rv-zoom，absolute inset 0）
+  盖住的就是看得见的那一块，而不是整份文档那么高。
+*/
+.workspace-file-modal-body:has(.rv-review-pdf) { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+.workspace-file-modal-body:has(.rv-review-pdf) > .workspace-viewer-path { flex: none; }
+.rv-review:has(.rv-review-pdf) { flex: 1 1 auto; min-height: 0; }
+/* 讲稿为什么没有（没装 python-pptx）—— 一行小字，不抢 PDF 的位置 */
+.rv-review-hint { margin: 0; font-size: 10px; line-height: 1.6; color: var(--text-tertiary); white-space: pre-wrap; }
+/* 没有 LibreOffice 时那条安装命令 + 复制按钮 */
+.rv-review-install { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.rv-review-install code {
+  font-size: 11px; padding: 3px 7px; border-radius: 4px;
+  background: var(--bg-tertiary); border: 1px solid var(--border); user-select: all;
+}

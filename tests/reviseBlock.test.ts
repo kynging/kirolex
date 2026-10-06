@@ -104,9 +104,14 @@ describe('主进程接线', () => {
     assert.match(body, /return enqueueRevise\(sessionId, async \(\) => reviseOnce\(\), input\?\.label \|\| '改写'\);/);
     assert.match(body, /await ensureAttached\(sessionId\);/);
     assert.match(body, /const stillBusy = await waitIdle\(sessionId, 20 \* 60 \* 1000\);/);
-    assert.match(body, /askWaiters\.delete\(sessionId\);\s*\n\s*reject\(new Error\('等了 8 分钟没等到回复'\)\);/);
     assert.match(body, /if \(askWaiters\.has\(sessionId\)\) return \{ ok: false/);
+    assert.match(body, /const reply = await askOnce\(/);
     assert.match(body, /replyUsable\(/);
+    /* 等待者的挂、摘、超时只有一份（`askOnce`），文本一块和 deck 一页共用 */
+    const ask = MAIN.slice(MAIN.indexOf('const askOnce = '), MAIN.indexOf('const askOnce = ') + 1200);
+    assert.match(ask, /askWaiters\.delete\(sessionId\);\s*\n\s*reject\(new Error\('等了 8 分钟没等到回复'\)\);/);
+    assert.match(ask, /if \(drop\(\)\) reject\(new Error\('这一轮没有正常结束/);
+    assert.equal((MAIN.match(/await askOnce\(/g) || []).length, 2);
   });
 
   test('等待者**只在一轮成功收尾时**兑付 —— 出错/取消那两条 flush 的是半截输出', () => {

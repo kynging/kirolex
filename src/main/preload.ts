@@ -409,6 +409,24 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 只拷一份（「提交给这份文件的会话」那条路：会话自己改文件，走不到上面那道写前备份）。 */
   reviewBackupFile: (sessionId: string | null | undefined, filePath: string) =>
     ipcRenderer.invoke('review:backup-file', sessionId, filePath),
+  /** `.pptx`/`.docx`… → 一个 PDF（`.pdf` 直通，不需要 LibreOffice）+ 讲稿。路径按 `sessionId` 解析。 */
+  previewDeck: (sessionId: string | null | undefined, filePath: string, force?: boolean) =>
+    ipcRenderer.invoke('preview:deck', sessionId, filePath, force),
+  /** PDF 的字节（base64）—— 渲染层取不到 `file://`。只给预览缓存里的，或这条会话读过的 `.pdf`。 */
+  previewPdfBytes: (sessionId: string | null | undefined, pdfPath: string) =>
+    ipcRenderer.invoke('preview:pdf-bytes', sessionId, pdfPath),
+  /** 改**一页**的演讲者备注（一页一个 XML part，不重导整份）—— 写前备份。 */
+  deckWriteNote: (sessionId: string | null | undefined, filePath: string, page: number, text: string) =>
+    ipcRenderer.invoke('deck:write-note', sessionId, filePath, page, text),
+  /** 问打开这份 deck 的会话这一页的字该怎么改，KiroLex 按 run 地址写进去（正忙就排队）。 */
+  deckReviseSlideText: (input: { sessionId: string; filePath: string; page: number; note: string }) =>
+    ipcRenderer.invoke('deck:revise-slide-text', input),
+  /** 读一页幻灯片上的文字（按 run 地址）。 */
+  deckReadSlideText: (sessionId: string | null | undefined, filePath: string, page: number) =>
+    ipcRenderer.invoke('deck:read-slide-text', sessionId, filePath, page),
+  /** 按 run 地址直接写一页的文字（`地址` 形如 `2.0.0`）。 */
+  deckWriteSlideText: (sessionId: string | null | undefined, filePath: string, page: number, edits: Array<{ at: string; text: string }>) =>
+    ipcRenderer.invoke('deck:write-slide-text', sessionId, filePath, page, edits),
   /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）。 */
   sessionNote: (sessionId: string, text: string) => ipcRenderer.invoke('session:note', sessionId, text),
   /** Watch exactly these files for on-disk edits, replacing any previous set.

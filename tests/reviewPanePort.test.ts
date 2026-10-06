@@ -44,9 +44,20 @@ describe('入口', () => {
     assert.match(APP, /\) : isMarkdownPath\(fileViewer\.path\) && !fileViewerRaw \? \(/);
   });
 
-  test('没有 PDF / deck 那一半', () => {
-    assert.doesNotMatch(RV, /PdfView|previewDeck|deckWriteNote/);
-    assert.doesNotMatch(APP, /PdfView|previewDeck/);
+  test('PDF / deck 那一半由同一个 pane 管，不进 comment 开关（它们本来就是批注视图）', () => {
+    assert.match(RV, /<PdfView/);
+    assert.match(RV, /const on = isDeck \|\| !!commenting;/);
+    /* deck 的 hooks 全在早返回之前 —— 转换失败那支少走 hook 会让 React 报 hooks 数量不一致 */
+    const early = RV.indexOf('if (isDeck && why) {');
+    assert.ok(early > 0);
+    assert.ok(RV.lastIndexOf('useState', early) < early && RV.indexOf('useState(', early) < 0, '早返回之后不能再有 hook');
+    assert.ok(RV.indexOf('useMemo(', early) < 0 && RV.indexOf('useCallback(', early) < 0 && RV.indexOf('useEffect(', early) < 0);
+  });
+
+  test('deck 的「✓ 确认」只给能改的（有主人会话 + .pptx），否则只有「记下」+ 提交', () => {
+    assert.match(RV, /const live = !!sessionId && editable;/);
+    assert.match(RV, /\? \(live \? \(instruction: string\) => applySlideOne\(anchor, instruction\) : undefined\)/);
+    assert.match(RV, /window\.kiroApi\.deckWriteNote\?\.\(sessionId, path, page, res\.text\)/);
   });
 });
 

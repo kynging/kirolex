@@ -8,11 +8,13 @@
  *
  *   · `reviseInSessionPrompt`  发给那条会话的提示词（`block` 只回这一段 / `whole` 回整份）
  *   · `parseRevised`           回复 → 能直接拼回文件的正文，以及"改不了"的记号
+ *   · `reviseSlideTextPrompt` / `parseSlideEdits`  deck 预览里「✓ 确认」改一页幻灯片（按 run 地址改字 +
+ *                           几条动版面的指令），落盘由 `deckPreview` 那几段 python 做
  *
- * 门那侧另外两条（一次性 helper 子进程的 `revisePrompt`、「＋ 加一条」的 `insert` 档）和 PPT 那条
- * （按 run 地址改幻灯片文字）都没搬 —— 它们分别属于 flow 的门和 deck 预览，这边没有调用者。
+ * 门那侧另外两条（一次性 helper 子进程的 `revisePrompt`、「＋ 加一条」的 `insert` 档）没搬 —— 它们属于
+ * flow 的门，这边没有调用者。
  *
- * 发送、排队、等回复、写盘在 `index.ts`（`review:revise-in-session` / `review:write-file`），
+ * 发送、排队、等回复、写盘在 `index.ts`（`review:revise-in-session` / `review:write-file` / `deck:*`），
  * 这里只放"说什么"和"收到的怎么认"，所以全部可测。
  */
 
@@ -150,4 +152,237 @@ export function replyUsable(meta: { stopReason?: string | null; wedged?: boolean
   const r = String(meta.stopReason ?? '').trim();
   if (r && r !== 'end_turn' && r !== 'n/a') return { ok: false, why: `回复没有正常结束（${r}）—— 可能被截断，不写` };
   return { ok: true };
+}
+
+/**
+ * 改**一页幻灯片上的文字**那条提示词 —— PURE。
+ *
+ * 「现在就做一个工具吧」：这条路让模型**只出文本、不写代码** —— 编辑那一步由 KiroLex 按 run 地址
+ * 直接写（`WRITE_SLIDE_TEXT_SCRIPT`）。量过为什么值得：它自己写 python 时，九次调用每次跑 0.3–1.1 秒，
+ * 而相邻两次之间等模型 20–45 秒 —— 四分多钟里工具只占 6 秒。往返才是成本。
+ *
+ * 输出格式定成**一行一条 `地址<TAB>新文本`**，而不是 JSON：
+ *   · 文字里带引号、逗号、书名号都不用转义（JSON 会在这上面翻车，而这是一份中文 deck）；
+ *   · **只回改动的那几行** —— 没提到的 run 我一个字节都不动，所以它不必把整页抄一遍；
+ *   · 半截输出也能用：解析出几条就应用几条，而不是整个作废。
+ */
+export function reviseSlideTextPrompt(input: {
+  /**
+   * 这一页现在有哪些可改的文字（地址 + 原文），**外加各自的格式**。
+   *
+   * 格式那几项（字号/字体/缩进层级/项目符号）是「统一下格式」这类意见的唯一依据 ——
+   * 少了它们模型看不出哪一行大哪一行小，只能猜（见下面单独那一节）。
+   */
+  runs: Array<{ at: string; text: string; pt?: number; font?: string; lvl?: number; bullet?: string }>;
+  /** 用户写的那条意见。 */
+  note: string;
+  /** 第几页。 */
+  page: number;
+  /** 这份 deck 的路径 —— 一条会话里可能同时开着几份。 */
+  path?: string;
+  /**
+   * 这一页的**形状表** —— 加/删/挪框都要靠它（编号、当前位置大小、里面的字）。
+   *
+   * 「所以我甚至不能让 comment 添加或者修改页面上的文本框吗」：只给 run 的话，模型能动的就只有
+   * 已经存在的那几个字 —— 加一个框没有落点，删一个框没有编号。
+   */
+  shapes?: Array<{ i: number; kind: string; name: string; text?: string; l?: number; t?: number; w?: number; h?: number }>;
+  /** 页面尺寸（厘米）—— 放框的时候要知道边界在哪。 */
+  pageW?: number;
+  pageH?: number;
+}): string {
+  const list = (input.runs || []).map((r) => `${r.at}\t${r.text}`).join('\n');
+  /*
+    **形状表也摆出来** ——「所以我甚至不能让 comment 添加或者修改页面上的文本框吗，WTF」。
+    只给 run 的话，能改的就只有"已经存在的那几个字"：加一个框要有落点、删一个框要有编号、
+    挪一个框要知道它现在在哪。位置一律**厘米**（EMU 是 914400 分之一英寸，拿那种数字排版排不准）。
+  */
+  /* 有格式信息的那些才列 —— 全靠继承（什么都没设）的行列出来只是一堆 `-` */
+  const fmt = (input.runs || [])
+    .filter((r: any) => r.pt || r.font || r.lvl || (r.bullet && r.bullet !== '-'))
+    .map((r: any) => `${r.at}\t${r.pt ? `${r.pt}pt` : '-'}\t${r.font || '-'}\t${r.lvl ?? 0}\t${r.bullet || '-'}`)
+    .join('\n');
+  const shapes = (input.shapes || []).map((sh) => {
+    const geo = [sh.l, sh.t, sh.w, sh.h].every((v) => typeof v === 'number')
+      ? `位置 ${sh.l},${sh.t} 大小 ${sh.w}×${sh.h}cm`
+      : '（位置读不到）';
+    return `${sh.i}\t${sh.kind}\t${geo}\t${sh.name}${sh.text ? `\t「${sh.text}」` : ''}`;
+  }).join('\n');
+  return [
+    `按下面这条意见改**第 ${input.page} 页幻灯片**。${input.path ? `文件：${input.path}` : ''}`,
+    '',
+    '这一页可改的文字（`地址<TAB>原文`，地址是"形状.段.run"）：',
+    '---',
+    list || '（这一页没有可改的文字）',
+    '---',
+    ...(fmt ? [
+      '',
+      /*
+        **格式单独一节，不塞进上面那张表** ——「怎么有大 bullet 有小 bullet，统一下格式」。
+        塞进去的话那张表就有三列，而回复用的是**两列**（`地址<TAB>新文本`）——
+        模型很容易照着三列回，于是新文本里混进一段格式说明。输入和输出保持同构，这类错就不会有。
+      */
+      '这一页的格式（`地址<TAB>字号<TAB>字体<TAB>缩进层级<TAB>项目符号`；项目符号 `-` = 没设、跟版式走）：',
+      '---',
+      fmt,
+      '---',
+    ] : []),
+    ...(shapes ? [
+      '',
+      `这一页的形状（\`编号<TAB>类型<TAB>位置大小<TAB>名字[<TAB>里面的字]\`，页面 ${input.pageW ?? 25.4}×${input.pageH ?? 14.29}cm）：`,
+      '---',
+      shapes,
+      '---',
+    ] : []),
+    '',
+    '意见：',
+    String(input.note ?? '').trim(),
+    '',
+    '要求：',
+    '· **只回你要改的那几行**，一行一条，格式和上面一样：`地址<TAB>新文本`。',
+    '  没回的地址我一个字节都不动 —— 所以不必把整页抄一遍；',
+    '· 不要写解释、不要用 ``` 围栏、不要加序号或者项目符号；',
+    '· **一条文字要放在一行里** —— 换行会被当成下一条；',
+    /*
+      **删掉一段字要有说法** ——「我让他把 subtitle 删掉，不行吗」。
+
+      这条路原来只能"替换"：解析器故意丢掉空文本（空文本和"格式没对上"长得一模一样），
+      于是"把副标题删掉"这个意见在这里**没有表达方式** —— 模型回一行空的，被丢掉，
+      你看到的是"它没有给出可用的改动行"，像是它没听懂。
+
+      所以给一个明确的标记。用 `<DELETE>` 而不是"回一行空的"：一个写错格式的回复不该被当成
+      "清空这一行字"—— 那是不可逆的（原文只在备份里）。
+      顺带说清它只清文字、不删框：真要去掉那个框是结构改动，走 `CANNOT-REVISE-LOCALLY` 那条。
+    */
+    '· **要清掉某段文字**就把新文本写成 `<DELETE>`（例：`2.0.0\t<DELETE>`）——',
+    '  它只清字，框还留着（空框在导出的 PDF 上看不见，但它还占着位置）；',
+    '',
+    /*
+      **三条动版面的指令** —— 之前"加一个框 / 删掉这个空框 / 把它挪下去"全都只能回
+      `CANNOT-REVISE-LOCALLY`，然后走提交那条路（会话自己写 python，实测 2–4 分钟）。
+      而这三件事 python-pptx 各自只有一两行，判据全在 `SLIDE_OPS_SCRIPT` 里，实测都过了。
+
+      语法用 `指令 参数…` 这种一行一条的形状，和上面 `地址<TAB>文本` 同一个风格 —— 让它输出 JSON
+      的话，一个逗号写错整条就没了，而这里每一行都是独立的，坏一行不影响别的。
+    */
+    '· **删掉整个框/图**（连底板一起消失）：`DELETE-SHAPE <编号>`，编号取上面形状表里的；',
+    '· **加一个文本框**：`ADD-TEXT <左> <上> <宽> <高> <参考地址> <TAB> 文字`',
+    '  —— 前四个是厘米（照着形状表里那些数挑位置，别压到别的框上）；',
+    '  `<参考地址>` 是上面文字表里的一个地址，新框的字号/加粗/字体/颜色照抄它 ——',
+    '  写 `-` 表示不抄（那会是默认的黑色小字，在定过样式的页上一眼就是补丁）；',
+    '· **挪动或缩放**：`MOVE <编号> <左> <上> [<宽> <高>]`，不写宽高就保持原样；',
+    /*
+      **格式那三条** ——「怎么有大 bullet 有小 bullet，统一下格式，kirolex 处理不了？」
+      改字号是 run 上的事，项目符号和缩进是**段落**上的事，所以地址粒度不一样 —— 这必须说清，
+      否则它会拿 run 地址去设项目符号（那一段里三个 run 就会互相打三次）。
+    */
+    '· **改字号**：`SET-SIZE <地址> <磅值>`（地址是 `形状.段.run`，一行里可以只改半句）；',
+    '· **改项目符号**：`SET-BULLET <形状.段> <字符>` —— 写 `none` 就是不要符号；',
+    '  它设的是**真正的项目符号**（PowerPoint 自己画的那个），和"把 `●` 打进正文"是两回事：',
+    '  如果原文里的圆点是手打的字符（格式表里那一列是 `-`），统一它就直接改文字，别用这条；',
+    '· **改缩进层级**：`SET-LEVEL <形状.段> <0-8>` —— 层级决定缩进和符号大小；',
+    '· 这三条和 `地址<TAB>新文本` 可以混在一份回复里，一行一条；',
+    '· 只改这条意见说的地方。**要换图、要改配色/字号本身、要动别的页**做不到，那时只回一行',
+    '  `CANNOT-REVISE-LOCALLY: <一句话说为什么>`；',
+    '· **不要自己去动这个文件**（`fs_write`、python 都不要）—— 落盘由 KiroLex 做，',
+    '  你也动一遍就是两个写者对同一个文件。',
+  ].join('\n');
+}
+
+/**
+ * 模型那几行 → 可以直接写的改动 —— PURE。
+ *
+ * 只收**形如 `数字.数字.数字<TAB>文本`** 的行，别的一概丢掉（它偶尔会加一句"好的"或者用 `-` 起头）。
+ * 一条都没解析出来时要和"它说改不了"分开：前者是格式没对上（该重试或退回让它自己改），
+ * 后者是它明确说这条意见做不到。
+ */
+/** 动版面的一条指令 —— 判据见 `parseSlideEdits`，落盘见 `SLIDE_OPS_SCRIPT`。 */
+export type SlideOp =
+  | { op: 'delete-shape'; i: number }
+  | { op: 'move'; i: number; l?: number; t?: number; w?: number; h?: number }
+  | { op: 'add-text'; l: number; t: number; w: number; h: number; text: string; like?: string }
+  /* 字号是逐 run 的（`形状.段.run`）—— 一行里可以半句大半句小 */
+  | { op: 'set-size'; at: string; pt: number }
+  /* 项目符号和缩进是**整段**的（`形状.段`）—— 用 run 地址会让一段里的几个 run 互相打几次 */
+  | { op: 'set-bullet'; at: string; char: string }
+  | { op: 'set-level'; at: string; lvl: number };
+
+export function parseSlideEdits(
+  stdout: string,
+): { edits: Array<{ at: string; text: string }>; ops: SlideOp[]; cannot?: string } {
+  const raw = String(stdout ?? '');
+  const m = /^\s*CANNOT-REVISE-LOCALLY:\s*(.*)$/m.exec(raw);
+  const cannot = m ? (m[1].trim() || '这条意见改不了这一页的文字') : undefined;
+  const edits: Array<{ at: string; text: string }> = [];
+  /*
+    **动版面的那三条** ——「所以我甚至不能让 comment 添加或者修改页面上的文本框吗，WTF」。
+
+    和 `地址<TAB>新文本` 混在同一份回复里，一行一条。数字一律厘米。
+    宽松到什么程度：指令名不分大小写、`-` 可以写成空格或没有（`DELETE SHAPE` / `deleteshape` 都认）、
+    参数之间任意空白 —— 理由和分隔符那次一样：一次改写 5–25 秒，为一个连字符作废不值得。
+  */
+  const num = (t: string) => { const v = Number(String(t).replace(/[，,]/g, '')); return Number.isFinite(v) ? v : undefined; };
+  const ops: SlideOp[] = [];
+  for (const line of raw.split('\n')) {
+    const t = line.trim().replace(/^[-*•]\s*/, '');
+    /* DELETE-SHAPE <编号> */
+    let m = /^delete[\s-]*shape[\s:：]+(\d+)\b/i.exec(t);
+    if (m) { ops.push({ op: 'delete-shape', i: Number(m[1]) }); continue; }
+    /* MOVE <编号> <左> <上> [<宽> <高>] */
+    m = /^move[\s:：]+(\d+)\s+(-?[\d.]+)\s+(-?[\d.]+)(?:\s+([\d.]+)\s+([\d.]+))?/i.exec(t);
+    if (m) {
+      const row: SlideOp = { op: 'move', i: Number(m[1]), l: num(m[2]), t: num(m[3]) };
+      if (m[4] !== undefined) { (row as any).w = num(m[4]); (row as any).h = num(m[5]); }
+      ops.push(row);
+      continue;
+    }
+    /* SET-SIZE <形状.段.run> <磅值> */
+    m = /^set[\s-]*size[\s:：]+(\d+\.\d+\.\d+)\s+([\d.]+)/i.exec(t);
+    if (m) { const pt = num(m[2]); if (pt) ops.push({ op: 'set-size', at: m[1], pt }); continue; }
+    /* SET-BULLET <形状.段> <字符|none> —— 段地址两段；给了三段就取前两段（它常顺手写 run 地址） */
+    m = /^set[\s-]*bullet[\s:：]+(\d+\.\d+)(?:\.\d+)?\s+(\S+)/i.exec(t);
+    if (m) { ops.push({ op: 'set-bullet', at: m[1], char: /^none$/i.test(m[2]) ? 'none' : m[2][0] }); continue; }
+    /* SET-LEVEL <形状.段> <0-8> */
+    m = /^set[\s-]*level[\s:：]+(\d+\.\d+)(?:\.\d+)?\s+(\d)/i.exec(t);
+    if (m) { ops.push({ op: 'set-level', at: m[1], lvl: Number(m[2]) }); continue; }
+    /* ADD-TEXT <左> <上> <宽> <高> <参考地址|-> <TAB 或空白> 文字 */
+    m = /^add[\s-]*text[\s:：]+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+([\d.]+)\s+(\S+)[\t ]+(.*)$/i.exec(t);
+    if (m) {
+      const text = m[6].trim();
+      const like = m[5];
+      if (text) {
+        ops.push({
+          op: 'add-text', l: num(m[1])!, t: num(m[2])!, w: num(m[3])!, h: num(m[4])!, text,
+          ...(/^\d+\.\d+\.\d+$/.test(like) ? { like } : null),
+        });
+      }
+      continue;
+    }
+  }
+  for (const line of raw.split('\n')) {
+    /*
+      **分隔符放宽到"地址后面那一下"** ——「改写失败：它没有给出可用的改动行」。
+      
+      约定是 `地址<TAB>新文本`，而原来只认制表符和"两个以上空格"。实测失败过：模型很容易把那个
+      制表符写成**一个空格**（或者顺手加个冒号、箭头、项目符号）—— 那时整份回复一条都不匹配，
+      结果是"它没有给出可用的改动行"，而它其实给了，格式差一个字符。
+      
+      放宽的风险是把散文里以 `1.2.3 ` 开头的句子当成改动。但地址那个形状（三段数字带点）在中文
+      幻灯片文案里几乎不会出现在行首，而现在这条路的代价是**整次改写作废**（一次 5–25 秒，
+      还要你重新措辞再试一遍）。两边一比，宽一点明显划算。
+    */
+    /* 有分隔符时空格可有可无（`1.0.0：新标题` 是实际写法）；没有分隔符就必须至少一个空格 */
+    const hit = /^\s*(?:[-*•]\s*)?(\d+\.\d+\.\d+)(?:\s*(?:\t|:|：|->|→|\|)\s*|\s+)(.*)$/.exec(line);
+    if (!hit) continue;
+    const text = hit[2].trim();
+    /*
+      **`<DELETE>` 才算"清掉这段字"** ——「我让他把 subtitle 删掉，不行吗」。
+      回一行空的照旧丢掉：那和"格式没对上"长得一模一样，而清空是不可逆的（原文只在备份里）。
+      标记是提示词里教给它的，见 `reviseSlideTextPrompt`。
+    */
+    if (/^<\s*delete\s*>$/i.test(text)) { edits.push({ at: hit[1], text: '' }); continue; }
+    if (!text) continue;                                  // 空文本不当"清空"——那多半是格式没对上
+    edits.push({ at: hit[1], text });
+  }
+  return cannot ? { edits, ops, cannot } : { edits, ops };
 }

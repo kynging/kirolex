@@ -26,7 +26,7 @@ import { compactMemoryPrompt, memoryWarnings, type MemoryScope } from '../main/m
 import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache } from './modelList';
 import { SkillDialog } from './components/SkillDialog';
 import { WorkspacePanel } from './components/WorkspacePanel';
-import { ReviewPane } from './components/ReviewPane';
+import { ReviewPane, isDeckPath } from './components/ReviewPane';
 import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
@@ -273,6 +273,27 @@ declare global {
       /** 提交前拷一份 —— 提交那条路是会话自己写文件，走不到上面那道写前备份。 */
       reviewBackupFile?: (sessionId: string | null | undefined, filePath: string)
         => Promise<{ ok: boolean; at?: string; bytes?: number; error?: string }>;
+      /**
+       * `.pptx`/`.docx`… → 一个 PDF（`.pdf` 直通，不需要 LibreOffice）+ 每页讲稿。路径按 `sessionId` 解析。
+       * 没有 LibreOffice 时 `ok: false` + `why`（找过哪里、怎么装）+ `install`（那条命令，界面配复制按钮）。
+       */
+      previewDeck?: (sessionId: string | null | undefined, filePath: string, force?: boolean) => Promise<{
+        ok: boolean; pdf?: string; pages?: number | null; notes?: string[] | null; pdfHash?: string | null;
+        editable?: boolean; notesWhy?: string; why?: string; install?: string; noConverter?: boolean;
+      }>;
+      /** PDF 的字节（base64）—— 渲染层取不到 `file://`。 */
+      previewPdfBytes?: (sessionId: string | null | undefined, pdfPath: string)
+        => Promise<{ ok: boolean; base64?: string; bytes?: number; why?: string }>;
+      /** 改**一页**的演讲者备注（只动那一页的 XML part）—— 写前备份，返回重抽的全部备注。 */
+      deckWriteNote?: (sessionId: string | null | undefined, filePath: string, page: number, text: string)
+        => Promise<{ ok: boolean; notes?: string[]; error?: string }>;
+      /** 问打开这份 deck 的会话这一页的字/版面该怎么改，KiroLex 按 run 地址写（正忙就排队）。 */
+      deckReviseSlideText?: (input: { sessionId: string; filePath: string; page: number; note: string })
+        => Promise<{ ok: boolean; changed?: number; partial?: string; cannot?: string; error?: string }>;
+      deckReadSlideText?: (sessionId: string | null | undefined, filePath: string, page: number)
+        => Promise<{ ok: boolean; runs?: Array<{ at: string; text: string }>; error?: string }>;
+      deckWriteSlideText?: (sessionId: string | null | undefined, filePath: string, page: number, edits: Array<{ at: string; text: string }>)
+        => Promise<{ ok: boolean; changed?: number; error?: string }>;
       /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）—— 改写落盘之后报一句。 */
       sessionNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
       /** Watch exactly these files for on-disk edits, replacing the previous set. */
@@ -507,6 +528,11 @@ export interface FileTab {
    * 空的（没有会话时打开的）就不给「✓ 确认」和「提交」。
    */
   ownerSessionId?: string;
+  /**
+   * 这份文件在盘上最后一次变化（或者被手动刷新）的时间 —— **deck 的预览靠它重取**。文本那侧一直会自动更新
+   * （正文就是 `content`）；deck 的 PDF 和讲稿是 `ReviewPane` 自己取的，不推这一下屏幕上还是旧那十四页。
+   */
+  changedAt?: number;
 }
 /** Cap: an image tab holds a base64 data URL (up to 25 MB each), so unbounded tabs
  *  would balloon renderer memory. Oldest non-active tab is evicted first. */
@@ -1909,7 +1935,12 @@ const App: React.FC = () => {
     if (existing) { setActiveFileTabId(existing.id); return; }
 
     // Known non-previewable type: go straight to the system app, no tab flash.
-    if (needsSystemApp(p)) {
+    /*
+      **PDF / deck 例外** —— 它们由 KiroLex 自己生成预览（`isDeckPath` 是唯一判据）：`.pdf` 直接画，
+      `.pptx` / `.docx`… 由主进程用 LibreOffice 转成 PDF。转不出来（没装 LibreOffice）也不甩出去：标签页里
+      说清楚缺什么、怎么装，顶栏「↗ 打开文件」照样能交给系统应用。
+    */
+    if (needsSystemApp(p) && !isDeckPath(p)) {
       const res = await window.kiroApi.openExternal?.(p, sessionForPath || undefined);
       if (res?.ok !== false) return;
       // Fall through to the in-app tab so the failure is visible (and the tab
@@ -1933,7 +1964,8 @@ const App: React.FC = () => {
       const result = await window.kiroApi.workspaceRead(sessionForPath, p);
       // Detected binary (NUL bytes / oversized image) with no useful preview:
       // hand it to the system app and drop the tab we just opened.
-      if (result.binary && !result.image) {
+      /* **deck 例外**（第二道门）：`.pptx` 本质是个 zip，必然被判成 binary —— 它不需要 content，`ReviewPane` 自己取 */
+      if (result.binary && !result.image && !isDeckPath(p)) {
         const res = await window.kiroApi.openExternal?.(p, sessionForPath || undefined);
         if (res?.ok !== false) { closeFileTab(id); return; }
       }
@@ -1965,6 +1997,8 @@ const App: React.FC = () => {
       setFileTabs((prev) => prev.map((t) => (t.id === tabId
         ? { ...t, ...result, raw: t.raw, stale: false, gone: false }
         : t)));
+      /* 再推一下 `changedAt`：deck 的预览靠它重取 PDF 和讲稿（文本那侧用的是 content，这一项对它无害） */
+      setFileTabs((prev) => prev.map((t) => (t.id === tabId ? { ...t, changedAt: Date.now() } : t)));
     } catch (err: any) {
       // Do NOT wipe the content: an unreadable file (mid-write, permissions) is a
       // reason to flag the tab, not to lose what the user was reading.
@@ -3715,7 +3749,26 @@ const App: React.FC = () => {
               {!fileViewerLoading && fileViewer && (
                 <>
                   <div className="workspace-viewer-path" title={fileViewer.path}>{fileViewer.path}</div>
-                  {fileViewer.image && fileViewer.dataUrl ? (
+                  {/*
+                    **PDF / deck 走逐页预览** —— 排在 binary 那一支**前面**：.pptx 会被 workspaceRead 判成
+                    binary（它就是个 zip），落到下面就是一句「无法预览」。转换、缓存、讲稿都在主进程
+                    （preview:deck）；没有 LibreOffice 时 ReviewPane 自己把缺什么、怎么装摆出来。
+
+                    「✓ 确认」和提交都走 ownerSessionId —— **打开这份文件的那条会话**，不是此刻选中的那条。
+                    key 带路径：换标签页时意见和草稿都是那一份文件自己的，不串。
+                  */}
+                  {isDeckPath(fileViewer.path) ? (
+                    <ReviewPane
+                      key={fileViewer.path}
+                      path={fileViewer.path}
+                      sessionId={fileViewer.ownerSessionId}
+                      /* 文件在盘上变了（会话改完 pptx、或者你点了 ⟳ 刷新）就重取预览 */
+                      changedAt={fileViewer.changedAt}
+                      onSubmit={fileViewer.ownerSessionId
+                        ? (prompt: string) => { void handleSendMessage(prompt, undefined, fileViewer.ownerSessionId); }
+                        : undefined}
+                    />
+                  ) : fileViewer.image && fileViewer.dataUrl ? (
                     <div className="workspace-image-wrap">
                       <img className="workspace-image" src={fileViewer.dataUrl} alt={baseName(fileViewer.path) || 'image'} />
                     </div>
