@@ -26,6 +26,7 @@ import { compactMemoryPrompt, memoryWarnings, type MemoryScope } from '../main/m
 import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache } from './modelList';
 import { SkillDialog } from './components/SkillDialog';
 import { WorkspacePanel } from './components/WorkspacePanel';
+import { ReviewPane } from './components/ReviewPane';
 import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
@@ -254,6 +255,26 @@ declare global {
         image?: boolean;
         dataUrl?: string;
       }>;
+      /**
+       * 侧栏 review 的「✓ 确认」—— 在**打开这份文件的那条会话**里改一块（正忙就在主进程里排队）。
+       *   `block`（默认）只回改完的这一块；`whole` 整份 —— 只在 block 那次回了 `cannot`（跨段的意见）时才问。
+       * `full` 是整份重改的基准正文（盘上此刻那一份），不让它照自己记得的旧版重写。
+       */
+      reviseInSession?: (input: {
+        sessionId: string; where: string; note: string; about?: string;
+        scope?: 'block' | 'whole'; label?: string; full?: string;
+      }) => Promise<{ ok: boolean; text?: string; cannot?: string; error?: string }>;
+      /**
+       * 把改完的正文写回那个文件 —— 路径按 `sessionId` 解析（和 workspaceRead 同一个 resolveUserPath），
+       * 只许写**这条会话的标签页读过**的，写前备份到 `~/.kirolex/backups/review-files/`。
+       */
+      reviewWriteFile?: (sessionId: string | null | undefined, filePath: string, text: string)
+        => Promise<{ ok: boolean; path?: string; bytes?: number; was?: number; unchanged?: boolean; error?: string }>;
+      /** 提交前拷一份 —— 提交那条路是会话自己写文件，走不到上面那道写前备份。 */
+      reviewBackupFile?: (sessionId: string | null | undefined, filePath: string)
+        => Promise<{ ok: boolean; at?: string; bytes?: number; error?: string }>;
+      /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）—— 改写落盘之后报一句。 */
+      sessionNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
       /** Watch exactly these files for on-disk edits, replacing the previous set. */
       workspaceWatchFiles?: (sessionId: string | null | undefined, paths: string[]) => Promise<{ ok: boolean; watching: number; dirs: number }>;
       onWorkspaceFileChanged?: (callback: (data: { path: string; exists: boolean; mtimeMs: number }) => void) => () => void;
@@ -476,6 +497,16 @@ export interface FileTab {
    *  content stays readable, but labelled -- silently showing a stale copy of a file
    *  that no longer exists is worse than saying so. */
   gone?: boolean;
+  /**
+   * **哪条会话该负责改这份文件** —— 打开这个标签页时那条会话，钉在标签页上。
+   *
+   * 「确认一下侧栏的每个 tab 知道应该由哪个会话改写，而不是随意飘移到其他没有上下文的会话」。
+   * 审阅的「✓ 确认」是在会话里改的，而 `currentSessionId` 是**此刻选中的**那条 —— 你在 A 里做出这份文件、
+   * 打开它、去 B 看了一眼，回来提一条意见，那条意见就发给了 B。B 没见过这份文件。
+   * 所以钉住：从哪条会话打开，就由那条会话改、以它的名义写回（相对路径也按它解析）。
+   * 空的（没有会话时打开的）就不给「✓ 确认」和「提交」。
+   */
+  ownerSessionId?: string;
 }
 /** Cap: an image tab holds a base64 data URL (up to 25 MB each), so unbounded tabs
  *  would balloon renderer memory. Oldest non-active tab is evicted first. */
@@ -525,6 +556,14 @@ function needsSystemApp(p: string): boolean {
   const dot = name.lastIndexOf('.');
   if (dot <= 0) return false;
   return SYSTEM_APP_EXTS.has(name.slice(dot + 1).toLowerCase());
+}
+
+/**
+ * 能在侧栏逐行写意见的文件 —— Markdown 和纯文本。
+ * 代码文件不在内：它们按行渲染会丢掉语法高亮，而且"让会话改一行代码"该走正常对话，不是批注。
+ */
+function isReviewableText(p: string): boolean {
+  return /.(md|markdown|mdown|mkd|mdx|txt|text)$/i.test(String(p || '').trim());
 }
 
 /** Files whose preview should be RENDERED markdown rather than raw source. */
@@ -1119,6 +1158,11 @@ const App: React.FC = () => {
   const fileBodyRef = useRef<HTMLDivElement | null>(null);
   const fileViewer = fileTabs.find((t) => t.id === activeFileTabId) || null;
   const [fileViewerLoading, setFileViewerLoading] = useState(false);
+  /**
+   * 文本文件在不在 comment 模式 —— 默认**关**。关着的时候一个按钮都不渲染，纯粹读文档；开着才出现每行
+   * 右边那个 💬 / ✕ 和最下面那块。默认关是因为大多数时候你只是想看一眼。
+   */
+  const [commenting, setCommenting] = useState(false);
   // Markdown files render formatted by default; the toggle shows the raw source.
   const fileViewerRaw = !!fileViewer?.raw;
   const [settings, setSettings] = useState<Settings>(loadSettings);
@@ -1874,7 +1918,8 @@ const App: React.FC = () => {
 
     const id = `ft_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     setFileTabs((prev) => {
-      const next = [...prev, { id, path: p, content: '' }];
+      /* `ownerSessionId`：这份文件从哪条会话打开 —— 审阅的「✓ 确认」就由它改（见 `FileTab.ownerSessionId`） */
+      const next = [...prev, { id, path: p, content: '', ownerSessionId: sessionForPath || undefined }];
       // Evict the oldest tab that is not the one we just opened.
       return next.length > MAX_FILE_TABS ? next.slice(next.length - MAX_FILE_TABS) : next;
     });
@@ -1914,7 +1959,9 @@ const App: React.FC = () => {
    *  refresh must not throw away the rendered/source choice or jump to the top. */
   const refreshFileTab = useCallback(async (tabId: string, filePath: string) => {
     try {
-      const result = await window.kiroApi.workspaceRead(currentSessionId, filePath);
+      /* 以这个标签页的主人会话去读 —— 和打开时同一个身份（review 写回的白名单按它记，见 `ownerSessionId`） */
+      const owner = fileTabsRef.current.find((t) => t.id === tabId)?.ownerSessionId;
+      const result = await window.kiroApi.workspaceRead(owner || currentSessionId, filePath);
       setFileTabs((prev) => prev.map((t) => (t.id === tabId
         ? { ...t, ...result, raw: t.raw, stale: false, gone: false }
         : t)));
@@ -3681,7 +3728,46 @@ const App: React.FC = () => {
                       {fileViewer.truncated && (
                         <div className="workspace-hint">⚠️ Preview truncated at 512 KB. Download for the complete file.</div>
                       )}
-                      {isMarkdownPath(fileViewer.path) && !fileViewerRaw ? (
+                      {/*
+                        **逐行批注** —— 一个开关按钮，开着才有 💬 / ✕（默认纯读）。
+                        截断的预览不给：拼回整份写盘会把后面那截删掉（主进程那侧也挡着）。
+                      */}
+                      {isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated && (
+                        <button
+                          type="button"
+                          className={`rv-review-toggle${commenting ? ' on' : ''}`}
+                          title={commenting
+                            ? '退出批注，安静读'
+                            : fileViewer.ownerSessionId
+                              ? '逐行写意见：「✓ 确认」当场让打开这份文件的会话改那一块并写回；「记下」的攒起来一起提交'
+                              : '逐行写意见 —— 这个标签页没有归属会话，只能看不能发（从会话里点开文件链接才有）'}
+                          onClick={() => setCommenting((v) => !v)}
+                        >{commenting ? '✓ comment' : '💬 comment'}</button>
+                      )}
+                      {isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated && commenting ? (
+                        <ReviewPane
+                          /* key 带路径：换标签页时意见、草稿都是那一份文件自己的，不串 */
+                          key={fileViewer.path}
+                          path={fileViewer.path}
+                          text={fileViewer.content}
+                          markdown={isMarkdownPath(fileViewer.path)}
+                          commenting={commenting}
+                          /* **由打开这份文件的那条会话改**，不是此刻选中的那条（见 `FileTab.ownerSessionId`） */
+                          sessionId={fileViewer.ownerSessionId}
+                          onRewritten={(next: string) => {
+                            const at = fileViewer.path;
+                            setFileTabs((prev) => prev.map((t) => (t.path === at ? { ...t, content: next } : t)));
+                          }}
+                          /*
+                            **提交也发给这个 tab 的主人** ——「就从这个会话提交更改」。提交完**退出 comment 模式**：
+                            控件还在你会接着写第二批，两批意见落在同一份文件上，模型不知道该按哪一批改。
+                          */
+                          onSubmit={fileViewer.ownerSessionId ? (prompt: string) => {
+                            void handleSendMessage(prompt, undefined, fileViewer.ownerSessionId);
+                            setCommenting(false);
+                          } : undefined}
+                        />
+                      ) : isMarkdownPath(fileViewer.path) && !fileViewerRaw ? (
                         <div className="workspace-viewer-md">
                           <MarkdownView content={fileViewer.content} />
                         </div>

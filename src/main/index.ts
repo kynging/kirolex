@@ -61,6 +61,7 @@ import {
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
+import { parseRevised, reviseInSessionPrompt, replyUsable } from './reviseBlock.ts';
 import { logger } from './logger';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -3294,6 +3295,109 @@ function noteInSession(sessionId: string, body: string): boolean {
   } catch { return false; }
 }
 
+/* ───────────────── 侧栏文件预览的「✓ 确认」：在那条会话里改一处 ─────────────────
+ *
+ * 从 feature/flow 搬过来（那边门上和侧栏共用），这里只留文件预览那条路：
+ * `review:revise-in-session` 把意见发给**打开这份文件的那条会话**，等这一轮的完整回复，
+ * 渲染层拼回整份之后再走 `review:write-file` 落盘。
+ */
+
+/**
+ * 某条会话上**正在等一轮完整回复**的那一个 —— `review:revise-in-session` 挂上，一轮成功收尾时兑付。
+ *
+ * 只在**成功收尾**那一处兑付（见 `sendPromptOnce` 里 `flushAssistant` 之后那段），不在 `flushAssistant`
+ * 里兑付：出错 / 取消那两条路也会 flush 半截输出，而半截正文拿去写盘就是把文件后半截删掉。
+ * 那两条路走完 `sendPromptOnce` 照样返回（或抛），等待者由调用方自己摘掉。
+ */
+const askWaiters = new Map<string, {
+  resolve: (reply: { text: string; stopReason: string; wedged: boolean }) => void;
+  timer: NodeJS.Timeout;
+}>();
+
+/** 兑付这条会话上的等待者。没有等待者就什么都不做（绝大多数轮次都是这样）。 */
+function settleAsk(sessionId: string, reply: { text: string; stopReason: string; wedged: boolean }) {
+  const w = askWaiters.get(sessionId);
+  if (!w) return;
+  askWaiters.delete(sessionId);
+  clearTimeout(w.timer);
+  w.resolve(reply);
+}
+
+/**
+ * 每条会话上**排队等着改写**的那些 —— 「如果有会话已经在跑的话确认会失败，这个不对，把它改成加入到 queue」。
+ *
+ * 原来是直接拒：`busyReasonFor` 说忙就返回错误，让你等它停下来再点一次。那是把调度推给你 ——
+ * 而你判断不了它什么时候停（那一轮可能跑十分钟），也不该记着"我还有三条要提"。
+ * 现在按会话串成一条链：一条跑完下一条自动接上。链**按 sessionId** 分 —— 不同会话之间没有理由互等。
+ */
+const reviseChain = new Map<string, Promise<unknown>>();
+
+/**
+ * 每条会话上**还没跑完**的改写条数 —— 只为了「前面还有 N 条」那句话说得准。
+ *
+ * 不能用 `reviseChain.has()` 代替：那个 map 的键从来不删（它存的是"下一条接在谁后面"），
+ * 所以第二条改写起它永远为真 —— 实测因此报了两次不存在的排队。
+ */
+const revisePending = new Map<string, number>();
+
+/**
+ * 排到这条会话的队尾，轮到了再跑。失败不断链（否则一次失败会把后面几条全带走）。
+ *
+ * **真的要等的时候说一声**：队列只活在主进程里，等待期间会话里一个字都没有 —— 而"什么都没发生"和
+ * "排上队了"在屏幕上长得一模一样。不等的那些（绝大多数）什么都不说：一条"已排队"紧接着一条"已改完"
+ * 只是噪音。
+ */
+function enqueueRevise<T>(sessionId: string, job: () => Promise<T>, label?: string): Promise<T> {
+  const ahead = revisePending.get(sessionId) || 0;
+  if (label) {
+    const busy = busyReasonFor(sessionId);
+    if (ahead > 0) {
+      noteInSession(sessionId, `⏳ 已排队：${label} —— 前面还有 ${ahead} 条改写没跑完，轮到它会自动发出去。`);
+    } else if (busy) {
+      noteInSession(sessionId, `⏳ 已排队：${label} —— 这条会话正忙（${busy}），空下来会自动发出去。`);
+    }
+  }
+  revisePending.set(sessionId, ahead + 1);
+  const prev = reviseChain.get(sessionId) || Promise.resolve();
+  const next = prev.then(job, job);
+  reviseChain.set(sessionId, next.then(() => {}, () => {}).then(() => {
+    const left = (revisePending.get(sessionId) || 1) - 1;
+    if (left > 0) revisePending.set(sessionId, left);
+    else revisePending.delete(sessionId);
+  }));
+  return next;
+}
+
+/** 等这条会话空下来 —— 轮到自己之后还要等它自己那一轮跑完（用户手动发的那些）。返回还忙的原因，空了是 null。 */
+async function waitIdle(sessionId: string, maxMs: number): Promise<string | null> {
+  const started = Date.now();
+  for (;;) {
+    const why = busyReasonFor(sessionId);
+    if (!why) return null;
+    if (Date.now() - started > maxMs) return String(why);
+    await new Promise((r) => setTimeout(r, 500));
+  }
+}
+
+/**
+ * 每条会话为预览**读过**哪些文件（解析之后的绝对路径）—— `review:write-file` 的白名单。
+ *
+ * 不用路径形状去判（那种判据要么太松要么挡住正常路径），用"你确实以这条会话的身份打开看过它"这个事实：
+ * 你对着它提的意见，写回同一份才成立。**按会话记**：写回只允许打开这个标签页的那条会话
+ * （`FileTab.ownerSessionId`）—— 和改写走的是同一条会话，别的会话不能借这条通道去写它没读过的文件。
+ * 键 `''` = 没带会话读的（工作区面板、没有当前会话时）。进程重启就清空 —— 重启之后你没看过任何东西。
+ */
+const reviewedPaths = new Map<string, Set<string>>();
+function markReviewed(sessionId: string | null | undefined, resolvedPath: string): void {
+  const key = String(sessionId || '');
+  let set = reviewedPaths.get(key);
+  if (!set) { set = new Set(); reviewedPaths.set(key, set); }
+  set.add(resolvedPath);
+}
+function wasReviewed(sessionId: string | null | undefined, resolvedPath: string): boolean {
+  return !!reviewedPaths.get(String(sessionId || ''))?.has(resolvedPath);
+}
+
 function isFeatureEnabled(key: keyof typeof FEATURE_DEFAULTS | string): boolean {
   const flags = loadFeatureFlags();
   return flags[key] !== false;
@@ -6141,7 +6245,18 @@ app.whenReady().then(async () => {
               detachExecutor(sessionId);
             }
             const producedOutput = !!(entry.assistantBuf || entry.fileChanges.length);
+            /*
+              侧栏 review 的「✓ 确认」在等这一轮的完整回复（见 `askWaiters`）—— 在 flush 清空之前取，
+              只取模型自己写的那部分（`wedgeNote` 是 KiroLex 加的说明，不是正文）。
+              priming 那一轮不算：那是在补历史，不是对这条改写的回答。
+            */
+            const askReply = entry.priming ? null : {
+              text: entry.assistantBuf,
+              stopReason: String(result?.stopReason ?? 'n/a'),
+              wedged: !!entry.wedgeNote,
+            };
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
+            if (askReply) settleAsk(sessionId, askReply);
             // The request was accepted and answered, so the snapshot it carried IS
             // in this backend now: the claim written before the send is confirmed.
             // Re-marked against the CURRENT entry rather than just clearing the
@@ -8438,6 +8553,12 @@ app.whenReady().then(async () => {
     filePath = resolveUserPath(filePath, sessionId);
     const stats = fs.statSync(filePath);
     if (stats.isDirectory()) throw new Error('Path is a directory, not a file.');
+    /*
+      **记下这一份，记在这条会话名下**：侧栏 review 的「✓ 确认」要把改完的正文写回这个文件，而那是
+      离开 KiroLex 自己数据目录的写 —— 路径不能只凭渲染进程说。判据是"这条会话的标签页确实读过它"
+      （见 `reviewedPaths` / `review:write-file`）。
+    */
+    markReviewed(sessionId, filePath);
 
     // Image files: return a base64 data URL so the renderer can show them inline
     // as an <img> instead of the "binary — no preview" fallback.
@@ -8819,7 +8940,11 @@ app.whenReady().then(async () => {
   });
 
   let firstAttachMarked = false;
-  ipcMain.handle('acp:load-session', async (_event, sessionId: string, cwd: string, model: string) => {
+  /**
+   * 挂载一条会话 —— **抽成函数是为了让主进程自己也能调**（见下面的 `ensureAttached`）。
+   * 函数体就是原来那个 `acp:load-session` handler，原样搬出来，逻辑一个字节没改；IPC 那侧只是转发。
+   */
+  const loadSessionImpl = async (sessionId: string, cwd: string, model: string): Promise<any> => {
     if (!firstAttachMarked) { firstAttachMarked = true; startupMark('attach: first loadSession', `sessionId=${sessionId}`); }
     const askedCwd = cwd === '~' ? os.homedir() : cwd;
     /*
@@ -9117,6 +9242,236 @@ app.whenReady().then(async () => {
       return result;
     } finally {
       attachInFlight.delete(sessionId);
+    }
+  };
+  ipcMain.handle('acp:load-session', async (_event, sessionId: string, cwd: string, model: string) =>
+    loadSessionImpl(sessionId, cwd, model));
+
+  /**
+   * 把一条会话挂起来（主进程自己调）—— **改写之前先挂回来**。
+   *
+   * 「你应该评估一下什么时候应该回收会话」：问题不在"何时回收"，而在**回收之后还能不能用**。
+   * 归档 / LRU 会 `detachExecutor`，而侧栏 review 的改写走 `review:revise-in-session`，`sendPromptOnce`
+   * 只认活着的执行器 —— 于是"回收得早"直接变成"改写不了"（`Session not connected`）。
+   * 正确的分工是：**回收该早**，**要用的时候自己挂回来**。挂载只有一份实现（`loadSessionImpl`，
+   * IPC 那侧只是转发），重试、race、`deletedSessionIds` 那些判据都在里面。
+   *
+   * 挂载失败**不抛**：调用方后面还会自己判一次，而且有更合适的报错。
+   */
+  const ensureAttached = async (sessionId: string): Promise<boolean> => {
+    const sid = String(sessionId || '').trim();
+    if (!sid) return false;
+    if (sessionClients.get(sid)) return true;
+    try {
+      await loadSessionImpl(sid, '~', store.readRecord(sid)?.profile.model || DEFAULT_MODEL);
+    } catch (err: any) {
+      logger.warn('revise', `按需挂起失败 sessionId=${sid}: ${err?.message || err}`);
+    }
+    return !!sessionClients.get(sid);
+  };
+
+  /** 改写前的整份副本留多少份。要回滚也只会回到最近几版。 */
+  const REVIEW_BACKUPS_KEPT = 12;
+
+  /**
+   * 改写这个文件之前先拷一份，并**顺手把老的清掉**（按 mtime 留最近 N 份）。
+   *
+   * 清理放在写备份之后：先保证这一份在，再删旧的 —— 反过来的话中间崩一下就两头空。
+   * 返回备份路径；拷不成返回 null（调用方据此**不写**，见 `review:write-file`）。
+   */
+  const saveReviewBackup = (want: string, bytes: Buffer | string): string | null => {
+    try {
+      const backupDir = path.join(os.homedir(), '.kirolex', 'backups', 'review-files');
+      fs.mkdirSync(backupDir, { recursive: true });
+      const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+      const name = path.basename(want).replace(/[^\w.-]+/g, '_');
+      const at = path.join(backupDir, `${name}__${stamp}`);
+      fs.writeFileSync(at, bytes as any);
+      try {
+        const old = fs.readdirSync(backupDir)
+          .map((n) => { const full = path.join(backupDir, n); try { return { full, t: fs.statSync(full).mtimeMs }; } catch { return null; } })
+          .filter((e): e is { full: string; t: number } => !!e)
+          .sort((a, b) => b.t - a.t)
+          .slice(REVIEW_BACKUPS_KEPT);
+        for (const e of old) { try { fs.rmSync(e.full, { force: true }); } catch { /* 下次再说 */ } }
+      } catch { /* 清理是 best-effort，不能拦住主流程 */ }
+      return at;
+    } catch { return null; }
+  };
+
+  /**
+   * 渲染层给的 (会话, 路径) → 要写的那个绝对路径 + 能不能写 —— 两个 review 写盘通道共用这一道闸。
+   *
+   * 解析走**和读的时候同一个** `resolveUserPath(filePath, sessionId)`：相对路径落到这条会话自己的
+   * `sessions/<id>/files/`。闸是"**这条会话**的标签页读过这一份"（`wasReviewed`）—— 不凭渲染进程说它想写哪儿。
+   */
+  const reviewTarget = (sessionId: string | null | undefined, filePath: string): { ok: true; want: string } | { ok: false; error: string } => {
+    const raw = String(filePath || '');
+    if (!raw) return { ok: false, error: '没有路径' };
+    let want: string;
+    try { want = resolveUserPath(raw, sessionId); } catch (e: any) { return { ok: false, error: String(e?.message || e) }; }
+    if (!wasReviewed(sessionId, want)) {
+      logger.warn('review', `refused: not previewed by session=${sessionId || '(none)'} (${want})`);
+      return { ok: false, error: '这个文件不是这条会话的标签页打开预览过的 —— 不写' };
+    }
+    return { ok: true, want };
+  };
+
+  /**
+   * **拷一份，什么都不改** —— 侧栏 review 的「提交给这份文件的会话」那条路要用。
+   *
+   * 那条路是**会话自己写这个文件**（意见拼成一条普通消息发过去），走不到 `review:write-file` 里那段
+   * "写前拷一份"。备在**发之前**：文件在它落笔前一个字节都没变，这时拷的就是"改之前"。
+   */
+  ipcMain.handle('review:backup-file', async (_event, sessionId: string | null | undefined, filePath: string) => {
+    const t = reviewTarget(sessionId, filePath);
+    if (!t.ok) return t;
+    try {
+      const bytes = fs.readFileSync(t.want);
+      const at = saveReviewBackup(t.want, bytes);
+      if (!at) return { ok: false, error: '备份写不进去' };
+      logger.info('review', `backed up ${t.want} -> ${at} (${bytes.length} bytes)`);
+      return { ok: true, at, bytes: bytes.length };
+    } catch (error: any) {
+      return { ok: false, error: String(error?.message || error) };
+    }
+  });
+
+  /**
+   * WRITE BACK A FILE THE REVIEW PANE IS LOOKING AT —— 侧栏 review 的「✓ 确认」落盘用。
+   *
+   * 「确认一条就当场改完并写回」：模型只回正文（提示词里禁止它自己动文件 —— 两个写者对同一个文件
+   * 要么改两遍要么互相覆盖），落盘由这里统一做。四道闸：
+   *   · 路径按**这条会话**解析，而且必须是这条会话的标签页读过的（`reviewTarget`）；
+   *   · 文件必须已经存在（改的是你正在看的那一份，不新建）；
+   *   · 文件不能比预览上限大 —— 预览只读了前 512KB，拿它拼出来的"整份"写回去等于把后面截掉；
+   *   · 写前留备份（`~/.kirolex/backups/review-files/`），**拷不成就不写**；内容一样就什么都不做。
+   */
+  ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string) => {
+    if (typeof text !== 'string' || !text.trim()) return { ok: false, error: '内容是空的，不写' };
+    const t = reviewTarget(sessionId, filePath);
+    if (!t.ok) return t;
+    const want = t.want;
+    try {
+      let previous = '';
+      try {
+        if (fs.statSync(want).size > WORKSPACE_PREVIEW_MAX_BYTES) {
+          return { ok: false, error: '这个文件比预览上限（512KB）大 —— 预览里只有前半截，写回去会把后面截掉，所以不写' };
+        }
+        previous = fs.readFileSync(want, 'utf-8');
+      } catch {
+        return { ok: false, error: '这个文件现在读不到 —— 不新建，先确认路径对不对' };
+      }
+      if (previous === text) return { ok: true, path: want, unchanged: true };
+      if (!saveReviewBackup(want, previous)) {
+        return { ok: false, error: '写前备份失败 —— 没有可回滚的副本，所以这次不改。检查 ~/.kirolex/backups 能不能写。' };
+      }
+      fs.writeFileSync(want, text, 'utf-8');
+      logger.info('review', `wrote ${want} (${text.length} chars, was ${previous.length}) session=${sessionId || '(none)'}`);
+      return { ok: true, path: want, bytes: text.length, was: previous.length };
+    } catch (error: any) {
+      return { ok: false, error: String(error?.message || error) };
+    }
+  });
+
+  /** 在某条会话里留一行 **KiroLex 自己说的话**（改写落盘之后报一句"写进去了"）—— 不发给模型，见 `noteInSession`。 */
+  ipcMain.handle('session:note', async (_event, sessionId: string, text: string) => {
+    return noteInSession(sessionId, text) ? { ok: true } : { ok: false };
+  });
+
+  /**
+   * 侧栏 review 的改写 —— **在打开这份文件的那条会话里做**（「否则新的 session 缺少必要的上下文」）。
+   *
+   * 判据（提示词、输出清洗、"改不了"的记号、什么样的回复能写盘）在 `reviseBlock.ts`，纯的、有测试。
+   * 这里只管：排队（正忙不是报错）→ 挂回来 → 等它空下来 → 发一轮 → 等**成功收尾**的那份完整回复。
+   *
+   * 返回 `cannot` 时**不改任何东西**；渲染层据此升级到整份（`scope: 'whole'`），或者把原因摆给你看。
+   */
+  ipcMain.handle('review:revise-in-session', async (_event, input: {
+    sessionId: string; where: string; note: string; about?: string;
+    /** `block`（默认，快）/ `whole`（跨段的意见才用）—— 见 `reviseInSessionPrompt`。 */
+    scope?: 'block' | 'whole';
+    /** 会话里那条消息显示成什么位置（「a.md 第 12 行」）—— 回头翻会话要看得出说的是哪儿。 */
+    label?: string;
+    /** 整份重改时的基准正文（盘上此刻那一份）—— 见 `reviseInSessionPrompt.full`。 */
+    full?: string;
+  }) => {
+    const sessionId = String(input?.sessionId || '').trim();
+    const note = String(input?.note ?? '').trim();
+    const where = String(input?.where ?? '');
+    if (!sessionId) return { ok: false, error: '这个标签页没有归属会话 —— 没地方问' };
+    if (!note) return { ok: false, error: '没有意见' };
+    if (deletedSessionIds.has(sessionId)) return { ok: false, error: '这条会话已经删掉了' };
+    if (store.readRecord(sessionId)?.archived) return { ok: false, error: '这条会话已经归档了 —— 取消归档之后才能在里面改' };
+    /*
+      **正忙就排队，不是报错**：排到这条会话的队尾（`enqueueRevise`），轮到了再等它空下来（`waitIdle`）——
+      插进一轮正在跑的对话里，改写会和它正在做的事混在一起。
+    */
+    return enqueueRevise(sessionId, async () => reviseOnce(), input?.label || '改写');
+
+    async function reviseOnce() {
+      await ensureAttached(sessionId);
+      if (!sessionClients.get(sessionId)) return { ok: false, error: '这条会话连不上 —— 点一下它让它连上再试' };
+      const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
+      if (stillBusy) return { ok: false, error: `等了 20 分钟这条会话还在忙（${stillBusy}）` };
+      if (askWaiters.has(sessionId)) return { ok: false, error: '这条会话上已经有一次改写在等回复' };
+      /* 白名单而不是透传：这个值来自渲染进程，越界的写法落回默认那一档 */
+      const wantScope = input?.scope === 'whole' ? 'whole' : 'block';
+      const prompt = reviseInSessionPrompt({
+        where, note, about: input?.about, scope: wantScope,
+        full: typeof input?.full === 'string' ? input.full : undefined,
+      });
+      const started = Date.now();
+      try {
+        const reply = await new Promise<{ text: string; stopReason: string; wedged: boolean }>((resolve, reject) => {
+          /*
+            兜底超时：整份重写实测几十秒到几分钟。等不到就报错**并把等待者摘掉** ——
+            留着它的话，这条会话下一轮正常对话的回复会被当成这次改写的结果。
+          */
+          const timer = setTimeout(() => {
+            askWaiters.delete(sessionId);
+            reject(new Error('等了 8 分钟没等到回复'));
+          }, 8 * 60 * 1000);
+          askWaiters.set(sessionId, { resolve, timer });
+          /** 还挂着的是**这一次**的等待者就摘掉 —— 返回摘没摘 */
+          const drop = (): boolean => {
+            const w = askWaiters.get(sessionId);
+            if (w && w.timer === timer) { askWaiters.delete(sessionId); clearTimeout(w.timer); return true; }
+            return false;
+          };
+          sendPromptOnce(
+            sessionId,
+            [{ type: 'text', text: prompt }],
+            undefined,
+            /* 位置写进显示文本 —— 回头翻会话要看得出这条是说哪一处的 */
+            { displayText: input?.label ? `【改写 · ${input.label}】${note}` : `【改写】${note}` },
+          ).then(() => {
+            /*
+              这一发走完了却没兑付 = 这一轮不是正常收尾（被取消、出错后没重发成、priming 吃掉了）——
+              那条路上 flush 的是半截输出，不能拿去写盘。
+            */
+            if (drop()) reject(new Error('这一轮没有正常结束（被取消或没有回复）'));
+          }, (err: any) => {
+            drop();
+            reject(err);
+          });
+        });
+        const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
+        if (!usable.ok) {
+          logger.warn('revise', `in-session ${sessionId}: ${usable.why}`);
+          return { ok: false, error: usable.why };
+        }
+        const out = parseRevised(reply.text, where);
+        if (out.cannot) {
+          logger.info('revise', `not local (in-session ${sessionId}): ${out.cannot}`);
+          return { ok: false, cannot: out.cannot };
+        }
+        logger.info('revise', `in-session ${sessionId} scope=${wantScope}: ${out.text.length} chars in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        return { ok: true, text: out.text };
+      } catch (err: any) {
+        logger.warn('revise', `in-session ${sessionId} failed: ${err?.message || err}`);
+        return { ok: false, error: String(err?.message || err) };
+      }
     }
   });
 

@@ -397,6 +397,20 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('app:path-exists', filePath, sessionId),
   workspaceDownload: (sessionId: string | null | undefined, filePath: string) =>
     ipcRenderer.invoke('workspace:download', sessionId, filePath),
+  /**
+   * 侧栏 review 的「✓ 确认」：把一条意见发给**打开这份文件的那条会话**，等它回改完的正文。
+   * 正忙就在主进程里排队；`cannot` = 它说这条改不了单独一段（渲染层据此升级到 `whole`）。
+   */
+  reviseInSession: (input: { sessionId: string; where: string; note: string; about?: string; scope?: 'block' | 'whole'; label?: string; full?: string }) =>
+    ipcRenderer.invoke('review:revise-in-session', input),
+  /** 把改完的正文写回这份文件 —— 路径按这条会话解析，只许写这条会话的标签页读过的，写前备份。 */
+  reviewWriteFile: (sessionId: string | null | undefined, filePath: string, text: string) =>
+    ipcRenderer.invoke('review:write-file', sessionId, filePath, text),
+  /** 只拷一份（「提交给这份文件的会话」那条路：会话自己改文件，走不到上面那道写前备份）。 */
+  reviewBackupFile: (sessionId: string | null | undefined, filePath: string) =>
+    ipcRenderer.invoke('review:backup-file', sessionId, filePath),
+  /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）。 */
+  sessionNote: (sessionId: string, text: string) => ipcRenderer.invoke('session:note', sessionId, text),
   /** Watch exactly these files for on-disk edits, replacing any previous set.
    *  Main watches their parent directories (a save is usually write+rename, which a
    *  per-file watcher stops following), and reports each change once, debounced. */

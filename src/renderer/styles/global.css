@@ -8310,3 +8310,137 @@ button, input, select, textarea {
 .backup-mem.pending { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 40%, transparent); }
 .backup-mem.never { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, transparent); }
 .backup-mem.muted { color: var(--text-muted); }
+
+/* ── 侧栏文件预览：逐行 comment（`ReviewPane` / `CommentBox`）──────────────────────────────
+   从 feature/flow 搬过来（那边门上和侧栏共用 `.rt-note-*`）。这里**全部挂在 `.rv-review` 下面**：
+   上面那批 `.rt-*` 是门的老样式（这条分支里已经没人用），挂在作用域下面才压得住、也不会反过来影响别处。 */
+.rv-review { display: flex; flex-direction: column; gap: 10px; padding: 4px 0 0; position: relative; }
+/*
+  comment 模式那个开关 —— 一个按钮，不是两个并排的模式（两个并排会让人以为是两种视图）。
+  关着淡、开着亮：它自己就说明了当前在哪个态。
+*/
+.rv-review-toggle {
+  align-self: flex-start; font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 5px; margin-bottom: 6px;
+  cursor: pointer; border: 1px solid var(--border); background: transparent; color: var(--text-tertiary);
+}
+.rv-review-toggle:hover { border-color: var(--accent); color: var(--accent); }
+.rv-review-toggle.on { border-color: var(--accent); color: var(--accent); background: rgba(124,111,224,.12); }
+/* 按行之后每块很矮，块间距收紧 —— 段落那种 14px 会把一份文档拉得到处是空隙 */
+.rv-review-blocks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
+/*
+  `position: relative` + 右边给 💬(right:0) 和 ✕(right:22) 两个 absolute 按钮让位。
+  `gap: 0` 是刻意的：块内只有"正文"和"那个不占高度的工具包装"，留 gap 的话**每一行都会多一截**。
+*/
+.rv-review-block { position: relative; display: flex; flex-direction: column; gap: 0; padding-right: 46px; }
+.rv-review-md { font-size: 12px; line-height: 1.75; }
+.rv-review-md > :first-child { margin-top: 0; }
+.rv-review-md > :last-child { margin-bottom: 0; }
+.rv-review-text {
+  margin: 0; font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
+  color: var(--text-primary);
+}
+/* 这个包装不占任何高度 —— 按钮贴着 `.rv-review-block` 定位，它只负责把展开的框放进文档流 */
+.rv-review-tools { position: static; }
+.rv-review .rt-note-btn,
+.rv-review .rt-block-drop {
+  position: absolute; top: 0; width: 20px; height: 20px; padding: 0;
+  font: inherit; font-size: 11px; line-height: 1; cursor: pointer; border-radius: 4px;
+  border: 1px solid transparent; background: none; color: var(--text-tertiary);
+  opacity: .35; transition: opacity .12s;
+}
+.rv-review .rt-note-btn { right: 0; }
+.rv-review .rt-block-drop { right: 22px; font-size: 10px; }
+/*
+  **鼠标停在哪一行，那一行就亮起来**，按钮也只在这一行 hover 时显形 ——「这个 comment 界面根本看不出来
+  哪个按钮对应的是哪一行」：一行只有 21px 高，一整列淡图标每个都"像是属于旁边那行"。
+*/
+.rv-review-block:hover .rt-note-btn,
+.rv-review-block:hover .rt-block-drop { opacity: .9; }
+.rv-review .rt-note-btn:hover { opacity: 1; border-color: var(--border); background: var(--bg-hover); }
+.rv-review .rt-block-drop:hover { opacity: 1; border-color: var(--error); color: var(--error); background: var(--bg-hover); }
+.rv-review .rt-note-btn:focus-visible, .rv-review .rt-block-drop:focus-visible { opacity: 1; }
+/* 标了删的那一块一直显示它的 ↩ —— 那是唯一能撤回的入口 */
+.rv-review .rt-block-drop.on,
+.rv-review-block.dropped .rt-block-drop { opacity: 1; color: var(--error); border-color: var(--error); }
+/* 写过意见的那一行：💬 常显、强调色，**行高一点不变** */
+.rv-review .rt-note-btn.has-note { opacity: 1; color: var(--success, #3fb950); border-color: rgba(63,185,80,.45); }
+.rv-review-block:hover,
+.rv-review-block:has(.rt-note-box) { background: var(--bg-hover, rgba(255, 255, 255, .045)); border-radius: 4px; }
+
+/* 删掉的**留在原位划掉**，不是消失：消失了你就不知道自己删了什么、也点不回来 */
+.rv-review-block.dropped .rv-review-text,
+.rv-review-block.dropped .rv-review-md { opacity: .38; text-decoration: line-through; text-decoration-color: var(--error); }
+.rv-review-block.dropped:not(.in-section) { border-left: 2px solid var(--error); padding-left: 7px; }
+/* 写过意见的块：左边一道竖线 —— 收起输入框之后也看得出哪几行评过（竖线不占高度） */
+.rv-review-block.noted:not(.in-section) { border-left: 2px solid var(--success, #3fb950); padding-left: 7px; margin-left: 1px; }
+.rv-review-block.noted.dropped { border-left-color: var(--error); }
+/*
+  **一节被评/被删时，整节都要画出来**（标题带到同级标题或 `---` 为止，见 `reviewBlocks.dropSpan`）。
+  竖线用伪元素画、上下各探出一点，跨过块间的 2px 空隙，整节是**一条连续的线**而不是一截一截。
+*/
+.rv-review-block.in-section { padding-left: 10px; margin-left: 1px; }
+.rv-review-block.in-section::before {
+  content: ''; position: absolute; left: 0; top: -1px; bottom: -1px; width: 2px;
+  background: var(--border); border-radius: 1px;
+}
+.rv-review-block.in-section.section-noted::before { background: var(--success, #3fb950); }
+.rv-review-block.in-section.section-dropped::before { background: var(--error); }
+/* 这一行自己那道（外层没说过的事才画）—— 画在整节那道右边 */
+.rv-review-block.in-section.noted:not(.section-noted),
+.rv-review-block.in-section.dropped:not(.section-dropped) { padding-left: 16px; }
+.rv-review-block.in-section.noted:not(.section-noted)::after,
+.rv-review-block.in-section.dropped:not(.section-dropped)::after {
+  content: ''; position: absolute; left: 6px; top: -1px; bottom: -1px; width: 2px; border-radius: 1px;
+}
+.rv-review-block.in-section.noted:not(.section-noted)::after { background: var(--success, #3fb950); }
+.rv-review-block.in-section.dropped:not(.section-dropped)::after { background: var(--error); }
+/* **鼠标停在标题上，整段亮起来** —— ✕ 一个标题可能带走十几行，范围要在点之前看得见 */
+.rv-review-block.section-preview { background: var(--bg-hover, rgba(255, 255, 255, .045)); border-radius: 0; }
+.rv-review-block.section-preview.section-head { border-radius: 4px 4px 0 0; background: var(--bg-hover, rgba(255, 255, 255, .075)); }
+.rv-review-block.section-head:hover .rt-block-drop { color: var(--error); opacity: 1; }
+/* 改写中的那一节**锁住**：变淡 + 不可选，处置按钮全部收掉，并明确写出"改写中" */
+.rv-review-block.locked { opacity: .62; user-select: none; }
+.rv-review .rt-block-lock { font-size: 10px; line-height: 1.5; margin-top: 3px; color: var(--success, #3fb950); }
+
+/* 意见框：草稿 + 确认/记下/取消。宽度铺满这一栏，高度跟着内容长（一句话就一行高） */
+.rv-note-slot { display: block; }
+.rv-review .rt-note-box { margin-top: 4px; margin-bottom: 6px; }
+.rv-review .rt-note {
+  width: 100%; box-sizing: border-box; min-height: 0; max-height: 50vh; field-sizing: content; overflow-y: auto;
+  resize: vertical; margin-top: 4px; font: inherit; font-size: 11px; line-height: 1.5; padding: 4px 6px;
+  border: 1px solid var(--border); border-radius: 5px; background: transparent; color: var(--text-primary);
+}
+.rv-review .rt-note-actions { display: flex; justify-content: flex-end; align-items: center; gap: 8px; margin-top: 5px; }
+/* 「✓ 确认」：强调色描边、不用实心底 —— 实心底留给最下面那个「提交」，这里一屏可能按十次 */
+.rv-review .rt-note-apply {
+  appearance: none; -webkit-appearance: none; font: inherit; font-size: 10px;
+  padding: 3px 8px; border-radius: 4px; cursor: pointer;
+  border: 1px solid var(--accent); background: none; color: var(--accent);
+}
+.rv-review .rt-note-apply:hover:not(:disabled) { background: rgba(124,111,224,.16); }
+.rv-review .rt-note-apply:disabled { opacity: .45; cursor: default; }
+/* 上一次没改成的原因 —— 那时框留着，所以必须就地说出来 */
+.rv-review .rt-note-applied { font-size: 10px; line-height: 1.6; color: var(--text-tertiary); margin-top: 3px; }
+/* 记下的那条意见：一行摘要，带一直可见的「✎ / ✕」 */
+.rv-review .rt-brief-row { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
+.rv-review .rt-hist-one { display: flex; align-items: baseline; gap: 4px; min-width: 0; }
+.rv-review .rt-hist-one > .rt-note-brief { flex: 1 1 auto; min-width: 0; width: auto; }
+.rv-review .rt-hist-btn {
+  flex: none; font: inherit; font-size: 10px; line-height: 1; cursor: pointer;
+  width: 20px; height: 20px; padding: 0; border-radius: 4px;
+  border: 1px solid transparent; background: none; color: var(--text-tertiary); opacity: .65;
+}
+.rv-review .rt-hist-btn:hover { opacity: 1; border-color: var(--border); background: var(--bg-hover); color: var(--accent); }
+.rv-review .rt-hist-del:hover { border-color: var(--error); color: var(--error); }
+
+/* 最下面：「其他意见」一个框 + 提交 */
+.rv-review-adds { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.rv-review .rv-review-adds-input { min-height: 0; }
+.rv-review-submit {
+  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
+  padding: 10px 0 6px; border-top: 1px dashed var(--border); position: sticky; bottom: 0;
+  background: var(--bg-primary);
+}
+.rv-review-submit .rv-gate-pass:disabled { opacity: .4; cursor: default; filter: none; }
+.rv-review-sent { margin: 0; font-size: 10px; line-height: 1.6; color: var(--accent); }
+.rv-review-warn { margin: 0; font-size: 10px; line-height: 1.6; color: var(--error); }
