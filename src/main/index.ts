@@ -9504,7 +9504,24 @@ app.whenReady().then(async () => {
     sessionId: string,
     messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: store.StoredToolCall[] }>,
   ) => {
-    store.rewriteTranscript(sessionId, Array.isArray(messages) ? messages : []);
+    const next = Array.isArray(messages) ? messages : [];
+    /*
+      **保留的消息必须本来就是这条会话的** ——「有的会话似乎内容混了」。
+      重跑 / 打断后覆盖都是"保留前面一段、丢掉后面"，所以 next 里的消息 id 一定出现在现有 transcript 里。
+      一条都对不上，说明渲染层传来的是**别的会话**的消息（切会话那一拍的缓存错配，见 useAcp 的
+      messagesOwner）—— 照写就是把这条会话的历史整份换成别人的。拒绝，留下现状。
+    */
+    const existing = store.readTranscript(sessionId);
+    if (existing.length && next.length) {
+      const have = new Set(existing.map((m) => m.id));
+      const known = next.filter((m) => have.has(m.id)).length;
+      if (known === 0) {
+        logger.error('session', `拒绝重写 transcript sessionId=${sessionId}：要保留的 ${next.length} 条消息一条都不在这条会话里`
+          + `（现有 ${existing.length} 条）—— 多半是别的会话的消息，照写会把它的历史换掉`);
+        return { ok: false, error: '要保留的消息不属于这条会话，没有重写（防止把别的会话的内容写进来）。' };
+      }
+    }
+    store.rewriteTranscript(sessionId, next);
     return { ok: true };
   });
 

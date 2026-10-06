@@ -370,7 +370,25 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch {}
     return null;
   });
-  const [messages, setMessages] = useState<Message[]>([]);
+  const [messages, setMessagesState] = useState<Message[]>([]);
+  /**
+   * **`messages` 属于哪条会话** ——「有的会话似乎内容混了」。
+   *
+   * 切会话时 `currentSessionId` 先变成 B，而 `messages` 还是 A 的（B 的历史是异步读进来的，晚一拍）。
+   * 下面那个"把当前视图存进缓存"的 effect 在这一拍里跑一次，就把 **A 的消息存进了 B 的缓存格子**；
+   * 之后 B 上任何按缓存整份重写 transcript 的动作（重跑、自动重发、打断后覆盖 → `rewriteTranscript`）
+   * 都会把 B 的磁盘历史整份换成 A 的。实测一次：「AWS Resilience 博客素材评估」的 transcript
+   * 被换成了「FSx ONTAP」那条的 28 条消息，触发点是模型切换后的自动重发。
+   *
+   * 所有调用点在调 setMessages 时都已经保证"这批消息属于 currentSessionRef.current"（要么先判过
+   * `currentSessionRef.current === sid`，要么就在 switchSession 里刚把它设成新会话之后），
+   * 所以在这里一起记下归属，effect 只在归属等于当前会话时才写缓存。
+   */
+  const [messagesOwner, setMessagesOwner] = useState<string | null>(null);
+  const setMessages = useCallback((next: Message[] | ((prev: Message[]) => Message[])) => {
+    setMessagesOwner(currentSessionRef.current);
+    setMessagesState(next as any);
+  }, []);
   // Session IDs currently streaming (supports parallel streaming across models)
   const [streamingIds, setStreamingIds] = useState<string[]>([]);
   // Session IDs whose per-session executor is ATTACHED this run (design §3).
@@ -1669,10 +1687,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // instant. Nothing is written to localStorage any more: the durable transcript
   // on disk is the source of truth and switchSession reads it on a cache miss.
   useEffect(() => {
-    if (currentSessionId && messages.length > 0) {
+    /* 归属对不上就是切会话那一拍 —— 写进去就是把别的会话的消息存成这条的（见 messagesOwner） */
+    if (currentSessionId && messagesOwner === currentSessionId && messages.length > 0) {
       messagesCacheRef.current.set(currentSessionId, messages);
     }
-  }, [messages, currentSessionId]);
+  }, [messages, currentSessionId, messagesOwner]);
   /**
    * Same array object, reachable synchronously from switchSession —— 但**必须连它属于哪条会话一起记**。
    *
@@ -1684,7 +1703,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 症状是「修改画布下面那个 session 变成了别的会话内容」：画布下面那格是
    * `renderPane(studioSid, …)`，它不是焦点会话时读的正是 `paneViews[studioSid]`。
    */
-  useEffect(() => { focusedMessagesRef.current = { sessionId: currentSessionId, messages }; });
+  /* 记的是 messages 的**真实归属**，不是 currentSessionId —— 那一拍里两者正好对不上 */
+  useEffect(() => { focusedMessagesRef.current = { sessionId: messagesOwner, messages }; });
 
 
   // Persist sessions whenever they change
