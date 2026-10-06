@@ -68,7 +68,8 @@ describe('the wedge watchdog does not consult the CPU', () => {
     assert.ok((hook.match(/markTurnInterrupted\(/g) || []).length >= 3,
       'Stop, executor death and the watchdog must all mark the turn');
     const wedge = hook.slice(hook.indexOf('window.kiroApi.onTurnWedged'));
-    const branch = wedge.slice(0, 1600);
+    /* 这一支后来先试自动续写（见 WEDGE_CONTINUE_PROMPT），次数用完才走 markTurnInterrupted，所以窗口放宽 */
+    const branch = wedge.slice(0, 4000);
     assert.match(branch, /if \(produced\) \{/, 'the produced branch must do more than return');
     assert.match(branch, /markTurnInterrupted\(sid\)/);
     // The anchor walk existed in three copies; a fourth would drift.

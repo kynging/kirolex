@@ -86,37 +86,45 @@ const mdUrlTransform = (url: string) => (/^javascript:/i.test(url) ? '' : url);
 const URL_RE = /^(https?:|mailto:|tel:)/i;
 // Open a file path inside KiroLex's own viewer (not the OS default app). App
 // listens for this event and shows the in-app file modal. URLs still go external.
-function openPathInApp(target: string) {
-  window.dispatchEvent(new CustomEvent('kirolex:open-file', { detail: { path: target } }));
+function openPathInApp(target: string, sessionId?: string) {
+  window.dispatchEvent(new CustomEvent('kirolex:open-file', { detail: { path: target, sessionId } }));
 }
+/**
+ * **这条消息属于哪条会话** ——「为啥这两个会话里的文件链接打不开」。相对路径（`files/blog-draft-v1.md`）
+ * 要按那条会话自己的目录解析；以前查存在和打开都不带会话 id，主进程只能按家目录解析，于是全部打不开。
+ * 用 context 而不是读全局"当前会话"：分屏时两个窗格是两条会话。
+ */
+const PathSessionContext = React.createContext<string>('');
 // Existence cache so a file path is only stat'd once across the whole transcript.
 // 'pending' while the async check is in flight; a path that doesn't exist is
 // rendered as plain text (no dead link) instead of a clickable reference.
 const pathExistsCache = new Map<string, boolean>();
 const pathExistsInflight = new Map<string, Promise<boolean>>();
-function usePathExists(path: string): 'pending' | 'yes' | 'no' {
-  const cached = pathExistsCache.get(path);
+function usePathExists(path: string, sessionId = ''): 'pending' | 'yes' | 'no' {
+  /* 缓存按"会话 + 路径"：同一个相对路径在两条会话里指的是两个文件 */
+  const key = `${sessionId}|${path}`;
+  const cached = pathExistsCache.get(key);
   const [state, setState] = useState<'pending' | 'yes' | 'no'>(
     cached === undefined ? 'pending' : cached ? 'yes' : 'no',
   );
   useEffect(() => {
-    if (pathExistsCache.has(path)) {
-      setState(pathExistsCache.get(path) ? 'yes' : 'no');
+    if (pathExistsCache.has(key)) {
+      setState(pathExistsCache.get(key) ? 'yes' : 'no');
       return;
     }
     let live = true;
-    let p = pathExistsInflight.get(path);
+    let p = pathExistsInflight.get(key);
     if (!p) {
-      p = Promise.resolve(window.kiroApi.pathExists?.(path) ?? true).then((ok) => {
-        pathExistsCache.set(path, !!ok);
-        pathExistsInflight.delete(path);
+      p = Promise.resolve(window.kiroApi.pathExists?.(path, sessionId || undefined) ?? true).then((ok) => {
+        pathExistsCache.set(key, !!ok);
+        pathExistsInflight.delete(key);
         return !!ok;
       });
-      pathExistsInflight.set(path, p);
+      pathExistsInflight.set(key, p);
     }
     p.then((ok) => { if (live) setState(ok ? 'yes' : 'no'); });
     return () => { live = false; };
-  }, [path]);
+  }, [key, path, sessionId]);
   return state;
 }
 // Renders a file/dir path as a clickable in-app reference ONLY when it exists on
@@ -126,16 +134,18 @@ const FileRef = ({ path, as, className, children }: {
   path: string; as: 'a' | 'code'; className?: string; children: React.ReactNode;
 }) => {
   const t = useT();
-  const exists = usePathExists(path);
+  const sessionId = React.useContext(PathSessionContext);
+  const exists = usePathExists(path, sessionId);
   if (exists !== 'yes') {
-    // Not (yet) known to exist -> plain, non-clickable text.
+    // Not (yet) known to exist -> plain, non-clickable text. **不带链接的样式**：原来照样挂着
+    // md-file-link，看起来能点、点了没反应 —— 那就是「文件链接打不开」的另一半。
     return as === 'code'
-      ? <code className={className}>{children}</code>
+      ? <code className={className === 'md-file-link' ? undefined : className}>{children}</code>
       : <span>{children}</span>;
   }
   if (as === 'code') {
     return (
-      <code className="md-file-link" title={t('Open the file inside KiroLex')} onClick={() => openPathInApp(path)}>
+      <code className="md-file-link" title={t('Open the file inside KiroLex')} onClick={() => openPathInApp(path, sessionId)}>
         {children}
       </code>
     );
@@ -144,7 +154,7 @@ const FileRef = ({ path, as, className, children }: {
     <a
       href="#"
       className="md-link"
-      onClick={(e: React.MouseEvent) => { e.preventDefault(); openPathInApp(path); }}
+      onClick={(e: React.MouseEvent) => { e.preventDefault(); openPathInApp(path, sessionId); }}
     >
       {children}
     </a>
@@ -2212,7 +2222,8 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
  *  The `diff` button is intentionally unaffected: the diff text lives in the
  *  transcript, so what changed stays readable even once the file is gone. */
 const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label }) => {
-  const exists = usePathExists(path);
+  const sessionId = React.useContext(PathSessionContext);
+  const exists = usePathExists(path, sessionId);
   if (exists === 'no') {
     return (
       <span
@@ -2227,7 +2238,7 @@ const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label
     <span
       className="files-item-path"
       title={`在 KiroLex 内打开 ${path}`}
-      onClick={() => openPathInApp(path)}
+      onClick={() => openPathInApp(path, sessionId)}
     >
       {label}
     </span>
@@ -3436,6 +3447,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   }, [paneFocused, findOpen, closeFind]);
 
   return (
+    /* 消息里的文件链接按这条会话的目录解析（见 PathSessionContext） */
+    <PathSessionContext.Provider value={currentSessionId || ''}>
     <div
       className={`chat-main ${isDragOver ? 'drag-over' : ''}${readOnly ? ' chat-main-pane' : ''}`}
       onDrop={readOnly ? undefined : handleDrop}
@@ -4537,5 +4550,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       )}
       <ConfirmDialog request={confirm} onClose={() => setConfirm(null)} />
     </div>
+    </PathSessionContext.Provider>
   );
 };

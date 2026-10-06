@@ -169,7 +169,10 @@ describe('路径：`\\` 和 `/` 都要认', () => {
       文件头那段注释里也会提到旧写法（在解释为什么改）。
     */
     assert.equal(/\.trim\(\)\.replace\(\/\^file:/.test(M), false, '调用点不该再就地剥前缀');
-    assert.ok((M.match(/stripFileUrl\(/g) || []).length >= 5);
+    /* path-exists / open-external 后来并进了 resolveUserPath（相对路径按会话目录解析），调用点少了两处，
+       但每个入口仍然经过它 */
+    assert.ok((M.match(/stripFileUrl\(/g) || []).length >= 3);
+    assert.match(M, /function resolveUserPath\(filePath: string, sessionId\?: string \| null\): string \{\r?\n    let p = stripFileUrl\(filePath\);/);
     /* percent-encoding 也要解 —— `file://` URL 里空格是 %20 */
     assert.match(M, /decodeURIComponent\(p\)/);
   });

@@ -8321,12 +8321,7 @@ app.whenReady().then(async () => {
         // Resolve the SAME way app:path-exists / workspace:read do, so a relative
         // or ~-prefixed path handed over from chat still points at the real file
         // instead of being resolved against the app process cwd.
-        let p = stripFileUrl(target);
-        if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
-        if (!path.isAbsolute(p)) {
-          const entry = sessionId ? sessionClients.get(sessionId) : undefined;
-          p = path.resolve(entry?.cwd || os.homedir(), p);
-        }
+        const p = resolveUserPath(target, sessionId);
         const err = await shell.openPath(p);
         if (err) return { ok: false, error: err };
       }
@@ -8364,15 +8359,12 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:path-exists', (_event, filePath: string, sessionId?: string) => {
     try {
       if (!filePath) return false;
-      const entry = sessionId ? sessionClients.get(sessionId) : undefined;
-      if (entry?.profile.remote?.sshHost) return true;
-      let p = stripFileUrl(filePath);
-      if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
-      if (!path.isAbsolute(p)) {
-        const base = entry?.cwd || os.homedir();
-        p = path.resolve(base, p);
-      }
-      return fs.existsSync(p);
+      /*
+        和打开走同一个解析（resolveUserPath）—— 原来这里自己按 `entry.cwd || 家目录` 解析，远程会话还一律
+        回 true：于是"显示成链接"和"点了能不能打开"是两套判断，看起来是链接、点了 ENOENT。
+        远程那头的文件（只在那台机器上的路径）在本机打不开，就不该显示成链接。
+      */
+      return fs.existsSync(resolveUserPath(filePath, sessionId));
     } catch {
       return false;
     }
@@ -8398,12 +8390,30 @@ app.whenReady().then(async () => {
     return os.homedir();
   }
 
-  /** Expand `file://` and `~`, then resolve relatives against workspaceBase. */
+  /**
+   * Expand `file://` and `~`, then resolve relatives.
+   *
+   * **相对路径按这条会话自己的目录找** ——「为啥这两个会话里的文件链接打不开」。会话里写出来的相对路径
+   * （`files/blog-draft-v1.md`、`channel/digest_diff.py`）指的是这条会话在本机的文件夹：cwd 固定成
+   * `sessions/<id>/files/` 之后，模型有时相对 files/ 说、有时相对会话目录说（"files/xxx"）。原来一律按
+   * workspaceBase 解析 —— 远程会话和渲染层没带会话 id 的情况都落到家目录，于是全部 ENOENT。
+   * 现在依次试：会话的 files/ → 会话目录 → 项目设的工作目录 → workspaceBase（家目录 / 本地 cwd），
+   * 取第一个存在的；都不存在就返回第一个（报错里给的是最可能的那个路径）。会话不需要连着。
+   */
   function resolveUserPath(filePath: string, sessionId?: string | null): string {
     let p = stripFileUrl(filePath);
     if (p === '~' || p.startsWith('~/')) p = path.join(os.homedir(), p.slice(1));
-    if (!path.isAbsolute(p)) p = path.resolve(workspaceBase(sessionId), p);
-    return p;
+    if (path.isAbsolute(p)) return p;
+    const bases: string[] = [];
+    if (sessionId && /^[\w.-]+$/.test(sessionId) && fs.existsSync(path.join(sessionsBaseDir, sessionId))) {
+      bases.push(path.join(sessionsBaseDir, sessionId, SESSION_FILES_DIR), path.join(sessionsBaseDir, sessionId));
+      const profile = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile;
+      const ws = profile ? projectWorkspaceFor(profile) : '';
+      if (ws) bases.push(ws);
+    }
+    bases.push(workspaceBase(sessionId));
+    const candidates = bases.map((b) => path.resolve(b, p));
+    return candidates.find((c) => fs.existsSync(c)) || candidates[0];
   }
 
   ipcMain.handle('workspace:list', (_event, sessionId?: string | null, directory?: string) => {

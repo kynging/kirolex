@@ -1856,7 +1856,8 @@ const App: React.FC = () => {
   // OS default app. Reads via the connected session's workspace:read.
   // Exception: file types the viewer cannot render (PDF/Office/media/archives…)
   // are handed to the OS default application instead of opening a dead tab.
-  const openFileInApp = useCallback(async (rawPath: string) => {
+  const openFileInApp = useCallback(async (rawPath: string, forSessionId?: string) => {
+    const sessionForPath = forSessionId || currentSessionId;
     const p = rawPath.replace(/^file:\/\//, '');
     // Already open -> just focus that tab. Re-reading would throw away the scroll
     // position and the rendered/raw choice the user had set.
@@ -1865,7 +1866,7 @@ const App: React.FC = () => {
 
     // Known non-previewable type: go straight to the system app, no tab flash.
     if (needsSystemApp(p)) {
-      const res = await window.kiroApi.openExternal?.(p, currentSessionId || undefined);
+      const res = await window.kiroApi.openExternal?.(p, sessionForPath || undefined);
       if (res?.ok !== false) return;
       // Fall through to the in-app tab so the failure is visible (and the tab
       // still offers Download).
@@ -1884,11 +1885,11 @@ const App: React.FC = () => {
       // on a session made the viewer (and the Workspace panel that feeds it) fail
       // with "打开一个已连接的会话后才能..." for any dormant chat. currentSessionId is
       // passed only so a RELATIVE path resolves against that chat's cwd.
-      const result = await window.kiroApi.workspaceRead(currentSessionId, p);
+      const result = await window.kiroApi.workspaceRead(sessionForPath, p);
       // Detected binary (NUL bytes / oversized image) with no useful preview:
       // hand it to the system app and drop the tab we just opened.
       if (result.binary && !result.image) {
-        const res = await window.kiroApi.openExternal?.(p, currentSessionId || undefined);
+        const res = await window.kiroApi.openExternal?.(p, sessionForPath || undefined);
         if (res?.ok !== false) { closeFileTab(id); return; }
       }
       setFileTabs((prev) => prev.map((t) => (t.id === id ? { ...t, ...result } : t)));
@@ -2030,7 +2031,9 @@ const App: React.FC = () => {
   useEffect(() => {
     const handler = (e: Event) => {
       const path = (e as CustomEvent).detail?.path;
-      if (typeof path === 'string' && path) void openFileInApp(path);
+      /* 带着点击所在那条会话的 id：相对路径按它解析（分屏时不一定是"当前"会话） */
+      const sid = (e as CustomEvent).detail?.sessionId;
+      if (typeof path === 'string' && path) void openFileInApp(path, typeof sid === 'string' && sid ? sid : undefined);
     };
     window.addEventListener('kirolex:open-file', handler as EventListener);
     return () => window.removeEventListener('kirolex:open-file', handler as EventListener);

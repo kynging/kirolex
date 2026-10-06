@@ -200,6 +200,14 @@ function autoRetryMax(): number {
   } catch { return AUTO_RESEND_MAX_ATTEMPTS; }
 }
 
+/**
+ * 一轮已经有产出、却被"静默太久"判定卡死时自动发的那句（见 onTurnWedged）。
+ * 只叫它接着做，不重复原问题；并点名最常见的成因 —— 一口气憋一大段长输出，期间没有任何工具调用。
+ */
+export const WEDGE_CONTINUE_PROMPT = '上一轮被 KiroLex 判定"静默太久"自动中断了（很可能是一次性构思了很长的输出，期间没有任何工具调用）。'
+  + '已经做完的不用重做，从中断的地方接着做完。长内容请分段写、每写完一段就保存一次（例如每节一次 local_write / 文件写入），'
+  + '不要把整篇憋在一次输出里。';
+
 const PENDING_STEERS_KEY = 'kirolex-pending-steers';
 /** 每次改动都把自己写进 ui-state 的 Map（只存会被放回队列的那两样：文字和附件）。 */
 class PersistedSteerMap extends Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]> {
@@ -946,6 +954,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // Sessions already examined for an interrupted turn this run, so recovery runs at
   // most once per chat.
   const recoveryCheckedRef = useRef<Set<string>>(new Set());
+  /** 每条会话因"静默太久"被自动续写了几次（用户自己发一条就清零）；上限是 autoRetryMax()。 */
+  const wedgeContinuesRef = useRef<Map<string, number>>(new Map());
+  /** 正在由自动续写发出的那一条 —— sendMessage 见到它就不清零上面那个计数。 */
+  const autoContinueInFlightRef = useRef<Set<string>>(new Set());
   /** A turn that never got a reply — the app quit (or crashed) while it was running.
    *  Recovery RESENDS it automatically: the transcript is truncated back to before
    *  that user message and the same prompt (with its attachments and paste refs) is
@@ -2458,6 +2470,33 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             await new Promise((r) => setTimeout(r, 300));
           }
           if (streamingIdsRef.current.has(sid)) return;   // never settled; leave it alone
+          /*
+            **自动续写** ——「像这样的中断有没有什么办法能让会话自动重试数次」。
+            已经有产出的那一轮不能重发原问题（会把做过的事再做一遍、答两遍），但可以发一句
+            "接着做"：实测那次是模型一口气构思整篇长文、15 分钟没有任何工具调用而被判卡死，
+            接着做、并且分段写，就能写完。次数和自动重发共用「自动重试次数」那个设置；
+            用户自己发一条消息就清零（见 sendMessage 开头）。
+            **不能**走 markTurnInterrupted：它会让下一次发送"覆盖"这一轮 —— 续写那条一发出去，
+            前面那段已有的产出就被截掉了。
+          */
+          let resendOff = false;
+          try { resendOff = JSON.parse(uiGet('kirolex-settings') || '{}')?.recoverInterruptedTurns === false; } catch { /* 默认开 */ }
+          const max = autoRetryMax();
+          const done = wedgeContinuesRef.current.get(sid) || 0;
+          if (!resendOff && max > 0 && done < max) {
+            wedgeContinuesRef.current.set(sid, done + 1);
+            autoContinueInFlightRef.current.add(sid);
+            setSessionActivity(sid, `⚠️ 这一轮静默太久被中断，正在自动续写（第 ${done + 1}/${max} 次）…`);
+            try {
+              await sendMessageRef.current([{ type: 'text', text: WEDGE_CONTINUE_PROMPT }], undefined, undefined, undefined, undefined, sid);
+            } catch {
+              autoContinueInFlightRef.current.delete(sid);
+              markTurnInterrupted(sid);
+            } finally {
+              setSessionActivity(sid, null);
+            }
+            return;
+          }
           markTurnInterrupted(sid);
         })();
         return;
@@ -3226,6 +3265,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // be open, which then answered it.
     let sid = targetSid || currentSessionRef.current || currentSessionId;
     const activeModel = model || modelForSession(sid);
+    /* 自动续写发的那条不算；人发的一条 = 这条会话的续写次数从头算 */
+    if (sid) { if (autoContinueInFlightRef.current.has(sid)) autoContinueInFlightRef.current.delete(sid); else wedgeContinuesRef.current.delete(sid); }
 
     // Cancel-overwrite: if this session had a turn cancelled, the next submit
     // OVERWRITES the interrupted turn — truncate from that user message and

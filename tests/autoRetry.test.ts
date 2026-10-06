@@ -81,3 +81,20 @@ describe('steer 和队列不再丢', () => {
     assert.match(APP, /const orphans = takeOrphanSteers\(\);/);
   });
 });
+
+describe('静默太久被中断、但已有产出的那一轮：自动续写', () => {
+  const H = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+  test('发"接着做"，不重发原问题；次数受「自动重试次数」管', () => {
+    assert.match(H, /export const WEDGE_CONTINUE_PROMPT = /);
+    assert.match(H, /if \(!resendOff && max > 0 && done < max\) \{/);
+    assert.match(H, /await sendMessageRef\.current\(\[\{ type: 'text', text: WEDGE_CONTINUE_PROMPT \}\], undefined, undefined, undefined, undefined, sid\);/);
+  });
+  test('续写不走 markTurnInterrupted（否则下一次发送会把已有产出覆盖掉）；用完次数才退回老路', () => {
+    const at = H.indexOf('if (!resendOff && max > 0 && done < max) {');
+    const block = H.slice(at, at + 900);
+    assert.match(block, /return;\n {10}\}\n {10}markTurnInterrupted\(sid\);/);
+  });
+  test('人自己发一条就清零；自动续写那条不清零', () => {
+    assert.match(H, /if \(autoContinueInFlightRef\.current\.has\(sid\)\) autoContinueInFlightRef\.current\.delete\(sid\); else wedgeContinuesRef\.current\.delete\(sid\);/);
+  });
+});
