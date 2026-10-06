@@ -2732,9 +2732,12 @@ button, input, select, textarea {
 /* Rendered markdown inside the file/report viewer. Self-contained on purpose: the
    chat's markdown rules are scoped to `.message.assistant .message-content`, and
    widening those selectors risks the chat layout. */
+/* 侧栏的正文跟着「字号」设置走 ——「我改了字号似乎不影响这个侧栏」。原来写死 13px / 12px，
+   而那个设置只设了 --chat-font-size、只有聊天消息在用。标题、行内代码用的是 em，跟着正文一起变；
+   行号、标签这类小字不跟（它们是界面，不是内容）。 */
 .workspace-viewer-md {
   padding: 4px 2px 24px;
-  font-size: 13px;
+  font-size: var(--chat-font-size, 13px);
   line-height: 1.65;
   color: var(--text-primary);
   overflow-wrap: anywhere;
@@ -4806,7 +4809,8 @@ button, input, select, textarea {
   margin: 0;
   color: var(--text-primary);
   font-family: 'SF Mono', 'JetBrains Mono', monospace;
-  font-size: 12px;
+  /* 代码 / 原文视图比正文小 1px（等宽字看着更大），同样跟着设置走 */
+  font-size: calc(var(--chat-font-size, 13px) - 1px);
   line-height: 1.5;
   white-space: pre-wrap;
   word-break: break-word;
@@ -8332,7 +8336,7 @@ button, input, select, textarea {
   `gap: 0` 是刻意的：块内只有"正文"和"那个不占高度的工具包装"，留 gap 的话**每一行都会多一截**。
 */
 .rv-review-block { position: relative; display: flex; flex-direction: column; gap: 0; padding-right: 46px; }
-.rv-review-md { font-size: 12px; line-height: 1.75; }
+.rv-review-md { font-size: var(--chat-font-size, 12px); line-height: 1.75; }
 .rv-review-md > :first-child { margin-top: 0; }
 .rv-review-md > :last-child { margin-bottom: 0; }
 .rv-review-text {

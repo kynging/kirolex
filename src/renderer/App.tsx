@@ -503,6 +503,8 @@ const DEFAULT_SETTINGS: Settings = { fontSize: 12, fontFamily: '', monoFontFamil
 export interface FileTab {
   id: string;
   path: string;
+  /** 当初点开时给的路径（可能是相对的）—— `path` 读完会换成解析后的绝对路径，判重要两个都比 */
+  requestedPath?: string;
   content: string;
   truncated?: boolean;
   binary?: boolean;
@@ -1931,7 +1933,12 @@ const App: React.FC = () => {
     const p = rawPath.replace(/^file:\/\//, '');
     // Already open -> just focus that tab. Re-reading would throw away the scroll
     // position and the rendered/raw choice the user had set.
-    const existing = fileTabs.find((t) => t.path === p);
+    /*
+      **同一个文件只开一个标签** —— 实测点同一个 `files/blog-draft-v1.md` 两次开出两个标签：读完之后
+      标签的 `path` 被结果里解析好的绝对路径覆盖（`{ ...t, ...result }`），再点那个相对路径就对不上了。
+      所以也按"当初点的是什么"（requestedPath）比，并且读 ref 里最新的标签表（两次点击之间可能还没重渲染）。
+    */
+    const existing = fileTabsRef.current.find((t) => t.path === p || t.requestedPath === p);
     if (existing) { setActiveFileTabId(existing.id); return; }
 
     // Known non-previewable type: go straight to the system app, no tab flash.
@@ -1950,7 +1957,7 @@ const App: React.FC = () => {
     const id = `ft_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
     setFileTabs((prev) => {
       /* `ownerSessionId`：这份文件从哪条会话打开 —— 审阅的「✓ 确认」就由它改（见 `FileTab.ownerSessionId`） */
-      const next = [...prev, { id, path: p, content: '', ownerSessionId: sessionForPath || undefined }];
+      const next = [...prev, { id, path: p, requestedPath: p, content: '', ownerSessionId: sessionForPath || undefined }];
       // Evict the oldest tab that is not the one we just opened.
       return next.length > MAX_FILE_TABS ? next.slice(next.length - MAX_FILE_TABS) : next;
     });

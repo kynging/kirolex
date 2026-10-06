@@ -16,6 +16,7 @@
  */
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
+import net from 'node:net';
 import os from 'node:os';
 import crypto from 'node:crypto';
 import path from 'node:path';
@@ -105,6 +106,21 @@ const RESTART_LOCK_GRACE_MS = 60_000;
  * 日志里 retry 7、8 隔一秒、9、10 又隔一秒，两个新实例抢同一把锁。
  */
 let pendingStart = null;
+/** 主进程 --dev 下开的远程调试端口（src/main/index.ts 里的 remote-debugging-port）。 */
+const CDP_PORT = 9222;
+/** 端口没人 listen 了就 resolve(true)；到时间还被占着就 resolve(false)。 */
+function waitPortFree(port, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  return new Promise((resolve) => {
+    const probe = () => {
+      const sock = net.connect({ port, host: '127.0.0.1' });
+      sock.once('connect', () => { sock.destroy(); if (Date.now() > deadline) resolve(false); else setTimeout(probe, 300); });
+      sock.once('error', () => resolve(true));
+    };
+    probe();
+  });
+}
+
 function scheduleStart(wait) {
   if (pendingStart) clearTimeout(pendingStart);
   pendingStart = setTimeout(() => { pendingStart = null; if (!shuttingDown) startElectron(); }, wait);
@@ -158,7 +174,19 @@ function startElectron() {
       // Windows: the old instance's network-service process outlives the main one by
       // a moment and still holds the --dev CDP port (9222), so an immediate relaunch
       // came up with no debug port at all. A short pause lets it go.
-      scheduleStart(process.platform === 'win32' ? 1500 : 0);
+      /*
+        **固定 1.5 秒不够** —— 实测（10-06 两次）：重启之后新实例照样没有调试端口，旧实例的网络进程
+        占着 9222 比 1.5 秒久。改成等它真的放开（最多 15 秒），放开了再起；等不到也照样起（端口没了
+        只影响调试，不影响用）。
+      */
+      if (process.platform === 'win32') {
+        void waitPortFree(CDP_PORT, 15_000).then((free) => {
+          if (!free) log('electron', `port ${CDP_PORT} still busy after 15s -- starting anyway (no remote debugging this run)`);
+          scheduleStart(300);
+        });
+      } else {
+        scheduleStart(0);
+      }
       return;
     }
     // 42 = another instance owns the single-instance lock. Retrying can never

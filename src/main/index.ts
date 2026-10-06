@@ -8486,7 +8486,10 @@ app.whenReady().then(async () => {
         回 true：于是"显示成链接"和"点了能不能打开"是两套判断，看起来是链接、点了 ENOENT。
         远程那头的文件（只在那台机器上的路径）在本机打不开，就不该显示成链接。
       */
-      return fs.existsSync(resolveUserPath(filePath, sessionId));
+      if (fs.existsSync(resolveUserPath(filePath, sessionId))) return true;
+      /* 远端那台机器上的路径：直接算"能点"（不为每个链接开一次 ssh —— 一次要好几秒），点开时再去读，
+         真没有就在标签页里说清楚（见 readRemoteFile） */
+      return !!remoteFileFor(sessionId, filePath);
     } catch {
       return false;
     }
@@ -8550,6 +8553,48 @@ app.whenReady().then(async () => {
     return { path: target, parent: path.dirname(target), entries };
   });
 
+  /**
+   * **远程会话在它自己那台机器上写的文件** ——「在会话中我根本不能点开看文件」。
+   *
+   * 远端那条会话用它自己的工具写文件，落在那台机器上（`/home/ec2-user/kirolex/scratch/…`），本机根本
+   * 没有 —— 于是"这一轮改了哪些文件"里一排都是「文件已不存在」。本机找不到、而它像是那台机器上的路径时，
+   * 返回那台机器和远端路径，由 `readRemoteFile` 用 ssh 读。
+   *   · POSIX 绝对路径，但**不含 `/Users/`**：那是 Mac 上的路径（这些会话以前在 Mac 上跑过），哪儿都读不到；
+   *   · 相对路径按那条会话在远端的 cwd 拼。
+   * 只读：远端文件不进 `reviewedPaths`，`review:write-file` 照旧拒写。
+   */
+  function remoteFileFor(sessionId: string | null | undefined, rawPath: string): { target: RemoteTarget; path: string } | null {
+    if (!sessionId) return null;
+    const target = kiroConfigTargetFor(sessionId);
+    if (!target?.sshHost) return null;
+    const p = stripFileUrl(rawPath).trim();
+    if (!p || p.includes('\\') || /^[A-Za-z]:/.test(p) || p.startsWith('~')) return null;
+    if (p.startsWith('/')) return p.startsWith('/Users/') ? null : { target, path: p };
+    const cwd = sessionClients.get(sessionId)?.cwd;
+    return cwd && cwd.startsWith('/') ? { target, path: path.posix.join(cwd, p) } : null;
+  }
+
+  /** 用 ssh 读远端一个文件（base64 回来，和配置面板那条路一样），形状和本地读的结果一致。 */
+  async function readRemoteFile(target: RemoteTarget, remotePath: string) {
+    const MAX = WORKSPACE_PREVIEW_MAX_BYTES;
+    const script = `f=${shellQuote(remotePath)}; if [ -d "$f" ]; then echo KXDIR; elif [ -f "$f" ]; then printf 'KXSIZE %s\\n' "$(wc -c <"$f" | tr -d ' ')"; head -c ${MAX} "$f" | base64 -w0; else echo KXMISSING; fi`;
+    const out = String(await runRemoteCapture(target, script, 30_000) || '');
+    const host = labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost;
+    if (out.startsWith('KXDIR')) throw new Error(`${host} 上的 ${remotePath} 是目录，不是文件。`);
+    if (!out.startsWith('KXSIZE ')) throw new Error(`${host} 上没有这个文件：${remotePath}`);
+    const nl = out.indexOf('\n');
+    const size = Number(out.slice(7, nl)) || 0;
+    const buffer = Buffer.from(out.slice(nl + 1).trim(), 'base64');
+    const base = { path: remotePath, remote: true, remoteHost: host, readOnly: true };
+    const ext = path.posix.extname(remotePath).toLowerCase();
+    if (IMAGE_MIME_BY_EXT[ext]) {
+      if (size > MAX) return { ...base, content: `图片过大（${(size / 1048576).toFixed(1)} MB），在 ${host} 上查看。`, binary: true, truncated: false };
+      return { ...base, image: true, dataUrl: `data:${IMAGE_MIME_BY_EXT[ext]};base64,${buffer.toString('base64')}`, content: '' };
+    }
+    if (buffer.includes(0)) return { ...base, content: '(binary file — preview unavailable)', binary: true, truncated: false };
+    return { ...base, content: buffer.toString('utf-8'), truncated: size > MAX };
+  }
+
   ipcMain.handle('workspace:read', async (_event, sessionId: string | null | undefined, filePath: string) => {
     /*
       镜像没了之后**读之前不需要先拉**：远端没有这个项目的副本，review / diff / gate 读的
@@ -8557,7 +8602,13 @@ app.whenReady().then(async () => {
     */
     // No session required: see workspaceBase. The session, when present, only
     // decides what a relative path is relative to.
+    const rawPath = filePath;
     filePath = resolveUserPath(filePath, sessionId);
+    /* 本机没有、而它是远端那台机器上的路径 → 从那台机器读（只读，见 remoteFileFor） */
+    if (!fs.existsSync(filePath)) {
+      const remote = remoteFileFor(sessionId, rawPath);
+      if (remote) return readRemoteFile(remote.target, remote.path);
+    }
     const stats = fs.statSync(filePath);
     if (stats.isDirectory()) throw new Error('Path is a directory, not a file.');
     /*

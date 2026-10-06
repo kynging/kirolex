@@ -16,7 +16,7 @@ const CSS = read('src/renderer/styles/global.css');
 describe('标签页记住它的主人会话', () => {
   test('打开时钉上 ownerSessionId（点链接那条会话，不是此刻选中的那条）', () => {
     assert.match(APP, /ownerSessionId\?: string;/);
-    assert.match(APP, /\{ id, path: p, content: '', ownerSessionId: sessionForPath \|\| undefined \}/);
+    assert.match(APP, /\{ id, path: p, requestedPath: p, content: '', ownerSessionId: sessionForPath \|\| undefined \}/);
   });
 
   test('改写、写回、提交都用主人会话', () => {
