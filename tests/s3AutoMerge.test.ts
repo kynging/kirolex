@@ -45,3 +45,13 @@ test('界面在合并后扔掉缓存重读', () => {
   assert.match(H, /messagesCacheRef\.current\.delete\(d\.sessionId\)/);
   assert.match(H, /switchSessionRef\.current = switchSession;/);
 });
+
+test('从桶里拉的文件只许落在本会话 files/ 或 memory/ 下（key 是远端数据）', () => {
+  assert.match(M, /function containedPath\(base: string, rel: string\)/);
+  assert.match(M, /abs\.startsWith\(root \+ path\.sep\)/);
+  const at = M.indexOf('async function mergeBucketSession(');
+  const body = M.slice(at, M.indexOf('\n}\n', at));
+  assert.match(body, /if \(!o\.key\.startsWith\(fpfx\)\) continue;/);
+  assert.match(body, /containedPath\(filesRoot,/);
+  assert.match(M, /containedPath\(memRoot, path\.relative\('memory', rel\)\)/);
+});

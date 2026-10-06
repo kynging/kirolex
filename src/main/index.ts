@@ -3475,6 +3475,17 @@ function catalogEntriesFor(
 }
 
 /**
+ * 桶里拉下来的对象落到本地之前，确认它真的在 `base` 下面。
+ * `relFor` 已经拒了 `..` 和绝对路径，这里是第二道：key 是远端来的数据，
+ * 而这个路径会被直接写盘 —— 一个越界的 key 就是写到 ~/.kirolex 之外。
+ */
+function containedPath(base: string, rel: string): string | null {
+  const root = path.resolve(base);
+  const abs = path.resolve(root, rel);
+  return abs.startsWith(root + path.sep) ? abs : null;
+}
+
+/**
  * **冲突时自动合并** ——「这个不对，很显然应该自动合并」。
  *
  * 原来判成冲突（桶里那份是别的机器传的、而且更新）就把本机这份传到 conflicts/ 旁路、等人来处理，
@@ -3513,11 +3524,14 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
   }
   let pulledFiles = 0;
   const fpfx = `${keyFor(prefix, path.join('sessions', sessionId, SESSION_FILES_DIR))}/`;
+  const filesRoot = path.join(sdir, SESSION_FILES_DIR);
   for (const o of await listObjects(creds, fpfx)) {
+    if (!o.key.startsWith(fpfx)) continue;
     const rel = relFor(prefix, o.key);
     if (!rel) continue;
-    const abs = path.join(KIROLEX_HOME, rel);
-    if (fs.existsSync(abs)) continue;
+    /* 只许落在这条会话自己的 files/ 下 */
+    const abs = containedPath(filesRoot, path.relative(path.join('sessions', sessionId, SESSION_FILES_DIR), rel));
+    if (!abs || fs.existsSync(abs)) continue;
     fs.mkdirSync(path.dirname(abs), { recursive: true });
     fs.writeFileSync(abs, await getObject(creds, o.key));
     pulledFiles += 1;
@@ -3735,9 +3749,12 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         ...memoryRelsFor(KIROLEX_HOME, ids, memoryProjects).filter((r) => r.endsWith('.md')),
         ...memRemote.keys(),
       ]);
+      const memRoot = path.join(KIROLEX_HOME, 'memory');
       for (const rel of candidates) {
         if (!memScope(rel)) continue;
-        const abs = path.join(KIROLEX_HOME, rel);
+        /* 记忆的路径可能来自桶里的列表 —— 只许落在 ~/.kirolex/memory 下 */
+        const abs = containedPath(memRoot, path.relative('memory', rel));
+        if (!abs) continue;
         let local: { size: number; mtimeMs: number } | undefined;
         try { const st = fs.statSync(abs); local = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* 本机没有 */ }
         const remote = memRemote.get(rel);
