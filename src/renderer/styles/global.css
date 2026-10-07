@@ -74,6 +74,32 @@ button, input, select, textarea {
   background: var(--text-muted);
 }
 
+/*
+  **Windows / Linux 自己画的标题条** ——「有什么办法让最大化的时候把最上面的那个白条隐藏」。
+  系统那条白的去掉了（titleBarStyle: hidden + titleBarOverlay），最小化 / 最大化 / 关闭由系统画在右上角，
+  这条只负责颜色、标题和拖动。高度跟最大化变（主进程推 --win-titlebar-height：平时 32、最大化 28）。
+*/
+:root { --win-titlebar-height: 32px; }
+.win-titlebar {
+  position: fixed;
+  top: 0;
+  left: 0;
+  right: 0;
+  height: var(--win-titlebar-height);
+  display: flex;
+  align-items: center;
+  padding-left: 12px;
+  background: var(--bg-primary);
+  -webkit-app-region: drag;
+  user-select: none;
+  z-index: 999;
+}
+.win-titlebar-title { font-size: 12px; color: var(--text-secondary); letter-spacing: 0.02em; }
+.app-layout.no-toolbar.win {
+  height: calc(100% - var(--win-titlebar-height));
+  margin-top: var(--win-titlebar-height);
+}
+
 /* Drag region */
 .drag-region {
   -webkit-app-region: drag;

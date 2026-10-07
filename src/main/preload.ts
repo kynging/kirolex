@@ -159,6 +159,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
   archiveSession: (sessionId: string, archived: boolean) => ipcRenderer.invoke('acp:archive-session', sessionId, archived),
   getExecutorCap: () => ipcRenderer.invoke('acp:get-executor-cap'),
   reveal: () => ipcRenderer.invoke('acp:reveal'),
+  /** 窗口是否最大化 + 标题条该留多高（Windows / Linux 自己画的那条，见 createWindow） */
+  onWindowMaximized: (callback: (data: { maximized: boolean; height: number }) => void) => {
+    const handler = (_event: any, data: { maximized: boolean; height: number }) => callback(data);
+    ipcRenderer.on('window:maximized', handler);
+    return () => ipcRenderer.removeListener('window:maximized', handler);
+  },
   splashStatus: (text: string) => ipcRenderer.invoke('acp:splash-status', text),
   deleteProjectMemory: (projectId: string) => ipcRenderer.invoke('acp:delete-project-memory', projectId),
   readMemory: (projectId?: string, sessionId?: string) => ipcRenderer.invoke('acp:read-memory', projectId, sessionId),

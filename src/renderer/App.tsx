@@ -685,9 +685,19 @@ function saveSettings(settings: Settings) {
 const isMac =
   typeof navigator !== 'undefined' &&
   navigator.platform.toUpperCase().includes('MAC');
+/** Windows / Linux：系统白标题栏去掉了（见主进程 createWindow），这里自己画一条深色的、可拖动的。 */
+const isWinFrame = typeof navigator !== 'undefined' && !isMac;
 
 const App: React.FC = () => {
   const t = useT();
+  /* 标题条高度跟着最大化 / 还原变（主进程同时改系统按钮那一块的高度，两边用同一个数） */
+  useEffect(() => {
+    if (!isWinFrame) return;
+    const off = (window as any).kiroApi?.onWindowMaximized?.((d: { height: number }) => {
+      if (d?.height) document.documentElement.style.setProperty('--win-titlebar-height', `${d.height}px`);
+    });
+    return () => { try { off?.(); } catch { /* 卸载 */ } };
+  }, []);
   const {
     status,
     errorBySession,
@@ -3452,8 +3462,10 @@ const App: React.FC = () => {
   return (
     <LangProvider lang={settings.language}>
       {/* One line, because 「什么都没出现」 is the one thing a registration must never do silently. */}
-      <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}`}>
+      <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}${isWinFrame ? ' win' : ''}`}>
         {isMac && <div className="mac-titlebar" />}
+        {/* 拖它移动窗口、双击最大化 / 还原（系统行为）；右边留给系统画的最小化 / 最大化 / 关闭 */}
+        {isWinFrame && <div className="win-titlebar"><span className="win-titlebar-title">KiroLex</span></div>}
         <Toasts />
         {!sidebarCollapsed && (
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>

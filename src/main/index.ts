@@ -573,6 +573,14 @@ function emitSessionModel(sessionId: string, model: string) {
  *  kiro-cli session id (so history/context is preserved), then persist + announce
  *  the effective model. Returns false if no candidate could take over, in which
  *  case the caller must surface the original failure. */
+/** 这个模型此刻还在那台机器（本机 / 远端）的 `--list-models` 清单里吗。问不到就当"不在"（维持原来的保守判断）。 */
+async function modelStillListed(profile: AgentProfile, modelId: string): Promise<boolean> {
+  try {
+    const list = profile.remote?.sshHost ? await remotePreflight(profile.remote) : await localModelIds();
+    return Array.isArray(list) && list.includes(modelId);
+  } catch { return false; }
+}
+
 async function swapSessionModel(sessionId: string, failedModel: string, label: string, exclude?: Set<string>): Promise<string | null> {
   const entry = sessionClients.get(sessionId);
   if (!entry) return null;
@@ -595,6 +603,15 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
   sessionClients.delete(sessionId);               // release single-process ownership
   try { await entry.client.disconnect(); } catch {}
   try {
+  /*
+    **先问那台机器：它的模型清单里还有没有这个模型** ——「为什么这两个会话的模型又变回 GPT 了」。
+    实测（10-06 15:22）：到东京的 ssh 断了一下，两条会话一起重连、一起重发，重发那一轮 kiro-cli
+    报了「model is not available」，于是两条都被换成 gpt-5.6-sol、偏好也清掉了 —— 可那台机器的
+    `--list-models` 里 claude-opus-5.5 好好地在。那是一次抖动，不是退役。
+    清单里还在 → 只是这一轮换掉（让对话接着走），**偏好留着、不记成死模型、不记"在这台机器上挣来的"**，
+    下次连上就回到你选的那个；清单里真没有了 → 才按退役处理（下面那段原来的规则）。
+  */
+  const stillListed = await modelStillListed(entry.profile, failedModel);
   for (const model of candidates) {
     /*
       **偏好一并丢掉。**
@@ -612,9 +629,9 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       里重新选一次就会重新写上（手动切换同时更新 `model` 和 `preferredModel`）。
     */
     /* 记下是**哪台机器**挣的：换机器之后这条降级就不该再生效（见 `modelEarnedOn`） */
-    const profile: AgentProfile = {
-      ...entry.profile, model, preferredModel: undefined, modelEarnedOn: machineKeyOf(entry.profile),
-    };
+    const profile: AgentProfile = stillListed
+      ? { ...entry.profile, model, modelEarnedOn: undefined }
+      : { ...entry.profile, model, preferredModel: undefined, modelEarnedOn: machineKeyOf(entry.profile) };
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, entry));
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
@@ -633,14 +650,16 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       rec.executorState = 'attached';
       store.writeRecord(rec);
       logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`
-        + `${entry.profile.preferredModel === failedModel ? `（并清掉偏好 '${failedModel}' —— 轮次里报出的退役是确定性事实，留着它每次重启都要再付一次那 30 秒）` : ''}`);
+        + (stillListed
+          ? `（但那台机器的模型清单里还有 '${failedModel}' —— 当作一时抖动：偏好留着，下次连上回到它）`
+          : `${entry.profile.preferredModel === failedModel ? `（并清掉偏好 '${failedModel}' —— 清单里也没有它了，是真退役）` : ''}`));
       /*
         换成功了 = `failedModel` 在这个后端确实跑不了，记下来。不记的话下一条会话再付一次
         30 秒（实测一次运行里发生了两遍）。只在**换成功**时记：连接失败可能是限流或一时抖动，
         那种不该被当成「这个模型死了」。
       */
       /* 记到**这台机器**名下 —— 同一个模型在另一台机器上可能是好的（见 `modelsKnownDeadBy`） */
-      deadModelsFor(machineKeyOf(entry.profile)).add(failedModel);
+      if (!stillListed) deadModelsFor(machineKeyOf(entry.profile)).add(failedModel);
       emitSessionModel(sessionId, model);
       return model;
     } catch (err: any) {
@@ -4600,6 +4619,10 @@ function getSessionDir(sessionId?: string): string {
 // (per-model getClient removed — executors are now created per-session in the
 //  acp:new-session / acp:load-session handlers, keyed by sessionId.)
 
+/** Windows / Linux 自己画的标题条有多高（系统按钮叠在它右边）；最大化时收窄。 */
+const WIN_TITLEBAR_HEIGHT = 32;
+const WIN_TITLEBAR_HEIGHT_MAXIMIZED = 28;
+
 function createWindow() {
   startupMark('createWindow: start');
   mainWindow = new BrowserWindow({
@@ -4607,7 +4630,13 @@ function createWindow() {
     height: 800,
     minWidth: 800,
     minHeight: 600,
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    /*
+      **Windows / Linux 不要系统那条白色标题栏** ——「全屏模式下总有一个上面的白框，kirolex 标题」。
+      换成 hidden + titleBarOverlay：最小化 / 最大化 / 关闭还是系统自己画（行为、贴边、Snap 都不变），
+      颜色和界面一致；标题和拖动区是渲染层那条 .win-titlebar。最大化时收窄（见下面 maximize 事件）。
+    */
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
+    ...(process.platform === 'darwin' ? {} : { titleBarOverlay: { color: '#1a1a1a', symbolColor: '#a0a0a0', height: WIN_TITLEBAR_HEIGHT } }),
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
     show: false, // Hidden until connected
@@ -4622,6 +4651,16 @@ function createWindow() {
   if (process.platform !== 'darwin') {
     mainWindow.setMenuBarVisibility(false);
     mainWindow.setMenu(null);
+    /* 最大化时标题条收窄到按钮那么高；渲染层按同一个数字留出空间（kiroApi.onWindowMaximized） */
+    const win = mainWindow;
+    const applyTitleBar = (): void => {
+      if (win.isDestroyed()) return;
+      const maximized = win.isMaximized() || win.isFullScreen();
+      try { win.setTitleBarOverlay({ height: maximized ? WIN_TITLEBAR_HEIGHT_MAXIMIZED : WIN_TITLEBAR_HEIGHT }); } catch { /* 老版本 / 不支持 */ }
+      win.webContents.send('window:maximized', { maximized, height: maximized ? WIN_TITLEBAR_HEIGHT_MAXIMIZED : WIN_TITLEBAR_HEIGHT });
+    };
+    for (const ev of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen'] as const) win.on(ev as any, applyTitleBar);
+    win.webContents.on('did-finish-load', applyTitleBar);
   }
 
   // EVERY web link leaves the app — always to the OS default browser, never into
