@@ -309,3 +309,16 @@ describe('trustedChanges 认主进程 patch 档的 PatchChange', () => {
     assert.deepEqual(got, [{ from: 3, to: 3, original: '第一段。\n\n第二段。', origFrom: 3, origTo: 5, text: '第一段。第二段。' }]);
   });
 });
+
+describe('「AI 刚改过」+ 撤销的位置：右边那一栏、按钮正下面', () => {
+  test('绝对定位在按钮那一行下面、贴右；这一段按行数撑高，不压到下一段', () => {
+    const css = fs.readFileSync('src/renderer/styles/global.css', 'utf8');
+    const side = /\.rv-ai-side \{([^}]*)\}/.exec(css)?.[1] || '';
+    assert.match(side, /position: absolute/);
+    assert.match(side, /top: var\(--rv-tool-row\)/);
+    assert.match(side, /right: 0/);
+    assert.match(css, /\.rv-review-block\.ai-host \{ padding-right: \d+px; \}/);
+    const RV = fs.readFileSync('src/renderer/components/ReviewPane.tsx', 'utf8');
+    assert.ok(RV.includes("style={aiHere.length ? { minHeight: `calc(${aiHere.length + 1} * var(--rv-tool-row))` } : undefined}"));
+  });
+});

@@ -1580,7 +1580,10 @@ export const ReviewPane: React.FC<{
                 + `${on && previewing && (ownsSection || owner !== undefined) ? ' section-preview' : ''}`
                 + `${ownsSection ? ' section-head' : ''}`
                 + `${locked ? ' locked' : ''}`
-                + `${aiLayout.lit.has(g.anchor) ? ' ai-changed' : ''}`}
+                + `${aiLayout.lit.has(g.anchor) ? ' ai-changed' : ''}`
+                + `${aiHere.length ? ' ai-host' : ''}`}
+              /* 右边那一栏：第一行 ✎ ✕ ＋ 💬，下面每处 AI 改动一行 —— 这一段至少撑到放得下它们，不压到下一段 */
+              style={aiHere.length ? { minHeight: `calc(${aiHere.length + 1} * var(--rv-tool-row))` } : undefined}
             >
               {/*
                 **comment 模式左边显示行号** ——「我希望 md 的 comment 模式左侧能显示行号」（早先「不要显示什么段落号」
@@ -1629,8 +1632,9 @@ export const ReviewPane: React.FC<{
               )}
               {on && applyNote[`drop:${g.anchor}`] && <div className="rt-note-applied">{applyNote[`drop:${g.anchor}`]}</div>}
               {/*
-                AI 刚改过的那一处：「AI 刚改过」+ 撤销 摆在**正文下面多出来的一行**里（在文档流里，自己撑高这一段）——
-                不再塞进右边那一栏，就不会压到下一段的 ✎ ✕ ＋ 💬。撤销没成的原因也跟在正文下面。
+                AI 刚改过的那一处：「AI 刚改过」+ 撤销 摆在**右边那一栏、✎ ✕ ＋ 💬 正下面那一行**，靠右对齐 ——
+                不另起一行占正文下面的位置。这一段的 min-height 把两行都包住（见上面 li 的 style），不会压到下一段。
+                撤销没成的原因（一句话，放不进那一栏）还是跟在正文下面。
               */}
               {aiHere.length > 0 && (
                 <div className="rv-ai-side">

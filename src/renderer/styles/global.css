@@ -8801,11 +8801,17 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 }
 .rv-review-block.ai-changed:not(.targeted) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
 /*
-  正文下面多出来的一行：「AI 刚改过」+ 撤销，靠右摆。它在文档流里，这一段自己就被撑高了 ——
-  不和右上角的 ✎ ✕ ＋ 💬 抢位置，也不会压到下一段。
+  「AI 刚改过」+ 撤销：右边那一栏的**第二行**，就在 ✎ ✕ ＋ 💬（top: 0、20px 高）正下面，和它们一样贴右边。
+  一处一行往下排；这一段的 min-height（`--rv-tool-row` × 行数，ReviewPane 里算）把它们包住，不压到下一段。
+  这一栏比按钮那排宽一点（「AI 刚改过」+「撤销」放不进 90px），所以挂了它的那一段右边多让出一截，正文不被盖住。
 */
-.rv-ai-side { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 2px 10px; padding: 2px 0; }
-.rv-ai-one { display: flex; align-items: center; gap: 6px; height: 20px; white-space: nowrap; }
+.rv-review-block { --rv-tool-row: 22px; }
+.rv-review-block.ai-host { padding-right: 112px; }
+.rv-ai-side {
+  position: absolute; top: var(--rv-tool-row); right: 0;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 2px;
+}
+.rv-ai-one { display: flex; align-items: center; justify-content: flex-end; gap: 5px; height: 20px; white-space: nowrap; }
 .rv-ai-tag { font-size: 11px; font-weight: 600; color: var(--accent); cursor: help; }
 /* 「撤销」：实心强调色底、白字 —— 深浅主题下都一眼看得到 */
 .rv-review .rt-hist-btn.rv-ai-undo {
