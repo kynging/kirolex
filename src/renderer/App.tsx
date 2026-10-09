@@ -82,6 +82,8 @@ declare global {
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
+      getPendingQuit?: () => Promise<boolean>;
+      onPendingQuit?: (cb: (pending: boolean) => void) => () => void;
       /** The skills kiro actually has, parsed from ~/.kiro/skills. Read-only. */
       skillList?: () => Promise<{ dir: string; skills: Array<{ folder: string; path: string; ok: boolean; doc?: any; summary?: string; error?: string }> }>;
       skillRead?: (filePath: string) => Promise<{ ok: boolean; path?: string; raw?: string; doc?: any; error?: string }>;
@@ -3120,9 +3122,20 @@ const App: React.FC = () => {
     });
   }, [currentSessionId]);
 
+  /*
+    **等待退出期间不排空队列** —— agent-board「拉取并重启」请 KiroLex 退出时，正在跑的那几轮跑完就退；
+    排着的消息不再开新一轮（它们落盘在 ui-state 里，重启后原样恢复）。取消等待就照常排空。
+  */
+  const [quitPending, setQuitPending] = useState(false);
+  useEffect(() => {
+    void window.kiroApi.getPendingQuit?.().then((p) => setQuitPending(!!p)).catch(() => {});
+    return window.kiroApi.onPendingQuit?.(setQuitPending);
+  }, []);
+
   // Drain every session independently when it becomes idle. This continues in
   // the background after the user switches chats, matching MeshClaw slots.
   useEffect(() => {
+    if (quitPending) return;
     for (const [sessionId, queue] of Object.entries(queuesBySession)) {
       if (
         queue.length === 0 ||
@@ -3203,6 +3216,7 @@ const App: React.FC = () => {
     currentSessionId,
     switchingModel,
     switchingAgent,
+    quitPending,
     recoveringIds,
   ]);
 

@@ -50,6 +50,8 @@ import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import { createControlServer, type ControlServer } from './controlServer.ts';
+import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
@@ -88,6 +90,10 @@ let splashWindow: BrowserWindow | null = null;
 let mainWindowRevealed = false;
 let tray: Tray | null = null;
 let isQuitting = false;
+/** 控制入口的「等待退出」：为真时不再开始新的一轮（定时 / 循环任务的 ticker、渲染端的排队排空都停下） */
+let quitPending = false;
+/** 正在跑一轮的定时 / 循环任务：schedule id → sessionId。控制入口据此判断"忙"。 */
+const schedulesInFlight = new Map<string, string>();
 
 process.on('uncaughtException', (error) => {
   logger.error('process', 'uncaughtException', error);
@@ -7010,13 +7016,12 @@ app.whenReady().then(async () => {
    * stateless mode to switch it off, because carrying the last result forward is what makes
    * a scheduled job report the same thing every morning. */
   const SCHEDULE_TICK_MS = 20_000;
-  /** Jobs currently mid-run, so a slow turn is never re-entered by the next tick. */
-  const schedulesInFlight = new Set<string>();
+  /* Jobs currently mid-run (`schedulesInFlight`, module level), so a slow turn is never re-entered by the next tick. */
 
   async function runScheduledJob(job: scheduleStore.StoredSchedule): Promise<void> {
     const { id, state } = job;
     if (schedulesInFlight.has(id)) return;
-    schedulesInFlight.add(id);
+    schedulesInFlight.set(id, state.sessionId);
     try {
       // CHARGE THE RUN FIRST, and flush it. Recording only on completion means a process
       // killed mid-run forgets it paid -- the shape of a job that bills a turn per restart.
@@ -7060,6 +7065,8 @@ app.whenReady().then(async () => {
   }
 
   const scheduleTicker = setInterval(() => {
+    // 等待退出期间不开新一轮；到期的任务留着，取消等待或重启后下一跳照样触发
+    if (quitPending) return;
     const now = Date.now();
     for (const job of scheduleStore.listSchedules(os.homedir())) {
       if (isDue(job.state, now)) void runScheduledJob(job);
@@ -11342,6 +11349,43 @@ app.on('before-quit', () => {
   */
   try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ }
 });
+
+/** 本机控制入口（agent-board「拉取并重启」）：`POST /quit` 走的就是托盘「Quit」那条路径。 */
+let controlServer: ControlServer | null = null;
+/** 现在忙的会话（带标题）—— 判据见 busySessions.ts */
+function getBusySessions(): BusySession[] {
+  const turns = new Set<string>([...attachingSessions, ...reconfiguringSessions]);
+  for (const [id, e] of sessionClients) if (e.busy) turns.add(id);
+  return collectBusySessions({
+    turns,
+    scheduleRuns: schedulesInFlight.values(),
+    revisePending: revisePending.entries(),
+    queues: queueCounts(uiState()['kirolex-queues']),
+    titleOf: (id) => store.readRecord(id)?.title,
+  });
+}
+ipcMain.handle('control:pending-quit', () => quitPending);
+app.whenReady().then(async () => {
+  try {
+    controlServer = await createControlServer({
+      onQuit: () => { isQuitting = true; app.quit(); },
+      getBusy: getBusySessions,
+      onPendingChange: (pending) => {
+        quitPending = pending;
+        mainWindow?.webContents.send('control:pending-quit', pending);
+        if (pending) {
+          const busy = getBusySessions();
+          logger.info('app', `pending quit: waiting for ${busy.map((b) => `${b.title || b.id}[${b.reasons.join(',')}]`).join(' ')}`);
+        }
+      },
+      log: (msg) => logger.info('control', msg),
+    });
+    logger.info('app', `control server on 127.0.0.1:${controlServer.port}`);
+  } catch (err: any) {
+    logger.info('app', `control server failed to start: ${err?.message}`);
+  }
+});
+app.on('will-quit', () => { void controlServer?.close(); });
 
 /** Turn a supervisor's SIGTERM into a REAL app quit.
  *

@@ -264,6 +264,13 @@ contextBridge.exposeInMainWorld('kiroApi', {
   scheduleList: () => ipcRenderer.invoke('schedule:list'),
   schedulePause: (id: string, paused: boolean) => ipcRenderer.invoke('schedule:pause', id, paused),
   scheduleRemove: (id: string) => ipcRenderer.invoke('schedule:remove', id),
+  /** 控制入口的「等待退出」（agent-board「拉取并重启」）：为真时排队消息先不发，等正在跑的那几轮结束后退出 */
+  getPendingQuit: () => ipcRenderer.invoke('control:pending-quit'),
+  onPendingQuit: (cb: (pending: boolean) => void) => {
+    const handler = (_e: any, pending: boolean) => cb(!!pending);
+    ipcRenderer.on('control:pending-quit', handler);
+    return () => ipcRenderer.removeListener('control:pending-quit', handler);
+  },
   onScheduleChanged: (cb: (payload: any) => void) => {
     const handler = (_e: any, payload: any) => cb(payload);
     ipcRenderer.on('schedule:changed', handler);
