@@ -112,14 +112,19 @@ export function kiroBinProblem(): string | null {
 export function kiroCliCandidates(): string[] {
   /* 配了就**只用**它：不再往下试那串猜测路径（见 `kiroBinProblem`） */
   if (configuredKiroBin) return [configuredKiroBin];
+  /* 变量没设时**不生成**这一项：否则模板字符串会拼出 `undefined\Kiro-Cli\…` 这种假路径，
+     `.filter(Boolean)` 去不掉。HOME 在 Windows 上（资源管理器启动）常常没有，退回 os.homedir()。 */
+  const local = process.env.LOCALAPPDATA;
+  const roaming = process.env.APPDATA;
+  const home = process.env.HOME || os.homedir();
   return [
     process.env.KIRO_CLI_PATH,
     // Windows
-    `${process.env.LOCALAPPDATA}\\Kiro-Cli\\kiro-cli.exe`,
-    `${process.env.LOCALAPPDATA}\\Programs\\kiro-cli\\kiro-cli.exe`,
-    `${process.env.APPDATA}\\kiro-cli\\kiro-cli.exe`,
+    local && `${local}\\Kiro-Cli\\kiro-cli.exe`,
+    local && `${local}\\Programs\\kiro-cli\\kiro-cli.exe`,
+    roaming && `${roaming}\\kiro-cli\\kiro-cli.exe`,
     // macOS/Linux
-    `${process.env.HOME}/.local/bin/kiro-cli`,
+    home && `${home}/.local/bin/kiro-cli`,
     '/usr/local/bin/kiro-cli',
     '/opt/homebrew/bin/kiro-cli',
   ].filter(Boolean) as string[];

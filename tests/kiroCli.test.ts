@@ -47,6 +47,14 @@ describe('kiroCliCandidates', () => {
     delete process.env.KIRO_CLI_PATH;
     for (const c of kiroCliCandidates()) assert.ok(!c.includes('undefined/'), c);
   });
+
+  test('unset LOCALAPPDATA / APPDATA / HOME never yield "undefined…" paths; HOME falls back to os.homedir()', () => {
+    for (const k of ['KIRO_CLI_PATH', 'LOCALAPPDATA', 'APPDATA', 'HOME']) delete process.env[k];
+    const c = kiroCliCandidates();
+    for (const p of c) assert.ok(!p.includes('undefined'), p);
+    const want = path.join(os.homedir(), '.local/bin/kiro-cli');
+    assert.ok(c.some((p) => path.normalize(p) === want), `missing ${want} in ${JSON.stringify(c)}`);
+  });
 });
 
 describe('resolveKiroCli', () => {
