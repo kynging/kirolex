@@ -48,12 +48,36 @@ describe('发给会话的提示词', () => {
     assert.doesNotMatch(p, /现在的完整正文/, 'block 档不多发一份整文');
   });
 
-  test('whole 档：以**盘上此刻**的正文为基准，并明说"这里没有的就是删掉的"', () => {
-    const p = reviseInSessionPrompt({ where: 'x', note: 'y', scope: 'whole', full: '整份正文' });
-    assert.match(p, /输出完整正文/);
-    assert.match(p, /现在的完整正文[\s\S]*整份正文/);
-    assert.match(p, /上面那份正文里没有的东西，就是已经删掉的/);
-    assert.match(p, /结构调整是允许的/);
+  test('patch 档：带行号的全文 + 意见的位置，只交回要换的那几处（不整篇重写）', () => {
+    const p = reviseInSessionPrompt({
+      where: '乙段', note: '把这段和下一段合并', about: 'a.md', scope: 'patch',
+      full: '甲段\n\n乙段\n\n丙段', fromLine: 3, toLine: 3,
+    });
+    assert.match(p, /现在的完整正文[\s\S]*^1\t甲段$[\s\S]*^3\t乙段$[\s\S]*^5\t丙段$/m, '每行带行号');
+    assert.match(p, /意见指的位置：第 3 行/);
+    assert.match(p, /把这段和下一段合并/);
+    assert.match(p, /@@ <起始行>-<结束行> \| <这几行原文开头的几个字>/);
+    assert.match(p, /@@ END/);
+    assert.match(p, /不需要动的段落一个字都不要交回/);
+    assert.match(p, /合并两段：用一块新内容换掉这两段的整个行范围/);
+    assert.match(p, /<DELETE>/);
+    assert.match(p, /不要用工具去改文件/);
+    assert.match(p, /CANNOT-REVISE-LOCALLY/);
+    assert.doesNotMatch(p, /输出完整正文/);
+    assert.doesNotMatch(p, /只输出改完的这一段/);
+  });
+
+  test('patch 档：整篇的意见不写行号，多行范围写成 起-止', () => {
+    const p0 = reviseInSessionPrompt({ where: '（整篇）', note: 'y', scope: 'patch', full: 'a' });
+    assert.match(p0, /意见指的位置：\n/);
+    const p1 = reviseInSessionPrompt({ where: 'x', note: 'y', scope: 'patch', full: 'a\nb\nc', fromLine: 2, toLine: 3 });
+    assert.match(p1, /意见指的位置：第 2-3 行/);
+  });
+
+  test('没有整份重写那一档了', () => {
+    const src = fs.readFileSync('src/main/reviseBlock.ts', 'utf8');
+    assert.doesNotMatch(src, /scope\?: [^;]*'whole'/);
+    assert.doesNotMatch(src, /输出完整正文/);
   });
 });
 
@@ -102,7 +126,7 @@ describe('主进程接线', () => {
 
   test('改写：排队、先挂回来、等空闲、超时摘掉等待者', () => {
     const at = MAIN.indexOf("ipcMain.handle('review:revise-in-session'");
-    const body = MAIN.slice(at, at + 5000);
+    const body = MAIN.slice(at, at + 6500);
     assert.ok(body.includes("return enqueueRevise(sessionId, async () => {\n      try { return await reviseOnce(); } finally { tk.close(); }\n    }, input?.label || '改写');"));
     /* 取消按 ticket 认这一次改写：排队 / 等空闲期间被取消就不发；在等回复的只停它自己那一轮 */
     assert.equal((body.match(/if \(tk\.cancelled\(\)\) return \{ ok: false, cancelled: true \};/g) || []).length, 4);

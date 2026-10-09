@@ -260,15 +260,27 @@ declare global {
       }>;
       /**
        * 侧栏 review 的「✓ 确认」—— 在**打开这份文件的那条会话**里改一块（正忙就在主进程里排队）。
-       *   `block`（默认）只回改完的这一块；`whole` 整份 —— 只在 block 那次回了 `cannot`（跨段的意见）时才问。
-       * `full` 是整份重改的基准正文（盘上此刻那一份），不让它照自己记得的旧版重写。
+       *   `block`（默认）只回改完的这一块；`patch` 跨段 —— block 那次回了 `cannot`、或者整篇的意见时才问，
+       *   模型只交回要换的那几处（带行号），主进程拼回去。
+       * `full` 是 patch 的基准正文（盘上此刻那一份，行号按它编）；`fromLine..toLine` 是意见指的那几行。
        */
       reviseInSession?: (input: {
         sessionId: string; where: string; note: string; about?: string;
-        scope?: 'block' | 'whole' | 'insert'; label?: string; full?: string; ticket?: string;
+        scope?: 'block' | 'patch' | 'insert'; label?: string; full?: string; fromLine?: number; toLine?: number; ticket?: string;
         /** 回复由主进程拼回去、写盘（窗口 reload 了也不丢）—— 见 main/reviewApply.ts */
-        apply?: { path: string; mode: 'splice' | 'insert' | 'whole'; from?: number; to?: number; base: string };
-      }) => Promise<{ ok: boolean; text?: string; cannot?: string; error?: string }>;
+        apply?: { path: string; mode: 'splice' | 'insert' | 'patch'; from?: number; to?: number; base: string };
+      }) => Promise<{
+        ok: boolean; text?: string; cannot?: string; error?: string; cancelled?: boolean;
+        /** `patch` 档：文件在等回复期间被别的改动动过了，这次没写（界面保留意见，刷新后重试）。 */
+        conflict?: boolean;
+        scope?: 'block' | 'patch' | 'insert'; written?: boolean; fullText?: string;
+        /**
+         * `patch` 档实际改了的每一处（见 main/reviewApply.ts 的 `PatchChange`）：
+         * `from..to` 新文件里的行范围（删掉的那处 `to = from - 1`）、`oldText` 原来的文本、
+         * `oldFrom..oldTo` 原文件里的行范围、`newText` 新文件里那几行。给高亮和逐段撤销用。
+         */
+        changes?: Array<{ from: number; to: number; oldFrom: number; oldTo: number; oldText: string; newText: string }>;
+      }>;
       /**
        * 把改完的正文写回那个文件 —— 路径按 `sessionId` 解析（和 workspaceRead 同一个 resolveUserPath），
        * 只许写**这条会话的标签页读过**的，写前备份到 `~/.kirolex/backups/review-files/`。

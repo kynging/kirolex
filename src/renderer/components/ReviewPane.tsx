@@ -1,7 +1,7 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { CommentBox, CommentOpener } from './CommentBox';
 import { PdfView } from './PdfView';
-import { pageBlocks, lineBlocks, dropSpan, displayGroups, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, type ReviewBlock } from '../reviewBlocks';
+import { pageBlocks, lineBlocks, dropSpan, displayGroups, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
 import { rewritePatch } from '../rewritePatch';
 import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
@@ -756,7 +756,7 @@ export const ReviewPane: React.FC<{
   /**
    * **一处 💬 / ＋** —— 轮到了发给打开这份文件的那条会话，KiroLex 拼回整份、写回文件。
    *
-   * 💬：先只要**这一块**（快），它回 `CANNOT-REVISE-LOCALLY` 才要整份（加段/删段/挪位置）。
+   * 💬：先只要**这一块**（快），它回 `CANNOT-REVISE-LOCALLY` 才走 `patch`（加段/删段/合并/挪位置 —— 只交回要换的那几处）。
    * ＋：只要**新加的那部分**，插在这一块（标题就是整节）后面 —— 原文不经过模型，就不会被顺手润色。
    * 没做成的：标记放回去、原因挂在那一段下面，下次提交会再带上它。
    */
@@ -807,23 +807,32 @@ export const ReviewPane: React.FC<{
         apply: { path, mode: 'splice', from, to, base },
       });
       if (res?.cancelled) return false;
-      let gotWhole = false;
       if (res?.cannot) {
+        /*
+          跨段的意见（合并、拆分、挪位置）：**不整篇重写**（长文件会撞上 8 分钟超时），
+          给它带行号的全文，它只交回要换的那几处，主进程拼回去（见 `parsePatchReply` / `applyPatch`）。
+        */
         res = await window.kiroApi.reviseInSession?.({
-          sessionId: sessionId!, where, note: instruction, about: path, label: `${label}（整份）`, scope: 'whole',
-          /* 整份重改以**盘上此刻**这一份为基准，不让它照自己记得的旧版重写 */
-          full: base, ticket,
-          apply: { path, mode: 'whole', base },
+          sessionId: sessionId!, where, note: instruction, about: path, label: `${label}（跨段）`, scope: 'patch',
+          /* 以**盘上此刻**这一份为基准、按它编行号 */
+          full: base, fromLine: from, toLine: to, ticket,
+          apply: { path, mode: 'patch', base },
         });
-        if (res?.cancelled) return false;
-        gotWhole = true;
+        /*
+          patch 只认**主进程已经写了**的结果 —— 这里不再自己写：渲染层那次写不带 expectBase，
+          文件在等回复期间被动过的话会被旧 base 拼的整份盖掉（见 `patchReplyOutcome`）。
+        */
+        const out = patchReplyOutcome(res);
+        if (out.kind === 'cancelled') return false;
+        if (out.kind === 'fail') return fail(out.why);
+        return writeBack(base, out.fullText, failKey, '', true);
       }
       if (!res?.ok || typeof res.text !== 'string') {
         return fail(res?.cannot ? `改不了：${res.cannot} —— 换个说法再试` : `改写失败：${res?.error || '没有返回'}`);
       }
       if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true);
       /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
-      const fullText = gotWhole ? String(res.text) : spliceLines(base, from, to, String(res.text));
+      const fullText = spliceLines(base, from, to, String(res.text));
       return writeBack(base, fullText, failKey, `已按意见改了${label}`);
     }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
   };
@@ -866,24 +875,28 @@ export const ReviewPane: React.FC<{
     }, () => livePane().setDropped((cur) => ({ ...cur, [anchor]: true })), { key: `drop:${anchor}`, text: '' });
   };
 
-  /** **整篇的意见** —— 按整份重改，带盘上此刻的正文当基准。排在最后：先让逐段的那些落定。 */
+  /**
+   * **整篇的意见** —— 带盘上此刻的正文（带行号）当基准，它只交回要换的那几处（`patch`），不整篇重写。
+   * 排在最后：先让逐段的那些落定。
+   */
   const queueWhole = (note: string) => {
     livePane().setApplyNote((cur) => { const n = { ...cur }; delete n.whole; return n; });
     enqueue('whole', 0, async (ticket) => {
       const base = currentText();
       const res: any = await window.kiroApi.reviseInSession?.({
         sessionId: sessionId!, where: '（整篇 —— 这条意见不针对某一处）', note, about: path,
-        label: `${fileName} 整篇`, scope: 'whole', full: base, ticket,
-        apply: { path, mode: 'whole', base },
+        label: `${fileName} 整篇`, scope: 'patch', full: base, ticket,
+        apply: { path, mode: 'patch', base },
       });
-      if (res?.cancelled) return false;
-      if (!res?.ok || typeof res.text !== 'string' || !String(res.text).trim()) {
+      /* 只认主进程已经写了的结果，渲染层不再自己写（见 `patchReplyOutcome`） */
+      const out = patchReplyOutcome(res);
+      if (out.kind === 'cancelled') return false;
+      if (out.kind === 'fail') {
         livePane().setWholeDraft((cur) => cur || note);
-        livePane().setApplyNote((cur) => ({ ...cur, whole: res?.cannot ? `改不了：${res.cannot}` : `改写失败：${res?.error || '没有返回'}` }));
+        livePane().setApplyNote((cur) => ({ ...cur, whole: out.why }));
         return false;
       }
-      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, 'whole', '', true);
-      return writeBack(base, String(res.text), 'whole', '已按整篇的意见改完');
+      return writeBack(base, out.fullText, 'whole', '', true);
     }, () => livePane().setWholeDraft((cur) => cur || note), { key: 'whole', text: note });
   };
 

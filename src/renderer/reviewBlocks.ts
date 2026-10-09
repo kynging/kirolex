@@ -537,4 +537,4 @@ export function spanRange(span: number[]): { from: number; to: number } {
   sliceLines / spliceLines / insertAfterLines / deleteLines 搬到了主进程那边（`src/main/reviewApply.ts`）——
   改写的回复由主进程拼回去、写盘，窗口在不在都一样；这里转出同一份，两边永远是同一套规则。
 */
-export { sliceLines, spliceLines, insertAfterLines, deleteLines } from '../main/reviewApply.ts';
+export { sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome } from '../main/reviewApply.ts';

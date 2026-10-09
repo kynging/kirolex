@@ -71,13 +71,12 @@ test('侧栏的折叠活过 reload；reload 之后那一阵子重新连上的会
 });
 
 describe('改写的回复由主进程拼回去、写盘（窗口 reload 了也不丢）', () => {
-  test('applyRevision：splice 换掉那几行、insert 插在后面、whole 整份', async () => {
+  test('applyRevision：splice 换掉那几行、insert 插在后面（patch 走 applyPatch）', async () => {
     const { applyRevision } = await import('../src/main/reviewApply.ts');
     const base = '甲\n\n乙\n\n丙';
     assert.equal(applyRevision({ path: 'a.md', mode: 'splice', from: 3, to: 3, base }, '乙改'), '甲\n\n乙改\n\n丙');
     assert.equal(applyRevision({ path: 'a.md', mode: 'insert', to: 3, base }, '新'), '甲\n\n乙\n\n新\n\n丙');
-    assert.equal(applyRevision({ path: 'a.md', mode: 'whole', base }, '全新'), '全新');
-    assert.equal(applyRevision({ path: 'a.md', mode: 'whole', base }, '  '), null, '空回复不写');
+    assert.equal(applyRevision({ path: 'a.md', mode: 'patch', base }, 'x'), null, 'patch 不走这里');
     assert.equal(applyRevision({ path: 'a.md', mode: 'splice', from: 4, to: 3, base }, 'x'), null, '位置不对不写');
   });
   test('渲染层的 reviewBlocks 转出的是同一份', async () => {

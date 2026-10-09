@@ -63,7 +63,7 @@ import {
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
-import { parseRevised, reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
+import { parseRevised, settlePatchRevision, reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
 import {
   SOFFICE_BUNDLE_PATHS, SOFFICE_PATH_NAMES, pickConverter, sofficeBinary, pathProbeCommand, firstProbeHit,
@@ -9636,16 +9636,27 @@ app.whenReady().then(async () => {
    * 判据（提示词、输出清洗、"改不了"的记号、什么样的回复能写盘）在 `reviseBlock.ts`，纯的、有测试。
    * 这里只管：排队（正忙不是报错）→ 挂回来 → 等它空下来 → 发一轮 → 等**成功收尾**的那份完整回复。
    *
-   * 返回 `cannot` 时**不改任何东西**；渲染层据此升级到整份（`scope: 'whole'`），或者把原因摆给你看。
+   * 返回 `cannot` 时**不改任何东西**；渲染层据此升级到 `scope: 'patch'`，或者把原因摆给你看。
+   *
+   * 返回值（`patch` 档另外多 `changes`）：
+   *   `{ ok: true, text, scope, written?, fullText?, changes? }` / `{ ok: false, cannot | error | cancelled }`
+   *   · `patch` 档的 `text` 和 `fullText` 都是拼好的整份正文；
+   *   · `changes: PatchChange[]`（见 `reviewApply.ts`）—— 这次实际改动的每一处：`from..to` 新文件里的行范围、
+   *     `oldText` 原来的文本、`oldFrom..oldTo` 原文件里的行范围。给界面做高亮和逐段撤销。
+   *   · `patch` 档**只在主进程写盘**：成功一定带 `written`；文件在等回复期间被动过（和 `apply.base` 对不上）
+   *     返回 `{ ok: false, conflict: true, error }`，不交回正文 —— 见 `settlePatchRevision`。
    */
   ipcMain.handle('review:revise-in-session', async (_event, input: {
     sessionId: string; where: string; note: string; about?: string;
-    /** `block`（默认，快）/ `whole`（跨段的意见才用）—— 见 `reviseInSessionPrompt`。 */
-    scope?: 'block' | 'whole' | 'insert';
+    /** `block`（默认，快）/ `patch`（跨段的意见：只交回要换的那几处）/ `insert` —— 见 `reviseInSessionPrompt`。 */
+    scope?: 'block' | 'patch' | 'insert';
     /** 会话里那条消息显示成什么位置（「a.md 第 12 行」）—— 回头翻会话要看得出说的是哪儿。 */
     label?: string;
-    /** 整份重改时的基准正文（盘上此刻那一份）—— 见 `reviseInSessionPrompt.full`。 */
+    /** `patch` 档的基准正文（盘上此刻那一份，行号按它编）—— 见 `reviseInSessionPrompt.full`。 */
     full?: string;
+    /** 意见指的那一处在 `full` 里的行范围 —— `patch` 档写进提示词；整篇的意见不传。 */
+    fromLine?: number;
+    toLine?: number;
     /** 这一次改写的 ticket —— 取消按它认（见 `reviseTickets`）。 */
     ticket?: string;
     /**
@@ -9681,10 +9692,15 @@ app.whenReady().then(async () => {
       /* 等它空下来的那段时间里被取消了 —— 同样不发 */
       if (tk.cancelled()) return { ok: false, cancelled: true };
       /* 白名单而不是透传：这个值来自渲染进程，越界的写法落回默认那一档 */
-      const wantScope = input?.scope === 'whole' ? 'whole' : input?.scope === 'insert' ? 'insert' : 'block';
+      const wantScope = input?.scope === 'patch' ? 'patch' : input?.scope === 'insert' ? 'insert' : 'block';
+      /* patch 的行号按哪一份编，拼回去就得按同一份拼 —— 有 apply 就用它的 base */
+      const patchBase = typeof input?.apply?.base === 'string' ? input.apply.base
+        : typeof input?.full === 'string' ? input.full : undefined;
+      if (wantScope === 'patch' && patchBase === undefined) return { ok: false, error: '没有带上正文 —— 没法按行号改' };
       const prompt = reviseInSessionPrompt({
         where, note, about: input?.about, scope: wantScope,
-        full: typeof input?.full === 'string' ? input.full : undefined,
+        full: wantScope === 'patch' ? patchBase : undefined,
+        fromLine: input?.fromLine, toLine: input?.toLine,
       });
       const started = Date.now();
       try {
@@ -9700,6 +9716,7 @@ app.whenReady().then(async () => {
           logger.warn('revise', `in-session ${sessionId}: ${usable.why}`);
           return { ok: false, error: usable.why };
         }
+        if (wantScope === 'patch') return await finishPatch(reply.text, patchBase!, started);
         const out = parseRevised(reply.text, where);
         if (out.cannot) {
           logger.info('revise', `not local (in-session ${sessionId}): ${out.cannot}`);
@@ -9730,6 +9747,32 @@ app.whenReady().then(async () => {
         logger.warn('revise', `in-session ${sessionId} failed: ${err?.message || err}`);
         return { ok: false, error: String(err?.message || err) };
       }
+    }
+
+    /**
+     * `patch` 档：回复 → 几处 `{from, to, text}` → 一次拼进 base → 写盘（照旧写前备份、对比 expectBase）。
+     * 判据全在 `settlePatchRevision`（纯的、有测试）：任何一处不对整轮不写；**盘上和 base 对不上也是失败**，
+     * 不像 block 那档把结果交回渲染层去写 —— 渲染层那次写不带 expectBase，会把等待期间的改动盖掉。
+     */
+    async function finishPatch(replyText: string, base: string, started: number) {
+      const apply = input?.apply;
+      const canWrite = !!apply && typeof apply.path === 'string' && typeof apply.base === 'string';
+      const res = settlePatchRevision({
+        replyText, base,
+        write: canWrite ? (fullText, expectBase) => writeReviewFile(sessionId, apply!.path, fullText, expectBase) : undefined,
+      });
+      const secs = ((Date.now() - started) / 1000).toFixed(1);
+      if (!res.ok) {
+        if ('cannot' in res) logger.info('revise', `not local (in-session ${sessionId} patch): ${res.cannot}`);
+        else logger.warn('revise', `in-session ${sessionId} patch not written${res.conflict ? ' (conflict)' : ''}: ${res.error}`);
+        return res;
+      }
+      logger.info('revise', `in-session ${sessionId} scope=patch: ${res.changes.length} edit(s) in ${secs}s${res.written ? ', written' : ''}`);
+      if (res.written) {
+        markTicketDone(input?.ticket);
+        noteInSession(sessionId, `✅ 已按意见改了${input?.label || '这份文件'}（${res.changes.length} 处，现在 ${res.fullText.length} 字）\n文件：${res.path || apply!.path}\nKiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。`);
+      }
+      return res;
     }
   });
 

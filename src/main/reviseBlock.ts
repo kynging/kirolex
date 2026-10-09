@@ -6,8 +6,9 @@
  *
  * 这一份是从 feature/flow 那边（门上的逐段改写）搬过来的，**只搬了文件预览用得到的那一半**：
  *
- *   · `reviseInSessionPrompt`  发给那条会话的提示词（`block` 只回这一段 / `whole` 回整份）
+ *   · `reviseInSessionPrompt`  发给那条会话的提示词（`block` 只回这一段 / `patch` 只回要换的那几处 / `insert`）
  *   · `parseRevised`           回复 → 能直接拼回文件的正文，以及"改不了"的记号
+ *   · `parsePatchReply`        `patch` 档的回复 → 若干处 `{from, to, text}`，拼回见 `reviewApply.applyPatch`
  *   · `reviseSlideTextPrompt` / `parseSlideEdits`  deck 预览里「✓ 确认」改一页幻灯片（按 run 地址改字 +
  *                           几条动版面的指令），落盘由 `deckPreview` 那几段 python 做
  *
@@ -17,6 +18,8 @@
  * 发送、排队、等回复、写盘在 `index.ts`（`review:revise-in-session` / `review:write-file` / `deck:*`），
  * 这里只放"说什么"和"收到的怎么认"，所以全部可测。
  */
+
+import { applyPatch, type PatchChange } from './reviewApply.ts';
 
 export interface RevisedBlock {
   /** 改写后的正文；`cannot` 为真时它等于原文。 */
@@ -60,12 +63,15 @@ export function parseRevised(stdout: string, original: string): RevisedBlock {
  * 一次性子进程什么都不知道 —— 不知道这是一份周报、不知道字段约定、不知道上游材料里那个客户叫什么；
  * 而这份文件往往正是那条会话刚做出来的，这些全在它的上下文里。代价是这一轮进它的 transcript —— 接受。
  *
- * ## 两档
+ * ## 几档
  *
  *   `block`  只回改完的这一段（默认）。绝大多数意见是"这句话口径不对"，让它把整份四千字重写一遍
  *            纯属白等 —— 实测一次改写 35 秒，其中生成那部分和回复长度直接相关。
- *   `whole`  整份正文。只在 `block` 那次回了 `CANNOT-REVISE-LOCALLY` 时才走 ——
- *            那说明这条意见要跨段（加一段、删一段、把一条挪到别的小节），只有整份才表达得出来。
+ *   `patch`  跨段的意见（`block` 回了 `CANNOT-REVISE-LOCALLY`，或者整篇的意见）。给它带行号的全文，
+ *            它**只交回要换掉的那几处**（每处：换掉第几到第几行 + 新内容）。
+ *            以前这里是 `whole`（整份重写）—— 长文件一写就是几分钟，常常撞上 8 分钟超时
+ *            （「把这段和下一段合并」就报了「等了 8 分钟没等到回复」）。合并两段只需要一处替换。
+ *   `insert` 在一段后面加东西，只回新加的部分。
  *
  * **落盘由 KiroLex 做**，提示词里明确禁止它自己动文件：两个写者对同一个文件要么改两遍要么互相覆盖。
  */
@@ -76,18 +82,24 @@ export function reviseInSessionPrompt(input: {
   note: string;
   /** 这份东西是什么（文件路径 / 文件名），可空。 */
   about?: string;
-  /** `insert`：在 `where` 那一段**后面**新加内容 —— 只回新加的那部分，原文一个字都不回。 */
-  scope?: 'block' | 'whole' | 'insert';
   /**
-   * **现在的完整正文**（只有 `whole` 档用）——「有一些我删掉的内容怎么变成我增加的内容了？」
+   * `block`：只回这一段；`insert`：在 `where` 那一段**后面**新加内容 —— 只回新加的那部分；
+   * `patch`：跨段的意见 —— 看带行号的全文，只交回要换掉的那几处（见 `parsePatchReply`）。
+   */
+  scope?: 'block' | 'patch' | 'insert';
+  /**
+   * **现在的完整正文**（只有 `patch` 档用）——「有一些我删掉的内容怎么变成我增加的内容了？」
    *
-   * 整份重改原来只把"意见指的那一段"发过去，然后叫它"输出完整正文" —— 于是它照**自己会话里记得的
-   * 那一版**重写，而那一版可能是你（或别的意见）改过之前的：已经删掉的内容又原样回来了。
-   * 所以要把盘上此刻那一份当基准发过去。
+   * 要把盘上此刻那一份当基准发过去：它会话里记得的那一版可能是改过之前的。`patch` 档还要靠它编行号 ——
+   * 模型交回来的每一处都按这一份的行号说"换掉第几到第几行"。
    */
   full?: string;
+  /** 意见指的那一处在 `full` 里的行范围（闭区间，从 1 起）—— `patch` 档用；整篇的意见不传。 */
+  fromLine?: number;
+  toLine?: number;
 }): string {
   const about = String(input.about || '').trim();
+  if (input.scope === 'patch') return revisePatchPrompt(input, about);
   /*
     **在一段后面加东西** ——「我要能在段落后加新的」。和改一段分开一档：让它"改这一段、顺便在后面加"
     的话，它回来的是原文 + 新内容，而原文那部分它常常顺手润色 —— 你没评的那段被改了。只要新内容，
@@ -114,23 +126,11 @@ export function reviseInSessionPrompt(input: {
       '  只单独一行写 `CANNOT-REVISE-LOCALLY: <一句话说缺什么>`。',
     ].join('\n');
   }
-  const whole = input.scope === 'whole';
-  const head = whole
-    ? `下面这条意见改不了单独一段，所以按它改**整份**${about ? `「${about}」` : '文件'}，然后只输出改完的完整正文。`
-    : `下面这条意见是对${about ? `「${about}」` : '那份文件'}里某一处提的。按它改，然后**只输出改完的这一段**。`;
-  const full = String(input.full ?? '').trim();
+  const head = `下面这条意见是对${about ? `「${about}」` : '那份文件'}里某一处提的。按它改，然后**只输出改完的这一段**。`;
   return [
     head,
     '',
-    ...(whole && full ? [
-      '**现在的完整正文**（以这一份为基准 —— 它就是盘上此刻的样子；',
-      '你自己记得的那一版可能是旧的，不要拿它当底稿）：',
-      '---',
-      full,
-      '---',
-      '',
-    ] : []),
-    whole && full ? '意见指的位置（上面那份里的一处）：' : '意见指的位置（原文片段）：',
+    '意见指的位置（原文片段）：',
     '---',
     String(input.where ?? '').trim(),
     '---',
@@ -139,23 +139,13 @@ export function reviseInSessionPrompt(input: {
     String(input.note ?? '').trim(),
     '',
     '要求：',
-    whole
-      ? '· **输出完整正文**，从第一行到最后一行 —— 不要只给改动的片段；'
-      : '· **只输出这一段改完的样子** —— 不要把整份重写一遍（那样我要多等好几十秒），'
-        + '\n  也不要只给"改动说明"；',
+    '· **只输出这一段改完的样子** —— 不要把整份重写一遍（那样我要多等好几十秒），'
+      + '\n  也不要只给"改动说明"；',
     '· 不要用 ``` 围栏包起来，也不要写"好的""已修改如下"这类开场（那些话会被原样写进文件）；',
     '· 保持原来的标记形式（原文是 markdown 列表就还是列表，是标题就还是同级标题，段落之间的空行照留）；',
-    whole
-      ? '· **只改这条意见说的地方**，其余每一行原样保留 —— 我会按行比对，动了别处会被当成误改；'
-        + (full
-          ? '\n· **上面那份正文里没有的东西，就是已经删掉的 —— 不要写回来**。'
-            + '你记得的那一版里有、这一份里没有的，一律当作已经删掉；'
-          : '')
-      : '· **意见没提到的地方一个字都不要动**；',
-    whole
-      ? '· 这条意见要求加一段、删一段、或者把某一条挪到别的位置时，**照做** —— 结构调整是允许的；'
-      : '· 如果这条意见**没法只改这一段**（要和别处合并、要新增段落、要把它挪到别的小节），'
-        + '\n  就原样返回这一段，并在最后单独一行写 `CANNOT-REVISE-LOCALLY: 需要改整份`；',
+    '· **意见没提到的地方一个字都不要动**；',
+    '· 如果这条意见**没法只改这一段**（要和别处合并、要新增段落、要把它挪到别的小节），'
+      + '\n  就原样返回这一段，并在最后单独一行写 `CANNOT-REVISE-LOCALLY: 需要跨段改`；',
     '· **不要用工具去改文件**（`fs_write` 之类）—— 落盘由 KiroLex 统一做。',
     '  你也动一遍的话就是两个写者对同一个文件：要么改两遍，要么互相覆盖；',
     '· 如果这条意见需要你没有的信息（要查外部系统、要问人），不要编：照原样返回，',
@@ -164,12 +154,151 @@ export function reviseInSessionPrompt(input: {
 }
 
 /**
+ * `patch` 档的提示词 —— 带行号的全文 + 意见指的位置，要它**只交回要换掉的那几处**。
+ *
+ * 格式（一处一块，`parsePatchReply` 认）：
+ *
+ *     @@ 12-15 | 原文开头几个字
+ *     新内容……
+ *     @@ END
+ *
+ * 行号让 KiroLex 知道换哪儿，开头几个字用来核对它没数错行 —— 数错了宁可整轮不写，也不能换错地方。
+ * 不用 JSON：正文里的引号、反斜杠、换行全要转义，一段 markdown 转义错一个字符整份就作废了。
+ */
+function revisePatchPrompt(
+  input: { where: string; note: string; full?: string; fromLine?: number; toLine?: number },
+  about: string,
+): string {
+  const full = String(input.full ?? '');
+  const numbered = full.split('\n').map((l, i) => `${i + 1}\t${l}`).join('\n');
+  const from = Number(input.fromLine);
+  const to = Number(input.toLine);
+  const span = Number.isInteger(from) && Number.isInteger(to) && from >= 1 && to >= from
+    ? (from === to ? `第 ${from} 行` : `第 ${from}-${to} 行`)
+    : '';
+  const where = String(input.where ?? '').trim();
+  return [
+    `下面这条意见是对${about ? `「${about}」` : '那份文件'}提的，可能要跨段改（合并、拆分、加段、删段、挪位置）。`,
+    '**只交回要换掉的那几处**，不要把整份重写一遍。',
+    '',
+    '**现在的完整正文**（每行开头是行号和一个制表符，行号不是正文的一部分；以这一份为基准 ——',
+    '它就是盘上此刻的样子，你自己记得的那一版可能是旧的。这里没有的东西就是已经删掉的，不要写回来）：',
+    '---',
+    numbered,
+    '---',
+    '',
+    span ? `意见指的位置：${span}` : '意见指的位置：',
+    '---',
+    where,
+    '---',
+    '',
+    '意见：',
+    String(input.note ?? '').trim(),
+    '',
+    '输出格式 —— 每一处改动写成一块：',
+    '@@ <起始行>-<结束行> | <这几行原文开头的几个字>',
+    '<换上去的新内容，可以多行>',
+    '@@ END',
+    '',
+    '要求：',
+    '· 一块就是"把第起始行到结束行（含）整体换成新内容"。行号按上面那份正文的编号写；',
+    '  `|` 后面照抄**起始行**原文开头的五到十个字（不带行号），我用它核对你没数错行；',
+    '· **不需要动的段落一个字都不要交回**；没提到的行我原样保留；',
+    '· 合并两段：用一块新内容换掉这两段的整个行范围（例：`@@ 12-17 | …` 换成合并后的一段）；',
+    '· 在某处后面加一段：把那一段的行范围连同新加的内容一起交回；',
+    '· 删掉一段：新内容只写一行 `<DELETE>`；',
+    '· 几块之间的行范围不能重叠；改好几处不相邻的地方就写好几块；',
+    '· 新内容保持原来的标记形式（列表还是列表，标题还是同级标题），新内容里不要带行号；',
+    '· 不要用 ``` 围栏包起来，块外面不要写解释或"好的"之类的话；',
+    '· **不要用工具去改文件**（`fs_write` 之类）—— 落盘由 KiroLex 统一做；',
+    '· 如果这条意见需要你没有的信息（要查外部系统、要问人），不要编：什么块都不写，',
+    '  只单独一行写 `CANNOT-REVISE-LOCALLY: <一句话说缺什么>`。',
+  ].join('\n');
+}
+
+/** `patch` 档里的一处：把 `from..to`（闭区间，从 1 起，按发过去那份正文的行号）换成 `text`。 */
+export interface PatchEdit {
+  from: number;
+  to: number;
+  /** 新内容；`''` = 删掉这几行（模型写的是 `<DELETE>`）。首尾空行已去掉，拼回时按原文补。 */
+  text: string;
+  /** 模型照抄的起始行原文开头 —— 拼回前拿它核对行号（见 `applyPatch`）；没写就不核对。 */
+  hint?: string;
+}
+
+/**
+ * `patch` 档的回复 → 若干处 `{from, to, text}` —— PURE。
+ *
+ * 宽松到什么程度（理由和 `parseSlideEdits` 放宽分隔符一样：一次改写几十秒，为一个符号作废不值得）：
+ *   · 块头 `@@` 可以是两个以上、前后可以有空白或项目符号；`REPLACE` / `替换` / `L` / `第…行` 这些修饰都认；
+ *   · 行号之间 `-`、`–`、`—`、`~`、`到`、`至`、`..` 都认；只写一个行号就是那一行；
+ *   · 开头几个字前面的分隔符 `|`、`｜`、`:`、`：` 都认，外面套的「」或引号、结尾的省略号去掉；
+ *   · `@@ END` 可以写成 `@@END`、`@@ 结束`；漏了也行 —— 下一个块头或者回复结束就是这一块的结尾。
+ *
+ * 不宽松的：
+ *   · 行首是 `@@` 却认不出行号的块头，整轮报错 —— 静默丢掉它，就成了"只改了一部分"还报成功；
+ *   · 行号带负号的（`@@ -1-2`）照样收下，交给 `applyPatch` 的范围校验整轮拒掉；
+ *   · 块里一个字都没有（又没写 `<DELETE>`）就报错 —— 那和"格式没对上"长得一样，当成删掉是不可逆的；
+ *   · 一块都没有又没说改不了，同样报错。
+ */
+export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: string; error?: string } {
+  let body = String(stdout ?? '').replace(/\r\n/g, '\n').trim();
+  const m = /^\s*CANNOT-REVISE-LOCALLY:\s*(.*)$/m.exec(body);
+  if (m) return { edits: [], cannot: m[1].trim() || '这条意见改不了' };
+  const fence = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1\s*$/.exec(body);
+  if (fence) body = fence[2];
+  const HEAD = /^\s*(?:[-*•]\s*)?@{2,}\s*(?:replace|替换)?\s*[:：]?\s*(?:L|第)?\s*([-−－]?\d+)\s*行?\s*(?:(?:-|–|—|~|～|到|至|\.\.)\s*(?:L|第)?\s*([-−－]?\d+)\s*行?)?\s*@*\s*(?:[|｜:：]\s*)?(.*?)\s*$/i;
+  const END = /^\s*@{2,}\s*(?:end|结束)\s*@*\s*$/i;
+  /* 长得像块头（行首 `@@`）却认不出来的 —— 整轮报错，不能当成上一块的正文或者块外的废话丢掉 */
+  const HEADISH = /^\s*(?:[-*•]\s*)?@{2,}/;
+  /* 行号可能带负号（`@@ -1-2`）—— 照样收下，交给 `applyPatch` 的范围校验整轮拒掉 */
+  const int = (t: string) => Number(String(t).replace(/^[−－]/, '-'));
+  const edits: PatchEdit[] = [];
+  let cur: { from: number; to: number; hint?: string; lines: string[] } | null = null;
+  const close = (): string | undefined => {
+    if (!cur) return undefined;
+    const lines = cur.lines;
+    while (lines.length && !lines[0].trim()) lines.shift();
+    while (lines.length && !lines[lines.length - 1].trim()) lines.pop();
+    const range = `${cur.from}-${cur.to}`;
+    const c = cur;
+    cur = null;
+    if (!lines.length) return `第 ${range} 行那一处没有给新内容（要删掉请写 <DELETE>）`;
+    const text = lines.length === 1 && /^<\s*delete\s*>$/i.test(lines[0].trim()) ? '' : lines.join('\n');
+    edits.push({ from: c.from, to: c.to, text, ...(c.hint ? { hint: c.hint } : null) });
+    return undefined;
+  };
+  for (const line of body.split('\n')) {
+    if (END.test(line)) { const e = close(); if (e) return { edits: [], error: e }; continue; }
+    const h = HEAD.exec(line);
+    if (h) {
+      const e = close();
+      if (e) return { edits: [], error: e };
+      const from = int(h[1]);
+      const to = h[2] !== undefined ? int(h[2]) : from;
+      const hint = String(h[3] ?? '').trim()
+        .replace(/^[「『“"'`]+|[」』”"'`]+$/g, '')
+        .replace(/(?:…+|\.{3,})$/, '')
+        .trim();
+      cur = { from, to, ...(hint ? { hint } : null), lines: [] };
+      continue;
+    }
+    if (HEADISH.test(line)) return { edits: [], error: `有一处块头看不懂（「${line.trim().slice(0, 40)}」）—— 整轮没写` };
+    if (cur) cur.lines.push(line);
+  }
+  const e = close();
+  if (e) return { edits: [], error: e };
+  if (!edits.length) return { edits: [], error: '它没有给出可用的改动（没有 `@@ 起-止` 那样的块）' };
+  return { edits };
+}
+
+/**
  * 这一轮的回复**能不能当成改写结果** —— PURE。
  *
  * 写回文件是这条路上唯一不可逆的一步（有备份，但你不一定会去翻），所以只收**正常结束**的那一轮：
  *
- *   · `stopReason` 不是 `end_turn`（`max_tokens`、`refusal`…）—— 回复是被截断的。`whole` 那一档拿一份
- *     截断的正文去写盘，等于把文件后半截删掉；
+ *   · `stopReason` 不是 `end_turn`（`max_tokens`、`refusal`…）—— 回复是被截断的。拿一段截断的
+ *     正文去写盘，等于把那一段后半截删掉；
  *   · 这一轮被看门狗判成卡死（`wedged`）—— 它的"回复"末尾挂着 KiroLex 自己的说明，不是模型写的正文。
  *
  * 取消 / 出错的那一轮根本不会走到这里（调用方只在一轮**成功收尾**时兑付等待者）。
@@ -412,4 +541,42 @@ export function parseSlideEdits(
     edits.push({ at: hit[1], text });
   }
   return cannot ? { edits, ops, cannot } : { edits, ops };
+}
+
+/** `settlePatchRevision` 的结果 —— 就是 `review:revise-in-session` 在 `patch` 档的返回值（见那里的注释）。 */
+export type PatchSettled =
+  | { ok: false; cannot: string }
+  | { ok: false; error: string; conflict?: true }
+  | { ok: true; text: string; fullText: string; scope: 'patch'; changes: PatchChange[]; written?: true; path?: string };
+
+/**
+ * `patch` 档收到回复之后的那一整段 —— 解析 → 拼回 → 写盘，PURE（写盘由调用方注入，主进程传 `writeReviewFile`）。
+ *
+ * **盘上那一份和 base 对不上（`mismatch`）就失败，不交回正文** —— block 档那里会把结果交回渲染层自己写，
+ * 而渲染层那次写**不带 expectBase**：等回复的那几分钟里文件被别的改动动过的话，拿旧 base 拼出来的整份
+ * 会把那次改动整个盖掉。所以这里返回 `conflict`，界面保留意见、让你看一眼新的正文再提一次。
+ */
+export function settlePatchRevision(input: {
+  replyText: string;
+  /** 发给模型的那一份正文（行号按它编）。 */
+  base: string;
+  /** 不传 = 只拼不写（没有 `apply` 的老调用方）。`expectBase` 照传给 `writeReviewFile`。 */
+  write?: (fullText: string, expectBase: string) => { ok?: boolean; mismatch?: boolean; error?: string; path?: string } | null | undefined;
+}): PatchSettled {
+  const parsed = parsePatchReply(input.replyText);
+  if (parsed.cannot) return { ok: false, cannot: parsed.cannot };
+  if (parsed.error) return { ok: false, error: parsed.error };
+  const res = applyPatch(input.base, parsed.edits);
+  if (!res.ok) return { ok: false, error: res.why };
+  const done = { ok: true as const, text: res.text, fullText: res.text, scope: 'patch' as const, changes: res.changes };
+  if (!input.write) return done;
+  const wrote = input.write(res.text, input.base);
+  if (!wrote?.ok && wrote?.mismatch) {
+    return {
+      ok: false, conflict: true,
+      error: '这份文件在等回复的时候被别的改动动过了 —— 这次的结果没写进去，刷新看一眼新的正文再提一次',
+    };
+  }
+  if (!wrote?.ok) return { ok: false, error: wrote?.error || '写不进这个文件' };
+  return { ...done, written: true, ...(wrote.path ? { path: wrote.path } : null) };
 }

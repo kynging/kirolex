@@ -414,9 +414,9 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('workspace:download', sessionId, filePath),
   /**
    * 侧栏 review 的「✓ 确认」：把一条意见发给**打开这份文件的那条会话**，等它回改完的正文。
-   * 正忙就在主进程里排队；`cannot` = 它说这条改不了单独一段（渲染层据此升级到 `whole`）。
+   * 正忙就在主进程里排队；`cannot` = 它说这条改不了单独一段（渲染层据此升级到 `patch`）。
    */
-  reviseInSession: (input: { sessionId: string; where: string; note: string; about?: string; scope?: 'block' | 'whole' | 'insert'; label?: string; full?: string; ticket?: string; apply?: { path: string; mode: 'splice' | 'insert' | 'whole'; from?: number; to?: number; base: string } }) =>
+  reviseInSession: (input: { sessionId: string; where: string; note: string; about?: string; scope?: 'block' | 'patch' | 'insert'; label?: string; full?: string; fromLine?: number; toLine?: number; ticket?: string; apply?: { path: string; mode: 'splice' | 'insert' | 'patch'; from?: number; to?: number; base: string } }) =>
     ipcRenderer.invoke('review:revise-in-session', input),
   /** 把改完的正文写回这份文件 —— 路径按这条会话解析，只许写这条会话的标签页读过的，写前备份。 */
   reviewWriteFile: (sessionId: string | null | undefined, filePath: string, text: string) =>

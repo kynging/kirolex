@@ -101,10 +101,12 @@ describe('积累模式：先标记，一次提交', () => {
 });
 
 describe('提交之后那条路', () => {
-  test('先只要这一块，改不了才整份，整份带盘上此刻的正文', () => {
+  test('先只要这一块，改不了才走 patch（只交回要换的那几处），带盘上此刻的正文', () => {
     assert.match(RV, /scope: 'block'/);
     assert.match(RV, /if \(res\?\.cannot\) \{/);
-    assert.match(RV, /scope: 'whole',[\s\S]{0,120}full: base,/);
+    assert.match(RV, /scope: 'patch',[\s\S]{0,120}full: base, fromLine: from, toLine: to,/);
+    assert.doesNotMatch(RV, /scope: 'whole'/, '侧栏文本 comment 不再整篇重写');
+    assert.doesNotMatch(RV, /mode: 'whole'/);
   });
 
   test('按闭区间取原文、按闭区间换回去 —— 段落之间的空行照带', () => {
@@ -154,8 +156,8 @@ describe('提交之后那条路', () => {
     assert.ok(RV.includes('insert ? `＋ 加在${where}后面` : `💬 改${where}`,'));
   });
 
-  test('最下面有对整篇的意见 + 提交，按整份重改、KiroLex 写回', () => {
-    assert.ok(RV.includes("label: `${fileName} 整篇`, scope: 'whole', full: base,"));
+  test('最下面有对整篇的意见 + 提交，走 patch（不整篇重写）、KiroLex 写回', () => {
+    assert.ok(RV.includes("label: `${fileName} 整篇`, scope: 'patch', full: base,"));
     assert.ok(RV.includes("{markCount > 1 ? `提交（${markCount} 处）` : '提交'}"));
   });
 });
