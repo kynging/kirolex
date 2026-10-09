@@ -15,16 +15,20 @@ function tmpFile(): string {
   return path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kctl-')), 'sub', 'control.json');
 }
 
-/** 一份可以随手改的假会话状态 */
+/** 一份可以随手改的假会话状态；`calls()` 是 getBusy 被查了几次（用来确认轮询真的跑过） */
 function fakeState() {
   const turns = new Set<string>();
   const scheduleRuns = new Map<string, string>();
   const queues = new Map<string, number>();
-  const getBusy = (): BusySession[] => collectBusySessions({
-    turns, scheduleRuns: scheduleRuns.values(), queues: queues.entries(),
-    titleOf: (id) => `title of ${id}`,
-  });
-  return { turns, scheduleRuns, queues, getBusy };
+  let calls = 0;
+  const getBusy = (): BusySession[] => {
+    calls++;
+    return collectBusySessions({
+      turns, scheduleRuns: scheduleRuns.values(), queues: queues.entries(),
+      titleOf: (id) => `title of ${id}`,
+    });
+  };
+  return { turns, scheduleRuns, queues, getBusy, calls: () => calls };
 }
 
 async function start(extra: Partial<ControlServerOptions> = {}) {
@@ -38,6 +42,21 @@ async function start(extra: Partial<ControlServerOptions> = {}) {
 }
 
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+
+/** 轮询到条件成立；机器忙的时候计时器会晚到，所以不用固定等待，超时才算失败 */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 10_000): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  while (!cond()) {
+    if (Date.now() > deadline) assert.fail(`等了 ${timeoutMs}ms 还没等到：${what}`);
+    await sleep(5);
+  }
+}
+
+/** 等 getBusy 再被查 n 次 —— 「不该退」的断言要在轮询确实跑过之后才有意义 */
+async function waitPolls(calls: () => number, n = 3): Promise<void> {
+  const target = calls() + n;
+  await waitFor(() => calls() >= target, `再轮询 ${n} 次`);
+}
 
 describe('controlServer：control.json', () => {
   test('写 control.json：port / token / pid', async () => {
@@ -98,6 +117,7 @@ describe('controlServer：HTTP', () => {
       assert.equal(r.status, 202);
       assert.deepEqual(await r.json(), { quitting: true });
       await post('/quit');
+      await waitFor(() => quits() > 0, '退出回调');
       await sleep(30);
       assert.equal(quits(), 1);
     } finally { await srv.close(); }
@@ -117,10 +137,10 @@ describe('controlServer：HTTP', () => {
       assert.deepEqual(await (await fetch(url('/ping'))).json(), { ok: true, pid: process.pid, busy: 2, pendingQuit: true });
 
       st.turns.delete('a');
-      await sleep(40);
+      await waitPolls(st.calls);
       assert.equal(quits(), 0, '还有一个定时任务在跑');
       st.scheduleRuns.clear();
-      await sleep(40);
+      await waitFor(() => quits() > 0, '空下来后退出');
       assert.equal(quits(), 1);
     } finally { await srv.close(); }
   });
@@ -133,7 +153,7 @@ describe('controlServer：HTTP', () => {
       const r = await post('/quit?force=1');
       assert.equal(r.status, 202);
       assert.deepEqual(await r.json(), { quitting: true });
-      await sleep(30);
+      await waitFor(() => quits() > 0, '强制退出');
       assert.equal(quits(), 1);
     } finally { await srv.close(); }
   });
@@ -175,7 +195,7 @@ describe('等待退出（不依赖 HTTP）', () => {
     const pendingSeen: boolean[] = [];
     const q = createQuitCoordinator({ onQuit: () => quits++, getBusy: () => [], onPendingChange: (p) => pendingSeen.push(p), pollMs: 10 });
     assert.deepEqual(q.request(), { quitting: true });
-    await sleep(5);
+    await waitFor(() => quits > 0, '退出回调');
     assert.equal(quits, 1);
     assert.equal(q.pending, false);
     assert.deepEqual(pendingSeen, []);
@@ -190,12 +210,12 @@ describe('等待退出（不依赖 HTTP）', () => {
     assert.deepEqual(q.request(), { quitting: false, waiting: 1 });
     assert.equal(q.pending, true);
     assert.equal(paused, true, '等待期间排队 / 定时任务要暂停');
-    await sleep(40);
+    await waitPolls(st.calls);
     assert.equal(quits, 0);
     // 再请求一次：还在等，不重复起计时器
     assert.deepEqual(q.request(), { quitting: false, waiting: 1 });
     st.turns.clear();
-    await sleep(40);
+    await waitFor(() => quits > 0, '空下来后退出');
     assert.equal(quits, 1);
     q.dispose();
   });
@@ -206,15 +226,16 @@ describe('等待退出（不依赖 HTTP）', () => {
     let quits = 0;
     const q = createQuitCoordinator({ onQuit: () => quits++, getBusy: st.getBusy, pollMs: 10 });
     assert.deepEqual(q.request(), { quitting: true });
-    await sleep(5);
+    await waitFor(() => quits > 0, '退出回调');
     assert.equal(quits, 1);
   });
 
   test('判断忙不忙时抛错 → 当作忙，不退', async () => {
     let quits = 0;
-    const q = createQuitCoordinator({ onQuit: () => quits++, getBusy: () => { throw new Error('boom'); }, pollMs: 10 });
+    let calls = 0;
+    const q = createQuitCoordinator({ onQuit: () => quits++, getBusy: () => { calls++; throw new Error('boom'); }, pollMs: 10 });
     assert.equal(q.request().quitting, false);
-    await sleep(30);
+    await waitPolls(() => calls);
     assert.equal(quits, 0);
     q.dispose();
   });
@@ -226,9 +247,11 @@ describe('等待退出（不依赖 HTTP）', () => {
     const q = createQuitCoordinator({ onQuit: () => quits++, getBusy: st.getBusy, pollMs: 10 });
     q.request();
     assert.deepEqual(q.request(true), { quitting: true });
-    await sleep(5);
+    await waitFor(() => quits > 0, '强制退出');
     assert.equal(quits, 1);
+    const polled = st.calls();
     await sleep(30);
+    assert.equal(st.calls(), polled, '计时器也停了');
     assert.equal(quits, 1, '计时器也停了，不会再退一次');
   });
 
