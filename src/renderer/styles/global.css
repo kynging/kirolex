@@ -8423,7 +8423,7 @@ button, input, select, textarea {
 /* 按行之后每块很矮，块间距收紧 —— 段落那种 14px 会把一份文档拉得到处是空隙 */
 .rv-review-blocks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 /*
-  `position: relative` + 右边给 💬(right:0) 和 ✕(right:22) 两个 absolute 按钮让位。
+  `position: relative` + 右边 90px 给 ✎(66) ✕(44) ＋(22) 💬(0) 四个 absolute 按钮让位。
   `gap: 0` 是刻意的：块内只有"正文"和"那个不占高度的工具包装"，留 gap 的话**每一行都会多一截**。
 */
 .rv-review-block { position: relative; display: flex; flex-direction: column; gap: 0; padding-right: 90px; }
@@ -8443,18 +8443,41 @@ button, input, select, textarea {
 .rv-review .rt-block-drop {
   position: absolute; top: 0; width: 20px; height: 20px; padding: 0;
   font: inherit; font-size: 11px; line-height: 1; cursor: pointer; border-radius: 4px;
-  border: 1px solid transparent; background: none; color: var(--text-tertiary);
-  opacity: .35; transition: opacity .12s;
+  /* 每个按钮一种颜色（--rv-c）：同色字、同色细边、很淡的同色底 —— 平时也看得清，不再是 .35 的淡灰 */
+  --rv-c: var(--text-secondary);
+  border: 1px solid color-mix(in srgb, var(--rv-c) 45%, transparent);
+  background: color-mix(in srgb, var(--rv-c) 10%, transparent); color: var(--rv-c);
+  opacity: .75; transition: opacity .12s, background-color .12s, border-color .12s;
 }
+/* 从左到右 ✎ ✕ ＋ 💬（DOM 也是这个顺序，Tab 键同序） */
 .rv-review .rt-note-btn { right: 0; }
-.rv-review .rt-block-drop { right: 22px; font-size: 10px; }
 /* ＋ 在这一块后面加新内容 ——「我要能在段落后加新的」 */
-.rv-review .rv-insert-btn { right: 44px; font-size: 12px; }
+.rv-review .rv-insert-btn { right: 22px; font-size: 12px; --rv-c: var(--success); }
+.rv-review .rt-block-drop { right: 44px; font-size: 10px; --rv-c: var(--error); }
 /* ✎ 直接改这一块（不经过模型） */
-.rv-review .rv-edit-btn { right: 66px; font-size: 11px; }
-.rv-review-block:hover .rv-edit-btn { opacity: .9; }
-.rv-review .rv-edit-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
-.rv-review .rv-edit-btn.has-note { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.rv-review .rv-edit-btn { right: 66px; font-size: 11px; --rv-c: var(--accent); }
+.rv-review-block:hover .rv-edit-btn,
+.rv-review-block:hover .rv-insert-btn,
+.rv-review-block:hover .rt-note-btn,
+.rv-review-block:hover .rt-block-drop { opacity: 1; }
+.rv-review .rt-note-btn:hover,
+.rv-review .rv-insert-btn:hover,
+.rv-review .rv-edit-btn:hover,
+.rv-review .rt-block-drop:hover {
+  opacity: 1; border-color: var(--rv-c); background: color-mix(in srgb, var(--rv-c) 24%, transparent);
+}
+.rv-review .rt-note-btn:focus-visible,
+.rv-review .rv-insert-btn:focus-visible,
+.rv-review .rv-edit-btn:focus-visible,
+.rv-review .rt-block-drop:focus-visible { opacity: 1; outline: 1px solid var(--rv-c); outline-offset: 1px; }
+/* 有草稿的 ✎ / ＋：实线全色边 + 更深的底，和"平时"一眼分得开 */
+.rv-review .rv-edit-btn.has-note,
+.rv-review .rv-insert-btn.has-note {
+  opacity: 1; border-color: var(--rv-c); background: color-mix(in srgb, var(--rv-c) 30%, transparent);
+  box-shadow: 0 0 0 1px color-mix(in srgb, var(--rv-c) 35%, transparent);
+}
+.rv-review .rv-edit-btn.has-note:hover,
+.rv-review .rv-insert-btn.has-note:hover { background: color-mix(in srgb, var(--rv-c) 42%, transparent); }
 /*
   **改的时候和没改的时候看起来一样** ——「能让修改和没修改时看起来字号什么的都一样吗」。✎ 那个框原来是 11px 等宽字，
   正文是会话字号、1.75 倍行距：一点开整块就缩小、换字体、行距变密。现在框里的字体、字号、行距都和那一块正文一样，
@@ -8467,25 +8490,19 @@ button, input, select, textarea {
 }
 /* 没有这一条就是浏览器默认那圈白色粗框 —— 和正文差得最远的就是它 */
 .rv-review .rv-edit-slot .rt-note:focus { outline: none; border-style: solid; }
-.rv-review-block:hover .rv-insert-btn { opacity: .9; }
-.rv-review .rv-insert-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
-.rv-review .rv-insert-btn:focus-visible { opacity: 1; }
 /* ＋ 的框用强调色的左边线，和 💬 的框一眼分得开：一个是改这里，一个是往这里后面加 */
 .rv-insert-slot .rt-note-box { border-left: 2px solid var(--accent); padding-left: 6px; }
 /*
   **鼠标停在哪一行，那一行就亮起来**，按钮也只在这一行 hover 时显形 ——「这个 comment 界面根本看不出来
   哪个按钮对应的是哪一行」：一行只有 21px 高，一整列淡图标每个都"像是属于旁边那行"。
 */
-.rv-review-block:hover .rt-note-btn,
-.rv-review-block:hover .rt-block-drop { opacity: .9; }
-.rv-review .rt-note-btn:hover { opacity: 1; border-color: var(--border); background: var(--bg-hover); }
-.rv-review .rt-block-drop:hover { opacity: 1; border-color: var(--error); color: var(--error); background: var(--bg-hover); }
-.rv-review .rt-note-btn:focus-visible, .rv-review .rt-block-drop:focus-visible { opacity: 1; }
-/* 标了删的那一块一直显示它的 ↩ —— 那是唯一能撤回的入口 */
+/* 标了删的那一块一直显示它的 ↩ —— 那是唯一能撤回的入口：实心红底白字，和平时的 ✕ 一眼分得开 */
 .rv-review .rt-block-drop.on,
-.rv-review-block.dropped .rt-block-drop { opacity: 1; color: var(--error); border-color: var(--error); }
+.rv-review-block.dropped .rt-block-drop { opacity: 1; color: #fff; border-color: var(--error); background: var(--error); }
+.rv-review .rt-block-drop.on:hover,
+.rv-review-block.dropped .rt-block-drop:hover { background: color-mix(in srgb, var(--error) 80%, #000); }
 /* 写过意见的那一行：💬 常显、强调色，**行高一点不变** */
-.rv-review .rt-note-btn.has-note { opacity: 1; color: var(--success, #3fb950); border-color: rgba(63,185,80,.45); }
+.rv-review .rt-note-btn.has-note { opacity: 1; --rv-c: var(--success, #3fb950); border-color: var(--rv-c); background: color-mix(in srgb, var(--rv-c) 22%, transparent); }
 .rv-review-block:hover,
 .rv-review-block:has(.rt-note-box) { background: var(--bg-hover, rgba(255, 255, 255, .045)); border-radius: 4px; }
 
@@ -8519,7 +8536,6 @@ button, input, select, textarea {
 /* **鼠标停在标题上，整段亮起来** —— ✕ 一个标题可能带走十几行，范围要在点之前看得见 */
 .rv-review-block.section-preview { background: var(--bg-hover, rgba(255, 255, 255, .045)); border-radius: 0; }
 .rv-review-block.section-preview.section-head { border-radius: 4px 4px 0 0; background: var(--bg-hover, rgba(255, 255, 255, .075)); }
-.rv-review-block.section-head:hover .rt-block-drop { color: var(--error); opacity: 1; }
 /* 改写中的那一节**锁住**：变淡 + 不可选，处置按钮全部收掉，并明确写出"改写中" */
 .rv-review-block.locked { opacity: .62; user-select: none; }
 .rv-review .rt-block-lock { font-size: 10px; line-height: 1.5; margin-top: 3px; color: var(--success, #3fb950); }
@@ -8561,8 +8577,6 @@ button, input, select, textarea {
 .rv-box-target { font-size: 10px; line-height: 1.6; color: var(--accent); margin-top: 4px; }
 /* 排着队的那几条：排队中淡一些，进行中用原来那个绿色 */
 .rv-review .rt-block-lock.queued { color: var(--text-tertiary); }
-/* ＋ 标过内容的那一段：＋ 常显、强调色（和 💬 的 has-note 一样）*/
-.rv-review .rv-insert-btn.has-note { opacity: 1; color: var(--accent); border-color: var(--accent); }
 /* 最下面提交那一行：左边是标了几处，右边是按钮 */
 .rv-review .rv-review-whole-actions { justify-content: space-between; }
 .rv-review-count { font-size: 10px; color: var(--text-tertiary); }
@@ -8595,10 +8609,8 @@ button, input, select, textarea {
 .rv-page-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
 .rt-block-drop.rv-drop-page {
   width: auto; height: 20px; padding: 0 7px; white-space: nowrap; font-size: 10px;
-  opacity: .6; pointer-events: auto;
+  opacity: .75; pointer-events: auto;
 }
-.rt-block-drop.rv-drop-page:hover { opacity: 1; border-color: var(--error); color: var(--error); }
-.rt-block-drop.rv-drop-page.on { opacity: 1; color: var(--error); border-color: var(--error); }
 .rv-review-pagerow {
   list-style: none; margin: 0; padding: 0;
   display: flex; flex-wrap: wrap; gap: 6px;
@@ -8702,6 +8714,10 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .rv-review .rv-page-tools .rt-block-drop,
 .rv-review .rt-block-drop.rv-drop-page { position: static; opacity: .8; }
 .rv-review .rt-block-drop.rv-drop-page { width: auto; padding: 0 7px; white-space: nowrap; }
+/* 页级按钮不在 .rv-review-block 里，没有「整行 hover」那一层 —— 自己 hover / 有草稿 / 标了删时完全不透明 */
+.rv-review .rv-page-tools .rt-note-btn:is(:hover, :focus-visible, .has-note),
+.rv-review .rv-page-tools .rv-insert-btn:is(:hover, :focus-visible, .has-note),
+.rv-review .rt-block-drop.rv-drop-page:is(:hover, :focus-visible, .on) { opacity: 1; }
 /*
   **给 PDF 一块确定的高度** —— 页在 .rv-pdf-pages 里自己滚，放大浮层（.rv-zoom，absolute inset 0）
   盖住的就是看得见的那一块，而不是整份文档那么高。
@@ -8760,12 +8776,19 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   border-radius: 4px;
 }
 .rv-review-block.ai-changed:not(.targeted) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
-/* 右边那一栏（`.rv-review-block` 的 90px 右内边距）的第二行 —— 第一行是 ✎ 💬 ＋ ✕（top: 0，各 20px 高） */
-.rv-ai-side {
-  position: absolute; top: 22px; right: 0; width: 88px;
-  display: flex; flex-direction: column; align-items: flex-end; gap: 2px;
+/*
+  正文下面多出来的一行：「AI 刚改过」+ 撤销，靠右摆。它在文档流里，这一段自己就被撑高了 ——
+  不和右上角的 ✎ ✕ ＋ 💬 抢位置，也不会压到下一段。
+*/
+.rv-ai-side { display: flex; flex-wrap: wrap; justify-content: flex-end; align-items: center; gap: 2px 10px; padding: 2px 0; }
+.rv-ai-one { display: flex; align-items: center; gap: 6px; height: 20px; white-space: nowrap; }
+.rv-ai-tag { font-size: 11px; font-weight: 600; color: var(--accent); cursor: help; }
+/* 「撤销」：实心强调色底、白字 —— 深浅主题下都一眼看得到 */
+.rv-review .rt-hist-btn.rv-ai-undo {
+  width: auto; height: 18px; padding: 0 5px; font-size: 11px; font-weight: 600; line-height: 16px;
+  color: #fff; background: var(--accent); border-color: var(--accent); opacity: 1;
 }
-.rv-ai-one { display: flex; align-items: center; justify-content: flex-end; gap: 3px; height: 20px; white-space: nowrap; }
-.rv-ai-tag { font-size: 10px; color: var(--accent); cursor: help; }
-.rv-review .rt-hist-btn.rv-ai-undo { width: auto; height: 18px; padding: 0 4px; font-size: 10px; line-height: 16px; border-color: var(--border); opacity: .9; }
-.rv-review .rt-hist-btn.rv-ai-undo:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }
+.rv-review .rt-hist-btn.rv-ai-undo:hover {
+  opacity: 1; color: #fff;
+  background: color-mix(in srgb, var(--accent) 78%, #000); border-color: color-mix(in srgb, var(--accent) 78%, #000);
+}

@@ -1169,7 +1169,7 @@ export const ReviewPane: React.FC<{
     </div>
   );
 
-  /** 文本那侧每一块的按钮：💬 改这一块、＋ 在后面加、✕ 标删（↩ 取消）。框不在这里，见 `boxFor`。 */
+  /** 文本那侧每一块的按钮，从左到右：✎ 直接改、✕ 标删（↩ 取消）、＋ 在后面加、💬 改这一块。框不在这里，见 `boxFor`。 */
   const tools = (block: ReviewBlock) => {
     const where = spanWhere(block.index);
     const gone = !!dropped[block.index];
@@ -1190,18 +1190,6 @@ export const ReviewPane: React.FC<{
             }}
           >✎</button>
         )}
-        {!boxOpen && !gone && (
-          <CommentOpener onClick={() => openBox('comment', block.index)} active={!!draftOf(String(block.index)).trim()}
-            title={`对${where}提意见（先标记，点「✓ 确认」时一起提交）`} />
-        )}
-        {!boxOpen && !gone && (
-          <button
-            type="button"
-            className={`rv-insert-btn${draftOf(`+${block.index}`).trim() ? ' has-note' : ''} nopan nodrag`}
-            title={`在${where}后面加新内容（先标记，一起提交）`}
-            onClick={(e) => { e.stopPropagation(); openBox('insert', block.index); }}
-          >＋</button>
-        )}
         {!boxOpen && (
           <button
             type="button"
@@ -1213,6 +1201,18 @@ export const ReviewPane: React.FC<{
               if (!gone) bumpMark(`drop:${block.index}`);
             }}
           >{gone ? '↩' : '✕'}</button>
+        )}
+        {!boxOpen && !gone && (
+          <button
+            type="button"
+            className={`rv-insert-btn${draftOf(`+${block.index}`).trim() ? ' has-note' : ''} nopan nodrag`}
+            title={`在${where}后面加新内容（先标记，一起提交）`}
+            onClick={(e) => { e.stopPropagation(); openBox('insert', block.index); }}
+          >＋</button>
+        )}
+        {!boxOpen && !gone && (
+          <CommentOpener onClick={() => openBox('comment', block.index)} active={!!draftOf(String(block.index)).trim()}
+            title={`对${where}提意见（先标记，点「✓ 确认」时一起提交）`} />
         )}
       </div>
     );
@@ -1572,8 +1572,6 @@ export const ReviewPane: React.FC<{
           return (
             <li
               key={g.anchor}
-              /* 右边那一栏第二行放「AI 刚改过」：一行高的块得撑高到放得下它（每处一行） */
-              style={aiHere.length ? { minHeight: `calc(${aiHere.length + 1} * 22px)` } : undefined}
               onMouseEnter={() => setHoverAt(g.anchor)}
               onMouseLeave={() => setHoverAt((cur) => (cur === g.anchor ? null : cur))}
               className={'rv-review-block'
@@ -1631,8 +1629,8 @@ export const ReviewPane: React.FC<{
               )}
               {on && applyNote[`drop:${g.anchor}`] && <div className="rt-note-applied">{applyNote[`drop:${g.anchor}`]}</div>}
               {/*
-                AI 刚改过的那一处：「AI 刚改过」+ 撤销 摆在**右边那一栏的第二行**（第一行是 ✎ 💬 ＋ ✕）——
-                不占正文下面的位置。撤销没成的原因还是跟在正文下面（一句话放不进那一栏）。
+                AI 刚改过的那一处：「AI 刚改过」+ 撤销 摆在**正文下面多出来的一行**里（在文档流里，自己撑高这一段）——
+                不再塞进右边那一栏，就不会压到下一段的 ✎ ✕ ＋ 💬。撤销没成的原因也跟在正文下面。
               */}
               {aiHere.length > 0 && (
                 <div className="rv-ai-side">
