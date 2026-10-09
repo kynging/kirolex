@@ -8735,5 +8735,12 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   border-radius: 4px;
 }
 .rv-review-block.ai-changed:not(.targeted) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
-.rv-ai-tag { font-size: 10px; color: var(--accent); margin-right: 4px; cursor: help; }
-.rv-ai-undo { font-size: 10px; }
+/* 右边那一栏（`.rv-review-block` 的 90px 右内边距）的第二行 —— 第一行是 ✎ 💬 ＋ ✕（top: 0，各 20px 高） */
+.rv-ai-side {
+  position: absolute; top: 22px; right: 0; width: 88px;
+  display: flex; flex-direction: column; align-items: flex-end; gap: 2px;
+}
+.rv-ai-one { display: flex; align-items: center; justify-content: flex-end; gap: 3px; height: 20px; white-space: nowrap; }
+.rv-ai-tag { font-size: 10px; color: var(--accent); cursor: help; }
+.rv-review .rt-hist-btn.rv-ai-undo { width: auto; height: 18px; padding: 0 4px; font-size: 10px; line-height: 16px; border-color: var(--border); opacity: .9; }
+.rv-review .rt-hist-btn.rv-ai-undo:hover { opacity: 1; color: var(--accent); border-color: var(--accent); }

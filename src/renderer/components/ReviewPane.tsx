@@ -1568,9 +1568,12 @@ export const ReviewPane: React.FC<{
           const ownsSection = (spans[g.anchor]?.length || 0) > 1;
           const goneBy = droppedBy(g.anchor);
           const locked = lockedLines.has(g.anchor);
+          const aiHere = (aiLayout.rowAt.get(g.anchor) || []).map((i) => aiMarks[i]).filter(Boolean);
           return (
             <li
               key={g.anchor}
+              /* 右边那一栏第二行放「AI 刚改过」：一行高的块得撑高到放得下它（每处一行） */
+              style={aiHere.length ? { minHeight: `calc(${aiHere.length + 1} * 22px)` } : undefined}
               onMouseEnter={() => setHoverAt(g.anchor)}
               onMouseLeave={() => setHoverAt((cur) => (cur === g.anchor ? null : cur))}
               className={'rv-review-block'
@@ -1627,17 +1630,17 @@ export const ReviewPane: React.FC<{
                 </div>
               )}
               {on && applyNote[`drop:${g.anchor}`] && <div className="rt-note-applied">{applyNote[`drop:${g.anchor}`]}</div>}
-              {/* AI 刚改过的那一处（每处一行）：标签 + 撤销 —— 只把这一段换回原文。留到下一次提交 */}
-              {(aiLayout.rowAt.get(g.anchor) || []).map((i) => {
-                const m = aiMarks[i];
-                if (!m) return null;
-                const removed = m.to < m.from;
-                return (
-                  <div key={`ai:${m.id}`} className="rt-brief-row rv-ai-row">
-                    <span className="rt-hist-one">
+              {/*
+                AI 刚改过的那一处：「AI 刚改过」+ 撤销 摆在**右边那一栏的第二行**（第一行是 ✎ 💬 ＋ ✕）——
+                不占正文下面的位置。撤销没成的原因还是跟在正文下面（一句话放不进那一栏）。
+              */}
+              {aiHere.length > 0 && (
+                <div className="rv-ai-side">
+                  {aiHere.map((m) => (
+                    <span key={`ai:${m.id}`} className="rv-ai-one">
                       <span className="rv-ai-tag" title={m.original ? `原来是：
 ${m.original}` : '原来这里没有这段'}>
-                        {removed ? 'AI 刚删掉了一段' : 'AI 刚改过'}
+                        {m.to < m.from ? 'AI 删了一段' : 'AI 刚改过'}
                       </span>
                       {sessionId && !locked && (
                         <button type="button" className="rt-hist-btn rv-ai-undo nopan nodrag"
@@ -1645,10 +1648,12 @@ ${m.original}` : '原来这里没有这段'}>
                           onClick={() => { void undoAi(m.id); }}>撤销</button>
                       )}
                     </span>
-                    {(m.note || applyNote[`ai:${m.id}`]) && <div className="rt-note-applied">{m.note || applyNote[`ai:${m.id}`]}</div>}
-                  </div>
-                );
-              })}
+                  ))}
+                </div>
+              )}
+              {aiHere.map((m) => ((m.note || applyNote[`ai:${m.id}`])
+                ? <div key={`ai-note:${m.id}`} className="rt-note-applied">{m.note || applyNote[`ai:${m.id}`]}</div>
+                : null))}
               {/* 提交那一行在**最新标的那一段**下面（见 `latestMark`） */}
               {on && !locked && submitHereText(g.anchor) && submitRow}
               {/* 排着的改动挂在那一节末尾 —— 见 `statusAt` */}
