@@ -178,6 +178,137 @@ describe('controlServer：HTTP', () => {
     } finally { await srv.close(); }
   });
 
+  test('POST /reload 没 token / 错 token → 401，不刷新', async () => {
+    let reloads = 0;
+    const { srv, post, url, quits } = await start({ onReload: () => { reloads++; } });
+    try {
+      assert.equal((await post('/reload', null)).status, 401);
+      assert.equal((await post('/reload', 'nope')).status, 401);
+      assert.equal((await fetch(url('/reload'), { method: 'POST', headers: { Authorization: srv.token } })).status, 401);
+      await sleep(20);
+      assert.equal(reloads, 0);
+      assert.equal(quits(), 0);
+    } finally { await srv.close(); }
+  });
+
+  test('空闲时 POST /reload → 200 {ok:true}，立即调一次刷新回调，不退出、不进入等待', async () => {
+    let reloads = 0;
+    const pendingSeen: boolean[] = [];
+    const { srv, post, url, quits } = await start({ onReload: () => { reloads++; }, onPendingChange: (p) => pendingSeen.push(p) });
+    try {
+      const r = await post('/reload');
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), { ok: true });
+      await waitFor(() => reloads === 1, '刷新回调被调用');
+      await sleep(20);
+      assert.equal(reloads, 1);
+      assert.equal(quits(), 0);
+      assert.equal(srv.quit.pending, false);
+      assert.deepEqual(pendingSeen, [], '空闲时不进入等待，也就不暂停任何东西');
+      assert.deepEqual(await (await fetch(url('/ping'))).json(), { ok: true, pid: process.pid, busy: 0 });
+    } finally { await srv.close(); }
+  });
+
+  test('忙时 POST /reload → 202 {reloading:false, waiting}，ping 带 pendingReload，暂停新一轮；空下来先恢复再刷新', async () => {
+    const st = fakeState();
+    const events: string[] = [];
+    const { srv, url, post, quits } = await start({
+      getBusy: st.getBusy,
+      onReload: () => { events.push('reload'); },
+      onPendingChange: (p) => events.push(p ? 'pause' : 'resume'),
+    });
+    try {
+      st.turns.add('a');
+      st.scheduleRuns.set('sched_1', 'b');
+      const r = await post('/reload');
+      assert.equal(r.status, 202);
+      assert.deepEqual(await r.json(), { reloading: false, waiting: 2 });
+      assert.deepEqual(events, ['pause'], '等待期间告诉 index.ts 不开始新一轮');
+      assert.deepEqual(await (await fetch(url('/ping'))).json(), { ok: true, pid: process.pid, busy: 2, pendingReload: true });
+
+      st.turns.delete('a');
+      await waitPolls(st.calls);
+      assert.deepEqual(events, ['pause'], '还有一个定时任务在跑，不刷新');
+      st.scheduleRuns.clear();
+      await waitFor(() => events.includes('reload'), '空下来后刷新');
+      await sleep(30);
+      assert.deepEqual(events, ['pause', 'resume', 'reload'], '先恢复排队和定时任务，再刷新，只刷新一次');
+      assert.equal(quits(), 0);
+      assert.equal(srv.quit.pending, false);
+      assert.equal((await (await fetch(url('/ping'))).json()).pendingReload, undefined);
+    } finally { await srv.close(); }
+  });
+
+  test('POST /reload?force=1 忙也不等', async () => {
+    const st = fakeState();
+    st.turns.add('a');
+    let reloads = 0;
+    const { srv, post } = await start({ getBusy: st.getBusy, onReload: () => { reloads++; } });
+    try {
+      const r = await post('/reload?force=1');
+      assert.equal(r.status, 200);
+      assert.deepEqual(await r.json(), { ok: true });
+      await waitFor(() => reloads === 1, '刷新回调');
+    } finally { await srv.close(); }
+  });
+
+  test('POST /quit/cancel 取消等待刷新：不刷新，pendingReload 消失，恢复排队；之后空下来也不刷新', async () => {
+    const st = fakeState();
+    st.turns.add('a');
+    const events: string[] = [];
+    const { srv, url, post } = await start({
+      getBusy: st.getBusy,
+      onReload: () => { events.push('reload'); },
+      onPendingChange: (p) => events.push(p ? 'pause' : 'resume'),
+    });
+    try {
+      await post('/reload');
+      const c = await post('/quit/cancel');
+      assert.equal(c.status, 200);
+      assert.deepEqual(await c.json(), { ok: true, cancelled: true });
+      assert.equal((await (await fetch(url('/ping'))).json()).pendingReload, undefined);
+      st.turns.clear();
+      await sleep(50);
+      assert.deepEqual(events, ['pause', 'resume']);
+    } finally { await srv.close(); }
+  });
+
+  test('等刷新时来了 /quit → 改成等退出；等退出时来了 /reload → 照样等退出，不刷新', async () => {
+    const st = fakeState();
+    st.turns.add('a');
+    const events: string[] = [];
+    const { srv, url, post, quits } = await start({
+      getBusy: st.getBusy,
+      onReload: () => { events.push('reload'); },
+      onPendingChange: (p) => events.push(p ? 'pause' : 'resume'),
+    });
+    try {
+      await post('/reload');
+      assert.deepEqual(await (await post('/quit')).json(), { quitting: false, waiting: 1 });
+      assert.deepEqual(await (await fetch(url('/ping'))).json(), { ok: true, pid: process.pid, busy: 1, pendingQuit: true });
+      assert.deepEqual(await (await post('/reload')).json(), { reloading: false, waiting: 1 });
+      st.turns.clear();
+      await waitFor(() => quits() === 1, '空下来后退出');
+      await sleep(30);
+      assert.deepEqual(events, ['pause'], '不刷新，也不在退出前恢复排队');
+    } finally { await srv.close(); }
+  });
+
+  test('POST /reload 刷新回调抛错也照样 200，服务还活着', async () => {
+    const { srv, post, url } = await start({ onReload: () => { throw new Error('boom'); } });
+    try {
+      assert.equal((await post('/reload')).status, 200);
+      await sleep(20);
+      assert.equal((await fetch(url('/ping'))).status, 200);
+      assert.equal((await post('/reload')).status, 200, '刷新过一次之后还能再刷新');
+    } finally { await srv.close(); }
+  });
+
+  test('没传刷新回调 → POST /reload 501', async () => {
+    const { srv, post } = await start();
+    try { assert.equal((await post('/reload')).status, 501); } finally { await srv.close(); }
+  });
+
   test('其它路径和方法 → 404', async () => {
     const { srv, url } = await start();
     try {
@@ -185,6 +316,8 @@ describe('controlServer：HTTP', () => {
       assert.equal((await fetch(url('/quit'))).status, 404);
       assert.equal((await fetch(url('/quit/cancel'))).status, 404);
       assert.equal((await fetch(url('/ping'), { method: 'POST' })).status, 404);
+      assert.equal((await fetch(url('/reload'))).status, 404);
+      assert.equal((await fetch(url('/reload/x'), { method: 'POST' })).status, 404);
     } finally { await srv.close(); }
   });
 });

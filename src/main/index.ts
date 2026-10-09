@@ -11427,13 +11427,25 @@ app.whenReady().then(async () => {
   try {
     controlServer = await createControlServer({
       onQuit: () => { isQuitting = true; app.quit(); },
+      /*
+        **只刷新窗口，不动主进程** —— 会话、kiro-cli、排队、定时任务全在这边，原样留着。
+        和 `/quit` 一样只在没有会话忙的时候才调到这里（有忙的就先等，见 controlServer.ts）；
+        渲染端回来时从 ui-state.json 恢复标签 / 分屏 / 草稿。
+      */
+      onReload: () => {
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (win.isDestroyed() || win === splashWindow) continue;
+          logger.info('control', `reloading window "${win.getTitle()}"`);
+          win.webContents.reloadIgnoringCache();
+        }
+      },
       getBusy: getBusySessions,
       onPendingChange: (pending) => {
         quitPending = pending;
         mainWindow?.webContents.send('control:pending-quit', pending);
         if (pending) {
           const busy = getBusySessions();
-          logger.info('app', `pending quit: waiting for ${busy.map((b) => `${b.title || b.id}[${b.reasons.join(',')}]`).join(' ')}`);
+          logger.info('app', `pending ${controlServer?.quit.pendingAction ?? 'quit/reload'}: waiting for ${busy.map((b) => `${b.title || b.id}[${b.reasons.join(',')}]`).join(' ')}`);
         }
       },
       log: (msg) => logger.info('control', msg),
