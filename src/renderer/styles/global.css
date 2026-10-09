@@ -2961,8 +2961,29 @@ button, input, select, textarea {
   align-self: center;
   padding: 4px 0;
 }
-.file-panel-top .workspace-file-actions .text-btn { white-space: nowrap; }
-.file-panel-top .workspace-file-actions .text-btn:disabled { opacity: 0.45; cursor: default; }
+/* ⟳ 刷新 / 📂 打开位置：`.text-btn` 全局没有样式，不写就是浏览器默认的白底灰框 ——
+   和旁边的 ✕（.settings-close）同一套：透明底、无边框、淡字，悬停才出底色。 */
+.file-panel-top .workspace-file-actions { gap: 2px; }
+.file-panel-top .workspace-file-actions .text-btn {
+  gap: 4px;
+  padding: 4px 8px;
+  border: none;
+  border-radius: 4px;
+  background: none;
+  color: var(--text-secondary);
+  font: inherit;
+  font-size: 12px;
+  line-height: 1.2;
+  white-space: nowrap;
+  cursor: pointer;
+  transition: background 0.15s, color 0.15s;
+}
+.file-panel-top .workspace-file-actions .text-btn:hover:not(:disabled) {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.file-panel-top .workspace-file-actions .text-btn:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
+.file-panel-top .workspace-file-actions .text-btn:disabled { opacity: 0.4; cursor: default; }
 .file-tab.gone .file-tab-name { color: var(--text-muted); text-decoration: line-through; }
 
 .file-tab:hover .file-tab-close { color: var(--text-muted); }
