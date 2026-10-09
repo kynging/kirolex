@@ -28,6 +28,8 @@ import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache }
 import { SkillDialog } from './components/SkillDialog';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { ReviewPane, isDeckPath } from './components/ReviewPane';
+import { PreviewFind } from './components/PreviewFind';
+import { findOwner, isInPreview, previewSearchable } from './previewFind';
 import { savedScrollOf, scrollHostOf, restoreScroll } from './tabScroll';
 import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
@@ -1303,6 +1305,20 @@ const App: React.FC = () => {
   };
   // Markdown files render formatted by default; the toggle shows the raw source.
   const fileViewerRaw = !!fileViewer?.raw;
+  /**
+   * 焦点在不在右侧预览栏里（点过它，或者焦点落在它里面的元素上）—— 在的话 Ctrl/Cmd+F 归预览栏自己的搜索条，
+   * 聊天格让出（`findSuspended`）。点回聊天区、侧栏等任何别处就还给聊天格。判据见 `previewFind.ts`。
+   */
+  const [focusInPreview, setFocusInPreview] = useState(false);
+  useEffect(() => {
+    const onFocusTarget = (event: Event) => setFocusInPreview(isInPreview(event.target));
+    window.addEventListener('pointerdown', onFocusTarget, true);
+    window.addEventListener('focusin', onFocusTarget, true);
+    return () => {
+      window.removeEventListener('pointerdown', onFocusTarget, true);
+      window.removeEventListener('focusin', onFocusTarget, true);
+    };
+  }, []);
   const [settings, setSettings] = useState<Settings>(loadSettings);
 
   // --- Split view (1x1 … 3x3) -----------------------------------------------
@@ -3394,6 +3410,7 @@ const App: React.FC = () => {
   */
   const [fileViewerHidden, setFileViewerHidden] = useState(() => restoreGet('kirolex-fileviewer-hidden') === '1');
   useEffect(() => { restoreSet('kirolex-fileviewer-hidden', fileViewerHidden ? '1' : null); }, [fileViewerHidden]);
+  const previewOwnsFind = findOwner({ previewShown: !!fileViewer && !fileViewerHidden, focusInPreview }) === 'preview';
   const [winWidth, setWinWidth] = useState(() => window.innerWidth);
   useEffect(() => {
     const onResize = () => setWinWidth(window.innerWidth);
@@ -3539,6 +3556,7 @@ const App: React.FC = () => {
     const inner = (
       <ChatArea
         paneFocused={focused}
+        findSuspended={previewOwnsFind}
         messages={paneMessages}
         // A history rebuild is a real, cancellable operation even though its turn is
         // hidden: without counting it here the composer showed no Stop button at
@@ -4048,6 +4066,20 @@ const App: React.FC = () => {
                   <IconClose size={16} />
                 </button>
               </div>
+            </div>
+            {/* 预览栏自己的搜索条（Ctrl/Cmd+F，焦点在预览栏里时）：挂在一个零高的定位层上，浮在正文右上角 */}
+            <div className="preview-find-anchor">
+              <PreviewFind
+                body={fileBodyNode}
+                owns={previewOwnsFind}
+                searchable={!!fileViewer && !fileViewerLoading && previewSearchable({
+                  deck: isDeckPath(fileViewer.path), image: !!fileViewer.image, binary: !!fileViewer.binary,
+                })}
+                tabId={activeFileTabId}
+                raw={fileViewerRaw}
+                commenting={commenting}
+                content={fileViewer?.content || ''}
+              />
             </div>
             <div
               className="workspace-file-modal-body"

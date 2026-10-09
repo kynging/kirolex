@@ -111,7 +111,8 @@ describe('搜索条属于**这一格**,不属于窗口', () => {
     const at = CHAT.indexOf('Cmd/Ctrl+F 打开**这一格**的搜索条');
     assert.ok(at > 0, '没有那段 Cmd+F 的 effect');
     const block = CHAT.slice(at, at + 1200);
-    assert.match(block, /if \(!paneFocused\) return;/);
+    // findSuspended：焦点在右侧预览栏里时 Ctrl+F 归预览栏（tests/previewFind.test.ts）
+    assert.match(block, /if \(!paneFocused \|\| findSuspended\) return;/);
     // capture 阶段：composer 的 textarea 会先吃掉冒泡阶段的 keydown
     assert.match(block, /addEventListener\('keydown', onKey, true\)/);
   });
@@ -162,7 +163,8 @@ describe('高亮不许动 DOM,也不许滚别的格子', () => {
   });
 
   test('当前那一个从「全部」里排掉,否则两层颜色叠成第三种状态', () => {
-    assert.match(HL, /activeRange \? all\.filter\(\(r\) => r !== activeRange\) : all/);
+    // 「当前那一个」按格子各存一份（聊天格 / 预览栏各有自己的），全部排掉
+    assert.match(HL, /actives\.size \? all\.filter\(\(r\) => !actives\.has\(r\)\) : all/);
   });
 
   test('内核不支持时搜索仍然可用,只是不上色', () => {

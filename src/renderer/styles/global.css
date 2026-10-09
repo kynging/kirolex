@@ -3342,6 +3342,18 @@ button, input, select, textarea {
   cursor: pointer;
 }
 .pane-find-btn:hover { background: var(--bg-hover); color: var(--text-primary); }
+/* 右侧预览栏那一条：挂在标签行下面一个零高的定位层上，浮在正文右上角，不把正文往下挤 */
+.preview-find-anchor {
+  position: relative;
+  flex: 0 0 auto;
+  height: 0;
+  z-index: 20;
+}
+.preview-find-hint {
+  font-size: 11px;
+  color: var(--text-tertiary);
+  padding: 0 4px;
+}
 
 /*
   命中的高亮。用 CSS Custom Highlight API —— 名字必须在这里写死（`::highlight()` 不接受变量）,

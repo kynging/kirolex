@@ -25,8 +25,11 @@ const ACTIVE = 'kirolex-find-active';
 
 /** 按格子存的命中区间。key 一般是会话 id。 */
 const byPane = new Map<string, Range[]>();
-/** 当前那一个属于哪一格、是第几个 —— 只有一个,因为你同时只在一格里按 ↑↓。 */
-let activeRange: Range | null = null;
+/**
+ * 每一格「当前那一个」。按格子分开存:聊天格和右侧预览栏可以同时开着搜索,在一边按 ↑↓
+ * 不能把另一边当前项的颜色抹掉。
+ */
+const activeByPane = new Map<string, Range>();
 
 /** 这个内核支持自绘高亮吗。不支持也不该让搜索整体失效,所以到处都要先问一句。 */
 export function supportsHighlight(): boolean {
@@ -41,11 +44,12 @@ function flush(): void {
   const highlights = (CSS as any).highlights as Map<string, unknown>;
   const all: Range[] = [];
   for (const ranges of byPane.values()) all.push(...ranges);
+  const actives = new Set(activeByPane.values());
   // 当前那一个从「全部」里**排掉**：两层叠在同一段字上时颜色会混,读起来像第三种状态
-  const rest = activeRange ? all.filter((r) => r !== activeRange) : all;
+  const rest = actives.size ? all.filter((r) => !actives.has(r)) : all;
   const Ctor = (globalThis as any).Highlight;
   if (rest.length) highlights.set(ALL, new Ctor(...rest)); else highlights.delete(ALL);
-  if (activeRange) highlights.set(ACTIVE, new Ctor(activeRange)); else highlights.delete(ACTIVE);
+  if (actives.size) highlights.set(ACTIVE, new Ctor(...actives)); else highlights.delete(ACTIVE);
 }
 
 /**
@@ -138,27 +142,29 @@ export function setPaneRanges(key: string, ranges: Range[]): void {
 
 /** 这一格彻底不搜了（关掉条子、格子被关掉、会话被换掉)。 */
 export function clearPane(key: string): void {
-  const mine = byPane.get(key);
-  if (mine && activeRange && mine.includes(activeRange)) activeRange = null;
+  activeByPane.delete(key);
   byPane.delete(key);
   flush();
 }
 
 /**
- * 指定「当前那一个」并滚到它上面。传 null 就是取消当前项(命中清零时)。
+ * 指定 `key` 这一格「当前那一个」并滚到它上面。传 null 就是取消当前项(命中清零时)。
  *
  * **不用 `scrollIntoView`** —— 那是仓库里明令禁止的（`tests/scrollIsolation.test.ts`）:
  * 它会把祖先一起滚,包括分屏那层共享的 `overflow:hidden` 网格,于是搜 A 格会把 B 格也拽走。
- * 分屏搜索恰恰是这条禁令存在的理由,所以这里只动**这一格自己**的 `.chat-messages`。
+ * 分屏搜索恰恰是这条禁令存在的理由,所以这里只动**这一格自己**的 `.chat-messages`
+ * （右侧预览栏不在聊天格里,由调用方用 `scrollHost` 给出它自己的滚动容器）。
  */
-export function setActive(range: Range | null): void {
-  activeRange = range;
+export function setActive(key: string, range: Range | null, scrollHost?: HTMLElement | null): void {
+  if (range) activeByPane.set(key, range); else activeByPane.delete(key);
   flush();
   if (!range) return;
   const anchor = range.startContainer.parentElement;
-  const container = anchor?.closest('.chat-messages') as HTMLElement | null;
+  const container = scrollHost || anchor?.closest('.chat-messages') as HTMLElement | null;
   if (!anchor || !container) return;
-  const box = anchor.getBoundingClientRect();
+  // 预览栏的原文模式整份文件是**一个** `<pre>` 里的一个文本节点,量父元素量到的是整份文件的中点 ——
+  // 所以那边量命中本身
+  const box = (scrollHost ? range : anchor).getBoundingClientRect();
   const view = container.getBoundingClientRect();
   // 居中而不是「刚好露出来」：搜索时你要看的是命中周围的上下文,贴边的那一行读不出来
   const offset = (box.top + box.height / 2) - (view.top + view.height / 2);

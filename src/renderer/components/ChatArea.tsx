@@ -2482,6 +2482,8 @@ interface ChatAreaProps {
   /** False for split panes that are not focused: they must not react to global
    *  triggers such as "open Agent config". */
   paneFocused?: boolean;
+  /** 焦点在右侧文件预览栏里时为 true：那时 Ctrl/Cmd+F 归预览栏自己的搜索（`previewFind.ts`），这一格不响应。 */
+  findSuspended?: boolean;
 }
 
 /** Generated suggestions keyed `${sessionId}:${lastAssistantMessageId}`.
@@ -2587,6 +2589,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onStopLoop,
   readOnly = false,
   paneFocused = true,
+  findSuspended = false,
 }) => {
   /*
     **`/model` / `/agent` 打开自己的下拉** ——「cli 里面是会有选项的」（而 ACP 不带 picker,
@@ -3426,7 +3429,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         // 换了词就回到第 1 个;没有命中就没有「当前」
         const first = ranges.length ? 1 : 0;
         setFindActive(first);
-        setActive(first ? ranges[0] : null);
+        setActive(findKey, first ? ranges[0] : null);
       });
     });
     return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
@@ -3441,10 +3444,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (!ranges.length) return;
     setFindActive((current) => {
       const next = stepIndex(current, ranges.length, direction);
-      setActive(ranges[next - 1] || null);
+      setActive(findKey, ranges[next - 1] || null);
       return next;
     });
-  }, []);
+  }, [findKey]);
 
   const closeFind = useCallback(() => {
     setFindOpen(false);
@@ -3462,7 +3465,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * 而「在输入框里按 Cmd+F」正是最常用的时刻。
    */
   useEffect(() => {
-    if (!paneFocused) return;
+    if (!paneFocused || findSuspended) return;
     const onKey = (event: KeyboardEvent) => {
       if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 'f') {
         event.preventDefault();
@@ -3478,7 +3481,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     };
     window.addEventListener('keydown', onKey, true);
     return () => window.removeEventListener('keydown', onKey, true);
-  }, [paneFocused, findOpen, closeFind]);
+  }, [paneFocused, findSuspended, findOpen, closeFind]);
 
   return (
     /* 消息里的文件链接按这条会话的目录解析（见 PathSessionContext） */

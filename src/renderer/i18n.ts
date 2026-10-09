@@ -145,6 +145,8 @@ const ZH: Record<string, string> = {
   'Previous (Shift+Enter)': '上一个 (Shift+Enter)',
   'Next (Enter)': '下一个 (Enter)',
   'Close (Esc)': '关闭 (Esc)',
+  'Find in this file…': '在这个文件中查找…',
+  'This file type does not support search': '此类文件不支持搜索',
   'No results': '无结果',
 
   // ── 工作区面板 ───────────────────────────────────────────────────────────
