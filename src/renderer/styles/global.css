@@ -8430,6 +8430,30 @@ button, input, select, textarea {
 .rv-review-md { font-size: var(--chat-font-size, 12px); line-height: 1.75; }
 .rv-review-md > :first-child { margin-top: 0; }
 .rv-review-md > :last-child { margin-bottom: 0; }
+/*
+  **标题分得出层级** —— 原来用浏览器默认样式：H4 和正文一样大、H5/H6 比正文还小。现在 H1→H6 依次变小、
+  最小一级也和正文一样大；前面再挂一个灰色「H1」…「H6」小标签。用 ::before 画，复制标题时不会带上标签字。
+*/
+.rv-review-md :is(h1, h2, h3, h4, h5, h6) { font-weight: 600; line-height: 1.4; margin: 6px 0 2px; }
+.rv-review-md h1 { font-size: 1.6em; }
+.rv-review-md h2 { font-size: 1.4em; }
+.rv-review-md h3 { font-size: 1.25em; }
+.rv-review-md h4 { font-size: 1.13em; }
+.rv-review-md h5 { font-size: 1.05em; }
+.rv-review-md h6 { font-size: 1em; color: var(--text-secondary); }
+.rv-review-md :is(h1, h2, h3, h4, h5, h6)::before {
+  display: inline-block; vertical-align: middle; position: relative; top: -.08em;
+  margin-right: 6px; padding: 1px 4px; border-radius: 3px;
+  font-size: 9px; font-weight: 500; line-height: 1.3; letter-spacing: .02em;
+  color: var(--text-secondary); background: color-mix(in srgb, var(--text-secondary) 16%, transparent);
+  user-select: none;
+}
+.rv-review-md h1::before { content: 'H1'; }
+.rv-review-md h2::before { content: 'H2'; }
+.rv-review-md h3::before { content: 'H3'; }
+.rv-review-md h4::before { content: 'H4'; }
+.rv-review-md h5::before { content: 'H5'; }
+.rv-review-md h6::before { content: 'H6'; }
 .rv-review-text {
   margin: 0; font-size: 12px; line-height: 1.7; white-space: pre-wrap; word-break: break-word;
   color: var(--text-primary);
