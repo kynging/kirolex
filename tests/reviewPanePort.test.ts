@@ -22,7 +22,7 @@ describe('标签页记住它的主人会话', () => {
   test('改写、写回、提交都用主人会话', () => {
     assert.match(APP, /sessionId=\{fileViewer\.ownerSessionId\}/);
     assert.match(APP, /handleSendMessage\(prompt, undefined, fileViewer\.ownerSessionId\)/);
-    assert.match(RV, /window\.kiroApi\.reviewWriteFile\?\.\(sessionId, path, fullText\)/);
+    assert.match(RV, /window\.kiroApi\.reviewWriteFile\?\.\(sessionId, path, fullText, opts\.expectBase\)/);
     assert.match(RV, /window\.kiroApi\.reviewBackupFile\?\.\(sessionId, path\)/);
   });
 

@@ -9579,8 +9579,9 @@ app.whenReady().then(async () => {
       return { ok: false, error: String(error?.message || error) };
     }
   };
-  ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string) =>
-    writeReviewFile(sessionId, filePath, text));
+  /* `expectBase`（可选）：盘上此刻不是这一份就不写 —— 侧栏撤销「AI 刚改过」那一处用它，不会盖掉预览还没刷出来的改动 */
+  ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string, expectBase?: unknown) =>
+    writeReviewFile(sessionId, filePath, text, typeof expectBase === 'string' ? expectBase : undefined));
 
   /**
    * 哪些 ticket 已经在主进程这边**写完盘**了 —— 窗口 reload 回来时，"上次没做完"的那些里有些其实做完了

@@ -285,8 +285,8 @@ declare global {
        * 把改完的正文写回那个文件 —— 路径按 `sessionId` 解析（和 workspaceRead 同一个 resolveUserPath），
        * 只许写**这条会话的标签页读过**的，写前备份到 `~/.kirolex/backups/review-files/`。
        */
-      reviewWriteFile?: (sessionId: string | null | undefined, filePath: string, text: string)
-        => Promise<{ ok: boolean; path?: string; bytes?: number; was?: number; unchanged?: boolean; error?: string }>;
+      reviewWriteFile?: (sessionId: string | null | undefined, filePath: string, text: string, expectBase?: string)
+        => Promise<{ ok: boolean; path?: string; bytes?: number; was?: number; unchanged?: boolean; mismatch?: boolean; error?: string }>;
       /** 提交前拷一份 —— 提交那条路是会话自己写文件，走不到上面那道写前备份。 */
       reviewBackupFile?: (sessionId: string | null | undefined, filePath: string)
         => Promise<{ ok: boolean; at?: string; bytes?: number; error?: string }>;

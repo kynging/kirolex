@@ -419,8 +419,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   reviseInSession: (input: { sessionId: string; where: string; note: string; about?: string; scope?: 'block' | 'patch' | 'insert'; label?: string; full?: string; fromLine?: number; toLine?: number; ticket?: string; apply?: { path: string; mode: 'splice' | 'insert' | 'patch'; from?: number; to?: number; base: string } }) =>
     ipcRenderer.invoke('review:revise-in-session', input),
   /** 把改完的正文写回这份文件 —— 路径按这条会话解析，只许写这条会话的标签页读过的，写前备份。 */
-  reviewWriteFile: (sessionId: string | null | undefined, filePath: string, text: string) =>
-    ipcRenderer.invoke('review:write-file', sessionId, filePath, text),
+  reviewWriteFile: (sessionId: string | null | undefined, filePath: string, text: string, expectBase?: string) =>
+    ipcRenderer.invoke('review:write-file', sessionId, filePath, text, expectBase),
   /** 只拷一份（「提交给这份文件的会话」那条路：会话自己改文件，走不到上面那道写前备份）。 */
   reviewBackupFile: (sessionId: string | null | undefined, filePath: string) =>
     ipcRenderer.invoke('review:backup-file', sessionId, filePath),

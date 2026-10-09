@@ -8725,3 +8725,15 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 /* 改过还没提交：那道强调色竖线画在正文**外面**（不占内边距），字和没改时在同一个位置 */
 .rv-review .rv-edited { box-shadow: -6px 0 0 -4px var(--accent); }
 .rv-edited-tag { font-size: 10px; color: var(--accent); margin-right: 4px; }
+
+/*
+  「AI 刚改过」的那几段：一层淡淡的强调色底，左边一道细线 —— 一眼看得出是哪几段，但不盖过正文。
+  hover 时仍然用 hover 那层底（后面那条规则只在不 hover 时生效），免得两层叠在一起发脏。
+*/
+.rv-review-block.ai-changed:not(:hover) {
+  background: color-mix(in srgb, var(--accent) 9%, transparent);
+  border-radius: 4px;
+}
+.rv-review-block.ai-changed:not(.targeted) { box-shadow: inset 2px 0 0 color-mix(in srgb, var(--accent) 55%, transparent); }
+.rv-ai-tag { font-size: 10px; color: var(--accent); margin-right: 4px; cursor: help; }
+.rv-ai-undo { font-size: 10px; }

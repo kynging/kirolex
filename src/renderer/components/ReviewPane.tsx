@@ -1,8 +1,10 @@
-import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { CommentBox, CommentOpener } from './CommentBox';
 import { PdfView } from './PdfView';
 import { pageBlocks, lineBlocks, dropSpan, displayGroups, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
 import { rewritePatch } from '../rewritePatch';
+import { diffChanges, trustedChanges, remapChanges, planUndo, markLayout, UNDO_REFUSED, type AiMark, type AiMarkState } from '../aiChanges';
+import { getAiMarks, updateAiMarks, subscribeAiMarks, aiRoundOf, beginAiRound, recordAiWrite } from '../aiMarkStore';
 import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
 import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, type ReviewQueueItem } from '../reviewQueue';
@@ -55,6 +57,9 @@ type PaneApi = {
   clearDraft: (key: string) => void;
 };
 const paneApis = new Map<string, PaneApi>();
+/** 「AI 刚改过」的编号 —— 撤销按它认那一处。标记本身按文件存在 `aiMarkStore`（pane 卸掉也还在）。 */
+let aiMarkSeq = 0;
+const NO_AI_MARKS: AiMarkState = { base: '', marks: [] };
 /** 被取消的那些（按 ticket）—— 和队列本身一样跟着文件走，不跟着 pane。 */
 const cancelledTickets = new Set<string>();
 
@@ -288,6 +293,19 @@ export const ReviewPane: React.FC<{
   const clearDraft = (key: string) => setDraftLive((cur) => { const n = { ...cur }; delete n[key]; return n; });
   /** 标了删的那些 —— 键是你点 ✕ 的那个锚点（标题就带整节，见 `spans`）/ 页号。 */
   const [dropped, setDropped] = useState<Record<number, true>>(initialMarks.dropped);
+  /**
+   * **AI 刚改过的那几处** —— 底色 +「AI 刚改过」+ 撤销。留到下一次提交（`submitAll` 清掉），撤销了的那处随之摘掉。
+   * 行号是此刻文件里的：之后每次落盘都按 `remapChanges` 跟着挪（见 `writeBack`）。
+   * **按文件存**（`aiMarkStore`），不是这个 pane 的 state —— 切文件、退出批注、切原文视图都会卸掉 pane，标记不能跟着没了。
+   */
+  const subscribeAi = useCallback((cb: () => void) => subscribeAiMarks(path, cb), [path]);
+  const aiState = useSyncExternalStore(subscribeAi, () => getAiMarks(path) ?? NO_AI_MARKS, () => getAiMarks(path) ?? NO_AI_MARKS);
+  const aiMarks = aiState.marks;
+  /* 文件在 KiroLex 外面被改了（或者 pane 挂回来时正文已经变了）：标记跟着挪，被改到的那几处**留着**（撤销时说清楚，见 `remapChanges.keepTouched`） */
+  useEffect(() => {
+    if (isDeck) return;
+    updateAiMarks(path, (cur) => (!cur || cur.base === text ? cur : { base: text, marks: remapChanges(cur.marks, cur.base, text, true) }));
+  }, [text, isDeck, path]);
   /** 最下面那个「整篇的意见」框 —— 不挂在任何一段上。 */
   const [wholeDraft, setWholeDraft] = useState(initialMarks.whole);
   /**
@@ -380,6 +398,8 @@ export const ReviewPane: React.FC<{
    * 一个代码块被撕成 N 个，而 ``` 那两行渲染出来是空的 `<pre>` —— 那就是「黑色空行」。
    */
   const groups = useMemo(() => (isDeck ? [] : displayGroups(blocks)), [isDeck, blocks]);
+  /** 「AI 刚改过」挂在哪几块上、标记行摆在哪 —— 见 `markLayout`。 */
+  const aiLayout = useMemo(() => markLayout(aiMarks, groups), [aiMarks, groups]);
   /**
    * **行号竖着居中在这一块排出来的第一行上** ——「行号现在在字号很大的时候看起来很奇怪，应该让他在排版的第一行的居中位置」。
    *
@@ -592,10 +612,21 @@ export const ReviewPane: React.FC<{
   /**
    * `alreadyWritten`：主进程已经拼好、写好了（`apply` 那条路，窗口不在也不丢）—— 这里只跟着刷新界面，
    * 不再写一遍，会话里那句"落盘完成"也由主进程说过了。
+   * `ai`：这次是 AI 改的 —— 改了的那几处挂上「AI 刚改过」（`changes` 是主进程回的那份，对不上就自己比）。
+   * `round` 是这条任务入队时的提交轮次：已经不是当前这一轮（之后又提交过）就照常写回、不挂标记（见 `recordAiWrite`）。
+   * `undid`：这次是撤销那一处 —— 它的标记摘掉。
+   * `expectBase`：盘上此刻必须正好是这一份才写（主进程读、比、写一气呵成）—— 撤销用它，不会盖掉预览还没刷出来的改动。
    */
-  const writeBack = async (base: string, fullText: string, key: string, what: string, alreadyWritten = false): Promise<boolean> => {
+  const writeBack = async (
+    base: string, fullText: string, key: string, what: string, alreadyWritten = false,
+    opts: { ai?: { changes?: unknown; round: number }; undid?: number; expectBase?: string } = {},
+  ): Promise<boolean> => {
     if (!alreadyWritten) {
-      const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText);
+      const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText, opts.expectBase);
+      if (!wrote?.ok && wrote?.mismatch && opts.undid !== undefined) {
+        noteAiMark(opts.undid, UNDO_REFUSED);
+        return false;
+      }
       if (!wrote?.ok) {
         livePane().setApplyNote((cur) => ({ ...cur, [key]: `写不进这个文件：${wrote?.error || '未知原因'}` }));
         return false;
@@ -616,6 +647,10 @@ export const ReviewPane: React.FC<{
       return out;
     });
     remapReviewLines(path, patch.keep);
+    const fresh: AiMark[] = opts.ai
+      ? (trustedChanges(opts.ai.changes, base, fullText) ?? diffChanges(base, fullText)).map((c) => ({ ...c, id: ++aiMarkSeq }))
+      : [];
+    recordAiWrite(path, { base, fullText, fresh, round: opts.ai?.round, undid: opts.undid });
     /*
       在会话里报一句 ——「不然不知道修改成功了没有」。报的是**已经发生的事实**（写进了哪个文件、
       做了什么），而不是让模型说一句它看不见的"已修改"。这句标成 KiroLex 自己说的话，不发给模型。
@@ -708,6 +743,36 @@ export const ReviewPane: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draftLive, dropped, wholeDraft, markOrder, path, jobs]);
 
+  /**
+   * **撤销 AI 改的那一处** —— 只把这一段换回原文，别的行逐字照抄；写盘走 `writeBack`（写前备份、内容不变不写）。
+   * 和排着的改动走同一条链（`serialize`），读到的是前面那些写完之后的正文。这一段之后又被改过就不写，说一句。
+   */
+  function noteAiMark(id: number, why: string) {
+    updateAiMarks(path, (cur) => cur && { ...cur, marks: cur.marks.map((x) => (x.id === id ? { ...x, note: why } : x)) });
+  }
+  /*
+    **以盘上此刻那一份为准**，不信预览缓存（`currentText`）：文件可能刚在外面被改过、预览还没刷。读盘 → 把标记挪到那一份上
+    再核对（`planUndo`）→ 写的时候带上 `expectBase`，读完到写之间又变了主进程就不写。哪一步对不上都只说一句，什么都不动。
+  */
+  const undoAi = (id: number) => serialize(async () => {
+    const state = getAiMarks(path);
+    if (!state) return false;
+    let disk: string;
+    try {
+      const r: any = await window.kiroApi.workspaceRead(sessionId, path);
+      if (!r || r.binary || r.truncated || typeof r.content !== 'string') { noteAiMark(id, '读不到盘上这份文件 —— 没撤销'); return false; }
+      disk = r.content;
+    } catch (err: any) {
+      noteAiMark(id, `读不到盘上这份文件（${err?.message || err}）—— 没撤销`);
+      return false;
+    }
+    const plan = planUndo(state, id, disk);
+    if (!plan.ok) { noteAiMark(id, plan.why); return false; }
+    const m = plan.mark;
+    const where = m.to >= m.from ? whereOf(m.from, m.to) : `第 ${m.from} ${unit}前`;
+    return writeBack(disk, plan.text, `ai:${id}`, `已撤销 ${fileName} ${where}的 AI 改动，恢复原文`, false, { undid: id, expectBase: disk });
+  });
+
   /** 排进这份文件的队列 —— 提交那一刻全部排上，轮到了才真的开跑。 */
   /**
    * 排进队列。每一条带一张 **ticket**（主进程按它认这一次改写 —— 取消只取消它，不碰你正在跑的那一轮对话），
@@ -763,6 +828,8 @@ export const ReviewPane: React.FC<{
   const queueText = (anchor: number, instruction: string, mode: 'revise' | 'insert') => {
     const anchorText = anchorTextOf(anchor);
     if (anchorText === undefined) return;
+    /* 入队这一刻是第几轮提交 —— 写完时已经不是这一轮了就不挂「AI 刚改过」 */
+    const round = aiRoundOf(path);
     const key = mode === 'insert' ? `+${anchor}` : String(anchor);
     livePane().clearDraft(key);
     livePane().setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; });
@@ -798,9 +865,9 @@ export const ReviewPane: React.FC<{
         if (res.scope !== 'insert') {
           return fail('主进程还是旧版本，不认「加一段」—— 重启 KiroLex 之后再试（这次什么都没写）');
         }
-        if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true);
+        if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
         const fullText = insertAfterLines(base, to, String(res.text));
-        return writeBack(base, fullText, failKey, `已在${label}后面加了一段`);
+        return writeBack(base, fullText, failKey, `已在${label}后面加了一段`, false, { ai: { round } });
       }
       let res: any = await window.kiroApi.reviseInSession?.({
         sessionId: sessionId!, where, note: instruction, about: path, label, scope: 'block', ticket,
@@ -825,15 +892,15 @@ export const ReviewPane: React.FC<{
         const out = patchReplyOutcome(res);
         if (out.kind === 'cancelled') return false;
         if (out.kind === 'fail') return fail(out.why);
-        return writeBack(base, out.fullText, failKey, '', true);
+        return writeBack(base, out.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
       }
       if (!res?.ok || typeof res.text !== 'string') {
         return fail(res?.cannot ? `改不了：${res.cannot} —— 换个说法再试` : `改写失败：${res?.error || '没有返回'}`);
       }
-      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true);
+      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
       /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
       const fullText = spliceLines(base, from, to, String(res.text));
-      return writeBack(base, fullText, failKey, `已按意见改了${label}`);
+      return writeBack(base, fullText, failKey, `已按意见改了${label}`, false, { ai: { round } });
     }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
   };
 
@@ -880,6 +947,7 @@ export const ReviewPane: React.FC<{
    * 排在最后：先让逐段的那些落定。
    */
   const queueWhole = (note: string) => {
+    const round = aiRoundOf(path);
     livePane().setApplyNote((cur) => { const n = { ...cur }; delete n.whole; return n; });
     enqueue('whole', 0, async (ticket) => {
       const base = currentText();
@@ -896,7 +964,7 @@ export const ReviewPane: React.FC<{
         livePane().setApplyNote((cur) => ({ ...cur, whole: out.why }));
         return false;
       }
-      return writeBack(base, out.fullText, 'whole', '', true);
+      return writeBack(base, out.fullText, 'whole', '', true, { ai: { changes: res.changes, round } });
     }, () => livePane().setWholeDraft((cur) => cur || note), { key: 'whole', text: note });
   };
 
@@ -971,6 +1039,8 @@ export const ReviewPane: React.FC<{
     if (!sessionId || markCount === 0) return false;
     closeBoxes();
     if (!isDeck) {
+      /* 上一轮的「AI 刚改过」到此为止 —— 这一轮改完再标新的 */
+      beginAiRound(path);
       for (const [line, t] of marks.insert) queueText(line, t, 'insert');
       for (const [line, t] of marks.edit) queueEdit(line, t);
       for (const [line, t] of marks.revise) queueText(line, t, 'revise');
@@ -1508,7 +1578,8 @@ export const ReviewPane: React.FC<{
                 + `${on && targeted ? ' section-preview targeted' : ''}`
                 + `${on && previewing && (ownsSection || owner !== undefined) ? ' section-preview' : ''}`
                 + `${ownsSection ? ' section-head' : ''}`
-                + `${locked ? ' locked' : ''}`}
+                + `${locked ? ' locked' : ''}`
+                + `${aiLayout.lit.has(g.anchor) ? ' ai-changed' : ''}`}
             >
               {/*
                 **comment 模式左边显示行号** ——「我希望 md 的 comment 模式左侧能显示行号」（早先「不要显示什么段落号」
@@ -1556,6 +1627,28 @@ export const ReviewPane: React.FC<{
                 </div>
               )}
               {on && applyNote[`drop:${g.anchor}`] && <div className="rt-note-applied">{applyNote[`drop:${g.anchor}`]}</div>}
+              {/* AI 刚改过的那一处（每处一行）：标签 + 撤销 —— 只把这一段换回原文。留到下一次提交 */}
+              {(aiLayout.rowAt.get(g.anchor) || []).map((i) => {
+                const m = aiMarks[i];
+                if (!m) return null;
+                const removed = m.to < m.from;
+                return (
+                  <div key={`ai:${m.id}`} className="rt-brief-row rv-ai-row">
+                    <span className="rt-hist-one">
+                      <span className="rv-ai-tag" title={m.original ? `原来是：
+${m.original}` : '原来这里没有这段'}>
+                        {removed ? 'AI 刚删掉了一段' : 'AI 刚改过'}
+                      </span>
+                      {sessionId && !locked && (
+                        <button type="button" className="rt-hist-btn rv-ai-undo nopan nodrag"
+                          title="只把这一段恢复成改之前的原文（写前会备份）"
+                          onClick={() => { void undoAi(m.id); }}>撤销</button>
+                      )}
+                    </span>
+                    {(m.note || applyNote[`ai:${m.id}`]) && <div className="rt-note-applied">{m.note || applyNote[`ai:${m.id}`]}</div>}
+                  </div>
+                );
+              })}
               {/* 提交那一行在**最新标的那一段**下面（见 `latestMark`） */}
               {on && !locked && submitHereText(g.anchor) && submitRow}
               {/* 排着的改动挂在那一节末尾 —— 见 `statusAt` */}

@@ -315,8 +315,9 @@ describe('主进程 / 界面接线', () => {
   });
   test('界面的两处 patch 都经 patchReplyOutcome，成功只刷新（alreadyWritten），不自己写', () => {
     assert.equal((RV.match(/const out = patchReplyOutcome\(res\);/g) || []).length, 2);
-    assert.match(RV, /return writeBack\(base, out\.fullText, failKey, '', true\);/);
-    assert.match(RV, /return writeBack\(base, out\.fullText, 'whole', '', true\);/);
+    /* 末尾带上「AI 刚改过」要的改动列表和轮次（见 `aiChanges.ts`）—— 照样是 alreadyWritten，不自己写 */
+    assert.match(RV, /return writeBack\(base, out\.fullText, failKey, '', true, \{ ai: \{ changes: res\.changes, round \} \}\);/);
+    assert.match(RV, /return writeBack\(base, out\.fullText, 'whole', '', true, \{ ai: \{ changes: res\.changes, round \} \}\);/);
     assert.doesNotMatch(RV, /gotPatch/);
   });
   test('主进程不再认 whole 那一档', () => {

@@ -118,7 +118,7 @@ describe('主进程接线', () => {
     /* 写盘那段抽成了 `writeReviewFile`（review:write-file 和改写那条路的 `apply` 共用） */
     const at = MAIN.indexOf('const writeReviewFile = (');
     const body = MAIN.slice(at, at + 2200);
-    assert.ok(MAIN.includes("ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string) =>\n    writeReviewFile(sessionId, filePath, text));"));
+    assert.ok(MAIN.includes("ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string, expectBase?: unknown) =>\n    writeReviewFile(sessionId, filePath, text, typeof expectBase === 'string' ? expectBase : undefined));"));
     assert.match(body, /if \(!saveReviewBackup\(want, previous\)\) \{\s*\n\s*return \{ ok: false/);
     assert.match(body, /WORKSPACE_PREVIEW_MAX_BYTES/);
     assert.ok(body.indexOf('saveReviewBackup(want, previous)') < body.indexOf('fs.writeFileSync(want, text'));

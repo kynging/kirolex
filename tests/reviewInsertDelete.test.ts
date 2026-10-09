@@ -95,7 +95,7 @@ describe('改写的回复由主进程拼回去、写盘（窗口 reload 了也�
     assert.ok(M.includes("ipcMain.handle('review:tickets-done'"));
     const RV = fs.readFileSync('src/renderer/components/ReviewPane.tsx', 'utf8');
     assert.ok(RV.includes("apply: { path, mode: 'splice', from, to, base },"));
-    assert.ok(RV.includes("if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true);"));
+    assert.ok(RV.includes("if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });"));
     assert.ok(RV.includes('void window.kiroApi.reviewTicketsDone?.(tickets).then((done) => {'));
   });
 });
