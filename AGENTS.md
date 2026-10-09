@@ -362,7 +362,9 @@ docs/            设计文档（§1）
 - **rename 偶发 `EPERM` / `EBUSY`**：杀毒软件或索引器占着目标文件。不是代码 bug，但"配置偶尔存不上"时先想到它。
 - **换行**：仓库文本一律 LF（`.gitattributes`）。读文本时要容忍 `\r\n`（`skillDoc.ts`、`localMcp.ts` 的分帧都是这样做的）；新写的解析逻辑也要容忍。
 - `fs.watch` 在 Windows 上会丢"刚启动就创建的文件"事件 → `DEV_QUIT_REQUEST` 用的是轮询。
-- 代理自己在 Windows 上跑命令时：本环境的 shell 是 Git Bash，用 `/` 路径和 POSIX 语法；`npm test` 的 glob 带了引号，交给 Node 自己展开。
+- 代理自己在 Windows 上跑命令时：先确认当前用的是哪种 shell（不同代理 / 环境不一样，不要假定）——
+  PowerShell 用 PowerShell 语法（`$env:VAR`、`;` 分隔命令等），Git Bash 用 `/` 路径和 POSIX 语法；
+  `npm test` 的 glob 带了引号，交给 Node 自己展开，两种 shell 下都一样。
 
 ### 5.2 测试里不要依赖固定等待时间
 
