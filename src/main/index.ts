@@ -8594,6 +8594,20 @@ app.whenReady().then(async () => {
     }
   });
 
+  // 预览侧栏的「📂 打开位置」：在资源管理器 / Finder 里打开文件所在文件夹并选中它。
+  // 和 app:open-external 走同一个 resolveUserPath，相对路径 / ~ 开头的也指向真文件。
+  ipcMain.handle('app:show-in-folder', (_event, target: string, sessionId?: string) => {
+    if (!target) return { ok: false, error: 'No path.' };
+    try {
+      const p = resolveUserPath(target, sessionId);
+      if (!fs.existsSync(p)) return { ok: false, error: 'File not found.' };
+      shell.showItemInFolder(p);
+      return { ok: true };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || String(error) };
+    }
+  });
+
   // Read an image straight off disk as a data URL, with NO session involved.
   //
   // Attachment thumbnails used to go through `workspace:read`, which starts with

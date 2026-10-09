@@ -32,10 +32,46 @@ describe('标签页记住它的主人会话', () => {
   });
 });
 
+describe('预览侧栏顶部排版', () => {
+  test('没有文件名标题；标签行置顶，一个文件也显示', () => {
+    const panel = APP.slice(APP.indexOf('className="workspace-file-panel"'), APP.indexOf('className="workspace-file-modal-body"'));
+    assert.ok(panel.length > 0);
+    assert.ok(!panel.includes('<h3'), '侧栏顶上不该再有 h3 标题');
+    assert.ok(!panel.includes('fileTabs.length > 1'), '只开一个文件也要显示标签');
+    assert.match(panel, /className="file-panel-top"/);
+  });
+
+  test('右侧依次是 ⟳ 刷新、📂 打开位置、✕；没有 Download', () => {
+    const panel = APP.slice(APP.indexOf('className="workspace-file-panel"'), APP.indexOf('className="workspace-file-modal-body"'));
+    const a = panel.indexOf('⟳ 刷新'), b = panel.indexOf('📂 打开位置'), c = panel.indexOf('settings-close');
+    assert.ok(a > 0 && a < b && b < c, '顺序：刷新 → 打开位置 → 关闭');
+    assert.ok(!panel.includes('Download'));
+    assert.ok(panel.includes(`isMac ? '在 Finder 中显示' : '在资源管理器中显示'`));
+    assert.ok(panel.includes('disabled={!!fileViewer.gone}'));
+  });
+
+  test('打开位置走主进程 shell.showItemInFolder', () => {
+    const MAIN = read('src/main/index.ts');
+    const PRE = read('src/main/preload.ts');
+    assert.ok(PRE.includes(`ipcRenderer.invoke('app:show-in-folder', filePath, sessionId)`));
+    const h = MAIN.indexOf(`ipcMain.handle('app:show-in-folder'`);
+    assert.ok(h > 0 && MAIN.slice(h, h + 500).includes('shell.showItemInFolder(p)'));
+  });
+
+  test('原文切换和 comment 同一行，排在 comment 后面', () => {
+    const bar = APP.slice(APP.indexOf('<div className="rv-toggle-bar">'));
+    const c = bar.indexOf('💬 comment'), r = bar.indexOf("t('◎ Raw')"), end = bar.indexOf('</div>');
+    assert.ok(c > 0 && c < r && r < end);
+    assert.ok(APP.includes('if (!canComment && !canRaw) return null;'));
+    /* 标签区可缩、自己滚动，右侧按钮不被挤掉 */
+    assert.match(CSS, /\.file-panel-top \.file-tabs \{\s*flex: 1 1 auto;\s*min-width: 0;/);
+  });
+});
+
 describe('入口', () => {
   test('只对 md / txt 给 comment 开关，截断的预览不给', () => {
     assert.match(APP, /function isReviewableText\(p: string\): boolean/);
-    assert.match(APP, /isReviewableText\(fileViewer\.path\) && !fileViewerRaw && !fileViewer\.truncated && \(/);
+    assert.match(APP, /const canComment = isReviewableText\(fileViewer\.path\) && !fileViewerRaw && !fileViewer\.truncated;/);
     assert.match(APP, /\{commenting \? '✓ comment' : '💬 comment'\}/);
   });
 

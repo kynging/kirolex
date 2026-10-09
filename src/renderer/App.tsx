@@ -323,6 +323,7 @@ declare global {
       /** Session-independent image read for attachment thumbnails; null when the
        *  path is missing, unreadable, oversized, or not an image. */
       readImageDataUrl?: (filePath: string) => Promise<{ path: string; dataUrl: string } | null>;
+      showItemInFolder?: (filePath: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>;
       workspaceDownload: (sessionId: string | null | undefined, filePath: string) => Promise<{
         ok: boolean;
         path?: string;
@@ -2040,7 +2041,7 @@ const App: React.FC = () => {
       const res = await window.kiroApi.openExternal?.(p, sessionForPath || undefined);
       if (res?.ok !== false) return;
       // Fall through to the in-app tab so the failure is visible (and the tab
-      // still offers Download).
+      // still offers 📂 打开位置).
     }
 
     const id = `ft_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
@@ -3863,64 +3864,24 @@ const App: React.FC = () => {
         {(fileViewerLoading || fileViewer) && !fileViewerHidden && (
           <div className="workspace-file-panel" role="complementary" aria-label="File preview" style={{ width: fileViewerShown }}>
             <div className="file-resize-handle" onMouseDown={handleFileResizeStart} title={t('Drag to resize width')} />
-            <div className="settings-header">
-              <h3 title={fileViewer?.path} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
-                <span style={{ overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {fileViewer ? (baseName(fileViewer.path) || fileViewer.path) : 'Loading…'}
-                </span>
-                {/* Say it rather than showing a stale copy as if it were current. */}
-                {fileViewer?.gone && (
-                  <span className="stat-del" title={t('This file is no longer on disk (deleted or renamed). What is shown below is the last content read.')}>
-                    已删除
-                  </span>
-                )}
-              </h3>
-              <div className="workspace-file-actions">
-                {fileViewer && !fileViewer.image && !fileViewer.binary && (isMarkdownPath(fileViewer.path) || !!viewerLangFor(fileViewer.path)) && (
-                  <button
-                    className="text-btn"
-                    title={fileViewerRaw ? t('Show the rendered view (Markdown / syntax highlighting / formatted JSON)') : t('Show the raw file')}
-                    onClick={() => setActiveTabRaw(!fileViewerRaw)}
-                  >
-                    {fileViewerRaw ? t('◉ Rendered') : t('◎ Raw')}
-                  </button>
-                )}
-                {/* Manual refresh as well as the watcher: fs.watch does not fire for
-                    every writer on every filesystem (network mounts, some containers),
-                    and a button costs nothing when it does not. */}
-                {fileViewer && !fileViewer.gone && (
-                  <button
-                    className="text-btn"
-                    title={t('Re-read this file from disk (keeps scroll position and current view)')}
-                    onClick={() => void refreshFileTab(fileViewer.id, fileViewer.path)}
-                  >
-                    ⟳ 刷新
-                  </button>
-                )}
-                {/* Download no longer requires a connected chat -- it is a local
-                    file copy through a save dialog. */}
-                {fileViewer && (
-                  <button
-                    className="text-btn"
-                    onClick={() => void window.kiroApi.workspaceDownload?.(currentSessionId, fileViewer.path)}
-                  >
-                    ⬇ Download
-                  </button>
-                )}
-                <button className="settings-close" onClick={() => { setFileTabs([]); setActiveFileTabId(null); setFileViewerLoading(false); }} title={t('Close panel')}>
-                  <IconClose size={16} />
-                </button>
-              </div>
-            </div>
-            {fileTabs.length > 1 && (
+            {/*
+              顶上一行：左边标签页（多了横向滚动），右边固定三个按钮 ⟳ 刷新 / 📂 打开位置 / ✕。
+              没有文件名标题了 —— 只开一个文件也显示标签，靠它看出当前是哪份；已删除的标签带 ⚠。
+            */}
+            <div className="file-panel-top">
               <div className="file-tabs" role="tablist" aria-label="Open files">
+                {fileTabs.length === 0 && fileViewerLoading && (
+                  <div className="file-tab active"><span className="file-tab-name">Loading…</span></div>
+                )}
                 {fileTabs.map((tab) => (
                   <div
                     key={tab.id}
                     role="tab"
                     aria-selected={tab.id === activeFileTabId}
-                    className={`file-tab ${tab.id === activeFileTabId ? 'active' : ''}`}
-                    title={tab.path}
+                    className={`file-tab ${tab.id === activeFileTabId ? 'active' : ''}${tab.gone ? ' gone' : ''}`}
+                    title={tab.gone
+                      ? `${tab.path}\n${t('This file is no longer on disk (deleted or renamed). What is shown below is the last content read.')}`
+                      : tab.path}
                     onClick={() => setActiveFileTabId(tab.id)}
                     onAuxClick={(e) => { if (e.button === 1) { e.preventDefault(); closeFileTab(tab.id); } }}
                   >
@@ -3938,7 +3899,36 @@ const App: React.FC = () => {
                   </div>
                 ))}
               </div>
-            )}
+              <div className="workspace-file-actions">
+                {/* Manual refresh as well as the watcher: fs.watch does not fire for
+                    every writer on every filesystem (network mounts, some containers),
+                    and a button costs nothing when it does not. */}
+                {fileViewer && !fileViewer.gone && (
+                  <button
+                    className="text-btn"
+                    title={t('Re-read this file from disk (keeps scroll position and current view)')}
+                    onClick={() => void refreshFileTab(fileViewer.id, fileViewer.path)}
+                  >
+                    ⟳ 刷新
+                  </button>
+                )}
+                {fileViewer && (
+                  <button
+                    className="text-btn"
+                    disabled={!!fileViewer.gone}
+                    title={fileViewer.gone
+                      ? t('This file is no longer on disk (deleted or renamed). What is shown below is the last content read.')
+                      : isMac ? '在 Finder 中显示' : '在资源管理器中显示'}
+                    onClick={() => void window.kiroApi.showItemInFolder?.(fileViewer.path, fileViewer.ownerSessionId)}
+                  >
+                    📂 打开位置
+                  </button>
+                )}
+                <button className="settings-close" onClick={() => { setFileTabs([]); setActiveFileTabId(null); setFileViewerLoading(false); }} title={t('Close panel')}>
+                  <IconClose size={16} />
+                </button>
+              </div>
+            </div>
             <div
               className="workspace-file-modal-body"
               ref={fileBodyRef}
@@ -3950,6 +3940,38 @@ const App: React.FC = () => {
               {fileViewerLoading && <div className="workspace-hint">Loading file…</div>}
               {!fileViewerLoading && fileViewer && (
                 <>
+                  {!isDeckPath(fileViewer.path) && !fileViewer.image && !fileViewer.binary && (() => {
+                    /* 💬 comment 和 ◎ 原文 同一行（钉在预览栏顶上，见 `.rv-toggle-bar`）—— 它占的那一行不让正文从旁边透出来。
+                       代码 / JSON 能切原文但不能批注：这行只剩原文按钮；两个都不适用就不出这一行。
+                       切到原文时批注按钮收起，原文按钮还在，好切回去。 */
+                    const canComment = isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated;
+                    const canRaw = isMarkdownPath(fileViewer.path) || !!viewerLangFor(fileViewer.path);
+                    if (!canComment && !canRaw) return null;
+                    return (
+                      <div className="rv-toggle-bar">
+                        {canComment && (
+                          <button
+                            type="button"
+                            className={`rv-review-toggle${commenting ? ' on' : ''}`}
+                            title={commenting
+                              ? '退出批注，安静读'
+                              : fileViewer.ownerSessionId
+                                ? '逐段写意见：💬「✓ 确认」当场让打开这份文件的会话改那一块并写回；＋ 在那一段后面加新内容；✕ 直接删掉'
+                                : '逐行写意见 —— 这个标签页没有归属会话，只能看不能发（从会话里点开文件链接才有）'}
+                            onClick={toggleCommenting}
+                          >{commenting ? '✓ comment' : '💬 comment'}</button>
+                        )}
+                        {canRaw && (
+                          <button
+                            type="button"
+                            className={`rv-review-toggle${fileViewerRaw ? ' on' : ''}`}
+                            title={fileViewerRaw ? t('Show the rendered view (Markdown / syntax highlighting / formatted JSON)') : t('Show the raw file')}
+                            onClick={() => setActiveTabRaw(!fileViewerRaw)}
+                          >{fileViewerRaw ? t('◉ Rendered') : t('◎ Raw')}</button>
+                        )}
+                      </div>
+                    );
+                  })()}
                   <div className="workspace-viewer-path" title={fileViewer.path}>{fileViewer.path}</div>
                   {/*
                     **PDF / deck 走逐页预览** —— 排在 binary 那一支**前面**：.pptx 会被 workspaceRead 判成
@@ -3976,32 +3998,17 @@ const App: React.FC = () => {
                     </div>
                   ) : fileViewer.binary ? (
                     <div className="workspace-binary-hint">
-                      <span>{fileViewer.content || 'This file type cannot be previewed. Download it to open it locally.'}</span>
+                      <span>{fileViewer.content || 'This file type cannot be previewed. Use 「📂 打开位置」 to open it locally.'}</span>
                     </div>
                   ) : (
                     <>
                       {fileViewer.truncated && (
-                        <div className="workspace-hint">⚠️ Preview truncated at 512 KB. Download for the complete file.</div>
+                        <div className="workspace-hint">⚠️ Preview truncated at 512 KB. Use 「📂 打开位置」 to open the complete file.</div>
                       )}
                       {/*
                         **逐行批注** —— 一个开关按钮，开着才有 💬 / ✕（默认纯读）。
                         截断的预览不给：拼回整份写盘会把后面那截删掉（主进程那侧也挡着）。
                       */}
-                      {isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated && (
-                        /* 钉在预览栏顶上的那一整条（见 `.rv-toggle-bar`）—— 它占的那一行不让正文从旁边透出来 */
-                        <div className="rv-toggle-bar">
-                        <button
-                          type="button"
-                          className={`rv-review-toggle${commenting ? ' on' : ''}`}
-                          title={commenting
-                            ? '退出批注，安静读'
-                            : fileViewer.ownerSessionId
-                              ? '逐段写意见：💬「✓ 确认」当场让打开这份文件的会话改那一块并写回；＋ 在那一段后面加新内容；✕ 直接删掉'
-                              : '逐行写意见 —— 这个标签页没有归属会话，只能看不能发（从会话里点开文件链接才有）'}
-                          onClick={toggleCommenting}
-                        >{commenting ? '✓ comment' : '💬 comment'}</button>
-                        </div>
-                      )}
                       {isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated && commenting ? (
                         <ReviewPane
                           /* key 带路径：换标签页时意见、草稿都是那一份文件自己的，不串 */

@@ -410,6 +410,9 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('app:image-data-url', filePath),
   pathExists: (filePath: string, sessionId?: string) =>
     ipcRenderer.invoke('app:path-exists', filePath, sessionId),
+  /** 在资源管理器 / Finder 里打开文件所在文件夹并选中该文件 */
+  showItemInFolder: (filePath: string, sessionId?: string) =>
+    ipcRenderer.invoke('app:show-in-folder', filePath, sessionId),
   workspaceDownload: (sessionId: string | null | undefined, filePath: string) =>
     ipcRenderer.invoke('workspace:download', sessionId, filePath),
   /**

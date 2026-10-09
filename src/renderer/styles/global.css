@@ -2942,6 +2942,29 @@ button, input, select, textarea {
   cursor: pointer;
 }
 
+/* 预览侧栏最上面一行：标签页占满剩下的宽度、自己横向滚动；右边三个按钮（⟳ 📂 ✕）固定不缩，
+   标签再多也挤不掉它们。下边线画在整行上，标签区自己就不画了。 */
+.file-panel-top {
+  display: flex;
+  align-items: flex-end;
+  gap: 8px;
+  flex: 0 0 auto;
+  padding-right: 10px;
+  border-bottom: 1px solid var(--border);
+}
+.file-panel-top .file-tabs {
+  flex: 1 1 auto;
+  min-width: 0;
+  border-bottom: none;
+}
+.file-panel-top .workspace-file-actions {
+  align-self: center;
+  padding: 4px 0;
+}
+.file-panel-top .workspace-file-actions .text-btn { white-space: nowrap; }
+.file-panel-top .workspace-file-actions .text-btn:disabled { opacity: 0.45; cursor: default; }
+.file-tab.gone .file-tab-name { color: var(--text-muted); text-decoration: line-through; }
+
 .file-tab:hover .file-tab-close { color: var(--text-muted); }
 .file-tab-close:hover { background: var(--bg-hover); color: var(--text-primary); }
 
@@ -8388,6 +8411,8 @@ button, input, select, textarea {
   position: sticky; top: -10px; z-index: 6;
   margin: -10px -14px 6px; padding: 4px 14px;
   background: var(--bg-secondary); border-bottom: 1px solid var(--border);
+  /* 💬 comment 和 ◎ 原文 紧挨着排一行 */
+  display: flex; align-items: center; gap: 6px;
 }
 .rv-review-toggle {
   align-self: flex-start; font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 5px;
