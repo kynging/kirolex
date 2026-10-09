@@ -2,6 +2,7 @@ import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react'
 import { baseName } from './pathBits.ts';
 import { type SubagentRow } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
+import { restoreGet, restoreSet, restoreGetJson } from './uiRestore';
 import { normalizeLang, type Lang } from './i18n';
 import { LangProvider, useT } from './hooks/useLang';
 import { useRemoteTargets } from './hooks/useRemoteTargets';
@@ -262,7 +263,9 @@ declare global {
        */
       reviseInSession?: (input: {
         sessionId: string; where: string; note: string; about?: string;
-        scope?: 'block' | 'whole'; label?: string; full?: string;
+        scope?: 'block' | 'whole' | 'insert'; label?: string; full?: string; ticket?: string;
+        /** 回复由主进程拼回去、写盘（窗口 reload 了也不丢）—— 见 main/reviewApply.ts */
+        apply?: { path: string; mode: 'splice' | 'insert' | 'whole'; from?: number; to?: number; base: string };
       }) => Promise<{ ok: boolean; text?: string; cannot?: string; error?: string }>;
       /**
        * 把改完的正文写回那个文件 —— 路径按 `sessionId` 解析（和 workspaceRead 同一个 resolveUserPath），
@@ -288,7 +291,10 @@ declare global {
       deckWriteNote?: (sessionId: string | null | undefined, filePath: string, page: number, text: string)
         => Promise<{ ok: boolean; notes?: string[]; error?: string }>;
       /** 问打开这份 deck 的会话这一页的字/版面该怎么改，KiroLex 按 run 地址写（正忙就排队）。 */
-      deckReviseSlideText?: (input: { sessionId: string; filePath: string; page: number; note: string })
+      /** 取消侧栏 comment 提交的那一次改写（按 ticket）。 */
+      reviewCancel?: (ticket: string) => Promise<{ ok: boolean }>;
+      reviewTicketsDone?: (tickets: string[]) => Promise<string[]>;
+      deckReviseSlideText?: (input: { sessionId: string; filePath: string; page: number; note: string; ticket?: string })
         => Promise<{ ok: boolean; changed?: number; partial?: string; cannot?: string; error?: string }>;
       deckReadSlideText?: (sessionId: string | null | undefined, filePath: string, page: number)
         => Promise<{ ok: boolean; runs?: Array<{ at: string; text: string }>; error?: string }>;
@@ -469,6 +475,11 @@ export interface Settings {
   recoverInterruptedTurns: boolean;
   /** 被非人为原因打断（执行器死了、重启、看门狗）的那一轮最多自动重发几次。0 = 不重发。默认 10。 */
   autoRetryMax?: number;
+  /**
+   * 重启后恢复界面状态 —— 左侧会话栏收没收起、各组折叠、comment 模式和每份文件里的 comment 标记。
+   * 关了只活过窗口 reload（见 `uiRestore`）。默认开。
+   */
+  restoreUiState?: boolean;
   /** Auto-fold 💭 thinking segments once thinking finishes (default on). */
   autoFoldThinking: boolean;
   /** Auto-fold 🔧 tool segments once the tool call finishes (default on). */
@@ -496,7 +507,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -540,6 +551,10 @@ export interface FileTab {
  *  would balloon renderer memory. Oldest non-active tab is evicted first. */
 const MAX_FILE_TABS = 12;
 const OPEN_TABS_KEY = 'kirolex-open-file-tabs';
+/** 右侧文件 / comment 栏最窄多宽。 */
+const FILE_PANEL_MIN = 320;
+/** 拖宽右侧栏时**会话区至少留多宽** —— 再窄输入框和消息就没法用了（见 `fileViewerMax`）。 */
+const CHAT_MIN_WIDTH = 420;
 const SPLIT_SESSION_KEY = 'kirolex-split-session';
 /** 每个会话排着的后续消息 —— 落盘，因为它们是你已经按过回车的东西（见 `queuesBySession`） */
 const QUEUES_KEY = 'kirolex-queues';
@@ -590,6 +605,15 @@ function needsSystemApp(p: string): boolean {
  * 能在侧栏逐行写意见的文件 —— Markdown 和纯文本。
  * 代码文件不在内：它们按行渲染会丢掉语法高亮，而且"让会话改一行代码"该走正常对话，不是批注。
  */
+/**
+ * 路径本身就说明了主人的那种 —— 会话自己的目录 `~/.kirolex/sessions/<id>/…`。
+ * 给没存主人的旧标签兜底（存主人是后来才加的，见 `OPEN_TABS_KEY` 那段）。
+ */
+export function ownerFromPath(p: string): string | undefined {
+  const m = /[\\/]\.kirolex[\\/]sessions[\\/](s_[\w-]+)[\\/]/.exec(String(p || ''));
+  return m ? m[1] : undefined;
+}
+
 function isReviewableText(p: string): boolean {
   return /.(md|markdown|mdown|mkd|mdx|txt|text)$/i.test(String(p || '').trim());
 }
@@ -690,14 +714,34 @@ const isWinFrame = typeof navigator !== 'undefined' && !isMac;
 
 const App: React.FC = () => {
   const t = useT();
-  /* 标题条高度跟着最大化 / 还原变（主进程同时改系统按钮那一块的高度，两边用同一个数） */
+  /*
+    **标题条：最大化时自动隐藏** ——「能让上面这个程序框自动隐藏吗」。窗口是无边框的（主进程 frame: false），
+    最大化 / 全屏时标题条收起、不占高度；鼠标碰到屏幕顶边（那条 4px 的感应带）它滑下来，离开 600ms 后收回。
+    还原成普通窗口时一直显示（要靠它拖动窗口）。
+  */
+  const [winMaxed, setWinMaxed] = useState(false);
+  const [titlebarShown, setTitlebarShown] = useState(false);
+  const titlebarHideTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => {
     if (!isWinFrame) return;
-    const off = (window as any).kiroApi?.onWindowMaximized?.((d: { height: number }) => {
+    const off = (window as any).kiroApi?.onWindowMaximized?.((d: { maximized: boolean; height: number }) => {
       if (d?.height) document.documentElement.style.setProperty('--win-titlebar-height', `${d.height}px`);
+      setWinMaxed(!!d?.maximized);
+      setTitlebarShown(false);
     });
     return () => { try { off?.(); } catch { /* 卸载 */ } };
   }, []);
+  const revealTitlebar = useCallback(() => {
+    if (titlebarHideTimer.current) { clearTimeout(titlebarHideTimer.current); titlebarHideTimer.current = null; }
+    setTitlebarShown(true);
+  }, []);
+  const scheduleHideTitlebar = useCallback(() => {
+    if (titlebarHideTimer.current) clearTimeout(titlebarHideTimer.current);
+    titlebarHideTimer.current = setTimeout(() => setTitlebarShown(false), 600);
+  }, []);
+  const windowControl = (action: 'minimize' | 'toggle-maximize' | 'close') => {
+    void (window as any).kiroApi?.windowControl?.(action).then((r: any) => { if (r && typeof r.maximized === 'boolean') setWinMaxed(r.maximized); });
+  };
   const {
     status,
     errorBySession,
@@ -936,6 +980,8 @@ const App: React.FC = () => {
   const [showWorkspace, setShowWorkspace] = useState(false);
 
   const [showMemory, setShowMemory] = useState(false);
+  /** 记忆编辑器开给哪条会话、落在哪一层 —— 横幅的「编辑」从某个窗格打开（分屏时不一定是当前会话） */
+  const [memoryTarget, setMemoryTarget] = useState<{ sessionId?: string; projectId?: string; scope?: 'global' | 'project' | 'session' } | null>(null);
   /**
    * 会话内搜索（Cmd+F）**已经搬到每一格自己身上** —— 「哪个分屏的搜索应该显示在那个分屏中」。
    * 状态、命中计数、高亮都在 `ChatArea` 里（见那里的 `findOpen` 那一段），App 不再持有全局搜索状态：
@@ -1200,7 +1246,24 @@ const App: React.FC = () => {
    * 文本文件在不在 comment 模式 —— 默认**关**。关着的时候一个按钮都不渲染，纯粹读文档；开着才出现每行
    * 右边那个 💬 / ✕ 和最下面那块。默认关是因为大多数时候你只是想看一眼。
    */
-  const [commenting, setCommenting] = useState(false);
+  /*
+    **按文件记，不是全局一个开关** ——「comment 模式会改变所有现在打开的文件，这个按钮应该只影响当前文件」。
+    原来是一个布尔：在 A 打开 comment，切到 B、C 也全是 comment 模式。现在是"哪些路径开着"，按钮只拨当前这份；
+    跟着「重启后恢复界面状态」一起记（见 `uiRestore`）。
+  */
+  const [commentingPaths, setCommentingPaths] = useState<string[]>(() => {
+    const saved = restoreGetJson<unknown>('kirolex-commenting-paths');
+    return Array.isArray(saved) ? saved.map(String) : [];
+  });
+  useEffect(() => {
+    restoreSet('kirolex-commenting-paths', commentingPaths.length ? JSON.stringify(commentingPaths) : null);
+  }, [commentingPaths]);
+  const commenting = !!fileViewer && commentingPaths.includes(fileViewer.path);
+  const toggleCommenting = () => {
+    const at = fileViewer?.path;
+    if (!at) return;
+    setCommentingPaths((cur) => (cur.includes(at) ? cur.filter((p) => p !== at) : [...cur, at]));
+  };
   // Markdown files render formatted by default; the toggle shows the raw source.
   const fileViewerRaw = !!fileViewer?.raw;
   const [settings, setSettings] = useState<Settings>(loadSettings);
@@ -1941,6 +2004,8 @@ const App: React.FC = () => {
   const openFileInApp = useCallback(async (rawPath: string, forSessionId?: string) => {
     const sessionForPath = forSessionId || currentSessionId;
     const p = rawPath.replace(/^file:\/\//, '');
+    /* 你点开了一个文件 = 要看它：藏着的预览栏放出来（启动时把上次的标签开回来那一遍不算） */
+    if (!tabsRestoringRef.current) setFileViewerHidden(false);
     // Already open -> just focus that tab. Re-reading would throw away the scroll
     // position and the rendered/raw choice the user had set.
     /*
@@ -2065,13 +2130,27 @@ const App: React.FC = () => {
 
   // Persist WHICH files are open (paths only, plus the raw/rendered choice) so the
   // set survives a restart; content is re-read lazily on first activation.
+  /** 正在把上次的标签一个个开回来 —— 那期间别存：存进去的是开了一半的那几个，reload 一次就少几个标签。 */
+  const tabsRestoringRef = useRef(false);
   useEffect(() => {
+    /*
+      **开回来之前一律不存** ——「我明明跟你说刷新之后仍然要记录已经打开的 review 侧栏并重新打开，为什么这个功能没实现」。
+      这个 effect 声明在"开回来"那个前面，同一次挂载里**先跑**：那一刻一个标签都还没开（`fileTabs` 是空的），
+      于是走到下面 `uiRemove` —— 把存着的那份标签单子删了，紧接着"开回来"去读，读到的是空。每次刷新都是这样。
+      所以等"开回来"那一遍跑过（`tabsRestoredRef`）、并且开完（`tabsRestoringRef`）再存。
+    */
+    if (!tabsRestoredRef.current || tabsRestoringRef.current) return;
     try {
       // Shared store, not origin-scoped localStorage -- same reason as the drafts and
       // split sizes: the set of open files was reset on every dev/prod origin switch.
       if (fileTabs.length === 0) { uiRemove(OPEN_TABS_KEY); return; }
       uiSet(OPEN_TABS_KEY, JSON.stringify({
-        tabs: fileTabs.map((t) => ({ path: t.path, raw: !!t.raw })),
+        /*
+          **连同主人会话一起存** ——「你重新加载了之后我之前打开的 comment 侧栏还是会丢」。原来只存路径，
+          开回来时主人就成了"此刻选中的那条"（启动那一刻往往还没有）—— 没有主人，comment 那一侧就只能看，
+          💬 / ✕ 和那些标记全都不见了。
+        */
+        tabs: fileTabs.map((t) => ({ path: t.path, raw: !!t.raw, ...(t.ownerSessionId ? { owner: t.ownerSessionId } : {}) })),
         activePath: fileViewer?.path || null,
       }));
     } catch {}
@@ -2084,12 +2163,17 @@ const App: React.FC = () => {
   useEffect(() => {
     if (tabsRestoredRef.current) return;
     tabsRestoredRef.current = true;
-    let saved: { tabs?: { path: string; raw?: boolean }[]; activePath?: string | null } | null = null;
+    let saved: { tabs?: { path: string; raw?: boolean; owner?: string }[]; activePath?: string | null } | null = null;
     try { saved = JSON.parse(uiGet(OPEN_TABS_KEY) || 'null'); } catch {}
-    const paths = (saved?.tabs || []).map((t) => t.path).filter(Boolean);
-    if (!paths.length) return;
+    const list = (saved?.tabs || []).filter((t) => t && t.path);
+    if (!list.length) return;
+    tabsRestoringRef.current = true;
     (async () => {
-      for (const path of paths.slice(0, MAX_FILE_TABS)) await openFileInApp(path);
+      try {
+        for (const t of list.slice(0, MAX_FILE_TABS)) await openFileInApp(t.path, t.owner || ownerFromPath(t.path));
+      } finally {
+        tabsRestoringRef.current = false;
+      }
       const active = saved?.activePath;
       if (active) {
         setFileTabs((prev) => {
@@ -2331,19 +2415,30 @@ const App: React.FC = () => {
   }, []);
 
   /**
-   * 这条会话该显示哪台机器的模型。远端那台**问一次就够**（列表不会一分钟变一次），
-   * 问不到时退回本机那份 —— 空下拉比"可能多几个"更糟（那时你连当前模型都看不见）。
+   * 这条会话该显示哪台机器的模型。远端那台**问一次就够**（列表不会一分钟变一次）。
+   *
+   * **问到之前绝不拿本机那份顶上** ——「这个远程会话怎么中间又提示 claude unavailable 了，这个模型不可能不能用啊」。
+   * 本机 kiro-cli 的清单里根本没有 Claude（只有 gpt-5.6-* / deepseek / glm…），远端那台有 21 个。原来远端清单
+   * 还没回来（窗口一 reload、一重连就是这样）时退回本机那份 —— 于是远端会话正在用的 Claude 在下拉里被标成
+   * 「· unavailable」，直到远端清单回来才消失。那个模型从来没有不能用过，是下拉在拿别的机器的清单比。
+   * 现在：先用上次缓存的那份远端清单；连缓存都没有就给空 —— 空清单时下拉只显示当前模型本身，不下结论。
    */
   const modelsFor = useCallback((session: Session | null): any[] => {
     const host = session?.remoteHost;
     if (!host) return models;
     const machine = remoteTargets.targets.find((t) => t.label === host)?.id;
-    if (!machine) return models;
+    /* 机器表还没加载出来：同样不能拿本机的比 */
+    if (!machine) return [];
     if (!askedModels.current.has(machine)) {
       askedModels.current.add(machine);
       void refreshModels(machine);
     }
-    return modelsByMachine[machine] || models;
+    if (modelsByMachine[machine]?.length) return modelsByMachine[machine];
+    try {
+      const cached = JSON.parse(uiGet(`kirolex-models:${machine}`) || '[]');
+      if (Array.isArray(cached) && cached.length) return cached;
+    } catch { /* 坏缓存当没有 */ }
+    return [];
   }, [models, modelsByMachine, refreshModels, remoteTargets.targets]);
 
   /**
@@ -3127,7 +3222,9 @@ const App: React.FC = () => {
     } catch {}
     return 240;
   });
-  const [sidebarCollapsed, setSidebarCollapsed] = useState(false);
+  /* 左侧会话栏收没收起 —— 「重启后恢复界面状态」开着时活过重启（见 `uiRestore`） */
+  const [sidebarCollapsed, setSidebarCollapsed] = useState(() => restoreGet('kirolex-sidebar-hidden') === '1');
+  useEffect(() => { restoreSet('kirolex-sidebar-hidden', sidebarCollapsed ? '1' : null); }, [sidebarCollapsed]);
   const isResizingRef = useRef(false);
   // Resizable width for the right-side file panel (drag its left edge).
   const [fileViewerWidth, setFileViewerWidth] = useState(() => {
@@ -3137,15 +3234,36 @@ const App: React.FC = () => {
     } catch {}
     return 520;
   });
+  /*
+    **右侧文件 / comment 栏最宽能到多少** ——「windows 版本的 comment 栏似乎可以无限往左拉压缩左侧会话和侧栏的空间」。
+    原来只有一个固定上限 1100px：窗口一宽（Windows 上常见的 1920 逻辑像素），1100 就挤得动左边 ——
+    会话区被压到几十像素、侧栏也跟着被压窄。上限改成**跟着窗口走**：窗口宽 − 侧栏（开着时）− 会话区至少留的那么宽。
+    拖的时候按它夹，窗口变窄 / 侧栏打开时显示也按它夹（存的宽度不动，窗口再变宽就回到你拖的那个宽度）。
+  */
+  /*
+    **右侧预览栏可以藏起来** ——「预览侧栏现在没有隐藏按钮，这个就很不方便」。原来只有一个 ✕，而它关掉的是
+    **所有标签**（连同每份文件的 comment 状态入口）。藏起来只是不占地方：标签都留着，右边缘那条点一下就回来；
+    从会话里再点开一个文件也会把它放出来。跟着「重启后恢复界面状态」一起记。
+  */
+  const [fileViewerHidden, setFileViewerHidden] = useState(() => restoreGet('kirolex-fileviewer-hidden') === '1');
+  useEffect(() => { restoreSet('kirolex-fileviewer-hidden', fileViewerHidden ? '1' : null); }, [fileViewerHidden]);
+  const [winWidth, setWinWidth] = useState(() => window.innerWidth);
+  useEffect(() => {
+    const onResize = () => setWinWidth(window.innerWidth);
+    window.addEventListener('resize', onResize);
+    return () => window.removeEventListener('resize', onResize);
+  }, []);
+  const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarCollapsed ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));
+  const fileViewerShown = Math.min(fileViewerWidth, fileViewerMax);
   const handleFileResizeStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
     isResizingRef.current = true;
     const startX = e.clientX;
-    const startWidth = fileViewerWidth;
+    const startWidth = Math.min(fileViewerWidth, fileViewerMax);
     const onMouseMove = (ev: MouseEvent) => {
       if (!isResizingRef.current) return;
       // Panel sits on the RIGHT: dragging the left edge leftwards widens it.
-      const newWidth = Math.max(320, Math.min(1100, startWidth + startX - ev.clientX));
+      const newWidth = Math.max(FILE_PANEL_MIN, Math.min(fileViewerMax, startWidth + startX - ev.clientX));
       setFileViewerWidth(newWidth);
     };
     const onMouseUp = () => {
@@ -3159,7 +3277,7 @@ const App: React.FC = () => {
     document.body.style.userSelect = 'none';
     document.addEventListener('mousemove', onMouseMove);
     document.addEventListener('mouseup', onMouseUp);
-  }, [fileViewerWidth]);
+  }, [fileViewerWidth, fileViewerMax]);
   useEffect(() => {
     try { uiSet('kirolex-fileviewer-width', String(fileViewerWidth)); } catch {}
   }, [fileViewerWidth]);
@@ -3345,7 +3463,10 @@ const App: React.FC = () => {
         onCompactMemory={(scope) => {
           if (sid) void compactMemory(scope, sid, session?.projectId);
         }}
-        onOpenMemory={() => setShowMemory(true)}
+        onOpenMemory={(scope) => {
+          setMemoryTarget(scope ? { sessionId: sid || undefined, projectId: session?.projectId, scope } : null);
+          setShowMemory(true);
+        }}
         onKiroAgentChange={(agentName) => { void handleKiroAgentChange(agentName, sid || undefined); }}
         onForkMessage={messageCallbacks.onFork}
         onRerunMessage={messageCallbacks.onRerun}
@@ -3462,10 +3583,32 @@ const App: React.FC = () => {
   return (
     <LangProvider lang={settings.language}>
       {/* One line, because 「什么都没出现」 is the one thing a registration must never do silently. */}
-      <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}${isWinFrame ? ' win' : ''}`}>
+      <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}${isWinFrame ? ' win' : ''}${isWinFrame && winMaxed ? ' maxed' : ''}`}>
         {isMac && <div className="mac-titlebar" />}
         {/* 拖它移动窗口、双击最大化 / 还原（系统行为）；右边留给系统画的最小化 / 最大化 / 关闭 */}
-        {isWinFrame && <div className="win-titlebar"><span className="win-titlebar-title">KiroLex</span></div>}
+        {isWinFrame && winMaxed && !titlebarShown && <div className="win-titlebar-hotzone" onMouseEnter={revealTitlebar} />}
+        {isWinFrame && (
+          <div
+            className={`win-titlebar${winMaxed ? ' auto-hide' : ''}${winMaxed && titlebarShown ? ' shown' : ''}`}
+            onMouseEnter={winMaxed ? revealTitlebar : undefined}
+            onMouseLeave={winMaxed ? scheduleHideTitlebar : undefined}
+          >
+            <span className="win-titlebar-title">KiroLex</span>
+            <div className="win-titlebar-controls">
+              <button className="win-ctl" onClick={() => windowControl('minimize')} title="最小化" aria-label="Minimize">
+                <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" stroke="currentColor" strokeWidth="1" /></svg>
+              </button>
+              <button className="win-ctl" onClick={() => windowControl('toggle-maximize')} title={winMaxed ? '还原' : '最大化'} aria-label="Maximize">
+                {winMaxed
+                  ? <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 0.5h7v7M0.5 2.5h7v7h-7z" fill="none" stroke="currentColor" strokeWidth="1" /></svg>
+                  : <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1" /></svg>}
+              </button>
+              <button className="win-ctl win-ctl-close" onClick={() => windowControl('close')} title="关闭" aria-label="Close">
+                <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0.5 0.5l9 9M9.5 0.5l-9 9" stroke="currentColor" strokeWidth="1" /></svg>
+              </button>
+            </div>
+          </div>
+        )}
         <Toasts />
         {!sidebarCollapsed && (
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>
@@ -3601,7 +3744,7 @@ const App: React.FC = () => {
             <div className="sidebar-resize-handle" onMouseDown={handleResizeStart} />
           )}
           <button
-            className="sidebar-collapse-btn"
+            className="side-collapse-btn sidebar-collapse-btn"
             onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
             title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
           >
@@ -3677,8 +3820,22 @@ const App: React.FC = () => {
             onOpenFile={(p) => void openFileInApp(p)}
           />
         )}
+        {/*
+          **右侧也是一个和左侧一样的折叠按钮** ——「你这个右侧都变成侧栏了，我要的是和左侧一样的可隐藏按钮，弄大一些就好了」。
+          一个零宽的条，按钮贴着预览栏的左边缘（藏起来时贴着窗口右边缘），开着时 ▶ 收起、收着时 ◀ 放出来。
+        */}
         {(fileViewerLoading || fileViewer) && (
-          <div className="workspace-file-panel" role="complementary" aria-label="File preview" style={{ width: fileViewerWidth }}>
+          <div className="file-collapse-area">
+            <button
+              type="button"
+              className="side-collapse-btn file-collapse-btn"
+              onClick={() => setFileViewerHidden(!fileViewerHidden)}
+              title={fileViewerHidden ? `显示预览栏（${fileTabs.length} 个标签）` : '隐藏预览栏（标签都留着）'}
+            >{fileViewerHidden ? '◀' : '▶'}</button>
+          </div>
+        )}
+        {(fileViewerLoading || fileViewer) && !fileViewerHidden && (
+          <div className="workspace-file-panel" role="complementary" aria-label="File preview" style={{ width: fileViewerShown }}>
             <div className="file-resize-handle" onMouseDown={handleFileResizeStart} title={t('Drag to resize width')} />
             <div className="settings-header">
               <h3 title={fileViewer?.path} style={{ display: 'flex', alignItems: 'center', gap: 8, minWidth: 0 }}>
@@ -3805,16 +3962,19 @@ const App: React.FC = () => {
                         截断的预览不给：拼回整份写盘会把后面那截删掉（主进程那侧也挡着）。
                       */}
                       {isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated && (
+                        /* 钉在预览栏顶上的那一整条（见 `.rv-toggle-bar`）—— 它占的那一行不让正文从旁边透出来 */
+                        <div className="rv-toggle-bar">
                         <button
                           type="button"
                           className={`rv-review-toggle${commenting ? ' on' : ''}`}
                           title={commenting
                             ? '退出批注，安静读'
                             : fileViewer.ownerSessionId
-                              ? '逐行写意见：「✓ 确认」当场让打开这份文件的会话改那一块并写回；「记下」的攒起来一起提交'
+                              ? '逐段写意见：💬「✓ 确认」当场让打开这份文件的会话改那一块并写回；＋ 在那一段后面加新内容；✕ 直接删掉'
                               : '逐行写意见 —— 这个标签页没有归属会话，只能看不能发（从会话里点开文件链接才有）'}
-                          onClick={() => setCommenting((v) => !v)}
+                          onClick={toggleCommenting}
                         >{commenting ? '✓ comment' : '💬 comment'}</button>
+                        </div>
                       )}
                       {isReviewableText(fileViewer.path) && !fileViewerRaw && !fileViewer.truncated && commenting ? (
                         <ReviewPane
@@ -3831,12 +3991,11 @@ const App: React.FC = () => {
                             setFileTabs((prev) => prev.map((t) => (t.path === at ? { ...t, content: next } : t)));
                           }}
                           /*
-                            **提交也发给这个 tab 的主人** ——「就从这个会话提交更改」。提交完**退出 comment 模式**：
-                            控件还在你会接着写第二批，两批意见落在同一份文件上，模型不知道该按哪一批改。
+                            **改不了单块的那几条直接发给这个 tab 的主人**（「就从这个会话提交更改」）。
+                            不再退出 comment 模式：没有"一批"了 —— 每条都是当场处理的，发完你接着评下一处。
                           */
                           onSubmit={fileViewer.ownerSessionId ? (prompt: string) => {
                             void handleSendMessage(prompt, undefined, fileViewer.ownerSessionId);
-                            setCommenting(false);
                           } : undefined}
                         />
                       ) : isMarkdownPath(fileViewer.path) && !fileViewerRaw ? (
@@ -3975,9 +4134,10 @@ const App: React.FC = () => {
 
       {showMemory && (
         <MemoryDialog
-          projectId={sessions.find((s) => s.id === currentSessionId)?.projectId}
-          sessionId={currentSessionId && !currentSessionId.startsWith('pending_') ? currentSessionId : undefined}
-          onClose={() => setShowMemory(false)}
+          projectId={memoryTarget ? memoryTarget.projectId : sessions.find((s) => s.id === currentSessionId)?.projectId}
+          sessionId={memoryTarget ? memoryTarget.sessionId : (currentSessionId && !currentSessionId.startsWith('pending_') ? currentSessionId : undefined)}
+          initialTab={memoryTarget?.scope}
+          onClose={() => { setShowMemory(false); setMemoryTarget(null); }}
         />
       )}
       {showLogs && (

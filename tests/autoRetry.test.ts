@@ -98,3 +98,15 @@ describe('静默太久被中断、但已有产出的那一轮：自动续写', (
     assert.match(H, /if \(autoContinueInFlightRef\.current\.has\(sid\)\) autoContinueInFlightRef\.current\.delete\(sid\); else wedgeContinuesRef\.current\.delete\(sid\);/);
   });
 });
+
+describe('Claude Code 的工具调用：标题在后面的 tool_call_update 里', () => {
+  const H = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
+  test('update 带了标题就换上；不带 status 时不把 status 抹成空；第一条就是 update 也建一条', () => {
+    const at = H.indexOf("case 'tool_call_update': {");
+    const body = H.slice(at, at + 2600);
+    assert.ok(body.includes("if (typeof update.title === 'string' && update.title.trim()) existing.title = update.title;"));
+    assert.ok(body.includes('if (update.status) existing.status = update.status;'));
+    assert.ok(!body.includes('            existing.status = update.status;\n            if (update.kind)'), '不再无条件覆盖 status');
+    assert.ok(body.includes("?? (update.toolCallId ? { toolCallId: update.toolCallId, title: update.title || 'Tool call'"));
+  });
+});

@@ -6,7 +6,7 @@ import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'chil
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { ADAPTER_PACKAGE, ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf } from './engines.ts';
-import { applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
+import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
 import {
   CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
@@ -62,6 +62,7 @@ import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { parseRevised, reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
+import { applyRevision, type ReviewApply } from './reviewApply.ts';
 import {
   SOFFICE_BUNDLE_PATHS, SOFFICE_PATH_NAMES, pickConverter, sofficeBinary, pathProbeCommand, firstProbeHit,
   installConverterCmd, noConverterWhy, pythonCandidates, PPTX_PROBE_SCRIPT, pythonEnv, noPythonPptxWhy,
@@ -219,6 +220,10 @@ interface SessionEntry {
    *  permanently instead of living in a floating banner that outlives the turn
    *  it describes. Never set for a user-pressed Stop. */
   wedgeNote?: string;
+  /** ms timestamp of the moment KiroLex's own timeout decided to interrupt this
+   *  turn. The auto-continue that follows may arrive before the cancel has
+   *  released `busy`; sendPromptOnce waits it out instead of rejecting. */
+  wedgedAt?: number;
   /** In-flight history rebuild, so a user prompt WAITS for it instead of being
    *  sent into an empty backend. Shared by the eager (post-attach) path and the
    *  lazy (pre-prompt) path so the rebuild happens exactly once. */
@@ -3340,6 +3345,22 @@ const askWaiters = new Map<string, {
   timer: NodeJS.Timeout;
 }>();
 
+/**
+ * **侧栏 comment 那一次次改写的 ticket** —— 取消要能认出"就是这一次"，而不是"这条会话此刻在跑的那一轮"：
+ * 一次改写可能还排在 `enqueueRevise` 里、或者在等你自己那一轮对话跑完（`waitIdle`），那时按会话去 cancel
+ * 停掉的是**你的对话**。所以：取消只记一笔；轮到它时看一眼，被取消了就不发；已经在等回复（`asking`）的，
+ * 停的是它自己那一轮（那时 `askWaiters` 上挂的就是它）。
+ */
+const reviseTickets = new Map<string, { sessionId: string; cancelled: boolean; asking: boolean }>();
+function openTicket(ticket: string | undefined, sessionId: string) {
+  if (ticket) reviseTickets.set(ticket, { sessionId, cancelled: false, asking: false });
+  return {
+    cancelled: () => !!ticket && !!reviseTickets.get(ticket)?.cancelled,
+    asking: (on: boolean) => { const t = ticket ? reviseTickets.get(ticket) : undefined; if (t) t.asking = on; },
+    close: () => { if (ticket) reviseTickets.delete(ticket); },
+  };
+}
+
 /** 兑付这条会话上的等待者。没有等待者就什么都不做（绝大多数轮次都是这样）。 */
 function settleAsk(sessionId: string, reply: { text: string; stopReason: string; wedged: boolean }) {
   const w = askWaiters.get(sessionId);
@@ -4619,9 +4640,8 @@ function getSessionDir(sessionId?: string): string {
 // (per-model getClient removed — executors are now created per-session in the
 //  acp:new-session / acp:load-session handlers, keyed by sessionId.)
 
-/** Windows / Linux 自己画的标题条有多高（系统按钮叠在它右边）；最大化时收窄。 */
+/** Windows / Linux 自己画的标题条有多高（无边框窗口；最大化时它自动隐藏，见渲染层 .win-titlebar）。 */
 const WIN_TITLEBAR_HEIGHT = 32;
-const WIN_TITLEBAR_HEIGHT_MAXIMIZED = 28;
 
 function createWindow() {
   startupMark('createWindow: start');
@@ -4631,12 +4651,15 @@ function createWindow() {
     minWidth: 800,
     minHeight: 600,
     /*
-      **Windows / Linux 不要系统那条白色标题栏** ——「全屏模式下总有一个上面的白框，kirolex 标题」。
-      换成 hidden + titleBarOverlay：最小化 / 最大化 / 关闭还是系统自己画（行为、贴边、Snap 都不变），
-      颜色和界面一致；标题和拖动区是渲染层那条 .win-titlebar。最大化时收窄（见下面 maximize 事件）。
+      **Windows / Linux 不要系统那条白色标题栏** ——「全屏模式下总有一个上面的白框，kirolex 标题」→
+      「能让上面这个程序框自动隐藏吗」。
+      第一版用的是 titleBarOverlay（系统画三个按钮）—— 但系统那三个按钮**藏不掉**，于是最大化时那条
+      没法自动隐藏。所以改成完全无边框（frame: false），最小化 / 最大化 / 关闭由渲染层自己画（window:control），
+      标题条在最大化时自动收起、鼠标碰到顶边才滑下来。代价只有一个：Win11 悬停最大化按钮弹出的
+      「贴靠布局」菜单没了（那是系统按钮自带的）；拖到屏幕边贴靠、双击标题条最大化、边缘拖拽缩放都还在。
     */
-    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'hidden',
-    ...(process.platform === 'darwin' ? {} : { titleBarOverlay: { color: '#1a1a1a', symbolColor: '#a0a0a0', height: WIN_TITLEBAR_HEIGHT } }),
+    titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
+    ...(process.platform === 'darwin' ? {} : { frame: false }),
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
     show: false, // Hidden until connected
@@ -4651,13 +4674,12 @@ function createWindow() {
   if (process.platform !== 'darwin') {
     mainWindow.setMenuBarVisibility(false);
     mainWindow.setMenu(null);
-    /* 最大化时标题条收窄到按钮那么高；渲染层按同一个数字留出空间（kiroApi.onWindowMaximized） */
+    /* 最大化 / 全屏时渲染层把标题条收起来（自动隐藏），还原时放回去（kiroApi.onWindowMaximized） */
     const win = mainWindow;
     const applyTitleBar = (): void => {
       if (win.isDestroyed()) return;
       const maximized = win.isMaximized() || win.isFullScreen();
-      try { win.setTitleBarOverlay({ height: maximized ? WIN_TITLEBAR_HEIGHT_MAXIMIZED : WIN_TITLEBAR_HEIGHT }); } catch { /* 老版本 / 不支持 */ }
-      win.webContents.send('window:maximized', { maximized, height: maximized ? WIN_TITLEBAR_HEIGHT_MAXIMIZED : WIN_TITLEBAR_HEIGHT });
+      win.webContents.send('window:maximized', { maximized, height: WIN_TITLEBAR_HEIGHT });
     };
     for (const ev of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen'] as const) win.on(ev as any, applyTitleBar);
     win.webContents.on('did-finish-load', applyTitleBar);
@@ -5613,6 +5635,16 @@ app.whenReady().then(async () => {
     }
   });
 
+  /** 无边框窗口自己画的最小化 / 最大化 / 关闭（见 createWindow 的 frame: false）。关闭走窗口自己的 close —— 托盘那套逻辑照旧。 */
+  ipcMain.handle('window:control', (_event, action: string) => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return { maximized: false };
+    if (action === 'minimize') win.minimize();
+    else if (action === 'toggle-maximize') { if (win.isMaximized()) win.unmaximize(); else win.maximize(); }
+    else if (action === 'close') win.close();
+    return { maximized: win.isMaximized() || win.isFullScreen() };
+  });
+
   ipcMain.handle('acp:reveal', async () => {
     startupMark('reveal: window shown (hydrate + eager-attach finished)');
     showMainWindow();
@@ -5963,6 +5995,18 @@ app.whenReady().then(async () => {
     // Kiro CLI performs context compaction inside the active session/prompt
     // request. Keep that original request authoritative until it fully settles;
     // queued follow-ups must never overlap it or run during compaction.
+    /*
+      **超时中断后的自动续写，别被"还忙着"挡回去** —— 实测 ONTAP 那条：WEDGED 之后 4ms
+      续写就到了（窗口刚 reload 过，渲染端不知道这一轮还在跑，没等它收尾），而 cancel
+      要 170ms 才放开 busy —— 续写被这里拒掉，那一轮就停在"已中断"、没有任何重试。
+      只对 KiroLex 自己刚判卡死的那一轮等（最多 20 秒，teardown 本身 15 秒封顶），
+      别的情况照旧拒绝，不让排队的消息和正在跑的那一轮重叠。
+    */
+    if (entry.busy && entry.wedgedAt && Date.now() - entry.wedgedAt < 30000) {
+      const waitUntil = Date.now() + 20000;
+      while (entry.busy && Date.now() < waitUntil) await new Promise((r) => setTimeout(r, 200));
+      logger.info('prompt', `waited for wedged turn to release sessionId=${sessionId} busy=${entry.busy}`);
+    }
     if (entry.busy) {
       throw new Error('Wait for the active turn (including context compaction) to finish before sending the queued message.');
     }
@@ -6229,6 +6273,7 @@ app.whenReady().then(async () => {
             e.wedgeNote = staleToolCount
               ? `⚠️ 这一轮被 KiroLex 按超时中断：静默 ${dur(quietFor)}，其中 ${staleToolCount} 个工具调用有 ${dur(toolIdleFor)}没有进度更新（上限 ${Math.round(TOOL_STALL_MS / 60000)} 分钟）。工具本身可能仍在后台继续跑。可在设置「工具无进度多久判定卡死」里调大。`
               : `⚠️ 这一轮被 KiroLex 按超时中断：静默 ${dur(quietFor)}（上限 ${Math.round(WEDGE_CONFIRM_MS / 60000)} 分钟），没有工具在运行。可在设置「静默多久判定卡死」里调大。`;
+            e.wedgedAt = Date.now();
             logger.warn('prompt', `WEDGED sessionId=${sessionId} cli=${entry.cliSessionId} quiet=${quietSeconds}s produced=${produced} -- ${why}, interrupting`);
             // `produced` is the whole payload the renderer acts on: it decides
             // auto-resend vs. leaving the partial reply alone. The human-readable
@@ -7833,10 +7878,30 @@ app.whenReady().then(async () => {
    * 查不到时反查会得到 `undefined`，而"没有目标"的意思是**切回本地**。只想换个目录、
    * 顺手把会话从远端切了下来，是那种改完很久才发现的错。
    */
+  /**
+   * **还没连上过的新会话没有记录** ——「新会话无法切换引擎或运行位置，显示找不到会话记录」。
+   * 记录是 acp:new-session 连上之后才写的；连不上（比如本机 kiro-cli 坏了）的新会话就一直没有记录，
+   * 而那正是最想把它换个引擎 / 换台机器的时候。这里给它建一份最小的（默认模型 + 渲染层告诉我们的项目），
+   * 切换写进去，下次连接就按新的来。删掉过的会话（墓碑）不建 —— 否则会把它复活。
+   */
+  const coldRecordFor = (sessionId: string, hint?: { projectId?: string | null }): store.SessionRecord | null => {
+    const existing = store.readRecord(sessionId);
+    if (existing) return existing;
+    if (!/^s_[\w-]+$/.test(sessionId)) return null;
+    if (deletedSessionIds.has(sessionId) || loadSessionTombstones().includes(sessionId)) return null;
+    const profile: AgentProfile = {
+      model: DEFAULT_MODEL, preferredModel: DEFAULT_MODEL, permissionMode: 'auto-approve',
+      ...(hint?.projectId ? { projectId: hint.projectId } : {}),
+    };
+    logger.info('session', `新会话还没有记录（没连上过），切换前先建一份 sessionId=${sessionId} project=${hint?.projectId || '(无)'}`);
+    return store.createSession(sessionId, profile);
+  };
+
   const applySessionTarget = async (
     sessionId: string,
     target: RemoteTarget | undefined,
     localDir?: string,
+    hint?: { projectId?: string | null },
   ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
     const oldEntry = sessionClients.get(sessionId);
     /*
@@ -7849,7 +7914,7 @@ app.whenReady().then(async () => {
     const interrupted = !!oldEntry?.busy;
     if (reconfiguringSessions.has(sessionId)) throw new Error('上一次切换还没完成，稍等。');
 
-    const rec0 = store.readRecord(sessionId);
+    const rec0 = oldEntry ? store.readRecord(sessionId) : coldRecordFor(sessionId, hint);
     if (!oldEntry && !rec0) throw new Error('找不到这条会话的记录。');
     const currentRemote = oldEntry?.profile.remote?.sshHost || rec0?.profile?.remote?.sshHost || '';
     const wasRemote = !!currentRemote;
@@ -7971,10 +8036,11 @@ app.whenReady().then(async () => {
     sessionId: string,
     remoteId: string | null,
     localDir?: string,
+    hint?: { projectId?: string | null },
   ) => {
     const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
     if (remoteId && !target) throw new Error(`找不到远端目标 ${remoteId}（设置里删掉了？）—— 没有猜一台机器。`);
-    return applySessionTarget(sessionId, target, localDir);
+    return applySessionTarget(sessionId, target, localDir, hint);
   });
 
   ipcMain.handle('acp:engine-models', (_event, sessionId: string) => {
@@ -8230,11 +8296,12 @@ app.whenReady().then(async () => {
    * 自己的记录重建（随下一条消息带过去）。对话一条都不动。没连着的会话只改记录 —— 下次打开时
    * 按新引擎起（和「运行位置」那条路一样，「没连上也应该能切」）。
    */
-  ipcMain.handle('acp:switch-engine', async (_event, sessionId: string, engineArg: string) => {
+  ipcMain.handle('acp:switch-engine', async (_event, sessionId: string, engineArg: string, hint?: { projectId?: string | null }) => {
     const engine = engineOf({ engine: engineArg });
     const label = ENGINE_LABEL[engine];
     const oldEntry = sessionClients.get(sessionId);
-    const rec0 = store.readRecord(sessionId);
+    /* 没连着、也还没有记录的新会话：先建一份（见 coldRecordFor） */
+    const rec0 = oldEntry ? store.readRecord(sessionId) : coldRecordFor(sessionId, hint);
     const before = engineOf(oldEntry?.profile || rec0?.profile);
     if (before === engine) return { ok: true, unchanged: true, engine };
     /* kiro 的模型 id / agent 对另外两家没意义；切回 kiro 时用你选过的偏好模型 */
@@ -8357,10 +8424,15 @@ app.whenReady().then(async () => {
       ].join('; '), 45_000);
       const [claudeOut, codexOut, settings, toml] = out.split(SEP).map((x) => x.trim());
       const gw = pickClaudeEnv(settings || '').ANTHROPIC_BASE_URL;
+      /* 走 Bedrock 时没有"登录"这回事（凭证是那台机器的 AWS 凭证链），状态直接说走的是 Bedrock */
+      const cb = claudeBedrockOf(settings || '');
+      const xb = codexBedrockOf(toml || '');
+      const claude = parseClaudeStatus(claudeOut || '', gw);
+      const codex = parseCodexStatus(codexOut || '', codexGateway(toml || ''));
       return {
         ok: true,
-        claude: parseClaudeStatus(claudeOut || '', gw),
-        codex: parseCodexStatus(codexOut || '', codexGateway(toml || '')),
+        claude: cb && claude.installed ? { ...claude, loggedIn: true, detail: `走 Amazon Bedrock（global，${cb.region || '?'}）`, gateway: undefined } : claude,
+        codex: xb && codex.installed ? { ...codex, loggedIn: true, detail: `走 Amazon Bedrock（${xb.model || '?'} @ ${xb.region || '?'}）`, gateway: undefined } : codex,
       };
     } catch (err: any) {
       return { ok: false, error: err?.message || String(err) };
@@ -8384,7 +8456,12 @@ app.whenReady().then(async () => {
    * Codex：TOML 片段（顶层 model / model_provider + 一个 [model_providers.<id>] 段）→ 合并进 ~/.codex/config.toml。
    * 写之前把原文件备份成 `.kirolex-bak`；只改这几项，其余逐字保留（见 aiLogin.ts）。
    */
-  ipcMain.handle('ai-login:apply', async (_event, machine: string, input: { tool: 'claude' | 'codex'; text: string }) => {
+  /** 那台机器的 AWS region：先问 IMDSv2（EC2），再看 AWS CLI 的配置；最后一行是结果 */
+  const REMOTE_REGION_SCRIPT = 'T=$(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null); '
+    + 'R=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $T" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null); '
+    + '[ -z "$R" ] && R=$(aws configure get region 2>/dev/null); echo "${R:-us-east-1}"';
+
+  ipcMain.handle('ai-login:apply', async (_event, machine: string, input: { tool: 'claude' | 'codex'; text?: string; mode?: 'manual' | 'bedrock' }) => {
     try {
       const remote = aiLoginTarget(machine);
       const writeTo = async (file: string, content: string): Promise<void> => {
@@ -8393,6 +8470,24 @@ app.whenReady().then(async () => {
           `mkdir -p ${dir} && { [ -f ${file} ] && cp -p ${file} ${file}.kirolex-bak || true; } && cat > ${file} && chmod 600 ${file}`,
           content);
       };
+      /*
+        **Amazon Bedrock（默认推荐）** ——「默认将模型设置为 bedrock 的 global endpoint」。不写任何凭证：用那台机器的
+        AWS 凭证链（EC2 实例角色等）。Claude Code 用那台机器自己的 region（global 推理配置文件在各区都能用）；
+        Codex 的 region 固定 us-east-1（见 aiLogin.ts 的 BEDROCK_DEFAULTS）。手动填写 / 官方登录照旧可选。
+      */
+      if (input.mode === 'bedrock') {
+        if (input.tool === 'claude') {
+          const region = (await runRemoteCapture(remote, REMOTE_REGION_SCRIPT, 30_000)).trim().split(/\s+/).pop() || 'us-east-1';
+          const existing = await runRemoteCapture(remote, 'cat ~/.claude/settings.json 2>/dev/null || true', 30_000);
+          await writeTo('~/.claude/settings.json', claudeBedrockSettings(existing, region));
+          logger.info('ai-login', `Claude Code 改成走 Amazon Bedrock（${remote.sshHost}，region=${region}，global 推理配置文件）`);
+        } else {
+          const existing = await runRemoteCapture(remote, 'cat ~/.codex/config.toml 2>/dev/null || true', 30_000);
+          await writeTo('~/.codex/config.toml', codexBedrockToml(existing));
+          logger.info('ai-login', `Codex 改成走 Amazon Bedrock（${remote.sshHost}，${BEDROCK_DEFAULTS.codex.model} @ ${BEDROCK_DEFAULTS.codex.region}）`);
+        }
+        return { ok: true };
+      }
       if (input.tool === 'claude') {
         const env = parseClaudeEditor(String(input.text || ''));
         const existing = await runRemoteCapture(remote, 'cat ~/.claude/settings.json 2>/dev/null || true', 30_000);
@@ -9444,7 +9539,11 @@ app.whenReady().then(async () => {
    *   · 文件不能比预览上限大 —— 预览只读了前 512KB，拿它拼出来的"整份"写回去等于把后面截掉；
    *   · 写前留备份（`~/.kirolex/backups/review-files/`），**拷不成就不写**；内容一样就什么都不做。
    */
-  ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string) => {
+  /**
+   * 写回一份 review 的文件 —— `review:write-file` 和改写那条路（`apply`）共用。
+   * `expectBase`：盘上此刻必须正好是这一份才写 —— 改写跑的那几分钟里文件被别的改动动过，拼上去就是错位。
+   */
+  const writeReviewFile = (sessionId: string | null | undefined, filePath: string, text: string, expectBase?: string): any => {
     if (typeof text !== 'string' || !text.trim()) return { ok: false, error: '内容是空的，不写' };
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return t;
@@ -9459,6 +9558,9 @@ app.whenReady().then(async () => {
       } catch {
         return { ok: false, error: '这个文件现在读不到 —— 不新建，先确认路径对不对' };
       }
+      if (typeof expectBase === 'string' && previous !== expectBase) {
+        return { ok: false, mismatch: true, error: '这份文件在改写期间被别的改动动过了 —— 这次的结果没写进去，看一眼新的正文再提一次' };
+      }
       if (previous === text) return { ok: true, path: want, unchanged: true };
       if (!saveReviewBackup(want, previous)) {
         return { ok: false, error: '写前备份失败 —— 没有可回滚的副本，所以这次不改。检查 ~/.kirolex/backups 能不能写。' };
@@ -9469,7 +9571,22 @@ app.whenReady().then(async () => {
     } catch (error: any) {
       return { ok: false, error: String(error?.message || error) };
     }
-  });
+  };
+  ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string) =>
+    writeReviewFile(sessionId, filePath, text));
+
+  /**
+   * 哪些 ticket 已经在主进程这边**写完盘**了 —— 窗口 reload 回来时，"上次没做完"的那些里有些其实做完了
+   * （回复到的时候没有窗口，主进程自己拼、自己写的）；渲染层问一句，做完的就不再当标记放回去。
+   */
+  const doneTickets = new Map<string, number>();
+  const markTicketDone = (ticket: string | undefined) => {
+    if (!ticket) return;
+    doneTickets.set(ticket, Date.now());
+    if (doneTickets.size > 500) for (const k of [...doneTickets.keys()].slice(0, 100)) doneTickets.delete(k);
+  };
+  ipcMain.handle('review:tickets-done', async (_event, tickets: string[]) =>
+    (Array.isArray(tickets) ? tickets : []).filter((t) => doneTickets.has(String(t))));
 
   /** 在某条会话里留一行 **KiroLex 自己说的话**（改写落盘之后报一句"写进去了"）—— 不发给模型，见 `noteInSession`。 */
   ipcMain.handle('session:note', async (_event, sessionId: string, text: string) => {
@@ -9517,15 +9634,23 @@ app.whenReady().then(async () => {
   ipcMain.handle('review:revise-in-session', async (_event, input: {
     sessionId: string; where: string; note: string; about?: string;
     /** `block`（默认，快）/ `whole`（跨段的意见才用）—— 见 `reviseInSessionPrompt`。 */
-    scope?: 'block' | 'whole';
+    scope?: 'block' | 'whole' | 'insert';
     /** 会话里那条消息显示成什么位置（「a.md 第 12 行」）—— 回头翻会话要看得出说的是哪儿。 */
     label?: string;
     /** 整份重改时的基准正文（盘上此刻那一份）—— 见 `reviseInSessionPrompt.full`。 */
     full?: string;
+    /** 这一次改写的 ticket —— 取消按它认（见 `reviseTickets`）。 */
+    ticket?: string;
+    /**
+     * **回复由主进程拼回去、写盘**（见 `reviewApply.ts`）—— 窗口在这几分钟里 reload 了也不丢。
+     * 不传就退回老路：只回改写结果，由渲染层自己拼、自己写。
+     */
+    apply?: ReviewApply;
   }) => {
     const sessionId = String(input?.sessionId || '').trim();
     const note = String(input?.note ?? '').trim();
     const where = String(input?.where ?? '');
+    const tk = openTicket(typeof input?.ticket === 'string' ? input.ticket : undefined, sessionId);
     if (!sessionId) return { ok: false, error: '这个标签页没有归属会话 —— 没地方问' };
     if (!note) return { ok: false, error: '没有意见' };
     if (deletedSessionIds.has(sessionId)) return { ok: false, error: '这条会话已经删掉了' };
@@ -9534,27 +9659,35 @@ app.whenReady().then(async () => {
       **正忙就排队，不是报错**：排到这条会话的队尾（`enqueueRevise`），轮到了再等它空下来（`waitIdle`）——
       插进一轮正在跑的对话里，改写会和它正在做的事混在一起。
     */
-    return enqueueRevise(sessionId, async () => reviseOnce(), input?.label || '改写');
+    return enqueueRevise(sessionId, async () => {
+      try { return await reviseOnce(); } finally { tk.close(); }
+    }, input?.label || '改写');
 
     async function reviseOnce() {
+      /* 排队期间被取消了 —— 一个字都不发 */
+      if (tk.cancelled()) return { ok: false, cancelled: true };
       await ensureAttached(sessionId);
       if (!sessionClients.get(sessionId)) return { ok: false, error: '这条会话连不上 —— 点一下它让它连上再试' };
       const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
       if (stillBusy) return { ok: false, error: `等了 20 分钟这条会话还在忙（${stillBusy}）` };
       if (askWaiters.has(sessionId)) return { ok: false, error: '这条会话上已经有一次改写在等回复' };
+      /* 等它空下来的那段时间里被取消了 —— 同样不发 */
+      if (tk.cancelled()) return { ok: false, cancelled: true };
       /* 白名单而不是透传：这个值来自渲染进程，越界的写法落回默认那一档 */
-      const wantScope = input?.scope === 'whole' ? 'whole' : 'block';
+      const wantScope = input?.scope === 'whole' ? 'whole' : input?.scope === 'insert' ? 'insert' : 'block';
       const prompt = reviseInSessionPrompt({
         where, note, about: input?.about, scope: wantScope,
         full: typeof input?.full === 'string' ? input.full : undefined,
       });
       const started = Date.now();
       try {
+        tk.asking(true);
         const reply = await askOnce(
           sessionId, prompt,
           /* 位置写进显示文本 —— 回头翻会话要看得出这条是说哪一处的 */
           input?.label ? `【改写 · ${input.label}】${note}` : `【改写】${note}`,
-        );
+        ).finally(() => tk.asking(false));
+        if (tk.cancelled()) return { ok: false, cancelled: true };
         const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
         if (!usable.ok) {
           logger.warn('revise', `in-session ${sessionId}: ${usable.why}`);
@@ -9566,12 +9699,49 @@ app.whenReady().then(async () => {
           return { ok: false, cannot: out.cannot };
         }
         logger.info('revise', `in-session ${sessionId} scope=${wantScope}: ${out.text.length} chars in ${((Date.now() - started) / 1000).toFixed(1)}s`);
-        return { ok: true, text: out.text };
+        const apply = input?.apply;
+        if (apply && typeof apply.base === 'string' && typeof apply.path === 'string') {
+          const fullText = applyRevision(apply, out.text);
+          if (fullText === null) return { ok: false, error: '拼不回去（位置不对）—— 没写' };
+          const wrote = writeReviewFile(sessionId, apply.path, fullText, apply.base);
+          /*
+            盘上和渲染层手里那一份对不上（换行符、别的改动……）：主进程不写，把结果照老样子交回去，由渲染层按它手里那份拼、写 ——
+            和以前一样，只是少了"窗口不在也不丢"那层保险。不能因为这一层就让改写整个失败。
+          */
+          if (!wrote?.ok && wrote?.mismatch) return { ok: true, text: out.text, scope: wantScope };
+          if (!wrote?.ok) return { ok: false, error: wrote?.error || '写不进这个文件' };
+          markTicketDone(input?.ticket);
+          /* 窗口可能不在 —— 落盘这件事由主进程自己在会话里说一句 */
+          noteInSession(sessionId, `✅ 已按意见改了${input?.label || '这份文件'}（现在 ${fullText.length} 字）\n文件：${wrote.path || apply.path}\nKiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。`);
+          return { ok: true, text: out.text, scope: wantScope, written: true, fullText };
+        }
+        /* 回报实际走的那一档 —— 渲染端的「＋」靠它确认主进程认得 insert（旧主进程会把它当 block，回来的是改过的原文） */
+        return { ok: true, text: out.text, scope: wantScope };
       } catch (err: any) {
+        /* 我们自己停的那一轮：askOnce 会以"没有正常结束"拒掉 —— 那不是失败，是取消 */
+        if (tk.cancelled()) return { ok: false, cancelled: true };
         logger.warn('revise', `in-session ${sessionId} failed: ${err?.message || err}`);
         return { ok: false, error: String(err?.message || err) };
       }
     }
+  });
+
+  /**
+   * 取消侧栏 comment 提交的**那一次**改写 —— 见 `reviseTickets`。还没轮到 / 还在等会话空下来的：记一笔，
+   * 轮到时不发。已经发出去在等回复的：停**它自己那一轮**（那时这条会话上挂着的等待者就是它，不会误停你的对话）。
+   */
+  ipcMain.handle('review:cancel', async (_event, ticket: string) => {
+    const t = reviseTickets.get(String(ticket || ''));
+    if (!t) return { ok: false };
+    t.cancelled = true;
+    if (t.asking && askWaiters.has(t.sessionId)) {
+      const entry = sessionClients.get(t.sessionId);
+      if (entry?.busy && !entry.priming) {
+        logger.info('revise', `cancel ticket ${ticket}: stopping its own turn sessionId=${t.sessionId}`);
+        try { await entry.client.cancelPrompt(entry.cliSessionId); } catch { /* 管道可能已经断了 */ }
+      }
+    }
+    return { ok: true };
   });
 
   /* ───────────────── 侧栏文件预览：PDF / deck（`.pptx` 等先转成 PDF）─────────────────
@@ -9924,6 +10094,8 @@ app.whenReady().then(async () => {
    */
   ipcMain.handle('deck:revise-slide-text', async (_event, input: {
     sessionId: string; filePath: string; page: number; note: string;
+    /** 这一次改写的 ticket —— 取消按它认（见 `reviseTickets`）。 */
+    ticket?: string;
   }) => {
     const sid = String(input?.sessionId || '').trim();
     const note = String(input?.note || '').trim();
@@ -9933,12 +10105,15 @@ app.whenReady().then(async () => {
     if (!g.ok) return g;
     const { want, at: page } = g;
     if (!(await findPythonPptx())) return { ok: false, error: noPythonPptxWhy(process.platform) };
+    const tk = openTicket(typeof input?.ticket === 'string' ? input.ticket : undefined, sid);
     return enqueueRevise(sid, async () => {
+      if (tk.cancelled()) { tk.close(); return { ok: false, cancelled: true }; }
       await ensureAttached(sid);
-      if (!sessionClients.get(sid)) return { ok: false, error: '这条会话连不上 —— 点一下它让它连上再试' };
+      if (!sessionClients.get(sid)) { tk.close(); return { ok: false, error: '这条会话连不上 —— 点一下它让它连上再试' }; }
       const stillBusy = await waitIdle(sid, 20 * 60 * 1000);
-      if (stillBusy) return { ok: false, error: `等了 20 分钟这条会话还在忙（${stillBusy}）` };
-      if (askWaiters.has(sid)) return { ok: false, error: '这条会话上已经有一次改写在等回复' };
+      if (stillBusy) { tk.close(); return { ok: false, error: `等了 20 分钟这条会话还在忙（${stillBusy}）` }; }
+      if (askWaiters.has(sid)) { tk.close(); return { ok: false, error: '这条会话上已经有一次改写在等回复' }; }
+      if (tk.cancelled()) { tk.close(); return { ok: false, cancelled: true }; }
       try {
         /* 先把这一页现有的文字读出来 —— 模型要按地址回，就得先看见地址 */
         const cur = parseSlideRuns(await runPy(SLIDE_TEXT_SCRIPT, [want, String(page)]));
@@ -9950,7 +10125,11 @@ app.whenReady().then(async () => {
           ...(cur.page ? { pageW: cur.page.w, pageH: cur.page.h } : null),
         });
         const started = Date.now();
-        const reply = await askOnce(sid, prompt, `【改写 · ${path.basename(want)} 第 ${page} 页版面文字】${note}`);
+        tk.asking(true);
+        const reply = await askOnce(sid, prompt, `【改写 · ${path.basename(want)} 第 ${page} 页版面文字】${note}`)
+          .finally(() => tk.asking(false));
+        /* 我们自己停的那一轮 —— 回复不用，也不写 */
+        if (tk.cancelled()) return { ok: false, cancelled: true };
         const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
         if (!usable.ok) return { ok: false, error: usable.why };
         const got = parseSlideEdits(reply.text);
@@ -9979,8 +10158,11 @@ app.whenReady().then(async () => {
         }
         return { ok: true, changed };
       } catch (err: any) {
+        if (tk.cancelled()) return { ok: false, cancelled: true };
         logger.warn('deck', `slide text revise failed: ${err?.message || err}`);
         return { ok: false, error: err instanceof NoPythonPptx ? err.message : String(err?.message || err) };
+      } finally {
+        tk.close();
       }
     }, `${path.basename(want)} 第 ${page} 页版面文字`);
   });

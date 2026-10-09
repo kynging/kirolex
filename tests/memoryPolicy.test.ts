@@ -1,5 +1,7 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert';
+import * as fs from 'node:fs';
+import * as path from 'node:path';
 import {
   MEMORY_WARN_BYTES,
   memoryWarnings,
@@ -14,8 +16,20 @@ describe('三层各有自己的阈值，因为每字节的代价不同', () => {
     assert.ok(MEMORY_WARN_BYTES.global < MEMORY_WARN_BYTES.project);
   });
 
-  test('会话层的阈值最低于全局 —— 它本来就有 MAX_CHARS=1200 的设计上限，超出即异常', () => {
-    assert.ok(MEMORY_WARN_BYTES.session < MEMORY_WARN_BYTES.global);
+  test('数值：全局 1 KB、项目 16 KB、会话 10 KB（「把会话记忆提示的阈值设置为 10KB」「全局记忆的阈值……就 1KB」）', () => {
+    assert.deepEqual(MEMORY_WARN_BYTES, { global: 1024, project: 16 * 1024, session: 10 * 1024 });
+    /* 全局仍然是三层里最严的 —— 它注入进每一个会话 */
+    assert.ok(MEMORY_WARN_BYTES.global < MEMORY_WARN_BYTES.session && MEMORY_WARN_BYTES.global < MEMORY_WARN_BYTES.project);
+  });
+
+  test('横幅上有「编辑」，直接打开那一层、那个窗格的会话', () => {
+    const C = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+    const D = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/MemoryDialog.tsx'), 'utf8');
+    assert.ok(C.includes("<button className=\"memory-warn-btn edit\" onClick={() => onOpenMemory(warning.scope as 'global' | 'project' | 'session')}"), '编辑用自己的颜色，不和查看一样');
+    assert.ok(A.includes('setMemoryTarget(scope ? { sessionId: sid || undefined, projectId: session?.projectId, scope } : null);'));
+    assert.ok(A.includes('initialTab={memoryTarget?.scope}'));
+    assert.ok(D.includes("const defaultTab = (): Tab => initialTab || (projectId ? 'project' : 'global');"));
   });
 
   test('正好等于阈值不报警，超出一个字节才报警', () => {

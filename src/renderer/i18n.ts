@@ -311,6 +311,7 @@ const ZH: Record<string, string> = {
   'Helper model (titles and prompt suggestions; does not affect the chat)': '辅助模型（生成标题与提示词建议，不影响对话本身）',
   'No fallback': '不使用备用',
   'Resend an unanswered prompt after a restart': '重启后自动重发未完成的提问',
+  'Restore the window layout after a restart': '重启后恢复界面状态（侧栏、折叠、comment 标记）',
   'Silence before a turn counts as wedged (seconds, 0 = never)': '静默多久判定卡死（秒，0 = 不中断）',
 
   // ── 聊天区主体（ChatArea）───────────────────────────────────────────────

@@ -4,6 +4,8 @@ import { useT } from '../hooks/useLang';
 interface MemoryDialogProps {
   projectId?: string; // current session's project (undefined = unassigned)
   sessionId?: string; // current session (undefined = none open)
+  /** 打开就落在哪一层 —— 记忆太大横幅的「编辑」用它直接打开那一层（不给就按原来：有项目开项目层，否则全局） */
+  initialTab?: 'global' | 'project' | 'session';
   onClose: () => void;
 }
 
@@ -11,9 +13,10 @@ type Scope = 'global' | 'project' | 'session';
 /** The editable scopes plus a read-only view of what the last send really carried. */
 type Tab = Scope | 'snapshot';
 
-export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId, onClose }) => {
+export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId, initialTab, onClose }) => {
   const t = useT();
-  const [tab, setTab] = useState<Tab>(() => (projectId ? 'project' : 'global'));
+  const defaultTab = (): Tab => initialTab || (projectId ? 'project' : 'global');
+  const [tab, setTab] = useState<Tab>(defaultTab);
   const [text, setText] = useState<Record<Scope, string>>({ global: '', project: '', session: '' });
   const [paths, setPaths] = useState<Record<Scope, string | null>>({ global: '', project: null, session: null });
   const [loading, setLoading] = useState(true);
@@ -30,8 +33,8 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
   // The selected chat determines the default scope each time the dialog opens
   // or the active session changes while it is open.
   useEffect(() => {
-    setTab(projectId ? 'project' : 'global');
-  }, [projectId, sessionId]);
+    setTab(defaultTab());
+  }, [projectId, sessionId, initialTab]);
 
   useEffect(() => {
     let alive = true;

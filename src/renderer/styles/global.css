@@ -99,6 +99,24 @@ button, input, select, textarea {
   height: calc(100% - var(--win-titlebar-height));
   margin-top: var(--win-titlebar-height);
 }
+/* 无边框窗口自己画的三个按钮（系统的藏不掉，所以自己画 —— 见主进程 createWindow） */
+.win-titlebar-controls { margin-left: auto; display: flex; height: 100%; -webkit-app-region: no-drag; }
+.win-ctl {
+  width: 46px; height: 100%; border: none; background: transparent; color: var(--text-secondary);
+  display: flex; align-items: center; justify-content: center; cursor: default;
+}
+.win-ctl:hover { background: var(--bg-hover); color: var(--text-primary); }
+.win-ctl-close:hover { background: #c42b1c; color: #fff; }
+/* 最大化：标题条不占高度、收在屏幕外；碰到顶边那条感应带才滑下来，盖在内容上面 */
+.app-layout.no-toolbar.win.maxed { height: 100%; margin-top: 0; }
+.win-titlebar.auto-hide {
+  transform: translateY(-100%);
+  transition: transform 0.15s ease;
+  box-shadow: 0 2px 10px rgba(0, 0, 0, 0.45);
+  z-index: 1002;
+}
+.win-titlebar.auto-hide.shown { transform: translateY(0); }
+.win-titlebar-hotzone { position: fixed; top: 0; left: 0; right: 0; height: 4px; z-index: 1003; }
 
 /* Drag region */
 .drag-region {
@@ -974,37 +992,41 @@ button, input, select, textarea {
   opacity: 0.4;
 }
 
-.sidebar-collapse-btn {
+/*
+  **两侧的折叠 / 展开按钮** ——「左侧和右侧应该都可以折叠，这个需要给两侧弄更大的折叠/展开按钮，不然总是很难找」。
+  原来左边那个 10×32、7px 的箭头，还是 hover 到那条 8px 的缝上才显形 —— 几乎找不到。现在两侧同一个尺寸
+  （宽度照旧 10px —— 「你把按钮变得太宽了，保持原先的宽度」—— 长度 56px），一直半透明地在那儿，hover 变实。
+*/
+.side-collapse-btn {
   position: absolute;
   top: 50%;
-  left: -5px;
   transform: translateY(-50%);
   width: 10px;
-  height: 32px;
+  height: 56px;
   background: var(--bg-tertiary);
   border: 1px solid var(--border);
-  border-radius: 0 3px 3px 0;
-  color: var(--text-muted);
-  font-size: 7px;
+  color: var(--text-secondary);
+  font-size: 8px;
+  line-height: 1;
   cursor: pointer;
   display: flex;
   align-items: center;
   justify-content: center;
   z-index: 11;
-  opacity: 0;
-  transition: opacity 0.2s;
+  opacity: .7;
+  transition: opacity 0.15s, background 0.15s, border-color 0.15s;
   padding: 0;
 }
-
-.sidebar-resize-area:hover .sidebar-collapse-btn {
+.side-collapse-btn:hover {
   opacity: 1;
-}
-
-.sidebar-collapse-btn:hover {
   background: var(--bg-hover);
   color: var(--text-primary);
   border-color: var(--accent);
 }
+.sidebar-collapse-btn { left: 0; border-radius: 0 6px 6px 0; }
+/* 右侧：零宽的条，按钮往左伸出去贴着预览栏的左边缘（藏起来时贴着窗口右边缘） */
+.file-collapse-area { position: relative; width: 0; flex-shrink: 0; z-index: 11; }
+.file-collapse-btn { right: 0; border-radius: 6px 0 0 6px; }
 
 .sidebar-settings-btn {
   margin-left: auto;
@@ -3326,6 +3348,9 @@ button, input, select, textarea {
 .memory-warn-btn:disabled { opacity: .5; cursor: default; }
 .memory-warn-btn.ghost { background: transparent; border-color: var(--border); color: var(--text-muted); }
 .memory-warn-btn.ghost:hover { color: var(--text-secondary); }
+/* 「编辑」和「查看」分开：压缩 = 琥珀（会动文件）、编辑 = 强调色（直接打开那一层去改）、查看 = 灰（只是打开看） */
+.memory-warn-btn.edit { background: var(--accent-soft); border-color: var(--accent); color: var(--accent); }
+.memory-warn-btn.edit:hover:not(:disabled) { background: var(--accent); color: #fff; }
 .archived-unarchive-btn {
   background: var(--accent);
   color: #fff;
@@ -4824,7 +4849,8 @@ button, input, select, textarea {
 .workspace-viewer-path {
   margin-bottom: 6px;
   overflow: hidden;
-  color: var(--text-muted);
+  /* 「这个路径应该换个颜色现在根本看不清」—— 原来是最淡那一档灰；换成一个清楚、又不和正文抢的浅蓝 */
+  color: var(--path-color, #7fb2e5);
   font-family: 'SF Mono', 'JetBrains Mono', monospace;
   font-size: 10px;
   text-overflow: ellipsis;
@@ -8349,19 +8375,33 @@ button, input, select, textarea {
   comment 模式那个开关 —— 一个按钮，不是两个并排的模式（两个并排会让人以为是两种视图）。
   关着淡、开着亮：它自己就说明了当前在哪个态。
 */
+/*
+  **一直浮在上方** ——「最上方的 comment 开关应该一直浮在上方可以在文章任意地方点」。原来跟着正文滚走，
+  读到文章中间想开 / 关 comment 得先滚回顶上。sticky 在预览栏的滚动容器里钉住；底色是实的 ——
+  半透明的话滚过去的正文会从它底下透出来。
+*/
+/*
+  「浮动的时候让它再往上一点紧贴上沿，它所占据的那一行不要显示文字」：钉住的是**整条**（不是按钮自己），
+  吃掉滚动容器 10px 的上内边距贴到上沿，左右也吃掉 14px 的内边距 —— 这一行整条是实底，滚过去的正文从它底下走。
+*/
+.rv-toggle-bar {
+  position: sticky; top: -10px; z-index: 6;
+  margin: -10px -14px 6px; padding: 4px 14px;
+  background: var(--bg-secondary); border-bottom: 1px solid var(--border);
+}
 .rv-review-toggle {
-  align-self: flex-start; font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 5px; margin-bottom: 6px;
-  cursor: pointer; border: 1px solid var(--border); background: transparent; color: var(--text-tertiary);
+  align-self: flex-start; font: inherit; font-size: 10px; padding: 3px 9px; border-radius: 5px;
+  cursor: pointer; border: 1px solid var(--border); background: var(--bg-secondary); color: var(--text-secondary);
 }
 .rv-review-toggle:hover { border-color: var(--accent); color: var(--accent); }
-.rv-review-toggle.on { border-color: var(--accent); color: var(--accent); background: rgba(124,111,224,.12); }
+.rv-review-toggle.on { border-color: var(--accent); color: var(--accent); background: var(--bg-secondary); box-shadow: inset 0 0 0 999px rgba(124,111,224,.14); }
 /* 按行之后每块很矮，块间距收紧 —— 段落那种 14px 会把一份文档拉得到处是空隙 */
 .rv-review-blocks { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 2px; }
 /*
   `position: relative` + 右边给 💬(right:0) 和 ✕(right:22) 两个 absolute 按钮让位。
   `gap: 0` 是刻意的：块内只有"正文"和"那个不占高度的工具包装"，留 gap 的话**每一行都会多一截**。
 */
-.rv-review-block { position: relative; display: flex; flex-direction: column; gap: 0; padding-right: 46px; }
+.rv-review-block { position: relative; display: flex; flex-direction: column; gap: 0; padding-right: 90px; }
 .rv-review-md { font-size: var(--chat-font-size, 12px); line-height: 1.75; }
 .rv-review-md > :first-child { margin-top: 0; }
 .rv-review-md > :last-child { margin-bottom: 0; }
@@ -8371,7 +8411,10 @@ button, input, select, textarea {
 }
 /* 这个包装不占任何高度 —— 按钮贴着 `.rv-review-block` 定位，它只负责把展开的框放进文档流 */
 .rv-review-tools { position: static; }
+.rv-page-tools .rv-review-tools { display: flex; align-items: center; gap: 6px; }
 .rv-review .rt-note-btn,
+.rv-review .rv-insert-btn,
+.rv-review .rv-edit-btn,
 .rv-review .rt-block-drop {
   position: absolute; top: 0; width: 20px; height: 20px; padding: 0;
   font: inherit; font-size: 11px; line-height: 1; cursor: pointer; border-radius: 4px;
@@ -8380,6 +8423,30 @@ button, input, select, textarea {
 }
 .rv-review .rt-note-btn { right: 0; }
 .rv-review .rt-block-drop { right: 22px; font-size: 10px; }
+/* ＋ 在这一块后面加新内容 ——「我要能在段落后加新的」 */
+.rv-review .rv-insert-btn { right: 44px; font-size: 12px; }
+/* ✎ 直接改这一块（不经过模型） */
+.rv-review .rv-edit-btn { right: 66px; font-size: 11px; }
+.rv-review-block:hover .rv-edit-btn { opacity: .9; }
+.rv-review .rv-edit-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
+.rv-review .rv-edit-btn.has-note { opacity: 1; color: var(--accent); border-color: var(--accent); }
+/*
+  **改的时候和没改的时候看起来一样** ——「能让修改和没修改时看起来字号什么的都一样吗」。✎ 那个框原来是 11px 等宽字，
+  正文是会话字号、1.75 倍行距：一点开整块就缩小、换字体、行距变密。现在框里的字体、字号、行距都和那一块正文一样，
+  框本身只剩一道虚线边（看得出在改），内边距收到几乎为零 —— 字不挪位置。
+*/
+.rv-review .rv-edit-slot .rt-note {
+  font-family: inherit; font-size: var(--chat-font-size, 12px); line-height: 1.75;
+  padding: 0 4px; margin-top: 0; margin-left: -5px; width: calc(100% + 5px);
+  border: 1px dashed var(--accent); border-radius: 4px; background: rgba(124, 111, 224, .05);
+}
+/* 没有这一条就是浏览器默认那圈白色粗框 —— 和正文差得最远的就是它 */
+.rv-review .rv-edit-slot .rt-note:focus { outline: none; border-style: solid; }
+.rv-review-block:hover .rv-insert-btn { opacity: .9; }
+.rv-review .rv-insert-btn:hover { opacity: 1; border-color: var(--accent); color: var(--accent); background: var(--bg-hover); }
+.rv-review .rv-insert-btn:focus-visible { opacity: 1; }
+/* ＋ 的框用强调色的左边线，和 💬 的框一眼分得开：一个是改这里，一个是往这里后面加 */
+.rv-insert-slot .rt-note-box { border-left: 2px solid var(--accent); padding-left: 6px; }
 /*
   **鼠标停在哪一行，那一行就亮起来**，按钮也只在这一行 hover 时显形 ——「这个 comment 界面根本看不出来
   哪个按钮对应的是哪一行」：一行只有 21px 高，一整列淡图标每个都"像是属于旁边那行"。
@@ -8463,15 +8530,26 @@ button, input, select, textarea {
 .rv-review .rt-hist-btn:hover { opacity: 1; border-color: var(--border); background: var(--bg-hover); color: var(--accent); }
 .rv-review .rt-hist-del:hover { border-color: var(--error); color: var(--error); }
 
-/* 最下面：「其他意见」一个框 + 提交 */
-.rv-review-adds { display: flex; flex-direction: column; gap: 6px; margin-top: 8px; padding-top: 8px; border-top: 1px dashed var(--border); }
-.rv-review .rv-review-adds-input { min-height: 0; }
-.rv-review-submit {
-  display: flex; flex-direction: column; gap: 8px; align-items: flex-start;
-  padding: 10px 0 6px; border-top: 1px dashed var(--border); position: sticky; bottom: 0;
-  background: var(--bg-primary);
+/* 框 / 删除确认正对着的那一段：强调色左边线一直亮着（单独一行也亮）—— 看得见评的是哪一段 */
+.rv-review-block.targeted { box-shadow: inset 2px 0 0 var(--accent); }
+/* 框顶上那一行：它管的是哪几行 */
+.rv-box-target { font-size: 10px; line-height: 1.6; color: var(--accent); margin-top: 4px; }
+/* 排着队的那几条：排队中淡一些，进行中用原来那个绿色 */
+.rv-review .rt-block-lock.queued { color: var(--text-tertiary); }
+/* ＋ 标过内容的那一段：＋ 常显、强调色（和 💬 的 has-note 一样）*/
+.rv-review .rv-insert-btn.has-note { opacity: 1; color: var(--accent); border-color: var(--accent); }
+/* 最下面提交那一行：左边是标了几处，右边是按钮 */
+.rv-review .rv-review-whole-actions { justify-content: space-between; }
+.rv-review-count { font-size: 10px; color: var(--text-tertiary); }
+.rv-note-tools-row { flex-direction: column; align-items: stretch; }
+/* 最下面：整篇的意见 + 提交 */
+.rv-review-whole { display: flex; flex-direction: column; gap: 4px; margin-top: 10px; padding-top: 8px; border-top: 1px dashed var(--border); }
+.rv-review .rv-review-whole-input { min-height: 0; }
+/* 最下面一行：发给会话之后的确认 / 备份没成的警告（没有提交区了 —— 每个动作都当场生效） */
+.rv-review-status {
+  display: flex; flex-direction: column; gap: 4px; padding: 8px 0 4px;
+  border-top: 1px dashed var(--border); position: sticky; bottom: 0; background: var(--bg-primary);
 }
-.rv-review-submit .rv-gate-pass:disabled { opacity: .4; cursor: default; filter: none; }
 .rv-review-sent { margin: 0; font-size: 10px; line-height: 1.6; color: var(--accent); }
 .rv-review-warn { margin: 0; font-size: 10px; line-height: 1.6; color: var(--error); }
 
@@ -8595,6 +8673,7 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
    .rv-review .rt-note-btn 钉成了贴着那一行右上角的 absolute；在 deck 那侧它会跑到幻灯片的右上角去。
 */
 .rv-review .rv-page-tools .rt-note-btn,
+.rv-review .rv-page-tools .rv-insert-btn,
 .rv-review .rv-page-tools .rt-block-drop,
 .rv-review .rt-block-drop.rv-drop-page { position: static; opacity: .8; }
 .rv-review .rt-block-drop.rv-drop-page { width: auto; padding: 0 7px; white-space: nowrap; }
@@ -8613,3 +8692,36 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   font-size: 11px; padding: 3px 7px; border-radius: 4px;
   background: var(--bg-tertiary); border: 1px solid var(--border); user-select: all;
 }
+
+/* 最新标的那一段下面那一行：标了几处 + 「✓ 确认」（提交全部）。不钉在底部 —— 跟着你刚改的地方走 */
+.rv-mark-submit { display: flex; align-items: center; justify-content: flex-end; gap: 8px; margin-top: 4px; }
+
+/*
+  comment 模式左边的行号槽 —— 和文件里的行号同一个数（框顶、排队那一行、会话里说的「第 N 行」都是它）。
+  「我还是看不到左侧的行号」：原来 10px、最淡的那一档灰、再打七折透明度，而且贴着块的顶边 —— 渲染出来了，
+  但几乎看不见。现在用正文那一档的次要色、一道分隔线把它和正文隔开，行高对齐正文第一行。
+*/
+/*
+  「行号更靠近边缘」「离右侧正文更远」「数字加粗并用一个不同的颜色」「你可以把整个右边正文都往左挪」：
+  整个 comment 视图吃掉预览栏左边那 14px 内边距（行号贴着栏的左边缘 2px），行号粗体琥珀色、左对齐；正文从 32px 起
+  （「文字的布局位置仍然可以往左挪」）。
+*/
+.workspace-file-modal-body > .rv-review:has(.rv-line-no) { margin-left: -12px; }
+.rv-review-blocks:has(.rv-line-no) .rv-review-block { padding-left: calc(var(--chat-font-size, 12px) * 2.2 + 6px); }
+.rv-line-no {
+  position: absolute; left: 0; top: 0; width: calc(var(--chat-font-size, 12px) * 2.2); padding-left: 2px; box-sizing: border-box;
+  text-align: left; font-family: var(--mono-font, ui-monospace, monospace);
+  /* 跟着正文字号走 —— 字号调大时行号不该还是那么小一个 */
+  font-size: max(10px, calc(var(--chat-font-size, 12px) * .88)); font-weight: 700; letter-spacing: -.02em;
+  /* 自己的行高固定；竖直位置由 ReviewPane 量第一行算出来（见 `listRef` 那段），这里只给一个量出来之前的初值 */
+  line-height: 1.2;
+  color: var(--line-no-color, #e0a458); user-select: none; white-space: nowrap; overflow: hidden;
+}
+.rv-review-block:hover .rv-line-no,
+.rv-review-block.targeted .rv-line-no { color: var(--accent); }
+
+
+/* ✎ 直接改过、还没提交的那一块：显示改过的那份，左边一道强调色，下面一行「已直接改（未提交）」 */
+/* 改过还没提交：那道强调色竖线画在正文**外面**（不占内边距），字和没改时在同一个位置 */
+.rv-review .rv-edited { box-shadow: -6px 0 0 -4px var(--accent); }
+.rv-edited-tag { font-size: 10px; color: var(--accent); margin-right: 4px; }

@@ -78,15 +78,15 @@ describe('接线', () => {
 
   test('接到备注那个框的「确认」上，而且用重抽的那份刷新界面', () => {
     assert.match(PRE, /deckWriteNote:/);
-    assert.match(RV, /onApply=\{live \? \(instruction\) => applyNoteOne\(page, instruction\) : undefined\}/);
+    assert.ok(RV.includes('if (live) queueNote(page, t);'));
     assert.match(RV, /window\.kiroApi\.deckWriteNote\?\.\(sessionId, path, page, res\.text\)/);
-    assert.match(RV, /if \(Array\.isArray\(wrote\.notes\)\) setNotes\(wrote\.notes\);/);
+    assert.ok(RV.includes('if (Array.isArray(wrote.notes)) livePane().setNotes(wrote.notes);'));
   });
 
   test('**PDF 不用重转** —— 备注不在 PDF 里', () => {
     /* `--convert-to pdf` 导出的是幻灯片本体，不含备注；改讲稿不该让人等一次 LibreOffice */
     assert.match(RV, /PDF 不用重转/);
-    assert.doesNotMatch(RV.slice(RV.indexOf('const applyNoteOne'), RV.indexOf('const applyNoteOne') + 2200), /fetchDeck|previewDeck/);
+    assert.doesNotMatch(RV.slice(RV.indexOf('const queueNote'), RV.indexOf('const queueNote') + 2200), /fetchDeck|previewDeck/);
   });
 });
 

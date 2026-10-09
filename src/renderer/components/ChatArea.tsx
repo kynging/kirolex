@@ -1,4 +1,5 @@
 import { createPortal } from 'react-dom';
+import { useReviewQueue } from '../reviewQueue';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
 import { KiroConfigPanel, type KiroConfigCategory } from './KiroConfigPanel';
@@ -1267,6 +1268,38 @@ const UserGroupItem = memo<{
 });
 
 // Isolated input component: does NOT receive `messages` prop, so it never re-renders due to streaming chunks. This is the primary fix for input lag.
+/**
+ * **侧栏 comment 提交之后排着的改写** —— 摆在这条会话自己的排队消息旁边，每条一个取消。
+ * 执行不走这里（见 `reviewQueue.ts`：那些改写的回复要由 KiroLex 接住拼回文件），这里只是看得见、取消得了。
+ */
+const ReviewQueueStack: React.FC<{ sessionId: string | null }> = ({ sessionId }) => {
+  const items = useReviewQueue(sessionId);
+  if (!items.length) return null;
+  return (
+    <div className="queue-row">
+      <div className="queue-stack review-queue-stack">
+        <div className="queue-stack-header">
+          <span>侧栏 comment 改写</span>
+          <span>{items.length}</span>
+        </div>
+        {items.map((item, index) => (
+          <div key={item.id} className="queue-card">
+            <span className="queue-card-order">{index + 1}</span>
+            <div className="queue-card-body">
+              <span className="queue-card-text" title={`${item.file} · ${item.label}`}>
+                {item.state === 'running' ? '⏳ ' : ''}{item.file} · {item.label}{item.state === 'running' ? '（进行中）' : '（排队中）'}
+              </span>
+            </div>
+            <div className="queue-card-actions">
+              <button onClick={() => item.cancel()} title="取消这一条改写（侧栏那条标记会放回去）">✕</button>
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+};
+
 /** Queued follow-ups panel. Rendered as its own in-flow row between the message
  *  list and the composer (NOT an absolute overlay) so it never covers the chat
  *  or the input box -- the message list shrinks to give the queue its own space. */
@@ -2367,7 +2400,8 @@ interface ChatAreaProps {
    *  是往同一条会话发消息，同时发两条只会互相打断。 */
   compactingMemoryScope: string | null;
   onCompactMemory: (scope: MemoryScope) => void;
-  onOpenMemory: () => void;
+  /** 打开记忆编辑器；给了 scope 就直接落在那一层（记忆太大横幅的「编辑」） */
+  onOpenMemory: (scope?: 'global' | 'project' | 'session') => void;
   usage: { contextPercent: number; credits: number; turnMs?: number } | null;
   plan: PlanEntry[];
   autoFoldThinking: boolean;
@@ -3557,7 +3591,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             >
               {compactingMemoryScope?.startsWith(`${warning.scope}:`) ? t('Compacting…') : t('Compact')}
             </button>
-            <button className="memory-warn-btn ghost" onClick={onOpenMemory} title={t('Open the memory editor and clean it up yourself')}>
+            {/* 「编辑」直接打开**这一层**（会话 / 项目 / 全局），而且是这个窗格的会话 —— 分屏时不一定是"当前"那条 */}
+            <button className="memory-warn-btn edit" onClick={() => onOpenMemory(warning.scope as 'global' | 'project' | 'session')} title={`打开${warning.label}，自己删改`}>
+              编辑
+            </button>
+            <button className="memory-warn-btn ghost" onClick={() => onOpenMemory()} title={t('Open the memory editor and clean it up yourself')}>
               {t('View')}
             </button>
           </div>
@@ -3797,6 +3835,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         )}
       </div>
 
+      {!readOnly && <ReviewQueueStack sessionId={currentSessionId} />}
       {!readOnly && (
         <QueueStack
           queuedMessages={queuedMessages}

@@ -216,6 +216,59 @@ npm_i '@openai/codex' codex
 npm_i '@agentclientprotocol/claude-agent-acp' claude-agent-acp
 npm_i '@agentclientprotocol/codex-acp' codex-acp
 
+# ---------------------------------------------------------------- 默认走 Amazon Bedrock
+#
+# 「脚本应该默认将模型设置为 bedrock 的 global endpoint。保留让客户自己配置域名和 key 或者用官方订阅登录的选项」。
+# 只给**还没配过**的工具写默认值：已经配了网关 / Bedrock、或者官方账号登录过的，一律不碰（KiroLex 的「🔑 登录」页
+# 随时可以改成 Bedrock / 手动填写 / 官方登录）。不写任何密钥 —— 用这台机器的 AWS 凭证链（EC2 实例角色、~/.aws、SSO）。
+# 模型 ID 和 aiLogin.ts 的 BEDROCK_DEFAULTS 一致：
+#   · Claude Code：global 推理配置文件，region 用这台机器自己的；
+#   · Codex：Bedrock 的 Responses 端点上 OpenAI 模型目前只在美东，所以固定 us-east-1（它也不认 global 前缀）。
+step "默认模型：Amazon Bedrock"
+IMDS_T=$(curl -s -m 3 -X PUT http://169.254.169.254/latest/api/token -H "X-aws-ec2-metadata-token-ttl-seconds: 60" 2>/dev/null)
+AWS_R=$(curl -s -m 3 -H "X-aws-ec2-metadata-token: $IMDS_T" http://169.254.169.254/latest/meta-data/placement/region 2>/dev/null)
+[ -z "$AWS_R" ] && AWS_R=$(aws configure get region 2>/dev/null)
+[ -z "$AWS_R" ] && AWS_R=us-east-1
+
+if have claude; then
+  if [ -f "$HOME/.claude/.credentials.json" ] || grep -qE '"(ANTHROPIC_BASE_URL|ANTHROPIC_API_KEY|ANTHROPIC_AUTH_TOKEN|CLAUDE_CODE_USE_BEDROCK)"' "$HOME/.claude/settings.json" 2>/dev/null; then
+    say "→ Claude Code 已经配过（网关 / Bedrock / 官方登录），不动"
+  else
+    mkdir -p "$HOME/.claude"
+    KX_R="$AWS_R" node -e '
+      const fs = require("fs"), f = process.env.HOME + "/.claude/settings.json";
+      let j = {}; try { j = JSON.parse(fs.readFileSync(f, "utf8")); } catch {}
+      j.env = Object.assign({}, j.env, {
+        CLAUDE_CODE_USE_BEDROCK: "1", AWS_REGION: process.env.KX_R, ANTHROPIC_BEDROCK_REGION_PREFIX: "global",
+        ANTHROPIC_MODEL: "global.anthropic.claude-opus-5-5",
+        ANTHROPIC_DEFAULT_OPUS_MODEL: "global.anthropic.claude-opus-5-5",
+        ANTHROPIC_DEFAULT_SONNET_MODEL: "global.anthropic.claude-sonnet-5-5",
+        ANTHROPIC_DEFAULT_HAIKU_MODEL: "global.anthropic.claude-haiku-4-5-20251001-v1:0" });
+      fs.writeFileSync(f, JSON.stringify(j, null, 2) + "\n", { mode: 0o600 });' \
+      && say "→ Claude Code 默认走 Amazon Bedrock（global 推理配置文件，region=$AWS_R）"
+  fi
+fi
+
+if have codex; then
+  if [ -f "$HOME/.codex/auth.json" ] || grep -qE '^\s*model_provider\s*=' "$HOME/.codex/config.toml" 2>/dev/null; then
+    say "→ Codex 已经配过（provider / 官方登录），不动"
+  else
+    mkdir -p "$HOME/.codex"
+    { [ -f "$HOME/.codex/config.toml" ] && cat "$HOME/.codex/config.toml"; } > "$HOME/.codex/config.toml.kx-rest" 2>/dev/null || true
+    { printf 'model = "openai.gpt-6.1-sol"\nmodel_provider = "amazon-bedrock"\n'
+      cat "$HOME/.codex/config.toml.kx-rest"
+      printf '\n[model_providers.amazon-bedrock.aws]\nregion = "us-east-1"\n'; } > "$HOME/.codex/config.toml"
+    rm -f "$HOME/.codex/config.toml.kx-rest"
+    chmod 600 "$HOME/.codex/config.toml"
+    say "→ Codex 默认走 Amazon Bedrock（openai.gpt-6.1-sol @ us-east-1）"
+  fi
+  # Codex 的沙箱要 bubblewrap；没有的话它用自带的那份并每次警告一句。能免密 sudo 就顺手装上
+  if ! have bwrap && sudo -n true 2>/dev/null; then
+    { sudo -n dnf install -y bubblewrap || sudo -n yum install -y bubblewrap || sudo -n apt-get install -y bubblewrap; } >/dev/null 2>&1 \
+      && say "→ bubblewrap 装上了（Codex 沙箱）"
+  fi
+fi
+
 # ---------------------------------------------------------------- kiro 登录
 #
 # 这台机器没有浏览器，所以用 `--use-device-flow`：它打印一个 URL + 一串 code，你在**本机**
@@ -351,7 +404,8 @@ fi
 say ""
 if [ "$rc" -eq 0 ]; then
   say "✓ 这台机器可以跑远程会话了。文件仍然在你本地 —— 远端通过隧道读写你这台机器上的文件（不复制）。"
-  say "  Claude Code / Codex 的远程会话还要在这台机器上登录过它们（\`claude\` 跑一次登录、\`codex login\`）。"
+  say "  Claude Code / Codex 默认走 Amazon Bedrock（用这台机器的 AWS 凭证，需要 Bedrock 调用权限）；"
+  say "  想用自己的域名 + key 或官方账号登录，在 KiroLex 那条会话左下角「🔑 登录」里改。"
 else
   say "✗ 还差上面标 ✗ / 缺 / 没登录 的那几项。"
 fi

@@ -463,7 +463,7 @@ describe('侧栏那个 🌐 徽标真的到得了界面', () => {
     /* 「点切换了之后没有立刻打上 tag」：真 tag 要等远端探完、执行器起完才来 */
     const at = SB.indexOf('const onSetTarget = async');
     const body = SB.slice(at, at + 900);
-    assert.ok(body.indexOf('setPendingTarget(sessionId, remoteId ?') < body.indexOf('api.setRemoteTarget(sessionId, remoteId)'), '先挂 tag 再等 IPC');
+    assert.ok(body.indexOf('setPendingTarget(sessionId, remoteId ?') < body.indexOf('api.setRemoteTarget(sessionId, remoteId, undefined, { projectId })'), '先挂 tag 再等 IPC');
     assert.match(body, /\.finally\(\(\) => setPendingTarget\(sessionId, undefined\)\)/);
     assert.match(SB, /⏳ \{pendingTarget \|\| '本地'\}/);
   });
@@ -1356,7 +1356,7 @@ describe('工作目录在会话界面上', () => {
   test('切机器只有一段机械，目录跟着切远端那一步走', () => {
     assert.match(M, /const applySessionTarget = async \(/);
     assert.equal((M.match(/const applySessionTarget = async \(/g) || []).length, 1);
-    assert.match(M, /return applySessionTarget\(sessionId, target, localDir\);/);
+    assert.match(M, /return applySessionTarget\(sessionId, target, localDir, hint\);/);
   });
 });
 

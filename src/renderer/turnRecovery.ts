@@ -124,3 +124,15 @@ export function adoptedMessages<T extends Msg>(msgs: T[], peek: TurnPeek): T[] {
   } as unknown as T;
   return [...msgs, seeded];
 }
+
+/**
+ * 这一轮是不是侧栏 review 发的**改写**（`askOnce` 的显示文本都以「【改写」开头）—— PURE。
+ *
+ * 「这个功能中断的话不要让 kirolex 做回填」：改写那一轮被取消 / 卡死 / 窗口重载打断之后，它的那条
+ * 用户消息就成了"没答完的提问"，自动重发和自动续写都会把它当普通问题再发一遍 —— 可那一轮的回复
+ * 本该由 KiroLex 接住、拼回文件，重发出去的那轮没有人等，模型只能自己动手改文件（正是改写这条路要避免的
+ * 两个写者）。所以这种轮次中断了就停在那儿：要改，回到侧栏再按一次「✓ 确认」。
+ */
+export function isReviseRequest(text: string | null | undefined): boolean {
+  return /^【改写/.test(String(text ?? '').trim());
+}

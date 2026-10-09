@@ -76,7 +76,8 @@ export function reviseInSessionPrompt(input: {
   note: string;
   /** 这份东西是什么（文件路径 / 文件名），可空。 */
   about?: string;
-  scope?: 'block' | 'whole';
+  /** `insert`：在 `where` 那一段**后面**新加内容 —— 只回新加的那部分，原文一个字都不回。 */
+  scope?: 'block' | 'whole' | 'insert';
   /**
    * **现在的完整正文**（只有 `whole` 档用）——「有一些我删掉的内容怎么变成我增加的内容了？」
    *
@@ -87,6 +88,32 @@ export function reviseInSessionPrompt(input: {
   full?: string;
 }): string {
   const about = String(input.about || '').trim();
+  /*
+    **在一段后面加东西** ——「我要能在段落后加新的」。和改一段分开一档：让它"改这一段、顺便在后面加"
+    的话，它回来的是原文 + 新内容，而原文那部分它常常顺手润色 —— 你没评的那段被改了。只要新内容，
+    由 KiroLex 插到那一段后面，原文就一个字节都不经过模型。
+  */
+  if (input.scope === 'insert') {
+    return [
+      `在${about ? `「${about}」` : '那份文件'}里下面这一段的**后面**新加内容。只输出要新加的部分。`,
+      '',
+      '新内容要接在这一段后面（原文片段，只是给你看位置，不要改它、也不要把它重复输出）：',
+      '---',
+      String(input.where ?? '').trim(),
+      '---',
+      '',
+      '要加什么：',
+      String(input.note ?? '').trim(),
+      '',
+      '要求：',
+      '· **只输出新加的那部分** —— 上面那段原文不要再写一遍，我会把你的输出插在它后面；',
+      '· 不要用 ``` 围栏包起来，也不要写"好的""以下是新增内容"这类开场（那些话会被原样写进文件）；',
+      '· 和上下文用同样的标记形式（前面是 markdown 列表就接着写列表项，是正文段落就写段落）；',
+      '· **不要用工具去改文件**（`fs_write` 之类）—— 落盘由 KiroLex 统一做；',
+      '· 如果这条要求需要你没有的信息（要查外部系统、要问人），不要编：什么都不输出，',
+      '  只单独一行写 `CANNOT-REVISE-LOCALLY: <一句话说缺什么>`。',
+    ].join('\n');
+  }
   const whole = input.scope === 'whole';
   const head = whole
     ? `下面这条意见改不了单独一段，所以按它改**整份**${about ? `「${about}」` : '文件'}，然后只输出改完的完整正文。`

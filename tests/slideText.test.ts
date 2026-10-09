@@ -206,9 +206,9 @@ describe('接线', () => {
   });
 
   test('界面：deck 的页走这条，文本文件走改正文那条', () => {
-    assert.match(RV, /\? \(instruction: string\) => applySlideOne\(anchor, instruction\)/);
+    assert.ok(RV.includes('if (live) queueSlide(page, t);'));
     assert.match(RV, /window\.kiroApi\.deckReviseSlideText\?\./);
-    /* 改不了时说清下一步 —— 那种意见确实需要它自己动手 */
-    assert.match(RV, /从下面「提交」交给会话自己动手/);
+    /* 改不了时交给会话 —— 那种意见确实需要它自己动手 */
+    assert.ok(RV.includes('（KiroLex 当场改不了这一条：${res.cannot}）'));
   });
 });

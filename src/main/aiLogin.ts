@@ -230,3 +230,95 @@ export function parseCodexEditor(text: string): CodexProvider {
   const model = topLevelValue(text, 'model');
   return { id, model: model || undefined, section };
 }
+
+/*
+ * **默认走 Amazon Bedrock** ——「脚本应该默认将模型设置为 bedrock 的 global endpoint。保留让客户自己配置域名和 key
+ * 或者用官方订阅登录的选项」。凭证不写进任何文件：两边都走 AWS SDK 的凭证链（EC2 实例角色 / ~/.aws / SSO）。
+ *
+ * 实测（10-07，东京 ap-northeast-1 那台，实例角色 ec2-admin）：
+ *   · Claude Code：global 推理配置文件可用（`global.anthropic.claude-opus-5-5` 回了 BEDROCK_OK）；
+ *     region 用那台机器自己的，ANTHROPIC_BEDROCK_REGION_PREFIX=global（Claude Code ≥ 2.1.224）。
+ *   · Codex：走的是 Bedrock 的 Responses 端点（bedrock-mantle），**东京那个端点上没有 OpenAI 模型**（404），
+ *     `global.` 前缀它也不认；us-east-1 + `openai.gpt-6.1-sol` 才通。所以 Codex 的 region 固定 us-east-1。
+ */
+export const BEDROCK_DEFAULTS = {
+  claude: {
+    opus: 'global.anthropic.claude-opus-5-5',
+    sonnet: 'global.anthropic.claude-sonnet-5-5',
+    haiku: 'global.anthropic.claude-haiku-4-5-20251001-v1:0',
+  },
+  codex: { model: 'openai.gpt-6.1-sol', region: 'us-east-1' },
+} as const;
+
+/** 写 Bedrock 时要拿掉的网关项 —— 留着的话 Claude Code 会继续打那个网关 */
+const CLAUDE_GATEWAY_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_SMALL_FAST_MODEL'];
+
+/** settings.json 合并进 Bedrock 的 env（只动 env 里这几项，别的设置原样保留）。`region` 是那台机器自己的。 */
+export function claudeBedrockSettings(existingText: string, region: string): string {
+  let j: any;
+  try { j = JSON.parse(existingText || '{}'); } catch { j = {}; }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) j = {};
+  const env: Record<string, string> = { ...(j.env && typeof j.env === 'object' ? j.env : {}) };
+  for (const k of CLAUDE_GATEWAY_KEYS) delete env[k];
+  Object.assign(env, {
+    CLAUDE_CODE_USE_BEDROCK: '1',
+    AWS_REGION: region,
+    ANTHROPIC_BEDROCK_REGION_PREFIX: 'global',
+    ANTHROPIC_MODEL: BEDROCK_DEFAULTS.claude.opus,
+    ANTHROPIC_DEFAULT_OPUS_MODEL: BEDROCK_DEFAULTS.claude.opus,
+    ANTHROPIC_DEFAULT_SONNET_MODEL: BEDROCK_DEFAULTS.claude.sonnet,
+    ANTHROPIC_DEFAULT_HAIKU_MODEL: BEDROCK_DEFAULTS.claude.haiku,
+  });
+  return `${JSON.stringify({ ...j, env }, null, 2)}\n`;
+}
+
+/** 这份 settings.json 是不是走 Bedrock；是就给出 region（显示用）。 */
+export function claudeBedrockOf(settingsText: string): { region?: string } | undefined {
+  try {
+    const env = JSON.parse(settingsText || '{}')?.env || {};
+    return env.CLAUDE_CODE_USE_BEDROCK === '1' || env.CLAUDE_CODE_USE_BEDROCK === 1 ? { region: env.AWS_REGION } : undefined;
+  } catch { return undefined; }
+}
+
+/** 删掉 `[model_providers.<id>]` 以及它的所有子表（`[model_providers.<id>.aws]`）。 */
+function dropProviderTables(lines: string[], id: string): string[] {
+  const esc = id.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
+  const own = new RegExp(`^\\s*\\[model_providers\\.("?)${esc}\\1(\\.[^\\]]+)?\\]\\s*(#.*)?$`);
+  const out: string[] = [];
+  let skipping = false;
+  for (const l of lines) {
+    if (TABLE_HEADER.test(l)) skipping = own.test(l);
+    if (!skipping) out.push(l);
+  }
+  return out;
+}
+
+/**
+ * config.toml 合并进 Bedrock：顶层 `model` / `model_provider` 换掉，`amazon-bedrock` 的旧段（含子表）删掉再写新的；
+ * 别的 provider（比如原来那个网关）、项目信任、MCP 原样保留 —— 想切回去改一行 `model_provider` 就行。
+ */
+export function codexBedrockToml(existing: string, opts?: { model?: string; region?: string }): string {
+  const model = opts?.model || BEDROCK_DEFAULTS.codex.model;
+  const region = opts?.region || BEDROCK_DEFAULTS.codex.region;
+  const body = dropProviderTables(String(existing || '').split(/\r?\n/), 'amazon-bedrock');
+  const firstTable = body.findIndex((l) => TABLE_HEADER.test(l));
+  const top = (firstTable < 0 ? body : body.slice(0, firstTable))
+    .filter((l) => !/^\s*model_provider\s*=/.test(l) && !/^\s*model\s*=/.test(l));
+  const rest = firstTable < 0 ? [] : body.slice(firstTable);
+  const out = [`model = ${JSON.stringify(model)}`, 'model_provider = "amazon-bedrock"', ...top, ...rest]
+    .join('\n').replace(/\n{3,}/g, '\n\n').replace(/\s*$/, '');
+  return `${out}\n\n[model_providers.amazon-bedrock.aws]\nregion = ${JSON.stringify(region)}\n`;
+}
+
+/** 这份 config.toml 是不是走 Bedrock（显示用）。 */
+export function codexBedrockOf(toml: string): { region?: string; model?: string } | undefined {
+  if (topLevelValue(toml, 'model_provider') !== 'amazon-bedrock') return undefined;
+  const lines = String(toml || '').split(/\r?\n/);
+  const at = lines.findIndex((l) => /^\s*\[model_providers\.amazon-bedrock\.aws\]/.test(l));
+  let region: string | undefined;
+  for (let i = at + 1; at >= 0 && i < lines.length && !TABLE_HEADER.test(lines[i]); i++) {
+    const m = lines[i].match(/^\s*region\s*=\s*(.+?)\s*$/);
+    if (m) region = unquote(m[1]);
+  }
+  return { region, model: topLevelValue(toml, 'model') };
+}

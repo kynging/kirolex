@@ -533,15 +533,8 @@ export function spanRange(span: number[]): { from: number; to: number } {
   return { from: sorted[0], to: sorted[sorted.length - 1] };
 }
 
-/** 文件里 `from..to`（行号，闭区间，从 1 起）那一段原文 —— 空行照带。 */
-export function sliceLines(text: string | null | undefined, from: number, to: number): string {
-  return String(text ?? '').split('\n').slice(from - 1, to).join('\n');
-}
-
-/**
- * 把文件里 `from..to` 那一段**整体换成** `replacement` —— PURE。其余每一行逐字照抄（包括末尾换行）。
- */
-export function spliceLines(text: string | null | undefined, from: number, to: number, replacement: string): string {
-  const lines = String(text ?? '').split('\n');
-  return [...lines.slice(0, from - 1), String(replacement ?? ''), ...lines.slice(to)].join('\n');
-}
+/*
+  sliceLines / spliceLines / insertAfterLines / deleteLines 搬到了主进程那边（`src/main/reviewApply.ts`）——
+  改写的回复由主进程拼回去、写盘，窗口在不在都一样；这里转出同一份，两边永远是同一套规则。
+*/
+export { sliceLines, spliceLines, insertAfterLines, deleteLines } from '../main/reviewApply.ts';

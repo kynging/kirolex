@@ -28,7 +28,7 @@ function firstUrl(text: string): string | null {
 }
 
 export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatus | null; onChanged: () => void }> = ({ machine, tool, status, onChanged }) => {
-  const [mode, setMode] = useState<'none' | 'manual' | 'official'>('none');
+  const [mode, setMode] = useState<'none' | 'manual' | 'official' | 'bedrock'>('none');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
   /** 手动填写 = 这个编辑器：Claude Code 是 JSON（env 的键值），Codex 是 TOML 片段。 */
@@ -70,6 +70,14 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
     if (r?.ok) { setMode('none'); setText(''); onChanged(); }
   };
 
+  const applyBedrock = async (): Promise<void> => {
+    setBusy(true); setMsg(null);
+    const r = await api()?.aiLoginApply?.(machine, { tool, mode: 'bedrock' });
+    setBusy(false);
+    setMsg({ ok: !!r?.ok, text: r?.ok ? '已改成走 Amazon Bedrock。正在跑的会话要重连之后才会用上新配置。' : (r?.error || '失败') });
+    if (r?.ok) { setMode('none'); onChanged(); }
+  };
+
   const startOfficial = async (consoleBilling = false): Promise<void> => {
     setMsg(null); setLog('');
     const r = await api()?.aiLoginRun?.(machine, tool, { console: consoleBilling });
@@ -92,9 +100,29 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
 
       {status?.installed && (
         <div className="remote-row-actions">
+          {/* 默认推荐 Bedrock ——「默认将模型设置为 bedrock 的 global endpoint，保留让客户自己配置域名和 key 或者用官方订阅登录的选项」 */}
+          <button className="remote-btn remote-btn-primary" disabled={busy || !!runId} onClick={() => setMode(mode === 'bedrock' ? 'none' : 'bedrock')}>用 Amazon Bedrock（推荐）</button>
           <button className="remote-btn" disabled={busy || !!runId} onClick={() => setMode(mode === 'manual' ? 'none' : 'manual')}>手动填写</button>
           <button className="remote-btn" disabled={busy || !!runId} onClick={() => setMode(mode === 'official' ? 'none' : 'official')}>官方账号登录</button>
         </div>
+      )}
+
+      {mode === 'bedrock' && (
+        <>
+          <p className="settings-hint" style={{ margin: '4px 0' }}>
+            {tool === 'claude'
+              ? <>写进那台机器 <code>~/.claude/settings.json</code> 的 <code>env</code>：<code>CLAUDE_CODE_USE_BEDROCK=1</code>、那台机器自己的 <code>AWS_REGION</code>、
+                  global 推理配置文件（<code>global.anthropic.claude-opus-5-5</code> / sonnet-5-5 / haiku-4-5）；原来的网关地址和 key 去掉，别的设置不动。</>
+              : <>写进那台机器 <code>~/.codex/config.toml</code>：<code>model_provider = "amazon-bedrock"</code>、<code>openai.gpt-6.1-sol</code>，region <code>us-east-1</code>
+                  （Codex 走 Bedrock 的 Responses 端点，OpenAI 模型目前在美东区；它不认 global 前缀）。原来的网关那一段保留，想切回去改 <code>model_provider</code> 就行。</>}
+            {' '}<b>不写任何密钥</b>：用那台机器的 AWS 凭证链（EC2 实例角色、<code>~/.aws</code>、SSO），需要有 Bedrock 的调用权限。原文件先备份成 <code>.kirolex-bak</code>。
+          </p>
+          <div className="remote-row-actions">
+            <button className="remote-btn remote-btn-primary" disabled={busy} onClick={() => void applyBedrock()}>
+              {busy ? '写入中…' : '写到那台机器上'}
+            </button>
+          </div>
+        </>
       )}
 
       {mode === 'manual' && (

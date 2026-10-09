@@ -53,7 +53,7 @@ export const CommentBox: React.FC<{
    *
    * 不给这个 prop 就只有 `✓ 确认`（文件预览那侧就是这样）。
    */
-  onApply?: (text: string) => Promise<boolean> | void;
+  onApply?: (text: string) => Promise<boolean> | boolean | void;
   /**
    * 正在改 —— **整个框收走**，由上层在那一块摆一行「改写中…」。
    *
@@ -84,15 +84,13 @@ export const CommentBox: React.FC<{
    */
   draft?: string;
   onDraft?: (next: string) => void;
-  /**
-   * 有 `onApply` 时**也给「记下」** —— 侧栏 review 那侧要的。
-   *
-   * 门上把它删了（「那记一条有什么用啊」：那边记下的东西不会发给任何人）。侧栏不一样：记下的意见进
-   * 底下那个「提交给这份文件的会话」，攒几条一起发 —— 那是一条真的出口，所以两个按钮都该在。
-   * ⌘/Ctrl+Enter 一直是"记下"（不发模型）：一个快捷键不该悄悄花掉一次几十秒的改写。
-   */
-  allowRecord?: boolean;
-}> = ({ value, onChange, startOpen = false, placeholder, rows = 5, mark = '💬', onRemove, title, onDismiss, onApply, applying, applyNote, draft: outerDraft, onDraft, allowRecord }) => {
+  /** 「✓ 确认」按钮的提示 —— 「＋ 加一段」那种框确认的是"加什么"，不是"怎么改这一块"。 */
+  applyTitle?: string;
+  /** 「✓ 确认」按钮上的字 —— 积累模式下写成「✓ 确认（3 处）」：按下去提交的是所有标记，不只这一条。 */
+  applyLabel?: string;
+  /** 这个框空着也能按「✓ 确认」—— 积累模式下它提交的是**别处**已经标记的那些。 */
+  applyWhenEmpty?: boolean;
+}> = ({ value, onChange, startOpen = false, placeholder, rows = 5, mark = '💬', onRemove, title, onDismiss, onApply, applying, applyNote, draft: outerDraft, onDraft, applyTitle, applyLabel, applyWhenEmpty }) => {
   const [open, setOpen] = useState(startOpen);
   const [localDraft, setLocalDraft] = useState(value);
   const controlled = onDraft !== undefined;
@@ -115,6 +113,17 @@ export const CommentBox: React.FC<{
     onChange(next);
     setOpen(false);
     onDismiss?.();
+  };
+  /*
+    **成功了清草稿**（框由上层关掉，见 `ResultTable` 的 `setNoteOpenAt(null)`）。
+    清草稿是必须的：那条指令已经执行完了，留在框里下一次会被再发一遍
+    （于是同一处改两遍，第二遍是对着已经改过的文本执行同一条指令）。
+    失败/改不了时**保留草稿、框也留着** —— 那条话还没起作用，让你改措辞再试，而不是重新打一遍。
+  */
+  const apply = () => {
+    const next = draft.trim();
+    if ((!next && !applyWhenEmpty) || !onApply) return;
+    void Promise.resolve(onApply(next)).then((ok) => { if (ok) setDraft(''); });
   };
   const cancel = () => {
     // 从来没确认过的（原值为空）取消就等于不写；确认过的退回上一次确认的内容
@@ -157,7 +166,8 @@ export const CommentBox: React.FC<{
         onChange={(e) => setDraft(e.target.value)}
         onKeyDown={(e) => {
           if (e.key === 'Escape') cancel();
-          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) commit();
+          /* 有「✓ 确认」就是它 —— 侧栏 review 上的「记下」已经删了（「comment 时不应该有什么记下按钮」） */
+          if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { if (onApply) apply(); else commit(); }
         }}
       />
       {/* 没改成的原因 —— 那时框留着，所以必须就地说出来（改成了的话框已经关了） */}
@@ -171,36 +181,20 @@ export const CommentBox: React.FC<{
           <button
             type="button"
             className="rt-note-apply nopan nodrag"
-            disabled={!draft.trim()}
-            title="确认这条意见 —— 让打开这份文件的那条会话按它改这一块（改不了单块时自动按整份改），KiroLex 写回文件、当场更新"
-            onClick={() => {
-              const next = draft.trim();
-              if (!next) return;
-              /*
-                **成功了清草稿**（框由上层关掉，见 `ResultTable` 的 `setNoteOpenAt(null)`）。
-                清草稿是必须的：那条指令已经执行完了，留在框里下一次会被再发一遍
-                （于是同一处改两遍，第二遍是对着已经改过的文本执行同一条指令）。
-                失败/改不了时**保留草稿、框也留着** —— 那条话还没起作用，让你改措辞再试，
-                而不是重新打一遍。
-              */
-              void Promise.resolve(onApply(next)).then((ok) => { if (ok) setDraft(''); });
-            }}
-          >✓ 确认</button>
+            disabled={!draft.trim() && !applyWhenEmpty}
+            title={applyTitle || '确认这条意见 —— 让打开这份文件的那条会话按它改这一块（改不了单块时自动按整份改），KiroLex 写回文件、当场更新（⌘/Ctrl + Enter）'}
+            onClick={apply}
+          >{applyLabel || '✓ 确认'}</button>
         )}
         {/*
-          **第二个按钮：记下（不改）**。
-
-          门上把它删了（「那记一条有什么用啊」）—— 那边记下的东西不会发给任何人，只是一个让人以为提交了
-          什么的按钮。侧栏 review 不一样：记下的意见进最底下的「提交给这份文件的会话」，攒几条一起发，
-          所以那边传 `allowRecord`，两个按钮都在：「✓ 确认」当场改这一块，「记下」先攒着。
-
-          两个都在时它叫「记下」而不是「✓ 确认」—— 同一个框里两个一样名字的按钮做的是两件事，没法选。
-          没有 `onApply` 的那种（没有归属会话）照旧只有它，叫「✓ 确认」。
+          **没有「记下」了** ——「comment 时不应该有什么记下按钮，而且现在应该不再需要提交按钮了」。
+          门上早就删了它（「那记一条有什么用啊」）；侧栏留着是因为底下有个「提交」攒着一起发，那个提交没了，
+          它也就没有出口了。没有 `onApply` 的那种（门上那几个纯记录的框）照旧只有它，叫「✓ 确认」。
         */}
-        {(!onApply || allowRecord) && (
+        {!onApply && (
           <button type="button" className="rt-note-ok nopan nodrag"
-            title={onApply ? '只记下这条意见，不改文件 —— 和别的意见一起从最下面「提交」（⌘/Ctrl + Enter）' : '记下来并收起（⌘/Ctrl + Enter）'}
-            onClick={commit}>{onApply ? '记下' : '✓ 确认'}</button>
+            title="记下来并收起（⌘/Ctrl + Enter）"
+            onClick={commit}>✓ 确认</button>
         )}
         <button type="button" className="rt-note-cancel nopan nodrag"
           title="丢掉刚写的（Esc）" onClick={cancel}>取消</button>

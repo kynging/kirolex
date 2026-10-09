@@ -152,3 +152,46 @@ describe('编辑器 ——「提供一个按钮把本机配置直接拷过来，
     assert.throws(() => parseCodexEditor(codexEditorText('')), /base_url 不能为空/, '空模板不能直接写过去');
   });
 });
+
+describe('默认走 Amazon Bedrock ——「默认将模型设置为 bedrock 的 global endpoint」', () => {
+  test('Claude：去掉网关项、写 Bedrock + global 推理配置文件，别的设置原样保留', async () => {
+    const { claudeBedrockSettings, claudeBedrockOf, BEDROCK_DEFAULTS } = await import('../src/main/aiLogin.ts');
+    const out = JSON.parse(claudeBedrockSettings(JSON.stringify({ env: { ANTHROPIC_BASE_URL: 'u', ANTHROPIC_API_KEY: 'k', KEEP: '1' }, permissions: { allow: ['x'] } }), 'ap-northeast-1'));
+    assert.equal(out.env.ANTHROPIC_BASE_URL, undefined);
+    assert.equal(out.env.ANTHROPIC_API_KEY, undefined);
+    assert.equal(out.env.KEEP, '1');
+    assert.deepEqual(out.permissions, { allow: ['x'] });
+    assert.equal(out.env.CLAUDE_CODE_USE_BEDROCK, '1');
+    assert.equal(out.env.AWS_REGION, 'ap-northeast-1');
+    assert.equal(out.env.ANTHROPIC_BEDROCK_REGION_PREFIX, 'global');
+    assert.match(out.env.ANTHROPIC_MODEL, /^global\.anthropic\./);
+    assert.equal(out.env.ANTHROPIC_MODEL, BEDROCK_DEFAULTS.claude.opus);
+    assert.deepEqual(claudeBedrockOf(JSON.stringify(out)), { region: 'ap-northeast-1' });
+    assert.equal(claudeBedrockOf('{"env":{"ANTHROPIC_BASE_URL":"u"}}'), undefined);
+  });
+  test('Codex：顶层两行换成 amazon-bedrock，旧网关段保留；反复写不重复（子表也认得）', async () => {
+    const { codexBedrockToml, codexBedrockOf } = await import('../src/main/aiLogin.ts');
+    const once = codexBedrockToml(LOCAL_TOML);
+    assert.equal(topLevelValue(once, 'model_provider'), 'amazon-bedrock');
+    assert.equal(topLevelValue(once, 'model'), 'openai.gpt-6.1-sol');
+    assert.match(once, /\[model_providers\.workshop\]/, '原来的网关那一段留着，切回去改一行就行');
+    assert.equal(codexBedrockToml(once), once);
+    assert.equal((once.match(/\[model_providers\.amazon-bedrock\.aws\]/g) || []).length, 1);
+    assert.deepEqual(codexBedrockOf(once), { region: 'us-east-1', model: 'openai.gpt-6.1-sol' });
+    assert.equal(codexBedrockOf(LOCAL_TOML), undefined);
+  });
+  test('接线：apply 有 bedrock 模式、状态认得 Bedrock；登录页有这个选项；安装脚本只给没配过的工具写默认', () => {
+    const require_ = (p: string): string => (globalThis as any).process.getBuiltinModule('node:fs').readFileSync(p, 'utf8');
+    const M2 = require_('src/main/index.ts');
+    assert.match(M2, /if \(input\.mode === 'bedrock'\) \{/);
+    assert.match(M2, /const cb = claudeBedrockOf\(settings \|\| ''\);/);
+    const L = require_('src/renderer/components/LoginSettings.tsx');
+    assert.match(L, />用 Amazon Bedrock（推荐）</);
+    assert.match(L, /aiLoginApply\?\.\(machine, \{ tool, mode: 'bedrock' \}\)/);
+    const SH = require_('scripts/remote-bootstrap.sh');
+    assert.match(SH, /step "默认模型：Amazon Bedrock"/);
+    assert.match(SH, /Claude Code 已经配过（网关 \/ Bedrock \/ 官方登录），不动/);
+    assert.match(SH, /Codex 已经配过（provider \/ 官方登录），不动/);
+    assert.match(SH, /ANTHROPIC_MODEL: "global\.anthropic\.claude-opus-5-5"/);
+  });
+});

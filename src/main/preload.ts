@@ -159,6 +159,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   archiveSession: (sessionId: string, archived: boolean) => ipcRenderer.invoke('acp:archive-session', sessionId, archived),
   getExecutorCap: () => ipcRenderer.invoke('acp:get-executor-cap'),
   reveal: () => ipcRenderer.invoke('acp:reveal'),
+  /** 无边框窗口的三个按钮 —— 'minimize' | 'toggle-maximize' | 'close' */
+  windowControl: (action: 'minimize' | 'toggle-maximize' | 'close') => ipcRenderer.invoke('window:control', action),
   /** 窗口是否最大化 + 标题条该留多高（Windows / Linux 自己画的那条，见 createWindow） */
   onWindowMaximized: (callback: (data: { maximized: boolean; height: number }) => void) => {
     const handler = (_event: any, data: { maximized: boolean; height: number }) => callback(data);
@@ -407,7 +409,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 侧栏 review 的「✓ 确认」：把一条意见发给**打开这份文件的那条会话**，等它回改完的正文。
    * 正忙就在主进程里排队；`cannot` = 它说这条改不了单独一段（渲染层据此升级到 `whole`）。
    */
-  reviseInSession: (input: { sessionId: string; where: string; note: string; about?: string; scope?: 'block' | 'whole'; label?: string; full?: string }) =>
+  reviseInSession: (input: { sessionId: string; where: string; note: string; about?: string; scope?: 'block' | 'whole' | 'insert'; label?: string; full?: string; ticket?: string; apply?: { path: string; mode: 'splice' | 'insert' | 'whole'; from?: number; to?: number; base: string } }) =>
     ipcRenderer.invoke('review:revise-in-session', input),
   /** 把改完的正文写回这份文件 —— 路径按这条会话解析，只许写这条会话的标签页读过的，写前备份。 */
   reviewWriteFile: (sessionId: string | null | undefined, filePath: string, text: string) =>
@@ -425,7 +427,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
   deckWriteNote: (sessionId: string | null | undefined, filePath: string, page: number, text: string) =>
     ipcRenderer.invoke('deck:write-note', sessionId, filePath, page, text),
   /** 问打开这份 deck 的会话这一页的字该怎么改，KiroLex 按 run 地址写进去（正忙就排队）。 */
-  deckReviseSlideText: (input: { sessionId: string; filePath: string; page: number; note: string }) =>
+  /** 取消侧栏 comment 提交的**那一次**改写（按 ticket）—— 没轮到的直接不跑，在跑的只停它那一轮，不碰别的对话。 */
+  reviewCancel: (ticket: string) => ipcRenderer.invoke('review:cancel', ticket),
+  /** 这几个 ticket 里哪些已经在主进程写完盘了（窗口 reload 回来时用：做完的不再当标记放回去）。 */
+  reviewTicketsDone: (tickets: string[]): Promise<string[]> => ipcRenderer.invoke('review:tickets-done', tickets),
+  deckReviseSlideText: (input: { sessionId: string; filePath: string; page: number; note: string; ticket?: string }) =>
     ipcRenderer.invoke('deck:revise-slide-text', input),
   /** 读一页幻灯片上的文字（按 run 地址）。 */
   deckReadSlideText: (sessionId: string | null | undefined, filePath: string, page: number) =>
@@ -474,8 +480,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * **把一条已有会话切到另一台机器（或切回本地）**。`remoteId` 传 null = 本地。
    * 切到远端时要给项目目录（没给就用记录里的那个；都没有会报错 —— 远端要镜像的就是它）。
    */
-  setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string) =>
-    ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir),
+  setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string, hint?: { projectId?: string | null }) =>
+    ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir, hint),
   /**
    * **KiroLex 自己对你说的一句话**（推/拉进度、冲突、换机器…）。
    *
@@ -551,7 +557,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('ai-login:exit', handler);
   },
   /** 给已有的会话换引擎（kiro / claude / codex）。没连着的只改记录。 */
-  switchEngine: (sessionId: string, engine: string) => ipcRenderer.invoke('acp:switch-engine', sessionId, engine),
+  switchEngine: (sessionId: string, engine: string, hint?: { projectId?: string | null }) => ipcRenderer.invoke('acp:switch-engine', sessionId, engine, hint),
   onEngineChanged: (callback: (d: { sessionId: string; engine: 'kiro' | 'claude' | 'codex' }) => void) => {
     const handler = (_event: any, d: any) => callback(d);
     ipcRenderer.on('session:engine-changed', handler);

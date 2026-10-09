@@ -29,7 +29,7 @@ import type { ScheduleSpec } from '../../main/schedule';
 import type { ScheduleView } from '../scheduleView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
-import { decideTurnRecovery, adoptedMessages, type TurnPeek } from '../turnRecovery';
+import { decideTurnRecovery, adoptedMessages, isReviseRequest, type TurnPeek } from '../turnRecovery';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -1062,10 +1062,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (opts?.interrupted) while (i >= 0 && msgs[i].role === 'assistant') i--;
     if (i < 0) return;
     if (msgs[i].role !== 'user') {
-      // Answered. Clear this chat's resend ledger entry: it exists only to stop a
-      // resend from firing twice, and once a reply is in there is nothing to guard.
-      // Leaving it behind is what made the guard permanent -- see below.
-      void window.kiroApi.setAutoResent?.(sid, '');
+      /*
+        **最后一条是助手消息 ≠ 这一轮答完了** —— 实测 ONTAP 那条：一轮跑到一半（已经
+        local_write 了两个文件、落盘了半截回复）时窗口 reload，这里只看"最后一条是谁"就当成
+        答完了直接 return，根本没去 peek —— 后端那一轮其实还在跑，窗口却不认领它：不显示在跑、
+        Stop 不可用，后来超时中断后的自动续写也因为"窗口以为没在跑"而抢在 cancel 收尾前发出、
+        被拒。所以先问一句 main：还在跑就认领（不重发、不计次数），不在跑才算答完。
+      */
+      void (async () => {
+        let peek: TurnPeek | null = null;
+        try { peek = (await window.kiroApi.peekTurn?.(sid)) ?? null; } catch { peek = null; }
+        if (peek?.live && !streamingIdsRef.current.has(sid)) { adoptTurn(sid, peek); return; }
+        // Answered. Clear this chat's resend ledger entry: it exists only to stop a
+        // resend from firing twice, and once a reply is in there is nothing to guard.
+        // Leaving it behind is what made the guard permanent -- see below.
+        void window.kiroApi.setAutoResent?.(sid, '');
+      })();
       return;
     }
     // Anchor to the turn's BASE user message (steers are merged into it on disk, separate in memory).
@@ -1073,6 +1085,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     while (base > 0 && msgs[base].steer) base--;
     const target = msgs[base];
     if (target.role !== 'user' || !target.content.trim()) return;
+    /* 侧栏 review 的改写中断了不回填 —— 见 `isReviseRequest`。要改就回侧栏再按一次「✓ 确认」 */
+    if (isReviseRequest(target.content)) return;
     /* 重发的是**基础那条 + 这一轮已经吃进去的 steer**（原来只发基础那条，steer 就丢了） */
     const resendText = withConsumedSteers(msgs, base);
     /* 这期间队列不许抢着发 —— 否则排队那条会落在没答的问题后面，把它永远顶掉 */
@@ -2054,9 +2068,19 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
 
         case 'tool_call_update': {
-          const existing = toolCallsRef.current.get(update.toolCallId);
+          /*
+            **Claude Code 的工具调用显示是空的** —— claude-agent-acp 的第一条 `tool_call` 在工具入参到之前就发了，
+            标题是占位（"Terminal" / "Read File" / "Preparing file…"），真正的标题（命令、文件路径）在后面的
+            `tool_call_update` 里；而且 update 只带变了的字段，经常**不带 status**。原来这里不更新标题、还无条件
+            `existing.status = update.status`，于是每条命令都显示成 "Terminal"、运行中的标记中途消失。
+            kiro-cli 第一条就给全了标题，所以 kiro 会话一直是好的。落盘那边（主进程）本来就是合并的，只有实时界面错。
+            第一条就是 update 的（没见过 tool_call）也建一条，和主进程一致。
+          */
+          const existing = toolCallsRef.current.get(update.toolCallId)
+            ?? (update.toolCallId ? { toolCallId: update.toolCallId, title: update.title || 'Tool call', status: update.status || 'in_progress', kind: update.kind } as any : undefined);
           if (existing) {
-            existing.status = update.status;
+            if (update.status) existing.status = update.status;
+            if (typeof update.title === 'string' && update.title.trim()) existing.title = update.title;
             if (update.kind) existing.kind = update.kind;
             const newLocations = extractLocations(update);
             const newDiffs = extractDiffs(update);
@@ -2457,6 +2481,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // anything set here would be a floating notice outliving the turn it describes.
     const removeTurnWedged = window.kiroApi.onTurnWedged?.(({ sessionId: sid, produced }) => {
       if (!sid) return;
+      /* 卡死的是侧栏 review 的改写那一轮：不自动续写、不自动重发（见 `isReviseRequest`） */
+      const lastUser = [...(messagesCacheRef.current.get(sid) || [])].reverse().find((m) => m.role === 'user');
+      if (lastUser && isReviseRequest(lastUser.content)) return;
       if (produced) {
         // A partial reply exists, so resending would duplicate it -- but the turn was
         // still CUT SHORT by us, and it used to be left looking completed: no banner, an

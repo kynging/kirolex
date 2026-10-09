@@ -432,7 +432,8 @@ describe('模型列表按机器分', () => {
     assert.match(A, /const key = `kirolex-models\$\{machine === 'local' \? '' : `:\$\{machine\}`\}`;/);
     /* 远端那台问一次就够；问不到退回本机那份 —— 空下拉比"可能多几个"更糟 */
     assert.match(A, /if \(!askedModels\.current\.has\(machine\)\)/);
-    assert.match(A, /return modelsByMachine\[machine\] \|\| models;/);
+    /* 远端那台的清单没回来时用它自己的缓存、再不行给空 —— 不拿本机的顶（见 reviewPanePort 里那条） */
+    assert.ok(A.includes('if (modelsByMachine[machine]?.length) return modelsByMachine[machine];'));
   });
 });
 

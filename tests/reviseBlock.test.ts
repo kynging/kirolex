@@ -91,8 +91,10 @@ describe('主进程接线', () => {
   });
 
   test('写前备份，拷不成就不写；比预览上限大的不写', () => {
-    const at = MAIN.indexOf("ipcMain.handle('review:write-file'");
+    /* 写盘那段抽成了 `writeReviewFile`（review:write-file 和改写那条路的 `apply` 共用） */
+    const at = MAIN.indexOf('const writeReviewFile = (');
     const body = MAIN.slice(at, at + 2200);
+    assert.ok(MAIN.includes("ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string) =>\n    writeReviewFile(sessionId, filePath, text));"));
     assert.match(body, /if \(!saveReviewBackup\(want, previous\)\) \{\s*\n\s*return \{ ok: false/);
     assert.match(body, /WORKSPACE_PREVIEW_MAX_BYTES/);
     assert.ok(body.indexOf('saveReviewBackup(want, previous)') < body.indexOf('fs.writeFileSync(want, text'));
@@ -101,7 +103,9 @@ describe('主进程接线', () => {
   test('改写：排队、先挂回来、等空闲、超时摘掉等待者', () => {
     const at = MAIN.indexOf("ipcMain.handle('review:revise-in-session'");
     const body = MAIN.slice(at, at + 5000);
-    assert.match(body, /return enqueueRevise\(sessionId, async \(\) => reviseOnce\(\), input\?\.label \|\| '改写'\);/);
+    assert.ok(body.includes("return enqueueRevise(sessionId, async () => {\n      try { return await reviseOnce(); } finally { tk.close(); }\n    }, input?.label || '改写');"));
+    /* 取消按 ticket 认这一次改写：排队 / 等空闲期间被取消就不发；在等回复的只停它自己那一轮 */
+    assert.equal((body.match(/if \(tk\.cancelled\(\)\) return \{ ok: false, cancelled: true \};/g) || []).length, 4);
     assert.match(body, /await ensureAttached\(sessionId\);/);
     assert.match(body, /const stillBusy = await waitIdle\(sessionId, 20 \* 60 \* 1000\);/);
     assert.match(body, /if \(askWaiters\.has\(sessionId\)\) return \{ ok: false/);

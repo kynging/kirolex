@@ -1,9 +1,11 @@
-import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState } from 'react';
 import { CommentBox, CommentOpener } from './CommentBox';
 import { PdfView } from './PdfView';
-import { pageBlocks, lineBlocks, reviewPrompt, dropSpan, displayGroups, mdLine, spanRange, sliceLines, spliceLines, type ReviewBlock } from '../reviewBlocks';
+import { pageBlocks, lineBlocks, dropSpan, displayGroups, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, type ReviewBlock } from '../reviewBlocks';
 import { rewritePatch } from '../rewritePatch';
 import { MarkdownView } from './ChatArea';
+import { restoreGetJson, restoreSet } from '../uiRestore';
+import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, type ReviewQueueItem } from '../reviewQueue';
 
 /**
  * 走逐页预览的那些 —— `.pdf` 直接画，其余先由主进程用 LibreOffice 转成 PDF。
@@ -17,6 +19,120 @@ export function isDeckPath(p: string): boolean {
 }
 
 /**
+ * **没提交的标记活过重启** ——「右侧 comment 中有哪些内容，这个 kirolex 一重启就重置了，应该记录下来自动恢复」。
+ * 按文件路径存一份（`restoreSet`：设置里「重启后恢复界面状态」开着才落盘，关着只活过 reload）。
+ *
+ * 文本那侧的标记挂在行号上，而重启之间文件可能被改过 —— 所以连同那一行的**原文**一起存，读回来时按原文
+ * 重新找它现在在第几行（几处一样就取离原来最近的）；找不到的那条丢掉，不把意见挂到别的段上。
+ */
+const MARKS_KEY = 'kirolex-review-marks';
+
+/*
+  **按文件、不按 pane 的那几样** ——「为什么我点删除的时候 queue 里增加了两条消息？」
+  队列是闭包，pane 卸掉（换标签、藏预览栏）它照样跑。所以它要的东西都不能放在 pane 自己身上：
+    · `chains`   这份文件的「读→问→写」串行链 —— 新挂上的 pane 另起一条链的话，两条链会对同一份文件同时写；
+    · `fileText` 这份文件**此刻**的正文 —— 卸掉的那个 pane 的 textRef 不再更新，拿它当底稿会把后来的改动盖掉；
+    · `paneApis` 此刻挂着的那个 pane 的 setter —— 后台那条跑完要放回标记、挂原因、清草稿，得落到你看得见的那个 pane 上。
+*/
+const chains = new Map<string, Promise<unknown>>();
+function serializeFor<T>(path: string, job: () => Promise<T>): Promise<T> {
+  /* 前一个不管成没成都接着跑 —— 一次失败不该把后面排着的都堵死 */
+  const next = (chains.get(path) || Promise.resolve()).then(job, job);
+  chains.set(path, next.catch(() => {}));
+  return next;
+}
+const fileText = new Map<string, string>();
+/** 上一次从 props 收到的正文 —— 只有 props 真的变了才覆盖 `fileText`（落盘后、上层还没把新正文传下来的那一帧，props 还是旧的）。 */
+const lastPropText = new Map<string, string>();
+type PaneApi = {
+  setDraftLive: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  setApplyNote: React.Dispatch<React.SetStateAction<Record<string, string>>>;
+  setDropped: React.Dispatch<React.SetStateAction<Record<number, true>>>;
+  setWholeDraft: React.Dispatch<React.SetStateAction<string>>;
+  setMarkOrder: React.Dispatch<React.SetStateAction<Record<string, number>>>;
+  setNotes: React.Dispatch<React.SetStateAction<string[] | null>>;
+  typeDraft: (key: string, next: string) => void;
+  clearDraft: (key: string) => void;
+};
+const paneApis = new Map<string, PaneApi>();
+/** 被取消的那些（按 ticket）—— 和队列本身一样跟着文件走，不跟着 pane。 */
+const cancelledTickets = new Set<string>();
+
+/**
+ * 一块的 Markdown —— **按内容记住**，内容没变就不重渲染。「为什么直接编辑文字这么卡」：每敲一个字这个 pane
+ * 整个重渲染，而 `MarkdownView` 不是 memo 的 —— 一份几百块的文档，每个按键都把几百块重新解析、重新画一遍。
+ */
+const MdBlock = memo(({ md }: { md: string }) => <MarkdownView content={md} />);
+type SavedMarks = {
+  drafts: Record<string, string>;
+  dropped: number[];
+  whole: string;
+  order: Record<string, number>;
+  /** 行号 → 那一行的原文（只有文本那侧有）。 */
+  anchors?: Record<string, string>;
+  /**
+   * **提交了、还没写进文件的那些**（标记的键）—— 它们也照标记的样子存在上面几样里。
+   *
+   * 「我之前提交给 ontap 这个会话的要求加一段怎么消失了」「我提交的删除也没生效」：队列跑在窗口里，
+   * 一次 reload（实测是改代码触发的整页刷新）把排着的、在跑的全抹了 —— 而提交那一刻标记已经清掉了，
+   * 什么都没剩。现在没写完的那些照样落盘，reload / 重启回来时**作为标记放回去**，挂一句"上次没做完"，
+   * 你再提交一次就行。（在跑的那一轮回复到了也没人接，所以不能假装它会自己续上。）
+   */
+  interrupted?: string[];
+  /** `interrupted` 里每一条是哪一张 ticket —— 回来时问主进程它是不是其实已经写完了（`review:tickets-done`）。 */
+  interruptedTickets?: Record<string, string>;
+};
+const EMPTY_MARKS = { drafts: {} as Record<string, string>, dropped: {} as Record<number, true>, whole: '', order: {} as Record<string, number>, interrupted: [] as string[], interruptedTickets: {} as Record<string, string> };
+
+export function loadMarks(path: string, text: string | null): typeof EMPTY_MARKS {
+  const saved = restoreGetJson<Record<string, SavedMarks>>(MARKS_KEY)?.[path];
+  if (!saved || typeof saved !== 'object') return { ...EMPTY_MARKS };
+  /* 旧行号 → 新行号。deck 那侧是页号，原样用 */
+  const move = (line: number): number | null => {
+    if (text === null) return line;
+    const want = saved.anchors?.[String(line)];
+    if (want === undefined) return null;
+    let best: number | null = null;
+    for (const b of lineBlocks(text)) {
+      if (b.kind !== 'line' || b.text !== want) continue;
+      if (best === null || Math.abs(b.index - line) < Math.abs(best - line)) best = b.index;
+    }
+    return best;
+  };
+  const rekey = (k: string): string | null => {
+    const m = /^(\+|=|drop:)?(\d+)$/.exec(k);
+    if (!m) return k;                       // `note:页`、整篇 —— 不随正文挪
+    const to = move(Number(m[2]));
+    return to === null ? null : `${m[1] || ''}${to}`;
+  };
+  const drafts: Record<string, string> = {};
+  for (const [k, v] of Object.entries(saved.drafts || {})) {
+    const nk = rekey(k);
+    if (nk && String(v || '').trim()) drafts[nk] = String(v);
+  }
+  const dropped: Record<number, true> = {};
+  for (const line of saved.dropped || []) { const to = move(Number(line)); if (to !== null) dropped[to] = true; }
+  const order: Record<string, number> = {};
+  for (const [k, v] of Object.entries(saved.order || {})) { const nk = rekey(k); if (nk) order[nk] = Number(v) || 0; }
+  const interrupted: string[] = [];
+  const interruptedTickets: Record<string, string> = {};
+  for (const k of saved.interrupted || []) {
+    const nk = rekey(String(k));
+    if (!nk) continue;
+    interrupted.push(nk);
+    const tk = saved.interruptedTickets?.[String(k)];
+    if (tk) interruptedTickets[nk] = tk;
+  }
+  return { drafts, dropped, whole: String(saved.whole || ''), order, interrupted, interruptedTickets };
+}
+
+function saveMarks(path: string, marks: SavedMarks | null): void {
+  const all = restoreGetJson<Record<string, SavedMarks>>(MARKS_KEY) || {};
+  if (marks) all[path] = marks; else delete all[path];
+  restoreSet(MARKS_KEY, Object.keys(all).length ? JSON.stringify(all) : null);
+}
+
+/**
  * 看一个文本 / Markdown 文件，并**逐行（逐块）提意见** ——「像门一样增加一个评论然后提交修改」。
  *
  * 从 feature/flow 搬过来。两种文件共用一个 pane，因为它们本来是一件事：你看，然后你说哪里要改。
@@ -26,17 +142,19 @@ export function isDeckPath(p: string): boolean {
  *                       （每页一张 canvas，见 `PdfView` 为什么不用内置查看器）；有讲稿时讲稿和它的意见在右栏，
  *                       版面的评论入口在每页底下。`.pptx` 还能当场改一页的字/版面、改一页讲稿（要 python-pptx）
  *
- * 评论不叠在页上（canvas 上没法放框）：你在 PDF 里看到第 5 页有问题，就在第 5 页底下写 —— 间接一点，
- * 但锚点一样准。
+ * ## 积累模式 —— 先标记，一次提交
  *
- * ## 两个出口
+ * 「把 comment 功能做成积累模式，也就是填写的 comment 或删除先标记，不管在哪一处点确认按钮的时候一起提交修改」。
  *
- *   · **逐块「✓ 确认」** —— 这条意见当场发给**打开这份文件的那条会话**（文件往往是它刚做出来的，上下文
- *     全在它那儿），它只回改完的那一块（改不了单块时再要整份），KiroLex 拼回整份、写回文件
- *     （`reviewWriteFile`，写前备份）。见 `applyOne`。
- *   · **「提交给这份文件的会话」** —— 「记下」的那些意见 + ✕ 掉的块 + 其他意见，拼成**一条普通用户消息**
- *     （`reviewPrompt`）发过去，由那条会话自己去改文件。普通消息而不是隐藏指令：它进 transcript、模型有
- *     全部上下文、你也看得见发出去的是什么。
+ *   · **标记**：💬 框里写的字就是这一段的修改意见、＋ 框里写的是要加在这一段后面的内容、✕ 把这一段标成删除
+ *     （再点一次 ↩ 取消）。写完不用按任何东西 —— 点别处框就收起，意见留在那一段下面（点它接着改，✕ 去掉）。
+ *     草稿就是标记（`draftLive`），所以没有「记下」那一步。
+ *   · **提交**：任何一个框里的「✓ 确认」、或者最下面的「提交」，提交的都是**全部标记**（`submitAll`）。
+ *
+ * 提交之后每一处排进这份文件的队列，一条一条做（读→问→写 串行，见 `serialize`）：文本那侧 ＋ → 💬 → ✕ → 整篇，
+ * 都由**打开这份文件的那条会话**生成、KiroLex 写回（`reviewWriteFile`，写前备份）；位置按原文找，前面的改动
+ * 挪了行号也找得到。deck 那侧当场改得了的（`.pptx` 一页的字、一页讲稿）照样当场改，改不了的（加页、删页、
+ * `.pdf`、整份的意见）拼成**一条**消息发给那条会话。
  */
 export const ReviewPane: React.FC<{
   path: string;
@@ -50,17 +168,17 @@ export const ReviewPane: React.FC<{
   /** 文件名像不像 Markdown —— 是就逐行渲染成 Markdown，否则 `<pre>` 原文。 */
   markdown?: boolean;
   /**
-   * 提交 —— 接到**打开这份文件那条会话**的 `sendMessage` 上（不是此刻选中的那条）。
+   * 把 KiroLex 自己改不了的那些发给**打开这份文件那条会话**（它的 `sendMessage`，不是此刻选中的那条）。
    *
    * 「是不是应该给这个 tab 记录它是从哪个会话打开的，就从这个会话提交更改」：那条会话才见过这份文件。
-   * 没有主人时不传，按钮会禁用并说明原因 —— 与其乱发，不如说清没地方发。
+   * 只有 deck 那侧用（加页/删页、`.pdf`、整份的意见、改不了这一页的那种）—— 普通消息，进 transcript。
    */
   onSubmit?: (prompt: string) => void;
   /** 在不在 comment 模式。默认关 —— 大多数时候你只是想看一眼。 */
   commenting?: boolean;
   /**
-   * 这个标签页的**主人会话** —— 「✓ 确认」就在它里面改，写回也以它的名义（路径按它解析、白名单按它查）。
-   * 不传就没有「✓ 确认」这条出口，只剩「记下」+ 提交（而提交也会禁用）。
+   * 这个标签页的**主人会话** —— 改写在它里面问，写回也以它的名义（路径按它解析、白名单按它查）。
+   * 不传就只能看：没有地方能让这些意见生效，给入口只会让人以为改了。
    */
   sessionId?: string;
   /**
@@ -93,48 +211,117 @@ export const ReviewPane: React.FC<{
   /** 上一次拿到的那份 PDF 的路径 / 内容指纹 —— 判断"这次要不要重画十四页"（改讲稿不改 PDF） */
   const lastPdfRef = useRef<string | null>(null);
   const lastHashRef = useRef<string | null>(null);
-  /**
-   * **演讲者备注**上的意见 —— 和 `comments`（幻灯片版面）分开两条通道：「这页图太密」改版面，
-   * 「这段话术别提竞品」改讲稿；混成一条「第 3 页：…」模型只能猜，而猜错就是去改了另一个。
-   */
-  const [noteComments, setNoteComments] = useState<Record<number, string>>({});
-  /** 备注那条通道哪一页的框开着（版面那条用 `openAt`）。 */
-  const [noteOpenAt, setNoteOpenAt] = useState<number | null>(null);
-  /** 备注那条通道正在改哪一页 —— 两条通道各自一个忙位，提交一条不收另一条的按钮。 */
-  const [applyingNoteAt, setApplyingNoteAt] = useState<number | null>(null);
-  const [comments, setComments] = useState<Record<number, string>>({});
-  const [dropped, setDropped] = useState<Record<number, true>>({});
-  /** 哪一块的框开着。 */
+  /** 哪一块的 💬 框开着（deck：哪一页的版面框）。 */
   const [openAt, setOpenAt] = useState<number | null>(null);
+  /** 哪一块后面的 ＋ 框开着 —— 和 💬 互斥（同一时刻只开一个框，见 `openBox`）。 */
+  const [insertAt, setInsertAt] = useState<number | null>(null);
   /**
-   * 正在写的那份草稿 —— **这一层拿着，不落盘**。
-   *
-   * 草稿原来是 `CommentBox` 自己的 `useState(value)`，而这个框挂在**别的行**下面（整节的框挂在整节末尾），
-   * 上层任何一次让它重挂载的重渲染都会把那句 `useState` 重跑一遍 —— 正在写的字当场变回空
-   * （「打断了之后之前写的东西没有保存」）。提上来之后重渲染、关掉再点开都还在。键是锚点行号。
+   * 哪一块的 **✎ 直接改** 框开着 ——「应该加一个直接修改的按钮」（门上那个「✎ 改正文」）：你自己改这一块的
+   * Markdown，不经过模型。同样先标记（键 `=行号`），提交时 KiroLex 直接把这一块换成你写的那份。
    */
-  const [draftLive, setDraftLive] = useState<Record<string, string>>({});
-  const draftOf = (key: string, fallback: string) => draftLive[key] ?? fallback;
-  const typeDraft = (key: string, next: string) => setDraftLive((cur) => ({ ...cur, [key]: next }));
-  const clearDraft = (key: string) => setDraftLive((cur) => { const n = { ...cur }; delete n[key]; return n; });
+  const [editAt, setEditAt] = useState<number | null>(null);
+  /** 讲稿那条通道哪一页的框开着。 */
+  const [noteOpenAt, setNoteOpenAt] = useState<number | null>(null);
   /**
-   * 鼠标停在哪一块上 —— **给"标题带整段"做动手前的预览**：✕ 一个标题可能带走十几行，那不可逆，
+   * **标记**（= 草稿）—— 键：💬 是锚点行号 / 页号，＋ 是 `+行号`，讲稿是 `note:页`。写了字就算标记了。
+   *
+   * 这一层拿着、不放在 `CommentBox` 里：框挂在**别的行**下面（整节的框挂在整节末尾），上层任何一次让它
+   * 重挂载的重渲染都会把框里的 `useState` 重跑一遍 —— 正在写的字当场变回空
+   * （「打断了之后之前写的东西没有保存」）。提上来之后重渲染、关掉再点开都还在。
+   */
+  /** 上次没提交的标记 —— 「重启后恢复界面状态」（见 `loadMarks`）。只在挂载时读一次。 */
+  const [initialMarks] = useState(() => {
+    const m = loadMarks(path, isDeck ? null : text);
+    /*
+      "上次没做完"的那些里，**还在后台排 / 在跑的**不是没做完 —— 它们只是换了个 pane 在显示。不把它们当标记放回去，
+      否则你下一次提交会把同一条再排一遍（实测：点了个删除，queue 里多出一条重复的改写）。
+    */
+    const live = new Set(liveReviewItems(path).map((i) => i.persist?.key).filter(Boolean) as string[]);
+    if (!live.size) return m;
+    for (const k of live) {
+      if (k.startsWith('drop:')) delete m.dropped[Number(k.slice(5))];
+      else if (k === 'whole') m.whole = '';
+      else delete m.drafts[k];
+    }
+    m.interrupted = m.interrupted.filter((k) => !live.has(k));
+    return m;
+  });
+  const [draftLive, setDraftLive] = useState<Record<string, string>>(initialMarks.drafts);
+  /*
+    "上次没做完"的那些里，有的其实**做完了**：回复到的时候窗口不在，主进程自己拼、自己写了（`apply`）。
+    问主进程一句，做完的那几条从标记里摘掉 —— 否则你再提交一次，同一处就改了两遍。
+  */
+  useEffect(() => {
+    const byTicket = initialMarks.interruptedTickets;
+    const tickets = Object.values(byTicket);
+    if (!tickets.length) return;
+    void window.kiroApi.reviewTicketsDone?.(tickets).then((done) => {
+      const finished = new Set(done || []);
+      const keys = Object.entries(byTicket).filter(([, t]) => finished.has(t)).map(([k]) => k);
+      if (!keys.length) return;
+      setDraftLive((cur) => { const n = { ...cur }; for (const k of keys) if (!k.startsWith('drop:') && k !== 'whole') delete n[k]; return n; });
+      setDropped((cur) => { const n = { ...cur }; for (const k of keys) if (k.startsWith('drop:')) delete n[Number(k.slice(5))]; return n; });
+      if (keys.includes('whole')) setWholeDraft('');
+      setApplyNote((cur) => { const n = { ...cur }; for (const k of keys) delete n[k]; return n; });
+    }).catch(() => {});
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+  /**
+   * 每条标记**最后一次被动的先后** —— 提交按钮摆在**最新改的那一段下面**
+   * （「comment 和删除的提交按钮还是在最新修改那一段落的下方就行，不要在底部单独设置按钮」）。
+   * 键和标记同一套（`38` / `+38` / `note:3` / `drop:38`），值是序号，越大越新。
+   */
+  const [markOrder, setMarkOrder] = useState<Record<string, number>>(initialMarks.order);
+  const markSeq = useRef(Math.max(0, ...Object.values(initialMarks.order)));
+  /* 只在"最新的那条"换了时才动 —— 同一个框里每敲一个字都改一次 markOrder，就是每个字多一轮整页重渲染 */
+  const lastBumped = useRef<string | null>(null);
+  const bumpMark = (key: string) => {
+    if (lastBumped.current === key) return;
+    lastBumped.current = key;
+    setMarkOrder((cur) => ({ ...cur, [key]: ++markSeq.current }));
+  };
+  const draftOf = (key: string) => draftLive[key] ?? '';
+  const typeDraft = (key: string, next: string) => {
+    setDraftLive((cur) => ({ ...cur, [key]: next }));
+    if (next.trim()) bumpMark(key);
+  };
+  const clearDraft = (key: string) => setDraftLive((cur) => { const n = { ...cur }; delete n[key]; return n; });
+  /** 标了删的那些 —— 键是你点 ✕ 的那个锚点（标题就带整节，见 `spans`）/ 页号。 */
+  const [dropped, setDropped] = useState<Record<number, true>>(initialMarks.dropped);
+  /** 最下面那个「整篇的意见」框 —— 不挂在任何一段上。 */
+  const [wholeDraft, setWholeDraft] = useState(initialMarks.whole);
+  /**
+   * 鼠标停在哪一块上 —— **给"标题带整段"做动手前的预览**：✕ 一个标题会带走十几行，
    * 范围必须在点之前就看得见。纯 CSS 做不到：一行亮不亮取决于"盖住它的那个锚点是不是正被 hover"。
    */
   const [hoverAt, setHoverAt] = useState<number | null>(null);
-  /** 刚提交过 —— 显示一句确认，而不是让界面**看起来毫无变化**（否则你会再点一次）。 */
+  /** 刚发给会话过一条 —— 显示一句确认，而不是让界面**看起来毫无变化**（否则你会再点一次）。 */
   const [justSent, setJustSent] = useState(false);
-  /** 提交前那次备份没成 —— 说出来，因为接下来是会话自己改文件，改坏了没有副本。 */
+  /** 发给会话前那次备份没成 —— 说出来，因为接下来是会话自己改文件，改坏了没有副本。 */
   const [backupWarn, setBackupWarn] = useState('');
   /**
-   * **其他意见：一个框，边打边算，不用确认** ——「其他意见改成直接提交，不要再走确认了，没有必要」。
-   * 一行一条（空行跳过）。这里的意见不挂任何东西，唯一的出口就是下面那个提交按钮。
+   * **提交之后排着队的那些** —— 每一处一个条目，各自显示排队 / 进行中，结束各自摘掉。
+   * `line` 是它**此刻**指的那一行 —— 前面的改动落盘后按 `patch.keep` 跟着挪（见 `writeBack`）。
+   * deck 那侧 `line` 是页号，讲稿那条通道用 `note`（同一页的版面和讲稿各锁各的）。
    */
-  const [extraText, setExtraText] = useState('');
-  const extra = useMemo(
-    () => extraText.split('\n').map((t) => t.trim()).filter(Boolean),
-    [extraText],
-  );
+  type Job = ReviewQueueItem;
+  /* 不是这个 pane 自己的 state —— 见 `reviewQueue.ts`：pane 换了，还在跑的那些照样看得见 */
+  const jobs = useReviewQueueForPath(path);
+  const jobSeq = useRef(0);
+  /** 没做成的原因，按标记的键记（💬 / ＋ / 讲稿 / `drop:行` / `whole`）。 */
+  const [applyNote, setApplyNote] = useState<Record<string, string>>(() => Object.fromEntries(
+    /* 上次提交了、没写完就被 reload / 重启打断的那些 —— 标记已经放回去了，这里说一句为什么它们又出现了 */
+    initialMarks.interrupted.map((k) => [k, '上次提交没做完（窗口重新加载 / 重启打断了）—— 标记放回来了，再提交一次']),
+  ));
+
+  /** 同一时刻只开一个框 —— 别的框收起，**它们写的字留着**（那就是标记）。 */
+  const openBox = (kind: 'comment' | 'insert' | 'edit', at: number) => {
+    setOpenAt(kind === 'comment' ? at : null);
+    setInsertAt(kind === 'insert' ? at : null);
+    setEditAt(kind === 'edit' ? at : null);
+    setNoteOpenAt(null);
+  };
+  const closeBoxes = () => { setOpenAt(null); setInsertAt(null); setEditAt(null); setNoteOpenAt(null); };
 
   /* 换文件时把镜像清掉 —— 不清的话新文件会被"同一份"那个判断当成旧的，于是不重画 */
   useEffect(() => { lastPdfRef.current = null; lastHashRef.current = null; bytesRef.current = null; }, [path]);
@@ -194,8 +381,63 @@ export const ReviewPane: React.FC<{
    */
   const groups = useMemo(() => (isDeck ? [] : displayGroups(blocks)), [isDeck, blocks]);
   /**
+   * **行号竖着居中在这一块排出来的第一行上** ——「行号现在在字号很大的时候看起来很奇怪，应该让他在排版的第一行的居中位置」。
+   *
+   * 纯 CSS 给不出这个位置：第一行可能是正文、可能是一个大号标题、可能是代码块里的等宽字，各自的行高和上边距
+   * 都不一样，字号设置一改又全变。所以量：找这一块里第一个有字的文本节点，取它第一个字的那个框，
+   * 把行号的中线对到那个框的中线上。版面一变（字号、栏宽、换文件）就重量一遍（`ResizeObserver`）。
+   */
+  const listRef = useRef<HTMLOListElement | null>(null);
+  useLayoutEffect(() => {
+    const ol = listRef.current;
+    if (!ol) return;
+    /*
+      先全部量、再全部写：量一个写一个的话，每写一次 `style.top` 下一次读就得重新排版 —— 几百块就是几百次整页排版。
+      而且一帧只量一次（ResizeObserver 在打字时框一长高就会触发）。
+    */
+    let frame = 0;
+    const place = () => {
+      const writes: Array<[HTMLElement, string]> = [];
+      for (const li of Array.from(ol.children) as HTMLElement[]) {
+        const no = li.querySelector(':scope > .rv-line-no') as HTMLElement | null;
+        /* ✎ 正在改的那一块：行号对到框里第一行字的中线（框里没有文本节点可量，按它的内边距和行高算） */
+        const ta = li.querySelector(':scope > .rv-edit-slot textarea') as HTMLTextAreaElement | null;
+        if (no && ta) {
+          const cs = getComputedStyle(ta);
+          const lh = parseFloat(cs.lineHeight) || parseFloat(cs.fontSize) * 1.75;
+          const mid = ta.getBoundingClientRect().top + (parseFloat(cs.borderTopWidth) || 0) + (parseFloat(cs.paddingTop) || 0) + lh / 2;
+          writes.push([no, `${Math.round(mid - li.getBoundingClientRect().top - no.offsetHeight / 2)}px`]);
+          continue;
+        }
+        const body = li.querySelector(':scope > .rv-review-md, :scope > .rv-review-text') as HTMLElement | null;
+        if (!no || !body) continue;
+        const walker = document.createTreeWalker(body, NodeFilter.SHOW_TEXT, {
+          acceptNode: (n) => (/\S/.test(n.nodeValue || '') ? NodeFilter.FILTER_ACCEPT : NodeFilter.FILTER_SKIP),
+        });
+        const node = walker.nextNode() as Text | null;
+        if (!node) { writes.push([no, '']); continue; }
+        const at = (node.nodeValue || '').search(/\S/);
+        const range = document.createRange();
+        range.setStart(node, at);
+        range.setEnd(node, at + 1);
+        const r = range.getBoundingClientRect();
+        if (!r.height) continue;
+        const liTop = li.getBoundingClientRect().top;
+        writes.push([no, `${Math.round(r.top + r.height / 2 - liTop - no.offsetHeight / 2)}px`]);
+      }
+      for (const [el, top] of writes) if (el.style.top !== top) el.style.top = top;
+    };
+    place();
+    const ro = new ResizeObserver(() => {
+      if (frame) return;
+      frame = requestAnimationFrame(() => { frame = 0; place(); });
+    });
+    ro.observe(ol);
+    return () => { ro.disconnect(); if (frame) cancelAnimationFrame(frame); };
+  }, [groups, commenting, sessionId]);
+  /**
    * 锚点 → 它实际覆盖的行号。**代码围栏**（那一整段代码）、**标题**（它下面整节）、**列表项**（它的子项）
-   * 会超过一行 ——「comment 的是标题的话应该视为整段」，所以它们进这张表，提示词里写成范围。
+   * 会超过一行 ——「comment 的是标题的话应该视为整段」，所以它们进这张表。
    */
   const spans = useMemo(() => {
     const out: Record<number, number[]> = {};
@@ -205,7 +447,7 @@ export const ReviewPane: React.FC<{
     }
     return out;
   }, [groups, blocks]);
-  /** 行号 → 是**哪一行**把它盖住的（最内层那个）—— 被盖住的行跟着画出"属于这一节"。 */
+  /** 行号 → 是**哪一行**把它盖住的（最内层那个）。 */
   const coveredBy = useMemo(() => {
     const out = new Map<number, number>();
     for (const [anchorKey, span] of Object.entries(spans)) {
@@ -226,403 +468,764 @@ export const ReviewPane: React.FC<{
     },
     [spans],
   );
-  /** 正在改写哪一块（锚点）。那期间那一块（标题连整节）不接受任何处置。 */
-  const [applyingAt, setApplyingAt] = useState<number | null>(null);
+  /** 这一行有没有被某个标了删的锚点带走（自己被标，或者在一个被标删的整节里）。 */
+  const droppedBy = (line: number): number | null => {
+    for (const k of Object.keys(dropped)) if (covers(Number(k), line)) return Number(k);
+    return null;
+  };
   /**
-   * **同一份文件的改写一条一条来**。每次改写都是"读这份文件 → 问模型（几十秒）→ 写回去"；两条重叠的话
+   * **同一份文件的改动一条一条来**。每次都是"读这份文件 → 问模型（几十秒）→ 写回去"；两条重叠的话
    * 后写的那次基于**它自己开始时读到的那一版**，先落盘的那次就被静默盖掉。主进程那道队列只管"问模型"，
    * 管不到这里的拼接和写盘，所以这里按这一份文件把整段 读→问→写 串起来。
    */
-  const chainRef = useRef<Promise<unknown>>(Promise.resolve());
-  const serialize = useCallback(<T,>(job: () => Promise<T>): Promise<T> => {
-    /* 前一个不管成没成都接着跑 —— 一次失败不该把后面排着的都堵死 */
-    const next = chainRef.current.then(job, job);
-    chainRef.current = next.catch(() => {});
-    return next;
-  }, []);
+  /* 按文件串（`serializeFor`），不按 pane —— 换了 pane 也还是同一条链 */
+  const serialize = useCallback(<T,>(job: () => Promise<T>): Promise<T> => serializeFor(path, job), [path]);
   /**
-   * **排队的那一条要读到前一条写完之后的正文**，而不是它被点下去那一刻的 —— 所以正文和块都走一个 ref，
+   * **排队的那一条要读到前一条写完之后的正文**，而不是它被提交那一刻的 —— 所以正文走一个 ref，
    * 每次真正开跑时再取。拿闭包里那份的话，第二条会对着旧文拼接，把第一条的改动整个盖掉。
    */
   const textRef = useRef(text);
   textRef.current = text;
-  /** 上一次改写**没改成的原因**，按锚点记。 */
-  const [applyNote, setApplyNote] = useState<Record<string, string>>({});
-  /** 有哪个**别的**锚点带着这一行、而且它被标了删 / 写了意见（多级标题下可能有好几层） */
-  const outerState = useCallback((line: number) => {
-    let anyDropped = false;
-    let anyNoted = false;
-    for (const key of Object.keys(spans)) {
-      const anchor = Number(key);
-      if (anchor === line || !(spans[anchor] || []).includes(line)) continue;
-      if (dropped[anchor]) anyDropped = true;
-      if (comments[anchor]) anyNoted = true;
-    }
-    return { anyDropped, anyNoted };
-  }, [spans, dropped, comments]);
+  if (!isDeck && lastPropText.get(path) !== text) { lastPropText.set(path, text); fileText.set(path, text); }
+  /** 这份文件此刻的正文 —— 排着的那些开跑时读它（见 `fileText`）。 */
+  const currentText = () => fileText.get(path) ?? textRef.current;
   const unit = isDeck ? '页' : '行';
-  /** 这一刻要不要显示批注控件 —— deck 永远算开着（PDF 本身就是阅读视图，页底下那几个入口本来就淡） */
-  const on = isDeck || !!commenting;
+  /**
+   * 这一刻要不要显示批注控件。**没有主人会话就不给** —— 没有会话就没有地方能让这些标记生效；
+   * 给一个按下去什么都不发生的入口，比明说"只能看"更糟。deck 永远算开着（PDF 本身就是阅读视图）。
+   */
+  const on = (isDeck || !!commenting) && !!sessionId;
   /** 这份 deck **到底有没有讲稿** —— 没有就不出右边那一栏（一列"没写备注"的空框白占地方还把页挤窄） */
   const hasNotes = !!notes?.some((t) => t.trim());
-  /** 能不能当场改：有主人会话 + `.pptx`（主进程判的）。否则 deck 那侧只有「记下」+ 整体提交。 */
+  /** 能不能当场改：有主人会话 + `.pptx`（主进程判的）。否则 deck 那侧的标记拼成一条消息发给会话。 */
   const live = !!sessionId && editable;
-  /**
-   * 提交 slide 意见时告诉它**"讲稿已定稿，跟着讲稿改、别动讲稿"** —— 条件是真有讲稿、而且讲稿那条通道
-   * 是实时的（`live`：我确实能逐页改它，盘上那份是定稿）。否则说"已定稿"就是假话。
-   */
-  const prompt = reviewPrompt({
-    path, blocks, comments, dropped, extra, spans, noteComments,
-    ...(isDeck && hasNotes && live ? { notesFinal: true } : null),
-    /* deck 那侧允许动结构 —— 加页/删页/调序/挪图（见 `deckRework`） */
-    ...(isDeck ? { deckRework: true } : null),
-  });
+  const fileName = path.split(/[\\/]/).pop() || path;
+
+  /** 一个位置的说法：整节写范围，单行写行号 —— 框上、标记、排队那一行、会话里都用它。 */
+  const whereOf = (from: number, to: number) => (from !== to ? `第 ${from}–${to} ${unit}` : `第 ${from} ${unit}`);
+  const spanWhere = (anchor: number) => {
+    const span = spans[anchor];
+    return span && span.length > 1 ? `${whereOf(span[0], span[span.length - 1])}（这一整节）` : whereOf(anchor, anchor);
+  };
 
   /**
-   * **确认一条就当场改完并写回文件** ——「1 听起来更好？」。
-   *
-   * 攒起来一次提交那条路的问题是：你不知道它到底改了没有、改的是不是你说的那处，而两批意见落在同一份
-   * 文件上时它也不知道该按哪一批。所以这里：这条意见连同"它指的那一处"发给打开这份文件的那条会话，
-   * 先只要**这一块**（快），它回 `CANNOT-REVISE-LOCALLY` 才要整份（加段/删段/挪位置），落盘由 KiroLex
-   * 统一做 —— 提示词里明确禁止它自己动文件，否则两个写者互相覆盖。
-   *
-   * 改完之后**剩下那些意见要跟着它们那一行走**（`rewritePatch(...).keep`：旧行号 → 新行号），
-   * 对不上的（它评的那行被改掉/删掉了）就丢掉 —— 它说的东西已经不在了。
+   * **全部标记** —— 提交的就是这一份。草稿里写了字的、标了删的、整篇那一框。
+   * 落在一个标了删的整节**里面**的意见不算：那一节都要走了，对它改一句没有意义。
    */
-  const applyOne = async (anchor: number, instruction: string): Promise<boolean> => {
-    if (!sessionId) return false;
-    setApplyingAt(anchor);
-    setApplyNote((cur) => ({ ...cur, [String(anchor)]: '' }));
-    /* 排到这份文件的队尾 —— 读→问→写 中间不许插进另一次改写（见 `serialize`） */
-    return serialize(async () => {
+  const marks = useMemo(() => {
+    const revise: Array<[number, string]> = [];
+    const insert: Array<[number, string]> = [];
+    const note: Array<[number, string]> = [];
+    const edit: Array<[number, string]> = [];
+    for (const [k, v] of Object.entries(draftLive)) {
+      const t = String(v || '').trim();
+      if (k.startsWith('=')) {
+        /* 直接改：和这一块现在的原文一样就不算改（打开框不动它不该变成一处标记）；改成空 = 不要了，那是 ✕ 的事 */
+        const line = Number(k.slice(1));
+        if (t && t !== blockSource(line).trim()) edit.push([line, String(v)]);
+        continue;
+      }
+      if (!t) continue;
+      if (k.startsWith('note:')) note.push([Number(k.slice(5)), t]);
+      else if (k.startsWith('+')) insert.push([Number(k.slice(1)), t]);
+      else revise.push([Number(k), t]);
+    }
+    const inDropped = (line: number) => Object.keys(dropped).some((d) => covers(Number(d), line));
+    const drops = Object.keys(dropped).map(Number).sort((a, b) => a - b);
+    const byLine = (a: [number, string], b: [number, string]) => a[0] - b[0];
+    const edited = new Set(edit.map(([l]) => l));
+    return {
+      edit: edit.filter(([l]) => !inDropped(l)).sort(byLine),
+      /* 同一块你自己直接改了，就不再让模型按意见改它 —— 你写的那份说了算 */
+      revise: revise.filter(([l]) => !inDropped(l) && !edited.has(l)).sort(byLine),
+      insert: insert.filter(([l]) => !inDropped(l)).sort(byLine),
+      note: note.sort(byLine),
+      drops,
+      whole: wholeDraft.trim(),
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftLive, dropped, wholeDraft, covers, text]);
+  const markCount = marks.edit.length + marks.revise.length + marks.insert.length + marks.note.length + marks.drops.length + (marks.whole ? 1 : 0);
+  const confirmLabel = markCount > 1 ? `✓ 确认（${markCount} 处）` : '✓ 确认';
+  const confirmTitle = '提交全部标记 —— 每一处排进队列，由打开这份文件的那条会话生成、KiroLex 写回（⌘/Ctrl + Enter）';
+
+  /**
+   * 把 KiroLex 自己改不了的那些**一条消息**发给那条会话，由它自己改文件（deck 那侧）。
+   * 先备份再发：这条路是会话自己写这个文件，走不到 `reviewWriteFile` 那道「写前拷一份」。
+   */
+  const sendToSession = (message: string): boolean => {
+    if (!onSubmit) return false;
+    void window.kiroApi.reviewBackupFile?.(sessionId, path).then((res: any) => {
+      setBackupWarn(res?.ok ? '' : String(res?.error || '没能备份'));
+    });
+    onSubmit(message);
+    setJustSent(true);
+    window.setTimeout(() => setJustSent(false), 4000);
+    return true;
+  };
+
+  /** 标记的键在改动之后要跟着它那一行走（`patch.keep`：旧行号 → 新行号）；对不上的就丢掉。 */
+  const remapKeyed = <V,>(cur: Record<string, V>, keep: Record<number, number>, done: string): Record<string, V> => {
+    const out: Record<string, V> = {};
+    for (const [k, v] of Object.entries(cur)) {
+      if (k === done) continue;
+      const m = /^(\+|=|drop:)?(\d+)$/.exec(k);
+      if (!m) { out[k] = v; continue; }   // 讲稿 `note:页`、`whole` 不随正文挪
+      const toLine = keep[Number(m[2])];
+      if (toLine) out[`${m[1] || ''}${toLine}`] = v;
+    }
+    return out;
+  };
+
+  /*
+    此刻挂着的那个 pane 的 setter（见 `paneApis`）—— 后台那条跑完时，这个 pane 可能已经卸掉、换成了新的一个；
+    放回标记、挂原因要落到你看得见的那一个上。一个都没挂着时落回自己（那时也没人看）。
+  */
+  const own: PaneApi = { setDraftLive, setApplyNote, setDropped, setWholeDraft, setMarkOrder, setNotes, typeDraft, clearDraft };
+  useLayoutEffect(() => {
+    paneApis.set(path, own);
+    return () => { if (paneApis.get(path) === own) paneApis.delete(path); };
+  });
+  const livePane = (): PaneApi => paneApis.get(path) ?? own;
+
+  /** 写回 + 报一句 + 交回上层 —— 每一处收尾都一样。 */
+  /**
+   * `alreadyWritten`：主进程已经拼好、写好了（`apply` 那条路，窗口不在也不丢）—— 这里只跟着刷新界面，
+   * 不再写一遍，会话里那句"落盘完成"也由主进程说过了。
+   */
+  const writeBack = async (base: string, fullText: string, key: string, what: string, alreadyWritten = false): Promise<boolean> => {
+    if (!alreadyWritten) {
+      const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText);
+      if (!wrote?.ok) {
+        livePane().setApplyNote((cur) => ({ ...cur, [key]: `写不进这个文件：${wrote?.error || '未知原因'}` }));
+        return false;
+      }
+    }
+    const baseBlocks = lineBlocks(base);
+    const patch = rewritePatch(
+      baseBlocks.flatMap((b) => (b.kind === 'line' ? [{ index: b.index, text: b.text }] : [])),
+      fullText,
+    );
+    /* 提交之后又标的那些、没做成退回来的那些、排在后面的那些 —— 全都跟着它们那一行走 */
+    livePane().setDraftLive((cur) => remapKeyed(cur, patch.keep, ''));
+    livePane().setMarkOrder((cur) => remapKeyed(cur, patch.keep, ''));
+    livePane().setApplyNote((cur) => remapKeyed(cur, patch.keep, key));
+    livePane().setDropped((cur) => {
+      const out: Record<number, true> = {};
+      for (const k of Object.keys(cur)) { const to = patch.keep[Number(k)]; if (to) out[to] = true; }
+      return out;
+    });
+    remapReviewLines(path, patch.keep);
+    /*
+      在会话里报一句 ——「不然不知道修改成功了没有」。报的是**已经发生的事实**（写进了哪个文件、
+      做了什么），而不是让模型说一句它看不见的"已修改"。这句标成 KiroLex 自己说的话，不发给模型。
+    */
+    if (!alreadyWritten) {
+      void window.kiroApi.sessionNote?.(
+        sessionId!,
+        `✅ ${what}（现在 ${fullText.length} 字）\n文件：${path}\n`
+        + 'KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。',
+      );
+    }
+    textRef.current = fullText;
+    fileText.set(path, fullText);
+    onRewritten?.(fullText);
+    return true;
+  };
+
+  /**
+   * 这一块在**此刻**的文件里占哪一段 —— **按原文找，不按行号**。
+   *
+   * 排在队里的那条提交的时候记下了锚点那一行的原文；轮到它时前面的改动可能已经让行号挪了好几行
+   * （上面加了一段、删了一段）。按行号去对就会"这一处已经变了"，或者更糟 —— 对上了别的段。
+   * 所以拿原文在此刻的正文里找，有几处一样的就取离原来行号最近的那一处。找不到（那一行本身被前面的
+   * 改动改掉了）就返回 null，调用方说清楚，而不是改错地方。
+   */
+  const locate = (base: string, anchorText: string, nearLine: number): { from: number; to: number; anchor: number } | null => {
+    const baseBlocks = lineBlocks(base);
+    let best: number | null = null;
+    for (const b of baseBlocks) {
+      if (b.kind !== 'line' || b.text !== anchorText) continue;
+      if (best === null || Math.abs(b.index - nearLine) < Math.abs(best - nearLine)) best = b.index;
+    }
+    if (best === null) return null;
+    const g = displayGroups(baseBlocks).find((x) => x.anchor === best);
+    const { from, to } = spanRange(g && g.span.length > 1 ? g.span : dropSpan(baseBlocks, best));
+    return { from, to, anchor: best };
+  };
+  /** 一块在**此刻屏幕上**的原文 —— 提交那一刻记下来，排队期间行号怎么挪都按它找。 */
+  const anchorTextOf = (anchor: number): string | undefined => {
+    const b = blocks.find((x) => x.index === anchor);
+    return b && b.kind === 'line' ? b.text : undefined;
+  };
+  /** 这一块（标题连整节、围栏连整段）此刻的 Markdown 原文 —— ✎ 框里一开始放的就是它。 */
+  function blockSource(anchor: number): string {
+    const span = spans[anchor] && spans[anchor].length > 1 ? spans[anchor] : [anchor];
+    const { from, to } = spanRange(span);
+    return sliceLines(text, from, to).replace(/\n+$/, '');
+  }
+
+  /*
+    标记一变就存（连同每个行号此刻的原文，见 `loadMarks`）；一条都没有就把这份文件的那一项删掉。
+    **停下来 0.4 秒才写** —— 每个按键都把整张表 parse 一遍、stringify 一遍、再经主进程写一次盘，打字就卡。
+    pane 卸掉（换标签、藏预览栏）时把还没写的那一份立刻写掉，不丢。
+  */
+  const pendingSave = useRef<(() => void) | null>(null);
+  useEffect(() => () => { pendingSave.current?.(); pendingSave.current = null; }, []);
+  useEffect(() => {
+    const run = () => {
+      pendingSave.current = null;
+    const drafts: Record<string, string> = Object.fromEntries(Object.entries(draftLive).filter(([, v]) => String(v || '').trim()));
+    const drops = Object.keys(dropped).map(Number);
+    let whole = wholeDraft;
+    /* 提交了还没写完的那些也照标记的样子存 —— 窗口在这期间 reload 了，它们回来时还是标记 */
+    const interrupted: string[] = [];
+    const interruptedTickets: Record<string, string> = {};
+    for (const j of jobs) {
+      const k = j.persist?.key;
+      if (!k) continue;
+      interrupted.push(k);
+      if (j.persist?.ticket) interruptedTickets[k] = j.persist.ticket;
+      if (k.startsWith('drop:')) { const n = Number(k.slice(5)); if (!drops.includes(n)) drops.push(n); }
+      else if (k === 'whole') whole = whole.trim() ? whole : j.persist!.text;
+      else if (!String(drafts[k] || '').trim()) drafts[k] = j.persist!.text;
+    }
+    if (!Object.keys(drafts).length && !drops.length && !whole.trim()) { saveMarks(path, null); return; }
+    const anchors: Record<string, string> = {};
+    if (!isDeck) {
+      const lines = [...drops, ...Object.keys(drafts).map((k) => /^[+=]?(\d+)$/.exec(k)?.[1]).filter(Boolean).map(Number)];
+      for (const line of lines) { const t = anchorTextOf(line); if (t !== undefined) anchors[String(line)] = t; }
+    }
+    saveMarks(path, {
+      drafts, dropped: drops, whole, order: markOrder,
+      ...(interrupted.length ? { interrupted, interruptedTickets } : {}),
+      ...(isDeck ? {} : { anchors }),
+    });
+    };
+    pendingSave.current = run;
+    const timer = window.setTimeout(run, 400);
+    return () => window.clearTimeout(timer);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [draftLive, dropped, wholeDraft, markOrder, path, jobs]);
+
+  /** 排进这份文件的队列 —— 提交那一刻全部排上，轮到了才真的开跑。 */
+  /**
+   * 排进队列。每一条带一张 **ticket**（主进程按它认这一次改写 —— 取消只取消它，不碰你正在跑的那一轮对话），
+   * 同时登记进 `reviewQueue`：会话那边的队列旁边也看得见、也能取消（「为什么不直接用会话的 queue 功能」）。
+   *
+   * 取消：还没轮到的直接跳过；已经在跑的让主进程停掉**这一次**改写（`reviewCancel`）。两种都把标记放回去
+   * （`restore`）—— 取消是"这次先别做"，不是"这条意见不要了"，要不要再提交你自己定。
+   */
+  const enqueue = (kind: Job['kind'], line: number, run: (ticket: string) => Promise<boolean>, restore: () => void, persist?: Job['persist']) => {
+    const id = ++jobSeq.current;
+    const ticket = `rv:${path}#${id}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+    const what = kind === 'insert' ? (isDeck ? '加一页' : '加一段') : kind === 'delete' ? '删除'
+      : kind === 'whole' ? '整篇改写' : kind === 'note' ? '改讲稿' : kind === 'edit' ? '直接改' : '改写';
+    const where = kind === 'whole' ? '' : isDeck ? ` · 第 ${line} 页` : ` · ${whereOf(line, line)}`;
+    let running = false;
+    const cancel = () => {
+      cancelledTickets.add(ticket);
+      if (running) void window.kiroApi.reviewCancel?.(ticket).catch?.(() => {});
+    };
+    putReviewItem({
+      id: ticket, sessionId: sessionId || '', path, file: fileName, kind, line,
+      label: `${what}${where}`, state: 'queued', cancel, ...(persist ? { persist: { ...persist, ticket } } : {}),
+    });
+    void serialize(async () => {
       try {
-        const base = textRef.current;
-        const baseBlocks = lineBlocks(base);
-        /*
-          这一块在**此刻**的文件里占哪一段：前一条改写可能已经挪动了行号，所以按锚点那一行的原文去对 ——
-          对不上（那一行已经被前一条改掉了）就不改，说清楚，而不是改错地方。
-        */
-        const textAt = (list: ReviewBlock[], line: number) => {
-          const b = list.find((x) => x.index === line);
-          return b && b.kind === 'line' ? b.text : undefined;
-        };
-        const anchorText = textAt(blocks, anchor);
-        const stillThere = anchorText !== undefined && textAt(baseBlocks, anchor) === anchorText;
-        if (!stillThere) {
-          setApplyNote((cur) => ({ ...cur, [String(anchor)]: '这一处在前一条改写里已经变了 —— 看一眼新的正文，再对它提一次' }));
-          return false;
-        }
-        const span = (() => {
-          const g = displayGroups(baseBlocks).find((x) => x.anchor === anchor);
-          return g && g.span.length > 1 ? g.span : dropSpan(baseBlocks, anchor);
-        })();
-        /* 按闭区间取原文、按闭区间换回去 —— 段落之间的空行照带（见 `spanRange`） */
-        const { from, to } = spanRange(span);
-        const where = sliceLines(base, from, to);
-        const about = path;
-        /* 位置写进显示文本：整节写范围，单行写行号 —— 回头翻会话要看得出说的是哪儿 */
-        const name = path.split(/[\\/]/).pop() || path;
-        const label = from !== to ? `${name} 第 ${from}–${to} ${unit}` : `${name} 第 ${from} ${unit}`;
-        let res: any = await window.kiroApi.reviseInSession?.({
-          sessionId, where, note: instruction, about, label, scope: 'block',
-        });
-        let gotWhole = false;
-        if (res?.cannot) {
-          setApplyNote((cur) => ({ ...cur, [String(anchor)]: '这条改不了单独一块 —— 正在按整份重改…' }));
-          res = await window.kiroApi.reviseInSession?.({
-            sessionId, where, note: instruction, about, label: `${label}（整份）`, scope: 'whole',
-            /* 整份重改以**盘上此刻**这一份为基准，不让它照自己记得的旧版重写 */
-            full: base,
-          });
-          gotWhole = true;
-        }
-        if (!res?.ok || typeof res.text !== 'string') {
-          setApplyNote((cur) => ({
-            ...cur,
-            [String(anchor)]: res?.cannot
-              ? `改不了：${res.cannot} —— 换个说法再试，或者「记下」它，从下面「提交」交给会话自己动手`
-              : `改写失败：${res?.error || '没有返回'}`,
-          }));
-          return false;
-        }
-        /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
-        const fullText = gotWhole ? String(res.text) : spliceLines(base, from, to, String(res.text));
-        const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText);
-        if (!wrote?.ok) {
-          setApplyNote((cur) => ({ ...cur, [String(anchor)]: `写不进这个文件：${wrote?.error || '未知原因'}` }));
-          return false;
-        }
-        /* 剩下那些意见按 `keep` 重新对位；对不上的就丢掉 */
-        const patch = rewritePatch(
-          baseBlocks.flatMap((b) => (b.kind === 'line' ? [{ index: b.index, text: b.text }] : [])),
-          fullText,
-        );
-        const remap = <V,>(map: Record<number, V>): Record<number, V> => {
-          const out: Record<number, V> = {};
-          for (const [k, v] of Object.entries(map)) {
-            const fromLine = Number(k);
-            if (fromLine === anchor) continue;                 // 这一条已经生效了
-            const toLine = patch.keep[fromLine];
-            if (toLine) out[toLine] = v;
-          }
-          return out;
-        };
-        setComments((cur) => remap(cur));
-        setDropped((cur) => remap(cur));
-        setDraftLive((cur) => {
-          const out: Record<string, string> = {};
-          for (const [k, v] of Object.entries(cur)) {
-            const toLine = Number(k) === anchor ? 0 : patch.keep[Number(k)];
-            if (toLine) out[String(toLine)] = v;
-          }
-          return out;
-        });
-        setApplyNote({});
-        /*
-          在会话里报一句 ——「不然不知道修改成功了没有」。报的是**已经发生的事实**（写进了哪个文件、
-          多少字），而不是让模型说一句它看不见的"已修改"。这句标成 KiroLex 自己说的话，不发给模型。
-        */
-        void window.kiroApi.sessionNote?.(
-          sessionId,
-          `✅ 已写回这份文件（${fullText.length} 字）\n文件：${path}\n`
-          + 'KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。',
-        );
-        textRef.current = fullText;
-        setOpenAt(null);
-        onRewritten?.(fullText);
-        return true;
+        if (cancelledTickets.has(ticket)) { restore(); return false; }
+        running = true;
+        patchReviewItem(ticket, { state: 'running' });
+        const ok = await run(ticket);
+        /* 跑完才发现被取消了（主进程回了 cancelled，或者取消落在两次往返之间）—— 标记放回去 */
+        if (!ok && cancelledTickets.has(ticket)) restore();
+        return ok;
+      } catch {
+        return false;
       } finally {
-        setApplyingAt(null);
+        cancelledTickets.delete(ticket);
+        removeReviewItem(ticket);
       }
     });
   };
+  /*
+    pane 卸掉（藏起预览栏、换标签）**不取消**排着的那些：队列是闭包，照样一条条跑完、写回、从清单里摘掉
+    （`finally`）。藏一下侧栏就把你提交的改动全撤了，那才是意外。
+  */
 
   /**
-   * 一块的按钮 —— 和它的**输入框分开**。
+   * **一处 💬 / ＋** —— 轮到了发给打开这份文件的那条会话，KiroLex 拼回整份、写回文件。
    *
-   * 「在填写 comment 的时候也应该在整段下面」：标题上的意见管的是整节，所以框要出现在**整节的末尾**，
-   * 而不是紧贴标题那一行。按钮留在标题上（那是你点的地方），框由 `noteBoxFor` 渲染到整节最后一行下面。
+   * 💬：先只要**这一块**（快），它回 `CANNOT-REVISE-LOCALLY` 才要整份（加段/删段/挪位置）。
+   * ＋：只要**新加的那部分**，插在这一块（标题就是整节）后面 —— 原文不经过模型，就不会被顺手润色。
+   * 没做成的：标记放回去、原因挂在那一段下面，下次提交会再带上它。
    */
+  const queueText = (anchor: number, instruction: string, mode: 'revise' | 'insert') => {
+    const anchorText = anchorTextOf(anchor);
+    if (anchorText === undefined) return;
+    const key = mode === 'insert' ? `+${anchor}` : String(anchor);
+    livePane().clearDraft(key);
+    livePane().setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; });
+    enqueue(mode, anchor, async (ticket) => {
+      let failKey = key;
+      const fail = (why: string) => {
+        livePane().typeDraft(failKey, instruction);
+        livePane().setApplyNote((cur) => ({ ...cur, [failKey]: why }));
+        return false;
+      };
+      const base = currentText();
+      const at = locate(base, anchorText, anchor);
+      if (!at) return fail('这一段在前面的改动里已经变了 —— 看一眼新的正文，再对它提一次');
+      const { from, to } = at;
+      failKey = mode === 'insert' ? `+${at.anchor}` : String(at.anchor);
+      /* 按闭区间取原文、按闭区间换回去 —— 段落之间的空行照带（见 `spanRange`） */
+      const where = sliceLines(base, from, to);
+      /* 位置写进显示文本 —— 回头翻会话要看得出说的是哪儿 */
+      const label = `${fileName} ${whereOf(from, to)}`;
+      if (mode === 'insert') {
+        const res: any = await window.kiroApi.reviseInSession?.({
+          sessionId: sessionId!, where, note: instruction, about: path, label: `${label} 后面新加`, scope: 'insert', ticket,
+          apply: { path, mode: 'insert', to, base },
+        });
+        if (res?.cancelled) return false;
+        if (!res?.ok || typeof res.text !== 'string') {
+          return fail(res?.cannot ? `加不了：${res.cannot}` : `生成失败：${res?.error || '没有返回'}`);
+        }
+        /*
+          主进程得真的走了 insert 那一档 —— 旧的主进程不认它、按 block 改，回来的是**改过的原文**，
+          插进去就是同一段出现两遍。没回报 scope 的一律不写。
+        */
+        if (res.scope !== 'insert') {
+          return fail('主进程还是旧版本，不认「加一段」—— 重启 KiroLex 之后再试（这次什么都没写）');
+        }
+        if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true);
+        const fullText = insertAfterLines(base, to, String(res.text));
+        return writeBack(base, fullText, failKey, `已在${label}后面加了一段`);
+      }
+      let res: any = await window.kiroApi.reviseInSession?.({
+        sessionId: sessionId!, where, note: instruction, about: path, label, scope: 'block', ticket,
+        apply: { path, mode: 'splice', from, to, base },
+      });
+      if (res?.cancelled) return false;
+      let gotWhole = false;
+      if (res?.cannot) {
+        res = await window.kiroApi.reviseInSession?.({
+          sessionId: sessionId!, where, note: instruction, about: path, label: `${label}（整份）`, scope: 'whole',
+          /* 整份重改以**盘上此刻**这一份为基准，不让它照自己记得的旧版重写 */
+          full: base, ticket,
+          apply: { path, mode: 'whole', base },
+        });
+        if (res?.cancelled) return false;
+        gotWhole = true;
+      }
+      if (!res?.ok || typeof res.text !== 'string') {
+        return fail(res?.cannot ? `改不了：${res.cannot} —— 换个说法再试` : `改写失败：${res?.error || '没有返回'}`);
+      }
+      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true);
+      /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
+      const fullText = gotWhole ? String(res.text) : spliceLines(base, from, to, String(res.text));
+      return writeBack(base, fullText, failKey, `已按意见改了${label}`);
+    }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
+  };
+
   /**
-   * 删掉这一块 / 这一页。deck 那侧（`labelled`）**写出字来、单独摆在页头** ——「删除按钮应该 ppt 和 note
-   * 都删，这个应该单独找个显眼的地方放着」：它删的是整页（版面和讲稿一起走），和那两个"对某样东西提意见"
-   * 的入口不是一类动作，挤在一起你分不清哪个删的是什么。
+   * **一处 ✎ 直接改** —— 不问模型：这一块（标题就是整节）原样换成你写的那份。排在 ＋ 后面、💬 前面：
+   * ＋ 要按这一块的**原文**找位置，先换掉就找不到了。同样排队、按原文找、写前备份；没做成就把标记放回去。
    */
-  const dropTool = (block: ReviewBlock, groupSpan?: number[], labelled = false) => {
-    const gone = !!dropped[block.index];
-    /**
-     * ✕ 这一块实际会删掉哪些 —— 标题连整节；**代码围栏连它自己那几行**。只删围栏开头那一行的话，
-     * 剩下的代码会散在文档里，而模型拿到的是"删掉第 12 行"，照做之后文档就坏了。
-     */
-    const span = groupSpan && groupSpan.length > 1 ? groupSpan : dropSpan(blocks, block.index);
+  const queueEdit = (anchor: number, replacement: string) => {
+    const anchorText = anchorTextOf(anchor);
+    if (anchorText === undefined) return;
+    const key = `=${anchor}`;
+    livePane().clearDraft(key);
+    livePane().setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; });
+    enqueue('edit', anchor, async () => {
+      const base = currentText();
+      const at = locate(base, anchorText, anchor);
+      if (!at) {
+        livePane().typeDraft(`=${anchor}`, replacement);
+        livePane().setApplyNote((cur) => ({ ...cur, [key]: '这一段在前面的改动里已经变了 —— 没换，看一眼新的正文再改' }));
+        return false;
+      }
+      const fullText = spliceLines(base, at.from, at.to, replacement.replace(/\n+$/, ''));
+      return writeBack(base, fullText, `=${at.anchor}`, `已按你写的直接改了 ${fileName} ${whereOf(at.from, at.to)}`);
+    }, () => livePane().typeDraft(key, replacement), { key, text: replacement });
+  };
+
+  /** **一处 ✕** —— 不问模型：删是确定的操作。同样排队、按原文找、写前备份；没做成就把删除标记放回去。 */
+  const queueDelete = (anchor: number) => {
+    const anchorText = anchorTextOf(anchor);
+    if (anchorText === undefined) return;
+    enqueue('delete', anchor, async () => {
+      const base = currentText();
+      const at = locate(base, anchorText, anchor);
+      if (!at) {
+        livePane().setApplyNote((cur) => ({ ...cur, [`drop:${anchor}`]: '这一段在前面的改动里已经变了 —— 没删，看一眼新的正文再标' }));
+        return false;
+      }
+      return writeBack(base, deleteLines(base, at.from, at.to), `drop:${at.anchor}`, `已删掉 ${fileName} ${whereOf(at.from, at.to)}`);
+    }, () => livePane().setDropped((cur) => ({ ...cur, [anchor]: true })), { key: `drop:${anchor}`, text: '' });
+  };
+
+  /** **整篇的意见** —— 按整份重改，带盘上此刻的正文当基准。排在最后：先让逐段的那些落定。 */
+  const queueWhole = (note: string) => {
+    livePane().setApplyNote((cur) => { const n = { ...cur }; delete n.whole; return n; });
+    enqueue('whole', 0, async (ticket) => {
+      const base = currentText();
+      const res: any = await window.kiroApi.reviseInSession?.({
+        sessionId: sessionId!, where: '（整篇 —— 这条意见不针对某一处）', note, about: path,
+        label: `${fileName} 整篇`, scope: 'whole', full: base, ticket,
+        apply: { path, mode: 'whole', base },
+      });
+      if (res?.cancelled) return false;
+      if (!res?.ok || typeof res.text !== 'string' || !String(res.text).trim()) {
+        livePane().setWholeDraft((cur) => cur || note);
+        livePane().setApplyNote((cur) => ({ ...cur, whole: res?.cannot ? `改不了：${res.cannot}` : `改写失败：${res?.error || '没有返回'}` }));
+        return false;
+      }
+      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, 'whole', '', true);
+      return writeBack(base, String(res.text), 'whole', '已按整篇的意见改完');
+    }, () => livePane().setWholeDraft((cur) => cur || note), { key: 'whole', text: note });
+  };
+
+  /**
+   * **deck 一页的版面文字**（`.pptx`，当场改）—— 一次往返：这一页现有的文字（按 run 地址编号）连同意见发给
+   * 那条会话，它只回 `地址<TAB>新文本` 和几条版面指令，KiroLex 按地址写进去（字号、加粗、字体不动）。
+   * 改不了的（换图、动别的页）退回给会话自己改。改完 mtime 变了，`changedAt` 一变预览就重转重画。
+   */
+  const queueSlide = (page: number, instruction: string) => {
+    livePane().clearDraft(String(page));
+    enqueue('revise', page, async (ticket) => {
+      const res: any = await window.kiroApi.deckReviseSlideText?.({ sessionId: sessionId!, filePath: path, page, note: instruction, ticket });
+      if (res?.cancelled) return false;
+      if (!res?.ok) {
+        if (res?.cannot) {
+          return sendToSession(`请改「${path}」第 ${page} 页：${instruction}\n（KiroLex 当场改不了这一条：${res.cannot}）\n改完保存这个文件。`);
+        }
+        livePane().typeDraft(String(page), instruction);
+        livePane().setApplyNote((cur) => ({ ...cur, [String(page)]: `改写失败：${res?.error || '没有返回'}` }));
+        return false;
+      }
+      void window.kiroApi.sessionNote?.(
+        sessionId!,
+        `✅ 已改第 ${page} 页幻灯片（${res.changed} 处）${res.partial ? `；${res.partial}` : ''}\n文件：${path}\n`
+        + 'KiroLex 按 run 地址落盘完成（写前已备份，字号和加粗没动）。',
+      );
+      return true;
+    }, () => livePane().typeDraft(String(page), instruction), { key: String(page), text: instruction });
+  };
+
+  /**
+   * **deck 一页的演讲者备注**（`.pptx`，当场改）—— 要回这一页的新讲稿，KiroLex 用 python-pptx 只改这一页的
+   * 备注，版面和别的页不动。PDF 不用重转（讲稿不在 PDF 里）。
+   */
+  const queueNote = (page: number, instruction: string) => {
+    const key = `note:${page}`;
+    livePane().clearDraft(key);
+    const before = notes?.[page - 1] || '';
+    enqueue('note', page, async (ticket) => {
+      const fail = (why: string) => { livePane().typeDraft(key, instruction); livePane().setApplyNote((cur) => ({ ...cur, [key]: why })); return false; };
+      const res: any = await window.kiroApi.reviseInSession?.({
+        sessionId: sessionId!,
+        where: before || '（这一页原来没写备注）',
+        note: instruction,
+        /* 带上全路径：一条会话里可能同时开着几份 deck，只说"第 3 页"它分不出是哪一份 */
+        about: `${path} 第 ${page} 页的演讲者备注（讲稿，不是幻灯片上的字）`,
+        label: `${fileName} 第 ${page} 页备注`,
+        ticket,
+      });
+      if (res?.cancelled) return false;
+      if (!res?.ok || typeof res.text !== 'string') return fail(res?.cannot ? `改不了：${res.cannot}` : `改写失败：${res?.error || '没有返回'}`);
+      const wrote: any = await window.kiroApi.deckWriteNote?.(sessionId, path, page, res.text);
+      if (!wrote?.ok) return fail(`写不进这一页的备注：${wrote?.error || '未知原因'}`);
+      /* 用**重抽出来的**那一份，不是我们以为写进去的那份 */
+      if (Array.isArray(wrote.notes)) livePane().setNotes(wrote.notes);
+      void window.kiroApi.sessionNote?.(
+        sessionId!,
+        `✅ 已写入第 ${page} 页的演讲者备注（${String(res.text).length} 字）\n文件：${path}\n`
+        + 'KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。',
+      );
+      return true;
+    }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
+  };
+
+  /**
+   * **提交全部标记** —— 任何一个框的「✓ 确认」和最下面的「提交」都是它。
+   *
+   * 文本那侧的顺序：＋ → 💬 → ✕ → 整篇。＋ 在 💬 前面：同一段既要改又要在后面加时，＋ 按这一段的**原文**找位置，
+   * 先改了它就找不到了；✕ 和整篇放最后，让逐段的那些先落定。位置都按原文找（`locate`），谁先谁后不会错位。
+   */
+  const submitAll = (): boolean => {
+    if (!sessionId || markCount === 0) return false;
+    closeBoxes();
+    if (!isDeck) {
+      for (const [line, t] of marks.insert) queueText(line, t, 'insert');
+      for (const [line, t] of marks.edit) queueEdit(line, t);
+      for (const [line, t] of marks.revise) queueText(line, t, 'revise');
+      for (const line of marks.drops) queueDelete(line);
+      if (marks.whole) queueWhole(marks.whole);
+      /* 落在标了删的整节里的那些意见作废 —— 那一节都要走了 */
+      livePane().setDraftLive((cur) => {
+        const out: Record<string, string> = {};
+        for (const [k, v] of Object.entries(cur)) {
+          const m = /^[+=]?(\d+)$/.exec(k);
+          if (m && Object.keys(dropped).some((d) => covers(Number(d), Number(m[1])))) continue;
+          out[k] = v;
+        }
+        return out;
+      });
+      livePane().setDropped({});
+      livePane().setWholeDraft('');
+      livePane().setMarkOrder({});
+      return true;
+    }
+    /*
+      deck：当场改得了的（`.pptx` 一页的字、一页讲稿）一页一页排队改；其余的 —— 加页、删页、`.pdf` / 不能改的
+      deck 上的意见、整份的意见 —— 拼成**一条**消息发给会话，由它一次改完（拆成几条发，它就得改几遍、存几遍）。
+    */
+    const handOff: string[] = [];
+    for (const [page, t] of marks.revise) {
+      if (live) queueSlide(page, t);
+      else { handOff.push(`· 第 ${page} 页（版面）：${t}`); livePane().clearDraft(String(page)); }
+    }
+    for (const [page, t] of marks.note) {
+      if (live) queueNote(page, t);
+      else { handOff.push(`· 第 ${page} 页（演讲者备注）：${t}`); livePane().clearDraft(`note:${page}`); }
+    }
+    for (const [page, t] of marks.insert) { handOff.push(`· 在第 ${page} 页后面新加一页：${t}`); livePane().clearDraft(`+${page}`); }
+    for (const page of marks.drops) handOff.push(`· 删掉第 ${page} 页（版面和演讲者备注一起）`);
+    if (marks.whole) handOff.push(`· 整份：${marks.whole}`);
+    if (handOff.length) {
+      /* 页号按**提交这一刻**的说 —— 删页、加页会让后面的页号变，所以叫它整批按这份清单一次改完 */
+      sendToSession(`请按下面这几条改「${path}」（页号都是改之前的），一次改完、保存这个文件：\n${handOff.join('\n')}`);
+    }
+    livePane().setDropped({});
+    livePane().setWholeDraft('');
+    livePane().setMarkOrder({});
+    return true;
+  };
+
+  /** 排着的改动锁住的行 —— **整节一起锁**：标题那条意见改的是整节，节内任何一行都不能同时再标。 */
+  const lockedLines = new Set<number>();
+  /** 行 → 挂在它下面的那几条状态（排队中 / 进行中）—— 摆在那一节的**末行**，和框原来的位置同一处。 */
+  const statusAt = new Map<number, Job[]>();
+  if (!isDeck) {
+    for (const j of jobs) {
+      if (j.kind === 'whole') continue;
+      const span = spans[j.line] && spans[j.line].length > 1 ? spans[j.line] : [j.line];
+      for (const l of span) lockedLines.add(l);
+      const host = span[span.length - 1];
+      statusAt.set(host, [...(statusAt.get(host) || []), j]);
+    }
+  }
+  /** 一条排着的改动那一行：前面还有几条、在做什么 —— 队在哪儿得看得见。 */
+  const jobRow = (j: Job) => {
+    const ahead = jobs.findIndex((x) => x.id === j.id);
+    const what = j.kind === 'insert' ? (isDeck ? '加一页' : '加一段') : j.kind === 'delete' ? '删除'
+      : j.kind === 'whole' ? '整篇改写' : j.kind === 'note' ? '改讲稿' : j.kind === 'edit' ? '直接改' : '改写';
+    const where = j.kind === 'whole' ? '' : `${isDeck ? `第 ${j.line} 页` : spanWhere(j.line)} · `;
     return (
-      <button
-        type="button"
-        className={`rt-block-drop${gone ? ' on' : ''}${labelled ? ' rv-drop-page' : ''} nopan nodrag`}
-        title={gone ? '不删了'
-          : labelled ? '删掉这一页 —— 版面和讲稿一起不要了（提交时一起发给会话）'
-          : span.length > 1 ? `删掉这一块和它带着的整节（第 ${span[0]}–${span[span.length - 1]} ${unit}）—— 提交时一起发给会话`
-          : `这一${unit}删掉 —— 提交时一起发给会话`}
-        onClick={() => setDropped((cur) => {
-          const next = { ...cur };
-          for (const at of span) { if (gone) delete next[at]; else next[at] = true; }
-          return next;
-        })}
-      >{gone ? (labelled ? '↩ 不删了' : '↩') : (labelled ? '✕ 删掉这一页' : '✕')}</button>
+      <div key={j.id} className={`rt-block-lock${j.state === 'queued' ? ' queued' : ''}`} aria-live="polite">
+        {j.state === 'running'
+          ? `${where}${what}中…（在那条会话里做，做完自动写回）`
+          : `${where}${what}排队中（前面还有 ${ahead} 条）`}
+        {/* 取消这一条 —— 没轮到的不发，在跑的只停它自己那一轮；标记放回去（会话那边的队列旁边也有同一个按钮） */}
+        {j.cancel && (
+          <button type="button" className="rt-hist-btn rv-job-cancel nopan nodrag" title="取消这一条（标记会放回去）"
+            onClick={() => j.cancel!()}>取消</button>
+        )}
+      </div>
     );
   };
 
-  /** 一块的入口按钮（💬）+ 删除 —— 框不在这里，见 `noteBoxFor`（整节的意见要写在整节下面）。 */
-  const tools = (block: ReviewBlock, groupSpan?: number[], only?: 'comment') => {
+  /** 一条标记收起后的样子：点它接着改，✕ 去掉这条标记。没做成的原因跟在后面。 */
+  const markChip = (key: string, markGlyph: string, reopen: () => void) => {
+    const said = String(draftLive[key] || '').trim();
+    const failed = applyNote[key];
+    if (!said && !failed) return null;
+    return (
+      <div key={key} className="rt-brief-row">
+        {said && (
+          <span className="rt-hist-one">
+            <button type="button" className="rt-note-brief nopan nodrag" title="接着改这条标记" onClick={reopen}>
+              <span className="rt-note-brief-mark">{markGlyph}</span>
+              <span className="rt-note-brief-text">{said.replace(/\s+/g, ' ')}</span>
+            </button>
+            {/* 「已经写完的 comment 缺少一个修改按钮」—— 点摘要本身也能改，但那不是一眼看得出来的入口 */}
+            <button type="button" className="rt-hist-btn nopan nodrag" title="修改这条标记" onClick={reopen}>✎</button>
+            <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag" title="去掉这条标记"
+              onClick={() => { clearDraft(key); setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; }); }}>✕</button>
+          </span>
+        )}
+        {failed && <div className="rt-note-applied">{failed}</div>}
+      </div>
+    );
+  };
+
+  /** 一个标记框 —— 写的字就是标记；「✓ 确认」提交全部；「取消」丢掉**这一条**。顶上写明它管的是哪几行。 */
+  const markBox = (key: string, header: string, placeholder: string, markGlyph: string, onClose: () => void) => (
+    <div className={`rv-note-slot${key.startsWith('+') ? ' rv-insert-slot' : ''}`}>
+      <div className="rv-box-target">{header}</div>
+      <CommentBox
+        value=""
+        mark={markGlyph}
+        draft={draftOf(key)}
+        onDraft={(next) => typeDraft(key, next)}
+        startOpen
+        /* 对着一行写的意见通常是一句话 —— 不要一个突然出现的大方块 */
+        rows={2}
+        placeholder={placeholder}
+        onApply={() => submitAll()}
+        applyWhenEmpty={markCount > 0}
+        applyLabel={confirmLabel}
+        applyTitle={confirmTitle}
+        applyNote={applyNote[key] || ''}
+        onChange={() => {}}
+        /* 取消 = 丢掉这一条（CommentBox 把草稿退回空）；框关掉要通知这一层，不然这一块再也点不开 */
+        onDismiss={onClose}
+      />
+    </div>
+  );
+
+  /** 文本那侧每一块的按钮：💬 改这一块、＋ 在后面加、✕ 标删（↩ 取消）。框不在这里，见 `boxFor`。 */
+  const tools = (block: ReviewBlock) => {
+    const where = spanWhere(block.index);
     const gone = !!dropped[block.index];
-    const said = comments[block.index] || '';
-    const open = openAt === block.index;
-    const span = groupSpan && groupSpan.length > 1 ? groupSpan : dropSpan(blocks, block.index);
+    const boxOpen = openAt === block.index || insertAt === block.index || editAt === block.index;
+    const editedHere = !!marks.edit.find(([l]) => l === block.index);
     return (
       <div className="rv-review-tools">
-        {!gone && !open && (
-          <CommentOpener
-            onClick={() => setOpenAt(block.index)}
-            active={!!said}
-            title={(() => {
-              if (isDeck) return said ? `第 ${block.index} 页【版面】的意见：${said}` : `对第 ${block.index} 页的版面提意见`;
-              const where = span.length > 1
-                ? `第 ${span[0]}–${span[span.length - 1]} ${unit}（这一整节）`
-                : `第 ${block.index} ${unit}`;
-              return said ? `${where}的意见：${said}` : `对${where}提意见`;
-            })()}
-          />
+        {!boxOpen && !gone && (
+          <button
+            type="button"
+            className={`rv-edit-btn${editedHere ? ' has-note' : ''} nopan nodrag`}
+            title={`直接改${where}的原文（不经过模型；先标记，一起提交）`}
+            onClick={(e) => {
+              e.stopPropagation();
+              /* 第一次打开时框里放这一块现在的原文 —— 你在它上面改，而不是对着空框重打一遍 */
+              if (!draftLive[`=${block.index}`]) setDraftLive((cur) => ({ ...cur, [`=${block.index}`]: blockSource(block.index) }));
+              openBox('edit', block.index);
+            }}
+          >✎</button>
         )}
-        {/* deck 那侧删按钮单独摆在页头（`only === 'comment'`）—— 见 `dropTool` */}
-        {only !== 'comment' && dropTool(block, groupSpan)}
+        {!boxOpen && !gone && (
+          <CommentOpener onClick={() => openBox('comment', block.index)} active={!!draftOf(String(block.index)).trim()}
+            title={`对${where}提意见（先标记，点「✓ 确认」时一起提交）`} />
+        )}
+        {!boxOpen && !gone && (
+          <button
+            type="button"
+            className={`rv-insert-btn${draftOf(`+${block.index}`).trim() ? ' has-note' : ''} nopan nodrag`}
+            title={`在${where}后面加新内容（先标记，一起提交）`}
+            onClick={(e) => { e.stopPropagation(); openBox('insert', block.index); }}
+          >＋</button>
+        )}
+        {!boxOpen && (
+          <button
+            type="button"
+            className={`rt-block-drop${gone ? ' on' : ''} nopan nodrag`}
+            title={gone ? '不删了' : `把${where}标成删除（点「✓ 确认」时一起提交）`}
+            onClick={(e) => {
+              e.stopPropagation();
+              setDropped((cur) => { const n = { ...cur }; if (gone) delete n[block.index]; else n[block.index] = true; return n; });
+              if (!gone) bumpMark(`drop:${block.index}`);
+            }}
+          >{gone ? '↩' : '✕'}</button>
+        )}
       </div>
     );
   };
 
   /**
-   * 该在**这一行下面**渲染输入框吗 —— 框渲染在打开的那个锚点**覆盖的最后一行**下面：
-   * 普通行就是它自己，标题就是整节的末尾。于是你写的时候看得见自己在评的是哪一段。deck 那侧一页就是一块。
+   * 该在**这一行下面**渲染输入框吗 —— 渲染在打开的那个锚点**覆盖的最后一行**下面：
+   * 普通行就是它自己，标题就是整节的末尾。＋ 的框也在那里 —— 新内容就是要加在那个位置。
+   * 框顶上**写明它管的是哪几行** ——「现在这些 comment 功能没有选择行号」。
    */
-  const noteBoxFor = (line: number) => {
-    if (openAt === null) return null;
-    /* 改写中连框的壳一起收走 —— 那一行「改写中…」由 `lockRow` 摆 */
-    if (applyingAt === openAt) return null;
-    const anchor = openAt;
+  const boxFor = (line: number) => {
+    const anchor = openAt ?? insertAt;
+    if (anchor === null) return null;
     const span = spans[anchor];
     const last = span && span.length > 1 ? span[span.length - 1] : anchor;
     if (last !== line) return null;
-    const said = comments[anchor] || '';
-    /*
-      确认 = 当场生效。两条路按文件形态分：
-        **文本文件**  在会话里改正文，KiroLex 写回文件（`applyOne`）
-        **deck 的页** 问它这一页的文字/版面该怎么改，KiroLex 按 run 地址写（`applySlideOne`，只有 `.pptx`）
-      没有归属会话（或者这份 deck 改不了）就不给这个出口 —— 只有「✓ 确认」= 记下，从最下面一起提交。
-    */
-    const apply = !sessionId ? undefined
-      : isDeck
-        ? (live ? (instruction: string) => applySlideOne(anchor, instruction) : undefined)
-        : (instruction: string) => applyOne(anchor, instruction);
-    return (
-      <div className="rv-note-slot">
-        <CommentBox
-          value={said}
-          draft={draftOf(String(anchor), said)}
-          onDraft={(next) => typeDraft(String(anchor), next)}
-          startOpen
-          /* 对着一行写的意见通常是一句话 —— 不要一个突然出现的大方块 */
-          rows={2}
-          placeholder={isDeck
-            ? `对第 ${anchor} 页版面的意见${live ? ' —— 「✓ 确认」当场改这一页的字/框；「记下」攒着一起提交' : ' —— 提交时一起发给会话'}`
-            : span && span.length > 1
-              ? `对第 ${span[0]}–${span[span.length - 1]} ${unit}（这一整节）的意见`
-              : `对第 ${anchor} ${unit}的意见`}
-          onApply={apply}
-          /* 「记下」= 先攒着，从最下面一起提交（那是一条真出口，所以和「✓ 确认」并排） */
-          allowRecord
-          applying={applyingAt === anchor}
-          applyNote={applyNote[String(anchor)] || ''}
-          onChange={(next) => {
-            setComments((cur) => {
-              const c = { ...cur };
-              if (next) c[anchor] = next; else delete c[anchor];
-              return c;
-            });
-            clearDraft(String(anchor));
-            setOpenAt(null);
-          }}
-          /* 取消也要清掉 —— 不清的话上层以为框还开着，这一块再也点不开。草稿留着（下次点开还是那句话） */
-          onDismiss={() => setOpenAt(null)}
-        />
-      </div>
+    const where = spanWhere(anchor);
+    const insert = insertAt === anchor;
+    return markBox(
+      insert ? `+${anchor}` : String(anchor),
+      insert ? `＋ 加在${where}后面` : `💬 改${where}`,
+      insert ? '写要加的内容，或者说清要它写什么' : '这一段要怎么改',
+      insert ? '＋' : '💬',
+      () => { setOpenAt(null); setInsertAt(null); },
     );
   };
 
   /**
-   * **改一页的演讲者备注，当场生效** ——「为什么不能分页处理」。
-   *
-   * 意见发给打开这份 deck 的那条会话（往往是它刚做出来的），要回**这一页的新讲稿**，然后由 KiroLex
-   * 用 python-pptx 改这一页的备注 —— 版面和别的页的讲稿都不动。PDF 不用重转（讲稿不在 PDF 里）。
+   * **✎ 直接在原文上改** ——「这个修改按钮的效果不对，应该是直接在原文上修改，上方为什么还显示原文」。
+   * 框**顶替**这一块（标题就是整节）：原文不再另外摆一份在上面，你改的就是它本身。
    */
-  const applyNoteOne = async (page: number, instruction: string): Promise<boolean> => {
-    if (!sessionId || !live) return false;
-    const key = `note:${page}`;
-    const before = notes?.[page - 1] || '';
-    setApplyingNoteAt(page);
-    setApplyNote((cur) => ({ ...cur, [key]: '' }));
-    return serialize(async () => {
-      try {
-        const name = path.split(/[\\/]/).pop() || path;
-        const res: any = await window.kiroApi.reviseInSession?.({
-          sessionId,
-          where: before || '（这一页原来没写备注）',
-          note: instruction,
-          /* 带上全路径：一条会话里可能同时开着几份 deck，只说"第 3 页"它分不出是哪一份 */
-          about: `${path} 第 ${page} 页的演讲者备注（讲稿，不是幻灯片上的字）`,
-          label: `${name} 第 ${page} 页备注`,
-        });
-        if (!res?.ok || typeof res.text !== 'string') {
-          setApplyNote((cur) => ({ ...cur, [key]: res?.cannot ? `改不了：${res.cannot}` : `改写失败：${res?.error || '没有返回'}` }));
-          return false;
-        }
-        const wrote: any = await window.kiroApi.deckWriteNote?.(sessionId, path, page, res.text);
-        if (!wrote?.ok) {
-          setApplyNote((cur) => ({ ...cur, [key]: `写不进这一页的备注：${wrote?.error || '未知原因'}` }));
-          return false;
-        }
-        /* 用**重抽出来的**那一份，不是我们以为写进去的那份 */
-        if (Array.isArray(wrote.notes)) setNotes(wrote.notes);
-        void window.kiroApi.sessionNote?.(
-          sessionId,
-          `✅ 已写入第 ${page} 页的演讲者备注（${String(res.text).length} 字）\n文件：${path}\n`
-          + 'KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。',
-        );
-        clearDraft(key);
-        setNoteOpenAt(null);
-        return true;
-      } finally {
-        setApplyingNoteAt(null);
-      }
-    });
+  const editBox = (anchor: number) => {
+    const where = spanWhere(anchor);
+    return (
+        <div className="rv-note-slot rv-edit-slot">
+          <div className="rv-box-target">✎ 直接改{where}（不经过模型）</div>
+          <CommentBox
+            value=""
+            mark="✎"
+            draft={draftOf(`=${anchor}`)}
+            onDraft={(next) => typeDraft(`=${anchor}`, next)}
+            startOpen
+            rows={Math.min(14, Math.max(3, blockSource(anchor).split('\n').length + 1))}
+            placeholder="这一块的原文 —— 直接改"
+            onApply={() => submitAll()}
+            applyWhenEmpty={markCount > 0}
+            applyLabel={confirmLabel}
+            applyTitle={confirmTitle}
+            applyNote={applyNote[`=${anchor}`] || ''}
+            onChange={() => {}}
+            onDismiss={() => setEditAt(null)}
+          />
+        </div>
+      );
   };
 
-  /**
-   * **改一页幻灯片上的文字（和几条版面指令），当场生效** —— 「现在就做一个工具吧」。
-   *
-   * 一次往返：这一页现有的文字（按 run 地址编号）连同你的意见发给那条会话，它只回 `地址<TAB>新文本`
-   * 和几条 `DELETE-SHAPE / ADD-TEXT / MOVE / SET-…`，KiroLex 按地址写进去 —— 字号、加粗、字体一个字节不动。
-   * 改不了的（换图、动别的页）它回 `CANNOT-REVISE-LOCALLY`，那时「记下」它、走提交那条路。
-   * 改完文件 mtime 变了，监听报"文件变了"，`changedAt` 一变预览就重转重画。
-   */
-  const applySlideOne = async (page: number, instruction: string): Promise<boolean> => {
-    if (!sessionId || !live) return false;
-    setApplyingAt(page);
-    setApplyNote((cur) => ({ ...cur, [String(page)]: '' }));
-    return serialize(async () => {
-      try {
-        const res: any = await window.kiroApi.deckReviseSlideText?.({ sessionId, filePath: path, page, note: instruction });
-        if (!res?.ok) {
-          setApplyNote((cur) => ({
-            ...cur,
-            [String(page)]: res?.cannot
-              ? `这条改不了这一页：${res.cannot} —— 「记下」它，从下面「提交」交给会话自己动手`
-              : `改写失败：${res?.error || '没有返回'}`,
-          }));
-          return false;
-        }
-        void window.kiroApi.sessionNote?.(
-          sessionId,
-          `✅ 已改第 ${page} 页幻灯片（${res.changed} 处）${res.partial ? `；${res.partial}` : ''}\n文件：${path}\n`
-          + 'KiroLex 按 run 地址落盘完成（写前已备份，字号和加粗没动）。',
-        );
-        clearDraft(String(page));
-        setOpenAt(null);
-        return true;
-      } finally {
-        setApplyingAt(null);
-      }
-    });
+  /** 删掉这一页（标记）—— 写出字来、单独摆在页头（它删的是整页，和"对某样东西提意见"不是一类动作）。 */
+  const dropPageBtn = (page: number) => {
+    const gone = !!dropped[page];
+    return (
+      <button
+        type="button"
+        className={`rt-block-drop rv-drop-page${gone ? ' on' : ''} nopan nodrag`}
+        title={gone ? '不删了' : '把这一页标成删除 —— 版面和讲稿一起（点「✓ 确认」时一起提交）'}
+        onClick={() => {
+          setDropped((cur) => { const n = { ...cur }; if (gone) delete n[page]; else n[page] = true; return n; });
+          if (!gone) bumpMark(`drop:${page}`);
+        }}
+      >{gone ? '↩ 不删了' : '✕ 删掉这一页'}</button>
+    );
   };
 
-  /**
-   * 正在改写的那一块 —— 收走它自己的入口和输入框，只留一行「改写中…」。一次改写实测十几秒，
-   * 这中间点得动却什么都不做的控件，比一个明说"正在忙"的界面更难懂。**收的只有它自己那条通道**。
-   */
-  const lockRow = () => <div className="rt-block-lock" aria-live="polite">改写中…（在那条会话里改，改完自动写回）</div>;
-  /** 锁住的行 —— **整节一起锁**：标题那条意见改的是整节，节内任何一行都不能同时被处置。 */
-  const lockedLines = new Set<number>(applyingAt === null || isDeck ? [] : (spans[applyingAt] || [applyingAt]));
-  /** 那行「改写中…」摆在锁住这一节的**末行** —— 和它的输入框原来在的位置同一处。 */
-  const lockHost = applyingAt === null ? null
-    : (spans[applyingAt] && spans[applyingAt].length > 1
-      ? spans[applyingAt][spans[applyingAt].length - 1]
-      : applyingAt);
-
-  /** 版面那条通道：入口 + 正在写的那个框。页底下和大图里共用同一段。 */
+  /** 版面那条通道：💬 + ＋ + 标记 + 正在写的那个框。页底下和大图里共用同一段。 */
   const pageToolRow = (page: number) => {
-    if (applyingAt === page) return lockRow();
+    if (!on) return null;
+    const busy = jobs.filter((j) => j.line === page && j.kind !== 'note');
+    if (busy.length) return <>{busy.map(jobRow)}</>;
+    const open = openAt === page;
+    const adding = insertAt === page;
     return (
       <>
-        <div className="rv-page-tools">{tools({ kind: 'page', index: page }, undefined, 'comment')}</div>
-        {noteBoxFor(page)}
+        {!open && !adding && (
+          <div className="rv-page-tools">
+            <div className="rv-review-tools">
+              <CommentOpener onClick={() => openBox('comment', page)} active={!!draftOf(String(page)).trim()} title={`对第 ${page} 页的版面提意见`} />
+              <button type="button" className={`rv-insert-btn${draftOf(`+${page}`).trim() ? ' has-note' : ''} nopan nodrag`}
+                title={`在第 ${page} 页后面加一页`}
+                onClick={(e) => { e.stopPropagation(); openBox('insert', page); }}>＋</button>
+            </div>
+          </div>
+        )}
+        {!open && markChip(String(page), '💬', () => openBox('comment', page))}
+        {!adding && markChip(`+${page}`, '＋', () => openBox('insert', page))}
+        {submitHerePage(page, false) && submitRow}
+        {open && markBox(String(page), `💬 改第 ${page} 页的版面`, live ? '这一页的字 / 框要怎么改' : '这一页要怎么改（会发给会话去改）', '💬', () => setOpenAt(null))}
+        {adding && markBox(`+${page}`, `＋ 第 ${page} 页后面加一页`, '写这一页要讲什么', '＋', () => setInsertAt(null))}
       </>
     );
   };
@@ -631,107 +1234,111 @@ export const ReviewPane: React.FC<{
    * **讲稿**那条通道的 💬 + 框 —— 和版面那套是两套，不共用：共用的话就得判断"这条意见是说版面还是说讲稿"，
    * 而那个判断没有依据 —— 你写的时候知道，代码不知道。两个入口 = 你在点的时候就把这件事说清了。
    */
-  const noteTools = (page: number) => {
-    const said = noteComments[page] || '';
+  const noteToolRow = (page: number) => {
+    if (!on) return null;
+    const busy = jobs.filter((j) => j.line === page && j.kind === 'note');
+    if (busy.length) return <>{busy.map(jobRow)}</>;
+    const key = `note:${page}`;
     const open = noteOpenAt === page;
     return (
-      <div className="rv-review-tools rv-note-tools">
+      <div className="rv-page-tools rv-note-tools-row">
         {!open && (
-          <CommentOpener
-            onClick={() => setNoteOpenAt(page)}
-            active={!!said}
-            title={said || '对这一页的讲稿提意见'}
-          />
+          <div className="rv-review-tools rv-note-tools">
+            <CommentOpener onClick={() => { closeBoxes(); setNoteOpenAt(page); }} active={!!draftOf(key).trim()} title="对这一页的讲稿提意见" />
+          </div>
         )}
-        {open && (
-          <CommentBox
-            value={said}
-            draft={draftOf(`note:${page}`, said)}
-            onDraft={(next) => typeDraft(`note:${page}`, next)}
-            startOpen
-            rows={2}
-            mark="🗒"
-            placeholder={`对第 ${page} 页讲稿的意见 —— 改的是备注，不是幻灯片上的字`}
-            /* 确认 = 当场改这一页的备注（只写那一个 XML part），见 `applyNoteOne` */
-            onApply={live ? (instruction) => applyNoteOne(page, instruction) : undefined}
-            allowRecord
-            applying={applyingNoteAt === page}
-            applyNote={applyNote[`note:${page}`] || ''}
-            onChange={(next) => {
-              setNoteComments((cur) => {
-                const c = { ...cur };
-                if (next) c[page] = next; else delete c[page];
-                return c;
-              });
-              clearDraft(`note:${page}`);
-              setNoteOpenAt(null);
-            }}
-            /* 取消也要通知上层 —— 少了这一条就是死路：框关了、按钮也不回来 */
-            onDismiss={() => setNoteOpenAt(null)}
-          />
-        )}
+        {!open && markChip(key, '🗒', () => { closeBoxes(); setNoteOpenAt(page); })}
+        {submitHerePage(page, true) && submitRow}
+        {open && markBox(key, `🗒 改第 ${page} 页的讲稿`, '改的是备注，不是幻灯片上的字', '🗒', () => setNoteOpenAt(null))}
       </div>
     );
   };
-  /** 讲稿那条通道的一行（改写中就只剩一行「改写中…」）。备注框下面和大图里共用。 */
-  const noteToolRow = (page: number) => {
-    if (applyingNoteAt === page) return lockRow();
-    return <div className="rv-page-tools">{noteTools(page)}</div>;
-  };
 
+  /** 发给会话之后那一句确认 / 备份没成的警告。 */
+  const statusLine = (justSent || backupWarn) ? (
+    <div className="rv-review-status">
+      {justSent && <p className="rv-review-sent">已发给这份文件的会话 —— 去那条会话里看它怎么改。</p>}
+      {backupWarn && <p className="rv-review-warn">发之前没能备份这份文件（{backupWarn}）—— 会话改坏了没有副本可回滚。</p>}
+    </div>
+  ) : null;
   /**
-   * 最下面那块：「其他意见」一个框 + 提交 —— 文本和 deck 两侧同一份（提交给的都是这个标签页的主人会话）。
+   * 最下面：**对整篇的意见 + 提交** ——「最下面应该有一个额外的 comment 和提交按钮框是针对整篇文章提出修改建议的」。
+   * 这里的「提交」和各个框里的「✓ 确认」是同一个动作：提交全部标记（整篇这一框也是一条标记）。
    */
-  const submitArea = (
-    <>
-      {on && (
-        <div className="rv-review-adds">
-          {/* 一行一条，写完就算 —— 不用确认，也没有「＋」（换行就是加一条） */}
-          <textarea
-            className="rt-note rv-review-adds-input"
-            rows={2}
-            value={extraText}
-            onChange={(e) => setExtraText(e.target.value)}
-            placeholder={`其他意见 —— 落不到某一${unit}上的那些（整体口径、结构、缺了什么）；一行一条`}
-          />
-        </div>
-      )}
-      {on && (
-        <div className="rv-review-submit">
-          {justSent && !prompt && (
-            <p className="rv-review-sent">已发给这份文件的会话 —— 去那条会话里看它怎么改。</p>
-          )}
-          {backupWarn && <p className="rv-review-warn">提交前没能备份这份文件（{backupWarn}）—— 会话改坏了没有副本可回滚。</p>}
-          <button
-            type="button"
-            className="rv-gate-pass"
-            disabled={!prompt || !onSubmit}
-            title={!onSubmit ? '这个标签页没有归属会话（不是从某条会话里打开的）—— 没地方发'
-              : !prompt
-                ? '还没有攒下待提交的意见（「✓ 确认」的那些当场就改了，不进这里；「记下」的、✕ 掉的、其他意见才进）'
-                : '把记下的意见、删掉的块和其他意见拼成一条消息，发给打开这份文件的那条会话，由它改这个文件'}
-            onClick={() => {
-              if (!prompt || !onSubmit) return;
-              /*
-                **先备份，再发** —— 这条路是**会话自己写这个文件**，走不到 `reviewWriteFile` 那道「写前拷一份」。
-                备在发之前：文件在它落笔前一个字节都没变。备份失败照旧发（只是少一份保险），但要说出来。
-              */
-              void window.kiroApi.reviewBackupFile?.(sessionId, path).then((res: any) => {
-                if (!res?.ok) setBackupWarn(String(res?.error || '没能备份'));
-                else setBackupWarn('');
-              });
-              onSubmit(prompt);
-              /* 提交完就清空 —— 那些意见已经发出去了，留着只会在下一批里再发一遍 */
-              setComments({}); setDropped({}); setExtraText(''); setOpenAt(null); setDraftLive({});
-              setNoteComments({}); setNoteOpenAt(null);
-              setJustSent(true);
-              window.setTimeout(() => setJustSent(false), 4000);
-            }}
-          >提交给这份文件的会话</button>
-        </div>
-      )}
-    </>
+  const wholeJobs = jobs.filter((j) => j.kind === 'whole');
+  const summary = [
+    marks.edit.length ? `${marks.edit.length} 处直接改` : '',
+    marks.revise.length ? `${marks.revise.length} 处修改` : '',
+    marks.note.length ? `${marks.note.length} 处讲稿` : '',
+    marks.insert.length ? `${marks.insert.length} 处新增` : '',
+    marks.drops.length ? `${marks.drops.length} 处删除` : '',
+    marks.whole ? '整篇意见' : '',
+  ].filter(Boolean).join('、');
+  const wholeBox = (
+    <div className="rv-review-whole">
+      <div className="rv-box-target">对整篇{isDeck ? '（整份 deck）' : '文章'}的修改意见</div>
+      <textarea
+        className="rt-note rv-review-whole-input"
+        rows={2}
+        value={wholeDraft}
+        onChange={(e) => setWholeDraft(e.target.value)}
+        onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitAll(); } }}
+        placeholder="落不到某一段上的那些 —— 整体口径、结构、语气、缺了什么"
+      />
+      {applyNote.whole && <div className="rt-note-applied">{applyNote.whole}</div>}
+      {wholeJobs.map(jobRow)}
+      <div className="rt-note-actions rv-review-whole-actions">
+        <span className="rv-review-count">{markCount ? `已标记：${summary}` : '还没有标记'}</span>
+        <button
+          type="button"
+          className="rt-note-apply nopan nodrag"
+          disabled={markCount === 0}
+          title={confirmTitle}
+          onClick={() => submitAll()}
+        >{markCount > 1 ? `提交（${markCount} 处）` : '提交'}</button>
+      </div>
+    </div>
   );
+  /**
+   * **提交按钮在最新改的那一段下面** ——「comment 和删除的提交按钮还是在最新修改那一段落的下方就行，
+   * 不要在底部单独设置按钮」。只标了删除的时候一个框都没开，所以不能只靠框里那个「✓ 确认」。
+   *
+   * "最新"按 `markOrder`：还在的那些标记里最后被动的那一条。它在哪一段（标题就是整节末尾）/ 哪一页，
+   * 这一行就摆在哪儿；有框开着时不摆 —— 那个框里的「✓ 确认」就是它。
+   */
+  const latestMark = (() => {
+    let best: { key: string; seq: number } | null = null;
+    for (const [k, seq] of Object.entries(markOrder)) {
+      const alive = k.startsWith('drop:') ? !!dropped[Number(k.slice(5))] : !!String(draftLive[k] || '').trim();
+      if (alive && (!best || seq > best.seq)) best = { key: k, seq };
+    }
+    if (!best) return null;
+    const m = /^(\+|=|drop:|note:)?(\d+)$/.exec(best.key);
+    return m ? { line: Number(m[2]), note: m[1] === 'note:' } : null;
+  })();
+  const anyBoxOpen = openAt !== null || insertAt !== null || editAt !== null || noteOpenAt !== null;
+  const submitRow = (
+    <div className="rv-mark-submit">
+      <span className="rv-review-count">已标记：{summary}</span>
+      <button type="button" className="rt-note-apply nopan nodrag" title={confirmTitle} onClick={() => submitAll()}>
+        {confirmLabel}
+      </button>
+    </div>
+  );
+  /** 这一段（文本：它那一节的末行）下面要不要摆提交那一行。 */
+  const submitHereText = (line: number) => {
+    if (!latestMark || anyBoxOpen || markCount === 0) return false;
+    const span = spans[latestMark.line];
+    const host = span && span.length > 1 ? span[span.length - 1] : latestMark.line;
+    return host === line;
+  };
+  /** deck：这一页的版面那一行 / 讲稿那一行下面要不要摆。 */
+  const submitHerePage = (page: number, note: boolean) =>
+    !!latestMark && !anyBoxOpen && markCount > 0 && latestMark.line === page && latestMark.note === note;
+  /** 没有主人会话：明说只能看（入口都不给，见 `on`）。 */
+  const ownerless = !sessionId && (isDeck || commenting)
+    ? <p className="rv-review-hint">这个标签页没有归属会话（不是从某条会话里打开的）—— 只能看。从会话里点开文件链接才能逐段改。</p>
+    : null;
 
   /* ── deck 的早返回：**必须在所有 hook 之后**（转换失败那支不走后面的 hook 会让 React 报 hooks 数量不一致） ── */
   if (isDeck && why) {
@@ -768,15 +1375,16 @@ export const ReviewPane: React.FC<{
   if (isDeck) {
     return (
       <div className="rv-review">
+        {ownerless}
         {/* 讲稿为什么没有 —— 多半是没装 python-pptx。预览和逐页意见不受影响 */}
         {notesWhy && <p className="rv-review-hint">{notesWhy}</p>}
-        {pageCount !== null && !hasNotes && (
+        {on && pageCount !== null && !hasNotes && (
           /* 没有讲稿时这一排只放页码和「删掉这一页」；评论入口在每页底下 */
           <ol className="rv-review-pagerow">
             {blocks.map((block) => (
               <li key={block.index} className={`rv-review-pagecell${dropped[block.index] ? ' dropped' : ''}`}>
                 <span className="rv-review-anchor">第 {block.index} {unit}</span>
-                {dropTool(block, undefined, true)}
+                {dropPageBtn(block.index)}
               </li>
             ))}
           </ol>
@@ -799,8 +1407,7 @@ export const ReviewPane: React.FC<{
                   <div className={`rv-review-pagecell${dropped[page] ? ' dropped' : ''}`}>
                     <div className="rv-page-head">
                       <span className="rv-review-anchor">第 {page} {unit}</span>
-                      {/* 改写中连「删掉这一页」也收走 —— 删掉正在改的那一页，回来的结果就没有落脚处了 */}
-                      {applyingAt !== page && applyingNoteAt !== page && dropTool({ kind: 'page', index: page }, undefined, true)}
+                      {on && !jobs.some((j) => j.line === page) && dropPageBtn(page)}
                     </div>
                     {note
                       ? <div className="rv-review-note">{note}</div>
@@ -811,31 +1418,38 @@ export const ReviewPane: React.FC<{
                 </>
               );
             } : undefined}
-            /* **在图上**留个痕迹 —— 有意见/要删掉的页在图上角挂一个标记，点它直接展开那条意见 */
+            /* **在图上**留个痕迹 —— 有标记的页在图上角挂一个标记，点它直接展开那条 */
             overlayFor={(page) => {
-              const said = comments[page] || '';
-              const saidNote = noteComments[page] || '';
+              const said = draftOf(String(page)).trim();
+              const saidNote = draftOf(`note:${page}`).trim();
+              const adding = draftOf(`+${page}`).trim();
               const gone = !!dropped[page];
-              if (!said && !saidNote && !gone) return null;
+              if (!said && !saidNote && !adding && !gone) return null;
               return (
                 <div className="rv-pdf-mark" onClick={(e) => e.stopPropagation()}>
-                  {gone && <span className="rv-pdf-mark-drop" title={`第 ${page} 页要删掉`}>✕ 已标删</span>}
+                  {gone && <span className="rv-pdf-mark-drop" title={`第 ${page} 页标了删除`}>✕ 已标删</span>}
                   {said && (
                     <button type="button" className="rv-pdf-mark-note nopan nodrag"
                       title={`第 ${page} 页【版面】的意见：${said}\n（点开可以改）`}
-                      onClick={() => setOpenAt(page)}>💬 版面</button>
+                      onClick={() => openBox('comment', page)}>💬 版面</button>
                   )}
                   {saidNote && (
                     <button type="button" className="rv-pdf-mark-note note nopan nodrag"
                       title={`第 ${page} 页【讲稿】的意见：${saidNote}\n（点开可以改）`}
-                      onClick={() => setNoteOpenAt(page)}>🗒 讲稿</button>
+                      onClick={() => { closeBoxes(); setNoteOpenAt(page); }}>🗒 讲稿</button>
+                  )}
+                  {adding && (
+                    <button type="button" className="rv-pdf-mark-note nopan nodrag"
+                      title={`第 ${page} 页后面要加一页：${adding}\n（点开可以改）`}
+                      onClick={() => openBox('insert', page)}>＋ 加页</button>
                   )}
                 </div>
               );
             }}
           />
         </div>
-        {submitArea}
+        {on && wholeBox}
+        {statusLine}
       </div>
     );
   }
@@ -843,90 +1457,103 @@ export const ReviewPane: React.FC<{
 
   return (
     <div className="rv-review">
-      <ol className="rv-review-blocks">
+      {ownerless}
+      <ol className="rv-review-blocks" ref={listRef}>
         {groups.map((g) => {
           /*
-            这一行是被别人（标题/围栏/列表项）盖住的吗。**只有当那个锚点真的被动过**，这一行才"跟着整节走"——
-            不是"在某个标题下面"就算（那样几乎每一行都会被判成 in-section，整份文档一个 💬 都没有）。
+            ✎ 那一块（标题连整节）：开着框时框顶替它，改过（还没提交）时显示**改过的那份** —— 盖住的那几行不再单独显示。
           */
+          const editHost = (() => {
+            if (!on) return null;
+            if (editAt !== null && covers(editAt, g.anchor)) return editAt;
+            for (const [l] of marks.edit) if (covers(l, g.anchor)) return l;
+            return null;
+          })();
+          if (editHost !== null && editHost !== g.anchor) return null;
+          const editingHere = editHost === g.anchor && editAt === g.anchor;
+          const editedHere = editHost === g.anchor && !editingHere;
           const owner = coveredBy.get(g.anchor);
-          const { anyDropped: sectionDropped, anyNoted: sectionNoted } = outerState(g.anchor);
-          const inSection = sectionDropped || sectionNoted;
           /*
-            预览：hover 那个"带整段"的锚点时整段亮。**框开着时也算** —— 鼠标一进框里 hover 就没了，
-            写的时候整段必须一直亮着，否则那个框看着像是在评最后那一行。
+            预览：hover 那个"带整段"的锚点时整段亮 —— ✕ 删的、💬 改的、＋ 接在后面的都是那一整段。
+            **框开着时一定亮，单独一行也亮** —— 鼠标一进框里 hover 就没了，而你得一直看得见自己评的是哪一段
+            （实测：评的是上面那段，结果以为动了下面那段）。
           */
-          const highlightAnchor = openAt ?? hoverAt;
-          const previewing = covers(highlightAnchor, g.anchor)
-            && (highlightAnchor === g.anchor || (spans[highlightAnchor!]?.length || 0) > 1);
+          const target = openAt ?? insertAt ?? editAt;
+          const targeted = target !== null && covers(target, g.anchor);
+          const previewing = target === null && covers(hoverAt, g.anchor)
+            && (hoverAt === g.anchor || (spans[hoverAt!]?.length || 0) > 1);
           const ownsSection = (spans[g.anchor]?.length || 0) > 1;
+          const goneBy = droppedBy(g.anchor);
+          const locked = lockedLines.has(g.anchor);
           return (
             <li
               key={g.anchor}
               onMouseEnter={() => setHoverAt(g.anchor)}
               onMouseLeave={() => setHoverAt((cur) => (cur === g.anchor ? null : cur))}
-              className={`rv-review-block${dropped[g.anchor] || sectionDropped ? ' dropped' : ''}`
-                /* 写过意见的块要一直看得出来 —— 竖线不占高度，「comment 不许增加行距」仍然成立 */
-                + `${comments[g.anchor] ? ' noted' : ''}`
-                + `${inSection ? ' in-section' : ''}${sectionNoted ? ' section-noted' : ''}`
-                + `${sectionDropped ? ' section-dropped' : ''}`
+              className={'rv-review-block'
+                + `${goneBy !== null ? ' dropped' : ''}${goneBy !== null && goneBy !== g.anchor ? ' section-dropped' : ''}`
+                + `${on && targeted ? ' section-preview targeted' : ''}`
                 + `${on && previewing && (ownsSection || owner !== undefined) ? ' section-preview' : ''}`
                 + `${ownsSection ? ' section-head' : ''}`
-                + `${lockedLines.has(g.anchor) ? ' locked' : ''}`}
+                + `${locked ? ' locked' : ''}`}
             >
               {/*
-                **不显示行号** ——「不要显示什么段落号」。号只用来拼提示词，它对读没有帮助。
+                **comment 模式左边显示行号** ——「我希望 md 的 comment 模式左侧能显示行号」（早先「不要显示什么段落号」
+                说的是纯读的时候；纯读不走这里）。号就是文件里的行号，和框顶上、排队那一行、会话里说的「第 N 行」
+                是同一个数；代码围栏那一组写起止。
                 Markdown 逐行渲染时**先摘掉缩进**（`mdLine`）：单独看一行，`    - 三级` 会被 CommonMark 当成
                 代码块。缩进用 padding 还原。围栏组不摘：它本来就该是代码。
               */}
-              {markdown
+              {on && (
+                <span className="rv-line-no" aria-hidden="true">
+                  {/* 代码块写起始行就够了（起止在框顶上写着）—— 写成「10–13」在这一栏里放不下 */}
+                  {g.anchor}
+                </span>
+              )}
+              {editingHere ? editBox(g.anchor) : editedHere ? (
+                <div className={markdown ? 'rv-review-md rv-edited' : 'rv-review-text rv-edited'}>
+                  {markdown ? <MarkdownView content={draftOf(`=${g.anchor}`)} /> : <pre className="rv-review-text">{draftOf(`=${g.anchor}`)}</pre>}
+                </div>
+              ) : markdown
                 ? (() => {
                   const { md, indent } = g.fenced ? { md: g.text, indent: 0 } : mdLine(g.text);
                   return (
                     <div className="rv-review-md" style={indent ? { paddingLeft: indent * 4 } : undefined}>
-                      <MarkdownView content={md} />
+                      <MdBlock md={md} />
                     </div>
                   );
                 })()
                 : <pre className="rv-review-text">{g.text}</pre>}
-              {/* 这一节被**标了删**时才收掉这一行的按钮 —— 它要走了，对它单独提意见会和上面那条打架 */}
-              {on && !sectionDropped && !lockedLines.has(g.anchor)
-                && tools({ kind: 'line', index: g.anchor, text: g.text, ...(g.fenced ? { fenced: true as const } : null) }, g.span)}
-              {/*
-                **记下的那条意见摆出来，带修改和删除**。只有写过意见的行多这一行 —— 没写过的照旧一行一行贴着。
-                点意见本身 = 改它；`✕` 直接删掉这条，不用先点开框。
-              */}
-              {on && !!comments[g.anchor] && !lockedLines.has(g.anchor) && openAt !== g.anchor && (
-                <div className="rt-brief-row">
+              {/* 在一个标了删的整节里的那几行不给按钮 —— 它们跟着整节走，单独处置会和那条打架 */}
+              {on && !locked && (goneBy === null || goneBy === g.anchor)
+                && tools({ kind: 'line', index: g.anchor, text: g.text, ...(g.fenced ? { fenced: true as const } : null) })}
+              {/* 收起的标记摆在那一段下面：点它接着改，✕ 去掉；没做成的原因也在这里 */}
+              {on && !locked && openAt !== g.anchor && markChip(String(g.anchor), '💬', () => openBox('comment', g.anchor))}
+              {on && !locked && insertAt !== g.anchor && markChip(`+${g.anchor}`, '＋', () => openBox('insert', g.anchor))}
+              {/* 直接改过的那一块：只在真的改了（和原文不一样）时挂一行 */}
+              {on && !locked && editedHere && (
+                <div className="rt-brief-row rv-edited-row">
                   <span className="rt-hist-one">
-                    <button type="button" className="rt-note-brief nopan nodrag"
-                      title="修改这条意见"
-                      onClick={() => setOpenAt(g.anchor)}>
-                      <span className="rt-note-brief-mark">💬</span>
-                      <span className="rt-note-brief-text">
-                        {String(comments[g.anchor] || '').replace(/\s+/g, ' ').trim()}
-                      </span>
-                    </button>
-                    <button type="button" className="rt-hist-btn nopan nodrag"
-                      title="修改"
-                      onClick={() => setOpenAt(g.anchor)}>✎</button>
-                    <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag"
-                      title="删除这条意见"
-                      onClick={() => {
-                        setComments((cur) => { const c = { ...cur }; delete c[g.anchor]; return c; });
-                        clearDraft(String(g.anchor));
-                      }}>✕</button>
+                    <span className="rv-edited-tag">✎ 已直接改（未提交）</span>
+                    <button type="button" className="rt-hist-btn nopan nodrag" title="接着改" onClick={() => openBox('edit', g.anchor)}>✎</button>
+                    <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag" title="撤销这处直接改，恢复原文"
+                      onClick={() => clearDraft(`=${g.anchor}`)}>✕</button>
                   </span>
+                  {applyNote[`=${g.anchor}`] && <div className="rt-note-applied">{applyNote[`=${g.anchor}`]}</div>}
                 </div>
               )}
-              {/* 整节的意见写在整节末尾 —— 见 `noteBoxFor`。改写中那里换成一行「改写中…」 */}
-              {lockedLines.has(g.anchor) && lockHost === g.anchor && lockRow()}
-              {on && noteBoxFor(g.anchor)}
+              {on && applyNote[`drop:${g.anchor}`] && <div className="rt-note-applied">{applyNote[`drop:${g.anchor}`]}</div>}
+              {/* 提交那一行在**最新标的那一段**下面（见 `latestMark`） */}
+              {on && !locked && submitHereText(g.anchor) && submitRow}
+              {/* 排着的改动挂在那一节末尾 —— 见 `statusAt` */}
+              {(statusAt.get(g.anchor) || []).map(jobRow)}
+              {on && !locked && boxFor(g.anchor)}
             </li>
           );
         })}
       </ol>
-      {submitArea}
+      {on && wholeBox}
+      {statusLine}
     </div>
   );
 };

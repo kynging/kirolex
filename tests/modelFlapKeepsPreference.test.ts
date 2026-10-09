@@ -13,14 +13,15 @@ test('一轮报"模型不可用"时先问那台机器的清单：还在 → 只�
   assert.match(M, /if \(!stillListed\) deadModelsFor\(machineKeyOf\(entry\.profile\)\)\.add\(failedModel\);/);
 });
 
-test('Windows：系统白标题栏换成自己画的深色条，最大化时收窄', () => {
+test('Windows：无边框窗口 + 自己画的标题条和三个按钮；最大化时标题条自动隐藏、碰顶边滑下来', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
   const C = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
-  assert.match(M, /titleBarStyle: process\.platform === 'darwin' \? 'hiddenInset' : 'hidden',/);
-  assert.match(M, /titleBarOverlay: \{ color: '#1a1a1a', symbolColor: '#a0a0a0', height: WIN_TITLEBAR_HEIGHT \}/);
-  assert.match(M, /win\.setTitleBarOverlay\(\{ height: maximized \? WIN_TITLEBAR_HEIGHT_MAXIMIZED : WIN_TITLEBAR_HEIGHT \}\)/);
-  assert.match(A, /\{isWinFrame && <div className="win-titlebar"><span className="win-titlebar-title">KiroLex<\/span><\/div>\}/);
-  assert.match(C, /\.win-titlebar \{[^}]*-webkit-app-region: drag;/);
-  assert.match(C, /\.app-layout\.no-toolbar\.win \{\n  height: calc\(100% - var\(--win-titlebar-height\)\);/);
+  assert.match(M, /\.\.\.\(process\.platform === 'darwin' \? \{\} : \{ frame: false \}\),/);
+  assert.doesNotMatch(M, /titleBarOverlay: \{/, '系统按钮藏不掉，所以不再用 overlay');
+  assert.match(M, /ipcMain\.handle\('window:control', \(_event, action: string\) => \{/);
+  assert.match(A, /\{isWinFrame && winMaxed && !titlebarShown && <div className="win-titlebar-hotzone" onMouseEnter=\{revealTitlebar\} \/>\}/);
+  assert.match(A, /windowControl\('toggle-maximize'\)/);
+  assert.match(C, /\.win-titlebar\.auto-hide \{\n  transform: translateY\(-100%\);/);
+  assert.match(C, /\.app-layout\.no-toolbar\.win\.maxed \{ height: 100%; margin-top: 0; \}/);
 });

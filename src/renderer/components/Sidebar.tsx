@@ -1,4 +1,7 @@
 import { projectsToCollapse } from '../projectActivity';
+import { restoreGetJson, restoreSet } from '../uiRestore';
+/** 侧栏折叠了哪些组 —— 活过 reload；「重启后恢复界面状态」开着时也活过重启（见 `restoredCollapse`）。 */
+const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions } from '../sessionSearch';
@@ -582,8 +585,21 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * Computed once, from the sessions present when the sidebar first has them: recomputing would fight the
    * user, snapping a project they just expanded shut again. Expanding is what connects it.
    */
-  const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  /*
+    **重新加载画面时保留你折叠的那些组** ——「重新加载画面的时候能不能不把我之前折叠的侧栏打开」。
+    折叠原来只活在这个组件的 state 里，reload 一次就按冷热重算一遍。现在经 `restoreGet`：设置里
+    「重启后恢复界面状态」开着（默认）就连重启也保留；关了只活过 reload，重启时照旧按 `projectsToCollapse` 算。
+  */
+  const restoredCollapse = useRef<string[] | null>((() => {
+    const list = restoreGetJson<unknown>(COLLAPSED_KEY);
+    return Array.isArray(list) ? list.map(String) : null;
+  })());
+  const [collapsed, setCollapsed] = useState<Set<string>>(() => new Set(restoredCollapse.current || []));
   const autoCollapsed = useRef(false);
+  useEffect(() => {
+    if (!autoCollapsed.current) return;   // 自动折叠那一遍之前别存（存进去的是一个还没算的空集合）
+    restoreSet(COLLAPSED_KEY, JSON.stringify([...collapsed]));
+  }, [collapsed]);
   /** kiro trace 日志开着吗（见下面那个 ⚑）—— 跟着 `kirolex:features-changed` 刷新 */
   const [traceOn, setTraceOn] = useState(kiroTraceOn());
   useEffect(() => {
@@ -607,6 +623,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   useEffect(() => {
     if (autoCollapsed.current || sessions.length === 0) return;
     autoCollapsed.current = true;
+    /* reload 回来的：用你上次的折叠，不重算 */
+    if (restoredCollapse.current) return;
     const cold = projectsToCollapse(sessions, { now: Date.now(), keepId: currentSessionId });
     if (cold.length) setCollapsed((prev) => new Set([...prev, ...cold]));
   }, [sessions, currentSessionId]);
@@ -644,6 +662,44 @@ export const Sidebar: React.FC<SidebarProps> = ({
       onWarmProject(project);
     }
   }, [collapsed, onWarmProject]);
+  /*
+    **有活动会话的组自动展开** ——「我为什么新建 new chat 的时候未分组是折叠的，只要有活动会话所有项目和未分组都应该自动展开」。
+    原来折叠只在启动时算一次（只留热的那个 project 展开），之后新建的会话、开始跑的会话所在的组照样折着。
+    "活动" = 当前这条、在分屏里、连着（attached）或者正在跑。判据是**新变成活动的那条**所在的组：
+    已经活动着的组你手动折起来，不会被立刻弹开；只有它里面又有会话变成活动时才展开。
+    自动展开**不算**你点开的，所以不触发整组预热（预热那段只认"你真的点开了它"）—— 否则一条活动会话会把整组都连上。
+  */
+  const prevActiveIds = useRef<Set<string> | null>(null);
+  /*
+    reload 之后的头一阵子不算"新变成活动"：那时各条会话在重新连上（attached）、在跑的那轮被接回来
+    （streaming）—— 它们不是刚开始活动，只是窗口刚知道。算进去的话，你折起来的组 reload 一次全被弹开。
+  */
+  const settleUntil = useRef(restoredCollapse.current ? Date.now() + 15000 : 0);
+  useEffect(() => {
+    if (!autoCollapsed.current) return;
+    const active = new Set(sessions.filter((s) => !s.archived && (
+      s.id === currentSessionId
+      || (splitOrder?.(s.id) || 0) > 0
+      || attachedSessionIds.includes(s.id)
+      || streamingSessionIds.includes(s.id)
+    )).map((s) => s.id));
+    const prev = prevActiveIds.current;
+    prevActiveIds.current = active;
+    if (Date.now() < settleUntil.current) return;
+    const groups = new Set<string>();
+    for (const s of sessions) {
+      if (active.has(s.id) && (!prev || !prev.has(s.id))) groups.add(s.projectId || UNASSIGNED);
+    }
+    if (!groups.size) return;
+    for (const g of groups) warmed.current.add(g);   // 自动展开不触发整组预热
+    setCollapsed((cur) => {
+      if (![...groups].some((g) => cur.has(g))) return cur;
+      const next = new Set(cur);
+      for (const g of groups) next.delete(g);
+      return next;
+    });
+  }, [sessions, currentSessionId, attachedSessionIds, streamingSessionIds, splitOrder]);
+
   const newProjectRef = useRef<HTMLInputElement>(null);
 
   const sensors = useSensors(
@@ -723,14 +779,17 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const onSetEngine = async (sessionId: string, engine: 'kiro' | 'claude' | 'codex'): Promise<void> => {
     const api = (window as any).kiroApi;
     if (!api?.switchEngine) return;
-    const r = await api.switchEngine(sessionId, engine).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    /* 带上项目：还没连上过的新会话没有记录，主进程要给它建一份（见主进程 coldRecordFor） */
+    const projectId = sessions.find((s) => s.id === sessionId)?.projectId ?? null;
+    const r = await api.switchEngine(sessionId, engine, { projectId }).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
     if (!r?.ok) showToast(`✗ 切换引擎失败：${String(r?.error || '原因不明').replace(/^Error invoking remote method '[^']+': (Error: )?/, '')}`);
   };
   const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
     const api = (window as any).kiroApi;
     if (!api?.setRemoteTarget) return;
     setPendingTarget(sessionId, remoteId ? (remoteTargets.find((t) => t.id === remoteId)?.label || remoteId) : null);
-    const r = await api.setRemoteTarget(sessionId, remoteId)
+    const projectId = sessions.find((s) => s.id === sessionId)?.projectId ?? null;
+    const r = await api.setRemoteTarget(sessionId, remoteId, undefined, { projectId })
       .catch((e: any) => ({ ok: false, error: e?.message || String(e) }))
       .finally(() => setPendingTarget(sessionId, undefined));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */
