@@ -23,6 +23,9 @@
   "build": {
     "appId": "com.kirolex.app",
     "productName": "KiroLex",
+    "directories": {
+      "output": "release"
+    },
     "files": [
       "dist/**/*"
     ],

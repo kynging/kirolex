@@ -123,6 +123,10 @@ npm run package            # Windows portable directory (--win --dir)
 npm run package:installer  # Windows installer
 ```
 
+Packaged output goes to `release/` (`build.directories.output`): the Windows portable is
+`release/KiroLex.exe`, and `--dir` gives `release/win-unpacked/`. `dist/` holds only
+`npm run build` output, so a previous package run never ends up inside the next `app.asar`.
+
 macOS builds are unsigned on purpose (`build.mac.identity: null`): with no Developer ID
 configured, electron-builder would otherwise fail the whole run trying to sign. Set it
 to a real identity when there is one. Linux has no target configured yet.
