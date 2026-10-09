@@ -5,6 +5,9 @@ import { uiGet, uiSet, uiRemove } from '../uiStore';
 import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
 import { sessionsToWarm } from '../projectActivity';
 import type { TurnOutcome } from '../idleNotify';
+import { classifyDeleteResult } from '../deleteOutcome';
+import { normalizeLang } from '../i18n';
+import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
 import {
   advance,
@@ -4158,13 +4161,22 @@ ${text}`,
         }
       }
       // Never swallow this: a failed disk delete used to leave the chat on disk and
-      // it came back at the next start. Main tombstones it so it stays hidden and
-      // retries the removal, but the user should know the files are still there.
-      if (res && res.ok === false) {
+      // it came back at the next start.
+      // 界面语言：这个 hook 在 LangProvider 外面（App 里先调它），所以删的那一刻直接读已保存的设置
+      let lang = normalizeLang(undefined);
+      try { lang = normalizeLang(JSON.parse(uiGet('kirolex-settings') || '{}')?.language); } catch { /* 坏值退回默认 */ }
+      const outcome = classifyDeleteResult(res, lang);
+      if (outcome.kind === 'tombstoned') {
         /**
-         * `ok: false` 是**拒绝**，不是"删了但文件还在"。后者主进程返回 `ok: true, tombstoned: true`
-         * （它确实立了墓碑、下次启动重试），而这里原来把两种情况混成一句话，于是被拒时界面会说
-         * 「已标记为待删除，下次启动会自动重试」—— 三重错：没标记、不会重试，而且会话根本没被删。
+         * `ok: false, tombstoned: true` = **已经删了**，只是有些文件暂时被占用（Windows 上常见：刚断开的
+         * kiro-cli 或它起的子进程还没放手 files/）。主进程已经立了墓碑、广播了 `acp:sessions-purged`，
+         * 本次运行期间会隔一段时间在后台再删，下次启动也会再试 —— 所以会话**不放回**列表，也不说
+         * 「没有删除」，只给一句不吓人的提示。
+         */
+        showToast(outcome.notice);
+      } else if (outcome.kind === 'refused') {
+        /**
+         * `ok: false` 且没有 `tombstoned` 才是**拒绝**：会话根本没被删，没立墓碑，也不会重试。
          *
          * 所以要把它**放回原位**。不放回去它就成了一条"界面上不存在、磁盘上活着"的幽灵会话，
          * 而这个状态会静默地影响别的判断（实测：让 flow 的会话复用挑错了会话）。
@@ -4174,7 +4186,7 @@ ${text}`,
             ? prev
             : [...prev.slice(0, doomedIndex), doomedRecord, ...prev.slice(doomedIndex)]));
         }
-        noteError(null, `没有删除这个会话：${res.error || '未知原因'}`);
+        noteError(null, outcome.error);
       }
     } catch (error: any) {
       noteError(null, `删除会话失败：${error?.message || error}。该会话可能在下次启动时重新出现。`);

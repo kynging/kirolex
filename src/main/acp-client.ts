@@ -8,6 +8,7 @@ import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, resolveAdapter, type Engine } from './engines.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
+import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
 
 interface JsonRpcRequest {
   jsonrpc: '2.0';
@@ -157,6 +158,8 @@ export interface EngineSelect { current: string; options: Array<{ value: string;
 
 export class AcpClient extends EventEmitter {
   private process: ChildProcess | null = null;
+  /** 起 `process` 的那一刻（毫秒）。删除时用它核对「这个 pid 还是不是我们起的那个进程」（Windows 会复用 pid）。 */
+  private spawnedAt?: number;
   private nextId = 0;
   private pendingRequests: Map<number, { resolve: Function; reject: Function; timer: ReturnType<typeof setTimeout>; idleMs: number }> = new Map();
   private model: string;
@@ -337,6 +340,7 @@ export class AcpClient extends EventEmitter {
       const env = this.remote?.sshHost ? sshEnv(this.remote, this.env) : { ...this.env };
       if (this.engine === 'kiro' && kiroTraceEnabled()) env.KIRO_LOG_LEVEL = 'trace';
       Object.assign(env, extraEnv);
+      this.spawnedAt = Date.now();
       this.process = spawn(command, args, {
         stdio: ['pipe', 'pipe', 'pipe'],
         env,
@@ -418,13 +422,33 @@ export class AcpClient extends EventEmitter {
    * even though that PID is gone. So: close stdin, wait for a clean exit, and
    * only escalate to a kill if it does not exit in time.
    */
-  async disconnect() {
+  async disconnect(opts: { killTree?: boolean } = {}) {
     const proc = this.process;
     this.process = null;
     if (proc) {
       const exited = new Promise<void>((resolve) => {
+        // 删除时进程可能早就退了（close 已经发过），别白等 5 秒
+        if (opts.killTree && (proc.exitCode !== null || proc.signalCode !== null)) { resolve(); return; }
         proc.once('close', () => resolve());
       });
+      /*
+        **删除会话时（`killTree`）在 Windows 上连子进程一起收**：kiro-cli 起的 shell / python 等不会随它退出，
+        而它们的工作目录常常就在 `sessions/<id>/files` 里，Windows 就不让移动这个目录（EBUSY）。
+        所以趁 kiro-cli 还活着先拍一张「它下面有哪些进程」的快照（pid + 创建时间，只认这一棵树，不碰别的会话），
+        它退出后再把快照里还活着的收掉；它不肯退出要强杀时，用 `taskkill /T /F` 整棵树一起结束。
+
+        **旧 pid 不可信**：执行器已经退出的话，它的 pid 可能已被另一个会话的 kiro-cli 复用 —— 那时按 pid 查树
+        就会把别人的子进程当成自己的。所以执行器已退出就不查；查到的根还要核对创建时间是不是我们 spawn 的那一刻
+        （见 `snapshotExecutorTree`），对不上就什么都不认，强杀也退回 `proc.kill()`（走 Node 自己的进程句柄）。
+      */
+      const treeDeps: TreeDeps = {
+        list: () => listWindowsProcesses(2000),
+        kill: (pid) => taskkillTree(pid),
+        killOne: (pid) => taskkillOne(pid),
+      };
+      const tree = opts.killTree && process.platform === 'win32'
+        ? await snapshotExecutorTree(proc, this.spawnedAt, treeDeps)
+        : null;
       try { proc.stdin?.end(); } catch { /* already closed */ }
       let timer: ReturnType<typeof setTimeout> | undefined;
       const timeout = new Promise<'timeout'>((resolve) => {
@@ -433,8 +457,11 @@ export class AcpClient extends EventEmitter {
       const outcome = await Promise.race([exited.then(() => 'exited' as const), timeout]);
       if (timer) clearTimeout(timer);
       if (outcome === 'timeout') {
-        try { proc.kill(); } catch { /* already gone */ }
+        if (!(await forceKillExecutorTree(proc, tree, treeDeps))) {
+          try { proc.kill(); } catch { /* already gone */ }
+        }
       }
+      await sweepExecutorChildren(tree, treeDeps);
     }
     /*
       **远端那个进程要单独杀** —— 杀掉本地的 ssh 并不会带走它（实测那台 EC2 上攒了 85 个孤儿

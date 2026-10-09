@@ -358,6 +358,9 @@ const ZH: Record<string, string> = {
   'Finished': '已完成',
   'Stopped with an error': '出错了',
   'Stopped with an error: {error}': '出错了：{error}',
+
+  // ── 删除会话：已删除、部分文件暂时被占用 ────────────────────────────────
+  'Chat deleted. Some files are in use and will be cleaned up automatically later.': '会话已删除，部分文件被占用，稍后自动清理',
 };
 
 /**

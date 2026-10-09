@@ -53,6 +53,7 @@ import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { createControlServer, type ControlServer } from './controlServer.ts';
 import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { windowIsActive } from './idleNotice.ts';
+import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
@@ -4380,12 +4381,20 @@ function flushAssistant(sessionId: string) {
 /** Actively detach one session's executor: free the slot immediately, kill the
  *  kiro-cli process, mark the record dormant, and tell the renderer (dot ->
  *  dormant). The session's durable transcript + memory are untouched; a later
- *  prompt/open transparently re-attaches (loadSession). */
-function detachExecutor(sessionId: string) {
+ *  prompt/open transparently re-attaches (loadSession).
+ *
+ *  Returns the disconnect promise (never rejects) so `purgeSession` can wait for
+ *  the process to really be gone before moving its directory; every other caller
+ *  ignores it, exactly as before. `killTree` is the delete path only: on Windows it
+ *  also ends the processes kiro-cli started (see `AcpClient.disconnect`). */
+function detachExecutor(sessionId: string, opts: { killTree?: boolean } = {}): Promise<void> {
   const entry = sessionClients.get(sessionId);
-  if (!entry) return;
+  if (!entry) return Promise.resolve();
   sessionClients.delete(sessionId); // free the slot synchronously
-  try { entry.client.disconnect(); } catch { /* process may already be gone */ }
+  let disconnected: Promise<void> = Promise.resolve();
+  try {
+    disconnected = Promise.resolve(entry.client.disconnect(opts.killTree ? { killTree: true } : undefined)).catch(() => {});
+  } catch { /* process may already be gone */ }
   const rec = store.readRecord(sessionId);
   if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
   /*
@@ -4395,6 +4404,7 @@ function detachExecutor(sessionId: string) {
   */
   releaseLocalTools(sessionId, entry.profile.remote);
   mainWindow?.webContents.send('acp:disconnected', { sessionId });
+  return disconnected;
 }
 
 /** LRU auto-detach: before attaching another executor, evict the least-recently-
@@ -7393,6 +7403,9 @@ app.whenReady().then(async () => {
 
   const approvalLocks = new Map<string, Promise<void>>();
 
+  /** Deleted sessions whose files were still locked: id -> cancel its background retries. */
+  const pendingPurgeRetries = new Map<string, () => void>();
+
   /**
    * THE ACTUAL DELETE — no guard here on purpose.
    *
@@ -7420,9 +7433,15 @@ app.whenReady().then(async () => {
     // transcript open — disconnect is asynchronous) the chat used to come back on
     // the next boot. The tombstone hides it and gets the removal retried.
     addSessionTombstone(sessionId);
-    detachExecutor(sessionId);
+    // WAIT for the executor to really be gone before touching the directory.
+    // kiro-cli's working directory is sessions/<id>/files, and on Windows a live
+    // process (or a shell it started) keeps that directory from being moved --
+    // that was the EBUSY on delete. disconnect() waits up to 5s for a clean exit,
+    // then force-kills (with its process tree on Windows); cap the wait so a
+    // wedged teardown can never hang the delete.
+    await waitAtMost(detachExecutor(sessionId, { killTree: true }), 8000);
 
-    // Remove the directory, retrying briefly: rmSync can fail with EBUSY/EPERM
+    // Remove the directory, retrying with real (async) waits: the rename can fail with EBUSY/EPERM
     // while the just-disconnected process releases its file handles. The old code
     // called rmSync once with no try/catch, so a failure rejected the IPC — and the
     // renderer swallowed that error, leaving the chat on disk to be rehydrated.
@@ -7433,50 +7452,32 @@ app.whenReady().then(async () => {
     // local snapshots on this machine there was nothing to restore from. A rename
     // is also atomic and cannot half-finish, unlike a recursive delete. Only the
     // trash is ever hard-deleted, and only once it ages out.
-    const removeDir = (dir: string): string | null => {
-      for (let attempt = 0; attempt < 5; attempt++) {
-        try {
-          if (!fs.existsSync(dir)) return null;
-          const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-          const grave = path.join(SESSION_TRASH_DIR, `${sessionId}__${stamp}`);
-          fs.mkdirSync(SESSION_TRASH_DIR, { recursive: true });
-          fs.renameSync(dir, grave);
-          if (!fs.existsSync(dir)) {
-            logger.info('delete-session', `moved to trash: ${grave} (restore by moving it back to ${dir})`);
-            return null;
-          }
-        } catch (err: any) {
-          // A cross-device rename (or a locked directory) cannot be helped by
-          // retrying forever; fall back to the destructive path on the last try so
-          // "delete" never silently fails and resurrects the chat on next boot.
-          if (attempt === 4) {
-            try {
-              fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
-              logger.warn('delete-session', `could not move to trash (${err?.message}); removed permanently: ${dir}`);
-              return fs.existsSync(dir) ? 'directory still present after retries' : null;
-            } catch (hardErr: any) {
-              return hardErr?.message || err?.message || String(err);
+    // (Retry policy and the trash fallback live in `sessionPurge.ts`, where they are tested.)
+    const removeDirs = async (delaysMs?: number[]): Promise<string | null> => {
+      const removeDir = (dir: string) => moveDirToTrash(dir, {
+        trashDir: SESSION_TRASH_DIR,
+        name: sessionId,
+        delaysMs,
+        log: (level, msg) => logger[level]('delete-session', msg),
+      });
+      let error: string | null = await removeDir(path.join(sessionsBaseDir, sessionId));
+      // Sweep any directory whose name embeds this session id (legacy layouts).
+      try {
+        if (fs.existsSync(sessionsBaseDir)) {
+          for (const dir of fs.readdirSync(sessionsBaseDir)) {
+            if (dir === sessionId || dir.includes(sessionId)) {
+              const e = await removeDir(path.join(sessionsBaseDir, dir));
+              if (e && !error) error = e;
             }
           }
         }
-      }
-      return fs.existsSync(dir) ? 'directory still present after retries' : null;
+      } catch { /* best-effort */ }
+      return error;
     };
 
-    let error: string | null = removeDir(path.join(sessionsBaseDir, sessionId));
+    const error: string | null = await removeDirs();
     // Also delete this chat's session-specific memory.
     try { deleteSessionMemory(sessionId); } catch { /* best-effort */ }
-    // Sweep any directory whose name embeds this session id (legacy layouts).
-    try {
-      if (fs.existsSync(sessionsBaseDir)) {
-        for (const dir of fs.readdirSync(sessionsBaseDir)) {
-          if (dir === sessionId || dir.includes(sessionId)) {
-            const e = removeDir(path.join(sessionsBaseDir, dir));
-            if (e && !error) error = e;
-          }
-        }
-      }
-    } catch { /* best-effort */ }
     // Drop draft paste refs for the gone chat so its blobs become collectable.
     try {
       const map = loadDraftPastes();
@@ -7500,9 +7501,25 @@ app.whenReady().then(async () => {
       if (!win.isDestroyed()) win.webContents.send('acp:sessions-purged', { sessionIds: [sessionId] });
     }
     if (error) {
-      logger.warn('delete-session', `${sessionId}: files not fully removed (${error}); tombstoned and will retry at next start`);
+      logger.warn('delete-session', `${sessionId}: files not fully removed (${error}); tombstoned, will retry in the background and at next start`);
+      // Don't rely on the next boot alone: retry a few times while the app runs
+      // (30s, 2min, 5min). The tombstone stays until a retry really removes it.
+      pendingPurgeRetries.get(sessionId)?.();
+      pendingPurgeRetries.set(sessionId, scheduleBackgroundRetries(async () => {
+        const e = await removeDirs([200, 500, 1000]);
+        if (e) {
+          logger.warn('delete-session', `${sessionId}: background retry still blocked (${e})`);
+          return false;
+        }
+        pendingPurgeRetries.delete(sessionId);
+        clearSessionTombstone(sessionId);
+        logger.info('delete-session', `${sessionId}: background retry removed the leftover files`);
+        return true;
+      }, { onGiveUp: () => pendingPurgeRetries.delete(sessionId) }));
       return { ok: false, tombstoned: true, error };
     }
+    pendingPurgeRetries.get(sessionId)?.();
+    pendingPurgeRetries.delete(sessionId);
     clearSessionTombstone(sessionId); // fully gone — no need to keep the marker
     return { ok: true };
   };
