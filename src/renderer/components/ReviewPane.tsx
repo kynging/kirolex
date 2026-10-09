@@ -1,7 +1,7 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { CommentBox, CommentOpener } from './CommentBox';
 import { PdfView } from './PdfView';
-import { pageBlocks, lineBlocks, dropSpan, displayGroups, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
+import { pageBlocks, lineBlocks, dropSpan, displayGroups, groupAnchorOf, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
 import { rewritePatch } from '../rewritePatch';
 import { diffChanges, trustedChanges, remapChanges, planUndo, markLayout, UNDO_REFUSED, type AiMark, type AiMarkState } from '../aiChanges';
 import { getAiMarks, updateAiMarks, subscribeAiMarks, aiRoundOf, beginAiRound, recordAiWrite } from '../aiMarkStore';
@@ -467,6 +467,17 @@ export const ReviewPane: React.FC<{
     }
     return out;
   }, [groups, blocks]);
+  /** 行号 → 它所在显示组的锚点 —— 见 `groupAnchorOf`。 */
+  const anchorOfLine = useMemo(() => groupAnchorOf(groups), [groups]);
+  /**
+   * 挂在某个锚点**覆盖范围末行**下面的东西（框、提交行、状态行）实际摆在哪一组 ——
+   * 末行落在代码围栏里时换成那个围栏的锚点，因为只有组锚点才有自己的 `<li>`。
+   */
+  const hostOf = (anchor: number): number => {
+    const span = spans[anchor];
+    const last = span && span.length > 1 ? span[span.length - 1] : anchor;
+    return anchorOfLine.get(last) ?? last;
+  };
   /** 行号 → 是**哪一行**把它盖住的（最内层那个）。 */
   const coveredBy = useMemo(() => {
     const out = new Map<number, number>();
@@ -1096,7 +1107,7 @@ export const ReviewPane: React.FC<{
       if (j.kind === 'whole') continue;
       const span = spans[j.line] && spans[j.line].length > 1 ? spans[j.line] : [j.line];
       for (const l of span) lockedLines.add(l);
-      const host = span[span.length - 1];
+      const host = hostOf(j.line);
       statusAt.set(host, [...(statusAt.get(host) || []), j]);
     }
   }
@@ -1226,9 +1237,7 @@ export const ReviewPane: React.FC<{
   const boxFor = (line: number) => {
     const anchor = openAt ?? insertAt;
     if (anchor === null) return null;
-    const span = spans[anchor];
-    const last = span && span.length > 1 ? span[span.length - 1] : anchor;
-    if (last !== line) return null;
+    if (hostOf(anchor) !== line) return null;
     const where = spanWhere(anchor);
     const insert = insertAt === anchor;
     return markBox(
@@ -1411,9 +1420,7 @@ export const ReviewPane: React.FC<{
   /** 这一段（文本：它那一节的末行）下面要不要摆提交那一行。 */
   const submitHereText = (line: number) => {
     if (!latestMark || anyBoxOpen || markCount === 0) return false;
-    const span = spans[latestMark.line];
-    const host = span && span.length > 1 ? span[span.length - 1] : latestMark.line;
-    return host === line;
+    return hostOf(latestMark.line) === line;
   };
   /** deck：这一页的版面那一行 / 讲稿那一行下面要不要摆。 */
   const submitHerePage = (page: number, note: boolean) =>

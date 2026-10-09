@@ -1,7 +1,7 @@
 import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import {
-  pageBlocks, lineBlocks, reviewPrompt, hasFeedback, dropSpan, headingLevel, displayGroups, mdLine, isRuleLine,
+  pageBlocks, lineBlocks, reviewPrompt, hasFeedback, dropSpan, headingLevel, displayGroups, groupAnchorOf, mdLine, isRuleLine,
   spanRange, sliceLines, spliceLines,
 } from '../src/renderer/reviewBlocks.ts';
 
@@ -280,6 +280,32 @@ describe('围栏里的行合成一块显示', () => {
     const g2 = displayGroups(lineBlocks('a\n\nb\nc'));
     assert.deepEqual(g2.map((g) => [g.anchor, g.span, g.fenced]), [[1, [1], false], [3, [3], false], [4, [4], false]]);
     assert.deepEqual(displayGroups([]), []);
+  });
+});
+
+describe('行号 → 它所在那一组的锚点（框 / 提交行 / 状态行挂在哪）', () => {
+  test('代码围栏：组里每一行都映射到围栏首行；普通行映射到自己', () => {
+    const md = ['正文', '```json', '{', '  "a": 1', '}', '```', '结尾'].join('\n');
+    const groups = displayGroups(lineBlocks(md));
+    const of = groupAnchorOf(groups);
+    assert.deepEqual([1, 2, 3, 4, 5, 6, 7].map((l) => of.get(l)), [1, 2, 2, 2, 2, 2, 7]);
+    // 围栏覆盖范围的末行是 6（收尾那个 ```），但渲染时只有锚点 2 那一组 —— 框得挂到 2 上
+    const fence = groups.find((g) => g.fenced)!;
+    assert.equal(of.get(fence.span[fence.span.length - 1]), 2);
+  });
+
+  test('以代码围栏结尾的标题节：整节末行落在围栏里，映射到围栏首行', () => {
+    const blocks = lineBlocks(['# 标题', '说明', '~~~', 'code', '~~~', '# 下一节'].join('\n'));
+    const of = groupAnchorOf(displayGroups(blocks));
+    const section = dropSpan(blocks, 1);
+    assert.deepEqual(section, [1, 2, 3, 4, 5]);
+    assert.equal(of.get(section[section.length - 1]), 3);
+    assert.equal(of.get(1), 1);
+    assert.equal(of.get(6), 6);
+  });
+
+  test('空输入：空表', () => {
+    assert.equal(groupAnchorOf([]).size, 0);
   });
 });
 

@@ -146,6 +146,17 @@ export function displayGroups(blocks: ReviewBlock[]): DisplayGroup[] {
   return out;
 }
 
+/**
+ * 行号 → 包含它的那个显示组的锚点。渲染只按每组的 `anchor` 出一个 `<li>`，
+ * 围栏里除首行以外的行没有自己的 `<li>` —— 框 / 提交行 / 状态行要挂在「覆盖范围的末行」下面时，
+ * 得先把末行换成它所在那一组的锚点，否则末行落在围栏里就哪儿都不画。
+ */
+export function groupAnchorOf(groups: DisplayGroup[]): Map<number, number> {
+  const out = new Map<number, number>();
+  for (const g of groups) for (const line of g.span) out.set(line, g.anchor);
+  return out;
+}
+
 export interface ReviewSubmission {
   /** 文件路径，原样写进提示词 —— 模型要靠它知道改哪个文件。 */
   path: string;
