@@ -13,7 +13,9 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { findLabel, matchOffsets, shouldSearch, stepIndex } from '../src/renderer/paneFind.ts';
+import {
+  FIND_DEBOUNCE_MS, findDebounceDelay, findLabel, matchOffsets, shouldExpandForFind, shouldSearch, stepIndex,
+} from '../src/renderer/paneFind.ts';
 
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', ...p), 'utf8');
 const CHAT = read('src', 'renderer', 'components', 'ChatArea.tsx');
@@ -126,10 +128,56 @@ describe('搜索条属于**这一格**,不属于窗口', () => {
   });
 });
 
+describe('什么时候整开:只打开不整开,真有查询词才整开', () => {
+  test('只打开搜索条、还没输入 —— 不整开(长会话按 Ctrl+F 卡很久就是因为这里整开了)', () => {
+    assert.equal(shouldExpandForFind({ findOpen: true, query: '' }), false);
+    assert.equal(shouldExpandForFind({ findOpen: true, query: '   ' }), false);
+  });
+
+  test('打开且有查询词 —— 整开,否则搜不到窗口外和 /clear 之前的', () => {
+    assert.equal(shouldExpandForFind({ findOpen: true, query: 'Cognito' }), true);
+  });
+
+  test('关着的格子哪怕留着旧查询词也不整开', () => {
+    assert.equal(shouldExpandForFind({ findOpen: false, query: 'Cognito' }), false);
+    assert.equal(shouldExpandForFind({ findOpen: false, query: '' }), false);
+  });
+});
+
+describe('查询词防抖', () => {
+  test('防抖在 200～300ms 之间 —— 短到不觉得慢,长到打字时不每个字都整开一次', () => {
+    assert.ok(FIND_DEBOUNCE_MS >= 200 && FIND_DEBOUNCE_MS <= 300);
+  });
+
+  test('非空查询词要等一下', () => {
+    assert.equal(findDebounceDelay('a'), FIND_DEBOUNCE_MS);
+    assert.equal(findDebounceDelay('Cognito'), FIND_DEBOUNCE_MS);
+  });
+
+  test('清空查询词**立刻**生效 —— 马上收回只挂最近一窗,不用等', () => {
+    assert.equal(findDebounceDelay(''), 0);
+    assert.equal(findDebounceDelay('  '), 0);
+  });
+});
+
 describe('搜索**只能搜挂上来的 DOM**,所以搜索时要整开', () => {
-  test('判据是这一格自己的 findOpen,不是一个全局开关', () => {
-    assert.match(CHAT, /const expandForFind = findOpen \|\| !!searchOpen;/);
+  test('判据是这一格自己的 findOpen + **防抖后**的查询词,不是一打开就整开', () => {
+    assert.match(CHAT, /const expandForFind = shouldExpandForFind\(\{ findOpen, query: findSearchQuery \}\) \|\| !!searchOpen;/);
     assert.match(CHAT, /const windowSize = expandForFind\s*\n?\s*\? renderGroups\.length/);
+    assert.doesNotMatch(CHAT, /const expandForFind = findOpen \|\|/, '一打开就整开 = 长会话按 Ctrl+F 卡住');
+  });
+
+  test('命中和计数用防抖后的那个词 —— 和整开用同一个,否则第一次搜的还是没整开的 DOM', () => {
+    const at = CHAT.indexOf('重新算这一格的命中');
+    const block = CHAT.slice(at, at + 2400);
+    assert.match(block, /shouldSearch\(findSearchQuery\)/);
+    assert.match(block, /matchOffsets\(textOf\(el\), findSearchQuery\)/);
+    assert.match(block, /\[findOpen, findSearchQuery, findKey, visibleGroups\.length\]/);
+    assert.match(CHAT, /findLabel\(\{ query: findSearchQuery,/);
+  });
+
+  test('防抖的时长来自 findDebounceDelay', () => {
+    assert.match(CHAT, /findDebounceDelay\(findQuery\)/);
   });
 
   test('等两帧再算 —— 同一帧里 DOM 还是旧的那 120 组', () => {

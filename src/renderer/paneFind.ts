@@ -28,6 +28,28 @@ export function shouldSearch(query: string): boolean {
 }
 
 /**
+ * 这一格要不要把整份记录挂上（不设窗口、清空边界也让开）。
+ *
+ * **只打开、还没输入时不整开**:整开要把长会话的每一组 markdown 一次挂进页面,按 Ctrl+F 那一下
+ * 就卡很久,而这时根本没东西要搜。真有查询词了才付这个代价。`query` 应当是防抖后的那个词。
+ */
+export function shouldExpandForFind(arg: { findOpen: boolean; query: string }): boolean {
+  return arg.findOpen && shouldSearch(arg.query);
+}
+
+/** 查询词防抖时长:打字过程中不每敲一个字就整开、重算一次。 */
+export const FIND_DEBOUNCE_MS = 250;
+
+/**
+ * 查询词变成 `query` 之后等多久才拿去搜。
+ *
+ * 清空（空串/纯空白）**立刻**生效:那是「收回只挂最近一窗」,没有理由让人等。
+ */
+export function findDebounceDelay(query: string): number {
+  return shouldSearch(query) ? FIND_DEBOUNCE_MS : 0;
+}
+
+/**
  * `needle` 在 `haystack` 里所有的起始下标,大小写不敏感、**不重叠**。
  *
  * 不重叠是刻意的:搜 `aa` 在 `aaa` 里应当是 1 个而不是 2 个 —— 编辑器和浏览器都这么算,

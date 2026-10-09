@@ -90,10 +90,10 @@ describe('接进了聊天区', () => {
       窗口现在还多一层：**这一格的搜索条开着就整开**（搜索只搜已渲染的 DOM，窗口挡住的就是搜不到的）。
       清空边界那条收窄也一起让开 —— 否则清空过的会话搜不到清空之前的内容，实测搜 `Cognito` 得到「无结果」。
 
-      判据是 `expandForFind`（= 这一格自己的 `findOpen`），不再是窗口级那个 `searchOpen`：
-      搜索条搬进每一格之后，只有真的在搜的那一格需要付「挂完整棵树」的代价。
+      判据是 `expandForFind`（= 这一格自己的 `findOpen` 且查询词非空），不再是窗口级那个 `searchOpen`：
+      搜索条搬进每一格之后，只有真的在搜的那一格需要付「挂完整棵树」的代价；只打开、还没输入时不整开。
     */
-    assert.match(CHAT, /const expandForFind = findOpen \|\| !!searchOpen;/);
+    assert.match(CHAT, /const expandForFind = shouldExpandForFind\(\{ findOpen, query: findSearchQuery \}\) \|\| !!searchOpen;/);
     assert.match(CHAT, /expandForFind\s*\n?\s*\? renderGroups\.length/);
     assert.match(CHAT, /groupsSinceClear > 0 \? Math\.min\(renderLimit, groupsSinceClear\) : renderLimit/);
   });

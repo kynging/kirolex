@@ -11,7 +11,7 @@ import { FILE_TOKEN_RE, PATH_RE } from '../filePaths';
 // 清空上下文那条分界线：默认视图收到它之后，并在原位画出来（判据见那个模块）
 import { sinceLastClear, isClearCommand, clearNoteText } from '../clearBoundary';
 // 这一格自己的会话内搜索：命中算术（纯，可测）+ 高亮（Range/CSS.highlights，不动 DOM）
-import { findLabel, matchOffsets, shouldSearch, stepIndex } from '../paneFind';
+import { findDebounceDelay, findLabel, matchOffsets, shouldExpandForFind, shouldSearch, stepIndex } from '../paneFind';
 import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHighlight';
 import { useT } from '../hooks/useLang';
 // 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
@@ -3092,6 +3092,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   */
   const [findOpen, setFindOpen] = useState(false);
   const [findQuery, setFindQuery] = useState('');
+  /**
+   * 防抖后的查询词 —— 整开、算命中、计数标签都用它。输入框绑的还是 `findQuery`(打字不能卡)。
+   * 清空立刻生效,马上收回只挂最近一窗（`findDebounceDelay`）。
+   */
+  const [findSearchQuery, setFindSearchQuery] = useState('');
+  useEffect(() => {
+    const delay = findDebounceDelay(findQuery);
+    if (delay <= 0) { setFindSearchQuery(findQuery); return; }
+    const timer = setTimeout(() => setFindSearchQuery(findQuery), delay);
+    return () => clearTimeout(timer);
+  }, [findQuery]);
   /** 当前是第几个命中,1 起;0 = 还没定位（或者没有命中）。 */
   const [findActive, setFindActive] = useState(0);
   const [findTotal, setFindTotal] = useState(0);
@@ -3386,8 +3397,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    *
    * 判据是**这一格自己的** `findOpen`,不再是全局那一个:分屏时只有你真的在搜的那一格
    * 需要付「挂完整棵树」的代价,旁边那格照旧只挂最近 120 组。
+   *
+   * 而且要**真有(防抖后的)查询词**才整开:只按了 Ctrl+F 还没输入时就整开,长会话会卡很久。
+   * 清空查询词或关掉搜索条,就回到平时那一窗。
    */
-  const expandForFind = findOpen || !!searchOpen;
+  const expandForFind = shouldExpandForFind({ findOpen, query: findSearchQuery }) || !!searchOpen;
   const windowSize = expandForFind
     ? renderGroups.length
     : (groupsSinceClear > 0 ? Math.min(renderLimit, groupsSinceClear) : renderLimit);
@@ -3400,7 +3414,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   /**
    * 重新算这一格的命中。
    *
-   * 等**两帧**再算,和当年 `findInPage` 那版同一个理由:`findOpen` 变 true 让 `windowSize` 整开,
+   * 等**两帧**再算,和当年 `findInPage` 那版同一个理由:有了查询词让 `windowSize` 整开,
    * 而那棵树是下一帧才挂上来的 —— 同一帧里算,搜的还是旧的那 120 组,表现成「第一次搜没结果,
    * 再敲一个字才对」。
    *
@@ -3409,7 +3423,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    */
   useEffect(() => {
     const root = chatMessagesRef.current;
-    if (!findOpen || !root || !shouldSearch(findQuery)) {
+    if (!findOpen || !root || !shouldSearch(findSearchQuery)) {
       findRangesRef.current = [];
       clearPane(findKey);
       setFindTotal(0);
@@ -3421,8 +3435,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       raf2 = requestAnimationFrame(() => {
         const el = chatMessagesRef.current;
         if (!el) return;
-        const offsets = matchOffsets(textOf(el), findQuery);
-        const ranges = rangesIn(el, findQuery, offsets);
+        const offsets = matchOffsets(textOf(el), findSearchQuery);
+        const ranges = rangesIn(el, findSearchQuery, offsets);
         findRangesRef.current = ranges;
         setPaneRanges(findKey, ranges);
         setFindTotal(ranges.length);
@@ -3433,7 +3447,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       });
     });
     return () => { cancelAnimationFrame(raf1); cancelAnimationFrame(raf2); };
-  }, [findOpen, findQuery, findKey, visibleGroups.length]);
+  }, [findOpen, findSearchQuery, findKey, visibleGroups.length]);
 
   /** 这一格没了(关掉、换会话)就把它的高亮撤掉 —— 留着会画在别的会话的字上。 */
   useEffect(() => () => { clearPane(findKey); }, [findKey]);
@@ -3522,7 +3536,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             }}
           />
           <span className="pane-find-count">
-            {findLabel({ query: findQuery, active: findActive, total: findTotal })}
+            {findLabel({ query: findSearchQuery, active: findActive, total: findTotal })}
           </span>
           <button className="pane-find-btn" onClick={() => findStep('prev')} title={t('Previous (Shift+Enter)')}>↑</button>
           <button className="pane-find-btn" onClick={() => findStep('next')} title={t('Next (Enter)')}>↓</button>
