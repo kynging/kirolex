@@ -263,7 +263,9 @@ test('两侧的折叠按钮一样大、一直看得见；右侧是贴边的按�
 });
 
 test('reload 之后 comment 侧栏还在：标签连同主人会话一起存、一起开回来；开回来的过程中不存半截', () => {
-  assert.ok(APP.includes('tabs: fileTabs.map((t) => ({ path: t.path, raw: !!t.raw, ...(t.ownerSessionId ? { owner: t.ownerSessionId } : {}) })),'));
+  assert.ok(APP.includes('...(t.ownerSessionId ? { owner: t.ownerSessionId } : {}),'));
+  /* 滚动位置按路径一起存（开回来停在原处，见 tabScroll.ts） */
+  assert.ok(APP.includes('...(scroll > 0 ? { scroll } : {}),'));
   assert.ok(APP.includes('await openFileInApp(t.path, t.owner || ownerFromPath(t.path));'));
   assert.ok(APP.includes('if (!tabsRestoredRef.current || tabsRestoringRef.current) return;'));
   const m = /export function ownerFromPath[\s\S]*?const m = (\/.*\/)\.exec/.exec(APP);

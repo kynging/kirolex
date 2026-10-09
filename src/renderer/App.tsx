@@ -28,6 +28,7 @@ import { MODEL_LIST_WARMUP_DELAY_MS, AGENTS_CACHE_KEY, shouldReplaceModelCache }
 import { SkillDialog } from './components/SkillDialog';
 import { WorkspacePanel } from './components/WorkspacePanel';
 import { ReviewPane, isDeckPath } from './components/ReviewPane';
+import { savedScrollOf, scrollHostOf, restoreScroll } from './tabScroll';
 import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
@@ -1248,6 +1249,12 @@ const App: React.FC = () => {
   const [fileTabs, setFileTabs] = useState<FileTab[]>([]);
   const [activeFileTabId, setActiveFileTabId] = useState<string | null>(null);
   const fileScrollRef = useRef<Record<string, number>>({});   // tabId -> scrollTop
+  /** 正在把某个标签滚回原处（见 `restoreScroll`）—— 那期间程序自己滚出来的位置不算数，别记进 `fileScrollRef`。 */
+  const scrollRestoreStopRef = useRef<(() => void) | null>(null);
+  /** 开回上次的标签之后推一下：当前标签可能没变（id 一样），但它的位置刚从存档里填进来，得再滚一次。 */
+  const [scrollRestoreTick, setScrollRestoreTick] = useState(0);
+  /** 滚动停下几百毫秒才写盘（见 `persistOpenTabs`）—— 每滚一下都写 ui-state 是白花的磁盘。 */
+  const scrollSaveTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** Mirrors of the tab state, so the disk-change listener does not have to be torn
    *  down and re-registered on every tab edit (which would drop events mid-save). */
   const fileTabsRef = useRef<FileTab[]>([]);
@@ -1255,6 +1262,16 @@ const App: React.FC = () => {
   const activeFileTabIdRef = useRef<string | null>(null);
   activeFileTabIdRef.current = activeFileTabId;
   const fileBodyRef = useRef<HTMLDivElement | null>(null);
+  /**
+   * 滚动容器**此刻挂着的那个节点** —— 进 state 是为了让"滚回原处"在它重新挂上时再跑一次。
+   * 预览栏藏着时它根本不在（见 `fileViewerHidden`）：藏着重启、开回标签那一下没地方滚，展开时标签 / 内容都没变，
+   * 只靠 ref 的话就再也不会滚回去了。
+   */
+  const [fileBodyNode, setFileBodyNode] = useState<HTMLDivElement | null>(null);
+  const setFileBody = useCallback((node: HTMLDivElement | null) => {
+    fileBodyRef.current = node;
+    setFileBodyNode(node);
+  }, []);
   const fileViewer = fileTabs.find((t) => t.id === activeFileTabId) || null;
   const [fileViewerLoading, setFileViewerLoading] = useState(false);
   /**
@@ -2135,18 +2152,64 @@ const App: React.FC = () => {
 
   // Restore this tab's scroll position after it becomes active (and after its
   // content lands, which is why `fileViewer?.content` is a dependency).
+  /*
+    不是第一帧设一次就完：Markdown 渲染、代码高亮、PDF 逐页画都是慢慢出来的，高度不够时设了也白设。
+    `restoreScroll` 隔一会儿再试，到位 / 超时 / 用户自己动手滚了就停。
+  */
   useEffect(() => {
     if (!activeFileTabId) return;
     const node = fileBodyRef.current;
     if (!node) return;
     const target = fileScrollRef.current[activeFileTabId] ?? 0;
-    requestAnimationFrame(() => { try { node.scrollTop = target; } catch {} });
-  }, [activeFileTabId, fileViewer?.content]);
+    const stop = restoreScroll(node, target, () => { scrollRestoreStopRef.current = null; }, 15000);
+    scrollRestoreStopRef.current = stop;
+    return () => {
+      stop();
+      if (scrollRestoreStopRef.current === stop) scrollRestoreStopRef.current = null;
+    };
+  }, [activeFileTabId, fileViewer?.content, scrollRestoreTick, fileBodyNode]);
 
   // Persist WHICH files are open (paths only, plus the raw/rendered choice) so the
   // set survives a restart; content is re-read lazily on first activation.
   /** 正在把上次的标签一个个开回来 —— 那期间别存：存进去的是开了一半的那几个，reload 一次就少几个标签。 */
   const tabsRestoringRef = useRef(false);
+  /** 把此刻开着的标签（连同各自的滚动位置）写进 `OPEN_TABS_KEY`。读的是 ref，所以滚动的防抖和关窗前都能直接调。 */
+  const persistOpenTabs = useCallback(() => {
+    if (!tabsRestoredRef.current || tabsRestoringRef.current) return;
+    try {
+      const tabs = fileTabsRef.current;
+      // Shared store, not origin-scoped localStorage -- same reason as the drafts and
+      // split sizes: the set of open files was reset on every dev/prod origin switch.
+      if (tabs.length === 0) { uiRemove(OPEN_TABS_KEY); return; }
+      const active = tabs.find((t) => t.id === activeFileTabIdRef.current);
+      uiSet(OPEN_TABS_KEY, JSON.stringify({
+        /*
+          **连同主人会话一起存** ——「你重新加载了之后我之前打开的 comment 侧栏还是会丢」。原来只存路径，
+          开回来时主人就成了"此刻选中的那条"（启动那一刻往往还没有）—— 没有主人，comment 那一侧就只能看，
+          💬 / ✕ 和那些标记全都不见了。
+          **滚动位置也存**（按路径 —— 开回来标签 id 就变了），开回来停在上次看到的那一段。
+        */
+        tabs: tabs.map((t) => {
+          const scroll = Math.round(fileScrollRef.current[t.id] || 0);
+          return {
+            path: t.path, raw: !!t.raw,
+            ...(t.ownerSessionId ? { owner: t.ownerSessionId } : {}),
+            ...(scroll > 0 ? { scroll } : {}),
+          };
+        }),
+        activePath: active?.path || null,
+      }));
+    } catch {}
+  }, []);
+  /* 关窗口 / 刷新前补写一次 —— 滚动的防抖那一下可能还没到点 */
+  useEffect(() => {
+    const flush = () => {
+      if (scrollSaveTimerRef.current) { clearTimeout(scrollSaveTimerRef.current); scrollSaveTimerRef.current = null; }
+      persistOpenTabs();
+    };
+    window.addEventListener('beforeunload', flush);
+    return () => window.removeEventListener('beforeunload', flush);
+  }, [persistOpenTabs]);
   useEffect(() => {
     /*
       **开回来之前一律不存** ——「我明明跟你说刷新之后仍然要记录已经打开的 review 侧栏并重新打开，为什么这个功能没实现」。
@@ -2154,22 +2217,8 @@ const App: React.FC = () => {
       于是走到下面 `uiRemove` —— 把存着的那份标签单子删了，紧接着"开回来"去读，读到的是空。每次刷新都是这样。
       所以等"开回来"那一遍跑过（`tabsRestoredRef`）、并且开完（`tabsRestoringRef`）再存。
     */
-    if (!tabsRestoredRef.current || tabsRestoringRef.current) return;
-    try {
-      // Shared store, not origin-scoped localStorage -- same reason as the drafts and
-      // split sizes: the set of open files was reset on every dev/prod origin switch.
-      if (fileTabs.length === 0) { uiRemove(OPEN_TABS_KEY); return; }
-      uiSet(OPEN_TABS_KEY, JSON.stringify({
-        /*
-          **连同主人会话一起存** ——「你重新加载了之后我之前打开的 comment 侧栏还是会丢」。原来只存路径，
-          开回来时主人就成了"此刻选中的那条"（启动那一刻往往还没有）—— 没有主人，comment 那一侧就只能看，
-          💬 / ✕ 和那些标记全都不见了。
-        */
-        tabs: fileTabs.map((t) => ({ path: t.path, raw: !!t.raw, ...(t.ownerSessionId ? { owner: t.ownerSessionId } : {}) })),
-        activePath: fileViewer?.path || null,
-      }));
-    } catch {}
-  }, [fileTabs, fileViewer?.path]);
+    persistOpenTabs();
+  }, [fileTabs, fileViewer?.path, persistOpenTabs]);
 
   // Re-open last session's tabs on mount. This used to wait for `currentSessionId`
   // because workspaceRead demanded a connected chat; it no longer does, so the tabs
@@ -2178,7 +2227,7 @@ const App: React.FC = () => {
   useEffect(() => {
     if (tabsRestoredRef.current) return;
     tabsRestoredRef.current = true;
-    let saved: { tabs?: { path: string; raw?: boolean; owner?: string }[]; activePath?: string | null } | null = null;
+    let saved: { tabs?: { path: string; raw?: boolean; owner?: string; scroll?: number }[]; activePath?: string | null } | null = null;
     try { saved = JSON.parse(uiGet(OPEN_TABS_KEY) || 'null'); } catch {}
     const list = (saved?.tabs || []).filter((t) => t && t.path);
     if (!list.length) return;
@@ -2189,6 +2238,19 @@ const App: React.FC = () => {
       } finally {
         tabsRestoringRef.current = false;
       }
+      /*
+        存下的滚动位置挂回**新的**标签 id 上（旧存档没有这一项 = 顶部）。当前标签靠下面那一推马上滚，
+        其余的切过去时由"切标签滚回原处"那个 effect 滚。用 `setFileTabs` 拿最新的标签表 —— ref 要等重渲染才更新。
+      */
+      setFileTabs((prev) => {
+        for (const tab of prev) {
+          const savedTab = list.find((x) => x.path === tab.path || x.path === tab.requestedPath);
+          const scroll = savedScrollOf(savedTab);
+          if (scroll > 0 && !fileScrollRef.current[tab.id]) fileScrollRef.current[tab.id] = scroll;
+        }
+        return prev;
+      });
+      setScrollRestoreTick((n) => n + 1);
       const active = saved?.activePath;
       if (active) {
         setFileTabs((prev) => {
@@ -3931,10 +3993,17 @@ const App: React.FC = () => {
             </div>
             <div
               className="workspace-file-modal-body"
-              ref={fileBodyRef}
-              onScroll={(e) => {
+              ref={setFileBody}
+              /* capture：deck 是在里面那一列页（`.rv-pdf-pages`）里滚的，scroll 事件不冒泡 */
+              onScrollCapture={(e) => {
                 // Remember where this tab was scrolled to; restored on switch back.
-                if (activeFileTabId) fileScrollRef.current[activeFileTabId] = (e.target as HTMLDivElement).scrollTop;
+                const body = fileBodyRef.current;
+                /* 正在滚回原处时那些位置是程序滚出来的（内容还没长够），不记 */
+                if (!activeFileTabId || !body || scrollRestoreStopRef.current) return;
+                if (e.target !== scrollHostOf(body)) return;   // 代码块横向滚、输入框里滚都不算
+                fileScrollRef.current[activeFileTabId] = (e.target as HTMLElement).scrollTop;
+                if (scrollSaveTimerRef.current) clearTimeout(scrollSaveTimerRef.current);
+                scrollSaveTimerRef.current = setTimeout(() => { scrollSaveTimerRef.current = null; persistOpenTabs(); }, 500);
               }}
             >
               {fileViewerLoading && <div className="workspace-hint">Loading file…</div>}
