@@ -206,7 +206,7 @@ function revisePatchPrompt(
     '· **不需要动的段落一个字都不要交回**；没提到的行我原样保留；',
     '· 合并两段：用一块新内容换掉这两段的整个行范围（例：`@@ 12-17 | …` 换成合并后的一段）；',
     '· 在某处后面加一段：把那一段的行范围连同新加的内容一起交回；',
-    '· 删掉一段：新内容只写一行 `<DELETE>`；',
+    '· 删掉一段：新内容只写一行 `<DELETE>`；块下面不能留空 —— 空块我认不出你是要删还是漏写了，整轮都不会写；',
     '· 几块之间的行范围不能重叠；改好几处不相邻的地方就写好几块；',
     '· 新内容保持原来的标记形式（列表还是列表，标题还是同级标题），新内容里不要带行号；',
     '· 不要用 ``` 围栏包起来，块外面不要写解释或"好的"之类的话；',
@@ -241,7 +241,7 @@ export interface PatchEdit {
  *   · 块里一个字都没有（又没写 `<DELETE>`）就报错 —— 那和"格式没对上"长得一样，当成删掉是不可逆的；
  *   · 一块都没有又没说改不了，同样报错。
  */
-export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: string; error?: string } {
+export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: string; error?: string; fix?: string } {
   let body = String(stdout ?? '').replace(/\r\n/g, '\n').trim();
   const m = /^\s*CANNOT-REVISE-LOCALLY:\s*(.*)$/m.exec(body);
   if (m) return { edits: [], cannot: m[1].trim() || '这条意见改不了' };
@@ -255,6 +255,9 @@ export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: 
   const int = (t: string) => Number(String(t).replace(/^[−－]/, '-'));
   const edits: PatchEdit[] = [];
   let cur: { from: number; to: number; hint?: string; lines: string[] } | null = null;
+  /** 格式错误：`error` 给你看，`fix` 是追问时告诉模型哪里不对、怎么改（见 `patchFollowUp`） */
+  const bad = (error: string, fix: string) => ({ edits: [] as PatchEdit[], error, fix });
+  let closeFix = '';
   const close = (): string | undefined => {
     if (!cur) return undefined;
     const lines = cur.lines;
@@ -263,17 +266,20 @@ export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: 
     const range = `${cur.from}-${cur.to}`;
     const c = cur;
     cur = null;
-    if (!lines.length) return `第 ${range} 行那一处没有给新内容（要删掉请写 <DELETE>）`;
+    if (!lines.length) {
+      closeFix = `第 ${range} 行那一处是空的：要删这几行就只写一行 \`<DELETE>\`；不是要删就补上新内容`;
+      return `第 ${range} 行那一处没有给新内容（要删掉请写 <DELETE>）`;
+    }
     const text = lines.length === 1 && /^<\s*delete\s*>$/i.test(lines[0].trim()) ? '' : lines.join('\n');
     edits.push({ from: c.from, to: c.to, text, ...(c.hint ? { hint: c.hint } : null) });
     return undefined;
   };
   for (const line of body.split('\n')) {
-    if (END.test(line)) { const e = close(); if (e) return { edits: [], error: e }; continue; }
+    if (END.test(line)) { const e = close(); if (e) return bad(e, closeFix); continue; }
     const h = HEAD.exec(line);
     if (h) {
       const e = close();
-      if (e) return { edits: [], error: e };
+      if (e) return bad(e, closeFix);
       const from = int(h[1]);
       const to = h[2] !== undefined ? int(h[2]) : from;
       const hint = String(h[3] ?? '').trim()
@@ -283,13 +289,49 @@ export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: 
       cur = { from, to, ...(hint ? { hint } : null), lines: [] };
       continue;
     }
-    if (HEADISH.test(line)) return { edits: [], error: `有一处块头看不懂（「${line.trim().slice(0, 40)}」）—— 整轮没写` };
+    if (HEADISH.test(line)) {
+      const head = line.trim().slice(0, 40);
+      return bad(`有一处块头看不懂（「${head}」）—— 整轮没写`,
+        `有一处块头看不懂（「${head}」）：块头要写成 \`@@ <起始行>-<结束行> | <起始行原文开头几个字>\`，行号是数字`);
+    }
     if (cur) cur.lines.push(line);
   }
   const e = close();
-  if (e) return { edits: [], error: e };
-  if (!edits.length) return { edits: [], error: '它没有给出可用的改动（没有 `@@ 起-止` 那样的块）' };
+  if (e) return bad(e, closeFix);
+  if (!edits.length) {
+    return bad('它没有给出可用的改动（没有 `@@ 起-止` 那样的块）', '一块改动都没找到：每一处改动都要按下面的格式写成一块');
+  }
   return { edits };
+}
+
+/**
+ * `patch` 档回复**格式不对**时，在同一条会话里追问的那段话 —— PURE；不该追问就返回 `null`。
+ *
+ * 只有 `parsePatchReply` 报的格式错误（空块、看不懂的块头、一块都没有，带 `fix` 的那几种）才追问 ——
+ * 那是"写法没对上"，再问一次多半就对了，不值得让整轮作废、让你重新提。说改不了（`cannot`）、行号越界 /
+ * 重叠这些不追问：前者是它的判断，后者是它数错了行。**空块绝不自动当成删除** —— 删除不可逆，只能让它自己说。
+ *
+ * 要它把**这一轮的全部改动**重交（不是只补那一块）：拼回是整轮一次做的，只补一块的话前面那几块就没了。
+ */
+export function patchFollowUp(parsed: { cannot?: string; error?: string; fix?: string }): string | null {
+  if (parsed.cannot || !parsed.error || !parsed.fix) return null;
+  return [
+    '你上一条回复的格式不对，我没法用 —— 整轮都还没写进文件：',
+    `· ${parsed.fix}`,
+    '',
+    '请按原来的格式把**这一轮的全部改动**重新交一遍（不是只补这一处 —— 上一条里写对的那几块也要原样再写一遍）。',
+    '行号还是按我最开始发给你的那份正文编，不要按你改完的样子重新数。',
+    '',
+    '格式 —— 每一处改动写成一块：',
+    '@@ <起始行>-<结束行> | <这几行原文开头的几个字>',
+    '<换上去的新内容，可以多行>',
+    '@@ END',
+    '',
+    '· 删掉一段：新内容只写一行 `<DELETE>`；块下面不能留空；',
+    '· 块外面不要写解释或"好的"之类的话，不要用 ``` 围栏包起来；',
+    '· **不要用工具去改文件** —— 落盘由 KiroLex 统一做；',
+    '· 如果这条意见需要你没有的信息，什么块都不写，只单独一行写 `CANNOT-REVISE-LOCALLY: <一句话说缺什么>`。',
+  ].join('\n');
 }
 
 /**
@@ -543,10 +585,12 @@ export function parseSlideEdits(
   return cannot ? { edits, ops, cannot } : { edits, ops };
 }
 
+const PATCH_CONFLICT = '这份文件在等回复的时候被别的改动动过了 —— 这次的结果没写进去，刷新看一眼新的正文再提一次';
+
 /** `settlePatchRevision` 的结果 —— 就是 `review:revise-in-session` 在 `patch` 档的返回值（见那里的注释）。 */
 export type PatchSettled =
   | { ok: false; cannot: string }
-  | { ok: false; error: string; conflict?: true }
+  | { ok: false; error: string; conflict?: true; badFormat?: true; followUp?: string }
   | { ok: true; text: string; fullText: string; scope: 'patch'; changes: PatchChange[]; written?: true; path?: string };
 
 /**
@@ -562,20 +606,37 @@ export function settlePatchRevision(input: {
   base: string;
   /** 不传 = 只拼不写（没有 `apply` 的老调用方）。`expectBase` 照传给 `writeReviewFile`。 */
   write?: (fullText: string, expectBase: string) => { ok?: boolean; mismatch?: boolean; error?: string; path?: string } | null | undefined;
+  /** 这已经是追问之后的那份回复 —— 还是格式错误就报失败，不再追问（只追问一次）。 */
+  followedUp?: boolean;
+  /**
+   * 只读：盘上此刻的正文（读不到给 `null`）。要追问之前拿它和 `base` 核对 —— 格式错误那一轮走不到 `write`，
+   * 等回复期间文件被改过的话，不核对就会白追问一轮（最后写盘那次还会再核对一遍）。
+   */
+  onDisk?: () => string | null | undefined;
 }): PatchSettled {
   const parsed = parsePatchReply(input.replyText);
   if (parsed.cannot) return { ok: false, cannot: parsed.cannot };
-  if (parsed.error) return { ok: false, error: parsed.error };
+  if (parsed.error) {
+    /* 格式错误（`badFormat`）：第一次带上 `followUp`，由调用方在同一条会话里追问一次；补过了还不对就照常报失败 */
+    const followUp = input.followedUp ? null : patchFollowUp(parsed);
+    if (followUp) {
+      const now = input.onDisk?.();
+      if (typeof now === 'string' && now !== input.base) return { ok: false, conflict: true, badFormat: true, error: PATCH_CONFLICT };
+      return { ok: false, error: parsed.error, badFormat: true, followUp };
+    }
+    return {
+      ok: false,
+      error: input.followedUp ? `${parsed.error}（已经让它补过一次，还是不对）` : parsed.error,
+      ...(parsed.fix ? { badFormat: true as const } : null),
+    };
+  }
   const res = applyPatch(input.base, parsed.edits);
   if (!res.ok) return { ok: false, error: res.why };
   const done = { ok: true as const, text: res.text, fullText: res.text, scope: 'patch' as const, changes: res.changes };
   if (!input.write) return done;
   const wrote = input.write(res.text, input.base);
   if (!wrote?.ok && wrote?.mismatch) {
-    return {
-      ok: false, conflict: true,
-      error: '这份文件在等回复的时候被别的改动动过了 —— 这次的结果没写进去，刷新看一眼新的正文再提一次',
-    };
+    return { ok: false, conflict: true, error: PATCH_CONFLICT };
   }
   if (!wrote?.ok) return { ok: false, error: wrote?.error || '写不进这个文件' };
   return { ...done, written: true, ...(wrote.path ? { path: wrote.path } : null) };

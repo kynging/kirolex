@@ -9593,6 +9593,12 @@ app.whenReady().then(async () => {
       return { ok: false, error: String(error?.message || error) };
     }
   };
+  /** 只读：按和 `writeReviewFile` 同样的规则解析路径，读出盘上此刻的正文；读不到给 `null`。 */
+  const readReviewFile = (sessionId: string | null | undefined, filePath: string): string | null => {
+    const t = reviewTarget(sessionId, filePath);
+    if (!t.ok) return null;
+    try { return fs.readFileSync(t.want, 'utf-8'); } catch { return null; }
+  };
   /* `expectBase`（可选）：盘上此刻不是这一份就不写 —— 侧栏撤销「AI 刚改过」那一处用它，不会盖掉预览还没刷出来的改动 */
   ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string, expectBase?: unknown) =>
     writeReviewFile(sessionId, filePath, text, typeof expectBase === 'string' ? expectBase : undefined));
@@ -9731,7 +9737,11 @@ app.whenReady().then(async () => {
           logger.warn('revise', `in-session ${sessionId}: ${usable.why}`);
           return { ok: false, error: usable.why };
         }
-        if (wantScope === 'patch') return await finishPatch(reply.text, patchBase!, started);
+        if (wantScope === 'patch') {
+          const first = await finishPatch(reply.text, patchBase!, started, false);
+          if (first.ok || !('followUp' in first) || !first.followUp) return first;
+          return await followUpPatch(first.followUp, patchBase!, started);
+        }
         const out = parseRevised(reply.text, where);
         if (out.cannot) {
           logger.info('revise', `not local (in-session ${sessionId}): ${out.cannot}`);
@@ -9769,17 +9779,21 @@ app.whenReady().then(async () => {
      * 判据全在 `settlePatchRevision`（纯的、有测试）：任何一处不对整轮不写；**盘上和 base 对不上也是失败**，
      * 不像 block 那档把结果交回渲染层去写 —— 渲染层那次写不带 expectBase，会把等待期间的改动盖掉。
      */
-    async function finishPatch(replyText: string, base: string, started: number) {
+    async function finishPatch(replyText: string, base: string, started: number, followedUp: boolean) {
       const apply = input?.apply;
       const canWrite = !!apply && typeof apply.path === 'string' && typeof apply.base === 'string';
       const res = settlePatchRevision({
-        replyText, base,
+        replyText, base, followedUp,
         write: canWrite ? (fullText, expectBase) => writeReviewFile(sessionId, apply!.path, fullText, expectBase) : undefined,
+        /* 要追问之前先看一眼盘上那一份 —— 已经被改过就不追问，直接报冲突 */
+        onDisk: canWrite ? () => readReviewFile(sessionId, apply!.path) : undefined,
       });
       const secs = ((Date.now() - started) / 1000).toFixed(1);
       if (!res.ok) {
         if ('cannot' in res) logger.info('revise', `not local (in-session ${sessionId} patch): ${res.cannot}`);
-        else logger.warn('revise', `in-session ${sessionId} patch not written${res.conflict ? ' (conflict)' : ''}: ${res.error}`);
+        else logger.warn('revise', `in-session ${sessionId} patch not written${res.conflict ? ' (conflict)' : ''}${res.followUp ? ' (will ask once more)' : ''}: ${res.error}`);
+        /* 格式没解析出来 —— 记下原始回复的前一段，以后排查它到底写成了什么样 */
+        if ('badFormat' in res && res.badFormat) logger.warn('revise', `in-session ${sessionId} patch raw reply${followedUp ? ' (after follow-up)' : ''}: ${String(replyText).slice(0, 2000)}`);
         return res;
       }
       logger.info('revise', `in-session ${sessionId} scope=patch: ${res.changes.length} edit(s) in ${secs}s${res.written ? ', written' : ''}`);
@@ -9788,6 +9802,30 @@ app.whenReady().then(async () => {
         noteInSession(sessionId, `✅ 已按意见改了${input?.label || '这份文件'}（${res.changes.length} 处，现在 ${res.fullText.length} 字）\n文件：${res.path || apply!.path}\nKiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。`);
       }
       return res;
+    }
+
+    /**
+     * `patch` 档的回复格式不对（空块、看不懂的块头、一块都没有）—— 在**同一条会话**里追问**一次**，
+     * 要它把这一轮的全部改动按原格式重交；行号基准还是 `base`。第二次还不对就照常报失败（见 `settlePatchRevision`）。
+     * 和第一轮一样：还在这条会话的改写队列里，先等它空下来；取消按同一个 ticket 停；落盘还是 `finishPatch`。
+     */
+    async function followUpPatch(followUp: string, base: string, started: number) {
+      const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
+      if (stillBusy) return { ok: false, error: `回复格式不对，想让它补一次，但等了 20 分钟这条会话还在忙（${stillBusy}）` };
+      if (tk.cancelled()) return { ok: false, cancelled: true };
+      if (askWaiters.has(sessionId)) return { ok: false, error: '回复格式不对，想让它补一次，但这条会话上已经有一次改写在等回复' };
+      tk.asking(true);
+      const again = await askOnce(
+        sessionId, followUp,
+        input?.label ? `【改写 · ${input.label}】上一条格式不对，请重交一遍` : '【改写】上一条格式不对，请重交一遍',
+      ).finally(() => tk.asking(false));
+      if (tk.cancelled()) return { ok: false, cancelled: true };
+      const usable = replyUsable({ stopReason: again.stopReason, wedged: again.wedged });
+      if (!usable.ok) {
+        logger.warn('revise', `in-session ${sessionId} follow-up: ${usable.why}`);
+        return { ok: false, error: usable.why };
+      }
+      return await finishPatch(again.text, base, started, true);
     }
   });
 

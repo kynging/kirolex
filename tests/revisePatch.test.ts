@@ -3,7 +3,7 @@ import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parsePatchReply, settlePatchRevision } from '../src/main/reviseBlock.ts';
+import { parsePatchReply, settlePatchRevision, patchFollowUp, reviseInSessionPrompt } from '../src/main/reviseBlock.ts';
 import { applyPatch, patchReplyOutcome, sliceLines } from '../src/main/reviewApply.ts';
 
 /**
@@ -322,5 +322,142 @@ describe('主进程 / 界面接线', () => {
   });
   test('主进程不再认 whole 那一档', () => {
     assert.doesNotMatch(M, /input\?\.scope === 'whole'/);
+  });
+});
+
+describe('格式不对时自动追问一次', () => {
+  /* 用户遇到的那次：几块写得好好的改动 + 一块空的 `@@ 116-117`（本意是删掉，但没写 <DELETE>） */
+  const BIG = Array.from({ length: 130 }, (_, i) => `第${i + 1}行原文`).join('\n');
+  const GOOD = [
+    '@@ 100-100 | 第100行',
+    '新起的一段',
+    '',
+    '第100行原文',
+    '@@ END',
+    '@@ 110-112 | 第110行',
+    '改写后的一段',
+    '@@ END',
+  ].join('\n');
+  const FIRST = `${GOOD}\n@@ 116-117 | 第116行\n\n@@ END`;
+  const SECOND = `${GOOD}\n@@ 116-117 | 第116行\n<DELETE>\n@@ END`;
+
+  test('空块 → 追问：指出是哪几行、怎么改，要求整轮重交、行号按原来那份', () => {
+    const p = patchFollowUp(parsePatchReply(FIRST));
+    assert.ok(p);
+    assert.match(p!, /第 116-117 行那一处是空的/);
+    assert.match(p!, /只写一行 `?<DELETE>`?/);
+    assert.match(p!, /不是要删就补上新内容/);
+    assert.match(p!, /全部改动/);
+    assert.match(p!, /行号.*最开始发给你的那份正文/);
+    assert.match(p!, /@@ <起始行>-<结束行>/);
+  });
+
+  test('看不懂的块头 → 追问', () => {
+    const p = patchFollowUp(parsePatchReply('@@ 第一段 | 本周\n新内容\n@@ END'));
+    assert.ok(p);
+    assert.match(p!, /块头看不懂/);
+  });
+
+  test('一块都没有 → 追问', () => {
+    assert.ok(patchFollowUp(parsePatchReply('我觉得这样挺好')));
+  });
+
+  test('CANNOT-REVISE-LOCALLY / 格式正确 → 不追问', () => {
+    assert.equal(patchFollowUp(parsePatchReply('CANNOT-REVISE-LOCALLY: 要查客户名单')), null);
+    assert.equal(patchFollowUp(parsePatchReply('@@ 3-3 | 本周\n新\n@@ END')), null);
+  });
+
+  test('settle：格式错误第一次 → 不写、带 followUp；cannot / 越界 / 重叠 / 冲突 → 不带 followUp', () => {
+    let writes = 0;
+    const write = () => { writes++; return { ok: true }; };
+    const r1 = settlePatchRevision({ replyText: FIRST, base: BIG, write }) as any;
+    assert.equal(r1.ok, false);
+    assert.equal(writes, 0);
+    assert.match(r1.followUp, /第 116-117 行那一处是空的/);
+    assert.equal((settlePatchRevision({ replyText: 'CANNOT-REVISE-LOCALLY: 缺', base: BIG, write }) as any).followUp, undefined);
+    assert.equal((settlePatchRevision({ replyText: '@@ 999-999 | x\ny\n@@ END', base: BIG, write }) as any).followUp, undefined);
+    assert.equal((settlePatchRevision({ replyText: '@@ 1-5 | 第1行\na\n@@ END\n@@ 3-4 | 第3行\nb\n@@ END', base: BIG, write }) as any).followUp, undefined);
+    const c = settlePatchRevision({ replyText: SECOND, base: BIG, write: () => ({ ok: false, mismatch: true }) }) as any;
+    assert.equal(c.conflict, true);
+    assert.equal(c.followUp, undefined);
+    assert.equal(writes, 0);
+  });
+
+  test('第一次格式错误但盘上文件已经被改过 → 不追问，直接报冲突、不写', () => {
+    let writes = 0;
+    let reads = 0;
+    const r = settlePatchRevision({
+      replyText: FIRST, base: BIG,
+      onDisk: () => { reads++; return `${BIG}\n别人刚加的一行`; },
+      write: () => { writes++; return { ok: true }; },
+    }) as any;
+    assert.equal(r.ok, false);
+    assert.equal(r.conflict, true);
+    assert.equal(r.followUp, undefined);
+    assert.match(r.error, /被别的改动动过了/);
+    assert.equal(reads, 1);
+    assert.equal(writes, 0);
+    /* 盘上没变 → 照常追问 */
+    const ok = settlePatchRevision({ replyText: FIRST, base: BIG, onDisk: () => BIG, write: () => ({ ok: true }) }) as any;
+    assert.ok(ok.followUp);
+    assert.equal(ok.conflict, undefined);
+  });
+
+  test('补过一次还是格式错误 → 报失败，提示注明补过一次，不再追问、不写', () => {
+    let writes = 0;
+    const r = settlePatchRevision({ replyText: FIRST, base: BIG, followedUp: true, write: () => { writes++; return { ok: true }; } }) as any;
+    assert.equal(r.ok, false);
+    assert.equal(r.followUp, undefined);
+    assert.match(r.error, /没有给新内容/);
+    assert.match(r.error, /已经让它补过一次/);
+    assert.equal(writes, 0);
+    assert.match(patchReplyOutcome(r).why, /已经让它补过一次/);
+  });
+
+  test('用户的场景：第一次空块 → 追问；第二次改成 <DELETE> → 整轮写进文件，内容正确', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kl-followup-'));
+    const file = path.join(dir, 'a.md');
+    fs.writeFileSync(file, BIG);
+    const write = (fullText: string, expectBase: string) => {
+      if (fs.readFileSync(file, 'utf8') !== expectBase) return { ok: false, mismatch: true };
+      fs.writeFileSync(file, fullText);
+      return { ok: true, path: file };
+    };
+    const r1 = settlePatchRevision({ replyText: FIRST, base: BIG, write }) as any;
+    assert.ok(r1.followUp);
+    assert.equal(fs.readFileSync(file, 'utf8'), BIG);
+    const r2 = settlePatchRevision({ replyText: SECOND, base: BIG, write, followedUp: true }) as any;
+    assert.equal(r2.ok, true);
+    assert.equal(r2.written, true);
+    const want = BIG.split('\n');
+    want.splice(115, 2);                                   // 116-117 删掉
+    want.splice(109, 3, '改写后的一段');                    // 110-112 改写
+    want.splice(99, 1, '新起的一段', '', '第100行原文');      // 100 上面新起一段
+    assert.equal(fs.readFileSync(file, 'utf8'), want.join('\n'));
+    assert.equal(r2.fullText, want.join('\n'));
+    fs.rmSync(dir, { recursive: true, force: true });
+  });
+
+  test('提示词里"删掉一段"那条强调块下面不能留空', () => {
+    const p = reviseInSessionPrompt({ where: 'x', note: 'y', scope: 'patch', full: 'a\nb' });
+    assert.match(p, /删掉一段：新内容只写一行 `<DELETE>`[^\n]*块下面不能留空/);
+  });
+
+  test('主进程接线：追问在同一条会话、只一次、能取消、记下原始回复', () => {
+    const M = fs.readFileSync('src/main/index.ts', 'utf8');
+    const at = M.indexOf("ipcMain.handle('review:revise-in-session'");
+    const body = M.slice(at, M.indexOf("ipcMain.handle('review:cancel'", at));
+    assert.match(body, /\.followUp/);
+    assert.ok(body.includes('finishPatch(reply.text, patchBase!, started, false)'));
+    assert.ok(body.includes('finishPatch(again.text, base, started, true)'));
+    assert.ok(body.includes('replyText, base, followedUp,'));
+    /* 追问前只读核对盘上那一份（不写） */
+    assert.match(body, /onDisk: canWrite \? \(\) => readReviewFile\(sessionId, apply!\.path\) : undefined/);
+    /* 追问那一轮同样等会话空下来、认取消 */
+    const fu = body.slice(body.indexOf('async function followUpPatch('));
+    assert.ok(fu.includes('waitIdle(sessionId'));
+    assert.ok(fu.includes('if (tk.cancelled()) return { ok: false, cancelled: true }'));
+    assert.ok(fu.includes('tk.asking(true)'));
+    assert.match(body, /logger\.warn\('revise', [^\n]*slice\(0, 2000\)/);
   });
 });

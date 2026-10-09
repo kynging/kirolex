@@ -139,7 +139,8 @@ describe('主进程接线', () => {
     const ask = MAIN.slice(MAIN.indexOf('const askOnce = '), MAIN.indexOf('const askOnce = ') + 1200);
     assert.match(ask, /askWaiters\.delete\(sessionId\);\s*\n\s*reject\(new Error\('等了 8 分钟没等到回复'\)\);/);
     assert.match(ask, /if \(drop\(\)\) reject\(new Error\('这一轮没有正常结束/);
-    assert.equal((MAIN.match(/await askOnce\(/g) || []).length, 2);
+    /* 文本一块、deck 一页，外加 patch 档格式不对时追问的那一次（`followUpPatch`）—— 都走同一个 askOnce */
+    assert.equal((MAIN.match(/await askOnce\(/g) || []).length, 3);
   });
 
   test('等待者**只在一轮成功收尾时**兑付 —— 出错/取消那两条 flush 的是半截输出', () => {
