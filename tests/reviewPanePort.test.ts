@@ -344,7 +344,7 @@ test('打字不卡：每块的 Markdown 按内容 memo；存盘停 0.4 秒才写
   assert.ok(RV.includes('useEffect(() => () => { pendingSave.current?.(); pendingSave.current = null; }, []);'));
   assert.ok(RV.includes('frame = requestAnimationFrame(() => { frame = 0; place(); });'));
   assert.ok(RV.includes('for (const [el, top] of writes) if (el.style.top !== top) el.style.top = top;'));
-  assert.ok(RV.includes('if (lastBumped.current === key) return;'));
+  assert.ok(RV.includes('if (!shouldBumpMark(markOrder, key, lastBumped.current)) return;'));
 });
 
 test('✎ 改的时候和没改时字号、字体、行距一样，字不挪位置', () => {

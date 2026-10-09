@@ -1,7 +1,7 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { CommentBox, CommentOpener } from './CommentBox';
 import { PdfView } from './PdfView';
-import { pageBlocks, lineBlocks, dropSpan, displayGroups, groupAnchorOf, mdLine, spanRange, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
+import { pageBlocks, lineBlocks, dropSpan, displayGroups, groupAnchorOf, mdLine, spanRange, shouldBumpMark, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
 import { rewritePatch } from '../rewritePatch';
 import { diffChanges, trustedChanges, remapChanges, planUndo, markLayout, UNDO_REFUSED, type AiMark, type AiMarkState } from '../aiChanges';
 import { getAiMarks, updateAiMarks, subscribeAiMarks, aiRoundOf, beginAiRound, recordAiWrite } from '../aiMarkStore';
@@ -278,10 +278,13 @@ export const ReviewPane: React.FC<{
    */
   const [markOrder, setMarkOrder] = useState<Record<string, number>>(initialMarks.order);
   const markSeq = useRef(Math.max(0, ...Object.values(initialMarks.order)));
-  /* 只在"最新的那条"换了时才动 —— 同一个框里每敲一个字都改一次 markOrder，就是每个字多一轮整页重渲染 */
+  /*
+    只在"最新的那条"换了时才动 —— 同一个框里每敲一个字都改一次 markOrder，就是每个字多一轮整页重渲染。
+    比的是此刻的 markOrder，不只是 lastBumped：提交清空、落盘挪行号之后同一个键再标要重新记（见 `shouldBumpMark`）。
+  */
   const lastBumped = useRef<string | null>(null);
   const bumpMark = (key: string) => {
-    if (lastBumped.current === key) return;
+    if (!shouldBumpMark(markOrder, key, lastBumped.current)) return;
     lastBumped.current = key;
     setMarkOrder((cur) => ({ ...cur, [key]: ++markSeq.current }));
   };

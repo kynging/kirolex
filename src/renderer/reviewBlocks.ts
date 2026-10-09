@@ -544,6 +544,18 @@ export function spanRange(span: number[]): { from: number; to: number } {
   return { from: sorted[0], to: sorted[sorted.length - 1] };
 }
 
+/**
+ * 这一条要不要在 `markOrder` 里重新记一笔（提交行跟着最新标的那条走）。
+ * 只有"上次记的就是它、它还在、而且还是最新那条"才省掉 —— 同一个框里连续打字不每个字重渲染一轮；
+ * 提交清空过、落盘挪行号让键没了、别处又标过，都照常记，不然同一个行号再标时提交行不出来。
+ */
+export function shouldBumpMark(order: Record<string, number>, key: string, last: string | null): boolean {
+  if (last !== key) return true;
+  const seq = order[key];
+  if (seq === undefined) return true;
+  return Object.values(order).some((v) => v > seq);
+}
+
 /*
   sliceLines / spliceLines / insertAfterLines / deleteLines 搬到了主进程那边（`src/main/reviewApply.ts`）——
   改写的回复由主进程拼回去、写盘，窗口在不在都一样；这里转出同一份，两边永远是同一套规则。
