@@ -19,6 +19,8 @@
  * costs either a duplicate billable turn or a question that is never answered.
  */
 
+import { isKirolexNote } from '../main/kirolexNote.ts';
+
 /** What main can tell us about a session's in-flight turn. */
 export interface TurnPeek {
   /** Is a turn running right now for this session? */
@@ -135,4 +137,71 @@ export function adoptedMessages<T extends Msg>(msgs: T[], peek: TurnPeek): T[] {
  */
 export function isReviseRequest(text: string | null | undefined): boolean {
   return /^【改写/.test(String(text ?? '').trim());
+}
+
+/** 往回找没答的提问时要看的那几样（渲染进程的 `Message` 收窄成这些）。 */
+interface RecoveryMsg {
+  role: string;
+  content: string;
+  steer?: 'pending' | 'consumed';
+  kirolex?: boolean;
+}
+
+/** 一轮里**已经被模型吃进去的** steer，接在基础那条后面一起重发 —— PURE。
+ *  KiroLex 自己的提示（`isKirolexNote`）夹在中间时跳过，不拼进去。 */
+export function consumedSteersText(msgs: RecoveryMsg[], baseIndex: number): string {
+  const parts = [msgs[baseIndex]?.content || ''];
+  for (let j = baseIndex + 1; j < msgs.length && msgs[j].role === 'user' && (msgs[j].steer || isKirolexNote(msgs[j])); j++) {
+    if (isKirolexNote(msgs[j])) continue;
+    if (msgs[j].steer === 'consumed' && msgs[j].content.trim()) parts.push(msgs[j].content);
+  }
+  return parts.filter((p) => p.trim()).join('\n');
+}
+
+export type RecoveryTarget =
+  /** 没有可续跑的东西（空记录、只有提示、基础那条是空的…）。 */
+  | { kind: 'none' }
+  /** 最后一条实打实的消息是助手回复：这一轮答完了（调用方仍要 peek 一下是不是还在跑）。 */
+  | { kind: 'answered' }
+  /** 没答的提问：`base` 是这一轮的基础那条，`text` 是要重发的内容。 */
+  | { kind: 'unanswered'; base: number; text: string };
+
+/**
+ * 重启 / 刷新后，这条会话最后是不是一个没答的提问 —— PURE。
+ *
+ * 往回找时跳过助手的 `💭 ` 思考段，也跳过 **KiroLex 自己的提示**（noteInSession 以
+ * `role:'user', kirolex:true` 落盘，例如「✅ 已按意见改了…」）：那是对你说的话，不是你的提问；
+ * 原来不跳，刷新后就把它当新 prompt 发给了模型。
+ */
+export function findRecoveryTarget(msgs: RecoveryMsg[], opts?: { interrupted?: boolean }): RecoveryTarget {
+  const thinking = (m: RecoveryMsg) => m.role === 'assistant' && m.content.startsWith('💭 ');
+  let i = msgs.length - 1;
+  while (i >= 0 && (thinking(msgs[i]) || isKirolexNote(msgs[i]))) i--;
+  /* 中途死掉的那一轮可能已经吐了半截回复：那不是"答完了"，重跑这一轮 */
+  if (opts?.interrupted) while (i >= 0 && (msgs[i].role === 'assistant' || isKirolexNote(msgs[i]))) i--;
+  if (i < 0) return { kind: 'none' };
+  if (msgs[i].role !== 'user') return { kind: 'answered' };
+  // Anchor to the turn's BASE user message (steers are merged into it on disk, separate in memory).
+  let base = i;
+  while (base > 0 && (msgs[base].steer || isKirolexNote(msgs[base]))) base--;
+  const target = msgs[base];
+  if (target.role !== 'user' || isKirolexNote(target) || !target.content.trim()) return { kind: 'none' };
+  return { kind: 'unanswered', base, text: consumedSteersText(msgs, base) };
+}
+
+/**
+ * 插话（steer）放在哪 —— PURE。紧跟这一轮**基础那条**提问（和它前面已有的 steer）后面，
+ * 也就是这一轮所有助手 / 工具段之前。找基础那条时跳过 KiroLex 自己的提示：它也是 `role:'user'`，
+ * 不跳的话 steer 会落在提示后面、和基础那条之间隔着助手回复，中断续跑时就把它漏掉了。
+ * 返回 -1 = 没有基础那条（接在最后）。
+ */
+export function steerInsertIndex(msgs: RecoveryMsg[]): number {
+  let baseIdx = -1;
+  for (let i = msgs.length - 1; i >= 0; i--) {
+    if (msgs[i].role === 'user' && !msgs[i].steer && !isKirolexNote(msgs[i])) { baseIdx = i; break; }
+  }
+  if (baseIdx < 0) return -1;
+  let insertAt = baseIdx + 1;
+  while (insertAt < msgs.length && msgs[insertAt].role === 'user' && msgs[insertAt].steer) insertAt++;
+  return insertAt;
 }

@@ -14,6 +14,7 @@ import { decideTurnRecovery } from '../src/renderer/turnRecovery.ts';
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', ...p), 'utf-8');
 const HK = read('src', 'renderer', 'hooks', 'useAcp.ts');
 const APP = read('src', 'renderer', 'App.tsx');
+const TR = read('src', 'renderer', 'turnRecovery.ts');
 const SD = read('src', 'renderer', 'components', 'SettingsDialog.tsx');
 
 describe('重试次数：默认 10，设置里可调，0 = 不重发', () => {
@@ -42,7 +43,9 @@ describe('非人为中断会自动重发', () => {
   test('执行器中途死了：不是你停的就等重连后重发这一轮（哪怕吐了半截）', () => {
     assert.match(HK, /const autoRecover = wasStreaming && !recoveryCancelledRef\.current\.has\(sid\)/);
     assert.match(HK, /recoverInterruptedTurn\(sid, messagesCacheRef\.current\.get\(sid\) \|\| \[\], \{ assumeCurrent: true, interrupted: true \}\);/);
-    assert.match(HK, /if \(opts\?\.interrupted\) while \(i >= 0 && msgs\[i\]\.role === 'assistant'\) i--;/);
+    /* 往回找的逻辑在 turnRecovery.findRecoveryTarget（跳过半截回复时也跳过 KiroLex 的提示） */
+    assert.match(HK, /const found = findRecoveryTarget\(msgs, \{ interrupted: opts\?\.interrupted \}\);/);
+    assert.match(TR, /if \(opts\?\.interrupted\) while \(i >= 0 && \(msgs\[i\]\.role === 'assistant' \|\| isKirolexNote\(msgs\[i\]\)\)\) i--;/);
     /* 重连都没成才退回老路（标成被打断、问题放回输入框） */
     assert.match(HK, /if \(autoRecover\) markTurnInterrupted\(sid\);/);
   });

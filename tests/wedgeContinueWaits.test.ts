@@ -14,7 +14,7 @@ test('超时中断时记下时间点，自动续写据此等 cancel 收尾（ONT
 
 test('窗口 reload 后，最后一条是半截助手回复也要先 peek：还在跑就认领，不当成答完了', () => {
   const U = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
-  const branch = U.indexOf("if (msgs[i].role !== 'user') {");
+  const branch = U.indexOf("if (found.kind === 'answered') {");
   const adopt = U.indexOf('if (peek?.live && !streamingIdsRef.current.has(sid)) { adoptTurn(sid, peek); return; }', branch);
   const clear = U.indexOf("void window.kiroApi.setAutoResent?.(sid, '');", branch);
   assert.ok(branch > 0 && adopt > branch && clear > adopt, '先认领还在跑的那一轮，再清重发台账');

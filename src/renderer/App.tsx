@@ -364,6 +364,8 @@ export interface Message {
   timestamp: number;
   /** Pasted blobs referenced by `[ 粘贴 #N · M 行 ]` placeholders in content. */
   pastes?: { seq: number; lines: number; chars: number; path: string }[];
+  /** KiroLex 自己对你说的话（主进程 noteInSession 落盘时带的标记），不是你的提问 —— 见 `main/kirolexNote`。 */
+  kirolex?: true;
 }
 
 export interface ToolCall {

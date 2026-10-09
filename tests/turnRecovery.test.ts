@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { decideTurnRecovery, adoptedMessages, type TurnPeek } from '../src/renderer/turnRecovery.ts';
+import { decideTurnRecovery, adoptedMessages, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../src/renderer/turnRecovery.ts';
 
 /**
  * ADOPTING AN IN-FLIGHT TURN INSTEAD OF RESENDING IT.
@@ -267,5 +267,97 @@ describe('an adopted stream is closed by main, since the renderer has no promise
     assert.ok(start > 0, 'onSessionBusy moved — update this guard');
     assert.match(body, /adoptedTurnsRef[\s\S]{0,300}removeStreaming\(/,
       'the idle signal does not release an adopted stream');
+  });
+});
+
+/**
+ * KiroLex 自己的提示（noteInSession 落盘的 `role:'user', kirolex:true`）不是没答的提问。
+ * 实测：comment 改完 md 后会话里多一条「✅ 已按意见改了…」，刷新 / 重启后中断续跑把它当成
+ * 新 prompt 发给了模型。
+ */
+describe('findRecoveryTarget: KiroLex 提示不算没答的提问', () => {
+  const NOTE = '✅ 已按意见改了blog-final.md 第 39–46 行（现在 12835 字）\n文件：D:/x/blog-final.md\nKiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。';
+  const m = (role: string, content: string, extra: Record<string, unknown> = {}) => ({ role, content, ...extra });
+
+  test('(a) 最后一条是提示、前一条是助手回复：已答完，不重发', () => {
+    const msgs = [m('user', '帮我改一下'), m('assistant', '改好了'), m('user', NOTE, { kirolex: true })];
+    assert.deepEqual(findRecoveryTarget(msgs), { kind: 'answered' });
+  });
+
+  test('(a) 提示和思考段交错也一样跳过', () => {
+    const msgs = [m('user', 'q'), m('assistant', 'a'), m('assistant', '💭 想'), m('user', NOTE, { kirolex: true }), m('user', '⏳ 已排队：x')];
+    assert.deepEqual(findRecoveryTarget(msgs), { kind: 'answered' });
+  });
+
+  test('(b) 提示前面是没答的真实提问：重发那条，内容不含提示', () => {
+    const msgs = [m('user', 'q0'), m('assistant', 'a0'), m('user', '真正的问题'), m('user', NOTE, { kirolex: true })];
+    const r = findRecoveryTarget(msgs);
+    assert.equal(r.kind, 'unanswered');
+    if (r.kind !== 'unanswered') return;
+    assert.equal(r.base, 2);
+    assert.equal(r.text, '真正的问题');
+    assert.ok(!r.text.includes('已按意见改了'));
+  });
+
+  test('(b) 带 steer 时：提示不拼进重发内容，也不挡住找基础那条', () => {
+    const msgs = [
+      m('user', '基础问题'),
+      m('user', NOTE, { kirolex: true }),
+      m('user', '补一句', { steer: 'consumed' }),
+      m('user', '⚠️ 这条会话现在跑在 gpt-5.6-sol 上'),
+    ];
+    const r = findRecoveryTarget(msgs);
+    assert.equal(r.kind, 'unanswered');
+    if (r.kind !== 'unanswered') return;
+    assert.equal(r.base, 0);
+    assert.equal(r.text, '基础问题\n补一句');
+    assert.equal(consumedSteersText(msgs, 0), '基础问题\n补一句');
+  });
+
+  test('(c) 只有 kirolex 标记、内容是「✅ 已按意见改了…」：不会被重发', () => {
+    // 「✅ 」不在 KIROLEX_NOTE_OPENINGS 里，只能靠标记认出来
+    assert.deepEqual(findRecoveryTarget([m('user', NOTE, { kirolex: true })]), { kind: 'none' });
+    assert.deepEqual(findRecoveryTarget([m('assistant', 'a'), m('user', NOTE, { kirolex: true })]), { kind: 'answered' });
+  });
+
+  test('没有标记的普通提问照旧续跑', () => {
+    const r = findRecoveryTarget([m('assistant', 'a'), m('user', NOTE)]);
+    assert.equal(r.kind, 'unanswered');
+  });
+
+  test('interrupted：跳过半截回复和提示，重跑真实提问', () => {
+    const msgs = [m('user', 'q'), m('assistant', '半截'), m('user', NOTE, { kirolex: true })];
+    const r = findRecoveryTarget(msgs, { interrupted: true });
+    assert.equal(r.kind, 'unanswered');
+    if (r.kind !== 'unanswered') return;
+    assert.equal(r.text, 'q');
+  });
+
+  test('原有行为：最后是助手回复 → answered；最后是提问 → unanswered；空 → none', () => {
+    assert.deepEqual(findRecoveryTarget([m('user', 'q'), m('assistant', 'a')]), { kind: 'answered' });
+    assert.equal(findRecoveryTarget([m('user', 'q'), m('assistant', '💭 想')]).kind, 'unanswered');
+    assert.deepEqual(findRecoveryTarget([]), { kind: 'none' });
+  });
+});
+
+describe('steerInsertIndex: 插话不落在 KiroLex 提示后面', () => {
+  const NOTE = '✅ 已按意见改了a.md（现在 10 字）\n文件：a.md\nKiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。';
+  const m = (role: string, content: string, extra: Record<string, unknown> = {}) => ({ role, content, ...extra });
+
+  test('「真实问题、助手半截回复、提示」里插话：放在问题后面，中断续跑带上它', () => {
+    const msgs: Array<ReturnType<typeof m>> = [m('user', 'q0'), m('assistant', 'a0'), m('user', '真实问题'), m('assistant', '半截'), m('user', NOTE, { kirolex: true })];
+    const at = steerInsertIndex(msgs);
+    assert.equal(at, 3);
+    const withSteer = [...msgs.slice(0, at), m('user', '补一句', { steer: 'consumed' }), ...msgs.slice(at)];
+    const r = findRecoveryTarget(withSteer, { interrupted: true });
+    assert.equal(r.kind, 'unanswered');
+    if (r.kind !== 'unanswered') return;
+    assert.equal(r.text, '真实问题\n补一句');
+    assert.ok(!r.text.includes('已按意见改了'));
+  });
+
+  test('排在已有 steer 后面；没有真实提问时返回 -1', () => {
+    assert.equal(steerInsertIndex([m('user', 'q'), m('user', 's1', { steer: 'consumed' }), m('assistant', 'x')]), 2);
+    assert.equal(steerInsertIndex([m('assistant', 'a'), m('user', NOTE, { kirolex: true })]), -1);
   });
 });

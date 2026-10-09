@@ -29,7 +29,8 @@ import type { ScheduleSpec } from '../../main/schedule';
 import type { ScheduleView } from '../scheduleView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
-import { decideTurnRecovery, adoptedMessages, isReviseRequest, type TurnPeek } from '../turnRecovery';
+import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
+import { isKirolexNote } from '../../main/kirolexNote.ts';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -228,11 +229,8 @@ class PersistedSteerMap extends Map<string, { msgId: string; content: string; at
 /** 一轮里**已经被模型吃进去的** steer —— 重发、重跑、塞回输入框时都要跟着基础那条一起走，
  *  否则「steer 的内容不会被重试、rerun 或者恢复」。还没被吃的那些不在这里：它们在轮末回到队列。 */
 export function withConsumedSteers(msgs: Message[], baseIndex: number): string {
-  const parts = [msgs[baseIndex]?.content || ''];
-  for (let j = baseIndex + 1; j < msgs.length && msgs[j].role === 'user' && msgs[j].steer; j++) {
-    if (msgs[j].steer === 'consumed' && msgs[j].content.trim()) parts.push(msgs[j].content);
-  }
-  return parts.filter((p) => p.trim()).join('\n');
+  /* KiroLex 自己的提示不拼进去 —— 见 `consumedSteersText` */
+  return consumedSteersText(msgs, baseIndex);
 }
 
 /** Per-session usage, persisted so the context gauge is not blank until the next
@@ -303,6 +301,7 @@ function toStoredTranscript(messages: Message[]) {
       toolCalls: m.toolCalls,
       ...(m.attachments?.length ? { attachments: m.attachments } : {}),
       ...((m as any).pastes?.length ? { pastes: (m as any).pastes } : {}),
+      ...(m.kirolex ? { kirolex: true as const } : {}),
     }));
 }
 
@@ -939,7 +938,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const msgs = messagesCacheRef.current.get(sid) || [];
     let idx = -1;
     for (let i = msgs.length - 1; i >= 0; i--) {
-      if (msgs[i].role === 'user' && !msgs[i].steer) { idx = i; break; }
+      if (msgs[i].role === 'user' && !msgs[i].steer && !isKirolexNote(msgs[i])) { idx = i; break; }
     }
     if (idx < 0) return;
     markInterrupted(sid, msgs[idx].id);
@@ -1054,14 +1053,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (overwriteTargetRef.current.has(sid)) return;   // already flagged
     if (loopsRef.current.has(sid)) return;             // a loop is already resending this
     if (sessionsRef.current.find((s) => s.id === sid)?.archived) return; // archived chats are inert
-    // Walk back over live-only thinking segments; a real assistant reply means the
-    // turn completed.
-    let i = msgs.length - 1;
-    while (i >= 0 && msgs[i].role === 'assistant' && msgs[i].content.startsWith('💭 ')) i--;
-    /* 中途死掉的那一轮可能已经吐了半截回复：那不是"答完了"，重跑这一轮（rerun 会把半截覆盖掉） */
-    if (opts?.interrupted) while (i >= 0 && msgs[i].role === 'assistant') i--;
-    if (i < 0) return;
-    if (msgs[i].role !== 'user') {
+    // Walk back over live-only thinking segments AND KiroLex's own notes (「✅ 已按意见改了…」
+    // is not a question); a real assistant reply means the turn completed. With `interrupted`
+    // a half-written reply is skipped too (rerun overwrites it). See `findRecoveryTarget`.
+    const found = findRecoveryTarget(msgs, { interrupted: opts?.interrupted });
+    if (found.kind === 'none') return;
+    if (found.kind === 'answered') {
       /*
         **最后一条是助手消息 ≠ 这一轮答完了** —— 实测 ONTAP 那条：一轮跑到一半（已经
         local_write 了两个文件、落盘了半截回复）时窗口 reload，这里只看"最后一条是谁"就当成
@@ -1080,14 +1077,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       })();
       return;
     }
-    // Anchor to the turn's BASE user message (steers are merged into it on disk, separate in memory).
-    let base = i;
-    while (base > 0 && msgs[base].steer) base--;
+    // Anchored to the turn's BASE user message (steers are merged into it on disk, separate in memory).
+    const base = found.base;
     const target = msgs[base];
-    if (target.role !== 'user' || !target.content.trim()) return;
     /* 侧栏 review 的改写中断了不回填 —— 见 `isReviseRequest`。要改就回侧栏再按一次「✓ 确认」 */
     if (isReviseRequest(target.content)) return;
-    /* 重发的是**基础那条 + 这一轮已经吃进去的 steer**（原来只发基础那条，steer 就丢了） */
+    /* 重发的是**基础那条 + 这一轮已经吃进去的 steer**（原来只发基础那条，steer 就丢了）；KiroLex 的提示不拼进去 */
     const resendText = withConsumedSteers(msgs, base);
     /* 这期间队列不许抢着发 —— 否则排队那条会落在没答的问题后面，把它永远顶掉 */
     markRecovering(sid, true);
@@ -1387,13 +1382,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // messages, partial reply). ChatArea groups adjacent steers into the same
       // bubble; a steer stranded after an assistant message renders as a lone
       // orphan bubble with no Steer label.
-      let baseIdx = -1;
-      for (let i = prev.length - 1; i >= 0; i--) {
-        if (prev[i].role === 'user' && !prev[i].steer) { baseIdx = i; break; }
-      }
-      if (baseIdx < 0) return [...prev, steerMsg];
-      let insertAt = baseIdx + 1;
-      while (insertAt < prev.length && prev[insertAt].role === 'user' && prev[insertAt].steer) insertAt++;
+      // KiroLex's own notes are skipped when finding the base -- see `steerInsertIndex`.
+      const insertAt = steerInsertIndex(prev);
+      if (insertAt < 0) return [...prev, steerMsg];
       return [...prev.slice(0, insertAt), steerMsg, ...prev.slice(insertAt)];
     });
 
@@ -1547,6 +1538,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           toolCalls: m.toolCalls,
           attachments: m.attachments,
           pastes: (m as any).pastes,
+          ...((m as any).kirolex ? { kirolex: true as const } : {}),
           timestamp: m.ts,
         }));
         messagesCacheRef.current.set(lastSid, restored);
@@ -1570,6 +1562,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             id: m.id, role: m.role, content: m.content,
             toolCalls: m.toolCalls, attachments: m.attachments,
             pastes: (m as any).pastes, timestamp: m.ts,
+            ...((m as any).kirolex ? { kirolex: true as const } : {}),
           }));
           messagesCacheRef.current.set(sid, msgs);
           rebuildFileChanges(sid, msgs, currentSessionRef.current === sid);
@@ -2994,6 +2987,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             toolCalls: m.toolCalls,
             attachments: (m as any).attachments,
             pastes: (m as any).pastes,
+            ...((m as any).kirolex ? { kirolex: true as const } : {}),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(id) || [];
@@ -3098,6 +3092,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             // Attachment chips must survive a restart (persisted per message).
             attachments: (m as any).attachments,
             pastes: (m as any).pastes,
+            ...((m as any).kirolex ? { kirolex: true as const } : {}),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(sessionId) || [];
