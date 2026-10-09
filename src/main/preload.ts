@@ -319,6 +319,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   openRunWindow: (project: string, id: string) => ipcRenderer.invoke('window:open-run', project, id),
   /** From the run window: bring the main window forward on the chat that ran a step. */
   focusSession: (sessionId: string) => ipcRenderer.invoke('window:focus-session', sessionId),
+  /** 钉住的会话闲下来了：主进程判断窗口不在前台才弹系统通知；点通知走 `onFocusSessionRequest` 那条路。 */
+  notifySessionIdle: (payload: { sessionId: string; title: string; body: string }) => ipcRenderer.invoke('app:notify-session-idle', payload),
   onFocusSessionRequest: (handler: (payload: { sessionId: string }) => void) => {
     const listener = (_e: unknown, payload: { sessionId: string }) => handler(payload);
     ipcRenderer.on('session:focus-request', listener);

@@ -4,6 +4,7 @@ import { type SubagentRow } from '../../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
 import { sessionsToWarm } from '../projectActivity';
+import type { TurnOutcome } from '../idleNotify';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
 import {
   advance,
@@ -509,6 +510,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const currentMessageRef = useRef<string>('');
   const toolCallsRef = useRef<Map<string, ToolCall>>(new Map());
   const currentSessionRef = useRef<string | null>(null);
+  /**
+   * 每条会话**最后一轮**怎么结束的 —— 给「钉住的会话闲下来发系统通知」用（见 `idleNotify.ts`）。
+   * 新的一轮开始（`beginStreamingTurn`）时清掉；报错（`noteError` / 发送失败气泡）记成 error；
+   * 用户自己点停止记成 cancelled（那种停下不发通知）。没有记录 = 正常结束。
+   */
+  const turnOutcomeRef = useRef<Map<string, TurnOutcome>>(new Map());
   /** Attribute an error banner to a chat, or clear it.
    *
    *  Falls back to the focused chat when the caller has no id, and only to
@@ -518,6 +525,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  in a dependency array (those arrays are evaluated during render). */
   const noteError = useCallback((sid: string | null | undefined, message: string | null) => {
     const key = sid || currentSessionRef.current || APP_ERROR_KEY;
+    if (message) turnOutcomeRef.current.set(key, { kind: 'error', message });
     setErrorBySession((prev) => {
       if (!message) {
         if (!(key in prev)) return prev;              // no-op keeps the object stable
@@ -754,6 +762,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // auto-recovery the banner sat there permanently contradicting the composer's
     // own hint line.
     clearInterrupted(sid);
+    turnOutcomeRef.current.delete(sid);
     addStreaming(sid);
     return token;
   };
@@ -3578,6 +3587,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             removeStreaming(sid);
             return;
           }
+          turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || 'Failed to send message.' });
           setMessages((prev) => [
             ...prev,
             { id: `err_${Date.now()}`, role: 'assistant', content: `⚠️ ${retryErr?.message || 'Failed to send message.'}`, timestamp: Date.now() },
@@ -3707,6 +3717,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
   const stopLoop = useCallback(async (sessionId: string) => {
     if (!endLoop(sessionId, 'aborted')) return;
+    turnOutcomeRef.current.set(sessionId, { kind: 'cancelled' });
     activePromptTokenRef.current.delete(sessionId);
     try {
       await window.kiroApi.cancel(sessionId, modelForSession(sessionId), true);
@@ -4040,6 +4051,7 @@ ${text}`,
       // else (/stop, a background pane) cancelled the current iteration and the loop
       // immediately scheduled the next one, so the loop looked unstoppable.
       endLoop(sessionForCancel, 'aborted');
+      turnOutcomeRef.current.set(sessionForCancel, { kind: 'cancelled' });
       await window.kiroApi.cancel(
         sessionForCancel,
         modelForSession(sessionForCancel),
@@ -4059,6 +4071,7 @@ ${text}`,
   const forceStop = useCallback(async (model: string) => {
     // User-initiated, from the force-stop control: an abort, not a teardown.
     endLoop(undefined, 'aborted');
+    for (const id of streamingIdsRef.current) turnOutcomeRef.current.set(id, { kind: 'cancelled' });
     // Clear all streaming state immediately
     activePromptTokenRef.current.clear();
     streamingIdsRef.current.clear();
@@ -4666,6 +4679,11 @@ ${text}`,
     takeOrphanSteers,
     /** 正在自动重发的会话 —— App 的队列在这期间不发。 */
     recoveringIds,
+    /** 这条会话最后一轮怎么结束的（读的是 ref，永远是此刻的值）。没记录 = 正常结束。 */
+    turnOutcomeOf: useCallback(
+      (sessionId: string): TurnOutcome => turnOutcomeRef.current.get(sessionId) || { kind: 'ok' },
+      [],
+    ),
     /** Call off a pending/in-flight auto-resend for this chat. `recoveryCancelledRef`
      *  existed but was NEVER written, so an auto-resend could not be stopped at all
      *  -- Stop now routes here. */

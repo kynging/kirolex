@@ -32,6 +32,7 @@ import { savedScrollOf, scrollHostOf, restoreScroll } from './tabScroll';
 import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
+import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
@@ -137,6 +138,7 @@ declare global {
       openRunWindow?: (project: string, id: string) => Promise<{ ok: boolean; focused?: boolean }>;
       onRunChanged?: (handler: (payload: { project: string; id: string }) => void) => (() => void);
       focusSession?: (sessionId: string) => Promise<{ ok: boolean; error?: string }>;
+      notifySessionIdle?: (payload: { sessionId: string; title: string; body: string }) => Promise<{ shown: boolean; reason?: string }>;
       onFocusSessionRequest?: (handler: (payload: { sessionId: string }) => void) => (() => void);
       /** SKILL FLOWS. The run lives in main and on disk: an approval gate has to
        *  survive this window closing, which a renderer-owned run cannot do. */
@@ -777,6 +779,7 @@ const App: React.FC = () => {
     cancelAutoResend,
     takeOrphanSteers,
     recoveringIds,
+    turnOutcomeOf,
     interruptedSessionIds,
     connectingSessionIds,
     failedSessionIds,
@@ -3296,6 +3299,59 @@ const App: React.FC = () => {
     quitPending,
     recoveringIds,
   ]);
+
+  /*
+    **钉住的会话真正闲下来 → 系统通知**（判定见 `idleNotify.ts`）。
+
+    "闲"要把排队算进去：队列非空、或者排队那条正在发（`queueSendingRef`，那条还没开始流式时
+    其他状态看起来全是闲的）都算忙。`stepIdle` 要求闲置持续 `IDLE_SETTLE_MS` 才算数，所以这里
+    除了状态变化时查一次，还要在它说"再等 N ms"的时候定时再查 —— 那时 ref 里的发送标记可能已经
+    清掉了，而清掉它不会触发重渲染。窗口在不在前台由主进程判断。
+  */
+  const idleTracksRef = useRef<Map<string, IdleTrack>>(new Map());
+  const idleTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const evaluateIdleRef = useRef<() => void>(() => {});
+  evaluateIdleRef.current = () => {
+    const now = Date.now();
+    let recheck: number | null = null;
+    const seen = new Set<string>();
+    for (const session of sessions) {
+      if (!session.id || session.id.startsWith('pending_')) continue;
+      seen.add(session.id);
+      const sid = session.id;
+      const decision = stepIdle(idleTracksRef.current.get(sid), {
+        pinned: !!session.pinned && !session.archived,
+        busy: streamingIds.includes(sid)
+          || (queuesBySessionRef.current[sid]?.length ?? 0) > 0
+          || queueSendingRef.current.has(sid)
+          || isBackendOccupied(busyBySession[sid])
+          || recoveringIds.includes(sid)
+          || loopingIds.includes(sid),
+        awaitingPermission: !!permissionRequests[sid],
+        outcome: turnOutcomeOf(sid),
+      }, now);
+      idleTracksRef.current.set(sid, decision.track);
+      if (decision.recheckInMs !== null) recheck = Math.min(recheck ?? Infinity, decision.recheckInMs);
+      if (decision.notify) {
+        void window.kiroApi.notifySessionIdle?.({
+          sessionId: sid,
+          title: (session.title || '').trim() || 'KiroLex',
+          body: idleNoticeBody(settings.language, decision.notify),
+        }).catch(() => {});
+      }
+    }
+    for (const sid of Array.from(idleTracksRef.current.keys())) {
+      if (!seen.has(sid)) idleTracksRef.current.delete(sid);
+    }
+    if (idleTimerRef.current) { clearTimeout(idleTimerRef.current); idleTimerRef.current = null; }
+    if (recheck !== null) {
+      idleTimerRef.current = setTimeout(() => { idleTimerRef.current = null; evaluateIdleRef.current(); }, recheck + 50);
+    }
+  };
+  useEffect(() => {
+    evaluateIdleRef.current();
+  }, [sessions, streamingIds, queuesBySession, busyBySession, recoveringIds, loopingIds, permissionRequests]);
+  useEffect(() => () => { if (idleTimerRef.current) clearTimeout(idleTimerRef.current); }, []);
 
   // Drop queues whose sessions were deleted or archived.
   useEffect(() => {

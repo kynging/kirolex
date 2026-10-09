@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -52,6 +52,7 @@ import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, p
 import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { createControlServer, type ControlServer } from './controlServer.ts';
 import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
+import { windowIsActive } from './idleNotice.ts';
 import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
@@ -80,6 +81,10 @@ import { logger } from './logger';
 // DevTools open -- it is never emitted in the packaged production app. Suppressing
 // it keeps the auto-opened DevTools console clean on every startup.
 process.env.ELECTRON_DISABLE_SECURITY_WARNINGS = 'true';
+
+// Windows 只给登记过 AppUserModelId 的程序弹通知；必须和打包配置（package.json 的 build.appId）一致，
+// 否则「钉住的会话做完了」那条通知不显示，点了也回不到这个窗口。
+if (process.platform === 'win32') app.setAppUserModelId('com.kirolex.app');
 
 let mainWindow: BrowserWindow | null = null;
 let splashWindow: BrowserWindow | null = null;
@@ -7310,6 +7315,46 @@ app.whenReady().then(async () => {
     mainWindow.focus();
     mainWindow.webContents.send('session:focus-request', { sessionId });
     return { ok: true };
+  });
+
+  /**
+   * 钉住的会话全部做完 / 出错停下 —— 系统通知（Windows 右下角弹窗、macOS 通知中心），带提示音。
+   *
+   * 「是不是真的闲了、钉没钉住、写什么」渲染端已经判过了（`renderer/idleNotify.ts`）；这里只管
+   * 「用户是不是正在看 KiroLex」—— 正在看就不发。点通知：窗口恢复到前台并切到那条会话。
+   * 通知对象要留着引用，否则被 GC 掉之后点击事件就没了。
+   */
+  const idleNotices = new Set<Notification>();
+  ipcMain.handle('app:notify-session-idle', async (_event, payload: { sessionId: string; title: string; body: string }) => {
+    const sessionId = String(payload?.sessionId || '');
+    if (!sessionId) return { shown: false, reason: 'no session' };
+    const win = mainWindow && !mainWindow.isDestroyed() ? mainWindow : null;
+    const active = windowIsActive({
+      exists: !!win,
+      focused: !!win?.isFocused(),
+      visible: !!win?.isVisible(),
+      minimized: !!win?.isMinimized(),
+    });
+    if (active) return { shown: false, reason: 'window active' };
+    if (!Notification.isSupported()) return { shown: false, reason: 'unsupported' };
+    const notice = new Notification({
+      title: String(payload?.title || 'KiroLex'),
+      body: String(payload?.body || ''),
+      silent: false,
+    });
+    idleNotices.add(notice);
+    notice.on('click', () => {
+      idleNotices.delete(notice);
+      if (!mainWindow || mainWindow.isDestroyed()) return;
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.show();
+      mainWindow.focus();
+      mainWindow.webContents.send('session:focus-request', { sessionId });
+    });
+    notice.on('close', () => { idleNotices.delete(notice); });
+    notice.show();
+    logger.info('notify', `idle notice sessionId=${sessionId}`);
+    return { shown: true };
   });
 
   /**

@@ -353,6 +353,11 @@ const ZH: Record<string, string> = {
   "Don't ask again": '不再询问',
   'Delete this chat?': '删除这个会话？',
   'This cannot be undone.': '此操作不可撤销。',
+
+  // ── 系统通知（钉住的会话闲下来）──────────────────────────────────────────
+  'Finished': '已完成',
+  'Stopped with an error': '出错了',
+  'Stopped with an error: {error}': '出错了：{error}',
 };
 
 /**
