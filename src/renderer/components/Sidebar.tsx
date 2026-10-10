@@ -1,4 +1,4 @@
-import { projectsToCollapse } from '../projectActivity';
+import { projectsToCollapse, projectsToWarmNow } from '../projectActivity';
 import { restoreGetJson, restoreSet } from '../uiRestore';
 /** 侧栏折叠了哪些组 —— 活过 reload；「重启后恢复界面状态」开着时也活过重启（见 `restoredCollapse`）。 */
 const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
@@ -641,48 +641,52 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * 所以折叠不再自己判时间，直接用 `projectsToCollapse` —— 和 `sessionsToWarm` 同一份答案，
    * 包括「你落在哪条会话上」这一层（`currentSessionId`，也就是启动时恢复的那条）。
    */
+  /**
+   * 自动折叠那一刻的 `collapsed` 对象 —— 给下面的预热判「自动折叠落到 state 上了没有」：
+   * `collapsed` 换成了别的对象 = 那次 `setCollapsed` 已经生效（哪怕同一轮里又有组被自动展开摘掉了）。
+   * 没有要折的（或 reload 回来沿用上次的折叠，它从一开始就在 state 里）就是 null，不用等。
+   */
+  const collapsedBeforeAuto = useRef<Set<string> | null>(null);
   useEffect(() => {
     if (autoCollapsed.current || sessions.length === 0) return;
     autoCollapsed.current = true;
     /* reload 回来的：用你上次的折叠，不重算 */
     if (restoredCollapse.current) return;
     const cold = projectsToCollapse(sessions, { now: Date.now(), keepId: currentSessionId });
-    if (cold.length) setCollapsed((prev) => new Set([...prev, ...cold]));
+    if (cold.length) {
+      collapsedBeforeAuto.current = collapsed;
+      setCollapsed((prev) => new Set([...prev, ...cold]));
+    }
   }, [sessions, currentSessionId]);
 
   /**
-   * OPENING A PROJECT WARMS IT — 「不折叠的时候就自动预热」，但**只在你把它打开的那一刻**。
+   * OPENING A PROJECT WARMS IT — 「不折叠的时候就自动预热」。
    *
-   * 原来这条是按折叠**状态**跑的：每次启动都会把所有没折叠的 project 各预热一遍。那正好抵消了启动那侧
-   * 的收紧 —— `sessionsToWarm` 现在只热「上一个活跃的 project」，而这里紧接着又把另外几个展开的全热了，
-   * 每个约 0.4 GB。
+   * 启动那一遍**只登记、不预热**：启动时该热什么已经由 `sessionsToWarm` 决定了（它只热「上一个活跃的
+   * project」），这里再把展开着的全热一遍就把那份收紧抵消掉了，每个约 0.4 GB。
+   * 之后任何一个 project 只要**此刻展开着**、这次运行里还没热过，就预热它整组。
    *
-   * 所以第一遍**只登记、不预热**：启动时该热什么已经由 `sessionsToWarm` 决定了，这里没有话说。
-   * 之后任何一个 project 从折叠变成展开（也就是你真的点了它）才预热它整组。
-   * 展开着但冷的那些不会变得到不了 —— 点它里面任一会话就地预热（`warmSession`）。
-   *
-   * 判据是**折叠 → 展开的跃变**，不是「此刻展开着」。
-   *
-   * 不能拿「此刻展开着」当判据然后把它们记成已处理：`setCollapsed` 是异步的，自动折叠那一遍要到下一次
-   * 渲染才生效，所以第一遍看到的 `collapsed` 还是空集 —— 那样**每个** project 都会被记成「已处理」，
-   * 之后你点开一个折叠的它也不会预热了。存上一次的折叠集合，比对出「刚被打开的那个」，就没有这个时序问题。
+   * 判据原来是「折叠 → 展开的**跃变**」——「为什么 blog 这个 project 打开的时候没有预热」。跃变靠
+   * 「上一次渲染时它是折叠的」这个记忆，而这个 effect 的依赖里有 `onWarmProject`（App 里是**内联箭头**，
+   * 每次渲染都是新引用），于是它每次渲染都跑、每跑一遍就把"上一次"覆盖掉。中间插一次与折叠无关的重渲染
+   * （会话状态、标题、busy 都算），那次跃变就被吃掉了 —— 而 `warmed` 里又没记录，这个 project 在这次
+   * 运行里**再也不会**被预热。所以改按状态判：「展开着 = 该是热的」本来就是这个机制的不变量。
    *
    * `warmed` 保证每个 project 每次运行只热一次，不会在重渲染里变成 spawn 循环。
+   * 判据本身在 `projectsToWarmNow`（含启动那一遍怎么记账、等什么），那里有状态顺序的行为测试。
    */
   const warmed = useRef<Set<string>>(new Set());
-  const prevCollapsed = useRef<Set<string> | null>(null);
+  const warmBaselined = useRef(false);
   useEffect(() => {
     if (!onWarmProject || !autoCollapsed.current) return;
-    const prev = prevCollapsed.current;
-    prevCollapsed.current = new Set(collapsed);
-    // 第一次看到折叠状态：启动那侧（`sessionsToWarm`）已经决定了冷热，这里没有话说
-    if (!prev) return;
-    for (const project of prev) {
-      if (collapsed.has(project) || warmed.current.has(project)) continue;
-      warmed.current.add(project);        // 它刚从折叠变成展开 = 你真的点开了它
-      onWarmProject(project);
-    }
-  }, [collapsed, onWarmProject]);
+    const projects = [...new Set(sessions.map((s) => (s.projectId || '').trim()).filter(Boolean))];
+    /* `setCollapsed` 是异步的：自动折叠那一轮里这里看到的还是折叠前的对象，要等它换掉 */
+    const landed = collapsed !== collapsedBeforeAuto.current;
+    const ledger = { warmed: warmed.current, baselined: warmBaselined.current };
+    const toWarm = projectsToWarmNow(projects, collapsed, ledger, landed);
+    warmBaselined.current = ledger.baselined;
+    for (const project of toWarm) onWarmProject(project);
+  }, [collapsed, sessions, onWarmProject]);
   /*
     **有活动会话的组自动展开** ——「我为什么新建 new chat 的时候未分组是折叠的，只要有活动会话所有项目和未分组都应该自动展开」。
     原来折叠只在启动时算一次（只留热的那个 project 展开），之后新建的会话、开始跑的会话所在的组照样折着。
@@ -898,6 +902,27 @@ export const Sidebar: React.FC<SidebarProps> = ({
      * 挂着 skill 的 project 由流程管理：会话是「主会话 + 每步一个」，拖进来的会话不属于任何一步，
      * 回收规则看不见它 —— 所以这里直接拒，并把原因说出来而不是静默不动。
      */
+    moveInto(sessionId, targetProject);
+  };
+
+  /**
+   * 搬会话进一个组 —— **顺手把那个组展开**，「移到 dev 之后 dev 没有自动展开，这个不应该」。
+   *
+   * 多数 project 是折起来的（启动时只留热的那个展开，见 `projectsToCollapse`），所以往一个折起来的组里
+   * 搬东西，界面上的结果是**那条会话当场消失**：它从原来的位置被拿走，而新位置是收起的。你既看不到它
+   * 去哪了，也无从确认这次搬动成功了。所有搬动入口（拖放、「移动项目」子菜单、恢复到未分组、指派弹窗）
+   * 都走这里，下一个入口才不会漏。展开也会让那一组按「展开 = 热的」被预热（见上面那个 effect）。
+   *
+   * 未分组（`targetProject === null`）也一样展开：那也是个可折叠的组。
+   */
+  const moveInto = (sessionId: string, targetProject: string | null) => {
+    const key = targetProject ?? UNASSIGNED;
+    setCollapsed((prev) => {
+      if (!prev.has(key)) return prev;                    // 本来就是开着的，别白改一次状态
+      const next = new Set(prev);
+      next.delete(key);
+      return next;
+    });
     onMoveSession(sessionId, targetProject);
   };
 
@@ -922,7 +947,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * 同一个字符串 —— 于是「命中 1 个」的那一条留在收起的组里，你看到的是「什么都没找到」。搜索时把折叠这件事
    * 整个让开，比修一层容易再错的映射稳。
    */
-  const isCollapsed = (key: string) => (search.idle ? collapsed.has(key) : false);
+  /**
+   * **分屏里有会话的组一直展开** ——「我已经在分屏中的会话为什么他的 project 能被折叠呢」。
+   * 分屏那几格是你此刻正在看的东西，它所属的组折起来之后，左边就没有任何东西对应屏幕上那一格。
+   * 判据用 `splitOrder(id) > 0`（和会话行上那个「分屏第 N 格」角标同一个来源），所以两边永远一致。
+   */
+  const inSplit = (key: string) => sessions.some(
+    (x) => !x.archived && (x.projectId || UNASSIGNED) === key && splitOrder(x.id) > 0,
+  );
+  const isCollapsed = (key: string) => (search.idle ? (collapsed.has(key) && !inSplit(key)) : false);
 
   const activeSessions = visible.filter((s) => !s.archived);
   const archivedSessions = sortForDisplay(visible.filter((s) => s.archived));
@@ -1112,7 +1145,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className="context-menu-item"
                 onClick={() => {
                   onArchiveSession(ctxSession.id, false);
-                  onMoveSession(ctxSession.id, null);
+                  moveInto(ctxSession.id, null);
                   setContextMenu(null);
                 }}
               >
@@ -1165,7 +1198,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   <div
                     key={p}
                     className="context-menu-item"
-                    onClick={() => { onMoveSession(ctxSession.id, p); setContextMenu(null); }}
+                    onClick={() => { moveInto(ctxSession.id, p); setContextMenu(null); }}
                   >
                     🏷️ {p}
                   </div>
@@ -1449,7 +1482,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               onKeyDown={(e) => {
                 if (e.key === 'Enter') {
                   const val = (e.target as HTMLInputElement).value.trim();
-                  if (val) onMoveSession(assignPopup.sessionId, val);
+                  if (val) moveInto(assignPopup.sessionId, val);
                   setAssignPopup(null);
                 } else if (e.key === 'Escape') {
                   setAssignPopup(null);
@@ -1463,7 +1496,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 onClick={() => {
                   const input = document.querySelector('.assign-popup-input') as HTMLInputElement;
                   const val = input?.value.trim();
-                  if (val) onMoveSession(assignPopup.sessionId, val);
+                  if (val) moveInto(assignPopup.sessionId, val);
                   setAssignPopup(null);
                 }}
               >{t('Move')}</button>

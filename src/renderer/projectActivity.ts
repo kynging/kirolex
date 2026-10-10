@@ -185,3 +185,40 @@ export function sessionsToWarm(sessions: WarmCandidate[], opts: WarmOptions): st
   live.sort((a, b) => (a.id === keepId ? -1 : b.id === keepId ? 1 : 0));
   return live.slice(0, Math.max(0, limit)).map((s) => s.id);
 }
+
+/** 侧栏「展开 = 热的」那一段的账本：`warmed` 里的 project 这次运行里不再热；`baselined` = 启动那一遍已经记过账 */
+export interface WarmLedger {
+  warmed: Set<string>;
+  baselined: boolean;
+}
+
+/**
+ * 这一次渲染该预热哪些 project —— Sidebar 里那个 effect 的判据，抽出来才测得了状态顺序。
+ *
+ * 启动那一遍**只记账、不预热**（冷热由 `sessionsToWarm` 决定），而且要等自动折叠**落到 state 上**
+ * （`landed`）再记，否则看到的还是空集，每个 project 都会被记成已处理。
+ *
+ * `landed` 由调用方按「collapsed 已经换过一次对象」判，**不按"冷的那些都在 collapsed 里"判**：同一轮里
+ * 「有活动会话的组自动展开」会把其中某个组立刻摘掉，那个集合条件就永远等不到，启动那一遍永远不结束，
+ * 之后点开哪个组都不会预热。
+ */
+export function projectsToWarmNow(
+  projects: string[],
+  collapsed: ReadonlySet<string>,
+  ledger: WarmLedger,
+  landed: boolean,
+): string[] {
+  if (!ledger.baselined) {
+    if (!landed) return [];
+    ledger.baselined = true;
+    for (const project of projects) if (!collapsed.has(project)) ledger.warmed.add(project);
+    return [];
+  }
+  const out: string[] = [];
+  for (const project of projects) {
+    if (collapsed.has(project) || ledger.warmed.has(project)) continue;
+    ledger.warmed.add(project);
+    out.push(project);
+  }
+  return out;
+}

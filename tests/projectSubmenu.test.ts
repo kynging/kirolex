@@ -41,9 +41,9 @@ describe('「移动项目」是一个子菜单入口', () => {
   });
   test('子菜单里没有「移到未分组」，只有其他项目', () => {
     assert.equal(block.includes("t('Unassign')"), false);
-    assert.equal(block.includes('onMoveSession(ctxSession.id, null)'), false);
+    assert.equal(block.includes('moveInto(ctxSession.id, null)'), false);
     assert.ok(block.includes('projects.filter((p) => p !== ctxSession.projectId)'));
-    assert.ok(block.includes('onMoveSession(ctxSession.id, p)'));
+    assert.ok(block.includes('moveInto(ctxSession.id, p)'));
   });
   test('没有其他项目时显示一行灰色、不能点的提示', () => {
     assert.match(block, /context-menu-item disabled[^]*没有其他项目/);

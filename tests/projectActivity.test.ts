@@ -142,18 +142,24 @@ describe('侧栏：点开一个 project 才预热它', () => {
     path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'Sidebar.tsx'), 'utf8',
   );
 
-  test('判据是折叠 → 展开的**跃变**，不是"此刻展开着"', () => {
-    /*
-      按"此刻展开着"跑的话，每次启动都会把所有没折叠的 project 各预热一遍 —— 正好抵消启动那侧的收紧。
-      而拿"此刻展开着"去记"已处理"也不行：setCollapsed 是异步的，第一遍看到的 collapsed 还是空集，
-      那样每个 project 都会被记成已处理，之后点开一个折叠的它也不会预热了。
-    */
+  /*
+    判据从「跃变」改成「此刻展开着」——「为什么 blog 这个 project 打开的时候没有预热」。
+    跃变判据靠"上一次渲染时它是折叠的"这个记忆，而那个 effect 的依赖里有 `onWarmProject`（App 里是
+    内联箭头），每次渲染都跑、每跑一次就把"上一次"覆盖掉，跃变就被吃掉了。
+
+    两个原来的顾虑仍然要挡住，靠的是别的东西而不是那份记忆：
+      · "启动时把展开着的都热一遍"会抵消 `sessionsToWarm` 的收紧 → 启动那一遍只记账（`baselined`）；
+      · "第一遍 collapsed 还是空集"会把每个 project 都记成已处理 → 等自动折叠真的落到 state 上（`landed`）再记账。
+    判据本身在 `projectsToWarmNow`，状态顺序的行为测试在 tests/sidebarMoveExpands.test.ts。
+  */
+  test('判据是"此刻展开着"，跃变那套记忆已经去掉', () => {
     const at = SIDEBAR.indexOf('const warmed = useRef<Set<string>>(new Set());');
     assert.ok(at > 0, '找不到那段');
-    const block = SIDEBAR.slice(at, at + 900);
-    assert.match(block, /prevCollapsed/);
-    assert.match(block, /if \(!prev\) return;/, '第一次看到折叠状态时什么都不热');
-    assert.match(block, /for \(const project of prev\)/, '只看上一次折叠着、现在不折叠了的那些');
+    const block = SIDEBAR.slice(at, at + 1800);
+    assert.equal(SIDEBAR.includes('prevCollapsed'), false, '两套判据不能并存');
+    assert.match(block, /projectsToWarmNow\(projects, collapsed, ledger, landed\)/);
+    assert.match(block, /const landed = collapsed !== collapsedBeforeAuto\.current;/,
+      '等自动折叠真的落到 state 上再记账');
   });
 });
 

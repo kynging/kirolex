@@ -62,7 +62,7 @@ describe('右键菜单里的归档/恢复', () => {
     const at = SIDEBAR.indexOf('onArchiveSession(ctxSession.id, false)');
     assert.ok(at > 0);
     const around = SIDEBAR.slice(at, at + 220);
-    assert.match(around, /onMoveSession\(ctxSession\.id, null\)/,
+    assert.match(around, /moveInto\(ctxSession\.id, null\)/,
       '恢复必须同时把会话移到 Unassigned —— 原项目可能已不存在或已被流程托管');
     // 文案现在走 i18n（`t('Restore to Unassigned')`），所以断言的是那个 key 而不是中文原文 ——
     // 中文在 `i18n.ts` 的字典里，由 tests/i18n.test.ts 钉住。
