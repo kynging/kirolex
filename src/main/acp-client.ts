@@ -172,6 +172,14 @@ export class AcpClient extends EventEmitter {
   private localTools?: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] };
   /** 最近一点 stderr —— ssh 退出码 255 的**原因**在里面（见 stderr 处理那一段）。 */
   private lastStderr = '';
+  /**
+   * **会话接线之前**的 stderr —— MCP server 起不来正好发生在这一段。
+   *
+   * `wireSession` 要等 connect / newSession / loadSession 跑完才挂监听，这之间的 `error` 事件
+   * 只落到构造函数里那个空监听上，于是启动期的 MCP 初始化失败从来到不了界面。先攒着，
+   * 接线时由 `takeEarlyStderr()` 一次性取走；取走之后不再攒（之后的走正常监听）。
+   */
+  private earlyStderr: string[] | null = [];
   /** 远端那个 kiro-cli 的 PID（它自己报的）—— 断开时要把它杀掉，见 `KIROLEX_PID`。 */
   remotePid?: number;
   /**
@@ -225,6 +233,23 @@ export class AcpClient extends EventEmitter {
     // process and surfaced as "Internal error" on IPCs like acp:switch-model.
     // This no-op keeps 'error' always listened; real handling is additive.
     this.on('error', () => {});
+  }
+
+  /** 接线前的 stderr 攒起来（只留最近 50 段，防止一直没人接线时无限长） */
+  private noteEarlyStderr(msg: string): void {
+    if (!this.earlyStderr) return;
+    this.earlyStderr.push(msg);
+    if (this.earlyStderr.length > 50) this.earlyStderr.shift();
+  }
+
+  /**
+   * 取走接线前攒下的 stderr，并停止再攒 —— 由 `wireSession` 挂好监听之后调用一次。
+   * 第二次调用返回空：同一段不会被报两遍。
+   */
+  takeEarlyStderr(): string[] {
+    const out = this.earlyStderr || [];
+    this.earlyStderr = null;
+    return out;
   }
 
   async connect(): Promise<any> {
@@ -361,6 +386,7 @@ export class AcpClient extends EventEmitter {
         const pid = parseRemotePid(msg);
         if (pid) this.remotePid = pid;
         if (msg) {
+          this.noteEarlyStderr(msg);
           this.emit('error', { type: 'stderr', message: msg });
         }
       });

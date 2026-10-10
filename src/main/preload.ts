@@ -637,6 +637,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('acp:error', handler);
     return () => ipcRenderer.removeListener('acp:error', handler);
   },
+  /** 后端 stderr 里筛出来的那几行（MCP / 认证 / 工具 / 明确的 error），见 `stderrNotice.ts`。 */
+  onNotice: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => {
+    const handler = (_event: any, n: any) => callback(n);
+    ipcRenderer.on('acp:notice', handler);
+    return () => ipcRenderer.removeListener('acp:notice', handler);
+  },
   /** Per-session backend occupancy (turn / reconfiguring / attaching / priming). */
   onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

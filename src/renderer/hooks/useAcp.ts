@@ -2371,7 +2371,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     });
 
     const removeError = window.kiroApi.onError((error: any) => {
+      /* 原始 stderr 留在控制台 —— 值得给人看的那几行走下面 `onNotice` 那一路（已筛过、带类别） */
       console.error('ACP error:', error);
+    });
+    /** 挂到**那条会话**的错误横幅上：MCP 是按会话起的，要看得出是哪条会话的工具坏了 */
+    const removeNotice = window.kiroApi.onNotice?.((n) => {
+      if (!n?.text) return;
+      noteError(n.sessionId || null, `${n.label}：${n.text}`);
     });
 
     // Turn end: adopt main's authoritative full assistant text. The streaming
@@ -2688,6 +2694,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => {
       removeUpdate();
       removeError();
+      removeNotice?.();
       removeAssistantFinal?.();
       removeSessionModel?.();
       removeTurnRestart?.();

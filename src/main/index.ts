@@ -5,6 +5,7 @@ import os from 'os';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
+import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { ADAPTER_PACKAGE, ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf } from './engines.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
@@ -4453,10 +4454,26 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       : undefined;
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
+  /*
+    后端 stderr 里**值得看的那几行**送到界面上（判据在 `stderrNotice`）—— 原来这里只进日志，
+    渲染层的 `onError` 只 `console.error`，于是 MCP server 起不来时界面上什么都没说。
+    只筛 stderr 这一路；其余 error 事件照旧。
+  */
+  const reportStderr = (message: string) => {
+    for (const n of noticesFromStderr(message)) {
+      logger.warn('backend', `${n.kind} sessionId=${sessionId}: ${n.text}`);
+      mainWindow?.webContents.send('acp:notice', {
+        sessionId, level: n.level, kind: n.kind, label: noticeLabel(n.kind), text: n.text,
+      });
+    }
+  };
   client.on('error', (error: any) => {
     logger.warn('session', `error event sessionId=${sessionId}`, error?.message || error);
+    if (error?.type === 'stderr') reportStderr(String(error.message || ''));
     mainWindow?.webContents.send('acp:error', { ...error, sessionId });
   });
+  /* 接线之前（connect / newSession / loadSession 期间）的 stderr —— MCP 初始化失败就在这一段 */
+  for (const message of client.takeEarlyStderr()) reportStderr(message);
   client.on('disconnected', () => {
     logger.info('session', `disconnected sessionId=${sessionId} cli=${entry.cliSessionId} busy=${entry.busy} remote=${!!entry.profile.remote?.sshHost}`);
     // Identity guard: a detached executor's process 'close' fires asynchronously.
