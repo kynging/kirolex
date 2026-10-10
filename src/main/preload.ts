@@ -197,6 +197,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   clearContextOverride: (sessionId: string) => ipcRenderer.invoke('acp:clear-context-override', sessionId),
   /** 清掉后端的活动上下文（`/clear`）—— flow 复用会话时用，transcript 不动。见 flowContext.ts */
   clearContext: (sessionId: string) => ipcRenderer.invoke('acp:clear-context', sessionId),
+  /** 输入框 `/clear` 的历史水位线落盘 —— 之前的消息不再读回来，transcript 不删。见 `SessionRecord.clearedAt` */
+  markCleared: (sessionId: string) => ipcRenderer.invoke('acp:mark-cleared', sessionId),
   writeMemory: (scope: 'global' | 'project' | 'session', projectId: string | undefined, sessionId: string | undefined, content: string) => ipcRenderer.invoke('acp:write-memory', scope, projectId, sessionId, content),
   /** 三层记忆各自的字节数。每轮注入后主进程也会主动推 `acp:memory-bytes`；这个 invoke 是给
    *  「打开就要看到」和「手动清理完立刻更新」两个时机用的。 */

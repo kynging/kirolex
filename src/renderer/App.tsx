@@ -124,6 +124,7 @@ declare global {
       runReset?: (project: string, id: string, nodeIds: string[], rewindGate?: string, opts?: { cascade?: boolean }) => Promise<{ ok: boolean; reset?: string[]; closeSessions?: string[]; error?: string }>;
       runReconcile?: (project: string, id: string) => Promise<{ ok: boolean; changed?: number; error?: string }>;
       clearContext?: (sessionId: string) => Promise<{ ok: boolean; error?: string }>;
+      markCleared?: (sessionId: string) => Promise<{ ok: boolean; clearedAt?: number; error?: string }>;
       /**
        * 一个 `file:` 产出的正文 —— 门上要能逐段 comment 它（`file:` 的产出不进 run values）。
        * 路径的算法和 `fileOutputs` 那条检查同一套：占位符按起跑输入替换、相对路径相对 run 冻结的工作目录。
@@ -2880,8 +2881,14 @@ const App: React.FC = () => {
     // the backend also resets its context. KiroLex's own stored transcript is
     // deliberately left alone -- see the note on clearConversation.
     if (text.trim() === '/clear') {
+      /*
+        水位线**先落盘再清屏**：`switchSession` 见到空缓存会从磁盘重读，没有水位线的话切走再切回来
+        整份历史就回来了，快照也会把它重新喂给模型。transcript 本身不删。见 `SessionRecord.clearedAt`。
+      */
+      if (sid) await window.kiroApi.markCleared?.(sid);
       clearConversation(sid);
-      await sendMessage([{ type: 'text', text: '/clear' }]);
+      // 显式发给 sid：上面 await 期间可能已经切到别的会话，落回"当前焦点"就会清错那一条
+      await sendMessage([{ type: 'text', text: '/clear' }], undefined, undefined, undefined, undefined, sid || undefined);
       return;
     }
 

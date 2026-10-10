@@ -5264,7 +5264,7 @@ app.whenReady().then(async () => {
     if (dirs.length) {
       const referenced = new Set<string>();
       for (const rec of store.listSessions()) {
-        for (const m of store.readTranscript(rec.id) as any[]) {
+        for (const m of store.readTranscript(rec.id, { raw: true }) as any[]) {
           for (const a of (m?.attachments || [])) if (a?.path) referenced.add(path.resolve(a.path));
           for (const p of (m?.pastes || [])) if (p?.path) referenced.add(path.resolve(p.path));
         }
@@ -7526,12 +7526,33 @@ app.whenReady().then(async () => {
    *
    * `display` 不给可见文本：这是流程的内务，不该在你的对话里留下一条"用户说了 /clear"。
    */
+  /**
+   * `/clear` 的水位线落盘 —— 这个时刻之前的消息不再算这条会话的历史（判据见 `SessionRecord.clearedAt`）。
+   * 输入框里打的 `/clear` 走这里；复用会话前自动清的那一下见下面的 `acp:clear-context`。
+   * transcript 一个字节都不删。
+   */
+  ipcMain.handle('acp:mark-cleared', async (_event, sessionId: string) => {
+    if (!sessionId?.trim()) return { ok: false, error: '没有指定会话' };
+    const rec = store.readRecord(sessionId);
+    if (!rec) return { ok: false, error: '没有这个会话' };
+    const at = Date.now();
+    store.writeRecord({ ...rec, clearedAt: at });
+    // 水位线之后历史变短了：下一次该按新的历史重建，而不是继续认为后端里装着那份旧的
+    clearContextEstablished(sessionId);
+    logger.info('session', `clear watermark set sessionId=${sessionId} at=${at}`);
+    return { ok: true, clearedAt: at };
+  });
+
   ipcMain.handle('acp:clear-context', async (_event, sessionId: string) => {
     if (!sessionId?.trim()) return { ok: false, error: '没有指定会话' };
     try {
       await sendPromptOnce(sessionId, [{ type: 'text', text: '/clear' }], undefined, {
         messageId: `flow_clear_${Date.now()}`,
       });
+      // 后端清掉了，KiroLex 这侧的历史水位线也要跟上 —— 否则下一次重建又把它喂回去
+      const rec = store.readRecord(sessionId);
+      if (rec) store.writeRecord({ ...rec, clearedAt: Date.now() });
+      clearContextEstablished(sessionId);
       logger.info('flow', `cleared context sessionId=${sessionId}`);
       return { ok: true };
     } catch (err: any) {

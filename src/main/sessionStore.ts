@@ -153,6 +153,17 @@ export interface SessionRecord {
    *  after a restart the same id resolves to a blank backend. Pairing it with
    *  the pid makes the marker expire exactly when the process does. */
   contextEstablishedPid?: number;
+  /**
+   * `/clear` 的水位线（epoch ms）—— 这个时刻**之前**的消息不再算这条会话的历史。
+   *
+   * 必须落盘：渲染端 `switchSession` 判"要不要从磁盘重读"的条件是 `!cached || cached.length === 0`，
+   * "故意清空"和"还没装载过"是同一个 `[]`，切走再切回来就把整份 transcript 读了回来；快照
+   * （`renderHistoryFile`、ride-along）也读 transcript，下一次重建上下文又把历史喂回模型。
+   *
+   * 过滤放在 `readTranscript` 这一处，视图和快照都走它。**transcript 本身不删** —— `/clear`
+   * 是给后端的指令，不是删除。
+   */
+  clearedAt?: number;
   /** How this chat's context is restored onto a fresh backend.
    *  'snapshot' (default): ONE prompt carrying the artifact manifest, the most
    *  recent turns verbatim, and the path of the fully rendered history file, which
@@ -250,7 +261,14 @@ export function writeLastInjection(id: string, snapshot: string): void {
 export function readLastInjection(id: string): { text: string; at: number } | null {
   try {
     const p = lastInjectionPath(id);
-    return { text: fs.readFileSync(p, 'utf-8'), at: fs.statSync(p).mtimeMs };
+    const { mtimeMs } = fs.statSync(p);
+    /*
+      `/clear` 之前发出去的那份装着清空前的历史 —— 快照页不再读回它（文件留着）。否则它出现在可编辑的
+      快照页里，一保存就成了清空之后的 override，把旧历史又发给模型。
+    */
+    const cleared = Number(readRecord(id)?.clearedAt);
+    if (Number.isFinite(cleared) && cleared > 0 && mtimeMs <= cleared) return null;
+    return { text: fs.readFileSync(p, 'utf-8'), at: mtimeMs };
   } catch {
     return null;   // nothing has been injected for this chat yet
   }
@@ -276,7 +294,14 @@ export function readContextOverride(id: string): { text: string; at: number } | 
     const p = contextOverridePath(id);
     const text = fs.readFileSync(p, 'utf-8');
     if (!text.trim()) return null;      // an empty file is not an override
-    return { text, at: fs.statSync(p).mtimeMs };
+    const { mtimeMs } = fs.statSync(p);
+    /*
+      `/clear` 之前手改保存的快照装着清空前的历史 —— 它不再生效（文件留着，不删），
+      否则 ride-along 会绕过 `readTranscript` 的水位线把旧历史再喂给模型。清空之后新保存的照旧生效。
+    */
+    const cleared = Number(readRecord(id)?.clearedAt);
+    if (Number.isFinite(cleared) && cleared > 0 && mtimeMs <= cleared) return null;
+    return { text, at: mtimeMs };
   } catch {
     return null;
   }
@@ -461,8 +486,22 @@ export function appendMessage(id: string, msg: StoredMessage): void {
   if (rec) writeRecord(rec); // bump updatedAt
 }
 
+/**
+ * 这条会话的历史 —— **`/clear` 的水位线（`SessionRecord.clearedAt`）之前的不算**。
+ *
+ * 视图（`acp:read-transcript`）、历史文件、ride-along 快照都从这里拿历史，所以只在这一处过滤。
+ * 没有 `ts` 的行留着（不确定就不隐藏你的记录）。`opts.raw` 给真要全量的调用方（例如粘贴文件的引用清扫）。
+ */
+export function readTranscript(id: string, opts?: { raw?: boolean }): StoredMessage[] {
+  const all = readTranscriptRaw(id);
+  if (opts?.raw) return all;
+  const at = Number(readRecord(id)?.clearedAt);
+  if (!Number.isFinite(at) || at <= 0) return all;
+  return all.filter((m) => !Number.isFinite(Number((m as any).ts)) || Number((m as any).ts) > at);
+}
+
 /** Read the full transcript (tolerant of unknown fields + partial last line). */
-export function readTranscript(id: string): StoredMessage[] {
+function readTranscriptRaw(id: string): StoredMessage[] {
   try {
     const raw = fs.readFileSync(transcriptPath(id), 'utf-8');
     const out: StoredMessage[] = [];
@@ -522,7 +561,25 @@ export function rewriteTranscript(id: string, messages: StoredMessage[]): void {
   ensureDir(id);
   const file = transcriptPath(id);
   const tmp = `${file}.tmp`;
-  const body = messages.map((m) => JSON.stringify(m)).join('\n');
+  /*
+    调用方给的是界面上能看到的那些（水位线之后的）—— 水位线之前的原样行保住，
+    否则编辑后重跑会把 `/clear` 之前的记录真删掉。
+  */
+  const at = Number(readRecord(id)?.clearedAt);
+  const before: string[] = [];
+  if (Number.isFinite(at) && at > 0 && fs.existsSync(file)) {
+    // 渲染端缓存若还装着水位线之前的消息（例如自动清理时界面没清屏），它们已经在 messages 里，别写两遍
+    const given = new Set(messages.map((m) => m.id));
+    for (const line of fs.readFileSync(file, 'utf-8').split('\n')) {
+      if (!line.trim()) continue;
+      try {
+        const m = JSON.parse(line) as StoredMessage;
+        const ts = Number(m.ts);
+        if (Number.isFinite(ts) && ts <= at && !given.has(m.id)) before.push(line);
+      } catch { /* torn line */ }
+    }
+  }
+  const body = [...before, ...messages.map((m) => JSON.stringify(m))].join('\n');
   fs.writeFileSync(tmp, body ? `${body}\n` : '');
   fs.renameSync(tmp, file);
   const rec = readRecord(id);

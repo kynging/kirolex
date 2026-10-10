@@ -121,7 +121,8 @@ describe('KiroLex issues exactly one kind of prompt the user did not type', () =
     // feature must not have removed the user's own way to reset the context.
     const app = fs.readFileSync(path.join(root, 'src/renderer/App.tsx'), 'utf-8');
     assert.match(app, /if \(text\.trim\(\) === '\/clear'\) \{/);
-    assert.match(app, /sendMessage\(\[\{ type: 'text', text: '\/clear' \}\]\)/);
+    // 后面可以带目标会话等参数（显式发给落了水位线的那条，见 clearWatermark.test.ts）
+    assert.match(app, /sendMessage\(\[\{ type: 'text', text: '\/clear' \}\](, [^)]*)?\)/);
     assert.doesNotMatch(app, /clearHistory/, 'App still calls the removed bridge');
   });
 });
