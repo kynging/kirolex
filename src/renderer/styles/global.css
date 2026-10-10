@@ -2730,22 +2730,24 @@ button, input, select, textarea {
 .queue-card-actions {
   display: flex;
   align-items: center;
-  gap: 1px;
+  gap: 3px;          /* 1px 太挤 —— 误点相邻那个的代价是撤回一条消息 */
   flex-shrink: 0;
 }
 
+/* 让它们看起来是按钮：原来透明底、无边框、灰色小字，和句末一个字符没区别，"能不能点"只能靠试。
+   一道淡边框加一点底色，够读成控件，又不至于在卡片里抢戏。 */
 .queue-card-actions button {
-  width: 22px;
-  height: 22px;
+  width: 24px;
+  height: 24px;
   display: inline-flex;
   align-items: center;
   justify-content: center;
   padding: 0;
-  border: none;
+  border: 1px solid color-mix(in srgb, var(--border) 70%, transparent);
   border-radius: 5px;
-  background: transparent;
-  color: var(--text-muted);
-  font-size: 10px;
+  background: color-mix(in srgb, var(--bg-primary) 55%, transparent);
+  color: var(--text-secondary);
+  font-size: 11px;
   cursor: pointer;
 }
 

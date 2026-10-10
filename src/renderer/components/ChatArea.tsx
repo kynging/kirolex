@@ -1334,7 +1334,7 @@ const ReviewQueueStack: React.FC<{ sessionId: string | null }> = ({ sessionId })
               </span>
             </div>
             <div className="queue-card-actions">
-              <button onClick={() => item.cancel()} title="取消这一条改写（侧栏那条标记会放回去）">✕</button>
+              <button type="button" onClick={() => item.cancel()} title="取消这一条改写（侧栏那条标记会放回去）">✕</button>
             </div>
           </div>
         ))}
@@ -1385,6 +1385,8 @@ const QueueStack = memo<{
                 <input
                   className="queue-card-edit-input"
                   value={editingQueueText}
+                  /* 说清怎么收尾 —— 这个框长得像一行普通输入，而它的两个出口都是键盘 */
+                  placeholder="改完按 Enter 保存，Esc 取消"
                   autoFocus
                   onChange={(event) => setEditingQueueText(event.target.value)}
                   onKeyDown={(event) => {
@@ -1407,36 +1409,42 @@ const QueueStack = memo<{
               {editingQueueId === item.id ? (
                 <>
                   <button
+                    type="button"
                     onClick={() => {
                       if (editingQueueText.trim()) onEditQueuedMessage(item.id, editingQueueText);
                       setEditingQueueId(null);
                     }}
-                    title="Save edit"
+                    title="保存这次修改"
                   >✓</button>
-                  <button onClick={() => setEditingQueueId(null)} title="Cancel edit">↩</button>
+                  <button type="button" onClick={() => setEditingQueueId(null)} title="放弃这次修改">↩</button>
                 </>
               ) : (
                 <>
+                  {/* 都写 `type="button"`：`<button>` 默认是 submit，哪天被包进 `<form>` 点一下就成了提交 */}
                   <button
+                    type="button"
                     onClick={() => onMoveQueuedMessage(item.id, -1)}
                     disabled={index === 0}
-                    title="Move earlier"
+                    title="往前排一位"
                   >↑</button>
                   <button
+                    type="button"
                     onClick={() => onMoveQueuedMessage(item.id, 1)}
                     disabled={index === queuedMessages.length - 1}
-                    title="Move later"
+                    title="往后排一位"
                   >↓</button>
                   <button
+                    type="button"
                     onClick={() => {
                       setEditingQueueId(item.id);
                       setEditingQueueText(item.content);
                     }}
-                    title="Edit queued message"
+                    title="改这条排队的消息"
                   >✎</button>
                   <button
+                    type="button"
                     onClick={() => onCancelQueuedMessage(item.id)}
-                    title="Cancel and return to composer"
+                    title="撤回这条 —— 内容退回输入框"
                   >✕</button>
                 </>
               )}
