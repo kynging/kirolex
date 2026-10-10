@@ -3,6 +3,7 @@ import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
 import { useT } from '../hooks/useLang';
+import { fontSelectOptions } from '../fontOptions';
 import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
@@ -20,8 +21,8 @@ interface SettingsDialogProps {
 }
 
 // Font choices. Empty value = keep the app default stack. Only fonts that ship
-// with macOS/Windows are offered as presets; anything else goes in the custom field.
-const CUSTOM_FONT = '__custom__';
+// with macOS/Windows are offered as presets; a legacy value outside them shows up
+// as an extra "Current: …" option (see fontSelectOptions).
 const FONT_PRESETS: Array<{ label: string; value: string }> = [
   { label: 'System default', value: '' },
   { label: 'PingFang SC / 苹方', value: "'PingFang SC', -apple-system, sans-serif" },
@@ -324,24 +325,14 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             <div className="settings-control">
               <select
                 className="settings-select"
-                value={FONT_PRESETS.some((f) => f.value === settings.fontFamily) ? settings.fontFamily : CUSTOM_FONT}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  if (v === CUSTOM_FONT) return; // keep the current custom value; edit it in the field
-                  onChange({ ...settings, fontFamily: v });
-                }}
+                value={settings.fontFamily}
+                onChange={(e) => onChange({ ...settings, fontFamily: e.target.value })}
               >
-                {FONT_PRESETS.map((f) => (
-                  <option key={f.label} value={f.value}>{t(f.label)}</option>
+                {fontSelectOptions(FONT_PRESETS, settings.fontFamily, t).map((f) => (
+                  <option key={f.value} value={f.value}>{f.label}</option>
                 ))}
-                <option value={CUSTOM_FONT}>{t('Custom…')}</option>
               </select>
             </div>
-            <input
-              className="settings-input"
-              value={settings.fontFamily}
-              onChange={(e) => onChange({ ...settings, fontFamily: e.target.value })}
-            />
           </div>
           )}
 
@@ -351,24 +342,14 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             <div className="settings-control">
               <select
                 className="settings-select"
-                value={MONO_PRESETS.some((f) => f.value === settings.monoFontFamily) ? settings.monoFontFamily : CUSTOM_FONT}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  if (v === CUSTOM_FONT) return;
-                  onChange({ ...settings, monoFontFamily: v });
-                }}
+                value={settings.monoFontFamily}
+                onChange={(e) => onChange({ ...settings, monoFontFamily: e.target.value })}
               >
-                {MONO_PRESETS.map((f) => (
-                  <option key={f.label} value={f.value}>{t(f.label)}</option>
+                {fontSelectOptions(MONO_PRESETS, settings.monoFontFamily, t).map((f) => (
+                  <option key={f.value} value={f.value}>{f.label}</option>
                 ))}
-                <option value={CUSTOM_FONT}>{t('Custom…')}</option>
               </select>
             </div>
-            <input
-              className="settings-input"
-              value={settings.monoFontFamily}
-              onChange={(e) => onChange({ ...settings, monoFontFamily: e.target.value })}
-            />
           </div>
           )}
 
