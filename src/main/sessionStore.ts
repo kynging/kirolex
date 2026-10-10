@@ -113,6 +113,12 @@ export interface SessionRecord {
   lastExecutorError?: string;
   /** User-archived: hidden from the main list, never eager-attached. Not deleted. */
   archived?: boolean;
+  /**
+   * 项目（`profile.projectId`）或归档状态最后一次被**用户**改动的时刻 ——
+   * 「同步时让会话的项目和归档状态在多台机器间自动跟随」。多台机器之间位置按它谁新用谁
+   * （`placementToFollow` / `mergeRecords`），不跟着每条消息都会动的 `updatedAt` 走。老记录没有 → 当 0。
+   */
+  placementChangedAt?: number;
   /** User-pinned: sorts to the top of its group. Renderer mirror of session.pinned;
    *  persisted here so it survives restart AND renderer-origin (localStorage) changes. */
   pinned?: boolean;
@@ -364,6 +370,15 @@ export function createSession(id: string, profile: AgentProfile, title = 'New Ch
 export function writeRecord(rec: SessionRecord): void {
   ensureDir(rec.id);
   rec.updatedAt = Date.now();
+  const tmp = recordPath(rec.id) + '.tmp';
+  fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
+  fs.renameSync(tmp, recordPath(rec.id)); // atomic replace
+}
+
+/** Overwrite record.json WITHOUT bumping updatedAt (sync-side bookkeeping that is
+ *  not a user edit, e.g. following another machine's project/archive move). */
+export function writeRecordKeepUpdatedAt(rec: SessionRecord): void {
+  ensureDir(rec.id);
   const tmp = recordPath(rec.id) + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
   fs.renameSync(tmp, recordPath(rec.id)); // atomic replace

@@ -22,7 +22,7 @@ import {
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
-  decideMemory, memoryRelsFor,
+  decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { markArchivedLocally, unarchiveRestoredRecord } from './restoreArchive.ts';
@@ -3295,6 +3295,13 @@ function loadFeatureFlags(): Record<string, boolean> {
  * 不推迟就得在一轮中间 detach，把正在跑的那一轮连根拔掉；而拒绝换项目又让人在最想整理的时候动不了。
  */
 const pendingProjectReset = new Set<string>();
+/** 消化欠下的执行器重置。必须在这一轮的回复落盘之后调：detachExecutor 会立刻把 entry 拿掉。 */
+function consumePendingProjectReset(sessionId: string, why: string): void {
+  if (pendingProjectReset.delete(sessionId)) {
+    logger.info('session', `${why} sessionId=${sessionId}`);
+    void detachExecutor(sessionId);
+  }
+}
 const cliFailStreak = new Map<string, number>();
 /**
  * **这条会话上一次换后端会话是什么时候** ——「我他妈说的是最近那几次 workshop 的」。
@@ -3620,7 +3627,7 @@ function sessionExcluded(cfg: SyncConfig, sessionId: string): boolean {
 }
 
 function catalogEntriesFor(
-  sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any }>,
+  sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any; archived?: boolean; placementChangedAt?: number }>,
   machine: string,
 ): CatalogEntry[] {
   const now = Date.now();
@@ -3635,7 +3642,58 @@ function catalogEntriesFor(
     }, 0),
     from: machine,
     syncedAt: now,
+    /* 位置跟随用（见 `placementToFollow`）：别的机器按它判断要不要跟着这台挪项目 / 归档 */
+    archived: !!r.archived,
+    placementChangedAt: placementOf(r).placementChangedAt,
   }));
+}
+
+/**
+ * **项目 / 归档跟着别的机器走** ——「同步时让会话的项目和归档状态在多台机器间自动跟随」。
+ *
+ * 读到桶里的 catalog 之后、生成本机条目和上传计划**之前**调：桶里那条的 `placementChangedAt`
+ * 比本机新（别的机器后挪过），就把本机记录的 projectId / archived / placementChangedAt 改成桶里的。
+ * 不先做这一步的话，本机只要又聊过一句（updatedAt 更新），就会把旧位置传上去盖掉对方的移动。
+ *
+ * 只动这三个字段，transcript 和别的字段不碰；`updatedAt` 也不碰（这不是一次新的对话改动，
+ * 碰了会打乱侧栏排序、还会让对方下一轮误判"本机更新"）。
+ * 正在跑一轮的照样改（同 `acp:move-session`）：记录立刻改，重置执行器推迟到这一轮结束。
+ * 设成不同步的项目 / 会话不参与 —— 那些本来就不和桶来往。
+ */
+function followBucketPlacements(cfg: SyncConfig, catalog: Catalog | null, sessions: store.SessionRecord[]): string[] {
+  const byId = new Map((catalog?.entries || []).map((e) => [e.id, e]));
+  const changed: string[] = [];
+  for (const r of sessions) {
+    if (projectExcluded(cfg, projectOf(r)) || sessionExcluded(cfg, r.id)) continue;
+    const theirs = byId.get(r.id);
+    if (!placementToFollow(r, theirs)) continue;
+    /* 写之前按磁盘再读一遍 —— 列表那份可能已经旧了，拿它写回去会丢掉这期间别的改动 */
+    const cur = store.readRecord(r.id);
+    const p = placementToFollow(cur, theirs);
+    if (!cur || !p) continue;
+    const before = placementOf(cur);
+    try {
+      store.writeRecordKeepUpdatedAt(applyPlacement(cur, p));
+    } catch (err: any) {
+      logger.warn('s3', `位置跟随 ${r.id} 写不进记录：${err?.message || err}`);
+      continue;
+    }
+    const projectChanged = before.projectId !== p.projectId;
+    const archiveChanged = before.archived !== p.archived;
+    if (!projectChanged && !archiveChanged) continue;          // 位置本来就一样，只是补上时间戳
+    const describe = (x: { projectId: string; archived: boolean }) => `项目「${x.projectId || '未分组'}」${x.archived ? '·已归档' : ''}`;
+    logger.info('s3', `位置跟随 ${r.id}（${cur.title || 'New Chat'}）：${describe(before)} → ${describe(p)}`
+      + `（来自 ${theirs?.from || '未知机器'}，${new Date(p.placementChangedAt).toLocaleString()} 改的）`);
+    /* 换了项目要换 memory scope、归档要把执行器让出来 —— 和 move-session / archive-session 一样 */
+    if (projectChanged || p.archived) {
+      const live = sessionClients.get(r.id);
+      if (live?.busy) pendingProjectReset.add(r.id);
+      else if (live) void detachExecutor(r.id);
+    }
+    mainWindow?.webContents.send('session:placement-changed', { sessionId: r.id, projectId: p.projectId || null, archived: p.archived });
+    changed.push(r.id);
+  }
+  return changed;
 }
 
 /**
@@ -3812,6 +3870,17 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       而不是 `planUpload` 里面：那个函数只认"路径 + 上次的状态"，把项目概念塞进去
       会让它同时对两件事负责。
     */
+    const thisMachine = machineTag(os.hostname());
+    /*
+      **先看桶里有没有别人动过同一条会话**（参考 Tabby 插件的 `conflict detection` +
+      `safe conflict backups`）。catalog 要在上传**之前**读：读晚了就已经盖掉对方了。
+      也要在**列会话、做上传计划之前**读 —— 位置跟随（`followBucketPlacements`）得先把别的机器挪过的
+      项目 / 归档改到本机，后面的计划和 catalog 条目才是新位置，不会把旧位置再传上去。
+    */
+    const oldRaw0 = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+    let oldCatalog: Catalog | null = null;
+    try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
+    followBucketPlacements(cfg, oldCatalog, store.listSessions());   // 侧栏按 session:placement-changed 逐条改
     const allSessions = store.listSessions();
     const sessions = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)) && !sessionExcluded(cfg, r.id));
     const excludedCount = allSessions.length - sessions.length;
@@ -3827,14 +3896,6 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     const memoryProjects = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'))
       .filter((p) => !projectExcluded(cfg, p));
     const plan = planUpload(KIROLEX_HOME, ids, state, { projects: memoryProjects });
-    const thisMachine = machineTag(os.hostname());
-    /*
-      **先看桶里有没有别人动过同一条会话**（参考 Tabby 插件的 `conflict detection` +
-      `safe conflict backups`）。catalog 要在上传**之前**读：读晚了就已经盖掉对方了。
-    */
-    const oldRaw0 = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
-    let oldCatalog: Catalog | null = null;
-    try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
     let freshEntries = catalogEntriesFor(sessions, thisMachine);
     const conflicts = detectConflicts(oldCatalog, freshEntries, thisMachine);
     /*
@@ -6373,11 +6434,6 @@ app.whenReady().then(async () => {
               因为本地是唯一真相，而 review 读的就是本地文件。拉失败不抛（这一轮已经成了），
               但会留一个"远端有未取回的改动"并在会话里说一句 —— 绝不让人以为本地是新的。
             */
-            /* 换项目时欠下的执行器重置，在这里消化（那时它正忙，不能 detach） */
-            if (pendingProjectReset.delete(sessionId)) {
-              logger.info('session', `本轮结束，执行下推的执行器重置 sessionId=${sessionId}`);
-              detachExecutor(sessionId);
-            }
             const producedOutput = !!(entry.assistantBuf || entry.fileChanges.length);
             /*
               侧栏 review 的「✓ 确认」在等这一轮的完整回复（见 `askWaiters`）—— 在 flush 清空之前取，
@@ -6424,6 +6480,12 @@ app.whenReady().then(async () => {
             });
             // 一轮结束就看看要不要压一次会话记忆 —— 不等它，也不让它影响这一轮的返回
             void maybeConsolidateSessionMemory(sessionId);
+            /*
+              换项目 / 归档时欠下的执行器重置，在这里消化（那时它正忙，不能 detach）。
+              **必须排在 flushAssistant 和上面的收尾之后**：detachExecutor 会立刻把 entry 从 sessionClients
+              拿掉，排在前面的话 flushAssistant 找不到 entry 直接返回 —— 这一轮的完整回复就没落盘。
+            */
+            consumePendingProjectReset(sessionId, '本轮结束，执行下推的执行器重置');
             // Tag the result so the renderer can flag an abnormal end even when
             // kiro-cli reports no stopReason at all (silent empty turn).
             return { ...(result || {}), __kirolex: { produced: producedOutput } };
@@ -6772,6 +6834,15 @@ app.whenReady().then(async () => {
       /* 报出去之前把 kiro-cli 那句真话带上 —— 光一句 Internal error 谁也不知道该干什么 */
       if (cliWhy && isBareInternalError(errText)) throw new Error(`${errText}\n\n${cliWhy}`);
       throw err;
+    } finally {
+      /*
+        **这一轮报错收场也要消化欠下的执行器重置** —— 只在成功收尾那一处消化的话，回复期间被挪了项目 / 归档
+        （尤其是同步跟随：位置时间戳已经跟上了，下一次同步不会再触发）、这一轮又报错，旧执行器就会
+        带着旧项目的记忆一直用下去。放在 finally：上面的 catch 已经先 flushAssistant 把半截回复落了盘。
+        成功那条路已经消化过（再调是空操作）；自动重发那条路由里层那次调用消化。
+        别的一轮正在跑（busy）就不动 —— 它收尾时会消化。
+      */
+      if (!sessionClients.get(sessionId)?.busy) consumePendingProjectReset(sessionId, '本轮报错结束，执行下推的执行器重置');
     }
   }
 
@@ -10491,6 +10562,7 @@ app.whenReady().then(async () => {
       throw new Error('projectId is write-once; it cannot be changed once set.');
     }
     rec.profile.projectId = projectId;
+    rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
     store.writeRecord(rec);
     const entry = sessionClients.get(sessionId);
     if (entry) entry.profile.projectId = projectId; // keep live executor in sync
@@ -10504,6 +10576,7 @@ app.whenReady().then(async () => {
     const rec = store.readRecord(sessionId);
     if (!rec) return { sessionId, projectId };
     rec.profile.projectId = projectId ?? undefined;
+    rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
     store.writeRecord(rec);
     const entry = sessionClients.get(sessionId);
     if (entry) entry.profile.projectId = projectId ?? undefined;
@@ -10539,6 +10612,7 @@ app.whenReady().then(async () => {
     if (rec) {
       rec.profile.projectId = projectId ?? undefined;
       rec.archived = false; // moving a chat brings it out of the archive
+      rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
       store.writeRecord(rec);
     }
     if (busy) {
@@ -10653,6 +10727,7 @@ app.whenReady().then(async () => {
     const rec = store.readRecord(sessionId);
     if (rec) {
       rec.archived = !!archived;
+      rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
       /*
         **归档不再抹掉项目绑定** ——「可是你现在所有的 archive 会话都显示在未分组中」。
 

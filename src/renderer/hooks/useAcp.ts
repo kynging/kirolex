@@ -1501,6 +1501,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
 
+  /* 同步时跟随了别的机器挪过的项目 / 归档（主进程已经改了记录）—— 侧栏按新位置分组 */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onSessionPlacementChanged?.((d: { sessionId: string; projectId: string | null; archived: boolean }) => {
+      if (!d?.sessionId) return;
+      const pid = d.projectId || undefined;
+      setSessions((prev) => prev.map((s) => (s.id === d.sessionId ? { ...s, projectId: pid, archived: !!d.archived } : s)));
+      if (pid) setProjects((prev) => (prev.includes(pid) ? prev : [...prev, pid]));
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
   useEffect(() => {
     const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
       if (!d?.sessionId) return;

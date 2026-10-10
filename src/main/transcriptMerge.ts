@@ -99,8 +99,9 @@ export function mergeTranscripts(localText: string, remoteText: string): MergeRe
  * 合并 `record.json`。
  *
  * 策略：**`updatedAt` 新的那份赢**（标题、模型、profile 这些"最后一次是什么样"的字段），
- * 但两件事例外：
+ * 但三件事例外：
  *
+ * · 项目 / 归档（`profile.projectId`、`archived`、`placementChangedAt`）按 `placementChangedAt` 新的那份；
  * · `createdAt` 取**更早**的那个 —— 这条会话是什么时候开始的，不随谁后改一次而变；
  * · 数组型的（`tags` 之类）取**并集** —— 两台机器各加过一个标签时，
  *   按"新的赢"会把另一台那个丢掉，而那是用户明确加过的东西。
@@ -127,6 +128,24 @@ export function mergeRecords(local: any, remote: any): any {
     const union = [...a, ...b].filter((v, i, arr) => arr.indexOf(v) === i);
     if (union.length) out[key] = union;
     else delete out[key];
+  }
+
+  /*
+    **位置（项目 / 归档）按 `placementChangedAt` 谁新用谁** —— 不跟着整份记录的 `updatedAt` 走：
+    A 移过项目、B 之后又聊过一句，按 updatedAt 就是 B 的旧项目赢，A 的移动被盖掉。
+    一样新（包括两边都是没有这个字段的老记录）就保持上面按 updatedAt 的结果。
+  */
+  const placedA = Number(local.placementChangedAt) || 0;
+  const placedB = Number(remote.placementChangedAt) || 0;
+  if (placedA !== placedB) {
+    const src = placedA > placedB ? local : remote;
+    const profile = { ...(out.profile || {}) };
+    if (src.profile && src.profile.projectId !== undefined) profile.projectId = src.profile.projectId;
+    else delete profile.projectId;
+    out.profile = profile;
+    if (src.archived !== undefined) out.archived = src.archived;
+    else delete out.archived;
+    out.placementChangedAt = src.placementChangedAt;
   }
 
   /* 这台机器的东西不许被另一台的覆盖 */

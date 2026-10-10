@@ -133,9 +133,63 @@ export interface CatalogEntry {
   /** 上传这份备份的机器名 —— 多台机器往同一个桶备份时，这是唯一能分清来源的东西。 */
   from?: string;
   syncedAt: number;
+  /** 这条会话是不是归档了（`record.archived`）。老条目没有 → 当未归档。 */
+  archived?: boolean;
+  /**
+   * 项目 / 归档最后一次被**用户**改动的时刻（`record.placementChangedAt`）——
+   * 「同步时让会话的项目和归档状态在多台机器间自动跟随」。见 `placementToFollow`。
+   * 老条目没有 → 0（永远不会被拿去跟随）。
+   */
+  placementChangedAt?: number;
 }
 
 export interface Catalog { version: 1; entries: CatalogEntry[] }
+
+/**
+ * 一条会话"放在哪儿"：哪个项目、归没归档、这个位置是什么时候被用户改的。
+ *
+ * 为什么单独一个时间戳而不是用 `updatedAt`：`updatedAt` 每发一条消息都会动。A 把会话移到 Y 之后，
+ * B 上这条只要又聊过一句，B 的 `updatedAt` 就更新 —— 按它判谁新，B 会把旧的项目传回去，
+ * A 的移动被悄悄盖掉。位置只该跟"谁后挪的"走。
+ */
+export interface Placement { projectId: string; archived: boolean; placementChangedAt: number }
+
+export function placementOf(rec: { profile?: any; archived?: any; placementChangedAt?: any } | null | undefined): Placement {
+  const pid = (rec?.profile as any)?.projectId;
+  return {
+    projectId: typeof pid === 'string' ? pid.trim() : '',
+    archived: !!rec?.archived,
+    placementChangedAt: Number(rec?.placementChangedAt) || 0,
+  };
+}
+
+/**
+ * 本机这条要不要跟随桶里那条的位置 —— 要就返回跟随成什么，不要就 `null`。
+ *
+ * 只看 `placementChangedAt`：桶里的严格更新才跟。老条目 / 老记录没有这个字段当 0 ——
+ * 桶里是 0 就永远不跟，所以升级前的 catalog 不会把本机的位置乱改。
+ */
+export function placementToFollow(
+  local: { profile?: any; archived?: any; placementChangedAt?: any } | null | undefined,
+  theirs: CatalogEntry | null | undefined,
+): Placement | null {
+  if (!local || !theirs) return null;
+  const at = Number(theirs.placementChangedAt) || 0;
+  if (at <= placementOf(local).placementChangedAt) return null;
+  return {
+    projectId: typeof theirs.project === 'string' ? theirs.project.trim() : '',
+    archived: !!theirs.archived,
+    placementChangedAt: at,
+  };
+}
+
+/** 把位置写进一份记录的副本 —— 只动 projectId / archived / placementChangedAt，别的原样。 */
+export function applyPlacement<T extends { profile?: any }>(rec: T, p: Placement): T {
+  const profile = { ...(rec.profile || {}) };
+  if (p.projectId) profile.projectId = p.projectId;
+  else delete profile.projectId;
+  return { ...rec, profile, archived: p.archived, placementChangedAt: p.placementChangedAt };
+}
 
 /**
  * 这一轮要传哪些文件。
