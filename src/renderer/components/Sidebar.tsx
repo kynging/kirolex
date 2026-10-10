@@ -5,9 +5,9 @@ const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions } from '../sessionSearch';
-import { placeMenu } from '../menuPlacement';
+import { placeMenu, placeSubmenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
-import React, { useState, useRef, useEffect, useReducer } from 'react';
+import React, { useState, useRef, useEffect, useLayoutEffect, useReducer } from 'react';
 import { useT } from '../hooks/useLang';
 import {
   DndContext,
@@ -53,11 +53,28 @@ type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' 
  *
  * 展开方向固定向右、用 CSS 定位（`left: 100%`）：这个菜单本身已经被 `placeMenu` 摆在视口内了，
  * 子菜单跟着它走就行 —— 再写一套边界计算只会多一处会算错的地方。
+ * 唯一的例外是**竖直方向**：「移到项目」那个子菜单随项目数变长，从入口往下展开会出屏幕底部，
+ * 所以面板限高（CSS，超出的在面板里滚动），展开时量一次高度、用 `placeSubmenu` 往上挪到放得下。
  */
 const Submenu: React.FC<{ label: string; children: React.ReactNode }> = ({ label, children }) => {
   const [open, setOpen] = useState(false);
+  const row = useRef<HTMLDivElement | null>(null);
+  const panel = useRef<HTMLDivElement | null>(null);
+  const [top, setTop] = useState<number | null>(null);
+  /* 列表很长时（项目子菜单）往下展开会出屏幕底部：画之前量一次，往上挪到放得下 */
+  useLayoutEffect(() => {
+    if (!open) { setTop(null); return; }
+    const r = row.current, p = panel.current;
+    if (!r || !p) return;
+    setTop(placeSubmenu({
+      rowTop: r.getBoundingClientRect().top,
+      height: p.getBoundingClientRect().height,
+      viewportHeight: window.innerHeight,
+    }));
+  }, [open]);
   return (
     <div
+      ref={row}
       className={`context-menu-item context-submenu${open ? ' open' : ''}`}
       onMouseEnter={() => setOpen(true)}
       onMouseLeave={() => setOpen(false)}
@@ -66,7 +83,11 @@ const Submenu: React.FC<{ label: string; children: React.ReactNode }> = ({ label
     >
       <span className="context-submenu-label">{label}</span>
       <span className="context-submenu-caret">›</span>
-      {open && <div className="context-submenu-panel">{children}</div>}
+      {open && (
+        <div ref={panel} className="context-submenu-panel" style={top === null ? undefined : { top }}>
+          {children}
+        </div>
+      )}
     </div>
   );
 };
@@ -1136,29 +1157,32 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {!ctxSession.id.startsWith('pending_') && (
             <>
               <div className="context-menu-divider" />
-              <div
-                className="context-menu-item"
-                style={{ opacity: 0.6, fontSize: 11, textTransform: 'uppercase', letterSpacing: '0.04em', pointerEvents: 'none' }}
-              >
-                {ctxSession.projectId ? 'Move to project' : 'Assign to project'}
-              </div>
-              {projects.filter((p) => p !== ctxSession.projectId).map((p) => (
-                <div
-                  key={p}
-                  className="context-menu-item"
-                  onClick={() => { onMoveSession(ctxSession.id, p); setContextMenu(null); }}
-                >
-                  🏷️ {p}
-                </div>
-              ))}
-              {ctxSession.projectId && (
-                <div
-                  className="context-menu-item"
-                  onClick={() => { onMoveSession(ctxSession.id, null); setContextMenu(null); }}
-                >
-                  {`⬜ ${t('Unassign')}`}
-                </div>
-              )}
+              {/* 项目一多，平铺的话菜单在屏幕里放不下 —— 收进一个右侧展开的子菜单（面板自己限高、滚动） */}
+              <Submenu label={ctxSession.projectId ? `🏷️ 移到项目：${ctxSession.projectId}` : '🏷️ 归到项目'}>
+                {ctxSession.projectId && (
+                  <>
+                    <div
+                      className="context-menu-item"
+                      onClick={() => { onMoveSession(ctxSession.id, null); setContextMenu(null); }}
+                    >
+                      {`⬜ ${t('Unassign')}`}
+                    </div>
+                    <div className="context-menu-divider" />
+                  </>
+                )}
+                {projects.filter((p) => p !== ctxSession.projectId).map((p) => (
+                  <div
+                    key={p}
+                    className="context-menu-item"
+                    onClick={() => { onMoveSession(ctxSession.id, p); setContextMenu(null); }}
+                  >
+                    🏷️ {p}
+                  </div>
+                ))}
+                {!projects.some((p) => p !== ctxSession.projectId) && (
+                  <div className="context-menu-item disabled" onClick={(e) => e.stopPropagation()}>没有其他项目</div>
+                )}
+              </Submenu>
               {/*
                 **换引擎** ——「我还需要现有会话也能切换 agent 运行类型」。和「运行位置」一样：
                 连着就换执行器（对话不动，上下文随下一条消息带过去），没连着就只改记录。

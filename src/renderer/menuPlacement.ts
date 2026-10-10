@@ -36,3 +36,23 @@ export function placeMenu(opts: {
 
   return { left, top };
 }
+
+/**
+ * 子菜单（右侧展开）竖直方向放哪儿 —— 返回相对入口那一行的 `top`（px）。
+ *
+ * 默认贴着入口（-5px，和面板的 padding 对齐）；往下展开会超出屏幕底部就往上挪到刚好放得下，
+ * 再高也不越过屏幕顶部（CSS 已把面板限高到可见区域内，超出的在面板里滚动）。
+ */
+export function placeSubmenu(opts: {
+  rowTop: number;
+  height: number;
+  viewportHeight: number;
+  margin?: number;
+}): number {
+  const margin = opts.margin ?? 6;
+  const { rowTop, height, viewportHeight: vh } = opts;
+  let top = rowTop - 5;
+  if (top + height > vh - margin) top = vh - margin - height;
+  top = Math.max(margin, top);
+  return top - rowTop;
+}
