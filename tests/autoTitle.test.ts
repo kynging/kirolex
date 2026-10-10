@@ -85,3 +85,31 @@ describe('a chat names itself no matter how the message was delivered', () => {
     assert.match(body, /logger\.info\('title', 'skipped/);
   });
 });
+
+/**
+ * 自动起的标题**也要落盘** —— 手改的名字走 `renameSession`（带 `renameSessionOnDisk`），
+ * 而自动命名原来直接 `setSessions`：侧栏显示得好好的，磁盘记录里 `title` 仍是 `New Chat`，
+ * 重启 / 按记录搜标题时就认不出这条会话。绝大多数会话的名字恰恰是自动起的。
+ */
+describe('自动标题要落盘', () => {
+  const MAYBE = acp.slice(acp.indexOf('const maybeAutoTitle = ('));
+  const BODY = MAYBE.slice(0, MAYBE.indexOf('\n  };'));
+
+  test('两条写入口（模型给的名字、截断兜底）走同一个 applyTitle，而它落盘', () => {
+    const at = BODY.indexOf('const applyTitle =');
+    assert.ok(at > 0, '两处不该各写一遍 —— 写两遍必有一遍忘了落盘');
+    const fn = BODY.slice(at, at + 400);
+    assert.match(fn, /setSessions\(/);
+    assert.match(fn, /renameSessionOnDisk\?\.\(sid, title\)/);
+    assert.match(BODY, /applyTitle\(truncated\)/, '截断兜底走 applyTitle');
+    assert.match(BODY, /applyTitle\(r\.title\)/, '模型给的名字走 applyTitle');
+  });
+
+  test('不再有绕过它的裸 setSessions 改标题', () => {
+    // applyTitle 自己那一句 setSessions 是正路；它之后到函数结尾不该再有
+    const at = BODY.indexOf('const applyTitle =');
+    const rest = BODY.slice(BODY.indexOf('\n    };', at));
+    assert.doesNotMatch(rest, /setSessions\(/, '改标题一律经 applyTitle，否则又会漏掉落盘');
+    assert.equal((BODY.match(/setSessions\(/g) || []).length, 1);
+  });
+});

@@ -803,15 +803,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       .map((m) => m.content).pop();
     // 只在它仍然叫 New Chat 时写:这中间你可能已经自己改过名字。
     const stillNew = () => /^New Chat\b/.test((sessionsRef.current.find((s) => s.id === sid)?.title || '').trim());
+    /* 两条写入口(模型给的名字、截断兜底)都走这里,而它**落盘** —— 原来直接 setSessions,
+       侧栏显示得好好的,磁盘记录里却还是 New Chat,重启后就认不出这条会话。 */
+    const applyTitle = (title: string) => {
+      setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title } : s)));
+      void window.kiroApi.renameSessionOnDisk?.(sid, title);
+    };
     const fallBackToTruncation = () => {
       if (tries + 1 < MAX_TITLE_TRIES) return;
       const truncated = firstUser.slice(0, 40);
-      if (truncated) setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title: truncated } : s)));
+      if (truncated) applyTitle(truncated);
     };
     window.kiroApi.generateTitle?.(firstUser, firstAssistant).then((r) => {
       if (!stillNew()) return;
       if (r?.title) {
-        setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title: r.title! } : s)));
+        applyTitle(r.title);
         titleTriesRef.current.delete(sid);
         return;
       }
