@@ -387,8 +387,9 @@ describe('断开时杀掉整棵远端进程树', () => {
     const body = M.slice(at, at + 3000);
     /* kiro-cli 的会话是单进程独占的：同一个 cliSessionId 不可能同时被两个进程 load */
     assert.match(body, /Session is active in another process/);
-    /* 没连着的时候要说清怎么走出去，而不是一句 Session not connected */
-    assert.match(body, /点一下这条会话（或者直接发一条消息）会自动重连/);
+    /* 没连着的时候不再是一句 Session not connected：休眠时直接写记录、下次挂起时生效（见 dormantSwitch.test.ts） */
+    assert.match(body, /if \(!oldEntry\) \{[\s\S]*?setDormantProfile\(sessionId/);
+    assert.doesNotMatch(body, /throw new Error\('Session not connected'\)/);
   });
 });
 

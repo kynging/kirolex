@@ -8331,25 +8331,56 @@ app.whenReady().then(async () => {
     return setEngineOption(sessionId, category, value);
   });
 
+  /**
+   * **休眠的会话也能改 model / agent / 权限** —— 「❌ Error invoking remote method
+   * 'acp:switch-kiro-agent': Error: Session not connected」。
+   *
+   * 三个 switch 原来都是"没有活的执行器就抛错"。可一次重启之后大多数会话都在休眠 ——
+   * 于是点开任意一条老对话去换 agent，得到的是一句 Electron 的原始报错。而这件事根本不需要
+   * 执行器：kiro-cli 是在**启动进程时**绑定 `--agent` / `--model` 的，所以"下次挂起时用哪个"
+   * 本来就只是记录里的字段（attach 那边读的正是 `existing.profile`）。换引擎 / 换机器早就是
+   * 这么做的（没连着就只改记录），这里补上剩下三条。
+   *
+   * 所以休眠时**写记录、返回成功**，并标 `dormant: true` 让界面别把它标成 attached。
+   * `executorState` 不动 —— 它本来就不是 attached。没有记录才是真错误（attach 那边同样
+   * 拒绝重建，见 "ATTACH MUST NOT CREATE"）。`onlyKiro` 给 model / agent 用：Claude Code /
+   * Codex 会话的这两样不归 kiro 管，休眠时也一样拒绝。
+   */
+  const setDormantProfile = (
+    sessionId: string, patch: Partial<AgentProfile>, what: string, onlyKiro?: string,
+  ): { ok: true; dormant: true } => {
+    const rec = store.readRecord(sessionId);
+    if (!rec) throw new Error('该会话在磁盘上不存在（可能已被删除）。');
+    if (onlyKiro && engineOf(rec.profile) !== 'kiro') throw new Error(onlyKiro);
+    rec.profile = { ...rec.profile, ...patch };
+    store.writeRecord(rec);
+    logger.info('acp', `${what} on dormant session ${sessionId} —— 下次挂起时生效`);
+    return { ok: true, dormant: true };
+  };
+
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
     const oldEntry = sessionClients.get(sessionId);
     /* 模型下拉是 kiro 的清单；Claude Code / Codex 用它们自己 CLI 配的模型（界面上也不显示这个下拉） */
-    if (oldEntry && engineOf(oldEntry.profile) !== 'kiro') {
-      throw new Error(`${ENGINE_LABEL[engineOf(oldEntry.profile)]} 会话的模型在它自己的 CLI 里配，这里还不能切。`);
-    }
+    const notKiroModel = (p: AgentProfile) => `${ENGINE_LABEL[engineOf(p)]} 会话的模型在它自己的 CLI 里配，这里还不能切。`;
+    if (oldEntry && engineOf(oldEntry.profile) !== 'kiro') throw new Error(notKiroModel(oldEntry.profile));
+    const normalizedModel = model.trim() || DEFAULT_MODEL;
     /*
-      **说清怎么走出去** —— 实测用户连着撞了三次：换模型失败之后这条会话是 detached 的
-      （回滚那支会把盘上的状态写成实话），于是再点模型下拉就只有一句 `Session not connected`,
-      而它没有告诉任何人下一步该干什么。重连那条路本来就是可靠的 —— 说出来就行。
+      休眠：`--model` 是启动执行器时绑的，记下来就行（见 `setDormantProfile`）。两个字段一起写 ——
+      `preferredModel` 是"你选的"（attach 只认它），`model` 是"这次用的"；和下面活着那条一样记机器。
     */
     if (!oldEntry) {
-      throw new Error('这条会话现在没有连着执行器，所以还不能换模型。'
-        + '点一下这条会话（或者直接发一条消息）会自动重连，连上之后再换。');
+      const rec = store.readRecord(sessionId);
+      return {
+        ...setDormantProfile(sessionId, {
+          model: normalizedModel, preferredModel: normalizedModel,
+          modelEarnedOn: machineKeyOf(rec?.profile || {}),
+        }, `model -> ${normalizedModel}`, rec ? notKiroModel(rec.profile) : undefined),
+        model: normalizedModel,
+      };
     }
     if (oldEntry.busy) throw new Error('Wait for the current response to finish before switching models.');
     if (reconfiguringSessions.has(sessionId)) throw new Error('Another model, Agent, or permission change is still in progress.');
 
-    const normalizedModel = model.trim() || DEFAULT_MODEL;
     if (oldEntry.profile.model === normalizedModel) return { ok: true, model: normalizedModel };
 
     // Never release/reload a session while an attach is mid-flight on it --
@@ -8459,9 +8490,15 @@ app.whenReady().then(async () => {
     permissionMode: 'auto-approve' | 'ask',
   ) => {
     const entry = sessionClients.get(sessionId);
-    if (!entry) throw new Error('Session not connected');
-
     const normalizedMode = permissionMode === 'ask' ? 'ask' : 'auto-approve';
+    /* 休眠：写记录就够了 —— 下次挂起时按记录起（见 `setDormantProfile`） */
+    if (!entry) {
+      return {
+        ...setDormantProfile(sessionId, { permissionMode: normalizedMode }, `permission -> ${normalizedMode}`),
+        permissionMode: normalizedMode,
+      };
+    }
+
     entry.client.setPermissionMode(normalizedMode);
     entry.profile.permissionMode = normalizedMode;
 
@@ -8483,12 +8520,18 @@ app.whenReady().then(async () => {
   // receives the normal layered-memory injection on its next prompt.
   ipcMain.handle('acp:switch-kiro-agent', async (_event, sessionId: string, agentName: string) => {
     const oldEntry = sessionClients.get(sessionId);
-    if (!oldEntry) throw new Error('Session not connected');
+    const normalizedAgent = agentName.trim() || undefined;
+    /* 休眠：`--agent` 是启动执行器时才绑的，所以现在只需要记下"下次用哪个"（见 `setDormantProfile`） */
+    if (!oldEntry) {
+      return {
+        ...setDormantProfile(sessionId, { kiroAgent: normalizedAgent }, `agent -> ${normalizedAgent || '(default)'}`, 'kiro agent 只对 Kiro 会话有用。'),
+        kiroAgent: normalizedAgent || '',
+      };
+    }
     if (engineOf(oldEntry.profile) !== 'kiro') throw new Error('kiro agent 只对 Kiro 会话有用。');
     if (oldEntry.busy) throw new Error('Wait for the current response to finish before switching agents.');
     if (reconfiguringSessions.has(sessionId)) throw new Error('Another model, Agent, or permission change is still in progress.');
 
-    const normalizedAgent = agentName.trim() || undefined;
     if (oldEntry.profile.kiroAgent === normalizedAgent) {
       return { ok: true, kiroAgent: normalizedAgent || '' };
     }

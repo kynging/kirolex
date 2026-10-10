@@ -4341,7 +4341,13 @@ ${text}`,
       // "Session not connected"): if this session isn't attached yet, attach it
       // first, then perform the agent switch.
       if (!attachedIdsRef.current.has(sessionId)) {
-        try { await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId)); addAttached(sessionId); } catch {}
+        /*
+          **挂不上不是死路** —— 主进程允许在休眠状态下改（只写记录，下次挂起时生效），
+          所以这里挂不上也照旧往下走；但**把真实原因打出来**：原来这个 `catch {}` 是空的，
+          真实原因被吞掉，接着 switch 抛一句和原因无关的 "Session not connected"。
+        */
+        try { await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId)); addAttached(sessionId); }
+        catch (e: any) { console.warn('[kirolex] 换 agent 前挂起失败（改动会记在下次挂起时生效）:', e?.message || e); }
       }
       const result = await window.kiroApi.switchKiroAgent(sessionId, kiroAgent);
       if (result?.ok) {
@@ -4350,7 +4356,8 @@ ${text}`,
             ? { ...session, kiroAgent: result.kiroAgent || undefined }
             : session
         )));
-        addAttached(sessionId);
+        /* 休眠那条路只写了记录，执行器仍然没起来 —— 标成 attached 会让界面说谎（点亮那个绿点） */
+        if (!result.dormant) addAttached(sessionId);
       }
     } catch (err: any) {
       noteError(sessionId, err?.message || 'Failed to switch agent');
@@ -4371,7 +4378,9 @@ ${text}`,
       // Wait for the backend to be connected before switching the model: attach
       // the session first if it isn't live yet, then switch.
       if (!attachedIdsRef.current.has(sessionId)) {
-        try { await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId)); addAttached(sessionId); } catch {}
+        /* 挂不上照旧往下走（主进程允许休眠时改，只写记录）—— 但把真实原因打出来，见换 agent 那段 */
+        try { await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId)); addAttached(sessionId); }
+        catch (e: any) { console.warn('[kirolex] 换模型前挂起失败（改动会记在下次挂起时生效）:', e?.message || e); }
       }
       const result = await window.kiroApi.switchModel(sessionId, model);
       // Only the BACKEND decides what is in effect. A non-ok result used to leave
@@ -4385,7 +4394,8 @@ ${text}`,
       setSessions((prev) => prev.map((session) => (
         session.id === sessionId ? { ...session, model: result.model } : session
       )));
-      addAttached(sessionId);
+      /* 休眠那条路只写了记录 —— 标 attached 会让那个绿点说谎 */
+      if (!result.dormant) addAttached(sessionId);
       return result.model as string;
     } catch (err: any) {
       noteError(sessionId, err?.message || 'Failed to switch model');

@@ -170,9 +170,9 @@ declare global {
       listKiroAgents: (machine?: string) => Promise<{ agents: Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>; error?: string }>;
       openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => Promise<{ opened: boolean; path?: string; content?: string; error?: string }>;
       saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => Promise<{ saved: boolean; path?: string; error?: string }>;
-      switchKiroAgent: (sessionId: string, agentName: string) => Promise<{ ok: boolean; kiroAgent: string }>;
-      switchModel: (sessionId: string, model: string) => Promise<{ ok: boolean; model: string }>;
-      switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') => Promise<{ ok: boolean; permissionMode: 'auto-approve' | 'ask' }>;
+      switchKiroAgent: (sessionId: string, agentName: string) => Promise<{ ok: boolean; kiroAgent: string; dormant?: boolean }>;
+      switchModel: (sessionId: string, model: string) => Promise<{ ok: boolean; model: string; dormant?: boolean }>;
+      switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') => Promise<{ ok: boolean; permissionMode: 'auto-approve' | 'ask'; dormant?: boolean }>;
       deleteSession: (sessionId: string) => Promise<{ ok: boolean; tombstoned?: boolean; error?: string }>;
       assignProject: (sessionId: string, projectId: string) => Promise<{ sessionId: string; projectId: string }>;
       setProject: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
