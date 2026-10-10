@@ -1,4 +1,5 @@
 import { LANG_OPTIONS, normalizeLang } from '../i18n';
+import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN } from '../uiZoom';
 import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
@@ -131,6 +132,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   onConfirmDeletesChange,
 }) => {
   const t = useT();
+  const zoom = normalizeUiZoom(settings.uiZoom);
   // Executor cap (max concurrent connected sessions). 0/'' in the input = auto.
   /* 打开时停在「机器」那一页 —— 那是当前在配的东西；不记住上次选的哪一页（多一份状态，
      换来的只是"上次我在哪"，而每次打开设置的理由通常都不一样）。 */
@@ -380,7 +382,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             </div>
 
             <div className="settings-item">
-              <label className="settings-label">{t('Font size')}</label>
+              <label className="settings-label">{t('Chat font size')}</label>
               <div className="settings-control">
                 <button
                   className="settings-btn"
@@ -394,6 +396,37 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   onClick={() => onChange({ ...settings, fontSize: Math.min(22, settings.fontSize + 1) })}
                 >
                   +
+                </button>
+              </div>
+            </div>
+
+            {/* 界面缩放：整窗按比例缩放（文字、图标、按钮、间距一起变）；Ctrl(⌘) + 加号 / 减号 / 0 改的也是这个值 */}
+            <div className="settings-item">
+              <label className="settings-label" title={t('Ctrl + plus / minus / 0 also work (⌘ on macOS)')}>{t('Interface zoom')}</label>
+              <div className="settings-control">
+                <button
+                  className="settings-btn"
+                  disabled={zoom <= UI_ZOOM_MIN}
+                  onClick={() => onChange({ ...settings, uiZoom: stepUiZoom(zoom, 'out') })}
+                >
+                  −
+                </button>
+                <span className="settings-value">{zoom}%</span>
+                <button
+                  className="settings-btn"
+                  disabled={zoom >= UI_ZOOM_MAX}
+                  onClick={() => onChange({ ...settings, uiZoom: stepUiZoom(zoom, 'in') })}
+                >
+                  +
+                </button>
+                <button
+                  className="settings-btn"
+                  style={{ width: 'auto', padding: '0 10px', fontSize: 12 }}
+                  disabled={zoom === UI_ZOOM_DEFAULT}
+                  title={t('Back to 100% (Ctrl + 0)')}
+                  onClick={() => onChange({ ...settings, uiZoom: stepUiZoom(zoom, 'reset') })}
+                >
+                  {t('Reset')}
                 </button>
               </div>
             </div>

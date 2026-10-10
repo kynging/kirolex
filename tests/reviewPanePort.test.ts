@@ -276,7 +276,9 @@ test('reload 之后 comment 侧栏还在：标签连同主人会话一起存、�
 });
 
 test('右侧 comment 栏拖宽有上限：窗口宽 − 侧栏 − 会话区最小宽度（Windows 宽屏上不再把左边挤没）', () => {
-  assert.ok(APP.includes('const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarCollapsed ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));'));
+  assert.ok(APP.includes('const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarHidden ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));'));
+  /* 侧栏「实际收没收」= 用户收起 或 窗口放不下时临时让位（panelFit.ts） */
+  assert.ok(APP.includes('const sidebarHidden = sidebarCollapsed || autoFold.sidebar;'));
   assert.ok(APP.includes('const newWidth = Math.max(FILE_PANEL_MIN, Math.min(fileViewerMax, startWidth + startX - ev.clientX));'));
   /* 显示也夹住 —— 窗口变窄 / 侧栏打开时不越界 */
   assert.ok(APP.includes('style={{ width: fileViewerShown }}>'));
@@ -284,7 +286,8 @@ test('右侧 comment 栏拖宽有上限：窗口宽 − 侧栏 − 会话区最�
 
 test('写完的标记有 ✎ 修改按钮；预览栏能藏起来（标签留着，贴边那个按钮放回来，点开文件也放回来）', () => {
   assert.ok(RV.includes('title="修改这条标记" onClick={reopen}>✎</button>'));
-  assert.ok(APP.includes('onClick={() => setFileViewerHidden(!fileViewerHidden)}'));
+  assert.ok(APP.includes('if (previewHidden) { setFileViewerHidden(false); setPanelPins((p) => ({ ...p, previewAt: winWidth })); }'));
+  assert.ok(APP.includes('else setFileViewerHidden(true);'));
   assert.ok(APP.includes('if (!tabsRestoringRef.current) setFileViewerHidden(false);'));
   assert.ok(APP.includes("restoreSet('kirolex-fileviewer-hidden', fileViewerHidden ? '1' : null);"));
 });

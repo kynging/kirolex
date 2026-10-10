@@ -161,7 +161,11 @@ const ZH: Record<string, string> = {
 
   // ── 设置 ─────────────────────────────────────────────────────────────────
   'Interface language': '界面语言',
-  'Font size': '字号',
+  'Chat font size': '聊天字号',
+  'Interface zoom': '界面缩放',
+  'Ctrl + plus / minus / 0 also work (⌘ on macOS)': '也可以按 Ctrl + 加号 / 减号 / 0（macOS 上是 ⌘）',
+  'Back to 100% (Ctrl + 0)': '回到 100%（Ctrl + 0）',
+  'Reset': '重置',
   'UI font': '界面字体',
   'Code font': '代码字体',
   'System default': '系统默认',

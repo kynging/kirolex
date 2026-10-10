@@ -4,9 +4,11 @@ import { type SubagentRow } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
 import { restoreGet, restoreSet, restoreGetJson } from './uiRestore';
 import { normalizeLang, type Lang } from './i18n';
+import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT } from './uiZoom';
 import { LangProvider, useT } from './hooks/useLang';
 import { useRemoteTargets } from './hooks/useRemoteTargets';
 import { carrySplitSizes, computePaneFlex, SplitSizes } from './splitLayout';
+import { autoFoldPanels } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
 import { schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
@@ -487,7 +489,10 @@ export interface SessionFolder {
 }
 
 export interface Settings {
+  /** 聊天字号（px）：只管聊天内容区的字。整窗放大缩小是 `uiZoom`。 */
   fontSize: number;
+  /** 界面缩放，整数百分比（80～200，一档 10，默认 100），整窗按比例缩放，见 `uiZoom.ts`。 */
+  uiZoom: number;
   /** Font stack for all UI/chat text. Empty = system default. */
   fontFamily: string;
   /** Font stack for code blocks and file paths. Empty = built-in mono stack. */
@@ -529,7 +534,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -716,6 +721,8 @@ function loadSettings(): Settings {
       if (!SPLIT_GRIDS[merged.splitGrid]) merged.splitGrid = '2x2';
       // 存量 settings 里没有 language；坏值也一律退回中文（见 normalizeLang）
       merged.language = normalizeLang(merged.language);
+      // 存量 settings 里没有 uiZoom → 100%；坏值 / 越界的也规整回范围（见 normalizeUiZoom）
+      merged.uiZoom = normalizeUiZoom(merged.uiZoom);
       return merged;
     }
   } catch {}
@@ -2661,6 +2668,23 @@ const App: React.FC = () => {
     document.documentElement.style.setProperty('--chat-font-size', `${settings.fontSize}px`);
   }, [settings.fontSize]);
 
+  // 界面缩放：整窗按比例缩放（webFrame.setZoomFactor，和浏览器整页缩放一样，
+  // 拖分栏 / 菜单定位用的 clientX、getBoundingClientRect 都在同一套 CSS px 里，不会错位）
+  useEffect(() => {
+    (window as any).kiroApi?.setUiZoom?.(normalizeUiZoom(settings.uiZoom) / 100);
+  }, [settings.uiZoom]);
+
+  // Ctrl(⌘) + 加号 / 减号 / 0：主进程拦下后转过来，改的就是设置里这个值（设置对话框的数字跟着变）
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onUiZoomKey?.((action: 'in' | 'out' | 'reset') => {
+      setSettings((cur) => {
+        const next = stepUiZoom(cur.uiZoom, action);
+        return next === cur.uiZoom ? cur : { ...cur, uiZoom: next };
+      });
+    });
+    return () => { try { off?.(); } catch { /* 卸载 */ } };
+  }, []);
+
   // Font families are applied as CSS variables so every surface (chat, sidebar,
   // dialogs, code blocks) follows the setting without per-component overrides.
   useEffect(() => {
@@ -3410,14 +3434,31 @@ const App: React.FC = () => {
   */
   const [fileViewerHidden, setFileViewerHidden] = useState(() => restoreGet('kirolex-fileviewer-hidden') === '1');
   useEffect(() => { restoreSet('kirolex-fileviewer-hidden', fileViewerHidden ? '1' : null); }, [fileViewerHidden]);
-  const previewOwnsFind = findOwner({ previewShown: !!fileViewer && !fileViewerHidden, focusInPreview }) === 'preview';
   const [winWidth, setWinWidth] = useState(() => window.innerWidth);
   useEffect(() => {
     const onResize = () => setWinWidth(window.innerWidth);
     window.addEventListener('resize', onResize);
     return () => window.removeEventListener('resize', onResize);
   }, []);
-  const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarCollapsed ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));
+  /*
+    **窗口放不下时两边的栏临时让位** —— 界面缩放调大以后（1024 宽的窗口开 200% 只剩 512 CSS px），
+    侧栏 + 预览栏的最低宽度会把聊天区挤没。这里只算「这一刻要不要临时收起」，不改、不存用户自己的开关；
+    用户在当前宽度下亲手点开的那一栏（panelPins，记的是点开时的窗口宽度）不收。规则见 panelFit.ts。
+  */
+  const [panelPins, setPanelPins] = useState<{ sidebarAt: number | null; previewAt: number | null }>({ sidebarAt: null, previewAt: null });
+  const autoFold = autoFoldPanels({
+    winWidth,
+    sidebarWidth,
+    sidebarCollapsed,
+    previewOpen: !!(fileViewerLoading || fileViewer) && !fileViewerHidden,
+    previewWidth: FILE_PANEL_MIN,
+    pinnedSidebar: panelPins.sidebarAt === winWidth,
+    pinnedPreview: panelPins.previewAt === winWidth,
+  });
+  const sidebarHidden = sidebarCollapsed || autoFold.sidebar;
+  const previewHidden = fileViewerHidden || autoFold.preview;
+  const previewOwnsFind = findOwner({ previewShown: !!fileViewer && !previewHidden, focusInPreview }) === 'preview';
+  const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarHidden ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));
   const fileViewerShown = Math.min(fileViewerWidth, fileViewerMax);
   const handleFileResizeStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
@@ -3775,7 +3816,7 @@ const App: React.FC = () => {
           </div>
         )}
         <Toasts />
-        {!sidebarCollapsed && (
+        {!sidebarHidden && (
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>
             <Sidebar
               sessions={sessions}
@@ -3905,15 +3946,19 @@ const App: React.FC = () => {
           </div>
         )}
         <div className="sidebar-resize-area">
-          {!sidebarCollapsed && (
+          {!sidebarHidden && (
             <div className="sidebar-resize-handle" onMouseDown={handleResizeStart} />
           )}
           <button
             className="side-collapse-btn sidebar-collapse-btn"
-            onClick={() => setSidebarCollapsed(!sidebarCollapsed)}
-            title={sidebarCollapsed ? 'Show sidebar' : 'Hide sidebar'}
+            onClick={() => {
+              // 点开时记下当前宽度：窗口放不下时这一栏也不被自动收回去（panelPins）
+              if (sidebarHidden) { setSidebarCollapsed(false); setPanelPins((p) => ({ ...p, sidebarAt: winWidth })); }
+              else setSidebarCollapsed(true);
+            }}
+            title={sidebarHidden ? 'Show sidebar' : 'Hide sidebar'}
           >
-            {sidebarCollapsed ? '▶' : '◀'}
+            {sidebarHidden ? '▶' : '◀'}
           </button>
         </div>
         {/*
@@ -3994,12 +4039,15 @@ const App: React.FC = () => {
             <button
               type="button"
               className="side-collapse-btn file-collapse-btn"
-              onClick={() => setFileViewerHidden(!fileViewerHidden)}
-              title={fileViewerHidden ? `显示预览栏（${fileTabs.length} 个标签）` : '隐藏预览栏（标签都留着）'}
-            >{fileViewerHidden ? '◀' : '▶'}</button>
+              onClick={() => {
+                if (previewHidden) { setFileViewerHidden(false); setPanelPins((p) => ({ ...p, previewAt: winWidth })); }
+                else setFileViewerHidden(true);
+              }}
+              title={previewHidden ? `显示预览栏（${fileTabs.length} 个标签）` : '隐藏预览栏（标签都留着）'}
+            >{previewHidden ? '◀' : '▶'}</button>
           </div>
         )}
-        {(fileViewerLoading || fileViewer) && !fileViewerHidden && (
+        {(fileViewerLoading || fileViewer) && !previewHidden && (
           <div className="workspace-file-panel" role="complementary" aria-label="File preview" style={{ width: fileViewerShown }}>
             <div className="file-resize-handle" onMouseDown={handleFileResizeStart} title={t('Drag to resize width')} />
             {/*

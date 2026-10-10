@@ -76,6 +76,7 @@ import {
 } from './deckPreview.ts';
 import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.ts';
 import { logger } from './logger';
+import { zoomKeyAction } from './zoomKeys.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
 // It fires because the Vite dev server is served without a CSP (a strict CSP would
@@ -4787,6 +4788,18 @@ function createWindow() {
     if (/^(file:|http:\/\/localhost:5173)/i.test(url) && !EXTERNAL_SCHEME.test(url)) return; // own UI
     event.preventDefault();
     if (EXTERNAL_SCHEME.test(url)) void shell.openExternal(url);
+  });
+
+  /*
+    **界面缩放快捷键**：Ctrl(⌘) + 加号 / 减号 / 0。在这里拦，不在页面 keydown 里拦：
+    这里先于页面拿到按键，光标在输入框里也一样；macOS 自带菜单的 ⌘=/⌘-/⌘0 也被挡下，
+    不会绕过设置自己改缩放。真正的值在渲染端的设置里（settings.uiZoom），这里只把「哪一下」告诉它。
+  */
+  mainWindow.webContents.on('before-input-event', (event, input) => {
+    const action = zoomKeyAction(input, process.platform);
+    if (!action) return;
+    event.preventDefault();
+    mainWindow?.webContents.send('app:ui-zoom-key', action);
   });
 
   // Renderer load lifecycle: this is the phase that owns most of the unexplained

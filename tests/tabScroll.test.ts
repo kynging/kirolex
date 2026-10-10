@@ -108,5 +108,6 @@ test('scroll restore re-runs when the preview body mounts again (panel was hidde
   assert.ok(/const setFileBody = useCallback\(\(node: HTMLDivElement \| null\) => \{\s*fileBodyRef\.current = node;\s*setFileBodyNode\(node\);/.test(APP));
   assert.ok(APP.includes('}, [activeFileTabId, fileViewer?.content, scrollRestoreTick, fileBodyNode]);'));
   /* 藏着的时候容器确实不渲染 —— 这正是需要上面那一条的原因 */
-  assert.ok(APP.includes('{(fileViewerLoading || fileViewer) && !fileViewerHidden && ('));
+  assert.ok(APP.includes('{(fileViewerLoading || fileViewer) && !previewHidden && ('));
+  assert.ok(APP.includes('const previewHidden = fileViewerHidden || autoFold.preview;'));
 });

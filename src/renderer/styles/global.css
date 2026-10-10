@@ -3426,6 +3426,17 @@ button, input, select, textarea {
   /* Always keep the composer and its控件 row on screen: it sizes to content and
      never gets squeezed by the transcript above it. */
   flex: 0 0 auto;
+  /* 但也不能比聊天区本身还高：窗口很矮（或界面缩放调大、按 CSS px 算变矮）时，上面那排推荐问题
+     会把输入框推出窗口底部。封顶在聊天区高度，多出来的由推荐问题那一块自己滚动（见下一条）。
+     减掉的 62px = 上面消息列表缩到最小也留着的上下 padding（.chat-messages 24px × 2）+ 拖高输入框那条（.input-resize-area 14px）。 */
+  max-height: calc(100% - 62px);
+}
+
+/* 推荐问题 / 回复里的选项：空间不够时它先让，自己滚动 —— 输入框和发送键始终留在窗口里 */
+.chat-input-area > .prompt-suggestions {
+  flex: 0 1 auto;
+  min-height: 0;
+  overflow-y: auto;
 }
 
 .permission-bar {
@@ -3861,6 +3872,18 @@ button, input, select, textarea {
    2x2 split only reaches here on a small window. */
 @container pane (max-width: 380px) {
   .composer-shortcut { display: none; }
+  /* 再窄（小窗口分屏、或界面缩放调大以后栏宽按 CSS px 算变窄了）一行放不下时**换行**，
+     不能让 .composer-controls（min-width:0）缩到比按钮还窄、按钮溢出去压在发送键上。
+     发送键留在右边（margin-left:auto）。 */
+  .composer-toolbar { flex-wrap: wrap; row-gap: 4px; }
+  .composer-controls { flex-wrap: wrap; row-gap: 4px; }
+  .composer-send { margin-left: auto; }
+}
+
+/* 极窄：权限模式那颗按钮只留图标（文字靠 title 提示），下拉框的版本限宽 */
+@container pane (max-width: 260px) {
+  button.composer-mode { font-size: 0; gap: 0; padding: 0 8px; }
+  .composer-mode.composer-mode-select { max-width: 96px; }
 }
 
 .composer-belowbar-left,

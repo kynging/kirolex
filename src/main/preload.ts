@@ -1,4 +1,4 @@
-import { contextBridge, ipcRenderer } from 'electron';
+import { contextBridge, ipcRenderer, webFrame } from 'electron';
 
 /** Shared UI state (project groups, split layout, settings, widths…).
  *
@@ -172,6 +172,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
     const handler = (_event: any, data: { maximized: boolean; height: number }) => callback(data);
     ipcRenderer.on('window:maximized', handler);
     return () => ipcRenderer.removeListener('window:maximized', handler);
+  },
+  /** 界面缩放（整窗，像浏览器整页缩放）。factor = 百分比 / 100，值由渲染端的设置 uiZoom 决定 */
+  setUiZoom: (factor: number) => { webFrame.setZoomFactor(factor); },
+  /** Ctrl(⌘) + 加号 / 减号 / 0 —— 主进程 before-input-event 拦下后转过来（见 zoomKeys.ts） */
+  onUiZoomKey: (callback: (action: 'in' | 'out' | 'reset') => void) => {
+    const handler = (_event: any, action: 'in' | 'out' | 'reset') => callback(action);
+    ipcRenderer.on('app:ui-zoom-key', handler);
+    return () => ipcRenderer.removeListener('app:ui-zoom-key', handler);
   },
   splashStatus: (text: string) => ipcRenderer.invoke('acp:splash-status', text),
   deleteProjectMemory: (projectId: string) => ipcRenderer.invoke('acp:delete-project-memory', projectId),
