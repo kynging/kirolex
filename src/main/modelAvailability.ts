@@ -90,6 +90,45 @@ export function pickAvailableModel(wanted: string, available: string[], order: s
 }
 
 /**
+ * **起执行器时第一个该试的模型** —— 和 `connectWithModelFallback` 排候选的规则一致：
+ * 你选的（`preferredModel`）优先；没有就用**在这台机器上**挣来的 `model`；都没有就用兜底链第一个。
+ *
+ * 不在这台机器上挣来的 `model` 不采信（见 config.ts 里 `modelEarnedOn` 那段）：拿它去问远端清单，
+ * 一条在本机被降级成 deepseek 的会话到了远端还会被"验证通过"、继续跑 deepseek。
+ */
+export function firstWantedModel(
+  profile: { model?: string; preferredModel?: string; modelEarnedOn?: string },
+  machine: string,
+  order: string[],
+): string {
+  const earned = profile.modelEarnedOn && profile.modelEarnedOn === machine ? profile.model : undefined;
+  return profile.preferredModel || earned || order[0] || profile.model || '';
+}
+
+/** 远端清单里没有想要的模型时挑哪个：兜底链里第一个远端有的；都没有就清单里第一个非 `auto` 的；再没有就 `auto`。 */
+export function remoteFallbackModel(models: string[], order: string[]): string {
+  return order.find((m) => models.includes(m)) || models.find((m) => m !== 'auto') || 'auto';
+}
+
+/**
+ * **远程会话的启动候选，按那台机器的清单过滤** —— 本机的兜底链不等于远端有的模型。
+ *
+ * 不过滤的话：远端没有的模型排在前面照样 `connect()` 成功（kiro-cli 只在真跑一轮时才报），
+ * 然后 kiro-cli **静默退回**它自己的默认模型 —— `pickRemoteModel` 在会话里说的"改用 X"就成了假话。
+ *
+ * 顺序保持调用方给的（第一个是 `pickRemoteModel` 已经验过的那个），只删掉清单里没有的；
+ * 删完如果一个都不剩，补上 `remoteFallbackModel` 挑的那个，所以结果永远是那台机器真有的模型。
+ * **清单为空时原样返回**（去重）—— 没探到清单就没有依据删任何东西。
+ */
+export function remoteStartCandidates(candidates: string[], models: string[], order: string[]): string[] {
+  const unique = candidates.filter((m, i, arr) => !!m && arr.indexOf(m) === i);
+  if (!models.length) return unique;
+  const kept = unique.filter((m) => models.includes(m));
+  const last = remoteFallbackModel(models, order);
+  return kept.includes(last) ? kept : [...kept, last];
+}
+
+/**
  * 把模型**钉进 agent JSON** —— 因为 `--model` 不管用（见文件头第 2 条）。
  *
  * 只在真的不一样时写盘：这个函数在每次标题/建议调用前都会跑一遍，而那是几秒一次的频率。

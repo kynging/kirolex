@@ -3,7 +3,7 @@ import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { parseModelList, pickAvailableModel, pinAgentModel } from '../src/main/modelAvailability.ts';
+import { parseModelList, pickAvailableModel, pinAgentModel, firstWantedModel, remoteFallbackModel, remoteStartCandidates } from '../src/main/modelAvailability.ts';
 
 /*
  * 「claude-opus-5 is not available 这条你要不要查」→ 查了，是**两件独立的事**叠在一起，
@@ -139,8 +139,8 @@ describe('模型可用性：清单、挑选、钉进 agent', () => {
   });
 
   test('两个调用点都把 sessionId 传进去了（不传就只进日志）', () => {
-    assert.match(M, /connectWithModelFallback\(profile, 'new-session', startLocalTools, kiroLexId\)/);
-    assert.match(M, /connectWithModelFallback\(profile, `attach \$\{sessionId\}`, localTools, sessionId\)/);
+    assert.match(M, /connectWithModelFallback\(profile, 'new-session', startLocalTools, kiroLexId, remoteModels\)/);
+    assert.match(M, /connectWithModelFallback\(profile, `attach \$\{sessionId\}`, localTools, sessionId, remoteModels\)/);
   });
 
   test('清单探测失败不缓存空值 —— 空是"这次没依据"', () => {
@@ -211,5 +211,76 @@ describe('模型可用性按机器分', () => {
     assert.match(M, /modelEarnedOn: machineKeyOf\(oldEntry\.profile\)/);
     /* attach 构造 profile 时要带着走，否则每次 attach 都当成"没记" */
     assert.match(M, /modelEarnedOn: existing\?\.profile\.modelEarnedOn,/);
+  });
+});
+
+/*
+ * **远程会话的启动候选要按那台机器的清单来** —— 审查意见：远程启动仍用 preferredModel、earned 和
+ * 本机 MODEL_FALLBACK_ORDER 拼候选；`pickRemoteModel` 挑出来的 `profile.model` 没有 `modelEarnedOn`
+ * 就被丢掉，而远端清单里没有的偏好模型排第一。`connect()` 对它照样成功，kiro-cli 随后静默退回默认模型，
+ * 会话里那句"改用 X"成了假话。
+ */
+describe('远程会话的模型回退按那台机器的清单', () => {
+  const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+  const ORDER = ['gpt-5.6-sol', 'gpt-5.6-terra', 'deepseek-3.2'];
+  const TOKYO = 'ec2-user@tokyo';
+
+  test('第一个该试的：偏好 > 在这台机器上挣来的 > 兜底链第一个；别的机器挣来的不算', () => {
+    assert.equal(firstWantedModel({ model: 'deepseek-3.2', preferredModel: 'claude-opus-5', modelEarnedOn: TOKYO }, TOKYO, ORDER), 'claude-opus-5');
+    assert.equal(firstWantedModel({ model: 'deepseek-3.2', modelEarnedOn: TOKYO }, TOKYO, ORDER), 'deepseek-3.2');
+    /* 本机降级挣来的 deepseek 到了东京不算数 —— 这正是 26 条会话那次的 bug */
+    assert.equal(firstWantedModel({ model: 'deepseek-3.2', modelEarnedOn: 'local' }, TOKYO, ORDER), 'gpt-5.6-sol');
+    assert.equal(firstWantedModel({ model: 'deepseek-3.2' }, TOKYO, ORDER), 'gpt-5.6-sol');
+  });
+
+  test('远端挑不到想要的：兜底链里远端有的 > 清单里第一个非 auto > auto', () => {
+    assert.equal(remoteFallbackModel(['auto', 'deepseek-3.2', 'gpt-5.6-terra'], ORDER), 'gpt-5.6-terra');
+    assert.equal(remoteFallbackModel(['auto', 'glm-5'], ORDER), 'glm-5');
+    assert.equal(remoteFallbackModel(['auto'], ORDER), 'auto');
+  });
+
+  test('候选只留远端有的，顺序不变；挑出来的那个排第一', () => {
+    const remote = ['auto', 'claude-opus-5.5', 'gpt-5.6-terra', 'deepseek-3.2'];
+    /* 偏好 claude-opus-5 远端没有 → pickRemoteModel 挑了 gpt-5.6-terra；它必须排第一，opus-5 和 sol 不许出现 */
+    assert.deepEqual(
+      remoteStartCandidates(['gpt-5.6-terra', 'claude-opus-5', ...ORDER], remote, ORDER),
+      ['gpt-5.6-terra', 'deepseek-3.2'],
+    );
+    /* 偏好远端有 → 它第一 */
+    assert.deepEqual(
+      remoteStartCandidates(['claude-opus-5.5', 'claude-opus-5.5', ...ORDER], remote, ORDER),
+      ['claude-opus-5.5', 'gpt-5.6-terra', 'deepseek-3.2'],
+    );
+  });
+
+  test('过滤完一个不剩：补上远端真有的那个，绝不交出远端没有的模型', () => {
+    const remote = ['auto', 'glm-5'];
+    const out = remoteStartCandidates(['claude-opus-5', ...ORDER], remote, ORDER);
+    assert.deepEqual(out, ['glm-5']);
+    for (const m of out) assert.ok(remote.includes(m), `${m} 不在远端清单里`);
+  });
+
+  test('清单为空（没探到）= 没依据：原样（去重）返回，不删任何东西', () => {
+    assert.deepEqual(
+      remoteStartCandidates(['claude-opus-5', 'claude-opus-5', ...ORDER, ''], [], ORDER),
+      ['claude-opus-5', ...ORDER],
+    );
+  });
+
+  test('接线：connectWithModelFallback 远程时把挑出来的排第一并按远端清单过滤', () => {
+    assert.match(M, /remoteStartCandidates\(\[profile\.model, \.\.\.base\], remoteModels \|\| \[\], MODEL_FALLBACK_ORDER\)/);
+    assert.match(M, /const remotePicked = !!profile\.remote\?\.sshHost && !!remoteModels;/);
+  });
+
+  test('接线：每条经 connectWithModelFallback 起远程 kiro 的路都把远端清单传进去', () => {
+    const calls = M.match(/await connectWithModelFallback\([^;]*\);/g) || [];
+    assert.equal(calls.length, 3, '新建 / 换引擎 / attach');
+    for (const c of calls) assert.match(c, /, remoteModels\);$/, `没传远端清单：${c}`);
+  });
+
+  test('接线：pickRemoteModel 验的是"第一个该试的"，不是记录里可能是别的机器挣来的 model', () => {
+    const picks = M.match(/= pickRemoteModel\([^;]*\);/g) || [];
+    assert.equal(picks.length, 4, '新建 / 换机器 / 换引擎 / attach');
+    for (const p of picks) assert.match(p, /firstWantedModel\(profile, machineKeyOf\(profile\), MODEL_FALLBACK_ORDER\)/);
   });
 });

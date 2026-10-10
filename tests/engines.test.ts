@@ -245,7 +245,7 @@ describe('已有会话换引擎 ——「我还需要现有会话也能切换 ag
     assert.match(body, /if \(!oldEntry\) \{[\s\S]*?rec0\.profile = reshape\(rec0\.profile\);/);
     assert.match(body, /if \(oldEntry\.busy\) throw new Error/);
     assert.match(body, /if \(engine !== 'kiro'\) await remoteAdapterCheck\(profile\.remote, engine\);/, '远程会话换到 Claude/Codex 先查适配器');
-    assert.match(body, /const started = await connectWithModelFallback\(profile, 'switch-engine', localTools, sessionId\);/);
+    assert.match(body, /const started = await connectWithModelFallback\(profile, 'switch-engine', localTools, sessionId, remoteModels\);/);
     assert.ok(body.indexOf('await client.newSession(') < body.indexOf('await oldEntry.client.disconnect()'), '先起新的、再断旧的');
     assert.match(body, /restoreContextAfterExecutorSwap\(sessionId, 'switch-engine'\);/);
     assert.match(body, /webContents\.send\('session:engine-changed', \{ sessionId, engine \}\)/);

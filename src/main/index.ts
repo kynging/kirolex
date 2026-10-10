@@ -14,7 +14,7 @@ import {
   remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
 } from './kiroConfig';
 import { rewriteImagePaths } from './imagePaths';
-import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel } from './modelAvailability.ts';
+import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
 import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } from './reachability.ts';
 import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
@@ -463,6 +463,11 @@ async function connectWithModelFallback(
   localTools?: { remotePort: number; localPort: number; agentOverride: string },
   /** 有它才能在会话里说一句"你选的模型这台机器上没有"。没有就只进日志。 */
   sessionId?: string,
+  /**
+   * 远程 kiro 会话：preflight 问到的那台机器的模型清单。传了它就表示 `profile.model` 是
+   * `pickRemoteModel` 按这份清单挑过的 —— 它排第一，而且候选只留清单里有的（见 `remoteStartCandidates`）。
+   */
+  remoteModels?: string[],
 ): Promise<{ client: AcpClient; model: string }> {
   /*
     **Claude Code / Codex 不走这套降级** —— 下面的模型清单、"哪个模型在这台机器上挣来的"、
@@ -492,13 +497,27 @@ async function connectWithModelFallback(
   */
   const earnedHere = !!profile.modelEarnedOn && profile.modelEarnedOn === machine;
   const earned = earnedHere ? profile.model : undefined;
-  if (!earnedHere && profile.model) {
+  /* 远程且带着清单：`profile.model` 是 `pickRemoteModel` 刚按那台机器的清单挑的，不是记录里的旧值 */
+  const remotePicked = !!profile.remote?.sshHost && !!remoteModels;
+  if (!earnedHere && profile.model && !remotePicked) {
     logger.info('model', `${label}: 记录里的 '${profile.model}' 不是在 ${machine} 上挣来的`
       + `（记着 ${profile.modelEarnedOn || '没记'}）—— 不采信它，回到偏好模型`);
   }
-  const all: string[] = [profile.preferredModel, earned, ...MODEL_FALLBACK_ORDER]
+  const base: string[] = [profile.preferredModel, earned, ...MODEL_FALLBACK_ORDER]
     .filter((m): m is string => !!m)
     .filter((m, i, arr) => arr.indexOf(m) === i);
+  /*
+    **远程会话按那台机器的清单排** —— 以前远程也用上面这串：`pickRemoteModel` 挑出来的 `profile.model`
+    没有 `modelEarnedOn` 就被丢掉，排第一的反而是远端清单里根本没有的偏好模型。`connect()` 对它照样成功，
+    kiro-cli 随后静默退回默认模型，会话里"改用 X"那句话就是假的。
+    现在：挑出来的那个排第一，其余按原顺序、只留远端有的。
+  */
+  const all: string[] = remotePicked
+    ? remoteStartCandidates([profile.model, ...base], remoteModels || [], MODEL_FALLBACK_ORDER)
+    : base;
+  if (remotePicked) {
+    logger.info('model', `${label}: 按 ${machine} 的模型清单排启动候选：${all.join(', ')}`);
+  }
   /*
     已知跑不了的排到**最后**而不是删掉：万一它们是唯一剩下的（清单探测错了、或者别的模型
     也都挂了），还得能试。删掉的话一次误判会让整个会话连不上，那比多等 30 秒糟得多。
@@ -5961,6 +5980,8 @@ app.whenReady().then(async () => {
       以及连那台机器用的私钥本身。挡在**建会话**这一步，因为等到第一次推送才报错时，
       那一轮已经等了几分钟、而且人根本不知道在等什么。
     */
+    /* 远端那台的模型清单 —— 交给 `connectWithModelFallback`，候选只留它有的 */
+    let remoteModels: string[] | undefined;
     if (profile.remote?.sshHost) {
       /*
         没归项目的会话，本地 cwd 就是它自己的会话目录 —— 远程照办（镜像那一份就够，
@@ -5976,8 +5997,8 @@ app.whenReady().then(async () => {
       if (engineOf(profile) !== 'kiro') {
         await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
       } else {
-        const remoteModels = await remotePreflight(profile.remote);
-        profile.model = pickRemoteModel(kiroLexId, profile.model, remoteModels, profile.remote.sshHost || '');
+        remoteModels = await remotePreflight(profile.remote);
+        profile.model = pickRemoteModel(kiroLexId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
       }
     }
     const startLocalTools = profile.remote?.sshHost
@@ -5992,7 +6013,7 @@ app.whenReady().then(async () => {
     const cliCwd = profile.remote?.sshHost
       ? sessionCwd(profile, resolvedCwd)
       : resolvedCwd;
-    const started = await connectWithModelFallback(profile, 'new-session', startLocalTools, kiroLexId);
+    const started = await connectWithModelFallback(profile, 'new-session', startLocalTools, kiroLexId, remoteModels);
     const client = started.client;
     profile.model = started.model;
     let cliSessionId: string;
@@ -8249,7 +8270,7 @@ app.whenReady().then(async () => {
           await remoteAdapterCheck(profile.remote!, engineOf(profile) as 'claude' | 'codex');
         } else {
           const models = await remotePreflight(profile.remote!);
-          profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote!.sshHost || '');
+          profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), models, profile.remote!.sshHost || '');
         }
       }
       /* 换机器 = 换进程 = 后端是空的：起一条**新的**后端会话，上下文按既有那条路重建 */
@@ -8653,16 +8674,17 @@ app.whenReady().then(async () => {
     emitSessionBusy(sessionId);
     const profile = reshape(oldEntry.profile);
     let client: AcpClient | undefined;
+    let remoteModels: string[] | undefined;
     try {
       if (profile.remote?.sshHost) {
         if (engine !== 'kiro') await remoteAdapterCheck(profile.remote, engine);
         else {
-          const models = await remotePreflight(profile.remote);
-          profile.model = pickRemoteModel(sessionId, profile.model, models, profile.remote.sshHost || '');
+          remoteModels = await remotePreflight(profile.remote);
+          profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
         }
       }
       const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
-      const started = await connectWithModelFallback(profile, 'switch-engine', localTools, sessionId);
+      const started = await connectWithModelFallback(profile, 'switch-engine', localTools, sessionId, remoteModels);
       client = started.client;
       profile.model = started.model;
       const created = await client.newSession(oldEntry.cwd);
@@ -9572,6 +9594,7 @@ app.whenReady().then(async () => {
         建**新**会话那一步仍然是硬拒绝：那时候还没有任何历史，明确报错比悄悄换目标好。
       */
       let localTools: { remotePort: number; localPort: number; agentOverride: string } | undefined;
+      let remoteModels: string[] | undefined;
       if (profile.remote?.sshHost) {
         /* 没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录，和本地那条路一致 */
         resolvedCwd = localDirOrSessionDir(sessionId, resolvedCwd);
@@ -9583,12 +9606,12 @@ app.whenReady().then(async () => {
         if (engineOf(profile) !== 'kiro') {
           await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
         } else {
-          const remoteModels = await remotePreflight(profile.remote);
-          profile.model = pickRemoteModel(sessionId, profile.model, remoteModels, profile.remote.sshHost || '');
+          remoteModels = await remotePreflight(profile.remote);
+          profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
         }
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
-      const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId);
+      const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId, remoteModels);
       const client = started.client;
       profile.model = started.model;
       // Resume the mapped kiro-cli session; fall back to id (legacy records where
