@@ -351,6 +351,8 @@ declare global {
       /** Is a turn running for this chat right now, and what has it produced? Lets a reloaded
        *  window adopt a turn that never stopped instead of resending the question. */
       peekTurn?: (sessionId: string) => Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }>;
+      /** 这条会话的斜杠命令表（后端推过的原样那份），窗口重载后靠它补回来。 */
+      sessionCommands?: (sessionId: string) => Promise<{ commands: any[] }>;
       onDisconnected: (callback: (data?: any) => void) => () => void;
       onSessionReady: (callback: (data: { sessionId: string; projectId?: string }) => void) => () => void;
     };

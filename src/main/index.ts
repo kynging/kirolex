@@ -203,6 +203,19 @@ interface SessionEntry {
   /** kiro's native subagents for THIS chat, as last reported by `_kiro.dev/subagent/list_update`.
    *  Kept so the left rail can carry a tag for as long as one is still running. */
   subagents?: SubagentRow[];
+  /**
+   * 这条会话能用的斜杠命令（`/clear`、`/agent`、`/model`…），后端在 `_kiro.dev/commands/available`
+   * 里推过来的**原样**那一份。
+   *
+   * 为什么要在主进程留一份：那条通知**一条会话只推一次**（连上之后），而渲染进程原来只把它放在
+   * `commandsMapRef`（内存里的 Map）。窗口一重载（开发时一次 HMR 也算）那份 Map 就空了，
+   * 而后端不会再推 —— 于是输入 `/` 什么都不弹，直到你新建会话或者重连。
+   * 主进程活得比渲染进程久，所以这份留在这儿；渲染进程发现自己空了就来取（`acp:session-commands`）。
+   *
+   * 存原始形状而不是解析后的：解析只在渲染进程那一处（`src/renderer/slashCommands.ts`），两条路进来的东西
+   * 走同一段解析，语义才一定一致。
+   */
+  commands?: any[];
   /* No memory-injection bookkeeping here on purpose: the block goes out on EVERY
      turn, so there is no "has it been sent yet / has it changed" decision to carry.
      Three fields used to exist for that decision and were the reason a standing rule
@@ -4412,6 +4425,20 @@ function wireSession(sessionId: string, entry: SessionEntry) {
      *      indistinguishable from the parent's. `childSessionId` preserves it: present means "a subagent
      *      did this", and it is the child's real, addressable ACP session.
      */
+    /* 把这份命令表留下来 —— 见 `SessionEntry.commands`。 */
+    if (data?.update?.method === '_kiro.dev/commands/available' && Array.isArray(data.update.commands)) {
+      /*
+        只在真的变了才记一行 —— 后端一次启动可能连推好几次同一份整表（每个 MCP server 初始化完就重发）。
+        比名字，不比整对象：描述/提示词后端可能顺手改字，而这行日志答的是"这条会话现在能用哪些命令"。
+        缓存照旧每次都写 —— 幂等，而且描述真变了也该跟上。
+      */
+      const names = data.update.commands.map((c: any) => String(c?.name || '')).join(',');
+      const before = (entry.commands || []).map((c: any) => String(c?.name || '')).join(',');
+      entry.commands = data.update.commands;
+      if (names !== before) {
+        logger.info('acp', `commands: ${data.update.commands.length} 条 (sessionId=${sessionId})`);
+      }
+    }
     if (isSubagentListUpdate(data?.update?.method)) {
       const roster = parseSubagentList(data.update);
       entry.subagents = mergeSubagentList(entry.subagents, roster);
@@ -6927,6 +6954,15 @@ app.whenReady().then(async () => {
       text: entry.assistantBuf || '',
       startedAt: entry.lastUsedAt ?? null,
     };
+  });
+
+  /**
+   * 这条会话的斜杠命令表 —— 渲染进程重载之后来这儿补（见 `SessionEntry.commands`）。
+   * 拿不到就返回空数组：这条会话可能还没连上（后端还没推过），界面照旧不弹菜单，不会更差。
+   */
+  ipcMain.handle('acp:session-commands', async (_event, sessionId: string) => {
+    const entry = sessionClients.get(String(sessionId || ''));
+    return { commands: Array.isArray(entry?.commands) ? entry!.commands : [] };
   });
 
   ipcMain.handle('acp:cancel', async (

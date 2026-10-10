@@ -184,6 +184,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   splashStatus: (text: string) => ipcRenderer.invoke('acp:splash-status', text),
   deleteProjectMemory: (projectId: string) => ipcRenderer.invoke('acp:delete-project-memory', projectId),
   readMemory: (projectId?: string, sessionId?: string) => ipcRenderer.invoke('acp:read-memory', projectId, sessionId),
+  /** 这条会话的斜杠命令表 —— 后端一条会话只推一次，窗口重载后渲染进程靠这个补回来。 */
+  sessionCommands: (sessionId: string) => ipcRenderer.invoke('acp:session-commands', sessionId),
   /** The context blocks the LAST send actually carried (archived at send time), plus
    *  whether a hand-edited override is pinned for this chat -- the Snapshot tab has to
    *  say which of the two the next message will carry. */

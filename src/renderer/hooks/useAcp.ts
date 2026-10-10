@@ -7,6 +7,7 @@ import { sessionsToWarm } from '../projectActivity';
 import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
 import { normalizeLang } from '../i18n';
+import { toSlashCommands, type SlashCommand } from '../slashCommands';
 import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
 import {
@@ -59,12 +60,7 @@ type LoopHandle = {
   timer: ReturnType<typeof setTimeout> | null;
 };
 
-export interface SlashCommand {
-  name: string;
-  description?: string;
-  hint?: string;
-  subcommands?: string[];
-}
+export type { SlashCommand } from '../slashCommands';
 
 export interface PermissionOption {
   optionId: string;
@@ -1714,16 +1710,39 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => { cancelled = true; };
   }, [hydrated]);
 
+  /**
+   * **空了就去主进程要一份** —— 命令表由后端在 `_kiro.dev/commands/available` 里推来，
+   * **一条会话只推一次**（连上之后）。`commandsMapRef` 只在内存里：窗口一重载（一次 HMR 也算）
+   * 就空了，后端不会再推，于是输入 `/` 什么都不弹。主进程留着那一份（`SessionEntry.commands`），
+   * 这里发现自己没有就去取。
+   *
+   * 解析走**同一段**代码（`toSlashCommands`）—— 推来的和取来的形状一样，语义才一定一致。
+   */
+  const fetchCommands = useCallback(async (sid: string) => {
+    if (!sid || commandsMapRef.current.get(sid)?.length) return;
+    try {
+      const got = await window.kiroApi.sessionCommands?.(sid);
+      const rows = toSlashCommands(got?.commands);
+      if (!rows.length) return;
+      /* 等回来的这段时间里后端可能已经推了新的一份 —— 那份更新，别覆盖它 */
+      if (commandsMapRef.current.get(sid)?.length) return;
+      commandsMapRef.current.set(sid, rows);
+      if (currentSessionRef.current === sid) setCommands(rows);
+    } catch { /* 取不到就照旧空着 —— 不弹菜单，和以前一样 */ }
+  }, []);
+
   // Keep ref in sync with state, persist last session.
   useEffect(() => {
     currentSessionRef.current = currentSessionId;
     setCommands(currentSessionId ? (commandsMapRef.current.get(currentSessionId) || []) : []);
+    /* 选中一条会话时补一次 —— 判据在 `fetchCommands` 里（已经有就直接返回） */
+    if (currentSessionId) void fetchCommands(currentSessionId);
     if (currentSessionId) {
       try {
         uiSet('kirolex-last-session', currentSessionId);
       } catch {}
     }
-  }, [currentSessionId]);
+  }, [currentSessionId, fetchCommands]);
 
   // Keep the IN-MEMORY cache for the current session so switching back is
   // instant. Nothing is written to localStorage any more: the durable transcript
@@ -2246,14 +2265,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             if (isActiveSession) setUsage(next);
             patchPane(sessionId, { usage: next });
           } else if (update.method === '_kiro.dev/commands/available' && Array.isArray(update.commands)) {
-            const nextCommands: SlashCommand[] = update.commands
-              .filter((command: any) => typeof command?.name === 'string')
-              .map((command: any) => ({
-                name: command.name,
-                description: command.description,
-                hint: command.meta?.hint || undefined,
-                subcommands: command.meta?.subcommands || undefined,
-              }));
+            /* 解析和"从主进程补一份"那条路共用（`toSlashCommands`）—— 两条路进来的形状必须一致 */
+            const nextCommands = toSlashCommands(update.commands);
             commandsMapRef.current.set(targetSid, nextCommands);
             if (isActiveSession) setCommands(nextCommands);
           } else if (typeof update.method === 'string' && update.method.startsWith('_kiro.dev/')) {
