@@ -3209,10 +3209,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   useEffect(() => {
     const onRestored = (e: Event): void => {
       const ids: string[] = Array.isArray((e as CustomEvent).detail?.ids) ? (e as CustomEvent).detail.ids : [];
+      /* 恢复时顺手取消归档的那几条：水化会把 archived 改成 false，也要等它落定，不然 warmSession 看到的还是归档、直接跳过 */
+      const unarchived: string[] = Array.isArray((e as CustomEvent).detail?.unarchived) ? (e as CustomEvent).detail.unarchived : [];
       void (async () => {
         await hydrateFromDiskRef.current();
         /* setSessions 是异步落定的：warmSession 读的是 sessions，等它看得见新条目 */
-        for (let i = 0; i < 20 && ids.some((id) => !sessionsRef.current.some((x) => x.id === id)); i++) {
+        const settled = (): boolean =>
+          ids.every((id) => sessionsRef.current.some((x) => x.id === id))
+          && unarchived.every((id) => !sessionsRef.current.find((x) => x.id === id)?.archived);
+        for (let i = 0; i < 20 && !settled(); i++) {
           await new Promise((r) => setTimeout(r, 100));
         }
         for (const id of ids) void warmSessionRef.current(id);

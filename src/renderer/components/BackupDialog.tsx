@@ -25,6 +25,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
+import { groupBackups } from '../backupGroups.ts';
 
 interface Backup {
   id: string;
@@ -38,6 +39,8 @@ interface Backup {
   existsLocally?: boolean;
   /** 正在跑一轮 —— 恢复会被拒（那一轮还没落盘），所以不给勾。连着但空闲的会自动先断开。 */
   busy?: boolean;
+  /** 本机已经把它归档了 —— 放进「已归档」组；恢复时会取消归档、回到原项目。 */
+  archivedLocally?: boolean;
 }
 
 interface SessionRow {
@@ -70,12 +73,13 @@ const memSize = (n: number): string => (n < 1024 ? `${n} B` : kb(n));
 /** 小于这个就当它是空壳：只有一行标题、一条记忆都没有。 */
 const EMPTY_MEMORY_BYTES = 64;
 
+/** 未分组的那一摊在界面上要有个名字，否则它是一行空白。 */
+const projectLabel = (p?: string): string => (p && p.trim() ? p : '未分组');
+
 const api = (): any => (window as any).kiroApi;
 
 const when = (ms?: number): string => (ms ? new Date(ms).toLocaleString() : '—');
 const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
-/** 未分组的那一摊在界面上要有个名字，否则它是一行空白。 */
-const projectLabel = (p?: string): string => (p && p.trim() ? p : '未分组');
 
 export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const [tab, setTab] = useState<'sync' | 'restore'>('sync');
@@ -222,22 +226,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     } finally { setBusy(null); }
   };
 
-  /* ---------- 恢复：按项目分组 ---------- */
-  const groups = useMemo(() => {
-    const map = new Map<string, Backup[]>();
-    for (const e of entries || []) {
-      const key = projectLabel(e.project);
-      const list = map.get(key) || [];
-      list.push(e);
-      map.set(key, list);
-    }
-    /* 组内按最近更新排；「未分组」整组排最后 */
-    for (const list of map.values()) list.sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-    return [...map.entries()].sort((a, b) => {
-      if ((a[0] === '未分组') !== (b[0] === '未分组')) return a[0] === '未分组' ? 1 : -1;
-      return (b[1][0]?.updatedAt || 0) - (a[1][0]?.updatedAt || 0);
-    });
-  }, [entries]);
+  /* ---------- 恢复：按项目分组（本机已归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
+  const groups = useMemo(() => groupBackups(entries || []), [entries]);
 
   const selectable = useMemo(() => (entries || []).filter((e) => !e.busy), [entries]);
   const chosen = useMemo(() => selectable.filter((e) => picked.has(e.id)), [selectable, picked]);
@@ -281,8 +271,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
   const restore = async (): Promise<void> => {
     if (!chosen.length) return;
+    const unarchiving = chosen.filter((e) => e.archivedLocally);
     const lines = [
       `要恢复 ${chosen.length} 条会话。`,
+      ...(unarchiving.length
+        ? ['', `其中 ${unarchiving.length} 条本机已归档，恢复后会取消归档、回到原来的项目。`]
+        : []),
       ...(merging.length
         ? ['', `其中 ${merging.length} 条本地已经有了，会和本地那份「合并」（按消息 id 去重、按时间排序）：`,
           ...merging.map((e) => `  · ${e.title || e.id}`),
@@ -297,6 +291,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     const ok: string[] = [];
     const bad: string[] = [];
     const restoredIds: string[] = [];
+    const unarchivedIds: string[] = [];
     let files = 0;
     /* 一条一条来：并发恢复会同时写 trash 和 sessions，而失败要能说清是**哪一条** */
     for (const e of chosen) {
@@ -304,7 +299,9 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
         const r = await api()?.restoreS3Session?.(e.id);
         if (r?.ok) {
           restoredIds.push(e.id);
-          ok.push(`${e.title || e.id}${r.merged ? `（并进 ${r.merged.added} 条${r.merged.clashed ? `，${r.merged.clashed} 条同 id 保留本地` : ''}）` : ''}`);
+          if (r.unarchived) unarchivedIds.push(e.id);
+          ok.push(`${e.title || e.id}${r.merged ? `（并进 ${r.merged.added} 条${r.merged.clashed ? `，${r.merged.clashed} 条同 id 保留本地` : ''}）` : ''}`
+            + (r.unarchived ? `，已取消归档，回到「${projectLabel(r.unarchived.projectId)}」` : ''));
           files += Number(r.restored) || 0;
         } else bad.push(`${e.title || e.id}：${r?.error || '失败'}`);
       } catch (x: any) {
@@ -314,7 +311,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setBusy(null);
     setPicked(new Set());
     /* 侧栏立刻对一遍磁盘 + 把这几条连上（不用重启） */
-    if (restoredIds.length) window.dispatchEvent(new CustomEvent('kirolex:sessions-restored', { detail: { ids: restoredIds } }));
+    if (restoredIds.length) window.dispatchEvent(new CustomEvent('kirolex:sessions-restored', { detail: { ids: restoredIds, unarchived: unarchivedIds } }));
     await loadBackups();
     setMsg({
       kind: bad.length ? 'bad' : 'ok',
@@ -493,10 +490,10 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
               {!!groups.length && (
                 <div className="backup-restore-list">
-                  {groups.map(([name, rows]) => {
-                    const shut = collapsed.has(name);
+                  {groups.map(({ key, name, archived, rows }) => {
+                    const shut = collapsed.has(key);
                     return (
-                      <div key={name} className="backup-group">
+                      <div key={key} className="backup-group">
                         {/*
                           组头只做两件事：说清这是哪一摊、能收起来。
                           原来这里还有一颗「选整组」——「选整组那个按钮是干毛线，删掉吧」：
@@ -506,11 +503,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                         <div className="backup-group-head">
                           <button className="backup-group-toggle" onClick={() => setCollapsed((prev) => {
                             const next = new Set(prev);
-                            if (next.has(name)) next.delete(name); else next.add(name);
+                            if (next.has(key)) next.delete(key); else next.add(key);
                             return next;
                           })}>{shut ? '▸' : '▾'} {name}</button>
                           <span className="backup-restore-meta">{rows.length} 条</span>
-                          {(() => {
+                          {archived && <span className="settings-hint">本机已归档 · 恢复后会取消归档、回到原来的项目</span>}
+                          {!archived && (() => {
                             const proj = rows[0]?.project || '';
                             if (!proj) return null;             // 未分组没有项目记忆
                             const m = bucketMemory[proj];
@@ -525,12 +523,21 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               </span>
                             );
                           })()}
-                          {/* 整组删云上的备份（不动本地）—— 从「同步」那页挪过来的 */}
-                          <button className="remote-btn backup-del" disabled={!!busy}
-                                  title="删掉这一组在桶里的备份（不动本地会话）"
-                                  onClick={() => void deleteProject(rows[0]?.project || '', rows.length)}>
-                            {busy === `del:${rows[0]?.project || ''}` ? '删除中…' : '删除备份'}
-                          </button>
+                          {/*
+                            整组删云上的备份（不动本地）—— 从「同步」那页挪过来的。
+                            按项目删会连带这个项目里本机已归档的那几条（它们在「已归档」组里），所以条数按整个项目数；
+                            「已归档」组里混着好几个项目，没有整组删 —— 要删就勾选后用上面的「删除选中的」。
+                          */}
+                          {!archived && (
+                            <button className="remote-btn backup-del" disabled={!!busy}
+                                    title="删掉这一组在桶里的备份（不动本地会话；含这个项目里本机已归档的）"
+                                    onClick={() => {
+                                      const proj = rows[0]?.project || '';
+                                      void deleteProject(proj, (entries || []).filter((x) => (x.project || '') === proj).length);
+                                    }}>
+                              {busy === `del:${rows[0]?.project || ''}` ? '删除中…' : '删除备份'}
+                            </button>
+                          )}
                         </div>
                         {!shut && rows.map((e) => (
                           <label
@@ -543,6 +550,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             <input type="checkbox" checked={picked.has(e.id)} disabled={!!e.busy || !!busy}
                                    onChange={() => toggle(e.id)} />
                             <span className="backup-restore-title">{e.title || e.id}</span>
+                            {e.archivedLocally && (
+                              <span className="backup-tag warn" title="本机已归档 —— 恢复后会取消归档，回到原来的项目">本机已归档</span>
+                            )}
+                            {e.archivedLocally && (
+                              <span className="backup-restore-meta">原属「{projectLabel(e.project)}」</span>
+                            )}
                             {e.busy
                               ? <span className="backup-tag warn">正在跑</span>
                               : e.existsLocally

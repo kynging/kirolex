@@ -927,9 +927,10 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
   });
 
   test('恢复那页按项目分组、组头粘顶、能收起', () => {
-    assert.match(UI5, /const groups = useMemo/);
-    /* 「未分组」整组排最后 */
-    assert.match(UI5, /a\[0\] === '未分组' \? 1 : -1/);
+    assert.match(UI5, /const groups = useMemo\(\(\) => groupBackups\(/);
+    /* 「未分组」整组排最后（分组逻辑抽到了 backupGroups.ts，行为见 restoreArchived.test.ts） */
+    const GB5 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/backupGroups.ts'), 'utf8');
+    assert.match(GB5, /a\[0\] === '未分组' \? 1 : -1/);
     /*
       「选整组」删掉了 —— 恢复整个项目不是常见动作，而那颗按钮占的位置最容易误点。
       只看真会渲染出来的部分：文件头那段注释里会提到它（在解释为什么删的）。
@@ -1088,7 +1089,8 @@ describe('单条会话的同步与否 ——「我是说单独会话级别的同
     const restoreAt = UI.indexOf("{tab === 'restore' && (");
     const syncPart = UI.slice(syncAt, restoreAt);
     assert.doesNotMatch(syncPart, /deleteProject\(/);
-    assert.match(UI.slice(restoreAt), /onClick=\{\(\) => void deleteProject\(rows\[0\]\?\.project \|\| '', rows\.length\)\}/);
+    /* 条数按整个项目算（含本机已归档、被放进「已归档」组的那几条 —— 按项目删会连它们一起删） */
+    assert.match(UI.slice(restoreAt), /void deleteProject\(proj, \(entries \|\| \[\]\)\.filter\(\(x\) => \(x\.project \|\| ''\) === proj\)\.length\)/);
   });
 });
 
@@ -1112,7 +1114,7 @@ describe('恢复 ——「我尝试恢复但没有生效」', () => {
   });
 
   test('不用重启：恢复完侧栏对一遍磁盘，并把那几条连上', () => {
-    assert.match(UI, /new CustomEvent\('kirolex:sessions-restored', \{ detail: \{ ids: restoredIds \} \}\)/);
+    assert.match(UI, /new CustomEvent\('kirolex:sessions-restored', \{ detail: \{ ids: restoredIds, unarchived: unarchivedIds \} \}\)/);
     assert.doesNotMatch(UI, /重启 KiroLex 后它们会出现在列表里/);
     assert.match(HK, /window\.addEventListener\('kirolex:sessions-restored', onRestored\);/);
     assert.match(HK, /await hydrateFromDiskRef\.current\(\);/);
