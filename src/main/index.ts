@@ -27,6 +27,7 @@ import {
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { markArchivedLocally, unarchiveRestoredRecord } from './restoreArchive.ts';
+import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -1275,13 +1276,24 @@ function renderHistoryFile(sessionId: string): { path: string; count: number } |
       .filter(modelFacing);
     const lines = stored.map((m) => historyLine(m));
     if (!lines.join('').trim()) return null;
+    /* 有预算，不再整份全渲：实测 696 KB 的 history.md 让后端只回一句笼统的 `Internal error`。
+       判据和"丢了要说出来"都在 `historyBudget.ts`；丢掉的部分不静默 —— 顶部那句说明给模型看，
+       日志那句给人对账。 */
+    const fitted = fitHistory(lines.map((line) => ({ line })));
+    const note = historyTrimNote(fitted.dropped, lines.length);
+    if (fitted.dropped) {
+      logger.warn('prime', `history trimmed sessionId=${sessionId} kept=${fitted.kept.length}/${lines.length}`
+        + ` bytes=${fitted.bytes} (budget ${HISTORY_BUDGET_BYTES})`);
+    }
     const path = store.writeHistoryFile(
       sessionId,
-      `# ${sessionId} — 完整对话历史（由 KiroLex 从自身记录渲染）\n`
-      + `# 渲染时间 ${new Date().toISOString()}，共 ${lines.length} 条消息\n\n`
-      + `${lines.join('\n\n---\n\n')}\n`,
+      `# ${sessionId} — 对话历史（由 KiroLex 从自身记录渲染）\n`
+      + `# 渲染时间 ${new Date().toISOString()}，共 ${lines.length} 条消息，`
+      + `这份带 ${fitted.kept.length} 条\n`
+      + note
+      + `\n${fitted.kept.map((e) => e.line).join('\n\n---\n\n')}\n`,
     );
-    return { path, count: lines.length };
+    return { path, count: fitted.kept.length };
   } catch (err: any) {
     logger.info('prime', `render history FAILED sessionId=${sessionId} err=${err?.message}`);
     return null;
@@ -1399,7 +1411,20 @@ function buildSnapshot(sessionId: string, stored: any[], lines: string[], opts?:
     opts?.rideAlong
       ? '以下是本会话之前的对话记录（由 KiroLex 保存并恢复；kiro-cli 不持久化 ACP 会话，所以每次重启后端都是空的）。不要复述它，也不要重新回答其中已经回答过的问题，只把它当作你和用户此前的共同上下文。'
       : '以下是本会话之前对话的恢复上下文（由 KiroLex 保存并恢复；kiro-cli 不持久化 ACP 会话，所以每次重启后端都是空的）。请只回复“OK”，不要复述、不要重新回答其中内容。',
-    `完整历史原文（全部 ${lines.length} 条消息，未删减）保存在这个文件里：\n${historyPath}\n这个文件会随本会话继续更新，任何时候重新读它拿到的都是最新的完整记录。下面只内联了最近 ${recent.length} 条${omitted > 0 ? `，更早的 ${omitted} 条没有内联` : ''}。凡是需要更早的细节、原话或数字，直接读这个文件，不要凭印象作答，也不要说“不记得”。`,
+    // 这句必须和文件里真有多少条一致：history.md 有预算，截断后还写「未删减」，
+    // 模型会把半份历史当全部，对"之前说过什么"给出自信的错答案。
+    // `rendered.count` 是实际写进文件的条数（`fitHistory` 之后）。
+    (() => {
+      const inFile = rendered?.count ?? lines.length;
+      const missing = lines.length - inFile;
+      const claim = missing > 0
+        ? `这个文件里是**最近 ${inFile} 条**（共 ${lines.length} 条，更早的 ${missing} 条超出上下文预算没有写进去）`
+        : `完整历史原文（全部 ${lines.length} 条消息，未删减）`;
+      return `${claim}保存在这个文件里：\n${historyPath}\n这个文件会随本会话继续更新，任何时候重新读它拿到的都是最新的记录。`
+        + `下面只内联了最近 ${recent.length} 条${omitted > 0 ? `，更早的 ${omitted} 条没有内联` : ''}。`
+        + '凡是需要更早的细节、原话或数字，直接读这个文件，不要凭印象作答，也不要说“不记得”。'
+        + (missing > 0 ? `文件里也没有的那 ${missing} 条，**问用户**，不要推断。` : '');
+    })(),
   ];
   if (manifest) {
     parts.push(`本会话全程产出/修改过的文件（内容一律以磁盘上的文件为准，需要时直接读取）：\n${manifest}`);
