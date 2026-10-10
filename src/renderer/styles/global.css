@@ -1757,6 +1757,37 @@ button, input, select, textarea {
   content: ''; flex: 1; height: 1px; background: var(--border);
 }
 .chat-clear-line > span { flex: none; white-space: nowrap; }
+/* KiroLex 自己说的话（换模型了、排队了、写好了…）：居中的小卡片，不是用户气泡 */
+.kirolex-message {
+  display: flex;
+  justify-content: center;
+  margin: 12px 0;
+  padding: 0 16px;
+}
+.kirolex-message-card {
+  display: inline-flex;
+  align-items: baseline;
+  justify-content: center;
+  gap: 7px;
+  max-width: min(92%, 760px);
+  padding: 5px 10px;
+  border: 1px solid rgba(124, 111, 224, 0.28);
+  border-radius: 12px;
+  background: rgba(124, 111, 224, 0.09);
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 1.45;
+  text-align: center;
+}
+.kirolex-message-label {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .03em;
+}
+.kirolex-message-body { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+.kirolex-message-time { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; }
 
 .load-older-btn {
   display: block;

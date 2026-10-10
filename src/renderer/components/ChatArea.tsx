@@ -161,6 +161,28 @@ const FileRef = ({ path, as, className, children }: {
     </a>
   );
 };
+/**
+ * 用户气泡和 KiroLex 自己的提示里的裸路径也变成可点的 —— 「修改里的文件位置没有链接」。
+ *
+ * 助手那侧一直有（`remarkLinkifyPaths` + `FileRef`），用户这侧是**纯文本**渲染，而且那是故意的：
+ * 你打进去的字不该被 markdown 重排。所以这里只把命中 `PATH_RE` 的那几段换成 `FileRef`，其余原样。
+ * 文件不在盘上时 `FileRef` 自己退回普通文本，所以不会出现一个点了没反应的链接。
+ */
+function withPathLinks(text: string, keyBase: string): React.ReactNode {
+  PATH_RE.lastIndex = 0;
+  if (!PATH_RE.test(text)) return text;
+  PATH_RE.lastIndex = 0;
+  const out: React.ReactNode[] = [];
+  let last = 0;
+  let m: RegExpExecArray | null;
+  while ((m = PATH_RE.exec(text))) {
+    if (m.index > last) out.push(text.slice(last, m.index));
+    out.push(<FileRef key={`${keyBase}:${m.index}`} path={m[0]} as="a">{m[0]}</FileRef>);
+    last = m.index + m[0].length;
+  }
+  if (last < text.length) out.push(text.slice(last));
+  return out;
+}
 const MD_COMPONENTS = {
   a: ({ href, children }: any) => {
     // Real URLs always open externally. A linkified file/dir path only becomes a
@@ -679,6 +701,27 @@ const formatMessageTime = (timestamp: number) => {
   ).format(messageDate);
 };
 
+/**
+ * KiroLex 自己说的话（`isKirolexNote`：换了后端会话、退到了备用模型、排队了、写好了备注…）。
+ * 它既不是你说的，也不是助手的回答，所以画成居中的一张小卡片，不画成用户气泡 ——
+ * 气泡会让它看起来像你发出去的，还带着「编辑 / Rerun」。里面的路径照样可点。
+ */
+const KirolexMessageItem = memo<{ message: Message }>(({ message }) => (
+  <div className="kirolex-message" role="status">
+    <div className="kirolex-message-card">
+      <span className="kirolex-message-label">KiroLex</span>
+      <span className="kirolex-message-body">{withPathLinks(message.content, message.id)}</span>
+      <time
+        className="kirolex-message-time"
+        dateTime={new Date(message.timestamp).toISOString()}
+        title={new Date(message.timestamp).toLocaleString()}
+      >
+        {formatMessageTime(message.timestamp)}
+      </time>
+    </div>
+  </div>
+));
+
 // Kiro CLI does not expose exact per-turn token counts. Estimate the visible
 // question + answer, treating CJK characters as roughly one token and the
 // remaining text as roughly one token per four characters.
@@ -1164,7 +1207,7 @@ const UserGroupItem = memo<{
             let m: RegExpExecArray | null;
             while ((m = PASTE_PLACEHOLDER_RE.exec(paragraph.text))) {
               const lead = paragraph.text.slice(last, m.index);
-              if (lead.trim()) parts.push(<p key={`${key}:t${last}`}>{lead}</p>);
+              if (lead.trim()) parts.push(<p key={`${key}:t${last}`}>{withPathLinks(lead, `${key}:t${last}`)}</p>);
               const seq = Number(m[1]);
               const blk = pasteBlocks.find((b) => b.seq === seq)
                 || { seq, lines: Number(m[2]) || 0, chars: 0, path: '' };
@@ -1172,7 +1215,7 @@ const UserGroupItem = memo<{
               last = m.index + m[0].length;
             }
             const tail = paragraph.text.slice(last);
-            if (tail.trim()) parts.push(<p key={`${key}:tail`}>{tail}</p>);
+            if (tail.trim()) parts.push(<p key={`${key}:tail`}>{withPathLinks(tail, `${key}:tail`)}</p>);
             return <React.Fragment key={key}>{parts}</React.Fragment>;
           }
           // Long pasted code/log/JSON collapses into a click-to-expand block;
@@ -1188,7 +1231,7 @@ const UserGroupItem = memo<{
                 <React.Fragment key={key}>
                   <p className={paragraph.isSteer ? 'steer-paragraph' : undefined}>
                     {label}
-                    {head}
+                    {withPathLinks(head, key)}
                   </p>
                   <CollapsibleUserBlock content={block} />
                 </React.Fragment>
@@ -1206,10 +1249,10 @@ const UserGroupItem = memo<{
           return paragraph.isSteer ? (
             <p key={key} className="steer-paragraph">
               <span className="steer-side-label" title="Steered into the running turn">Steer</span>
-              {paragraph.text}
+              {withPathLinks(paragraph.text, key)}
             </p>
           ) : (
-            <p key={key}>{paragraph.text}</p>
+            <p key={key}>{withPathLinks(paragraph.text, key)}</p>
           );
         })}
       </div>
@@ -3302,6 +3345,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // message ordering/ids in state are untouched.
   type RenderGroup =
     | { kind: 'user'; base: Message; steers: Message[] }
+    | { kind: 'kirolex'; message: Message }
     | { kind: 'assistant'; segments: Message[]; isLast: boolean; question: string };
   // Heal stranded steers before grouping: a steer that ended up AFTER this
   // turn's assistant/tool messages (ordering slip, or restored history) is moved
@@ -3314,7 +3358,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       if (m.role === 'user' && m.steer) {
         let baseIdx = -1;
         for (let i = out.length - 1; i >= 0; i--) {
-          if (out[i].role === 'user' && !out[i].steer) { baseIdx = i; break; }
+          if (out[i].role === 'user' && !out[i].steer && !isKirolexNote(out[i])) { baseIdx = i; break; }
         }
         if (baseIdx >= 0) {
           let at = baseIdx + 1;
@@ -3334,7 +3378,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     const messages = orderedMessages;
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
-      if (m.role === 'user') {
+      /* KiroLex 自己的话单独成组：不是提问（不进 lastQuestion），也不收 steer */
+      if (m.role === 'user' && isKirolexNote(m)) {
+        groups.push({ kind: 'kirolex', message: m });
+      } else if (m.role === 'user') {
         if (!m.steer) {
           const steers: Message[] = [];
           let j = i + 1;
@@ -3724,6 +3771,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="chat-clear-line" key={`${currentSessionId ?? 'none'}:${group.base.id}`}>
               <span>{clearNoteText(hiddenGroupCount)}</span>
             </div>
+          ) : group.kind === 'kirolex' ? (
+            <KirolexMessageItem
+              key={`${currentSessionId ?? 'none'}:${group.message.id}`}
+              message={group.message}
+            />
           ) : group.kind === 'user' ? (
             <UserGroupItem
               key={`${currentSessionId ?? 'none'}:${group.base.id}`}

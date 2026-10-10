@@ -167,10 +167,20 @@ describe('落盘之后在会话里报一句', () => {
     assert.match(RB2, /\*\*不要自己去动这个文件\*\*/);
   });
 
-  /*
-    flow 那边还有一条「那条路径点得开」（用户气泡里的裸路径渲染成链接，`withPathLinks`）—— 那是 9649ef1 里
-    ChatArea 的改动，不属于这次搬的文件预览，没有跟着搬，那条测试也就不在这里。
-  */
+  test('那条路径**点得开** —— 用户气泡和 KiroLex 的提示里的裸路径都变成链接', () => {
+    /* 用户气泡是纯文本渲染（不走 markdown），所以单独过一遍 `withPathLinks`；KiroLex 的提示是居中卡片，用同一个链接器 */
+    const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
+    assert.match(CA, /function withPathLinks\(text: string, keyBase: string\)/);
+    /* 命中的那几段换成 `FileRef`（它自己会先确认文件在盘上，否则退回普通文本） */
+    assert.match(CA, /out\.push\(<FileRef key=\{`\$\{keyBase\}:\$\{m\.index\}`\} path=\{m\[0\]\} as="a">\{m\[0\]\}<\/FileRef>\);/);
+    /* 两种段落都要过一遍 —— 普通的和 steer 的 */
+    assert.match(CA, /<p key=\{key\}>\{withPathLinks\(paragraph\.text, key\)\}<\/p>/);
+    assert.match(CA, /\{withPathLinks\(paragraph\.text, key\)\}\n\s*<\/p>/);
+    /* KiroLex 的居中提示也用同一个链接器 */
+    assert.match(CA, /\{withPathLinks\(message\.content, message\.id\)\}/);
+    /* 判据和助手那侧同一条正则 —— 两侧对"什么算路径"必须一致 */
+    assert.match(CA, /PATH_RE\.exec\(text\)/);
+  });
 
   test('那条正则接得住实际写法：中文文件名 + 后面紧跟换行', () => {
     /* `文件：/Users/…/周报 2026-09-07.pptx\nKiroLex…` —— 全角冒号打头、空格在文件名里、结尾是换行 */
