@@ -120,6 +120,13 @@ export interface AgentProfile {
   projectId?: string;
 
   /**
+   * 你亲手把它移出项目了（`acp:set-project` / `acp:move-session` 传 null）。
+   * 没有它的话"从来没归过项目"和"刚被移出来"在盘上一模一样，attach 会按目录把 projectId
+   * 反推回去 —— 看起来就是"移出去它又自己跑回去了"。指派给项目时清掉。
+   */
+  unassigned?: true;
+
+  /**
    * Remote target. When set, this profile's executor spawns over SSH (see the
    * RemoteTarget docstring). Undefined means local execution.
    */
@@ -181,6 +188,23 @@ export function canAssignProjectId(current: string | undefined, next: string | u
   if (!next) return false;              // never un-set / assign empty
   if (current && current !== next) return false; // never change between projects
   return current === undefined || current === next;
+}
+
+/**
+ * 把活着的执行器手里的 profile 写回记录时，**项目归属以盘上的为准**。
+ *
+ * 一轮回复中途移出 / 换项目（`acp:move-session`）只改盘，这一轮剩下的部分仍按旧的 memory scope 跑，
+ * 所以 entry.profile 里还是旧项目。这时若自动换模型把 entry.profile 整份写回，旧项目就回到盘上、
+ * `unassigned` 被抹掉 —— 移出操作被悄悄撤销。
+ */
+export function keepRecordPlacement(profile: AgentProfile, onDisk: AgentProfile | undefined): AgentProfile {
+  if (!onDisk) return profile;
+  const { projectId: _p, unassigned: _u, ...rest } = profile;
+  return {
+    ...rest,
+    ...(onDisk.projectId ? { projectId: onDisk.projectId } : {}),
+    ...(onDisk.unassigned ? { unassigned: true as const } : {}),
+  };
 }
 
 /** True if this profile targets a remote host (executor spawns over SSH). */

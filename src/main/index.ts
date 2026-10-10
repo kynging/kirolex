@@ -27,7 +27,7 @@ import {
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { markArchivedLocally, unarchiveRestoredRecord } from './restoreArchive.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, sessionCwd, resolveRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -683,7 +683,8 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       sessionClients.set(sessionId, next);
       wireSession(sessionId, next);
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-      rec.profile = profile;
+      /* 项目归属以盘上为准：这一轮中途移出项目时 entry 里还是旧项目，整份写回就把移出撤销了 */
+      rec.profile = keepRecordPlacement(profile, rec.profile);
       rec.cliSessionId = cliSessionId;
       rec.executorState = 'attached';
       store.writeRecord(rec);
@@ -9510,7 +9511,8 @@ app.whenReady().then(async () => {
         throw new Error('该会话在磁盘上不存在（可能已被删除），不再重建。');
       }
       const derived = derivedProjectFor(sessionId, resolvedCwd);
-      const projectId = existing?.profile.projectId ?? derived;
+      /* 你亲手移出项目的，不按目录再反推回去（见 `AgentProfile.unassigned`） */
+      const projectId = existing?.profile.projectId ?? (existing?.profile.unassigned ? undefined : derived);
       const profile: AgentProfile = {
         model: model || existing?.profile.model || DEFAULT_MODEL,
         // ONLY a recorded preference, else the default. Deliberately does NOT fall
@@ -9525,6 +9527,8 @@ app.whenReady().then(async () => {
         modelEarnedOn: existing?.profile.modelEarnedOn,
         permissionMode: existing?.profile.permissionMode || 'auto-approve',
         projectId,
+        /* 白名单：漏了的话下一次把 entry.profile 整份写回记录（切模型等）就把这个标记丢了 */
+        ...(existing?.profile.unassigned ? { unassigned: true as const } : {}),
         kiroAgent: existing?.profile.kiroAgent,
         // Persisted remote target survives restarts; a remote session re-attaches
         // over SSH exactly as it was created.
@@ -10697,10 +10701,11 @@ app.whenReady().then(async () => {
       throw new Error('projectId is write-once; it cannot be changed once set.');
     }
     rec.profile.projectId = projectId;
+    delete rec.profile.unassigned;
     rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
     store.writeRecord(rec);
     const entry = sessionClients.get(sessionId);
-    if (entry) entry.profile.projectId = projectId; // keep live executor in sync
+    if (entry) { entry.profile.projectId = projectId; delete entry.profile.unassigned; } // keep live executor in sync
     return { sessionId, projectId };
   });
 
@@ -10711,10 +10716,14 @@ app.whenReady().then(async () => {
     const rec = store.readRecord(sessionId);
     if (!rec) return { sessionId, projectId };
     rec.profile.projectId = projectId ?? undefined;
+    if (projectId) delete rec.profile.unassigned; else rec.profile.unassigned = true;
     rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
     store.writeRecord(rec);
     const entry = sessionClients.get(sessionId);
-    if (entry) entry.profile.projectId = projectId ?? undefined;
+    if (entry) {
+      entry.profile.projectId = projectId ?? undefined;
+      if (projectId) delete entry.profile.unassigned; else entry.profile.unassigned = true;
+    }
     return { sessionId, projectId };
   });
 
@@ -10746,6 +10755,7 @@ app.whenReady().then(async () => {
     const rec = store.readRecord(sessionId);
     if (rec) {
       rec.profile.projectId = projectId ?? undefined;
+      if (projectId) delete rec.profile.unassigned; else rec.profile.unassigned = true;
       rec.archived = false; // moving a chat brings it out of the archive
       rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
       store.writeRecord(rec);
