@@ -77,6 +77,7 @@ import {
 import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.ts';
 import { logger } from './logger';
 import { zoomKeyAction } from './zoomKeys.ts';
+import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
 // It fires because the Vite dev server is served without a CSP (a strict CSP would
@@ -242,9 +243,8 @@ interface SessionEntry {
    *  sent into an empty backend. Shared by the eager (post-attach) path and the
    *  lazy (pre-prompt) path so the rebuild happens exactly once. */
   primePromise?: Promise<{ ok: boolean; error?: string }>;
-  /** Rebuild attempts so far. Informational only: there is NO attempt limit --
-   *  the rebuild retries until it completes, the user presses Stop, or the user
-   *  clears the history. Truncating the replay was rejected as a design: a
+  /** Rebuild attempts so far. Informational only. A run gives up on a chunk per
+   *  `primeVerdict` (primeRetry.ts), but the history is never truncated: a
    *  partial history is indistinguishable from a complete one to the model. */
   primeAttempts?: number;
   /** Chunks already ACCEPTED by this backend. A retry resumes from here rather
@@ -255,8 +255,14 @@ interface SessionEntry {
   /** Chunk snapshot for the current rebuild so retries replay identical content
    *  (and the cursor keeps meaning the same thing). */
   primeChunks?: string[];
-  /** Last rebuild error, shown in the status line while it keeps retrying. */
+  /** Last rebuild error. After a give-up this holds the `primeGiveUpNote`. */
   primeLastError?: string;
+  /** The last run GAVE UP (`primeVerdict` → 'give-up'). `needsHistoryPrime` stays
+   *  set -- that was not a success -- but the session is released and nothing
+   *  re-schedules the rebuild automatically; the next real use (send / open /
+   *  manual rebuild) tries again and clears this. Without it the owed flag would
+   *  re-queue the run within a second: the same endless loop by another door. */
+  primeGaveUp?: boolean;
   /** Human-readable rebuild progress ("重建历史上下文 2/5"), surfaced to the
    *  renderer with the busy event so a long rebuild is visible, not a freeze. */
   primeDetail?: string;
@@ -923,10 +929,9 @@ function busyReasonFor(sessionId: string): BusyReason {
   // no history must not accept a new message that would be answered from nothing.
   // New messages queue behind the rebuild instead.
   if (entry?.needsHistoryPrime) {
-    // …unless the user abandoned it. That is the ONLY release: there is no
-    // attempt limit any more, so a rebuild keeps the session occupied until it
-    // finishes, the user presses Stop, or the user clears the history.
-    if (entry.primeAbandoned) return null;
+    // …unless the user abandoned it, or the last run gave up (primeVerdict): then
+    // the session is released and the next send retries the rebuild itself.
+    if (entry.primeAbandoned || entry.primeGaveUp) return null;
     return 'prime-pending';
   }
   return null;
@@ -967,7 +972,7 @@ function drainPrimeQueue(): void {
     if (!sessionId) return;
     const entry = sessionClients.get(sessionId);
     // 排队期间情况可能已经变了：执行器没了、你放弃了、或者别人已经重建完了
-    if (!entry || entry.primeAbandoned || entry.priming || !entry.needsHistoryPrime) continue;
+    if (!entry || entry.primeAbandoned || entry.primeGaveUp || entry.priming || !entry.needsHistoryPrime) continue;
     primeInFlight.add(sessionId);
     logger.info('prime', `auto-start sessionId=${sessionId} (owed rebuild, ${primeWaiting.length} still waiting)`);
     void primeHistoryNow(sessionId)
@@ -1085,12 +1090,13 @@ function historyLine(m: {
  *  context window and get compacted away), which silently left the chat with no
  *  memory of its own history. Chunking makes a large rebuild converge. */
 const PRIME_CHUNK_CHARS = 24000;
-/** NO cap on how much history is replayed, and NO attempt limit. Truncating the
- *  replay was rejected as a design: a silently shortened history is
- *  indistinguishable from a complete one on the model's side, which is exactly
- *  the failure this machinery exists to prevent. The rebuild instead retries with
- *  backoff until every chunk lands. The escape hatches are both explicit and
- *  user-initiated: Stop (abandon this rebuild) or clear the history. */
+/** NO cap on how much history is replayed. Truncating the replay was rejected as
+ *  a design: a silently shortened history is indistinguishable from a complete one
+ *  on the model's side, which is exactly the failure this machinery exists to
+ *  prevent. The rebuild retries with backoff; when one chunk keeps failing,
+ *  `primeVerdict` decides split / give-up (limits below). Giving up leaves the
+ *  rebuild owed, so the next use retries it. Stop and clearing the history remain
+ *  the user's own ways out. */
 const PRIME_RETRY_BASE_MS = 5000;
 const PRIME_RETRY_MAX_MS = 60000;
 /** After this many consecutive failures on the SAME chunk, halve it and retry.
@@ -1100,6 +1106,12 @@ const PRIME_SPLIT_AFTER = 2;
 /** Floor for that halving, so a hard failure cannot devolve into thousands of
  *  microscopic prompts. */
 const PRIME_MIN_CHUNK_CHARS = 2000;
+/** Failures on ONE chunk before giving up, whatever the reason. Without it a chunk
+ *  that kept failing was retried every 60s forever (`chunk 1/6 FAILED tries=20`). */
+const PRIME_MAX_TRIES = 8;
+/** Failures on a chunk already at the floor before giving up: its size is no
+ *  longer the cause, so more tries only repeat the same failure. */
+const PRIME_GIVE_UP_AT_FLOOR = 3;
 /** How much of the tail of the conversation a snapshot rebuild carries verbatim.
  *  Everything older is reachable through the rendered history file. */
 const SNAPSHOT_RECENT_CHARS = 18000;
@@ -1513,16 +1525,19 @@ async function primeHistoryNow(
     entry.primeCursor = 0;
   }
   entry.primeAttempts = (entry.primeAttempts || 0) + 1;
+  entry.primeGaveUp = false;   // this IS the "next use": try again from the cursor
 
   const run = (async (): Promise<{ ok: boolean; error?: string }> => {
     entry.busy = true;
     entry.priming = true;
     try {
       let sameChunkFailures = 0;
-      // Retry until every chunk is accepted. There is deliberately no attempt
-      // limit and no truncation: the alternatives are giving the model a history
-      // it believes is complete when it is not, or wedging the chat. Both were
-      // rejected. The user's ways out are Stop (abandon) and clearing history.
+      // "Backend still settling" retries: they drive the backoff but are NOT
+      // failures, so they never count towards giving up.
+      let busyWaits = 0;
+      // Retry until every chunk is accepted, never truncating. A chunk that keeps
+      // failing ends the run per `primeVerdict` (flag stays set, next use retries).
+      // The user's other ways out are Stop (abandon) and clearing history.
       while ((entry.primeCursor || 0) < chunks.length) {
         // The executor can be replaced under us (model swap / re-attach). A new
         // kiro-cli process starts EMPTY, so this run's cursor is meaningless
@@ -1553,6 +1568,7 @@ async function primeHistoryNow(
           entry.primeCursor = i + 1;
           entry.primeLastError = undefined;
           sameChunkFailures = 0;
+          busyWaits = 0;
           continue;
         } catch (err: any) {
           // Surface WHY. kiro-cli answers many backend faults with a bare -32603
@@ -1563,8 +1579,12 @@ async function primeHistoryNow(
           try { detail = err?.data ? (typeof err.data === 'string' ? err.data : JSON.stringify(err.data)) : ''; } catch {}
           const msg = `${err?.message || 'prime failed'}${detail ? ` — ${detail}` : ''}`;
           entry.primeLastError = msg;
-          sameChunkFailures++;
-          logger.info('prime', `chunk ${i + 1}/${totalNow} FAILED sessionId=${sessionId} chars=${chunks[i].length} tries=${sameChunkFailures} err=${msg}`);
+          // A turn is still settling in the backend (often context compaction).
+          // Not an error state: wait it out and retry the SAME chunk.
+          const stillBusy = /prompt already in progress|active turn|compaction/i.test(msg);
+          if (stillBusy) busyWaits++;
+          else sameChunkFailures++;
+          logger.info('prime', `chunk ${i + 1}/${totalNow} FAILED sessionId=${sessionId} chars=${chunks[i].length} tries=${sameChunkFailures} busyWaits=${busyWaits} err=${msg}`);
 
           // Model retired mid-rebuild: swapping replaces the executor, whose new
           // process is empty, so this run ends and the fresh one rebuilds from 0.
@@ -1585,22 +1605,43 @@ async function primeHistoryNow(
             }
             logger.info('prime', `model unavailable during rebuild sessionId=${sessionId} NOT swapping (tried=${Array.from(tried).join(',')}) -> backing off and retrying same model`);
           }
-          // A turn is still settling in the backend (often context compaction).
-          // Not an error state: wait it out and retry the SAME chunk.
-          const stillBusy = /prompt already in progress|active turn|compaction/i.test(msg);
+          const verdict = primeVerdict({
+            tries: sameChunkFailures,
+            chunkChars: chunks[i].length,
+            stillBusy,
+            minChunkChars: PRIME_MIN_CHUNK_CHARS,
+            splitAfter: PRIME_SPLIT_AFTER,
+            maxTries: PRIME_MAX_TRIES,
+            giveUpAtFloor: PRIME_GIVE_UP_AT_FLOOR,
+          });
+          if (verdict === 'give-up') {
+            // NOT a success: needsHistoryPrime stays set so the next use retries
+            // (resuming at this cursor). primeGaveUp releases the session and keeps
+            // the owed flag from re-queuing this run straight away.
+            const note = primeGiveUpNote({
+              chunk: i + 1, total: totalNow, chars: chunks[i].length, tries: sameChunkFailures, error: msg,
+              atFloor: chunks[i].length <= PRIME_MIN_CHUNK_CHARS,
+            });
+            entry.primeLastError = note;
+            entry.primeGaveUp = true;
+            primeModelsTried.delete(sessionId);
+            logger.info('prime', `GAVE UP sessionId=${sessionId} chunk=${i + 1}/${totalNow} chars=${chunks[i].length} tries=${sameChunkFailures} cursor=${entry.primeCursor}/${chunks.length} err=${msg} (still owed; next use retries)`);
+            return { ok: false, error: note };
+          }
           // Repeated failure on one chunk: halve it. Helps if the backend is
           // rejecting this single request's size; harmless otherwise.
-          if (!stillBusy && sameChunkFailures >= PRIME_SPLIT_AFTER && chunks[i].length > PRIME_MIN_CHUNK_CHARS) {
+          if (verdict === 'split') {
             const half = splitHistory([chunks[i]], Math.max(PRIME_MIN_CHUNK_CHARS, Math.floor(chunks[i].length / 2)));
             if (half.length > 1) {
               chunks.splice(i, 1, ...half);
               entry.primeChunks = chunks;
               sameChunkFailures = 0;
+              busyWaits = 0;
               logger.info('prime', `chunk ${i + 1} SPLIT into ${half.length} sessionId=${sessionId} sizes=${half.map((c) => c.length).join(',')} total=${chunks.length}`);
               continue;
             }
           }
-          const wait = Math.min(PRIME_RETRY_MAX_MS, PRIME_RETRY_BASE_MS * Math.pow(2, Math.max(0, sameChunkFailures - 1)));
+          const wait = Math.min(PRIME_RETRY_MAX_MS, PRIME_RETRY_BASE_MS * Math.pow(2, Math.max(0, sameChunkFailures + busyWaits - 1)));
           entry.primeDetail = `重建历史上下文 ${i + 1}/${totalNow} 失败，${Math.round(wait / 1000)}s 后重试`;
           emitSessionBusy(sessionId);
           logger.info('prime', `retry in ${wait}ms sessionId=${sessionId} chunk=${i + 1}/${totalNow}`);
@@ -6106,7 +6147,9 @@ app.whenReady().then(async () => {
       } else if (!primed.ok && !primed.skipped) {
         // Do NOT silently continue on an empty backend. Surfacing this is the
         // whole point: the flag stays set, so the next send retries the rebuild.
-        throw new Error(`历史上下文重建未完成（${primed.error || '未知原因'}），这条消息未发出以免在空上下文上作答。重建会继续自动重试；不想等就按 Stop 放弃重建（这一条消息会照常发出，只是后端没有历史）。`);
+        throw new Error(entry.primeGaveUp
+          ? `历史上下文重建未完成（${primed.error || '未知原因'}），这条消息未发出以免在空上下文上作答。再发一次会重新尝试重建；不想重建就按 Stop 放弃（之后的消息会照常发出，只是后端没有历史）。`
+          : `历史上下文重建未完成（${primed.error || '未知原因'}），这条消息未发出以免在空上下文上作答。重建会继续自动重试；不想等就按 Stop 放弃重建（这一条消息会照常发出，只是后端没有历史）。`);
       }
     }
     // Kiro CLI performs context compaction inside the active session/prompt
