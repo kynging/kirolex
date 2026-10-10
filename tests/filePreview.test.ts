@@ -42,8 +42,27 @@ describe('the viewer watches the files it has open', () => {
   });
 
   test('a deleted file is reported as such rather than dropped', () => {
-    assert.match(body, /let exists = true;[\s\S]*?catch \{ exists = false; \}/);
-    assert.match(body, /send\('workspace:file-changed', \{ path: full2, exists, mtimeMs \}\)/);
+    // Reporting lives in `viewerChanged`, shared by `fs.watch` and the fallback poll,
+    // so both paths send the same shape -- and a deletion is a change too.
+    assert.match(body, /viewerChanged\(full2\);/);
+    assert.match(main, /function viewerChanged\(full: string\): void \{/);
+    assert.match(main, /return `\$\{st\.mtimeMs\}\|\$\{st\.size\}`; \} catch \{ return 'gone'; \}/);
+    assert.match(main, /exists: stamp !== 'gone',/);
+    assert.match(main, /send\('workspace:file-changed', \{/);
+  });
+
+  test('a fallback poll catches what fs.watch misses', () => {
+    // `fs.watch` never fires on some filesystems (network mounts, some container bind
+    // mounts). A `stat` every two seconds is cheap and does not read content.
+    assert.match(main, /const VIEWER_POLL_MS = 2000;/);
+    assert.match(body, /viewerPoll = setInterval\(\(\) => \{/);
+    assert.match(body, /for \(const full of \[\.\.\.viewerSeen\.keys\(\)\]\) viewerChanged\(full\);/);
+    // Same fingerprint -> no event; this also stops watch + poll from both reporting one save.
+    assert.match(main, /if \(viewerSeen\.get\(full\) === stamp\) return;/);
+    // Replacing the set must stop the previous timer, or every tab change adds one.
+    assert.match(main, /function stopViewerWatch\(\): void \{[\s\S]*?if \(viewerPoll\) \{ clearInterval\(viewerPoll\); viewerPoll = null; \}/);
+    // Seed the fingerprints, or the first tick treats every open file as just changed.
+    assert.match(body, /viewerSeen\.set\(full, viewerStamp\(full\)\);/);
   });
 
   test('the bridge is exposed both ways', () => {

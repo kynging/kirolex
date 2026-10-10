@@ -9164,6 +9164,13 @@ app.whenReady().then(async () => {
   const viewerWatchers = new Map<string, fs.FSWatcher>();   // dir -> watcher
   const viewerFiles = new Map<string, Set<string>>();       // dir -> basenames
   const viewerDebounce = new Map<string, NodeJS.Timeout>(); // full path -> timer
+  /** Fallback poll: `fs.watch` does not fire on every filesystem (network mounts, some
+   *  container bind mounts). Every `VIEWER_POLL_MS` the open files are `stat`ed -- at
+   *  most 32 (the tab cap), no content read -- and a changed fingerprint sends the same
+   *  event the watcher would. */
+  const viewerSeen = new Map<string, string>();             // full path -> `mtimeMs|size`
+  let viewerPoll: NodeJS.Timeout | null = null;
+  const VIEWER_POLL_MS = 2000;
 
   function stopViewerWatch(): void {
     for (const w of viewerWatchers.values()) { try { w.close(); } catch { /* already closed */ } }
@@ -9171,6 +9178,26 @@ app.whenReady().then(async () => {
     viewerFiles.clear();
     for (const t of viewerDebounce.values()) clearTimeout(t);
     viewerDebounce.clear();
+    viewerSeen.clear();
+    if (viewerPoll) { clearInterval(viewerPoll); viewerPoll = null; }
+  }
+
+  /** A file's fingerprint, `mtimeMs|size`; `gone` when it no longer exists. */
+  function viewerStamp(full: string): string {
+    try { const st = fs.statSync(full); return `${st.mtimeMs}|${st.size}`; } catch { return 'gone'; }
+  }
+
+  /** Report a change -- shared by `fs.watch` and the poll, so one save is reported once
+   *  and a deletion is reported (as `exists: false`) rather than dropped. */
+  function viewerChanged(full: string): void {
+    const stamp = viewerStamp(full);
+    if (viewerSeen.get(full) === stamp) return;   // unchanged, or already reported by the other path
+    viewerSeen.set(full, stamp);
+    mainWindow?.webContents.send('workspace:file-changed', {
+      path: full,
+      exists: stamp !== 'gone',
+      mtimeMs: stamp === 'gone' ? 0 : Number(stamp.split('|')[0]),
+    });
   }
 
   /** Replace the watched set with exactly these files. Returns how many are watched. */
@@ -9185,6 +9212,8 @@ app.whenReady().then(async () => {
       const names = viewerFiles.get(dir) || new Set<string>();
       names.add(base);
       viewerFiles.set(dir, names);
+      // Seed the fingerprint, or the first poll would report every open file as changed.
+      viewerSeen.set(full, viewerStamp(full));
       if (viewerWatchers.has(dir)) continue;
       try {
         const watcher = fs.watch(dir, (_type, changed) => {
@@ -9196,10 +9225,7 @@ app.whenReady().then(async () => {
           if (prev) clearTimeout(prev);
           viewerDebounce.set(full2, setTimeout(() => {
             viewerDebounce.delete(full2);
-            let exists = true;
-            let mtimeMs = 0;
-            try { mtimeMs = fs.statSync(full2).mtimeMs; } catch { exists = false; }
-            mainWindow?.webContents.send('workspace:file-changed', { path: full2, exists, mtimeMs });
+            viewerChanged(full2);
           }, 180));
         });
         watcher.on('error', () => { try { watcher.close(); } catch {} viewerWatchers.delete(dir); });
@@ -9209,6 +9235,11 @@ app.whenReady().then(async () => {
         // over: the viewer simply does not auto-refresh that file.
         logger.info('workspace', `watch skipped ${dir}: ${err?.message || err}`);
       }
+    }
+    if (viewerSeen.size) {
+      viewerPoll = setInterval(() => {
+        for (const full of [...viewerSeen.keys()]) viewerChanged(full);
+      }, VIEWER_POLL_MS);
     }
     return { ok: true, watching: wanted.length, dirs: viewerWatchers.size };
   });
