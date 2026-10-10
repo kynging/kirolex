@@ -7,7 +7,7 @@ import { normalizeLang, type Lang } from './i18n';
 import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT } from './uiZoom';
 import { LangProvider, useT } from './hooks/useLang';
 import { useRemoteTargets } from './hooks/useRemoteTargets';
-import { carrySplitSizes, computePaneFlex, SplitSizes } from './splitLayout';
+import { activeSplitSizes, computePaneFlex, putSplitSizes, resetSplitSizes, SplitSizeStore } from './splitLayout';
 import { autoFoldPanels } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
@@ -1441,10 +1441,10 @@ const App: React.FC = () => {
     for (let i = 0; i < panes.length; i += paneCols) out.push(panes.slice(i, i + paneCols));
     return out.length ? out : [[null]];
   }, [panes, paneCols]);
-  /** Dragged sizes are keyed by layout shape: restoring fractions that belonged to
-   *  a different pane count would silently mis-size the new arrangement. */
+  /** Dragged sizes are stored per layout shape (one bucket each, see splitLayout.ts):
+   *  a drag in one layout must not replace what you dragged in another. */
   const splitShape = `${paneRowsOfPanes.length}x${paneCols}:${panes.length}:${stripBelow ? 'b' : stripRight ? 'r' : '-'}`;
-  const [splitSizes, setSplitSizes] = useState<SplitSizes | null>(() => {
+  const [splitSizes, setSplitSizes] = useState<SplitSizeStore | null>(() => {
     try {
       // Shared store, NOT localStorage. localStorage is origin-scoped and this app
       // has two renderer origins (file:// for a normal start, http://localhost:5173
@@ -1458,10 +1458,10 @@ const App: React.FC = () => {
   // Live feature switches (main owns them; a Settings toggle re-renders here).
   const featureFlags = useFeatureFlags();
   const dragSplits = featureFlags.splitDragResize !== false;
-  // Carried, not exact-matched: adding a pane must not move the dividers that
-  // still describe the same structure. See carrySplitSizes.
+  // This shape's own bucket, else carried from the latest drag: adding a pane must
+  // not move the dividers that still describe the same structure. See activeSplitSizes.
   const activeSizes = useMemo(
-    () => carrySplitSizes(splitSizes, splitShape, paneRowsOfPanes),
+    () => activeSplitSizes(splitSizes, splitShape, paneRowsOfPanes),
     [splitSizes, splitShape, paneRowsOfPanes],
   );
   const rowFlex = (r: number) => activeSizes?.rows?.[r] ?? 1;
@@ -1505,7 +1505,7 @@ const App: React.FC = () => {
         // Build on the CARRIED sizes, not on an exact shape match: otherwise the
         // first drag after adding a pane would discard the proportions that were
         // just carried over and snap everything back to equal.
-        const carried = carrySplitSizes(cur, splitShape, paneRowsOfPanes);
+        const carried = activeSplitSizes(cur, splitShape, paneRowsOfPanes);
         const base = carried
           ? { shape: splitShape, rows: [...carried.rows], cols: carried.cols.map((row) => [...row]) }
           : {
@@ -1524,7 +1524,7 @@ const App: React.FC = () => {
         const share = pairSum * (newPrev / total);
         target[dividerIndex] = share;
         target[dividerIndex + 1] = pairSum - share;
-        return base;
+        return putSplitSizes(cur, base);
       });
     };
     const onMouseUp = () => {
@@ -1541,9 +1541,9 @@ const App: React.FC = () => {
   }, [splitShape, paneRowsOfPanes]);
   useEffect(() => {
     try {
-      // Reset (null) must also clear storage, otherwise a reload restores the
-      // proportions the user just discarded.
-      if (splitSizes) uiSet(SPLIT_SIZES_KEY, JSON.stringify(splitSizes));
+      // An empty store must also clear storage, otherwise a reload restores
+      // proportions that are no longer there.
+      if (splitSizes && Object.keys(splitSizes).length) uiSet(SPLIT_SIZES_KEY, JSON.stringify(splitSizes));
       else uiRemove(SPLIT_SIZES_KEY);
     } catch {}
   }, [splitSizes]);
@@ -3987,7 +3987,7 @@ const App: React.FC = () => {
                     className={`pane-resize-handle horizontal${dragSplits ? '' : ' locked'}`}
                     title={dragSplits ? t('Drag to resize (double-click to even out)') : t('Pane dragging is turned off in Settings')}
                     onMouseDown={dragSplits ? (e) => handlePaneResizeStart(e, 'row', 0, r - 1) : undefined}
-                    onDoubleClick={dragSplits ? () => setSplitSizes(null) : undefined}
+                    onDoubleClick={dragSplits ? () => setSplitSizes((cur) => resetSplitSizes(cur, splitShape)) : undefined}
                   />
                 )}
                 <div className="chat-row" style={{ flexGrow: rowFlex(r), flexBasis: 0 }}>
@@ -3998,7 +3998,7 @@ const App: React.FC = () => {
                           className={`pane-resize-handle vertical${dragSplits ? '' : ' locked'}`}
                           title={dragSplits ? t('Drag to resize width (double-click to even out)') : t('Pane dragging is turned off in Settings')}
                           onMouseDown={dragSplits ? (e) => handlePaneResizeStart(e, 'col', r, c - 1) : undefined}
-                          onDoubleClick={dragSplits ? () => setSplitSizes(null) : undefined}
+                          onDoubleClick={dragSplits ? () => setSplitSizes((cur) => resetSplitSizes(cur, splitShape)) : undefined}
                         />
                       )}
                       {renderPane(sid, sid === currentSessionId, true, {

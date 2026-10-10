@@ -60,6 +60,98 @@ export function carrySplitSizes(
   };
 }
 
+/** All dragged sizes, one bucket per shape. Key order is recency: the last key is the
+ *  most recently written bucket (see `putSplitSizes`). */
+export type SplitSizeStore = Record<string, SplitSizes>;
+
+/** What may be on disk: the bucketed store, or the old single `SplitSizes` object. */
+type StoredSplitSizes = SplitSizes | SplitSizeStore | null | undefined;
+
+const isSizes = (v: unknown): v is SplitSizes =>
+  !!v && typeof v === 'object' && typeof (v as SplitSizes).shape === 'string';
+
+/** Normalise either stored format into a fresh bucket map (the old single object
+ *  becomes its own shape's bucket). Junk entries are dropped. */
+function toStore(stored: StoredSplitSizes): SplitSizeStore {
+  const out: SplitSizeStore = {};
+  if (!stored || typeof stored !== 'object') return out;
+  if (isSizes(stored)) {
+    out[stored.shape] = stored;
+    return out;
+  }
+  for (const [k, v] of Object.entries(stored)) if (isSizes(v)) out[k] = v;
+  return out;
+}
+
+/**
+ * The dragged sizes for exactly this shape, or null when this shape was never dragged.
+ *
+ * Sizes are stored per shape because a drag belongs to one layout: with a single stored
+ * object, dragging in a 3-pane grid replaced what you had dragged in the 2-pane one, so
+ * going back to 2 panes no longer looked the way you left it.
+ */
+export function pickSplitSizes(stored: StoredSplitSizes, shape: string): SplitSizes | null {
+  return toStore(stored)[shape] ?? null;
+}
+
+/** True when these sizes are the even split nobody dragged: every value is 1, or
+ *  missing / not a number (which the readers also treat as 1). */
+export function isNeutralSizes(v: SplitSizes | null | undefined): boolean {
+  if (!v) return true;
+  const rows = Array.isArray(v.rows) ? v.rows : [];
+  const cols = Array.isArray(v.cols) ? v.cols.filter(Array.isArray).flat() : [];
+  return [...rows, ...cols].every((n) => !(typeof n === 'number' && Number.isFinite(n)) || Math.abs(n - 1) < 1e-9);
+}
+
+/**
+ * Write `next` into its own shape's bucket, leaving every other bucket alone, and make it
+ * the most recent one (an unseen shape carries from it, see `activeSplitSizes`).
+ *
+ * An even split never overwrites a dragged one: dragging always changes a proportion,
+ * so the only way to get all-1s here is a write that is not a drag, and letting it
+ * through would erase a drag for good. Evening a shape out is `resetSplitSizes`.
+ */
+export function putSplitSizes(stored: StoredSplitSizes, next: SplitSizes): SplitSizeStore {
+  const out = toStore(stored);
+  if (isNeutralSizes(next) && out[next.shape] && !isNeutralSizes(out[next.shape])) return out;
+  delete out[next.shape];
+  out[next.shape] = next;
+  return out;
+}
+
+/**
+ * Double-click on a divider: even out THIS shape only. It used to clear the whole store,
+ * which also threw away every other layout's drags.
+ *
+ * The shape gets an explicit empty (= even) bucket rather than none at all, because a
+ * shape without a bucket carries from the latest drag (`activeSplitSizes`) and would
+ * not even out. The bucket also becomes the latest, so a shape seen for the first time
+ * after a reset starts even too -- as it did when a reset cleared everything.
+ */
+export function resetSplitSizes(stored: StoredSplitSizes, shape: string): SplitSizeStore {
+  const out = toStore(stored);
+  delete out[shape];
+  out[shape] = { shape, rows: [], cols: [] };
+  return out;
+}
+
+/**
+ * The sizes to lay out `shape` with: its own bucket when it has one, otherwise the most
+ * recently dragged bucket carried over by index (`carrySplitSizes`), so adding a pane
+ * still keeps the dividers whose structure did not change.
+ */
+export function activeSplitSizes(
+  stored: StoredSplitSizes,
+  shape: string,
+  rowsOfPanes: PaneRow[],
+): SplitSizes | null {
+  const store = toStore(stored);
+  const own = store[shape];
+  if (own) return own;
+  const keys = Object.keys(store);
+  return carrySplitSizes(keys.length ? store[keys[keys.length - 1]] : null, shape, rowsOfPanes);
+}
+
 /**
  * Flex grow per pane, per row. The panes divide their row BETWEEN THEM: free capacity
  * to the right of a row is a slim strip of fixed width, not a share of the row.
