@@ -24,22 +24,26 @@ describe('子菜单竖直方向留在屏幕内', () => {
   });
 });
 
-describe('「移到项目」是一个子菜单入口', () => {
-  const at = SB.indexOf('移到项目：');
-  const block = SB.slice(at - 400, at + 1600);
+/*
+ * 「名字应该叫移动项目。里面不应该有移动到未分组的选项。而且现在第一个项目怎么显示在左边了，根本点不了」：
+ * 入口原来写「🏷️ 移到项目：<当前项目>」，看起来就像左边菜单里一个能点的项目 —— 其实只是入口，点了没反应。
+ */
+describe('「移动项目」是一个子菜单入口', () => {
+  const at = SB.indexOf("<Submenu label=\"🏷️ 移动项目\">");
+  const block = SB.slice(at, SB.indexOf('</Submenu>', at));
 
-  test('入口文字：已在项目里 / 还没归项目', () => {
+  test('入口文字固定是「移动项目」，不带当前项目名', () => {
     assert.ok(at > 0);
-    assert.match(block, /<Submenu label=\{ctxSession\.projectId \? `🏷️ 移到项目：\$\{ctxSession\.projectId\}` : '🏷️ 归到项目'\}>/);
+    assert.equal(/移到项目：|归到项目/.test(SB), false);
   });
   test('不再平铺 Move to project / Assign to project 标题', () => {
     assert.equal(/'Move to project'|'Assign to project'/.test(SB), false);
   });
-  test('移到未分组在最上面，后面接分隔线，再接项目列表', () => {
-    const un = block.indexOf("t('Unassign')");
-    const list = block.indexOf('projects.filter((p) => p !== ctxSession.projectId)');
-    assert.ok(un > 0 && list > un, '未分组要在项目列表之前');
-    assert.match(block.slice(un, list), /context-menu-divider/);
+  test('子菜单里没有「移到未分组」，只有其他项目', () => {
+    assert.equal(block.includes("t('Unassign')"), false);
+    assert.equal(block.includes('onMoveSession(ctxSession.id, null)'), false);
+    assert.ok(block.includes('projects.filter((p) => p !== ctxSession.projectId)'));
+    assert.ok(block.includes('onMoveSession(ctxSession.id, p)'));
   });
   test('没有其他项目时显示一行灰色、不能点的提示', () => {
     assert.match(block, /context-menu-item disabled[^]*没有其他项目/);

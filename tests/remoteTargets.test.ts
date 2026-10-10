@@ -659,11 +659,10 @@ describe('右键菜单：那条说的是"去哪儿"，不是"从哪儿走"', () 
     assert.equal(/'Unassign': '移出项目'/.test(I), false);
   });
 
-  test('动作没动：还是 onMoveSession(id, null)', () => {
+  /* 「移动项目」子菜单里**不应该有**移到未分组（用户后来的要求），右键菜单里就不再有这一条 */
+  test('右键菜单里不再有「移到未分组」这一条', () => {
     const SB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/Sidebar.tsx'), 'utf8');
-    const at = SB.indexOf("t('Unassign')");
-    assert.ok(at > 0);
-    assert.match(SB.slice(at - 320, at), /onMoveSession\(ctxSession\.id, null\)/);
+    assert.equal(SB.includes("t('Unassign')"), false);
   });
 });
 

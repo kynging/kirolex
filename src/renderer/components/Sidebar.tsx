@@ -1157,19 +1157,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {!ctxSession.id.startsWith('pending_') && (
             <>
               <div className="context-menu-divider" />
-              {/* 项目一多，平铺的话菜单在屏幕里放不下 —— 收进一个右侧展开的子菜单（面板自己限高、滚动） */}
-              <Submenu label={ctxSession.projectId ? `🏷️ 移到项目：${ctxSession.projectId}` : '🏷️ 归到项目'}>
-                {ctxSession.projectId && (
-                  <>
-                    <div
-                      className="context-menu-item"
-                      onClick={() => { onMoveSession(ctxSession.id, null); setContextMenu(null); }}
-                    >
-                      {`⬜ ${t('Unassign')}`}
-                    </div>
-                    <div className="context-menu-divider" />
-                  </>
-                )}
+              {/* 项目一多，平铺的话菜单在屏幕里放不下 —— 收进一个右侧展开的子菜单（面板自己限高、滚动）。
+                  入口名字固定，不带当前项目名：带上的话它看起来就像左边一个能点的项目，其实只是入口。
+                  这里不放「移到未分组」，只列其他项目。 */}
+              <Submenu label="🏷️ 移动项目">
                 {projects.filter((p) => p !== ctxSession.projectId).map((p) => (
                   <div
                     key={p}
