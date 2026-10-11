@@ -507,7 +507,8 @@ export async function handleRpc(
  * 为什么是"原样转发"而不是自己包一层工具：那些 server 的工具清单、schema、行为都由它们自己说，
  * 包一层就等于要跟着它们的版本走 —— 而转发连它们的 `initialize` 响应都不用看懂。
  */
-export interface ProxySpec {
+export interface StdioProxySpec {
+  type?: 'stdio';
   /** MCP 的名字（远端 agent 配置里也用这个名字）。 */
   name: string;
   command: string;
@@ -515,15 +516,37 @@ export interface ProxySpec {
   env?: Record<string, string>;
 }
 
+/**
+ * **HTTP 型**：远端发来的请求由本机代为发往一个**固定的**上游网址 —— 上游看到的是你本机的
+ * 出口 IP，密钥也只在本机（典型：妙想 MCP，StreamableHttp，请求头 `em_api_key` 鉴权）。
+ * 请求头的值可以写 `${env:NAME}` / `${NAME}`，转发时展开成本机环境变量。
+ */
+export interface HttpProxySpec {
+  type: 'http';
+  name: string;
+  url: string;
+  headers?: Record<string, string>;
+  /** 默认 `PROXY_TIMEOUT_MS`，下限 `HTTP_PROXY_MIN_TIMEOUT_MS`。 */
+  timeoutMs?: number;
+}
+
+export type ProxySpec = StdioProxySpec | HttpProxySpec;
+
+/** 被代理的 MCP 的共同面：转发一条 JSON-RPC（通知返回 null），会话结束时停掉。 */
+interface ForwardProxy {
+  call(msg: any): Promise<any | null>;
+  stop(): void;
+}
+
 /** 一个被代理的 stdio MCP：懒启动、按 id 配对、会话结束时杀掉。 */
-class StdioProxy {
-  private spec: ProxySpec;
+class StdioProxy implements ForwardProxy {
+  private spec: StdioProxySpec;
   private log: LocalMcpDeps['log'];
   private child: ChildProcess | null = null;
   private buf = '';
   private pending = new Map<string | number, (msg: any) => void>();
 
-  constructor(spec: ProxySpec, log: LocalMcpDeps['log']) {
+  constructor(spec: StdioProxySpec, log: LocalMcpDeps['log']) {
     this.spec = spec;
     this.log = log;
   }
@@ -624,6 +647,454 @@ class StdioProxy {
  */
 export const PROXY_TIMEOUT_MS = 180_000;
 
+/* ------------------------------------------- HTTP 型转发：本机代发到固定上游 */
+
+/** HTTP 型转发的超时下限：上游（例如妙想）查一次数据常要一两分钟，太短会被误判成坏了。 */
+export const HTTP_PROXY_MIN_TIMEOUT_MS = 120_000;
+/** 上游一次回复的上限 —— 防止一个失控的上游把本机内存吃光。 */
+const HTTP_PROXY_MAX_BODY = 16 * 1024 * 1024;
+
+export function httpProxyTimeout(spec: HttpProxySpec): number {
+  const t = Number(spec.timeoutMs);
+  return Math.max(HTTP_PROXY_MIN_TIMEOUT_MS, Number.isFinite(t) && t > 0 ? t : PROXY_TIMEOUT_MS);
+}
+
+/** 密钥打码：只留前 4 位；8 位以内的整段打码（留 4 位就等于露了一半）。 */
+export function maskSecret(value: string): string {
+  const s = String(value ?? '');
+  if (s.length <= 8) return '*'.repeat(s.length);
+  return s.slice(0, 4) + '*'.repeat(s.length - 4);
+}
+
+/** URL 打码：query 参数的值和 userinfo 一律打码（有人把 key 放在 `?key=` 里）。 */
+export function maskUrl(url: string): string {
+  let u: URL;
+  try { u = new URL(url); } catch { return maskSecret(url); }
+  if (u.username) u.username = maskSecret(decodeURIComponent(u.username));
+  if (u.password) u.password = maskSecret(decodeURIComponent(u.password));
+  const masked = new URLSearchParams();
+  for (const [k, v] of u.searchParams) masked.append(k, maskSecret(v));
+  u.search = masked.toString();
+  return u.toString();
+}
+
+/** `${env:NAME}` / `${NAME}` 引用的变量本机没有 —— 这是配置错误，不是上游的错。 */
+export class MissingEnvError extends Error {
+  envName: string;
+  constructor(envName: string) {
+    super(`本机环境变量 ${envName} 不存在`);
+    this.envName = envName;
+  }
+}
+
+/** 把 `${env:NAME}` 和 `${NAME}` 展开成环境变量的值；变量不存在就抛 `MissingEnvError`。 */
+export function expandEnvRefs(value: string, env: Record<string, string | undefined> = process.env): string {
+  return String(value ?? '').replace(/\$\{(?:env:)?([A-Za-z_][A-Za-z0-9_]*)\}/g, (_m, name: string) => {
+    const v = env[name];
+    if (v === undefined) throw new MissingEnvError(name);
+    return v;
+  });
+}
+
+/** 转发途中一次可读的失败。`sessionGone` = 上游明确说会话没了，值得重建一次。 */
+class UpstreamError extends Error {
+  sessionGone: boolean;
+  /** 失效时这条请求**实际带着的** session id —— 用来分辨"失效的是不是当前这个会话"。 */
+  staleSession: string | null;
+  constructor(message: string, sessionGone = false, staleSession: string | null = null) {
+    super(message);
+    this.sessionGone = sessionGone;
+    this.staleSession = staleSession;
+  }
+}
+
+/**
+ * 上游正文是否**明确**在说"会话不存在 / 过期 / 无效"。只看到 `session` 这个词不算 ——
+ * `Invalid argument sessionDate` 这种参数错误若被当成会话失效，工具就会被重复调用一次。
+ */
+export function sessionGoneText(text: string): boolean {
+  const t = String(text || '');
+  return /\bsession(?:[\s_-]*id)?\b[^.\n]{0,20}?\b(?:not\s+found|expired|invalid|terminated|unknown|does\s+not\s+exist|is\s+required|missing)\b/i.test(t)
+    || /\b(?:no\s+valid|invalid|unknown|expired|missing|no)\s+(?:mcp[\s-]*)?session(?:[\s_-]*id)?\b/i.test(t)
+    || /会话.{0,10}(?:失效|过期|不存在|无效)/.test(t);
+}
+
+/** fetch 抛出来的网络错误 → 一句人话。 */
+function describeNetError(err: any): string {
+  const cause = err?.cause;
+  const code: string = String(cause?.code || cause?.errors?.[0]?.code || err?.code || '');
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return `连不上上游：域名解析失败（${code}）`;
+  if (code === 'ECONNREFUSED') return `连不上上游：连接被拒绝（${code}）`;
+  if (code === 'ECONNRESET') return `连不上上游：连接被重置（${code}）`;
+  if (code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return `连不上上游：连接超时（${code}）`;
+  if (/CERT|SSL|TLS|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(code)) return `连不上上游：TLS 握手失败（${code}）`;
+  return `连不上上游：${code || cause?.message || err?.message || String(err)}`;
+}
+
+/**
+ * 一个被代理的 **HTTP（StreamableHttp）MCP**。
+ *
+ * **只能发往 `spec.url`**：远端送来的只有 JSON-RPC 本身 —— 它的路径、query、请求头一概不看，
+ * 否则这个端点就成了一个"用你的 IP、带你的密钥"的通用代理。请求头只用 `spec.headers`
+ * 加上协议必需的几条；上游要求跳转也不跟（跟了密钥就被带去别处了）。
+ *
+ * 上游的 `mcp-session-id` 由这里保管：远端不知道它，也不需要知道。上游说会话没了（404 /
+ * 明确的会话失效），就用远端当初那份 initialize 参数重建一次，再重试原请求。
+ */
+export class HttpProxy implements ForwardProxy {
+  private spec: HttpProxySpec;
+  private log: LocalMcpDeps['log'];
+  private timeoutMs: number;
+  private sessionId: string | null = null;
+  private protocolVersion: string | null = null;
+  private initParams: any = null;
+  private reinit: Promise<void> | null = null;
+  private inflight = new Set<AbortController>();
+  private announced = false;
+  private stopped = false;
+  private reinitSeq = 0;
+  /** 这一轮实际用到的密钥（展开后的请求头值、URL query 的值）—— 日志和错误文案里都要抹掉。 */
+  private secrets: string[] = [];
+
+  constructor(spec: HttpProxySpec, log: LocalMcpDeps['log']) {
+    this.spec = spec;
+    this.log = log;
+    this.timeoutMs = httpProxyTimeout(spec);
+  }
+
+  private tag(): string { return `本机→上游（${this.spec.name}）`; }
+
+  /**
+   * 把任何出现过的密钥抹成打码形式 —— fetch 的异常信息等可能把它带出来。
+   * 不设长度门槛：再短的密钥也是密钥（宁可把日志里几个碰巧相同的字符打成 `*`）。
+   */
+  private scrub(text: string): string {
+    let out = String(text);
+    for (const s of this.secrets) out = out.split(s).join(maskSecret(s));
+    return out;
+  }
+
+  private say(level: 'info' | 'warn', text: string): void {
+    try { this.log(level, this.scrub(`[${this.spec.name}] ${text}`)); } catch { /* 日志坏了不能连累转发 */ }
+  }
+
+  private fail(id: any, reason: string): any {
+    return { jsonrpc: '2.0', id: id ?? null, error: { code: -32000, message: this.scrub(`${this.tag()}${reason}`) } };
+  }
+
+  /** 校验网址、展开请求头。配置有问题就抛 `UpstreamError`（不发请求）。 */
+  private prepare(): Record<string, string> {
+    let u: URL;
+    try { u = new URL(this.spec.url); } catch { throw new UpstreamError('配置错误：上游网址无效'); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new UpstreamError(`配置错误：上游网址只支持 http / https（现在是 ${u.protocol}）`);
+    const secrets: string[] = [];
+    for (const [, v] of u.searchParams) secrets.push(v);
+    if (u.username) secrets.push(decodeURIComponent(u.username));
+    if (u.password) secrets.push(decodeURIComponent(u.password));
+    const headers: Record<string, string> = {};
+    for (const [k, raw] of Object.entries(this.spec.headers || {})) {
+      try {
+        headers[k] = expandEnvRefs(String(raw));
+      } catch (e: any) {
+        if (e instanceof MissingEnvError) throw new UpstreamError(`配置错误：请求头 ${k} 引用的本机环境变量 ${e.envName} 不存在`);
+        throw e;
+      }
+      secrets.push(headers[k], String(raw));
+      /*
+        `Bearer <密钥>` 这类值：上游回显时往往只回显后半截，所以每一段也单独当密钥抹掉
+        （认证方案名本身不是密钥，留着便于看懂日志）。
+      */
+      for (const part of headers[k].split(/[\s,;]+/)) {
+        if (part && !/^(bearer|basic|token|digest)$/i.test(part)) secrets.push(part);
+      }
+    }
+    /* 长的先抹：一个密钥是另一个的前缀时，先抹短的会留下长的后半截 */
+    this.secrets = [...new Set(secrets.filter(Boolean))].sort((a, b) => b.length - a.length);
+    if (!this.announced) {
+      this.announced = true;
+      const shown = Object.keys(headers).map((k) => `${k}=${maskSecret(headers[k])}`).join(', ');
+      this.say('info', `HTTP 转发到 ${maskUrl(this.spec.url)}${shown ? `（请求头：${shown}）` : ''}`);
+    }
+    return headers;
+  }
+
+  /** 转发一条 JSON-RPC。通知（没有 id）发完返回 null。`timeoutMs` 只给测试 / 探测用。 */
+  async call(msg: any, timeoutMs = this.timeoutMs): Promise<any | null> {
+    return (await this.send(msg, timeoutMs)).answer;
+  }
+
+  /**
+   * 和 `call` 一样转发，但同时交出失败原因。远端的通知没处可回错（本地服务照样回 202），
+   * 而探测必须知道 `notifications/initialized` 有没有真的发成功 —— 否则握手失败会被报成可用。
+   */
+  async send(msg: any, timeoutMs = this.timeoutMs): Promise<{ answer: any | null; error: string | null }> {
+    const id = msg?.id;
+    const isNote = id === undefined;
+    try {
+      if (this.stopped) throw new UpstreamError('转发已停止（会话已结束）');
+      const headers = this.prepare();
+      if (msg?.method === 'initialize') {
+        this.initParams = msg?.params ?? null;
+        /* 远端重新握手 = 一个新会话；带着旧的 session id 去 initialize 会被上游拒 */
+        this.sessionId = null;
+      }
+      let out: any;
+      try {
+        out = await this.post(msg, headers, timeoutMs);
+      } catch (e: any) {
+        if (!(e instanceof UpstreamError) || !e.sessionGone) throw e;
+        /*
+          并发时会有好几条请求带着同一个旧会话先后回 404。只有失效的**正是当前会话**时才清掉、重建；
+          别的请求已经在重建（或已经建好新会话）时，等它 / 直接用新会话重试 ——
+          晚到的旧会话错误不能把刚建好的新会话清掉。
+        */
+        if (msg?.method === 'initialize') {
+          this.sessionId = null;
+        } else if (this.reinit) {
+          await this.reinit;
+        } else if (this.sessionId === e.staleSession) {
+          this.say('warn', '上游说会话失效了 —— 清掉 session id，重新 initialize 一次再重试');
+          await this.reinitialize(headers, timeoutMs);
+        }
+        try {
+          out = await this.post(msg, headers, timeoutMs);
+        } catch (e2: any) {
+          if (e2 instanceof UpstreamError && e2.sessionGone) throw new UpstreamError('会话失效，重建后上游仍然不认');
+          throw e2;
+        }
+      }
+      return { answer: isNote ? null : out, error: null };
+    } catch (e: any) {
+      const reason = e instanceof UpstreamError ? e.message : `转发失败：${e?.message || e}`;
+      const answer = this.fail(id, reason);
+      this.say('warn', `${isNote ? `通知 ${msg?.method} ` : ''}${answer.error.message}`);
+      return { answer: isNote ? null : answer, error: answer.error.message };
+    }
+  }
+
+  /** 用远端当初的 initialize 参数重建上游会话。并发的几个请求共用同一次重建。 */
+  private reinitialize(headers: Record<string, string>, timeoutMs: number): Promise<void> {
+    if (this.reinit) return this.reinit;
+    const run = async (): Promise<void> => {
+      /* 同步执行到第一个 await 之前：建好 this.reinit 之前旧 id 就已经清掉了 */
+      this.sessionId = null;
+      const init = {
+        jsonrpc: '2.0',
+        id: `kirolex-reinit-${++this.reinitSeq}`,
+        method: 'initialize',
+        params: this.initParams ?? {
+          protocolVersion: this.protocolVersion || MCP_PROTOCOL_VERSION,
+          capabilities: {},
+          clientInfo: { name: 'kirolex-http-proxy', version: '1' },
+        },
+      };
+      let r: any;
+      try { r = await this.post(init, headers, timeoutMs); } catch (e: any) {
+        throw new UpstreamError(`重建会话失败：${e instanceof UpstreamError ? e.message : e?.message || e}`);
+      }
+      if (r?.error) throw new UpstreamError(`重建会话失败：${r.error?.message || JSON.stringify(r.error)}`);
+      await this.post({ jsonrpc: '2.0', method: 'notifications/initialized' }, headers, timeoutMs);
+    };
+    this.reinit = run().finally(() => { this.reinit = null; });
+    return this.reinit;
+  }
+
+  /** 发一次 POST。请求返回那条配对的响应，通知返回 null；失败抛 `UpstreamError`。 */
+  private async post(msg: any, headers: Record<string, string>, timeoutMs: number): Promise<any | null> {
+    const id = msg?.id;
+    const isNote = id === undefined;
+    const ac = new AbortController();
+    this.inflight.add(ac);
+    const timer = setTimeout(() => ac.abort(), timeoutMs);
+    const sentSession = this.sessionId;
+    try {
+      /* 协议必需的几条放在最后：本机配置也不能把 Accept / session 覆盖掉 */
+      const h: Record<string, string> = {
+        ...headers,
+        'content-type': 'application/json',
+        accept: 'application/json, text/event-stream',
+      };
+      if (sentSession) h['mcp-session-id'] = sentSession;
+      if (this.protocolVersion) h['mcp-protocol-version'] = this.protocolVersion;
+      let res: Response;
+      try {
+        res = await fetch(this.spec.url, {
+          method: 'POST', headers: h, body: JSON.stringify(msg), signal: ac.signal, redirect: 'manual',
+        });
+      } catch (e: any) {
+        if (ac.signal.aborted) throw this.abortError(timeoutMs);
+        throw new UpstreamError(describeNetError(e));
+      }
+      const sid = res.headers.get('mcp-session-id');
+      if (sid) this.sessionId = sid;
+
+      if (res.status < 200 || res.status >= 300) {
+        const text = await this.readText(res, ac, timeoutMs).catch(() => '');
+        if (msg?.method !== 'initialize' && ((res.status === 404 && sentSession) || ((res.status === 400 || res.status === 404) && sessionGoneText(text)))) {
+          throw new UpstreamError(`会话失效：HTTP ${res.status}`, true, sentSession);
+        }
+        if (res.status === 401 || res.status === 403) {
+          throw new UpstreamError(`鉴权失败：HTTP ${res.status}，请检查本机配置的密钥`);
+        }
+        if (res.status >= 300 && res.status < 400) {
+          throw new UpstreamError(`上游要求跳转（HTTP ${res.status}），出于安全不跟随，请检查本机配置的网址`);
+        }
+        /* 上游的报错正文不写进日志和错误：它可能回显密钥的任意一部分，打码保证不了 */
+        throw new UpstreamError(`请求失败：HTTP ${res.status}`);
+      }
+
+      if (isNote) {
+        try { await res.body?.cancel(); } catch {}
+        return null;
+      }
+      const ct = (res.headers.get('content-type') || '').toLowerCase();
+      const answer = ct.includes('text/event-stream')
+        ? await this.readSse(res, id, ac, timeoutMs)
+        : this.pickJson(await this.readText(res, ac, timeoutMs), id);
+      if (msg?.method === 'initialize' && typeof answer?.result?.protocolVersion === 'string') {
+        this.protocolVersion = answer.result.protocolVersion;
+      }
+      return answer;
+    } finally {
+      clearTimeout(timer);
+      this.inflight.delete(ac);
+    }
+  }
+
+  private abortError(timeoutMs: number): UpstreamError {
+    return this.stopped
+      ? new UpstreamError('转发已停止（会话已结束）')
+      : new UpstreamError(`超时：${timeoutMs}ms 内上游没有回复`);
+  }
+
+  private async readText(res: Response, ac: AbortController, timeoutMs: number): Promise<string> {
+    const chunks: Buffer[] = [];
+    let total = 0;
+    try {
+      const reader = res.body?.getReader();
+      if (!reader) return '';
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        total += value.length;
+        if (total > HTTP_PROXY_MAX_BODY) {
+          reader.cancel().catch(() => {});
+          throw new UpstreamError(`响应解析失败：上游回复超过 ${HTTP_PROXY_MAX_BODY} 字节`);
+        }
+        chunks.push(Buffer.from(value));
+      }
+    } catch (e: any) {
+      if (e instanceof UpstreamError) throw e;
+      if (ac.signal.aborted) throw this.abortError(timeoutMs);
+      throw new UpstreamError(`响应解析失败：读取上游回复时断开（${e?.message || e}）`);
+    }
+    return Buffer.concat(chunks).toString('utf-8');
+  }
+
+  private pickJson(text: string, id: any): any {
+    if (!text.trim()) throw new UpstreamError('响应解析失败：上游没有返回内容');
+    let parsed: any;
+    try { parsed = JSON.parse(text); } catch {
+      throw new UpstreamError('响应解析失败：上游返回的不是合法 JSON');
+    }
+    if (Array.isArray(parsed)) {
+      const hit = parsed.find((m) => m && m.id === id);
+      if (!hit) throw new UpstreamError(`响应解析失败：上游回复里没有 id 为 ${JSON.stringify(id)} 的响应`);
+      return hit;
+    }
+    if (!parsed || typeof parsed !== 'object') throw new UpstreamError('响应解析失败：上游返回的不是 JSON-RPC 对象');
+    return parsed;
+  }
+
+  /** 解析 SSE：取出 id 对应的那条响应就收手；上游顺带推的通知 / 请求一律丢掉。 */
+  private async readSse(res: Response, id: any, ac: AbortController, timeoutMs: number): Promise<any> {
+    const reader = res.body?.getReader();
+    if (!reader) throw new UpstreamError('响应解析失败：SSE 流是空的');
+    const decoder = new TextDecoder();
+    let buf = '';
+    let total = 0;
+    try {
+      for (;;) {
+        const { done, value } = await reader.read();
+        if (value) {
+          total += value.length;
+          if (total > HTTP_PROXY_MAX_BODY) throw new UpstreamError(`响应解析失败：上游回复超过 ${HTTP_PROXY_MAX_BODY} 字节`);
+          buf += decoder.decode(value, { stream: true });
+        }
+        if (done) buf += `${decoder.decode()}\n\n`;
+        /* `\r` 落在块尾时它后面可能还有 `\n`，先留着不规整 */
+        let keep = '';
+        if (!done && buf.endsWith('\r')) { keep = '\r'; buf = buf.slice(0, -1); }
+        buf = buf.replace(/\r\n?/g, '\n');
+        let i: number;
+        while ((i = buf.indexOf('\n\n')) >= 0) {
+          const block = buf.slice(0, i);
+          buf = buf.slice(i + 2);
+          const data = block.split('\n')
+            .filter((l) => l.startsWith('data:'))
+            .map((l) => l.slice(5).replace(/^ /, ''))
+            .join('\n');
+          if (!data) continue;
+          let m: any;
+          try { m = JSON.parse(data); } catch { continue; }
+          const hit = Array.isArray(m)
+            ? m.find((x) => x && x.id === id && ('result' in x || 'error' in x))
+            : (m && m.id === id && ('result' in m || 'error' in m) ? m : undefined);
+          if (hit) {
+            reader.cancel().catch(() => {});
+            return hit;
+          }
+        }
+        buf += keep;
+        if (done) break;
+      }
+    } catch (e: any) {
+      reader.cancel().catch(() => {});
+      if (e instanceof UpstreamError) throw e;
+      if (ac.signal.aborted) throw this.abortError(timeoutMs);
+      throw new UpstreamError(`响应解析失败：读取 SSE 时断开（${e?.message || e}）`);
+    }
+    throw new UpstreamError(`响应解析失败：SSE 流结束了也没有 id 为 ${JSON.stringify(id)} 的响应`);
+  }
+
+  stop(): void {
+    this.stopped = true;
+    for (const ac of this.inflight) { try { ac.abort(); } catch {} }
+    this.inflight.clear();
+    this.sessionId = null;
+  }
+}
+
+/**
+ * 探测一个 HTTP MCP 能不能用：initialize + notifications/initialized + tools/list。
+ * 给会话准备阶段调用，在界面上提示"密钥不对 / 连不上 / 有几个工具"。
+ */
+export async function probeHttpMcp(
+  spec: HttpProxySpec,
+  opts: { log?: LocalMcpDeps['log']; timeoutMs?: number } = {},
+): Promise<{ ok: boolean; toolCount: number; error?: string }> {
+  const proxy = new HttpProxy(spec, opts.log || (() => {}));
+  const t = opts.timeoutMs;
+  try {
+    const init = await proxy.call({
+      jsonrpc: '2.0', id: 1, method: 'initialize',
+      params: { protocolVersion: MCP_PROTOCOL_VERSION, capabilities: {}, clientInfo: { name: 'kirolex-probe', version: '1' } },
+    }, t);
+    if (init?.error) return { ok: false, toolCount: 0, error: String(init.error.message || JSON.stringify(init.error)) };
+    const note = await proxy.send({ jsonrpc: '2.0', method: 'notifications/initialized' }, t);
+    if (note.error) return { ok: false, toolCount: 0, error: note.error };
+    const list = await proxy.call({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, t);
+    if (list?.error) return { ok: false, toolCount: 0, error: String(list.error.message || JSON.stringify(list.error)) };
+    const tools = list?.result?.tools;
+    if (!Array.isArray(tools)) return { ok: false, toolCount: 0, error: `本机→上游（${spec.name}）响应解析失败：tools/list 没有返回工具清单` };
+    return { ok: true, toolCount: tools.length };
+  } catch (e: any) {
+    return { ok: false, toolCount: 0, error: `本机→上游（${spec.name}）探测失败：${e?.message || e}` };
+  } finally {
+    proxy.stop();
+  }
+}
+
 /* ------------------------------------------------------------ HTTP 服务 */
 
 export interface LocalMcpServer {
@@ -650,7 +1121,7 @@ export function newToken(): string {
 export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpServer> {
   const sessions = new Map<string, LocalMcpSession>();   // token -> session
   /** `<sessionId>\0<名字>` -> 那个被代理的本机 MCP。 */
-  const proxies = new Map<string, StdioProxy>();
+  const proxies = new Map<string, ForwardProxy>();
   const stopProxies = (sessionId: string): void => {
     for (const [k, v] of proxies) {
       if (k.startsWith(`${sessionId}\u0000`)) { v.stop(); proxies.delete(k); }
@@ -717,7 +1188,13 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
         setProxies(sessionId, specs) {
           stopProxies(sessionId);
           for (const spec of specs) {
-            if (!spec?.name || !spec?.command) continue;
+            if (!spec?.name) continue;
+            if (spec.type === 'http') {
+              if (!spec.url) continue;
+              proxies.set(`${sessionId}\u0000${spec.name}`, new HttpProxy(spec, deps.log));
+              continue;
+            }
+            if (!spec.command) continue;
             proxies.set(`${sessionId}\u0000${spec.name}`, new StdioProxy(spec, deps.log));
           }
         },
