@@ -273,7 +273,12 @@ describe('远程会话的模型回退按那台机器的清单', () => {
   });
 
   test('接线：每条经 connectWithModelFallback 起远程 kiro 的路都把远端清单传进去', () => {
-    const calls = M.match(/await connectWithModelFallback\([^;]*\);/g) || [];
+    /* 换「组合」那一条只给 Claude Code / Codex（不走 kiro 的模型清单）：单独核对它前面拦了 kiro */
+    const all = M.match(/await connectWithModelFallback\([^;]*\);/g) || [];
+    const calls = all.filter((c) => !c.includes("'switch-mcp-combo'"));
+    assert.equal(all.length - calls.length, 1);
+    const combo = M.slice(M.indexOf("ipcMain.handle('acp:switch-mcp-combo'"), M.indexOf("'switch-mcp-combo', localTools"));
+    assert.match(combo, /if \(engineOf\(oldEntry\.profile\) === 'kiro'\) throw/);
     assert.equal(calls.length, 3, '新建 / 换引擎 / attach');
     for (const c of calls) assert.match(c, /, remoteModels\);$/, `没传远端清单：${c}`);
   });

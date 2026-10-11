@@ -33,7 +33,9 @@ describe('休眠的会话也能改 model / agent / 权限', () => {
   });
 
   test('三条路都走它 —— 不能只修被报上来的那一条', () => {
-    assert.equal((MAIN.match(/setDormantProfile\(sessionId/g) || []).length, 3);
+    /* 第四条是换「组合」（Claude Code / Codex 专有，见 mcpCombos.test.ts） */
+    assert.equal((MAIN.match(/setDormantProfile\(sessionId/g) || []).length, 4);
+    assert.match(MAIN, /setDormantProfile\(sessionId, \{ mcpCombo: nextCombo \}/);
     /* 换模型写两个字段：`preferredModel` 是"你选的"（attach 只认它），`model` 是"这次用的" */
     assert.match(MAIN, /setDormantProfile\(sessionId, \{\s*model: normalizedModel, preferredModel: normalizedModel,/);
     assert.match(MAIN, /setDormantProfile\(sessionId, \{ kiroAgent: normalizedAgent \}/);

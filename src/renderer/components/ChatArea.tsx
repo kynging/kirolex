@@ -4,6 +4,7 @@ import { uiGet, uiSet, uiRemove } from '../uiStore';
 import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
 import { KiroConfigPanel, type KiroConfigCategory } from './KiroConfigPanel';
 import { EngineLoginPane } from './LoginSettings.tsx';
+import { McpCombosPane } from './McpCombosPane.tsx';
 import ReactMarkdown from 'react-markdown';
 import { mdText } from '../mdText';
 // 「这段文字是不是路径」的判据 —— 抽出来是为了能被 node:test 测到（.tsx 跑不了测试）
@@ -3012,6 +3013,37 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     void api?.engineModels?.(currentSessionId).then((d: any) => { if (d) setEngineModels(d); }).catch(() => {});
     return () => { try { off?.(); } catch { /* 卸载 */ } };
   }, [nonKiro, currentSessionId, engine, status]);
+  /*
+    **「组合」下拉**（取代原来的 effort 下拉）——「不同对话挂不同的 MCP」。清单是本机全局的
+    `~/.kirolex/mcp-combos.json`（面板里「🧩 组合」那页改），每条会话记自己选的那个；换了要重启执行器（main 做）。
+  */
+  type McpComboList = { combos: Array<{ id: string; name: string; effort?: string }>; current: string; missing?: string; error?: string };
+  const [mcpCombos, setMcpCombos] = useState<McpComboList | null>(null);
+  const [mcpComboBusy, setMcpComboBusy] = useState(false);
+  useEffect(() => {
+    setMcpCombos(null);
+    if (!nonKiro || !currentSessionId) return;
+    const api = (window as any).kiroApi;
+    let alive = true;
+    const load = () => {
+      void api?.mcpCombos?.(currentSessionId).then((d: McpComboList) => { if (alive && d) setMcpCombos(d); }).catch(() => {});
+    };
+    load();
+    const off = api?.onMcpCombosChanged?.(load);
+    return () => { alive = false; try { off?.(); } catch { /* 卸载 */ } };
+  }, [nonKiro, currentSessionId, engine, status]);
+  const onMcpComboChange = async (comboId: string): Promise<void> => {
+    if (!currentSessionId) return;
+    setMcpComboBusy(true); setEngineModelErr('');
+    try {
+      const d = await (window as any).kiroApi.switchMcpCombo(currentSessionId, comboId);
+      setMcpCombos((prev) => (prev ? { ...prev, current: d?.current || comboId, missing: undefined } : prev));
+    } catch (err: any) {
+      setEngineModelErr(String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
+    } finally {
+      setMcpComboBusy(false);
+    }
+  };
   const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
   const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode', value: string): Promise<void> => {
     if (!currentSessionId) return;
@@ -4100,20 +4132,24 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         {engine === 'claude' ? <IconClaudeSpark size={15} /> : <IconCodexPrompt size={15} />}
                       </button>
                       {/*
-                        **effort** ——「配置按钮右边的那个 claude code 难道不应该改成什么其他的配置选项吗」→「改成 effort 吧」。
-                        引擎是谁看左边那个图标就知道了（悬停有字）。
+                        **组合** —— 取代原来的 effort 下拉：组合里带着 MCP 和 effort（「不同对话挂不同的 MCP」）。
+                        换组合会重启这条会话的执行器，所以回复中不让换。
                       */}
                       <select
-                        className="composer-select composer-effort-select"
-                        value={engineModels?.effort?.current || ''}
-                        onChange={(event) => void onEngineOptionChange('thought_level', event.target.value)}
-                        disabled={!currentSessionId || !engineModels?.effort?.options.length || isStreaming || isLooping || engineModelBusy || status !== 'connected'}
-                        title={`${engineLabel} 的 effort（想多久）`}
-                        aria-label="Effort"
+                        className="composer-select composer-combo-select"
+                        value={mcpCombos?.current || 'default'}
+                        onChange={(event) => void onMcpComboChange(event.target.value)}
+                        disabled={!currentSessionId || !mcpCombos || isStreaming || isLooping || mcpComboBusy || engineModelBusy}
+                        title={isStreaming
+                          ? '等这一轮回复完再换组合'
+                          : mcpCombos?.error
+                            ? `组合文件有错：${mcpCombos.error}`
+                            : `${engineLabel} 的组合（MCP + effort）—— 换了会重启这条会话的执行器`}
+                        aria-label="组合"
                       >
-                        {engineModels?.effort?.options.length
-                          ? engineModels.effort.options.map((o) => <option key={o.value} value={o.value}>{`Effort · ${o.name}`}</option>)
-                          : <option value="">Effort</option>}
+                        {(mcpCombos?.combos || [{ id: 'default', name: '通用' }]).map((c) => (
+                          <option key={c.id} value={c.id}>{`组合 · ${c.name}`}</option>
+                        ))}
                       </select>
                     </div>
                   ) : (
@@ -4642,7 +4678,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label="Close">✕</button>
             </div>
             <div className="kiro-config-tabs" role="tablist">
-              {[{ id: 'login', label: '🔑 登录' }, ...engineConfigCats].map((c) => (
+              {[{ id: 'login', label: '🔑 登录' }, { id: 'mcp-combos', label: '🧩 组合' }, ...engineConfigCats].map((c) => (
                 <button
                   key={c.id}
                   role="tab"
@@ -4656,6 +4692,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
             {engineConfigTab === 'login'
               ? <EngineLoginPane sessionId={currentSessionId} tool={engine as 'claude' | 'codex'} />
+              : engineConfigTab === 'mcp-combos'
+              ? <McpCombosPane onClose={() => setEngineConfigOpen(false)} />
               : (() => {
                 const cat = engineConfigCats.find((c) => c.id === engineConfigTab);
                 return cat

@@ -83,6 +83,7 @@ import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.
 import { logger } from './logger';
 import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
+import { readMcpCombos, saveMcpCombos, pickCombo, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID } from './mcpCombos.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
 // It fires because the Vite dev server is served without a CSP (a strict CSP would
@@ -1841,13 +1842,43 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
  */
 const toollessSessions = new Set<string>();
 
+/**
+ * **本地 Claude Code / Codex 会话的「组合」** ——「不同对话挂不同的 MCP」。
+ *
+ * 所选组合里没 disabled 的 MCP 按 ACP 格式交给 session/new / load 的 `mcpServers`（环境变量在这里展开，
+ * 用的是登录 shell 的环境）。`forwardFromLocal` 在本地会话里不起作用。缺环境变量的那一条跳过并在会话里说一句。
+ * 借 `localTools` 那个参数交给 `AcpClient`（端口字段对本地会话没意义，填 0）。kiro 会话不走这里。
+ */
+function localComboTools(
+  sessionId: string, profile: AgentProfile,
+): { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined {
+  if (engineOf(profile) === 'kiro') return undefined;
+  const { combos, error } = readMcpCombos(os.homedir());
+  const combo = pickCombo(combos, profile.mcpCombo);
+  if (error) {
+    logger.warn('mcp-combo', `${mcpCombosPath(os.homedir())} 读不了：${error}`);
+    if (profile.mcpCombo && profile.mcpCombo !== BUILTIN_COMBO_ID) {
+      sessionNotice(sessionId, `⚠️ 组合文件有错（${error}），这次按「通用」起，不挂 MCP。`);
+    }
+  } else if (profile.mcpCombo && combo.id !== profile.mcpCombo) {
+    sessionNotice(sessionId, `⚠️ 找不到组合「${profile.mcpCombo}」（可能被删了），这次按「${combo.name}」起。`);
+  }
+  const { servers, skipped } = buildAcpMcpServers(combo, shellEnv as Record<string, string | undefined>);
+  for (const s of skipped) {
+    sessionNotice(sessionId, `⚠️ 组合「${combo.name}」里的 MCP「${s.name}」要用环境变量 ${s.missing.join('、')}，本机没有设置 —— 这一条先跳过。`);
+  }
+  if (!servers.length) return undefined;
+  logger.info('mcp-combo', `组合「${combo.name}」挂 ${servers.length} 个 MCP sessionId=${sessionId}: ${JSON.stringify(maskAcpServers(servers))}`);
+  return { remotePort: 0, localPort: 0, agentOverride: '', mcpServers: servers };
+}
+
 async function ensureLocalTools(
   sessionId: string,
   profile: AgentProfile,
   localDir: string,
 ): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] } | undefined> {
   const remote = profile.remote;
-  if (!remote?.sshHost) return undefined;
+  if (!remote?.sshHost) return localComboTools(sessionId, profile);
   try {
     const server = await ensureLocalMcpServer();
     const agentOverride = sessionAgentName(sessionId, OWNER);
@@ -4299,14 +4330,16 @@ function engineModelsPayload(sessionId: string, entry: SessionEntry) {
 const DEFAULT_ENGINE_MODE: Partial<Record<'claude' | 'codex', string>> = { claude: 'bypassPermissions' };
 
 /** 这条会话记着的那几个值（模型 / effort / 模式），按"先模型后 effort"的顺序 —— 换模型可能会换掉 effort 的可选值。 */
-function wantedEngineOptions(profile: AgentProfile): Array<[EngineOptionCategory, string]> {
+function wantedEngineOptions(profile: AgentProfile, comboEffort?: string): Array<[EngineOptionCategory, string]> {
   const engine = engineOf(profile);
   if (engine === 'kiro') return [];
   const saved = profile.engineOptions?.[engine] || {};
   const out: Array<[EngineOptionCategory, string]> = [];
   const model = profile.engineModels?.[engine];
   if (model) out.push(['model', model]);
-  if (saved.thought_level) out.push(['thought_level', saved.thought_level]);
+  /* 所选「组合」设了 effort 就用它；没设才沿用会话记住的（再没有就是引擎默认） */
+  const effort = comboEffort || saved.thought_level;
+  if (effort) out.push(['thought_level', effort]);
   const mode = saved.mode || DEFAULT_ENGINE_MODE[engine];
   if (mode) out.push(['mode', mode]);
   return out;
@@ -4315,10 +4348,26 @@ function wantedEngineOptions(profile: AgentProfile): Array<[EngineOptionCategory
 async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise<void> {
   const engine = engineOf(entry.profile);
   if (engine === 'kiro') return;
-  for (const [cat, want] of wantedEngineOptions(entry.profile)) {
+  const combo = pickCombo(readMcpCombos(os.homedir()).combos, entry.profile.mcpCombo);
+  for (const [cat, want] of wantedEngineOptions(entry.profile, combo.effort)) {
     const opts = entry.client.selectOptions(cat);
+    /*
+      组合要的 effort：设不上（不支持 / 适配器拒绝）就**主动退回默认档位**并说一句，不报错 ——
+      重连加载的会话可能带着旧档位回来，光跳过等于沿用它（见 `applyComboEffort`）。
+    */
+    if (cat === 'thought_level' && combo.effort) {
+      const r = await applyComboEffort(combo.effort, combo.name, {
+        options: () => entry.client.selectOptions('thought_level'),
+        set: (v) => entry.client.setSelectOption(entry.cliSessionId, 'thought_level', v),
+      });
+      logger.info('mcp-combo', `组合「${combo.name}」effort -> ${r.value || '(未变)'} sessionId=${sessionId}`);
+      if (r.notice) sessionNotice(sessionId, r.notice);
+      continue;
+    }
     if (!opts || opts.current === want || !opts.options.some((o) => o.value === want)) continue;
-    try { await entry.client.setSelectOption(entry.cliSessionId, cat, want); } catch (err) {
+    try {
+      await entry.client.setSelectOption(entry.cliSessionId, cat, want);
+    } catch (err) {
       logger.warn('engine-model', `重设 ${ENGINE_LABEL[engine]} ${cat}=${want} 失败 sessionId=${sessionId}`, err);
     }
   }
@@ -8472,11 +8521,13 @@ app.whenReady().then(async () => {
    * Codex 会话的这两样不归 kiro 管，休眠时也一样拒绝。
    */
   const setDormantProfile = (
-    sessionId: string, patch: Partial<AgentProfile>, what: string, onlyKiro?: string,
+    sessionId: string, patch: Partial<AgentProfile>, what: string, onlyKiro?: string, notKiro?: string,
   ): { ok: true; dormant: true } => {
     const rec = store.readRecord(sessionId);
     if (!rec) throw new Error('该会话在磁盘上不存在（可能已被删除）。');
     if (onlyKiro && engineOf(rec.profile) !== 'kiro') throw new Error(onlyKiro);
+    /* 反过来：「组合」只对 Claude Code / Codex 会话有用 */
+    if (notKiro && engineOf(rec.profile) === 'kiro') throw new Error(notKiro);
     rec.profile = { ...rec.profile, ...patch };
     store.writeRecord(rec);
     logger.info('acp', `${what} on dormant session ${sessionId} —— 下次挂起时生效`);
@@ -8804,6 +8855,101 @@ app.whenReady().then(async () => {
     } catch (err) {
       if (client) { try { await client.disconnect(); } catch {} }
       logger.warn('engine', `切换引擎失败 sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`, err);
+      throw err;
+    } finally {
+      reconfiguringSessions.delete(sessionId);
+      emitSessionBusy(sessionId);
+    }
+  });
+
+  /**
+   * **「组合」**（`mcpCombos.ts`）—— Claude Code / Codex 左下角的下拉 + 配置面板里那一页。
+   * 文件是本机全局的（`~/.kirolex/mcp-combos.json`），所有会话共用；每条会话只记自己选了哪个（`profile.mcpCombo`）。
+   */
+  ipcMain.handle('acp:mcp-combos', (_event, sessionId?: string) => {
+    const { combos, error } = readMcpCombos(os.homedir());
+    const live = sessionId ? sessionClients.get(sessionId) : undefined;
+    const picked = (live?.profile || (sessionId ? store.readRecord(sessionId)?.profile : undefined))?.mcpCombo;
+    return {
+      combos: combos.map((c) => ({ id: c.id, name: c.name, ...(c.effort ? { effort: c.effort } : {}) })),
+      current: pickCombo(combos, picked).id,
+      ...(picked && !combos.some((c) => c.id === picked) ? { missing: picked } : {}),
+      ...(error ? { error } : {}),
+    };
+  });
+  ipcMain.handle('acp:mcp-combos-file', () => {
+    const r = readMcpCombos(os.homedir());
+    return { path: mcpCombosPath(os.homedir()), exists: r.exists, text: r.exists ? r.text : MCP_COMBOS_TEMPLATE, error: r.error };
+  });
+  ipcMain.handle('acp:save-mcp-combos', (_event, text: string) => {
+    const r = saveMcpCombos(os.homedir(), String(text ?? ''));
+    if (!r.ok) return { ok: false, error: r.error };
+    logger.info('mcp-combo', `保存了 ${r.combos.length - 1} 个组合（不含内置「通用」）`);
+    mainWindow?.webContents.send('acp:mcp-combos-changed');
+    return { ok: true };
+  });
+
+  /**
+   * **换组合** —— MCP 是 session/new / load 时交给适配器的，所以要重启这条会话的执行器。
+   * 和换引擎 / 换 kiro agent 同一套：先起新的、再断旧的，后端会话是新的，上下文从 KiroLex 自己的记录重建
+   * （随下一条消息带过去）。没连着的会话只改记录（见 `setDormantProfile`）。这一轮还在跑时拒绝。
+   */
+  ipcMain.handle('acp:switch-mcp-combo', async (_event, sessionId: string, comboId: string) => {
+    const { combos } = readMcpCombos(os.homedir());
+    const combo = combos.find((c) => c.id === comboId);
+    if (!combo) throw new Error(`找不到组合「${comboId}」（组合文件改过了？重新打开下拉看看）。`);
+    const nextCombo = combo.id === BUILTIN_COMBO_ID ? undefined : combo.id;
+    const onlyEngines = '组合只对 Claude Code / Codex 会话有用。';
+    const oldEntry = sessionClients.get(sessionId);
+    if (!oldEntry) {
+      return { ...setDormantProfile(sessionId, { mcpCombo: nextCombo }, `mcp-combo -> ${combo.id}`, undefined, onlyEngines), current: combo.id };
+    }
+    if (engineOf(oldEntry.profile) === 'kiro') throw new Error(onlyEngines);
+    if (oldEntry.busy) throw new Error('这一轮还在跑 —— 等它结束再换组合。');
+    if (reconfiguringSessions.has(sessionId)) throw new Error('另一个切换（模型 / agent / 机器）还没做完。');
+    if ((oldEntry.profile.mcpCombo || BUILTIN_COMBO_ID) === combo.id) return { ok: true, current: combo.id };
+
+    await awaitAttachIdle(sessionId);
+    reconfiguringSessions.add(sessionId);
+    emitSessionBusy(sessionId);
+    const profile: AgentProfile = { ...oldEntry.profile, mcpCombo: nextCombo };
+    let client: AcpClient | undefined;
+    try {
+      if (profile.remote?.sshHost) await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+      const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
+      const started = await connectWithModelFallback(profile, 'switch-mcp-combo', localTools, sessionId);
+      client = started.client;
+      const created = await client.newSession(oldEntry.cwd);
+      const nextEntry: SessionEntry = {
+        ...oldEntry,
+        client,
+        cliSessionId: created.sessionId,
+        profile,
+        assistantBuf: '',
+        assistantMsgId: null,
+        fileChanges: [],
+        lastUsedAt: Date.now(),
+        busy: false,
+      };
+      try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
+      sessionClients.set(sessionId, nextEntry);
+      wireSession(sessionId, nextEntry);
+
+      const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
+      rec.profile = profile;
+      rec.cliSessionId = created.sessionId;
+      rec.executorState = 'attached';
+      store.writeRecord(rec);
+      clearContextEstablished(sessionId);
+      markContextOwedIfUnverified(sessionId, 'switch-mcp-combo');
+      restoreContextAfterExecutorSwap(sessionId, 'switch-mcp-combo');
+      sessionNotice(sessionId, `🧩 这条会话换成了组合「${combo.name}」。执行器重启过，上下文会随下一条消息带过去；之前的对话一条都没动。`
+        + (profile.remote?.sshHost ? '（远程会话暂时还不挂组合里的 MCP。）' : ''));
+      logger.info('mcp-combo', `切换组合 sessionId=${sessionId} -> ${combo.id}`);
+      return { ok: true, current: combo.id };
+    } catch (err) {
+      if (client) { try { await client.disconnect(); } catch {} }
+      logger.warn('mcp-combo', `切换组合失败 sessionId=${sessionId} -> ${combo.id}`, err);
       throw err;
     } finally {
       reconfiguringSessions.delete(sessionId);
@@ -9694,6 +9840,8 @@ app.whenReady().then(async () => {
         /* 同一张白名单：漏了的话手选的模型 / effort / 模式一重连就丢（实测：选了 sonnet，重启后回到 opus） */
         ...(existing?.profile.engineModels ? { engineModels: existing.profile.engineModels } : {}),
         ...(existing?.profile.engineOptions ? { engineOptions: existing.profile.engineOptions } : {}),
+        /* 同一张白名单：所选「组合」（漏了的话一重启就回到「通用」） */
+        ...(existing?.profile.mcpCombo ? { mcpCombo: existing.profile.mcpCombo } : {}),
       };
       if (!profile.remote?.sshHost) resolvedCwd = localCwdFor(sessionId, resolvedCwd);
       // For a remote session the executor's working directory is a REMOTE path,
@@ -9726,6 +9874,9 @@ app.whenReady().then(async () => {
           remoteModels = await remotePreflight(profile.remote);
           profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
         }
+        localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
+      } else {
+        /* 本地 Claude Code / Codex：所选「组合」里的 MCP（kiro 会话返回 undefined，见 `localComboTools`） */
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
       const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId, remoteModels);

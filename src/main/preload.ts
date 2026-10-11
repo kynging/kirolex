@@ -137,6 +137,16 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('session:engine-models', handler);
     return () => ipcRenderer.removeListener('session:engine-models', handler);
   },
+  /** Claude Code / Codex 的「组合」（`~/.kirolex/mcp-combos.json`，本机全局） */
+  mcpCombos: (sessionId?: string) => ipcRenderer.invoke('acp:mcp-combos', sessionId),
+  mcpCombosFile: () => ipcRenderer.invoke('acp:mcp-combos-file'),
+  saveMcpCombos: (text: string) => ipcRenderer.invoke('acp:save-mcp-combos', text),
+  switchMcpCombo: (sessionId: string, comboId: string) => ipcRenderer.invoke('acp:switch-mcp-combo', sessionId, comboId),
+  onMcpCombosChanged: (cb: () => void) => {
+    const handler = () => cb();
+    ipcRenderer.on('acp:mcp-combos-changed', handler);
+    return () => ipcRenderer.removeListener('acp:mcp-combos-changed', handler);
+  },
   switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') =>
     ipcRenderer.invoke('acp:switch-permission-mode', sessionId, permissionMode),
   readTranscript: (sessionId: string) => ipcRenderer.invoke('acp:read-transcript', sessionId),

@@ -108,6 +108,8 @@ export interface AgentProfile {
     claude?: { thought_level?: string; mode?: string };
     codex?: { thought_level?: string; mode?: string };
   };
+  /** Claude Code / Codex 会话选的「组合」id（`~/.kirolex/mcp-combos.json`，见 `mcpCombos.ts`）。没有 = 内置「通用」。 */
+  mcpCombo?: string;
 
   /**
    * Project identity for the layered memory store. WRITE-ONCE:

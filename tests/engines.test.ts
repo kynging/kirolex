@@ -60,7 +60,7 @@ describe('kiro 专有的东西对另外两家关掉', () => {
     assert.match(cmd, /exec '\\''claude-agent-acp'\\''/);
     assert.doesNotMatch(M, /会话目前只能在本机跑/);
     /* kiro 那套 preflight（查 kiro-cli / 登录 / 模型清单）对另外两家换成"适配器在不在" */
-    assert.equal((M.match(/await remoteAdapterCheck\(/g) || []).length, 4, '新建 / 换机器 / 重连 / 换引擎 四处');
+    assert.equal((M.match(/await remoteAdapterCheck\(/g) || []).length, 5, '新建 / 换机器 / 重连 / 换引擎 / 换组合 五处');
     assert.match(M, /会装上它（\$\{ADAPTER_PACKAGE\[engine\]\}）/);
   });
 
@@ -140,7 +140,8 @@ describe('Claude Code / Codex：effort 和权限模式', () => {
   test('引擎名那一格换成 effort；顶上 Auto/Ask 换成它们自己的 mode（Claude 默认 bypass）', () => {
     const ca = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.doesNotMatch(ca, /className="composer-engine"/, '「改成 effort 吧」');
-    assert.match(ca, /onEngineOptionChange\('thought_level', event\.target\.value\)/);
+    /* effort 下拉后来换成了「组合」下拉（组合里带 effort，见 mcpCombos.test.ts） */
+    assert.match(ca, /onMcpComboChange\(event\.target\.value\)/);
     assert.match(ca, /engineMode=\{nonKiro \? \{/);
     assert.match(ca, /\{engineMode \? \(\s*<select/);
     const M = read('src', 'main', 'index.ts');
@@ -149,6 +150,7 @@ describe('Claude Code / Codex：effort 和权限模式', () => {
     /* attach 按白名单重建 profile —— 漏了这两个，手选的值一重连就丢 */
     assert.match(M, /\.\.\.\(existing\?\.profile\.engineModels \? \{ engineModels: existing\.profile\.engineModels \} : \{\}\),/);
     assert.match(M, /\.\.\.\(existing\?\.profile\.engineOptions \? \{ engineOptions: existing\.profile\.engineOptions \} : \{\}\),/);
+    assert.match(M, /\.\.\.\(existing\?\.profile\.mcpCombo \? \{ mcpCombo: existing\.profile\.mcpCombo \} : \{\}\),/);
   });
   test('这两家问不问由它们自己的 mode 决定 —— KiroLex 这一层不再自动批准', async () => {
     const { AcpClient } = await import('../src/main/acp-client.ts');
