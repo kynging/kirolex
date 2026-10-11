@@ -564,7 +564,7 @@ describe('把本机的 MCP 转发给远端会话', () => {
     /* 取的是 `ensureLocalMcpServer()` 拿回来的那**一个** server —— 见 tests/sshMux.test.ts
        里「本地 MCP server 只起一个」：读模块变量的话并发启动时会读到被覆盖的那个 */
     assert.match(M, /server\.setProxies\(sessionId, forwardable\);/);
-    assert.match(M, /const forwardable = profile\.kiroAgent \? forwardableFrom\(localAgentJson\(profile\.kiroAgent\)\) : \[\];/);
+    assert.match(M, /const forwardable = profile\.kiroAgent \? forwardableFrom\(localAgentJson\(profile\.kiroAgent\), loadForwardMcpList\(\)\) : \[\];/);
     const { remoteContextBlock } = await import('../src/main/remoteContext.ts');
     const b = remoteContextBlock({ hostLabel: 'h', remoteDir: '/r', localDir: '/l', forwarded: ['playwright'] });
     assert.match(b, /作用在用户那台机器上/);

@@ -399,6 +399,9 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  CPU corroboration was removed as uninformative. */
   getWedgeTimeout: () => ipcRenderer.invoke('app:get-wedge-timeout'),
   setWedgeTimeout: (n: number) => ipcRenderer.invoke('app:set-wedge-timeout', n),
+  /** 「远程会话从本机转发的 MCP」名单（存在 ~/.kirolex/config.json，不进 Kiro 的 agent 文件）。 */
+  getForwardMcp: () => ipcRenderer.invoke('app:get-forward-mcp'),
+  setForwardMcp: (list: Array<{ name: string; timeoutSec?: number }>) => ipcRenderer.invoke('app:set-forward-mcp', list),
   /** How long an open tool call may go without an update before it stops counting as
    *  progress. Bounds the tool-call guard so a missing closing update cannot disable
    *  wedge detection for a whole turn. */

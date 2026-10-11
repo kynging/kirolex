@@ -3,6 +3,7 @@ import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN 
 import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
+import { ForwardMcpSettings } from './ForwardMcpSettings';
 import { useT } from '../hooks/useLang';
 import { fontSelectOptions } from '../fontOptions';
 import React from 'react';
@@ -305,6 +306,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             分页之后它自己一页，顺序不再是稀缺资源。
           */}
           {tab === 'machines' && <RemoteSettings startNew={newMachinePending} />}
+          {tab === 'machines' && <ForwardMcpSettings />}
 
           {tab === 'appearance' && (
           <div className="settings-item settings-item-wide">

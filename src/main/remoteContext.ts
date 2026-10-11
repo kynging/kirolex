@@ -16,7 +16,7 @@
 
 import { localActionHelp } from './localAction.ts';
 import { localToolsHelp } from './remoteLocalTools.ts';
-import { forwardHelp } from './forwardMcp.ts';
+import { forwardHelp, forwardHttpHelp } from './forwardMcp.ts';
 
 export interface RemoteContextInput {
   /** 给人看的机器名（设置里的 label）。 */
@@ -55,6 +55,11 @@ export interface RemoteContextInput {
    * 点浏览器"是最难看出来的一类错（截图回来的是另一台机器的屏幕）。
    */
   forwarded?: string[];
+  /**
+   * 名单里那些从用户机器**中转**的 HTTP MCP（妙想之类）。要说清请求从他机器发出、
+   * 别在远端另配同名的直连（那里没有密钥，出口 IP 也不对）。
+   */
+  forwardedHttp?: string[];
 }
 
 /**
@@ -153,6 +158,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
     localActionHelp(),
     forwardHelp(input.forwarded || []),
+    forwardHttpHelp(input.forwardedHttp || []),
     /* 这条只在**他那边真有工程**时成立；没有的话它会把人往错的机器上引 */
     input.hasLocalProject === false ? ''
       : '· 在**他的工程**上跑构建 / 测试 / git 要用 `local_bash` —— 那里才有他的 `node_modules`、'

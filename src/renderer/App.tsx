@@ -187,6 +187,8 @@ declare global {
       setExecutorCap: (n: number) => Promise<{ ok: boolean; cap: number }>;
       getWedgeTimeout: () => Promise<{ seconds: number; default: number; min: number; max: number }>;
       setWedgeTimeout: (n: number) => Promise<{ ok: boolean; seconds: number }>;
+      getForwardMcp?: () => Promise<Array<{ name: string; timeoutSec: number }>>;
+      setForwardMcp?: (list: Array<{ name: string; timeoutSec?: number }>) => Promise<{ ok: boolean; list: Array<{ name: string; timeoutSec: number }> }>;
       getToolStallTimeout: () => Promise<{ seconds: number; default: number; min: number; max: number }>;
       setToolStallTimeout: (n: number) => Promise<{ ok: boolean; seconds: number }>;
       getWorkspaceDir: () => Promise<string | null>;

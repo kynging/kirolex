@@ -11,9 +11,22 @@
  * 而你要的是点你自己屏幕上那个。这一类靠名字白名单挑（`FORWARD_BY_NAME`），
  * 因为"它该在哪台机器上跑"是语义问题，命令行里看不出来。
  *
+ * **第三条判据：KiroLex 设置里那份「远程会话从本机转发的 MCP」名单**（`config.json` 的
+ * `remoteForwardMcp`）。名单里的名字（和 agent 文件 `mcpServers` 的键一致）：
+ *   · HTTP 型（有 `url`、没有 `command`）—— 产出 http 规格，由 `localMcp.ts` 的 `HttpProxy`
+ *     在**本机**代发到上游。为的是妙想这类：上游按来源 IP / 本机密钥鉴权，远端直连要么被拒、
+ *     要么得把密钥抄到那台机器上。头里的 `${env:…}` 原样交出去，展开发生在 HttpProxy 里；
+ *   · stdio 型 —— 不看命令长什么样，一律转发（"它该在哪台机器上跑"由你说了算）。
+ * 不在名单里的照旧：本机路径命令或 `FORWARD_BY_NAME` 才转发，HTTP 型跳过。名单为空 = 和以前一样。
+ *
+ * 标记**只存在 KiroLex 自己的设置里**，绝不写进 Kiro 的 agent 文件 —— kiro-cli 严格校验 agent JSON，
+ * 多一个它不认识的字段就整份拒绝、静默退回默认 agent（见 `remoteLocalTools.ts` 文件头）。
+ * 远端会话 agent 里也只写隧道地址，上游 url / 头 / 密钥一个字都不出本机（见 `remoteForwardPlan`）。
+ *
  * 这个模块只做**纯**判断（挑哪些、用什么名字），起进程和转发在 `localMcp.ts`。
  */
 
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
@@ -32,6 +45,53 @@ export interface McpEntry {
   command: string;
   args?: string[];
   env?: Record<string, string>;
+}
+
+/** 名单里那条 HTTP 型产出的规格（形状同 `localMcp.ts` 的 `HttpProxySpec`）。 */
+export interface HttpMcpEntry {
+  type: 'http';
+  name: string;
+  /** 上游地址 —— 只在本机用，绝不写到远端。 */
+  url: string;
+  /** 原样保留 `${env:…}` 引用，HttpProxy 转发时才展开。 */
+  headers: Record<string, string>;
+  timeoutMs: number;
+}
+
+export type ForwardEntry = McpEntry | HttpMcpEntry;
+
+export function isHttpForward(e: ForwardEntry): e is HttpMcpEntry {
+  return (e as HttpMcpEntry).type === 'http';
+}
+
+/** 「远程会话从本机转发的 MCP」名单里的一项。 */
+export interface ForwardListItem {
+  /** 和 Kiro agent 文件 `mcpServers` 里的键一致。 */
+  name: string;
+  /** 只对 HTTP 型生效（HttpProxy 另有 120 秒下限）。 */
+  timeoutSec: number;
+}
+
+export const FORWARD_TIMEOUT_SEC_DEFAULT = 180;
+export const FORWARD_TIMEOUT_SEC_MAX = 3600;
+
+/** 名单规范化：去空名、同名只留第一条，超时不是正数就退回默认。设置读写两头都过它。 */
+export function normalizeForwardList(raw: unknown): ForwardListItem[] {
+  if (!Array.isArray(raw)) return [];
+  const out: ForwardListItem[] = [];
+  const seen = new Set<string>();
+  for (const it of raw) {
+    if (!it || typeof it !== 'object') continue;
+    const name = String((it as any).name ?? '').trim();
+    if (!name || seen.has(name)) continue;
+    seen.add(name);
+    const t = Number((it as any).timeoutSec);
+    const timeoutSec = Number.isFinite(t) && t > 0
+      ? Math.min(FORWARD_TIMEOUT_SEC_MAX, Math.floor(t))
+      : FORWARD_TIMEOUT_SEC_DEFAULT;
+    out.push({ name, timeoutSec });
+  }
+  return out;
 }
 
 /** 本机那份 agent 定义（读不到返回 null —— 那时不转发任何东西，而不是猜）。 */
@@ -66,18 +126,30 @@ export function isLocalPathCommand(command: string): boolean {
 /**
  * 从一份 agent 定义里挑出该转发的 MCP。
  *
- * `disabled: true` 的跳过（那是你自己关掉的）；`type: 'http'` 的也跳过 ——
- * 那种本来就是"某个地址上的服务"，远端自己也能敲同一个地址，没有转发的理由。
+ * `disabled: true` 的跳过（那是你自己关掉的）。`list` 是设置里那份名单（见文件头）：
+ * 名单里的 HTTP 型产出 http 规格、名单里的 stdio 一律转发；不在名单里的 `type: 'http'` 照旧跳过 ——
+ * 那种本来就是"某个地址上的服务"，远端自己也能敲同一个地址。
  */
-export function forwardableFrom(agentJson: any): McpEntry[] {
+export function forwardableFrom(agentJson: any, list: ForwardListItem[] = []): ForwardEntry[] {
   const servers = (agentJson && typeof agentJson === 'object' && agentJson.mcpServers) || {};
-  const out: McpEntry[] = [];
+  const listed = new Map(list.map((it) => [it.name, it]));
+  const out: ForwardEntry[] = [];
   for (const [name, raw] of Object.entries(servers as Record<string, any>)) {
     if (!raw || typeof raw !== 'object') continue;
     if (raw.disabled) continue;
+    const item = listed.get(name);
     const command = typeof raw.command === 'string' ? raw.command.trim() : '';
-    if (!command) continue;                                  // http/url 型：远端自己能连
-    if (!FORWARD_BY_NAME.includes(name) && !isLocalPathCommand(command)) continue;
+    if (!command) {
+      const url = typeof raw.url === 'string' ? raw.url.trim() : '';
+      if (!item || !url) continue;                           // http/url 型：不在名单里就让远端自己连
+      const headers: Record<string, string> = {};
+      if (raw.headers && typeof raw.headers === 'object') {
+        for (const [k, v] of Object.entries(raw.headers)) if (typeof v === 'string') headers[k] = v;
+      }
+      out.push({ type: 'http', name, url, headers, timeoutMs: item.timeoutSec * 1000 });
+      continue;
+    }
+    if (!item && !FORWARD_BY_NAME.includes(name) && !isLocalPathCommand(command)) continue;
     out.push({
       name,
       command,
@@ -86,6 +158,41 @@ export function forwardableFrom(agentJson: any): McpEntry[] {
     });
   }
   return out;
+}
+
+/**
+ * 上游地址的指纹（sha256），给远端"同 url 剔除"用 —— 比的是指纹，于是上游 url 本身不必出本机
+ * （有人把 key 放在 `?key=` 里）。去掉首尾空白和末尾 `/` 再算；远端那段 python 用同一个规则。
+ */
+export function upstreamUrlKey(url: string): string {
+  return crypto.createHash('sha256').update(String(url ?? '').trim().replace(/\/+$/, ''), 'utf8').digest('hex');
+}
+
+/**
+ * 交给远端的那一半：每个转发项只给隧道地址 `<base>/<名字>`，http 项另给上游 url 的指纹
+ * （远端底子 agent 里别名、同上游的直连条目要从会话 agent 里剔掉，见 `remoteAgentScript`）。
+ */
+export function remoteForwardPlan(entries: ForwardEntry[], tunnelBase: string): {
+  forwarded: Array<{ name: string; url: string }>;
+  dropUpstream: string[];
+  httpNames: string[];
+  stdioNames: string[];
+} {
+  const http = entries.filter(isHttpForward);
+  return {
+    forwarded: entries.map((e) => ({ name: e.name, url: `${tunnelBase}/${e.name}` })),
+    dropUpstream: [...new Set(http.map((e) => upstreamUrlKey(e.url)))],
+    httpNames: http.map((e) => e.name),
+    stdioNames: entries.filter((e) => !isHttpForward(e)).map((e) => e.name),
+  };
+}
+
+/** 会话准备时探测失败的那句提示（和「本地工具通道没起来」同一种：说出来，不阻断）。 */
+export function httpProbeNotice(name: string, error: string): string {
+  const why = String(error || '未知错误');
+  const msg = why.startsWith('本机→上游') ? why : `本机→上游（${name}）${why}`;
+  return `⚠️ 从本机转发的 MCP「${name}」现在用不了：${msg}。`
+    + `这条会话照常可用，只是调它的工具会报同样的错 —— 改好本机配置后重开会话即可。`;
 }
 
 /**
@@ -100,4 +207,18 @@ export function forwardHelp(names: string[]): string {
     + `${names.map((n) => `\`${n}\``).join('、')}。`
     + `所以 \`browser_*\` 之类点的是**他屏幕上**那个浏览器 —— 这也正是他要看的；`
     + `这台机器上没有图形界面，别在这里另起一个。`;
+}
+
+/**
+ * 名单里 HTTP 型那些的一句（`forwardHelp` 说的是"作用在用户机器上"，这里说的是"从用户机器发出"）。
+ *
+ * 不说的话它看到工具报错会"好心"在这台机器上另配一个同名 MCP 直连 —— 那里没有密钥，
+ * 出口 IP 也不是用户的，上游要么拒绝要么记到别人头上。
+ */
+export function forwardHttpHelp(names: string[]): string {
+  if (!names.length) return '';
+  return `· 这些 MCP 由 KiroLex 从用户机器中转：${names.map((n) => `\`${n}\``).join('、')}。`
+    + `它们的请求**从用户那台机器发出**（用他本机的网络出口和密钥），在这里直接调就行；`
+    + `**不要**在这台机器上另配同名或指向同一地址的 MCP 去直连 —— 这里没有密钥，出口 IP 也不对。`
+    + `报「本机→上游 …」的错是用户本机那头的问题（密钥 / 网络），原样告诉他，别在这里绕。`;
 }

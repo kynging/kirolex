@@ -121,9 +121,16 @@ export function remoteAgentScript(
   url: string,
   /** 额外要并进去的 MCP（从本机转发过来的那些）：名字 → 它在远端要敲的 URL。 */
   forwarded: Array<{ name: string; url: string }> = [],
+  /**
+   * 从本机中转的 HTTP MCP 的**上游 url 指纹**（`forwardMcp.upstreamUrlKey`）。远端底子 agent 里
+   * 别的名字、url 指向同一上游的条目（远端自己配的直连）从会话 agent 里剔掉 —— 留着的话模型会
+   * 有两套同样的工具，一套从远端出口直连（没密钥 / IP 不对）。只比指纹，上游 url 不出本机；
+   * 只改会话专用 agent，不动远端原文件。
+   */
+  dropUpstream: string[] = [],
 ): string {
   const program = [
-    'import json, os',
+    'import json, os, hashlib',
     'h = os.path.expanduser("~/.kiro/agents")',
     'base = os.environ.get("KX_BASE", "")',
     'out = os.environ["KX_OUT"]',
@@ -145,9 +152,22 @@ export function remoteAgentScript(
     /* 从本机转发过来的那些（`/mcp/<token>/<名字>`）—— 和上面那条同一个形状 */
     'for fname, furl in json.loads(os.environ.get("KX_FWD", "{}")).items():',
     '    cfg["mcpServers"][fname] = {"type": "http", "url": furl}',
+    /* 同上游、别的名字的远端直连条目：从会话 agent 里剔掉（同名的上面已经覆盖了） */
+    'drop = set(json.loads(os.environ.get("KX_DROP", "[]")))',
+    'fwd = json.loads(os.environ.get("KX_FWD", "{}"))',
+    'dropped = []',
+    'for k, v in list(cfg["mcpServers"].items()):',
+    '    u = v.get("url") if isinstance(v, dict) else None',
+    '    if k != name and k not in fwd and isinstance(u, str) and hashlib.sha256(u.strip().rstrip("/").encode("utf-8")).hexdigest() in drop:',
+    '        del cfg["mcpServers"][k]',
+    '        dropped.append(k)',
+    '        print("KX_DROP " + k)',
+    'def kept(t):',
+    '    return not any(t == "@" + d or str(t).startswith("@" + d + "/") for d in dropped)',
     'for k in ("prompt", "model", "resources", "hooks", "toolsSettings", "includeMcpJson", "useLegacyMcpJson"):',
     '    if k in src: cfg[k] = src[k]',
     'tools = src.get("tools")',
+    'if isinstance(tools, list): tools = [t for t in tools if kept(t)]',
     'tags = [tag] + ["@" + k for k in json.loads(os.environ.get("KX_FWD", "{}")).keys()]',
     'if isinstance(tools, list):',
     /* 白名单里要有它们，否则"工具在但调不动"（而且失败是静默的） */
@@ -155,14 +175,15 @@ export function remoteAgentScript(
     'else:',
     /* 缺 `tools` 字段 = 一个工具都不给（实测：远端回"我手上没有任何可调用的工具"） */
     '    cfg["tools"] = ["*"]',
-    'allowed = list(src.get("allowedTools") or [])',
+    'allowed = [t for t in (src.get("allowedTools") or []) if kept(t)]',
     'cfg["allowedTools"] = allowed + [t for t in tags if t not in allowed]',
     'os.makedirs(h, exist_ok=True)',
     'open(os.path.join(h, out + ".json"), "w").write(json.dumps(cfg, indent=2))',
     'print("KX_AGENT " + (found or "default"))',
   ].join('\n');
   const fwd = JSON.stringify(Object.fromEntries(forwarded.map((f) => [f.name, f.url])));
-  const env = `KX_OUT=${shq(sessionAgent)} KX_URL=${shq(url)} KX_BASE=${shq(baseAgent || '')} KX_FWD=${shq(fwd)}`;
+  const env = `KX_OUT=${shq(sessionAgent)} KX_URL=${shq(url)} KX_BASE=${shq(baseAgent || '')} KX_FWD=${shq(fwd)}`
+    + (dropUpstream.length ? ` KX_DROP=${shq(JSON.stringify(dropUpstream))}` : '');
   return `mkdir -p ~/.kiro/agents && ${env} python3 -c '${program}'`;
 }
 
@@ -170,6 +191,11 @@ export function remoteAgentScript(
 export function parseAgentBase(out: string): string {
   const m = /KX_AGENT\s+(\S+)/.exec(String(out || ''));
   return m ? m[1] : '';
+}
+
+/** 上面那段脚本剔掉了哪些远端条目（同上游的直连），给本机记日志。 */
+export function parseDroppedDupes(out: string): string[] {
+  return [...String(out || '').matchAll(/^KX_DROP\s+(\S+)/gm)].map((m) => m[1]);
 }
 
 function shq(s: string): string {

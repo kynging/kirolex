@@ -52,14 +52,17 @@ import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecut
 import { remoteContextBlock } from './remoteContext.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
-import { startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import { probeHttpMcp, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { createControlServer, type ControlServer } from './controlServer.ts';
 import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
-import { forwardableFrom, localAgentJson } from './forwardMcp.ts';
 import {
-  allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase,
+  forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward, httpProbeNotice,
+  type ForwardListItem,
+} from './forwardMcp.ts';
+import {
+  allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
   sweepAgentsScript, STALE_AGENT_MINUTES, orphanSweepScript, parseOrphanSweep,
   staleExecutorSweepScript, parseStaleSweep,
@@ -1794,7 +1797,7 @@ function sessionNotice(sessionId: string, text: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; mcpServers?: any[] }>();
+const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] }>();
 
 /**
  * **只起一个** MCP server ——「重复利用」顺手挖出来的一个真 bug。
@@ -1842,7 +1845,7 @@ async function ensureLocalTools(
   sessionId: string,
   profile: AgentProfile,
   localDir: string,
-): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; mcpServers?: any[] } | undefined> {
+): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] } | undefined> {
   const remote = profile.remote;
   if (!remote?.sshHost) return undefined;
   try {
@@ -1927,13 +1930,35 @@ async function ensureLocalTools(
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
       return spec;
     }
-    const forwardable = profile.kiroAgent ? forwardableFrom(localAgentJson(profile.kiroAgent)) : [];
+    /*
+      设置里那份「远程会话从本机转发的 MCP」名单也算进来（妙想这类 HTTP MCP 由本机代发到上游）。
+      远端 agent 里只写隧道地址 —— 上游 url / 头 / 密钥只在本机这份 forwardable 里（见 `remoteForwardPlan`）。
+    */
+    const forwardable = profile.kiroAgent ? forwardableFrom(localAgentJson(profile.kiroAgent), loadForwardMcpList()) : [];
     server.setProxies(sessionId, forwardable);
-    const forwarded = forwardable.map((f) => ({ name: f.name, url: `${mcpUrl(remotePort, urlPath)}/${f.name}` }));
+    const plan = remoteForwardPlan(forwardable, mcpUrl(remotePort, urlPath));
+    const forwarded = plan.forwarded;
     const agentOut = await runRemoteCapture(remote,
-      remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath), forwarded));
+      remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath), plan.forwarded, plan.dropUpstream));
     if (forwarded.length) {
       logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${forwarded.map((f) => f.name).join(', ')}`);
+    }
+    for (const dup of parseDroppedDupes(agentOut)) {
+      logger.info('localmcp', `远端 agent 里的「${dup}」和本机中转的 MCP 指向同一上游，已从会话 agent 剔除（远端原文件没动）sessionId=${sessionId}`);
+    }
+    /*
+      **探测，但不挡会话**：密钥错 / 上游连不上时在会话里说一句（同「本地工具通道没起来」那种提示），
+      会话照常起来 —— local_* 和别的转发都不受影响，调到这个 MCP 时也会拿到同样可读的错误。
+    */
+    for (const spec of forwardable.filter(isHttpForward)) {
+      void probeHttpMcp(spec, { log: (level, message) => logger[level]('localmcp', message) }).then((r) => {
+        if (r.ok) {
+          logger.info('localmcp', `中转 MCP「${spec.name}」探测通过：${r.toolCount} 个工具 sessionId=${sessionId}`);
+          return;
+        }
+        sessionNotice(sessionId, httpProbeNotice(spec.name, r.error || ''));
+        logger.warn('localmcp', `中转 MCP「${spec.name}」探测失败 sessionId=${sessionId}: ${r.error}`);
+      }).catch(() => { /* 探测永远不能让会话准备失败 */ });
     }
     const usedBase = parseAgentBase(agentOut);
     if (profile.kiroAgent && usedBase === 'default') {
@@ -1945,7 +1970,8 @@ async function ensureLocalTools(
     }
     const spec = {
       remotePort, localPort: server.port(), agentOverride,
-      forwarded: forwarded.map((f) => f.name),
+      forwarded: plan.stdioNames,
+      forwardedHttp: plan.httpNames,
     };
     localToolsBySession.set(sessionId, spec);
     toollessSessions.delete(sessionId);
@@ -2401,6 +2427,7 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     hasLocalProject: !!projectWorkspaceFor(entry.profile),
     /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
+    forwardedHttp: localToolsBySession.get(sessionId)?.forwardedHttp,
   });
 }
 
@@ -3284,6 +3311,26 @@ function saveWedgeConfirmSeconds(n: number) {
     : 0;
   try { fs.mkdirSync(path.dirname(KIROLEX_CONFIG_PATH), { recursive: true }); } catch {}
   fs.writeFileSync(KIROLEX_CONFIG_PATH, JSON.stringify(cfg, null, 2));
+}
+/**
+ * 「远程会话从本机转发的 MCP」名单（`config.json` 的 `remoteForwardMcp`）。
+ * 只存在 KiroLex 自己的设置里 —— 绝不写进 Kiro 的 agent 文件（kiro-cli 严格校验，多一个字段就整份拒绝）。
+ * 每次准备远程会话时现读，所以改完对下一条远程会话生效。
+ */
+function loadForwardMcpList(): ForwardListItem[] {
+  try {
+    return normalizeForwardList(JSON.parse(fs.readFileSync(KIROLEX_CONFIG_PATH, 'utf-8'))?.remoteForwardMcp);
+  } catch { return []; }
+}
+function saveForwardMcpList(list: unknown): ForwardListItem[] {
+  let cfg: any = {};
+  try { cfg = JSON.parse(fs.readFileSync(KIROLEX_CONFIG_PATH, 'utf-8')); } catch {}
+  cfg.remoteForwardMcp = normalizeForwardList(list);
+  fs.mkdirSync(path.dirname(KIROLEX_CONFIG_PATH), { recursive: true });
+  const tmp = `${KIROLEX_CONFIG_PATH}.${process.pid}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(cfg, null, 2));
+  fs.renameSync(tmp, KIROLEX_CONFIG_PATH);
+  return cfg.remoteForwardMcp;
 }
 /** 0 disables wedge interruption. Mutable: the Settings handler applies it live. */
 let WEDGE_CONFIRM_MS = loadWedgeConfirmSeconds() * 1000;
@@ -10960,6 +11007,14 @@ app.whenReady().then(async () => {
     WEDGE_CONFIRM_MS = loadWedgeConfirmSeconds() * 1000;
     logger.info('features', `wedge interrupt threshold = ${WEDGE_CONFIRM_MS ? `${WEDGE_CONFIRM_MS / 1000}s` : 'off'}`);
     return { ok: true, seconds: Math.round(WEDGE_CONFIRM_MS / 1000) };
+  });
+
+  /* 「远程会话从本机转发的 MCP」名单：对下一条远程会话生效（准备时现读） */
+  ipcMain.handle('app:get-forward-mcp', async () => loadForwardMcpList());
+  ipcMain.handle('app:set-forward-mcp', async (_event, list: unknown) => {
+    const saved = saveForwardMcpList(list);
+    logger.info('localmcp', `远程会话从本机转发的 MCP 名单 = ${saved.map((it) => `${it.name}(${it.timeoutSec}s)`).join(', ') || '（空）'}`);
+    return { ok: true, list: saved };
   });
 
   ipcMain.handle('app:get-tool-stall-timeout', async () => ({
