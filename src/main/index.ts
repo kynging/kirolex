@@ -8291,9 +8291,10 @@ app.whenReady().then(async () => {
       rec.localDir = nextLocalDir;
       store.writeRecord(rec);
       const where = target ? `远端 ${hostLabelOf(target)}` : '本地';
-      sessionNotice(sessionId, `🔀 这条会话下次打开会跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
-        + `它现在没有连着，所以没有执行器要换；对话一条都没动。`);
+      sessionNotice(sessionId, `🔀 这条会话改成跑在**${where}**上（工作目录 \`${nextLocalDir}\`）。`
+        + `它刚才没有连着，现在按新位置去连；对话一条都没动。`);
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
+      /* 渲染层收到后发现它没连着，会按新记录立刻 attach（见 useAcp 的 reconnectAfterRetarget） */
       mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
       return { ok: true, remoteHost: hostLabelOf(target), cold: true };
     }

@@ -36,6 +36,7 @@ import type { ScheduleView } from '../scheduleView';
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
+import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -1514,6 +1515,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
 
+  const reconnectAfterRetargetRef = useRef<((sid: string) => Promise<void>) | null>(null);
   useEffect(() => {
     const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
       if (!d?.sessionId) return;
@@ -1521,6 +1523,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         /* 工作目录也在这个事件里 —— 会话界面上那个 📂 显示的就是它，换完必须当场变 */
         ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir }
         : s)));
+      /* 没连着的那条：换完立刻在新机器上连（已连着的主进程已经换好执行器了，函数里会跳过） */
+      void reconnectAfterRetargetRef.current?.(d.sessionId);
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
@@ -3237,6 +3241,45 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   }, [sessions]);
   const warmSessionRef = useRef(warmSession);
   warmSessionRef.current = warmSession;
+
+  /**
+   * **没连上的会话换了机器，立刻在新机器上连** —— 原来只改记录，于是本机没配 kiro 时留下的
+   * 「⚠️ 这条会话没连上：…本机…」和失败状态一直挂着，看着像切到远程还在报本机的错。
+   *
+   * 走的是普通 attach（load-session 按**记录**起执行器，记录里的 remote 刚被改好），所以远程不会变本地。
+   * 连上：摘掉失败状态和旧的那条提示；连不上：换成新机器的那一条（只留一条），保持失败。
+   * 已经连着的不碰 —— 主进程那条路已经换好执行器了。
+   */
+  const reconnectAfterRetarget = async (sessionId: string) => {
+    const record = sessionsRef.current.find((s) => s.id === sessionId);
+    if (!record || record.archived || String(sessionId).startsWith('pending_')) return;
+    if (creatingRef.current.has(sessionId) || attachedIdsRef.current.has(sessionId)) return;
+    markConnecting(sessionId);
+    try {
+      await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
+      addAttached(sessionId);
+      clearFailed(sessionId);
+      /* 没缓存过的后台会话不往缓存里写空数组 —— 那会让点开时以为已经有内容、不去读盘 */
+      if (currentSessionRef.current === sessionId || messagesCacheRef.current.has(sessionId)) mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur));
+      void window.kiroApi.ensureContext?.(sessionId).catch(() => {});
+    } catch (err: any) {
+      const why = String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, '');
+      markFailed(sessionId);
+      /* 没缓存的后台会话先把历史读进来：只塞一条提示的话缓存就"非空"了，点开时会跳过读盘、历史看不见 */
+      if (currentSessionRef.current !== sessionId) {
+        const seeded = await historyBeforeNotice(messagesCacheRef.current.get(sessionId), () => window.kiroApi.readTranscript(sessionId));
+        /* 读盘期间别处（点开 / 分屏）可能已经填好了缓存，那就不覆盖 */
+        if (seeded && !(messagesCacheRef.current.get(sessionId) || []).length) {
+          messagesCacheRef.current.set(sessionId, seeded);
+          rebuildFileChanges(sessionId, seeded, false);
+        }
+      }
+      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, connectFailureNotice(why)));
+    } finally {
+      clearConnecting(sessionId);
+    }
+  };
+  reconnectAfterRetargetRef.current = reconnectAfterRetarget;
 
   /**
    * **恢复之后立刻出现、立刻连上** ——「恢复了之后的会话应该被立刻连接，为什么没有连接」。

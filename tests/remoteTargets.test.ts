@@ -1175,7 +1175,7 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
   test('**没连上不再拒绝** —— 执行器是下次打开时按记录起的，要求"先连上"是多余的门槛', () => {
     assert.equal(/这条会话还没连上，先打开它再切换/.test(M), false, '这道门槛不许再有');
     assert.match(body, /if \(!oldEntry\) \{/);
-    assert.match(body, /这条会话下次打开会跑在\*\*\$\{where\}\*\*上/);
+    assert.match(body, /这条会话改成跑在\*\*\$\{where\}\*\*上/);
     /* 冷路径只改记录 */
     assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*store\.writeRecord\(rec\);/);
   });
