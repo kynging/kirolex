@@ -8660,6 +8660,15 @@ button, input, select, textarea {
 .rv-review-block.section-preview.section-head { border-radius: 4px 4px 0 0; background: var(--bg-hover, rgba(255, 255, 255, .075)); }
 /* 改写中的那一节**锁住**：变淡 + 不可选，处置按钮全部收掉，并明确写出"改写中" */
 .rv-review-block.locked { opacity: .62; user-select: none; }
+/*
+  **Ctrl+A 只选文件正文**（见 ReviewPane 的 `onKey`）：每一块里除了正文本身（`.rv-review-md` / `.rv-review-text`），
+  行号、✎ ✕ ＋ 💬、标记、AI 改动标签、意见框 / 直接改的框、提交那一行都不进选区。
+  框里的字：没聚焦时也不进 —— Chromium 画外面那段选区时不看 textarea 的 user-select，照样把框里的字涂蓝，
+  所以没聚焦时连 ::selection 也设成透明；聚焦后照样能选字、Ctrl+A 只选框里的。
+*/
+.rv-review-block > :not(.rv-review-md):not(.rv-review-text) { user-select: none; }
+.rv-review-block textarea:not(:focus), .rv-review-block input:not(:focus) { user-select: none; }
+.rv-review-block textarea:not(:focus)::selection, .rv-review-block input:not(:focus)::selection { background: transparent; color: inherit; }
 .rv-review .rt-block-lock { font-size: 10px; line-height: 1.5; margin-top: 3px; color: var(--success, #3fb950); }
 
 /* 意见框：草稿 + 确认/记下/取消。宽度铺满这一栏，高度跟着内容长（一句话就一行高） */

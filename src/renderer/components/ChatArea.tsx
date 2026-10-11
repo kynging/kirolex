@@ -3273,6 +3273,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   useEffect(() => {
     const handleSelectAll = (e: KeyboardEvent) => {
       if ((e.ctrlKey || e.metaKey) && e.key === 'a') {
+        // The file side panel (ReviewPane) already took it: last click / focus was there.
+        if (e.defaultPrevented) return;
         // If focus is in any editable element (chat input, a rename field, etc.),
         // let the browser's default select-all work on that field instead.
         const el = document.activeElement as HTMLElement | null;

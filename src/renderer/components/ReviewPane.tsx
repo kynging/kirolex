@@ -7,6 +7,7 @@ import { diffChanges, trustedChanges, remapChanges, planUndo, markLayout, UNDO_R
 import { getAiMarks, updateAiMarks, subscribeAiMarks, aiRoundOf, beginAiRound, recordAiWrite } from '../aiMarkStore';
 import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
+import { reviewSelectAll, lastInteraction, coversWhole } from '../selectAllScope';
 import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, type ReviewQueueItem } from '../reviewQueue';
 
 /**
@@ -458,6 +459,48 @@ export const ReviewPane: React.FC<{
     ro.observe(ol);
     return () => { ro.disconnect(); if (frame) cancelAnimationFrame(frame); };
   }, [groups, commenting, sessionId]);
+  /**
+   * **侧栏里的 Ctrl+A 只选这份文件的正文** —— 聊天区在 document 上挂着一个全局 Ctrl+A（选聊天记录）。
+   * 最后一次点在 / 焦点落在侧栏里时这里先接住（window 捕获阶段，比 document 上那个早），`preventDefault`
+   * 之后聊天区看到 `defaultPrevented` 就让开。焦点在输入框里时不管 —— 浏览器只全选那个框。
+   * 行号、按钮、标记、意见框都是 `user-select: none`（global.css），高亮只落在正文上；复制时写**文件原文**，
+   * 不靠浏览器从渲染出来的 Markdown 里拼。deck 是画出来的页，没有文字层：吞掉这一下，什么也不选。
+   */
+  const rootRef = useRef<HTMLDivElement | null>(null);
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if (!(e.ctrlKey || e.metaKey) || e.altKey || e.key !== 'a' || e.defaultPrevented) return;
+      const root = rootRef.current;
+      const act = reviewSelectAll({
+        zone: root?.closest('.workspace-file-panel') ?? root,
+        last: lastInteraction(),
+        active: document.activeElement as HTMLElement | null,
+        deck: isDeck,
+      });
+      if (act === 'ignore') return;
+      e.preventDefault();
+      const ol = listRef.current;
+      const sel = window.getSelection();
+      if (act !== 'select' || !ol || !sel) return;
+      const range = document.createRange();
+      range.selectNodeContents(ol);
+      sel.removeAllRanges();
+      sel.addRange(range);
+    };
+    const onCopy = (e: ClipboardEvent) => {
+      const sel = window.getSelection();
+      if (isDeck || !e.clipboardData || !sel || sel.rangeCount !== 1) return;
+      if (!coversWhole(sel.getRangeAt(0), listRef.current)) return;
+      e.clipboardData.setData('text/plain', textRef.current);
+      e.preventDefault();
+    };
+    window.addEventListener('keydown', onKey, true);
+    document.addEventListener('copy', onCopy);
+    return () => {
+      window.removeEventListener('keydown', onKey, true);
+      document.removeEventListener('copy', onCopy);
+    };
+  }, [isDeck]);
   /**
    * 锚点 → 它实际覆盖的行号。**代码围栏**（那一整段代码）、**标题**（它下面整节）、**列表项**（它的子项）
    * 会超过一行 ——「comment 的是标题的话应该视为整段」，所以它们进这张表。
@@ -1436,7 +1479,7 @@ export const ReviewPane: React.FC<{
   /* ── deck 的早返回：**必须在所有 hook 之后**（转换失败那支不走后面的 hook 会让 React 报 hooks 数量不一致） ── */
   if (isDeck && why) {
     return (
-      <div className="rv-review rv-review-blocked">
+      <div className="rv-review rv-review-blocked" ref={rootRef}>
         {/* 转不出来时也不给"用系统应用打开"按钮 —— 顶栏那个 `↗ 打开文件` 就在正上方 */}
         <p className="rv-review-why">{why}</p>
         {install && (
@@ -1459,7 +1502,7 @@ export const ReviewPane: React.FC<{
   }
   if (isDeck && !bytes) {
     return (
-      <div className="rv-review rv-review-loading">
+      <div className="rv-review rv-review-loading" ref={rootRef}>
         {/\.pdf$/i.test(path) ? '正在读取 PDF…' : '正在转成 PDF…（第一次会慢一些，之后走缓存）'}
       </div>
     );
@@ -1467,7 +1510,7 @@ export const ReviewPane: React.FC<{
 
   if (isDeck) {
     return (
-      <div className="rv-review">
+      <div className="rv-review" ref={rootRef}>
         {ownerless}
         {/* 讲稿为什么没有 —— 多半是没装 python-pptx。预览和逐页意见不受影响 */}
         {notesWhy && <p className="rv-review-hint">{notesWhy}</p>}
@@ -1549,7 +1592,7 @@ export const ReviewPane: React.FC<{
 
 
   return (
-    <div className="rv-review">
+    <div className="rv-review" ref={rootRef}>
       {ownerless}
       <ol className="rv-review-blocks" ref={listRef}>
         {groups.map((g) => {
