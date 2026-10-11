@@ -5,8 +5,7 @@ import { useEffect, useState } from 'react';
  *
  * 粒度在会话这一层：新建会话时选一次，之后固定。所以这个列表只在"新建"的界面上用。
  *
- * `enabled: false`（feature flag 关着、或者配置里没有任何远端）时返回空列表，界面应当
- * **完全不显示**目标选择 —— 显示一个选了会报错的选项比不显示糟。
+ * 远程会话没有开关了：配了几台就给几台；一台没配就是空列表。
  */
 export interface RemoteTargetInfo {
   id: string;
@@ -33,8 +32,7 @@ export function useRemoteTargets(): { enabled: boolean; targets: RemoteTargetInf
     const load = (): void => {
       void (window as any).kiroApi?.remoteTargets?.().then((r: any) => {
         if (!alive || !r) return;
-        /* 主进程开关关着也会发已配的机器（设置页要看），新建会话的选项只在开着时给 */
-        setState({ enabled: !!r.enabled, targets: r.enabled && Array.isArray(r.targets) ? r.targets : [] });
+        setState({ enabled: !!r.enabled, targets: Array.isArray(r.targets) ? r.targets : [] });
       }).catch(() => {});
     };
     load();

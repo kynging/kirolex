@@ -3353,15 +3353,10 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   smartTitle: true,
   /** 会话记忆自动维护：一轮结束、攒够新消息就压一次（`sessionMemory.ts`） */
   sessionMemory: true,
-  /**
-   * **远程会话**：把这条会话的 kiro-cli 跑在另一台机器上，文件留在本机、通过反向隧道读写
-   * （`localMcp.ts`）。见 `docs/DESIGN_remote_sessions.md`。
-   *
-   * 默认**开** ——「为什么加了远程机器还没有切换到远程会话的选项」。原来默认关，理由是它改了
-   * "发送前先 rsync 推镜像"那条主路；镜像早就去掉了，剩下的效果只是：你在设置里配好一台机器，
-   * 新建对话里却永远看不到它。配一台机器本身就是选择要用它；一台没配时这个开关什么也不改变。
-   */
-  remoteSessions: true,
+  /*
+    远程会话不再是开关（原来的 `remoteSessions`）：配一台机器本身就是选择要用它，一台没配时
+    什么也不改变。表里没有这个键，老 config.json 里留着的 `features.remoteSessions: false` 也就不被认了。
+  */
   /** Store a large paste on disk and show a placeholder in the composer. */
   pasteFolding: true,
   /** Draggable dividers between split panes. */
@@ -5958,13 +5953,10 @@ app.whenReady().then(async () => {
     let resolvedCwd = cwd === '~' ? os.homedir() : cwd;
     const derived = derivedProjectFor(kiroLexId, resolvedCwd);
     /*
-      feature flag 关着的时候一条远程会话都建不起来 —— 主路上那几句同步代码就是死代码。
       老配置里的 `agents[].remote`（全局开关）不再自动生效：它只会作为一个**可选目标**
       出现在列表里（`remoteTargets`），选不选由这一次新建决定。
     */
-    const remote = isFeatureEnabled('remoteSessions')
-      ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId)
-      : undefined;
+    const remote = findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId);
     if (remoteId && !remote) {
       throw new Error(`找不到远端目标 ${remoteId}（配置里的 remotes 变了？）—— 没有猜一台机器，这条会话没有建。`);
     }
@@ -11243,17 +11235,16 @@ app.whenReady().then(async () => {
   /**
    * **可选的远端有哪些**（`docs/DESIGN_remote_sessions.md`）。
    *
-   * flag 关着就返回空列表 —— 界面据此**完全不显示**目标选择，而不是显示一个选了会报错的选项。
+   * 远程会话没有开关了，`enabled` 永远是 true（字段留着，调用方不用跟着改）。
    */
   ipcMain.handle('app:remote-targets', () => {
     /*
-      **开关关着也要把已配的机器发出去** —— 原来这里直接回空列表，而「存」照样能存：于是设置页
+      **已配的机器一律发出去** —— 原来开关关着时这里直接回空列表，而「存」照样能存：于是设置页
       永远看不到你刚加的那台，每次回来都是一张空表，再加一次 —— 实测 config.json 里攒了
-      aws-tokyo、aws-tokyo-2、-3、-4 四条同一个 IP。`enabled` 照旧带着，"能不能新建远程会话"
-      由调用方看它（useRemoteTargets 关着时自己当空列表）。
+      aws-tokyo、aws-tokyo-2、-3、-4 四条同一个 IP。
     */
     return {
-      enabled: isFeatureEnabled('remoteSessions'),
+      enabled: true,
       /*
         **字段要发全** ——「我为什么选了密钥不生效」。这里原来只发 id/label/sshHost/remoteWorkdir，
         漏了 `identityFile` 和 `sshPort`：于是设置界面永远显示"没有选私钥"（明明配置里有），

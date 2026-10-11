@@ -244,7 +244,7 @@ describe('设置分页 + 文案', () => {
        侧栏那个 ☁️ 要直接落到备份页（「这个同步应该在左侧下方有一个入口按钮」）。 */
     assert.match(D, /useState<SettingsTab>\(initialTab \|\| 'appearance'\)/);
     assert.match(D, /initialTab\?: SettingsTab;/);
-    assert.match(D, /\{tab === 'machines' && <RemoteSettings \/>\}/);
+    assert.match(D, /\{tab === 'machines' && <RemoteSettings startNew=\{newMachinePending\} \/>\}/);
     for (const id of ids.slice(1)) {
       assert.ok(
         D.includes(`{tab === '${id}' && (`) || D.includes(`{tab === '${id}' && <`),

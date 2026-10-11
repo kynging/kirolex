@@ -975,6 +975,8 @@ const App: React.FC = () => {
   const [showBackup, setShowBackup] = useState(false);
   /** 打开设置时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。 */
   const [settingsTab, setSettingsTab] = useState<'machines' | 'backup' | undefined>(undefined);
+  /** 打开设置时机器页直接进入「添加一台机器」（侧栏右键「运行位置 → ＋ 添加机器…」）。 */
+  const [settingsNewMachine, setSettingsNewMachine] = useState(false);
   /**
    * 上一次备份的结果 —— 侧栏那个 ☁️ 用它上色和写 title。
    *
@@ -3876,7 +3878,8 @@ const App: React.FC = () => {
               onMoveSession={moveSession}
               onReorderSessions={reorderSessions}
               onArchiveSession={archiveSession}
-              onSettings={() => { setSettingsTab(undefined); setShowSettings(true); }}
+              onSettings={() => { setSettingsTab(undefined); setSettingsNewMachine(false); setShowSettings(true); }}
+              onAddMachine={() => { setSettingsTab('machines'); setSettingsNewMachine(true); setShowSettings(true); }}
               /*
                 ☁️ 只管**恢复** ——「这个云按钮只保留恢复，这个界面应该展示所有已经备份的会话，
                 然后留一个多选/恢复按钮即可」。配置回到 设置 → ☁️ 备份。
@@ -4281,6 +4284,7 @@ const App: React.FC = () => {
       {showSettings && (
         <SettingsDialog
           initialTab={settingsTab}
+          startNewMachine={settingsNewMachine}
           settings={settings}
           onChange={handleSettingsChange}
           onClose={() => setShowSettings(false)}

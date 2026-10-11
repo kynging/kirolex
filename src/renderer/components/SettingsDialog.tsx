@@ -14,6 +14,8 @@ type SettingsTab = 'appearance' | 'session' | 'switches' | 'machines' | 'backup'
 interface SettingsDialogProps {
   /** 打开时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。不传 = 机器页。 */
   initialTab?: SettingsTab;
+  /** 机器页一打开就停在「+ 添加一台机器…」（侧栏右键「运行位置 → ＋ 添加机器…」）。不传 = 和以前一样。 */
+  startNewMachine?: boolean;
   settings: Settings;
   onChange: (settings: Settings) => void;
   onClose: () => void;
@@ -125,6 +127,7 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   initialTab,
+  startNewMachine,
   settings,
   onChange,
   onClose,
@@ -141,6 +144,9 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
     不传就还是机器页（那是最常改的一页）。
   */
   const [tab, setTab] = useState<SettingsTab>(initialTab || 'appearance');
+  /* 「直接进入添加新机器」只管这一次打开：切到别的页再回来就是平常的机器页（不再给一张空表） */
+  const [newMachinePending, setNewMachinePending] = useState(!!startNewMachine);
+  useEffect(() => { if (tab !== 'machines') setNewMachinePending(false); }, [tab]);
   const [capInfo, setCapInfo] = useState<{ cap: number; auto: number; overridden: boolean } | null>(null);
   const [capInput, setCapInput] = useState('');
   // Wedge-interrupt threshold in seconds. '' while loading, '0' = never interrupt.
@@ -298,7 +304,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             （「我还是没有找到配置远程服务器的地方」）—— 那是在跟布局较劲。
             分页之后它自己一页，顺序不再是稀缺资源。
           */}
-          {tab === 'machines' && <RemoteSettings />}
+          {tab === 'machines' && <RemoteSettings startNew={newMachinePending} />}
 
           {tab === 'appearance' && (
           <div className="settings-item settings-item-wide">

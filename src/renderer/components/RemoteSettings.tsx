@@ -206,9 +206,9 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
   );
 };
 
-export const RemoteSettings: React.FC = () => {
+/** `startNew`：打开时直接停在「+ 添加一台机器…」、给一张空表（侧栏右键「运行位置 → ＋ 添加机器…」）。 */
+export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) => {
   const [rows, setRows] = useState<RemoteRow[]>([]);
-  const [enabled, setEnabled] = useState(false);
   /** 本机那三个启动命令（和远端同样的字段，只是没有 SSH 那几项）。 */
   const [local, setLocal] = useState<ExecBins>({});
   const savedLocalSig = useRef('');
@@ -251,24 +251,24 @@ export const RemoteSettings: React.FC = () => {
     const r = await (window as any).kiroApi?.remoteTargets?.();
     const list: RemoteRow[] = Array.isArray(r?.targets) ? r.targets : [];
     setRows(list);
-    setEnabled(!!r?.enabled);
     const lb: ExecBins = { ...(r?.localBins || {}) };
     setLocal(lb);
     savedLocalSig.current = JSON.stringify([lb.kiro || '', lb.claude || '', lb.codex || '']);
     const wd = String(r?.localWorkdir || DEFAULT_WORKDIR);
     setLocalWorkdir(wd);
     savedLocalWorkdir.current = wd;
-    /* 默认：最近编辑的那台；一台都没有就是本机（见 defaultPick） */
-    const next = keep && list.some((x) => x.id === keep) ? keep : defaultPick(list);
+    /* 默认：最近编辑的那台；一台都没有就是本机（见 defaultPick）。`NEW` = 直接进入添加新机器 */
+    const next = keep === NEW || (keep && list.some((x) => x.id === keep)) ? keep : defaultPick(list);
     setPicked(next);
     if (next === LOCAL) { setDraft(null); savedSig.current = ''; return; }
+    if (next === NEW) { setDraft({ ...EMPTY }); savedSig.current = sig({ ...EMPTY }); return; }
     const row = list.find((x) => x.id === next);
     const d = { ...EMPTY, ...row, remoteWorkdir: row?.remoteWorkdir || DEFAULT_WORKDIR };
     setDraft(d);
     savedSig.current = sig(d);   // 打开设置不该写盘
   };
 
-  useEffect(() => { void reload(); }, []);
+  useEffect(() => { void reload(startNew ? NEW : undefined); }, []);
 
   useEffect(() => {
     const off = (window as any).kiroApi?.onRemoteBootstrapOutput?.((d: { chunk: string }) => {
@@ -420,13 +420,6 @@ export const RemoteSettings: React.FC = () => {
         配了远端机器之后，<b>新建对话</b>或右键「运行位置」就能让某条会话的 kiro-cli 跑在那台机器上 ——
         <b>文件不会被复制过去</b>：它通过一条反向隧道调回你这台机器上的工具来读写。
       </p>
-      {!enabled && (
-        <p className="settings-hint" style={{ color: 'var(--error)' }}>
-          远程会话当前是关着的（<code>remoteSessions</code>，开关在下面的功能开关里）——
-          关着的时候这里配了也不会出现在新建对话的选项里。
-        </p>
-      )}
-
       <select
         className="settings-select"
         value={picked}

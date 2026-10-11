@@ -217,6 +217,8 @@ interface SidebarProps {
   onReorderSessions?: (sessions: Session[]) => void;
   onArchiveSession: (sessionId: string, archived: boolean) => void;
   onSettings: () => void;
+  /** 右键「运行位置 → ＋ 添加机器…」：打开设置 → 机器页，直接进入添加新机器。 */
+  onAddMachine?: () => void;
   /**
    * 打开 ☁️「从备份恢复」——「这个同步应该在左侧下方有一个入口按钮」，
    * 而「这个云按钮只保留恢复」：配置在 设置 → ☁️ 备份。
@@ -576,6 +578,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onReorderSessions,
   onArchiveSession,
   onSettings,
+  onAddMachine,
   onOpenBackup,
   backupState,
   workspaceOpen,
@@ -1227,38 +1230,42 @@ export const Sidebar: React.FC<SidebarProps> = ({
               {/*
                 **换机器** ——「AI角色扮演这个应该是远程的」：一条已有会话应该能改成在远端跑，
                 而不是"只能重新建一条"（重建会把这条对话在后端的历史扔掉）。
-                只在配了远端、且 feature flag 开着时出现（`remoteTargets`）。
+                **一直显示**：一台远端都没配时里面只有「本地」，最下面的「＋ 添加机器…」就是配第一台的入口。
               */}
-              {remoteTargets.length > 0 && (
-                <>
-                  <div className="context-menu-divider" />
-                  {/*
-                    **一个入口、右侧展开**：这是"这条会话在哪台机器上跑"这**一个**问题，
-                    多个互斥选项；平铺的话每台机器占一行，和下面那堆 🏷️ 项目混在一起越来越难扫。
-                    当前在哪儿用 ✓ 标出来。
-                  */}
-                  <Submenu label={`${ctxSession.remoteHost ? '🌐' : '💻'} 运行位置：${ctxSession.remoteHost || '本地'}`}>
-                    <div
-                      className="context-menu-item"
-                      onClick={() => { void onSetTarget?.(ctxSession.id, null); setContextMenu(null); }}
-                      title="切回本地跑。切之前会先把远端的改动取回来 —— 取不回来就不切。"
-                    >
-                      {`${ctxSession.remoteHost ? '　' : '✓ '}💻 本地`}
-                    </div>
-                    {remoteTargets.map((tg) => (
-                      <div
-                        key={tg.id}
-                        className="context-menu-item"
-                        onClick={() => { void onSetTarget?.(ctxSession.id, tg.id); setContextMenu(null); }}
-                        title={`在 ${tg.sshHost} 上跑（文件仍在本地，每轮前后同步镜像）`}
-                      >
-                        {`${ctxSession.remoteHost === tg.label ? '✓ ' : '　'}🌐 ${tg.label}`}
-                      </div>
-                    ))}
-                  </Submenu>
-                  <div className="context-menu-divider" />
-                </>
-              )}
+              <div className="context-menu-divider" />
+              {/*
+                **一个入口、右侧展开**：这是"这条会话在哪台机器上跑"这**一个**问题，
+                多个互斥选项；平铺的话每台机器占一行，和下面那堆 🏷️ 项目混在一起越来越难扫。
+                当前在哪儿用 ✓ 标出来。
+              */}
+              <Submenu label={`${ctxSession.remoteHost ? '🌐' : '💻'} 运行位置：${ctxSession.remoteHost || '本地'}`}>
+                <div
+                  className="context-menu-item"
+                  onClick={() => { void onSetTarget?.(ctxSession.id, null); setContextMenu(null); }}
+                  title="切回本地跑。切之前会先把远端的改动取回来 —— 取不回来就不切。"
+                >
+                  {`${ctxSession.remoteHost ? '　' : '✓ '}💻 本地`}
+                </div>
+                {remoteTargets.map((tg) => (
+                  <div
+                    key={tg.id}
+                    className="context-menu-item"
+                    onClick={() => { void onSetTarget?.(ctxSession.id, tg.id); setContextMenu(null); }}
+                    title={`在 ${tg.sshHost} 上跑（文件仍在本地，每轮前后同步镜像）`}
+                  >
+                    {`${ctxSession.remoteHost === tg.label ? '✓ ' : '　'}🌐 ${tg.label}`}
+                  </div>
+                ))}
+                <div className="context-menu-divider" />
+                <div
+                  className="context-menu-item"
+                  onClick={() => { setContextMenu(null); onAddMachine?.(); }}
+                  title="打开 设置 → 机器，直接添加一台新机器；存好之后它就出现在这里"
+                >
+                  ＋ 添加机器…
+                </div>
+              </Submenu>
+              <div className="context-menu-divider" />
               <div
                 className="context-menu-item"
                 onClick={() => { setAssignPopup({ sessionId: ctxSession.id }); setContextMenu(null); }}

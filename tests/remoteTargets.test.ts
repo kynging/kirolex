@@ -90,23 +90,36 @@ describe('接线：主进程', () => {
     assert.equal(/loadActiveRemoteTarget\(/.test(M), false, '全局开关那条路必须断掉，否则"共存"是假的');
   });
 
-  test('flag 关着：设置页照样看得到已配的机器，新建会话那边看不到、主进程也不建', () => {
+  test('没有「远程会话」开关了：一律当作开着，config.json 里写了 false 也不认', () => {
+    /* 开关表里没有这一项 → loadFeatureFlags 只认表里的键，`features.remoteSessions: false` 自然被忽略；
+       set-feature 也会拒绝它（unknown feature） */
+    const table = M.slice(M.indexOf('const FEATURE_DEFAULTS'), M.indexOf('function loadFeatureFlags'));
+    assert.ok(table.length > 0);
+    assert.doesNotMatch(table, /^\s*remoteSessions:/m);
+    assert.doesNotMatch(M, /isFeatureEnabled\('remoteSessions'\)/);
     const at = M.indexOf("ipcMain.handle('app:remote-targets'");
     assert.ok(at > 0);
     const body = M.slice(at, at + 900);
     /* 原来关着就回空列表，设置页于是永远看不到刚存的那台，人就一次次重加（实测攒了 4 条同 IP） */
     assert.doesNotMatch(body, /return \{ enabled: false, targets: \[\] \}/);
-    assert.match(body, /enabled: isFeatureEnabled\('remoteSessions'\),/);
-    /* 新建会话的选项只在开着时给 */
+    assert.match(body, /enabled: true,/);
+    /* new-session 认 remoteId，不再看开关 */
+    assert.match(M, /const remote = findRemoteTarget\(KIROLEX_CONFIG_PATH, remoteId\);/);
+    /* 渲染进程也不再因为 enabled 把机器列表清空 */
     const hook = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useRemoteTargets.ts'), 'utf8');
-    assert.match(hook, /targets: r\.enabled && Array\.isArray\(r\.targets\) \? r\.targets : \[\]/);
-    /* 真正的闸在主进程：关着时 new-session 不认 remoteId */
-    assert.match(M, /const remote = isFeatureEnabled\('remoteSessions'\)\s*\? findRemoteTarget\(KIROLEX_CONFIG_PATH, remoteId\)/);
+    assert.doesNotMatch(hook, /r\.enabled &&/);
+    assert.match(hook, /targets: Array\.isArray\(r\.targets\) \? r\.targets : \[\]/);
+    /* 设置页：功能开关里没有它，「远程会话当前是关着的」那段红字也删了 */
+    const D = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
+    assert.doesNotMatch(D, /remoteSessions/);
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.doesNotMatch(RS, /远程会话当前是关着的/);
+    assert.doesNotMatch(RS, /remoteSessions/);
   });
 
-  test('远程会话默认开；新建对话的机器列表随设置页的增删就地刷新，不用重启', () => {
-    /* 「为什么加了远程机器还没有切换到远程会话的选项」 */
-    assert.match(M, /^\s*remoteSessions: true,$/m);
+  test('远程会话永远开；新建对话的机器列表随设置页的增删就地刷新，不用重启', () => {
+    /* 「为什么加了远程机器还没有切换到远程会话的选项」 —— 连开关都没有了 */
+    assert.doesNotMatch(M, /isFeatureEnabled\('remoteSessions'\)/);
     const hook = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useRemoteTargets.ts'), 'utf8');
     assert.match(hook, /window\.addEventListener\(REMOTE_TARGETS_CHANGED, load\);/);
     assert.match(hook, /window\.addEventListener\('focus', load\);/);
@@ -247,7 +260,7 @@ describe('在界面上加/改/删一台远端', () => {
     }
     assert.match(P, /remoteSave:/);
     assert.match(P, /remoteTest:/);
-    assert.match(SD, /<RemoteSettings \/>/);
+    assert.match(SD, /<RemoteSettings startNew=\{newMachinePending\} \/>/);
   });
 
   test('「测试连接」用的是**同一个**预检判据，不是另写一套', () => {
@@ -1079,13 +1092,40 @@ describe('切换一条已有会话的机器', () => {
        「这条会话在哪台机器上跑」是一个问题、多个互斥选项 —— 子菜单才是它的形状。 */
     assert.match(SB, /const Submenu: React\.FC</);
     assert.match(SB, /运行位置：\$\{ctxSession\.remoteHost \|\| '本地'\}/);
-    assert.match(SB, /\{remoteTargets\.length > 0 && \(/);
+    /* 一直显示：一台远端都没配时子菜单里只有「本地」（和最下面的「添加机器」） */
+    assert.doesNotMatch(SB, /remoteTargets\.length > 0 &&/);
     /* 当前在哪儿要能一眼看出来 */
     assert.match(SB, /ctxSession\.remoteHost \? '　' : '✓ '/);
     assert.match(SB, /ctxSession\.remoteHost === tg\.label \? '✓ ' : '　'/);
     /* 展开方向靠 CSS，不再写第二套边界计算 */
     const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
     assert.match(CSS, /\.context-submenu-panel \{[^}]*left: 100%/s);
+  });
+
+  test('「运行位置」子菜单最下面有「＋ 添加机器…」：关菜单、带着「机器页 + 新建」打开设置', () => {
+    const at = SB.indexOf('运行位置：${ctxSession.remoteHost');
+    assert.ok(at > 0);
+    const sub = SB.slice(at, SB.indexOf('</Submenu>', at));
+    /* 在各台机器之后、子菜单结尾之前：分隔线 + 添加机器 */
+    const list = sub.indexOf('remoteTargets.map(');
+    const add = sub.indexOf('＋ 添加机器…');
+    assert.ok(list > 0 && add > list, '「添加机器」在各台机器下面');
+    assert.match(sub.slice(list, add), /context-menu-divider/);
+    assert.match(sub, /onClick=\{\(\) => \{ setContextMenu\(null\); onAddMachine\?\.\(\); \}\}/);
+    assert.match(SB, /onAddMachine\?: \(\) => void;/);
+    /* App：机器页 + 直接进入新建；别的入口（齿轮）把新建参数清掉，行为不变 */
+    const A = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
+    assert.match(A, /onAddMachine=\{\(\) => \{ setSettingsTab\('machines'\); setSettingsNewMachine\(true\); setShowSettings\(true\); \}\}/);
+    assert.match(A, /onSettings=\{\(\) => \{ setSettingsTab\(undefined\); setSettingsNewMachine\(false\); setShowSettings\(true\); \}\}/);
+    assert.match(A, /startNewMachine=\{settingsNewMachine\}/);
+    /* SettingsDialog 把它交给机器页；机器页首次加载就选中「+ 添加一台机器…」、给一张空表 */
+    const D = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
+    assert.match(D, /startNewMachine\?: boolean;/);
+    assert.match(D, /useState\(!!startNewMachine\)/);
+    assert.match(D, /<RemoteSettings startNew=\{newMachinePending\} \/>/);
+    const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
+    assert.match(RS, /useEffect\(\(\) => \{ void reload\(startNew \? NEW : undefined\); \}, \[\]\);/);
+    assert.match(RS, /if \(next === NEW\) \{ setDraft\(\{ \.\.\.EMPTY \}\); savedSig\.current = sig\(\{ \.\.\.EMPTY \}\); return; \}/);
   });
 
   test('切换时**不强制**问目录（目录是会话界面上一个独立的东西），失败要让人看见', () => {
