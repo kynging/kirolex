@@ -59,7 +59,7 @@ import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward, httpProbeNotice,
-  type ForwardListItem,
+  forwardableFromCombo, remoteComboMcpServers, type ForwardListItem,
 } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
@@ -83,7 +83,7 @@ import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.
 import { logger } from './logger';
 import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
-import { readMcpCombos, saveMcpCombos, pickCombo, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID } from './mcpCombos.ts';
+import { readMcpCombos, saveMcpCombos, pickCombo, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
 // It fires because the Vite dev server is served without a CSP (a strict CSP would
@@ -1842,6 +1842,21 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
  */
 const toollessSessions = new Set<string>();
 
+/** 这条会话所选的组合（读不了 / 找不到时退回「通用」并在会话里说一句）。本地和远程会话共用。 */
+function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
+  const { combos, error } = readMcpCombos(os.homedir());
+  const combo = pickCombo(combos, profile.mcpCombo);
+  if (error) {
+    logger.warn('mcp-combo', `${mcpCombosPath(os.homedir())} 读不了：${error}`);
+    if (profile.mcpCombo && profile.mcpCombo !== BUILTIN_COMBO_ID) {
+      sessionNotice(sessionId, `⚠️ 组合文件有错（${error}），这次按「通用」起，不挂 MCP。`);
+    }
+  } else if (profile.mcpCombo && combo.id !== profile.mcpCombo) {
+    sessionNotice(sessionId, `⚠️ 找不到组合「${profile.mcpCombo}」（可能被删了），这次按「${combo.name}」起。`);
+  }
+  return combo;
+}
+
 /**
  * **本地 Claude Code / Codex 会话的「组合」** ——「不同对话挂不同的 MCP」。
  *
@@ -1853,16 +1868,7 @@ function localComboTools(
   sessionId: string, profile: AgentProfile,
 ): { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined {
   if (engineOf(profile) === 'kiro') return undefined;
-  const { combos, error } = readMcpCombos(os.homedir());
-  const combo = pickCombo(combos, profile.mcpCombo);
-  if (error) {
-    logger.warn('mcp-combo', `${mcpCombosPath(os.homedir())} 读不了：${error}`);
-    if (profile.mcpCombo && profile.mcpCombo !== BUILTIN_COMBO_ID) {
-      sessionNotice(sessionId, `⚠️ 组合文件有错（${error}），这次按「通用」起，不挂 MCP。`);
-    }
-  } else if (profile.mcpCombo && combo.id !== profile.mcpCombo) {
-    sessionNotice(sessionId, `⚠️ 找不到组合「${profile.mcpCombo}」（可能被删了），这次按「${combo.name}」起。`);
-  }
+  const combo = sessionCombo(sessionId, profile);
   const { servers, skipped } = buildAcpMcpServers(combo, shellEnv as Record<string, string | undefined>);
   for (const s of skipped) {
     sessionNotice(sessionId, `⚠️ 组合「${combo.name}」里的 MCP「${s.name}」要用环境变量 ${s.missing.join('、')}，本机没有设置 —— 这一条先跳过。`);
@@ -1955,7 +1961,41 @@ async function ensureLocalTools(
     */
     if (engineOf(profile) !== 'kiro') {
       const mcp = { type: 'http', name: 'kirolex-local', url: mcpUrl(remotePort, urlPath), headers: [] };
-      const spec = { remotePort, localPort: server.port(), agentOverride, forwarded: [] as string[], mcpServers: [mcp] };
+      /*
+        **所选组合里「从本机转发」的那些也经这条隧道** —— 规则见 `forwardableFromCombo`。
+        本机这份 `entries`（上游 url / 头 / env）只交给 setProxies；远端适配器只拿到 `<隧道>/<名字>`。
+        每次准备都 setProxies 一遍（没有就是空表）：换组合 / 换机器 / 重连时上一批代理和本机进程先停掉，
+        会话结束时 `releaseLocalTools` → `forget` 停掉 —— 和 Kiro 同一条生命周期。
+      */
+      const combo = sessionCombo(sessionId, profile);
+      const { entries, skipped } = forwardableFromCombo(combo.mcpServers, shellEnv as Record<string, string | undefined>);
+      for (const s of skipped) {
+        sessionNotice(sessionId, s.missing
+          ? `⚠️ 组合「${combo.name}」里的 MCP「${s.name}」要用环境变量 ${s.missing.join('、')}，本机没有设置 —— 这条远程会话里先不挂它。`
+          : `⚠️ 组合「${combo.name}」里的 MCP「${s.name}」没法从本机转发：${s.reason} —— 这条远程会话里先不挂它。`);
+      }
+      server.setProxies(sessionId, entries);
+      const http = entries.filter(isHttpForward);
+      const spec = {
+        remotePort, localPort: server.port(), agentOverride,
+        forwarded: entries.filter((e) => !isHttpForward(e)).map((e) => e.name),
+        forwardedHttp: http.map((e) => e.name),
+        mcpServers: [mcp, ...remoteComboMcpServers(entries, mcpUrl(remotePort, urlPath))],
+      };
+      if (entries.length) {
+        logger.info('localmcp', `组合「${combo.name}」经本机转发给 sessionId=${sessionId}：${entries.map((e) => e.name).join(', ')}`);
+      }
+      /* 探测，但不挡会话（同 Kiro 分支） */
+      for (const h of http) {
+        void probeHttpMcp(h, { log: (level, message) => logger[level]('localmcp', message) }).then((r) => {
+          if (r.ok) {
+            logger.info('localmcp', `中转 MCP「${h.name}」探测通过：${r.toolCount} 个工具 sessionId=${sessionId}`);
+            return;
+          }
+          sessionNotice(sessionId, httpProbeNotice(h.name, r.error || ''));
+          logger.warn('localmcp', `中转 MCP「${h.name}」探测失败 sessionId=${sessionId}: ${r.error}`);
+        }).catch(() => { /* 探测永远不能让会话准备失败 */ });
+      }
       localToolsBySession.set(sessionId, spec);
       toollessSessions.delete(sessionId);
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
@@ -8431,6 +8471,11 @@ app.whenReady().then(async () => {
         try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
         sessionClients.set(sessionId, nextEntry);
         wireSession(sessionId, nextEntry);
+        /*
+          **远程 → 本地：旧的转发通道收掉** —— 本地那条路不走 setProxies，不收的话上一台机器那批中转代理
+          和本机起的进程（playwright 的浏览器）要一直留到会话结束。放在 set 之后：关复用连接看的是"还有没有会话在那台机器上"。
+        */
+        if (!target && oldEntry.profile.remote?.sshHost) releaseLocalTools(sessionId, oldEntry.profile.remote);
 
         const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
         rec.profile = profile;
@@ -8914,8 +8959,11 @@ app.whenReady().then(async () => {
     emitSessionBusy(sessionId);
     const profile: AgentProfile = { ...oldEntry.profile, mcpCombo: nextCombo };
     let client: AcpClient | undefined;
+    /* 远程会话：ensureLocalTools 会换掉这条会话的 token、停掉旧的中转 —— 旧执行器手里那个隧道地址从这一刻起就失效了 */
+    let toolsSwapped = false;
     try {
       if (profile.remote?.sshHost) await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+      toolsSwapped = !!profile.remote?.sshHost;
       const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
       const started = await connectWithModelFallback(profile, 'switch-mcp-combo', localTools, sessionId);
       client = started.client;
@@ -8943,13 +8991,22 @@ app.whenReady().then(async () => {
       clearContextEstablished(sessionId);
       markContextOwedIfUnverified(sessionId, 'switch-mcp-combo');
       restoreContextAfterExecutorSwap(sessionId, 'switch-mcp-combo');
-      sessionNotice(sessionId, `🧩 这条会话换成了组合「${combo.name}」。执行器重启过，上下文会随下一条消息带过去；之前的对话一条都没动。`
-        + (profile.remote?.sshHost ? '（远程会话暂时还不挂组合里的 MCP。）' : ''));
+      sessionNotice(sessionId, `🧩 这条会话换成了组合「${combo.name}」。执行器重启过，上下文会随下一条消息带过去；之前的对话一条都没动。`);
       logger.info('mcp-combo', `切换组合 sessionId=${sessionId} -> ${combo.id}`);
       return { ok: true, current: combo.id };
     } catch (err) {
       if (client) { try { await client.disconnect(); } catch {} }
       logger.warn('mcp-combo', `切换组合失败 sessionId=${sessionId} -> ${combo.id}`, err);
+      /*
+        **新执行器没起来，旧的也已经没有工具通道了**（token 换了、旧中转停了）—— 留着它就是一条
+        local_* 和转发 MCP 全部 404 的会话。所以把旧执行器也收掉（顺带收掉刚建的通道和本机进程）：
+        记录里还是原来的组合，下一次打开 / 发消息按原组合重新接上，工具通道跟着一起重建。
+      */
+      if (toolsSwapped && sessionClients.get(sessionId) === oldEntry) {
+        void detachExecutor(sessionId);
+        sessionNotice(sessionId, `⚠️ 换组合「${combo.name}」没成功（${(err as any)?.message || err}），这条会话还是原来的组合。`
+          + '执行器已经断开，下一条消息会按原来的组合重新接上（包括你本机的工具）。');
+      }
       throw err;
     } finally {
       reconfiguringSessions.delete(sessionId);

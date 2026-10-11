@@ -30,6 +30,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
+import { expandEnvRefs as expandComboEnv, type McpComboServer } from './mcpCombos.ts';
 
 /**
  * 按名字就该转发的那些 —— 它们的意义就是"操作我这台机器"。
@@ -221,4 +222,78 @@ export function forwardHttpHelp(names: string[]): string {
     + `它们的请求**从用户那台机器发出**（用他本机的网络出口和密钥），在这里直接调就行；`
     + `**不要**在这台机器上另配同名或指向同一地址的 MCP 去直连 —— 这里没有密钥，出口 IP 也不对。`
     + `报「本机→上游 …」的错是用户本机那头的问题（密钥 / 网络），原样告诉他，别在这里绕。`;
+}
+
+/* ---------------------------------------------- Claude Code / Codex 的「组合」 */
+
+/** 隧道上 `/mcp/<token>/<名字>` 那一段能认的名字（同 `localMcp.ts` 的路由正则）。 */
+const TUNNEL_NAME = /^[\w.-]{1,40}$/;
+
+/**
+ * **Claude Code / Codex 远程会话：组合里哪些 MCP 经本机中转**（组合见 `mcpCombos.ts`）。
+ *
+ *   · http 型、标了 `forwardFromLocal` —— 产出 http 规格，由 `HttpProxy` 在本机代发（超时 `timeoutSec`，默认 180 秒）；
+ *   · http 型没标 —— 不出现（远程会话里没有它；要它就标上）；
+ *   · stdio 型标了、或命令符合上面那两条老规则（本机路径 / `FORWARD_BY_NAME`）—— 本机起进程转发；
+ *   · 其余 stdio —— 不出现。
+ *
+ * 头和 env 里的 `${env:…}` 在这里按传进来的环境（登录 shell 的）展开，和本地会话挂组合同一个口径；
+ * 缺变量的那条跳过。名字要能放进隧道 URL、不能和 `kirolex-local` 撞，不然也跳过。
+ * 跳过的都记进 `skipped`，由调用方在会话里说一句。
+ */
+export function forwardableFromCombo(
+  servers: Record<string, McpComboServer>, env: Record<string, string | undefined>,
+): { entries: ForwardEntry[]; skipped: Array<{ name: string; missing?: string[]; reason?: string }> } {
+  const entries: ForwardEntry[] = [];
+  const skipped: Array<{ name: string; missing?: string[]; reason?: string }> = [];
+  const expand = (m: Record<string, string> | undefined, missing: string[]): Record<string, string> => {
+    const out: Record<string, string> = {};
+    for (const [k, v] of Object.entries(m || {})) {
+      const r = expandComboEnv(v, env);
+      for (const n of r.missing) if (!missing.includes(n)) missing.push(n);
+      out[k] = r.value;
+    }
+    return out;
+  };
+  for (const [name, s] of Object.entries(servers || {})) {
+    if (!s || typeof s !== 'object' || s.disabled) continue;
+    const isHttp = s.url !== undefined;
+    const command = typeof s.command === 'string' ? s.command.trim() : '';
+    const pick = isHttp
+      ? !!s.forwardFromLocal
+      : !!command && (!!s.forwardFromLocal || FORWARD_BY_NAME.includes(name) || isLocalPathCommand(command));
+    if (!pick) continue;
+    if (!TUNNEL_NAME.test(name)) {
+      skipped.push({ name, reason: '名字只能用字母、数字、_ . -（最多 40 个），否则放不进转发地址' });
+      continue;
+    }
+    if (name === 'kirolex-local') {
+      skipped.push({ name, reason: '和本地工具通道 kirolex-local 重名' });
+      continue;
+    }
+    const missing: string[] = [];
+    if (isHttp) {
+      const headers = expand(s.headers, missing);
+      const sec = typeof s.timeoutSec === 'number' && s.timeoutSec > 0
+        ? Math.min(FORWARD_TIMEOUT_SEC_MAX, Math.floor(s.timeoutSec))
+        : FORWARD_TIMEOUT_SEC_DEFAULT;
+      if (missing.length) { skipped.push({ name, missing }); continue; }
+      entries.push({ type: 'http', name, url: String(s.url).trim(), headers, timeoutMs: sec * 1000 });
+    } else {
+      const childEnv = s.env ? expand(s.env, missing) : undefined;
+      if (missing.length) { skipped.push({ name, missing }); continue; }
+      entries.push({ name, command, args: Array.isArray(s.args) ? s.args.map(String) : [], ...(childEnv ? { env: childEnv } : {}) });
+    }
+  }
+  return { entries, skipped };
+}
+
+/**
+ * 交给远端适配器的 `mcpServers` 里追加的那几条：**只有隧道地址** `<base>/<名字>`，头是空的 ——
+ * 上游 url、头、env、密钥、命令都只留在本机那份 `entries` 里（`server.setProxies` 用）。
+ */
+export function remoteComboMcpServers(
+  entries: ForwardEntry[], tunnelBase: string,
+): Array<{ type: 'http'; name: string; url: string; headers: never[] }> {
+  return entries.map((e) => ({ type: 'http' as const, name: e.name, url: `${tunnelBase}/${e.name}`, headers: [] }));
 }
