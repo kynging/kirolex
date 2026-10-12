@@ -276,6 +276,8 @@ test('reload 之后 comment 侧栏还在：标签连同主人会话一起存、�
 });
 
 test('右侧 comment 栏拖宽有上限：窗口宽 − 侧栏 − 会话区最小宽度（Windows 宽屏上不再把左边挤没）', () => {
+  /* 会话区最少留 240（Mac 小屏上 review 栏要能拉得更宽） */
+  assert.ok(APP.includes('const CHAT_MIN_WIDTH = 240;'));
   assert.ok(APP.includes('const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarHidden ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));'));
   /* 侧栏「实际收没收」= 用户收起 或 窗口放不下时临时让位（panelFit.ts） */
   assert.ok(APP.includes('const sidebarHidden = sidebarCollapsed || autoFold.sidebar;'));

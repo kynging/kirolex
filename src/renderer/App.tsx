@@ -586,8 +586,9 @@ const MAX_FILE_TABS = 12;
 const OPEN_TABS_KEY = 'kirolex-open-file-tabs';
 /** 右侧文件 / comment 栏最窄多宽。 */
 const FILE_PANEL_MIN = 320;
-/** 拖宽右侧栏时**会话区至少留多宽** —— 再窄输入框和消息就没法用了（见 `fileViewerMax`）。 */
-const CHAT_MIN_WIDTH = 420;
+/** 拖宽右侧栏时**会话区至少留多宽** —— 再窄输入框和消息就没法用了（见 `fileViewerMax`）。
+ *  取 240：Mac 笔记本 1440～1512 宽的屏上 review 栏要能拉得更宽（原来 420 时只能拉到 780～850 左右）。 */
+const CHAT_MIN_WIDTH = 240;
 const SPLIT_SESSION_KEY = 'kirolex-split-session';
 /** 每个会话排着的后续消息 —— 落盘，因为它们是你已经按过回车的东西（见 `queuesBySession`） */
 const QUEUES_KEY = 'kirolex-queues';
