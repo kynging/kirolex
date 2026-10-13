@@ -345,7 +345,10 @@ describe('接线：隧道、会话专用 agent、以及远端进程的收尾', (
       { model: 'm', remote: { enabled: true, sshHost: 'h', remoteWorkdir: '/home/x/kirolex-mirror' } } as any,
       '/Users/k/code/blog',
     );
-    assert.match(cwd, /\/home\/x\/kirolex-mirror\/scratch\//);
+    /* 远端 cwd 只是缓存目录（~/.cache/kirolex/<会话>），不再指向 kirolex-mirror/scratch —— 见 remoteWriteGuard.test.ts */
+    assert.match(cwd, /\/\.cache\/kirolex\/blog-[0-9a-f]{8}$/);
+    assert.equal(cwd.includes('kirolex-mirror'), false);
+    assert.equal(cwd.includes('/scratch/'), false);
   });
 });
 

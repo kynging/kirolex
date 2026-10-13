@@ -2329,6 +2329,44 @@ const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label
     </span>
   );
 };
+/**
+ * **「⇩ 复制到本机」** —— 远程会话把交付文件写在了远端时，状态行上每个文件一颗（`sessionNotice` 的 `copyRemote`）。
+ * 经已有的 ssh 连接读出来写进这条会话的本机文件夹，然后打开本机那一份 —— 不让用户自己去 ssh。
+ */
+const RemoteCopyButtons: React.FC<{ sessionId: string; paths: string[] }> = ({ sessionId, paths }) => {
+  const t = useT();
+  /* 每个路径：'busy' 复制中、{ ok } 复制好了（本机路径）、{ error } 失败原因 */
+  const [state, setState] = useState<Record<string, 'busy' | { ok: string } | { error: string }>>({});
+  const copy = async (p: string) => {
+    setState((s) => ({ ...s, [p]: 'busy' }));
+    const res = await window.kiroApi.copyRemoteToLocal?.(sessionId, p)
+      .catch((err: any) => ({ ok: false, path: undefined, error: String(err?.message || err) }));
+    if (res?.ok && res.path) {
+      setState((s) => ({ ...s, [p]: { ok: res.path! } }));
+      openPathInApp(res.path, sessionId);
+    } else {
+      setState((s) => ({ ...s, [p]: { error: res?.error || t('Copy failed') } }));
+    }
+  };
+  return (
+    <span className="session-notice-actions">
+      {paths.map((p) => {
+        const st = state[p];
+        const name = p.split(/[/\\]/).pop() || p;
+        return (
+          <span key={p} className="session-notice-action-wrap">
+            <button className="session-notice-action" title={p} disabled={st === 'busy'} onClick={() => { void copy(p); }}>
+              {t('⇩ Copy to this machine')} {name}
+            </button>
+            {st && st !== 'busy' && ('ok' in st
+              ? <span className="session-notice-action-ok" title={st.ok}>{t('Copied to {path}', { path: st.ok })}</span>
+              : <span className="session-notice-action-error">⚠️ {st.error}</span>)}
+          </span>
+        );
+      })}
+    </span>
+  );
+};
 const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(({ fileChanges, remoteHost }) => {
   const t = useT();
   const [collapsed, setCollapsed] = useState(false);
@@ -4066,7 +4104,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               )}
               {sessionNotice && (
                 <div className={`session-notice${/⚠️/.test(sessionNotice.text) ? ' warn' : ''}`}>
-                  <span className="session-notice-text">{sessionNotice.text}</span>
+                  <span className="session-notice-text">
+                    {sessionNotice.text}
+                    {/* 放在文字下面（同一列）：分屏时一格很窄，并排会把按钮挤出去 */}
+                    {sessionNotice.copyRemote && currentSessionId && (
+                      <RemoteCopyButtons sessionId={currentSessionId} paths={sessionNotice.copyRemote} />
+                    )}
+                  </span>
                   <button className="session-notice-close" onClick={dismissNotice} title="关掉">✕</button>
                 </div>
               )}

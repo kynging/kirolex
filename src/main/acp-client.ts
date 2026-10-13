@@ -4,6 +4,7 @@ import * as fs from 'fs';
 import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
+import { ToolCallLedger } from './remoteWriteGuard.ts';
 import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, resolveAdapter, type Engine } from './engines.ts';
@@ -191,6 +192,13 @@ export class AcpClient extends EventEmitter {
   launchedWith?: string;
   /** 哪个引擎（kiro / claude / codex）。见 `engines.ts`：只有起进程那一步和 kiro 专有的扩展不同。 */
   readonly engine: Engine;
+  /**
+   * 远程会话的写文件闸（`remoteWriteGuard.remoteWriteVerdict`，index.ts 的 `wireSession` 接上）。
+   * 给它权限请求里那个 toolCall，回 `block: true` 就直接拒，不自动批准、也不转给人。
+   */
+  remoteWriteGuard?: (toolCall: any) => { block: boolean; paths: string[] } | null | undefined;
+  /** 通知里每个工具调用的 kind / rawInput（权限请求里没有，按 toolCallId 合并 —— 见 `ToolCallLedger`）。 */
+  private toolLedger = new ToolCallLedger();
 
   constructor(
     model: string,
@@ -823,6 +831,9 @@ export class AcpClient extends EventEmitter {
     }
 
     if (method === 'session/update') {
+      /* 权限请求只带 toolCallId / title；写文件闸要的 kind / rawInput 在这里（只有远程会话接了闸才记） */
+      const su = params?.update?.sessionUpdate;
+      if (this.remoteWriteGuard && (su === 'tool_call' || su === 'tool_call_update')) this.toolLedger.remember(params.update);
       this.emit('update', params);
     } else if (method.startsWith('_kiro.dev/')) {
       // Kiro-specific notifications (mcp init, commands, etc.)
@@ -840,6 +851,24 @@ export class AcpClient extends EventEmitter {
     
     if (method === 'session/request_permission') {
       const options: Array<{ optionId: string; kind?: string }> = params?.options || [];
+      /*
+        **远程会话：远端自带的写文件工具写到缓存以外 → 拒** ——「用户需要的文件一律落在本机」。
+        排在自动批准 / 问人**之前**：两种模式都不该把交付文件放到那台机器上。判据在 `remoteWriteGuard.ts`
+        （由 index.ts 按会话接上），拒掉之后说一声（`remote-write-blocked`），模型按提示词改用 `local_write`。
+      */
+      const guard = this.remoteWriteGuard?.(this.toolLedger.join(params?.toolCall ?? params));
+      if (guard?.block) {
+        const reject = pickPermissionOption(options, false);
+        this.send({
+          jsonrpc: '2.0',
+          id,
+          result: reject
+            ? { outcome: { outcome: 'selected', optionId: reject.optionId } }
+            : { outcome: { outcome: 'cancelled' } },
+        });
+        this.emit('remote-write-blocked', { sessionId: params?.sessionId, paths: guard.paths, title: params?.toolCall?.title });
+        return;
+      }
       if (this.permissionMode === 'auto-approve') {
         const allow = pickPermissionOption(options, true);
         this.send({

@@ -267,7 +267,12 @@ declare global {
         /** Images come back as a base64 data URL for inline display. */
         image?: boolean;
         dataUrl?: string;
+        /** 远程会话那台机器上的文件（本机没有，经 ssh 读的） */
+        remote?: boolean;
+        remoteHost?: string;
       }>;
+      /** 远程会话落在远端的文件 → 复制进这条会话的本机文件夹，回本机路径 */
+      copyRemoteToLocal?: (sessionId: string, remotePath: string) => Promise<{ ok: boolean; path?: string; bytes?: number; error?: string }>;
       /**
        * 侧栏 review 的「✓ 确认」—— 在**打开这份文件的那条会话**里改一块（正忙就在主进程里排队）。
        *   `block`（默认）只回改完的这一块；`patch` 跨段 —— block 那次回了 `cannot`、或者整篇的意见时才问，
@@ -574,6 +579,11 @@ export interface FileTab {
    * 空的（没有会话时打开的）就不给「✓ 确认」和「提交」。
    */
   ownerSessionId?: string;
+  /** 这份是远程会话那台机器上的文件（本机没有）—— 预览顶上给「⇩ 复制到本机」 */
+  remote?: boolean;
+  remoteHost?: string;
+  /** 「⇩ 复制到本机」失败的原因（显示在那颗按钮旁边） */
+  copyError?: string;
   /**
    * 这份文件在盘上最后一次变化（或者被手动刷新）的时间 —— **deck 的预览靠它重取**。文本那侧一直会自动更新
    * （正文就是 `content`）；deck 的 PDF 和讲稿是 `ReviewPane` 自己取的，不推这一下屏幕上还是旧那十四页。
@@ -4196,6 +4206,32 @@ const App: React.FC = () => {
                     );
                   })()}
                   <div className="workspace-viewer-path" title={fileViewer.path}>{fileViewer.path}</div>
+                  {/*
+                    **远端的文件不是交付位置** ——「远程会话里，用户需要的文件一律落在本机」。
+                    这份是经 ssh 从那台机器上读的；点一下复制进这条会话的本机文件夹并打开本机那一份，
+                    之后 comment 写回的就是本机文件，不用自己去 ssh。
+                  */}
+                  {fileViewer.remote && fileViewer.ownerSessionId && (
+                    <div className="workspace-hint remote-file-hint">
+                      <span>{t('🌐 This file is on {host}, not on your machine.', { host: fileViewer.remoteHost || t('the remote machine') })}</span>
+                      <button
+                        type="button"
+                        className="rv-review-toggle"
+                        onClick={async () => {
+                          const tab = fileViewer;
+                          const res = await window.kiroApi.copyRemoteToLocal?.(tab.ownerSessionId!, tab.path)
+                            .catch((err: any) => ({ ok: false, path: undefined as string | undefined, error: String(err?.message || err) }));
+                          if (res?.ok && res.path) {
+                            closeFileTab(tab.id);
+                            void openFileInApp(res.path, tab.ownerSessionId);
+                          } else {
+                            setFileTabs((prev) => prev.map((x) => (x.id === tab.id ? { ...x, copyError: res?.error || t('Copy failed') } : x)));
+                          }
+                        }}
+                      >{t('⇩ Copy to this machine')}</button>
+                      {fileViewer.copyError && <span className="remote-file-hint-error">⚠️ {fileViewer.copyError}</span>}
+                    </div>
+                  )}
                   {/*
                     **PDF / deck 走逐页预览** —— 排在 binary 那一支**前面**：.pptx 会被 workspaceRead 判成
                     binary（它就是个 zip），落到下面就是一句「无法预览」。转换、缓存、讲稿都在主进程

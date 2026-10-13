@@ -8935,3 +8935,27 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   opacity: 1; color: #fff;
   background: color-mix(in srgb, var(--accent) 78%, #000); border-color: color-mix(in srgb, var(--accent) 78%, #000);
 }
+
+/* 远程会话：落在远端的交付文件 →「⇩ 复制到本机」（状态行里每个文件一颗；预览顶上一条） */
+.session-notice-actions { display: flex; flex-direction: column; gap: 4px; margin-top: 6px; white-space: normal; }
+.session-notice-action-wrap { display: flex; align-items: center; gap: 6px; min-width: 0; }
+.session-notice-action {
+  flex-shrink: 1;
+  min-width: 0;
+  max-width: 100%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 2px 8px;
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  background: var(--bg-secondary, transparent);
+  color: var(--text-primary);
+  font-size: 11px;
+  cursor: pointer;
+}
+.session-notice-action:disabled { opacity: 0.6; cursor: progress; }
+.session-notice-action-ok { color: var(--text-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.session-notice-action-error { color: var(--error); min-width: 0; word-break: break-word; }
+.remote-file-hint { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
+.remote-file-hint-error { color: var(--error); }

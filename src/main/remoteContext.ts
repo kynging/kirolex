@@ -85,7 +85,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     (localDir && input.hasLocalProject !== false) ? localToolsHelp(localDir) : '',
     input.hasLocalProject === false
       ? `· **这条会话没有本地工程** —— 用户没给它挑本机目录，所以"项目"就在**你这台机器上**`
-        + `（当前目录 \`${remoteDir}\`）。要找文件、找代码、跑命令，都在这里找，`
+        + `（当前目录 \`${remoteDir}\` 是缓存目录，交付物不放这里）。要找文件、找代码、跑命令，都在这里找，`
         + `**别拿 \`local_glob\` / \`local_grep\` 去搜用户的 Mac** —— 那边没有这个工程，`
         + `\`local_*\` 的默认目录是这条会话在他机器上的文件夹${input.filesDir ? `（\`${input.filesDir}\`）` : ''}，`
         + `里面只有这条会话自己的产出，不是工程。`
@@ -138,6 +138,20 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     */
     `· **默认在这台机器上做**：跑命令、装依赖、下载、解压、访问网络、落临时文件 ——`
       + `当前目录 \`${remoteDir}\` 就是你的工作区。这台机器就是给你干活用的，别把这些搬回用户的笔记本。`,
+    /*
+      **交付给用户的文件写本机** ——「v1 是经本机工具写到本机的，v3 却落在了 EC2」。
+      远端 kiro-cli 自带的写文件工具模型可以任选，选了它文件就落在那台机器上：用户找不到、
+      侧栏 comment 写不回去。所以：远端只放用完即弃的东西（cwd 就是缓存目录，随时会被清），
+      用户要的文件一律 `local_write`；自带的写文件工具写到缓存以外会被 KiroLex 拒掉
+      （`remoteWriteGuard.ts`），被拒了就改走 `local_write`，别换条路绕过去。
+    */
+    `· **交付给用户的文件一律写在他机器上**：文档、报告、改好的稿子、生成的代码 —— 用 \`local_write\``
+      + (input.filesDir ? `（默认放进 \`${input.filesDir}\`，或者他指定的本机路径）` : '（或者他指定的本机路径）')
+      + `。**别用你这台机器上自带的写文件工具（fs_write / write 之类）写交付物**：`
+      + `当前目录 \`${remoteDir}\` 是**缓存**，里面的东西随时会被清、不算交付；`
+      + `往缓存（和 /tmp）以外写会被 KiroLex 拒绝 —— 被拒了就改用 \`local_write\`，别换个路径重试，也别用 shell 重定向绕过去。`
+      + `用命令在这里生成的产物（编译结果、脚本输出）要给他的，最后用 \`local_write\` 交回去；`
+      + `写不了的二进制文件就把它在这台机器上的完整路径告诉他。`,
     input.hasLocalProject === false
       ? '· **什么时候回到用户机器**：只有两种 —— ① 他把某个本机路径明确写给你；'
         + '② 他明说了"在本地/在我机器上"做。其余一律在这里做，'

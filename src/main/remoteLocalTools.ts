@@ -175,7 +175,19 @@ export function remoteAgentScript(
     'else:',
     /* 缺 `tools` 字段 = 一个工具都不给（实测：远端回"我手上没有任何可调用的工具"） */
     '    cfg["tools"] = ["*"]',
-    'allowed = [t for t in (src.get("allowedTools") or []) if kept(t)]',
+    /*
+      **远端自带的写文件工具不预先放行** ——「远程会话里，用户需要的文件一律落在本机」。
+      `allowedTools` 里信任了它（`fs_write` / `write`，或 `*` / `fs_*` / `@builtin` 这类通配）的话，
+      kiro-cli 写之前根本不来问，KiroLex 在权限那一层（`remoteWriteGuard`）就拦不到，交付文件照样落在远端。
+      `toolsSettings` 里它的 `allowedPaths` 同理（那是"这些路径不用问"）。只改会话专用 agent，远端原文件不动。
+    */
+    'import fnmatch',
+    'native_write = ["fs_write", "write", "@builtin/fs_write", "@builtin/write"]',
+    'def trusts_write(t):',
+    '    return str(t) == "@builtin" or any(fnmatch.fnmatchcase(w, str(t)) for w in native_write)',
+    'if isinstance(cfg.get("toolsSettings"), dict):',
+    '    cfg["toolsSettings"] = {k: v for k, v in cfg["toolsSettings"].items() if k not in native_write}',
+    'allowed = [t for t in (src.get("allowedTools") or []) if kept(t) and not trusts_write(t)]',
     'cfg["allowedTools"] = allowed + [t for t in tags if t not in allowed]',
     'os.makedirs(h, exist_ok=True)',
     'open(os.path.join(h, out + ".json"), "w").write(json.dumps(cfg, indent=2))',

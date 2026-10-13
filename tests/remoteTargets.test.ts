@@ -811,7 +811,8 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
     assert.equal(defaultRemoteWorkdir('ec2-user@1.2.3.4'), '/home/ec2-user/kirolex');
     assert.equal(defaultRemoteWorkdir('root@h'), '/root/kirolex');
     const cwd = sessionCwd({ model: 'm', remote: { enabled: true, sshHost: 'ec2-user@h' } } as any, '/Users/me/blog');
-    assert.match(cwd, /^\/home\/ec2-user\/kirolex\/scratch\/blog-[0-9a-f]{8}$/);
+    /* 远端 cwd 是缓存目录，不随工作目录走：~/.cache/kirolex/<会话> */
+    assert.match(cwd, /^\/home\/ec2-user\/\.cache\/kirolex\/blog-[0-9a-f]{8}$/);
   });
 
   test('同 IP 的重复项留**最近编辑的**那条，按旧 id 也能找到它', async () => {
@@ -842,7 +843,7 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
     assert.equal(resolveRemoteWorkdir('~/kirolex', 'h', 'kyn06'), '/home/kyn06/kirolex');
     assert.equal(resolveRemoteWorkdir('~/kirolex', 'h', ''), '~/kirolex', '连本机用户名都不知道才原样');
     const cwd = sessionCwd({ model: 'm', remote: { enabled: true, sshHost: 'ec2-user@h', remoteWorkdir: '~/kirolex' } } as any, '/Users/me/blog');
-    assert.match(cwd, /^\/home\/ec2-user\/kirolex\/scratch\//);
+    assert.match(cwd, /^\/home\/ec2-user\/\.cache\/kirolex\//);
   });
 
   test('用户名单独一栏，存下去仍然是 用户名@IP', async () => {
@@ -1231,7 +1232,8 @@ describe('KiroLex 的提示走状态行；换项目不许杀掉正在跑的一�
   const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
 
   test('提示只发事件、**不写进 transcript**', () => {
-    assert.match(M, /function sessionNotice\(sessionId: string, text: string\): void \{/);
+    /* 第三个参数只带「复制到本机」的路径（远程会话落在远端的交付文件），照样只发事件 */
+    assert.match(M, /function sessionNotice\(sessionId: string, text: string, extra\?: \{ copyRemote\?: string\[\] \}\): void \{/);
     assert.match(M, /mainWindow\?\.webContents\.send\('session:notice'/);
     /* 远程那几处（同步进度/冲突、agent 缺 MCP、模型降级、换机器、退回本地）都改走它了 */
     assert.ok((M.match(/sessionNotice\(/g) || []).length >= 6);

@@ -448,6 +448,9 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('app:show-in-folder', filePath, sessionId),
   workspaceDownload: (sessionId: string | null | undefined, filePath: string) =>
     ipcRenderer.invoke('workspace:download', sessionId, filePath),
+  /** 远程会话落在远端的文件 → 经 ssh 读出来写进这条会话的本机文件夹，回本机路径 */
+  copyRemoteToLocal: (sessionId: string, remotePath: string) =>
+    ipcRenderer.invoke('workspace:copy-remote-to-local', sessionId, remotePath),
   /**
    * 侧栏 review 的「✓ 确认」：把一条意见发给**打开这份文件的那条会话**，等它回改完的正文。
    * 正忙就在主进程里排队；`cannot` = 它说这条改不了单独一段（渲染层据此升级到 `patch`）。
@@ -531,7 +534,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 这些不进 transcript：它们不是对话内容，写进去会打断对话的读法、把 transcript 撑大
    * （远程会话每轮都要推它），还得靠"别发给模型"那条过滤一直兜着。界面显示在输入框上方、自动消失。
    */
-  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number }) => void) => {
+  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number; copyRemote?: string[] }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:notice', handler);
     return () => ipcRenderer.removeListener('session:notice', handler);

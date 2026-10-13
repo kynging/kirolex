@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import crypto from 'crypto';
+import { REMOTE_CACHE_SUBDIR } from './remoteWriteGuard.ts';
 
 /**
  * A session's execution profile. An executor process is bound to (model, host);
@@ -314,12 +315,23 @@ export function sessionCwd(profile: AgentProfile, localDefault: string): string 
       它自己要落个临时文件时有地方放，而不是"项目在这里"。
       一条会话一个目录 —— 共用一个的话两条会话的临时文件会互相覆盖。
     */
-    const wd = resolveRemoteWorkdir(profile.remote.remoteWorkdir, profile.remote.sshHost);
+    /*
+      **cwd 是缓存目录，不再是 `<remoteWorkdir>/scratch/…`** ——「远端只放缓存」。
+      那个 scratch 是镜像时代留下的，模型把它当工作区，相对路径和新建的交付文件都落在了那里
+      （实测 `~/kirolex-mirror/scratch/files-<hash>/…v3.md`）。现在远端只留一个明确的
+      `~/.cache/kirolex/<会话>`：用完即弃，交付物一律写回本机（`remoteWriteGuard.ts`）。
+    */
+    const wd = remoteHomeDir(profile.remote.sshHost);
     /* 名字里带一段**本地目录的哈希**：`~/code/blog` 和 `~/work/blog` 的 basename 一样，
        只用 basename 会把两条会话的草稿目录叠在一起。 */
     const base = (localDefault.split('/').filter(Boolean).pop() || 'session').replace(/[^\w.@-]+/g, '_');
     const h = crypto.createHash('sha1').update(localDefault).digest('hex').slice(0, 8);
-    return `${wd.replace(/\/+$/, '')}/scratch/${base}-${h}`;
+    return `${wd.replace(/\/+$/, '')}/${REMOTE_CACHE_SUBDIR}/${base}-${h}`;
   }
   return localDefault;
+}
+
+/** 远端家目录（按 "user@host" 的登录用户算，见 `resolveRemoteWorkdir`）。 */
+export function remoteHomeDir(sshHost: string): string {
+  return resolveRemoteWorkdir('~', sshHost);
 }

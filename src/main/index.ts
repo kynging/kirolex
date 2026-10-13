@@ -29,7 +29,7 @@ import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
 import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
-import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
+import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, remoteHomeDir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
@@ -50,6 +50,7 @@ import { writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
+import { remoteWriteVerdict, strayRemoteDeliverables, blockedWriteNotice, strayWriteNotice, saveRemoteCopy, captureBufferFor } from './remoteWriteGuard.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { probeHttpMcp, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
@@ -146,6 +147,8 @@ interface SessionEntry {
    * 所以不设也不会错 —— 但设上之后就不用在每个用点再判一次"这是远程吗"。
    */
   localDir?: string;
+  /** 远程会话：已经提示过"交付文件落在远端"的那些 toolCallId（每个调用只说一次，见 `wireSession`）。 */
+  strayRemoteNoticed?: Set<string>;
   /** accumulates the in-flight assistant response; flushed to the durable
    *  store only when the turn completes (asymmetric durability, §7). */
   assistantBuf: string;
@@ -1785,9 +1788,10 @@ const diagHost = (remote?: RemoteTarget): HostOps => hostFor(remote, { buildSshA
  *
  * 所以它们只发事件，界面显示在输入框上方、自己会消失。
  */
-function sessionNotice(sessionId: string, text: string): void {
+function sessionNotice(sessionId: string, text: string, extra?: { copyRemote?: string[] }): void {
   try {
-    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now() });
+    /* `copyRemote`：远程会话里落在远端的交付文件 —— 状态行上给每个一颗「⇩ 复制到本机」（`workspace:copy-remote-to-local`） */
+    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), ...(extra?.copyRemote?.length ? { copyRemote: extra.copyRemote } : {}) });
   } catch { /* 提示永远不能让主流程失败 */ }
   logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
@@ -2378,11 +2382,12 @@ function runProbe(machine: string, script: string): Promise<string> {
 }
 
 /** 在远端跑一条命令并**拿回 stdout**（`writeRemoteFile` 丢掉输出）。 */
-function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000): Promise<string> {
+function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer?: number): Promise<string> {
   return new Promise((resolve, reject) => {
     execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
       /* 默认 60 秒够所有探测用；`kiro-cli update` 要下一个几十 MB 的二进制，调用方会放宽 */
-      { timeout: timeoutMs, encoding: 'utf8', env: sshEnv(remote) },
+      /* `maxBuffer`：读大文件的调用方（「复制到本机」）要放宽，默认 1 MiB 装不下 base64 之后的正文 */
+      { timeout: timeoutMs, encoding: 'utf8', env: sshEnv(remote), ...(maxBuffer ? { maxBuffer } : {}) },
       (err, stdout, stderr) => {
         if (err && !String(stdout || '')) {
           /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
@@ -4416,6 +4421,21 @@ async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise
 function wireSession(sessionId: string, entry: SessionEntry) {
   const { client } = entry;
   void applyEngineModel(sessionId, entry);
+  /*
+    **远程会话：用户要的文件落在本机，远端只放缓存**（`remoteWriteGuard.ts`）。
+    远端自带的写文件工具写到缓存以外 → 权限那一层拒掉（`AcpClient.remoteWriteGuard`）；
+    漏过去的（不来问的模式）在下面 tool_call 那段事后认出来，给「复制到本机」。
+    `entry.cwd` 每次现取：换模型 / 换机器之后它可能变。
+  */
+  const remoteHost = entry.profile.remote?.sshHost;
+  if (remoteHost) {
+    client.remoteWriteGuard = (toolCall) => remoteWriteVerdict(toolCall, { cwd: entry.cwd, home: remoteHomeDir(remoteHost) });
+    client.on('remote-write-blocked', (d: { paths?: string[]; title?: string }) => {
+      const paths = Array.isArray(d?.paths) ? d.paths : [];
+      logger.info('permission', `remote write blocked sessionId=${sessionId} ${String(d?.title || '').slice(0, 80)} paths=${paths.join(',').slice(0, 200)}`);
+      sessionNotice(sessionId, blockedWriteNotice(labelForHost(KIROLEX_CONFIG_PATH, remoteHost) || remoteHost, paths, sessionFilesDir(sessionId)));
+    });
+  }
   client.on('update', (data: any) => {
     // A background history-priming turn's output must never surface: don't
     // forward to the UI, accumulate, or persist it.
@@ -4495,6 +4515,17 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           diffs: diffs.length > 0 ? diffs : previous?.diffs,
           content: output ? clampToolOutput(output) : previous?.content,
         };
+        /* 远程会话：这次写已经落在远端缓存以外（没经过权限闸）—— 说出来，给「复制到本机」。每个调用只说一次。 */
+        if (remoteHost && status === 'completed') {
+          const stray = strayRemoteDeliverables({ ...u, kind: next.kind, title: next.title, locations: next.locations, diffs: next.diffs, status },
+            { cwd: entry.cwd, home: remoteHomeDir(remoteHost) });
+          const said = (entry.strayRemoteNoticed ??= new Set<string>());
+          if (stray.length && !said.has(toolCallId)) {
+            said.add(toolCallId);
+            logger.warn('tool', `deliverable written on remote sessionId=${sessionId} paths=${stray.join(',').slice(0, 200)}`);
+            sessionNotice(sessionId, strayWriteNotice(labelForHost(KIROLEX_CONFIG_PATH, remoteHost) || remoteHost, stray), { copyRemote: stray });
+          }
+        }
         // Outstanding-tool bookkeeping for wedge detection (see openToolCalls).
         // `lastUpdate` is rewritten on every update, so it measures STALENESS, not
         // age: a tool that keeps reporting keeps its session protected. `startedAt`
@@ -9386,10 +9417,10 @@ app.whenReady().then(async () => {
   }
 
   /** 用 ssh 取远端一个文件的前 `max` 字节和它的总大小（base64 回来，和配置面板那条路一样）。 */
-  async function remoteFileBytes(target: RemoteTarget, remotePath: string, max = WORKSPACE_PREVIEW_MAX_BYTES):
+  async function remoteFileBytes(target: RemoteTarget, remotePath: string, max = WORKSPACE_PREVIEW_MAX_BYTES, timeoutMs = 30_000):
     Promise<{ kind: 'dir' | 'missing' } | { kind: 'file'; size: number; buffer: Buffer }> {
     const script = `f=${shellQuote(remotePath)}; if [ -d "$f" ]; then echo KXDIR; elif [ -f "$f" ]; then printf 'KXSIZE %s\\n' "$(wc -c <"$f" | tr -d ' ')"; head -c ${max} "$f" | base64 -w0; else echo KXMISSING; fi`;
-    const out = String(await runRemoteCapture(target, script, 30_000) || '');
+    const out = String(await runRemoteCapture(target, script, timeoutMs, captureBufferFor(max)) || '');
     if (out.startsWith('KXDIR')) return { kind: 'dir' };
     if (!out.startsWith('KXSIZE ')) return { kind: 'missing' };
     const nl = out.indexOf('\n');
@@ -9494,6 +9525,33 @@ app.whenReady().then(async () => {
       };
     } finally {
       fs.closeSync(descriptor);
+    }
+  });
+
+  /**
+   * **「⇩ 复制到本机」** —— 远程会话把交付文件写在了远端（`remoteWriteGuard.strayRemoteDeliverables`），
+   * 用户不该自己去 ssh：经已有的 ssh 连接（`remoteFileBytes`）读出来，写进这条会话的本机文件夹
+   * （`sessions/<id>/files/`）。本机已有同名的别的文件时不覆盖（`localCopyPath`）；内容一样就复用那一份。
+   * 回本机路径，渲染端接着用它打开预览 —— 之后 comment 写回的就是本机这一份。
+   */
+  ipcMain.handle('workspace:copy-remote-to-local', async (_event, sessionId: string, remotePath: string) => {
+    try {
+      if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: '没有会话' };
+      const remote = remoteFileFor(sessionId, String(remotePath || ''));
+      if (!remote) return { ok: false, error: '这不是这条远程会话那台机器上的路径' };
+      const MAX = 64 * 1024 * 1024;
+      /* 最多 64 MB：stdout 上限按它算（`captureBufferFor`），超时也放宽到 5 分钟 */
+      const got = await remoteFileBytes(remote.target, remote.path, MAX, 5 * 60_000);
+      const host = remoteHostLabel(remote.target);
+      if (got.kind === 'dir') return { ok: false, error: `${host} 上的 ${remote.path} 是目录，不是文件` };
+      if (got.kind !== 'file') return { ok: false, error: `${host} 上没有这个文件：${remote.path}` };
+      if (got.size > MAX) return { ok: false, error: `文件太大（${(got.size / 1048576).toFixed(1)} MB），超过 64 MB 不经这条路复制` };
+      const dest = saveRemoteCopy(sessionFilesDir(sessionId), remote.path, got.buffer);
+      logger.info('workspace', `copied remote file to local sessionId=${sessionId} ${host}:${remote.path} -> ${dest} (${got.size} bytes)`);
+      return { ok: true, path: dest, bytes: got.size };
+    } catch (err: any) {
+      logger.warn('workspace', `copy remote file failed sessionId=${sessionId} ${remotePath}: ${err?.message || err}`);
+      return { ok: false, error: String(err?.message || err) };
     }
   });
 

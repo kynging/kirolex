@@ -17,16 +17,18 @@ const WARN_MS = 45_000;
 export interface SessionNotice {
   text: string;
   ts: number;
+  /** 远程会话落在远端的交付文件 —— 每个给一颗「⇩ 复制到本机」 */
+  copyRemote?: string[];
 }
 
 export function useSessionNotice(sessionId: string | null): { notice: SessionNotice | null; dismiss: () => void } {
   const [notice, setNotice] = useState<SessionNotice | null>(null);
 
   useEffect(() => {
-    const off = (window as any).kiroApi?.onSessionNotice?.((d: { sessionId: string; text: string; ts: number }) => {
+    const off = (window as any).kiroApi?.onSessionNotice?.((d: { sessionId: string; text: string; ts: number; copyRemote?: string[] }) => {
       /* 只显示**当前这条会话**的：别的会话的进度不该盖住你正在看的东西 */
       if (!d?.text || d.sessionId !== sessionId) return;
-      setNotice({ text: d.text, ts: d.ts || Date.now() });
+      setNotice({ text: d.text, ts: d.ts || Date.now(), ...(Array.isArray(d.copyRemote) && d.copyRemote.length ? { copyRemote: d.copyRemote } : {}) });
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, [sessionId]);
