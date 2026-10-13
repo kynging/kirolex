@@ -6,7 +6,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
-import { autoFoldPanels, CHAT_FIT_MIN, PANEL_FIT_RESERVE } from '../src/renderer/panelFit.ts';
+import { autoFoldPanels, CHAT_FIT_MIN, PANEL_FIT_RESERVE, filePanelMax } from '../src/renderer/panelFit.ts';
 
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', ...p), 'utf8');
 const base = { sidebarWidth: 240, sidebarCollapsed: false, previewOpen: true, previewWidth: 320 };
@@ -72,5 +72,28 @@ describe('接线', () => {
     const at = app.indexOf('autoFoldPanels({');
     const seg = app.slice(at, at + 800);
     assert.doesNotMatch(seg, /setSidebarCollapsed|setFileViewerHidden/);
+  });
+});
+
+describe('右侧栏最宽能拉到多少：只看窗口宽 − 侧栏 − 聊天区最少 240，没有固定上限', () => {
+  const max = (winWidth: number, sidebarShownWidth: number) =>
+    filePanelMax({ winWidth, sidebarShownWidth, chatMin: 240, panelMin: 320 });
+  test('1920 宽、侧栏开着：能拉到聊天区只剩 240（不再被 1100 卡住）', () => {
+    assert.equal(max(1920, 240), 1920 - 240 - 240);
+    assert.equal(max(1920, 0), 1920 - 240);
+  });
+  test('窗口变窄，上限跟着收回，聊天区永远留 240', () => {
+    for (const w of [2560, 1920, 1512, 1440, 1024, 800]) {
+      assert.equal(w - 240 - max(w, 240), 240, `窗口 ${w}`);
+    }
+  });
+  test('再窄也不低于 FILE_PANEL_MIN（那时由 autoFoldPanels 收栏保聊天区）', () => {
+    assert.equal(max(600, 240), 320);
+    assert.equal(max(300, 0), 320);
+  });
+  test('App 按它夹拖拽和显示宽度，不再写死 1100', () => {
+    const app = read('src', 'renderer', 'App.tsx');
+    assert.match(app, /const fileViewerMax = filePanelMax\(\{ winWidth, sidebarShownWidth: sidebarHidden \? 0 : sidebarWidth, chatMin: CHAT_MIN_WIDTH, panelMin: FILE_PANEL_MIN \}\);/);
+    assert.doesNotMatch(app, /Math\.min\(1100,/);
   });
 });

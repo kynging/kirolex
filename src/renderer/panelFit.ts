@@ -39,3 +39,12 @@ export function autoFoldPanels(i: PanelFitInput): { sidebar: boolean; preview: b
   if (previewShown && !i.pinnedPreview && room() < CHAT_FIT_MIN) { previewShown = false; preview = true; }
   return { sidebar, preview };
 }
+
+/**
+ * 右侧文件 / comment 栏拖宽时最宽能到多少：窗口宽 − 侧栏（开着时）− 聊天区至少留的宽度，不低于 `panelMin`。
+ * 原来还有个固定上限 1100px，大窗口（1920 宽最大化）里它先卡住，聊天区还剩 500 多 px 也拉不动 —— 去掉了。
+ * 窗口窄到连 `panelMin` 都放不下时，由 `autoFoldPanels` 收栏保住聊天区。
+ */
+export function filePanelMax(i: { winWidth: number; sidebarShownWidth: number; chatMin: number; panelMin: number }): number {
+  return Math.max(i.panelMin, i.winWidth - i.sidebarShownWidth - i.chatMin);
+}

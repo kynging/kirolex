@@ -8,7 +8,7 @@ import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT } from './uiZoom';
 import { LangProvider, useT } from './hooks/useLang';
 import { useRemoteTargets } from './hooks/useRemoteTargets';
 import { activeSplitSizes, computePaneFlex, putSplitSizes, resetSplitSizes, SplitSizeStore } from './splitLayout';
-import { autoFoldPanels } from './panelFit';
+import { autoFoldPanels, filePanelMax } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
 import { schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
@@ -3449,7 +3449,8 @@ const App: React.FC = () => {
   /*
     **右侧文件 / comment 栏最宽能到多少** ——「windows 版本的 comment 栏似乎可以无限往左拉压缩左侧会话和侧栏的空间」。
     原来只有一个固定上限 1100px：窗口一宽（Windows 上常见的 1920 逻辑像素），1100 就挤得动左边 ——
-    会话区被压到几十像素、侧栏也跟着被压窄。上限改成**跟着窗口走**：窗口宽 − 侧栏（开着时）− 会话区至少留的那么宽。
+    会话区被压到几十像素、侧栏也跟着被压窄。上限改成**跟着窗口走**：窗口宽 − 侧栏（开着时）− 会话区至少留的那么宽，
+    不再另外封顶 1100（大窗口里它先卡住，会话区留着 500 多 px 也拉不动，见 panelFit.ts 的 filePanelMax）。
     拖的时候按它夹，窗口变窄 / 侧栏打开时显示也按它夹（存的宽度不动，窗口再变宽就回到你拖的那个宽度）。
   */
   /*
@@ -3483,7 +3484,7 @@ const App: React.FC = () => {
   const sidebarHidden = sidebarCollapsed || autoFold.sidebar;
   const previewHidden = fileViewerHidden || autoFold.preview;
   const previewOwnsFind = findOwner({ previewShown: !!fileViewer && !previewHidden, focusInPreview }) === 'preview';
-  const fileViewerMax = Math.max(FILE_PANEL_MIN, Math.min(1100, winWidth - (sidebarHidden ? 0 : sidebarWidth) - CHAT_MIN_WIDTH));
+  const fileViewerMax = filePanelMax({ winWidth, sidebarShownWidth: sidebarHidden ? 0 : sidebarWidth, chatMin: CHAT_MIN_WIDTH, panelMin: FILE_PANEL_MIN });
   const fileViewerShown = Math.min(fileViewerWidth, fileViewerMax);
   const handleFileResizeStart = useCallback((e: React.MouseEvent) => {
     e.preventDefault();
