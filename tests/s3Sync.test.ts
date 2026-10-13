@@ -499,8 +499,8 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
 
   test('多选 + 一颗恢复按钮', () => {
     assert.match(UI, /const \[picked, setPicked\] = useState<Set<string>>/);
-    /* 「选整组」那颗按钮删了（「选整组那个按钮是干毛线」）—— 要多选逐行勾就够了 */
-    assert.equal(/toggleGroup/.test(UI), false);
+    /* 组头的全选框又加回来了（用户明确要的）—— 行为见 backupGroupPick.test.ts */
+    assert.match(UI, /toggleGroupPick\(prev, rows\)/);
     assert.match(UI, /恢复选中的/);
     /* 一条一条恢复：并发会同时写 trash 和 sessions，而失败要说清是哪一条 */
     assert.match(UI, /for \(const e of chosen\)/);
@@ -509,8 +509,8 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
 
   test('**一次**确认，而且把要覆盖的那几条点名', () => {
     /* 逐条确认的问题不是慢，是每次长得一样 —— 点到第五次就不看了，而其中可能有一条是覆盖 */
-    /* 恢复那一页只确认一次；同步那一页删备份还有一次（那是另一个动作） */
-    assert.equal((UI.match(/window\.confirm/g) || []).length, 2);
+    /* 恢复那一页只确认一次（删备份用的是两次点击，不弹系统确认框） */
+    assert.equal((UI.match(/window\.confirm/g) || []).length, 1);
     assert.match(UI, /merging\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
     /* 本地已有的那些现在是**合并**（见下面那个 describe），不是覆盖 */
     /* 原生 confirm 不认 markdown，所以这里用「」而不是 ** */
@@ -932,11 +932,11 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
     const GB5 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/backupGroups.ts'), 'utf8');
     assert.match(GB5, /a\[0\] === '未分组' \? 1 : -1/);
     /*
-      「选整组」删掉了 —— 恢复整个项目不是常见动作，而那颗按钮占的位置最容易误点。
-      只看真会渲染出来的部分：文件头那段注释里会提到它（在解释为什么删的）。
+      组头有「全选」框（以前删过一颗「选整组」按钮，用户后来明确要了回来）：
+      组头的删除只删这一组里勾选的，全选方便一次勾一整组。
     */
-    assert.equal(/>\s*\{allOn \? '取消整组' : '选整组'\}/.test(UI5), false);
-    assert.equal(/toggleGroup/.test(UI5), false);
+    assert.match(UI5, /className="backup-group-all"/);
+    assert.match(UI5, /toggleGroupPick\(prev, rows\)/);
     /* 滚到一半时"我在看哪个项目"不该需要往上翻 */
     const at = CSS5.indexOf('.backup-group-head {');
     assert.ok(at > 0);
@@ -1089,8 +1089,9 @@ describe('单条会话的同步与否 ——「我是说单独会话级别的同
     const restoreAt = UI.indexOf("{tab === 'restore' && (");
     const syncPart = UI.slice(syncAt, restoreAt);
     assert.doesNotMatch(syncPart, /deleteProject\(/);
-    /* 条数按整个项目算（含本机已归档、被放进「已归档」组的那几条 —— 按项目删会连它们一起删） */
-    assert.match(UI.slice(restoreAt), /void deleteProject\(proj, \(entries \|\| \[\]\)\.filter\(\(x\) => \(x\.project \|\| ''\) === proj\)\.length\)/);
+    /* 组头的删除只删这一组里勾选的（不再一键删整个项目 —— 经常误点）；行为见 backupGroupPick.test.ts */
+    assert.match(UI.slice(restoreAt), /void removeGroupBackups\(key, gp\.pickedIds\)/);
+    assert.doesNotMatch(UI, /deleteProject\(/);
   });
 });
 

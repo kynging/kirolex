@@ -25,7 +25,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
-import { groupBackups } from '../backupGroups.ts';
+import { groupBackups, groupPickState, toggleGroupPick } from '../backupGroups.ts';
 
 interface Backup {
   id: string;
@@ -175,43 +175,6 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     }
   };
 
-  /**
-   * **删掉一个项目在桶里的备份** ——「同步这里没有删除按钮」。
-   *
-   * 这是不可逆的（S3 删了就没了，我们不知道桶有没有开版本控制），所以确认框里
-   * 把三件事都说出来：删几条、删的是**云上**的、本地一个字都不动。
-   * 最后那句最重要 —— "删除备份"和"删除会话"只差两个字。
-   */
-  const deleteProject = async (project: string, count?: number): Promise<void> => {
-    const row = (projects || []).find((p) => p.project === project);
-    /* 从「恢复」那页点的：数的是**桶里**这一组有几条（本地那张表可能早就没有它们了） */
-    const n = count ?? (row?.sessions.length || 0);
-    const name = projectLabel(project);
-    if (!window.confirm([
-      `把「${name}」在桶里的备份删掉？`,
-      '',
-      `涉及 ${n} 条会话${row ? `（本地 ${kb(row.bytes || 0)}）` : ''}。`,
-      '删的是**云上那份**，本地会话一个字都不动。',
-      'S3 上删掉就找不回来了（除非这个桶开了版本控制）。',
-      '',
-      '继续？',
-    ].join('\n'))) return;
-    setBusy(`del:${project}`); setMsg(null);
-    try {
-      const r = await api()?.s3DeleteProject?.(project, project);
-      if (r?.ok) {
-        setMsg({
-          kind: r.failed?.length ? 'bad' : 'ok',
-          text: `已删掉「${name}」的备份：${r.sessions} 条会话 / ${r.deleted} 个对象。`
-            + (r.failed?.length ? `\n有 ${r.failed.length} 个没删掉：\n${r.failed.join('\n')}` : ''),
-        });
-      } else setMsg({ kind: 'bad', text: String(r?.error || '删除失败') });
-      await loadProjects();
-      /* 桶里的东西变了，恢复那张表要重新拉 */
-      setEntries(null);
-    } finally { setBusy(null); }
-  };
-
   const syncNow = async (): Promise<void> => {
     setBusy('sync'); setMsg(null);
     try {
@@ -245,15 +208,27 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     会卡住渲染线程。只删桶里那份，本地一个字不动。
   */
   const [armDelete, setArmDelete] = useState(false);
-  useEffect(() => { setArmDelete(false); }, [picked]);
+  /* 组头的「删除选中的 N 条」同一套两次点击 —— 记着是哪一组点了第一下 */
+  const [armGroup, setArmGroup] = useState<string | null>(null);
+  useEffect(() => { setArmDelete(false); setArmGroup(null); }, [picked]);
   const stillLocal = useMemo(() => chosen.filter((e) => e.existsLocally), [chosen]);
   const removeBackups = async (): Promise<void> => {
     if (!chosen.length) return;
     if (!armDelete) { setArmDelete(true); return; }
     setArmDelete(false);
-    setBusy('delete'); setMsg(null);
+    await deleteBackups(chosen.map((e) => e.id), 'delete');
+  };
+  /* 组头的删除：只删这一组里勾选的那几条（以前是一键删整个项目的备份，跟勾了什么无关，经常误点） */
+  const removeGroupBackups = async (key: string, ids: string[]): Promise<void> => {
+    if (!ids.length) return;
+    if (armGroup !== key) { setArmGroup(key); return; }
+    setArmGroup(null);
+    await deleteBackups(ids, `del:${key}`);
+  };
+  const deleteBackups = async (ids: string[], busyKey: string): Promise<void> => {
+    setBusy(busyKey); setMsg(null);
     try {
-      const r = await api()?.deleteS3Sessions?.(chosen.map((e) => e.id));
+      const r = await api()?.deleteS3Sessions?.(ids);
       if (!r?.ok) { setMsg({ kind: 'bad', text: r?.error || '没删掉' }); return; }
       const back = Array.isArray(r.willReturn) ? r.willReturn.length : 0;
       setMsg({
@@ -262,7 +237,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
           + (back ? ` 其中 ${back} 条本地还在，下次同步会再传上去 —— 要它彻底消失，在侧栏把本地那条也删掉。` : '')
           + (r.failed?.length ? `\n${r.failed.length} 个对象没删掉：${r.failed.slice(0, 3).join('；')}` : ''),
       });
-      setPicked(new Set());
+      /* 只清掉删了的那几条的勾 —— 别的组还勾着的留着 */
+      setPicked((prev) => new Set([...prev].filter((id) => !ids.includes(id))));
       await loadBackups();
     } catch (x: any) {
       setMsg({ kind: 'bad', text: String(x?.message || x) });
@@ -492,13 +468,16 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 <div className="backup-restore-list">
                   {groups.map(({ key, name, archived, rows }) => {
                     const shut = collapsed.has(key);
+                    const gp = groupPickState(rows, picked);
+                    const armed = armGroup === key;
                     return (
                       <div key={key} className="backup-group">
                         {/*
-                          组头只做两件事：说清这是哪一摊、能收起来。
-                          原来这里还有一颗「选整组」——「选整组那个按钮是干毛线，删掉吧」：
-                          恢复整个项目不是常见动作（你通常是在找某一条），而那颗按钮占的位置
-                          刚好在"要不要点它"最容易犹豫的地方。要多选，逐行勾就够了。
+                          组头：说清这是哪一摊、能收起来、能全选、能删这一组里勾了的。
+                          以前删掉过一颗「选整组」（「选整组那个按钮是干毛线，删掉吧」），后来用户又明确要了回来：
+                          组头的「删除备份」原来一键删整个项目的备份、跟勾了什么无关，经常误点 ——
+                          现在它只删这一组里勾选的，所以要有个全选框方便一次勾一整组。
+                          全选跳过正在跑的行，只动这一组，别的组勾着的不动；勾了一部分显示半选。
                         */}
                         <div className="backup-group-head">
                           <button className="backup-group-toggle" onClick={() => setCollapsed((prev) => {
@@ -523,21 +502,28 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               </span>
                             );
                           })()}
+                          <label className="backup-group-all" title="选中 / 取消这一组里所有能选的会话（正在跑的除外）">
+                            <input type="checkbox"
+                                   checked={gp.state === 'all'}
+                                   ref={(el) => { if (el) el.indeterminate = gp.state === 'some'; }}
+                                   disabled={!!busy || !gp.selectable}
+                                   onChange={() => setPicked((prev) => toggleGroupPick(prev, rows))} />
+                            全选
+                          </label>
                           {/*
-                            整组删云上的备份（不动本地）—— 从「同步」那页挪过来的。
-                            按项目删会连带这个项目里本机已归档的那几条（它们在「已归档」组里），所以条数按整个项目数；
-                            「已归档」组里混着好几个项目，没有整组删 —— 要删就勾选后用上面的「删除选中的」。
+                            只删这一组里勾选的云上备份（不动本地）。两次点击确认，和顶上「删除选中的」同一套：
+                            第一次变成「确认删除 N 条备份」，失去焦点或勾选变了就退回去。
                           */}
-                          {!archived && (
-                            <button className="remote-btn backup-del" disabled={!!busy}
-                                    title="删掉这一组在桶里的备份（不动本地会话；含这个项目里本机已归档的）"
-                                    onClick={() => {
-                                      const proj = rows[0]?.project || '';
-                                      void deleteProject(proj, (entries || []).filter((x) => (x.project || '') === proj).length);
-                                    }}>
-                              {busy === `del:${rows[0]?.project || ''}` ? '删除中…' : '删除备份'}
-                            </button>
-                          )}
+                          <button className={`remote-btn backup-del${armed ? ' remote-btn-danger' : ''}`}
+                                  disabled={!!busy || !gp.pickedIds.length}
+                                  title="只删这一组里勾选的会话在桶里的备份，本地不动"
+                                  onClick={() => void removeGroupBackups(key, gp.pickedIds)}
+                                  onBlur={() => { if (armed) setArmGroup(null); }}>
+                            {busy === `del:${key}` ? '删除中…'
+                              : !gp.pickedIds.length ? '删除备份'
+                              : armed ? `确认删除 ${gp.pickedIds.length} 条备份`
+                              : `删除选中的 ${gp.pickedIds.length} 条`}
+                          </button>
                         </div>
                         {!shut && rows.map((e) => (
                           <label

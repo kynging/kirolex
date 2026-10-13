@@ -47,3 +47,28 @@ export function groupBackups<T extends { project?: string; updatedAt?: number; a
   if (archived.length) groups.push({ key: ARCHIVED_GROUP, name: '已归档', archived: true, rows: archived });
   return groups;
 }
+
+type Pickable = { id: string; busy?: boolean };
+
+/**
+ * 一组里勾了哪些（只算能选的 —— 正在跑的 busy 行不算），以及组头全选框该显示成什么：
+ * 一条没勾 none、勾了一部分 some（半选）、能选的全勾了 all。
+ */
+export function groupPickState<T extends Pickable>(
+  rows: T[],
+  picked: ReadonlySet<string>,
+): { pickedIds: string[]; selectable: number; state: 'none' | 'some' | 'all' } {
+  const ok = rows.filter((e) => !e.busy);
+  const pickedIds = ok.filter((e) => picked.has(e.id)).map((e) => e.id);
+  const state = !pickedIds.length ? 'none' : pickedIds.length === ok.length ? 'all' : 'some';
+  return { pickedIds, selectable: ok.length, state };
+}
+
+/** 组头的全选框：没全选 → 把这一组能选的都勾上；已全选 → 取消这一组的。别的组不动。 */
+export function toggleGroupPick<T extends Pickable>(picked: ReadonlySet<string>, rows: T[]): Set<string> {
+  const next = new Set(picked);
+  const ok = rows.filter((e) => !e.busy);
+  if (groupPickState(rows, picked).state === 'all') for (const e of ok) next.delete(e.id);
+  else for (const e of ok) next.add(e.id);
+  return next;
+}
