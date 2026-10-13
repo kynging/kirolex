@@ -46,6 +46,33 @@ export function allocateRemotePort(used: Iterable<number>): number {
 }
 
 /**
+ * **远端那台机器上已经有人在听的端口** —— 不支持连接复用（Windows）时按会话分固定端口，
+ * 只看"我自己分出去的"不够：另一台电脑上的 KiroLex、或者没被回收的旧 sshd-session 正占着
+ * 39100 / 39101 时，`ExitOnForwardFailure=yes` 让这条 ssh 必然起不来，而下一次还分同一个。
+ * 所以分之前先问远端一句，把正在 listen 的都算"已占用"。`ss` 没有就退到 `netstat`；
+ * 两个都没有就是空输出（只是少了这层避让，不挡会话）。
+ */
+export const LISTENING_PORTS_SCRIPT = '(ss -Htln 2>/dev/null || netstat -tln 2>/dev/null) || true';
+
+/**
+ * 从 `ss -Htln` / `netstat -tln` 的输出里拿端口：每行第一个形如 `地址:端口` 的字段就是本地监听地址
+ * （`127.0.0.1:39101`、`[::1]:39101`、`*:22`、`0.0.0.0:22`）。表头、空行认不出来就跳过。
+ */
+export function parseListeningPorts(out: string): number[] {
+  const ports = new Set<number>();
+  for (const line of String(out || '').split(/\r?\n/)) {
+    for (const tok of line.trim().split(/\s+/)) {
+      const m = /:(\d+)$/.exec(tok);
+      if (!m) continue;
+      const n = Number(m[1]);
+      if (n > 0 && n <= 65535) ports.add(n);
+      break;
+    }
+  }
+  return [...ports];
+}
+
+/**
  * 那条会话专用 agent 的名字前缀。
  *
  * 单独拿出来是因为 agent 列表要**按它过滤**：这些是 KiroLex 每条远程会话私有的配置

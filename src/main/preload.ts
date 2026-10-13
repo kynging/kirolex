@@ -534,7 +534,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 这些不进 transcript：它们不是对话内容，写进去会打断对话的读法、把 transcript 撑大
    * （远程会话每轮都要推它），还得靠"别发给模型"那条过滤一直兜着。界面显示在输入框上方、自动消失。
    */
-  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number; copyRemote?: string[] }) => void) => {
+  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:notice', handler);
     return () => ipcRenderer.removeListener('session:notice', handler);
@@ -731,6 +731,15 @@ contextBridge.exposeInMainWorld('kiroApi', {
   },
   // Seam hook A (design §11): a session's executor attached and is ready for its
   // first prompt. Carries { sessionId, projectId } for the memory layer + UI.
+  /**
+   * 主进程自己把一条断了的远程会话接回来了（断线恢复按退避一直重试，见 index.ts `remoteRecovery`）——
+   * 渲染层只在它自己 loadSession 成功时才把会话标成"连着"，所以要告诉它。
+   */
+  onReattached: (callback: (data: { sessionId: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:reattached', handler);
+    return () => ipcRenderer.removeListener('acp:reattached', handler);
+  },
   onSessionReady: (callback: (data: { sessionId: string; projectId?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:ready-for-first-prompt', handler);

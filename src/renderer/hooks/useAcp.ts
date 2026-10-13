@@ -2695,7 +2695,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     });
 
+    /* 断了的远程会话被主进程自己接回来了（它一直按退避重试，渲染层那次只试一次）：标成连着 */
+    const removeReattached = (window as any).kiroApi.onReattached?.((data?: { sessionId?: string }) => {
+      const sid = data?.sessionId;
+      if (!sid) return;
+      clearConnecting(sid);
+      addAttached(sid);
+      setSessionActivity(sid, null);
+    });
+
     return () => {
+      removeReattached?.();
       removeUpdate();
       removeError();
       removeNotice?.();

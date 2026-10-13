@@ -152,6 +152,8 @@ describe('ssh 连接复用', () => {
         fake.killed = false;
         fake.exitCode = null;
         fake.stderr = new EventEmitter();
+        /* 真 ssh 在 `-R …:0:…` 时会说 sshd 分到了哪个端口 —— 没有这句 master 不算就绪 */
+        setImmediate(() => fake.stderr.emit('data', Buffer.from('Allocated port 39100 for remote forward to 127.0.0.1:51234')));
         fake.kill = (): void => { fake.killed = true; srv.close(); };
         return fake;
       },
@@ -184,6 +186,7 @@ describe('ssh 连接复用', () => {
         fake = new EventEmitter() as any;
         fake.killed = false; fake.exitCode = null;
         fake.stderr = new EventEmitter();
+        setImmediate(() => fake.stderr.emit('data', Buffer.from('Allocated port 39100 for remote forward to 127.0.0.1:1')));
         fake.kill = (): void => { fake.killed = true; srv.close(); };
         return fake;
       },
@@ -473,7 +476,8 @@ describe('Windows：复用不可用时回到每会话一条隧道', () => {
   test('`ensure` 在不支持的平台上明确抛错，而不是返回 undefined', async () => {
     const S = fs.readFileSync(path.join(process.cwd(), 'src/main/sshMux.ts'), 'utf8');
     /* undefined 很容易被当成"还没建好、等一下再看" */
-    assert.match(S, /if \(!muxSupported\(\)\) throw new Error\('MUX_UNSUPPORTED'\);/);
+    /* 平台可以注入（只为测试 —— Windows 上也要能跑那套状态机），默认仍是 process.platform */
+    assert.match(S, /if \(!muxSupported\((this\.deps\.platform)?\)\) throw new Error\('MUX_UNSUPPORTED'\);/);
   });
 
   test('接线：不支持就自己分端口，ssh 自己带 -R（也就是复用之前的行为）', () => {

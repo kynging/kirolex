@@ -39,6 +39,15 @@
  * `ExitOnForwardFailure=yes` 留在 master 上：端口占用时宁可 master 起不来、把错误说出去，
  * 也不要起一个"连上了但没有本地工具"的执行器 —— 那种降级是静默的，而模型会把"工具调不通"
  * 解释成"这个文件不存在"。
+ *
+ * ## 远端端口让 sshd 分，不写死
+ *
+ * 原来是 39100 起按机器递增的固定端口。实测：远端 39100–39102 都被别的、还 ESTAB 的
+ * sshd-session 占着（同一用户另一台电脑上的 KiroLex，或者本机上一次留在远端没被回收的旧连接），
+ * 于是 `remote port forwarding failed for listen port 39101`，而重建时还要同一个端口 ——
+ * **必然再失败**。现在用 `-R 127.0.0.1:0:…`，从 ssh 的 `Allocated port N for remote forward`
+ * 里拿到分到的端口；每次重建都是 sshd 现分的空闲端口，也就不会跟谁撞。
+ * 别人占着的端口我们不碰 —— 那可能是用户另一台电脑正在用的。
  */
 
 import { spawn, type ChildProcess } from 'child_process';
@@ -127,7 +136,8 @@ export function masterArgs(opts: {
   proxyJump?: string;
   passwordCipher?: string;
   socket: string;
-  remotePort: number;
+  /** 远端监听端口；默认 0 = 让 sshd 分（见文件头「远端端口让 sshd 分」）。 */
+  remotePort?: number;
   localPort: number;
 }): string[] {
   assertSafeSshHost(opts.sshHost);
@@ -135,14 +145,20 @@ export function masterArgs(opts: {
     '-N',
     '-o', batchModeFor(opts),
     '-o', 'ConnectTimeout=10',
-    '-o', 'ServerAliveInterval=30',
+    /*
+      15 秒 × 3 次：死连接 45 秒内认出来、master 退出、排重建 ——「断网再恢复后一分钟内回来」
+      靠的就是这一档。正常退出时 ssh 会给对端发断开，远端那条 sshd-session 当场就走。
+    */
+    '-o', 'ServerAliveInterval=15',
     '-o', 'ServerAliveCountMax=3',
+    /* `Allocated port N` 是 INFO 级的 —— 用户 ~/.ssh/config 里写了 LogLevel QUIET/ERROR 就看不到它 */
+    '-o', 'LogLevel=INFO',
     '-o', 'StrictHostKeyChecking=accept-new',
     '-o', 'ExitOnForwardFailure=yes',
     '-o', 'ControlMaster=yes',
     '-o', 'ControlPersist=no',
     '-o', `ControlPath=${opts.socket}`,
-    '-R', `127.0.0.1:${opts.remotePort}:127.0.0.1:${opts.localPort}`,
+    '-R', `127.0.0.1:${opts.remotePort ?? 0}:127.0.0.1:${opts.localPort}`,
   ];
   /* 和 buildSshArgs 同一条：密码错了就失败，别让 askpass 用同一个答案被问三次 */
   if (opts.passwordCipher) args.push('-o', 'NumberOfPasswordPrompts=1');
@@ -173,6 +189,19 @@ export function clientArgs(opts: { sshHost: string; socket: string; remoteComman
     opts.sshHost,
     opts.remoteCommand,
   ];
+}
+
+/**
+ * 从 master 的 stderr 里拿 sshd 分到的远端端口（`-R …:0:…` 时 ssh 打的那句）：
+ * `Allocated port 41235 for remote forward to 127.0.0.1:58660`。取最后一句 —— 那是这一次的。
+ */
+export function parseAllocatedPort(stderr: string): number | undefined {
+  let port: number | undefined;
+  for (const m of String(stderr || '').matchAll(/Allocated port (\d+) for remote forward/g)) {
+    const n = Number(m[1]);
+    if (n > 0 && n <= 65535) port = n;
+  }
+  return port;
 }
 
 /** socket 在不在（`ControlPath` 是个 unix socket 文件）。 */
@@ -218,13 +247,21 @@ export interface MuxEntry {
  */
 export const HEAL_BACKOFF_MS = [2_000, 5_000, 15_000, 30_000, 60_000];
 
+/** 第 n 次重建（从 0 数）要等多久：按退避表走，到顶之后一直用最后一档。 */
+export function healDelay(n: number, table: readonly number[] = HEAL_BACKOFF_MS): number {
+  return table[Math.min(Math.max(0, n), table.length - 1)];
+}
+
+/**
+ * 连上之后活够这么久才算"真的好了"、退避从头算。
+ * 不这样的话"连上就掉"会让退避永远停在第一档 —— 每 2 秒敲一次门。
+ */
+export const HEAL_STABLE_MS = 60_000;
+
 export interface MuxDeps {
   log(level: 'info' | 'warn', message: string): void;
   /** 本地 MCP server 的端口（懒启动，所以现取）。 */
   localPort(): number;
-  /** 这台机器上已经占掉的远端端口（给 `allocateRemotePort`）。 */
-  usedRemotePorts(): number[];
-  allocateRemotePort(used: Iterable<number>): number;
   owner: string;
   spawnSsh?(args: string[]): ChildProcess;
   /**
@@ -241,6 +278,17 @@ export interface MuxDeps {
    * 它那条 kiro-cli 根本没被配上本地 MCP，端口回来了也用不上。
    */
   onReady?(key: string): void;
+  /**
+   * 连接断了、排上了第 `attempt` 次重建 —— 调用方据此在那台机器的会话上说
+   * 「本机工具连接中断，正在重连（第 N 次）」。连上之后是 `onReady`。
+   */
+  onHealing?(key: string, attempt: number): void;
+  /** 退避表（毫秒）。可注入**只为测试** —— 真机上用 `HEAL_BACKOFF_MS`。 */
+  healBackoffMs?: readonly number[];
+  /** 探 socket（默认 `probeSocket`）。可注入只为测试：Windows 上没有 unix socket。 */
+  probeSocket?(socket: string): Promise<boolean>;
+  /** 平台（默认 `process.platform`）。可注入只为测试。 */
+  platform?: string;
   /**
    * 等 socket 出现的上限（毫秒，默认 12 秒）。
    *
@@ -260,6 +308,11 @@ export interface MuxDeps {
 export class SshMux {
   private entries = new Map<string, MuxEntry>();
   private starting = new Map<string, Promise<MuxEntry>>();
+  /**
+   * 正在 `start` 里、还没登记进 `entries` 的那个 ssh 进程。`close` 要能杀到它 ——
+   * 不然退出时一条正在握手的 master 会被漏掉，之后还把自己登记成有效连接。
+   */
+  private startingProcs = new Map<string, ChildProcess>();
   /** 希望活着的那些机器 —— `close()` 把它摘掉，自愈只对这里面的生效。 */
   private wanted = new Set<string>();
   /** 正在排的自愈定时器 + 已经试了几次（退避用）。 */
@@ -295,6 +348,10 @@ export class SshMux {
     return e.socket;
   }
 
+  private probe(socket: string): Promise<boolean> {
+    return (this.deps.probeSocket || probeSocket)(socket);
+  }
+
   socketFor(key: string): string {
     return controlPath(key, this.deps.owner, this.dir);
   }
@@ -312,10 +369,10 @@ export class SshMux {
       调用方要据此走"每条会话自己一条连接"那条路，而一个 undefined 很容易被当成
       "还没建好、等一下再看"。
     */
-    if (!muxSupported()) throw new Error('MUX_UNSUPPORTED');
+    if (!muxSupported(this.deps.platform)) throw new Error('MUX_UNSUPPORTED');
     const key = muxKey(target.sshHost, target.sshPort);
     const live = this.entries.get(key);
-    if (live && !live.proc.killed && live.proc.exitCode === null && await probeSocket(live.socket)) return live;
+    if (live && !live.proc.killed && live.proc.exitCode === null && await this.probe(live.socket)) return live;
     const pending = this.starting.get(key);
     if (pending) return pending;
     /* 记下"这台机器该有一条连接"——自愈只对 wanted 的生效 */
@@ -348,8 +405,9 @@ export class SshMux {
       return;
     }
     const n = this.healAttempts.get(key) || 0;
-    const delay = HEAL_BACKOFF_MS[Math.min(n, HEAL_BACKOFF_MS.length - 1)];
+    const delay = healDelay(n, this.deps.healBackoffMs);
     this.healAttempts.set(key, n + 1);
+    try { this.deps.onHealing?.(key, n + 1); } catch { /* 提示失败不该影响重建 */ }
     const t = setTimeout(() => {
       this.healTimers.delete(key);
       if (!this.wanted.has(key) || !this.deps.hasSessions(key)) return;
@@ -375,28 +433,41 @@ export class SshMux {
     if (old) { try { old.proc.kill(); } catch { /* 已经没了 */ } this.entries.delete(key); }
     const socket = this.socketFor(key);
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
-    if (!(await probeSocket(socket))) clearStaleSocket(socket);
+    if (!(await this.probe(socket))) clearStaleSocket(socket);
 
     /*
-      端口在这台机器上唯一，而且**跨会话复用**。沿用 `allocateRemotePort` 是为了跟别的
-      KiroLex 实例（另一台笔记本连同一台机器）不撞 —— 它只保证"我自己不撞自己"，
-      真正的冲突检测还是 `ExitOnForwardFailure`：撞了就起不来，而起不来会被说出来。
+      **远端端口让 sshd 分**（`-R 127.0.0.1:0:…`，见文件头）。分到几号要等 ssh 在 stderr 里
+      说 `Allocated port N`；在那之前 entry.remotePort 是 0，不许交出去。
+      每次重建都重新分 —— 上一次那个端口可能正被一条还没被回收的旧连接占着。
     */
-    const remotePort = this.deps.allocateRemotePort(this.deps.usedRemotePorts());
     const localPort = this.deps.localPort();
-    const args = masterArgs({ ...target, socket, remotePort, localPort });
+    const args = masterArgs({ ...target, socket, remotePort: 0, localPort });
     const proc = (this.deps.spawnSsh || ((a: string[]) => spawn('ssh', a, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv(target) })))(args);
-    const entry: MuxEntry = { key, socket, remotePort, localPort, proc, stderr: '' };
+    const entry: MuxEntry = { key, socket, remotePort: 0, localPort, proc, stderr: '' };
+    this.startingProcs.set(key, proc);
+    let exited = false;
+    let readyAt = 0;
+    /*
+      **原样**攒着的 stderr：管道可以在任意字节处把一句话切成两段，`Allocated port 412` + `35 for …`
+      分开到达时，只看单段就永远认不出来。所以端口从这份连续缓冲里解析，不 trim、不插换行。
+    */
+    let raw = '';
     proc.stderr?.on('data', (d: Buffer) => {
-      const s = d.toString('utf-8').trim();
+      const chunk = d.toString('utf-8');
+      raw = `${raw}${chunk}`.slice(-8000);
+      const s = chunk.trim();
       if (s) entry.stderr = `${entry.stderr}\n${s}`.slice(-2000);
+      if (!entry.remotePort) entry.remotePort = parseAllocatedPort(raw) || 0;
     });
     proc.on('exit', (code) => {
+      exited = true;
       /*
         master 没了 = 这台机器上所有会话的工具通道都没了。**必须说出来**：
         静默的话表现是"模型说文件不存在"，而那是这条路上最贵的误导。
       */
       if (this.entries.get(key) === entry) this.entries.delete(key);
+      /* 活够了才把退避从头算 —— 连上就掉的那种不算"好了"（见 `HEAL_STABLE_MS`） */
+      if (readyAt && Date.now() - readyAt >= HEAL_STABLE_MS) this.healAttempts.delete(key);
       /*
         原来这里写的是"会话会在下一次调用工具时重连"，那句话**不是实话**：重连只发生在
         新的 attach 上，已经连着的会话不会再调 `ensure()`。实测后果是 7 条会话一直挂在
@@ -406,12 +477,28 @@ export class SshMux {
         + `这台机器上的会话暂时读不到你机器上的文件，正在排重建。`
         + `${entry.stderr.trim() ? ` 最后的输出：${entry.stderr.trim()}` : ''}`);
       clearStaleSocket(socket);
-      this.scheduleHeal(key);
+      /* 还没就绪就退了的那次由下面的失败分支排重建（它还要把错误抛给调用方） */
+      if (readyAt) this.scheduleHeal(key);
     });
 
-    /* 等 socket 真的出现 —— 进程起来了不等于连接建好了，而 client 要的是**连接** */
-    const ok = await waitFor(() => probeSocket(socket), this.deps.socketWaitMs ?? 12_000);
-    if (!ok) {
+    /*
+      等 **socket 出现、而且隧道真的建好**（`Allocated port` 来了）。只看 socket 是实测那次的坑：
+      socket 先出来、`-R` 的结果晚一点才回，于是日志说"已建立"，0.06 秒后就因为端口被占退了 ——
+      而调用方已经拿着那个端口去起会话了。进程退了就别再等满 12 秒。
+    */
+    const ok = await waitFor(
+      async () => exited || (entry.remotePort > 0 && await this.probe(socket)),
+      this.deps.socketWaitMs ?? 12_000,
+    );
+    /* 等的这段时间里被 `close` 了（退出、这台机器不要了）：不许再登记、不许 onReady */
+    const cancelled = this.startingProcs.get(key) !== proc;
+    if (!cancelled) this.startingProcs.delete(key);
+    if (cancelled) {
+      try { proc.kill(); } catch { /* 已经没了 */ }
+      clearStaleSocket(socket);
+      throw new Error(`${key} 的复用连接在建立过程中被关掉了`);
+    }
+    if (!ok || exited) {
       try { proc.kill(); } catch { /* 已经没了 */ }
       /*
         **建不起来也要排重建** —— 这正是实测撞到的那个口子：14:19 那次 12 秒等超时之后
@@ -420,14 +507,14 @@ export class SshMux {
       this.scheduleHeal(key);
       throw new Error(`${key} 的复用连接没建起来。${entry.stderr.trim() || '（ssh 没有输出）'}`);
     }
+    readyAt = Date.now();
     this.entries.set(key, entry);
-    this.healAttempts.delete(key);          // 建好了，退避从头算
-    this.deps.log('info', `${key} 复用连接已建立：远端 ${remotePort} → 本地 ${localPort}`
+    this.deps.log('info', `${key} 复用连接已建立：远端 ${entry.remotePort}（sshd 分的）→ 本地 ${localPort}`
       + `（这台机器上的会话共用这一条，各自用自己的 token）`);
     /*
       **光把 master 拉回来不够**：执行器是在 `localTools` 为 undefined 时起的，
-      它那条 kiro-cli 没被配上本地 MCP，端口回来了也用不上。所以要通知调用方
-      去把"连着但没有工具"的会话重新备一次。
+      它那条 kiro-cli 没被配上本地 MCP —— 而且重建之后端口多半变了，
+      原来那些会话 agent 里写的还是旧端口。所以要通知调用方把那台机器上的会话重新备一次。
     */
     try { this.deps.onReady?.(key); } catch { /* 通知失败不该影响连接本身 */ }
     return entry;
@@ -441,6 +528,12 @@ export class SshMux {
     this.lastTarget.delete(key);
     const t = this.healTimers.get(key);
     if (t) { clearTimeout(t); this.healTimers.delete(key); }
+    /* 正在建的那条也要杀 —— 它还不在 entries 里 */
+    const pending = this.startingProcs.get(key);
+    if (pending) {
+      this.startingProcs.delete(key);
+      try { pending.kill(); } catch { /* 已经没了 */ }
+    }
     const e = this.entries.get(key);
     if (!e) return;
     this.entries.delete(key);
@@ -455,7 +548,7 @@ export class SshMux {
       只遍历 entries 会把它的定时器留下来 —— 退出时那个 `unref` 过的定时器不挡退出，
       但在"关掉所有连接"之后又把一条连接拉起来，那是个说不通的状态。
     */
-    for (const key of new Set([...this.entries.keys(), ...this.wanted])) this.close(key);
+    for (const key of new Set([...this.entries.keys(), ...this.wanted, ...this.startingProcs.keys()])) this.close(key);
   }
 
   keys(): string[] { return [...this.entries.keys()]; }

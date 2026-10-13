@@ -9,6 +9,7 @@ import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { ADAPTER_PACKAGE, ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf } from './engines.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
+import { RemoteRecovery } from './remoteRecovery.ts';
 import {
   CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
   remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
@@ -68,7 +69,7 @@ import {
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
   sweepAgentsScript, STALE_AGENT_MINUTES, orphanSweepScript, parseOrphanSweep,
   staleExecutorSweepScript, parseStaleSweep,
-  ownerTag, ownedAgentPrefix,
+  ownerTag, ownedAgentPrefix, LISTENING_PORTS_SCRIPT, parseListeningPorts,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
@@ -1797,6 +1798,17 @@ function sessionNotice(sessionId: string, text: string, extra?: { copyRemote?: s
 }
 
 /**
+ * 同 `sessionNotice`，但**不自动消失**：一直挂到这条会话的下一句提示把它换掉
+ * （「本机工具连接中断，正在重连（第 N 次）」要挂到连上为止，连上时那句"回来了"把它顶掉）。
+ */
+function stickySessionNotice(sessionId: string, text: string): void {
+  try {
+    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), sticky: true });
+  } catch { /* 提示永远不能让主流程失败 */ }
+  logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
+}
+
+/**
  * **本地工具通道** ——「把镜像去掉，给远程配一些能调用本地 MCP 的能力」。
  *
  * 一个 MCP server（只听 127.0.0.1），每条远程会话一个 token + 一个远端端口。
@@ -1846,6 +1858,17 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
  * master 自愈回来之后要重接的就是这批（见 `rearmLocalToolsFor`）。
  */
 const toollessSessions = new Set<string>();
+
+/**
+ * 每条远程会话用的是哪台机器的复用连接（sessionId → muxKey）。
+ *
+ * 自愈要问"这台机器上还有会话吗"，而只看 `sessionClients` 会漏掉**正在 attach** 的那条：
+ * 它的执行器还没登记，可它刚拿着这条连接的端口。实测就是这个口子 —— 连接"建立"后 0.06 秒
+ * 退出，那一刻唯一的会话还在 attach，于是判成"没有会话"、重建被悄悄放弃，之后再也没人试。
+ */
+const muxUsers = new Map<string, string>();
+/** 正在重连那几台机器上、已经被告知"中断了"的会话 —— 连上后要跟它们说一声"回来了"。 */
+const muxDownNoticed = new Map<string, Set<string>>();
 
 /** 这条会话所选的组合（读不了 / 找不到时退回「通用」并在会话里说一句）。本地和远程会话共用。 */
 function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
@@ -1922,6 +1945,7 @@ async function ensureLocalTools(
     */
     let remotePort: number;
     if (muxSupported()) {
+      muxUsers.set(sessionId, muxKey(remote.sshHost, remote.sshPort));
       remotePort = (await sshMux.ensure(remote)).remotePort;
     } else {
       /* 按会话分端口：把**自己当前那个**也算进"已占用"，避免"先起新的再关旧的"时撞上自己 */
@@ -1930,9 +1954,17 @@ async function ensureLocalTools(
         从 39101 改成 39102（表里 39101 就"空"了），可它旧的 ssh 要等新的连上才关、还占着 39101；
         第二条于是又分到 39101，`ExitOnForwardFailure=yes` 让它的 ssh 当场退出 →「连不上远程」。
       */
+      /*
+        **远端已经有人在听的端口也算** —— 另一台电脑上的 KiroLex、没被回收的旧连接占着 39100 时，
+        只看自己分出去的就会一直分到它、一直失败（见 `LISTENING_PORTS_SCRIPT`）。每次准备都现问，
+        所以一次撞车之后下一次重连自然换到别的端口。问不到就当没有，不挡会话。
+      */
+      const remoteBusy = await runRemoteCapture(remote, LISTENING_PORTS_SCRIPT, 15_000)
+        .then(parseListeningPorts, () => [] as number[]);
       const used = [
         ...[...localToolsBySession.values()].map((v) => v.remotePort),
         ...[...sessionClients.values()].map((e) => e.client.forwardedRemotePort).filter((p): p is number => typeof p === 'number'),
+        ...remoteBusy,
       ];
       remotePort = allocateRemotePort(used);
       if (!muxWarned) {
@@ -2056,6 +2088,11 @@ async function ensureLocalTools(
   } catch (err: any) {
     /* 记下来：master 自愈回来之后要重接的就是这批（见 `rearmLocalToolsFor`） */
     toollessSessions.add(sessionId);
+    /*
+      没有复用连接的平台（Windows）没有 master 自愈，也就没有 onReady 来叫重接 ——
+      交给 `remoteRecovery` 按退避一直试（每次重试都重新查远端占用、重新分端口）。
+    */
+    if (!muxSupported()) startRemoteRecovery(sessionId);
     sessionNotice(sessionId, `⚠️ 本地工具通道没起来：${err?.message || err}。`
       + `这条远程会话读不到你机器上的文件 —— 先别让它改东西。`
       + `连接恢复后会自动重接这条会话。`);
@@ -2278,6 +2315,7 @@ setInterval(() => {
 function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
   const spec = localToolsBySession.get(sessionId);
   localToolsBySession.delete(sessionId);
+  muxUsers.delete(sessionId);
   localMcpServer?.forget(sessionId);
   if (spec && remote?.sshHost) {
     /* 不等结果：收尾动作卡住会让"换模型"看起来像界面挂了 */
@@ -2642,28 +2680,28 @@ const OWNED_AGENT_PREFIX = ownedAgentPrefix(OWNER);
  * 远端端口不再属于任何一条会话（见 `sshMux.ts` 开头）：它唯一的工作是"能连到本机那个 MCP
  * server"，而"你是哪条会话"靠 URL 里的 token 区分 —— 所以一个端口 + N 个 token 就够。
  *
- * `usedRemotePorts` 收的是**已经建起来的那些机器**的端口：两台远端机器各要一条隧道，
- * 它们的远端端口互不相干（各自的 127.0.0.1），沿用 `allocateRemotePort` 只是让日志里
- * 一眼能分清哪条隧道是哪台机器的。
+ * 远端端口由那台机器的 sshd 分（`-R 127.0.0.1:0:…`），不再从 39100 起按机器递增 ——
+ * 固定端口被别人（另一台电脑上的 KiroLex、没被回收的旧连接）占着时，重建会必然再失败。
  */
 const sshMux: SshMux = new SshMux({
   log: (level, message) => logger[level]('sshmux', message),
   localPort: () => localMcpServer?.port() || 0,
-  usedRemotePorts: (): number[] => sshMux.keys()
-    .map((k: string) => sshMux.remotePortFor(k))
-    .filter((port): port is number => typeof port === 'number'),
-  allocateRemotePort,
   owner: OWNER,
   /*
     **自愈的判据：这台机器上还有连着的会话吗** —— 见 `sshMux.scheduleHeal`。
     没有会话就别敲门（机器可能已经关了），有会话就一直试 —— 那几条会话正指着它。
   */
-  hasSessions: (key: string): boolean => {
-    for (const entry of sessionClients.values()) {
-      const r = entry.profile.remote;
-      if (r?.sshHost && muxKey(r.sshHost, r.sshPort) === key) return true;
+  hasSessions: (key: string): boolean => muxSessionsOn(key).length > 0,
+  /* 断了、排上了重建：那台机器上的每条会话都挂一句不会自己消失的提示，连上后由 onReady 顶掉 */
+  onHealing: (key: string, attempt: number) => {
+    const noticed = muxDownNoticed.get(key) || new Set<string>();
+    muxDownNoticed.set(key, noticed);
+    for (const sessionId of muxSessionsOn(key)) {
+      /* 已经在 remoteRecovery 里的那几条有自己的「第 N 次」，别两套数字打架 */
+      if (remoteRecovery.has(sessionId)) continue;
+      noticed.add(sessionId);
+      stickySessionNotice(sessionId, `⚠️ 本机工具连接中断，正在重连（第 ${attempt} 次）—— 这期间这条远程会话读写不了你机器上的文件。`);
     }
-    return false;
   },
   /*
     master 回来之后，把那台机器上**连着但没有工具**的会话重新备一次。
@@ -2674,6 +2712,15 @@ const sshMux: SshMux = new SshMux({
   */
   onReady: (key: string) => {
     void rearmLocalToolsFor(key);
+    /* 断线时执行器已经没了的那几条：现在就接（不等它们各自的退避定时器） */
+    remoteRecovery.kick(key);
+    const noticed = muxDownNoticed.get(key);
+    muxDownNoticed.delete(key);
+    /* 要重接的那几条由 rearm 自己说；其余的（端口没变、工具本来就在）在这里把"正在重连"顶掉 */
+    for (const sessionId of noticed || []) {
+      if (needsRearm(sessionId, key)) continue;
+      sessionNotice(sessionId, '🔌 本机工具连接已恢复。');
+    }
     /* 连接刚断过：死连接下面那批执行器现在没人持有了，顺手收掉 */
     const target = listRemoteTargets(KIROLEX_CONFIG_PATH).find((t) => t.sshHost && muxKey(t.sshHost, t.sshPort) === key);
     if (target) setTimeout(() => { void sweepRemoteExecutors(target, '连接恢复后'); }, 30_000).unref?.();
@@ -2691,15 +2738,51 @@ const sshMux: SshMux = new SshMux({
  * ssh 握手砸向 sshd 的 `MaxStartups`（10:30:100）—— 那正是当初把那台 EC2 弄挂的成因。
  * 正在跑的那一轮不动：打断一轮正在产出的对话比晚几秒拿回工具更贵。
  */
+/**
+ * 这台机器上算"在用这条连接"的会话：活着的执行器，加上正在 attach / 重配、已经登记过这台机器的
+ * （见 `muxUsers`）。自愈判据、"正在重连"提示用的都是它。
+ */
+function muxSessionsOn(key: string): string[] {
+  const ids = new Set<string>();
+  for (const [sessionId, entry] of sessionClients) {
+    const r = entry.profile.remote;
+    if (r?.sshHost && muxKey(r.sshHost, r.sshPort) === key) ids.add(sessionId);
+  }
+  for (const [sessionId, k] of muxUsers) {
+    if (k === key && (attachingSessions.has(sessionId) || reconfiguringSessions.has(sessionId))) ids.add(sessionId);
+  }
+  /* 断了、正在等这条连接回来的会话（执行器已经没了）—— 少了它们，master 一断重建就停 */
+  for (const sessionId of remoteRecovery.waitingOn(key)) ids.add(sessionId);
+  return [...ids];
+}
+
+/**
+ * 这条会话要不要重接：没备上工具的，或者它 agent 里写的远端端口**不是**这条连接现在的端口
+ * （远端端口由 sshd 分，重建之后多半变了 —— 见 `sshMux.ts` 文件头）。
+ * 连接现在不在就不判：端口无从比较，等它回来时 `onReady` 会再叫一次。
+ */
+function needsRearm(sessionId: string, key: string): boolean {
+  if (toollessSessions.has(sessionId)) return true;
+  const port = sshMux.remotePortFor(key);
+  const spec = localToolsBySession.get(sessionId);
+  return typeof port === 'number' && !!spec && spec.remotePort !== port;
+}
+
 async function rearmLocalToolsFor(key: string): Promise<void> {
   const victims: string[] = [];
+  let busyPending = false;
   for (const [sessionId, entry] of sessionClients) {
     const r = entry.profile.remote;
     if (!r?.sshHost || muxKey(r.sshHost, r.sshPort) !== key) continue;
-    if (!toollessSessions.has(sessionId)) continue;   // 它有工具，别碰
-    if (entry.busy) continue;                         // 正在产出，别打断
+    if (!needsRearm(sessionId, key)) continue;        // 它有工具、端口也对，别碰
+    if (entry.busy) { busyPending = true; continue; } // 正在产出，别打断 —— 过一会儿再看
     victims.push(sessionId);
   }
+  /*
+    正在跑的那几条**不是不管**：它那一轮的本地工具已经是死的，这一轮结束后就该重接。
+    过一会儿再看一次（连接又断了的话 needsRearm 判不出端口，就留给下一次 onReady）。
+  */
+  if (busyPending) setTimeout(() => { void rearmLocalToolsFor(key); }, 15_000).unref?.();
   if (!victims.length) return;
   logger.info('sshmux', `${key} 的连接回来了 —— ${victims.length} 条会话缺本地工具，逐条重接：${victims.join(' ')}`);
   for (const sessionId of victims) {
@@ -2707,11 +2790,41 @@ async function rearmLocalToolsFor(key: string): Promise<void> {
       sessionNotice(sessionId, '🔌 本地工具通道回来了，正在重接这条会话的执行器 —— 之后它就能读写你机器上的文件了。');
       detachExecutor(sessionId);
       toollessSessions.delete(sessionId);
-      /* 不在这里主动起：下一次打开/发消息会按记录接上，而那条路本来就是对的 */
+      /* 主动接回来（不等用户下一次发消息）：走和断线恢复同一条路，接上之前一直按退避重试 */
+      startRemoteRecovery(sessionId, { quiet: true });
     } catch (err: any) {
       logger.warn('sshmux', `重接失败 sessionId=${sessionId}: ${err?.message || err}`);
     }
   }
+}
+/**
+ * **断了的远程会话自己接回来** —— 状态机在 `remoteRecovery.ts`（判据和理由都在那儿），这里只接线。
+ *
+ * 判据按**记录**来（还在、没归档、没删、仍是远程、没在退出）：执行器断了之后 `sessionClients` 里
+ * 已经没有它，正是要靠记录才知道"用户还开着这条会话"。
+ */
+let reattachSession: ((sessionId: string) => Promise<boolean>) | undefined;
+const remoteRecovery = new RemoteRecovery<{ key: string; remote: RemoteTarget }>({
+  target: (sid) => {
+    if (isQuitting || deletedSessionIds.has(sid)) return undefined;
+    const rec = store.readRecord(sid);
+    const remote = rec && !rec.archived ? rec.profile.remote : undefined;
+    return remote?.sshHost ? { key: muxKey(remote.sshHost, remote.sshPort), remote } : undefined;
+  },
+  attached: (sessionId) => sessionClients.has(sessionId),
+  toolless: (sessionId) => toollessSessions.has(sessionId),
+  busy: (sessionId) => !!sessionClients.get(sessionId)?.busy,
+  detach: async (sessionId) => { await detachExecutor(sessionId); toollessSessions.delete(sessionId); },
+  /* 复用平台：先把这台机器的连接拉起来（并发只握一次手），没回来就不起执行器 */
+  ensureConnection: muxSupported() ? (t) => sshMux.ensure(t.remote) : undefined,
+  reattach: async (sessionId) => !!(await reattachSession?.(sessionId)),
+  notice: (sessionId, text, sticky) => (sticky ? stickySessionNotice(sessionId, text) : sessionNotice(sessionId, text)),
+  /* 渲染层只在它自己 loadSession 成功时才把会话标成"连着" —— 主进程接上的要告诉它 */
+  recovered: (sessionId) => { mainWindow?.webContents.send('acp:reattached', { sessionId }); },
+  log: (message) => logger.info('remote', message),
+});
+function startRemoteRecovery(sessionId: string, opts: { quiet?: boolean } = {}): void {
+  remoteRecovery.start(sessionId, opts);
 }
 /** 「这个平台不支持复用」只说一次 —— 每条会话都说一遍就是噪音。 */
 let muxWarned = false;
@@ -4690,6 +4803,11 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     const rec = store.readRecord(sessionId);
     if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
     mainWindow?.webContents.send('acp:disconnected', { sessionId });
+    /*
+      **远程会话的执行器意外没了**（多半是连接断了）：交给 `remoteRecovery` 一直试到接上 ——
+      渲染层那次自动重连只试一次，网络没回来就放弃了。主动 detach 的不走这里（上面那道身份守卫）。
+    */
+    if (entry.profile.remote?.sshHost && !isQuitting) startRemoteRecovery(sessionId);
   });
 }
 
@@ -10258,6 +10376,8 @@ app.whenReady().then(async () => {
     }
     return !!sessionClients.get(sid);
   };
+  /* 断线恢复（`remoteRecovery`）在模块级，它要用的就是这一份挂载实现 */
+  reattachSession = ensureAttached;
 
   /** 改写前的整份副本留多少份。要回滚也只会回到最近几版。 */
   const REVIEW_BACKUPS_KEPT = 12;
@@ -12308,8 +12428,16 @@ app.on('before-quit', () => {
     launchd 收养（PPID 变 1），也就是下一次启动要扫的垃圾 —— 而那正是那台 EC2 被压死的
     累积链的第一环（见 `sweepStrayLocalSsh`）。
   */
+  /* 断线恢复也停掉：退出时被收掉的执行器不该再被拉回来 */
+  try { remoteRecovery.stopAll(); } catch { /* 退出路径不抛 */ }
   try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ }
 });
+/*
+  **兜底**：没走 before-quit 的退出（`process.exit`、SIGTERM 那条 5 秒的后备）也要把自己的反向隧道
+  明确关掉 —— 不然 ssh 子进程被收养、还连着远端，远端那个端口和那条 sshd-session 就一直被它占着。
+  `kill` 是同步发信号，可以放在 `exit` 里。
+*/
+process.on('exit', () => { try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ } });
 
 /** 本机控制入口（agent-board「拉取并重启」）：`POST /quit` 走的就是托盘「Quit」那条路径。 */
 let controlServer: ControlServer | null = null;
