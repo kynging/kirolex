@@ -206,7 +206,7 @@ describe('模型可用性按机器分', () => {
   });
 
   test('三个写入点都盖上机器：降级、attach 持久化、手动切换', () => {
-    assert.match(M, /preferredModel: undefined, modelEarnedOn: machineKeyOf\(entry\.profile\)/);
+    assert.match(M, /: \{ \.\.\.entry\.profile, model, modelEarnedOn: machineKeyOf\(entry\.profile\) \}/);
     assert.match(M, /rec\.profile\.modelEarnedOn = machineKeyOf\(profile\);/);
     assert.match(M, /modelEarnedOn: machineKeyOf\(oldEntry\.profile\)/);
     /* attach 构造 profile 时要带着走，否则每次 attach 都当成"没记" */

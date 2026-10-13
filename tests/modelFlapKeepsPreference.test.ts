@@ -9,7 +9,8 @@ test('一轮报"模型不可用"时先问那台机器的清单：还在 → 只�
   assert.match(M, /async function modelStillListed\(profile: AgentProfile, modelId: string\): Promise<boolean> \{/);
   assert.match(M, /const list = profile\.remote\?\.sshHost \? await remotePreflight\(profile\.remote\) : await localModelIds\(\);/);
   assert.match(M, /const stillListed = await modelStillListed\(entry\.profile, failedModel\);/);
-  assert.match(M, /\? \{ \.\.\.entry\.profile, model, modelEarnedOn: undefined \}\n\s+: \{ \.\.\.entry\.profile, model, preferredModel: undefined, modelEarnedOn: machineKeyOf\(entry\.profile\) \};/);
+  /* 清单里也没有（真跑不了）：同样留着偏好，只记这台机器挣的 —— 见 retargetDuringAttach.test.ts */
+  assert.match(M, /\? \{ \.\.\.entry\.profile, model, modelEarnedOn: undefined \}\n\s+: \{ \.\.\.entry\.profile, model, modelEarnedOn: machineKeyOf\(entry\.profile\) \};/);
   assert.match(M, /if \(!stillListed\) deadModelsFor\(machineKeyOf\(entry\.profile\)\)\.add\(failedModel\);/);
 });
 

@@ -55,6 +55,7 @@ import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, p
 import { probeHttpMcp, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { createControlServer, type ControlServer } from './controlServer.ts';
 import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
+import { settleInFlightAttach } from './attachGate.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import {
@@ -677,24 +678,23 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
   const stillListed = await modelStillListed(entry.profile, failedModel);
   for (const model of candidates) {
     /*
-      **偏好一并丢掉。**
+      **偏好留着，只记"这个降级是在哪台机器上挣来的"。**
 
-      `MODEL_FALLBACK_ORDER` 上面那段写着「自动降级绝不覆盖 `preferredModel`，下次 attach 再试
-      一遍真正被选中的那个」。那条规则对**连接失败**是对的（限流、一时抖动，下次也许就好了），
-      但这里的失败不是那种：走到 `swapSessionModel` 的路径是 `isModelUnavailableError` ——
-      kiro-cli 明说「这个模型不可用，请用 /model 换一个」。那是**确定性事实**，不是抖动。
+      kiro-cli 明说「这个模型不可用，请用 /model 换一个」是**这台机器**上的确定性事实，不是别的机器上的：
+      本机因为出口 IP 的地域过滤一个 Claude 都没有，而远端那台 Claude 全在。上一版在这里把偏好清掉，
+      于是一条在本机被降级成 GPT 的会话切到远端时 `firstWantedModel` 拿不到偏好、只能从兜底链头上取 GPT ——
+      远端明明有你选的 Claude，也回不去了。
 
-      留着偏好的代价是实测过的：偏好在下次 attach 抢先连上（连接对死模型永远成功）→ 第一轮
-      再报退役 → 再换一次 → 每次重启都付一遍那 30 秒的静默窗口。
+      原来清偏好是为了"偏好在下次 attach 抢先连上 → 第一轮再报退役 → 每次重启付 30 秒"。那件事现在由
+      清单挡着：本机这台 `connectWithModelFallback` 先问 `localModelIds`，清单里没有的排到最后；远端按
+      `remoteStartCandidates` 只留那台有的。只有清单问不到时才会再付一次那 30 秒，比把你的选择永久丢掉便宜。
 
-      丢掉而不是改成 `model`：把一个自动选中的模型写成「你偏好的」正是上面那条规则要防的事。
-      丢掉的意思是「你那个偏好在这个后端满足不了，先按记录里能跑的来」——想要回去，在 composer
-      里重新选一次就会重新写上（手动切换同时更新 `model` 和 `preferredModel`）。
+      仍然**不**把 `model` 写成偏好：把一个自动选中的模型写成「你偏好的」正是 MODEL_FALLBACK_ORDER 那段要防的事。
     */
     /* 记下是**哪台机器**挣的：换机器之后这条降级就不该再生效（见 `modelEarnedOn`） */
     const profile: AgentProfile = stillListed
       ? { ...entry.profile, model, modelEarnedOn: undefined }
-      : { ...entry.profile, model, preferredModel: undefined, modelEarnedOn: machineKeyOf(entry.profile) };
+      : { ...entry.profile, model, modelEarnedOn: machineKeyOf(entry.profile) };
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, entry));
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
@@ -716,7 +716,7 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`
         + (stillListed
           ? `（但那台机器的模型清单里还有 '${failedModel}' —— 当作一时抖动：偏好留着，下次连上回到它）`
-          : `${entry.profile.preferredModel === failedModel ? `（并清掉偏好 '${failedModel}' —— 清单里也没有它了，是真退役）` : ''}`));
+          : `${entry.profile.preferredModel === failedModel ? `（${machineKeyOf(entry.profile)} 的清单里也没有它，这台机器上记成跑不了；偏好留着 —— 换到有它的机器时回到它）` : ''}`));
       /*
         换成功了 = `failedModel` 在这个后端确实跑不了，记下来。不记的话下一条会话再付一次
         30 秒（实测一次运行里发生了两遍）。只在**换成功**时记：连接失败可能是限流或一时抖动，
@@ -8405,6 +8405,8 @@ app.whenReady().then(async () => {
     localDir?: string,
     hint?: { projectId?: string | null },
   ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
+    /* 先等在飞的 attach 落定：它按旧记录在本机起，不等的话徽标是远端、执行器是本机（见 attachGate.ts） */
+    await settleInFlightAttach(attachInFlight, sessionId);
     const oldEntry = sessionClients.get(sessionId);
     /*
       **右键菜单优先于正在跑的任务** ——「这些右键菜单应该优先级大于正在跑的任务」。

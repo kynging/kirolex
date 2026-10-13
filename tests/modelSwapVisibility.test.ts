@@ -148,23 +148,28 @@ describe('attach 不许把「只是连上了」写成有效模型', () => {
   });
 });
 
-describe('轮次里报出的退役是确定性事实，偏好要丢掉', () => {
-  test('swapSessionModel 换成功时清掉 preferredModel', () => {
+/*
+ * 规则改过：原来「轮次里报出的退役是确定性事实，偏好要丢掉」。可那只是**这台机器**上的事实 ——
+ * 本机地域过滤没有 Claude，清掉偏好之后切到有 Claude 的远端也回不去（retargetDuringAttach.test.ts）。
+ * 现在偏好留着、只记这台机器挣的；"下次 attach 偏好抢先"由清单检查挡。
+ */
+describe('轮次里报出的退役只是这台机器上的事实：偏好留着，记下机器', () => {
+  test('swapSessionModel 换成功时不清 preferredModel，记 modelEarnedOn', () => {
     const body = swapBody();
-    assert.match(body, /preferredModel: undefined/);
+    assert.doesNotMatch(body, /preferredModel: undefined/);
+    assert.match(body, /: \{ \.\.\.entry\.profile, model, modelEarnedOn: machineKeyOf\(entry\.profile\) \}/);
   });
 
-  test('**丢掉而不是改成新模型** —— 把自动选的写成「你偏好的」正是 MODEL_FALLBACK_ORDER 那段要防的', () => {
+  test('**也不改成新模型** —— 把自动选的写成「你偏好的」正是 MODEL_FALLBACK_ORDER 那段要防的', () => {
     const body = swapBody();
     assert.doesNotMatch(body, /preferredModel: model\b/);
-    // 那条规则本身还在，只是这里说清了它管的是连接失败、不是轮次里的退役
     // 那条规则住在 config.ts 的 MODEL_FALLBACK_ORDER 上面
     assert.match(CONFIG, /never overwrites `preferredModel`/);
     assert.match(body, /确定性事实/);
   });
 
-  test('清掉了要在日志里说 —— 否则用户的偏好悄悄没了', () => {
+  test('日志里说清：这台机器上记成跑不了、偏好留着', () => {
     const body = swapBody();
-    assert.match(body, /并清掉偏好/);
+    assert.match(body, /这台机器上记成跑不了；偏好留着/);
   });
 });
