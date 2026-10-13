@@ -33,10 +33,10 @@ describe('会话里的文件链接按这条会话自己的目录解析', () => {
 
 describe('远程会话在它自己那台机器上写的文件', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-  test('本机没有、像是远端路径 → 用 ssh 读，只读；Mac 的 /Users/ 路径不认', () => {
+  test('本机没有、像是远端路径 → 用 ssh 读（读成就登记，写回见 reviewAccess.test.ts）；Mac 的 /Users/ 路径不认', () => {
     assert.match(M, /if \(p\.startsWith\('\/'\)\) return p\.startsWith\('\/Users\/'\) \? null : \{ target, path: p \};/);
-    assert.match(M, /const remote = remoteFileFor\(sessionId, rawPath\);\n\s+if \(remote\) return readRemoteFile\(remote\.target, remote\.path\);/);
-    assert.match(M, /const base = \{ path: remotePath, remote: true, remoteHost: host, readOnly: true \};/);
+    assert.match(M, /const remote = remoteFileFor\(sessionId, rawPath\);\n\s+if \(remote\) \{\n\s+const out = await readRemoteFile\(remote\.target, remote\.path\);/);
+    assert.match(M, /const base = \{ path: remotePath, remote: true, remoteHost: host \};/);
     /* 显示成链接时不为每个链接开 ssh */
     assert.match(M, /return !!remoteFileFor\(sessionId, filePath\);/);
   });

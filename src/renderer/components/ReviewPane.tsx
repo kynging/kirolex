@@ -56,8 +56,27 @@ type PaneApi = {
   setNotes: React.Dispatch<React.SetStateAction<string[] | null>>;
   typeDraft: (key: string, next: string) => void;
   clearDraft: (key: string) => void;
+  setWriteWarn: React.Dispatch<React.SetStateAction<string>>;
 };
 const paneApis = new Map<string, PaneApi>();
+/**
+ * 每个（会话, 文件）**第一次提交前重新读一次** —— 主进程的写回白名单只在内存里：重启之后恢复出来的标签页、
+ * 当时没读成的远端文件都不在上面，不读一次的话模型改好了也写不回去。读一次（`workspaceRead`）就按这条会话登记了。
+ * 读成了记住，读不成下次提交再试；返回读不成的原因。
+ */
+const registered = new Set<string>();
+const registerOnce = async (sessionId: string | undefined, path: string): Promise<string | null> => {
+  const key = `${sessionId || ''}\n${path}`;
+  if (registered.has(key)) return null;
+  try {
+    await window.kiroApi.workspaceRead(sessionId, path);
+    registered.add(key);
+    return null;
+  } catch (err: any) {
+    /* 去掉 Electron 套的那层「Error invoking remote method 'workspace:read': Error: 」，只留真正的原因 */
+    return String(err?.message || err || '读不到').replace(/^Error invoking remote method '[^']*': (Error: )?/, '');
+  }
+};
 /** 「AI 刚改过」的编号 —— 撤销按它认那一处。标记本身按文件存在 `aiMarkStore`（pane 卸掉也还在）。 */
 let aiMarkSeq = 0;
 const NO_AI_MARKS: AiMarkState = { base: '', marks: [] };
@@ -321,6 +340,8 @@ export const ReviewPane: React.FC<{
   const [justSent, setJustSent] = useState(false);
   /** 发给会话前那次备份没成 —— 说出来，因为接下来是会话自己改文件，改坏了没有副本。 */
   const [backupWarn, setBackupWarn] = useState('');
+  /** 提交前读不到这份文件（远端连不上……）—— 什么都没发，标记留着；原因摆出来，而不是让人反复点。 */
+  const [writeWarn, setWriteWarn] = useState('');
   /**
    * **提交之后排着队的那些** —— 每一处一个条目，各自显示排队 / 进行中，结束各自摘掉。
    * `line` 是它**此刻**指的那一行 —— 前面的改动落盘后按 `patch.keep` 跟着挪（见 `writeBack`）。
@@ -658,7 +679,7 @@ export const ReviewPane: React.FC<{
     此刻挂着的那个 pane 的 setter（见 `paneApis`）—— 后台那条跑完时，这个 pane 可能已经卸掉、换成了新的一个；
     放回标记、挂原因要落到你看得见的那一个上。一个都没挂着时落回自己（那时也没人看）。
   */
-  const own: PaneApi = { setDraftLive, setApplyNote, setDropped, setWholeDraft, setMarkOrder, setNotes, typeDraft, clearDraft };
+  const own: PaneApi = { setDraftLive, setApplyNote, setDropped, setWholeDraft, setMarkOrder, setNotes, typeDraft, clearDraft, setWriteWarn };
   useLayoutEffect(() => {
     paneApis.set(path, own);
     return () => { if (paneApis.get(path) === own) paneApis.delete(path); };
@@ -858,6 +879,14 @@ export const ReviewPane: React.FC<{
         if (cancelledTickets.has(ticket)) { restore(); return false; }
         running = true;
         patchReviewItem(ticket, { state: 'running' });
+        /* 第一次提交前重新登记（见 `registerOnce`）；读不到就不发 —— 发了模型改好了也写不回去 */
+        const why = isDeck ? null : await registerOnce(sessionId, path);
+        if (why) {
+          restore();
+          livePane().setWriteWarn(why);
+          return false;
+        }
+        livePane().setWriteWarn('');
         const ok = await run(ticket);
         /* 跑完才发现被取消了（主进程回了 cancelled，或者取消落在两次往返之间）—— 标记放回去 */
         if (!ok && cancelledTickets.has(ticket)) restore();
@@ -1393,9 +1422,10 @@ export const ReviewPane: React.FC<{
   };
 
   /** 发给会话之后那一句确认 / 备份没成的警告。 */
-  const statusLine = (justSent || backupWarn) ? (
+  const statusLine = (justSent || backupWarn || writeWarn) ? (
     <div className="rv-review-status">
       {justSent && <p className="rv-review-sent">已发给这份文件的会话 —— 去那条会话里看它怎么改。</p>}
+      {writeWarn && <p className="rv-review-warn">读不到这份文件，这次没提交（{writeWarn}）—— 标记都还在，连上之后再点「✓ 确认」。</p>}
       {backupWarn && <p className="rv-review-warn">发之前没能备份这份文件（{backupWarn}）—— 会话改坏了没有副本可回滚。</p>}
     </div>
   ) : null;

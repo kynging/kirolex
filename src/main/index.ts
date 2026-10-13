@@ -72,7 +72,8 @@ import {
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
-import { parseRevised, settlePatchRevision, reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
+import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, type ReviewTarget } from './reviewAccess.ts';
+import { parseRevised, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
 import {
   SOFFICE_BUNDLE_PATHS, SOFFICE_PATH_NAMES, pickConverter, sofficeBinary, pathProbeCommand, firstProbeHit,
@@ -3666,17 +3667,15 @@ async function waitIdle(sessionId: string, maxMs: number): Promise<string | null
  * 不用路径形状去判（那种判据要么太松要么挡住正常路径），用"你确实以这条会话的身份打开看过它"这个事实：
  * 你对着它提的意见，写回同一份才成立。**按会话记**：写回只允许打开这个标签页的那条会话
  * （`FileTab.ownerSessionId`）—— 和改写走的是同一条会话，别的会话不能借这条通道去写它没读过的文件。
- * 键 `''` = 没带会话读的（工作区面板、没有当前会话时）。进程重启就清空 —— 重启之后你没看过任何东西。
+ * 键 `''` = 没带会话读的（工作区面板、没有当前会话时）。进程重启就清空 —— 重启之后你没看过任何东西
+ * （恢复出来的标签页第一次提交前，渲染层会重新读一次）。远端文件按 `remoteReviewKey(机器, 路径)` 记（见 `reviewAccess.ts`）。
  */
-const reviewedPaths = new Map<string, Set<string>>();
+const reviewedPaths = new ReviewedPaths();
 function markReviewed(sessionId: string | null | undefined, resolvedPath: string): void {
-  const key = String(sessionId || '');
-  let set = reviewedPaths.get(key);
-  if (!set) { set = new Set(); reviewedPaths.set(key, set); }
-  set.add(resolvedPath);
+  reviewedPaths.mark(sessionId, resolvedPath);
 }
 function wasReviewed(sessionId: string | null | undefined, resolvedPath: string): boolean {
-  return !!reviewedPaths.get(String(sessionId || ''))?.has(resolvedPath);
+  return reviewedPaths.has(sessionId, resolvedPath);
 }
 
 function isFeatureEnabled(key: keyof typeof FEATURE_DEFAULTS | string): boolean {
@@ -9372,7 +9371,8 @@ app.whenReady().then(async () => {
    * 返回那台机器和远端路径，由 `readRemoteFile` 用 ssh 读。
    *   · POSIX 绝对路径，但**不含 `/Users/`**：那是 Mac 上的路径（这些会话以前在 Mac 上跑过），哪儿都读不到；
    *   · 相对路径按那条会话在远端的 cwd 拼。
-   * 只读：远端文件不进 `reviewedPaths`，`review:write-file` 照旧拒写。
+   * 读成功就按「会话 + 机器 + 路径」进 `reviewedPaths`（`remoteReviewKey`）—— 侧栏 review 写回时经 ssh 写回同一个路径
+   * （`writeRemoteReviewFile`）；别的会话没读过，照样拒写。
    */
   function remoteFileFor(sessionId: string | null | undefined, rawPath: string): { target: RemoteTarget; path: string } | null {
     if (!sessionId) return null;
@@ -9385,18 +9385,36 @@ app.whenReady().then(async () => {
     return cwd && cwd.startsWith('/') ? { target, path: path.posix.join(cwd, p) } : null;
   }
 
-  /** 用 ssh 读远端一个文件（base64 回来，和配置面板那条路一样），形状和本地读的结果一致。 */
-  async function readRemoteFile(target: RemoteTarget, remotePath: string) {
-    const MAX = WORKSPACE_PREVIEW_MAX_BYTES;
-    const script = `f=${shellQuote(remotePath)}; if [ -d "$f" ]; then echo KXDIR; elif [ -f "$f" ]; then printf 'KXSIZE %s\\n' "$(wc -c <"$f" | tr -d ' ')"; head -c ${MAX} "$f" | base64 -w0; else echo KXMISSING; fi`;
+  /** 用 ssh 取远端一个文件的前 `max` 字节和它的总大小（base64 回来，和配置面板那条路一样）。 */
+  async function remoteFileBytes(target: RemoteTarget, remotePath: string, max = WORKSPACE_PREVIEW_MAX_BYTES):
+    Promise<{ kind: 'dir' | 'missing' } | { kind: 'file'; size: number; buffer: Buffer }> {
+    const script = `f=${shellQuote(remotePath)}; if [ -d "$f" ]; then echo KXDIR; elif [ -f "$f" ]; then printf 'KXSIZE %s\\n' "$(wc -c <"$f" | tr -d ' ')"; head -c ${max} "$f" | base64 -w0; else echo KXMISSING; fi`;
     const out = String(await runRemoteCapture(target, script, 30_000) || '');
-    const host = labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost;
-    if (out.startsWith('KXDIR')) throw new Error(`${host} 上的 ${remotePath} 是目录，不是文件。`);
-    if (!out.startsWith('KXSIZE ')) throw new Error(`${host} 上没有这个文件：${remotePath}`);
+    if (out.startsWith('KXDIR')) return { kind: 'dir' };
+    if (!out.startsWith('KXSIZE ')) return { kind: 'missing' };
     const nl = out.indexOf('\n');
     const size = Number(out.slice(7, nl)) || 0;
     const buffer = Buffer.from(out.slice(nl + 1).trim(), 'base64');
-    const base = { path: remotePath, remote: true, remoteHost: host, readOnly: true };
+    /*
+      `runRemoteCapture` 在 ssh 报错但已经有输出时照样返回 —— 读回来的可能只是前半截。字节数对不上就当读失败：
+      预览不显示残缺正文，备份 / 写回不拿它当原文（写回那边 `writeTextVia` 另有一道同样的核对）。
+    */
+    if (buffer.length !== Math.min(size, max)) {
+      throw new Error(`读回来的不完整（${buffer.length} / ${Math.min(size, max)} 字节），连接可能中途断了`);
+    }
+    return { kind: 'file', size, buffer };
+  }
+  const remoteHostLabel = (target: RemoteTarget): string => labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost;
+
+  /** 用 ssh 读远端一个文件，形状和本地读的结果一致。 */
+  async function readRemoteFile(target: RemoteTarget, remotePath: string) {
+    const MAX = WORKSPACE_PREVIEW_MAX_BYTES;
+    const got = await remoteFileBytes(target, remotePath, MAX);
+    const host = remoteHostLabel(target);
+    if (got.kind === 'dir') throw new Error(`${host} 上的 ${remotePath} 是目录，不是文件。`);
+    if (got.kind !== 'file') throw new Error(`${host} 上没有这个文件：${remotePath}`);
+    const { size, buffer } = got;
+    const base = { path: remotePath, remote: true, remoteHost: host };
     const ext = path.posix.extname(remotePath).toLowerCase();
     if (IMAGE_MIME_BY_EXT[ext]) {
       if (size > MAX) return { ...base, content: `图片过大（${(size / 1048576).toFixed(1)} MB），在 ${host} 上查看。`, binary: true, truncated: false };
@@ -9415,10 +9433,14 @@ app.whenReady().then(async () => {
     // decides what a relative path is relative to.
     const rawPath = filePath;
     filePath = resolveUserPath(filePath, sessionId);
-    /* 本机没有、而它是远端那台机器上的路径 → 从那台机器读（只读，见 remoteFileFor） */
+    /* 本机没有、而它是远端那台机器上的路径 → 从那台机器读，读成功就记在这条会话名下（写回经 ssh，见 remoteFileFor） */
     if (!fs.existsSync(filePath)) {
       const remote = remoteFileFor(sessionId, rawPath);
-      if (remote) return readRemoteFile(remote.target, remote.path);
+      if (remote) {
+        const out = await readRemoteFile(remote.target, remote.path);
+        markReviewed(sessionId, remoteReviewKey(remote.target.sshHost, remote.path));
+        return out;
+      }
     }
     const stats = fs.statSync(filePath);
     if (stats.isDirectory()) throw new Error('Path is a directory, not a file.');
@@ -10213,17 +10235,59 @@ app.whenReady().then(async () => {
    *
    * 解析走**和读的时候同一个** `resolveUserPath(filePath, sessionId)`：相对路径落到这条会话自己的
    * `sessions/<id>/files/`。闸是"**这条会话**的标签页读过这一份"（`wasReviewed`）—— 不凭渲染进程说它想写哪儿。
+   * 本机没有、而它是远程会话那台机器上的路径（`remoteFileFor`）并且这条会话读过它 → 带回 `remote`，写回经 ssh。
+   * 判据在 `pickReviewTarget`（reviewAccess.ts，纯的、有测试）。
    */
-  const reviewTarget = (sessionId: string | null | undefined, filePath: string): { ok: true; want: string } | { ok: false; error: string } => {
-    const raw = String(filePath || '');
-    if (!raw) return { ok: false, error: '没有路径' };
-    let want: string;
-    try { want = resolveUserPath(raw, sessionId); } catch (e: any) { return { ok: false, error: String(e?.message || e) }; }
-    if (!wasReviewed(sessionId, want)) {
-      logger.warn('review', `refused: not previewed by session=${sessionId || '(none)'} (${want})`);
-      return { ok: false, error: '这个文件不是这条会话的标签页打开预览过的 —— 不写' };
+  const reviewTarget = (sessionId: string | null | undefined, filePath: string): ReviewTarget<RemoteTarget> => {
+    const t = pickReviewTarget<RemoteTarget>({
+      raw: String(filePath || ''),
+      resolveLocal: (raw) => resolveUserPath(raw, sessionId),
+      localExists: (p) => fs.existsSync(p),
+      remoteFor: (raw) => remoteFileFor(sessionId, raw),
+      reviewed: (key) => wasReviewed(sessionId, key),
+    });
+    if (!t.ok && t.notPreviewed) {
+      logger.warn('review', `refused: not previewed by session=${sessionId || '(none)'} (${String(filePath || '')})`);
     }
-    return { ok: true, want };
+    return t;
+  };
+
+  /** 远端出错时给界面的那句话 —— 说清楚是连不上那台机器，不是"不成功"。 */
+  const remoteWhy = (target: RemoteTarget, err: any): string =>
+    `连不上 ${remoteHostLabel(target)}，这次没写回（${String(err?.message || err).slice(0, 200)}）—— 等它连上再提交`;
+
+  /**
+   * 远端文件写回：经 ssh 读那台机器上这一份 → 比 → **先备份到本机** `~/.kirolex/backups/review-files/` → 用
+   * `remoteWriteScript` 写回同一个路径（先写临时文件再 mv）。判据和本地那份一样（`writeTextVia`）。
+   */
+  const writeRemoteReviewFile = async (
+    sessionId: string | null | undefined, target: RemoteTarget, want: string, text: string, expectBase?: string,
+  ): Promise<any> => {
+    let failed: any = null;
+    const r = await writeTextVia({
+      max: WORKSPACE_PREVIEW_MAX_BYTES,
+      read: async () => {
+        try {
+          const got = await remoteFileBytes(target, want);
+          return got.kind === 'file' ? { size: got.size, bytes: got.buffer.length, text: got.buffer.toString('utf-8') } : null;
+        } catch (err) { failed = err; throw err; }
+      },
+      backup: (prev) => !!saveReviewBackup(want, prev),
+      write: async (body) => {
+        try {
+          await writeRemoteFile(target, remoteWriteScript(want, shellQuote), Buffer.from(body, 'utf-8').toString('base64'));
+        } catch (err) { failed = err; throw err; }
+      },
+    }, text, expectBase);
+    if (!r.ok) {
+      if (failed) {
+        logger.warn('review', `remote write failed ${target.sshHost}:${want}: ${failed?.message || failed}`);
+        return { ok: false, error: remoteWhy(target, failed) };
+      }
+      return r;
+    }
+    if (!r.unchanged) logger.info('review', `wrote ${target.sshHost}:${want} (${text.length} chars, was ${r.was}) session=${sessionId || '(none)'}`);
+    return { ...r, path: want };
   };
 
   /**
@@ -10235,6 +10299,20 @@ app.whenReady().then(async () => {
   ipcMain.handle('review:backup-file', async (_event, sessionId: string | null | undefined, filePath: string) => {
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return t;
+    /* 远端文件：从那台机器读出来，存本机 —— 只备份读得全的（ssh 回来的是前 512KB），读不全就说清楚 */
+    if (t.remote) {
+      try {
+        const got = await remoteFileBytes(t.remote, t.want);
+        if (got.kind !== 'file') return { ok: false, error: `${remoteHostLabel(t.remote)} 上没有这个文件：${t.want}` };
+        if (got.size > got.buffer.length) return { ok: false, error: '这个文件比预览上限（512KB）大 —— 没备份' };
+        const at = saveReviewBackup(t.want, got.buffer);
+        if (!at) return { ok: false, error: '备份写不进去' };
+        logger.info('review', `backed up ${t.remote.sshHost}:${t.want} -> ${at} (${got.buffer.length} bytes)`);
+        return { ok: true, at, bytes: got.buffer.length };
+      } catch (error: any) {
+        return { ok: false, error: remoteWhy(t.remote, error) };
+      }
+    }
     try {
       const bytes = fs.readFileSync(t.want);
       const at = saveReviewBackup(t.want, bytes);
@@ -10259,11 +10337,13 @@ app.whenReady().then(async () => {
   /**
    * 写回一份 review 的文件 —— `review:write-file` 和改写那条路（`apply`）共用。
    * `expectBase`：盘上此刻必须正好是这一份才写 —— 改写跑的那几分钟里文件被别的改动动过，拼上去就是错位。
+   * 远端文件（远程会话那台机器上的）经 ssh 写回同一个路径（`writeRemoteReviewFile`）。
    */
-  const writeReviewFile = (sessionId: string | null | undefined, filePath: string, text: string, expectBase?: string): any => {
+  const writeReviewFile = async (sessionId: string | null | undefined, filePath: string, text: string, expectBase?: string): Promise<any> => {
     if (typeof text !== 'string' || !text.trim()) return { ok: false, error: '内容是空的，不写' };
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return t;
+    if (t.remote) return writeRemoteReviewFile(sessionId, t.remote, t.want, text, expectBase);
     const want = t.want;
     try {
       let previous = '';
@@ -10290,9 +10370,15 @@ app.whenReady().then(async () => {
     }
   };
   /** 只读：按和 `writeReviewFile` 同样的规则解析路径，读出盘上此刻的正文；读不到给 `null`。 */
-  const readReviewFile = (sessionId: string | null | undefined, filePath: string): string | null => {
+  const readReviewFile = async (sessionId: string | null | undefined, filePath: string): Promise<string | null> => {
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return null;
+    if (t.remote) {
+      try {
+        const got = await remoteFileBytes(t.remote, t.want);
+        return got.kind === 'file' ? got.buffer.toString('utf-8') : null;
+      } catch { return null; }
+    }
     try { return fs.readFileSync(t.want, 'utf-8'); } catch { return null; }
   };
   /* `expectBase`（可选）：盘上此刻不是这一份就不写 —— 侧栏撤销「AI 刚改过」那一处用它，不会盖掉预览还没刷出来的改动 */
@@ -10414,6 +10500,9 @@ app.whenReady().then(async () => {
       const patchBase = typeof input?.apply?.base === 'string' ? input.apply.base
         : typeof input?.full === 'string' ? input.full : undefined;
       if (wantScope === 'patch' && patchBase === undefined) return { ok: false, error: '没有带上正文 —— 没法按行号改' };
+      /* 要由主进程写回的，**先看闸** —— 不然模型白改一遍，最后才发现写不回去（"改好了却写不回去"） */
+      const gate = input?.apply && typeof input.apply.path === 'string' ? reviewTarget(sessionId, input.apply.path) : null;
+      if (gate && !gate.ok) return { ok: false, error: gate.error };
       const prompt = reviseInSessionPrompt({
         where, note, about: input?.about, scope: wantScope,
         full: wantScope === 'patch' ? patchBase : undefined,
@@ -10448,7 +10537,7 @@ app.whenReady().then(async () => {
         if (apply && typeof apply.base === 'string' && typeof apply.path === 'string') {
           const fullText = applyRevision(apply, out.text);
           if (fullText === null) return { ok: false, error: '拼不回去（位置不对）—— 没写' };
-          const wrote = writeReviewFile(sessionId, apply.path, fullText, apply.base);
+          const wrote = await writeReviewFile(sessionId, apply.path, fullText, apply.base);
           /*
             盘上和渲染层手里那一份对不上（换行符、别的改动……）：主进程不写，把结果照老样子交回去，由渲染层按它手里那份拼、写 ——
             和以前一样，只是少了"窗口不在也不丢"那层保险。不能因为这一层就让改写整个失败。
@@ -10478,12 +10567,16 @@ app.whenReady().then(async () => {
     async function finishPatch(replyText: string, base: string, started: number, followedUp: boolean) {
       const apply = input?.apply;
       const canWrite = !!apply && typeof apply.path === 'string' && typeof apply.base === 'string';
-      const res = settlePatchRevision({
+      /* 写盘（远端文件走 ssh）是异步的：先拼，拼成了再写，写的结果按同一套判据收（`patchWritten`） */
+      const onDisk = canWrite ? await readReviewFile(sessionId, apply!.path) : undefined;
+      const settled = settlePatchRevision({
         replyText, base, followedUp,
-        write: canWrite ? (fullText, expectBase) => writeReviewFile(sessionId, apply!.path, fullText, expectBase) : undefined,
         /* 要追问之前先看一眼盘上那一份 —— 已经被改过就不追问，直接报冲突 */
-        onDisk: canWrite ? () => readReviewFile(sessionId, apply!.path) : undefined,
+        onDisk: canWrite ? () => onDisk : undefined,
       });
+      const res = settled.ok && canWrite
+        ? patchWritten(settled, await writeReviewFile(sessionId, apply!.path, settled.fullText, base))
+        : settled;
       const secs = ((Date.now() - started) / 1000).toFixed(1);
       if (!res.ok) {
         if ('cannot' in res) logger.info('revise', `not local (in-session ${sessionId} patch): ${res.cannot}`);
@@ -10777,6 +10870,7 @@ app.whenReady().then(async () => {
     { ok: true; want: string; at: number } | { ok: false; error: string } => {
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return t;
+    if (t.remote) return { ok: false, error: `这份 deck 在 ${remoteHostLabel(t.remote)} 上 —— 只能预览，不能在这里逐页改` };
     if (!canEditDeck(t.want)) return { ok: false, error: '只有 .pptx 能这么改（.ppt / .odp / 文档类只能预览和整体提交）' };
     const at = Number(page);
     if (!Number.isInteger(at) || at < 1) return { ok: false, error: '页码不对' };

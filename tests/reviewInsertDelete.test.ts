@@ -89,7 +89,7 @@ describe('改写的回复由主进程拼回去、写盘（窗口 reload 了也�
     const fs = await import('node:fs');
     const M = fs.readFileSync('src/main/index.ts', 'utf8');
     assert.ok(M.includes('const fullText = applyRevision(apply, out.text);'));
-    assert.ok(M.includes('const wrote = writeReviewFile(sessionId, apply.path, fullText, apply.base);'));
+    assert.ok(M.includes('const wrote = await writeReviewFile(sessionId, apply.path, fullText, apply.base);'));
     assert.ok(M.includes('if (!wrote?.ok && wrote?.mismatch) return { ok: true, text: out.text, scope: wantScope };'));
     assert.ok(M.includes('markTicketDone(input?.ticket);'));
     assert.ok(M.includes("ipcMain.handle('review:tickets-done'"));

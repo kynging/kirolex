@@ -439,7 +439,8 @@ export function parseRemoteRead(out: string): { exists: boolean; content: string
 /** 远程写：内容从 stdin 进来（base64），落到同目录的临时文件再 mv —— 和本机一样原子。 */
 export function remoteWriteScript(rel: string, q: (s: string) => string): string {
   return [
-    `f="$HOME"/${q(rel)}`,
+    /* 以 `/` 开头的是那台机器上的绝对路径（侧栏 review 写回远端文件），原样用；其余相对家目录 */
+    rel.startsWith('/') ? `f=${q(rel)}` : `f="$HOME"/${q(rel)}`,
     'mkdir -p "$(dirname "$f")"',
     't="$f.kirolex-$$.tmp"',
     'base64 -d > "$t" && mv -f "$t" "$f" || { rm -f "$t"; exit 1; }',

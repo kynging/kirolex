@@ -305,7 +305,8 @@ describe('主进程 / 界面接线', () => {
     assert.ok(at > 0);
     const body = M.slice(at, M.indexOf('\n    }\n', at));
     assert.match(body, /settlePatchRevision\(\{/);
-    assert.match(body, /writeReviewFile\(sessionId, apply!\.path, fullText, expectBase\)/);
+    /* 写盘是异步的（远端走 ssh）：先拼，再写、按 patchWritten 收 —— expectBase 是同一份 base */
+    assert.match(body, /patchWritten\(settled, await writeReviewFile\(sessionId, apply!\.path, settled\.fullText, base\)\)/);
     assert.doesNotMatch(body, /mismatch/);
     assert.doesNotMatch(M, /mismatch\) return \{ ok: true, text: fullText/);
   });
@@ -452,7 +453,8 @@ describe('格式不对时自动追问一次', () => {
     assert.ok(body.includes('finishPatch(again.text, base, started, true)'));
     assert.ok(body.includes('replyText, base, followedUp,'));
     /* 追问前只读核对盘上那一份（不写） */
-    assert.match(body, /onDisk: canWrite \? \(\) => readReviewFile\(sessionId, apply!\.path\) : undefined/);
+    assert.match(body, /const onDisk = canWrite \? await readReviewFile\(sessionId, apply!\.path\) : undefined;/);
+    assert.match(body, /onDisk: canWrite \? \(\) => onDisk : undefined/);
     /* 追问那一轮同样等会话空下来、认取消 */
     const fu = body.slice(body.indexOf('async function followUpPatch('));
     assert.ok(fu.includes('waitIdle(sessionId'));

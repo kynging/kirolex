@@ -107,8 +107,10 @@ describe('主进程接线', () => {
   test('写回**按主人会话解析路径**，并且只许写这条会话读过的', () => {
     const at = MAIN.indexOf('const reviewTarget = ');
     const body = MAIN.slice(at, at + 900);
-    assert.match(body, /want = resolveUserPath\(raw, sessionId\)/);
-    assert.match(body, /if \(!wasReviewed\(sessionId, want\)\)/);
+    /* 判据在 pickReviewTarget（reviewAccess.test.ts 覆盖）；这里按同一个解析、同一个会话的白名单去查 */
+    assert.match(body, /pickReviewTarget<RemoteTarget>\(\{/);
+    assert.match(body, /resolveLocal: \(raw\) => resolveUserPath\(raw, sessionId\)/);
+    assert.match(body, /reviewed: \(key\) => wasReviewed\(sessionId, key\)/);
     /* 记账在 workspace:read 里，用的是同一个解析之后的路径、同一个会话 */
     const read = MAIN.slice(MAIN.indexOf("ipcMain.handle('workspace:read'"));
     assert.match(read.slice(0, 1500), /filePath = resolveUserPath\(filePath, sessionId\);[\s\S]*markReviewed\(sessionId, filePath\);/);
@@ -116,7 +118,7 @@ describe('主进程接线', () => {
 
   test('写前备份，拷不成就不写；比预览上限大的不写', () => {
     /* 写盘那段抽成了 `writeReviewFile`（review:write-file 和改写那条路的 `apply` 共用） */
-    const at = MAIN.indexOf('const writeReviewFile = (');
+    const at = MAIN.indexOf('const writeReviewFile = async (');
     const body = MAIN.slice(at, at + 2200);
     assert.ok(MAIN.includes("ipcMain.handle('review:write-file', async (_event, sessionId: string | null | undefined, filePath: string, text: string, expectBase?: unknown) =>\n    writeReviewFile(sessionId, filePath, text, typeof expectBase === 'string' ? expectBase : undefined));"));
     assert.match(body, /if \(!saveReviewBackup\(want, previous\)\) \{\s*\n\s*return \{ ok: false/);

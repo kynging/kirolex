@@ -634,7 +634,17 @@ export function settlePatchRevision(input: {
   if (!res.ok) return { ok: false, error: res.why };
   const done = { ok: true as const, text: res.text, fullText: res.text, scope: 'patch' as const, changes: res.changes };
   if (!input.write) return done;
-  const wrote = input.write(res.text, input.base);
+  return patchWritten(done, input.write(res.text, input.base));
+}
+
+/**
+ * 拼好的那一份交给写盘之后怎么收 —— `settlePatchRevision` 自己写时用它；写盘是异步的调用方（远端文件走 ssh）
+ * 先不带 `write` 拼，再自己写、拿结果来这里收，判据是同一套。
+ */
+export function patchWritten(
+  done: Extract<PatchSettled, { ok: true }>,
+  wrote: { ok?: boolean; mismatch?: boolean; error?: string; path?: string } | null | undefined,
+): PatchSettled {
   if (!wrote?.ok && wrote?.mismatch) {
     return { ok: false, conflict: true, error: PATCH_CONFLICT };
   }
