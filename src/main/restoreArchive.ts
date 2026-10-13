@@ -1,29 +1,46 @@
 /**
- * **恢复页里的「本机已归档」** —— 纯逻辑，`index.ts` 的 `s3:list-backups` / `s3:restore` 收集状态后传进来。
+ * **恢复时会话放在哪儿（项目 + 是否归档）** —— 纯逻辑，`index.ts` 的 `s3:list-backups` / `s3:restore` 用。
  *
- * catalog 只记"备份时属于哪个项目"，不知道本机已经把这条归档了。于是本机归档的会话在恢复页里
- * 还挂在原项目下，点恢复走合并、合并完 archived 还是 true —— 侧栏项目里看不到它，看起来像恢复失败。
- * 这里只靠**本机记录**判断（不改 catalog 格式、不动上传）。
+ * 规则是「谁后挪用谁」，判据和同步时的位置跟随同一套（`placementToFollow`，只看 `placementChangedAt`）：
+ * catalog 里这条的 `placementChangedAt` 比本机（合并**之前**）那份新 → 用 catalog 的项目和归档；
+ * 否则保持本机原来的（包括本机归档的继续归档）。catalog 条目没有这个字段（老备份）当 0 → 保持本机的。
+ * 本机原来没有这条 → 不管（直接用备份里的记录），返回 null。
  */
+import { placementOf, placementToFollow, type CatalogEntry, type Placement } from './s3Sync.ts';
 
-/** 给每条备份加 `archivedLocally`：本机同 id 那条记录的 archived；本机没有就是 false。 */
-export function markArchivedLocally<T extends { id: string }>(
-  entries: T[],
-  localRecs: Array<{ id: string; archived?: boolean }>,
-): Array<T & { archivedLocally: boolean }> {
-  const archived = new Set(localRecs.filter((r) => r.archived).map((r) => r.id));
-  return entries.map((e) => ({ ...e, archivedLocally: archived.has(e.id) }));
+export interface RestorePlacement {
+  /** 恢复后记录应该是的位置 */
+  placement: Placement;
+  /** 合并之前本机的位置 */
+  before: Placement;
+  /** 项目或归档状态和本机原来的不一样 */
+  changed: boolean;
+}
+
+export function restorePlacement(
+  localBefore: { profile?: any; archived?: any; placementChangedAt?: any } | null | undefined,
+  entry: CatalogEntry | null | undefined,
+): RestorePlacement | null {
+  if (!localBefore) return null;
+  const before = placementOf(localBefore);
+  const placement = placementToFollow(localBefore, entry) || before;
+  return { placement, before, changed: placement.projectId !== before.projectId || placement.archived !== before.archived };
 }
 
 /**
- * 恢复（合并）完成后取消归档。`wasArchived` 是**合并之前**本机那份记录的 archived。
+ * 恢复页里这条备份算哪个项目 —— 按云上（catalog）的；`undefined` = 未分组。
  *
- * 返回要写回的新记录（`archived: false`，项目沿用合并后记录里的 `profile.projectId` —— 就是它原来的项目），
- * 不需要动时返回 null。`archived` 写成显式 false 而不是删掉：渲染端水化用的是 `rec.archived ?? existing.archived`，
- * 字段不存在会退回内存里那个旧的 true。
+ * 只有**老 catalog 条目**（`project` 那一版之前写的）才拿本机记录补：那时候不记项目，全挤进未分组没法看。
+ * 新格式的条目未分组时是**不写** `project` 字段的（`projectOf(r) || undefined`），所以不能拿"没有 project"
+ * 判断老条目 —— 新格式总会写 `archived` / `placementChangedAt`，有其中一个就是新条目，没 project 就是云上未分组。
+ * `project` 是空串（明确未分组）同理。
  */
-export function unarchiveRestoredRecord(merged: any, wasArchived: boolean): { record: any; projectId?: string } | null {
-  if (!wasArchived || !merged || typeof merged !== 'object') return null;
-  const projectId = typeof merged.profile?.projectId === 'string' && merged.profile.projectId ? merged.profile.projectId : undefined;
-  return { record: { ...merged, archived: false }, projectId };
+export function catalogProject(
+  entry: { project?: unknown; archived?: unknown; placementChangedAt?: unknown },
+  localProject: string | undefined,
+): string | undefined {
+  if (typeof entry.project === 'string') return entry.project.trim() || undefined;
+  const isNewFormat = entry.archived !== undefined || entry.placementChangedAt !== undefined;
+  if (isNewFormat) return undefined;
+  return localProject || undefined;
 }

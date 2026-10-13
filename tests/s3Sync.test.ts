@@ -528,9 +528,9 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
 
   test('三种状态各有一个标，"哪几条会动到本地"要看得见', () => {
     assert.match(UI, /backup-tag warn">正在跑/);
-    /* 本地已有的那些是**合并**（见下面那个 describe），所以这个标也跟着改了 */
-    assert.match(UI, /backup-tag over">会合并/);
-    assert.match(UI, /backup-tag new">本地没有/);
+    /* 「会合并 / 本地没有」换成了新旧对比（本机较新 / 云上较新 / 两边一样 / 本地没有，见 restoreArchived.test.ts） */
+    assert.match(UI, /\{FRESHNESS_LABEL\[fresh\]\}/);
+    assert.match(UI, /恢复会和本地那份合并/);
     /* 覆盖那个是这一页唯一有破坏性的，颜色要区分开 */
     assert.match(CSS, /\.backup-tag\.over \{[\s\S]{0,160}--warning/);
   });
@@ -683,9 +683,10 @@ describe('合并：桶里那份并进本地那条', () => {
     assert.match(body, /const existed = fs\.existsSync\(localDir\);/);
   });
 
-  test('界面上那个标改成「会合并」，并说清它不合模型的上下文', () => {
+  test('界面上说清本地已有的会合并，并说清它不合模型的上下文', () => {
     const UI2 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
-    assert.match(UI2, /backup-tag over">会合并/);
+    /* 行上的标现在是新旧对比，「会合并」放进了鼠标悬停提示里 */
+    assert.match(UI2, /恢复会和本地那份合并/);
     assert.equal(/会覆盖本地/.test(UI2), false);
     /* 这是合并唯一的硬边界，必须在确认框里说 */
     assert.match(UI2, /模型自己那套上下文在跑过它的那台机器上，不会一起合并/);
@@ -968,8 +969,8 @@ describe('老 catalog 的项目归属从本地记录补', () => {
   test('catalog 里有就用 catalog 的，没有才回退到本地', () => {
     const at = M6.indexOf("ipcMain.handle('s3:list-backups'");
     const body = M6.slice(at, at + 2400);
-    /* 顺序要求：桶里那份是权威的（它记的是"备份时属于哪个项目"） */
-    assert.match(body, /project: e\.project \|\| projectById\.get\(e\.id\) \|\| undefined,/);
+    /* 顺序要求：桶里那份是权威的（它记的是"备份时属于哪个项目"）；只有老条目才回退到本地（判据见 catalogProject，行为见 restoreArchived.test.ts） */
+    assert.match(body, /project: catalogProject\(e, projectById\.get\(e\.id\)\),/);
     assert.match(body, /const projectById = new Map\(localRecs\.map\(\(r\) => \[r\.id, projectOf\(r\)\]\)\);/);
     /* 本地记录只读一遍 —— existsLocally 和这个补齐共用它 */
     assert.equal((body.match(/store\.listSessions\(\)/g) || []).length, 1);

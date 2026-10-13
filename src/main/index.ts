@@ -26,7 +26,7 @@ import {
   decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
-import { markArchivedLocally, unarchiveRestoredRecord } from './restoreArchive.ts';
+import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, type ExecutorBins, type RemoteTarget } from './config';
@@ -5618,6 +5618,8 @@ app.whenReady().then(async () => {
         syncedAt: marks[rec.id]?.at || 0,
         state: sessionSyncState(marks[rec.id], rec.updatedAt || 0, uploadedIds.has(rec.id)),
         excluded: sessionExcluded(cfg, rec.id),
+        /* 本机归档的 —— 同步页把它放进「已归档」组（同步与否仍按它这个项目 / 它自己的设置） */
+        archived: !!rec.archived,
       });
       byProject.set(key, cur);
     }
@@ -5695,16 +5697,18 @@ app.whenReady().then(async () => {
           if (m) memoryByProject[m[1]] = { bytes: o.size, lastModified: o.lastModified };
         }
       } catch { /* 列不出来就不显示，不挡恢复 */ }
+      const recById = new Map(localRecs.map((r) => [r.id, r]));
       return {
         memoryByProject,
-        /*
-          **本机已经归档的标出来**（`archivedLocally`）—— catalog 不知道本机归档了它，于是恢复页把它
-          挂在原项目下；恢复页据此把它挪进「已归档」组，恢复时会顺手取消归档（见 `s3:restore`）。
-        */
-        entries: markArchivedLocally(catalog.entries || [], localRecs).map((e) => ({
+        /* 分组 / 归档按 catalog 自己的（恢复页显示的是云上那份），本机归档了没有不管 */
+        entries: (catalog.entries || []).map((e) => ({
           ...e,
-          project: e.project || projectById.get(e.id) || undefined,
+          project: catalogProject(e, projectById.get(e.id)),
           existsLocally: local.has(e.id),
+          /* 新旧对比用（本机较新 / 云上较新 / 两边一样） */
+          localUpdatedAt: recById.get(e.id)?.updatedAt || 0,
+          /* 恢复后位置会不会按云上的改（谁后挪用谁，见 `s3:restore`）—— 确认框里要说出来 */
+          placementWillChange: !!restorePlacement(recById.get(e.id), e)?.changed,
           /*
             只把**正在跑一轮**的标出来 ——「恢复的未分组里面怎么有这么多正连着」。
             原来标的是"有执行器"，而启动预热会把未分组整组拉起来，于是一大片都显示正连着、
@@ -5859,8 +5863,18 @@ app.whenReady().then(async () => {
 
       const localDir = path.join(KIROLEX_HOME, 'sessions', sessionId);
       const existed = fs.existsSync(localDir);
-      /* 合并**之前**本机这条是不是归档的 —— 合并完要取消归档，否则它恢复回来还藏在归档里 */
-      const wasArchived = existed && !!store.readRecord(sessionId)?.archived;
+      /* 合并**之前**本机这条的位置（项目 / 归档）—— 合并完按「谁后挪用谁」定恢复后放在哪儿 */
+      const localBefore = existed ? store.readRecord(sessionId) : null;
+      /* catalog 里这条（它的 placementChangedAt 是判据）。读不到就当没有 → 保持本机的位置 */
+      let catalogEntry: CatalogEntry | undefined;
+      if (localBefore) {
+        try {
+          const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+          if (raw) catalogEntry = ((JSON.parse(raw.toString('utf-8')) as Catalog).entries || []).find((e) => e.id === sessionId);
+        } catch (err: any) {
+          logger.warn('s3', `恢复 ${sessionId}：读不到 catalog（${err?.message || err}），位置保持本机的`);
+        }
+      }
       /*
         **动手之前先把本地那份挪走** —— 合并也一样：合并是个算法，算法会有 bug，
         而"选了合并"不等于"愿意拿这条会话赌一次"。挪进 trash 的代价只是一点磁盘。
@@ -5925,6 +5939,40 @@ app.whenReady().then(async () => {
       try { recAfter = JSON.parse(fs.readFileSync(recordPath, 'utf-8')); } catch { recAfter = undefined; }
 
       /*
+        **恢复后放在哪儿：谁后挪用谁** —— catalog 里这条的 placementChangedAt 比本机（合并前）新，
+        就用云上的项目和归档；否则保持本机原来的（本机归档的继续归档）。合并完的记录里位置可能是
+        备份那份 record.json 的，要按这里算出来的写回去。本机原来没有这条的不管（直接用备份里的）。
+        放在记忆前面：项目记忆要按恢复后的项目拉。
+      */
+      const describePlacement = (projectId: string | undefined, archived: boolean) => `「${projectId || '未分组'}」${archived ? '·已归档' : ''}`;
+      let placement: { projectId?: string; archived: boolean; fromProjectId?: string; fromArchived: boolean } | undefined;
+      const rp = restorePlacement(localBefore, catalogEntry);
+      if (rp && recAfter) {
+        const cur = placementOf(recAfter);
+        const want = rp.placement;
+        if (cur.projectId !== want.projectId || cur.archived !== want.archived || cur.placementChangedAt !== want.placementChangedAt) {
+          const next = applyPlacement(recAfter, want);
+          const tmp = `${recordPath}.tmp`;
+          fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
+          fs.renameSync(tmp, recordPath);
+          recAfter = next;
+        }
+        if (rp.changed) {
+          placement = {
+            projectId: want.projectId || undefined, archived: want.archived,
+            fromProjectId: rp.before.projectId || undefined, fromArchived: rp.before.archived,
+          };
+          /* 换了项目要换 memory scope、归档要把执行器让出来 —— 和 followBucketPlacements 一样 */
+          if (rp.before.projectId !== want.projectId || want.archived) {
+            const cl = sessionClients.get(sessionId);
+            if (cl?.busy) pendingProjectReset.add(sessionId);
+            else if (cl) void detachExecutor(sessionId);
+          }
+          mainWindow?.webContents.send('session:placement-changed', { sessionId, projectId: want.projectId || null, archived: want.archived });
+        }
+      }
+
+      /*
         **记忆跟着会话回来** ——「你看看是不是连 memory 一起被备份了」。备份时 `memory/**` 整个传了，
         恢复却只拉了 `sessions/<id>/`，于是恢复回来的会话"忘了你教过它的事"。
           · 这条会话自己的记忆：直接恢复（只属于它）。
@@ -5983,20 +6031,6 @@ app.whenReady().then(async () => {
         fs.writeFileSync(recordPath, JSON.stringify(recAfter, null, 2));
         madeLocal = true;
       }
-      /*
-        **本机归档过的，恢复 = 取消归档、回到原项目** —— 不然合并完 archived 还是 true，侧栏项目里
-        看不到它，看起来像恢复失败。项目用合并后记录里那个（就是它原来的项目）。
-        渲染端那边，恢复页恢复完会发 `kirolex:sessions-restored` 让侧栏从磁盘重新水化，它就出现在项目里了。
-      */
-      let unarchived: { projectId?: string } | undefined;
-      const un = unarchiveRestoredRecord(recAfter, wasArchived);
-      if (un) {
-        const tmp = `${recordPath}.tmp`;
-        fs.writeFileSync(tmp, JSON.stringify(un.record, null, 2));
-        fs.renameSync(tmp, recordPath);
-        recAfter = un.record;
-        unarchived = { projectId: un.projectId };
-      }
       /* 以前在这台机器上删过它的话，墓碑会让它在水化时继续隐身 —— 恢复就是要它回来 */
       clearSessionTombstone(sessionId);
       deletedSessionIds.delete(sessionId);
@@ -6004,9 +6038,10 @@ app.whenReady().then(async () => {
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
         + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}`
-        + `${unarchived ? `，已取消归档（回到「${unarchived.projectId || '未分组'}」）` : ''}`
+        + `${placement ? `，位置按云上改成${describePlacement(placement.projectId, placement.archived)}`
+          + `（原来${describePlacement(placement.fromProjectId, placement.fromArchived)}）` : ''}`
         + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
-      return { ok: true, restored, backedUp, merged, memoryFiles, madeLocal, projectId: project || undefined, unarchived };
+      return { ok: true, restored, backedUp, merged, memoryFiles, madeLocal, projectId: project || undefined, placement };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };

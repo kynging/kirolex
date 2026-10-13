@@ -25,7 +25,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
-import { groupBackups, groupPickState, toggleGroupPick } from '../backupGroups.ts';
+import { groupBackups, groupSyncProjects, compareFreshness, FRESHNESS_LABEL, groupPickState, toggleGroupPick } from '../backupGroups.ts';
 
 interface Backup {
   id: string;
@@ -39,8 +39,12 @@ interface Backup {
   existsLocally?: boolean;
   /** 正在跑一轮 —— 恢复会被拒（那一轮还没落盘），所以不给勾。连着但空闲的会自动先断开。 */
   busy?: boolean;
-  /** 本机已经把它归档了 —— 放进「已归档」组；恢复时会取消归档、回到原项目。 */
-  archivedLocally?: boolean;
+  /** 云上这份是不是归档的（catalog 的 archived）—— 放进「已归档」组。 */
+  archived?: boolean;
+  /** 本机这条记录的 updatedAt（本机没有是 0）—— 新旧对比用。 */
+  localUpdatedAt?: number;
+  /** 恢复后会按云上的位置改到别的项目 / 改变归档状态（谁后挪用谁，主进程算的）。 */
+  placementWillChange?: boolean;
 }
 
 interface SessionRow {
@@ -53,6 +57,8 @@ interface SessionRow {
   state: 'never' | 'pending' | 'synced';
   /** 这条会话单独设成了不同步。 */
   excluded?: boolean;
+  /** 本机归档了 —— 同步页放进「已归档」组。 */
+  archived?: boolean;
 }
 
 interface ProjectRow {
@@ -189,7 +195,16 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     } finally { setBusy(null); }
   };
 
-  /* ---------- 恢复：按项目分组（本机已归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
+  /* ---------- 同步：按本机分组（本机归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
+  const syncGroups = useMemo(() => groupSyncProjects<SessionRow, ProjectRow>(projects || [], () => ({
+    project: '', sessions: [], bytes: 0, updatedAt: 0, excluded: excluded.includes(''),
+  })), [projects, excluded]);
+  const syncRowByProject = useMemo(
+    () => new Map(syncGroups.filter((g) => g.row).map((g) => [g.project as string, g.row as ProjectRow])),
+    [syncGroups],
+  );
+
+  /* ---------- 恢复：按云上分组（云上归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
   const groups = useMemo(() => groupBackups(entries || []), [entries]);
 
   const selectable = useMemo(() => (entries || []).filter((e) => !e.busy), [entries]);
@@ -247,11 +262,11 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
   const restore = async (): Promise<void> => {
     if (!chosen.length) return;
-    const unarchiving = chosen.filter((e) => e.archivedLocally);
+    const moving = chosen.filter((e) => e.existsLocally && e.placementWillChange);
     const lines = [
       `要恢复 ${chosen.length} 条会话。`,
-      ...(unarchiving.length
-        ? ['', `其中 ${unarchiving.length} 条本机已归档，恢复后会取消归档、回到原来的项目。`]
+      ...(moving.length
+        ? ['', `其中 ${moving.length} 条会按云上的位置改到别的项目或改变归档状态（云上那边是后挪的）。`]
         : []),
       ...(merging.length
         ? ['', `其中 ${merging.length} 条本地已经有了，会和本地那份「合并」（按消息 id 去重、按时间排序）：`,
@@ -275,9 +290,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
         const r = await api()?.restoreS3Session?.(e.id);
         if (r?.ok) {
           restoredIds.push(e.id);
-          if (r.unarchived) unarchivedIds.push(e.id);
+          /* 位置变成"不归档"的：侧栏水化要等它的 archived 落定再预热（见 useAcp 的 onRestored） */
+          if (r.placement && !r.placement.archived) unarchivedIds.push(e.id);
           ok.push(`${e.title || e.id}${r.merged ? `（并进 ${r.merged.added} 条${r.merged.clashed ? `，${r.merged.clashed} 条同 id 保留本地` : ''}）` : ''}`
-            + (r.unarchived ? `，已取消归档，回到「${projectLabel(r.unarchived.projectId)}」` : ''));
+            + (r.placement
+              ? `，位置按云上改成「${projectLabel(r.placement.projectId)}」${r.placement.archived ? '（已归档）' : ''}`
+                + `（原来在「${projectLabel(r.placement.fromProjectId)}」${r.placement.fromArchived ? '·已归档' : ''}）`
+              : ''));
           files += Number(r.restored) || 0;
         } else bad.push(`${e.title || e.id}：${r?.error || '失败'}`);
       } catch (x: any) {
@@ -346,29 +365,33 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{where.last.error}</div>
               )}
 
-              {!projects ? <div className="settings-hint backup-note">读项目…</div> : !projects.length ? (
-                <div className="settings-hint backup-note">还没有会话。</div>
-              ) : (
+              {!projects ? <div className="settings-hint backup-note">读项目…</div> : (
                 <div className="backup-restore-list">
-                  {projects.map((p) => {
-                    const shut = !openProjects.has(p.project);
-                    /* 这个项目里有几条还没备份 —— 收起来的时候也要看得见 */
-                    const behind = p.sessions.filter((x) => x.state !== 'synced').length;
+                  {syncGroups.map((g) => {
+                    const shut = !openProjects.has(g.key);
+                    /* 这一组里有几条还没备份 —— 收起来的时候也要看得见 */
+                    const behind = g.sessions.filter((x) => x.state !== 'synced').length;
+                    const row = g.row;
                     return (
-                      <div key={p.project || '__none__'} className="backup-group">
+                      <div key={g.archived ? g.key : (g.project || '__none__')} className="backup-group">
                         <div className="backup-proj-row">
                           <button className="backup-group-toggle" onClick={() => setOpenProjects((prev) => {
                             const next = new Set(prev);
-                            if (next.has(p.project)) next.delete(p.project); else next.add(p.project);
+                            if (next.has(g.key)) next.delete(g.key); else next.add(g.key);
                             return next;
-                          })}>{shut ? '▸' : '▾'} {projectLabel(p.project)}</button>
+                          })}>{shut ? '▸' : '▾'} {g.name}</button>
                           <span className="backup-restore-meta">
-                            {p.sessions.length} 条 · {kb(p.bytes)}
+                            {g.sessions.length} 条{g.bytes ? ` · ${kb(g.bytes)}` : ''}
                             {behind ? ` · ${behind} 条待同步` : ''}
+                            {g.archivedCount ? ` · 另有 ${g.archivedCount} 条在「已归档」` : ''}
                           </span>
+                          {g.archived && (
+                            <span className="settings-hint">本机归档的 · 同步与否按原项目和单条的设置</span>
+                          )}
                           {/* 项目记忆 ——「project 上面也得显示到底 project memory 是否同步了、最新时间是什么时候」 */}
-                          {p.memory && (
-                            !p.memory.exists
+                          {row?.memory && (() => {
+                            const p = row as ProjectRow & { memory: NonNullable<ProjectRow['memory']> };
+                            return !p.memory.exists
                               ? <span className="backup-mem muted" title="这个项目还没有记忆文件">记忆：还没有</span>
                               : <span
                                   className={`backup-mem ${p.memory.state}`}
@@ -377,21 +400,27 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                   记忆 {memSize(p.memory.bytes)} · {p.memory.state === 'synced'
                                     ? (p.memory.syncedAt ? `已同步 ${when(p.memory.syncedAt)}` : '已同步（时间未知）')
                                     : p.memory.state === 'pending' ? '有改动待同步' : '没备份过'}
-                                </span>
+                                </span>;
+                          })()}
+                          {row && (
+                            <ToggleButton
+                              on={!row.excluded}
+                              labels={['同步', '不同步']}
+                              ariaLabel={`${g.name} 是否同步`}
+                              disabled={!!busy}
+                              onChange={(next) => void toggleProject(row.project, next)}
+                            />
                           )}
-                          <ToggleButton
-                            on={!p.excluded}
-                            labels={['同步', '不同步']}
-                            ariaLabel={`${projectLabel(p.project)} 是否同步`}
-                            disabled={!!busy}
-                            onChange={(next) => void toggleProject(p.project, next)}
-                          />
                           {/* 「删除备份」在「恢复」那一页 ——「这个删除备份的按钮不应该在备份这个界面，而是恢复界面」：
                               这一页管"以后传不传"，删桶里已有的是另一件事，挨着开关放太容易点错 */}
                         </div>
-                        {!shut && p.sessions.map((x) => (
+                        {!shut && g.sessions.map((x) => {
+                          /* 这条会话在本机所属的项目 —— 「已归档」组里的也按原项目的开关算 */
+                          const p = syncRowByProject.get(x.project) || { excluded: excluded.includes(x.project) };
+                          return (
                           <div key={x.id} className="backup-restore-row" title={x.id}>
                             <span className="backup-restore-title">{x.title}</span>
+                            {g.archived && <span className="backup-restore-meta">原属「{projectLabel(x.project)}」</span>}
                             {x.state === 'never'
                               ? <span className="backup-tag warn">没备份过</span>
                               : x.state === 'pending'
@@ -416,7 +445,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                 : x.state === 'synced' ? '已同步（时间未知）' : '—'}
                             </span>
                           </div>
-                        ))}
+                          );
+                        })}
                       </div>
                     );
                   })}
@@ -464,9 +494,9 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 <div className="settings-hint backup-note">桶里还没有备份 —— 先在「同步」那个 tab 点一次「立即同步」。</div>
               )}
 
-              {!!groups.length && (
+              {!!entries && (entries.length > 0 || !err) && (
                 <div className="backup-restore-list">
-                  {groups.map(({ key, name, archived, rows }) => {
+                  {groups.map(({ key, name, archived, project: proj = '', rows }) => {
                     const shut = collapsed.has(key);
                     const gp = groupPickState(rows, picked);
                     const armed = armGroup === key;
@@ -486,9 +516,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             return next;
                           })}>{shut ? '▸' : '▾'} {name}</button>
                           <span className="backup-restore-meta">{rows.length} 条</span>
-                          {archived && <span className="settings-hint">本机已归档 · 恢复后会取消归档、回到原来的项目</span>}
+                          {archived && <span className="settings-hint">云上那份是归档的</span>}
                           {!archived && (() => {
-                            const proj = rows[0]?.project || '';
                             if (!proj) return null;             // 未分组没有项目记忆
                             const m = bucketMemory[proj];
                             if (!m) return <span className="backup-mem never" title="桶里没有这个项目的记忆">记忆：桶里没有</span>;
@@ -525,7 +554,9 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               : `删除选中的 ${gp.pickedIds.length} 条`}
                           </button>
                         </div>
-                        {!shut && rows.map((e) => (
+                        {!shut && rows.map((e) => {
+                          const fresh = compareFreshness(e);
+                          return (
                           <label
                             key={e.id}
                             className={`backup-restore-row${e.busy ? ' disabled' : ''}${picked.has(e.id) ? ' picked' : ''}`}
@@ -536,20 +567,21 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             <input type="checkbox" checked={picked.has(e.id)} disabled={!!e.busy || !!busy}
                                    onChange={() => toggle(e.id)} />
                             <span className="backup-restore-title">{e.title || e.id}</span>
-                            {e.archivedLocally && (
-                              <span className="backup-tag warn" title="本机已归档 —— 恢复后会取消归档，回到原来的项目">本机已归档</span>
-                            )}
-                            {e.archivedLocally && (
+                            {archived && (
                               <span className="backup-restore-meta">原属「{projectLabel(e.project)}」</span>
                             )}
-                            {e.busy
-                              ? <span className="backup-tag warn">正在跑</span>
-                              : e.existsLocally
-                                ? <span className="backup-tag over">会合并</span>
-                                : <span className="backup-tag new">本地没有</span>}
+                            {e.busy && <span className="backup-tag warn">正在跑</span>}
+                            {/* 新旧对比：本机记录的 updatedAt 和云上那份比 */}
+                            <span
+                              className={`backup-tag ${fresh === 'cloud-newer' ? 'over' : 'new'}`}
+                              title={fresh === 'missing'
+                                ? '本机没有这条，恢复是纯新增'
+                                : `本机 ${when(e.localUpdatedAt)} · 云上 ${when(e.updatedAt)}\n恢复会和本地那份合并（按消息 id 去重、按时间排序）`}
+                            >{FRESHNESS_LABEL[fresh]}</span>
                             <span className="backup-restore-meta">{kb(e.bytes)} · {when(e.updatedAt)}</span>
                           </label>
-                        ))}
+                          );
+                        })}
                       </div>
                     );
                   })}
