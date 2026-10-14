@@ -17,6 +17,8 @@ remote box, without babysitting a stack of terminals.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
+![KiroLex main window: sessions grouped by project in the sidebar, a chat with its changed files, commands and task list](docs/screenshots/overview.png)
+
 ## Features
 
 ### Engines and executors
@@ -69,6 +71,8 @@ remote box, without babysitting a stack of terminals.
 - **Answer helpers**: numbered options in a reply become clickable chips, and follow-up
   suggestions are offered after a turn.
 
+![Three follow-ups waiting as queued cards while the agent is still working on the current turn](docs/screenshots/message-queue.png)
+
 ### Permissions and change tracking
 - **Permission approval**: tool permission requests appear inline (allow once / always
   allow / deny). Kiro sessions can be switched between Ask and Auto at runtime without
@@ -76,6 +80,10 @@ remote box, without babysitting a stack of terminals.
 - **Per-turn panels**: the agent's task plan, the files it edited (with diffs) and the commands
   it ran, all attached to the turn that produced them.
 - **Usage tracking**: context-window usage and credit consumption per session.
+
+![Permission bar asking whether the agent may run a database migration: allow once, always allow or reject](docs/screenshots/permission-approval.png)
+
+![Per-turn panels: changed files with an expanded diff, commands run and the task list](docs/screenshots/turn-panels.png)
 
 ### Workspace, files and review
 - **Split view**: up to 4 chats side by side (`1x1` / `1x2` / `2x1` / `2x2`). Each pane is a
@@ -87,6 +95,10 @@ remote box, without babysitting a stack of terminals.
   (converted with LibreOffice). Add per-line comments (change / insert / delete) and send them
   all at once. The revision runs in the session that opened the file, AI edits are highlighted,
   and each one can be undone individually.
+
+![Split view with four independent chats in a 2x2 grid](docs/screenshots/split-view.png)
+
+![Side preview of a Markdown file with an AI-edited line highlighted and a line comment being written](docs/screenshots/side-preview.png)
 
 ### Remote sessions (ssh)
 - **Execution remote, files local**: each session picks its machine. The executor runs on the
@@ -106,6 +118,8 @@ remote box, without babysitting a stack of terminals.
   run the official login.
 - **MCP forwarding**: chosen local MCP servers can be forwarded to remote sessions.
 
+![Settings page for remote machines, with an example ssh host and its launch commands](docs/screenshots/remote-machines.png)
+
 ### Scheduled tasks
 - **Time-triggered tasks**: re-send a prompt `interval` / `daily` / `weekly` / `once`, always
   with a required `maxRuns` budget, and pause or cancel at any time. Each run is booked on disk
@@ -113,12 +127,16 @@ remote box, without babysitting a stack of terminals.
 - **Loop bookkeeping**: loop round counters are owned by the main process and saved before each
   round. Verifier commands only run if they were registered beforehand.
 
+![A chat with a daily scheduled job: the banner shows the next run and the run budget, and the sidebar marks scheduled chats](docs/screenshots/scheduled-tasks.png)
+
 ### Memory
 - **Three layers of Markdown memory**: global, per project and per session, under
   `~/.kirolex/memory/`, injected before every turn (feature switch `memoryInjection`, on by
   default).
 - Session memory is consolidated automatically in the background. A memory dialog lets you
   view and edit each layer, with size warnings and backups.
+
+![Memory dialog showing the project layer, with tabs for the global, project and chat layers](docs/screenshots/memory.png)
 
 ### Agents, subagents, skills and MCP
 - **Kiro subagents**: kiro's native delegated agents are tracked live, with a tag in the sidebar
