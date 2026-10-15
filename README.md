@@ -17,7 +17,7 @@ remote box, without babysitting a stack of terminals.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
-![KiroLex main window: sessions grouped by project in the sidebar, a chat with its changed files, commands and task list](docs/screenshots/overview.png)
+![KiroLex main window: sessions grouped by project in the sidebar, a finished turn with its changed files, commands run and task list](docs/screenshots/overview.png)
 
 ## Features
 
@@ -40,20 +40,27 @@ remote box, without babysitting a stack of terminals.
   produced text or run a tool yet, so side effects are never repeated. A diagnostic bundle is
   written when a send fails.
 
+![Two chats side by side on different engines: a Kiro chat with its agent and model pickers (Claude Sonnet 4.5) and a Codex chat on GPT-5 Codex, each with its own executor](docs/screenshots/engines-per-session.png)
+
 ### Sessions
 - **Durable sessions**: a session is a record on disk. The executor is a disposable process
   behind it. User messages are written immediately; assistant messages are written once
   complete. After a restart, chats come back from disk, and a turn that was still running is
   taken over instead of being resent.
 - **Projects**: sessions are grouped by project (working directory), with collapsible groups,
-  drag-and-drop reordering, pinning, search, archive, and auto-generated titles.
+  drag-and-drop reordering, pinning, archive, and auto-generated titles. The right-click menu on
+  a session also renames it, adds it to a split pane, moves it to another project, and switches
+  its engine or the machine it runs on.
 - **Trash**: deleted sessions are moved to a trash folder and kept for 30 days.
-- **Duplicate session**: forks a conversation with its history carried over as context.
+- **Fork from a message**: the fork button on a message starts a new session with the history up
+  to that message carried over as context.
 - **Unread markers and idle notifications**: background sessions show when they have new
   output. Pinned sessions raise a system notification when they go idle while the window is
   not in focus.
 - **Context budget**: when context has to be rebuilt, oversized history is trimmed from the
   oldest end, and the chat says how much was dropped.
+
+![Sidebar with sessions grouped by project, a pinned session and the Archived group open, and a session's right-click menu: rename, pin, add to split, move to project, engine, machine, archive, delete](docs/screenshots/session-menu.png)
 
 ### Composer, queue and steering
 - **Per-session message queue**: follow-ups sent while the agent is busy become editable,
@@ -61,8 +68,9 @@ remote box, without babysitting a stack of terminals.
   optional merge mode that combines several queued items into one turn. Queues are saved to
   disk and survive restarts.
 - **Steering** (kiro): pressing Enter during a running turn injects the text into that turn
-  without cancelling it. `Ctrl/⌘+Enter` always adds a separate queue item. A steer that cannot
-  be delivered goes back to the head of the queue, so messages are never lost.
+  without cancelling it. Once follow-ups are already queued, Enter appends to the last queued
+  item instead. `Ctrl/⌘+Enter` always adds a separate queue item. A steer that cannot be
+  delivered goes back to the head of the queue, so messages are never lost.
 - **Attachments**: drag and drop files, paste screenshots, add file / folder / URL / text
   context. Every image passed to the model is first scaled down to at most 1500 px on its long
   edge, because one oversized image can make Bedrock reject the whole conversation.
@@ -71,7 +79,7 @@ remote box, without babysitting a stack of terminals.
 - **Answer helpers**: numbered options in a reply become clickable chips, and follow-up
   suggestions are offered after a turn.
 
-![Three follow-ups waiting as queued cards while the agent is still working on the current turn](docs/screenshots/message-queue.png)
+![Three follow-ups waiting as queued cards, each with move, edit and remove buttons, while the agent is still working on the current turn](docs/screenshots/message-queue.png)
 
 ### Permissions and change tracking
 - **Permission approval**: tool permission requests appear inline (allow once / always
@@ -81,9 +89,7 @@ remote box, without babysitting a stack of terminals.
   it ran, all attached to the turn that produced them.
 - **Usage tracking**: context-window usage and credit consumption per session.
 
-![Permission bar asking whether the agent may run a database migration: allow once, always allow or reject](docs/screenshots/permission-approval.png)
-
-![Per-turn panels: changed files with an expanded diff, commands run and the task list](docs/screenshots/turn-panels.png)
+![Permission bar asking whether the agent may run a database migration (allow once, always allow or reject) above the composer in Ask mode, next to the turn's task list](docs/screenshots/permission-approval.png)
 
 ### Workspace, files and review
 - **Split view**: up to 4 chats side by side (`1x1` / `1x2` / `2x1` / `2x2`). Each pane is a
@@ -96,9 +102,7 @@ remote box, without babysitting a stack of terminals.
   all at once. The revision runs in the session that opened the file, AI edits are highlighted,
   and each one can be undone individually.
 
-![Split view with four independent chats in a 2x2 grid](docs/screenshots/split-view.png)
-
-![Side preview of a Markdown file with an AI-edited line highlighted and a line comment being written](docs/screenshots/side-preview.png)
+![Side preview of a Markdown file next to its chat: an AI-edited line highlighted with an Undo button, and a line comment being written](docs/screenshots/side-preview.png)
 
 ### Remote sessions (ssh)
 - **Execution remote, files local**: each session picks its machine. The executor runs on the
@@ -118,49 +122,65 @@ remote box, without babysitting a stack of terminals.
   run the official login.
 - **MCP forwarding**: chosen local MCP servers can be forwarded to remote sessions.
 
-![Settings page for remote machines, with an example ssh host and its launch commands](docs/screenshots/remote-machines.png)
+![Settings → Machines with an example ssh host: connection fields, Test connection and Install AI tools, launch-command detection and MCP forwarding](docs/screenshots/remote-machines.png)
 
 ### Scheduled tasks
-- **Time-triggered tasks**: re-send a prompt `interval` / `daily` / `weekly` / `once`, always
-  with a required `maxRuns` budget, and pause or cancel at any time. Each run is booked on disk
+- **Time-triggered tasks**: the ⏰ button on one of your messages re-sends it `interval` /
+  `daily` / `weekly` / `once`, always with a required `maxRuns` budget. The chat shows a banner
+  with the next run and the runs used so far, the sidebar tags scheduled chats, and a job can be
+  paused or cancelled at any time. Each run is booked on disk
   before it is sent, so a crash cannot cause a run to repeat over and over.
 - **Loop bookkeeping**: loop round counters are owned by the main process and saved before each
   round. Verifier commands only run if they were registered beforehand.
 
-![A chat with a daily scheduled job: the banner shows the next run and the run budget, and the sidebar marks scheduled chats](docs/screenshots/scheduled-tasks.png)
+![A chat with a daily scheduled job: the banner shows the next run and the run budget with Pause and Cancel, and the sidebar tags scheduled and paused chats](docs/screenshots/scheduled-tasks.png)
 
 ### Memory
 - **Three layers of Markdown memory**: global, per project and per session, under
   `~/.kirolex/memory/`, injected before every turn (feature switch `memoryInjection`, on by
   default).
 - Session memory is consolidated automatically in the background. A memory dialog lets you
-  view and edit each layer, with size warnings and backups.
+  view and edit each layer, with size warnings and backups. Its Snapshot tab shows the context
+  the next message will carry, and lets you replace it with a hand-edited version.
 
-![Memory dialog showing the project layer, with tabs for the global, project and chat layers](docs/screenshots/memory.png)
+![Memory dialog showing the project layer, with tabs for the global, project and chat layers and the context snapshot](docs/screenshots/memory.png)
 
 ### Agents, subagents, skills and MCP
 - **Kiro subagents**: kiro's native delegated agents are tracked live, with a tag in the sidebar
   while any are still running.
-- **Kiro config panel**: edit `~/.kiro` agents and other kiro (and Claude Code / Codex) config
-  files on the machine where the session runs. A skill viewer reads the actual `SKILL.md` files.
+- **Kiro config panel**: the robot button next to the agent picker opens an editor for `~/.kiro`
+  (Agents, MCP, Steering, Prompts, Skills, Powers, Settings) on the machine where the session
+  runs, with JSON validation. Claude Code / Codex sessions get the same kind of panel for their
+  own config files, plus login. A skill viewer reads the actual `SKILL.md` files.
 - **MCP combos** for Claude Code / Codex: named sets of MCP servers in
   `~/.kirolex/mcp-combos.json`, chosen per session and passed in at session start.
+
+![Kiro agent configuration panel: a global code-reviewer agent open in the JSON editor with its tools and an MCP server, and tabs for MCP, steering, prompts, skills, powers and settings](docs/screenshots/kiro-agent-config.png)
 
 ### Sync and backup
 - **S3 sync**: hand-written SigV4 client (no AWS SDK). It syncs sessions, session files, memory,
   attachments and pasted images according to an allowlist, and never syncs `config.json` or
   logs. When the same session changed on two machines, transcripts are merged instead of
   overwritten. Restoring also merges.
+- **Setup and restore**: Settings → Backup takes the bucket, region, access key, secret (stored
+  encrypted with the OS keychain, never in plain text), an optional key prefix and the sync
+  interval, with Test connectivity and Sync now buttons. The ☁️ button in the sidebar lists what
+  is in the bucket, restores chosen chats, and lets you exclude projects or sessions from sync.
+
+![Settings → Backup with an example S3 bucket, region and access key, a saved secret, Test connectivity and Sync now, and an hourly scheduled sync](docs/screenshots/s3-backup-settings.png)
 
 ### Desktop
 - **Interface in Chinese and English**, switchable in Settings. Session content, paths and model
   names are never translated.
 - **System tray** (closing the window keeps KiroLex running in the tray), **single instance**
   (a second launch focuses the existing window instead of competing for the same data), a splash screen until sessions
-  are loaded, system proxy detection (Windows registry / shell profile), adjustable fonts and
-  zoom, resizable panels.
+  are loaded, system proxy detection (Windows registry / shell profile), resizable panels.
+- **Appearance**: Settings → Appearance sets the interface language, the text and code fonts,
+  the chat font size and the interface zoom (also `Ctrl/⌘` + plus / minus / 0).
 - **Local control endpoint**: a loopback-only HTTP endpoint (`ping` / graceful `quit`) that waits
   for busy sessions to finish before quitting.
+
+![Settings → Appearance: font preview, text and code fonts, interface language set to English, chat font size and interface zoom](docs/screenshots/appearance-settings.png)
 
 ## Platform support
 
