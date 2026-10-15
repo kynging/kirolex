@@ -414,8 +414,8 @@ describe('模型列表按机器分', () => {
 
   test('问不到就**报错**，不要假装成"只有 auto"', () => {
     /* 那份退化结果曾经被写进缓存，于是"网恢复了却还是显示模型都不可用" */
-    assert.match(M, /没有报出模型列表/);
-    assert.match(M, /问不到 \$\{target\.sshHost\} 的模型列表/);
+    assert.match(M, /did not report a model list/);
+    assert.match(M, /tr\('Could not get the model list from \{host\}: \{err\}', \{ host: target\.sshHost/);
   });
 
   test('名字/窗口/乘数从本机那份**补上**（集合归机器，属性归模型）', () => {
@@ -936,7 +936,8 @@ describe('只管自己创建的会话', () => {
   test('这个模块仍然没有任何 import（它只拼字符串）', () => {
     const RL = fs.readFileSync(path.join(process.cwd(), 'src/main/remoteLocalTools.ts'), 'utf8');
     /* 所以 owner 的 hash 是自带的 FNV-1a，宿主信息由调用方传进来 */
-    assert.equal(/^import /m.test(RL), false);
+    /* 唯一允许的是纯的文案表 `uiText.ts`（它自己也没有任何依赖），给那一句报错做中英文 */
+    assert.equal(/^import (?!\{ tr \} from '\.\/uiText\.ts';$)/m.test(RL), false);
     assert.match(RL, /FNV-1a/);
   });
 

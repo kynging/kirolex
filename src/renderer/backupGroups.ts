@@ -10,12 +10,16 @@
  * 然后「未分组」，最后「已归档」。
  */
 
+import { t, type Lang } from './i18n.ts';
+
 /** 「已归档」组的 key —— 不和任何项目名撞（项目名也可能就叫「已归档」）。 */
 export const ARCHIVED_GROUP = '\u0000archived';
 
 const UNGROUPED = '未分组';
 
 const projectLabel = (p?: string): string => (p && p.trim() ? p : UNGROUPED);
+/** 组头显示用的名字：「未分组」按界面语言翻译（key 仍是中文，收起状态和排序不受影响）。 */
+const displayName = (name: string, lang: Lang): string => (name === UNGROUPED ? t(lang, 'Unassigned') : name);
 
 export interface BackupGroup<T> {
   /** 收起 / 展开用的 key */
@@ -31,6 +35,7 @@ export interface BackupGroup<T> {
 
 export function groupBackups<T extends { project?: string; updatedAt?: number; archived?: boolean }>(
   entries: T[],
+  lang: Lang = 'zh',
 ): BackupGroup<T>[] {
   const map = new Map<string, T[]>([[UNGROUPED, []]]);
   const archived: T[] = [];
@@ -49,8 +54,8 @@ export function groupBackups<T extends { project?: string; updatedAt?: number; a
       if ((a[0] === '未分组') !== (b[0] === '未分组')) return a[0] === '未分组' ? 1 : -1;
       return (b[1][0]?.updatedAt || 0) - (a[1][0]?.updatedAt || 0);
     })
-    .map(([name, rows]) => ({ key: name, name, archived: false, project: name === UNGROUPED ? '' : name, rows }));
-  groups.push({ key: ARCHIVED_GROUP, name: '已归档', archived: true, rows: archived });
+    .map(([name, rows]) => ({ key: name, name: displayName(name, lang), archived: false, project: name === UNGROUPED ? '' : name, rows }));
+  groups.push({ key: ARCHIVED_GROUP, name: t(lang, 'Archived'), archived: true, rows: archived });
   return groups;
 }
 
@@ -73,6 +78,16 @@ export const FRESHNESS_LABEL: Record<Freshness, string> = {
   missing: '本地没有',
 };
 
+/** 按界面语言给新旧对比的标签（中文和上面的 `FRESHNESS_LABEL` 一致）。 */
+export function freshnessLabel(f: Freshness, lang: Lang = 'zh'): string {
+  switch (f) {
+    case 'local-newer': return t(lang, 'Newer on this machine');
+    case 'cloud-newer': return t(lang, 'Newer in the cloud');
+    case 'same': return t(lang, 'Same on both sides');
+    default: return t(lang, 'Not on this machine');
+  }
+}
+
 /** 同步页的一组。`project` 为 null 的是「已归档」组（混着好几个项目，没有项目级开关）。 */
 export interface SyncGroup<S, P> {
   key: string;
@@ -92,7 +107,7 @@ export interface SyncGroup<S, P> {
 export function groupSyncProjects<
   S extends { updatedAt?: number; bytes?: number; archived?: boolean },
   P extends { project: string; sessions: S[] },
->(projects: P[], blankUngrouped: () => P): SyncGroup<S, P>[] {
+>(projects: P[], blankUngrouped: () => P, lang: Lang = 'zh'): SyncGroup<S, P>[] {
   const rows = projects.some((p) => !p.project) ? projects : [...projects, blankUngrouped()];
   const archived: Array<S & { project: string }> = [];
   const byRecent = (a: { updatedAt?: number }, b: { updatedAt?: number }): number => (b.updatedAt || 0) - (a.updatedAt || 0);
@@ -106,7 +121,7 @@ export function groupSyncProjects<
     live.sort(byRecent);
     return {
       key: p.project,
-      name: projectLabel(p.project),
+      name: displayName(projectLabel(p.project), lang),
       archived: false,
       project: p.project,
       row: p,
@@ -120,7 +135,7 @@ export function groupSyncProjects<
   archived.sort(byRecent);
   groups.push({
     key: ARCHIVED_GROUP,
-    name: '已归档',
+    name: t(lang, 'Archived'),
     archived: true,
     project: null,
     sessions: archived,

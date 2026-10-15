@@ -1,5 +1,6 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { createPortal } from 'react-dom';
+import { useT } from '../hooks/useLang';
 
 /**
  * THE SKILLS KIRO ACTUALLY HAS — read from `~/.kiro/skills/<name>/SKILL.md`.
@@ -70,6 +71,7 @@ interface SkillEntry {
 type Tab = 'rules' | 'tables' | 'source';
 
 export function SkillDialog({ onClose }: { onClose: () => void }) {
+  const t = useT();
   const [dir, setDir] = useState('');
   const [skills, setSkills] = useState<SkillEntry[]>([]);
   const [active, setActive] = useState<SkillEntry | null>(null);
@@ -104,29 +106,29 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
       rules: doc.rules.length,
       pauses: doc.rules.filter((r) => r.interactive).length,
       writes: doc.rules.filter((r) => r.writes).length,
-      tableRows: doc.tables.reduce((sum, t) => sum + t.rows.length, 0),
+      tableRows: doc.tables.reduce((sum, tb) => sum + tb.rows.length, 0),
     };
   }, [doc]);
 
   return createPortal(
     <>
       <div className="overlay" onClick={onClose} />
-      <div className="skill-dialog" role="dialog" aria-label="技能">
+      <div className="skill-dialog" role="dialog" aria-label={t('Skills')}>
         <div className="skill-dialog-head">
-          <span className="skill-dialog-title">🧩 Kiro 技能</span>
+          <span className="skill-dialog-title">{t('🧩 Kiro skills')}</span>
           <span className="skill-dialog-sub">
-            {loading ? '读取中…' : active?.summary || (skills.length ? '选择一个技能' : '没有找到技能')}
+            {loading ? t('Reading…') : active?.summary || (skills.length ? t('Pick a skill') : t('No skills found'))}
           </span>
-          <button className="skill-dialog-close" onClick={onClose} aria-label="关闭">✕</button>
+          <button className="skill-dialog-close" onClick={onClose} aria-label={t('Close')}>✕</button>
         </div>
 
         <div className="skill-dialog-body">
           <div className="skill-side skill-side-left">
             <div className="skill-side-section">
-              <div className="skill-side-head">已安装（{skills.length}）</div>
+              <div className="skill-side-head">{t('Installed ({n})', { n: skills.length })}</div>
               {!loading && skills.length === 0 && (
                 <div className="skill-side-empty">
-                  <code>{dir || '~/.kiro/skills'}</code> 下没有技能目录。
+                  {withCode(t('No skill folders under {dir}.', { dir: SLOT }), <code>{dir || '~/.kiro/skills'}</code>)}
                 </div>
               )}
               {skills.map((skill) => (
@@ -141,10 +143,9 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
               ))}
             </div>
             <div className="skill-side-section skill-provenance">
-              <div className="skill-side-head">这些文件归 kiro 所有</div>
+              <div className="skill-side-head">{t('These files belong to kiro')}</div>
               <div className="skill-provenance-body">
-                技能由<b>模型自己</b>按下面的触发条件加载，KiroLex 不调用、不改写这些文件。
-                这里只是把它们读出来给你看。
+                {t('Skills are loaded by ')}<b>{t('the model itself')}</b>{t(' based on the trigger conditions below. KiroLex does not invoke or modify these files; it only reads them to show you.')}
               </div>
             </div>
           </div>
@@ -152,40 +153,40 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
           <div className="skill-main">
             {!doc && !loading && (
               <div className="skill-graph-empty">
-                技能放在 <code>~/.kiro/skills/&lt;名字&gt;/SKILL.md</code>。
-                <br />frontmatter 里的 <code>description</code> 就是它的触发条件。
+                {t('Skills live in ')}<code>{t('~/.kiro/skills/<name>/SKILL.md')}</code>{t('.')}
+                <br />{withCode(t('The {field} in the frontmatter is its trigger condition.', { field: SLOT }), <code>description</code>)}
               </div>
             )}
             {doc && (
               <>
                 <div className="skill-trigger">
-                  <div className="skill-trigger-label">触发条件（模型据此决定要不要用这个技能）</div>
-                  <div className="skill-trigger-text">{doc.triggerText || doc.description || '（frontmatter 没有 description —— 模型无从判断何时该用它）'}</div>
+                  <div className="skill-trigger-label">{t('Trigger condition (the model uses this to decide whether to use the skill)')}</div>
+                  <div className="skill-trigger-text">{doc.triggerText || doc.description || t('(no description in the frontmatter, so the model cannot tell when to use it)')}</div>
                 </div>
 
                 <div className="skill-tabs">
-                  {([['rules', `规则 ${counts?.rules ?? 0}`], ['tables', `数据表 ${doc.tables.length}`], ['source', '原文']] as [Tab, string][])
+                  {([['rules', t('Rules {n}', { n: counts?.rules ?? 0 })], ['tables', t('Tables {n}', { n: doc.tables.length })], ['source', t('Source')]] as [Tab, string][])
                     .map(([id, label]) => (
                       <button key={id} className={`skill-tab${tab === id ? ' active' : ''}`} onClick={() => setTab(id)}>
                         {label}
                       </button>
                     ))}
                   <span className="skill-tabs-spacer" />
-                  {counts!.pauses > 0 && <span className="skill-badge pause">{counts!.pauses} 处要人参与</span>}
-                  {counts!.writes > 0 && <span className="skill-badge write">{counts!.writes} 处写外部系统</span>}
+                  {counts!.pauses > 0 && <span className="skill-badge pause">{t('{n} need a human', { n: counts!.pauses })}</span>}
+                  {counts!.writes > 0 && <span className="skill-badge write">{t('{n} write to external systems', { n: counts!.writes })}</span>}
                 </div>
 
                 {tab === 'rules' && (
                   <div className="skill-rules">
-                    {doc.rules.length === 0 && <div className="skill-side-empty">这个技能没有编号规则，只有散文说明。见「原文」。</div>}
+                    {doc.rules.length === 0 && <div className="skill-side-empty">{t('This skill has no numbered rules, only prose. See "Source".')}</div>}
                     {doc.rules.map((rule, index) => (
                       <div className={`skill-rule${rule.interactive ? ' interactive' : ''}${rule.writes ? ' writes' : ''}`} key={index}>
                         <span className="skill-rule-num">{rule.number}</span>
                         <div className="skill-rule-main">
                           <div className="skill-rule-label">
                             {rule.label}
-                            {rule.interactive && <span className="skill-badge pause">要人参与</span>}
-                            {rule.writes && <span className="skill-badge write">写外部系统</span>}
+                            {rule.interactive && <span className="skill-badge pause">{t('Needs a human')}</span>}
+                            {rule.writes && <span className="skill-badge write">{t('Writes externally')}</span>}
                           </div>
                           <div className="skill-rule-text">{rule.text}</div>
                         </div>
@@ -196,8 +197,7 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
                         rendering bug. */}
                     {hasNumberingOddity(doc.rules) && (
                       <div className="skill-rules-note">
-                        注意：文件里的编号有重复或跳号（{doc.rules.map((r) => r.number).join(', ')}）。
-                        这里按原样显示 —— 面板不替文件重排编号，否则你就看不出文件本身有这个问题。
+                        {t('Note: the numbering in the file has duplicates or gaps ({list}). It is shown as is; the panel does not renumber the file, or you could not tell the file itself has this problem.', { list: doc.rules.map((r) => r.number).join(', ') })}
                       </div>
                     )}
                   </div>
@@ -205,10 +205,10 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
 
                 {tab === 'tables' && (
                   <div className="skill-tables">
-                    {doc.tables.length === 0 && <div className="skill-side-empty">这个技能没有数据表。</div>}
+                    {doc.tables.length === 0 && <div className="skill-side-empty">{t('This skill has no tables.')}</div>}
                     {doc.tables.map((table, index) => (
                       <div className="skill-table-block" key={index}>
-                        <div className="skill-table-caption">{table.section} · {table.rows.length} 行</div>
+                        <div className="skill-table-caption">{table.section} · {t('{n} rows', { n: table.rows.length })}</div>
                         <div className="skill-table-scroll">
                           <table>
                             <thead>
@@ -229,7 +229,7 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
                 {tab === 'source' && (
                   <div className="skill-source">
                     <div className="skill-source-path"><code>{active?.path}</code></div>
-                    <pre>{raw || '（读取中…）'}</pre>
+                    <pre>{raw || t('(loading…)')}</pre>
                   </div>
                 )}
               </>
@@ -238,13 +238,20 @@ export function SkillDialog({ onClose }: { onClose: () => void }) {
         </div>
 
         <div className="skill-dialog-foot">
-          这些规则由模型执行，<b>KiroLex 不强制</b>：模型可能跳过某一条。「写外部系统」是提醒，不是闸门。
-          {doc && <> 章节：{doc.sections.map((s) => s.title).join(' · ')}</>}
+          {t('These rules are carried out by the model, ')}<b>{t('KiroLex does not enforce them')}</b>{t(': the model may skip any of them. "Writes externally" is a reminder, not a gate.')}
+          {doc && <> {t('Sections: {list}', { list: doc.sections.map((s) => s.title).join(' · ') })}</>}
         </div>
       </div>
     </>,
     document.body,
   );
+}
+
+/** 把译文里 `SLOT` 那个位置换成一个元素（中英文里 <code> 的位置不一样，不能拆成前后两段）。 */
+const SLOT = '\u0000';
+function withCode(text: string, node: React.ReactNode): React.ReactNode {
+  const at = text.indexOf(SLOT);
+  return at < 0 ? text : <>{text.slice(0, at)}{node}{text.slice(at + SLOT.length)}</>;
 }
 
 /** Duplicated or non-monotonic numbering in the source file. */

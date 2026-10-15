@@ -101,14 +101,14 @@ describe('接进了聊天区', () => {
   test('更早的用**现成的**分页按钮取回 —— 记录一条没少', () => {
     const at = CHAT.indexOf('const visibleGroups = renderGroups.length > windowSize');
     assert.ok(at > 0, '窗口没有按 windowSize 切');
-    assert.match(CHAT, /加载更早的消息（还有 \{hiddenGroupCount\} 组）/);
+    assert.match(CHAT, /t\('⤴ Load earlier messages \(\{n\} more groups\)', \{ n: hiddenGroupCount \}\)/);
   });
 
   test('清空那条画成分界线，不画成用户气泡', () => {
     // 一个写着 `/clear` 的气泡说不出「上面的模型不记得了」，而那是这条消息在这一页上唯一的意义
     assert.match(CHAT, /group\.kind === 'user' && isClearCommand\(\(group as any\)\.base\) \?/);
     assert.match(CHAT, /className="chat-clear-line"/);
-    assert.match(CHAT, /clearNoteText\(hiddenGroupCount\)/);
+    assert.match(CHAT, /clearNoteText\(hiddenGroupCount, findLang\)/);
   });
 
   test('找不到那一组就退回不干预 —— 它可能被合并进了别人', () => {

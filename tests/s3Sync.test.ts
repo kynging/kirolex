@@ -13,6 +13,9 @@ import {
 } from '../src/main/s3Sync.ts';
 import type { CatalogEntry } from '../src/main/s3Sync.ts';
 
+/** 备份页的中文文案进了字典（key 是英文，源码里是 t('英文')）——"界面上说了这句"要到字典里看中文。 */
+const ZHP = fs.readFileSync(path.join(process.cwd(), 'src/renderer/i18nZh/settingsPanels.ts'), 'utf8');
+
 /*
  * 「加一个定时向 S3 同步的功能，然后用户可以选择哪个会话恢复回本地，S3 认证用 AKSK」。
  *
@@ -269,7 +272,7 @@ describe('接线', () => {
 
   test('secret 用 safeStorage 加密，没有 keychain 就**拒绝保存**而不是退回明文', () => {
     assert.match(M, /safeStorage\.encryptString/);
-    assert.match(M, /拒绝把 secret 明文写进配置/);
+    assert.match(M, /refuses to write the secret into the config in plain text/);
     /* 明文既不落盘也不回渲染层 */
     assert.match(M, /hasSecret: !!cfg\.secretCipher/);
     assert.equal(/secretAccessKey: cfg\.secretAccessKey/.test(M), false);
@@ -292,7 +295,7 @@ describe('接线', () => {
     assert.match(body, /getObject/);
     assert.match(body, /是两条独立的权限/);
     /* 写进去再读回来对比 —— 桶上可能有改写内容的策略 */
-    assert.match(body, /内容不一致/);
+    assert.match(body, /doesn\\'t match what was written/);
     /*
       「测试应该是写完然后删除」—— 留着那个 `.kirolex-write-test` 是往用户桶里扔垃圾，
       桶开了版本控制的话每次测还会攒一个版本。
@@ -300,7 +303,7 @@ describe('接线', () => {
     assert.match(body, /await deleteObject\(creds!, key\);/);
     /* 但删不掉**不算测试失败**：要证明的"能读能写"已经成立了。只是必须说出来。 */
     assert.match(body, /leftover = /);
-    assert.match(body, /没有 s3:DeleteObject/);
+    assert.match(body, /may lack s3:DeleteObject/);
     assert.ok(body.indexOf('const back = await getObject') < body.indexOf('await deleteObject'),
       '先验证内容，再删 —— 反过来就没东西可读了');
   });
@@ -315,7 +318,8 @@ describe('接线', () => {
   test('按钮上不再写"真写一个小对象" —— 它不留痕迹了，那句是噪音', () => {
     const CONF2 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
     assert.equal(/测连通（真写一个小对象）/.test(CONF2), false);
-    assert.match(CONF2, /'测连通'/);
+    assert.match(CONF2, /t\('Test connectivity'\)/);
+    assert.match(ZHP, /'Test connectivity': '测连通'/);
   });
 
   test('catalog **最后**传：它是恢复的唯一入口，先传会指向还没上传完的东西', () => {
@@ -354,7 +358,7 @@ describe('接线', () => {
     assert.match(body, /detachExecutor\(sessionId\)/);
     assert.ok(body.indexOf('live?.busy') < body.indexOf('detachExecutor(sessionId)'), '先判 busy 再断开');
     /* 会话 id 来自渲染层，要当输入校验（它会被拼进文件路径） */
-    assert.ok(body.includes('会话 id 不合法'), '缺 id 校验');
+    assert.ok(body.includes('Invalid session id.'), '缺 id 校验');
     assert.ok(body.includes('w.-]+$'), '缺白名单正则');
     /* 覆盖前挪进 trash */
     assert.match(body, /trashDirFor/);
@@ -385,10 +389,12 @@ describe('接线', () => {
   test('界面：覆盖前要确认，并且说清挪进 trash', () => {
     assert.match(UI, /window\.confirm/);
     /* 本地已有的那些现在是**合并**（不是覆盖），所以措辞跟着改了 */
-    assert.match(UI, /合并/);
+    assert.match(UI, /merged with the local copy/);
+    assert.match(ZHP, /合并/);
     assert.match(UI, /trash/);
     /* secret 框平时是空的，空 = 不改 */
-    assert.match(CONF, /留空 = 不改/);   /* secret 在配置那一页 */
+    assert.match(CONF, /t\('Saved \(leave empty to keep\)'\)/);   /* secret 在配置那一页 */
+    assert.match(ZHP, /留空 = 不改/);
   });
 });
 
@@ -475,10 +481,10 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
   const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
 
   test('配置回到设置里', () => {
-    assert.match(SD, /\{ id: 'backup', label: '☁️ 备份' \}/);
+    assert.match(SD, /\{ id: 'backup', label: '☁️ Backup' \}/);
     assert.match(SD, /\{tab === 'backup' && <BackupSettings \/>\}/);
     /* 桶 / 凭据 / 定时都在那一页 */
-    for (const f of ['label="Bucket"', 'label="Region"', 'label="Access Key ID"', 'label="Secret"', '定时同步']) {
+    for (const f of ['label="Bucket"', "label={t('Region')}", 'label="Access Key ID"', "label={t('Secret')}", '定时同步']) {
       assert.ok(CONF.includes(f), `配置页要有 ${f}`);
     }
   });
@@ -501,10 +507,11 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     assert.match(UI, /const \[picked, setPicked\] = useState<Set<string>>/);
     /* 组头的全选框又加回来了（用户明确要的）—— 行为见 backupGroupPick.test.ts */
     assert.match(UI, /toggleGroupPick\(prev, rows\)/);
-    assert.match(UI, /恢复选中的/);
+    assert.match(UI, /t\('Restore \{n\} selected', \{ n: chosen\.length \}\)/);
+    assert.match(ZHP, /'Restore \{n\} selected': '恢复选中的 \{n\} 条'/);
     /* 一条一条恢复：并发会同时写 trash 和 sessions，而失败要说清是哪一条 */
     assert.match(UI, /for \(const e of chosen\)/);
-    assert.match(UI, /bad\.push\(`\$\{e\.title \|\| e\.id\}：/);
+    assert.match(UI, /bad\.push\(`\$\{e\.title \|\| e\.id\}\$\{t\(': '\)\}/);
   });
 
   test('**一次**确认，而且把要覆盖的那几条点名', () => {
@@ -514,8 +521,9 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     assert.match(UI, /merging\.map\(\(e\) => `  · \$\{e\.title \|\| e\.id\}`\)/);
     /* 本地已有的那些现在是**合并**（见下面那个 describe），不是覆盖 */
     /* 原生 confirm 不认 markdown，所以这里用「」而不是 ** */
-    assert.match(UI, /会和本地那份「合并」/);
-    assert.match(UI, /不会真的丢/);
+    assert.match(UI, /t\('\{n\} of them already exist locally and will be merged with the local copy/);
+    assert.match(ZHP, /会和本地那份「合并」/);
+    assert.match(ZHP, /不会真的丢/);
   });
 
   test('正在跑的不给勾 —— 主进程会拒，让人勾上再被拒是最差的', () => {
@@ -527,10 +535,12 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
   });
 
   test('三种状态各有一个标，"哪几条会动到本地"要看得见', () => {
-    assert.match(UI, /backup-tag warn">正在跑/);
+    assert.match(UI, /backup-tag warn">\{t\('Running now'\)\}/);
+    assert.match(ZHP, /'Running now': '正在跑'/);
     /* 「会合并 / 本地没有」换成了新旧对比（本机较新 / 云上较新 / 两边一样 / 本地没有，见 restoreArchived.test.ts） */
-    assert.match(UI, /\{FRESHNESS_LABEL\[fresh\]\}/);
-    assert.match(UI, /恢复会和本地那份合并/);
+    assert.match(UI, /\{freshnessLabel\(fresh, lang\)\}/);
+    assert.match(UI, /t\('Restoring merges it with the local copy/);
+    assert.match(ZHP, /恢复会和本地那份合并/);
     /* 覆盖那个是这一页唯一有破坏性的，颜色要区分开 */
     assert.match(CSS, /\.backup-tag\.over \{[\s\S]{0,160}--warning/);
   });
@@ -562,12 +572,13 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
     for (const fake of ['my-kirolex-backup', 'ap-northeast-1', 'AKIA…', 'kirolex（可留空）']) {
       assert.equal(CONF.includes(`placeholder="${fake}"`), false, `${fake} 不该当 placeholder`);
     }
-    assert.match(CONF, /label="Key 前缀（可选）"/);
+    assert.match(CONF, /label=\{t\('Key prefix \(optional\)'\)\}/);
+    assert.match(ZHP, /'Key prefix \(optional\)': 'Key 前缀（可选）'/);
     const idx = (x: string): number => CONF.indexOf(x);
-    assert.ok(idx('label="Bucket"') < idx('label="Region"'));
-    assert.ok(idx('label="Region"') < idx('label="Access Key ID"'), 'region 放在 ak 前面');
-    assert.ok(idx('label="Access Key ID"') < idx('label="Secret"'));
-    assert.ok(idx('label="Secret"') < idx('label="Key 前缀（可选）"'), '可选的那个放最后');
+    assert.ok(idx('label="Bucket"') < idx("label={t('Region')}"));
+    assert.ok(idx("label={t('Region')}") < idx('label="Access Key ID"'), 'region 放在 ak 前面');
+    assert.ok(idx('label="Access Key ID"') < idx("label={t('Secret')}"));
+    assert.ok(idx("label={t('Secret')}") < idx("label={t('Key prefix (optional)')}"), '可选的那个放最后');
     /* 间隔是下拉，不是能敲任意数字的输入框 */
     assert.equal(/type="number"/.test(CONF), false);
     assert.match(CONF, /<select className="settings-select backup-interval"/);
@@ -671,7 +682,7 @@ describe('合并：桶里那份并进本地那条', () => {
   test('接线：合并前挪 trash、history.md 重建而不是照抄', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf("ipcMain.handle('s3:restore'");
-    const body = M.slice(at, at + 4200);
+    const body = M.slice(at, at + 4600);
     /* 合并是个算法，算法会有 bug —— "选了合并"不等于"愿意拿这条会话赌一次" */
     assert.match(body, /backedUp = trashDirFor\(KIROLEX_HOME, sessionId\)/);
     assert.match(body, /mergeTranscripts\(mine, body\.toString\('utf-8'\)\)/);
@@ -686,10 +697,12 @@ describe('合并：桶里那份并进本地那条', () => {
   test('界面上说清本地已有的会合并，并说清它不合模型的上下文', () => {
     const UI2 = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
     /* 行上的标现在是新旧对比，「会合并」放进了鼠标悬停提示里 */
-    assert.match(UI2, /恢复会和本地那份合并/);
+    assert.match(UI2, /t\('Restoring merges it with the local copy/);
+    assert.match(ZHP, /恢复会和本地那份合并/);
     assert.equal(/会覆盖本地/.test(UI2), false);
     /* 这是合并唯一的硬边界，必须在确认框里说 */
-    assert.match(UI2, /模型自己那套上下文在跑过它的那台机器上，不会一起合并/);
+    assert.match(UI2, /t\('Note: only the chat history is merged/);
+    assert.match(ZHP, /模型自己那套上下文在跑过它的那台机器上，不会一起合并/);
   });
 });
 
@@ -770,7 +783,8 @@ describe('两处显示上的收口', () => {
 
   test('但"测试对象没删掉"要原样说出来 —— 那是新信息，不是复述', () => {
     /* 那种情况下桶里真留了个东西，而且可能意味着这个 key 没有 DeleteObject */
-    assert.match(CONF3, /\/没删掉\/\.test\(String\(r\.message \|\| ''\)\)/);
+    /* 主进程那句现在按界面语言给（中文 "没删掉" / 英文 "could not be deleted"），两种都要认 */
+    assert.match(CONF3, /\/没删掉\|could not be deleted\/\.test\(String\(r\.message \|\| ''\)\)/);
   });
 
   test('标题上写清是哪个桶', () => {
@@ -778,7 +792,8 @@ describe('两处显示上的收口', () => {
     assert.match(UI3, /className="backup-where"/);
     assert.match(UI3, /\{where\.bucket\}\{where\.region \? ` \/ \$\{where\.region\}` : ''\}/);
     /* 还没配桶时也要说，而且指路到设置 */
-    assert.match(UI3, /还没配桶（设置 → ☁️ 备份）/);
+    assert.match(UI3, /t\('No bucket configured yet \(Settings → ☁️ Backup\)'\)/);
+    assert.match(ZHP, /还没配桶（设置 → ☁️ 备份）/);
     /* 凭据仍然只在设置里改 —— 这一页的 saveS3Config 只用来存"哪些项目不同步" */
     assert.equal(/bucket: cfg\.bucket/.test(UI3), false);
   });
@@ -813,25 +828,30 @@ describe('配置页只留有信息量的文字', () => {
 
   test('留下的两句各有理由', () => {
     /* ① 凭据会不会被传上去，是个真问题 */
-    assert.match(shown, /不含 <code>config\.json<\/code> 和日志/);
+    assert.match(shown, /\{t\('Only sessions, memory and attachments are uploaded, not '\)\}<code>config\.json<\/code>\{t\(' or logs\. Restore is under the '\)\}/);
+    assert.match(ZHP, /'Only sessions, memory and attachments are uploaded, not ': '只传会话、记忆层和附件，不含 '/);
+    assert.match(ZHP, /' or logs\. Restore is under the ': ' 和日志。恢复在侧栏那颗 '/);
     /* ② 不说的话人会在这一页找恢复 */
-    assert.match(shown, /恢复在侧栏那颗/);
+    assert.match(ZHP, /恢复在侧栏那颗/);
   });
 
   test('Secret 那条只留"需要哪些权限"——那是你真要去授的东西', () => {
-    assert.match(shown, /需要 s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject。/);
+    assert.match(shown, /t\('Needs s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject\.'\)/);
+    assert.match(ZHP, /需要 s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject。/);
     /* DeleteObject 要在里面：测连通现在写完会删掉那个对象 */
     assert.match(shown, /DeleteObject/);
   });
 
   test('但没有 keychain 那条**警告**要留着 —— 它解释了为什么 Secret 那栏是灰的', () => {
     /* 警告不是描述：它只在真有问题时出现，而且解释了一个当场看得见的现象 */
-    assert.match(CONF4, /没有可用的加密存储（keychain \/ keyring）/);
+    assert.match(CONF4, /t\('No encrypted storage \(keychain \/ keyring\) is available on this machine/);
+    assert.match(ZHP, /没有可用的加密存储（keychain \/ keyring）/);
     assert.match(CONF4, /disabled=\{!cfg\.encryptionAvailable\}/);
   });
 
   test('"上一次同步"那行状态也留着 —— 它回答"备份到底在不在跑"', () => {
-    assert.match(shown, /上一次：/);
+    assert.match(shown, /t\('Last run: \{at\} · uploaded \{n\} \/ \{size\}'/);
+    assert.match(ZHP, /'上一次：\{at\}/);
   });
 });
 
@@ -887,7 +907,9 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
       已经传上去的还在桶里 —— `mergeCatalog` 会把老条目并进来，所以它们照旧可以恢复。
       界面上要说出来，否则"关了它怎么还在列表里"看起来像开关没生效。
     */
-    assert.match(UI5, /停止继续备份<\/b>，不是删掉已有备份/);
+    assert.match(UI5, /<b>\{t\('stops further backups'\)\}<\/b>\{t\(', it does not delete existing backups\./);
+    assert.match(ZHP, /'stops further backups': '停止继续备份'/);
+    assert.match(ZHP, /'，不是删掉已有备份/);
     const S = fs.readFileSync(path.join(process.cwd(), 'src/main/s3Sync.ts'), 'utf8');
     assert.match(S, /已经传上去的不会被删/);
   });
@@ -924,7 +946,7 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
     /* 列表是一次网络请求，只开同步 tab 的人不该付这个钱 */
     assert.match(UI5, /if \(tab === 'restore' && !entries\) void loadBackups\(\);/);
     /* tab 上带计数：不点进去也知道有多少 */
-    assert.match(UI5, /同步\{projects \? ` \(\$\{syncingCount\}\/\$\{projects\.length\}\)` : ''\}/);
+    assert.match(UI5, /\{t\('Sync'\)\}\{projects \? ` \(\$\{syncingCount\}\/\$\{projects\.length\}\)` : ''\}/);
   });
 
   test('恢复那页按项目分组、组头粘顶、能收起', () => {
@@ -954,7 +976,7 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
   });
 
   test('未分组要有个名字，否则它是一行空白', () => {
-    assert.match(UI5, /const projectLabel = \(p\?: string\): string => \(p && p\.trim\(\) \? p : '未分组'\)/);
+    assert.match(UI5, /const projectLabel = \(p: string \| undefined, t: \(k: string\) => string\): string => \(p && p\.trim\(\) \? p : t\('Unassigned'\)\)/);
   });
 });
 
@@ -1042,11 +1064,15 @@ describe('每条会话的最新同步时间', () => {
   test('界面上"时间未知"和"没备份过"要分开说', () => {
     const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
     /* 编一个时间比说"不知道"糟 —— 假时间会被拿去判断备份新不新 */
-    assert.match(UI, /x\.state === 'synced' \? '已同步（时间未知）' : '—'/);
-    assert.match(UI, /没备份过/);
-    assert.match(UI, /有改动待同步/);
+    assert.match(UI, /x\.state === 'synced' \? t\('Synced \(time unknown\)'\) : '—'/);
+    assert.match(ZHP, /'Synced \(time unknown\)': '已同步（时间未知）'/);
+    assert.match(UI, /t\('Never backed up'\)/);
+    assert.match(ZHP, /没备份过/);
+    assert.match(UI, /t\('Changes waiting to sync'\)/);
+    assert.match(ZHP, /有改动待同步/);
     /* 收起时组头也要能看出"这摊有几条没同步" */
-    assert.match(UI, /\$\{behind\} 条待同步/);
+    assert.match(UI, /t\('\{behind\} waiting to sync', \{ behind \}\)/);
+    assert.match(ZHP, /'\{behind\} 条待同步'/);
   });
 
   test('删掉一个项目的备份要连状态表和 mark 表一起清', () => {

@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import { useT } from '../hooks/useLang';
 
 /**
  * **机器人按钮里 Agent 之外的那几个 tab** —— 每个 tab 都是"文件列表 + 编辑器"，
@@ -29,17 +30,17 @@ interface Entry { name: string; size: number; label?: string; readOnly?: boolean
 const api = () => (window as any).kiroApi;
 
 /** JSON 校验：给出行号，和 Agents tab 那边的体验一致。 */
-function jsonError(text: string): string | null {
+function jsonError(text: string, t: (k: string, v?: Record<string, string | number>) => string): string | null {
   try {
     const v = JSON.parse(text);
-    if (!v || typeof v !== 'object' || Array.isArray(v)) return '必须是一个 JSON 对象';
+    if (!v || typeof v !== 'object' || Array.isArray(v)) return t('Must be a JSON object');
     return null;
   } catch (e: any) {
     const msg = String(e?.message || e);
     const pos = /position (\d+)/.exec(msg);
     if (pos) {
       const line = text.slice(0, Number(pos[1])).split('\n').length;
-      return `第 ${line} 行：${msg}`;
+      return t('Line {line}: {msg}', { line, msg });
     }
     return msg;
   }
@@ -50,6 +51,7 @@ export const KiroConfigPanel: React.FC<{
   category: KiroConfigCategory;
   onClose: () => void;
 }> = ({ sessionId, category, onClose }) => {
+  const t = useT();
   const [where, setWhere] = useState('');
   const [entries, setEntries] = useState<Entry[]>([]);
   const [listError, setListError] = useState<string | null>(null);
@@ -69,12 +71,12 @@ export const KiroConfigPanel: React.FC<{
     setLoading(true); setStatus(null);
     try {
       const r = await api().kiroConfigRead(sessionId, category.id, name);
-      if (!r?.ok) { setStatus({ text: r?.error || '读不到', ok: false }); return; }
+      if (!r?.ok) { setStatus({ text: r?.error || t('Could not read'), ok: false }); return; }
       if (r.where) setWhere(r.where);
       setSelected(name); setPath(r.path || ''); setContent(r.content || ''); setInitial(r.content || '');
       setExists(r.exists !== false);
     } finally { setLoading(false); }
-  }, [sessionId, category.id]);
+  }, [sessionId, category.id, t]);
 
   const refresh = useCallback(async (pick?: string) => {
     setListError(null);
@@ -87,21 +89,21 @@ export const KiroConfigPanel: React.FC<{
     setLoading(true);
     const r = await api().kiroConfigList(sessionId, category.id).finally(() => setLoading(false));
     setWhere(r?.where || '');
-    if (!r?.ok) { setListError(r?.error || '列不出来'); setEntries([]); return; }
+    if (!r?.ok) { setListError(r?.error || t('Could not list')); setEntries([]); return; }
     const list: Entry[] = r.entries || [];
     setEntries(list);
     /* 打开刚建的那个，或者第一个 */
     if (pick) void open(pick);
     else if (list.length) void open(list[0].name);
     else { setSelected(undefined); setContent(''); setInitial(''); setPath(''); }
-  }, [sessionId, category.id, category.kind, open]);
+  }, [sessionId, category.id, category.kind, open, t]);
 
   /* 换 tab 就是换一个组件实例（key=category.id），所以这里只在挂载时拉一次 */
   useEffect(() => { void refresh(); }, [refresh]);
 
   const invalid = useMemo(
-    () => (category.json && content.trim() ? jsonError(content) : null),
-    [category.json, content],
+    () => (category.json && content.trim() ? jsonError(content, t) : null),
+    [category.json, content, t],
   );
   const dirty = content !== initial;
   const selectedEntry = entries.find((e) => e.name === selected);
@@ -112,23 +114,23 @@ export const KiroConfigPanel: React.FC<{
     setSaving(true); setStatus(null);
     try {
       const r = await api().kiroConfigWrite(sessionId, category.id, selected, content);
-      if (!r?.ok) { setStatus({ text: r?.error || '没存上', ok: false }); return; }
+      if (!r?.ok) { setStatus({ text: r?.error || t('Not saved'), ok: false }); return; }
       setInitial(content); setExists(true); setPath(r.path || path);
-      setStatus({ text: `已保存${where ? `（${where}）` : ''}`, ok: true });
+      setStatus({ text: where ? t('Saved ({where})', { where }) : t('Saved'), ok: true });
       if (category.kind === 'list') void api().kiroConfigList(sessionId, category.id).then((x: any) => x?.ok && setEntries(x.entries || []));
     } finally { setSaving(false); }
-  }, [canEdit, invalid, saving, dirty, exists, sessionId, category.id, category.kind, selected, content, path, where]);
+  }, [canEdit, invalid, saving, dirty, exists, sessionId, category.id, category.kind, selected, content, path, where, t]);
 
   const create = useCallback(async () => {
     let n = String(newName || '').trim();
     if (!n) return;
     if (category.ext && !n.toLowerCase().endsWith(category.ext)) n += category.ext;
-    if (entries.some((e) => e.name === n)) { setStatus({ text: `${n} 已经有了`, ok: false }); return; }
+    if (entries.some((e) => e.name === n)) { setStatus({ text: t('{name} already exists', { name: n }), ok: false }); return; }
     const r = await api().kiroConfigWrite(sessionId, category.id, n, `# ${n.replace(/\.[^.]+$/, '')}\n\n`);
-    if (!r?.ok) { setStatus({ text: r?.error || '建不了', ok: false }); return; }
+    if (!r?.ok) { setStatus({ text: r?.error || t('Could not create'), ok: false }); return; }
     setNewName(null);
     await refresh(n);
-  }, [newName, category.ext, category.id, entries, sessionId, refresh]);
+  }, [newName, category.ext, category.id, entries, sessionId, refresh, t]);
 
   const format = () => {
     try { setContent(`${JSON.stringify(JSON.parse(content), null, 2)}\n`); } catch { /* 有错就不动 */ }
@@ -139,7 +141,7 @@ export const KiroConfigPanel: React.FC<{
       <div className="agent-config-editor-workspace kiro-config-workspace">
         <aside className="agent-config-agent-list" aria-label={category.label}>
           <div className="agent-config-group-head">
-            <span title="这台机器上的 kiro-cli 读的就是这一份">{where || '…'}</span>
+            <span title={t('This is the copy the kiro-cli on this machine reads')}>{where || '…'}</span>
             {category.kind === 'list' && <span>{entries.length}</span>}
           </div>
           {listError && <div className="agent-config-readonly-note"><span>{listError}</span></div>}
@@ -161,19 +163,19 @@ export const KiroConfigPanel: React.FC<{
                   {shown}
                   {dir && !e.label && !/skills$/.test(category.id) && <span className="kiro-config-row-dir"> {dir}</span>}
                 </span>
-                {selected === e.name && dirty && <span className="agent-config-row-dirty" title="有未保存的改动" />}
-                <span className="kiro-config-row-size">{category.kind === 'single' && !e.size ? '' : e.size < 0 ? '还没有' : e.size < 1024 ? `${e.size} B` : `${(e.size / 1024).toFixed(1)} KB`}</span>
+                {selected === e.name && dirty && <span className="agent-config-row-dirty" title={t('Unsaved changes')} />}
+                <span className="kiro-config-row-size">{category.kind === 'single' && !e.size ? '' : e.size < 0 ? t('None yet') : e.size < 1024 ? `${e.size} B` : `${(e.size / 1024).toFixed(1)} KB`}</span>
               </button>
             );
           })}
           {category.creatable && (newName === null ? (
-            <button className="agent-config-row kiro-config-new" onClick={() => setNewName('')}>＋ 新建</button>
+            <button className="agent-config-row kiro-config-new" onClick={() => setNewName('')}>{t('+ New')}</button>
           ) : (
             <div className="kiro-config-new-row">
               <input
                 className="settings-input"
                 autoFocus
-                placeholder={`名字${category.ext ? `（${category.ext} 可省）` : ''}`}
+                placeholder={category.ext ? t('Name ({ext} optional)', { ext: category.ext }) : t('File name')}
                 value={newName}
                 onChange={(ev) => setNewName(ev.target.value)}
                 onKeyDown={(ev) => {
@@ -187,15 +189,15 @@ export const KiroConfigPanel: React.FC<{
 
         <div className="agent-config-editor-body">
           <div className="agent-config-editor-selection">
-            <strong>{category.kind === 'single' ? category.file : (selectedEntry?.label || selected || '（选一个）')}</strong>
-            {selectedEntry?.readOnly && <span className="kiro-config-ro-tag">插件 · 只读</span>}
+            <strong>{category.kind === 'single' ? category.file : (selectedEntry?.label || selected || t('(pick one)'))}</strong>
+            {selectedEntry?.readOnly && <span className="kiro-config-ro-tag">{t('Plugin · read-only')}</span>}
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
-          <div className="kiro-config-hint">{category.hint}{!exists && ' · 这个文件还不存在，保存就会建出来。'}</div>
+          <div className="kiro-config-hint">{category.hint}{!exists && ` · ${t('This file does not exist yet; saving will create it.')}`}</div>
           {loading ? (
-            <div className="agent-config-editor-message">Loading…</div>
+            <div className="agent-config-editor-message">{t('Loading…')}</div>
           ) : category.kind === 'list' && !selected ? (
-            <div className="agent-config-editor-message"><span>这里还没有{category.label}。{category.creatable ? '点左边「＋ 新建」。' : ''}</span></div>
+            <div className="agent-config-editor-message"><span>{t('No {label} here yet.', { label: category.label })}{category.creatable ? t(' Click "+ New" on the left.') : ''}</span></div>
           ) : (
             <>
               <div className={`agent-config-editor-shell ${invalid ? 'invalid' : 'valid'}`}>
@@ -213,7 +215,7 @@ export const KiroConfigPanel: React.FC<{
               </div>
               {category.json && (invalid
                 ? <div className="agent-config-validation invalid"><span>{invalid}</span></div>
-                : <div className="agent-config-validation valid">✓ Valid JSON</div>)}
+                : <div className="agent-config-validation valid">{t('✓ Valid JSON')}</div>)}
             </>
           )}
         </div>
@@ -221,16 +223,16 @@ export const KiroConfigPanel: React.FC<{
       <div className="agent-config-editor-actions">
         {status && <span className={status.ok ? 'saved' : 'error'}>{status.text}</span>}
         {category.json && (
-          <button className="btn deny" onClick={format} disabled={!canEdit || !!invalid}>Format JSON</button>
+          <button className="btn deny" onClick={format} disabled={!canEdit || !!invalid}>{t('Format JSON')}</button>
         )}
-        <button className="btn deny" onClick={onClose}>Close</button>
+        <button className="btn deny" onClick={onClose}>{t('Close')}</button>
         {!category.readOnly && (
           <button
             className="btn allow"
             onClick={() => void save()}
             disabled={!canEdit || !!invalid || saving || (!dirty && exists)}
           >
-            {saving ? 'Saving…' : 'Save'}
+            {saving ? t('Saving…') : t('Save')}
           </button>
         )}
       </div>

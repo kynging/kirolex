@@ -61,7 +61,7 @@ describe('kiro 专有的东西对另外两家关掉', () => {
     assert.doesNotMatch(M, /会话目前只能在本机跑/);
     /* kiro 那套 preflight（查 kiro-cli / 登录 / 模型清单）对另外两家换成"适配器在不在" */
     assert.equal((M.match(/await remoteAdapterCheck\(/g) || []).length, 5, '新建 / 换机器 / 重连 / 换引擎 / 换组合 五处');
-    assert.match(M, /会装上它（\$\{ADAPTER_PACKAGE\[engine\]\}）/);
+    assert.match(M, /will install it \(\{pkg\}\)[\s\S]{0,300}pkg: ADAPTER_PACKAGE\[engine\]/);
   });
 
   test('远程会话的本地工具通道：kiro 走 agent 文件，另外两家走 ACP 的 mcpServers', () => {
@@ -73,8 +73,8 @@ describe('kiro 专有的东西对另外两家关掉', () => {
 
   test('不走 kiro 的模型降级；换模型 / 换 kiro agent 对它们直接说明', () => {
     assert.match(M, /if \(engine !== 'kiro'\) \{\s*const client = new AcpClient\(profile\.model, shellEnv, undefined, profile\.permissionMode, profile\.remote, localTools, engine\);/);
-    assert.match(M, /会话的模型在它自己的 CLI 里配，这里还不能切/);
-    assert.match(M, /kiro agent 只对 Kiro 会话有用/);
+    assert.match(M, /session is configured in its own CLI; it cannot be switched here yet/);
+    assert.match(M, /A kiro agent only applies to Kiro sessions/);
   });
 });
 
@@ -217,7 +217,7 @@ describe('本机工作目录 ——「本机应该有工作目录这个功能，
 
   test('设置页：本机有「工作目录」，没有「更新本机的 kiro-cli」那颗按钮', () => {
     const RS = read('src', 'renderer', 'components', 'RemoteSettings.tsx');
-    assert.match(RS, /<Field label="工作目录" hint="没归项目的本地会话/);
+    assert.match(RS, /<Field label=\{t\('Working directory'\)\} hint=\{t\('Local sessions without a project work in this directory/);
     assert.match(RS, /localSaveWorkdir\?\.\(localWorkdir\)/);
     assert.doesNotMatch(RS, /KiroVersionRow/);
     assert.doesNotMatch(RS, /'更新本机的 kiro-cli'/);
@@ -257,7 +257,7 @@ describe('已有会话换引擎 ——「我还需要现有会话也能切换 ag
 
   test('界面：右键「运行引擎」三选一，换完 tag 当场变', () => {
     const SB = read('src', 'renderer', 'components', 'Sidebar.tsx');
-    assert.match(SB, /<Submenu label=\{`🤖 运行引擎：\$\{ENGINE_NAMES\[ctxSession\.engine \|\| 'kiro'\]\}`\}>/);
+    assert.match(SB, /<Submenu label=\{t\('🤖 Engine: \{engine\}', \{ engine: ENGINE_NAMES\[ctxSession\.engine \|\| 'kiro'\] \}\)\}>/);
     assert.match(SB, /api\.switchEngine\(sessionId, engine, \{ projectId \}\)/);
     const HK = read('src', 'renderer', 'hooks', 'useAcp.ts');
     assert.match(HK, /onEngineChanged\?\.\(/);

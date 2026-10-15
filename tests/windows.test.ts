@@ -255,7 +255,7 @@ describe('提示语和换行', () => {
 
   test('"绝对路径"的说明不写死 `/`', async () => {
     const P = fs.readFileSync(path.join(process.cwd(), 'src/main/projectStore.ts'), 'utf8');
-    assert.ok(P.includes('C:\\\\Users\\\\你\\\\项目'), 'Windows 上要给 Windows 的例子');
+    assert.ok(P.includes("tr('Must be an absolute path (like C:\\\\Users\\\\you\\\\project)')"), 'Windows 上要给 Windows 的例子');
   });
 
   test('.gitattributes 钉住 .sh 的 LF', () => {
@@ -327,7 +327,7 @@ describe('模型列出来的选项变成可点的片', () => {
       而万一认错了，填进去还能删，发出去就收不回。
     */
     assert.match(CA, /onClick=\{\(\) => setInput\(\(prev\) =>/);
-    assert.match(CA, /不会直接发送/);
+    assert.match(CA, /not sent yet/);
     /* 流式过程中不显示：那份文字是半截的，片会一项一项闪出来 */
     assert.match(CA, /\{!isStreaming && !isLooping && choiceChips\.length > 0 && \(/);
     /* 最后说话的是用户 → 没有待答的问题 */
@@ -403,7 +403,7 @@ describe('`/model` `/agent` 走 KiroLex 自己的下拉', () => {
     assert.match(CA, /if \(isModel\) onModelChange\(exact\); else onKiroAgentChange\(exact\);/);
     /* 对不上时说清，并指回下拉 */
     assert.match(CA, /setLocalNotice\(matches\.length/);
-    assert.match(CA, /会把下拉打开/);
+    assert.match(CA, /to open the dropdown/);
   });
 
   test('那句本地提示和主进程那条共用同一个位置，换会话清掉', () => {

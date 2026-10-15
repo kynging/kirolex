@@ -21,6 +21,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { tr } from './uiText.ts';
 
 /** kiro 的六类 + Claude Code / Codex 各自的那几类（id 带引擎前缀，三家放在一张表里不撞名）。 */
 export type KiroConfigCategory = 'mcp' | 'steering' | 'prompts' | 'skills' | 'powers' | 'settings' | string;
@@ -69,30 +70,30 @@ export interface CategorySpec {
 export const CATEGORIES: CategorySpec[] = [
   {
     id: 'mcp', label: 'MCP', root: 'settings', kind: 'single', file: 'mcp.json', json: true,
-    hint: '全局 MCP server（所有 agent 共用）。某个 agent 自己的 mcpServers 在 Agents 里改。',
+    hint: "Global MCP servers (shared by every agent). An agent's own mcpServers are edited under Agents.",
   },
   {
     id: 'steering', label: 'Steering', root: 'steering', kind: 'list', match: /\.md$/i, depth: 3,
     creatable: true, ext: '.md',
-    hint: '常驻规则：每一轮都会带给模型。',
+    hint: "Standing rules: sent to the model on every turn.",
   },
   {
     id: 'prompts', label: 'Prompts', root: 'prompts', kind: 'list', match: /\.md$/i, depth: 2,
     creatable: true, ext: '.md',
-    hint: '存下来的提示词，在会话里用 @名字 调出来。',
+    hint: "Saved prompts. Call one up in a session with @name.",
   },
   {
     id: 'skills', label: 'Skills', root: 'skills', kind: 'list', match: /^[^/]+\/SKILL\.md$/, depth: 2,
-    hint: '每个 skill 的 SKILL.md（同目录下的脚本/参考文件不在这里改）。',
+    hint: "Each skill's SKILL.md (scripts/reference files in the same folder are not edited here).",
   },
   {
     id: 'powers', label: 'Powers', root: 'powers', kind: 'single', file: 'installed.json', json: true,
     readOnly: true,
-    hint: '已安装的 Powers —— 由 kiro-cli 管理，这里只看不改（手改会和它的安装记录打架）。',
+    hint: "Installed Powers, managed by kiro-cli. View only here (editing by hand would conflict with its install records).",
   },
   {
     id: 'settings', label: 'Settings', root: 'settings', kind: 'single', file: 'cli.json', json: true,
-    hint: 'kiro-cli settings（默认模型、autoApprove、MCP 超时…）。和 `kiro-cli settings <键> <值>` 是同一个文件。',
+    hint: "kiro-cli settings (default model, autoApprove, MCP timeouts...). Same file as `kiro-cli settings <key> <value>`.",
   },
 ];
 
@@ -104,54 +105,55 @@ export const CATEGORIES: CategorySpec[] = [
 CATEGORIES.push(
   {
     id: 'claude-settings', engine: 'claude', base: '.claude', label: 'Settings', root: '', kind: 'single', file: 'settings.json', json: true,
-    hint: 'Claude Code 的用户设置（env 里是网关地址和 key、permissions、model…）。远程会话改的是那台机器上的这份。',
+    hint: "Claude Code user settings (env holds the gateway URL and key; also permissions, model...). For remote sessions this edits the copy on that machine.",
   },
   {
     id: 'claude-memory', engine: 'claude', base: '.claude', label: 'CLAUDE.md', root: '', kind: 'single', file: 'CLAUDE.md',
-    hint: '用户级的常驻说明：每个会话都会读它（和 kiro 的 Steering 一个用途）。',
+    hint: "User-level standing instructions: every session reads it (same purpose as kiro's Steering).",
   },
   {
     id: 'claude-agents', engine: 'claude', base: '.claude', label: 'Agents', root: 'agents', kind: 'list', match: /\.md$/i, depth: 1,
     creatable: true, ext: '.md', pluginDir: 'agents',
-    hint: '子代理定义（每个一份 .md，开头是 YAML front matter）。标着插件名的是插件带的，只读。',
+    hint: "Subagent definitions (one .md each, starting with YAML front matter). Entries tagged with a plugin name come from plugins and are read-only.",
   },
   {
     id: 'claude-commands', engine: 'claude', base: '.claude', label: 'Commands', root: 'commands', kind: 'list', match: /\.md$/i, depth: 2,
     creatable: true, ext: '.md', pluginDir: 'commands',
-    hint: '自定义斜杠命令：文件名就是命令名（/名字）。标着插件名的是插件带的（/插件:名字），只读。',
+    hint: "Custom slash commands: the file name is the command name (/name). Entries tagged with a plugin name come from plugins (/plugin:name) and are read-only.",
   },
   {
     id: 'claude-skills', engine: 'claude', base: '.claude', label: 'Skills', root: 'skills', kind: 'list', match: /^[^/]+\/SKILL\.md$/, depth: 2,
     pluginDir: 'skills',
-    hint: '每个 skill 的 SKILL.md（同目录下的脚本/参考文件不在这里改）。标着插件名的是插件带的，只读。',
+    hint: "Each skill's SKILL.md (scripts/reference files in the same folder are not edited here). Entries tagged with a plugin name come from plugins and are read-only.",
   },
   {
     id: 'claude-plugins', engine: 'claude', base: '.claude', label: 'Plugins', root: 'plugins', kind: 'single', file: 'installed_plugins.json',
     json: true, readOnly: true,
-    hint: '装了哪些插件（由 Claude Code 管理，这里只看）。装 / 卸用 `claude plugin install|uninstall`；开关在 Settings 的 enabledPlugins。',
+    hint: "Installed plugins (managed by Claude Code, view only here). Install / uninstall with `claude plugin install|uninstall`; toggle them via enabledPlugins in Settings.",
   },
   {
     id: 'codex-config', engine: 'codex', base: '.codex', label: 'config.toml', root: '', kind: 'single', file: 'config.toml',
-    hint: 'Codex 的配置（model、model_provider、[model_providers.*]、MCP、sandbox…）。是 TOML，不是 JSON。',
+    hint: "Codex config (model, model_provider, [model_providers.*], MCP, sandbox...). It is TOML, not JSON.",
   },
   {
     id: 'codex-agents', engine: 'codex', base: '.codex', label: 'AGENTS.md', root: '', kind: 'single', file: 'AGENTS.md',
-    hint: '用户级的常驻说明：每个会话都会读它。',
+    hint: "User-level standing instructions: every session reads it.",
   },
   {
     id: 'codex-prompts', engine: 'codex', base: '.codex', label: 'Prompts', root: 'prompts', kind: 'list', match: /\.md$/i, depth: 1,
     creatable: true, ext: '.md',
-    hint: '自定义提示词：文件名就是命令名（/prompts:名字）。',
+    hint: "Custom prompts: the file name is the command name (/prompts:name).",
   },
   {
     id: 'codex-skills', engine: 'codex', base: '.codex', label: 'Skills', root: 'skills', kind: 'list', match: /^[^/]+\/SKILL\.md$/, depth: 2,
-    hint: '每个 skill 的 SKILL.md。',
+    hint: "Each skill's SKILL.md.",
   },
 );
 
 /** 某个引擎的那几类（机器人面板的 tab）。 */
 export function categoriesFor(engine: 'kiro' | 'claude' | 'codex' = 'kiro'): CategorySpec[] {
-  return CATEGORIES.filter((c) => (c.engine || 'kiro') === engine);
+  /* hint 是给人看的：表里存英文 key，这里按当前界面语言翻（词条在 uiTextZh/modulesB.ts） */
+  return CATEGORIES.filter((c) => (c.engine || 'kiro') === engine).map((c) => ({ ...c, hint: tr(c.hint) }));
 }
 
 /** 相对家目录的根：`.kiro/steering`、`.claude`（单文件直接放在 base 下时 root 是空的）。 */
@@ -206,14 +208,14 @@ export function entryPath(home: string, spec: CategorySpec, name?: string): stri
 
 /** 保存前的内容校验。返回一句给人看的错误，或 `null`。 */
 export function validateContent(spec: CategorySpec, content: string): string | null {
-  if (spec.readOnly) return `${spec.label} 由 kiro-cli 管理，这里不能改。`;
-  if (content.length > 1024 * 1024) return '超过 1 MB —— 这么大的配置多半是贴错了东西。';
+  if (spec.readOnly) return tr('{label} is managed by kiro-cli and cannot be edited here.', { label: spec.label });
+  if (content.length > 1024 * 1024) return tr('Larger than 1 MB. A config this big is most likely something pasted by mistake.');
   if (spec.json) {
     try {
       const v = JSON.parse(content);
-      if (!v || typeof v !== 'object' || Array.isArray(v)) return '必须是一个 JSON 对象。';
+      if (!v || typeof v !== 'object' || Array.isArray(v)) return tr('Must be a JSON object.');
     } catch (e: any) {
-      return `JSON 有错：${e?.message || e}`;
+      return tr('JSON error: {err}', { err: e?.message || e });
     }
   }
   return null;
@@ -301,7 +303,7 @@ export function pickEntries(spec: CategorySpec, lines: string[]): ConfigEntry[] 
 
 /** 插件带的条目不许写 —— 插件一更新就会被它自己的版本盖回去，改了也白改。 */
 export function pluginWriteError(name?: string): string | null {
-  return isPluginName(name) ? '这是插件带的，只读（改它会在插件更新时被盖掉）。要改就在 Skills / Commands / Agents 里建一份自己的同名文件。' : null;
+  return isPluginName(name) ? tr('This comes from a plugin and is read-only (edits would be overwritten when the plugin updates). To change it, create your own file with the same name under Skills / Commands / Agents.') : null;
 }
 
 /* ------------------------------------------------------------------ 本机 */
@@ -362,7 +364,7 @@ export class LocalKiroConfig {
 
   read(spec: CategorySpec, name?: string): { path: string; content: string; exists: boolean } | { error: string } {
     const p = entryPath(this.home, spec, name);
-    if (!p) return { error: '名字不合规。' };
+    if (!p) return { error: tr('Invalid name.') };
     try { return { path: p, content: fs.readFileSync(p, 'utf-8'), exists: true }; } catch (e: any) {
       if (e?.code === 'ENOENT') return { path: p, content: spec.json ? '{}\n' : '', exists: false };
       return { error: e?.message || String(e) };
@@ -373,7 +375,7 @@ export class LocalKiroConfig {
     const why = validateContent(spec, content) || pluginWriteError(name);
     if (why) return { error: why };
     const p = entryPath(this.home, spec, name);
-    if (!p) return { error: '名字不合规。' };
+    if (!p) return { error: tr('Invalid name.') };
     /* 原子写：kiro-cli 随时可能在读它，写一半被读到就是一份坏配置 */
     const tmp = `${p}.kirolex-${process.pid}.tmp`;
     try {

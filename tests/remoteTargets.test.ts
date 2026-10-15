@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
+import { t } from '../src/renderer/i18n.ts';
 import { parseRemoteTargets, listRemoteTargets, findRemoteTarget, deriveLabel, expandHome } from '../src/main/remoteTargets.ts';
 
 /*
@@ -128,7 +129,7 @@ describe('接线：主进程', () => {
   });
 
   test('找不到那个 id 就不建会话（**不猜**一台机器）', () => {
-    assert.match(M, /找不到远端目标/);
+    assert.match(M, /tr\('Remote target \{id\} not found/);
   });
 
   test('机器列表能查（那套"同步状态"的订阅/查询随镜像一起删掉了）', () => {
@@ -152,7 +153,7 @@ describe('接线：渲染进程', () => {
 
   test('新建对话框里有目标选择，而且**记住你上一次选的那台**', () => {
     assert.match(A, /remoteTargets\.enabled && remoteTargets\.targets\.length > 0/);
-    assert.match(A, /<option value="">本地<\/option>/);
+    assert.match(A, /<option value="">\{t\('Local'\)\}<\/option>/);
     /*
       **不再每次启动都退回本地** ——「新建的会话应该刚开始就有远程 tag」
       「为什么新会话又变成本地了」。
@@ -363,7 +364,7 @@ describe('一键装齐远端依赖', () => {
 
   test('接线：按钮在设置里，且只有你按才会跑（没有自动触发）', () => {
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
-    assert.match(RS, />\{installing \? '安装中…' : '安装 AI 工具'\}</);
+    assert.match(RS, />\{installing \? t\('Installing…'\) : t\('Install AI tools'\)\}</);
     assert.match(RS, /remoteBootstrap\?\.\(/);
     assert.match(RS, /className="remote-log"/, '输出要看得见');
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
@@ -396,19 +397,19 @@ describe('远端机器那一块的形状', () => {
 
   test('下拉选机器，而不是一行一台各带四个按钮', () => {
     assert.match(RS, /<select/);
-    assert.match(RS, /\+ 添加一台机器…/);
+    assert.match(RS, /t\('\+ Add a machine…'\)/);
     /* 上一版每行四个按钮，实测只有 43–63px 宽，机器一多就是一片按钮 */
     assert.equal(/className="remote-row"/.test(RS), false, '行式列表已经换掉了');
     /* 同一时刻只在编辑一台，所以**机器级**的动作按钮只有一组（测试连接 / 安装 AI 工具 / 删除）。
        每个工具自己那个「测试」是另一件事 —— 它问的是"这条命令能不能起来"，不是"这台机器连不连得上"。 */
-    assert.equal((RS.match(/>测试连接</g) || []).length, 1);
-    assert.equal((RS.match(/>安装 AI 工具</g) || []).length, 0, '安装 AI 工具那个按钮带状态文案');
-    assert.match(RS, /\{installing \? '安装中…' : '安装 AI 工具'\}/);
+    assert.equal((RS.match(/>\{t\('Test connection'\)\}</g) || []).length, 1);
+    assert.equal((RS.match(/>\{t\('Install AI tools'\)\}</g) || []).length, 0, '安装 AI 工具那个按钮带状态文案');
+    assert.match(RS, /\{installing \? t\('Installing…'\) : t\('Install AI tools'\)\}/);
   });
 
   test('密钥用 Finder 选，不让人手写路径', () => {
     assert.match(RS, /remotePickKey\?\.\(\)/);
-    assert.match(RS, /选择密钥…/);
+    assert.match(RS, /t\('Choose key…'\)/);
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf("ipcMain.handle('remote:pick-key'");
     assert.ok(at > 0, '主进程要有这个 IPC');
@@ -478,7 +479,7 @@ describe('侧栏那个 🌐 徽标真的到得了界面', () => {
     const body = SB.slice(at, at + 900);
     assert.ok(body.indexOf('setPendingTarget(sessionId, remoteId ?') < body.indexOf('api.setRemoteTarget(sessionId, remoteId, undefined, { projectId })'), '先挂 tag 再等 IPC');
     assert.match(body, /\.finally\(\(\) => setPendingTarget\(sessionId, undefined\)\)/);
-    assert.match(SB, /⏳ \{pendingTarget \|\| '本地'\}/);
+    assert.match(SB, /⏳ \{pendingTarget \|\| t\('Local'\)\}/);
   });
 
   test('它和"此刻在发生什么"分开：身份固定，状态会来会走', () => {
@@ -514,7 +515,9 @@ describe('工具调用要标出跑在哪台机器上', () => {
   });
 
   test('文件面板要说清"远端改的、打开的是本地那一份"', () => {
-    assert.match(CA, /在 \$\{remoteHost\} 上改的；这里打开的是已同步回本地的那一份/);
+    // 文案接进了翻译：调用点是英文 key，中文表里还是原来那句话
+    assert.match(CA, /t\('Changed on \{host\}; this opens the copy already synced back locally', \{ host: remoteHost \}\)/);
+    assert.equal(t('zh', 'Changed on {host}; this opens the copy already synced back locally', { host: 'h' }), '在 h 上改的；这里打开的是已同步回本地的那一份');
   });
 
   test('样式和侧栏那个 🌐 同一个色相 —— 看到一次就认得', () => {
@@ -558,7 +561,7 @@ describe('徽标显示配置里的名字，不是 IP', () => {
     assert.match(M, /hostLabel: labelForHost\(KIROLEX_CONFIG_PATH, remote\.sshHost\) \|\| remote\.sshHost,/);
     /* 连接/预检那些消息照旧用 sshHost —— 那些话讲的是"连到哪儿"，IP 才是有用的 */
     const PF = fs.readFileSync(path.join(process.cwd(), 'src/main/remotePreflight.ts'), 'utf8');
-    assert.match(PF, /连不上 \$\{host\}/);
+    assert.match(PF, /tr\('Cannot connect to \{host\}: \{why\}\..*\{ host, why \}\)/);
     assert.match(PF, /const host = remote\.sshHost/);
   });
 });
@@ -715,7 +718,7 @@ describe('远端配置自动保存（没有保存按钮）', () => {
   });
 
   test('要有一句"存了没" —— 没有按钮时人得知道改动算不算数', () => {
-    assert.match(RS, /saving \? '正在保存…' : '改动自动保存'/);
+    assert.match(RS, /saving \? t\('Saving…'\) : t\('Changes are saved automatically'\)/);
   });
 });
 
@@ -763,8 +766,8 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
 
   test('输入框都有常驻标签 —— placeholder 一打字就没了', () => {
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
-    for (const label of ['名称', 'IP 地址', '用户名', '端口', '私钥', '工作目录']) {
-      assert.ok(RS.includes(`label="${label}"`), `缺标签 ${label}`);
+    for (const label of ['Name', 'IP address', 'Username', 'Port', 'Private key', 'Working directory']) {
+      assert.ok(RS.includes(`label={t('${label}')}`), `缺标签 ${label}`);
     }
     assert.match(RS, /const Field: React\.FC</);
   });
@@ -854,7 +857,7 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
     assert.equal(joinSshHost('', '1.2.3.4'), '1.2.3.4');
     assert.equal(DEFAULT_WORKDIR, '~/kirolex');
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
-    assert.ok(RS.includes('label="用户名"'));
+    assert.ok(RS.includes("label={t('Username')}"));
     /* 只填了用户名（sshHost = "user@"）不算一台机器，不许自动保存 */
     assert.match(RS, /if \(!draft \|\| !splitSshHost\(draft\.sshHost\)\.host\.trim\(\)\) return;/);
     assert.match(RS, /remoteWorkdir: DEFAULT_WORKDIR \}/, '新机器的工作目录直接填上默认值');
@@ -1009,7 +1012,7 @@ describe('远端的模型列表要验', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     assert.match(M, /function pickRemoteModel\(/);
     assert.match(M, /MODEL_FALLBACK_ORDER\.find\(\(m\) => models\.includes\(m\)\)/);
-    assert.match(M, /上没有模型「\$\{wanted\}」/);
+    assert.match(M, /\{host\} has no model "\{wanted\}"/);
     /* 列表问不到时什么都不做 —— 没依据的判断比不判断糟 */
     assert.match(M, /if \(!models\.length \|\| models\.includes\(wanted\)\) return wanted;/);
     /* 数量会随功能增加（换机器那条路也要验），所以只钉"每条起远程执行器的路都验过" */
@@ -1049,15 +1052,15 @@ describe('切换一条已有会话的机器', () => {
   /* 锚在**那段机械**上，不是 IPC 名字上：换机器和只换目录现在共用它（`applySessionTarget`），
      两个 IPC 都只剩几行解析参数 —— 锚在 IPC 上会切到一段几乎空的代码，然后每条断言都"过了"。 */
   const at = M.indexOf('const applySessionTarget = async (');
-  const body = M.slice(at, at + 6000);
+  const body = M.slice(at, at + 7000); /* 英文提示比中文长，窗口放宽一点 */
 
   test('**右键菜单优先于正在跑的任务**：照切，只是明确说那一轮被打断了', () => {
     assert.ok(at > 0, 'IPC 要存在');
     /* 上一版在 busy 时直接拒绝 —— 一条长回合跑着时什么都改不了，而那正是你想改设置的时候 */
     assert.equal(/throw new Error\('这一轮还在跑 —— 等它结束再切换机器/.test(body), false);
     assert.match(body, /const interrupted = !!oldEntry\?\.busy;/);
-    assert.match(body, /切换打断了正在跑的那一轮/);
-    assert.match(body, /已产出的内容都在/);
+    assert.match(body, /The switch interrupted the turn that was running/);
+    assert.match(body, /Everything it produced is kept/);
   });
 
 
@@ -1084,15 +1087,15 @@ describe('切换一条已有会话的机器', () => {
   });
 
   test('要在会话里说清换到哪、以及"对话一条都没动"', () => {
-    assert.match(body, /这条会话从现在开始跑在\*\*\$\{where\}\*\*上/);
-    assert.match(body, /之前的对话一条都没动/);
+    assert.match(body, /From now on this session runs on \*\*\{where\}\*\*/);
+    assert.match(body, /the earlier conversation is untouched/);
   });
 
   test('右键菜单是**一个入口、右侧展开**（本地 / 各远端），当前位置打 ✓', () => {
     /* 上一版是平铺：每台机器占一行，和下面那堆 🏷️ 项目混在一起，菜单越长越难扫。
        「这条会话在哪台机器上跑」是一个问题、多个互斥选项 —— 子菜单才是它的形状。 */
     assert.match(SB, /const Submenu: React\.FC</);
-    assert.match(SB, /运行位置：\$\{ctxSession\.remoteHost \|\| '本地'\}/);
+    assert.match(SB, /t\('\{icon\} Runs on: \{where\}', \{ icon: ctxSession\.remoteHost \? '🌐' : '💻', where: ctxSession\.remoteHost \|\| t\('Local'\) \}\)/);
     /* 一直显示：一台远端都没配时子菜单里只有「本地」（和最下面的「添加机器」） */
     assert.doesNotMatch(SB, /remoteTargets\.length > 0 &&/);
     /* 当前在哪儿要能一眼看出来 */
@@ -1104,12 +1107,12 @@ describe('切换一条已有会话的机器', () => {
   });
 
   test('「运行位置」子菜单最下面有「＋ 添加机器…」：关菜单、带着「机器页 + 新建」打开设置', () => {
-    const at = SB.indexOf('运行位置：${ctxSession.remoteHost');
+    const at = SB.indexOf("t('{icon} Runs on: {where}'");
     assert.ok(at > 0);
     const sub = SB.slice(at, SB.indexOf('</Submenu>', at));
     /* 在各台机器之后、子菜单结尾之前：分隔线 + 添加机器 */
     const list = sub.indexOf('remoteTargets.map(');
-    const add = sub.indexOf('＋ 添加机器…');
+    const add = sub.indexOf("＋ {t('Add machine…')}");
     assert.ok(list > 0 && add > list, '「添加机器」在各台机器下面');
     assert.match(sub.slice(list, add), /context-menu-divider/);
     assert.match(sub, /onClick=\{\(\) => \{ setContextMenu\(null\); onAddMachine\?\.\(\); \}\}/);
@@ -1135,7 +1138,7 @@ describe('切换一条已有会话的机器', () => {
     assert.equal(/remotePickDir/.test(SB), false, '侧栏不该再弹目录选择');
     /* 失败要让人看见 —— 这个动作会换执行器，静悄悄失败只会被当成"点了没反应" */
     /* 不用 window.alert —— 它是模态的，弹着的时候整个界面都停住；换成不阻塞的提示条 */
-    assert.match(SB, /showToast\(`✗ 切换运行位置失败：/);
+    assert.match(SB, /showToast\(t\('✗ Could not switch where this runs: \{reason\}'/);
     assert.doesNotMatch(SB, /window\.alert\(/);
   });
 });
@@ -1176,7 +1179,7 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
   test('**没连上不再拒绝** —— 执行器是下次打开时按记录起的，要求"先连上"是多余的门槛', () => {
     assert.equal(/这条会话还没连上，先打开它再切换/.test(M), false, '这道门槛不许再有');
     assert.match(body, /if \(!oldEntry\) \{/);
-    assert.match(body, /这条会话改成跑在\*\*\$\{where\}\*\*上/);
+    assert.match(body, /This session now runs on \*\*\{where\}\*\*/);
     /* 冷路径只改记录 */
     assert.match(body, /rec\.localDir = nextLocalDir;\s*\n\s*store\.writeRecord\(rec\);/);
   });
@@ -1548,11 +1551,11 @@ describe('每台机器（含本机）都能配三个 CLI 的启动命令', () =>
   test('界面：本机和远端**共用同一组字段**，都在同一个下拉里', () => {
     const R = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
     assert.match(R, /const BinFields: React\.FC</);
-    assert.match(R, /<option value=\{LOCAL\}>💻 本机（这台电脑）<\/option>/);
+    assert.match(R, /<option value=\{LOCAL\}>\{t\('💻 Local \(this computer\)'\)\}<\/option>/);
     /* 两处都用它 —— 各写一遍迟早分叉 */
     assert.equal((R.match(/<BinFields /g) || []).length, 2);
     /* claude/codex 现在只存不用，标签上要明说 —— 填了不生效比没有这个框更让人怀疑配置是假的 */
-    assert.match(R, /claude 启动命令（暂未使用）/);
+    assert.match(R, /t\('claude launch command \(not used yet\)'\)/);
   });
 });
 
@@ -1580,7 +1583,8 @@ describe('远程会话建失败不许静默变本地', () => {
     const at = HK.indexOf('const createPromise = (async (): Promise<string> =>');
     assert.ok(at > 0);
     const body = HK.slice(at, at + 2600);
-    assert.match(body, /⚠️ 这条会话没连上：/);
+    // 那句提示和换机器重连失败那条共用一个构造（connectFailureNotice，带中英两版）
+    assert.match(body, /connectFailureNotice\(why, Date\.now\(\), uiLangNow\(\)\)/);
     assert.match(body, /throw err;/, '吞掉异常 = 上层以为建成功了');
     /* 光 clearConnecting 不算处理 */
     assert.equal(/\} catch \{\s*\n\s*clearConnecting\(id\);\s*\n\s*\} finally/.test(body), false);

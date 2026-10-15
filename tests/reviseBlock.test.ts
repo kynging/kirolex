@@ -129,7 +129,7 @@ describe('主进程接线', () => {
   test('改写：排队、先挂回来、等空闲、超时摘掉等待者', () => {
     const at = MAIN.indexOf("ipcMain.handle('review:revise-in-session'");
     const body = MAIN.slice(at, at + 6500);
-    assert.ok(body.includes("return enqueueRevise(sessionId, async () => {\n      try { return await reviseOnce(); } finally { tk.close(); }\n    }, input?.label || '改写');"));
+    assert.ok(body.includes("return enqueueRevise(sessionId, async () => {\n      try { return await reviseOnce(); } finally { tk.close(); }\n    }, input?.label || tr('Revision'));"));
     /* 取消按 ticket 认这一次改写：排队 / 等空闲期间被取消就不发；在等回复的只停它自己那一轮 */
     assert.equal((body.match(/if \(tk\.cancelled\(\)\) return \{ ok: false, cancelled: true \};/g) || []).length, 4);
     assert.match(body, /await ensureAttached\(sessionId\);/);
@@ -139,8 +139,8 @@ describe('主进程接线', () => {
     assert.match(body, /replyUsable\(/);
     /* 等待者的挂、摘、超时只有一份（`askOnce`），文本一块和 deck 一页共用 */
     const ask = MAIN.slice(MAIN.indexOf('const askOnce = '), MAIN.indexOf('const askOnce = ') + 1200);
-    assert.match(ask, /askWaiters\.delete\(sessionId\);\s*\n\s*reject\(new Error\('等了 8 分钟没等到回复'\)\);/);
-    assert.match(ask, /if \(drop\(\)\) reject\(new Error\('这一轮没有正常结束/);
+    assert.match(ask, /askWaiters\.delete\(sessionId\);\s*\n\s*reject\(new Error\(tr\('No reply after waiting 8 minutes'\)\)\);/);
+    assert.match(ask, /if \(drop\(\)\) reject\(new Error\(tr\('This turn did not finish normally/);
     /* 文本一块、deck 一页，外加 patch 档格式不对时追问的那一次（`followUpPatch`）—— 都走同一个 askOnce */
     assert.equal((MAIN.match(/await askOnce\(/g) || []).length, 3);
   });

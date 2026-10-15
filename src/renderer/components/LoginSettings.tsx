@@ -13,6 +13,7 @@
  */
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { defaultPick } from '../remotePick.ts';
+import { useT } from '../hooks/useLang';
 
 type Tool = 'claude' | 'codex';
 interface ToolStatus { installed: boolean; loggedIn: boolean; detail: string; gateway?: string }
@@ -28,6 +29,7 @@ function firstUrl(text: string): string | null {
 }
 
 export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatus | null; onChanged: () => void }> = ({ machine, tool, status, onChanged }) => {
+  const t = useT();
   const [mode, setMode] = useState<'none' | 'manual' | 'official' | 'bedrock'>('none');
   const [busy, setBusy] = useState(false);
   const [msg, setMsg] = useState<{ ok: boolean; text: string } | null>(null);
@@ -47,11 +49,11 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
     const offExit = api()?.onAiLoginExit?.((d: { runId: string; code: number | null }) => {
       if (d.runId !== runRef.current) return;
       setRunId(null);
-      setMsg({ ok: d.code === 0, text: d.code === 0 ? '登录完成。' : `登录没完成（退出码 ${d.code ?? '?'}）。` });
+      setMsg({ ok: d.code === 0, text: d.code === 0 ? t('Login complete.') : t('Login did not complete (exit code {code}).', { code: d.code ?? '?' }) });
       onChanged();
     });
     return () => { try { offOut?.(); offExit?.(); } catch { /* 卸载 */ } };
-  }, [onChanged]);
+  }, [onChanged, t]);
 
   /* 换机器：上一台的编辑器内容和输出都不该留着 */
   useEffect(() => { setMode('none'); setMsg(null); setLog(''); setRunId(null); setText(''); }, [machine]);
@@ -59,14 +61,14 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
   /** 「拷入本机配置」：把这台电脑上那份放进编辑器（只读本机，不写任何地方）。 */
   const copyLocal = async (): Promise<void> => {
     const r = await api()?.aiLoginLocalConfig?.(tool);
-    if (r?.ok) { setText(r.text); setMsg(null); } else setMsg({ ok: false, text: r?.error || '读不到本机的配置' });
+    if (r?.ok) { setText(r.text); setMsg(null); } else setMsg({ ok: false, text: r?.error || t('Could not read the config on this computer') });
   };
 
   const apply = async (): Promise<void> => {
     setBusy(true); setMsg(null);
     const r = await api()?.aiLoginApply?.(machine, { tool, text });
     setBusy(false);
-    setMsg({ ok: !!r?.ok, text: r?.ok ? '已写到那台机器上。' : (r?.error || '失败') });
+    setMsg({ ok: !!r?.ok, text: r?.ok ? t('Written to that machine.') : (r?.error || t('Failed')) });
     if (r?.ok) { setMode('none'); setText(''); onChanged(); }
   };
 
@@ -74,14 +76,14 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
     setBusy(true); setMsg(null);
     const r = await api()?.aiLoginApply?.(machine, { tool, mode: 'bedrock' });
     setBusy(false);
-    setMsg({ ok: !!r?.ok, text: r?.ok ? '已改成走 Amazon Bedrock。正在跑的会话要重连之后才会用上新配置。' : (r?.error || '失败') });
+    setMsg({ ok: !!r?.ok, text: r?.ok ? t('Switched to Amazon Bedrock. Running sessions pick up the new config after they reconnect.') : (r?.error || t('Failed')) });
     if (r?.ok) { setMode('none'); onChanged(); }
   };
 
   const startOfficial = async (consoleBilling = false): Promise<void> => {
     setMsg(null); setLog('');
     const r = await api()?.aiLoginRun?.(machine, tool, { console: consoleBilling });
-    if (!r?.ok) { setMsg({ ok: false, text: r?.error || '起不来' }); return; }
+    if (!r?.ok) { setMsg({ ok: false, text: r?.error || t('Could not start') }); return; }
     setRunId(r.runId);
   };
   const url = firstUrl(log);
@@ -91,8 +93,8 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
       <div className="remote-row-actions" style={{ justifyContent: 'space-between' }}>
         <b>{NAME[tool]}</b>
         <span className="settings-hint">
-          {!status ? '查询中…'
-            : !status.installed ? '✗ 那台机器上没装（先在「机器」页点「安装 AI 工具」）'
+          {!status ? t('Checking…')
+            : !status.installed ? t('✗ Not installed on that machine (click "Install AI tools" on the Machines page first)')
               : status.loggedIn ? `✓ ${status.detail}${status.gateway ? ` · ${status.gateway}` : ''}`
                 : `✗ ${status.detail}`}
         </span>
@@ -101,9 +103,9 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
       {status?.installed && (
         <div className="remote-row-actions">
           {/* 默认推荐 Bedrock ——「默认将模型设置为 bedrock 的 global endpoint，保留让客户自己配置域名和 key 或者用官方订阅登录的选项」 */}
-          <button className="remote-btn remote-btn-primary" disabled={busy || !!runId} onClick={() => setMode(mode === 'bedrock' ? 'none' : 'bedrock')}>用 Amazon Bedrock（推荐）</button>
-          <button className="remote-btn" disabled={busy || !!runId} onClick={() => setMode(mode === 'manual' ? 'none' : 'manual')}>手动填写</button>
-          <button className="remote-btn" disabled={busy || !!runId} onClick={() => setMode(mode === 'official' ? 'none' : 'official')}>官方账号登录</button>
+          <button className="remote-btn remote-btn-primary" disabled={busy || !!runId} onClick={() => setMode(mode === 'bedrock' ? 'none' : 'bedrock')}>{t('Use Amazon Bedrock (recommended)')}</button>
+          <button className="remote-btn" disabled={busy || !!runId} onClick={() => setMode(mode === 'manual' ? 'none' : 'manual')}>{t('Enter manually')}</button>
+          <button className="remote-btn" disabled={busy || !!runId} onClick={() => setMode(mode === 'official' ? 'none' : 'official')}>{t('Sign in with official account')}</button>
         </div>
       )}
 
@@ -111,15 +113,13 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
         <>
           <p className="settings-hint" style={{ margin: '4px 0' }}>
             {tool === 'claude'
-              ? <>写进那台机器 <code>~/.claude/settings.json</code> 的 <code>env</code>：<code>CLAUDE_CODE_USE_BEDROCK=1</code>、那台机器自己的 <code>AWS_REGION</code>、
-                  global 推理配置文件（<code>global.anthropic.claude-opus-5-5</code> / sonnet-5-5 / haiku-4-5）；原来的网关地址和 key 去掉，别的设置不动。</>
-              : <>写进那台机器 <code>~/.codex/config.toml</code>：<code>model_provider = "amazon-bedrock"</code>、<code>openai.gpt-6.1-sol</code>，region <code>us-east-1</code>
-                  （Codex 走 Bedrock 的 Responses 端点，OpenAI 模型目前在美东区；它不认 global 前缀）。原来的网关那一段保留，想切回去改 <code>model_provider</code> 就行。</>}
-            {' '}<b>不写任何密钥</b>：用那台机器的 AWS 凭证链（EC2 实例角色、<code>~/.aws</code>、SSO），需要有 Bedrock 的调用权限。原文件先备份成 <code>.kirolex-bak</code>。
+              ? <>{t('Writes to ')}<code>~/.claude/settings.json</code>{t(' on that machine, under ')}<code>env</code>{t(': ')}<code>CLAUDE_CODE_USE_BEDROCK=1</code>{t(', that machine\'s own ')}<code>AWS_REGION</code>{t(', and the global inference profiles (')}<code>global.anthropic.claude-opus-5-5</code>{t(' / sonnet-5-5 / haiku-4-5). The old gateway URL and key are removed; other settings are untouched.')}</>
+              : <>{t('Writes to ')}<code>~/.codex/config.toml</code>{t(' on that machine: ')}<code>model_provider = "amazon-bedrock"</code>{t(', ')}<code>openai.gpt-6.1-sol</code>{t(', region ')}<code>us-east-1</code>{t(' (Codex uses the Bedrock Responses endpoint, and OpenAI models are currently in US East; it does not accept the global prefix). The old gateway section is kept; to switch back, just change ')}<code>model_provider</code>{t(' again.')}</>}
+            {' '}<b>{t('No keys are written')}</b>{t(': it uses that machine\'s AWS credential chain (EC2 instance role, ')}<code>~/.aws</code>{t(', SSO), which needs permission to invoke Bedrock. The original file is backed up as ')}<code>.kirolex-bak</code>{t('.')}
           </p>
           <div className="remote-row-actions">
             <button className="remote-btn remote-btn-primary" disabled={busy} onClick={() => void applyBedrock()}>
-              {busy ? '写入中…' : '写到那台机器上'}
+              {busy ? t('Writing…') : t('Write to that machine')}
             </button>
           </div>
         </>
@@ -129,9 +129,9 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
         <>
           <p className="settings-hint" style={{ margin: '4px 0' }}>
             {tool === 'claude'
-              ? <>JSON：写进那台机器 <code>~/.claude/settings.json</code> 的 <code>env</code>（只覆盖这里给出的键，别的设置不动）。至少要有 <code>ANTHROPIC_API_KEY</code>。</>
-              : <>TOML：顶层的 <code>model</code> / <code>model_provider</code> 加一个 <code>[model_providers.&lt;名字&gt;]</code> 段，合并进那台机器的 <code>~/.codex/config.toml</code>（别的设置不动）。</>}
-            {' '}原文件先备份成 <code>.kirolex-bak</code>。
+              ? <>{t('JSON: written to ')}<code>~/.claude/settings.json</code>{t(' on that machine, under ')}<code>env</code>{t(' (only the keys given here are overwritten; other settings are untouched). It needs at least ')}<code>ANTHROPIC_API_KEY</code>{t('.')}</>
+              : <>{t('TOML: top-level ')}<code>model</code> / <code>model_provider</code>{t(' plus a ')}<code>{t('[model_providers.<name>]')}</code>{t(' section, merged into ')}<code>~/.codex/config.toml</code>{t(' on that machine (other settings are untouched).')}</>}
+            {' '}{t('The original file is backed up as ')}<code>.kirolex-bak</code>{t('.')}
           </p>
           <textarea
             className="settings-input"
@@ -143,11 +143,11 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
           />
           <div className="remote-row-actions">
             <button className="remote-btn" disabled={busy} onClick={() => void copyLocal()}
-              title={tool === 'claude' ? '把这台电脑 ~/.claude/settings.json 里的 ANTHROPIC_* 那几项放进上面的编辑器' : '把这台电脑 ~/.codex/config.toml 里当前用的 provider（顶层两行 + 那一段）放进上面的编辑器'}>
-              拷入本机配置
+              title={tool === 'claude' ? t('Put the ANTHROPIC_* entries from ~/.claude/settings.json on this computer into the editor above') : t('Put the provider currently used in ~/.codex/config.toml on this computer (the two top-level lines + its section) into the editor above')}>
+              {t('Copy in local config')}
             </button>
             <button className="remote-btn remote-btn-primary" disabled={busy || !text.trim()} onClick={() => void apply()}>
-              {busy ? '写入中…' : '写到那台机器上'}
+              {busy ? t('Writing…') : t('Write to that machine')}
             </button>
           </div>
         </>
@@ -156,25 +156,25 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
       {mode === 'official' && (
         <>
           <p className="settings-hint" style={{ margin: '4px 0' }}>
-            在那台机器上跑 {tool === 'claude' ? <code>claude auth login</code> : <code>codex login --device-auth</code>}。
-            它给出授权网址后，点「在浏览器打开」用这台电脑的浏览器授权
-            {tool === 'claude' ? '；授权完浏览器会给一串 code，贴到下面发回去。' : '（还要输入下面显示的验证码）；授权完它自己就结束了。'}
+            {t('Runs ')}{tool === 'claude' ? <code>claude auth login</code> : <code>codex login --device-auth</code>}{t(' on that machine.')}
+            {t(' Once it shows the authorization URL, click "Open in browser" to authorize in this computer\'s browser')}
+            {tool === 'claude' ? t('; after authorizing, the browser shows a code. Paste it below to send it back.') : t(' (you also need to enter the verification code shown below); it finishes on its own once authorized.')}
           </p>
           {!runId ? (
             <div className="remote-row-actions">
-              <button className="remote-btn" onClick={() => void startOfficial(false)}>{tool === 'claude' ? '用 Claude 账号登录' : '开始登录'}</button>
-              {tool === 'claude' && <button className="remote-btn" onClick={() => void startOfficial(true)}>用 Anthropic Console（按 API 计费）登录</button>}
+              <button className="remote-btn" onClick={() => void startOfficial(false)}>{tool === 'claude' ? t('Sign in with Claude account') : t('Start login')}</button>
+              {tool === 'claude' && <button className="remote-btn" onClick={() => void startOfficial(true)}>{t('Sign in with Anthropic Console (API billing)')}</button>}
             </div>
           ) : (
             <div className="remote-row-actions">
-              {url && <button className="remote-btn remote-btn-primary" onClick={() => void api()?.openExternal?.(url)}>在浏览器打开</button>}
+              {url && <button className="remote-btn remote-btn-primary" onClick={() => void api()?.openExternal?.(url)}>{t('Open in browser')}</button>}
               {tool === 'claude' && (
                 <>
                   <input className="settings-input" style={{ flex: 1 }} spellCheck={false} value={code} onChange={(e) => setCode(e.target.value)} />
-                  <button className="remote-btn" disabled={!code.trim()} onClick={() => { void api()?.aiLoginInput?.(runId, code); setCode(''); }}>发送 code</button>
+                  <button className="remote-btn" disabled={!code.trim()} onClick={() => { void api()?.aiLoginInput?.(runId, code); setCode(''); }}>{t('Send code')}</button>
                 </>
               )}
-              <button className="remote-btn" onClick={() => void api()?.aiLoginCancel?.(runId)}>取消</button>
+              <button className="remote-btn" onClick={() => void api()?.aiLoginCancel?.(runId)}>{t('Cancel')}</button>
             </div>
           )}
           {log && <pre className="remote-log">{log}</pre>}
@@ -187,6 +187,7 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
 };
 
 export const LoginSettings: React.FC = () => {
+  const t = useT();
   const [targets, setTargets] = useState<Target[] | null>(null);
   const [machine, setMachine] = useState('');
   const [status, setStatus] = useState<{ claude: ToolStatus; codex: ToolStatus } | null>(null);
@@ -206,25 +207,24 @@ export const LoginSettings: React.FC = () => {
     setStatus(null); setErr('');
     const r = await api()?.aiLoginStatus?.(machine);
     if (r?.ok) setStatus({ claude: r.claude, codex: r.codex });
-    else setErr(r?.error || '查不到状态');
-  }, [machine]);
+    else setErr(r?.error || t('Could not get status'));
+  }, [machine, t]);
   useEffect(() => { void refresh(); }, [refresh]);
 
-  if (targets === null) return <p className="settings-hint">读取中…</p>;
-  if (!targets.length) return <p className="settings-hint">还没有远端机器 —— 先在「🖥 机器」里加一台。登录只给远端机器配（这台电脑上的登录是你自己配好的，这里不碰）。</p>;
+  if (targets === null) return <p className="settings-hint">{t('Reading…')}</p>;
+  if (!targets.length) return <p className="settings-hint">{t('No remote machines yet. Add one under "🖥 Machines" first. Login is only configured for remote machines (login on this computer is yours to set up; this page does not touch it).')}</p>;
 
   return (
     <div className="settings-item settings-item-wide">
-      <label className="settings-label">远端机器上 Claude Code / Codex 的登录</label>
+      <label className="settings-label">{t('Claude Code / Codex login on remote machines')}</label>
       <p className="settings-hint">
-        登录落在那台机器上（ssh）。<b>手动填写</b>是一个编辑器：可以用「拷入本机配置」把这台电脑上那份先放进去，
-        看一眼、改一改再写过去；<b>官方账号登录</b>在那台机器上跑登录命令，授权网址用这台电脑的浏览器打开。
+        {t('Login happens on that machine (over ssh). ')}<b>{t('Enter manually')}</b>{t(' is an editor: use "Copy in local config" to start from the copy on this computer, review and tweak it, then write it over. ')}<b>{t('Sign in with official account')}</b>{t(' runs the login command on that machine and opens the authorization URL in this computer\'s browser.')}
       </p>
       <div className="remote-row-actions">
         <select className="settings-select" value={machine} onChange={(e) => setMachine(e.target.value)}>
-          {targets.map((t) => <option key={t.id} value={t.id}>{`🌐 ${t.label} — ${t.sshHost}`}</option>)}
+          {targets.map((x) => <option key={x.id} value={x.id}>{`🌐 ${x.label} — ${x.sshHost}`}</option>)}
         </select>
-        <button className="remote-btn" onClick={() => void refresh()}>刷新状态</button>
+        <button className="remote-btn" onClick={() => void refresh()}>{t('Refresh status')}</button>
       </div>
       {err && <p className="settings-hint" style={{ color: 'var(--error)' }}>✗ {err}</p>}
       <ToolCard machine={machine} tool="claude" status={status?.claude || null} onChanged={() => void refresh()} />
@@ -238,19 +238,20 @@ export const LoginSettings: React.FC = () => {
  * 登录给**这条会话跑的那台机器**（`machine` 传会话 id，主进程按它找到那台远端；本机会话会说清不在这里登录）。
  */
 export const EngineLoginPane: React.FC<{ sessionId: string; tool: Tool }> = ({ sessionId, tool }) => {
+  const t = useT();
   const [status, setStatus] = useState<ToolStatus | null>(null);
   const [err, setErr] = useState('');
   const refresh = useCallback(async () => {
     setStatus(null); setErr('');
     const r = await api()?.aiLoginStatus?.(sessionId);
-    if (r?.ok) setStatus(r[tool]); else setErr(r?.error || '查不到状态');
-  }, [sessionId, tool]);
+    if (r?.ok) setStatus(r[tool]); else setErr(r?.error || t('Could not get status'));
+  }, [sessionId, tool, t]);
   useEffect(() => { void refresh(); }, [refresh]);
   return (
     <div style={{ padding: '8px 4px' }}>
       <div className="remote-row-actions">
-        <span className="settings-hint">登录落在这条会话跑的那台机器上（ssh）。</span>
-        <button className="remote-btn" onClick={() => void refresh()}>刷新状态</button>
+        <span className="settings-hint">{t('Login happens on the machine this session runs on (over ssh).')}</span>
+        <button className="remote-btn" onClick={() => void refresh()}>{t('Refresh status')}</button>
       </div>
       {err
         ? <p className="settings-hint" style={{ color: 'var(--error)', whiteSpace: 'pre-wrap' }}>✗ {err}</p>

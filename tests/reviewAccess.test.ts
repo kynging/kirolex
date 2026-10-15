@@ -216,7 +216,7 @@ describe('主进程 / 界面接线', () => {
   test('界面：第一次提交前重新读一次（经 workspaceRead 登记），读不到就把原因摆出来', () => {
     assert.match(RV, /const registerOnce = /);
     assert.match(RV, /window\.kiroApi\.workspaceRead\(sessionId, path\)/);
-    assert.match(RV, /const why = isDeck \? null : await registerOnce\(sessionId, path\);/);
+    assert.match(RV, /const why = isDeck \? null : await registerOnce\(sessionId, path, lang\);/);
     assert.match(RV, /setWriteWarn\(/);
   });
 });

@@ -15,6 +15,7 @@
  */
 
 import { HEAL_BACKOFF_MS, healDelay } from './sshMux.ts';
+import { tr } from './uiText.ts';
 
 export interface RecoveryTarget {
   /** 那台机器的 muxKey —— 连接回来时按它把等着的会话叫醒。 */
@@ -45,8 +46,9 @@ export interface RecoveryDeps<T extends RecoveryTarget = RecoveryTarget> {
 }
 
 export const RECONNECTING_TEXT = (n: number): string =>
-  `⚠️ 本机工具连接中断，正在重连（第 ${n} 次）—— 这期间这条远程会话读写不了你机器上的文件。`;
-export const RECOVERED_TEXT = '🔌 本机工具连接已恢复，这条远程会话重新接上了。';
+  tr('⚠️ The connection to the local tools dropped, reconnecting (attempt {n}). Until then this remote session cannot read or write files on your machine.', { n });
+/** 按当前界面语言取（所以是函数，不是常量） */
+export const RECOVERED_TEXT = (): string => tr('🔌 The local tools connection is back; this remote session is reconnected.');
 
 interface State { attempt: number; timer?: NodeJS.Timeout; running?: boolean }
 
@@ -157,7 +159,7 @@ export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
     if (!ok) { this.schedule(sessionId); return; }
     this.stop(sessionId);
     this.deps.log?.(`远程会话自动接回来了 sessionId=${sessionId}（第 ${st.attempt} 次）`);
-    this.deps.notice(sessionId, RECOVERED_TEXT, false);
+    this.deps.notice(sessionId, RECOVERED_TEXT(), false);
     try { this.deps.recovered?.(sessionId, st.attempt); } catch { /* 通知失败不影响恢复本身 */ }
   }
 }

@@ -18,6 +18,7 @@
  */
 
 import type { RemoteTarget } from './config';
+import { tr } from './uiText.ts';
 
 /**
  * 包一层单引号给 `/bin/sh` —— `ProxyCommand` 的值是交给 shell 跑的，
@@ -70,7 +71,7 @@ export function unsafeSshHost(host: string | undefined): boolean {
   return /^\s*-/.test(String(host || ''));
 }
 export function assertSafeSshHost(host: string | undefined): void {
-  if (unsafeSshHost(host)) throw new Error(`SSH 地址不能以 \`-\` 开头（${String(host).slice(0, 40)}）—— 拒绝拼进 ssh 命令。`);
+  if (unsafeSshHost(host)) throw new Error(tr('The SSH address cannot start with `-` ({host}). Refusing to put it into an ssh command.', { host: String(host).slice(0, 40) }));
 }
 
 export function proxyArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile'>): string[] {

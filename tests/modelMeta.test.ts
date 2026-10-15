@@ -84,7 +84,7 @@ describe('模型元数据的三层兜底', () => {
   test('界面要说清非实时的数字是哪来的（快照会过期）', () => {
     const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
     assert.match(CA, /metaFrom/);
-    assert.match(CA, /不是这台机器这一刻报的/);
+    assert.match(CA, /not reported by this machine right now/);
   });
 });
 

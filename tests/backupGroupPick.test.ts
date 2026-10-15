@@ -63,7 +63,11 @@ describe('BackupDialog 恢复页组头', () => {
     assert.match(restorePart, /toggleGroupPick\(prev, rows\)/);
     assert.match(restorePart, /\.indeterminate = /);
     assert.match(UI, /deleteS3Sessions\?\.\(ids\)/);
-    assert.match(restorePart, /确认删除 \$\{gp\.pickedIds\.length\} 条备份/);
-    assert.match(restorePart, /删除选中的 \$\{gp\.pickedIds\.length\} 条/);
+    /* 文案进了字典（i18nZh/settingsPanels.ts），源码里是 t('英文', { n }) */
+    assert.match(restorePart, /t\('Confirm deleting \{n\} backups', \{ n: gp\.pickedIds\.length \}\)/);
+    assert.match(restorePart, /t\('Delete \{n\} selected', \{ n: gp\.pickedIds\.length \}\)/);
+    const ZHP = fs.readFileSync(path.join(process.cwd(), 'src/renderer/i18nZh/settingsPanels.ts'), 'utf8');
+    assert.match(ZHP, /'Confirm deleting \{n\} backups': '确认删除 \{n\} 条备份'/);
+    assert.match(ZHP, /'Delete \{n\} selected': '删除选中的 \{n\} 条'/);
   });
 });

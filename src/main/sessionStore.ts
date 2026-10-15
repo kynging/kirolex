@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { AgentProfile } from './config';
+import { tr } from './uiText.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -67,6 +68,8 @@ export interface StoredMessage {
    * （`historyLine` 那侧的过滤，见 `readTranscript` 的调用点）。
    */
   kirolex?: true;
+  /** KiroLex 自己写的那句话的中英两版（`uiText.textVariants`）—— 显示时按当前界面语言挑；你和 agent 的消息没有这一项。 */
+  variants?: { zh: string; en: string };
   // additive: future fields (model, etc.) may be appended safely
 }
 
@@ -190,7 +193,7 @@ const ID_SHAPE = /^[A-Za-z0-9_-]{1,120}$/;
 function safeId(id: string): string {
   const s = String(id ?? '');
   if (!ID_SHAPE.test(s)) {
-    throw new Error(`会话 id 不合法：${JSON.stringify(s.slice(0, 80))} —— 只允许字母、数字、下划线和短横`);
+    throw new Error(tr('Invalid session id: {id}. Only letters, digits, underscores and hyphens are allowed', { id: JSON.stringify(s.slice(0, 80)) }));
   }
   return s;
 }
@@ -536,7 +539,7 @@ export function truncateTranscriptBefore(id: string, messageId: string): StoredM
     try { return (JSON.parse(line) as StoredMessage).id === messageId; }
     catch { return false; }
   });
-  if (targetIndex < 0) throw new Error(`Message ${messageId} was not found in the durable transcript.`);
+  if (targetIndex < 0) throw new Error(tr('Message {id} was not found in the saved transcript.', { id: messageId }));
 
   ensureDir(id);
   const tmp = `${file}.tmp`;

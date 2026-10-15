@@ -197,7 +197,7 @@ describe('ssh exit 255 = 掉线，可自动重发', () => {
   test('接线：只有远程执行器才这么判（本地 code 0 那条语义不动）', () => {
     const src = fs.readFileSync(path.join(process.cwd(), 'src/main/acp-client.ts'), 'utf8');
     assert.match(src, /this\.remote\?\.sshHost && isSshTransportExit\(code\)/);
-    assert.match(src, /执行器已退出（正常退出，code 0）/, '本地那句话必须还在');
+    assert.match(src, /tr\('The executor exited \(clean exit, code 0\)/, '本地那句话必须还在');
   });
 });
 

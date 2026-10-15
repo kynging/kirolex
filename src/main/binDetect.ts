@@ -19,6 +19,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { tr } from './uiText.ts';
 
 /** 支持的三个工具。`claude` / `codex` 目前只检测和记录，KiroLex 还只起 kiro-cli。 */
 export type ToolId = 'kiro' | 'claude' | 'codex';
@@ -195,14 +196,14 @@ export function parseDetect(out: string, tools: ToolSpec[] = TOOLS): DetectResul
     const real = m[4].replace(/^"|"$/g, '').trim() || undefined;
     const rest = m[5].trim();
     if (!command) continue;
-    if (!ok) { res[tool].push({ command, real, ok: false, error: rest || '跑不起来' }); continue; }
+    if (!ok) { res[tool].push({ command, real, ok: false, error: rest || tr('Fails to run') }); continue; }
     /*
       **跑得起来还不够，得是这个工具** —— 实测：PATH 上的 `kiro` 是 Kiro IDE 的 CLI
       （`--version` 回 `0.12.333`），和 kiro-cli 是两个东西。名字像不代表是它。
     */
     const v = spec.get(tool)?.verify;
     if (v && rest && !v.test(rest)) {
-      res[tool].push({ command, real, ok: false, version: rest, error: `跑起来了，但看着不是 ${spec.get(tool)?.label}（它报的是「${rest}」）` });
+      res[tool].push({ command, real, ok: false, version: rest, error: tr('It runs, but it does not look like {label} (it reports "{version}")', { label: String(spec.get(tool)?.label), version: rest }) });
       continue;
     }
     res[tool].push({ command, real, ok: true, version: rest || undefined });
@@ -213,9 +214,9 @@ export function parseDetect(out: string, tools: ToolSpec[] = TOOLS): DetectResul
 /** 解析单个「测试」的结果。 */
 export function parseTest(out: string): { ok: boolean; version?: string; error?: string } {
   const m = new RegExp(`^${MARK}\\s+(ok|bad)\\s*\\|\\s*(.*)$`, 'm').exec(String(out || ''));
-  if (!m) return { ok: false, error: '没有拿到探测结果（连不上，或者那台机器的 shell 没回话）' };
+  if (!m) return { ok: false, error: tr('No probe result (could not connect, or the shell on that machine did not answer)') };
   const rest = m[2].trim();
-  return m[1] === 'ok' ? { ok: true, version: rest || undefined } : { ok: false, error: rest || '跑不起来' };
+  return m[1] === 'ok' ? { ok: true, version: rest || undefined } : { ok: false, error: rest || tr('Fails to run') };
 }
 
 /* -------------------------------------------------------------- 历史记忆 */
@@ -266,7 +267,7 @@ export function mergeHistory(found: BinCandidate[], history: string[] = []): Bin
       out.push({ ...hit, command: cmd, known: true });
       continue;
     }
-    out.push({ command: cmd, ok: false, known: true, error: '这次没检测到（以前起过）' });
+    out.push({ command: cmd, ok: false, known: true, error: tr('Not detected this time (it worked before)') });
   }
   for (const c of found) if (left.has(c.command)) out.push(c);
   return out;
@@ -401,8 +402,8 @@ export async function detectWindows(
         version: probe.ok && looksRight ? (probe.first || '').slice(0, 120) : undefined,
         ok: probe.ok && looksRight,
         error: probe.ok
-          ? (looksRight ? undefined : `版本输出不像 ${t.label}：${(probe.first || '').slice(0, 80)}`)
-          : (probe.first || '跑不起来').slice(0, 160),
+          ? (looksRight ? undefined : tr('Version output does not look like {label}: {output}', { label: t.label, output: (probe.first || '').slice(0, 80) }))
+          : (probe.first || tr('Fails to run')).slice(0, 160),
       });
     }
   }

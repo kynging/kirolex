@@ -14,6 +14,7 @@
  */
 import fs from 'fs';
 import path from 'path';
+import { tr } from './uiText.ts';
 /**
  * project 名 → 目录名。**逐字来自原来的 `runStore.projectDirName`** —— 那个模块属于 flow，
  * 而这里是它唯一还需要的东西，所以就地放一份，不为一个函数留一条跨模块依赖。
@@ -71,12 +72,12 @@ export function whyNotWorkspace(dir: string): string | null {
   /* 别在提示里写死 `/` —— Windows 上绝对路径长 `C:\…` 那样，照着那句话改只会更错 */
   if (!path.isAbsolute(want)) {
     return process.platform === 'win32'
-      ? '要写绝对路径（像 C:\\Users\\你\\项目）'
-      : '要写绝对路径（从 / 开始）';
+      ? tr('Must be an absolute path (like C:\\Users\\you\\project)')
+      : tr('Must be an absolute path (starting with /)');
   }
   try {
-    if (!fs.statSync(want).isDirectory()) return '这不是一个目录';
-  } catch { return '这个目录不存在'; }
+    if (!fs.statSync(want).isDirectory()) return tr('This is not a directory');
+  } catch { return tr('This directory does not exist'); }
   return null;
 }
 

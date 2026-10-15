@@ -135,7 +135,7 @@ describe('接线', () => {
   test('渲染层把它挂到**那条会话**上，走已有的错误通道', () => {
     /* MCP 是按会话起的（不同 agent 配不同 server），而且你要能看出是哪条会话的工具坏了 */
     assert.match(ACP, /const removeNotice = window\.kiroApi\.onNotice\?\.\(/);
-    assert.match(ACP, /noteError\(n\.sessionId \|\| null, `\$\{n\.label\}：\$\{n\.text\}`\)/);
+    assert.match(ACP, /noteError\(n\.sessionId \|\| null, t\('\{label\}: \{text\}', \{ label: n\.label, text: n\.text \}\)\)/);
     assert.match(ACP, /removeNotice\?\.\(\)/, '卸载时要注销');
   });
 });

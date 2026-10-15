@@ -9,6 +9,8 @@ import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
 import { reviewSelectAll, lastInteraction, coversWhole } from '../selectAllScope';
 import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, type ReviewQueueItem } from '../reviewQueue';
+import { useLang, useT } from '../hooks/useLang';
+import { noteVariants, t as translate, type Lang } from '../i18n';
 
 /**
  * 走逐页预览的那些 —— `.pdf` 直接画，其余先由主进程用 LibreOffice 转成 PDF。
@@ -65,7 +67,7 @@ const paneApis = new Map<string, PaneApi>();
  * 读成了记住，读不成下次提交再试；返回读不成的原因。
  */
 const registered = new Set<string>();
-const registerOnce = async (sessionId: string | undefined, path: string): Promise<string | null> => {
+const registerOnce = async (sessionId: string | undefined, path: string, lang: Lang = 'zh'): Promise<string | null> => {
   const key = `${sessionId || ''}\n${path}`;
   if (registered.has(key)) return null;
   try {
@@ -74,7 +76,7 @@ const registerOnce = async (sessionId: string | undefined, path: string): Promis
     return null;
   } catch (err: any) {
     /* 去掉 Electron 套的那层「Error invoking remote method 'workspace:read': Error: 」，只留真正的原因 */
-    return String(err?.message || err || '读不到').replace(/^Error invoking remote method '[^']*': (Error: )?/, '');
+    return String(err?.message || err || translate(lang, 'Couldn\'t read it')).replace(/^Error invoking remote method '[^']*': (Error: )?/, '');
   }
 };
 /** 「AI 刚改过」的编号 —— 撤销按它认那一处。标记本身按文件存在 `aiMarkStore`（pane 卸掉也还在）。 */
@@ -214,6 +216,8 @@ export const ReviewPane: React.FC<{
    */
   onRewritten?: (text: string) => void;
 }> = ({ path, text = '', markdown, onSubmit, commenting, sessionId, onRewritten, changedAt }) => {
+  const t = useT();
+  const lang = useLang();
   const isDeck = isDeckPath(path);
   /**
    * PDF 字节 —— **不是 blob URL / file://**：渲染层取不到 `file://`（dev 下 origin 是 localhost:5173），
@@ -354,7 +358,7 @@ export const ReviewPane: React.FC<{
   /** 没做成的原因，按标记的键记（💬 / ＋ / 讲稿 / `drop:行` / `whole`）。 */
   const [applyNote, setApplyNote] = useState<Record<string, string>>(() => Object.fromEntries(
     /* 上次提交了、没写完就被 reload / 重启打断的那些 —— 标记已经放回去了，这里说一句为什么它们又出现了 */
-    initialMarks.interrupted.map((k) => [k, '上次提交没做完（窗口重新加载 / 重启打断了）—— 标记放回来了，再提交一次']),
+    initialMarks.interrupted.map((k) => [k, t('The last submission didn\'t finish (interrupted by a window reload or restart). The marks are back; submit again.')]),
   ));
 
   /** 同一时刻只开一个框 —— 别的框收起，**它们写的字留着**（那就是标记）。 */
@@ -384,15 +388,15 @@ export const ReviewPane: React.FC<{
        */
       const fetchDeck = async (force?: boolean): Promise<any> => {
         const r: any = await window.kiroApi.previewDeck?.(sessionId, path, force);
-        if (!r?.ok || !r.pdf) return { why: r?.why || '转 PDF 失败', install: r?.install || '', final: true };
+        if (!r?.ok || !r.pdf) return { why: r?.why || t('Failed to convert to PDF'), install: r?.install || '', final: true };
         const b: any = await window.kiroApi.previewPdfBytes?.(sessionId, r.pdf);
-        if (!b?.ok || !b.base64) return { why: b?.why || '读不到转好的 PDF', deck: r };
+        if (!b?.ok || !b.base64) return { why: b?.why || t('Couldn\'t read the converted PDF'), deck: r };
         return { deck: r, base64: String(b.base64) };
       };
       let got: any = await fetchDeck();
       if (!cancelled && !got.base64 && !got.final) got = await fetchDeck(true);
       if (cancelled) return;
-      if (!got.base64 || !got.deck) { setWhy(got.why || '转 PDF 失败'); setInstall(got.install || ''); return; }
+      if (!got.base64 || !got.deck) { setWhy(got.why || t('Failed to convert to PDF')); setInstall(got.install || ''); return; }
       const res = got.deck;
       if (res.pages) setPageCount(res.pages);
       setNotes(res.notes ?? null);
@@ -587,7 +591,6 @@ export const ReviewPane: React.FC<{
   if (!isDeck && lastPropText.get(path) !== text) { lastPropText.set(path, text); fileText.set(path, text); }
   /** 这份文件此刻的正文 —— 排着的那些开跑时读它（见 `fileText`）。 */
   const currentText = () => fileText.get(path) ?? textRef.current;
-  const unit = isDeck ? '页' : '行';
   /**
    * 这一刻要不要显示批注控件。**没有主人会话就不给** —— 没有会话就没有地方能让这些标记生效；
    * 给一个按下去什么都不发生的入口，比明说"只能看"更糟。deck 永远算开着（PDF 本身就是阅读视图）。
@@ -599,12 +602,17 @@ export const ReviewPane: React.FC<{
   const live = !!sessionId && editable;
   const fileName = path.split(/[\\/]/).pop() || path;
 
-  /** 一个位置的说法：整节写范围，单行写行号 —— 框上、标记、排队那一行、会话里都用它。 */
-  const whereOf = (from: number, to: number) => (from !== to ? `第 ${from}–${to} ${unit}` : `第 ${from} ${unit}`);
+  /** 一个位置的说法（跟着界面语言）：整节写范围，单行写行号 —— 框上、标记、排队那一行、会话里显示的 label 都用它。 */
+  const whereAt = (from: number, to: number) => (isDeck
+    ? (from !== to ? t('pages {from}–{to}', { from, to }) : t('page {n}', { n: from }))
+    : (from !== to ? t('lines {from}–{to}', { from, to }) : t('line {n}', { n: from })));
   const spanWhere = (anchor: number) => {
     const span = spans[anchor];
-    return span && span.length > 1 ? `${whereOf(span[0], span[span.length - 1])}（这一整节）` : whereOf(anchor, anchor);
+    return span && span.length > 1 ? t('{where} (this whole section)', { where: whereAt(span[0], span[span.length - 1]) }) : whereAt(anchor, anchor);
   };
+  /** 一条排着的改动做的是什么（排队那一行、会话那边的队列都用它）。 */
+  const kindLabel = (kind: Job['kind']) => (kind === 'insert' ? (isDeck ? t('Add a page') : t('Add a paragraph')) : kind === 'delete' ? t('Delete')
+    : kind === 'whole' ? t('Whole-document rewrite') : kind === 'note' ? t('Edit speaker notes') : kind === 'edit' ? t('Direct edit') : t('Rewrite'));
 
   /**
    * **全部标记** —— 提交的就是这一份。草稿里写了字的、标了删的、整篇那一框。
@@ -644,8 +652,8 @@ export const ReviewPane: React.FC<{
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [draftLive, dropped, wholeDraft, covers, text]);
   const markCount = marks.edit.length + marks.revise.length + marks.insert.length + marks.note.length + marks.drops.length + (marks.whole ? 1 : 0);
-  const confirmLabel = markCount > 1 ? `✓ 确认（${markCount} 处）` : '✓ 确认';
-  const confirmTitle = '提交全部标记 —— 每一处排进队列，由打开这份文件的那条会话生成、KiroLex 写回（⌘/Ctrl + Enter）';
+  const confirmLabel = markCount > 1 ? t('✓ Confirm ({n})', { n: markCount }) : t('✓ Confirm');
+  const confirmTitle = t('Submit all marks: each one is queued, generated by the session that opened this file, and written back by KiroLex (⌘/Ctrl + Enter)');
 
   /**
    * 把 KiroLex 自己改不了的那些**一条消息**发给那条会话，由它自己改文件（deck 那侧）。
@@ -654,7 +662,7 @@ export const ReviewPane: React.FC<{
   const sendToSession = (message: string): boolean => {
     if (!onSubmit) return false;
     void window.kiroApi.reviewBackupFile?.(sessionId, path).then((res: any) => {
-      setBackupWarn(res?.ok ? '' : String(res?.error || '没能备份'));
+      setBackupWarn(res?.ok ? '' : String(res?.error || t('Backup failed')));
     });
     onSubmit(message);
     setJustSent(true);
@@ -702,11 +710,11 @@ export const ReviewPane: React.FC<{
     if (!alreadyWritten) {
       const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText, opts.expectBase);
       if (!wrote?.ok && wrote?.mismatch && opts.undid !== undefined) {
-        noteAiMark(opts.undid, UNDO_REFUSED);
+        noteAiMark(opts.undid, t('This passage was changed again afterward, so it wasn\'t undone'));
         return false;
       }
       if (!wrote?.ok) {
-        livePane().setApplyNote((cur) => ({ ...cur, [key]: `写不进这个文件：${wrote?.error || '未知原因'}` }));
+        livePane().setApplyNote((cur) => ({ ...cur, [key]: t('Couldn\'t write to this file: {err}', { err: wrote?.error || t('unknown reason') }) }));
         return false;
       }
     }
@@ -734,11 +742,8 @@ export const ReviewPane: React.FC<{
       做了什么），而不是让模型说一句它看不见的"已修改"。这句标成 KiroLex 自己说的话，不发给模型。
     */
     if (!alreadyWritten) {
-      void window.kiroApi.sessionNote?.(
-        sessionId!,
-        `✅ ${what}（现在 ${fullText.length} 字）\n文件：${path}\n`
-        + 'KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。',
-      );
+      const note = t('✅ {what} (now {n} chars)\nFile: {path}\nKiroLex saved it to disk (backed up first to ~/.kirolex/backups/review-files/).', { what, n: fullText.length, path });
+      void window.kiroApi.sessionNote?.(sessionId!, note, noteVariants(note));
     }
     textRef.current = fullText;
     fileText.set(path, fullText);
@@ -838,17 +843,17 @@ export const ReviewPane: React.FC<{
     let disk: string;
     try {
       const r: any = await window.kiroApi.workspaceRead(sessionId, path);
-      if (!r || r.binary || r.truncated || typeof r.content !== 'string') { noteAiMark(id, '读不到盘上这份文件 —— 没撤销'); return false; }
+      if (!r || r.binary || r.truncated || typeof r.content !== 'string') { noteAiMark(id, t('Couldn\'t read this file from disk, so nothing was undone')); return false; }
       disk = r.content;
     } catch (err: any) {
-      noteAiMark(id, `读不到盘上这份文件（${err?.message || err}）—— 没撤销`);
+      noteAiMark(id, t('Couldn\'t read this file from disk ({err}), so nothing was undone', { err: String(err?.message || err) }));
       return false;
     }
-    const plan = planUndo(state, id, disk);
+    const plan = planUndo(state, id, disk, lang);
     if (!plan.ok) { noteAiMark(id, plan.why); return false; }
     const m = plan.mark;
-    const where = m.to >= m.from ? whereOf(m.from, m.to) : `第 ${m.from} ${unit}前`;
-    return writeBack(disk, plan.text, `ai:${id}`, `已撤销 ${fileName} ${where}的 AI 改动，恢复原文`, false, { undid: id, expectBase: disk });
+    const where = m.to >= m.from ? whereAt(m.from, m.to) : (isDeck ? t('before page {n}', { n: m.from }) : t('before line {n}', { n: m.from }));
+    return writeBack(disk, plan.text, `ai:${id}`, t('Undid the AI change to {file} {where} and restored the original', { file: fileName, where }), false, { undid: id, expectBase: disk });
   });
 
   /** 排进这份文件的队列 —— 提交那一刻全部排上，轮到了才真的开跑。 */
@@ -862,9 +867,8 @@ export const ReviewPane: React.FC<{
   const enqueue = (kind: Job['kind'], line: number, run: (ticket: string) => Promise<boolean>, restore: () => void, persist?: Job['persist']) => {
     const id = ++jobSeq.current;
     const ticket = `rv:${path}#${id}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
-    const what = kind === 'insert' ? (isDeck ? '加一页' : '加一段') : kind === 'delete' ? '删除'
-      : kind === 'whole' ? '整篇改写' : kind === 'note' ? '改讲稿' : kind === 'edit' ? '直接改' : '改写';
-    const where = kind === 'whole' ? '' : isDeck ? ` · 第 ${line} 页` : ` · ${whereOf(line, line)}`;
+    const what = kindLabel(kind);
+    const where = kind === 'whole' ? '' : ` · ${whereAt(line, line)}`;
     let running = false;
     const cancel = () => {
       cancelledTickets.add(ticket);
@@ -880,7 +884,7 @@ export const ReviewPane: React.FC<{
         running = true;
         patchReviewItem(ticket, { state: 'running' });
         /* 第一次提交前重新登记（见 `registerOnce`）；读不到就不发 —— 发了模型改好了也写不回去 */
-        const why = isDeck ? null : await registerOnce(sessionId, path);
+        const why = isDeck ? null : await registerOnce(sessionId, path, lang);
         if (why) {
           restore();
           livePane().setWriteWarn(why);
@@ -928,32 +932,32 @@ export const ReviewPane: React.FC<{
       };
       const base = currentText();
       const at = locate(base, anchorText, anchor);
-      if (!at) return fail('这一段在前面的改动里已经变了 —— 看一眼新的正文，再对它提一次');
+      if (!at) return fail(t('This passage was changed by an earlier edit. Look at the new text and comment on it again.'));
       const { from, to } = at;
       failKey = mode === 'insert' ? `+${at.anchor}` : String(at.anchor);
       /* 按闭区间取原文、按闭区间换回去 —— 段落之间的空行照带（见 `spanRange`） */
       const where = sliceLines(base, from, to);
       /* 位置写进显示文本 —— 回头翻会话要看得出说的是哪儿 */
-      const label = `${fileName} ${whereOf(from, to)}`;
+      const label = `${fileName} ${whereAt(from, to)}`;
       if (mode === 'insert') {
         const res: any = await window.kiroApi.reviseInSession?.({
-          sessionId: sessionId!, where, note: instruction, about: path, label: `${label} 后面新加`, scope: 'insert', ticket,
+          sessionId: sessionId!, where, note: instruction, about: path, label: t('{label} (add after)', { label }), scope: 'insert', ticket,
           apply: { path, mode: 'insert', to, base },
         });
         if (res?.cancelled) return false;
         if (!res?.ok || typeof res.text !== 'string') {
-          return fail(res?.cannot ? `加不了：${res.cannot}` : `生成失败：${res?.error || '没有返回'}`);
+          return fail(res?.cannot ? t('Couldn\'t add it: {why}', { why: res.cannot }) : t('Generation failed: {err}', { err: res?.error || t('no response') }));
         }
         /*
           主进程得真的走了 insert 那一档 —— 旧的主进程不认它、按 block 改，回来的是**改过的原文**，
           插进去就是同一段出现两遍。没回报 scope 的一律不写。
         */
         if (res.scope !== 'insert') {
-          return fail('主进程还是旧版本，不认「加一段」—— 重启 KiroLex 之后再试（这次什么都没写）');
+          return fail(t('The main process is still the old version and doesn\'t support "Add a paragraph". Restart KiroLex and try again (nothing was written this time).'));
         }
         if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
         const fullText = insertAfterLines(base, to, String(res.text));
-        return writeBack(base, fullText, failKey, `已在${label}后面加了一段`, false, { ai: { round } });
+        return writeBack(base, fullText, failKey, t('Added a paragraph after {file} {where}', { file: fileName, where: whereAt(from, to) }), false, { ai: { round } });
       }
       let res: any = await window.kiroApi.reviseInSession?.({
         sessionId: sessionId!, where, note: instruction, about: path, label, scope: 'block', ticket,
@@ -966,7 +970,7 @@ export const ReviewPane: React.FC<{
           给它带行号的全文，它只交回要换的那几处，主进程拼回去（见 `parsePatchReply` / `applyPatch`）。
         */
         res = await window.kiroApi.reviseInSession?.({
-          sessionId: sessionId!, where, note: instruction, about: path, label: `${label}（跨段）`, scope: 'patch',
+          sessionId: sessionId!, where, note: instruction, about: path, label: t('{label} (across sections)', { label }), scope: 'patch',
           /* 以**盘上此刻**这一份为基准、按它编行号 */
           full: base, fromLine: from, toLine: to, ticket,
           apply: { path, mode: 'patch', base },
@@ -975,18 +979,18 @@ export const ReviewPane: React.FC<{
           patch 只认**主进程已经写了**的结果 —— 这里不再自己写：渲染层那次写不带 expectBase，
           文件在等回复期间被动过的话会被旧 base 拼的整份盖掉（见 `patchReplyOutcome`）。
         */
-        const out = patchReplyOutcome(res);
+        const out = patchReplyOutcome(res, lang);
         if (out.kind === 'cancelled') return false;
         if (out.kind === 'fail') return fail(out.why);
         return writeBack(base, out.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
       }
       if (!res?.ok || typeof res.text !== 'string') {
-        return fail(res?.cannot ? `改不了：${res.cannot} —— 换个说法再试` : `改写失败：${res?.error || '没有返回'}`);
+        return fail(res?.cannot ? t('Couldn\'t change it: {why}. Try wording it differently.', { why: res.cannot }) : t('Rewrite failed: {err}', { err: res?.error || t('no response') }));
       }
       if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
       /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
       const fullText = spliceLines(base, from, to, String(res.text));
-      return writeBack(base, fullText, failKey, `已按意见改了${label}`, false, { ai: { round } });
+      return writeBack(base, fullText, failKey, t('Revised {file} {where} as commented', { file: fileName, where: whereAt(from, to) }), false, { ai: { round } });
     }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
   };
 
@@ -1005,11 +1009,11 @@ export const ReviewPane: React.FC<{
       const at = locate(base, anchorText, anchor);
       if (!at) {
         livePane().typeDraft(`=${anchor}`, replacement);
-        livePane().setApplyNote((cur) => ({ ...cur, [key]: '这一段在前面的改动里已经变了 —— 没换，看一眼新的正文再改' }));
+        livePane().setApplyNote((cur) => ({ ...cur, [key]: t('This passage was changed by an earlier edit, so it wasn\'t replaced. Look at the new text and edit again.') }));
         return false;
       }
       const fullText = spliceLines(base, at.from, at.to, replacement.replace(/\n+$/, ''));
-      return writeBack(base, fullText, `=${at.anchor}`, `已按你写的直接改了 ${fileName} ${whereOf(at.from, at.to)}`);
+      return writeBack(base, fullText, `=${at.anchor}`, t('Replaced {file} {where} with what you wrote', { file: fileName, where: whereAt(at.from, at.to) }));
     }, () => livePane().typeDraft(key, replacement), { key, text: replacement });
   };
 
@@ -1021,10 +1025,10 @@ export const ReviewPane: React.FC<{
       const base = currentText();
       const at = locate(base, anchorText, anchor);
       if (!at) {
-        livePane().setApplyNote((cur) => ({ ...cur, [`drop:${anchor}`]: '这一段在前面的改动里已经变了 —— 没删，看一眼新的正文再标' }));
+        livePane().setApplyNote((cur) => ({ ...cur, [`drop:${anchor}`]: t('This passage was changed by an earlier edit, so it wasn\'t deleted. Look at the new text and mark it again.') }));
         return false;
       }
-      return writeBack(base, deleteLines(base, at.from, at.to), `drop:${at.anchor}`, `已删掉 ${fileName} ${whereOf(at.from, at.to)}`);
+      return writeBack(base, deleteLines(base, at.from, at.to), `drop:${at.anchor}`, t('Deleted {file} {where}', { file: fileName, where: whereAt(at.from, at.to) }));
     }, () => livePane().setDropped((cur) => ({ ...cur, [anchor]: true })), { key: `drop:${anchor}`, text: '' });
   };
 
@@ -1039,11 +1043,11 @@ export const ReviewPane: React.FC<{
       const base = currentText();
       const res: any = await window.kiroApi.reviseInSession?.({
         sessionId: sessionId!, where: '（整篇 —— 这条意见不针对某一处）', note, about: path,
-        label: `${fileName} 整篇`, scope: 'patch', full: base, ticket,
+        label: t('{file} (whole document)', { file: fileName }), scope: 'patch', full: base, ticket,
         apply: { path, mode: 'patch', base },
       });
       /* 只认主进程已经写了的结果，渲染层不再自己写（见 `patchReplyOutcome`） */
-      const out = patchReplyOutcome(res);
+      const out = patchReplyOutcome(res, lang);
       if (out.kind === 'cancelled') return false;
       if (out.kind === 'fail') {
         livePane().setWholeDraft((cur) => cur || note);
@@ -1069,14 +1073,13 @@ export const ReviewPane: React.FC<{
           return sendToSession(`请改「${path}」第 ${page} 页：${instruction}\n（KiroLex 当场改不了这一条：${res.cannot}）\n改完保存这个文件。`);
         }
         livePane().typeDraft(String(page), instruction);
-        livePane().setApplyNote((cur) => ({ ...cur, [String(page)]: `改写失败：${res?.error || '没有返回'}` }));
+        livePane().setApplyNote((cur) => ({ ...cur, [String(page)]: t('Rewrite failed: {err}', { err: res?.error || t('no response') }) }));
         return false;
       }
-      void window.kiroApi.sessionNote?.(
-        sessionId!,
-        `✅ 已改第 ${page} 页幻灯片（${res.changed} 处）${res.partial ? `；${res.partial}` : ''}\n文件：${path}\n`
-        + 'KiroLex 按 run 地址落盘完成（写前已备份，字号和加粗没动）。',
-      );
+      {
+        const note = t('✅ Updated slide {page} ({n} changes){partial}\nFile: {path}\nKiroLex wrote it to disk by run address (backed up first; font size and bold untouched).', { page, n: res.changed, partial: res.partial ? t('; {partial}', { partial: res.partial }) : '', path });
+        void window.kiroApi.sessionNote?.(sessionId!, note, noteVariants(note));
+      }
       return true;
     }, () => livePane().typeDraft(String(page), instruction), { key: String(page), text: instruction });
   };
@@ -1097,20 +1100,19 @@ export const ReviewPane: React.FC<{
         note: instruction,
         /* 带上全路径：一条会话里可能同时开着几份 deck，只说"第 3 页"它分不出是哪一份 */
         about: `${path} 第 ${page} 页的演讲者备注（讲稿，不是幻灯片上的字）`,
-        label: `${fileName} 第 ${page} 页备注`,
+        label: t('{file} page {page} notes', { file: fileName, page }),
         ticket,
       });
       if (res?.cancelled) return false;
-      if (!res?.ok || typeof res.text !== 'string') return fail(res?.cannot ? `改不了：${res.cannot}` : `改写失败：${res?.error || '没有返回'}`);
+      if (!res?.ok || typeof res.text !== 'string') return fail(res?.cannot ? t('Couldn\'t change it: {why}', { why: res.cannot }) : t('Rewrite failed: {err}', { err: res?.error || t('no response') }));
       const wrote: any = await window.kiroApi.deckWriteNote?.(sessionId, path, page, res.text);
-      if (!wrote?.ok) return fail(`写不进这一页的备注：${wrote?.error || '未知原因'}`);
+      if (!wrote?.ok) return fail(t('Couldn\'t write this page\'s notes: {err}', { err: wrote?.error || t('unknown reason') }));
       /* 用**重抽出来的**那一份，不是我们以为写进去的那份 */
       if (Array.isArray(wrote.notes)) livePane().setNotes(wrote.notes);
-      void window.kiroApi.sessionNote?.(
-        sessionId!,
-        `✅ 已写入第 ${page} 页的演讲者备注（${String(res.text).length} 字）\n文件：${path}\n`
-        + 'KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。',
-      );
+      {
+        const note = t('✅ Wrote the speaker notes for page {page} ({n} chars)\nFile: {path}\nKiroLex saved it to disk (backed up first to ~/.kirolex/backups/review-files/).', { page, n: String(res.text).length, path });
+        void window.kiroApi.sessionNote?.(sessionId!, note, noteVariants(note));
+      }
       return true;
     }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
   };
@@ -1189,18 +1191,17 @@ export const ReviewPane: React.FC<{
   /** 一条排着的改动那一行：前面还有几条、在做什么 —— 队在哪儿得看得见。 */
   const jobRow = (j: Job) => {
     const ahead = jobs.findIndex((x) => x.id === j.id);
-    const what = j.kind === 'insert' ? (isDeck ? '加一页' : '加一段') : j.kind === 'delete' ? '删除'
-      : j.kind === 'whole' ? '整篇改写' : j.kind === 'note' ? '改讲稿' : j.kind === 'edit' ? '直接改' : '改写';
-    const where = j.kind === 'whole' ? '' : `${isDeck ? `第 ${j.line} 页` : spanWhere(j.line)} · `;
+    const what = kindLabel(j.kind);
+    const where = j.kind === 'whole' ? '' : `${isDeck ? whereAt(j.line, j.line) : spanWhere(j.line)} · `;
     return (
       <div key={j.id} className={`rt-block-lock${j.state === 'queued' ? ' queued' : ''}`} aria-live="polite">
         {j.state === 'running'
-          ? `${where}${what}中…（在那条会话里做，做完自动写回）`
-          : `${where}${what}排队中（前面还有 ${ahead} 条）`}
+          ? t('{where}{what} in progress… (running in that session, written back when done)', { where, what })
+          : t('{where}{what} queued ({n} ahead)', { where, what, n: ahead })}
         {/* 取消这一条 —— 没轮到的不发，在跑的只停它自己那一轮；标记放回去（会话那边的队列旁边也有同一个按钮） */}
         {j.cancel && (
-          <button type="button" className="rt-hist-btn rv-job-cancel nopan nodrag" title="取消这一条（标记会放回去）"
-            onClick={() => j.cancel!()}>取消</button>
+          <button type="button" className="rt-hist-btn rv-job-cancel nopan nodrag" title={t('Cancel this one (its mark will be restored)')}
+            onClick={() => j.cancel!()}>{t('Cancel')}</button>
         )}
       </div>
     );
@@ -1215,13 +1216,13 @@ export const ReviewPane: React.FC<{
       <div key={key} className="rt-brief-row">
         {said && (
           <span className="rt-hist-one">
-            <button type="button" className="rt-note-brief nopan nodrag" title="接着改这条标记" onClick={reopen}>
+            <button type="button" className="rt-note-brief nopan nodrag" title={t('Keep editing this mark')} onClick={reopen}>
               <span className="rt-note-brief-mark">{markGlyph}</span>
               <span className="rt-note-brief-text">{said.replace(/\s+/g, ' ')}</span>
             </button>
             {/* 「已经写完的 comment 缺少一个修改按钮」—— 点摘要本身也能改，但那不是一眼看得出来的入口 */}
-            <button type="button" className="rt-hist-btn nopan nodrag" title="修改这条标记" onClick={reopen}>✎</button>
-            <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag" title="去掉这条标记"
+            <button type="button" className="rt-hist-btn nopan nodrag" title={t('Edit this mark')} onClick={reopen}>✎</button>
+            <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag" title={t('Remove this mark')}
               onClick={() => { clearDraft(key); setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; }); }}>✕</button>
           </span>
         )}
@@ -1267,7 +1268,7 @@ export const ReviewPane: React.FC<{
           <button
             type="button"
             className={`rv-edit-btn${editedHere ? ' has-note' : ''} nopan nodrag`}
-            title={`直接改${where}的原文（不经过模型；先标记，一起提交）`}
+            title={t('Edit the original text of {where} directly (no model; marked now, submitted together)', { where })}
             onClick={(e) => {
               e.stopPropagation();
               /* 第一次打开时框里放这一块现在的原文 —— 你在它上面改，而不是对着空框重打一遍 */
@@ -1280,7 +1281,7 @@ export const ReviewPane: React.FC<{
           <button
             type="button"
             className={`rt-block-drop${gone ? ' on' : ''} nopan nodrag`}
-            title={gone ? '不删了' : `把${where}标成删除（点「✓ 确认」时一起提交）`}
+            title={gone ? t('Keep it') : t('Mark {where} for deletion (submitted together when you click "✓ Confirm")', { where })}
             onClick={(e) => {
               e.stopPropagation();
               setDropped((cur) => { const n = { ...cur }; if (gone) delete n[block.index]; else n[block.index] = true; return n; });
@@ -1292,13 +1293,13 @@ export const ReviewPane: React.FC<{
           <button
             type="button"
             className={`rv-insert-btn${draftOf(`+${block.index}`).trim() ? ' has-note' : ''} nopan nodrag`}
-            title={`在${where}后面加新内容（先标记，一起提交）`}
+            title={t('Add new content after {where} (marked now, submitted together)', { where })}
             onClick={(e) => { e.stopPropagation(); openBox('insert', block.index); }}
           >＋</button>
         )}
         {!boxOpen && !gone && (
           <CommentOpener onClick={() => openBox('comment', block.index)} active={!!draftOf(String(block.index)).trim()}
-            title={`对${where}提意见（先标记，点「✓ 确认」时一起提交）`} />
+            title={t('Comment on {where} (marked now, submitted together when you click "✓ Confirm")', { where })} />
         )}
       </div>
     );
@@ -1317,8 +1318,8 @@ export const ReviewPane: React.FC<{
     const insert = insertAt === anchor;
     return markBox(
       insert ? `+${anchor}` : String(anchor),
-      insert ? `＋ 加在${where}后面` : `💬 改${where}`,
-      insert ? '写要加的内容，或者说清要它写什么' : '这一段要怎么改',
+      insert ? t('+ Add after {where}', { where }) : t('💬 Revise {where}', { where }),
+      insert ? t('Write what to add, or describe what it should write') : t('How should this passage change?'),
       insert ? '＋' : '💬',
       () => { setOpenAt(null); setInsertAt(null); },
     );
@@ -1332,7 +1333,7 @@ export const ReviewPane: React.FC<{
     const where = spanWhere(anchor);
     return (
         <div className="rv-note-slot rv-edit-slot">
-          <div className="rv-box-target">✎ 直接改{where}（不经过模型）</div>
+          <div className="rv-box-target">{t('✎ Edit {where} directly (no model)', { where })}</div>
           <CommentBox
             value=""
             mark="✎"
@@ -1340,7 +1341,7 @@ export const ReviewPane: React.FC<{
             onDraft={(next) => typeDraft(`=${anchor}`, next)}
             startOpen
             rows={Math.min(14, Math.max(3, blockSource(anchor).split('\n').length + 1))}
-            placeholder="这一块的原文 —— 直接改"
+            placeholder={t('The original text of this block. Edit it directly.')}
             onApply={() => submitAll()}
             applyWhenEmpty={markCount > 0}
             applyLabel={confirmLabel}
@@ -1360,12 +1361,12 @@ export const ReviewPane: React.FC<{
       <button
         type="button"
         className={`rt-block-drop rv-drop-page${gone ? ' on' : ''} nopan nodrag`}
-        title={gone ? '不删了' : '把这一页标成删除 —— 版面和讲稿一起（点「✓ 确认」时一起提交）'}
+        title={gone ? t('Keep it') : t('Mark this page for deletion, slide and notes together (submitted together when you click "✓ Confirm")')}
         onClick={() => {
           setDropped((cur) => { const n = { ...cur }; if (gone) delete n[page]; else n[page] = true; return n; });
           if (!gone) bumpMark(`drop:${page}`);
         }}
-      >{gone ? '↩ 不删了' : '✕ 删掉这一页'}</button>
+      >{gone ? t('↩ Keep it') : t('✕ Delete this page')}</button>
     );
   };
 
@@ -1381,9 +1382,9 @@ export const ReviewPane: React.FC<{
         {!open && !adding && (
           <div className="rv-page-tools">
             <div className="rv-review-tools">
-              <CommentOpener onClick={() => openBox('comment', page)} active={!!draftOf(String(page)).trim()} title={`对第 ${page} 页的版面提意见`} />
+              <CommentOpener onClick={() => openBox('comment', page)} active={!!draftOf(String(page)).trim()} title={t('Comment on the layout of page {page}', { page })} />
               <button type="button" className={`rv-insert-btn${draftOf(`+${page}`).trim() ? ' has-note' : ''} nopan nodrag`}
-                title={`在第 ${page} 页后面加一页`}
+                title={t('Add a page after page {page}', { page })}
                 onClick={(e) => { e.stopPropagation(); openBox('insert', page); }}>＋</button>
             </div>
           </div>
@@ -1391,8 +1392,8 @@ export const ReviewPane: React.FC<{
         {!open && markChip(String(page), '💬', () => openBox('comment', page))}
         {!adding && markChip(`+${page}`, '＋', () => openBox('insert', page))}
         {submitHerePage(page, false) && submitRow}
-        {open && markBox(String(page), `💬 改第 ${page} 页的版面`, live ? '这一页的字 / 框要怎么改' : '这一页要怎么改（会发给会话去改）', '💬', () => setOpenAt(null))}
-        {adding && markBox(`+${page}`, `＋ 第 ${page} 页后面加一页`, '写这一页要讲什么', '＋', () => setInsertAt(null))}
+        {open && markBox(String(page), t('💬 Revise the layout of page {page}', { page }), live ? t('How should the text / boxes on this page change?') : t('How should this page change? (sent to the session to do)'), '💬', () => setOpenAt(null))}
+        {adding && markBox(`+${page}`, t('+ Add a page after page {page}', { page }), t('What should this page cover?'), '＋', () => setInsertAt(null))}
       </>
     );
   };
@@ -1411,12 +1412,12 @@ export const ReviewPane: React.FC<{
       <div className="rv-page-tools rv-note-tools-row">
         {!open && (
           <div className="rv-review-tools rv-note-tools">
-            <CommentOpener onClick={() => { closeBoxes(); setNoteOpenAt(page); }} active={!!draftOf(key).trim()} title="对这一页的讲稿提意见" />
+            <CommentOpener onClick={() => { closeBoxes(); setNoteOpenAt(page); }} active={!!draftOf(key).trim()} title={t('Comment on this page\'s speaker notes')} />
           </div>
         )}
         {!open && markChip(key, '🗒', () => { closeBoxes(); setNoteOpenAt(page); })}
         {submitHerePage(page, true) && submitRow}
-        {open && markBox(key, `🗒 改第 ${page} 页的讲稿`, '改的是备注，不是幻灯片上的字', '🗒', () => setNoteOpenAt(null))}
+        {open && markBox(key, t('🗒 Revise the speaker notes of page {page}', { page }), t('This changes the notes, not the text on the slide'), '🗒', () => setNoteOpenAt(null))}
       </div>
     );
   };
@@ -1424,9 +1425,9 @@ export const ReviewPane: React.FC<{
   /** 发给会话之后那一句确认 / 备份没成的警告。 */
   const statusLine = (justSent || backupWarn || writeWarn) ? (
     <div className="rv-review-status">
-      {justSent && <p className="rv-review-sent">已发给这份文件的会话 —— 去那条会话里看它怎么改。</p>}
-      {writeWarn && <p className="rv-review-warn">读不到这份文件，这次没提交（{writeWarn}）—— 标记都还在，连上之后再点「✓ 确认」。</p>}
-      {backupWarn && <p className="rv-review-warn">发之前没能备份这份文件（{backupWarn}）—— 会话改坏了没有副本可回滚。</p>}
+      {justSent && <p className="rv-review-sent">{t('Sent to this file\'s session. Check that session to see how it edits the file.')}</p>}
+      {writeWarn && <p className="rv-review-warn">{t('Couldn\'t read this file, so nothing was submitted ({why}). Your marks are all still here; click "✓ Confirm" again once it\'s reachable.', { why: writeWarn })}</p>}
+      {backupWarn && <p className="rv-review-warn">{t('Couldn\'t back up this file before sending ({why}). If the session breaks it, there\'s no copy to roll back to.', { why: backupWarn })}</p>}
     </div>
   ) : null;
   /**
@@ -1435,35 +1436,35 @@ export const ReviewPane: React.FC<{
    */
   const wholeJobs = jobs.filter((j) => j.kind === 'whole');
   const summary = [
-    marks.edit.length ? `${marks.edit.length} 处直接改` : '',
-    marks.revise.length ? `${marks.revise.length} 处修改` : '',
-    marks.note.length ? `${marks.note.length} 处讲稿` : '',
-    marks.insert.length ? `${marks.insert.length} 处新增` : '',
-    marks.drops.length ? `${marks.drops.length} 处删除` : '',
-    marks.whole ? '整篇意见' : '',
-  ].filter(Boolean).join('、');
+    marks.edit.length ? t('{n} direct edits', { n: marks.edit.length }) : '',
+    marks.revise.length ? t('{n} revisions', { n: marks.revise.length }) : '',
+    marks.note.length ? t('{n} notes edits', { n: marks.note.length }) : '',
+    marks.insert.length ? t('{n} additions', { n: marks.insert.length }) : '',
+    marks.drops.length ? t('{n} deletions', { n: marks.drops.length }) : '',
+    marks.whole ? t('whole-document comment') : '',
+  ].filter(Boolean).join(t(', '));
   const wholeBox = (
     <div className="rv-review-whole">
-      <div className="rv-box-target">对整篇{isDeck ? '（整份 deck）' : '文章'}的修改意见</div>
+      <div className="rv-box-target">{isDeck ? t('Comments on the whole deck') : t('Comments on the whole document')}</div>
       <textarea
         className="rt-note rv-review-whole-input"
         rows={2}
         value={wholeDraft}
         onChange={(e) => setWholeDraft(e.target.value)}
         onKeyDown={(e) => { if (e.key === 'Enter' && (e.metaKey || e.ctrlKey)) { e.preventDefault(); submitAll(); } }}
-        placeholder="落不到某一段上的那些 —— 整体口径、结构、语气、缺了什么"
+        placeholder={t('Things that don\'t belong to one passage: overall framing, structure, tone, what\'s missing')}
       />
       {applyNote.whole && <div className="rt-note-applied">{applyNote.whole}</div>}
       {wholeJobs.map(jobRow)}
       <div className="rt-note-actions rv-review-whole-actions">
-        <span className="rv-review-count">{markCount ? `已标记：${summary}` : '还没有标记'}</span>
+        <span className="rv-review-count">{markCount ? t('Marked: {summary}', { summary }) : t('No marks yet')}</span>
         <button
           type="button"
           className="rt-note-apply nopan nodrag"
           disabled={markCount === 0}
           title={confirmTitle}
           onClick={() => submitAll()}
-        >{markCount > 1 ? `提交（${markCount} 处）` : '提交'}</button>
+        >{markCount > 1 ? t('Submit ({n})', { n: markCount }) : t('Submit')}</button>
       </div>
     </div>
   );
@@ -1487,7 +1488,7 @@ export const ReviewPane: React.FC<{
   const anyBoxOpen = openAt !== null || insertAt !== null || editAt !== null || noteOpenAt !== null;
   const submitRow = (
     <div className="rv-mark-submit">
-      <span className="rv-review-count">已标记：{summary}</span>
+      <span className="rv-review-count">{t('Marked: {summary}', { summary })}</span>
       <button type="button" className="rt-note-apply nopan nodrag" title={confirmTitle} onClick={() => submitAll()}>
         {confirmLabel}
       </button>
@@ -1503,7 +1504,7 @@ export const ReviewPane: React.FC<{
     !!latestMark && !anyBoxOpen && markCount > 0 && latestMark.line === page && latestMark.note === note;
   /** 没有主人会话：明说只能看（入口都不给，见 `on`）。 */
   const ownerless = !sessionId && (isDeck || commenting)
-    ? <p className="rv-review-hint">这个标签页没有归属会话（不是从某条会话里打开的）—— 只能看。从会话里点开文件链接才能逐段改。</p>
+    ? <p className="rv-review-hint">{t('This tab doesn\'t belong to a session (it wasn\'t opened from one), so it\'s read-only. Open the file link from a session to edit it passage by passage.')}</p>
     : null;
 
   /* ── deck 的早返回：**必须在所有 hook 之后**（转换失败那支不走后面的 hook 会让 React 报 hooks 数量不一致） ── */
@@ -1524,7 +1525,7 @@ export const ReviewPane: React.FC<{
                   window.setTimeout(() => setCopied(false), 1500);
                 }).catch(() => {});
               }}
-            >{copied ? '已复制' : '复制命令'}</button>
+            >{copied ? t('Copied') : t('Copy command')}</button>
           </div>
         )}
       </div>
@@ -1533,7 +1534,7 @@ export const ReviewPane: React.FC<{
   if (isDeck && !bytes) {
     return (
       <div className="rv-review rv-review-loading" ref={rootRef}>
-        {/\.pdf$/i.test(path) ? '正在读取 PDF…' : '正在转成 PDF…（第一次会慢一些，之后走缓存）'}
+        {/\.pdf$/i.test(path) ? t('Reading PDF…') : t('Converting to PDF… (slower the first time, cached after that)')}
       </div>
     );
   }
@@ -1549,7 +1550,7 @@ export const ReviewPane: React.FC<{
           <ol className="rv-review-pagerow">
             {blocks.map((block) => (
               <li key={block.index} className={`rv-review-pagecell${dropped[block.index] ? ' dropped' : ''}`}>
-                <span className="rv-review-anchor">第 {block.index} {unit}</span>
+                <span className="rv-review-anchor">{t('Page {n}', { n: block.index })}</span>
                 {dropPageBtn(block.index)}
               </li>
             ))}
@@ -1572,12 +1573,12 @@ export const ReviewPane: React.FC<{
                 <>
                   <div className={`rv-review-pagecell${dropped[page] ? ' dropped' : ''}`}>
                     <div className="rv-page-head">
-                      <span className="rv-review-anchor">第 {page} {unit}</span>
+                      <span className="rv-review-anchor">{t('Page {n}', { n: page })}</span>
                       {on && !jobs.some((j) => j.line === page) && dropPageBtn(page)}
                     </div>
                     {note
                       ? <div className="rv-review-note">{note}</div>
-                      : <div className="rv-review-note empty">（这一页没写备注）</div>}
+                      : <div className="rv-review-note empty">{t('(No notes on this page)')}</div>}
                   </div>
                   {/* 讲稿的入口在那个带边框的格子**外面**（「不要让 comment 按钮在 note 框内」） */}
                   {noteToolRow(page)}
@@ -1593,21 +1594,21 @@ export const ReviewPane: React.FC<{
               if (!said && !saidNote && !adding && !gone) return null;
               return (
                 <div className="rv-pdf-mark" onClick={(e) => e.stopPropagation()}>
-                  {gone && <span className="rv-pdf-mark-drop" title={`第 ${page} 页标了删除`}>✕ 已标删</span>}
+                  {gone && <span className="rv-pdf-mark-drop" title={t('Page {page} is marked for deletion', { page })}>{t('✕ Marked for deletion')}</span>}
                   {said && (
                     <button type="button" className="rv-pdf-mark-note nopan nodrag"
-                      title={`第 ${page} 页【版面】的意见：${said}\n（点开可以改）`}
-                      onClick={() => openBox('comment', page)}>💬 版面</button>
+                      title={t('Layout comment on page {page}: {text}\n(click to edit)', { page, text: said })}
+                      onClick={() => openBox('comment', page)}>{t('💬 Layout')}</button>
                   )}
                   {saidNote && (
                     <button type="button" className="rv-pdf-mark-note note nopan nodrag"
-                      title={`第 ${page} 页【讲稿】的意见：${saidNote}\n（点开可以改）`}
-                      onClick={() => { closeBoxes(); setNoteOpenAt(page); }}>🗒 讲稿</button>
+                      title={t('Speaker-notes comment on page {page}: {text}\n(click to edit)', { page, text: saidNote })}
+                      onClick={() => { closeBoxes(); setNoteOpenAt(page); }}>{t('🗒 Notes')}</button>
                   )}
                   {adding && (
                     <button type="button" className="rv-pdf-mark-note nopan nodrag"
-                      title={`第 ${page} 页后面要加一页：${adding}\n（点开可以改）`}
-                      onClick={() => openBox('insert', page)}>＋ 加页</button>
+                      title={t('New page to add after page {page}: {text}\n(click to edit)', { page, text: adding })}
+                      onClick={() => openBox('insert', page)}>{t('+ Add page')}</button>
                   )}
                 </div>
               );
@@ -1705,9 +1706,9 @@ export const ReviewPane: React.FC<{
               {on && !locked && editedHere && (
                 <div className="rt-brief-row rv-edited-row">
                   <span className="rt-hist-one">
-                    <span className="rv-edited-tag">✎ 已直接改（未提交）</span>
-                    <button type="button" className="rt-hist-btn nopan nodrag" title="接着改" onClick={() => openBox('edit', g.anchor)}>✎</button>
-                    <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag" title="撤销这处直接改，恢复原文"
+                    <span className="rv-edited-tag">{t('✎ Edited directly (not submitted)')}</span>
+                    <button type="button" className="rt-hist-btn nopan nodrag" title={t('Keep editing')} onClick={() => openBox('edit', g.anchor)}>✎</button>
+                    <button type="button" className="rt-hist-btn rt-hist-del nopan nodrag" title={t('Undo this direct edit and restore the original')}
                       onClick={() => clearDraft(`=${g.anchor}`)}>✕</button>
                   </span>
                   {applyNote[`=${g.anchor}`] && <div className="rt-note-applied">{applyNote[`=${g.anchor}`]}</div>}
@@ -1723,14 +1724,13 @@ export const ReviewPane: React.FC<{
                 <div className="rv-ai-side">
                   {aiHere.map((m) => (
                     <span key={`ai:${m.id}`} className="rv-ai-one">
-                      <span className="rv-ai-tag" title={m.original ? `原来是：
-${m.original}` : '原来这里没有这段'}>
-                        {m.to < m.from ? 'AI 删了一段' : 'AI 刚改过'}
+                      <span className="rv-ai-tag" title={m.original ? t('It used to be:\n{text}', { text: m.original }) : t('This passage wasn\'t here before')}>
+                        {m.to < m.from ? t('AI deleted a passage') : t('AI just changed this')}
                       </span>
                       {sessionId && !locked && (
                         <button type="button" className="rt-hist-btn rv-ai-undo nopan nodrag"
-                          title="只把这一段恢复成改之前的原文（写前会备份）"
-                          onClick={() => { void undoAi(m.id); }}>撤销</button>
+                          title={t('Restore just this passage to its original text (backed up before writing)')}
+                          onClick={() => { void undoAi(m.id); }}>{t('Undo')}</button>
                       )}
                     </span>
                   ))}

@@ -27,6 +27,7 @@
 
 import path from 'path';
 import type { HostOps } from './hostOps.ts';
+import { tr } from './uiText.ts';
 
 /** kiro-cli 把 chat 日志写在 TMPDIR 下（实测 macOS 和 AL2023 都是 `$TMPDIR/kiro-log/kiro-chat.log`）。 */
 export function kiroCliLogPath(tmpdir: string): string {
@@ -94,21 +95,18 @@ export function explainCliError(lines: CliLogLine[]): string {
       最大的 9.11%；失败按时间聚堆（25 分钟里 13 失败 1 成功，之后 9 成功 1 失败）。
       也就是说这是**服务端那一段时间在返空响应**，跟你的消息、跟这条对话都没关系。
     */
-    return 'kiro-cli 的日志里是 `err=EmptyResponse`：服务端把回复流开了，但一个 token 都没发过来。'
-      + '这跟你的消息、跟这条对话的历史都没关系（实测：换一个几乎空的新会话照样失败，而上下文'
-      + '更满的那个反而好了；失败是按时间段聚堆的）。KiroLex 会按退避自己重发；'
-      + '整段时间都这样就换个模型，或者过几分钟再来。';
+    return tr('The kiro-cli log says `err=EmptyResponse`: the server opened the reply stream but never sent a single token. This has nothing to do with your message or this conversation\'s history (tested: a nearly empty new session fails just the same, while a fuller one worked; failures cluster in time). KiroLex will resend with backoff by itself; if it keeps happening for a while, switch models or come back in a few minutes.');
   }
   if (/dispatch failure|ConnectorError|timeout/i.test(t)) {
-    return `kiro-cli 的日志里是连接层错误（${t.slice(0, 90)}）：连不上后端。看网络/VPN。`;
+    return tr('The kiro-cli log shows a connection error ({detail}): the backend is unreachable. Check your network/VPN.', { detail: t.slice(0, 90) });
   }
   if (/Throttl|429|TooManyRequests/i.test(t)) {
-    return `被限流了（${t.slice(0, 90)}）：等一下再发，或者换个模型。`;
+    return tr('Rate limited ({detail}): wait a moment before sending again, or switch models.', { detail: t.slice(0, 90) });
   }
   if (/ValidationException|exceed|too large|max allowed/i.test(t)) {
-    return `服务端判这次请求不合法（${t.slice(0, 120)}）：通常是历史里有超限的东西（图片、过长的一段）。`;
+    return tr('The server rejected this request as invalid ({detail}): usually something in the history is over the limit (an image, an overly long block).', { detail: t.slice(0, 120) });
   }
-  return `kiro-cli 的日志里是：${t.slice(0, 160)}`;
+  return tr('The kiro-cli log says: {detail}', { detail: t.slice(0, 160) });
 }
 
 /**

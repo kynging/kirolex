@@ -1,4 +1,5 @@
 import path from 'node:path';
+import { tr } from './uiText.ts';
 /**
  * READING A REAL `SKILL.md` — the file kiro-cli itself loads. PURE, no fs, no IPC.
  *
@@ -240,11 +241,11 @@ export function describeSkill(doc: SkillDoc): string {
   const writes = doc.rules.filter((r) => r.writes).length;
   const rows = doc.tables.reduce((sum, t) => sum + t.rows.length, 0);
   return [
-    doc.name || doc.title || '(未命名)',
-    `${doc.rules.length} 条规则`,
-    pauses ? `${pauses} 处要人参与` : '',
-    writes ? `${writes} 处写外部系统` : '',
-    doc.tables.length ? `${doc.tables.length} 张表 / ${rows} 行` : '',
+    doc.name || doc.title || tr('(untitled)'),
+    tr('{n} rules', { n: doc.rules.length }),
+    pauses ? tr('{n} need a person', { n: pauses }) : '',
+    writes ? tr('{n} write to external systems', { n: writes }) : '',
+    doc.tables.length ? tr('{tables} tables / {rows} rows', { tables: doc.tables.length, rows }) : '',
   ].filter(Boolean).join(' · ');
 }
 
@@ -261,14 +262,14 @@ export function kiroSkillTarget(
   filePath: string,
   home: string,
 ): { ok: true; name: string; path: string } | { ok: false; why: string } {
-  if (typeof filePath !== 'string' || !filePath.trim()) return { ok: false, why: '没有给路径' };
+  if (typeof filePath !== 'string' || !filePath.trim()) return { ok: false, why: tr('No path given') };
   const root = path.resolve(home, '.kiro', 'skills');
   const full = path.resolve(filePath);
   const rel = path.relative(root, full);
-  if (rel.startsWith('..') || path.isAbsolute(rel)) return { ok: false, why: `不在 ${root} 下面` };
+  if (rel.startsWith('..') || path.isAbsolute(rel)) return { ok: false, why: tr('Not under {root}', { root }) };
   const parts = rel.split(path.sep);
-  if (parts.length !== 2) return { ok: false, why: 'skill 必须是 <名字>/SKILL.md 这一层' };
-  if (parts[1] !== 'SKILL.md') return { ok: false, why: '只能写 SKILL.md' };
+  if (parts.length !== 2) return { ok: false, why: tr('A skill must be exactly <name>/SKILL.md') };
+  if (parts[1] !== 'SKILL.md') return { ok: false, why: tr('Only SKILL.md can be written') };
   return { ok: true, name: parts[0], path: full };
 }
 

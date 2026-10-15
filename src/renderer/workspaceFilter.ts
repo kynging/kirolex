@@ -6,6 +6,8 @@
  * 要找远处的文件,先切目录。
  */
 
+import { t, type Lang } from './i18n.ts';
+
 export interface FilterableEntry {
   name: string;
   isDir: boolean;
@@ -36,8 +38,8 @@ export function filterEntries<T extends FilterableEntry>(entries: T[], query: st
  * 搜索结果那行说明。**查了没命中要明说** —— 否则一个空列表和「这个目录本来就是空的」
  * 长得一模一样,而那两件事你要做的动作完全不同(换词 / 换目录)。
  */
-export function filterNote(arg: { query: string; shown: number; total: number }): string {
+export function filterNote(arg: { query: string; shown: number; total: number }, lang: Lang = 'zh'): string {
   if (!shouldFilter(arg.query)) return '';
-  if (arg.shown === 0) return `没有匹配「${arg.query.trim()}」的条目（共 ${arg.total} 个）`;
+  if (arg.shown === 0) return t(lang, 'Nothing matches "{query}" ({total} items)', { query: arg.query.trim(), total: arg.total });
   return `${arg.shown} / ${arg.total}`;
 }

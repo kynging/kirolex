@@ -1,4 +1,11 @@
 import React from 'react';
+import { normalizeLang, t, type Lang } from '../i18n';
+import { uiGet } from '../uiStore';
+
+/** 这个边界包在 App（也就是 LangProvider）外面，拿不到 context —— 直接读存下来的界面语言。 */
+function savedLang(): Lang {
+  try { return normalizeLang(JSON.parse(uiGet('kirolex-settings') || '{}')?.language); } catch { return normalizeLang(undefined); }
+}
 
 interface State { error: Error | null; }
 
@@ -51,14 +58,15 @@ export class ErrorBoundary extends React.Component<{ children: React.ReactNode }
   render() {
     if (!this.state.error) return this.props.children;
     const { error } = this.state;
+    const lang = savedLang();
     return (
       <div className="error-boundary">
-        <h2>Something broke in the UI</h2>
-        <p>KiroLex caught a rendering error instead of leaving a blank window.</p>
+        <h2>{t(lang, 'Something broke in the UI')}</h2>
+        <p>{t(lang, 'KiroLex caught a rendering error instead of leaving a blank window.')}</p>
         <pre>{error.message}{'\n'}{error.stack}</pre>
         <div className="error-boundary-actions">
-          <button className="btn allow" onClick={() => window.location.reload()}>Reload</button>
-          <button className="btn deny" onClick={() => this.setState({ error: null })}>Try to continue</button>
+          <button className="btn allow" onClick={() => window.location.reload()}>{t(lang, 'Reload')}</button>
+          <button className="btn deny" onClick={() => this.setState({ error: null })}>{t(lang, 'Try to continue')}</button>
         </div>
       </div>
     );

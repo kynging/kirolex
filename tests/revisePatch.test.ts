@@ -315,7 +315,7 @@ describe('主进程 / 界面接线', () => {
     assert.match(M, /\{ ok: false, conflict: true, error \}/);
   });
   test('界面的两处 patch 都经 patchReplyOutcome，成功只刷新（alreadyWritten），不自己写', () => {
-    assert.equal((RV.match(/const out = patchReplyOutcome\(res\);/g) || []).length, 2);
+    assert.equal((RV.match(/const out = patchReplyOutcome\(res, lang\);/g) || []).length, 2);
     /* 末尾带上「AI 刚改过」要的改动列表和轮次（见 `aiChanges.ts`）—— 照样是 alreadyWritten，不自己写 */
     assert.match(RV, /return writeBack\(base, out\.fullText, failKey, '', true, \{ ai: \{ changes: res\.changes, round \} \}\);/);
     assert.match(RV, /return writeBack\(base, out\.fullText, 'whole', '', true, \{ ai: \{ changes: res\.changes, round \} \}\);/);

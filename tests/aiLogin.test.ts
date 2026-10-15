@@ -95,7 +95,7 @@ describe('接线：只对远端，这台电脑上什么都不改', () => {
     const at = M.indexOf('const aiLoginTarget = (machine: string): RemoteTarget => {');
     assert.ok(at > 0);
     const body = M.slice(at, at + 1200);
-    assert.match(body, /const r = kiroConfigTargetFor\(machine\);\s*if \(!r\) throw new Error\('这条会话在本机跑/);
+    assert.match(body, /const r = kiroConfigTargetFor\(machine\);\s*if \(!r\) throw new Error\(tr\('This session runs on this computer\./);
     assert.match(body, /const t = findRemoteTarget\(KIROLEX_CONFIG_PATH, machine\);/);
     for (const ch of ['ai-login:status', 'ai-login:apply', 'ai-login:run']) {
       const at = M.indexOf(`ipcMain.handle('${ch}'`);
@@ -186,7 +186,8 @@ describe('默认走 Amazon Bedrock ——「默认将模型设置为 bedrock 的
     assert.match(M2, /if \(input\.mode === 'bedrock'\) \{/);
     assert.match(M2, /const cb = claudeBedrockOf\(settings \|\| ''\);/);
     const L = require_('src/renderer/components/LoginSettings.tsx');
-    assert.match(L, />用 Amazon Bedrock（推荐）</);
+    assert.match(L, />\{t\('Use Amazon Bedrock \(recommended\)'\)\}</);
+    assert.match(require_('src/renderer/i18nZh/settingsPanels.ts'), /'Use Amazon Bedrock \(recommended\)': '用 Amazon Bedrock（推荐）'/);
     assert.match(L, /aiLoginApply\?\.\(machine, \{ tool, mode: 'bedrock' \}\)/);
     const SH = require_('scripts/remote-bootstrap.sh');
     assert.match(SH, /step "默认模型：Amazon Bedrock"/);

@@ -27,7 +27,7 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
       await onRespond(optionId);
     } catch (responseError: any) {
       setSubmitting(false);
-      setError(responseError?.message || 'Failed to send the permission decision.');
+      setError(responseError?.message || t('Failed to send the permission decision.'));
     }
   };
 
@@ -69,7 +69,7 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
           )}
         </div>
       </div>
-      {error && <div className="permission-bar-error">⚠ {error} Try again.</div>}
+      {error && <div className="permission-bar-error">⚠ {error} {t('Try again.')}</div>}
     </div>
   );
 };

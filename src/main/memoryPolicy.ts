@@ -11,6 +11,8 @@
  * 「~1.3k chars (~300 tokens) per turn」—— 偏离 55 倍，并且完全无声。
  */
 
+import { trIn, type UiLang } from './uiText.ts';
+
 export type MemoryScope = 'global' | 'project' | 'session';
 
 /**
@@ -58,20 +60,22 @@ export interface MemoryBytes {
  * 没有 projectId / sessionId 的层直接跳过 —— 那条会话根本没有那一层，报了也无从下手。
  * 阈值用 `>` 而不是 `>=`：正好卡在线上时不出声，省掉一个反复闪的边界。
  */
-export function memoryWarnings({ projectId, sessionId, bytes }: {
+export function memoryWarnings({ projectId, sessionId, bytes, lang = 'zh' }: {
   projectId?: string;
   sessionId?: string;
   bytes: MemoryBytes;
+  /** 横幅文字的语言（渲染层传当前界面语言；不传 = 中文） */
+  lang?: UiLang;
 }): MemoryWarning[] {
   const out: MemoryWarning[] = [];
   if (bytes.global > MEMORY_WARN_BYTES.global) {
-    out.push({ scope: 'global', bytes: bytes.global, label: '全局记忆' });
+    out.push({ scope: 'global', bytes: bytes.global, label: trIn(lang, 'Global memory') });
   }
   if (projectId && bytes.project > MEMORY_WARN_BYTES.project) {
-    out.push({ scope: 'project', bytes: bytes.project, label: `项目记忆「${projectId}」` });
+    out.push({ scope: 'project', bytes: bytes.project, label: trIn(lang, 'Project memory "{project}"', { project: projectId }) });
   }
   if (sessionId && bytes.session > MEMORY_WARN_BYTES.session) {
-    out.push({ scope: 'session', bytes: bytes.session, label: '本会话记忆' });
+    out.push({ scope: 'session', bytes: bytes.session, label: trIn(lang, "This chat's memory") });
   }
   return out;
 }

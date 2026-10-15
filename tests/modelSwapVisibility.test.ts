@@ -60,7 +60,7 @@ describe('换执行器期间必须报 busy', () => {
     assert.ok(fin > 0, '没有 finally');
     assert.match(body.slice(fin), /reconfiguringSessions\.delete\(sessionId\)/);
     // awaitReconfigureIdle 会等 30 秒然后抛错，所以漏清的代价是这条会话连不上
-    assert.match(MAIN, /会话切换模型\/Agent 超过 30 秒/);
+    assert.match(MAIN, /The model\/Agent switch for this session has not finished after 30 seconds/);
   });
 });
 

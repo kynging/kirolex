@@ -6,7 +6,7 @@ import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, 
 import { sessionsToWarm } from '../projectActivity';
 import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
-import { normalizeLang } from '../i18n';
+import { messageVariants, normalizeLang, pinShown, t as translate, type Lang } from '../i18n';
 import { toSlashCommands, type SlashCommand } from '../slashCommands';
 import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
@@ -36,6 +36,7 @@ import type { ScheduleView } from '../scheduleView';
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
+import { asVariants } from '../../main/uiText.ts';
 import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 
 export type { LoopSpec } from '../loopMachine';
@@ -202,6 +203,13 @@ function autoRetryMax(): number {
   } catch { return AUTO_RESEND_MAX_ATTEMPTS; }
 }
 
+/** 当前界面语言 —— useAcp 在 <LangProvider> 外面，useLang() 在这里只会拿到默认值，所以直接读设置（同删除会话那处）。 */
+function uiLangNow(): Lang {
+  try { return normalizeLang(JSON.parse(uiGet('kirolex-settings') || '{}')?.language); } catch { return normalizeLang(undefined); }
+}
+/** 按当前界面语言取文案（KiroLex 自己对人说的话；发给模型的提示词不走这里）。 */
+const t = (key: string, vars?: Record<string, string | number>): string => translate(uiLangNow(), key, vars);
+
 /**
  * 一轮已经有产出、却被"静默太久"判定卡死时自动发的那句（见 onTurnWedged）。
  * 只叫它接着做，不重复原问题；并点名最常见的成因 —— 一口气憋一大段长输出，期间没有任何工具调用。
@@ -303,6 +311,7 @@ function toStoredTranscript(messages: Message[]) {
       ...(m.attachments?.length ? { attachments: m.attachments } : {}),
       ...((m as any).pastes?.length ? { pastes: (m as any).pastes } : {}),
       ...(m.kirolex ? { kirolex: true as const } : {}),
+      ...(m.variants ? { variants: m.variants } : {}),
     }));
 }
 
@@ -313,15 +322,15 @@ function noticeForStopReason(reason: unknown, result?: any): string | null {
   if (norm === 'end_turn' || norm === 'endturn') return null;
   if (norm === 'cancelled' || norm === 'canceled') return null; // cancel path shows its own notice
   if (norm === 'max_tokens' || norm === 'maxtokens' || norm === 'max_token') {
-    return '⚠️ 回复被截断：达到本回合输出上限（stopReason: max_tokens）。发送「继续」可让它接着写。';
+    return t('⚠️ Reply cut off: hit the output limit for this turn (stopReason: max_tokens). Send "continue" to have it keep writing.');
   }
   if (norm === 'max_turn_requests' || norm === 'max_turn_request') {
-    return '⚠️ 回合被终止：达到本回合的工具调用次数上限（stopReason: max_turn_requests）。发送「继续」可让它接着做。';
+    return t('⚠️ Turn stopped: hit the tool-call limit for this turn (stopReason: max_turn_requests). Send "continue" to have it carry on.');
   }
   if (norm === 'refusal') {
-    return '⚠️ 模型拒绝了这次请求（stopReason: refusal）。换个说法或拆小问题再试。';
+    return t('⚠️ The model refused this request (stopReason: refusal). Try rephrasing or splitting it into smaller questions.');
   }
-  return `⚠️ 回合非正常结束（stopReason: ${r}）。`;
+  return t('⚠️ The turn ended abnormally (stopReason: {reason}).', { reason: r });
 }
 
 /** A turn that resolved with NO output and NO stated reason is abnormal too --
@@ -331,7 +340,9 @@ function noticeForEmptyTurn(result: any): string | null {
   if (produced !== false) return null;
   const r = String(result?.stopReason ?? '').trim().toLowerCase();
   if (r === 'cancelled' || r === 'canceled') return null; // cancel has its own banner
-  return `⚠️ 这一轮没有产生任何输出${r ? `（stopReason: ${r}）` : '，后端也没有说明结束原因'}。可以重发或点重跑。`;
+  return r
+    ? t('⚠️ This turn produced no output (stopReason: {reason}). You can resend or click Rerun.', { reason: r })
+    : t('⚠️ This turn produced no output, and the backend gave no reason. You can resend or click Rerun.');
 }
 
 export function useAcp() {  const [status, setStatus] = useState<ConnectionStatus>('disconnected');
@@ -525,6 +536,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  in a dependency array (those arrays are evaluated during render). */
   const noteError = useCallback((sid: string | null | undefined, message: string | null) => {
     const key = sid || currentSessionRef.current || APP_ERROR_KEY;
+    /* 钉住这句的中英两版（主进程给的原因也认，见 messageVariants；系统原文认不出就原样）——
+       切了语言，错误横幅按新语言显示（ChatArea 里 `shownIn`） */
+    if (message) pinShown(message, messageVariants(message));
     if (message) turnOutcomeRef.current.set(key, { kind: 'error', message });
     setErrorBySession((prev) => {
       if (!message) {
@@ -876,8 +890,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // Record which phase a session is in. Only surfaced for the viewed session;
   // background sessions keep their phase in the map for when you switch to them.
   const activityMapRef = useRef<Map<string, string>>(new Map());
-  const setSessionActivity = (sid: string | null, text: string | null) => {
+  const setSessionActivity = (sid: string | null, text: string | null, variants?: { zh: string; en: string }) => {
     if (!sid) return;
+    /* 钉住这句的中英两版：界面切了语言，还挂着的这句（当前会话和分屏后台会话）显示时按新语言取（`shownIn`） */
+    if (text) pinShown(text, variants);
     if (text) activityMapRef.current.set(sid, text);
     else activityMapRef.current.delete(sid);
     if (currentSessionRef.current === sid) setActivityStatus(text);
@@ -1039,7 +1055,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // while the chat is not marked streaming, and a chunk dropped before the seed would leave
     // a hole that only `acp:assistant-final` could heal.
     if (peek.text) mutateSessionMessagesRef.current?.(sid, (current) => adoptedMessages(current, peek));
-    setSessionActivity(sid, '⟳ 上一轮仍在运行，已接回它的回复（没有重发）');
+    setSessionActivity(sid, t('⟳ The previous turn is still running; reattached to its reply (not resent)'));
   };
 
   const recoverInterruptedTurn = (sid: string, msgs: Message[], opts?: {
@@ -1152,7 +1168,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // NOT "上一轮仍在收尾" any more: a live turn is adopted before this branch can be
           // reached, so what is being waited on here is an attach, a history rebuild or a
           // model/agent switch — never the previous turn.
-          if (!isRebuilding(sid)) setSessionActivity(sid, '⏳ 会话正忙（连接 / 重建中），稍后自动重发…');
+          if (!isRebuilding(sid)) setSessionActivity(sid, t('⏳ Chat is busy (connecting / rebuilding); will resend automatically shortly…'));
           await new Promise((r) => setTimeout(r, 3000));
         }
         return false;
@@ -1212,7 +1228,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (adopted) return;
 
       try { await window.kiroApi.setAutoResent?.(sid, `${key}#${attempts + 1}`); } catch {}
-      if (!isRebuilding(sid)) setSessionActivity(sid, `⟳ 上次未完成的这一轮，正在自动重发…（第 ${attempts + 1}/${autoRetryMax()} 次）`);
+      if (!isRebuilding(sid)) setSessionActivity(sid, t('⟳ Resending the unfinished turn automatically… (attempt {n}/{max})', { n: attempts + 1, max: autoRetryMax() }));
       /* 重试之间退避一下：执行器刚死就立刻重发，多半撞上同一个原因 */
       if (attempts > 0) await new Promise((r) => setTimeout(r, Math.min(30_000, 2000 * attempts)));
       if (recoveryCancelledRef.current.has(sid)) { setSessionActivity(sid, null); return; }
@@ -1222,7 +1238,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // A real failure IS worth a banner: the question would otherwise sit
         // unanswered with no explanation.
         setSessionActivity(sid, null);
-        noteError(sid, `自动重发失败：${error?.message || error}。可对该消息手动点重跑。`);
+        noteError(sid, t('Automatic resend failed: {error}. You can click Rerun on that message manually.', { error: String(error?.message || error) }));
       }
      } finally {
       markRecovering(sid, false);
@@ -1271,17 +1287,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  the context snapshot and history.md are rendered from. */
   const reportLoopEnd = useCallback((run: LoopRun, terminal: LoopTerminal) => {
     if (!shouldReportTerminal(terminal)) return;   // the chat itself is gone
-    const text = terminalSummary(run, terminal, Date.now());
+    const now = Date.now();
+    const text = terminalSummary(run, terminal, now, uiLangNow());
+    /* 这句是 KiroLex 写的：中英两版都留着，显示时按界面语言挑（切语言、重新打开都跟着换） */
+    const variants = { zh: terminalSummary(run, terminal, now, 'zh'), en: terminalSummary(run, terminal, now, 'en') };
     mutateSessionMessages(run.sessionId, (current) => [
       ...current,
       {
-        id: `loop_end_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
+        id: `loop_end_${now}_${Math.random().toString(36).slice(2, 6)}`,
         role: 'assistant',
         content: text,
-        timestamp: Date.now(),
+        variants,
+        timestamp: now,
       },
     ]);
-    void window.kiroApi.persistNote?.(run.sessionId, text).catch(() => {});
+    void window.kiroApi.persistNote?.(run.sessionId, text, variants).catch(() => {});
   }, [mutateSessionMessages]);
 
   /**
@@ -1568,6 +1588,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           attachments: m.attachments,
           pastes: (m as any).pastes,
           ...((m as any).kirolex ? { kirolex: true as const } : {}),
+            ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           timestamp: m.ts,
         }));
         messagesCacheRef.current.set(lastSid, restored);
@@ -1592,6 +1613,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             toolCalls: m.toolCalls, attachments: m.attachments,
             pastes: (m as any).pastes, timestamp: m.ts,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
+            ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           }));
           messagesCacheRef.current.set(sid, msgs);
           rebuildFileChanges(sid, msgs, currentSessionRef.current === sid);
@@ -1661,7 +1683,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           await new Promise((r) => setTimeout(r, 50)); // up to ~2s
         }
         if (cancelled) return;
-        await window.kiroApi.splashStatus?.('Loading session history…');
+        await window.kiroApi.splashStatus?.(t('Loading session history…'));
         // Decide the warm set and mark it connecting BEFORE the window shows,
         // otherwise the first painted frame has every dot grey ("not connected")
         // and the UI looks broken for a moment. getExecutorCap is a cheap
@@ -2019,7 +2041,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // is no structured ACP event for it — verified via probe). Surface it
           // as a transient status so the user knows what the quiet turn is doing.
           if (/compacting|compact(ing)? (the )?conversation|compact(ing)? context|正在压缩|压缩上下文|压缩对话/i.test(text)) {
-            setSessionActivity(targetSid, '🗜️ 正在压缩上下文…');
+            setSessionActivity(targetSid, t('🗜️ Compacting context…'));
           }
 
           // Safety: only write to active session if it's actually streaming.
@@ -2098,7 +2120,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           const diffs = extractDiffs(update);
           const tc: ToolCall = {
             toolCallId: update.toolCallId,
-            title: update.title || 'Tool call',
+            title: update.title || t('Tool call'),
             status: update.status || 'pending',
             kind: update.kind,
             locations,
@@ -2122,7 +2144,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             第一条就是 update 的（没见过 tool_call）也建一条，和主进程一致。
           */
           const existing = toolCallsRef.current.get(update.toolCallId)
-            ?? (update.toolCallId ? { toolCallId: update.toolCallId, title: update.title || 'Tool call', status: update.status || 'in_progress', kind: update.kind } as any : undefined);
+            ?? (update.toolCallId ? { toolCallId: update.toolCallId, title: update.title || t('Tool call'), status: update.status || 'in_progress', kind: update.kind } as any : undefined);
           if (existing) {
             if (update.status) existing.status = update.status;
             if (typeof update.title === 'string' && update.title.trim()) existing.title = update.title;
@@ -2175,7 +2197,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           const toolTitle = update.toolCall?.title
             || update.tool?.name
             || update.toolName
-            || 'Tool permission required';
+            || t('Tool permission required');
           const trustDisplay = update._meta?.trustOptions?.[0]?.display;
           const description = update.description
             || update.tool?.description
@@ -2381,7 +2403,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     /** 挂到**那条会话**的错误横幅上：MCP 是按会话起的，要看得出是哪条会话的工具坏了 */
     const removeNotice = window.kiroApi.onNotice?.((n) => {
       if (!n?.text) return;
-      noteError(n.sessionId || null, `${n.label}：${n.text}`);
+      noteError(n.sessionId || null, t('{label}: {text}', { label: n.label, text: n.text }));
     });
 
     // Turn end: adopt main's authoritative full assistant text. The streaming
@@ -2394,7 +2416,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (!sid) return;
       setSubagents((cur) => ({ ...cur, [sid]: Array.isArray(rows) ? rows : [] }));
     });
-    const removeSessionBusy = window.kiroApi.onSessionBusy?.(({ sessionId: sid, reason, detail }) => {
+    const removeSessionBusy = window.kiroApi.onSessionBusy?.(({ sessionId: sid, reason, detail, detailVariants }) => {
       if (!sid) return;
       // Mirror the rebuild state so background flows (auto-resend) can avoid
       // overwriting its status line -- that clobbering is why the rebuild looked
@@ -2403,9 +2425,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       else primeStateRef.current.delete(sid);
       // Rebuild progress ("重建历史上下文 2/5") must be visible: a large chat can
       // spend a minute here, and a silent wait is indistinguishable from a hang.
-      if (reason === 'priming') setSessionActivity(sid, `⏳ ${detail || '重建历史上下文'}…`);
+      if (reason === 'priming') {
+        const dv = asVariants(detailVariants);
+        setSessionActivity(sid, `⏳ ${detail || t('Rebuilding history context')}…`,
+          detail
+            ? (dv ? { zh: `⏳ ${dv.zh}…`, en: `⏳ ${dv.en}…` } : undefined)
+            : { zh: `⏳ ${translate('zh', 'Rebuilding history context')}…`, en: `⏳ ${translate('en', 'Rebuilding history context')}…` });
+      }
       else if (reason === 'prime-pending') {
-        setSessionActivity(sid, '⏳ 历史上下文缺失，正在重建（会重试到完成）；新消息排队，完成后依次发出。按 Stop 放弃重建（之后的消息会照常发出，只是后端没有这个会话的历史）');
+        setSessionActivity(sid, t('⏳ History context is missing; rebuilding (retries until done). New messages are queued and sent in order afterwards. Press Stop to abandon the rebuild (later messages still go out, but the backend will have no history for this chat)'));
         // Marking the chat busy is only safe if the rebuild actually STARTS. Main
         // kicks every one of them at attach, so this is only a backstop for a
         // missed trigger -- and it is limited to the chat the user is LOOKING at.
@@ -2428,7 +2456,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
       } else {        primeKickedRef.current.delete(sid);
         if (activityMapRef.current.get(sid)?.includes('重建')
-            || activityMapRef.current.get(sid)?.includes('历史上下文')) {
+            || activityMapRef.current.get(sid)?.includes('历史上下文')
+            || /rebuil|history context/i.test(activityMapRef.current.get(sid) || '')) {   // 英文界面下的同一行
           setSessionActivity(sid, null);
         }
       }
@@ -2437,7 +2466,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (adoptedTurnsRef.current.has(sid) && reason !== 'turn') {
         adoptedTurnsRef.current.delete(sid);
         removeStreaming(sid);
-        if (activityMapRef.current.get(sid)?.includes('已接回')) setSessionActivity(sid, null);
+        if (activityMapRef.current.get(sid)?.includes('已接回') || activityMapRef.current.get(sid)?.includes('reattached')) setSessionActivity(sid, null);
       }
       setBusyBySession((prev) => {
         const current = prev[sid] || null;
@@ -2501,7 +2530,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const cached = messagesCacheRef.current.get(sid);
       if (cached) messagesCacheRef.current.set(sid, dropPartial(cached));
       if (sid === currentSessionRef.current) setMessages((prev) => dropPartial(prev));
-      setSessionActivity(sid, '上一次尝试无响应，正在重试…');
+      setSessionActivity(sid, t('The last attempt got no response; retrying…'));
     });
 
     // Long silence on a running turn. Purely informational: shown as the session's
@@ -2558,7 +2587,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           if (!resendOff && max > 0 && done < max) {
             wedgeContinuesRef.current.set(sid, done + 1);
             autoContinueInFlightRef.current.add(sid);
-            setSessionActivity(sid, `⚠️ 这一轮静默太久被中断，正在自动续写（第 ${done + 1}/${max} 次）…`);
+            setSessionActivity(sid, t('⚠️ This turn was silent too long and got interrupted; continuing automatically (attempt {n}/{max})…', { n: done + 1, max }));
             try {
               await sendMessageRef.current([{ type: 'text', text: WEDGE_CONTINUE_PROMPT }], undefined, undefined, undefined, undefined, sid);
             } catch {
@@ -2574,7 +2603,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         return;
       }
       // The auto-resend, by contrast, IS live, so it gets a status line.
-      setSessionActivity(sid, '⚠️ 该轮无响应，已中断，正在自动重发…');
+      setSessionActivity(sid, t('⚠️ No response this turn; interrupted and resending automatically…'));
 
       void (async () => {
         // The event is emitted the moment main DECIDES, before the interrupt lands,
@@ -2629,7 +2658,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
         if (autoRecover) {
           markRecovering(sid, true);
-          setSessionActivity(sid, '⟳ 执行器中途断了，重连后自动重发这一轮…');
+          setSessionActivity(sid, t('⟳ The executor dropped mid-turn; will reconnect and resend this turn automatically…'));
         }
         // AUTO-RECOVERY: the executor process is genuinely gone, so bring the
         // session back by itself instead of leaving a dead grey chat that only
@@ -2729,7 +2758,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       setStatus('connected');
     } catch (err: any) {
       setStatus('disconnected');
-      noteError(null, err?.message || 'Failed to connect');
+      noteError(null, err?.message || t('Failed to connect'));
     }
   }, []);
 
@@ -2871,12 +2900,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         */
         markFailed(id);
         const why = String(err?.message || err);
-        mutateSessionMessages(id, (cur) => [...cur, {
-          id: `msg_${Date.now()}`,
-          role: 'kirolex' as any,
-          content: `⚠️ 这条会话没连上：${why}`,
-          timestamp: Date.now(),
-        } as Message]);
+        /* 和换机器重连失败那条同一个构造：整句（含 KiroLex 自己给的原因）都带中英两版 */
+        mutateSessionMessages(id, (cur) => [...cur, connectFailureNotice(why, Date.now(), uiLangNow())]);
         throw err;                       // 让 await 这个 promise 的那一侧知道它失败了
       } finally {
         creatingRef.current.delete(id);
@@ -2931,6 +2956,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             toolCalls: m.toolCalls,
             attachments: m.attachments,
             pastes: m.pastes,
+            ...(asVariants(m.variants) ? { variants: asVariants(m.variants) } : {}),
             timestamp: m.ts,
           }));
           // Only fill if nothing has been written to the fork meanwhile.
@@ -3051,6 +3077,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             attachments: (m as any).attachments,
             pastes: (m as any).pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
+            ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(id) || [];
@@ -3156,6 +3183,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             attachments: (m as any).attachments,
             pastes: (m as any).pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
+            ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(sessionId) || [];
@@ -3188,7 +3216,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       try {
         lastPromptedSessionRef.current = sessionId;
         markConnecting(sessionId); // flash while the executor attaches
-        setSessionActivity(sessionId, '正在连接会话…');
+        setSessionActivity(sessionId, t('Connecting to chat…'));
         const res = await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
         addAttached(sessionId);
         // Deliberately NOT rebuilding here on res.freshBackend. This path runs for
@@ -3284,7 +3312,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           rebuildFileChanges(sessionId, seeded, false);
         }
       }
-      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, connectFailureNotice(why)));
+      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, connectFailureNotice(why, undefined, uiLangNow())));
     } finally {
       clearConnecting(sessionId);
     }
@@ -3523,7 +3551,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ]);
           }
         } catch (err: any) {
-          noteError(sid, err?.message || 'Failed to create session');
+          noteError(sid, err?.message || t('Failed to create session'));
           return;
         }
       }
@@ -3634,7 +3662,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     recoveryCancelledRef.current.delete(sid!);
     addAttached(sid!); // first use -> live
     lastPromptedSessionRef.current = sid;
-    setSessionActivity(sid, '已发送，等待 Kiro 响应…');
+    setSessionActivity(sid, t('Sent, waiting for Kiro to respond…'));
 
     try {
       const res = await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });
@@ -3652,7 +3680,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // keep arriving) -- ADOPT it: show the session as busy again instead of
         // leaving a dead-looking chat. Its turn-end event clears this normally.
         if (!msg.includes('change to finish')) addStreaming(sid);
-        setSessionActivity(sid, '⏳ 当前回合仍在进行（可能在压缩上下文），请等它结束后再发送。');
+        setSessionActivity(sid, t('⏳ The current turn is still running (possibly compacting context). Please wait for it to finish before sending.'));
       } else {
         // Not attached (dormant/reopened this run) -> attach the SAME session
         // (main resumes its kiro-cli session; the KiroLex id stays stable) and retry once.
@@ -3663,15 +3691,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           这条内联重试只留给它本来的用途：给一条还没连上的会话发消息。
         */
         if (/Process exited|Disconnected/i.test(msg) && autoRetryMax() > 0 && !recoveryCancelledRef.current.has(sid!)) {
-          setSessionActivity(sid, '⟳ 执行器中途断了，重连后自动重发这一轮…');
+          setSessionActivity(sid, t('⟳ The executor dropped mid-turn; will reconnect and resend this turn automatically…'));
           return;
         }
         try {
           /* 你刚按了停止就别替你重连重发 */
           if (recoveryCancelledRef.current.has(sid!)) throw err;
-          setSessionActivity(sid, '正在重新连接会话…');
+          setSessionActivity(sid, t('Reconnecting to chat…'));
           await window.kiroApi.loadSession(sid, attachCwdFor(sid), activeModel);
-          setSessionActivity(sid, '已重连，重新发送…');
+          setSessionActivity(sid, t('Reconnected, resending…'));
           await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });
         } catch (retryErr: any) {
           const msg = String(retryErr?.message || retryErr || '');
@@ -3680,15 +3708,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // the user's chat (observed live). Surface it as a session activity
           // line; the un-answered user message is already marked for overwrite,
           // so re-submitting reruns that turn.
-          if (/active turn|context compaction|still (busy|running)/i.test(msg)) {
-            setSessionActivity(sid, '⏳ 上一轮仍在收尾，这条未发出；稍后可直接重发');
+          if (/active turn|context compaction|still (busy|running)|当前这一轮|上下文压缩/i.test(msg)) {
+            setSessionActivity(sid, t('⏳ The previous turn is still wrapping up, so this was not sent; you can resend it shortly'));
             removeStreaming(sid);
             return;
           }
-          turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || 'Failed to send message.' });
+          turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || t('Failed to send message.') });
           setMessages((prev) => [
             ...prev,
-            { id: `err_${Date.now()}`, role: 'assistant', content: `⚠️ ${retryErr?.message || 'Failed to send message.'}`, timestamp: Date.now() },
+            { id: `err_${Date.now()}`, role: 'assistant', content: `⚠️ ${retryErr?.message || t('Failed to send message.')}`, timestamp: Date.now() },
           ]);
         }
       }
@@ -3719,11 +3747,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // A flake and a broken verifier read the same in the log otherwise, and the
       // whole point of tolerating one is that the user can tell them apart.
       ? (run.unrunnableRounds < tolerance
-        ? `⚠️ 第 ${run.iteration} 轮校验无法执行（连续第 ${run.unrunnableRounds}/${tolerance} 次，暂不终止，稍后重试）`
-        : `⛔ 第 ${run.iteration} 轮校验无法执行（连续第 ${run.unrunnableRounds}/${tolerance} 次，已达容错上限）`)
+        ? t('⚠️ Round {i} check could not run ({n}/{max} in a row; not stopping yet, will retry)', { i: run.iteration, n: run.unrunnableRounds, max: tolerance })
+        : t('⛔ Round {i} check could not run ({n}/{max} in a row; tolerance limit reached)', { i: run.iteration, n: run.unrunnableRounds, max: tolerance }))
       : verdict.pass
-        ? `✅ 第 ${run.iteration} 轮校验通过（exit=${verdict.exitCode ?? 0}）`
-        : `❌ 第 ${run.iteration} 轮校验未通过（exit=${verdict.exitCode ?? '?'}）· 输出已回灌到下一轮`;
+        ? t('✅ Round {i} check passed (exit={code})', { i: run.iteration, code: verdict.exitCode ?? 0 })
+        : t('❌ Round {i} check failed (exit={code}) · output fed into the next round', { i: run.iteration, code: verdict.exitCode ?? '?' });
     const tail = verdict.output.trim() ? `\n\n\u0060\u0060\u0060\n${verdict.output.trim().slice(0, 1200)}\n\u0060\u0060\u0060` : '';
     mutateSessionMessages(sessionId, (current) => [
       ...current,
@@ -3784,7 +3812,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const result = await window.kiroApi.scheduleCreate?.(sessionId, spec);
     if (!result?.ok) {
       // Surfaced rather than swallowed: a mis-set job used to look like a created one.
-      noteError(sessionId, `定时任务未创建：${result?.error || '未知原因'}`);
+      noteError(sessionId, t('Scheduled task not created: {reason}', { reason: result?.error || t('unknown reason') }));
       return;
     }
     // NOTHING is written to the transcript. Main broadcasts the new job, the banner above this
@@ -3827,7 +3855,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const sid = targetSid || currentSessionRef.current;
     const text = editedText.trim();
     if (!sid || sid.startsWith('pending_') || !text) {
-      noteError(sid, `重跑未执行：${!sid ? '当前无会话' : sid.startsWith('pending_') ? '会话尚未创建（先发一条消息）' : '编辑内容为空'}`);
+      noteError(sid, t('Rerun not done: {reason}', { reason: !sid ? t('no current chat') : sid.startsWith('pending_') ? t('the chat has not been created yet (send a message first)') : t('the edited text is empty') }));
       return;
     }
     // Editing does not touch the running turn. On Rerun submit, if a turn is
@@ -3852,13 +3880,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     }
     if (targetIndex < 0) {
-      noteError(sid, '找不到要重跑的消息（该会话没有可重跑的用户消息）。');
+      noteError(sid, t('Could not find the message to rerun (this chat has no user message that can be rerun).'));
       return;
     }
     while (targetIndex > 0 && current[targetIndex].steer) targetIndex--;
     const target = current[targetIndex];
     if (target.role !== 'user') {
-      noteError(sid, '重跑未执行：定位到的目标不是用户消息。');
+      noteError(sid, t('Rerun not done: the located target is not a user message.'));
       return;
     }
     const retained = current.slice(0, targetIndex).map((message) => ({
@@ -3952,7 +3980,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch (error: any) {
       messagesCacheRef.current.set(sid, current);
       setMessages(current);
-      noteError(sid, error?.message || '编辑重跑失败。');
+      noteError(sid, error?.message || t('Edit and rerun failed.'));
     }
   }, [sendMessage]);
   // Expose rerunFromMessage to the send path (cancel-overwrite) without a
@@ -4188,7 +4216,7 @@ ${text}`,
       setStatus('connected');
     } catch (err: any) {
       setStatus('disconnected');
-      noteError(null, err?.message || 'Failed to reconnect');
+      noteError(null, err?.message || t('Failed to reconnect'));
     }
   }, [currentSessionId, endLoop]);
 
@@ -4284,7 +4312,7 @@ ${text}`,
         noteError(null, outcome.error);
       }
     } catch (error: any) {
-      noteError(null, `删除会话失败：${error?.message || error}。该会话可能在下次启动时重新出现。`);
+      noteError(null, t('Failed to delete the chat: {error}. It may reappear on the next launch.', { error: String(error?.message || error) }));
     }
     if (currentSessionId === sessionId) {
       // Auto-switch to the most recent remaining chat instead of dumping the
@@ -4426,7 +4454,7 @@ ${text}`,
         if (!result.dormant) addAttached(sessionId);
       }
     } catch (err: any) {
-      noteError(sessionId, err?.message || 'Failed to switch agent');
+      noteError(sessionId, err?.message || t('Failed to switch agent'));
     } finally {
       reconfiguringRef.current.delete(sessionId);
       clearConnecting(sessionId);
@@ -4454,7 +4482,7 @@ ${text}`,
       // the old (often retired) one -- the "selector says gpt-5.6-sol but every
       // send fails on claude-opus-5" drift.
       if (!result?.ok) {
-        throw new Error(`切换模型未生效（后端仍在使用 ${modelForSession(sessionId)}）。请重试或选择其他模型。`);
+        throw new Error(t('Model switch did not take effect (the backend is still using {model}). Please retry or pick another model.', { model: String(modelForSession(sessionId)) }));
       }
       sessionModelRef.current.set(sessionId, result.model);
       setSessions((prev) => prev.map((session) => (
@@ -4464,7 +4492,7 @@ ${text}`,
       if (!result.dormant) addAttached(sessionId);
       return result.model as string;
     } catch (err: any) {
-      noteError(sessionId, err?.message || 'Failed to switch model');
+      noteError(sessionId, err?.message || t('Failed to switch model'));
       throw err;
     } finally {
       reconfiguringRef.current.delete(sessionId);
@@ -4490,7 +4518,7 @@ ${text}`,
         )));
       }
     } catch (err: any) {
-      noteError(sessionId, err?.message || 'Failed to change tool permission mode');
+      noteError(sessionId, err?.message || t('Failed to change tool permission mode'));
       throw err;
     }
   }, []);
@@ -4829,7 +4857,7 @@ ${text}`,
         }
       }
       const res = await window.kiroApi.primeHistory?.(sid, true);
-      if (res && !res.ok) setSessionActivity(sid, `⚠️ 上下文重建失败：${res.error || '未知原因'}`);
+      if (res && !res.ok) setSessionActivity(sid, t('⚠️ Context rebuild failed: {reason}', { reason: res.error || t('unknown reason') }));
       return res || { ok: false, error: 'no ipc' };
     },
     interruptedSessionIds,

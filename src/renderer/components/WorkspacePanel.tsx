@@ -1,7 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { joinPath } from '../pathBits.ts';
 import { filterEntries, filterNote } from '../workspaceFilter';
-import { useT } from '../hooks/useLang';
+import { useLang, useT } from '../hooks/useLang';
 import {
   IconArrowUp,
   IconClose,
@@ -54,6 +54,10 @@ function remember(dir: string): void {
 
 export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({ sessionId, onClose, onOpenFile }) => {
   const t = useT();
+  /** `load` 只该随会话变；报错文案经 ref 取最新语言，不让切语言把它（和依赖它的 effect）重建一遍。 */
+  const tRef = useRef(t);
+  tRef.current = t;
+  const lang = useLang();
   const [listing, setListing] = useState<WorkspaceListing | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [loading, setLoading] = useState(false);
@@ -80,11 +84,11 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({ sessionId, onClo
               setListing(result);
               remember(result.path);
             })
-            .catch((e: any) => setError(e?.message || 'Failed to list directory.'))
+            .catch((e: any) => setError(e?.message || tRef.current('Failed to list directory.')))
             .finally(() => setLoading(false));
           return;
         }
-        setError(loadError?.message || 'Failed to list directory.');
+        setError(loadError?.message || tRef.current('Failed to list directory.'));
       })
       .finally(() => setLoading(false));
   }, [sessionId]);
@@ -125,10 +129,10 @@ export const WorkspacePanel: React.FC<WorkspacePanelProps> = ({ sessionId, onClo
   /** 过滤只作用于**当前目录已经拿到的那份列表**,不发 IPC。 */
   const entries = listing?.entries || [];
   const shown = useMemo(() => filterEntries(entries, query), [entries, query]);
-  const note = filterNote({ query, shown: shown.length, total: entries.length });
+  const note = filterNote({ query, shown: shown.length, total: entries.length }, lang);
 
   return (
-    <aside className="workspace-panel" aria-label="Workspace files">
+    <aside className="workspace-panel" aria-label={t('Workspace files')}>
       <div className="workspace-header">
         <h3><IconFolder size={17} /> {t('Workspace')}</h3>
         <button className="settings-close" onClick={onClose} title={t('Close workspace')}>

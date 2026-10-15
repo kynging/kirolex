@@ -20,6 +20,7 @@
  */
 
 import React from 'react';
+import { useT } from '../hooks/useLang';
 
 export const ToggleButton: React.FC<{
   on: boolean;
@@ -31,7 +32,8 @@ export const ToggleButton: React.FC<{
   /** 给读屏用的名字（这一行的标签文字通常在按钮外面）。 */
   ariaLabel?: string;
 }> = ({ on, onChange, disabled, labels, title, ariaLabel }) => {
-  const [onText, offText] = labels || ['开', '关'];
+  const t = useT();
+  const [onText, offText] = labels || [t('On'), t('Off')];
   return (
     <button
       type="button"

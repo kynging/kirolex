@@ -95,8 +95,8 @@ describe('接线（src/main/index.ts）', () => {
     const at = M.indexOf("if (made && !plan.retry && (plan.reason === 'side-effects'");
     assert.ok(at > 0);
     const body = M.slice(at, at + 800);
-    assert.match(body, /没有自动重发/);
-    assert.match(body, /点重跑或者再发一条就会落在新会话上/);
+    assert.match(body, /did not resend automatically/);
+    assert.match(body, /Press rerun or send another message and it will land on the new session/);
   });
 
   test('重发时不再往 transcript 里追加同一条用户消息', () => {
@@ -177,8 +177,8 @@ describe('连着被拒绝生成 → 换模型重发', () => {
   test('复用 model-unavailable 那套机器（换执行器 + 原样重发），并在会话里说一句', () => {
     assert.match(body, /swapSessionModel\(sessionId, failedModel/);
     assert.match(body, /acp:turn-restart/);
-    assert.match(body, /noteInSession\(sessionId, `🔀/);
-    assert.match(body, /换后端会话对这种情况没用/);
+    assert.match(body, /noteInSession\(sessionId, tr\('🔀/);
+    assert.match(body, /Switching backend sessions does not help here/);
   });
 });
 

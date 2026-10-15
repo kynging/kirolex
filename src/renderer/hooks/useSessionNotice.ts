@@ -24,6 +24,8 @@ export interface SessionNotice {
    * 要一直挂到连上为止（连上时主进程会发一句"回来了"把它顶掉）。
    */
   sticky?: boolean;
+  /** 这句话的中英两版（主进程 `bothLangs`）—— 显示时按当前界面语言挑；没有就显示 `text` */
+  variants?: { zh: string; en: string };
 }
 
 /**
@@ -36,12 +38,13 @@ export function useSessionNotice(sessionId: string | null): { notice: SessionNot
   const [notice, setNotice] = useState<SessionNotice | null>(null);
 
   useEffect(() => {
-    const off = (window as any).kiroApi?.onSessionNotice?.((d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean }) => {
+    const off = (window as any).kiroApi?.onSessionNotice?.((d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean; variants?: { zh: string; en: string } }) => {
       if (!d?.text) return;
       const next: SessionNotice = {
         text: d.text, ts: d.ts || Date.now(),
         ...(Array.isArray(d.copyRemote) && d.copyRemote.length ? { copyRemote: d.copyRemote } : {}),
         ...(d.sticky ? { sticky: true } : {}),
+        ...(d.variants && typeof d.variants.zh === 'string' && typeof d.variants.en === 'string' ? { variants: { zh: d.variants.zh, en: d.variants.en } } : {}),
       };
       /* 这条会话的下一句提示（不管是不是 sticky）都把上一句 sticky 换掉 */
       if (next.sticky) stickyBySession.set(d.sessionId, next); else stickyBySession.delete(d.sessionId);

@@ -1,4 +1,5 @@
 import React, { useState } from 'react';
+import { useT } from '../hooks/useLang';
 
 /**
  * 一块内容旁边那个「写点意见」的框 —— 侧栏文件预览（`ReviewPane`）用它。
@@ -91,6 +92,7 @@ export const CommentBox: React.FC<{
   /** 这个框空着也能按「✓ 确认」—— 积累模式下它提交的是**别处**已经标记的那些。 */
   applyWhenEmpty?: boolean;
 }> = ({ value, onChange, startOpen = false, placeholder, rows = 5, mark = '💬', onRemove, title, onDismiss, onApply, applying, applyNote, draft: outerDraft, onDraft, applyTitle, applyLabel, applyWhenEmpty }) => {
+  const t = useT();
   const [open, setOpen] = useState(startOpen);
   const [localDraft, setLocalDraft] = useState(value);
   const controlled = onDraft !== undefined;
@@ -182,9 +184,9 @@ export const CommentBox: React.FC<{
             type="button"
             className="rt-note-apply nopan nodrag"
             disabled={!draft.trim() && !applyWhenEmpty}
-            title={applyTitle || '确认这条意见 —— 让打开这份文件的那条会话按它改这一块（改不了单块时自动按整份改），KiroLex 写回文件、当场更新（⌘/Ctrl + Enter）'}
+            title={applyTitle || t('Confirm this comment: the session that opened this file revises this block (or the whole file if one block can\'t be done alone); KiroLex writes it back and updates on the spot (⌘/Ctrl + Enter)')}
             onClick={apply}
-          >{applyLabel || '✓ 确认'}</button>
+          >{applyLabel || t('✓ Confirm')}</button>
         )}
         {/*
           **没有「记下」了** ——「comment 时不应该有什么记下按钮，而且现在应该不再需要提交按钮了」。
@@ -193,14 +195,14 @@ export const CommentBox: React.FC<{
         */}
         {!onApply && (
           <button type="button" className="rt-note-ok nopan nodrag"
-            title="记下来并收起（⌘/Ctrl + Enter）"
-            onClick={commit}>✓ 确认</button>
+            title={t('Save and collapse (⌘/Ctrl + Enter)')}
+            onClick={commit}>{t('✓ Confirm')}</button>
         )}
         <button type="button" className="rt-note-cancel nopan nodrag"
-          title="丢掉刚写的（Esc）" onClick={cancel}>取消</button>
+          title={t('Discard what you just wrote (Esc)')} onClick={cancel}>{t('Cancel')}</button>
         {onRemove && (
           <button type="button" className="rt-note-cancel nopan nodrag"
-            title="整块去掉" onClick={onRemove}>✕ 删掉</button>
+            title={t('Remove the whole block')} onClick={onRemove}>{t('✕ Remove')}</button>
         )}
       </div>
     </div>
@@ -219,12 +221,15 @@ export const CommentBox: React.FC<{
  */
 export const CommentOpener: React.FC<{
   onClick: () => void; title?: string; mark?: string; active?: boolean;
-}> = ({ onClick, title, mark = '💬', active }) => (
+}> = ({ onClick, title, mark = '💬', active }) => {
+  const t = useT();
+  return (
   <button
     type="button"
     /* 和门上那个 💬 同一个类 —— 位置（absolute right:0）、淡到不抢眼、hover 才亮，全都一样 */
     className={`rt-note-btn nopan nodrag${active ? ' has-note' : ''}`}
-    title={title || '写点意见'}
+    title={title || t('Add a comment')}
     onClick={(e) => { e.stopPropagation(); onClick(); }}
   >{mark}</button>
-);
+  );
+};

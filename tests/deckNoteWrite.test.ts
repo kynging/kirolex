@@ -3,6 +3,7 @@ import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
 import { WRITE_NOTE_SCRIPT, parseWriteNote } from '../src/main/deckPreview.ts';
+import { ZH_REVIEW } from '../src/renderer/i18nZh/review.ts';
 
 /**
  * 「你觉得整份重导设计合理吗，为什么不能分页处理」—— 不合理，能分页。
@@ -151,10 +152,10 @@ describe('落盘之后在会话里报一句', () => {
   });
 
   test('报的是**已经发生的事实**：哪一页、多少字、哪个文件', () => {
-    assert.match(RV, /已写入第 \$\{page\} 页的演讲者备注（\$\{String\(res\.text\)\.length\} 字）/);
+    assert.match(RV, /t\('✅ Wrote the speaker notes for page \{page\} \(\{n\} chars\)\\nFile: \{path\}\\n[^']*backed up first[^']*', \{ page, n: String\(res\.text\)\.length, path \}\)/);
     /* 「我建议回复中写一下 ppt 路径」—— 一条会话里可能同时开着几份 deck（v1/v2、中英两版） */
-    assert.match(RV, /文件：\$\{path\}/);
-    assert.match(RV, /写前已备份/);
+    assert.equal(ZH_REVIEW['✅ Wrote the speaker notes for page {page} ({n} chars)\nFile: {path}\nKiroLex saved it to disk (backed up first to ~/.kirolex/backups/review-files/).'],
+      '✅ 已写入第 {page} 页的演讲者备注（{n} 字）\n文件：{path}\nKiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。');
     /*
       **说完就停** ——「每次修改都有『不用你再动这个文件』这个废话，能把这个删掉吗」。
 
@@ -200,13 +201,13 @@ describe('落盘之后在会话里报一句', () => {
   test('角色用 `user` —— 读起来像工具回报，而且下一轮它看得见"这件事做完了"', () => {
     /* 不然它可能自己再去写一遍文件（两个写者对同一个文件） */
     /* 落盘那三件事搬进了 `noteInSession`（和"⏳ 已排队"那句共用）—— 断言跟着搬 */
-    assert.match(MAIN2, /function noteInSession\(sessionId: string, body: string\): boolean \{/);
+    assert.match(MAIN2, /function noteInSession\(sessionId: string, body: string, variants\?: TextVariants\): boolean \{/);
     const at = MAIN2.indexOf('function noteInSession(');
-    const body = MAIN2.slice(at, at + 900);
+    const body = MAIN2.slice(at, at + 1400); /* 多了两版文案（variants）那两行，窗口放宽一点 */
     assert.match(body, /role: 'user'/);
     assert.match(body, /send\('acp:user-message'/, '要推给界面，否则只在盘上');
     assert.match(body, /refreshHistoryFile\(sid\)/, 'history.md 也要跟上');
     /* IPC 那一侧只剩转发 —— 同一件事不该有两份实现 */
-    assert.match(MAIN2, /return noteInSession\(sessionId, text\) \? \{ ok: true \} : \{ ok: false \};/);
+    assert.match(MAIN2, /return noteInSession\(sessionId, text, asVariants\(variants\)\) \? \{ ok: true \} : \{ ok: false \};/);
   });
 });

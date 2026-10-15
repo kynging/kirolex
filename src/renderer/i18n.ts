@@ -20,6 +20,12 @@
  * 而不是屏幕上出现一个 `sidebar.newSession` 这样的裸 key —— 那种退化用户看得见,而且没法猜。
  */
 
+import { ZH_MAIN, ZH_MAIN_PARTS, rememberTr, textVariants, type TextVariants } from '../main/uiText.ts';
+import { ZH_REVIEW } from './i18nZh/review.ts';
+import { ZH_SETTINGS_PANELS } from './i18nZh/settingsPanels.ts';
+import { ZH_CHAT } from './i18nZh/chat.ts';
+import { ZH_SHELL } from './i18nZh/shell.ts';
+
 export type Lang = 'zh' | 'en';
 
 /** 设置里那个下拉的选项。语言名**用它自己的语言写**,这是所有做对了的软件的做法。 */
@@ -39,7 +45,7 @@ export function normalizeLang(raw: unknown): Lang {
  * 这样做的代价是 key 会比较长；换来的是**不可能出现「英文漏翻」**:漏的只可能是中文，
  * 而漏中文的表现是那一处显示英文原文 —— 难看但可读,不会是一个裸 key。
  */
-const ZH: Record<string, string> = {
+const ZH_BASE: Record<string, string> = {
   // ── 侧栏 ────────────────────────────────────────────────────────────────
   'New Session': '新建会话',
   'New Project': '新建项目',
@@ -191,9 +197,9 @@ const ZH: Record<string, string> = {
   // ── 分屏 / 文件查看器（App 的界面文案）────────────────────────────────────
   'Remove from split view': '从分屏中移除',
   'This pane is empty.': '这一格是空的分屏位。',
-  'Put a chat here: click any chat in the list on the left, or right-click it and pick 「⇆ Add to split」.':
+  'Put a chat here: click any chat in the list on the left, or right-click it and pick “⇆ Add to split”.':
     '把会话放进来：在左侧会话列表点任意一个会话，或右键该会话选「⇆ 加入分屏」。',
-  'Remove a pane: click the ✕ at its top-right, or right-click the chat and pick 「⇆ Remove from split」.':
+  'Remove a pane: click the ✕ at its top-right, or right-click the chat and pick “⇆ Remove from split”.':
     '移除某一格：点该格右上角的 ✕，或右键该会话选「⇆ 从分屏移除」。',
   'Resize: drag the divider between panes; double-click a divider to even them out.':
     '调整大小：拖动格子之间的分隔线，双击分隔线恢复均分。',
@@ -221,7 +227,7 @@ const ZH: Record<string, string> = {
     '从磁盘重新读取这个文件（保留滚动位置和当前视图）',
   'Close panel': '关闭面板',
   'Close tab': '关闭标签',
-  'Formatted for display (the file itself is minified JSON). Click 「Raw」 to see it unformatted.':
+  'Formatted for display (the file itself is minified JSON). Click “Raw” to see it unformatted.':
     '已格式化显示（原文为压缩 JSON）。点「原文」查看未格式化内容。',
   'Close logs': '关闭日志',
   'Edit and rerun': '编辑并重跑',
@@ -385,6 +391,17 @@ const ZH: Record<string, string> = {
   'Chat deleted. Some files are in use and will be cleaned up automatically later.': '会话已删除，部分文件被占用，稍后自动清理',
 };
 
+/** 渲染层的分表（按界面区域分文件，见 `i18nZh/`）。 */
+const ZH_PARTS: Record<string, Record<string, string>> = {
+  base: ZH_BASE,
+  review: ZH_REVIEW,
+  settingsPanels: ZH_SETTINGS_PANELS,
+  chat: ZH_CHAT,
+  shell: ZH_SHELL,
+};
+
+const ZH: Record<string, string> = Object.assign({}, ...Object.values(ZH_PARTS));
+
 /**
  * 取一条文案。
  *
@@ -392,16 +409,143 @@ const ZH: Record<string, string> = {
  * 漏翻的那一处显示英文原文,难看但可读,而不是把一个裸 key 摆到用户面前。
  */
 export function t(lang: Lang, key: string, vars?: Record<string, string | number>): string {
-  const raw = lang === 'en' ? key : (ZH[key] ?? key);
-  if (!vars) return raw;
+  const raw = lang === 'en' ? key : (ZH[key] ?? ZH_MAIN[key] ?? key);
   // `{name}` 占位符。两种语言的语序不同，所以占位符必须是**命名**的，不能按位置 ——
   // 「第 3 格」和 "pane 3" 里那个数字的位置就不一样。
-  return raw.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m));
+  const out = vars ? raw.replace(/\{(\w+)\}/g, (m, k) => (k in vars ? String(vars[k]) : m)) : raw;
+  // 记一笔「这句是哪个 key + 哪些值翻出来的」—— 写进会话的提示要靠它拿到中英两版（`noteVariants`）
+  return rememberTr(out, key, vars);
+}
+
+/**
+ * 一句刚用 `t()` 翻出来的话（占位符里嵌着的译文也算）的中英两版 —— 渲染层写进会话的 KiroLex 提示
+ * 把它一起交给主进程落盘，切语言、重新打开时按当时的界面语言显示。认不出就是 undefined。
+ */
+export function noteVariants(text: string): TextVariants | undefined {
+  return textVariants(text, t);
+}
+
+/**
+ * 一段**只剩文字**的 KiroLex 话（典型：主进程 `tr()` 出来、经 IPC 报错传过来的 `err.message`）的中英两版。
+ *
+ * 先查渲染层刚 `t()` 出来的那些（`noteVariants`）；查不到就拿字典里的句子当模板反过来对
+ * （中文模板和英文 key 两边都试，占位符的值抠出来、本身也按同样的办法换）。Electron 包的那层
+ * `Error invoking remote method '…': Error: ` 前缀原样留着。系统 / 网络原文（ECONNREFUSED 之类）认不出 —— 不猜，返回 undefined。
+ */
+interface Template { key: string; names: string[]; zh: RegExp; en: RegExp; literal: number }
+let templates: Template[] | null = null;
+function templateOf(key: string, zh: string): Template | null {
+  const names = [...key.matchAll(/\{(\w+)\}/g)].map((m) => m[1]);
+  // 字面部分太短的（'{label}: {text}' 之类）什么都能对上 —— 不拿它当模板
+  const literal = key.replace(/\{\w+\}/g, '').trim().length;
+  if (literal < 6) return null;
+  const toRe = (s: string, order: string[]) => {
+    const parts = s.split(/(\{\w+\})/);
+    // 占位符可以是空的（`{hint}` 没内容时）—— 所以是 `*?` 不是 `+?`
+    const src = parts.map((p) => (/^\{\w+\}$/.test(p) ? '([\\s\\S]*?)' : p.replace(/[.*+?^${}()|[\]\\]/g, '\\$&'))).join('');
+    order.push(...parts.filter((p) => /^\{\w+\}$/.test(p)).map((p) => p.slice(1, -1)));
+    return new RegExp(`^${src}$`);
+  };
+  const zhOrder: string[] = []; const enOrder: string[] = [];
+  const zhRe = toRe(zh, zhOrder); const enRe = toRe(key, enOrder);
+  return { key, names: [zhOrder.join(','), enOrder.join(',')], zh: zhRe, en: enRe, literal };
+}
+function allTemplates(): Template[] {
+  if (!templates) {
+    templates = [];
+    for (const table of [ZH, ZH_MAIN]) {
+      for (const [k, v] of Object.entries(table)) {
+        const tpl = templateOf(k, v);
+        if (tpl) templates.push(tpl);
+      }
+    }
+    templates.sort((a, b) => b.literal - a.literal);   // 字面越长越具体，先试
+  }
+  return templates;
+}
+const ELECTRON_PREFIX = /^(Error invoking remote method '[^']+': (?:Error: )?)([\s\S]*)$/;
+export function messageVariants(text: string, depth = 0): TextVariants | undefined {
+  const raw = String(text ?? '');
+  if (!raw || depth > 3) return undefined;
+  const known = noteVariants(raw);
+  if (known) return known;
+  const wrapped = ELECTRON_PREFIX.exec(raw);
+  if (wrapped) {
+    const inner = messageVariants(wrapped[2], depth + 1);
+    return inner ? { zh: wrapped[1] + inner.zh, en: wrapped[1] + inner.en } : undefined;
+  }
+  for (const tpl of allTemplates()) {
+    for (const side of ['zh', 'en'] as const) {
+      const m = (side === 'zh' ? tpl.zh : tpl.en).exec(raw);
+      if (!m) continue;
+      const order = (side === 'zh' ? tpl.names[0] : tpl.names[1]).split(',').filter(Boolean);
+      const vals: Record<string, string> = {};
+      order.forEach((name, i) => { vals[name] = m[i + 1]; });
+      const varsIn = (lang: Lang) => Object.fromEntries(Object.entries(vals).map(
+        ([k, v]) => [k, messageVariants(v, depth + 1)?.[lang] ?? v],
+      ));
+      const both = { zh: '', en: '' };
+      for (const lang of ['zh', 'en'] as const) both[lang] = t(lang, tpl.key, varsIn(lang));
+      return both;
+    }
+  }
+  /*
+    整段对不上模板：常见的是「原始错误 + 空行 + KiroLex 的说明 + 空行 + kiro-cli 原话」这样拼出来的。
+    按空行分段，各段分别认 —— 认得的段换语言，认不出的段（系统原文）原样；一段都不认得就是认不出。
+  */
+  const paras = raw.split(/(\n\n+)/);
+  if (paras.length > 1) {
+    let hit = false;
+    const both = { zh: '', en: '' };
+    for (const p of paras) {
+      const v = /^\n+$/.test(p) ? undefined : messageVariants(p, depth + 1);
+      if (v) hit = true;
+      both.zh += v?.zh ?? p;
+      both.en += v?.en ?? p;
+    }
+    if (hit) return both;
+  }
+  return undefined;
+}
+
+/**
+ * 「还挂在屏幕上的那一句」（输入框上方的活动状态行等）的中英两版 —— 设的时候钉住，显示的时候按当前语言取。
+ * 状态本身还是一个字符串（判断它的那些 `includes(...)` 照旧），只是显示多查一步。有上限，旧的先挤掉。
+ */
+const pinned = new Map<string, TextVariants>();
+const PINNED_MAX = 200;
+export function pinShown(text: string, variants?: TextVariants): void {
+  const v = variants ?? noteVariants(text);
+  if (!text || !v) return;
+  pinned.delete(text);
+  pinned.set(text, v);
+  if (pinned.size > PINNED_MAX) pinned.delete(pinned.keys().next().value as string);
+}
+export function shownIn(lang: Lang, text: string | null): string | null {
+  if (!text) return text;
+  return pinned.get(text)?.[lang] ?? text;
+}
+
+/**
+ * 会话标题的**显示**。新会话的默认标题 `'New Chat'` 是数据（存盘、标题生成都按这个英文值认），
+ * 不能改存的值；只在显示时按语言换成译文。别的标题（用户改过的、自动生成的）原样返回。
+ */
+export function displayTitle(lang: Lang, title: string | undefined | null): string {
+  const raw = String(title ?? '');
+  return raw === 'New Chat' ? t(lang, 'New Chat') : raw;
 }
 
 /** 中文表里还缺哪些 key —— 给测试用,防止「加了调用点忘了加文案」悄悄退化成英文。 */
 export function missingZh(keys: string[]): string[] {
-  return keys.filter((k) => !(k in ZH));
+  return keys.filter((k) => !(k in ZH) && !(k in ZH_MAIN));
+}
+
+/** 两张表（渲染层 + 主进程 `ZH_MAIN`）的全部条目 —— 测试用它逐条核对中英两版对不对得上。 */
+export function zhEntries(): Array<[key: string, zh: string, table: string]> {
+  const out: Array<[string, string, string]> = [];
+  for (const [name, part] of Object.entries(ZH_PARTS)) for (const [k, v] of Object.entries(part)) out.push([k, v, `renderer/${name}`]);
+  for (const [name, part] of Object.entries(ZH_MAIN_PARTS)) for (const [k, v] of Object.entries(part)) out.push([k, v, `main/${name}`]);
+  return out;
 }
 
 /** 字典里一共有多少条 —— 测试用它钉住「不许越翻越少」。 */

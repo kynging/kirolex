@@ -29,7 +29,7 @@ describe('子菜单竖直方向留在屏幕内', () => {
  * 入口原来写「🏷️ 移到项目：<当前项目>」，看起来就像左边菜单里一个能点的项目 —— 其实只是入口，点了没反应。
  */
 describe('「移动项目」是一个子菜单入口', () => {
-  const at = SB.indexOf("<Submenu label=\"🏷️ 移动项目\">");
+  const at = SB.indexOf("<Submenu label={t('🏷️ Move to project')}>");
   const block = SB.slice(at, SB.indexOf('</Submenu>', at));
 
   test('入口文字固定是「移动项目」，不带当前项目名', () => {
@@ -46,7 +46,7 @@ describe('「移动项目」是一个子菜单入口', () => {
     assert.ok(block.includes('moveInto(ctxSession.id, p)'));
   });
   test('没有其他项目时显示一行灰色、不能点的提示', () => {
-    assert.match(block, /context-menu-item disabled[^]*没有其他项目/);
+    assert.match(block, /context-menu-item disabled[^]*t\('No other projects'\)/);
   });
 });
 

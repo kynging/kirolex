@@ -41,7 +41,7 @@ describe('the commands panel folds itself when the turn ends', () => {
     // Measured live on a real 29-command turn: every row 1 line, 23 of them multi-line
     // underneath (heredocs), so the old pre-wrap rendering made the panel enormous.
     assert.match(body, /\{open \? commandLabel\(c\.title\) : head\}/);
-    assert.match(body, /\{open \? t\('Collapse'\) : `\+\$\{more\} 行`\}/,
+    assert.match(body, /\{open \? t\('Collapse'\) : t\('\+\{n\} lines', \{ n: more \}\)\}/,
       'a multi-line command must offer its remaining lines, not hide them in a tooltip');
     assert.match(src, /function commandFirstLine\(title: string\): \{ head: string; more: number \}/);
   });
@@ -171,8 +171,8 @@ describe('the shortcut hint survives a split pane', () => {
 
   test('both variants name the queue shortcut', () => {
     const full = src.slice(src.indexOf('<span className="composer-shortcut-full">'));
-    assert.match(full.slice(0, 600), /\$\{MOD_KEY\}\+Enter queue/);
+    assert.match(full.slice(0, 600), /\{key\}\+Enter queue', \{ key: MOD_KEY \}/);
     const short = src.slice(src.indexOf('<span className="composer-shortcut-short">'));
-    assert.match(short.slice(0, 400), /\$\{MOD_KEY\}\+Enter queue/);
+    assert.match(short.slice(0, 400), /\{key\}\+Enter queue', \{ key: MOD_KEY \}/);
   });
 });

@@ -32,6 +32,8 @@
  * （`Program Files` / `Program Files (x86)`），以及 PATH 要用 `where` 而不是 `command -v` 去找。
  */
 
+import { tr, uiLang } from './uiText.ts';
+
 /**
  * LibreOffice 的常规落点 —— **PATH 里通常没有它**，两个平台都是。
  *
@@ -112,18 +114,18 @@ export function installConverterCmd(platform: string): string {
 export function noConverterWhy(opts: { platform: string; looked?: string[]; ext?: string }): string {
   const ext = String(opts.ext || '').replace(/^\./, '').toLowerCase() || 'pptx';
   const looked = (opts.looked && opts.looked.length ? opts.looked : [
-    ...SOFFICE_PATH_NAMES.map((n) => `PATH 上的 ${n}`),
+    ...SOFFICE_PATH_NAMES.map((n) => tr('{name} on PATH', { name: n })),
     ...SOFFICE_BUNDLE_PATHS,
   ]);
   const where = opts.platform === 'win32'
-    ? '从 https://www.libreoffice.org/download/ 下载安装（默认装到 C:\\Program Files\\LibreOffice），或者用下面那条 winget 命令'
+    ? tr('download it from https://www.libreoffice.org/download/ (installs to C:\\Program Files\\LibreOffice by default), or use the winget command below')
     : opts.platform === 'darwin'
-      ? '从 https://www.libreoffice.org/download/ 下载安装，或者用下面那条 brew 命令'
-      : '用系统的包管理器装（下面那条命令），或者从 https://www.libreoffice.org/download/ 下载';
-  return `这台机器上没有 LibreOffice，没法把 .${ext} 转成 PDF，所以暂时不能在这里预览。\n\n`
-    + `装一个 LibreOffice 就行：${where}。装完回到这里点「⟳ 刷新」或重开这个文件即可，不用重启 KiroLex。\n\n`
-    + `找过这些位置：\n${looked.map((l) => `  · ${l}`).join('\n')}\n\n`
-    + '在此之前：顶栏的「↗ 打开文件」用系统默认应用打开它；.pdf 文件不需要 LibreOffice，照常能在这里看。';
+      ? tr('download it from https://www.libreoffice.org/download/, or use the brew command below')
+      : tr("install it with your system's package manager (the command below), or download it from https://www.libreoffice.org/download/");
+  return tr("LibreOffice isn't installed on this machine, so the .{ext} file can't be converted to PDF and can't be previewed here yet.", { ext }) + '\n\n'
+    + tr('Just install LibreOffice: {where}. Afterwards, come back and click "⟳ Refresh" or reopen the file; no need to restart KiroLex.', { where }) + '\n\n'
+    + tr('Places checked:') + `\n${looked.map((l) => `  · ${l}`).join('\n')}\n\n`
+    + tr('Meanwhile: "↗ Open file" in the top bar opens it in the default app; .pdf files don\'t need LibreOffice and preview here as usual.');
 }
 
 /**
@@ -158,9 +160,9 @@ export function pythonEnv(base: Record<string, string | undefined>): Record<stri
 /** 没有可用的 python-pptx 时说给人听的话 —— 预览照样能看，只是讲稿那一列和"当场改字"用不了。 */
 export function noPythonPptxWhy(platform: string): string {
   const py = platform === 'win32' ? 'python' : 'python3';
-  return `讲稿（演讲者备注）和"当场改幻灯片上的字"要用 Python 3 + python-pptx，这台机器上没找到。`
-    + `装一下：\`${py} -m pip install python-pptx\`（没有 Python 的话先从 https://www.python.org/downloads/ 装）。`
-    + '预览和逐页意见不受影响 —— 意见照样能从「提交给这份文件的会话」发给会话，由它自己改。';
+  return tr('Speaker notes and "edit slide text in place" need Python 3 + python-pptx, which wasn\'t found on this machine.')
+    + tr(' Install it: `{py} -m pip install python-pptx` (no Python? Get it from https://www.python.org/downloads/ first).', { py })
+    + tr(' Preview and per-slide comments still work; comments can still be sent to the session via "Session for this file", which makes the edits itself.');
 }
 
 /**
@@ -627,18 +629,36 @@ export interface SlideShape {
   l?: number; t?: number; w?: number; h?: number;
 }
 
+/**
+ * 上面那几段 python 脚本自己说的几句话是写死的中文（脚本本身有测试钉着，不在 python 里翻）——
+ * 解析时按界面语言换掉。认不出的（python 异常原文等）原样返回。PURE（除了读当前界面语言）。
+ */
+export function localizeScriptError(raw: string): string {
+  const msg = String(raw ?? '');
+  if (msg === '页码超出范围') return tr('Page number out of range');
+  if (msg === '给的地址在这一页上都不存在') return tr('None of the given addresses exist on this page');
+  const none = /^一条都没做成：([\s\S]*)$/.exec(msg);
+  if (none) {
+    const detail = none[1] === '指令都不认识'
+      ? tr('none of the instructions were recognized')
+      : none[1].split('；').join(uiLang() === 'en' ? '; ' : '；');
+    return tr('None of the edits went through: {detail}', { detail });
+  }
+  return msg;
+}
+
 export function parseSlideRuns(
   stdout: string | null | undefined,
 ): { ok: true; runs: SlideRun[]; changed?: number; shapes?: SlideShape[]; page?: { w: number; h: number } }
   | { ok: false; error: string } {
   try {
     const v = JSON.parse(String(stdout || ''));
-    if (!v || typeof v !== 'object') return { ok: false, error: '脚本没有返回结果' };
-    if (v.ok !== true) return { ok: false, error: String(v.error || '脚本报了错') };
-    if (!Array.isArray(v.runs)) return { ok: false, error: '返回的形状不对' };
+    if (!v || typeof v !== 'object') return { ok: false, error: tr('The script returned no result') };
+    if (v.ok !== true) return { ok: false, error: v.error ? localizeScriptError(String(v.error)) : tr('The script reported an error') };
+    if (!Array.isArray(v.runs)) return { ok: false, error: tr('The script returned data in an unexpected shape') };
     const runs: SlideRun[] = [];
     for (const r of v.runs) {
-      if (!r || typeof r.at !== 'string' || typeof r.text !== 'string') return { ok: false, error: '返回的形状不对' };
+      if (!r || typeof r.at !== 'string' || typeof r.text !== 'string') return { ok: false, error: tr('The script returned data in an unexpected shape') };
       runs.push({ at: r.at, text: r.text });
     }
     /*
@@ -666,7 +686,7 @@ export function parseSlideRuns(
       ...(shapes.length ? { shapes } : null),
       ...(page ? { page } : null),
     };
-  } catch { return { ok: false, error: '脚本的输出解析不了' }; }
+  } catch { return { ok: false, error: tr("Couldn't parse the script output") }; }
 }
 
 /**
@@ -676,13 +696,13 @@ export function parseSlideRuns(
 export function parseWriteNote(stdout: string | null | undefined): { ok: true; notes: string[] } | { ok: false; error: string } {
   try {
     const v = JSON.parse(String(stdout || ''));
-    if (!v || typeof v !== 'object') return { ok: false, error: '写入脚本没有返回结果' };
-    if (v.ok !== true) return { ok: false, error: String(v.error || '写入脚本报了错') };
+    if (!v || typeof v !== 'object') return { ok: false, error: tr('The write script returned no result') };
+    if (v.ok !== true) return { ok: false, error: v.error ? localizeScriptError(String(v.error)) : tr('The write script reported an error') };
     if (!Array.isArray(v.notes) || v.notes.some((x: any) => typeof x !== 'string')) {
-      return { ok: false, error: '写入脚本返回的备注形状不对' };
+      return { ok: false, error: tr('The write script returned notes in an unexpected shape') };
     }
     return { ok: true, notes: v.notes as string[] };
-  } catch { return { ok: false, error: '写入脚本的输出解析不了' }; }
+  } catch { return { ok: false, error: tr("Couldn't parse the write script output") }; }
 }
 
 /**

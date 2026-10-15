@@ -197,7 +197,7 @@ describe('KiroLex 自己说的话不许发给模型', () => {
 
   test('落盘时标 `kirolex: true`，界面那一份也带上', () => {
     assert.match(ST, /kirolex\?: true;/);
-    assert.match(M, /store\.appendMessage\(sid, \{ id: messageId, role: 'user', content: text, ts: Date\.now\(\), kirolex: true \}\);/);
+    assert.match(M, /store\.appendMessage\(sid, \{ id: messageId, role: 'user', content: text, ts: Date\.now\(\), kirolex: true, \.\.\.\(v \? \{ variants: v \} : \{\}\) \}\);/);
     assert.match(M, /sessionId: sid, messageId, content: text, ts: Date\.now\(\), kirolex: true,/);
   });
 

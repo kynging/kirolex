@@ -28,7 +28,7 @@ describe('会话 id 得校验形状', () => {
   });
 
   test('报错要带上那个 id —— 参数错位时你得看得出传进去的是什么', () => {
-    assert.match(STORE, /会话 id 不合法：/);
+    assert.match(STORE, /tr\('Invalid session id: \{id\}\./);
     assert.match(STORE, /JSON\.stringify\(s\.slice\(0, 80\)\)/);
   });
 });

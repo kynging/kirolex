@@ -128,7 +128,7 @@ export function adoptedMessages<T extends Msg>(msgs: T[], peek: TurnPeek): T[] {
 }
 
 /**
- * 这一轮是不是侧栏 review 发的**改写**（`askOnce` 的显示文本都以「【改写」开头）—— PURE。
+ * 这一轮是不是侧栏 review 发的**改写**（`askOnce` 的显示文本都以「【改写」或 `[Revision` 开头）—— PURE。
  *
  * 「这个功能中断的话不要让 kirolex 做回填」：改写那一轮被取消 / 卡死 / 窗口重载打断之后，它的那条
  * 用户消息就成了"没答完的提问"，自动重发和自动续写都会把它当普通问题再发一遍 —— 可那一轮的回复
@@ -136,7 +136,8 @@ export function adoptedMessages<T extends Msg>(msgs: T[], peek: TurnPeek): T[] {
  * 两个写者）。所以这种轮次中断了就停在那儿：要改，回到侧栏再按一次「✓ 确认」。
  */
 export function isReviseRequest(text: string | null | undefined): boolean {
-  return /^【改写/.test(String(text ?? '').trim());
+  /* 中文界面（以及旧记录）是「【改写」开头；英文界面是 `[Revision]` / `[Revision · …]`（见主进程 `tr('[Revision · {label}] {note}')`） */
+  return /^(?:【改写|\[Revision(?: · [^\]\n]*)?\])/.test(String(text ?? '').trim());
 }
 
 /** 往回找没答的提问时要看的那几样（渲染进程的 `Message` 收窄成这些）。 */

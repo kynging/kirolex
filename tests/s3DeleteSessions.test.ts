@@ -34,5 +34,5 @@ test('界面：两次点击确认，不用系统确认框', () => {
   const body = UI.slice(at, at + 400);
   assert.match(body, /if \(!armDelete\) \{ setArmDelete\(true\); return; \}/);
   assert.equal(/window\.confirm/.test(body), false);
-  assert.match(UI, /确认删除 \$\{chosen\.length\} 条备份/);
+  assert.match(UI, /t\('Confirm deleting \{n\} backups', \{ n: chosen\.length \}\)/);
 });

@@ -226,7 +226,7 @@ docs/            设计文档（§1）
 | `src/main/aiLogin.ts`、`kiroLogin.ts` | 登录流程 |
 | `renderer/uiStore.ts` | `uiGet / uiSet / uiRemove`：localStorage 形状的同步 API，底下是 `~/.kirolex/ui-state.json` |
 | `renderer/uiRestore.ts` | `restoreGet / restoreSet`：受设置 `restoreUiState` 控制（关掉时只进 sessionStorage） |
-| `renderer/i18n.ts`、`hooks/useLang.tsx` | `t(lang, '英文原文', vars)`；key 就是英文原文，漏翻退化成英文；会话内容 / 路径 / 模型名不翻译。新加的界面文案要进中文表（`tests/i18n.test.ts` 会扫调用点） |
+| `renderer/i18n.ts`、`hooks/useLang.tsx` | `t(lang, '英文原文', vars)`；key 就是英文原文，漏翻退化成英文；会话内容 / 路径 / 模型名不翻译。新加的界面文案要进中文表：渲染层按区域分在 `renderer/i18nZh/*.ts`，主进程的在 `main/uiTextZh/*.ts`（`tr()` / `trIn()`，见 `main/uiText.ts`，语言跟着设置走）。`tests/i18nCoverage.test.ts` 扫全部 `src/` 调用点、核对中英两侧和占位符 —— key 必须是单个字面量。`App` 组件和 `useAcp` 在 LangProvider 外面，别用 `useT()` |
 | `hooks/useFeatureFlags.ts` | 功能开关，主进程拥有（`config.json` 的 `features`），`app:get-features` |
 | `renderer/splitLayout.ts` | 分屏几何（`1x1 / 1x2 / 2x1 / 2x2`，最多 2x2）；每一格是完整独立的会话（自己的输入框 / 队列 / 附件 / 模型），`tests/paneIndependence.test.ts` 守着 |
 | `renderer/filePaths.ts`、`pathBits.ts` | 路径解析，两种分隔符都认 |

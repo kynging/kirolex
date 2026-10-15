@@ -220,6 +220,6 @@ describe('接线', () => {
     assert.match(D, /groupBackups\(/);
     assert.match(D, /groupSyncProjects[<(]/);
     assert.match(D, /compareFreshness\(/);
-    assert.match(D, /原属「/);
+    assert.match(D, /t\('From "\{project\}"'/);
   });
 });

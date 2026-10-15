@@ -62,8 +62,8 @@ describe('agent 列表按机器分', () => {
   test('没配那台机器的启动命令就明说，不猜一个裸名字', () => {
     const at = M.indexOf("ipcMain.handle('kiro:list-agents'");
     const body = M.slice(at, at + 1800);
-    assert.match(body, /还没有设置 \$\{target\.sshHost\} 上的 kiro 启动命令/);
-    assert.match(body, /找不到这台机器/);
+    assert.match(body, /No kiro launch command is set for \{host\} yet/);
+    assert.match(body, /Machine not found \(\{machine\}\)/);
   });
 
   test('preload 和渲染层都带上机器', () => {

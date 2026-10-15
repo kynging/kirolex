@@ -91,16 +91,16 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
   };
 
   const tabs: { scope: Tab; label: string; enabled: boolean; hint: string }[] = [
-    { scope: 'global', label: 'Global', enabled: true, hint: 'Applies to all chats everywhere' },
-    { scope: 'project', label: projectId ? `Project: ${projectId}` : 'Project (none)', enabled: !!projectId, hint: `Applies to all chats in project "${projectId}"` },
+    { scope: 'global', label: t('Global'), enabled: true, hint: t('Applies to all chats everywhere') },
+    { scope: 'project', label: projectId ? t('Project: {name}', { name: projectId }) : t('Project (none)'), enabled: !!projectId, hint: t('Applies to all chats in project "{name}"', { name: String(projectId) }) },
     /*
       会话这一层原来**没有 tab** —— 「我让你加一个 session 级别的 memory，这个加了吗，主界面看不了啊」。
       文件、分层注入（全局 ⊕ project ⊕ 会话）和 readMemory 里的 session 字段一直都在，只有这一行漏了：
       于是它是一份写得进、读不出的记忆。现在它可编辑，而且说清了它会被自动维护（每攒够 12 条消息压一次），
       所以你手写的东西可能被下一次压缩合并 —— 不说这句，人会以为自己写的被吞了。
     */
-    { scope: 'session', label: 'This chat', enabled: !!sessionId, hint: '只作用于这个会话，并且每一轮都会注入。它由 KiroLex 自动维护（每攒够 12 条消息压一次），你手写的内容会被下一次压缩合并进去' },
-    { scope: 'snapshot', label: '📦 Snapshot', enabled: !!sessionId, hint: '这个会话下一条消息会带给模型的上下文；可以直接编辑并保存' },
+    { scope: 'session', label: t('This chat'), enabled: !!sessionId, hint: t('Applies only to this chat and is injected every turn. KiroLex maintains it automatically (compacted every 12 messages), so whatever you write by hand gets merged in by the next compaction') },
+    { scope: 'snapshot', label: t('📦 Snapshot'), enabled: !!sessionId, hint: t('The context the next message in this chat will carry to the model; you can edit and save it here') },
   ];
 
   const active = tabs.find((t) => t.scope === tab)!;
@@ -119,14 +119,14 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
         </div>
 
         <div style={{ display: 'flex', gap: 6, padding: '8px 16px 0' }}>
-          {tabs.map((t) => (
+          {tabs.map((tb) => (
             <button
-              key={t.scope}
-              className={`memory-tab ${tab === t.scope ? 'active' : ''}`}
-              onClick={() => setTab(t.scope)}
-              disabled={!t.enabled}
-              title={t.enabled ? t.hint : 'Not available for this chat'}
-            >{t.label}</button>
+              key={tb.scope}
+              className={`memory-tab ${tab === tb.scope ? 'active' : ''}`}
+              onClick={() => setTab(tb.scope)}
+              disabled={!tb.enabled}
+              title={tb.enabled ? tb.hint : t('Not available for this chat')}
+            >{tb.label}</button>
           ))}
         </div>
 
@@ -145,7 +145,7 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
                   {snapshot?.override
                     ? t('⚙︎ Hand-edited context (pinned) · the next message sends this verbatim instead of the auto snapshot')
                     : snapshot?.at
-                      ? `自动生成的快照 · 上一次发送于 ${new Date(snapshot.at).toLocaleString()}（下一次发送会按当时的对话重新生成）`
+                      ? t('Auto-generated snapshot · last sent {time} (the next send regenerates it from the conversation at that point)', { time: new Date(snapshot.at).toLocaleString() })
                       : t('No context has been injected into this chat yet')}
                 </label>
                 <textarea
@@ -160,9 +160,7 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
                     className="rename-popup-btn confirm"
                     onClick={() => void saveSnapshot()}
                     disabled={!sessionId}
-                    title={'保存后这份文本会原样作为上下文块，跟着你的下一条消息一起发出。\n'
-                      + '它是固定的：不会随对话增长而更新，所以聊得久了它会越来越旧 —— 想回到自动生成的快照就点右边那个按钮。\n'
-                      + '如果你删掉了结尾那句「下面是用户这一条新消息，请正常回答它」，发送时会自动补回去，否则模型会去回答这段历史本身。'}
+                    title={t('Once saved, this text is sent verbatim as the context block along with your next message.\nIt is fixed: it does not update as the conversation grows, so it gets staler the longer you chat. To go back to the auto-generated snapshot, click the button on the right.\nIf you delete the closing line that tells the model to answer the new user message normally, it is added back when sending; otherwise the model would answer the history itself.')}
                   >{t('Save and pin')}</button>
                   {snapshot?.override && (
                     <button
@@ -172,13 +170,13 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
                     >{t('Restore auto-generated')}</button>
                   )}
                   {snapshotDraft !== null && snapshotDraft !== (snapshot?.text ?? '') && (
-                    <button className="rename-popup-btn" onClick={() => setSnapshotDraft(null)}>放弃修改</button>
+                    <button className="rename-popup-btn" onClick={() => setSnapshotDraft(null)}>{t('Discard changes')}</button>
                   )}
                   {snapshotSaved === 'saved' && <span style={{ color: '#3fb950', fontSize: 12 }}>{`${t('Pinned')} ✓`}</span>}
                   {snapshotSaved === 'reverted' && <span style={{ color: '#3fb950', fontSize: 12 }}>{`${t('Back to auto-generated')} ✓`}</span>}
                 </div>
                 <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8, fontSize: 11, color: 'var(--text-muted)' }}>
-                  <span>{(snapshotDraft ?? snapshot?.text ?? '').length} 字符</span>
+                  <span>{t('{n} chars', { n: (snapshotDraft ?? snapshot?.text ?? '').length })}</span>
                   <span style={{ marginLeft: 'auto' }}>{snapshot?.override ? snapshot?.overridePath : snapshot?.path}</span>
                 </div>
               </div>
@@ -188,8 +186,8 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
           ) : !active.enabled ? (
             <p className="settings-preview settings-item-wide">
               {tab === 'project'
-                ? "This chat isn't assigned to a project."
-                : 'No chat is open.'}
+                ? t("This chat isn't assigned to a project.")
+                : t('No chat is open.')}
             </p>
           ) : (
             <div className="settings-item settings-item-wide" style={{ flexDirection: 'column', alignItems: 'stretch' }}>

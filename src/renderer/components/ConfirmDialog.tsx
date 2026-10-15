@@ -1,4 +1,5 @@
 import React, { useCallback, useEffect, useRef } from 'react';
+import { useT } from '../hooks/useLang';
 
 /**
  * In-app replacement for `window.confirm`.
@@ -45,6 +46,7 @@ interface ConfirmDialogProps {
 
 export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ request, onClose }) => {
   const confirmRef = useRef<HTMLButtonElement | null>(null);
+  const t = useT();
 
   const accept = useCallback(() => {
     const run = request?.onConfirm;
@@ -82,7 +84,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ request, onClose }
         <p style={{ whiteSpace: 'pre-wrap' }}>{request.message}</p>
         <div className="actions">
           <button className="btn deny" onClick={onClose}>
-            {request.cancelLabel || '取消'}
+            {request.cancelLabel || t('Cancel')}
           </button>
           <button
             ref={confirmRef}
@@ -90,7 +92,7 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ request, onClose }
             onClick={accept}
             style={request.destructive ? { background: '#ef5350' } : undefined}
           >
-            {request.confirmLabel || '确定'}
+            {request.confirmLabel || t('OK')}
           </button>
         </div>
       </div>

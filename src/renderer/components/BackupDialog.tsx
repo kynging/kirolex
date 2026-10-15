@@ -25,7 +25,8 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
-import { groupBackups, groupSyncProjects, compareFreshness, FRESHNESS_LABEL, groupPickState, toggleGroupPick } from '../backupGroups.ts';
+import { groupBackups, groupSyncProjects, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick } from '../backupGroups.ts';
+import { useLang, useT } from '../hooks/useLang';
 
 interface Backup {
   id: string;
@@ -80,7 +81,7 @@ const memSize = (n: number): string => (n < 1024 ? `${n} B` : kb(n));
 const EMPTY_MEMORY_BYTES = 64;
 
 /** 未分组的那一摊在界面上要有个名字，否则它是一行空白。 */
-const projectLabel = (p?: string): string => (p && p.trim() ? p : '未分组');
+const projectLabel = (p: string | undefined, t: (k: string) => string): string => (p && p.trim() ? p : t('Unassigned'));
 
 const api = (): any => (window as any).kiroApi;
 
@@ -88,6 +89,8 @@ const when = (ms?: number): string => (ms ? new Date(ms).toLocaleString() : '—
 const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
+  const lang = useLang();
+  const t = useT();
   const [tab, setTab] = useState<'sync' | 'restore'>('sync');
   const [where, setWhere] = useState<{ bucket?: string; region?: string; last?: any } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
@@ -185,8 +188,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setBusy('sync'); setMsg(null);
     try {
       const r = await api()?.syncS3Now?.();
-      if (r?.ok) setMsg({ kind: 'ok', text: `传了 ${r.uploaded} 个文件，${r.skipped} 个没变。` });
-      else setMsg({ kind: 'bad', text: String(r?.error || '失败') });
+      if (r?.ok) setMsg({ kind: 'ok', text: t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }) });
+      else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
       await loadConfig();
       /* 同步时间变了，项目那张表也要重新算 */
       await loadProjects();
@@ -198,14 +201,14 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   /* ---------- 同步：按本机分组（本机归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
   const syncGroups = useMemo(() => groupSyncProjects<SessionRow, ProjectRow>(projects || [], () => ({
     project: '', sessions: [], bytes: 0, updatedAt: 0, excluded: excluded.includes(''),
-  })), [projects, excluded]);
+  }), lang), [projects, excluded, lang]);
   const syncRowByProject = useMemo(
     () => new Map(syncGroups.filter((g) => g.row).map((g) => [g.project as string, g.row as ProjectRow])),
     [syncGroups],
   );
 
   /* ---------- 恢复：按云上分组（云上归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
-  const groups = useMemo(() => groupBackups(entries || []), [entries]);
+  const groups = useMemo(() => groupBackups(entries || [], lang), [entries, lang]);
 
   const selectable = useMemo(() => (entries || []).filter((e) => !e.busy), [entries]);
   const chosen = useMemo(() => selectable.filter((e) => picked.has(e.id)), [selectable, picked]);
@@ -244,13 +247,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setBusy(busyKey); setMsg(null);
     try {
       const r = await api()?.deleteS3Sessions?.(ids);
-      if (!r?.ok) { setMsg({ kind: 'bad', text: r?.error || '没删掉' }); return; }
+      if (!r?.ok) { setMsg({ kind: 'bad', text: r?.error || t('Could not delete') }); return; }
       const back = Array.isArray(r.willReturn) ? r.willReturn.length : 0;
       setMsg({
         kind: r.failed?.length ? 'bad' : 'ok',
-        text: `删掉了 ${r.sessions} 条会话的备份。`
-          + (back ? ` 其中 ${back} 条本地还在，下次同步会再传上去 —— 要它彻底消失，在侧栏把本地那条也删掉。` : '')
-          + (r.failed?.length ? `\n${r.failed.length} 个对象没删掉：${r.failed.slice(0, 3).join('；')}` : ''),
+        text: t('Deleted the backups of {n} sessions.', { n: r.sessions })
+          + (back ? ' ' + t('{back} of them still exist locally and will be uploaded again on the next sync. To get rid of one for good, delete the local copy in the sidebar too.', { back }) : '')
+          + (r.failed?.length ? '\n' + t('{n} objects could not be deleted: {list}', { n: r.failed.length, list: r.failed.slice(0, 3).join(t('; ')) }) : ''),
       });
       /* 只清掉删了的那几条的勾 —— 别的组还勾着的留着 */
       setPicked((prev) => new Set([...prev].filter((id) => !ids.includes(id))));
@@ -264,17 +267,17 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     if (!chosen.length) return;
     const moving = chosen.filter((e) => e.existsLocally && e.placementWillChange);
     const lines = [
-      `要恢复 ${chosen.length} 条会话。`,
+      t('About to restore {n} sessions.', { n: chosen.length }),
       ...(moving.length
-        ? ['', `其中 ${moving.length} 条会按云上的位置改到别的项目或改变归档状态（云上那边是后挪的）。`]
+        ? ['', t('{n} of them will move to another project or change archive state to match the cloud (it was moved there more recently).', { n: moving.length })]
         : []),
       ...(merging.length
-        ? ['', `其中 ${merging.length} 条本地已经有了，会和本地那份「合并」（按消息 id 去重、按时间排序）：`,
+        ? ['', t('{n} of them already exist locally and will be merged with the local copy (deduplicated by message id, sorted by time):', { n: merging.length }),
           ...merging.map((e) => `  · ${e.title || e.id}`),
-          '', '（合并前那几份会挪到 ~/.kirolex/trash/，不会真的丢。）',
-          '注意：合并的是聊天记录本身；模型自己那套上下文在跑过它的那台机器上，不会一起合并。']
-        : ['', '本地都没有这几条，纯新增。']),
-      '', '继续？',
+          '', t('(The pre-merge copies are moved to ~/.kirolex/trash/, so nothing is really lost.)'),
+          t('Note: only the chat history is merged. The model context lives on the machine that ran it and is not merged.')]
+        : ['', t('None of these exist locally, so they will simply be added.')]),
+      '', t('Continue?'),
     ];
     if (!window.confirm(lines.join('\n'))) return;
 
@@ -292,15 +295,17 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
           restoredIds.push(e.id);
           /* 位置变成"不归档"的：侧栏水化要等它的 archived 落定再预热（见 useAcp 的 onRestored） */
           if (r.placement && !r.placement.archived) unarchivedIds.push(e.id);
-          ok.push(`${e.title || e.id}${r.merged ? `（并进 ${r.merged.added} 条${r.merged.clashed ? `，${r.merged.clashed} 条同 id 保留本地` : ''}）` : ''}`
+          ok.push(`${e.title || e.id}${!r.merged ? '' : r.merged.clashed
+              ? t(' (merged {added} messages, kept the local copy of {clashed} with the same id)', { added: r.merged.added, clashed: r.merged.clashed })
+              : t(' (merged {added} messages)', { added: r.merged.added })}`
             + (r.placement
-              ? `，位置按云上改成「${projectLabel(r.placement.projectId)}」${r.placement.archived ? '（已归档）' : ''}`
-                + `（原来在「${projectLabel(r.placement.fromProjectId)}」${r.placement.fromArchived ? '·已归档' : ''}）`
+              ? t(', moved to "{to}"{toArchived} to match the cloud', { to: projectLabel(r.placement.projectId, t), toArchived: r.placement.archived ? t(' (archived)') : '' })
+                + t(' (was in "{from}"{fromArchived})', { from: projectLabel(r.placement.fromProjectId, t), fromArchived: r.placement.fromArchived ? t(', archived') : '' })
               : ''));
           files += Number(r.restored) || 0;
-        } else bad.push(`${e.title || e.id}：${r?.error || '失败'}`);
+        } else bad.push(`${e.title || e.id}${t(': ')}${r?.error || t('Failed')}`);
       } catch (x: any) {
-        bad.push(`${e.title || e.id}：${x?.message || x}`);
+        bad.push(`${e.title || e.id}${t(': ')}${x?.message || x}`);
       }
     }
     setBusy(null);
@@ -311,8 +316,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setMsg({
       kind: bad.length ? 'bad' : 'ok',
       text: [
-        ok.length ? `已处理 ${ok.length} 条（${files} 个文件）：\n${ok.map((x) => `  · ${x}`).join('\n')}\n已经放回侧栏、正在连接（在本机跑 —— 要跑远端，右键「运行位置」选一台）。` : '',
-        bad.length ? `有 ${bad.length} 条没成：\n${bad.join('\n')}` : '',
+        ok.length ? t('Processed {n} sessions ({files} files):', { n: ok.length, files }) + `\n${ok.map((x) => `  · ${x}`).join('\n')}\n` + t('They are back in the sidebar and connecting (running on this machine; to run remotely, right-click and pick a machine under "Run on").') : '',
+        bad.length ? t('{n} failed:', { n: bad.length }) + `\n${bad.join('\n')}` : '',
       ].filter(Boolean).join('\n'),
     });
   };
@@ -325,20 +330,20 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       <div className="settings-dialog backup-dialog" style={{ width: 'min(700px, 94vw)', height: 'min(80vh, 800px)' }}>
         <div className="settings-header">
           <h3>
-            ☁️ 备份
+            {t('☁️ Backup')}
             {where?.bucket
               ? <span className="backup-where"> · {where.bucket}{where.region ? ` / ${where.region}` : ''}</span>
-              : where && <span className="backup-where"> · 还没配桶（设置 → ☁️ 备份）</span>}
+              : where && <span className="backup-where"> · {t('No bucket configured yet (Settings → ☁️ Backup)')}</span>}
           </h3>
           <button className="settings-close" onClick={onClose}>✕</button>
         </div>
 
         <div className="backup-tabs">
           <button className={`memory-tab ${tab === 'sync' ? 'active' : ''}`} onClick={() => setTab('sync')}>
-            同步{projects ? ` (${syncingCount}/${projects.length})` : ''}
+            {t('Sync')}{projects ? ` (${syncingCount}/${projects.length})` : ''}
           </button>
           <button className={`memory-tab ${tab === 'restore' ? 'active' : ''}`} onClick={() => setTab('restore')}>
-            恢复{entries ? ` (${entries.length})` : ''}
+            {t('Recover')}{entries ? ` (${entries.length})` : ''}
           </button>
         </div>
 
@@ -352,12 +357,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
             <>
               <div className="backup-actions">
                 <button className="remote-btn remote-btn-primary" disabled={!!busy} onClick={() => void syncNow()}>
-                  {busy === 'sync' ? '同步中…' : '立即同步'}
+                  {busy === 'sync' ? t('Syncing…') : t('Sync now')}
                 </button>
                 {where?.last && (
                   <span className="settings-hint">
-                    上一次 {when(where.last.at)} · 传了 {where.last.uploaded} 个
-                    {where.last.error ? ' · 失败' : ''}
+                    {t('Last run {at} · uploaded {n}', { at: when(where.last.at), n: where.last.uploaded })}
+                    {where.last.error ? ` · ${t('failed')}` : ''}
                   </span>
                 )}
               </div>
@@ -365,7 +370,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{where.last.error}</div>
               )}
 
-              {!projects ? <div className="settings-hint backup-note">读项目…</div> : (
+              {!projects ? <div className="settings-hint backup-note">{t('Loading projects…')}</div> : (
                 <div className="backup-restore-list">
                   {syncGroups.map((g) => {
                     const shut = !openProjects.has(g.key);
@@ -381,32 +386,32 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             return next;
                           })}>{shut ? '▸' : '▾'} {g.name}</button>
                           <span className="backup-restore-meta">
-                            {g.sessions.length} 条{g.bytes ? ` · ${kb(g.bytes)}` : ''}
-                            {behind ? ` · ${behind} 条待同步` : ''}
-                            {g.archivedCount ? ` · 另有 ${g.archivedCount} 条在「已归档」` : ''}
+                            {t('{n} sessions', { n: g.sessions.length })}{g.bytes ? ` · ${kb(g.bytes)}` : ''}
+                            {behind ? ` · ${t('{behind} waiting to sync', { behind })}` : ''}
+                            {g.archivedCount ? ` · ${t('{n} more in "Archived"', { n: g.archivedCount })}` : ''}
                           </span>
                           {g.archived && (
-                            <span className="settings-hint">本机归档的 · 同步与否按原项目和单条的设置</span>
+                            <span className="settings-hint">{t('Archived on this machine · syncing follows the original project and per-session settings')}</span>
                           )}
                           {/* 项目记忆 ——「project 上面也得显示到底 project memory 是否同步了、最新时间是什么时候」 */}
                           {row?.memory && (() => {
                             const p = row as ProjectRow & { memory: NonNullable<ProjectRow['memory']> };
                             return !p.memory.exists
-                              ? <span className="backup-mem muted" title="这个项目还没有记忆文件">记忆：还没有</span>
+                              ? <span className="backup-mem muted" title={t('This project has no memory file yet')}>{t('Memory: none yet')}</span>
                               : <span
                                   className={`backup-mem ${p.memory.state}`}
-                                  title={`~/.kirolex/memory/projects/${p.project}/memory.md\n本地最后修改 ${when(p.memory.updatedAt)}`}
+                                  title={`~/.kirolex/memory/projects/${p.project}/memory.md\n${t('Last modified locally {at}', { at: when(p.memory.updatedAt) })}`}
                                 >
-                                  记忆 {memSize(p.memory.bytes)} · {p.memory.state === 'synced'
-                                    ? (p.memory.syncedAt ? `已同步 ${when(p.memory.syncedAt)}` : '已同步（时间未知）')
-                                    : p.memory.state === 'pending' ? '有改动待同步' : '没备份过'}
+                                  {t('Memory {size}', { size: memSize(p.memory.bytes) })} · {p.memory.state === 'synced'
+                                    ? (p.memory.syncedAt ? t('Synced {at}', { at: when(p.memory.syncedAt) }) : t('Synced (time unknown)'))
+                                    : p.memory.state === 'pending' ? t('Changes waiting to sync') : t('Never backed up')}
                                 </span>;
                           })()}
                           {row && (
                             <ToggleButton
                               on={!row.excluded}
-                              labels={['同步', '不同步']}
-                              ariaLabel={`${g.name} 是否同步`}
+                              labels={[t('Sync'), t("Don't sync")]}
+                              ariaLabel={t('Sync {name}?', { name: g.name })}
                               disabled={!!busy}
                               onChange={(next) => void toggleProject(row.project, next)}
                             />
@@ -420,17 +425,17 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                           return (
                           <div key={x.id} className="backup-restore-row" title={x.id}>
                             <span className="backup-restore-title">{x.title}</span>
-                            {g.archived && <span className="backup-restore-meta">原属「{projectLabel(x.project)}」</span>}
+                            {g.archived && <span className="backup-restore-meta">{t('From "{project}"', { project: projectLabel(x.project, t) })}</span>}
                             {x.state === 'never'
-                              ? <span className="backup-tag warn">没备份过</span>
+                              ? <span className="backup-tag warn">{t('Never backed up')}</span>
                               : x.state === 'pending'
-                                ? <span className="backup-tag over">有改动待同步</span>
-                                : <span className="backup-tag new">已同步</span>}
+                                ? <span className="backup-tag over">{t('Changes waiting to sync')}</span>
+                                : <span className="backup-tag new">{t('Synced')}</span>}
                             {/* 单条会话也能关 ——「我现在还是不能选择是否备份会话」。项目关着时整组都不传，这里就不给按 */}
                             <ToggleButton
                               on={!p.excluded && !x.excluded}
-                              labels={['同步', '不同步']}
-                              ariaLabel={`${x.title} 是否同步`}
+                              labels={[t('Sync'), t("Don't sync")]}
+                              ariaLabel={t('Sync {name}?', { name: x.title })}
                               disabled={!!busy || p.excluded}
                               onChange={(next) => void toggleSession(x.id, next)}
                             />
@@ -441,8 +446,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                 假时间会被拿去判断备份新不新。
                               */}
                               {x.syncedAt
-                                ? `同步于 ${when(x.syncedAt)}`
-                                : x.state === 'synced' ? '已同步（时间未知）' : '—'}
+                                ? t('Synced at {at}', { at: when(x.syncedAt) })
+                                : x.state === 'synced' ? t('Synced (time unknown)') : '—'}
                             </span>
                           </div>
                           );
@@ -453,8 +458,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 </div>
               )}
               <div className="settings-hint backup-note">
-                关掉一个项目或一条会话是<b>停止继续备份</b>，不是删掉已有备份 —— 之前传上去的还在桶里，
-                恢复那一页照旧能看到、能捞回来（要删也在那一页）。
+                {t('Turning off a project or session ')}<b>{t('stops further backups')}</b>{t(', it does not delete existing backups. What was uploaded before stays in the bucket and can still be seen and restored on the Recover tab (deleting is done there too).')}
               </div>
             </>
           )}
@@ -463,35 +467,35 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
             <>
               <div className="backup-actions">
                 <button className="remote-btn" disabled={!!busy} onClick={() => void loadBackups()}>
-                  {busy === 'list' ? '读取中…' : '刷新'}
+                  {busy === 'list' ? t('Reading…') : t('Refresh')}
                 </button>
                 <button className="remote-btn remote-btn-primary" disabled={!!busy || !chosen.length}
                         onClick={() => void restore()}>
-                  {busy === 'restore' ? '恢复中…' : `恢复选中的${chosen.length ? ` ${chosen.length} 条` : ''}`}
+                  {busy === 'restore' ? t('Restoring…') : chosen.length ? t('Restore {n} selected', { n: chosen.length }) : t('Restore selected')}
                 </button>
                 <button
                   className={`remote-btn${armDelete ? ' remote-btn-danger' : ''}`}
                   disabled={!!busy || !chosen.length}
                   onClick={() => void removeBackups()}
                   onBlur={() => setArmDelete(false)}
-                  title="只删桶里的备份，本地不动"
+                  title={t('Only deletes the backups in the bucket; local copies are untouched')}
                 >
-                  {busy === 'delete' ? '删除中…'
-                    : armDelete ? `确认删除 ${chosen.length} 条备份`
-                    : `删除选中的${chosen.length ? ` ${chosen.length} 条` : ''}`}
+                  {busy === 'delete' ? t('Deleting…')
+                    : armDelete ? t('Confirm deleting {n} backups', { n: chosen.length })
+                    : chosen.length ? t('Delete {n} selected', { n: chosen.length }) : t('Delete selected')}
                 </button>
                 {armDelete && !!stillLocal.length && (
-                  <span className="settings-hint">其中 {stillLocal.length} 条本地还在，下次同步会再传上去</span>
+                  <span className="settings-hint">{t('{n} of them still exist locally and will be uploaded again on the next sync', { n: stillLocal.length })}</span>
                 )}
                 {!armDelete && !!merging.length && (
-                  <span className="settings-hint">其中 {merging.length} 条会和本地合并</span>
+                  <span className="settings-hint">{t('{n} of them will be merged with the local copy', { n: merging.length })}</span>
                 )}
               </div>
 
               {err && <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{err}</div>}
 
               {entries && !entries.length && !err && (
-                <div className="settings-hint backup-note">桶里还没有备份 —— 先在「同步」那个 tab 点一次「立即同步」。</div>
+                <div className="settings-hint backup-note">{t('No backups in the bucket yet. Click "Sync now" on the Sync tab first.')}</div>
               )}
 
               {!!entries && (entries.length > 0 || !err) && (
@@ -515,29 +519,29 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             if (next.has(key)) next.delete(key); else next.add(key);
                             return next;
                           })}>{shut ? '▸' : '▾'} {name}</button>
-                          <span className="backup-restore-meta">{rows.length} 条</span>
-                          {archived && <span className="settings-hint">云上那份是归档的</span>}
+                          <span className="backup-restore-meta">{t('{n} sessions', { n: rows.length })}</span>
+                          {archived && <span className="settings-hint">{t('Archived in the cloud')}</span>}
                           {!archived && (() => {
                             if (!proj) return null;             // 未分组没有项目记忆
                             const m = bucketMemory[proj];
-                            if (!m) return <span className="backup-mem never" title="桶里没有这个项目的记忆">记忆：桶里没有</span>;
+                            if (!m) return <span className="backup-mem never" title={t('The bucket has no memory for this project')}>{t('Memory: not in bucket')}</span>;
                             const empty = m.bytes < EMPTY_MEMORY_BYTES;
                             return (
                               <span
                                 className={`backup-mem ${empty ? 'never' : 'synced'}`}
-                                title={empty ? '桶里这份几乎是空的（只有标题）—— 恢复时会和本地合并，不会盖掉本地' : '恢复会话时会和本地这个项目的记忆合并'}
+                                title={empty ? t('The bucket copy is almost empty (title only). Restoring merges it with the local one and never overwrites it') : t('Restoring sessions merges this with the local memory of the project')}
                               >
-                                记忆 {memSize(m.bytes)}{empty ? '（空）' : ''} · {new Date(m.lastModified).toLocaleString()}
+                                {t('Memory {size}', { size: memSize(m.bytes) })}{empty ? t(' (empty)') : ''} · {new Date(m.lastModified).toLocaleString()}
                               </span>
                             );
                           })()}
-                          <label className="backup-group-all" title="选中 / 取消这一组里所有能选的会话（正在跑的除外）">
+                          <label className="backup-group-all" title={t('Select / deselect every selectable session in this group (except running ones)')}>
                             <input type="checkbox"
                                    checked={gp.state === 'all'}
                                    ref={(el) => { if (el) el.indeterminate = gp.state === 'some'; }}
                                    disabled={!!busy || !gp.selectable}
                                    onChange={() => setPicked((prev) => toggleGroupPick(prev, rows))} />
-                            全选
+                            {t('Select all')}
                           </label>
                           {/*
                             只删这一组里勾选的云上备份（不动本地）。两次点击确认，和顶上「删除选中的」同一套：
@@ -545,13 +549,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                           */}
                           <button className={`remote-btn backup-del${armed ? ' remote-btn-danger' : ''}`}
                                   disabled={!!busy || !gp.pickedIds.length}
-                                  title="只删这一组里勾选的会话在桶里的备份，本地不动"
+                                  title={t('Only deletes the bucket backups of the checked sessions in this group; local copies are untouched')}
                                   onClick={() => void removeGroupBackups(key, gp.pickedIds)}
                                   onBlur={() => { if (armed) setArmGroup(null); }}>
-                            {busy === `del:${key}` ? '删除中…'
-                              : !gp.pickedIds.length ? '删除备份'
-                              : armed ? `确认删除 ${gp.pickedIds.length} 条备份`
-                              : `删除选中的 ${gp.pickedIds.length} 条`}
+                            {busy === `del:${key}` ? t('Deleting…')
+                              : !gp.pickedIds.length ? t('Delete backups')
+                              : armed ? t('Confirm deleting {n} backups', { n: gp.pickedIds.length })
+                              : t('Delete {n} selected', { n: gp.pickedIds.length })}
                           </button>
                         </div>
                         {!shut && rows.map((e) => {
@@ -561,23 +565,23 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             key={e.id}
                             className={`backup-restore-row${e.busy ? ' disabled' : ''}${picked.has(e.id) ? ' picked' : ''}`}
                             title={e.busy
-                              ? '这条会话正在跑一轮 —— 等它跑完再恢复，不然这一轮还没落盘的内容会丢'
-                              : `${e.id}\n备份于 ${when(e.syncedAt)}${e.from ? `（来自 ${e.from}）` : ''}`}
+                              ? t('This session is in the middle of a turn. Wait for it to finish before restoring, or whatever has not been written to disk yet will be lost')
+                              : `${e.id}\n${e.from ? t('Backed up {at} (from {from})', { at: when(e.syncedAt), from: e.from }) : t('Backed up {at}', { at: when(e.syncedAt) })}`}
                           >
                             <input type="checkbox" checked={picked.has(e.id)} disabled={!!e.busy || !!busy}
                                    onChange={() => toggle(e.id)} />
                             <span className="backup-restore-title">{e.title || e.id}</span>
                             {archived && (
-                              <span className="backup-restore-meta">原属「{projectLabel(e.project)}」</span>
+                              <span className="backup-restore-meta">{t('From "{project}"', { project: projectLabel(e.project, t) })}</span>
                             )}
-                            {e.busy && <span className="backup-tag warn">正在跑</span>}
+                            {e.busy && <span className="backup-tag warn">{t('Running now')}</span>}
                             {/* 新旧对比：本机记录的 updatedAt 和云上那份比 */}
                             <span
                               className={`backup-tag ${fresh === 'cloud-newer' ? 'over' : 'new'}`}
                               title={fresh === 'missing'
-                                ? '本机没有这条，恢复是纯新增'
-                                : `本机 ${when(e.localUpdatedAt)} · 云上 ${when(e.updatedAt)}\n恢复会和本地那份合并（按消息 id 去重、按时间排序）`}
-                            >{FRESHNESS_LABEL[fresh]}</span>
+                                ? t('Not on this machine; restoring simply adds it')
+                                : t('This machine {local} · cloud {cloud}', { local: when(e.localUpdatedAt), cloud: when(e.updatedAt) }) + '\n' + t('Restoring merges it with the local copy (deduplicated by message id, sorted by time)')}
+                            >{freshnessLabel(fresh, lang)}</span>
                             <span className="backup-restore-meta">{kb(e.bytes)} · {when(e.updatedAt)}</span>
                           </label>
                           );
@@ -590,7 +594,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
               {!!entries?.length && (
                 <div className="settings-hint backup-note">
-                  本地已有的会合并，合并前那份挪进 <code>~/.kirolex/trash/</code>。恢复完要重启 KiroLex。
+                  {t('Sessions that already exist locally are merged; the pre-merge copy is moved to ')}<code>~/.kirolex/trash/</code>{t('. Restart KiroLex after restoring.')}
                 </div>
               )}
             </>

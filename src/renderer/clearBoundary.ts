@@ -23,6 +23,8 @@
  * 只认**整条消息就是 `/clear`** 的：一句「我刚才 /clear 了一下」不是在清空。
  */
 
+import { t, type Lang } from './i18n.ts';
+
 export interface ClearCandidate {
   role?: string;
   content?: unknown;
@@ -60,7 +62,8 @@ export function sinceLastClear(messages: ClearCandidate[] | undefined): number |
  * 必须把**两件事**都说出来：上面的模型不记得了（否则你会以为它记得），
  * 以及那些记录还在、没被删（否则你会以为清空把历史弄丢了）。
  */
-export function clearNoteText(hiddenCount: number): string {
-  const above = hiddenCount > 0 ? `上面 ${hiddenCount} 条` : '上面的内容';
-  return `上下文已清空 —— ${above}模型不再记得（记录仍然保留在这条会话里）`;
+export function clearNoteText(hiddenCount: number, lang: Lang = 'zh'): string {
+  return hiddenCount > 0
+    ? t(lang, 'Context cleared. The model no longer remembers the {n} messages above (they are still kept in this chat)', { n: hiddenCount })
+    : t(lang, 'Context cleared. The model no longer remembers anything above (it is still kept in this chat)');
 }

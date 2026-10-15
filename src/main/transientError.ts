@@ -12,6 +12,8 @@
  * 单独一个文件（而不是留在 `index.ts` 里）：重试判据 `promptRetry` 要用它，而 `index.ts` 里有
  * electron —— 纯判据必须能在测试里直接 import。
  */
+import { tr } from './uiText.ts';
+
 /**
  * **SSH 自己掉线的退出码是 255** —— 远程会话（`docs/DESIGN_remote_sessions.md`）里的执行器是
  * `ssh -T … kiro-cli acp`，所以"连接断了"会以**进程退出**的形式出现，而不是一句错误文本。
@@ -40,10 +42,9 @@ export function isSshTransportExit(code: number | null | undefined): boolean {
 export function sshDropMessage(code: number | null | undefined, stderr = ''): string {
   const fwd = /remote port forwarding failed for listen port (\d+)/i.exec(String(stderr || ''));
   if (fwd) {
-    return `SSH connection closed（ssh exit ${code}）：远端端口 ${fwd[1]} 被占用，本地工具的隧道没建起来。`
-      + `KiroLex 会换一个端口重试 —— 要是反复出现，那台机器上可能有上次留下的 kiro-cli 还占着它。`;
+    return tr('SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools tunnel was not set up. KiroLex will retry on another port. If this keeps happening, a kiro-cli left over from last time may still hold it on that machine.', { code: String(code), port: fwd[1] });
   }
-  return `SSH connection closed（ssh exit ${code}）—— 远端执行器的连接断了，KiroLex 会按退避自动重发这一轮。`;
+  return tr('SSH connection closed (ssh exit {code}): the connection to the remote executor dropped. KiroLex will resend this turn automatically with backoff.', { code: String(code) });
 }
 
 export function isTransientTransportError(text: string): boolean {

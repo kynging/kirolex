@@ -26,6 +26,8 @@
  * job drifts by however long each run took, so a 9am report slides later every day.
  */
 
+import { trIn, uiLang, type UiLang } from './uiText.ts';
+
 export type ScheduleKind = 'interval' | 'daily' | 'weekly' | 'once';
 
 export interface ScheduleSpec {
@@ -78,7 +80,19 @@ export const MIN_INTERVAL_SEC = 60;
  *  billable turns to spend. */
 export const DEFAULT_MAX_RUNS = 20;
 
-const WEEKDAY_TEXT = ['日', '一', '二', '三', '四', '五', '六'];
+/** 「每周X HH:MM」 —— 中英文语序不同，所以按星期整句查表（0 = 周日，同 `Date.getDay()`）。 */
+function weeklyText(weekday: number, time: string, lang: UiLang): string {
+  const v = { time };
+  switch (weekday) {
+    case 1: return trIn(lang, 'Every Monday at {time}', v);
+    case 2: return trIn(lang, 'Every Tuesday at {time}', v);
+    case 3: return trIn(lang, 'Every Wednesday at {time}', v);
+    case 4: return trIn(lang, 'Every Thursday at {time}', v);
+    case 5: return trIn(lang, 'Every Friday at {time}', v);
+    case 6: return trIn(lang, 'Every Saturday at {time}', v);
+    default: return trIn(lang, 'Every Sunday at {time}', v);
+  }
+}
 
 /** `HH:MM` → parts, or null when it is not a real time of day. */
 export function parseClockTime(text: string): { hour: number; minute: number } | null {
@@ -90,22 +104,22 @@ export function parseClockTime(text: string): { hour: number; minute: number } |
   return { hour, minute };
 }
 
-export function validateSchedule(spec: ScheduleSpec): string[] {
+export function validateSchedule(spec: ScheduleSpec, lang: UiLang = uiLang()): string[] {
   const errors: string[] = [];
-  if (!spec.prompt.trim()) errors.push('要发送的内容为空');
+  if (!spec.prompt.trim()) errors.push(trIn(lang, 'The message to send is empty'));
   if (spec.kind === 'interval') {
     if (!Number.isFinite(spec.everySec) || spec.everySec < MIN_INTERVAL_SEC) {
-      errors.push(`间隔不能小于 ${MIN_INTERVAL_SEC} 秒`);
+      errors.push(trIn(lang, 'The interval must be at least {n} seconds', { n: MIN_INTERVAL_SEC }));
     }
   }
   if (spec.kind === 'daily' || spec.kind === 'weekly') {
-    if (!parseClockTime(spec.atTime || '')) errors.push('时间格式应为 HH:MM（24 小时制）');
+    if (!parseClockTime(spec.atTime || '')) errors.push(trIn(lang, 'Time must be HH:MM (24-hour)'));
   }
   if (spec.kind === 'weekly' && (spec.weekday === undefined || spec.weekday < 0 || spec.weekday > 6)) {
-    errors.push('请选择星期几');
+    errors.push(trIn(lang, 'Choose a day of the week'));
   }
-  if (spec.kind === 'once' && !Number.isFinite(spec.atEpoch)) errors.push('请选择触发时间');
-  if (!Number.isFinite(spec.maxRuns) || spec.maxRuns < 1) errors.push('运行次数上限必须 ≥ 1');
+  if (spec.kind === 'once' && !Number.isFinite(spec.atEpoch)) errors.push(trIn(lang, 'Choose when it should run'));
+  if (!Number.isFinite(spec.maxRuns) || spec.maxRuns < 1) errors.push(trIn(lang, 'The run limit must be at least 1'));
   return errors;
 }
 
@@ -195,29 +209,27 @@ export function createSchedule(sessionId: string, spec: ScheduleSpec, now: numbe
 /** Plain-language rendering, so a job in a list is never a black box. The lesson from
  *  n8n's bare "stopped due to max iterations": a limit that does not explain itself gets
  *  treated as an obstacle to route around. */
-export function describeSchedule(spec: ScheduleSpec): string {
+export function describeSchedule(spec: ScheduleSpec, lang: UiLang = uiLang()): string {
   switch (spec.kind) {
     case 'interval': {
       const secs = Math.max(MIN_INTERVAL_SEC, spec.everySec);
-      return secs % 3600 === 0 ? `每 ${secs / 3600} 小时`
-        : secs % 60 === 0 ? `每 ${secs / 60} 分钟`
-        : `每 ${secs} 秒`;
+      return secs % 3600 === 0 ? trIn(lang, 'Every {n} h', { n: secs / 3600 })
+        : secs % 60 === 0 ? trIn(lang, 'Every {n} min', { n: secs / 60 })
+        : trIn(lang, 'Every {n} s', { n: secs });
     }
     case 'daily':
-      return `每天 ${spec.atTime}`;
+      return trIn(lang, 'Daily at {time}', { time: String(spec.atTime) });
     case 'weekly':
-      return `每周${WEEKDAY_TEXT[spec.weekday ?? 0]} ${spec.atTime}`;
+      return weeklyText(spec.weekday ?? 0, String(spec.atTime), lang);
     case 'once':
-      return `一次性 · ${new Date(spec.atEpoch ?? 0).toLocaleString()}`;
+      return trIn(lang, 'One-time · {when}', { when: new Date(spec.atEpoch ?? 0).toLocaleString() });
   }
 }
 
-const TERMINAL_TEXT: Record<ScheduleTerminal, string> = {
-  'completed': '已完成',
-  'exhausted': '运行次数已用尽',
-  'cancelled': '已取消',
-};
-
-export function scheduleTerminalLabel(terminal: ScheduleTerminal): string {
-  return TERMINAL_TEXT[terminal];
+export function scheduleTerminalLabel(terminal: ScheduleTerminal, lang: UiLang = uiLang()): string {
+  switch (terminal) {
+    case 'completed': return trIn(lang, 'Completed');
+    case 'exhausted': return trIn(lang, 'Run limit reached');
+    case 'cancelled': return trIn(lang, 'Cancelled');
+  }
 }

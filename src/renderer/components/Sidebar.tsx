@@ -8,7 +8,8 @@ import { searchSessions } from '../sessionSearch';
 import { placeMenu, placeSubmenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
 import React, { useState, useRef, useEffect, useLayoutEffect, useReducer } from 'react';
-import { useT } from '../hooks/useLang';
+import { useLang, useT } from '../hooks/useLang';
+import { displayTitle } from '../i18n';
 import {
   DndContext,
   pointerWithin,
@@ -284,7 +285,8 @@ const SessionItem: React.FC<{
   subagents?: SubagentRow[];
 }> = ({ session, isActive, sessionStatus, busyReason, onSwitch, onContextMenu, onDelete, splitOrder = 0, onToggleSplit, scheduleSummary, subagents }) => {
   const t = useT();
-  const crew = subagentTag(subagents);
+  const lang = useLang();
+  const crew = subagentTag(subagents, lang);
   const pendingTarget = usePendingTarget(session.id);
   const { attributes, listeners, setNodeRef, transform, transition, isDragging } = useSortable({ id: session.id });
   const style = {
@@ -338,7 +340,7 @@ const SessionItem: React.FC<{
         {sessionStatus === 'rebuilding' && <span className="session-dot-arc" />}
       </span>
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-        {session.title}
+        {displayTitle(lang, session.title)}
       </span>
       {/* The row shows `short` (a countdown, or 已暂停) and carries the full sentence as its
           tooltip: there is no space here for "每天 09:00 · 3 小时 12 分后 · 已运行 2/20", and a
@@ -369,14 +371,13 @@ const SessionItem: React.FC<{
       */}
       {/* 不挂引擎 tag ——「左侧会话框不要显示 claude 这个 tag，你应该显示的仍然是远程 tag」。引擎在会话界面左下角看 */}
       {pendingTarget !== undefined ? (
-        <span className="session-remote session-remote-switching" title="正在切换运行位置…">
-          ⏳ {pendingTarget || '本地'}
+        <span className="session-remote session-remote-switching" title={t('Switching where this runs…')}>
+          ⏳ {pendingTarget || t('Local')}
         </span>
       ) : session.remoteHost && (
         <span
           className="session-remote"
-          title={`这条会话的 kiro-cli 跑在 ${session.remoteHost} 上；文件仍然在你这台机器上 ——`
-            + `它通过一条反向隧道调本地工具来读写（不复制文件）。`}
+          title={t('This chat’s kiro-cli runs on {host}; the files stay on this machine. It reads and writes them by calling local tools over a reverse tunnel (no files are copied).', { host: session.remoteHost })}
         >
           🌐 {session.remoteHost}
         </span>
@@ -593,6 +594,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [projectRenamePopup, setProjectRenamePopup] = useState<{ project: string } | null>(null);
   const [activeId, setActiveId] = useState<string | null>(null);
   const t = useT();
+  const lang = useLang();
+  /** 连接状态：`status` 本身是内部取值（CSS 类名也用它），这里只翻译显示出来的那几个字。 */
+  const statusLabel = status === 'connected' ? t('connected') : status === 'connecting' ? t('connecting') : t('disconnected');
   /** 为什么刚才那一拖没生效 —— 静默拒绝会被当成「拖不动」 */
   const [dropRefusal, setDropRefusal] = useState<string | null>(null);
   /**
@@ -810,7 +814,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     /* 带上项目：还没连上过的新会话没有记录，主进程要给它建一份（见主进程 coldRecordFor） */
     const projectId = sessions.find((s) => s.id === sessionId)?.projectId ?? null;
     const r = await api.switchEngine(sessionId, engine, { projectId }).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
-    if (!r?.ok) showToast(`✗ 切换引擎失败：${String(r?.error || '原因不明').replace(/^Error invoking remote method '[^']+': (Error: )?/, '')}`);
+    if (!r?.ok) showToast(t('✗ Could not switch engine: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
   };
   const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
     const api = (window as any).kiroApi;
@@ -821,7 +825,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       .catch((e: any) => ({ ok: false, error: e?.message || String(e) }))
       .finally(() => setPendingTarget(sessionId, undefined));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */
-    if (!r?.ok && !r?.unchanged) showToast(`✗ 切换运行位置失败：${String(r?.error || '原因不明').replace(/^Error invoking remote method '[^']+': (Error: )?/, '')}`);
+    if (!r?.ok && !r?.unchanged) showToast(t('✗ Could not switch where this runs: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
   };
 
 
@@ -1125,7 +1129,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="session-item drag-overlay-item">
                 <span className="session-dot idle" />
                 <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
-                  {sessions.find((s) => s.id === activeId)?.title || 'Chat'}
+                  {displayTitle(lang, sessions.find((s) => s.id === activeId)?.title) || t('Chat')}
                 </span>
               </div>
             ) : null}
@@ -1167,7 +1171,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className="context-menu-item"
             onClick={() => { onTogglePin(ctxSession.id); setContextMenu(null); }}
           >
-            {ctxSession.pinned ? '📌 Unpin' : '📌 Pin'}
+            {`📌 ${ctxSession.pinned ? t('Unpin') : t('Pin')}`}
           </div>
           {/* Deliberately NOT exposed here: 「重建上下文」(snapshot / full replay).
               It is a recovery lever for internal state -- which backend holds which
@@ -1196,7 +1200,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
               {/* 项目一多，平铺的话菜单在屏幕里放不下 —— 收进一个右侧展开的子菜单（面板自己限高、滚动）。
                   入口名字固定，不带当前项目名：带上的话它看起来就像左边一个能点的项目，其实只是入口。
                   这里不放「移到未分组」，只列其他项目。 */}
-              <Submenu label="🏷️ 移动项目">
+              <Submenu label={t('🏷️ Move to project')}>
                 {projects.filter((p) => p !== ctxSession.projectId).map((p) => (
                   <div
                     key={p}
@@ -1207,7 +1211,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   </div>
                 ))}
                 {!projects.some((p) => p !== ctxSession.projectId) && (
-                  <div className="context-menu-item disabled" onClick={(e) => e.stopPropagation()}>没有其他项目</div>
+                  <div className="context-menu-item disabled" onClick={(e) => e.stopPropagation()}>{t('No other projects')}</div>
                 )}
               </Submenu>
               {/*
@@ -1215,13 +1219,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 连着就换执行器（对话不动，上下文随下一条消息带过去），没连着就只改记录。
               */}
               <div className="context-menu-divider" />
-              <Submenu label={`🤖 运行引擎：${ENGINE_NAMES[ctxSession.engine || 'kiro']}`}>
+              <Submenu label={t('🤖 Engine: {engine}', { engine: ENGINE_NAMES[ctxSession.engine || 'kiro'] })}>
                 {(['kiro', 'claude', 'codex'] as const).map((eng) => (
                   <div
                     key={eng}
                     className="context-menu-item"
                     onClick={() => { void onSetEngine(ctxSession.id, eng); setContextMenu(null); }}
-                    title={eng === 'kiro' ? '用 kiro-cli 跑（kiro 的模型和 agent）' : `用 ${ENGINE_NAMES[eng]} 跑（它自己的登录和默认模型）`}
+                    title={eng === 'kiro' ? t('Run with kiro-cli (kiro’s models and agents)') : t('Run with {engine} (its own login and default model)', { engine: ENGINE_NAMES[eng] })}
                   >
                     {`${(ctxSession.engine || 'kiro') === eng ? '✓ ' : '　'}${ENGINE_NAMES[eng]}`}
                   </div>
@@ -1238,20 +1242,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 多个互斥选项；平铺的话每台机器占一行，和下面那堆 🏷️ 项目混在一起越来越难扫。
                 当前在哪儿用 ✓ 标出来。
               */}
-              <Submenu label={`${ctxSession.remoteHost ? '🌐' : '💻'} 运行位置：${ctxSession.remoteHost || '本地'}`}>
+              <Submenu label={t('{icon} Runs on: {where}', { icon: ctxSession.remoteHost ? '🌐' : '💻', where: ctxSession.remoteHost || t('Local') })}>
                 <div
                   className="context-menu-item"
                   onClick={() => { void onSetTarget?.(ctxSession.id, null); setContextMenu(null); }}
-                  title="切回本地跑。切之前会先把远端的改动取回来 —— 取不回来就不切。"
+                  title={t('Switch back to running locally. Remote changes are fetched first; if they can’t be fetched, nothing is switched.')}
                 >
-                  {`${ctxSession.remoteHost ? '　' : '✓ '}💻 本地`}
+                  {`${ctxSession.remoteHost ? '　' : '✓ '}💻 ${t('Local')}`}
                 </div>
                 {remoteTargets.map((tg) => (
                   <div
                     key={tg.id}
                     className="context-menu-item"
                     onClick={() => { void onSetTarget?.(ctxSession.id, tg.id); setContextMenu(null); }}
-                    title={`在 ${tg.sshHost} 上跑（文件仍在本地，每轮前后同步镜像）`}
+                    title={t('Run on {host} (files stay local, mirrored before and after each turn)', { host: tg.sshHost })}
                   >
                     {`${ctxSession.remoteHost === tg.label ? '✓ ' : '　'}🌐 ${tg.label}`}
                   </div>
@@ -1260,9 +1264,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 <div
                   className="context-menu-item"
                   onClick={() => { setContextMenu(null); onAddMachine?.(); }}
-                  title="打开 设置 → 机器，直接添加一台新机器；存好之后它就出现在这里"
+                  title={t('Opens Settings → Machines to add a new machine; once saved it shows up here')}
                 >
-                  ＋ 添加机器…
+                  ＋ {t('Add machine…')}
                 </div>
               </Submenu>
               <div className="context-menu-divider" />
@@ -1291,7 +1295,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                 className="context-menu-item"
                 onClick={() => { onArchiveSession(ctxSession.id, true); setContextMenu(null); }}
               >
-                🗄️ Archive
+                {`🗄️ ${t('Archive')}`}
               </div>
             </>
           )}
@@ -1363,9 +1367,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
       <div className="sidebar-status-bar">
         <div className="sidebar-status-info">
           <span className={`status-dot ${status}`} />
-          <span className="sidebar-status-label" title={status}>{status}</span>
+          <span className="sidebar-status-label" title={statusLabel}>{statusLabel}</span>
           {executorCap ? (
-            <span className="sidebar-slot-count" title={`已连接 ${attachedSessionIds.length} / 上限 ${executorCap} 个会话执行器`}>
+            <span className="sidebar-slot-count" title={t('{n} connected / limit {cap} chat executors', { n: attachedSessionIds.length, cap: executorCap })}>
               {attachedSessionIds.length}/{executorCap}
             </span>
           ) : null}
@@ -1399,13 +1403,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className={`sidebar-settings-btn sidebar-backup-btn${backupState?.error ? ' bad' : backupState ? ' ok' : ''}`}
             onClick={onOpenBackup}
             title={backupState?.error
-              ? `备份上次失败了（${new Date(backupState.at).toLocaleString()}）：${backupState.error.split('\n')[0]}`
-                + `\n点开是「从备份恢复」；配置在 设置 → ☁️ 备份`
+              ? t('The last backup failed ({at}): {error}\nClick to “Restore from backup”; configure it in Settings → ☁️ Backup', { at: new Date(backupState.at).toLocaleString(), error: backupState.error.split('\n')[0] })
               : backupState
-                ? `上次备份：${new Date(backupState.at).toLocaleString()} · 传了 ${backupState.uploaded} 个文件`
-                  + `\n点开是「从备份恢复」`
-                : '从备份恢复会话（还没配 —— 去 设置 → ☁️ 备份）'}
-            aria-label="备份"
+                ? t('Last backup: {at} · uploaded {n} files\nClick to “Restore from backup”', { at: new Date(backupState.at).toLocaleString(), n: backupState.uploaded })
+                : t('Restore chats from a backup (not set up yet: go to Settings → ☁️ Backup)')}
+            aria-label={t('Backup')}
           >
             ☁️
           </button>
@@ -1427,8 +1429,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           {traceOn && (
             <button
               className="sidebar-settings-btn sidebar-trace-on"
-              title={'kiro-cli trace 日志**开着** —— 每天十几 GB。点一下关掉（下一次起执行器生效）'}
-              aria-label="kiro trace 日志开着，点一下关掉"
+              title={t('kiro-cli trace logging is **on**: over 10 GB a day. Click to turn it off (takes effect the next time an executor starts)')}
+              aria-label={t('kiro trace logging is on, click to turn it off')}
               onClick={() => { void setKiroTrace(false).then((on) => setTraceOn(on)); }}
             >
               ⚑
@@ -1480,7 +1482,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           <div className="rename-popup">
             <h4>{t('Move to new project')}</h4>
             <p style={{ fontSize: 12, color: 'var(--text-muted)', margin: '0 0 12px' }}>
-              Creates the project and moves this chat into it (its executor resets to the new memory scope).
+              {t('Creates the project and moves this chat into it (its executor resets to the new memory scope).')}
             </p>
             <input
               autoFocus

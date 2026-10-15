@@ -9,7 +9,7 @@ import { findLabel, matchOffsets, shouldSearch, stepIndex } from '../paneFind';
 import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHighlight';
 import { PREVIEW_FIND_KEY, keepActive } from '../previewFind';
 import { scrollHostOf } from '../tabScroll';
-import { useT } from '../hooks/useLang';
+import { useLang, useT } from '../hooks/useLang';
 
 /** 正文在哪。路径行、💬 / ◎ 那一行不算正文 —— 搜文件名不该搜出一个命中。 */
 const CONTENT_SELECTOR = '.rv-review-blocks, .workspace-viewer-md, pre.workspace-viewer-content';
@@ -28,6 +28,7 @@ export const PreviewFind: React.FC<{
   content: string;
 }> = ({ body, owns, searchable, tabId, raw, commenting, content }) => {
   const t = useT();
+  const lang = useLang();
   const [open, setOpen] = useState(false);
   const [query, setQuery] = useState('');
   /** 当前是第几个命中,1 起;0 = 没有。 */
@@ -152,7 +153,7 @@ export const PreviewFind: React.FC<{
           }
         }}
       />
-      <span className="pane-find-count">{findLabel({ query, active, total })}</span>
+      <span className="pane-find-count">{findLabel({ query, active, total }, lang)}</span>
       <button className="pane-find-btn" onClick={() => step('prev')} title={t('Previous (Shift+Enter)')}>↑</button>
       <button className="pane-find-btn" onClick={() => step('next')} title={t('Next (Enter)')}>↓</button>
       <button className="pane-find-btn" onClick={close} title={t('Close (Esc)')}>✕</button>

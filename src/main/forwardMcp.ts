@@ -31,6 +31,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { expandEnvRefs as expandComboEnv, type McpComboServer } from './mcpCombos.ts';
+import { tr } from './uiText.ts';
 
 /**
  * 按名字就该转发的那些 —— 它们的意义就是"操作我这台机器"。
@@ -190,10 +191,10 @@ export function remoteForwardPlan(entries: ForwardEntry[], tunnelBase: string): 
 
 /** 会话准备时探测失败的那句提示（和「本地工具通道没起来」同一种：说出来，不阻断）。 */
 export function httpProbeNotice(name: string, error: string): string {
-  const why = String(error || '未知错误');
-  const msg = why.startsWith('本机→上游') ? why : `本机→上游（${name}）${why}`;
-  return `⚠️ 从本机转发的 MCP「${name}」现在用不了：${msg}。`
-    + `这条会话照常可用，只是调它的工具会报同样的错 —— 改好本机配置后重开会话即可。`;
+  const why = String(error || tr('Unknown error'));
+  /* 老的中文前缀照认（localMcp 那边给的错误），英文界面下再认英文那个 */
+  const msg = why.startsWith('本机→上游') || why.startsWith('Local→upstream') ? why : tr('Local→upstream ({name}) {why}', { name, why });
+  return tr('⚠️ The MCP "{name}" forwarded from this machine is unavailable right now: {msg}. This session still works, but calling its tools will fail with the same error. Fix the local config and reopen the session.', { name, msg });
 }
 
 /**
@@ -264,11 +265,11 @@ export function forwardableFromCombo(
       : !!command && (!!s.forwardFromLocal || FORWARD_BY_NAME.includes(name) || isLocalPathCommand(command));
     if (!pick) continue;
     if (!TUNNEL_NAME.test(name)) {
-      skipped.push({ name, reason: '名字只能用字母、数字、_ . -（最多 40 个），否则放不进转发地址' });
+      skipped.push({ name, reason: tr('Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL') });
       continue;
     }
     if (name === 'kirolex-local') {
-      skipped.push({ name, reason: '和本地工具通道 kirolex-local 重名' });
+      skipped.push({ name, reason: tr('Clashes with the local tool channel kirolex-local') });
       continue;
     }
     const missing: string[] = [];

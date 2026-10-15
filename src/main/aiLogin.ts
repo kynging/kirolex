@@ -11,6 +11,8 @@
  * 也不需要一个 TOML 解析器：config.toml 里我们只认、只改顶层那两行和一个段，其余逐字保留。
  */
 
+import { tr } from './uiText.ts';
+
 /** Claude Code 用网关跑需要的那几个变量（settings.json 的 `env` 里）。 */
 export const CLAUDE_ENV_KEYS = ['ANTHROPIC_BASE_URL', 'ANTHROPIC_API_KEY', 'ANTHROPIC_AUTH_TOKEN', 'ANTHROPIC_MODEL', 'ANTHROPIC_SMALL_FAST_MODEL'] as const;
 
@@ -134,15 +136,15 @@ export interface ToolLoginStatus {
 /** `claude auth status --json` 的输出 → 状态。 */
 export function parseClaudeStatus(out: string, gatewayUrl?: string): ToolLoginStatus {
   const text = String(out || '');
-  if (/command not found|not recognized|KX_NO_CLAUDE/i.test(text)) return { installed: false, loggedIn: false, detail: '没装 Claude Code' };
+  if (/command not found|not recognized|KX_NO_CLAUDE/i.test(text)) return { installed: false, loggedIn: false, detail: tr('Claude Code is not installed') };
   let j: any;
   try { j = JSON.parse(text.slice(text.indexOf('{'), text.lastIndexOf('}') + 1)); } catch { j = undefined; }
-  if (!j) return { installed: true, loggedIn: false, detail: '问不到登录状态' };
-  const how = j.authMethod === 'api_key' ? `API key（${j.apiKeySource || '?'}）` : j.authMethod === 'oauth' || j.authMethod === 'claudeai' ? 'Claude 账号' : String(j.authMethod || '');
+  if (!j) return { installed: true, loggedIn: false, detail: tr('Could not get the login status') };
+  const how = j.authMethod === 'api_key' ? tr('API key ({source})', { source: j.apiKeySource || '?' }) : j.authMethod === 'oauth' || j.authMethod === 'claudeai' ? tr('Claude account') : String(j.authMethod || '');
   return {
     installed: true,
     loggedIn: !!j.loggedIn,
-    detail: j.loggedIn ? `已登录：${how}` : '没登录',
+    detail: j.loggedIn ? tr('Logged in: {how}', { how }) : tr('Not logged in'),
     ...(gatewayUrl ? { gateway: hostOf(gatewayUrl) } : {}),
   };
 }
@@ -150,14 +152,14 @@ export function parseClaudeStatus(out: string, gatewayUrl?: string): ToolLoginSt
 /** `codex login status` 的输出 + 有没有自定义 provider → 状态。自定义网关不需要 `codex login`，有 provider 就算能用。 */
 export function parseCodexStatus(out: string, provider?: { id: string; baseUrl?: string }): ToolLoginStatus {
   const text = String(out || '').trim();
-  if (/command not found|not recognized|KX_NO_CODEX/i.test(text)) return { installed: false, loggedIn: false, detail: '没装 Codex' };
+  if (/command not found|not recognized|KX_NO_CODEX/i.test(text)) return { installed: false, loggedIn: false, detail: tr('Codex is not installed') };
   if (provider?.baseUrl) {
-    return { installed: true, loggedIn: true, detail: `走自定义网关「${provider.id}」`, gateway: hostOf(provider.baseUrl) };
+    return { installed: true, loggedIn: true, detail: tr('Using custom gateway "{id}"', { id: provider.id }), gateway: hostOf(provider.baseUrl) };
   }
   const logged = /^Logged in/i.test(text);
   /* 把 key 的那一截遮掉：`Logged in using an API key - sk-***` 后面那段不出主进程 */
   const said = text.split('\n')[0].replace(/ - .*$/, '');
-  return { installed: true, loggedIn: logged, detail: logged ? `已登录：${said.replace(/^Logged in using /i, '')}` : '没登录' };
+  return { installed: true, loggedIn: logged, detail: logged ? tr('Logged in: {how}', { how: said.replace(/^Logged in using /i, '') }) : tr('Not logged in') };
 }
 
 function hostOf(url: string): string {
@@ -188,16 +190,16 @@ export function claudeEditorText(localSettings: string): string {
 /** 编辑器里的 JSON → 要合并进 env 的键值。只收字符串；空值的键不写（"留空"不该把那台机器原来的值改成空串）。 */
 export function parseClaudeEditor(text: string): Record<string, string> {
   let j: any;
-  try { j = JSON.parse(text); } catch (e: any) { throw new Error(`不是合法的 JSON：${e?.message || e}`); }
-  if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error('要是一个 JSON 对象（键是变量名，值是字符串）。');
+  try { j = JSON.parse(text); } catch (e: any) { throw new Error(tr('Not valid JSON: {err}', { err: e?.message || e })); }
+  if (!j || typeof j !== 'object' || Array.isArray(j)) throw new Error(tr('It must be a JSON object (keys are variable names, values are strings).'));
   /* 整份 settings.json 贴进来也认：取它的 env */
   const src = j.env && typeof j.env === 'object' && !Array.isArray(j.env) ? j.env : j;
   const out: Record<string, string> = {};
   for (const [k, v] of Object.entries(src)) {
-    if (typeof v !== 'string') throw new Error(`「${k}」的值要是字符串。`);
+    if (typeof v !== 'string') throw new Error(tr('The value of "{key}" must be a string.', { key: k }));
     if (v.trim()) out[k] = v.trim();
   }
-  if (!out.ANTHROPIC_API_KEY && !out.ANTHROPIC_AUTH_TOKEN) throw new Error('至少要有 ANTHROPIC_API_KEY（或 ANTHROPIC_AUTH_TOKEN）。');
+  if (!out.ANTHROPIC_API_KEY && !out.ANTHROPIC_AUTH_TOKEN) throw new Error(tr('At least ANTHROPIC_API_KEY (or ANTHROPIC_AUTH_TOKEN) is required.'));
   return out;
 }
 
@@ -223,10 +225,10 @@ export function codexEditorText(localToml: string): string {
 /** 编辑器里的 TOML 片段 → provider。必须有顶层 `model_provider` 和同名的 `[model_providers.<id>]` 段。 */
 export function parseCodexEditor(text: string): CodexProvider {
   const id = topLevelValue(text, 'model_provider');
-  if (!id) throw new Error('缺顶层的 model_provider = "<名字>"（要写在所有 [段] 之前）。');
+  if (!id) throw new Error(tr('Missing the top-level model_provider = "<name>" (it must come before every [section]).'));
   const section = providerSection(text, id);
-  if (!section) throw new Error(`缺 [model_providers.${id}] 这一段。`);
-  if (!/^\s*base_url\s*=\s*"[^"]+"/m.test(section)) throw new Error(`[model_providers.${id}] 里的 base_url 不能为空。`);
+  if (!section) throw new Error(tr('Missing the [model_providers.{id}] section.', { id }));
+  if (!/^\s*base_url\s*=\s*"[^"]+"/m.test(section)) throw new Error(tr('base_url in [model_providers.{id}] cannot be empty.', { id }));
   const model = topLevelValue(text, 'model');
   return { id, model: model || undefined, section };
 }

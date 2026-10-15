@@ -33,6 +33,7 @@
 import { execFile } from 'child_process';
 import type { RemoteTarget } from './config';
 import { sshEnv } from './sshAuth.ts';
+import { tr } from './uiText.ts';
 
 /** The SSH argument builders, INJECTED rather than imported.
  *
@@ -202,7 +203,7 @@ export function runVerifier(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: Ssh
       if (timedOut) {
         resolve({
           ran: false, exitCode: null, output, host, durationMs, timedOut: true,
-          error: `校验命令超过 ${req.timeoutSec} 秒未结束，已终止`,
+          error: tr('The verifier command did not finish within {sec} seconds and was stopped', { sec: req.timeoutSec }),
         });
         return;
       }
@@ -213,7 +214,7 @@ export function runVerifier(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: Ssh
           // verifier command burn a loop's entire round budget.
           resolve({
             ran: false, exitCode: null, output, host, durationMs, timedOut: false,
-            error: `找不到校验命令（shell 退出码 ${err.code}）：${output.trim().split('\n')[0] || '命令不存在或不可执行'}`,
+            error: tr('Verifier command not found (shell exit code {code}): {detail}', { code: err.code, detail: output.trim().split('\n')[0] || tr('the command does not exist or is not executable') }),
           });
           return;
         }

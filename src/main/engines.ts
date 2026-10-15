@@ -18,6 +18,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { execFileSync } from 'child_process';
+import { tr } from './uiText.ts';
 
 export type Engine = 'kiro' | 'claude' | 'codex';
 export const ENGINES: Engine[] = ['kiro', 'claude', 'codex'];
@@ -114,7 +115,7 @@ export function resolveAdapter(
   /* 非 Windows 上 PATH 里的可执行文件可以直接起（那边 npm 装的是带 shebang 的脚本） */
   if ((opts.platform || process.platform) !== 'win32') return { command: spec.bin, args: [], env: {} };
   npmRootCache = undefined;   // 下次再问（多半是还没装，装完就能找到）
-  throw new Error(`没找到 ${ENGINE_LABEL[engine]} 的 ACP 适配器。装一下：\`${spec.install}\`（装完不用重启 KiroLex，新建会话时会重新找）。`);
+  throw new Error(tr('Could not find the ACP adapter for {engine}. Install it: `{install}` (no need to restart KiroLex afterwards, it is looked up again when you create a session).', { engine: ENGINE_LABEL[engine], install: spec.install }));
 }
 
 /** 找不到适配器时缓存的 `npm root -g` 也该重新问一次（刚装完的情况）。 */

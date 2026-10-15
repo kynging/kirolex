@@ -17,6 +17,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { tr, trList } from './uiText.ts';
 
 /** 远端缓存根（相对远端家目录）。远端 cwd 是它下面每条会话一个子目录（`config.sessionCwd`）。 */
 export const REMOTE_CACHE_SUBDIR = '.cache/kirolex';
@@ -154,19 +155,22 @@ export function strayRemoteDeliverables(toolCall: any, ctx: RemoteWriteContext):
   return writeTargets(toolCall, ctx.cwd, ctx.home).filter((p) => !isRemoteDisposablePath(p, ctx.home));
 }
 
-const showPaths = (paths: string[]) => paths.slice(0, 3).map((p) => `\`${p}\``).join('、') + (paths.length > 3 ? ` 等 ${paths.length} 个` : '');
+const showPaths = (paths: string[]) => {
+  const shown = trList(paths.slice(0, 3).map((p) => `\`${p}\``));
+  return paths.length > 3 ? tr('{paths}, etc. ({n} in total)', { paths: shown, n: paths.length }) : shown;
+};
 
 /** 拦下时给用户看的那句（状态行）。 */
 export function blockedWriteNotice(host: string, paths: string[], filesDir?: string): string {
-  return `🛡 拦下了一次往 ${host} 上写文件${paths.length ? `（${showPaths(paths)}）` : ''}：`
-    + `远程会话里交付给你的文件要落在你机器上 —— 已拒绝，按提示词它会改用 \`local_write\` 写到本机`
-    + (filesDir ? `（\`${filesDir}\`）` : '') + '。';
+  const where = paths.length ? tr(' ({paths})', { paths: showPaths(paths) }) : '';
+  return filesDir
+    ? tr('🛡 Blocked a file write to {host}{where}: in a remote session, files delivered to you must land on your machine. Refused; per its prompt it will use `local_write` to write locally instead (`{dir}`).', { host, where, dir: filesDir })
+    : tr('🛡 Blocked a file write to {host}{where}: in a remote session, files delivered to you must land on your machine. Refused; per its prompt it will use `local_write` to write locally instead.', { host, where });
 }
 
 /** 事后发现交付文件落在远端时给用户看的那句（状态行，带「复制到本机」按钮）。 */
 export function strayWriteNotice(host: string, paths: string[]): string {
-  return `⚠️ 这一轮把文件写在了 ${host} 上（${showPaths(paths)}），不在你机器上 —— `
-    + '点「⇩ 复制到本机」把它放进这条会话的本机文件夹，之后预览、comment 都按本机那一份来。';
+  return tr('⚠️ This turn wrote files on {host} ({paths}), not on your machine. Click "⇩ Copy to this machine" to put them in this session\'s local folder; previews and comments will then use the local copy.', { host, paths: showPaths(paths) });
 }
 
 /**

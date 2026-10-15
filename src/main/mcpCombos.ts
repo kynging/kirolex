@@ -22,6 +22,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
+import { tr } from './uiText.ts';
 
 export const BUILTIN_COMBO_ID = 'default';
 
@@ -48,6 +49,14 @@ export interface McpCombo {
 }
 
 export const BUILTIN_COMBO: McpCombo = Object.freeze({ id: BUILTIN_COMBO_ID, name: '通用', mcpServers: Object.freeze({}) as Record<string, McpComboServer> });
+
+/**
+ * 下拉 / 提示里显示的名字。内置那个的 `name`（「通用」）**不改** —— 它参与「名字重复」校验，
+ * 跟着界面语言变会让同一份文件在两种语言下一个过、一个不过；只在显示时换成当前语言。
+ */
+export function comboDisplayName(combo: Pick<McpCombo, 'id' | 'name'>): string {
+  return combo.id === BUILTIN_COMBO_ID ? tr('General') : combo.name;
+}
 
 export function mcpCombosPath(home: string): string {
   return path.join(home, '.kirolex', 'mcp-combos.json');
@@ -77,45 +86,45 @@ const isObj = (v: unknown): v is Record<string, unknown> => !!v && typeof v === 
 
 function checkStringMap(v: unknown, what: string): string | null {
   if (v === undefined) return null;
-  if (!isObj(v)) return `${what} 要是一个对象（名字 → 值）`;
+  if (!isObj(v)) return tr('{what} must be an object (name → value)', { what });
   for (const [k, val] of Object.entries(v)) {
-    if (typeof val !== 'string') return `${what} 里「${k}」的值要是字符串`;
+    if (typeof val !== 'string') return tr('{what}: the value of "{k}" must be a string', { what, k });
     for (const m of val.matchAll(ENV_REF)) {
       /* 不回显 `${env:…}` 里写的东西：写错的地方可能正是一段密钥（这句话会进日志） */
-      if (!ENV_NAME.test(m[1])) return `${what} 里「${k}」的 \${env:…} 引用不是合法的环境变量名（只能是字母、数字、下划线，不能以数字开头）`;
+      if (!ENV_NAME.test(m[1])) return tr('{what}: the ${env:...} reference in "{k}" is not a valid environment variable name (letters, digits and underscores only, not starting with a digit)', { what, k });
     }
   }
   return null;
 }
 
 function checkServer(name: string, s: unknown): string | null {
-  const where = `MCP「${name}」`;
-  if (!name.trim()) return 'MCP 名字不能是空的';
-  if (!isObj(s)) return `${where} 要是一个对象`;
+  const where = tr('MCP "{name}"', { name });
+  if (!name.trim()) return tr('The MCP name cannot be empty');
+  if (!isObj(s)) return tr('{where} must be an object', { where });
   const hasUrl = s.url !== undefined;
   const hasCmd = s.command !== undefined;
-  if (hasUrl && hasCmd) return `${where} 不能同时有 url 和 command（http 型写 url，stdio 型写 command）`;
-  if (!hasUrl && !hasCmd) return `${where} 要么写 url（http 型），要么写 command（stdio 型）`;
-  if (s.type !== undefined && s.type !== 'http' && s.type !== 'stdio') return `${where} 的 type 只能是 "http" 或 "stdio"`;
-  if (s.type === 'http' && !hasUrl) return `${where} 的 type 是 http，但没有 url`;
-  if (s.type === 'stdio' && !hasCmd) return `${where} 的 type 是 stdio，但没有 command`;
+  if (hasUrl && hasCmd) return tr('{where} cannot have both url and command (url for http, command for stdio)', { where });
+  if (!hasUrl && !hasCmd) return tr('{where} needs either url (http) or command (stdio)', { where });
+  if (s.type !== undefined && s.type !== 'http' && s.type !== 'stdio') return tr('{where}: type must be "http" or "stdio"', { where });
+  if (s.type === 'http' && !hasUrl) return tr('{where}: type is http but there is no url', { where });
+  if (s.type === 'stdio' && !hasCmd) return tr('{where}: type is stdio but there is no command', { where });
   for (const flag of ['forwardFromLocal', 'disabled'] as const) {
-    if (s[flag] !== undefined && typeof s[flag] !== 'boolean') return `${where} 的 ${flag} 要是 true / false`;
+    if (s[flag] !== undefined && typeof s[flag] !== 'boolean') return tr('{where}: {flag} must be true / false', { where, flag });
   }
   if (hasUrl) {
-    if (typeof s.url !== 'string' || !/^https?:\/\/\S+$/i.test(s.url)) return `${where} 的 url 要以 http:// 或 https:// 开头`;
-    const h = checkStringMap(s.headers, `${where} 的 headers`);
+    if (typeof s.url !== 'string' || !/^https?:\/\/\S+$/i.test(s.url)) return tr('{where}: url must start with http:// or https://', { where });
+    const h = checkStringMap(s.headers, tr('{where} headers', { where }));
     if (h) return h;
     if (s.timeoutSec !== undefined && (typeof s.timeoutSec !== 'number' || !Number.isFinite(s.timeoutSec) || s.timeoutSec <= 0)) {
-      return `${where} 的 timeoutSec 要是正数（秒）`;
+      return tr('{where}: timeoutSec must be a positive number (seconds)', { where });
     }
-    for (const k of ['command', 'args', 'env']) if (s[k] !== undefined) return `${where} 是 http 型，不能写 ${k}`;
+    for (const k of ['command', 'args', 'env']) if (s[k] !== undefined) return tr('{where} is an http server and cannot have {k}', { where, k });
   } else {
-    if (typeof s.command !== 'string' || !s.command.trim()) return `${where} 的 command 不能是空的`;
-    if (s.args !== undefined && (!Array.isArray(s.args) || s.args.some((a) => typeof a !== 'string'))) return `${where} 的 args 要是字符串列表`;
-    const e = checkStringMap(s.env, `${where} 的 env`);
+    if (typeof s.command !== 'string' || !s.command.trim()) return tr('{where}: command cannot be empty', { where });
+    if (s.args !== undefined && (!Array.isArray(s.args) || s.args.some((a) => typeof a !== 'string'))) return tr('{where}: args must be a list of strings', { where });
+    const e = checkStringMap(s.env, tr('{where} env', { where }));
     if (e) return e;
-    for (const k of ['headers', 'timeoutSec']) if (s[k] !== undefined) return `${where} 是 stdio 型，不能写 ${k}`;
+    for (const k of ['headers', 'timeoutSec']) if (s[k] !== undefined) return tr('{where} is a stdio server and cannot have {k}', { where, k });
   }
   return null;
 }
@@ -140,9 +149,9 @@ function jsonSyntaxError(text: string): string {
     const mid = (lo + hi) >> 1;
     if (incompleteOnly(mid + 1)) lo = mid + 1; else hi = mid;
   }
-  if (lo >= text.length) return '不是合法的 JSON：文件没写完（缺了右括号或引号？）';
+  if (lo >= text.length) return tr('Invalid JSON: the file ends too early (missing a closing bracket or quote?)');
   const before = text.slice(0, lo).split(/\r\n|\r|\n/);
-  return `不是合法的 JSON：第 ${before.length} 行第 ${before[before.length - 1].length + 1} 列附近有语法错误（比如漏了引号或逗号）`;
+  return tr('Invalid JSON: syntax error near line {line}, column {col} (a missing quote or comma?)', { line: before.length, col: before[before.length - 1].length + 1 });
 }
 
 export type ParseResult = { ok: true; combos: McpCombo[] } | { ok: false; error: string };
@@ -153,26 +162,26 @@ export function parseMcpCombos(text: string): ParseResult {
   try { raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch {
     return { ok: false, error: jsonSyntaxError(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) };
   }
-  if (!Array.isArray(raw)) return { ok: false, error: '文件内容要是一个组合列表（[ … ]）' };
+  if (!Array.isArray(raw)) return { ok: false, error: tr('The file must contain a list of combos ([ ... ])') };
   const combos: McpCombo[] = [BUILTIN_COMBO];
   const ids = new Set<string>([BUILTIN_COMBO_ID]);
   const names = new Set<string>([BUILTIN_COMBO.name]);
   for (let i = 0; i < raw.length; i += 1) {
     const c = raw[i];
-    const at = `第 ${i + 1} 个组合`;
-    if (!isObj(c)) return { ok: false, error: `${at}要是一个对象` };
-    if (typeof c.id !== 'string' || !COMBO_ID.test(c.id)) return { ok: false, error: `${at}的 id 要是 1–64 位字母、数字、- 或 _` };
-    if (c.id === BUILTIN_COMBO_ID) return { ok: false, error: `${at}：id「${BUILTIN_COMBO_ID}」是内置「通用」组合保留的，换一个` };
-    if (ids.has(c.id)) return { ok: false, error: `${at}的 id「${c.id}」重复了` };
-    if (typeof c.name !== 'string' || !c.name.trim()) return { ok: false, error: `${at}（${c.id}）缺少 name（下拉里显示的名字）` };
+    const at = tr('Combo #{n}', { n: i + 1 });
+    if (!isObj(c)) return { ok: false, error: tr('{at} must be an object', { at }) };
+    if (typeof c.id !== 'string' || !COMBO_ID.test(c.id)) return { ok: false, error: tr('{at}: id must be 1-64 letters, digits, - or _', { at }) };
+    if (c.id === BUILTIN_COMBO_ID) return { ok: false, error: tr('{at}: id "{id}" is reserved for the built-in "General" combo; pick another', { at, id: BUILTIN_COMBO_ID }) };
+    if (ids.has(c.id)) return { ok: false, error: tr('{at}: id "{id}" is a duplicate', { at, id: c.id }) };
+    if (typeof c.name !== 'string' || !c.name.trim()) return { ok: false, error: tr('{at} ({id}) has no name (the name shown in the dropdown)', { at, id: c.id }) };
     const name = c.name.trim();
-    if (names.has(name)) return { ok: false, error: `${at}的名字「${name}」重复了（下拉里会分不清）` };
-    if (c.effort !== undefined && (typeof c.effort !== 'string' || !c.effort.trim())) return { ok: false, error: `${at}（${name}）的 effort 要是非空字符串，或者干脆不写` };
-    if (c.mcpServers !== undefined && !isObj(c.mcpServers)) return { ok: false, error: `${at}（${name}）的 mcpServers 要是一个对象（名字 → 配置）` };
+    if (names.has(name)) return { ok: false, error: tr('{at}: name "{name}" is a duplicate (the dropdown could not tell them apart)', { at, name }) };
+    if (c.effort !== undefined && (typeof c.effort !== 'string' || !c.effort.trim())) return { ok: false, error: tr('{at} ({name}): effort must be a non-empty string, or omitted', { at, name }) };
+    if (c.mcpServers !== undefined && !isObj(c.mcpServers)) return { ok: false, error: tr('{at} ({name}): mcpServers must be an object (name → config)', { at, name }) };
     const servers = (c.mcpServers || {}) as Record<string, unknown>;
     for (const [sn, s] of Object.entries(servers)) {
       const e = checkServer(sn, s);
-      if (e) return { ok: false, error: `${at}（${name}）：${e}` };
+      if (e) return { ok: false, error: tr('{at} ({name}): {e}', { at, name, e }) };
     }
     ids.add(c.id);
     names.add(name);
@@ -269,9 +278,11 @@ export function planComboEffort(
   comboName = '',
 ): { apply: boolean; notice?: string } {
   if (opts && opts.options.some((o) => o.value === want)) return { apply: true };
-  const who = comboName ? `组合「${comboName}」` : '组合';
-  const avail = opts?.options.length ? `（可选：${opts.options.map((o) => o.value).join(' / ')}）` : '（这个引擎没给 effort 选项）';
-  return { apply: false, notice: `ℹ️ ${who}要的 effort「${want}」当前引擎 / 模型不支持${avail}` };
+  const who = comboName ? tr('Combo "{name}"', { name: comboName }) : tr('The combo');
+  const avail = opts?.options.length
+    ? tr(' (options: {list})', { list: opts.options.map((o) => o.value).join(' / ') })
+    : tr(' (this engine offers no effort options)');
+  return { apply: false, notice: tr('ℹ️ {who} wants effort "{want}", which the current engine / model does not support{avail}', { who, want, avail }) };
 }
 
 type EffortSelect = { current: string; options: Array<{ value: string; name: string }> } | null;
@@ -302,18 +313,25 @@ export async function applyComboEffort(
   if (plan.apply) {
     if (io.options()?.current === want) return { value: want };
     try { await io.set(want); return { value: want }; } catch (err: any) {
-      base = `⚠️ 组合「${comboName}」要的 effort「${want}」没设上（${err?.message || err}）`;
+      base = tr('⚠️ Could not set effort "{want}" for combo "{name}" ({err})', { want, name: comboName, err: String(err?.message || err) });
     }
   }
   const now = io.options();
   const fb = defaultEffort(now);
-  const keep = now?.current ? `「${now.current}」` : '';
-  if (!fb) return { notice: `${base}，这个引擎没有可以退回的默认档位，保持当前档位${keep}。` };
-  if (now?.current === fb) return { value: fb, notice: `${base}，用默认档位「${fb}」。` };
+  const cur = now?.current || '';
+  if (!fb) {
+    return { notice: cur
+      ? tr('{base}; this engine has no default level to fall back to, keeping the current level "{cur}".', { base, cur })
+      : tr('{base}; this engine has no default level to fall back to, keeping the current level.', { base }) };
+  }
+  if (now?.current === fb) return { value: fb, notice: tr('{base}; using the default level "{fb}".', { base, fb }) };
   try {
     await io.set(fb);
-    return { value: fb, notice: `${base}，已退回默认档位「${fb}」。` };
+    return { value: fb, notice: tr('{base}; fell back to the default level "{fb}".', { base, fb }) };
   } catch (err: any) {
-    return { notice: `${base}，退回默认档位「${fb}」也没成功（${err?.message || err}），保持当前档位${keep}。` };
+    const e = String(err?.message || err);
+    return { notice: cur
+      ? tr('{base}; falling back to the default level "{fb}" also failed ({err}), keeping the current level "{cur}".', { base, fb, err: e, cur })
+      : tr('{base}; falling back to the default level "{fb}" also failed ({err}), keeping the current level.', { base, fb, err: e }) };
   }
 }

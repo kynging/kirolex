@@ -24,6 +24,8 @@
  * only normalises them and answers "is anything still running".
  */
 
+import { trIn, type UiLang } from './uiText.ts';
+
 export interface SubagentRow {
   /** The subagent's OWN ACP session id — not a KiroLex session id, and not the parent's. */
   sessionId: string;
@@ -87,12 +89,12 @@ export function activeSubagents(rows: SubagentRow[] | undefined): SubagentRow[] 
  * What the left rail shows next to the chat — 「直到subagent被关掉」 is the whole requirement, so this is
  * `null` the moment the last one terminates, and the count is of the running ones only.
  */
-export function subagentTag(rows: SubagentRow[] | undefined): { count: number; title: string } | null {
+export function subagentTag(rows: SubagentRow[] | undefined, lang: UiLang = 'zh'): { count: number; title: string } | null {
   const live = activeSubagents(rows);
   if (!live.length) return null;
   return {
     count: live.length,
-    title: live.map((row) => `${row.name}（${row.agentName || '未知 agent'}）${row.statusMessage ? ' · ' + row.statusMessage : ''}`).join('\n'),
+    title: live.map((row) => `${trIn(lang, '{name} ({agent})', { name: row.name, agent: row.agentName || trIn(lang, 'unknown agent') })}${row.statusMessage ? ' · ' + row.statusMessage : ''}`).join('\n'),
   };
 }
 

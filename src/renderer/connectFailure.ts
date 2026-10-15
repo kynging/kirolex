@@ -1,4 +1,6 @@
 import type { Message } from './App';
+import { messageVariants, t, type Lang } from './i18n.ts';
+import { asVariants } from '../main/uiText.ts';
 
 /**
  * 「⚠️ 这条会话没连上：…」那条提示 —— 只在界面上，不落盘。
@@ -8,16 +10,24 @@ import type { Message } from './App';
  * 用户或模型的消息哪怕字面一样也不动。
  */
 export const CONNECT_FAILURE_PREFIX = '⚠️ 这条会话没连上：';
+/** 英文界面下的同一个开头（只在界面上、不落盘，所以判据两种都认）。 */
+const connectFailurePrefix = (lang: Lang): string => t(lang, "⚠️ This chat couldn't connect: ");
+const CONNECT_FAILURE_PREFIXES = [CONNECT_FAILURE_PREFIX, connectFailurePrefix('en')];
 
-export const connectFailureNotice = (why: string, now: number = Date.now()): Message => ({
-  id: `msg_${now}`,
-  role: 'kirolex' as any,
-  content: `${CONNECT_FAILURE_PREFIX}${why}`,
-  timestamp: now,
-} as Message);
+export const connectFailureNotice = (why: string, now: number = Date.now(), lang: Lang = 'zh'): Message => {
+  /* 整句的中英两版：原因是 KiroLex 自己说的（主进程 tr() 出来的报错）就一起换，系统原文（ECONNREFUSED…）原样 */
+  const reason = messageVariants(why);
+  return {
+    id: `msg_${now}`,
+    role: 'kirolex' as any,
+    content: `${connectFailurePrefix(lang)}${why}`,
+    variants: { zh: `${connectFailurePrefix('zh')}${reason?.zh ?? why}`, en: `${connectFailurePrefix('en')}${reason?.en ?? why}` },
+    timestamp: now,
+  } as Message;
+};
 
 export const isConnectFailureNotice = (m: Pick<Message, 'role' | 'content'> | null | undefined): boolean =>
-  !!m && (m.role as string) === 'kirolex' && typeof m.content === 'string' && m.content.startsWith(CONNECT_FAILURE_PREFIX);
+  !!m && (m.role as string) === 'kirolex' && typeof m.content === 'string' && CONNECT_FAILURE_PREFIXES.some((p) => (m.content as string).startsWith(p));
 
 /** 摘掉所有连接失败提示；给了 `notice` 就换成这一条（只留一条，不并存）。 */
 export const replaceConnectFailureNotices = (msgs: Message[], notice?: Message): Message[] => {
@@ -46,6 +56,8 @@ export const historyBeforeNotice = async (
       toolCalls: m.toolCalls, attachments: m.attachments,
       pastes: m.pastes, timestamp: m.ts,
       ...(m.kirolex ? { kirolex: true as const } : {}),
+      /* KiroLex 提示的中英两版 —— 漏了它，这条后台会话打开后提示就停在写下时的语言 */
+      ...(asVariants(m.variants) ? { variants: asVariants(m.variants) } : {}),
     } as Message));
   } catch {
     return null;

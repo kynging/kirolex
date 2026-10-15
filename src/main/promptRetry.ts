@@ -32,6 +32,7 @@
 
 import { isTransientTransportError } from './transientError.ts';
 import { isBareInternalError } from './staleSession.ts';
+import { tr, trConcat } from './uiText.ts';
 
 /** 一次用户发送里，KiroLex 最多自己重发几次。3 次 —— 实测"换三个后端会话才通"是真实发生过的上限。 */
 export const MAX_AUTO_RETRIES = 3;
@@ -110,7 +111,6 @@ export function planRetry(input: RetryInput): RetryPlan {
 /** 重试都用光之后给用户看的那句话 —— 要说清试过几次、以及该看哪儿。 */
 export function retriesExhaustedNote(errText: string, attempts: number): string {
   const head = String(errText || '').slice(0, 160);
-  return `${head}\n\n（KiroLex 已经自己重发了 ${attempts} 次，都是同一个结果。`
-    + '这一轮什么都没产出，所以重发是安全的、也确实做了；到这一步说明问题在后端而不是这条消息 ——'
-    + '可以点重跑再试，或者把这一轮拆小一点再发。）';
+  /* trConcat：原始错误原样，后面那句说明能整段换成另一种语言（切了界面语言、隔着 IPC 都认得） */
+  return trConcat(head, '\n\n', tr('(KiroLex already resent this {n} times by itself, with the same result each time. This turn produced nothing, so resending was safe and was done; at this point the problem is on the backend, not in this message. Click rerun to try again, or split this turn into smaller pieces.)', { n: attempts }));
 }

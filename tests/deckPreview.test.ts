@@ -275,7 +275,7 @@ describe('PdfView：pdf.js 自己画，worker 打进包里', () => {
   test('页数由 pdf.js 报，进视口才画，单页失败要说出来', () => {
     assert.match(PDF, /onPages\?\.\(d\.numPages\);/);
     assert.match(PDF, /new IntersectionObserver\(/);
-    assert.match(PDF, /第 \{index\} 页画不出来/);
+    assert.match(PDF, /\{t\('Couldn\\'t render page \{index\}: \{why\}', \{ index, why: pageWhy \}\)\}/);
   });
 
   test('字节不走 file:// —— 渲染层拿主进程给的 base64', () => {

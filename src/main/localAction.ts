@@ -28,6 +28,8 @@
  * 数据外带不是这条通道新增的风险：那台机器本来就有完整的出网能力，想发东西自己就发了。
  */
 
+import { tr } from './uiText.ts';
+
 /** 标记词。行首（允许 markdown 的项目符号/加粗/反引号包裹）。 */
 export const LOCAL_MARKER = 'KIROLEX-LOCAL';
 
@@ -62,16 +64,16 @@ export function parseLocalActions(line: string): { actions: LocalAction[]; rejec
   const verb = m[1].toLowerCase();
   const rest = m[2].trim();
   if (verb !== 'open') {
-    rejected.push({ raw: clean, why: `只支持 open，不认 \`${verb}\`` });
+    rejected.push({ raw: clean, why: tr('only open is supported, not `{verb}`', { verb }) });
     return { actions, rejected };
   }
   const target = rest.split(/\s+/)[0] || '';
   if (!target) {
-    rejected.push({ raw: clean, why: '没给地址' });
+    rejected.push({ raw: clean, why: tr('no address given') });
     return { actions, rejected };
   }
   if (!/^https?:\/\//i.test(target)) {
-    rejected.push({ raw: clean, why: '只能开 http/https 地址（别的 scheme 在 macOS 上是应用启动器）' });
+    rejected.push({ raw: clean, why: tr('only http/https addresses can be opened (other schemes are app launchers on macOS)') });
     return { actions, rejected };
   }
   try {
@@ -79,7 +81,7 @@ export function parseLocalActions(line: string): { actions: LocalAction[]; rejec
     if (!u.hostname) throw new Error('no host');
     actions.push({ verb: 'open', target: u.toString() });
   } catch {
-    rejected.push({ raw: clean, why: '不是一个合法地址' });
+    rejected.push({ raw: clean, why: tr('not a valid address') });
   }
   return { actions, rejected };
 }

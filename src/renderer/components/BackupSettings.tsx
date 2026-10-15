@@ -33,6 +33,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { intervalChoices, intervalLabel } from '../backupIntervals.ts';
 import { ToggleButton } from './ToggleButton.tsx';
+import { useLang, useT } from '../hooks/useLang';
 
 interface Cfg {
   enabled: boolean;
@@ -61,6 +62,8 @@ const Field: React.FC<{ label: string; children: React.ReactNode; hint?: string 
 );
 
 export const BackupSettings: React.FC = () => {
+  const lang = useLang();
+  const t = useT();
   const [cfg, setCfg] = useState<Cfg | null>(null);
   const [secret, setSecret] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
@@ -95,7 +98,7 @@ export const BackupSettings: React.FC = () => {
       });
       setSecret('');
       await load();
-      setMsg({ kind: 'ok', text: '已保存。' });
+      setMsg({ kind: 'ok', text: t('Saved.') });
     } catch (err: any) {
       setMsg({ kind: 'bad', text: String(err?.message || err) });
     } finally { setBusy(null); }
@@ -114,28 +117,27 @@ export const BackupSettings: React.FC = () => {
           唯一例外是**测试对象没删掉**那种（`leftover`）：那时桶里真留了个东西，
           必须原样说出来 —— 那是个新信息，不是复述。
         */
-        const leftover = what === 'test' && /没删掉/.test(String(r.message || '')) ? String(r.message) : '';
+        const leftover = what === 'test' && /没删掉|could not be deleted/.test(String(r.message || '')) ? String(r.message) : '';
         setMsg({
           kind: 'ok',
           text: what === 'test'
             ? (leftover || '✅')
-            : `传了 ${r.uploaded} 个文件，${r.skipped} 个没变。`,
+            : t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }),
         });
-      } else setMsg({ kind: 'bad', text: String(r?.error || '失败') });
+      } else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
       await load();
     } catch (err: any) {
       setMsg({ kind: 'bad', text: String(err?.message || err) });
     } finally { setBusy(null); }
   };
 
-  if (!cfg) return <div className="settings-item settings-item-wide settings-hint">读配置…</div>;
+  if (!cfg) return <div className="settings-item settings-item-wide settings-hint">{t('Loading settings…')}</div>;
 
   return (
     <div className="settings-item settings-item-wide backup-config">
       {!cfg.encryptionAvailable && (
         <div className="settings-warn backup-note">
-          这台机器上没有可用的加密存储（keychain / keyring）—— 所以不能保存 Secret Access Key。
-          明文写进配置文件不是一个选项。
+          {t('No encrypted storage (keychain / keyring) is available on this machine, so the Secret Access Key cannot be saved. Writing it to the config file in plain text is not an option.')}
         </div>
       )}
 
@@ -147,14 +149,14 @@ export const BackupSettings: React.FC = () => {
         ② 恢复在别的地方（否则人会在这一页找恢复）。
       */}
       <div className="settings-hint backup-note">
-        只传会话、记忆层和附件，不含 <code>config.json</code> 和日志。恢复在侧栏那颗 <b>☁️</b>。
+        {t('Only sessions, memory and attachments are uploaded, not ')}<code>config.json</code>{t(' or logs. Restore is under the ')}<b>☁️</b>{t(' button in the sidebar.')}
       </div>
 
       <Field label="Bucket">
         <input className="settings-input" value={cfg.bucket}
                onChange={(e) => patch({ bucket: e.target.value })} onBlur={() => void save()} />
       </Field>
-      <Field label="Region">
+      <Field label={t('Region')}>
         <input className="settings-input" value={cfg.region}
                onChange={(e) => patch({ region: e.target.value })} onBlur={() => void save()} />
       </Field>
@@ -163,23 +165,23 @@ export const BackupSettings: React.FC = () => {
                onChange={(e) => patch({ accessKeyId: e.target.value })} onBlur={() => void save()} />
       </Field>
       <Field
-        label="Secret"
-        hint="需要 s3:PutObject / GetObject / ListBucket / DeleteObject。"
+        label={t('Secret')}
+        hint={t('Needs s3:PutObject / GetObject / ListBucket / DeleteObject.')}
       >
         <input className="settings-input" type="password" value={secret}
-               placeholder={cfg.hasSecret ? '已保存（留空 = 不改）' : '填一次，之后不再显示'}
+               placeholder={cfg.hasSecret ? t('Saved (leave empty to keep)') : t('Enter once; it will not be shown again')}
                disabled={!cfg.encryptionAvailable}
                onChange={(e) => setSecret(e.target.value)}
                onBlur={() => { if (secret.trim()) void save(); }} />
         {cfg.hasSecret && (
           <button className="remote-btn" disabled={!!busy}
                   onClick={() => void save({ clearSecret: true })}
-                  title="从配置里删掉已保存的 secret">清掉</button>
+                  title={t('Remove the saved secret from the config')}>{t('Clear saved')}</button>
         )}
       </Field>
       {/* 唯一可选的那个，所以标在**标签**上而不是塞进 placeholder ——
           placeholder 一填东西就消失了，而"这栏可以不填"是一直成立的事 */}
-      <Field label="Key 前缀（可选）">
+      <Field label={t('Key prefix (optional)')}>
         <input className="settings-input" value={cfg.prefix}
                onChange={(e) => patch({ prefix: e.target.value })} onBlur={() => void save()} />
       </Field>
@@ -187,33 +189,33 @@ export const BackupSettings: React.FC = () => {
       {/* 先确认可读可写，再谈定时 */}
       <div className="backup-actions">
         <button className="remote-btn remote-btn-primary" disabled={!!busy} onClick={() => void run('test')}>
-          {busy === 'test' ? '测试中…' : '测连通'}
+          {busy === 'test' ? t('Testing…') : t('Test connectivity')}
         </button>
         <button className="remote-btn" disabled={!!busy} onClick={() => void run('sync')}>
-          {busy === 'sync' ? '同步中…' : '立即同步'}
+          {busy === 'sync' ? t('Syncing…') : t('Sync now')}
         </button>
       </div>
 
-      <Field label="定时同步">
+      <Field label={t('Scheduled sync')}>
         <ToggleButton
           on={cfg.enabled}
-          ariaLabel="定时同步"
-          title={cfg.enabled ? '定时同步开着 —— 点一下关掉' : '定时同步关着 —— 点一下打开'}
+          ariaLabel={t('Scheduled sync')}
+          title={cfg.enabled ? t('Scheduled sync is on. Click to turn it off') : t('Scheduled sync is off. Click to turn it on')}
           onChange={(next) => { patch({ enabled: next }); void save({ enabled: next }); }}
         />
         <select className="settings-select backup-interval"
                 value={String(cfg.intervalMinutes)}
                 onChange={(e) => { const m = Number(e.target.value); patch({ intervalMinutes: m }); void save({ intervalMinutes: m }); }}>
           {intervalChoices(cfg.intervalMinutes).map((m) => (
-            <option key={m} value={m}>{intervalLabel(m)}</option>
+            <option key={m} value={m}>{intervalLabel(m, lang)}</option>
           ))}
         </select>
       </Field>
 
       {cfg.last && (
         <div className="settings-value backup-note">
-          上一次：{when(cfg.last.at)} · 传了 {cfg.last.uploaded} 个 / {kb(cfg.last.bytes)}
-          {' · '}跳过 {cfg.last.skipped}{cfg.last.error ? ' · 失败' : ''}
+          {t('Last run: {at} · uploaded {n} / {size}', { at: when(cfg.last.at), n: cfg.last.uploaded, size: kb(cfg.last.bytes) })}
+          {' · '}{t('skipped {n}', { n: cfg.last.skipped })}{cfg.last.error ? ` · ${t('failed')}` : ''}
         </div>
       )}
       {cfg.last?.error && (

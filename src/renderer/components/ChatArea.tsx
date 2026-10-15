@@ -14,7 +14,9 @@ import { sinceLastClear, isClearCommand, clearNoteText } from '../clearBoundary'
 // 这一格自己的会话内搜索：命中算术（纯，可测）+ 高亮（Range/CSS.highlights，不动 DOM）
 import { findDebounceDelay, findLabel, matchOffsets, shouldExpandForFind, shouldSearch, stepIndex } from '../paneFind';
 import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHighlight';
-import { useT } from '../hooks/useLang';
+import { useLang, useT } from '../hooks/useLang';
+import { displayTitle, shownIn } from '../i18n';
+import { pickVariant } from '../../main/uiText.ts';
 // 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
 import { shouldApplyHandoff } from '../handoffDraft';
 import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
@@ -248,6 +250,7 @@ const MD_COMPONENTS = {
  *  from disk on demand instead, cached per path so a re-render never re-reads. */
 const thumbCache = new Map<string, string>();
 const AttachmentThumb: React.FC<{ file: AttachedFile; sessionId: string | null; onOpen?: (path: string) => void }> = ({ file, sessionId, onOpen }) => {
+  const t = useT();
   const [src, setSrc] = useState<string | null>(file.preview || thumbCache.get(file.path) || null);
   useEffect(() => {
     if (src || !file.isImage || !file.path) return;
@@ -277,7 +280,7 @@ const AttachmentThumb: React.FC<{ file: AttachedFile; sessionId: string | null; 
       className="message-attachment-thumb"
       src={src}
       alt={file.name}
-      title={`${file.name} — 点击查看原图`}
+      title={t('{name} — click to view full size', { name: file.name })}
       onClick={onOpen ? () => onOpen(file.path) : undefined}
     />
   );
@@ -410,12 +413,12 @@ interface JsonValidationIssue {
   column: number;
 }
 
-function validateAgentConfigJson(content: string): JsonValidationIssue | null {
+function validateAgentConfigJson(content: string, t: (key: string) => string = (key) => key): JsonValidationIssue | null {
   try {
     const parsed = JSON.parse(content);
     if (!parsed || typeof parsed !== 'object' || Array.isArray(parsed)) {
       return {
-        message: 'Agent configuration must be a JSON object.',
+        message: t('Agent configuration must be a JSON object.'),
         line: 1,
         column: 1,
       };
@@ -674,15 +677,15 @@ const PastedBlockView = memo<{ block: { seq: number; lines: number; chars: numbe
         title={open ? t('Click to collapse') : t('Click to expand the pasted content')}
       >
         <span className="user-code-caret">{open ? '▾' : '▸'}</span>
-        <span className="user-code-kind">粘贴 #{block.seq}</span>
-        <span className="user-code-meta">{block.lines} 行 · {block.chars} 字符</span>
+        <span className="user-code-kind">{t('Paste #{n}', { n: block.seq })}</span>
+        <span className="user-code-meta">{t('{lines} lines · {chars} chars', { lines: block.lines, chars: block.chars })}</span>
         <button type="button" className="user-code-copy" onClick={copy} title={t('Copy')}>
           {copied ? t('✓ Copied') : t('Copy')}
         </button>
       </div>
       {open && (
         <pre className="user-code-body">
-          <code>{missing ? t('(pasted content unavailable: the file was deleted)') : (body ?? '读取中…')}</code>
+          <code>{missing ? t('(pasted content unavailable: the file was deleted)') : (body ?? t('Reading…'))}</code>
         </pre>
       )}
     </div>
@@ -707,6 +710,17 @@ const formatMessageTime = (timestamp: number) => {
  * 它既不是你说的，也不是助手的回答，所以画成居中的一张小卡片，不画成用户气泡 ——
  * 气泡会让它看起来像你发出去的，还带着「编辑 / Rerun」。里面的路径照样可点。
  */
+/**
+ * 带 `variants` 的消息按某种语言显示的那一份。**同一条消息 + 同一种语言永远是同一个对象**（WeakMap 缓存）——
+ * 否则每次消息列表一变，这几条都是新对象，下面那些 memo 的消息项会白白重渲染（见 `paneIndependence` 那组测试）。
+ */
+const variantViews = new WeakMap<Message, { zh?: Message; en?: Message }>();
+function variantView(m: Message, lang: 'zh' | 'en'): Message {
+  let views = variantViews.get(m);
+  if (!views) { views = {}; variantViews.set(m, views); }
+  return views[lang] ??= { ...m, content: pickVariant(lang, m.content, m.variants) };
+}
+
 const KirolexMessageItem = memo<{ message: Message }>(({ message }) => (
   <div className="kirolex-message" role="status">
     <div className="kirolex-message-card">
@@ -882,16 +896,16 @@ const MessageItem = memo<{
         {estimatedTokens !== null && (
           <span
             className="message-token-count"
-            title="Estimated from the visible question and answer; Kiro CLI does not expose exact per-turn token counts."
+            title={t('Estimated from the visible question and answer; Kiro CLI does not expose exact per-turn token counts.')}
           >
-            · ≈ {estimatedTokens.toLocaleString()} tokens
+            · ≈ {estimatedTokens.toLocaleString()} {t('tokens')}
           </span>
         )}
         <button
           className="message-action-btn"
           onClick={() => void copyMessage()}
-          title={copied ? 'Copied!' : 'Copy'}
-          aria-label={copied ? 'Copied!' : 'Copy message'}
+          title={copied ? t('Copied!') : t('Copy')}
+          aria-label={copied ? t('Copied!') : t('Copy message')}
         >
           {copied ? '✓' : <IconCopy size={14} />}
         </button>
@@ -899,8 +913,8 @@ const MessageItem = memo<{
           className="message-action-btn"
           onClick={() => onFork(last.id)}
           disabled={actionLocked}
-          title="Fork conversation from here"
-          aria-label="Fork conversation from here"
+          title={t('Fork conversation from here')}
+          aria-label={t('Fork conversation from here')}
         >
           <IconFork size={14} />
         </button>
@@ -983,6 +997,9 @@ function looksLikeCodeOrData(text: string): boolean {
   return classifyBlock(t) !== null;
 }
 
+/** 上面那几个类别是内部标识（也拿来比较），显示时换成界面语言 —— 英文 key 都在字典里。 */
+const BLOCK_KIND_LABEL: Record<string, string> = { '日志': 'Log', '代码': 'Code', '表格数据': 'Tabular data', '粘贴内容': 'Pasted content' };
+
 function blockKind(text: string): string {
   // Fenced content we didn't classify is still just "pasted content" — do not
   // assert 代码/日志 without evidence.
@@ -1059,8 +1076,8 @@ const CollapsibleUserBlock = memo<{ content: string }>(({ content }) => {
         title={open ? t('Click to collapse') : t('Click to expand')}
       >
         <span className="user-code-caret">{open ? '▾' : '▸'}</span>
-        <span className="user-code-kind">{kind}</span>
-        <span className="user-code-meta">{lineCount} 行 · {body.length} 字符</span>
+        <span className="user-code-kind">{BLOCK_KIND_LABEL[kind] ? t(BLOCK_KIND_LABEL[kind]) : kind}</span>
+        <span className="user-code-meta">{t('{lines} lines · {chars} chars', { lines: lineCount, chars: body.length })}</span>
         <button type="button" className="user-code-copy" onClick={copy} title={t('Copy')}>
           {copied ? t('✓ Copied') : t('Copy')}
         </button>
@@ -1225,7 +1242,7 @@ const UserGroupItem = memo<{
           if (looksLikeCodeOrData(paragraph.text)) {
             const { head, block } = splitProseAndBlock(paragraph.text);
             const label = paragraph.isSteer ? (
-              <span className="steer-side-label" title="Steered into the running turn">Steer</span>
+              <span className="steer-side-label" title={t('Steered into the running turn')}>{t('Steer')}</span>
             ) : null;
             if (head) {
               return (
@@ -1249,7 +1266,7 @@ const UserGroupItem = memo<{
           }
           return paragraph.isSteer ? (
             <p key={key} className="steer-paragraph">
-              <span className="steer-side-label" title="Steered into the running turn">Steer</span>
+              <span className="steer-side-label" title={t('Steered into the running turn')}>{t('Steer')}</span>
               {withPathLinks(paragraph.text, key)}
             </p>
           ) : (
@@ -1260,7 +1277,7 @@ const UserGroupItem = memo<{
       {editing && (
         <div className="message-edit-actions" ref={editActionsRef}>
           <button type="button" className="message-edit-btn cancel" onClick={() => setEditing(false)}>{t('Cancel')}</button>
-          <button type="button" className="message-edit-btn rerun" onClick={submitRerun} disabled={isLooping || !draft.trim()}>Rerun</button>
+          <button type="button" className="message-edit-btn rerun" onClick={submitRerun} disabled={isLooping || !draft.trim()}>{t('Rerun')}</button>
         </div>
       )}
       <div className="message-actions">
@@ -1274,8 +1291,8 @@ const UserGroupItem = memo<{
         <button
           className="message-action-btn"
           onClick={() => void copyMessage()}
-          title={copied ? 'Copied!' : 'Copy'}
-          aria-label={copied ? 'Copied!' : 'Copy message'}
+          title={copied ? t('Copied!') : t('Copy')}
+          aria-label={copied ? t('Copied!') : t('Copy message')}
         >
           {copied ? '✓' : <IconCopy size={14} />}
         </button>
@@ -1318,12 +1335,13 @@ const UserGroupItem = memo<{
  */
 const ReviewQueueStack: React.FC<{ sessionId: string | null }> = ({ sessionId }) => {
   const items = useReviewQueue(sessionId);
+  const t = useT();
   if (!items.length) return null;
   return (
     <div className="queue-row">
       <div className="queue-stack review-queue-stack">
         <div className="queue-stack-header">
-          <span>侧栏 comment 改写</span>
+          <span>{t('Sidebar comment rewrites')}</span>
           <span>{items.length}</span>
         </div>
         {items.map((item, index) => (
@@ -1331,11 +1349,11 @@ const ReviewQueueStack: React.FC<{ sessionId: string | null }> = ({ sessionId })
             <span className="queue-card-order">{index + 1}</span>
             <div className="queue-card-body">
               <span className="queue-card-text" title={`${item.file} · ${item.label}`}>
-                {item.state === 'running' ? '⏳ ' : ''}{item.file} · {item.label}{item.state === 'running' ? '（进行中）' : '（排队中）'}
+                {item.state === 'running' ? '⏳ ' : ''}{item.file} · {item.label}{item.state === 'running' ? t(' (in progress)') : t(' (queued)')}
               </span>
             </div>
             <div className="queue-card-actions">
-              <button type="button" onClick={() => item.cancel()} title="取消这一条改写（侧栏那条标记会放回去）">✕</button>
+              <button type="button" onClick={() => item.cancel()} title={t('Cancel this rewrite (the sidebar mark goes back)')}>✕</button>
             </div>
           </div>
         ))}
@@ -1363,7 +1381,7 @@ const QueueStack = memo<{
     <div className="queue-row">
       <div className="queue-stack">
         <div className="queue-stack-header">
-          <span>Queued follow-ups</span>
+          <span>{t('Queued follow-ups')}</span>
           {/* The merge setting CHANGES the meaning of this queue (one turn vs N
               turns), so it has to be visible right here — not only in Settings. */}
           <span
@@ -1387,7 +1405,7 @@ const QueueStack = memo<{
                   className="queue-card-edit-input"
                   value={editingQueueText}
                   /* 说清怎么收尾 —— 这个框长得像一行普通输入，而它的两个出口都是键盘 */
-                  placeholder="改完按 Enter 保存，Esc 取消"
+                  placeholder={t('Press Enter to save, Esc to cancel')}
                   autoFocus
                   onChange={(event) => setEditingQueueText(event.target.value)}
                   onKeyDown={(event) => {
@@ -1415,9 +1433,9 @@ const QueueStack = memo<{
                       if (editingQueueText.trim()) onEditQueuedMessage(item.id, editingQueueText);
                       setEditingQueueId(null);
                     }}
-                    title="保存这次修改"
+                    title={t('Save this edit')}
                   >✓</button>
-                  <button type="button" onClick={() => setEditingQueueId(null)} title="放弃这次修改">↩</button>
+                  <button type="button" onClick={() => setEditingQueueId(null)} title={t('Discard this edit')}>↩</button>
                 </>
               ) : (
                 <>
@@ -1426,13 +1444,13 @@ const QueueStack = memo<{
                     type="button"
                     onClick={() => onMoveQueuedMessage(item.id, -1)}
                     disabled={index === 0}
-                    title="往前排一位"
+                    title={t('Move up one')}
                   >↑</button>
                   <button
                     type="button"
                     onClick={() => onMoveQueuedMessage(item.id, 1)}
                     disabled={index === queuedMessages.length - 1}
-                    title="往后排一位"
+                    title={t('Move down one')}
                   >↓</button>
                   <button
                     type="button"
@@ -1440,12 +1458,12 @@ const QueueStack = memo<{
                       setEditingQueueId(item.id);
                       setEditingQueueText(item.content);
                     }}
-                    title="改这条排队的消息"
+                    title={t('Edit this queued message')}
                   >✎</button>
                   <button
                     type="button"
                     onClick={() => onCancelQueuedMessage(item.id)}
-                    title="撤回这条 —— 内容退回输入框"
+                    title={t('Withdraw this one (its text goes back to the input box)')}
                   >✕</button>
                 </>
               )}
@@ -1870,13 +1888,13 @@ const ChatInputBox = memo<{
         判据在 `choiceChips.ts`（保守：要有问号或冒号、要 ≥2 项、每项要短、不在代码块里）。
       */}
       {!isStreaming && !isLooping && choiceChips.length > 0 && (
-        <div className="prompt-suggestions" aria-label="回复里的选项">
+        <div className="prompt-suggestions" aria-label={t('Options in the reply')}>
           {choiceChips.map((chip) => (
             <button
               key={chip.value}
               className="prompt-chip choice-chip"
               onClick={() => setInput((prev) => (prev.trim() ? `${prev.replace(/\s+$/, '')} ${chip.value}` : chip.value))}
-              title="点一下填进输入框（不会直接发送）—— 你还能再补一句"
+              title={t('Click to fill it into the input box (not sent yet), so you can still add to it')}
             >
               {chip.label}
             </button>
@@ -1946,12 +1964,12 @@ const ChatInputBox = memo<{
           isLooping
             ? t('Looping this message — click Stop to end it')
             : status !== 'connected'
-            ? 'Connecting... (type /stop to force reconnect)'
+            ? t('Connecting... (type /stop to force reconnect)')
             : isStreaming && queuedMessages.length > 0
-            ? `Agent is working — Enter appends to the last queued follow-up · ${MOD_KEY}+Enter adds a new queue item`
+            ? t('Agent is working — Enter appends to the last queued follow-up · {key}+Enter adds a new queue item', { key: MOD_KEY })
             : isStreaming
-            ? `Agent is working — Enter steers the running turn · ${MOD_KEY}+Enter queues`
-            : 'Type a message...'
+            ? t('Agent is working — Enter steers the running turn · {key}+Enter queues', { key: MOD_KEY })
+            : t('Type a message...')
         }
         value={input}
         disabled={isLooping}
@@ -1983,8 +2001,8 @@ const ChatInputBox = memo<{
               value={engineMode.current}
               onChange={(e) => engineMode.onChange(e.target.value)}
               disabled={isLooping || isStreaming || status !== 'connected' || engineMode.busy || !engineMode.options.length}
-              title="权限模式（这个引擎自己的）：要不要先问你再动手"
-              aria-label="Permission mode"
+              title={t("Permission mode (this engine's own): whether to ask you before acting")}
+              aria-label={t('Permission mode')}
             >
               {engineMode.options.length
                 ? engineMode.options.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)
@@ -2030,7 +2048,7 @@ const ChatInputBox = memo<{
           <button
             className="composer-icon-btn"
             onClick={handleQueue}
-            title={`Queue message (${MOD_KEY}+Enter)`}
+            title={t('Queue message ({key}+Enter)', { key: MOD_KEY })}
             disabled={isLooping || status !== 'connected'}
           >
             <IconQueue />
@@ -2043,17 +2061,17 @@ const ChatInputBox = memo<{
               {isLooping
                 ? t('Loop running · Stop to end it')
                 : isStreaming && queuedMessages.length > 0
-                ? `Enter append to queue tail · Shift+Enter newline · ${MOD_KEY}+Enter new queue item`
+                ? t('Enter append to queue tail · Shift+Enter newline · {key}+Enter new queue item', { key: MOD_KEY })
                 : isStreaming
-                ? `Enter steer running turn · Shift+Enter newline · ${MOD_KEY}+Enter queue`
-                : `Enter send · Shift+Enter newline · ${MOD_KEY}+Enter queue`}
+                ? t('Enter steer running turn · Shift+Enter newline · {key}+Enter queue', { key: MOD_KEY })
+                : t('Enter send · Shift+Enter newline · {key}+Enter queue', { key: MOD_KEY })}
             </span>
             <span className="composer-shortcut-short">
               {isLooping
                 ? t('Stop the loop')
                 : isStreaming && queuedMessages.length > 0
-                ? `${MOD_KEY}+Enter new queue item`
-                : `${MOD_KEY}+Enter queue`}
+                ? t('{key}+Enter new queue item', { key: MOD_KEY })
+                : t('{key}+Enter queue', { key: MOD_KEY })}
             </span>
           </span>
         </div>
@@ -2063,7 +2081,7 @@ const ChatInputBox = memo<{
             <span className="stop-btn-square" />
           </button>
         ) : isStreaming && !canSend ? (
-          <button className="composer-send stop" onClick={onCancel} title="Stop">
+          <button className="composer-send stop" onClick={onCancel} title={t('Stop')}>
             <span className="stop-btn-square" />
           </button>
         ) : (
@@ -2080,12 +2098,12 @@ const ChatInputBox = memo<{
             // reason to grey out. handleSend/handleQueue drop a truly empty message.
             disabled={status !== 'connected'}
             title={queueModifierHeld
-              ? `Add a new queued message (${MOD_KEY}+Enter)`
+              ? t('Add a new queued message ({key}+Enter)', { key: MOD_KEY })
               : isStreaming && queuedMessages.length > 0
-              ? 'Append to the last queued message (Enter)'
+              ? t('Append to the last queued message (Enter)')
               : isStreaming
-              ? 'Steer the running turn (Enter)'
-              : 'Send (Enter)'}
+              ? t('Steer the running turn (Enter)')
+              : t('Send (Enter)')}
           >
             {queueModifierHeld ? (
               <IconQueue size={17} />
@@ -2139,9 +2157,9 @@ const PlanPanel = memo<{ plan: PlanEntry[] }>(({ plan }) => {
             >
               <span className="plan-item-icon">{PLAN_STATUS_ICON[entry.status || 'pending'] || '○'}</span>
               <span className="plan-item-text">{entry.content}</span>
-              {current && <span className="plan-item-current">current</span>}
+              {current && <span className="plan-item-current">{t('current')}</span>}
               {entry.priority && entry.priority !== 'medium' && (
-                <span className={`plan-item-pri pri-${entry.priority}`}>{entry.priority}</span>
+                <span className={`plan-item-pri pri-${entry.priority}`}>{entry.priority === 'high' ? t('high') : entry.priority === 'low' ? t('low') : entry.priority}</span>
               )}
             </li>
             );
@@ -2235,7 +2253,7 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
         {/* **这些命令是在哪台机器上跑的** —— 记录里只有 `Running: <cmd>`，相对路径，
             跟本地执行分不出来。一条 rm 落在哪台机器上不该靠猜。 */}
         {remoteHost && (
-          <span className="turn-panel-remote" title={`这些命令跑在 ${remoteHost} 上（不是你的 Mac）`}>
+          <span className="turn-panel-remote" title={t('These commands run on {host} (not your Mac)', { host: remoteHost })}>
             🌐 {remoteHost}
           </span>
         )}
@@ -2278,7 +2296,7 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
                         return next;
                       })}
                     >
-                      {open ? t('Collapse') : `+${more} 行`}
+                      {open ? t('Collapse') : t('+{n} lines', { n: more })}
                     </button>
                   )}
                   {c.status === 'failed' && <span className="stat-del">{t('Failed')}</span>}
@@ -2307,13 +2325,14 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
  *  The `diff` button is intentionally unaffected: the diff text lives in the
  *  transcript, so what changed stays readable even once the file is gone. */
 const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label }) => {
+  const t = useT();
   const sessionId = React.useContext(PathSessionContext);
   const exists = usePathExists(path, sessionId);
   if (exists === 'no') {
     return (
       <span
         className="files-item-path missing"
-        title={`文件已不存在，无法打开：${path}\n（可能在这一轮之后被改名或删除；下方 diff 仍可查看改了什么）`}
+        title={t('The file no longer exists and cannot be opened: {path}\n(It may have been renamed or deleted after this turn; the diff below still shows what changed)', { path })}
       >
         {label}
       </span>
@@ -2322,7 +2341,7 @@ const FileChangePath: React.FC<{ path: string; label: string }> = ({ path, label
   return (
     <span
       className="files-item-path"
-      title={`在 KiroLex 内打开 ${path}`}
+      title={t('Open {path} in KiroLex', { path })}
       onClick={() => openPathInApp(path, sessionId)}
     >
       {label}
@@ -2411,7 +2430,7 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(
         {/* 远程会话：改是在远端改的，但这里点开的是**本地**那一份（镜像已经同步回来了）。
             两件事都要说清，否则"远端改的"和"我打开的是哪一份"会被混成一件事。 */}
         {remoteHost && (
-          <span className="turn-panel-remote" title={`在 ${remoteHost} 上改的；这里打开的是已同步回本地的那一份`}>
+          <span className="turn-panel-remote" title={t('Changed on {host}; this opens the copy already synced back locally', { host: remoteHost })}>
             🌐 {remoteHost}
           </span>
         )}
@@ -2681,6 +2700,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   paneFocused = true,
   findSuspended = false,
 }) => {
+  // 放在最前面：下面的回调（如 handleSlashPicker）要用 `t`，并把它列进依赖。
+  const t = useT();
+  const findLang = useLang();
   /*
     **`/model` / `/agent` 打开自己的下拉** ——「cli 里面是会有选项的」（而 ACP 不带 picker,
     见 `slashPicker.ts`）。`showPicker()` 是浏览器给原生 `<select>` 的标准接口;
@@ -2717,11 +2739,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     */
     const { exact, matches } = resolveChoice(intent.arg, options);
     if (exact) { if (isModel) onModelChange(exact); else onKiroAgentChange(exact); return; }
-    const what = isModel ? '模型' : 'agent';
+    const what = isModel ? t('model') : 'agent';
     setLocalNotice(matches.length
-      ? `「${intent.arg}」对上了 ${matches.length} 个${what}：${matches.join('、')} —— 说全一点，或者直接打 /${intent.kind} 从下拉里选。`
-      : `没有叫「${intent.arg}」的${what}。打 /${intent.kind}（不带参数）会把下拉打开。`);
-  }, [models, kiroAgents, onModelChange, onKiroAgentChange]);
+      ? t('"{arg}" matches {n} {what}s: {list}. Be more specific, or type /{cmd} and pick from the dropdown.', { arg: intent.arg, n: matches.length, what, list: matches.join(t(', ')), cmd: intent.kind })
+      : t('There is no {what} called "{arg}". Type /{cmd} (with no argument) to open the dropdown.', { arg: intent.arg, what, cmd: intent.kind }));
+  }, [models, kiroAgents, onModelChange, onKiroAgentChange, t]);
 
   /*
     **模型列出来的选项**（只认最后一条助手消息）——「有一些问题会给用户提问并提供多个选项」。
@@ -2858,7 +2880,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     atEpoch: schedKind === 'once' ? Date.parse(schedOnceAt) : undefined,
     maxRuns: Number.parseInt(schedMaxRuns, 10) || 0,
   }), [scheduleSetup, schedKind, schedEvery, schedTime, schedWeekday, schedOnceAt, schedMaxRuns]);
-  const scheduleProblems = useMemo(() => validateSchedule(draftSchedule), [draftSchedule]);
+  const scheduleProblems = useMemo(() => validateSchedule(draftSchedule, findLang), [draftSchedule, findLang]);
   /** Stable, because it is handed to a MEMOISED message item.
    *
    *  It was an inline arrow, so every render of this component gave all user groups a
@@ -2903,9 +2925,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   }, [kiroAgents, kiroAgent]);
   const agentConfigValidationError = useMemo(
     () => agentConfigEditor && !agentConfigEditor.error
-      ? validateAgentConfigJson(agentConfigEditor.content)
+      ? validateAgentConfigJson(agentConfigEditor.content, t)
       : null,
-    [agentConfigEditor?.content, agentConfigEditor?.error],
+    [agentConfigEditor?.content, agentConfigEditor?.error, t],
   );
   const agentConfigLines = useMemo(
     () => agentConfigEditor?.content.split('\n') || [''],
@@ -2995,7 +3017,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               path: '',
               content: '',
               initialContent: '',
-              error: result.error || 'Unable to open this Agent configuration.',
+              error: result.error || t('Unable to open this Agent configuration.'),
             }
           : {
               agentName,
@@ -3017,6 +3039,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     agentConfigEditor,
     agentConfigDrafts,
     agentConfigAgents,
+    t,
   ]);
 
   const openAgentConfig = useCallback(() => {
@@ -3141,7 +3164,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       agentConfigEditor.error ||
       agentConfigSaving
     ) return;
-    const validationError = validateAgentConfigJson(agentConfigEditor.content);
+    const validationError = validateAgentConfigJson(agentConfigEditor.content, t);
     if (validationError) {
       setAgentConfigStatus(validationError.message);
       return;
@@ -3160,7 +3183,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         agentConfigEditor.content,
       );
       if (!result.saved) {
-        setAgentConfigStatus(result.error || 'Unable to save this Agent configuration.');
+        setAgentConfigStatus(result.error || t('Unable to save this Agent configuration.'));
         return;
       }
       const savedConfig: AgentConfigEditorState = {
@@ -3177,7 +3200,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     } finally {
       setAgentConfigSaving(false);
     }
-  }, [currentSessionId, agentConfigEditor, agentConfigSaving, agentConfigAgents]);
+  }, [currentSessionId, agentConfigEditor, agentConfigSaving, agentConfigAgents, t]);
 
   const toggleImportPicker = useCallback(() => {
     const el = importBtnRef.current;
@@ -3203,7 +3226,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return 140;
   });
   const [inputCollapsed, setInputCollapsed] = useState(false);
-  const t = useT();
   const chatMessagesRef = useRef<HTMLDivElement>(null);
 
   /*
@@ -3432,9 +3454,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // back next to its base user message, so it renders as a Steer paragraph in
   // the same bubble instead of a lone orphan bubble without the Steer label.
   const orderedMessages = useMemo<Message[]>(() => {
-    if (!messages.some((m) => m.role === 'user' && m.steer)) return messages;
+    /*
+      KiroLex 自己写进会话的那几句（换模型、排队、改写落盘、循环结束…）存了中英两版（`variants`）——
+      这里按**当前**界面语言挑一版来显示：切了语言、重新打开都跟着换。你和 agent 的消息没有 variants，原样。
+    */
+    const shown = messages.some((m) => m.variants)
+      ? messages.map((m) => (m.variants ? variantView(m, findLang) : m))
+      : messages;
+    if (!shown.some((m) => m.role === 'user' && m.steer)) return shown;
     const out: Message[] = [];
-    for (const m of messages) {
+    for (const m of shown) {
       if (m.role === 'user' && m.steer) {
         let baseIdx = -1;
         for (let i = out.length - 1; i >= 0; i--) {
@@ -3450,7 +3479,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       out.push(m);
     }
     return out;
-  }, [messages]);
+  }, [messages, findLang]);
 
   const renderGroups = useMemo<RenderGroup[]>(() => {
     const groups: RenderGroup[] = [];
@@ -3663,7 +3692,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             }}
           />
           <span className="pane-find-count">
-            {findLabel({ query: findSearchQuery, active: findActive, total: findTotal })}
+            {findLabel({ query: findSearchQuery, active: findActive, total: findTotal }, findLang)}
           </span>
           <button className="pane-find-btn" onClick={() => findStep('prev')} title={t('Previous (Shift+Enter)')}>↑</button>
           <button className="pane-find-btn" onClick={() => findStep('next')} title={t('Next (Enter)')}>↓</button>
@@ -3673,14 +3702,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       {isDragOver && (
         <div className="drop-overlay">
           <div className="drop-overlay-content">
-            📎 Drop files to attach
+            {t('📎 Drop files to attach')}
           </div>
         </div>
       )}
 
       {connectionError && messages.length > 0 && (
         <div className="chat-error-banner" role="alert">
-          <span className="chat-error-banner-text">❌ {connectionError}</span>
+          <span className="chat-error-banner-text">❌ {shownIn(findLang, connectionError)}</span>
           {onDismissError && (
             <button
               className="chat-error-banner-close"
@@ -3711,9 +3740,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       */}
       {activeSubagents(subagents).length > 0 && (
         <div className="chat-crew-bar" role="status">
-          <span className="chat-crew-count">🤖 {activeSubagents(subagents).length} 个子代理在跑</span>
+          <span className="chat-crew-count">🤖 {t('{n} subagents running', { n: activeSubagents(subagents).length })}</span>
           {activeSubagents(subagents).map((row) => (
-            <span className="chat-crew-item" key={row.name} title={`${row.name}（${row.agentName || '未知 agent'}）`}>
+            <span className="chat-crew-item" key={row.name} title={t('{name} ({agent})', { name: row.name, agent: row.agentName || t('unknown agent') })}>
               <b>{row.name}</b>
               {row.statusMessage ? <span>{row.statusMessage}</span> : null}
             </span>
@@ -3725,7 +3754,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         return (
           <div className="memory-warn-bar" role="status" key={warning.scope}>
             <span className="memory-warn-text">
-              ⚠ {warning.label} {formatMemoryBytes(warning.bytes)} — 每轮对话都会完整发送
+              ⚠ {warning.label} {formatMemoryBytes(warning.bytes)} — {t('sent in full with every turn')}
             </span>
             <button
               className="memory-warn-btn"
@@ -3736,8 +3765,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               {compactingMemoryScope?.startsWith(`${warning.scope}:`) ? t('Compacting…') : t('Compact')}
             </button>
             {/* 「编辑」直接打开**这一层**（会话 / 项目 / 全局），而且是这个窗格的会话 —— 分屏时不一定是"当前"那条 */}
-            <button className="memory-warn-btn edit" onClick={() => onOpenMemory(warning.scope as 'global' | 'project' | 'session')} title={`打开${warning.label}，自己删改`}>
-              编辑
+            <button className="memory-warn-btn edit" onClick={() => onOpenMemory(warning.scope as 'global' | 'project' | 'session')} title={t('Open {label} and edit it yourself', { label: warning.label })}>
+              {t('Edit')}
             </button>
             <button className="memory-warn-btn ghost" onClick={() => onOpenMemory()} title={t('Open the memory editor and clean it up yourself')}>
               {t('View')}
@@ -3823,13 +3852,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 borderRadius: 8, textAlign: 'left', fontSize: 13, lineHeight: 1.6,
                 color: 'var(--error)', whiteSpace: 'pre-wrap',
               }}>
-                ❌ {connectionError}
+                ❌ {shownIn(findLang, connectionError)}
               </div>
             ) : (
               <p style={{ fontSize: 14 }}>
                 {status === 'connected'
-                  ? 'Start a conversation or drag files here'
-                  : 'Connecting...'}
+                  ? t('Start a conversation or drag files here')
+                  : t('Connecting...')}
               </p>
             )}
           </div>
@@ -3837,7 +3866,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
         {hiddenGroupCount > 0 && (
           <button className="load-older-btn" onClick={loadOlder}>
-            ⤴ 加载更早的消息（还有 {hiddenGroupCount} 组）
+            {t('⤴ Load earlier messages ({n} more groups)', { n: hiddenGroupCount })}
           </button>
         )}
 
@@ -3849,7 +3878,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           */
           group.kind === 'user' && isClearCommand((group as any).base) ? (
             <div className="chat-clear-line" key={`${currentSessionId ?? 'none'}:${group.base.id}`}>
-              <span>{clearNoteText(hiddenGroupCount)}</span>
+              <span>{clearNoteText(hiddenGroupCount, findLang)}</span>
             </div>
           ) : group.kind === 'kirolex' ? (
             <KirolexMessageItem
@@ -3901,8 +3930,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 只匹配 subagent / delegate 这些词的话，真正的委派一次都命中不了。
               */}
               {/(subagent|sub-agent|子代理|delegate|agent crew|task\b)/i.test(activeToolCall)
-                ? `🤖 子代理运行中 · ${activeToolCall}`
-                : `⚙️ 运行中 · ${activeToolCall}`}
+                ? t('🤖 Subagent running · {tool}', { tool: activeToolCall })
+                : t('⚙️ Running · {tool}', { tool: activeToolCall })}
             </span>
           </div>
         ) : (activityStatus || (isStreaming && messages.length > 0)) ? (
@@ -3912,7 +3941,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <span /><span /><span />
               </div>
               {activityStatus && (
-                <span className="activity-status-text">{activityStatus}</span>
+                <span className="activity-status-text">{shownIn(findLang, activityStatus)}</span>
               )}
             </div>
           </div>
@@ -3925,7 +3954,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             the indicator so it shows in either branch, and main refreshes it every
             30s so the elapsed time never freezes. */}
         {isStreaming && stall && (() => {
-          const dur = (s: number) => (s < 90 ? `${Math.max(1, Math.round(s))} 秒` : `${Math.round(s / 60)} 分钟`);
+          const dur = (s: number) => (s < 90 ? t('{n} sec', { n: Math.max(1, Math.round(s)) }) : t('{n} min', { n: Math.round(s / 60) }));
           // ONE line. The only fact the user cannot get from the spinner is WHETHER AND
           // WHEN this turn will be cut off, so that is the whole sentence. Everything
           // else the old three-sentence version said -- that long commands legitimately
@@ -3937,29 +3966,29 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           // first in Settings (10 min) -- so "再 23 分钟" read as a contradiction of the
           // 600 on that page. Both bounds have to be passed and the later one wins.
           const bound = stall.boundBy === 'tool'
-            ? `工具无进度多久判定卡死 ${dur(stall.boundSeconds)}`
-            : `静默多久判定卡死 ${dur(stall.boundSeconds)}`;
+            ? t('Tool stall threshold {d}', { d: dur(stall.boundSeconds) })
+            : t('Silence threshold {d}', { d: dur(stall.boundSeconds) });
           const line = stall.interruptInSeconds === null
             ? t('The timeout interrupt is off, so it will wait indefinitely.')
             : stall.interruptInSeconds > 0
               ? (stall.openTools > 0
-                  ? `${stall.openTools} 个工具仍在运行，再 ${dur(stall.interruptInSeconds)}无进度才会中断（按「${bound}」）。`
-                  : `没有工具在运行，${dur(stall.interruptInSeconds)}后中断（按「${bound}」）。`)
+                  ? t('{n} tools still running; it will be interrupted only after {d} more without progress (per "{bound}").', { n: stall.openTools, d: dur(stall.interruptInSeconds), bound })
+                  : t('No tool is running; it will be interrupted in {d} (per "{bound}").', { d: dur(stall.interruptInSeconds), bound }))
               : t('About to interrupt this turn…');
           const tip = [
             stall.openTools > 0
-              ? `${stall.openTools} 个工具调用已开始但还没有回报结束，最近一次进度更新在 ${dur(stall.toolIdleSeconds)}前。`
+              ? t('{n} tool calls have started but not reported finishing; the last progress update was {d} ago.', { n: stall.openTools, d: dur(stall.toolIdleSeconds) })
               : t('This turn has produced no output and no tool activity.'),
-            '长命令（构建、测试、解析大文件）本来就是在开始和结束之间什么都不报，所以静默本身不代表卡死。',
-            '中断需要两个条件同时成立：静默超过「静默多久判定卡死」，且没有工具在「工具无进度多久判定卡死」之内报告过进度。',
-            '所以有工具在跑时，实际等待时间是两个阈值里更晚的那个 —— 上面那句括号写的就是当前生效的是哪一个。',
-            '真的中断时，已产出的内容会保留，工具本身可能仍在后台继续跑。按 Stop 可以随时自己结束。',
+            t('Long commands (builds, tests, parsing big files) report nothing between start and finish, so silence alone does not mean it is stuck.'),
+            t('Interrupting needs both conditions at once: silence beyond the silence threshold, and no tool reporting progress within the tool stall threshold.'),
+            t('So while a tool is running, the real wait is the later of the two thresholds; the parentheses in the line above name the one in effect.'),
+            t('If it does get interrupted, the output so far is kept, and the tool itself may keep running in the background. Press Stop to end it yourself at any time.'),
           ].join('\n');
           return (
             <div className="stall-notice" role="status" aria-live="polite" title={tip}>
               <span className="stall-notice-icon" aria-hidden="true">⏳</span>
               <div className="stall-notice-copy">
-                <strong>{`已 ${dur(stall.quietSeconds)}没有输出`}</strong>
+                <strong>{t('No output for {d}', { d: dur(stall.quietSeconds) })}</strong>
                 <span>{line}</span>
               </div>
             </div>
@@ -4046,13 +4075,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               setInputHeight((height) => Math.max(96, Math.min(maxHeight, height + delta)));
             }}
             role="separator"
-            aria-label="Resize message composer"
+            aria-label={t('Resize message composer')}
             aria-orientation="horizontal"
             aria-valuemin={96}
             aria-valuemax={Math.max(180, Math.floor(window.innerHeight * 0.7))}
             aria-valuenow={inputHeight}
             tabIndex={0}
-            title="Drag upward to enlarge · Double-click to reset"
+            title={t('Drag upward to enlarge · Double-click to reset')}
           >
             <span className="input-resize-grip" />
           </div>
@@ -4060,7 +4089,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         <button
           className="input-collapse-btn"
           onClick={() => setInputCollapsed(!inputCollapsed)}
-          title={inputCollapsed ? 'Show input' : 'Hide input'}
+          title={inputCollapsed ? t('Show input') : t('Hide input')}
         >
           {inputCollapsed ? '▲' : '▼'}
         </button>
@@ -4077,9 +4106,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         >
           {isArchived ? (
             <div className="archived-composer-banner">
-              <span>📥 This chat is archived — unarchive it to continue chatting.</span>
+              <span>{t('📥 This chat is archived — unarchive it to continue chatting.')}</span>
               {onUnarchive && (
-                <button className="archived-unarchive-btn" onClick={onUnarchive}>♻️ Unarchive</button>
+                <button className="archived-unarchive-btn" onClick={onUnarchive}>{t('♻️ Unarchive')}</button>
               )}
             </div>
           ) : (
@@ -4099,19 +4128,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               {localNotice && (
                 <div className="session-notice">
                   <span className="session-notice-text">{localNotice}</span>
-                  <button className="session-notice-close" onClick={() => setLocalNotice(null)} title="关掉">✕</button>
+                  <button className="session-notice-close" onClick={() => setLocalNotice(null)} title={t('Close notice')}>✕</button>
                 </div>
               )}
               {sessionNotice && (
                 <div className={`session-notice${/⚠️/.test(sessionNotice.text) ? ' warn' : ''}`}>
                   <span className="session-notice-text">
-                    {sessionNotice.text}
+                    {sessionNotice.variants?.[findLang] ?? sessionNotice.text}
                     {/* 放在文字下面（同一列）：分屏时一格很窄，并排会把按钮挤出去 */}
                     {sessionNotice.copyRemote && currentSessionId && (
                       <RemoteCopyButtons sessionId={currentSessionId} paths={sessionNotice.copyRemote} />
                     )}
                   </span>
-                  <button className="session-notice-close" onClick={dismissNotice} title="关掉">✕</button>
+                  <button className="session-notice-close" onClick={dismissNotice} title={t('Close notice')}>✕</button>
                 </div>
               )}
               <ChatInputBox
@@ -4169,8 +4198,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         className="composer-meta-btn composer-agent-config"
                         onClick={() => { setEngineConfigTab('login'); setEngineConfigOpen(true); }}
                         disabled={!currentSessionId}
-                        title={`${engineLabel} 的配置和登录（这条会话跑的那台机器上的）`}
-                        aria-label={`${engineLabel} config`}
+                        title={t('{engine} config and login (on the machine this chat runs on)', { engine: engineLabel })}
+                        aria-label={t('{engine} config', { engine: engineLabel })}
                       >
                         {/* 不用机器人 —— 那是 kiro 的（「左下角不应该再用那个机器人的图标了」） */}
                         {engine === 'claude' ? <IconClaudeSpark size={15} /> : <IconCodexPrompt size={15} />}
@@ -4185,21 +4214,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         onChange={(event) => void onMcpComboChange(event.target.value)}
                         disabled={!currentSessionId || !mcpCombos || isStreaming || isLooping || mcpComboBusy || engineModelBusy}
                         title={isStreaming
-                          ? '等这一轮回复完再换组合'
+                          ? t('Wait for this reply to finish before switching combos')
                           : mcpCombos?.error
-                            ? `组合文件有错：${mcpCombos.error}`
-                            : `${engineLabel} 的组合（MCP + effort）—— 换了会重启这条会话的执行器`}
-                        aria-label="组合"
+                            ? t('The combo file has an error: {error}', { error: mcpCombos.error })
+                            : t("{engine} combo (MCP + effort). Switching restarts this chat's executor", { engine: engineLabel })}
+                        aria-label={t('Combo')}
                       >
-                        {(mcpCombos?.combos || [{ id: 'default', name: '通用' }]).map((c) => (
-                          <option key={c.id} value={c.id}>{`组合 · ${c.name}`}</option>
+                        {(mcpCombos?.combos || [{ id: 'default', name: t('General purpose') }]).map((c) => (
+                          /* 内置组合的名字在这里按当前语言取：清单是进会话时拉的，那一刻的语言不一定是现在的 */
+                          <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.id === 'default' ? t('General purpose') : c.name })}</option>
                         ))}
                       </select>
                     </div>
                   ) : (
                   <div
                       className="composer-agent-selector"
-                      title="Agent (switching restarts this chat's executor with the selected Kiro agent)"
+                      title={t("Agent (switching restarts this chat's executor with the selected Kiro agent)")}
                     >
                       {/*
                         改这个 agent 的配置 —— 按钮就在选它的旁边。「把 kiro 的 agent 配置这个按钮放到会话界面」。
@@ -4212,7 +4242,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         className="composer-meta-btn composer-agent-config"
                         onClick={openAgentConfig}
                         disabled={!currentSessionId || agentConfigLoading}
-                        title={`编辑 ${kiroAgent || 'agent'} 的配置 —— 全局生效（所有会话共用这一份定义）`}
+                        title={t('Edit the config of {agent} (global: every chat shares this one definition)', { agent: kiroAgent || 'agent' })}
                         aria-label={t('Edit agent config (global)')}
                       >
                         {/* 还是那个机器人图标 —— 它在侧栏用了很久，认的是它，不是一个新的齿轮 */}
@@ -4225,14 +4255,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         value={kiroAgent}
                         onChange={(event) => onKiroAgentChange(event.target.value)}
                         disabled={!currentSessionId || isStreaming || isLooping || switchingAgent || status !== 'connected'}
-                        aria-label="Agent"
+                        aria-label={t('Agent')}
                       >
                         {kiroAgent && !kiroAgents.some((agent) => agent.name === kiroAgent) && (
                           <option value={kiroAgent}>{kiroAgent}</option>
                         )}
                         {kiroAgents.map((agent) => (
                           <option key={agent.name} value={agent.name}>
-                            {agent.name}{agent.isDefault ? ' (default)' : ''}
+                            {agent.name}{agent.isDefault ? t(' (default)') : ''}
                           </option>
                         ))}
                       </select>
@@ -4245,10 +4275,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       ref={importBtnRef}
                       className={`composer-meta-btn ${contextLinks.length > 0 ? 'active' : ''}`}
                       onClick={toggleImportPicker}
-                      title="Sync context from other sessions"
+                      title={t('Sync context from other sessions')}
                       disabled={importableSessions.length === 0}
                     >
-                      🛠️ <span className="composer-meta-label">Context Engineering</span>
+                      🛠️ <span className="composer-meta-label">{t('Context Engineering')}</span>
                       {contextLinks.length > 0 && <span className="composer-meta-count">{contextLinks.length}</span>}
                     </button>
                     {/* Portal to <body>: `.chat-main` now sets container-type for the
@@ -4262,11 +4292,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         <div className="import-picker-overlay" onClick={() => setShowImportPicker(false)} />
                         <div className="import-picker" style={{ left: pickerPos.left, bottom: pickerPos.bottom }}>
                           <div className="import-picker-header">
-                            <span>Select context to sync</span>
+                            <span>{t('Select context to sync')}</span>
                           </div>
                           <div className="import-picker-list">
                             {importableSessions.length === 0 ? (
-                              <div className="import-picker-empty">No other sessions available</div>
+                              <div className="import-picker-empty">{t('No other sessions available')}</div>
                             ) : (
                               importableSessions.map((session) => {
                                 const linked = contextLinks.some((link) => link.sourceId === session.id);
@@ -4274,11 +4304,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                                   <button
                                     key={session.id}
                                     className={`import-picker-item ${linked ? 'active' : ''}`}
-                                    title={session.title}
+                                    title={displayTitle(findLang, session.title)}
                                     onClick={() => onToggleContextSource(session.id)}
                                   >
                                     <span className="import-picker-box">{linked ? '☑' : '☐'}</span>
-                                    <span className="import-picker-title">{session.title || 'Untitled'}</span>
+                                    <span className="import-picker-title">{displayTitle(findLang, session.title) || t('Untitled')}</span>
                                   </button>
                                 );
                               })
@@ -4302,7 +4332,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         className={`composer-usage composer-usage-action ${usage.contextPercent >= 80 ? 'high' : usage.contextPercent >= 50 ? 'mid' : ''}`}
                         onClick={onManageContext}
                         disabled={!currentSessionId || isStreaming}
-                        title={`Manage context · currently ${usage.contextPercent.toFixed(1)}% used`}
+                        title={t('Manage context · currently {pct}% used', { pct: usage.contextPercent.toFixed(1) })}
                       >
                         <span className="composer-usage-bar">
                           <span className="composer-usage-fill" style={{ width: `${Math.min(100, Math.max(0, usage.contextPercent))}%` }} />
@@ -4314,9 +4344,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         className="composer-credits composer-usage-action"
                         onClick={onResetCredits}
                         disabled={!currentSessionId || isStreaming}
-                        title="Reset this session's local Credits counter"
+                        title={t("Reset this session's local Credits counter")}
                       >
-                        {usage.credits.toFixed(2)} credits
+                        {usage.credits.toFixed(2)} {t('credits')}
                       </button>
                     </>
                   ) : null}
@@ -4330,10 +4360,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       onChange={(event) => onModelChange(event.target.value)}
                       disabled={!currentSessionId || isStreaming || isLooping || switchingModel || status !== 'connected'}
                       title={isStreaming
-                        ? 'Wait for the current response to finish before switching models'
+                        ? t('Wait for the current response to finish before switching models')
                         : switchingModel
-                        ? 'Wait for the current model change to finish'
-                        : 'Model'}
+                        ? t('Wait for the current model change to finish')
+                        : t('Model')}
                     >
                       {models.length > 0 ? (
                         <>
@@ -4346,7 +4376,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                               non-selectable option keeps the selector honest. */}
                           {selectedModel && !models.some((model) => model.model_id === selectedModel) ? (
                             <option value={selectedModel} disabled>
-                              {selectedModel} · unavailable
+                              {selectedModel} {t('· unavailable')}
                             </option>
                           ) : null}
                           {models.map((model) => (
@@ -4360,7 +4390,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                                 所以非实时的那几条在 title 里说一句，而不是让 `2.2x` 看起来永远权威。
                               */
                               title={(model as any).metaFrom && (model as any).metaFrom !== 'live' && (model as any).metaFrom !== 'none'
-                                ? `${model.model_id}（倍率/窗口来自${(model as any).metaFrom === 'cache' ? '本机缓存' : '内置快照'}，不是这台机器这一刻报的）`
+                                ? ((model as any).metaFrom === 'cache'
+                                  ? t('{model} (rate/window from the local cache, not reported by this machine right now)', { model: model.model_id })
+                                  : t('{model} (rate/window from the built-in snapshot, not reported by this machine right now)', { model: model.model_id }))
                                 : model.model_id}
                             >
                               {model.model_name}{model.context_window_tokens ? ` · ${fmtContextWindow(model.context_window_tokens)}` : ''}
@@ -4380,7 +4412,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       value={engineModels?.current || ''}
                       onChange={(event) => void onEngineModelChange(event.target.value)}
                       disabled={!currentSessionId || !engineModels?.options.length || isStreaming || isLooping || engineModelBusy || status !== 'connected'}
-                      title={engineModelErr ? `✗ ${engineModelErr}` : isStreaming ? '等这一轮回复完再换模型' : `${engineLabel} 的模型`}
+                      title={engineModelErr ? `✗ ${engineModelErr}` : isStreaming ? t('Wait for this reply to finish before switching models') : t('{engine} model', { engine: engineLabel })}
                     >
                       {engineModels?.options.length ? (
                         <>
@@ -4390,7 +4422,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           {engineModels.options.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)}
                         </>
                       ) : (
-                        <option value="">{status === 'connected' ? '默认模型' : '连接中…'}</option>
+                        <option value="">{status === 'connected' ? t('Default model') : t('Connecting…')}</option>
                       )}
                     </select>
                   )}
@@ -4422,9 +4454,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <h3 id="schedule-dialog-title">{t('⏰ Scheduled job')}</h3>
             <div className="loop-dialog-preview">{scheduleSetup.text}</div>
             <div className="loop-dialog-level level-0">
-              {describeSchedule(draftSchedule)} · 最多 {draftSchedule.maxRuns} 次
+              {describeSchedule(draftSchedule, findLang)} · {t('up to {n} times', { n: draftSchedule.maxRuns })}
+              {/* 英文两句之间要断开；中文原样紧挨着 */}
+              {findLang === 'en' ? '. ' : ''}
               <span className="schedule-note">
-                每次都是独立的一次发送，不会把上一次的结果带进下一次 —— 否则定时任务会一直重复报告同一件事。
+                {t("Each run is an independent send that doesn't carry the previous result into the next; otherwise a scheduled job would keep reporting the same thing.")}
               </span>
             </div>
 
@@ -4441,7 +4475,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
               {schedKind === 'interval' && (
                 <label className="loop-dialog-field">
-                  <span>间隔（分钟，最少 {MIN_INTERVAL_SEC / 60}）</span>
+                  <span>{t('Interval (minutes, at least {n})', { n: MIN_INTERVAL_SEC / 60 })}</span>
                   <input
                     type="text"
                     inputMode="numeric"
@@ -4455,8 +4489,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <label className="loop-dialog-field">
                   <span>{t('Day of week')}</span>
                   <select value={schedWeekday} onChange={(event) => setSchedWeekday(event.target.value)}>
-                    {['日', '一', '二', '三', '四', '五', '六'].map((day, index) => (
-                      <option key={index} value={String(index)}>{`周${day}`}</option>
+                    {[t('Sunday'), t('Monday'), t('Tuesday'), t('Wednesday'), t('Thursday'), t('Friday'), t('Saturday')].map((day, index) => (
+                      <option key={index} value={String(index)}>{day}</option>
                     ))}
                   </select>
                 </label>
@@ -4488,14 +4522,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
 
             {scheduleProblems.length > 0 && (
-              <div className="loop-dialog-problems">{scheduleProblems.join('；')}</div>
+              <div className="loop-dialog-problems">{scheduleProblems.join(t('; '))}</div>
             )}
             <div className="loop-dialog-actions">
               <button className="loop-dialog-cancel" onClick={() => setScheduleSetup(null)}>{t('Cancel')}</button>
               <button
                 className="loop-dialog-start"
                 disabled={scheduleProblems.length > 0}
-                title={scheduleProblems.length > 0 ? scheduleProblems.join('；') : t('Create scheduled job')}
+                title={scheduleProblems.length > 0 ? scheduleProblems.join(t('; ')) : t('Create scheduled job')}
                 onClick={() => {
                   onStartSchedule(draftSchedule);
                   setScheduleSetup(null);
@@ -4521,12 +4555,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="settings-header">
               <div className="agent-config-editor-title">
                 <IconRobot size={17} />
-                <h3 id="agent-config-editor-title">Kiro Agent configurations</h3>
+                <h3 id="agent-config-editor-title">{t('Kiro Agent configurations')}</h3>
               </div>
-              <button className="settings-close" onClick={closeAgentConfig} aria-label="Close">✕</button>
+              <button className="settings-close" onClick={closeAgentConfig} aria-label={t('Close')}>✕</button>
             </div>
             <div className="kiro-config-tabs" role="tablist">
-              {[{ id: 'agents', label: 'Agents' }, ...kiroConfigCats].map((c) => (
+              {[{ id: 'agents', label: t('Agents') }, ...kiroConfigCats].map((c) => (
                 <button
                   key={c.id}
                   role="tab"
@@ -4540,10 +4574,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
             {agentConfigTab === 'agents' ? (<>
             <div className="agent-config-editor-workspace">
-              <aside className="agent-config-agent-list" aria-label="Kiro Agents">
+              <aside className="agent-config-agent-list" aria-label={t('Kiro Agents')}>
                 <input
                   className="agent-config-filter"
-                  placeholder={`筛选 ${agentConfigAgents.length} 个 agent`}
+                  placeholder={t('Filter {n} agents', { n: agentConfigAgents.length })}
                   value={agentConfigFilter}
                   onChange={(ev) => setAgentConfigFilter(ev.target.value)}
                 />
@@ -4556,7 +4590,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   return (
                     <div key={src} className="agent-config-group">
                       <div className="agent-config-group-head">
-                        {src === 'built-in' ? '内置（只读）' : src === 'global' ? '全局' : '本项目'}
+                        {src === 'built-in' ? t('Built-in (read-only)') : src === 'global' ? t('Global') : t('This project')}
                         <span>{group.length}</span>
                       </div>
                       {group.map((agent) => {
@@ -4568,11 +4602,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             className={`agent-config-row ${agentConfigEditor.agentName === agent.name ? 'active' : ''} ${src === 'built-in' ? 'readonly' : ''}`}
                             onClick={() => void loadAgentConfig(agent.name)}
                             disabled={agentConfigLoading}
-                            title={src === 'built-in' ? `${agent.name} 是内置的，不能改` : agent.name}
+                            title={src === 'built-in' ? t('{name} is built in and cannot be changed', { name: agent.name }) : agent.name}
                           >
                             <span className="agent-config-row-name">{agent.name}</span>
-                            {hasUnsavedDraft && <span className="agent-config-row-dirty" title="有未保存的改动" />}
-                            {agent.isDefault && <span className="agent-config-row-default">默认</span>}
+                            {hasUnsavedDraft && <span className="agent-config-row-dirty" title={t('Unsaved changes')} />}
+                            {agent.isDefault && <span className="agent-config-row-default">{t('Default')}</span>}
                           </button>
                         );
                       })}
@@ -4592,10 +4626,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 </div>
 
                 {agentConfigLoading ? (
-                  <div className="agent-config-editor-message">Loading configuration…</div>
+                  <div className="agent-config-editor-message">{t('Loading configuration…')}</div>
                 ) : agentConfigEditor.error ? (
                   <div className="agent-config-readonly-note">
-                    <strong>这个 agent 不能在这里改</strong>
+                    <strong>{t("This agent can't be edited here")}</strong>
                     <span>{agentConfigEditor.error}</span>
                   </div>
                 ) : (
@@ -4613,7 +4647,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             <span
                               key={lineNumber}
                               className={isErrorLine ? 'error' : ''}
-                              title={isErrorLine ? 'JSON error on this line' : undefined}
+                              title={isErrorLine ? t('JSON error on this line') : undefined}
                             >
                               {lineNumber}
                             </span>
@@ -4649,16 +4683,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         type="button"
                         className="agent-config-validation invalid"
                         onClick={focusAgentConfigError}
-                        title="Jump to the JSON error"
+                        title={t('Jump to the JSON error')}
                       >
                         <strong>
-                          Line {agentConfigValidationError.line}, column {agentConfigValidationError.column}
+                          {t('Line {line}, column {column}', { line: agentConfigValidationError.line, column: agentConfigValidationError.column })}
                         </strong>
                         <span>{agentConfigValidationError.message}</span>
                       </button>
                     ) : (
                       <div className="agent-config-validation valid">
-                        ✓ Valid JSON · {agentConfigLines.length} lines
+                        {t('✓ Valid JSON · {n} lines', { n: agentConfigLines.length })}
                       </div>
                     )}
                   </>
@@ -4668,7 +4702,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="agent-config-editor-actions">
               {agentConfigStatus && (
                 <span className={agentConfigStatus === 'Saved' ? 'saved' : 'error'}>
-                  {agentConfigStatus}
+                  {agentConfigStatus === 'Saved' ? t('Saved') : agentConfigStatus}
                 </span>
               )}
               <button
@@ -4680,11 +4714,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   !!agentConfigValidationError ||
                   agentConfigSaving
                 }
-                title="Format with two-space indentation"
+                title={t('Format with two-space indentation')}
               >
-                Format JSON
+                {t('Format JSON')}
               </button>
-              <button className="btn deny" onClick={closeAgentConfig}>Close</button>
+              <button className="btn deny" onClick={closeAgentConfig}>{t('Close')}</button>
               <button
                 className="btn allow"
                 onClick={() => void saveAgentConfig()}
@@ -4696,7 +4730,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   agentConfigEditor.content === agentConfigEditor.initialContent
                 }
               >
-                {agentConfigSaving ? 'Saving…' : 'Save'}
+                {agentConfigSaving ? t('Saving…') : t('Save')}
               </button>
             </div>
             </>) : (() => {
@@ -4717,12 +4751,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="settings-header">
               <div className="agent-config-editor-title">
                 {engine === 'claude' ? <IconClaudeSpark size={17} /> : <IconCodexPrompt size={17} />}
-                <h3 id="engine-config-title">{engineLabel} 配置</h3>
+                <h3 id="engine-config-title">{t('{engine} config', { engine: engineLabel })}</h3>
               </div>
-              <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label="Close">✕</button>
+              <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label={t('Close')}>✕</button>
             </div>
             <div className="kiro-config-tabs" role="tablist">
-              {[{ id: 'login', label: '🔑 登录' }, { id: 'mcp-combos', label: '🧩 组合' }, ...engineConfigCats].map((c) => (
+              {[{ id: 'login', label: t('🔑 Login') }, { id: 'mcp-combos', label: t('🧩 Combos') }, ...engineConfigCats].map((c) => (
                 <button
                   key={c.id}
                   role="tab"

@@ -9,6 +9,7 @@
  */
 
 import type { RemoteTarget } from './config';
+import { tr, trList } from './uiText.ts';
 
 export type PreflightCode = 'ok' | 'unreachable' | 'missing-tools' | 'not-logged-in';
 
@@ -144,7 +145,7 @@ export function judgePreflight(
     const why = firstLine(stderr) || `ssh exit ${exitCode}`;
     return {
       code: 'unreachable',
-      message: `连不上 ${host}：${why}。检查网络/密钥/安全组（这台机器的 kiro-cli 和文件都在它上面，连不上就跑不了）。`,
+      message: tr('Cannot connect to {host}: {why}. Check the network/keys/security group (kiro-cli and the files for this machine live on it, so nothing runs without a connection).', { host, why }),
       raw: why,
     };
   }
@@ -153,16 +154,17 @@ export function judgePreflight(
     return {
       code: 'missing-tools',
       missing,
-      message: `${host} 上缺 ${missing.join('、')}。在远端跑一次预置脚本装齐：`
-        + `\`scp ${bootstrapHint} ${host}:~/ && ssh ${host} 'bash ~/${baseName(bootstrapHint)}'\``
-        + `（KiroLex 不替你在远端装东西）。`,
+      message: tr('{host} is missing {tools}. Run the bootstrap script on the remote once to install everything: `{cmd}` (KiroLex does not install things on the remote for you).', {
+        host,
+        tools: trList(missing),
+        cmd: `scp ${bootstrapHint} ${host}:~/ && ssh ${host} 'bash ~/${baseName(bootstrapHint)}'`,
+      }),
     };
   }
   if (/AUTH no/.test(out)) {
     return {
       code: 'not-logged-in',
-      message: `${host} 上的 kiro-cli 没登录。去那台机器跑一次 \`kiro-cli login\`——`
-        + `没登录的话执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。`,
+      message: tr('kiro-cli on {host} is not logged in. Run `kiro-cli login` on that machine once. Without a login the executor starts, but every turn comes back empty, which looks just like the server returning empty responses.', { host }),
     };
   }
   const models = parseModels(out);
@@ -175,7 +177,9 @@ export function judgePreflight(
     kiroVersion: parseKiroVersion(out),
     memAvailMB: parseMemAvail(out),
     swapMB: parseSwap(out),
-    message: `${host}：kiro-cli 在，也登录了${models.length ? `，${models.length} 个可用模型` : ''}。`,
+    message: models.length
+      ? tr('{host}: kiro-cli is installed and logged in, {n} models available.', { host, n: models.length })
+      : tr('{host}: kiro-cli is installed and logged in.', { host }),
   };
 }
 

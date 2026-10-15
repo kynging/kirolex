@@ -192,7 +192,7 @@ describe('接线', () => {
   test('三道闸和别的写盘一致：主人会话读过 / 只有 `.pptx` / 写前备份', () => {
     const gate = MAIN.slice(MAIN.indexOf('const deckTarget = '), MAIN.indexOf('const deckTarget = ') + 700);
     assert.match(gate, /reviewTarget\(sessionId, filePath\)/);
-    assert.match(gate, /只有 \.pptx 能这么改/);
+    assert.match(gate, /Only \.pptx can be edited this way/);
     const at = MAIN.indexOf('const writeSlideText');
     const body = MAIN.slice(at, at + 2600);
     assert.match(body, /const bad = backupDeck\(want\);/);

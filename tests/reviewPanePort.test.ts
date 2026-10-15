@@ -43,10 +43,10 @@ describe('预览侧栏顶部排版', () => {
 
   test('右侧依次是 ⟳ 刷新、📂 打开位置、✕；没有 Download', () => {
     const panel = APP.slice(APP.indexOf('className="workspace-file-panel"'), APP.indexOf('className="workspace-file-modal-body"'));
-    const a = panel.indexOf('⟳ 刷新'), b = panel.indexOf('📂 打开位置'), c = panel.indexOf('settings-close');
+    const a = panel.indexOf("⟳ {t('Refresh')}"), b = panel.indexOf("📂 {t('Open location')}"), c = panel.indexOf('settings-close');
     assert.ok(a > 0 && a < b && b < c, '顺序：刷新 → 打开位置 → 关闭');
     assert.ok(!panel.includes('Download'));
-    assert.ok(panel.includes(`isMac ? '在 Finder 中显示' : '在资源管理器中显示'`));
+    assert.ok(panel.includes(`isMac ? t('Show in Finder') : t('Show in Explorer')`));
     assert.ok(panel.includes('disabled={!!fileViewer.gone}'));
   });
 
@@ -72,7 +72,7 @@ describe('入口', () => {
   test('只对 md / txt 给 comment 开关，截断的预览不给', () => {
     assert.match(APP, /function isReviewableText\(p: string\): boolean/);
     assert.match(APP, /const canComment = isReviewableText\(fileViewer\.path\) && !fileViewerRaw && !fileViewer\.truncated;/);
-    assert.match(APP, /\{commenting \? '✓ comment' : '💬 comment'\}/);
+    assert.match(APP, /\{commenting \? t\('✓ comment'\) : t\('💬 comment'\)\}/);
   });
 
   test('不开 comment 时照旧是原来的 MarkdownView —— 纯读不受影响', () => {
@@ -132,7 +132,7 @@ describe('积累模式：先标记，一次提交', () => {
 
   test('收起的标记摆在那一段下面：点它接着改，✕ 去掉', () => {
     assert.ok(RV.includes("markChip(String(g.anchor), '💬', () => openBox('comment', g.anchor))"));
-    assert.ok(RV.includes('title="去掉这条标记"'));
+    assert.ok(RV.includes("title={t('Remove this mark')}"));
   });
 });
 
@@ -189,12 +189,12 @@ describe('提交之后那条路', () => {
 
   test('框顶上写明它管的是哪几行（「comment 功能没有选择行号」）', () => {
     assert.ok(RV.includes('<div className="rv-box-target">{header}</div>'));
-    assert.ok(RV.includes('insert ? `＋ 加在${where}后面` : `💬 改${where}`,'));
+    assert.ok(RV.includes("insert ? t('+ Add after {where}', { where }) : t('💬 Revise {where}', { where }),"));
   });
 
   test('最下面有对整篇的意见 + 提交，走 patch（不整篇重写）、KiroLex 写回', () => {
-    assert.ok(RV.includes("label: `${fileName} 整篇`, scope: 'patch', full: base,"));
-    assert.ok(RV.includes("{markCount > 1 ? `提交（${markCount} 处）` : '提交'}"));
+    assert.ok(RV.includes("label: t('{file} (whole document)', { file: fileName }), scope: 'patch', full: base,"));
+    assert.ok(RV.includes("{markCount > 1 ? t('Submit ({n})', { n: markCount }) : t('Submit')}"));
   });
 });
 
@@ -235,7 +235,7 @@ test('重启后恢复：comment 标记按文件存、按原文重新对位；侧
   assert.ok(APP.includes('const commenting = !!fileViewer && commentingPaths.includes(fileViewer.path);'));
   assert.ok(APP.includes('onClick={toggleCommenting}'));
   assert.ok(!APP.includes('setCommenting('), '没有全局开关了');
-  assert.ok(SD.includes("{ key: 'restoreUiState', store: 'settings', group: '界面',"));
+  assert.ok(SD.includes("{ key: 'restoreUiState', store: 'settings', group: 'Interface',"));
 });
 
 test('md 的 comment 模式左侧显示行号（和「第 N 行」同一个数；围栏组写起止）', () => {
@@ -287,7 +287,7 @@ test('右侧 comment 栏拖宽有上限：窗口宽 − 侧栏 − 会话区最�
 });
 
 test('写完的标记有 ✎ 修改按钮；预览栏能藏起来（标签留着，贴边那个按钮放回来，点开文件也放回来）', () => {
-  assert.ok(RV.includes('title="修改这条标记" onClick={reopen}>✎</button>'));
+  assert.ok(RV.includes("title={t('Edit this mark')} onClick={reopen}>✎</button>"));
   assert.ok(APP.includes('if (previewHidden) { setFileViewerHidden(false); setPanelPins((p) => ({ ...p, previewAt: winWidth })); }'));
   assert.ok(APP.includes('else setFileViewerHidden(true);'));
   assert.ok(APP.includes('if (!tabsRestoringRef.current) setFileViewerHidden(false);'));
@@ -310,7 +310,7 @@ test('排着的改写在会话的队列旁边看得见、能取消；取消按 t
 test('提交了还没写完的照标记存着：窗口 reload / 重启回来时放回去，说一句"上次没做完"', () => {
   assert.ok(RV.includes('interrupted.push(k);'));
   assert.ok(RV.includes("}, [draftLive, dropped, wholeDraft, markOrder, path, jobs]);"));
-  assert.ok(RV.includes("initialMarks.interrupted.map((k) => [k, '上次提交没做完（窗口重新加载 / 重启打断了）—— 标记放回来了，再提交一次']),"));
+  assert.ok(RV.includes("initialMarks.interrupted.map((k) => [k, t('The last submission didn\\'t finish (interrupted by a window reload or restart). The marks are back; submit again.')]),"));
   /* 每一类都带着自己的标记形状 */
   for (const s of ["{ key, text: instruction }", "{ key: `drop:${anchor}`, text: '' }", "{ key: 'whole', text: note }", "{ key: String(page), text: instruction }"]) {
     assert.ok(RV.includes(s), s);
@@ -326,7 +326,7 @@ test('远程会话的模型下拉：远端清单没回来之前用缓存，没�
 test('✎ 直接在原文上改：框顶替那一块（原文不再另摆一份），改过没提交时显示改过的那份', () => {
   assert.ok(RV.includes("if (editHost !== null && editHost !== g.anchor) return null;"), '被那一块盖住的几行不单独显示');
   assert.ok(RV.includes('{editingHere ? editBox(g.anchor) : editedHere ? ('));
-  assert.ok(RV.includes('<span className="rv-edited-tag">✎ 已直接改（未提交）</span>'));
+  assert.ok(RV.includes("<span className=\"rv-edited-tag\">{t('✎ Edited directly (not submitted)')}</span>"));
   /* 框不再挂在那一块下面 */
   assert.ok(RV.includes('  const boxFor = (line: number) => {\n    const anchor = openAt ?? insertAt;'));
 });

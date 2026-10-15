@@ -53,18 +53,18 @@ describe('排队卡片上那几个动作要看得出是按钮', () => {
   });
 
   test('提示词跟周围一致（中文），并说清点了会发生什么', () => {
-    assert.match(CHAT, /title="改这条排队的消息"/);
-    assert.match(CHAT, /title="撤回这条 —— 内容退回输入框"/);
-    assert.match(CHAT, /title="往前排一位"/);
-    assert.match(CHAT, /title="往后排一位"/);
-    assert.match(CHAT, /title="保存这次修改"/);
-    assert.match(CHAT, /title="放弃这次修改"/);
+    assert.match(CHAT, /title=\{t\('Edit this queued message'\)\}/);
+    assert.match(CHAT, /title=\{t\('Withdraw this one \(its text goes back to the input box\)'\)\}/);
+    assert.match(CHAT, /title=\{t\('Move up one'\)\}/);
+    assert.match(CHAT, /title=\{t\('Move down one'\)\}/);
+    assert.match(CHAT, /title=\{t\('Save this edit'\)\}/);
+    assert.match(CHAT, /title=\{t\('Discard this edit'\)\}/);
     for (const old of ['Edit queued message', 'Cancel and return to composer', 'Move earlier', 'Move later', 'Save edit', 'Cancel edit']) {
       assert.doesNotMatch(CHAT, new RegExp(`title="${old}"`));
     }
   });
 
   test('改的时候说清怎么收尾 —— 两个出口都是键盘', () => {
-    assert.match(CHAT, /placeholder="改完按 Enter 保存，Esc 取消"/);
+    assert.match(CHAT, /placeholder=\{t\('Press Enter to save, Esc to cancel'\)\}/);
   });
 });

@@ -29,12 +29,13 @@ interface SettingsDialogProps {
 // as an extra "Current: …" option (see fontSelectOptions).
 const FONT_PRESETS: Array<{ label: string; value: string }> = [
   { label: 'System default', value: '' },
-  { label: 'PingFang SC / 苹方', value: "'PingFang SC', -apple-system, sans-serif" },
-  { label: 'Hiragino Sans GB / 冬青黑', value: "'Hiragino Sans GB', 'PingFang SC', sans-serif" },
-  { label: 'Songti SC / 宋体', value: "'Songti SC', 'Times New Roman', serif" },
+  // 这些 label 在 fontSelectOptions 里过 t()；中文名（苹方 / 冬青黑 / 宋体 / 微软雅黑）在 i18nZh/shell.ts
+  { label: 'PingFang SC', value: "'PingFang SC', -apple-system, sans-serif" },
+  { label: 'Hiragino Sans GB', value: "'Hiragino Sans GB', 'PingFang SC', sans-serif" },
+  { label: 'Songti SC', value: "'Songti SC', 'Times New Roman', serif" },
   { label: 'Helvetica Neue', value: "'Helvetica Neue', Helvetica, Arial, sans-serif" },
   { label: 'Segoe UI', value: "'Segoe UI', Tahoma, sans-serif" },
-  { label: 'Microsoft YaHei / 微软雅黑', value: "'Microsoft YaHei', 'PingFang SC', sans-serif" },
+  { label: 'Microsoft YaHei', value: "'Microsoft YaHei', 'PingFang SC', sans-serif" },
 ];
 const MONO_PRESETS: Array<{ label: string; value: string }> = [
   { label: 'Default mono', value: '' },
@@ -64,49 +65,50 @@ const MONO_PRESETS: Array<{ label: string; value: string }> = [
  *  Labels state what the switch DOES; `help` states what turning it OFF means,
  *  because that is the decision being made. */
 type SwitchStore = 'feature' | 'settings' | 'prop';
-const SWITCH_GROUPS = ['上下文与历史', '对话与输入', '界面', '安全'] as const;
+// group / label / help 都是英文 key，渲染时过 t()；中文在 i18nZh/shell.ts（测试扫不到这张表，加条目时手动补字典）。
+const SWITCH_GROUPS = ['Context & history', 'Conversation & input', 'Interface', 'Safety'] as const;
 const SWITCHES: Array<{
   key: string; store: SwitchStore; group: typeof SWITCH_GROUPS[number]; label: string; help: string;
 }> = [
-  { key: 'rideAlongContext', store: 'feature', group: '上下文与历史',
+  { key: 'rideAlongContext', store: 'feature', group: 'Context & history',
     label: 'Send history context along with the message (no extra turn)',
-    help: '开：重启后第一条消息附带历史快照，不花额外的模型回合。关：改回“先跑一次重建回合再发消息”。' },
-  { key: 'historyFileRefresh', store: 'feature', group: '上下文与历史',
+    help: 'On: after a restart, the first message carries a history snapshot, with no extra model turn. Off: go back to "run a rebuild turn first, then send the message".' },
+  { key: 'historyFileRefresh', store: 'feature', group: 'Context & history',
     label: 'Refresh history.md every turn',
-    help: '开：每个回合结束立刻重写完整历史文件，模型随时读到的都是最新的。关：只在重建时写一次，之后会滞后。' },
-  { key: 'memoryInjection', store: 'feature', group: '上下文与历史',
+    help: 'On: the full history file is rewritten as soon as each turn ends, so the model always reads the latest. Off: written once at rebuild time and lags behind afterwards.' },
+  { key: 'memoryInjection', store: 'feature', group: 'Context & history',
     label: 'Inject memory (global / project / this chat)',
-    help: '开：每一轮都带上 ~/.kirolex/memory 的内容（约 1.3k 字符），所以「每次回复都要…」这类规则每轮都成立。关：模型完全看不到这些背景。' },
-  { key: 'recoverInterruptedTurns', store: 'settings', group: '上下文与历史',
+    help: 'On: every turn carries the contents of ~/.kirolex/memory (about 1.3k characters), so rules like "every reply must…" hold on every turn. Off: the model sees none of this background.' },
+  { key: 'recoverInterruptedTurns', store: 'settings', group: 'Context & history',
     label: 'Resend an unanswered prompt after a restart',
-    help: '开：不是你停的中断（执行器中途断了、重启、看门狗）之后，自动重发那一轮（连同它已经吃进去的 steer；会消耗额度），最多重发「自动重试次数」那么多次，你按了停止就不重发。关：那一轮就留在原处，由你决定要不要重发。' },
-  { key: 'pasteFolding', store: 'feature', group: '对话与输入',
+    help: 'On: after an interruption you didn’t cause (executor dropped mid-turn, restart, watchdog), the turn is resent automatically (along with any steer it had already taken in; this uses quota), up to the "auto-retry attempts" limit; nothing is resent if you pressed Stop. Off: the turn stays where it is and you decide whether to resend it.' },
+  { key: 'pasteFolding', store: 'feature', group: 'Conversation & input',
     label: 'Fold large pastes to disk',
-    help: '开：很长的粘贴内容存到 ~/.kirolex/pastes 并在输入框显示占位符（单行需超过 4000 字符才折叠）。关：粘贴内容一律直接进输入框。' },
-  { key: 'mergeQueuedMessages', store: 'settings', group: '对话与输入',
+    help: 'On: very long pastes are saved to ~/.kirolex/pastes and shown as a placeholder in the composer (a single line folds only past 4000 characters). Off: pastes always go straight into the composer.' },
+  { key: 'mergeQueuedMessages', store: 'settings', group: 'Conversation & input',
     label: 'Merge queued messages into one',
-    help: '开：排队的多条消息在发送时合并为一条。关：逐条依次发送，各自占一个回合。' },
-  { key: 'promptSuggestions', store: 'feature', group: '对话与输入',
+    help: 'On: multiple queued messages are merged into one when sent. Off: they are sent one by one, each taking its own turn.' },
+  { key: 'promptSuggestions', store: 'feature', group: 'Conversation & input',
     label: 'Show starter prompts when the composer is empty',
-    help: '开：输入框为空时显示可点击的起始提示。关：不显示，也不为此调用辅助模型。' },
-  { key: 'smartTitle', store: 'feature', group: '对话与输入',
+    help: 'On: clickable starter prompts appear when the composer is empty. Off: none are shown, and the helper model isn’t called for them.' },
+  { key: 'smartTitle', store: 'feature', group: 'Conversation & input',
     label: 'Generate chat titles automatically',
-    help: '开：用辅助模型给新会话起标题。关：保持 New Chat——注意标题相同的会话在侧栏难以区分，曾因此误删过一个会话。' },
-  { key: 'splitDragResize', store: 'feature', group: '界面',
+    help: 'On: the helper model names new chats. Off: they stay "New Chat". Note that chats with identical titles are hard to tell apart in the sidebar; one was deleted by mistake because of that.' },
+  { key: 'splitDragResize', store: 'feature', group: 'Interface',
     label: 'Draggable pane dividers',
-    help: '开：格子之间有可拖动的分隔线（双击恢复均分）。关：固定均分，分隔线仍在但不可拖。' },
-  { key: 'restoreUiState', store: 'settings', group: '界面',
+    help: 'On: the dividers between cells can be dragged (double-click to even them out). Off: fixed even split; the dividers are still there but can’t be dragged.' },
+  { key: 'restoreUiState', store: 'settings', group: 'Interface',
     label: 'Restore the window layout after a restart',
-    help: '开：重启 KiroLex 之后，左侧会话栏收没收起、各组折叠、右侧 comment 模式和每份文件里没提交的 comment / 删除标记都照原样恢复。关：这些只在窗口重新加载时保留，重启就回到默认。' },
-  { key: 'autoFoldThinking', store: 'settings', group: '界面',
+    help: 'On: after restarting KiroLex, whether the left chat list was collapsed, each group’s folding, the right-side comment mode, and each file’s unsent comments / delete marks all come back as they were. Off: these are kept only across window reloads; a restart resets them.' },
+  { key: 'autoFoldThinking', store: 'settings', group: 'Interface',
     label: 'Auto-fold thinking when it finishes (💭 thinking)',
-    help: '开：思考段落结束后自动收起。关：一直展开。' },
-  { key: 'autoFoldTools', store: 'settings', group: '界面',
+    help: 'On: a thinking block folds up once it ends. Off: always expanded.' },
+  { key: 'autoFoldTools', store: 'settings', group: 'Interface',
     label: 'Auto-fold tool calls when they finish (🔧 tool)',
-    help: '开：工具调用结束后自动收起。关：一直展开。' },
-  { key: 'confirmDeletes', store: 'prop', group: '安全',
+    help: 'On: a tool call folds up once it ends. Off: always expanded.' },
+  { key: 'confirmDeletes', store: 'prop', group: 'Safety',
     label: 'Confirm before deleting chats',
-    help: '开：删除会话前弹确认框。关：点了就删——删除现在会移到 ~/.kirolex/trash 保留 30 天，但仍建议保持开启。' },
+    help: 'On: ask for confirmation before deleting a chat. Off: delete on click. Deleted chats now go to ~/.kirolex/trash for 30 days, but keeping this on is still recommended.' },
 ];
 
 /**
@@ -118,12 +120,12 @@ const SWITCHES: Array<{
  */
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
-  { id: 'appearance', label: '🎨 外观' },
-  { id: 'session', label: '💬 会话' },
-  { id: 'switches', label: '🧪 开关' },
-  { id: 'machines', label: '🖥 机器' },
+  { id: 'appearance', label: '🎨 Appearance' },
+  { id: 'session', label: '💬 Chats' },
+  { id: 'switches', label: '🧪 Switches' },
+  { id: 'machines', label: '🖥 Machines' },
   /* 备份的**配置**在这儿；「桶里有哪些、恢复哪几条」在侧栏那颗 ☁️ 里 */
-  { id: 'backup', label: '☁️ 备份' },
+  { id: 'backup', label: '☁️ Backup' },
 ];
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
@@ -293,7 +295,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 aria-selected={tab === tb.id}
                 className={`settings-tab${tab === tb.id ? ' active' : ''}`}
                 onClick={() => setTab(tb.id)}
-              >{tb.label}</button>
+              >{t(tb.label)}</button>
             ))}
           </div>
           <button className="settings-close" onClick={onClose}>✕</button>
@@ -315,7 +317,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
               className="settings-preview"
               style={{ fontSize: settings.fontSize, fontFamily: settings.fontFamily || undefined }}
             >
-              The quick brown fox jumps over the lazy dog. 中文预览 0O1lI
+              {t('The quick brown fox jumps over the lazy dog. 0O1lI')}
             </p>
             <p
               className="settings-preview"
@@ -324,7 +326,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 fontFamily: settings.monoFontFamily || 'var(--mono-font)',
               }}
             >
-              const answer = 42; // 代码字体预览
+              {t('const answer = 42; // code font preview')}
             </p>
           </div>
           )}
@@ -447,15 +449,15 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           <div className="settings-col">
             {/* 「重试次数默认是 10，可以在 setting 中调整」 */}
             <div className="settings-item">
-              <label className="settings-label">自动重试次数（非人为中断）</label>
+              <label className="settings-label">{t('Auto-retry attempts (interruptions you didn’t cause)')}</label>
               <div className="settings-control">
                 <button className="settings-btn"
                   onClick={() => onChange({ ...settings, autoRetryMax: Math.max(0, (settings.autoRetryMax ?? 10) - 1) })}>−</button>
-                <span className="settings-value">{settings.autoRetryMax ?? 10} 次</span>
+                <span className="settings-value">{t('{n} times', { n: settings.autoRetryMax ?? 10 })}</span>
                 <button className="settings-btn"
                   onClick={() => onChange({ ...settings, autoRetryMax: Math.min(50, (settings.autoRetryMax ?? 10) + 1) })}>＋</button>
               </div>
-              <p className="settings-hint">执行器中途断了、重启、看门狗打断之后，自动把那一轮再发一次，最多这么多次（重试之间会退避）。0 = 不自动重发。你按了停止的不算。</p>
+              <p className="settings-hint">{t('After the executor drops mid-turn, restarts, or is interrupted by the watchdog, the turn is resent automatically, up to this many times (with backoff between retries). 0 = never resend automatically. Turns you stopped yourself don’t count.')}</p>
             </div>
             <div className="settings-item">
               <label className="settings-label">{t('Split grid (click a chat in the sidebar to add it; every pane has its own composer)')}</label>
@@ -464,7 +466,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   value={settings.splitGrid}
                   onChange={(event) => onChange({ ...settings, splitGrid: event.target.value as Settings['splitGrid'] })}
                   style={{ minWidth: 120 }}
-                  title="行 x 列，最大 2 行 x 2 列。空的分屏位占它在网格里的那一格，宽度跟随上一行，所以之后放会话进来时已有的格子不会移动；移除用该格右上角的 ✕。"
+                  title={t('Rows x columns, up to 2 rows x 2 columns. An empty split slot keeps its cell in the grid and takes the width of the row above, so existing cells don’t move when you add a chat later. Remove one with the ✕ at the top-right of its cell.')}
                 >
                   <option value="1x1">{t('1 × 1 (no split)')}</option>
                   <option value="1x2">{t('1 row × 2 cols (side by side)')}</option>
@@ -490,7 +492,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
 
             <div className="settings-item">
               <label className="settings-label">
-                静默多久判定卡死（秒，0 = 不中断）
+                {t('Treat a turn as stuck after silence for (seconds, 0 = never interrupt)')}
               </label>
               <div className="settings-control">
                 <input
@@ -506,27 +508,20 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                     // on its own either one looks like "the" timeout, and then the
                     // on-screen countdown -- which follows whichever bound is later --
                     // appears to contradict the number on this page.
-                    '中断需要两个条件同时成立：\n'
-                    + '  ① 这一轮在协议层完全静默超过这里设的时长；\n'
-                    + '  ② 并且没有工具在下面那个「工具无进度」时长之内报告过进度。\n\n'
-                    + '所以：没有工具在跑时，这个值就是实际的中断时间；有工具在跑时，实际等待是两个阈值里更晚的那个。\n'
-                    + '未产出任何内容的会自动重发；已产出部分内容的只提示，由你决定是否重发。\n\n'
-                    + `取值范围：${wedgeBounds?.min ?? 30}–${wedgeBounds?.max ?? 3600} 秒，默认 ${wedgeBounds?.default ?? 600} 秒。\n`
-                    + '设为 0 则完全不自动中断，只保留 5 分钟的静默提示。\n'
-                    + '首个 token 特别慢的模型如果被误中断，就把这个值调大。'
+                    t('A turn is interrupted only when both conditions hold:\n  ① the turn has been completely silent at the protocol level for longer than this;\n  ② and no tool has reported progress within the “tool with no progress” time below.\n\nSo: with no tool running, this value is the actual interrupt time; with a tool running, the actual wait is the later of the two thresholds.\nA turn that produced nothing is resent automatically; one that produced partial output only gets a notice, and you decide whether to resend.\n\nRange: {min}–{max} s, default {def} s.\nSet to 0 to never interrupt automatically; only the 5-minute silence notice remains.\nIf a model with a very slow first token gets interrupted by mistake, raise this value.', { min: wedgeBounds?.min ?? 30, max: wedgeBounds?.max ?? 3600, def: wedgeBounds?.default ?? 600 })
                   }
                 />
                 <span className="settings-hint">
                   {wedgeInput === '0'
-                    ? '已关闭：只提示不中断'
-                    : `没有工具在跑时：静默 ${wedgeInput || '—'} 秒后中断（5 分钟时先提示）。有工具在跑时，还要同时满足下面那一项`}
+                    ? t('Off: notify only, never interrupt')
+                    : t('With no tool running: interrupt after {s} s of silence (with a notice at 5 minutes). With a tool running, the setting below must also be met', { s: wedgeInput || '—' })}
                 </span>
               </div>
             </div>
 
             <div className="settings-item">
               <label className="settings-label">
-                工具无进度多久判定卡死（秒）
+                {t('Treat a tool as stuck after no progress for (seconds)')}
               </label>
               <div className="settings-control">
                 <input
@@ -539,18 +534,13 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   style={{ width: 90 }}
                   disabled={wedgeInput === '0'}
                   title={
-                    '工具调用运行期间，上面那条静默判定会被暂停 —— 因为长命令（构建、测试）本来就会长时间不出声。\n'
-                    + '但这个暂停必须有上界：如果后端没发出「工具已结束」的更新，暂停会无限持续，一轮对话可能就那样挂着（实测出现过 5 小时以上）。\n\n'
-                    + '所以：一个工具调用超过这个时长没有任何更新，才不再算作「仍在进行」，上面那条静默判定也才重新生效。\n'
-                    + '有工具在跑时，实际中断时间 = 两个阈值里更晚的那个，默认就是这一项（30 分钟）—— 停顿提示里那个倒计时通常来自这里，而不是上面的静默阈值。\n\n'
-                    + `范围 ${toolStallBounds?.min ?? 60}–${toolStallBounds?.max ?? 86400} 秒，默认 ${toolStallBounds?.default ?? 1800} 秒。\n`
-                    + '如果确实有跑得更久、且期间完全不报告进度的命令被误中断，就把这个值调大。'
+                    t('While a tool call is running, the silence check above is paused, because long commands (builds, tests) can stay quiet for a long time.\nBut that pause needs an upper bound: if the backend never sends the “tool finished” update, the pause lasts forever and a turn can hang like that (seen lasting over 5 hours).\n\nSo: once a tool call has had no update for longer than this, it no longer counts as “still running” and the silence check above applies again.\nWith a tool running, the actual interrupt time = the later of the two thresholds, which by default is this one (30 minutes). The countdown in the stall notice usually comes from here, not from the silence threshold above.\n\nRange {min}–{max} s, default {def} s.\nIf a command that genuinely runs longer without reporting any progress gets interrupted by mistake, raise this value.', { min: toolStallBounds?.min ?? 60, max: toolStallBounds?.max ?? 86400, def: toolStallBounds?.default ?? 1800 })
                   }
                 />
                 <span className="settings-hint">
                   {wedgeInput === '0'
-                    ? '中断已关闭，此项不生效'
-                    : `有工具在跑时：它连续 ${toolStallInput || '—'} 秒没有更新才中断 —— 这就是停顿提示里倒计时的来源`}
+                    ? t('Interrupts are off, so this has no effect')
+                    : t('With a tool running: interrupt only after it has had no update for {s} s. This is where the countdown in the stall notice comes from', { s: toolStallInput || '—' })}
                 </span>
               </div>
             </div>
@@ -607,20 +597,20 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 if (!rows.length) return null;
                 return (
                   <div key={group} style={{ display: 'flex', flexDirection: 'column', gap: 6 }}>
-                    <div className="settings-switch-group">{group}</div>
+                    <div className="settings-switch-group">{t(group)}</div>
                     {rows.map((sw) => {
                       const on = switchValue(sw.key, sw.store);
                       return (
                         <div key={sw.key} className="settings-control" style={{ justifyContent: 'space-between', gap: 12 }}>
-                          <span className="settings-switch-label" title={sw.help}>
+                          <span className="settings-switch-label" title={t(sw.help)}>
                             {t(sw.label)}
                           </span>
                           {/* 开关做成按钮 ——「开关应该改成按钮形式」（见 ToggleButton 那段） */}
                           <ToggleButton
                             on={on}
-                            labels={['On', 'Off']}
+                            labels={[t('On'), t('Off')]}
                             ariaLabel={t(sw.label)}
-                            title={sw.help}
+                            title={t(sw.help)}
                             disabled={featureBusy === sw.key}
                             onChange={(next) => setSwitchValue(sw.key, sw.store, next)}
                           />

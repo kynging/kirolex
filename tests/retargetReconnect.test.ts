@@ -91,7 +91,12 @@ describe('没连上的会话换机器：立刻在新机器上连，旧报错不�
   });
 
   test('新建失败留下的那条提示，判据认得出来（开头和 role 对得上）', () => {
-    assert.match(ACP, /role: 'kirolex' as any,\s*content: `⚠️ 这条会话没连上：\$\{why\}`/);
+    // 新建失败那条现在也由 connectFailureNotice 构造 —— 构造出来的判据必须认得（两种语言都是）
+    assert.match(ACP, /mutateSessionMessages\(id, \(cur\) => \[\.\.\.cur, connectFailureNotice\(why, Date\.now\(\), uiLangNow\(\)\)\]\);/);
+    assert.equal(isConnectFailureNotice(connectFailureNotice('x', 1, 'zh')), true);
+    assert.equal(isConnectFailureNotice(connectFailureNotice('x', 1, 'en')), true);
+    // 英文界面写下的那条，判据也认得（只在界面上、不落盘，换机器时一样要摘掉）
+    assert.equal(isConnectFailureNotice({ role: 'kirolex' as any, content: "⚠️ This chat couldn't connect: x" }), true);
     assert.equal(isConnectFailureNotice({ role: 'kirolex' as any, content: '⚠️ 这条会话没连上：x' }), true);
   });
 });

@@ -185,7 +185,7 @@ test('index.ts：自愈判据算上正在 attach 的会话，重建后端口变�
   assert.match(M, /hasSessions: \(key: string\): boolean => muxSessionsOn\(key\)\.length > 0/);
   assert.match(M, /function muxSessionsOn[\s\S]{0,700}attachingSessions\.has\(sessionId\)/);
   assert.match(M, /function needsRearm[\s\S]{0,500}spec\.remotePort !== port/);
-  assert.match(M, /正在重连（第 \$\{attempt\} 次）/);
+  assert.match(M, /reconnecting \(attempt \{n\}\)[\s\S]{0,200}\{ n: attempt \}/);
   assert.match(M, /process\.on\('exit', \(\) => \{ try \{ sshMux\.closeAll\(\); \}/);
 });
 

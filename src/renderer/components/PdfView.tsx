@@ -1,6 +1,7 @@
 import React, { useEffect, useRef, useState } from 'react';
 import * as pdfjs from 'pdfjs-dist';
 import { uiGet, uiSet } from '../uiStore';
+import { useT } from '../hooks/useLang';
 // eslint-disable-next-line import/no-unresolved
 import workerUrl from 'pdfjs-dist/build/pdf.worker.min.mjs?url';
 
@@ -18,6 +19,7 @@ const PdfPage: React.FC<{
   /** CSS 宽度（不含 dpr）。变了就重画 —— canvas 是位图，拉伸会糊。 */
   width: number;
 }> = ({ doc, index, width }) => {
+  const t = useT();
   const ref = useRef<HTMLCanvasElement | null>(null);
   /** 这一页按多宽画过（宽度变了要重画；0 = 还没画） */
   const drawnAt = useRef<number>(0);
@@ -106,7 +108,7 @@ const PdfPage: React.FC<{
         style={{ width: `${width || 240}px`, height: `${Math.round((width || 240) * ratio)}px` }}
       />
       {pageWhy && (
-        <p className="rv-pdf-page-why">第 {index} 页画不出来：{pageWhy}</p>
+        <p className="rv-pdf-page-why">{t('Couldn\'t render page {index}: {why}', { index, why: pageWhy })}</p>
       )}
     </>
   );
@@ -151,6 +153,7 @@ const PdfZoom: React.FC<{
   onPage: (page: number) => void;
   onClose: () => void;
 }> = ({ doc, page, pages, note, tools, noteTools, onPage, onClose }) => {
+  const t = useT();
   const ref = useRef<HTMLCanvasElement | null>(null);
   const boxRef = useRef<HTMLDivElement | null>(null);
   /** 1 = 适应容器宽度。 */
@@ -224,24 +227,24 @@ const PdfZoom: React.FC<{
     /* 点背景关掉 —— 和别处的浮层一致；点到内容上不关（`stopPropagation`） */
     <div className="rv-zoom" onClick={onClose}>
       <div className="rv-zoom-bar" onClick={(e) => e.stopPropagation()}>
-        <button type="button" className="btn" disabled={page <= 1} onClick={() => onPage(page - 1)} title="上一页（←）">‹</button>
-        <span className="rv-zoom-at">第 {page} / {pages} 页</span>
-        <button type="button" className="btn" disabled={page >= pages} onClick={() => onPage(page + 1)} title="下一页（→）">›</button>
+        <button type="button" className="btn" disabled={page <= 1} onClick={() => onPage(page - 1)} title={t('Previous page (←)')}>‹</button>
+        <span className="rv-zoom-at">{t('Page {page} / {pages}', { page, pages })}</span>
+        <button type="button" className="btn" disabled={page >= pages} onClick={() => onPage(page + 1)} title={t('Next page (→)')}>›</button>
         <span className="rv-zoom-gap" />
-        <button type="button" className="btn" onClick={() => setZoom((z) => Math.max(0.5, z / 1.25))} title="缩小（-）">－</button>
+        <button type="button" className="btn" onClick={() => setZoom((z) => Math.max(0.5, z / 1.25))} title={t('Zoom out (-)')}>－</button>
         <span className="rv-zoom-at">{Math.round(zoom * 100)}%</span>
-        <button type="button" className="btn" onClick={() => setZoom((z) => Math.min(4, z * 1.25))} title="放大（+）">＋</button>
-        <button type="button" className="btn" onClick={() => setZoom(1)} title="适应宽度（0）">适应宽度</button>
+        <button type="button" className="btn" onClick={() => setZoom((z) => Math.min(4, z * 1.25))} title={t('Zoom in (+)')}>＋</button>
+        <button type="button" className="btn" onClick={() => setZoom(1)} title={t('Fit width (0)')}>{t('Fit width')}</button>
         {/*
           这里**不再放一个刷新** ——「我看错了，放大页面上面有刷新」：顶栏那个 `⟳ 刷新` 就在这个遮罩
           上方、够得着。同一件事两个入口只会让人猜它们有什么区别（「用系统应用打开」那次就是这样）。
           要保证的是**刷完别退回总览** —— 那件事在 `PdfView` 里（不清 `doc`、`zoomAt` 只夹不清）。
         */}
-        <button type="button" className="btn" onClick={onClose} title="关闭（Esc）">✕</button>
+        <button type="button" className="btn" onClick={onClose} title={t('Close preview (Esc)')}>✕</button>
       </div>
       {/* 放大之后要能滚着看 —— 不给滚动容器的话超出的部分根本到不了 */}
       <div className="rv-zoom-body" ref={boxRef} onClick={(e) => e.stopPropagation()}>
-        {why && <p className="rv-review-why">画不出来：{why}</p>}
+        {why && <p className="rv-review-why">{t('Couldn\'t render: {why}', { why })}</p>}
         <canvas ref={ref} className="rv-zoom-page" />
         {/*
           备注跟着一起显示 —— 放大一页通常正是为了对着它读讲稿。只显示不编辑：
@@ -348,6 +351,7 @@ export const PdfView: React.FC<{
   /** 放大时挂在**备注下面**的那一坨（版面那个走 `zoomToolsFor`，在页和备注之间）。 */
   zoomNoteToolsFor?: (page: number) => React.ReactNode;
 }> = ({ bytes, onPages, zoomKey, sideFor, overlayFor, noteFor, belowFor, zoomToolsFor, zoomNoteToolsFor }) => {
+  const t = useT();
   /**
    * 备注那一栏多宽 —— **中间那条可以左右拖** ——「中间加一个可以左右调整大小的拉拽功能」。
    *
@@ -464,7 +468,7 @@ export const PdfView: React.FC<{
       } catch (err: any) {
         if (cancelled) return;
         /* 说出是哪一步坏的 —— 空框不报错正是上一条路最难查的地方 */
-        setWhy(`渲染 PDF 失败：${String(err?.message || err).slice(0, 200)}`);
+        setWhy(t('Failed to render the PDF: {err}', { err: String(err?.message || err).slice(0, 200) }));
       }
     })();
     return () => {
@@ -513,7 +517,7 @@ export const PdfView: React.FC<{
   return (
     <div className="rv-pdf">
       {why && <p className="rv-review-why">{why}</p>}
-      {!why && !doc && <p className="rv-pdf-progress">正在解析 PDF…</p>}
+      {!why && !doc && <p className="rv-pdf-progress">{t('Parsing PDF…')}</p>}
       {/*
         **一个**滚动容器。页和它的备注在同一行里，所以永远对齐 ——
         「note 和页应该是同步的，而不能分开 scroll」。
@@ -535,7 +539,7 @@ export const PdfView: React.FC<{
               className="rv-pdf-cell"
               role="button"
               tabIndex={0}
-              title={`点开第 ${i + 1} 页看大图`}
+              title={t('Open page {n} full size', { n: i + 1 })}
               onClick={() => setZoomAt(i + 1)}
               onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setZoomAt(i + 1); } }}
             >
@@ -570,7 +574,7 @@ export const PdfView: React.FC<{
                   className="rv-pdf-grip nopan nodrag"
                   role="separator"
                   aria-orientation="vertical"
-                  title="拖动调整备注栏宽度（双击回到默认）"
+                  title={t('Drag to resize the notes column (double-click to reset)')}
                   onMouseDown={(e) => startDrag(e)}
                   onDoubleClick={() => { setSideW(null); uiSet(DECK_SIDE_W_KEY, ''); }}
                 />

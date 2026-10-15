@@ -52,6 +52,6 @@ test('接线：不再合并；读不到桶里列表就一份记忆都不传', ()
 test('项目记忆的 mark 键不会和会话 id 撞；两页都显示记忆状态', () => {
   assert.equal(projectMemoryMarkKey('Dev'), 'memory:projects/Dev');
   const UI = fs.readFileSync(new URL('../src/renderer/components/BackupDialog.tsx', import.meta.url), 'utf8');
-  assert.match(UI, /记忆 \{memSize\(p\.memory\.bytes\)\}/);
+  assert.match(UI, /\{t\('Memory \{size\}', \{ size: memSize\(p\.memory\.bytes\) \}\)\}/);
   assert.match(UI, /bucketMemory\[proj\]/);
 });

@@ -24,6 +24,7 @@ import path from 'path';
 import type { ExecutorBins, RemoteTarget } from './config';
 import { rememberBin, type BinHistoryMap, type ToolId } from './binDetect.ts';
 import { validJump } from './sshProxy.ts';
+import { tr } from './uiText.ts';
 
 export interface RemoteTargetEntry extends RemoteTarget {
   /** 稳定 id：存进会话的 profile，重启后靠它找回同一台机器。 */
@@ -156,7 +157,7 @@ export function localWorkdirSetting(configPath: string): string {
 }
 export function saveLocalWorkdir(configPath: string, dir: string): string {
   const v = String(dir || '').trim();
-  if (v && !path.isAbsolute(v) && !/^~([\/]|$)/.test(v)) throw new Error('工作目录要写绝对路径（或以 ~ 开头）。');
+  if (v && !path.isAbsolute(v) && !/^~([\/]|$)/.test(v)) throw new Error(tr('The working directory must be an absolute path (or start with ~).'));
   const cfg = readConfigObject(configPath);
   if (v && v !== DEFAULT_LOCAL_WORKDIR) cfg.localWorkdir = v; else delete cfg.localWorkdir;
   writeConfigObject(configPath, cfg);
@@ -272,21 +273,21 @@ export function newTargetId(input: RemoteTargetInput, taken: string[] = []): str
 /** 校验一条输入。返回一句给人看的错误，或者 `null` = 可以存。 */
 export function validateTarget(input: RemoteTargetInput): string | null {
   const host = String(input?.sshHost || '').trim();
-  if (!host) return 'IP 地址不能为空。';
-  if (/\s/.test(host)) return 'IP 地址里不能有空格。';
+  if (!host) return tr('The IP address cannot be empty.');
+  if (/\s/.test(host)) return tr('The IP address cannot contain spaces.');
   /* 以 `-` 开头会被 ssh 当成选项（`-oProxyCommand=…` = 在本机执行命令），见 sshProxy.ts unsafeSshHost */
-  if (host.startsWith('-')) return 'IP 地址不能以 `-` 开头。';
+  if (host.startsWith('-')) return tr('The IP address cannot start with `-`.');
   const port = input.sshPort === undefined || input.sshPort === null || (input.sshPort as any) === '' ? 22 : Number(input.sshPort);
-  if (!Number.isFinite(port) || port <= 0 || port > 65535) return '端口要是 1–65535 之间的数字。';
+  if (!Number.isFinite(port) || port <= 0 || port > 65535) return tr('The port must be a number between 1 and 65535.');
   const jump = String(input?.proxyJump || '').trim();
   /*
     白名单 —— 这个值会被拼进 `ProxyCommand`，而那串东西是交给 shell 跑的
     （见 `sshProxy.ts`）。只拦空格是不够的：`;` / `$(…)` / 反引号都能过。
   */
-  if (jump && !validJump(jump)) return '跳板地址只能是 `用户@主机` 或 `用户@主机:端口`（字母、数字、`@ . - _ :` 和 IPv6 的方括号）。';
+  if (jump && !validJump(jump)) return tr('The jump host must be `user@host` or `user@host:port` (letters, digits, `@ . - _ :` and IPv6 brackets).');
   if (input.remoteWorkdir && !String(input.remoteWorkdir).startsWith('/') && !String(input.remoteWorkdir).startsWith('~')) {
     /* 相对路径会落在登录 shell 的当前目录上 —— 那是"看起来能用，但镜像跑到了别处" */
-    return '工作目录要写绝对路径（以 `/` 或 `~` 开头）。';
+    return tr('The working directory must be an absolute path (starting with `/` or `~`).');
   }
   return null;
 }

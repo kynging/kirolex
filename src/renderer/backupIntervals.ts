@@ -6,6 +6,8 @@
  * 逻辑放在组件文件里就没法测。
  */
 
+import { t, type Lang } from './i18n.ts';
+
 /**
  * 可选的间隔（分钟）。
  *
@@ -32,8 +34,8 @@ export function intervalChoices(current?: number): number[] {
 }
 
 /** `60` → `1 小时`。到了小时级还写"60 分钟"要人自己换算。 */
-export function intervalLabel(minutes: number): string {
-  if (minutes % 1440 === 0) return `${minutes / 1440} 天`;
-  if (minutes % 60 === 0) return `${minutes / 60} 小时`;
-  return `${minutes} 分钟`;
+export function intervalLabel(minutes: number, lang: Lang = 'zh'): string {
+  if (minutes % 1440 === 0) { const n = minutes / 1440; return n === 1 ? t(lang, '1 day') : t(lang, '{n} days', { n }); }
+  if (minutes % 60 === 0) { const n = minutes / 60; return n === 1 ? t(lang, '1 hour') : t(lang, '{n} hours', { n }); }
+  return t(lang, '{n} min', { n: minutes });
 }

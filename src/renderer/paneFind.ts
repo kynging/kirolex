@@ -21,6 +21,7 @@
  * 插标签那条路是明确不能走的 —— 那些节点是 React 渲染的,手改它们下一次 render 就被覆盖或对不上,
  * 而且会切断代码块和链接（`findBar.ts` 当年就是因为这个才选了原生 API）。
  */
+import { t, type Lang } from './i18n.ts';
 
 /** 空查询不算搜索 —— 它既没有命中也不该清掉别人的高亮,一律当「还没开始」。 */
 export function shouldSearch(query: string): boolean {
@@ -83,8 +84,8 @@ export function stepIndex(active: number, total: number, direction: 'next' | 'pr
 }
 
 /** 计数标签。没查询就不显示;查了没结果要**明说**,否则和「还没开始查」分不清。 */
-export function findLabel(arg: { query: string; active: number; total: number }): string {
+export function findLabel(arg: { query: string; active: number; total: number }, lang: Lang = 'zh'): string {
   if (!shouldSearch(arg.query)) return '';
-  if (arg.total <= 0) return '无结果';
+  if (arg.total <= 0) return t(lang, 'No results');
   return `${arg.active}/${arg.total}`;
 }

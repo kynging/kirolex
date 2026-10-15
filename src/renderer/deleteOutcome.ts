@@ -20,5 +20,5 @@ export const TOMBSTONED_NOTICE_KEY = 'Chat deleted. Some files are in use and wi
 export function classifyDeleteResult(res: any, lang: Lang): DeleteOutcome {
   if (!res || res.ok !== false) return { kind: 'deleted' };
   if (res.tombstoned === true) return { kind: 'tombstoned', notice: t(lang, TOMBSTONED_NOTICE_KEY) };
-  return { kind: 'refused', error: `没有删除这个会话：${res.error || '未知原因'}` };
+  return { kind: 'refused', error: t(lang, 'Chat not deleted: {reason}', { reason: res.error || t(lang, 'unknown reason') }) };
 }

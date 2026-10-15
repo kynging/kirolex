@@ -71,7 +71,7 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
   };
 
   const handleAddText = () => {
-    const text = prompt('Enter text context:');
+    const text = prompt(t('Enter text context:'));
     if (text) {
       onAdd({
         id: `ctx_${Date.now()}`,
@@ -119,7 +119,7 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
             padding: '24px 16px',
             lineHeight: 1.6,
           }}>
-            Drag & drop files here, or click "Add" below to include context for your conversations.
+            {t('Drag & drop files here, or click "Add" below to include context for your conversations.')}
           </p>
         )}
 
@@ -132,7 +132,7 @@ export const ContextPanel: React.FC<ContextPanelProps> = ({
             <button
               className="remove-btn"
               onClick={() => onRemove(item.id)}
-              title="Remove"
+              title={t('Remove')}
             >
               ✕
             </button>

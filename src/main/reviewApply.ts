@@ -7,6 +7,8 @@
  * 渲染层的 `reviewBlocks.ts` 从这里转出这几个函数，两边永远是同一套规则。
  */
 
+import { tr, trIn, type UiLang } from './uiText.ts';
+
 /** 文件里 `from..to`（行号，闭区间，从 1 起）那一段原文 —— 空行照带。 */
 export function sliceLines(text: string | null | undefined, from: number, to: number): string {
   return String(text ?? '').split('\n').slice(from - 1, to).join('\n');
@@ -129,18 +131,18 @@ export function applyPatch(
 ): { ok: true; text: string; changes: PatchChange[] } | { ok: false; why: string } {
   const lines = String(base ?? '').split('\n');
   const n = lines.length;
-  if (!Array.isArray(edits) || !edits.length) return { ok: false, why: '没有要改的地方' };
+  if (!Array.isArray(edits) || !edits.length) return { ok: false, why: tr('Nothing to change') };
   const sorted = edits.map((e) => ({ ...e, from: Number(e.from), to: Number(e.to) })).sort((a, b) => a.from - b.from || a.to - b.to);
   for (const e of sorted) {
     if (!Number.isInteger(e.from) || !Number.isInteger(e.to) || e.from < 1 || e.to < e.from) {
-      return { ok: false, why: `第 ${e.from}-${e.to} 行这个范围不成立 —— 没写` };
+      return { ok: false, why: tr('Lines {from}-{to} are not a valid range. Nothing was written', { from: e.from, to: e.to }) };
     }
-    if (e.to > n) return { ok: false, why: `第 ${e.from}-${e.to} 行超出了文件（一共只有 ${n} 行）—— 没写` };
+    if (e.to > n) return { ok: false, why: tr('Lines {from}-{to} go past the end of the file (it only has {n} lines). Nothing was written', { from: e.from, to: e.to, n }) };
   }
   for (let i = 1; i < sorted.length; i++) {
     const a = sorted[i - 1];
     const b = sorted[i];
-    if (b.from <= a.to) return { ok: false, why: `第 ${a.from}-${a.to} 行和第 ${b.from}-${b.to} 行两处改动重叠了 —— 没写` };
+    if (b.from <= a.to) return { ok: false, why: tr('The edits at lines {aFrom}-{aTo} and {bFrom}-{bTo} overlap. Nothing was written', { aFrom: a.from, aTo: a.to, bFrom: b.from, bTo: b.to }) };
   }
   for (const e of sorted) {
     const want = normalizeForHint(e.hint || '');
@@ -150,7 +152,7 @@ export function applyPatch(
       const actual = lines.slice(e.from - 1, e.to).find((l) => l.trim()) || '';
       return {
         ok: false,
-        why: `第 ${e.from} 行对不上：它说那里是「${e.hint}」，实际是「${actual.trim().slice(0, 20)}」—— 多半数错了行，没写`,
+        why: tr('Line {line} does not match: it says "{hint}" is there, but it is actually "{actual}". It probably miscounted the lines. Nothing was written', { line: e.from, hint: String(e.hint), actual: actual.trim().slice(0, 20) }),
       };
     }
   }
@@ -214,14 +216,14 @@ export function applyRevision(apply: ReviewApply, reply: string): string | null 
  * 没写的成功结果（老主进程、或者以后谁改了主进程）一律当失败 —— 渲染层自己那次写不带 expectBase，
  * 文件在等回复期间被动过的话，拿旧 base 拼的整份会把那次改动盖掉。
  */
-export function patchReplyOutcome(res: any): { kind: 'done'; fullText: string } | { kind: 'cancelled' } | { kind: 'fail'; why: string } {
+export function patchReplyOutcome(res: any, lang: UiLang = 'zh'): { kind: 'done'; fullText: string } | { kind: 'cancelled' } | { kind: 'fail'; why: string } {
   if (res?.cancelled) return { kind: 'cancelled' };
   if (!res?.ok) {
-    return { kind: 'fail', why: res?.cannot ? `改不了：${res.cannot} —— 换个说法再试` : `改写失败：${res?.error || '没有返回'}` };
+    return { kind: 'fail', why: res?.cannot ? trIn(lang, 'Cannot change this: {reason}. Try phrasing it differently', { reason: res.cannot }) : trIn(lang, 'Rewrite failed: {error}', { error: res?.error || trIn(lang, 'no response') }) };
   }
   if (res.scope !== 'patch' || typeof res.fullText !== 'string') {
-    return { kind: 'fail', why: '主进程还是旧版本，不认跨段改写 —— 重启 KiroLex 之后再试（这次什么都没写）' };
+    return { kind: 'fail', why: trIn(lang, 'The main process is an older version that does not support cross-block rewrites. Restart KiroLex and try again (nothing was written this time)') };
   }
-  if (!res.written) return { kind: 'fail', why: '这次的结果没有写进文件 —— 刷新看一眼正文再提一次' };
+  if (!res.written) return { kind: 'fail', why: trIn(lang, 'This result was not written to the file. Refresh, check the text, and submit again') };
   return { kind: 'done', fullText: res.fullText };
 }

@@ -266,8 +266,8 @@ describe('creating and cancelling a job say nothing in the transcript', () => {
   test('the terminal note is still durable, and still main\'s job', () => {
     // `store.appendMessage`, not the renderer's screen-only mutation: it must survive a reload,
     // because it is the only record that a job ended and why.
-    assert.match(MAIN, /定时任务结束[\s\S]{0,200}|store\.appendMessage[\s\S]{0,300}定时任务结束/);
-    assert.doesNotMatch(HOOK, /定时任务结束/, 'the renderer must not duplicate main\'s note');
+    assert.match(MAIN, /store\.appendMessage[\s\S]{0,300}⏰ Scheduled task ended/);
+    assert.doesNotMatch(HOOK, /定时任务结束|Scheduled task ended/, 'the renderer must not duplicate main\'s note');
   });
 });
 

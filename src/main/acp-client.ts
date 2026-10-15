@@ -9,6 +9,7 @@ import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, resolveAdapter, type Engine } from './engines.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
+import { tr } from './uiText.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
 
 interface JsonRpcRequest {
@@ -107,8 +108,7 @@ export function remoteKiroBin(remote: RemoteTarget): string | undefined {
  */
 export function kiroBinProblem(): string | null {
   if (configuredKiroBin) return null;
-  return '还没有设置**本机**的 kiro 启动命令。打开 设置 → 🖥 机器 → 💻 本机，'
-    + '点「自动检测这台机器上的三个工具」，或者手填一个路径 —— 没有这个设置 KiroLex 不会去猜一个二进制。';
+  return tr('No kiro launch command is set for **this machine** yet. Open Settings → 🖥 Machines → 💻 This machine and click "Auto-detect the three tools on this machine", or enter a path by hand. Without this setting KiroLex won\'t guess a binary.');
 }
 
 export function kiroCliCandidates(): string[] {
@@ -306,9 +306,7 @@ export class AcpClient extends EventEmitter {
         command = 'ssh';
         const remoteBin = remoteKiroBin(this.remote) || '';
         if (!remoteBin) {
-          reject(new Error(`还没有设置 ${this.remote.sshHost} 上的 kiro 启动命令。`
-            + '打开 设置 → 🖥 机器 → 选中这台机器，点「自动检测这台机器上的三个工具」——'
-            + '没有这个设置 KiroLex 不会去猜远端的二进制（猜错的表现是"起来了但行为不对"）。'));
+          reject(new Error(tr('No kiro launch command is set for {host} yet. Open Settings → 🖥 Machines, select this machine and click "Auto-detect the three tools on this machine". Without this setting KiroLex won\'t guess the remote binary (a wrong guess shows up as "it starts, but behaves oddly").', { host: this.remote.sshHost })));
           return;
         }
         this.launchedWith = remoteBin;
@@ -338,9 +336,7 @@ export class AcpClient extends EventEmitter {
         const cliPath = resolveKiroCli();
         if (!cliPath) {
           reject(new Error(
-            `kiro-cli 找不到。试过这些：\n${kiroCliCandidates().join('\n')}\n\n`
-            + `在 设置 → 🖥 机器 → 💻 本机 里填一个路径，或者设 KIRO_CLI_PATH。`
-            + `（可以填 PATH 上的裸名字，不必是绝对路径。）`,
+            tr('kiro-cli not found. Tried these:\n{candidates}\n\nEnter a path in Settings → 🖥 Machines → 💻 This machine, or set KIRO_CLI_PATH. (A bare name on PATH works too, it doesn\'t have to be an absolute path.)', { candidates: kiroCliCandidates().join('\n') }),
           ));
           return;
         }
@@ -418,7 +414,7 @@ export class AcpClient extends EventEmitter {
           毫无用处，只会把后端那段历史白扔一次。判据在 `transientError.ts`。
         */
         this.rejectAllPending(new Error(code === 0
-          ? '执行器已退出（正常退出，code 0）—— KiroLex 会自动重连并重发这一轮。'
+          ? tr('The executor exited (clean exit, code 0). KiroLex will reconnect and resend this turn automatically.')
           : this.remote?.sshHost && isSshTransportExit(code)
             ? sshDropMessage(code, this.lastStderr)
             : `Process exited with code ${code}`));
@@ -585,7 +581,7 @@ export class AcpClient extends EventEmitter {
   /** 设一类的值。返回的 configOptions 整份记下来 —— 换模型时 effort 的可选值可能跟着变。 */
   async setSelectOption(sessionId: string, category: EngineOptionCategory, value: string): Promise<void> {
     const o = this.findOption(category);
-    if (!o) throw new Error(`这个引擎没有给出 ${category === 'model' ? '模型清单' : category === 'mode' ? '权限模式' : 'effort 选项'}`);
+    if (!o) throw new Error(category === 'model' ? tr('This engine did not provide a model list') : category === 'mode' ? tr('This engine did not provide permission modes') : tr('This engine did not provide effort options'));
     const r = await this.sendRequest('session/set_config_option', { sessionId, configId: o.id, value });
     this.noteConfigOptions(r?.configOptions);
   }
@@ -742,7 +738,7 @@ export class AcpClient extends EventEmitter {
 
   private send(msg: any) {
     if (!this.process?.stdin?.writable) {
-      throw new Error('Process not connected');
+      throw new Error(tr('Process not connected'));
     }
     const line = JSON.stringify(msg) + '\n';
     this.process.stdin.write(line);
@@ -908,8 +904,7 @@ export class AcpClient extends EventEmitter {
       */
       this.emit('error', {
         type: 'unknown-request',
-        message: `kiro-cli 发来一个 KiroLex 不认识的请求 \`${method}\`，已回空对象 {} —— `
-          + `如果它是在"问你"，那这一轮是按一个没人给过的答案继续跑的。请把这条报给 KiroLex。`,
+        message: tr('kiro-cli sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.', { method }),
         method,
         params,
       });

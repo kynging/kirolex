@@ -205,7 +205,8 @@ describe('接线：检测两台机器共用一段脚本；成功启动才记历�
   });
 
   test('界面：一个「自动检测」按钮，候选点一下就填进去；每行**没有**「测试」按钮', () => {
-    assert.match(R, /自动检测这台机器上的三个工具/);
+    assert.match(R, /t\('Auto-detect the three tools on this machine'\)/);
+    assert.match(fs.readFileSync(path.join(process.cwd(), 'src/renderer/i18nZh/settingsPanels.ts'), 'utf8'), /'Auto-detect the three tools on this machine': '自动检测这台机器上的三个工具'/);
     assert.match(R, /binsDetect\?\.\(machine\)/);
     /* 「启动命令右侧就不要那几个测试按钮了吧」 */
     assert.doesNotMatch(R, /binsTest\?\./);
@@ -267,10 +268,12 @@ describe('设置分页 + 文案', () => {
     /* 判据是**渲染出来的那个 label**，不是源文件里有没有这几个字 ——
        注释里提到旧名字是正常的（说清为什么改了） */
     assert.equal(/settings-label">远端机器/.test(R), false);
-    assert.match(R, /<label className="settings-label">机器与启动命令<\/label>/);
+    assert.match(R, /<label className="settings-label">\{t\('Machines & launch commands'\)\}<\/label>/);
+    assert.match(fs.readFileSync(path.join(process.cwd(), 'src/renderer/i18nZh/settingsPanels.ts'), 'utf8'), /'Machines & launch commands': '机器与启动命令'/);
     /* 镜像已经没有了，那句"每一轮前后自动同步镜像"不能还挂在界面上 */
     assert.equal(/每一轮前后自动同步镜像/.test(R), false);
-    assert.match(R, /文件不会被复制过去/);
+    assert.match(R, /<b>\{t\('Files are not copied over'\)\}<\/b>/);
+    assert.match(fs.readFileSync(path.join(process.cwd(), 'src/renderer/i18nZh/settingsPanels.ts'), 'utf8'), /'Files are not copied over': '文件不会被复制过去'/);
   });
 
   test('**不显示"默认：xxx"，也不放示例 placeholder** —— 空着就是空着', () => {
@@ -345,7 +348,7 @@ describe('没配启动命令就不许起连接', () => {
     /* 远端：那台机器没配也不起，而且错误里要带上是哪台机器 */
     /* 启动命令按 sshHost 现查配置（见下面那一组）—— 记录里那份快照只是兜底 */
     assert.match(A, /const remoteBin = remoteKiroBin\(this\.remote\) \|\| '';/);
-    assert.match(A, /还没有设置 \$\{this\.remote\.sshHost\} 上的 kiro 启动命令/);
+    assert.match(A, /tr\('No kiro launch command is set for \{host\} yet\..*', \{ host: this\.remote\.sshHost \}\)/);
     /* 不许再有 `|| 'kiro-cli'` 这种兜底 */
     assert.equal(/bins\?\.kiro \|\| 'kiro-cli'/.test(A), false);
   });

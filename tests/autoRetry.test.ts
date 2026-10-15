@@ -24,7 +24,7 @@ describe('重试次数：默认 10，设置里可调，0 = 不重发', () => {
     assert.match(HK, /maxAttempts: autoRetryMax\(\),/);
     assert.match(HK, /resendDisabled: resendDisabled \|\| autoRetryMax\(\) === 0,/);
     assert.match(APP, /autoRetryMax: 10,/);
-    assert.match(SD, /自动重试次数（非人为中断）/);
+    assert.match(SD, /t\('Auto-retry attempts \(interruptions you didn’t cause\)'\)/);
   });
 
   test('预算用完就停（第 10 次之后不再发）', () => {
@@ -110,6 +110,6 @@ describe('Claude Code 的工具调用：标题在后面的 tool_call_update 里'
     assert.ok(body.includes("if (typeof update.title === 'string' && update.title.trim()) existing.title = update.title;"));
     assert.ok(body.includes('if (update.status) existing.status = update.status;'));
     assert.ok(!body.includes('            existing.status = update.status;\n            if (update.kind)'), '不再无条件覆盖 status');
-    assert.ok(body.includes("?? (update.toolCallId ? { toolCallId: update.toolCallId, title: update.title || 'Tool call'"));
+    assert.ok(body.includes("?? (update.toolCallId ? { toolCallId: update.toolCallId, title: update.title || t('Tool call')"));
   });
 });

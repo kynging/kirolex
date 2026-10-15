@@ -128,7 +128,7 @@ describe('接线：文字先改、版面后动', () => {
   });
 
   test('文字成了、版面没成 = **不算全败**，要说清哪一半没成', () => {
-    assert.match(MAIN, /partial: `版面那几条没做成：\$\{wroteOps\.error\}`/);
+    assert.match(MAIN, /partial: tr\('The layout changes did not go through: \{err\}', \{ err: String\(wroteOps\.error\) \}\)/);
   });
 
   test('版面这条路同样有那三道闸（主人会话读过 / 只认 pptx / 写前备份）', () => {

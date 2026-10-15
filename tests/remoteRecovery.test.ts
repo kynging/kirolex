@@ -113,7 +113,7 @@ test('master 和会话连接全断、第一次恢复失败、之后网络恢复 
   assert.deepEqual([...attached].sort(), ['A', 'B']);
   assert.ok(portOf.get('A')! > 40001, '接回来用的是这次新分到的端口');
   assert.equal(portOf.get('A'), mux.remotePortFor(key));
-  assert.ok(notices.some((n) => n.sid === 'A' && n.text === RECOVERED_TEXT && !n.sticky), '接上后那句"正在重连"被顶掉');
+  assert.ok(notices.some((n) => n.sid === 'A' && n.text === RECOVERED_TEXT() && !n.sticky), '接上后那句"正在重连"被顶掉');
   assert.equal(recovery.keys().length, 0);
   mux.closeAll();
 });
@@ -143,7 +143,7 @@ test('没有复用连接（Windows）：会话自己的 ssh 断了，按退避�
   await until(() => recovered.length === 1);
   assert.ok(attached.has('W'));
   assert.equal(notices[0], RECONNECTING_TEXT(1));
-  assert.equal(notices.at(-1), RECOVERED_TEXT);
+  assert.equal(notices.at(-1), RECOVERED_TEXT());
 });
 
 test('用户归档 / 删除 / 切回本地之后就停（每次动手前按记录再判一次）', async () => {

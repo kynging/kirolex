@@ -66,7 +66,7 @@ export function backoffMs(attempt: number): number {
  */
 export function worthRetrying(message: string): boolean {
   const m = String(message || '');
-  if (/Permission denied|publickey|HOST KEY|Host key verification|没装|没有登录|没登录|还没有设置/.test(m)) return false;
+  if (/Permission denied|publickey|HOST KEY|Host key verification|没装|没有登录|没登录|还没有设置|is not installed|[Nn]ot logged in|No kiro launch command/.test(m)) return false;
   return /banner exchange|Connection timed out|timed out|Connection refused|Connection closed|reset by peer|Temporary failure|Could not resolve/.test(m);
 }
 

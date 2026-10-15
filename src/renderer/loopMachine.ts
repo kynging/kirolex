@@ -30,6 +30,8 @@
  * separate handle object so `LoopRun` itself stays JSON-serializable.
  */
 
+import { t, type Lang } from './i18n.ts';
+
 /** Verification strength, following the usual ladder. Only 0 and 1–3 are
  *  implemented; 4 (model-as-judge) and 5 (human checkpoint) are named so the level
  *  a loop claims cannot silently mean something else later. */
@@ -307,33 +309,33 @@ export function canReachSuccess(spec: LoopSpec): boolean {
 
 /** Complaints about a spec, in the user's language, empty when it is usable.
  *  Enforced at the UI boundary so an unusable loop cannot be started at all. */
-export function validateSpec(spec: LoopSpec): string[] {
+export function validateSpec(spec: LoopSpec, lang: Lang = 'zh'): string[] {
   const errors: string[] = [];
-  if (!spec.prompt.trim()) errors.push('循环内容为空');
+  if (!spec.prompt.trim()) errors.push(t(lang, 'The loop prompt is empty'));
   if (!Number.isFinite(spec.stop.maxIterations) || spec.stop.maxIterations < 1) {
     // No default is supplied on purpose. A default round cap at level 0 would be a
     // number of unattended billable turns chosen by the program rather than by the
     // person paying for them.
-    errors.push('必须填写轮数上限（≥ 1）');
+    errors.push(t(lang, 'A round limit is required (≥ 1)'));
   }
   if (spec.verifier.level > 0 && spec.verifier.kind === 'command') {
-    if (!spec.verifier.command.trim()) errors.push('校验命令为空');
+    if (!spec.verifier.command.trim()) errors.push(t(lang, 'The check command is empty'));
     if (!Number.isFinite(spec.verifier.timeoutSec) || spec.verifier.timeoutSec < 1) {
-      errors.push('校验超时必须 ≥ 1 秒');
+      errors.push(t(lang, 'The check timeout must be ≥ 1 second'));
     }
   }
-  if (spec.stop.successStreak < 1) errors.push('连续通过轮数必须 ≥ 1');
+  if (spec.stop.successStreak < 1) errors.push(t(lang, 'Consecutive passing rounds must be ≥ 1'));
   // Only worth saying once the cap itself is usable, or a missing cap reports twice.
   if (spec.stop.maxIterations >= 1 && spec.stop.successStreak > spec.stop.maxIterations) {
     // Otherwise the loop cannot succeed by construction and only its round cap can
     // end it -- an unreachable goal presented as a verified one.
-    errors.push('连续通过轮数不能大于轮数上限');
+    errors.push(t(lang, 'Consecutive passing rounds cannot exceed the round limit'));
   }
   if (spec.verifier.level === 0 && spec.stop.successStreak > 1) {
-    errors.push('L0 没有校验，连续通过轮数只能是 1');
+    errors.push(t(lang, 'L0 has no check, so consecutive passing rounds must be 1'));
   }
-  if (spec.stop.maxNoProgressRounds < 0) errors.push('停滞阈值不能为负');
-  if (spec.stop.maxUnrunnableRounds < 1) errors.push('校验器容错轮数必须 ≥ 1');
+  if (spec.stop.maxNoProgressRounds < 0) errors.push(t(lang, 'The stall threshold cannot be negative'));
+  if (spec.stop.maxUnrunnableRounds < 1) errors.push(t(lang, 'Rounds tolerated for an unrunnable check must be ≥ 1'));
   return errors;
 }
 
@@ -529,32 +531,34 @@ export function endWith(run: LoopRun, terminal: LoopTerminal): LoopRun {
 /** Names WHAT the level claims, not just its number: the badge sits next to the
  *  picker, and "L3 命令校验" would leave the badge saying less than the choice does. */
 const LEVEL_TEXT: Record<VerificationLevel, string> = {
-  0: 'L0 无校验',
-  1: 'L1 确定性断言',
-  2: 'L2 规则检查',
-  3: 'L3 延迟真值',
-  4: 'L4 模型评判',
-  5: 'L5 人工检查点',
+  // English keys; translated at use by `levelLabel` (every value is in the dictionary).
+  0: 'L0 No check',
+  1: 'L1 Deterministic assertion',
+  2: 'L2 Rule check',
+  3: 'L3 Delayed ground truth',
+  4: 'L4 Model judgement',
+  5: 'L5 Human checkpoint',
 };
 
-export function levelLabel(level: VerificationLevel): string {
-  return LEVEL_TEXT[level] || `L${level}`;
+export function levelLabel(level: VerificationLevel, lang: Lang = 'zh'): string {
+  return LEVEL_TEXT[level] ? t(lang, LEVEL_TEXT[level]) : `L${level}`;
 }
 
 const TERMINAL_TEXT: Record<LoopTerminal, string> = {
-  'success': '目标达成',
-  'no-op': '首轮校验即通过，本来无需改动',
-  'blocked': '无法继续（发送失败或校验器无法执行）',
-  'stalled': '连续多轮无进展',
-  'exhausted': '预算用尽（轮数或时长上限）',
-  'aborted': '用户手动停止',
-  'superseded': '被新启动的循环替换',
-  'torn-down': '连接或应用被拆除',
-  'discarded': '会话已删除',
+  // English keys; translated at use by `terminalLabel` (every value is in the dictionary).
+  'success': 'Goal reached',
+  'no-op': 'The first check already passed; no change was needed',
+  'blocked': 'Cannot continue (send failed or the check could not run)',
+  'stalled': 'No progress for several rounds in a row',
+  'exhausted': 'Budget used up (round or time limit)',
+  'aborted': 'Stopped by the user',
+  'superseded': 'Replaced by a newly started loop',
+  'torn-down': 'Connection or app was torn down',
+  'discarded': 'Chat deleted',
 };
 
-export function terminalLabel(terminal: LoopTerminal): string {
-  return TERMINAL_TEXT[terminal];
+export function terminalLabel(terminal: LoopTerminal, lang: Lang = 'zh'): string {
+  return t(lang, TERMINAL_TEXT[terminal]);
 }
 
 /** True when this ending is worth writing into the chat. Only a deleted chat is
@@ -567,24 +571,26 @@ export function shouldReportTerminal(terminal: LoopTerminal): boolean {
  *  transcript. This is the artifact whose absence made "the loop stopped" and "the
  *  loop succeeded" look identical, so it always states the level: a run that ended
  *  with nothing checking it must not read like a result. */
-export function terminalSummary(run: LoopRun, terminal: LoopTerminal, now: number): string {
+export function terminalSummary(run: LoopRun, terminal: LoopTerminal, now: number, lang: Lang = 'zh'): string {
   const secs = Math.max(0, Math.round((now - run.startedAt) / 1000));
-  const dur = secs < 60 ? `${secs} 秒` : `${Math.floor(secs / 60)} 分 ${secs % 60} 秒`;
+  const dur = secs < 60
+    ? t(lang, '{s}s', { s: secs })
+    : t(lang, '{m}m {s}s', { m: Math.floor(secs / 60), s: secs % 60 });
   const facts = [
-    `第 ${run.iteration}/${run.spec.stop.maxIterations} 轮`,
+    t(lang, 'Round {i}/{max}', { i: run.iteration, max: run.spec.stop.maxIterations }),
     dur,
-    levelLabel(run.spec.verifier.level),
+    levelLabel(run.spec.verifier.level, lang),
   ];
   if (run.lastVerdict && !run.lastVerdict.noEvidence) {
     facts.push(run.lastVerdict.unrunnable
-      ? '最后一次校验：无法执行'
-      : `最后一次校验：exit=${run.lastVerdict.exitCode ?? '?'}`);
+      ? t(lang, 'Last check: could not run')
+      : t(lang, 'Last check: exit={code}', { code: run.lastVerdict.exitCode ?? '?' }));
   }
   if (run.unrunnableRounds > 0) {
-    facts.push(`连续 ${run.unrunnableRounds} 轮校验无法执行`);
+    facts.push(t(lang, 'Check could not run for {n} rounds in a row', { n: run.unrunnableRounds }));
   }
   if (run.spec.verifier.level === 0) {
-    facts.push('没有任何校验运行过，因此无法判定目标是否达成');
+    facts.push(t(lang, 'No check ever ran, so there is no way to tell whether the goal was reached'));
   }
-  return `🔁 循环结束：${terminalLabel(terminal)}\n${facts.join(' · ')}`;
+  return `${t(lang, '🔁 Loop finished: {reason}', { reason: terminalLabel(terminal, lang) })}\n${facts.join(' · ')}`;
 }

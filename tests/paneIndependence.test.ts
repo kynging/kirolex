@@ -103,7 +103,8 @@ describe('clicking another pane must not re-render the transcripts', () => {
   test('the group list stays identity-stable while messages do', () => {
     // If these recomputed on every render the items would re-render regardless of the
     // callbacks, because `base`/`steers`/`segments` would be new objects each time.
-    assert.match(chatArea, /const orderedMessages = useMemo<Message\[\]>\([\s\S]*?\}, \[messages\]\);/);
+    // 依赖里多了界面语言：KiroLex 提示按语言挑一版显示（variants，见 variantView），语言不变时照样不重算
+    assert.match(chatArea, /const orderedMessages = useMemo<Message\[\]>\([\s\S]*?\}, \[messages, findLang\]\);/);
     assert.match(chatArea, /const renderGroups = useMemo<RenderGroup\[\]>\([\s\S]*?\}, \[orderedMessages\]\);/);
   });
 

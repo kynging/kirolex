@@ -15,6 +15,7 @@
 
 import https from 'https';
 import { signRequest } from './awsSigV4.ts';
+import { tr } from './uiText.ts';
 
 export interface S3Creds {
   accessKeyId: string;
@@ -46,20 +47,21 @@ export function parseS3ErrorCode(xml: string): string {
 /** 那几类失败各自该往哪儿看。**不泛化**：一句"上传失败"等于让人逐个猜。 */
 export function hintFor(status: number, code: string, xml = ''): string {
   if (code === 'SignatureDoesNotMatch') {
-    return '签名不匹配 —— 这通常**不是** AKSK 写错（那会是 AccessDenied/InvalidAccessKeyId），'
-      + '而是本机时钟偏差超过 15 分钟，或者 region 和 bucket 实际所在区不一致。';
+    return tr("Signature mismatch. This is usually **not** a wrong AKSK (that would be AccessDenied/InvalidAccessKeyId); more likely this computer's clock is off by more than 15 minutes, or the region doesn't match where the bucket actually lives.");
   }
-  if (code === 'InvalidAccessKeyId') return 'Access Key ID 不存在 —— 检查有没有多余的空格或换行。';
+  if (code === 'InvalidAccessKeyId') return tr('Access Key ID not found. Check for stray spaces or line breaks.');
   if (code === 'AccessDenied') {
-    return '凭证有效但没权限 —— 这个 key 需要对该 bucket 的 `s3:PutObject` / `s3:GetObject` / `s3:ListBucket`。';
+    return tr('The credentials are valid but lack permission. This key needs `s3:PutObject` / `s3:GetObject` / `s3:ListBucket` on this bucket.');
   }
-  if (code === 'NoSuchBucket') return 'bucket 不存在 —— 名字写错，或者它在另一个账号里。';
+  if (code === 'NoSuchBucket') return tr('Bucket not found. The name is wrong, or it belongs to another account.');
   if (code === 'PermanentRedirect' || status === 301) {
     const real = (xml.match(/<Region>([^<]+)<\/Region>/) || [])[1];
-    return `bucket 不在这个 region${real ? ` —— S3 说它在 \`${real}\`` : ''}。`;
+    return real
+      ? tr('The bucket is not in this region. S3 says it is in `{region}`.', { region: real })
+      : tr('The bucket is not in this region.');
   }
-  if (code === 'RequestTimeTooSkewed') return '本机时钟和 AWS 差太多（>15 分钟）—— 对一下系统时间。';
-  if (status === 404) return '对象或 bucket 不存在。';
+  if (code === 'RequestTimeTooSkewed') return tr("This computer's clock is too far off from AWS (>15 minutes). Check the system time.");
+  if (status === 404) return tr('The object or bucket does not exist.');
   return '';
 }
 
@@ -96,18 +98,14 @@ export function s3Suffix(region?: string): string {
  */
 export function dnsHint(creds: S3Creds, host: string): string {
   const parts = [
-    `解析不出这个域名，所以还没到 AWS 就断了 —— 一般不是网络问题，是下面三个之一：`,
-    `· bucket 名拼错了（现在是 \`${creds.bucket || '(空)'}\`）；`,
-    `· region 写错了（现在是 \`${creds.region || '(空)'}\`）；`,
+    tr('This domain name could not be resolved, so the request never reached AWS. It is usually not a network problem but one of these three:'),
+    tr('· The bucket name is misspelled (currently `{bucket}`);', { bucket: creds.bucket || tr('(empty)') }),
+    tr('· The region is wrong (currently `{region}`);', { region: creds.region || tr('(empty)') }),
   ];
   if (isChinaRegion(creds.region)) {
-    parts.push(`· 中国区（\`aws-cn\` 分区）的域名后缀是 \`.amazonaws.com.cn\` —— `
-      + `KiroLex 已经按这个拼了（\`${host}\`），如果你在「Key 前缀」旁边那个 endpoint 里`
-      + `手填过地址，检查一下它是不是漏了 \`.cn\`。`);
+    parts.push(tr('· China regions (the `aws-cn` partition) use the domain suffix `.amazonaws.com.cn`. KiroLex already builds it that way (`{host}`); if you typed an address into the endpoint field next to "Key prefix", check that it is not missing `.cn`.', { host }));
   } else {
-    parts.push(`· 如果这个桶在**中国区**（北京 \`cn-north-1\` / 宁夏 \`cn-northwest-1\`），`
-      + `region 必须填成那两个之一 —— 中国区是独立分区，域名后缀是 \`.amazonaws.com.cn\`，`
-      + `填成海外的区就会拼出一个不存在的域名。`);
+    parts.push(tr('· If this bucket is in a **China region** (Beijing `cn-north-1` / Ningxia `cn-northwest-1`), the region must be one of those two. China is a separate partition with the domain suffix `.amazonaws.com.cn`; a non-China region produces a domain that does not exist.'));
   }
   return parts.join('\n');
 }
@@ -148,7 +146,7 @@ function request(
       res.on('data', (c) => chunks.push(c));
       res.on('end', () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks), headers: res.headers }));
     });
-    req.on('timeout', () => { req.destroy(new Error(`S3 请求超过 ${timeoutMs / 1000}s 没响应`)); });
+    req.on('timeout', () => { req.destroy(new Error(tr('S3 request got no response within {sec}s', { sec: timeoutMs / 1000 }))); });
     /*
       **DNS 失败要说清它不是"网络坏了"** —— 实测用户拿到的是
       `getaddrinfo ENOTFOUND kyn-files.s3.cn-northwest-1.amazonaws.com`，
@@ -157,7 +155,7 @@ function request(
     */
     req.on('error', (err: any) => {
       if (err?.code === 'ENOTFOUND' || err?.code === 'EAI_AGAIN') {
-        reject(new S3Error(0, err.code, `连不上 ${host}（${err.code}）`, dnsHint(creds, host)));
+        reject(new S3Error(0, err.code, tr('Cannot reach {host} ({code})', { host, code: err.code }), dnsHint(creds, host)));
         return;
       }
       reject(err);
@@ -171,15 +169,15 @@ function check(r: RawResult, what: string): RawResult {
   if (r.status >= 200 && r.status < 300) return r;
   const xml = r.body.toString('utf-8');
   const code = parseS3ErrorCode(xml) || `HTTP_${r.status}`;
-  throw new S3Error(r.status, code, `${what} 失败（${r.status} ${code}）`, hintFor(r.status, code, xml));
+  throw new S3Error(r.status, code, tr('{what} failed ({status} {code})', { what, status: r.status, code }), hintFor(r.status, code, xml));
 }
 
 export async function putObject(creds: S3Creds, key: string, body: Buffer, contentType = 'application/octet-stream'): Promise<void> {
-  check(await request(creds, 'PUT', `/${key}`, {}, body, { 'content-type': contentType }), `上传 ${key}`);
+  check(await request(creds, 'PUT', `/${key}`, {}, body, { 'content-type': contentType }), tr('Upload {key}', { key }));
 }
 
 export async function getObject(creds: S3Creds, key: string): Promise<Buffer> {
-  return check(await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0)), `下载 ${key}`).body;
+  return check(await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0)), tr('Download {key}', { key })).body;
 }
 
 /**
@@ -189,14 +187,14 @@ export async function getObject(creds: S3Creds, key: string): Promise<Buffer> {
  * 这正是幂等清理想要的语义（重复调用不会变成错误）。
  */
 export async function deleteObject(creds: S3Creds, key: string): Promise<void> {
-  check(await request(creds, 'DELETE', `/${key}`, {}, Buffer.alloc(0)), `删除 ${key}`);
+  check(await request(creds, 'DELETE', `/${key}`, {}, Buffer.alloc(0)), tr('Delete {key}', { key }));
 }
 
 /** 对象不存在时返回 `null`（而不是抛）—— "还没有"是正常状态，不是错误。 */
 export async function getObjectIfExists(creds: S3Creds, key: string): Promise<Buffer | null> {
   const r = await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0));
   if (r.status === 404) return null;
-  return check(r, `下载 ${key}`).body;
+  return check(r, tr('Download {key}', { key })).body;
 }
 
 export interface S3Entry { key: string; size: number; lastModified: string }
@@ -208,7 +206,7 @@ export async function listObjects(creds: S3Creds, prefix: string): Promise<S3Ent
   do {
     const query: Record<string, string> = { 'list-type': '2', prefix };
     if (token) query['continuation-token'] = token;
-    const xml = check(await request(creds, 'GET', '/', query, Buffer.alloc(0)), `列 ${prefix}`).body.toString('utf-8');
+    const xml = check(await request(creds, 'GET', '/', query, Buffer.alloc(0)), tr('List {prefix}', { prefix })).body.toString('utf-8');
     for (const m of xml.matchAll(/<Contents>([\s\S]*?)<\/Contents>/g)) {
       const block = m[1];
       const key = (block.match(/<Key>([^<]*)<\/Key>/) || [])[1];

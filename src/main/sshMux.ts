@@ -53,6 +53,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, sshEnv } from './sshAuth.ts';
+import { tr } from './uiText.ts';
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -496,7 +497,7 @@ export class SshMux {
     if (cancelled) {
       try { proc.kill(); } catch { /* 已经没了 */ }
       clearStaleSocket(socket);
-      throw new Error(`${key} 的复用连接在建立过程中被关掉了`);
+      throw new Error(tr('The shared connection to {host} was closed while it was being set up', { host: key }));
     }
     if (!ok || exited) {
       try { proc.kill(); } catch { /* 已经没了 */ }
@@ -505,7 +506,7 @@ export class SshMux {
         没有任何东西再试（当时网络还在抖），于是会话永久没有工具。
       */
       this.scheduleHeal(key);
-      throw new Error(`${key} 的复用连接没建起来。${entry.stderr.trim() || '（ssh 没有输出）'}`);
+      throw new Error(tr('The shared connection to {host} could not be set up. {detail}', { host: key, detail: entry.stderr.trim() || tr('(ssh printed nothing)') }));
     }
     readyAt = Date.now();
     this.entries.set(key, entry);

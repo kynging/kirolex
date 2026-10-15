@@ -2,6 +2,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
+import { t } from '../src/renderer/i18n.ts';
 
 /**
  * The wedge watchdog has exactly TWO inputs, both deterministic and both user-tunable.
@@ -96,18 +97,23 @@ describe('the wedge watchdog does not consult the CPU', () => {
     // Carried all the way to the notice, not dropped in the hook or the props.
     assert.match(preload, /boundBy\?: 'tool' \| 'quiet'; boundSeconds\?: number/);
     assert.match(hook, /boundBy: data\.boundBy === 'tool' \? 'tool' : 'quiet'/);
-    assert.match(chat, /工具无进度多久判定卡死 \$\{dur\(stall\.boundSeconds\)\}/);
-    assert.match(chat, /按「\$\{bound\}」/);
+    assert.match(chat, /t\('Tool stall threshold \{d\}', \{ d: dur\(stall\.boundSeconds\) \}\)/);
+    assert.match(chat, /\(per "\{bound\}"\)/);
   });
 
   test('the two settings are named as one rule, and nothing still uses the old names', () => {
     const settings = fs.readFileSync(
       path.join(ROOT, 'src', 'renderer', 'components', 'SettingsDialog.tsx'), 'utf8');
-    assert.ok(settings.includes('静默多久判定卡死'), 'the silence bound must say what it decides');
-    assert.ok(settings.includes('工具无进度多久判定卡死'));
+    // The labels are i18n keys now (English source text; the Chinese names live in the dictionary).
+    const SILENCE = "t('Treat a turn as stuck after silence for (seconds, 0 = never interrupt)')";
+    const STALL = "t('Treat a tool as stuck after no progress for (seconds)')";
+    assert.ok(settings.includes(SILENCE), 'the silence bound must say what it decides');
+    assert.ok(settings.includes(STALL));
+    assert.equal(t('zh', 'Treat a turn as stuck after silence for (seconds, 0 = never interrupt)'), '静默多久判定卡死（秒，0 = 不中断）');
+    assert.equal(t('zh', 'Treat a tool as stuck after no progress for (seconds)'), '工具无进度多久判定卡死（秒）');
     // Each tooltip states BOTH bounds: read alone, either one reads as "the" timeout.
-    const wedgeTip = settings.slice(settings.indexOf('静默多久判定卡死'), settings.indexOf('工具无进度多久判定卡死'));
-    assert.match(wedgeTip, /两个条件同时成立/);
+    const wedgeTip = settings.slice(settings.indexOf(SILENCE), settings.indexOf(STALL));
+    assert.match(wedgeTip, /both conditions hold/);
     // 「无响应中断阈值」/「工具无进度上限」 were the old labels; a leftover reference would
     // point at a setting that no longer exists by that name.
     for (const src of [settings, main, chat]) {

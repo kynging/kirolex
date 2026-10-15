@@ -27,7 +27,7 @@ describe('休眠的会话也能改 model / agent / 权限', () => {
     assert.match(body, /store\.writeRecord\(rec\);/);
     assert.match(body, /return \{ ok: true, dormant: true \};/);
     /* 没有记录才是真错误 —— attach 那边同样拒绝重建（"ATTACH MUST NOT CREATE"） */
-    assert.match(body, /if \(!rec\) throw new Error\('该会话在磁盘上不存在（可能已被删除）。'\);/);
+    assert.match(body, /if \(!rec\) throw new Error\(tr\('This session does not exist on disk \(it may have been deleted\)\.'\)\);/);
     /* 不碰 executorState：休眠就是休眠，写成 attached 会让界面说谎 */
     assert.doesNotMatch(body, /executorState/);
   });
@@ -56,7 +56,7 @@ describe('休眠的会话也能改 model / agent / 权限', () => {
     const fn = MAIN.slice(MAIN.indexOf('const setDormantProfile = ('));
     const body = fn.slice(0, fn.indexOf('return { ok: true, dormant: true };'));
     assert.match(body, /onlyKiro/);
-    assert.match(MAIN, /setDormantProfile\(sessionId, \{ kiroAgent: normalizedAgent \}, `[^`]*`, 'kiro agent 只对 Kiro 会话有用。'\)/);
+    assert.match(MAIN, /setDormantProfile\(sessionId, \{ kiroAgent: normalizedAgent \}, `[^`]*`, tr\('A kiro agent only applies to Kiro sessions\.'\)\)/);
   });
 
   test('**休眠成功不算 attached** —— 标了那个绿点就在说谎', () => {

@@ -17,6 +17,7 @@
  *
  * 所以只挑**你能采取行动**的：MCP 起不来 / 认证过期 / 工具不可用 / 明确的 error。其余进日志。
  */
+import { tr } from './uiText.ts';
 
 export type NoticeLevel = 'error' | 'warn';
 
@@ -106,9 +107,9 @@ export function noticesFromStderr(chunk: string): StderrNotice[] {
 /** 界面上那句话的前缀 —— 说清这是**后端**报的，不是 KiroLex 自己出错。 */
 export function noticeLabel(kind: StderrNotice['kind']): string {
   switch (kind) {
-    case 'mcp': return 'MCP 服务器有问题';
-    case 'auth': return '后端认证有问题';
-    case 'tool': return '工具调用有问题';
-    default: return '后端报错';
+    case 'mcp': return tr('MCP server problem');
+    case 'auth': return tr('Backend authentication problem');
+    case 'tool': return tr('Tool call problem');
+    default: return tr('Backend error');
   }
 }

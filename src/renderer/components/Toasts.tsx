@@ -6,6 +6,7 @@
  * 这里是一个角落里的条，过一会儿自己消失，点一下也能关。
  */
 import React, { useEffect, useState } from 'react';
+import { useT } from '../hooks/useLang';
 
 interface Toast { id: number; text: string }
 const EVENT = 'kirolex:toast';
@@ -19,6 +20,7 @@ const LIFETIME_MS = 12_000;
 
 export const Toasts: React.FC = () => {
   const [items, setItems] = useState<Toast[]>([]);
+  const tr = useT();
   useEffect(() => {
     const on = (e: Event): void => {
       const t = (e as CustomEvent<Toast>).detail;
@@ -33,7 +35,7 @@ export const Toasts: React.FC = () => {
   return (
     <div className="kx-toasts" role="status">
       {items.map((t) => (
-        <div key={t.id} className="kx-toast" onClick={() => setItems((prev) => prev.filter((x) => x.id !== t.id))} title="点一下关掉">
+        <div key={t.id} className="kx-toast" onClick={() => setItems((prev) => prev.filter((x) => x.id !== t.id))} title={tr('Click to dismiss')}>
           {t.text}
         </div>
       ))}

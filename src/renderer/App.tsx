@@ -3,9 +3,9 @@ import { baseName } from './pathBits.ts';
 import { type SubagentRow } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
 import { restoreGet, restoreSet, restoreGetJson } from './uiRestore';
-import { normalizeLang, type Lang } from './i18n';
+import { displayTitle, normalizeLang, t as translate, type Lang } from './i18n';
 import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT } from './uiZoom';
-import { LangProvider, useT } from './hooks/useLang';
+import { LangProvider } from './hooks/useLang';
 import { useRemoteTargets } from './hooks/useRemoteTargets';
 import { activeSplitSizes, computePaneFlex, putSplitSizes, resetSplitSizes, SplitSizeStore } from './splitLayout';
 import { autoFoldPanels, filePanelMax } from './panelFit';
@@ -68,7 +68,7 @@ declare global {
       onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => () => void;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
-      persistNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
+      persistNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
       readEvents?: (sessionId: string, limit?: number) => Promise<{ events: any[]; path: string; truncated: boolean }>;
       loopRegisterVerifier?: (sessionId: string, command: string, timeoutSec: number) => Promise<{ ok: boolean; registered?: boolean; error?: string }>;
       loopVerify?: (sessionId: string, command: string, timeoutSec: number) => Promise<{
@@ -330,7 +330,7 @@ declare global {
       deckWriteSlideText?: (sessionId: string | null | undefined, filePath: string, page: number, edits: Array<{ at: string; text: string }>)
         => Promise<{ ok: boolean; changed?: number; error?: string }>;
       /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）—— 改写落盘之后报一句。 */
-      sessionNote?: (sessionId: string, text: string) => Promise<{ ok: boolean; error?: string }>;
+      sessionNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
       /** Watch exactly these files for on-disk edits, replacing the previous set. */
       workspaceWatchFiles?: (sessionId: string | null | undefined, paths: string[]) => Promise<{ ok: boolean; watching: number; dirs: number }>;
       onWorkspaceFileChanged?: (callback: (data: { path: string; exists: boolean; mtimeMs: number }) => void) => () => void;
@@ -349,7 +349,7 @@ declare global {
       onError: (callback: (error: any) => void) => () => void;
       onNotice?: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => () => void;
       onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string }) => void) => () => void;
-      onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string }) => void) => () => void;
+      onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
       onSessionModel: (callback: (data: { sessionId: string; model: string }) => void) => () => void;
@@ -383,6 +383,8 @@ export interface Message {
   pastes?: { seq: number; lines: number; chars: number; path: string }[];
   /** KiroLex 自己对你说的话（主进程 noteInSession 落盘时带的标记），不是你的提问 —— 见 `main/kirolexNote`。 */
   kirolex?: true;
+  /** 这句 KiroLex 提示的中英两版 —— 显示时按界面语言挑（`pickVariant`）；没有就显示 `content`。 */
+  variants?: { zh: string; en: string };
 }
 
 export interface ToolCall {
@@ -759,7 +761,6 @@ const isMac =
 const isWinFrame = typeof navigator !== 'undefined' && !isMac;
 
 const App: React.FC = () => {
-  const t = useT();
   /*
     **标题条：最大化时自动隐藏** ——「能让上面这个程序框自动隐藏吗」。窗口是无边框的（主进程 frame: false），
     最大化 / 全屏时标题条收起、不占高度；鼠标碰到屏幕顶边（那条 4px 的感应带）它滑下来，离开 600ms 后收回。
@@ -871,27 +872,6 @@ const App: React.FC = () => {
     restoredInputDraft,
     consumeRestoredInputDraft,
   } = useAcp();
-
-  /**
-   * ONE summary per chat, computed HERE and handed to both surfaces.
-   *
-   * The banner above a transcript and the next-run time on a sidebar row are the same fact seen
-   * from two places, so they must not each format it: two formatters is how a row and a banner
-   * end up naming different times for one job. `sessionScheduleSummary` also decides what counts
-   * as live (finished and cancelled jobs are not pending), so neither component filters jobs.
-   *
-   * Memoised on the job list plus the coarse clock -- the countdown text only changes when one
-   * of those does.
-   */
-  const scheduleSummaryFor = useMemo(() => {
-    const byId = schedulesBySession(schedules);
-    const cache = new Map<string, ScheduleSummary | null>();
-    return (sid: string | null): ScheduleSummary | null => {
-      if (!sid) return null;
-      if (!cache.has(sid)) cache.set(sid, sessionScheduleSummary(byId.get(sid) || [], scheduleNow));
-      return cache.get(sid) ?? null;
-    };
-  }, [schedules, scheduleNow]);
 
   // Attachments are PER SESSION: with several composers on screen at once, one
   // shared list would let a file dropped on pane A be sent from pane B.
@@ -1346,6 +1326,36 @@ const App: React.FC = () => {
     };
   }, []);
   const [settings, setSettings] = useState<Settings>(loadSettings);
+  // App 自己在 <LangProvider> 外面（它就是那个 Provider 的父组件），useT() 在这里只会拿到默认的中文 ——
+  // 所以 App 里的文案直接按 settings.language 取。身份随语言变，进了 useMemo/useCallback 依赖也会跟着重算。
+  const t = useMemo(
+    () => (key: string, vars?: Record<string, string | number>) => translate(settings.language, key, vars),
+    [settings.language],
+  );
+  /** 给不该因换语言而重跑的 effect 用（例如排队消息的发送）：读到的永远是当前语言的 t。 */
+  const tRef = useRef(t);
+  tRef.current = t;
+
+  /**
+   * ONE summary per chat, computed HERE and handed to both surfaces.
+   *
+   * The banner above a transcript and the next-run time on a sidebar row are the same fact seen
+   * from two places, so they must not each format it: two formatters is how a row and a banner
+   * end up naming different times for one job. `sessionScheduleSummary` also decides what counts
+   * as live (finished and cancelled jobs are not pending), so neither component filters jobs.
+   *
+   * Memoised on the job list plus the coarse clock (and the UI language) -- the countdown text
+   * only changes when one of those does. Declared after `settings` because it reads the language.
+   */
+  const scheduleSummaryFor = useMemo(() => {
+    const byId = schedulesBySession(schedules);
+    const cache = new Map<string, ScheduleSummary | null>();
+    return (sid: string | null): ScheduleSummary | null => {
+      if (!sid) return null;
+      if (!cache.has(sid)) cache.set(sid, sessionScheduleSummary(byId.get(sid) || [], scheduleNow, settings.language));
+      return cache.get(sid) ?? null;
+    };
+  }, [schedules, scheduleNow, settings.language]);
 
   // --- Split view (1x1 … 3x3) -----------------------------------------------
   // The user CHECKS sessions in the sidebar; every checked session gets its own
@@ -2404,8 +2414,8 @@ const App: React.FC = () => {
     try { skip = uiGet('kirolex-skip-delete-confirm') === 'true'; } catch {}
     if (skip) { deleteSession(sessionId); return; }
     const session = sessions.find((s) => s.id === sessionId);
-    setDeleteConfirm({ sessionId, title: session?.title || 'this session' });
-  }, [sessions, skipDeleteConfirm, deleteSession]);
+    setDeleteConfirm({ sessionId, title: displayTitle(settings.language, session?.title) || t('this session') });
+  }, [sessions, skipDeleteConfirm, deleteSession, settings.language, t]);
 
   /**
    * Create a new chat directly inside a project (created already assigned).
@@ -2914,7 +2924,7 @@ const App: React.FC = () => {
         // Add as a fake assistant message
         sendMessage([{ type: 'text', text: '/usage' }], result.text);
       } catch (err) {
-        sendMessage([{ type: 'text', text: '/usage' }], 'Failed to fetch usage info');
+        sendMessage([{ type: 'text', text: '/usage' }], tRef.current('Failed to fetch usage info'));
       }
       return;
     }
@@ -3319,7 +3329,7 @@ const App: React.FC = () => {
       // blank paragraphs inside the merged prompt.
       const parts = consumed.map((item) => (item.content || '').trim()).filter(Boolean);
       const content = parts.length > 1
-        ? `【已合并 ${parts.length} 条排队消息】\n\n${parts.join('\n\n')}`
+        ? `${tRef.current('[{n} queued messages merged]', { n: parts.length })}\n\n${parts.join('\n\n')}`
         : (parts[0] ?? '');
       // Placeholders stay in `content` (display/transcript); the delivered prompt
       // gets the expanded text.
@@ -3400,7 +3410,7 @@ const App: React.FC = () => {
       if (decision.notify) {
         void window.kiroApi.notifySessionIdle?.({
           sessionId: sid,
-          title: (session.title || '').trim() || 'KiroLex',
+          title: displayTitle(settings.language, (session.title || '').trim()) || 'KiroLex',
           body: idleNoticeBody(settings.language, decision.notify),
         }).catch(() => {});
       }
@@ -3690,6 +3700,7 @@ const App: React.FC = () => {
             project: session?.projectId ? (memoryBytes.project[session.projectId] ?? 0) : 0,
             session: sid ? (memoryBytes.session[sid] ?? 0) : 0,
           },
+          lang: settings.language,
         })}
         compactingMemoryScope={compactingMemory}
         onCompactMemory={(scope) => {
@@ -3762,7 +3773,7 @@ const App: React.FC = () => {
         }}
       >
         <div className="chat-pane-header">
-          <span className="chat-pane-title" title={session?.title}>{session?.title || 'Untitled'}</span>
+          <span className="chat-pane-title" title={displayTitle(settings.language, session?.title)}>{displayTitle(settings.language, session?.title) || t('Untitled')}</span>
           <button
             className="chat-pane-btn"
             title={t('Remove from split view')}
@@ -3787,12 +3798,12 @@ const App: React.FC = () => {
     const remaining = Math.max(0, splitCapacity - panes.length);
     const tip = [
       t('This pane is empty.'),
-      t('Put a chat here: click any chat in the list on the left, or right-click it and pick 「⇆ Add to split」.'),
+      t('Put a chat here: click any chat in the list on the left, or right-click it and pick “⇆ Add to split”.'),
       // Deliberately does NOT restate the layout: it reported the CONFIGURED grid
       // (e.g. 2x2) while the panes on screen were arranged 1x2, so it contradicted
       // what the user could see. The remaining-slots count below is the honest part.
-      `还能再放 ${remaining} 个会话。`,
-      t('Remove a pane: click the ✕ at its top-right, or right-click the chat and pick 「⇆ Remove from split」.'),
+      t('Room for {n} more chats.', { n: remaining }),
+      t('Remove a pane: click the ✕ at its top-right, or right-click the chat and pick “⇆ Remove from split”.'),
       t('Resize: drag the divider between panes; double-click a divider to even them out.'),
       t('Change the layout: Settings → Split layout.'),
       t('Every pane is a full chat, each with its own composer, queue and attachments.'),
@@ -3827,15 +3838,15 @@ const App: React.FC = () => {
           >
             <span className="win-titlebar-title">KiroLex</span>
             <div className="win-titlebar-controls">
-              <button className="win-ctl" onClick={() => windowControl('minimize')} title="最小化" aria-label="Minimize">
+              <button className="win-ctl" onClick={() => windowControl('minimize')} title={t('Minimize')} aria-label={t('Minimize')}>
                 <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0 5h10" stroke="currentColor" strokeWidth="1" /></svg>
               </button>
-              <button className="win-ctl" onClick={() => windowControl('toggle-maximize')} title={winMaxed ? '还原' : '最大化'} aria-label="Maximize">
+              <button className="win-ctl" onClick={() => windowControl('toggle-maximize')} title={winMaxed ? t('Restore') : t('Maximize')} aria-label={winMaxed ? t('Restore') : t('Maximize')}>
                 {winMaxed
                   ? <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M2.5 0.5h7v7M0.5 2.5h7v7h-7z" fill="none" stroke="currentColor" strokeWidth="1" /></svg>
                   : <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><rect x="0.5" y="0.5" width="9" height="9" fill="none" stroke="currentColor" strokeWidth="1" /></svg>}
               </button>
-              <button className="win-ctl win-ctl-close" onClick={() => windowControl('close')} title="关闭" aria-label="Close">
+              <button className="win-ctl win-ctl-close" onClick={() => windowControl('close')} title={t('Close')} aria-label={t('Close')}>
                 <svg width="10" height="10" viewBox="0 0 10 10" aria-hidden="true"><path d="M0.5 0.5l9 9M9.5 0.5l-9 9" stroke="currentColor" strokeWidth="1" /></svg>
               </button>
             </div>
@@ -3928,12 +3939,12 @@ const App: React.FC = () => {
                 void (async () => {
                   const now = projectWorkspaces[project] || '';
                   const next = window.prompt(
-                    `「${project}」的会话在哪个目录里干活？\n\n留空 = 家目录。写绝对路径 = 这个 project 的所有会话（包括 flow 的每一步）都在那儿跑。`,
+                    t('Which folder should chats in "{project}" work in?\n\nLeave empty = your home folder. An absolute path = every chat in this project (including each flow step) runs there.', { project }),
                     now,
                   );
                   if (next === null) return;
                   const res = await window.kiroApi.projectSetWorkspace?.(project, next.trim());
-                  if (!res?.ok) { showToast(`设不上：${res?.error || t('unknown reason')}`); return; }
+                  if (!res?.ok) { showToast(t('Could not set it: {reason}', { reason: res?.error || t('unknown reason') })); return; }
                   projectCwdCache.current.delete(project);
                   setProjectWorkspaces((cur) => ({ ...cur, [project]: next.trim() }));
                 })();
@@ -3983,7 +3994,7 @@ const App: React.FC = () => {
               if (sidebarHidden) { setSidebarCollapsed(false); setPanelPins((p) => ({ ...p, sidebarAt: winWidth })); }
               else setSidebarCollapsed(true);
             }}
-            title={sidebarHidden ? 'Show sidebar' : 'Hide sidebar'}
+            title={sidebarHidden ? t('Show sidebar') : t('Hide sidebar')}
           >
             {sidebarHidden ? '▶' : '◀'}
           </button>
@@ -4070,21 +4081,21 @@ const App: React.FC = () => {
                 if (previewHidden) { setFileViewerHidden(false); setPanelPins((p) => ({ ...p, previewAt: winWidth })); }
                 else setFileViewerHidden(true);
               }}
-              title={previewHidden ? `显示预览栏（${fileTabs.length} 个标签）` : '隐藏预览栏（标签都留着）'}
+              title={previewHidden ? t('Show preview panel ({n} tabs)', { n: fileTabs.length }) : t('Hide preview panel (tabs are kept)')}
             >{previewHidden ? '◀' : '▶'}</button>
           </div>
         )}
         {(fileViewerLoading || fileViewer) && !previewHidden && (
-          <div className="workspace-file-panel" role="complementary" aria-label="File preview" style={{ width: fileViewerShown }}>
+          <div className="workspace-file-panel" role="complementary" aria-label={t('File preview')} style={{ width: fileViewerShown }}>
             <div className="file-resize-handle" onMouseDown={handleFileResizeStart} title={t('Drag to resize width')} />
             {/*
               顶上一行：左边标签页（多了横向滚动），右边固定三个按钮 ⟳ 刷新 / 📂 打开位置 / ✕。
               没有文件名标题了 —— 只开一个文件也显示标签，靠它看出当前是哪份；已删除的标签带 ⚠。
             */}
             <div className="file-panel-top">
-              <div className="file-tabs" role="tablist" aria-label="Open files">
+              <div className="file-tabs" role="tablist" aria-label={t('Open files')}>
                 {fileTabs.length === 0 && fileViewerLoading && (
-                  <div className="file-tab active"><span className="file-tab-name">Loading…</span></div>
+                  <div className="file-tab active"><span className="file-tab-name">{t('Loading…')}</span></div>
                 )}
                 {fileTabs.map((tab) => (
                   <div
@@ -4122,7 +4133,7 @@ const App: React.FC = () => {
                     title={t('Re-read this file from disk (keeps scroll position and current view)')}
                     onClick={() => void refreshFileTab(fileViewer.id, fileViewer.path)}
                   >
-                    ⟳ 刷新
+                    ⟳ {t('Refresh')}
                   </button>
                 )}
                 {fileViewer && (
@@ -4131,10 +4142,10 @@ const App: React.FC = () => {
                     disabled={!!fileViewer.gone}
                     title={fileViewer.gone
                       ? t('This file is no longer on disk (deleted or renamed). What is shown below is the last content read.')
-                      : isMac ? '在 Finder 中显示' : '在资源管理器中显示'}
+                      : isMac ? t('Show in Finder') : t('Show in Explorer')}
                     onClick={() => void window.kiroApi.showItemInFolder?.(fileViewer.path, fileViewer.ownerSessionId)}
                   >
-                    📂 打开位置
+                    📂 {t('Open location')}
                   </button>
                 )}
                 <button className="settings-close" onClick={() => { setFileTabs([]); setActiveFileTabId(null); setFileViewerLoading(false); }} title={t('Close panel')}>
@@ -4171,7 +4182,7 @@ const App: React.FC = () => {
                 scrollSaveTimerRef.current = setTimeout(() => { scrollSaveTimerRef.current = null; persistOpenTabs(); }, 500);
               }}
             >
-              {fileViewerLoading && <div className="workspace-hint">Loading file…</div>}
+              {fileViewerLoading && <div className="workspace-hint">{t('Loading file…')}</div>}
               {!fileViewerLoading && fileViewer && (
                 <>
                   {!isDeckPath(fileViewer.path) && !fileViewer.image && !fileViewer.binary && (() => {
@@ -4188,12 +4199,12 @@ const App: React.FC = () => {
                             type="button"
                             className={`rv-review-toggle${commenting ? ' on' : ''}`}
                             title={commenting
-                              ? '退出批注，安静读'
+                              ? t('Stop commenting and just read')
                               : fileViewer.ownerSessionId
-                                ? '逐段写意见：💬「✓ 确认」当场让打开这份文件的会话改那一块并写回；＋ 在那一段后面加新内容；✕ 直接删掉'
-                                : '逐行写意见 —— 这个标签页没有归属会话，只能看不能发（从会话里点开文件链接才有）'}
+                                ? t('Comment block by block: 💬 “✓ Confirm” has the chat that opened this file revise that block and write it back right away; + adds new content after the block; ✕ deletes it')
+                                : t('Comment line by line. This tab has no owning chat, so comments can be viewed but not sent (open the file from a link in a chat to get one)')}
                             onClick={toggleCommenting}
-                          >{commenting ? '✓ comment' : '💬 comment'}</button>
+                          >{commenting ? t('✓ comment') : t('💬 comment')}</button>
                         )}
                         {canRaw && (
                           <button
@@ -4254,16 +4265,16 @@ const App: React.FC = () => {
                     />
                   ) : fileViewer.image && fileViewer.dataUrl ? (
                     <div className="workspace-image-wrap">
-                      <img className="workspace-image" src={fileViewer.dataUrl} alt={baseName(fileViewer.path) || 'image'} />
+                      <img className="workspace-image" src={fileViewer.dataUrl} alt={baseName(fileViewer.path) || t('image')} />
                     </div>
                   ) : fileViewer.binary ? (
                     <div className="workspace-binary-hint">
-                      <span>{fileViewer.content || 'This file type cannot be previewed. Use 「📂 打开位置」 to open it locally.'}</span>
+                      <span>{fileViewer.content || t('This file type cannot be previewed. Use “📂 Open location” to open it locally.')}</span>
                     </div>
                   ) : (
                     <>
                       {fileViewer.truncated && (
-                        <div className="workspace-hint">⚠️ Preview truncated at 512 KB. Use 「📂 打开位置」 to open the complete file.</div>
+                        <div className="workspace-hint">{t('⚠️ Preview truncated at 512 KB. Use “📂 Open location” to open the complete file.')}</div>
                       )}
                       {/*
                         **逐行批注** —— 一个开关按钮，开着才有 💬 / ✕（默认纯读）。
@@ -4301,7 +4312,7 @@ const App: React.FC = () => {
                         return (
                           <>
                             {hl.prettified && (
-                              <div className="workspace-hint">{t('Formatted for display (the file itself is minified JSON). Click 「Raw」 to see it unformatted.')}</div>
+                              <div className="workspace-hint">{t('Formatted for display (the file itself is minified JSON). Click “Raw” to see it unformatted.')}</div>
                             )}
                             <pre className="workspace-viewer-content hljs">
                               <code
@@ -4340,26 +4351,26 @@ const App: React.FC = () => {
         <>
           <div className="overlay" onClick={() => setShowNewChat(false)} />
           <div className="permission-dialog">
-            <h3>💬 New Chat</h3>
-            <p style={{ marginBottom: 10 }}>Assign this chat to a project (optional). A project gives the chat its own memory.</p>
-            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>Project</label>
+            <h3>{t('💬 New Chat')}</h3>
+            <p style={{ marginBottom: 10 }}>{t('Assign this chat to a project (optional). A project gives the chat its own memory.')}</p>
+            <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>{t('Project')}</label>
             <select
               className="rename-popup-input"
               value={newChatProject}
               onChange={(e) => setNewChatProject(e.target.value)}
               style={{ marginBottom: 12 }}
             >
-              <option value="">No project (unassigned)</option>
+              <option value="">{t('No project (unassigned)')}</option>
               {projects.map((p) => (
                 <option key={p} value={p}>{p}</option>
               ))}
-              <option value="__new__">+ New project…</option>
+              <option value="__new__">{t('+ New project…')}</option>
             </select>
             {newChatProject === '__new__' && (
               <input
                 autoFocus
                 className="rename-popup-input"
-                placeholder="New project name…"
+                placeholder={t('New project name…')}
                 value={newChatNewProjectName}
                 onChange={(e) => setNewChatNewProjectName(e.target.value)}
                 onKeyDown={(e) => { if (e.key === 'Enter') handleCreateChat(); }}
@@ -4372,7 +4383,7 @@ const App: React.FC = () => {
               默认本地：远程是个明确的选择，不该因为配置里有一台机器就悄悄改变默认行为。
             */}
             <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
-              用哪个 AI
+              {t('Which AI')}
             </label>
             <select
               className="rename-popup-input"
@@ -4386,13 +4397,13 @@ const App: React.FC = () => {
             </select>
             {newChatEngine !== 'kiro' && (
               <p style={{ fontSize: 11, color: 'var(--text-muted)', marginTop: -6, marginBottom: 12, lineHeight: 1.5 }}>
-                用 {newChatEngine === 'claude' ? 'Claude Code' : 'Codex'} 自己的登录和默认模型；选远端机器的话，那台机器上要装好它的 ACP 适配器（设置 → 机器 →「安装 AI 工具」）并登录过。
+                {t('Uses {engine}’s own login and default model. To run it on a remote machine, that machine needs its ACP adapter installed (Settings → Machines → “Install AI tools”) and signed in.', { engine: newChatEngine === 'claude' ? 'Claude Code' : 'Codex' })}
               </p>
             )}
             {remoteTargets.enabled && remoteTargets.targets.length > 0 && (
               <>
                 <label style={{ display: 'block', fontSize: 12, color: 'var(--text-muted)', marginBottom: 4 }}>
-                  在哪台机器上跑
+                  {t('Which machine to run on')}
                 </label>
                 <select
                   className="rename-popup-input"
@@ -4400,21 +4411,21 @@ const App: React.FC = () => {
                   onChange={(e) => setNewChatRemoteId(e.target.value)}
                   style={{ marginBottom: 6 }}
                 >
-                  <option value="">本地</option>
+                  <option value="">{t('Local')}</option>
                   {remoteTargets.targets.map((t) => (
                     <option key={t.id} value={t.id}>{`🌐 ${t.label}`}</option>
                   ))}
                 </select>
                 {newChatRemoteId && (
                   <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
-                    文件仍然在本地 —— 远端那个 kiro-cli 通过隧道读写你这台机器上的文件（不复制）。
+                    {t('Files stay local. The remote kiro-cli reads and writes the files on this machine through a tunnel (nothing is copied).')}
                   </p>
                 )}
               </>
             )}
             <div className="actions">
-              <button className="btn deny" onClick={() => setShowNewChat(false)}>Cancel</button>
-              <button className="btn allow" onClick={handleCreateChat}>Create</button>
+              <button className="btn deny" onClick={() => setShowNewChat(false)}>{t('Cancel')}</button>
+              <button className="btn allow" onClick={handleCreateChat}>{t('Create')}</button>
             </div>
           </div>
         </>
@@ -4440,7 +4451,7 @@ const App: React.FC = () => {
           <div className="settings-dialog" style={{ width: 720, maxWidth: '90vw', maxHeight: '80vh', display: 'flex', flexDirection: 'column' }}>
             <div className="settings-header">
               <h3 style={{ display: 'flex', alignItems: 'center', gap: 8 }}>
-                <IconLogs size={17} /> 日志
+                <IconLogs size={17} /> {t('Logs')}
               </h3>
               <button className="settings-close" onClick={() => setShowLogs(false)} title={t('Close logs')}>
                 <IconClose size={16} />
@@ -4463,14 +4474,14 @@ const App: React.FC = () => {
                     });
                   }}
                 >
-                  刷新
+                  {t('Refresh')}
                 </button>
                 <button
                   className="btn deny"
                   style={{ padding: '6px 12px', border: 'none', borderRadius: 6, cursor: 'pointer', background: 'var(--bg-tertiary)', color: 'var(--text-secondary)' }}
                   onClick={() => void window.kiroApi.openLogs()}
                 >
-                  打开日志文件
+                  {t('Open log file')}
                 </button>
               </div>
               <pre style={{
@@ -4492,8 +4503,8 @@ const App: React.FC = () => {
                   if (e.currentTarget.scrollTop <= 40) void loadOlderLogs();
                 }}
               >
-                {logsHasMoreRef.current && (logsLoadingOlder ? '⋯ 加载更早的日志…\n' : '↑ 上拉加载更早的日志\n')}
-                {logsText || '(no logs yet)'}
+                {logsHasMoreRef.current && (logsLoadingOlder ? t('⋯ Loading older logs…') + '\n' : t('↑ Scroll up to load older logs') + '\n')}
+                {logsText || t('(no logs yet)')}
               </pre>
             </div>
           </div>
@@ -4505,27 +4516,26 @@ const App: React.FC = () => {
           <div className="permission-dialog">
             {usageActionConfirm === 'contextMenu' ? (
               <>
-                <h3>Manage context</h3>
+                <h3>{t('Manage context')}</h3>
                 <p>
-                  Choose whether to summarize older context or clear the active
-                  conversation context completely.
+                  {t('Choose whether to summarize older context or clear the active conversation context completely.')}
                 </p>
                 <div className="actions">
                   <button className="btn deny" onClick={() => setUsageActionConfirm(null)}>
-                    Cancel
+                    {t('Cancel')}
                   </button>
                   <button
                     className="btn deny"
                     onClick={() => setUsageActionConfirm('clear')}
                     style={{ color: 'var(--error)' }}
                   >
-                    Clear
+                    {t('Clear')}
                   </button>
                   <button
                     className="btn allow"
                     onClick={() => setUsageActionConfirm('compact')}
                   >
-                    Compact
+                    {t('Compact')}
                   </button>
                 </div>
               </>
@@ -4533,21 +4543,21 @@ const App: React.FC = () => {
               <>
                 <h3>
                   {usageActionConfirm === 'compact'
-                    ? 'Compact context?'
+                    ? t('Compact context?')
                     : usageActionConfirm === 'clear'
-                    ? 'Clear context?'
-                    : 'Reset Credits counter?'}
+                    ? t('Clear context?')
+                    : t('Reset Credits counter?')}
                 </h3>
                 <p>
                   {usageActionConfirm === 'compact'
-                    ? 'Kiro CLI will summarize older conversation context to free context-window capacity. The original full context cannot be restored inside this active Kiro session.'
+                    ? t('Kiro CLI will summarize older conversation context to free context-window capacity. The original full context cannot be restored inside this active Kiro session.')
                     : usageActionConfirm === 'clear'
-                    ? 'Kiro CLI will discard the active conversation context, and KiroLex will clear the currently displayed history. This cannot be undone inside this active chat.'
-                    : 'This resets the Credits counter for the current KiroLex session to 0. It does not change actual account usage, billing, or Kiro credit records.'}
+                    ? t('Kiro CLI will discard the active conversation context, and KiroLex will clear the currently displayed history. This cannot be undone inside this active chat.')
+                    : t('This resets the Credits counter for the current KiroLex session to 0. It does not change actual account usage, billing, or Kiro credit records.')}
                 </p>
                 <div className="actions">
                   <button className="btn deny" onClick={() => setUsageActionConfirm(null)}>
-                    Cancel
+                    {t('Cancel')}
                   </button>
                   <button
                     className="btn allow"
@@ -4555,10 +4565,10 @@ const App: React.FC = () => {
                     style={usageActionConfirm === 'clear' ? { background: 'var(--error)' } : undefined}
                   >
                     {usageActionConfirm === 'compact'
-                      ? 'Compact'
+                      ? t('Compact')
                       : usageActionConfirm === 'clear'
-                      ? 'Clear'
-                      : 'Reset'}
+                      ? t('Clear')
+                      : t('Reset')}
                   </button>
                 </div>
               </>
@@ -4572,7 +4582,10 @@ const App: React.FC = () => {
           <div className="permission-dialog">
             <h3>{t('Edit and rerun')}</h3>
             <p>
-              将删除这条之后的 <strong>{rerunConfirm.deleteCount}</strong> 条记录并基于编辑后的消息重跑。
+              {(() => {
+                const [before, after] = t('This deletes the {n} messages after this one and reruns from the edited message.', { n: '\u0000' }).split('\u0000');
+                return <>{before}<strong>{rerunConfirm.deleteCount}</strong>{after}</>;
+              })()}
             </p>
             <div className="actions">
               <button className="btn deny" onClick={() => setRerunConfirm(null)}>{t('Cancel')}</button>
@@ -4602,10 +4615,11 @@ const App: React.FC = () => {
         <>
           <div className="overlay" onClick={() => setDeleteConfirm(null)} />
           <div className="permission-dialog">
-            <h3>🗑️ Delete Session</h3>
+            <h3>{t('🗑️ Delete Session')}</h3>
             <p>
-              Are you sure you want to delete <strong>"{deleteConfirm.title}"</strong>?
-              This will permanently remove the session and its history.
+              {t('Are you sure you want to delete "{title}"? This will permanently remove the session and its history.', { title: '\u0000' })
+                .split(/(\u0000)/)
+                .map((part, i) => (part === '\u0000' ? <strong key={i}>{deleteConfirm.title}</strong> : part))}
             </p>
             <label style={{ display: 'flex', alignItems: 'center', gap: 8, fontSize: 13, color: 'var(--text-secondary)', margin: '4px 0 14px', cursor: 'pointer' }}>
               <input
@@ -4613,14 +4627,14 @@ const App: React.FC = () => {
                 checked={dontAskDelete}
                 onChange={(e) => setDontAskDelete(e.target.checked)}
               />
-              Don't ask again
+              {t("Don't ask again")}
             </label>
             <div className="actions">
               <button className="btn deny" onClick={() => { setDeleteConfirm(null); setDontAskDelete(false); }}>
-                Cancel
+                {t('Cancel')}
               </button>
               <button className="btn allow" onClick={confirmDelete} style={{ background: '#ef5350' }}>
-                Delete
+                {t('Delete')}
               </button>
             </div>
           </div>
@@ -4630,19 +4644,24 @@ const App: React.FC = () => {
         <>
           <div className="overlay" onClick={() => setDeleteProjectConfirm(null)} />
           <div className="permission-dialog">
-            <h3>🗑️ Delete Project</h3>
+            <h3>{t('🗑️ Delete Project')}</h3>
             <p>
-              Are you sure you want to delete the project <strong>"{deleteProjectConfirm.name}"</strong>?
-              This permanently removes its memory{deleteProjectConfirm.memberCount > 0
-                ? <> and <strong>{deleteProjectConfirm.memberCount} chat{deleteProjectConfirm.memberCount === 1 ? '' : 's'}</strong> inside it (with their history)</>
-                : null}. This cannot be undone.
+              {(deleteProjectConfirm.memberCount > 0
+                ? t('Are you sure you want to delete the project "{name}"? This permanently removes its memory and {chats} inside it (with their history). This cannot be undone.', { name: '\u0000', chats: '\u0001' })
+                : t('Are you sure you want to delete the project "{name}"? This permanently removes its memory. This cannot be undone.', { name: '\u0000' }))
+                .split(/(\u0000|\u0001)/)
+                .map((part, i) => (part === '\u0000'
+                  ? <strong key={i}>{deleteProjectConfirm.name}</strong>
+                  : part === '\u0001'
+                    ? <strong key={i}>{deleteProjectConfirm.memberCount === 1 ? t('1 chat') : t('{n} chats', { n: deleteProjectConfirm.memberCount })}</strong>
+                    : part))}
             </p>
             <div className="actions">
               <button className="btn deny" onClick={() => setDeleteProjectConfirm(null)}>
-                Cancel
+                {t('Cancel')}
               </button>
               <button className="btn allow" onClick={confirmDeleteProject} style={{ background: '#ef5350' }}>
-                Delete project
+                {t('Delete project')}
               </button>
             </div>
           </div>

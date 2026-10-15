@@ -23,6 +23,8 @@
  * 别的字段原样抄过去。
  */
 
+import { tr } from './uiText.ts';
+
 /** 远端那条 MCP 的名字。工具名在模型那边会显示成 `@kirolex-local/local_read` 这种形状。 */
 export const MCP_SERVER_NAME = 'kirolex-local';
 
@@ -42,7 +44,7 @@ export function allocateRemotePort(used: Iterable<number>): number {
     const p = REMOTE_PORT_BASE + i;
     if (!taken.has(p)) return p;
   }
-  throw new Error(`没有空闲的远端端口了（${REMOTE_PORT_BASE}–${REMOTE_PORT_BASE + REMOTE_PORT_SPAN}）。`);
+  throw new Error(tr('No free remote ports left ({from}–{to}).', { from: REMOTE_PORT_BASE, to: REMOTE_PORT_BASE + REMOTE_PORT_SPAN }));
 }
 
 /**

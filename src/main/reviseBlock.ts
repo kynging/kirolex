@@ -20,6 +20,7 @@
  */
 
 import { applyPatch, type PatchChange } from './reviewApply.ts';
+import { tr } from './uiText.ts';
 
 export interface RevisedBlock {
   /** 改写后的正文；`cannot` 为真时它等于原文。 */
@@ -40,7 +41,7 @@ export function parseRevised(stdout: string, original: string): RevisedBlock {
   let cannot: string | undefined;
   const m = /^\s*CANNOT-REVISE-LOCALLY:\s*(.*)$/m.exec(body);
   if (m) {
-    cannot = m[1].trim() || '这条意见改不了单独一段';
+    cannot = m[1].trim() || tr("This comment can't be applied to a single section");
     body = body.replace(m[0], '').trim();
   }
   /*
@@ -51,7 +52,7 @@ export function parseRevised(stdout: string, original: string): RevisedBlock {
   if (fence) body = fence[2].trim();
   if (cannot) return { text: String(original ?? ''), cannot };
   /* 空回复不能当成"改成空的" —— 那会静默删掉一段（整份那一档就是删掉整个文件） */
-  if (!body) return { text: String(original ?? ''), cannot: '模型没有返回内容' };
+  if (!body) return { text: String(original ?? ''), cannot: tr('The model returned nothing') };
   return { text: body };
 }
 
@@ -244,7 +245,7 @@ export interface PatchEdit {
 export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: string; error?: string; fix?: string } {
   let body = String(stdout ?? '').replace(/\r\n/g, '\n').trim();
   const m = /^\s*CANNOT-REVISE-LOCALLY:\s*(.*)$/m.exec(body);
-  if (m) return { edits: [], cannot: m[1].trim() || '这条意见改不了' };
+  if (m) return { edits: [], cannot: m[1].trim() || tr("This comment can't be applied") };
   const fence = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1\s*$/.exec(body);
   if (fence) body = fence[2];
   const HEAD = /^\s*(?:[-*•]\s*)?@{2,}\s*(?:replace|替换)?\s*[:：]?\s*(?:L|第)?\s*([-−－]?\d+)\s*行?\s*(?:(?:-|–|—|~|～|到|至|\.\.)\s*(?:L|第)?\s*([-−－]?\d+)\s*行?)?\s*@*\s*(?:[|｜:：]\s*)?(.*?)\s*$/i;
@@ -268,7 +269,7 @@ export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: 
     cur = null;
     if (!lines.length) {
       closeFix = `第 ${range} 行那一处是空的：要删这几行就只写一行 \`<DELETE>\`；不是要删就补上新内容`;
-      return `第 ${range} 行那一处没有给新内容（要删掉请写 <DELETE>）`;
+      return tr('Lines {range}: no new content was given (write <DELETE> to remove them)', { range });
     }
     const text = lines.length === 1 && /^<\s*delete\s*>$/i.test(lines[0].trim()) ? '' : lines.join('\n');
     edits.push({ from: c.from, to: c.to, text, ...(c.hint ? { hint: c.hint } : null) });
@@ -291,7 +292,7 @@ export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: 
     }
     if (HEADISH.test(line)) {
       const head = line.trim().slice(0, 40);
-      return bad(`有一处块头看不懂（「${head}」）—— 整轮没写`,
+      return bad(tr('One block header could not be understood ("{head}"); nothing from this round was written', { head }),
         `有一处块头看不懂（「${head}」）：块头要写成 \`@@ <起始行>-<结束行> | <起始行原文开头几个字>\`，行号是数字`);
     }
     if (cur) cur.lines.push(line);
@@ -299,7 +300,7 @@ export function parsePatchReply(stdout: string): { edits: PatchEdit[]; cannot?: 
   const e = close();
   if (e) return bad(e, closeFix);
   if (!edits.length) {
-    return bad('它没有给出可用的改动（没有 `@@ 起-止` 那样的块）', '一块改动都没找到：每一处改动都要按下面的格式写成一块');
+    return bad(tr('It gave no usable edits (no blocks like `@@ start-end`)'), '一块改动都没找到：每一处改动都要按下面的格式写成一块');
   }
   return { edits };
 }
@@ -346,9 +347,9 @@ export function patchFollowUp(parsed: { cannot?: string; error?: string; fix?: s
  * 取消 / 出错的那一轮根本不会走到这里（调用方只在一轮**成功收尾**时兑付等待者）。
  */
 export function replyUsable(meta: { stopReason?: string | null; wedged?: boolean }): { ok: true } | { ok: false; why: string } {
-  if (meta.wedged) return { ok: false, why: '这一轮卡住被中断了 —— 回复不完整，不写' };
+  if (meta.wedged) return { ok: false, why: tr('This turn got stuck and was interrupted; the reply is incomplete, so nothing was written') };
   const r = String(meta.stopReason ?? '').trim();
-  if (r && r !== 'end_turn' && r !== 'n/a') return { ok: false, why: `回复没有正常结束（${r}）—— 可能被截断，不写` };
+  if (r && r !== 'end_turn' && r !== 'n/a') return { ok: false, why: tr('The reply did not finish normally ({reason}); it may be truncated, so nothing was written', { reason: r }) };
   return { ok: true };
 }
 
@@ -510,7 +511,7 @@ export function parseSlideEdits(
 ): { edits: Array<{ at: string; text: string }>; ops: SlideOp[]; cannot?: string } {
   const raw = String(stdout ?? '');
   const m = /^\s*CANNOT-REVISE-LOCALLY:\s*(.*)$/m.exec(raw);
-  const cannot = m ? (m[1].trim() || '这条意见改不了这一页的文字') : undefined;
+  const cannot = m ? (m[1].trim() || tr("This comment can't be applied to the text on this slide")) : undefined;
   const edits: Array<{ at: string; text: string }> = [];
   /*
     **动版面的那三条** ——「所以我甚至不能让 comment 添加或者修改页面上的文本框吗，WTF」。
@@ -585,7 +586,8 @@ export function parseSlideEdits(
   return cannot ? { edits, ops, cannot } : { edits, ops };
 }
 
-const PATCH_CONFLICT = '这份文件在等回复的时候被别的改动动过了 —— 这次的结果没写进去，刷新看一眼新的正文再提一次';
+/** 每次用时现取 —— 界面语言可能在启动后改过。 */
+const patchConflict = (): string => tr('This file was changed by something else while waiting for the reply; this result was not written. Refresh, check the new text, and submit again');
 
 /** `settlePatchRevision` 的结果 —— 就是 `review:revise-in-session` 在 `patch` 档的返回值（见那里的注释）。 */
 export type PatchSettled =
@@ -621,12 +623,12 @@ export function settlePatchRevision(input: {
     const followUp = input.followedUp ? null : patchFollowUp(parsed);
     if (followUp) {
       const now = input.onDisk?.();
-      if (typeof now === 'string' && now !== input.base) return { ok: false, conflict: true, badFormat: true, error: PATCH_CONFLICT };
+      if (typeof now === 'string' && now !== input.base) return { ok: false, conflict: true, badFormat: true, error: patchConflict() };
       return { ok: false, error: parsed.error, badFormat: true, followUp };
     }
     return {
       ok: false,
-      error: input.followedUp ? `${parsed.error}（已经让它补过一次，还是不对）` : parsed.error,
+      error: input.followedUp ? tr('{error} (it was already asked to fix this once and it is still wrong)', { error: parsed.error }) : parsed.error,
       ...(parsed.fix ? { badFormat: true as const } : null),
     };
   }
@@ -646,8 +648,8 @@ export function patchWritten(
   wrote: { ok?: boolean; mismatch?: boolean; error?: string; path?: string } | null | undefined,
 ): PatchSettled {
   if (!wrote?.ok && wrote?.mismatch) {
-    return { ok: false, conflict: true, error: PATCH_CONFLICT };
+    return { ok: false, conflict: true, error: patchConflict() };
   }
-  if (!wrote?.ok) return { ok: false, error: wrote?.error || '写不进这个文件' };
+  if (!wrote?.ok) return { ok: false, error: wrote?.error || tr("Couldn't write to this file") };
   return { ...done, written: true, ...(wrote.path ? { path: wrote.path } : null) };
 }

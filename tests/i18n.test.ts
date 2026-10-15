@@ -101,7 +101,7 @@ describe('字典不许越翻越少', () => {
     for (const f of files) {
       const src = read('src', 'renderer', ...f.split('/'));
       for (const m of src.matchAll(/\bt\((?:'((?:[^'\\]|\\.)*)'|"((?:[^"\\]|\\.)*)")/g)) {
-        const k = (m[1] ?? m[2] ?? '').replace(/\\'/g, "'").replace(/\\"/g, '"');
+        const k = (m[1] ?? m[2] ?? '').replace(/\\n/g, '\n').replace(/\\'/g, "'").replace(/\\"/g, '"');
         if (k) keys.add(k);
       }
     }

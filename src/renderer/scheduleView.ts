@@ -14,6 +14,8 @@
  * can act on is less useful than the date itself.
  */
 
+import { t, type Lang } from './i18n.ts';
+
 export interface ScheduleView {
   id: string;
   sessionId: string;
@@ -50,16 +52,16 @@ export interface ScheduleSummary {
  * "due" and "started" are not the same instant, and a countdown that goes negative reads
  * as a bug.
  */
-export function countdownText(at: number | null, now: number): string | null {
+export function countdownText(at: number | null, now: number, lang: Lang = 'zh'): string | null {
   if (at === null || !Number.isFinite(at)) return null;
   const ms = at - now;
-  if (ms <= 0) return '即将运行';
+  if (ms <= 0) return t(lang, 'Due now');
   const secs = Math.round(ms / 1000);
-  if (secs < 60) return `${secs} 秒后`;
+  if (secs < 60) return t(lang, 'in {n}s', { n: secs });
   const mins = Math.round(secs / 60);
-  if (mins < 60) return `${mins} 分钟后`;
+  if (mins < 60) return t(lang, 'in {n} min', { n: mins });
   const hours = Math.floor(mins / 60);
-  if (hours < 24) return `${hours} 小时 ${mins % 60} 分后`;
+  if (hours < 24) return t(lang, 'in {h}h {m}m', { h: hours, m: mins % 60 });
   // Beyond a day the date is the useful fact. Locale-formatted, because this is the same
   // string a person would read off a calendar.
   return new Date(at).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
@@ -78,7 +80,7 @@ function isLive(job: ScheduleView): boolean {
  * With several jobs the SOONEST one is described, because that is the next thing that will
  * actually happen — showing whichever was created first would name a run that is not next.
  */
-export function sessionScheduleSummary(jobs: ScheduleView[], now: number): ScheduleSummary | null {
+export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: Lang = 'zh'): ScheduleSummary | null {
   const live = jobs.filter(isLive);
   if (live.length === 0) return null;
 
@@ -96,25 +98,25 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number): Sched
   const allPaused = active.length === 0;
   const hasError = live.some((job) => !!job.lastError);
   const budget = next ? `${next.runs}/${next.maxRuns}` : '';
-  const countdown = allPaused ? null : countdownText(next?.nextRunAt ?? null, now);
+  const countdown = allPaused ? null : countdownText(next?.nextRunAt ?? null, now, lang);
 
   const parts: string[] = [];
   if (next) parts.push(next.describe);
-  if (allPaused) parts.push('已暂停');
+  if (allPaused) parts.push(t(lang, 'Paused'));
   else if (countdown) parts.push(countdown);
-  if (budget) parts.push(`已运行 ${budget}`);
-  if (live.length > 1) parts.push(`共 ${live.length} 个任务`);
+  if (budget) parts.push(t(lang, 'Ran {budget}', { budget }));
+  if (live.length > 1) parts.push(t(lang, '{n} jobs in total', { n: live.length }));
   // The error goes LAST but is never dropped: a daily job that has failed every morning
   // must not read the same as one that has been working.
   if (hasError) {
     const failing = live.find((job) => job.lastError)!;
-    parts.push(`上次失败：${failing.lastError}`);
+    parts.push(t(lang, 'Last failure: {error}', { error: String(failing.lastError) }));
   }
 
   return {
     count: live.length,
     text: parts.join(' · '),
-    short: allPaused ? '已暂停' : (countdown || next?.describe || ''),
+    short: allPaused ? t(lang, 'Paused') : (countdown || next?.describe || ''),
     paused: allPaused,
     hasError,
     next,

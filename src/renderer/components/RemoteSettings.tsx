@@ -1,6 +1,7 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, joinSshHost, splitSshHost } from '../remotePick.ts';
 import { notifyRemoteTargetsChanged } from '../hooks/useRemoteTargets.ts';
+import { useT } from '../hooks/useLang';
 
 /**
  * **在界面上配一台远端机器** ——「界面上甚至没有配置远程EC2的地方」。
@@ -108,6 +109,7 @@ const BinRow: React.FC<{
   candidates?: BinCandidate[];
   onChange: (v: string) => void;
 }> = ({ label, hint, value, candidates, onChange }) => {
+  const t = useT();
   return (
     <Field label={label} hint={hint}>
       <div className="bin-row">
@@ -129,7 +131,7 @@ const BinRow: React.FC<{
             <button
               key={c.command}
               className={`bin-candidate${c.ok ? '' : ' bad'}${value === c.command ? ' active' : ''}`}
-              title={c.ok ? (c.version || '能起来') : (c.error || '起不来')}
+              title={c.ok ? (c.version || t('Starts')) : (c.error || t('Does not start'))}
               onClick={() => onChange(c.command)}
             >
               {c.ok ? '✓' : '✗'} {c.known ? '★ ' : ''}{c.command}
@@ -154,6 +156,7 @@ const BinRow: React.FC<{
  */
 
 const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecBins) => void }> = ({ bins, machine, onChange }) => {
+  const t = useT();
   const [found, setFound] = useState<Record<string, BinCandidate[]> | null>(null);
   const [detecting, setDetecting] = useState(false);
   const [err, setErr] = useState('');
@@ -164,7 +167,7 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
     setErr('');
     const r = await (window as any).kiroApi?.binsDetect?.(machine);
     setDetecting(false);
-    if (!r?.ok) { setErr(r?.error || '检测失败'); return; }
+    if (!r?.ok) { setErr(r?.error || t('Detection failed')); return; }
     setFound(r.tools || {});
     /* **不自动改你的配置**：只有那一栏是空的（= 用默认）时才替你填上第一个能跑的 ——
        已经填了东西就不动，那是你的选择。 */
@@ -183,22 +186,22 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
           远端是上面「安装 AI 工具」那颗按钮的事。 */}
       <div className="remote-row-actions" style={{ marginTop: 2 }}>
         <button className="remote-btn" disabled={detecting} onClick={() => void detect()}>
-          {detecting ? '检测中…' : '自动检测这台机器上的三个工具'}
+          {detecting ? t('Detecting…') : t('Auto-detect the three tools on this machine')}
         </button>
         {err && <span className="settings-hint" style={{ color: 'var(--error)' }}>{err}</span>}
       </div>
       <BinRow
-        label="kiro 启动命令" hint="留空 = 用 PATH 上的 kiro-cli。可填绝对路径，或另一个名字"
+        label={t('kiro launch command')} hint={t('Empty = use kiro-cli from PATH. You can enter an absolute path or a different name')}
         value={bins.kiro || ''}
         candidates={found?.kiro} onChange={(kiro) => onChange({ ...bins, kiro })}
       />
       <BinRow
-        label="claude 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先检测并存着"
+        label={t('claude launch command (not used yet)')} hint={t('KiroLex only launches kiro-cli for now; this is detected and saved for later')}
         value={bins.claude || ''}
         candidates={found?.claude} onChange={(claude) => onChange({ ...bins, claude })}
       />
       <BinRow
-        label="codex 启动命令（暂未使用）" hint="KiroLex 目前只起 kiro-cli；这里先检测并存着"
+        label={t('codex launch command (not used yet)')} hint={t('KiroLex only launches kiro-cli for now; this is detected and saved for later')}
         value={bins.codex || ''}
         candidates={found?.codex} onChange={(codex) => onChange({ ...bins, codex })}
       />
@@ -208,6 +211,7 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
 
 /** `startNew`：打开时直接停在「+ 添加一台机器…」、给一张空表（侧栏右键「运行位置 → ＋ 添加机器…」）。 */
 export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) => {
+  const t = useT();
   const [rows, setRows] = useState<RemoteRow[]>([]);
   /** 本机那三个启动命令（和远端同样的字段，只是没有 SSH 那几项）。 */
   const [local, setLocal] = useState<ExecBins>({});
@@ -291,7 +295,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       setSaving(true);
       const r = await (window as any).kiroApi?.remoteSave?.(draft);
       setSaving(false);
-      if (!r?.ok) { setResult({ ok: false, text: r?.error || '保存失败' }); return; }
+      if (!r?.ok) { setResult({ ok: false, text: r?.error || t('Save failed') }); return; }
       setResult(null);
       notifyRemoteTargetsChanged();   // 新建对话里的机器下拉就地刷新
       const saved = r.target as RemoteRow;
@@ -315,7 +319,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       setSaving(true);
       const r = await (window as any).kiroApi?.localSaveWorkdir?.(localWorkdir);
       setSaving(false);
-      if (!r?.ok) { setResult({ ok: false, text: r?.error || '保存失败' }); return; }
+      if (!r?.ok) { setResult({ ok: false, text: r?.error || t('Save failed') }); return; }
       setResult(null);
       savedLocalWorkdir.current = localWorkdir;
     }, 600);
@@ -330,7 +334,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       setSaving(true);
       const r = await (window as any).kiroApi?.localSaveBins?.(local);
       setSaving(false);
-      if (!r?.ok) { setResult({ ok: false, text: r?.error || '保存失败' }); return; }
+      if (!r?.ok) { setResult({ ok: false, text: r?.error || t('Save failed') }); return; }
       setResult(null);
       savedLocalSig.current = mine;
     }, 600);
@@ -360,7 +364,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
     const r = await (window as any).kiroApi?.remoteDelete?.(draft.id);
     setBusy(false);
     notifyRemoteTargetsChanged();
-    if (!r?.ok) setResult({ ok: false, text: r?.error || '删除失败' });
+    if (!r?.ok) setResult({ ok: false, text: r?.error || t('Delete failed') });
     await reload();
   };
 
@@ -372,7 +376,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
     const r = await (window as any).kiroApi?.remoteTest?.(draft);
     setBusy(false);
     setTestedOk(r?.ok ? tested : '');
-    setResult({ ok: !!r?.ok, text: r?.message || '测试失败' });
+    setResult({ ok: !!r?.ok, text: r?.message || t('Test failed') });
   };
 
   /**
@@ -387,7 +391,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
     const r = await (window as any).kiroApi?.remoteBootstrap?.(draft);
     if (!r?.ok) {
       setInstalling(false);
-      setResult({ ok: false, text: r?.error || '安装失败' });
+      setResult({ ok: false, text: r?.error || t('Install failed') });
       return;
     }
     /* 安装脚本对已装的工具是跳过的，所以 kiro-cli 的**更新**在这里补上 —— 原来那颗
@@ -395,10 +399,10 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
     const u = draft.id ? await (window as any).kiroApi?.kiroUpdate?.(draft.id, false) : null;
     setInstalling(false);
     const kiro = !u ? ''
-      : u.needsConfirm ? `kiro-cli 没更新：${u.error}`
-        : !u.ok ? `kiro-cli 更新失败：${u.error || '?'}`
-          : u.changed ? `kiro-cli 已更新：${u.from} → ${u.to}。` : `kiro-cli 已经是最新的（${u.to || u.from || '?'}）。`;
-    setResult({ ok: true, text: `装好了 —— 上面是自检输出。${kiro ? `\n${kiro}` : ''}` });
+      : u.needsConfirm ? t('kiro-cli not updated: {error}', { error: u.error })
+        : !u.ok ? t('kiro-cli update failed: {error}', { error: u.error || '?' })
+          : u.changed ? t('kiro-cli updated: {from} → {to}.', { from: u.from, to: u.to }) : t('kiro-cli is already up to date ({version}).', { version: u.to || u.from || '?' });
+    setResult({ ok: true, text: `${t('Installed. The self-check output is above.')}${kiro ? `\n${kiro}` : ''}` });
   };
 
   const locked = busy || installing;
@@ -414,11 +418,11 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
         而"远程会话"只是其中一个用途。下面那句说明同样改了：镜像已经没有了
         （见 `registerRemoteSync`），文件留在你机器上、远端那条会话靠 `local_*` 工具回来读写。
       */}
-      <label className="settings-label">机器与启动命令</label>
+      <label className="settings-label">{t('Machines & launch commands')}</label>
       <p className="settings-hint" style={{ marginTop: 0 }}>
-        每台机器上 kiro / claude / codex 分别用哪个命令启动，可以自动检测、逐个测试。
-        配了远端机器之后，<b>新建对话</b>或右键「运行位置」就能让某条会话的 kiro-cli 跑在那台机器上 ——
-        <b>文件不会被复制过去</b>：它通过一条反向隧道调回你这台机器上的工具来读写。
+        {t('Which command launches kiro / claude / codex on each machine. They can be auto-detected and tested one by one.')}
+        {t(' Once a remote machine is set up, ')}<b>{t('New chat')}</b>{t(' or right-click → "Run on" lets a session run its kiro-cli on that machine. ')}
+        <b>{t('Files are not copied over')}</b>{t(': it reads and writes through a reverse tunnel back to the tools on your machine.')}
       </p>
       <select
         className="settings-select"
@@ -426,11 +430,11 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
         onChange={(e) => pick(e.target.value)}
         style={{ marginBottom: 8, width: '100%' }}
       >
-        <option value={LOCAL}>💻 本机（这台电脑）</option>
+        <option value={LOCAL}>{t('💻 Local (this computer)')}</option>
         {rows.map((r) => (
           <option key={r.id} value={r.id}>{`🌐 ${r.label} — ${r.sshHost}`}</option>
         ))}
-        <option value={NEW}>+ 添加一台机器…</option>
+        <option value={NEW}>{t('+ Add a machine…')}</option>
       </select>
 
       {/*
@@ -441,12 +445,11 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       {localOnly && (
         <div className="remote-form">
           <p className="settings-hint" style={{ marginTop: 0 }}>
-            留空 = 按常见安装位置自己找。填绝对路径或另一个名字都行 —— 这台机器上可能装着两个
-            kiro-cli，而"跑的是哪一个"决定了模型列表、agent 和 MCP 的行为。
-            <b>★</b> = 以前真的起过一条会话；<b>✗</b> = 找到了但起不来（或者不是这个工具）。
+            {t('Empty = look in the usual install locations. An absolute path or a different name both work. This machine may have two kiro-cli installs, and which one runs decides the model list, agents and MCP behavior.')}
+            {' '}<b>★</b>{t(' = has actually started a session before; ')}<b>✗</b>{t(' = found but does not start (or is not this tool).')}
           </p>
           {/* 「本机应该有工作目录这个功能，默认是用户目录下的 kirolex」—— 没归项目的本地会话在这里干活 */}
-          <Field label="工作目录" hint="没归项目的本地会话在这个目录里干活（归了项目的用项目目录）。~ 是你的用户目录">
+          <Field label={t('Working directory')} hint={t('Local sessions without a project work in this directory (sessions in a project use the project directory). ~ is your home directory')}>
             <input
               className="settings-input"
               spellCheck={false}
@@ -460,28 +463,28 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
 
       {!localOnly && draft && (
         <div className="remote-form">
-          <Field label="名称" hint="侧栏徽标和新建对话的下拉里显示的就是这个名称">
+          <Field label={t('Name')} hint={t('Shown on the sidebar badge and in the New chat dropdown')}>
             <input
               className="settings-input"
               value={draft.label || ''}
               onChange={(e) => setDraft({ ...draft, label: e.target.value })}
             />
           </Field>
-          <Field label="IP 地址" hint="那台机器的 IP 或主机名">
+          <Field label={t('IP address')} hint={t('IP or hostname of that machine')}>
             <input
               className="settings-input"
               value={splitSshHost(draft.sshHost).host}
               onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(splitSshHost(draft.sshHost).user, e.target.value) })}
             />
           </Field>
-          <Field label="用户名" hint="ssh 登录那台机器用的用户名。留空 = 用本机的用户名">
+          <Field label={t('Username')} hint={t('Username for ssh login to that machine. Empty = use your local username')}>
             <input
               className="settings-input"
               value={splitSshHost(draft.sshHost).user}
               onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, splitSshHost(draft.sshHost).host) })}
             />
           </Field>
-          <Field label="端口" hint="不填就是 22">
+          <Field label={t('Port')} hint={t('Defaults to 22')}>
             <input
               className="settings-input"
               value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
@@ -490,7 +493,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
           </Field>
           {/* 密钥用 Finder 选 —— 手写路径错一个字母，表现是"认证失败"，跟机器没开长得一样 */}
           {/* 密码可以不填 ——「除了用户名应该还有密码，不过密码可以是空的」。存的是加密后的，界面只知道"有没有" */}
-          <Field label="密码" hint="密码和私钥填一个就行（「这个应该和密码是二选一即可」）；都不填就用 ssh 自己的配置。存下去是加密的">
+          <Field label={t('Password')} hint={t('Fill in either the password or the private key; leave both empty to use your own ssh config. Stored encrypted')}>
             <div className="remote-key">
               <input
                 className="settings-input"
@@ -501,24 +504,24 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
               />
               {draft.hasPassword && !draft.password && !draft.clearPassword && (
                 <>
-                  <span className="settings-hint">已保存</span>
-                  <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, password: '', clearPassword: true })}>清除</button>
+                  <span className="settings-hint">{t('Saved')}</span>
+                  <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, password: '', clearPassword: true })}>{t('Clear')}</button>
                 </>
               )}
             </div>
           </Field>
-          <Field label="私钥" hint="私钥和密码填一个就行；都不填 = 用 ssh 自己的配置（~/.ssh/config、ssh-agent）">
+          <Field label={t('Private key')} hint={t('Fill in either the private key or the password; leave both empty to use your own ssh config (~/.ssh/config, ssh-agent)')}>
           <div className="remote-key">
             <span className={`remote-key-path${draft.identityFile ? '' : ' empty'}`} title={draft.identityFile || ''}>
-              🔑 {draft.identityFile || '没有选私钥（和密码二选一，都不填就用 ssh 自己的配置）'}
+              🔑 {draft.identityFile || t('No private key selected (use it or a password; with neither, your own ssh config is used)')}
             </span>
-            <button className="remote-btn" disabled={locked} onClick={() => void pickKey()}>选择密钥…</button>
+            <button className="remote-btn" disabled={locked} onClick={() => void pickKey()}>{t('Choose key…')}</button>
             {draft.identityFile && (
-              <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>清除</button>
+              <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>{t('Clear')}</button>
             )}
           </div>
           </Field>
-          <Field label="工作目录" hint="那台机器上的目录，~ 是登录用户的家目录。KiroLex 在这里给每条会话建一个草稿目录">
+          <Field label={t('Working directory')} hint={t('A directory on that machine; ~ is the login user\'s home. KiroLex creates a scratch directory for each session here')}>
             <input
               className="settings-input"
               value={draft.remoteWorkdir || ''}
@@ -533,16 +536,16 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
             然后去怀疑是不是路径写错了。
           */}
           <div className="remote-row-actions">
-            <button className="remote-btn" disabled={locked || !canAct} onClick={() => void test()}>测试连接</button>
+            <button className="remote-btn" disabled={locked || !canAct} onClick={() => void test()}>{t('Test connection')}</button>
             <button
               className="remote-btn remote-btn-primary"
               disabled={locked || !canAct || !connVerified}
               title={connVerified
-                ? '在这台机器上装 kiro-cli / claude code / codex，以及它们要的 node / rsync / git 和 kiro-cli 默认 agent 的 web search MCP（幂等，已装的跳过）'
-                : '先「测试连接」，通过了才能装 —— 连不上的机器装不了任何东西'}
+                ? t('Install kiro-cli / claude code / codex on this machine, plus the node / rsync / git they need and the web search MCP for the kiro-cli default agent (idempotent; already installed ones are skipped)')
+                : t('Run "Test connection" first. Installing needs a passing test, since nothing can be installed on a machine you cannot reach')}
               onClick={() => void bootstrap()}
-            >{installing ? '安装中…' : '安装 AI 工具'}</button>
-            {draft.id && <button className="remote-btn" disabled={locked} onClick={() => void remove()}>删除</button>}
+            >{installing ? t('Installing…') : t('Install AI tools')}</button>
+            {draft.id && <button className="remote-btn" disabled={locked} onClick={() => void remove()}>{t('Delete')}</button>}
           </div>
           {/* 这台远端机器上那三个 CLI 怎么起（空 = 用 PATH 上的那个） */}
           <BinFields bins={draft.bins || {}} machine={draft.id || ''} onChange={(bins) => setDraft({ ...draft, bins })} />
@@ -551,12 +554,12 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
 
       {/* 没有保存按钮，所以要有一句"存了没"—— 否则人不知道改动算不算数 */}
       {(localOnly || draft?.sshHost.trim()) && (
-        <p className="settings-hint">{saving ? '正在保存…' : '改动自动保存'}</p>
+        <p className="settings-hint">{saving ? t('Saving…') : t('Changes are saved automatically')}</p>
       )}
-      {busy && <p className="settings-hint">正在连…（最多等 30 秒）</p>}
+      {busy && <p className="settings-hint">{t('Connecting… (up to 30 seconds)')}</p>}
       {installing && (
         <p className="settings-hint">
-          正在 {draft?.sshHost} 上装 AI 工具…（kiro-cli 的包有几百 MB，npm 还要装几个，几分钟是正常的）
+          {t('Installing AI tools on {host}… (the kiro-cli package is several hundred MB and npm installs a few more, so a few minutes is normal)', { host: draft?.sshHost || '' })}
         </p>
       )}
       {log && <pre ref={logRef} className="remote-log">{log}</pre>}

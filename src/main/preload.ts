@@ -236,8 +236,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  Same reason as persistSteer -- a message created in the renderer never reaches
    *  the durable transcript on its own, so the reason a loop stopped would die with
    *  the window. */
-  persistNote: (sessionId: string, text: string) =>
-    ipcRenderer.invoke('acp:persist-note', sessionId, text),
+  persistNote: (sessionId: string, text: string, variants?: { zh: string; en: string }) =>
+    ipcRenderer.invoke('acp:persist-note', sessionId, text, variants),
 
   /** This session's RUN EVENT LOG (events.jsonl): timestamped prompt/tool/permission
    *  boundaries. A separate file from the transcript on purpose -- the transcript has
@@ -486,7 +486,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   deckWriteSlideText: (sessionId: string | null | undefined, filePath: string, page: number, edits: Array<{ at: string; text: string }>) =>
     ipcRenderer.invoke('deck:write-slide-text', sessionId, filePath, page, edits),
   /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）。 */
-  sessionNote: (sessionId: string, text: string) => ipcRenderer.invoke('session:note', sessionId, text),
+  sessionNote: (sessionId: string, text: string, variants?: { zh: string; en: string }) => ipcRenderer.invoke('session:note', sessionId, text, variants),
   /** Watch exactly these files for on-disk edits, replacing any previous set.
    *  Main watches their parent directories (a save is usually write+rename, which a
    *  per-file watcher stops following), and reports each change once, debounced. */
@@ -534,7 +534,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 这些不进 transcript：它们不是对话内容，写进去会打断对话的读法、把 transcript 撑大
    * （远程会话每轮都要推它），还得靠"别发给模型"那条过滤一直兜着。界面显示在输入框上方、自动消失。
    */
-  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean }) => void) => {
+  onSessionNotice: (callback: (d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean; variants?: { zh: string; en: string } }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:notice', handler);
     return () => ipcRenderer.removeListener('session:notice', handler);
@@ -662,7 +662,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('acp:notice', handler);
   },
   /** Per-session backend occupancy (turn / reconfiguring / attaching / priming). */
-  onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string }) => void) => {
+  onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:session-busy', handler);
     return () => ipcRenderer.removeListener('acp:session-busy', handler);

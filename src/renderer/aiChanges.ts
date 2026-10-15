@@ -9,6 +9,9 @@
  *
  * 行号都是文件里的真实行号（从 1 起，含空行），和 `reviewBlocks` 同一套。
  */
+import { t, type Lang } from './i18n.ts';
+/** 撤销拒绝那句的默认语言（和 `planUndo` 的 `lang` 默认值一致）。 */
+const DEFAULT_LANG: Lang = 'zh';
 
 export interface AiChange {
   /** 在**新文件**里占的行（闭区间）。纯删除时是空区间：`to === from - 1`，`from` 是原文该插回去的那一行。 */
@@ -233,7 +236,7 @@ export type AiMark = AiChange & { id: number; note?: string };
 export type AiMarkState = { base: string; marks: AiMark[] };
 
 /** 撤销拒绝时给人看的那句。 */
-export const UNDO_REFUSED = '这一段之后又改过了，没撤销';
+export const UNDO_REFUSED = t(DEFAULT_LANG, 'This passage was changed again afterward, so it wasn\'t undone');
 
 /**
  * **撤销那一处，基于盘上此刻的正文** —— 不信预览缓存：文件可能已经在外面被改了、预览还没刷。
@@ -243,13 +246,13 @@ export const UNDO_REFUSED = '这一段之后又改过了，没撤销';
  * 对不上 / 找不到这条：返回拒绝。
  */
 export function planUndo(
-  state: AiMarkState, id: number, disk: string,
+  state: AiMarkState, id: number, disk: string, lang: Lang = 'zh',
 ): { ok: true; text: string; mark: AiMark } | { ok: false; why: string } {
   const own = state.marks.find((m) => m.id === id);
-  if (!own) return { ok: false, why: '这条标记已经不在了' };
+  if (!own) return { ok: false, why: t(lang, 'This mark no longer exists') };
   /* 跟不上的（被碰过、对不准位置）一律不撤 —— 字面上对得上也不行，那几行可能已经是另一段了 */
   const [mark] = state.base === disk ? [own] : remapChanges([own], state.base, disk, true);
   const text = mark && !mark.stale ? revertChange(disk, mark) : null;
-  if (!mark || text === null) return { ok: false, why: UNDO_REFUSED };
+  if (!mark || text === null) return { ok: false, why: t(lang, 'This passage was changed again afterward, so it wasn\'t undone') };
   return { ok: true, text, mark };
 }

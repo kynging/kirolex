@@ -56,6 +56,15 @@ test('改写那一轮中断了不回填：自动重发和自动续写都跳过�
   const { isReviseRequest } = await import('../src/renderer/turnRecovery.ts');
   assert.equal(isReviseRequest('【改写 · a.md 第 38 行】这些场景需要重写'), true);
   assert.equal(isReviseRequest('普通问题'), false);
+  /* 英文界面下主进程写的是英文开头（`tr('[Revision · {label}] {note}')`）—— 同样要认，旧的中文开头照认 */
+  const { trIn } = await import('../src/main/uiText.ts');
+  assert.equal(isReviseRequest(trIn('en', '[Revision · {label}] {note}', { label: 'a.md line 38', note: 'rewrite these' })), true);
+  assert.equal(isReviseRequest(trIn('en', '[Revision] {note}', { note: 'x' })), true);
+  assert.equal(isReviseRequest(trIn('en', '[Revision · {file} page {page} slide text] {note}', { file: 'd.pptx', page: 2, note: 'x' })), true);
+  assert.equal(isReviseRequest(trIn('zh', '[Revision · {label}] {note}', { label: 'a.md 第 38 行', note: 'x' })), true);
+  /* 只认 KiroLex 自己那种方括号开头，不吃掉你随手写的 "[Revision notes] …" / "Revision: …" */
+  assert.equal(isReviseRequest('[Revision notes] please read'), false);
+  assert.equal(isReviseRequest('Revision: fix the intro'), false);
   const fs = await import('node:fs');
   const U = fs.readFileSync('src/renderer/hooks/useAcp.ts', 'utf8');
   assert.ok(U.includes('if (isReviseRequest(target.content)) return;'));

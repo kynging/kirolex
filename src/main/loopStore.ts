@@ -31,6 +31,7 @@
 
 import fs from 'fs';
 import path from 'path';
+import { tr } from './uiText.ts';
 
 /** Structurally `LoopRun` from the renderer's loopMachine, kept as a loose shape on
  *  purpose. main's tsconfig pins `rootDir: ./src/main`, so importing the renderer's
@@ -107,7 +108,7 @@ export function beginRound(
   now: number,
 ): { run: StoredLoopRun | null; terminal: string | null; error?: string } {
   const run = readLoop(sessionId, home);
-  if (!run) return { run: null, terminal: null, error: '没有找到这个会话的循环记录' };
+  if (!run) return { run: null, terminal: null, error: tr('No loop record found for this session') };
   // Already over: report the recorded reason rather than inventing a new one.
   if (run.terminal) return { run, terminal: run.terminal };
 

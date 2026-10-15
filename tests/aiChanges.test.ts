@@ -155,7 +155,7 @@ describe('planUndo：以盘上此刻那一份为准', () => {
   test('撤销读盘、带 expectBase 写；主进程按 expectBase 原子核对', () => {
     const RV = fs.readFileSync('src/renderer/components/ReviewPane.tsx', 'utf8');
     assert.ok(RV.includes('await window.kiroApi.workspaceRead(sessionId, path)'));
-    assert.ok(RV.includes('const plan = planUndo(state, id, disk);'));
+    assert.ok(RV.includes('const plan = planUndo(state, id, disk, lang);'));
     assert.ok(RV.includes('{ undid: id, expectBase: disk }'));
     assert.ok(RV.includes('reviewWriteFile?.(sessionId, path, fullText, opts.expectBase)'));
     const P = fs.readFileSync('src/main/preload.ts', 'utf8');

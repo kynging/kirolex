@@ -42,6 +42,7 @@ import crypto from 'crypto';
 import fs from 'fs';
 import http from 'http';
 import path from 'path';
+import { tr } from './uiText.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -375,7 +376,7 @@ export async function callTool(
       } catch (err: any) {
         return text(`写不进去：${err?.message || err}`, true);
       }
-      deps.notice(session.sessionId, `📝 远端那条会话改了你本机的 \`${f}\`。`);
+      deps.notice(session.sessionId, tr('📝 The remote session changed `{file}` on this machine.', { file: f }));
       deps.log('info', `local_write ${f} sessionId=${session.sessionId}`);
       return text(`已写入 ${f}（${Buffer.byteLength(String(args?.content ?? ''))} 字节）`);
     }
@@ -682,7 +683,7 @@ export function maskUrl(url: string): string {
 export class MissingEnvError extends Error {
   envName: string;
   constructor(envName: string) {
-    super(`本机环境变量 ${envName} 不存在`);
+    super(tr('Local environment variable {name} does not exist', { name: envName }));
     this.envName = envName;
   }
 }
@@ -723,12 +724,12 @@ export function sessionGoneText(text: string): boolean {
 function describeNetError(err: any): string {
   const cause = err?.cause;
   const code: string = String(cause?.code || cause?.errors?.[0]?.code || err?.code || '');
-  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return `连不上上游：域名解析失败（${code}）`;
-  if (code === 'ECONNREFUSED') return `连不上上游：连接被拒绝（${code}）`;
-  if (code === 'ECONNRESET') return `连不上上游：连接被重置（${code}）`;
-  if (code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return `连不上上游：连接超时（${code}）`;
-  if (/CERT|SSL|TLS|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(code)) return `连不上上游：TLS 握手失败（${code}）`;
-  return `连不上上游：${code || cause?.message || err?.message || String(err)}`;
+  if (code === 'ENOTFOUND' || code === 'EAI_AGAIN') return tr('Cannot reach upstream: DNS lookup failed ({code})', { code });
+  if (code === 'ECONNREFUSED') return tr('Cannot reach upstream: connection refused ({code})', { code });
+  if (code === 'ECONNRESET') return tr('Cannot reach upstream: connection reset ({code})', { code });
+  if (code === 'ETIMEDOUT' || code === 'UND_ERR_CONNECT_TIMEOUT') return tr('Cannot reach upstream: connection timed out ({code})', { code });
+  if (/CERT|SSL|TLS|SELF_SIGNED|UNABLE_TO_VERIFY/i.test(code)) return tr('Cannot reach upstream: TLS handshake failed ({code})', { code });
+  return tr('Cannot reach upstream: {why}', { why: String(code || cause?.message || err?.message || String(err)) });
 }
 
 /**
@@ -762,7 +763,6 @@ export class HttpProxy implements ForwardProxy {
     this.timeoutMs = httpProxyTimeout(spec);
   }
 
-  private tag(): string { return `本机→上游（${this.spec.name}）`; }
 
   /**
    * 把任何出现过的密钥抹成打码形式 —— fetch 的异常信息等可能把它带出来。
@@ -779,14 +779,14 @@ export class HttpProxy implements ForwardProxy {
   }
 
   private fail(id: any, reason: string): any {
-    return { jsonrpc: '2.0', id: id ?? null, error: { code: -32000, message: this.scrub(`${this.tag()}${reason}`) } };
+    return { jsonrpc: '2.0', id: id ?? null, error: { code: -32000, message: this.scrub(tr('Local→upstream ({name}) {why}', { name: this.spec.name, why: reason })) } };
   }
 
   /** 校验网址、展开请求头。配置有问题就抛 `UpstreamError`（不发请求）。 */
   private prepare(): Record<string, string> {
     let u: URL;
-    try { u = new URL(this.spec.url); } catch { throw new UpstreamError('配置错误：上游网址无效'); }
-    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new UpstreamError(`配置错误：上游网址只支持 http / https（现在是 ${u.protocol}）`);
+    try { u = new URL(this.spec.url); } catch { throw new UpstreamError(tr('Config error: the upstream URL is invalid')); }
+    if (u.protocol !== 'http:' && u.protocol !== 'https:') throw new UpstreamError(tr('Config error: the upstream URL must be http / https (got {protocol})', { protocol: u.protocol }));
     const secrets: string[] = [];
     for (const [, v] of u.searchParams) secrets.push(v);
     if (u.username) secrets.push(decodeURIComponent(u.username));
@@ -796,7 +796,7 @@ export class HttpProxy implements ForwardProxy {
       try {
         headers[k] = expandEnvRefs(String(raw));
       } catch (e: any) {
-        if (e instanceof MissingEnvError) throw new UpstreamError(`配置错误：请求头 ${k} 引用的本机环境变量 ${e.envName} 不存在`);
+        if (e instanceof MissingEnvError) throw new UpstreamError(tr('Config error: header {header} refers to local environment variable {name}, which does not exist', { header: k, name: e.envName }));
         throw e;
       }
       secrets.push(headers[k], String(raw));
@@ -831,7 +831,7 @@ export class HttpProxy implements ForwardProxy {
     const id = msg?.id;
     const isNote = id === undefined;
     try {
-      if (this.stopped) throw new UpstreamError('转发已停止（会话已结束）');
+      if (this.stopped) throw new UpstreamError(tr('Forwarding stopped (the session has ended)'));
       const headers = this.prepare();
       if (msg?.method === 'initialize') {
         this.initParams = msg?.params ?? null;
@@ -859,13 +859,13 @@ export class HttpProxy implements ForwardProxy {
         try {
           out = await this.post(msg, headers, timeoutMs);
         } catch (e2: any) {
-          if (e2 instanceof UpstreamError && e2.sessionGone) throw new UpstreamError('会话失效，重建后上游仍然不认');
+          if (e2 instanceof UpstreamError && e2.sessionGone) throw new UpstreamError(tr('Session expired, and upstream still rejects it after re-creating'));
           throw e2;
         }
       }
       return { answer: isNote ? null : out, error: null };
     } catch (e: any) {
-      const reason = e instanceof UpstreamError ? e.message : `转发失败：${e?.message || e}`;
+      const reason = e instanceof UpstreamError ? e.message : tr('Forwarding failed: {why}', { why: String(e?.message || e) });
       const answer = this.fail(id, reason);
       this.say('warn', `${isNote ? `通知 ${msg?.method} ` : ''}${answer.error.message}`);
       return { answer: isNote ? null : answer, error: answer.error.message };
@@ -890,9 +890,9 @@ export class HttpProxy implements ForwardProxy {
       };
       let r: any;
       try { r = await this.post(init, headers, timeoutMs); } catch (e: any) {
-        throw new UpstreamError(`重建会话失败：${e instanceof UpstreamError ? e.message : e?.message || e}`);
+        throw new UpstreamError(tr('Failed to re-create the session: {why}', { why: String(e instanceof UpstreamError ? e.message : e?.message || e) }));
       }
-      if (r?.error) throw new UpstreamError(`重建会话失败：${r.error?.message || JSON.stringify(r.error)}`);
+      if (r?.error) throw new UpstreamError(tr('Failed to re-create the session: {why}', { why: String(r.error?.message || JSON.stringify(r.error)) }));
       await this.post({ jsonrpc: '2.0', method: 'notifications/initialized' }, headers, timeoutMs);
     };
     this.reinit = run().finally(() => { this.reinit = null; });
@@ -931,16 +931,16 @@ export class HttpProxy implements ForwardProxy {
       if (res.status < 200 || res.status >= 300) {
         const text = await this.readText(res, ac, timeoutMs).catch(() => '');
         if (msg?.method !== 'initialize' && ((res.status === 404 && sentSession) || ((res.status === 400 || res.status === 404) && sessionGoneText(text)))) {
-          throw new UpstreamError(`会话失效：HTTP ${res.status}`, true, sentSession);
+          throw new UpstreamError(tr('Session expired: HTTP {status}', { status: res.status }), true, sentSession);
         }
         if (res.status === 401 || res.status === 403) {
-          throw new UpstreamError(`鉴权失败：HTTP ${res.status}，请检查本机配置的密钥`);
+          throw new UpstreamError(tr('Authentication failed: HTTP {status}. Check the key configured on this machine', { status: res.status }));
         }
         if (res.status >= 300 && res.status < 400) {
-          throw new UpstreamError(`上游要求跳转（HTTP ${res.status}），出于安全不跟随，请检查本机配置的网址`);
+          throw new UpstreamError(tr('Upstream asked for a redirect (HTTP {status}), which is not followed for security. Check the URL configured on this machine', { status: res.status }));
         }
         /* 上游的报错正文不写进日志和错误：它可能回显密钥的任意一部分，打码保证不了 */
-        throw new UpstreamError(`请求失败：HTTP ${res.status}`);
+        throw new UpstreamError(tr('Request failed: HTTP {status}', { status: res.status }));
       }
 
       if (isNote) {
@@ -963,8 +963,8 @@ export class HttpProxy implements ForwardProxy {
 
   private abortError(timeoutMs: number): UpstreamError {
     return this.stopped
-      ? new UpstreamError('转发已停止（会话已结束）')
-      : new UpstreamError(`超时：${timeoutMs}ms 内上游没有回复`);
+      ? new UpstreamError(tr('Forwarding stopped (the session has ended)'))
+      : new UpstreamError(tr('Timed out: no reply from upstream within {ms}ms', { ms: timeoutMs }));
   }
 
   private async readText(res: Response, ac: AbortController, timeoutMs: number): Promise<string> {
@@ -979,37 +979,37 @@ export class HttpProxy implements ForwardProxy {
         total += value.length;
         if (total > HTTP_PROXY_MAX_BODY) {
           reader.cancel().catch(() => {});
-          throw new UpstreamError(`响应解析失败：上游回复超过 ${HTTP_PROXY_MAX_BODY} 字节`);
+          throw new UpstreamError(tr('Bad response: the upstream reply exceeds {n} bytes', { n: HTTP_PROXY_MAX_BODY }));
         }
         chunks.push(Buffer.from(value));
       }
     } catch (e: any) {
       if (e instanceof UpstreamError) throw e;
       if (ac.signal.aborted) throw this.abortError(timeoutMs);
-      throw new UpstreamError(`响应解析失败：读取上游回复时断开（${e?.message || e}）`);
+      throw new UpstreamError(tr('Bad response: disconnected while reading the upstream reply ({why})', { why: String(e?.message || e) }));
     }
     return Buffer.concat(chunks).toString('utf-8');
   }
 
   private pickJson(text: string, id: any): any {
-    if (!text.trim()) throw new UpstreamError('响应解析失败：上游没有返回内容');
+    if (!text.trim()) throw new UpstreamError(tr('Bad response: upstream returned nothing'));
     let parsed: any;
     try { parsed = JSON.parse(text); } catch {
-      throw new UpstreamError('响应解析失败：上游返回的不是合法 JSON');
+      throw new UpstreamError(tr('Bad response: upstream did not return valid JSON'));
     }
     if (Array.isArray(parsed)) {
       const hit = parsed.find((m) => m && m.id === id);
-      if (!hit) throw new UpstreamError(`响应解析失败：上游回复里没有 id 为 ${JSON.stringify(id)} 的响应`);
+      if (!hit) throw new UpstreamError(tr('Bad response: the upstream reply has no response with id {id}', { id: JSON.stringify(id) }));
       return hit;
     }
-    if (!parsed || typeof parsed !== 'object') throw new UpstreamError('响应解析失败：上游返回的不是 JSON-RPC 对象');
+    if (!parsed || typeof parsed !== 'object') throw new UpstreamError(tr('Bad response: upstream did not return a JSON-RPC object'));
     return parsed;
   }
 
   /** 解析 SSE：取出 id 对应的那条响应就收手；上游顺带推的通知 / 请求一律丢掉。 */
   private async readSse(res: Response, id: any, ac: AbortController, timeoutMs: number): Promise<any> {
     const reader = res.body?.getReader();
-    if (!reader) throw new UpstreamError('响应解析失败：SSE 流是空的');
+    if (!reader) throw new UpstreamError(tr('Bad response: the SSE stream is empty'));
     const decoder = new TextDecoder();
     let buf = '';
     let total = 0;
@@ -1018,7 +1018,7 @@ export class HttpProxy implements ForwardProxy {
         const { done, value } = await reader.read();
         if (value) {
           total += value.length;
-          if (total > HTTP_PROXY_MAX_BODY) throw new UpstreamError(`响应解析失败：上游回复超过 ${HTTP_PROXY_MAX_BODY} 字节`);
+          if (total > HTTP_PROXY_MAX_BODY) throw new UpstreamError(tr('Bad response: the upstream reply exceeds {n} bytes', { n: HTTP_PROXY_MAX_BODY }));
           buf += decoder.decode(value, { stream: true });
         }
         if (done) buf += `${decoder.decode()}\n\n`;
@@ -1052,9 +1052,9 @@ export class HttpProxy implements ForwardProxy {
       reader.cancel().catch(() => {});
       if (e instanceof UpstreamError) throw e;
       if (ac.signal.aborted) throw this.abortError(timeoutMs);
-      throw new UpstreamError(`响应解析失败：读取 SSE 时断开（${e?.message || e}）`);
+      throw new UpstreamError(tr('Bad response: disconnected while reading SSE ({why})', { why: String(e?.message || e) }));
     }
-    throw new UpstreamError(`响应解析失败：SSE 流结束了也没有 id 为 ${JSON.stringify(id)} 的响应`);
+    throw new UpstreamError(tr('Bad response: the SSE stream ended without a response with id {id}', { id: JSON.stringify(id) }));
   }
 
   stop(): void {
@@ -1086,10 +1086,10 @@ export async function probeHttpMcp(
     const list = await proxy.call({ jsonrpc: '2.0', id: 2, method: 'tools/list' }, t);
     if (list?.error) return { ok: false, toolCount: 0, error: String(list.error.message || JSON.stringify(list.error)) };
     const tools = list?.result?.tools;
-    if (!Array.isArray(tools)) return { ok: false, toolCount: 0, error: `本机→上游（${spec.name}）响应解析失败：tools/list 没有返回工具清单` };
+    if (!Array.isArray(tools)) return { ok: false, toolCount: 0, error: tr('Local→upstream ({name}) {why}', { name: spec.name, why: tr('Bad response: tools/list returned no tool list') }) };
     return { ok: true, toolCount: tools.length };
   } catch (e: any) {
-    return { ok: false, toolCount: 0, error: `本机→上游（${spec.name}）探测失败：${e?.message || e}` };
+    return { ok: false, toolCount: 0, error: tr('Local→upstream ({name}) {why}', { name: spec.name, why: tr('Probe failed: {why}', { why: String(e?.message || e) }) }) };
   } finally {
     proxy.stop();
   }
