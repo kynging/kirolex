@@ -126,6 +126,16 @@ export const ZH_MODULES_B: Record<string, string> = {
   // ── remotePreflight.ts ──
   'Cannot connect to {host}: {why}. Check the network/keys/security group (kiro-cli and the files for this machine live on it, so nothing runs without a connection).':
     '连不上 {host}：{why}。检查网络/密钥/安全组（这台机器的 kiro-cli 和文件都在它上面，连不上就跑不了）。',
+  'Cannot connect to {host}: {why}. {hint} (kiro-cli and the files for this machine live on it, so nothing runs without a connection).':
+    '连不上 {host}：{why}。{hint}（这台机器的 kiro-cli 和文件都在它上面，连不上就跑不了）。',
+  'the private key file permissions are too open, so ssh refuses to use it': '私钥文件权限太宽，ssh 拒绝使用它',
+  '<private key path>': '<私钥路径>',
+  'Restrict it so only you can read it: `{cmd}`': '把它收紧到只有自己可读：`{cmd}`',
+  'the remote host key has changed (rebuilding the instance or changing its IP does this)': '远端的主机密钥变了（重建过实例或换了 IP 都会这样）',
+  '<host>': '<主机>',
+  'After confirming it is your own machine, remove the old entry and connect again: `{cmd}`': '确认是你自己的机器后，删掉旧记录再连：`{cmd}`',
+  'the remote does not accept this key': '远端不接受这把密钥',
+  'Check that the configured private key belongs to this machine and that the user name is right': '检查配置里的私钥是不是这台机器的、用户名对不对',
   '{host} is missing {tools}. Run the bootstrap script on the remote once to install everything: `{cmd}` (KiroLex does not install things on the remote for you).':
     '{host} 上缺 {tools}。在远端跑一次预置脚本装齐：`{cmd}`（KiroLex 不替你在远端装东西）。',
   'kiro-cli on {host} is not logged in. Run `kiro-cli login` on that machine once. Without a login the executor starts, but every turn comes back empty, which looks just like the server returning empty responses.':

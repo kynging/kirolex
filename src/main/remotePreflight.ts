@@ -10,6 +10,7 @@
 
 import type { RemoteTarget } from './config';
 import { tr, trList } from './uiText.ts';
+import { userInfo } from 'node:os';
 
 export type PreflightCode = 'ok' | 'unreachable' | 'missing-tools' | 'not-logged-in';
 
@@ -142,6 +143,14 @@ export function judgePreflight(
   const host = remote.sshHost || 'remote';
   const out = String(stdout || '');
   if (exitCode !== 0 && !/HAVE |MISS /.test(out)) {
+    const known = sshFailure(stderr, remote);
+    if (known) {
+      return {
+        code: 'unreachable',
+        message: tr('Cannot connect to {host}: {why}. {hint} (kiro-cli and the files for this machine live on it, so nothing runs without a connection).', { host, ...known }),
+        raw: known.why,
+      };
+    }
     const why = firstLine(stderr) || `ssh exit ${exitCode}`;
     return {
       code: 'unreachable',
@@ -333,12 +342,57 @@ export function parseModelMeta(stdout: string): Record<string, { rate?: number; 
   } catch { return {}; }
 }
 
+/**
+ * **认得出的 ssh 失败直接说人话** ——「连不上远程机器，帮我看看怎么回事」。
+ *
+ * 2026-10-14 实测：私钥继承了 `CodexSandboxUsers` 的修改权限，Windows 自带的 ssh 打出
+ * `UNPROTECTED PRIVATE KEY FILE!` 横幅后拒用密钥。横幅第一行是一整排 `@`，于是界面上只剩
+ * "连不上 …：@@@@@@"，看着像主机密钥变了；而 Git Bash 的 ssh 不查 NTFS 权限、照样连得上，
+ * 排查很容易走偏。所以这几种常见原因各给一句话和下一步。
+ *
+ * 顺序是故意的：权限太宽时 ssh 还会顺带打一句 `Permission denied (publickey…)`，真正原因是前者。
+ */
+function sshFailure(stderr: string, remote: RemoteTarget): { why: string; hint: string } | null {
+  const s = String(stderr || '');
+  if (/UNPROTECTED PRIVATE KEY FILE|bad permissions/i.test(s)) {
+    const key = remote.identityFile || tr('<private key path>');
+    const cmd = process.platform === 'win32'
+      ? `icacls "${key}" /inheritance:r /grant:r "${currentUser()}:R"`
+      : `chmod 600 "${key}"`;
+    return {
+      why: tr('the private key file permissions are too open, so ssh refuses to use it'),
+      hint: tr('Restrict it so only you can read it: `{cmd}`', { cmd }),
+    };
+  }
+  if (/REMOTE HOST IDENTIFICATION HAS CHANGED/i.test(s)) {
+    const h = (remote.sshHost || '').replace(/^.*@/, '');
+    /* 非 22 端口在 known_hosts 里记成 `[host]:port` */
+    const entry = !h ? tr('<host>') : remote.sshPort && remote.sshPort !== 22 ? `"[${h}]:${remote.sshPort}"` : h;
+    return {
+      why: tr('the remote host key has changed (rebuilding the instance or changing its IP does this)'),
+      hint: tr('After confirming it is your own machine, remove the old entry and connect again: `{cmd}`', { cmd: `ssh-keygen -R ${entry}` }),
+    };
+  }
+  if (/Permission denied \(publickey/i.test(s)) {
+    return {
+      why: tr('the remote does not accept this key'),
+      hint: tr('Check that the configured private key belongs to this machine and that the user name is right'),
+    };
+  }
+  return null;
+}
+
+function currentUser(): string {
+  try { return userInfo().username; } catch { return process.env.USERNAME || process.env.USER || '%USERNAME%'; }
+}
+
 function firstLine(s: string): string {
   return String(s || '')
     .split('\n')
     .map((l) => l.trim())
     /* SSH 的后量子告警每次都有，不是原因 —— 认它会让每一次"连不上"都指错 */
-    .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*/.test(l))[0] || '';
+    /* ssh 告警横幅的边框（一整排 `@`、`@  WARNING …  @`）也不是原因 */
+    .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*|^@+$|^@.*@$/.test(l))[0] || '';
 }
 
 function escape(s: string): string {
