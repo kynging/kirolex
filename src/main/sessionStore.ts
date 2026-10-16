@@ -1,8 +1,9 @@
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { AgentProfile } from './config';
+import type { AgentProfile } from './config';
 import { tr } from './uiText.ts';
+import { isAdvancedOnly } from './advancedOnly.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -227,6 +228,7 @@ export function hasHistoryFile(id: string): boolean {
   try { return fs.existsSync(historyFilePath(id)); } catch { return false; }
 }
 export function writeHistoryFile(id: string, text: string): string {
+  refuseAdvancedOnlyWrite(id);
   const target = historyFilePath(id);
   ensureDir(id);
   const tmp = `${target}.tmp`;
@@ -249,6 +251,7 @@ export function lastInjectionPath(id: string): string {
 }
 
 export function writeLastInjection(id: string, snapshot: string): void {
+  refuseAdvancedOnlyWrite(id);
   ensureDir(id);
   const target = lastInjectionPath(id);
   const header = '# 上一次发送实际带给模型的上下文快照\n'
@@ -311,6 +314,7 @@ export function readContextOverride(id: string): { text: string; at: number } | 
 }
 
 export function writeContextOverride(id: string, text: string): void {
+  refuseAdvancedOnlyWrite(id);
   ensureDir(id);
   const target = contextOverridePath(id);
   const tmp = `${target}.tmp`;
@@ -320,11 +324,27 @@ export function writeContextOverride(id: string, text: string): void {
 
 /** Back to the generated snapshot. Returns false when there was nothing to remove. */
 export function clearContextOverride(id: string): boolean {
+  if (isAdvancedOnlySession(id)) return false;   // advanced 的上下文不动
   try {
     fs.unlinkSync(contextOverridePath(id));
     return true;
   } catch {
     return false;
+  }
+}
+
+/**
+ * 磁盘上这条是不是 kirolex-advanced 的会话（判据见 `advancedOnly.ts`）—— 是的话标准版**不改它的任何文件**。
+ * 下面每个会改 record / transcript / 目录的函数都先问它：入口那层（index.ts）挡住的是正常路径，
+ * 这里挡住的是以后新加、忘了挡的那条。
+ */
+export function isAdvancedOnlySession(id: string): boolean {
+  try { return isAdvancedOnly(readRecord(id)); } catch { return false; }
+}
+
+function refuseAdvancedOnlyWrite(id: string): void {
+  if (isAdvancedOnlySession(id)) {
+    throw new Error(tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.'));
   }
 }
 
@@ -356,8 +376,9 @@ export function mergePending(rec: SessionRecord, patch: Partial<SessionRecord> |
 /**
  * 写一个字段，不管记录现在有没有。返回它是立刻写进去了，还是挂起等记录。
  */
-export function patchRecord(id: string, patch: Partial<SessionRecord>): 'written' | 'pending' {
+export function patchRecord(id: string, patch: Partial<SessionRecord>): 'written' | 'pending' | 'refused' {
   const rec = readRecord(id);
+  if (isAdvancedOnly(rec)) return 'refused';   // advanced 的记录不改
   if (rec) {
     writeRecord(mergePending(rec, patch));
     pendingPatches.delete(id);
@@ -396,6 +417,7 @@ export function createSession(id: string, profile: AgentProfile, title = 'New Ch
 
 /** Overwrite record.json (metadata is small + rewritable). */
 export function writeRecord(rec: SessionRecord): void {
+  if (isAdvancedOnlySession(rec.id)) return;   // advanced 的记录：跳过，不改
   ensureDir(rec.id);
   rec.updatedAt = Date.now();
   const tmp = recordPath(rec.id) + '.tmp';
@@ -406,6 +428,7 @@ export function writeRecord(rec: SessionRecord): void {
 /** Overwrite record.json WITHOUT bumping updatedAt (sync-side bookkeeping that is
  *  not a user edit, e.g. following another machine's project/archive move). */
 export function writeRecordKeepUpdatedAt(rec: SessionRecord): void {
+  if (isAdvancedOnlySession(rec.id)) return;
   ensureDir(rec.id);
   const tmp = recordPath(rec.id) + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
@@ -435,6 +458,7 @@ export function markAllExecutorsDetached(): void {
   if (!fs.existsSync(baseDir)) return;
   for (const id of fs.readdirSync(baseDir)) {
     const rec = readRecord(id);
+    if (isAdvancedOnly(rec)) continue;   // advanced 自己管它的执行器状态
     if (rec && (rec.executorState === 'attached' || rec.executorState === 'attaching')) {
       rec.executorState = 'detached';
       try {
@@ -472,9 +496,20 @@ export function listSessions(): SessionRecord[] {
   const out: SessionRecord[] = [];
   for (const id of fs.readdirSync(baseDir)) {
     const rec = readRecord(id);
-    if (rec) out.push(rec);
+    // advanced 的会话（flow / skill）不进标准版的任何枚举：侧栏、分屏、搜索、预热、S3、项目归位、级联都走这里
+    if (rec && !isAdvancedOnly(rec)) out.push(rec);
   }
   return out.sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+/** `listSessions()` 藏起来的那些（advanced 的会话）的 id —— S3 页要靠它认出「本机有、只是不显示」。 */
+export function listAdvancedOnlyIds(): Set<string> {
+  const out = new Set<string>();
+  if (!fs.existsSync(baseDir)) return out;
+  for (const id of fs.readdirSync(baseDir)) {
+    if (isAdvancedOnly(readRecord(id))) out.add(id);
+  }
+  return out;
 }
 
 /**
@@ -483,6 +518,7 @@ export function listSessions(): SessionRecord[] {
  * the instant it is sent; an assistant message only once fully received).
  */
 export function appendMessage(id: string, msg: StoredMessage): void {
+  if (isAdvancedOnlySession(id)) return;   // advanced 的 transcript 不追加
   ensureDir(id);
   fs.appendFileSync(transcriptPath(id), JSON.stringify(msg) + '\n');
   const rec = readRecord(id);
@@ -532,6 +568,7 @@ ${message.content}`;
 
 /** Atomically keep only raw transcript events before `messageId`. */
 export function truncateTranscriptBefore(id: string, messageId: string): StoredMessage[] {
+  refuseAdvancedOnlyWrite(id);
   const file = transcriptPath(id);
   const raw = fs.existsSync(file) ? fs.readFileSync(file, 'utf-8') : '';
   const lines = raw.split('\n').filter((line) => line.trim().length > 0);
@@ -551,8 +588,34 @@ export function truncateTranscriptBefore(id: string, messageId: string): StoredM
   return readTranscript(id);
 }
 
+/**
+ * 启动时重试上一次没删完的会话（`deleted-sessions.json` 的墓碑，见 index.ts）。
+ *
+ * - `suppress`：这一次要压住、不许复活的 id（调用方放进 `deletedSessionIds`）；
+ * - `keep`：还要留在墓碑里的 id（没删掉的、以及跳过的 advanced 会话）。
+ *
+ * **advanced 的会话（flow / skill）跳过** —— 不删目录、不压住，墓碑原样留着给 advanced 自己处理。
+ * 两版共用这份文件，残留的 id 可能就是它的。
+ */
+export function retryPendingDeletions(pending: string[]): { suppress: string[]; keep: string[]; skippedAdvanced: string[] } {
+  const suppress: string[] = [];
+  const keep: string[] = [];
+  const skippedAdvanced: string[] = [];
+  for (const id of pending) {
+    if (isAdvancedOnlySession(id)) { skippedAdvanced.push(id); keep.push(id); continue; }
+    suppress.push(id);
+    const dir = path.join(baseDir, id);
+    try {
+      if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
+      if (fs.existsSync(dir)) keep.push(id);
+    } catch { keep.push(id); }
+  }
+  return { suppress, keep, skippedAdvanced };
+}
+
 export function deleteSession(id: string): void {
   const d = dirFor(id);
+  if (isAdvancedOnlySession(id)) return;
   if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
 }
 
@@ -561,6 +624,7 @@ export function deleteSession(id: string): void {
  *  precisely which messages to retain, so no id lookup (which fails for un-persisted
  *  messages like mid-turn steers) is needed. */
 export function rewriteTranscript(id: string, messages: StoredMessage[]): void {
+  refuseAdvancedOnlyWrite(id);
   ensureDir(id);
   const file = transcriptPath(id);
   const tmp = `${file}.tmp`;

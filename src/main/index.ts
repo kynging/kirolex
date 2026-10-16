@@ -34,6 +34,7 @@ import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, can
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
+import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord } from './advancedOnly.ts';
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
@@ -856,6 +857,7 @@ const memoryConsolidating = new Set<string>();
 
 async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
   if (!isFeatureEnabled('sessionMemory')) return;
+  if (refuseAdvancedOnly(sessionId, 'consolidate-memory')) return;
   try {
     const messages = store.readTranscript(sessionId) || [];
     const record = store.readRecord(sessionId);
@@ -3669,6 +3671,7 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants)
   const sid = String(sessionId || '').trim();
   const text = String(body || '').trim();
   if (!sid || !text) return false;
+  if (refuseAdvancedOnly(sid, 'note')) return false;
   /* 中英两版一起落盘（tr() 出来的才认得；渲染层发起的自己带过来）—— 切了语言、重新打开都按当时的界面语言显示 */
   const v = asVariants(variants) ?? textVariants(text);
   const messageId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_note`;
@@ -3967,6 +3970,57 @@ function projectExcluded(cfg: SyncConfig, project: string): boolean {
 /** 这条会话要不要同步 ——「我现在还是不能选择是否备份会话」。项目关着的话整组都不传，这里是再细一层。 */
 function sessionExcluded(cfg: SyncConfig, sessionId: string): boolean {
   return Array.isArray(cfg.excludeSessions) && cfg.excludeSessions.includes(sessionId);
+}
+
+/**
+ * **advanced 的会话（flow / skill），标准版按 id 也不碰** ——「防止两版串」。
+ *
+ * 枚举那一侧 `store.listSessions()` 已经把它们藏了；这里挡的是按 id 直接打进来的（UI 缓存里残留的 id、
+ * 老的分屏布局、控制入口）。返回 null = 放行；否则是要回给调用方的拒绝原因。判据只有一份（`advancedOnly.ts`）。
+ */
+function refuseAdvancedOnly(sessionId: string, what: string): string | null {
+  if (!sessionId || !store.isAdvancedOnlySession(sessionId)) return null;
+  logger.warn('session', `refused ${what}: sessionId=${sessionId} 是 KiroLex Advanced 的会话（flow / skill），标准版不碰`);
+  return tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.');
+}
+
+/**
+ * **只在云上的那些备份是不是 advanced 的** —— 本机没有记录（`listAdvancedOnlyIds` 认不出）时，
+ * 读桶里那份 `record.json` 用同一个判据判。读失败的进 `unreadable`：删除备份时一律不删。
+ */
+function cloudAdvancedBackups(creds: S3Creds, prefix: string | undefined, ids: Iterable<string>) {
+  return findAdvancedBackups(ids, (id) => getObjectIfExists(creds, keyFor(prefix, path.join('sessions', id, 'record.json'))));
+}
+
+/**
+ * **恢复页要藏起来的那些备份** —— advanced 的会话（flow / skill）：本机藏着的（`listAdvancedOnlyIds`），
+ * 加上只在云上、桶里 record.json 是 advanced 的。不认出来就会显示成「本地没有」：既像可恢复，又像该清理的。
+ * 读不出来的照常列（恢复时 `refuseAdvancedBackup` 还会再判；删除备份时不删）。
+ */
+async function advancedBackupIds(creds: S3Creds, prefix: string | undefined, catalog: Catalog, local: Set<string>): Promise<Set<string>> {
+  const hidden = store.listAdvancedOnlyIds();
+  const cloudOnly = (catalog.entries || []).map((e) => e.id).filter((id) => !local.has(id) && !hidden.has(id));
+  const cloud = await cloudAdvancedBackups(creds, prefix, cloudOnly);
+  return new Set([...hidden, ...cloud.advanced]);
+}
+
+/**
+ * 桶里这份备份是不是 advanced 的会话（flow / skill）—— `s3:restore` 动任何本地文件之前问。
+ * 本机没有这条时 `refuseAdvancedOnly` 挡不住，而 catalog 里不带 purpose，只能看备份里的 record.json。
+ * 判据在 `vetBackupRecord`：**读不出来 = 不恢复**（确认不了用途就不写）。放行时带回一个 `get`：
+ * 恢复循环用它下载，record.json 直接给已校验的那份字节，不再 GET 一次（两次读到的可能不一样）。
+ */
+async function refuseAdvancedBackup(creds: S3Creds, prefix: string, objects: Array<{ key: string }>, sessionId: string): Promise<{ refused: string } | { get: (key: string) => Promise<Buffer> }> {
+  const recordKey = objects.some((o) => o.key === `${prefix}record.json`) ? `${prefix}record.json` : null;
+  const v = await vetBackupRecord(recordKey, (key) => getObject(creds, key));
+  if (v.ok) {
+    const vetted = v.record;
+    return { get: async (key) => (vetted && key === recordKey ? vetted : getObject(creds, key)) };
+  }
+  logger.warn('s3', `refused s3:restore: sessionId=${sessionId} ${v.reason === 'advanced' ? '桶里那份是 KiroLex Advanced 的会话' : '桶里那份 record.json 读不出来、确认不了用途'}，标准版不恢复`);
+  return { refused: v.reason === 'advanced'
+    ? tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.')
+    : tr("Could not read this backup's record.json, so it is not restored (it might be a KiroLex Advanced session). Try again later.") };
 }
 
 function catalogEntriesFor(
@@ -5490,17 +5544,12 @@ app.whenReady().then(async () => {
   try {
     const pending = loadSessionTombstones();
     if (pending.length) {
-      const stillThere: string[] = [];
-      for (const id of pending) {
-        deletedSessionIds.add(id);
-        const dir = path.join(os.homedir(), '.kirolex', 'sessions', id);
-        try {
-          if (fs.existsSync(dir)) fs.rmSync(dir, { recursive: true, force: true, maxRetries: 3, retryDelay: 120 });
-          if (fs.existsSync(dir)) stillThere.push(id);
-        } catch { stillThere.push(id); }
-      }
+      /* advanced 的会话（flow / skill）在里面跳过：不删、不压住，墓碑留给 advanced 自己 */
+      const { suppress, keep: stillThere, skippedAdvanced } = store.retryPendingDeletions(pending);
+      for (const id of suppress) deletedSessionIds.add(id);
       saveSessionTombstones(stillThere);
-      logger.info('delete-session', `retried ${pending.length} pending deletion(s); ${stillThere.length} still locked`);
+      logger.info('delete-session', `retried ${pending.length} pending deletion(s); ${stillThere.length - skippedAdvanced.length} still locked`
+        + `${skippedAdvanced.length ? `; skipped ${skippedAdvanced.length} KiroLex Advanced session(s)` : ''}`);
     }
   } catch {}
 
@@ -5520,6 +5569,7 @@ app.whenReady().then(async () => {
     try {
       for (const id of fs.readdirSync(sessionsDir)) {
         const d = path.join(sessionsDir, id);
+        if (store.isAdvancedOnlySession(id)) continue;   // advanced 的会话目录不碰
         if (fs.statSync(d).isDirectory()) dirs.push(d);
       }
     } catch { /* no sessions yet */ }
@@ -5565,7 +5615,9 @@ app.whenReady().then(async () => {
     ].filter((d) => fs.existsSync(d));
     if (dirs.length) {
       const referenced = new Set<string>();
-      for (const rec of store.listSessions()) {
+      /* advanced 的会话（flow / skill）不在 listSessions() 里，但它们引用的粘贴也是活的 —— 只读，一起算上 */
+      const advanced = [...store.listAdvancedOnlyIds()].map((id) => ({ id }));
+      for (const rec of [...store.listSessions(), ...advanced]) {
         for (const m of store.readTranscript(rec.id, { raw: true }) as any[]) {
           for (const a of (m?.attachments || [])) if (a?.path) referenced.add(path.resolve(a.path));
           for (const p of (m?.pastes || [])) if (p?.path) referenced.add(path.resolve(p.path));
@@ -5868,10 +5920,11 @@ app.whenReady().then(async () => {
         }
       } catch { /* 列不出来就不显示，不挡恢复 */ }
       const recById = new Map(localRecs.map((r) => [r.id, r]));
+      const hidden = await advancedBackupIds(creds!, cfg.prefix, catalog, local);   // advanced 的会话不进恢复页
       return {
         memoryByProject,
         /* 分组 / 归档按 catalog 自己的（恢复页显示的是云上那份），本机归档了没有不管 */
-        entries: (catalog.entries || []).map((e) => ({
+        entries: (catalog.entries || []).filter((e) => !hidden.has(e.id)).map((e) => ({
           ...e,
           project: catalogProject(e, projectById.get(e.id)),
           existsLocally: local.has(e.id),
@@ -5928,7 +5981,12 @@ app.whenReady().then(async () => {
       let catalog: Catalog;
       try { catalog = JSON.parse(raw.toString('utf-8')) as Catalog; } catch { return { ok: false, error: tr('The catalog could not be read.') }; }
       const projectById = new Map(store.listSessions().map((r) => [r.id, projectOf(r)]));
-      const mine = (catalog.entries || []).filter((e) => (e.project || projectById.get(e.id) || '') === project);
+      /* 本机藏起来的 advanced 会话（flow / skill）不算这个项目的、不删 —— 它们由 advanced 自己同步 */
+      const hidden = store.listAdvancedOnlyIds();
+      const candidates = (catalog.entries || []).filter((e) => !hidden.has(e.id) && (e.project || projectById.get(e.id) || '') === project);
+      /* 本机没有的：看桶里的 record.json —— advanced 的、读不出来的都不删 */
+      const cloud = await cloudAdvancedBackups(creds!, cfg.prefix, candidates.map((e) => e.id).filter((id) => !projectById.has(id)));
+      const mine = candidates.filter((e) => !cloud.advanced.has(e.id) && !cloud.unreadable.has(e.id));
       if (!mine.length) return { ok: false, error: tr('The bucket has no backups belonging to "{project}".', { project: project || tr('Unassigned') }) };
 
       const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, catalog, new Set(mine.map((e) => e.id)));
@@ -5958,7 +6016,8 @@ app.whenReady().then(async () => {
   ipcMain.handle('s3:keep-local', async (_event, ids: string[]) => {
     const { creds, problem } = syncCredsOrProblem();
     if (problem) return { ok: false, error: problem };
-    const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id) && store.readRecord(id));
+    const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id) && store.readRecord(id)
+      && !refuseAdvancedOnly(id, 's3:keep-local'));   // advanced 的会话由 advanced 自己同步
     if (!want.length) return { ok: false, error: tr('No sessions selected, or none of them exist on this machine.') };
     const cfg = loadSyncConfig();
     const thisMachine = machineTag(os.hostname());
@@ -5988,9 +6047,13 @@ app.whenReady().then(async () => {
       let catalog: Catalog;
       try { catalog = JSON.parse(raw.toString('utf-8')) as Catalog; } catch { return { ok: false, error: tr('The catalog could not be read.') }; }
       const inBucket = new Set((catalog.entries || []).map((e) => e.id));
-      const gone = new Set(want.filter((id) => inBucket.has(id)));
-      if (!gone.size) return { ok: false, error: tr('None of the selected sessions are in the bucket any more.') };
+      /* 本机藏起来的 advanced 会话（flow / skill）：恢复页不列它们，这里也绝不删它们在桶里的备份 */
+      const hidden = store.listAdvancedOnlyIds();
       const local = new Set(store.listSessions().map((r) => r.id));
+      /* 本机没有的：看桶里的 record.json —— advanced 的、读不出来的都不删 */
+      const cloud = await cloudAdvancedBackups(creds!, cfg.prefix, want.filter((id) => inBucket.has(id) && !local.has(id) && !hidden.has(id)));
+      const gone = new Set(want.filter((id) => inBucket.has(id) && !hidden.has(id) && !cloud.advanced.has(id) && !cloud.unreadable.has(id)));
+      if (!gone.size) return { ok: false, error: tr('None of the selected sessions are in the bucket any more.') };
       const willReturn = [...gone].filter((id) => local.has(id));
       const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, catalog, gone);
       logger.warn('s3', `删掉了 ${gone.size} 条会话的备份 / ${deleted} 个对象`
@@ -6011,6 +6074,7 @@ app.whenReady().then(async () => {
     const { creds, problem } = syncCredsOrProblem();
     if (problem) return { ok: false, error: problem };
     if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
+    { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
     /*
       **连着的先断开，不再让人手动去断** —— 恢复现在是合并（同 id 去重、按时间排），
       断开之后执行器手上那份不会再写盘，合并完下次打开按记录重新接上。
@@ -6030,6 +6094,7 @@ app.whenReady().then(async () => {
       const prefix = `${keyFor(cfg.prefix, path.join('sessions', sessionId))}/`;
       const objects = await listObjects(creds!, prefix);
       if (!objects.length) return { ok: false, error: tr('The bucket has no files for {id}.', { id: sessionId }) };
+      const vetted = await refuseAdvancedBackup(creds!, prefix, objects, sessionId); if ('refused' in vetted) return { ok: false, error: vetted.refused };
 
       const localDir = path.join(KIROLEX_HOME, 'sessions', sessionId);
       const existed = fs.existsSync(localDir);
@@ -6068,7 +6133,7 @@ app.whenReady().then(async () => {
         const rel = relFor(cfg.prefix, obj.key);
         if (!rel) continue;                                  // 不属于这个布局 / 含 `..`
         const abs = path.join(KIROLEX_HOME, rel);
-        const body = await getObject(creds!, obj.key);
+        const body = await vetted.get(obj.key);
         const base = path.basename(rel);
 
         if (existed && base === 'transcript.jsonl') {
@@ -6410,6 +6475,7 @@ app.whenReady().then(async () => {
      * 实测的样子：flow 重置一步 → 那条 worker 被回收进回收站 → **7 秒后**它那一发在途的 prompt 到了 →
      * 目录重新出现，成了一条没有任何节点引用的孤儿 worker。这就是「很多没用的子会话还在那」的来源之一。
      */
+    { const advRefused = refuseAdvancedOnly(sessionId, 'prompt'); if (advRefused) throw new Error(advRefused); }
     if (deletedSessionIds.has(sessionId)) {
       logger.warn('prompt', `refused: sessionId=${sessionId} was deleted —— 不再复活它`);
       throw new Error(tr('This session has been deleted. Nothing more will be sent to it.'));
@@ -7468,6 +7534,7 @@ app.whenReady().then(async () => {
    *  re-sent through acp:prompt, which persists it there. */
   ipcMain.handle('acp:persist-steer', async (_event, sessionId: string, text: string, messageId?: string) => {
     if (!sessionId || !text) return { ok: false, error: 'no text' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'persist-steer'); if (advRefused) return { ok: false, error: advRefused }; }
     const entry = sessionClients.get(sessionId);
     // The turn's own user message is the merge target. If it is unknown (a steer
     // into a turn this process did not start — e.g. after a hot restart), fall back
@@ -7503,6 +7570,7 @@ app.whenReady().then(async () => {
    *  completion and the asymmetric-durability rule. */
   ipcMain.handle('acp:persist-note', async (_event, sessionId: string, text: string, variants?: unknown) => {
     if (!sessionId || !text || !text.trim()) return { ok: false, error: 'no text' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'persist-note'); if (advRefused) return { ok: false, error: advRefused }; }
     if (!store.readRecord(sessionId)) return { ok: false, error: 'unknown session' };
     const content = text.length > 4000 ? `${text.slice(0, 4000)}…` : text;
     try {
@@ -7537,6 +7605,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('loop:register-verifier', (_event, sessionId: string, command: string, timeoutSec: number) => {
     if (!sessionId) return { ok: false, error: 'no session' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'loop:register-verifier'); if (advRefused) return { ok: false, error: advRefused }; }
     if (!command || !command.trim()) {
       registeredVerifiers.delete(sessionId);
       logger.info('loop', `verifier cleared sessionId=${sessionId}`);
@@ -7557,6 +7626,7 @@ app.whenReady().then(async () => {
    *  the session's own profile, exactly like the executor's. */
   ipcMain.handle('loop:verify', async (_event, sessionId: string, command: string, timeoutSec: number) => {
     if (!sessionId) return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: 'no session' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'loop:verify'); if (advRefused) return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: advRefused }; }
     const approved = registeredVerifiers.get(sessionId);
     if (!approved || approved.command !== command) {
       // Not an error the user caused: it means something asked to run a command
@@ -7619,7 +7689,7 @@ app.whenReady().then(async () => {
       // CHARGE THE RUN FIRST, and flush it. Recording only on completion means a process
       // killed mid-run forgets it paid -- the shape of a job that bills a turn per restart.
       const charged = recordRun(state, Date.now());
-      scheduleStore.writeSchedule(id, charged, os.homedir());
+      scheduleStore.writeSchedule(id, charged, os.homedir(), store.isAdvancedOnlySession);
 
       let failure: string | undefined;
       try {
@@ -7637,7 +7707,7 @@ app.whenReady().then(async () => {
       const settled = { ...latest.state, lastError: failure ?? null };
       const terminal = scheduleTerminal(settled);
       const final = terminal ? { ...settled, terminal } : settled;
-      scheduleStore.writeSchedule(id, final, os.homedir());
+      scheduleStore.writeSchedule(id, final, os.homedir(), store.isAdvancedOnlySession);
       logger.info('schedule', `run id=${id} session=${state.sessionId} runs=${final.runs}/${final.spec.maxRuns}`
         + ` error=${failure ? JSON.stringify(failure) : 'none'} terminal=${terminal ?? 'none'}`);
 
@@ -7661,7 +7731,8 @@ app.whenReady().then(async () => {
     // 等待退出期间不开新一轮；到期的任务留着，取消等待或重启后下一跳照样触发
     if (quitPending) return;
     const now = Date.now();
-    for (const job of scheduleStore.listSchedules(os.homedir())) {
+    /* advanced 会话（flow / skill）的定时任务不跑、不记账 —— 它们归 advanced 自己 */
+    for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)) {
       if (isDue(job.state, now)) void runScheduledJob(job);
     }
   }, SCHEDULE_TICK_MS);
@@ -7680,11 +7751,12 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('schedule:create', (_event, sessionId: string, spec: ScheduleSpec) => {
     if (!sessionId || sessionId.startsWith('pending_')) return { ok: false, error: tr('Select a session that has already been created first') };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'schedule:create'); if (advRefused) return { ok: false, error: advRefused }; }
     const problems = validateSchedule(spec);
     if (problems.length) return { ok: false, error: problems.join(tr('; ')) };
     const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const state = newSchedule(sessionId, spec, Date.now());
-    scheduleStore.writeSchedule(id, state, os.homedir());
+    scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
     logger.info('schedule', `created id=${id} session=${sessionId} ${describeSchedule(spec)} maxRuns=${spec.maxRuns}`);
     // Announced like every other mutation: the window that created the job learns of it the
     // same way as any other, so its banner appears without a reload. The end of a RUN used to
@@ -7693,7 +7765,7 @@ app.whenReady().then(async () => {
     return { ok: true, id, nextRunAt: nextRunAt(state), describe: describeSchedule(spec) };
   });
 
-  ipcMain.handle('schedule:list', () => scheduleStore.listSchedules(os.homedir()).map((job) => ({
+  ipcMain.handle('schedule:list', () => scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).map((job) => ({
     id: job.id,
     sessionId: job.state.sessionId,
     prompt: job.state.spec.prompt,
@@ -7710,15 +7782,18 @@ app.whenReady().then(async () => {
   ipcMain.handle('schedule:pause', (_event, id: string, paused: boolean) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
     if (!job) return { ok: false, error: tr('This scheduled task was not found') };
+    { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:pause'); if (advRefused) return { ok: false, error: advRefused }; }
     const state = { ...job.state, paused };
-    scheduleStore.writeSchedule(id, state, os.homedir());
+    scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
     logger.info('schedule', `${paused ? 'paused' : 'resumed'} id=${id}`);
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true };
   });
 
   ipcMain.handle('schedule:remove', (_event, id: string) => {
-    scheduleStore.removeSchedule(id, os.homedir());
+    { const owner = scheduleStore.readSchedule(id, os.homedir())?.state.sessionId;
+      const advRefused = owner ? refuseAdvancedOnly(owner, 'schedule:remove') : null; if (advRefused) return { ok: false, error: advRefused }; }
+    scheduleStore.removeSchedule(id, os.homedir(), store.isAdvancedOnlySession);
     logger.info('schedule', `removed id=${id}`);
     // `state: null` says GONE. The renderer re-reads the list either way, but a payload that
     // omitted the outcome would make "removed" indistinguishable from "changed somehow".
@@ -7738,8 +7813,9 @@ app.whenReady().then(async () => {
    * decision, and the recorded reason a run ended. */
   ipcMain.handle('loop:persist', (_event, sessionId: string, run: any) => {
     if (!sessionId || !run?.spec?.stop) return { ok: false, error: 'no run' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'loop:persist'); if (advRefused) return { ok: false, error: advRefused }; }
     try {
-      loopStore.writeLoop(sessionId, run, os.homedir());
+      loopStore.writeLoop(sessionId, run, os.homedir(), store.isAdvancedOnlySession);
       return { ok: true };
     } catch (err: any) {
       return { ok: false, error: err?.message || 'persist failed' };
@@ -7750,7 +7826,8 @@ app.whenReady().then(async () => {
    *  The renderer must call this instead of counting locally, or the count goes back to
    *  being per-window. */
   ipcMain.handle('loop:begin-round', (_event, sessionId: string) => {
-    const result = loopStore.beginRound(sessionId, os.homedir(), Date.now());
+    { const advRefused = refuseAdvancedOnly(sessionId, 'loop:begin-round'); if (advRefused) return { run: null, terminal: null, error: advRefused }; }
+    const result = loopStore.beginRound(sessionId, os.homedir(), Date.now(), store.isAdvancedOnlySession);
     if (result.run) {
       logger.info('loop', `round sessionId=${sessionId} iteration=${result.run.iteration}`
         + `/${result.run.spec.stop.maxIterations} terminal=${result.terminal ?? 'none'}`);
@@ -7759,9 +7836,11 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('loop:read', (_event, sessionId: string) => loopStore.readLoop(sessionId, os.homedir()));
-  ipcMain.handle('loop:list-live', () => loopStore.listLiveLoops(os.homedir()));
+  /* advanced 会话的循环不交给标准版去续跑（它们的会话标准版本来就看不见、也发不进去） */
+  ipcMain.handle('loop:list-live', () => loopStore.listLiveLoops(os.homedir()).filter((r) => !store.isAdvancedOnlySession(r.sessionId)));
   ipcMain.handle('loop:clear', (_event, sessionId: string) => {
-    loopStore.clearLoop(sessionId, os.homedir());
+    { const advRefused = refuseAdvancedOnly(sessionId, 'loop:clear'); if (advRefused) return { ok: false, error: advRefused }; }
+    loopStore.clearLoop(sessionId, os.homedir(), store.isAdvancedOnlySession);
     return { ok: true };
   });
 
@@ -7862,6 +7941,7 @@ app.whenReady().then(async () => {
    */
   ipcMain.handle('acp:mark-cleared', async (_event, sessionId: string) => {
     if (!sessionId?.trim()) return { ok: false, error: tr('No session specified') };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'mark-cleared'); if (advRefused) return { ok: false, error: advRefused }; }
     const rec = store.readRecord(sessionId);
     if (!rec) return { ok: false, error: tr('No such session') };
     const at = Date.now();
@@ -7874,6 +7954,7 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('acp:clear-context', async (_event, sessionId: string) => {
     if (!sessionId?.trim()) return { ok: false, error: tr('No session specified') };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'clear-context'); if (advRefused) return { ok: false, error: advRefused }; }
     try {
       await sendPromptOnce(sessionId, [{ type: 'text', text: '/clear' }], undefined, {
         messageId: `flow_clear_${Date.now()}`,
@@ -8013,6 +8094,7 @@ app.whenReady().then(async () => {
    * —— 否则「不许手删」就等于「永远删不掉」。守卫放在 IPC 那一层，这个函数是两条路共用的动作。
    */
   const purgeSession = async (sessionId: string): Promise<{ ok: boolean; tombstoned?: boolean; error?: string }> => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'delete'); if (advRefused) return { ok: false, error: advRefused }; }
     // Kill this chat's executor first (frees a slot, stops the kiro-cli process)
     // so deleting a chat never leaves an orphaned process running.
     //
@@ -8165,6 +8247,7 @@ app.whenReady().then(async () => {
   };
 
   ipcMain.handle('acp:delete-session', async (_event, sessionId: string) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'delete'); if (advRefused) return { ok: false, error: advRefused, cascaded: [] }; }
     /**
      * A FLOW'S MAIN SESSION IS NOT DELETABLE — refused HERE, not only in the menu.
      *
@@ -8714,6 +8797,7 @@ app.whenReady().then(async () => {
     localDir?: string,
     hint?: { projectId?: string | null },
   ) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'set-remote-target'); if (advRefused) throw new Error(advRefused); }
     const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
     if (remoteId && !target) throw new Error(tr('Remote target {id} not found (was it removed in Settings?). KiroLex did not guess a machine.', { id: remoteId }));
     return applySessionTarget(sessionId, target, localDir, hint);
@@ -8729,6 +8813,7 @@ app.whenReady().then(async () => {
    * 不用像 kiro 那样换执行器。选了就记在会话上，下次连上（`applyEngineModel`）设回去。
    */
   const setEngineOption = async (sessionId: string, category: EngineOptionCategory, value: string) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'set-engine-option'); if (advRefused) throw new Error(advRefused); }
     const entry = sessionClients.get(sessionId);
     if (!entry) throw new Error(tr('This session is not connected right now. Switch after it connects (click it or send a message to reconnect).'));
     const engine = engineOf(entry.profile);
@@ -8783,6 +8868,7 @@ app.whenReady().then(async () => {
   };
 
   ipcMain.handle('acp:switch-model', async (_event, sessionId: string, model: string) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'switch-model'); if (advRefused) throw new Error(advRefused); }
     const oldEntry = sessionClients.get(sessionId);
     /* 模型下拉是 kiro 的清单；Claude Code / Codex 用它们自己 CLI 配的模型（界面上也不显示这个下拉） */
     const notKiroModel = (p: AgentProfile) => tr('The model of a {engine} session is configured in its own CLI; it cannot be switched here yet.', { engine: ENGINE_LABEL[engineOf(p)] });
@@ -8912,6 +8998,7 @@ app.whenReady().then(async () => {
     sessionId: string,
     permissionMode: 'auto-approve' | 'ask',
   ) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'switch-permission-mode'); if (advRefused) throw new Error(advRefused); }
     const entry = sessionClients.get(sessionId);
     const normalizedMode = permissionMode === 'ask' ? 'ask' : 'auto-approve';
     /* 休眠：写记录就够了 —— 下次挂起时按记录起（见 `setDormantProfile`） */
@@ -8942,6 +9029,7 @@ app.whenReady().then(async () => {
   // and durable transcript remain; the selected agent starts fresh context and
   // receives the normal layered-memory injection on its next prompt.
   ipcMain.handle('acp:switch-kiro-agent', async (_event, sessionId: string, agentName: string) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'switch-agent'); if (advRefused) throw new Error(advRefused); }
     const oldEntry = sessionClients.get(sessionId);
     const normalizedAgent = agentName.trim() || undefined;
     /* 休眠：`--agent` 是启动执行器时才绑的，所以现在只需要记下"下次用哪个"（见 `setDormantProfile`） */
@@ -9017,6 +9105,7 @@ app.whenReady().then(async () => {
    * 按新引擎起（和「运行位置」那条路一样，「没连上也应该能切」）。
    */
   ipcMain.handle('acp:switch-engine', async (_event, sessionId: string, engineArg: string, hint?: { projectId?: string | null }) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'switch-engine'); if (advRefused) throw new Error(advRefused); }
     const engine = engineOf({ engine: engineArg });
     const label = ENGINE_LABEL[engine];
     const oldEntry = sessionClients.get(sessionId);
@@ -9142,6 +9231,7 @@ app.whenReady().then(async () => {
    * （随下一条消息带过去）。没连着的会话只改记录（见 `setDormantProfile`）。这一轮还在跑时拒绝。
    */
   ipcMain.handle('acp:switch-mcp-combo', async (_event, sessionId: string, comboId: string) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'switch-mcp-combo'); if (advRefused) throw new Error(advRefused); }
     const { combos } = readMcpCombos(os.homedir());
     const combo = combos.find((c) => c.id === comboId);
     if (!combo) throw new Error(tr('Combo "{id}" not found (did the combo file change? Reopen the dropdown and check).', { id: comboId }));
@@ -9671,6 +9761,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('workspace:copy-remote-to-local', async (_event, sessionId: string, remotePath: string) => {
     try {
       if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('No session') };
+      { const advRefused = refuseAdvancedOnly(sessionId, 'copy-remote-to-local'); if (advRefused) return { ok: false, error: advRefused }; }
       const remote = remoteFileFor(sessionId, String(remotePath || ''));
       if (!remote) return { ok: false, error: tr('This is not a path on the machine this remote session runs on') };
       const MAX = 64 * 1024 * 1024;
@@ -10059,6 +10150,7 @@ app.whenReady().then(async () => {
    * 函数体就是原来那个 `acp:load-session` handler，原样搬出来，逻辑一个字节没改；IPC 那侧只是转发。
    */
   const loadSessionImpl = async (sessionId: string, cwd: string, model: string): Promise<any> => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'attach'); if (advRefused) throw new Error(advRefused); }
     if (!firstAttachMarked) { firstAttachMarked = true; startupMark('attach: first loadSession', `sessionId=${sessionId}`); }
     const askedCwd = cwd === '~' ? os.homedir() : cwd;
     /*
@@ -10439,6 +10531,8 @@ app.whenReady().then(async () => {
       localExists: (p) => fs.existsSync(p),
       remoteFor: (raw) => remoteFileFor(sessionId, raw),
       reviewed: (key) => wasReviewed(sessionId, key),
+      /* advanced 会话（flow / skill）的文件不改 —— 审阅 / 演示稿的每一条写盘路都经过这里（备份、写回、改写、幻灯片文字 / 备注） */
+      refuse: () => (sessionId ? refuseAdvancedOnly(sessionId, 'review-target') : null),
     });
     if (!t.ok && t.notPreviewed) {
       logger.warn('review', `refused: not previewed by session=${sessionId || '(none)'} (${String(filePath || '')})`);
@@ -10491,6 +10585,7 @@ app.whenReady().then(async () => {
    * "写前拷一份"。备在**发之前**：文件在它落笔前一个字节都没变，这时拷的就是"改之前"。
    */
   ipcMain.handle('review:backup-file', async (_event, sessionId: string | null | undefined, filePath: string) => {
+    { const advRefused = sessionId ? refuseAdvancedOnly(sessionId, 'review:backup-file') : null; if (advRefused) return { ok: false, error: advRefused }; }
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return t;
     /* 远端文件：从那台机器读出来，存本机 —— 只备份读得全的（ssh 回来的是前 512KB），读不全就说清楚 */
@@ -10535,6 +10630,7 @@ app.whenReady().then(async () => {
    */
   const writeReviewFile = async (sessionId: string | null | undefined, filePath: string, text: string, expectBase?: string): Promise<any> => {
     if (typeof text !== 'string' || !text.trim()) return { ok: false, error: tr('The content is empty, so nothing was written') };
+    { const advRefused = sessionId ? refuseAdvancedOnly(sessionId, 'review:write-file') : null; if (advRefused) return { ok: false, error: advRefused }; }
     const t = reviewTarget(sessionId, filePath);
     if (!t.ok) return t;
     if (t.remote) return writeRemoteReviewFile(sessionId, t.remote, t.want, text, expectBase);
@@ -11090,6 +11186,7 @@ app.whenReady().then(async () => {
    * 改讲稿必然改 mtime（缓存 key 失效），而讲稿根本不进 PDF；这次改动是我们做的，我们清楚只有讲稿变了。
    */
   ipcMain.handle('deck:write-note', async (_event, sessionId: string | null | undefined, filePath: string, page: number, text: string) => {
+    { const advRefused = sessionId ? refuseAdvancedOnly(sessionId, 'deck:write-note') : null; if (advRefused) return { ok: false, error: advRefused }; }
     const g = deckTarget(sessionId, filePath, page);
     if (!g.ok) return g;
     const { want, at } = g;
@@ -11190,6 +11287,7 @@ app.whenReady().then(async () => {
     const sid = String(input?.sessionId || '').trim();
     const note = String(input?.note || '').trim();
     if (!sid) return { ok: false, error: tr('This file does not belong to a session, so there is nowhere to ask') };
+    { const advRefused = refuseAdvancedOnly(sid, 'deck:revise-slide-text'); if (advRefused) return { ok: false, error: advRefused }; }
     if (!note) return { ok: false, error: tr('No comment given') };
     const g = deckTarget(sid, String(input?.filePath || ''), Number(input?.page));
     if (!g.ok) return g;
@@ -11279,6 +11377,7 @@ app.whenReady().then(async () => {
   /** Manual rebuild. `force` also covers the case a successful session/load
    *  cannot rule out: kiro-cli resumed an id that was itself empty. */
   ipcMain.handle('acp:prime-history', async (_event, sessionId: string, force?: boolean) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'prime-history'); if (advRefused) return { ok: false, error: advRefused }; }
     return primeHistoryNow(sessionId, { force: !!force });
   });
 
@@ -11293,6 +11392,7 @@ app.whenReady().then(async () => {
    *  to use this chat is known. */
   ipcMain.handle('acp:ensure-context', async (_event, sessionId: string) => {
     if (!sessionId || sessionId.startsWith('pending_')) return { ok: true, skipped: true };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'ensure-context'); if (advRefused) return { ok: false, error: advRefused }; }
     const entry = sessionClients.get(sessionId);
     if (!entry) return { ok: false, error: 'not attached' };
     // Opening a chat costs NOTHING for the default (snapshot) path: the context
@@ -11317,6 +11417,7 @@ app.whenReady().then(async () => {
    *  worth 78 model turns per launch. */
   ipcMain.handle('acp:set-prime-mode', async (_event, sessionId: string, primeMode: 'snapshot' | 'full') => {
     if (!sessionId) return { ok: false, error: 'no sessionId' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'set-prime-mode'); if (advRefused) return { ok: false, error: advRefused }; }
     try {
       /*
         `patchRecord` 而不是「读-改-写」：这个 IPC 也是在会话刚建出来时被调用的(flow 编辑会话交底那一步),
@@ -11388,6 +11489,7 @@ app.whenReady().then(async () => {
   // null/undefined -> concrete transition; project->project or un-set is
   // rejected. Persists to the durable record and syncs any live executor.
   ipcMain.handle('acp:assign-project', async (_event, sessionId: string, projectId: string) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'assign-project'); if (advRefused) throw new Error(advRefused); }
     const rec = store.readRecord(sessionId);
     if (!rec) throw new Error(tr('No such session'));
     if (!canAssignProjectId(rec.profile.projectId, projectId)) {
@@ -11406,6 +11508,8 @@ app.whenReady().then(async () => {
   // admin operation). Unlike acp:assign-project this bypasses the write-once
   // check on purpose; per-session Assign still goes through the checked path.
   ipcMain.handle('acp:set-project', async (_event, sessionId: string, projectId: string | null) => {
+    /* 改名 / 删项目时成批调：advanced 的那条跳过，不报错（它本来就不在标准版的列表里） */
+    if (refuseAdvancedOnly(sessionId, 'set-project')) return { sessionId, projectId, skipped: true };
     const rec = store.readRecord(sessionId);
     if (!rec) return { sessionId, projectId };
     rec.profile.projectId = projectId ?? undefined;
@@ -11429,6 +11533,7 @@ app.whenReady().then(async () => {
   // so the conversation is preserved. Unlike assign-project this is not
   // write-once — it is an explicit user move.
   ipcMain.handle('acp:move-session', async (_event, sessionId: string, projectId: string | null) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'move'); if (advRefused) throw new Error(advRefused); }
     /*
       **一轮在跑的时候不许换项目** ——「为什么远程 session 换不了 project」。
       换项目要重置执行器（换 memory scope），而 `detachExecutor` 是无条件的：跑着的那一轮会被
@@ -11569,6 +11674,7 @@ app.whenReady().then(async () => {
   // frees its executor slot (a later unarchive/open re-attaches transparently);
   // the durable transcript + memory are untouched. Not a delete.
   ipcMain.handle('acp:archive-session', async (_event, sessionId: string, archived: boolean) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'archive'); if (advRefused) throw new Error(advRefused); }
     const rec = store.readRecord(sessionId);
     if (rec) {
       rec.archived = !!archived;
@@ -11633,6 +11739,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:get-auto-resent', () => loadAutoResent());
   ipcMain.handle('app:set-auto-resent', (_event, sessionId: string, key: string) => {
     if (!sessionId) return { ok: false };
+    if (refuseAdvancedOnly(sessionId, 'set-auto-resent')) return { ok: false };
     const map = loadAutoResent();
     if (key) map[sessionId] = String(key); else delete map[sessionId];
     saveAutoResent(map);
@@ -11642,6 +11749,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('app:get-draft-pastes', () => loadDraftPastes());
   ipcMain.handle('app:set-draft-pastes', (_event, sessionId: string, blocks: any[]) => {
     if (!sessionId) return { ok: false };
+    if (refuseAdvancedOnly(sessionId, 'set-draft-pastes')) return { ok: false };
     const map = loadDraftPastes();
     if (Array.isArray(blocks) && blocks.length) {
       map[sessionId] = blocks.map((b: any) => ({
@@ -11678,7 +11786,10 @@ app.whenReady().then(async () => {
     _event,
     sessionId: string,
     messageId: string,
-  ) => store.truncateTranscriptBefore(sessionId, messageId));
+  ) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'truncate-transcript'); if (advRefused) throw new Error(advRefused); }
+    return store.truncateTranscriptBefore(sessionId, messageId);
+  });
 
   // Rewrite the transcript to exactly the given messages (edit-and-rerun). Robust
   // against renderer messages that were never persisted under that id (steers).
@@ -11687,6 +11798,7 @@ app.whenReady().then(async () => {
     sessionId: string,
     messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: store.StoredToolCall[] }>,
   ) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'rewrite-transcript'); if (advRefused) throw new Error(advRefused); }
     const next = Array.isArray(messages) ? messages : [];
     /*
       **保留的消息必须本来就是这条会话的** ——「有的会话似乎内容混了」。
@@ -11774,6 +11886,7 @@ app.whenReady().then(async () => {
    */
   ipcMain.handle('acp:mark-session-purpose', async (_event, sessionId: string, purpose: string, flow?: string) => {
     if (!sessionId) return { ok: false, error: 'no sessionId' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'mark-purpose'); if (advRefused) return { ok: false, error: advRefused }; }
     const patch: Partial<ReturnType<typeof store.readRecord> & object> = {
       purpose: (purpose || '').trim() || undefined,
     };
@@ -11798,6 +11911,7 @@ app.whenReady().then(async () => {
    */
   ipcMain.handle('acp:rename-session', async (_event, sessionId: string, title: string) => {
     if (!sessionId) return { ok: false, error: 'no sessionId' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'rename'); if (advRefused) return { ok: false, error: advRefused }; }
     const next = String(title || '').trim();
     if (!next) return { ok: false, error: 'empty title' };
     const where = store.patchRecord(sessionId, { title: next } as any);
@@ -11809,7 +11923,7 @@ app.whenReady().then(async () => {
   // changes. Writes directly (no updatedAt bump) so pinning never reorders the list.
   ipcMain.handle('acp:set-session-pinned', async (_event, sessionId: string, pinned: boolean) => {
     const rec = store.readRecord(sessionId);
-    if (rec) {
+    if (rec && !refuseAdvancedOnly(sessionId, 'pin')) {
       rec.pinned = !!pinned;
       try {
         const p = path.join(os.homedir(), '.kirolex', 'sessions', sessionId, 'record.json');
@@ -12315,6 +12429,7 @@ app.whenReady().then(async () => {
   /** Pin a hand-edited context block for this chat. Used verbatim by the next send. */
   ipcMain.handle('acp:write-context-override', async (_event, sessionId: string, text: string) => {
     if (!sessionId) return { ok: false, error: 'no sessionId' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'write-context-override'); if (advRefused) return { ok: false, error: advRefused }; }
     try {
       if (!text.trim()) {
         // Saving an empty editor means "stop overriding", not "send nothing".
@@ -12333,30 +12448,45 @@ app.whenReady().then(async () => {
   /** Back to the generated snapshot. */
   ipcMain.handle('acp:clear-context-override', async (_event, sessionId: string) => {
     if (!sessionId) return { ok: false, error: 'no sessionId' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'clear-context-override'); if (advRefused) return { ok: false, error: advRefused }; }
     const existed = store.clearContextOverride(sessionId);
     logger.info('prime', `context override removed sessionId=${sessionId} existed=${existed} -> generated snapshot again`);
     return { ok: true, existed };
   });
 
+  /*
+    **advanced 的会话（flow / skill）的会话层记忆不碰** —— 读 / 写 / 备份 / 看体积都会顺手给 sessionId
+    建 `memory/sessions/<id>/`。会话层直接拒；全局 / 项目层照常，但不带这个 sessionId 往下传。
+  */
+  const memorySessionId = (sessionId: string | undefined, what: string): string | undefined =>
+    (sessionId && refuseAdvancedOnly(sessionId, what) ? undefined : sessionId);
   ipcMain.handle('acp:read-memory', async (_event, projectId?: string, sessionId?: string) => {
-    return readMemory(projectId, sessionId);
+    return readMemory(projectId, memorySessionId(sessionId, 'read-memory'));
   });  ipcMain.handle('acp:write-memory', async (_event, scope: 'global' | 'project' | 'session', projectId: string | undefined, sessionId: string | undefined, content: string) => {
-    writeMemory(scope, projectId, sessionId, content);
+    const sid = memorySessionId(sessionId, 'write-memory');
+    if (scope === 'session' && sessionId && !sid) {
+      return { ok: false, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+    }
+    writeMemory(scope, projectId, sid, content);
     return { ok: true };
   });
 
   /** 三层体积，按需取一次。给两个时机用：会话切换/启动（打开就能看到横幅），以及
    *  MemoryDialog 保存之后（你手动清理完立刻消失，不用等下一轮对话）。 */
   ipcMain.handle('acp:memory-bytes', async (_event, projectId?: string, sessionId?: string) => {
-    return memoryLayerBytes(projectId, sessionId);
+    return memoryLayerBytes(projectId, memorySessionId(sessionId, 'memory-bytes'));
   });
 
   /** 压缩前备份某一层记忆。时间戳由主进程生成，渲染进程不需要关心命名规则。 */
   ipcMain.handle('acp:backup-memory', async (
     _event, scope: MemoryScope, projectId?: string, sessionId?: string,
   ) => {
+    const sid = memorySessionId(sessionId, 'backup-memory');
+    if (scope === 'session' && sessionId && !sid) {
+      return { ok: false, at: null, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+    }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const at = backupMemoryLayer(scope, projectId, sessionId, stamp);
+    const at = backupMemoryLayer(scope, projectId, sid, stamp);
     if (at) logger.info('memory', `backed up ${scope} -> ${at}`);
     else logger.warn('memory', `nothing to back up for scope=${scope}`);
     return { ok: !!at, at };

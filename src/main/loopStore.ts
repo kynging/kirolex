@@ -59,6 +59,13 @@ interface Envelope {
   updatedAt: number;
 }
 
+/**
+ * 这条会话的循环文件**不归调用方管**（标准版里 = KiroLex Advanced 的会话，判据在 `advancedOnly.ts`，
+ * 由 index.ts 传 `store.isAdvancedOnlySession` 进来）。是的话：写入抛错、记轮次拒绝、清除跳过 ——
+ * 已有的文件字节不变，没有的也不新建。不传就是老行为。
+ */
+export type Protected = (sessionId: string) => boolean;
+
 function loopDir(home: string): string {
   return path.join(home, '.kirolex', 'loop-runs');
 }
@@ -72,7 +79,8 @@ export function loopRunPath(sessionId: string, home: string): string {
 /** Atomic write: temp + rename, as everywhere else in this codebase. A partially
  *  written counter is worse than none — it would read as a smaller number and hand the
  *  loop rounds it had already spent. */
-export function writeLoop(sessionId: string, run: StoredLoopRun, home: string): void {
+export function writeLoop(sessionId: string, run: StoredLoopRun, home: string, isProtected?: Protected): void {
+  if (isProtected?.(sessionId)) throw new Error(tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.'));
   const dir = loopDir(home);
   fs.mkdirSync(dir, { recursive: true });
   const file = loopRunPath(sessionId, home);
@@ -106,7 +114,11 @@ export function beginRound(
   sessionId: string,
   home: string,
   now: number,
+  isProtected?: Protected,
 ): { run: StoredLoopRun | null; terminal: string | null; error?: string } {
+  if (isProtected?.(sessionId)) {
+    return { run: null, terminal: null, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+  }
   const run = readLoop(sessionId, home);
   if (!run) return { run: null, terminal: null, error: tr('No loop record found for this session') };
   // Already over: report the recorded reason rather than inventing a new one.
@@ -143,6 +155,7 @@ export function listLiveLoops(home: string): StoredLoopRun[] {
   return out.sort((a, b) => a.startedAt - b.startedAt);
 }
 
-export function clearLoop(sessionId: string, home: string): void {
+export function clearLoop(sessionId: string, home: string, isProtected?: Protected): void {
+  if (isProtected?.(sessionId)) return;
   try { fs.rmSync(loopRunPath(sessionId, home), { force: true }); } catch { /* already gone */ }
 }

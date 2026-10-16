@@ -20,6 +20,13 @@ export interface StoredSchedule {
   updatedAt: number;
 }
 
+/**
+ * 这条会话的定时任务**不归调用方管**（标准版里 = KiroLex Advanced 的会话，判据在 `advancedOnly.ts`，
+ * 由 index.ts 传 `store.isAdvancedOnlySession` 进来）。是的话：列表不列、写入抛错、删除跳过 ——
+ * 已有的任务文件字节不变，没有的也不新建。不传就是老行为。
+ */
+export type Protected = (sessionId: string) => boolean;
+
 export function scheduleDir(home: string): string {
   return path.join(home, '.kirolex', 'schedules');
 }
@@ -30,7 +37,10 @@ function scheduleFile(id: string, home: string): string {
 
 /** Atomic: temp + rename. A partially written job could otherwise read back with a lower
  *  run count and hand itself budget it had already spent. */
-export function writeSchedule(id: string, state: ScheduleState, home: string): void {
+export function writeSchedule(id: string, state: ScheduleState, home: string, isProtected?: Protected): void {
+  if (isProtected && (isProtected(state.sessionId) || isProtected(readSchedule(id, home)?.state.sessionId ?? ''))) {
+    throw new Error('This session belongs to KiroLex Advanced; the standard edition does not modify it.');
+  }
   const dir = scheduleDir(home);
   fs.mkdirSync(dir, { recursive: true });
   const file = scheduleFile(id, home);
@@ -54,18 +64,19 @@ export function readSchedule(id: string, home: string): StoredSchedule | null {
 
 /** Every job on disk. This is how the app finds its schedules after a restart — nothing
  *  survives in memory, so enumeration is the only entry point. */
-export function listSchedules(home: string): StoredSchedule[] {
+export function listSchedules(home: string, isProtected?: Protected): StoredSchedule[] {
   let names: string[];
   try { names = fs.readdirSync(scheduleDir(home)); } catch { return []; }
   const out: StoredSchedule[] = [];
   for (const name of names) {
     if (!name.endsWith('.json')) continue;
     const job = readSchedule(decodeURIComponent(name.slice(0, -'.json'.length)), home);
-    if (job) out.push(job);
+    if (job && !isProtected?.(job.state.sessionId)) out.push(job);
   }
   return out.sort((a, b) => a.state.createdAt - b.state.createdAt);
 }
 
-export function removeSchedule(id: string, home: string): void {
+export function removeSchedule(id: string, home: string, isProtected?: Protected): void {
+  if (isProtected?.(readSchedule(id, home)?.state.sessionId ?? '')) return;
   try { fs.rmSync(scheduleFile(id, home), { force: true }); } catch { /* already gone */ }
 }

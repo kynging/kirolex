@@ -2,6 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { MEMORY_BACKUPS, type MemoryScope } from './memoryPolicy.ts';
+import { isAdvancedOnlySession } from './sessionStore.ts';
 
 /**
  * Layered memory store (design §6). THREE curated layers on disk, ordered
@@ -38,6 +39,14 @@ function sessionPath(sessionId: string): string {
   return path.join(sessionDir(sessionId), 'memory.md');
 }
 
+/**
+ * **这条会话的会话层记忆归 KiroLex Advanced 管**（flow / skill 会话，判据在 `advancedOnly.ts`）——
+ * 标准版不给它建、写、备份、删 `memory/sessions/<id>/` 下的任何文件。全局 / 项目层照常（那是共享的）。
+ */
+function sessionMemoryProtected(sessionId: string | undefined): boolean {
+  return !!sessionId && isAdvancedOnlySession(sessionId);
+}
+
 function readIfExists(p: string): string {
   try { return fs.readFileSync(p, 'utf-8').trim(); } catch { return ''; }
 }
@@ -52,7 +61,7 @@ export function ensureMemoryFiles(projectId?: string, sessionId?: string): void 
       const pp = projectPath(projectId);
       if (!fs.existsSync(pp)) fs.writeFileSync(pp, `# Project memory: ${projectId}\n\n`);
     }
-    if (sessionId) {
+    if (sessionId && !sessionMemoryProtected(sessionId)) {
       fs.mkdirSync(sessionDir(sessionId), { recursive: true });
       const sp = sessionPath(sessionId);
       if (!fs.existsSync(sp)) fs.writeFileSync(sp, `# Chat-specific memory\n\n`);
@@ -98,6 +107,7 @@ export function backupMemoryLayer(
   sessionId: string | undefined,
   stamp: string,
 ): string | null {
+  if (scope === 'session' && sessionMemoryProtected(sessionId)) return null;
   try {
     const src = scope === 'global' ? globalPath
       : scope === 'project' ? (projectId ? projectPath(projectId) : '')
@@ -129,6 +139,7 @@ export function deleteProjectMemory(projectId: string): void {
 
 /** Delete a session's memory directory (chat deletion). */
 export function deleteSessionMemory(sessionId: string): void {
+  if (sessionMemoryProtected(sessionId)) return;
   try {
     const d = sessionDir(sessionId);
     if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
@@ -161,6 +172,9 @@ export function writeMemory(
   sessionId: string | undefined,
   content: string,
 ): void {
+  if (scope === 'session' && sessionMemoryProtected(sessionId)) {
+    throw new Error('This session belongs to KiroLex Advanced; the standard edition does not modify it.');
+  }
   ensureMemoryFiles(projectId, sessionId);
   if (scope === 'global') {
     fs.writeFileSync(globalPath, content);

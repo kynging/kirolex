@@ -47,7 +47,14 @@ export function pickReviewTarget<R extends { sshHost: string }>(input: {
   localExists: (p: string) => boolean;
   remoteFor: (raw: string) => { target: R; path: string } | null;
   reviewed: (key: string) => boolean;
+  /**
+   * 这条会话的文件**不许改**时给出原因（标准版里 = KiroLex Advanced 的会话，判据在 `advancedOnly.ts`）。
+   * 最先判 —— "预览过"也不放行：预览只是读，读过不等于这条会话归标准版管。
+   */
+  refuse?: () => string | null;
 }): ReviewTarget<R> {
+  const refused = input.refuse?.();
+  if (refused) return { ok: false, error: refused };
   const raw = String(input.raw || '');
   if (!raw) return { ok: false, error: tr('No path') };
   let want: string;

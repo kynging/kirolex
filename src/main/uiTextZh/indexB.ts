@@ -179,4 +179,6 @@ export const ZH_INDEX_B: Record<string, string> = {
   'Session was deleted; not re-attaching.': '会话已被删除，不再重新连接。',
   'Session was deleted during attach; aborted.': '连接过程中会话被删除了，已中止。',
   'projectId is write-once; it cannot be changed once set.': 'projectId 只能设置一次，设置后不能再改。',
+  'This session belongs to KiroLex Advanced; the standard edition does not modify it.': '这条会话属于 KiroLex Advanced（流程 / skill），标准版不显示也不改它。',
+  "Could not read this backup's record.json, so it is not restored (it might be a KiroLex Advanced session). Try again later.": '读不出这份备份的 record.json，确认不了它是不是 KiroLex Advanced 的会话，所以没有恢复。请稍后再试。',
 };
