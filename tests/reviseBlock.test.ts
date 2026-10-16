@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseRevised, reviseInSessionPrompt, replyUsable } from '../src/main/reviseBlock.ts';
+import { parseRevised, reviseInSessionPrompt, replyUsable, keepHeading } from '../src/main/reviseBlock.ts';
 
 /**
  * 侧栏 review「✓ 确认」的主进程那半：提示词、回复清洗、什么样的回复能写盘，以及 IPC 接线。
@@ -78,6 +78,70 @@ describe('发给会话的提示词', () => {
     const src = fs.readFileSync('src/main/reviseBlock.ts', 'utf8');
     assert.doesNotMatch(src, /scope\?: [^;]*'whole'/);
     assert.doesNotMatch(src, /输出完整正文/);
+  });
+});
+
+describe('评论标题后改写不把标题弄丢', () => {
+  const where = '## 客户待确认 - RDS for Db2 数据迁移与跨库复制方案\n\n- 迁移窗口待定\n- 复制延迟待测';
+
+  test('原文以标题开头、回复没标题 → 补上原标题，空行照原文', () => {
+    const out = keepHeading(where, '- 迁移窗口：11 月第二周\n- 复制延迟待测');
+    assert.equal(out, '## 客户待确认 - RDS for Db2 数据迁移与跨库复制方案\n\n- 迁移窗口：11 月第二周\n- 复制延迟待测');
+  });
+
+  test('标题和正文之间没有空行的，补的时候也不加', () => {
+    assert.equal(keepHeading('### 标题\n正文', '新正文'), '### 标题\n新正文');
+  });
+
+  test('回复带了改过的标题 → 用回复里的，不出现两个标题', () => {
+    const reply = '## 已确认 - RDS for Db2 迁移方案\n\n- 迁移窗口待定';
+    const out = keepHeading(where, reply);
+    assert.equal(out, reply);
+    assert.equal((out.match(/^#+ /gm) || []).length, 1);
+  });
+
+  test('回复第一行是标题、只是级别不同 —— 也照用，不再叠一个', () => {
+    assert.equal(keepHeading(where, '### 新标题\n正文'), '### 新标题\n正文');
+  });
+
+  test('回复前面有空行也按第一个非空行判断', () => {
+    assert.equal(keepHeading(where, '\n\n## 新标题\n正文'), '\n\n## 新标题\n正文');
+  });
+
+  test('原文不是标题 → 回复原样不动', () => {
+    assert.equal(keepHeading('- 做了 A\n- 做了 B', '- 做了 A2'), '- 做了 A2');
+    assert.equal(keepHeading('#hashtag 不是标题', '改过的'), '改过的');
+  });
+
+  test('insert / patch 档不补标题', () => {
+    assert.equal(keepHeading(where, '- 新加一条', 'insert'), '- 新加一条');
+    assert.equal(keepHeading(where, '- 新加一条', 'patch'), '- 新加一条');
+  });
+
+  test('CRLF 的原文补回去也用 CRLF', () => {
+    assert.equal(keepHeading('# T\r\n\r\nbody', 'new'), '# T\r\n\r\nnew');
+  });
+
+  test('提示词：原文以标题开头时要求交回这个标题、级别不变', () => {
+    const p = reviseInSessionPrompt({ where, note: '迁移窗口定了，11 月第二周' });
+    assert.match(p, /第一行必须是这个标题/);
+    assert.match(p, /2 个 `#`/);
+    assert.match(p, /原样保留/);
+    const p2 = reviseInSessionPrompt({ where: '- 做了 A', note: 'x' });
+    assert.doesNotMatch(p2, /第一行必须是这个标题/, '原文不是标题就不提');
+    const p3 = reviseInSessionPrompt({ where, note: 'x', scope: 'insert' });
+    assert.doesNotMatch(p3, /第一行必须是这个标题/, 'insert 档不提');
+  });
+
+  test('主进程 block 档：写盘和交回渲染层都用补过标题的结果', () => {
+    const src = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
+    const i = src.indexOf("ipcMain.handle('review:revise-in-session'");
+    const body = src.slice(i, src.indexOf('async function finishPatch', i));
+    /* 补过的结果写回 out.text，后面拼回写盘（applyRevision）和交回渲染层（text: out.text）用的都是它 */
+    const fixAt = body.indexOf('out.text = keepHeading(where, out.text, wantScope);');
+    assert.ok(fixAt > body.indexOf('if (out.cannot)'), '在"改不了"判断之后、拼回之前补');
+    assert.ok(fixAt < body.indexOf('applyRevision(apply, out.text)'));
+    assert.ok(fixAt < body.lastIndexOf('return { ok: true, text: out.text, scope: wantScope };'));
   });
 });
 

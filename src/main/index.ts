@@ -75,7 +75,7 @@ import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
 import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, type ReviewTarget } from './reviewAccess.ts';
-import { parseRevised, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
+import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
 import {
   SOFFICE_BUNDLE_PATHS, SOFFICE_PATH_NAMES, pickConverter, sofficeBinary, pathProbeCommand, firstProbeHit,
@@ -10726,6 +10726,7 @@ app.whenReady().then(async () => {
           logger.info('revise', `not local (in-session ${sessionId}): ${out.cannot}`);
           return { ok: false, cannot: out.cannot };
         }
+        out.text = keepHeading(where, out.text, wantScope);
         logger.info('revise', `in-session ${sessionId} scope=${wantScope}: ${out.text.length} chars in ${((Date.now() - started) / 1000).toFixed(1)}s`);
         const apply = input?.apply;
         if (apply && typeof apply.base === 'string' && typeof apply.path === 'string') {

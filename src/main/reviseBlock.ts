@@ -56,6 +56,45 @@ export function parseRevised(stdout: string, original: string): RevisedBlock {
   return { text: body };
 }
 
+/** ATX 标题（`# ` … `###### `，前面最多 3 个空格）—— 和 CommonMark 一样，`#hashtag` 不算。 */
+const HEADING = /^ {0,3}(#{1,6})(?:[ \t]|$)/;
+
+/** 原文片段第一个非空行是 Markdown 标题的话，给出那一行、它的级别和它后面跟着几个空行。 */
+function leadingHeading(where: string): { line: string; level: number; blanks: number; eol: string } | null {
+  const src = String(where ?? '');
+  const eol = src.includes('\r\n') ? '\r\n' : '\n';
+  const lines = src.split(/\r?\n/);
+  let i = 0;
+  while (i < lines.length && !lines[i].trim()) i++;
+  const m = i < lines.length ? HEADING.exec(lines[i]) : null;
+  if (!m) return null;
+  let j = i + 1;
+  while (j < lines.length && !lines[j].trim()) j++;
+  /* 片段只有这一行标题：按最常见的写法空一行 */
+  const blanks = j < lines.length ? j - i - 1 : 1;
+  return { line: lines[i], level: m[1].length, blanks, eol };
+}
+
+/**
+ * block 档的兜底：**评论标题后改写，不能把标题弄丢** —— PURE。
+ *
+ * 对标题点 💬 时发过去的原文片段是「标题 + 下面整节」，回复会整节替换回去；模型漏掉标题行时，
+ * 标题就从文件里消失了（实测：「客户待确认 - RDS for Db2 数据迁移与跨库复制方案」改写后没了）。
+ *
+ * 原文第一行是标题、回复第一个非空行不是标题 → 把原来那一行补在最前面，中间的空行照原文。
+ * 回复第一行是标题（哪怕文字或级别变了）就照用 —— 那是按意见改过的标题，再补一个就成了两个。
+ * 只管 `block`：`insert` 的回复是新加的内容，本来就不带标题；`patch` 按行号换，没有"整节"这回事。
+ */
+export function keepHeading(where: string, revised: string, scope: 'block' | 'patch' | 'insert' = 'block'): string {
+  const text = String(revised ?? '');
+  if (scope !== 'block') return text;
+  const head = leadingHeading(where);
+  if (!head) return text;
+  const first = text.split(/\r?\n/).find((l) => l.trim());
+  if (first === undefined || HEADING.test(first)) return text;
+  return head.line + head.eol.repeat(head.blanks + 1) + text;
+}
+
 /**
  * 发给**打开这份文件那条会话**的提示词 —— PURE。
  *
@@ -127,6 +166,7 @@ export function reviseInSessionPrompt(input: {
       '  只单独一行写 `CANNOT-REVISE-LOCALLY: <一句话说缺什么>`。',
     ].join('\n');
   }
+  const heading = leadingHeading(input.where);
   const head = `下面这条意见是对${about ? `「${about}」` : '那份文件'}里某一处提的。按它改，然后**只输出改完的这一段**。`;
   return [
     head,
@@ -145,6 +185,11 @@ export function reviseInSessionPrompt(input: {
     '· 不要用 ``` 围栏包起来，也不要写"好的""已修改如下"这类开场（那些话会被原样写进文件）；',
     '· 保持原来的标记形式（原文是 markdown 列表就还是列表，是标题就还是同级标题，段落之间的空行照留）；',
     '· **意见没提到的地方一个字都不要动**；',
+    /* 片段以标题开头时整节会被你的回复替换 —— 漏了标题行，标题就从文件里没了（`keepHeading` 是兜底） */
+    ...(heading ? [
+      `· 原文片段第一行是标题「${heading.line.trim()}」：**你输出的第一行必须是这个标题**，级别不变（还是 ${heading.level} 个 \`#\`）；`
+        + '\n  意见要求改标题就交回改过的标题，没要求就原样保留这一行 —— 漏掉它，标题就从文件里没了；',
+    ] : []),
     '· 如果这条意见**没法只改这一段**（要和别处合并、要新增段落、要把它挪到别的小节），'
       + '\n  就原样返回这一段，并在最后单独一行写 `CANNOT-REVISE-LOCALLY: 需要跨段改`；',
     '· **不要用工具去改文件**（`fs_write` 之类）—— 落盘由 KiroLex 统一做。',
