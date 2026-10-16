@@ -230,8 +230,8 @@ export function markLayout(
   return { lit, rowAt };
 }
 
-/** 一处标记：改动本身 + 给撤销认它的 `id` + 撤销没成的原因。 */
-export type AiMark = AiChange & { id: number; note?: string };
+/** 一处标记：改动本身 + 给撤销认它的 `id` + 撤销没成的原因 + 这次改写删掉了字段时的那句提示（`warn`）。 */
+export type AiMark = AiChange & { id: number; note?: string; warn?: string };
 /** 标记连同它们的行号所对的那一版正文 —— 正文变了据此挪（`remapChanges`）。 */
 export type AiMarkState = { base: string; marks: AiMark[] };
 

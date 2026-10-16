@@ -4,6 +4,7 @@ import { PdfView } from './PdfView';
 import { pageBlocks, lineBlocks, dropSpan, displayGroups, groupAnchorOf, mdLine, spanRange, shouldBumpMark, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
 import { rewritePatch } from '../rewritePatch';
 import { diffChanges, trustedChanges, remapChanges, planUndo, markLayout, UNDO_REFUSED, type AiMark, type AiMarkState } from '../aiChanges';
+import { lostFields, lostFieldsByChange } from '../../main/reviseBlock.ts';
 import { getAiMarks, updateAiMarks, subscribeAiMarks, aiRoundOf, beginAiRound, recordAiWrite } from '../aiMarkStore';
 import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
@@ -699,13 +700,15 @@ export const ReviewPane: React.FC<{
    * `alreadyWritten`：主进程已经拼好、写好了（`apply` 那条路，窗口不在也不丢）—— 这里只跟着刷新界面，
    * 不再写一遍，会话里那句"落盘完成"也由主进程说过了。
    * `ai`：这次是 AI 改的 —— 改了的那几处挂上「AI 刚改过」（`changes` 是主进程回的那份，对不上就自己比）。
+   * `ai.lost`：这次改写删掉的字段（见 `lostOf`）—— 每一处标记只说**它自己**删掉的那几个（`lostFieldsByChange`），
+   *   点它旁边的撤销，回来的正好是它说的那几个。
    * `round` 是这条任务入队时的提交轮次：已经不是当前这一轮（之后又提交过）就照常写回、不挂标记（见 `recordAiWrite`）。
    * `undid`：这次是撤销那一处 —— 它的标记摘掉。
    * `expectBase`：盘上此刻必须正好是这一份才写（主进程读、比、写一气呵成）—— 撤销用它，不会盖掉预览还没刷出来的改动。
    */
   const writeBack = async (
     base: string, fullText: string, key: string, what: string, alreadyWritten = false,
-    opts: { ai?: { changes?: unknown; round: number }; undid?: number; expectBase?: string } = {},
+    opts: { ai?: { changes?: unknown; round: number; lost?: string[] }; undid?: number; expectBase?: string } = {},
   ): Promise<boolean> => {
     if (!alreadyWritten) {
       const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText, opts.expectBase);
@@ -733,9 +736,10 @@ export const ReviewPane: React.FC<{
       return out;
     });
     remapReviewLines(path, patch.keep);
-    const fresh: AiMark[] = opts.ai
-      ? (trustedChanges(opts.ai.changes, base, fullText) ?? diffChanges(base, fullText)).map((c) => ({ ...c, id: ++aiMarkSeq }))
-      : [];
+    const changes = opts.ai ? (trustedChanges(opts.ai.changes, base, fullText) ?? diffChanges(base, fullText)) : [];
+    const perChange = lostFieldsByChange(changes, opts.ai?.lost ?? []);
+    const fresh: AiMark[] = changes
+      .map((c, i) => ({ ...c, id: ++aiMarkSeq, ...(perChange[i].length ? { warn: lostWarnText(perChange[i]) } : null) }));
     recordAiWrite(path, { base, fullText, fresh, round: opts.ai?.round, undid: opts.undid });
     /*
       在会话里报一句 ——「不然不知道修改成功了没有」。报的是**已经发生的事实**（写进了哪个文件、
@@ -909,6 +913,15 @@ export const ReviewPane: React.FC<{
   */
 
   /**
+   * block 档整节改写：原节（`where`）里的 `- **字段**:` 回复（主进程补过标题的 `res.text`）里漏了的那几个。
+   * 判据是 `reviseBlock.lostFields`（纯的、有测试）；归到哪一处标记上见 `writeBack`。
+   */
+  const lostOf = (where: string, res: any): string[] => (typeof res?.text === 'string' ? lostFields(where, res.text) : []);
+  /** 挂在那一处标记下面的那句提示 —— 只列这一处删掉的。 */
+  const lostWarnText = (fields: string[]) =>
+    t('⚠ This rewrite deleted the field(s) {fields}. Click Undo to bring them back.', { fields: fields.join(lang === 'zh' ? '、' : ', ') });
+
+  /**
    * **一处 💬 / ＋** —— 轮到了发给打开这份文件的那条会话，KiroLex 拼回整份、写回文件。
    *
    * 💬：先只要**这一块**（快），它回 `CANNOT-REVISE-LOCALLY` 才走 `patch`（加段/删段/合并/挪位置 —— 只交回要换的那几处）。
@@ -987,10 +1000,11 @@ export const ReviewPane: React.FC<{
       if (!res?.ok || typeof res.text !== 'string') {
         return fail(res?.cannot ? t('Couldn\'t change it: {why}. Try wording it differently.', { why: res.cannot }) : t('Rewrite failed: {err}', { err: res?.error || t('no response') }));
       }
-      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
+      const lost = lostOf(where, res);
+      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round, lost } });
       /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
       const fullText = spliceLines(base, from, to, String(res.text));
-      return writeBack(base, fullText, failKey, t('Revised {file} {where} as commented', { file: fileName, where: whereAt(from, to) }), false, { ai: { round } });
+      return writeBack(base, fullText, failKey, t('Revised {file} {where} as commented', { file: fileName, where: whereAt(from, to) }), false, { ai: { round, lost } });
     }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
   };
 
@@ -1736,6 +1750,8 @@ export const ReviewPane: React.FC<{
                   ))}
                 </div>
               )}
+              {/* 这次整节改写删掉了字段 —— 醒目地说出来，撤销就在右边那一栏 */}
+              {aiHere.map((m) => (m.warn ? <div key={`ai-warn:${m.id}`} className="rt-note-applied rv-ai-warn">{m.warn}</div> : null))}
               {aiHere.map((m) => ((m.note || applyNote[`ai:${m.id}`])
                 ? <div key={`ai-note:${m.id}`} className="rt-note-applied">{m.note || applyNote[`ai:${m.id}`]}</div>
                 : null))}

@@ -8696,6 +8696,8 @@ button, input, select, textarea {
 .rv-review .rt-note-apply:disabled { opacity: .45; cursor: default; }
 /* 上一次没改成的原因 —— 那时框留着，所以必须就地说出来 */
 .rv-review .rt-note-applied { font-size: 10px; line-height: 1.6; color: var(--text-tertiary); margin-top: 3px; }
+/* 整节改写删掉了字段：要一眼看得见，不能和普通的灰字说明混在一起 */
+.rv-review .rv-ai-warn { font-size: 11px; font-weight: 600; color: var(--error, #e0703c); }
 /* 记下的那条意见：一行摘要，带一直可见的「✎ / ✕」 */
 .rv-review .rt-brief-row { display: flex; flex-direction: column; align-items: stretch; gap: 2px; }
 .rv-review .rt-hist-one { display: flex; align-items: baseline; gap: 4px; min-width: 0; }

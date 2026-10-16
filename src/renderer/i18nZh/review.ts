@@ -114,6 +114,7 @@ export const ZH_REVIEW: Record<string, string> = {
   'AI just changed this': 'AI 刚改过',
   'Restore just this passage to its original text (backed up before writing)': '只把这一段恢复成改之前的原文（写前会备份）',
   'Undo': '撤销',
+  '⚠ This rewrite deleted the field(s) {fields}. Click Undo to bring them back.': '⚠ 这次改写删掉了 {fields} 字段，点「撤销」可以恢复',
   // ── components/CommentBox.tsx ──
   "Confirm this comment: the session that opened this file revises this block (or the whole file if one block can't be done alone); KiroLex writes it back and updates on the spot (⌘/Ctrl + Enter)": '确认这条意见 —— 让打开这份文件的那条会话按它改这一块（改不了单块时自动按整份改），KiroLex 写回文件、当场更新（⌘/Ctrl + Enter）',
   '✓ Confirm': '✓ 确认',

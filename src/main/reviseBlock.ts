@@ -83,7 +83,7 @@ function leadingHeading(where: string): { line: string; level: number; blanks: n
  *
  * 原文第一行是标题、回复第一个非空行不是标题 → 把原来那一行补在最前面，中间的空行照原文。
  * 回复第一行是标题（哪怕文字或级别变了）就照用 —— 那是按意见改过的标题，再补一个就成了两个。
- * 只管 `block`：`insert` 的回复是新加的内容，本来就不带标题；`patch` 按行号换，没有"整节"这回事。
+ * 只管 `block`：`insert` 的回复是新加的内容，本来就不带标题；`patch` 按行号换，每一处另走 `keepPatchHeadings`。
  */
 export function keepHeading(where: string, revised: string, scope: 'block' | 'patch' | 'insert' = 'block'): string {
   const text = String(revised ?? '');
@@ -93,6 +93,131 @@ export function keepHeading(where: string, revised: string, scope: 'block' | 'pa
   const first = text.split(/\r?\n/).find((l) => l.trim());
   if (first === undefined || HEADING.test(first)) return text;
   return head.line + head.eol.repeat(head.blanks + 1) + text;
+}
+
+/**
+ * patch 档的同一道兜底 —— PURE。每一处 `{from, to, text}` 覆盖的原文（`base` 第 from..to 行）里**每一个**标题，
+ * 回复那一处对应的位置没有标题，就把原标题补回去（见 `restoreHeadings`）；回复自带（哪怕改了名的）标题就照用。
+ * 删除（`text` 为空，即 `<DELETE>`）不补 —— 删掉一整节是它明说要做的。
+ */
+export function keepPatchHeadings<E extends { from: number; to: number; text: string }>(base: string, edits: E[]): E[] {
+  const lines = String(base ?? '').split('\n');
+  return edits.map((e) => {
+    if (!e.text || !Number.isInteger(e.from) || !Number.isInteger(e.to) || e.from < 1 || e.to < e.from) return e;
+    const text = restoreHeadings(lines.slice(e.from - 1, e.to), e.text);
+    return text === e.text ? e : { ...e, text };
+  });
+}
+
+/**
+ * 一处替换：原文 `orig`（那几行）里的标题，回复 `reply` 里漏了的补回去 —— PURE。
+ *
+ * 先认回复里**已经有的**：文字一样的对上（不管先后 —— 两节换了顺序不算漏）；剩下改了名的，按"前面隔了几行正文"最接近的那个原标题对上
+ * （顶替它，不再补原来那个）。还没对上的原标题补在回复里对应的位置：从上一个标题（没有就是开头）往后数，
+ * 原文隔了几行正文，回复里也隔几行；前后的空行照原文。只有开头那个标题时，结果和 `keepHeading` 一样。
+ */
+function restoreHeadings(orig: string[], reply: string): string {
+  const blank = (l: string) => !l.trim();
+  const content = (l: string) => !!l.trim() && !HEADING.test(l);
+  const heads = orig.flatMap((l, i) => (HEADING.test(l) ? [i] : []));
+  if (!heads.length) return reply;
+  /* 每一行前面有几行正文 —— 对位置用 */
+  const before = (ls: string[], i: number) => ls.slice(0, i).filter(content).length;
+  const work: { line: string; o?: number }[] = reply.split('\n').map((line) => ({ line }));
+  const rHeads = work.flatMap((w, i) => (HEADING.test(w.line) ? [i] : []));
+  const used = new Set<number>();
+  /* 1. 文字一样的对上 —— 不要求顺序：换了两节的先后，标题照样都在 */
+  for (const r of rHeads) {
+    const o = heads.find((h) => !used.has(h) && orig[h].trim() === work[r].line.trim());
+    if (o === undefined) continue;
+    work[r].o = o; used.add(o);
+  }
+  /* 2. 改了名的：挑还没对上的原标题里"前面正文行数"最接近的那个（同样不要求顺序） */
+  const replyLines = work.map((w) => w.line);
+  for (const r of rHeads) {
+    if (work[r].o !== undefined) continue;
+    const want = before(replyLines, r);
+    let best: number | undefined;
+    for (const h of heads) {
+      if (used.has(h)) continue;
+      if (best === undefined || Math.abs(before(orig, h) - want) < Math.abs(before(orig, best) - want)) best = h;
+    }
+    if (best === undefined) continue;
+    work[r].o = best; used.add(best);
+  }
+  /* 3. 还没对上的补回去 */
+  let cursor = -1;
+  let prevO = -1;
+  for (const h of heads) {
+    if (used.has(h)) {
+      cursor = work.findIndex((w) => w.o === h);
+      prevO = h;
+      continue;
+    }
+    const gap = orig.slice(prevO + 1, h).filter(content).length;
+    let limit = work.findIndex((w, i) => i > cursor && w.o !== undefined);
+    if (limit < 0) limit = work.length;
+    let j = cursor + 1;
+    for (let seen = 0; j < limit && seen < gap; j++) if (content(work[j].line)) seen++;
+    while (j < limit && blank(work[j].line)) j++;
+    let pre = 0;
+    for (let i = h - 1; i > prevO && blank(orig[i]); i--) pre++;
+    let post = 0;
+    let i = h + 1;
+    while (i < orig.length && blank(orig[i])) { post++; i++; }
+    /* 原文里标题后面就没东西了：按最常见的写法空一行（和 `keepHeading` 一样） */
+    if (i >= orig.length) post = 1;
+    const ins: { line: string; o?: number }[] = [];
+    if (j > 0 && !blank(work[j - 1].line)) for (let k = 0; k < pre; k++) ins.push({ line: '' });
+    ins.push({ line: orig[h], o: h });
+    if (j < work.length && !blank(work[j].line)) for (let k = 0; k < post; k++) ins.push({ line: '' });
+    work.splice(j, 0, ...ins);
+    used.add(h);
+    cursor = work.findIndex((w) => w.o === h);
+    prevO = h;
+  }
+  return work.map((w) => w.line).join('\n');
+}
+
+/** 周报这类每节固定几个的字段行：`- **本周进展**: …`（冒号在加粗里外、全角半角都认）。 */
+const FIELD = /^\s{0,3}[-*+]\s+\*\*\s*([^*\n]+?)\s*(?:[:：]\s*\*\*|\*\*\s*[:：])/;
+
+function fieldNames(text: string): string[] {
+  const out: string[] = [];
+  for (const line of String(text ?? '').split(/\r?\n/)) {
+    const m = FIELD.exec(line);
+    if (m && !out.includes(m[1])) out.push(m[1]);
+  }
+  return out;
+}
+
+/**
+ * block 档整节替换之后**回复里没了的字段** —— PURE。按原文的顺序、去重，只认 `- **名字**:` 行的名字。
+ * 模型漏写几个字段时，整节一换它们就从文件里没了；这里只负责找出来，提示（和撤销）由界面做。
+ */
+export function lostFields(where: string, revised: string): string[] {
+  const kept = new Set(fieldNames(revised));
+  return fieldNames(where).filter((k) => !kept.has(k));
+}
+
+/**
+ * `lostFields` 算出的那几个，**各归到真正删掉它的那一处改动上** —— PURE。返回和 `changes` 一一对应的字段名列表。
+ *
+ * 一次整节改写在界面上常拆成好几处标记（改了这一行、删了那一行），撤销是一处一处撤的：提示得挂在删了那个字段的那一处，
+ * 点它旁边的撤销，回来的正好就是它说的那几个。某一处的原文里有这个字段、它改完的那几行里没有，就算它删的；
+ * 哪一处都对不上的（拆分方式特殊）挂在第一处删了字段的地方，再没有就挂第一处 —— 提示不能丢。
+ */
+export function lostFieldsByChange(changes: { original: string; text: string }[], lost: string[]): string[][] {
+  const out = changes.map(() => [] as string[]);
+  const todo = new Set(lost);
+  changes.forEach((c, i) => {
+    for (const k of lostFields(c.original, c.text)) if (todo.has(k)) { out[i].push(k); todo.delete(k); }
+  });
+  if (todo.size && out.length) {
+    const at = Math.max(0, out.findIndex((ks) => ks.length));
+    out[at].push(...lost.filter((k) => todo.has(k)));
+  }
+  return out;
 }
 
 /**
@@ -677,7 +802,8 @@ export function settlePatchRevision(input: {
       ...(parsed.fix ? { badFormat: true as const } : null),
     };
   }
-  const res = applyPatch(input.base, parsed.edits);
+  /* 覆盖了标题行、回复里那一处没写标题的 —— 把标题补回去再拼（见 `keepPatchHeadings`） */
+  const res = applyPatch(input.base, keepPatchHeadings(input.base, parsed.edits));
   if (!res.ok) return { ok: false, error: res.why };
   const done = { ok: true as const, text: res.text, fullText: res.text, scope: 'patch' as const, changes: res.changes };
   if (!input.write) return done;

@@ -2,7 +2,7 @@ import assert from 'node:assert/strict';
 import { describe, test } from 'node:test';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseRevised, reviseInSessionPrompt, replyUsable, keepHeading } from '../src/main/reviseBlock.ts';
+import { parseRevised, reviseInSessionPrompt, replyUsable, keepHeading, lostFields, lostFieldsByChange, keepPatchHeadings, settlePatchRevision } from '../src/main/reviseBlock.ts';
 
 /**
  * 侧栏 review「✓ 确认」的主进程那半：提示词、回复清洗、什么样的回复能写盘，以及 IPC 接线。
@@ -222,5 +222,170 @@ describe('主进程接线', () => {
     const body = MAIN.slice(at, at + 700);
     assert.match(body, /if \(sessionClients\.get\(sid\)\) return true;/);
     assert.match(body, /logger\.warn\('revise', `按需挂起失败/);
+  });
+});
+
+describe('整节改写漏了字段要说出来（lostFields）', () => {
+  const where = [
+    '## 项目 A',
+    '',
+    '- **本周进展**: 完成迁移方案',
+    '- **风险**: 窗口未定',
+    '- **下周计划**: 联调',
+    '- **负责人：** 张三',
+  ].join('\n');
+
+  test('回复漏了两个字段 → 按原文顺序报出这两个', () => {
+    const reply = '## 项目 A\n\n- **本周进展**: 迁移方案已评审\n- **负责人：** 张三';
+    assert.deepEqual(lostFields(where, reply), ['风险', '下周计划']);
+  });
+
+  test('字段齐全（值改了、顺序变了）→ 不报', () => {
+    const reply = '## 项目 A\n\n- **风险**: 已定\n- **本周进展**: 评审通过\n- **负责人**: 李四\n- **下周计划**: 上线';
+    assert.deepEqual(lostFields(where, reply), []);
+  });
+
+  test('只认 `- **名字**:` 这种字段行 —— 正文里的加粗、没有冒号的不算', () => {
+    assert.deepEqual(lostFields('这里 **强调** 一下\n- **不是字段** 没冒号', '全删了'), []);
+    assert.deepEqual(lostFields('* **状态**：进行中', '- 进行中'), ['状态']);
+  });
+
+  test('同名字段出现两次只报一次', () => {
+    assert.deepEqual(lostFields('- **备注**: a\n- **备注**: b', 'x'), ['备注']);
+  });
+});
+
+describe('删字段的提示挂在真正删了它的那一处上（lostFieldsByChange）', () => {
+  const base = ['## 项目', '', '- **Progress**: 旧', '- **Status**: 进行中', '- **Risks**: 窗口未定'].join('\n');
+
+  test('改了 Progress、留着 Status、删了 Risks → 两处改动，提示只在删 Risks 那一处；撤销那一处 Risks 就回来了', async () => {
+    const { diffChanges, planUndo } = await import('../src/renderer/aiChanges.ts');
+    const reply = '## 项目\n\n- **Progress**: 新\n- **Status**: 进行中';
+    const lost = lostFields(base, reply);
+    assert.deepEqual(lost, ['Risks']);
+    const changes = diffChanges(base, reply);
+    assert.equal(changes.length, 2, '改 Progress 和删 Risks 是两处');
+    assert.deepEqual(lostFieldsByChange(changes, lost), [[], ['Risks']]);
+    /* 撤销挂着提示的那一处 —— Risks 回来了，Progress 还是新的 */
+    const marks = changes.map((c, i) => ({ ...c, id: i + 1 }));
+    const undo = planUndo({ base: reply, marks }, 2, reply);
+    assert.equal(undo.ok, true);
+    if (undo.ok) {
+      assert.match(undo.text, /- \*\*Risks\*\*: 窗口未定/);
+      assert.match(undo.text, /- \*\*Progress\*\*: 新/);
+      assert.deepEqual(lostFields(base, undo.text), []);
+    }
+  });
+
+  test('两处各删了一个字段 → 各自那一处各说各的', async () => {
+    const { diffChanges } = await import('../src/renderer/aiChanges.ts');
+    const reply = '## 项目\n\n- **Status**: 进行中';
+    const lost = lostFields(base, reply);
+    assert.deepEqual(lost, ['Progress', 'Risks']);
+    const changes = diffChanges(base, reply);
+    assert.equal(changes.length, 2);
+    assert.deepEqual(lostFieldsByChange(changes, lost), [['Progress'], ['Risks']]);
+  });
+
+  test('一处删掉、另一处又写回来的不算丢；哪一处都对不上的挂在第一处删了字段的地方（提示不丢）', () => {
+    assert.deepEqual(lostFieldsByChange([
+      { original: '- **A**: 1', text: '' },
+      { original: '', text: '- **A**: 1' },
+    ], []), [[], []]);
+    assert.deepEqual(lostFieldsByChange([{ original: 'x', text: 'y' }, { original: '- **B**: 1', text: '' }], ['B', 'C']), [[], ['B', 'C']]);
+    assert.deepEqual(lostFieldsByChange([{ original: 'x', text: 'y' }], ['C']), [['C']]);
+    assert.deepEqual(lostFieldsByChange([], ['C']), []);
+  });
+});
+
+describe('patch 档也保住标题（keepPatchHeadings）', () => {
+  const base = ['# 周报', '', '## 项目 A', '', '- **进展**: 旧', '', '## 项目 B', '', '- **进展**: 旧 B'].join('\n');
+
+  test('一处覆盖了标题行、回复里没标题 → 原标题补回去，空行照原文', () => {
+    const [e] = keepPatchHeadings(base, [{ from: 3, to: 5, text: '- **进展**: 新' }]);
+    assert.equal(e.text, '## 项目 A\n\n- **进展**: 新');
+  });
+
+  test('回复自带（改过的）标题 → 照用，不出现两个标题', () => {
+    const [e] = keepPatchHeadings(base, [{ from: 3, to: 5, text: '## 项目 A（已更名）\n\n- **进展**: 新' }]);
+    assert.equal(e.text, '## 项目 A（已更名）\n\n- **进展**: 新');
+  });
+
+  test('没覆盖标题的那一处、删除（<DELETE>）的那一处不动', () => {
+    const out = keepPatchHeadings(base, [
+      { from: 5, to: 5, text: '- **进展**: 新' },
+      { from: 7, to: 9, text: '' },
+    ]);
+    assert.deepEqual(out.map((e) => e.text), ['- **进展**: 新', '']);
+  });
+
+  test('标题在这一处的中间、回复里没有 → 补回它原来的位置（前面隔了几行正文就隔几行）', () => {
+    const [e] = keepPatchHeadings('old paragraph\n## Heading\nold body', [{ from: 1, to: 3, text: 'new paragraph\nnew body' }]);
+    assert.equal(e.text, 'new paragraph\n## Heading\nnew body');
+  });
+
+  test('一处盖住好几个标题、回复一个都没写 → 每个都补回，空行照原文', () => {
+    const [e] = keepPatchHeadings(base, [{ from: 3, to: 9, text: '- **进展**: 新 A\n\n- **进展**: 新 B' }]);
+    assert.equal(e.text, '## 项目 A\n\n- **进展**: 新 A\n\n## 项目 B\n\n- **进展**: 新 B');
+  });
+
+  test('一处盖住好几个标题、回复只写了其中一个 → 只补漏了的那个，不重复', () => {
+    const [e] = keepPatchHeadings(base, [{ from: 3, to: 9, text: '## 项目 A\n\n- **进展**: 新 A\n\n- **进展**: 新 B' }]);
+    assert.equal(e.text, '## 项目 A\n\n- **进展**: 新 A\n\n## 项目 B\n\n- **进展**: 新 B');
+    const [f] = keepPatchHeadings(base, [{ from: 3, to: 9, text: '- **进展**: 新 A\n\n## 项目 B\n\n- **进展**: 新 B' }]);
+    assert.equal(f.text, '## 项目 A\n\n- **进展**: 新 A\n\n## 项目 B\n\n- **进展**: 新 B');
+  });
+
+  test('回复把这几个标题都改了名（个数对得上）→ 照用，不再补原标题', () => {
+    const reply = '## A 改名\n\n- **进展**: 新 A\n\n## B 改名\n\n- **进展**: 新 B';
+    const [e] = keepPatchHeadings(base, [{ from: 3, to: 9, text: reply }]);
+    assert.equal(e.text, reply);
+    /* 改了名的那个顶替它对应的原标题，只补真正漏掉的 */
+    const [f] = keepPatchHeadings(base, [{ from: 3, to: 9, text: '- **进展**: 新 A\n\n## B 改名\n\n- **进展**: 新 B' }]);
+    assert.equal((f.text.match(/^## /gm) || []).length, 2);
+    assert.ok(!f.text.includes('## 项目 B'));
+  });
+
+  test('回复把两节换了顺序（标题都在）→ 照用，不补出重复的标题', () => {
+    const orig = '## A\nbody A\n## B\nbody B';
+    const reply = '## B\nbody B\n## A\nbody A';
+    const [e] = keepPatchHeadings(orig, [{ from: 1, to: 4, text: reply }]);
+    assert.equal(e.text, reply);
+    /* 换了顺序、其中一个还改了名 —— 同样不补 */
+    const [f] = keepPatchHeadings(orig, [{ from: 1, to: 4, text: '## B\nbody B\n## A 改名\nbody A' }]);
+    assert.equal(f.text, '## B\nbody B\n## A 改名\nbody A');
+  });
+
+  test('settlePatchRevision 拼回的正文里标题还在', () => {
+    const res = settlePatchRevision({ replyText: '@@ 3-5 | ## 项目 A\n- **进展**: 新\n@@ END', base });
+    assert.equal(res.ok, true);
+    if (res.ok) {
+      assert.equal(res.fullText, ['# 周报', '', '## 项目 A', '', '- **进展**: 新', '', '## 项目 B', '', '- **进展**: 旧 B'].join('\n'));
+      assert.equal((res.fullText.match(/## 项目 A/g) || []).length, 1);
+    }
+  });
+});
+
+describe('丢字段提示的接线', () => {
+  const RV = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ReviewPane.tsx'), 'utf8');
+
+  test('block 档拿原节和（主进程补过标题的）回复比，两条写回路都带上提示', () => {
+    assert.ok(RV.includes("import { lostFields, lostFieldsByChange } from '../../main/reviseBlock.ts';"));
+    assert.ok(RV.includes("typeof res?.text === 'string' ? lostFields(where, res.text) : []"));
+    /* block 档那一段（insert 档在它前面，不带提示） */
+    const block = RV.slice(RV.indexOf("apply: { path, mode: 'splice', from, to, base },"));
+    const warnAt = block.indexOf('const lost = lostOf(where, res);');
+    assert.ok(warnAt > 0);
+    assert.ok(block.includes("return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round, lost } });"));
+    assert.ok(block.includes('whereAt(from, to) }), false, { ai: { round, lost } });'));
+    /* 每一处只说**它自己**删掉的那几个 —— 撤销哪一处，恢复的就是它说的那几个 */
+    assert.ok(RV.includes('const perChange = lostFieldsByChange(changes, opts.ai?.lost ?? []);'));
+    assert.ok(RV.includes('...(perChange[i].length ? { warn: lostWarnText(perChange[i]) } : null)'));
+  });
+
+  test('侧栏把它挂在 AI 改过的那一处下面，用醒目的样式', () => {
+    assert.match(RV, /className="rt-note-applied rv-ai-warn">\{m\.warn\}/);
+    const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
+    assert.match(CSS, /\.rv-review \.rv-ai-warn \{[^}]*color: var\(--error/);
   });
 });
