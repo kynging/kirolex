@@ -332,6 +332,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   markSessionPurpose: (sessionId: string, purpose: string, flow?: string) =>
     ipcRenderer.invoke('acp:mark-session-purpose', sessionId, purpose, flow),
   /** 把一个 flow 从这个 project 移出（配置动作，历史不动） */
+  /** 这些项目名里哪些是 KiroLex Advanced 专属的 flow 项目（标准版不显示）。 */
+  advancedOnlyProjects: (names: string[]) => ipcRenderer.invoke('app:advanced-only-projects', names),
   /** project 的工作目录 —— 它的会话都在这儿干活（空 = 家目录） */
   projectGetWorkspace: (project: string) => ipcRenderer.invoke('project:get-workspace', project),
   projectSetWorkspace: (project: string, workspace: string) =>

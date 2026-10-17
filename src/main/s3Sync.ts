@@ -172,12 +172,19 @@ export function placementOf(rec: { profile?: any; archived?: any; placementChang
 export function placementToFollow(
   local: { profile?: any; archived?: any; placementChangedAt?: any } | null | undefined,
   theirs: CatalogEntry | null | undefined,
+  /**
+   * 这个项目**不许跟进去**（标准版里 = KiroLex Advanced 专属的 flow 项目，判据在 `advancedOnly.ts`）。
+   * 别的机器把会话挪进了这样的项目 → 这台不跟，保持本机的位置；否则一条普通会话进去，那个项目就不再受保护。
+   */
+  refuseProject?: (projectId: string) => boolean,
 ): Placement | null {
   if (!local || !theirs) return null;
   const at = Number(theirs.placementChangedAt) || 0;
   if (at <= placementOf(local).placementChangedAt) return null;
+  const projectId = typeof theirs.project === 'string' ? theirs.project.trim() : '';
+  if (projectId && projectId !== placementOf(local).projectId && refuseProject?.(projectId)) return null;
   return {
-    projectId: typeof theirs.project === 'string' ? theirs.project.trim() : '',
+    projectId,
     archived: !!theirs.archived,
     placementChangedAt: at,
   };

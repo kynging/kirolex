@@ -156,3 +156,24 @@ export function mergeRecords(local: any, remote: any): any {
   out.updatedAt = Math.max(Number(local.updatedAt) || 0, Number(remote.updatedAt) || 0, Date.now());
   return out;
 }
+
+/**
+ * **合并结果不许把会话放进被拒绝的项目** —— 标准版里 = KiroLex Advanced 专属的 flow 项目（判据在 `advancedOnly.ts`）。
+ *
+ * `mergeRecords` 按 `placementChangedAt` / `updatedAt` 谁新用谁，云上那份可能把项目改成「周报」这样的项目：
+ * 一条普通会话进去，那个项目就不再受保护。这种时候位置（项目 / 归档 / `placementChangedAt`）保留本机的，
+ * 其余字段照合并结果。本机没有记录、或项目没变 / 不被拒，原样返回。
+ */
+export function guardMergedPlacement(merged: any, local: any, refuseProject: (projectId: string) => boolean): any {
+  if (!merged || !local) return merged;
+  const target = typeof merged.profile?.projectId === 'string' ? merged.profile.projectId.trim() : '';
+  const mine = typeof local.profile?.projectId === 'string' ? local.profile.projectId.trim() : '';
+  if (!target || target === mine || !refuseProject(target)) return merged;
+  const profile = { ...(merged.profile || {}) };
+  if (local.profile && local.profile.projectId !== undefined) profile.projectId = local.profile.projectId;
+  else delete profile.projectId;
+  const out: any = { ...merged, profile };
+  if (local.archived !== undefined) out.archived = local.archived; else delete out.archived;
+  if (local.placementChangedAt !== undefined) out.placementChangedAt = local.placementChangedAt; else delete out.placementChangedAt;
+  return out;
+}

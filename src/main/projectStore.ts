@@ -23,7 +23,7 @@ import { tr } from './uiText.ts';
  * project 的数据"消失"。判据是**白名单**（词字符、点、横线、空格、中日韩），不是黑名单；
  * 开头的点要换掉（`.foo` 会变成隐藏目录）。
  */
-function projectDirName(project: string): string {
+export function projectDirName(project: string): string {
   return (project || '').trim().replace(/[^\w.\- \u4e00-\u9fff]/g, '_').replace(/^\.+/, '_') || '_';
 }
 

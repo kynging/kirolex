@@ -2,7 +2,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { MEMORY_BACKUPS, type MemoryScope } from './memoryPolicy.ts';
-import { isAdvancedOnlySession } from './sessionStore.ts';
+import { isAdvancedOnlySession, isAdvancedOnlyProjectName, advancedOnlyProjectsAmong } from './sessionStore.ts';
 
 /**
  * Layered memory store (design §6). THREE curated layers on disk, ordered
@@ -47,6 +47,11 @@ function sessionMemoryProtected(sessionId: string | undefined): boolean {
   return !!sessionId && isAdvancedOnlySession(sessionId);
 }
 
+/** 项目层同理：KiroLex Advanced 专属的项目（flow 项目，判据见 `advancedOnly.isAdvancedOnlyProject`）的 `memory/projects/<名>/` 不碰。 */
+function projectMemoryProtected(projectId: string | undefined): boolean {
+  return !!projectId && isAdvancedOnlyProjectName(projectId);
+}
+
 function readIfExists(p: string): string {
   try { return fs.readFileSync(p, 'utf-8').trim(); } catch { return ''; }
 }
@@ -56,7 +61,7 @@ export function ensureMemoryFiles(projectId?: string, sessionId?: string): void 
   try {
     fs.mkdirSync(baseDir, { recursive: true });
     if (!fs.existsSync(globalPath)) fs.writeFileSync(globalPath, '# Global memory\n\n');
-    if (projectId) {
+    if (projectId && !projectMemoryProtected(projectId)) {
       fs.mkdirSync(projectDir(projectId), { recursive: true });
       const pp = projectPath(projectId);
       if (!fs.existsSync(pp)) fs.writeFileSync(pp, `# Project memory: ${projectId}\n\n`);
@@ -108,6 +113,7 @@ export function backupMemoryLayer(
   stamp: string,
 ): string | null {
   if (scope === 'session' && sessionMemoryProtected(sessionId)) return null;
+  if (scope === 'project' && projectMemoryProtected(projectId)) return null;
   try {
     const src = scope === 'global' ? globalPath
       : scope === 'project' ? (projectId ? projectPath(projectId) : '')
@@ -131,6 +137,7 @@ export function backupMemoryLayer(
 
 /** Delete a project's memory directory (project deletion). */
 export function deleteProjectMemory(projectId: string): void {
+  if (projectMemoryProtected(projectId)) return;
   try {
     const d = projectDir(projectId);
     if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
@@ -174,6 +181,9 @@ export function writeMemory(
 ): void {
   if (scope === 'session' && sessionMemoryProtected(sessionId)) {
     throw new Error('This session belongs to KiroLex Advanced; the standard edition does not modify it.');
+  }
+  if (scope === 'project' && projectMemoryProtected(projectId)) {
+    throw new Error('This project belongs to KiroLex Advanced; the standard edition does not modify it.');
   }
   ensureMemoryFiles(projectId, sessionId);
   if (scope === 'global') {
@@ -268,6 +278,9 @@ export function buildMemoryInjection(
           .filter((e) => e.isDirectory())
           .map((e) => e.name)
           .sort();
+        /* advanced 专属的项目不列给模型：列了它就会往那个项目的记忆里写 */
+        const hidden = advancedOnlyProjectsAmong(names);
+        names = names.filter((n) => !hidden.has(n));
       } catch { /* 还没有任何项目 */ }
       lines.push('');
       if (names.length) {

@@ -20,10 +20,12 @@ export interface RestorePlacement {
 export function restorePlacement(
   localBefore: { profile?: any; archived?: any; placementChangedAt?: any } | null | undefined,
   entry: CatalogEntry | null | undefined,
+  /** 不许跟进去的项目（见 `placementToFollow`）—— 跟不了就保持本机的位置 */
+  refuseProject?: (projectId: string) => boolean,
 ): RestorePlacement | null {
   if (!localBefore) return null;
   const before = placementOf(localBefore);
-  const placement = placementToFollow(localBefore, entry) || before;
+  const placement = placementToFollow(localBefore, entry, refuseProject) || before;
   return { placement, before, changed: placement.projectId !== before.projectId || placement.archived !== before.archived };
 }
 

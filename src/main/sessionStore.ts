@@ -3,7 +3,8 @@ import os from 'os';
 import path from 'path';
 import type { AgentProfile } from './config';
 import { tr } from './uiText.ts';
-import { isAdvancedOnly } from './advancedOnly.ts';
+import { isAdvancedOnly, isAdvancedOnlyProject } from './advancedOnly.ts';
+import { projectDirName } from './projectStore.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -500,6 +501,48 @@ export function listSessions(): SessionRecord[] {
     if (rec && !isAdvancedOnly(rec)) out.push(rec);
   }
   return out.sort((a, b) => b.updatedAt - a.updatedAt);
+}
+
+const kirolexDir = path.join(os.homedir(), '.kirolex');
+
+/** 项目在磁盘上有没有 advanced 的 flow 痕迹（`runs/` 非空 / `detached-flows.json` / 同名 flow 定义）—— 只 stat，不读内容。 */
+function advancedProjectMarks(project: string): { hasRuns: boolean; hasDetachedFlows: boolean; hasFlowDefinition: boolean } {
+  const dir = path.join(kirolexDir, 'projects', projectDirName(project));
+  let hasRuns = false;
+  try { hasRuns = fs.readdirSync(path.join(dir, 'runs')).length > 0; } catch { /* 没有 runs/ */ }
+  const hasDetachedFlows = fs.existsSync(path.join(dir, 'detached-flows.json'));
+  /* flow 定义按项目名逐字落在 flows/ 下；带路径分隔符的名字不可能是一个文件名 */
+  const name = (project || '').trim();
+  const hasFlowDefinition = !!name && !/[\\/]|\.\./.test(name) && fs.existsSync(path.join(kirolexDir, 'flows', `${name}.json`));
+  return { hasRuns, hasDetachedFlows, hasFlowDefinition };
+}
+
+/**
+ * 这些项目名里哪些是 **KiroLex Advanced 专属的项目**（判据在 `advancedOnly.isAdvancedOnlyProject`）：
+ * 有 flow 痕迹，并且项目下没有任何普通会话（purpose 为空）。标准版所有列出项目的地方都按它过滤，
+ * 会改项目文件 / 往项目里放会话的入口按它拒绝。
+ */
+export function advancedOnlyProjectsAmong(names: Iterable<string>): Set<string> {
+  const out = new Set<string>();
+  const candidates = [...new Set([...names].map((n) => String(n || '').trim()).filter(Boolean))]
+    .map((name) => ({ name, marks: advancedProjectMarks(name) }))
+    .filter((c) => c.marks.hasRuns || c.marks.hasDetachedFlows || c.marks.hasFlowDefinition);
+  if (!candidates.length) return out;   // 绝大多数项目在这里就结束了：不用去读所有会话记录
+  const standard = new Map<string, number>();
+  for (const rec of listSessions()) {
+    if ((rec.purpose || '').trim()) continue;
+    const p = String((rec.profile as any)?.projectId || '').trim();
+    if (p) standard.set(p, (standard.get(p) || 0) + 1);
+  }
+  for (const c of candidates) {
+    if (isAdvancedOnlyProject({ ...c.marks, standardSessions: standard.get(c.name) || 0 })) out.add(c.name);
+  }
+  return out;
+}
+
+export function isAdvancedOnlyProjectName(project: string | null | undefined): boolean {
+  const p = String(project || '').trim();
+  return !!p && advancedOnlyProjectsAmong([p]).has(p);
 }
 
 /** `listSessions()` 藏起来的那些（advanced 的会话）的 id —— S3 页要靠它认出「本机有、只是不显示」。 */

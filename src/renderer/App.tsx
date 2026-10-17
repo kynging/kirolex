@@ -112,6 +112,8 @@ declare global {
       /** 移出一个 flow（配置动作，历史不动）/ 名单 / 删某个 flow 的全部历史（进回收站） */
       runSetFlowDetached?: (project: string, flow: string, detached: boolean) => Promise<{ ok: boolean; detached: string[] }>;
       runDetachedFlows?: (project: string) => Promise<string[]>;
+      /** 这些项目名里哪些是 KiroLex Advanced 专属的 flow 项目（标准版不显示，见 useAcp 的 visibleProjects）。 */
+      advancedOnlyProjects?: (names: string[]) => Promise<string[]>;
       /** project 的工作目录 —— 它的会话都在这儿干活（空 = 家目录） */
       projectGetWorkspace?: (project: string) => Promise<{ workspace: string }>;
       projectSetWorkspace?: (project: string, workspace: string) => Promise<{ ok: boolean; error?: string }>;

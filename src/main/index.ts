@@ -26,7 +26,7 @@ import {
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
   decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
-import { mergeTranscripts, mergeRecords } from './transcriptMerge.ts';
+import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
 import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
@@ -34,7 +34,7 @@ import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, can
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
-import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord } from './advancedOnly.ts';
+import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectChange } from './advancedOnly.ts';
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
@@ -3996,12 +3996,19 @@ function cloudAdvancedBackups(creds: S3Creds, prefix: string | undefined, ids: I
  * **恢复页要藏起来的那些备份** —— advanced 的会话（flow / skill）：本机藏着的（`listAdvancedOnlyIds`），
  * 加上只在云上、桶里 record.json 是 advanced 的。不认出来就会显示成「本地没有」：既像可恢复，又像该清理的。
  * 读不出来的照常列（恢复时 `refuseAdvancedBackup` 还会再判；删除备份时不删）。
+ *
+ * 还有**归到本机 KiroLex Advanced 专属项目（flow 项目）的那些**：恢复页按项目分组，不藏的话就会冒出一个
+ * 「周报」分组，而点恢复只会被拒（见 `vetBackupRecord` 的 refuseProject）。归属的算法和恢复页显示的一样（`catalogProject`）。
  */
 async function advancedBackupIds(creds: S3Creds, prefix: string | undefined, catalog: Catalog, local: Set<string>): Promise<Set<string>> {
   const hidden = store.listAdvancedOnlyIds();
   const cloudOnly = (catalog.entries || []).map((e) => e.id).filter((id) => !local.has(id) && !hidden.has(id));
   const cloud = await cloudAdvancedBackups(creds, prefix, cloudOnly);
-  return new Set([...hidden, ...cloud.advanced]);
+  const projectById = new Map(store.listSessions().map((r) => [r.id, projectOf(r)]));
+  const groupOf = (e: CatalogEntry) => catalogProject(e, projectById.get(e.id)) || '';
+  const advancedProjects = store.advancedOnlyProjectsAmong((catalog.entries || []).map(groupOf));
+  const inAdvancedProject = (catalog.entries || []).filter((e) => advancedProjects.has(groupOf(e))).map((e) => e.id);
+  return new Set([...hidden, ...cloud.advanced, ...inAdvancedProject]);
 }
 
 /**
@@ -4012,15 +4019,30 @@ async function advancedBackupIds(creds: S3Creds, prefix: string | undefined, cat
  */
 async function refuseAdvancedBackup(creds: S3Creds, prefix: string, objects: Array<{ key: string }>, sessionId: string): Promise<{ refused: string } | { get: (key: string) => Promise<Buffer> }> {
   const recordKey = objects.some((o) => o.key === `${prefix}record.json`) ? `${prefix}record.json` : null;
-  const v = await vetBackupRecord(recordKey, (key) => getObject(creds, key));
+  const v = await vetBackupRecord(recordKey, (key) => getObject(creds, key), store.isAdvancedOnlyProjectName);
   if (v.ok) {
     const vetted = v.record;
     return { get: async (key) => (vetted && key === recordKey ? vetted : getObject(creds, key)) };
   }
-  logger.warn('s3', `refused s3:restore: sessionId=${sessionId} ${v.reason === 'advanced' ? '桶里那份是 KiroLex Advanced 的会话' : '桶里那份 record.json 读不出来、确认不了用途'}，标准版不恢复`);
+  logger.warn('s3', `refused s3:restore: sessionId=${sessionId} ${v.reason === 'advanced' ? '桶里那份是 KiroLex Advanced 的会话'
+    : v.reason === 'advanced-project' ? '桶里那份属于本机 KiroLex Advanced 专属的 flow 项目' : '桶里那份 record.json 读不出来、确认不了用途'}，标准版不恢复`);
   return { refused: v.reason === 'advanced'
     ? tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.')
-    : tr("Could not read this backup's record.json, so it is not restored (it might be a KiroLex Advanced session). Try again later.") };
+    : v.reason === 'advanced-project'
+      ? tr('This project belongs to KiroLex Advanced; the standard edition does not modify it.')
+      : tr("Could not read this backup's record.json, so it is not restored (it might be a KiroLex Advanced session). Try again later.") };
+}
+
+/**
+ * **KiroLex Advanced 专属的项目（flow 项目），标准版不显示也不碰** —— 判据在 `advancedOnly.isAdvancedOnlyProject`
+ * （有 flow 痕迹，并且项目下没有普通会话）。不改它的 project.json / runs / 记忆，也不许把会话放进去。
+ * 返回 null = 放行；否则是拒绝原因。
+ */
+function refuseAdvancedProject(projectId: string | null | undefined, what: string): string | null {
+  const p = String(projectId || '').trim();
+  if (!p || !store.isAdvancedOnlyProjectName(p)) return null;
+  logger.warn('project', `refused ${what}: project=${JSON.stringify(p)} 是 KiroLex Advanced 的 flow 项目，标准版不碰`);
+  return tr('This project belongs to KiroLex Advanced; the standard edition does not modify it.');
 }
 
 function catalogEntriesFor(
@@ -4063,10 +4085,11 @@ function followBucketPlacements(cfg: SyncConfig, catalog: Catalog | null, sessio
   for (const r of sessions) {
     if (projectExcluded(cfg, projectOf(r)) || sessionExcluded(cfg, r.id)) continue;
     const theirs = byId.get(r.id);
-    if (!placementToFollow(r, theirs)) continue;
+    /* 不跟进 KiroLex Advanced 专属的 flow 项目：保持本机的位置（见 placementToFollow） */
+    if (!placementToFollow(r, theirs, store.isAdvancedOnlyProjectName)) continue;
     /* 写之前按磁盘再读一遍 —— 列表那份可能已经旧了，拿它写回去会丢掉这期间别的改动 */
     const cur = store.readRecord(r.id);
-    const p = placementToFollow(cur, theirs);
+    const p = placementToFollow(cur, theirs, store.isAdvancedOnlyProjectName);
     if (!cur || !p) continue;
     const before = placementOf(cur);
     try {
@@ -4136,7 +4159,8 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
     let mine: any; let theirs: any;
     try { mine = JSON.parse(fs.readFileSync(rAbs, 'utf-8')); } catch { mine = undefined; }
     try { theirs = JSON.parse(rr.toString('utf-8')); } catch { theirs = undefined; }
-    const merged = mergeRecords(mine, theirs);
+    /* 云上那份的位置要是 KiroLex Advanced 专属的 flow 项目，保留本机的位置（followBucketPlacements 同一条规则） */
+    const merged = guardMergedPlacement(mergeRecords(mine, theirs), mine, store.isAdvancedOnlyProjectName);
     /* 合并之后这一份就是"最新"的：updatedAt 取两边的较大者，不然下一轮又被判成冲突 */
     merged.updatedAt = Math.max(Number(mine?.updatedAt) || 0, Number(theirs?.updatedAt) || 0, Date.now());
     const tmp = `${rAbs}.kirolex-${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(merged, null, 2)); fs.renameSync(tmp, rAbs);
@@ -4290,7 +4314,10 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       **记忆按同一个口径筛** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
       项目：本地所有有记忆的项目里，没被设成不同步的那些（一个项目底下暂时没有会话，它的记忆也该在）。
     */
-    const memoryProjects = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'))
+    const memoryProjectDirs = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'));
+    /* advanced 专属的项目（flow 项目）的记忆：不传、也不从桶里拉回来写 —— 由 advanced 自己同步 */
+    const advancedProjects = store.advancedOnlyProjectsAmong(memoryProjectDirs);
+    const memoryProjects = memoryProjectDirs.filter((p) => !advancedProjects.has(p))
       .filter((p) => !projectExcluded(cfg, p));
     const plan = planUpload(KIROLEX_HOME, ids, state, { projects: memoryProjects });
     let freshEntries = catalogEntriesFor(sessions, thisMachine);
@@ -4360,7 +4387,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       const parts = rel.split(path.sep);
       if (parts[0] !== 'memory' || !rel.endsWith('.md')) return false;
       if (parts.length === 2) return true;                                   // global.md 那一层
-      if (parts[1] === 'projects') return !projectExcluded(cfg, parts[2]);   // 别的机器建的项目也拉
+      if (parts[1] === 'projects') return !projectExcluded(cfg, parts[2]) && !store.isAdvancedOnlyProjectName(parts[2]);   // 别的机器建的项目也拉
       if (parts[1] === 'sessions') return ids.includes(parts[2]);            // 只管本机有的会话
       return false;
     };
@@ -5918,6 +5945,7 @@ app.whenReady().then(async () => {
           const m = /^([^/]+)\/memory\.md$/.exec(o.key.slice(mpfx.length));
           if (m) memoryByProject[m[1]] = { bytes: o.size, lastModified: o.lastModified };
         }
+        for (const p of store.advancedOnlyProjectsAmong(Object.keys(memoryByProject))) delete memoryByProject[p];
       } catch { /* 列不出来就不显示，不挡恢复 */ }
       const recById = new Map(localRecs.map((r) => [r.id, r]));
       const hidden = await advancedBackupIds(creds!, cfg.prefix, catalog, local);   // advanced 的会话不进恢复页
@@ -5931,7 +5959,7 @@ app.whenReady().then(async () => {
           /* 新旧对比用（本机较新 / 云上较新 / 两边一样） */
           localUpdatedAt: recById.get(e.id)?.updatedAt || 0,
           /* 恢复后位置会不会按云上的改（谁后挪用谁，见 `s3:restore`）—— 确认框里要说出来 */
-          placementWillChange: !!restorePlacement(recById.get(e.id), e)?.changed,
+          placementWillChange: !!restorePlacement(recById.get(e.id), e, store.isAdvancedOnlyProjectName)?.changed,
           /*
             只把**正在跑一轮**的标出来 ——「恢复的未分组里面怎么有这么多正连着」。
             原来标的是"有执行器"，而启动预热会把未分组整组拉起来，于是一大片都显示正连着、
@@ -5970,6 +5998,7 @@ app.whenReady().then(async () => {
     if (problem) return { ok: false, error: problem };
     if (typeof project !== 'string') return { ok: false, error: tr('Invalid project name.') };
     if (confirm !== project) return { ok: false, error: tr('Not confirmed: the project to delete must be passed back exactly.') };
+    { const advRefused = refuseAdvancedProject(project, 's3:delete-project'); if (advRefused) return { ok: false, error: advRefused }; }
     const cfg = loadSyncConfig();
     try {
       /*
@@ -6181,7 +6210,7 @@ app.whenReady().then(async () => {
       */
       const describePlacement = (projectId: string | undefined, archived: boolean) => `「${projectId || '未分组'}」${archived ? '·已归档' : ''}`;
       let placement: { projectId?: string; archived: boolean; fromProjectId?: string; fromArchived: boolean } | undefined;
-      const rp = restorePlacement(localBefore, catalogEntry);
+      const rp = restorePlacement(localBefore, catalogEntry, store.isAdvancedOnlyProjectName);   // 不跟进 advanced 专属项目
       if (rp && recAfter) {
         const cur = placementOf(recAfter);
         const want = rp.placement;
@@ -6226,7 +6255,7 @@ app.whenReady().then(async () => {
       const memTrash = path.join(backedUp || trashDirFor(KIROLEX_HOME, sessionId), '__memory');
       const memPrefixes = [
         `${keyFor(cfg.prefix, path.join('memory', 'sessions', sessionId))}/`,
-        ...(project && !/[\\/]|\.\./.test(project) ? [`${keyFor(cfg.prefix, path.join('memory', 'projects', project))}/`] : []),
+        ...(project && !/[\\/]|\.\./.test(project) && !store.isAdvancedOnlyProjectName(project) ? [`${keyFor(cfg.prefix, path.join('memory', 'projects', project))}/`] : []),
         keyFor(cfg.prefix, path.join('memory', 'global.md')),
       ];
       for (const pfx of memPrefixes) {
@@ -6352,6 +6381,7 @@ app.whenReady().then(async () => {
       这边没认）要查的地方完全不同，而这一行就把它们分开。留着不删：这条路以后还会被改。
     */
     logger.info('remote', `new-session ${kiroLexId}: remoteId=${remoteId ?? '(没传)'} project=${projectId || '(无)'} model=${model}`);
+    { const advRefused = refuseAdvancedProject(projectId, 'new-session'); if (advRefused) throw new Error(advRefused); }
     if (!ensureExecutorCapacity()) {
       throw new Error(tr('All live sessions are busy; cannot start another right now.'));
     }
@@ -6526,6 +6556,10 @@ app.whenReady().then(async () => {
     // session's executor, and the rest of the turn must continue on the new one.
     let entry = sessionClients.get(sessionId);
     if (!entry) throw new Error(tr('Session not connected'));
+    /* 不许借一次发送把会话放进 KiroLex Advanced 专属的 flow 项目 —— 在任何副作用（拷附件、写记录）之前 */
+    if (refusesProjectChange(projectId, entry.profile.projectId, store.isAdvancedOnlyProjectName)) {
+      throw new Error(refuseAdvancedProject(projectId, 'prompt') || tr('This project belongs to KiroLex Advanced; the standard edition does not modify it.'));
+    }
     logger.info('prompt', `received sessionId=${sessionId} cli=${entry.cliSessionId} busy=${entry.busy}`);
     /*
       **你自己写的那段文字** —— 摆渡只看它，别看注入进去的东西（`userPromptText`）。
@@ -7978,11 +8012,19 @@ app.whenReady().then(async () => {
    * 读:界面要显示当前值。写:先校验(不存在 / 不是目录 / 不是绝对路径都当场说),因为它错了的表现是
    * 「所有会话都起不来」,那时候人只会看到一条抽象的失败。
    */
+  /**
+   * 渲染层的项目名里，哪些是 **KiroLex Advanced 专属的项目**（flow 项目）—— 侧栏、项目菜单、「移到项目」、
+   * 新建会话选项目、设置里的项目列表都按它过滤。只回答，不改任何东西：共享的 `kirolex-projects` 列表原样留着。
+   */
+  ipcMain.handle('app:advanced-only-projects', async (_event, names: unknown) =>
+    [...store.advancedOnlyProjectsAmong(Array.isArray(names) ? names.filter((n): n is string => typeof n === 'string') : [])]);
+
   ipcMain.handle('project:get-workspace', async (_event, project: string) => ({
     workspace: projectStore.readProject(os.homedir(), project).workspace || '',
   }));
 
   ipcMain.handle('project:set-workspace', async (_event, project: string, workspace: string) => {
+    { const advRefused = refuseAdvancedProject(project, 'set-workspace'); if (advRefused) return { ok: false, error: advRefused }; }
     const why = projectStore.whyNotWorkspace(workspace);
     if (why) return { ok: false, error: why };
     projectStore.writeProject(os.homedir(), project, { workspace });
@@ -8644,7 +8686,8 @@ app.whenReady().then(async () => {
     if (deletedSessionIds.has(sessionId) || loadSessionTombstones().includes(sessionId)) return null;
     const profile: AgentProfile = {
       model: DEFAULT_MODEL, preferredModel: DEFAULT_MODEL, permissionMode: 'auto-approve',
-      ...(hint?.projectId ? { projectId: hint.projectId } : {}),
+      /* KiroLex Advanced 专属的 flow 项目不放进去：建成未分组 */
+      ...(hint?.projectId && !refuseAdvancedProject(hint.projectId, 'cold-record') ? { projectId: hint.projectId } : {}),
     };
     logger.info('session', `新会话还没有记录（没连上过），切换前先建一份 sessionId=${sessionId} project=${hint?.projectId || '(无)'}`);
     return store.createSession(sessionId, profile);
@@ -11489,6 +11532,7 @@ app.whenReady().then(async () => {
   // null/undefined -> concrete transition; project->project or un-set is
   // rejected. Persists to the durable record and syncs any live executor.
   ipcMain.handle('acp:assign-project', async (_event, sessionId: string, projectId: string) => {
+    { const advRefused = refuseAdvancedProject(projectId, 'assign-project'); if (advRefused) throw new Error(advRefused); }
     { const advRefused = refuseAdvancedOnly(sessionId, 'assign-project'); if (advRefused) throw new Error(advRefused); }
     const rec = store.readRecord(sessionId);
     if (!rec) throw new Error(tr('No such session'));
@@ -11510,6 +11554,7 @@ app.whenReady().then(async () => {
   ipcMain.handle('acp:set-project', async (_event, sessionId: string, projectId: string | null) => {
     /* 改名 / 删项目时成批调：advanced 的那条跳过，不报错（它本来就不在标准版的列表里） */
     if (refuseAdvancedOnly(sessionId, 'set-project')) return { sessionId, projectId, skipped: true };
+    { const advRefused = refuseAdvancedProject(projectId, 'set-project'); if (advRefused) throw new Error(advRefused); }
     const rec = store.readRecord(sessionId);
     if (!rec) return { sessionId, projectId };
     rec.profile.projectId = projectId ?? undefined;
@@ -11533,6 +11578,7 @@ app.whenReady().then(async () => {
   // so the conversation is preserved. Unlike assign-project this is not
   // write-once — it is an explicit user move.
   ipcMain.handle('acp:move-session', async (_event, sessionId: string, projectId: string | null) => {
+    { const advRefused = refuseAdvancedProject(projectId, 'move-session'); if (advRefused) throw new Error(advRefused); }
     { const advRefused = refuseAdvancedOnly(sessionId, 'move'); if (advRefused) throw new Error(advRefused); }
     /*
       **一轮在跑的时候不许换项目** ——「为什么远程 session 换不了 project」。
@@ -11703,6 +11749,7 @@ app.whenReady().then(async () => {
 
   // Delete a project's memory directory (project deletion).
   ipcMain.handle('acp:delete-project-memory', async (_event, projectId: string) => {
+    if (refuseAdvancedProject(projectId, 'delete-project-memory')) return { projectId, skipped: true };
     deleteProjectMemory(projectId);
     return { projectId };
   });
@@ -12467,6 +12514,10 @@ app.whenReady().then(async () => {
     if (scope === 'session' && sessionId && !sid) {
       return { ok: false, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
     }
+    if (scope === 'project') {
+      const advRefused = refuseAdvancedProject(projectId, 'write-memory');
+      if (advRefused) return { ok: false, error: advRefused };
+    }
     writeMemory(scope, projectId, sid, content);
     return { ok: true };
   });
@@ -12484,6 +12535,10 @@ app.whenReady().then(async () => {
     const sid = memorySessionId(sessionId, 'backup-memory');
     if (scope === 'session' && sessionId && !sid) {
       return { ok: false, at: null, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+    }
+    if (scope === 'project') {
+      const advRefused = refuseAdvancedProject(projectId, 'backup-memory');
+      if (advRefused) return { ok: false, at: null, error: advRefused };
     }
     const stamp = new Date().toISOString().replace(/[:.]/g, '-');
     const at = backupMemoryLayer(scope, projectId, sid, stamp);

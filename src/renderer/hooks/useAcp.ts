@@ -1,4 +1,4 @@
-import { useState, useCallback, useEffect, useRef } from 'react';
+import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { consumeHandoff } from '../handoffDraft';
 import { type SubagentRow } from '../../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
@@ -38,6 +38,7 @@ import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarge
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
 import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
+import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -1988,6 +1989,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       uiSet('kirolex-projects', JSON.stringify(projects));
     } catch {}
   }, [projects]);
+
+  /*
+    **KiroLex Advanced 专属的 flow 项目不显示** ——「标准版里仍然能看到『周报』和『SFDC Activity』」。
+    哪些要藏由主进程判（看磁盘），这里只拿结果；`projects` 本身（两版共用的 `kirolex-projects`）不删它们。
+    会话的项目归属一变就再问一次（`projectMembershipKey`）：项目下有了普通会话它就该重新出现，最后一条普通会话移走了它就该藏起来。
+  */
+  const [hiddenProjects, setHiddenProjects] = useState<string[]>([]);
+  const membership = useMemo(() => projectMembershipKey(sessions), [sessions]);
+  useEffect(() => {
+    let alive = true;
+    const ask = window.kiroApi.advancedOnlyProjects;
+    if (!ask || !projects.length) { setHiddenProjects([]); return; }
+    ask(projects).then((h) => { if (alive) setHiddenProjects(Array.isArray(h) ? h : []); }).catch(() => {});
+    return () => { alive = false; };
+  }, [projects, membership]);
+  const shownProjects = useMemo(() => visibleProjects(projects, hiddenProjects), [projects, hiddenProjects]);
 
   // Seed the projects list from any projectIds already present on sessions.
   useEffect(() => {
@@ -4651,9 +4668,9 @@ ${text}`,
   // Create an (initially empty) project. Sessions join by drag-assign (§6.4).
   const createProject = useCallback((name: string) => {
     const n = name.trim();
-    if (!n) return;
+    if (!n || hiddenProjects.includes(n)) return;   // 和 advanced 的 flow 项目同名：不往里放
     setProjects((prev) => (prev.includes(n) ? prev : [...prev, n]));
-  }, []);
+  }, [hiddenProjects]);
 
   // Reorder PROJECTS. The `projects` array order IS the sidebar display order, so
   // moving an element here is the whole feature. A NEW project is appended (see
@@ -4678,6 +4695,7 @@ ${text}`,
   const renameProject = useCallback((oldName: string, newName: string) => {
     const n = newName.trim();
     if (!n || n === oldName) return;
+    if (hiddenProjects.includes(n) || hiddenProjects.includes(oldName)) return;   // advanced 的 flow 项目不改、不并进去
     sessions.forEach((s) => {
       if (s.projectId === oldName) window.kiroApi.setProject(s.id, n).catch(() => {});
     });
@@ -4689,17 +4707,18 @@ ${text}`,
      * tag and its flow.
      */
     void window.kiroApi.runRenameProject?.(oldName, n).catch(() => {});
-  }, [sessions]);
+  }, [sessions, hiddenProjects]);
 
   // Delete a PROJECT: fully clear it — delete every member chat, delete the
   // project's memory directory, and remove the label. (A later same-name project
   // therefore starts fresh with no inherited memory or chats.)
   const deleteProject = useCallback((name: string) => {
+    if (hiddenProjects.includes(name)) return;   // advanced 的 flow 项目不删
     const members = sessions.filter((s) => s.projectId === name);
     members.forEach((s) => { deleteSession(s.id); });
     window.kiroApi.deleteProjectMemory(name).catch(() => {});
     setProjects((prev) => prev.filter((p) => p !== name));
-  }, [sessions, deleteSession]);
+  }, [sessions, deleteSession, hiddenProjects]);
 
   // Pin/unpin a session (pinned sessions sort to the top of their group).
   const togglePin = useCallback((sessionId: string) => {
@@ -4905,7 +4924,7 @@ ${text}`,
     assignProject,
     moveSession,
     archiveSession,
-    projects,
+    projects: shownProjects,
     createProject,
     reorderProjects,
     renameProject,
