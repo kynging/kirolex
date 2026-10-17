@@ -42,6 +42,7 @@ import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
 import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts';
+import { browserActionsOf } from '../localBrowserView.ts';
 import { visit } from 'unist-util-visit';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
@@ -882,6 +883,7 @@ const MessageItem = memo<{
                 runs and closes itself when it ends, so a finished turn does not leave a
                 wall of shell text in the transcript. */}
             <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} remoteHost={remoteHost} />
+            <BrowserPanel fileChanges={turnFileChanges} />
           </div>
         )}
       </div>
@@ -2305,6 +2307,39 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
               </li>
             );
           })}
+        </ul>
+      )}
+    </div>
+  );
+});
+
+/** 「🌐 浏览器操作」 -- what local_browser did this turn (opened which URL, read how
+ *  many chars, where the screenshot went). The main process records each operation as
+ *  a `kind: 'browser'` tool call (`noteBrowserAction`), so it is persisted with the
+ *  turn like any other. Collapsed shows the first entry; one line per operation. */
+const BrowserPanel = memo<{ fileChanges: ToolCall[] }>(({ fileChanges }) => {
+  const t = useT();
+  const [collapsed, setCollapsed] = useState(false);
+  const actions = useMemo(() => browserActionsOf(fileChanges), [fileChanges]);
+  if (!actions.length) return null;
+  return (
+    <div className="turn-panel browser-panel">
+      <button className="turn-panel-head" onClick={() => setCollapsed(!collapsed)}>
+        <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
+        <span className="turn-panel-label">{t('🌐 Browser actions')}</span>
+        <span className="turn-panel-count">{actions.length}</span>
+        {collapsed && <span className="commands-preview" title={actions[0].title}>{actions[0].title}</span>}
+      </button>
+      {!collapsed && (
+        <ul className="files-list">
+          {actions.map((a) => (
+            <li key={a.toolCallId} className="files-item">
+              <div className="files-item-row">
+                <span className="commands-item-title full" title={a.title}>{a.title}</span>
+                {a.status === 'failed' && <span className="stat-del">{t('Failed')}</span>}
+              </div>
+            </li>
+          ))}
         </ul>
       )}
     </div>

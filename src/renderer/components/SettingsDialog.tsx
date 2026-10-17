@@ -4,6 +4,7 @@ import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
 import { ForwardMcpSettings } from './ForwardMcpSettings';
+import { LocalBrowserSettings } from './LocalBrowserSettings';
 import { useT } from '../hooks/useLang';
 import { fontSelectOptions } from '../fontOptions';
 import React from 'react';
@@ -621,6 +622,8 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                 );
               })}
             </div>
+            {/* local_browser：接管已登录的浏览器读页面（只读）。总开关默认关 */}
+            <LocalBrowserSettings />
           </div>
           )}
         </div>

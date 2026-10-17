@@ -532,6 +532,12 @@ export class AcpClient extends EventEmitter {
   }
 
   private get mcpServers(): any[] {
+    /*
+      唯一的 kiro 例外：**本地 kiro 会话 + local_browser 开着**（index.ts `withLocalBrowser`）——
+      kiro-cli 的 initialize 声明了 `mcpCapabilities.http`，浏览器那几个工具就从这里交给它。
+      远程 kiro 照旧走 agent 文件（下面那行）。
+    */
+    if (this.engine === 'kiro' && !this.remote?.sshHost && this.localTools?.mcpServers?.length) return this.localTools.mcpServers;
     return this.engine !== 'kiro' ? (this.localTools?.mcpServers || []) : [];
   }
 

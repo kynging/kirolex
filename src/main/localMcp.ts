@@ -43,6 +43,7 @@ import fs from 'fs';
 import http from 'http';
 import path from 'path';
 import { tr } from './uiText.ts';
+import { browserToolDefs, isBrowserTool } from './localBrowser.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -74,6 +75,11 @@ export interface LocalMcpSession {
    * 不填 / 空数组等于 `[workdir]`。这**不是**权限边界（绝对路径照样能读，见文件头「边界」）。
    */
   dirs?: string[];
+  /**
+   * **本地会话**挂这条通道只为了 `local_browser_*`：它们自己就在本机，有原生的读写和 shell，
+   * 再给一套 `local_read` / `local_bash` 只会让模型在两套工具之间犹豫。所以只列、只认浏览器那几个。
+   */
+  browserOnly?: boolean;
 }
 
 /* ------------------------------------------- Windows：没有 find / grep 时自己走 */
@@ -190,6 +196,14 @@ export interface LocalMcpDeps {
   log(level: 'info' | 'warn', message: string): void;
   /** 写文件 / 跑命令要在会话里说出来（看得见比拦得住重要）。 */
   notice(sessionId: string, text: string): void;
+  /**
+   * `local_browser_*`（接管用户已登录的浏览器，见 `localBrowser.ts`）。不给 / `enabled()` 为假 =
+   * 设置里的总开关没开：工具清单里不出现，调到了也只回一句"没开"。
+   */
+  browser?: {
+    enabled(): boolean;
+    call(name: string, args: any, sessionId: string): Promise<{ text: string; isError?: boolean }>;
+  };
 }
 
 export interface ToolResult {
@@ -197,8 +211,17 @@ export interface ToolResult {
   isError?: boolean;
 }
 
-/** 工具清单 —— 给模型看的描述里要写清"这是用户那台机器"。 */
-export function toolDefs(): Array<{ name: string; description: string; inputSchema: any }> {
+/**
+ * 工具清单 —— 给模型看的描述里要写清"这是用户那台机器"。
+ * `browser`：总开关开着才把 `local_browser_*` 列进去；`browserOnly`：本地会话只列那几个。
+ */
+export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean } = {}): Array<{ name: string; description: string; inputSchema: any }> {
+  const browser = opts.browser ? browserToolDefs() : [];
+  if (opts.browserOnly) return browser;
+  return [...fileToolDefs(), ...browser];
+}
+
+function fileToolDefs(): Array<{ name: string; description: string; inputSchema: any }> {
   return [
     {
       name: 'local_read',
@@ -345,6 +368,12 @@ export async function callTool(
 ): Promise<ToolResult> {
   const cwd = session.workdir;
   const abs = (p: string): string => (path.isAbsolute(p) ? p : path.resolve(cwd, p));
+  if (isBrowserTool(name)) {
+    if (!deps.browser?.enabled()) return text('local_browser 没开：请用户在 KiroLex 设置 → 开关 → 本地浏览器 里打开总开关。', true);
+    const r = await deps.browser.call(name, args, session.sessionId);
+    return text(r.text, !!r.isError);
+  }
+  if (session.browserOnly) return text(`没有这个工具：${name}`, true);
   switch (name) {
     case 'local_read': {
       const paths: string[] = Array.isArray(args?.paths) ? args.paths : [args?.path].filter(Boolean);
@@ -479,7 +508,7 @@ export async function handleRpc(
     case 'notifications/cancelled':
       return null;
     case 'tools/list':
-      return reply({ tools: toolDefs() });
+      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly }) });
     case 'tools/call': {
       const r = await callTool(String(msg?.params?.name || ''), msg?.params?.arguments || {}, session, deps);
       return reply(r);

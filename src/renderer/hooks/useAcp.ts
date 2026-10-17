@@ -2147,7 +2147,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           toolCallsRef.current.set(update.toolCallId, tc);
           // Track per session so it is cleared even if you switch away mid-tool
           setSessionActiveTool(targetSid, tc.title);
-          if (locations.length || diffs.length || RUN_KINDS.has((tc.kind || '').toLowerCase())) attachFileChangeToLatestTurn(targetSid, tc, isActiveSession);
+          /* `browser` = local_browser 的操作记录（主进程 `noteBrowserAction`）—— 进「🌐 浏览器操作」回合面板 */
+          if (locations.length || diffs.length || RUN_KINDS.has((tc.kind || '').toLowerCase()) || tc.kind === 'browser') attachFileChangeToLatestTurn(targetSid, tc, isActiveSession);
           break;
         }
 

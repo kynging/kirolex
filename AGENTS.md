@@ -136,6 +136,7 @@ docs/            设计文档（§1）
 | `src/main/sshProxy.ts`、`sshAuth.ts` | 跳板（`proxyArgs` 用 ProxyCommand）、`assertSafeSshHost`、密码 / askpass |
 | `src/main/remotePreflight.ts` | 一次 ssh 拿到 `ok / unreachable / missing-tools / not-logged-in`；`remoteExecutorCap` |
 | `src/main/localMcp.ts` | **跑在本机**的 HTTP MCP：`local_read / local_write / local_glob / local_grep / local_git / local_bash`，只听 127.0.0.1，URL 带 token |
+| `src/main/localBrowser.ts`、`localBrowserHost.ts`、`wsLite.ts` | `local_browser_*`（同一条本地工具通道，总开关 `config.json` 的 `localBrowser`，默认关）：接管用户已登录的 Chrome / Edge（CDP，端点读 `DevToolsActivePort`）/ Firefox（WebDriver BiDi）读页面，只读。每个浏览器一条连接 + 一个 session（`LocalBrowserManager`），`before-quit` 收掉；协议方法有白名单；新域名确认按会话记。本地会话经 `withLocalBrowser`（index.ts）作为 `kirolex-browser` http MCP 挂上；每次操作以 `kind: 'browser'` 工具调用进回合面板 |
 | `src/main/remoteLocalTools.ts` | 远端每会话一份 `kirolex-local-<id>.json` agent（`remoteAgentScript`）、端口分配、远端孤儿扫描脚本 |
 | `src/main/forwardMcp.ts` | 哪些本机 MCP 要原样转发给远端（本机路径命令，或 `playwright` / `drawio` / `pencil`） |
 | `src/main/remoteContext.ts` | 每轮注入"项目不在那台机器上、用 `local_*` 工具"的上下文块 |

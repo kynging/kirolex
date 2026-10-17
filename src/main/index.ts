@@ -56,6 +56,8 @@ import { remoteWriteVerdict, strayRemoteDeliverables, blockedWriteNotice, strayW
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
 import { probeHttpMcp, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import { LocalBrowserHost, browserActionTitle, createQuitGuard } from './localBrowserHost.ts';
+import { isBrowserKind, type BrowserAction } from './localBrowser.ts';
 import { createControlServer, type ControlServer } from './controlServer.ts';
 import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
@@ -1847,9 +1849,97 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
   localMcpStarting = startLocalMcp({
     log: (level, message) => logger[level]('localmcp', message),
     notice: (sid, text) => sessionNotice(sid, text),
+    browser: {
+      enabled: () => localBrowser().enabled(),
+      call: (name, args, sid) => localBrowser().tools.call(name, args, sid),
+    },
   }).then((srv) => { localMcpServer = srv; return srv; })
     .finally(() => { localMcpStarting = undefined; });
   return localMcpStarting;
+}
+
+/**
+ * **local_browser** —— 接管用户已登录的 Chrome / Edge / Firefox 读页面（`localBrowser.ts`）。
+ *
+ * 懒建：`KIROLEX_CONFIG_PATH` 定义在这个文件更后面，模块求值到这里时还不能碰它。
+ * 连接单例在它的 `manager` 里：所有会话共用、每个浏览器一条连接，退出时 `before-quit` 收掉。
+ */
+let localBrowserHost: LocalBrowserHost | undefined;
+let browserActionSeq = 0;
+let browserStatusTimer: NodeJS.Timeout | undefined;
+function localBrowser(): LocalBrowserHost {
+  if (localBrowserHost) return localBrowserHost;
+  localBrowserHost = new LocalBrowserHost({
+    configPath: KIROLEX_CONFIG_PATH,
+    log: (level, message) => logger[level]('browser', message),
+    sendAsk: (ask) => {
+      if (!mainWindow || mainWindow.isDestroyed()) return false;
+      mainWindow.webContents.send('browser:domain-ask', ask);
+      /* 用户多半正看着浏览器：让 KiroLex 的窗口闪一下，确认框才不会没人看见 */
+      try { if (!mainWindow.isFocused()) mainWindow.flashFrame(true); } catch { /* 不支持就算了 */ }
+      return true;
+    },
+    onAsksCancelled: (ids) => { mainWindow?.webContents.send('browser:domain-ask-cancelled', ids); },
+    onStatus: () => {
+      if (browserStatusTimer) return;
+      browserStatusTimer = setTimeout(() => {
+        browserStatusTimer = undefined;
+        mainWindow?.webContents.send('browser:status-changed');
+      }, 200);
+    },
+    filesDir: (sid) => sessionFilesDir(sid),
+    onAction: (sid, a) => noteBrowserAction(sid, a),
+    /* 截图进会话之前就压到长边 1500（AGENTS.md §4.7：一张大图能让整条会话永久报错） */
+    capPng: (png) => {
+      const img = nativeImage.createFromBuffer(png);
+      if (img.isEmpty()) return png;
+      const capped = capImageSize(img);
+      return capped.from ? capped.img.toPNG() : png;
+    },
+  });
+  return localBrowserHost;
+}
+
+/**
+ * 每一次浏览器操作都进**回合面板**（「🌐 浏览器操作」）：作为一条 `kind: 'browser'` 的工具调用
+ * 走和后端工具调用同一条 `update` 路（落盘、发给界面都是现成的），标题就是"打开了什么 / 读了多少字 / 截图在哪"。
+ */
+function noteBrowserAction(sessionId: string, a: BrowserAction): void {
+  logger.info('browser', `${a.action} ok=${a.ok} browser=${a.browser} url=${a.url || '-'}${a.chars !== undefined ? ` chars=${a.chars}/${a.total}` : ''}${a.path ? ` path=${a.path}` : ''}${a.error ? ` error=${a.error.slice(0, 200)}` : ''} sessionId=${sessionId}`);
+  const entry = sessionClients.get(sessionId);
+  if (!entry) return;
+  browserActionSeq += 1;
+  const toolCallId = `kbrowser_${Date.now()}_${browserActionSeq}`;
+  const status = a.ok ? 'completed' : 'failed';
+  const title = browserActionTitle(a);
+  entry.client.emit('update', { sessionId: entry.cliSessionId, update: { sessionUpdate: 'tool_call', toolCallId, title, kind: 'browser', status } });
+  /* 再补一条终态 update：界面上"正在跑的工具"那一格靠它清掉 */
+  entry.client.emit('update', { sessionId: entry.cliSessionId, update: { sessionUpdate: 'tool_call_update', toolCallId, status } });
+}
+
+/**
+ * **本地会话也能用 local_browser**：总开关开着时，把本地工具通道作为一个 http MCP 交给 session/new / load
+ * （`browserOnly`：本地会话只拿浏览器那几个工具 —— 它们自己就有原生读写和 shell）。
+ * kiro-cli 和两个适配器的 initialize 都声明了 `mcpCapabilities.http`。开关关着 = 原样返回，什么都不加。
+ */
+async function withLocalBrowser(
+  sessionId: string,
+  spec: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined,
+): Promise<{ remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined> {
+  if (!localBrowser().enabled()) return spec;
+  try {
+    const server = await ensureLocalMcpServer();
+    server.register({ sessionId, workdir: sessionFilesDir(sessionId), browserOnly: true });
+    const urlPath = server.urlPathFor(sessionId);
+    if (!urlPath) return spec;
+    const mcp = { type: 'http', name: 'kirolex-browser', url: `http://127.0.0.1:${server.port()}${urlPath}`, headers: [] };
+    const base = spec || { remotePort: 0, localPort: 0, agentOverride: '' };
+    logger.info('browser', `本地会话挂上 local_browser sessionId=${sessionId}`);
+    return { ...base, mcpServers: [...(base.mcpServers || []), mcp] };
+  } catch (err: any) {
+    logger.warn('browser', `本地会话挂 local_browser 失败 sessionId=${sessionId}: ${err?.message || err}`);
+    return spec;
+  }
 }
 
 /**
@@ -1920,6 +2010,8 @@ async function ensureLocalTools(
   localDir: string,
 ): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] } | undefined> {
   const remote = profile.remote;
+  /* 本地会话 + local_browser 开着：组合里的 MCP 之外再挂浏览器那几个工具（`withLocalBrowser`） */
+  if (!remote?.sshHost && localBrowser().enabled()) return withLocalBrowser(sessionId, localComboTools(sessionId, profile));
   if (!remote?.sshHost) return localComboTools(sessionId, profile);
   try {
     const server = await ensureLocalMcpServer();
@@ -4796,7 +4888,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           unobservedToolKinds.add(kindLower);
           logger.info('tool', `tool_call with no locations/diffs kind=${next.kind || '<none>'} recorded=${ranSomething} title=${String(next.title).slice(0, 120)}`);
         }
-        if (next.locations?.length || next.diffs?.length || ranSomething) {
+        /* `browser` = local_browser 的操作记录（`noteBrowserAction`），进回合面板也要落盘 */
+        if (next.locations?.length || next.diffs?.length || ranSomething || kindLower === 'browser') {
           const index = entry.fileChanges.findIndex((change) => change.toolCallId === toolCallId);
           if (index >= 0) entry.fileChanges[index] = next;
           else entry.fileChanges.push(next);
@@ -6460,7 +6553,7 @@ app.whenReady().then(async () => {
     }
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
-      : undefined;
+      : await withLocalBrowser(kiroLexId, undefined);
     /*
       **远端 cwd 要在 `resolvedCwd` 定下来之后再算** —— 实测：它原来算在上面那段"没有项目目录 → 用会话目录"
       **之前**，于是 session/new 拿到的是按家目录算的 `scratch/C__Users_…-<hash>`，而 `ensureLocalTools`
@@ -7786,6 +7879,14 @@ app.whenReady().then(async () => {
     if (e.profile.remote?.sshHost) { try { void e.client.disconnect(); } catch { /* 退出路径不抛 */ } }
     void sid;
   }
+  /* local_browser：每个浏览器那一条连接 `session.end` / detach 再关（不给浏览器留 session，见 localBrowser.ts 头注释） */
+  /* `createQuitGuard`：挡住第一次退出、等收尾（有上限）再真的退 —— `void` 掉的 Promise Electron 不会等 */
+  app.on('before-quit', createQuitGuard({
+    needed: () => !!localBrowserHost?.manager.hasConnections(),
+    cleanup: () => localBrowserHost?.shutdown() ?? Promise.resolve(),
+    quit: () => { isQuitting = true; app.quit(); },
+    log: (m) => logger.info('browser', m),
+  }));
 
   ipcMain.handle('schedule:create', (_event, sessionId: string, spec: ScheduleSpec) => {
     if (!sessionId || sessionId.startsWith('pending_')) return { ok: false, error: tr('Select a session that has already been created first') };
@@ -11698,6 +11799,23 @@ app.whenReady().then(async () => {
     logger.info('features', `wedge interrupt threshold = ${WEDGE_CONFIRM_MS ? `${WEDGE_CONFIRM_MS / 1000}s` : 'off'}`);
     return { ok: true, seconds: Math.round(WEDGE_CONFIRM_MS / 1000) };
   });
+
+  /* local_browser 的设置 / 状态 / 确认框（`localBrowserHost.ts`） */
+  ipcMain.handle('browser:get-status', async () => localBrowser().status());
+  ipcMain.handle('browser:set-config', async (_event, patch: any) => {
+    const clean: Record<string, any> = {};
+    if (typeof patch?.enabled === 'boolean') clean.enabled = patch.enabled;
+    if (patch?.browser === 'auto' || isBrowserKind(patch?.browser)) clean.browser = patch.browser;
+    if (patch?.firefoxPort !== undefined) clean.firefoxPort = Number(patch.firefoxPort);
+    return localBrowser().setConfig(clean);
+  });
+  ipcMain.handle('browser:connect', async (_event, kind: unknown) => {
+    if (!isBrowserKind(kind)) return { ok: false, error: 'unknown browser' };
+    return localBrowser().connect(kind);
+  });
+  ipcMain.handle('browser:restart-firefox', async () => localBrowser().restartFirefox());
+  ipcMain.handle('browser:domain-reply', async (_event, id: string, decision: string) => ({ ok: localBrowser().answer(id, decision) }));
+  ipcMain.handle('browser:pending-asks', async () => (localBrowserHost ? localBrowserHost.pendingAsks() : []));
 
   /* 「远程会话从本机转发的 MCP」名单：对下一条远程会话生效（准备时现读） */
   ipcMain.handle('app:get-forward-mcp', async () => loadForwardMcpList());

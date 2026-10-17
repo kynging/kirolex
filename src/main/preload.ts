@@ -413,6 +413,29 @@ contextBridge.exposeInMainWorld('kiroApi', {
   setWedgeTimeout: (n: number) => ipcRenderer.invoke('app:set-wedge-timeout', n),
   /** 「远程会话从本机转发的 MCP」名单（存在 ~/.kirolex/config.json，不进 Kiro 的 agent 文件）。 */
   getForwardMcp: () => ipcRenderer.invoke('app:get-forward-mcp'),
+  /** local_browser（接管用户已登录的浏览器，只读）：设置 / 连接状态 / 新域名确认。 */
+  browserStatus: () => ipcRenderer.invoke('browser:get-status'),
+  browserSetConfig: (patch: { enabled?: boolean; browser?: string; firefoxPort?: number }) => ipcRenderer.invoke('browser:set-config', patch),
+  browserConnect: (kind: string) => ipcRenderer.invoke('browser:connect', kind),
+  browserRestartFirefox: () => ipcRenderer.invoke('browser:restart-firefox'),
+  browserDomainReply: (id: string, decision: 'once' | 'session' | 'deny') => ipcRenderer.invoke('browser:domain-reply', id, decision),
+  browserPendingAsks: () => ipcRenderer.invoke('browser:pending-asks'),
+  onBrowserDomainAsk: (callback: (ask: any) => void) => {
+    const handler = (_event: any, ask: any) => callback(ask);
+    ipcRenderer.on('browser:domain-ask', handler);
+    return () => ipcRenderer.removeListener('browser:domain-ask', handler);
+  },
+  /** 总开关被关掉：这些还没答复的确认作废了，界面上收掉。 */
+  onBrowserDomainAskCancelled: (callback: (ids: string[]) => void) => {
+    const handler = (_event: any, ids: string[]) => callback(ids);
+    ipcRenderer.on('browser:domain-ask-cancelled', handler);
+    return () => ipcRenderer.removeListener('browser:domain-ask-cancelled', handler);
+  },
+  onBrowserStatusChanged: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('browser:status-changed', handler);
+    return () => ipcRenderer.removeListener('browser:status-changed', handler);
+  },
   setForwardMcp: (list: Array<{ name: string; timeoutSec?: number }>) => ipcRenderer.invoke('app:set-forward-mcp', list),
   /** How long an open tool call may go without an update before it stops counting as
    *  progress. Bounds the tool-call guard so a missing closing update cannot disable

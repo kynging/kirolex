@@ -208,4 +208,17 @@ export const ZH_MODULES_B: Record<string, string> = {
   'Message {id} was not found in the saved transcript.': '保存的对话记录里找不到消息 {id}。',
   // ── acp-client.ts ──
   'Process not connected': '执行器进程没连着',
+  // ── localBrowserHost.ts（回合面板里的浏览器操作）──
+  'List tabs': '列出标签',
+  'Open': '打开',
+  'Read': '读取',
+  'Screenshot': '截图',
+  'Close tab': '关闭标签',
+  '⚠️ {what} failed {url}: {error}': '⚠️ {what}失败 {url}：{error}',
+  '🗂 Listed {n} browser tabs': '🗂 列出了 {n} 个浏览器标签',
+  '🌐 Opened {url}': '🌐 打开了 {url}',
+  '📖 Read {n} of {total} chars from {url}': '📖 读了 {url} 的 {n} 字（全文 {total} 字）',
+  '📖 Read {n} chars from {url}': '📖 读了 {url} 的 {n} 字',
+  '📸 Screenshot of {url} → {path}': '📸 截图 {url} → {path}',
+  '✖ Closed tab {url}': '✖ 关闭了标签 {url}',
 };

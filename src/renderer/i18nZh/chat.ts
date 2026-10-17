@@ -253,4 +253,5 @@ export const ZH_CHAT: Record<string, string> = {
   "Failed to switch agent": "切换 agent 失败",
   "Failed to switch model": "切换模型失败",
   "Failed to change tool permission mode": "切换工具权限模式失败",
+  "🌐 Browser actions": "🌐 浏览器操作",
 };

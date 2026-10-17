@@ -38,6 +38,8 @@ import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
+import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
+import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
 
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
 const RUN_DONE_CARD_KEY = 'kirolex-run-done-card';
@@ -190,6 +192,15 @@ declare global {
       getWedgeTimeout: () => Promise<{ seconds: number; default: number; min: number; max: number }>;
       setWedgeTimeout: (n: number) => Promise<{ ok: boolean; seconds: number }>;
       getForwardMcp?: () => Promise<Array<{ name: string; timeoutSec: number }>>;
+      browserStatus?: () => Promise<LocalBrowserStatusView>;
+      browserSetConfig?: (patch: { enabled?: boolean; browser?: string; firefoxPort?: number }) => Promise<unknown>;
+      browserConnect?: (kind: string) => Promise<{ ok: boolean; error?: string }>;
+      browserRestartFirefox?: () => Promise<{ ok: boolean; error?: string }>;
+      browserDomainReply?: (id: string, decision: 'once' | 'session' | 'deny') => Promise<{ ok: boolean }>;
+      browserPendingAsks?: () => Promise<BrowserDomainAsk[]>;
+      onBrowserDomainAsk?: (callback: (ask: BrowserDomainAsk) => void) => () => void;
+      onBrowserStatusChanged?: (callback: () => void) => () => void;
+      onBrowserDomainAskCancelled?: (callback: (ids: string[]) => void) => () => void;
       setForwardMcp?: (list: Array<{ name: string; timeoutSec?: number }>) => Promise<{ ok: boolean; list: Array<{ name: string; timeoutSec: number }> }>;
       getToolStallTimeout: () => Promise<{ seconds: number; default: number; min: number; max: number }>;
       setToolStallTimeout: (n: number) => Promise<{ ok: boolean; seconds: number }>;
@@ -3855,6 +3866,8 @@ const App: React.FC = () => {
           </div>
         )}
         <Toasts />
+        {/* local_browser：新域名第一次打开前问用户（允许一次 / 本会话内允许 / 拒绝） */}
+        <BrowserDomainPrompt sessionTitle={(sid) => displayTitle(settings.language, sessions.find((s) => s.id === sid)?.title)} />
         {!sidebarHidden && (
           <div style={{ width: sidebarWidth, flexShrink: 0 }}>
             <Sidebar
