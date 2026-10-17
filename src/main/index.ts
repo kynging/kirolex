@@ -4163,7 +4163,7 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
     const merged = guardMergedPlacement(mergeRecords(mine, theirs), mine, store.isAdvancedOnlyProjectName);
     /* 合并之后这一份就是"最新"的：updatedAt 取两边的较大者，不然下一轮又被判成冲突 */
     merged.updatedAt = Math.max(Number(mine?.updatedAt) || 0, Number(theirs?.updatedAt) || 0, Date.now());
-    const tmp = `${rAbs}.kirolex-${process.pid}.tmp`; fs.writeFileSync(tmp, JSON.stringify(merged, null, 2)); fs.renameSync(tmp, rAbs);
+    store.writeRecordKeepUpdatedAt({ ...merged, id: sessionId });   // 走写盘那道关（不进 advanced 专属项目），updatedAt 按上面算的
   }
   let pulledFiles = 0;
   const fpfx = `${keyFor(prefix, path.join('sessions', sessionId, SESSION_FILES_DIR))}/`;
@@ -6174,13 +6174,16 @@ app.whenReady().then(async () => {
           restored += 1;
           continue;
         }
+        /* 会话记录一律走 sessionStore 写（写盘那道关：不进 advanced 专属项目），不在这里直接写文件 */
+        const isRecord = abs === path.join(localDir, 'record.json');
         if (existed && base === 'record.json') {
           let mine: any;
           try { mine = JSON.parse(fs.readFileSync(abs, 'utf-8')); } catch { mine = undefined; }
           let theirs: any;
           try { theirs = JSON.parse(body.toString('utf-8')); } catch { theirs = undefined; }
           fs.mkdirSync(path.dirname(abs), { recursive: true });
-          fs.writeFileSync(abs, JSON.stringify(mergeRecords(mine, theirs), null, 2));
+          if (isRecord) store.writeRecordKeepUpdatedAt({ ...mergeRecords(mine, theirs), id: sessionId });
+          else fs.writeFileSync(abs, JSON.stringify(mergeRecords(mine, theirs), null, 2));
           restored += 1;
           continue;
         }
@@ -6192,7 +6195,10 @@ app.whenReady().then(async () => {
         if (existed && base === 'history.md') continue;
 
         fs.mkdirSync(path.dirname(abs), { recursive: true });
-        fs.writeFileSync(abs, body);
+        let rec: any;
+        if (isRecord) { try { rec = JSON.parse(body.toString('utf-8')); } catch { rec = undefined; } }
+        if (rec && typeof rec === 'object') store.writeRecordKeepUpdatedAt({ ...rec, id: sessionId });
+        else fs.writeFileSync(abs, body);   // 读不出来的记录带不了项目（vetBackupRecord 也已拒掉这种备份）
         restored += 1;
       }
       /* 合并之后重建 history.md —— 它是渲染产物，不是数据 */
@@ -6216,10 +6222,8 @@ app.whenReady().then(async () => {
         const want = rp.placement;
         if (cur.projectId !== want.projectId || cur.archived !== want.archived || cur.placementChangedAt !== want.placementChangedAt) {
           const next = applyPlacement(recAfter, want);
-          const tmp = `${recordPath}.tmp`;
-          fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
-          fs.renameSync(tmp, recordPath);
-          recAfter = next;
+          store.writeRecordKeepUpdatedAt({ ...next, id: sessionId });   // 写盘那道关兜底：不进 advanced 专属项目
+          recAfter = store.readRecord(sessionId) || next;
         }
         if (rp.changed) {
           placement = {
@@ -6292,7 +6296,7 @@ app.whenReady().then(async () => {
       let madeLocal = false;
       if (!existed && recAfter?.profile?.remote) {
         delete recAfter.profile.remote;
-        fs.writeFileSync(recordPath, JSON.stringify(recAfter, null, 2));
+        store.writeRecordKeepUpdatedAt({ ...recAfter, id: sessionId });
         madeLocal = true;
       }
       /* 以前在这台机器上删过它的话，墓碑会让它在水化时继续隐身 —— 恢复就是要它回来 */
@@ -11973,10 +11977,7 @@ app.whenReady().then(async () => {
     if (rec && !refuseAdvancedOnly(sessionId, 'pin')) {
       rec.pinned = !!pinned;
       try {
-        const p = path.join(os.homedir(), '.kirolex', 'sessions', sessionId, 'record.json');
-        const tmp = p + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
-        fs.renameSync(tmp, p);
+        store.writeRecordKeepUpdatedAt({ ...rec, id: sessionId });
       } catch { /* best-effort */ }
     }
     return { sessionId, pinned: !!pinned };

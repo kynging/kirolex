@@ -682,7 +682,7 @@ describe('合并：桶里那份并进本地那条', () => {
   test('接线：合并前挪 trash、history.md 重建而不是照抄', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = M.indexOf("ipcMain.handle('s3:restore'");
-    const body = M.slice(at, at + 4600);
+    const body = M.slice(at, at + 5200);
     /* 合并是个算法，算法会有 bug —— "选了合并"不等于"愿意拿这条会话赌一次" */
     assert.match(body, /backedUp = trashDirFor\(KIROLEX_HOME, sessionId\)/);
     assert.match(body, /mergeTranscripts\(mine, body\.toString\('utf-8'\)\)/);

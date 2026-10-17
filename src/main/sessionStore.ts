@@ -5,6 +5,7 @@ import type { AgentProfile } from './config';
 import { tr } from './uiText.ts';
 import { isAdvancedOnly, isAdvancedOnlyProject } from './advancedOnly.ts';
 import { projectDirName } from './projectStore.ts';
+import { logger } from './logger.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -416,9 +417,31 @@ export function createSession(id: string, profile: AgentProfile, title = 'New Ch
   return rec;
 }
 
+/**
+ * **写盘这一道关：会话不进 KiroLex Advanced 专属的项目** —— 发消息、新建、移动、S3 恢复、跟随云端归属、
+ * 冲突合并……各入口都有前置拒绝（给用户的提示更早），这里是兜底：以后新加、忘了挡的那条路也到不了盘上。
+ *
+ * 写入后的 `profile.projectId` 和磁盘上的不同、并且是 advanced 专属项目 → 换回磁盘上原来的项目
+ * （原来未分组就还是未分组），记一条日志，其余字段照常写。不抛错：上层流程不被打断。
+ * 换的是 `rec.profile`（新对象，不动调用方可能共享的那份 profile），调用方手里的记录和盘上一致。
+ */
+function keepOutOfAdvancedProject(rec: SessionRecord, via: string): void {
+  const next = String(rec.profile?.projectId ?? '').trim();
+  if (!next) return;
+  const prev = readRecord(rec.id)?.profile;
+  const prevId = String(prev?.projectId ?? '').trim();
+  if (next === prevId || !isAdvancedOnlyProjectName(next)) return;
+  const profile: AgentProfile = { ...rec.profile };
+  if (prevId) profile.projectId = prev!.projectId; else delete profile.projectId;
+  if (prev?.unassigned) profile.unassigned = true; else delete profile.unassigned;
+  rec.profile = profile;
+  logger.warn('session', `${via}: refused to put ${rec.id} into KiroLex Advanced project ${JSON.stringify(next)}; kept ${prevId ? JSON.stringify(prevId) : 'ungrouped'}`);
+}
+
 /** Overwrite record.json (metadata is small + rewritable). */
 export function writeRecord(rec: SessionRecord): void {
   if (isAdvancedOnlySession(rec.id)) return;   // advanced 的记录：跳过，不改
+  keepOutOfAdvancedProject(rec, 'writeRecord');
   ensureDir(rec.id);
   rec.updatedAt = Date.now();
   const tmp = recordPath(rec.id) + '.tmp';
@@ -430,6 +453,7 @@ export function writeRecord(rec: SessionRecord): void {
  *  not a user edit, e.g. following another machine's project/archive move). */
 export function writeRecordKeepUpdatedAt(rec: SessionRecord): void {
   if (isAdvancedOnlySession(rec.id)) return;
+  keepOutOfAdvancedProject(rec, 'writeRecordKeepUpdatedAt');
   ensureDir(rec.id);
   const tmp = recordPath(rec.id) + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
@@ -463,9 +487,7 @@ export function markAllExecutorsDetached(): void {
     if (rec && (rec.executorState === 'attached' || rec.executorState === 'attaching')) {
       rec.executorState = 'detached';
       try {
-        const tmp = recordPath(id) + '.tmp';
-        fs.writeFileSync(tmp, JSON.stringify(rec, null, 2)); // no updatedAt bump
-        fs.renameSync(tmp, recordPath(id));
+        writeRecordKeepUpdatedAt({ ...rec, id }); // no updatedAt bump; 按目录名写，不跟记录里的 id 走
       } catch { /* best-effort */ }
     }
   }

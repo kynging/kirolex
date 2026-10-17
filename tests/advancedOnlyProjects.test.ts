@@ -255,7 +255,8 @@ describe('on disk: the two flow projects are hidden and byte-identical after eve
       assert.deepEqual([...store.advancedOnlyProjectsAmong(names)], ['Mixed'], 'Mixed is now advanced-only → hidden');
       assert.deepEqual(visibleProjects(names, store.advancedOnlyProjectsAmong(names)), ['Plain']);
     } finally {
-      store.writeRecord({ ...store.readRecord('s_mixed_std')!, profile: { ...rec.profile, projectId: 'Mixed' } });
+      /* Mixed 此刻是 advanced 专属项目，writeRecord 那道关不许放回去 —— 夹具直接按原样写回盘上 */
+      session('s_mixed_std', 'Mixed');
     }
     assert.equal(store.advancedOnlyProjectsAmong(names).has('Mixed'), false, 'moving it back shows it again');
   });
@@ -335,7 +336,7 @@ describe('index.ts: the send / sync / restore paths use the shared project crite
     const body = fn.slice(0, fn.indexOf('\n}\n'));
     const guard = body.indexOf('const merged = guardMergedPlacement(mergeRecords(mine, theirs), mine, store.isAdvancedOnlyProjectName);');
     assert.ok(guard > 0);
-    assert.ok(guard < body.indexOf('fs.writeFileSync(tmp, JSON.stringify(merged, null, 2))'));
+    assert.ok(guard < body.indexOf('store.writeRecordKeepUpdatedAt({ ...merged, id: sessionId })'));
   });
 
   test('s3:list-backups hides entries grouped into an advanced project; placementWillChange uses the same guard as restore', () => {
