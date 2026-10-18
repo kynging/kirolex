@@ -7,8 +7,7 @@ export const ZH_MODULES_B: Record<string, string> = {
     '还没有设置 {host} 上的 kiro 启动命令。打开 设置 → 🖥 机器 → 选中这台机器，点「自动检测这台机器上的三个工具」——没有这个设置 KiroLex 不会去猜远端的二进制（猜错的表现是"起来了但行为不对"）。',
   "kiro-cli not found. Tried these:\n{candidates}\n\nEnter a path in Settings → 🖥 Machines → 💻 This machine, or set KIRO_CLI_PATH. (A bare name on PATH works too, it doesn't have to be an absolute path.)":
     'kiro-cli 找不到。试过这些：\n{candidates}\n\n在 设置 → 🖥 机器 → 💻 本机 里填一个路径，或者设 KIRO_CLI_PATH。（可以填 PATH 上的裸名字，不必是绝对路径。）',
-  'The executor exited (clean exit, code 0). KiroLex will reconnect and resend this turn automatically.':
-    '执行器已退出（正常退出，code 0）—— KiroLex 会自动重连并重发这一轮。',
+  'The executor exited normally (code 0); KiroLex reconnects automatically.': '执行器正常退出了（code 0），会自动重连。',
   'This engine did not provide a model list': '这个引擎没有给出 模型清单',
   'This engine did not provide permission modes': '这个引擎没有给出 权限模式',
   'This engine did not provide effort options': '这个引擎没有给出 effort 选项',
@@ -42,17 +41,16 @@ export const ZH_MODULES_B: Record<string, string> = {
   // ── forwardMcp.ts ──
   'Unknown error': '未知错误',
   'Local→upstream ({name}) {why}': '本机→上游（{name}）{why}',
-  '⚠️ The MCP "{name}" forwarded from this machine is unavailable right now: {msg}. This session still works, but calling its tools will fail with the same error. Fix the local config and reopen the session.':
-    '⚠️ 从本机转发的 MCP「{name}」现在用不了：{msg}。这条会话照常可用，只是调它的工具会报同样的错 —— 改好本机配置后重开会话即可。',
+  '⚠️ The MCP "{name}" forwarded from this machine is unavailable: {msg}. Fix the local config and reopen the session.': '⚠️ 本机转发的 MCP「{name}」暂时用不了：{msg}。改好本机配置后重开会话。',
   'Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL': '名字只能用字母、数字、_ . -（最多 40 个），否则放不进转发地址',
   'Clashes with the local tool channel kirolex-local': '和本地工具通道 kirolex-local 重名',
   // ── kiroCliLog.ts ──
-  "The kiro-cli log says `err=EmptyResponse`: the server opened the reply stream but never sent a single token. This has nothing to do with your message or this conversation's history (tested: a nearly empty new session fails just the same, while a fuller one worked; failures cluster in time). KiroLex will resend with backoff by itself; if it keeps happening for a while, switch models or come back in a few minutes.":
-    'kiro-cli 的日志里是 `err=EmptyResponse`：服务端把回复流开了，但一个 token 都没发过来。这跟你的消息、跟这条对话的历史都没关系（实测：换一个几乎空的新会话照样失败，而上下文更满的那个反而好了；失败是按时间段聚堆的）。KiroLex 会按退避自己重发；整段时间都这样就换个模型，或者过几分钟再来。',
-  'The kiro-cli log shows a connection error ({detail}): the backend is unreachable. Check your network/VPN.': 'kiro-cli 的日志里是连接层错误（{detail}）：连不上后端。看网络/VPN。',
-  'Rate limited ({detail}): wait a moment before sending again, or switch models.': '被限流了（{detail}）：等一下再发，或者换个模型。',
-  'The server rejected this request as invalid ({detail}): usually something in the history is over the limit (an image, an overly long block).': '服务端判这次请求不合法（{detail}）：通常是历史里有超限的东西（图片、过长的一段）。',
-  'The kiro-cli log says: {detail}': 'kiro-cli 的日志里是：{detail}',
+  'The service returned an empty reply, unrelated to your message and this history. Try again in a few minutes, or switch models.': '服务端返回了空回复，与你的消息和这段历史都无关。过几分钟再试，或换个模型。',
+  "Can't reach the model service. Check your network/VPN.": '连不上模型服务，检查网络/VPN。',
+  'Rate limited: wait a moment before sending again, or switch models.': '被限流了：等一下再发，或者换个模型。',
+  'The service rejected this request; usually something in the history is over the limit (an image, a very long block).': '请求被服务端拒绝，通常是历史里有超限的内容（图片、过长的一段）。',
+  'kiro-cli reported an error.': 'kiro-cli 报了错。',
+  'kiro-cli log: {detail}': 'kiro-cli 日志：{detail}',
   // ── kiroConfig.ts (category hints, translated in categoriesFor) ──
   "Global MCP servers (shared by every agent). An agent's own mcpServers are edited under Agents.": "全局 MCP server（所有 agent 共用）。某个 agent 自己的 mcpServers 在 Agents 里改。",
   "Standing rules: sent to the model on every turn.": "常驻规则：每一轮都会带给模型。",
@@ -111,12 +109,9 @@ export const ZH_MODULES_B: Record<string, string> = {
   // ── remoteWriteGuard.ts ──
   '{paths}, etc. ({n} in total)': '{paths} 等 {n} 个',
   ' ({paths})': '（{paths}）',
-  '🛡 Blocked a file write to {host}{where}: in a remote session, files delivered to you must land on your machine. Refused; per its prompt it will use `local_write` to write locally instead (`{dir}`).':
-    '🛡 拦下了一次往 {host} 上写文件{where}：远程会话里交付给你的文件要落在你机器上 —— 已拒绝，按提示词它会改用 `local_write` 写到本机（`{dir}`）。',
-  '🛡 Blocked a file write to {host}{where}: in a remote session, files delivered to you must land on your machine. Refused; per its prompt it will use `local_write` to write locally instead.':
-    '🛡 拦下了一次往 {host} 上写文件{where}：远程会话里交付给你的文件要落在你机器上 —— 已拒绝，按提示词它会改用 `local_write` 写到本机。',
-  "⚠️ This turn wrote files on {host} ({paths}), not on your machine. Click \"⇩ Copy to this machine\" to put them in this session's local folder; previews and comments will then use the local copy.":
-    '⚠️ 这一轮把文件写在了 {host} 上（{paths}），不在你机器上 —— 点「⇩ 复制到本机」把它放进这条会话的本机文件夹，之后预览、comment 都按本机那一份来。',
+  '⚠️ Blocked a file write to {host}{where}: delivered files must land on this machine; it should use `local_write` instead (`{dir}`).': '⚠️ 已拦下往 {host} 写文件{where}：交付文件要写在本机，它应改用 `local_write`（`{dir}`）。',
+  '⚠️ Blocked a file write to {host}{where}: delivered files must land on this machine; it should use `local_write` instead.': '⚠️ 已拦下往 {host} 写文件{where}：交付文件要写在本机，它应改用 `local_write`。',
+  "⚠️ This turn wrote files on {host} ({paths}). Click \"⇩ Copy to this machine\" to bring them here.": '⚠️ 这一轮把文件写在了 {host} 上（{paths}），点「⇩ 复制到本机」拿回来。',
   // ── sshMux.ts ──
   'The shared connection to {host} was closed while it was being set up': '{host} 的复用连接在建立过程中被关掉了',
   'The shared connection to {host} could not be set up. {detail}': '{host} 的复用连接没建起来。{detail}',
@@ -142,10 +137,7 @@ export const ZH_MODULES_B: Record<string, string> = {
     '{host} 上的 kiro-cli 没登录。去那台机器跑一次 `kiro-cli login`——没登录的话执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。',
   '{host}: kiro-cli is installed and logged in, {n} models available.': '{host}：kiro-cli 在，也登录了，{n} 个可用模型。',
   '{host}: kiro-cli is installed and logged in.': '{host}：kiro-cli 在，也登录了。',
-  // ── remoteRecovery.ts ──
-  '⚠️ The connection to the local tools dropped, reconnecting (attempt {n}). Until then this remote session cannot read or write files on your machine.':
-    '⚠️ 本机工具连接中断，正在重连（第 {n} 次）—— 这期间这条远程会话读写不了你机器上的文件。',
-  '🔌 The local tools connection is back; this remote session is reconnected.': '🔌 本机工具连接已恢复，这条远程会话重新接上了。',
+  // ── remoteRecovery.ts ──（「本机工具连接中断，正在重连」「本机工具连接已恢复」和 index.ts 用同一个 key，文案在 indexA）
   // ── remoteTargets.ts ──
   'The working directory must be an absolute path (or start with ~).': '工作目录要写绝对路径（或以 ~ 开头）。',
   'The IP address cannot be empty.': 'IP 地址不能为空。',
@@ -178,24 +170,20 @@ export const ZH_MODULES_B: Record<string, string> = {
   'A skill must be exactly <name>/SKILL.md': 'skill 必须是 <名字>/SKILL.md 这一层',
   'Only SKILL.md can be written': '只能写 SKILL.md',
   // ── primeRetry.ts ──
-  'This chunk is already too small for "too big to send" to be the cause, so no more retries. Most likely the backend connection of this session is broken. ':
-    '这一块已经小到不可能是"发得太大"，所以不再重试 —— 多半是这条会话的后端连接坏了。',
-  'The same chunk has hit the retry limit of {n}, so stopping for now. ': '同一块已经试到上限 {n} 次，所以先停下。',
-  'Rebuilding the history context got stuck at chunk {chunk}/{total} ({chars} chars) and failed all {tries} tries: {error}. {why}It will try again the next time you send a message; you can also restart KiroLex for a clean backend, or fork this session into a new one and keep the old one for reference.':
-    '重建历史上下文卡在第 {chunk}/{total} 块（{chars} 字），试了 {tries} 次都失败：{error}。{why}下次发消息时会再试一次；也可以重启 KiroLex 换一个干净后端，或者把这条会话分叉一条新的继续，旧的留着查。',
+  'failed {tries} times in a row: {error}': '连续 {tries} 次失败：{error}',
+  'This chunk is already small, so size is not the cause; the session connection is most likely broken. ': '这一块已经很小，不是太大的问题，多半是会话的连接坏了。',
+  'The same chunk hit the retry limit ({n}). ': '同一块已到重试上限（{n} 次）。',
+  'Rebuilding history got stuck at chunk {chunk}/{total} ({chars} chars) after {tries} tries: {error}. {why}It retries the next time you send; you can also fork this session and continue in the new one.': '重建历史卡在第 {chunk}/{total} 块（{chars} 字），试了 {tries} 次都失败：{error}。{why}下次发消息时会再试；也可以分叉出一条新会话继续。',
   // ── stderrNotice.ts ──
   'MCP server problem': 'MCP 服务器有问题',
   'Backend authentication problem': '后端认证有问题',
   'Tool call problem': '工具调用有问题',
   'Backend error': '后端报错',
   // ── promptRetry.ts ──
-  '(KiroLex already resent this {n} times by itself, with the same result each time. This turn produced nothing, so resending was safe and was done; at this point the problem is on the backend, not in this message. Click rerun to try again, or split this turn into smaller pieces.)':
-    '（KiroLex 已经自己重发了 {n} 次，都是同一个结果。这一轮什么都没产出，所以重发是安全的、也确实做了；到这一步说明问题在后端而不是这条消息 ——可以点重跑再试，或者把这一轮拆小一点再发。）',
+  '(Resent automatically {n} times with the same result. Press Rerun to try again, or split this turn into smaller messages.)': '（已自动重发 {n} 次，结果相同。可点「重跑」再试，或把这一轮拆小。）',
   // ── transientError.ts ──
-  'SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools tunnel was not set up. KiroLex will retry on another port. If this keeps happening, a kiro-cli left over from last time may still hold it on that machine.':
-    'SSH connection closed（ssh exit {code}）：远端端口 {port} 被占用，本地工具的隧道没建起来。KiroLex 会换一个端口重试 —— 要是反复出现，那台机器上可能有上次留下的 kiro-cli 还占着它。',
-  'SSH connection closed (ssh exit {code}): the connection to the remote executor dropped. KiroLex will resend this turn automatically with backoff.':
-    'SSH connection closed（ssh exit {code}）—— 远端执行器的连接断了，KiroLex 会按退避自动重发这一轮。',
+  'SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools connection was not set up; retrying on another port. If it keeps happening, a leftover kiro-cli on that machine may hold the port.': 'SSH connection closed（ssh exit {code}）：远端端口 {port} 被占用，本机工具连接没建起来，会换端口重试。反复出现的话，可能是那台机器上残留的 kiro-cli 占着端口。',
+  'SSH connection closed (ssh exit {code}): lost the connection to the remote. KiroLex reconnects; the turn is resent automatically only if it had produced nothing yet.': 'SSH connection closed（ssh exit {code}）：和远端的连接断了。会自动重连；这一轮还没产出时才自动重发。',
   // ── projectStore.ts ──
   'Must be an absolute path (like C:\\Users\\you\\project)': '要写绝对路径（像 C:\\Users\\你\\项目）',
   'Must be an absolute path (starting with /)': '要写绝对路径（从 / 开始）',

@@ -32,11 +32,11 @@ describe('KiroLex 自己的提示', () => {
 
   test('ChatArea 把它们分成独立的一组，用居中的 KirolexMessageItem 画', () => {
     const chat = source('src/renderer/components/ChatArea.tsx');
-    assert.match(chat, /\{ kind: 'kirolex'; message: Message \}/);
+    assert.match(chat, /\{ kind: 'kirolex'; message: Message; count\?: number \}/);
     assert.match(chat, /if \(m\.role === 'user' && isKirolexNote\(m\)\) \{\s*groups\.push\(\{ kind: 'kirolex', message: m \}\);/);
     assert.match(chat, /const KirolexMessageItem = memo/);
     assert.match(chat, /<KirolexMessageItem/);
-    assert.match(chat, /kirolex-message-body">\{withPathLinks\(message\.content, message\.id\)\}/);
+    assert.match(chat, /<NoticeBody text=\{message\.content\} count=\{count\} render=\{\(s\) => withPathLinks\(s, message\.id\)\} \/>/);
     const css = source('src/renderer/styles/global.css');
     assert.match(css, /\.kirolex-message\s*\{[\s\S]*?justify-content:\s*center/);
   });

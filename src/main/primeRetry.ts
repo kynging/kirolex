@@ -15,7 +15,8 @@
  * 放弃不等于"重建好了"：调用方不清 `needsHistoryPrime`，下次真正用到这个会话时再试一次
  * （那时后端可能已经重连过了），并把原因记在 `primeLastError` 上。
  */
-import { tr } from './uiText.ts';
+import { tr, trConcat } from './uiText.ts';
+import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
 
 export type PrimeVerdict = 'retry' | 'split' | 'give-up';
 
@@ -52,9 +53,14 @@ export function primeGiveUpNote(opts: {
   chunk: number; total: number; chars: number; tries: number; error: string; atFloor: boolean;
 }): string {
   const why = opts.atFloor
-    ? tr('This chunk is already too small for "too big to send" to be the cause, so no more retries. Most likely the backend connection of this session is broken. ')
-    : tr('The same chunk has hit the retry limit of {n}, so stopping for now. ', { n: opts.tries });
-  return tr('Rebuilding the history context got stuck at chunk {chunk}/{total} ({chars} chars) and failed all {tries} tries: {error}. {why}It will try again the next time you send a message; you can also restart KiroLex for a clean backend, or fork this session into a new one and keep the old one for reference.', {
-    chunk: opts.chunk, total: opts.total, chars: opts.chars, tries: opts.tries, error: opts.error, why,
-  });
+    ? tr('This chunk is already small, so size is not the cause; the session connection is most likely broken. ')
+    : tr('The same chunk hit the retry limit ({n}). ', { n: opts.tries });
+  /* 主句只有"试了几次 + 简短原因"（拼进「重建历史没完成（…）」那句）；分块编号、字数、原始错误全文、下一步折进详情 */
+  const short = String(opts.error || '').split('\n')[0].slice(0, 60);
+  return trConcat(
+    tr('failed {tries} times in a row: {error}', { tries: opts.tries, error: short }),
+    NOTE_DETAIL_SEP,
+    tr('Rebuilding history got stuck at chunk {chunk}/{total} ({chars} chars) after {tries} tries: {error}. {why}It retries the next time you send; you can also fork this session and continue in the new one.', {
+      chunk: opts.chunk, total: opts.total, chars: opts.chars, tries: opts.tries, error: opts.error, why,
+    }));
 }

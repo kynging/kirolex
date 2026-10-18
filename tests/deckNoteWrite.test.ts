@@ -178,7 +178,7 @@ describe('落盘之后在会话里报一句', () => {
     assert.match(CA, /<p key=\{key\}>\{withPathLinks\(paragraph\.text, key\)\}<\/p>/);
     assert.match(CA, /\{withPathLinks\(paragraph\.text, key\)\}\n\s*<\/p>/);
     /* KiroLex 的居中提示也用同一个链接器 */
-    assert.match(CA, /\{withPathLinks\(message\.content, message\.id\)\}/);
+    assert.match(CA, /render=\{\(s\) => withPathLinks\(s, message\.id\)\}/);
     /* 判据和助手那侧同一条正则 —— 两侧对"什么算路径"必须一致 */
     assert.match(CA, /PATH_RE\.exec\(text\)/);
   });
@@ -201,7 +201,8 @@ describe('落盘之后在会话里报一句', () => {
   test('角色用 `user` —— 读起来像工具回报，而且下一轮它看得见"这件事做完了"', () => {
     /* 不然它可能自己再去写一遍文件（两个写者对同一个文件） */
     /* 落盘那三件事搬进了 `noteInSession`（和"⏳ 已排队"那句共用）—— 断言跟着搬 */
-    assert.match(MAIN2, /function noteInSession\(sessionId: string, body: string, variants\?: TextVariants\): boolean \{/);
+    /* 第四个参数是同类提示的键（noteGroup，界面据此合并「×N」），可选 */
+    assert.match(MAIN2, /function noteInSession\(sessionId: string, body: string, variants\?: TextVariants, group\?: string\): boolean \{/);
     const at = MAIN2.indexOf('function noteInSession(');
     const body = MAIN2.slice(at, at + 1400); /* 多了两版文案（variants）那两行，窗口放宽一点 */
     assert.match(body, /role: 'user'/);

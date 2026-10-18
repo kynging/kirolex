@@ -297,8 +297,8 @@ const SessionItem: React.FC<{
   const dotTitle =
     busyReason === 'reconfiguring' ? t('Busy: switching model / agent…')
     : busyReason === 'attaching' ? t('Busy: connecting / reconnecting the backend…')
-    : busyReason === 'priming' ? t('Busy: rebuilding history context (retries until done; Stop to abandon)')
-    : busyReason === 'prime-pending' ? t('Busy: history context missing, rebuild imminent; new messages queue')
+    : busyReason === 'priming' ? t('Busy: rebuilding history (press Stop to give up)')
+    : busyReason === 'prime-pending' ? t('Busy: history missing, about to rebuild it; new messages wait')
     : busyReason === 'turn' ? t('Busy: turn in progress…')
     : sessionStatus === 'streaming' ? t('Working…')
     : sessionStatus === 'connecting' ? t('Connecting…')

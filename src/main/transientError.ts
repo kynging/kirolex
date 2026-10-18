@@ -42,9 +42,9 @@ export function isSshTransportExit(code: number | null | undefined): boolean {
 export function sshDropMessage(code: number | null | undefined, stderr = ''): string {
   const fwd = /remote port forwarding failed for listen port (\d+)/i.exec(String(stderr || ''));
   if (fwd) {
-    return tr('SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools tunnel was not set up. KiroLex will retry on another port. If this keeps happening, a kiro-cli left over from last time may still hold it on that machine.', { code: String(code), port: fwd[1] });
+    return tr('SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools connection was not set up; retrying on another port. If it keeps happening, a leftover kiro-cli on that machine may hold the port.', { code: String(code), port: fwd[1] });
   }
-  return tr('SSH connection closed (ssh exit {code}): the connection to the remote executor dropped. KiroLex will resend this turn automatically with backoff.', { code: String(code) });
+  return tr('SSH connection closed (ssh exit {code}): lost the connection to the remote. KiroLex reconnects; the turn is resent automatically only if it had produced nothing yet.', { code: String(code) });
 }
 
 export function isTransientTransportError(text: string): boolean {

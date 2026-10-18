@@ -103,10 +103,8 @@ const ZH_BASE: Record<string, string> = {
   // 占用原因（侧栏那个点的 tooltip）
   'Busy: switching model / agent…': '占用中：正在切换模型 / Agent…',
   'Busy: connecting / reconnecting the backend…': '占用中：正在连接 / 重新连接后端…',
-  'Busy: rebuilding history context (retries until done; Stop to abandon)':
-    '占用中：正在重建历史上下文（会重试到完成；按 Stop 可放弃）',
-  'Busy: history context missing, rebuild imminent; new messages queue':
-    '占用中：历史上下文缺失，重建即将/正在进行；新消息会排队',
+  'Busy: rebuilding history (press Stop to give up)': '占用中：正在重建历史（按「停止」可放弃）',
+  'Busy: history missing, about to rebuild it; new messages wait': '占用中：缺历史，即将重建历史；新消息会等它完成',
   'Busy: turn in progress…': '占用中：回合进行中…',
   'Working…': '处理中…',
   'Connecting…': '连接中…',
@@ -266,7 +264,7 @@ const ZH_BASE: Record<string, string> = {
   'Send this message again on a schedule': '按时间重复发送这条消息（定时任务）',
   'Make it a scheduled job': '设为定时任务',
   'A loop is running — stop it first': '循环运行中，请先停止循环',
-  'This turn was interrupted — resubmit below; the new message replaces it': '这一轮已被中断 — 请在下方输入框重新提交，新消息会覆盖被中断的这一轮',
+  'This turn was interrupted. Resubmit below; the new message replaces it': '这一轮已中断，在下方重新提交会替换它',
   'Merged': '合并模式',
   'One by one': '逐条发送',
   'Looping this message — click Stop to end it': '正在循环重发消息，点击 Stop 停止',

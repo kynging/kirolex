@@ -414,7 +414,7 @@ export class AcpClient extends EventEmitter {
           毫无用处，只会把后端那段历史白扔一次。判据在 `transientError.ts`。
         */
         this.rejectAllPending(new Error(code === 0
-          ? tr('The executor exited (clean exit, code 0). KiroLex will reconnect and resend this turn automatically.')
+          ? tr('The executor exited normally (code 0); KiroLex reconnects automatically.')
           : this.remote?.sshHost && isSshTransportExit(code)
             ? sshDropMessage(code, this.lastStderr)
             : `Process exited with code ${code}`));

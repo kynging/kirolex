@@ -35,7 +35,8 @@ export interface RecoveryDeps<T extends RecoveryTarget = RecoveryTarget> {
   ensureConnection?(target: T): Promise<unknown>;
   /** 把会话挂回来；成功返回 true。 */
   reattach(sessionId: string): Promise<boolean>;
-  notice(sessionId: string, text: string, sticky: boolean): void;
+  /** `group`：同类提示的键，界面据此把「第 1 次 / 第 2 次…」并成一条计数（`renderer/noticeMerge.ts`） */
+  notice(sessionId: string, text: string, sticky: boolean, group?: string): void;
   /** 接回来了（渲染层要把它标成"连着"）。 */
   recovered?(sessionId: string, attempts: number): void;
   log?(message: string): void;
@@ -46,9 +47,12 @@ export interface RecoveryDeps<T extends RecoveryTarget = RecoveryTarget> {
 }
 
 export const RECONNECTING_TEXT = (n: number): string =>
-  tr('⚠️ The connection to the local tools dropped, reconnecting (attempt {n}). Until then this remote session cannot read or write files on your machine.', { n });
+  tr('⚠️ The local tools connection dropped; reconnecting (attempt {n}). Until then this remote session can\'t read or write your files.', { n });
+/** 「正在重连」「已恢复」两类提示的键 —— index.ts 的 sshMux 那一路用同一对，两处说的是同一件事 */
+export const LOCAL_TOOLS_RECONNECT_GROUP = 'local-tools-reconnect';
+export const LOCAL_TOOLS_RESTORED_GROUP = 'local-tools-restored';
 /** 按当前界面语言取（所以是函数，不是常量） */
-export const RECOVERED_TEXT = (): string => tr('🔌 The local tools connection is back; this remote session is reconnected.');
+export const RECOVERED_TEXT = (): string => tr('Local tools connection restored.');
 
 interface State { attempt: number; timer?: NodeJS.Timeout; running?: boolean }
 
@@ -98,7 +102,7 @@ export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
     if (!this.deps.target(sessionId)) { this.stop(sessionId); return; }
     const delay = healDelay(st.attempt, this.deps.backoffMs || HEAL_BACKOFF_MS);
     st.attempt += 1;
-    if (!quiet) this.deps.notice(sessionId, RECONNECTING_TEXT(st.attempt), true);
+    if (!quiet) this.deps.notice(sessionId, RECONNECTING_TEXT(st.attempt), true, LOCAL_TOOLS_RECONNECT_GROUP);
     if (st.timer) clearTimeout(st.timer);
     st.timer = setTimeout(() => { void this.tick(sessionId); }, delay);
     /* `unref`：别让这个定时器挡住退出 */
@@ -159,7 +163,7 @@ export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
     if (!ok) { this.schedule(sessionId); return; }
     this.stop(sessionId);
     this.deps.log?.(`远程会话自动接回来了 sessionId=${sessionId}（第 ${st.attempt} 次）`);
-    this.deps.notice(sessionId, RECOVERED_TEXT(), false);
+    this.deps.notice(sessionId, RECOVERED_TEXT(), false, LOCAL_TOOLS_RESTORED_GROUP);
     try { this.deps.recovered?.(sessionId, st.attempt); } catch { /* 通知失败不影响恢复本身 */ }
   }
 }

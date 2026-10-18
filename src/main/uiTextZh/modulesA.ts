@@ -103,7 +103,7 @@ export const ZH_MODULES_A: Record<string, string> = {
   'The combo': '组合',
   ' (options: {list})': '（可选：{list}）',
   ' (this engine offers no effort options)': '（这个引擎没给 effort 选项）',
-  'ℹ️ {who} wants effort "{want}", which the current engine / model does not support{avail}': 'ℹ️ {who}要的 effort「{want}」当前引擎 / 模型不支持{avail}',
+  '⚠️ {who} wants effort "{want}", which the current engine / model does not support{avail}': '⚠️ {who}要的 effort「{want}」当前引擎 / 模型不支持{avail}',
   '⚠️ Could not set effort "{want}" for combo "{name}" ({err})': '⚠️ 组合「{name}」要的 effort「{want}」没设上（{err}）',
   '{base}; this engine has no default level to fall back to, keeping the current level "{cur}".': '{base}，这个引擎没有可以退回的默认档位，保持当前档位「{cur}」。',
   '{base}; this engine has no default level to fall back to, keeping the current level.': '{base}，这个引擎没有可以退回的默认档位，保持当前档位。',
@@ -125,7 +125,7 @@ export const ZH_MODULES_A: Record<string, string> = {
   '{error} (it was already asked to fix this once and it is still wrong)': '{error}（已经让它补过一次，还是不对）',
   "Couldn't write to this file": '写不进这个文件',
   // ── localMcp.ts ──
-  '📝 The remote session changed `{file}` on this machine.': '📝 远端那条会话改了你本机的 `{file}`。',
+  'The remote session changed `{file}` on this machine.': '远程会话改了你本机的 `{file}`。',
   'Local environment variable {name} does not exist': '本机环境变量 {name} 不存在',
   'Cannot reach upstream: DNS lookup failed ({code})': '连不上上游：域名解析失败（{code}）',
   'Cannot reach upstream: connection refused ({code})': '连不上上游：连接被拒绝（{code}）',

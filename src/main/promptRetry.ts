@@ -112,5 +112,5 @@ export function planRetry(input: RetryInput): RetryPlan {
 export function retriesExhaustedNote(errText: string, attempts: number): string {
   const head = String(errText || '').slice(0, 160);
   /* trConcat：原始错误原样，后面那句说明能整段换成另一种语言（切了界面语言、隔着 IPC 都认得） */
-  return trConcat(head, '\n\n', tr('(KiroLex already resent this {n} times by itself, with the same result each time. This turn produced nothing, so resending was safe and was done; at this point the problem is on the backend, not in this message. Click rerun to try again, or split this turn into smaller pieces.)', { n: attempts }));
+  return trConcat(head, '\n\n', tr('(Resent automatically {n} times with the same result. Press Rerun to try again, or split this turn into smaller messages.)', { n: attempts }));
 }

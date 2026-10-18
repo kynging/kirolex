@@ -164,13 +164,13 @@ const showPaths = (paths: string[]) => {
 export function blockedWriteNotice(host: string, paths: string[], filesDir?: string): string {
   const where = paths.length ? tr(' ({paths})', { paths: showPaths(paths) }) : '';
   return filesDir
-    ? tr('🛡 Blocked a file write to {host}{where}: in a remote session, files delivered to you must land on your machine. Refused; per its prompt it will use `local_write` to write locally instead (`{dir}`).', { host, where, dir: filesDir })
-    : tr('🛡 Blocked a file write to {host}{where}: in a remote session, files delivered to you must land on your machine. Refused; per its prompt it will use `local_write` to write locally instead.', { host, where });
+    ? tr('⚠️ Blocked a file write to {host}{where}: delivered files must land on this machine; it should use `local_write` instead (`{dir}`).', { host, where, dir: filesDir })
+    : tr('⚠️ Blocked a file write to {host}{where}: delivered files must land on this machine; it should use `local_write` instead.', { host, where });
 }
 
 /** 事后发现交付文件落在远端时给用户看的那句（状态行，带「复制到本机」按钮）。 */
 export function strayWriteNotice(host: string, paths: string[]): string {
-  return tr('⚠️ This turn wrote files on {host} ({paths}), not on your machine. Click "⇩ Copy to this machine" to put them in this session\'s local folder; previews and comments will then use the local copy.', { host, paths: showPaths(paths) });
+  return tr('⚠️ This turn wrote files on {host} ({paths}). Click "⇩ Copy to this machine" to bring them here.', { host, paths: showPaths(paths) });
 }
 
 /**

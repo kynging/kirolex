@@ -730,6 +730,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('acp:subagents', handler);
     return () => ipcRenderer.removeListener('acp:subagents', handler);
   },
+  /** 主进程 `noteInSession` 刚写进对话记录的一条 KiroLex 提示 —— 界面当场插进那条会话（不用等重新打开才看见）。 */
+  onUserMessage: (callback: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true; variants?: { zh: string; en: string }; noteGroup?: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:user-message', handler);
+    return () => ipcRenderer.removeListener('acp:user-message', handler);
+  },
   getBusyMap: (): Promise<Record<string, string>> => ipcRenderer.invoke('acp:get-busy-map'),
   /** Is a turn RUNNING for this chat, and what has it produced so far? Lets a reloaded window
    *  adopt a turn that never stopped, instead of resending the question and billing it twice. */

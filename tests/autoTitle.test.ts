@@ -113,3 +113,22 @@ describe('自动标题要落盘', () => {
     assert.equal((BODY.match(/setSessions\(/g) || []).length, 1);
   });
 });
+
+describe('自动命名不拿 KiroLex 自己的提示当话题', () => {
+  test('新建会话先出现备用模型提示、再发真实问题：命名材料是那条真实问题', async () => {
+    const { firstUserText } = await import('../src/renderer/titleSource.ts');
+    const msgs = [
+      { role: 'user', kirolex: true as const, content: '⚠️ 本机没有模型「claude-opus-5」，这条会话改用「gpt-5.6-sol」。\n\n⁣本机可用：gpt-5.6-sol' },
+      { role: 'user', content: '帮我把这个接口的错误处理补全' },
+      { role: 'assistant', content: '好的' },
+    ];
+    assert.equal(firstUserText(msgs), '帮我把这个接口的错误处理补全');
+    /* 截断兜底用的也是同一个值 —— 只有 KiroLex 提示、还没有你的话时，不起名 */
+    assert.equal(firstUserText([msgs[0]]), '');
+  });
+
+  test('接线：maybeAutoTitle 用 firstUserText（标题模型和截断兜底共用这一个值）', () => {
+    assert.match(acp, /const firstUser = firstUserText\(cached\);/);
+    assert.doesNotMatch(acp, /cached\.find\(\(m\) => m\.role === 'user' && \(m\.content \|\| ''\)\.trim\(\)\)/);
+  });
+});

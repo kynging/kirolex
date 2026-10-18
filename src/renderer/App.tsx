@@ -381,6 +381,7 @@ declare global {
       onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
+      onUserMessage?: (callback: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true; variants?: { zh: string; en: string }; noteGroup?: string }) => void) => () => void;
       onSessionModel: (callback: (data: { sessionId: string; model: string }) => void) => () => void;
       onTurnRestart: (callback: (data: { sessionId: string }) => void) => () => void;
       onTurnQuiet: (callback: (data: { sessionId: string; quietSeconds: number; openTools?: number; toolIdleSeconds?: number; interruptInSeconds?: number | null; boundBy?: 'tool' | 'quiet'; boundSeconds?: number }) => void) => () => void;
@@ -417,6 +418,8 @@ export interface Message {
   kirolex?: true;
   /** 这句 KiroLex 提示的中英两版 —— 显示时按界面语言挑（`pickVariant`）；没有就显示 `content`。 */
   variants?: { zh: string; en: string };
+  /** 这句 KiroLex 提示的「类型:对象[→结果]」—— 相邻同类的几条并成一条「×N」（`noticeMerge`）。 */
+  noteGroup?: string;
   /** 从盘上读回来时，折叠进这条用户消息的追加指令各段（`content` 已含它们）—— 只用来拆开显示，见 `steerSplit`。 */
   steerParts?: { id: string; content: string; ts: number }[];
 }
@@ -3277,7 +3280,7 @@ const App: React.FC = () => {
       // The turn already ended: there is no "current turn" to add to, so this IS
       // the next message. Sent straight away unless a queued item is already on
       // its way out — then it goes right behind that one (head of the queue).
-      noteSessionLocally(sessionId, tRef.current('This turn had already ended — your message was sent as a new message.'));
+      noteSessionLocally(sessionId, tRef.current('This turn had already ended, so your message was sent as a new one.'));
       await sendNowOrNext(sessionId, content, attachments, pastes?.length ? { displayText: shown, pastes } : undefined, ctl);
       return;
     }

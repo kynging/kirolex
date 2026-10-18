@@ -78,3 +78,27 @@ export function stripKirolexNotes(convo: string): string {
     })
     .join('\n\n');
 }
+
+/**
+ * **提示的「详情」** —— 主句只说"发生了什么 + 要不要你做什么"，pid / 后端会话 id / 日志原文这类诊断细节
+ * 折叠起来（写法见 `docs/notices-glossary.md`）。
+ *
+ * 详情和主句拼在**同一段文字**里、用这个分隔符隔开，而不是另加一个字段：这样落盘、IPC、中英两版
+ * （`trConcat` → `bothLangs`）都不用改形状；界面显示时 `splitNoteDetail` 拆开，详情放进可展开的「详情」。
+ * 不认识它的地方（日志、history.md）看到的就是空一行再接详情，照样读得通。
+ */
+export const NOTE_DETAIL_SEP = '\n\n\u2063';
+
+/** 主句 + 详情拼成一句（详情为空就只有主句）。主进程里要中英两版时用 `trConcat(main, NOTE_DETAIL_SEP, detail)`。 */
+export function withNoteDetail(main: string, detail?: string): string {
+  const d = String(detail || '').trim();
+  return d ? `${main}${NOTE_DETAIL_SEP}${d}` : main;
+}
+
+/** 拆回主句和详情（没有分隔符就没有详情）。 */
+export function splitNoteDetail(text: string): { main: string; detail: string } {
+  const s = String(text || '');
+  const at = s.indexOf(NOTE_DETAIL_SEP);
+  if (at < 0) return { main: s, detail: '' };
+  return { main: s.slice(0, at), detail: s.slice(at + NOTE_DETAIL_SEP.length).trim() };
+}

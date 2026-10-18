@@ -405,7 +405,7 @@ export async function callTool(
       } catch (err: any) {
         return text(`写不进去：${err?.message || err}`, true);
       }
-      deps.notice(session.sessionId, tr('📝 The remote session changed `{file}` on this machine.', { file: f }));
+      deps.notice(session.sessionId, tr('The remote session changed `{file}` on this machine.', { file: f }));
       deps.log('info', `local_write ${f} sessionId=${session.sessionId}`);
       return text(`已写入 ${f}（${Buffer.byteLength(String(args?.content ?? ''))} 字节）`);
     }

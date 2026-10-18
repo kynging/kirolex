@@ -27,6 +27,8 @@ import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
+import { splitNoteDetail } from '../../main/kirolexNote.ts';
+import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 
 import { useSessionNotice } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
@@ -725,11 +727,56 @@ function variantView(m: Message, lang: 'zh' | 'en'): Message {
   return views[lang] ??= { ...m, content: pickVariant(lang, m.content, m.variants) };
 }
 
-const KirolexMessageItem = memo<{ message: Message }>(({ message }) => (
+/**
+ * KiroLex 提示的正文：主句 +（有的话）折叠起来的「详情」+ 连续重复的计数「×N」。
+ * 详情和主句拼在同一段文字里（`withNoteDetail`），见 `docs/notices-glossary.md`。
+ */
+function NoticeBody({ text, count, render }: { text: string; count?: number; render?: (s: string) => React.ReactNode }) {
+  const t = useT();
+  const { main, detail } = splitNoteDetail(text);
+  const badge = repeatBadge(count);
+  return (
+    <>
+      {render ? render(main) : main}
+      {badge && <span className="notice-repeat" title={t('Repeated {n} times in a row', { n: count ?? 1 })}>{badge}</span>}
+      {detail && (
+        <details className="notice-detail">
+          <summary>{t('Details')}</summary>
+          <div className="notice-detail-body">{render ? render(detail) : detail}</div>
+        </details>
+      )}
+    </>
+  );
+}
+
+/** 一段回复正文：KiroLex 接在末尾的说明如果带「详情」（`withNoteDetail`），详情折叠起来；没有就和原来一样整段渲染。 */
+function AssistantBody({ body }: { body: string }) {
+  const t = useT();
+  const { main, detail } = splitNoteDetail(body);
+  const md = (s: string) => (
+    <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={[rehypeHighlight]} components={MD_COMPONENTS as any} urlTransform={mdUrlTransform}>
+      {s}
+    </ReactMarkdown>
+  );
+  if (!detail) return md(body);
+  return (
+    <>
+      {md(main)}
+      <details className="notice-detail">
+        <summary>{t('Details')}</summary>
+        <div className="notice-detail-body">{detail}</div>
+      </details>
+    </>
+  );
+}
+
+const KirolexMessageItem = memo<{ message: Message; count?: number }>(({ message, count }) => (
   <div className="kirolex-message" role="status">
     <div className="kirolex-message-card">
       <span className="kirolex-message-label">KiroLex</span>
-      <span className="kirolex-message-body">{withPathLinks(message.content, message.id)}</span>
+      <span className="kirolex-message-body">
+        <NoticeBody text={message.content} count={count} render={(s) => withPathLinks(s, message.id)} />
+      </span>
       <time
         className="kirolex-message-time"
         dateTime={new Date(message.timestamp).toISOString()}
@@ -872,9 +919,8 @@ const MessageItem = memo<{
                   </div>
                 ) : null
               ) : (
-                <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={[rehypeHighlight]} components={MD_COMPONENTS as any} urlTransform={mdUrlTransform}>
-                  {p.body}
-                </ReactMarkdown>
+                /* KiroLex 接在回复末尾的说明（例如超时中断那句）带「详情」时：主句照常渲染，详情折叠（NOTE_DETAIL_SEP） */
+                <AssistantBody body={p.body} />
               ))}
             </div>
           );
@@ -1304,7 +1350,7 @@ const UserGroupItem = memo<{
         title={isLooping
           ? t('A loop is running — stop it first')
           : interrupted
-          ? t('This turn was interrupted — resubmit below; the new message replaces it')
+          ? t('This turn was interrupted. Resubmit below; the new message replaces it')
           : t('Edit and rerun')}
         aria-label={t('Edit and rerun')}
       >
@@ -3595,7 +3641,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // message ordering/ids in state are untouched.
   type RenderGroup =
     | { kind: 'user'; base: Message; steers: Message[] }
-    | { kind: 'kirolex'; message: Message }
+    | { kind: 'kirolex'; message: Message; count?: number }
     | { kind: 'assistant'; segments: Message[]; isLast: boolean; question: string };
   // Heal stranded steers before grouping: a steer that ended up AFTER this
   // turn's assistant/tool messages (ordering slip, or restored history) is moved
@@ -3673,7 +3719,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         i = j - 1;
       }
     }
-    return groups;
+    /* 连续几条同类的 KiroLex 提示（同 noteGroup；没有就一字不差）并成一条、显示最新那条、记 ×N（`noticeMerge`）—— 不刷屏 */
+    return collapseAdjacent(groups, (g) => (g.kind === 'kirolex' ? noticeKey({ group: g.message.noteGroup, text: g.message.content }) : null))
+      .map(({ item, count }) => (item.kind === 'kirolex' && count > 1 ? { ...item, count } : item));
   }, [orderedMessages]);
   // The interrupted turn the next composer submit overwrites is the LAST base user
   // message (same anchor as markTurnInterrupted). Only that group shows its
@@ -3867,7 +3915,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
       {connectionError && messages.length > 0 && (
         <div className="chat-error-banner" role="alert">
-          <span className="chat-error-banner-text">❌ {shownIn(findLang, connectionError)}</span>
+          <span className="chat-error-banner-text"><NoticeBody text={bannerText(shownIn(findLang, connectionError) ?? '')} /></span>
           {onDismissError && (
             <button
               className="chat-error-banner-close"
@@ -4010,7 +4058,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 borderRadius: 8, textAlign: 'left', fontSize: 13, lineHeight: 1.6,
                 color: 'var(--error)', whiteSpace: 'pre-wrap',
               }}>
-                ❌ {shownIn(findLang, connectionError)}
+                <NoticeBody text={bannerText(shownIn(findLang, connectionError) ?? '')} />
               </div>
             ) : (
               <p style={{ fontSize: 14 }}>
@@ -4042,6 +4090,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <KirolexMessageItem
               key={`${currentSessionId ?? 'none'}:${group.message.id}`}
               message={group.message}
+              count={group.count}
             />
           ) : group.kind === 'user' ? (
             <UserGroupItem
@@ -4307,7 +4356,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               {sessionNotice && (
                 <div className={`session-notice${/⚠️/.test(sessionNotice.text) ? ' warn' : ''}`}>
                   <span className="session-notice-text">
-                    {sessionNotice.variants?.[findLang] ?? sessionNotice.text}
+                    <NoticeBody text={sessionNotice.variants?.[findLang] ?? sessionNotice.text} count={sessionNotice.count} />
                     {/* 放在文字下面（同一列）：分屏时一格很窄，并排会把按钮挤出去 */}
                     {sessionNotice.copyRemote && currentSessionId && (
                       <RemoteCopyButtons sessionId={currentSessionId} paths={sessionNotice.copyRemote} />

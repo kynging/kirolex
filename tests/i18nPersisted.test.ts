@@ -13,6 +13,7 @@ import assert from 'node:assert/strict';
 import * as fs from 'node:fs';
 import * as path from 'node:path';
 import { bothLangs, pickVariant, setUiLang, textVariants, tr, trConcat, trList, uiLang } from '../src/main/uiText.ts';
+import { NOTE_DETAIL_SEP } from '../src/main/kirolexNote.ts';
 import { localizeScriptError, parseSlideRuns, parseWriteNote } from '../src/main/deckPreview.ts';
 
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', ...p), 'utf8');
@@ -26,19 +27,20 @@ function inLang<T>(lang: 'zh' | 'en', fn: () => T): T {
 describe('拼接 / 列表出来的提示也有两种语言', () => {
   test('地域过滤那一支：两句 tr() 拼起来，切到英文整句都是英文', () => {
     const text = inLang('zh', () => trConcat(
-      tr('⚠️ The local kiro-cli model list has no "{wanted}", so this session will use one that is on the list. (Available here: {list}{more})', {
-        wanted: 'claude-opus-5', list: trList(['gpt-5.6-sol', 'gpt-5.6-terra']), more: '',
-      }),
-      tr('\nWhen the whole Claude family and `auto` vanish from the list, it is usually **region filtering on your outbound IP** (Anthropic models are region-restricted). Switching kiro-cli versions won\'t help. To use Claude, move this session to a remote machine.'),
+      tr('⚠️ This machine has no model "{wanted}", so this session uses "{model}" instead.', { wanted: 'claude-opus-5', model: 'gpt-5.6-sol' }),
+      NOTE_DETAIL_SEP,
+      tr('Available here: {list}{more}', { list: trList(['gpt-5.6-sol', 'gpt-5.6-terra']), more: '' }),
+      tr('\nNo Claude model and no `auto` in the list: usually your outbound IP is region-filtered (switching kiro-cli versions won\'t help). To use Claude, move this session to a remote machine.'),
     ));
-    assert.match(text, /本机 kiro-cli 的模型清单里没有/);
+    assert.match(text, /本机没有模型「claude-opus-5」，这条会话改用「gpt-5.6-sol」/);
     assert.match(text, /gpt-5\.6-sol、gpt-5\.6-terra/);
     const both = bothLangs(text);
     assert.ok(both, '拼出来的整句要认得');
     assert.equal(both!.zh, text);
-    assert.match(both!.en, /^⚠️ The local kiro-cli model list has no "claude-opus-5"/);
+    assert.match(both!.en, /^⚠️ This machine has no model "claude-opus-5"/);
     assert.match(both!.en, /gpt-5\.6-sol, gpt-5\.6-terra/, '列表分隔符也要换成英文的');
-    assert.match(both!.en, /region filtering on your outbound IP/);
+    assert.match(both!.en, /outbound IP is region-filtered/);
+    assert.ok(both!.en.includes(NOTE_DETAIL_SEP), '详情分隔符原样留在两版里');
     assert.doesNotMatch(both!.en, /[一-鿿、]/, '英文那版不许残留中文');
   });
 
@@ -232,8 +234,8 @@ describe('错误横幅：中文下报的错，切到英文显示英文（系统�
     const at = ACP.indexOf('const noteError = useCallback(');
     assert.ok(at > 0);
     assert.match(ACP.slice(at, at + 500), /if \(message\) pinShown\(message, messageVariants\(message\)\);/);
-    assert.equal((CA.match(/❌ \{shownIn\(findLang, connectionError\)\}/g) || []).length, 2, '有消息时的横幅和空会话那一处都要按语言取');
-    assert.doesNotMatch(CA, /❌ \{connectionError\}/);
+    assert.equal((CA.match(/\{bannerText\(shownIn\(findLang, connectionError\) \?\? ''\)\}/g) || []).length, 2, '有消息时的横幅和空会话那一处都要按语言取');
+    assert.doesNotMatch(CA, /\{connectionError\}/);
   });
 });
 
@@ -246,12 +248,12 @@ describe('原始错误 + KiroLex 的说明拼成的一段：跨 IPC、切语言�
     assert.match(zh, /^Internal error\n\n/);
     assert.match(zh, /[一-鿿]/);
     // 主进程这一侧：整段认得出（trConcat）
-    assert.match(bothLangs(zh)!.en, /^Internal error\n\n\(KiroLex already resent this 3 times by itself/);
+    assert.match(bothLangs(zh)!.en, /^Internal error\n\n\(Resent automatically 3 times/);
     // 渲染层这一侧：经 IPC 只剩 `Error invoking remote method …: Error: <整段>` 这串文字
     const wire = `Error invoking remote method 'acp:prompt': Error: ${zh}`;
     pinShown(wire, messageVariants(wire));
     const en = shownIn('en', wire)!;
-    assert.match(en, /^Error invoking remote method 'acp:prompt': Error: Internal error\n\n\(KiroLex already resent this 3 times by itself/);
+    assert.match(en, /^Error invoking remote method 'acp:prompt': Error: Internal error\n\n\(Resent automatically 3 times/);
     assert.doesNotMatch(en, /[一-鿿]/, '英文那版不许残留中文');
     assert.equal(shownIn('zh', wire), wire);
   });
@@ -262,7 +264,7 @@ describe('原始错误 + KiroLex 的说明拼成的一段：跨 IPC、切语言�
     const zh = inLang('zh', () => retriesExhaustedNote('Internal error', 2)) + '\n\nERROR chat: model overloaded (raw cli log)';
     const v = messageVariants(zh)!;
     assert.ok(v);
-    assert.match(v.en, /^Internal error\n\n\(KiroLex already resent this 2 times/);
+    assert.match(v.en, /^Internal error\n\n\(Resent automatically 2 times/);
     assert.match(v.en, /\n\nERROR chat: model overloaded \(raw cli log\)$/);
     assert.equal(v.zh, zh);
   });
@@ -270,27 +272,32 @@ describe('原始错误 + KiroLex 的说明拼成的一段：跨 IPC、切语言�
   test('占位符可以是空的（例如 {hint} 没有内容时）也认得', async () => {
     const { messageVariants } = await import('../src/renderer/i18n.ts');
     const { trIn } = await import('../src/main/uiText.ts');
-    const zh = trIn('zh', '(This turn had already run {n} tool call(s){hint}. Resending would run them all again, so KiroLex only switched to a new backend session ({id}…) and did not resend automatically. Press rerun or send another message and it will land on the new session.)', { n: 3, hint: '', id: 'abcd1234' });
-    assert.match(messageVariants(zh)!.en, /^\(This turn had already run 3 tool call\(s\)\. Resending/);
+    const zh = trIn('zh', '(This turn had already run {n} tool call(s){hint}, so it was not resent automatically, to avoid running them twice. Press Rerun or send a new message.)', { n: 3, hint: '' });
+    assert.match(messageVariants(zh)!.en, /^\(This turn had already run 3 tool call\(s\), so it was not resent/);
   });
 });
 
-describe('自动更换后端那句（♻️ + 说明）落盘带两版，重新打开 / 切语言都跟着换', () => {
+describe('自动更换后端会话那句（主句 + 详情）落盘带两版，重新打开 / 切语言都跟着换', () => {
   test('trConcat 拼出来的整句认得出两版；落盘后按语言显示', async () => {
     const { textVariants, trConcat, pickVariant } = await import('../src/main/uiText.ts');
-    const note = inLang('zh', () => trConcat('♻️ ', tr('The backend refused to generate a reply for this conversation {n} times in a row ({err}). The pid did not change, so the session did not expire; the backend cannot digest this history itself (a common cause: the result of some tool call). KiroLex switched to a new backend session ({id}…) and carried the context over; the conversation on disk is untouched.', { n: 3, err: 'Internal error', id: 'abcd1234' })));
+    const note = inLang('zh', () => trConcat(
+      tr('🔀 This conversation failed {n} times in a row ({err}), so it moved to a new backend session with the context carried over.', { n: 3, err: 'Internal error' }),
+      NOTE_DETAIL_SEP,
+      tr('The process (pid) did not change, so the session had not expired: most likely the history itself is what fails (often a tool result). New backend session: {id}…. The conversation is unchanged.', { id: 'abcd1234' })));
     const v = textVariants(note);
-    assert.ok(v, '整句（含图标）要认得出两版 —— 落盘时就带上 variants');
-    assert.match(v!.en, /^♻️ The backend refused to generate a reply for this conversation 3 times in a row \(Internal error\)/);
+    assert.ok(v, '整句（主句 + 详情）要认得出两版 —— 落盘时就带上 variants');
+    assert.match(v!.en, /^🔀 This conversation failed 3 times in a row \(Internal error\)/);
+    assert.match(v!.en, /New backend session: abcd1234…/, '后端会话 id 在详情里');
     // 模拟落盘再读回（JSON 往返）后，按语言显示
     const stored = JSON.parse(JSON.stringify({ content: note, kirolex: true, variants: v }));
     assert.equal(pickVariant('en', stored.content, stored.variants), v!.en);
     assert.equal(pickVariant('zh', stored.content, stored.variants), note);
   });
 
-  test('接线：index.ts 用 trConcat 拼 ♻️ 那句，不再用模板字符串', () => {
+  test('接线：index.ts 用 trConcat 拼那句（主句 + 详情），不再用模板字符串', () => {
     const M = read('src', 'main', 'index.ts');
-    assert.match(M, /noteInSession\(sessionId, trConcat\('♻️ ', note\)\);/);
+    assert.match(M, /trConcat\(\s*tr\('🔀 This conversation failed \{n\} times in a row/);
+    assert.match(M, /if \(poisoned\) \{\s*\n\s*noteInSession\(sessionId, note, undefined, 'backend-session-swap'\);/);
     assert.doesNotMatch(M, /noteInSession\(sessionId, `♻️ \$\{note\}`\);/);
   });
 });

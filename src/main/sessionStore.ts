@@ -76,6 +76,11 @@ export interface StoredMessage {
   kirolex?: true;
   /** KiroLex 自己写的那句话的中英两版（`uiText.textVariants`）—— 显示时按当前界面语言挑；你和 agent 的消息没有这一项。 */
   variants?: { zh: string; en: string };
+  /**
+   * KiroLex 提示的「类型:对象[→结果]」（例如 `local-tools-reconnect`、`model-fallback:a→b`）——
+   * 界面把相邻、同 group 的几条并成一条「×N」，内容取最新的（`renderer/noticeMerge.ts`）。只有 KiroLex 提示有。
+   */
+  noteGroup?: string;
   /** 这条是本机工具经控制入口发的（controlServer `POST /sessions/:id/send`），界面上标「经控制入口发送」。
    *  id 里也带着标记（`controlSessions.isControlMessageId`），界面认的是 id。 */
   via?: 'control';

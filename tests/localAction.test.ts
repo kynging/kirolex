@@ -93,10 +93,10 @@ describe('接线：边流边认，额度守住，每次都说出来', () => {
   });
 
   test('开了什么、是谁要求的，必须在状态行说出来', () => {
-    assert.match(M, /Opened `\{target\}` in \*\*your\*\* browser/);
-    assert.match(M, /\(requested by the agent on \{host\}\)\.', \{ target: a\.target, host \}/);
+    assert.match(M, /Opened `\{target\}` in your browser/);
+    assert.match(M, /\(requested from \{host\}\)\.', \{ target: a\.target, host \}/);
     /* 打不开也要说 —— 静静地什么都没发生是最糟的那种 */
-    assert.match(M, /but it couldn\\'t be opened: \{error\}', \{ target: a\.target, error: String\(err\?\.message \|\| err\) \}/);
+    assert.match(M, /Couldn\\'t open `\{target\}`: \{error\}', \{ target: a\.target, error: String\(err\?\.message \|\| err\) \}/);
   });
 });
 

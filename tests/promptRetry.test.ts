@@ -95,8 +95,8 @@ describe('接线（src/main/index.ts）', () => {
     const at = M.indexOf("if (made && !plan.retry && (plan.reason === 'side-effects'");
     assert.ok(at > 0);
     const body = M.slice(at, at + 800);
-    assert.match(body, /did not resend automatically/);
-    assert.match(body, /Press rerun or send another message and it will land on the new session/);
+    assert.match(body, /so it was not resent automatically, to avoid running them twice/);
+    assert.match(body, /Press Rerun or send a new message/);
   });
 
   test('重发时不再往 transcript 里追加同一条用户消息', () => {
@@ -105,7 +105,7 @@ describe('接线（src/main/index.ts）', () => {
 
   test('重试次数说给用户听 —— 不然看着像"它就是不行"', () => {
     assert.match(M, /retriesExhaustedNote\(errText, attempt\)/);
-    assert.match(retriesExhaustedNote(INTERNAL, 3), /重发了 3 次/);
+    assert.match(retriesExhaustedNote(INTERNAL, 3), /已自动重发 3 次/);
   });
 });
 
@@ -177,8 +177,9 @@ describe('连着被拒绝生成 → 换模型重发', () => {
   test('复用 model-unavailable 那套机器（换执行器 + 原样重发），并在会话里说一句', () => {
     assert.match(body, /swapSessionModel\(sessionId, failedModel/);
     assert.match(body, /acp:turn-restart/);
-    assert.match(body, /noteInSession\(sessionId, tr\('🔀/);
-    assert.match(body, /Switching backend sessions does not help here/);
+    assert.match(body, /noteInSession\(sessionId, trConcat\(\s*tr\('🔀/);
+    /* 为什么换的是模型（换后端会话没用）还在，只是折进了「详情」 */
+    assert.match(body, /NOTE_DETAIL_SEP,\s*tr\('Each attempt ended with a bare "Internal error", and switching backend sessions had not helped/);
   });
 });
 

@@ -61,20 +61,23 @@ describe('把原话翻译成"哪一层的问题 + 该干什么"', () => {
 
   test('EmptyResponse：说清是服务端没产出，不是这条会话的内容有问题', () => {
     const s = explainCliError(line('response stream encountered an error err=EmptyResponse loop_id=x'));
-    assert.match(s, /EmptyResponse/);
-    assert.match(s, /一个 token 都没发/);
+    assert.match(s, /服务端返回了空回复/);
     /* 实测校准：换会话对这种故障没用 —— 3.82% 上下文的新会话照样失败 */
-    assert.match(s, /跟这条对话的历史都没关系/);
-    assert.match(s, /按时间段聚堆/);
+    assert.match(s, /与你的消息和这段历史都无关/);
+    /* 给的是下一步（等一会儿 / 换模型）；日志原文 `EmptyResponse` 只进日志，不进给人看的那句（docs/notices-glossary.md） */
+    assert.match(s, /过几分钟再试，或换个模型/);
+    assert.doesNotMatch(s, /EmptyResponse/);
+    /* 这句话出现时自动重发已经结束了（预算用光 / 跑过工具不重发），不能再说"会自己重发" */
+    assert.doesNotMatch(s, /自己重发|自动重发/);
   });
 
   test('连接层错误指向网络，而不是会话', () => {
-    assert.match(explainCliError(line('An unknown error occurred: dispatch failure')), /看网络\/VPN/);
+    assert.match(explainCliError(line('An unknown error occurred: dispatch failure')), /检查网络\/VPN/);
   });
 
   test('限流、请求不合法各有各的话', () => {
     assert.match(explainCliError(line('ThrottlingException: Too many requests')), /限流/);
-    assert.match(explainCliError(line('ValidationException: image exceed max allowed size')), /不合法/);
+    assert.match(explainCliError(line('ValidationException: image exceed max allowed size')), /请求被服务端拒绝/);
   });
 
   test('LSP / MCP 启动噪音不算原因 —— 它们每次都在，认了就永远指错', () => {
@@ -197,7 +200,7 @@ describe('KiroLex 自己说的话不许发给模型', () => {
 
   test('落盘时标 `kirolex: true`，界面那一份也带上', () => {
     assert.match(ST, /kirolex\?: true;/);
-    assert.match(M, /store\.appendMessage\(sid, \{ id: messageId, role: 'user', content: text, ts: Date\.now\(\), kirolex: true, \.\.\.\(v \? \{ variants: v \} : \{\}\) \}\);/);
+    assert.match(M, /store\.appendMessage\(sid, \{ id: messageId, role: 'user', content: text, ts: Date\.now\(\), kirolex: true, \.\.\.\(v \? \{ variants: v \} : \{\}\), \.\.\.g \}\);/);
     assert.match(M, /sessionId: sid, messageId, content: text, ts: Date\.now\(\), kirolex: true,/);
   });
 

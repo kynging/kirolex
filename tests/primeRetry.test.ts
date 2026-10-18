@@ -49,14 +49,14 @@ describe('重建失败之后该怎么办', () => {
     assert.match(note, /第 1\/6 块/);
     assert.match(note, /1982 字/);
     assert.match(note, /Internal error/);
-    assert.match(note, /不可能是"发得太大"/, '要说清为什么不再试');
+    assert.match(note, /已经很小，不是太大的问题/, '要说清为什么不再试');
     assert.match(note, /重启 KiroLex|分叉/, '这条失败是有解的，不给出路等于只说了"失败了"');
     assert.match(note, /下次发消息/, '要说清它还会再试');
   });
 
   test('因次数到顶放弃时，不能说"小到不可能是发得太大"', () => {
     const note = primeGiveUpNote({ chunk: 2, total: 3, chars: 24000, tries: 8, error: 'boom', atFloor: false });
-    assert.doesNotMatch(note, /不可能是"发得太大"/);
+    assert.doesNotMatch(note, /已经很小，不是太大的问题/);
     assert.match(note, /8 次/);
   });
 });

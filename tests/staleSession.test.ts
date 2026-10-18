@@ -122,7 +122,7 @@ describe('传输层瞬时错误：自己重发', () => {
     const at = M.indexOf("if (plan.reason === 'budget')");
     assert.ok(at > 0);
     const body = M.slice(at, at + 700);
-    assert.match(body, /tr\('Cannot reach the backend \(\{err\}\)/);
+    assert.match(body, /tr\('Can\\\'t reach the model service \(\{err\}\)/);
     assert.match(body, /Check your network\/VPN, then send again\./);
   });
 });
@@ -187,8 +187,9 @@ describe('接线：失败计数按后端 session 记，成功就清零', () => {
   });
 
   test('毒了那条路要**在会话里说一句** —— 否则"前几条都失败、这一条突然成了"没人解释得了', () => {
-    // trConcat：整句（含 ♻️）落盘时带上中英两版，切语言 / 重新打开都跟着换
-    assert.match(M, /if \(poisoned\) \{\s*\n\s*noteInSession\(sessionId, trConcat\('♻️ ', note\)\);/);
+    // note 是 trConcat 拼的（主句 + 详情）：落盘时带上中英两版，切语言 / 重新打开都跟着换
+    assert.match(M, /if \(poisoned\) \{\s*\n\s*noteInSession\(sessionId, note, undefined, 'backend-session-swap'\);/);
+    assert.match(M, /\? trConcat\(\s*tr\('🔀 This conversation failed \{n\} times in a row/);
     /* pid 不一致那条是常规现象，不播报 —— 每次都说只会变成噪音 */
     assert.match(M, /只在"毒了"这条路上说/);
   });

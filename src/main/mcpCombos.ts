@@ -282,7 +282,7 @@ export function planComboEffort(
   const avail = opts?.options.length
     ? tr(' (options: {list})', { list: opts.options.map((o) => o.value).join(' / ') })
     : tr(' (this engine offers no effort options)');
-  return { apply: false, notice: tr('ℹ️ {who} wants effort "{want}", which the current engine / model does not support{avail}', { who, want, avail }) };
+  return { apply: false, notice: tr('⚠️ {who} wants effort "{want}", which the current engine / model does not support{avail}', { who, want, avail }) };
 }
 
 type EffortSelect = { current: string; options: Array<{ value: string; name: string }> } | null;

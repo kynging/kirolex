@@ -1822,6 +1822,21 @@ button, input, select, textarea {
 }
 .kirolex-message-body { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .kirolex-message-time { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; }
+/* 提示的「×N」（连续重复合并）和折叠起来的「详情」—— 聊天区卡片和状态行共用（docs/notices-glossary.md） */
+.notice-repeat {
+  margin-left: 6px;
+  padding: 0 5px;
+  border-radius: 8px;
+  background: rgba(124, 111, 224, 0.18);
+  color: var(--text-secondary);
+  font-size: 10px;
+  font-weight: 600;
+}
+.notice-detail { margin-top: 2px; text-align: left; white-space: normal; }
+.notice-detail > summary { cursor: pointer; color: var(--text-tertiary); font-size: 10px; list-style: none; display: inline; }
+.notice-detail > summary::before { content: '▸ '; }
+.notice-detail[open] > summary::before { content: '▾ '; }
+.notice-detail-body { margin-top: 3px; color: var(--text-tertiary); white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .load-older-btn {
   display: block;

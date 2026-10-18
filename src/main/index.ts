@@ -9,7 +9,8 @@ import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { ADAPTER_PACKAGE, ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf, type Engine } from './engines.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
-import { RemoteRecovery } from './remoteRecovery.ts';
+import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
+import { ModelFallbackNotes } from './modelFallbackNote.ts';
 import {
   CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
   remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
@@ -78,7 +79,7 @@ import {
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
-import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
+import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail } from './kirolexNote.ts';
 import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, reviewBackupPrefix, reviewBackupsToPrune, type ReviewTarget } from './reviewAccess.ts';
 import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
@@ -556,6 +557,8 @@ async function connectWithModelFallback(
     远程会话不走这儿：那台机器的清单由 `pickRemoteModel` 按 preflight 的结果判断。
     清单问不到（空数组）时什么都不做 —— 没依据的判断比不判断糟。
   */
+  /** 本机清单里没有你选的模型（连上之后据此在会话里说一句，见下面的循环） */
+  let localMissing: { wanted: string; available: string[]; geoFiltered: boolean } | null = null;
   if (!profile.remote?.sshHost) {
     const available = await localModelIds();
     if (available.length) {
@@ -581,13 +584,8 @@ async function connectWithModelFallback(
       const wanted = profile.preferredModel || profile.model;
       if (sessionId && wanted && !available.includes(wanted)) {
         const geoFiltered = !available.some((m) => m.startsWith('claude-')) && !available.includes('auto');
-        /* trConcat / trList：整句（含列表的分隔符）都认得出两种语言，界面切了语言这句也跟着换 */
-        sessionNotice(sessionId, trConcat(tr('⚠️ The local kiro-cli model list has no "{wanted}", so this session will use one that is on the list. (Available here: {list}{more})', {
-          wanted, list: trList(available.slice(0, 8)), more: available.length > 8 ? '…' : '',
-        }),
-          (geoFiltered
-            ? tr('\nWhen the whole Claude family and `auto` vanish from the list, it is usually **region filtering on your outbound IP** (Anthropic models are region-restricted). Switching kiro-cli versions won\'t help. To use Claude, move this session to a remote machine.')
-            : '')));
+        /* 实际用哪个要等下面连上才知道 —— 那时再说（换了模型 → 进对话记录，见 modelFallback） */
+        localMissing = { wanted, available, geoFiltered };
       }
     }
   }
@@ -614,6 +612,26 @@ async function connectWithModelFallback(
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
+      /*
+        **本机清单里没有你选的模型** —— 连上了才说，说的是实际跑的那个（换了模型影响结果 → 进对话记录）。
+        trConcat / trList：整句（含列表的分隔符）都认得出两种语言；本机可用清单和"为什么没有 Claude"折进详情。
+      */
+      if (sessionId && localMissing && model !== localMissing.wanted) {
+        const lm = localMissing;
+        modelFallback.note(sessionId, lm.wanted, model, trConcat(tr('⚠️ This machine has no model "{wanted}", so this session uses "{model}" instead.', { wanted: lm.wanted, model }),
+          NOTE_DETAIL_SEP,
+          tr('Available here: {list}{more}', { list: trList(lm.available.slice(0, 8)), more: lm.available.length > 8 ? '…' : '' }),
+          (lm.geoFiltered
+            ? tr('\nNo Claude model and no `auto` in the list: usually your outbound IP is region-filtered (switching kiro-cli versions won\'t help). To use Claude, move this session to a remote machine.')
+            : '')));
+      } else if (sessionId && !profile.remote?.sshHost && model === (profile.preferredModel || profile.model)) {
+        modelFallback.wantedInUse(sessionId);   // 又用上你选的那个了：下次再换要重新说
+      }
+      /* 远程：pickRemoteModel 挑过备用模型 → 按**实际起来的**这个说（它挑的那个可能没起来、换成了下一个） */
+      if (sessionId && remotePicked) {
+        if (modelFallback.hasRemotePick(sessionId)) modelFallback.remoteStarted(sessionId, model);
+        else modelFallback.wantedInUse(sessionId);   // 远端有你选的那个：下次再换要重新说
+      }
       if (model !== profile.model) {
         // NB: `model` is simply the first candidate that started — with a
         // preferredModel it may WIN AHEAD of profile.model, which was then never
@@ -628,6 +646,8 @@ async function connectWithModelFallback(
       try { await client.disconnect(); } catch {}
     }
   }
+  /* 一个都没起来：挑过的备用模型也不算数，不写"改用了 X" */
+  if (sessionId) modelFallback.remoteFailed(sessionId);
   throw lastError || new Error('No usable model: every candidate failed to start.');
 }
 
@@ -942,7 +962,7 @@ function clampToolOutput(text: string): string {
 function bigOutputHint(maxChars?: number): string {
   const n = Number(maxChars) || 0;
   if (n < 20000) return '';
-  return tr(' (the largest single output was {k}K characters, which is most likely what the backend choked on; next time add `--query` / `| head` to that command to keep its output small)', { k: Math.round(n / 1000) });
+  return tr(' (the largest tool output was {k}K characters, likely what broke it; next time add `--query` / `| head` to that command)', { k: Math.round(n / 1000) });
 }
 
 /** Text an ACP tool call reported
@@ -1527,7 +1547,7 @@ async function primeHistoryNow(
   logger.info('prime', `requested sessionId=${sessionId} force=${force} attached=${!!entry} needs=${!!entry?.needsHistoryPrime} busy=${!!entry?.busy} priming=${!!entry?.priming}`);
   if (!entry) {
     logger.info('prime', `SKIP sessionId=${sessionId} reason=not-attached`);
-    return { ok: false, error: tr('This session is not connected to a backend yet. Open it first, then rebuild.') };
+    return { ok: false, error: tr('This session is not connected yet. Open it first, then rebuild history.') };
   }
   if (entry.primePromise) {
     logger.info('prime', `JOIN sessionId=${sessionId} reason=already-in-flight`);
@@ -1627,18 +1647,18 @@ async function primeHistoryNow(
         // there; stop and let that executor's own gate rebuild from scratch.
         if (sessionClients.get(sessionId) !== entry) {
           logger.info('prime', `ABORT sessionId=${sessionId} reason=executor-replaced (new backend will rebuild from 0)`);
-          return { ok: false, error: tr('The backend was replaced; the rebuild will start over.') };
+          return { ok: false, error: tr('The session reconnected; rebuilding history will start over.') };
         }
         if (entry.primeAbandoned) {
           logger.info('prime', `ABORT sessionId=${sessionId} reason=user-abandoned mid-rebuild cursor=${entry.primeCursor}/${chunks.length}`);
-          return { ok: false, error: tr('Rebuild abandoned by the user') };
+          return { ok: false, error: tr('You gave up rebuilding history') };
         }
         const i = entry.primeCursor || 0;
         const totalNow = chunks.length;
         const retryNote = sameChunkFailures ? tr(' (attempt {n})', { n: sameChunkFailures + 1 }) : '';
         entry.primeDetail = totalNow > 1
-          ? tr('Rebuilding history context {i}/{total}{retry}', { i: i + 1, total: totalNow, retry: retryNote })
-          : tr('Rebuilding history context{retry}', { retry: retryNote });
+          ? tr('Rebuilding history {i}/{total}{retry}', { i: i + 1, total: totalNow, retry: retryNote })
+          : tr('Rebuilding history{retry}', { retry: retryNote });
         emitSessionBusy(sessionId);
         const head = totalNow > 1
           ? `以下是本会话之前对话历史的第 ${i + 1}/${totalNow} 部分（由 KiroLex 保存并恢复）。请只回复"OK"，不要复述、不要重新回答其中内容；全部部分接收完毕后把它们作为后续对话的已知上下文。`
@@ -1683,7 +1703,7 @@ async function primeHistoryNow(
               const swapped = await swapSessionModel(sessionId, entry.profile.model, `prime ${sessionId}`, tried);
               if (swapped) {
                 logger.info('prime', `model unavailable during rebuild sessionId=${sessionId} swapped=${swapped} tried=${Array.from(tried).join(',')}`);
-                return { ok: false, error: tr('Model unavailable; switched backend ({msg})', { msg }) };
+                return { ok: false, error: tr('Model unavailable, switched to {to}; rebuilding history starts over ({msg})', { msg, to: swapped }) };
               }
             }
             logger.info('prime', `model unavailable during rebuild sessionId=${sessionId} NOT swapping (tried=${Array.from(tried).join(',')}) -> backing off and retrying same model`);
@@ -1725,7 +1745,7 @@ async function primeHistoryNow(
             }
           }
           const wait = Math.min(PRIME_RETRY_MAX_MS, PRIME_RETRY_BASE_MS * Math.pow(2, Math.max(0, sameChunkFailures + busyWaits - 1)));
-          entry.primeDetail = tr('Rebuilding history context {i}/{total} failed, retrying in {s}s', { i: i + 1, total: totalNow, s: Math.round(wait / 1000) });
+          entry.primeDetail = tr('Rebuilding history {i}/{total} failed, retrying in {s}s', { i: i + 1, total: totalNow, s: Math.round(wait / 1000) });
           emitSessionBusy(sessionId);
           logger.info('prime', `retry in ${wait}ms sessionId=${sessionId} chunk=${i + 1}/${totalNow}`);
           await new Promise((r) => setTimeout(r, wait));
@@ -1810,12 +1830,13 @@ const diagHost = (remote?: RemoteTarget): HostOps => hostFor(remote, { buildSshA
  *
  * 所以它们只发事件，界面显示在输入框上方、自己会消失。
  */
-function sessionNotice(sessionId: string, text: string, extra?: { copyRemote?: string[] }): void {
+function sessionNotice(sessionId: string, text: string, extra?: { copyRemote?: string[]; group?: string }): void {
   try {
     /* `copyRemote`：远程会话里落在远端的交付文件 —— 状态行上给每个一颗「⇩ 复制到本机」（`workspace:copy-remote-to-local`） */
     /* `variants`：这句话的中英两版（tr() 出来的才有）—— 界面切了语言，挂着的这句也跟着换 */
     const variants = bothLangs(text);
-    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), ...(variants ? { variants } : {}), ...(extra?.copyRemote?.length ? { copyRemote: extra.copyRemote } : {}) });
+    /* `group`：同类提示的键（「类型:对象」）—— 还挂着时又来同类的一句，界面只计数不刷新一条（`noticeMerge`） */
+    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), ...(variants ? { variants } : {}), ...(extra?.copyRemote?.length ? { copyRemote: extra.copyRemote } : {}), ...(extra?.group ? { group: extra.group } : {}) });
   } catch { /* 提示永远不能让主流程失败 */ }
   logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
@@ -1824,10 +1845,10 @@ function sessionNotice(sessionId: string, text: string, extra?: { copyRemote?: s
  * 同 `sessionNotice`，但**不自动消失**：一直挂到这条会话的下一句提示把它换掉
  * （「本机工具连接中断，正在重连（第 N 次）」要挂到连上为止，连上时那句"回来了"把它顶掉）。
  */
-function stickySessionNotice(sessionId: string, text: string): void {
+function stickySessionNotice(sessionId: string, text: string, group?: string): void {
   try {
     const variants = bothLangs(text);
-    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), sticky: true, ...(variants ? { variants } : {}) });
+    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), sticky: true, ...(variants ? { variants } : {}), ...(group ? { group } : {}) });
   } catch { /* 提示永远不能让主流程失败 */ }
   logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
@@ -2011,7 +2032,7 @@ function localComboTools(
   const combo = sessionCombo(sessionId, profile);
   const { servers, skipped } = buildAcpMcpServers(combo, shellEnv as Record<string, string | undefined>);
   for (const s of skipped) {
-    sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, which are not set on this machine; skipping it for now.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) }));
+    sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) }));
   }
   if (!servers.length) return undefined;
   logger.info('mcp-combo', `组合「${combo.name}」挂 ${servers.length} 个 MCP sessionId=${sessionId}: ${JSON.stringify(maskAcpServers(servers))}`);
@@ -2122,8 +2143,8 @@ async function ensureLocalTools(
       const { entries, skipped } = forwardableFromCombo(combo.mcpServers, shellEnv as Record<string, string | undefined>);
       for (const s of skipped) {
         sessionNotice(sessionId, s.missing
-          ? tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, which are not set on this machine; it won\'t be attached in this remote session for now.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) })
-          : tr('⚠️ MCP "{mcp}" in combo "{combo}" can\'t be forwarded from this machine: {reason}. It won\'t be attached in this remote session for now.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
+          ? tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) })
+          : tr('⚠️ MCP "{mcp}" in combo "{combo}" can\'t be forwarded from this machine ({reason}); it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
       }
       server.setProxies(sessionId, entries);
       const http = entries.filter(isHttpForward);
@@ -2184,7 +2205,7 @@ async function ensureLocalTools(
     }
     const usedBase = parseAgentBase(agentOut);
     if (profile.kiroAgent && usedBase === 'default') {
-      sessionNotice(sessionId, tr('⚠️ {host} has no agent "{agent}", so this session uses the **default agent** plus your local tools. To run it as that agent, create a config with the same name on that machine.', { host: remote.sshHost, agent: profile.kiroAgent }));
+      sessionNotice(sessionId, tr('⚠️ {host} has no agent "{agent}", so the default agent is used. To use it, create a config with that name on that machine.', { host: remote.sshHost, agent: profile.kiroAgent }));
       logger.warn('localmcp', `远端没有 agent ${profile.kiroAgent}，退到默认 sessionId=${sessionId}`);
     } else if (usedBase && usedBase !== 'default') {
       logger.info('localmcp', `远端用它自己的 agent「${usedBase}」做底子 sessionId=${sessionId}`);
@@ -2206,7 +2227,7 @@ async function ensureLocalTools(
       交给 `remoteRecovery` 按退避一直试（每次重试都重新查远端占用、重新分端口）。
     */
     if (!muxSupported()) startRemoteRecovery(sessionId);
-    sessionNotice(sessionId, tr('⚠️ The local tools channel failed to start: {error}. This remote session can\'t read files on your machine, so don\'t let it change anything yet. It will reconnect automatically once the connection is back.', { error: String(err?.message || err) }));
+    sessionNotice(sessionId, tr('⚠️ The local tools connection failed ({error}); this remote session can\'t read or write your files for now. It reconnects automatically.', { error: String(err?.message || err) }));
     logger.warn('localmcp', `准备失败 sessionId=${sessionId}: ${err?.message || err}`);
     return undefined;
   }
@@ -2578,12 +2599,12 @@ function runLocalActions(sessionId: string, entry: SessionEntry, chunk: string):
     if (!line.includes(LOCAL_MARKER)) continue;
     const { actions, rejected } = parseLocalActions(line);
     for (const r of rejected) {
-      sessionNotice(sessionId, tr('⚠️ It asked your machine to do something KiroLex doesn\'t recognise: `{raw}` ({why}).', { raw: r.raw.slice(0, 120), why: r.why }));
+      sessionNotice(sessionId, tr('⚠️ Ignored an unrecognised request for this machine: `{raw}` ({why}).', { raw: r.raw.slice(0, 120), why: r.why }));
     }
     for (const a of actions) {
       if (entry.openedLocally?.has(a.target)) continue;   // 同一个地址一条会话只开一次
       if ((entry.localActionsThisTurn || 0) >= MAX_LOCAL_ACTIONS_PER_TURN) {
-        sessionNotice(sessionId, tr('⚠️ It has already asked to open {n} pages this turn, so the rest were not opened (`{target}`). The link is above; click it if you need it.', { n: MAX_LOCAL_ACTIONS_PER_TURN, target: a.target }));
+        sessionNotice(sessionId, tr('⚠️ This turn already opened {n} pages, so `{target}` was not opened; click the link above if you need it.', { n: MAX_LOCAL_ACTIONS_PER_TURN, target: a.target }));
         return;
       }
       /*
@@ -2599,7 +2620,8 @@ function runLocalActions(sessionId: string, entry: SessionEntry, chunk: string):
       */
       const scheme = (() => { try { return new URL(a.target).protocol; } catch { return ''; } })();
       if (scheme !== 'http:' && scheme !== 'https:') {
-        noteInSession(sessionId, tr('⚠️ Refused to open `{target}` on this machine. Only http/https is allowed.', { target: String(a.target).slice(0, 120) }));
+        /* 和同一组的另外几句一样走状态行：已经拦下了，不用你做什么 */
+        sessionNotice(sessionId, tr('⚠️ Refused to open `{target}`: only http/https links can be opened on this machine.', { target: String(a.target).slice(0, 120) }));
         logger.warn('localaction', `拒绝非 http(s) 目标 sessionId=${sessionId} scheme=${scheme || '(解析不了)'}`);
         continue;
       }
@@ -2607,8 +2629,8 @@ function runLocalActions(sessionId: string, entry: SessionEntry, chunk: string):
       (entry.openedLocally ||= new Set()).add(a.target);
       const host = labelForHost(KIROLEX_CONFIG_PATH, entry.profile.remote?.sshHost) || tr('the remote');
       void shell.openExternal(a.target).then(
-        () => sessionNotice(sessionId, tr('🌐 Opened `{target}` in **your** browser (requested by the agent on {host}).', { target: a.target, host })),
-        (err: any) => sessionNotice(sessionId, tr('⚠️ It asked to open `{target}`, but it couldn\'t be opened: {error}', { target: a.target, error: String(err?.message || err) })),
+        () => sessionNotice(sessionId, tr('Opened `{target}` in your browser (requested from {host}).', { target: a.target, host })),
+        (err: any) => sessionNotice(sessionId, tr('⚠️ Couldn\'t open `{target}`: {error}', { target: a.target, error: String(err?.message || err) })),
       );
       logger.info('remote', `本地动作 open ${a.target} sessionId=${sessionId}`);
     }
@@ -2810,7 +2832,7 @@ const sshMux: SshMux = new SshMux({
       /* 已经在 remoteRecovery 里的那几条有自己的「第 N 次」，别两套数字打架 */
       if (remoteRecovery.has(sessionId)) continue;
       noticed.add(sessionId);
-      stickySessionNotice(sessionId, tr('⚠️ The local tools connection dropped; reconnecting (attempt {n}). Until then this remote session can\'t read or write files on your machine.', { n: attempt }));
+      stickySessionNotice(sessionId, tr('⚠️ The local tools connection dropped; reconnecting (attempt {n}). Until then this remote session can\'t read or write your files.', { n: attempt }), LOCAL_TOOLS_RECONNECT_GROUP);
     }
   },
   /*
@@ -2829,7 +2851,7 @@ const sshMux: SshMux = new SshMux({
     /* 要重接的那几条由 rearm 自己说；其余的（端口没变、工具本来就在）在这里把"正在重连"顶掉 */
     for (const sessionId of noticed || []) {
       if (needsRearm(sessionId, key)) continue;
-      sessionNotice(sessionId, tr('🔌 Local tools connection restored.'));
+      sessionNotice(sessionId, tr('Local tools connection restored.'), { group: LOCAL_TOOLS_RESTORED_GROUP });
     }
     /* 连接刚断过：死连接下面那批执行器现在没人持有了，顺手收掉 */
     const target = listRemoteTargets(KIROLEX_CONFIG_PATH).find((t) => t.sshHost && muxKey(t.sshHost, t.sshPort) === key);
@@ -2897,7 +2919,7 @@ async function rearmLocalToolsFor(key: string): Promise<void> {
   logger.info('sshmux', `${key} 的连接回来了 —— ${victims.length} 条会话缺本地工具，逐条重接：${victims.join(' ')}`);
   for (const sessionId of victims) {
     try {
-      sessionNotice(sessionId, tr('🔌 The local tools channel is back; reconnecting this session\'s executor. After that it can read and write files on your machine again.'));
+      sessionNotice(sessionId, tr('⏳ Local tools connection restored; reconnecting this session…'));
       detachExecutor(sessionId);
       toollessSessions.delete(sessionId);
       /* 主动接回来（不等用户下一次发消息）：走和断线恢复同一条路，接上之前一直按退避重试 */
@@ -2928,7 +2950,7 @@ const remoteRecovery = new RemoteRecovery<{ key: string; remote: RemoteTarget }>
   /* 复用平台：先把这台机器的连接拉起来（并发只握一次手），没回来就不起执行器 */
   ensureConnection: muxSupported() ? (t) => sshMux.ensure(t.remote) : undefined,
   reattach: async (sessionId) => !!(await reattachSession?.(sessionId)),
-  notice: (sessionId, text, sticky) => (sticky ? stickySessionNotice(sessionId, text) : sessionNotice(sessionId, text)),
+  notice: (sessionId, text, sticky, group) => (sticky ? stickySessionNotice(sessionId, text, group) : sessionNotice(sessionId, text, { group })),
   /* 渲染层只在它自己 loadSession 成功时才把会话标成"连着" —— 主进程接上的要告诉它 */
   recovered: (sessionId) => { mainWindow?.webContents.send('acp:reattached', { sessionId }); },
   log: (message) => logger.info('remote', message),
@@ -3137,6 +3159,20 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
 }
 
 /**
+ * **自动改用备用模型要留在对话记录里，而且说的是实际起来的那个** —— 判据在 `modelFallbackNote.ts`（纯的、有测试）：
+ * 同一对「想要 → 实际」每条会话只记一次；新建会话时先攒着、记录落盘后补写；远端按连上之后实际起来的模型说。
+ */
+const modelFallback = new ModelFallbackNotes({
+  note: (sid, text, group) => noteInSession(sid, text, undefined, group),
+  /* 删掉的会话当作"在"：不攒、不补写，只在状态行说 */
+  recordExists: (sid) => !!store.readRecord(sid) || deletedSessionIds.has(sid),
+  status: (sid, text, group) => sessionNotice(sid, text, { group }),
+  remoteText: (host, wanted, used, models) => trConcat(tr('⚠️ {host} has no model "{wanted}", so this session uses "{fallback}" instead.', { host, wanted, fallback: used }),
+    NOTE_DETAIL_SEP,
+    tr('Available there: {list}{more}', { list: trList(models.slice(0, 8)), more: models.length > 8 ? '…' : '' })),
+});
+
+/**
  * **这条会话要用的模型，远端真的有吗** ——「模型列表其实也完全不一样，你看看能不能行」。
  *
  * 实测这两台机器上一样（各 19 个），但没验过就等于赌：远端要是个旧版少了那个模型，
@@ -3147,11 +3183,12 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
  * 列表问不到（空数组）时什么都不做：没依据的判断比不判断糟。
  */
 function pickRemoteModel(sessionId: string, wanted: string, models: string[], host: string): string {
+  /* 每次挑都从头记：上一次没连上留下的那条不能带到这一次 */
+  modelFallback.remoteReset(sessionId);
   if (!models.length || models.includes(wanted)) return wanted;
+  /* 说不说、说哪个模型，等连上之后（modelFallback.remoteStarted）按实际起来的那个定 */
+  modelFallback.remotePicked(sessionId, wanted, host, models);
   const fallback = MODEL_FALLBACK_ORDER.find((m) => models.includes(m)) || models.find((m) => m !== 'auto') || 'auto';
-  sessionNotice(sessionId, tr('⚠️ {host} has no model "{wanted}", so this session uses "{fallback}" instead. (Available there: {list}{more}) kiro-cli silently falls back to its default model in this case, so KiroLex says so here.', {
-    host, wanted, fallback, list: trList(models.slice(0, 8)), more: models.length > 8 ? '…' : '',
-  }));
   logger.warn('remote', `模型 ${wanted} 在 ${host} 上没有 -> 用 ${fallback}`);
   return fallback;
 }
@@ -3801,7 +3838,7 @@ const cliRecreatedAt = new Map<string, number>();
  */
 const bareFailStreak = new Map<string, number>();
 
-function noteInSession(sessionId: string, body: string, variants?: TextVariants): boolean {
+function noteInSession(sessionId: string, body: string, variants?: TextVariants, group?: string): boolean {
   const sid = String(sessionId || '').trim();
   const text = String(body || '').trim();
   if (!sid || !text) return false;
@@ -3824,10 +3861,12 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants)
      *
      * 界面照旧显示（可见性是这些话存在的理由），但每一条发给模型的路径都跳过它（`modelFacing`）。
      */
-    store.appendMessage(sid, { id: messageId, role: 'user', content: text, ts: Date.now(), kirolex: true, ...(v ? { variants: v } : {}) });
+    /* `noteGroup`：同类提示的键（「类型:对象[→结果]」）—— 界面把相邻的同类几条并成一条「×N」 */
+    const g = group ? { noteGroup: group } : {};
+    store.appendMessage(sid, { id: messageId, role: 'user', content: text, ts: Date.now(), kirolex: true, ...(v ? { variants: v } : {}), ...g });
     refreshHistoryFile(sid);
     mainWindow?.webContents.send('acp:user-message', {
-      sessionId: sid, messageId, content: text, ts: Date.now(), kirolex: true, ...(v ? { variants: v } : {}),
+      sessionId: sid, messageId, content: text, ts: Date.now(), kirolex: true, ...(v ? { variants: v } : {}), ...g,
     });
     return true;
   } catch { return false; }
@@ -3905,10 +3944,13 @@ function enqueueRevise<T>(sessionId: string, job: () => Promise<T>, label?: stri
   const ahead = revisePending.get(sessionId) || 0;
   if (label) {
     const busy = busyReasonFor(sessionId);
+    /*
+      「已排队」只需知道、不用操作 → 状态行（不进对话记录）；两种原因合成一句带参数的（docs/notices-glossary.md）
+    */
     if (ahead > 0) {
-      noteInSession(sessionId, tr('⏳ Queued: {label}. {n} earlier revision(s) are still running; it will be sent automatically when its turn comes.', { label, n: ahead }));
+      sessionNotice(sessionId, tr('⏳ Queued: {label} ({why}); it will be sent automatically.', { label, why: tr('{n} earlier revision(s) still running', { n: ahead }) }), { group: `revise-queued:${label}` });
     } else if (busy) {
-      noteInSession(sessionId, tr('⏳ Queued: {label}. This session is busy ({busy}); it will be sent automatically once it is free.', { label, busy }));
+      sessionNotice(sessionId, tr('⏳ Queued: {label} ({why}); it will be sent automatically.', { label, why: tr('session busy: {busy}', { busy }) }), { group: `revise-queued:${label}` });
     }
   }
   revisePending.set(sessionId, ahead + 1);
@@ -6619,6 +6661,7 @@ app.whenReady().then(async () => {
     } catch (err) {
       /* 起来了的执行器要收掉 —— 不收的话它在那台机器上一直空跑着 */
       try { await client.disconnect(); } catch { /* 已经没了 */ }
+      modelFallback.discard(kiroLexId);   // 没建成：连上时记下的「改用了备用模型」作废
       logger.warn('session', `new-session 失败 sessionId=${kiroLexId} engine=${ENGINE_LABEL[engine]} cwd=${cliCwd}`, err);
       throw err;
     }
@@ -6634,6 +6677,8 @@ app.whenReady().then(async () => {
        以它为准的话每次重连都会把家目录当项目（远程会话就是把整个家目录推上远端）。见 `localDir`。 */
     rec.localDir = resolvedCwd;
     store.writeRecord(rec);
+    /* 会话建成、记录落盘了：连接时记下的那句「改用了备用模型」现在写进对话记录 */
+    modelFallback.commit(kiroLexId);
     mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId: kiroLexId, projectId: profile.projectId });
     return { sessionId: kiroLexId };
   });
@@ -6841,9 +6886,17 @@ app.whenReady().then(async () => {
       } else if (!primed.ok && !primed.skipped) {
         // Do NOT silently continue on an empty backend. Surfacing this is the
         // whole point: the flag stays set, so the next send retries the rebuild.
-        throw new Error(entry.primeGaveUp
-          ? tr('Rebuilding the history context did not finish ({why}), so this message was not sent, to avoid answering on an empty context. Send again to retry the rebuild, or press Stop to give it up (later messages will go out as usual, just without history on the backend).', { why: primed.error || tr('unknown reason') })
-          : tr('Rebuilding the history context did not finish ({why}), so this message was not sent, to avoid answering on an empty context. The rebuild keeps retrying automatically; if you would rather not wait, press Stop to give up the rebuild (this message will then go out as usual, just without history on the backend).', { why: primed.error || tr('unknown reason') }));
+        /* 两种情形合成一句带参数的：只差"重建还在不在自己重试"（docs/notices-audit.md） */
+        /* 主句只放原因的主句（primeGiveUpNote 那种长诊断的分块 / 字数 / 原文在它的详情里），后面接到这条的详情 */
+        const { main: whyMain, detail: whyDetail } = splitNoteDetail(primed.error || tr('unknown reason'));
+        throw new Error(trConcat(
+          tr('History was not rebuilt ({why}), so this message was not sent. {next}', {
+            why: whyMain,
+            next: entry.primeGaveUp ? tr('Send again to retry.') : tr('Rebuilding is still retrying.'),
+          }),
+          NOTE_DETAIL_SEP,
+          tr('Press Stop to give up rebuilding; later messages then go out without history.'),
+          whyDetail ? `\n${whyDetail}` : ''));
       }
     }
     // Kiro CLI performs context compaction inside the active session/prompt
@@ -7127,9 +7180,12 @@ app.whenReady().then(async () => {
             // timeout firing, not as a backend fault: a measured case had the tool
             // genuinely still working, so blaming the backend would have been false.
             const dur = (ms: number) => (ms < 90000 ? tr('{n} s', { n: Math.round(ms / 1000) }) : tr('{n} min', { n: Math.round(ms / 60000) }));
+            /* 主句只说被中断了、为什么（一句）；时长、上限、设置项折进「详情」（回复气泡认 NOTE_DETAIL_SEP，见 ChatArea） */
             e.wedgeNote = staleToolCount
-              ? tr('⚠️ KiroLex interrupted this turn on a timeout: silent for {quiet}, and {count} tool call(s) showed no progress for {idle} (limit {limit} min). The tool itself may still be running in the background. You can raise "Tool stall threshold" in Settings.', { quiet: dur(quietFor), count: staleToolCount, idle: dur(toolIdleFor), limit: Math.round(TOOL_STALL_MS / 60000) })
-              : tr('⚠️ KiroLex interrupted this turn on a timeout: silent for {quiet} (limit {limit} min), with no tool running. You can raise "Silence before a turn counts as wedged" in Settings.', { quiet: dur(quietFor), limit: Math.round(WEDGE_CONFIRM_MS / 60000) });
+              ? trConcat(tr('⚠️ This turn was interrupted: a tool made no progress for too long.'), NOTE_DETAIL_SEP,
+                tr('{count} tool call(s) had no progress for {idle} (limit {limit} min); the tool may still be running in the background. To wait longer, raise "Tool stall threshold" in Settings.', { count: staleToolCount, idle: dur(toolIdleFor), limit: Math.round(TOOL_STALL_MS / 60000) }))
+              : trConcat(tr('⚠️ This turn was interrupted: no output for too long.'), NOTE_DETAIL_SEP,
+                tr('No output for {quiet} (limit {limit} min). To wait longer, raise "Silence before a turn counts as wedged" in Settings.', { quiet: dur(quietFor), limit: Math.round(WEDGE_CONFIRM_MS / 60000) }));
             e.wedgedAt = Date.now();
             logger.warn('prompt', `WEDGED sessionId=${sessionId} cli=${entry.cliSessionId} quiet=${quietSeconds}s produced=${produced} -- ${why}, interrupting`);
             // `produced` is the whole payload the renderer acts on: it decides
@@ -7300,7 +7356,12 @@ app.whenReady().then(async () => {
                 const next = sessionClients.get(sessionId);
                 if (next) {
                   logger.warn('prompt', `连着 ${bareStreak + 1} 次空响应，模型 '${failedModel}' → '${swapped}' 重发 sessionId=${sessionId}`);
-                  noteInSession(sessionId, tr('🔀 The backend refused to generate a reply for this turn {n} times in a row (kiro-cli logs `EmptyResponse`: the stream opened but not a single token came out). Switching backend sessions does not help here (tried three, all failed), so this time KiroLex switched the model: {from} → {to}, and resent your message as is.', { n: bareStreak + 1, from: failedModel, to: swapped }));
+                  /* 换了模型 → 进对话记录；为什么换（笼统 Internal error、换后端会话没用）折进详情 */
+                  noteInSession(sessionId, trConcat(
+                    tr('🔀 Got no reply {n} times in a row, so the model was switched from {from} to {to} and your message resent.', { n: bareStreak + 1, from: failedModel, to: swapped }),
+                    NOTE_DETAIL_SEP,
+                    tr('Each attempt ended with a bare "Internal error", and switching backend sessions had not helped. The conversation is unchanged.')),
+                    undefined, `model-swap:${failedModel}→${swapped}`);
                   entry = next;
                   entry.busy = true;
                   entry.turnSeq = myTurn;
@@ -7435,7 +7496,7 @@ app.whenReady().then(async () => {
       // (often mid context-compaction). Say so plainly instead of leaking a raw
       // "Internal error", and keep the wording matchable as an active turn.
       if (/prompt already in progress/i.test(`${err?.message || ''}${detail}`)) {
-        throw new Error(tr('The previous turn is still running on the backend (active turn, possibly compacting context). Wait for it to finish, or press Stop to interrupt it, then send again.'));
+        throw new Error(tr('The previous turn is still running (active turn, maybe compacting context). Wait for it, or press Stop, then send again.'));
       }
       // NOTE: an oversized image is deliberately NOT recovered from here.
       //
@@ -7510,8 +7571,12 @@ app.whenReady().then(async () => {
           cliFailStreak.delete(oldId);
           cliRecreatedAt.set(sessionId, Date.now());
           const poisoned = streak >= POISONED_AFTER;
+          /* 主句：发生了什么（简短原因）；pid / 新的后端会话 id / 推理折进详情（docs/notices-glossary.md） */
           const note = poisoned
-            ? tr('The backend refused to generate a reply for this conversation {n} times in a row ({err}). The pid did not change, so the session did not expire; the backend cannot digest this history itself (a common cause: the result of some tool call). KiroLex switched to a new backend session ({id}…) and carried the context over; the conversation on disk is untouched.', { n: streak, err: String(err?.message || '').slice(0, 60), id: made.sessionId.slice(0, 8) })
+            ? trConcat(
+              tr('🔀 This conversation failed {n} times in a row ({err}), so it moved to a new backend session with the context carried over.', { n: streak, err: String(err?.message || '').slice(0, 60) }),
+              NOTE_DETAIL_SEP,
+              tr('The process (pid) did not change, so the session had not expired: most likely the history itself is what fails (often a tool result). New backend session: {id}…. The conversation is unchanged.', { id: made.sessionId.slice(0, 8) }))
             : staleRecoveryNote(oldId, made.sessionId,
               store.readRecord(sessionId)?.contextEstablishedPid ?? 0, entry.client.pid ?? 0);
           logger.warn('prompt', `${poisoned ? 'poisoned' : 'stale'} cli session recreated sessionId=${sessionId}: ${note}`);
@@ -7521,7 +7586,7 @@ app.whenReady().then(async () => {
             （kiro-cli 不持久化 ACP 会话），每次都播报只会变成噪音。
           */
           if (poisoned) {
-            noteInSession(sessionId, trConcat('♻️ ', note));
+            noteInSession(sessionId, note, undefined, 'backend-session-swap');
           }
         } catch (again: any) {
           /* 换会话本身失败了（连不上进程之类）—— 照实报原来那个错，不是这里的新错。 */
@@ -7540,7 +7605,7 @@ app.whenReady().then(async () => {
             + `这一轮已产出（文字=${!!entry.assistantBuf} 工具=${entry.toolsThisTurn || 0} `
             + `最大工具输出=${entry.maxToolOutputThisTurn || 0} 字符），重发会重复副作用`);
           throw new Error(trConcat(`${errText}\n\n`,
-            tr('(This turn had already run {n} tool call(s){hint}. Resending would run them all again, so KiroLex only switched to a new backend session ({id}…) and did not resend automatically. Press rerun or send another message and it will land on the new session.)', { n: entry.toolsThisTurn || 0, hint: bigOutputHint(entry.maxToolOutputThisTurn), id: made.sessionId.slice(0, 8) }),
+            tr('(This turn had already run {n} tool call(s){hint}, so it was not resent automatically, to avoid running them twice. Press Rerun or send a new message.)', { n: entry.toolsThisTurn || 0, hint: bigOutputHint(entry.maxToolOutputThisTurn), id: made.sessionId.slice(0, 8) }),
             cliWhy ? `\n\n${cliWhy}` : ''));
         }
         if (made && plan.retry) {
@@ -7571,7 +7636,7 @@ app.whenReady().then(async () => {
         logger.warn('prompt', `自动重发用光预算（${attempt} 次）sessionId=${sessionId}: ${errText.slice(0, 160)}`);
         const why = cliWhy ? `\n\n${cliWhy}` : '';
         throw new Error(trConcat(isTransientTransportError(errText)
-          ? tr('Cannot reach the backend ({err}). KiroLex resent it {n} times and every attempt failed. Check your network/VPN, then send again.', { err: errText.slice(0, 120), n: attempt })
+          ? tr('Can\'t reach the model service ({err}); {n} automatic resends all failed. Check your network/VPN, then send again.', { err: errText.slice(0, 120), n: attempt })
           : retriesExhaustedNote(errText, attempt), why));
       }
       if (/^internal error$/i.test(String(err?.message || '')) && detail) {
@@ -7936,7 +8001,7 @@ app.whenReady().then(async () => {
           store.appendMessage(state.sessionId, {
             id: `sched_end_${Date.now()}`,
             role: 'assistant',
-            content: tr('⏰ Scheduled task ended: {why}\n{schedule} · ran {n} time(s) in total', { why: scheduleTerminalLabel(terminal), schedule: describeSchedule(final.spec), n: final.runs }),
+            content: tr('Scheduled task ended: {why} ({schedule}, ran {n} time(s))', { why: scheduleTerminalLabel(terminal), schedule: describeSchedule(final.spec), n: final.runs }),
             ts: Date.now(),
           });
         } catch {}
@@ -8953,7 +9018,10 @@ app.whenReady().then(async () => {
       rec.localDir = nextLocalDir;
       store.writeRecord(rec);
       const where = target ? tr('remote machine {host}', { host: String(hostLabelOf(target)) }) : tr('the local machine');
-      sessionNotice(sessionId, tr('🔀 This session now runs on **{where}** (working directory `{dir}`). It was not connected, so it will connect at the new location; the conversation is untouched.', { where, dir: nextLocalDir }));
+      sessionNotice(sessionId, trConcat(
+        tr('🔀 This session now runs on **{where}** (working directory `{dir}`); it connects there next time.', { where, dir: nextLocalDir }),
+        NOTE_DETAIL_SEP,
+        tr('The conversation is unchanged.')));
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
       /* 渲染层收到后发现它没连着，会按新记录立刻 attach（见 useAcp 的 reconnectAfterRetarget） */
       mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
@@ -8979,6 +9047,9 @@ app.whenReady().then(async () => {
       const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
       try {
         await client.connect();
+        /* 远端没有你选的模型（pickRemoteModel 挑了备用的）：连上了才说，说的是实际起来的那个 */
+        /* 先记下（真正写要等下面换上执行器、写好记录之后 —— session/new 失败就作废） */
+        if (target && engineOf(profile) === 'kiro') modelFallback.remoteStarted(sessionId, profile.model);
         const made = await withLoadTimeout(client.newSession(cliCwd), loadTimeoutFor(profile.remote), 'session/new');
         const nextEntry: SessionEntry = {
           ...oldEntry,
@@ -9011,15 +9082,21 @@ app.whenReady().then(async () => {
         clearContextEstablished(sessionId);
         markContextOwedIfUnverified(sessionId, 'switch-remote-target');
         restoreContextAfterExecutorSwap(sessionId, 'switch-remote-target');
+        modelFallback.commit(sessionId);   // 换成了：记下的「改用了备用模型」现在写
 
         const where = target ? tr('remote machine {host}', { host: String(hostLabelOf(target)) }) : tr('the local machine');
-        sessionNotice(sessionId, tr('🔀 From now on this session runs on **{where}** (working directory `{dir}`). The backend session is new; the context goes along with your next message, and the earlier conversation is untouched.', { where, dir: nextLocalDir })
-          + (interrupted ? `\n${tr('(The switch interrupted the turn that was running. Everything it produced is kept; the unfinished part is lost, so resend if you need it.)')}` : ''));
+        /* 主句：换到哪（被打断的那一轮也在主句里 —— 它影响结果）；后端会话是新的、对话记录不变 → 详情 */
+        sessionNotice(sessionId, trConcat(
+          tr('🔀 This session now runs on **{where}** (working directory `{dir}`).', { where, dir: nextLocalDir }),
+          interrupted ? `\n${tr('(The switch interrupted the running turn; its output so far is kept. Resend if you need the rest.)')}` : '',
+          NOTE_DETAIL_SEP,
+          tr('The backend session is new; the context goes along with your next message. The conversation is unchanged.')));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
         mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
         return { ok: true, remoteHost: hostLabelOf(target) };
       } catch (err) {
         try { await client.disconnect(); } catch {}
+        modelFallback.discard(sessionId);   // 没换成（session/new 等失败）：连上时记下的那句作废
         throw err;
       }
     } finally {
@@ -9187,7 +9264,7 @@ app.whenReady().then(async () => {
           **在会话里说一句** —— 只写日志的话用户看到的是"模型没换成，然后这条会话不能用了",
           而原因（那条 kiro-cli 会话的锁还被上一个进程握着）只有日志里有。
         */
-        sessionNotice(sessionId, tr('⚠️ Switching the model failed, and so did rolling back. This session is not connected to an executor right now. Click it to reconnect automatically (reconnecting takes the regular, reliable path).'));
+        sessionNotice(sessionId, tr('⚠️ The model switch failed and so did the rollback; this session is disconnected. Click it to reconnect.'));
         /*
           **回滚也失败了 → 把盘上的状态说成实话** —— 实测这条路走过两次（07:59、08:00），
           而记录里还写着 `attached`：于是界面以为它连着，下一次发送答的是「Session not connected」。
@@ -9399,7 +9476,7 @@ app.whenReady().then(async () => {
       if (!rec0) throw new Error(tr('Could not find the record for this session.'));
       rec0.profile = reshape(rec0.profile);
       store.writeRecord(rec0);
-      sessionNotice(sessionId, tr('🤖 Next time it opens, this session will run on **{engine}**. It is not connected right now, so there is no executor to swap; the conversation is untouched.', { engine: label }));
+      sessionNotice(sessionId, tr('🔀 This session will run on **{engine}** the next time it opens.', { engine: label }));
       mainWindow?.webContents.send('session:engine-changed', { sessionId, engine });
       logger.info('engine', `切换引擎（未连接）sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`);
       return { ok: true, engine, cold: true };
@@ -9448,12 +9525,14 @@ app.whenReady().then(async () => {
       clearContextEstablished(sessionId);
       markContextOwedIfUnverified(sessionId, 'switch-engine');
       restoreContextAfterExecutorSwap(sessionId, 'switch-engine');
-      sessionNotice(sessionId, tr('🤖 From now on this session runs on **{engine}**. The backend session is new; the context goes along with your next message, and the earlier conversation is untouched.', { engine: label }));
+      modelFallback.commit(sessionId);   // 换成了：记下的「改用了备用模型」现在写
+      sessionNotice(sessionId, tr('🔀 This session now runs on **{engine}**; the context goes along with your next message.', { engine: label }));
       mainWindow?.webContents.send('session:engine-changed', { sessionId, engine });
       logger.info('engine', `切换引擎 sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`);
       return { ok: true, engine };
     } catch (err) {
       if (client) { try { await client.disconnect(); } catch {} }
+      modelFallback.discard(sessionId);   // 没换成：连上时记下的那句作废
       logger.warn('engine', `切换引擎失败 sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`, err);
       throw err;
     } finally {
@@ -9552,11 +9631,13 @@ app.whenReady().then(async () => {
       clearContextEstablished(sessionId);
       markContextOwedIfUnverified(sessionId, 'switch-mcp-combo');
       restoreContextAfterExecutorSwap(sessionId, 'switch-mcp-combo');
-      sessionNotice(sessionId, tr('🧩 This session now uses the combo "{name}". The executor was restarted; the context goes along with your next message, and the earlier conversation is untouched.', { name: comboDisplayName(combo) }));
+      modelFallback.commit(sessionId);   // 换成了：记下的「改用了备用模型」现在写
+      sessionNotice(sessionId, tr('🔀 Switched to the combo "{name}"; the context goes along with your next message.', { name: comboDisplayName(combo) }));
       logger.info('mcp-combo', `切换组合 sessionId=${sessionId} -> ${combo.id}`);
       return { ok: true, current: combo.id };
     } catch (err) {
       if (client) { try { await client.disconnect(); } catch {} }
+      modelFallback.discard(sessionId);   // 没换成：连上时记下的那句作废
       logger.warn('mcp-combo', `切换组合失败 sessionId=${sessionId} -> ${combo.id}`, err);
       /*
         **新执行器没起来，旧的也已经没有工具通道了**（token 换了、旧中转停了）—— 留着它就是一条
@@ -9565,7 +9646,8 @@ app.whenReady().then(async () => {
       */
       if (toolsSwapped && sessionClients.get(sessionId) === oldEntry) {
         void detachExecutor(sessionId);
-        sessionNotice(sessionId, tr('⚠️ Switching to the combo "{name}" failed ({err}); this session keeps its previous combo. The executor is disconnected, and your next message will reconnect it with the previous combo (including the tools on this computer).', { name: comboDisplayName(combo), err: String((err as any)?.message || err) }));
+        /* 同一次失败只说一处：把"仍用原组合、下一条消息重新连接"放进抛出去的错误里（界面显示在组合下拉旁），不再另发状态行 */
+        throw new Error(tr('Switching to the combo "{name}" failed ({err}); the previous combo is kept and your next message reconnects with it.', { name: comboDisplayName(combo), err: String((err as any)?.message || err) }));
       }
       throw err;
     } finally {
@@ -9683,11 +9765,13 @@ app.whenReady().then(async () => {
     const describe = (kinds: PendingKind[]) => entries.filter((e) => kinds.includes(e.kind))
       .map((e) => `${pendingKindName(e.kind)} → ${shown(e.kind, e.label)}`).join(tr(', '));
     if (report.applied.length) {
-      sessionNotice(sessionId, tr('✅ This turn finished, so the switch you picked while it was running is now applied: {list}', { list: describe(report.applied) }));
+      sessionNotice(sessionId, tr('🔀 The turn finished; applied the switch you picked: {list}', { list: describe(report.applied) }));
     }
     if (report.failed.length) {
       const list = report.failed.map((f) => `${pendingKindName(f.kind)} → ${shown(f.kind, f.label)}（${f.error}）`).join(tr(', '));
-      sessionNotice(sessionId, tr('⚠️ The switch you picked while the turn was running did not take effect: {list}. The session keeps its current setting.', { list }));
+      /* 没生效 = 影响结果 → 进对话记录；生效了只是告知 → 上面那句留在状态行 */
+      noteInSession(sessionId, tr('⚠️ The switch you picked did not take effect: {list}. The current setting is kept.', { list }), undefined,
+        `pending-switch-failed:${report.failed.map((f) => `${f.kind}→${f.label}`).join(',')}`);
       logger.warn('pending-switch', `应用失败 sessionId=${sessionId} ${list}`);
     }
     const p = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile;
@@ -10897,8 +10981,12 @@ app.whenReady().then(async () => {
       store.writeRecord(rec);
       mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId, projectId: profile.projectId });
     }
+    /* 连上、resume / 新起后端会话、记录都成了：连接时记下的「改用了备用模型」现在写 */
+    modelFallback.commit(sessionId);
     return { ok: true, freshBackend: freshBackendResult };
     } finally {
+      /* 没走到上面那一步（中途失败 / 被删）：记下的那句作废 */
+      modelFallback.discard(sessionId);
       attachingSessions.delete(sessionId);
       emitSessionBusy(sessionId);
     }
@@ -11294,7 +11382,7 @@ app.whenReady().then(async () => {
           if (!wrote?.ok) return { ok: false, error: wrote?.error || tr('Could not write to this file') };
           markTicketDone(input?.ticket);
           /* 窗口可能不在 —— 落盘这件事由主进程自己在会话里说一句 */
-          noteInSession(sessionId, tr('✅ Revised {what} as commented (now {chars} characters)\nFile: {path}\nKiroLex saved it to disk (backed up to ~/.kirolex/backups/review-files/ before writing).', { what: input?.label || tr('this file'), chars: fullText.length, path: wrote.path || apply.path }));
+          noteInSession(sessionId, tr('✅ Revised {what} as commented (now {chars} characters)\nFile: {path}\nBacked up to ~/.kirolex/backups/review-files/ before writing.', { what: input?.label || tr('this file'), chars: fullText.length, path: wrote.path || apply.path }));
           return { ok: true, text: out.text, scope: wantScope, written: true, fullText };
         }
         /* 回报实际走的那一档 —— 渲染端的「＋」靠它确认主进程认得 insert（旧主进程会把它当 block，回来的是改过的原文） */
@@ -11336,7 +11424,7 @@ app.whenReady().then(async () => {
       logger.info('revise', `in-session ${sessionId} scope=patch: ${res.changes.length} edit(s) in ${secs}s${res.written ? ', written' : ''}`);
       if (res.written) {
         markTicketDone(input?.ticket);
-        noteInSession(sessionId, tr('✅ Revised {what} as commented ({n} change(s), now {chars} characters)\nFile: {path}\nKiroLex saved it to disk (backed up to ~/.kirolex/backups/review-files/ before writing).', { what: input?.label || tr('this file'), n: res.changes.length, chars: res.fullText.length, path: res.path || apply!.path }));
+        noteInSession(sessionId, tr('✅ Revised {what} as commented ({n} change(s), now {chars} characters)\nFile: {path}\nBacked up to ~/.kirolex/backups/review-files/ before writing.', { what: input?.label || tr('this file'), n: res.changes.length, chars: res.fullText.length, path: res.path || apply!.path }));
       }
       return res;
     }
@@ -12045,7 +12133,7 @@ app.whenReady().then(async () => {
     if (busy) {
       /* 这一轮结束再重置：`pendingProjectReset` 由 prompt 的收尾去消化 */
       pendingProjectReset.add(sessionId);
-      sessionNotice(sessionId, tr('📁 Project changed to **{project}**. This turn is still running, so the executor (memory scope) will be reset after it finishes; the rest of this turn keeps the old scope.', { project: projectId || tr('Unassigned') }));
+      sessionNotice(sessionId, tr('Project changed to **{project}**; the memory scope switches after this turn ends.', { project: projectId || tr('Unassigned') }));
       logger.info('session', `移动项目 sessionId=${sessionId} -> ${projectId || '(未分组)'}（执行器重置推迟到本轮结束）`);
       return { sessionId, projectId: projectId ?? null, deferredReset: true };
     }

@@ -1059,8 +1059,8 @@ describe('切换一条已有会话的机器', () => {
     /* 上一版在 busy 时直接拒绝 —— 一条长回合跑着时什么都改不了，而那正是你想改设置的时候 */
     assert.equal(/throw new Error\('这一轮还在跑 —— 等它结束再切换机器/.test(body), false);
     assert.match(body, /const interrupted = !!oldEntry\?\.busy;/);
-    assert.match(body, /The switch interrupted the turn that was running/);
-    assert.match(body, /Everything it produced is kept/);
+    assert.match(body, /The switch interrupted the running turn/);
+    assert.match(body, /its output so far is kept/);
   });
 
 
@@ -1086,9 +1086,9 @@ describe('切换一条已有会话的机器', () => {
     assert.match(body, /rec\.profile = profile;/);
   });
 
-  test('要在会话里说清换到哪、以及"对话一条都没动"', () => {
-    assert.match(body, /From now on this session runs on \*\*\{where\}\*\*/);
-    assert.match(body, /the earlier conversation is untouched/);
+  test('要在会话里说清换到哪、以及"对话记录不变"（短的一句，放在详情里）', () => {
+    assert.match(body, /This session now runs on \*\*\{where\}\*\*/);
+    assert.match(body, /NOTE_DETAIL_SEP,\s*tr\('The backend session is new; the context goes along with your next message\. The conversation is unchanged\.'\)/);
   });
 
   test('右键菜单是**一个入口、右侧展开**（本地 / 各远端），当前位置打 ✓', () => {
@@ -1235,8 +1235,8 @@ describe('KiroLex 的提示走状态行；换项目不许杀掉正在跑的一�
   const CA = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/ChatArea.tsx'), 'utf8');
 
   test('提示只发事件、**不写进 transcript**', () => {
-    /* 第三个参数只带「复制到本机」的路径（远程会话落在远端的交付文件），照样只发事件 */
-    assert.match(M, /function sessionNotice\(sessionId: string, text: string, extra\?: \{ copyRemote\?: string\[\] \}\): void \{/);
+    /* 第三个参数只带「复制到本机」的路径（远程会话落在远端的交付文件）和同类提示的键（group），照样只发事件 */
+    assert.match(M, /function sessionNotice\(sessionId: string, text: string, extra\?: \{ copyRemote\?: string\[\]; group\?: string \}\): void \{/);
     assert.match(M, /mainWindow\?\.webContents\.send\('session:notice'/);
     /* 远程那几处（同步进度/冲突、agent 缺 MCP、模型降级、换机器、退回本地）都改走它了 */
     assert.ok((M.match(/sessionNotice\(/g) || []).length >= 6);

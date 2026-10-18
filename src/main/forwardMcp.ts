@@ -194,7 +194,7 @@ export function httpProbeNotice(name: string, error: string): string {
   const why = String(error || tr('Unknown error'));
   /* 老的中文前缀照认（localMcp 那边给的错误），英文界面下再认英文那个 */
   const msg = why.startsWith('本机→上游') || why.startsWith('Local→upstream') ? why : tr('Local→upstream ({name}) {why}', { name, why });
-  return tr('⚠️ The MCP "{name}" forwarded from this machine is unavailable right now: {msg}. This session still works, but calling its tools will fail with the same error. Fix the local config and reopen the session.', { name, msg });
+  return tr('⚠️ The MCP "{name}" forwarded from this machine is unavailable: {msg}. Fix the local config and reopen the session.', { name, msg });
 }
 
 /**

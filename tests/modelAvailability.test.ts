@@ -132,8 +132,8 @@ describe('模型可用性：清单、挑选、钉进 agent', () => {
     assert.match(M, /if \(sessionId && wanted && !available\.includes\(wanted\)\)/);
     /* 判据是那个签名：一个 Claude 都没有、`auto` 也没有 */
     assert.match(M, /const geoFiltered = !available\.some\(\(m\) => m\.startsWith\('claude-'\)\) && !available\.includes\('auto'\)/);
-    assert.match(M, /region filtering on your outbound IP/);
-    assert.match(M, /Switching kiro-cli versions won\\'t help/);
+    assert.match(M, /outbound IP is region-filtered/);
+    assert.match(M, /switching kiro-cli versions won\\'t help/);
     /* 签名不成立时不许乱归因 —— 归错因比不归因贵，人会照着错方向查 */
     assert.match(M, /不乱归因/);
   });
