@@ -84,7 +84,7 @@ export const ZH_SHELL: Record<string, string> = {
   'On: every turn carries the contents of ~/.kirolex/memory (about 1.3k characters), so rules like "every reply must…" hold on every turn. Off: the model sees none of this background.':
     '开：每一轮都带上 ~/.kirolex/memory 的内容（约 1.3k 字符），所以「每次回复都要…」这类规则每轮都成立。关：模型完全看不到这些背景。',
   'On: after an interruption you didn’t cause (executor dropped mid-turn, restart, watchdog), the turn is resent automatically (along with any steer it had already taken in; this uses quota), up to the "auto-retry attempts" limit; nothing is resent if you pressed Stop. Off: the turn stays where it is and you decide whether to resend it.':
-    '开：不是你停的中断（执行器中途断了、重启、看门狗）之后，自动重发那一轮（连同它已经吃进去的 steer；会消耗额度），最多重发「自动重试次数」那么多次，你按了停止就不重发。关：那一轮就留在原处，由你决定要不要重发。',
+    '开：不是你停的中断（执行器中途断了、重启、看门狗）之后，自动重发那一轮（连同它已经吃进去的追加指令；会消耗额度），最多重发「自动重试次数」那么多次，你按了停止就不重发。关：那一轮就留在原处，由你决定要不要重发。',
   'On: very long pastes are saved to ~/.kirolex/pastes and shown as a placeholder in the composer (a single line folds only past 4000 characters). Off: pastes always go straight into the composer.':
     '开：很长的粘贴内容存到 ~/.kirolex/pastes 并在输入框显示占位符（单行需超过 4000 字符才折叠）。关：粘贴内容一律直接进输入框。',
   'On: multiple queued messages are merged into one when sent. Off: they are sent one by one, each taking its own turn.':

@@ -126,7 +126,7 @@ const ZH_BASE: Record<string, string> = {
   'Edit': '编辑',
   'Fork': '分叉',
   'Rerun': '重跑',
-  'Steer': '引导',
+  'Steer': '追加指令',
   'Load earlier messages': '加载更早的消息',
   'Jump to latest': '回到最新',
   'Thinking': '思考',

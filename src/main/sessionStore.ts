@@ -49,6 +49,9 @@ export interface StoredMessage {
   ts: number;
   /** Append-only event: materialize this text into an earlier user message. */
   mergeIntoMessageId?: string;
+  /** Read-side only: the merge events `readTranscript` folded into this user message, in order,
+   *  so the view can show each steer as its own bubble again. `content` already includes them. */
+  steerParts?: { id: string; content: string; ts: number }[];
   /** File-changing tool calls produced during this assistant turn. */
   toolCalls?: StoredToolCall[];
   /** Files/images the user attached to THIS message. Persisted so the chips
@@ -619,6 +622,8 @@ function readTranscriptRaw(id: string): StoredMessage[] {
           if (target?.role === 'user') {
             target.content = `${target.content}
 ${message.content}`;
+            /* 记下这一段从哪开始 —— 界面按它把追加指令拆回独立的几条显示（content 照旧是合并后的） */
+            (target.steerParts ||= []).push({ id: message.id, content: message.content, ts: message.ts });
             continue;
           }
         }

@@ -1,6 +1,7 @@
 import type { Message } from './App';
 import { messageVariants, t, type Lang } from './i18n.ts';
 import { asVariants } from '../main/uiText.ts';
+import { asSteerParts } from './steerSplit.ts';
 
 /**
  * 「⚠️ 这条会话没连上：…」那条提示 —— 只在界面上，不落盘。
@@ -55,6 +56,7 @@ export const historyBeforeNotice = async (
       id: m.id, role: m.role, content: m.content,
       toolCalls: m.toolCalls, attachments: m.attachments,
       pastes: m.pastes, timestamp: m.ts,
+      ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
       ...(m.kirolex ? { kirolex: true as const } : {}),
       /* KiroLex 提示的中英两版 —— 漏了它，这条后台会话打开后提示就停在写下时的语言 */
       ...(asVariants(m.variants) ? { variants: asVariants(m.variants) } : {}),

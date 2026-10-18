@@ -404,6 +404,8 @@ export interface Message {
   kirolex?: true;
   /** 这句 KiroLex 提示的中英两版 —— 显示时按界面语言挑（`pickVariant`）；没有就显示 `content`。 */
   variants?: { zh: string; en: string };
+  /** 从盘上读回来时，折叠进这条用户消息的追加指令各段（`content` 已含它们）—— 只用来拆开显示，见 `steerSplit`。 */
+  steerParts?: { id: string; content: string; ts: number }[];
 }
 
 export interface ToolCall {

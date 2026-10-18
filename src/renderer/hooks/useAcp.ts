@@ -34,6 +34,7 @@ import type { ScheduleSpec } from '../../main/schedule';
 import type { ScheduleView } from '../scheduleView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
+import { asSteerParts, toStoredUserLines } from '../steerSplit';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
@@ -303,7 +304,8 @@ function autoResendKey(text: string): string {
 function toStoredTranscript(messages: Message[]) {
   return messages
     .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')))
-    .map((m) => ({
+    /* 从盘上读回来、折叠着追加指令的那条拆回「原消息 + mergeIntoMessageId 事件」写回去，下次读回来还能分开显示 */
+    .flatMap((m) => toStoredUserLines({
       id: m.id,
       role: m.role,
       content: m.content,
@@ -313,6 +315,7 @@ function toStoredTranscript(messages: Message[]) {
       ...((m as any).pastes?.length ? { pastes: (m as any).pastes } : {}),
       ...(m.kirolex ? { kirolex: true as const } : {}),
       ...(m.variants ? { variants: m.variants } : {}),
+      ...(m.steerParts ? { steerParts: m.steerParts } : {}),
     }));
 }
 
@@ -1590,6 +1593,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           pastes: (m as any).pastes,
           ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
+          ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
           timestamp: m.ts,
         }));
         messagesCacheRef.current.set(lastSid, restored);
@@ -1613,6 +1617,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             id: m.id, role: m.role, content: m.content,
             toolCalls: m.toolCalls, attachments: m.attachments,
             pastes: (m as any).pastes, timestamp: m.ts,
+            ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           }));
@@ -2975,6 +2980,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             attachments: m.attachments,
             pastes: m.pastes,
             ...(asVariants(m.variants) ? { variants: asVariants(m.variants) } : {}),
+            ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             timestamp: m.ts,
           }));
           // Only fill if nothing has been written to the fork meanwhile.
@@ -3096,6 +3102,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             pastes: (m as any).pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
+            ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(id) || [];
@@ -3202,6 +3209,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             pastes: (m as any).pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
+            ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(sessionId) || [];

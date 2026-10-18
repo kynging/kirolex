@@ -1575,6 +1575,25 @@ button, input, select, textarea {
   user-select: none;
 }
 
+/* A turn's original message + its steers: separate bubbles, grouped tightly so
+   they read as one turn. The steer tag sits in the bubble's action row. */
+.user-turn-group > .message.user:not(:last-child) {
+  margin-bottom: 6px;
+}
+
+.message.user .message-actions .steer-tag {
+  margin-right: 4px;
+  white-space: nowrap;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 16px;
+  color: #2f9e8f;
+  background: rgba(47, 158, 143, 0.12);
+  border: 1px solid rgba(47, 158, 143, 0.30);
+  user-select: none;
+}
+
 /* Collapsed-by-default block for long code/log/JSON pasted into a user message.
    Anchors the steer label the same way p.steer-paragraph does. */
 .message.user .message-content .steer-block-wrap {

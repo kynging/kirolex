@@ -30,6 +30,7 @@ import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { useSessionNotice } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
+import { userTurnBubbles } from '../steerSplit';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // Scheduling replaced loop mode. `schedule.ts` lives under src/main because the DRIVER
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
@@ -1096,11 +1097,14 @@ const CollapsibleUserBlock = memo<{ content: string }>(({ content }) => {
 });
 CollapsibleUserBlock.displayName = 'CollapsibleUserBlock';
 
-// Renders a turn's original user message and every mid-turn steer as one
-// continuous paragraph in one bubble. The underlying steer messages and ids
-// remain separate for pending/rollback/consume/queue-fallback bookkeeping, but
-// the UI exposes one timestamp, one Copy action, and one Fork action for the
-// whole turn. Fork still targets the last steer id so its history is complete.
+// Renders a turn's original user message and every mid-turn steer. Each steer is
+// its OWN bubble right after the original (own time, own Copy, an "追加指令" tag),
+// grouped tightly with it; the reply below still belongs to the whole turn. The
+// underlying steer messages and ids are untouched (pending/rollback/consume/
+// queue-fallback bookkeeping), and Fork still targets the last steer id.
+// Exception: the turn that was interrupted and awaits an overwrite from the
+// composer (`merged`) renders as ONE bubble -- that combined text is exactly what
+// the rerun will send, so it is shown as one message.
 const UserGroupItem = memo<{
   base: Message;
   steers: Message[];
@@ -1109,46 +1113,38 @@ const UserGroupItem = memo<{
   /** The turn was interrupted and awaits an overwrite from the composer -- per
    *  message Rerun is intentionally blocked in that state. */
   interrupted?: boolean;
+  /** This group IS that interrupted turn: show original + steers as one bubble. */
+  merged?: boolean;
   isLooping: boolean;
   onScheduleSetup: (text: string) => void;
   /** Needed to read an image attachment back from disk for its thumbnail. */
   attachmentSessionId?: string | null;
   onOpenAttachment?: (path: string) => void;
-}>(({ base, steers, isStreaming, onRerun, isLooping, onScheduleSetup, interrupted, attachmentSessionId, onOpenAttachment }) => {
+}>(({ base, steers, isStreaming, onRerun, isLooping, onScheduleSetup, interrupted, merged, attachmentSessionId, onOpenAttachment }) => {
   const t = useT();
-  const [copied, setCopied] = useState(false);
+  const [copiedId, setCopiedId] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
-  // Each entry keeps an isSteer flag so a mid-turn steer paragraph can carry a
-  // small left marker in the bubble, while the original question does not. The
-  // group shows a single timestamp + Copy/Edit (Fork lives on the reply).
-  const paragraphs = useMemo(() => {
-    const out: { text: string; isSteer: boolean }[] = [];
-    const b = base.content.trim();
-    if (b) out.push({ text: b, isSteer: false });
-    for (const steer of steers) {
-      const t = steer.content.trim();
-      if (t) out.push({ text: t, isSteer: true });
-    }
-    return out;
-  }, [base.content, steers]);
+  // One entry per bubble (original first, then each steer -- in-memory ones, or
+  // the boundaries readTranscript recorded for steers folded on disk).
+  const bubbles = useMemo(() => userTurnBubbles(base, steers), [base, steers]);
+  // Each entry keeps an isSteer flag so, in the merged bubble, a steer paragraph
+  // can carry a small left marker while the original question does not.
+  const paragraphs = useMemo(
+    () => bubbles.filter((b) => b.text).map((b) => ({ text: b.text, isSteer: b.isSteer })),
+    [bubbles],
+  );
   const combinedText = useMemo(() => paragraphs.map((p) => p.text).join('\n\n'), [paragraphs]);
   // Editor draft joins paragraphs with a single newline so previously-steered
   // turns don't show the display-only blank-line spacing inside the textarea.
   const draftText = useMemo(() => paragraphs.map((p) => p.text).join('\n'), [paragraphs]);
-  const attachments = useMemo(
-    () => [
-      ...(base.attachments || []),
-      ...steers.flatMap((steer) => steer.attachments || []),
-    ],
-    [base.attachments, steers],
-  );
+  const attachments = useMemo(() => bubbles.flatMap((b) => b.attachments || []), [bubbles]);
 
-  const copyMessage = useCallback(async () => {
-    await navigator.clipboard.writeText(combinedText);
-    setCopied(true);
-    window.setTimeout(() => setCopied(false), 1500);
-  }, [combinedText]);
+  const copyText = useCallback(async (id: string, text: string) => {
+    await navigator.clipboard.writeText(text);
+    setCopiedId(id);
+    window.setTimeout(() => setCopiedId((cur) => (cur === id ? null : cur)), 1500);
+  }, []);
 
   const beginEdit = useCallback(() => {
     setDraft(draftText);
@@ -1172,30 +1168,169 @@ const UserGroupItem = memo<{
     requestAnimationFrame(() => revealInContainer(editActionsRef.current));
   }, [editing]);
 
+  // Attachments belong ABOVE the text: they are the context the message
+  // refers to, so the reader sees the files/images first.
+  const renderAttachments = (files: AttachedFile[]) => files.length > 0 && (
+    <div className="message-attachments">
+      {files.map((file) => (
+        <div
+          key={file.id}
+          className={`message-attachment-item${file.isImage ? ' image' : ''}`}
+          title={file.path}
+        >
+          {file.isImage ? (
+            <AttachmentThumb file={file} sessionId={attachmentSessionId ?? null} onOpen={onOpenAttachment} />
+          ) : (
+            <span className="message-attachment-icon">
+              {file.path.endsWith('/') || file.path.endsWith('\\') || !file.name.includes('.') ? '📁' : '📄'}
+            </span>
+          )}
+          <span className="message-attachment-name">{file.name}</span>
+        </div>
+      ))}
+    </div>
+  );
+
+  const renderParagraph = (paragraph: { text: string; isSteer: boolean }, key: string) => {
+    // A `[ 粘贴 #N · M 行 ]` placeholder is authoritative: this text WAS pasted,
+    // so it folds by provenance and needs no content guessing at all.
+    const pasteBlocks = base.pastes || [];
+    if (pasteBlocks.length && PASTE_PLACEHOLDER_RE.test(paragraph.text)) {
+      PASTE_PLACEHOLDER_RE.lastIndex = 0;
+      const parts: React.ReactNode[] = [];
+      let last = 0;
+      let m: RegExpExecArray | null;
+      while ((m = PASTE_PLACEHOLDER_RE.exec(paragraph.text))) {
+        const lead = paragraph.text.slice(last, m.index);
+        if (lead.trim()) parts.push(<p key={`${key}:t${last}`}>{withPathLinks(lead, `${key}:t${last}`)}</p>);
+        const seq = Number(m[1]);
+        const blk = pasteBlocks.find((b) => b.seq === seq)
+          || { seq, lines: Number(m[2]) || 0, chars: 0, path: '' };
+        parts.push(<PastedBlockView key={`${key}:p${seq}`} block={blk} />);
+        last = m.index + m[0].length;
+      }
+      const tail = paragraph.text.slice(last);
+      if (tail.trim()) parts.push(<p key={`${key}:tail`}>{withPathLinks(tail, `${key}:tail`)}</p>);
+      return <React.Fragment key={key}>{parts}</React.Fragment>;
+    }
+    // Long pasted code/log/JSON collapses into a click-to-expand block;
+    // any leading prose (the user's question/intro) stays visible, and
+    // short text (incl. all steer prose) keeps its existing rendering.
+    if (looksLikeCodeOrData(paragraph.text)) {
+      const { head, block } = splitProseAndBlock(paragraph.text);
+      const label = paragraph.isSteer ? (
+        <span className="steer-side-label" title={t('Steered into the running turn')}>{t('Steer')}</span>
+      ) : null;
+      if (head) {
+        return (
+          <React.Fragment key={key}>
+            <p className={paragraph.isSteer ? 'steer-paragraph' : undefined}>
+              {label}
+              {withPathLinks(head, key)}
+            </p>
+            <CollapsibleUserBlock content={block} />
+          </React.Fragment>
+        );
+      }
+      return paragraph.isSteer ? (
+        <div key={key} className="steer-paragraph steer-block-wrap">
+          {label}
+          <CollapsibleUserBlock content={block} />
+        </div>
+      ) : (
+        <CollapsibleUserBlock key={key} content={block} />
+      );
+    }
+    return paragraph.isSteer ? (
+      <p key={key} className="steer-paragraph">
+        <span className="steer-side-label" title={t('Steered into the running turn')}>{t('Steer')}</span>
+        {withPathLinks(paragraph.text, key)}
+      </p>
+    ) : (
+      <p key={key}>{withPathLinks(paragraph.text, key)}</p>
+    );
+  };
+
+  const renderTime = (timestamp: number) => (
+    <time
+      className="message-time"
+      dateTime={new Date(timestamp).toISOString()}
+      title={new Date(timestamp).toLocaleString()}
+    >
+      {formatMessageTime(timestamp)}
+    </time>
+  );
+
+  const renderCopy = (id: string, text: string) => (
+    <button
+      className="message-action-btn"
+      onClick={() => void copyText(id, text)}
+      title={copiedId === id ? t('Copied!') : t('Copy')}
+      aria-label={copiedId === id ? t('Copied!') : t('Copy message')}
+    >
+      {copiedId === id ? '✓' : <IconCopy size={14} />}
+    </button>
+  );
+
+  // Schedule + Edit act on the whole turn, so they sit on the original only.
+  const turnActions = (
+    <>
+      <button
+        className="message-action-btn schedule-message-action"
+        onClick={() => onScheduleSetup(combinedText)}
+        // NOT disabled during a turn. Inherited from the 🔁 loop button, where starting a loop
+        // mid-turn genuinely conflicted (the renderer drove those sends). Creating a SCHEDULE
+        // sends nothing now — it writes one record and main's ticker fires it later — so the
+        // guard only enforced "wait for the reply before you may schedule anything".
+        // Empty text still cannot be scheduled: there would be no prompt to send.
+        disabled={!combinedText.trim()}
+        title={t('Send this message again on a schedule')}
+        aria-label={t('Make it a scheduled job')}
+      >
+        ⏰
+      </button>
+      <button
+        className="message-action-btn"
+        onClick={beginEdit}
+        disabled={isLooping || interrupted}
+        title={isLooping
+          ? t('A loop is running — stop it first')
+          : interrupted
+          ? t('This turn was interrupted — resubmit below; the new message replaces it')
+          : t('Edit and rerun')}
+        aria-label={t('Edit and rerun')}
+      >
+        <IconEdit size={14} />
+      </button>
+    </>
+  );
+
+  if (!merged && !editing) {
+    return (
+      <div className="user-turn-group">
+        {bubbles.map((bubble) => (
+          <div key={bubble.id} className={`message user${bubble.isSteer ? ' steer-message' : ''}`}>
+            {renderAttachments(bubble.attachments || [])}
+            <div className="message-content">
+              {bubble.text ? renderParagraph({ text: bubble.text, isSteer: false }, `${bubble.id}:paragraph`) : null}
+            </div>
+            <div className="message-actions">
+              {bubble.isSteer && (
+                <span className="steer-tag" title={t('Steered into the running turn')}>{t('Steer')}</span>
+              )}
+              {renderTime(bubble.timestamp)}
+              {renderCopy(bubble.id, bubble.text)}
+              {!bubble.isSteer && turnActions}
+            </div>
+          </div>
+        ))}
+      </div>
+    );
+  }
+
   return (
     <div className="message user">
-      {/* Attachments belong ABOVE the text: they are the context the message
-          refers to, so the reader sees the files/images first. */}
-      {attachments.length > 0 && (
-        <div className="message-attachments">
-          {attachments.map((file) => (
-            <div
-              key={file.id}
-              className={`message-attachment-item${file.isImage ? ' image' : ''}`}
-              title={file.path}
-            >
-              {file.isImage ? (
-                <AttachmentThumb file={file} sessionId={attachmentSessionId ?? null} onOpen={onOpenAttachment} />
-              ) : (
-                <span className="message-attachment-icon">
-                  {file.path.endsWith('/') || file.path.endsWith('\\') || !file.name.includes('.') ? '📁' : '📄'}
-                </span>
-              )}
-              <span className="message-attachment-name">{file.name}</span>
-            </div>
-          ))}
-        </div>
-      )}
+      {renderAttachments(attachments)}
       <div className={`message-content ${editing ? 'editing' : ''}`}>
         {editing ? (
           <textarea
@@ -1215,66 +1350,7 @@ const UserGroupItem = memo<{
             autoFocus
             rows={Math.max(3, Math.min(12, draft.split('\n').length + 1))}
           />
-        ) : paragraphs.map((paragraph, index) => {
-          const key = `${base.id}:paragraph:${index}`;
-          // A `[ 粘贴 #N · M 行 ]` placeholder is authoritative: this text WAS pasted,
-          // so it folds by provenance and needs no content guessing at all.
-          const pasteBlocks = base.pastes || [];
-          if (pasteBlocks.length && PASTE_PLACEHOLDER_RE.test(paragraph.text)) {
-            PASTE_PLACEHOLDER_RE.lastIndex = 0;
-            const parts: React.ReactNode[] = [];
-            let last = 0;
-            let m: RegExpExecArray | null;
-            while ((m = PASTE_PLACEHOLDER_RE.exec(paragraph.text))) {
-              const lead = paragraph.text.slice(last, m.index);
-              if (lead.trim()) parts.push(<p key={`${key}:t${last}`}>{withPathLinks(lead, `${key}:t${last}`)}</p>);
-              const seq = Number(m[1]);
-              const blk = pasteBlocks.find((b) => b.seq === seq)
-                || { seq, lines: Number(m[2]) || 0, chars: 0, path: '' };
-              parts.push(<PastedBlockView key={`${key}:p${seq}`} block={blk} />);
-              last = m.index + m[0].length;
-            }
-            const tail = paragraph.text.slice(last);
-            if (tail.trim()) parts.push(<p key={`${key}:tail`}>{withPathLinks(tail, `${key}:tail`)}</p>);
-            return <React.Fragment key={key}>{parts}</React.Fragment>;
-          }
-          // Long pasted code/log/JSON collapses into a click-to-expand block;
-          // any leading prose (the user's question/intro) stays visible, and
-          // short text (incl. all steer prose) keeps its existing rendering.
-          if (looksLikeCodeOrData(paragraph.text)) {
-            const { head, block } = splitProseAndBlock(paragraph.text);
-            const label = paragraph.isSteer ? (
-              <span className="steer-side-label" title={t('Steered into the running turn')}>{t('Steer')}</span>
-            ) : null;
-            if (head) {
-              return (
-                <React.Fragment key={key}>
-                  <p className={paragraph.isSteer ? 'steer-paragraph' : undefined}>
-                    {label}
-                    {withPathLinks(head, key)}
-                  </p>
-                  <CollapsibleUserBlock content={block} />
-                </React.Fragment>
-              );
-            }
-            return paragraph.isSteer ? (
-              <div key={key} className="steer-paragraph steer-block-wrap">
-                {label}
-                <CollapsibleUserBlock content={block} />
-              </div>
-            ) : (
-              <CollapsibleUserBlock key={key} content={block} />
-            );
-          }
-          return paragraph.isSteer ? (
-            <p key={key} className="steer-paragraph">
-              <span className="steer-side-label" title={t('Steered into the running turn')}>{t('Steer')}</span>
-              {withPathLinks(paragraph.text, key)}
-            </p>
-          ) : (
-            <p key={key}>{withPathLinks(paragraph.text, key)}</p>
-          );
-        })}
+        ) : paragraphs.map((paragraph, index) => renderParagraph(paragraph, `${base.id}:paragraph:${index}`))}
       </div>
       {editing && (
         <div className="message-edit-actions" ref={editActionsRef}>
@@ -1283,52 +1359,14 @@ const UserGroupItem = memo<{
         </div>
       )}
       <div className="message-actions">
-        <time
-          className="message-time"
-          dateTime={new Date(base.timestamp).toISOString()}
-          title={new Date(base.timestamp).toLocaleString()}
-        >
-          {formatMessageTime(base.timestamp)}
-        </time>
-        <button
-          className="message-action-btn"
-          onClick={() => void copyMessage()}
-          title={copied ? t('Copied!') : t('Copy')}
-          aria-label={copied ? t('Copied!') : t('Copy message')}
-        >
-          {copied ? '✓' : <IconCopy size={14} />}
-        </button>
-        <button
-          className="message-action-btn schedule-message-action"
-          onClick={() => onScheduleSetup(combinedText)}
-          // NOT disabled during a turn. Inherited from the 🔁 loop button, where starting a loop
-          // mid-turn genuinely conflicted (the renderer drove those sends). Creating a SCHEDULE
-          // sends nothing now — it writes one record and main's ticker fires it later — so the
-          // guard only enforced "wait for the reply before you may schedule anything".
-          // Empty text still cannot be scheduled: there would be no prompt to send.
-          disabled={!combinedText.trim()}
-          title={t('Send this message again on a schedule')}
-          aria-label={t('Make it a scheduled job')}
-        >
-          ⏰
-        </button>
-        <button
-          className="message-action-btn"
-          onClick={beginEdit}
-          disabled={isLooping || interrupted}
-          title={isLooping
-            ? t('A loop is running — stop it first')
-            : interrupted
-            ? t('This turn was interrupted — resubmit below; the new message replaces it')
-            : t('Edit and rerun')}
-          aria-label={t('Edit and rerun')}
-        >
-          <IconEdit size={14} />
-        </button>
+        {renderTime(base.timestamp)}
+        {renderCopy(base.id, combinedText)}
+        {turnActions}
       </div>
     </div>
   );
 });
+UserGroupItem.displayName = 'UserGroupItem';
 
 // Isolated input component: does NOT receive `messages` prop, so it never re-renders due to streaming chunks. This is the primary fix for input lag.
 /**
@@ -3503,7 +3541,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   // Group each turn's original user message with the mid-turn steers injected
   // into the SAME turn (consecutive user messages carrying a `steer` flag). The
-  // group renders as one bubble; an assistant message carries the COMBINED text
+  // group renders as adjacent bubbles (see UserGroupItem); an assistant message carries the COMBINED text
   // (original + all steers) of its preceding user group so the token estimate
   // reflects the whole question, not just the last steer. Render-layer only —
   // message ordering/ids in state are untouched.
@@ -3513,8 +3551,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     | { kind: 'assistant'; segments: Message[]; isLast: boolean; question: string };
   // Heal stranded steers before grouping: a steer that ended up AFTER this
   // turn's assistant/tool messages (ordering slip, or restored history) is moved
-  // back next to its base user message, so it renders as a Steer paragraph in
-  // the same bubble instead of a lone orphan bubble without the Steer label.
+  // back next to its base user message, so it renders as a Steer bubble in the
+  // same group instead of a lone orphan bubble without the Steer label.
   const orderedMessages = useMemo<Message[]>(() => {
     /*
       KiroLex 自己写进会话的那几句（换模型、排队、改写落盘、循环结束…）存了中英两版（`variants`）——
@@ -3589,6 +3627,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }
     return groups;
   }, [orderedMessages]);
+  // The interrupted turn the next composer submit overwrites is the LAST base user
+  // message (same anchor as markTurnInterrupted). Only that group shows its
+  // original + steers merged into one bubble; earlier turns keep them separate.
+  const interruptedBaseId = useMemo(() => {
+    for (let i = renderGroups.length - 1; i >= 0; i--) {
+      const g = renderGroups[i];
+      if (g.kind === 'user' && !g.base.steer) return g.base.id;
+    }
+    return null;
+  }, [renderGroups]);
 
   /**
    * 清空过上下文的会话，**默认只显示清空之后的部分** ——
@@ -3957,6 +4005,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               attachmentSessionId={currentSessionId}
               onOpenAttachment={openPathInApp}
               interrupted={!!turnInterrupted}
+              merged={!!turnInterrupted && group.base.id === interruptedBaseId}
               isLooping={isLooping}
               onScheduleSetup={openScheduleSetup}
             />
