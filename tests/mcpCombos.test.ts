@@ -337,9 +337,10 @@ describe('接线（源码扫描）', () => {
     assert.match(fn, /if \(r\.notice\) sessionNotice\(sessionId, r\.notice\);/);
   });
 
-  test('换组合：回复中拒绝，先起新的再断旧的', () => {
-    const h = M.slice(M.indexOf("ipcMain.handle('acp:switch-mcp-combo'"));
-    assert.match(h.slice(0, 2000), /if \(oldEntry\.busy\) throw/);
+  test('换组合：回复中不拒绝、记成 pending 跑完再换（pendingSwitch.ts），先起新的再断旧的', () => {
+    /* 实现抽成了 switchMcpComboImpl（忙时记下的切换跑完后也走它） */
+    const h = M.slice(M.indexOf('const switchMcpComboImpl = async'));
+    assert.match(h.slice(0, 2000), /queueSwitchWhileBusy\(sessionId, 'combo'/);
     assert.ok(h.indexOf('client.newSession(') < h.indexOf('oldEntry.client.disconnect()'));
   });
 });

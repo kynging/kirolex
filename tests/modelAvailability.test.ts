@@ -277,7 +277,7 @@ describe('远程会话的模型回退按那台机器的清单', () => {
     const all = M.match(/await connectWithModelFallback\([^;]*\);/g) || [];
     const calls = all.filter((c) => !c.includes("'switch-mcp-combo'"));
     assert.equal(all.length - calls.length, 1);
-    const combo = M.slice(M.indexOf("ipcMain.handle('acp:switch-mcp-combo'"), M.indexOf("'switch-mcp-combo', localTools"));
+    const combo = M.slice(M.indexOf('const switchMcpComboImpl = async'), M.indexOf("'switch-mcp-combo', localTools"));
     assert.match(combo, /if \(engineOf\(oldEntry\.profile\) === 'kiro'\) throw/);
     assert.equal(calls.length, 3, '新建 / 换引擎 / attach');
     for (const c of calls) assert.match(c, /, remoteModels\);$/, `没传远端清单：${c}`);

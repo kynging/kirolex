@@ -182,4 +182,15 @@ export const ZH_INDEX_B: Record<string, string> = {
   'This session belongs to KiroLex Advanced; the standard edition does not modify it.': '这条会话属于 KiroLex Advanced（流程 / skill），标准版不显示也不改它。',
   'This project belongs to KiroLex Advanced; the standard edition does not modify it.': '这个项目属于 KiroLex Advanced（流程项目），标准版不显示也不改它。',
   "Could not read this backup's record.json, so it is not restored (it might be a KiroLex Advanced session). Try again later.": '读不出这份备份的 record.json，确认不了它是不是 KiroLex Advanced 的会话，所以没有恢复。请稍后再试。',
+  /* 忙时切换：这一轮跑完再切（pendingSwitch.ts） */
+  'Run location': '运行位置',
+  'Engine': '引擎',
+  'Combo': '组合',
+  'Agent': 'Agent',
+  'Model': '模型',
+  'Effort': '思考强度',
+  'Permission mode': '权限模式',
+  ', ': '、',
+  '✅ This turn finished, so the switch you picked while it was running is now applied: {list}': '✅ 这一轮跑完了，刚才忙时选的切换已经生效：{list}',
+  '⚠️ The switch you picked while the turn was running did not take effect: {list}. The session keeps its current setting.': '⚠️ 刚才忙时选的切换没能生效：{list}。会话保持原来的设置。',
 };

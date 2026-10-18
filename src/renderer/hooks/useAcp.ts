@@ -4436,11 +4436,59 @@ ${text}`,
     );
   }, []);
 
+  /**
+   * **忙时记下、这一轮跑完再切的切换**（主进程 `pendingSwitch.ts`）：`{ [sessionId]: { kind: 新值 } }`。
+   * 下拉框显示新值并标「⏳ 这一轮跑完后切换」；应用完（或失败）由 `acp:pending-switch-result` 带回实际值回填。
+   * 内存态在主进程，窗口重载后从 `getPendingSwitches` 补。
+   */
+  const [pendingSwitches, setPendingSwitches] = useState<Record<string, Record<string, string>>>({});
+  useEffect(() => {
+    const api = window.kiroApi as any;
+    void api?.getPendingSwitches?.().then((all: any) => { if (all && typeof all === 'object') setPendingSwitches(all); }).catch(() => {});
+    const offPending = api?.onPendingSwitches?.((d: { sessionId: string; pending: Record<string, string> }) => {
+      setPendingSwitches((prev) => ({ ...prev, [d.sessionId]: d.pending || {} }));
+    });
+    const offResult = api?.onPendingSwitchResult?.((d: { sessionId: string; profile: any; pending: Record<string, string> }) => {
+      setPendingSwitches((prev) => ({ ...prev, [d.sessionId]: d.pending || {} }));
+      const prof = d.profile;
+      if (!prof) return;
+      /* 实际生效的值回填（失败的那几类就是原来的值，界面跟着回退） */
+      if (prof.engine === 'kiro' && prof.model) sessionModelRef.current.set(d.sessionId, prof.model);
+      setSessions((prev) => prev.map((session) => (session.id === d.sessionId
+        ? {
+          ...session,
+          kiroAgent: prof.kiroAgent || undefined,
+          permissionMode: prof.permissionMode,
+          ...(prof.engine === 'kiro' && prof.model ? { model: prof.model } : {}),
+        }
+        : session)));
+    });
+    return () => { try { offPending?.(); offResult?.(); } catch { /* 卸载 */ } };
+  }, []);
+  const cancelPendingSwitch = useCallback(async (sessionId: string, kind?: string) => {
+    try {
+      const r = await (window.kiroApi as any).cancelPendingSwitch(sessionId, kind);
+      setPendingSwitches((prev) => ({ ...prev, [sessionId]: r?.pending || {} }));
+    } catch (err: any) {
+      noteError(sessionId, err?.message || String(err));
+    }
+  }, []);
+
   // Switch the named kiro-cli agent for one session. The main process starts a
   // replacement executor before retiring the old one, while the renderer shows
   // the normal connecting state and persists the selected agent per session.
   const changeSessionAgent = useCallback(async (sessionId: string, kiroAgent: string) => {
     if (!sessionId || sessionId.startsWith('pending_')) return;
+    /* 这一轮还在跑：主进程只是记下来（pending），跑完再切 —— 别把界面标成"连接中"、也别清命令表 */
+    if (streamingIdsRef.current.has(sessionId)) {
+      try {
+        const r = await window.kiroApi.switchKiroAgent(sessionId, kiroAgent);
+        /* 主进程那一轮其实刚结束：当场就切了（不是 pending）—— 按确认的值回填 */
+        if (r?.ok && !r.pending) setSessions((prev) => prev.map((session) => (session.id === sessionId ? { ...session, kiroAgent: r.kiroAgent || undefined } : session)));
+      }
+      catch (err: any) { noteError(sessionId, err?.message || t('Failed to switch agent')); }
+      return;
+    }
     commandsMapRef.current.delete(sessionId);
     if (sessionId === currentSessionRef.current) setCommands([]);
     markConnecting(sessionId);
@@ -4462,7 +4510,8 @@ ${text}`,
         catch (e: any) { console.warn('[kirolex] 换 agent 前挂起失败（改动会记在下次挂起时生效）:', e?.message || e); }
       }
       const result = await window.kiroApi.switchKiroAgent(sessionId, kiroAgent);
-      if (result?.ok) {
+      /* 主进程那边其实还忙（界面还没收到 streaming）：记成了 pending，实际值等 acp:pending-switch-result */
+      if (result?.ok && !result.pending) {
         setSessions((prev) => prev.map((session) => (
           session.id === sessionId
             ? { ...session, kiroAgent: result.kiroAgent || undefined }
@@ -4484,6 +4533,19 @@ ${text}`,
   // applies atomically to the next message.
   const changeSessionModel = useCallback(async (sessionId: string, model: string) => {
     if (!sessionId || sessionId.startsWith('pending_')) return;
+    /* 这一轮还在跑：主进程只是记下来（pending），跑完再切；实际值等 acp:pending-switch-result 回填 */
+    if (streamingIdsRef.current.has(sessionId)) {
+      let r: Awaited<ReturnType<typeof window.kiroApi.switchModel>>;
+      try { r = await window.kiroApi.switchModel(sessionId, model); }
+      catch (err: any) { noteError(sessionId, err?.message || t('Failed to switch model')); throw err; }
+      /* 主进程那一轮其实刚结束：当场就切了（不是 pending）—— 按确认的值回填 */
+      if (r?.ok && !r.pending && r.model) {
+        sessionModelRef.current.set(sessionId, r.model);
+        setSessions((prev) => prev.map((session) => (session.id === sessionId ? { ...session, model: r.model } : session)));
+        return r.model as string;
+      }
+      return undefined;
+    }
     markConnecting(sessionId);
     reconfiguringRef.current.add(sessionId); // block disconnect auto-recovery
     try {
@@ -4502,6 +4564,7 @@ ${text}`,
       if (!result?.ok) {
         throw new Error(t('Model switch did not take effect (the backend is still using {model}). Please retry or pick another model.', { model: String(modelForSession(sessionId)) }));
       }
+      if (result.pending) return undefined;
       sessionModelRef.current.set(sessionId, result.model);
       setSessions((prev) => prev.map((session) => (
         session.id === sessionId ? { ...session, model: result.model } : session
@@ -4528,7 +4591,7 @@ ${text}`,
     if (!sessionId || sessionId.startsWith('pending_')) return;
     try {
       const result = await window.kiroApi.switchPermissionMode(sessionId, permissionMode);
-      if (result?.ok) {
+      if (result?.ok && !result.pending) {
         setSessions((prev) => prev.map((session) => (
           session.id === sessionId
             ? { ...session, permissionMode: result.permissionMode }
@@ -4814,6 +4877,8 @@ ${text}`,
   return {
     status,
     errorBySession,
+    pendingSwitches,
+    cancelPendingSwitch,
     /** Dismiss ONE chat's banner. Takes the id because the banner is per chat now. */
     clearSessionError: (sid?: string | null) => noteError(sid ?? null, null),
     sessions,

@@ -3983,6 +3983,35 @@ button, input, select, textarea {
   font-size: 10px;
 }
 
+/* 「⏳ 这一轮跑完后切换 ✕」：忙时选的切换，跑完再切（main/pendingSwitch.ts） */
+.composer-pending-switch {
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  flex-shrink: 0;
+  padding: 1px 4px 1px 7px;
+  border: 1px dashed var(--border);
+  border-radius: 999px;
+  font-size: 11px;
+  white-space: nowrap;
+  color: var(--text-secondary, inherit);
+}
+
+.composer-pending-switch-cancel {
+  border: none;
+  background: transparent;
+  padding: 0 3px;
+  font-size: 11px;
+  line-height: 1;
+  cursor: pointer;
+  color: inherit;
+  opacity: 0.7;
+}
+
+.composer-pending-switch-cancel:hover {
+  opacity: 1;
+}
+
 /* Auto/Ask permission mode pill inside the composer toolbar. */
 .composer-mode {
   display: inline-flex;

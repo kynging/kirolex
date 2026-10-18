@@ -386,7 +386,7 @@ describe('断开时杀掉整棵远端进程树', () => {
 
   test('换模型必须先放锁再加载 —— 所以"先起新的"这条路走不通，得靠杀干净', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    const at = M.indexOf("ipcMain.handle('acp:switch-model'");
+    const at = M.indexOf('const switchModelImpl = async'); // acp:switch-model 的实现
     const body = M.slice(at, at + 3000);
     /* kiro-cli 的会话是单进程独占的：同一个 cliSessionId 不可能同时被两个进程 load */
     assert.match(body, /Session is active in another process/);

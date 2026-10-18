@@ -129,8 +129,9 @@ describe('接线（源码扫描）', () => {
   });
 
   test('切换组合时新执行器起不来：旧执行器的工具通道已被换掉，要把它收掉（下一条消息按原组合重接），不能留一条工具全失效的会话', () => {
-    const h = M.indexOf("ipcMain.handle('acp:switch-mcp-combo'");
-    const handler = M.slice(h, M.indexOf('\n  });\n', h));
+    /* acp:switch-mcp-combo 的实现抽成了 switchMcpComboImpl（忙时记下的切换跑完后也走它） */
+    const h = M.indexOf('const switchMcpComboImpl = async');
+    const handler = M.slice(h, M.indexOf('\n  };\n', h));
     const tools = handler.indexOf('await ensureLocalTools(');
     const flag = handler.indexOf('toolsSwapped = !!profile.remote?.sshHost;');
     assert.ok(flag > 0 && flag < tools, '要在换通道之前记下"通道换了"');

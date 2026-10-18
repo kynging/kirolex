@@ -175,9 +175,14 @@ declare global {
       listKiroAgents: (machine?: string) => Promise<{ agents: Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>; error?: string }>;
       openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => Promise<{ opened: boolean; path?: string; content?: string; error?: string }>;
       saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => Promise<{ saved: boolean; path?: string; error?: string }>;
-      switchKiroAgent: (sessionId: string, agentName: string) => Promise<{ ok: boolean; kiroAgent: string; dormant?: boolean }>;
-      switchModel: (sessionId: string, model: string) => Promise<{ ok: boolean; model: string; dormant?: boolean }>;
-      switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') => Promise<{ ok: boolean; permissionMode: 'auto-approve' | 'ask'; dormant?: boolean }>;
+      /* `pending: true` = 这一轮还在跑，主进程记下来了，跑完再切（见 main/pendingSwitch.ts） */
+      switchKiroAgent: (sessionId: string, agentName: string) => Promise<{ ok: boolean; kiroAgent: string; dormant?: boolean; pending?: boolean }>;
+      switchModel: (sessionId: string, model: string) => Promise<{ ok: boolean; model: string; dormant?: boolean; pending?: boolean }>;
+      switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') => Promise<{ ok: boolean; permissionMode: 'auto-approve' | 'ask'; dormant?: boolean; pending?: boolean }>;
+      getPendingSwitches?: (sessionId?: string) => Promise<Record<string, Record<string, string>>>;
+      cancelPendingSwitch?: (sessionId: string, kind?: string) => Promise<{ ok: boolean; cancelled: boolean; pending: Record<string, string> }>;
+      onPendingSwitches?: (cb: (d: { sessionId: string; pending: Record<string, string> }) => void) => () => void;
+      onPendingSwitchResult?: (cb: (d: { sessionId: string; applied: string[]; failed: Array<{ kind: string; label: string; error: string }>; profile: any; pending: Record<string, string> }) => void) => () => void;
       deleteSession: (sessionId: string) => Promise<{ ok: boolean; tombstoned?: boolean; error?: string }>;
       assignProject: (sessionId: string, projectId: string) => Promise<{ sessionId: string; projectId: string }>;
       setProject: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
@@ -855,6 +860,8 @@ const App: React.FC = () => {
     changeSessionModel,
     changeSessionAgent,
     changeSessionPermissionMode,
+    pendingSwitches,
+    cancelPendingSwitch,
     assignProject,
     moveSession,
     reorderSessions,
@@ -2749,24 +2756,33 @@ const App: React.FC = () => {
 
   const handleModelChange = useCallback(async (model: string, paneSid?: string) => {
     const sid = paneSid || currentSessionId;
+    /* 这一轮还在跑（包括循环里的一轮）也能选 —— 主进程记成 pending，这一轮跑完、下一轮开始前切（见 main/pendingSwitch.ts） */
     if (
       !sid ||
-      streamingIds.includes(sid) ||
-      loopingIds.includes(sid) ||
       switchingModelIds.includes(sid)
     ) return;
+    const pendingModel = pendingSwitches[sid]?.model;
+    if (pendingModel !== undefined) {
+      if (model === pendingModel) return;
+      /* 选回现在实际在用的那个 = 不切了：取消 pending */
+      const actual = sessions.find((x) => x.id === sid)?.model;
+      if (model === actual) { await cancelPendingSwitch(sid, 'model'); return; }
+    }
 
     setSwitchingModelIds((prev) => (prev.includes(sid) ? prev : [...prev, sid]));
     try {
-      const effective = (await changeSessionModel(sid, model)) || model;
+      const confirmed = await changeSessionModel(sid, model);
       // Reflect what the BACKEND confirmed. Setting the requested model here
       // unconditionally is what let the selector drift away from the executor.
-      setSelectedModel(effective);
-      try { uiSet('kirolex-last-model', effective); } catch {}
+      // 记成 pending 时没有"确认的值"（undefined）：下拉显示 pending 那个，实际值不动。
+      if (confirmed) {
+        setSelectedModel(confirmed);
+        try { uiSet('kirolex-last-model', confirmed); } catch {}
+      }
     } finally {
       setSwitchingModelIds((prev) => prev.filter((id) => id !== sid));
     }
-  }, [currentSessionId, streamingIds, loopingIds, switchingModelIds, changeSessionModel]);
+  }, [currentSessionId, sessions, switchingModelIds, changeSessionModel, pendingSwitches, cancelPendingSwitch]);
 
   // Keep the model dropdown in sync with the current session's model.
   // A session with its own explicit model shows it; 'auto'/legacy sessions fall
@@ -2796,13 +2812,17 @@ const App: React.FC = () => {
     const currentAgent = sessions.find((session) => session.id === sid)?.kiroAgent
       || kiroAgents.find((agent) => agent.isDefault)?.name
       || 'kiro_default';
+    /* 这一轮还在跑（包括循环里的一轮）也能选 —— 主进程记成 pending，这一轮跑完、下一轮开始前切（见 main/pendingSwitch.ts） */
     if (
       !sid ||
-      streamingIds.includes(sid) ||
-      loopingIds.includes(sid) ||
-      switchingAgentIds.includes(sid) ||
-      agentName === currentAgent
+      switchingAgentIds.includes(sid)
     ) return;
+    const pendingAgent = pendingSwitches[sid]?.agent;
+    if (pendingAgent !== undefined) {
+      if (agentName === pendingAgent) return;
+      /* 选回现在实际在用的那个 = 不切了：取消 pending */
+      if (agentName === currentAgent) { await cancelPendingSwitch(sid, 'agent'); return; }
+    } else if (agentName === currentAgent) return;
 
     setSwitchingAgentIds((prev) => (prev.includes(sid) ? prev : [...prev, sid]));
     try {
@@ -2810,7 +2830,7 @@ const App: React.FC = () => {
     } finally {
       setSwitchingAgentIds((prev) => prev.filter((id) => id !== sid));
     }
-  }, [currentSessionId, sessions, kiroAgents, streamingIds, loopingIds, switchingAgentIds, changeSessionAgent]);
+  }, [currentSessionId, sessions, kiroAgents, switchingAgentIds, changeSessionAgent, pendingSwitches, cancelPendingSwitch]);
 
 
   const permissionMode = currentSession?.permissionMode || 'auto-approve';
@@ -2820,19 +2840,21 @@ const App: React.FC = () => {
   ) => {
     const sid = paneSid || currentSessionId;
     const sessionForMode = sid ? sessions.find((s) => s.id === sid) : null;
-    if (
-      !sid
-      || streamingIds.includes(sid)
-      || loopingIds.includes(sid)
-      || mode === (sessionForMode?.permissionMode || 'auto-approve')
-    ) return;
+    /* 这一轮还在跑（包括循环里的一轮）也能点 —— 主进程记成 pending，跑完再换（见 main/pendingSwitch.ts） */
+    if (!sid) return;
+    const pendingMode = pendingSwitches[sid]?.permission;
+    const actualMode = sessionForMode?.permissionMode || 'auto-approve';
+    if (pendingMode !== undefined) {
+      if (mode === pendingMode) return;
+      if (mode === actualMode) { await cancelPendingSwitch(sid, 'permission'); return; }
+    } else if (mode === actualMode) return;
     await changeSessionPermissionMode(sid, mode);
   }, [
     currentSessionId,
     sessions,
-    streamingIds,
-    loopingIds,
     changeSessionPermissionMode,
+    pendingSwitches,
+    cancelPendingSwitch,
   ]);
 
   const handleDropFiles = useCallback((files: AttachedFile[], sid?: string) => {
@@ -3703,6 +3725,9 @@ const App: React.FC = () => {
         switchingModel={focused && switchingModel}
         permissionMode={session?.permissionMode || 'auto-approve'}
         onPermissionModeChange={(mode) => { void handlePermissionModeChange(mode, sid || undefined); }}
+        /* 忙时选的、这一轮跑完再切的那些（agent / 模型 / 权限 / 引擎 / 组合 / 运行位置） */
+        pendingSwitch={sid ? pendingSwitches[sid] : undefined}
+        onCancelPendingSwitch={(kind) => { if (sid) void cancelPendingSwitch(sid, kind); }}
         /* 这条会话当前还在跑的子代理 —— 侧栏那个 `🤖 N` 用的是同一份数据，只是它只有 tooltip。
            会话里原来只能看到子代理**说过的话**，看不到"现在有几个在跑、各自卡在哪"。 */
         subagents={sid ? (subagents[sid] || []) : []}

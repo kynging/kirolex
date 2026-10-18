@@ -43,8 +43,9 @@ describe('休眠的会话也能改 model / agent / 权限', () => {
   });
 
   test('那三处 `Session not connected` 的抛错没了', () => {
-    for (const h of ['acp:switch-model', 'acp:switch-kiro-agent', 'acp:switch-permission-mode']) {
-      const at = MAIN.indexOf(`ipcMain.handle('${h}'`);
+    /* 三个 handler 的实现抽成了 *Impl（忙时记下的切换跑完后也走它们） */
+    for (const h of ['const switchModelImpl = async', 'const switchKiroAgentImpl = async', 'const switchPermissionModeImpl = async']) {
+      const at = MAIN.indexOf(h);
       assert.ok(at > 0, `找不到 ${h}`);
       const head = MAIN.slice(at, at + 1500);
       assert.doesNotMatch(head, /throw new Error\('Session not connected'\)/, h);

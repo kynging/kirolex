@@ -814,7 +814,9 @@ export const Sidebar: React.FC<SidebarProps> = ({
     /* 带上项目：还没连上过的新会话没有记录，主进程要给它建一份（见主进程 coldRecordFor） */
     const projectId = sessions.find((s) => s.id === sessionId)?.projectId ?? null;
     const r = await api.switchEngine(sessionId, engine, { projectId }).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
-    if (!r?.ok) showToast(t('✗ Could not switch engine: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
+    /* 这一轮还在跑：主进程记下来了，跑完再换（会话输入框下面那一排也会标「⏳」） */
+    if (r?.pending) showToast(t('⏳ This turn is still running; the switch will happen as soon as it finishes.'));
+    else if (!r?.ok) showToast(t('✗ Could not switch engine: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
   };
   const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
     const api = (window as any).kiroApi;
@@ -825,7 +827,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
       .catch((e: any) => ({ ok: false, error: e?.message || String(e) }))
       .finally(() => setPendingTarget(sessionId, undefined));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */
-    if (!r?.ok && !r?.unchanged) showToast(t('✗ Could not switch where this runs: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
+    if (r?.pending) showToast(t('⏳ This turn is still running; the switch will happen as soon as it finishes.'));
+    else if (!r?.ok && !r?.unchanged) showToast(t('✗ Could not switch where this runs: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
   };
 
 

@@ -149,6 +149,19 @@ contextBridge.exposeInMainWorld('kiroApi', {
   },
   switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') =>
     ipcRenderer.invoke('acp:switch-permission-mode', sessionId, permissionMode),
+  /** 忙时记下、这一轮跑完再切的那些切换（`pendingSwitch.ts`）：`{ [sessionId]: { kind: 新值 } }` */
+  getPendingSwitches: (sessionId?: string) => ipcRenderer.invoke('acp:get-pending-switches', sessionId),
+  cancelPendingSwitch: (sessionId: string, kind?: string) => ipcRenderer.invoke('acp:cancel-pending-switch', sessionId, kind),
+  onPendingSwitches: (cb: (d: { sessionId: string; pending: Record<string, string> }) => void) => {
+    const handler = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('acp:pending-switches', handler);
+    return () => ipcRenderer.removeListener('acp:pending-switches', handler);
+  },
+  onPendingSwitchResult: (cb: (d: { sessionId: string; applied: string[]; failed: Array<{ kind: string; label: string; error: string }>; profile: any; pending: Record<string, string> }) => void) => {
+    const handler = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('acp:pending-switch-result', handler);
+    return () => ipcRenderer.removeListener('acp:pending-switch-result', handler);
+  },
   readTranscript: (sessionId: string) => ipcRenderer.invoke('acp:read-transcript', sessionId),
   /** Store a pasted text blob on disk (composer keeps only a placeholder). */
   savePasteText: (text: string) => ipcRenderer.invoke('app:save-paste-text', text),

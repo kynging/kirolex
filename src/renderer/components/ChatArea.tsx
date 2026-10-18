@@ -1505,6 +1505,22 @@ function stashComposerDraft(sessionId: string | null, text: string) {
   try { uiSet(COMPOSER_DRAFTS_KEY, JSON.stringify(composerDrafts)); } catch {}
 }
 
+/**
+ * 「⏳ 这一轮跑完后切换」—— 这一轮还在跑时选的 agent / 模型 / 权限 / 引擎……主进程先记下来（pending），
+ * 跑完立刻切（见 main/pendingSwitch.ts）。✕ = 不切了。`what` 给了就带上"切的是什么 → 新值"（没有自己下拉的那几类用）。
+ */
+function PendingSwitchBadge({ what, onCancel }: { what?: string; onCancel?: () => void }) {
+  const t = useT();
+  return (
+    <span className="composer-pending-switch" title={t('This turn is still running. The switch is applied as soon as it finishes.')}>
+      ⏳ {what ? `${what} · ` : ''}{t('Switches after this turn')}
+      {onCancel && (
+        <button type="button" className="composer-pending-switch-cancel" onClick={onCancel} aria-label={t('Cancel this pending switch')} title={t('Cancel this pending switch')}>✕</button>
+      )}
+    </span>
+  );
+}
+
 const ChatInputBox = memo<{
   sessionId: string | null;
   isStreaming: boolean;
@@ -1519,6 +1535,8 @@ const ChatInputBox = memo<{
    * 默认是 bypass 就好」。给了就显示下拉，不给就是 kiro 的 Auto/Ask。
    */
   engineMode?: { current: string; options: Array<{ value: string; name: string }>; busy: boolean; onChange: (value: string) => void } | null;
+  /** 权限（kiro 的 Auto/Ask 或那两家的权限模式）是这一轮跑完再换的：给了就显示「⏳」和 ✕ */
+  permissionPending?: { onCancel: () => void } | null;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteer: (text: string, pastes?: PastedBlock[]) => void;
   onCancel: () => void;
@@ -1547,7 +1565,7 @@ const ChatInputBox = memo<{
    * 只有 `session/request_permission`），所以这些只能从回复文字里认。
    */
   choiceChips: ChoiceChip[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, permissionPending, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
@@ -2002,7 +2020,7 @@ const ChatInputBox = memo<{
               className={`composer-mode composer-mode-select ${engineModeTone(engineMode.current)}`}
               value={engineMode.current}
               onChange={(e) => engineMode.onChange(e.target.value)}
-              disabled={isLooping || isStreaming || status !== 'connected' || engineMode.busy || !engineMode.options.length}
+              disabled={status !== 'connected' || engineMode.busy || !engineMode.options.length}
               title={t("Permission mode (this engine's own): whether to ask you before acting")}
               aria-label={t('Permission mode')}
             >
@@ -2017,7 +2035,7 @@ const ChatInputBox = memo<{
             onClick={() => onPermissionModeChange(
               permissionMode === 'auto-approve' ? 'ask' : 'auto-approve'
             )}
-            disabled={isLooping || isStreaming || status !== 'connected'}
+            disabled={status !== 'connected'}
             aria-pressed={permissionMode === 'auto-approve'}
             title={permissionMode === 'auto-approve'
               ? t('Auto-approve all tools (click to require approval)')
@@ -2041,6 +2059,7 @@ const ChatInputBox = memo<{
             )}
           </button>
           )}
+          {permissionPending && <PendingSwitchBadge onCancel={permissionPending.onCancel} />}
           {/* Deliberately NOT disabled on empty content, only on states the user can
               actually reason about (looping / not connected). A button greyed out
               purely because the composer is empty explains nothing, and it read as
@@ -2568,6 +2587,9 @@ interface ChatAreaProps {
   permissionMode: 'auto-approve' | 'ask';
   onPermissionModeChange: (mode: 'auto-approve' | 'ask') => void;
   onKiroAgentChange: (agentName: string) => void;
+  /** 这一轮还在跑时选的、跑完再切的那些：`{ agent: 'x', model: 'y', … }`（main/pendingSwitch.ts 的 kind → 新值） */
+  pendingSwitch?: Record<string, string>;
+  onCancelPendingSwitch?: (kind?: string) => void;
   onForkMessage: (messageId: string) => void;
   onRerunMessage: (messageId: string, editedText: string) => void;
   turnInterrupted?: boolean;
@@ -2698,6 +2720,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   permissionMode,
   onPermissionModeChange,
   onKiroAgentChange,
+  pendingSwitch,
+  onCancelPendingSwitch,
   onForkMessage,
   onRerunMessage,
   turnInterrupted,
@@ -3133,7 +3157,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     setMcpComboBusy(true); setEngineModelErr('');
     try {
       const d = await (window as any).kiroApi.switchMcpCombo(currentSessionId, comboId);
-      setMcpCombos((prev) => (prev ? { ...prev, current: d?.current || comboId, missing: undefined } : prev));
+      /* pending = 这一轮跑完再换：实际值不动，下拉显示 pending 的那个 */
+      if (!d?.pending) setMcpCombos((prev) => (prev ? { ...prev, current: d?.current || comboId, missing: undefined } : prev));
     } catch (err: any) {
       setEngineModelErr(String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
     } finally {
@@ -3149,7 +3174,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       const d = category === 'model'
         ? await api.setEngineModel(currentSessionId, value)
         : await api.setEngineOption(currentSessionId, category, value);
-      if (d) setEngineModels(d);
+      /* pending = 这一轮跑完再设：返回的不是清单，别拿它覆盖 */
+      if (d && !d.pending) setEngineModels(d);
     } catch (err: any) {
       setEngineModelErr(String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
     } finally {
@@ -4186,10 +4212,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 isLooping={isLooping}
                 status={status}
                 sessionConnected={sessionConnected}
-                permissionMode={permissionMode}
+                permissionMode={(pendingSwitch?.permission as 'auto-approve' | 'ask' | undefined) ?? permissionMode}
                 onPermissionModeChange={onPermissionModeChange}
+                permissionPending={(nonKiro ? pendingSwitch?.engineMode : pendingSwitch?.permission) !== undefined
+                  ? { onCancel: () => onCancelPendingSwitch?.(nonKiro ? 'engineMode' : 'permission') }
+                  : null}
                 engineMode={nonKiro ? {
-                  current: engineModels?.mode?.current || '',
+                  current: pendingSwitch?.engineMode ?? (engineModels?.mode?.current || ''),
                   options: engineModels?.mode?.options || [],
                   busy: engineModelBusy,
                   onChange: (v) => void onEngineOptionChange('mode', v),
@@ -4221,6 +4250,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
               <div className="composer-belowbar">
                 <div className="composer-belowbar-left">
+                  {/* 引擎 / 运行位置 / effort 在这一排没有自己的下拉（在侧栏右键菜单里换）：忙时选了就在这里说一声 */}
+                  {pendingSwitch?.engine !== undefined && (
+                    <PendingSwitchBadge what={`${t('Engine')} → ${pendingSwitch.engine}`} onCancel={() => onCancelPendingSwitch?.('engine')} />
+                  )}
+                  {pendingSwitch?.remote !== undefined && (
+                    <PendingSwitchBadge what={`${t('Run location')} → ${pendingSwitch.remote}`} onCancel={() => onCancelPendingSwitch?.('remote')} />
+                  )}
+                  {pendingSwitch?.engineEffort !== undefined && (
+                    <PendingSwitchBadge what={`${t('Effort')} → ${pendingSwitch.engineEffort}`} onCancel={() => onCancelPendingSwitch?.('engineEffort')} />
+                  )}
 
                   {/* kiro 的 agent 只对 Kiro 会话有意义；Claude Code / Codex 会话在这儿显示引擎名 */}
                   {nonKiro ? (
@@ -4245,12 +4284,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       */}
                       <select
                         className="composer-select composer-combo-select"
-                        value={mcpCombos?.current || 'default'}
+                        /* pending 里记的是组合 id（和显示名、界面语言无关），直接对上选项 */
+                        value={(pendingSwitch?.combo !== undefined && mcpCombos?.combos.some((c) => c.id === pendingSwitch.combo) ? pendingSwitch.combo : '') || mcpCombos?.current || 'default'}
                         onChange={(event) => void onMcpComboChange(event.target.value)}
-                        disabled={!currentSessionId || !mcpCombos || isStreaming || isLooping || mcpComboBusy || engineModelBusy}
-                        title={isStreaming
-                          ? t('Wait for this reply to finish before switching combos')
-                          : mcpCombos?.error
+                        disabled={!currentSessionId || !mcpCombos || mcpComboBusy || engineModelBusy}
+                        title={mcpCombos?.error
                             ? t('The combo file has an error: {error}', { error: mcpCombos.error })
                             : t("{engine} combo (MCP + effort). Switching restarts this chat's executor", { engine: engineLabel })}
                         aria-label={t('Combo')}
@@ -4260,6 +4298,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.id === 'default' ? t('General purpose') : c.name })}</option>
                         ))}
                       </select>
+                      {pendingSwitch?.combo !== undefined && <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.('combo')} />}
                     </div>
                   ) : (
                   <div
@@ -4287,13 +4326,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       <select
                         ref={agentSelectRef}
                         className="composer-select composer-agent-select"
-                        value={kiroAgent}
+                        value={pendingSwitch?.agent ?? kiroAgent}
                         onChange={(event) => onKiroAgentChange(event.target.value)}
-                        disabled={!currentSessionId || isStreaming || isLooping || switchingAgent || status !== 'connected'}
+                        /* 这一轮还在跑（包括循环里的一轮）也能选：跑完再切（见 PendingSwitchBadge） */
+                        disabled={!currentSessionId || switchingAgent || status !== 'connected'}
                         aria-label={t('Agent')}
                       >
                         {kiroAgent && !kiroAgents.some((agent) => agent.name === kiroAgent) && (
                           <option value={kiroAgent}>{kiroAgent}</option>
+                        )}
+                        {pendingSwitch?.agent && pendingSwitch.agent !== kiroAgent && !kiroAgents.some((agent) => agent.name === pendingSwitch.agent) && (
+                          <option value={pendingSwitch.agent}>{pendingSwitch.agent}</option>
                         )}
                         {kiroAgents.map((agent) => (
                           <option key={agent.name} value={agent.name}>
@@ -4302,6 +4345,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         ))}
                       </select>
                       {switchingAgent && <span className="composer-agent-spinner">⏳</span>}
+                      {pendingSwitch?.agent !== undefined && <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.('agent')} />}
                     </div>
                   )}
 
@@ -4391,12 +4435,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   <select
                       ref={modelSelectRef}
                       className="composer-select composer-model-select"
-                      value={selectedModel}
+                      value={pendingSwitch?.model ?? selectedModel}
                       onChange={(event) => onModelChange(event.target.value)}
-                      disabled={!currentSessionId || isStreaming || isLooping || switchingModel || status !== 'connected'}
-                      title={isStreaming
-                        ? t('Wait for the current response to finish before switching models')
-                        : switchingModel
+                      /* 这一轮还在跑（包括循环里的一轮）也能选：跑完再切（见 PendingSwitchBadge） */
+                      disabled={!currentSessionId || switchingModel || status !== 'connected'}
+                      title={switchingModel
                         ? t('Wait for the current model change to finish')
                         : t('Model')}
                     >
@@ -4444,10 +4487,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   {nonKiro && (
                     <select
                       className="composer-select composer-model-select"
-                      value={engineModels?.current || ''}
+                      value={pendingSwitch?.engineModel ?? (engineModels?.current || '')}
                       onChange={(event) => void onEngineModelChange(event.target.value)}
-                      disabled={!currentSessionId || !engineModels?.options.length || isStreaming || isLooping || engineModelBusy || status !== 'connected'}
-                      title={engineModelErr ? `✗ ${engineModelErr}` : isStreaming ? t('Wait for this reply to finish before switching models') : t('{engine} model', { engine: engineLabel })}
+                      disabled={!currentSessionId || !engineModels?.options.length || engineModelBusy || status !== 'connected'}
+                      title={engineModelErr ? `✗ ${engineModelErr}` : t('{engine} model', { engine: engineLabel })}
                     >
                       {engineModels?.options.length ? (
                         <>
@@ -4462,6 +4505,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                     </select>
                   )}
                   {(switchingModel || engineModelBusy) && <span className="composer-agent-spinner">⏳</span>}
+                  {(nonKiro ? pendingSwitch?.engineModel : pendingSwitch?.model) !== undefined && (
+                    <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.(nonKiro ? 'engineModel' : 'model')} />
+                  )}
                   {engineModelErr && <span className="composer-engine-err" title={engineModelErr}>✗</span>}
                 </div>
               </div>

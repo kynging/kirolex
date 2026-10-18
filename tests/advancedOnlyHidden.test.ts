@@ -351,9 +351,9 @@ describe('index.ts by-id entry points refuse advanced-only sessions', () => {
     "ipcMain.handle('acp:assign-project'",
     "ipcMain.handle('acp:set-project'",
     "ipcMain.handle('acp:move-session'",
-    "ipcMain.handle('acp:switch-model'",
-    "ipcMain.handle('acp:switch-kiro-agent'",
-    "ipcMain.handle('acp:switch-engine'",
+    'const switchModelImpl = async',          // acp:switch-model 的实现（忙时 pending 也走它）
+    'const switchKiroAgentImpl = async',      // acp:switch-kiro-agent
+    'const switchEngineImpl = async',         // acp:switch-engine
     'const setEngineOption = ',
     "ipcMain.handle('acp:mark-session-purpose'",
     "ipcMain.handle('s3:restore'",
@@ -367,8 +367,8 @@ describe('index.ts by-id entry points refuse advanced-only sessions', () => {
     "ipcMain.handle('acp:truncate-transcript-before'",
     "ipcMain.handle('acp:rewrite-transcript'",
     "ipcMain.handle('acp:set-remote-target'",
-    "ipcMain.handle('acp:switch-permission-mode'",
-    "ipcMain.handle('acp:switch-mcp-combo'",
+    'const switchPermissionModeImpl = async', // acp:switch-permission-mode
+    'const switchMcpComboImpl = async',       // acp:switch-mcp-combo
     "ipcMain.handle('acp:prime-history'",
     "ipcMain.handle('acp:ensure-context'",
     "ipcMain.handle('acp:rename-session'",

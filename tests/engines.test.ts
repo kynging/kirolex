@@ -121,7 +121,8 @@ describe('Claude Code / Codex 的模型下拉 ——「右侧的选模型为什�
     const M = read('src', 'main', 'index.ts');
     /* 记在会话上（按引擎分开），每次连上（wireSession）设回去 */
     assert.match(M, /engineModels: \{ \.\.\.entry\.profile\.engineModels, \[engine\]: value \}/);
-    assert.match(M, /function wireSession\(sessionId: string, entry: SessionEntry\) \{\r?\n  const \{ client \} = entry;\r?\n  void applyEngineModel\(sessionId, entry\);/);
+    /* 恢复的 promise 记在 entry 上（忙时记下的即时项要等它落定，见 pendingSwitch.test.ts） */
+    assert.match(M, /function wireSession\(sessionId: string, entry: SessionEntry\) \{\r?\n  const \{ client \} = entry;\r?\n  entry\.engineOptionsReady = applyEngineModel\(sessionId, entry\)/);
     const ca = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.match(ca, /\{nonKiro && \(\s*<select/);
     assert.match(ca, /api\.setEngineModel\(currentSessionId, value\)/);
@@ -241,11 +242,13 @@ describe('远端安装脚本：装上适配器，**而且以后的登录 shell �
 
 describe('已有会话换引擎 ——「我还需要现有会话也能切换 agent 运行类型」', () => {
   test('主进程：没连着只改记录；连着就先起新的再断旧的，上下文随下一条带过去', () => {
-    const at = M.indexOf("ipcMain.handle('acp:switch-engine'");
+    /* 实现抽成了 reshapeForEngine + switchEngineImpl（忙时记下的切换跑完后也走它） */
+    const at = M.indexOf('const reshapeForEngine = (');
     assert.ok(at > 0);
     const body = M.slice(at, M.indexOf("ipcMain.handle('app:get-home-dir'", at));
     assert.match(body, /if \(!oldEntry\) \{[\s\S]*?rec0\.profile = reshape\(rec0\.profile\);/);
-    assert.match(body, /if \(oldEntry\.busy\) throw new Error/);
+    /* 这一轮还在跑：不再拒绝，记成 pending、跑完再换（pendingSwitch.ts） */
+    assert.match(body, /queueSwitchWhileBusy\(sessionId, 'engine'/);
     assert.match(body, /if \(engine !== 'kiro'\) await remoteAdapterCheck\(profile\.remote, engine\);/, '远程会话换到 Claude/Codex 先查适配器');
     assert.match(body, /const started = await connectWithModelFallback\(profile, 'switch-engine', localTools, sessionId, remoteModels\);/);
     assert.ok(body.indexOf('await client.newSession(') < body.indexOf('await oldEntry.client.disconnect()'), '先起新的、再断旧的');
