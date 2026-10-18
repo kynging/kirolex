@@ -330,8 +330,9 @@ declare global {
       previewPdfBytes?: (sessionId: string | null | undefined, pdfPath: string)
         => Promise<{ ok: boolean; base64?: string; bytes?: number; why?: string }>;
       /** 改**一页**的演讲者备注（只动那一页的 XML part）—— 写前备份，返回重抽的全部备注。 */
-      deckWriteNote?: (sessionId: string | null | undefined, filePath: string, page: number, text: string)
-        => Promise<{ ok: boolean; notes?: string[]; error?: string }>;
+      /** `expect`：这条意见是对着哪一份讲稿提的 —— 盘上这一页已经不是它就不写（`conflict`） */
+      deckWriteNote?: (sessionId: string | null | undefined, filePath: string, page: number, text: string, expect?: string)
+        => Promise<{ ok: boolean; notes?: string[]; error?: string; conflict?: boolean }>;
       /** 问打开这份 deck 的会话这一页的字/版面该怎么改，KiroLex 按 run 地址写（正忙就排队）。 */
       /** 取消侧栏 comment 提交的那一次改写（按 ticket）。 */
       reviewCancel?: (ticket: string) => Promise<{ ok: boolean }>;

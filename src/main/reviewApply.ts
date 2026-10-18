@@ -14,10 +14,24 @@ export function sliceLines(text: string | null | undefined, from: number, to: nu
   return String(text ?? '').split('\n').slice(from - 1, to).join('\n');
 }
 
+/**
+ * 这份正文**通篇是 CRLF**（每个 `\n` 前面都是 `\r`）。按 `\n` 切行时每一行都带着自己的 `\r`，
+ * 而模型 / 输入框交回来的新内容是 LF —— 不跟着换，一份 Windows 文件改一处就混进几个 LF 换行。
+ * 本来就混用的文件不去"统一"它。
+ */
+function crlfOnly(text: string): boolean {
+  const lf = text.split('\n').length - 1;
+  return lf > 0 && (text.match(/\r\n/g) || []).length === lf;
+}
+/** 拼好的整份按 `base` 的换行符收一遍（见 `crlfOnly`）。 */
+function sameEol(base: string, out: string): string {
+  return crlfOnly(base) ? out.replace(/\r?\n/g, '\r\n') : out;
+}
+
 /** 把文件里 `from..to` 那一段**整体换成** `replacement`。其余每一行逐字照抄（包括末尾换行）。 */
 export function spliceLines(text: string | null | undefined, from: number, to: number, replacement: string): string {
   const lines = String(text ?? '').split('\n');
-  return [...lines.slice(0, from - 1), String(replacement ?? ''), ...lines.slice(to)].join('\n');
+  return sameEol(String(text ?? ''), [...lines.slice(0, from - 1), String(replacement ?? ''), ...lines.slice(to)].join('\n'));
 }
 
 /** 这一行是不是一个列表项（`-`、`*`、`+`、`1.`、`1)`）。 */
@@ -42,7 +56,7 @@ export function insertAfterLines(text: string | null | undefined, to: number, ad
   const tight = isListItem(before[before.length - 1] || '') && isListItem(add.split('\n')[0]);
   const head = tight || blank(before[before.length - 1]) ? [] : [''];
   const tail = tight || blank(after[0]) ? [] : [''];
-  return [...before, ...head, ...add.split('\n'), ...tail, ...after].join('\n');
+  return sameEol(String(text ?? ''), [...before, ...head, ...add.split('\n'), ...tail, ...after].join('\n'));
 }
 
 /**
@@ -103,10 +117,13 @@ export interface PatchChange {
   newText: string;
 }
 
-/** 核对用：去掉空白、markdown 记号（行首的 `#`、`-`、`1.`、`>`，行内的 `*`、`_`、`` ` ``），只比字。 */
+/**
+ * 核对用：去掉空白、markdown 记号（行首的 `#`、`-`、`1.`、`>`、表格行开头的 `|`，行内的 `*`、`_`、`` ` ``），只比字。
+ * 表格行那个 `|`：模型抄"开头几个字"时常常不带它（`@@ 9-9 | A | 进行中`），带不带都该认。
+ */
 function normalizeForHint(text: string): string {
   return String(text ?? '').split('\n')
-    .map((l) => l.replace(/^\s*(?:(?:#{1,6}|[-*+>]|\d+[.)])\s*)*/, ''))
+    .map((l) => l.replace(/^\s*(?:(?:#{1,6}|[-*+>|]|\d+[.)])\s*)*/, ''))
     .join('')
     .replace(/[\s*_`]/g, '');
 }
@@ -194,7 +211,11 @@ export function applyPatch(
     at = to + 1;
   }
   out.push(...lines.slice(at - 1));
-  return { ok: true, text: out.join('\n'), changes };
+  const text = sameEol(String(base ?? ''), out.join('\n'));
+  /* 换行符收过之后 `newText` 按新文件里那几行重取（CRLF 文件每行带着 `\r`）—— 和 `sliceLines(新文件, from, to)` 一致 */
+  const fin = text.split('\n');
+  for (const c of changes) c.newText = fin.slice(c.from - 1, c.to).join('\n');
+  return { ok: true, text, changes };
 }
 
 /** 回复 + `apply` → 写盘的整份正文。坏的输入返回 null，调用方据此不写。`patch` 走 `applyPatch`（要拿改动列表）。 */

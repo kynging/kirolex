@@ -80,7 +80,7 @@ describe('接线', () => {
   test('接到备注那个框的「确认」上，而且用重抽的那份刷新界面', () => {
     assert.match(PRE, /deckWriteNote:/);
     assert.ok(RV.includes('if (live) queueNote(page, t);'));
-    assert.match(RV, /window\.kiroApi\.deckWriteNote\?\.\(sessionId, path, page, res\.text\)/);
+    assert.match(RV, /window\.kiroApi\.deckWriteNote\?\.\(sessionId, path, page, res\.text, expectNote\)/);
     assert.ok(RV.includes('if (Array.isArray(wrote.notes)) livePane().setNotes(wrote.notes);'));
   });
 

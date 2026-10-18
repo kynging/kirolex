@@ -66,23 +66,104 @@ function norm(s: string): string {
  *
  * 走标准 DP。门上的产出实测 60–80 行，`O(n·m)` 完全够；换成 Myers 的收益还不如它带来的读不懂。
  */
+/**
+ * 侧栏 review 每次落盘都拿**整份文件**来对（`writeBack`），一份接近 512KB 的文件有上万行 —— 整张 DP 表就是
+ * 上亿格、几个 GB，界面直接卡死。所以先剥掉首尾相同的行（一次改写通常只动中间一小段），只对中间那段做 DP。
+ *
+ * 中间那段还是太大（首尾各改了一行这种）：**不能放弃对齐** —— 那一段里没改的行就都没有 `keep`，挂在上面的意见
+ * 和删除标记全被清掉。这时先用"两边都只出现一次的行"当锚点（按先后取最长的一串，patience 的做法），
+ * 锚点之间的每一小段再递归对齐；一个锚点都找不到、又大到 DP 不起时才放弃那一小段。
+ */
+const ALIGN_MAX_CELLS = 4_000_000;
+
 function align(a: string[], b: string[]): Array<[number, number]> {
-  const n = a.length;
-  const m = b.length;
-  const dp: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i -= 1) {
-    for (let j = m - 1; j >= 0; j -= 1) {
-      dp[i][j] = a[i] === b[j] ? dp[i + 1][j + 1] + 1 : Math.max(dp[i + 1][j], dp[i][j + 1]);
+  const out: Array<[number, number]> = [];
+  alignRange(a, b, 0, a.length, 0, b.length, out);
+  return out;
+}
+
+/** 对齐 `a[a0..a1)` 和 `b[b0..b1)`，配对按先后追加进 `out`。 */
+function alignRange(a: string[], b: string[], a0: number, a1: number, b0: number, b1: number, out: Array<[number, number]>): void {
+  let pre = 0;
+  while (a0 + pre < a1 && b0 + pre < b1 && a[a0 + pre] === b[b0 + pre]) pre += 1;
+  let suf = 0;
+  while (suf < a1 - a0 - pre && suf < b1 - b0 - pre && a[a1 - 1 - suf] === b[b1 - 1 - suf]) suf += 1;
+  for (let k = 0; k < pre; k += 1) out.push([a0 + k, b0 + k]);
+  const s0 = a0 + pre;
+  const t0 = b0 + pre;
+  const n = a1 - suf - s0;
+  const m = b1 - suf - t0;
+  if (n > 0 && m > 0) {
+    if (n * m <= ALIGN_MAX_CELLS) {
+      lcs(a, b, s0, n, t0, m, out);
+    } else {
+      const anchors = uniqueAnchors(a, b, s0, s0 + n, t0, t0 + m);
+      let pa = s0;
+      let pb = t0;
+      for (const [i, j] of anchors) {
+        alignRange(a, b, pa, i, pb, j, out);
+        out.push([i, j]);
+        pa = i + 1;
+        pb = j + 1;
+      }
+      if (anchors.length) alignRange(a, b, pa, s0 + n, pb, t0 + m, out);
+      else {
+        /*
+          一个只出现一次的行都没有（满屏一样的 `- TODO`）：再递归就是原地打转。退一步，**同一个偏移上字面一样的行**
+          配成对 —— 两边行数没变时（首尾各改一行这种）中间那些行照样跟着走；配对按先后递增，不会交叉。
+        */
+        for (let k = 0; k < Math.min(n, m); k += 1) if (a[s0 + k] === b[t0 + k]) out.push([s0 + k, t0 + k]);
+      }
     }
   }
-  const out: Array<[number, number]> = [];
+  for (let k = suf; k > 0; k -= 1) out.push([a1 - k, b1 - k]);
+}
+
+/** 标准 LCS（DP），`a[s0..s0+n)` 对 `b[t0..t0+m)`。 */
+function lcs(a: string[], b: string[], s0: number, n: number, t0: number, m: number, out: Array<[number, number]>): void {
+  const w = m + 1;
+  const dp = new Uint32Array((n + 1) * w);
+  for (let i = n - 1; i >= 0; i -= 1) {
+    for (let j = m - 1; j >= 0; j -= 1) {
+      dp[i * w + j] = a[s0 + i] === b[t0 + j] ? dp[(i + 1) * w + j + 1] + 1 : Math.max(dp[(i + 1) * w + j], dp[i * w + j + 1]);
+    }
+  }
   let i = 0;
   let j = 0;
   while (i < n && j < m) {
-    if (a[i] === b[j]) { out.push([i, j]); i += 1; j += 1; continue; }
-    if (dp[i + 1][j] >= dp[i][j + 1]) i += 1; else j += 1;
+    if (a[s0 + i] === b[t0 + j]) { out.push([s0 + i, t0 + j]); i += 1; j += 1; continue; }
+    if (dp[(i + 1) * w + j] >= dp[i * w + j + 1]) i += 1; else j += 1;
   }
-  return out;
+}
+
+/** 两边各只出现一次的行配成对，取按两边先后都递增的最长一串（最长递增子序列，O(k log k)）。 */
+function uniqueAnchors(a: string[], b: string[], a0: number, a1: number, b0: number, b1: number): Array<[number, number]> {
+  const count = (arr: string[], lo: number, hi: number) => {
+    const c = new Map<string, { n: number; at: number }>();
+    for (let k = lo; k < hi; k += 1) { const e = c.get(arr[k]); if (e) e.n += 1; else c.set(arr[k], { n: 1, at: k }); }
+    return c;
+  };
+  const ca = count(a, a0, a1);
+  const cb = count(b, b0, b1);
+  const pairs: Array<[number, number]> = [];
+  for (let k = a0; k < a1; k += 1) {
+    const ea = ca.get(a[k])!;
+    const eb = cb.get(a[k]);
+    if (ea.n === 1 && eb && eb.n === 1) pairs.push([k, eb.at]);
+  }
+  /* pairs 已按 a 递增；在 b 下标上取最长递增子序列 */
+  const tails: number[] = [];
+  const prev: number[] = new Array(pairs.length).fill(-1);
+  for (let k = 0; k < pairs.length; k += 1) {
+    let lo = 0;
+    let hi = tails.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (pairs[tails[mid]][1] < pairs[k][1]) lo = mid + 1; else hi = mid; }
+    if (lo > 0) prev[k] = tails[lo - 1];
+    tails[lo] = k;
+  }
+  const seq: Array<[number, number]> = [];
+  for (let k = tails.length ? tails[tails.length - 1] : -1; k >= 0; k = prev[k]) seq.push(pairs[k]);
+  return seq.reverse();
 }
 
 /**
@@ -191,4 +272,86 @@ export function rewritePatch(blocks: PatchBlock[], newText: string): RewritePatc
   }
   hunk(oi, blocks.length, nj, next.length, prevKept);
   return prefix ? { edits, inserts, drops, keep, prefix } : { edits, inserts, drops, keep };
+}
+
+/** 一次落盘**实际改了的一段**：原文 `oldFrom..oldTo` 换成了新文件里的 `newFrom..newTo`（闭区间，从 1 起；空范围 = 纯插入 / 纯删除）。 */
+export interface EditRange { oldFrom: number; oldTo: number; newFrom: number; newTo: number }
+
+/**
+ * 只改了**一段**（`oldFrom..oldTo` 整段换掉；纯插入给 `oldFrom = 插入点后一行、oldTo = oldFrom - 1`）时那一段在新文件里的范围 ——
+ * 按两版的行数差算。删一段时 `deleteLines` 可能顺手收掉接缝后的空行：差出来的那几行算进被删的范围。
+ */
+export function singleRange(base: string, next: string, oldFrom: number, oldTo: number): EditRange {
+  const delta = String(next ?? '').split('\n').length - String(base ?? '').split('\n').length;
+  let to = oldTo;
+  let newTo = oldTo + delta;
+  if (newTo < oldFrom - 1) { to += (oldFrom - 1) - newTo; newTo = oldFrom - 1; }
+  return { oldFrom, oldTo: to, newFrom: oldFrom, newTo };
+}
+
+/**
+ * **按实际改了的那几段**给旧行号找新行号 —— PURE。认不出来的返回 null（那一行要改的东西已经不在了）。
+ *
+ * 「重复文字的排队保护仍不完整」：只拿两版全文按文字对齐（`rewritePatch.keep`）的话，`- TODO\n\n- TODO` 删掉第一处之后，
+ * 留下的那一处会被认成"第一处还在"，排在后面对第一处的删除就删到了第二处。所以身份按改动范围定：
+ *   · 改动范围**之外**的行：按前面那几段的行数差平移，再核对一遍那一行字面没变（对不上就当认不出来）；
+ *   · 改动范围**之内**的行：只有它的字在这一段的原文里只出现一次、在新内容里也只出现一次，才算"还在"（整节改写只动了一行，
+ *     节里别的行照样跟着走）；否则一律认不出来 —— 宁可让排着的那条报冲突，也不能改到另一处。
+ */
+export function exactLineMap(base: string, next: string, ranges: EditRange[]): (line: number) => number | null {
+  const a = String(base ?? '').split('\n');
+  const b = String(next ?? '').split('\n');
+  const rs = [...ranges].sort((x, y) => x.oldFrom - y.oldFrom || x.oldTo - y.oldTo);
+  /* 每一段之前累计的行数差 —— 查一行时二分找到它落在哪一段之后，不逐段累加 */
+  const before: number[] = [];
+  let acc = 0;
+  for (const r of rs) { before.push(acc); acc += (r.newTo - r.newFrom + 1) - (r.oldTo - r.oldFrom + 1); }
+  /*
+    每一段**只建一次**索引：原文那几行里每种字出现几次、新内容里每种字出现在哪些行。大文件整节 / 跨段改写时，
+    逐行去扫整段就是 O(段长²) —— 一万多行卡十几秒。索引用到才建（大多数行落在改动范围外）。
+  */
+  const index = new Map<number, { inOld: Map<string, number>; inNew: Map<string, number[]> }>();
+  const indexOf = (i: number) => {
+    let ix = index.get(i);
+    if (ix) return ix;
+    const r = rs[i];
+    const inOld = new Map<string, number>();
+    for (let k = r.oldFrom; k <= r.oldTo; k += 1) { const w = norm(a[k - 1]); inOld.set(w, (inOld.get(w) || 0) + 1); }
+    const inNew = new Map<string, number[]>();
+    for (let k = r.newFrom; k <= r.newTo; k += 1) { const w = norm(b[k - 1]); const l = inNew.get(w); if (l) l.push(k); else inNew.set(w, [k]); }
+    ix = { inOld, inNew };
+    index.set(i, ix);
+    return ix;
+  };
+  return (line: number) => {
+    /* 最后一段 `oldFrom <= line` 的 */
+    let lo = 0;
+    let hi = rs.length;
+    while (lo < hi) { const mid = (lo + hi) >> 1; if (rs[mid].oldFrom <= line) lo = mid + 1; else hi = mid; }
+    const i = lo - 1;
+    let shift = 0;
+    if (i >= 0) {
+      const r = rs[i];
+      if (line <= r.oldTo) {
+        const want = norm(a[line - 1]);
+        if (!want) return null;
+        const ix = indexOf(i);
+        const hits = ix.inNew.get(want) || [];
+        return ix.inOld.get(want) === 1 && hits.length === 1 ? hits[0] : null;
+      }
+      shift = before[i] + (r.newTo - r.newFrom + 1) - (r.oldTo - r.oldFrom + 1);
+    }
+    const to = line + shift;
+    if (to < 1 || to > b.length || norm(b[to - 1]) !== norm(a[line - 1])) return null;
+    return to;
+  };
+}
+
+/** `exactLineMap` 摊成 `旧行号 → 新行号` 的表（和 `RewritePatch.keep` 同形，认不出来的行不在表里）。 */
+export function exactKeep(base: string, next: string, ranges: EditRange[]): Record<number, number> {
+  const map = exactLineMap(base, next, ranges);
+  const out: Record<number, number> = {};
+  const n = String(base ?? '').split('\n').length;
+  for (let line = 1; line <= n; line += 1) { const to = map(line); if (to) out[line] = to; }
+  return out;
 }

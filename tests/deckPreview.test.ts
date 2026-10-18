@@ -230,7 +230,7 @@ describe('路径和闸门 —— 和文本那侧同一套', () => {
     const PRE = read('src/main/preload.ts');
     assert.match(PRE, /invoke\('preview:deck', sessionId, filePath, force\)/);
     assert.match(PRE, /invoke\('preview:pdf-bytes', sessionId, pdfPath\)/);
-    assert.match(PRE, /invoke\('deck:write-note', sessionId, filePath, page, text\)/);
+    assert.match(PRE, /invoke\('deck:write-note', sessionId, filePath, page, text, expect\)/);
   });
 });
 

@@ -47,9 +47,12 @@ export function parseRevised(stdout: string, original: string): RevisedBlock {
   /*
     去掉**最外层**围栏（模型即使被告知也常加一层）。只去最外层：原文里本来就可能有代码块，
     把里面的也剥掉会毁掉内容。
+    **原文本身就是一个围栏代码块**（对代码块 comment）时，回复的那层围栏就是代码块自己的 —— 剥掉它，
+    拼回去代码块就成了裸文本。那时只在模型又多包了一层（里面还是一个围栏）时才剥。
   */
   const fence = /^(`{3,}|~{3,})[^\n]*\n([\s\S]*?)\n\1\s*$/.exec(body);
-  if (fence) body = fence[2].trim();
+  const FENCE_OPEN = /^\s{0,3}(`{3,}|~{3,})/;
+  if (fence && (!FENCE_OPEN.test(String(original ?? '').trim()) || FENCE_OPEN.test(fence[2].trim()))) body = fence[2].trim();
   if (cannot) return { text: String(original ?? ''), cannot };
   /* 空回复不能当成"改成空的" —— 那会静默删掉一段（整份那一档就是删掉整个文件） */
   if (!body) return { text: String(original ?? ''), cannot: tr('The model returned nothing') };

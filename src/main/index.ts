@@ -77,13 +77,13 @@ import {
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS } from './kirolexNote.ts';
-import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, type ReviewTarget } from './reviewAccess.ts';
+import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, reviewBackupPrefix, reviewBackupsToPrune, type ReviewTarget } from './reviewAccess.ts';
 import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
 import {
   SOFFICE_BUNDLE_PATHS, SOFFICE_PATH_NAMES, pickConverter, sofficeBinary, pathProbeCommand, firstProbeHit,
   installConverterCmd, noConverterWhy, pythonCandidates, PPTX_PROBE_SCRIPT, pythonEnv, noPythonPptxWhy,
-  previewKey, needsConversion, isPreviewable, canEditDeck, NOTES_SCRIPT, WRITE_NOTE_SCRIPT, SLIDE_TEXT_SCRIPT,
+  previewKey, needsConversion, isPreviewable, canEditDeck, NOTES_SCRIPT, WRITE_NOTE_SCRIPT, SLIDE_TEXT_SCRIPT, noteChanged,
   SLIDE_OPS_SCRIPT, WRITE_SLIDE_TEXT_SCRIPT, parseSlideRuns, parseWriteNote, parseNotesResult,
 } from './deckPreview.ts';
 import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.ts';
@@ -3764,6 +3764,11 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants)
   const text = String(body || '').trim();
   if (!sid || !text) return false;
   if (refuseAdvancedOnly(sid, 'note')) return false;
+  /*
+    会话已经删了（或者盘上根本没有它的记录）就不说 —— `appendMessage` 会先建目录，侧栏后台那条改写写完盘时
+    主人会话刚被删掉的话，`sessions/<id>/` 下就重新长出一个只有 transcript 的目录。
+  */
+  if (deletedSessionIds.has(sid) || !store.readRecord(sid)) return false;
   /* 中英两版一起落盘（tr() 出来的才认得；渲染层发起的自己带过来）—— 切了语言、重新打开都按当时的界面语言显示 */
   const v = asVariants(variants) ?? textVariants(text);
   const messageId = `u_${Date.now()}_${Math.random().toString(36).slice(2, 8)}_note`;
@@ -10635,7 +10640,7 @@ app.whenReady().then(async () => {
   /* 断线恢复（`remoteRecovery`）在模块级，它要用的就是这一份挂载实现 */
   reattachSession = ensureAttached;
 
-  /** 改写前的整份副本留多少份。要回滚也只会回到最近几版。 */
+  /** 改写前的整份副本**每份文件**留多少份。要回滚也只会回到最近几版。 */
   const REVIEW_BACKUPS_KEPT = 12;
 
   /**
@@ -10649,16 +10654,16 @@ app.whenReady().then(async () => {
       const backupDir = path.join(os.homedir(), '.kirolex', 'backups', 'review-files');
       fs.mkdirSync(backupDir, { recursive: true });
       const stamp = new Date().toISOString().replace(/[:.]/g, '-');
-      const name = path.basename(want).replace(/[^\w.-]+/g, '_');
-      const at = path.join(backupDir, `${name}__${stamp}`);
+      /* 按文件留、按文件清（`backupsToPrune`）—— 改别的文件不会把这个文件的备份挤掉 */
+      const at = path.join(backupDir, `${reviewBackupPrefix(want)}${stamp}`);
       fs.writeFileSync(at, bytes as any);
       try {
-        const old = fs.readdirSync(backupDir)
-          .map((n) => { const full = path.join(backupDir, n); try { return { full, t: fs.statSync(full).mtimeMs }; } catch { return null; } })
-          .filter((e): e is { full: string; t: number } => !!e)
-          .sort((a, b) => b.t - a.t)
-          .slice(REVIEW_BACKUPS_KEPT);
-        for (const e of old) { try { fs.rmSync(e.full, { force: true }); } catch { /* 下次再说 */ } }
+        const entries = fs.readdirSync(backupDir)
+          .map((name) => { try { return { name, t: fs.statSync(path.join(backupDir, name)).mtimeMs }; } catch { return null; } })
+          .filter((e): e is { name: string; t: number } => !!e);
+        for (const name of reviewBackupsToPrune(entries, want, REVIEW_BACKUPS_KEPT)) {
+          try { fs.rmSync(path.join(backupDir, name), { force: true }); } catch { /* 下次再说 */ }
+        }
       } catch { /* 清理是 best-effort，不能拦住主流程 */ }
       return at;
     } catch { return null; }
@@ -11317,6 +11322,18 @@ app.whenReady().then(async () => {
     if (!Number.isInteger(at) || at < 1) return { ok: false, error: tr('Invalid page number') };
     return { ok: true, want: t.want, at };
   };
+  /** 这份 deck 在盘上此刻的样子（mtime + 大小）—— 等回复的那几十秒里它被别的改动动过没有，靠比这个。 */
+  const deckStamp = (want: string): string => {
+    try { const st = fs.statSync(want); return `${st.mtimeMs}:${st.size}`; } catch { return ''; }
+  };
+  /**
+   * 等回复期间 pptx 被别的改动动过（会话自己改了它、你在 PowerPoint 里存了一下）时的返回值 —— **不写**：
+   * 改一页文字用的地址（`形状.段.run`）、讲稿那一页的原文都是按改之前那一份来的，照写就是改错了框、盖掉了那次改动。
+   */
+  const deckChanged = (want: string, page: number) => {
+    logger.warn('deck', `${path.basename(want)} changed while waiting for the reply; page ${page} not written`);
+    return { ok: false, conflict: true, error: tr('This file was changed by something else while waiting for the reply; this result was not written. Refresh, check the new text, and submit again') };
+  };
   /** 写前二进制备份；拷不成返回那句错误（调用方据此**不写**）。 */
   const backupDeck = (want: string): string | null => {
     try {
@@ -11333,13 +11350,22 @@ app.whenReady().then(async () => {
    * 写完把所有页的备注重抽一遍返回 —— 界面要的是磁盘上那一份。顺手把已经转好的 PDF **搬到新 key 下面**：
    * 改讲稿必然改 mtime（缓存 key 失效），而讲稿根本不进 PDF；这次改动是我们做的，我们清楚只有讲稿变了。
    */
-  ipcMain.handle('deck:write-note', async (_event, sessionId: string | null | undefined, filePath: string, page: number, text: string) => {
+  /*
+    `expect`（可选）：这条讲稿意见是对着哪一份讲稿提的（渲染层提交那一刻看到的那一页）。等回复的那十几秒里
+    这一页的讲稿被别的改动改过（会话自己动了 pptx、你在 PowerPoint 里改了），照写就是把那次改动整页盖掉 —— 那时不写。
+  */
+  ipcMain.handle('deck:write-note', async (_event, sessionId: string | null | undefined, filePath: string, page: number, text: string, expect?: unknown) => {
     { const advRefused = sessionId ? refuseAdvancedOnly(sessionId, 'deck:write-note') : null; if (advRefused) return { ok: false, error: advRefused }; }
     const g = deckTarget(sessionId, filePath, page);
     if (!g.ok) return g;
     const { want, at } = g;
     try {
       const beforeStat = fs.statSync(want);
+      if (typeof expect === 'string') {
+        let now: string[] | null = null;
+        try { now = parseNotesResult(await runPy(NOTES_SCRIPT, [want]))?.notes ?? null; } catch { now = null; }
+        if (noteChanged(now, at, expect)) return deckChanged(want, at);
+      }
       const bad = backupDeck(want);
       if (bad) return { ok: false, error: bad };
       const parsed = parseWriteNote(await runPy(WRITE_NOTE_SCRIPT, [want, String(at)], String(text ?? '')));
@@ -11451,6 +11477,8 @@ app.whenReady().then(async () => {
       if (askWaiters.has(sid)) { tk.close(); return { ok: false, error: tr('A revision is already waiting for a reply in this session') }; }
       if (tk.cancelled()) { tk.close(); return { ok: false, cancelled: true }; }
       try {
+        /* 地址是按**这一份**编的 —— 等回复期间被改过就不按旧地址写（见 `deckChanged`） */
+        const stampBefore = deckStamp(want);
         /* 先把这一页现有的文字读出来 —— 模型要按地址回，就得先看见地址 */
         const cur = parseSlideRuns(await runPy(SLIDE_TEXT_SCRIPT, [want, String(page)]));
         if (!cur.ok) return { ok: false, error: cur.error };
@@ -11476,6 +11504,7 @@ app.whenReady().then(async () => {
         }
         logger.info('deck', `slide: ${got.edits.length} 处文字 + ${got.ops.length} 条版面指令 for page ${page}`
           + ` in ${((Date.now() - started) / 1000).toFixed(1)}s`);
+        if (deckStamp(want) !== stampBefore) return deckChanged(want, page);
         let changed = 0;
         if (got.edits.length) {
           const wroteText = await writeSlideText(want, page, got.edits);

@@ -96,14 +96,14 @@ describe('入口', () => {
     assert.ok(RV.includes('if (live) queueSlide(page, t);'));
     assert.ok(RV.includes('if (live) queueNote(page, t);'));
     assert.ok(RV.includes("sendToSession(`请按下面这几条改「${path}」（页号都是改之前的），一次改完、保存这个文件：\\n${handOff.join('\\n')}`);"));
-    assert.match(RV, /window\.kiroApi\.deckWriteNote\?\.\(sessionId, path, page, res\.text\)/);
+    assert.match(RV, /window\.kiroApi\.deckWriteNote\?\.\(sessionId, path, page, res\.text, expectNote\)/);
   });
 });
 
 describe('积累模式：先标记，一次提交', () => {
   test('「把 comment 功能做成积累模式……不管在哪一处点确认按钮的时候一起提交修改」', () => {
     /* 每个框的「✓ 确认」和最下面的「提交」都是同一个 submitAll */
-    assert.ok(RV.includes('onApply={() => submitAll()}'));
+    assert.ok(RV.includes('onApply={() => submitFromBox(submitAll)}'));
     assert.ok(RV.includes('onClick={() => submitAll()}'));
     /* 框里空着也能按 —— 它提交的是别处的标记 */
     assert.ok(RV.includes('applyWhenEmpty={markCount > 0}'));
@@ -146,7 +146,10 @@ describe('提交之后那条路', () => {
   });
 
   test('按闭区间取原文、按闭区间换回去 —— 段落之间的空行照带', () => {
-    assert.match(RV, /spanRange\(g && g\.span\.length > 1 \? g\.span : dropSpan\(baseBlocks, best\)\);/);
+    /* 按原文找那一块的范围搬进了 reviewBlocks.ts 的 locateBlock（纯的、有测试） */
+    const RB = read('src/renderer/reviewBlocks.ts');
+    assert.match(RB, /spanRange\(g && g\.span\.length > 1 \? g\.span : dropSpan\(baseBlocks, best\)\);/);
+    assert.match(RV, /locateBlock\(base, anchorText, near\)/);
     assert.match(RV, /const where = sliceLines\(base, from, to\);/);
     assert.match(RV, /spliceLines\(base, from, to, String\(res\.text\)\)/);
   });
@@ -183,7 +186,7 @@ describe('提交之后那条路', () => {
   test('排队：各自一个条目、各自显示、按原文找位置（行号挪了也找得到）', () => {
     assert.ok(RV.includes('const jobs = useReviewQueueForPath(path);'));
     assert.ok(RV.includes('removeReviewItem(ticket);'));
-    assert.ok(RV.includes("if (b.kind !== 'line' || b.text !== anchorText) continue;"));
+    assert.ok(read('src/renderer/reviewBlocks.ts').includes("if (b.kind !== 'line' || b.text !== anchorText) continue;"));
     assert.doesNotMatch(RV, /setApplyingAt\(/);
   });
 
@@ -367,7 +370,7 @@ test('队列状态和串行链、正文都按文件记（不按 pane）：pane �
   assert.ok(RV.includes('const base = currentText();'));
   assert.ok(!RV.includes('const base = textRef.current;'));
   /* 还活着的那些不算 interrupted，也不放回标记 */
-  assert.ok(RV.includes('const live = new Set(liveReviewItems(path).map((i) => i.persist?.key).filter(Boolean) as string[]);'));
+  assert.ok(RV.includes('const live = new Set(liveReviewItems(path).filter((i) => i.persist?.key).map((i) => liveMarkKey(i)));'));
   /* 后台那条的 setter 落到此刻挂着的 pane 上 */
   assert.ok(RV.includes('const livePane = (): PaneApi => paneApis.get(path) ?? own;'));
 });

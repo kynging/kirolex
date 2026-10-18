@@ -561,3 +561,84 @@ export function shouldBumpMark(order: Record<string, number>, key: string, last:
   改写的回复由主进程拼回去、写盘，窗口在不在都一样；这里转出同一份，两边永远是同一套规则。
 */
 export { sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome } from '../main/reviewApply.ts';
+
+/**
+ * 一块在**此刻**的正文里占哪一段 —— **按原文找，不按行号**，PURE（`ReviewPane` 排着的那几条开跑时用）。
+ *
+ * 排在队里的那条提交的时候记下了锚点那一行的原文；轮到它时前面的改动可能已经让行号挪了好几行。
+ * 所以拿原文在此刻的正文里找，有几处一样的就取离 `nearLine` 最近的那一处 —— `nearLine` 要给**此刻**的行号
+ * （队列里跟着落盘挪过的那个，见 `reviewQueue.reviewItemLine`），给提交那一刻的老行号的话，一份里有两行一样的
+ * （`- TODO`）时会对上另一处。找不到（那一行本身被前面的改动改掉了）返回 null，调用方说清楚，而不是改错地方。
+ */
+export function locateBlock(base: string, anchorText: string, nearLine: number): { from: number; to: number; anchor: number } | null {
+  const baseBlocks = lineBlocks(base);
+  let best: number | null = null;
+  for (const b of baseBlocks) {
+    if (b.kind !== 'line' || b.text !== anchorText) continue;
+    if (best === null || Math.abs(b.index - nearLine) < Math.abs(best - nearLine)) best = b.index;
+  }
+  if (best === null) return null;
+  const g = displayGroups(baseBlocks).find((x) => x.anchor === best);
+  const { from, to } = spanRange(g && g.span.length > 1 ? g.span : dropSpan(baseBlocks, best));
+  return { from, to, anchor: best };
+}
+
+/**
+ * **先备份、备份成了才交给会话改** —— PURE（备份和发送由调用方注入），`ReviewPane.sendToSession` 用。
+ *
+ * 那条路是会话自己写这个文件（PDF、不能当场改的 deck），走不到 `review:write-file` 那道"写前拷一份"。
+ * 原来是发出备份请求后立刻发消息：远端备份慢的时候，备到的可能已经是会话改过的那一版；备份失败也照发 ——
+ * 会话改坏了就没有副本可回滚。所以等备份回来：成了才发；没成（或抛错）就不发、把原因交回去，标记由调用方留着。
+ */
+export async function backupThenSend(
+  backup: () => Promise<{ ok?: boolean; error?: string } | null | undefined> | null | undefined,
+  send: () => void,
+): Promise<{ ok: true } | { ok: false; why: string }> {
+  let res: { ok?: boolean; error?: string } | null | undefined;
+  try { res = await backup(); } catch (err: any) { res = { ok: false, error: String(err?.message || err) }; }
+  if (!res?.ok) return { ok: false, why: String(res?.error || '') };
+  send();
+  return { ok: true };
+}
+
+/**
+ * **一批交给会话的标记，发出去之后只清这一批** —— PURE。`sent` 是提交那一刻的快照（键 → 当时的值）；
+ * 此刻的值和快照**还一样**的才清，等备份那几秒里新写的、改过的都留着（它们不在发出去的那条消息里）。
+ */
+export function clearSent<V>(cur: Record<string, V>, sent: Record<string, V>): Record<string, V> {
+  let changed = false;
+  const out: Record<string, V> = {};
+  for (const [k, v] of Object.entries(cur)) {
+    if (k in sent && sent[k] === v) { changed = true; continue; }
+    out[k] = v;
+  }
+  return changed ? out : cur;
+}
+
+/**
+ * 同一份文件**同一时刻只交出去一批** —— 等备份的那几秒里再点提交，不会把同一批意见再发一遍。PURE。
+ * `run` 在已经有一批在路上时直接返回 null（调用方据此什么都不做、标记照留）。
+ */
+export function createSubmitGate(): { readonly busy: boolean; run: <T>(job: () => Promise<T>) => Promise<T | null> } {
+  let busy = false;
+  return {
+    get busy() { return busy; },
+    async run<T>(job: () => Promise<T>): Promise<T | null> {
+      if (busy) return null;
+      busy = true;
+      try { return await job(); } finally { busy = false; }
+    },
+  };
+}
+
+/**
+ * 侧栏 review 的框（`CommentBox`）里点「✓ 确认」—— 提交全部标记，**但告诉框别自己清草稿**（返回 false）。PURE。
+ *
+ * 标记清不清由 `ReviewPane` 自己说了算：文本那侧入队时就清了；deck 那批要等备份回来、而且只清和提交快照一样的
+ * （`clearSent`）。框自己再按"成功了就清"清一遍的话，等备份那几秒里你重新打开同一页、改了意见，
+ * 旧框的回调会把你改的那份也清掉（它不知道快照这回事，框卸掉了回调照样跑）。
+ */
+export function submitFromBox(submit: () => boolean | Promise<boolean>): false {
+  void Promise.resolve(submit()).catch(() => {});
+  return false;
+}

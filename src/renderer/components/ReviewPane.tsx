@@ -1,15 +1,15 @@
 import React, { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, useSyncExternalStore } from 'react';
 import { CommentBox, CommentOpener } from './CommentBox';
 import { PdfView } from './PdfView';
-import { pageBlocks, lineBlocks, dropSpan, displayGroups, groupAnchorOf, mdLine, spanRange, shouldBumpMark, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, type ReviewBlock } from '../reviewBlocks';
-import { rewritePatch } from '../rewritePatch';
+import { pageBlocks, lineBlocks, dropSpan, displayGroups, groupAnchorOf, mdLine, spanRange, shouldBumpMark, sliceLines, spliceLines, insertAfterLines, deleteLines, patchReplyOutcome, locateBlock, backupThenSend, clearSent, createSubmitGate, submitFromBox, type ReviewBlock } from '../reviewBlocks';
+import { rewritePatch, singleRange, exactKeep, type EditRange } from '../rewritePatch';
 import { diffChanges, trustedChanges, remapChanges, planUndo, markLayout, UNDO_REFUSED, type AiMark, type AiMarkState } from '../aiChanges';
 import { lostFields, lostFieldsByChange } from '../../main/reviseBlock.ts';
 import { getAiMarks, updateAiMarks, subscribeAiMarks, aiRoundOf, beginAiRound, recordAiWrite } from '../aiMarkStore';
 import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
 import { reviewSelectAll, lastInteraction, coversWhole } from '../selectAllScope';
-import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, type ReviewQueueItem } from '../reviewQueue';
+import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, reviewItemLine, reviewItemLost, liveMarkKey, type ReviewQueueItem } from '../reviewQueue';
 import { useLang, useT } from '../hooks/useLang';
 import { noteVariants, t as translate, type Lang } from '../i18n';
 
@@ -85,6 +85,13 @@ let aiMarkSeq = 0;
 const NO_AI_MARKS: AiMarkState = { base: '', marks: [] };
 /** 被取消的那些（按 ticket）—— 和队列本身一样跟着文件走，不跟着 pane。 */
 const cancelledTickets = new Set<string>();
+/** deck 那侧「整批交给会话」的那道门 —— 按文件、不按 pane：等备份期间换了 pane 再点提交，也不会把同一批再发一遍。 */
+const handoffGates = new Map<string, ReturnType<typeof createSubmitGate>>();
+function handoffGateFor(path: string) {
+  let g = handoffGates.get(path);
+  if (!g) { g = createSubmitGate(); handoffGates.set(path, g); }
+  return g;
+}
 
 /**
  * 一块的 Markdown —— **按内容记住**，内容没变就不重渲染。「为什么直接编辑文字这么卡」：每敲一个字这个 pane
@@ -266,7 +273,8 @@ export const ReviewPane: React.FC<{
       "上次没做完"的那些里，**还在后台排 / 在跑的**不是没做完 —— 它们只是换了个 pane 在显示。不把它们当标记放回去，
       否则你下一次提交会把同一条再排一遍（实测：点了个删除，queue 里多出一条重复的改写）。
     */
-    const live = new Set(liveReviewItems(path).map((i) => i.persist?.key).filter(Boolean) as string[]);
+    /* 按此刻的行号认（`liveMarkKey`）—— 存的时候也是按它存的，前面的改动挪过行号也对得上 */
+    const live = new Set(liveReviewItems(path).filter((i) => i.persist?.key).map((i) => liveMarkKey(i)));
     if (!live.size) return m;
     for (const k of live) {
       if (k.startsWith('drop:')) delete m.dropped[Number(k.slice(5))];
@@ -319,6 +327,9 @@ export const ReviewPane: React.FC<{
     if (next.trim()) bumpMark(key);
   };
   const clearDraft = (key: string) => setDraftLive((cur) => { const n = { ...cur }; delete n[key]; return n; });
+  /** 此刻的草稿 —— 等备份回来之后（异步）判断哪些还和提交时一样，见 `submitAll` 的 `clearHanded` */
+  const draftRef = useRef(draftLive);
+  draftRef.current = draftLive;
   /** 标了删的那些 —— 键是你点 ✕ 的那个锚点（标题就带整节，见 `spans`）/ 页号。 */
   const [dropped, setDropped] = useState<Record<number, true>>(initialMarks.dropped);
   /**
@@ -336,6 +347,8 @@ export const ReviewPane: React.FC<{
   }, [text, isDeck, path]);
   /** 最下面那个「整篇的意见」框 —— 不挂在任何一段上。 */
   const [wholeDraft, setWholeDraft] = useState(initialMarks.whole);
+  const wholeRef = useRef(wholeDraft);
+  wholeRef.current = wholeDraft;
   /**
    * 鼠标停在哪一块上 —— **给"标题带整段"做动手前的预览**：✕ 一个标题会带走十几行，
    * 范围必须在点之前就看得见。纯 CSS 做不到：一行亮不亮取决于"盖住它的那个锚点是不是正被 hover"。
@@ -345,6 +358,8 @@ export const ReviewPane: React.FC<{
   const [justSent, setJustSent] = useState(false);
   /** 发给会话前那次备份没成 —— 说出来，因为接下来是会话自己改文件，改坏了没有副本。 */
   const [backupWarn, setBackupWarn] = useState('');
+  /** 一批正在等备份、准备交给会话 —— 说一句，免得你以为没反应又点一次（再点也不会重复发，见 `handoffGateFor`） */
+  const [handingOff, setHandingOff] = useState(false);
   /** 提交前读不到这份文件（远端连不上……）—— 什么都没发，标记留着；原因摆出来，而不是让人反复点。 */
   const [writeWarn, setWriteWarn] = useState('');
   /**
@@ -659,13 +674,16 @@ export const ReviewPane: React.FC<{
   /**
    * 把 KiroLex 自己改不了的那些**一条消息**发给那条会话，由它自己改文件（deck 那侧）。
    * 先备份再发：这条路是会话自己写这个文件，走不到 `reviewWriteFile` 那道「写前拷一份」。
+   * **等备份回来、成了才发**（`backupThenSend`）：没成就不发，原因摆出来，标记由调用方留着（返回 false）。
    */
-  const sendToSession = (message: string): boolean => {
+  const sendToSession = async (message: string): Promise<boolean> => {
     if (!onSubmit) return false;
-    void window.kiroApi.reviewBackupFile?.(sessionId, path).then((res: any) => {
-      setBackupWarn(res?.ok ? '' : String(res?.error || t('Backup failed')));
-    });
-    onSubmit(message);
+    const r = await backupThenSend(() => window.kiroApi.reviewBackupFile?.(sessionId, path), () => onSubmit(message));
+    if (!r.ok) {
+      setBackupWarn(r.why || t('Backup failed'));
+      return false;
+    }
+    setBackupWarn('');
     setJustSent(true);
     window.setTimeout(() => setJustSent(false), 4000);
     return true;
@@ -708,7 +726,7 @@ export const ReviewPane: React.FC<{
    */
   const writeBack = async (
     base: string, fullText: string, key: string, what: string, alreadyWritten = false,
-    opts: { ai?: { changes?: unknown; round: number; lost?: string[] }; undid?: number; expectBase?: string } = {},
+    opts: { ai?: { changes?: unknown; round: number; lost?: string[] }; undid?: number; expectBase?: string; edited?: EditRange[] } = {},
   ): Promise<boolean> => {
     if (!alreadyWritten) {
       const wrote: any = await window.kiroApi.reviewWriteFile?.(sessionId, path, fullText, opts.expectBase);
@@ -721,11 +739,18 @@ export const ReviewPane: React.FC<{
         return false;
       }
     }
-    const baseBlocks = lineBlocks(base);
-    const patch = rewritePatch(
-      baseBlocks.flatMap((b) => (b.kind === 'line' ? [{ index: b.index, text: b.text }] : [])),
-      fullText,
-    );
+    /*
+      旧行号 → 新行号。**知道这次实际改了哪一段时按那一段算**（`exactKeep`）：只按全文文字对齐的话，两处一样的 `- TODO`
+      删掉第一处之后，留下的那一处会被认成"第一处还在"，排在后面对第一处的删除就删到了第二处。
+      不知道改了哪一段（主进程回的 changes 对不上）才退回全文对齐。
+    */
+    const edited = opts.edited ?? (opts.ai ? trustedChanges(opts.ai.changes, base, fullText)?.map((c) => ({ oldFrom: c.origFrom, oldTo: c.origTo, newFrom: c.from, newTo: c.to })) : undefined);
+    const patch = edited
+      ? { keep: exactKeep(base, fullText, edited) }
+      : rewritePatch(
+        lineBlocks(base).flatMap((b) => (b.kind === 'line' ? [{ index: b.index, text: b.text }] : [])),
+        fullText,
+      );
     /* 提交之后又标的那些、没做成退回来的那些、排在后面的那些 —— 全都跟着它们那一行走 */
     livePane().setDraftLive((cur) => remapKeyed(cur, patch.keep, ''));
     livePane().setMarkOrder((cur) => remapKeyed(cur, patch.keep, ''));
@@ -755,26 +780,11 @@ export const ReviewPane: React.FC<{
     return true;
   };
 
-  /**
-   * 这一块在**此刻**的文件里占哪一段 —— **按原文找，不按行号**。
-   *
-   * 排在队里的那条提交的时候记下了锚点那一行的原文；轮到它时前面的改动可能已经让行号挪了好几行
-   * （上面加了一段、删了一段）。按行号去对就会"这一处已经变了"，或者更糟 —— 对上了别的段。
-   * 所以拿原文在此刻的正文里找，有几处一样的就取离原来行号最近的那一处。找不到（那一行本身被前面的
-   * 改动改掉了）就返回 null，调用方说清楚，而不是改错地方。
-   */
-  const locate = (base: string, anchorText: string, nearLine: number): { from: number; to: number; anchor: number } | null => {
-    const baseBlocks = lineBlocks(base);
-    let best: number | null = null;
-    for (const b of baseBlocks) {
-      if (b.kind !== 'line' || b.text !== anchorText) continue;
-      if (best === null || Math.abs(b.index - nearLine) < Math.abs(best - nearLine)) best = b.index;
-    }
-    if (best === null) return null;
-    const g = displayGroups(baseBlocks).find((x) => x.anchor === best);
-    const { from, to } = spanRange(g && g.span.length > 1 ? g.span : dropSpan(baseBlocks, best));
-    return { from, to, anchor: best };
-  };
+  /*
+    这一块在**此刻**的文件里占哪一段 —— **按原文找，不按行号**（`locateBlock`，reviewBlocks.ts，纯的、有测试）。
+    找的时候给的是这一条**此刻**的行号（`reviewItemLine`：队列里跟着前面的落盘挪过的那个），不是提交那一刻的 ——
+    一份里有两行一样的（`- TODO`）时，拿老行号去找会对上另一处。
+  */
   /** 一块在**此刻屏幕上**的原文 —— 提交那一刻记下来，排队期间行号怎么挪都按它找。 */
   const anchorTextOf = (anchor: number): string | undefined => {
     const b = blocks.find((x) => x.index === anchor);
@@ -804,8 +814,9 @@ export const ReviewPane: React.FC<{
     const interrupted: string[] = [];
     const interruptedTickets: Record<string, string> = {};
     for (const j of jobs) {
-      const k = j.persist?.key;
-      if (!k) continue;
+      if (!j.persist?.key) continue;
+      /* 按此刻的行号存 —— 前面的改动挪了行号，放回来的意见还挂在它那一行上 */
+      const k = liveMarkKey(j);
       interrupted.push(k);
       if (j.persist?.ticket) interruptedTickets[k] = j.persist.ticket;
       if (k.startsWith('drop:')) { const n = Number(k.slice(5)); if (!drops.includes(n)) drops.push(n); }
@@ -857,7 +868,7 @@ export const ReviewPane: React.FC<{
     if (!plan.ok) { noteAiMark(id, plan.why); return false; }
     const m = plan.mark;
     const where = m.to >= m.from ? whereAt(m.from, m.to) : (isDeck ? t('before page {n}', { n: m.from }) : t('before line {n}', { n: m.from }));
-    return writeBack(disk, plan.text, `ai:${id}`, t('Undid the AI change to {file} {where} and restored the original', { file: fileName, where }), false, { undid: id, expectBase: disk });
+    return writeBack(disk, plan.text, `ai:${id}`, t('Undid the AI change to {file} {where} and restored the original', { file: fileName, where }), false, { undid: id, expectBase: disk, edited: [singleRange(disk, plan.text, m.from, m.to)] });
   });
 
   /** 排进这份文件的队列 —— 提交那一刻全部排上，轮到了才真的开跑。 */
@@ -868,9 +879,11 @@ export const ReviewPane: React.FC<{
    * 取消：还没轮到的直接跳过；已经在跑的让主进程停掉**这一次**改写（`reviewCancel`）。两种都把标记放回去
    * （`restore`）—— 取消是"这次先别做"，不是"这条意见不要了"，要不要再提交你自己定。
    */
-  const enqueue = (kind: Job['kind'], line: number, run: (ticket: string) => Promise<boolean>, restore: () => void, persist?: Job['persist']) => {
+  const enqueue = (kind: Job['kind'], line: number, run: (ticket: string) => Promise<boolean>, putBack: (ticket: string) => void, persist?: Job['persist']) => {
     const id = ++jobSeq.current;
     const ticket = `rv:${path}#${id}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+    /* 放回标记：放在这一条**此刻**指的那一行（`reviewItemLine(ticket)`）—— 排队期间前面的改动可能已经挪了它 */
+    const restore = () => putBack(ticket);
     const what = kindLabel(kind);
     const where = kind === 'whole' ? '' : ` · ${whereAt(line, line)}`;
     let running = false;
@@ -936,15 +949,25 @@ export const ReviewPane: React.FC<{
     const key = mode === 'insert' ? `+${anchor}` : String(anchor);
     livePane().clearDraft(key);
     livePane().setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; });
+    /* 此刻指的那一行 —— 排队期间前面的改动挪过它（见 `enqueue` 的 `restore`） */
+    const restoreAt = (ticket: string) => reviewItemLine(ticket) ?? anchor;
+    const keyAt = (line: number) => (mode === 'insert' ? `+${line}` : String(line));
     enqueue(mode, anchor, async (ticket) => {
-      let failKey = key;
+      const near = reviewItemLine(ticket) ?? anchor;
+      let failKey = keyAt(near);
       const fail = (why: string) => {
         livePane().typeDraft(failKey, instruction);
         livePane().setApplyNote((cur) => ({ ...cur, [failKey]: why }));
         return false;
       };
+      /*
+        渲染层自己写的那一次（主进程没写：老主进程，或者盘上和 base 对不上）**写不进去时把意见放回去** ——
+        原来只挂了一句原因，意见本身（提交时已经从标记里清掉了）就这么没了。
+      */
+      const landed = (ok: boolean) => { if (!ok) livePane().typeDraft(failKey, instruction); return ok; };
       const base = currentText();
-      const at = locate(base, anchorText, anchor);
+      /* 要改的那一行已经被前面的改动改掉 / 删掉了：不再按原文去找（会找到另一处一样的），当成冲突 */
+      const at = reviewItemLost(ticket) ? null : locateBlock(base, anchorText, near);
       if (!at) return fail(t('This passage was changed by an earlier edit. Look at the new text and comment on it again.'));
       const { from, to } = at;
       failKey = mode === 'insert' ? `+${at.anchor}` : String(at.anchor);
@@ -968,9 +991,13 @@ export const ReviewPane: React.FC<{
         if (res.scope !== 'insert') {
           return fail(t('The main process is still the old version and doesn\'t support "Add a paragraph". Restart KiroLex and try again (nothing was written this time).'));
         }
-        if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round } });
+        if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round }, edited: [singleRange(base, res.fullText, to + 1, to)] });
         const fullText = insertAfterLines(base, to, String(res.text));
-        return writeBack(base, fullText, failKey, t('Added a paragraph after {file} {where}', { file: fileName, where: whereAt(from, to) }), false, { ai: { round } });
+        /*
+          **带 expectBase 写**：主进程没写、把结果交回来，多半是因为盘上已经不是 `base` 了（等回复期间被外面 / 模型的工具 /
+          另一条会话改过）—— 不带的话这一次就拿旧底稿拼的整份把那次改动静默盖掉。对不上就不写、意见放回去。
+        */
+        return landed(await writeBack(base, fullText, failKey, t('Added a paragraph after {file} {where}', { file: fileName, where: whereAt(from, to) }), false, { ai: { round }, expectBase: base, edited: [singleRange(base, fullText, to + 1, to)] }));
       }
       let res: any = await window.kiroApi.reviseInSession?.({
         sessionId: sessionId!, where, note: instruction, about: path, label, scope: 'block', ticket,
@@ -1001,11 +1028,12 @@ export const ReviewPane: React.FC<{
         return fail(res?.cannot ? t('Couldn\'t change it: {why}. Try wording it differently.', { why: res.cannot }) : t('Rewrite failed: {err}', { err: res?.error || t('no response') }));
       }
       const lost = lostOf(where, res);
-      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round, lost } });
+      if (res.written && typeof res.fullText === 'string') return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round, lost }, edited: [singleRange(base, res.fullText, from, to)] });
       /* 只回了这一块（快的那一档）时，先把它拼回整份 —— 写盘要的是完整正文 */
       const fullText = spliceLines(base, from, to, String(res.text));
-      return writeBack(base, fullText, failKey, t('Revised {file} {where} as commented', { file: fileName, where: whereAt(from, to) }), false, { ai: { round, lost } });
-    }, () => livePane().typeDraft(key, instruction), { key, text: instruction });
+      /* 带 expectBase 写（同上面 ＋ 那一处）：盘上已经不是 `base` 就不写、意见放回去 */
+      return landed(await writeBack(base, fullText, failKey, t('Revised {file} {where} as commented', { file: fileName, where: whereAt(from, to) }), false, { ai: { round, lost }, expectBase: base, edited: [singleRange(base, fullText, from, to)] }));
+    }, (ticket) => livePane().typeDraft(keyAt(restoreAt(ticket)), instruction), { key, text: instruction });
   };
 
   /**
@@ -1018,32 +1046,44 @@ export const ReviewPane: React.FC<{
     const key = `=${anchor}`;
     livePane().clearDraft(key);
     livePane().setApplyNote((cur) => { const n = { ...cur }; delete n[key]; return n; });
-    enqueue('edit', anchor, async () => {
+    const restoreAt = (ticket: string) => reviewItemLine(ticket) ?? anchor;
+    enqueue('edit', anchor, async (ticket) => {
       const base = currentText();
-      const at = locate(base, anchorText, anchor);
+      const near = reviewItemLine(ticket) ?? anchor;
+      /* 要改的那一行已经被前面的改动改掉 / 删掉了：不再按原文去找（会找到另一处一样的），当成冲突 */
+      const at = reviewItemLost(ticket) ? null : locateBlock(base, anchorText, near);
       if (!at) {
-        livePane().typeDraft(`=${anchor}`, replacement);
-        livePane().setApplyNote((cur) => ({ ...cur, [key]: t('This passage was changed by an earlier edit, so it wasn\'t replaced. Look at the new text and edit again.') }));
+        livePane().typeDraft(`=${near}`, replacement);
+        livePane().setApplyNote((cur) => ({ ...cur, [`=${near}`]: t('This passage was changed by an earlier edit, so it wasn\'t replaced. Look at the new text and edit again.') }));
         return false;
       }
       const fullText = spliceLines(base, at.from, at.to, replacement.replace(/\n+$/, ''));
-      return writeBack(base, fullText, `=${at.anchor}`, t('Replaced {file} {where} with what you wrote', { file: fileName, where: whereAt(at.from, at.to) }));
-    }, () => livePane().typeDraft(key, replacement), { key, text: replacement });
+      /* 带 expectBase 写：预览还没刷出外面那次改动时，不拿旧底稿把它盖掉；写不进去就把你写的那份放回去 */
+      const ok = await writeBack(base, fullText, `=${at.anchor}`, t('Replaced {file} {where} with what you wrote', { file: fileName, where: whereAt(at.from, at.to) }), false, { expectBase: base, edited: [singleRange(base, fullText, at.from, at.to)] });
+      if (!ok) livePane().typeDraft(`=${at.anchor}`, replacement);
+      return ok;
+    }, (ticket) => livePane().typeDraft(`=${restoreAt(ticket)}`, replacement), { key, text: replacement });
   };
 
   /** **一处 ✕** —— 不问模型：删是确定的操作。同样排队、按原文找、写前备份；没做成就把删除标记放回去。 */
   const queueDelete = (anchor: number) => {
     const anchorText = anchorTextOf(anchor);
     if (anchorText === undefined) return;
-    enqueue('delete', anchor, async () => {
+    const restoreAt = (ticket: string) => reviewItemLine(ticket) ?? anchor;
+    enqueue('delete', anchor, async (ticket) => {
       const base = currentText();
-      const at = locate(base, anchorText, anchor);
+      const near = reviewItemLine(ticket) ?? anchor;
+      /* 要改的那一行已经被前面的改动改掉 / 删掉了：不再按原文去找（会找到另一处一样的），当成冲突 */
+      const at = reviewItemLost(ticket) ? null : locateBlock(base, anchorText, near);
       if (!at) {
-        livePane().setApplyNote((cur) => ({ ...cur, [`drop:${anchor}`]: t('This passage was changed by an earlier edit, so it wasn\'t deleted. Look at the new text and mark it again.') }));
+        livePane().setApplyNote((cur) => ({ ...cur, [`drop:${near}`]: t('This passage was changed by an earlier edit, so it wasn\'t deleted. Look at the new text and mark it again.') }));
         return false;
       }
-      return writeBack(base, deleteLines(base, at.from, at.to), `drop:${at.anchor}`, t('Deleted {file} {where}', { file: fileName, where: whereAt(at.from, at.to) }));
-    }, () => livePane().setDropped((cur) => ({ ...cur, [anchor]: true })), { key: `drop:${anchor}`, text: '' });
+      /* 带 expectBase 写（同 ✎）；写不进去就把删除标记放回去 */
+      const ok = await writeBack(base, deleteLines(base, at.from, at.to), `drop:${at.anchor}`, t('Deleted {file} {where}', { file: fileName, where: whereAt(at.from, at.to) }), false, { expectBase: base, edited: [singleRange(base, deleteLines(base, at.from, at.to), at.from, at.to)] });
+      if (!ok) livePane().setDropped((cur) => ({ ...cur, [at.anchor]: true }));
+      return ok;
+    }, (ticket) => livePane().setDropped((cur) => ({ ...cur, [restoreAt(ticket)]: true })), { key: `drop:${anchor}`, text: '' });
   };
 
   /**
@@ -1084,7 +1124,10 @@ export const ReviewPane: React.FC<{
       if (res?.cancelled) return false;
       if (!res?.ok) {
         if (res?.cannot) {
-          return sendToSession(`请改「${path}」第 ${page} 页：${instruction}\n（KiroLex 当场改不了这一条：${res.cannot}）\n改完保存这个文件。`);
+          const sent = await sendToSession(`请改「${path}」第 ${page} 页：${instruction}\n（KiroLex 当场改不了这一条：${res.cannot}）\n改完保存这个文件。`);
+          /* 备份没成就没发 —— 意见放回去（原因在底下那行备份提示里） */
+          if (!sent) livePane().typeDraft(String(page), instruction);
+          return sent;
         }
         livePane().typeDraft(String(page), instruction);
         livePane().setApplyNote((cur) => ({ ...cur, [String(page)]: t('Rewrite failed: {err}', { err: res?.error || t('no response') }) }));
@@ -1106,6 +1149,8 @@ export const ReviewPane: React.FC<{
     const key = `note:${page}`;
     livePane().clearDraft(key);
     const before = notes?.[page - 1] || '';
+    /* 讲稿读到过才拿它核对（`deck:write-note` 的 `expect`）—— 没读到时 `before` 只是个空串，拿它比会把每次都判成冲突 */
+    const expectNote = Array.isArray(notes) ? before : undefined;
     enqueue('note', page, async (ticket) => {
       const fail = (why: string) => { livePane().typeDraft(key, instruction); livePane().setApplyNote((cur) => ({ ...cur, [key]: why })); return false; };
       const res: any = await window.kiroApi.reviseInSession?.({
@@ -1119,7 +1164,7 @@ export const ReviewPane: React.FC<{
       });
       if (res?.cancelled) return false;
       if (!res?.ok || typeof res.text !== 'string') return fail(res?.cannot ? t('Couldn\'t change it: {why}', { why: res.cannot }) : t('Rewrite failed: {err}', { err: res?.error || t('no response') }));
-      const wrote: any = await window.kiroApi.deckWriteNote?.(sessionId, path, page, res.text);
+      const wrote: any = await window.kiroApi.deckWriteNote?.(sessionId, path, page, res.text, expectNote);
       if (!wrote?.ok) return fail(t('Couldn\'t write this page\'s notes: {err}', { err: wrote?.error || t('unknown reason') }));
       /* 用**重抽出来的**那一份，不是我们以为写进去的那份 */
       if (Array.isArray(wrote.notes)) livePane().setNotes(wrote.notes);
@@ -1137,7 +1182,11 @@ export const ReviewPane: React.FC<{
    * 文本那侧的顺序：＋ → 💬 → ✕ → 整篇。＋ 在 💬 前面：同一段既要改又要在后面加时，＋ 按这一段的**原文**找位置，
    * 先改了它就找不到了；✕ 和整篇放最后，让逐段的那些先落定。位置都按原文找（`locate`），谁先谁后不会错位。
    */
-  const submitAll = (): boolean => {
+  /*
+    返回值给框（`CommentBox.onApply`）用：真 = 已经交出去了，框把它那份草稿清掉。deck 那批要**等备份回来**才知道发没发出去
+    （见 `sendToSession`），所以那时返回 Promise —— 备份没成就是 false，框里写的字留着。
+  */
+  const submitAll = (): boolean | Promise<boolean> => {
     if (!sessionId || markCount === 0) return false;
     closeBoxes();
     if (!isDeck) {
@@ -1167,27 +1216,53 @@ export const ReviewPane: React.FC<{
       deck：当场改得了的（`.pptx` 一页的字、一页讲稿）一页一页排队改；其余的 —— 加页、删页、`.pdf` / 不能改的
       deck 上的意见、整份的意见 —— 拼成**一条**消息发给会话，由它一次改完（拆成几条发，它就得改几遍、存几遍）。
     */
+    /* 上一批还在等备份 / 在发：这一次什么都不做、标记照留（框里的字也不清）—— 否则同一批意见会发两遍 */
+    if (handoffGateFor(path).busy) return false;
     const handOff: string[] = [];
+    /* 交给会话的那几条的草稿键 —— **发出去了才清**：备份没成就没发，标记得留着让你再提交（见 `sendToSession`） */
+    const handedKeys: string[] = [];
     for (const [page, t] of marks.revise) {
       if (live) queueSlide(page, t);
-      else { handOff.push(`· 第 ${page} 页（版面）：${t}`); livePane().clearDraft(String(page)); }
+      else { handOff.push(`· 第 ${page} 页（版面）：${t}`); handedKeys.push(String(page)); }
     }
     for (const [page, t] of marks.note) {
       if (live) queueNote(page, t);
-      else { handOff.push(`· 第 ${page} 页（演讲者备注）：${t}`); livePane().clearDraft(`note:${page}`); }
+      else { handOff.push(`· 第 ${page} 页（演讲者备注）：${t}`); handedKeys.push(`note:${page}`); }
     }
-    for (const [page, t] of marks.insert) { handOff.push(`· 在第 ${page} 页后面新加一页：${t}`); livePane().clearDraft(`+${page}`); }
+    for (const [page, t] of marks.insert) { handOff.push(`· 在第 ${page} 页后面新加一页：${t}`); handedKeys.push(`+${page}`); }
     for (const page of marks.drops) handOff.push(`· 删掉第 ${page} 页（版面和演讲者备注一起）`);
     if (marks.whole) handOff.push(`· 整份：${marks.whole}`);
+    /*
+      **提交这一刻的快照** —— 发出去之后只清这一批里此刻还和快照一样的那些（`clearSent`）：
+      等备份的那几秒里你新写的、改过的不在发出去的那条消息里，不能跟着清掉。
+    */
+    const sentDrafts: Record<string, string> = Object.fromEntries(handedKeys.map((k) => [k, draftLive[k]]));
+    const sentDrops: Record<string, true> = Object.fromEntries(marks.drops.map((p) => [String(p), true as const]));
+    const sentWhole = wholeDraft;
+    const clearHanded = () => {
+      const nowDrafts = draftRef.current;
+      const cleared = [
+        ...handedKeys.filter((k) => nowDrafts[k] === sentDrafts[k]),
+        ...marks.drops.map((p) => `drop:${p}`),
+        ...(wholeRef.current === sentWhole ? ['whole'] : []),
+      ];
+      livePane().setDraftLive((cur) => clearSent(cur, sentDrafts));
+      livePane().setDropped((cur) => clearSent(cur as Record<string, true>, sentDrops) as Record<number, true>);
+      livePane().setWholeDraft((cur) => (cur === sentWhole ? '' : cur));
+      livePane().setMarkOrder((cur) => { const n = { ...cur }; for (const k of cleared) delete n[k]; return n; });
+    };
     if (handOff.length) {
+      setHandingOff(true);
       /* 页号按**提交这一刻**的说 —— 删页、加页会让后面的页号变，所以叫它整批按这份清单一次改完 */
-      sendToSession(`请按下面这几条改「${path}」（页号都是改之前的），一次改完、保存这个文件：\n${handOff.join('\n')}`);
+      const send = () => sendToSession(`请按下面这几条改「${path}」（页号都是改之前的），一次改完、保存这个文件：\n${handOff.join('\n')}`);
+      const sent = handoffGateFor(path).run(send).then((ok) => !!ok);
+      void sent.then((ok) => { if (ok) clearHanded(); }).finally(() => setHandingOff(false));
+      return sent;
     }
-    livePane().setDropped({});
-    livePane().setWholeDraft('');
-    livePane().setMarkOrder({});
+    clearHanded();
     return true;
   };
+
 
   /** 排着的改动锁住的行 —— **整节一起锁**：标题那条意见改的是整节，节内任何一行都不能同时再标。 */
   const lockedLines = new Set<number>();
@@ -1258,7 +1333,7 @@ export const ReviewPane: React.FC<{
         /* 对着一行写的意见通常是一句话 —— 不要一个突然出现的大方块 */
         rows={2}
         placeholder={placeholder}
-        onApply={() => submitAll()}
+        onApply={() => submitFromBox(submitAll)}
         applyWhenEmpty={markCount > 0}
         applyLabel={confirmLabel}
         applyTitle={confirmTitle}
@@ -1356,7 +1431,7 @@ export const ReviewPane: React.FC<{
             startOpen
             rows={Math.min(14, Math.max(3, blockSource(anchor).split('\n').length + 1))}
             placeholder={t('The original text of this block. Edit it directly.')}
-            onApply={() => submitAll()}
+            onApply={() => submitFromBox(submitAll)}
             applyWhenEmpty={markCount > 0}
             applyLabel={confirmLabel}
             applyTitle={confirmTitle}
@@ -1437,11 +1512,12 @@ export const ReviewPane: React.FC<{
   };
 
   /** 发给会话之后那一句确认 / 备份没成的警告。 */
-  const statusLine = (justSent || backupWarn || writeWarn) ? (
+  const statusLine = (justSent || backupWarn || writeWarn || handingOff) ? (
     <div className="rv-review-status">
+      {handingOff && <p className="rv-review-sent">{t('Backing up this file before sending it to the session…')}</p>}
       {justSent && <p className="rv-review-sent">{t('Sent to this file\'s session. Check that session to see how it edits the file.')}</p>}
       {writeWarn && <p className="rv-review-warn">{t('Couldn\'t read this file, so nothing was submitted ({why}). Your marks are all still here; click "✓ Confirm" again once it\'s reachable.', { why: writeWarn })}</p>}
-      {backupWarn && <p className="rv-review-warn">{t('Couldn\'t back up this file before sending ({why}). If the session breaks it, there\'s no copy to roll back to.', { why: backupWarn })}</p>}
+      {backupWarn && <p className="rv-review-warn">{t('Couldn\'t back up this file ({why}), so nothing was sent to the session. Your marks are still here; submit again once the backup works.', { why: backupWarn })}</p>}
     </div>
   ) : null;
   /**

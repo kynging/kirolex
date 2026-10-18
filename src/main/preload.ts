@@ -495,8 +495,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   previewPdfBytes: (sessionId: string | null | undefined, pdfPath: string) =>
     ipcRenderer.invoke('preview:pdf-bytes', sessionId, pdfPath),
   /** 改**一页**的演讲者备注（一页一个 XML part，不重导整份）—— 写前备份。 */
-  deckWriteNote: (sessionId: string | null | undefined, filePath: string, page: number, text: string) =>
-    ipcRenderer.invoke('deck:write-note', sessionId, filePath, page, text),
+  deckWriteNote: (sessionId: string | null | undefined, filePath: string, page: number, text: string, expect?: string) =>
+    ipcRenderer.invoke('deck:write-note', sessionId, filePath, page, text, expect),
   /** 问打开这份 deck 的会话这一页的字该怎么改，KiroLex 按 run 地址写进去（正忙就排队）。 */
   /** 取消侧栏 comment 提交的**那一次**改写（按 ticket）—— 没轮到的直接不跑，在跑的只停它那一轮，不碰别的对话。 */
   reviewCancel: (ticket: string) => ipcRenderer.invoke('review:cancel', ticket),

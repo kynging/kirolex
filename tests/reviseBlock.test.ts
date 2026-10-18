@@ -376,8 +376,8 @@ describe('丢字段提示的接线', () => {
     const block = RV.slice(RV.indexOf("apply: { path, mode: 'splice', from, to, base },"));
     const warnAt = block.indexOf('const lost = lostOf(where, res);');
     assert.ok(warnAt > 0);
-    assert.ok(block.includes("return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round, lost } });"));
-    assert.ok(block.includes('whereAt(from, to) }), false, { ai: { round, lost } });'));
+    assert.ok(block.includes("return writeBack(base, res.fullText, failKey, '', true, { ai: { changes: res.changes, round, lost }, edited: [singleRange(base, res.fullText, from, to)] });"));
+    assert.ok(block.includes('whereAt(from, to) }), false, { ai: { round, lost }, expectBase: base, edited: [singleRange(base, fullText, from, to)] }));'));
     /* 每一处只说**它自己**删掉的那几个 —— 撤销哪一处，恢复的就是它说的那几个 */
     assert.ok(RV.includes('const perChange = lostFieldsByChange(changes, opts.ai?.lost ?? []);'));
     assert.ok(RV.includes('...(perChange[i].length ? { warn: lostWarnText(perChange[i]) } : null)'));

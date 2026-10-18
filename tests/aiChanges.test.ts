@@ -156,7 +156,7 @@ describe('planUndo：以盘上此刻那一份为准', () => {
     const RV = fs.readFileSync('src/renderer/components/ReviewPane.tsx', 'utf8');
     assert.ok(RV.includes('await window.kiroApi.workspaceRead(sessionId, path)'));
     assert.ok(RV.includes('const plan = planUndo(state, id, disk, lang);'));
-    assert.ok(RV.includes('{ undid: id, expectBase: disk }'));
+    assert.ok(RV.includes('{ undid: id, expectBase: disk, edited: [singleRange(disk, plan.text, m.from, m.to)] }'));
     assert.ok(RV.includes('reviewWriteFile?.(sessionId, path, fullText, opts.expectBase)'));
     const P = fs.readFileSync('src/main/preload.ts', 'utf8');
     assert.ok(P.includes("ipcRenderer.invoke('review:write-file', sessionId, filePath, text, expectBase)"));

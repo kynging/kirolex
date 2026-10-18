@@ -105,3 +105,33 @@ export async function writeTextVia(io: {
     return { ok: false, error: String(error?.message || error) };
   }
 }
+
+/**
+ * 一份文件的备份文件名前缀：`<文件名>__<完整路径的短指纹>__`（后面接时间戳）。
+ *
+ * 带指纹是为了**按文件**清理（`reviewBackupsToPrune`）：只按文件名分的话，`a/README.md` 和 `b/README.md` 共用一份额度。
+ * 文件名摆在最前面 —— 翻 `~/.kirolex/backups/review-files/` 找回某个文件时一眼认得出来。
+ * 两种分隔符都认（Windows 路径是 `\`），文件名那一段最多留 `BACKUP_NAME_MAX` 个字符：备份名要在
+ * 常见的 255 字符文件名上限以内，否则备份写不成、整次写回被拒。截掉的部分靠指纹区分。
+ */
+const BACKUP_NAME_MAX = 100;
+export function reviewBackupPrefix(want: string): string {
+  const name = (String(want || '').split(/[\\/]/).pop() || '').replace(/[^\w.-]+/g, '_').slice(0, BACKUP_NAME_MAX) || 'file';
+  let h = 0x811c9dc5;
+  for (const ch of String(want || '')) { h ^= ch.codePointAt(0)!; h = Math.imul(h, 0x01000193) >>> 0; }
+  return `${name}__${h.toString(16).padStart(8, '0')}__`;
+}
+
+/**
+ * 刚给 `want` 写了一份备份之后，要删掉哪些（返回文件名）—— **只看这份文件自己的**，按时间留最近 `keep` 份。
+ *
+ * 原来是整个目录一起排、一共留 12 份：改别的文件十几次，这个文件改之前唯一的那份备份就被挤掉了。
+ */
+export function reviewBackupsToPrune(entries: Array<{ name: string; t: number }>, want: string, keep: number): string[] {
+  const prefix = reviewBackupPrefix(want);
+  return entries
+    .filter((e) => e.name.startsWith(prefix))
+    .sort((a, b) => b.t - a.t)
+    .slice(keep)
+    .map((e) => e.name);
+}

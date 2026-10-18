@@ -738,3 +738,14 @@ export function parseNotesResult(
     };
   } catch { return null; }
 }
+
+/**
+ * 讲稿在等回复期间被别的改动改过没有 —— PURE（`deck:write-note` 写之前用）。
+ *
+ * `notes` 是盘上此刻抽出来的每页讲稿（`NOTES_SCRIPT`，已经 strip 过），`expect` 是这条意见提交时看到的那一页。
+ * 读不到（`null`、页码越界）就不拦：写的那一步自己会报错，这里只管"确实变了"。
+ */
+export function noteChanged(notes: string[] | null | undefined, page: number, expect: string): boolean {
+  if (!Array.isArray(notes) || !Number.isInteger(page) || page < 1 || page > notes.length) return false;
+  return String(notes[page - 1] ?? '').trim() !== String(expect ?? '').trim();
+}

@@ -1,5 +1,6 @@
 import React, { useState } from 'react';
 import { useT } from '../hooks/useLang';
+import { applyDraft } from '../commentBoxApply';
 
 /**
  * 一块内容旁边那个「写点意见」的框 —— 侧栏文件预览（`ReviewPane`）用它。
@@ -122,11 +123,8 @@ export const CommentBox: React.FC<{
     （于是同一处改两遍，第二遍是对着已经改过的文本执行同一条指令）。
     失败/改不了时**保留草稿、框也留着** —— 那条话还没起作用，让你改措辞再试，而不是重新打一遍。
   */
-  const apply = () => {
-    const next = draft.trim();
-    if ((!next && !applyWhenEmpty) || !onApply) return;
-    void Promise.resolve(onApply(next)).then((ok) => { if (ok) setDraft(''); });
-  };
+  /* 判据在 `applyDraft`（commentBoxApply.ts，纯的、有测试） */
+  const apply = () => { void applyDraft(draft, onApply, setDraft, applyWhenEmpty); };
   const cancel = () => {
     // 从来没确认过的（原值为空）取消就等于不写；确认过的退回上一次确认的内容
     if (!value.trim() && onRemove) { onRemove(); return; }
