@@ -105,6 +105,8 @@ export interface SessionRecord {
    *  KiroLex owns `id` (dir key); this maps to the backend session for resume.
    *  Absent on legacy records where id WAS the kiro-cli id (treat id as fallback). */
   cliSessionId?: string;
+  /** 这条会话收到过模型起的后台命令 / 监视的输出（可能带凭证）：之后的故障诊断包不再抄会话内容（见 failureBundle.ts）。 */
+  bgOutputSeen?: boolean;
   /**
    * **这条会话的本地工作目录**。
    *
@@ -265,6 +267,14 @@ export function lastInjectionPath(id: string): string {
 
 export function writeLastInjection(id: string, snapshot: string): void {
   refuseAdvancedOnlyWrite(id);
+  /*
+    **收到过后台命令 / 监视输出的会话不另存快照**：快照是从会话记录拼的，里面会带着那段输出（可能有凭证），
+    而那段输出只该留在会话记录里、不额外落盘。旧的那份一起删掉 —— 不然快照视图里挂着的是过时的东西。
+  */
+  if (readRecord(id)?.bgOutputSeen) {
+    try { fs.rmSync(lastInjectionPath(id), { force: true }); } catch { /* 没有就算了 */ }
+    return;
+  }
   ensureDir(id);
   const target = lastInjectionPath(id);
   const header = '# 上一次发送实际带给模型的上下文快照\n'

@@ -41,6 +41,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // imports the same module rather than keeping a second copy of the rules.
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
 import type { ScheduleSummary } from '../scheduleView';
+import { bgElapsedText, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
 import { IconClaudeSpark, IconCodexPrompt, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
@@ -2756,6 +2757,10 @@ interface ChatAreaProps {
    *  empty chip still reads as "scheduled". Liveness and wording are decided in that helper,
    *  so this component neither filters jobs nor formats a countdown. */
   scheduleSummary?: ScheduleSummary | null;
+  /** 模型起的、**还在跑**的后台命令 / 监视（`runningBgJobs` 过滤好的）。空数组 = 那一行不出现。 */
+  bgJobs?: BgJobRow[];
+  /** 停掉一个（主进程只结束它自己起的那个进程，并在会话里说一声）。 */
+  onStopBgJob?: (jobId: string) => void;
 
   /** The project this chat belongs to, or null when it is unassigned. The flow rail is offered
    *  ONLY when there is one: a flow is a property of a project, so a "流程" entry on an
@@ -2878,6 +2883,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   isLooping,
   onStartSchedule,
   scheduleSummary,
+  bgJobs,
+  onStopBgJob,
   projectName,
   onPauseSchedule,
   onCancelSchedule,
@@ -3062,6 +3069,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [cancelArmed, setCancelArmed] = useState(false);
   const cancelArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   useEffect(() => () => { if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current); }, []);
+  /** 后台任务那一行的「运行了多久」用的钟：只在有任务在跑时走，粒度跟显示一致（第一分钟里按秒，之后按分钟）。 */
+  const [bgNow, setBgNow] = useState(() => Date.now());
+  const hasBgJobs = !!bgJobs?.length;
+  useEffect(() => {
+    if (!hasBgJobs) return;
+    setBgNow(Date.now());
+    const timer = setInterval(() => setBgNow(Date.now()), 5000);
+    return () => clearInterval(timer);
+  }, [hasBgJobs]);
 
   const draftSchedule = useMemo<ScheduleSpec>(() => ({
     prompt: scheduleSetup?.text || '',
@@ -3990,6 +4006,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           title={scheduleSummary.text}
         >
           <span className="schedule-banner-icon">{scheduleSummary.paused ? '⏸️' : '⏰'}</span>
+          {scheduleSummary.byModel && (
+            <span className="schedule-banner-by-model" title={t('The model in this chat set this up itself (schedule_create). Pause or cancel it like any other job.')}>{t('🤖 Created by the model')}</span>
+          )}
           <span className="schedule-banner-text">{scheduleSummary.text}</span>
           {scheduleSummary.next && (
             <>
@@ -4020,6 +4039,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               >{cancelArmed ? t('Confirm cancel?') : t('🗑️ Cancel')}</button>
             </>
           )}
+        </div>
+      )}
+
+      {/* 模型起的后台命令 / 监视：和定时任务横幅同一个位置、同一个理由 —— 在跑的东西必须看得见、停得掉。
+          只列还在跑的（结束的结果已经作为一条消息回到会话里了）。 */}
+      {bgJobs && bgJobs.length > 0 && (
+        <div className="bg-jobs-banner">
+          {bgJobs.map((job) => (
+            <div key={job.jobId} className="bg-job-row" title={job.command}>
+              <span className="bg-job-icon">{job.kind === 'watch' ? '👀' : '⚙️'}</span>
+              <span className="bg-job-kind">{job.kind === 'watch' ? t('Watching') : t('Background command')}</span>
+              <span className="bg-job-label">{job.label}</span>
+              <span className="bg-job-elapsed">{t('running for {time}', { time: bgElapsedText(job.startedAt, bgNow, findLang) })}</span>
+              {job.kind === 'watch' && job.events > 0 && <span className="bg-job-events">{t('{n} event(s)', { n: job.events })}</span>}
+              <button
+                className="bg-job-stop"
+                onClick={() => onStopBgJob?.(job.jobId)}
+                title={t('Stop it (only the process it started is ended)')}
+              >{t('⏹️ Stop')}</button>
+            </div>
+          ))}
         </div>
       )}
 

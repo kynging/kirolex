@@ -320,7 +320,8 @@ describe('接线（源码扫描）', () => {
   const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
 
   test('本地会话走 localComboTools；kiro 不挂；日志打码', () => {
-    assert.match(M, /if \(!remote\?\.sshHost\) return localComboTools\(sessionId, profile\);/);
+    /* 本地会话外面再包一层 kirolex-local（定时 / 后台命令，见 withLocalBrowser），组合里的 MCP 仍由 localComboTools 给 */
+    assert.match(M, /if \(!remote\?\.sshHost\) return withLocalBrowser\(sessionId, localComboTools\(sessionId, profile\)\);/);
     const fn = M.slice(M.indexOf('function localComboTools('), M.indexOf('async function ensureLocalTools('));
     assert.match(fn, /if \(engineOf\(profile\) === 'kiro'\) return undefined;/);
     assert.match(fn, /maskAcpServers\(servers\)/);

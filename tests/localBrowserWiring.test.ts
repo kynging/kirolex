@@ -19,16 +19,20 @@ test('退出 KiroLex 时收掉浏览器连接（session.end / detach）', () => 
   assert.doesNotMatch(M, /void localBrowserHost\.shutdown\(\)/);
 });
 
-test('本地工具通道带上浏览器工具；本地会话（新建 + 重连）在开关开着时挂上 kirolex-browser', () => {
+test('本地工具通道带上浏览器工具；本地会话（新建 + 重连）挂上 kirolex-local，浏览器工具只在开关开着时列出', () => {
   const start = M.slice(M.indexOf('localMcpStarting = startLocalMcp({'), M.indexOf('localMcpStarting = startLocalMcp({') + 400);
   assert.match(start, /browser: \{\s*enabled: \(\) => localBrowser\(\)\.enabled\(\)/);
-  assert.match(M, /if \(!remote\?\.sshHost && localBrowser\(\)\.enabled\(\)\) return withLocalBrowser\(sessionId, localComboTools\(sessionId, profile\)\);/);
+  /* 本地会话现在总是挂这条通道（定时 / 后台命令那组工具也在上面），不再只在浏览器开关开着时挂 */
+  assert.match(M, /if \(!remote\?\.sshHost\) return withLocalBrowser\(sessionId, localComboTools\(sessionId, profile\)\);/);
   const AC = src('main', 'acp-client.ts');
   assert.match(AC, /if \(this\.engine === 'kiro' && !this\.remote\?\.sshHost && this\.localTools\?\.mcpServers\?\.length\) return this\.localTools\.mcpServers;/, '远程 kiro 不走这条');
   assert.match(M, /: await withLocalBrowser\(kiroLexId, undefined\);/);
   const fn = M.slice(M.indexOf('async function withLocalBrowser('), M.indexOf('async function withLocalBrowser(') + 900);
-  assert.match(fn, /if \(!localBrowser\(\)\.enabled\(\)\) return spec;/, '开关关着什么都不加');
   assert.match(fn, /browserOnly: true/);
+  /* 开关关着：浏览器那几个工具不列（判据在 tools/list，见 localMcp.toolDefs） */
+  const LM = src('main', 'localMcp.ts');
+  assert.match(LM, /tools: toolDefs\(\{ browser: !!deps\.browser\?\.enabled\(\), browserOnly: session\.browserOnly/);
+  assert.match(LM, /const browser = opts\.browser \? browserToolDefs\(\) : \[\];/);
 });
 
 test('浏览器操作作为 kind=browser 的工具调用落盘、进回合面板', () => {

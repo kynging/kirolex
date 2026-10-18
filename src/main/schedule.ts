@@ -55,7 +55,9 @@ export type ScheduleTerminal =
   /** The run budget ran out. */
   | 'exhausted'
   /** The user removed it. */
-  | 'cancelled';
+  | 'cancelled'
+  /** A model-created job outlived its `expiresAt` (default 7 days, `MODEL_SCHEDULE_TTL_MS`). */
+  | 'expired';
 
 export interface ScheduleState {
   spec: ScheduleSpec;
@@ -69,6 +71,10 @@ export interface ScheduleState {
   lastError: string | null;
   paused: boolean;
   terminal: ScheduleTerminal | null;
+  /** 「由模型创建」：会话里的模型自己用 `schedule_create` 建的（kirolex-local 工具）。用户建的没有这个字段。 */
+  createdBy?: 'model';
+  /** 过了这一刻就不再触发（终态 `expired`）。模型建的循环任务默认 7 天；用户建的没有。 */
+  expiresAt?: number | null;
 }
 
 /** Floor on the interval, matching KiroCrew's cron. Every run costs a model turn, so a
@@ -94,6 +100,11 @@ function weeklyText(weekday: number, time: string, lang: UiLang): string {
   }
 }
 
+/** 0 = 周日 … 6 = 周六，必须是整数（1.5 / NaN 会让 `dueAt` 的找日子循环永远停不下来）。 */
+function isWeekday(v: unknown): v is number {
+  return typeof v === 'number' && Number.isInteger(v) && v >= 0 && v <= 6;
+}
+
 /** `HH:MM` → parts, or null when it is not a real time of day. */
 export function parseClockTime(text: string): { hour: number; minute: number } | null {
   const match = /^(\d{1,2}):(\d{2})$/.exec(String(text ?? '').trim());
@@ -115,7 +126,7 @@ export function validateSchedule(spec: ScheduleSpec, lang: UiLang = uiLang()): s
   if (spec.kind === 'daily' || spec.kind === 'weekly') {
     if (!parseClockTime(spec.atTime || '')) errors.push(trIn(lang, 'Time must be HH:MM (24-hour)'));
   }
-  if (spec.kind === 'weekly' && (spec.weekday === undefined || spec.weekday < 0 || spec.weekday > 6)) {
+  if (spec.kind === 'weekly' && !isWeekday(spec.weekday)) {
     errors.push(trIn(lang, 'Choose a day of the week'));
   }
   if (spec.kind === 'once' && !Number.isFinite(spec.atEpoch)) errors.push(trIn(lang, 'Choose when it should run'));
@@ -169,6 +180,8 @@ export function dueAt(spec: ScheduleSpec, lastRunAt: number | null, createdAt: n
 
   // Weekly: walk to the declared weekday, never returning a slot already spent.
   const target = spec.weekday ?? 0;
+  /* 不是 0–6 的整数（盘上的坏文件）就永远不到点 —— 否则下面这个循环找不到那一天、把主进程卡死 */
+  if (!isWeekday(target)) return Number.POSITIVE_INFINITY;
   while (candidate.getDay() !== target) candidate.setDate(candidate.getDate() + 1);
   if (anchor >= candidate.getTime()) candidate.setDate(candidate.getDate() + 7);
   return candidate.getTime();
@@ -176,6 +189,7 @@ export function dueAt(spec: ScheduleSpec, lastRunAt: number | null, createdAt: n
 
 export function isDue(state: ScheduleState, now: number): boolean {
   if (state.terminal || state.paused) return false;
+  if (isExpired(state, now)) return false;
   if (state.runs >= state.spec.maxRuns) return false;
   return now >= dueAt(state.spec, state.lastRunAt, state.createdAt);
 }
@@ -194,12 +208,76 @@ export function recordRun(state: ScheduleState, now: number, error?: string): Sc
   return { ...state, runs: state.runs + 1, lastRunAt: now, lastError: error ?? null };
 }
 
-/** Whether the schedule is over, and why. Not a verdict on the work. */
-export function scheduleTerminal(state: ScheduleState): ScheduleTerminal | null {
+/** Whether the schedule is over, and why. Not a verdict on the work. `now` only matters for
+ *  jobs carrying an `expiresAt`; without it expiry is not judged. */
+export function scheduleTerminal(state: ScheduleState, now?: number): ScheduleTerminal | null {
   if (state.terminal) return state.terminal;
   if (state.spec.kind === 'once' && state.runs >= 1) return 'completed';
   if (state.runs >= state.spec.maxRuns) return 'exhausted';
+  if (now !== undefined && isExpired(state, now)) return 'expired';
   return null;
+}
+
+/**
+ * 到点那一刻会话正忙，这一次就排着等（`wakeQueue.ts`）。**真正发之前**再看一眼盘上的任务：
+ * 被删了 / 暂停了 / 结束了 / 过期了就不发，返回原因；照发返回 null。
+ * 不看 `runs >= maxRuns`：这一次在排队前已经记过账，最后一次排着的时候 runs 本来就等于上限。
+ */
+export function scheduleDeliveryBlocker(state: ScheduleState | null, now: number): string | null {
+  if (!state) return 'removed';
+  if (state.paused) return 'paused';
+  if (state.terminal) return state.terminal;
+  if (isExpired(state, now)) return 'expired';
+  return null;
+}
+
+/** 记了账却没发出去（排着的时候被取消 / 暂停）：把那一次退回去 —— 没跑的不该占预算。 */
+export function refundRun(current: ScheduleState, beforeCharge: ScheduleState): ScheduleState {
+  return { ...current, runs: Math.max(0, current.runs - 1), lastRunAt: beforeCharge.lastRunAt };
+}
+
+function isExpired(state: ScheduleState, now: number): boolean {
+  return typeof state.expiresAt === 'number' && Number.isFinite(state.expiresAt) && now >= state.expiresAt;
+}
+
+/** 模型建的循环任务（interval / daily / weekly）默认多久过期。一个被忘掉的循环最多再花 7 天的钱。 */
+export const MODEL_SCHEDULE_TTL_MS = 7 * 24 * 3600 * 1000;
+
+/**
+ * `schedule_create` 的参数 → 一份 `ScheduleSpec`（加上过期时间），或者一句给模型看的错误。
+ *
+ * 和对话框建的任务走**同一个** `validateSchedule`（最短 60 秒、maxRuns ≥ 1、时间格式），只多两条：
+ *   · 循环类 `maxRuns` **必须给** —— 对话框里它是一个看得见的预填数字，模型这边没有人看着，
+ *     替它挑一个次数就是程序替人决定花多少轮；
+ *   · `once` 可以用 `delaySec`（「N 秒后叫醒我」），`maxRuns` 不给就是 1。
+ */
+export function modelScheduleFromArgs(args: any, now: number, lang: UiLang = uiLang()):
+  { spec: ScheduleSpec; expiresAt: number | null } | { error: string } {
+  const kind = String(args?.kind || '') as ScheduleKind;
+  if (!['interval', 'daily', 'weekly', 'once'].includes(kind)) {
+    return { error: trIn(lang, 'kind must be one of interval / daily / weekly / once') };
+  }
+  const num = (v: unknown): number | undefined => (v === undefined || v === null || v === '' ? undefined : Number(v));
+  let maxRuns = num(args?.maxRuns);
+  if (maxRuns === undefined) {
+    if (kind !== 'once') return { error: trIn(lang, 'maxRuns is required for a recurring job (how many times it may run at most)') };
+    maxRuns = 1;
+  }
+  const spec: ScheduleSpec = {
+    prompt: String(args?.prompt ?? ''),
+    kind,
+    everySec: kind === 'interval' ? Number(num(args?.everySec) ?? NaN) : 0,
+    maxRuns: Math.floor(maxRuns),
+  };
+  if (kind === 'daily' || kind === 'weekly') spec.atTime = String(args?.atTime ?? '');
+  if (kind === 'weekly') spec.weekday = num(args?.weekday);
+  if (kind === 'once') {
+    const delay = num(args?.delaySec);
+    spec.atEpoch = delay !== undefined ? (delay >= 0 ? now + delay * 1000 : NaN) : num(args?.atEpoch);
+  }
+  const problems = validateSchedule(spec, lang);
+  if (problems.length) return { error: problems.join(trIn(lang, '; ')) };
+  return { spec, expiresAt: kind === 'once' ? null : now + MODEL_SCHEDULE_TTL_MS };
 }
 
 export function createSchedule(sessionId: string, spec: ScheduleSpec, now: number): ScheduleState {
@@ -231,5 +309,6 @@ export function scheduleTerminalLabel(terminal: ScheduleTerminal, lang: UiLang =
     case 'completed': return trIn(lang, 'Completed');
     case 'exhausted': return trIn(lang, 'Run limit reached');
     case 'cancelled': return trIn(lang, 'Cancelled');
+    case 'expired': return trIn(lang, 'Expired');
   }
 }

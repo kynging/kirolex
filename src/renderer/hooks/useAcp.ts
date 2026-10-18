@@ -32,6 +32,7 @@ import {
 // rather than duplicated here, so the rules cannot drift between the two.
 import type { ScheduleSpec } from '../../main/schedule';
 import type { ScheduleView } from '../scheduleView';
+import type { BgJobRow } from '../bgJobsView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { asSteerParts, toStoredUserLines } from '../steerSplit';
@@ -2599,6 +2600,29 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Paint the initial snapshot (sessions already busy before this mount).
     window.kiroApi.getBusyMap?.().then((map) => { if (map) setBusyBySession(map); }).catch(() => {});
 
+    /**
+     * **主进程自己发起的一轮**（定时到点 / 后台命令退出 / 监视事件，见主进程 `wakeDispatcher`）。
+     *
+     * 这一轮不是这个窗口发的：没有乐观插入的用户消息，也没有 `beginStreamingTurn`，于是原来那条消息只在盘上、
+     * 回复的流被挡在门外（只进缓存），切走再回来才看得见。所以：按 id 去重插进这条消息，再像「接回」那样
+     * 接管这一轮的流 —— 结束信号是主进程的 busy 不再是 'turn'（见上面 `adoptedTurnsRef` 那段）。
+     */
+    const removeMainTurn = window.kiroApi.onMainTurn?.(({ sessionId: sid, messageId, content, ts }) => {
+      if (!sid || !messageId) return;
+      const add = (list: Message[]): Message[] => (
+        list.some((m) => m.id === messageId)
+          ? list
+          : [...list, { id: messageId, role: 'user' as const, content: String(content || ''), timestamp: Number(ts) || Date.now() }]
+      );
+      if (sid === currentSessionRef.current) setMessages((prev) => add(prev));
+      const cached = messagesCacheRef.current.get(sid);
+      if (cached) commitBackgroundMessages(sid, add(cached));
+      if (!streamingIdsRef.current.has(sid)) {
+        adoptedTurnsRef.current.add(sid);
+        addStreaming(sid);
+      }
+    });
+
     const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text }) => {
       if (!sid || !text) return;
       const patch = (list: Message[]): Message[] => {
@@ -2859,6 +2883,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       removeError();
       removeNotice?.();
       removeAssistantFinal?.();
+      removeMainTurn?.();
       removeSessionModel?.();
       removeTurnRestart?.();
       removeTurnQuiet?.();
@@ -3921,6 +3946,26 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const off = window.kiroApi.onScheduleChanged?.(refresh);
     const tick = setInterval(() => setScheduleNow(Date.now()), 20000);
     return () => { off?.(); clearInterval(tick); };
+  }, []);
+
+  /**
+   * 模型起的后台命令 / 监视（`bg_run` / `watch`）—— 同样只是主进程那份的只读镜像：主进程每次起 / 停 / 结束都发
+   * `bg:changed`，这里重新问一遍。会话顶部据此列出标签、运行时长和一个停止按钮。
+   */
+  const [bgJobs, setBgJobs] = useState<BgJobRow[]>([]);
+  useEffect(() => {
+    const refresh = () => {
+      void window.kiroApi.bgList?.()
+        .then((list) => setBgJobs(Array.isArray(list) ? list : []))
+        .catch(() => {});
+    };
+    refresh();
+    const off = window.kiroApi.onBgChanged?.(refresh);
+    return () => { off?.(); };
+  }, []);
+  const stopBgJob = useCallback(async (jobId: string) => {
+    if (!jobId) return;
+    try { await window.kiroApi.bgStop?.(jobId); } catch {}
   }, []);
 
   /**
@@ -5130,6 +5175,8 @@ ${text}`,
     scheduleNow,
     pauseSchedule,
     cancelSchedule,
+    bgJobs,
+    stopBgJob,
     stopLoop,
     restoredInputDraft,
     /**

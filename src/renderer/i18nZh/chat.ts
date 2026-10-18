@@ -14,6 +14,18 @@ export const ZH_CHAT: Record<string, string> = {
   'Ran {budget}': '已运行 {budget}',
   '{n} jobs in total': '共 {n} 个任务',
   'Last failure: {error}': '上次失败：{error}',
+  // ── bgJobsView.ts / 后台任务行 / 由模型创建 ──
+  '{n}s': '{n} 秒',
+  '{h}h {m}m': '{h} 小时 {m} 分钟',
+  '🤖 Created by the model': '🤖 由模型创建',
+  'By model': '模型建',
+  'The model in this chat set this up itself (schedule_create). Pause or cancel it like any other job.': '这是这条会话里的模型自己建的（schedule_create）。和别的定时任务一样可以暂停或取消。',
+  'Watching': '监视',
+  'Background command': '后台命令',
+  'running for {time}': '已运行 {time}',
+  '{n} event(s)': '{n} 个事件',
+  'Stop it (only the process it started is ended)': '停止（只结束它自己起的进程）',
+  '⏹️ Stop': '⏹️ 停止',
   // ── loopMachine.ts ──
   'The loop prompt is empty': '循环内容为空',
   'A round limit is required (≥ 1)': '必须填写轮数上限（≥ 1）',

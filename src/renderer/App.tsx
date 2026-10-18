@@ -12,6 +12,7 @@ import { autoFoldPanels, filePanelMax } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
 import { schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
+import { runningBgJobs, type BgJobRow } from './bgJobsView';
 // 给主会话的交底 —— 它原本对流程一无所知，连执行会话都不知道
 import { consumeHandoff } from './handoffDraft';
 // 哪几步共用一条会话 —— 和画布同源（草稿声明的泳道），驱动器不再各算一套
@@ -90,10 +91,16 @@ declare global {
       loopClear?: (sessionId: string) => Promise<{ ok: boolean }>;
       /** SCHEDULED TASKS. The ticker is in main, so a job fires with no window open. */
       scheduleCreate?: (sessionId: string, spec: any) => Promise<{ ok: boolean; id?: string; error?: string; nextRunAt?: number | null; describe?: string }>;
-      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null }>>;
+      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null }>>;
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
+      /** 模型起的后台命令 / 监视（进程在 main 里）。 */
+      bgList?: () => Promise<BgJobRow[]>;
+      bgStop?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
+      onBgChanged?: (cb: () => void) => () => void;
+      /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件）。 */
+      onMainTurn?: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number }) => void) => () => void;
       getPendingQuit?: () => Promise<boolean>;
       onPendingQuit?: (cb: (pending: boolean) => void) => () => void;
       /** 控制入口（controlServer `POST /sessions/:id/send`）：主进程转来一条，界面按 Enter 的同一套路由处理后回话 */
@@ -923,6 +930,8 @@ const App: React.FC = () => {
     scheduleNow,
     pauseSchedule,
     cancelSchedule,
+    bgJobs,
+    stopBgJob,
     stopLoop,
     restoredInputDraft,
     consumeRestoredInputDraft,
@@ -1411,6 +1420,16 @@ const App: React.FC = () => {
       return cache.get(sid) ?? null;
     };
   }, [schedules, scheduleNow, settings.language]);
+
+  /** 每条会话还在跑的后台命令 / 监视（按会话缓存：没变就是同一个数组，ChatArea 的 memo 不白算）。 */
+  const bgJobsFor = useMemo(() => {
+    const cache = new Map<string, BgJobRow[]>();
+    return (sid: string | null): BgJobRow[] => {
+      const key = sid || '';
+      if (!cache.has(key)) cache.set(key, runningBgJobs(bgJobs, sid));
+      return cache.get(key)!;
+    };
+  }, [bgJobs]);
 
   // --- Split view (1x1 … 3x3) -----------------------------------------------
   // The user CHECKS sessions in the sidebar; every checked session gets its own
@@ -3909,6 +3928,8 @@ const App: React.FC = () => {
         scheduleSummary={scheduleSummaryFor(sid)}
         onPauseSchedule={(id, paused) => void pauseSchedule(id, paused)}
         onCancelSchedule={(id) => void cancelSchedule(id)}
+        bgJobs={bgJobsFor(sid)}
+        onStopBgJob={(jobId) => void stopBgJob(jobId)}
         onStopLoop={() => { if (sid) void stopLoop(sid); }}
       />
     );

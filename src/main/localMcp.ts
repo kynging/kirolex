@@ -44,6 +44,7 @@ import http from 'http';
 import path from 'path';
 import { tr } from './uiText.ts';
 import { browserToolDefs, isBrowserTool } from './localBrowser.ts';
+import { isWakeTool, wakeToolDefs } from './wakeTools.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -76,7 +77,7 @@ export interface LocalMcpSession {
    */
   dirs?: string[];
   /**
-   * **本地会话**挂这条通道只为了 `local_browser_*`：它们自己就在本机，有原生的读写和 shell，
+   * **本地会话**挂这条通道只为了 `local_browser_*` 和「过一会儿再看」那组工具（`wakeTools.ts`）：它们自己就在本机，有原生的读写和 shell，
    * 再给一套 `local_read` / `local_bash` 只会让模型在两套工具之间犹豫。所以只列、只认浏览器那几个。
    */
   browserOnly?: boolean;
@@ -204,6 +205,13 @@ export interface LocalMcpDeps {
     enabled(): boolean;
     call(name: string, args: any, sessionId: string): Promise<{ text: string; isError?: boolean }>;
   };
+  /**
+   * 「过一会儿再看」那组工具（`schedule_*` / `bg_*` / `watch`，见 `wakeTools.ts`）。不给 = 不列、调到了说没有。
+   * 本地会话和远程会话都列（`browserOnly` 也列）。
+   */
+  wake?: {
+    call(name: string, args: any, sessionId: string, workdir: string): Promise<{ text: string; isError?: boolean }>;
+  };
 }
 
 export interface ToolResult {
@@ -215,10 +223,11 @@ export interface ToolResult {
  * 工具清单 —— 给模型看的描述里要写清"这是用户那台机器"。
  * `browser`：总开关开着才把 `local_browser_*` 列进去；`browserOnly`：本地会话只列那几个。
  */
-export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean } = {}): Array<{ name: string; description: string; inputSchema: any }> {
+export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean; wake?: boolean } = {}): Array<{ name: string; description: string; inputSchema: any }> {
   const browser = opts.browser ? browserToolDefs() : [];
-  if (opts.browserOnly) return browser;
-  return [...fileToolDefs(), ...browser];
+  const wake = opts.wake ? wakeToolDefs() : [];
+  if (opts.browserOnly) return [...browser, ...wake];
+  return [...fileToolDefs(), ...browser, ...wake];
 }
 
 function fileToolDefs(): Array<{ name: string; description: string; inputSchema: any }> {
@@ -373,6 +382,11 @@ export async function callTool(
     const r = await deps.browser.call(name, args, session.sessionId);
     return text(r.text, !!r.isError);
   }
+  if (isWakeTool(name)) {
+    if (!deps.wake) return text(`没有这个工具：${name}`, true);
+    const r = await deps.wake.call(name, args, session.sessionId, session.workdir);
+    return text(r.text, !!r.isError);
+  }
   if (session.browserOnly) return text(`没有这个工具：${name}`, true);
   switch (name) {
     case 'local_read': {
@@ -508,7 +522,7 @@ export async function handleRpc(
     case 'notifications/cancelled':
       return null;
     case 'tools/list':
-      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly }) });
+      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly, wake: !!deps.wake }) });
     case 'tools/call': {
       const r = await callTool(String(msg?.params?.name || ''), msg?.params?.arguments || {}, session, deps);
       return reply(r);

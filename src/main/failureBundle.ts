@@ -33,6 +33,11 @@ export interface BundleInput {
   cliSessionId?: string;
   /** 这一轮发出去的文本块（KiroLex 侧的原样）。 */
   promptText: string;
+  /**
+   * 这一轮带着**后台命令 / 监视的输出**（模型自己起的 bg_run / watch，见 bgJobs.ts）：那段输出只回到会话、不额外落盘
+   * （里面可能有凭证）。所以不抄 kiro-cli 自己那份会话历史（里面也有它）；prompt 用 `diagnosticPromptText` 换成占位。
+   */
+  omitConversation?: boolean;
   error: string;
   model?: string;
   pid?: number;
@@ -47,6 +52,21 @@ export interface BundleInput {
   cliLogTailBytes?: number;
   home?: string;
   now?: number;
+}
+
+/**
+ * 诊断包要不要**去掉会话内容**（prompt 原文 + kiro-cli 的会话历史）。
+ * 不光是带着后台输出的那一轮：输出一旦进了会话，之后每一轮的历史（kiro-cli 那份会话、随行的历史快照）里都有它，
+ * 所以这条会话之后任何一轮失败都一样不抄（`bgOutputSeen` 记在会话记录里，重启后也成立）。
+ */
+export function bundleOmitsSessionContent(o: { bgOutputThisTurn: boolean; sessionSawBgOutput: boolean }): boolean {
+  return o.bgOutputThisTurn || o.sessionSawBgOutput;
+}
+
+/** 进诊断包的 prompt 原文；`omitOutput` = 这一轮是后台输出，只留一句占位和字数。 */
+export function diagnosticPromptText(prompt: any[], omitOutput: boolean): string {
+  const text = (prompt || []).map((b: any) => (typeof b === 'string' ? b : b?.text || '')).join('');
+  return omitOutput ? `(background command output omitted: ${text.length} chars; it is kept only in the session)` : text;
 }
 
 export function bundleRoot(home = os.homedir()): string {
@@ -84,7 +104,7 @@ export async function writeFailureBundle(input: BundleInput): Promise<string | n
     }, null, 2));
     /* kiro-cli 自己那份会话（状态 + 历史）—— 这是唯一能看到"后端手里是什么"的东西。
        路径挂在**跑 kiro-cli 那台机器**的 HOME 下，所以 home 从 host 问，不是 os.homedir()。 */
-    if (input.cliSessionId) {
+    if (input.cliSessionId && !input.omitConversation) {
       const base = path.join(await input.host.home(), '.kiro', 'sessions', 'cli', input.cliSessionId);
       await save(input.host, base + '.json', path.join(dir, 'cli-session.json'), 8 * 1024 * 1024, 'all');
       await save(input.host, base + '.jsonl', path.join(dir, 'cli-session.jsonl'), 2 * 1024 * 1024, 'tail');

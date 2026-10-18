@@ -40,8 +40,11 @@ import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectCha
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
-import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec } from './schedule.ts';
+import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, scheduleDeliveryBlocker, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
+import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
+import { BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
+import { callWakeTool, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
@@ -50,7 +53,7 @@ import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, R
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
-import { writeFailureBundle } from './failureBundle.ts';
+import { bundleOmitsSessionContent, diagnosticPromptText, writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
@@ -1888,6 +1891,7 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
       enabled: () => localBrowser().enabled(),
       call: (name, args, sid) => localBrowser().tools.call(name, args, sid),
     },
+    wake: wakeMcpTools,   /* schedule_* / bg_* / watch（见 wakeTools.ts） */
   }).then((srv) => { localMcpServer = srv; return srv; })
     .finally(() => { localMcpStarting = undefined; });
   return localMcpStarting;
@@ -1953,26 +1957,26 @@ function noteBrowserAction(sessionId: string, a: BrowserAction): void {
 }
 
 /**
- * **本地会话也能用 local_browser**：总开关开着时，把本地工具通道作为一个 http MCP 交给 session/new / load
- * （`browserOnly`：本地会话只拿浏览器那几个工具 —— 它们自己就有原生读写和 shell）。
- * kiro-cli 和两个适配器的 initialize 都声明了 `mcpCapabilities.http`。开关关着 = 原样返回，什么都不加。
+ * **本地会话也挂上本地工具通道**（kirolex-local）：作为一个 http MCP 交给 session/new / load。
+ * 本地会话只拿「过一会儿再看」那组工具（`schedule_*` / `bg_*` / `watch`，见 wakeTools.ts），
+ * 外加总开关开着时的浏览器那几个（`browserOnly`：不给 `local_read` / `local_bash` —— 它们自己就有原生读写和 shell）。
+ * kiro-cli 和两个适配器的 initialize 都声明了 `mcpCapabilities.http`。浏览器开关关着时浏览器工具不列（见 `toolDefs`）。
  */
 async function withLocalBrowser(
   sessionId: string,
   spec: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined,
 ): Promise<{ remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined> {
-  if (!localBrowser().enabled()) return spec;
   try {
     const server = await ensureLocalMcpServer();
     server.register({ sessionId, workdir: sessionFilesDir(sessionId), browserOnly: true });
     const urlPath = server.urlPathFor(sessionId);
     if (!urlPath) return spec;
-    const mcp = { type: 'http', name: 'kirolex-browser', url: `http://127.0.0.1:${server.port()}${urlPath}`, headers: [] };
+    const mcp = { type: 'http', name: 'kirolex-local', url: `http://127.0.0.1:${server.port()}${urlPath}`, headers: [] };
     const base = spec || { remotePort: 0, localPort: 0, agentOverride: '' };
-    logger.info('browser', `本地会话挂上 local_browser sessionId=${sessionId}`);
+    logger.info('localmcp', `本地会话挂上 kirolex-local（定时 / 后台命令${localBrowser().enabled() ? ' / local_browser' : ''}）sessionId=${sessionId}`);
     return { ...base, mcpServers: [...(base.mcpServers || []), mcp] };
   } catch (err: any) {
-    logger.warn('browser', `本地会话挂 local_browser 失败 sessionId=${sessionId}: ${err?.message || err}`);
+    logger.warn('localmcp', `本地会话挂 kirolex-local 失败 sessionId=${sessionId}: ${err?.message || err}`);
     return spec;
   }
 }
@@ -2045,9 +2049,8 @@ async function ensureLocalTools(
   localDir: string,
 ): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] } | undefined> {
   const remote = profile.remote;
-  /* 本地会话 + local_browser 开着：组合里的 MCP 之外再挂浏览器那几个工具（`withLocalBrowser`） */
-  if (!remote?.sshHost && localBrowser().enabled()) return withLocalBrowser(sessionId, localComboTools(sessionId, profile));
-  if (!remote?.sshHost) return localComboTools(sessionId, profile);
+  /* 本地会话：组合里的 MCP 之外再挂 kirolex-local（定时 / 后台命令，开关开着时还有浏览器，见 `withLocalBrowser`） */
+  if (!remote?.sshHost) return withLocalBrowser(sessionId, localComboTools(sessionId, profile));
   try {
     const server = await ensureLocalMcpServer();
     const agentOverride = sessionAgentName(sessionId, OWNER);
@@ -3871,6 +3874,93 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants,
     return true;
   } catch { return false; }
 }
+
+/* ─────────────── 模型自己安排的「过一会儿再看」：定时提示 / 后台命令 / 监视 ───────────────
+ *
+ * 工具在 kirolex-local 上（`wakeTools.ts`），结果都经 `wakeDispatcher` 作为**新的一条消息**发回会话：
+ * 会话正忙就等这一轮结束（不 steer、不进渲染端的排队卡片、不被「合并排队消息」合并），多条按时间顺序逐条发。
+ * 真正发送的那一下（`wakeDeliver`）要用 `sendPromptOnce` / `ensureAttached`，它们在 whenReady 里，到时候再挂上。
+ */
+let wakeDeliver: ((item: WakeItem) => Promise<void>) | null = null;
+const wakeDispatcher = new WakeDispatcher({
+  /* 等待退出期间也算忙：不开新一轮（同定时任务 / 排队消息） */
+  isBusy: (sid) => quitPending || !!busyReasonFor(sid),
+  deliver: (item) => {
+    if (!wakeDeliver) return Promise.reject(Object.assign(new Error('KiroLex is still starting'), { code: SESSION_BUSY }));
+    return wakeDeliver(item);
+  },
+  /* 定时任务那一次排着的时候被删 / 暂停 / 过期了就不发（盘上的状态为准，见 `scheduleDeliveryBlocker`） */
+  isStale: (item) => (item.source === 'schedule' && item.ref
+    ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now())
+    : null),
+  /* 不看报错文字（tr() 出来的，中文界面下是中文）：看错误码，或者此刻会话是不是真的在忙 */
+  isBusyError: (err, item) => isWakeBusyError(err, quitPending || !!busyReasonFor(item.sessionId)),
+  log: (m) => logger.info('wake', m),
+});
+
+const bgJobs = new BgJobManager({
+  wake: (sessionId, text, job) => {
+    void wakeDispatcher.enqueue({ sessionId, text, at: Date.now(), source: job.kind === 'watch' ? 'watch' : 'bg', ref: job.jobId })
+      .then((r) => { if (!r.ok) logger.warn('bg', `唤醒没发出去 job=${job.jobId} session=${sessionId}: ${r.error}`); });
+  },
+  /* 落进会话记录（重开也在），同时在状态行上说一声 —— 记录里那条要等下次读盘才出现在屏幕上 */
+  note: (sessionId, text) => { noteInSession(sessionId, text); sessionNotice(sessionId, text); },
+  changed: (running) => {
+    /* 只记标签和命令前 80 字（见 bgJobs.ts）—— 重启后据此补一句「已中断」 */
+    try { writeRunningJobs(os.homedir(), running); } catch (err: any) { logger.warn('bg', `bg-jobs.json 写不进去: ${err?.message || err}`); }
+    mainWindow?.webContents.send('bg:changed');
+  },
+  log: (m) => logger.info('bg', m),
+});
+
+/** 这条会话见过后台命令 / 监视的输出（唤醒里带着、或 bg_status 读到）：持久记下，之后的诊断包 / 上下文快照都不留会话内容。 */
+function markBgOutputSeen(sessionId: string): void {
+  try { if (!store.readRecord(sessionId)?.bgOutputSeen) store.patchRecord(sessionId, { bgOutputSeen: true }); } catch { /* 记录读写失败不挡工具 */ }
+}
+
+/** kirolex-local 上的 schedule_* / bg_* / watch：本地和远程会话都有。 */
+const wakeMcpTools = {
+  call: (name: string, args: any, sid: string, workdir: string) => callWakeTool(name, args, sid, workdir, wakeHost),
+};
+
+/** kirolex-local 上那组工具的落地：定时任务就是现有的定时任务（同一个存储、同一个计时器）。 */
+const wakeHost: WakeHost = {
+  now: () => Date.now(),
+  createSchedule: (sessionId, spec, expiresAt) => {
+    if (refuseAdvancedOnly(sessionId, 'schedule:create')) return { ok: false, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+    if (!store.readRecord(sessionId) || deletedSessionIds.has(String(sessionId))) return { ok: false, error: tr('Select a session that has already been created first') };
+    const id = `sched_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const state = { ...newSchedule(sessionId, spec, Date.now()), createdBy: 'model' as const, expiresAt };
+    try {
+      scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
+    } catch (err: any) {
+      return { ok: false, error: String(err?.message || err) };
+    }
+    logger.info('schedule', `created by model id=${id} session=${sessionId} ${describeSchedule(spec)} maxRuns=${spec.maxRuns} expiresAt=${expiresAt ?? 'none'}`);
+    mainWindow?.webContents.send('schedule:changed', { id, state });
+    return { ok: true, id, describe: describeSchedule(spec), nextRunAt: nextRunAt(state) };
+  },
+  listSchedules: (sessionId) => scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)
+    .filter((job) => job.state.sessionId === sessionId)
+    .map((job) => ({
+      id: job.id, describe: describeSchedule(job.state.spec), prompt: job.state.spec.prompt, runs: job.state.runs,
+      maxRuns: job.state.spec.maxRuns, paused: job.state.paused, terminal: job.state.terminal, nextRunAt: nextRunAt(job.state),
+      createdBy: job.state.createdBy, expiresAt: job.state.expiresAt ?? null,
+    })),
+  deleteSchedule: (sessionId, id) => {
+    const job = scheduleStore.readSchedule(id, os.homedir());
+    if (!job || job.state.sessionId !== sessionId) return { ok: false, error: tr('This scheduled task was not found') };
+    scheduleStore.removeSchedule(id, os.homedir(), store.isAdvancedOnlySession);
+    wakeDispatcher.dropRef(id, 'removed');
+    logger.info('schedule', `removed by model id=${id}`);
+    mainWindow?.webContents.send('schedule:changed', { id, state: null });
+    return { ok: true };
+  },
+  bg: bgJobs,
+  /* 同 `local_bash`：跑在本机、cwd 是这条会话的**本地**工作目录（远程会话的 entry.cwd 是远端草稿目录，不能用） */
+  cwdFor: (sessionId, fallback) => sessionClients.get(sessionId)?.localDir || store.readRecord(sessionId)?.localDir || fallback,
+  markOutputSeen: (sessionId) => markBgOutputSeen(sessionId),
+};
 
 /* ───────────────── 侧栏文件预览的「✓ 确认」：在那条会话里改一处 ─────────────────
  *
@@ -6740,7 +6830,7 @@ app.whenReady().then(async () => {
 
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
-  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }, _model?: string, attempt = 0): Promise<any> {
+  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null }, _model?: string, attempt = 0): Promise<any> {
     /*
       **忙时记下的切换先应用，再发这一条** —— 新消息要用新的 agent / 模型；不先切的话一轮接一轮
       （排队消息、定时任务）会一直抢在前面，切换永远排不上。自动重发（attempt > 0）是同一轮，不切。
@@ -6915,7 +7005,16 @@ app.whenReady().then(async () => {
       logger.info('prompt', `waited for wedged turn to release sessionId=${sessionId} busy=${entry.busy}`);
     }
     if (entry.busy) {
-      throw new Error(tr('Wait for the active turn (including context compaction) to finish before sending the queued message.'));
+      /* 带错误码：后台唤醒据此判「撞上忙、空了再发」，不靠这句随界面语言变的文字 */
+      throw Object.assign(new Error(tr('Wait for the active turn (including context compaction) to finish before sending the queued message.')), { code: SESSION_BUSY });
+    }
+    /*
+      **提交之前最后再问一次还该不该发**（定时提示：挂执行器 / 等切换 / 重建历史的这段时间里，任务可能刚被暂停或删除）。
+      在用户消息落盘之前：不发就什么都不留。
+    */
+    if (attempt === 0 && display?.stillWanted) {
+      const blocked = display.stillWanted();
+      if (blocked) throw new WakeSkipped(blocked);
     }
     // Most-recently-used: protect this session from LRU eviction this turn.
     entry.lastUsedAt = Date.now();
@@ -6968,6 +7067,13 @@ app.whenReady().then(async () => {
             }
           : {}),
       });
+      /*
+        **主进程自己发起的这一轮**（定时到点 / 后台命令退出 / 监视事件）—— 界面原来不知道有这一轮：
+        用户消息只在盘上、回复不流式，切走再回来才看得见。告诉渲染端：插进这条消息，并接管这一轮的流。
+      */
+      if (display?.announce) {
+        mainWindow?.webContents.send('acp:main-turn', { sessionId, messageId: userMessageId, content: display?.displayText ?? promptText, ts: Date.now() });
+      }
     } catch {}
     // Inject layered memory (global ⊕ project ⊕ this chat) on EVERY turn.
     //
@@ -7476,10 +7582,14 @@ app.whenReady().then(async () => {
        * kiro-cli 里好的、KiroLex 里不好"，而故障不能按需复现；下一次犯的时候要能对着差异看，
        * 而不是再猜一轮。同一条会话 1 分钟内只落一包、每条只留最近 5 包。
        */
+      /* 这一轮带着后台输出，或者这条会话早先收到过（之后每一轮的历史里都有它）：都不抄会话内容 */
+      const omitSessionContent = bundleOmitsSessionContent({ bgOutputThisTurn: !!display?.bgOutput, sessionSawBgOutput: !!store.readRecord(sessionId)?.bgOutputSeen });
       const bundle = await writeFailureBundle({
         sessionId,
         cliSessionId: entry.cliSessionId,
-        promptText: (prompt || []).map((b: any) => (typeof b === 'string' ? b : b?.text || '')).join(''),
+        /* 后台命令 / 监视的输出只回到会话、不额外落盘（可能有凭证）—— 诊断包里只留占位，也不抄后端那份会话历史 */
+        promptText: diagnosticPromptText(prompt, omitSessionContent),
+        omitConversation: omitSessionContent,
         error: `${err?.message || err}${detail}`,
         model: entry.profile.model,
         pid: entry.client.pid,
@@ -7976,21 +8086,29 @@ app.whenReady().then(async () => {
       const charged = recordRun(state, Date.now());
       scheduleStore.writeSchedule(id, charged, os.homedir(), store.isAdvancedOnlySession);
 
-      let failure: string | undefined;
-      try {
-        await sendPromptOnce(state.sessionId, [{ type: 'text', text: state.spec.prompt }], undefined, {
-          messageId: `sched_${id}_${Date.now()}`,
-          displayText: state.spec.prompt,
-        });
-      } catch (err: any) {
-        failure = err?.message || tr('Send failed');
-      }
-
+      /*
+        **经 `wakeDispatcher` 发**：会话正忙就等这一轮结束再发（原来直接 `sendPromptOnce`，撞上忙就报错、
+        白白记掉一次），作为新的一条，不进排队卡片；同一会话里几个同时到期的按到点时间逐条发。
+      */
+      const delivered = await wakeDispatcher.enqueue({
+        sessionId: state.sessionId, text: state.spec.prompt, at: nextRunAt(state) ?? Date.now(), source: 'schedule', ref: id,
+      });
       // Re-read: the user may have paused or removed the job during the turn.
       const latest = scheduleStore.readSchedule(id, os.homedir());
+      if (delivered.skipped) {
+        /* 排着等会话空下来的时候被删 / 暂停 / 过期了：这一次没发，记的账退回去（删掉的就什么都不用写） */
+        logger.info('schedule', `run skipped id=${id} session=${state.sessionId}: ${delivered.error}`);
+        if (latest) {
+          const back = refundRun(latest.state, state);
+          scheduleStore.writeSchedule(id, back, os.homedir(), store.isAdvancedOnlySession);
+          mainWindow?.webContents.send('schedule:changed', { id, state: back });
+        }
+        return;
+      }
+      const failure: string | undefined = delivered.ok ? undefined : (delivered.error || tr('Send failed'));
       if (!latest) return;
       const settled = { ...latest.state, lastError: failure ?? null };
-      const terminal = scheduleTerminal(settled);
+      const terminal = scheduleTerminal(settled, Date.now());
       const final = terminal ? { ...settled, terminal } : settled;
       scheduleStore.writeSchedule(id, final, os.homedir(), store.isAdvancedOnlySession);
       logger.info('schedule', `run id=${id} session=${state.sessionId} runs=${final.runs}/${final.spec.maxRuns}`
@@ -8018,10 +8136,66 @@ app.whenReady().then(async () => {
     const now = Date.now();
     /* advanced 会话（flow / skill）的定时任务不跑、不记账 —— 它们归 advanced 自己 */
     for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)) {
+      if (expireSchedule(job, now)) continue;
       if (isDue(job.state, now)) void runScheduledJob(job);
     }
   }, SCHEDULE_TICK_MS);
   app.on('before-quit', () => clearInterval(scheduleTicker));
+
+  /** 模型建的循环任务过了 `expiresAt`（默认 7 天）：记成 `expired`、在会话里说一声。返回是否刚过期。 */
+  function expireSchedule(job: scheduleStore.StoredSchedule, now: number): boolean {
+    if (job.state.terminal || schedulesInFlight.has(job.id) || scheduleTerminal(job.state, now) !== 'expired') return false;
+    const final = { ...job.state, terminal: 'expired' as const };
+    try { scheduleStore.writeSchedule(job.id, final, os.homedir(), store.isAdvancedOnlySession); } catch { return false; }
+    logger.info('schedule', `expired id=${job.id} session=${job.state.sessionId} runs=${final.runs}/${final.spec.maxRuns}`);
+    noteInSession(job.state.sessionId, tr('Scheduled task ended: {why} ({schedule}, ran {n} time(s))', { why: scheduleTerminalLabel('expired'), schedule: describeSchedule(final.spec), n: final.runs }));
+    mainWindow?.webContents.send('schedule:changed', { id: job.id, state: final });
+    return true;
+  }
+
+  /*
+    唤醒真正发出去的那一下：挂回执行器（被回收了也照样发）→ `sendPromptOnce`，`announce` 让界面插进这条消息、接管这一轮的流。
+    删掉 / 归档的会话不发（同 `acp:prompt` 的守卫）。
+  */
+  wakeDeliver = async (item) => {
+    const sid = item.sessionId;
+    if (deletedSessionIds.has(sid)) throw new Error(tr('This session has been deleted. Nothing more will be sent to it.'));
+    if (refuseAdvancedOnly(sid, 'wake')) throw new Error(tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.'));
+    if (store.readRecord(sid)?.archived) throw new Error(tr('This session is archived. Unarchive it to keep chatting.'));
+    await ensureAttached(sid);
+    if (!sessionClients.get(sid)) throw new Error(tr('Session not connected'));
+    /* 挂执行器那段时间里任务可能已经被暂停 / 删除：再看一次（sendPromptOnce 里提交之前还会再看一次） */
+    const stillWanted = () => (item.source === 'schedule' && item.ref
+      ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now())
+      : null);
+    { const blocked = stillWanted(); if (blocked) throw new WakeSkipped(blocked); }
+    /* 后台输出要进会话了：先记下来，之后这条会话的故障诊断包都不抄会话内容 */
+    if (item.source !== 'schedule') markBgOutputSeen(sid);
+    const prefix = item.source === 'schedule' ? `sched_${item.ref}` : `wake_${item.ref || item.source}`;
+    await sendPromptOnce(sid, [{ type: 'text', text: item.text }], undefined, {
+      messageId: `${prefix}_${Date.now()}`,
+      displayText: item.text,
+      announce: true,
+      bgOutput: item.source !== 'schedule',
+      stillWanted,
+    }).catch((err) => {
+      /* 同 acp:prompt 那层兜底：没发出去就把随行快照的标记收回，下一条照常带上历史 */
+      const e = sessionClients.get(sid);
+      if (e?.rideAlongUnconfirmed) { e.rideAlongUnconfirmed = false; clearContextEstablished(sid); }
+      throw err;
+    });
+  };
+
+  /* 上次退出（或崩溃）时还在跑的后台命令 / 监视：不静默消失，在各自的会话里补一句「已中断」 */
+  for (const job of takeInterruptedJobs(os.homedir())) {
+    logger.info('bg', `interrupted by restart ${job.jobId} session=${job.sessionId} cmd=${job.command}`);
+    noteInSession(job.sessionId, interruptedNotice(job));
+  }
+  /* 后台命令 / 监视随 KiroLex 退出结束（同步杀：before-quit 不会等 Promise）；登记留着，下次启动据此补「已中断」 */
+  app.on('before-quit', () => bgJobs.stopAllSync());
+
+  ipcMain.handle('bg:list', () => bgJobs.list());
+  ipcMain.handle('bg:stop', (_event, jobId: string) => bgJobs.stop(String(jobId || ''), 'user'));
   /* 正在跑的同步要跟着死 —— 不掐的话它会被 launchd 收养（ppid=1）继续推，没人读结果还吃光上行 */
   /*
     **退出时也要收掉远端的执行器** —— 实测同一条会话在远端留了两个 kiro-cli：
@@ -8070,6 +8244,8 @@ app.whenReady().then(async () => {
     lastRunAt: job.state.lastRunAt,
     lastError: job.state.lastError,
     nextRunAt: nextRunAt(job.state),
+    createdBy: job.state.createdBy ?? null,
+    expiresAt: job.state.expiresAt ?? null,
   })));
 
   ipcMain.handle('schedule:pause', (_event, id: string, paused: boolean) => {
@@ -8078,6 +8254,8 @@ app.whenReady().then(async () => {
     { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:pause'); if (advRefused) return { ok: false, error: advRefused }; }
     const state = { ...job.state, paused };
     scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
+    /* 正排着等会话空下来的那一次也撤掉 */
+    if (paused) wakeDispatcher.dropRef(id, 'paused');
     logger.info('schedule', `${paused ? 'paused' : 'resumed'} id=${id}`);
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true };
@@ -8087,6 +8265,7 @@ app.whenReady().then(async () => {
     { const owner = scheduleStore.readSchedule(id, os.homedir())?.state.sessionId;
       const advRefused = owner ? refuseAdvancedOnly(owner, 'schedule:remove') : null; if (advRefused) return { ok: false, error: advRefused }; }
     scheduleStore.removeSchedule(id, os.homedir(), store.isAdvancedOnlySession);
+    wakeDispatcher.dropRef(id, 'removed');
     logger.info('schedule', `removed id=${id}`);
     // `state: null` says GONE. The renderer re-reads the list either way, but a payload that
     // omitted the outcome would make "removed" indistinguishable from "changed somehow".
@@ -8411,6 +8590,9 @@ app.whenReady().then(async () => {
     } catch {}
     deletedSessionIds.add(sessionId); // block any racing/subsequent load-session resurrection
     pendingSwitches.cancel(sessionId); // 删掉的会话不再应用欠着的切换
+    /* 它的后台命令 / 监视一起停掉，排着没发的唤醒作废 */
+    void bgJobs.stopSession(sessionId);
+    wakeDispatcher.drop(sessionId, 'session deleted');
     // Durable tombstone FIRST: `deletedSessionIds` is in-memory only, so if the
     // directory cannot be removed right now (kiro-cli may still hold the
     // transcript open — disconnect is asynchronous) the chat used to come back on

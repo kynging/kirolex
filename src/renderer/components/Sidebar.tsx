@@ -357,9 +357,10 @@ const SessionItem: React.FC<{
       {scheduleSummary && (
         <span
           className={`session-schedule${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
-          title={scheduleSummary.text}
+          title={scheduleSummary.byModel ? `${t('🤖 Created by the model')} · ${scheduleSummary.text}` : scheduleSummary.text}
         >
           {scheduleSummary.paused ? '⏸️' : '⏰'} {scheduleSummary.short}
+          {scheduleSummary.byModel && <span className="session-schedule-by-model">{t('By model')}</span>}
         </span>
       )}
       {/*

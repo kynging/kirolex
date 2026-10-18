@@ -100,7 +100,8 @@ describe('接线（src/main/index.ts）', () => {
 
   test('存的是**这一轮实际发出去的**文本（含随行快照 + memory）', () => {
     const at = M.indexOf('const bundle = await writeFailureBundle({');
-    assert.match(M.slice(at, at + 600), /promptText: \(prompt \|\| \[\]\)\.map/);
+    /* 仍然是这一轮实际发出去的 `prompt`；只有后台命令输出那一轮换成占位（见 failureBundleWake.test.ts） */
+    assert.match(M.slice(at, at + 700), /promptText: diagnosticPromptText\(prompt, omitSessionContent\)/);
   });
 });
 

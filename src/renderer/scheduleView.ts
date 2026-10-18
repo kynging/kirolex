@@ -30,6 +30,9 @@ export interface ScheduleView {
   lastRunAt: number | null;
   lastError: string | null;
   nextRunAt: number | null;
+  /** `'model'` = 会话里的模型用 `schedule_create` 自己建的（横幅 / 侧栏标「由模型创建」）。 */
+  createdBy?: string | null;
+  expiresAt?: number | null;
 }
 
 export interface ScheduleSummary {
@@ -43,6 +46,8 @@ export interface ScheduleSummary {
   hasError: boolean;
   /** The soonest job, so a click can act on the thing being described. */
   next: ScheduleView | null;
+  /** 横幅描述的那一个（`next`）是模型自己建的 —— 标「由模型创建」，人一眼能看出这不是自己设的。 */
+  byModel: boolean;
 }
 
 /**
@@ -120,6 +125,7 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
     paused: allPaused,
     hasError,
     next,
+    byModel: next?.createdBy === 'model',
   };
 }
 

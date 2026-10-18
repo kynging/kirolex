@@ -330,6 +330,21 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('schedule:changed', handler);
   },
 
+  /* ── 模型起的后台命令 / 监视（bg_run / watch，进程在 MAIN 里）—— 这里只列出来、给一个停止按钮 ── */
+  bgList: () => ipcRenderer.invoke('bg:list'),
+  bgStop: (jobId: string) => ipcRenderer.invoke('bg:stop', jobId),
+  onBgChanged: (cb: () => void) => {
+    const handler = () => cb();
+    ipcRenderer.on('bg:changed', handler);
+    return () => ipcRenderer.removeListener('bg:changed', handler);
+  },
+  /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件）：插进这条用户消息，接管这一轮的流。 */
+  onMainTurn: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number }) => void) => {
+    const handler = (_e: any, data: any) => cb(data);
+    ipcRenderer.on('acp:main-turn', handler);
+    return () => ipcRenderer.removeListener('acp:main-turn', handler);
+  },
+
   /** THE SKILLS KIRO HAS: ~/.kiro/skills/<name>/SKILL.md, parsed. Read-only -- a kiro
    *  skill is triggered by the MODEL matching its frontmatter description, not by a
    *  command, so KiroLex observes it and does not drive it. */

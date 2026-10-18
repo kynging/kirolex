@@ -2163,6 +2163,59 @@ button, input, select, textarea {
   border-color: rgba(239, 83, 80, 0.30);
   color: var(--error);
 }
+/* 「由模型创建」：一个小标签，让人一眼看出这不是自己设的 */
+.schedule-banner-by-model,
+.session-schedule-by-model {
+  flex-shrink: 0;
+  padding: 0 6px;
+  border-radius: 4px;
+  background: rgba(124, 111, 224, 0.18);
+  font-size: 11px;
+  white-space: nowrap;
+}
+
+/* 模型起的后台命令 / 监视：和定时任务横幅同样的位置和外观，一行一个 */
+.bg-jobs-banner {
+  margin: 6px 48px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.bg-job-row {
+  padding: 4px 12px;
+  border-radius: 8px;
+  background: rgba(76, 175, 80, 0.08);
+  border: 1px solid rgba(76, 175, 80, 0.26);
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.bg-job-kind { flex-shrink: 0; color: var(--text-muted); }
+.bg-job-label {
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 500;
+}
+.bg-job-elapsed,
+.bg-job-events { flex-shrink: 0; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.bg-job-stop {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.8;
+}
+.bg-job-stop:hover { opacity: 1; color: var(--error); border-color: rgba(239, 83, 80, 0.55); }
 
 /* Chat error banner: surfaces connectionError even when the chat has messages
    (the empty-state placeholder shows it otherwise). */
