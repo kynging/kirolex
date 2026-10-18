@@ -38,6 +38,7 @@ import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { busyEnterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { queuedBatch, joinQueuedBatch } from './queueBatch';
 import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
@@ -3385,22 +3386,11 @@ const App: React.FC = () => {
           && !isBackendOccupied(busyBySession[sessionId]))
       ) continue;
 
-      // Merge mode sends the whole queue as ONE turn. Bounded on purpose: without
-      // a cap, a long queue becomes a single enormous prompt; the remainder simply
-      // drains on the next turn.
-      const MERGE_MAX_ITEMS = 10;
+      // 「合并排队消息」只在这里（发送时）生效：关着一张一张发，开着把队首最多 10 张合并成一条（`queueBatch.ts`）。
       // 「重建历史中，结束后发送」的那条单独作为下一条发出，不和后面的排队合并。
-      const consumed = settings.mergeQueuedMessages && !queue[0].afterRebuild
-        ? queue.slice(0, MERGE_MAX_ITEMS)
-        : [queue[0]];
+      const consumed = queuedBatch(queue, settings.mergeQueuedMessages && !queue[0].afterRebuild);
       const consumedIds = new Set(consumed.map((item) => item.id));
-      // Empty-content items are real (a busy Enter with attachments and no typed
-      // text degrades to a queued item), and joining them blindly produced stray
-      // blank paragraphs inside the merged prompt.
-      const parts = consumed.map((item) => (item.content || '').trim()).filter(Boolean);
-      const content = parts.length > 1
-        ? `${tRef.current('[{n} queued messages merged]', { n: parts.length })}\n\n${parts.join('\n\n')}`
-        : (parts[0] ?? '');
+      const content = joinQueuedBatch(consumed, (n) => tRef.current('[{n} queued messages merged]', { n }));
       // Placeholders stay in `content` (display/transcript); the delivered prompt
       // gets the expanded text.
       const queuedPastes = consumed.flatMap((item) => item.pastes || []);
