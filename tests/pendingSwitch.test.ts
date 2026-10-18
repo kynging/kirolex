@@ -268,7 +268,7 @@ describe('接线：每一种切换忙时登记 pending、不再 throw', () => {
   });
 });
 
-describe('接线：界面忙时可选，显示「⏳ 这一轮跑完后切换」并能取消', () => {
+describe('接线：界面忙时可选，显示「⏳」并能取消', () => {
   const C = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'ChatArea.tsx'), 'utf-8');
   const A = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'App.tsx'), 'utf-8');
   test('agent / 模型下拉：显示 pending 的值，回复中不再禁用，旁边有 ⏳ 徽标', () => {
@@ -740,5 +740,28 @@ describe('重连进行中再选：登记成下一批 pending，最后一次选�
       assert.ok(q < d, `${anchor}：登记要排在「${dormant}」之前`);
     }
     assert.ok(/shouldQueueSwitch\(\{ busy: !!sessionClients\.get\(sessionId\)\?\.busy, applying: pendingSwitchRunner\.isApplying\(sessionId\), fromPending \}\)/.test(M));
+  });
+});
+
+describe('等待时不显示"这一轮跑完后切换"之类的字眼（用户要求）', () => {
+  const C = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'ChatArea.tsx'), 'utf-8');
+  const S = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'Sidebar.tsx'), 'utf-8');
+  const Z = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'i18nZh', 'chat.ts'), 'utf-8');
+  test('⏳ 小标只有图标（和"切的是什么 → 新值"）+ ✕，不带"跑完后切换"的文字和悬停说明', () => {
+    const at = C.indexOf('function PendingSwitchBadge(');
+    const badge = C.slice(at, C.indexOf('\n}\n', at));
+    assert.ok(badge.includes('⏳'));
+    assert.ok(badge.includes("aria-label={t('Cancel')}"), '✕ 还在，提示只说「取消」');
+    for (const words of ['Switches after this turn', 'as soon as it finishes', 'after this turn', 'Cancel this pending switch']) {
+      assert.ok(!badge.includes(words), `小标里不该有：${words}`);
+    }
+    assert.ok(!/<span className="composer-pending-switch" title=/.test(badge), '不要悬停说明');
+  });
+  test('侧栏换引擎 / 运行位置：pending 时不弹"跑完立刻切换"的提示', () => {
+    assert.ok(!S.includes('the switch will happen as soon as it finishes'));
+    assert.equal((S.match(/if \(r\?\.pending\) return;/g) || []).length, 2);
+  });
+  test('中文表里也不再有这几句', () => {
+    for (const zh of ['这一轮跑完后切换', '跑完会立刻切换', '跑完立刻切换', '取消这次待切换']) assert.ok(!Z.includes(zh), zh);
   });
 });

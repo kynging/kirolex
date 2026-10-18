@@ -1506,16 +1506,17 @@ function stashComposerDraft(sessionId: string | null, text: string) {
 }
 
 /**
- * 「⏳ 这一轮跑完后切换」—— 这一轮还在跑时选的 agent / 模型 / 权限 / 引擎……主进程先记下来（pending），
+ * 「⏳ ✕」—— 这一轮还在跑时选的 agent / 模型 / 权限 / 引擎……主进程先记下来（pending），
  * 跑完立刻切（见 main/pendingSwitch.ts）。✕ = 不切了。`what` 给了就带上"切的是什么 → 新值"（没有自己下拉的那几类用）。
+ * **等待时不说"这一轮跑完后切换"之类的话**（用户要求）：下拉里已经是新选择，只留一个 ⏳ 和取消。
  */
 function PendingSwitchBadge({ what, onCancel }: { what?: string; onCancel?: () => void }) {
   const t = useT();
   return (
-    <span className="composer-pending-switch" title={t('This turn is still running. The switch is applied as soon as it finishes.')}>
-      ⏳ {what ? `${what} · ` : ''}{t('Switches after this turn')}
+    <span className="composer-pending-switch">
+      ⏳{what ? ` ${what}` : ''}
       {onCancel && (
-        <button type="button" className="composer-pending-switch-cancel" onClick={onCancel} aria-label={t('Cancel this pending switch')} title={t('Cancel this pending switch')}>✕</button>
+        <button type="button" className="composer-pending-switch-cancel" onClick={onCancel} aria-label={t('Cancel')} title={t('Cancel')}>✕</button>
       )}
     </span>
   );

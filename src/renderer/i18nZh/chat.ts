@@ -254,9 +254,4 @@ export const ZH_CHAT: Record<string, string> = {
   "Failed to switch model": "切换模型失败",
   "Failed to change tool permission mode": "切换工具权限模式失败",
   "🌐 Browser actions": "🌐 浏览器操作",
-  /* 忙时切换：这一轮跑完再切（main/pendingSwitch.ts） */
-  "Switches after this turn": "这一轮跑完后切换",
-  "This turn is still running. The switch is applied as soon as it finishes.": "这一轮还在跑，跑完会立刻切换。",
-  "Cancel this pending switch": "不切了（取消这次待切换）",
-  "⏳ This turn is still running; the switch will happen as soon as it finishes.": "⏳ 这一轮还在跑，跑完立刻切换。",
 };
