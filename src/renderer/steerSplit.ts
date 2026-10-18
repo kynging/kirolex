@@ -62,7 +62,8 @@ export function userTurnBubbles<A extends AttachmentLike>(base: TurnMsg<A>, stee
   }
   for (const s of steers) {
     const text = s.content.trim();
-    if (text) out.push({ id: s.id, text, timestamp: s.timestamp, isSteer: true, attachments: s.attachments });
+    // 只发了附件、没写字的追加指令也是一条：留着它，气泡里显示它的附件（否则发出去之后界面上什么都看不到）
+    if (text || s.attachments?.length) out.push({ id: s.id, text, timestamp: s.timestamp, isSteer: true, attachments: s.attachments });
   }
   return out;
 }

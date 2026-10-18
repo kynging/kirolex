@@ -24,11 +24,11 @@ const steer = (() => {
   return rest.slice(0, rest.indexOf('\n  }, ['));
 })();
 
-describe('并进队尾这一步认的是哪条会话', () => {
-  test('读格子自己的队列，用 ref', () => {
-    assert.match(steer, /const paneQueue = queuesBySessionRef\.current\[sessionId\] \|\| \[\];/);
-    assert.match(steer, /if \(paneQueue\.length > 0\)/);
-    assert.match(steer, /const tailId = paneQueue\[paneQueue\.length - 1\]\.id;/);
+describe('忙时 Enter 认的是哪条会话（以前是「并进队尾」，现在一律 steer —— 见 tests/steerAlways.test.ts）', () => {
+  test('目标会话是这一格的：paneSid 优先，steer / 重建后发送都落在它上面', () => {
+    assert.match(steer, /const sessionId = paneSid \|\| currentSessionId;/);
+    assert.match(steer, /steerMessage\(content, sessionId,/);
+    assert.match(steer, /\[sessionId\]: withAfterRebuild\(prev\[sessionId\] \|\| \[\],/);
   });
 
   test('不再读按焦点会话算的队列', () => {
@@ -38,8 +38,8 @@ describe('并进队尾这一步认的是哪条会话', () => {
       '任何按焦点会话算的队列都会重新引入那次消息静默消失');
   });
 
-  test('写回的仍然是这一格的会话 —— 判据和落笔必须是同一条会话', () => {
-    assert.match(steer, /\[sessionId\]: \(prev\[sessionId\] \|\| \[\]\)\.map\(/);
+  test('附件从这一格取、在这一格清 —— 判据和落笔必须是同一条会话', () => {
+    assert.match(steer, /attachedFor\(sessionId\)/);
     assert.match(steer, /clearAttachments\(sessionId\)/);
   });
 });

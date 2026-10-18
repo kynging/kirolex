@@ -144,7 +144,7 @@ export function isReviseRequest(text: string | null | undefined): boolean {
 interface RecoveryMsg {
   role: string;
   content: string;
-  steer?: 'pending' | 'consumed';
+  steer?: 'pending' | 'consumed' | 'failed';
   kirolex?: boolean;
 }
 

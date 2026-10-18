@@ -15,6 +15,7 @@ import {
   remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
 } from './kiroConfig';
 import { rewriteImagePaths } from './imagePaths';
+import { steerRefusal } from './steerGate';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
 import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } from './reachability.ts';
@@ -7691,24 +7692,28 @@ app.whenReady().then(async () => {
   // that existed, a consumed steer never reached the transcript at all, and since
   // the ride-along snapshot and history.md are both rendered from the transcript, a
   // restored chat showed the model answering a question nobody had asked.
+  /** 渲染端在登记一条 steer 之前先问「真正会写出去的是什么」：acp:steer 会把大图路径换成缩小后的副本，
+   *  kiro 回报「吃掉了」时带的是换过的正文。渲染端拿它登记、按它精确对账 —— 图片的身份（哪张图）保留着。
+   *  同一个函数、按路径+mtime+大小缓存，所以 acp:steer 再处理一遍得到的是同一份文字。 */
+  ipcMain.handle('acp:cap-steer-text', async (_event, message: string) => capImageRefsInText(String(message || '')));
+
   ipcMain.handle('acp:steer', async (_event, sessionId: string, message: string) => {
     const entry = sessionClients.get(sessionId);
-    if (!entry) return { steered: false, reason: 'not-connected' };
-    if (reconfiguringSessions.has(sessionId)) return { steered: false, reason: 'reconfiguring' };
-    // A history rebuild is a LOCKED task, not a conversational turn. Steering into
-    // it would inject the user's text into a hidden priming turn (invisible, and
-    // answered without the very context being restored). Report it as queueable so
-    // the renderer parks the message until the rebuild finishes.
-    if (entry.priming) {
-      logger.info('prime', `steer REFUSED during rebuild sessionId=${sessionId} -> renderer should queue`);
-      return { steered: false, reason: 'priming' };
-    }
-    if (!entry.client.supportsSteer) return { steered: false, reason: 'unsupported' };
-    // A steer only makes sense while a turn is actually in flight. If the turn
-    // already finished (race between the renderer deciding to steer and this IPC
-    // arriving), report idle so the renderer queues it instead — it will drain
-    // immediately on the now-idle session.
-    if (!entry.busy) return { steered: false, reason: 'idle' };
+    // Order matters (see steerGate.ts): a history rebuild is a LOCKED task, not a
+    // conversational turn -- steering into it would inject the user's text into a
+    // hidden priming turn, so the renderer parks it until the rebuild finishes.
+    // "The turn already ended" is checked BEFORE "engine cannot steer": a claude /
+    // codex turn that just finished must send the message as a new one ('idle'),
+    // not mark it red as unsupported.
+    const refused = steerRefusal({
+      connected: !!entry,
+      reconfiguring: reconfiguringSessions.has(sessionId),
+      priming: !!entry?.priming,
+      busy: !!entry?.busy,
+      supportsSteer: !!entry?.client.supportsSteer,
+    });
+    if (refused === 'priming') logger.info('prime', `steer REFUSED during rebuild sessionId=${sessionId} -> renderer should wait for it`);
+    if (refused || !entry) return { steered: false, reason: refused || 'not-connected' };
     entry.lastUsedAt = Date.now();
     // Same cap as the prompt path: a steer can carry attachments too.
     const steered = entry.client.steer(entry.cliSessionId, capImageRefsInText(message));
@@ -7731,8 +7736,13 @@ app.whenReady().then(async () => {
    *
    *  Called on CONSUMED only. An un-consumed steer goes back to the queue and is
    *  re-sent through acp:prompt, which persists it there. */
-  ipcMain.handle('acp:persist-steer', async (_event, sessionId: string, text: string, messageId?: string) => {
-    if (!sessionId || !text) return { ok: false, error: 'no text' };
+  ipcMain.handle('acp:persist-steer', async (_event, sessionId: string, text: string, messageId?: string, attachments?: { id?: string; name: string; path: string; isImage?: boolean }[]) => {
+    /* 带附件的 steer 可以没有文字（只发了一张图） */
+    const files = Array.isArray(attachments)
+      ? attachments.filter((a) => a && typeof a.path === 'string' && a.path)
+        .map((a) => ({ ...(a.id ? { id: String(a.id) } : {}), name: String(a.name || ''), path: a.path, ...(a.isImage ? { isImage: true } : {}) }))
+      : [];
+    if (!sessionId || (!text && !files.length)) return { ok: false, error: 'no text' };
     { const advRefused = refuseAdvancedOnly(sessionId, 'persist-steer'); if (advRefused) return { ok: false, error: advRefused }; }
     const entry = sessionClients.get(sessionId);
     // The turn's own user message is the merge target. If it is unknown (a steer
@@ -7743,11 +7753,12 @@ app.whenReady().then(async () => {
       store.appendMessage(sessionId, {
         id: messageId || `steer_${Date.now()}`,
         role: 'user',
-        content: text,
+        content: text || '',
         ts: Date.now(),
+        ...(files.length ? { attachments: files } : {}),
         ...(mergeInto ? { mergeIntoMessageId: mergeInto } : {}),
       });
-      logger.info('prompt', `steer persisted sessionId=${sessionId} chars=${text.length} mergeInto=${mergeInto || '<none, standalone>'}`);
+      logger.info('prompt', `steer persisted sessionId=${sessionId} chars=${(text || '').length} files=${files.length} mergeInto=${mergeInto || '<none, standalone>'}`);
       return { ok: true, merged: !!mergeInto };
     } catch (err: any) {
       logger.warn('prompt', `steer persist FAILED sessionId=${sessionId} err=${err?.message || err}`);

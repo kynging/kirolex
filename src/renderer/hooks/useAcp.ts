@@ -35,6 +35,7 @@ import type { ScheduleView } from '../scheduleView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { asSteerParts, toStoredUserLines } from '../steerSplit';
+import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
@@ -221,9 +222,21 @@ export const WEDGE_CONTINUE_PROMPT = '上一轮被 KiroLex 判定"静默太久"�
   + '不要把整篇憋在一次输出里。';
 
 const PENDING_STEERS_KEY = 'kirolex-pending-steers';
+/** 没能追加到这一轮、还在等用户选的 steer（见 `addFailedSteer`）。重启后**仍是标红的失败消息**（带原因、附件和两个按钮），
+ *  不变成排队 —— 只有用户点「作为下一条发送」才进队列（见 steerPending.withFailedSteers）。 */
+const FAILED_STEERS_KEY = 'kirolex-failed-steers';
+export type FailedSteer = FailedSteerRecord<AttachedFile>;
+/** 一条失败记录 → 界面上那条标红的消息 */
+function failedSteerMessage(f: FailedSteer): Message {
+  return {
+    id: f.msgId, role: 'user', content: f.content, steer: 'failed', steerError: f.reason || 'unknown',
+    timestamp: f.ts || Date.now(),
+    ...(f.attachments.length ? { attachments: f.attachments } : {}),
+  };
+}
 /** 每次改动都把自己写进 ui-state 的 Map（只存会被放回队列的那两样：文字和附件）。 */
-class PersistedSteerMap extends Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]> {
-  set(key: string, value: { msgId: string; content: string; attachments: AttachedFile[] }[]): this {
+class PersistedSteerMap extends Map<string, PendingSteer<AttachedFile>[]> {
+  set(key: string, value: PendingSteer<AttachedFile>[]): this {
     super.set(key, value); this.save(); return this;
   }
   delete(key: string): boolean { const r = super.delete(key); this.save(); return r; }
@@ -304,6 +317,8 @@ function autoResendKey(text: string): string {
 function toStoredTranscript(messages: Message[]) {
   return messages
     .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')))
+    /* 没能追加进去的 steer 模型从没见过，不进记录（它在等用户选「作为下一条发送 / 放回输入框」） */
+    .filter((m) => m.steer !== 'failed')
     /* 从盘上读回来、折叠着追加指令的那条拆回「原消息 + mergeIntoMessageId 事件」写回去，下次读回来还能分开显示 */
     .flatMap((m) => toStoredUserLines({
       id: m.id,
@@ -652,7 +667,23 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   if (orphanSteersRef.current === null) {
     try { orphanSteersRef.current = JSON.parse(uiGet(PENDING_STEERS_KEY) || '{}') || {}; } catch { orphanSteersRef.current = {}; }
   }
-  const pendingSteersRef = useRef<Map<string, { msgId: string; content: string; attachments: AttachedFile[] }[]>>(new PersistedSteerMap());
+  /* 上一次没能追加、用户也还没选的 steer：原样读回来，读到会话记录时作为标红消息挂回那一轮（`withFailed`），不进队列 */
+  const failedSteersRef = useRef<Map<string, FailedSteer[]> | null>(null);
+  if (failedSteersRef.current === null) {
+    failedSteersRef.current = new Map(Object.entries(parseFailedSteers<AttachedFile>(uiGet(FAILED_STEERS_KEY))));
+  }
+  const saveFailedSteers = () => {
+    try {
+      const out: Record<string, FailedSteer[]> = {};
+      for (const [k, list] of failedSteersRef.current!) if (list.length) out[k] = list;
+      if (Object.keys(out).length) uiSet(FAILED_STEERS_KEY, JSON.stringify(out));
+      else uiRemove(FAILED_STEERS_KEY);
+    } catch { /* 写不进去就只在内存里 */ }
+  };
+  /** 从盘上读回来的会话记录：把这条会话还没处理的失败 steer 作为标红消息挂回去（重启 / 刷新后仍由用户选） */
+  const withFailed = (sid: string, msgs: Message[]): Message[] =>
+    withFailedSteers(msgs, failedSteersRef.current!.get(sid), failedSteerMessage, steerInsertIndex);
+  const pendingSteersRef = useRef<Map<string, PendingSteer<AttachedFile>[]>>(new PersistedSteerMap());
   /** 上一次运行留下、没被吃的 steer（每个会话一组）。只给一次：App 启动时把它们放进队列。 */
   const takeOrphanSteers = useCallback((): Record<string, { content: string; attachments: AttachedFile[] }[]> => {
     const out = orphanSteersRef.current || {};
@@ -1394,24 +1425,35 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
   // Inject a mid-turn steer into the running turn via _session/steer. Shows the
   // message optimistically with a 'pending' badge, fires the (text-only) steer,
-  // and returns { steered }. On a false result the caller (App) routes the SAME
-  // text to the queue so it is never dropped. Attachments are NOT sent via steer
-  // (the ext-method is text-only) — App must route attachment-bearing messages
-  // to the queue and never call this with attachments.
+  // and returns { steered }. On a false result the optimistic message is rolled
+  // back and the caller (App) decides what happens to the SAME text (see
+  // `steerRoute.steerFailureRoute`) — it is never dropped. The ext-method is
+  // text-only, so attachments travel as local-path refs inside `sendText`
+  // (built by `steerRoute.steerPayload`, same refs a normal message carries);
+  // `attachments` is what the bubble shows and what is persisted.
   const steerMessage = useCallback(async (
     content: string,
     targetSid?: string,
+    opts?: { attachments?: AttachedFile[]; sendText?: string },
   ): Promise<{ steered: boolean; reason?: string }> => {
     // Explicit target: a split pane can steer its own running turn without
     // depending on which chat happens to be focused.
     const sid = targetSid || currentSessionRef.current;
     const text = content.trim();
-    if (!sid || !text) return { steered: false, reason: 'no-session' };
+    const attachments = opts?.attachments || [];
+    let sent = (opts?.sendText ?? text).trim();
+    if (!sid || !sent) return { steered: false, reason: 'no-session' };
+    // 先拿到真正会写出去的文字（大图路径换成缩小副本，见主进程 acp:cap-steer-text），登记和对账都用它：
+    // kiro 回报「吃掉了」时带的就是这份，精确比较才能分清「同样的话、不同的图」。拿不到就用原文。
+    if (sent.includes('/') || sent.includes('\\')) {
+      try { sent = ((await window.kiroApi.capSteerText?.(sent)) || sent).trim(); } catch { /* 用原文 */ }
+    }
 
     const msgId = `steer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     mutateSessionMessages(sid, (prev) => {
       const steerMsg: Message = {
         id: msgId, role: 'user', content: text, steer: 'pending', timestamp: Date.now(),
+        ...(attachments.length ? { attachments } : {}),
       };
       // Place the steer directly AFTER this turn's base user message (and after
       // any earlier steers of the same turn), i.e. BEFORE every assistant/tool
@@ -1434,35 +1476,32 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const pending = pendingSteersRef.current.get(sid) || [];
     pendingSteersRef.current.set(sid, [
       ...pending,
-      { msgId, content: text, attachments: [] },
+      // inFlight：结果还没回来。轮末对账不会把它当「没被吃」放回队列（见 steerPending.settleAtTurnEnd）。
+      { msgId, content: text, attachments, ...(sent !== text ? { sent } : {}), inFlight: true },
     ]);
 
     let res: { steered: boolean; reason?: string };
     try {
-      res = await window.kiroApi.steer(sid, text);
+      res = await window.kiroApi.steer(sid, sent);
     } catch {
       res = { steered: false, reason: 'ipc-error' };
     }
 
-    if (!res?.steered) {
-      const current = pendingSteersRef.current.get(sid) || [];
-      const stillPending = current.some((item) => item.msgId === msgId);
-
-      // If it disappeared while IPC was in flight, either Kiro consumed it or
-      // turn-end reconciliation already moved it to Queue. Both paths have
-      // safely handled the message, so do not enqueue a duplicate.
-      if (!stillPending) return { steered: true };
-
-      const remaining = current.filter((item) => item.msgId !== msgId);
-      if (remaining.length > 0) pendingSteersRef.current.set(sid, remaining);
-      else pendingSteersRef.current.delete(sid);
-
-      // The write failed before delivery; roll back the optimistic message and
-      // let the caller place the exact text at the Queue head.
+    /*
+      结果回来了（判据在 steerPending.settleIpcResult）：
+        · 已经不在待确认里 → 被吃掉了，或者用户点了停止把它丢了；都不用再管；
+        · 没写进去 → 拿掉乐观显示，交给 App 按原因处理（标红让用户选 / 这一轮已结束就作为新消息发）；
+        · 写进去了，但结果回来之前这一轮已经结束（轮末对账只给它打了 turnEnded 记号）→ 等于这一轮已结束。
+      以前这里在「轮末已经把它挪进队列」时直接回 steered:true，失败也绕过了标红 —— 那就是静默排队。
+    */
+    const settled = settleIpcResult(pendingSteersRef.current.get(sid) || [], msgId, res);
+    if (settled.outcome.kind === 'gone') return { steered: true };
+    if (settled.list.length > 0) pendingSteersRef.current.set(sid, settled.list);
+    else pendingSteersRef.current.delete(sid);
+    if (settled.outcome.kind === 'failed') {
       mutateSessionMessages(sid, (prev) => prev.filter((m) => m.id !== msgId));
-      return { steered: false, reason: res?.reason };
+      return { steered: false, reason: settled.outcome.reason };
     }
-
     return { steered: true };
   }, [mutateSessionMessages]);
 
@@ -1472,9 +1511,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // queued item, order preserved, never dropped. Called by App when a session
   // leaves the streaming set.
   const takeUnconsumedSteers = useCallback((sid: string): { content: string; attachments: AttachedFile[] }[] => {
-    const list = pendingSteersRef.current.get(sid);
-    if (!list || list.length === 0) return [];
-    pendingSteersRef.current.delete(sid);
+    const all = pendingSteersRef.current.get(sid);
+    if (!all || all.length === 0) return [];
+    // 结果还没回来的那些留下（标 turnEnded），等 IPC 结果再定 —— 见 steerPending.settleAtTurnEnd
+    const { requeue: list, keep } = settleAtTurnEnd(all);
+    if (keep.length > 0) pendingSteersRef.current.set(sid, keep);
+    else pendingSteersRef.current.delete(sid);
+    if (list.length === 0) return [];
     const ids = new Set(list.map((s) => s.msgId));
     mutateSessionMessages(sid, (prev) => prev.filter((m) => !ids.has(m.id)));
     return list.map((s) => ({ content: s.content, attachments: s.attachments }));
@@ -1495,6 +1538,39 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const ids = new Set(list.map((s) => s.msgId));
       mutateSessionMessages(target, (prev) => prev.filter((m) => !ids.has(m.id)));
     }
+  }, [mutateSessionMessages]);
+
+  /**
+   * steer 没能追加到这一轮（不支持 / 写失败 / 没连上…）：**不再静默转排队**。
+   * 消息留在这一轮的气泡里、标红「没能追加到这一轮：<原因>」，由用户选「作为下一条发送」或「放回输入框」
+   * （`takeFailedSteer` 取走）。在用户选之前它落盘在 `kirolex-failed-steers`，重启也不丢。
+   */
+  const addFailedSteer = useCallback((sid: string, content: string, attachments: AttachedFile[], reason?: string) => {
+    const msgId = `steer_failed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    // 属于哪一轮：落盘之前就从缓存同步算好（不能放进下面的状态更新回调 —— 它可能晚于 saveFailedSteers 执行）
+    const baseId = turnBaseId(messagesCacheRef.current.get(sid) || [], steerInsertIndex);
+    const record: FailedSteer = { msgId, content, attachments, reason, ts: Date.now(), ...(baseId ? { baseId } : {}) };
+    const msg = failedSteerMessage(record);
+    mutateSessionMessages(sid, (prev) => {
+      const insertAt = steerInsertIndex(prev);
+      if (insertAt < 0) return [...prev, msg];
+      return [...prev.slice(0, insertAt), msg, ...prev.slice(insertAt)];
+    });
+    failedSteersRef.current!.set(sid, [...(failedSteersRef.current!.get(sid) || []), record]);
+    saveFailedSteers();
+    return msgId;
+  }, [mutateSessionMessages]);
+
+  /** 用户对一条失败的 steer 做了选择：把它从气泡和落盘里拿掉，返回原文和附件。找不到返回 null。 */
+  const takeFailedSteer = useCallback((sid: string, msgId: string): { content: string; attachments: AttachedFile[] } | null => {
+    const list = failedSteersRef.current!.get(sid) || [];
+    const hit = list.find((f) => f.msgId === msgId);
+    mutateSessionMessages(sid, (prev) => prev.filter((m) => m.id !== msgId));
+    if (!hit) return null;
+    const rest = list.filter((f) => f.msgId !== msgId);
+    if (rest.length) failedSteersRef.current!.set(sid, rest); else failedSteersRef.current!.delete(sid);
+    saveFailedSteers();
+    return { content: hit.content, attachments: hit.attachments };
   }, [mutateSessionMessages]);
 
   // Populate sessionModelRef from persisted sessions on init
@@ -1596,11 +1672,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
           timestamp: m.ts,
         }));
-        messagesCacheRef.current.set(lastSid, restored);
-        rebuildFileChanges(lastSid, restored, currentSessionRef.current === lastSid || !currentSessionRef.current);
+        // 还没处理的失败 steer 挂回这一轮（标红 + 两个按钮），不进队列
+        const restoredWithFailed = withFailed(lastSid, restored);
+        messagesCacheRef.current.set(lastSid, restoredWithFailed);
+        rebuildFileChanges(lastSid, restoredWithFailed, currentSessionRef.current === lastSid || !currentSessionRef.current);
         // Only paint it if the user is still on that session (hydrate is async).
-        if (currentSessionRef.current === lastSid || !currentSessionRef.current) setMessages(restored);
-        recoverInterruptedTurn(lastSid, restored, { assumeCurrent: true });
+        if (currentSessionRef.current === lastSid || !currentSessionRef.current) setMessages(restoredWithFailed);
+        recoverInterruptedTurn(lastSid, restoredWithFailed, { assumeCurrent: true });
       } catch {}
       // Split panes are on screen too, and nothing ever ran the check for them: an
       // unanswered question in a pane just sat there because the FOCUSED chat was a
@@ -1621,9 +1699,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           }));
-          messagesCacheRef.current.set(sid, msgs);
-          rebuildFileChanges(sid, msgs, currentSessionRef.current === sid);
-          recoverInterruptedTurn(sid, msgs);
+          const msgsWithFailed = withFailed(sid, msgs);
+          messagesCacheRef.current.set(sid, msgsWithFailed);
+          rebuildFileChanges(sid, msgsWithFailed, currentSessionRef.current === sid);
+          recoverInterruptedTurn(sid, msgsWithFailed);
         }
       } catch {}
     })();
@@ -2351,40 +2430,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           const list = pendingSteersRef.current.get(targetSid) || [];
           if (list.length === 0) break;
 
-          const consumedIds = new Set<string>();
-          if (snapshot) {
-            // Kiro normally returns one or more wrapped user-message blocks.
-            // Match each block to exactly one pending entry so duplicate text is
-            // consumed by count rather than all identical entries at once.
-            const blocks = Array.from(
-              snapshot.matchAll(/<user_message>\s*([\s\S]*?)\s*<\/user_message>/g),
-              (match) => match[1].trim(),
-            );
-
-            if (blocks.length > 0) {
-              for (const block of blocks) {
-                const match = list.find(
-                  (item) => !consumedIds.has(item.msgId) && item.content === block,
-                );
-                if (match) consumedIds.add(match.msgId);
-              }
-            } else {
-              // Compatibility path for versions that emit unwrapped snapshots.
-              // Remove one matched occurrence at a time to preserve duplicate
-              // counts and pending order.
-              let remainingSnapshot = snapshot;
-              for (const item of list) {
-                const index = remainingSnapshot.indexOf(item.content);
-                if (index < 0) continue;
-                consumedIds.add(item.msgId);
-                remainingSnapshot = `${remainingSnapshot.slice(0, index)}${remainingSnapshot.slice(index + item.content.length)}`;
-              }
-            }
-          }
-
-          // Some versions omit the consumed content entirely. Their lifecycle
-          // remains FIFO, so consume exactly the oldest pending steer.
-          if (consumedIds.size === 0) consumedIds.add(list[0].msgId);
+          // 对账判据在 steerPending.matchConsumedSteers：按「除图片路径外一模一样」比 —— 主进程会把大图路径换成
+          // 缩小后的副本再写出去，精确比较会让一次吃掉的两条大图 steer 只认出最老那一条，另一条轮末再被排队重发。
+          const consumedIds = matchConsumedSteers(list, snapshot);
 
           const remaining = list.filter((item) => !consumedIds.has(item.msgId));
           if (remaining.length > 0) pendingSteersRef.current.set(targetSid, remaining);
@@ -2399,7 +2447,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // — which persists it there, so writing it here as well would double it.
           for (const item of list) {
             if (!consumedIds.has(item.msgId)) continue;
-            void window.kiroApi.persistSteer?.(targetSid, item.content, item.msgId).catch(() => {});
+            // 带附件的 steer 连附件一起落盘（和普通消息一样）：重开会话时气泡上的附件、快照里的文件引用都还在。
+            void window.kiroApi.persistSteer?.(targetSid, item.content, item.msgId, item.attachments?.length ? item.attachments : undefined).catch(() => {});
           }
           mutateSessionMessages(targetSid, (prev) =>
             prev.map((m) => (consumedIds.has(m.id) ? { ...m, steer: 'consumed' as const } : m))
@@ -3108,10 +3157,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           const live = messagesCacheRef.current.get(id) || [];
           const liveById = new Map(live.map((message) => [message.id, message]));
           const restoredIds = new Set(restored.map((message) => message.id));
-          const merged = [
+          // 还没处理的失败 steer 挂回这一轮（已经在 live 里的不重复）
+          const merged = withFailed(id, [
             ...restored.map((message) => liveById.get(message.id) || message),
             ...live.filter((message) => !restoredIds.has(message.id)),
-          ];
+          ]);
           commitBackgroundMessages(id, merged);
           rebuildFileChanges(id, merged, currentSessionRef.current === id);
         }
@@ -3215,10 +3265,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           const live = messagesCacheRef.current.get(sessionId) || [];
           const liveById = new Map(live.map((message) => [message.id, message]));
           const restoredIds = new Set(restored.map((message) => message.id));
-          const merged = [
+          // 还没处理的失败 steer 挂回这一轮（已经在 live 里的不重复）
+          const merged = withFailed(sessionId, [
             ...restored.map((message) => liveById.get(message.id) || message),
             ...live.filter((message) => !restoredIds.has(message.id)),
-          ];
+          ]);
           messagesCacheRef.current.set(sessionId, merged);
           rebuildFileChanges(sessionId, merged, currentSessionRef.current === sessionId);
           // Only apply if the user hasn't switched away while we were reading.
@@ -5009,6 +5060,8 @@ ${text}`,
     sendMessage,
     sendQueuedMessage,
     steerMessage,
+    addFailedSteer,
+    takeFailedSteer,
     takeUnconsumedSteers,
     discardUnconsumedSteers,
     cancelStream,

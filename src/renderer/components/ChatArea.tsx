@@ -17,6 +17,7 @@ import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHi
 import { useLang, useT } from '../hooks/useLang';
 import { displayTitle, shownIn } from '../i18n';
 import { pickVariant } from '../../main/uiText.ts';
+import { steerFailureReasonKey } from '../steerRoute';
 // 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
 import { shouldApplyHandoff } from '../handoffDraft';
 import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
@@ -38,7 +39,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
 import type { ScheduleSummary } from '../scheduleView';
 import { decidePaste } from '../pasteDecision';
-import { IconAppendMessage, IconClaudeSpark, IconCodexPrompt, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
+import { IconClaudeSpark, IconCodexPrompt, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
@@ -1120,11 +1121,17 @@ const UserGroupItem = memo<{
   /** Needed to read an image attachment back from disk for its thumbnail. */
   attachmentSessionId?: string | null;
   onOpenAttachment?: (path: string) => void;
-}>(({ base, steers, isStreaming, onRerun, isLooping, onScheduleSetup, interrupted, merged, attachmentSessionId, onOpenAttachment }) => {
+  /** 一条没能追加到这一轮的 steer（`steer: 'failed'`）上的两个按钮。 */
+  onFailedSteer?: (msgId: string, action: 'send-next' | 'restore') => void;
+}>(({ base, steers: allSteers, isStreaming, onRerun, isLooping, onScheduleSetup, interrupted, merged, attachmentSessionId, onOpenAttachment, onFailedSteer }) => {
   const t = useT();
   const [copiedId, setCopiedId] = useState<string | null>(null);
   const [editing, setEditing] = useState(false);
   const [draft, setDraft] = useState('');
+  // 没能追加到这一轮的 steer 不算这一轮的内容：不进气泡 / 复制 / 编辑重跑的文字，也不进附件条，
+  // 单独在下面标红显示（带它自己的附件名）。
+  const steers = useMemo(() => allSteers.filter((steer) => steer.steer !== 'failed'), [allSteers]);
+  const failedSteers = useMemo(() => allSteers.filter((steer) => steer.steer === 'failed'), [allSteers]);
   // One entry per bubble (original first, then each steer -- in-memory ones, or
   // the boundaries readTranscript recorded for steers folded on disk).
   const bubbles = useMemo(() => userTurnBubbles(base, steers), [base, steers]);
@@ -1305,15 +1312,42 @@ const UserGroupItem = memo<{
     </>
   );
 
+  // 没能追加到这一轮的 steer：标红，挂在这一轮用户消息的下面，两个按钮由用户选
+  const failedBlock = failedSteers.length > 0 && (
+    <>
+      {failedSteers.map((steer) => (
+        <div key={steer.id} className="steer-failed" role="alert">
+          <div className="steer-failed-reason">
+            {t('Could not add this to the current turn: {reason}', { reason: t(steerFailureReasonKey(steer.steerError)) })}
+          </div>
+          {steer.content.trim() && <div className="steer-failed-text">{steer.content}</div>}
+          {!!steer.attachments?.length && (
+            <div className="steer-failed-files">{steer.attachments.map((f) => f.name).join(' · ')}</div>
+          )}
+          <div className="steer-failed-actions">
+            <button type="button" className="steer-failed-btn primary" onClick={() => onFailedSteer?.(steer.id, 'send-next')}>
+              {t('Send as the next message')}
+            </button>
+            <button type="button" className="steer-failed-btn" onClick={() => onFailedSteer?.(steer.id, 'restore')}>
+              {t('Put back in the input box')}
+            </button>
+          </div>
+        </div>
+      ))}
+    </>
+  );
+
   if (!merged && !editing) {
     return (
       <div className="user-turn-group">
         {bubbles.map((bubble) => (
           <div key={bubble.id} className={`message user${bubble.isSteer ? ' steer-message' : ''}`}>
             {renderAttachments(bubble.attachments || [])}
-            <div className="message-content">
-              {bubble.text ? renderParagraph({ text: bubble.text, isSteer: false }, `${bubble.id}:paragraph`) : null}
-            </div>
+            {bubble.text || !bubble.isSteer ? (
+              <div className="message-content">
+                {bubble.text ? renderParagraph({ text: bubble.text, isSteer: false }, `${bubble.id}:paragraph`) : null}
+              </div>
+            ) : null}
             <div className="message-actions">
               {bubble.isSteer && (
                 <span className="steer-tag" title={t('Steered into the running turn')}>{t('Steer')}</span>
@@ -1324,6 +1358,7 @@ const UserGroupItem = memo<{
             </div>
           </div>
         ))}
+        {failedBlock}
       </div>
     );
   }
@@ -1352,6 +1387,7 @@ const UserGroupItem = memo<{
           />
         ) : paragraphs.map((paragraph, index) => renderParagraph(paragraph, `${base.id}:paragraph:${index}`))}
       </div>
+      {failedBlock}
       {editing && (
         <div className="message-edit-actions" ref={editActionsRef}>
           <button type="button" className="message-edit-btn cancel" onClick={() => setEditing(false)}>{t('Cancel')}</button>
@@ -2024,8 +2060,6 @@ const ChatInputBox = memo<{
             ? t('Looping this message — click Stop to end it')
             : status !== 'connected'
             ? t('Connecting... (type /stop to force reconnect)')
-            : isStreaming && queuedMessages.length > 0
-            ? t('Agent is working — Enter appends to the last queued follow-up · {key}+Enter adds a new queue item', { key: MOD_KEY })
             : isStreaming
             ? t('Agent is working — Enter steers the running turn · {key}+Enter queues', { key: MOD_KEY })
             : t('Type a message...')
@@ -2120,8 +2154,6 @@ const ChatInputBox = memo<{
             <span className="composer-shortcut-full">
               {isLooping
                 ? t('Loop running · Stop to end it')
-                : isStreaming && queuedMessages.length > 0
-                ? t('Enter append to queue tail · Shift+Enter newline · {key}+Enter new queue item', { key: MOD_KEY })
                 : isStreaming
                 ? t('Enter steer running turn · Shift+Enter newline · {key}+Enter queue', { key: MOD_KEY })
                 : t('Enter send · Shift+Enter newline · {key}+Enter queue', { key: MOD_KEY })}
@@ -2147,7 +2179,7 @@ const ChatInputBox = memo<{
         ) : (
           <button
             className={`composer-send${
-              queueModifierHeld || (isStreaming && queuedMessages.length > 0)
+              queueModifierHeld
                 ? ' queue'
                 : isStreaming
                 ? ' steer'
@@ -2159,16 +2191,12 @@ const ChatInputBox = memo<{
             disabled={status !== 'connected'}
             title={queueModifierHeld
               ? t('Add a new queued message ({key}+Enter)', { key: MOD_KEY })
-              : isStreaming && queuedMessages.length > 0
-              ? t('Append to the last queued message (Enter)')
               : isStreaming
               ? t('Steer the running turn (Enter)')
               : t('Send (Enter)')}
           >
             {queueModifierHeld ? (
               <IconQueue size={17} />
-            ) : isStreaming && queuedMessages.length > 0 ? (
-              <IconAppendMessage size={17} />
             ) : isStreaming ? (
               <IconSteer size={17} />
             ) : (
@@ -2633,7 +2661,9 @@ interface ChatAreaProps {
   onRerunMessage: (messageId: string, editedText: string) => void;
   turnInterrupted?: boolean;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
-  onSteerMessage: (text: string) => void;
+  onSteerMessage: (text: string, pastes?: PastedBlock[]) => void;
+  /** 没能追加到这一轮的 steer 上那两个按钮（App `handleFailedSteer`）。 */
+  onFailedSteer?: (msgId: string, action: 'send-next' | 'restore') => void;
   onCancel: () => void;
   onDropFiles: (files: AttachedFile[]) => void;
   onRemoveFile: (id: string) => void;
@@ -2782,6 +2812,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onConsumeRestoredInputDraft,
   onQueueMessage,
   onCancelQueuedMessage,
+  onFailedSteer,
   onEditQueuedMessage,
   onMoveQueuedMessage,
   importableSessions,
@@ -2801,6 +2832,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // 放在最前面：下面的回调（如 handleSlashPicker）要用 `t`，并把它列进依赖。
   const t = useT();
   const findLang = useLang();
+  /* 「重建历史中，结束后发送」的那几条不是排队：不进排队卡片（也不让输入框以为队列非空），单独一条标出来 */
+  const rebuildPending = React.useMemo(() => queuedMessages.filter((item) => item.afterRebuild), [queuedMessages]);
+  const plainQueue = React.useMemo(
+    () => (rebuildPending.length ? queuedMessages.filter((item) => !item.afterRebuild) : queuedMessages),
+    [queuedMessages, rebuildPending],
+  );
   /*
     **`/model` / `/agent` 打开自己的下拉** ——「cli 里面是会有选项的」（而 ACP 不带 picker,
     见 `slashPicker.ts`）。`showPicker()` 是浏览器给原生 `<select>` 的标准接口;
@@ -4008,6 +4045,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               merged={!!turnInterrupted && group.base.id === interruptedBaseId}
               isLooping={isLooping}
               onScheduleSetup={openScheduleSetup}
+              onFailedSteer={onFailedSteer}
             />
           ) : (
             <MessageItem
@@ -4125,9 +4163,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       </div>
 
       {!readOnly && <ReviewQueueStack sessionId={currentSessionId} />}
+      {!readOnly && rebuildPending.length > 0 && (
+        <div className="rebuild-pending" role="status">
+          {rebuildPending.map((item) => (
+            <div key={item.id} className="rebuild-pending-item">
+              <span className="rebuild-pending-label">{t('Rebuilding history — sends when it finishes')}</span>
+              <span className="rebuild-pending-text">{item.content || item.attachments.map((f) => f.name).join(' · ')}</span>
+              <button type="button" className="rebuild-pending-btn" onClick={() => onCancelQueuedMessage(item.id)}>
+                {t('Put back in the input box')}
+              </button>
+            </div>
+          ))}
+        </div>
+      )}
       {!readOnly && (
         <QueueStack
-          queuedMessages={queuedMessages}
+          queuedMessages={plainQueue}
           onCancelQueuedMessage={onCancelQueuedMessage}
           onEditQueuedMessage={onEditQueuedMessage}
           onMoveQueuedMessage={onMoveQueuedMessage}
@@ -4278,7 +4329,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 onCancel={onCancel}
                 onStopLoop={onStopLoop}
                 onQueueCommand={onQueueMessage}
-                queuedMessages={queuedMessages}
+                queuedMessages={plainQueue}
                 restoredDraft={restoredQueueDraft}
                 restoredInputDraft={restoredInputDraft}
                 onConsumeRestoredDraft={onConsumeRestoredDraft}

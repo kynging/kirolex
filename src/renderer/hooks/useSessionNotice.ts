@@ -34,11 +34,18 @@ export interface SessionNotice {
  */
 const stickyBySession = new Map<string, SessionNotice>();
 
+/** 渲染端自己要在状态行说的一句（例如「这一轮已经结束，刚才那条作为新消息发出」）—— 和主进程发来的同一个落点。 */
+const localListeners = new Set<(d: { sessionId: string; text: string; ts: number }) => void>();
+export function noteSessionLocally(sessionId: string, text: string): void {
+  const d = { sessionId, text, ts: Date.now() };
+  for (const fn of localListeners) { try { fn(d); } catch { /* 一个监听坏了不影响别的 */ } }
+}
+
 export function useSessionNotice(sessionId: string | null): { notice: SessionNotice | null; dismiss: () => void } {
   const [notice, setNotice] = useState<SessionNotice | null>(null);
 
   useEffect(() => {
-    const off = (window as any).kiroApi?.onSessionNotice?.((d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean; variants?: { zh: string; en: string } }) => {
+    const onNotice = (d: { sessionId: string; text: string; ts: number; copyRemote?: string[]; sticky?: boolean; variants?: { zh: string; en: string } }) => {
       if (!d?.text) return;
       const next: SessionNotice = {
         text: d.text, ts: d.ts || Date.now(),
@@ -51,8 +58,13 @@ export function useSessionNotice(sessionId: string | null): { notice: SessionNot
       /* 只显示**当前这条会话**的：别的会话的进度不该盖住你正在看的东西 */
       if (d.sessionId !== sessionId) return;
       setNotice(next);
-    });
-    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+    };
+    const off = (window as any).kiroApi?.onSessionNotice?.(onNotice);
+    localListeners.add(onNotice);
+    return () => {
+      localListeners.delete(onNotice);
+      try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ }
+    };
   }, [sessionId]);
 
   /* 换会话就清掉 —— 上一条会话的提示留在这儿只会让人以为是这条的 */

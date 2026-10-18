@@ -147,7 +147,8 @@ describe('a consumed steer reaches the durable transcript', () => {
     const end = useAcp.indexOf("case 'steer_cleared'", start);
     assert.ok(start > 0 && end > start, 'the steer_consumed branch moved');
     const branch = useAcp.slice(start, end);
-    assert.match(branch, /persistSteer\?\.\(targetSid, item\.content, item\.msgId\)/);
+    // 带附件的 steer 多传一个附件参数（落盘时附件并进这一轮的用户消息）
+    assert.match(branch, /persistSteer\?\.\(targetSid, item\.content, item\.msgId[,)]/);
     // Anywhere else would double-write: an un-consumed steer is re-sent through
     // acp:prompt, which persists it on that path.
     const calls = (useAcp.match(/persistSteer\?\./g) || []).length;

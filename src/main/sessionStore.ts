@@ -620,10 +620,13 @@ function readTranscriptRaw(id: string): StoredMessage[] {
         if (message.mergeIntoMessageId) {
           const target = out.find((candidate) => candidate.id === message.mergeIntoMessageId);
           if (target?.role === 'user') {
-            target.content = `${target.content}
+            if (message.content) target.content = `${target.content}
 ${message.content}`;
-            /* 记下这一段从哪开始 —— 界面按它把追加指令拆回独立的几条显示（content 照旧是合并后的） */
-            (target.steerParts ||= []).push({ id: message.id, content: message.content, ts: message.ts });
+            // 带附件的 steer：附件并到这一轮那条用户消息上（气泡里本来就是这么显示的）
+            if (message.attachments?.length) target.attachments = [...(target.attachments || []), ...message.attachments];
+            /* 记下这一段从哪开始 —— 界面按它把追加指令拆回独立的几条显示（content 照旧是合并后的）。
+               只有附件、没有文字的那段没有接进 content，也就不记边界（否则拆分对不上） */
+            if (message.content) (target.steerParts ||= []).push({ id: message.id, content: message.content, ts: message.ts });
             continue;
           }
         }

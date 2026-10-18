@@ -9009,3 +9009,103 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .session-notice-action-error { color: var(--error); min-width: 0; word-break: break-word; }
 .remote-file-hint { display: flex; align-items: center; flex-wrap: wrap; gap: 8px; margin: 4px 0 8px; }
 .remote-file-hint-error { color: var(--error); }
+
+/* 没能追加到这一轮的 steer：挂在这一轮的用户气泡下面，标红，两个按钮让用户自己选（不再静默转排队） */
+.steer-failed {
+  max-width: 80%;
+  margin-top: 6px;
+  padding: 8px 10px;
+  border: 1px solid color-mix(in srgb, var(--error) 60%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-secondary) 85%, var(--error) 15%);
+  font-size: 13px;
+  text-align: left;
+  box-sizing: border-box;
+}
+.steer-failed-reason {
+  color: var(--error);
+  font-weight: 600;
+  font-size: 12px;
+}
+.steer-failed-text {
+  margin-top: 4px;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 8em;
+  overflow: auto;
+  color: var(--text-primary);
+}
+.steer-failed-files {
+  margin-top: 4px;
+  font-size: 12px;
+  color: var(--text-secondary);
+}
+.steer-failed-actions {
+  display: flex;
+  gap: 6px;
+  margin-top: 8px;
+  flex-wrap: wrap;
+}
+.steer-failed-btn {
+  padding: 3px 10px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-size: 12px;
+  cursor: pointer;
+}
+.steer-failed-btn.primary {
+  border-color: var(--accent);
+  background: var(--accent);
+  color: #fff;
+}
+.steer-failed-btn:hover { filter: brightness(1.08); }
+
+/* 「重建历史中，结束后发送」：不是排队卡片，单独一行，输入框正上方 */
+.rebuild-pending {
+  flex: 0 0 auto;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: 4px;
+  padding: 0 48px 6px;
+  box-sizing: border-box;
+}
+.rebuild-pending-item {
+  width: 80%;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  box-sizing: border-box;
+  border: 1px dashed color-mix(in srgb, var(--accent) 60%, var(--border));
+  border-radius: 10px;
+  background: color-mix(in srgb, var(--bg-secondary) 88%, var(--accent) 12%);
+  font-size: 12px;
+}
+.rebuild-pending-label {
+  flex: 0 0 auto;
+  color: var(--accent);
+  font-weight: 600;
+}
+.rebuild-pending-text {
+  flex: 1 1 auto;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  color: var(--text-primary);
+}
+.rebuild-pending-btn {
+  flex: 0 0 auto;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-primary);
+  color: var(--text-secondary);
+  font-size: 12px;
+  cursor: pointer;
+}
+/* 气泡分开显示时（user-turn-group），红框也靠右，和这一轮的用户消息对齐 */
+.user-turn-group > .steer-failed { margin-left: auto; width: fit-content; max-width: 70%; margin-bottom: 6px; }

@@ -37,6 +37,8 @@ import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
+import { busyEnterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
@@ -236,10 +238,11 @@ declare global {
       prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }) => Promise<any>;
       cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean) => Promise<void>;
       steer: (sessionId: string, message: string) => Promise<{ steered: boolean; reason?: string }>;
+      capSteerText?: (message: string) => Promise<string>;
       /** Persist a CONSUMED steer into the durable transcript (its only writer:
        *  steers never go through `prompt`). Merges into the turn's base user
        *  message, which is also how it is rendered. */
-      persistSteer?: (sessionId: string, text: string, messageId?: string) => Promise<{ ok: boolean; merged?: boolean; error?: string }>;
+      persistSteer?: (sessionId: string, text: string, messageId?: string, attachments?: { id?: string; name: string; path: string; isImage?: boolean }[]) => Promise<{ ok: boolean; merged?: boolean; error?: string }>;
       respondPermission: (requestId: number | string, optionId: string, sessionId: string) => Promise<void>;
       listModels: (machine?: string) => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
@@ -395,8 +398,11 @@ export interface Message {
   toolCalls?: ToolCall[];
   /** Present on a user message injected mid-turn via _session/steer:
    *  'pending' = written, awaiting the agent's next tool boundary;
-   *  'consumed' = the agent folded it into the running turn. */
-  steer?: 'pending' | 'consumed';
+   *  'consumed' = the agent folded it into the running turn;
+   *  'failed' = `acp:steer` refused it — shown in red with "send next / back to input"
+   *  (`steerError` is the reason), never silently queued. */
+  steer?: 'pending' | 'consumed' | 'failed';
+  steerError?: string;
   timestamp: number;
   /** Pasted blobs referenced by `[ 粘贴 #N · M 行 ]` placeholders in content. */
   pastes?: { seq: number; lines: number; chars: number; path: string }[];
@@ -460,6 +466,12 @@ export interface QueuedMessage {
    * 或者你把那个会话打开了(你在看着)。发出去或者被你编辑过之后,这个标记就没有意义了。
    */
   restored?: boolean;
+  /**
+   * 会话正在**后台重建历史**时按的普通 Enter（不能 steer 进那个隐藏的 priming 轮）。
+   * 它不显示成普通排队卡片，而是标「重建历史中，结束后发送」；排在普通排队之前（`steerRoute.withAfterRebuild`），
+   * 重建一结束就作为下一条单独发出。放进队列结构里是为了复用落盘和排空，不是"排队"。
+   */
+  afterRebuild?: boolean;
 }
 
 /** 远程会话的同步状态（`docs/DESIGN_remote_sessions.md`）。 */
@@ -879,6 +891,8 @@ const App: React.FC = () => {
     sendMessage,
     sendQueuedMessage,
     steerMessage,
+    addFailedSteer,
+    takeFailedSteer,
     takeUnconsumedSteers,
     discardUnconsumedSteers,
     cancelStream,
@@ -3065,6 +3079,9 @@ const App: React.FC = () => {
             ...(Array.isArray(item.pastes) ? { pastes: item.pastes } : null),
             createdAt: Number(item.createdAt) || Date.now(),
             restored: true,
+            // 「重建历史中，结束后发送」的标记必须跟着回来：否则刷新 / 重启后它变成普通排队卡片，
+            // 合并排队开着时还会和后面的排队一起发出去
+            ...(item.afterRebuild === true ? { afterRebuild: true } : null),
           })) as QueuedMessage[];
         if (kept.length) out[sid] = kept;
       }
@@ -3147,15 +3164,30 @@ const App: React.FC = () => {
     prevSteerStreamingRef.current = streamingIds;
   }, [streamingIds, takeUnconsumedSteers]);
 
-  // Ordinary Enter while a turn is running. Precedence:
-  //   (4) queue non-empty  -> extend the queue tail (never steer/interrupt);
-  //   (7) has attachments  -> queue it (steer is text-only; never drop files);
-  //   (3) else             -> steer the running turn via _session/steer.
-  // Ctrl/⌘+Enter (handleQueueMessage) always adds a separate FIFO item instead.
+  /**
+   * 普通 Enter，会话忙时：**永远 steer 当前这一轮**（路由判据在 `steerRoute.ts`，有测试）。
+   *
+   * 以前有四条路会把它悄悄变成排队（队列非空 → 并进队尾 / 带附件 → 排队 / 重建历史中 → 排队 /
+   * steer 失败 → 放队头）。实测一次：会话在跑 120 秒的 `local_bash`，前面三次 steer 都成功了，第四次 Enter
+   * 却进了队列，而且卡片里还是粘贴占位符 —— 输入框交给 `onSteerMessage` 的时候把粘贴块丢了。现在：
+   *   · 队列非空也照样 steer（想排队用 ⌘/Ctrl+Enter，`handleQueueMessage`，不变）；
+   *   · 带附件：附件按本机路径写进 steer 文字（和普通消息一样的引用块），气泡上照常显示附件；
+   *   · 粘贴：先展开再 steer（所有入口都把 `pastes` 带过来）；
+   *   · 重建历史中：不能 steer 进隐藏的 priming 轮 → 标「重建历史中，结束后发送」，重建一结束就作为下一条发出；
+   *   · steer 失败：消息标红，用户自己选「作为下一条发送」/「放回输入框」。只有「这一轮已经结束」直接作为新消息发出，
+   *     并在状态行说一声。
+   *
+   * 操作的永远是**这一格的会话**（`paneSid || currentSessionId`），不是焦点会话（见 tests/queuePaneScope.test.ts）。
+   */
+  /* 读最新的忙碌状态：回调里先 await 了 focusSession，闭包里的那份那时可能已经过期 */
+  const busyBySessionRef = useRef(busyBySession);
+  busyBySessionRef.current = busyBySession;
   const handleSteerMessage = useCallback(async (text: string, pastes?: PastedBlock[], paneSid?: string) => {
     const steerSid = paneSid || currentSessionId;
     if (steerSid && loopingIds.includes(steerSid)) return;   // loop owns the session
     await focusSession(steerSid);
+    // 带占位符的原文：「重建后发送」那条和「这一轮已结束」直接发出的那条按普通消息的方式显示（占位符 + 粘贴块）。
+    const shown = text.trim();
     // Steering carries text only, so a paste must be expanded before it goes out —
     // the placeholder would otherwise reach the model as literal noise.
     if (pastes?.length) text = expandPastes(text, pastes);
@@ -3163,92 +3195,58 @@ const App: React.FC = () => {
     const sessionId = paneSid || currentSessionId;
     const attachments = [...attachedFor(sessionId)];
     if ((!content && attachments.length === 0) || !sessionId) return;
+    clearAttachments(sessionId);
 
     // A history rebuild is a LOCKED task: it is a hidden turn whose whole purpose
     // is to restore the context, so steering into it would be answered without
-    // that context and would never be visible. Park the message in the queue; it
-    // drains in order the moment the rebuild finishes.
-    const reason = busyBySession[sessionId];
-    if (reason === 'priming' || reason === 'prime-pending') {
-      queueMessageRef.current?.(content, pastes, sessionId);
-      return;
-    }
-
-    /**
-     * (4) 这条会话的队列非空：普通 Enter 并进最后一张卡片（正文空行相连，附件合并），永不 steer。
-     *
-     * 队列必须读**这一格自己的**（`queuesBySessionRef.current[sessionId]`），不能读 `currentQueue`
-     * —— 后者是按 `currentSessionId`（焦点会话）算的，而这里操作的是 `paneSid || currentSessionId`。
-     * 分屏时两者常常不是同一条会话，于是会发生消息静默消失：
-     *
-     *   焦点会话队列非空 → 这个分支成立 → tailId 取的是**焦点会话**最后一张卡片的 id
-     *   → `.map` 在**这一格**的队列里找不到那个 id → 什么都没改
-     *   → `clearAttachments(sessionId)` 把附件清掉 → `return`
-     *
-     * 结果就是你打的字和附件一起没了，界面上什么都不发生。反向也坏：焦点会话队列为空而这一格有队列
-     * 时，会掉到下面的 steer 分支，追问变成打断正在跑的那一轮。
-     *
-     * 用 ref 而不是闭包里捕获的值：`currentQueue` 是 useCallback 创建时捕获的，两次渲染之间会过期；
-     * ref 读的永远是最近一次渲染的值。取消/编辑/移动那几个处理函数早就是这么读的（见下面几个）。
-     */
-    const paneQueue = queuesBySessionRef.current[sessionId] || [];
-    if (paneQueue.length > 0) {
-      const tailId = paneQueue[paneQueue.length - 1].id;
+    // that context and would never be visible. Park it as "send after rebuild".
+    const parkUntilRebuilt = () => {
       setQueuesBySession((prev) => ({
         ...prev,
-        [sessionId]: (prev[sessionId] || []).map((item) => (
-          item.id === tailId
-            ? {
-                ...item,
-                // Skip empty sides: a pure-attachment item (or an empty tail)
-                // would otherwise leave blank paragraphs in the queued text.
-                content: [item.content, content].map((s) => (s || '').trim()).filter(Boolean).join('\n\n'),
-                attachments: [...item.attachments, ...attachments],
-              }
-            : item
-        )),
+        [sessionId]: withAfterRebuild(prev[sessionId] || [], {
+          id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          content: pastes?.length ? shown : content,
+          attachments,
+          ...(pastes?.length ? { pastes } : {}),
+          createdAt: Date.now(),
+          afterRebuild: true,
+        }),
       }));
-      clearAttachments(sessionId);
+    };
+    if (busyEnterRoute({ busy: busyBySessionRef.current[sessionId] }) === 'after-rebuild') { parkUntilRebuilt(); return; }
+
+    const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments) });
+    if (res.steered) return;
+    const route = steerFailureRoute(res.reason);
+    if (route === 'after-rebuild') { parkUntilRebuilt(); return; }
+    if (route === 'send-now') {
+      // The turn already ended: there is no "current turn" to add to, so this IS
+      // the next message. Sent straight away unless a queued item is already on
+      // its way out — then it goes right behind that one (head of the queue).
+      noteSessionLocally(sessionId, tRef.current('This turn had already ended — your message was sent as a new message.'));
+      if (queueSendingRef.current.has(sessionId)) {
+        setQueuesBySession((prev) => ({
+          ...prev,
+          [sessionId]: [
+            { id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, content, attachments, createdAt: Date.now() },
+            ...(prev[sessionId] || []),
+          ],
+        }));
+        return;
+      }
+      queueSendingRef.current.add(sessionId);
+      try {
+        await sendQueuedMessage(sessionId, content, attachments, pastes?.length ? { displayText: shown, pastes } : undefined);
+      } catch (error: any) {
+        addFailedSteer(sessionId, content, attachments, String(error?.message || error || ''));
+      } finally {
+        queueSendingRef.current.delete(sessionId);
+      }
       return;
     }
-
-    // (7) _session/steer carries text only. A busy message with attachments
-    // cannot be steered without silently dropping them — safe-degrade to a
-    // normal queued item (drains after the turn); the UI shows it as queued.
-    if (attachments.length > 0) {
-      setQueuesBySession((prev) => ({
-        ...prev,
-        [sessionId]: [
-          ...(prev[sessionId] || []),
-          {
-            id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
-            content,
-            attachments,
-            createdAt: Date.now(),
-          },
-        ],
-      }));
-      clearAttachments(sessionId);
-      return;
-    }
-
-    // (3) Busy + empty queue + no attachments: steer the running turn. The
-    // helper shows it optimistically and returns { steered }.
-    clearAttachments(sessionId);
-    const res = await steerMessage(content, sessionId);
-    if (!res.steered) {
-      // Reliable fallback (steer unsupported / turn already idle / write failed):
-      // never drop the message — put it at the queue head so it delivers next.
-      setQueuesBySession((prev) => ({
-        ...prev,
-        [sessionId]: [
-          { id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, content, attachments: [], createdAt: Date.now() },
-          ...(prev[sessionId] || []),
-        ],
-      }));
-    }
-    // `currentQueue` 不在依赖里：队列现在从 ref 读，而把它列进来会让这个回调每次队列变化都重建。
-  }, [currentSessionId, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds]);
+    // Anything else: never silently queue. Mark it red on the turn and let the user choose.
+    addFailedSteer(sessionId, content, attachments, res.reason);
+  }, [currentSessionId, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds, sendQueuedMessage, addFailedSteer]);
 
   const handleQueueMessage = useCallback((text: string, pastes?: PastedBlock[], paneSid?: string) => {
     const content = text.trim();
@@ -3290,6 +3288,35 @@ const App: React.FC = () => {
     }));
   }, [currentSessionId, addAttachments]);
 
+  /**
+   * 一条没能追加到这一轮的 steer（标红那条），用户点了两个按钮之一：
+   *   'send-next' → 作为**下一条**发送：放到排队最前面（「重建后发送」那几条之后），这一轮一结束就发；
+   *   'restore'   → 放回输入框：文字回到这一格的输入框，附件回到附件栏。
+   */
+  const handleFailedSteer = useCallback((msgId: string, action: 'send-next' | 'restore', paneSid?: string) => {
+    const sid = paneSid || currentSessionId;
+    if (!sid) return;
+    const hit = takeFailedSteer(sid, msgId);
+    if (!hit) return;
+    if (action === 'restore') {
+      addAttachments(sid, hit.attachments);
+      setRestoredQueueDraft({ id: Date.now(), text: hit.content, sessionId: sid });
+      return;
+    }
+    setQueuesBySession((prev) => {
+      const queue = prev[sid] || [];
+      let at = 0;
+      while (at < queue.length && queue[at].afterRebuild) at++;
+      const item: QueuedMessage = {
+        id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        content: hit.content,
+        attachments: hit.attachments,
+        createdAt: Date.now(),
+      };
+      return { ...prev, [sid]: [...queue.slice(0, at), item, ...queue.slice(at)] };
+    });
+  }, [currentSessionId, takeFailedSteer, addAttachments]);
+
   const handleEditQueuedMessage = useCallback((queueId: string, content: string, paneSid?: string) => {
     const sid = paneSid || currentSessionId;
     if (!sid || !content.trim()) return;
@@ -3309,6 +3336,8 @@ const App: React.FC = () => {
       const from = queue.findIndex((item) => item.id === queueId);
       const to = from + direction;
       if (from < 0 || to < 0 || to >= queue.length) return prev;
+      // 「重建后发送」那几条不在排队卡片里，普通卡片不能和它们换位置
+      if (queue[from].afterRebuild || queue[to].afterRebuild) return prev;
       const [item] = queue.splice(from, 1);
       queue.splice(to, 0, item);
       return { ...prev, [sid]: queue };
@@ -3360,7 +3389,10 @@ const App: React.FC = () => {
       // a cap, a long queue becomes a single enormous prompt; the remainder simply
       // drains on the next turn.
       const MERGE_MAX_ITEMS = 10;
-      const consumed = settings.mergeQueuedMessages ? queue.slice(0, MERGE_MAX_ITEMS) : [queue[0]];
+      // 「重建历史中，结束后发送」的那条单独作为下一条发出，不和后面的排队合并。
+      const consumed = settings.mergeQueuedMessages && !queue[0].afterRebuild
+        ? queue.slice(0, MERGE_MAX_ITEMS)
+        : [queue[0]];
       const consumedIds = new Set(consumed.map((item) => item.id));
       // Empty-content items are real (a busy Enter with attachments and no typed
       // text degrades to a queued item), and joining them blindly produced stray
@@ -3755,7 +3787,7 @@ const App: React.FC = () => {
         onForkMessage={messageCallbacks.onFork}
         onRerunMessage={messageCallbacks.onRerun}
         onSend={(text, pastes) => { void handleSendMessage(text, pastes, sid || undefined); }}
-        onSteerMessage={(text) => { void handleSteerMessage(text, undefined, sid || undefined); }}
+        onSteerMessage={(text, pastes) => { void handleSteerMessage(text, pastes, sid || undefined); }}
         onCancel={() => { void handleStopStream(sid || undefined); }}
         onDropFiles={(files) => handleDropFiles(files, sid || undefined)}
         onRemoveFile={(id) => handleRemoveFile(id, sid || undefined)}
@@ -3782,6 +3814,7 @@ const App: React.FC = () => {
         restoredInputDraft={restoredInputDraft}
         onQueueMessage={(text, pastes) => handleQueueMessage(text, pastes, sid || undefined)}
         onCancelQueuedMessage={(queueId) => handleCancelQueuedMessage(queueId, sid || undefined)}
+        onFailedSteer={(msgId, action) => handleFailedSteer(msgId, action, sid || undefined)}
         onEditQueuedMessage={(queueId, content) => handleEditQueuedMessage(queueId, content, sid || undefined)}
         onMoveQueuedMessage={(queueId, direction) => handleMoveQueuedMessage(queueId, direction, sid || undefined)}
         importableSessions={sessions

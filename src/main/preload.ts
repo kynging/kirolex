@@ -240,11 +240,15 @@ contextBridge.exposeInMainWorld('kiroApi', {
   // steered is false so the message is never dropped.
   steer: (sessionId: string, message: string) =>
     ipcRenderer.invoke('acp:steer', sessionId, message),
+  /** The exact text acp:steer will write (oversized image paths swapped for their capped copies),
+   *  so the renderer can match the CONSUMED snapshot against it exactly. */
+  capSteerText: (message: string) =>
+    ipcRenderer.invoke('acp:cap-steer-text', message),
   /** Persist a steer the backend reported CONSUMED. Steers do not travel through
    *  `prompt`, so this is their only path to the durable transcript — and the
    *  transcript is what the context snapshot and history.md are rendered from. */
-  persistSteer: (sessionId: string, text: string, messageId?: string) =>
-    ipcRenderer.invoke('acp:persist-steer', sessionId, text, messageId),
+  persistSteer: (sessionId: string, text: string, messageId?: string, attachments?: { id?: string; name: string; path: string; isImage?: boolean }[]) =>
+    ipcRenderer.invoke('acp:persist-steer', sessionId, text, messageId, attachments),
   /** Persist a renderer-produced assistant note (currently: why a loop ended).
    *  Same reason as persistSteer -- a message created in the renderer never reaches
    *  the durable transcript on its own, so the reason a loop stopped would die with

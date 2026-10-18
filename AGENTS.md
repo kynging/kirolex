@@ -151,7 +151,7 @@ docs/            设计文档（§1）
 
 | 位置 | 关键点 |
 |---|---|
-| `App.tsx` | `queuesBySession`（每会话一条 FIFO，落盘在 ui-state 的 `kirolex-queues`，`QUEUES_KEY`）、`handleSteerMessage`（普通 Enter，运行中）、`handleQueueMessage`（Ctrl/⌘+Enter，永远新加一条）、排空队列的 effect（一次一条；合并模式 `settings.mergeQueuedMessages` 一次最多 `MERGE_MAX_ITEMS = 10` 条拼成一轮）、轮次结束时把没被消费的 steer 放回队头 |
+| `App.tsx` | `queuesBySession`（每会话一条 FIFO，落盘在 ui-state 的 `kirolex-queues`，`QUEUES_KEY`）、`handleSteerMessage`（普通 Enter，运行中）、`handleFailedSteer`（失败 steer 的两个按钮）、`handleQueueMessage`（Ctrl/⌘+Enter，永远新加一条）、排空队列的 effect（一次一条；合并模式 `settings.mergeQueuedMessages` 一次最多 `MERGE_MAX_ITEMS = 10` 条拼成一轮）、轮次结束时把没被消费的 steer 放回队头 |
 | `hooks/useAcp.ts` | `steerMessage`（乐观插入 `steer:'pending'` 消息，**先**登记到 `pendingSteersRef` 再发 IPC）、`takeUnconsumedSteers`、`discardUnconsumedSteers`（用户点停止时丢弃）、`takeOrphanSteers`（启动时把上次没消费的 steer 回队）、`withConsumedSteers`、`sendQueuedMessage`（按目标会话发，不依赖焦点）；持久化键 `kirolex-pending-steers` |
 | `components/ChatArea.tsx` | `ChatInputBox`：运行中 Enter → `onSteer`，空闲 Enter → `onSend`，Ctrl/⌘+Enter → 排队；`QueueStack` 排队卡片（可编辑 / 取消 / 拖动排序） |
 | `index.ts` | `acp:steer`（未连接 / 换执行器中 / 重建历史中 / 引擎不支持 / 已空闲时拒绝并给理由）、`acp:persist-steer`（被消费后并进那条用户消息写进 transcript） |
@@ -258,20 +258,24 @@ docs/            设计文档（§1）
 
 渲染端 `App.tsx` 的 `handleSteerMessage` 注释是权威说明，规则如下：
 
-- 运行中按**普通 Enter**，按优先级：
-  1. **队列非空** → 把文字并进**队尾那张卡**（不插话、不打断）。否则插话会越过已排队的消息，顺序就乱了。
-  2. **带附件** → 排队（steer 只能带文字，绝不丢文件）。
-  3. 其他 → steer：通过 `_session/steer` 注入**当前这一轮**。steer **不取消**这一轮，也不另起一轮
-     （`scripts/steer-smoke.mjs` 断言的就是 `stopReason !== 'cancelled'`）。
+- 运行中按**普通 Enter** = **永远 steer 当前这一轮**（判据在 `steerRoute.ts`，测试 `tests/steerRoute.test.ts` / `tests/steerAlways.test.ts`）：
+  - 队列非空、带附件、带粘贴都照样 steer。附件按本机路径写进 steer 文字（和普通消息同一个 `file:` 引用块，`steerPayload`）；
+    粘贴先展开（所有入口都把 `pastes` 带到 `handleSteerMessage`）。steer **不取消**这一轮，也不另起一轮
+    （`scripts/steer-smoke.mjs` 断言的就是 `stopReason !== 'cancelled'`）。
+  - 正在重建历史（`priming` / `prime-pending`）→ 存成 `afterRebuild` 条目（复用队列的落盘和排空，但界面上单独标
+    「重建历史中，结束后发送」，不是排队卡片），重建一结束作为下一条单独发出。
 - **Ctrl/⌘+Enter** 永远新加一条独立的 FIFO 项。
-- steer 发送失败（不支持 / 已经空闲 / 写失败） → 放到**队头**，下一轮先发。消息永远不丢。
+- steer 发送失败 → **不转排队**：消息标红「没能追加到这一轮：<原因>」，用户选「作为下一条发送」（进队头）或「放回输入框」
+  （`addFailedSteer` / `takeFailedSteer`，未处理的落盘在 `kirolex-failed-steers`，重启后仍是标红的失败消息、挂回那一轮，不进队列）。「重建后发送」条目恢复时保留 `afterRebuild`。
+  只有 `idle`（这一轮已经结束）直接作为新消息发出，并在状态行说一声。消息永远不丢。
 - 被消费的确认（`steer_consumed`）按 FIFO 对应**最老的**待确认 steer；所以 `pendingSteersRef` 必须在**发 IPC 之前**登记
   （kiro 可能 stdin 一被读走就发 consumed，后登记会竞态）。
+- 发 IPC 前登记的 steer 带 `inFlight`：结果没回来之前轮次结束，轮末对账**不动它**（只标 `turnEnded`），等结果回来再按失败原因处理 / 成功则当作「这一轮已结束」作为新消息发（`steerPending.ts`）。主进程 `acp:steer` 的拒绝顺序在 `steerGate.ts`：「这一轮已结束」排在「引擎不支持」前面。
 - 轮次结束时**没被消费**的 steer → 按原顺序放回**队头**。用户点**停止** → 丢弃未消费的 steer，但**普通队列保留**。
 - 每个会话的队列独立 FIFO、在后台独立排空（`sendQueuedMessage` 按目标会话发）；分屏下读的必须是**那一格自己的**队列
   （`queuesBySessionRef.current[sessionId]`，不能用跟着焦点走的 `currentQueue`——曾经导致输入文字静默消失）。
 - 排空时要跳过：正在流式 / 后端被占（含重建历史）/ 被循环占用 / 正在发送 / 自动恢复中 / 正在换模型或 agent / 等待退出中。
-- 引擎只有 kiro 支持 steer（`AcpClient.supportsSteer`）；claude / codex 上运行中的 Enter 会走"失败 → 队头"那条路。
+- 引擎只有 kiro 支持 steer（`AcpClient.supportsSteer`）；claude / codex 上运行中的 Enter 会走"失败 → 标红让用户选"那条路。
 - 队列落盘在 ui-state 的 `kirolex-queues`，未消费 steer 在 `kirolex-pending-steers`；重启后恢复（恢复的排队项带 `restored: true`）。
   控制入口把 `queued` 报为"忙"但**不挡退出**，正因为它已经落盘。
 
