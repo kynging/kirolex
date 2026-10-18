@@ -331,7 +331,7 @@ describe('模型列出来的选项变成可点的片', () => {
     /* 流式过程中不显示：那份文字是半截的，片会一项一项闪出来 */
     assert.match(CA, /\{!isStreaming && !isLooping && choiceChips\.length > 0 && \(/);
     /* 最后说话的是用户 → 没有待答的问题 */
-    assert.match(CA, /if \(msg\.role === 'user'\) return \[\];/);
+    assert.match(CA, /if \(msg\.role === 'user' && !isKirolexNote\(msg\)\) return \[\];/);
   });
 
   test('这是唯一的办法 —— 协议里确实没有这种方法', () => {

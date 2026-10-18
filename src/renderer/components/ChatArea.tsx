@@ -2955,7 +2955,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (isStreaming) return [];
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const msg = messages[i];
-      if (msg.role === 'user') return [];        // 最后说话的是你 → 没有待答的问题
+      if (msg.role === 'user' && !isKirolexNote(msg)) return [];   // 最后说话的是你 → 没有待答的问题（KiroLex 的提示不算）
       if (msg.role !== 'assistant') continue;    // 工具/子代理那些跳过
       return extractChoiceChips(String(msg.content || ''));
     }

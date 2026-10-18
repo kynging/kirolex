@@ -6,6 +6,7 @@ import { tr } from './uiText.ts';
 import { isAdvancedOnly, isAdvancedOnlyProject } from './advancedOnly.ts';
 import { projectDirName } from './projectStore.ts';
 import { logger } from './logger.ts';
+import { isKirolexNote } from './kirolexNote.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -637,7 +638,8 @@ function readTranscriptRaw(id: string): StoredMessage[] {
         const message = JSON.parse(t) as StoredMessage;
         if (message.mergeIntoMessageId) {
           const target = out.find((candidate) => candidate.id === message.mergeIntoMessageId);
-          if (target?.role === 'user') {
+          /* 目标是 KiroLex 的提示（也是 role:'user'）就不并：追加指令单独留一条，文字不丢 */
+          if (target?.role === 'user' && !isKirolexNote(target)) {
             if (message.content) target.content = `${target.content}
 ${message.content}`;
             // 带附件的 steer：附件并到这一轮那条用户消息上（气泡里本来就是这么显示的）

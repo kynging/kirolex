@@ -6,8 +6,10 @@
  * 不切模型、不删会话。设置里的开关默认关（`config.json` 的 `features.controlSessionAccess`）。
  *
  * 这里只管形状：截断、过滤、请求体校验。会话从哪来、消息怎么发，由 index.ts 注入。
- * 不 import 任何东西，测试和渲染端都能直接用（渲染端用 `isControlMessageId` 给气泡挂标签）。
+ * 只 import 纯的 `kirolexNote.ts`，测试和渲染端都能直接用（渲染端用 `isControlMessageId` 给气泡挂标签）。
  */
+
+import { isKirolexNote } from './kirolexNote.ts';
 
 /** `GET /sessions/:id/tail?n=` 的上限 */
 export const CONTROL_TAIL_MAX = 50;
@@ -74,6 +76,8 @@ export interface TranscriptLike {
   id: string;
   role: string;
   content?: string;
+  /** KiroLex 自己插进对话的提示（`isKirolexNote`）—— 落盘也是 role:'user' */
+  kirolex?: true | boolean;
   ts?: number;
   toolCalls?: Array<{ title?: string; kind?: string; status?: string; content?: string }>;
 }
@@ -103,7 +107,9 @@ function oneLine(s: string, max = 200): string {
  * - `<hidden>…</hidden>`（附件引用、复制会话带的历史）不给：那是给模型的，不是对话；
  * - 工具调用**只给一行标题**（`[tool] 标题`），工具输出原文（`toolCalls[].content`、diff）一律不出去 ——
  *   里面可能是读到的文件、命令输出、凭据；
- * - 正文截到 8000 字。
+ * - 正文截到 8000 字；
+ * - KiroLex 自己插进对话的提示（换模型等）落盘是 `role: 'user'`，这里给 `role: 'kirolex'` ——
+ *   外部调用方不能把它当成用户发的。
  */
 export function tailEntries(transcript: TranscriptLike[], n: number): ControlTailEntry[] {
   const count = Math.min(CONTROL_TAIL_MAX, Math.max(1, Math.floor(n) || CONTROL_TAIL_DEFAULT));
@@ -112,7 +118,7 @@ export function tailEntries(transcript: TranscriptLike[], n: number): ControlTai
     const tools = (Array.isArray(m.toolCalls) ? m.toolCalls : [])
       .map((tc) => `[tool] ${oneLine(String(tc?.title || tc?.kind || 'tool'))}`);
     const text = [...tools, ...(body ? [body] : [])].join('\n');
-    return { id: String(m.id), role: String(m.role), ts: Number(m.ts) || 0, text: clip(text) };
+    return { id: String(m.id), role: isKirolexNote(m) ? 'kirolex' : String(m.role), ts: Number(m.ts) || 0, text: clip(text) };
   });
 }
 

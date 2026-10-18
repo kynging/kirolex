@@ -40,6 +40,7 @@ import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { busyEnterRoute, composerRunning, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
 import { carryControlMark, controlMessageId, isControlMessageId } from '../main/controlSessions';
+import { isKirolexNote } from '../main/kirolexNote.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
 import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
@@ -2455,7 +2456,7 @@ const App: React.FC = () => {
       turnEnd++;
     }
     const laterRecords = list.slice(turnEnd + 1);
-    const hasLaterUserTurn = laterRecords.some((message) => message.role === 'user');
+    const hasLaterUserTurn = laterRecords.some((message) => message.role === 'user' && !isKirolexNote(message));
     if (hasLaterUserTurn) {
       setRerunConfirm({ messageId, editedText, deleteCount: laterRecords.length, sessionId: sid || undefined });
       return;

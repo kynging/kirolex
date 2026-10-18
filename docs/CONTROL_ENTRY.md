@@ -40,6 +40,7 @@ KiroLex 启动时在 `127.0.0.1` 的一个随机端口上开一个很小的 HTTP
 **`GET /sessions/:id/tail?n=10`** → `[{id, role, ts, text}]`
 
 - `n` 默认 10，最多 50；
+- `role` 是 `user`（你发的）、`assistant`，或 `kirolex`（KiroLex 自己插进对话的提示，例如换了模型 —— 不是你发的）；
 - `text` 截到 8000 字；
 - 工具调用只给一行标题（`[tool] 标题`），**不给工具输出原文**（读到的文件、命令输出都不出去）；
 - 附件引用这类给模型看的隐藏块（`<hidden>…</hidden>`）不给。

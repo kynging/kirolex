@@ -44,6 +44,7 @@ import { asVariants } from '../../main/uiText.ts';
 import { withLiveNote } from '../noticeMerge.ts';
 import { firstUserText } from '../titleSource.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
+import { chatHistoryBody } from '../historyBlock.ts';
 import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 
@@ -1421,7 +1422,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // this project does not target, so it was a standing TS2550 + implicit-any.
       let lastUserIndex = -1;
       for (let index = current.length - 1; index >= 0; index--) {
-        if (current[index].role === 'user') { lastUserIndex = index; break; }
+        if (current[index].role === 'user' && !isKirolexNote(current[index])) { lastUserIndex = index; break; }
       }
       let assistantIndex = -1;
       for (let index = current.length - 1; index > lastUserIndex; index--) {
@@ -2665,11 +2666,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const dropPartial = (list: Message[]): Message[] => {
         let idx = -1;
         for (let i = list.length - 1; i >= 0; i--) {
-          if (list[i].role === 'user') break;               // reached this turn's prompt
+          if (list[i].role === 'user' && !isKirolexNote(list[i])) break;   // reached this turn's prompt
           if (list[i].role === 'assistant') { idx = i; break; }
         }
         if (idx < 0) return list;
-        return list.filter((_, i) => i < idx);
+        /* KiroLex 的提示不是半截回复，留着 */
+        return list.filter((m, i) => i < idx || (i > idx && isKirolexNote(m)));
       };
       const cached = messagesCacheRef.current.get(sid);
       if (cached) messagesCacheRef.current.set(sid, dropPartial(cached));
@@ -2700,7 +2702,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const removeTurnWedged = window.kiroApi.onTurnWedged?.(({ sessionId: sid, produced }) => {
       if (!sid) return;
       /* 卡死的是侧栏 review 的改写那一轮：不自动续写、不自动重发（见 `isReviseRequest`） */
-      const lastUser = [...(messagesCacheRef.current.get(sid) || [])].reverse().find((m) => m.role === 'user');
+      const lastUser = [...(messagesCacheRef.current.get(sid) || [])].reverse().find((m) => m.role === 'user' && !isKirolexNote(m));
       if (lastUser && isReviseRequest(lastUser.content)) return;
       if (produced) {
         // A partial reply exists, so resending would duplicate it -- but the turn was
@@ -3102,7 +3104,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             toolCalls: m.toolCalls,
             attachments: m.attachments,
             pastes: m.pastes,
-            ...(asVariants(m.variants) ? { variants: asVariants(m.variants) } : {}),
+            ...((m as any).kirolex ? { kirolex: true as const } : {}),
+            ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+            ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             timestamp: m.ts,
           }));
@@ -3716,9 +3720,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (dupHistory) {
         duplicateHistoryRef.current.delete(pendingId!);
         if (dupHistory.length > 0) {
-          const body = dupHistory
-            .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-            .join('\n\n');
+          const body = chatHistoryBody(dupHistory);
           prompt = [
             {
               type: 'text',
@@ -3736,9 +3738,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (rebuiltHistory) {
       duplicateHistoryRef.current.delete(sid!);
       if (rebuiltHistory.length > 0) {
-        const body = rebuiltHistory
-          .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-          .join('\n\n');
+        const body = chatHistoryBody(rebuiltHistory);
         prompt = [
           {
             type: 'text',
@@ -3779,10 +3779,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
         const delta = srcMsgs.slice(link.syncedCount);
         if (delta.length > 0) {
-          const body = delta
-            .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content}`)
-            .join('\n\n');
-          sections.push(`【${link.sourceTitle}】\n${body}`);
+          const body = chatHistoryBody(delta);
+          /* 新增的只有 KiroLex 的提示 → 没什么可同步的，只把进度记上 */
+          if (body) sections.push(`【${link.sourceTitle}】\n${body}`);
           changed = true;
           updated.push({ ...link, syncedCount: srcMsgs.length });
         } else {
@@ -4049,7 +4048,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // ids from the transcript. Fall back to the latest base user message so an
       // interrupted turn can still be rerun / overwritten.
       for (let i = current.length - 1; i >= 0; i--) {
-        if (current[i].role === 'user' && !current[i].steer) { targetIndex = i; break; }
+        if (current[i].role === 'user' && !current[i].steer && !isKirolexNote(current[i])) { targetIndex = i; break; }
       }
     }
     if (targetIndex < 0) {

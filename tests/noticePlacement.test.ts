@@ -188,6 +188,6 @@ describe('同类提示带上「类型:对象」，界面才能合并计数', () 
     assert.match(fnBody(M, 'noteInSession'), /const g = group \? \{ noteGroup: group \} : \{\};/);
     const A = read('src', 'renderer', 'hooks', 'useAcp.ts');
     assert.ok((A.match(/noteGroup: \(m as any\)\.noteGroup/g) || []).length >= 4, '每条从 transcript 读回来的路都要带上');
-    assert.match(read('src', 'renderer', 'hooks', 'useSessionNotice.ts'), /group: d\.group/);
+    assert.match(read('src', 'renderer', 'sessionNoticeHub.ts'), /group: d\.group/);
   });
 });

@@ -1251,7 +1251,7 @@ describe('KiroLex 的提示走状态行；换项目不许杀掉正在跑的一�
     assert.match(HK, /const FADE_MS = 12_000;/);
     assert.match(HK, /const WARN_MS = 45_000;/);
     /* 只显示当前会话的 —— 别的会话的进度不该盖住你正在看的 */
-    assert.match(HK, /d\.sessionId !== sessionId/);
+    assert.match(HK, /noticeSessionId !== sessionId/);
     /* 换会话要清掉，否则上一条的提示看起来像这条的 */
     assert.match(HK, /useEffect\(\(\) => \{ setNotice\(null\); \}, \[sessionId\]\);/);
   });
