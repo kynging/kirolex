@@ -316,6 +316,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('control:pending-quit', handler);
     return () => ipcRenderer.removeListener('control:pending-quit', handler);
   },
+  /** 控制入口的 `POST /sessions/:id/send`：主进程转来，界面按 Enter 的同一套路由处理，再用 controlSendResult 回话 */
+  onControlSend: (cb: (req: { reqId: string; sessionId: string; text: string; mode: 'auto' | 'next' }) => void) => {
+    const handler = (_e: any, req: any) => cb(req);
+    ipcRenderer.on('control:send', handler);
+    return () => ipcRenderer.removeListener('control:send', handler);
+  },
+  controlSendResult: (reqId: string, reply: unknown) => ipcRenderer.invoke('control:send-result', reqId, reply),
+  controlReady: () => ipcRenderer.invoke('control:ready'),
   onScheduleChanged: (cb: (payload: any) => void) => {
     const handler = (_e: any, payload: any) => cb(payload);
     ipcRenderer.on('schedule:changed', handler);

@@ -35,6 +35,7 @@ import type { ScheduleView } from '../scheduleView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { asSteerParts, toStoredUserLines } from '../steerSplit';
+import { carryControlMark, viaFor } from '../../main/controlSessions';
 import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
@@ -187,7 +188,11 @@ function extractToolOutput(update: any): string {
 /** Supplied by the cancel-overwrite path: it has ALREADY built the prompt from the
  *  composer (new attachments, expanded pastes), so the rerun must use those rather
  *  than resurrecting the interrupted message's own attachments. */
-type RerunOverride = { prompt?: any[]; attachments?: any[]; pastes?: any[]; displayText?: string };
+type RerunOverride = {
+  prompt?: any[]; attachments?: any[]; pastes?: any[]; displayText?: string;
+  /** 被重发的那条是经控制入口发的，新的那条也带标记（`carryControlMark`）。自动重发用；你手动「编辑重跑」不带 */
+  carryMark?: boolean;
+};
 
 /** How many times an interrupted prompt may be auto-resent before KiroLex stops
  *  trying. More than one, because the resend's OWN turn can be interrupted too;
@@ -234,7 +239,7 @@ function failedSteerMessage(f: FailedSteer): Message {
     ...(f.attachments.length ? { attachments: f.attachments } : {}),
   };
 }
-/** 每次改动都把自己写进 ui-state 的 Map（只存会被放回队列的那两样：文字和附件）。 */
+/** 每次改动都把自己写进 ui-state 的 Map（只存会被放回队列的：文字、附件，和 id —— id 用来认出经控制入口发的那条，放回队列时保留标记）。 */
 class PersistedSteerMap extends Map<string, PendingSteer<AttachedFile>[]> {
   set(key: string, value: PendingSteer<AttachedFile>[]): this {
     super.set(key, value); this.save(); return this;
@@ -243,8 +248,8 @@ class PersistedSteerMap extends Map<string, PendingSteer<AttachedFile>[]> {
   clear(): void { super.clear(); this.save(); }
   private save(): void {
     try {
-      const out: Record<string, { content: string; attachments: AttachedFile[] }[]> = {};
-      for (const [k, list] of this) out[k] = list.map((s) => ({ content: s.content, attachments: s.attachments || [] }));
+      const out: Record<string, { content: string; attachments: AttachedFile[]; msgId?: string }[]> = {};
+      for (const [k, list] of this) out[k] = list.map((s) => ({ content: s.content, attachments: s.attachments || [], msgId: s.msgId }));
       uiSet(PENDING_STEERS_KEY, JSON.stringify(out));
     } catch { /* 写不进去就只在内存里，和以前一样 */ }
   }
@@ -331,6 +336,8 @@ function toStoredTranscript(messages: Message[]) {
       ...(m.kirolex ? { kirolex: true as const } : {}),
       ...(m.variants ? { variants: m.variants } : {}),
       ...(m.steerParts ? { steerParts: m.steerParts } : {}),
+      // 经控制入口发的（id 带标记）：整份重写时显式来源照样写回去
+      ...viaFor(m.id),
     }));
 }
 
@@ -663,7 +670,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     现在每次变动都写进 ui-state；启动时上一次留下的那些作为排队消息放回各自会话（见 takeOrphanSteers）。
     先读后写：上一次的那份要在第一次保存之前取走。
   */
-  const orphanSteersRef = useRef<Record<string, { content: string; attachments: AttachedFile[] }[]> | null>(null);
+  const orphanSteersRef = useRef<Record<string, { content: string; attachments: AttachedFile[]; msgId?: string }[]> | null>(null);
   if (orphanSteersRef.current === null) {
     try { orphanSteersRef.current = JSON.parse(uiGet(PENDING_STEERS_KEY) || '{}') || {}; } catch { orphanSteersRef.current = {}; }
   }
@@ -685,7 +692,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     withFailedSteers(msgs, failedSteersRef.current!.get(sid), failedSteerMessage, steerInsertIndex);
   const pendingSteersRef = useRef<Map<string, PendingSteer<AttachedFile>[]>>(new PersistedSteerMap());
   /** 上一次运行留下、没被吃的 steer（每个会话一组）。只给一次：App 启动时把它们放进队列。 */
-  const takeOrphanSteers = useCallback((): Record<string, { content: string; attachments: AttachedFile[] }[]> => {
+  const takeOrphanSteers = useCallback((): Record<string, { content: string; attachments: AttachedFile[]; msgId?: string }[]> => {
     const out = orphanSteersRef.current || {};
     orphanSteersRef.current = {};
     return out;
@@ -1268,7 +1275,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (attempts > 0) await new Promise((r) => setTimeout(r, Math.min(30_000, 2000 * attempts)));
       if (recoveryCancelledRef.current.has(sid)) { setSessionActivity(sid, null); return; }
       try {
-        await rerunFromMessageRef.current?.(target.id, resendText, undefined, sid);
+        // 原来那条是经控制入口发的：重发的新消息照样带标记
+        await rerunFromMessageRef.current?.(target.id, resendText, { carryMark: true }, sid);
       } catch (error: any) {
         // A real failure IS worth a banner: the question would otherwise sit
         // unanswered with no explanation.
@@ -1434,7 +1442,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const steerMessage = useCallback(async (
     content: string,
     targetSid?: string,
-    opts?: { attachments?: AttachedFile[]; sendText?: string },
+    opts?: { attachments?: AttachedFile[]; sendText?: string; /** 调用方指定的 id（控制入口发的带标记，见 controlSessions.isControlMessageId） */ msgId?: string },
   ): Promise<{ steered: boolean; reason?: string }> => {
     // Explicit target: a split pane can steer its own running turn without
     // depending on which chat happens to be focused.
@@ -1449,7 +1457,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       try { sent = ((await window.kiroApi.capSteerText?.(sent)) || sent).trim(); } catch { /* 用原文 */ }
     }
 
-    const msgId = `steer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const msgId = opts?.msgId || `steer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     mutateSessionMessages(sid, (prev) => {
       const steerMsg: Message = {
         id: msgId, role: 'user', content: text, steer: 'pending', timestamp: Date.now(),
@@ -1510,7 +1518,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // can re-queue the exact text at the queue head — reappearing as a normal
   // queued item, order preserved, never dropped. Called by App when a session
   // leaves the streaming set.
-  const takeUnconsumedSteers = useCallback((sid: string): { content: string; attachments: AttachedFile[] }[] => {
+  const takeUnconsumedSteers = useCallback((sid: string): { content: string; attachments: AttachedFile[]; msgId: string }[] => {
     const all = pendingSteersRef.current.get(sid);
     if (!all || all.length === 0) return [];
     // 结果还没回来的那些留下（标 turnEnded），等 IPC 结果再定 —— 见 steerPending.settleAtTurnEnd
@@ -1520,7 +1528,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (list.length === 0) return [];
     const ids = new Set(list.map((s) => s.msgId));
     mutateSessionMessages(sid, (prev) => prev.filter((m) => !ids.has(m.id)));
-    return list.map((s) => ({ content: s.content, attachments: s.attachments }));
+    return list.map((s) => ({ content: s.content, attachments: s.attachments, msgId: s.msgId }));
   }, [mutateSessionMessages]);
 
   // Explicitly drop a session's (or every session's, when sid is omitted)
@@ -1545,8 +1553,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 消息留在这一轮的气泡里、标红「没能追加到这一轮：<原因>」，由用户选「作为下一条发送」或「放回输入框」
    * （`takeFailedSteer` 取走）。在用户选之前它落盘在 `kirolex-failed-steers`，重启也不丢。
    */
-  const addFailedSteer = useCallback((sid: string, content: string, attachments: AttachedFile[], reason?: string) => {
-    const msgId = `steer_failed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  const addFailedSteer = useCallback((sid: string, content: string, attachments: AttachedFile[], reason?: string, idOverride?: string) => {
+    const msgId = idOverride || `steer_failed_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     // 属于哪一轮：落盘之前就从缓存同步算好（不能放进下面的状态更新回调 —— 它可能晚于 saveFailedSteers 执行）
     const baseId = turnBaseId(messagesCacheRef.current.get(sid) || [], steerInsertIndex);
     const record: FailedSteer = { msgId, content, attachments, reason, ts: Date.now(), ...(baseId ? { baseId } : {}) };
@@ -3488,7 +3496,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     }
   }, [mutateSessionMessages]);
 
-  const sendMessage = useCallback(async (prompt: any[], localResponse?: string, attachments?: any[], model?: string, display?: { text?: string; pastes?: any[] }, targetSid?: string) => {
+  const sendMessage = useCallback(async (prompt: any[], localResponse?: string, attachments?: any[], model?: string, display?: { text?: string; pastes?: any[]; /** 调用方指定的用户消息 id（自动重发经控制入口发的那条时带标记） */ messageId?: string }, targetSid?: string) => {
     // `targetSid` makes this send TARGET-ADDRESSED. Without it this function always
     // sent to whatever chat was focused, which is wrong for every caller that acts
     // on a specific chat: rerunFromMessage truncated the transcript of chat A (it
@@ -3538,7 +3546,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
     // Use one stable id in the renderer and append-only durable transcript so
     // later busy-Enter steering can target and materialize into this user turn.
-    const userMessageId = `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const userMessageId = display?.messageId || `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     const optimisticUserMessage: Message = {
       id: userMessageId,
       role: 'user',
@@ -4022,6 +4030,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         ? target.attachments.map((a) => ({ ...a }))
         : undefined;
       const keptPastes = (target as any).pastes?.length ? (target as any).pastes : undefined;
+      // 自动重发经控制入口发的那条：新消息的 id 照样带标记（气泡标签、记录里的 via 都跟着它）
+      const carried = override?.carryMark ? carryControlMark(target.id, 'user') : undefined;
       const rerunPrompt: any[] = [];
       if (keptAttachments?.length) {
         // Same hidden file-ref block the normal send path uses, so the backend can
@@ -4051,7 +4061,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         undefined,
         keptAttachments,
         modelForSession(sid),
-        keptPastes ? { text, pastes: keptPastes } : undefined,
+        (keptPastes || carried)
+          ? { text, ...(keptPastes ? { pastes: keptPastes } : {}), ...(carried ? { messageId: carried } : {}) }
+          : undefined,
         sid, // same chat that was truncated above; see sendMessage's targetSid
       );
     } catch (error: any) {
@@ -4073,7 +4085,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     sessionId: string,
     text: string,
     attachments: any[] = [],
-    options?: { mergeIntoMessageId?: string; onStarted?: () => void; displayText?: string; pastes?: any[] },
+    options?: { mergeIntoMessageId?: string; onStarted?: () => void; displayText?: string; pastes?: any[]; /** 调用方指定的用户消息 id（控制入口发的带标记） */ messageId?: string },
   ) => {
     const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
     if (!session || session.archived || sessionId.startsWith('pending_')) return;
@@ -4123,7 +4135,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     };
 
-    const userMessageId = `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const userMessageId = options?.messageId || `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     // `text` is what the MODEL gets (pastes expanded); the bubble/transcript keep
     // the short placeholder form when the caller supplies one.
     const shownText = options?.displayText ?? text;

@@ -51,6 +51,28 @@ export function busyEnterRoute(s: { busy?: string | null }): 'steer' | 'after-re
   return isRebuildingHistory(s.busy) ? 'after-rebuild' : 'steer';
 }
 
+/** 输入框眼里「这一轮在跑」—— 这时普通 Enter 走 steer（`ChatInputBox` 的 `isStreaming`）。
+ *  `busy === 'turn'` 是主进程说的，`streaming` 是渲染端的（窗口刷新会丢），两边都问；重建历史也算（steer 那边再停到重建之后）。 */
+export function composerRunning(streaming: boolean, busy?: string | null): boolean {
+  return streaming || busy === 'turn' || isRebuildingHistory(busy);
+}
+
+export type EnterRoute = 'blocked' | 'steer' | 'queue' | 'send';
+
+/**
+ * **普通 Enter 最终走哪条路** —— 输入框（`composerRunning` → steer）和 `handleSendMessage`
+ * （循环占着 → 不发；后端被占着但不是在跑一轮 → 排队；在跑一轮 → steer）合起来的那一套。
+ * 控制入口的 `send` 用的就是它，和你在输入框按 Enter 一模一样；`mode:'next'` 等于 ⌘/Ctrl+Enter（排队）。
+ * `occupied` = `isBackendOccupied(busy)`（在 useAcp 里，测试 import 不了，所以由调用方算好传进来）。
+ */
+export function enterRoute(s: { streaming: boolean; busy?: string | null; occupied: boolean; looping: boolean; next?: boolean }): EnterRoute {
+  if (s.looping) return 'blocked';
+  if (s.next) return 'queue';
+  if (composerRunning(s.streaming, s.busy)) return 'steer';
+  if (s.occupied) return 'queue';
+  return 'send';
+}
+
 /** 正在后台重建历史（隐藏的 priming 轮）—— 这时不能 steer：那一轮是为了恢复上下文，往里塞话会在没有上下文的情况下被回答。 */
 export function isRebuildingHistory(busy?: string | null): boolean {
   return busy === 'priming' || busy === 'prime-pending';

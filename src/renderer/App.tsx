@@ -37,7 +37,8 @@ import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
-import { busyEnterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { busyEnterRoute, composerRunning, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { carryControlMark, controlMessageId, isControlMessageId } from '../main/controlSessions';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
 import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
@@ -95,6 +96,11 @@ declare global {
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
       getPendingQuit?: () => Promise<boolean>;
       onPendingQuit?: (cb: (pending: boolean) => void) => () => void;
+      /** 控制入口（controlServer `POST /sessions/:id/send`）：主进程转来一条，界面按 Enter 的同一套路由处理后回话 */
+      onControlSend?: (cb: (req: { reqId: string; sessionId: string; text: string; mode: 'auto' | 'next' }) => void) => () => void;
+      controlSendResult?: (reqId: string, reply: ControlSendReply) => Promise<void>;
+      /** 界面就绪、能接控制入口的 send 了 */
+      controlReady?: () => Promise<void>;
       /** The skills kiro actually has, parsed from ~/.kiro/skills. Read-only. */
       skillList?: () => Promise<{ dir: string; skills: Array<{ folder: string; path: string; ok: boolean; doc?: any; summary?: string; error?: string }> }>;
       skillRead?: (filePath: string) => Promise<{ ok: boolean; path?: string; raw?: string; doc?: any; error?: string }>;
@@ -450,6 +456,14 @@ export interface AttachedFile {
   isImage?: boolean;
   preview?: string; // thumbnail data URL for image attachments
 }
+
+/** 控制入口发来的一条：`report` 在决定走哪条路的那一刻告诉主进程（`sent` / `steer` / `queued` + 消息 id）。 */
+interface ControlSendCtx {
+  report: (r: { routed: 'sent' | 'steer' | 'queued'; messageId: string; steerFailed?: string }) => void;
+}
+export type ControlSendReply =
+  | { ok: true; routed: 'sent' | 'steer' | 'queued'; messageId: string; steerFailed?: string }
+  | { ok: false; status: number; error: string };
 
 export interface QueuedMessage {
   id: string;
@@ -3129,7 +3143,8 @@ const App: React.FC = () => {
       for (const sid of sids) {
         next[sid] = [
           ...orphans[sid].map((s) => ({
-            id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            // 经控制入口追加的那条照样带标记（`carryControlMark`）
+            id: carryControlMark(s.msgId, 'queue') ?? `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             content: s.content,
             attachments: s.attachments || [],
             createdAt: Date.now(),
@@ -3153,7 +3168,8 @@ const App: React.FC = () => {
         ...current,
         [fid]: [
           ...leftover.map((s) => ({
-            id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+            // 经控制入口追加的那条放回队头时照样带标记（发出去时气泡上标「经控制入口发送」）
+            id: carryControlMark(s.msgId, 'queue') ?? `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
             content: s.content,
             attachments: s.attachments,
             createdAt: Date.now(),
@@ -3183,10 +3199,44 @@ const App: React.FC = () => {
   /* 读最新的忙碌状态：回调里先 await 了 focusSession，闭包里的那份那时可能已经过期 */
   const busyBySessionRef = useRef(busyBySession);
   busyBySessionRef.current = busyBySession;
-  const handleSteerMessage = useCallback(async (text: string, pastes?: PastedBlock[], paneSid?: string) => {
+  /**
+   * 「现在就作为新消息发」—— 已经有一条排队的正在发出去，就排在它后面（队头）。
+   * steer 时这一轮已经结束，和控制入口在会话空闲时发，走的都是这一条（按 sessionId 发，不依赖焦点）。
+   */
+  const sendNowOrNext = useCallback(async (
+    sessionId: string, content: string, attachments: AttachedFile[],
+    display?: { displayText?: string; pastes?: PastedBlock[] }, ctl?: ControlSendCtx,
+  ) => {
+    if (queueSendingRef.current.has(sessionId)) {
+      const id = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      ctl?.report({ routed: 'queued', messageId: id });
+      setQueuesBySession((prev) => ({
+        ...prev,
+        [sessionId]: [
+          { id, content, attachments, createdAt: Date.now() },
+          ...(prev[sessionId] || []),
+        ],
+      }));
+      return;
+    }
+    const messageId = ctl ? controlMessageId('user') : undefined;
+    if (ctl) ctl.report({ routed: 'sent', messageId: messageId! });
+    queueSendingRef.current.add(sessionId);
+    try {
+      await sendQueuedMessage(sessionId, content, attachments, display || messageId ? { ...display, ...(messageId ? { messageId } : {}) } : undefined);
+    } catch (error: any) {
+      // 经控制入口发的那条没发出去：标红那条照样带标记，之后「作为下一条发送」也认得出来
+      addFailedSteer(sessionId, content, attachments, String(error?.message || error || ''), carryControlMark(messageId, 'steer'));
+    } finally {
+      queueSendingRef.current.delete(sessionId);
+    }
+  }, [sendQueuedMessage, addFailedSteer]);
+
+  const handleSteerMessage = useCallback(async (text: string, pastes?: PastedBlock[], paneSid?: string, ctl?: ControlSendCtx) => {
     const steerSid = paneSid || currentSessionId;
     if (steerSid && loopingIds.includes(steerSid)) return;   // loop owns the session
-    await focusSession(steerSid);
+    // 控制入口发来的：不抢你的焦点（下面全是按 sessionId 发的），也不带走你输入框里的附件
+    if (!ctl) await focusSession(steerSid);
     // 带占位符的原文：「重建后发送」那条和「这一轮已结束」直接发出的那条按普通消息的方式显示（占位符 + 粘贴块）。
     const shown = text.trim();
     // Steering carries text only, so a paste must be expanded before it goes out —
@@ -3194,18 +3244,20 @@ const App: React.FC = () => {
     if (pastes?.length) text = expandPastes(text, pastes);
     const content = text.trim();
     const sessionId = paneSid || currentSessionId;
-    const attachments = [...attachedFor(sessionId)];
+    const attachments = ctl ? [] : [...attachedFor(sessionId)];
     if ((!content && attachments.length === 0) || !sessionId) return;
-    clearAttachments(sessionId);
+    if (!ctl) clearAttachments(sessionId);
 
     // A history rebuild is a LOCKED task: it is a hidden turn whose whole purpose
     // is to restore the context, so steering into it would be answered without
     // that context and would never be visible. Park it as "send after rebuild".
     const parkUntilRebuilt = () => {
+      const parkedId = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      ctl?.report({ routed: 'queued', messageId: parkedId });
       setQueuesBySession((prev) => ({
         ...prev,
         [sessionId]: withAfterRebuild(prev[sessionId] || [], {
-          id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+          id: parkedId,
           content: pastes?.length ? shown : content,
           attachments,
           ...(pastes?.length ? { pastes } : {}),
@@ -3216,8 +3268,9 @@ const App: React.FC = () => {
     };
     if (busyEnterRoute({ busy: busyBySessionRef.current[sessionId] }) === 'after-rebuild') { parkUntilRebuilt(); return; }
 
-    const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments) });
-    if (res.steered) return;
+    const steerId = ctl ? controlMessageId('steer') : undefined;
+    const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments), msgId: steerId });
+    if (res.steered) { if (ctl) ctl.report({ routed: 'steer', messageId: steerId! }); return; }
     const route = steerFailureRoute(res.reason);
     if (route === 'after-rebuild') { parkUntilRebuilt(); return; }
     if (route === 'send-now') {
@@ -3225,43 +3278,29 @@ const App: React.FC = () => {
       // the next message. Sent straight away unless a queued item is already on
       // its way out — then it goes right behind that one (head of the queue).
       noteSessionLocally(sessionId, tRef.current('This turn had already ended — your message was sent as a new message.'));
-      if (queueSendingRef.current.has(sessionId)) {
-        setQueuesBySession((prev) => ({
-          ...prev,
-          [sessionId]: [
-            { id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, content, attachments, createdAt: Date.now() },
-            ...(prev[sessionId] || []),
-          ],
-        }));
-        return;
-      }
-      queueSendingRef.current.add(sessionId);
-      try {
-        await sendQueuedMessage(sessionId, content, attachments, pastes?.length ? { displayText: shown, pastes } : undefined);
-      } catch (error: any) {
-        addFailedSteer(sessionId, content, attachments, String(error?.message || error || ''));
-      } finally {
-        queueSendingRef.current.delete(sessionId);
-      }
+      await sendNowOrNext(sessionId, content, attachments, pastes?.length ? { displayText: shown, pastes } : undefined, ctl);
       return;
     }
     // Anything else: never silently queue. Mark it red on the turn and let the user choose.
-    addFailedSteer(sessionId, content, attachments, res.reason);
-  }, [currentSessionId, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds, sendQueuedMessage, addFailedSteer]);
+    const failedId = addFailedSteer(sessionId, content, attachments, res.reason, ctl ? controlMessageId('steer') : undefined);
+    ctl?.report({ routed: 'steer', messageId: failedId, steerFailed: res.reason || 'unknown' });
+  }, [currentSessionId, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds, sendNowOrNext, addFailedSteer]);
 
-  const handleQueueMessage = useCallback((text: string, pastes?: PastedBlock[], paneSid?: string) => {
+  const handleQueueMessage = useCallback((text: string, pastes?: PastedBlock[], paneSid?: string, ctl?: ControlSendCtx) => {
     const content = text.trim();
     const sessionId = paneSid || currentSessionId;
     if (!content || !sessionId) return;
     if (loopingIds.includes(sessionId)) return;   // loop owns the session
     const item: QueuedMessage = {
-      id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      id: ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       content,
-      attachments: [...attachedFor(sessionId)],
+      // 控制入口发来的不带走你输入框里的附件
+      attachments: ctl ? [] : [...attachedFor(sessionId)],
       ...(pastes?.length ? { pastes } : {}),
       createdAt: Date.now(),
     };
-    clearAttachments(sessionId);
+    ctl?.report({ routed: 'queued', messageId: item.id });
+    if (!ctl) clearAttachments(sessionId);
     setQueuesBySession((prev) => ({
       ...prev,
       [sessionId]: [...(prev[sessionId] || []), item],
@@ -3271,6 +3310,50 @@ const App: React.FC = () => {
   queueMessageRef.current = handleQueueMessage;
   sendMessageRef.current = handleSendMessage;
   handleSteerMessageRef.current = handleSteerMessage;
+
+  /**
+   * **控制入口发来的一条**（主进程 `control:send`，见 controlServer.ts 的 `POST /sessions/:id/send`）。
+   *
+   * 和你在输入框按 Enter **走同一套路由**（`steerRoute.enterRoute`）：空闲就发；这一轮在跑就追加指令
+   * （失败照样标红等你选）；重建历史中就「重建后发送」；`mode:'next'` 等于 ⌘/Ctrl+Enter（排队卡片）。
+   * 不同的只有：不切你的焦点、不带走你输入框里的附件、消息 id 带标记（气泡上显示「经控制入口发送」）。
+   * 一决定走哪条路就回话（`report`），不等这一轮跑完。
+   */
+  const handleControlSend = useCallback((req: { sessionId: string; text: string; mode: 'auto' | 'next' }): Promise<ControlSendReply> => {
+    const sid = req.sessionId;
+    const session = sessions.find((s) => s.id === sid);
+    // 界面里还没有这条（还在 hydrate）—— 不在主进程里绕过界面直接发
+    if (!session) return Promise.resolve({ ok: false, status: 503, error: 'ui-not-ready' });
+    if (session.archived) return Promise.resolve({ ok: false, status: 409, error: 'archived' });
+    const busy = busyBySessionRef.current[sid];
+    const route = enterRoute({
+      streaming: streamingIds.includes(sid), busy, occupied: isBackendOccupied(busy),
+      looping: loopingIds.includes(sid), next: req.mode === 'next',
+    });
+    if (route === 'blocked') return Promise.resolve({ ok: false, status: 409, error: 'loop-running' });
+    return new Promise<ControlSendReply>((resolve) => {
+      let done = false;
+      const ctl: ControlSendCtx = { report: (r) => { if (!done) { done = true; resolve({ ok: true, ...r }); } } };
+      const run = route === 'steer' ? handleSteerMessage(req.text, undefined, sid, ctl)
+        : route === 'queue' ? handleQueueMessage(req.text, undefined, sid, ctl)
+        : sendNowOrNext(sid, req.text, [], undefined, ctl);
+      Promise.resolve(run).catch(() => {}).finally(() => {
+        if (!done) { done = true; resolve({ ok: false, status: 500, error: 'not-routed' }); }
+      });
+    });
+  }, [sessions, streamingIds, loopingIds, handleSteerMessage, handleQueueMessage, sendNowOrNext]);
+  const controlSendRef = useRef(handleControlSend);
+  controlSendRef.current = handleControlSend;
+  useEffect(() => {
+    const off = window.kiroApi.onControlSend?.((req) => {
+      void Promise.resolve()
+        .then(() => controlSendRef.current(req))
+        .catch((): ControlSendReply => ({ ok: false, status: 500, error: 'renderer-error' }))
+        .then((reply) => window.kiroApi.controlSendResult?.(req.reqId, reply));
+    });
+    void window.kiroApi.controlReady?.();
+    return off;
+  }, []);
 
   // Queue actions carry their own session: in split view the pane you clicked in
   // is NOT necessarily the focused chat, and using currentSessionId moved queue
@@ -3309,7 +3392,8 @@ const App: React.FC = () => {
       let at = 0;
       while (at < queue.length && queue[at].afterRebuild) at++;
       const item: QueuedMessage = {
-        id: `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+        // 经控制入口发、没能追加进去的那条：作为下一条发送时照样带标记
+        id: carryControlMark(msgId, 'queue') ?? `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
         content: hit.content,
         attachments: hit.attachments,
         createdAt: Date.now(),
@@ -3405,7 +3489,13 @@ const App: React.FC = () => {
         ...prev,
         [sessionId]: (prev[sessionId] || []).filter((item) => !consumedIds.has(item.id)),
       }));
-      Promise.resolve(sendQueuedMessage(sessionId, deliveredContent, attachments, queuedPastes.length ? { displayText: content, pastes: queuedPastes } : undefined))
+      // 经控制入口排进来的那张（id 带标记）发出去时，气泡上照样标「经控制入口发送」
+      const viaControl = consumed.some((item) => isControlMessageId(item.id));
+      const sendOpts = {
+        ...(queuedPastes.length ? { displayText: content, pastes: queuedPastes } : null),
+        ...(viaControl ? { messageId: controlMessageId('user') } : null),
+      };
+      Promise.resolve(sendQueuedMessage(sessionId, deliveredContent, attachments, Object.keys(sendOpts).length ? sendOpts : undefined))
         .catch((error) => {
           // The backend remains authoritative. If the original turn (including
           // compaction) was still busy or delivery otherwise failed, restore the
@@ -3705,9 +3795,8 @@ const App: React.FC = () => {
         // had ended: Enter stopped steering and sent a NEW message instead, which
         // main rejected ("wait for the active turn") after the bubble was already on
         // screen. Main always knows whether a turn is running; ask it too.
-        isStreaming={!!sid && (streamingIds.includes(sid)
-          || busyBySession[sid] === 'turn'
-          || busyBySession[sid] === 'priming' || busyBySession[sid] === 'prime-pending')}
+        // 判据在 steerRoute.composerRunning —— 控制入口的 send 用同一个（`enterRoute`）
+        isStreaming={!!sid && composerRunning(streamingIds.includes(sid), busyBySession[sid])}
         status={status}
         sessionConnected={!!sid && attachedSessionIds.includes(sid) && !connectingSessionIds.includes(sid)}
         // Per CHAT, not per focus. Previously this was one app-wide string shown only

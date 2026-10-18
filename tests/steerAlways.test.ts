@@ -80,7 +80,7 @@ describe('队列非空也 steer 当前这一轮', () => {
 
 describe('带附件也 steer：附件按本机路径写进 steer 文字', () => {
   test('steer 带着附件和 steerPayload 生成的文字', () => {
-    assert.match(steer, /steerMessage\(content, sessionId, \{ attachments, sendText: steerPayload\(content, attachments\) \}\)/);
+    assert.match(steer, /steerMessage\(content, sessionId, \{ attachments, sendText: steerPayload\(content, attachments\), msgId: steerId \}\)/);
   });
 
   test('没有「带附件就排队」那条路了', () => {
@@ -129,12 +129,12 @@ describe('带附件的 steer 被吃掉后，附件跟着落盘', () => {
 describe('steer 失败：标红 + 两个按钮，不进队列', () => {
   test('按 steerFailureRoute 分流；其余原因交给 addFailedSteer', () => {
     assert.match(steer, /const route = steerFailureRoute\(res\.reason\);/);
-    assert.match(steer, /addFailedSteer\(sessionId, content, attachments, res\.reason\);/);
+    assert.match(steer, /addFailedSteer\(sessionId, content, attachments, res\.reason, /);
   });
 
   test('失败那条路不碰队列（只有「这一轮已结束、另一条正在发」时排到它后面）', () => {
     const afterSteer = steer.slice(steer.indexOf('const res = await steerMessage'));
-    const ask = afterSteer.slice(afterSteer.lastIndexOf('addFailedSteer(sessionId, content, attachments, res.reason)') - 200);
+    const ask = afterSteer.slice(afterSteer.lastIndexOf('addFailedSteer(sessionId, content, attachments, res.reason,') - 200);
     assert.doesNotMatch(ask, /setQueuesBySession/);
   });
 
@@ -170,10 +170,14 @@ describe('这一轮已经结束：直接作为新消息发出，并在状态行�
   test('send-now → sendQueuedMessage + noteSessionLocally', () => {
     const block = steer.slice(steer.indexOf("if (route === 'send-now')"));
     assert.match(block, /noteSessionLocally\(sessionId, tRef\.current\('This turn had already ended/);
-    assert.match(block, /await sendQueuedMessage\(sessionId, content, attachments, pastes\?\.length \? \{ displayText: shown, pastes \} : undefined\);/);
+    assert.match(block, /await sendNowOrNext\(sessionId, content, attachments, pastes\?\.length \? \{ displayText: shown, pastes \} : undefined, ctl\);/);
+    // sendNowOrNext（控制入口空闲时发也走它）：已有一条在发就排到它后面（队头），否则 sendQueuedMessage
+    const now = stripComments(slice(APP, 'const sendNowOrNext = useCallback'));
+    assert.match(now, /await sendQueuedMessage\(sessionId, content, attachments, /);
     // 和排空互斥：同一会话不能同时发两条
-    assert.match(block, /queueSendingRef\.current\.add\(sessionId\);/);
-    assert.match(block, /queueSendingRef\.current\.delete\(sessionId\);/);
+    assert.match(now, /if \(queueSendingRef\.current\.has\(sessionId\)\) \{/);
+    assert.match(now, /queueSendingRef\.current\.add\(sessionId\);/);
+    assert.match(now, /queueSendingRef\.current\.delete\(sessionId\);/);
   });
 });
 
@@ -205,7 +209,8 @@ describe('不变的规则', () => {
 
   test('轮末没被吃的 steer 仍然回队头（原文 + 附件，不是带引用块的那份）', () => {
     const fn = slice(ACP, 'const takeUnconsumedSteers = useCallback');
-    assert.match(fn, /return list\.map\(\(s\) => \(\{ content: s\.content, attachments: s\.attachments \}\)\);/);
+    // msgId 只用来认出「经控制入口发的」（放回队头时带上标记），回队的仍是原文 + 附件
+    assert.match(fn, /return list\.map\(\(s\) => \(\{ content: s\.content, attachments: s\.attachments, msgId: s\.msgId \}\)\);/);
   });
 
   test('停止时丢弃未消费 steer 的逻辑没动', () => {

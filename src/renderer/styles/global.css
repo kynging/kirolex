@@ -1594,6 +1594,21 @@ button, input, select, textarea {
   user-select: none;
 }
 
+/* 「经控制入口发送」：本机工具经控制入口发的消息（controlSessions.isControlMessageId） */
+.control-tag {
+  margin-right: 4px;
+  white-space: nowrap;
+  padding: 0 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 16px;
+  color: #8a6d1f;
+  background: rgba(214, 168, 46, 0.14);
+  border: 1px solid rgba(214, 168, 46, 0.38);
+  user-select: none;
+}
+.steer-failed-reason .control-tag { margin-left: 8px; }
+
 /* Collapsed-by-default block for long code/log/JSON pasted into a user message.
    Anchors the steer label the same way p.steer-paragraph does. */
 .message.user .message-content .steer-block-wrap {

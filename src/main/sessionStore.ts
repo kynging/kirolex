@@ -76,6 +76,9 @@ export interface StoredMessage {
   kirolex?: true;
   /** KiroLex 自己写的那句话的中英两版（`uiText.textVariants`）—— 显示时按当前界面语言挑；你和 agent 的消息没有这一项。 */
   variants?: { zh: string; en: string };
+  /** 这条是本机工具经控制入口发的（controlServer `POST /sessions/:id/send`），界面上标「经控制入口发送」。
+   *  id 里也带着标记（`controlSessions.isControlMessageId`），界面认的是 id。 */
+  via?: 'control';
   // additive: future fields (model, etc.) may be appended safely
 }
 

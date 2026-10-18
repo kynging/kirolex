@@ -326,6 +326,9 @@ const ZH_BASE: Record<string, string> = {
   'Feature switches (take effect immediately, no restart)': '功能开关（改完立即生效，无需重启）',
   'Send history context along with the message (no extra turn)': '历史上下文随消息附带（零额外回合）',
   'Fold large pastes to disk': '大段粘贴折叠到磁盘',
+  'Allow local tools to read and send messages through the control entry': '允许本机工具通过控制入口读取和发送消息',
+  'On: tools on this computer that hold the token in ~/.kirolex/control.json (e.g. your local Claude Code, a script) can list chats, read the latest messages and send a message into a chat; such messages are marked "Sent via control entry". It never opens a debugging port and cannot run commands or change settings. Off (default): those requests are refused.':
+    '开：本机持有 ~/.kirolex/control.json 里 token 的工具（例如你本机的 Claude Code、脚本）可以列出会话、读最近的消息、往某条会话里发消息；这样发的消息标「经控制入口发送」。不会打开调试端口，也不能执行命令或改设置。关（默认）：这些请求一律拒绝。',
   'Tool stall threshold (seconds without progress)': '工具无进度多久判定卡死（秒）',
   'Auto-fold tool calls when they finish (🔧 tool)': '工具调用结束后自动折叠（🔧 tool）',
   'Concurrent connection limit (most chats connected at once)': '并发连接上限（最多同时连接的会话数）',

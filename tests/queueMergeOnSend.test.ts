@@ -93,7 +93,9 @@ describe('接线', () => {
   });
 
   test('重建历史期间（Enter / 普通发送）：新建 afterRebuild 卡片 / 走 handleQueueMessage', () => {
-    assert.match(fnBody('handleSteerMessage'), /withAfterRebuild\(prev\[sessionId\] \|\| \[\], \{\s*id: `queue_/);
+    assert.match(fnBody('handleSteerMessage'), /withAfterRebuild\(prev\[sessionId\] \|\| \[\], \{\s*id: parkedId,/);
+    // 新建的卡片（控制入口来的 id 带标记）
+    assert.match(fnBody('handleSteerMessage'), /const parkedId = ctl \? controlMessageId\('queue'\) : `queue_/);
     assert.match(fnBody('handleSendMessage'), /queueMessageRef\.current\?\.\(text, pastes, sid\)/);
   });
 

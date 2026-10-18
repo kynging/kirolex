@@ -19,6 +19,13 @@
  *   - 没传 `onReload` → 501。
  *   会话、kiro-cli 进程都在主进程里，刷新不碰它们；界面状态靠 ui-state.json 恢复。
  * - `POST /quit/cancel` → 要 token。取消等待（退出或刷新都算），`onPendingChange(false)` 恢复排队和定时任务。
+ * - **读会话 / 发消息**（`controlSessions.ts`，全部要 token；设置里的开关关着时一律 403 `{error:'disabled'}`）：
+ *   - `GET /sessions[?q=]` → 会话列表（不含消息内容）；
+ *   - `GET /sessions/:id/tail?n=10` → 最近 n 条（≤50），正文截到 8000 字，工具调用只给一行标题；
+ *   - `GET /sessions/:id/status` → `{busy, turnStartedAt, queued, lastMessageAt}`；
+ *   - `POST /sessions/:id/send` `{text, mode?:'auto'|'next'}` → 交给界面按 Enter 的同一套路由发
+ *     （`{accepted:true, messageId, routed:'sent'|'steer'|'queued'}`）；界面没就绪 503 `{error:'ui-not-ready'}`。
+ *   会话不存在 / KiroLex Advanced 的会话 → 404。日志只记路由、会话 id、字数，不记正文、不记 token。
  * - 其它一律 404。
  *
  * **用户正在用的会话不能被打断** —— 所以默认是等，不是退。
@@ -34,6 +41,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { blocksQuit, type BusySession } from './busySessions.ts';
+import {
+  checkSendBody, filterByTitle, parseTailCount,
+  type ControlRouted, type ControlSendMode, type ControlSessionSummary, type ControlTailEntry,
+} from './controlSessions.ts';
 
 export const CONTROL_FILE = path.join(os.homedir(), '.kirolex', 'control.json');
 export const QUIT_POLL_MS = 1000;
@@ -162,11 +173,36 @@ export function createQuitCoordinator(opts: QuitCoordinatorOptions): QuitCoordin
 
 /* ───────────────────────── HTTP ───────────────────────── */
 
+export interface ControlSessionStatus {
+  busy: boolean;
+  turnStartedAt: number | null;
+  queued: number;
+  lastMessageAt: number | null;
+}
+
+export type ControlSendResult =
+  | { ok: true; messageId: string; routed: ControlRouted; steerFailed?: string }
+  | { ok: false; status: number; error: string };
+
+/** `/sessions…` 那几条路由的数据来源，index.ts 注入。会话不存在 / 不许碰（advanced 的）一律当不存在。 */
+export interface ControlSessionAccess {
+  /** 设置里的开关（默认关）。每次请求都现读 */
+  enabled: () => boolean;
+  list: () => ControlSessionSummary[];
+  exists: (id: string) => boolean;
+  tail: (id: string, n: number) => ControlTailEntry[];
+  status: (id: string) => ControlSessionStatus;
+  /** 交给界面按 Enter 的同一套路由发；界面没就绪就 `{ok:false, status:503, error:'ui-not-ready'}` */
+  send: (id: string, text: string, mode: ControlSendMode) => Promise<ControlSendResult>;
+}
+
 export interface ControlServerOptions extends QuitCoordinatorOptions {
   /** 写 `{port, token, pid}` 的地方；默认 `~/.kirolex/control.json` */
   file?: string;
   token?: string;
   pid?: number;
+  /** 不传 = 没有 `/sessions…` 路由（404） */
+  sessions?: ControlSessionAccess;
 }
 
 export interface ControlServer {
@@ -190,6 +226,100 @@ function send(res: http.ServerResponse, status: number, body: unknown): void {
   const text = JSON.stringify(body);
   res.writeHead(status, { 'Content-Type': 'application/json', 'Content-Length': Buffer.byteLength(text) });
   res.end(text);
+}
+
+/** 请求体上限：20000 字的 UTF-8 加上 JSON 转义也远小于它 */
+const MAX_BODY_BYTES = 256 * 1024;
+
+function readBody(req: http.IncomingMessage): Promise<string | null> {
+  return new Promise((resolve) => {
+    const chunks: Buffer[] = [];
+    let size = 0;
+    let done = false;
+    req.on('data', (c: Buffer) => {
+      if (done) return;
+      size += c.length;
+      if (size > MAX_BODY_BYTES) { done = true; resolve(null); return; }
+      chunks.push(c);
+    });
+    req.on('end', () => { if (!done) { done = true; resolve(Buffer.concat(chunks).toString('utf8')); } });
+    req.on('error', () => { if (!done) { done = true; resolve(null); } });
+  });
+}
+
+/** 和 sessionStore.safeId 同一个形状；别的一律当不存在 */
+const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
+const SESSION_ROUTE_RE = /^\/sessions\/([^/]+)\/(tail|status|send)$/;
+
+/**
+ * `/sessions…`：已过 token。返回 false = 不是这几条路由。
+ * 日志只记「路由 + 会话 id + 字数 + 结果」—— 不记正文，不记 token。
+ */
+async function handleSessions(
+  req: http.IncomingMessage, res: http.ServerResponse, u: URL,
+  access: ControlSessionAccess, log: (msg: string) => void,
+): Promise<boolean> {
+  const method = req.method || 'GET';
+  const isList = u.pathname === '/sessions';
+  const m = SESSION_ROUTE_RE.exec(u.pathname);
+  if (!isList && !m) return false;
+  const action = isList ? 'list' : m![2];
+  const wantMethod = action === 'send' ? 'POST' : 'GET';
+  if (method !== wantMethod) return false;
+  let enabled = false;
+  try { enabled = access.enabled(); } catch { enabled = false; }
+  if (!enabled) { send(res, 403, { ok: false, error: 'disabled' }); return true; }
+  if (isList) {
+    const list = filterByTitle(access.list(), u.searchParams.get('q'));
+    log(`GET /sessions -> ${list.length}`);
+    send(res, 200, list);
+    return true;
+  }
+  let id = '';
+  try { id = decodeURIComponent(m![1]); } catch { id = ''; }
+  if (!SESSION_ID_RE.test(id) || !access.exists(id)) {
+    log(`${method} /sessions/:id/${action} session=${SESSION_ID_RE.test(id) ? id : '<invalid>'} -> 404`);
+    send(res, 404, { ok: false, error: 'not-found' });
+    return true;
+  }
+  if (action === 'tail') {
+    const n = parseTailCount(u.searchParams.get('n'));
+    log(`GET /sessions/:id/tail session=${id} n=${n}`);
+    send(res, 200, access.tail(id, n));
+    return true;
+  }
+  if (action === 'status') {
+    send(res, 200, access.status(id));
+    return true;
+  }
+  const raw = await readBody(req);
+  if (raw === null) {
+    log(`POST /sessions/:id/send session=${id} -> 413`);
+    send(res, 413, { ok: false, error: 'too-large' });
+    return true;
+  }
+  let body: unknown = null;
+  try { body = JSON.parse(raw); } catch { body = null; }
+  const checked = checkSendBody(body);
+  if (!checked.ok) {
+    log(`POST /sessions/:id/send session=${id} -> 400 ${checked.error}`);
+    send(res, 400, { ok: false, error: checked.error });
+    return true;
+  }
+  let result: ControlSendResult;
+  try { result = await access.send(id, checked.text, checked.mode); } catch { result = { ok: false, status: 500, error: 'send-failed' }; }
+  const chars = checked.text.length;
+  if (!result.ok) {
+    log(`POST /sessions/:id/send session=${id} chars=${chars} mode=${checked.mode} -> ${result.status} ${result.error}`);
+    send(res, result.status, { ok: false, error: result.error });
+    return true;
+  }
+  log(`POST /sessions/:id/send session=${id} chars=${chars} mode=${checked.mode} -> ${result.routed}${result.steerFailed ? ` (steer failed: ${result.steerFailed})` : ''}`);
+  send(res, 200, {
+    accepted: true, messageId: result.messageId, routed: result.routed,
+    ...(result.steerFailed ? { steerFailed: result.steerFailed } : null),
+  });
+  return true;
 }
 
 export function createControlServer(opts: ControlServerOptions): Promise<ControlServer> {
@@ -223,6 +353,13 @@ export function createControlServer(opts: ControlServerOptions): Promise<Control
       const decision = quit.requestReload(force);
       // 立即刷新 → 200 {ok:true}；要等 → 202 {reloading:false, waiting}
       return decision.reloading ? send(res, 200, { ok: true }) : send(res, 202, decision);
+    }
+    if (opts.sessions && (u.pathname === '/sessions' || u.pathname.startsWith('/sessions/'))) {
+      if (!tokenMatches(req.headers.authorization, token)) return send(res, 401, { ok: false, error: 'unauthorized' });
+      void handleSessions(req, res, u, opts.sessions, opts.log ?? (() => {})).then((handled) => {
+        if (!handled) send(res, 404, { ok: false, error: 'not found' });
+      }).catch(() => { if (!res.headersSent) send(res, 500, { ok: false, error: 'internal' }); });
+      return;
     }
     send(res, 404, { ok: false, error: 'not found' });
   });

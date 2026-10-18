@@ -211,6 +211,10 @@ docs/            设计文档（§1）
 - `GET /ping`：不要 token，回 `{ok, pid, busy, pendingQuit?}`。
 - `POST /quit`：要 `Authorization: Bearer <token>`。没人忙 → 退；有人忙 → 进入"等待退出"，每秒查一次，空了再退；`?force=1` 直接退。
 - `POST /quit/cancel`：取消等待。其他路径 404。
+- `GET /sessions`、`GET /sessions/:id/tail|status`、`POST /sessions/:id/send`：读会话 / 发消息（`controlSessions.ts`，
+  说明见 `docs/CONTROL_ENTRY.md`）。功能开关 `controlSessionAccess` **默认关**（关着 403）。`send` 由主进程经
+  `control:send` 交给渲染端，`App.tsx` 的 `handleControlSend` 用 `steerRoute.enterRoute`（和 Enter 同一套）分流；
+  经它发的消息 id 带 `_ctl_`（`isControlMessageId`），气泡上标「经控制入口发送」，transcript 里带 `via: 'control'`。
 - `index.ts` 传进来的 `onQuit` 就是托盘 Quit 那条路（`isQuitting = true; app.quit()`），**不能换成 `process.exit`**（会跳过 `before-quit`，见 §4.1）。
   等待退出期间 `quitPending` 为真，排队消息和定时 / 循环任务不开始新一轮（`control:pending-quit` 推给渲染端）。
 - 忙不忙由 `getBusySessions()`（`index.ts`）→ `collectBusySessions` 判定。

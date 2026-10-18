@@ -66,6 +66,8 @@ const MONO_PRESETS: Array<{ label: string; value: string }> = [
  *  Labels state what the switch DOES; `help` states what turning it OFF means,
  *  because that is the decision being made. */
 type SwitchStore = 'feature' | 'settings' | 'prop';
+/** 主进程 FEATURE_DEFAULTS 里默认关的那几个 */
+const DEFAULT_OFF_FEATURES = new Set(['controlSessionAccess']);
 // group / label / help 都是英文 key，渲染时过 t()；中文在 i18nZh/shell.ts（测试扫不到这张表，加条目时手动补字典）。
 const SWITCH_GROUPS = ['Context & history', 'Conversation & input', 'Interface', 'Safety'] as const;
 const SWITCHES: Array<{
@@ -110,6 +112,9 @@ const SWITCHES: Array<{
   { key: 'confirmDeletes', store: 'prop', group: 'Safety',
     label: 'Confirm before deleting chats',
     help: 'On: ask for confirmation before deleting a chat. Off: delete on click. Deleted chats now go to ~/.kirolex/trash for 30 days, but keeping this on is still recommended.' },
+  { key: 'controlSessionAccess', store: 'feature', group: 'Safety',
+    label: 'Allow local tools to read and send messages through the control entry',
+    help: 'On: tools on this computer that hold the token in ~/.kirolex/control.json (e.g. your local Claude Code, a script) can list chats, read the latest messages and send a message into a chat; such messages are marked "Sent via control entry". It never opens a debugging port and cannot run commands or change settings. Off (default): those requests are refused.' },
 ];
 
 /**
@@ -192,7 +197,8 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   /** Read/write a switch without the UI caring which store owns it. Keeping this
    *  in one place is what lets the panel show a single list. */
   const switchValue = (key: string, store: SwitchStore): boolean => {
-    if (store === 'feature') return features[key] !== false;
+    // 还没从主进程读到时按默认值显示：默认关的那个（控制入口读写消息）不能先闪成「开」
+    if (store === 'feature') return key in features ? features[key] !== false : !DEFAULT_OFF_FEATURES.has(key);
     if (store === 'prop') return confirmDeletes;
     return (settings as unknown as Record<string, boolean>)[key] !== false;
   };

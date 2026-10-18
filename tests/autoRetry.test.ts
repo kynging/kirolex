@@ -61,7 +61,8 @@ describe('steer 和队列不再丢', () => {
   test('重发 / 塞回输入框都带上这一轮已经吃进去的 steer', () => {
     assert.match(HK, /export function withConsumedSteers\(msgs: Message\[\], baseIndex: number\): string/);
     assert.match(HK, /const resendText = withConsumedSteers\(msgs, base\);/);
-    assert.match(HK, /await rerunFromMessageRef\.current\?\.\(target\.id, resendText, undefined, sid\);/);
+    // 第三个参数只是让重发的新消息保留「经控制入口发送」标记（controlSendRoute.test.ts 守着），发的仍是 resendText
+    assert.match(HK, /await rerunFromMessageRef\.current\?\.\(target\.id, resendText, \{ carryMark: true \}, sid\);/);
     assert.match(HK, /const text = withConsumedSteers\(msgs, idx\);/);
   });
 

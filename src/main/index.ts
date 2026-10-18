@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification, type WebContents } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -59,8 +59,9 @@ import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, p
 import { probeHttpMcp, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { LocalBrowserHost, browserActionTitle, createQuitGuard } from './localBrowserHost.ts';
 import { isBrowserKind, type BrowserAction } from './localBrowser.ts';
-import { createControlServer, type ControlServer } from './controlServer.ts';
-import { collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
+import { createControlServer, type ControlServer, type ControlSessionAccess } from './controlServer.ts';
+import { isControlMessageId, tailEntries } from './controlSessions.ts';
+import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
@@ -145,6 +146,8 @@ interface SessionEntry {
   /** kiro-cli's session id for this executor. The Map key is the KiroLex id;
    *  client calls (sendPrompt/cancel/load) use THIS. */
   cliSessionId: string;
+  /** 这一轮从什么时候开始跑（`busy` 为真时才有意义）—— 控制入口的 status 用 */
+  turnStartedAt?: number;
   profile: AgentProfile;
   /** Working directory used when creating/loading replacement executors. */
   cwd: string;
@@ -3715,6 +3718,9 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   splitDragResize: true,
   /** Starter-prompt chips above an empty composer. */
   promptSuggestions: true,
+  /** 控制入口的「列会话 / 读最近消息 / 发消息」（controlServer.ts 的 `/sessions…`）。**默认关**：
+   *  关着时那几条路由一律 403，`/ping` `/quit` `/reload` 不受影响。 */
+  controlSessionAccess: false,
 };
 function loadFeatureFlags(): Record<string, boolean> {
   const out = { ...FEATURE_DEFAULTS };
@@ -6888,6 +6894,8 @@ app.whenReady().then(async () => {
         content: display?.displayText ?? promptText,
         ts: Date.now(),
         ...(display?.mergeIntoMessageId ? { mergeIntoMessageId: display.mergeIntoMessageId } : {}),
+        // 经控制入口发出的（id 带标记，见 controlSessions.isControlMessageId）：对话记录里显式记一笔
+        ...(isControlMessageId(userMessageId) ? { via: 'control' as const } : {}),
         ...(display?.attachments?.length
           ? {
               attachments: display.attachments.map((a: any) => ({
@@ -6997,6 +7005,7 @@ app.whenReady().then(async () => {
     }
     try {
       entry.busy = true; // in-flight turn — exempt from LRU eviction
+      entry.turnStartedAt = Date.now();   // 控制入口 `GET /sessions/:id/status` 的 turnStartedAt
       emitSessionBusy(sessionId);
       // Tag this turn so a *rejected duplicate* invocation can never clear the
       // busy flag belonging to the turn that is actually running.
@@ -7752,6 +7761,7 @@ app.whenReady().then(async () => {
     try {
       store.appendMessage(sessionId, {
         id: messageId || `steer_${Date.now()}`,
+        ...(isControlMessageId(messageId) ? { via: 'control' as const } : {}),
         role: 'user',
         content: text || '',
         ts: Date.now(),
@@ -12291,7 +12301,9 @@ app.whenReady().then(async () => {
     messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: store.StoredToolCall[] }>,
   ) => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'rewrite-transcript'); if (advRefused) throw new Error(advRefused); }
-    const next = Array.isArray(messages) ? messages : [];
+    // 经控制入口发的（id 带标记）：渲染层漏带了显式来源 via 也补回去
+    const next = (Array.isArray(messages) ? messages : [])
+      .map((m) => ({ ...m, ...(isControlMessageId(m?.id) ? { via: 'control' as const } : {}) }));
     /*
       **保留的消息必须本来就是这条会话的** ——「有的会话似乎内容混了」。
       重跑 / 打断后覆盖都是"保留前面一段、丢掉后面"，所以 next 里的消息 id 一定出现在现有 transcript 里。
@@ -13097,6 +13109,84 @@ function getBusySessions(): BusySession[] {
   });
 }
 ipcMain.handle('control:pending-quit', () => quitPending);
+
+/*
+  **控制入口的「读会话 / 发消息」**（controlServer.ts 的 `/sessions…`，纯逻辑在 controlSessions.ts）。
+
+  `send` 必须先交给界面：界面里有和 Enter 同一套的路由（空闲发 / 追加指令 / 排队、失败标红），
+  主进程不绕过它直接 prompt。界面没开、正在刷新、还没说过 `control:ready` → 503 `ui-not-ready`。
+  删掉的（墓碑）和 KiroLex Advanced 的会话一律当不存在（404）。
+*/
+let controlUiContents: WebContents | null = null;
+const controlSendWaiters = new Map<string, (reply: any) => void>();
+const CONTROL_SEND_TIMEOUT_MS = 15_000;
+ipcMain.handle('control:ready', (event) => { controlUiContents = event.sender; });
+ipcMain.handle('control:send-result', (_event, reqId: string, reply: any) => {
+  const waiter = controlSendWaiters.get(reqId);
+  if (waiter) { controlSendWaiters.delete(reqId); waiter(reply); }
+});
+function controlVisibleRecord(id: string): store.SessionRecord | null {
+  if (!id || deletedSessionIds.has(id) || loadSessionTombstones().includes(id)) return null;
+  const rec = store.readRecord(id);
+  return rec && !isAdvancedOnly(rec) ? rec : null;
+}
+function controlBusyIds(): Set<string> {
+  return new Set(getBusySessions().filter(blocksQuit).map((b) => b.id));
+}
+const controlSessionAccess: ControlSessionAccess = {
+  enabled: () => isFeatureEnabled('controlSessionAccess'),
+  list: () => {
+    const busy = controlBusyIds();
+    const tombstoned = new Set([...loadSessionTombstones(), ...deletedSessionIds]);
+    return store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((rec) => ({
+      id: rec.id,
+      title: rec.title,
+      projectId: rec.profile?.projectId ?? null,
+      busy: busy.has(rec.id),
+      remote: rec.profile?.remote?.sshHost ? (labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) || rec.profile.remote.sshHost) : null,
+      archived: !!rec.archived,
+      updatedAt: rec.updatedAt,
+    }));
+  },
+  exists: (id) => !!controlVisibleRecord(id),
+  tail: (id, n) => tailEntries(store.readTranscript(id), n),
+  status: (id) => {
+    const entry = sessionClients.get(id);
+    const last = store.readTranscript(id).slice(-1)[0];
+    const queued = queueCounts(uiState()['kirolex-queues']).find(([sid]) => sid === id)?.[1] ?? 0;
+    return {
+      busy: controlBusyIds().has(id),
+      turnStartedAt: entry?.busy && entry.turnStartedAt ? entry.turnStartedAt : null,
+      queued,
+      lastMessageAt: last ? Number(last.ts) || null : null,
+    };
+  },
+  send: (id, text, mode) => {
+    const rec = controlVisibleRecord(id);
+    if (!rec) return Promise.resolve({ ok: false, status: 404, error: 'not-found' });
+    if (rec.archived) return Promise.resolve({ ok: false, status: 409, error: 'archived' });
+    const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+    if (!wc || wc !== controlUiContents || wc.isLoading() || wc.isCrashed()) {
+      return Promise.resolve({ ok: false, status: 503, error: 'ui-not-ready' });
+    }
+    const reqId = `ctl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    return new Promise((resolve) => {
+      const timer = setTimeout(() => {
+        controlSendWaiters.delete(reqId);
+        resolve({ ok: false, status: 504, error: 'ui-timeout' });
+      }, CONTROL_SEND_TIMEOUT_MS);
+      controlSendWaiters.set(reqId, (reply) => {
+        clearTimeout(timer);
+        if (reply?.ok && typeof reply.messageId === 'string' && ['sent', 'steer', 'queued'].includes(reply.routed)) {
+          resolve({ ok: true, messageId: reply.messageId, routed: reply.routed, ...(reply.steerFailed ? { steerFailed: String(reply.steerFailed) } : {}) });
+        } else {
+          resolve({ ok: false, status: Number(reply?.status) || 500, error: String(reply?.error || 'renderer-error') });
+        }
+      });
+      wc.send('control:send', { reqId, sessionId: id, text, mode });
+    });
+  },
+};
 app.whenReady().then(async () => {
   try {
     controlServer = await createControlServer({
@@ -13114,6 +13204,7 @@ app.whenReady().then(async () => {
         }
       },
       getBusy: getBusySessions,
+      sessions: controlSessionAccess,
       onPendingChange: (pending) => {
         quitPending = pending;
         mainWindow?.webContents.send('control:pending-quit', pending);

@@ -190,6 +190,8 @@ export const ZH_CHAT: Record<string, string> = {
   "Copy message": "复制消息",
   "Fork conversation from here": "从这里分叉会话",
   "Steered into the running turn": "已追加到正在进行的这一轮",
+  "Sent via control entry": "经控制入口发送",
+  "Sent by a tool on this computer through the KiroLex control entry": "由本机工具通过 KiroLex 控制入口发送",
   "Queued follow-ups": "排队中的后续消息",
   "Connecting... (type /stop to force reconnect)": "连接中…（输入 /stop 强制重连）",
   "Agent is working — Enter steers the running turn · {key}+Enter queues": "Agent 正在工作 —— Enter 追加指令到当前这一轮 · {key}+Enter 排队",

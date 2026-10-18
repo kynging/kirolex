@@ -32,6 +32,7 @@ import { useSessionNotice } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import { userTurnBubbles } from '../steerSplit';
+import { isControlMessageId } from '../../main/controlSessions';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // Scheduling replaced loop mode. `schedule.ts` lives under src/main because the DRIVER
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
@@ -1312,6 +1313,13 @@ const UserGroupItem = memo<{
     </>
   );
 
+  // 本机工具经控制入口发的（id 带标记，见 controlSessions.isControlMessageId）
+  const controlTag = (
+    <span className="control-tag" title={t('Sent by a tool on this computer through the KiroLex control entry')}>
+      {t('Sent via control entry')}
+    </span>
+  );
+
   // 没能追加到这一轮的 steer：标红，挂在这一轮用户消息的下面，两个按钮由用户选
   const failedBlock = failedSteers.length > 0 && (
     <>
@@ -1319,6 +1327,7 @@ const UserGroupItem = memo<{
         <div key={steer.id} className="steer-failed" role="alert">
           <div className="steer-failed-reason">
             {t('Could not add this to the current turn: {reason}', { reason: t(steerFailureReasonKey(steer.steerError)) })}
+            {isControlMessageId(steer.id) && controlTag}
           </div>
           {steer.content.trim() && <div className="steer-failed-text">{steer.content}</div>}
           {!!steer.attachments?.length && (
@@ -1352,6 +1361,7 @@ const UserGroupItem = memo<{
               {bubble.isSteer && (
                 <span className="steer-tag" title={t('Steered into the running turn')}>{t('Steer')}</span>
               )}
+              {isControlMessageId(bubble.id) && controlTag}
               {renderTime(bubble.timestamp)}
               {renderCopy(bubble.id, bubble.text)}
               {!bubble.isSteer && turnActions}
@@ -1395,6 +1405,7 @@ const UserGroupItem = memo<{
         </div>
       )}
       <div className="message-actions">
+        {bubbles.some((b) => isControlMessageId(b.id)) && controlTag}
         {renderTime(base.timestamp)}
         {renderCopy(base.id, combinedText)}
         {turnActions}
