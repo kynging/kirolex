@@ -66,6 +66,17 @@ describe('工具清单', () => {
     assert.match(all, /过一段时间再看结果|等某个后台过程结束/);
   });
 
+  test('bg_run / watch 写明已知限制：长期服务别用后台任务起；自己脱离进程组的在 macOS/Linux 上不会被自动结束', () => {
+    for (const name of ['bg_run', 'watch']) {
+      const d = wakeToolDefs().find((x) => x.name === name)!.description;
+      assert.match(d, /别用它起要长期留着的服务/, name);
+      assert.match(d, /setsid/, name);
+      assert.match(d, /daemonize/, name);
+      assert.match(d, /detached/, name);
+      assert.match(d, /macOS\/Linux 上[^。]*不会被自动结束/, name);
+    }
+  });
+
   test('schedule_create 的 schema：maxRuns 写明必填（循环类）', () => {
     const d = wakeToolDefs().find((x) => x.name === 'schedule_create')!;
     assert.ok(d.inputSchema.properties.maxRuns);

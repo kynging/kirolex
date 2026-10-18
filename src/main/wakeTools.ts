@@ -55,6 +55,9 @@ export interface WakeHost {
 const WHEN = '要过一段时间再看结果，或等某个后台过程结束，用这些工具（schedule_create / bg_run / watch）；'
   + '**不要在一轮里 sleep 轮询**（那会一直占着这一轮，而且会被超时打断）。结果会作为一条新消息自动发回这条会话，'
   + '那时你再接着处理。会话正忙时会等这一轮结束再发。';
+/** 已知限制（不改实现）：POSIX 上只按任务的进程组结束，主动脱离进程组的漏在外面；Windows 的作业对象能覆盖到。 */
+const DETACH_LIMIT = '别用它起要长期留着的服务。会自己脱离进程组的程序（`setsid`、`daemonize`、Node `detached: true` 等）'
+  + '在 macOS/Linux 上不在任务的进程组里，任务结束 / 被停止 / 退出 KiroLex 时都不会被自动结束（Windows 上会）。';
 
 export function wakeToolDefs(): Array<{ name: string; description: string; inputSchema: any }> {
   return [
@@ -97,7 +100,7 @@ export function wakeToolDefs(): Array<{ name: string; description: string; input
         + '典型用法：等一个过程结束 —— `until aws cloudformation describe-stacks --stack-name X | grep -qE "COMPLETE|FAILED"; do sleep 30; done; '
         + 'aws cloudformation describe-stack-events --stack-name X --max-items 20`。'
         + `超时默认 ${BG_DEFAULT_TIMEOUT_SEC} 秒、上限 ${BG_MAX_TIMEOUT_SEC} 秒；单会话同时最多 ${MAX_JOBS_PER_SESSION} 个后台命令 + 监视。`
-        + '命令结束时，它自己放到后台的进程（`nohup x &` / `start /b x`）也会一起结束 —— 别用它起要长期留着的服务。',
+        + '命令结束时，它自己放到后台的进程（`nohup x &` / `start /b x`）也会一起结束。' + DETACH_LIMIT,
       inputSchema: {
         type: 'object',
         properties: {
@@ -123,7 +126,7 @@ export function wakeToolDefs(): Array<{ name: string; description: string; input
       description: `**监视**一条长期运行的命令（例如 \`tail -f\` 日志并 grep 关键行）：它的**每行 stdout** 作为一个事件发回这条会话唤醒你，`
         + `${WATCH_COALESCE_MS}ms 内的几行合并成一条。${WHEN}\n`
         + `事件太多（${Math.round(WATCH_RATE_LIMIT.windowMs / 1000)} 秒内超过 ${WATCH_RATE_LIMIT.events} 条）会被自动停掉 —— 所以先在命令里过滤，只让值得叫醒你的行打出来。`
-        + `超时默认 ${WATCH_DEFAULT_TIMEOUT_SEC / 60} 分钟、上限 ${WATCH_MAX_TIMEOUT_SEC / 3600} 小时，结束时也会通知。`,
+        + `超时默认 ${WATCH_DEFAULT_TIMEOUT_SEC / 60} 分钟、上限 ${WATCH_MAX_TIMEOUT_SEC / 3600} 小时，结束时也会通知。` + DETACH_LIMIT,
       inputSchema: {
         type: 'object',
         properties: {

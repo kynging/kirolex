@@ -22,7 +22,7 @@ You do not need to know anything about KiroLex's source code to use it.
 | [Chat](chat.md) | The composer, attachments and images, the message queue, steering, tool approval, commands |
 | [Workspace and files](workspace-and-files.md) | Split panes, the workspace browser, the file viewer, changed files, commenting on files |
 | [Remote sessions](remote-sessions.md) | Running a chat on another machine over ssh while your files stay local |
-| [Automation](automation.md) | Scheduled jobs |
+| [Automation](automation.md) | Scheduled jobs, background commands and watches |
 | [Memory](memory.md) | Global, project and per-chat memory: what it is, where to see it, how to turn it off |
 | [Settings](settings.md) | Every setting and feature switch, fonts, zoom, language, proxy |
 | [Data and privacy](data-and-privacy.md) | What is stored in `~/.kirolex/`, backups, S3 sync, what deleting a chat does |

@@ -180,3 +180,21 @@ describe('审查跟进 5：判忙不看界面语言', () => {
     assert.doesNotMatch(MAIN, /isBusyError: \(err\) => \/active turn/);
   });
 });
+
+describe('后台任务跟进：用户停止的记录当场显示', () => {
+  test('bgJobs 的 note 走 noteInSession（和其他 KiroLex 提示同一套实时显示），不另起插入逻辑', () => {
+    const deps = fnBody(MAIN, 'const bgJobs = new BgJobManager({', 1200);
+    assert.match(deps, /note: \(sessionId, text\) => \{ noteInSession\(sessionId, text\);/);
+    assert.doesNotMatch(deps, /webContents\.send\('acp:user-message'/, '插入只在 noteInSession 里发');
+  });
+
+  test('noteInSession 落盘后推 acp:user-message（kirolex: true）；渲染端忙时攒着、这一轮结束再插', () => {
+    const fn = fnBody(MAIN, 'function noteInSession(', 2500);
+    assert.match(fn, /store\.appendMessage\(sid,[\s\S]{0,400}webContents\.send\('acp:user-message', \{[\s\S]{0,120}kirolex: true/);
+    const h = fnBody(HOOK, 'const removeUserMessage = window.kiroApi.onUserMessage?.(', 900);
+    assert.match(h, /if \(streamingIdsRef\.current\.has\(d\.sessionId\)\) \{[\s\S]{0,200}heldNotesRef\.current\.set\(d\.sessionId/);
+    assert.match(h, /showLiveNotes\(d\.sessionId, \[note\]\)/);
+    const rs = fnBody(HOOK, 'const removeStreaming = (sid: string | null) => {', 1200);
+    assert.match(rs, /heldNotesRef\.current\.get\(sid\)[\s\S]{0,200}showLiveNotes\(sid, held\)/);
+  });
+});

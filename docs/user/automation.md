@@ -65,3 +65,27 @@ up its run budget, or was cancelled.
 - While KiroLex is waiting to quit, no new runs start.
 
 Scheduled jobs are stored in `~/.kirolex/schedules/`. See [Data and privacy](data-and-privacy.md).
+
+## Background commands and watches started by the agent
+
+The agent can also start work that reports back later, without holding the current reply open:
+
+- **`bg_run`** runs a shell command in the background on your computer, in the chat's folder. When
+  the command exits, its exit code and the end of its output arrive in the chat as a new message.
+- **`watch`** runs a long-running command (for example `tail -f` on a log, filtered with `grep`).
+  Every line it prints is sent back to the chat as an event.
+
+While they run, a banner above the conversation lists them (⚙️ 后台命令 / 👀 监视, *Background
+command / Watching*) with their label and running time. **⏹️ Stop** ends one; the chat then records
+that you stopped it. If a reply is running at that moment, the record appears when that reply ends.
+
+**Ending a task ends the processes it started.** When a task finishes, is stopped, times out, or
+KiroLex quits, KiroLex ends that command and the processes it started, including ones it put in the
+background (`nohup x &`, `start /b x`). Two consequences:
+
+- **Don't use a background task to start a service you want to keep running.** Start it yourself in a
+  terminal instead.
+- **Known limitation on macOS and Linux:** a program that detaches itself from the task's process
+  group, for example with `setsid`, `daemonize`, or Node's `detached: true`, is no longer in the
+  task's process group. KiroLex does **not** end it when the task finishes, is stopped, or KiroLex
+  quits; you have to end it yourself. On Windows, such programs are still ended.

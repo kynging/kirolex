@@ -3903,7 +3903,7 @@ const bgJobs = new BgJobManager({
     void wakeDispatcher.enqueue({ sessionId, text, at: Date.now(), source: job.kind === 'watch' ? 'watch' : 'bg', ref: job.jobId })
       .then((r) => { if (!r.ok) logger.warn('bg', `唤醒没发出去 job=${job.jobId} session=${sessionId}: ${r.error}`); });
   },
-  /* 落进会话记录（重开也在），同时在状态行上说一声 —— 记录里那条要等下次读盘才出现在屏幕上 */
+  /* 落进会话记录（重开也在）：`noteInSession` 同时推给界面当场插进这条会话（正在回复就等这一轮结束再插）；状态行上也说一声 */
   note: (sessionId, text) => { noteInSession(sessionId, text); sessionNotice(sessionId, text); },
   changed: (running) => {
     /* 只记标签和命令前 80 字（见 bgJobs.ts）—— 重启后据此补一句「已中断」 */
