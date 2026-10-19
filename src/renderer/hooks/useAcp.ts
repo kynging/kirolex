@@ -3589,6 +3589,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // same message, screenshots included, into the unrelated chat that happened to
     // be open, which then answered it.
     let sid = targetSid || currentSessionRef.current || currentSessionId;
+    /** 发起时的那个 id —— 只有 pending → 真会话时 sid 才会变 */
+    const originSid = sid;
     const activeModel = model || modelForSession(sid);
     /* 自动续写发的那条不算；人发的一条 = 这条会话的续写次数从头算 */
     if (sid) { if (autoContinueInFlightRef.current.has(sid)) autoContinueInFlightRef.current.delete(sid); else wedgeContinuesRef.current.delete(sid); }
@@ -3667,9 +3669,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (pendingId && creatingRef.current.has(pendingId)) {
         try {
           sid = await creatingRef.current.get(pendingId)!;
-          currentSessionRef.current = sid;
           sessionModelRef.current.set(sid, activeModel);
-          setCurrentSessionId(sid);
+          /* 等的这段时间你切走了就不抢焦点（同下面 newSession 那段） */
+          if (currentSessionRef.current === pendingId) {
+            currentSessionRef.current = sid;
+            setCurrentSessionId(sid);
+          }
         } catch { /* fall through to create below */ }
       }
       if (!sid || sid.startsWith('pending_')) {
@@ -3698,9 +3703,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           );
           const prevId = sid;
           sid = newId;
-          currentSessionRef.current = sid;
+          /*
+            **你已经切走了就不抢焦点** —— newSession 要等几秒（远程更久）。期间切到 C 的话，原来这里照样把焦点
+            拉回新会话，而 messages 还是 C 的：第一个 chunk 一到，C 的消息加 chunk 就被记成新会话的（见 messagesOwner）。
+            没切走（包括从欢迎页发、期间也没点开别的会话）照旧聚焦新会话。
+          */
+          const stillViewing = (currentSessionRef.current || null) === (prevId || null);
+          if (stillViewing) {
+            currentSessionRef.current = sid;
+            setCurrentSessionId(sid);
+          }
           sessionModelRef.current.set(sid, activeModel);
-          setCurrentSessionId(sid);
           addAttached(sid);
           if (prevId && prevId.startsWith('pending_')) {
             const pendingMessages = messagesCacheRef.current.get(prevId);
@@ -3763,9 +3776,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Cross-session context sync: if this session is linked to one or more
     // sources, inject each source's NEW messages (delta since last sync) as a
     // single <hidden> block. Migrate link key if the id changed (pending -> real).
-    if (currentSessionId && currentSessionId !== sid && contextLinksRef.current.has(currentSessionId)) {
-      const moved = contextLinksRef.current.get(currentSessionId)!;
-      contextLinksRef.current.delete(currentSessionId);
+    /*
+      搬的是**这条消息自己的** pending id，不是焦点会话：原来比的是 `currentSessionId`，分屏里给另一格
+      （或后台排队 / 控制入口）发消息时 sid ≠ 焦点，焦点会话的上下文链接就被整份搬到了那一条上。
+    */
+    if (originSid && originSid !== sid && contextLinksRef.current.has(originSid)) {
+      const moved = contextLinksRef.current.get(originSid)!;
+      contextLinksRef.current.delete(originSid);
       contextLinksRef.current.set(sid!, moved);
       persistContextLinks();
     }
@@ -3877,7 +3894,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             return;
           }
           turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || t('Failed to send message.') });
-          setMessages((prev) => [
+          /* 写进**这条**会话：await 期间焦点可能已经换了，分屏里发的也常常不是焦点那一格 */
+          mutateSessionMessages(sid!, (prev) => [
             ...prev,
             { id: `err_${Date.now()}`, role: 'assistant', content: `⚠️ ${retryErr?.message || t('Failed to send message.')}`, timestamp: Date.now() },
           ]);
@@ -4096,14 +4114,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         **还没被吃的 steer 不扔** —— 原来这里直接 `delete`，于是重跑（包括自动重发）把它们丢了。
         留着它们：这一轮结束时 App 的轮末对账（takeUnconsumedSteers）会把它们原样放回队列头。
       */
-      currentMessageRef.current = '';
-      toolCallsRef.current.clear();
+      /* 这两个是全局的（跟着焦点会话的流式走）：后台那条会话重跑时不能清掉正在流式的焦点会话的工具卡片 */
+      if (sid === currentSessionRef.current) {
+        currentMessageRef.current = '';
+        toolCallsRef.current.clear();
+      }
 
       // Truncate the view to retained; sendMessage appends the edited user
       // message and streams the new reply in the same flow (no rebuild step,
       // no priming — the live backend already holds the full context).
-      messagesCacheRef.current.set(sid, retained);
-      setMessages(retained);
+      /*
+        **按 sid 写，不按焦点写** —— 自动重发（recoverInterruptedTurn）对的常常是后台那条会话。
+        原来是 `setMessages(retained)`：焦点那条的界面被换成了这条的历史，归属还记成焦点会话（见 messagesOwner），
+        缓存 effect 再把它存成焦点会话的。
+      */
+      mutateSessionMessages(sid, () => retained);
       // CARRY THE ORIGINAL ATTACHMENTS. A rerun edits the TEXT; the images/files
       // that came with that message are still part of it. Dropping them meant the
       // model lost the picture you were asking about, the chips disappeared, and
@@ -4165,11 +4190,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         sid, // same chat that was truncated above; see sendMessage's targetSid
       );
     } catch (error: any) {
-      messagesCacheRef.current.set(sid, current);
-      setMessages(current);
+      mutateSessionMessages(sid, () => current);
       noteError(sid, error?.message || t('Edit and rerun failed.'));
     }
-  }, [sendMessage]);
+  }, [sendMessage, mutateSessionMessages]);
   // Expose rerunFromMessage to the send path (cancel-overwrite) without a
   // circular useCallback dependency.
   rerunFromMessageRef.current = rerunFromMessage;

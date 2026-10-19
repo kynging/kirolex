@@ -196,7 +196,7 @@ test('连着但没有本地工具：不在跑就换执行器重接；正在跑�
 test('index.ts 接线：执行器意外断开就进恢复；复用连接的判据算上在等的会话；连接回来就叫醒', () => {
   const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const disc = M.slice(M.indexOf("client.on('disconnected'"), M.indexOf("client.on('disconnected'") + 1600);
-  assert.match(disc, /if \(sessionClients\.get\(sessionId\) !== entry\) return;/);
+  assert.match(disc, /if \(sessionClients\.get\(sessionId\) !== entry \|\| retiringClients\.has\(client\)\) return;/);
   assert.match(disc, /startRemoteRecovery\(sessionId\)/);
   assert.match(M, /for \(const sessionId of remoteRecovery\.waitingOn\(key\)\) ids\.add\(sessionId\);/);
   assert.match(M, /onReady: \(key: string\) => \{[\s\S]{0,300}remoteRecovery\.kick\(key\);/);

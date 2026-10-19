@@ -52,6 +52,7 @@ import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts'
 import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
+import { runSessionRequest, setErr, statusFor, cleanIpcError, type RequestStatusMap } from '../sessionRequestStatus.ts';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -2058,10 +2059,21 @@ const ChatInputBox = memo<{
     const el = (e.currentTarget || textareaRef.current) as HTMLTextAreaElement | null;
     const selStart = el?.selectionStart ?? input.length;
     const selEnd = el?.selectionEnd ?? selStart;
+    /** 粘贴时这一格是哪条会话 —— await 期间这一格可能已经换成了别的会话 */
+    const pasteSid = sessionId;
     /** preventDefault() already ran, so the browser will NOT insert anything: every
      *  path out of here must put SOMETHING in the composer or the paste is silently
      *  lost. Falls back to the raw text, unfolded. */
     const insert = (piece: string) => {
+      /*
+        **这段粘贴属于原来那条会话**：换了会话的话 `input` 还是旧会话的文字，`setInput` 会把它连同占位符
+        塞进新会话的输入框、盖掉新会话的草稿。改写进原会话存着的草稿（粘贴块本身已按 pasteSid 存了）。
+      */
+      if (draftSessionRef.current !== pasteSid) {
+        const stored = (pasteSid && composerDrafts[pasteSid]) || '';
+        stashComposerDraft(pasteSid, stored === input ? input.slice(0, selStart) + piece + input.slice(selEnd) : stored + piece);
+        return;
+      }
       const next = input.slice(0, selStart) + piece + input.slice(selEnd);
       setInput(next);
       requestAnimationFrame(() => {
@@ -3344,17 +3356,32 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   type EngineSelect = { current: string; options: Array<{ value: string; name: string }> };
   /** 模型清单（`current`/`options`）+ effort + 权限模式 —— 三样都来自适配器的 configOptions。 */
   const [engineModels, setEngineModels] = useState<(EngineSelect & { effort?: EngineSelect | null; mode?: EngineSelect | null }) | null>(null);
-  const [engineModelBusy, setEngineModelBusy] = useState(false);
-  const [engineModelErr, setEngineModelErr] = useState('');
+  /*
+    **忙 / 失败原因按会话记**（sessionRequestStatus.ts）：在 A 发起切换、等待期间这一格换成 B，A 的结果（尤其是失败）
+    写回 A，不落到 B 的模型栏上；切回 A 时 A 的状态原样回来。界面只读当前会话那一份。
+  */
+  const [requestStatus, setRequestStatus] = useState<RequestStatusMap>({});
+  const { engineBusy: engineModelBusy, comboBusy: mcpComboBusy, err: engineModelErr } = statusFor(requestStatus, currentSessionId);
+  /** 同一条会话的引擎 / 连接状态变了：清掉它上次的错误（原来的行为）；换成别的会话时不清，留着切回来看 */
+  const engineErrSidRef = useRef(currentSessionId);
+  /** 这一格现在是哪条会话 —— 下拉切换的结果回来时核对，换了会话就不写（A 的清单不能出现在 B 的下拉里） */
+  const engineSidRef = useRef(currentSessionId);
+  engineSidRef.current = currentSessionId;
   useEffect(() => {
-    setEngineModels(null); setEngineModelErr('');
+    setEngineModels(null);
+    if (engineErrSidRef.current === currentSessionId && currentSessionId) {
+      const sid = currentSessionId;
+      setRequestStatus((m) => setErr(m, sid, ''));
+    }
+    engineErrSidRef.current = currentSessionId;
     if (!nonKiro || !currentSessionId) return;
     const api = (window as any).kiroApi;
+    let alive = true;
     const off = api?.onEngineModels?.((d: any) => {
       if (d?.sessionId === currentSessionId) setEngineModels(d);
     });
-    void api?.engineModels?.(currentSessionId).then((d: any) => { if (d) setEngineModels(d); }).catch(() => {});
-    return () => { try { off?.(); } catch { /* 卸载 */ } };
+    void api?.engineModels?.(currentSessionId).then((d: any) => { if (alive && d) setEngineModels(d); }).catch(() => {});
+    return () => { alive = false; try { off?.(); } catch { /* 卸载 */ } };
   }, [nonKiro, currentSessionId, engine, status]);
   /*
     **「组合」下拉**（取代原来的 effort 下拉）——「不同对话挂不同的 MCP」。清单是本机全局的
@@ -3362,7 +3389,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   */
   type McpComboList = { combos: Array<{ id: string; name: string; effort?: string }>; current: string; missing?: string; error?: string };
   const [mcpCombos, setMcpCombos] = useState<McpComboList | null>(null);
-  const [mcpComboBusy, setMcpComboBusy] = useState(false);
   useEffect(() => {
     setMcpCombos(null);
     if (!nonKiro || !currentSessionId) return;
@@ -3377,33 +3403,27 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   }, [nonKiro, currentSessionId, engine, status]);
   const onMcpComboChange = async (comboId: string): Promise<void> => {
     if (!currentSessionId) return;
-    setMcpComboBusy(true); setEngineModelErr('');
-    try {
-      const d = await (window as any).kiroApi.switchMcpCombo(currentSessionId, comboId);
-      /* pending = 这一轮跑完再换：实际值不动，下拉显示 pending 的那个 */
-      if (!d?.pending) setMcpCombos((prev) => (prev ? { ...prev, current: d?.current || comboId, missing: undefined } : prev));
-    } catch (err: any) {
-      setEngineModelErr(String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
-    } finally {
-      setMcpComboBusy(false);
-    }
+    const sid = currentSessionId;
+    await runSessionRequest(sid, 'combo', setRequestStatus,
+      () => (window as any).kiroApi.switchMcpCombo(sid, comboId),
+      (d: any) => {
+        /* pending = 这一轮跑完再换：实际值不动，下拉显示 pending 的那个 */
+        if (!d?.pending && engineSidRef.current === sid) setMcpCombos((prev) => (prev ? { ...prev, current: d?.current || comboId, missing: undefined } : prev));
+      },
+      cleanIpcError);
   };
   const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
   const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode', value: string): Promise<void> => {
     if (!currentSessionId) return;
-    setEngineModelBusy(true); setEngineModelErr('');
-    try {
-      const api = (window as any).kiroApi;
-      const d = category === 'model'
-        ? await api.setEngineModel(currentSessionId, value)
-        : await api.setEngineOption(currentSessionId, category, value);
-      /* pending = 这一轮跑完再设：返回的不是清单，别拿它覆盖 */
-      if (d && !d.pending) setEngineModels(d);
-    } catch (err: any) {
-      setEngineModelErr(String(err?.message || err).replace(/^Error invoking remote method '[^']+': (Error: )?/, ''));
-    } finally {
-      setEngineModelBusy(false);
-    }
+    const sid = currentSessionId;
+    const api = (window as any).kiroApi;
+    await runSessionRequest(sid, 'engine', setRequestStatus,
+      () => (category === 'model' ? api.setEngineModel(sid, value) : api.setEngineOption(sid, category, value)),
+      (d: any) => {
+        /* pending = 这一轮跑完再设：返回的不是清单，别拿它覆盖 */
+        if (d && !d.pending && engineSidRef.current === sid) setEngineModels(d);
+      },
+      cleanIpcError);
   };
 
   /* Claude Code / Codex 面板的 tab：按这条会话的引擎从 main 拿（换了引擎就重新拿） */

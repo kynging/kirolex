@@ -46,7 +46,8 @@ test('"归档期间不带项目记忆"改成显式守卫 —— 它不能再靠�
     字段留着了，所以这条不变量必须自己站得住：归档会话一轮都不该产生。
     判据盯 prompt 这条路，因为项目记忆只在 prompt 时注入。
   */
-  const at = code.indexOf('deletedSessionIds.has(sessionId)');
+  /* 锚在 prompt 路径那道删除守卫上（会话记忆整理那里也有一处 deletedSessionIds.has，不是这条路） */
+  const at = code.indexOf("deletedSessionIds.has(sessionId)) {\n      logger.warn('prompt'");
   assert.ok(at > 0);
   const near = code.slice(at, at + 900);
   assert.match(near, /readRecord\(sessionId\)\?\.archived/, 'prompt 路径上没有归档守卫');

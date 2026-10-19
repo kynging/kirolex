@@ -2990,7 +2990,8 @@ const App: React.FC = () => {
       /* 这是**你**停的：它会断开所有执行器，正在跑的那几条都不许被"中断自动重发"拉回去 */
       for (const id of new Set([...streamingIds, ...(currentSessionId ? [currentSessionId] : [])])) cancelAutoResend(id);
       await forceStop(selectedModel);
-      sendMessage([{ type: 'text', text: '/stop' }], '🔄 Force interrupted and reconnected.');
+      // 回显给敲命令的那一格：await forceStop 期间焦点可能已经换了（同下面 /clear 那段）
+      sendMessage([{ type: 'text', text: '/stop' }], '🔄 Force interrupted and reconnected.', undefined, undefined, undefined, sid || undefined);
       return;
     }
 
@@ -3013,10 +3014,10 @@ const App: React.FC = () => {
     if (text.trim() === '/usage') {
       try {
         const result = await window.kiroApi.getUsage();
-        // Add as a fake assistant message
-        sendMessage([{ type: 'text', text: '/usage' }], result.text);
+        // Add as a fake assistant message — 发给 sid：await 期间焦点可能已经换了
+        sendMessage([{ type: 'text', text: '/usage' }], result.text, undefined, undefined, undefined, sid || undefined);
       } catch (err) {
-        sendMessage([{ type: 'text', text: '/usage' }], tRef.current('Failed to fetch usage info'));
+        sendMessage([{ type: 'text', text: '/usage' }], tRef.current('Failed to fetch usage info'), undefined, undefined, undefined, sid || undefined);
       }
       return;
     }
@@ -3046,7 +3047,8 @@ const App: React.FC = () => {
       prompt,
       undefined,
       currentAttachments.length > 0 ? currentAttachments : undefined,
-      selectedModel,
+      // selectedModel 是焦点会话的（还是 await focusSession 之前的闭包值）：别的格子发的让 sendMessage 按 sid 自己的模型来
+      sid && sid !== currentSessionId ? undefined : selectedModel,
       pastes?.length
         ? { text, pastes: pastes.map(({ seq, lines, chars, path }) => ({ seq, lines, chars, path })) }
         : undefined,

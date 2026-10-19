@@ -106,6 +106,7 @@ describe('换组合失败只说一处', () => {
     assert.match(caught, /throw new Error\(tr\('Switching to the combo "\{name\}" failed/);
     assert.doesNotMatch(caught, /sessionNotice\(/);
     const CA = read('src', 'renderer', 'components', 'ChatArea.tsx');
-    assert.match(CA, /kiroApi\.switchMcpCombo\(currentSessionId, comboId\);[\s\S]{0,300}setEngineModelErr\(String\(err\?\.message \|\| err\)/);
+    assert.match(CA, /kiroApi\.switchMcpCombo\(sid, comboId\),[\s\S]{0,400}cleanIpcError\);/);
+    assert.match(CA, /\{engineModelErr && <span className="composer-engine-err"/);
   });
 });

@@ -125,7 +125,7 @@ describe('Claude Code / Codex 的模型下拉 ——「右侧的选模型为什�
     assert.match(M, /function wireSession\(sessionId: string, entry: SessionEntry\) \{\r?\n  const \{ client \} = entry;\r?\n  entry\.engineOptionsReady = applyEngineModel\(sessionId, entry\)/);
     const ca = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.match(ca, /\{nonKiro && \(\s*<select/);
-    assert.match(ca, /api\.setEngineModel\(currentSessionId, value\)/);
+    assert.match(ca, /api\.setEngineModel\(sid, value\)/);
   });
 });
 
@@ -251,7 +251,7 @@ describe('已有会话换引擎 ——「我还需要现有会话也能切换 ag
     assert.match(body, /queueSwitchWhileBusy\(sessionId, 'engine'/);
     assert.match(body, /if \(engine !== 'kiro'\) await remoteAdapterCheck\(profile\.remote, engine\);/, '远程会话换到 Claude/Codex 先查适配器');
     assert.match(body, /const started = await connectWithModelFallback\(profile, 'switch-engine', localTools, sessionId, remoteModels\);/);
-    assert.ok(body.indexOf('await client.newSession(') < body.indexOf('await oldEntry.client.disconnect()'), '先起新的、再断旧的');
+    assert.ok(body.indexOf('await client.newSession(') < body.indexOf('await retireExecutor(oldEntry.client)'), '先起新的、再断旧的');
     assert.match(body, /restoreContextAfterExecutorSwap\(sessionId, 'switch-engine'\);/);
     assert.match(body, /webContents\.send\('session:engine-changed', \{ sessionId, engine \}\)/);
     /* kiro 的模型 / agent 对另外两家没意义；切回 kiro 用偏好模型 */

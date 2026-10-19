@@ -342,6 +342,6 @@ describe('接线（源码扫描）', () => {
     /* 实现抽成了 switchMcpComboImpl（忙时记下的切换跑完后也走它） */
     const h = M.slice(M.indexOf('const switchMcpComboImpl = async'));
     assert.match(h.slice(0, 2000), /queueSwitchWhileBusy\(sessionId, 'combo'/);
-    assert.ok(h.indexOf('client.newSession(') < h.indexOf('oldEntry.client.disconnect()'));
+    assert.ok(h.indexOf('client.newSession(') < h.indexOf('retireExecutor(oldEntry.client)'));
   });
 });

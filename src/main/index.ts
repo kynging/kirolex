@@ -922,12 +922,18 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
     const produced = cleanLiteOutput(await runLiteOneShot(buildConsolidationPrompt(recent, stripTextToolCalls(existing)), 'session-memory'));
     /* 早先压进记忆的文字版调用块（`<invoke …>`）这一次清掉 —— 记忆每一轮都注入，留着就是一轮一轮喂回模型（sessionMemory.ts / textToolCall.ts）。
        null = 不写：没变化，或者没清理、这次也没产出（别把已有记忆清成空）；清理后为空照样写回 */
+    /*
+      **等这一次调用的几秒里会话可能被删了**：再写 writeMemory / 记录就把它的目录重新建出来。
+      记录也只补这一个字段 —— 上面那份 record 是 await 之前读的，整份写回会把这期间换后端 / 换机器写进去的
+      cliSessionId、profile 等改回旧值。
+    */
+    if (deletedSessionIds.has(sessionId) || !store.readRecord(sessionId)) return;
     const merged = consolidatedSessionMemory(existing, produced);
     if (merged !== null) {
       writeMemory('session', projectId, sessionId, merged);
       logger.info('memory', `session ${sessionId}: consolidated at ${messages.length} messages (${merged.length} chars)`);
     }
-    store.writeRecord({ ...record, memoryConsolidatedAt: messages.length } as any);
+    store.patchRecord(sessionId, { memoryConsolidatedAt: messages.length } as any);
   } catch (err: any) {
     logger.warn('memory', `session ${sessionId}: consolidation failed (${err?.message || err})`);
   } finally {
@@ -5028,9 +5034,24 @@ async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise
   if (sessionClients.get(sessionId) === entry) mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
 }
 
+/**
+ * **被换下来的执行器** —— 换机器 / 换引擎 / 换组合 / 换 agent 时，旧的那个 client 在这里登记后再断开。
+ *
+ * 那几条路有的是「先 await 旧的 disconnect，再 set 新的」：旧进程 close → 'disconnected' 发生时 map 里还是
+ * 旧 entry，身份守卫放行，于是删掉 entry、记录写成 detached、给渲染层发 acp:disconnected，远程会话还会对着
+ * **旧那台机器**起断线恢复。迟到的 update 也会被当成这条会话的流式输出发出去。登记过的 client 的事件一律丢掉。
+ */
+const retiringClients = new WeakSet<AcpClient>();
+async function retireExecutor(client: AcpClient): Promise<void> {
+  retiringClients.add(client);
+  await client.disconnect();
+}
+
 function wireSession(sessionId: string, entry: SessionEntry) {
   const { client } = entry;
   entry.engineOptionsReady = applyEngineModel(sessionId, entry).catch(() => { /* 恢复失败只记日志（applyEngineModel 里） */ });
+  /** 这个 client 已经不是这条会话的执行器了（被换下来 / 已摘掉）：它的事件不再属于这条会话的任何一轮 */
+  const superseded = () => retiringClients.has(client) || sessionClients.get(sessionId)?.client !== client;
   /*
     **远程会话：用户要的文件落在本机，远端只放缓存**（`remoteWriteGuard.ts`）。
     远端自带的写文件工具写到缓存以外 → 权限那一层拒掉（`AcpClient.remoteWriteGuard`）；
@@ -5047,6 +5068,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     });
   }
   client.on('update', (data: any) => {
+    if (superseded()) return;
     // A background history-priming turn's output must never surface: don't
     // forward to the UI, accumulate, or persist it.
     //
@@ -5287,6 +5309,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
   };
   client.on('error', (error: any) => {
     logger.warn('session', `error event sessionId=${sessionId}`, error?.message || error);
+    if (superseded()) return;
     if (error?.type === 'stderr') reportStderr(String(error.message || ''));
     mainWindow?.webContents.send('acp:error', { ...error, sessionId });
   });
@@ -5298,7 +5321,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // If the session was already re-attached (move-reset, LRU, reconnect), the
     // map now holds a DIFFERENT entry — this stale event must not delete it or
     // spuriously notify the renderer.
-    if (sessionClients.get(sessionId) !== entry) return;
+    if (sessionClients.get(sessionId) !== entry || retiringClients.has(client)) return;
     sessionClients.delete(sessionId);
     const rec = store.readRecord(sessionId);
     if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
@@ -9417,7 +9440,7 @@ app.whenReady().then(async () => {
           lastUsedAt: Date.now(),
           busy: false,
         };
-        try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
+        try { await retireExecutor(oldEntry.client); } catch { /* 旧的已经没用了 */ }
         sessionClients.set(sessionId, nextEntry);
         wireSession(sessionId, nextEntry);
         /*
@@ -9642,7 +9665,7 @@ app.whenReady().then(async () => {
     };
 
     sessionClients.delete(sessionId); // release the slot + ownership claim
-    try { await oldEntry.client.disconnect(); } catch {}
+    try { await retireExecutor(oldEntry.client); } catch {}
 
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
@@ -9771,7 +9794,7 @@ app.whenReady().then(async () => {
       };
       sessionClients.set(sessionId, nextEntry);
       wireSession(sessionId, nextEntry);
-      try { await oldEntry.client.disconnect(); } catch {}
+      try { await retireExecutor(oldEntry.client); } catch {}
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.profile = profile;
@@ -9877,7 +9900,7 @@ app.whenReady().then(async () => {
         lastUsedAt: Date.now(),
         busy: false,
       };
-      try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
+      try { await retireExecutor(oldEntry.client); } catch { /* 旧的已经没用了 */ }
       sessionClients.set(sessionId, nextEntry);
       wireSession(sessionId, nextEntry);
 
@@ -9983,7 +10006,7 @@ app.whenReady().then(async () => {
         lastUsedAt: Date.now(),
         busy: false,
       };
-      try { await oldEntry.client.disconnect(); } catch { /* 旧的已经没用了 */ }
+      try { await retireExecutor(oldEntry.client); } catch { /* 旧的已经没用了 */ }
       sessionClients.set(sessionId, nextEntry);
       wireSession(sessionId, nextEntry);
 
