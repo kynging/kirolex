@@ -21,14 +21,15 @@ KiroLex 启动时在 `127.0.0.1` 的一个随机端口上开一个很小的 HTTP
 | `GET /sessions/:id/tail?n=10` | 是 + 开关 | 最近 n 条消息 |
 | `GET /sessions/:id/status` | 是 + 开关 | 这条会话忙不忙 |
 | `POST /sessions/:id/send` | 是 + 开关 | 往这条会话发一条消息 |
+| `POST /sessions/:id/new-backend` | 是 + 开关 | 给这条会话换新的后端会话（会话卡住时用） |
 
 ### 读会话 / 发消息：先在设置里打开
 
-`/sessions…` 这四条默认**关着**：设置 → 🧪 开关 → 安全 →「允许本机工具通过控制入口读取和发送消息」。
+`/sessions…` 这几条默认**关着**：设置 → 🧪 开关 → 安全 →「允许本机工具通过控制入口读取和发送消息」。
 关着时一律 `403 {"error":"disabled"}`；`/ping` `/quit` `/reload` 不受影响。开关存在 `~/.kirolex/config.json`
 的 `features.controlSessionAccess`，改完立即生效。
 
-只有「读」和「发消息」——没有执行命令、改设置、切模型、删会话的路由。KiroLex Advanced 的会话（flow / skill）
+只有「读」「发消息」和「换新的后端会话」——没有执行命令、改设置、切模型、删会话的路由，也不开放任意斜杠命令。KiroLex Advanced 的会话（flow / skill）
 不出现在列表里，按 id 访问也是 `404`。
 
 **`GET /sessions`** → `[{id, title, projectId, busy, remote, archived, updatedAt}]`
@@ -80,6 +81,21 @@ KiroLex 启动时在 `127.0.0.1` 的一个随机端口上开一个很小的 HTTP
 （`~/.kirolex/sessions/<id>/transcript.jsonl`）里那条带 `"via": "control"`，消息 id 里带 `_ctl_`。
 主进程日志（`~/.kirolex/logs/main-*.log`，`[control]`）每次记一行：路由、会话 id、字数、走了哪条路——不记正文、不记 token。
 
+**`POST /sessions/:id/new-backend`**（不要 body）→ `200 {"ok": true, "backendSessionId": "…"}`
+
+给这条会话换一个新的后端会话（kiro-cli 那边的会话），和 KiroLex 自己处理 EmptyResponse / 连续拒绝 / 反复把工具调用写成文字时
+**同一套**：会话 id 和对话记录不变，上下文跟着下一条消息带过去（历史里写成文字的工具调用已折叠成一句）；正在跑的后台任务
+（bg_run / watch / 定时任务）不受影响，结果照常回到这条会话。会话没连着会先连上。会话里会留一句「🔀 经控制入口换了后端会话」。
+用在本机工具发现会话卡住的时候（例如它一直把工具调用写成文字）——不用叫你去点。
+
+| 情况 | 返回 |
+|---|---|
+| 会话不存在 / KiroLex Advanced 的会话 | `404 {"error":"not-found"}` |
+| 会话已归档 | `409 {"error":"archived"}` |
+| 这一轮正在跑 / 正在重建历史 / 正在换模型 | `409 {"error":"busy"}`（等 `status` 不忙了再试） |
+| 连不上执行器 | `502 {"error":"not-connected"}` |
+| 换的时候出错 | `502 {"error":"swap-failed"}` |
+
 ## 例子
 
 bash（macOS / Linux / Git Bash）：
@@ -107,6 +123,9 @@ curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/
 # 等这一轮结束后作为下一条发
 curl -s -X POST -H "Authorization: Bearer $TOKEN" -H "Content-Type: application/json" \
   -d '{"text":"跑完之后把结果总结一下","mode":"next"}' "$BASE/sessions/$SID/send"
+
+# 会话卡住了：换新的后端会话（再发一句「继续」它就在新的后端会话上接着干）
+curl -s -X POST -H "Authorization: Bearer $TOKEN" "$BASE/sessions/$SID/new-backend"
 ```
 
 PowerShell：

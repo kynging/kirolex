@@ -14,6 +14,8 @@
  *   有上限      记忆本身不许无限长(MAX_CHARS)—— 它每一轮都要被注入,长了就是每一轮都在付钱
  *   只留事实    提示词明说要「决定、约束、路径、名字」,不要过程叙述:注入的是事实,不是日记
  */
+import { stripTextToolCalls } from './textToolCall.ts';
+
 export interface SessionMemoryState {
   /** 现在这个会话有多少条消息 */
   messages: number;
@@ -73,4 +75,21 @@ export function mergeSessionMemory(existing: string, produced: string, cap = MAX
     .slice(0, 12);
   const joined = lines.map((line) => `- ${line}`).join('\n');
   return joined.length <= cap ? joined : `${joined.slice(0, cap).replace(/\n[^\n]*$/, '')}`;
+}
+
+/**
+ * 这一次整理要写回的会话记忆；`null` = 不写。
+ *
+ * 已有记忆和这次产出里的文字版调用块（`<invoke …>`）都清掉 —— 记忆每一轮都注入，留着就是一轮一轮喂回模型。
+ *   · 没变化 → 不写；
+ *   · 已有记忆**没清理什么**、这次也没产出 → 不写（`mergeSessionMemory` 保持原样，别把记忆清成空）；
+ *   · 已有记忆全是调用块、清完是空的、这次也没产出 → 写回空 —— 不然旧调用块会一直留着被注入。
+ */
+export function consolidatedSessionMemory(existing: string, produced: string, cap = MAX_CHARS): string | null {
+  const before = String(existing || '');
+  const clean = stripTextToolCalls(before);
+  const merged = mergeSessionMemory(clean, stripTextToolCalls(String(produced || '')), cap);
+  if (merged === before) return null;
+  if (!merged && clean === before) return null;
+  return merged;
 }

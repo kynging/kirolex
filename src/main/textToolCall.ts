@@ -190,6 +190,78 @@ export function foldTextToolCall(text: string, from = 0): string {
   return [s.before, textToolCallNote(s.tools), s.after].filter(Boolean).join('\n\n');
 }
 
+/**
+ * 会话记忆用：把文字里**每一段**文字版调用块都去掉（不只末尾那段）。
+ *
+ * 会话记忆是压缩完永久留着、每一轮都注入的 —— 早先压进去的一段 `<invoke …>` 会一轮一轮喂回模型。
+ * 记忆里不会有该保留的调用示例，所以这里不看代码块 / 「示例」上下文，凡是带 `name=` 的调用块都清；
+ * 紧挨在前面那行孤零零的 `code` / 围栏行一起清，清完只剩列表符号的空行也去掉。
+ */
+export function stripTextToolCalls(text: string): string {
+  const src = String(text ?? '');
+  if (!/<\/?(?:[a-z][\w-]*:)?(?:function_calls|invoke|parameter)\b/i.test(src)) return src;
+  const blocks: Array<{ start: number; end: number }> = [];
+  let depth = 0;
+  let cur: { start: number; end: number } | null = null;
+  TAG_RE.lastIndex = 0;
+  for (let m = TAG_RE.exec(src); m; m = TAG_RE.exec(src)) {
+    const tagEnd = m.index + m[0].length;
+    if (m[1] !== '/') {
+      if (depth === 0) cur = { start: m.index, end: tagEnd };
+      if (/\/>$/.test(m[0])) { if (cur) cur.end = tagEnd; if (depth === 0 && cur) { blocks.push(cur); cur = null; } continue; }
+      depth += 1;
+      if (cur) cur.end = tagEnd;
+    } else if (depth > 0) {
+      depth -= 1;
+      if (cur) cur.end = tagEnd;
+      if (depth === 0 && cur) { blocks.push(cur); cur = null; }
+    } else if (blocks.length) {
+      blocks[blocks.length - 1].end = tagEnd;
+    }
+  }
+  if (cur) { cur.end = src.length; blocks.push(cur); }
+  /* 紧挨着块的前一行 `code` / 围栏开头、后一行围栏收尾（可带列表符号）一起清；离块远的围栏不碰 */
+  const LEAD = /^[ \t]*(?:[-*•][ \t]*)?(?:`{3,}[\w-]*|~{3,}[\w-]*|code|xml|html|tool_code|tool_use)[ \t]*\r?$/i;
+  const CLOSE = /^[ \t]*(?:[-*•][ \t]*)?(?:`{3,}|~{3,})[ \t]*\r?$/;
+  let out = src;
+  let removed = false;
+  for (const b of blocks.reverse()) {
+    const inner = src.slice(b.start, b.end);
+    if (!/<(?:[a-z][\w-]*:)?(?:invoke|parameter)\s+name\s*=/i.test(inner) && !/<(?:[a-z][\w-]*:)?function_calls\s*>/i.test(inner)) continue;
+    let start = b.start;
+    const lineStart = src.lastIndexOf('\n', start - 1) + 1;
+    /* 块前面这一行只有列表符号：整行算块的 */
+    if (/^[ \t]*(?:[-*•][ \t]*)?$/.test(src.slice(lineStart, start))) {
+      start = lineStart;
+      if (lineStart > 0) {
+        const prevStart = src.lastIndexOf('\n', lineStart - 2) + 1;
+        if (LEAD.test(src.slice(prevStart, lineStart - 1))) start = prevStart;
+      }
+    }
+    let end = b.end;
+    const lineEnd = src.indexOf('\n', end);
+    if (lineEnd >= 0 && !src.slice(end, lineEnd).trim()) {
+      const nextEnd = src.indexOf('\n', lineEnd + 1);
+      const nextLine = src.slice(lineEnd + 1, nextEnd < 0 ? src.length : nextEnd);
+      end = CLOSE.test(nextLine) ? (nextEnd < 0 ? src.length : nextEnd) : lineEnd;
+    }
+    /* 块占满了整行：连换行一起去掉，不留空行 */
+    if (start <= lineStart) {
+      if (src[end] === '\n') end += 1;
+      else if (start > 0 && end >= src.length) start -= 1;
+    }
+    out = out.slice(0, start) + out.slice(end);
+    removed = true;
+  }
+  if (!removed) return src;
+  return out
+    .split('\n')
+    .filter((line) => !(line.trim() && /^[ \t]*[-*•][ \t]*\r?$/.test(line)))   // 只剩列表符号的行
+    .join('\n')
+    .replace(/\n{3,}/g, '\n\n')
+    .trim();
+}
+
 export type TextToolAction = 'none' | 'nudge' | 'stop';
 
 /**

@@ -25,6 +25,8 @@
  *   - `GET /sessions/:id/status` → `{busy, turnStartedAt, queued, lastMessageAt}`；
  *   - `POST /sessions/:id/send` `{text, mode?:'auto'|'next'}` → 交给界面按 Enter 的同一套路由发
  *     （`{accepted:true, messageId, routed:'sent'|'steer'|'queued'}`）；界面没就绪 503 `{error:'ui-not-ready'}`。
+ *   - `POST /sessions/:id/new-backend` → 换新的后端会话（和 EmptyResponse / 「写成文字」反复发作同一套，上下文带过去），
+ *     `{ok:true, backendSessionId}`；这一轮还在跑 409 `{error:'busy'}`，换不了 502 `{error:'swap-failed'}`。
  *   会话不存在 / KiroLex Advanced 的会话 → 404。日志只记路由、会话 id、字数，不记正文、不记 token。
  * - 其它一律 404。
  *
@@ -194,7 +196,13 @@ export interface ControlSessionAccess {
   status: (id: string) => ControlSessionStatus;
   /** 交给界面按 Enter 的同一套路由发；界面没就绪就 `{ok:false, status:503, error:'ui-not-ready'}` */
   send: (id: string, text: string, mode: ControlSendMode) => Promise<ControlSendResult>;
+  /** 换新的后端会话；不传 = 501 */
+  newBackend?: (id: string) => Promise<ControlNewBackendResult>;
 }
+
+export type ControlNewBackendResult =
+  | { ok: true; backendSessionId: string }
+  | { ok: false; status: number; error: string };
 
 export interface ControlServerOptions extends QuitCoordinatorOptions {
   /** 写 `{port, token, pid}` 的地方；默认 `~/.kirolex/control.json` */
@@ -249,7 +257,7 @@ function readBody(req: http.IncomingMessage): Promise<string | null> {
 
 /** 和 sessionStore.safeId 同一个形状；别的一律当不存在 */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
-const SESSION_ROUTE_RE = /^\/sessions\/([^/]+)\/(tail|status|send)$/;
+const SESSION_ROUTE_RE = /^\/sessions\/([^/]+)\/(tail|status|send|new-backend)$/;
 
 /**
  * `/sessions…`：已过 token。返回 false = 不是这几条路由。
@@ -264,7 +272,7 @@ async function handleSessions(
   const m = SESSION_ROUTE_RE.exec(u.pathname);
   if (!isList && !m) return false;
   const action = isList ? 'list' : m![2];
-  const wantMethod = action === 'send' ? 'POST' : 'GET';
+  const wantMethod = action === 'send' || action === 'new-backend' ? 'POST' : 'GET';
   if (method !== wantMethod) return false;
   let enabled = false;
   try { enabled = access.enabled(); } catch { enabled = false; }
@@ -290,6 +298,15 @@ async function handleSessions(
   }
   if (action === 'status') {
     send(res, 200, access.status(id));
+    return true;
+  }
+  if (action === 'new-backend') {
+    if (!access.newBackend) { send(res, 501, { ok: false, error: 'not-supported' }); return true; }
+    let r: ControlNewBackendResult;
+    try { r = await access.newBackend(id); } catch { r = { ok: false, status: 500, error: 'swap-failed' }; }
+    log(`POST /sessions/:id/new-backend session=${id} -> ${r.ok ? 'ok' : `${r.status} ${r.error}`}`);
+    if (!r.ok) send(res, r.status, { ok: false, error: r.error });
+    else send(res, 200, { ok: true, backendSessionId: r.backendSessionId });
     return true;
   }
   const raw = await readBody(req);

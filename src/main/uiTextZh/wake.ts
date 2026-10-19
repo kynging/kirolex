@@ -28,8 +28,16 @@ export const ZH_WAKE: Record<string, string> = {
   '⚠️ KiroLex restarted, so background task "{label}" ({id}) was interrupted and is no longer running':
     '⚠️ KiroLex 重启，后台任务「{label}」（{id}）已中断，不再运行',
   // ── 工具调用写成了文字（index.ts handleTextToolCall，textToolCall.ts）──
-  '⚠️ The model wrote its tool call as text again, so nothing ran. Auto-correction stopped; consider starting a new backend session.':
-    '⚠️ 模型又把工具调用写成了文字，没有执行。已停止自动纠正，建议换新的后端会话。',
-  'Two turns in a row ended with a tool call written as text ({tools}) instead of actually calling it; it was corrected once automatically. In rebuilt history these blocks are folded into one line and are not fed back to the model. Starting a new session gives the model a clean backend session.':
-    '连续两轮都以文字版的工具调用（{tools}）结束、没有真的调用，已自动纠正过一次。重建历史时这类块会折叠成一句说明，不会原样喂回模型。新开一条会话，模型就从干净的后端会话开始。',
+  '⚠️ The model still writes tool calls as text, so automatic handling has stopped until you send your next message.':
+    '⚠️ 模型仍把工具调用写成文字，已停止自动处理，等你发下一条消息。',
+  'Within {window} minutes it already switched to a new backend session {n} time(s) automatically (limit {max}); the last tool it tried to call: {tools}. Until you send the next message, it will not correct or switch automatically.':
+    '{window} 分钟内已自动换过 {n} 次后端会话（上限 {max} 次），最近一次想调用的工具：{tools}。你发下一条消息之前，不再自动纠正或换后端会话。',
+  '⚠️ Could not switch to a new backend session, so the step that did not run was not continued.':
+    '⚠️ 没能换新的后端会话，没执行的那一步没有继续。',
+  'Reason: {err}. Send a message to continue.': '原因：{err}。发一条消息就能继续。',
+  'This session is busy, so the backend session was not switched. Try again when it is idle.': '会话正忙，没有换后端会话。等它空下来再试。',
+  // ── 控制入口换后端会话（index.ts controlSessionAccess.newBackend）──
+  '🔀 Switched to a new backend session via the control entry; the context goes along with the next message.':
+    '🔀 经控制入口换了后端会话，上下文随下一条消息带过去。',
+  'New backend session: {id}…. The conversation is unchanged.': '新的后端会话：{id}…。对话记录不变。',
 };

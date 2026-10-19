@@ -32,7 +32,10 @@ describe('主进程：一轮结束时判定', () => {
     assert.match(after, /correctionTurn: isTextToolNudgeId\(userMessageId\)/);
     /* 侧栏改写那一轮（正文要拿去写盘）不管 */
     assert.match(after, /skip: askWaiters\.has\(sessionId\)/);
-    assert.match(after, /handleTextToolCall\(sessionId, textTool\.action/);
+    /* 判定结果和 flush 之前那份正文一起交出去（「这一步是干什么的」要从标记块里取） */
+    assert.match(after, /const textToolBuf = textTool && textTool\.action !== 'none' \? entry\.assistantBuf : '';/);
+    assert.ok(after.indexOf('const textToolBuf') < after.indexOf('flushAssistant(sessionId)'));
+    assert.match(after, /handleTextToolCall\(sessionId, textTool, textToolBuf\)/);
   });
 
   test('开工具调用时记下正文长度；每轮开始清零', () => {
@@ -40,12 +43,14 @@ describe('主进程：一轮结束时判定', () => {
     assert.match(M, /entry\.toolsThisTurn = 0;[^\n]*\n\s*entry\.bufAtLastTool = 0;/);
   });
 
-  test('纠正：走唤醒投递队列（source nudge），原话；停下：会话里一句 ⚠️ + 详情，带 group', () => {
-    const h = slice(M, 'function handleTextToolCall(');
-    assert.match(h, /wakeDispatcher\.enqueue\(\{ sessionId, text: TEXT_TOOL_NUDGE_PROMPT, at: Date\.now\(\), source: 'nudge'/);
+  test('纠正 / 换后端续发：走唤醒投递队列（source nudge），处置由 textToolRecovery 决定；停下：会话里一句 ⚠️ + 详情，带 group', () => {
+    const h = slice(M, 'function handleTextToolCall(', 3000);
+    assert.match(h, /decideTextToolRecovery\(textToolRecovery\.get\(sessionId\)/);
+    assert.match(h, /wakeDispatcher\.enqueue\(\{\s*sessionId, text: d\.prompt, at: Date\.now\(\), source: 'nudge'/);
+    assert.match(h, /\.\.\.\(d\.action === 'swap' \? \{ swap: true \} : \{\}\)/);
     assert.match(h, /noteInSession\(sessionId, trConcat\(/);
     assert.match(h, /NOTE_DETAIL_SEP/);
-    assert.match(h, /'text-tool-call-stop'/);
+    assert.match(h, /'text-tool-call-halt'/);
   });
 
   test('排着的纠正过时（又开了别的一轮）就不发：队列的 isStale 和发送前的 stillWanted 都认', () => {
@@ -60,7 +65,7 @@ describe('主进程：一轮结束时判定', () => {
     const d = slice(M, 'wakeDeliver = async (item) => {', 3000);
     assert.match(d, /\.\.\.\(nudge \? \{ kirolexNote: true \} : \{\}\)/);
     assert.match(d, /bgOutput: item\.source !== 'schedule' && !nudge/);
-    assert.match(d, /nudge \? TEXT_TOOL_NUDGE_ID_PREFIX\.slice\(0, -1\)/);
+    assert.match(d, /nudge \? \(item\.swap \? TEXT_TOOL_SWAP_ID_PREFIX : TEXT_TOOL_NUDGE_ID_PREFIX\)\.slice\(0, -1\)/);
     assert.match(M, /\.\.\.\(display\?\.kirolexNote \? \{ kirolex: true as const \} : \{\}\),/);
     assert.match(M, /'acp:main-turn', \{[^\n]*\.\.\.\(display\?\.kirolexNote \? \{ kirolex: true \} : \{\}\)/);
     const r = read('renderer', 'hooks', 'useAcp.ts');
@@ -68,12 +73,12 @@ describe('主进程：一轮结束时判定', () => {
   });
 
   test('停下的提示有中文，主句 ≤ 40 字左右、开头一个 ⚠️（docs/notices-glossary.md）', () => {
-    const key = '⚠️ The model wrote its tool call as text again, so nothing ran. Auto-correction stopped; consider starting a new backend session.';
+    const key = '⚠️ The model still writes tool calls as text, so automatic handling has stopped until you send your next message.';
     const zh = ZH_MAIN[key];
     assert.ok(zh);
     assert.ok(zh.startsWith('⚠️ '));
     assert.ok(zh.length <= 45, zh);
-    assert.match(zh, /换新的后端会话/);
+    assert.match(zh, /等你发下一条消息/);
   });
 });
 

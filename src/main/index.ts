@@ -43,13 +43,14 @@ import * as loopStore from './loopStore.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, scheduleDeliveryBlocker, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
-import { TEXT_TOOL_NUDGE_PROMPT, TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall } from './textToolCall.ts';
+import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
+import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
 import { callWakeTool, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
-import { shouldConsolidate, buildConsolidationPrompt, mergeSessionMemory, CONSOLIDATE_EVERY } from './sessionMemory.ts';
+import { shouldConsolidate, buildConsolidationPrompt, consolidatedSessionMemory, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
@@ -918,9 +919,11 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
       .map((m: any) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.role === 'assistant' ? foldTextToolCall(m.content || '', m.toolTailFrom) : m.content || '').slice(0, 800)}`)
       .join('\n\n');
     if (!recent.trim()) return;
-    const produced = cleanLiteOutput(await runLiteOneShot(buildConsolidationPrompt(recent, existing), 'session-memory'));
-    const merged = mergeSessionMemory(existing, produced);
-    if (merged && merged !== existing) {
+    const produced = cleanLiteOutput(await runLiteOneShot(buildConsolidationPrompt(recent, stripTextToolCalls(existing)), 'session-memory'));
+    /* 早先压进记忆的文字版调用块（`<invoke …>`）这一次清掉 —— 记忆每一轮都注入，留着就是一轮一轮喂回模型（sessionMemory.ts / textToolCall.ts）。
+       null = 不写：没变化，或者没清理、这次也没产出（别把已有记忆清成空）；清理后为空照样写回 */
+    const merged = consolidatedSessionMemory(existing, produced);
+    if (merged !== null) {
       writeMemory('session', projectId, sessionId, merged);
       logger.info('memory', `session ${sessionId}: consolidated at ${messages.length} messages (${merged.length} chars)`);
     }
@@ -3888,14 +3891,18 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants,
  * 真正发送的那一下（`wakeDeliver`）要用 `sendPromptOnce` / `ensureAttached`，它们在 whenReady 里，到时候再挂上。
  */
 let wakeDeliver: ((item: WakeItem) => Promise<void>) | null = null;
+/** 控制入口 `new-backend` 要先挂上执行器 —— `ensureAttached` 在 whenReady 里，到时候再挂上。 */
+let attachForControl: ((sessionId: string) => Promise<unknown>) | null = null;
 /**
  * 每条会话开过几轮（`sendPromptOnce` 每次新发一条 +1，纠正那一轮不算）。
  * 「把工具调用写成了文字」的纠正排着的时候又开了别的一轮（你自己发了一条、排队的、后台唤醒），
  * 那条纠正就过时了 —— 不发（`textToolNudgeStale`）。
+ * 换后端续做那一条只认 `userTurnStarts`（你自己发的几条）：后台结果 / 定时任务先到先跑一轮不取消它（`textToolWakeStale`）。
  */
 const turnStarts = new Map<string, number>();
+const userTurnStarts = new Map<string, number>();
 function textToolNudgeStale(item: WakeItem): string | null {
-  return String(turnStarts.get(item.sessionId) || 0) === String(item.ref) ? null : 'another turn started';
+  return textToolWakeStale(item, { turns: turnStarts.get(item.sessionId) || 0, userTurns: userTurnStarts.get(item.sessionId) || 0 });
 }
 const wakeDispatcher = new WakeDispatcher({
   /* 等待退出期间也算忙：不开新一轮（同定时任务 / 排队消息） */
@@ -3914,24 +3921,100 @@ const wakeDispatcher = new WakeDispatcher({
 });
 
 /**
- * **模型把工具调用写成了文字就结束了这一轮**（判据见 `textToolCall.ts`）：
- *   · `nudge`：作为新的一条补发纠正（显示为 KiroLex 提示，不算你的消息）—— 走后台唤醒同一条投递队列：
- *     等这一轮真的结束再发；排着的时候开了别的一轮就不发了（`textToolNudgeStale`）；
- *   · `stop`：纠正那一轮还是这样（连续两轮）—— 不再纠正，在会话里说一句。
+ * **换新的后端会话**（同一个执行器进程里 `session/new`）—— EmptyResponse / 连续拒绝、「写成文字」反复发作、
+ * 控制入口的 `new-backend` 共用这一套：新开后端会话、记进记录、清掉「已建立上下文」并标成欠着
+ * （上下文跟着下一条带过去；历史里文字版调用块已折叠成一句，见 `historyLine`）。
+ * KiroLex 的会话 id、transcript 不变；后台任务（bg_run / watch / 定时任务）按 KiroLex 会话 id 记账，不受影响。
  */
-function handleTextToolCall(sessionId: string, action: 'nudge' | 'stop', tools: string[]): void {
-  const names = tools.join(', ') || '?';
-  logger.warn('prompt', `tool call written as text sessionId=${sessionId} action=${action} tools=${names}`);
-  if (action === 'nudge') {
-    void wakeDispatcher.enqueue({ sessionId, text: TEXT_TOOL_NUDGE_PROMPT, at: Date.now(), source: 'nudge', ref: String(turnStarts.get(sessionId) || 0) })
-      .then((r) => { if (!r.ok && !r.skipped) logger.warn('prompt', `text-tool nudge not sent session=${sessionId}: ${r.error}`); });
+async function recreateBackendSession(sessionId: string, entry: SessionEntry, trigger: string): Promise<{ oldId: string; newId: string }> {
+  const oldId = entry.cliSessionId;
+  /* 和 attach 那边同一个来源 —— cwd 不一致的话新会话会落在别的目录上 */
+  const cwd = entry.cwd || sessionCwd(entry.profile, os.homedir());
+  const made = await entry.client.newSession(cwd);
+  entry.cliSessionId = made.sessionId;
+  const rec2 = store.readRecord(sessionId);
+  if (rec2) { rec2.cliSessionId = made.sessionId; store.writeRecord(rec2); }
+  /* 新会话里当然什么都没有 —— 清掉"已建立"，让上下文跟着下一次发送带过去 */
+  clearContextEstablished(sessionId);
+  markContextOwedIfUnverified(sessionId, trigger);
+  /* 换完 id，那条旧对话的失败计数就没意义了 */
+  cliFailStreak.delete(oldId);
+  return { oldId, newId: made.sessionId };
+}
+
+/**
+ * 会话**空着**的时候换后端会话（「写成文字」的自动恢复、控制入口）：换的那一下占住会话（和换模型同一个标记），
+ * 别让同一刻发出的一条新消息落到旧的后端会话上。正在跑一轮 / 重建历史 / 换执行器 / 挂载中 → 抛 `SESSION_BUSY`。
+ */
+async function swapBackendSessionWhenIdle(sessionId: string, trigger: string): Promise<{ oldId: string; newId: string }> {
+  const entry = sessionClients.get(sessionId);
+  if (!entry) throw new Error(tr('Session not connected'));
+  const busy = busyReasonFor(sessionId);
+  if (busy && busy !== 'prime-pending') {
+    throw Object.assign(new Error(tr('This session is busy, so the backend session was not switched. Try again when it is idle.')), { code: SESSION_BUSY });
+  }
+  reconfiguringSessions.add(sessionId);
+  emitSessionBusy(sessionId);
+  try {
+    const r = await recreateBackendSession(sessionId, entry, trigger);
+    /* 新的后端是干净的：「写成文字」的计数从头来 */
+    textToolRecovery.set(sessionId, afterBackendSwap(textToolRecovery.get(sessionId)));
+    logger.warn('prompt', `backend session swapped (${trigger}) sessionId=${sessionId} ${r.oldId} -> ${r.newId}`);
+    return r;
+  } finally {
+    reconfiguringSessions.delete(sessionId);
+    emitSessionBusy(sessionId);
+  }
+}
+
+/** 已经换过后端会话、还没续发出去的那几条（按唤醒项 id）—— 见 `wakeDeliver`。 */
+const textToolSwapDone = new Set<string>();
+/** 每条会话「写成文字」的恢复状态（检测次数、窗口里自动换过几次后端会话、是否停下）—— 判据见 `textToolRecovery.ts`。 */
+const textToolRecovery = new Map<string, TextToolRecoveryState>();
+
+/**
+ * **模型把工具调用写成了文字就结束了这一轮**（判据见 `textToolCall.ts`，怎么处置见 `textToolRecovery.ts`）：
+ *   · `nudge`（第一次）：作为新的一条补发纠正（显示为 KiroLex 提示，不算你的消息）—— 走后台唤醒同一条投递队列：
+ *     等这一轮真的结束再发；排着的时候开了别的一轮就不发了（`textToolNudgeStale`）；
+ *   · `swap`（第二次，含跨轮次）：同一条投递队列，发之前换新的后端会话（`wakeDeliver` 里），再把卡住的那一步发给新后端；
+ *   · `halt`（30 分钟里已经自动换过 SWAP_MAX 次还这样）：会话里一句 ⚠️ + 详情，之后不再自动处理，直到你发下一条消息。
+ */
+function handleTextToolCall(sessionId: string, verdict: { action: TextToolAction; hit?: TextToolCall }, text: string): void {
+  const d = decideTextToolRecovery(textToolRecovery.get(sessionId), { verdict, text, now: Date.now() });
+  textToolRecovery.set(sessionId, d.state);
+  const names = d.tools.join(', ') || '?';
+  logger.warn('prompt', `tool call written as text sessionId=${sessionId} verdict=${verdict.action} action=${d.action} swaps=${d.swapsInWindow} tools=${names}`);
+  if ((d.action === 'nudge' || d.action === 'swap') && d.prompt) {
+    void wakeDispatcher.enqueue({
+      sessionId, text: d.prompt, at: Date.now(), source: 'nudge',
+      /* 纠正按「开过几轮」判过时；换后端续做按「你发过几条」判（见 textToolWakeStale） */
+      ref: String((d.action === 'swap' ? userTurnStarts : turnStarts).get(sessionId) || 0),
+      ...(d.action === 'swap' ? { swap: true } : {}),
+    }).then((r) => {
+      /* 换后端那一条没换成（被你的新消息取代 / 出错）：不记次数，下次再犯直接换 */
+      if (d.action === 'swap' && (!r.ok || r.skipped)) textToolRecovery.set(sessionId, swapAbandoned(textToolRecovery.get(sessionId)));
+      if (r.ok || r.skipped) return;
+      logger.warn('prompt', `text-tool ${d.action} not sent session=${sessionId}: ${r.error}`);
+      /* 换后端会话 / 续发没成：说一句，别让你以为它在继续 */
+      if (d.action === 'swap') {
+        noteInSession(sessionId, trConcat(
+          tr('⚠️ Could not switch to a new backend session, so the step that did not run was not continued.'),
+          NOTE_DETAIL_SEP,
+          tr('Reason: {err}. Send a message to continue.', { err: String(r.error || '').slice(0, 160) })),
+        undefined, 'text-tool-call-swap-failed');
+      }
+    });
     return;
   }
-  noteInSession(sessionId, trConcat(
-    tr('⚠️ The model wrote its tool call as text again, so nothing ran. Auto-correction stopped; consider starting a new backend session.'),
-    NOTE_DETAIL_SEP,
-    tr('Two turns in a row ended with a tool call written as text ({tools}) instead of actually calling it; it was corrected once automatically. In rebuilt history these blocks are folded into one line and are not fed back to the model. Starting a new session gives the model a clean backend session.', { tools: names })),
-  undefined, 'text-tool-call-stop');
+  if (d.action === 'halt') {
+    noteInSession(sessionId, trConcat(
+      tr('⚠️ The model still writes tool calls as text, so automatic handling has stopped until you send your next message.'),
+      NOTE_DETAIL_SEP,
+      tr('Within {window} minutes it already switched to a new backend session {n} time(s) automatically (limit {max}); the last tool it tried to call: {tools}. Until you send the next message, it will not correct or switch automatically.', {
+        window: Math.round(SWAP_WINDOW_MS / 60_000), n: d.swapsInWindow, max: SWAP_MAX, tools: names,
+      })),
+    undefined, 'text-tool-call-halt');
+  }
 }
 
 const bgJobs = new BgJobManager({
@@ -6880,6 +6963,7 @@ app.whenReady().then(async () => {
     if (attempt === 0) await pendingSwitchRunner.settle(sessionId);
     /* 开过几轮（纠正那一轮不算）—— 排着的「写成文字」纠正据此判过时，见 `textToolNudgeStale` */
     if (attempt === 0 && !isTextToolNudgeId(display?.messageId)) turnStarts.set(sessionId, (turnStarts.get(sessionId) || 0) + 1);
+    if (attempt === 0 && isUserTurnMessageId(display?.messageId)) userTurnStarts.set(sessionId, (userTurnStarts.get(sessionId) || 0) + 1);
     /*
       两轮之间（循环 / 排队）会话不忙，那时候选的切换是立即做的；下一轮恰好在换执行器途中发出来的话，
       entry 还不在 —— 等这次切换落定再发，别报「Session not connected」把循环打断。
@@ -6896,6 +6980,10 @@ app.whenReady().then(async () => {
       throw new Error(refuseAdvancedProject(projectId, 'prompt') || tr('This project belongs to KiroLex Advanced; the standard edition does not modify it.'));
     }
     logger.info('prompt', `received sessionId=${sessionId} cli=${entry.cliSessionId} busy=${entry.busy}`);
+    /* 你自己发的一条（输入框 / 排队 / 控制入口）：「写成文字」到了上限停下的状态解除（textToolRecovery.ts） */
+    if (attempt === 0 && isUserTurnMessageId(display?.messageId) && textToolRecovery.has(sessionId)) {
+      textToolRecovery.set(sessionId, afterUserMessage(textToolRecovery.get(sessionId)));
+    }
     /*
       **你自己写的那段文字** —— 摆渡只看它，别看注入进去的东西（`userPromptText`）。
 
@@ -7418,9 +7506,11 @@ app.whenReady().then(async () => {
               correctionTurn: isTextToolNudgeId(userMessageId),
               skip: askWaiters.has(sessionId) || userMessageId.startsWith('flow_clear_'),
             });
+            /* 标记块的下标是相对这份缓冲的 —— flush 会清空它，先留一份给「这一步是干什么的」用 */
+            const textToolBuf = textTool && textTool.action !== 'none' ? entry.assistantBuf : '';
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             if (askReply) settleAsk(sessionId, askReply);
-            if (textTool && textTool.action !== 'none') handleTextToolCall(sessionId, textTool.action, textTool.hit?.tools || []);
+            if (textTool && textTool.action !== 'none') handleTextToolCall(sessionId, textTool, textToolBuf);
             // The request was accepted and answered, so the snapshot it carried IS
             // in this backend now: the claim written before the send is confirmed.
             // Re-marked against the CURRENT entry rather than just clearing the
@@ -7726,18 +7816,10 @@ app.whenReady().then(async () => {
       if (verdict === 'recreate') {
         let made: { sessionId: string } | null = null;
         try {
-          const oldId = entry.cliSessionId;
-          /* 和 attach 那边同一个来源 —— cwd 不一致的话新会话会落在别的目录上 */
-          const cwd = entry.cwd || sessionCwd(entry.profile, os.homedir());
-          made = await entry.client.newSession(cwd);
-          entry.cliSessionId = made.sessionId;
-          const rec2 = store.readRecord(sessionId);
-          if (rec2) { rec2.cliSessionId = made.sessionId; store.writeRecord(rec2); }
-          /* 新会话里当然什么都没有 —— 清掉"已建立"，让上下文跟着这一次重发带过去 */
-          clearContextEstablished(sessionId);
-          markContextOwedIfUnverified(sessionId, 'stale-session-recreate');
-          /* 换完 id，那条旧对话的失败计数就没意义了 */
-          cliFailStreak.delete(oldId);
+          /* 换新的后端会话：和「写成文字」反复发作、控制入口 new-backend 同一套（`recreateBackendSession`），上下文跟着这一次重发带过去 */
+          const swapped = await recreateBackendSession(sessionId, entry, 'stale-session-recreate');
+          const oldId = swapped.oldId;
+          made = { sessionId: swapped.newId };
           cliRecreatedAt.set(sessionId, Date.now());
           const poisoned = streak >= POISONED_AFTER;
           /* 主句：发生了什么（简短原因）；pid / 新的后端会话 id / 推理折进详情（docs/notices-glossary.md） */
@@ -8216,6 +8298,7 @@ app.whenReady().then(async () => {
     唤醒真正发出去的那一下：挂回执行器（被回收了也照样发）→ `sendPromptOnce`，`announce` 让界面插进这条消息、接管这一轮的流。
     删掉 / 归档的会话不发（同 `acp:prompt` 的守卫）。
   */
+  attachForControl = (sid) => ensureAttached(sid);
   wakeDeliver = async (item) => {
     const sid = item.sessionId;
     if (deletedSessionIds.has(sid)) throw new Error(tr('This session has been deleted. Nothing more will be sent to it.'));
@@ -8231,15 +8314,28 @@ app.whenReady().then(async () => {
     /* 后台输出要进会话了：先记下来，之后这条会话的故障诊断包都不抄会话内容 */
     const nudge = item.source === 'nudge';   // 「写成文字」的纠正（handleTextToolCall）：不是后台输出，显示成 KiroLex 提示
     if (item.source !== 'schedule' && !nudge) markBgOutputSeen(sid);
-    const prefix = item.source === 'schedule' ? `sched_${item.ref}` : nudge ? TEXT_TOOL_NUDGE_ID_PREFIX.slice(0, -1) : `wake_${item.ref || item.source}`;
+    /*
+      **反复写成文字 → 先换新的后端会话，再续发那一步**（textToolRecovery.ts）—— 和 EmptyResponse 同一套换法，
+      上下文跟着下面这条带过去（历史里那段已折叠）。后台任务 / 定时任务按 KiroLex 会话 id 投递，不受影响。
+    */
+    if (nudge && item.swap && !textToolSwapDone.has(item.id)) {
+      await swapBackendSessionWhenIdle(sid, 'text-tool-call');
+      /* 真的换成了才记一次（30 分钟上限按实际换成的算） */
+      textToolRecovery.set(sid, recordAutoSwap(textToolRecovery.get(sid), Date.now()));
+      /* 换完、发的那一下撞上忙被放回队头：下次只续发，不再换一次 */
+      textToolSwapDone.add(item.id);
+    }
+    const prefix = item.source === 'schedule' ? `sched_${item.ref}` : nudge ? (item.swap ? TEXT_TOOL_SWAP_ID_PREFIX : TEXT_TOOL_NUDGE_ID_PREFIX).slice(0, -1) : `wake_${item.ref || item.source}`;
     await sendPromptOnce(sid, [{ type: 'text', text: item.text }], undefined, {
       messageId: `${prefix}_${Date.now()}`,
-      displayText: item.text,
+      /* 换后端那一条在会话里带 🔀（只给你看；发给模型的是原话） */
+      displayText: nudge && item.swap ? `🔀 ${item.text}` : item.text,
       announce: true,
       bgOutput: item.source !== 'schedule' && !nudge,
       ...(nudge ? { kirolexNote: true } : {}),
       stillWanted,
-    }).catch((err) => {
+    }).then(() => { textToolSwapDone.delete(item.id); }, (err) => {
+      if (!isWakeBusyError(err, quitPending || !!busyReasonFor(sid))) textToolSwapDone.delete(item.id);
       /* 同 acp:prompt 那层兜底：没发出去就把随行快照的标记收回，下一条照常带上历史 */
       const e = sessionClients.get(sid);
       if (e?.rideAlongUnconfirmed) { e.rideAlongUnconfirmed = false; clearContextEstablished(sid); }
@@ -13516,6 +13612,36 @@ const controlSessionAccess: ControlSessionAccess = {
       });
       wc.send('control:send', { reqId, sessionId: id, text, mode });
     });
+  },
+  /*
+    **经控制入口换新的后端会话** —— 本机工具发现会话卡住（比如反复把工具调用写成文字）时不用叫你去点。
+    和 EmptyResponse / 「写成文字」反复发作同一套（`recreateBackendSession`），上下文跟着下一条带过去；
+    这一轮还在跑就不换（409），没挂执行器先挂上。会话里说一句「经控制入口换了后端会话」。
+  */
+  newBackend: async (id) => {
+    const rec = controlVisibleRecord(id);
+    if (!rec) return { ok: false, status: 404, error: 'not-found' };
+    if (rec.archived) return { ok: false, status: 409, error: 'archived' };
+    const busy = busyReasonFor(id);
+    if (busy && busy !== 'prime-pending') return { ok: false, status: 409, error: 'busy' };
+    if (!sessionClients.get(id)) {
+      if (!attachForControl) return { ok: false, status: 503, error: 'not-ready' };
+      try { await attachForControl(id); } catch { /* 下面按「没连上」回 */ }
+      if (!sessionClients.get(id)) return { ok: false, status: 502, error: 'not-connected' };
+    }
+    try {
+      const r = await swapBackendSessionWhenIdle(id, 'control-new-backend');
+      noteInSession(id, trConcat(
+        tr('🔀 Switched to a new backend session via the control entry; the context goes along with the next message.'),
+        NOTE_DETAIL_SEP,
+        tr('New backend session: {id}…. The conversation is unchanged.', { id: r.newId.slice(0, 8) })),
+      undefined, 'backend-session-swap:control');
+      return { ok: true, backendSessionId: r.newId };
+    } catch (err: any) {
+      if (err?.code === SESSION_BUSY) return { ok: false, status: 409, error: 'busy' };
+      logger.warn('control', `new-backend failed session=${id}: ${err?.message || err}`);
+      return { ok: false, status: 502, error: 'swap-failed' };
+    }
   },
 };
 app.whenReady().then(async () => {

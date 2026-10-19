@@ -23,6 +23,8 @@ export interface WakeItem {
   source: 'schedule' | 'bg' | 'watch' | 'nudge';
   /** 定时任务的 id（`source = 'schedule'`）—— 发送时拿它当消息 id 的一部分。 */
   ref?: string;
+  /** `nudge` 才有：发之前先换新的后端会话（「写成文字」反复发作，见 index.ts `handleTextToolCall` / textToolRecovery.ts）。 */
+  swap?: boolean;
 }
 
 /**

@@ -77,9 +77,14 @@ describe('接线', () => {
     const at = MAIN.indexOf("if (verdict === 'recreate')");
     assert.ok(at > 0);
     const body = MAIN.slice(at, at + 1500);
-    assert.match(body, /clearContextEstablished\(sessionId\)/);
-    assert.match(body, /markContextOwedIfUnverified\(sessionId, 'stale-session-recreate'\)/);
-    assert.match(body, /rec2\.cliSessionId = made\.sessionId/, '新 id 要落盘，否则重启又回到旧的');
+    /* 换后端会话那几步抽成了 recreateBackendSession（「写成文字」反复发作、控制入口 new-backend 共用同一套） */
+    assert.match(body, /recreateBackendSession\(sessionId, entry, 'stale-session-recreate'\)/);
+    const h = MAIN.indexOf('async function recreateBackendSession(');
+    assert.ok(h > 0);
+    const helper = MAIN.slice(h, h + 1500);
+    assert.match(helper, /clearContextEstablished\(sessionId\)/);
+    assert.match(helper, /markContextOwedIfUnverified\(sessionId, trigger\)/);
+    assert.match(helper, /rec2\.cliSessionId = made\.sessionId/, '新 id 要落盘，否则重启又回到旧的');
   });
 
   test('重试次数用参数传下去（计数），而不是靠外面的循环', () => {
