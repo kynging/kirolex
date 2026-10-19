@@ -338,8 +338,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('bg:changed', handler);
     return () => ipcRenderer.removeListener('bg:changed', handler);
   },
-  /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件）：插进这条用户消息，接管这一轮的流。 */
-  onMainTurn: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number }) => void) => {
+  /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件 / 「写成文字」的纠正）：插进这条消息，接管这一轮的流。`kirolex` = 显示成 KiroLex 提示。 */
+  onMainTurn: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true }) => void) => {
     const handler = (_e: any, data: any) => cb(data);
     ipcRenderer.on('acp:main-turn', handler);
     return () => ipcRenderer.removeListener('acp:main-turn', handler);
@@ -757,7 +757,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   peekTurn: (sessionId: string): Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }> =>
     ipcRenderer.invoke('acp:peek-turn', sessionId),
   /** Authoritative full assistant text at turn end (heals dropped chunks). */
-  onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string }) => void) => {
+  onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:assistant-final', handler);
     return () => ipcRenderer.removeListener('acp:assistant-final', handler);

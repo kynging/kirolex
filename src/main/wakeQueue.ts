@@ -19,7 +19,8 @@ export interface WakeItem {
   text: string;
   /** 什么时候该发（到点时间 / 事件发生时间，epoch ms）—— 同一会话里按它排序。 */
   at: number;
-  source: 'schedule' | 'bg' | 'watch';
+  /** `nudge`：「把工具调用写成了文字」的那一次纠正（index.ts `handleTextToolCall`，判据见 textToolCall.ts）。 */
+  source: 'schedule' | 'bg' | 'watch' | 'nudge';
   /** 定时任务的 id（`source = 'schedule'`）—— 发送时拿它当消息 id 的一部分。 */
   ref?: string;
 }

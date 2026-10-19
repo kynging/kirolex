@@ -27,4 +27,9 @@ export const ZH_WAKE: Record<string, string> = {
   '🔔 Background command "{label}" finished: exit code {code}, ran {dur} ({id})': '🔔 后台命令「{label}」已结束：退出码 {code}，用时 {dur}（{id}）',
   '⚠️ KiroLex restarted, so background task "{label}" ({id}) was interrupted and is no longer running':
     '⚠️ KiroLex 重启，后台任务「{label}」（{id}）已中断，不再运行',
+  // ── 工具调用写成了文字（index.ts handleTextToolCall，textToolCall.ts）──
+  '⚠️ The model wrote its tool call as text again, so nothing ran. Auto-correction stopped; consider starting a new backend session.':
+    '⚠️ 模型又把工具调用写成了文字，没有执行。已停止自动纠正，建议换新的后端会话。',
+  'Two turns in a row ended with a tool call written as text ({tools}) instead of actually calling it; it was corrected once automatically. In rebuilt history these blocks are folded into one line and are not fed back to the model. Starting a new session gives the model a clean backend session.':
+    '连续两轮都以文字版的工具调用（{tools}）结束、没有真的调用，已自动纠正过一次。重建历史时这类块会折叠成一句说明，不会原样喂回模型。新开一条会话，模型就从干净的后端会话开始。',
 };

@@ -55,6 +55,9 @@ export interface StoredMessage {
   steerParts?: { id: string; content: string; ts: number }[];
   /** File-changing tool calls produced during this assistant turn. */
   toolCalls?: StoredToolCall[];
+  /** 助手消息：这一轮最后一次**真实**工具调用开始时正文的长度。判「把工具调用写成了文字」只看这之后（`textToolCall.ts`），
+   *  一轮结束时的判定、界面折叠、历史折叠用同一个口径。没调过工具就没有。 */
+  toolTailFrom?: number;
   /** Files/images the user attached to THIS message. Persisted so the chips
    *  survive a restart AND so history priming can re-point a fresh backend at
    *  them (otherwise an image sent earlier is forgotten entirely). */

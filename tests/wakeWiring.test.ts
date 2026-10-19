@@ -151,7 +151,9 @@ describe('审查跟进 2：挂执行器期间被取消、会话收到过后台�
   });
   test('后台输出进会话前记 bgOutputSeen；之后任何一轮的诊断包都按它去掉会话内容', () => {
     const d = fnBody(MAIN, 'wakeDeliver = async (item) => {', 2000);
-    assert.match(d, /if \(item\.source !== 'schedule'\) markBgOutputSeen\(sid\);/);
+    /* 「写成文字」的纠正（source nudge）不是后台输出，不打这个标记 */
+    assert.match(d, /const nudge = item\.source === 'nudge';/);
+    assert.match(d, /if \(item\.source !== 'schedule' && !nudge\) markBgOutputSeen\(sid\);/);
     assert.match(fnBody(MAIN, 'function markBgOutputSeen(', 300), /store\.patchRecord\(sessionId, \{ bgOutputSeen: true \}\)/);
     /* bg_status 把输出交给模型那条路也打同一个标记 */
     assert.match(MAIN, /markOutputSeen: \(sessionId\) => markBgOutputSeen\(sessionId\)/);

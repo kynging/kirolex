@@ -277,4 +277,7 @@ export const ZH_CHAT: Record<string, string> = {
   "Failed to switch model": "切换模型失败",
   "Failed to change tool permission mode": "切换工具权限模式失败",
   "🌐 Browser actions": "🌐 浏览器操作",
+  // 回复里把工具调用写成了文字（main/textToolCall.ts）
+  "⚠️ Tool call written as text, not executed: {tools}": "⚠️ 工具调用被写成了文字，未执行：{tools}",
+  "⚠️ Tool call written as text, not executed": "⚠️ 工具调用被写成了文字，未执行",
 };

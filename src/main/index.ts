@@ -43,6 +43,7 @@ import * as loopStore from './loopStore.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, scheduleDeliveryBlocker, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
+import { TEXT_TOOL_NUDGE_PROMPT, TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall } from './textToolCall.ts';
 import { BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
 import { callWakeTool, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
@@ -197,6 +198,8 @@ interface SessionEntry {
    * 重发一次就是再执行一遍。所以单独数，每轮开始清零，`tool_call`（不含 update）时 +1。
    */
   toolsThisTurn?: number;
+  /** 这一轮最后一次开工具调用那一刻 `assistantBuf` 的长度 —— 判「把工具调用写成了文字」只看这之后的正文（`textToolCall.ts`）。 */
+  bufAtLastTool?: number;
   /**
    * **这一轮有没有工具可能写过文件**（只远程会话用）。
    *
@@ -912,7 +915,7 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
         之后每一轮模型都会读到它，一句临时通知就变成了长期上下文。判据见 `kirolexNote`。
       */
       .filter(modelFacing)
-      .map((m: any) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.content || '').slice(0, 800)}`)
+      .map((m: any) => `${m.role === 'assistant' ? 'Assistant' : 'User'}: ${String(m.role === 'assistant' ? foldTextToolCall(m.content || '', m.toolTailFrom) : m.content || '').slice(0, 800)}`)
       .join('\n\n');
     if (!recent.trim()) return;
     const produced = cleanLiteOutput(await runLiteOneShot(buildConsolidationPrompt(recent, existing), 'session-memory'));
@@ -1129,6 +1132,7 @@ function historyLine(m: {
   content: string;
   attachments?: { name: string; path: string }[];
   toolCalls?: { title?: string; kind?: string; status?: string; locations?: string[] }[];
+  toolTailFrom?: number;
 }, forExecutor: (p: string) => string = (p) => p): string {
   const who = m.role === 'user' ? 'User' : 'Assistant';
   // Every historical attachment is re-emitted here on EVERY turn, so an oversized
@@ -1164,7 +1168,9 @@ function historyLine(m: {
   // the model happily re-reads them, so an oversized original kept coming back on
   // every turn even though the attachment refs were already capped. Prose paths get
   // the same treatment for the same reason. See capImagePathsInText.
-  return capImagePathsInText(`${who}: ${m.content}${actions}${tail}`);
+  /* 助手把工具调用写成了文字（没执行）的那段折叠成一句说明 —— 原样喂回去，模型会越学越像（textToolCall.ts） */
+  const body = m.role === 'user' ? m.content : foldTextToolCall(m.content, m.toolTailFrom);
+  return capImagePathsInText(`${who}: ${body}${actions}${tail}`);
 }
 
 /** One rebuild prompt carries at most this many characters. A whole 100k+ char
@@ -3882,6 +3888,15 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants,
  * 真正发送的那一下（`wakeDeliver`）要用 `sendPromptOnce` / `ensureAttached`，它们在 whenReady 里，到时候再挂上。
  */
 let wakeDeliver: ((item: WakeItem) => Promise<void>) | null = null;
+/**
+ * 每条会话开过几轮（`sendPromptOnce` 每次新发一条 +1，纠正那一轮不算）。
+ * 「把工具调用写成了文字」的纠正排着的时候又开了别的一轮（你自己发了一条、排队的、后台唤醒），
+ * 那条纠正就过时了 —— 不发（`textToolNudgeStale`）。
+ */
+const turnStarts = new Map<string, number>();
+function textToolNudgeStale(item: WakeItem): string | null {
+  return String(turnStarts.get(item.sessionId) || 0) === String(item.ref) ? null : 'another turn started';
+}
 const wakeDispatcher = new WakeDispatcher({
   /* 等待退出期间也算忙：不开新一轮（同定时任务 / 排队消息） */
   isBusy: (sid) => quitPending || !!busyReasonFor(sid),
@@ -3892,11 +3907,32 @@ const wakeDispatcher = new WakeDispatcher({
   /* 定时任务那一次排着的时候被删 / 暂停 / 过期了就不发（盘上的状态为准，见 `scheduleDeliveryBlocker`） */
   isStale: (item) => (item.source === 'schedule' && item.ref
     ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now())
-    : null),
+    : item.source === 'nudge' ? textToolNudgeStale(item) : null),
   /* 不看报错文字（tr() 出来的，中文界面下是中文）：看错误码，或者此刻会话是不是真的在忙 */
   isBusyError: (err, item) => isWakeBusyError(err, quitPending || !!busyReasonFor(item.sessionId)),
   log: (m) => logger.info('wake', m),
 });
+
+/**
+ * **模型把工具调用写成了文字就结束了这一轮**（判据见 `textToolCall.ts`）：
+ *   · `nudge`：作为新的一条补发纠正（显示为 KiroLex 提示，不算你的消息）—— 走后台唤醒同一条投递队列：
+ *     等这一轮真的结束再发；排着的时候开了别的一轮就不发了（`textToolNudgeStale`）；
+ *   · `stop`：纠正那一轮还是这样（连续两轮）—— 不再纠正，在会话里说一句。
+ */
+function handleTextToolCall(sessionId: string, action: 'nudge' | 'stop', tools: string[]): void {
+  const names = tools.join(', ') || '?';
+  logger.warn('prompt', `tool call written as text sessionId=${sessionId} action=${action} tools=${names}`);
+  if (action === 'nudge') {
+    void wakeDispatcher.enqueue({ sessionId, text: TEXT_TOOL_NUDGE_PROMPT, at: Date.now(), source: 'nudge', ref: String(turnStarts.get(sessionId) || 0) })
+      .then((r) => { if (!r.ok && !r.skipped) logger.warn('prompt', `text-tool nudge not sent session=${sessionId}: ${r.error}`); });
+    return;
+  }
+  noteInSession(sessionId, trConcat(
+    tr('⚠️ The model wrote its tool call as text again, so nothing ran. Auto-correction stopped; consider starting a new backend session.'),
+    NOTE_DETAIL_SEP,
+    tr('Two turns in a row ended with a tool call written as text ({tools}) instead of actually calling it; it was corrected once automatically. In rebuilt history these blocks are folded into one line and are not fed back to the model. Starting a new session gives the model a clean backend session.', { tools: names })),
+  undefined, 'text-tool-call-stop');
+}
 
 const bgJobs = new BgJobManager({
   wake: (sessionId, text, job) => {
@@ -4951,6 +4987,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
         /* 只数新开的调用（不数 update）—— 这是"这一轮动过东西没有"的依据，见 `toolsThisTurn`。 */
         if (u?.sessionUpdate === 'tool_call') entry.toolsThisTurn = (entry.toolsThisTurn || 0) + 1;
+        /* 这之前的文字就算带着调用标记，后面也真调了工具 —— 判「写成文字没执行」只看这之后（见 textToolCall.ts） */
+        if (u?.sessionUpdate === 'tool_call') entry.bufAtLastTool = entry.assistantBuf.length;
         /*
           远程会话：这一步可能在远端写了文件 —— 防抖拉一次（不等它）。这是让 gate / file review
           在一轮**进行中**就看得到改动的那一半；只在一轮结束时拉的话，界面会一直显示上一版。
@@ -5193,6 +5231,8 @@ function flushAssistant(sessionId: string) {
     content: finalText,
     ts: Date.now(),
     ...(entry.fileChanges.length > 0 ? { toolCalls: entry.fileChanges } : {}),
+    /* 最后一次真实工具调用的位置：界面 / 历史判「写成文字没执行」只看这之后（和一轮结束时的判定同一个口径，见 textToolCall.ts） */
+    ...(entry.bufAtLastTool ? { toolTailFrom: entry.bufAtLastTool } : {}),
   });
   // Keep the rendered history.md in step with the conversation, so the path the
   // backend was given never points at a frozen snapshot of an older turn.
@@ -5207,6 +5247,8 @@ function flushAssistant(sessionId: string) {
       sessionId,
       messageId: finalId,
       text: finalText,
+      /* 界面也要知道最后一次真实工具调用在正文的哪里（判「写成文字没执行」，和上面落盘的同一个值） */
+      ...(entry.bufAtLastTool ? { toolTailFrom: entry.bufAtLastTool } : {}),
     });
   }
   entry.assistantBuf = '';
@@ -6830,12 +6872,14 @@ app.whenReady().then(async () => {
 
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
-  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null }, _model?: string, attempt = 0): Promise<any> {
+  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean }, _model?: string, attempt = 0): Promise<any> {
     /*
       **忙时记下的切换先应用，再发这一条** —— 新消息要用新的 agent / 模型；不先切的话一轮接一轮
       （排队消息、定时任务）会一直抢在前面，切换永远排不上。自动重发（attempt > 0）是同一轮，不切。
     */
     if (attempt === 0) await pendingSwitchRunner.settle(sessionId);
+    /* 开过几轮（纠正那一轮不算）—— 排着的「写成文字」纠正据此判过时，见 `textToolNudgeStale` */
+    if (attempt === 0 && !isTextToolNudgeId(display?.messageId)) turnStarts.set(sessionId, (turnStarts.get(sessionId) || 0) + 1);
     /*
       两轮之间（循环 / 排队）会话不忙，那时候选的切换是立即做的；下一轮恰好在换执行器途中发出来的话，
       entry 还不在 —— 等这次切换落定再发，别报「Session not connected」把循环打断。
@@ -7045,6 +7089,8 @@ app.whenReady().then(async () => {
         role: 'user',
         content: display?.displayText ?? promptText,
         ts: Date.now(),
+        /* KiroLex 自己补发的（「写成文字」的纠正）：显示成 KiroLex 提示，不算你的消息，也不进喂给模型的历史 */
+        ...(display?.kirolexNote ? { kirolex: true as const } : {}),
         ...(display?.mergeIntoMessageId ? { mergeIntoMessageId: display.mergeIntoMessageId } : {}),
         // 经控制入口发出的（id 带标记，见 controlSessions.isControlMessageId）：对话记录里显式记一笔
         ...(isControlMessageId(userMessageId) ? { via: 'control' as const } : {}),
@@ -7072,7 +7118,7 @@ app.whenReady().then(async () => {
         用户消息只在盘上、回复不流式，切走再回来才看得见。告诉渲染端：插进这条消息，并接管这一轮的流。
       */
       if (display?.announce) {
-        mainWindow?.webContents.send('acp:main-turn', { sessionId, messageId: userMessageId, content: display?.displayText ?? promptText, ts: Date.now() });
+        mainWindow?.webContents.send('acp:main-turn', { sessionId, messageId: userMessageId, content: display?.displayText ?? promptText, ts: Date.now(), ...(display?.kirolexNote ? { kirolex: true } : {}) });
       }
     } catch {}
     // Inject layered memory (global ⊕ project ⊕ this chat) on EVERY turn.
@@ -7197,6 +7243,7 @@ app.whenReady().then(async () => {
           // forever: a turn killed mid-tool never sends the closing update.
           entry.openToolCalls?.clear();
           entry.toolsThisTurn = 0;       // 这一轮的工具计数从零开始（自动重试的安全闸）
+          entry.bufAtLastTool = 0;
           entry.localActionsThisTurn = 0;      // 「在你机器上打开」的额度按轮给（见 localAction.ts）
           entry.localLineBuf = '';             // 上一轮的半行不能拼到这一轮的第一行上
           entry.maxToolOutputThisTurn = 0;
@@ -7360,8 +7407,20 @@ app.whenReady().then(async () => {
               stopReason: String(result?.stopReason ?? 'n/a'),
               wedged: !!entry.wedgeNote,
             };
+            /*
+              **把工具调用写成了文字就结束了**（`textToolCall.ts`）—— 在 flush 清空缓冲之前判，只看最后一次真实工具调用之后的正文。
+              侧栏改写那一轮（有人在等完整回复，正文要拿去写盘）和 /clear 那一下不管。
+            */
+            const textTool = entry.priming ? null : textToolCallVerdict({
+              stopReason: String(result?.stopReason ?? ''),
+              text: entry.assistantBuf,
+              tailFrom: entry.bufAtLastTool || 0,
+              correctionTurn: isTextToolNudgeId(userMessageId),
+              skip: askWaiters.has(sessionId) || userMessageId.startsWith('flow_clear_'),
+            });
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             if (askReply) settleAsk(sessionId, askReply);
+            if (textTool && textTool.action !== 'none') handleTextToolCall(sessionId, textTool.action, textTool.hit?.tools || []);
             // The request was accepted and answered, so the snapshot it carried IS
             // in this backend now: the claim written before the send is confirmed.
             // Re-marked against the CURRENT entry rather than just clearing the
@@ -8167,16 +8226,18 @@ app.whenReady().then(async () => {
     /* 挂执行器那段时间里任务可能已经被暂停 / 删除：再看一次（sendPromptOnce 里提交之前还会再看一次） */
     const stillWanted = () => (item.source === 'schedule' && item.ref
       ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now())
-      : null);
+      : item.source === 'nudge' ? textToolNudgeStale(item) : null);
     { const blocked = stillWanted(); if (blocked) throw new WakeSkipped(blocked); }
     /* 后台输出要进会话了：先记下来，之后这条会话的故障诊断包都不抄会话内容 */
-    if (item.source !== 'schedule') markBgOutputSeen(sid);
-    const prefix = item.source === 'schedule' ? `sched_${item.ref}` : `wake_${item.ref || item.source}`;
+    const nudge = item.source === 'nudge';   // 「写成文字」的纠正（handleTextToolCall）：不是后台输出，显示成 KiroLex 提示
+    if (item.source !== 'schedule' && !nudge) markBgOutputSeen(sid);
+    const prefix = item.source === 'schedule' ? `sched_${item.ref}` : nudge ? TEXT_TOOL_NUDGE_ID_PREFIX.slice(0, -1) : `wake_${item.ref || item.source}`;
     await sendPromptOnce(sid, [{ type: 'text', text: item.text }], undefined, {
       messageId: `${prefix}_${Date.now()}`,
       displayText: item.text,
       announce: true,
-      bgOutput: item.source !== 'schedule',
+      bgOutput: item.source !== 'schedule' && !nudge,
+      ...(nudge ? { kirolexNote: true } : {}),
       stillWanted,
     }).catch((err) => {
       /* 同 acp:prompt 那层兜底：没发出去就把随行快照的标记收回，下一条照常带上历史 */

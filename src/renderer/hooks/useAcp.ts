@@ -45,6 +45,7 @@ import { withLiveNote } from '../noticeMerge.ts';
 import { firstUserText } from '../titleSource.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { chatHistoryBody } from '../historyBlock.ts';
+import { mergeAssistantFinal } from '../assistantFinal.ts';
 import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 
@@ -340,6 +341,7 @@ function toStoredTranscript(messages: Message[]) {
       ...((m as any).pastes?.length ? { pastes: (m as any).pastes } : {}),
       ...(m.kirolex ? { kirolex: true as const } : {}),
       ...(m.noteGroup ? { noteGroup: m.noteGroup } : {}),
+      ...(typeof m.toolTailFrom === 'number' ? { toolTailFrom: m.toolTailFrom } : {}),
       ...(m.variants ? { variants: m.variants } : {}),
       ...(m.steerParts ? { steerParts: m.steerParts } : {}),
       // 经控制入口发的（id 带标记）：整份重写时显式来源照样写回去
@@ -1698,6 +1700,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           pastes: (m as any).pastes,
           ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+            ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
           timestamp: m.ts,
@@ -1728,6 +1731,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+            ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           }));
           const msgsWithFailed = withFailed(sid, msgs);
@@ -2608,12 +2612,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
      * 回复的流被挡在门外（只进缓存），切走再回来才看得见。所以：按 id 去重插进这条消息，再像「接回」那样
      * 接管这一轮的流 —— 结束信号是主进程的 busy 不再是 'turn'（见上面 `adoptedTurnsRef` 那段）。
      */
-    const removeMainTurn = window.kiroApi.onMainTurn?.(({ sessionId: sid, messageId, content, ts }) => {
+    const removeMainTurn = window.kiroApi.onMainTurn?.(({ sessionId: sid, messageId, content, ts, kirolex }) => {
       if (!sid || !messageId) return;
       const add = (list: Message[]): Message[] => (
         list.some((m) => m.id === messageId)
           ? list
-          : [...list, { id: messageId, role: 'user' as const, content: String(content || ''), timestamp: Number(ts) || Date.now() }]
+          /* `kirolex`：KiroLex 自己补发的（「写成文字」的纠正）—— 画成 KiroLex 提示，不画成你的气泡 */
+          : [...list, { id: messageId, role: 'user' as const, content: String(content || ''), timestamp: Number(ts) || Date.now(), ...(kirolex ? { kirolex: true as const } : {}) }]
       );
       if (sid === currentSessionRef.current) setMessages((prev) => add(prev));
       const cached = messagesCacheRef.current.get(sid);
@@ -2624,7 +2629,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     });
 
-    const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text }) => {
+    const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text, toolTailFrom }) => {
       if (!sid || !text) return;
       const patch = (list: Message[]): Message[] => {
         // Prefer the id main used; fall back to the last assistant message.
@@ -2635,13 +2640,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           }
         }
         if (idx < 0) return list;
-        if (list[idx].content === text) return list;
-        if (text.length < list[idx].content.length) return list; // never shrink
-        console.warn('[kirolex] healed truncated assistant message', {
-          sid, rendered: list[idx].content.length, authoritative: text.length,
-        });
+        /* 正文只增不减（never shrink）；toolTailFrom 正文一样也要更新（见 assistantFinal.ts） */
+        const merged = mergeAssistantFinal(list[idx], text, toolTailFrom);
+        if (!merged) return list;
+        if (merged.content !== list[idx].content) {
+          console.warn('[kirolex] healed truncated assistant message', {
+            sid, rendered: list[idx].content.length, authoritative: text.length,
+          });
+        }
         const next = [...list];
-        next[idx] = { ...next[idx], content: text };
+        next[idx] = { ...next[idx], ...merged };
         return next;
       };
       const cached = messagesCacheRef.current.get(sid);
@@ -3106,6 +3114,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             pastes: m.pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+            ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             timestamp: m.ts,
@@ -3229,6 +3238,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             pastes: (m as any).pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+            ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             timestamp: m.ts,
@@ -3338,6 +3348,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             pastes: (m as any).pastes,
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+            ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             timestamp: m.ts,

@@ -1842,6 +1842,12 @@ button, input, select, textarea {
 .notice-detail > summary::before { content: '▸ '; }
 .notice-detail[open] > summary::before { content: '▾ '; }
 .notice-detail-body { margin-top: 3px; color: var(--text-tertiary); white-space: pre-wrap; overflow-wrap: anywhere; }
+/* 回复里把工具调用写成了文字（没执行）：标记块默认折叠，标「未执行」（ChatArea AssistantBody） */
+.text-tool-call { margin: 6px 0; border: 1px dashed var(--warning); border-radius: 6px; padding: 4px 8px; background: var(--bg-tertiary); }
+.text-tool-call > summary { cursor: pointer; color: var(--warning); font-size: 12px; list-style: none; }
+.text-tool-call > summary::before { content: '▸ '; }
+.text-tool-call[open] > summary::before { content: '▾ '; }
+.text-tool-call-body { margin: 6px 0 2px; max-height: 240px; overflow: auto; color: var(--text-secondary); font-family: var(--mono-font); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; }
 
 .load-older-btn {
   display: block;

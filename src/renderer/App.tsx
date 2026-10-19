@@ -101,7 +101,7 @@ declare global {
       bgStop?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
       onBgChanged?: (cb: () => void) => () => void;
       /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件）。 */
-      onMainTurn?: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number }) => void) => () => void;
+      onMainTurn?: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true }) => void) => () => void;
       getPendingQuit?: () => Promise<boolean>;
       onPendingQuit?: (cb: (pending: boolean) => void) => () => void;
       /** 控制入口（controlServer `POST /sessions/:id/send`）：主进程转来一条，界面按 Enter 的同一套路由处理后回话 */
@@ -385,7 +385,7 @@ declare global {
       onUpdate: (callback: (data: any) => void) => () => void;
       onError: (callback: (error: any) => void) => () => void;
       onNotice?: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => () => void;
-      onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string }) => void) => () => void;
+      onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number }) => void) => () => void;
       onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
@@ -430,6 +430,8 @@ export interface Message {
   noteGroup?: string;
   /** 从盘上读回来时，折叠进这条用户消息的追加指令各段（`content` 已含它们）—— 只用来拆开显示，见 `steerSplit`。 */
   steerParts?: { id: string; content: string; ts: number }[];
+  /** 助手消息：这一轮最后一次真实工具调用开始时正文的长度（主进程落盘时记的）—— 判「把工具调用写成了文字」只看这之后（`main/textToolCall.ts`）。 */
+  toolTailFrom?: number;
 }
 
 export interface ToolCall {

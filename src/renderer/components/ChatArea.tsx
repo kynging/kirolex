@@ -28,6 +28,7 @@ import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
+import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 
 import { useSessionNotice } from '../hooks/useSessionNotice';
@@ -800,8 +801,13 @@ function NoticeBody({ text, count, render }: { text: string; count?: number; ren
   );
 }
 
-/** 一段回复正文：KiroLex 接在末尾的说明如果带「详情」（`withNoteDetail`），详情折叠起来；没有就和原来一样整段渲染。 */
-function AssistantBody({ body }: { body: string }) {
+/**
+ * 一段回复正文：KiroLex 接在末尾的说明如果带「详情」（`withNoteDetail`），详情折叠起来；没有就和原来一样整段渲染。
+ *
+ * 模型把工具调用写成了文字（末尾一段 `<invoke …>`，没执行 —— 判据见 `main/textToolCall.ts`）：那段标记默认折叠，标「未执行」，
+ * 不再让一大段代码看起来像是干了活。
+ */
+function AssistantBody({ body, toolTailFrom, realToolAfter }: { body: string; toolTailFrom?: number; realToolAfter?: boolean }) {
   const t = useT();
   const { main, detail } = splitNoteDetail(body);
   const md = (s: string) => (
@@ -809,10 +815,27 @@ function AssistantBody({ body }: { body: string }) {
       {s}
     </ReactMarkdown>
   );
-  if (!detail) return md(body);
+  /* 和一轮结束时的判定同一个口径：只看最后一次真实工具调用之后（`toolTailFrom`）；这一段后面还跟着真实工具调用的（进行中那一轮按段显示）不算 */
+  const textTool = realToolAfter ? null : splitTextToolCall(main, toolTailFrom);
+  if (!detail && !textTool) return md(body);
+  const mainView = textTool ? (
+    <>
+      {textTool.before && md(textTool.before)}
+      <details className="text-tool-call">
+        <summary>
+          {textTool.tools.length
+            ? t('⚠️ Tool call written as text, not executed: {tools}', { tools: textTool.tools.join(', ') })
+            : t('⚠️ Tool call written as text, not executed')}
+        </summary>
+        <pre className="text-tool-call-body">{textTool.markup}</pre>
+      </details>
+      {textTool.after && md(textTool.after)}
+    </>
+  ) : md(main);
+  if (!detail) return mainView;
   return (
     <>
-      {md(main)}
+      {mainView}
       <details className="notice-detail">
         <summary>{t('Details')}</summary>
         <div className="notice-detail-body">{detail}</div>
@@ -888,7 +911,7 @@ const MessageItem = memo<{
       : variant === 'tool' ? seg.content.slice(TOOL_PREFIX.length)
       : variant === 'thinking' ? seg.content.slice(THINK_PREFIX.length)
       : seg.content;
-    return { id: seg.id, variant, body };
+    return { id: seg.id, variant, body, toolTailFrom: seg.toolTailFrom };
   }), [segments]);
   // Copy excludes tool + thinking segments — only the actual reply text.
   const combinedText = useMemo(
@@ -971,7 +994,7 @@ const MessageItem = memo<{
                 ) : null
               ) : (
                 /* KiroLex 接在回复末尾的说明（例如超时中断那句）带「详情」时：主句照常渲染，详情折叠（NOTE_DETAIL_SEP） */
-                <AssistantBody body={p.body} />
+                <AssistantBody body={p.body} toolTailFrom={p.toolTailFrom} realToolAfter={parts.slice(idx + 1).some((q) => q.variant === 'tool')} />
               ))}
             </div>
           );
@@ -3080,7 +3103,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
          漏掉的后果实测过：追问建议是照着「⚠️ 这条会话现在跑在 gpt-5.6-sol 上」生成的。 */
       .filter((m) => !isKirolexNote(m as any))
       .filter((m) => !m.content.startsWith('💭 ') && !m.content.startsWith('🔧 '))
-      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${m.content.slice(0, 800)}`)
+      /* 写成文字没执行的调用标记折叠成一句（main/textToolCall.ts）—— 不照着它生成追问建议 */
+      .map((m) => `${m.role === 'user' ? 'User' : 'Assistant'}: ${(m.role === 'user' ? m.content : foldTextToolCall(m.content, m.toolTailFrom)).slice(0, 800)}`)
       .join('\n\n');
     let cancelled = false;
     const timer = setTimeout(() => {

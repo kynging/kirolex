@@ -30,8 +30,9 @@ describe('超时中断：主句一句，时长 / 上限 / 设置项进详情', (
 
   test('回复气泡认这个分隔符：主句照常渲染，详情折叠', () => {
     const CA = read('src', 'renderer', 'components', 'ChatArea.tsx');
-    assert.match(CA, /function AssistantBody\(\{ body \}: \{ body: string \}\) \{[\s\S]{0,200}const \{ main, detail \} = splitNoteDetail\(body\);/);
-    assert.match(CA, /<AssistantBody body=\{p\.body\} \/>/);
+    /* AssistantBody 多收了「写成文字的工具调用」用的两个参数（textToolCall.ts），详情照旧从 body 拆 */
+    assert.match(CA, /function AssistantBody\(\{ body[^}]*\}: \{ body: string[^}]*\}\) \{[\s\S]{0,200}const \{ main, detail \} = splitNoteDetail\(body\);/);
+    assert.match(CA, /<AssistantBody body=\{p\.body\}[^\n]*\/>/);
   });
 });
 
