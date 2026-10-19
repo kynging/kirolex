@@ -17,7 +17,7 @@ import {
   BG_DEFAULT_TIMEOUT_SEC, BG_MAX_TIMEOUT_SEC, MAX_JOBS_PER_SESSION, WATCH_DEFAULT_TIMEOUT_SEC, WATCH_MAX_TIMEOUT_SEC,
   WATCH_COALESCE_MS, WATCH_RATE_LIMIT, formatDuration, type BgJobView, type BgStartInput,
 } from './bgJobs.ts';
-import { uiLang } from './uiText.ts';
+import { tr, uiLang } from './uiText.ts';
 
 /** 单会话同时最多几个**还活着的**定时任务（结束了的不占名额）。 */
 export const MAX_SCHEDULES_PER_SESSION = 20;
@@ -141,6 +141,20 @@ export function wakeToolDefs(): Array<{ name: string; description: string; input
 }
 
 const NAMES = new Set(['schedule_create', 'schedule_list', 'schedule_delete', 'bg_run', 'bg_status', 'bg_stop', 'watch']);
+/**
+ * **换运行位置时，这条会话手上还在跑的后台任务 / 定时任务怎么办** —— 照常：
+ * 后台命令和监视一直跑在**本机**（同 `local_bash`，远程会话也是），定时任务按 KiroLex 会话 id 记账，
+ * 两样都不跟执行器走，所以换到哪台机器都不动它们，结果照常作为新消息发回这条会话。
+ * 在切换提示里明说一句（没有就不说），别让人以为它们跟着旧机器一起断了。
+ */
+export function switchCarryOverText(bgRunning: number, schedulesLive: number): string {
+  if (bgRunning <= 0 && schedulesLive <= 0) return '';
+  const parts: string[] = [];
+  if (bgRunning > 0) parts.push(tr('{n} background task(s) (bg_run / watch) keep running on this computer', { n: bgRunning }));
+  if (schedulesLive > 0) parts.push(tr('{n} scheduled task(s) still fire on time', { n: schedulesLive }));
+  return tr('⏳ {what}; results still come back to this session.', { what: parts.join(tr('; ')) });
+}
+
 export function isWakeTool(name: string): boolean {
   return NAMES.has(name);
 }

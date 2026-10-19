@@ -46,7 +46,7 @@ import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeIt
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
-import { callWakeTool, type WakeHost } from './wakeTools.ts';
+import { callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
@@ -62,7 +62,7 @@ import { remoteContextBlock } from './remoteContext.ts';
 import { remoteWriteVerdict, strayRemoteDeliverables, blockedWriteNotice, strayWriteNotice, saveRemoteCopy, captureBufferFor } from './remoteWriteGuard.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
-import { probeHttpMcp, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import { probeHttpMcp, releaseSessionTools, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { LocalBrowserHost, browserActionTitle, createQuitGuard } from './localBrowserHost.ts';
 import { isBrowserKind, type BrowserAction } from './localBrowser.ts';
 import { createControlServer, type ControlServer, type ControlSessionAccess } from './controlServer.ts';
@@ -2456,11 +2456,12 @@ setInterval(() => {
 }, REMOTE_SWEEP_MS).unref?.();
 
 /** 会话的执行器没了：作废 token、放开端口、把远端那份临时 agent 删掉。 */
-function releaseLocalTools(sessionId: string, remote?: RemoteTarget): void {
+function releaseLocalTools(sessionId: string, remote?: RemoteTarget, opts: { keepToken?: boolean } = {}): void {
   const spec = localToolsBySession.get(sessionId);
   localToolsBySession.delete(sessionId);
   muxUsers.delete(sessionId);
-  localMcpServer?.forget(sessionId);
+  /* 换运行位置（远程 → 本机）时 token 已经交给了新执行器：只停中转，不作废（见 `releaseSessionTools`） */
+  releaseSessionTools(localMcpServer, sessionId, { keepToken: opts.keepToken });
   if (spec && remote?.sshHost) {
     /* 不等结果：收尾动作卡住会让"换模型"看起来像界面挂了 */
     void writeRemoteFile(remote, removeAgentScript(spec.agentOverride), '').catch(() => {});
@@ -4035,6 +4036,19 @@ const bgJobs = new BgJobManager({
 /** 这条会话见过后台命令 / 监视的输出（唤醒里带着、或 bg_status 读到）：持久记下，之后的诊断包 / 上下文快照都不留会话内容。 */
 function markBgOutputSeen(sessionId: string): void {
   try { if (!store.readRecord(sessionId)?.bgOutputSeen) store.patchRecord(sessionId, { bgOutputSeen: true }); } catch { /* 记录读写失败不挡工具 */ }
+}
+
+/**
+ * 换运行位置时提示里的那句：后台任务 / 定时任务不跟执行器走（跑在本机、按会话 id 记账），
+ * 还有在跑的就明说「照常」（见 `switchCarryOverText`）；没有就是空串。
+ */
+function wakeCarryOverFor(sessionId: string): string {
+  const bgLive = bgJobs.list(sessionId).filter((j) => j.state === 'running').length;
+  const schedLive = scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)
+    .filter((j) => j.state.sessionId === sessionId && !j.state.terminal && !j.state.paused).length;
+  const text = switchCarryOverText(bgLive, schedLive);
+  if (text) logger.info('remote', `切换运行位置时还有后台任务 ${bgLive} 个、定时任务 ${schedLive} 个，照常运行 sessionId=${sessionId}`);
+  return text;
 }
 
 /** kirolex-local 上的 schedule_* / bg_* / watch：本地和远程会话都有。 */
@@ -9410,7 +9424,7 @@ app.whenReady().then(async () => {
           **远程 → 本地：旧的转发通道收掉** —— 本地那条路不走 setProxies，不收的话上一台机器那批中转代理
           和本机起的进程（playwright 的浏览器）要一直留到会话结束。放在 set 之后：关复用连接看的是"还有没有会话在那台机器上"。
         */
-        if (!target && oldEntry.profile.remote?.sshHost) releaseLocalTools(sessionId, oldEntry.profile.remote);
+        if (!target && oldEntry.profile.remote?.sshHost) releaseLocalTools(sessionId, oldEntry.profile.remote, { keepToken: true });
 
         const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
         rec.profile = profile;
@@ -9424,10 +9438,12 @@ app.whenReady().then(async () => {
         modelFallback.commit(sessionId);   // 换成了：记下的「改用了备用模型」现在写
 
         const where = target ? tr('remote machine {host}', { host: String(hostLabelOf(target)) }) : tr('the local machine');
+        const carryOver = wakeCarryOverFor(sessionId);
         /* 主句：换到哪（被打断的那一轮也在主句里 —— 它影响结果）；后端会话是新的、对话记录不变 → 详情 */
         sessionNotice(sessionId, trConcat(
           tr('🔀 This session now runs on **{where}** (working directory `{dir}`).', { where, dir: nextLocalDir }),
           interrupted ? `\n${tr('(The switch interrupted the running turn; its output so far is kept. Resend if you need the rest.)')}` : '',
+          carryOver ? `\n${carryOver}` : '',
           NOTE_DETAIL_SEP,
           tr('The backend session is new; the context goes along with your next message. The conversation is unchanged.')));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
@@ -9436,6 +9452,15 @@ app.whenReady().then(async () => {
       } catch (err) {
         try { await client.disconnect(); } catch {}
         modelFallback.discard(sessionId);   // 没换成（session/new 等失败）：连上时记下的那句作废
+        /*
+          **新执行器没起来，旧的工具 token 也已经换掉了**（`ensureLocalTools` 登记新 token 时旧的作废）——
+          留着旧执行器就是一条 bg_run / local_* 全部不可用的会话（同切换组合失败那条路）。没在跑一轮就收掉它：
+          记录里还是原来的位置，下一条消息按原位置重新接上，工具通道跟着重建。
+        */
+        if (sessionClients.get(sessionId) === oldEntry && !oldEntry.busy) {
+          logger.warn('remote', `切换目标失败，旧执行器的工具连接已作废，收掉它 sessionId=${sessionId}`);
+          void detachExecutor(sessionId);
+        }
         throw err;
       }
     } finally {

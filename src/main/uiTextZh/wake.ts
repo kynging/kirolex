@@ -27,6 +27,10 @@ export const ZH_WAKE: Record<string, string> = {
   '🔔 Background command "{label}" finished: exit code {code}, ran {dur} ({id})': '🔔 后台命令「{label}」已结束：退出码 {code}，用时 {dur}（{id}）',
   '⚠️ KiroLex restarted, so background task "{label}" ({id}) was interrupted and is no longer running':
     '⚠️ KiroLex 重启，后台任务「{label}」（{id}）已中断，不再运行',
+  // ── wakeTools.ts switchCarryOverText（换运行位置的提示）──
+  '{n} background task(s) (bg_run / watch) keep running on this computer': '{n} 个后台任务（bg_run / watch）在本机继续跑',
+  '{n} scheduled task(s) still fire on time': '{n} 个定时任务照常到点触发',
+  '⏳ {what}; results still come back to this session.': '⏳ {what}，结果照常发回这条会话。',
   // ── 工具调用写成了文字（index.ts handleTextToolCall，textToolCall.ts）──
   '⚠️ The model still writes tool calls as text, so automatic handling has stopped until you send your next message.':
     '⚠️ 模型仍把工具调用写成文字，已停止自动处理，等你发下一条消息。',

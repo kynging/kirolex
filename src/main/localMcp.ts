@@ -1140,6 +1140,49 @@ export async function probeHttpMcp(
 
 /* ------------------------------------------------------------ HTTP 服务 */
 
+/**
+ * 拿着**作废 token** 的请求：状态还是 404（这把钥匙确实不能用了），但要让模型看得懂、日志里查得到。
+ *
+ * `tools/call` 回 200 + `isError` 的工具结果 —— 只有这样每个 MCP 客户端都会把那句话原样交给模型
+ * （404 的 body 有的客户端会丢掉，模型就只看到一个「404」）。别的请求（initialize / tools/list）照旧 404，
+ * body 里带同一句 JSON-RPC 错误：对方不能以为自己连上了。
+ */
+function retiredReply(
+  req: http.IncomingMessage,
+  res: http.ServerResponse,
+  gone: { sessionId: string; reason: string },
+  proxyName: string | undefined,
+  deps: LocalMcpDeps,
+): void {
+  const where = proxyName ? ` proxy=${proxyName}` : '';
+  if (req.method !== 'POST') {
+    deps.log('warn', `kirolex-local 拒绝请求 HTTP 404（token 已作废）sessionId=${gone.sessionId} method=${req.method}${where}`);
+    res.writeHead(404).end();
+    return;
+  }
+  let body = '';
+  req.on('data', (d) => { body += d; if (body.length > 1024 * 1024) req.destroy(); });
+  req.on('end', () => {
+    let msg: any;
+    try { msg = JSON.parse(body); } catch { msg = null; }
+    const one = Array.isArray(msg) ? msg[0] : msg;
+    const method = String(one?.method || '?');
+    const tool = method === 'tools/call' ? String(one?.params?.name || '') : '';
+    const text = unavailableText(tool, gone.reason);
+    if (!Array.isArray(msg) && method === 'tools/call' && one?.id !== undefined) {
+      deps.log('warn', `kirolex-local 工具调用失败 HTTP 404（token 已作废，回给模型可读错误）sessionId=${gone.sessionId} tool=${tool}${where}`);
+      res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify({
+        jsonrpc: '2.0', id: one.id, result: { content: [{ type: 'text', text }], isError: true },
+      }));
+      return;
+    }
+    deps.log('warn', `kirolex-local 拒绝请求 HTTP 404（token 已作废）sessionId=${gone.sessionId} method=${method}${where}`);
+    res.writeHead(404, { 'content-type': 'application/json' }).end(JSON.stringify({
+      jsonrpc: '2.0', id: one?.id ?? null, error: { code: -32001, message: text },
+    }));
+  });
+}
+
 export interface LocalMcpServer {
   /** 实际监听的本地端口（只在 127.0.0.1 上）。 */
   port(): number;
@@ -1150,8 +1193,11 @@ export interface LocalMcpServer {
   setProxies(sessionId: string, specs: ProxySpec[]): void;
   /** 登记一条会话，拿到它的 token（URL 里用）。 */
   register(session: LocalMcpSession): string;
-  /** 会话没了就作废它的 token。 */
-  forget(sessionId: string): void;
+  /**
+   * 会话没了就作废它的 token。作废的 token 记下「是哪条会话、为什么」（`reason`，给模型看的一句）：
+   * 还拿着它的后端再来调工具时回一句看得懂的错误，并在日志里记会话 id 和 HTTP 状态（见 `retiredReply`）。
+   */
+  forget(sessionId: string, reason?: string): void;
   urlPathFor(sessionId: string): string | undefined;
   stop(): void;
 }
@@ -1161,8 +1207,48 @@ export function newToken(): string {
   return crypto.randomBytes(16).toString('hex');
 }
 
+/** 最多记住多少把作废的 token（只为给拿着旧 token 的后端一句看得懂的错误；超了丢最早的）。 */
+export const RETIRED_TOKENS_MAX = 256;
+/** 作废原因（给模型看）：同一条会话重新登记、拿到了新 token。 */
+export const RETIRED_REPLACED = '这条会话的工具连接已经换新（切换了运行位置或重建了执行器），这一条是旧连接。请结束这一轮，用户发下一条消息时会用新连接';
+/** 作废原因（给模型看）：执行器断开、会话的工具通道收掉了。 */
+export const RETIRED_RELEASED = '这条会话的执行器已经断开，工具连接随之作废。请结束这一轮，用户发下一条消息时会重新连接';
+
+/** 拿着作废 token 调工具时给模型的那句。`local_*` 那几个（远程会话）换个说法，别说成「后台任务工具」。 */
+export function unavailableText(tool: string, reason: string): string {
+  const what = isWakeTool(tool) || !tool ? '后台任务工具' : 'KiroLex 本地工具';
+  return `${what}在这条会话暂时不可用：${reason}。`;
+}
+
+/**
+ * **换运行位置之后收掉旧的那一套** —— 「切到本机之后 bg_run 返回 404」的根因就在这儿。
+ *
+ * 远程 → 本机时，新执行器（本机）**已经拿着新 token 连上了**，这时才收旧的远程那一套。原来收的方式是
+ * `forget(sessionId)` —— 它按会话 id 作废**所有** token，于是刚发给本机执行器的那把也一起作废：
+ * tools/list 在 session/new 时已经拿到了（模型看得到 bg_run），之后每一次调用都 404。
+ *
+ * 所以换位置时 `keepToken`：只停掉上一台机器那批中转代理（本机进程），token 留给新执行器；
+ * 真的断开会话（detach / 删除）才 `forget`。
+ */
+export function releaseSessionTools(
+  server: Pick<LocalMcpServer, 'forget' | 'setProxies'> | undefined,
+  sessionId: string,
+  opts: { keepToken?: boolean; reason?: string } = {},
+): void {
+  if (!server) return;
+  if (opts.keepToken) server.setProxies(sessionId, []);
+  else server.forget(sessionId, opts.reason);
+}
+
 export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpServer> {
   const sessions = new Map<string, LocalMcpSession>();   // token -> session
+  /** 作废的 token -> 哪条会话、为什么（只为给还拿着它的后端一句看得懂的错误）。 */
+  const retired = new Map<string, { sessionId: string; reason: string }>();
+  const retire = (token: string, sessionId: string, reason: string): void => {
+    retired.delete(token);
+    retired.set(token, { sessionId, reason });
+    while (retired.size > RETIRED_TOKENS_MAX) retired.delete(retired.keys().next().value as string);
+  };
   /** `<sessionId>\0<名字>` -> 那个被代理的本机 MCP。 */
   const proxies = new Map<string, ForwardProxy>();
   const stopProxies = (sessionId: string): void => {
@@ -1174,15 +1260,26 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
     const url = new URL(req.url || '/', 'http://127.0.0.1');
     /* `/mcp/<token>` = KiroLex 自己那组工具；`/mcp/<token>/<名字>` = 转发本机那个 MCP */
     const m = /^\/mcp\/([0-9a-f]{32})(?:\/([\w.-]{1,40}))?$/.exec(url.pathname);
+    const gone = m && !sessions.has(m[1]) ? retired.get(m[1]) : undefined;
+    if (gone) {
+      /* 这把 token 发出去过、后来作废了：对方是这条会话的某个后端 —— 说清楚为什么，日志里记下来 */
+      retiredReply(req, res, gone, m![2], deps);
+      return;
+    }
     if (!m || !sessions.has(m[1])) {
       /* 不说为什么：能敲到这个端口的东西不该从错误消息里学到 token 的形状 */
+      deps.log('warn', `kirolex-local 拒绝请求 HTTP 404（不认识的地址）sessionId=未知 method=${req.method}`);
       res.writeHead(404).end();
       return;
     }
     const session = sessions.get(m[1])!;
     const proxyName = m[2];
     const proxy = proxyName ? proxies.get(`${session.sessionId}\u0000${proxyName}`) : undefined;
-    if (proxyName && !proxy) { res.writeHead(404).end(); return; }
+    if (proxyName && !proxy) {
+      deps.log('warn', `kirolex-local 拒绝请求 HTTP 404（这条会话没有转发「${proxyName}」）sessionId=${session.sessionId}`);
+      res.writeHead(404).end();
+      return;
+    }
     if (req.method === 'GET') {
       /* 有些客户端会开一条 SSE 通道等服务端主动推。我们没有要推的东西，但也不能报错 —— 挂着即可。 */
       res.writeHead(200, { 'content-type': 'text/event-stream', 'cache-control': 'no-cache', connection: 'keep-alive' });
@@ -1223,7 +1320,7 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
       resolve({
         port: () => actual,
         register(session) {
-          for (const [t, s] of sessions) if (s.sessionId === session.sessionId) sessions.delete(t);
+          for (const [t, s] of sessions) if (s.sessionId === session.sessionId) { sessions.delete(t); retire(t, s.sessionId, RETIRED_REPLACED); }
           const token = newToken();
           sessions.set(token, session);
           return token;
@@ -1241,8 +1338,8 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
             proxies.set(`${sessionId}\u0000${spec.name}`, new StdioProxy(spec, deps.log));
           }
         },
-        forget(sessionId) {
-          for (const [t, s] of sessions) if (s.sessionId === sessionId) sessions.delete(t);
+        forget(sessionId, reason) {
+          for (const [t, s] of sessions) if (s.sessionId === sessionId) { sessions.delete(t); retire(t, sessionId, reason || RETIRED_RELEASED); }
           /* 会话没了，那个浏览器也不该继续开着 */
           stopProxies(sessionId);
         },
