@@ -48,6 +48,7 @@ import { chatHistoryBody } from '../historyBlock.ts';
 import { mergeAssistantFinal } from '../assistantFinal.ts';
 import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
+import { reconcileWithStore } from '../messageReconcile';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -323,6 +324,25 @@ function autoResendKey(text: string): string {
   let h = 0;
   for (let i = 0; i < text.length; i++) { h = (h * 31 + text.charCodeAt(i)) | 0; }
   return `${text.length}:${h}`;
+}
+
+/** transcript 里的一条 → 界面的 Message（switchSession 读盘、对账共用）。 */
+function messageFromStored(m: any): Message {
+  return {
+    id: m.id,
+    role: m.role,
+    content: m.content,
+    toolCalls: m.toolCalls,
+    // Attachment chips must survive a restart (persisted per message).
+    attachments: (m as any).attachments,
+    pastes: (m as any).pastes,
+    ...((m as any).kirolex ? { kirolex: true as const } : {}),
+    ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
+    ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
+    ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
+    ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
+    timestamp: m.ts,
+  };
 }
 
 function toStoredTranscript(messages: Message[]) {
@@ -660,6 +680,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // On the first real send, this history is injected as a <hidden> priming block
   // so the freshly-created kiro-cli session inherits the full conversation context.
   const duplicateHistoryRef = useRef<Map<string, Message[]>>(new Map());
+  /**
+   * 每条会话里**本来就只在界面上**的消息 id（`/usage` 这类本地回显、复制会话带过来的历史）——
+   * 切会话时和 store 对账（`messageReconcile`）不能把它们当成别的会话的丢掉。
+   */
+  const localOnlyIdsRef = useRef<Map<string, Set<string>>>(new Map());
+  const markLocalOnly = (sid: string, ids: string[]) => {
+    const set = localOnlyIdsRef.current.get(sid) || new Set<string>();
+    for (const id of ids) set.add(id);
+    localOnlyIdsRef.current.set(sid, set);
+  };
+  const moveLocalOnly = (from: string, to: string) => {
+    const set = localOnlyIdsRef.current.get(from);
+    if (!set) return;
+    localOnlyIdsRef.current.delete(from);
+    markLocalOnly(to, Array.from(set));
+  };
   // Pending duplicate id -> source project. Keep this separate from React state so
   // an immediate first send cannot race the pending session render and lose the
   // source chat's project while materializing the backend session.
@@ -819,6 +855,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   /** 把几条 KiroLex 提示插进那条会话的消息列表（判据在 `noticeMerge.withLiveNote`：重复的、没读过历史的不插） */
   const showLiveNotes = (sid: string, notes: Message[]) => {
     for (const note of notes) {
+      /* 主进程推给这条会话的提示：切会话对账时认它（没落盘的也不当成别人的） */
+      markLocalOnly(sid, [note.id]);
       mutateSessionMessagesRef.current?.(sid, (cur) => withLiveNote(cur, note, creatingRef.current.has(sid)) ?? cur);
     }
   };
@@ -1123,6 +1161,45 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     setSessionActivity(sid, t('⏳ The previous turn is still running; reattached to its reply (not resent)'));
   };
 
+  /**
+   * 读盘，和这条会话的消息缓存对账；对不上就换成 store 的（判据见 messageReconcile）。
+   * 返回对过账的列表和 store 里的 id；读不到、读盘期间缓存动过、或这时在跑一轮 → `null`（没法确认，调用方别动）。
+   */
+  const reconcileCacheFromStore = async (sid: string): Promise<{ messages: Message[]; storedIds: Set<string> } | null> => {
+    const before = messagesCacheRef.current.get(sid);
+    let transcript: any;
+    try { transcript = await window.kiroApi.readTranscript(sid); } catch { return null; }
+    /* 读到空数组也对账：新会话还没落盘时缓存里全是别人的，也要清回空的 */
+    if (!Array.isArray(transcript)) return null;
+    /* 读盘期间这条会话动过（来了消息、开始一轮）就不碰 —— 对账只针对读盘前那一份 */
+    if (messagesCacheRef.current.get(sid) !== before || streamingIdsRef.current.has(sid)) return null;
+    const storedIds = new Set<string>(transcript.map((m: any) => m?.id));
+    const cached = before || [];
+    const reconciled = reconcileWithStore(cached, transcript.map(messageFromStored), localOnlyIdsRef.current.get(sid));
+    if (!reconciled) return { messages: cached, storedIds };
+    const healed = withFailed(sid, reconciled);
+    console.warn('[kirolex] message cache did not match the store; reloaded from the transcript', {
+      sessionId: sid, cached: cached.length, stored: transcript.length,
+    });
+    messagesCacheRef.current.set(sid, healed);
+    patchPane(sid, { messages: healed });
+    rebuildFileChanges(sid, healed, currentSessionRef.current === sid);
+    if (currentSessionRef.current === sid) setMessages(healed);
+    return { messages: healed, storedIds };
+  };
+  /**
+   * **自动重发前确认这条问题是这条会话的** —— 恢复是在某一刻的缓存上捕获的（断线恢复、切会话），那份缓存
+   * 可能被别的会话的消息污染过：照发就是把别人的问题当成这条会话的重发，`rerunFromMessage` 还会把
+   * 截短后的污染历史写进这条会话的 transcript。所以先和 store 对账（顺带把缓存修好），只有那条用户消息
+   * 在这条会话的 store 里（或是这条会话自己登记的、没落盘的那条）才重发；没法确认就这次不发、下次再查。
+   */
+  const recoveryTargetIsOwn = async (sid: string, targetId: string): Promise<boolean> => {
+    const verified = await reconcileCacheFromStore(sid);
+    return !!verified
+      && verified.messages.some((m) => m.id === targetId)
+      && (verified.storedIds.has(targetId) || !!localOnlyIdsRef.current.get(sid)?.has(targetId));
+  };
+
   const recoverInterruptedTurn = (sid: string, msgs: Message[], opts?: {
     assumeCurrent?: boolean;
     /** 已知这一轮被**非人为**打断（执行器死了）：哪怕已经吐出半截回复也重跑这一轮。 */
@@ -1297,6 +1374,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       /* 重试之间退避一下：执行器刚死就立刻重发，多半撞上同一个原因 */
       if (attempts > 0) await new Promise((r) => setTimeout(r, Math.min(30_000, 2000 * attempts)));
       if (recoveryCancelledRef.current.has(sid)) { setSessionActivity(sid, null); return; }
+      /* 重发前确认这条问题是这条会话的（见 recoveryTargetIsOwn） */
+      if (!(await recoveryTargetIsOwn(sid, target.id))) {
+        if (!isRebuilding(sid)) setSessionActivity(sid, null);
+        recoveryCheckedRef.current.delete(sid);
+        return;
+      }
       try {
         // 原来那条是经控制入口发的：重发的新消息照样带标记
         await rerunFromMessageRef.current?.(target.id, resendText, { carryMark: true }, sid);
@@ -3095,6 +3178,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
     // Copy messages into the duplicate's display cache and persist
     messagesCacheRef.current.set(newId, copied);
+    /* 复制来的历史只在界面上（新会话的 transcript 里没有，首条消息时作为隐藏块注入） */
+    markLocalOnly(newId, copied.map((m) => m.id));
 
     // Cold cache (a session hydrated from disk but never opened this run) used to
     // fork an EMPTY chat: message bodies are no longer mirrored into localStorage,
@@ -3122,6 +3207,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // Only fill if nothing has been written to the fork meanwhile.
           if ((messagesCacheRef.current.get(newId) || []).length === 0) {
             messagesCacheRef.current.set(newId, restored);
+            markLocalOnly(newId, restored.map((m) => m.id));
             duplicateHistoryRef.current.set(newId, restored);
             rebuildFileChanges(newId, restored, currentSessionRef.current === newId);
             if (currentSessionRef.current === newId) setMessages(restored);
@@ -3318,7 +3404,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Restore from local cache instantly
     const cached = messagesCacheRef.current.get(sessionId);
     setMessages(cached || []);
-    if (cached && cached.length > 0) recoverInterruptedTurn(sessionId, cached, { assumeCurrent: true });
+    /* 静止的会话先和 store 对账再查恢复（见下面 reconcileFirst 那段）；正在跑 / 正在建 / 有没吃完的追加指令时照旧当场查 */
+    const reconcileFirst = !!cached && cached.length > 0
+      && !sessionId.startsWith('pending_')
+      && !streamingIdsRef.current.has(sessionId)
+      && !creatingRef.current.has(sessionId)
+      && !(pendingSteersRef.current.get(sessionId)?.length);
+    if (cached && cached.length > 0 && !reconcileFirst) recoverInterruptedTurn(sessionId, cached, { assumeCurrent: true });
 
     // Pending new/forked chats intentionally have no backend executor until
     // their first message materializes the real session and injects history.
@@ -3331,6 +3423,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // an empty/"no messages" state that filled in a moment later, which reads as
     // "the history is gone". loadSession below resumes the backend without
     // re-streaming, so this is the only path that repopulates old chats.
+    const fromStored = messageFromStored;
     if (!cached || cached.length === 0) {
       const known = sessionsRef.current.find((s) => s.id === sessionId);
       const hasTranscript = !!known && !sessionId.startsWith('pending_');
@@ -3338,21 +3431,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       try {
         const transcript = await window.kiroApi.readTranscript(sessionId);
         if (Array.isArray(transcript) && transcript.length > 0) {
-          const restored: Message[] = transcript.map((m) => ({
-            id: m.id,
-            role: m.role,
-            content: m.content,
-            toolCalls: m.toolCalls,
-            // Attachment chips must survive a restart (persisted per message).
-            attachments: (m as any).attachments,
-            pastes: (m as any).pastes,
-            ...((m as any).kirolex ? { kirolex: true as const } : {}),
-            ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
-            ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
-            ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
-            ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
-            timestamp: m.ts,
-          }));
+          const restored: Message[] = transcript.map(fromStored);
           const live = messagesCacheRef.current.get(sessionId) || [];
           const liveById = new Map(live.map((message) => [message.id, message]));
           const restoredIds = new Set(restored.map((message) => message.id));
@@ -3372,6 +3451,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       } finally {
         clearHistoryLoading(sessionId);
       }
+    } else if (reconcileFirst) {
+      /*
+        **有缓存也和 store 对账** ——「新会话里出现大量别的会话的历史，切走切回还在」。
+        缓存一旦被写进别的会话的消息（那次是后台会话断线重跑时的 `setMessages(retained)`），上面那条路
+        看到非空就直接用，盘上明明是干净的，界面却一直错下去。对不上就以 store 为准（判据见 messageReconcile）。
+        **对完账才检查要不要自动重发**，而且只拿对过账的那份去查：污染缓存末尾那条外来的「没答的提问」
+        要是先被恢复流程捕获，就会被当成这条会话的问题重发、截短后的污染历史还会被写进这条会话的 transcript。
+        读不到 / 读盘期间这条会话动过：这次不查（没记成查过，下次打开再查）。
+      */
+      const verified = await reconcileCacheFromStore(sessionId);
+      if (verified) recoverInterruptedTurn(sessionId, verified.messages, { assumeCurrent: true });
     }
 
     // Attach the executor on switch so the SELECTED chat becomes live (green dot)
@@ -3537,6 +3627,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
     const activeModel = modelForSession(sessionId);
     const userMessageId = `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    /* 这条是为这条会话写的：发送失败没落盘时，切会话对账也认它（见 messageReconcile） */
+    markLocalOnly(sessionId, [userMessageId]);
     mutateSessionMessages(sessionId, (current) => [
       ...current,
       { id: userMessageId, role: 'user', content: text, timestamp: Date.now() },
@@ -3640,6 +3732,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       pastes,
       timestamp: Date.now(),
     };
+    /* 这条是为这条会话写的：发送失败没落盘时，切会话对账也认它（见 messageReconcile） */
+    if (sid) markLocalOnly(sid, [userMessageId]);
     if (sid) mutateSessionMessages(sid, (current) => [...current, optimisticUserMessage]);
     else setMessages((current) => [...current, optimisticUserMessage]);
 
@@ -3650,6 +3744,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         content: localResponse,
         timestamp: Date.now(),
       };
+      /* 本地回显不落盘：切会话对账时别当成别的会话的丢掉 */
+      if (sid) markLocalOnly(sid, [userMessageId, response.id]);
       if (sid) mutateSessionMessages(sid, (current) => [...current, response]);
       else setMessages((current) => [...current, response]);
       return;
@@ -3721,6 +3817,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               messagesCacheRef.current.set(sid, pendingMessages);
               messagesCacheRef.current.delete(prevId);
             }
+            moveLocalOnly(prevId, sid);
             setSessions((prev) => prev.map((s) => (
               s.id === prevId ? { ...s, id: sid!, projectId: pendingProjectId } : s
             )));
@@ -3895,9 +3992,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           }
           turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || t('Failed to send message.') });
           /* 写进**这条**会话：await 期间焦点可能已经换了，分屏里发的也常常不是焦点那一格 */
+          const errTs = Date.now();
+          markLocalOnly(sid!, [`err_${errTs}`]);
           mutateSessionMessages(sid!, (prev) => [
             ...prev,
-            { id: `err_${Date.now()}`, role: 'assistant', content: `⚠️ ${retryErr?.message || t('Failed to send message.')}`, timestamp: Date.now() },
+            { id: `err_${errTs}`, role: 'assistant', content: `⚠️ ${retryErr?.message || t('Failed to send message.')}`, timestamp: Date.now() },
           ]);
         }
       }
@@ -4258,6 +4357,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     };
 
     const userMessageId = options?.messageId || `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    /* 这条是为这条会话写的：发送失败没落盘时，切会话对账也认它（见 messageReconcile） */
+    if (!options?.mergeIntoMessageId) markLocalOnly(sessionId, [userMessageId]);
     // `text` is what the MODEL gets (pastes expanded); the bubble/transcript keep
     // the short placeholder form when the caller supplies one.
     const shownText = options?.displayText ?? text;
@@ -4456,6 +4557,7 @@ ${text}`,
     // materialization for this session.
     duplicateHistoryRef.current.delete(sessionId);
     duplicateProjectRef.current.delete(sessionId);
+    localOnlyIdsRef.current.delete(sessionId);
     // Clear local message cache
     messagesCacheRef.current.delete(sessionId);
     // ...and this chat's error banner: it is keyed by session id, so without this the
