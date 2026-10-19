@@ -49,6 +49,7 @@ import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
 import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts';
 import { browserActionsOf } from '../localBrowserView.ts';
+import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
@@ -553,6 +554,55 @@ function scrollContainerToBottom(el: HTMLElement | null, stillWanted: () => bool
   if (!el) return;
   el.scrollTop = el.scrollHeight;
   requestAnimationFrame(() => { if (stillWanted()) el.scrollTop = el.scrollHeight; });
+}
+
+/**
+ * 每个会话上次离开时看到的位置（见 `scrollMemory.ts`）。按**会话**记、不按格子记：
+ * 每一格滚动时只更新自己的快照（`PaneScroll`），离开时才提交到这里 —— 分屏里同一条会话谁最后离开就以谁为准。
+ * 写进 ui-state.json 让重启 / 刷新后也能回来；只存会话 id → 位置，不存消息内容。落盘合并成一秒一次，关窗前补一次。
+ */
+const SCROLL_MEMO_KEY = 'kirolex-scroll-positions';
+const scrollMemory = ScrollMemory.fromJSON(uiGet(SCROLL_MEMO_KEY));
+let scrollMemoTimer: ReturnType<typeof setTimeout> | null = null;
+function flushScrollMemory(): void {
+  if (scrollMemoTimer) { clearTimeout(scrollMemoTimer); scrollMemoTimer = null; }
+  // 落盘时把还开着的格子的快照叠上去（只叠在要写的那份上，内存里的仍按「最后离开」为准）：
+  // 关窗不一定来得及跑 beforeunload，崩溃更不会，没叠的话正在看的那条会话就记不住了。
+  const onDisk = scrollMemory.toJSON();
+  for (const pane of livePanes) {
+    const snap = pane.peek();
+    if (snap) onDisk[snap.sid] = snap.memo;
+  }
+  try { uiSet(SCROLL_MEMO_KEY, JSON.stringify(onDisk)); } catch {}
+}
+function scheduleScrollFlush(): void {
+  if (!scrollMemoTimer) scrollMemoTimer = setTimeout(flushScrollMemory, 1000);
+}
+/** 还开着的每一格：刷新 / 关窗前它们也算「离开」。 */
+const livePanes = new Set<PaneScroll>();
+try {
+  window.addEventListener('beforeunload', () => {
+    for (const pane of livePanes) pane.commit(scrollMemory);
+    flushScrollMemory();
+  });
+} catch {}
+
+/** 一组消息挂在 `<div class="chat-anchor" data-anchor-id>`（display: contents）里；量它的子元素。 */
+function anchorBox(node: HTMLElement, viewTop: number): AnchorBox | null {
+  const first = node.firstElementChild as HTMLElement | null;
+  const last = node.lastElementChild as HTMLElement | null;
+  if (!first || !last) return null;
+  return {
+    id: node.dataset.anchorId || '',
+    top: first.getBoundingClientRect().top - viewTop,
+    bottom: last.getBoundingClientRect().bottom - viewTop,
+  };
+}
+function findAnchorNode(container: HTMLElement, id: string): HTMLElement | null {
+  for (const node of container.querySelectorAll<HTMLElement>('[data-anchor-id]')) {
+    if (node.dataset.anchorId === id) return node;
+  }
+  return null;
 }
 
 /**
@@ -3484,8 +3534,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const RENDER_CHUNK = 120;
   const [renderLimit, setRenderLimit] = useState(INITIAL_RENDER);
   const preExpandHeightRef = useRef<number | null>(null);
-  // Reset the window when switching sessions so a newly-opened chat starts capped.
-  useEffect(() => { setRenderLimit(INITIAL_RENDER); }, [currentSessionId]);
+  // (The window is reset per session by the switch effect below: capped, or back to
+  // as many groups as were loaded when you left this chat.)
   const loadOlder = useCallback(() => {
     const el = chatMessagesRef.current;
     if (el) preExpandHeightRef.current = el.scrollHeight;
@@ -3548,12 +3598,63 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     scrollContainerToBottom(chatMessagesRef.current, () => stickToBottomRef.current);
   }, [messages]);
 
-  // Switching chats always starts at the bottom (freshest turn) and re-arms stick.
-  useEffect(() => {
+  /*
+    切会话回到上次离开时看到的位置（`scrollMemory.ts`）。
+    位置是滚动时随手量好、记在这一格自己的快照里的（`captureScrollPosition`），离开（切走 / 卸载 / 刷新前）
+    才提交到共享记录；离开那一刻不量：单屏切会话时这一格是原地换内容，任何 effect 跑到的时候 DOM
+    已经是新会话的了，再量就量错了会话。
+    - 上次贴底 / 没记过 → 到**新的**最下面并重新贴底（原来的行为）。
+    - 上次在翻历史 → 先把窗口恢复到当时挂的组数，等这份记录到了再把锚点滚回原偏移（下面那个 layout effect）。
+    layout effect：要赶在浏览器派发「内容换了、scrollTop 被夹」的 scroll 事件之前把待恢复状态立起来。
+  */
+  const sessionIdRef = useRef(currentSessionId);
+  sessionIdRef.current = currentSessionId;
+  const renderLimitRef = useRef(renderLimit);
+  renderLimitRef.current = renderLimit;
+  const pendingRestoreRef = useRef<Extract<ScrollMemo, { stick: false }> | null>(null);
+  const paneScrollRef = useRef(new PaneScroll());
+  const commitPaneScroll = useCallback(() => {
+    paneScrollRef.current.commit(scrollMemory);
+    scheduleScrollFlush();
+  }, []);
+  // layout effect：卸载时的提交要赶在同一次提交里新挂上的格子读位置之前。
+  useLayoutEffect(() => {
+    const pane = paneScrollRef.current;
+    livePanes.add(pane);
+    return () => { livePanes.delete(pane); commitPaneScroll(); };
+  }, [commitPaneScroll]);
+  useLayoutEffect(() => {
+    // 先交上一条会话的快照（滚动时量的），再读这一条的
+    commitPaneScroll();
+    const memo = currentSessionId ? scrollMemory.get(currentSessionId) : undefined;
+    if (memo && !memo.stick) {
+      pendingRestoreRef.current = memo;
+      stickToBottomRef.current = false;
+      setRenderLimit(Math.max(INITIAL_RENDER, memo.loadedGroups));
+      return;
+    }
+    pendingRestoreRef.current = null;
+    setRenderLimit(INITIAL_RENDER);
     stickToBottomRef.current = true;
     setShowJumpToBottom(false);
     requestAnimationFrame(() => scrollContainerToBottom(chatMessagesRef.current, () => stickToBottomRef.current));
   }, [currentSessionId]);
+  const captureScrollPosition = useCallback(() => {
+    const el = chatMessagesRef.current;
+    const sid = sessionIdRef.current;
+    if (!el || !sid || pendingRestoreRef.current) return;
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 60;
+    const items: AnchorBox[] = [];
+    if (!atBottom) {
+      const viewTop = el.getBoundingClientRect().top;
+      for (const node of el.querySelectorAll<HTMLElement>('[data-anchor-id]')) {
+        const box = anchorBox(node, viewTop);
+        if (box && box.bottom > 1) { items.push(box); break; }
+      }
+    }
+    paneScrollRef.current.record(sid, snapshotPosition(atBottom, items, renderLimitRef.current));
+    scheduleScrollFlush();
+  }, []);
 
   const jumpToBottom = useCallback(() => {
     stickToBottomRef.current = true;
@@ -3739,6 +3840,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return collapseAdjacent(groups, (g) => (g.kind === 'kirolex' ? noticeKey({ group: g.message.noteGroup, text: g.message.content }) : null))
       .map(({ item, count }) => (item.kind === 'kirolex' && count > 1 ? { ...item, count } : item));
   }, [orderedMessages]);
+  /** 切会话回到原位置用的锚点 id。回复组取**第一段**：流式输出只往后追加段，第一段的 id 不会变。 */
+  const groupAnchorId = (g: RenderGroup): string =>
+    g.kind === 'user' ? g.base.id : g.kind === 'kirolex' ? g.message.id : g.segments[0].id;
   // The interrupted turn the next composer submit overwrites is the LAST base user
   // message (same anchor as markTurnInterrupted). Only that group shows its
   // original + steers merged into one bubble; earlier turns keep them separate.
@@ -3788,6 +3892,61 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     ? renderGroups.slice(renderGroups.length - windowSize)
     : renderGroups;
   const hiddenGroupCount = renderGroups.length - visibleGroups.length;
+
+  /*
+    把上次离开时的锚点滚回原偏移（待恢复状态由切会话那个 effect 立起来）。
+    记录还在加载就等；锚点那一组没挂上就再放大窗口；锚点没了（被删、编辑后重跑记录被重写）就到底部。
+    滚回去之后约一秒内每帧再对一次：markdown / 高亮晚一点才定高，刚启动时窗口宽度还会变（跨在视口顶上的那条
+    重新折行就差一行）。期间你一动（滚轮 / 按下 / 按键 / 触摸）就不再管。
+  */
+  useLayoutEffect(() => {
+    const memo = pendingRestoreRef.current;
+    const el = chatMessagesRef.current;
+    const sid = currentSessionId;
+    if (!memo || !el || !sid) return;
+    // 只在记录还在加载时等。加载完了还是空的（记录被清空 / 重写成空）就是锚点没了，走下面退回底部那条：
+    // 不然待恢复状态一直不清、onScroll 一直被拦着、也不会重新贴底。
+    if (restoreGate(historyLoading) === 'wait') return;
+    const plan = planRestore(memo, renderGroups.map(groupAnchorId), INITIAL_RENDER);
+    if (plan.kind === 'anchor' && renderLimit < plan.renderLimit) { setRenderLimit(plan.renderLimit); return; }
+    const node = plan.kind === 'anchor' ? findAnchorNode(el, plan.anchorId) : null;
+    pendingRestoreRef.current = null;
+    if (plan.kind !== 'anchor' || !node) {
+      scrollMemory.delete(sid);
+      paneScrollRef.current.clear();
+      scheduleScrollFlush();
+      setRenderLimit(INITIAL_RENDER);
+      stickToBottomRef.current = true;
+      setShowJumpToBottom(false);
+      scrollContainerToBottom(el, () => stickToBottomRef.current);
+      return;
+    }
+    const apply = (): number => {
+      const box = anchorBox(node, el.getBoundingClientRect().top);
+      if (box) el.scrollTop = anchorScrollTop(el.scrollTop, box.top, plan.offset);
+      return el.scrollTop;
+    };
+    apply();
+    const atBottom = el.scrollHeight - el.scrollTop - el.clientHeight <= 60;
+    stickToBottomRef.current = atBottom;
+    setShowJumpToBottom(!atBottom);
+    let userMoved = false;
+    const onUser = () => { userMoved = true; };
+    const intents = ['wheel', 'pointerdown', 'keydown', 'touchstart'] as const;
+    for (const ev of intents) el.addEventListener(ev, onUser, { passive: true });
+    // 从第一帧真正画出来算起：刚启动时窗口还藏着、不出帧，等它显示出来宽度才定（那时才会重新折行）。
+    let until = 0;
+    const settle = () => {
+      if (!until) until = performance.now() + 1000;
+      if (!userMoved && sessionIdRef.current === sid && node.isConnected && !stickToBottomRef.current && performance.now() < until) {
+        apply();
+        requestAnimationFrame(settle);
+        return;
+      }
+      for (const ev of intents) el.removeEventListener(ev, onUser);
+    };
+    requestAnimationFrame(settle);
+  }, [currentSessionId, historyLoading, renderGroups, renderLimit]);
 
   /**
    * 重新算这一格的命中。
@@ -4068,6 +4227,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         ref={chatMessagesRef}
         onScroll={(e) => {
           const el = e.currentTarget;
+          // 还在等这份记录到了再回原位置：这时的 scroll 是换内容时 scrollTop 被夹出来的，不是你在滚。
+          if (pendingRestoreRef.current) return;
+          captureScrollPosition();
           // Sticky-bottom detection: within 60px of the bottom counts as "at
           // bottom" (covers fractional scroll heights and in-flight layout).
           const distanceFromBottom = el.scrollHeight - el.scrollTop - el.clientHeight;
@@ -4117,12 +4279,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         )}
 
         {visibleGroups.map((group) => (
-          /*
+          /* 外面这层 display: contents，不占版面；只给「切会话回到原位置」标出这一组是哪条消息（groupAnchorId）。 */
+          <div
+            className="chat-anchor"
+            data-anchor-id={groupAnchorId(group)}
+            key={`${currentSessionId ?? 'none'}:${group.kind === 'assistant' ? group.segments[group.segments.length - 1].id : groupAnchorId(group)}`}
+          >
+          {/*
             清空那条**画成分界线**，不画成用户气泡：一个写着 `/clear` 的气泡说不出
             「上面的模型不记得了」，而那正是这条消息在这一页上唯一的意义。
             两句话都要有：上面的不记得了（否则你以为它记得）、记录还在（否则你以为清空把历史弄丢了）。
-          */
-          group.kind === 'user' && isClearCommand((group as any).base) ? (
+          */}
+          {group.kind === 'user' && isClearCommand((group as any).base) ? (
             <div className="chat-clear-line" key={`${currentSessionId ?? 'none'}:${group.base.id}`}>
               <span>{clearNoteText(hiddenGroupCount, findLang)}</span>
             </div>
@@ -4159,7 +4327,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               foldThinking={autoFoldThinking}
               foldTools={autoFoldTools}
             />
-          )
+          )}
+          </div>
         ))}
 
         {plan.length > 0 && (

@@ -1406,6 +1406,11 @@ button, input, select, textarea {
   -webkit-user-drag: none;
 }
 
+/* 每组消息外面那层：只带 data-anchor-id 给「切会话回到原位置」用，不参与布局。 */
+.chat-anchor {
+  display: contents;
+}
+
 .message {
   margin-bottom: 20px;
   width: 80%;
