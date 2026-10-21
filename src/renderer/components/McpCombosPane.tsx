@@ -1,5 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useT } from '../hooks/useLang';
+import { formatJsonOnOpen, formatJsonText, jsonErrorAt } from '../jsonText.ts';
+import { JsonCodeEditor } from './JsonCodeEditor';
 
 /**
  * **Claude Code / Codex 面板里的「🧩 组合」那页** ——「不同对话挂不同的 MCP」。
@@ -14,11 +16,8 @@ import { useT } from '../hooks/useLang';
 const api = () => (window as any).kiroApi;
 
 function syntaxError(text: string, t: (k: string, v?: Record<string, string | number>) => string): string | null {
-  try { JSON.parse(text); return null; } catch (e: any) {
-    const msg = String(e?.message || e);
-    const pos = /position (\d+)/.exec(msg);
-    return pos ? t('Line {line}: {msg}', { line: text.slice(0, Number(pos[1])).split('\n').length, msg }) : msg;
-  }
+  const at = jsonErrorAt(text);
+  return at && `${t('Line {line}, column {column}', { line: at.line, column: at.column })}: ${at.message}`;
 }
 
 export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) => {
@@ -35,7 +34,9 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     let alive = true;
     void api()?.mcpCombosFile?.().then((r: { path: string; exists: boolean; text: string; error?: string }) => {
       if (!alive || !r) return;
-      setPath(r.path); setExists(r.exists); setContent(r.text); setInitial(r.exists ? r.text : '');
+      /* 打开就展开成 2 空格缩进（不合法的原样显示，下面标出错位置）；initial 也用展开后的，光打开不算改动 */
+      const text = formatJsonOnOpen(r.text);
+      setPath(r.path); setExists(r.exists); setContent(text); setInitial(r.exists ? text : '');
       if (r.error) setStatus({ ok: false, text: t('The file on disk has errors, so only "General" is used for now: {error}', { error: r.error }) });
     }).catch((err: any) => { if (alive) setStatus({ ok: false, text: String(err?.message || err) }); })
       .finally(() => { if (alive) setLoading(false); });
@@ -43,15 +44,18 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   }, []);
 
   const invalid = syntaxError(content, t);
+  const errorLine = invalid ? jsonErrorAt(content)?.line : null;
   const dirty = content !== initial;
 
   const save = async () => {
     if (invalid || saving) return;
     setSaving(true); setStatus(null);
     try {
-      const r = await api().saveMcpCombos(content);
+      /* 按格式化后的样子写盘（只动空白，不改语义；校验仍在 main 那边） */
+      const text = formatJsonText(content).text ?? content;
+      const r = await api().saveMcpCombos(text);
       if (r?.ok) {
-        setInitial(content); setExists(true);
+        setContent(text); setInitial(text); setExists(true);
         setStatus({ ok: true, text: t('Saved. Sessions using this combo pick up the new content the next time they reconnect; to apply it now, switch to another combo in the bottom-left and back.') });
       } else {
         setStatus({ ok: false, text: t('Not saved: {error}', { error: r?.error || t('Validation failed') }) });
@@ -80,16 +84,15 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
           ) : (
             <>
               <div className={`agent-config-editor-shell ${invalid ? 'invalid' : 'valid'}`}>
-                <textarea
-                  className="agent-config-editor-textarea"
+                <JsonCodeEditor
                   value={content}
-                  onChange={(ev) => setContent(ev.target.value)}
+                  errorLine={errorLine}
+                  onChange={setContent}
                   onKeyDown={(ev) => {
                     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 's') { ev.preventDefault(); void save(); }
                     else if (ev.key === 'Escape') { ev.preventDefault(); onClose(); }
                   }}
-                  spellCheck={false}
-                  aria-label="mcp-combos.json"
+                  ariaLabel="mcp-combos.json"
                 />
               </div>
               {invalid
@@ -101,6 +104,14 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       </div>
       <div className="agent-config-editor-actions">
         {status && <span className={status.ok ? 'saved' : 'error'}>{status.text}</span>}
+        <button
+          className="btn deny"
+          onClick={() => { const r = formatJsonText(content); if (r.ok) setContent(r.text!); }}
+          disabled={loading || !!invalid || saving}
+          title={t('Format with two-space indentation')}
+        >
+          {t('Format JSON')}
+        </button>
         <button className="btn deny" onClick={onClose}>{t('Close')}</button>
         <button
           className="btn allow"

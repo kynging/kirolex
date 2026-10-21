@@ -4807,6 +4807,56 @@ button, input, select, textarea {
   border: 0;
 }
 
+/* JsonCodeEditor：透明文字的 textarea 叠在高亮层上。两层的字体 / 字号 / 行高 / padding 必须一模一样，
+   否则光标和看到的字对不上。 */
+.json-code-editor {
+  position: relative;
+  display: flex;
+  flex: 1;
+  min-width: 0;
+  min-height: 0;
+  overflow: hidden;
+}
+
+.json-code-editor-highlight {
+  position: absolute;
+  inset: 0;
+  margin: 0;
+  padding: 14px 12px;
+  overflow: hidden;
+  pointer-events: none;
+  color: var(--text-primary);
+  font-family: var(--mono-font);
+  font-size: 12px;
+  line-height: 1.55;
+  tab-size: 2;
+  white-space: pre;
+}
+
+.json-code-editor-highlight > code {
+  display: block;
+  font: inherit;
+  will-change: transform;
+}
+
+.agent-config-editor-shell .json-code-editor .agent-config-editor-textarea {
+  position: relative;
+  color: transparent;
+  caret-color: var(--text-primary);
+}
+
+.json-code-editor .agent-config-editor-textarea::selection {
+  background: color-mix(in srgb, var(--accent) 35%, transparent);
+}
+
+.json-code-editor-highlight .hljs-attr { color: #9cdcfe; }
+.json-code-editor-highlight .hljs-string { color: #ce9178; }
+.json-code-editor-highlight .hljs-number { color: #b5cea8; }
+.json-code-editor-highlight .hljs-literal,
+.json-code-editor-highlight .hljs-keyword { color: #569cd6; }
+.json-code-editor-highlight .hljs-punctuation { color: var(--text-secondary); }
+.json-code-editor-highlight .hljs-comment { color: #6a7581; font-style: italic; }
+
 .agent-config-validation.invalid {
   display: flex;
   align-items: flex-start;

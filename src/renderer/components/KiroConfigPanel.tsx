@@ -1,5 +1,7 @@
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useT } from '../hooks/useLang';
+import { formatJsonOnOpen, formatJsonText, jsonErrorAt } from '../jsonText.ts';
+import { JsonCodeEditor } from './JsonCodeEditor';
 
 /**
  * **机器人按钮里 Agent 之外的那几个 tab** —— 每个 tab 都是"文件列表 + 编辑器"，
@@ -36,13 +38,9 @@ function jsonError(text: string, t: (k: string, v?: Record<string, string | numb
     if (!v || typeof v !== 'object' || Array.isArray(v)) return t('Must be a JSON object');
     return null;
   } catch (e: any) {
-    const msg = String(e?.message || e);
-    const pos = /position (\d+)/.exec(msg);
-    if (pos) {
-      const line = text.slice(0, Number(pos[1])).split('\n').length;
-      return t('Line {line}: {msg}', { line, msg });
-    }
-    return msg;
+    const at = jsonErrorAt(text);
+    if (at) return `${t('Line {line}, column {column}', { line: at.line, column: at.column })}: ${at.message}`;
+    return String(e?.message || e);
   }
 }
 
@@ -73,10 +71,12 @@ export const KiroConfigPanel: React.FC<{
       const r = await api().kiroConfigRead(sessionId, category.id, name);
       if (!r?.ok) { setStatus({ text: r?.error || t('Could not read'), ok: false }); return; }
       if (r.where) setWhere(r.where);
-      setSelected(name); setPath(r.path || ''); setContent(r.content || ''); setInitial(r.content || '');
+      /* JSON 打开就展开成 2 空格缩进（不合法的原样显示）；initial 也用展开后的，光打开不算改动 */
+      const text = category.json ? formatJsonOnOpen(r.content || '') : (r.content || '');
+      setSelected(name); setPath(r.path || ''); setContent(text); setInitial(text);
       setExists(r.exists !== false);
     } finally { setLoading(false); }
-  }, [sessionId, category.id, t]);
+  }, [sessionId, category.id, category.json, t]);
 
   const refresh = useCallback(async (pick?: string) => {
     setListError(null);
@@ -105,6 +105,8 @@ export const KiroConfigPanel: React.FC<{
     () => (category.json && content.trim() ? jsonError(content, t) : null),
     [category.json, content, t],
   );
+  /** 语法错的位置（行号栏标红那一行）；合法但不是对象时没有位置 */
+  const syntaxAt = useMemo(() => (invalid ? jsonErrorAt(content) : null), [invalid, content]);
   const dirty = content !== initial;
   const selectedEntry = entries.find((e) => e.name === selected);
   const canEdit = !category.readOnly && !selectedEntry?.readOnly && (category.kind === 'single' || !!selected);
@@ -113,13 +115,15 @@ export const KiroConfigPanel: React.FC<{
     if (!canEdit || invalid || saving || (!dirty && exists)) return;
     setSaving(true); setStatus(null);
     try {
-      const r = await api().kiroConfigWrite(sessionId, category.id, selected, content);
+      /* JSON 按格式化后的样子写盘（只动空白，不改语义） */
+      const text = category.json ? (formatJsonText(content).text ?? content) : content;
+      const r = await api().kiroConfigWrite(sessionId, category.id, selected, text);
       if (!r?.ok) { setStatus({ text: r?.error || t('Not saved'), ok: false }); return; }
-      setInitial(content); setExists(true); setPath(r.path || path);
+      setContent(text); setInitial(text); setExists(true); setPath(r.path || path);
       setStatus({ text: where ? t('Saved ({where})', { where }) : t('Saved'), ok: true });
       if (category.kind === 'list') void api().kiroConfigList(sessionId, category.id).then((x: any) => x?.ok && setEntries(x.entries || []));
     } finally { setSaving(false); }
-  }, [canEdit, invalid, saving, dirty, exists, sessionId, category.id, category.kind, selected, content, path, where, t]);
+  }, [canEdit, invalid, saving, dirty, exists, sessionId, category.id, category.kind, category.json, selected, content, path, where, t]);
 
   const create = useCallback(async () => {
     let n = String(newName || '').trim();
@@ -133,7 +137,12 @@ export const KiroConfigPanel: React.FC<{
   }, [newName, category.ext, category.id, entries, sessionId, refresh, t]);
 
   const format = () => {
-    try { setContent(`${JSON.stringify(JSON.parse(content), null, 2)}\n`); } catch { /* 有错就不动 */ }
+    const r = formatJsonText(content);
+    if (r.ok) setContent(r.text!); /* 有错就不动 */
+  };
+  const keyDown = (ev: React.KeyboardEvent<HTMLTextAreaElement>) => {
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 's') { ev.preventDefault(); void save(); }
+    else if (ev.key === 'Escape') { ev.preventDefault(); onClose(); }
   };
 
   return (
@@ -201,17 +210,25 @@ export const KiroConfigPanel: React.FC<{
           ) : (
             <>
               <div className={`agent-config-editor-shell ${invalid ? 'invalid' : 'valid'}`}>
-                <textarea
-                  className={`agent-config-editor-textarea${category.json ? '' : ' kiro-config-prose'}`}
-                  value={content}
-                  readOnly={!canEdit}
-                  onChange={(ev) => setContent(ev.target.value)}
-                  onKeyDown={(ev) => {
-                    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === 's') { ev.preventDefault(); void save(); }
-                    else if (ev.key === 'Escape') { ev.preventDefault(); onClose(); }
-                  }}
-                  spellCheck={false}
-                />
+                {category.json ? (
+                  <JsonCodeEditor
+                    value={content}
+                    readOnly={!canEdit}
+                    errorLine={syntaxAt?.line}
+                    onChange={setContent}
+                    onKeyDown={keyDown}
+                    ariaLabel={category.file || selected}
+                  />
+                ) : (
+                  <textarea
+                    className="agent-config-editor-textarea kiro-config-prose"
+                    value={content}
+                    readOnly={!canEdit}
+                    onChange={(ev) => setContent(ev.target.value)}
+                    onKeyDown={keyDown}
+                    spellCheck={false}
+                  />
+                )}
               </div>
               {category.json && (invalid
                 ? <div className="agent-config-validation invalid"><span>{invalid}</span></div>

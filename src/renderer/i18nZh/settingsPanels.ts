@@ -10,7 +10,6 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Uploaded {uploaded} files, {skipped} unchanged.': '传了 {uploaded} 个文件，{skipped} 个没变。',
   'Clear': '清除',
   'Test connection': '测试连接',
-  'Line {line}: {msg}': '第 {line} 行：{msg}',
   'This file does not exist yet; saving will create it.': '这个文件还不存在，保存就会建出来。',
 
   // ── backupGroups.ts ──

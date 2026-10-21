@@ -5,6 +5,8 @@ import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMe
 import { KiroConfigPanel, type KiroConfigCategory } from './KiroConfigPanel';
 import { EngineLoginPane } from './LoginSettings.tsx';
 import { McpCombosPane } from './McpCombosPane.tsx';
+import { JsonCodeEditor } from './JsonCodeEditor';
+import { formatJsonOnOpen, formatJsonText } from '../jsonText.ts';
 import ReactMarkdown from 'react-markdown';
 import { mdText } from '../mdText';
 // 「这段文字是不是路径」的判据 —— 抽出来是为了能被 node:test 测到（.tsx 跑不了测试）
@@ -3189,7 +3191,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [pickerPos, setPickerPos] = useState<{ left: number; bottom: number }>({ left: 0, bottom: 0 });
   const importBtnRef = useRef<HTMLButtonElement>(null);
   const agentConfigTextareaRef = useRef<HTMLTextAreaElement>(null);
-  const agentConfigLineNumbersRef = useRef<HTMLDivElement>(null);
 
   const [agentConfigEditor, setAgentConfigEditor] = useState<AgentConfigEditorState | null>(null);
   /* 机器人面板的 tab：'agents' 是原来那个编辑器，其余的见 KiroConfigPanel */
@@ -3242,8 +3243,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
   const formatAgentConfig = useCallback(() => {
     if (!agentConfigEditor || agentConfigValidationError) return;
-    const formatted = `${JSON.stringify(JSON.parse(agentConfigEditor.content), null, 2)}\n`;
-    updateAgentConfigContent(formatted);
+    const formatted = formatJsonText(agentConfigEditor.content);
+    if (formatted.ok) updateAgentConfigContent(formatted.text!);
   }, [agentConfigEditor, agentConfigValidationError, updateAgentConfigContent]);
 
   const focusAgentConfigError = useCallback(() => {
@@ -3268,9 +3269,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       (agentConfigValidationError.line - 1) * lineHeight - textarea.clientHeight / 2,
     );
     textarea.scrollTop = scrollTop;
-    if (agentConfigLineNumbersRef.current) {
-      agentConfigLineNumbersRef.current.scrollTop = scrollTop;
-    }
   }, [agentConfigEditor, agentConfigValidationError]);
 
   const loadAgentConfig = useCallback(async (agentName: string) => {
@@ -3317,8 +3315,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           : {
               agentName,
               path: result.path,
-              content: result.content,
-              initialContent: result.content,
+              /* 打开就展开成 2 空格缩进（不合法的原样显示）；initialContent 也用展开后的，光打开不算改动 */
+              content: formatJsonOnOpen(result.content),
+              initialContent: formatJsonOnOpen(result.content),
             };
       setAgentConfigEditor(loadedConfig);
       setAgentConfigDrafts((current) => ({
@@ -3475,6 +3474,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       return;
     }
 
+    // 按格式化后的样子写盘（只动空白，不改语义）
+    const content = formatJsonText(agentConfigEditor.content).text ?? agentConfigEditor.content;
     setAgentConfigSaving(true);
     setAgentConfigStatus(null);
     try {
@@ -3485,7 +3486,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         currentSessionId,
         agentConfigEditor.agentName,
         agentSource,
-        agentConfigEditor.content,
+        content,
       );
       if (!result.saved) {
         setAgentConfigStatus(result.error || t('Unable to save this Agent configuration.'));
@@ -3493,7 +3494,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       }
       const savedConfig: AgentConfigEditorState = {
         ...agentConfigEditor,
-        initialContent: agentConfigEditor.content,
+        content,
+        initialContent: content,
         path: result.path || agentConfigEditor.path,
       };
       setAgentConfigEditor(savedConfig);
@@ -5131,35 +5133,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 ) : (
                   <>
                     <div className={`agent-config-editor-shell ${agentConfigValidationError ? 'invalid' : 'valid'}`}>
-                      <div
-                        ref={agentConfigLineNumbersRef}
-                        className="agent-config-line-numbers"
-                        aria-hidden="true"
-                      >
-                        {agentConfigLines.map((_, index) => {
-                          const lineNumber = index + 1;
-                          const isErrorLine = agentConfigValidationError?.line === lineNumber;
-                          return (
-                            <span
-                              key={lineNumber}
-                              className={isErrorLine ? 'error' : ''}
-                              title={isErrorLine ? t('JSON error on this line') : undefined}
-                            >
-                              {lineNumber}
-                            </span>
-                          );
-                        })}
-                      </div>
-                      <textarea
+                      <JsonCodeEditor
                         ref={agentConfigTextareaRef}
-                        className="agent-config-editor-textarea"
                         value={agentConfigEditor.content}
-                        onChange={(event) => updateAgentConfigContent(event.target.value)}
-                        onScroll={(event) => {
-                          if (agentConfigLineNumbersRef.current) {
-                            agentConfigLineNumbersRef.current.scrollTop = event.currentTarget.scrollTop;
-                          }
-                        }}
+                        errorLine={agentConfigValidationError?.line}
+                        onChange={updateAgentConfigContent}
                         onKeyDown={(event) => {
                           if ((event.metaKey || event.ctrlKey) && event.key.toLowerCase() === 's') {
                             event.preventDefault();
@@ -5169,8 +5147,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                             closeAgentConfig();
                           }
                         }}
-                        aria-invalid={!!agentConfigValidationError}
-                        spellCheck={false}
                         autoFocus
                       />
                     </div>
