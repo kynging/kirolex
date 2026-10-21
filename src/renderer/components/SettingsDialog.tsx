@@ -7,6 +7,7 @@ import { ForwardMcpSettings } from './ForwardMcpSettings';
 import { LocalBrowserSettings } from './LocalBrowserSettings';
 import { useT } from '../hooks/useLang';
 import { fontSelectOptions } from '../fontOptions';
+import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
 import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
@@ -258,6 +259,24 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
       if (names.length) setModelChoices(names);
     }).catch(() => {});
   }, []);
+  /*
+    **新会话默认组合**（Claude Code / Codex）——「帮我做一个默认通用的吧」。全局一个，项目在侧栏项目菜单里覆盖。
+    只影响之后新建的会话（本机和远端），已有会话不动。设的那个本机没有时下拉里明说按通用。
+  */
+  const [comboInfo, setComboInfo] = useState<DefaultComboInfo | null>(null);
+  const [comboErr, setComboErr] = useState('');
+  useEffect(() => {
+    window.kiroApi.defaultCombo?.().then((r) => { if (r) setComboInfo(r); }).catch(() => {});
+  }, []);
+  const saveDefaultCombo = async (id: string) => {
+    setComboErr('');
+    try {
+      const r = await window.kiroApi.setDefaultCombo?.(id);
+      if (r && !r.ok) setComboErr(r.error || '');
+    } catch (err: any) { setComboErr(String(err?.message || err)); }
+    const next = await window.kiroApi.defaultCombo?.().catch(() => null);
+    if (next) setComboInfo(next);
+  };
   const saveHelper = (model: string, fallback: string) => {
     setHelperModel(model);
     setHelperFallback(fallback);
@@ -454,6 +473,22 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           {/* 会话那一页：分屏、并发、卡死判定、辅助模型 —— 都是「会话怎么跑」的旋钮 */}
           {tab === 'session' && (
           <div className="settings-col">
+            <div className="settings-item">
+              <label className="settings-label">{t('Default combo for new sessions (Claude Code / Codex)')}</label>
+              <div className="settings-control">
+                <select
+                  value={comboInfo ? (defaultComboOptions(comboInfo, 'global', t).find((o) => o.selected)?.value ?? 'default') : 'default'}
+                  onChange={(e) => void saveDefaultCombo(e.target.value)}
+                  disabled={!comboInfo}
+                  style={{ minWidth: 220 }}
+                >
+                  {(comboInfo ? defaultComboOptions(comboInfo, 'global', t) : [{ value: 'default', label: t('General purpose'), selected: true }])
+                    .map((o) => <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>)}
+                </select>
+              </div>
+              <p className="settings-hint">{t('New Claude Code / Codex sessions (on this machine or remote) start with this combo; existing sessions are not changed. A project can override it from its menu in the sidebar. The combos themselves are edited on the 🧩 Combos page of the Claude Code / Codex config panel.')}</p>
+              {comboErr && <p className="settings-hint error">{t('Could not set it: {reason}', { reason: comboErr })}</p>}
+            </div>
             {/* 「重试次数默认是 10，可以在 setting 中调整」 */}
             <div className="settings-item">
               <label className="settings-label">{t('Auto-retry attempts (interruptions you didn’t cause)')}</label>

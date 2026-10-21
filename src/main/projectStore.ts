@@ -37,7 +37,18 @@ export interface ProjectConfig {
    *   写入许可的基准目录
    */
   workspace?: string;
+  /**
+   * 这个 project 里新建 Claude Code / Codex 会话默认用哪个组合（`defaultCombo.ts`）。
+   * 空 = 跟着全局的设置；`default` = 明确用内置「通用」。
+   */
+  defaultMcpCombo?: string;
 }
+
+const clean = (raw: any): ProjectConfig => {
+  const workspace = String(raw?.workspace || '').trim();
+  const combo = String(raw?.defaultMcpCombo || '').trim();
+  return { ...(workspace ? { workspace } : {}), ...(/^[A-Za-z0-9_-]{1,64}$/.test(combo) ? { defaultMcpCombo: combo } : {}) };
+};
 
 const configFile = (home: string, project: string) =>
   path.join(home, '.kirolex', 'projects', projectDirName(project), 'project.json');
@@ -46,18 +57,20 @@ export function readProject(home: string, project: string): ProjectConfig {
   try {
     const raw = JSON.parse(fs.readFileSync(configFile(home, project), 'utf8'));
     if (!raw || typeof raw !== 'object') return {};
-    const workspace = String((raw as any).workspace || '').trim();
-    return workspace ? { workspace } : {};
+    return clean(raw);
   } catch { return {}; }
 }
 
-/** 原子写，和其它 store 一样：半写的配置会让下一次起会话落在一个不存在的目录里。 */
+/**
+ * 原子写，和其它 store 一样：半写的配置会让下一次起会话落在一个不存在的目录里。
+ * **只改传进来的那几项**（其余照旧）：改工作目录不能把「新会话默认组合」冲掉，反过来也一样。
+ */
 export function writeProject(home: string, project: string, config: ProjectConfig): void {
   const file = configFile(home, project);
   fs.mkdirSync(path.dirname(file), { recursive: true });
-  const workspace = String(config?.workspace || '').trim();
+  const next = clean({ ...readProject(home, project), ...config });
   const tmp = `${file}.tmp`;
-  fs.writeFileSync(tmp, JSON.stringify(workspace ? { workspace } : {}, null, 2));
+  fs.writeFileSync(tmp, JSON.stringify(next, null, 2));
   fs.renameSync(tmp, file);
 }
 

@@ -30,3 +30,46 @@ export function comboSelectView(
   }
   return { value: list?.current || 'default' };
 }
+
+/**
+ * **「新会话默认组合」下拉的选项**（设置里的全局那个、侧栏项目菜单里的项目覆盖）。
+ *
+ * 设的那个在本机的 `mcp-combos.json` 里没有时（别的电脑上的、被删了、文件有错），新会话按「通用」——
+ * 和上面 `comboSelectView` 同一个说法：加一条选中的、不可选的提示项明说，不悄悄显示成「通用」。
+ * `follow`：项目菜单里的第一项「跟随全局（…）」，值是 ''。
+ */
+export type DefaultComboInfo = {
+  combos: Array<{ id: string; name: string }>;
+  global: string;
+  project?: string;
+  error?: string;
+};
+
+export type DefaultComboOption = { value: string; label: string; selected: boolean; disabled?: boolean };
+
+export function defaultComboOptions(
+  info: DefaultComboInfo,
+  scope: 'global' | 'project',
+  t: T,
+): DefaultComboOption[] {
+  const chosen = scope === 'global' ? (info.global || 'default') : (info.project || '');
+  const nameOf = (id: string) => info.combos.find((c) => c.id === id)?.name;
+  const out: DefaultComboOption[] = [];
+  if (scope === 'project') {
+    const g = info.global || 'default';
+    const gName = nameOf(g) || t('General purpose');
+    out.push({ value: '', label: t('Follow global ({name})', { name: gName }), selected: chosen === '' });
+  }
+  for (const c of info.combos) out.push({ value: c.id, label: c.name, selected: c.id === chosen });
+  if (chosen && !info.combos.some((c) => c.id === chosen)) {
+    out.push({
+      value: chosen,
+      label: info.error
+        ? t('Combo "{id}" could not be read (the combo file has an error); new sessions use General', { id: chosen })
+        : t('Combo "{id}" does not exist on this machine; new sessions use General', { id: chosen }),
+      selected: true,
+      disabled: true,
+    });
+  }
+  return out;
+}

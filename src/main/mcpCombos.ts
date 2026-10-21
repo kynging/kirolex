@@ -62,8 +62,20 @@ export function mcpCombosPath(home: string): string {
   return path.join(home, '.kirolex', 'mcp-combos.json');
 }
 
-/** 面板里文件还不存在时给的样板 */
+/**
+ * 面板里「插入示例」插进去的样板（文件不存在时**不**直接显示成内容 —— 看着像「投研」已经配好了）。
+ * 第一条是「通用（带本机工具）」的写法：`forwardFromLocal: true` 的 MCP 在远程会话里经本机转发（本机起、远端用），
+ * 本地会话里照常直接用；http 型（如 context7）不需要转发。
+ */
 export const MCP_COMBOS_TEMPLATE = `[
+  {
+    "id": "general",
+    "name": "通用（带本机工具）",
+    "mcpServers": {
+      "builder-mcp": { "command": "builder-mcp", "forwardFromLocal": true },
+      "context7": { "url": "https://mcp.context7.com/mcp" }
+    }
+  },
   {
     "id": "research",
     "name": "投研",

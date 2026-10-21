@@ -8679,6 +8679,11 @@ button, input, select, textarea {
 /* 「组合」那页只有一份文件，没有左边的文件列表：编辑器占满整行 */
 .agent-config-editor-workspace.mcp-combos-workspace { grid-template-columns: minmax(0, 1fr); }
 .mcp-combos-workspace .kiro-config-ro-tag { white-space: nowrap; }
+/* 组合文件还不存在：「还没有自定义组合」+「插入示例」，竖着排、居中（不把示例直接当内容显示） */
+.agent-config-editor-message.mcp-combos-empty { flex-direction: column; gap: 10px; padding: 24px; text-align: center; color: var(--text-secondary); }
+.mcp-combos-empty .kiro-config-hint { max-width: 520px; }
+.mcp-combos-empty .btn { padding: 8px 16px; border: 0; border-radius: 6px; font-family: inherit; font-size: 13px; font-weight: 500; cursor: pointer; background: var(--accent); color: #fff; }
+.mcp-combos-empty .btn:disabled { opacity: 0.45; cursor: default; }
 
 /* 备份/恢复页上的项目记忆状态：和会话的三种状态同色，空壳单独标红 */
 .backup-mem { font-size: 11.5px; padding: 1px 7px; border-radius: 4px; white-space: nowrap; border: 1px solid var(--border); color: var(--text-secondary); }

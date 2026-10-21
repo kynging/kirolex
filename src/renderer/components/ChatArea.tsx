@@ -3383,7 +3383,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     });
     void api?.engineModels?.(currentSessionId).then((d: any) => { if (alive && d) setEngineModels(d); }).catch(() => {});
     return () => { alive = false; try { off?.(); } catch { /* 卸载 */ } };
-  }, [nonKiro, currentSessionId, engine, status]);
+  /* sessionConnected：新会话的记录（带默认组合）是连上之后才写的，连上时再读一遍 */
+  }, [nonKiro, currentSessionId, engine, status, sessionConnected]);
   /*
     **「组合」下拉**（取代原来的 effort 下拉）——「不同对话挂不同的 MCP」。清单是本机全局的
     `~/.kirolex/mcp-combos.json`（面板里「🧩 组合」那页改），每条会话记自己选的那个；换了要重启执行器（main 做）。
@@ -3403,7 +3404,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     load();
     const off = api?.onMcpCombosChanged?.(load);
     return () => { alive = false; try { off?.(); } catch { /* 卸载 */ } };
-  }, [nonKiro, currentSessionId, engine, status]);
+  /* sessionConnected：新会话的记录（带默认组合）是连上之后才写的，连上时再读一遍 */
+  }, [nonKiro, currentSessionId, engine, status, sessionConnected]);
   const onMcpComboChange = async (comboId: string): Promise<void> => {
     if (!currentSessionId) return;
     const sid = currentSessionId;

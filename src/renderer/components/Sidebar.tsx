@@ -32,6 +32,7 @@ import type { Session } from '../App';
 import type { ScheduleSummary } from '../scheduleView';
 import { IconLogs, IconWorkspaceFolder } from './Icons';
 import { showToast } from './Toasts';
+import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
 
 type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
 
@@ -593,6 +594,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
   const [assignPopup, setAssignPopup] = useState<{ sessionId: string } | null>(null);
   const [projectMenu, setProjectMenu] = useState<{ x: number; y: number; project: string } | null>(null);
   const [projectRenamePopup, setProjectRenamePopup] = useState<{ project: string } | null>(null);
+  /** 项目菜单打开时读一次：这个项目的「新会话默认组合」（跟随全局 / 覆盖成哪个） */
+  const [projectCombo, setProjectCombo] = useState<{ project: string; info: DefaultComboInfo } | null>(null);
+  useEffect(() => {
+    const project = projectMenu?.project;
+    if (!project) { setProjectCombo(null); return; }
+    let alive = true;
+    void (window as any).kiroApi?.defaultCombo?.(project)
+      .then((info: DefaultComboInfo) => { if (alive && info) setProjectCombo({ project, info }); })
+      .catch(() => {});
+    return () => { alive = false; };
+  }, [projectMenu?.project]);
+  const onSetProjectCombo = async (project: string, comboId: string): Promise<void> => {
+    const r = await (window as any).kiroApi?.setDefaultCombo?.(comboId, project)
+      .catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    if (r && !r.ok) showToast(t('Could not set it: {reason}', { reason: r.error || t('unknown reason') }));
+  };
   const [activeId, setActiveId] = useState<string | null>(null);
   const t = useT();
   const lang = useLang();
@@ -1355,6 +1372,28 @@ export const Sidebar: React.FC<SidebarProps> = ({
               </div>
             </>
           )}
+          {/*
+            这个项目里新建 Claude Code / Codex 会话默认用哪个组合 ——「帮我做一个默认通用的吧」的项目覆盖。
+            第一项「跟随全局」= 不覆盖；设的那个本机没有时选中一条明说「新会话按通用」的提示项。
+          */}
+          {projectCombo?.project === projectMenu.project && (() => {
+            const opts = defaultComboOptions(projectCombo.info, 'project', t);
+            const cur = opts.find((o) => o.selected);
+            return (
+              <Submenu label={t('🧩 New-session combo: {name}', { name: cur?.label || t('General purpose') })}>
+                <div className="context-menu-hint" style={{ padding: '4px 12px' }}>{t('Combo for new Claude Code / Codex sessions in this project; existing sessions are not changed')}</div>
+                {opts.map((o) => (
+                  <div
+                    key={o.value || '(follow)'}
+                    className={`context-menu-item${o.disabled ? ' disabled' : ''}`}
+                    onClick={() => { if (o.disabled) return; void onSetProjectCombo(projectMenu.project, o.value); setProjectMenu(null); }}
+                  >
+                    {`${o.selected ? '✓ ' : '　'}${o.label}`}
+                  </div>
+                ))}
+              </Submenu>
+            );
+          })()}
           <div className="context-menu-divider" />
           <div
             className="context-menu-item danger"

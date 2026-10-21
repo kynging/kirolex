@@ -26,7 +26,8 @@ test('本地工具通道带上浏览器工具；本地会话（新建 + 重连�
   assert.match(M, /if \(!remote\?\.sshHost\) return withLocalBrowser\(sessionId, localComboTools\(sessionId, profile\)\);/);
   const AC = src('main', 'acp-client.ts');
   assert.match(AC, /if \(this\.engine === 'kiro' && !this\.remote\?\.sshHost && this\.localTools\?\.mcpServers\?\.length\) return this\.localTools\.mcpServers;/, '远程 kiro 不走这条');
-  assert.match(M, /: await withLocalBrowser\(kiroLexId, undefined\);/);
+  /* 新建也带上组合里的 MCP（新会话默认组合），和重连那条同一个写法 */
+  assert.match(M, /: await withLocalBrowser\(kiroLexId, localComboTools\(kiroLexId, profile\)\);/);
   const fn = M.slice(M.indexOf('async function withLocalBrowser('), M.indexOf('async function withLocalBrowser(') + 900);
   assert.match(fn, /browserOnly: true/);
   /* 开关关着：浏览器那几个工具不列（判据在 tools/list，见 localMcp.toolDefs） */

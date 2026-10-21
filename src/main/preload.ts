@@ -141,6 +141,9 @@ contextBridge.exposeInMainWorld('kiroApi', {
   mcpCombos: (sessionId?: string) => ipcRenderer.invoke('acp:mcp-combos', sessionId),
   mcpCombosFile: () => ipcRenderer.invoke('acp:mcp-combos-file'),
   saveMcpCombos: (text: string) => ipcRenderer.invoke('acp:save-mcp-combos', text),
+  /** 新会话默认组合：不传 project = 全局；传了 = 那个项目的覆盖（'' = 跟随全局） */
+  defaultCombo: (project?: string) => ipcRenderer.invoke('acp:default-combo', project),
+  setDefaultCombo: (comboId: string, project?: string) => ipcRenderer.invoke('acp:set-default-combo', comboId, project),
   switchMcpCombo: (sessionId: string, comboId: string) => ipcRenderer.invoke('acp:switch-mcp-combo', sessionId, comboId),
   onMcpCombosChanged: (cb: () => void) => {
     const handler = () => cb();

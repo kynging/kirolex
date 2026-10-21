@@ -136,6 +136,9 @@ declare global {
       /** project 的工作目录 —— 它的会话都在这儿干活（空 = 家目录） */
       projectGetWorkspace?: (project: string) => Promise<{ workspace: string }>;
       projectSetWorkspace?: (project: string, workspace: string) => Promise<{ ok: boolean; error?: string }>;
+      /** 新会话默认组合（Claude Code / Codex）：不传 project = 全局；传了 = 那个项目的覆盖（'' = 跟随全局） */
+      defaultCombo?: (project?: string) => Promise<import('./comboPick').DefaultComboInfo>;
+      setDefaultCombo?: (comboId: string, project?: string) => Promise<{ ok: boolean; error?: string }>;
       /** `sessions` 是级联删掉的会话数，`cascaded` 是它们的 id（渲染层要按 id 从侧栏摘掉）。
        *  声明按主进程 `run:remove-flow-runs` 的实际返回值写 —— 它早就返回这四个字段了，只有这里没跟上。 */
       runRemoveFlowRuns?: (project: string, flow: string) => Promise<{ ok: boolean; removed: number; sessions?: number; cascaded?: string[] }>;

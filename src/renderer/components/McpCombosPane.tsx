@@ -26,29 +26,34 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   const [content, setContent] = useState('');
   const [initial, setInitial] = useState('');
   const [exists, setExists] = useState(true);
+  /* 「插入示例」用的样板：文件不存在时**不**直接放进编辑框（样板里有「投研」，看着像已经配好了） */
+  const [template, setTemplate] = useState('');
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
 
   useEffect(() => {
     let alive = true;
-    void api()?.mcpCombosFile?.().then((r: { path: string; exists: boolean; text: string; error?: string }) => {
+    void api()?.mcpCombosFile?.().then((r: { path: string; exists: boolean; text: string; template?: string; error?: string }) => {
       if (!alive || !r) return;
       /* 打开就展开成 2 空格缩进（不合法的原样显示，下面标出错位置）；initial 也用展开后的，光打开不算改动 */
       const text = formatJsonOnOpen(r.text);
-      setPath(r.path); setExists(r.exists); setContent(text); setInitial(r.exists ? text : '');
+      setPath(r.path); setExists(r.exists); setContent(r.exists ? text : ''); setInitial(r.exists ? text : '');
+      setTemplate(r.template || '');
       if (r.error) setStatus({ ok: false, text: t('The file on disk has errors, so only "General" is used for now: {error}', { error: r.error }) });
     }).catch((err: any) => { if (alive) setStatus({ ok: false, text: String(err?.message || err) }); })
       .finally(() => { if (alive) setLoading(false); });
     return () => { alive = false; };
   }, []);
 
-  const invalid = syntaxError(content, t);
+  /* 文件不存在、编辑框也还是空的：显示「还没有自定义组合」，不是一个空编辑框（空文本也不是合法 JSON） */
+  const empty = !exists && !content.trim();
+  const invalid = empty ? null : syntaxError(content, t);
   const errorLine = invalid ? jsonErrorAt(content)?.line : null;
   const dirty = content !== initial;
 
   const save = async () => {
-    if (saving) return;
+    if (saving || empty) return;
     /* Ctrl+S 绕过了禁用的保存按钮：JSON 有错时也要明说没存，不能什么都不发生 */
     if (invalid) { setStatus({ ok: false, text: t('Not saved: {error}', { error: invalid }) }); return; }
     setSaving(true); setStatus(null);
@@ -79,10 +84,18 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">
-            {t('A list of combos: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed.')}{!exists && ` · ${t('This file does not exist yet. Below is a template; saving will create it.')}`}
+            {t('A list of combos: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed.')}
           </div>
           {loading ? (
             <div className="agent-config-editor-message">{t('Loading…')}</div>
+          ) : empty ? (
+            <div className="agent-config-editor-message mcp-combos-empty">
+              <div>{t('No custom combos yet: right now there is only the built-in "General" (no MCP). mcp-combos.json does not exist.')}</div>
+              <div className="kiro-config-hint">{t('Insert example puts an example in the editor (a "General (with local tools)" combo using forwardFromLocal, plus a "Research" combo); edit it, then Save to create the file.')}</div>
+              <div>
+                <button className="btn allow" onClick={() => setContent(formatJsonOnOpen(template))} disabled={!template}>{t('Insert example')}</button>
+              </div>
+            </div>
           ) : (
             <>
               <div className={`agent-config-editor-shell ${invalid ? 'invalid' : 'valid'}`}>
@@ -106,12 +119,12 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       </div>
       <div className="agent-config-editor-actions">
         {status && <span className={status.ok ? 'saved' : 'error'} title={status.text}>{status.text}</span>}
-        {/* 文件不存在时编辑框里是样板（样板里正好有个「投研」）—— 明说还没存，免得看着像已经有了 */}
-        {!exists && !status && !loading && <span className="error">{t('Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.')}</span>}
+        {/* 插入了示例、还没存：明说还没存，免得看着像已经有了（样板里正好有个「投研」） */}
+        {!exists && !status && !loading && !empty && <span className="error">{t('Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.')}</span>}
         <button
           className="btn deny"
           onClick={() => { const r = formatJsonText(content); if (r.ok) setContent(r.text!); }}
-          disabled={loading || !!invalid || saving}
+          disabled={loading || empty || !!invalid || saving}
           title={t('Format with two-space indentation')}
         >
           {t('Format JSON')}
@@ -120,7 +133,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         <button
           className="btn allow"
           onClick={() => void save()}
-          disabled={loading || !!invalid || saving || (!dirty && exists)}
+          disabled={loading || empty || !!invalid || saving || (!dirty && exists)}
         >
           {saving ? t('Saving…') : t('Save')}
         </button>

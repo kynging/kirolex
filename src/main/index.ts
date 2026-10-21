@@ -103,6 +103,7 @@ import { logger } from './logger';
 import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
+import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
 import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
@@ -7047,6 +7048,9 @@ app.whenReady().then(async () => {
     }
     /* kiro 的模型 id 对另外两家没有意义：它们用自己 CLI 配的默认模型，记录里写个占位 */
     const engineModel = engine === 'kiro' ? (model || DEFAULT_MODEL) : 'default';
+    /* 新会话默认组合（全局 / 项目覆盖，`defaultCombo.ts`）—— 只在建 profile 这一刻填，已有会话不动 */
+    const newCombo = defaultComboForNewSession({ home: os.homedir(), configPath: KIROLEX_CONFIG_PATH, engine, projectId: projectId ?? derived });
+    if (newCombo.missing) logger.warn('mcp-combo', `new-session ${kiroLexId}: 默认组合 ${newCombo.missing}（${newCombo.source}）本机没有 -> 按通用`);
     const profile: AgentProfile = {
       model: engineModel,
       // Set at creation, NOT left undefined. An absent preference used to be
@@ -7059,6 +7063,7 @@ app.whenReady().then(async () => {
       kiroAgent: engine === 'kiro' ? (kiroAgent || undefined) : undefined,
       remote,
       ...(engine !== 'kiro' ? { engine } : {}),
+      ...(newCombo.mcpCombo ? { mcpCombo: newCombo.mcpCombo } : {}),
     };
     // Remote sessions run kiro-cli on the remote host, so its working directory
     // must be a REMOTE path, not the local per-session scratch dir.
@@ -7105,7 +7110,8 @@ app.whenReady().then(async () => {
     }
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
-      : await withLocalBrowser(kiroLexId, undefined);
+      /* 本地：新会话也可能一建出来就带组合（新会话默认组合），组合里的 MCP 要在 session/new 时就交出去 —— 和重连那条路（`ensureLocalTools`）一样 */
+      : await withLocalBrowser(kiroLexId, localComboTools(kiroLexId, profile));
     /*
       **远端 cwd 要在 `resolvedCwd` 定下来之后再算** —— 实测：它原来算在上面那段"没有项目目录 → 用会话目录"
       **之前**，于是 session/new 拿到的是按家目录算的 `scratch/C__Users_…-<hash>`，而 `ensureLocalTools`
@@ -10179,9 +10185,46 @@ app.whenReady().then(async () => {
       ...(error ? { error } : {}),
     };
   });
+  /* 文件不存在时 text 是空的、样板单独给（`template`）：编辑器不能把样板当成已经配好的内容显示 */
   ipcMain.handle('acp:mcp-combos-file', () => {
     const r = readMcpCombos(os.homedir());
-    return { path: mcpCombosPath(os.homedir()), exists: r.exists, text: r.exists ? r.text : MCP_COMBOS_TEMPLATE, error: r.error };
+    return { path: mcpCombosPath(os.homedir()), exists: r.exists, text: r.exists ? r.text : '', template: MCP_COMBOS_TEMPLATE, error: r.error };
+  });
+  /**
+   * **新会话默认组合**（`defaultCombo.ts`）：全局一个（config.json），项目可覆盖（project.json）。
+   * 只影响之后新建的 Claude Code / Codex 会话（`acp:new-session`），已有会话不动。
+   * 返回本机的组合清单 + 两层各自设的值；设的那个本机没有时界面要说出来（`missing`）。
+   */
+  ipcMain.handle('acp:default-combo', (_event, project?: string) => {
+    const { combos, error } = readMcpCombos(os.homedir());
+    const global = readGlobalDefaultCombo(KIROLEX_CONFIG_PATH);
+    const name = String(project || '').trim();
+    const projectValue = name ? (projectStore.readProject(os.homedir(), name).defaultMcpCombo || '') : undefined;
+    return {
+      combos: combos.map((c) => ({ id: c.id, name: comboDisplayName(c) })),
+      global,
+      ...(projectValue !== undefined ? { project: projectValue } : {}),
+      effective: resolveDefaultCombo(combos, global, projectValue),
+      ...(error ? { error } : {}),
+    };
+  });
+  ipcMain.handle('acp:set-default-combo', (_event, comboId: string, project?: string) => {
+    const id = String(comboId ?? '').trim();
+    const name = String(project || '').trim();
+    try {
+      if (name) {
+        { const advRefused = refuseAdvancedProject(name, 'set-default-combo'); if (advRefused) return { ok: false, error: advRefused }; }
+        if (id && !normalizeComboId(id)) throw new Error(`invalid combo id: ${id}`);
+        projectStore.writeProject(os.homedir(), name, { defaultMcpCombo: id });
+      } else {
+        writeGlobalDefaultCombo(KIROLEX_CONFIG_PATH, id);
+      }
+    } catch (err: any) {
+      logger.warn('mcp-combo', `设新会话默认组合没成功（${name || '全局'} -> ${id || '(清空)'}）`, err);
+      return { ok: false, error: String(err?.message || err) };
+    }
+    logger.info('mcp-combo', `新会话默认组合：${name ? `项目 ${name}` : '全局'} -> ${id || '(跟随 / 通用)'}`);
+    return { ok: true };
   });
   ipcMain.handle('acp:save-mcp-combos', (_event, text: string) => {
     const r = saveMcpCombos(os.homedir(), String(text ?? ''));
