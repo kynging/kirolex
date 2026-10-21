@@ -42,7 +42,8 @@ import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarge
 import { insertOptimistic, isDuplicateMessageError, removeOptimistic } from '../queueRetry';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
-import { withLiveNote } from '../noticeMerge.ts';
+import { withLiveNote, notesAfterReload } from '../noticeMerge.ts';
+import { cleanIpcError } from '../sessionRequestStatus.ts';
 import { firstUserText } from '../titleSource.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { chatHistoryBody } from '../historyBlock.ts';
@@ -598,8 +599,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  it belongs to and never moves between panes when focus changes. Declared next to
    *  `currentSessionRef` because it reads it, and before every callback that lists it
    *  in a dependency array (those arrays are evaluated during render). */
-  const noteError = useCallback((sid: string | null | undefined, message: string | null) => {
+  const noteError = useCallback((sid: string | null | undefined, raw: string | null) => {
     const key = sid || currentSessionRef.current || APP_ERROR_KEY;
+    /* 去掉 Electron 包的那层「Error invoking remote method '…': Error: 」—— 横幅上只显示我们自己的那句 */
+    const message = raw ? cleanIpcError(raw) : raw;
     /* 钉住这句的中英两版（主进程给的原因也认，见 messageVariants；系统原文认不出就原样）——
        切了语言，错误横幅按新语言显示（ChatArea 里 `shownIn`） */
     if (message) pinShown(message, messageVariants(message));
@@ -864,11 +867,24 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const heldNotesRef = useRef<Map<string, Message[]>>(new Map());
   /** 把几条 KiroLex 提示插进那条会话的消息列表（判据在 `noticeMerge.withLiveNote`：重复的、没读过历史的不插） */
   const showLiveNotes = (sid: string, notes: Message[]) => {
+    /* 正看着的这条会话历史还没进列表（启动时那条、空记录）：下面插不进去 —— 读回盘上的历史，提示已经落盘、就在里面 */
+    const unloaded = currentSessionRef.current === sid && !creatingRef.current.has(sid)
+      && !(messagesCacheRef.current.get(sid) || []).length;
     for (const note of notes) {
       /* 主进程推给这条会话的提示：切会话对账时认它（没落盘的也不当成别人的） */
       markLocalOnly(sid, [note.id]);
       mutateSessionMessagesRef.current?.(sid, (cur) => withLiveNote(cur, note, creatingRef.current.has(sid)) ?? cur);
     }
+    if (!unloaded) return;
+    void (async () => {
+      let transcript: any;
+      try { transcript = await window.kiroApi.readTranscript(sid); } catch { return; }
+      if (!Array.isArray(transcript) || !transcript.length) return;
+      const stored = withFailed(sid, transcript.map(messageFromStored));
+      const wasEmpty = !(messagesCacheRef.current.get(sid) || []).length;
+      mutateSessionMessagesRef.current?.(sid, (cur) => notesAfterReload(cur, stored, notes) ?? cur);
+      if (wasEmpty) rebuildFileChanges(sid, stored, currentSessionRef.current === sid);
+    })();
   };
   const beginStreamingTurn = (sid: string) => {
     const token = Symbol(sid);
@@ -4044,10 +4060,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || t('Failed to send message.') });
           /* 写进**这条**会话：await 期间焦点可能已经换了，分屏里发的也常常不是焦点那一格 */
           const errTs = Date.now();
+          /* 只留我们自己的那句：Electron 包的「Error invoking remote method 'acp:load-session': Error: 」不给人看 */
           markLocalOnly(sid!, [`err_${errTs}`]);
           mutateSessionMessages(sid!, (prev) => [
             ...prev,
-            { id: `err_${errTs}`, role: 'assistant', content: `⚠️ ${retryErr?.message || t('Failed to send message.')}`, timestamp: Date.now() },
+            { id: `err_${errTs}`, role: 'assistant', content: `⚠️ ${(retryErr?.message && cleanIpcError(retryErr)) || t('Failed to send message.')}`, timestamp: Date.now() },
           ]);
         }
       }

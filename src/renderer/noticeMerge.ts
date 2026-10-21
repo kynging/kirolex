@@ -82,3 +82,21 @@ export function withLiveNote<T extends { id: string }>(current: T[], note: T, fr
   if (current.some((m) => m.id === note.id)) return null;
   return [...current, note];
 }
+
+/**
+ * `withLiveNote` 没插进去（列表还是空的、不是新建的会话）的提示，读回盘上的历史之后再放 ——
+ * 「第一次启动时有时要重新打开会话才看到」：启动时正看着的那条会话历史还没进列表（空记录读回来也是空），
+ * 提示就被丢了。提示是先落盘再推过来的，所以盘上的历史里本来就有它。
+ *
+ * · 读盘那会儿列表已经被别处填好了 → 照常把没有的那几条接上去；
+ * · 列表还是空、盘上有 → 用盘上的（再补上盘上没有的提示）；
+ * · 都是空 → 不动（返回 null）。
+ */
+export function notesAfterReload<T extends { id: string }>(current: T[], stored: T[], notes: T[]): T[] | null {
+  const base = current.length ? current : stored;
+  if (!base.length) return null;
+  const have = new Set(base.map((m) => m.id));
+  const missing = notes.filter((n) => !have.has(n.id));
+  if (current.length && !missing.length) return null;
+  return [...base, ...missing];
+}

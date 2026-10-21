@@ -44,21 +44,22 @@ export function useSessionNotice(sessionId: string | null): { notice: SessionNot
 
   /* 换会话就清掉 —— 上一条会话的提示留在这儿只会让人以为是这条的 */
   useEffect(() => { setNotice(null); }, [sessionId]);
-  /* ……但这条会话还挂着的 sticky 提示（正在重连）要回来：它说的是这条会话的现状（带着切走前的「×N」） */
+  /* ……但这条会话还挂着的 sticky 提示（正在重连）要回来：它说的是这条会话的现状（带着切走前的「×N」）；没有就回到钉住的那句 */
   useEffect(() => {
-    const sticky = sessionId ? hub.stickyFor(sessionId) : undefined;
+    const sticky = sessionId ? hub.stickyFor(sessionId) ?? hub.pinnedFor(sessionId) : undefined;
     if (sticky) setNotice(sticky);
   }, [sessionId]);
 
   useEffect(() => {
     if (!notice || notice.sticky) return;
     const warn = /⚠️/.test(notice.text);
-    const timer = setTimeout(() => setNotice(null), warn ? WARN_MS : FADE_MS);
+    /* 淡出后回到这条会话钉住的那句（`pinned`），没有就空着 */
+    const timer = setTimeout(() => setNotice((sessionId && hub.pinnedFor(sessionId)) || null), warn ? WARN_MS : FADE_MS);
     return () => clearTimeout(timer);
-  }, [notice]);
+  }, [notice, sessionId]);
 
   return {
     notice,
-    dismiss: () => { if (sessionId) hub.clearSticky(sessionId); setNotice(null); },
+    dismiss: () => { if (sessionId) { hub.clearSticky(sessionId); hub.clearPinned(sessionId); } setNotice(null); },
   };
 }

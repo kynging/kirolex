@@ -102,3 +102,23 @@ export function splitNoteDetail(text: string): { main: string; detail: string } 
   if (at < 0) return { main: s, detail: '' };
   return { main: s.slice(0, at), detail: s.slice(at + NOTE_DETAIL_SEP.length).trim() };
 }
+
+/**
+ * **这句提示记录里已经有了吗** ——「还没登录」那句每次重启都再记一条（×2、×3）：「说过了」原来只记在内存里，
+ * 重启就忘。所以落盘前看一眼记录：同组（`noteGroup`）**最新**那条 KiroLex 提示说的就是这句（任一语言版本），
+ * 就不再追加。同组最新那条说的是别的（状态变过）就照常说。
+ * `texts`：这次要说的这句和它的中英两版。
+ */
+export function noteAlreadyInTranscript(
+  transcript: Array<{ content?: string; kirolex?: true | boolean; noteGroup?: string; variants?: { zh?: string; en?: string } }>,
+  group: string,
+  texts: string[],
+): boolean {
+  const want = new Set(texts.map((t) => String(t || '').trim()).filter(Boolean));
+  for (let i = transcript.length - 1; i >= 0; i -= 1) {
+    const m = transcript[i];
+    if (!m?.kirolex || m.noteGroup !== group) continue;
+    return [m.content, m.variants?.zh, m.variants?.en].some((t) => want.has(String(t || '').trim()));
+  }
+  return false;
+}

@@ -21,6 +21,12 @@ export interface SessionNotice {
    * 要一直挂到连上为止（连上时主进程会发一句"回来了"把它顶掉）。
    */
   sticky?: boolean;
+  /**
+   * **钉住**：比 sticky 更久 —— 别的提示来了照常盖在上面，它们淡出后回到这一句；切走再切回来也还在。
+   * 只有这条会话的下一句 pinned 换掉它、或者你关掉它。说的是这条会话**一直成立**的情况
+   * （「登录 shell 看不到…已直接用 fnm 的 node 起」：几秒就消失的话，晚点打开这条会话就看不到了）。
+   */
+  pinned?: boolean;
   /** 这句话的中英两版（主进程 `bothLangs`）—— 显示时按当前界面语言挑；没有就显示 `text` */
   variants?: { zh: string; en: string };
   /** 同类提示的键（主进程给的「类型:对象」）—— 还挂着时又来同类的一句只计数（`noticeMerge`） */
@@ -32,7 +38,7 @@ export interface SessionNotice {
 /** 主进程 `session:notice` / 渲染端 `noteSessionLocally` 发来的原样 */
 export interface RawSessionNotice {
   sessionId: string; text: string; ts: number;
-  copyRemote?: string[]; sticky?: boolean; variants?: { zh: string; en: string }; group?: string;
+  copyRemote?: string[]; sticky?: boolean; pinned?: boolean; variants?: { zh: string; en: string }; group?: string;
 }
 
 export function toSessionNotice(d: RawSessionNotice): SessionNotice {
@@ -40,6 +46,7 @@ export function toSessionNotice(d: RawSessionNotice): SessionNotice {
     text: d.text, ts: d.ts || Date.now(),
     ...(Array.isArray(d.copyRemote) && d.copyRemote.length ? { copyRemote: d.copyRemote } : {}),
     ...(d.sticky ? { sticky: true } : {}),
+    ...(d.pinned ? { pinned: true } : {}),
     ...(typeof d.group === 'string' && d.group ? { group: d.group } : {}),
     ...(d.variants && typeof d.variants.zh === 'string' && typeof d.variants.en === 'string' ? { variants: { zh: d.variants.zh, en: d.variants.en } } : {}),
   };
@@ -50,6 +57,8 @@ export type NoticeListener = (sessionId: string, next: SessionNotice) => void;
 export function createNoticeHub(attach: (fn: (d: RawSessionNotice) => void) => (() => void) | void) {
   /** 每条会话还挂着的那句 sticky 提示（合并后的）—— **所有会话的都记**：切走再切回来它要还在 */
   const stickyBySession = new Map<string, SessionNotice>();
+  /** 每条会话钉住的那句（`pinned`）—— 别的提示不换掉它 */
+  const pinnedBySession = new Map<string, SessionNotice>();
   const listeners = new Set<NoticeListener>();
   let detach: (() => void) | null = null;
 
@@ -59,6 +68,7 @@ export function createNoticeHub(attach: (fn: (d: RawSessionNotice) => void) => (
     /* 这条会话的下一句提示（不管是不是 sticky）都把上一句 sticky 换掉；同类的 sticky 接着计数 */
     if (next.sticky) stickyBySession.set(d.sessionId, mergeNotice(stickyBySession.get(d.sessionId) ?? null, next));
     else stickyBySession.delete(d.sessionId);
+    if (next.pinned) pinnedBySession.set(d.sessionId, next);
     for (const fn of listeners) { try { fn(d.sessionId, next); } catch { /* 一个监听坏了不影响别的 */ } }
   }
 
@@ -79,5 +89,7 @@ export function createNoticeHub(attach: (fn: (d: RawSessionNotice) => void) => (
     },
     stickyFor: (sessionId: string): SessionNotice | undefined => stickyBySession.get(sessionId),
     clearSticky: (sessionId: string): void => { stickyBySession.delete(sessionId); },
+    pinnedFor: (sessionId: string): SessionNotice | undefined => pinnedBySession.get(sessionId),
+    clearPinned: (sessionId: string): void => { pinnedBySession.delete(sessionId); },
   };
 }

@@ -2,6 +2,7 @@ import type { Message } from './App';
 import { messageVariants, t, type Lang } from './i18n.ts';
 import { asVariants } from '../main/uiText.ts';
 import { asSteerParts } from './steerSplit.ts';
+import { cleanIpcError } from './sessionRequestStatus.ts';
 
 /**
  * 「⚠️ 这条会话没连上：…」那条提示 —— 只在界面上，不落盘。
@@ -15,7 +16,9 @@ export const CONNECT_FAILURE_PREFIX = '⚠️ 这条会话没连上：';
 const connectFailurePrefix = (lang: Lang): string => t(lang, "⚠️ This chat couldn't connect: ");
 const CONNECT_FAILURE_PREFIXES = [CONNECT_FAILURE_PREFIX, connectFailurePrefix('en')];
 
-export const connectFailureNotice = (why: string, now: number = Date.now(), lang: Lang = 'zh'): Message => {
+export const connectFailureNotice = (rawWhy: string, now: number = Date.now(), lang: Lang = 'zh'): Message => {
+  /* 新建会话 / 重连失败时原因前面套着 Electron 的「Error invoking remote method 'acp:new-session': Error: 」—— 只留我们自己的那句 */
+  const why = cleanIpcError(rawWhy);
   /* 整句的中英两版：原因是 KiroLex 自己说的（主进程 tr() 出来的报错）就一起换，系统原文（ECONNREFUSED…）原样 */
   const reason = messageVariants(why);
   return {

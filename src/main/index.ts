@@ -89,7 +89,7 @@ import {
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
-import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail } from './kirolexNote.ts';
+import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
 import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, reviewBackupPrefix, reviewBackupsToPrune, type ReviewTarget } from './reviewAccess.ts';
 import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
@@ -1898,11 +1898,12 @@ function sessionNotice(sessionId: string, text: string, extra?: { copyRemote?: s
 /**
  * 同 `sessionNotice`，但**不自动消失**：一直挂到这条会话的下一句提示把它换掉
  * （「本机工具连接中断，正在重连（第 N 次）」要挂到连上为止，连上时那句"回来了"把它顶掉）。
+ * `pinned`：别的提示也不换掉它 —— 盖在上面的那句淡出后回到它（见 `sessionNoticeHub` 的 `pinned`）。
  */
-function stickySessionNotice(sessionId: string, text: string, group?: string): void {
+function stickySessionNotice(sessionId: string, text: string, group?: string, opts?: { pinned?: boolean }): void {
   try {
     const variants = bothLangs(text);
-    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), sticky: true, ...(variants ? { variants } : {}), ...(group ? { group } : {}) });
+    mainWindow?.webContents.send('session:notice', { sessionId, text, ts: Date.now(), sticky: true, ...(opts?.pinned ? { pinned: true } : {}), ...(variants ? { variants } : {}), ...(group ? { group } : {}) });
   } catch { /* 提示永远不能让主流程失败 */ }
   logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
@@ -3133,12 +3134,18 @@ async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'code
 /**
  * `remoteAdapterCheck` 要说的话。同一条会话同一件事只说一次（每次重连 / 换组合都会走到）；
  * 新建会话时记录还没落盘（`noteInSession` 写不进），先攒着，`acp:new-session` 写好记录后 `commit`。
+ *
+ * 状态行那句（「登录 shell 看不到…已直接用 fnm 的 node 起」）钉住（pinned）：说的是这条会话现在怎么起的，
+ * 几秒就消失的话晚点打开这条会话就看不到了；实测 40ms 后就来一句「自动起标题…」，普通 sticky 会被它换掉。
+ * 进记录的那句（「还没登录」）重启后 `said` 是空的：记录里同组最新那条已经是这句就不再追加（`noteAlreadyInTranscript`）。
  */
 const adapterNotes = (() => {
   const said = new Set<string>();
   const staged = new Map<string, Array<{ how: 'note' | 'status'; text: string; group: string }>>();
   const emit = (sid: string, how: 'note' | 'status', text: string, group: string): boolean => {
-    if (how === 'status') { sessionNotice(sid, text, { group }); return true; }
+    if (how === 'status') { stickySessionNotice(sid, text, group, { pinned: true }); return true; }
+    const v = textVariants(text);
+    if (noteAlreadyInTranscript(store.readTranscript(sid), group, [text, v?.zh || '', v?.en || ''])) return true;
     return noteInSession(sid, text, undefined, group);
   };
   return {
