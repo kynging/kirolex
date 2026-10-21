@@ -338,6 +338,68 @@ export function staleExecutorSweepScript(
   ].join(' ');
 }
 
+/**
+ * **Claude Code / Codex 适配器的标记** —— 上面两道只认 kiro 的 `--agent` 参数里的前缀 / `kiro-cli acp`，
+ * 而适配器那条命令（`exec claude-agent-acp`）命令行里什么标记都没有，崩溃 / 被杀 / 断网留下的适配器
+ * （连同它起的 `claude` CLI、MCP server、shell）两道都扫不到。
+ *
+ * 所以远端适配器带一个环境变量 `KIROLEX_EXECUTOR=<会话 agent 名>`（`buildRemoteAdapterCommand`）：
+ * 它被**整棵进程树**继承，清扫从 `/proc/<pid>/environ` 认（只在 Linux 上有；别处什么都找不到 = 什么都不杀）。
+ * 值就是 `sessionAgentName`，带本机 owner 前缀 —— 别的笔记本起的执行器碰不到。
+ */
+export const ADAPTER_TAG_ENV = 'KIROLEX_EXECUTOR';
+
+/**
+ * 认出要杀的那几个进程 —— `adapterSweepScript` 里那段 awk（单独导出是为了能在本机拿假数据跑）。
+ *
+ * 输入每行 `pid ppid etimes tag`（只含带本机标签的进程）。「顶」= 父进程不带标签的那个（就是 exec 进来的适配器）。
+ *   · 孤儿（`keep` 为 null）：顶的父进程是 1 —— ssh 那一头已经没了；它的子孙按「属于哪个顶」一起收。
+ *   · 没人持有：顶不在 `keep.pids` 里、它的标签不在 `keep.tags` 里（正在 attach / 换执行器的会话），且活了 ≥ age 秒。
+ * 同一条会话换执行器时新旧两个顶带的是**同一个**标签，所以按「顶」分组，不按标签 —— 按标签会把新的那个一起杀掉。
+ */
+export function adapterVictimsAwk(keep: { pids: number[]; tags: string[] } | null, minAgeSec: number): string {
+  const orphan = keep === null;
+  const pids = (keep?.pids || []).filter((p) => Number.isInteger(p) && p > 1);
+  const tags = (keep?.tags || []).filter((t) => /^[\w.-]+$/.test(t));
+  return `awk -v orphan=${orphan ? 1 : 0} -v keep=" ${pids.join(' ')} " -v skip=" ${tags.join(' ')} " -v age=${Math.max(0, Math.floor(minAgeSec))} '`
+    + 'NF==4 {pp[$1]=$2; et[$1]=$3; tag[$1]=$4}'
+    + ' function top(p) { while (pp[p] in tag) p = pp[p]; return p }'
+    + ' END { for (p in tag) { t = top(p); if (t in seen) continue; seen[t] = 1;'
+    + ' if (orphan) { if (pp[t] == 1) bad[t] = 1 }'
+    + ' else if (et[t] >= age && index(keep, " " t " ") == 0 && index(skip, " " tag[t] " ") == 0) bad[t] = 1 }'
+    + ' for (p in tag) if (top(p) in bad) print p }'
+    + "'";
+}
+
+/**
+ * 远端适配器的清扫（孤儿 / 没人持有两种，判据见 `adapterVictimsAwk`）。输出 `KIROLEX_ADAPTER_SWEPT <n>`。
+ * 不落盘（同 `orphanSweepScript` 的理由）；先收子孙、后收顶无所谓 —— 一次列出、一次 TERM。
+ */
+export function adapterSweepScript(
+  owner: string,
+  keep: { pids: number[]; sessions: string[] } | null,
+  minAgeSec = 120,
+): string {
+  const pfx = ownedAgentPrefix(owner);
+  const awkKeep = keep && { pids: keep.pids, tags: keep.sessions.map((sid) => sessionAgentName(sid, owner)) };
+  return [
+    `pfx=${shq(pfx)}; rows=$(for d in /proc/[0-9]*; do p=\${d#/proc/};`,
+    `  t=$(tr '\\0' '\\n' < "$d/environ" 2>/dev/null | sed -n 's/^${ADAPTER_TAG_ENV}=//p' | head -1);`,
+    '  case "$t" in "$pfx"*) echo "$p $(ps -o ppid=,etimes= -p "$p" 2>/dev/null) $t";; esac;',
+    'done)',
+    `; pids=$(printf "%s\\n" "$rows" | ${adapterVictimsAwk(awkKeep, minAgeSec)})`,
+    '; n=$(printf "%s" "$pids" | grep -c . || true)',
+    '; [ "${n:-0}" -gt 0 ] && printf "%s\\n" $pids | xargs -r kill -TERM 2>/dev/null',
+    '; echo "KIROLEX_ADAPTER_SWEPT ${n:-0}"',
+  ].join(' ');
+}
+
+/** `adapterSweepScript` 输出里那个数字。 */
+export function parseAdapterSweep(out: string): number {
+  const m = /KIROLEX_ADAPTER_SWEPT\s+(\d+)/.exec(String(out || ''));
+  return m ? Number(m[1]) : 0;
+}
+
 /** `staleExecutorSweepScript` 输出里那个数字。 */
 export function parseStaleSweep(out: string): number {
   const m = /KIROLEX_STALE\s+(\d+)/.exec(String(out || ''));

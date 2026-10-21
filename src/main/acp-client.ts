@@ -7,8 +7,9 @@ import type { PermissionMode, RemoteTarget } from './config';
 import { ToolCallLedger } from './remoteWriteGuard.ts';
 import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
-import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, resolveAdapter, type Engine } from './engines.ts';
+import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, adapterAuthMessage, adapterMissingMessage, isAuthRequiredError, resolveAdapter, type Engine } from './engines.ts';
 import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
+import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 import { tr } from './uiText.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
@@ -287,7 +288,7 @@ export class AcpClient extends EventEmitter {
           args = buildSshArgs(
             this.remote,
             /* 探测（`remoteAdapterCheck`）记下的起法：登录 shell 看不到时是 node 绝对路径 + 入口 */
-            buildRemoteAdapterCommand(bin, remoteAdapterLaunchFor(this.remote, this.engine)),
+            buildRemoteAdapterCommand(bin, remoteAdapterLaunchFor(this.remote, this.engine), this.localTools?.agentOverride),
             this.localTools ? { remotePort: this.localTools.remotePort, localPort: this.localTools.localPort } : undefined,
           );
         } else try {
@@ -419,10 +420,17 @@ export class AcpClient extends EventEmitter {
           ? tr('The executor exited normally (code 0); KiroLex reconnects automatically.')
           : this.remote?.sshHost && isSshTransportExit(code)
             ? sshDropMessage(code, this.lastStderr)
-            : `Process exited with code ${code}`));
+            /* Claude Code / Codex 一起来就退（没 node、node 版本不对、配置坏了）：原因只在 stderr 里，带上最后几行 */
+            : `Process exited with code ${code}${this.engine !== 'kiro' ? adapterExitDetail(this.lastStderr) : ''}`));
       });
 
-      this.process.on('error', (err) => {
+      this.process.on('error', (err: NodeJS.ErrnoException) => {
+        /* 非 Windows 上没找到适配器包时退回的是 PATH 上的裸名字（`resolveAdapter`）：不在 PATH 上就是 ENOENT，
+           说成「装哪个包」，别让人对着一句 `spawn claude-agent-acp ENOENT` 猜 */
+        if (this.engine !== 'kiro' && !this.remote?.sshHost && err?.code === 'ENOENT') {
+          reject(Object.assign(new Error(adapterMissingMessage(this.engine)), { code: err.code }));
+          return;
+        }
         reject(err);
       });
 
@@ -616,6 +624,22 @@ export class AcpClient extends EventEmitter {
 
   async cancelPrompt(sessionId: string) {
     this.sendNotification('session/cancel', { sessionId });
+    /*
+      ACP：发了 session/cancel，客户端**必须**把挂着的 session/request_permission 都答成 cancelled ——
+      适配器那一轮在等这个回答，不答它就停不下来（停止按钮等到超时）。只对 Claude Code / Codex：
+      它们在 KiroLex 里永远是 ask（见构造函数），kiro 这条路保持原样。
+    */
+    if (this.engine !== 'kiro') {
+      for (const id of [...this.pendingPermissions.keys()]) {
+        this.pendingPermissions.delete(id);
+        try { this.send({ jsonrpc: '2.0', id, result: { outcome: { outcome: 'cancelled' } } }); } catch { /* 进程已经没了 */ }
+      }
+    }
+  }
+
+  /** 有没有权限请求在等人回答（看门狗据此不把「等人」当成卡死）。 */
+  get awaitingPermission(): boolean {
+    return this.pendingPermissions.size > 0;
   }
 
   /**
@@ -783,8 +807,13 @@ export class AcpClient extends EventEmitter {
           // Attach the JSON-RPC error.data so callers can surface WHY (kiro-cli
           // often sends a bare "Internal error" message with the real reason in
           // data, e.g. a stale session lock or bad session state).
-          const e: any = new Error(msg.error.message || JSON.stringify(msg.error));
-          if (msg.error.data !== undefined) e.data = msg.error.data;
+          /* Claude Code / Codex 没登录：ACP 的 auth_required —— 换成说清是哪个工具、去哪登录的那句（原文留在 data） */
+          const authMissing = this.engine !== 'kiro' && isAuthRequiredError(msg.error);
+          const e: any = new Error(authMissing
+            ? adapterAuthMessage(this.engine as Exclude<Engine, 'kiro'>)
+            : (msg.error.message || JSON.stringify(msg.error)));
+          if (authMissing) e.data = msg.error.data ?? msg.error.message;
+          else if (msg.error.data !== undefined) e.data = msg.error.data;
           if (msg.error.code !== undefined) e.code = msg.error.code;
           pending.reject(e);
         } else {
@@ -835,6 +864,22 @@ export class AcpClient extends EventEmitter {
     }
 
     if (method === 'session/update') {
+      /*
+        **适配器自己改了配置**（Claude 批准 ExitPlanMode 后离开 plan 模式、`/model` 换模型…）：ACP 用
+        `config_option_update`（整份清单）/ `current_mode_update`（只报模式）通知。原来没人接，下拉一直停在旧值。
+        记下来再发 `config-options`，index.ts 把下拉重推给界面。kiro 不发这两种。
+      */
+      const cu = params?.update;
+      if (cu?.sessionUpdate === 'config_option_update' && Array.isArray(cu.configOptions)) {
+        this.noteConfigOptions(cu.configOptions);
+        this.emit('config-options');
+      } else if (cu?.sessionUpdate === 'current_mode_update' && typeof cu.currentModeId === 'string') {
+        const mode = this.findOption('mode');
+        if (mode) {
+          this.configOptions = this.configOptions.map((o) => (o === mode ? { ...o, currentValue: cu.currentModeId } : o));
+          this.emit('config-options');
+        }
+      }
       /* 权限请求只带 toolCallId / title；写文件闸要的 kind / rawInput 在这里（只有远程会话接了闸才记） */
       const su = params?.update?.sessionUpdate;
       if (this.remoteWriteGuard && (su === 'tool_call' || su === 'tool_call_update')) this.toolLedger.remember(params.update);
@@ -973,8 +1018,10 @@ export function shellQuote(value: string): string {
  * 就是要杀的那个。走 stderr：stdout 是 ACP 的协议流，掺一个字节进去就毁了它。
  */
 /** 远端起 Claude Code / Codex 的 ACP 适配器：和 kiro 那条一样先报 PID（`remoteKillTree` 靠它收尸）。 */
-export function buildRemoteAdapterCommand(bin: string, launch?: AdapterVerdict): string {
-  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; ${adapterExecLine(bin, launch)}`)}`;
+export function buildRemoteAdapterCommand(bin: string, launch?: AdapterVerdict, tag?: string): string {
+  /* 带上会话标记：整棵进程树都继承它，远端清扫靠它认出崩溃 / 断网留下的适配器（`adapterSweepScript`） */
+  const mark = tag && /^[\w.-]+$/.test(tag) ? `export ${ADAPTER_TAG_ENV}=${tag}; ` : '';
+  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; ${mark}${adapterExecLine(bin, launch)}`)}`;
 }
 
 function buildRemoteKiroCommand(model: string, kiroAgent: string | undefined, bin: string): string {
@@ -1019,6 +1066,17 @@ export function remoteKillTree(pid: number): string {
     `done;`,
     `kill -TERM ${pid} 2>/dev/null || true`,
   ].join(' ');
+}
+
+/**
+ * 适配器异常退出时 stderr 的最后几行（去掉远端自报 PID 那行），拼在 `Process exited with code N` 后面。
+ * 不带的话「适配器崩了 / 远端没 node / 版本不对」在界面上都只是同一句退出码，分不清。
+ */
+export function adapterExitDetail(lastStderr: string): string {
+  const lines = String(lastStderr || '').split(/\r?\n/).map((l) => l.trim())
+    .filter((l) => l && !l.startsWith(REMOTE_PID_MARKER));
+  const tail = lines.slice(-3).join('\n').slice(-400);
+  return tail ? `\n${tail}` : '';
 }
 
 /** 远端 kiro-cli 自报 PID 用的前缀（stderr 上的一行）。 */

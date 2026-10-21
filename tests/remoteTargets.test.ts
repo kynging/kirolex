@@ -1555,7 +1555,8 @@ describe('每台机器（含本机）都能配三个 CLI 的启动命令', () =>
     /* 两处都用它 —— 各写一遍迟早分叉 */
     assert.equal((R.match(/<BinFields /g) || []).length, 2);
     /* claude/codex 现在只存不用，标签上要明说 —— 填了不生效比没有这个框更让人怀疑配置是假的 */
-    assert.match(R, /t\('claude launch command \(not used yet\)'\)/);
+    /* 会话起的是适配器、不读这一格（engineAuditFixes3 的 A15）：标签照样明说 */
+    assert.match(R, /t\('claude CLI \(for reference; sessions do not use this field\)'\)/);
   });
 });
 

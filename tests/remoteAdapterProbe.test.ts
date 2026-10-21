@@ -276,7 +276,8 @@ describe('启动命令接上探测结果', () => {
     assert.match(body, /adapterProbeScript\(engine\)/);
     assert.match(body, /rememberRemoteAdapterLaunch\(remote, engine, verdict\)/);
     assert.match(body, /remoteLoginHint\(/);
-    assert.match(AC, /buildRemoteAdapterCommand\(bin, remoteAdapterLaunchFor\(this\.remote, this\.engine\)\)/);
+    /* 第三个参数是会话标记（远端孤儿清扫用，见 engineAuditFixes2 的 A9）；启动方式仍取自探测结果 */
+    assert.match(AC, /buildRemoteAdapterCommand\(bin, remoteAdapterLaunchFor\(this\.remote, this\.engine\)(\)|, this\.localTools\?\.agentOverride\))/);
     const b = M.slice(M.indexOf("ipcMain.handle('remote:bootstrap'"), M.indexOf("ipcMain.handle('remote:bootstrap'") + 12000);
     assert.match(b, /verifyRemoteAdapter\(/);
     assert.match(read('src', 'main', 'index.ts'), /buildSshArgs\(remote, buildRemoteAdapterCommand\(REMOTE_ADAPTER_BIN\[engine\], verdict\)\)/,

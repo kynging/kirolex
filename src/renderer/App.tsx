@@ -261,7 +261,7 @@ declare global {
       respondPermission: (requestId: number | string, optionId: string, sessionId: string) => Promise<void>;
       listModels: (machine?: string) => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
-      generateTitle: (firstUser: string, firstAssistant?: string) => Promise<{ title?: string; error?: string }>;
+      generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => Promise<{ title?: string; error?: string; skipped?: boolean | 'engine' }>;
       generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => Promise<{ suggestions: string[]; error?: string }>;
       setSessionPinned: (id: string, pinned: boolean) => Promise<{ sessionId: string; pinned: boolean }>;
       getHomeDir: () => Promise<string>;
@@ -2638,6 +2638,8 @@ const App: React.FC = () => {
   const modelsFor = useCallback((session: Session | null): any[] => {
     const host = session?.remoteHost;
     if (!host) return models;
+    /* Claude Code / Codex 的模型清单来自它们自己的适配器（engine-models）：别为它们去远端问 kiro 的清单 */
+    if (session?.engine === 'claude' || session?.engine === 'codex') return [];
     const machine = remoteTargets.targets.find((t) => t.label === host)?.id;
     /* 机器表还没加载出来：同样不能拿本机的比 */
     if (!machine) return [];

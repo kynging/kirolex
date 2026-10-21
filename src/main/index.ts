@@ -6,8 +6,9 @@ import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'chil
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
-import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf, type Engine } from './engines.ts';
-import { adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
+import { acpAvailableCommands } from './acpCommands.ts';
+import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, type Engine } from './engines.ts';
+import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
@@ -82,7 +83,7 @@ import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
   sweepAgentsScript, STALE_AGENT_MINUTES, orphanSweepScript, parseOrphanSweep,
-  staleExecutorSweepScript, parseStaleSweep,
+  staleExecutorSweepScript, parseStaleSweep, adapterSweepScript, parseAdapterSweep,
   ownerTag, ownedAgentPrefix, LISTENING_PORTS_SCRIPT, parseListeningPorts,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
@@ -695,7 +696,8 @@ async function modelStillListed(profile: AgentProfile, modelId: string): Promise
 
 async function swapSessionModel(sessionId: string, failedModel: string, label: string, exclude?: Set<string>): Promise<string | null> {
   const entry = sessionClients.get(sessionId);
-  if (!entry) return null;
+  /* 回退链、模型清单、死模型表都是 kiro 的：Claude Code / Codex 的模型由适配器自己管，换不了也不该换 */
+  if (!entry || engineOf(entry.profile) !== 'kiro') return null;
   const candidates = MODEL_FALLBACK_ORDER.filter((m) => m && m !== failedModel && !exclude?.has(m));
   const cliSessionId = entry.cliSessionId;
   const cwd = entry.cwd;
@@ -895,9 +897,31 @@ async function runLiteOneShot(prompt: string, label: string): Promise<string> {
  */
 const memoryConsolidating = new Set<string>();
 
+/** 已经说过「辅助小任务对这条 Claude Code / Codex 会话不跑」的会话 —— 一条会话只说一次 */
+const liteSkipNoticed = new Set<string>();
+/**
+ * 这条会话的辅助小任务（标题 / 追问建议 / 记忆整理）要不要跳过 —— 判据在 `liteHelperSkipReason`（engines.ts）。
+ * 跳过时第一次在会话里说一句、记一行日志；之后静默跳过（不起进程、不重试）。不知道是哪条会话（老调用方没带 id）→ 照旧跑。
+ */
+function skipLiteHelperFor(sessionId: string | null | undefined, what: string): boolean {
+  if (!sessionId) return false;
+  let profile: AgentProfile | undefined;
+  try { profile = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile; } catch { /* 读不到 = 不知道 */ }
+  const reason = profile ? liteHelperSkipReason(engineOf(profile)) : null;
+  if (!reason) return false;
+  if (!liteSkipNoticed.has(sessionId)) {
+    liteSkipNoticed.add(sessionId);
+    logger.info('lite', `${what} skipped sessionId=${sessionId} engine=${engineOf(profile)} —— 辅助小任务只用 kiro 跑，不把这条会话交给它`);
+    sessionNotice(sessionId, reason, { group: 'lite-helper-skip' });
+  }
+  return true;
+}
+
 async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
   if (!isFeatureEnabled('sessionMemory')) return;
   if (refuseAdvancedOnly(sessionId, 'consolidate-memory')) return;
+  /* Claude Code / Codex 会话：不整理（原来起 kiro-cli，没装就每轮失败重试一次；装了就是把内容交给另一家） */
+  if (skipLiteHelperFor(sessionId, 'session-memory')) return;
   try {
     const messages = store.readTranscript(sessionId) || [];
     const record = store.readRecord(sessionId);
@@ -1229,9 +1253,10 @@ const primeModelsTried = new Map<string, Set<string>>();
 function contextEstablished(sessionId: string, entry: SessionEntry): boolean {
   try {
     const rec = store.readRecord(sessionId);
-    return !!rec
-      && rec.contextEstablishedFor === entry.cliSessionId
-      && rec.contextEstablishedPid === entry.client.pid;
+    /* kiro 绑进程；Claude Code / Codex 的会话存在适配器那边，同一个后端会话 id 就够（见 `contextMarkerHolds`） */
+    return !!rec && contextMarkerHolds(engineOf(entry.profile),
+      { for: rec.contextEstablishedFor, pid: rec.contextEstablishedPid },
+      { cliSessionId: entry.cliSessionId, pid: entry.client.pid });
   } catch { return false; }
 }
 
@@ -2449,6 +2474,12 @@ async function sweepRemoteExecutors(target: RemoteTarget, why: string): Promise<
     const stale = parseStaleSweep(await runRemoteCapture(target, staleExecutorSweepScript(OWNER, heldExecutorsOn(target))));
     if (stale > 0) {
       logger.warn('localmcp', `${target.sshHost}: 杀掉 ${stale} 个没人持有的执行器（带本机标签但不是这个 KiroLex 正连着的，${why}）`);
+    }
+    /* Claude Code / Codex 的适配器：上面两道认不出（命令行里没有 kiro 的 agent 前缀），按环境变量标记再扫一遍 */
+    const adapterOrphans = parseAdapterSweep(await runRemoteCapture(target, adapterSweepScript(OWNER, null)));
+    const adapterStale = parseAdapterSweep(await runRemoteCapture(target, adapterSweepScript(OWNER, heldExecutorsOn(target))));
+    if (adapterOrphans + adapterStale > 0) {
+      logger.warn('localmcp', `${target.sshHost}: 杀掉 ${adapterOrphans} 个孤儿、${adapterStale} 个没人持有的 Claude Code / Codex 适配器进程（${why}）`);
     }
   } catch (err: any) {
     logger.info('localmcp', `${target.sshHost}: 远端执行器清理没成功（${err?.message || err}）—— 只是清垃圾，不影响会话`);
@@ -4038,6 +4069,14 @@ async function recreateBackendSession(sessionId: string, entry: SessionEntry, tr
   /* 新会话里当然什么都没有 —— 清掉"已建立"，让上下文跟着下一次发送带过去 */
   clearContextEstablished(sessionId);
   markContextOwedIfUnverified(sessionId, trigger);
+  /*
+    Claude Code / Codex：新的后端会话回到适配器默认的模型 / effort / 权限模式（Claude 会退回那台机器的
+    defaultMode，于是每个工具都来问）。把这条会话记着的设回去，并且等设完 —— 调用方紧接着就重发。
+  */
+  if (engineOf(entry.profile) !== 'kiro') {
+    entry.engineOptionsReady = applyEngineModel(sessionId, entry).catch(() => { /* 失败只记日志（applyEngineModel 里） */ });
+    await entry.engineOptionsReady;
+  }
   /* 换完 id，那条旧对话的失败计数就没意义了 */
   cliFailStreak.delete(oldId);
   return { oldId, newId: made.sessionId };
@@ -5211,6 +5250,11 @@ function wireSession(sessionId: string, entry: SessionEntry) {
   }
   /** 一轮之外收到、已丢掉的回放块数（见下面 isReplayOutsideTurn）—— 只为每一段记一行日志 */
   let replayDropped = 0;
+  /* Claude Code / Codex 自己改了模型 / 模式（`config_option_update` / `current_mode_update`）：下拉跟着变 */
+  client.on('config-options', () => {
+    if (superseded()) return;
+    mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
+  });
   client.on('update', (data: any) => {
     if (superseded()) return;
     // A background history-priming turn's output must never surface: don't
@@ -5427,6 +5471,13 @@ function wireSession(sessionId: string, entry: SessionEntry) {
      *      indistinguishable from the parent's. `childSessionId` preserves it: present means "a subagent
      *      did this", and it is the child's real, addressable ACP session.
      */
+    /*
+      Claude Code / Codex 的命令表走 ACP 标准的 `available_commands_update`：换成 kiro 那份表的形状
+      （`acpAvailableCommands`），下面的缓存和渲染层的斜杠菜单就都认得 —— 原来没人接，打 `/` 什么都不弹。
+    */
+    if (engineOf(entry.profile) !== 'kiro' && data?.update?.sessionUpdate === 'available_commands_update') {
+      data = { ...data, update: { sessionUpdate: '_kiro_internal', method: '_kiro.dev/commands/available', commands: acpAvailableCommands(data.update.availableCommands) } };
+    }
     /* 把这份命令表留下来 —— 见 `SessionEntry.commands`。 */
     if (data?.update?.method === '_kiro.dev/commands/available' && Array.isArray(data.update.commands)) {
       /*
@@ -7258,6 +7309,15 @@ app.whenReady().then(async () => {
       && !entry.needsHistoryPrime
       && store.readRecord(sessionId)?.primeMode !== 'full'
       && store.transcriptFileSize(sessionId) > 0;
+    /*
+      **Claude Code / Codex：这一轮开始时后端已经握着这条会话的全部历史**（之前建立过，或者这是第一轮、盘上还什么都没有）
+      → 这一轮成功结束就把「上下文已建立」记到这个后端会话 id 上。不记的话只聊过一轮就重启，
+      `session/load` 明明接回了那段对话，attach / 发送前的判据（`contextMarkerHolds`）仍找不到标记，下一条照样带一份历史快照。
+      kiro 不走这条：它的标记绑进程，规则不变。
+    */
+    const heldBackendAtStart = backendHeldAtTurnStart(engineOf(entry.profile),
+      contextEstablished(sessionId, entry), store.transcriptFileSize(sessionId) === 0)
+      ? entry.cliSessionId : undefined;
     // The context snapshot exactly as sent, kept for the Snapshot view. Captured here
     // rather than re-derived later: it is built from the transcript, so rebuilding it
     // afterwards describes the CURRENT conversation, not the one this turn carried.
@@ -7541,6 +7601,14 @@ app.whenReady().then(async () => {
           const watchdog = setInterval(() => {
             const e = sessionClients.get(sessionId);
             if (!e || e !== entry) return;
+            /*
+              **等人批准不是卡死**：Claude Code / Codex 在 KiroLex 里永远是 ask（`AcpClient` 构造函数），
+              一个没人点的权限请求原来会被静默上限当成卡死、取消、再自动续一轮（又来问一次）。等着的时候把计时往后推。
+            */
+            if (engineOf(e.profile) !== 'kiro' && e.client.awaitingPermission) {
+              e.lastStreamAt = Date.now();
+              return;
+            }
             const quietFor = Date.now() - (e.lastStreamAt || Date.now());
             // Freshest update among the OPEN tool calls; -1 when none are open.
             const freshestToolUpdate = e.openToolCalls?.size
@@ -7719,6 +7787,8 @@ app.whenReady().then(async () => {
             if (rideAlong && entry.rideAlongUnconfirmed) {
               markContextEstablished(sessionId, entry);
               entry.rideAlongUnconfirmed = false;
+            } else if (heldBackendAtStart && heldBackendAtStart === entry.cliSessionId && !contextEstablished(sessionId, entry)) {
+              markContextEstablished(sessionId, entry);
             }
             // Surface WHY the turn ended. A non-end_turn reason (max_tokens,
             // refusal, ...) is exactly the "reply stopped mid-sentence with no
@@ -7792,7 +7862,7 @@ app.whenReady().then(async () => {
              */
             const bareStreak = bareFailStreak.get(sessionId) || 0;
             const producedThisTurn = !!entry.assistantBuf || (entry.toolsThisTurn || 0) > 0;
-            if (isBareInternalError(text) && bareStreak >= POISONED_AFTER && !producedThisTurn
+            if (engineOf(entry.profile) === 'kiro' && isBareInternalError(text) && bareStreak >= POISONED_AFTER && !producedThisTurn
                 && emptySwaps < 1 && modelSwaps < MAX_MODEL_SWAPS) {
               modelSwaps++;
               emptySwaps++;
@@ -7828,7 +7898,7 @@ app.whenReady().then(async () => {
                 }
               }
             }
-            if (isModelUnavailableError(text) && modelSwaps < MAX_MODEL_SWAPS) {
+            if (engineOf(entry.profile) === 'kiro' && isModelUnavailableError(text) && modelSwaps < MAX_MODEL_SWAPS) {
               modelSwaps++;
               eventLog.appendEvent(sessionId, {
                 ts: Date.now(),
@@ -7985,6 +8055,8 @@ app.whenReady().then(async () => {
         error: `${err?.message || ''}${detail}`,
         contextPid: store.readRecord(sessionId)?.contextEstablishedPid,
         clientPid: entry.client.pid,
+        /* Claude Code / Codex 的会话存在适配器那边：pid 变了不等于上下文没了 */
+        persistentBackend: backendPersistsSessions(engineOf(entry.profile)),
         /**
          * **预算是 `MAX_AUTO_RETRIES` 次，不是一次** ——「你难道不能让它自动重试吗，挂了你他妈也不管啊」。
          *
@@ -11157,7 +11229,9 @@ app.whenReady().then(async () => {
 
   // Generate a concise chat title from the first message via a one-shot kiro-cli
   // call. execFile (args array) — user text is never shell-interpolated.
-  ipcMain.handle('app:generate-title', async (_event, firstUser: string, firstAssistant?: string) => {
+  ipcMain.handle('app:generate-title', async (_event, firstUser: string, firstAssistant?: string, sessionId?: string) => {
+    /* Claude Code / Codex 会话不交给 kiro 起标题：渲染层看到 `skipped: 'engine'` 直接用第一条消息 */
+    if (skipLiteHelperFor(sessionId, 'title')) return { ok: false, skipped: 'engine' };
     const convo = `User: ${String(firstUser || '').slice(0, 1500)}`
       + (firstAssistant ? `\n\nAssistant: ${String(firstAssistant).slice(0, 1500)}` : '');
     if (!isFeatureEnabled('smartTitle')) {
@@ -11211,6 +11285,8 @@ app.whenReady().then(async () => {
     */
     const convo = stripKirolexNotes(String(recentConvo || '')).slice(0, 4000);
     if (!convo.trim()) return { suggestions: [] };
+    /* Claude Code / Codex 会话不交给 kiro 生成追问建议（输入框上面照常是那几条固定的） */
+    if (skipLiteHelperFor(meta?.sessionId, 'suggestions')) return { suggestions: [], skipped: 'engine' };
     const prompt = `Based on the conversation below, propose 3 short follow-up prompts the user might send next. Each must be a concrete, actionable next step in the SAME language as the conversation, max 12 words, no numbering, no quotes. Reply with ONLY the 3 prompts, one per line.\n\n${convo}`;
     try {
       const stdout = await runLiteOneShot(prompt, 'suggestions');
@@ -11443,7 +11519,7 @@ app.whenReady().then(async () => {
       if (!freshBackend) {
         const establishedFor = existing?.contextEstablishedFor;
         const establishedPid = existing?.contextEstablishedPid;
-        if (establishedFor !== undefined && (establishedFor !== cliSessionId || establishedPid !== client.pid)) {
+        if (establishedFor !== undefined && !contextMarkerHolds(engineOf(profile), { for: establishedFor, pid: establishedPid }, { cliSessionId, pid: client.pid })) {
           logger.info('attach', `resume ok but context is NOT in this backend sessionId=${sessionId} resumed=${cliSessionId} pid=${client.pid} establishedFor=${establishedFor} establishedPid=${establishedPid} -> will rebuild when the chat is used`);
           freshBackend = true;
         }
@@ -13506,7 +13582,8 @@ app.whenReady().then(async () => {
       passwordCipher: passwordCipherForUse(input),
     } as RemoteTarget;
     /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */
-    const args = buildSshArgs(target, `bash -lc ${shellQuote(preflightScript(undefined, { models: false }))}`);
+    /* kiro 的预检之后顺带探两家适配器（同一次 ssh）：只为 Claude Code / Codex 配的机器也要能测通 */
+    const args = buildSshArgs(target, `bash -lc ${shellQuote(testConnectionScript(preflightScript(undefined, { models: false })))}`);
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
@@ -13514,7 +13591,8 @@ app.whenReady().then(async () => {
         stderr: String(stderr || ''),
       }));
     });
-    const verdict = judgePreflight(out.code, out.stdout, out.stderr, target);
+    const sections = splitTestOutput(out.stdout);
+    const verdict = judgeTestConnection(target.sshHost || 'remote', judgePreflight(out.code, sections.kiro, out.stderr, target), sections);
     /*
       **「测试连接」通了就把熔断清掉** —— 否则你刚点完"通了"，紧接着打开会话还要空等一个
       20 秒的窗口（熔断记的是"刚才连不上"，而你手里这次探测正是更新的证据）。

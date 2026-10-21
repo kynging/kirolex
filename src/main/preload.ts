@@ -427,7 +427,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    */
   listModels: (machine?: string) => ipcRenderer.invoke('acp:list-models', machine),
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
-  generateTitle: (firstUser: string, firstAssistant?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant),
+  generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant, sessionId),
   generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),
   setSessionPinned: (id: string, pinned: boolean) => ipcRenderer.invoke('acp:set-session-pinned', id, pinned),
   getHomeDir: () => ipcRenderer.invoke('app:get-home-dir'),

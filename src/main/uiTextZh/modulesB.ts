@@ -1,6 +1,12 @@
 /** 主进程各模块（第二组） 的中文文案。key 是英文原文（约定见 `src/main/uiText.ts`）。 */
 export const ZH_MODULES_B: Record<string, string> = {
   // ── remoteAdapterProbe.ts ──
+  '{engine}: adapter not installed ({bin}).': '{engine}：没装适配器（{bin}）。',
+  '{engine}: adapter found, but there is no node to run it.': '{engine}：适配器在，但没有能跑它的 node。',
+  '{engine}: ready.': '{engine}：可以用。',
+  '{engine}: installed, but not signed in (no Bedrock / API key configured either).': '{engine}：装了，但还没登录（也没配 Bedrock / API key）。',
+  '{host} is reachable.': '{host} 连得上。',
+  'Kiro: {why}': 'Kiro：{why}',
   '{host} has no ACP adapter for {engine} ({bin}). Settings → 🖥 Machines → select this machine → "Install AI tools" will install it ({pkg}). You also need to have signed in to {engine} on that machine.':
     '{host} 上没有 {engine} 的 ACP 适配器（{bin}）。设置 → 🖥 机器 → 选中这台机器 →「安装 AI 工具」会装上它（{pkg}）；另外那台机器上要登录过 {engine}。',
   '{host} has the ACP adapter for {engine} installed ({entry}), but no node to run it: the login shell (bash -lc) has no node, and none was found under fnm / nvm / Volta / asdf either. The adapter belongs to {manager}; add this line to ~/.bash_profile (or ~/.profile) on that machine so the login shell sees it: {fix}':
@@ -54,8 +60,12 @@ export const ZH_MODULES_B: Record<string, string> = {
   'Not detected this time (it worked before)': '这次没检测到（以前起过）',
   'Version output does not look like {label}: {output}': '版本输出不像 {label}：{output}',
   // ── engines.ts ──
+  'Auto title, follow-up suggestions and session-memory tidying run on Kiro, so they are off for this {engine} session (its content is not sent to another AI). The title is taken from your first message; session memory can still be edited by hand.':
+    '自动起标题、追问建议和会话记忆整理是用 Kiro 跑的，所以这条 {engine} 会话不用它们（会话内容不会交给另一家 AI）。标题取你的第一条消息；会话记忆仍然可以手动编辑。',
   'Could not find the ACP adapter for {engine}. Install it: `{install}` (no need to restart KiroLex afterwards, it is looked up again when you create a session).':
     '没找到 {engine} 的 ACP 适配器。装一下：`{install}`（装完不用重启 KiroLex，新建会话时会重新找）。',
+  '{engine} is not logged in on the machine running this session. Run `{login}` in a terminal on that machine (remote sessions: 🔑 Login in the session panel), then try again.':
+    '跑这条会话的那台机器上 {engine} 还没登录。在那台机器的终端里跑 `{login}`（远程会话：会话面板里的 🔑 登录），再试一次。',
   // ── forwardMcp.ts ──
   'Unknown error': '未知错误',
   'Local→upstream ({name}) {why}': '本机→上游（{name}）{why}',

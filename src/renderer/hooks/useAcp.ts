@@ -932,8 +932,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const truncated = firstUser.slice(0, 40);
       if (truncated) applyTitle(truncated);
     };
-    window.kiroApi.generateTitle?.(firstUser, firstAssistant).then((r) => {
+    window.kiroApi.generateTitle?.(firstUser, firstAssistant, sid).then((r) => {
       if (!stillNew()) return;
+      /* 这条会话的引擎不跑辅助小任务（Claude Code / Codex，见主进程 `skipLiteHelperFor`）：不用再试，直接取第一条消息 */
+      if (r?.skipped === 'engine') {
+        titleTriesRef.current.delete(sid);
+        const truncated = firstUser.slice(0, 40);
+        if (truncated) applyTitle(truncated);
+        return;
+      }
       if (r?.title) {
         applyTitle(r.title);
         titleTriesRef.current.delete(sid);

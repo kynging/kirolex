@@ -325,3 +325,66 @@ export function adapterVerifyMessage(host: string, engine: AdapterEngine, v: Ada
 
 /** ACP 的第一句话：验证只看它回不回。 */
 export const ACP_INITIALIZE_LINE = `${JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: 1, clientCapabilities: {} } })}\n`;
+
+/* ─────────── 「测试连接」：kiro 之外也报 Claude Code / Codex 能不能用 ─────────── */
+
+const ENGINE_SPLIT = 'KX_ENGINE_SPLIT';
+
+/**
+ * 「测试连接」那一次 ssh 跑的整段：kiro 的预检原样在前，后面接两家适配器的探测（同一个 `adapterProbeScript`，
+ * fnm / nvm 管的 node 也认）。原来只查 kiro-cli：只为 Claude / Codex 配的机器报「缺 kiro-cli」，
+ * 装了 kiro、没装适配器的机器反而报「通了」。
+ */
+export function testConnectionScript(kiroPreflight: string): string {
+  return [
+    kiroPreflight,
+    `echo ${ENGINE_SPLIT} claude`, adapterProbeScript('claude'),
+    `echo ${ENGINE_SPLIT} codex`, adapterProbeScript('codex'),
+  ].join('\n');
+}
+
+/** 把输出切回三段（kiro 那段就是 `judgePreflight` 原来看的那份）。 */
+export function splitTestOutput(out: string): { kiro: string; claude: string; codex: string } {
+  const parts: Record<string, string> = { kiro: '', claude: '', codex: '' };
+  let cur = 'kiro';
+  for (const line of String(out || '').split(/\r?\n/)) {
+    const m = new RegExp(`^${ENGINE_SPLIT} (claude|codex)\\s*$`).exec(line);
+    if (m) { cur = m[1]; continue; }
+    parts[cur] += `${line}\n`;
+  }
+  return parts as { kiro: string; claude: string; codex: string };
+}
+
+/** 一家适配器在那台机器上：能起（`ready`，带不带登录）/ 没 node / 没装。 */
+export function adapterTestLine(engine: AdapterEngine, probeOut: string): { ready: boolean; text: string } {
+  const p = parseAdapterProbe(probeOut);
+  const v = judgeAdapterProbe(p);
+  const label = ENGINE_LABEL[engine];
+  if (v.kind === 'missing') return { ready: false, text: tr('{engine}: adapter not installed ({bin}).', { engine: label, bin: REMOTE_ADAPTER_BIN[engine] }) };
+  if (v.kind === 'no-node') return { ready: false, text: tr('{engine}: adapter found, but there is no node to run it.', { engine: label }) };
+  return remoteAuthConfigured(engine, p)
+    ? { ready: true, text: tr('{engine}: ready.', { engine: label }) }
+    : { ready: true, text: tr('{engine}: installed, but not signed in (no Bedrock / API key configured either).', { engine: label }) };
+}
+
+/**
+ * kiro 的结论 + 两家适配器 → 「测试连接」的结果。
+ *   · 连不上：kiro 那句原样（连不上谈不到哪个工具）。
+ *   · kiro 通了：照旧算通，后面补两行适配器的情况。
+ *   · kiro 不行、但有一家适配器能起：这台机器能跑那家的会话，算通（不然只为 Claude / Codex 配的机器永远过不了测试）。
+ *   · 都不行：kiro 那个结论，后面补两行。
+ */
+export function judgeTestConnection(
+  host: string,
+  kiro: { code: string; message: string; missing?: string[] },
+  sections: { claude: string; codex: string },
+): { ok: boolean; code: string; message: string; missing?: string[] } {
+  if (kiro.code === 'unreachable') return { ok: false, code: kiro.code, message: kiro.message, missing: kiro.missing };
+  const lines = [adapterTestLine('claude', sections.claude), adapterTestLine('codex', sections.codex)];
+  const tail = lines.map((l) => l.text).join('\n');
+  if (kiro.code === 'ok') return { ok: true, code: 'ok', message: `${kiro.message}\n${tail}`, missing: kiro.missing };
+  if (lines.some((l) => l.ready)) {
+    return { ok: true, code: 'ok', message: `${tr('{host} is reachable.', { host })}\n${tail}\n${tr('Kiro: {why}', { why: kiro.message })}` };
+  }
+  return { ok: false, code: kiro.code, message: `${kiro.message}\n${tail}`, missing: kiro.missing };
+}

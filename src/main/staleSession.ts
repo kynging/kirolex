@@ -71,6 +71,12 @@ export interface StaleInput {
    * "会话又断了"，而它对这种故障一点用都没有 —— 那时该说的是"后端在返空响应"，而不是继续折腾会话。
    */
   lastRecreateAgoMs?: number;
+  /**
+   * **后端自己把会话存盘了**（Claude Code / Codex 的适配器，见 `engines.ts` 的 `backendPersistsSessions`）。
+   * 那时「pid 变了 = 这个 id 在新进程里没有上下文」不成立：新进程 `session/load` 接回的就是那段对话，
+   * 为一次笼统的 Internal error 换后端会话等于把它真实存在的历史扔掉。连着坏（`consecutiveFailures`）那条照旧。
+   */
+  persistentBackend?: boolean;
 }
 
 /** 刚换过后端会话多久之内不再换。5 分钟 —— 见 `lastRecreateAgoMs`。 */
@@ -104,6 +110,7 @@ export function staleVerdict(input: StaleInput): StaleVerdict {
       · `clientPid` 是 undefined → 连不上进程，问题在更前面
   */
   if (!input.contextPid || !input.clientPid) return 'report';
+  if (input.persistentBackend) return 'report';
   return input.contextPid !== input.clientPid ? 'recreate' : 'report';
 }
 

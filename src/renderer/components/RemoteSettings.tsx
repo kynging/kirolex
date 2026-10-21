@@ -151,8 +151,9 @@ const BinRow: React.FC<{
  * 远端走 ssh），每条都真的 `--version` 跑一遍 —— **找到文件 ≠ 能跑**。
  * `★` = 以前真的起过一条会话（历史）。
  *
- * `claude` / `codex` 现在只检测和记录（KiroLex 还只起 kiro-cli），标签上明说"暂未使用"：
- * 一个填了却不生效的输入框，比没有这个输入框更让人怀疑配置是假的。
+ * `claude` / `codex` 这两格**只检测和记录那个 CLI**：Claude Code / Codex 会话起的是它们的 ACP 适配器
+ * （本机按 npm 全局包或 `KIROLEX_<引擎>_ACP` 找，见 `engines.ts` 的 `resolveAdapter`；远端按「安装 AI 工具」装的适配器探测，
+ * 见 `remoteAdapterProbe.ts`），不读这两格。标签上把这件事说清 —— 一个填了却不生效、又不说明的输入框，比没有更让人怀疑配置是假的。
  */
 
 const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecBins) => void }> = ({ bins, machine, onChange }) => {
@@ -196,12 +197,12 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
         candidates={found?.kiro} onChange={(kiro) => onChange({ ...bins, kiro })}
       />
       <BinRow
-        label={t('claude launch command (not used yet)')} hint={t('KiroLex only launches kiro-cli for now; this is detected and saved for later')}
+        label={t('claude CLI (for reference; sessions do not use this field)')} hint={t('{engine} sessions are started through its ACP adapter ({adapter}), not this command: on this machine KiroLex finds the npm global package (or {env}); on a remote machine it uses the adapter that "Install AI tools" sets up. This field only records which CLI was detected here.', { engine: 'Claude Code', adapter: 'claude-agent-acp', env: 'KIROLEX_CLAUDE_ACP' })}
         value={bins.claude || ''}
         candidates={found?.claude} onChange={(claude) => onChange({ ...bins, claude })}
       />
       <BinRow
-        label={t('codex launch command (not used yet)')} hint={t('KiroLex only launches kiro-cli for now; this is detected and saved for later')}
+        label={t('codex CLI (for reference; sessions do not use this field)')} hint={t('{engine} sessions are started through its ACP adapter ({adapter}), not this command: on this machine KiroLex finds the npm global package (or {env}); on a remote machine it uses the adapter that "Install AI tools" sets up. This field only records which CLI was detected here.', { engine: 'Codex', adapter: 'codex-acp', env: 'KIROLEX_CODEX_ACP' })}
         value={bins.codex || ''}
         candidates={found?.codex} onChange={(codex) => onChange({ ...bins, codex })}
       />

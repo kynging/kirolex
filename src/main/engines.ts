@@ -115,8 +115,69 @@ export function resolveAdapter(
   /* 非 Windows 上 PATH 里的可执行文件可以直接起（那边 npm 装的是带 shebang 的脚本） */
   if ((opts.platform || process.platform) !== 'win32') return { command: spec.bin, args: [], env: {} };
   npmRootCache = undefined;   // 下次再问（多半是还没装，装完就能找到）
-  throw new Error(tr('Could not find the ACP adapter for {engine}. Install it: `{install}` (no need to restart KiroLex afterwards, it is looked up again when you create a session).', { engine: ENGINE_LABEL[engine], install: spec.install }));
+  throw new Error(adapterMissingMessage(engine));
+}
+
+/** 适配器没装时说的那句（Windows 上找不到入口、别处 spawn 裸名字 ENOENT，说的是同一件事）。 */
+export function adapterMissingMessage(engine: Exclude<Engine, 'kiro'>): string {
+  return tr('Could not find the ACP adapter for {engine}. Install it: `{install}` (no need to restart KiroLex afterwards, it is looked up again when you create a session).', { engine: ENGINE_LABEL[engine], install: ADAPTERS[engine].install });
+}
+
+/** 那个 CLI 自己的登录命令（适配器沿用它的登录）。 */
+const LOGIN_COMMAND: Record<Exclude<Engine, 'kiro'>, string> = { claude: 'claude auth login', codex: 'codex login' };
+
+/**
+ * ACP 的 `auth_required`（-32000）—— 适配器起来了、但那个 CLI 没登录。
+ * 不认出来的话界面上只有一句英文 `Authentication required`，和"没装"、"崩了"分不清，也不知道去哪登。
+ */
+export function isAuthRequiredError(err: { code?: unknown; message?: unknown } | null | undefined): boolean {
+  return err?.code === -32000 || /authentication required|auth_required/i.test(String(err?.message ?? ''));
+}
+
+export function adapterAuthMessage(engine: Exclude<Engine, 'kiro'>): string {
+  return tr('{engine} is not logged in on the machine running this session. Run `{login}` in a terminal on that machine (remote sessions: 🔑 Login in the session panel), then try again.', { engine: ENGINE_LABEL[engine], login: LOGIN_COMMAND[engine] });
+}
+
+/**
+ * 后端自己会不会把 ACP 会话存盘、换个进程 `session/load` 能不能接回同一段对话。
+ * kiro-cli 不会（index.ts `loadSessionImpl` 那段实测：load 一个旧 id 得到的是空对话）；
+ * 两个适配器会（Claude Code 写 `~/.claude/projects/…`，Codex 写它的 rollout 文件）。
+ */
+export function backendPersistsSessions(engine: Engine): boolean {
+  return engine !== 'kiro';
+}
+
+/**
+ * 记录里「上下文已经在后端里」那个标记（`contextEstablishedFor` / `contextEstablishedPid`）对现在这个后端还算不算数。
+ * kiro：同一个后端会话 id **且**同一个进程；适配器：同一个后端会话 id 就够（新进程 load 回来的就是那段对话）。
+ */
+export function contextMarkerHolds(
+  engine: Engine,
+  marker: { for?: string; pid?: number },
+  backend: { cliSessionId: string; pid?: number },
+): boolean {
+  if (marker.for === undefined || marker.for !== backend.cliSessionId) return false;
+  return backendPersistsSessions(engine) || marker.pid === backend.pid;
 }
 
 /** 找不到适配器时缓存的 `npm root -g` 也该重新问一次（刚装完的情况）。 */
 export function forgetAdapterCache(): void { npmRootCache = undefined; }
+
+/**
+ * 这一轮开始时，后端是不是已经握着这条会话的全部历史 —— 是的话这一轮成功结束就该记「上下文已建立」。
+ * 只对会存盘的后端（适配器）：之前的标记仍然算数，或者盘上还一条消息都没有（第一轮，后端会话就是为它新建的）。
+ * kiro 永远 false：它的标记只由随行快照 / 重建历史来记，规则不变。
+ */
+export function backendHeldAtTurnStart(engine: Engine, markerHolds: boolean, transcriptEmpty: boolean): boolean {
+  return backendPersistsSessions(engine) && (markerHolds || transcriptEmpty);
+}
+
+/**
+ * **KiroLex 自己的辅助小任务**（自动标题、追问建议、会话记忆整理）是用 kiro-cli 一次性跑的（index.ts `runLiteOneShot`）。
+ * Claude Code / Codex 会话不跑：只装了这两家的机器上 kiro-cli 根本起不来（原来静默失败、记忆整理每轮重试一次），
+ * 装了 kiro 的机器上则是把这条会话的内容交给另一家模型、记在 Kiro 的额度上。返回要对用户说的那句（只说一次）；kiro / 不知道是哪条会话 → null（原样跑）。
+ */
+export function liteHelperSkipReason(engine: Engine | undefined): string | null {
+  if (!engine || engine === 'kiro') return null;
+  return tr('Auto title, follow-up suggestions and session-memory tidying run on Kiro, so they are off for this {engine} session (its content is not sent to another AI). The title is taken from your first message; session memory can still be edited by hand.', { engine: ENGINE_LABEL[engine] });
+}
