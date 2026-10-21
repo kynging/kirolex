@@ -465,11 +465,14 @@ test('接线：switchSession 有缓存时也读盘对账，只在这条会话静
   assert.ok(at >= 0);
   const body = H.slice(at, H.indexOf('// Attach the executor on switch', at));
   assert.match(body, /!streamingIdsRef\.current\.has\(sessionId\)/);
-  assert.match(body, /!creatingRef\.current\.has\(sessionId\)/);
+  /* 正在建的会话也对账（不再整段跳过），但不查自动重发 —— 见上面「新会话第一次打开」那几条 */
+  assert.match(body, /const creating = creatingRef\.current\.has\(sessionId\);/);
+  const gate = body.slice(body.indexOf('const reconcileFirst'), body.indexOf('const reconcileFirst') + 300);
+  assert.doesNotMatch(gate, /creatingRef/);
   assert.match(body, /pendingSteersRef\.current\.get\(sessionId\)/);
-  /* 静止的会话：先对账，再只拿对过账的那份查自动重发（不在对账前对缓存查） */
-  assert.match(body, /if \(cached && cached\.length > 0 && !reconcileFirst\) recoverInterruptedTurn\(sessionId, cached/);
-  assert.match(body, /\} else if \(reconcileFirst\) \{[\s\S]*?const verified = await reconcileCacheFromStore\(sessionId\);\s*if \(verified\) recoverInterruptedTurn\(sessionId, verified\.messages, \{ assumeCurrent: true \}\);/);
+  /* 静止的会话：先对账，再只拿对过账的那份查自动重发（不在对账前对缓存查）；正在建的一律不查 */
+  assert.match(body, /if \(cached && cached\.length > 0 && !reconcileFirst && !creating\) recoverInterruptedTurn\(sessionId, cached/);
+  assert.match(body, /\} else if \(reconcileFirst\) \{[\s\S]*?const verified = await reconcileCacheFromStore\(sessionId\);\s*if \(verified && !creating\) recoverInterruptedTurn\(sessionId, verified\.messages, \{ assumeCurrent: true \}\);/);
   const helper = H.slice(H.indexOf('const reconcileCacheFromStore = async'), H.indexOf('const recoverInterruptedTurn = ('));
   assert.match(helper, /reconcileWithStore\(/);
   /* 读盘回来后缓存还是对账时那一份、而且没在跑，才换（期间有新消息就不碰） */

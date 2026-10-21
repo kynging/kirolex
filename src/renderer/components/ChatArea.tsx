@@ -3120,7 +3120,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       .join('\n\n');
     let cancelled = false;
     const timer = setTimeout(() => {
-      window.kiroApi.generateSuggestions?.(recent)
+      /* 带上是哪一格、哪条会话、几条消息：主进程在**发起时**记一行（「generated」那行要等几秒到几十秒，单看它分不出是谁触发的） */
+      window.kiroApi.generateSuggestions?.(recent, { sessionId: currentSessionId, messages: messages.length, paneFocused })
         .then((r) => {
           if (cancelled) return;
           if (r?.suggestions?.length) {

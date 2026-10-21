@@ -262,11 +262,12 @@ declare global {
       listModels: (machine?: string) => Promise<any>;
       getUsage: () => Promise<{ text: string }>;
       generateTitle: (firstUser: string, firstAssistant?: string) => Promise<{ title?: string; error?: string }>;
-      generateSuggestions: (recentConvo: string) => Promise<{ suggestions: string[]; error?: string }>;
+      generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => Promise<{ suggestions: string[]; error?: string }>;
       setSessionPinned: (id: string, pinned: boolean) => Promise<{ sessionId: string; pinned: boolean }>;
       getHomeDir: () => Promise<string>;
       getLogs: (maxLines?: number) => Promise<{ text: string; path: string }>;
       openLogs: () => Promise<{ ok: boolean; error?: string }>;
+      diagSessionView?: (event: string, detail: Record<string, unknown>) => void;
       openExternal: (target: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>;
       savePasteText: (text: string) => Promise<{ path: string; lines: number; chars: number; preview: string } | null>;
       readPaste: (filePath: string) => Promise<string | null>;

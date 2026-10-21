@@ -1181,6 +1181,24 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     console.warn('[kirolex] message cache did not match the store; reloaded from the transcript', {
       sessionId: sid, cached: cached.length, stored: transcript.length,
     });
+    /* 进主进程日志，而且说出**外来的消息是谁的**：在别的会话的缓存里找同 id 的（只记 id 和条数） */
+    try {
+      const keptIds = new Set(healed.map((m) => m.id));
+      const foreign = cached.filter((m) => !keptIds.has(m.id));
+      const owners: Record<string, number> = {};
+      for (const m of foreign) {
+        let owner = '(没有别的会话缓存里有它)';
+        for (const [other, list] of messagesCacheRef.current) {
+          if (other !== sid && list.some((x) => x.id === m.id)) { owner = other; break; }
+        }
+        owners[owner] = (owners[owner] || 0) + 1;
+      }
+      window.kiroApi.diagSessionView?.('cache reloaded from store', {
+        sessionId: sid, creating: creatingRef.current.has(sid), focused: currentSessionRef.current === sid,
+        cached: cached.length, stored: transcript.length, dropped: foreign.length,
+        droppedIds: foreign.slice(0, 6).map((m) => `${m.role}:${m.id}`), droppedOwners: owners,
+      });
+    } catch { /* 诊断不能影响对账 */ }
     messagesCacheRef.current.set(sid, healed);
     patchPane(sid, { messages: healed });
     rebuildFileChanges(sid, healed, currentSessionRef.current === sid);
@@ -3404,13 +3422,19 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Restore from local cache instantly
     const cached = messagesCacheRef.current.get(sessionId);
     setMessages(cached || []);
-    /* 静止的会话先和 store 对账再查恢复（见下面 reconcileFirst 那段）；正在跑 / 正在建 / 有没吃完的追加指令时照旧当场查 */
+    /* 静止的会话先和 store 对账再查恢复（见下面 reconcileFirst 那段）；正在跑 / 有没吃完的追加指令时照旧当场查 */
+    /*
+      **正在建的会话也对账，但不查恢复** ——「远程新建会话界面仍出现历史会话内容」。原来正在建（远程要等
+      preflight + 连 ssh + session/new，好几秒）就整段跳过：缓存里有什么就画什么，还拿这份没核对过的缓存
+      去查自动重发。一条还没建好的会话没有被打断的一轮可以重发；它缓存里本会话的东西（你先发出的那条、
+      KiroLex 提示）都登记过 localOnly，对账会留着，别的一律清掉（store 是空的也照样对，见 messageReconcile）。
+    */
+    const creating = creatingRef.current.has(sessionId);
     const reconcileFirst = !!cached && cached.length > 0
       && !sessionId.startsWith('pending_')
       && !streamingIdsRef.current.has(sessionId)
-      && !creatingRef.current.has(sessionId)
       && !(pendingSteersRef.current.get(sessionId)?.length);
-    if (cached && cached.length > 0 && !reconcileFirst) recoverInterruptedTurn(sessionId, cached, { assumeCurrent: true });
+    if (cached && cached.length > 0 && !reconcileFirst && !creating) recoverInterruptedTurn(sessionId, cached, { assumeCurrent: true });
 
     // Pending new/forked chats intentionally have no backend executor until
     // their first message materializes the real session and injects history.
@@ -3461,7 +3485,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         读不到 / 读盘期间这条会话动过：这次不查（没记成查过，下次打开再查）。
       */
       const verified = await reconcileCacheFromStore(sessionId);
-      if (verified) recoverInterruptedTurn(sessionId, verified.messages, { assumeCurrent: true });
+      if (verified && !creating) recoverInterruptedTurn(sessionId, verified.messages, { assumeCurrent: true });
     }
 
     // Attach the executor on switch so the SELECTED chat becomes live (green dot)
@@ -4627,7 +4651,18 @@ ${text}`,
     } catch (error: any) {
       noteError(null, t('Failed to delete the chat: {error}. It may reappear on the next launch.', { error: String(error?.message || error) }));
     }
-    if (currentSessionId === sessionId) {
+    /*
+      **看的是删完这一刻的焦点，不是点删除那一刻的** —— 远程会话的删除要等执行器退出（最多 8 s）再挪目录，
+      这段时间里你可能已经点了「新对话」。闭包里的 `currentSessionId` 还是被删的那条，照它判断就会
+      把焦点从你刚建的会话拽走（拽到列表里最新的那条 —— 常常就是这条新会话自己，正在建、缓存没对过账）。
+      被删的那条一从列表里摘掉，App 那边就 `unfocusSession()`（焦点指着不存在的会话），所以「还停在原处」
+      是焦点仍是它、或者已经是空的；换成了别的会话就是你自己选的，不动。
+    */
+    const focusNow = currentSessionRef.current;
+    if (currentSessionId === sessionId && focusNow !== sessionId && focusNow !== null) {
+      window.kiroApi.diagSessionView?.('delete: focus moved during the delete, not auto-switching', { deleted: sessionId, focusNow });
+    }
+    if (currentSessionId === sessionId && (focusNow === sessionId || focusNow === null)) {
       // Auto-switch to the most recent remaining chat instead of dumping the
       // user onto the empty welcome screen. Fall back to empty only if none.
       const next = sessionsRef.current

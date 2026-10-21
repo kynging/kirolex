@@ -428,11 +428,13 @@ contextBridge.exposeInMainWorld('kiroApi', {
   listModels: (machine?: string) => ipcRenderer.invoke('acp:list-models', machine),
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
   generateTitle: (firstUser: string, firstAssistant?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant),
-  generateSuggestions: (recentConvo: string) => ipcRenderer.invoke('app:generate-suggestions', recentConvo),
+  generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),
   setSessionPinned: (id: string, pinned: boolean) => ipcRenderer.invoke('acp:set-session-pinned', id, pinned),
   getHomeDir: () => ipcRenderer.invoke('app:get-home-dir'),
   getLogs: (maxLines?: number) => ipcRenderer.invoke('app:get-logs', maxLines),
   openLogs: () => ipcRenderer.invoke('app:open-logs'),
+  /* 渲染层的会话视图诊断进主进程日志（见 index.ts 的 diag:session-view） */
+  diagSessionView: (event: string, detail: Record<string, unknown>) => ipcRenderer.send('diag:session-view', event, detail),
   openExternal: (target: string, sessionId?: string) =>
     ipcRenderer.invoke('app:open-external', target, sessionId),
   getExecutorCapInfo: () => ipcRenderer.invoke('app:get-executor-cap-info'),

@@ -17,6 +17,7 @@ import {
 } from './kiroConfig';
 import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
+import { isReplayOutsideTurn } from './replayGuard';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { parseAgentList } from './kiroAgentList.ts';
 import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } from './reachability.ts';
@@ -5067,6 +5068,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       sessionNotice(sessionId, blockedWriteNotice(labelForHost(KIROLEX_CONFIG_PATH, remoteHost) || remoteHost, paths, sessionFilesDir(sessionId)));
     });
   }
+  /** 一轮之外收到、已丢掉的回放块数（见下面 isReplayOutsideTurn）—— 只为每一段记一行日志 */
+  let replayDropped = 0;
   client.on('update', (data: any) => {
     if (superseded()) return;
     // A background history-priming turn's output must never surface: don't
@@ -5082,6 +5085,22 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // one. Anything added here later that sends a prompt the user did not type must
     // suppress it the same way.
     if (entry.priming) return;
+    /*
+      **一轮之外的对话正文是后端回放的旧对话，丢掉**（判据和理由见 `replayGuard.ts`）——
+      「远程新建会话界面仍出现历史会话内容」。不丢的话它进了渲染层这条会话的缓存，切到它时就画出来。
+      每一段只记一行：哪条会话、多少块、后端那边的会话 id（来源）。
+    */
+    if (isReplayOutsideTurn(data?.update, !!entry.busy)) {
+      if (!replayDropped++) {
+        const origin = typeof data?.sessionId === 'string' ? data.sessionId : '?';
+        logger.warn('acp', `dropped replayed ${data?.update?.sessionUpdate} outside a turn sessionId=${sessionId} backend=${origin} (current backend=${entry.cliSessionId}) —— 不显示、不落盘`);
+      }
+      return;
+    }
+    if (replayDropped) {
+      logger.info('acp', `replay outside a turn ended sessionId=${sessionId} dropped=${replayDropped}`);
+      replayDropped = 0;
+    }
     // Stall watchdog: any inbound stream activity proves the turn is alive.
     entry.lastStreamAt = Date.now();
     // Accumulate assistant text so we can persist the COMPLETE message on
@@ -11034,7 +11053,13 @@ app.whenReady().then(async () => {
   // Dynamic, conversation-aware prompt suggestions: given the recent transcript,
   // produce a few short follow-up prompts the user is likely to want next. One-
   // shot kiro-cli via execFile (args array — the convo text can't shell-inject).
-  ipcMain.handle('app:generate-suggestions', async (_event, recentConvo: string) => {
+  ipcMain.handle('app:generate-suggestions', async (_event, recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => {
+    /*
+      **发起时记一行：哪条会话、几条消息** ——「新建会话 10:40:36，10:40:45 `[suggestions] generated 3`」被当成过
+      「新会话那时 messages 已经非空」的证据，但「generated」是**完成**时记的，一次要排队 + 起 kiro-cli + 跑模型，
+      实测（10-21 本机）渲染层 00:47:12.8 触发，00:47:40 才真正起 kiro-cli，00:47:55 才有结果。只看完成那行分不出是哪条会话触发的。
+    */
+    logger.info('suggestions', `requested sessionId=${meta?.sessionId || '?'} messages=${meta?.messages ?? '?'} paneFocused=${meta?.paneFocused ?? '?'}`);
     /*
       **在发出去的这一处再挡一次** —— 实测泄漏就是从这条路出去的：
       `[suggestions] … Based on the conversation below … User: ⚠️ 这条会话现在跑在 gpt-5.6-sol 上…`。
@@ -13475,6 +13500,17 @@ app.whenReady().then(async () => {
     else logger.warn('memory', `nothing to back up for scope=${scope}`);
     return { ok: !!at, at };
   });
+});
+
+/**
+ * **渲染层的会话视图诊断进日志** ——「新建会话界面出现别的会话的历史」两次都只能靠推断：盘上、tail 都干净，
+ * 而渲染层的 console 不进这份日志。缓存和 store 对不上被重载、删除后的自动切换这类「界面上这条会话
+ * 的内容从哪来」的事，从这里记一行（只记 id 和条数，不记正文）。
+ */
+ipcMain.on('diag:session-view', (_event, what: string, detail: Record<string, unknown>) => {
+  let text = '';
+  try { text = JSON.stringify(detail ?? {}).slice(0, 1500); } catch { text = '(unserializable)'; }
+  logger.warn('view', `${String(what).slice(0, 60)} ${text}`);
 });
 
 /** Shared UI state. Registered OUTSIDE the app-ready IPC block because preload
