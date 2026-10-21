@@ -1,5 +1,23 @@
 /** 主进程各模块（第二组） 的中文文案。key 是英文原文（约定见 `src/main/uiText.ts`）。 */
 export const ZH_MODULES_B: Record<string, string> = {
+  // ── remoteAdapterProbe.ts ──
+  '{host} has no ACP adapter for {engine} ({bin}). Settings → 🖥 Machines → select this machine → "Install AI tools" will install it ({pkg}). You also need to have signed in to {engine} on that machine.':
+    '{host} 上没有 {engine} 的 ACP 适配器（{bin}）。设置 → 🖥 机器 → 选中这台机器 →「安装 AI 工具」会装上它（{pkg}）；另外那台机器上要登录过 {engine}。',
+  '{host} has the ACP adapter for {engine} installed ({entry}), but no node to run it: the login shell (bash -lc) has no node, and none was found under fnm / nvm / Volta / asdf either. The adapter belongs to {manager}; add this line to ~/.bash_profile (or ~/.profile) on that machine so the login shell sees it: {fix}':
+    '{host} 上装了 {engine} 的 ACP 适配器（{entry}），但没有 node 能跑它：登录 shell（bash -lc）里没有 node，fnm / nvm / Volta / asdf 下也没找到。适配器归 {manager} 管；在那台机器的 ~/.bash_profile（没有就 ~/.profile）里加这一行，让登录 shell 看得到：{fix}',
+  "The login shell on {host} can't find the {engine} adapter; started it with {manager}'s node directly.":
+    '{host} 的登录 shell 找不到 {engine} 适配器，已直接用 {manager} 的 node 起。',
+  "The node on that machine is managed by {manager}, which only adds itself to PATH in interactive shells, so `bash -lc` can't see it. To make the login shell see it, add this line to ~/.bash_profile (or ~/.profile) there: {fix}\nnode: {node}\nadapter: {entry}":
+    '那台机器的 node 由 {manager} 管，它只在交互 shell 里加 PATH，所以 `bash -lc` 看不到。要让登录 shell 也看得到，在那台机器的 ~/.bash_profile（没有就 ~/.profile）里加这一行：{fix}\nnode：{node}\n适配器：{entry}',
+  '⚠️ Claude Code on {host} is not signed in and has no Bedrock / API key configured, so messages will fail. Set it up under 🔑 Login at the bottom left of this session.':
+    '⚠️ {host} 上的 Claude Code 还没登录，也没配 Bedrock / API key，发消息会失败。在这条会话左下角「🔑 登录」里配置。',
+  '⚠️ Codex on {host} is not signed in and has no provider / API key configured, so messages will fail. Set it up under 🔑 Login at the bottom left of this session.':
+    '⚠️ {host} 上的 Codex 还没登录，也没配 provider / API key，发消息会失败。在这条会话左下角「🔑 登录」里配置。',
+  '✅ {engine} adapter on {host} starts the way sessions start it (bash -lc).': '✅ {host} 上的 {engine} 适配器按会话的启动方式（bash -lc）能起。',
+  'it did not answer initialize within the time limit': '限定时间内没回 initialize',
+  'it exited with code {code}': '它退出了，退出码 {code}',
+  '⚠️ After installing, tried to start the {engine} adapter on {host} the way sessions do (bash -lc), and it did not start: {why}.{stderr}':
+    '⚠️ 装完按会话的启动方式（bash -lc）在 {host} 上试起 {engine} 的适配器，没起来：{why}。{stderr}',
   // ── acp-client.ts ──
   "No kiro launch command is set for **this machine** yet. Open Settings → 🖥 Machines → 💻 This machine and click \"Auto-detect the three tools on this machine\", or enter a path by hand. Without this setting KiroLex won't guess a binary.":
     '还没有设置**本机**的 kiro 启动命令。打开 设置 → 🖥 机器 → 💻 本机，点「自动检测这台机器上的三个工具」，或者手填一个路径 —— 没有这个设置 KiroLex 不会去猜一个二进制。',

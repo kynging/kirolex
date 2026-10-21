@@ -61,7 +61,9 @@ describe('kiro 专有的东西对另外两家关掉', () => {
     assert.doesNotMatch(M, /会话目前只能在本机跑/);
     /* kiro 那套 preflight（查 kiro-cli / 登录 / 模型清单）对另外两家换成"适配器在不在" */
     assert.equal((M.match(/await remoteAdapterCheck\(/g) || []).length, 5, '新建 / 换机器 / 重连 / 换引擎 / 换组合 五处');
-    assert.match(M, /will install it \(\{pkg\}\)[\s\S]{0,300}pkg: ADAPTER_PACKAGE\[engine\]/);
+    /* 「没装」那句搬进了 remoteAdapterProbe.ts（和「装了但没有 node」那句放在一起），index.ts 抛的就是它给的话 */
+    assert.match(read('src', 'main', 'remoteAdapterProbe.ts'), /will install it \(\{pkg\}\)[\s\S]{0,300}pkg: ADAPTER_PACKAGE\[engine\]/);
+    assert.match(M, /const problem = adapterProblemMessage\(host, engine, verdict\);\s*if \(problem\) throw new Error\(problem\);/);
   });
 
   test('远程会话的本地工具通道：kiro 走 agent 文件，另外两家走 ACP 的 mcpServers', () => {
@@ -249,7 +251,7 @@ describe('已有会话换引擎 ——「我还需要现有会话也能切换 ag
     assert.match(body, /if \(!oldEntry\) \{[\s\S]*?rec0\.profile = reshape\(rec0\.profile\);/);
     /* 这一轮还在跑：不再拒绝，记成 pending、跑完再换（pendingSwitch.ts） */
     assert.match(body, /queueSwitchWhileBusy\(sessionId, 'engine'/);
-    assert.match(body, /if \(engine !== 'kiro'\) await remoteAdapterCheck\(profile\.remote, engine\);/, '远程会话换到 Claude/Codex 先查适配器');
+    assert.match(body, /if \(engine !== 'kiro'\) await remoteAdapterCheck\(profile\.remote, engine, sessionId\);/, '远程会话换到 Claude/Codex 先查适配器');
     assert.match(body, /const started = await connectWithModelFallback\(profile, 'switch-engine', localTools, sessionId, remoteModels\);/);
     assert.ok(body.indexOf('await client.newSession(') < body.indexOf('await retireExecutor(oldEntry.client)'), '先起新的、再断旧的');
     assert.match(body, /restoreContextAfterExecutorSwap\(sessionId, 'switch-engine'\);/);

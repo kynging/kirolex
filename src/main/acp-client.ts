@@ -8,6 +8,7 @@ import { ToolCallLedger } from './remoteWriteGuard.ts';
 import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, resolveAdapter, type Engine } from './engines.ts';
+import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 import { tr } from './uiText.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
@@ -285,7 +286,8 @@ export class AcpClient extends EventEmitter {
           this.launchedWith = bin;
           args = buildSshArgs(
             this.remote,
-            buildRemoteAdapterCommand(bin),
+            /* 探测（`remoteAdapterCheck`）记下的起法：登录 shell 看不到时是 node 绝对路径 + 入口 */
+            buildRemoteAdapterCommand(bin, remoteAdapterLaunchFor(this.remote, this.engine)),
             this.localTools ? { remotePort: this.localTools.remotePort, localPort: this.localTools.localPort } : undefined,
           );
         } else try {
@@ -971,8 +973,8 @@ export function shellQuote(value: string): string {
  * 就是要杀的那个。走 stderr：stdout 是 ACP 的协议流，掺一个字节进去就毁了它。
  */
 /** 远端起 Claude Code / Codex 的 ACP 适配器：和 kiro 那条一样先报 PID（`remoteKillTree` 靠它收尸）。 */
-export function buildRemoteAdapterCommand(bin: string): string {
-  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; exec ${shellQuote(bin)}`)}`;
+export function buildRemoteAdapterCommand(bin: string, launch?: AdapterVerdict): string {
+  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; ${adapterExecLine(bin, launch)}`)}`;
 }
 
 function buildRemoteKiroCommand(model: string, kiroAgent: string | undefined, bin: string): string {

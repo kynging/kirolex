@@ -216,6 +216,41 @@ npm_i '@openai/codex' codex
 npm_i '@agentclientprotocol/claude-agent-acp' claude-agent-acp
 npm_i '@agentclientprotocol/codex-acp' codex-acp
 
+# 装到 fnm / nvm 管的 node 下时，`npm -g` 的 bin 落在那个版本自己的目录里 —— 只有交互 shell 看得到。
+# KiroLex 起适配器用的是 `bash -lc`，所以那里**连同 node** 都要找得到；找不到就在 ~/.local/bin
+# （~/.kirolex-env.sh 已经把它放进登录 shell 的 PATH）放一个用 node 绝对路径的包装脚本。
+# 已经装好的（跳过了 npm_i 的）也要过这一步：graviton 上就是"早就装了、只是登录 shell 看不到"。
+login_visible() {
+  local bin="$1" pkg="$2" entry nodebin w
+  if bash -lc "command -v $bin && command -v node" </dev/null >/dev/null 2>&1; then
+    say "→ $bin：登录 shell 里找得到（连同 node）"; return 0
+  fi
+  have node || { note_fail "$bin：这里也没有 node，放不了包装脚本"; return 1; }
+  entry="$(npm root -g 2>/dev/null)/$pkg/dist/index.js"
+  [ -f "$entry" ] || { note_fail "$bin：找不到它的入口 $entry"; return 1; }
+  # fnm 的 `command -v node` 是一个每个 shell 临时建的 multishell 链接 —— 要解到真正的安装目录
+  nodebin="$(command -v node)"; nodebin="$(readlink -f "$nodebin" 2>/dev/null || printf '%s' "$nodebin")"
+  mkdir -p "$HOME/.local/bin"
+  w="$HOME/.local/bin/$bin"
+  # 先删：npm prefix 是 ~/.local 时这里是 npm 的 symlink，直接写会顺着它改掉适配器自己的入口
+  rm -f "$w"
+  cat > "$w" <<WEOF
+#!/bin/sh
+# KiroLex（remote-bootstrap.sh）：登录 shell 看不到这台机器的 node（fnm / nvm 只在交互 shell 里加 PATH），用绝对路径起 $pkg
+[ -x '$nodebin' ] || { echo "$bin: $nodebin 不在了（node 换过版本？）—— 在 KiroLex 里重跑「安装 AI 工具」" >&2; exit 127; }
+export PATH='$(dirname "$nodebin")':"\$PATH"
+exec '$nodebin' '$entry' "\$@"
+WEOF
+  chmod +x "$w"
+  if bash -lc "command -v $bin" </dev/null >/dev/null 2>&1; then
+    say "→ $bin：登录 shell 看不到 node，放了包装脚本 $w（node：$nodebin）"
+  else
+    note_fail "$bin：放了包装脚本 $w，但 ~/.local/bin 不在登录 shell 的 PATH 里"
+  fi
+}
+login_visible claude-agent-acp '@agentclientprotocol/claude-agent-acp'
+login_visible codex-acp '@agentclientprotocol/codex-acp'
+
 # ---------------------------------------------------------------- 默认走 Amazon Bedrock
 #
 # 「脚本应该默认将模型设置为 bedrock 的 global endpoint。保留让客户自己配置域名和 key 或者用官方订阅登录的选项」。

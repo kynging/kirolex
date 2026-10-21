@@ -3,10 +3,11 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
-import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin } from './acp-client';
+import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
-import { ADAPTER_PACKAGE, ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf, type Engine } from './engines.ts';
+import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, engineOf, type Engine } from './engines.ts';
+import { adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
@@ -3058,20 +3059,111 @@ function localCwdFor(sessionId: string, dir?: string): string {
  * Claude Code / Codex 的远端检查：只问那台机器上**有没有适配器**。kiro 那套 preflight 查的是
  * kiro-cli、kiro 登录和 kiro 的模型清单，对另外两家全都不相干（而且会因为"没有 kiro-cli"误拒）。
  * 不在就说清楚怎么装 —— 否则失败会伪装成"ssh 断了"。
+ *
+ * 不只问登录 shell 的 `command -v`：Node 由 fnm / nvm 管的机器上登录 shell 里连 node 都没有，
+ * 适配器装好了也会被判成"没装"（graviton 上实测）。探测和判定在 `remoteAdapterProbe.ts`；
+ * 判出来的起法按机器 + 引擎记下，`AcpClient.connect` 起适配器时取（`remoteAdapterLaunchFor`）。
+ * 顺带看一眼那家 CLI 登录 / 配过没有 —— 不然要等第一条消息失败才知道。
  */
-async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'codex'): Promise<void> {
-  const bin = REMOTE_ADAPTER_BIN[engine];
+async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'codex', sessionId?: string): Promise<void> {
+  const host = remote.sshHost || '';
   let out = '';
   try {
-    out = await runRemoteCapture(remote, `command -v ${bin} >/dev/null 2>&1 && echo KX_HAVE || echo KX_MISSING`, 30_000);
+    out = await runRemoteCapture(remote, adapterProbeScript(engine), 30_000);
   } catch (err: any) {
     throw new Error(tr('Can\'t connect to {host}: {error}', { host: remote.sshHost, error: String(err?.message || err) }));
   }
-  if (!out.includes('KX_HAVE')) {
-    throw new Error(tr('{host} has no ACP adapter for {engine} ({bin}). Settings → 🖥 Machines → select this machine → "Install AI tools" will install it ({pkg}). You also need to have signed in to {engine} on that machine.', {
-      host: remote.sshHost, engine: ENGINE_LABEL[engine], bin, pkg: ADAPTER_PACKAGE[engine],
-    }));
+  const probe = parseAdapterProbe(out);
+  const verdict = judgeAdapterProbe(probe);
+  rememberRemoteAdapterLaunch(remote, engine, verdict);
+  logger.info('remote', `适配器探测 ${host} ${engine}: ${verdict.kind}`
+    + (verdict.kind === 'absolute' ? `（${verdict.manager}：${verdict.node} ${verdict.entry}）` : '')
+    + (verdict.kind === 'no-node' ? `（${verdict.manager}：${verdict.entry}）` : '')
+    + ` 登录痕迹=${[...probe.auth, ...probe.cfg.map((c) => `${c.src}:${c.key}=${c.val}`)].join(',') || '无'}`);
+  const problem = adapterProblemMessage(host, engine, verdict);
+  if (problem) throw new Error(problem);
+  if (!sessionId) return;
+  const hidden = adapterHiddenNotice(host, engine, verdict);
+  if (hidden) adapterNotes.say(sessionId, 'status', hidden, `adapter-hidden:${host}:${engine}`);
+  if (!remoteAuthConfigured(engine, probe)) adapterNotes.say(sessionId, 'note', remoteLoginHint(host, engine), `remote-login:${host}:${engine}`);
+}
+
+/**
+ * `remoteAdapterCheck` 要说的话。同一条会话同一件事只说一次（每次重连 / 换组合都会走到）；
+ * 新建会话时记录还没落盘（`noteInSession` 写不进），先攒着，`acp:new-session` 写好记录后 `commit`。
+ */
+const adapterNotes = (() => {
+  const said = new Set<string>();
+  const staged = new Map<string, Array<{ how: 'note' | 'status'; text: string; group: string }>>();
+  const emit = (sid: string, how: 'note' | 'status', text: string, group: string): boolean => {
+    if (how === 'status') { sessionNotice(sid, text, { group }); return true; }
+    return noteInSession(sid, text, undefined, group);
+  };
+  return {
+    say(sid: string, how: 'note' | 'status', text: string, group: string): void {
+      const key = `${sid}|${group}`;
+      if (said.has(key)) return;
+      if (!store.readRecord(sid)) {
+        const list = (staged.get(sid) || []).filter((x) => x.group !== group);
+        staged.set(sid, [...list, { how, text, group }]);
+        return;
+      }
+      if (emit(sid, how, text, group)) said.add(key);
+    },
+    commit(sid: string): void {
+      const list = staged.get(sid) || [];
+      staged.delete(sid);
+      for (const x of list) if (emit(sid, x.how, x.text, x.group)) said.add(`${sid}|${x.group}`);
+    },
+  };
+})();
+
+/**
+ * 「安装 AI 工具」之后的验证：探测 → 用**会话起适配器的同一条命令**（`buildRemoteAdapterCommand` + 探测出的起法，
+ * 同一套 `buildSshArgs`）起一次，发 ACP `initialize`，回了才算能起。起来的那个随即收掉（关 stdin，再按自报的 PID 杀树）。
+ */
+async function verifyRemoteAdapter(remote: RemoteTarget, engine: 'claude' | 'codex'): Promise<AdapterVerifyResult> {
+  const host = remote.sshHost || '';
+  let out = '';
+  try {
+    out = await runRemoteCapture(remote, adapterProbeScript(engine), 30_000);
+  } catch (err: any) {
+    return { ok: false, problem: tr('Can\'t connect to {host}: {error}', { host, error: String(err?.message || err) }) };
   }
+  const verdict = judgeAdapterProbe(parseAdapterProbe(out));
+  rememberRemoteAdapterLaunch(remote, engine, verdict);
+  const problem = adapterProblemMessage(host, engine, verdict);
+  if (problem) return { ok: false, problem };
+  return await new Promise<AdapterVerifyResult>((resolve) => {
+    const child = spawn('ssh', buildSshArgs(remote, buildRemoteAdapterCommand(REMOTE_ADAPTER_BIN[engine], verdict)), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
+    let stdout = '';
+    let stderr = '';
+    let done = false;
+    /* 远端自报的 PID（`buildRemoteAdapterCommand` 的第一行）：收尸用 */
+    let pid: number | undefined;
+    const finish = (timedOut: boolean, exitCode: number | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      const r = judgeAdapterVerify({ stdout, stderr, exitCode, timedOut });
+      try { child.stdin.end(); } catch { /* 已经退了 */ }
+      if (pid) runRemoteCapture(remote, remoteKillTree(pid), 15_000).catch(() => { /* 收不掉就留给孤儿清扫 */ });
+      setTimeout(() => { try { child.kill(); } catch { /* 已经退了 */ } }, 3_000);
+      resolve(r);
+    };
+    child.stdout.on('data', (b: Buffer) => {
+      stdout = (stdout + b.toString('utf-8')).slice(-8000);
+      if (judgeAdapterVerify({ stdout, stderr: '', exitCode: null, timedOut: false }).ok) finish(false, null);
+    });
+    child.stderr.on('data', (b: Buffer) => {
+      stderr = (stderr + b.toString('utf-8')).slice(-8000);
+      pid = pid || parseRemotePid(stderr);
+    });
+    child.on('error', (err) => { stderr += `\n${err?.message || err}`; finish(false, null); });
+    child.on('close', (code) => finish(false, code));
+    const timer = setTimeout(() => finish(true, null), 60_000);
+    try { child.stdin.write(ACP_INITIALIZE_LINE); } catch { /* close 会报 */ }
+  });
 }
 
 function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
@@ -6905,7 +6997,7 @@ app.whenReady().then(async () => {
       /* 没有任何东西会被推到远端了，所以「这个目录能不能当镜像根」那道闸不存在了 */
       /* 起执行器之前先问清工具/登录/连通 —— 不问的话失败会伪装成别的东西 */
       if (engineOf(profile) !== 'kiro') {
-        await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+        await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex', kiroLexId);
       } else {
         remoteModels = await remotePreflight(profile.remote);
         profile.model = pickRemoteModel(kiroLexId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
@@ -6950,6 +7042,8 @@ app.whenReady().then(async () => {
     store.writeRecord(rec);
     /* 会话建成、记录落盘了：连接时记下的那句「改用了备用模型」现在写进对话记录 */
     modelFallback.commit(kiroLexId);
+    /* 远端适配器探测攒下的那几句（登录 shell 看不到适配器 / 那家 CLI 没登录）同理 */
+    adapterNotes.commit(kiroLexId);
     mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId: kiroLexId, projectId: profile.projectId });
     return { sessionId: kiroLexId };
   });
@@ -9430,7 +9524,7 @@ app.whenReady().then(async () => {
     try {
       if (target) {
         if (engineOf(profile) !== 'kiro') {
-          await remoteAdapterCheck(profile.remote!, engineOf(profile) as 'claude' | 'codex');
+          await remoteAdapterCheck(profile.remote!, engineOf(profile) as 'claude' | 'codex', sessionId);
         } else {
           const models = await remotePreflight(profile.remote!);
           profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), models, profile.remote!.sshHost || '');
@@ -9897,7 +9991,7 @@ app.whenReady().then(async () => {
     let remoteModels: string[] | undefined;
     try {
       if (profile.remote?.sshHost) {
-        if (engine !== 'kiro') await remoteAdapterCheck(profile.remote, engine);
+        if (engine !== 'kiro') await remoteAdapterCheck(profile.remote, engine, sessionId);
         else {
           remoteModels = await remotePreflight(profile.remote);
           profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
@@ -10008,7 +10102,7 @@ app.whenReady().then(async () => {
     /* 远程会话：ensureLocalTools 会换掉这条会话的 token、停掉旧的中转 —— 旧执行器手里那个隧道地址从这一刻起就失效了 */
     let toolsSwapped = false;
     try {
-      if (profile.remote?.sshHost) await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+      if (profile.remote?.sshHost) await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex', sessionId);
       toolsSwapped = !!profile.remote?.sshHost;
       const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
       const started = await connectWithModelFallback(profile, 'switch-mcp-combo', localTools, sessionId);
@@ -11222,7 +11316,7 @@ app.whenReady().then(async () => {
           （那是为了不让一条已存在的远程会话变成死结），现在也不需要了。
         */
         if (engineOf(profile) !== 'kiro') {
-          await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex');
+          await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex', sessionId);
         } else {
           remoteModels = await remotePreflight(profile.remote);
           profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
@@ -13191,14 +13285,29 @@ app.whenReady().then(async () => {
         clearTimeout(killer);
         resolve({ ok: false, code: null, error: err?.message || tr('ssh would not start') });
       });
-      child.on('close', (code) => {
+      child.on('close', async (code) => {
         clearTimeout(killer);
         logger.info('remote', `bootstrap 结束 ${target.sshHost} code=${code}`);
+        /*
+          **装完按会话的启动方式真起一次** ——「装完用和启动时完全一样的方式（bash -lc）验证能起」。
+          脚本里的自检只问 `command -v`，而 fnm / nvm 的机器上"找得到"和"起得来"是两回事。
+          两家都验：脚本两家都装了，哪家起不来都要说出原因。
+        */
+        const failed: string[] = [];
+        /* 255 = ssh 自己没连上：脚本根本没跑，再连两次只是多等 */
+        if (code !== 255) for (const engine of ['claude', 'codex'] as const) {
+          const v = await verifyRemoteAdapter(target, engine);
+          const line = adapterVerifyMessage(target.sshHost, engine, v);
+          logger.info('remote', `bootstrap 验证 ${target.sshHost} ${engine}: ${v.ok ? 'ok' : line}`);
+          send(`\n${line}\n`);
+          if (!v.ok) failed.push(line);
+        }
+        const scriptError = code === 0 ? '' : (tail.trim().split('\n').slice(-6).join('\n') || tr('Exit code {code}', { code: String(code) }));
         resolve({
-          ok: code === 0,
+          ok: code === 0 && !failed.length,
           code,
           /* 失败时把最后一段输出带回去：自检那几行就在里面，比一句 exit 1 有用得多 */
-          error: code === 0 ? undefined : (tail.trim().split('\n').slice(-6).join('\n') || tr('Exit code {code}', { code: String(code) })),
+          error: code === 0 && !failed.length ? undefined : [scriptError, ...failed].filter(Boolean).join('\n'),
         });
       });
     });

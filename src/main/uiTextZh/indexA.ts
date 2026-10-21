@@ -39,8 +39,6 @@ export const ZH_INDEX_A: Record<string, string> = {
   "⏳ Local tools connection restored; reconnecting this session…": '⏳ 本机工具连接已恢复，正在重连这条会话…',
   "Can't connect to {host}: {error}": '连不上 {host}：{error}',
   "Can't connect to {host}": '连不上 {host}',
-  '{host} has no ACP adapter for {engine} ({bin}). Settings → 🖥 Machines → select this machine → "Install AI tools" will install it ({pkg}). You also need to have signed in to {engine} on that machine.':
-    '{host} 上没有 {engine} 的 ACP 适配器（{bin}）。设置 → 🖥 机器 → 选中这台机器 →「安装 AI 工具」会装上它（{pkg}）；另外那台机器上要登录过 {engine}。',
   '⚠️ {host} has no model "{wanted}", so this session uses "{fallback}" instead.': '⚠️ {host} 上没有模型「{wanted}」，这条会话改用「{fallback}」。',
   'Available there: {list}{more}': '远端可用：{list}{more}',
   '{what} timed out (no response for {s}s)': '{what} 超时（{s}s 无响应）',
