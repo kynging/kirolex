@@ -13087,6 +13087,31 @@ app.whenReady().then(async () => {
     return { ok: true };
   });
 
+  /**
+   * 「会话信息」—— 排查时一次拿全：会话 id、后端会话 id、运行位置、引擎、会话目录（`renderer/sessionInfo.ts`）。
+   * 后端 id 先看活着的执行器（换过后端的话记录里那份可能还没写回），没连着再看记录。只读，不碰执行器。
+   */
+  ipcMain.handle('acp:session-info', async (_event, sessionId: string) => {
+    try {
+      const dir = store.sessionDirPath(sessionId);
+      const rec = store.readRecord(sessionId);
+      if (!rec) return { ok: false, error: tr('Session not found') };
+      const sshHost = rec.profile?.remote?.sshHost;
+      return {
+        ok: true,
+        info: {
+          id: rec.id || sessionId,
+          cliSessionId: sessionClients.get(sessionId)?.cliSessionId || rec.cliSessionId || undefined,
+          engine: rec.profile?.engine || 'kiro',
+          remote: sshHost ? { label: labelForHost(KIROLEX_CONFIG_PATH, sshHost), sshHost } : null,
+          dir,
+        },
+      };
+    } catch (error: any) {
+      return { ok: false, error: error?.message || String(error) };
+    }
+  });
+
   // Durable session index (design §4): the on-disk record.json set is the
   // source of truth for which sessions exist. The renderer hydrates its sidebar
   // from this so an origin change (dev port drift) or a cleared localStorage can

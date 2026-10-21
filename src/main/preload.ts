@@ -189,6 +189,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   setProject: (sessionId: string, projectId: string | null) => ipcRenderer.invoke('acp:set-project', sessionId, projectId),
   moveSession: (sessionId: string, projectId: string | null) => ipcRenderer.invoke('acp:move-session', sessionId, projectId),
   archiveSession: (sessionId: string, archived: boolean) => ipcRenderer.invoke('acp:archive-session', sessionId, archived),
+  /** 「会话信息」：会话 id / 后端会话 id / 运行位置 / 引擎 / 会话目录，排查时一次拿全 */
+  sessionInfo: (sessionId: string) => ipcRenderer.invoke('acp:session-info', sessionId),
   getExecutorCap: () => ipcRenderer.invoke('acp:get-executor-cap'),
   reveal: () => ipcRenderer.invoke('acp:reveal'),
   /** 无边框窗口的三个按钮 —— 'minimize' | 'toggle-maximize' | 'close' */

@@ -9264,3 +9264,97 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 }
 /* 气泡分开显示时（user-turn-group），红框也靠右，和这一轮的用户消息对齐 */
 .user-turn-group > .steer-failed { margin-left: auto; width: fit-content; max-width: 70%; margin-bottom: 6px; }
+
+
+/* 找会话弹框 / 会话信息弹框（沿用 .rename-popup 的外框） */
+.rename-popup.session-finder,
+.rename-popup.session-info {
+  width: 480px;
+  max-width: calc(100vw - 40px);
+}
+.session-finder-list {
+  max-height: 320px;
+  overflow-y: auto;
+  margin: -6px 0 4px;
+}
+.session-finder-item {
+  padding: 6px 8px;
+  border-radius: 6px;
+  cursor: pointer;
+}
+.session-finder-item:hover {
+  background: var(--bg-hover);
+}
+.session-finder-title {
+  font-size: 13px;
+  color: var(--text-primary);
+  display: flex;
+  gap: 8px;
+  align-items: baseline;
+}
+.session-finder-project {
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.session-finder-id {
+  font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.session-finder-empty,
+.session-info-note {
+  font-size: 12px;
+  color: var(--text-muted);
+  padding: 6px 2px 12px;
+}
+.session-info-row {
+  margin-bottom: 10px;
+}
+.session-info-label {
+  font-size: 11px;
+  color: var(--text-muted);
+  margin-bottom: 2px;
+}
+.session-info-value-line {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+.session-info-value {
+  flex: 1;
+  min-width: 0;
+  font-family: var(--font-mono, ui-monospace, Consolas, monospace);
+  font-size: 12px;
+  color: var(--text-primary);
+  word-break: break-all;
+  user-select: text;
+}
+.session-info-value.copyable,
+.session-info-value.link {
+  cursor: pointer;
+}
+.session-info-value.copyable:hover {
+  color: var(--accent);
+}
+.session-info-value.link {
+  color: var(--accent);
+  text-decoration: underline;
+}
+.session-info-value.muted {
+  font-family: inherit;
+  color: var(--text-muted);
+}
+.session-info-copy {
+  flex-shrink: 0;
+  background: var(--bg-tertiary);
+  color: var(--text-secondary);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 1px 6px;
+  font-size: 12px;
+  cursor: pointer;
+}
+.session-info-copy:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}

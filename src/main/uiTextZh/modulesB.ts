@@ -237,4 +237,5 @@ export const ZH_MODULES_B: Record<string, string> = {
   '📖 Read {n} chars from {url}': '📖 读了 {url} 的 {n} 字',
   '📸 Screenshot of {url} → {path}': '📸 截图 {url} → {path}',
   '✖ Closed tab {url}': '✖ 关闭了标签 {url}',
+  'Session not found': '找不到这条会话',
 };

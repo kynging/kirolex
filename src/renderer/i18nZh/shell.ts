@@ -211,4 +211,23 @@ export const ZH_SHELL: Record<string, string> = {
   // ── 会话默认标题的显示（存的值仍是 'New Chat'，见 i18n.ts displayTitle）──
   'New Chat': '新会话',
   'this session': '这个会话',
+  /* 会话信息 / 复制会话 id / 找会话（Sidebar.tsx、sessionInfo.ts） */
+  'Copy session id': '复制会话 id',
+  'Session info…': '会话信息…',
+  'Session info': '会话信息',
+  'Session id': '会话 id',
+  'Backend session id': '后端会话 id',
+  'None yet (assigned when the chat first connects)': '还没有（第一次连上后端时才分配）',
+  'Runs on': '运行位置',
+  'Engine': '引擎',
+  'Session folder': '会话目录',
+  'Copy all': '全部复制',
+  'Copied: {what}': '已复制：{what}',
+  'Could not copy: {reason}': '没能复制：{reason}',
+  'Find chat': '找会话',
+  'Find chat by title or id…': '按标题或 id 找会话…',
+  'No matching chats': '没有匹配的会话',
+  'Click to copy': '点一下复制',
+  'Click to open the folder': '点一下打开这个文件夹',
+  'Could not open it: {reason}': '没能打开：{reason}',
 };

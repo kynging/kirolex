@@ -5,6 +5,7 @@ const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions } from '../sessionSearch';
+import { sessionInfoRows, sessionInfoText, type SessionInfo } from '../sessionInfo';
 import { placeMenu, placeSubmenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
 import React, { useState, useRef, useEffect, useLayoutEffect, useReducer } from 'react';
@@ -623,6 +624,32 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * 留着这个变量而不是把过滤代码一并删掉：判据本身是对的，换入口时不必重写。
    */
   const [query] = useState('');
+  /**
+   * 「找会话」弹框（标题 / 项目名 / **id**）——「会话搜索框支持直接粘 id 定位到那条会话」。
+   * 侧栏常驻的那个框按要求去掉了（见上），所以这里是一个点 🔍 才出现的弹框，不改侧栏的列表和折叠。
+   * 判据和上面同一份 `searchSessions`。
+   */
+  const [finderOpen, setFinderOpen] = useState(false);
+  const [finderQuery, setFinderQuery] = useState('');
+  /** 「会话信息」弹框：开着的是哪条会话，以及主进程 `acp:session-info` 回来的东西 */
+  const [infoFor, setInfoFor] = useState<string | null>(null);
+  const [info, setInfo] = useState<{ ok: boolean; error?: string; info?: SessionInfo } | null>(null);
+  useEffect(() => {
+    if (!infoFor) { setInfo(null); return; }
+    let alive = true;
+    setInfo(null);
+    void Promise.resolve((window as any).kiroApi?.sessionInfo?.(infoFor))
+      .then((r: any) => { if (alive) setInfo(r || { ok: false, error: t('unknown reason') }); })
+      .catch((e: any) => { if (alive) setInfo({ ok: false, error: e?.message || String(e) }); });
+    return () => { alive = false; };
+  }, [infoFor]);
+  const copyToClipboard = (text: string, what: string) => {
+    if (!text) return;
+    void navigator.clipboard.writeText(text).then(
+      () => showToast(t('Copied: {what}', { what })),
+      (e: any) => showToast(t('Could not copy: {reason}', { reason: e?.message || String(e) })),
+    );
+  };
   const [creatingProject, setCreatingProject] = useState(false);
   const [newProjectName, setNewProjectName] = useState('');
   /**
@@ -1194,6 +1221,25 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             {`📌 ${ctxSession.pinned ? t('Unpin') : t('Pin')}`}
           </div>
+          {/* 会话 id ——「会话能查看/复制 id」：排查时日志按 `sessionId=` 过滤、给看板提 bug、控制入口 `/sessions/:id/…`
+              都要这串，原来只能靠标题去猜。还没落盘的 `pending_` 没有真 id，不给。 */}
+          {!ctxSession.id.startsWith('pending_') && (
+            <>
+              <div
+                className="context-menu-item"
+                title={ctxSession.id}
+                onClick={() => { copyToClipboard(ctxSession.id, t('Session id')); setContextMenu(null); }}
+              >
+                {`🆔 ${t('Copy session id')}`}
+              </div>
+              <div
+                className="context-menu-item"
+                onClick={() => { setInfoFor(ctxSession.id); setContextMenu(null); }}
+              >
+                {`ℹ️ ${t('Session info…')}`}
+              </div>
+            </>
+          )}
           {/* Deliberately NOT exposed here: 「重建上下文」(snapshot / full replay).
               It is a recovery lever for internal state -- which backend holds which
               history -- and does not map to anything a user can judge from the UI; it
@@ -1427,6 +1473,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             <IconWorkspaceFolder size={19} className="sidebar-workspace-icon" />
           </button>
+          {/* 找会话（标题 / 项目名 / id）：一个弹框，不是侧栏常驻的搜索框（那个按要求去掉了） */}
+          <button
+            className="sidebar-settings-btn find-session-btn"
+            onClick={() => { setFinderQuery(''); setFinderOpen(true); }}
+            title={t('Find chat by title or id…')}
+            aria-label={t('Find chat')}
+          >
+            🔍
+          </button>
           {/*
             Agent 配置那个按钮搬到会话界面里了（就在选 agent 的下拉旁边）——「放到会话界面，不过这个配置是全局的」。
             放在这排图标里时，它和 🧠、⚙️ 挤在一起，也看不出改的是「当前这个 agent」；而选 agent 本来就在会话那条工具栏上。
@@ -1591,6 +1646,94 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   setProjectRenamePopup(null);
                 }}
               >{t('Rename')}</button>
+            </div>
+          </div>
+        </>
+      )}
+
+      {/* 找会话：标题 / 项目名 / id（整串、前缀、最后 6 位都行）。回车 = 打开第一条 */}
+      {finderOpen && (() => {
+        const found = searchSessions(sessions, finderQuery);
+        const hits = found.idle ? [] : found.hits.slice(0, 30);
+        const pick = (id: string) => { setFinderOpen(false); onSwitchSession(id); };
+        return (
+          <>
+            <div className="overlay" onClick={() => setFinderOpen(false)} />
+            <div className="rename-popup session-finder">
+              <h4>{t('Find chat')}</h4>
+              <input
+                autoFocus
+                className="rename-popup-input session-finder-input"
+                placeholder={t('Find chat by title or id…')}
+                value={finderQuery}
+                onChange={(e) => setFinderQuery(e.target.value)}
+                onKeyDown={(e) => {
+                  if (e.key === 'Enter' && hits[0]) pick(hits[0].id);
+                  else if (e.key === 'Escape') setFinderOpen(false);
+                }}
+              />
+              {!found.idle && (
+                <div className="session-finder-list">
+                  {hits.length === 0 && <div className="session-finder-empty">{t('No matching chats')}</div>}
+                  {hits.map((s) => (
+                    <div key={s.id} className="session-finder-item" onClick={() => pick(s.id)} title={s.id}>
+                      <div className="session-finder-title">
+                        {s.archived ? '🗄️ ' : ''}{displayTitle(lang, s.title) || t('Chat')}
+                        {s.projectId && <span className="session-finder-project">{s.projectId}</span>}
+                      </div>
+                      <div className="session-finder-id">{s.id}</div>
+                    </div>
+                  ))}
+                </div>
+              )}
+            </div>
+          </>
+        );
+      })()}
+
+      {/* 会话信息：排查时一次拿全（id、后端会话 id、运行位置、引擎、会话目录），每项点一下复制 */}
+      {infoFor && (
+        <>
+          <div className="overlay" onClick={() => setInfoFor(null)} />
+          <div className="rename-popup session-info">
+            <h4>{t('Session info')}</h4>
+            {!info && <div className="session-info-note">{t('Loading…')}</div>}
+            {info && !info.ok && <div className="session-info-note">⚠ {info.error || t('unknown reason')}</div>}
+            {info?.ok && info.info && (
+              <>
+                {sessionInfoRows(info.info, t).map((row) => (
+                  <div key={row.key} className={`session-info-row info-${row.key}`}>
+                    <div className="session-info-label">{row.label}</div>
+                    <div className="session-info-value-line">
+                      {row.open ? (
+                        <span
+                          className="session-info-value link"
+                          title={t('Click to open the folder')}
+                          onClick={() => {
+                            void Promise.resolve((window as any).kiroApi?.openExternal?.(row.open))
+                              .then((r: any) => { if (r && !r.ok) showToast(t('Could not open it: {reason}', { reason: r.error || t('unknown reason') })); });
+                          }}
+                        >{row.value}</span>
+                      ) : (
+                        <span
+                          className={`session-info-value${row.copy ? ' copyable' : ' muted'}`}
+                          title={row.copy ? t('Click to copy') : undefined}
+                          onClick={() => copyToClipboard(row.copy, row.label)}
+                        >{row.value}</span>
+                      )}
+                      {row.copy && (
+                        <button className="session-info-copy" title={t('Copy')} onClick={() => copyToClipboard(row.copy, row.label)}>⧉</button>
+                      )}
+                    </div>
+                  </div>
+                ))}
+              </>
+            )}
+            <div className="rename-popup-actions">
+              {info?.ok && info.info && (
+                <button className="rename-popup-btn cancel" onClick={() => copyToClipboard(sessionInfoText(info.info!), t('Session info'))}>{t('Copy all')}</button>
+              )}
+              <button className="rename-popup-btn confirm" onClick={() => setInfoFor(null)}>{t('Close')}</button>
             </div>
           </div>
         </>

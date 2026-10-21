@@ -221,6 +221,10 @@ function safeId(id: string): string {
 function dirFor(id: string): string {
   return path.join(baseDir, safeId(id));
 }
+/** 这条会话的目录（`~/.kirolex/sessions/<id>`）—— 「会话信息」里给人看 / 点开用。id 不合规照样抛。 */
+export function sessionDirPath(id: string): string {
+  return dirFor(id);
+}
 function recordPath(id: string): string {
   return path.join(dirFor(id), 'record.json');
 }

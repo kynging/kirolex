@@ -208,6 +208,7 @@ declare global {
       setProject: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
       moveSession: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
       archiveSession: (sessionId: string, archived: boolean) => Promise<{ sessionId: string; archived: boolean }>;
+      sessionInfo: (sessionId: string) => Promise<{ ok: boolean; error?: string; info?: import('./sessionInfo').SessionInfo }>;
       getExecutorCap: () => Promise<number>;
       getExecutorCapInfo: () => Promise<{ cap: number; auto: number; overridden: boolean }>;
       prepareImageAttachment?: (filePath: string) => Promise<{ path: string; downscaled?: boolean; from?: string; to?: string }>;
