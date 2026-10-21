@@ -77,6 +77,19 @@ describe('「新会话默认组合」下拉', () => {
     assert.equal(opts[0].label, '跟随全局（通用（带本机工具））');
     assert.deepEqual(sel(opts), ['']);
   });
+  test('项目跟随全局、全局那个本机没有：「跟随全局」里写明缺的是哪个、新会话按通用', () => {
+    const opts = defaultComboOptions(info({ global: 'mac-only', project: '' }), 'project', zh);
+    assert.equal(opts[0].label, '跟随全局（组合「mac-only」在本机不存在，新会话按通用）');
+    assert.deepEqual(sel(opts), ['']);
+    assert.equal(opts.some((o) => o.disabled), false);
+  });
+  test('项目跟随全局、组合文件有错：「跟随全局」里说读不到', () => {
+    const opts = defaultComboOptions({ combos: [{ id: 'default', name: '通用' }], global: 'general', project: '', error: 'x' }, 'project', zh);
+    assert.equal(opts[0].label, '跟随全局（组合「general」读不到（组合文件有错），新会话按通用）');
+  });
+  test('项目跟随全局、全局没设：仍是「跟随全局（通用）」', () => {
+    assert.equal(defaultComboOptions(info({ project: '' }), 'project', zh)[0].label, '跟随全局（通用）');
+  });
   test('项目覆盖了：选中覆盖的那个', () => {
     assert.deepEqual(sel(defaultComboOptions(info({ global: 'general', project: 'default' }), 'project', zh)), ['default']);
   });

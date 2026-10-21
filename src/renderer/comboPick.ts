@@ -54,22 +54,19 @@ export function defaultComboOptions(
 ): DefaultComboOption[] {
   const chosen = scope === 'global' ? (info.global || 'default') : (info.project || '');
   const nameOf = (id: string) => info.combos.find((c) => c.id === id)?.name;
+  const missingLabel = (id: string) => info.error
+    ? t('Combo "{id}" could not be read (the combo file has an error); new sessions use General', { id })
+    : t('Combo "{id}" does not exist on this machine; new sessions use General', { id });
   const out: DefaultComboOption[] = [];
   if (scope === 'project') {
+    /* 全局设的那个本机没有时，「跟随全局」里就写明缺哪个、新会话按通用；内置的 default 不在清单里也算通用 */
     const g = info.global || 'default';
-    const gName = nameOf(g) || t('General purpose');
+    const gName = nameOf(g) || (g === 'default' ? t('General purpose') : missingLabel(g));
     out.push({ value: '', label: t('Follow global ({name})', { name: gName }), selected: chosen === '' });
   }
   for (const c of info.combos) out.push({ value: c.id, label: c.name, selected: c.id === chosen });
   if (chosen && !info.combos.some((c) => c.id === chosen)) {
-    out.push({
-      value: chosen,
-      label: info.error
-        ? t('Combo "{id}" could not be read (the combo file has an error); new sessions use General', { id: chosen })
-        : t('Combo "{id}" does not exist on this machine; new sessions use General', { id: chosen }),
-      selected: true,
-      disabled: true,
-    });
+    out.push({ value: chosen, label: missingLabel(chosen), selected: true, disabled: true });
   }
   return out;
 }
