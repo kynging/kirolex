@@ -87,7 +87,9 @@ describe('接线（src/main/index.ts）', () => {
     const at = M.indexOf('const plan = planRetry({');
     assert.ok(at > 0);
     const body = M.slice(at, at + 300);
-    assert.match(body, /producedText: !!entry\.assistantBuf,/);
+    /* producedText 不能只看 assistantBuf：这段在 flushAssistant 之后，buf 已经清空了（出过字的那一轮被当成没开始、自动重发）。
+       看流式时记下的 textThisTurn（flush 不动它），见 duplicateSubmit.test.ts 的 flush → planRetry 那组 */
+    assert.match(body, /producedText: !!\(entry\.textThisTurn \|\| entry\.assistantBuf\),/);
     assert.match(body, /toolsRan: entry\.toolsThisTurn \|\| 0,/);
   });
 

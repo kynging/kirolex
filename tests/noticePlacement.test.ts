@@ -180,7 +180,8 @@ describe('同类提示带上「类型:对象」，界面才能合并计数', () 
   test('换模型 / 换后端会话 / 改写排队 / 切换没生效：各自带 group（对象或结果不同就是不同的 group）', () => {
     assert.match(M, /undefined, `model-swap:\$\{failedModel\}→\$\{swapped\}`\);/);
     assert.match(M, /noteInSession\(sessionId, note, undefined, 'backend-session-swap'\);/);
-    assert.match(M, /\{ group: `revise-queued:\$\{label\}` \}\);/);
+    /* 同一次提交（ticket）一个 group；老调用方没有 ticket 时按 label */
+    assert.match(M, /\{ group: `revise-queued:\$\{noticeKey \|\| label\}` \}\);/);
     assert.match(M, /`pending-switch-failed:\$\{report\.failed\.map\(\(f\) => `\$\{f\.kind\}→\$\{f\.label\}`\)\.join\(','\)\}`/);
   });
 

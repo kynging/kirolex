@@ -74,7 +74,8 @@ function fnBody(name: string): string {
 
 describe('接线', () => {
   test('排空按设置取批次，设置只在这里被读', () => {
-    assert.match(CODE, /const consumed = queuedBatch\(queue, settings\.mergeQueuedMessages && !queue\[0\]\.afterRebuild\);/);
+    /* 队首是一批没发成的就原样重发（queueRetry.pickQueuedBatch，queueRetry.test.ts 守着），否则照设置交给 queuedBatch 分批 */
+    assert.match(CODE, /const picked = pickQueuedBatch\(queue, settings\.mergeQueuedMessages && !queue\[0\]\.afterRebuild, queuedBatch\);\s*\n\s*const consumed = picked\.items;/);
     assert.match(CODE, /joinQueuedBatch\(consumed,/);
     // 入队那几处都不看这个设置：设置只用于发送
     const reads = CODE.match(/settings\.mergeQueuedMessages/g) || [];
@@ -101,8 +102,13 @@ describe('接线', () => {
 
   test('任何入队入口都不改已有卡片的内容（只有「编辑卡片」可以）', () => {
     // 已有卡片被改内容的写法只有 `{ ...item, content: ... }` 一种；它只能出现在编辑卡片里。
+    // 「编辑卡片」改内容的那一下挪进了 queueRetry.editQueuedItem（改过已经试着发过的卡片要换 id，见 queueRetry.test.ts），
+    // 所以 App 里一处都不该有；editQueuedItem 也只在 handleEditQueuedMessage 里调。
     const edits = CODE.match(/\{ \.\.\.(item|last|tail|candidate|q), content:/g) || [];
-    assert.equal(edits.length, 1, '只有 handleEditQueuedMessage 能改已有卡片的内容');
-    assert.match(fnBody('handleEditQueuedMessage'), /\{ \.\.\.item, content: content\.trim\(\) \}/);
+    assert.equal(edits.length, 0, '只有 handleEditQueuedMessage（经 editQueuedItem）能改已有卡片的内容');
+    assert.equal((CODE.match(/editQueuedItem\(/g) || []).length, 1);
+    assert.match(fnBody('handleEditQueuedMessage'), /editQueuedItem\(prev\[sid\] \|\| \[\], queueId, content\.trim\(\),/);
+    const QR = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'queueRetry.ts'), 'utf-8');
+    assert.equal((QR.match(/\{ \.\.\.item, content,/g) || []).length, 1, 'queueRetry 里改内容的只有 editQueuedItem 那一处');
   });
 });

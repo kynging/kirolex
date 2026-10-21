@@ -39,6 +39,7 @@ import { asSteerParts, toStoredUserLines } from '../steerSplit';
 import { carryControlMark, viaFor } from '../../main/controlSessions';
 import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
+import { insertOptimistic, isDuplicateMessageError, removeOptimistic } from '../queueRetry';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
 import { withLiveNote } from '../noticeMerge.ts';
@@ -339,10 +340,17 @@ function messageFromStored(m: any): Message {
     ...((m as any).kirolex ? { kirolex: true as const } : {}),
     ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
     ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
+    ...replyMarksOf(m),
     ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
     ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
     timestamp: m.ts,
   };
+}
+
+/** 助手消息的去重标记（`replyTo` / `replyComplete`，见 `main/promptDedupe.ts`）—— 读回来、写回去都原样带着。 */
+function replyMarksOf(m: any): { replyTo?: string; replyComplete?: true } {
+  if (m?.role !== 'assistant' || typeof m.replyTo !== 'string') return {};
+  return { replyTo: m.replyTo, ...(m.replyComplete ? { replyComplete: true as const } : {}) };
 }
 
 function toStoredTranscript(messages: Message[]) {
@@ -362,6 +370,8 @@ function toStoredTranscript(messages: Message[]) {
       ...(m.kirolex ? { kirolex: true as const } : {}),
       ...(m.noteGroup ? { noteGroup: m.noteGroup } : {}),
       ...(typeof m.toolTailFrom === 'number' ? { toolTailFrom: m.toolTailFrom } : {}),
+      /* 回复的去重标记原样写回去（主进程那边也会按盘上的补，见 sessionStore.rewriteTranscript） */
+      ...replyMarksOf(m),
       ...(m.variants ? { variants: m.variants } : {}),
       ...(m.steerParts ? { steerParts: m.steerParts } : {}),
       // 经控制入口发的（id 带标记）：整份重写时显式来源照样写回去
@@ -1809,6 +1819,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
             ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
+            ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
           timestamp: m.ts,
@@ -1840,6 +1851,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
             ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
+            ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           }));
           const msgsWithFailed = withFailed(sid, msgs);
@@ -2737,7 +2749,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     });
 
-    const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text, toolTailFrom }) => {
+    const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text, toolTailFrom, replyTo, replyComplete }) => {
       if (!sid || !text) return;
       const patch = (list: Message[]): Message[] => {
         // Prefer the id main used; fall back to the last assistant message.
@@ -2750,14 +2762,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         if (idx < 0) return list;
         /* 正文只增不减（never shrink）；toolTailFrom 正文一样也要更新（见 assistantFinal.ts） */
         const merged = mergeAssistantFinal(list[idx], text, toolTailFrom);
-        if (!merged) return list;
-        if (merged.content !== list[idx].content) {
+        /* 去重标记（回的是哪一条、是不是完整回复）跟着这条走 —— 整份重写时原样写回去（`replyMarksOf`） */
+        const marks = replyMarksOf({ role: 'assistant', replyTo, replyComplete });
+        const marksNew = !!marks.replyTo && (list[idx].replyTo !== marks.replyTo || list[idx].replyComplete !== marks.replyComplete);
+        if (!merged && !marksNew) return list;
+        if (merged && merged.content !== list[idx].content) {
           console.warn('[kirolex] healed truncated assistant message', {
             sid, rendered: list[idx].content.length, authoritative: text.length,
           });
         }
         const next = [...list];
-        next[idx] = { ...next[idx], ...merged };
+        next[idx] = { ...next[idx], ...(merged || {}), ...marks };
         return next;
       };
       const cached = messagesCacheRef.current.get(sid);
@@ -3228,6 +3243,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
             ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
+            ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             timestamp: m.ts,
@@ -3353,6 +3369,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...((m as any).kirolex ? { kirolex: true as const } : {}),
             ...(typeof (m as any).noteGroup === 'string' ? { noteGroup: (m as any).noteGroup } : {}),
             ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
+            ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             timestamp: m.ts,
@@ -4391,6 +4408,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     };
 
     const userMessageId = options?.messageId || `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const sendToken = `send_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
     /* 这条是为这条会话写的：发送失败没落盘时，切会话对账也认它（见 messageReconcile） */
     if (!options?.mergeIntoMessageId) markLocalOnly(sessionId, [userMessageId]);
     // `text` is what the MODEL gets (pastes expanded); the bubble/transcript keep
@@ -4403,6 +4421,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       attachments,
       ...(options?.pastes?.length ? { pastes: options.pastes } : {}),
       timestamp: Date.now(),
+      /* 这一次插进来的那个气泡的记号 —— 失败时只撤它（`removeOptimistic`） */
+      sendToken,
     };
 
     if (options?.mergeIntoMessageId) {
@@ -4421,17 +4441,47 @@ ${text}`,
         return merged ? next : [...current, userMessage];
       });
     } else {
-      updateSession((current) => [...current, userMessage]);
+      /*
+        **按 id 复用**：没发成的那一批重试时还是原来的 messageId，那条用户消息可能已经在会话里了（上次已经落盘、
+        窗口重载 / 重新打开会话后从磁盘读回来了）—— 再插一个就是两个同 id 的气泡（`insertOptimistic`）。
+      */
+      updateSession((current) => insertOptimistic(current, userMessage));
     }
 
     if (creatingRef.current.has(sessionId)) {
       try { await creatingRef.current.get(sessionId); } catch {}
     }
+    // Undo the optimistic user-message materialization. The caller can put a
+    // failed queued item back at the head without duplicating its chat bubble.
+    const undoOptimistic = () => updateSession((current) => {
+      if (!options?.mergeIntoMessageId) {
+        /* 只撤这一次插进来的那个；原来就在的同 id 历史（上次已经落盘的那条）不动 */
+        return removeOptimistic(current, userMessageId, sendToken);
+      }
+      return current.map((message) => {
+        if (message.id !== options.mergeIntoMessageId || message.role !== 'user') return message;
+        const suffix = `\n${text}`;
+        return {
+          ...message,
+          content: message.content.endsWith(suffix)
+            ? message.content.slice(0, -suffix.length)
+            : message.content,
+          attachments: attachments.length > 0
+            ? (message.attachments || []).slice(0, -attachments.length)
+            : message.attachments,
+        };
+      });
+    });
+
     if (!attachedIdsRef.current.has(sessionId)) {
       markConnecting(sessionId);
       try {
         await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), activeModel);
         addAttached(sessionId);
+      } catch (attachError) {
+        /* 连不上（远端预检失败之类）：气泡也收回去 —— 原来只有发送失败那条路收，排空每重试一次就多留一个 */
+        undoOptimistic();
+        throw attachError;
       } finally {
         clearConnecting(sessionId);
       }
@@ -4477,26 +4527,8 @@ ${text}`,
     }
 
     if (deliveryError) {
-      // Undo the optimistic user-message materialization. The caller can put a
-      // failed queued item back at the head without duplicating its chat bubble.
-      updateSession((current) => {
-        if (!options?.mergeIntoMessageId) {
-          return current.filter((message) => message.id !== userMessageId);
-        }
-        return current.map((message) => {
-          if (message.id !== options.mergeIntoMessageId || message.role !== 'user') return message;
-          const suffix = `\n${text}`;
-          return {
-            ...message,
-            content: message.content.endsWith(suffix)
-              ? message.content.slice(0, -suffix.length)
-              : message.content,
-            attachments: attachments.length > 0
-              ? (message.attachments || []).slice(0, -attachments.length)
-              : message.attachments,
-          };
-        });
-      });
+      /* 主进程说这一条已经在盘上（答过了 / 上次已经开始执行）：气泡留着 —— 它就是盘上那条，不是这一次多插的 */
+      if (!isDuplicateMessageError(String(deliveryError?.message || deliveryError))) undoOptimistic();
       throw deliveryError;
     }
 

@@ -86,7 +86,8 @@ describe('接线：控制入口走 Enter 的同一套 handler', () => {
   });
 
   test('排队卡片发出时，控制入口排进来的那张照样带标记', () => {
-    assert.match(app, /const viaControl = consumed\.some\(\(item\) => isControlMessageId\(item\.id\)\)/);
+    /* messageId 跟着排队条目走（`pickQueuedBatch` → `queuedBatchMessageId`）：条目带标记，发出去的 id 也带（queueRetry.test.ts 守着） */
+    assert.match(app, /messageId: picked\.messageId,/);
   });
 
   test('换 id 的路径都带着标记：轮末没被吃的追加指令、启动时恢复的追加指令、失败后「作为下一条发送」、自动重发', () => {
@@ -178,7 +179,7 @@ describe('空闲时发送失败 → 标红 → 「作为下一条发送」：一
     assert.match(body, /addFailedSteer\(sessionId, content, attachments, String\(error\?\.message \|\| error \|\| ''\), carryControlMark\(messageId, 'steer'\)\);/);
     // 「作为下一条发送」按失败那条的 id 带过去，排空时按卡片 id 给出带标记的用户消息 id，主进程据此写 via
     assert.match(app, /id: carryControlMark\(msgId, 'queue'\) \?\? `queue_/);
-    assert.match(app, /\.\.\.\(viaControl \? \{ messageId: controlMessageId\('user'\) \} : null\)/);
+    assert.match(app, /messageId: picked\.messageId,/);
   });
 
   test('标记一路传下去：用户消息 → 失败的追加指令 → 排队卡片 → 再发出的用户消息；普通发送一路都不带', async () => {

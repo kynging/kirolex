@@ -49,6 +49,7 @@ import * as scheduleStore from './scheduleStore.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
+import { canRetrySame, decidePromptDedupe, DUPLICATE_MESSAGE, DUPLICATE_STARTED, InFlightPrompts, reviseMessageId, turnCompletedNormally } from './promptDedupe.ts';
 import { BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
 import { callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
@@ -204,6 +205,8 @@ interface SessionEntry {
    * 重发一次就是再执行一遍。所以单独数，每轮开始清零，`tool_call`（不含 update）时 +1。
    */
   toolsThisTurn?: number;
+  /** 这一次发送（和 `toolsThisTurn` 同一处清零）模型有没有出过字 —— `planRetry` 的 producedText 看它：flush 会清空 `assistantBuf`，这个不会。 */
+  textThisTurn?: boolean;
   /** 这一轮最后一次开工具调用那一刻 `assistantBuf` 的长度 —— 判「把工具调用写成了文字」只看这之后的正文（`textToolCall.ts`）。 */
   bufAtLastTool?: number;
   /**
@@ -337,6 +340,10 @@ interface SessionEntry {
    *  their own on disk; this is the id they merge into once the backend reports
    *  them CONSUMED (see acp:persist-steer). */
   currentUserMessageId?: string;
+  /** 这一轮**正常收尾**了：下一次 flush 的助手消息是回这一条用户消息的**完整**回复 —— 落盘成 `replyComplete`，去重按它认"答过了"（`promptDedupe.ts`）。flush 时取走。 */
+  completedReplyTo?: string;
+  /** 已经记过"模型开始做这一条了"的那个用户消息 id（`noteTurnStarted`）—— 一轮只记一次。 */
+  startedNoted?: string;
 }
 const sessionClients: Map<string, SessionEntry> = new Map();
 // Serializes model/Agent replacement per session. Renderer locks are UX only;
@@ -3070,6 +3077,8 @@ async function localKiroVersion(): Promise<string | undefined> {
  * 连 `force` 也一起等 —— 手动点重连要的是"现在的答案"，而在路上那次正是现在的答案。
  */
 const preflightInFlight = new Map<string, Promise<string[]>>();
+/** 熔断期间「跳过」那一行每台机器每个窗口只记一次（见 `runPreflight`）—— 记的时刻和之后又跳过了几次。 */
+const preflightSkipLog = new Map<string, { at: number; skipped: number }>();
 
 /**
  * **本地会话在哪个目录里干活** ——「本机应该有工作目录这个功能，默认是用户目录下的 kirolex」。
@@ -3217,7 +3226,19 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
   if (!opts?.force) {
     const recent = reachability.recentFailure(host);
     if (recent) {
-      logger.info('remote', `preflight ${host}: 跳过（${BREAKER_MS / 1000}s 内刚判定连不上）—— 复用上次结论`);
+      /*
+        **一个熔断窗口里只记一行**（外加跳过了几次）—— 实测远端连不上的 4 分钟里这一行刷了 488 次：
+        调用方（排队排空）在紧循环里反复来问。调用方那边已经改成退避了，这里再兜一层，日志不被淹。
+      */
+      const now = Date.now();
+      const last = preflightSkipLog.get(host);
+      if (!last || now - last.at >= BREAKER_MS) {
+        logger.info('remote', `preflight ${host}: 跳过（${BREAKER_MS / 1000}s 内刚判定连不上）—— 复用上次结论`
+          + (last?.skipped ? `（上一个窗口里又跳过了 ${last.skipped} 次，没逐条记）` : ''));
+        preflightSkipLog.set(host, { at: now, skipped: 0 });
+      } else {
+        last.skipped += 1;
+      }
       throw new Error(recent);
     }
   }
@@ -4249,6 +4270,75 @@ const wakeHost: WakeHost = {
  * 里兑付：出错 / 取消那两条路也会 flush 半截输出，而半截正文拿去写盘就是把文件后半截删掉。
  * 那两条路走完 `sendPromptOnce` 照样返回（或抛），等待者由调用方自己摘掉。
  */
+/** 按会话 + messageId 正在跑的发送 —— 同一次提交又来一次就合并到这一次（`promptDedupe.ts`）。 */
+const promptsInFlight = new InFlightPrompts<any>();
+
+/**
+ * `sendPromptOnce` 开头那一问：**同一个 messageId 只落盘一次、只发一次**（判据在 `promptDedupe.ts`）。
+ * 已经答过的同一次提交直接拒（抛 `DUPLICATE_MESSAGE`）；在盘上但没答的（上一次没发成）照发，但不再追加一条。
+ */
+/**
+ * **模型开始做这一条了**（第一次出字、第一次调工具）：记下这条用户消息的 id（`store.markMessageStarted`，跟着会话记录落盘）。
+ * 之后同一个 messageId 又来（排队重试、侧栏再提交、重连后重发、窗口重载后）就拒绝自动再发 —— 它可能已经写过文件、跑过命令。
+ * 重建历史那一轮（priming）不算：它不是在做这条消息。
+ */
+function noteTurnStarted(sessionId: string, entry: SessionEntry): void {
+  const id = entry.currentUserMessageId;
+  if (!id || entry.priming || entry.startedNoted === id) return;
+  entry.startedNoted = id;
+  try { store.markMessageStarted(sessionId, id); } catch { /* 记不下就只少一层保险，不影响这一轮 */ }
+}
+
+/**
+ * 侧栏改写**问过模型之后**失败了：这次提交还能不能按同一个 messageId 接着来（`retrySame`）——
+ * 只有模型对这一问还**什么都没做**（没出字、没跑工具）时可以；已经开始做了的，再按同一次来就是再做一遍，
+ * 渲染层就不留这张 ticket（再提交是新的一次 —— 等于你明确要求重跑）。重复被拒的那两种也不留。
+ */
+function retrySameIf(sessionId: string, messageId: string | undefined, err?: any): { retrySame?: true } {
+  if (err?.code === DUPLICATE_MESSAGE || err?.code === DUPLICATE_STARTED) return {};
+  if (!messageId) return {};
+  return canRetrySame(store.messageIdStatusOnDisk(sessionId, messageId)) ? { retrySame: true } : {};
+}
+
+function promptDedupeFor(sessionId: string, messageId: string | undefined, attempt: number): { persist: boolean } {
+  /*
+    自动重发（attempt > 0）也要看：这一轮（上一次那个用户消息 id，没给 id 时就是 `currentUserMessageId`）模型已经开始做了，
+    就不再发（`noteTurnStarted` 记的那份，跟着会话记录落盘）。
+  */
+  const checkId = messageId ?? (attempt > 0 ? sessionClients.get(sessionId)?.currentUserMessageId : undefined);
+  const dedupe = decidePromptDedupe({
+    explicitId: !!messageId,
+    attempt,
+    status: checkId ? store.messageIdStatusOnDisk(sessionId, checkId) : 'absent',
+  });
+  if (dedupe.action === 'reject' && dedupe.reason === 'started') {
+    logger.warn('prompt', `refused re-send sessionId=${sessionId} messageId=${checkId} attempt=${attempt}: 这一条上次已经开始执行（出过字 / 跑过工具）后中断了 —— 不自动再发`);
+    /* 在会话里说清楚为什么没再发、要怎么重来（同一条只说一次） */
+    noteInSession(sessionId, tr('⚠️ This message already started running last time (it produced output or ran tools) and was cut off, so KiroLex did not send it again automatically, to avoid doing it twice. To redo it, press Rerun on that message.'), undefined, `started-not-resent:${checkId}`);
+    throw Object.assign(new Error(tr('This message already started running last time and was cut off, so it was not sent again automatically. To redo it, press Rerun on that message.')), { code: DUPLICATE_STARTED });
+  }
+  if (dedupe.action === 'reject') {
+    logger.warn('prompt', `refused duplicate sessionId=${sessionId} messageId=${messageId}: 这一条已经在盘上、也有回复了 —— 不再追加、不再发`);
+    throw Object.assign(new Error(tr('This message was already sent and answered, so it was not sent again. To redo it, press Rerun on that message.')), { code: DUPLICATE_MESSAGE });
+  }
+  if (attempt === 0 && !dedupe.persist) {
+    logger.info('prompt', `messageId=${messageId} 已经在盘上、还没有回复 —— 重发这一条，不再追加 sessionId=${sessionId}`);
+  }
+  return dedupe;
+}
+
+/**
+ * 侧栏改写重试时，这一问（`messageId`）在盘上**已经有完整回复**了：直接拿它当这一问的回复（`askOnce`）——
+ * 同一次提交只发给模型一次。没有（没答过、或者只有被停掉 / 截断的半截）就返回 null，照常发。
+ */
+function storedReplyFor(sessionId: string, messageId: string | undefined): Promise<{ text: string; stopReason: string; wedged: boolean }> | null {
+  if (!messageId) return null;
+  const text = store.completedReplyOnDisk(sessionId, messageId);
+  if (text === null) return null;
+  logger.info('revise', `messageId=${messageId} 盘上已经有完整回复 —— 用它，不再发给模型 sessionId=${sessionId}`);
+  return Promise.resolve({ text, stopReason: 'end_turn', wedged: false });
+}
+
 const askWaiters = new Map<string, {
   resolve: (reply: { text: string; stopReason: string; wedged: boolean }) => void;
   timer: NodeJS.Timeout;
@@ -4296,6 +4386,24 @@ const reviseChain = new Map<string, Promise<unknown>>();
  */
 const revisePending = new Map<string, number>();
 
+/** 已经说过「已排队」的那些提交（ticket）—— 同一次提交只说一次。 */
+const reviseQueuedNoticed = new Set<string>();
+
+/** 正在排 / 正在跑的改写，按「ticket | 档」—— 同一次提交又来一次就合并到这一次（见 `review:revise-in-session`）。 */
+const revisesInFlight = new Map<string, Promise<any>>();
+
+/**
+ * 改写结束了却没写完盘的那些，按 ticket 记下**怎么结束的**（`review:tickets-status`）：`retry` = 那一问没拿到完整回复
+ * （网络断了、超时、被停掉 / 截断）或者"改不了"还没升级，`final` = 模型答了却没做成（格式不对、冲突……）。
+ * 那时窗口可能不在（reload 中），收不到这个结果 —— 窗口回来再问。只留最近的一些。
+ */
+const reviseOutcomes = new Map<string, 'retry' | 'final'>();
+function recordReviseOutcome(ticket: string | undefined, res: any): void {
+  if (!ticket || !res || res.ok || res.cancelled) return;
+  reviseOutcomes.set(ticket, res.error && !res.retrySame ? 'final' : 'retry');
+  if (reviseOutcomes.size > 500) for (const k of [...reviseOutcomes.keys()].slice(0, 100)) reviseOutcomes.delete(k);
+}
+
 /**
  * 排到这条会话的队尾，轮到了再跑。失败不断链（否则一次失败会把后面几条全带走）。
  *
@@ -4303,17 +4411,25 @@ const revisePending = new Map<string, number>();
  * "排上队了"在屏幕上长得一模一样。不等的那些（绝大多数）什么都不说：一条"已排队"紧接着一条"已改完"
  * 只是噪音。
  */
-function enqueueRevise<T>(sessionId: string, job: () => Promise<T>, label?: string): Promise<T> {
+function enqueueRevise<T>(sessionId: string, job: () => Promise<T>, label?: string, noticeKey?: string, trackScope?: string): Promise<T> {
   const ahead = revisePending.get(sessionId) || 0;
-  if (label) {
+  /* 同一次提交（同一张 ticket，含 block → patch 升级那一问）只说一次「已排队」 */
+  const noticedBefore = !!noticeKey && reviseQueuedNoticed.has(noticeKey);
+  if (label && !noticedBefore) {
     const busy = busyReasonFor(sessionId);
     /*
       「已排队」只需知道、不用操作 → 状态行（不进对话记录）；两种原因合成一句带参数的（docs/notices-glossary.md）
     */
+    if (ahead > 0 || busy) {
+      if (noticeKey) {
+        reviseQueuedNoticed.add(noticeKey);
+        if (reviseQueuedNoticed.size > 500) for (const k of [...reviseQueuedNoticed].slice(0, 100)) reviseQueuedNoticed.delete(k);
+      }
+    }
     if (ahead > 0) {
-      sessionNotice(sessionId, tr('⏳ Queued: {label} ({why}); it will be sent automatically.', { label, why: tr('{n} earlier revision(s) still running', { n: ahead }) }), { group: `revise-queued:${label}` });
+      sessionNotice(sessionId, tr('⏳ Queued: {label} ({why}); it will be sent automatically.', { label, why: tr('{n} earlier revision(s) still running', { n: ahead }) }), { group: `revise-queued:${noticeKey || label}` });
     } else if (busy) {
-      sessionNotice(sessionId, tr('⏳ Queued: {label} ({why}); it will be sent automatically.', { label, why: tr('session busy: {busy}', { busy }) }), { group: `revise-queued:${label}` });
+      sessionNotice(sessionId, tr('⏳ Queued: {label} ({why}); it will be sent automatically.', { label, why: tr('session busy: {busy}', { busy }) }), { group: `revise-queued:${noticeKey || label}` });
     }
   }
   revisePending.set(sessionId, ahead + 1);
@@ -4324,6 +4440,16 @@ function enqueueRevise<T>(sessionId: string, job: () => Promise<T>, label?: stri
     if (left > 0) revisePending.set(sessionId, left);
     else revisePending.delete(sessionId);
   }));
+  /*
+    `trackScope`：按「ticket | 档」登记进 `revisesInFlight`（在跑期间同一张 ticket 再来就合并）、结束时记结局（`recordReviseOutcome`，
+    窗口 reload 回来按它决定沿用还是新起）—— deck 一页版面文字那条用；`review:revise-in-session` 在自己的 handler 里做同样的事。
+  */
+  if (noticeKey && trackScope) {
+    const key = `${noticeKey}|${trackScope}`;
+    revisesInFlight.set(key, next);
+    next.then((res) => recordReviseOutcome(noticeKey, res), () => {});
+    next.finally(() => { if (revisesInFlight.get(key) === next) revisesInFlight.delete(key); }).catch(() => {});
+  }
   return next;
 }
 
@@ -5302,6 +5428,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       }
       if (u?.sessionUpdate === 'agent_message_chunk') {
         entry.assistantBuf += u?.content?.text || '';
+        if (u?.content?.text) { entry.textThisTurn = true; noteTurnStarted(sessionId, entry); }
         if (!entry.assistantMsgId) entry.assistantMsgId = u?.messageId || `a_${Date.now()}`;
         /* 远程会话：它可能在这几行里要求"在用户机器上打开某个页面"—— 边流边认，别等到一轮结束
            （一轮可能还要跑几分钟，而"让我看看进度"的价值就在于**现在**看） */
@@ -5311,6 +5438,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
         /* 只数新开的调用（不数 update）—— 这是"这一轮动过东西没有"的依据，见 `toolsThisTurn`。 */
         if (u?.sessionUpdate === 'tool_call') entry.toolsThisTurn = (entry.toolsThisTurn || 0) + 1;
+        /* 跑了工具 = 模型已经开始做这一条了：同一个 messageId 不能再被自动发一遍（`noteTurnStarted`） */
+        if (u?.sessionUpdate === 'tool_call') noteTurnStarted(sessionId, entry);
         /* 这之前的文字就算带着调用标记，后面也真调了工具 —— 判「写成文字没执行」只看这之后（见 textToolCall.ts） */
         if (u?.sessionUpdate === 'tool_call') entry.bufAtLastTool = entry.assistantBuf.length;
         /*
@@ -5550,6 +5679,10 @@ function wireSession(sessionId: string, entry: SessionEntry) {
  *  turn completion). No-op if nothing accumulated. */
 function flushAssistant(sessionId: string) {
   const entry = sessionClients.get(sessionId);
+  /* 只管这一次 flush：先取出来清掉（下面提前 return 时也不能留给下一次的半截） */
+  const completedFor = entry?.completedReplyTo;
+  if (entry) entry.completedReplyTo = undefined;
+  const replyTo = entry?.currentUserMessageId;
   // A wedge note alone is enough to persist: a turn cut before it produced
   // anything still owes the user an explanation for why it stopped.
   if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote)) return;
@@ -5565,6 +5698,9 @@ function flushAssistant(sessionId: string) {
     ...(entry.fileChanges.length > 0 ? { toolCalls: entry.fileChanges } : {}),
     /* 最后一次真实工具调用的位置：界面 / 历史判「写成文字没执行」只看这之后（和一轮结束时的判定同一个口径，见 textToolCall.ts） */
     ...(entry.bufAtLastTool ? { toolTailFrom: entry.bufAtLastTool } : {}),
+    /* 回的是哪一条用户消息；只有正常收尾的那一份带 `replyComplete`（出错 / 取消 flush 的半截不算"答过了"，同一条还可以重试） */
+    ...(replyTo ? { replyTo } : {}),
+    ...(replyTo && completedFor === replyTo ? { replyComplete: true as const } : {}),
   });
   // Keep the rendered history.md in step with the conversation, so the path the
   // backend was given never points at a frozen snapshot of an older turn.
@@ -5581,6 +5717,9 @@ function flushAssistant(sessionId: string) {
       text: finalText,
       /* 界面也要知道最后一次真实工具调用在正文的哪里（判「写成文字没执行」，和上面落盘的同一个值） */
       ...(entry.bufAtLastTool ? { toolTailFrom: entry.bufAtLastTool } : {}),
+      /* 去重标记也给界面一份：之后整份重写 transcript（编辑后重跑）时它原样写回去（主进程那边也会按盘上的补） */
+      ...(replyTo ? { replyTo } : {}),
+      ...(replyTo && completedFor === replyTo ? { replyComplete: true as const } : {}),
     });
   }
   entry.assistantBuf = '';
@@ -7184,7 +7323,11 @@ app.whenReady().then(async () => {
       throw new Error(tr('This session is archived. Unarchive it to keep chatting.'));
     }
     try {
-      return await sendPromptOnce(sessionId, prompt, projectId, display, model);
+      /* 同一个 messageId 正在跑 → 合并到那一次，不另起一轮（`promptDedupe.ts`） */
+      if (promptsInFlight.has(sessionId, display?.messageId)) {
+        logger.warn('prompt', `duplicate in flight sessionId=${sessionId} messageId=${display?.messageId} —— 合并到正在跑的那一次`);
+      }
+      return await promptsInFlight.run(sessionId, display?.messageId, () => sendPromptOnce(sessionId, prompt, projectId, display, model));
     } catch (err) {
       // LAST LINE OF DEFENCE for the ride-along marker. sendPromptOnce writes it
       // before the send and only its streaming catch used to take it back, so
@@ -7212,6 +7355,8 @@ app.whenReady().then(async () => {
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
   async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean }, _model?: string, attempt = 0): Promise<any> {
+    /* 同一次提交只发一次（`promptDedupeFor`） */
+    const dedupe = promptDedupeFor(sessionId, display?.messageId, attempt);
     /*
       **忙时记下的切换先应用，再发这一条** —— 新消息要用新的 agent / 模型；不先切的话一轮接一轮
       （排队消息、定时任务）会一直抢在前面，切换永远排不上。自动重发（attempt > 0）是同一轮，不切。
@@ -7433,6 +7578,8 @@ app.whenReady().then(async () => {
      */
     if (attempt > 0) {
       /* 这一条早就在盘上了（见上面）—— 什么都不做 */
+    } else if (!dedupe.persist) {
+      /* 同一个 messageId 上一次没发成：它也已经在盘上了（`promptDedupe.ts`）—— 不再追加一条 */
     } else try {
       const promptText = Array.isArray(prompt)
         ? prompt.map((p: any) => (typeof p === 'string' ? p : p?.text || '')).join('')
@@ -7597,6 +7744,7 @@ app.whenReady().then(async () => {
           entry.openToolCalls?.clear();
           entry.toolsThisTurn = 0;       // 这一轮的工具计数从零开始（自动重试的安全闸）
           entry.bufAtLastTool = 0;
+          entry.textThisTurn = false;    // 同 toolsThisTurn：这一轮还没出过字（planRetry 的 producedText 看它）
           entry.localActionsThisTurn = 0;      // 「在你机器上打开」的额度按轮给（见 localAction.ts）
           entry.localLineBuf = '';             // 上一轮的半行不能拼到这一轮的第一行上
           entry.maxToolOutputThisTurn = 0;
@@ -7781,6 +7929,8 @@ app.whenReady().then(async () => {
             });
             /* 标记块的下标是相对这份缓冲的 —— flush 会清空它，先留一份给「这一步是干什么的」用 */
             const textToolBuf = textTool && textTool.action !== 'none' ? entry.assistantBuf : '';
+            /* 只有正常、完整结束的这一轮才算"答过了"：被停掉 / 截断 / 卡死的半截同一条还能重试（`turnCompletedNormally`） */
+            if (turnCompletedNormally({ stopReason: result?.stopReason, wedged: !!entry.wedgeNote })) entry.completedReplyTo = userMessageId;
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             if (askReply) settleAsk(sessionId, askReply);
             if (textTool && textTool.action !== 'none') handleTextToolCall(sessionId, textTool, textToolBuf);
@@ -7899,6 +8049,7 @@ app.whenReady().then(async () => {
                   entry.assistantMsgId = null;
                   entry.fileChanges = [];
                   entry.toolsThisTurn = 0;
+                  entry.textThisTurn = false;
                   mainWindow?.webContents.send('acp:turn-restart', { sessionId });
                   continue;
                 }
@@ -8082,10 +8233,14 @@ app.whenReady().then(async () => {
        * 三条恢复路径（换会话、传输层抖动、后端笼统 Internal error）全部共用它，
        * 所以"已经跑过工具就不重发"这条硬闸不可能只在其中一条上生效。
        */
+      /*
+        **"这一轮出过字没有"不能看 `assistantBuf`** —— catch 开头那句 flushAssistant 已经把它清空了，原来读到的永远是"没出过字"：
+        已经输出了文字、随后断网的那一轮被当成"还没开始"自动重发。`textThisTurn` 在流式时记、每次发送开头清零，flush 不动它。
+      */
       const plan = planRetry({
         error: errText,
         attempt,
-        producedText: !!entry.assistantBuf,
+        producedText: !!(entry.textThisTurn || entry.assistantBuf),   // flush 已清空 buf —— 看流式时记下的 textThisTurn
         toolsRan: entry.toolsThisTurn || 0,
         /* 远程多给两次 —— 它多了 ssh / 隧道 / 那台机器这一整段会抖的东西 */
         remote: !!entry.profile.remote?.sshHost,
@@ -11905,8 +12060,35 @@ app.whenReady().then(async () => {
     doneTickets.set(ticket, Date.now());
     if (doneTickets.size > 500) for (const k of [...doneTickets.keys()].slice(0, 100)) doneTickets.delete(k);
   };
+  /**
+   * 同一张 ticket 的这一档**正在排 / 在跑**（`revisesInFlight`）→ 返回那一次，调用方合并过去；**已经写完了** → 返回"取消"
+   * （渲染层不把意见放回去，也不再做一遍）；都不是 → null，照常做。deck 一页版面文字那条用它；
+   * `review:revise-in-session` 自己内联着同一套判断。
+   */
+  const reviseAlready = (ticket: unknown, scope: string): Promise<any> | { ok: false; cancelled: true; alreadyDone: true } | null => {
+    const t = typeof ticket === 'string' && ticket ? ticket : undefined;
+    if (!t) return null;
+    const running = revisesInFlight.get(`${t}|${scope}`);
+    if (running) { logger.warn('revise', `duplicate request ticket=${t} scope=${scope} —— 合并到正在排 / 正在跑的那一次`); return running; }
+    if (doneTickets.has(t)) { logger.info('revise', `ticket=${t} 已经写完 —— 不再做一遍`); return { ok: false, cancelled: true, alreadyDone: true }; }
+    return null;
+  };
   ipcMain.handle('review:tickets-done', async (_event, tickets: string[]) =>
     (Array.isArray(tickets) ? tickets : []).filter((t) => doneTickets.has(String(t))));
+  /**
+   * 这几张 ticket **后来怎样了**（见 `renderer/reviewResume.ts` 的 `TicketStatus`）：还在排 / 跑（`revisesInFlight`）、
+   * 写完了（`doneTickets`）、怎么结束的（`reviseOutcomes`）、不记得（主进程重启过）。窗口 reload 回来，渲染层据此决定
+   * 你再提交同一条意见时是沿用这张 ticket（合并到那一次 / 按同一个 messageId 重试）还是新起一次。
+   */
+  ipcMain.handle('review:tickets-status', async (_event, tickets: string[]) => {
+    const live = new Set([...revisesInFlight.keys()].map((k) => k.slice(0, k.lastIndexOf('|'))));
+    const out: Record<string, 'live' | 'done' | 'retry' | 'final' | 'unknown'> = {};
+    for (const raw of Array.isArray(tickets) ? tickets : []) {
+      const t = String(raw);
+      out[t] = live.has(t) ? 'live' : doneTickets.has(t) ? 'done' : reviseOutcomes.get(t) ?? 'unknown';
+    }
+    return out;
+  });
 
   /** 在某条会话里留一行 **KiroLex 自己说的话**（改写落盘之后报一句"写进去了"）—— 不发给模型，见 `noteInSession`。 */
   ipcMain.handle('session:note', async (_event, sessionId: string, text: string, variants?: unknown) => {
@@ -11922,8 +12104,9 @@ app.whenReady().then(async () => {
    *   · 这一发走完了却没兑付 = 这一轮不是正常收尾（被取消、出错后没重发成、priming 吃掉了）——
    *     那条路上 flush 的是半截输出，不能拿去写盘（见 `askWaiters`）。
    */
-  const askOnce = (sessionId: string, prompt: string, displayText: string): Promise<{ text: string; stopReason: string; wedged: boolean }> =>
-    new Promise((resolve, reject) => {
+  const askOnce = (sessionId: string, prompt: string, displayText: string, messageId?: string): Promise<{ text: string; stopReason: string; wedged: boolean }> =>
+    /* 同一问早就完整答过了（同一次改写的重试）：用盘上那份，不再发给模型第二遍 —— 见 `storedReplyFor` */
+    storedReplyFor(sessionId, messageId) ?? new Promise((resolve, reject) => {
       const timer = setTimeout(() => {
         askWaiters.delete(sessionId);
         reject(new Error(tr('No reply after waiting 8 minutes')));
@@ -11935,7 +12118,8 @@ app.whenReady().then(async () => {
         if (w && w.timer === timer) { askWaiters.delete(sessionId); clearTimeout(w.timer); return true; }
         return false;
       };
-      sendPromptOnce(sessionId, [{ type: 'text', text: prompt }], undefined, { displayText }).then(() => {
+      /* `messageId`：侧栏改写按 ticket 给的（`reviseMessageId`）—— 同一次提交只落盘一次、只发一次 */
+      promptsInFlight.run(sessionId, messageId, () => sendPromptOnce(sessionId, [{ type: 'text', text: prompt }], undefined, { displayText, ...(messageId ? { messageId } : {}) })).then(() => {
         if (drop()) reject(new Error(tr('This turn did not finish normally (it was cancelled or got no reply)')));
       }, (err: any) => {
         drop();
@@ -11978,6 +12162,23 @@ app.whenReady().then(async () => {
      */
     apply?: ReviewApply;
   }) => {
+    /*
+      **同一张 ticket 的同一档又来一次 → 合并到正在排 / 正在跑的那一次** —— 不再排第二次、不再出第二条「已排队」、
+      不再往会话里发第二遍（「改写提交重复 11 次」）。要在 `openTicket` 之前判：它会把这张 ticket 的取消标记重置掉。
+    */
+    const ticketIn = typeof input?.ticket === 'string' && input.ticket ? input.ticket : undefined;
+    const scopeKey = input?.scope === 'patch' ? 'patch' : input?.scope === 'insert' ? 'insert' : 'block';
+    const dupKey = ticketIn ? `${ticketIn}|${scopeKey}` : '';
+    const already = dupKey ? revisesInFlight.get(dupKey) : undefined;
+    if (already) {
+      logger.warn('revise', `duplicate request ticket=${ticketIn} scope=${scopeKey} —— 合并到正在排 / 正在跑的那一次`);
+      return already;
+    }
+    /* 这张 ticket 已经写完盘了（窗口 reload 期间做完的那种）：不再做一遍 —— 渲染层按取消收尾，不把意见放回去 */
+    if (ticketIn && doneTickets.has(ticketIn)) {
+      logger.info('revise', `ticket=${ticketIn} 已经写完盘 —— 不再做一遍`);
+      return { ok: false, cancelled: true, alreadyDone: true };
+    }
     const sessionId = String(input?.sessionId || '').trim();
     const note = String(input?.note ?? '').trim();
     const where = String(input?.where ?? '');
@@ -11990,18 +12191,32 @@ app.whenReady().then(async () => {
       **正忙就排队，不是报错**：排到这条会话的队尾（`enqueueRevise`），轮到了再等它空下来（`waitIdle`）——
       插进一轮正在跑的对话里，改写会和它正在做的事混在一起。
     */
-    return enqueueRevise(sessionId, async () => {
+    /** 这次提交最近问过模型的那一问的 messageId —— 失败时据它判还能不能按同一次接着来（`retrySameIf`）。 */
+    let askedId: string | undefined;
+    const job = enqueueRevise(sessionId, async () => {
       try { return await reviseOnce(); } finally { tk.close(); }
-    }, input?.label || tr('Revision'));
+    }, input?.label || tr('Revision'), ticketIn);
+    /* 怎么结束的记下来 —— 窗口 reload 期间结束的，回来时按它决定沿用还是新起（`review:tickets-status`） */
+    job.then((res) => recordReviseOutcome(ticketIn, res), () => {});
+    if (dupKey) {
+      revisesInFlight.set(dupKey, job);
+      job.finally(() => { if (revisesInFlight.get(dupKey) === job) revisesInFlight.delete(dupKey); }).catch(() => {});
+    }
+    return job;
 
     async function reviseOnce() {
       /* 排队期间被取消了 —— 一个字都不发 */
       if (tk.cancelled()) return { ok: false, cancelled: true };
       await ensureAttached(sessionId);
-      if (!sessionClients.get(sessionId)) return { ok: false, error: tr('Cannot connect to this session. Click it to connect, then try again') };
+      /*
+        **还没问到模型就停下的那些都带 `retrySame`**（挂不上 —— 远端还连不上、等空闲超时、别的改写在等回复、闸没过……）：
+        这一问没拿到完整回复，渲染层把这张 ticket 留着，下次提交还是同一次（同一个 messageId，盘上那条不再追加）。
+        不带的话主进程记成 `final`、渲染层也不留 ticket —— 连续断网时第三次提交就换了编号，同一条又落一次。
+      */
+      if (!sessionClients.get(sessionId)) return { ok: false, error: tr('Cannot connect to this session. Click it to connect, then try again'), retrySame: true };
       const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
-      if (stillBusy) return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }) };
-      if (askWaiters.has(sessionId)) return { ok: false, error: tr('A revision is already waiting for a reply in this session') };
+      if (stillBusy) return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }), retrySame: true };
+      if (askWaiters.has(sessionId)) return { ok: false, error: tr('A revision is already waiting for a reply in this session'), retrySame: true };
       /* 等它空下来的那段时间里被取消了 —— 同样不发 */
       if (tk.cancelled()) return { ok: false, cancelled: true };
       /* 白名单而不是透传：这个值来自渲染进程，越界的写法落回默认那一档 */
@@ -12009,10 +12224,10 @@ app.whenReady().then(async () => {
       /* patch 的行号按哪一份编，拼回去就得按同一份拼 —— 有 apply 就用它的 base */
       const patchBase = typeof input?.apply?.base === 'string' ? input.apply.base
         : typeof input?.full === 'string' ? input.full : undefined;
-      if (wantScope === 'patch' && patchBase === undefined) return { ok: false, error: tr('The text was not included, so it cannot be edited by line number') };
+      if (wantScope === 'patch' && patchBase === undefined) return { ok: false, error: tr('The text was not included, so it cannot be edited by line number'), retrySame: true };
       /* 要由主进程写回的，**先看闸** —— 不然模型白改一遍，最后才发现写不回去（"改好了却写不回去"） */
       const gate = input?.apply && typeof input.apply.path === 'string' ? reviewTarget(sessionId, input.apply.path) : null;
-      if (gate && !gate.ok) return { ok: false, error: gate.error };
+      if (gate && !gate.ok) return { ok: false, error: gate.error, retrySame: true };
       const prompt = reviseInSessionPrompt({
         where, note, about: input?.about, scope: wantScope,
         full: wantScope === 'patch' ? patchBase : undefined,
@@ -12025,12 +12240,15 @@ app.whenReady().then(async () => {
           sessionId, prompt,
           /* 位置写进显示文本 —— 回头翻会话要看得出这条是说哪一处的 */
           input?.label ? tr('[Revision · {label}] {note}', { label: input.label, note }) : tr('[Revision] {note}', { note }),
+          /* id 跟着 ticket 走：同一次提交只落盘一次、只发一次（`reviseMessageId`）；记下来，失败时据它判能不能接着来 */
+          (askedId = reviseMessageId(input?.ticket, wantScope, prompt)),
         ).finally(() => tk.asking(false));
         if (tk.cancelled()) return { ok: false, cancelled: true };
         const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
         if (!usable.ok) {
           logger.warn('revise', `in-session ${sessionId}: ${usable.why}`);
-          return { ok: false, error: usable.why };
+          /* 没得到完整回复：模型还什么都没做才算"还是同一次"（`retrySameIf`）—— 已经出过字 / 跑过工具的不再按同一次来 */
+          return { ok: false, error: usable.why, ...retrySameIf(sessionId, askedId) };
         }
         if (wantScope === 'patch') {
           const first = await finishPatch(reply.text, patchBase!, started, false);
@@ -12066,7 +12284,16 @@ app.whenReady().then(async () => {
         /* 我们自己停的那一轮：askOnce 会以"没有正常结束"拒掉 —— 那不是失败，是取消 */
         if (tk.cancelled()) return { ok: false, cancelled: true };
         logger.warn('revise', `in-session ${sessionId} failed: ${err?.message || err}`);
-        return { ok: false, error: String(err?.message || err) };
+        /*
+          **在会话里说清楚没做成** —— 那条【改写 · …】已经落在会话里了，后面什么都没有的话，看着像"发出去了没人理"，
+          于是再点一次（实测同一条在会话里出现了 11 次）。重复提交被拒的那种不说：那一次本来就有结果。
+        */
+        if (err?.code !== DUPLICATE_MESSAGE && err?.code !== DUPLICATE_STARTED) {   // 后一种主进程已经在会话里说过了
+          const why = String(err?.message || err).split('\n')[0].slice(0, 200);
+          noteInSession(sessionId, tr('❌ The revision of {what} did not go through: {err}\nYour comment is back in the side panel. Press ✓ to submit it again when ready.', { what: input?.label || tr('this file'), err: why }));
+        }
+        /* 没拿到完整回复（网络断了、超时、没正常收尾）：再提交同一条意见时用回这张 ticket —— 重复被拒的那种不用 */
+        return { ok: false, error: String(err?.message || err), ...retrySameIf(sessionId, askedId, err) };
       }
     }
 
@@ -12111,21 +12338,23 @@ app.whenReady().then(async () => {
      */
     async function followUpPatch(followUp: string, base: string, started: number) {
       const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
-      if (stillBusy) return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but the session is still busy after 20 minutes ({busy})', { busy: stillBusy }) };
+      /* 追问那一问还没发出去就停下：同上，带 `retrySame`（第一问答过了，重试时用盘上那份，追问照常再问） */
+      if (stillBusy) return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but the session is still busy after 20 minutes ({busy})', { busy: stillBusy }), retrySame: true };
       if (tk.cancelled()) return { ok: false, cancelled: true };
-      if (askWaiters.has(sessionId)) return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but another revision is already waiting for a reply in this session') };
+      if (askWaiters.has(sessionId)) return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but another revision is already waiting for a reply in this session'), retrySame: true };
       tk.asking(true);
       const again = await askOnce(
         sessionId, followUp,
         input?.label
           ? tr('[Revision · {label}] The previous reply was in the wrong format, resubmitting', { label: input.label })
           : tr('[Revision] The previous reply was in the wrong format, resubmitting'),
+        (askedId = reviseMessageId(input?.ticket, 'patch', followUp, true)),
       ).finally(() => tk.asking(false));
       if (tk.cancelled()) return { ok: false, cancelled: true };
       const usable = replyUsable({ stopReason: again.stopReason, wedged: again.wedged });
       if (!usable.ok) {
         logger.warn('revise', `in-session ${sessionId} follow-up: ${usable.why}`);
-        return { ok: false, error: usable.why };
+        return { ok: false, error: usable.why, ...retrySameIf(sessionId, askedId) };
       }
       return await finishPatch(again.text, base, started, true);
     }
@@ -12525,6 +12754,7 @@ app.whenReady().then(async () => {
     /** 这一次改写的 ticket —— 取消按它认（见 `reviseTickets`）。 */
     ticket?: string;
   }) => {
+    { const dup = reviseAlready(input?.ticket, 'slide'); if (dup) return dup; }
     const sid = String(input?.sessionId || '').trim();
     const note = String(input?.note || '').trim();
     if (!sid) return { ok: false, error: tr('This file does not belong to a session, so there is nowhere to ask') };
@@ -12535,20 +12765,21 @@ app.whenReady().then(async () => {
     const { want, at: page } = g;
     if (!(await findPythonPptx())) return { ok: false, error: noPythonPptxWhy(process.platform) };
     const tk = openTicket(typeof input?.ticket === 'string' ? input.ticket : undefined, sid);
+    let slideAsk: string | undefined;
     return enqueueRevise(sid, async () => {
       if (tk.cancelled()) { tk.close(); return { ok: false, cancelled: true }; }
       await ensureAttached(sid);
-      if (!sessionClients.get(sid)) { tk.close(); return { ok: false, error: tr('Cannot connect to this session. Click it to connect, then try again') }; }
+      if (!sessionClients.get(sid)) { tk.close(); return { ok: false, error: tr('Cannot connect to this session. Click it to connect, then try again'), retrySame: true }; }
       const stillBusy = await waitIdle(sid, 20 * 60 * 1000);
-      if (stillBusy) { tk.close(); return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }) }; }
-      if (askWaiters.has(sid)) { tk.close(); return { ok: false, error: tr('A revision is already waiting for a reply in this session') }; }
+      if (stillBusy) { tk.close(); return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }), retrySame: true }; }
+      if (askWaiters.has(sid)) { tk.close(); return { ok: false, error: tr('A revision is already waiting for a reply in this session'), retrySame: true }; }
       if (tk.cancelled()) { tk.close(); return { ok: false, cancelled: true }; }
       try {
         /* 地址是按**这一份**编的 —— 等回复期间被改过就不按旧地址写（见 `deckChanged`） */
         const stampBefore = deckStamp(want);
         /* 先把这一页现有的文字读出来 —— 模型要按地址回，就得先看见地址 */
         const cur = parseSlideRuns(await runPy(SLIDE_TEXT_SCRIPT, [want, String(page)]));
-        if (!cur.ok) return { ok: false, error: cur.error };
+        if (!cur.ok) return { ok: false, error: cur.error, retrySame: true };
         if (!cur.runs.length && !cur.shapes?.length) return { ok: false, error: tr('This slide has no editable text (it may only have images)') };
         const prompt = reviseSlideTextPrompt({
           runs: cur.runs, note, page, path: want,
@@ -12557,12 +12788,12 @@ app.whenReady().then(async () => {
         });
         const started = Date.now();
         tk.asking(true);
-        const reply = await askOnce(sid, prompt, tr('[Revision · {file} page {page} slide text] {note}', { file: path.basename(want), page, note }))
+        const reply = await askOnce(sid, prompt, tr('[Revision · {file} page {page} slide text] {note}', { file: path.basename(want), page, note }), (slideAsk = reviseMessageId(input?.ticket, 'slide', prompt)))
           .finally(() => tk.asking(false));
         /* 我们自己停的那一轮 —— 回复不用，也不写 */
         if (tk.cancelled()) return { ok: false, cancelled: true };
         const usable = replyUsable({ stopReason: reply.stopReason, wedged: reply.wedged });
-        if (!usable.ok) return { ok: false, error: usable.why };
+        if (!usable.ok) return { ok: false, error: usable.why, ...retrySameIf(sid, slideAsk) };
         const got = parseSlideEdits(reply.text);
         if (!got.edits.length && !got.ops.length) {
           /* 一条都没解析出来时把它回的原话记下来 —— 否则这个失败查不了 */
@@ -12588,15 +12819,18 @@ app.whenReady().then(async () => {
           }
           changed += Number(wroteOps.changed) || 0;
         }
+        markTicketDone(input?.ticket);
         return { ok: true, changed };
       } catch (err: any) {
         if (tk.cancelled()) return { ok: false, cancelled: true };
         logger.warn('deck', `slide text revise failed: ${err?.message || err}`);
-        return { ok: false, error: err instanceof NoPythonPptx ? err.message : String(err?.message || err) };
+        /* 没拿到完整回复 / 还没问到模型：同一次提交可以接着来（retrySame）；重复被拒的那种不算 */
+        return { ok: false, error: err instanceof NoPythonPptx ? err.message : String(err?.message || err), ...(slideAsk ? retrySameIf(sid, slideAsk, err) : { retrySame: true as const }) };
       } finally {
         tk.close();
       }
-    }, tr('{file} slide {page} text', { file: path.basename(want), page }));
+      /* 同一张 ticket 的排队提示只说一次；在跑期间登记（再来就合并）、结束时记结局 —— `enqueueRevise` 的 track */
+    }, tr('{file} slide {page} text', { file: path.basename(want), page }), input?.ticket, 'slide');
   });
 
   ipcMain.handle('deck:read-slide-text', async (_event, sessionId: string | null | undefined, filePath: string, page: number) => {

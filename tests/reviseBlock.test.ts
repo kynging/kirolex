@@ -192,8 +192,12 @@ describe('主进程接线', () => {
 
   test('改写：排队、先挂回来、等空闲、超时摘掉等待者', () => {
     const at = MAIN.indexOf("ipcMain.handle('review:revise-in-session'");
-    const body = MAIN.slice(at, at + 6500);
-    assert.ok(body.includes("return enqueueRevise(sessionId, async () => {\n      try { return await reviseOnce(); } finally { tk.close(); }\n    }, input?.label || tr('Revision'));"));
+    /* 截到 `finishPatch` 为止 = 这个 handler 的主路（入口 + reviseOnce）；后面 followUpPatch 自己还有两处取消判断 */
+    const body = MAIN.slice(at, MAIN.indexOf('async function finishPatch(', at));
+    assert.ok(body.includes("const job = enqueueRevise(sessionId, async () => {\n      try { return await reviseOnce(); } finally { tk.close(); }\n    }, input?.label || tr('Revision'), ticketIn);"));
+    /* 同一张 ticket 的同一档又来一次：合并到那一次（不再排第二次、不再发第二遍）—— 在 openTicket 之前判 */
+    assert.ok(body.indexOf('revisesInFlight.get(dupKey)') < body.indexOf('const tk = openTicket('));
+    assert.match(body, /return job;/);
     /* 取消按 ticket 认这一次改写：排队 / 等空闲期间被取消就不发；在等回复的只停它自己那一轮 */
     assert.equal((body.match(/if \(tk\.cancelled\(\)\) return \{ ok: false, cancelled: true \};/g) || []).length, 4);
     assert.match(body, /await ensureAttached\(sessionId\);/);

@@ -7,6 +7,7 @@ import { isAdvancedOnly, isAdvancedOnlyProject } from './advancedOnly.ts';
 import { projectDirName } from './projectStore.ts';
 import { logger } from './logger.ts';
 import { isKirolexNote } from './kirolexNote.ts';
+import { carryReplyMarks, completedReplyInText, messageIdStatusInText, type MessageIdStatus } from './promptDedupe.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -88,6 +89,11 @@ export interface StoredMessage {
   /** 这条是本机工具经控制入口发的（controlServer `POST /sessions/:id/send`），界面上标「经控制入口发送」。
    *  id 里也带着标记（`controlSessions.isControlMessageId`），界面认的是 id。 */
   via?: 'control';
+  /** 助手消息：它回的是哪一条用户消息（id）。 */
+  replyTo?: string;
+  /** 助手消息：这是那一轮**正常收尾**的完整回复（出错 / 取消时 flush 的半截没有这一项）。
+   *  发送去重按 `replyTo` + 它认"这一条答过了"（`promptDedupe.ts`），而不是看后面有没有随便哪条助手消息。 */
+  replyComplete?: true;
   // additive: future fields (model, etc.) may be appended safely
 }
 
@@ -101,6 +107,11 @@ export type ExecutorState =
 export interface SessionRecord {
   schemaVersion: number;
   id: string;
+  /**
+   * 最近几条**模型已经开始做了**（出过字 / 跑过工具）的用户消息 id —— 发送去重据此拒绝同一条再被自动发一遍
+   * （见 `promptDedupe.decidePromptDedupe` 的 `started`）。只留最近的一些；跟着记录落盘，主进程重启后也还认得。
+   */
+  startedMessageIds?: string[];
   createdAt: number;
   updatedAt: number;
   title: string;
@@ -620,6 +631,33 @@ export function appendMessage(id: string, msg: StoredMessage): void {
 }
 
 /**
+ * 这个 messageId 在盘上的状态（不在 / 在但还没回复 / 答过了）—— 发送前按它去重，见 `promptDedupe.ts`。
+ * 读的是全量（不看 `/clear` 水位线）：问的是"这一条有没有落过盘"，不是"历史里还算不算它"。
+ */
+export function messageIdStatusOnDisk(id: string, messageId: string): MessageIdStatus {
+  let raw = '';
+  try { raw = fs.readFileSync(transcriptPath(id), 'utf-8'); } catch { return 'absent'; }
+  const started = readRecord(id)?.startedMessageIds;
+  return messageIdStatusInText(raw, messageId, Array.isArray(started) ? new Set(started) : undefined);
+}
+
+/** 记下"模型已经开始做这一条了"（`startedMessageIds`，最多留 `STARTED_KEPT` 条）。 */
+export const STARTED_KEPT = 50;
+export function markMessageStarted(id: string, messageId: string): void {
+  const prev = readRecord(id)?.startedMessageIds;
+  const list = (Array.isArray(prev) ? prev : []).filter((m) => m !== messageId);
+  list.push(messageId);
+  patchRecord(id, { startedMessageIds: list.slice(-STARTED_KEPT) });
+}
+
+/** 盘上回 `messageId` 的那份完整回复的正文（见 `promptDedupe.completedReplyInText`）；没有就 null。 */
+export function completedReplyOnDisk(id: string, messageId: string): string | null {
+  let raw = '';
+  try { raw = fs.readFileSync(transcriptPath(id), 'utf-8'); } catch { return null; }
+  return completedReplyInText(raw, messageId);
+}
+
+/**
  * 这条会话的历史 —— **`/clear` 的水位线（`SessionRecord.clearedAt`）之前的不算**。
  *
  * 视图（`acp:read-transcript`）、历史文件、ride-along 快照都从这里拿历史，所以只在这一处过滤。
@@ -746,7 +784,11 @@ export function rewriteTranscript(id: string, messages: StoredMessage[]): void {
       } catch { /* torn line */ }
     }
   }
-  const body = [...before, ...messages.map((m) => JSON.stringify(m))].join('\n');
+  /* 回复的去重标记（replyTo / replyComplete）以盘上为准补回去 —— 渲染层那一份可能没带（`carryReplyMarks`） */
+  let onDisk = '';
+  try { onDisk = fs.readFileSync(file, 'utf-8'); } catch { /* 还没有这份文件 */ }
+  const kept = carryReplyMarks(onDisk, messages);
+  const body = [...before, ...kept.map((m) => JSON.stringify(m))].join('\n');
   fs.writeFileSync(tmp, body ? `${body}\n` : '');
   fs.renameSync(tmp, file);
   const rec = readRecord(id);

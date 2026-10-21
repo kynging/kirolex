@@ -160,6 +160,12 @@ export const ZH_INDEX_B: Record<string, string> = {
   '[Revision · {label}] The previous reply was in the wrong format, resubmitting': '【改写 · {label}】上一条格式不对，请重交一遍',
   '[Revision] The previous reply was in the wrong format, resubmitting': '【改写】上一条格式不对，请重交一遍',
   '[Revision · {file} page {page} slide text] {note}': '【改写 · {file} 第 {page} 页版面文字】{note}',
+  '❌ The revision of {what} did not go through: {err}\nYour comment is back in the side panel. Press ✓ to submit it again when ready.': '❌ {what} 的改写没做成：{err}\n意见已经放回侧栏，准备好了点 ✓ 再提交一次。',
+
+  // ── 同一个 messageId 的重复提交（promptDedupe.ts；渲染端 queueRetry.isDuplicateMessageError 认这句）──
+  'This message was already sent and answered, so it was not sent again. To redo it, press Rerun on that message.': '这条消息已经发过、也有回复了，不再重复发送。要重来，在那条消息上点「重跑」。',
+  'This message already started running last time and was cut off, so it was not sent again automatically. To redo it, press Rerun on that message.': '这条消息上次已经开始执行、中途断了，所以没有自动再发。要重来，在那条消息上点「重跑」。',
+  '⚠️ This message already started running last time (it produced output or ran tools) and was cut off, so KiroLex did not send it again automatically, to avoid doing it twice. To redo it, press Rerun on that message.': '⚠️ 这条消息上次已经开始执行（已经输出了内容或运行了工具），中途断了。为免同一件事做两遍，KiroLex 没有自动再发；要重来，在那条消息上点「重跑」。',
 
   // ── src/main/index.ts: round 2, English literals that reach the UI ──
   'Starting…': '启动中…',

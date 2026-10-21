@@ -42,6 +42,7 @@ import { busyEnterRoute, composerRunning, enterRoute, steerFailureRoute, steerPa
 import { carryControlMark, controlMessageId, isControlMessageId } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
+import { pickQueuedBatch, sealRetryBatch, editQueuedItem, QueueBackoff, isDuplicateMessageError, type RetryBatch } from './queueRetry';
 import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
@@ -365,6 +366,8 @@ declare global {
       /** 取消侧栏 comment 提交的那一次改写（按 ticket）。 */
       reviewCancel?: (ticket: string) => Promise<{ ok: boolean }>;
       reviewTicketsDone?: (tickets: string[]) => Promise<string[]>;
+      /** 这几张 ticket 后来怎样了（live / retry / unknown / done / final，见 reviewResume.TicketStatus）—— 窗口重载后决定再提交时沿用还是新起 */
+      reviewTicketsStatus?: (tickets: string[]) => Promise<Record<string, string>>;
       deckReviseSlideText?: (input: { sessionId: string; filePath: string; page: number; note: string; ticket?: string })
         => Promise<{ ok: boolean; changed?: number; partial?: string; cannot?: string; error?: string }>;
       deckReadSlideText?: (sessionId: string | null | undefined, filePath: string, page: number)
@@ -390,7 +393,7 @@ declare global {
       onUpdate: (callback: (data: any) => void) => () => void;
       onError: (callback: (error: any) => void) => () => void;
       onNotice?: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => () => void;
-      onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number }) => void) => () => void;
+      onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true }) => void) => () => void;
       onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
@@ -437,6 +440,12 @@ export interface Message {
   steerParts?: { id: string; content: string; ts: number }[];
   /** 助手消息：这一轮最后一次真实工具调用开始时正文的长度（主进程落盘时记的）—— 判「把工具调用写成了文字」只看这之后（`main/textToolCall.ts`）。 */
   toolTailFrom?: number;
+  /** 助手消息：回的是哪一条用户消息 / 是不是正常收尾的完整回复（主进程落盘时记的，发送去重按它认"答过了"，见 `main/promptDedupe.ts`）。
+   *  只是原样带着 —— 读回来、整份重写时都不能丢。 */
+  replyTo?: string;
+  replyComplete?: true;
+  /** 只活在界面里：排队那条发出去时这一次插进来的气泡的记号 —— 发送失败只撤它，不撤原来就在的同 id 历史（`queueRetry.removeOptimistic`）。 */
+  sendToken?: string;
 }
 
 export interface ToolCall {
@@ -505,6 +514,8 @@ export interface QueuedMessage {
    * 重建一结束就作为下一条单独发出。放进队列结构里是为了复用落盘和排空，不是"排队"。
    */
   afterRebuild?: boolean;
+  /** 这一批发失败、放回了队头：重试时原样（同一批、同一个 messageId）再发，见 `queueRetry.pickQueuedBatch`。 */
+  retryBatch?: RetryBatch;
 }
 
 /** 远程会话的同步状态（`docs/DESIGN_remote_sessions.md`）。 */
@@ -3131,6 +3142,9 @@ const App: React.FC = () => {
             // 「重建历史中，结束后发送」的标记必须跟着回来：否则刷新 / 重启后它变成普通排队卡片，
             // 合并排队开着时还会和后面的排队一起发出去
             ...(item.afterRebuild === true ? { afterRebuild: true } : null),
+            // 没发成的那一批的 id 和边界也跟着回来：重启后重试照样是同一次提交（`queueRetry.pickQueuedBatch`）
+            ...(item.retryBatch && typeof item.retryBatch.id === 'string' && Number(item.retryBatch.size) > 0
+              ? { retryBatch: { id: item.retryBatch.id, size: Number(item.retryBatch.size) } } : null),
           })) as QueuedMessage[];
         if (kept.length) out[sid] = kept;
       }
@@ -3150,6 +3164,9 @@ const App: React.FC = () => {
     } catch {}
   }, [queuesBySession]);
   const queueSendingRef = useRef<Set<string>>(new Set());
+  /* 排队那条发失败之后按会话退避（`queueRetry.ts`）—— 退避到点时靠 `queueRetryTick` 叫醒排空 effect */
+  const queueBackoffRef = useRef(new QueueBackoff());
+  const [queueRetryTick, setQueueRetryTick] = useState(0);
   const [restoredQueueDraft, setRestoredQueueDraft] = useState<{ id: number; text: string; sessionId?: string } | null>(null);
 
   /*
@@ -3441,8 +3458,9 @@ const App: React.FC = () => {
     if (!sid || !content.trim()) return;
     setQueuesBySession((prev) => ({
       ...prev,
-      [sid]: (prev[sid] || []).map((item) => (
-        item.id === queueId ? { ...item, content: content.trim() } : item
+      /* 改的是一张已经试着发过的卡片：那是另一次提交 —— 换新 id（保留控制入口标记）、整批去掉 retryBatch（`editQueuedItem`） */
+      [sid]: editQueuedItem(prev[sid] || [], queueId, content.trim(), (oldId) => (
+        carryControlMark(oldId, 'queue') ?? `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`
       )),
     }));
   }, [currentSessionId]);
@@ -3489,6 +3507,8 @@ const App: React.FC = () => {
         // this drain would fire and slip a queued message between two loop turns.
         loopingIds.includes(sessionId) ||
         queueSendingRef.current.has(sessionId) ||
+        /* 上一次没发出去，还在退避期内（远端连不上时不再每次渲染都去捅 attach → preflight） */
+        queueBackoffRef.current.blocked(sessionId, Date.now()) ||
         /* 正在自动重发被打断的那一轮：等它发出去，排队的跟在后面（否则会把没答的问题顶掉） */
         recoveringIds.includes(sessionId) ||
         (sessionId === currentSessionId && (
@@ -3506,7 +3526,9 @@ const App: React.FC = () => {
 
       // 「合并排队消息」只在这里（发送时）生效：关着一张一张发，开着把队首最多 10 张合并成一条（`queueBatch.ts`）。
       // 「重建历史中，结束后发送」的那条单独作为下一条发出，不和后面的排队合并。
-      const consumed = queuedBatch(queue, settings.mergeQueuedMessages && !queue[0].afterRebuild);
+      /* 队首是一批没发成的：原样重发（同一批、同一个 id，不看合并开关、不并进后来排的）—— 见 `pickQueuedBatch` */
+      const picked = pickQueuedBatch(queue, settings.mergeQueuedMessages && !queue[0].afterRebuild, queuedBatch);
+      const consumed = picked.items;
       const consumedIds = new Set(consumed.map((item) => item.id));
       const content = joinQueuedBatch(consumed, (n) => tRef.current('[{n} queued messages merged]', { n }));
       // Placeholders stay in `content` (display/transcript); the delivered prompt
@@ -3523,14 +3545,28 @@ const App: React.FC = () => {
         ...prev,
         [sessionId]: (prev[sessionId] || []).filter((item) => !consumedIds.has(item.id)),
       }));
-      // 经控制入口排进来的那张（id 带标记）发出去时，气泡上照样标「经控制入口发送」
-      const viaControl = consumed.some((item) => isControlMessageId(item.id));
+      /*
+        **messageId 跟着排队条目走**（`pickQueuedBatch`）：发到一半失败、放回队头再发时还是同一个 id，
+        主进程认得出这是同一次提交 —— 已经落过盘的不再追加一条（原来每次现生成，同一条消息在会话里一遍遍出现）。
+        经控制入口排进来的那张 id 带标记，发出去时气泡上照样标「经控制入口发送」。
+      */
       const sendOpts = {
         ...(queuedPastes.length ? { displayText: content, pastes: queuedPastes } : null),
-        ...(viaControl ? { messageId: controlMessageId('user') } : null),
+        messageId: picked.messageId,
       };
-      Promise.resolve(sendQueuedMessage(sessionId, deliveredContent, attachments, Object.keys(sendOpts).length ? sendOpts : undefined))
+      Promise.resolve(sendQueuedMessage(sessionId, deliveredContent, attachments, sendOpts))
+        .then(() => { queueBackoffRef.current.ok(sessionId); })
         .catch((error) => {
+          /* 主进程说这一条已经发过、也答过了：再放回去发多少次都是这个结论 —— 不放回 */
+          if (isDuplicateMessageError(String(error?.message || error))) {
+            console.warn('Queued message already answered; not re-queued:', error);
+            queueBackoffRef.current.ok(sessionId);
+            return;
+          }
+          /* 等一等再试：退避到点叫醒这个 effect（不到点它会跳过这条会话） */
+          const now = Date.now();
+          const retryAt = queueBackoffRef.current.fail(sessionId, now);
+          window.setTimeout(() => setQueueRetryTick((n) => n + 1), Math.max(0, retryAt - now) + 50);
           // The backend remains authoritative. If the original turn (including
           // compaction) was still busy or delivery otherwise failed, restore the
           // exact items at the head and preserve FIFO order.
@@ -3538,7 +3574,8 @@ const App: React.FC = () => {
           setQueuesBySession((prev) => {
             const existing = prev[sessionId] || [];
             const existingIds = new Set(existing.map((item) => item.id));
-            const restored = consumed.filter((item) => !existingIds.has(item.id));
+            /* 盖上这一批的 id 和边界（`sealRetryBatch`，跟着队列落盘）：重试完成前不重新分批 */
+            const restored = sealRetryBatch(consumed.filter((item) => !existingIds.has(item.id)), picked.messageId);
             return { ...prev, [sessionId]: [...restored, ...existing] };
           });
         })
@@ -3556,6 +3593,7 @@ const App: React.FC = () => {
     switchingModel,
     switchingAgent,
     quitPending,
+    queueRetryTick,
     recoveringIds,
   ]);
 

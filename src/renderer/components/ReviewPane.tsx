@@ -10,6 +10,7 @@ import { MarkdownView } from './ChatArea';
 import { restoreGetJson, restoreSet } from '../uiRestore';
 import { reviewSelectAll, lastInteraction, coversWhole } from '../selectAllScope';
 import { putReviewItem, patchReviewItem, removeReviewItem, remapReviewLines, liveReviewItems, useReviewQueueForPath, reviewItemLine, reviewItemLost, liveMarkKey, type ReviewQueueItem } from '../reviewQueue';
+import { forgetRetryTicket, rememberRetryTicket, remapResumable, resumableFrom, resumableTicket, reusableAfterReload, type Resumable } from '../reviewResume';
 import { useLang, useT } from '../hooks/useLang';
 import { noteVariants, t as translate, type Lang } from '../i18n';
 
@@ -85,6 +86,35 @@ let aiMarkSeq = 0;
 const NO_AI_MARKS: AiMarkState = { base: '', marks: [] };
 /** 被取消的那些（按 ticket）—— 和队列本身一样跟着文件走，不跟着 pane。 */
 const cancelledTickets = new Set<string>();
+/**
+ * **没做成、可以按同一次提交再来的那些** —— 路径 → 标记 → ticket + 当时的意见。主进程回了 `retrySame`
+ * （那一问没拿到完整回复：网络断了、超时、被停掉 / 截断）时记下；意见一字没改再点 ✓ 就用回这张 ticket
+ * （同一个 messageId，会话里不再多一条、答过的那一问也不再问一遍）。模块级：pane 卸掉还在；跟着标记落盘（`retryTickets`）。
+ */
+const retryTicketsByPath = new Map<string, Resumable>();
+/** 这几张 ticket 的某一问没拿到完整回复（主进程回 `retrySame`）—— 失败放回标记时据此记进 `retryTicketsByPath`。 */
+const retrySameTickets = new Set<string>();
+/** 所有 `reviseInSession` 都走这里：记下主进程说"可以按同一次再来"的那些 ticket。 */
+async function reviseVia(input: Parameters<NonNullable<typeof window.kiroApi.reviseInSession>>[0]): Promise<any> {
+  return trackRetry(input.ticket, await window.kiroApi.reviseInSession?.(input));
+}
+/** deck 一页版面文字的改写也走同一套（`deck:revise-slide-text` 和 `review:revise-in-session` 去重规则一样）。 */
+async function slideVia(input: Parameters<NonNullable<typeof window.kiroApi.deckReviseSlideText>>[0]): Promise<any> {
+  return trackRetry(input.ticket, await window.kiroApi.deckReviseSlideText?.(input));
+}
+function trackRetry(ticket: string | undefined, res: any): any {
+  if (res?.retrySame && ticket) retrySameTickets.add(ticket);
+  /* 模型答了却没做成（不带 retrySame 的错误）：这张 ticket 不再沿用（`forgetRetryTicket`，在 enqueue 跑完时摘） */
+  else if (ticket && res && !res.ok && !res.cancelled && res.error) finalTickets.add(ticket);
+  return res;
+}
+/** 这几张 ticket 的结局是"模型答了却没做成"—— 跑完时从 `retryTicketsByPath` 里摘掉，再提交就是新的一次。 */
+const finalTickets = new Set<string>();
+/** 失败、意见放回标记 `key` 时调：这张 ticket 能按同一次再来就记下（`rememberRetryTicket`）。 */
+function rememberRetry(path: string, key: string, text: string, ticket: string): void {
+  if (!retrySameTickets.delete(ticket)) return;
+  retryTicketsByPath.set(path, rememberRetryTicket(retryTicketsByPath.get(path) || {}, key, text, ticket));
+}
 /** deck 那侧「整批交给会话」的那道门 —— 按文件、不按 pane：等备份期间换了 pane 再点提交，也不会把同一批再发一遍。 */
 const handoffGates = new Map<string, ReturnType<typeof createSubmitGate>>();
 function handoffGateFor(path: string) {
@@ -116,8 +146,10 @@ type SavedMarks = {
   interrupted?: string[];
   /** `interrupted` 里每一条是哪一张 ticket —— 回来时问主进程它是不是其实已经写完了（`review:tickets-done`）。 */
   interruptedTickets?: Record<string, string>;
+  /** 没做成、可以按同一次提交再来的那些（标记 → ticket + 意见，见 `retryTicketsByPath`）—— reload 回来再点 ✓ 也还是同一次。 */
+  retryTickets?: Resumable;
 };
-const EMPTY_MARKS = { drafts: {} as Record<string, string>, dropped: {} as Record<number, true>, whole: '', order: {} as Record<string, number>, interrupted: [] as string[], interruptedTickets: {} as Record<string, string> };
+const EMPTY_MARKS = { drafts: {} as Record<string, string>, dropped: {} as Record<number, true>, whole: '', order: {} as Record<string, number>, interrupted: [] as string[], interruptedTickets: {} as Record<string, string>, retryTickets: {} as Resumable };
 
 export function loadMarks(path: string, text: string | null): typeof EMPTY_MARKS {
   const saved = restoreGetJson<Record<string, SavedMarks>>(MARKS_KEY)?.[path];
@@ -158,7 +190,12 @@ export function loadMarks(path: string, text: string | null): typeof EMPTY_MARKS
     const tk = saved.interruptedTickets?.[String(k)];
     if (tk) interruptedTickets[nk] = tk;
   }
-  return { drafts, dropped, whole: String(saved.whole || ''), order, interrupted, interruptedTickets };
+  const retryTickets: Resumable = {};
+  for (const [k, v] of Object.entries(saved.retryTickets || {})) {
+    const nk = rekey(k);
+    if (nk && v && typeof v.ticket === 'string' && typeof v.text === 'string') retryTickets[nk] = { ticket: v.ticket, text: v.text };
+  }
+  return { drafts, dropped, whole: String(saved.whole || ''), order, interrupted, interruptedTickets, retryTickets };
 }
 
 function saveMarks(path: string, marks: SavedMarks | null): void {
@@ -284,15 +321,45 @@ export const ReviewPane: React.FC<{
     m.interrupted = m.interrupted.filter((k) => !live.has(k));
     return m;
   });
+  /*
+    上次没做成、可以按同一次再来的那些：模块里还没有（这是 reload / 重启之后第一次打开）就从落盘的那份接上 ——
+    **连同"上次没做完"的那些**（`interruptedTickets`）：reload 之后那一次可能还在跑、也可能已经因为网络失败结束了
+    （那时没有窗口，收不到 `retrySame`）。先一律当成"还是那一次"记下（跟着标记落盘，再 reload 也不丢），
+    下面问过主进程再把**已经写完**的、**模型答了却没做成**的摘掉（`reusableAfterReload`）。沿用是安全的：
+    主进程按 messageId 去重 —— 盘上有的不再追加，答完的那一问用盘上的回复，不会再发一遍。
+  */
+  if (!retryTicketsByPath.has(path)) {
+    const carried = resumableFrom(initialMarks.interruptedTickets, new Set(Object.values(initialMarks.interruptedTickets)), (k) => (
+      k.startsWith('drop:') ? '' : k === 'whole' ? initialMarks.whole : initialMarks.drafts[k]
+    ));
+    const all = { ...initialMarks.retryTickets, ...carried };
+    if (Object.keys(all).length) retryTicketsByPath.set(path, all);
+  }
   const [draftLive, setDraftLive] = useState<Record<string, string>>(initialMarks.drafts);
   /*
     "上次没做完"的那些里，有的其实**做完了**：回复到的时候窗口不在，主进程自己拼、自己写了（`apply`）。
     问主进程一句，做完的那几条从标记里摘掉 —— 否则你再提交一次，同一处就改了两遍。
   */
+  /**
+   * 你再提交同一条（意见没改）时 `enqueue` 用回哪张 ticket —— 上次没做成的、reload 前没做完的都在 `retryTicketsByPath` 里
+   * （还在主进程里跑的，主进程合并到原来那一次；已经结束的，按同一个 messageId 重试）。用一次就摘掉。
+   */
+  const takeResumable = (key: string, text: string): string | undefined => {
+    /* 只看不摘：这次重试要是又没做成（远端还连不上之类），下次还得是这张 —— 做成了 / 答了却没做成才摘（见 enqueue） */
+    return resumableTicket(retryTicketsByPath.get(path) || {}, key, text);
+  };
   useEffect(() => {
     const byTicket = initialMarks.interruptedTickets;
     const tickets = Object.values(byTicket);
     if (!tickets.length) return;
+    /* 问主进程这几张后来怎样了：写完了 / 模型答了却没做成的不再沿用（`reusableAfterReload`）；还在跑、没拿到完整回复、不知道的留着 */
+    void window.kiroApi.reviewTicketsStatus?.(tickets).then((status) => {
+      const drop = Object.entries(byTicket).filter(([, t]) => !reusableAfterReload(status?.[t])).map(([k]) => k);
+      if (!drop.length) return;
+      const cur = { ...(retryTicketsByPath.get(path) || {}) };
+      for (const k of drop) if (cur[k]?.ticket === byTicket[k]) delete cur[k];
+      retryTicketsByPath.set(path, cur);
+    }).catch(() => {});
     void window.kiroApi.reviewTicketsDone?.(tickets).then((done) => {
       const finished = new Set(done || []);
       const keys = Object.entries(byTicket).filter(([, t]) => finished.has(t)).map(([k]) => k);
@@ -761,6 +828,8 @@ export const ReviewPane: React.FC<{
       return out;
     });
     remapReviewLines(path, patch.keep);
+    /* 可沿用的那些（没做成、放回去的意见对应的原 ticket）也跟着它那一行走 —— 不然挪了行再提交就换了编号（`remapResumable`） */
+    { const r = retryTicketsByPath.get(path); if (r) retryTicketsByPath.set(path, remapResumable(r, patch.keep)); }
     const changes = opts.ai ? (trustedChanges(opts.ai.changes, base, fullText) ?? diffChanges(base, fullText)) : [];
     const perChange = lostFieldsByChange(changes, opts.ai?.lost ?? []);
     const fresh: AiMark[] = changes
@@ -832,6 +901,7 @@ export const ReviewPane: React.FC<{
     saveMarks(path, {
       drafts, dropped: drops, whole, order: markOrder,
       ...(interrupted.length ? { interrupted, interruptedTickets } : {}),
+      ...(Object.keys(retryTicketsByPath.get(path) || {}).length ? { retryTickets: retryTicketsByPath.get(path) } : {}),
       ...(isDeck ? {} : { anchors }),
     });
     };
@@ -881,7 +951,12 @@ export const ReviewPane: React.FC<{
    */
   const enqueue = (kind: Job['kind'], line: number, run: (ticket: string) => Promise<boolean>, putBack: (ticket: string) => void, persist?: Job['persist']) => {
     const id = ++jobSeq.current;
-    const ticket = `rv:${path}#${id}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
+    /*
+      窗口 reload 前提交的这一条还在主进程里排着 / 跑着（`resumableRef`）、意见一字没改：**用回原来那张 ticket** ——
+      主进程把这次合并到原来那一次、等它的结果（`review:revise-in-session` 按 ticket 合并），不再另起一次、再发一遍。
+    */
+    const resumed = persist ? takeResumable(persist.key, persist.text) : undefined;
+    const ticket = resumed ?? `rv:${path}#${id}:${Date.now()}:${Math.random().toString(36).slice(2, 6)}`;
     /* 放回标记：放在这一条**此刻**指的那一行（`reviewItemLine(ticket)`）—— 排队期间前面的改动可能已经挪了它 */
     const restore = () => putBack(ticket);
     const what = kindLabel(kind);
@@ -909,6 +984,11 @@ export const ReviewPane: React.FC<{
         }
         livePane().setWriteWarn('');
         const ok = await run(ticket);
+        /* 做成了、或者模型答了却没做成：这张 ticket 不再沿用；别的失败（没拿到完整回复、没问到模型）留着，下次还是同一次 */
+        if (ok || finalTickets.delete(ticket)) {
+          const cur = retryTicketsByPath.get(path);
+          if (cur) retryTicketsByPath.set(path, forgetRetryTicket(cur, ticket));
+        }
         /* 跑完才发现被取消了（主进程回了 cancelled，或者取消落在两次往返之间）—— 标记放回去 */
         if (!ok && cancelledTickets.has(ticket)) restore();
         return ok;
@@ -956,6 +1036,7 @@ export const ReviewPane: React.FC<{
       const near = reviewItemLine(ticket) ?? anchor;
       let failKey = keyAt(near);
       const fail = (why: string) => {
+        rememberRetry(path, failKey, instruction, ticket);
         livePane().typeDraft(failKey, instruction);
         livePane().setApplyNote((cur) => ({ ...cur, [failKey]: why }));
         return false;
@@ -976,7 +1057,7 @@ export const ReviewPane: React.FC<{
       /* 位置写进显示文本 —— 回头翻会话要看得出说的是哪儿 */
       const label = `${fileName} ${whereAt(from, to)}`;
       if (mode === 'insert') {
-        const res: any = await window.kiroApi.reviseInSession?.({
+        const res: any = await reviseVia({
           sessionId: sessionId!, where, note: instruction, about: path, label: t('{label} (add after)', { label }), scope: 'insert', ticket,
           apply: { path, mode: 'insert', to, base },
         });
@@ -999,7 +1080,7 @@ export const ReviewPane: React.FC<{
         */
         return landed(await writeBack(base, fullText, failKey, t('Added a paragraph after {file} {where}', { file: fileName, where: whereAt(from, to) }), false, { ai: { round }, expectBase: base, edited: [singleRange(base, fullText, to + 1, to)] }));
       }
-      let res: any = await window.kiroApi.reviseInSession?.({
+      let res: any = await reviseVia({
         sessionId: sessionId!, where, note: instruction, about: path, label, scope: 'block', ticket,
         apply: { path, mode: 'splice', from, to, base },
       });
@@ -1009,7 +1090,7 @@ export const ReviewPane: React.FC<{
           跨段的意见（合并、拆分、挪位置）：**不整篇重写**（长文件会撞上 8 分钟超时），
           给它带行号的全文，它只交回要换的那几处，主进程拼回去（见 `parsePatchReply` / `applyPatch`）。
         */
-        res = await window.kiroApi.reviseInSession?.({
+        res = await reviseVia({
           sessionId: sessionId!, where, note: instruction, about: path, label: t('{label} (across sections)', { label }), scope: 'patch',
           /* 以**盘上此刻**这一份为基准、按它编行号 */
           full: base, fromLine: from, toLine: to, ticket,
@@ -1095,7 +1176,7 @@ export const ReviewPane: React.FC<{
     livePane().setApplyNote((cur) => { const n = { ...cur }; delete n.whole; return n; });
     enqueue('whole', 0, async (ticket) => {
       const base = currentText();
-      const res: any = await window.kiroApi.reviseInSession?.({
+      const res: any = await reviseVia({
         sessionId: sessionId!, where: '（整篇 —— 这条意见不针对某一处）', note, about: path,
         label: t('{file} (whole document)', { file: fileName }), scope: 'patch', full: base, ticket,
         apply: { path, mode: 'patch', base },
@@ -1104,6 +1185,7 @@ export const ReviewPane: React.FC<{
       const out = patchReplyOutcome(res, lang);
       if (out.kind === 'cancelled') return false;
       if (out.kind === 'fail') {
+        rememberRetry(path, 'whole', note, ticket);
         livePane().setWholeDraft((cur) => cur || note);
         livePane().setApplyNote((cur) => ({ ...cur, whole: out.why }));
         return false;
@@ -1120,7 +1202,7 @@ export const ReviewPane: React.FC<{
   const queueSlide = (page: number, instruction: string) => {
     livePane().clearDraft(String(page));
     enqueue('revise', page, async (ticket) => {
-      const res: any = await window.kiroApi.deckReviseSlideText?.({ sessionId: sessionId!, filePath: path, page, note: instruction, ticket });
+      const res: any = await slideVia({ sessionId: sessionId!, filePath: path, page, note: instruction, ticket });
       if (res?.cancelled) return false;
       if (!res?.ok) {
         if (res?.cannot) {
@@ -1129,6 +1211,8 @@ export const ReviewPane: React.FC<{
           if (!sent) livePane().typeDraft(String(page), instruction);
           return sent;
         }
+        /* 没拿到完整回复（网络断了之类）：这张 ticket 留着，意见不改再点 ✓ 还是同一次提交（`rememberRetry`） */
+        rememberRetry(path, String(page), instruction, ticket);
         livePane().typeDraft(String(page), instruction);
         livePane().setApplyNote((cur) => ({ ...cur, [String(page)]: t('Rewrite failed: {err}', { err: res?.error || t('no response') }) }));
         return false;
@@ -1152,8 +1236,8 @@ export const ReviewPane: React.FC<{
     /* 讲稿读到过才拿它核对（`deck:write-note` 的 `expect`）—— 没读到时 `before` 只是个空串，拿它比会把每次都判成冲突 */
     const expectNote = Array.isArray(notes) ? before : undefined;
     enqueue('note', page, async (ticket) => {
-      const fail = (why: string) => { livePane().typeDraft(key, instruction); livePane().setApplyNote((cur) => ({ ...cur, [key]: why })); return false; };
-      const res: any = await window.kiroApi.reviseInSession?.({
+      const fail = (why: string) => { rememberRetry(path, key, instruction, ticket); livePane().typeDraft(key, instruction); livePane().setApplyNote((cur) => ({ ...cur, [key]: why })); return false; };
+      const res: any = await reviseVia({
         sessionId: sessionId!,
         where: before || '（这一页原来没写备注）',
         note: instruction,

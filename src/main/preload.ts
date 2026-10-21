@@ -549,6 +549,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   reviewCancel: (ticket: string) => ipcRenderer.invoke('review:cancel', ticket),
   /** 这几个 ticket 里哪些已经在主进程写完盘了（窗口 reload 回来时用：做完的不再当标记放回去）。 */
   reviewTicketsDone: (tickets: string[]): Promise<string[]> => ipcRenderer.invoke('review:tickets-done', tickets),
+  reviewTicketsStatus: (tickets: string[]): Promise<Record<string, string>> => ipcRenderer.invoke('review:tickets-status', tickets),
   deckReviseSlideText: (input: { sessionId: string; filePath: string; page: number; note: string; ticket?: string }) =>
     ipcRenderer.invoke('deck:revise-slide-text', input),
   /** 读一页幻灯片上的文字（按 run 地址）。 */
@@ -764,7 +765,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   peekTurn: (sessionId: string): Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }> =>
     ipcRenderer.invoke('acp:peek-turn', sessionId),
   /** Authoritative full assistant text at turn end (heals dropped chunks). */
-  onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number }) => void) => {
+  onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:assistant-final', handler);
     return () => ipcRenderer.removeListener('acp:assistant-final', handler);

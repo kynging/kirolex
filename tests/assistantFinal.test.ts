@@ -80,7 +80,8 @@ describe('接线：完成事件带 toolTailFrom、渲染端并进消息', () => 
     const i = r.indexOf('const removeAssistantFinal = window.kiroApi.onAssistantFinal');
     assert.ok(i > 0);
     const body = r.slice(i, i + 1500);
-    assert.match(body, /\(\{ sessionId: sid, messageId, text, toolTailFrom \}\)/);
+    /* 另外带着回复的去重标记（replyTo / replyComplete，见 duplicateSubmit.test.ts） */
+    assert.match(body, /\(\{ sessionId: sid, messageId, text, toolTailFrom, replyTo, replyComplete \}\)/);
     assert.match(body, /const merged = mergeAssistantFinal\(list\[idx\], text, toolTailFrom\);/);
     assert.doesNotMatch(body, /if \(list\[idx\]\.content === text\) return list;/);
   });

@@ -174,7 +174,8 @@ describe('接线', () => {
   test('一次往返：读这一页 → 问会话 → 自己写', () => {
     const at = MAIN.indexOf("ipcMain.handle('deck:revise-slide-text'");
     assert.ok(at > 0);
-    const body = MAIN.slice(at, at + 4000);
+    /* 截到这个 handler 结束为止（下一个是 deck:read-slide-text）—— 原来按 4000 个字符截，handler 加了去重的几行就截不全了 */
+    const body = MAIN.slice(at, MAIN.indexOf("ipcMain.handle('deck:read-slide-text'", at));
     assert.match(body, /SLIDE_TEXT_SCRIPT/, '先读出地址');
     /* 形状表和页面尺寸也一起给它 —— 加/删/挪框全靠这个（见 slideOps 那组） */
     assert.match(body, /\.\.\.\(cur\.shapes\?\.length \? \{ shapes: cur\.shapes \} : null\)/);
