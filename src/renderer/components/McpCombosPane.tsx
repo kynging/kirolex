@@ -48,7 +48,9 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   const dirty = content !== initial;
 
   const save = async () => {
-    if (invalid || saving) return;
+    if (saving) return;
+    /* Ctrl+S 绕过了禁用的保存按钮：JSON 有错时也要明说没存，不能什么都不发生 */
+    if (invalid) { setStatus({ ok: false, text: t('Not saved: {error}', { error: invalid }) }); return; }
     setSaving(true); setStatus(null);
     try {
       /* 按格式化后的样子写盘（只动空白，不改语义；校验仍在 main 那边） */
@@ -73,7 +75,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         <div className="agent-config-editor-body">
           <div className="agent-config-editor-selection">
             <strong>mcp-combos.json</strong>
-            <span className="kiro-config-ro-tag">{t('Global on this machine, shared by all sessions')}</span>
+            <span className="kiro-config-ro-tag">{t('Shared by all sessions; with S3 sync on, also synced to your other computers')}</span>
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">
@@ -103,7 +105,9 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         </div>
       </div>
       <div className="agent-config-editor-actions">
-        {status && <span className={status.ok ? 'saved' : 'error'}>{status.text}</span>}
+        {status && <span className={status.ok ? 'saved' : 'error'} title={status.text}>{status.text}</span>}
+        {/* 文件不存在时编辑框里是样板（样板里正好有个「投研」）—— 明说还没存，免得看着像已经有了 */}
+        {!exists && !status && !loading && <span className="error">{t('Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.')}</span>}
         <button
           className="btn deny"
           onClick={() => { const r = formatJsonText(content); if (r.ok) setContent(r.text!); }}

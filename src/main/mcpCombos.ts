@@ -204,16 +204,40 @@ export function readMcpCombos(home: string): { combos: McpCombo[]; error?: strin
   return r.ok ? { combos: r.combos, exists: true, text } : { combos: [BUILTIN_COMBO], error: r.error, exists: true, text };
 }
 
-/** 保存前校验；校验不过不写盘。写法是 tmp + rename（崩溃不留半个文件）。 */
+/**
+ * 写盘：tmp + rename（崩溃不留半个文件）。写不进去时把 tmp 删掉再抛 —— 调用方决定怎么报。
+ * S3 同步拉下来 / 合并出来的那份也走这里。
+ */
+export function writeMcpCombosText(home: string, text: string): void {
+  const file = mcpCombosPath(home);
+  const tmp = `${file}.${process.pid}.tmp`;
+  try {
+    fs.mkdirSync(path.dirname(file), { recursive: true });
+    fs.writeFileSync(tmp, text);
+    fs.renameSync(tmp, file);
+  } catch (err) {
+    try { fs.rmSync(tmp, { force: true }); } catch { /* 本来就没写出来 */ }
+    throw err;
+  }
+}
+
+/**
+ * 保存前校验；校验不过不写盘。**写盘失败也回 `{ ok: false, error }`、不抛** ——
+ * 「组合那里明明写的投研，为什么显示是通用」：以前写盘失败是一个抛出去的 IPC 异常，日志里什么都没有。
+ * 写完再从盘上读一遍，读回来的和刚存的不一样（或读回来解析不过）也算没存上。
+ */
 export function saveMcpCombos(home: string, text: string): ParseResult {
   const r = parseMcpCombos(text);
   if (!r.ok) return r;
   const file = mcpCombosPath(home);
-  fs.mkdirSync(path.dirname(file), { recursive: true });
-  const tmp = `${file}.${process.pid}.tmp`;
-  fs.writeFileSync(tmp, text);
-  fs.renameSync(tmp, file);
-  return r;
+  try { writeMcpCombosText(home, text); } catch (err: any) {
+    return { ok: false, error: tr('Could not write {file}: {err}', { file, err: String(err?.code || err?.message || err) }) };
+  }
+  const back = readMcpCombos(home);
+  if (!back.exists || back.text !== text || back.error) {
+    return { ok: false, error: tr('{file} was written, but reading it back did not give the same content; it may not have been saved', { file }) };
+  }
+  return { ok: true, combos: back.combos };
 }
 
 /** 按 id 找；没选 / 找不到（被删了）→ 通用 */

@@ -165,6 +165,8 @@ export const ZH_CHAT: Record<string, string> = {
   '{engine} config and login (on the machine this chat runs on)': '{engine} 的配置和登录（这条会话跑的那台机器上的）',
   'Wait for this reply to finish before switching combos': '等这一轮回复完再换组合',
   'The combo file has an error: {error}': '组合文件有错：{error}',
+  'Combo "{id}" does not exist on this machine; running as General': '组合「{id}」在本机不存在，已按通用运行',
+  'Combo "{id}" could not be read (the combo file has an error); running as General': '组合「{id}」读不到（组合文件有错），已按通用运行',
   "{engine} combo (MCP + effort). Switching restarts this chat's executor": '{engine} 的组合（MCP + effort）—— 换了会重启这条会话的执行器',
   'Combo': '组合',
   'General purpose': '通用',

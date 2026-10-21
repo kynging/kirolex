@@ -4526,6 +4526,7 @@ button, input, select, textarea {
 
 .agent-config-editor-actions > span {
   margin-right: auto;
+  min-width: 0;
   overflow: hidden;
   font-size: 12px;
   text-overflow: ellipsis;
@@ -4540,6 +4541,9 @@ button, input, select, textarea {
   font-size: 13px;
   font-weight: 500;
   cursor: pointer;
+  /* 状态文字很长时（保存成功那句）挤的是文字（省略号），不是按钮 */
+  flex-shrink: 0;
+  white-space: nowrap;
 }
 
 .agent-config-editor-actions .btn.allow {
@@ -8670,6 +8674,8 @@ button, input, select, textarea {
 /* 原来显示引擎名的那一格，现在是 effort */
 .composer-effort-select { max-width: 120px; }
 .composer-combo-select { max-width: 140px; }
+/* 记住的组合本机没有：提示项要整句看得见（comboPick.ts），用和「需要注意」同一种琥珀色 */
+.composer-combo-select[data-missing] { max-width: 360px; color: #d9a441; border-color: rgba(217, 164, 65, 0.6); }
 /* 「组合」那页只有一份文件，没有左边的文件列表：编辑器占满整行 */
 .agent-config-editor-workspace.mcp-combos-workspace { grid-template-columns: minmax(0, 1fr); }
 .mcp-combos-workspace .kiro-config-ro-tag { white-space: nowrap; }

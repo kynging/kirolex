@@ -64,8 +64,16 @@ export const ZH_MODULES_A: Record<string, string> = {
   'The write script reported an error': '写入脚本报了错',
   'The write script returned notes in an unexpected shape': '写入脚本返回的备注形状不对',
   "Couldn't parse the write script output": '写入脚本的输出解析不了',
+  // ── mcpCombosSync.ts ──
+  'The combo file on this machine has an error: {error}': '本机的组合文件有错：{error}',
+  'The combo file in the bucket has an error: {error}': '桶里的组合文件有错：{error}',
+  'The merged combo file did not pass validation: {error}': '合并出来的组合文件没通过校验：{error}',
+  '{name} (from another computer)': '{name}（另一台电脑的版本）',
+  '{name} (from another computer {n})': '{name}（另一台电脑的版本 {n}）',
   // ── mcpCombos.ts ──
   'General': '通用',
+  'Could not write {file}: {err}': '{file} 写不进去：{err}',
+  '{file} was written, but reading it back did not give the same content; it may not have been saved': '{file} 写了，但读回来的内容对不上，可能没存上',
   '{what} must be an object (name → value)': '{what} 要是一个对象（名字 → 值）',
   '{what}: the value of "{k}" must be a string': '{what} 里「{k}」的值要是字符串',
   '{what}: the ${env:...} reference in "{k}" is not a valid environment variable name (letters, digits and underscores only, not starting with a digit)': '{what} 里「{k}」的 ${env:…} 引用不是合法的环境变量名（只能是字母、数字、下划线，不能以数字开头）',

@@ -197,6 +197,32 @@ export async function getObjectIfExists(creds: S3Creds, key: string): Promise<Bu
   return check(r, tr('Download {key}', { key })).body;
 }
 
+/** 和 `getObjectIfExists` 一样，另外带回 ETag —— 给条件写入（`putObjectIf`）用。 */
+export async function getObjectWithEtag(creds: S3Creds, key: string): Promise<{ body: Buffer; etag: string } | null> {
+  const r = await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0));
+  if (r.status === 404) return null;
+  const ok = check(r, tr('Download {key}', { key }));
+  const etag = ok.headers.etag;
+  return { body: ok.body, etag: String(Array.isArray(etag) ? etag[0] : etag || '') };
+}
+
+/**
+ * **条件写入** —— 只在桶里那份还是我刚读到的那份（`ifMatch` = 它的 ETag）、或者桶里还没有（`ifNoneMatch: '*'`）时才写。
+ * 别人在这期间传过 → S3 回 412（并发写同一个 key 时也可能回 409）→ 返回 `'conflict'`，调用方重新下载、合并再试。
+ * 其他失败照常抛。
+ */
+export async function putObjectIf(
+  creds: S3Creds, key: string, body: Buffer, contentType: string,
+  cond: { ifMatch: string } | { ifNoneMatch: '*' },
+): Promise<'ok' | 'conflict'> {
+  const h: Record<string, string> = { 'content-type': contentType };
+  if ('ifMatch' in cond) h['if-match'] = cond.ifMatch; else h['if-none-match'] = '*';
+  const r = await request(creds, 'PUT', `/${key}`, {}, body, h);
+  if (r.status === 412 || r.status === 409) return 'conflict';
+  check(r, tr('Upload {key}', { key }));
+  return 'ok';
+}
+
 export interface S3Entry { key: string; size: number; lastModified: string }
 
 /** 列一个前缀下的所有对象（自动翻页 —— 一页 1000 个，超了不翻就是静默少数据）。 */

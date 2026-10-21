@@ -11,6 +11,7 @@
  *   · `sessions/<id>/{record.json, transcript.jsonl, history.md}` —— 恢复一条会话的最小集合；
  *   · `memory/**` —— 三层记忆，不带的话恢复回来的会话"忘了你教过它的事"；
  *   · `attachments/**`、`pasted/**` —— 会话里引用的图片。
+ *   · `mcp-combos.json` —— Claude Code / Codex 的「组合」，多台电脑共用一份（两边都改过时合并，见 `mcpCombosSync.ts`）。
  *
  * **不同步** `config.json`（里面是这台机器的路径、identityFile、远端主机），也不同步
  * `logs/`、`previews/`、`loffice-profile/` 这些纯本地产物。用户选的范围就是上面这三类。

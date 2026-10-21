@@ -286,8 +286,9 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Saved. Sessions using this combo pick up the new content the next time they reconnect; to apply it now, switch to another combo in the bottom-left and back.':
     '已保存 —— 正在用这个组合的会话要下次重连时才按新内容起；想马上生效，在左下角先切到别的组合、再切回来。',
   'Not saved: {error}': '没有保存：{error}',
+  'Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.': '还没保存：文件还不存在，上面只是样板，点「保存」才会建出来。',
   'Validation failed': '校验没通过',
-  'Global on this machine, shared by all sessions': '本机全局，所有会话共用',
+  'Shared by all sessions; with S3 sync on, also synced to your other computers': '所有会话共用；开了 S3 同步时也同步到你的其他电脑',
   'A list of combos: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ':
     '组合列表：每个组合有 id、name、可选 effort（如 high）和 mcpServers。http 型写 url / headers（可选 timeoutSec），stdio 型写 command / args / env；可选 disabled、forwardFromLocal。headers 和 env 的值可以用 ',
   '. The built-in "General" (no MCP) does not need to be listed.': ' 引用本机环境变量。内置「通用」（不挂 MCP）不用写。',

@@ -33,7 +33,8 @@ import {
 import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
 import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
-import { S3Creds, S3Error, putObject, deleteObject, getObject, getObjectIfExists, listObjects } from './s3Client.ts';
+import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
+import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, getObject, getObjectIfExists, getObjectWithEtag, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, remoteHomeDir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
@@ -101,7 +102,7 @@ import { logger } from './logger';
 import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
-import { readMcpCombos, saveMcpCombos, pickCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
+import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -4390,6 +4391,8 @@ const MODEL_META_PATH = path.join(KIROLEX_HOME, 'model-meta.json');
 const S3_STATE_PATH = path.join(KIROLEX_HOME, 's3-sync-state.json');
 /** 每条会话最后一次真的上传是什么时候（见 `readSessionMarks` 那段）。 */
 const S3_MARKS_PATH = path.join(KIROLEX_HOME, 's3-session-sync.json');
+/** 组合文件上次同步完两边的内容摘要（`mcpCombosSync.ts` 的 `ComboSyncMark`） */
+const S3_COMBOS_MARK_PATH = path.join(KIROLEX_HOME, 's3-combos-sync.json');
 
 function loadSyncConfig(): SyncConfig {
   try {
@@ -4768,6 +4771,50 @@ function isMemoryRel(rel: string): boolean {
   return rel.startsWith(`memory${path.sep}`) && rel.endsWith('.md');
 }
 
+/**
+ * **`mcp-combos.json` 和桶里那份对一下**（判据、校验、合并和"条件上传 + 冲突重试"都在 `mcpCombosSync.ts` 的 `syncComboFile`）——
+ * 多台电脑共用同一份组合。文件很小，每轮整份拉下来按**内容摘要**判断谁变过；上传带 ETag 条件，
+ * 下载之后别的电脑又传过 → 不覆盖，重新下载合并再试。
+ * 拉 / 合并会改本机文件：改之前把本机那份挪进 trash，改完通知下拉刷新。出错：这一轮不传，摘要不更新。返回传了几个文件（0 / 1）。
+ */
+async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefined): Promise<number> {
+  const rel = MCP_COMBOS_REL;
+  const key = keyFor(prefix, rel);
+  const abs = path.join(KIROLEX_HOME, rel);
+  try {
+    const r = await syncComboFile({
+      get: async () => { const g = await getObjectWithEtag(creds, key); return g ? { text: g.body.toString('utf-8'), etag: g.etag } : null; },
+      put: (text, cond) => putObjectIf(creds, key, Buffer.from(text, 'utf-8'), contentTypeFor(rel), cond),
+      readLocal: () => { try { return fs.readFileSync(abs, 'utf-8'); } catch { return undefined; } },
+      writeLocal: (text, plan) => {
+        /* 被换掉的那份先挪进 trash —— 拉 / 合并都是改写，改写之前留一份 */
+        if (fs.existsSync(abs)) {
+          const bak = path.join(KIROLEX_HOME, 'trash', `mcp-combos-sync-${Date.now()}`, rel);
+          fs.mkdirSync(path.dirname(bak), { recursive: true });
+          fs.copyFileSync(abs, bak);
+        }
+        writeMcpCombosText(os.homedir(), text);
+        mainWindow?.webContents.send('acp:mcp-combos-changed');
+        logger.info('s3', `组合文件：${plan.action === 'pull' ? '从桶里拉回（别的电脑改的 / 本机第一次同步）' : `按合并结果改写（从桶里并进 ${plan.added.length} 个组合）`}`);
+      },
+      readMark: () => readComboMark(S3_COMBOS_MARK_PATH),
+      writeMark: (m) => writeComboMark(S3_COMBOS_MARK_PATH, m),
+    });
+    for (const plan of r.plans) {
+      if (plan.action === 'skip') logger.warn('s3', `组合文件这一轮不同步，两边都不动：${plan.error}`);
+      if (plan.conflicts.length) {
+        logger.warn('s3', `组合文件两边改了同一个组合（${plan.conflicts.map((c) => `${c.id} → 桶里那份留成 ${c.keptAs}`).join('、')}），两份都留着，没有覆盖`);
+      }
+    }
+    if (r.plans.length > 1) logger.info('s3', `组合文件：上传时发现别的电脑刚传过，重新下载合并了 ${r.plans.length - 1} 次`);
+    if (r.gaveUp) logger.warn('s3', '组合文件：连着几次上传前都被别的电脑抢先改了，这一轮不传（没有覆盖对方），下一轮再合并');
+    return r.uploaded ? 1 : 0;
+  } catch (err: any) {
+    logger.warn('s3', `组合文件同步没成功（这一轮不传）：${err?.message || err}`);
+    return 0;
+  }
+}
+
 function walkDirs(dir: string): string[] {
   try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; }
 }
@@ -4942,6 +4989,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         }
       }
     }
+    /* 组合文件（mcp-combos.json）：多台电脑共用一份，两边都改过时合并、不静默覆盖 */
+    uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix);
     /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
     const uploadList = [
       ...plan.upload.filter((r) => !isMemoryRel(r)),
@@ -10064,7 +10113,8 @@ app.whenReady().then(async () => {
   });
   ipcMain.handle('acp:save-mcp-combos', (_event, text: string) => {
     const r = saveMcpCombos(os.homedir(), String(text ?? ''));
-    if (!r.ok) return { ok: false, error: r.error };
+    /* 原因里不带配置原文（见 parseMcpCombos / jsonSyntaxError），可以进日志 */
+    if (!r.ok) { logger.warn('mcp-combo', `保存组合没成功：${r.error}`); return { ok: false, error: r.error }; }
     logger.info('mcp-combo', `保存了 ${r.combos.length - 1} 个组合（不含内置「通用」）`);
     mainWindow?.webContents.send('acp:mcp-combos-changed');
     return { ok: true };

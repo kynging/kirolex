@@ -55,6 +55,7 @@ import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
 import { runSessionRequest, setErr, statusFor, cleanIpcError, type RequestStatusMap } from '../sessionRequestStatus.ts';
+import { comboSelectView, type ComboListView } from '../comboPick.ts';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -3387,8 +3388,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     **「组合」下拉**（取代原来的 effort 下拉）——「不同对话挂不同的 MCP」。清单是本机全局的
     `~/.kirolex/mcp-combos.json`（面板里「🧩 组合」那页改），每条会话记自己选的那个；换了要重启执行器（main 做）。
   */
-  type McpComboList = { combos: Array<{ id: string; name: string; effort?: string }>; current: string; missing?: string; error?: string };
+  type McpComboList = ComboListView;
   const [mcpCombos, setMcpCombos] = useState<McpComboList | null>(null);
+  /* 记住的组合本机没有时，下拉选中一条明说的提示项（comboPick.ts），不悄悄显示「通用」 */
+  const comboView = comboSelectView(mcpCombos, pendingSwitch?.combo, t);
   useEffect(() => {
     setMcpCombos(null);
     if (!nonKiro || !currentSessionId) return;
@@ -4701,15 +4704,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       */}
                       <select
                         className="composer-select composer-combo-select"
+                        data-missing={comboView.missing ? '1' : undefined}
                         /* pending 里记的是组合 id（和显示名、界面语言无关），直接对上选项 */
-                        value={(pendingSwitch?.combo !== undefined && mcpCombos?.combos.some((c) => c.id === pendingSwitch.combo) ? pendingSwitch.combo : '') || mcpCombos?.current || 'default'}
+                        value={(pendingSwitch?.combo !== undefined && mcpCombos?.combos.some((c) => c.id === pendingSwitch.combo) ? pendingSwitch.combo : '') || comboView.value}
                         onChange={(event) => void onMcpComboChange(event.target.value)}
                         disabled={!currentSessionId || !mcpCombos || mcpComboBusy || engineModelBusy}
-                        title={mcpCombos?.error
+                        title={comboView.missing
+                          ? comboView.missing.label
+                          : mcpCombos?.error
                             ? t('The combo file has an error: {error}', { error: mcpCombos.error })
                             : t("{engine} combo (MCP + effort). Switching restarts this chat's executor", { engine: engineLabel })}
                         aria-label={t('Combo')}
                       >
+                        {comboView.missing && <option value={comboView.missing.id} disabled>{comboView.missing.label}</option>}
                         {(mcpCombos?.combos || [{ id: 'default', name: t('General purpose') }]).map((c) => (
                           /* 内置组合的名字在这里按当前语言取：清单是进会话时拉的，那一刻的语言不一定是现在的 */
                           <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.id === 'default' ? t('General purpose') : c.name })}</option>
