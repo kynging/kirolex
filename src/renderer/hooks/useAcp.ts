@@ -3109,6 +3109,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       setPlan([]);
       setFileChanges([]);
       setActiveToolCall(null);
+      /* 状态行 / 卡住提示也是上一条会话的：不清的话它那句「正在连接会话…」会一直挂在新会话的欢迎页下面 */
+      setActivityStatus(null);
+      setTurnStall(null);
       setContextLinks([]);
     }
 
