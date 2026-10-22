@@ -185,3 +185,39 @@ export function runLocalAdapterInstall(engine: AdapterEngine, deps: {
 export function binOnPath(bin: string, env: NodeJS.ProcessEnv, exists: (p: string) => boolean): boolean {
   return String(env.PATH || '').split(path.delimiter).filter(Boolean).some((d) => exists(path.join(d, bin)));
 }
+
+/**
+ * **同一机器、同一引擎的安装只跑一次，进度广播给所有在等的会话**（index.ts `acp:install-adapter`）。
+ *
+ * 第二条会话点「安装」时不另起一次，而是订阅已经在跑的那个 job：先补发已经出来的输出（不然它只看到「安装中」），
+ * 之后的输出和第一条会话一样实时收到；结果（成功 / 失败原因）每个等待者都拿到同一份，各自写会话、各自重连。
+ * 装完（不管成败）job 就删掉，下次再点重新装。
+ */
+export function createSharedInstalls<R = InstallResult>(opts: { replayMax?: number } = {}) {
+  const replayMax = opts.replayMax ?? 6000;
+  const jobs = new Map<string, { promise: Promise<R>; subscribers: Set<(chunk: string) => void>; output: string }>();
+  return {
+    has(key: string): boolean { return jobs.has(key); },
+    /** 订阅 `key` 那个安装；还没有就用 `start` 起一个（`start` 拿到的 `broadcast` 把输出发给所有订阅者）。 */
+    join(key: string, onOutput: (chunk: string) => void, start: (broadcast: (chunk: string) => void) => Promise<R>): { promise: Promise<R>; joined: boolean } {
+      const safe = (chunk: string) => { try { onOutput(chunk); } catch { /* 那个窗口没了不影响别的 */ } };
+      const existing = jobs.get(key);
+      if (existing) {
+        if (existing.output) safe(existing.output);
+        existing.subscribers.add(safe);
+        return { promise: existing.promise, joined: true };
+      }
+      const job = { promise: undefined as unknown as Promise<R>, subscribers: new Set([safe]), output: '' };
+      const broadcast = (chunk: string) => {
+        if (!chunk) return;
+        job.output = (job.output + chunk).slice(-replayMax);
+        for (const fn of [...job.subscribers]) fn(chunk);
+      };
+      jobs.set(key, job);
+      let p: Promise<R>;
+      try { p = Promise.resolve(start(broadcast)); } catch (err: any) { p = Promise.reject(err); }
+      job.promise = p.finally(() => { if (jobs.get(key) === job) jobs.delete(key); });
+      return { promise: job.promise, joined: false };
+    },
+  };
+}

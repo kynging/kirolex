@@ -8,7 +8,7 @@ import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, type Engine } from './engines.ts';
-import { runLocalAdapterInstall, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath } from './adapterInstall.ts';
+import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath } from './adapterInstall.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
@@ -11949,7 +11949,8 @@ app.whenReady().then(async () => {
    * 机器和引擎以记录为准；新建失败的会话还没有记录，用渲染层带来的 engine / remoteId。
    * 输出边跑边推给界面（`acp:adapter-install-output`）；装不上把原因写进会话（有记录时）和日志。重连由渲染层做。
    */
-  const adapterInstallsInFlight = new Map<string, Promise<{ ok: boolean; error?: string }>>();
+  /* 同一机器、同一引擎只装一次；后点的会话订阅那一次，进度（含已经出来的）和结果都广播给它（`createSharedInstalls`） */
+  const adapterInstallsInFlight = createSharedInstalls<{ ok: boolean; error?: string }>();
   ipcMain.handle('acp:install-adapter', async (event, sessionId: string, engineArg?: string, remoteId?: string) => {
     const sid = String(sessionId || '').trim();
     const rec = sid ? store.readRecord(sid) : null;
@@ -11963,22 +11964,18 @@ app.whenReady().then(async () => {
     const send = (chunk: string) => { try { event.sender.send('acp:adapter-install-output', { sessionId: sid, chunk }); } catch { /* 窗口没了 */ } };
     const key = `${host || 'local'}|${engine}`;
     logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'}${adapterInstallsInFlight.has(key) ? '（已经在装了，等那一次）' : ''}`);
-    let job = adapterInstallsInFlight.get(key);
-    if (!job) {
-      job = (host
-        ? installRemoteAdapter(remote!, engine, send)
-        : runLocalAdapterInstall(engine, {
-          spawn: spawn as any,
-          platform: process.platform,
-          home: os.homedir(),
-          env: shellEnv,
-          onOutput: send,
-          findEntry: () => { forgetAdapterCache(); return findAdapterEntry(engine, shellEnv); },
-          binOnPath: (bin) => binOnPath(bin, shellEnv, (p) => { try { return fs.existsSync(p); } catch { return false; } }),
-        })
-      ).finally(() => { adapterInstallsInFlight.delete(key); });
-      adapterInstallsInFlight.set(key, job);
-    }
+    const { promise: job } = adapterInstallsInFlight.join(key, send, (broadcast) => (host
+      ? installRemoteAdapter(remote!, engine, broadcast)
+      : runLocalAdapterInstall(engine, {
+        spawn: spawn as any,
+        platform: process.platform,
+        home: os.homedir(),
+        env: shellEnv,
+        onOutput: broadcast,
+        findEntry: () => { forgetAdapterCache(); return findAdapterEntry(engine, shellEnv); },
+        binOnPath: (bin) => binOnPath(bin, shellEnv, (p) => { try { return fs.existsSync(p); } catch { return false; } }),
+      })
+    ));
     const r = await job;
     if (r.ok) {
       logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'} 装好了${(r as any).entry ? `（${(r as any).entry}）` : ''}`);

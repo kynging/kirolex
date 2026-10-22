@@ -16,7 +16,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import {
-  localInstallCommand, runLocalAdapterInstall, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, installFailureReason,
+  localInstallCommand, runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, installFailureReason,
 } from '../src/main/adapterInstall.ts';
 import { managerModuleRoots, findAdapterEntry, resolveAdapter, adapterMissingMessage } from '../src/main/engines.ts';
 import { adapterProblemMessage } from '../src/main/remoteAdapterProbe.ts';
@@ -384,6 +384,101 @@ describe('点「安装」之后：进度 → 装好自动重连；失败说原�
     release();
     await Promise.all([a, b]);
     assert.equal(installs, 1);
+  });
+});
+
+describe('同一机器、同一引擎的安装复用：进度和结果广播给所有在等的会话', () => {
+  /** 主进程那一侧：每条会话一个 send（带自己的 sessionId），都 join 同一个 key；渲染层按 sessionId 收进各自的状态。 */
+  function wire() {
+    const shared = createSharedInstalls();
+    const store = createAdapterInstallStore();
+    const sent: Record<string, string> = {};
+    const starts: string[] = [];
+    let child: any;
+    const spawn = (command: string, args: string[], opts: any) => {
+      starts.push(opts.cwd);
+      child = new EventEmitter();
+      child.stdout = new EventEmitter();
+      child.stderr = new EventEmitter();
+      child.kill = () => {};
+      return child;
+    };
+    const install = (sid: string, engine: 'claude' | 'codex', findEntry: () => string | null) => {
+      const send = (chunk: string) => { sent[sid] = (sent[sid] || '') + chunk; store.append(sid, chunk); };
+      return shared.join(`local|${engine}`, send, (broadcast) => runLocalAdapterInstall(engine, {
+        spawn: spawn as any, platform: 'linux', home: '/home/u', env: {}, onOutput: broadcast, findEntry,
+      })).promise;
+    };
+    return { shared, store, sent, starts, install, child: () => child };
+  }
+
+  test('两条会话先后点同一个安装：只起一次 npm，两边都收到进度（后点的补收前面的输出），装好都重连', async () => {
+    const w = wire();
+    const reconnected: string[] = [];
+    const deps = (entry: string | null) => ({
+      install: (sid: string, engine: 'claude' | 'codex') => w.install(sid, engine, () => entry),
+      reconnect: async (sid: string) => { reconnected.push(sid); return { ok: true }; },
+    });
+    const a = runAdapterInstall(w.store, 'sA', 'claude', deps('/g/claude-agent-acp/dist/index.js'));
+    w.child().stdout.emit('data', Buffer.from('fetching claude-agent-acp\n'));
+    const b = runAdapterInstall(w.store, 'sB', 'claude', deps('/g/claude-agent-acp/dist/index.js'));
+    assert.equal(w.shared.has('local|claude'), true);
+    w.child().stdout.emit('data', Buffer.from('added 3 packages\n'));
+    w.child().emit('close', 0);
+    assert.deepEqual(await Promise.all([a, b]), [true, true]);
+    assert.equal(w.starts.length, 1, '同一个安装只起一次');
+    for (const sid of ['sA', 'sB']) {
+      assert.match(w.sent[sid], /fetching claude-agent-acp/, `${sid} 收到装之前的输出`);
+      assert.match(w.sent[sid], /added 3 packages/, `${sid} 收到之后的输出`);
+      assert.match(w.store.get(sid)!.output, /added 3 packages/);
+      assert.equal(w.store.get(sid)!.phase, 'connected');
+    }
+    assert.deepEqual(reconnected.sort(), ['sA', 'sB']);
+    assert.equal(w.shared.has('local|claude'), false, '装完就把 job 删掉，下次点重新装');
+  });
+
+  test('复用的安装失败：两边都拿到同一个失败原因、都不重连', async () => {
+    const w = wire();
+    let reconnects = 0;
+    const deps = {
+      install: (sid: string, engine: 'claude' | 'codex') => w.install(sid, engine, () => null),
+      reconnect: async () => { reconnects += 1; return { ok: true }; },
+    };
+    const a = runAdapterInstall(w.store, 'sA', 'codex', deps);
+    const b = runAdapterInstall(w.store, 'sB', 'codex', deps);
+    w.child().stderr.emit('data', Buffer.from('npm ERR! code EACCES\n'));
+    w.child().emit('close', 243);
+    assert.deepEqual(await Promise.all([a, b]), [false, false]);
+    assert.equal(w.starts.length, 1);
+    assert.equal(reconnects, 0);
+    for (const sid of ['sA', 'sB']) {
+      assert.equal(w.store.get(sid)!.phase, 'failed');
+      assert.match(w.store.get(sid)!.error!, /EACCES/);
+      assert.match(w.sent[sid], /npm ERR! code EACCES/);
+    }
+  });
+
+  test('不同引擎 / 不同机器不合并；一个订阅者的回调抛错不影响别的', async () => {
+    const shared = createSharedInstalls();
+    let n = 0;
+    const got: string[] = [];
+    const start = (broadcast: (s: string) => void) => { n += 1; broadcast('x'); return Promise.resolve({ ok: true as const }); };
+    shared.join('local|claude', () => { throw new Error('窗口没了'); }, (broadcast) => new Promise((r) => setImmediate(() => { broadcast('y'); r({ ok: true }); })));
+    shared.join('local|claude', (c) => got.push(c), start);
+    await Promise.all([shared.join('local|codex', () => {}, start).promise, shared.join('graviton|claude', () => {}, start).promise]);
+    assert.equal(n, 2);
+    await new Promise((r) => setImmediate(r));
+    assert.deepEqual(got, ['y']);
+  });
+
+  test('主进程的 acp:install-adapter 用共享安装：输出交给 broadcast，不再只绑第一次点的那条会话', () => {
+    const M = read('src', 'main', 'index.ts');
+    const at = M.indexOf("ipcMain.handle('acp:install-adapter'");
+    const body = M.slice(at, at + 4000);
+    assert.match(M, /const adapterInstallsInFlight = createSharedInstalls(<[^>]*>)?\(\)/);
+    assert.match(body, /adapterInstallsInFlight\.join\(key, send,/);
+    assert.match(body, /installRemoteAdapter\(remote!, engine, broadcast\)/);
+    assert.match(body, /onOutput: broadcast,/);
   });
 });
 
