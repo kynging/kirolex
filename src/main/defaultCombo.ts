@@ -11,7 +11,7 @@
  */
 import fs from 'node:fs';
 import path from 'node:path';
-import { BUILTIN_COMBO_ID, readMcpCombos, type McpCombo } from './mcpCombos.ts';
+import { BUILTIN_COMBO_ID, findCombo, readMcpCombos, type McpCombo } from './mcpCombos.ts';
 import { readProject } from './projectStore.ts';
 
 const COMBO_ID = /^[A-Za-z0-9_-]{1,64}$/;
@@ -63,7 +63,7 @@ export type DefaultComboResolution = {
  * 设的那个本机没有 → 内置「通用」+ `missing`（不往下一层找：说的是「回退到通用」，就只回退到通用）。
  */
 export function resolveDefaultCombo(
-  combos: Array<Pick<McpCombo, 'id'>>,
+  combos: Array<Pick<McpCombo, 'id' | 'aliases'>>,
   globalId: string | undefined,
   projectId?: string | undefined,
 ): DefaultComboResolution {
@@ -72,7 +72,8 @@ export function resolveDefaultCombo(
   const source = p ? 'project' : g ? 'global' : 'builtin';
   const want = p || g;
   if (!want || want === BUILTIN_COMBO_ID) return { id: BUILTIN_COMBO_ID, source };
-  if (combos.some((c) => c.id === want)) return { id: want, source };
+  /* 记着自建通用原 id（如 general）的也算有 —— 它顶替了内置通用（`findCombo`） */
+  if (findCombo(combos, want)) return { id: want, source };
   return { id: BUILTIN_COMBO_ID, source, missing: want };
 }
 

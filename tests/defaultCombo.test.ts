@@ -87,6 +87,23 @@ describe('该用哪个：项目 > 全局 > 内置通用', () => {
   });
 });
 
+describe('自建通用顶替内置那条时', () => {
+  test('设的是它原来的 id（general）：算有，不报 missing；新会话解析到那条带 MCP 的', async () => {
+    const { pickCombo, readMcpCombos } = await import('../src/main/mcpCombos.ts');
+    const home = tmpHome();
+    withCombos(home);
+    const { combos } = readMcpCombos(home);
+    assert.deepEqual(combos.map((c) => c.id), ['default', 'research']);
+    assert.deepEqual(resolveDefaultCombo(combos, 'general', undefined), { id: 'general', source: 'global' });
+    for (const g of ['general', 'default', '']) {
+      writeGlobalDefaultCombo(cfgPath(home), g);
+      const r = defaultComboForNewSession({ home, configPath: cfgPath(home), engine: 'claude' });
+      assert.equal(r.missing, undefined);
+      assert.deepEqual(Object.keys(pickCombo(combos, r.mcpCombo).mcpServers), ['builder-mcp']);
+    }
+  });
+});
+
 describe('项目覆盖存在 project.json 里', () => {
   test('写默认组合不冲掉工作目录，改工作目录也不冲掉默认组合', () => {
     const home = tmpHome();
@@ -149,13 +166,15 @@ describe('组合编辑器：示例和真实内容分得清', () => {
   const PANE = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'McpCombosPane.tsx'), 'utf-8');
   const MAIN = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
 
-  test('示例本身能通过校验，第一条是「通用（带本机工具）」、用了 forwardFromLocal', async () => {
+  test('示例本身能通过校验，第一条写 id default、替换内置「通用」、用了 forwardFromLocal', async () => {
     const { MCP_COMBOS_TEMPLATE, parseMcpCombos } = await import('../src/main/mcpCombos.ts');
+    assert.match(MCP_COMBOS_TEMPLATE, /"id": "default",\s*"name": "通用"/);
     const r = parseMcpCombos(MCP_COMBOS_TEMPLATE);
     assert.equal(r.ok, true);
     if (!r.ok) return;
-    assert.equal(r.combos[1].name, '通用（带本机工具）');
-    assert.equal(Object.values(r.combos[1].mcpServers).some((s) => s.forwardFromLocal === true), true);
+    assert.deepEqual(r.combos.map((c) => c.id), ['default', 'research']);
+    assert.equal(r.combos[0].name, '通用');
+    assert.equal(Object.values(r.combos[0].mcpServers).some((s) => s.forwardFromLocal === true), true);
   });
 
   test('文件不存在时 main 给的内容是空的，示例单独给', () => {

@@ -110,7 +110,7 @@ import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
-import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
+import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -2108,7 +2108,7 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
     if (profile.mcpCombo && profile.mcpCombo !== BUILTIN_COMBO_ID) {
       sessionNotice(sessionId, tr('⚠️ The combo file has an error ({error}), so this time it starts as "General" with no MCP attached.', { error }));
     }
-  } else if (profile.mcpCombo && combo.id !== profile.mcpCombo) {
+  } else if (profile.mcpCombo && combo !== findCombo(combos, profile.mcpCombo)) {
     sessionNotice(sessionId, tr('⚠️ Combo "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
   }
   return combo;
@@ -10478,7 +10478,7 @@ app.whenReady().then(async () => {
     return {
       combos: combos.map((c) => ({ id: c.id, name: comboDisplayName(c), ...(c.effort ? { effort: c.effort } : {}) })),
       current: pickCombo(combos, picked).id,
-      ...(picked && !combos.some((c) => c.id === picked) ? { missing: picked } : {}),
+      ...(picked && !findCombo(combos, picked) ? { missing: picked } : {}),
       ...(error ? { error } : {}),
     };
   });
@@ -10499,8 +10499,9 @@ app.whenReady().then(async () => {
     const projectValue = name ? (projectStore.readProject(os.homedir(), name).defaultMcpCombo || '') : undefined;
     return {
       combos: combos.map((c) => ({ id: c.id, name: comboDisplayName(c) })),
-      global,
-      ...(projectValue !== undefined ? { project: projectValue } : {}),
+      /* 记的是自建通用的原 id（如 general）时，下拉里那条现在是 default：按它显示，别显示成「本机没有」 */
+      global: findCombo(combos, global)?.id ?? global,
+      ...(projectValue !== undefined ? { project: findCombo(combos, projectValue)?.id ?? projectValue } : {}),
       effective: resolveDefaultCombo(combos, global, projectValue),
       ...(error ? { error } : {}),
     };
@@ -10540,7 +10541,7 @@ app.whenReady().then(async () => {
   const switchMcpComboImpl = async (sessionId: string, comboId: string, fromPending?: boolean): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-mcp-combo'); if (advRefused) throw new Error(advRefused); }
     const { combos } = readMcpCombos(os.homedir());
-    const combo = combos.find((c) => c.id === comboId);
+    const combo = findCombo(combos, comboId);
     if (!combo) throw new Error(tr('Combo "{id}" not found (did the combo file change? Reopen the dropdown and check).', { id: comboId }));
     const nextCombo = combo.id === BUILTIN_COMBO_ID ? undefined : combo.id;
     const onlyEngines = tr('Combos only apply to Claude Code / Codex sessions.');
@@ -10554,7 +10555,7 @@ app.whenReady().then(async () => {
     }
     if (engineOf(oldEntry.profile) === 'kiro') throw new Error(onlyEngines);
     if (reconfiguringSessions.has(sessionId)) throw new Error(tr('Another switch (model / agent / machine) has not finished yet.'));
-    if ((oldEntry.profile.mcpCombo || BUILTIN_COMBO_ID) === combo.id) return { ok: true, current: combo.id, unchanged: true };
+    if (findCombo(combos, oldEntry.profile.mcpCombo || BUILTIN_COMBO_ID)?.id === combo.id) return { ok: true, current: combo.id, unchanged: true };
 
     await awaitAttachIdle(sessionId);
     reconfiguringSessions.add(sessionId);
@@ -10721,7 +10722,7 @@ app.whenReady().then(async () => {
     /* 组合记的是 id（见 switchMcpComboImpl）：说给人看时换成当前语言的显示名 */
     const shown = (kind: PendingKind, label: string): string => {
       if (kind !== 'combo') return label;
-      const c = readMcpCombos(os.homedir()).combos.find((x) => x.id === label);
+      const c = findCombo(readMcpCombos(os.homedir()).combos, label);
       return c ? comboDisplayName(c) : label;
     };
     const describe = (kinds: PendingKind[]) => entries.filter((e) => kinds.includes(e.kind))

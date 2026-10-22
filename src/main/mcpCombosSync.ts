@@ -11,7 +11,7 @@
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';
-import { parseMcpCombos } from './mcpCombos.ts';
+import { BUILTIN_COMBO, BUILTIN_COMBO_ID, parseMcpCombos } from './mcpCombos.ts';
 import { tr, trIn } from './uiText.ts';
 
 /** 相对 `~/.kirolex` 的路径（也是 S3 key 里 `v1/` 之后那段）。 */
@@ -125,9 +125,15 @@ export function mergeComboTexts(localText: string, remoteText: string): ComboMer
   if (!rp.ok) return { ok: false, error: tr('The combo file in the bucket has an error: {error}', { error: rp.error }) };
   const local = rawList(localText);
   const remote = rawList(remoteText);
-  const ids = new Set(lp.combos.map((c) => c.id));
-  const names = new Set(lp.combos.map((c) => c.name));
-  const localIds = new Set(local.filter(isObj).map((c) => String(c.id)));
+  /*
+    已用的 id / 名字按本机**文件里实际写的**条目算（自建通用在解析出的清单里换成了 default，不能按清单算）。
+    内置「通用」只是占位：桶里的 default 是来覆盖它的，不算撞；别的条目照旧不能和它重名。
+  */
+  const nameOf = (c: Record<string, unknown>): string => (c.id === BUILTIN_COMBO_ID && c.name === undefined ? BUILTIN_COMBO.name : String(c.name).trim());
+  const ids = new Set(local.filter(isObj).map((c) => String(c.id)));
+  const names = new Set(local.filter(isObj).map(nameOf));
+  let builtinShown = !ids.has(BUILTIN_COMBO_ID);
+  const localIds = new Set(ids);
   const out: unknown[] = [...local];
   const added: string[] = [];
   const conflicts: Array<{ id: string; keptAs: string }> = [];
@@ -136,7 +142,7 @@ export function mergeComboTexts(localText: string, remoteText: string): ComboMer
   for (const r of remote) {
     if (!isObj(r)) continue;
     const id = String(r.id);
-    const name = String(r.name).trim();
+    const name = nameOf(r);
     if (out.some((e) => canonical(e) === canonical(r))) continue;   // 一模一样（字段顺序无关）
     /*
       **反方向：桶里这条是另一台电脑合并时给「我这边某条原条目」起的副本** —— 名字是那条的副本名、
@@ -146,7 +152,8 @@ export function mergeComboTexts(localText: string, remoteText: string): ComboMer
     if (out.some((e) => isObj(e) && body(e) === body(r) && isCopyName(name, String(e.name).trim())
       && isCopyIdOf(id, String(e.id)))) continue;
     let entry: Record<string, unknown> = r;
-    if (ids.has(id) || names.has(name)) {
+    /* 本机没写 default 时内置「通用」在清单里：别的条目不能叫「通用」；default 本身是来覆盖它的 */
+    if (ids.has(id) || names.has(name) || (builtinShown && id !== BUILTIN_COMBO_ID && name === BUILTIN_COMBO.name)) {
       /*
         之前合并时**生成过**这一份副本 → 不再加。只认能确认是副本的：内容一样、名字正是合并时起的那种名字
         （「<原名>（另一台电脑的版本[ n]）」，两种语言都认），id 是 `<id>-n`，或者是原 id
@@ -165,7 +172,8 @@ export function mergeComboTexts(localText: string, remoteText: string): ComboMer
       if (localIds.has(id)) conflicts.push({ id, keptAs: newId });
     }
     ids.add(String(entry.id));
-    names.add(String(entry.name).trim());
+    names.add(nameOf(entry));
+    if (entry.id === BUILTIN_COMBO_ID) builtinShown = false;
     out.push(entry);
     added.push(String(entry.id));
   }

@@ -399,3 +399,57 @@ describe('S3 同步接线', () => {
     assert.equal(MCP_COMBOS_REL, 'mcp-combos.json');
   });
 });
+
+describe('合并：本机的自建通用顶替了内置通用时', () => {
+  test('桶里同 id（general）内容不同：照样换成 general-2，合并结果能过校验（原 id 也算本机已用）', () => {
+    const local = JSON.stringify([{ id: 'general', name: '通用（带本机工具）', mcpServers: {} }]);
+    const remote = JSON.stringify([{ id: 'general', name: 'Other', mcpServers: { a: { url: 'https://x.example.com/mcp' } } }]);
+    const r = mergeComboTexts(local, remote);
+    assert.equal(r.ok, true, r.ok ? '' : r.error);
+    if (!r.ok) return;
+    assert.deepEqual(r.added, ['general-2']);
+    assert.equal(parseMcpCombos(r.text).ok, true);
+  });
+});
+
+describe('合并：桶里有覆盖内置通用的 default（审查意见）', () => {
+  const tools = { 'builder-mcp': { command: 'builder-mcp', forwardFromLocal: true } };
+  const parsed = (t: string) => { const p = parseMcpCombos(t); assert.equal(p.ok, true, p.ok ? '' : p.error); return p.ok ? p.combos : []; };
+
+  test('本机只有 research、桶里 default 带 MCP：原样并进来（不改成 default-2），解析后通用就是它', () => {
+    const r = mergeComboTexts(text([research]), text([{ id: 'default', name: 'My tools', mcpServers: tools }]));
+    assert.equal(r.ok, true, r.ok ? '' : r.error);
+    if (!r.ok) return;
+    assert.deepEqual(r.added, ['default']);
+    assert.deepEqual(r.conflicts, []);
+    const combos = parsed(r.text);
+    assert.deepEqual(combos.map((c) => c.id), ['default', 'research']);
+    assert.equal(combos[0].name, 'My tools');
+    assert.deepEqual(Object.keys(combos[0].mcpServers), ['builder-mcp']);
+  });
+
+  test('桶里 default 不写 name：同样原样并进来，名字是「通用」', () => {
+    const r = mergeComboTexts(text([research]), text([{ id: 'default', mcpServers: tools }]));
+    assert.equal(r.ok, true, r.ok ? '' : r.error);
+    if (!r.ok) return;
+    assert.deepEqual(r.added, ['default']);
+    const combos = parsed(r.text);
+    assert.equal(combos[0].name, '通用');
+    assert.deepEqual(Object.keys(combos[0].mcpServers), ['builder-mcp']);
+  });
+
+  test('两边都写了 default、内容不同：真冲突照旧 —— 本机的留在 default，桶里那份换成 default-2', () => {
+    const r = mergeComboTexts(text([{ id: 'default', mcpServers: {} }]), text([{ id: 'default', mcpServers: tools }]));
+    assert.equal(r.ok, true, r.ok ? '' : r.error);
+    if (!r.ok) return;
+    assert.deepEqual(r.conflicts, [{ id: 'default', keptAs: 'default-2' }]);
+    assert.deepEqual(parsed(r.text).map((c) => c.id), ['default', 'default-2']);
+  });
+
+  test('本机没写 default 时，桶里别的条目叫「通用」照旧要改名（和内置通用重名）', () => {
+    const r = mergeComboTexts(text([research, { id: 'mine', name: '通用 A' }]), text([{ id: 'x', name: '通用' }]));
+    assert.equal(r.ok, true, r.ok ? '' : r.error);
+    if (!r.ok) return;
+    assert.notEqual(JSON.parse(r.text).find((c: any) => c.id === 'x').name, '通用');
+  });
+});

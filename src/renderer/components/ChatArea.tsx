@@ -4775,7 +4775,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         {comboView.missing && <option value={comboView.missing.id} disabled>{comboView.missing.label}</option>}
                         {(mcpCombos?.combos || [{ id: 'default', name: t('General purpose') }]).map((c) => (
                           /* 内置组合的名字在这里按当前语言取：清单是进会话时拉的，那一刻的语言不一定是现在的 */
-                          <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.id === 'default' ? t('General purpose') : c.name })}</option>
+                          <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.name })}</option>
                         ))}
                       </select>
                       {pendingSwitch?.combo !== undefined && <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.('combo')} />}

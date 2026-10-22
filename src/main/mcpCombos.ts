@@ -18,6 +18,8 @@
  * ```
  *
  * 内置一个「通用」（id `default`，没有 MCP、不设 effort）永远排第一；文件不存在时就只有它。
+ * 文件里写了 `id: "default"` 的条目就用它**取代**内置那条（同样排第一）；没写 default、但恰好有一条照「插入示例」
+ * 建的自建通用（`findGeneralLikeCombo`）时，也让它顶替内置那条 —— 下拉里只留一条通用（见 `parseMcpCombos`）。
  * 这个模块不碰 electron，路径作为参数传入（测试用临时目录）。
  */
 import fs from 'node:fs';
@@ -46,6 +48,11 @@ export interface McpCombo {
   /** 对应 ACP `thought_level` 的值；不写 = 沿用会话记住的 / 引擎默认 */
   effort?: string;
   mcpServers: Record<string, McpComboServer>;
+  /**
+   * 顶替内置「通用」的那条自建通用在文件里原来的 id（如 `general`）。它在清单里的 id 是 `default`，
+   * 记着原 id 的会话 / 设置也解析到它（`findCombo`）。
+   */
+  aliases?: string[];
 }
 
 export const BUILTIN_COMBO: McpCombo = Object.freeze({ id: BUILTIN_COMBO_ID, name: '通用', mcpServers: Object.freeze({}) as Record<string, McpComboServer> });
@@ -55,7 +62,8 @@ export const BUILTIN_COMBO: McpCombo = Object.freeze({ id: BUILTIN_COMBO_ID, nam
  * 跟着界面语言变会让同一份文件在两种语言下一个过、一个不过；只在显示时换成当前语言。
  */
 export function comboDisplayName(combo: Pick<McpCombo, 'id' | 'name'>): string {
-  return combo.id === BUILTIN_COMBO_ID ? tr('General') : combo.name;
+  /* 覆盖内置的那条（文件里的 default / 自建通用）有自己的名字就显示它；没写名字时名字就是「通用」 */
+  return combo.id === BUILTIN_COMBO_ID && combo.name === BUILTIN_COMBO.name ? tr('General') : combo.name;
 }
 
 export function mcpCombosPath(home: string): string {
@@ -64,13 +72,13 @@ export function mcpCombosPath(home: string): string {
 
 /**
  * 面板里「插入示例」插进去的样板（文件不存在时**不**直接显示成内容 —— 看着像「投研」已经配好了）。
- * 第一条是「通用（带本机工具）」的写法：`forwardFromLocal: true` 的 MCP 在远程会话里经本机转发（本机起、远端用），
+ * 第一条写 `id: "default"`，直接替换内置的「通用」（让通用带上本机工具）：`forwardFromLocal: true` 的 MCP 在远程会话里经本机转发（本机起、远端用），
  * 本地会话里照常直接用；http 型（如 context7）不需要转发。
  */
 export const MCP_COMBOS_TEMPLATE = `[
   {
-    "id": "general",
-    "name": "通用（带本机工具）",
+    "id": "default",
+    "name": "通用",
     "mcpServers": {
       "builder-mcp": { "command": "builder-mcp", "forwardFromLocal": true },
       "context7": { "url": "https://mcp.context7.com/mcp" }
@@ -166,27 +174,50 @@ function jsonSyntaxError(text: string): string {
   return tr('Invalid JSON: syntax error near line {line}, column {col} (a missing quote or comma?)', { line: before.length, col: before[before.length - 1].length + 1 });
 }
 
+/**
+ * **照「插入示例」建的自建通用**是哪一条：`id` 为 `general`，或名字以「通用」/ General 开头。
+ * 恰好一条才算（返回下标）；没有或不止一条 → -1（不迁移，维持现状）。纯函数，`raw` 是文件里的列表原样。
+ */
+export function findGeneralLikeCombo(raw: unknown[]): number {
+  const hits: number[] = [];
+  raw.forEach((c, i) => {
+    if (!isObj(c)) return;
+    const name = typeof c.name === 'string' ? c.name.trim() : '';
+    if (c.id === 'general' || name.startsWith('通用') || /^general/i.test(name)) hits.push(i);
+  });
+  return hits.length === 1 ? hits[0] : -1;
+}
+
 export type ParseResult = { ok: true; combos: McpCombo[] } | { ok: false; error: string };
 
-/** 解析 + 校验。成功时返回的清单第一个永远是内置「通用」。 */
+/**
+ * 解析 + 校验。成功时返回的清单第一个永远是 id `default` 的「通用」：文件里写了 `id: "default"` 就是那条；
+ * 没写但有一条自建通用（`findGeneralLikeCombo`）就是它（id 换成 `default`，原 id 记进 `aliases`）；都没有是内置那条。
+ * 只影响返回的清单，文件本身不改（它跟着 S3 同步，别的电脑可能是旧版本）。
+ */
 export function parseMcpCombos(text: string): ParseResult {
   let raw: unknown;
   try { raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch {
     return { ok: false, error: jsonSyntaxError(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) };
   }
   if (!Array.isArray(raw)) return { ok: false, error: tr('The file must contain a list of combos ([ ... ])') };
-  const combos: McpCombo[] = [BUILTIN_COMBO];
-  const ids = new Set<string>([BUILTIN_COMBO_ID]);
-  const names = new Set<string>([BUILTIN_COMBO.name]);
+  const hasOverride = raw.some((c) => isObj(c) && c.id === BUILTIN_COMBO_ID);
+  const generalAt = hasOverride ? -1 : findGeneralLikeCombo(raw);
+  const replaced = hasOverride || generalAt >= 0;
+  const combos: McpCombo[] = replaced ? [] : [BUILTIN_COMBO];
+  const ids = new Set<string>(replaced ? [] : [BUILTIN_COMBO_ID]);
+  const names = new Set<string>(replaced ? [] : [BUILTIN_COMBO.name]);
   for (let i = 0; i < raw.length; i += 1) {
     const c = raw[i];
     const at = tr('Combo #{n}', { n: i + 1 });
     if (!isObj(c)) return { ok: false, error: tr('{at} must be an object', { at }) };
     if (typeof c.id !== 'string' || !COMBO_ID.test(c.id)) return { ok: false, error: tr('{at}: id must be 1-64 letters, digits, - or _', { at }) };
-    if (c.id === BUILTIN_COMBO_ID) return { ok: false, error: tr('{at}: id "{id}" is reserved for the built-in "General" combo; pick another', { at, id: BUILTIN_COMBO_ID }) };
     if (ids.has(c.id)) return { ok: false, error: tr('{at}: id "{id}" is a duplicate', { at, id: c.id }) };
-    if (typeof c.name !== 'string' || !c.name.trim()) return { ok: false, error: tr('{at} ({id}) has no name (the name shown in the dropdown)', { at, id: c.id }) };
-    const name = c.name.trim();
+    const isDefault = c.id === BUILTIN_COMBO_ID;
+    /* 覆盖内置的那条可以不写名字 —— 显示「通用」 */
+    const rawName = isDefault && c.name === undefined ? BUILTIN_COMBO.name : c.name;
+    if (typeof rawName !== 'string' || !rawName.trim()) return { ok: false, error: tr('{at} ({id}) has no name (the name shown in the dropdown)', { at, id: c.id }) };
+    const name = rawName.trim();
     if (names.has(name)) return { ok: false, error: tr('{at}: name "{name}" is a duplicate (the dropdown could not tell them apart)', { at, name }) };
     if (c.effort !== undefined && (typeof c.effort !== 'string' || !c.effort.trim())) return { ok: false, error: tr('{at} ({name}): effort must be a non-empty string, or omitted', { at, name }) };
     if (c.mcpServers !== undefined && !isObj(c.mcpServers)) return { ok: false, error: tr('{at} ({name}): mcpServers must be an object (name → config)', { at, name }) };
@@ -197,11 +228,14 @@ export function parseMcpCombos(text: string): ParseResult {
     }
     ids.add(c.id);
     names.add(name);
-    combos.push({
-      id: c.id, name,
+    const asGeneral = isDefault || i === generalAt;
+    const combo: McpCombo = {
+      id: asGeneral ? BUILTIN_COMBO_ID : c.id, name,
       ...(typeof c.effort === 'string' ? { effort: c.effort.trim() } : {}),
       mcpServers: servers as Record<string, McpComboServer>,
-    });
+      ...(i === generalAt ? { aliases: [c.id] } : {}),
+    };
+    if (asGeneral) combos.unshift(combo); else combos.push(combo);
   }
   return { ok: true, combos };
 }
@@ -252,9 +286,15 @@ export function saveMcpCombos(home: string, text: string): ParseResult {
   return { ok: true, combos: back.combos };
 }
 
+/** 按 id 找（顶替内置通用的那条，记着它原 id 的也算）；找不到 → undefined */
+export function findCombo<T extends Pick<McpCombo, 'id' | 'aliases'>>(combos: T[], id: string | undefined): T | undefined {
+  if (!id) return undefined;
+  return combos.find((c) => c.id === id) || combos.find((c) => c.aliases?.includes(id));
+}
+
 /** 按 id 找；没选 / 找不到（被删了）→ 通用 */
 export function pickCombo(combos: McpCombo[], id: string | undefined): McpCombo {
-  return (id && combos.find((c) => c.id === id)) || combos.find((c) => c.id === BUILTIN_COMBO_ID) || BUILTIN_COMBO;
+  return findCombo(combos, id) || combos.find((c) => c.id === BUILTIN_COMBO_ID) || BUILTIN_COMBO;
 }
 
 /** 展开 `${env:NAME}`。缺的变量记进 `missing`（空字符串算"有"）。 */

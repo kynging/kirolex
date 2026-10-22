@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  BUILTIN_COMBO_ID, parseMcpCombos, readMcpCombos, saveMcpCombos, mcpCombosPath, pickCombo,
+  BUILTIN_COMBO, BUILTIN_COMBO_ID, parseMcpCombos, readMcpCombos, saveMcpCombos, mcpCombosPath, pickCombo, findCombo, findGeneralLikeCombo, comboDisplayName,
   buildAcpMcpServers, expandEnvRefs, maskAcpServers, planComboEffort, applyComboEffort, defaultEffort,
 } from '../src/main/mcpCombos.ts';
 
@@ -84,17 +84,18 @@ describe('组合文件解析和校验', () => {
     if (!r.ok) assert.match(r.error, /列表/);
   });
 
-  test('id 重复、名字缺失、占用内置 id 都拒绝，并指出是第几个', () => {
+  test('id 重复、名字缺失、和内置通用重名都拒绝，并指出是第几个', () => {
     const dup = parseMcpCombos(JSON.stringify([{ id: 'a', name: 'A' }, { id: 'a', name: 'B' }]));
     assert.equal(dup.ok, false);
     if (!dup.ok) assert.match(dup.error, /第 2 个.*重复/);
     const noName = parseMcpCombos(JSON.stringify([{ id: 'a' }]));
     assert.equal(noName.ok, false);
     if (!noName.ok) assert.match(noName.error, /name/);
-    const reserved = parseMcpCombos(JSON.stringify([{ id: BUILTIN_COMBO_ID, name: 'X' }]));
-    assert.equal(reserved.ok, false);
-    if (!reserved.ok) assert.match(reserved.error, /保留/);
-    const sameName = parseMcpCombos(JSON.stringify([{ id: 'a', name: '通用' }]));
+    /* id default 不再是保留的：它取代内置「通用」（见下面「自建通用顶替内置那条」） */
+    const override = parseMcpCombos(JSON.stringify([{ id: BUILTIN_COMBO_ID, name: 'X' }]));
+    assert.equal(override.ok, true);
+    /* 只有一条叫「通用」时它顶替内置那条（自建通用）；两条都像通用时不迁移，和内置「通用」重名照样拒绝 */
+    const sameName = parseMcpCombos(JSON.stringify([{ id: 'a', name: '通用' }, { id: 'b', name: 'B通用' }, { id: 'c', name: '通用 2' }]));
     assert.equal(sameName.ok, false);
   });
 
@@ -343,5 +344,105 @@ describe('接线（源码扫描）', () => {
     const h = M.slice(M.indexOf('const switchMcpComboImpl = async'));
     assert.match(h.slice(0, 2000), /queueSwitchWhileBusy\(sessionId, 'combo'/);
     assert.ok(h.indexOf('client.newSession(') < h.indexOf('retireExecutor(oldEntry.client)'));
+  });
+});
+
+describe('自建「通用」顶替内置那条（下拉只留一条通用）', () => {
+  const MINE = {
+    'builder-mcp': { command: '/Users/x/.toolbox/bin/builder-mcp', forwardFromLocal: true },
+    'agentcore-websearch': { type: 'stdio', command: '/Users/x/.local/bin/mcp-proxy-for-aws', args: ['a'], forwardFromLocal: true },
+    context7: { url: 'https://mcp.context7.com/mcp' },
+  };
+  const parse = (list: unknown[]) => {
+    const r = parseMcpCombos(JSON.stringify(list));
+    assert.equal(r.ok, true, r.ok ? '' : r.error);
+    return r.ok ? r.combos : [];
+  };
+
+  test('判据（纯函数）：id general 或名字以「通用」/ General 开头；只认恰好一条', () => {
+    assert.equal(findGeneralLikeCombo([{ id: 'research', name: '投研' }]), -1);
+    assert.equal(findGeneralLikeCombo([{ id: 'research', name: '投研' }, { id: 'general', name: 'X' }]), 1);
+    assert.equal(findGeneralLikeCombo([{ id: 'mine', name: '通用（带本机工具）' }]), 0);
+    assert.equal(findGeneralLikeCombo([{ id: 'mine', name: 'General (local tools)' }]), 0);
+    assert.equal(findGeneralLikeCombo([{ id: 'general', name: 'A' }, { id: 'b', name: '通用2' }]), -1);
+    assert.equal(findGeneralLikeCombo([null, 'x', { id: 'research', name: '投研' }]), -1);
+  });
+
+  test('① 没有 default 也没有通用写法：内置在第一，和以前一样', () => {
+    const combos = parse([{ id: 'research', name: '投研' }]);
+    assert.equal(combos[0], BUILTIN_COMBO);
+    assert.deepEqual(combos.map((c) => c.id), [BUILTIN_COMBO_ID, 'research']);
+  });
+
+  test('② id default：取代内置、不报错，排第一；不写 name 显示「通用」', () => {
+    const combos = parse([{ id: 'research', name: '投研' }, { id: 'default', name: '我的通用', mcpServers: MINE }]);
+    assert.deepEqual(combos.map((c) => c.id), [BUILTIN_COMBO_ID, 'research']);
+    assert.equal(combos[0].name, '我的通用');
+    assert.equal(comboDisplayName(combos[0]), '我的通用');
+    assert.deepEqual(Object.keys(combos[0].mcpServers), Object.keys(MINE));
+    const noName = parse([{ id: 'default', mcpServers: MINE }]);
+    assert.equal(noName.length, 1);
+    assert.equal(comboDisplayName(noName[0]), '通用');
+    /* 内置那条仍是 default，名字照旧 */
+    assert.equal(BUILTIN_COMBO.id, 'default');
+    assert.equal(comboDisplayName(BUILTIN_COMBO), '通用');
+  });
+
+  test('② 有覆盖时，别的条目也可以叫「通用」以外的名字；名字和覆盖条目重复照样报', () => {
+    const r = parseMcpCombos(JSON.stringify([{ id: 'default', name: 'A' }, { id: 'b', name: 'A' }]));
+    assert.equal(r.ok, false);
+  });
+
+  test('③ id general 名为「通用（带本机工具）」：当作通用，下拉只一条', () => {
+    const combos = parse([{ id: 'general', name: '通用（带本机工具）', mcpServers: MINE }, { id: 'research', name: '投研' }]);
+    assert.deepEqual(combos.map((c) => c.id), [BUILTIN_COMBO_ID, 'research']);
+    assert.equal(comboDisplayName(combos[0]), '通用（带本机工具）');
+    assert.deepEqual(combos[0].aliases, ['general']);
+  });
+
+  test('④ 两条都像通用：不迁移，维持现状', () => {
+    const combos = parse([{ id: 'general', name: '通用（带本机工具）' }, { id: 'g2', name: 'General 2' }]);
+    assert.deepEqual(combos.map((c) => c.id), [BUILTIN_COMBO_ID, 'general', 'g2']);
+    assert.equal(combos[0], BUILTIN_COMBO);
+  });
+
+  test('⑤ default 写两次：报重复', () => {
+    const r = parseMcpCombos(JSON.stringify([{ id: 'default', name: 'A' }, { id: 'default', name: 'B' }]));
+    assert.equal(r.ok, false);
+    if (!r.ok) assert.match(r.error, /第 2 个.*重复/);
+  });
+
+  test('有 default 时不再迁移 general（两条都留）', () => {
+    const combos = parse([{ id: 'default', name: 'A' }, { id: 'general', name: '通用（带本机工具）' }]);
+    assert.deepEqual(combos.map((c) => c.id), [BUILTIN_COMBO_ID, 'general']);
+    assert.equal(combos[0].name, 'A');
+  });
+
+  test('会话记着 general / default / 什么都没记：②③下解析到同一条，mcpServers 是文件里那几条', () => {
+    for (const list of [
+      [{ id: 'default', name: '通用', mcpServers: MINE }, { id: 'research', name: '投研' }],
+      [{ id: 'general', name: '通用（带本机工具）', mcpServers: MINE }, { id: 'research', name: '投研' }],
+    ]) {
+      const combos = parse(list);
+      const picks = ['general', 'default', undefined].map((id) => pickCombo(combos, id));
+      for (const p of picks) {
+        assert.equal(p, combos[0]);
+        assert.deepEqual(Object.keys(p.mcpServers), ['builder-mcp', 'agentcore-websearch', 'context7']);
+      }
+      assert.equal(findCombo(combos, 'research')?.id, 'research');
+    }
+    /* ② 下没有 general 这条：记着 general 的会话找不到（按通用跑），不是同一条的别名 */
+    const over = parse([{ id: 'default', name: '通用', mcpServers: MINE }]);
+    assert.equal(findCombo(over, 'general'), undefined);
+  });
+
+  test('读盘不改写文件本身', () => {
+    const home = fs.mkdtempSync(path.join(os.tmpdir(), 'kirolex-combo-general-'));
+    const text = JSON.stringify([{ id: 'general', name: '通用（带本机工具）', mcpServers: MINE }]);
+    fs.mkdirSync(path.dirname(mcpCombosPath(home)), { recursive: true });
+    fs.writeFileSync(mcpCombosPath(home), text);
+    const r = readMcpCombos(home);
+    assert.equal(r.combos.length, 1);
+    assert.equal(fs.readFileSync(mcpCombosPath(home), 'utf-8'), text);
   });
 });

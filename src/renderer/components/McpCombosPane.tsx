@@ -84,14 +84,14 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">
-            {t('A list of combos: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed.')}
+            {t('A list of combos: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed; a combo with id default replaces the built-in "General".')}
           </div>
           {loading ? (
             <div className="agent-config-editor-message">{t('Loading…')}</div>
           ) : empty ? (
             <div className="agent-config-editor-message mcp-combos-empty">
               <div>{t('No custom combos yet: right now there is only the built-in "General" (no MCP). mcp-combos.json does not exist.')}</div>
-              <div className="kiro-config-hint">{t('Insert example puts an example in the editor (a "General (with local tools)" combo using forwardFromLocal, plus a "Research" combo); edit it, then Save to create the file.')}</div>
+              <div className="kiro-config-hint">{t('Insert example puts an example in the editor (a "General" combo with local tools using forwardFromLocal, plus a "Research" combo); writing id default replaces the built-in "General". Edit it, then Save to create the file.')}</div>
               <div>
                 <button className="btn allow" onClick={() => setContent(formatJsonOnOpen(template))} disabled={!template}>{t('Insert example')}</button>
               </div>
