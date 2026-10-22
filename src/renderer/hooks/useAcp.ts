@@ -3,7 +3,7 @@ import { consumeHandoff } from '../handoffDraft';
 import { type SubagentRow } from '../../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
-import { sessionsToWarm } from '../projectActivity';
+import { remoteWarmCut, sessionsToWarm } from '../projectActivity';
 import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
 import { messageVariants, normalizeLang, pinShown, t as translate, type Lang } from '../i18n';
@@ -1961,7 +1961,18 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
          * reading exactly one of them. Everything else stays visible but cold and attaches on the click
          * (`warmSession` for a chat, `onWarmProject` for a group), which is 「等用户点开project再创建连接」.
          */
-        const warmIds = new Set(sessionsToWarm(sessionsRef.current, { now: Date.now(), limit, keepId: lastSid }));
+        /**
+         * REMOTE SESSIONS: ONLY THE VISIBLE ONES AND THE MOST RECENTLY USED — 「启动时不要一口气自动 attach 一大批远程会话」.
+         * All remote sessions on one machine share one ssh connection whose session count sshd caps (MaxSessions,
+         * default 10); 8 kiro-cli started together at launch filled it (`remoteWarmCut`). The rest attach on the click.
+         */
+        let splitIds: string[] = [];
+        try { const raw = uiGet('kirolex-split-session'); const v = raw ? JSON.parse(raw) : []; if (Array.isArray(v)) splitIds = v; } catch {}
+        const warmIds = new Set(remoteWarmCut(
+          sessionsToWarm(sessionsRef.current, { now: Date.now(), limit, keepId: lastSid }),
+          sessionsRef.current,
+          { visible: [lastSid, ...splitIds] },
+        ));
         toAttach = sessionsRef.current.filter((s) => warmIds.has(s.id));
         toAttach.forEach((s) => { if (!attachedIdsRef.current.has(s.id)) markConnecting(s.id); });
         // Let React paint the hydrated sidebar/transcript before the window shows.

@@ -140,6 +140,11 @@ export function masterArgs(opts: {
   /** 远端监听端口；默认 0 = 让 sshd 分（见文件头「远端端口让 sshd 分」）。 */
   remotePort?: number;
   localPort: number;
+  /**
+   * 要不要带反向隧道（默认要）。**备用主连接**（`openSpare`）不带：隧道在第一条上，
+   * 远端那个端口对这台机器上所有进程都通，走哪条连接起的执行器都能用它。
+   */
+  forward?: boolean;
 }): string[] {
   assertSafeSshHost(opts.sshHost);
   const args = [
@@ -155,11 +160,11 @@ export function masterArgs(opts: {
     /* `Allocated port N` 是 INFO 级的 —— 用户 ~/.ssh/config 里写了 LogLevel QUIET/ERROR 就看不到它 */
     '-o', 'LogLevel=INFO',
     '-o', 'StrictHostKeyChecking=accept-new',
-    '-o', 'ExitOnForwardFailure=yes',
+    ...(opts.forward === false ? [] : ['-o', 'ExitOnForwardFailure=yes']),
     '-o', 'ControlMaster=yes',
     '-o', 'ControlPersist=no',
     '-o', `ControlPath=${opts.socket}`,
-    '-R', `127.0.0.1:${opts.remotePort ?? 0}:127.0.0.1:${opts.localPort}`,
+    ...(opts.forward === false ? [] : ['-R', `127.0.0.1:${opts.remotePort ?? 0}:127.0.0.1:${opts.localPort}`]),
   ];
   /* 和 buildSshArgs 同一条：密码错了就失败，别让 askpass 用同一个答案被问三次 */
   if (opts.passwordCipher) args.push('-o', 'NumberOfPasswordPrompts=1');
@@ -204,6 +209,40 @@ export function parseAllocatedPort(stderr: string): number | undefined {
   }
   return port;
 }
+
+/**
+ * **ssh 报错 → 种类**（纯函数）——「Session open refused by peer」。
+ *
+ * 一台机器的所有执行器共用一条复用连接，每个执行器占它上面一个 session；sshd 默认 `MaxSessions 10`。
+ * 满了之后再开，mux 客户端报 `mux_client_request_session: session request failed: Session open refused by peer`，
+ * 有的版本 / 路径上是 channel 的 `administratively prohibited: open failed`。2026-10-22 实测（tokyo-arm）：
+ * 正好 10 个执行器时切换组合、远端清理全报这句，界面上只看到一句英文。
+ */
+export type SshErrorKind = 'sessions-full' | 'other';
+export function sshErrorKind(stderr: string): SshErrorKind {
+  const s = String(stderr || '');
+  if (/Session open refused by peer|administratively prohibited: open failed/i.test(s)) return 'sessions-full';
+  return 'other';
+}
+
+/** 会话数满了、而且再开一条主连接也没救时给人看的那句话。 */
+export function sessionsFullMessage(host: string): string {
+  return tr('{host} has run out of SSH sessions (sshd MaxSessions, default 10). Running "Install AI tools" for this machine in Settings raises the limit to 64; or close a few remote sessions you are not using.', { host });
+}
+
+/** 备用主连接的 ControlPath：原路径后加序号（第一条备用是 `-2`）。短 —— 见 `controlPath` 那段长度限制。 */
+export function spareControlPath(base: string, n: number): string {
+  return `${base}-${n}`;
+}
+
+/** 一台机器最多再开几条备用主连接。sshd 默认一条 10 个 session，三条备用 = 再多 30 个执行器。 */
+export const MAX_SPARES = 3;
+
+/**
+ * 一条连接被判"满了"之后多久再回去试它 —— 那上面的执行器会退，空位会回来。
+ * 判错的代价只是一次被拒、马上换一条重试，所以不必精确数 session。
+ */
+export const FULL_COOLDOWN_MS = 60_000;
 
 /** socket 在不在（`ControlPath` 是个 unix socket 文件）。 */
 export function socketExists(socket: string): boolean {
@@ -297,6 +336,8 @@ export interface MuxDeps {
    * 而测试里没有真 socket，照 12 秒等就是让整个测试套慢 12 秒。
    */
   socketWaitMs?: number;
+  /** 现在几点（默认 `Date.now`）。可注入只为测试：「满了」的冷却按它算。 */
+  now?(): number;
 }
 
 /**
@@ -323,6 +364,14 @@ export class SshMux {
   private lastTarget = new Map<string, { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }>();
   private deps: MuxDeps;
   private dir: string;
+  /**
+   * **备用主连接**（每台机器 0..MAX_SPARES 条）—— 第一条的 session 满了才开（`openSpare`）。
+   * 不带隧道、不自愈：它们只是"多几个 session 的位置"，死了就不用，下次满了再开。
+   */
+  private spares = new Map<string, MuxEntry[]>();
+  private sparesStarting = new Map<string, Promise<string | undefined>>();
+  /** socket → 什么时候被 sshd 拒过（`markFull`）。冷却期内新执行器绕开它。 */
+  private fullAt = new Map<string, number>();
 
   constructor(deps: MuxDeps, dir = path.join(os.tmpdir(), MUX_DIR)) {
     this.deps = deps;
@@ -343,10 +392,102 @@ export class SshMux {
    * 而那是一条**明确的错误**，不是静默降级。所以这里宁可快也不要"可能是活的"。
    */
   liveSocketFor(target: { sshHost: string; sshPort?: number }): string | undefined {
-    const e = this.entries.get(muxKey(target.sshHost, target.sshPort));
+    const key = muxKey(target.sshHost, target.sshPort);
+    const e = this.entries.get(key);
     if (!e) return undefined;
     if (e.proc.killed || e.proc.exitCode !== null) return undefined;
-    return e.socket;
+    /*
+      **优先用有空位的那条** —— 第一条最近被 sshd 拒过（session 满了）就先走备用的；
+      全都满着就还给第一条（被拒之后调用方会 `openSpare` 再开一条，或者把报错说成人话）。
+    */
+    if (!this.isFull(e.socket)) return e.socket;
+    const spare = (this.spares.get(key) || []).find((s) => alive(s) && !this.isFull(s.socket));
+    return spare ? spare.socket : e.socket;
+  }
+
+  private now(): number {
+    return this.deps.now ? this.deps.now() : Date.now();
+  }
+
+  private isFull(socket: string): boolean {
+    const at = this.fullAt.get(socket);
+    if (at === undefined) return false;
+    if (this.now() - at >= FULL_COOLDOWN_MS) { this.fullAt.delete(socket); return false; }
+    return true;
+  }
+
+  /** 这条连接刚被 sshd 拒开 session（`sshErrorKind` = sessions-full）：冷却期内新执行器绕开它。 */
+  markFull(socket: string): void {
+    if (socket) this.fullAt.set(socket, this.now());
+  }
+
+  /**
+   * **第一条满了，再开一条主连接** —— 换一个 ControlPath（原路径加序号），不带隧道。
+   *
+   * 返回能用的那条 socket；开不了（第一条都不在、备用到顶、建不起来）返回 undefined，
+   * 调用方据此把报错说成人话（`sessionsFullMessage`）。几条会话同时撞上满时共用同一次建立。
+   */
+  async openSpare(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<string | undefined> {
+    if (!muxSupported(this.deps.platform)) return undefined;
+    const key = muxKey(target.sshHost, target.sshPort);
+    const main = this.entries.get(key);
+    if (!main || !alive(main)) return undefined;
+    const free = (this.spares.get(key) || []).find((s) => alive(s) && !this.isFull(s.socket));
+    if (free) return free.socket;
+    const pending = this.sparesStarting.get(key);
+    if (pending) return pending;
+    const p = this.startSpare(key, main.socket, target).finally(() => { this.sparesStarting.delete(key); });
+    this.sparesStarting.set(key, p);
+    return p;
+  }
+
+  private async startSpare(key: string, base: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<string | undefined> {
+    const list = (this.spares.get(key) || []).filter(alive);
+    this.spares.set(key, list);
+    if (list.length >= MAX_SPARES) {
+      this.deps.log('warn', `${key} 的备用复用连接已经开到 ${MAX_SPARES} 条，都满了 —— 不再开`);
+      return undefined;
+    }
+    const used = new Set(list.map((x) => x.socket));
+    let n = 2;
+    while (used.has(spareControlPath(base, n))) n += 1;
+    const socket = spareControlPath(base, n);
+    if (!(await this.probe(socket))) clearStaleSocket(socket);
+    const localPort = this.deps.localPort();
+    const args = masterArgs({ ...target, socket, localPort, forward: false });
+    const proc = (this.deps.spawnSsh || ((a: string[]) => spawn('ssh', a, { stdio: ['ignore', 'pipe', 'pipe'], env: sshEnv(target) })))(args);
+    const entry: MuxEntry = { key, socket, remotePort: 0, localPort, proc, stderr: '' };
+    let exited = false;
+    proc.stderr?.on('data', (d: Buffer) => {
+      const t = d.toString('utf-8').trim();
+      if (t) entry.stderr = `${entry.stderr}\n${t}`.slice(-2000);
+    });
+    proc.on('exit', (code) => {
+      exited = true;
+      const cur = this.spares.get(key);
+      if (cur) this.spares.set(key, cur.filter((x) => x !== entry));
+      this.fullAt.delete(socket);
+      clearStaleSocket(socket);
+      this.deps.log('info', `${key} 的备用复用连接 ${socket} 退出了（code=${code}）`);
+    });
+    const ok = await waitFor(async () => exited || await this.probe(socket), this.deps.socketWaitMs ?? 12_000);
+    /* 等的时候这台机器被 close 了（第一条也没了）：不登记 */
+    if (!this.entries.has(key)) {
+      try { proc.kill(); } catch { /* 已经没了 */ }
+      clearStaleSocket(socket);
+      return undefined;
+    }
+    if (!ok || exited) {
+      try { proc.kill(); } catch { /* 已经没了 */ }
+      this.deps.log('warn', `${key} 备用复用连接没建起来：${entry.stderr.trim() || '(ssh 没输出)'}`);
+      return undefined;
+    }
+    const now = this.spares.get(key) || [];
+    now.push(entry);
+    this.spares.set(key, now);
+    this.deps.log('info', `${key} 第一条复用连接的 session 满了（sshd MaxSessions）—— 另开了一条 ${socket}`
+      + `（现在共 ${1 + now.length} 条；新执行器优先走有空位的那条）`);
+    return socket;
   }
 
   private probe(socket: string): Promise<boolean> {
@@ -433,6 +574,8 @@ export class SshMux {
     const old = this.entries.get(key);
     if (old) { try { old.proc.kill(); } catch { /* 已经没了 */ } this.entries.delete(key); }
     const socket = this.socketFor(key);
+    /* 重建的是一条新连接，上一条"满了"的记号不算它的 */
+    this.fullAt.delete(socket);
     fs.mkdirSync(this.dir, { recursive: true, mode: 0o700 });
     if (!(await this.probe(socket))) clearStaleSocket(socket);
 
@@ -529,6 +672,13 @@ export class SshMux {
     this.lastTarget.delete(key);
     const t = this.healTimers.get(key);
     if (t) { clearTimeout(t); this.healTimers.delete(key); }
+    /* 备用的一起关 —— 它们没有自愈，留着就是孤儿连接 */
+    for (const x of this.spares.get(key) || []) {
+      try { x.proc.kill(); } catch { /* 已经没了 */ }
+      this.fullAt.delete(x.socket);
+      clearStaleSocket(x.socket);
+    }
+    this.spares.delete(key);
     /* 正在建的那条也要杀 —— 它还不在 entries 里 */
     const pending = this.startingProcs.get(key);
     if (pending) {
@@ -538,6 +688,7 @@ export class SshMux {
     const e = this.entries.get(key);
     if (!e) return;
     this.entries.delete(key);
+    this.fullAt.delete(e.socket);
     try { e.proc.kill(); } catch { /* 已经没了 */ }
     clearStaleSocket(e.socket);
   }
@@ -549,10 +700,14 @@ export class SshMux {
       只遍历 entries 会把它的定时器留下来 —— 退出时那个 `unref` 过的定时器不挡退出，
       但在"关掉所有连接"之后又把一条连接拉起来，那是个说不通的状态。
     */
-    for (const key of new Set([...this.entries.keys(), ...this.wanted, ...this.startingProcs.keys()])) this.close(key);
+    for (const key of new Set([...this.entries.keys(), ...this.wanted, ...this.startingProcs.keys(), ...this.spares.keys()])) this.close(key);
   }
 
   keys(): string[] { return [...this.entries.keys()]; }
+}
+
+function alive(e: MuxEntry): boolean {
+  return !e.proc.killed && e.proc.exitCode === null;
 }
 
 /** 轮着等一个条件成立。`probeSocket` 本身就有超时，所以这里间隔可以短。 */

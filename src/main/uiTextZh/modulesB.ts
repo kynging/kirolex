@@ -148,6 +148,8 @@ export const ZH_MODULES_B: Record<string, string> = {
   'The shared connection to {host} was closed while it was being set up': '{host} 的复用连接在建立过程中被关掉了',
   'The shared connection to {host} could not be set up. {detail}': '{host} 的复用连接没建起来。{detail}',
   '(ssh printed nothing)': '（ssh 没有输出）',
+  '{host} has run out of SSH sessions (sshd MaxSessions, default 10). Running "Install AI tools" for this machine in Settings raises the limit to 64; or close a few remote sessions you are not using.':
+    '{host} 的 SSH 会话数满了（sshd MaxSessions，默认 10）。在设置里对这台机器跑一次『安装 AI 工具』会把上限调到 64；或者关掉几条不用的远程会话。',
   // ── remoteLocalTools.ts ──
   'No free remote ports left ({from}–{to}).': '没有空闲的远端端口了（{from}–{to}）。',
   // ── remotePreflight.ts ──

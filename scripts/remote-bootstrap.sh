@@ -425,26 +425,45 @@ fi
 # 老那台 EC2 被拖到 CPU 100%、sshd 握手超时，就是这类垃圾越积越多。
 #
 # 30 秒探一次、连续 4 次没回就断 = 2 分钟内回收，子进程随之收到 SIGHUP。
-# 先 `sshd -t` 再 reload：配置写坏了就还原，reload 不断现有连接。
+#
+# 顺带把 `MaxSessions` 调到 64：KiroLex 一台机器共用一条复用连接（sshMux.ts），每个执行器
+# （kiro-cli acp / claude-agent-acp / codex-acp）占它上面一个 session，而 sshd 默认只给 10 个。
+# 2026-10-22 实测：正好 10 个执行器时再起一个就报 `Session open refused by peer`。
+# 两项**分别**判断：已经有 ClientAlive、但没有 MaxSessions 的老机器也要补上。
+#
+# 先 `sshd -t` 再 reload：配置写坏了就还原，reload 不断现有连接（MaxSessions 对新连接才生效）。
 step "sshd 回收死连接"
 F=/etc/ssh/sshd_config.d/60-kirolex.conf
 if sudo -n true 2>/dev/null; then
-  if sudo grep -qs '^ClientAliveInterval' "$F"; then
+  NEED_ALIVE=0; NEED_SESS=0
+  sudo grep -qs '^ClientAliveInterval' "$F" || NEED_ALIVE=1
+  sudo grep -qs '^MaxSessions' "$F" || NEED_SESS=1
+  if [ "$NEED_ALIVE" = 0 ] && [ "$NEED_SESS" = 0 ]; then
     say "→ 已配置（$F）"
   else
     sudo cp -a "$F" /tmp/60-kirolex.conf.bak 2>/dev/null || sudo rm -f /tmp/60-kirolex.conf.bak
-    printf '%s\n' '# KiroLex：让 sshd 自己发现已经死掉的客户端（见 remote-bootstrap.sh）' \
-      'ClientAliveInterval 30' 'ClientAliveCountMax 4' | sudo tee -a "$F" >/dev/null
-    if sudo sshd -t 2>/dev/null; then
-      sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null || true
-      say "→ 已开：30 秒探一次，2 分钟内回收死连接"
-    else
+    if [ "$NEED_ALIVE" = 1 ]; then
+      printf '%s\n' '# KiroLex：让 sshd 自己发现已经死掉的客户端（见 remote-bootstrap.sh）' \
+        'ClientAliveInterval 30' 'ClientAliveCountMax 4' | sudo tee -a "$F" >/dev/null
+    fi
+    if [ "$NEED_SESS" = 1 ]; then
+      printf '%s\n' '# KiroLex：一条复用连接上最多 64 个会话（默认 10，执行器一多就被拒）' \
+        'MaxSessions 64' | sudo tee -a "$F" >/dev/null
+    fi
+    if ! sudo sshd -t 2>/dev/null; then
       if [ -f /tmp/60-kirolex.conf.bak ]; then sudo cp -a /tmp/60-kirolex.conf.bak "$F"; else sudo rm -f "$F"; fi
-      note_fail "sshd 配置校验没过，已还原 —— 死连接不会被自动回收"
+      note_fail "sshd 配置校验没过，已还原 —— 死连接不会被自动回收、会话数上限还是默认的 10"
+    elif sudo systemctl reload sshd 2>/dev/null || sudo systemctl reload ssh 2>/dev/null; then
+      if [ "$NEED_ALIVE" = 1 ]; then say "→ 已开：30 秒探一次，2 分钟内回收死连接"; fi
+      if [ "$NEED_SESS" = 1 ]; then say "→ 已开：一条连接最多 64 个会话（新连接生效）"; fi
+    else
+      # reload 没成功 = 正在跑的 sshd 还是旧配置；文件也还原，别留一份「看着改了、其实没生效」的配置
+      if [ -f /tmp/60-kirolex.conf.bak ]; then sudo cp -a /tmp/60-kirolex.conf.bak "$F"; else sudo rm -f "$F"; fi
+      note_fail "sshd 重新加载失败（systemctl reload sshd / ssh 都没成功），已还原 —— 死连接不会被自动回收、会话数上限还是默认的 10"
     fi
   fi
 else
-  say "→ 跳过：没有免密 sudo。建议手动加 ClientAliveInterval 30 / ClientAliveCountMax 4"
+  say "→ 跳过：没有免密 sudo。建议手动加 ClientAliveInterval 30 / ClientAliveCountMax 4 / MaxSessions 64"
 fi
 
 step "自检"

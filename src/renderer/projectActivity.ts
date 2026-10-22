@@ -186,6 +186,36 @@ export function sessionsToWarm(sessions: WarmCandidate[], opts: WarmOptions): st
   return live.slice(0, Math.max(0, limit)).map((s) => s.id);
 }
 
+/** 启动时除了看得见的那几条，远程会话再多连几条「最近用过的」。 */
+export const RECENT_REMOTE_WARM = 2;
+
+/**
+ * **启动时远程会话只连看得见的和最近用过的** ——「启动时不要一口气自动 attach 一大批远程会话」。
+ *
+ * 2026-10-22 实测（tokyo-arm）：启动时一起起来 8 个 kiro-cli，加上 2 个 claude-agent-acp，正好用完那台机器
+ * ssh 复用连接上的 10 个 session（sshd `MaxSessions` 默认值），之后切换组合就报 `Session open refused by peer`。
+ * 一台机器的所有远程会话共用一条连接，所以「Unassigned 一律预热」的代价落在远程会话上是成倍的。
+ *
+ * 在 `sessionsToWarm` 选出的候选里再筛一道（**只减不加**，上限规则不变）：本机会话原样保留；远程会话只留
+ * `visible`（落屏那条 + 分屏里的）和其余候选里最近活动的 `recent` 条。剩下的点开再连（`warmSession`）。
+ * 顺序不变 —— 落屏那条在最前的约定由 `sessionsToWarm` 定，这里不打乱。
+ */
+export function remoteWarmCut(
+  ids: string[],
+  sessions: Array<{ id: string; timestamp: number; remoteHost?: string }>,
+  opts: { visible: Array<string | null | undefined>; recent?: number },
+): string[] {
+  const byId = new Map(sessions.map((s) => [s.id, s]));
+  const isRemote = (id: string): boolean => !!byId.get(id)?.remoteHost;
+  const visible = new Set(opts.visible.filter(Boolean) as string[]);
+  const recent = new Set(
+    ids.filter((id) => isRemote(id) && !visible.has(id))
+      .sort((a, b) => (Number(byId.get(b)?.timestamp) || 0) - (Number(byId.get(a)?.timestamp) || 0))
+      .slice(0, Math.max(0, opts.recent ?? RECENT_REMOTE_WARM)),
+  );
+  return ids.filter((id) => !isRemote(id) || visible.has(id) || recent.has(id));
+}
+
 /** 侧栏「展开 = 热的」那一段的账本：`warmed` 里的 project 这次运行里不再热；`baselined` = 启动那一遍已经记过账 */
 export interface WarmLedger {
   warmed: Set<string>;

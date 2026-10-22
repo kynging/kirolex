@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
-import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree } from './acp-client';
+import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
@@ -11,7 +11,7 @@ import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersis
 import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath } from './adapterInstall.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
-import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
+import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
 import {
@@ -2669,20 +2669,32 @@ function runProbe(machine: string, script: string): Promise<string> {
 
 /** 在远端跑一条命令并**拿回 stdout**（`writeRemoteFile` 丢掉输出）。 */
 function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer?: number): Promise<string> {
-  return new Promise((resolve, reject) => {
-    execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
-      /* 默认 60 秒够所有探测用；`kiro-cli update` 要下一个几十 MB 的二进制，调用方会放宽 */
-      /* `maxBuffer`：读大文件的调用方（「复制到本机」）要放宽，默认 1 MiB 装不下 base64 之后的正文 */
-      { timeout: timeoutMs, encoding: 'utf8', env: sshEnv(remote), ...(maxBuffer ? { maxBuffer } : {}) },
-      (err, stdout, stderr) => {
-        if (err && !String(stdout || '')) {
-          /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
-          const real = String(stderr || err.message).split('\n').map((l) => l.trim())
-            .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*/.test(l))[0];
-          reject(new Error(real || String(err.message)));
-        } else resolve(String(stdout || ''));
-      });
-  });
+  return once(false);
+  function once(sparedOnce: boolean): Promise<string> {
+    const socket = sshMux.liveSocketFor(remote);
+    return new Promise((resolve, reject) => {
+      execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
+        /* 默认 60 秒够所有探测用；`kiro-cli update` 要下一个几十 MB 的二进制，调用方会放宽 */
+        /* `maxBuffer`：读大文件的调用方（「复制到本机」）要放宽，默认 1 MiB 装不下 base64 之后的正文 */
+        { timeout: timeoutMs, encoding: 'utf8', env: sshEnv(remote), ...(maxBuffer ? { maxBuffer } : {}) },
+        (err, stdout, stderr) => {
+          if (err && !String(stdout || '')) {
+            /* 复用连接 session 满了：换一条连接重试一次，还满就说人话（`onMuxSessionsFull`） */
+            if (socket && sshErrorKind(String(stderr || '')) === 'sessions-full') {
+              onMuxSessionsFull(remote, socket, sparedOnce).then((full) => {
+                if (full.retry && !sparedOnce) once(true).then(resolve, reject);
+                else reject(new Error(full.message));
+              }, reject);
+              return;
+            }
+            /* SSH 的后量子告警每次都在，不是原因 —— 认它会让每次失败都指错（踩过） */
+            const real = String(stderr || err.message).split('\n').map((l) => l.trim())
+              .filter((l) => l && !/post-quantum|store now, decrypt later|openssh\.com|^\*\*/.test(l))[0];
+            reject(new Error(real || String(err.message)));
+          } else resolve(String(stdout || ''));
+        });
+    });
+  }
 }
 
 /** 在远端跑一条 shell 命令，内容从 stdin 送进去（JSON 走命令行是引号地狱）。 */
@@ -3081,6 +3093,29 @@ let muxWarned = false;
 /* 每条 ssh 都先问一句"这台机器有没有现成的连接" —— 有就当 channel 走，没有照旧建新的 */
 setMuxSocketResolver((remote) => (remote?.sshHost ? sshMux.liveSocketFor(remote) : undefined));
 
+/**
+ * **复用连接的 session 满了**（sshd `MaxSessions`，默认 10）——「Session open refused by peer」。
+ *
+ * 2026-10-22 实测（tokyo-arm）：那条主连接下正好 10 个执行器，切换组合、远端清理全报这句英文。
+ * 先把那条标成满的、再开一条主连接（`sshMux.openSpare`，换一个 ControlPath）让调用方重试一次；
+ * 重试也满了（或开不出来）就说人话、写日志。执行器（`AcpClient.connect`）、预检、远端命令共用这一个。
+ */
+async function onMuxSessionsFull(remote: RemoteTarget, failedSocket: string | undefined, final: boolean): Promise<{ retry: boolean; message: string }> {
+  const host = labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost;
+  if (failedSocket) sshMux.markFull(failedSocket);
+  if (!final && failedSocket) {
+    const spare = await sshMux.openSpare(remote).catch(() => undefined);
+    if (spare) {
+      logger.info('remote', `${remote.sshHost}: 复用连接 ${failedSocket} 的 session 满了（Session open refused by peer）—— 改走另开的 ${spare} 重试一次`);
+      return { retry: true, message: '' };
+    }
+  }
+  const message = sessionsFullMessage(host);
+  logger.warn('remote', `${remote.sshHost}: ${message}（ssh 报 Session open refused by peer；${final ? '换了一条连接重试也满' : '没能再开一条主连接'}）`);
+  return { retry: false, message };
+}
+setMuxSessionsFullHandler(onMuxSessionsFull);
+
 /** 哪几台机器的规格已经报过了 —— 同一条信息不必每次 attach 都刷一遍。 */
 const remoteSpecsLogged = new Set<string>();
 /** 每台机器最近一次报的 kiro-cli 版本（preflight 顺路带回来的）。 */
@@ -3341,9 +3376,12 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
       throw new Error(recent);
     }
   }
-  const args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
+  let args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
   let verdict = { code: 'unreachable', message: tr('Can\'t connect to {host}', { host }) } as ReturnType<typeof judgePreflight>;
+  /** session 满了换连接重试过没有（只重试一次，见 `onMuxSessionsFull`） */
+  let sparedOnce = false;
   for (let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt += 1) {
+    const socket = sshMux.liveSocketFor(remote);
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
       execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(remote) }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
@@ -3352,6 +3390,17 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
       }));
     });
     verdict = judgePreflight(out.code, out.stdout, out.stderr, remote);
+    if (verdict.code === 'unreachable' && socket && sshErrorKind(out.stderr) === 'sessions-full') {
+      const full = await onMuxSessionsFull(remote, socket, sparedOnce);
+      if (full.retry && !sparedOnce) {
+        sparedOnce = true;
+        args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
+        attempt -= 1;   // 换了连接的这一次不算一次失败
+        continue;
+      }
+      verdict = { code: 'unreachable', message: full.message, raw: full.message };
+      break;
+    }
     logger.info('remote', `preflight ${host}: ${verdict.code} — ${verdict.message}`
       + (attempt > 1 ? `（第 ${attempt}/${PREFLIGHT_ATTEMPTS} 次）` : ''));
     if (verdict.code === 'ok') {

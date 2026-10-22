@@ -12,6 +12,7 @@ import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './
 import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 import { tr } from './uiText.ts';
+import { sshErrorKind, sessionsFullMessage } from './sshMux.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
 
 interface JsonRpcRequest {
@@ -175,6 +176,8 @@ export class AcpClient extends EventEmitter {
   private localTools?: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] };
   /** 最近一点 stderr —— ssh 退出码 255 的**原因**在里面（见 stderr 处理那一段）。 */
   private lastStderr = '';
+  /** 这次起执行器走的复用连接（`ControlPath`）；没走复用是 undefined。 */
+  private muxSocket?: string;
   /**
    * **会话接线之前**的 stderr —— MCP server 起不来正好发生在这一段。
    *
@@ -262,7 +265,47 @@ export class AcpClient extends EventEmitter {
     return out;
   }
 
+  /**
+   * 起执行器。远端那台的复用连接 **session 满了**（sshd `MaxSessions`，见 `sshErrorKind`）时
+   * 让主进程再开一条主连接（`setMuxSessionsFullHandler`），在新连接上**重试一次**；
+   * 还不行就把那句 `Session open refused by peer` 换成人话。
+   */
   async connect(): Promise<any> {
+    try {
+      return await this.connectOnce();
+    } catch (err) {
+      if (!this.sessionsFull()) throw err;
+      const first = await this.onSessionsFull(false);
+      if (!first.retry) throw new Error(first.message);
+      /* 上一次的进程已经退了：清掉它留下的东西，从头再起一次（这次 buildSshArgs 会挑到新那条） */
+      this.process = null;
+      this.buffer = '';
+      this.lastStderr = '';
+      if (this.earlyStderr) this.earlyStderr = [];
+      try {
+        return await this.connectOnce();
+      } catch (err2) {
+        if (!this.sessionsFull()) throw err2;
+        throw new Error((await this.onSessionsFull(true)).message);
+      }
+    }
+  }
+
+  private sessionsFull(): boolean {
+    return !!this.remote?.sshHost && sshErrorKind(this.lastStderr) === 'sessions-full';
+  }
+
+  private async onSessionsFull(final: boolean): Promise<{ retry: boolean; message: string }> {
+    const remote = this.remote!;
+    if (!muxSessionsFullHandler) return { retry: false, message: sessionsFullMessage(remote.sshHost) };
+    try {
+      return await muxSessionsFullHandler(remote, this.muxSocket, final);
+    } catch {
+      return { retry: false, message: sessionsFullMessage(remote.sshHost) };
+    }
+  }
+
+  private connectOnce(): Promise<any> {
     return new Promise((resolve, reject) => {
       let command: string;
       let args: string[];
@@ -368,6 +411,10 @@ export class AcpClient extends EventEmitter {
        *   · 或者 `touch ~/.kirolex/kiro-trace`（下一次起执行器就生效，不必从终端启动 app）
        * 关掉就把那个文件删掉。开着的时候 `failureBundle` 会多抄一段日志（见那边的 tailBytes）。
        */
+      /* 走的是哪条复用连接 —— session 满了时要把**这一条**标成满的（见 `connect`） */
+      this.muxSocket = command === 'ssh'
+        ? args.find((a) => a.startsWith('ControlPath='))?.slice('ControlPath='.length)
+        : undefined;
       /* 远端：给 ssh 带上密码（没配密码时 sshEnv 原样返回） */
       const env = this.remote?.sshHost ? sshEnv(this.remote, this.env) : { ...this.env };
       if (this.engine === 'kiro' && kiroTraceEnabled()) env.KIRO_LOG_LEVEL = 'trace';
@@ -400,6 +447,12 @@ export class AcpClient extends EventEmitter {
 
       this.process.on('close', (code) => {
         this.emit('disconnected', { code });
+        /*
+          sshd 拒开 session 时 ssh 几十毫秒就退了，那时 initialize 还没发出去（下面那 500ms），
+          不在这里直接失败的话要白等 initialize 的 45 秒超时才轮到 `connect` 去开第二条连接。
+          已经连上的那种走不到这里的效果（promise 已经定了，reject 是空操作）。
+        */
+        if (this.sessionsFull()) reject(new Error(this.lastStderr.trim()));
         /*
           **`code 0` 要说成"退出了"，不是"失败了"** ——「重连会话好像也会被当作失败处理？」
 
@@ -435,7 +488,10 @@ export class AcpClient extends EventEmitter {
       });
 
       // Send initialize
+      const spawned = this.process;
       setTimeout(async () => {
+        /* 这一次已经失败、`connect` 换了一条连接重起了：别把 initialize 发给新那个进程（它自己会发） */
+        if (this.process !== spawned) { reject(new Error(tr('Process not connected'))); return; }
         try {
           // Bounded handshake. The default request timeout (120s) meant a RETIRED
           // model — kiro-cli never answers initialize for one — stalled the whole
@@ -1119,6 +1175,18 @@ export function parseRemotePid(chunk: string): number | undefined {
 let muxSocketResolver: ((remote: RemoteTarget) => string | undefined) | undefined;
 export function setMuxSocketResolver(fn?: (remote: RemoteTarget) => string | undefined): void {
   muxSocketResolver = fn;
+}
+
+/**
+ * **复用连接 session 满了怎么办** —— 由主进程注入（它手上有 `sshMux` 和机器名）。
+ *
+ * `final = false`：把那条连接标成满的、试着再开一条主连接；`retry: true` 就在新连接上重起一次。
+ * `final = true`（重试也满了）：只要那句人话（并写日志）。没注入时直接给人话、不重试。
+ */
+export type MuxSessionsFullHandler = (remote: RemoteTarget, failedSocket: string | undefined, final: boolean) => Promise<{ retry: boolean; message: string }>;
+let muxSessionsFullHandler: MuxSessionsFullHandler | undefined;
+export function setMuxSessionsFullHandler(fn?: MuxSessionsFullHandler): void {
+  muxSessionsFullHandler = fn;
 }
 
 export function buildSshArgs(
