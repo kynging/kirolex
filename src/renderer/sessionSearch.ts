@@ -71,3 +71,12 @@ export function searchSessions<T extends Searchable>(sessions: T[], query: strin
     idle: false,
   };
 }
+
+/**
+ * 回车打开的「第一条」：按侧栏**显示顺序**传进来的各组（项目组… → 未分组 → 已归档），取第一条。
+ * 不是 `hits[0]` —— 那是输入数组的顺序，和你眼睛看到的最上面那条不一定是同一条。
+ */
+export function firstShown<T>(groups: T[][]): T | undefined {
+  for (const g of groups) if (g.length) return g[0];
+  return undefined;
+}

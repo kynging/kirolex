@@ -467,6 +467,51 @@ button, input, select, textarea {
   flex-shrink: 0;
 }
 
+/* 「新建会话」下面那个常驻搜会话框：和新建项目输入框同一套底色/字号，左右边距对齐上面那排按钮 */
+.sidebar-search {
+  position: relative;
+  margin: 0 12px 8px;
+  flex-shrink: 0;
+}
+.sidebar-search-input {
+  width: 100%;
+  box-sizing: border-box;
+  background: var(--input-bg);
+  border: 1px solid var(--border);
+  border-radius: 4px;
+  padding: 5px 26px 5px 8px;
+  color: var(--text-primary);
+  font-size: 13px;
+  outline: none;
+}
+.sidebar-search-input:focus {
+  border-color: var(--accent);
+}
+.sidebar-search-clear {
+  position: absolute;
+  right: 4px;
+  top: 50%;
+  transform: translateY(-50%);
+  width: 20px;
+  height: 20px;
+  padding: 0;
+  border: none;
+  border-radius: 4px;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: 11px;
+  cursor: pointer;
+}
+.sidebar-search-clear:hover {
+  background: var(--bg-hover);
+  color: var(--text-primary);
+}
+.sidebar-search-empty {
+  padding: 8px 16px;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+
 /* Folders */
 .folder-group {
   margin-bottom: 2px;
@@ -9293,42 +9338,11 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .user-turn-group > .steer-failed { margin-left: auto; width: fit-content; max-width: 70%; margin-bottom: 6px; }
 
 
-/* 找会话弹框 / 会话信息弹框（沿用 .rename-popup 的外框） */
-.rename-popup.session-finder,
+/* 会话信息弹框（沿用 .rename-popup 的外框） */
 .rename-popup.session-info {
   width: 480px;
   max-width: calc(100vw - 40px);
 }
-.session-finder-list {
-  max-height: 320px;
-  overflow-y: auto;
-  margin: -6px 0 4px;
-}
-.session-finder-item {
-  padding: 6px 8px;
-  border-radius: 6px;
-  cursor: pointer;
-}
-.session-finder-item:hover {
-  background: var(--bg-hover);
-}
-.session-finder-title {
-  font-size: 13px;
-  color: var(--text-primary);
-  display: flex;
-  gap: 8px;
-  align-items: baseline;
-}
-.session-finder-project {
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.session-finder-id {
-  font-family: var(--font-mono, ui-monospace, Consolas, monospace);
-  font-size: 11px;
-  color: var(--text-muted);
-}
-.session-finder-empty,
 .session-info-note {
   font-size: 12px;
   color: var(--text-muted);

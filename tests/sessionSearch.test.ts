@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { searchSessions } from '../src/renderer/sessionSearch.ts';
+import { searchSessions, firstShown } from '../src/renderer/sessionSearch.ts';
 
 const S = [
   { id: 'a', title: 'W33 周报草稿', projectId: '周报' },
@@ -88,5 +88,17 @@ describe('finding a chat by its id', () => {
   test('title search still works alongside id search', () => {
     assert.deepEqual(searchSessions(IDS, '灾备').hits.map((s) => s.id), ['s_1760000000000_ab12cd']);
     assert.deepEqual(searchSessions(IDS, 'dl006j').projects, ['P']);
+  });
+});
+
+describe('回车打开「第一条」= 侧栏里排在最上面的那条命中', () => {
+  test('按分组的显示顺序取，跳过没有命中的空组', () => {
+    // 侧栏按 项目组… → 未分组 → 已归档 的顺序画；回车打开的应该是你眼睛看到的第一条，不是输入数组里的第一条。
+    assert.equal(firstShown([[], [{ id: 'x' }, { id: 'y' }], [{ id: 'z' }]])?.id, 'x');
+  });
+
+  test('一条都没有命中时是 undefined（回车什么也不做）', () => {
+    assert.equal(firstShown([[], [], []]), undefined);
+    assert.equal(firstShown([]), undefined);
   });
 });

@@ -91,8 +91,8 @@ describe('接线：菜单项、信息面板、按 id 找会话', () => {
     assert.match(block, /store\.sessionDirPath\(/);
   });
 
-  test('找会话的框用的是 searchSessions（同一份「什么算命中」，含 id）', () => {
-    assert.match(SIDEBAR, /searchSessions\(sessions, finderQuery\)/);
-    assert.ok(SIDEBAR.includes("t('Find chat by title or id…')"));
+  test('侧栏搜会话框用的是 searchSessions（同一份「什么算命中」，含 id）', () => {
+    assert.match(SIDEBAR, /searchSessions\(sessions, query\)/);
+    assert.ok(SIDEBAR.includes("t('Search chats (title / project / id)')"));
   });
 });

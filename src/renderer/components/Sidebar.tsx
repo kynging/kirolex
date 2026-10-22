@@ -4,7 +4,7 @@ import { restoreGetJson, restoreSet } from '../uiRestore';
 const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
-import { searchSessions } from '../sessionSearch';
+import { searchSessions, firstShown } from '../sessionSearch';
 import { sessionInfoRows, sessionInfoText, type SessionInfo } from '../sessionInfo';
 import { placeMenu, placeSubmenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
@@ -619,18 +619,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   /** 为什么刚才那一拖没生效 —— 静默拒绝会被当成「拖不动」 */
   const [dropRefusal, setDropRefusal] = useState<string | null>(null);
   /**
-   * 搜会话的查询词。**现在没有入口了**（那个输入框按要求去掉了），所以它恒为空串 ——
-   * 于是 `searchSessions` 恒返回 `idle`，侧栏显示完整列表、折叠规则照旧。
-   * 留着这个变量而不是把过滤代码一并删掉：判据本身是对的，换入口时不必重写。
+   * 搜会话的查询词 ——「新建会话」下面那个常驻搜索框（标题 / 项目名 / **id**：整串、前缀、最后 6 位）。
+   * 左下角原来那个 🔍「找会话」弹框按「找会话应该新建会话下面显示一个搜索框就完了」删了（2026-10-22）。
+   * 空串时 `searchSessions` 返回 `idle`：侧栏是完整列表、折叠规则照旧；有字时只留命中的会话和它们所在的组。
    */
-  const [query] = useState('');
-  /**
-   * 「找会话」弹框（标题 / 项目名 / **id**）——「会话搜索框支持直接粘 id 定位到那条会话」。
-   * 侧栏常驻的那个框按要求去掉了（见上），所以这里是一个点 🔍 才出现的弹框，不改侧栏的列表和折叠。
-   * 判据和上面同一份 `searchSessions`。
-   */
-  const [finderOpen, setFinderOpen] = useState(false);
-  const [finderQuery, setFinderQuery] = useState('');
+  const [query, setQuery] = useState('');
   /** 「会话信息」弹框：开着的是哪条会话，以及主进程 `acp:session-info` 回来的东西 */
   const [infoFor, setInfoFor] = useState<string | null>(null);
   const [info, setInfo] = useState<{ ok: boolean; error?: string; info?: SessionInfo } | null>(null);
@@ -1035,6 +1028,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
 
   const unassigned = sortForDisplay(activeSessions.filter((s) => !s.projectId));
 
+  /**
+   * 搜索期间**没有命中的组不画**（含「未分组」「已归档」这两个平时常驻的桶）：留着一排空组，命中的那几条
+   * 就被挤在中间找不着。空框时一个不少，和原来一样。
+   */
+  const projectSessions = (p: string) => sortForDisplay(activeSessions.filter((s) => s.projectId === p));
+  const shownProjects = search.idle ? assignedProjects : assignedProjects.filter((p) => activeSessions.some((s) => s.projectId === p));
+  /** 回车打开的那条：侧栏上从上往下第一条命中（见 `firstShown`） */
+  const firstHit = search.idle ? undefined : firstShown([...shownProjects.map(projectSessions), unassigned, archivedSessions]);
+
   const confirmNewProject = () => {
     if (newProjectName.trim()) onCreateProject(newProjectName.trim());
     setCreatingProject(false);
@@ -1062,14 +1064,35 @@ export const Sidebar: React.FC<SidebarProps> = ({
           ＋ {t('New Project')}
         </button>
       </div>
-
-      {/*
-        侧栏原来在这里有一个「搜会话…」的输入框 —— 「左侧这里不要弄搜索框」，去掉了。
-
-        **只去掉入口，不去掉能力**：过滤那一套（`searchSessions`，一个有测试的纯模块）留着，
-        因为"什么算命中"和"命中的组要自己展开"这两条判据本身是对的，以后要给它换个入口（命令面板、
-        顶栏）时不必重写。`query` 恒为空串 → `search.idle` 恒为真 → 侧栏就是完整列表、折叠照旧生效。
-      */}
+      <div className="sidebar-search">
+        {/*
+          搜会话 ——「找会话应该新建会话下面显示一个搜索框就完了」（2026-10-22，替掉左下角的 🔍 弹框）。
+          输入即过滤（`searchSessions`：标题 / 项目名 / id 的整串、前缀、最后 6 位），命中的组自己展开；
+          回车打开侧栏上第一条命中，Esc 清空并失焦。空框 = 完整列表、折叠照旧。
+        */}
+        <input
+          className="sidebar-search-input no-drag"
+          value={query}
+          placeholder={t('Search chats (title / project / id)')}
+          aria-label={t('Search chats (title / project / id)')}
+          spellCheck={false}
+          onChange={(e) => setQuery(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter' && firstHit) onSwitchSession(firstHit.id);
+            else if (e.key === 'Escape') { setQuery(''); e.currentTarget.blur(); }
+          }}
+        />
+        {query && (
+          <button
+            className="sidebar-search-clear no-drag"
+            onClick={() => setQuery('')}
+            title={t('Clear')}
+            aria-label={t('Clear')}
+          >
+            ✕
+          </button>
+        )}
+      </div>
       {/* 拖拽被拒的原因：静默不动会被当成「拖不动」 */}
       {dropRefusal && (
         <div className="sb-refusal" onClick={() => setDropRefusal(null)} title={t('Dismiss')}>⚠ {dropRefusal}</div>
@@ -1101,15 +1124,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
             </div>
           )}
 
+          {/* 搜了但一条都没中：明说，空白列表会被当成「侧栏坏了 / 会话没了」 */}
+          {!search.idle && search.hits.length === 0 && (
+            <div className="sidebar-search-empty">{t('No matching chats')}</div>
+          )}
+
           {/* Project groups (drop targets for write-once assignment) */}
-          {assignedProjects.map((pName) => (
+          {shownProjects.map((pName) => (
             <ProjectGroup
               key={pName}
               name={pName}
               projectKey={pName}
               isDropTarget
               actionable
-              sessions={sortForDisplay(activeSessions.filter((s) => s.projectId === pName))}
+              sessions={projectSessions(pName)}
               collapsed={isCollapsed(pName)}
               currentSessionId={currentSessionId}
               statusFor={statusFor}
@@ -1128,8 +1156,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
           ))}
 
           {/* Unassigned bucket — ALWAYS visible (even when empty) as a drop
-              target for un-assigning a chat from a project. */}
-          <ProjectGroup
+              target for un-assigning a chat from a project. 搜索期间没命中就不画。 */}
+          {(search.idle || unassigned.length > 0) && (<ProjectGroup
             name={t('Unassigned')}
             projectKey={UNASSIGNED}
             isDropTarget
@@ -1149,18 +1177,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onDelete={onDeleteSession}
             onNewChat={onNewSessionInProject}
             onProjectMenu={handleProjectMenu}
-          />
+          />)}
 
           {/* Archived sessions — ALWAYS visible (even when empty), collapsed by
               default; NOT a drop target. Out of the way, not deleted. */}
-          <ProjectGroup
+          {(search.idle || archivedSessions.length > 0) && (<ProjectGroup
             name={t('Archived')}
             projectKey={ARCHIVED}
             isDropTarget={false}
             actionable={false}
             showCount={false}
             sessions={archivedSessions}
-            collapsed={!collapsed.has(ARCHIVED)}
+            collapsed={search.idle ? !collapsed.has(ARCHIVED) : false}
             currentSessionId={currentSessionId}
             statusFor={statusFor}
             busyFor={busyFor}
@@ -1174,7 +1202,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
             onDelete={onDeleteSession}
             onNewChat={onNewSessionInProject}
             onProjectMenu={handleProjectMenu}
-          />
+          />)}
 
           <DragOverlay dropAnimation={null}>
             {activeId && activeId.startsWith('projorder:') ? (
@@ -1481,15 +1509,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             <IconWorkspaceFolder size={19} className="sidebar-workspace-icon" />
           </button>
-          {/* 找会话（标题 / 项目名 / id）：一个弹框，不是侧栏常驻的搜索框（那个按要求去掉了） */}
-          <button
-            className="sidebar-settings-btn find-session-btn"
-            onClick={() => { setFinderQuery(''); setFinderOpen(true); }}
-            title={t('Find chat by title or id…')}
-            aria-label={t('Find chat')}
-          >
-            🔍
-          </button>
           {/*
             Agent 配置那个按钮搬到会话界面里了（就在选 agent 的下拉旁边）——「放到会话界面，不过这个配置是全局的」。
             放在这排图标里时，它和 🧠、⚙️ 挤在一起，也看不出改的是「当前这个 agent」；而选 agent 本来就在会话那条工具栏上。
@@ -1658,46 +1677,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           </div>
         </>
       )}
-
-      {/* 找会话：标题 / 项目名 / id（整串、前缀、最后 6 位都行）。回车 = 打开第一条 */}
-      {finderOpen && (() => {
-        const found = searchSessions(sessions, finderQuery);
-        const hits = found.idle ? [] : found.hits.slice(0, 30);
-        const pick = (id: string) => { setFinderOpen(false); onSwitchSession(id); };
-        return (
-          <>
-            <div className="overlay" onClick={() => setFinderOpen(false)} />
-            <div className="rename-popup session-finder">
-              <h4>{t('Find chat')}</h4>
-              <input
-                autoFocus
-                className="rename-popup-input session-finder-input"
-                placeholder={t('Find chat by title or id…')}
-                value={finderQuery}
-                onChange={(e) => setFinderQuery(e.target.value)}
-                onKeyDown={(e) => {
-                  if (e.key === 'Enter' && hits[0]) pick(hits[0].id);
-                  else if (e.key === 'Escape') setFinderOpen(false);
-                }}
-              />
-              {!found.idle && (
-                <div className="session-finder-list">
-                  {hits.length === 0 && <div className="session-finder-empty">{t('No matching chats')}</div>}
-                  {hits.map((s) => (
-                    <div key={s.id} className="session-finder-item" onClick={() => pick(s.id)} title={s.id}>
-                      <div className="session-finder-title">
-                        {s.archived ? '🗄️ ' : ''}{displayTitle(lang, s.title) || t('Chat')}
-                        {s.projectId && <span className="session-finder-project">{s.projectId}</span>}
-                      </div>
-                      <div className="session-finder-id">{s.id}</div>
-                    </div>
-                  ))}
-                </div>
-              )}
-            </div>
-          </>
-        );
-      })()}
 
       {/* 会话信息：排查时一次拿全（id、后端会话 id、运行位置、引擎、会话目录），每项点一下复制 */}
       {infoFor && (
