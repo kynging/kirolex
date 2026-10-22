@@ -46,6 +46,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
     engine,
   ),
   loadSession: (sessionId: string, cwd: string, model: string) => ipcRenderer.invoke('acp:load-session', sessionId, cwd, model),
+  /** 会话里「缺 ACP 适配器」提示上的「安装」：本机全局 npm / 远端只装那一个。engine / remoteId 只在还没有记录（新建失败）时用。 */
+  installAdapter: (sessionId: string, engine: string, remoteId?: string) =>
+    ipcRenderer.invoke('acp:install-adapter', sessionId, engine, remoteId),
+  onAdapterInstallOutput: (callback: (d: { sessionId: string; chunk: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:adapter-install-output', handler);
+    return () => ipcRenderer.removeListener('acp:adapter-install-output', handler);
+  },
   primeHistory: (sessionId: string, force?: boolean) =>
     ipcRenderer.invoke('acp:prime-history', sessionId, force),
   /** Called when a chat becomes the active one, so its context is verified (and

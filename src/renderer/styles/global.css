@@ -1827,6 +1827,24 @@ button, input, select, textarea {
 }
 .kirolex-message-body { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
 .kirolex-message-time { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; }
+/* 「没连上：缺 ACP 适配器」提示上的「安装」（ChatArea AdapterInstallAction） */
+.adapter-install {
+  display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px 8px;
+  margin-top: 6px; white-space: normal;
+}
+.adapter-install-btn {
+  padding: 3px 12px; border: 1px solid var(--accent); border-radius: 8px;
+  background: var(--accent); color: #fff; font-size: 11px; font-weight: 600; cursor: pointer;
+}
+.adapter-install-btn:disabled { opacity: .6; cursor: progress; }
+.adapter-install-status { color: var(--text-tertiary); font-size: 10.5px; }
+.adapter-install[data-phase="failed"] .adapter-install-status,
+.adapter-install[data-phase="reconnect-failed"] .adapter-install-status { color: var(--error, #d9534f); white-space: pre-wrap; }
+.adapter-install-output {
+  flex-basis: 100%; margin: 2px 0 0; padding: 6px 8px; max-height: 120px; overflow: auto;
+  border-radius: 6px; background: rgba(0, 0, 0, 0.18); color: var(--text-secondary);
+  font-size: 10px; line-height: 1.4; text-align: left; white-space: pre-wrap; overflow-wrap: anywhere;
+}
 /* 提示的「×N」（连续重复合并）和折叠起来的「详情」—— 聊天区卡片和状态行共用（docs/notices-glossary.md） */
 .notice-repeat {
   margin-left: 6px;

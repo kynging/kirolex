@@ -242,4 +242,12 @@ export const ZH_MODULES_B: Record<string, string> = {
   '📸 Screenshot of {url} → {path}': '📸 截图 {url} → {path}',
   '✖ Closed tab {url}': '✖ 关闭了标签 {url}',
   'Session not found': '找不到这条会话',
+  // ── adapterInstall.ts（会话里「安装」缺的 ACP 适配器）──
+  'it did not finish within {min} minutes': '{min} 分钟内没装完',
+  'npm was not found on this machine. Install Node.js (it comes with npm) first, then click Install again.': '这台机器上找不到 npm。先装 Node.js（自带 npm），再点一次「安装」。',
+  'npm has no permission to write its global folder (EACCES).': 'npm 没有权限写它的全局目录（EACCES）。',
+  '❌ Installing the {engine} ACP adapter ({pkg}) on {host} failed: {why}': '❌ 在 {host} 上安装 {engine} 的 ACP 适配器（{pkg}）没成功：{why}',
+  '❌ Installing the {engine} ACP adapter ({pkg}) on this machine failed: {why}': '❌ 在本机安装 {engine} 的 ACP 适配器（{pkg}）没成功：{why}',
+  'npm reported success, but KiroLex cannot find {pkg} in any global node_modules folder it knows about.': 'npm 说装好了，但 KiroLex 在它知道的全局 node_modules 目录里都找不到 {pkg}。',
+  'This session does not use Claude Code or Codex.': '这条会话用的不是 Claude Code / Codex。',
 };

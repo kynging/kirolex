@@ -30,6 +30,18 @@ export const connectFailureNotice = (rawWhy: string, now: number = Date.now(), l
   } as Message;
 };
 
+/** 会话里点「安装」装好适配器、重连上之后换上的那一条（同样只在界面上）。 */
+export const adapterInstalledNotice = (engine: 'claude' | 'codex', now: number = Date.now(), lang: Lang = 'zh'): Message => {
+  const say = (l: Lang) => t(l, '✅ The {engine} ACP adapter is installed and this chat is connected.', { engine: engine === 'codex' ? 'Codex' : 'Claude Code' });
+  return {
+    id: `msg_${now}_adapter_installed`,
+    role: 'kirolex' as any,
+    content: say(lang),
+    variants: { zh: say('zh'), en: say('en') },
+    timestamp: now,
+  } as Message;
+};
+
 export const isConnectFailureNotice = (m: Pick<Message, 'role' | 'content'> | null | undefined): boolean =>
   !!m && (m.role as string) === 'kirolex' && typeof m.content === 'string' && CONNECT_FAILURE_PREFIXES.some((p) => (m.content as string).startsWith(p));
 

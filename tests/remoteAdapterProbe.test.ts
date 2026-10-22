@@ -179,8 +179,10 @@ describe('安装后验证', () => {
 describe('安装脚本：装到登录 shell 看得见的地方', () => {
   const SH = read('scripts', 'remote-bootstrap.sh');
   test('两个适配器（含早就装好的）都要过 login_visible；看不到就在 ~/.local/bin 放用 node 绝对路径的包装脚本', () => {
-    assert.match(SH, /^login_visible claude-agent-acp '@agentclientprotocol\/claude-agent-acp'$/m);
-    assert.match(SH, /^login_visible codex-acp '@agentclientprotocol\/codex-acp'$/m);
+    /* `want <bin> && `：全装时永远为真；只装一个（ONLY，会话里的「安装」）时只过那一个 */
+    assert.match(SH, /^(want claude-agent-acp && )?login_visible claude-agent-acp '@agentclientprotocol\/claude-agent-acp'$/m);
+    assert.match(SH, /^(want codex-acp && )?login_visible codex-acp '@agentclientprotocol\/codex-acp'$/m);
+    assert.match(SH, /^want\(\) \{ \[ -z "\$ONLY" \] \|\| \[ "\$ONLY" = "\$1" \]; \}$/m, '不设 ONLY 时 want 永远为真');
     assert.match(SH, /bash -lc "command -v \$bin && command -v node"/, '判据和起适配器时一样：登录 shell 里连同 node');
     assert.match(SH, /readlink -f "\$nodebin"/, 'fnm 的 multishell 链接是临时的，要解到真正的安装目录');
     assert.match(SH, /rm -f "\$w"\n/, '先删：可能是 npm 的 symlink，直接写会改掉适配器入口');

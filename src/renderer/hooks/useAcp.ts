@@ -48,7 +48,9 @@ import { firstUserText } from '../titleSource.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { chatHistoryBody } from '../historyBlock.ts';
 import { mergeAssistantFinal } from '../assistantFinal.ts';
-import { connectFailureNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
+import { connectFailureNotice, adapterInstalledNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
+import { adapterInstallOffer } from '../adapterInstallOffer';
+import { adapterInstallStore, setAdapterInstallRunner } from '../adapterInstallState';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
 
@@ -717,6 +719,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // Lets a send that happens before connection completes await the SAME creation
   // instead of racing a duplicate (which lost the message).
   const creatingRef = useRef<Map<string, Promise<string>>>(new Map());
+  /** 新建没成的会话（主进程那边还没有记录）：怎么再建一次 —— 会话里点「安装」装好适配器之后用它重连（`reconnectAfterInstall`）。 */
+  const failedCreateRef = useRef<Map<string, () => Promise<unknown>>>(new Map());
   // Mid-turn steers written into a running turn but NOT yet consumed by the
   // agent, keyed by sessionId. Each entry keeps its optimistic user-message id
   // so `steer_consumed` can flip the badge to 'consumed', and turn-end can
@@ -3198,6 +3202,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         */
         markFailed(id);
         const why = String(err?.message || err);
+        /* 缺适配器的那种：提示上有「安装」，装好后照原样再建一次 */
+        failedCreateRef.current.set(id, () => window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId, opts?.engine));
         /* 和换机器重连失败那条同一个构造：整句（含 KiroLex 自己给的原因）都带中英两版 */
         mutateSessionMessages(id, (cur) => [...cur, connectFailureNotice(why, Date.now(), uiLangNow())]);
         throw err;                       // 让 await 这个 promise 的那一侧知道它失败了
@@ -3645,6 +3651,50 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   reconnectAfterRetargetRef.current = reconnectAfterRetarget;
 
   /**
+   * **会话里点「安装」装好适配器之后，重连这条会话** —— 新建没成的（主进程还没有记录）照原样再建一次，
+   * 其余的普通 attach。不看 attachedIds：发消息那条路会先 `addAttached` 再发，失败了它也还在集合里。
+   * 连上：「没连上」那条（带安装按钮的）换成「装好了、已连上」；连不上：换成新的那条原因。
+   */
+  const reconnectAfterInstall = async (sessionId: string, engine: 'claude' | 'codex'): Promise<{ ok: boolean; error?: string }> => {
+    const retryCreate = failedCreateRef.current.get(sessionId);
+    markConnecting(sessionId);
+    try {
+      if (retryCreate) {
+        await retryCreate();
+        failedCreateRef.current.delete(sessionId);
+      } else {
+        await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), modelForSession(sessionId));
+      }
+      addAttached(sessionId);
+      clearFailed(sessionId);
+      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, adapterInstalledNotice(engine, Date.now(), uiLangNow())));
+      void window.kiroApi.ensureContext?.(sessionId).catch(() => {});
+      return { ok: true };
+    } catch (err: any) {
+      const why = cleanIpcError(err);
+      markFailed(sessionId);
+      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, connectFailureNotice(why, undefined, uiLangNow())));
+      return { ok: false, error: why };
+    } finally {
+      clearConnecting(sessionId);
+    }
+  };
+  const reconnectAfterInstallRef = useRef(reconnectAfterInstall);
+  reconnectAfterInstallRef.current = reconnectAfterInstall;
+  useEffect(() => {
+    setAdapterInstallRunner({
+      install: (sid, engine) => window.kiroApi.installAdapter
+        ? window.kiroApi.installAdapter(sid, engine, intendedRemoteRef.current.get(sid))
+          /* 主进程已经写进会话了就不在按钮旁再说一遍 */
+          .then((r) => (r.ok || !r.noted ? r : { ok: false, error: '' }))
+        : Promise.resolve({ ok: false, error: 'installAdapter unavailable' }),
+      reconnect: (sid) => reconnectAfterInstallRef.current(sid, adapterInstallStore.get(sid)?.engine || 'claude'),
+    });
+    const off = window.kiroApi.onAdapterInstallOutput?.((d) => { if (d?.sessionId) adapterInstallStore.append(d.sessionId, String(d.chunk || '')); });
+    return () => { setAdapterInstallRunner(null); try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
+  /**
    * **恢复之后立刻出现、立刻连上** ——「恢复了之后的会话应该被立刻连接，为什么没有连接」。
    * 备份页恢复完发 `kirolex:sessions-restored`：先从磁盘把侧栏对一遍（新冒出来的会话和它的项目
    * 就出现了），等这一轮状态落定，再逐条预热（和侧栏展开一个项目时走的是同一个动作）。
@@ -4058,6 +4108,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             return;
           }
           turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || t('Failed to send message.') });
+          /* 连不上是因为缺 Claude Code / Codex 的适配器：给「没连上」那条（带「安装」按钮），不给一个答不了的助手气泡 */
+          if (adapterInstallOffer(cleanIpcError(retryErr))) {
+            markFailed(sid!);
+            mutateSessionMessages(sid!, (prev) => replaceConnectFailureNotices(prev, connectFailureNotice(String(retryErr?.message || retryErr), undefined, uiLangNow())));
+            return;
+          }
           /* 写进**这条**会话：await 期间焦点可能已经换了，分屏里发的也常常不是焦点那一格 */
           const errTs = Date.now();
           /* 只留我们自己的那句：Electron 包的「Error invoking remote method 'acp:load-session': Error: 」不给人看 */

@@ -72,8 +72,61 @@ export function globalModuleRoots(env: NodeJS.ProcessEnv = process.env, home = o
     '/usr/local/lib/node_modules',
     path.join(home, '.npm-global', 'lib', 'node_modules'),
     path.join(home, '.local', 'lib', 'node_modules'),
+    ...managerModuleRoots(env, home),
   ];
   return roots.filter((r, i, a): r is string => !!r && a.indexOf(r) === i);
+}
+
+/** 目录名里的版本号（`v22.23.3`）；认不出的排最后。 */
+function versionKey(p: string): number[] {
+  const m = /v?(\d+)\.(\d+)\.(\d+)/.exec(path.basename(p));
+  return m ? [Number(m[1]), Number(m[2]), Number(m[3])] : [-1, -1, -1];
+}
+
+/**
+ * **fnm / nvm / Volta / asdf 各自的全局 node_modules** —— 和远端探测（`remoteAdapterProbe.ts` 的 `adapterProbeScript`）
+ * 同一套目录布局。这几家只在交互 shell 里加 PATH，GUI 起的 KiroLex 里 `npm root -g` 要么问不到、要么问到另一份 node，
+ * 于是在会话里点「安装」装进那个管理器 node 下的适配器会被判成"还是没装"。
+ * 找到的入口照样用本进程自己的 node 跑（`resolveAdapter`），不需要那个管理器的 node 在 PATH 里。新版本排前面。
+ */
+export function managerModuleRoots(
+  env: NodeJS.ProcessEnv = process.env,
+  home = os.homedir(),
+  listDir: (dir: string) => string[] = (dir) => { try { return fs.readdirSync(dir); } catch { return []; } },
+): string[] {
+  const versions = (dir: string, tail: string[]): string[] => listDir(dir)
+    .map((v) => path.join(dir, v))
+    .sort((a, b) => {
+      const va = versionKey(a), vb = versionKey(b);
+      for (let i = 0; i < 3; i += 1) if (va[i] !== vb[i]) return vb[i] - va[i];
+      return 0;
+    })
+    .map((d) => path.join(d, ...tail));
+  const fnmDirs = [env.FNM_DIR, path.join(home, '.local', 'share', 'fnm'), path.join(home, '.fnm'), path.join(home, 'Library', 'Application Support', 'fnm')]
+    .filter((d, i, a): d is string => !!d && a.indexOf(d) === i);
+  const volta = env.VOLTA_HOME || path.join(home, '.volta');
+  return [
+    ...fnmDirs.flatMap((d) => versions(path.join(d, 'node-versions'), ['installation', 'lib', 'node_modules'])),
+    ...versions(path.join(env.NVM_DIR || path.join(home, '.nvm'), 'versions', 'node'), ['lib', 'node_modules']),
+    /* Volta 把每个全局包装在自己的目录里 */
+    ...Object.values(ADAPTER_PACKAGE).map((pkg) => path.join(volta, 'tools', 'image', 'packages', ...pkg.split('/'), 'lib', 'node_modules')),
+    ...versions(path.join(env.ASDF_DATA_DIR || path.join(home, '.asdf'), 'installs', 'nodejs'), ['lib', 'node_modules']),
+  ];
+}
+
+/** 适配器包的 JS 入口在哪（各个全局 node_modules 里找），找不到 = null。「安装」装完用它确认真的找得到。 */
+export function findAdapterEntry(
+  engine: Exclude<Engine, 'kiro'>,
+  env: NodeJS.ProcessEnv = process.env,
+  opts: { roots?: string[]; exists?: (p: string) => boolean } = {},
+): string | null {
+  const spec = ADAPTERS[engine];
+  const exists = opts.exists || ((p: string) => { try { return fs.existsSync(p); } catch { return false; } });
+  for (const root of opts.roots || globalModuleRoots(env)) {
+    const entry = path.join(root, ...spec.pkg.split('/'), ...spec.entry);
+    if (exists(entry)) return entry;
+  }
+  return null;
 }
 
 export interface AdapterLaunch {
@@ -106,12 +159,8 @@ export function resolveAdapter(
       ? { command: opts.execPath || process.execPath, args: [override], env: { ELECTRON_RUN_AS_NODE: '1' } }
       : { command: override, args: [], env: {} };
   }
-  for (const root of opts.roots || globalModuleRoots(env)) {
-    const entry = path.join(root, ...spec.pkg.split('/'), ...spec.entry);
-    if (exists(entry)) {
-      return { command: opts.execPath || process.execPath, args: [entry], env: { ELECTRON_RUN_AS_NODE: '1' } };
-    }
-  }
+  const entry = findAdapterEntry(engine, env, { roots: opts.roots, exists });
+  if (entry) return { command: opts.execPath || process.execPath, args: [entry], env: { ELECTRON_RUN_AS_NODE: '1' } };
   /* 非 Windows 上 PATH 里的可执行文件可以直接起（那边 npm 装的是带 shebang 的脚本） */
   if ((opts.platform || process.platform) !== 'win32') return { command: spec.bin, args: [], env: {} };
   npmRootCache = undefined;   // 下次再问（多半是还没装，装完就能找到）

@@ -31,15 +31,22 @@ set -u
 
 FORCE="${FORCE:-0}"
 KIRO_RELEASE_BASE="${KIRO_RELEASE_BASE:-https://desktop-release.q.us-east-1.amazonaws.com/latest}"
+# 只装缺的那一个 ACP 适配器（`claude-agent-acp` / `codex-acp`）：会话里「没连上：没有 … 的 ACP 适配器」那条提示上的
+# 「安装」按钮用（src/main/adapterInstall.ts 的 remoteInstallCommand）。只跑 Node（没有才装）、PATH、那一个适配器和它的
+# 登录 shell 可见性，其余（系统包 / kiro-cli / claude / codex / 默认模型 / 登录 / sshd）都跳过。不设 = 全装（「安装 AI 工具」）。
+ONLY="${ONLY:-}"
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s ==\n' "$*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+full() { [ -z "$ONLY" ]; }
+want() { [ -z "$ONLY" ] || [ "$ONLY" = "$1" ]; }
 
 rc=0
 note_fail() { say "✗ $*"; rc=1; }
 
 # ---------------------------------------------------------------- 系统包
+if full; then
 step "系统包（git / unzip / tar）"
 PKG=""
 if have dnf; then PKG="dnf"
@@ -63,6 +70,7 @@ install_pkg() {
 }
 
 for b in git unzip tar; do install_pkg "$b"; done
+fi
 
 # ---------------------------------------------------------------- Node
 # claude-code 和 codex 都是 npm 包。用 fnm 而不是系统 nodejs：发行版自带的往往太老，
@@ -79,6 +87,10 @@ load_fnm
 # **最新的 LTS** ——「把脚本改成运行最新的 LTS 版本 node」。不写死大版本：问 fnm 现在的 LTS 是哪一个，
 # 不是它就装上并设成默认（已经有一个老的 node 也一样升 —— 系统自带的、或者以前装的 22）。
 # 拿不到远端版本列表（离线 / 被墙）时退回 `--lts`，再不行就沿用现有的 node，不因为这一步把整个安装弄挂。
+# 只装一个适配器时（ONLY）已经有 node 就不动它：升级 node 会换掉全局 node_modules 所在的版本目录，已经装好的另一家适配器会跟着"消失"。
+if [ -n "$ONLY" ] && have node; then
+  say "→ 已有 node $(node -v)（$(command -v node)），只装 $ONLY，不升级 node"
+else
 if ! have fnm && [ ! -x "$HOME/.local/share/fnm/fnm" ]; then
   say "→ 装 fnm"
   curl -fsSL https://fnm.vercel.app/install | bash -s -- --skip-shell --install-dir "$HOME/.local/share/fnm" >/dev/null 2>&1
@@ -98,6 +110,7 @@ if [ -n "$FNM" ]; then
     "$FNM" install --lts >/dev/null 2>&1 && "$FNM" default lts-latest >/dev/null 2>&1 || true
   fi
   load_fnm
+fi
 fi
 if have node; then say "→ 现在用的 node：$(node -v)（$(command -v node)）"; else note_fail "node 没装上 —— claude-code / codex 都要它"; fi
 
@@ -131,6 +144,7 @@ fi
 #   curl … desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip
 # 解出来是 kirocli/{install.sh,bin/}，install.sh 把三个二进制放进 ~/.local/bin 再跑
 # `kiro-cli setup`（参数透传，所以给 --no-confirm）。
+if full; then
 step "kiro-cli"
 if have kiro-cli && [ "$FORCE" != "1" ]; then
   say "→ kiro-cli 已在 $(kiro-cli --version 2>/dev/null | head -1)"
@@ -180,9 +194,14 @@ else
     have kiro-cli || note_fail "kiro-cli 没装上"
   fi
 fi
+fi
 
 # ------------------------------------------------- claude code / codex
+if full; then
 step "claude code / codex（npm 全局）"
+else
+step "ACP 适配器 $ONLY（npm 全局）"
+fi
 npm_i() {
   local pkg="$1" bin="$2"
   # `</dev/null`：有些工具（claude-code-acp 是 stdio 上的 ACP 服务）会读 stdin，
@@ -197,10 +216,20 @@ npm_i() {
     say "→ npm 全局目录不可写，改装到 ~/.local"
   fi
   say "→ npm i -g $pkg"
-  npm install -g "$pkg" >/dev/null 2>&1 || { note_fail "$pkg 装不上"; return 1; }
+  # 输出先留在临时文件里：成功时不刷屏，失败时把最后几行（网络 / 权限 / 下载的具体原因）带出来，
+  # 加 `  npm: ` 前缀 —— KiroLex 从这几行取失败原因写进会话和日志（adapterInstall.ts 的 remoteInstallReason）。
+  local npm_log; npm_log="$(mktemp 2>/dev/null || echo "/tmp/kirolex-npm-$$.log")"
+  if npm install -g "$pkg" >"$npm_log" 2>&1 </dev/null; then
+    rm -f "$npm_log"
+  else
+    tail -n 12 "$npm_log" | tr -d '\r' | grep -v '^[[:space:]]*$' | sed 's/^/  npm: /'
+    rm -f "$npm_log"
+    note_fail "$pkg 装不上"; return 1
+  fi
 }
 # claude code 用**官方安装脚本**（原生二进制，不依赖 node）；装不上再退回 npm。
 # 实测这台机器上 https://claude.ai/install.sh 取到的就是官方 bash 安装器。
+if full; then
 if have claude && [ "$FORCE" != "1" ]; then
   say "→ claude 已在 ($(claude --version </dev/null 2>/dev/null | head -1))"
 else
@@ -211,10 +240,11 @@ else
   have claude || npm_i '@anthropic-ai/claude-code' claude
 fi
 npm_i '@openai/codex' codex
+fi
 # ACP 适配层：KiroLex 走 ACP，Claude Code / Codex 要靠它们才能当执行器（engines.ts 的 REMOTE_ADAPTER_BIN）。
 # 原来装的是 @zed-industries/claude-code-acp —— 那个包已经改名停更，KiroLex 起的是下面这两个命令。
-npm_i '@agentclientprotocol/claude-agent-acp' claude-agent-acp
-npm_i '@agentclientprotocol/codex-acp' codex-acp
+want claude-agent-acp && npm_i '@agentclientprotocol/claude-agent-acp' claude-agent-acp
+want codex-acp && npm_i '@agentclientprotocol/codex-acp' codex-acp
 
 # 装到 fnm / nvm 管的 node 下时，`npm -g` 的 bin 落在那个版本自己的目录里 —— 只有交互 shell 看得到。
 # KiroLex 起适配器用的是 `bash -lc`，所以那里**连同 node** 都要找得到；找不到就在 ~/.local/bin
@@ -248,8 +278,21 @@ WEOF
     note_fail "$bin：放了包装脚本 $w，但 ~/.local/bin 不在登录 shell 的 PATH 里"
   fi
 }
-login_visible claude-agent-acp '@agentclientprotocol/claude-agent-acp'
-login_visible codex-acp '@agentclientprotocol/codex-acp'
+want claude-agent-acp && login_visible claude-agent-acp '@agentclientprotocol/claude-agent-acp'
+want codex-acp && login_visible codex-acp '@agentclientprotocol/codex-acp'
+
+# 只装一个适配器（ONLY）到这里就完了：KiroLex 装完会再按会话的起法（bash -lc）真起一次验证（index.ts verifyRemoteAdapter）。
+if [ -n "$ONLY" ]; then
+  step "自检（$ONLY）"
+  if bash -lc "command -v $ONLY" </dev/null >/dev/null 2>&1; then
+    say "$ONLY : 登录 shell 里找得到"
+  else
+    say "$ONLY : **登录 shell 里找不到**"
+    rc=1
+  fi
+  if [ "$rc" -eq 0 ]; then say "✓ $ONLY 装好了。"; else say "✗ $ONLY 没装好，见上面标 ✗ 的那几行。"; fi
+  exit "$rc"
+fi
 
 # ---------------------------------------------------------------- 默认走 Amazon Bedrock
 #

@@ -7,7 +7,8 @@ import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, she
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
-import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, type Engine } from './engines.ts';
+import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, type Engine } from './engines.ts';
+import { runLocalAdapterInstall, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath } from './adapterInstall.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR } from './sshMux';
@@ -3249,6 +3250,59 @@ async function verifyRemoteAdapter(remote: RemoteTarget, engine: 'claude' | 'cod
     const timer = setTimeout(() => finish(true, null), 60_000);
     try { child.stdin.write(ACP_INITIALIZE_LINE); } catch { /* close 会报 */ }
   });
+}
+
+/** `scripts/remote-bootstrap.sh` 的内容（脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里）；找不到 = null。 */
+function readBootstrapScript(): string | null {
+  const candidates = [
+    path.join(app.getAppPath(), 'scripts', 'remote-bootstrap.sh'),
+    path.join(process.resourcesPath || '', 'scripts', 'remote-bootstrap.sh'),
+    path.join(__dirname, '..', '..', 'scripts', 'remote-bootstrap.sh'),
+  ];
+  const scriptPath = candidates.find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+  return scriptPath ? fs.readFileSync(scriptPath, 'utf-8') : null;
+}
+
+/**
+ * **会话里点「安装」装远端缺的那一个适配器** —— 和「安装 AI 工具」同一个脚本，带 `ONLY=<命令名>`
+ * （`remoteInstallCommand`）：只装那一个，Node 已有就不动，kiro-cli / 另一家 / 登录 / sshd 都不碰。
+ * 装完照「安装 AI 工具」那样按会话的起法真起一次（`verifyRemoteAdapter`，fnm / nvm / ~/.local/bin 包装脚本那套探测），
+ * 起得来才算装好。输出边跑边交给 `onChunk`。
+ */
+async function installRemoteAdapter(remote: RemoteTarget, engine: 'claude' | 'codex', onChunk: (s: string) => void): Promise<{ ok: boolean; error?: string }> {
+  const host = remote.sshHost || '';
+  const script = readBootstrapScript();
+  if (!script) return { ok: false, error: adapterInstallFailedMessage(engine, host, tr('remote-bootstrap.sh not found (it should be under the app’s scripts/)')) };
+  const remoteTmp = `/tmp/kirolex-adapter-${Date.now()}.sh`;
+  logger.info('remote', `会话里安装适配器 ${host} ${engine}（只装 ${REMOTE_ADAPTER_BIN[engine]}）`);
+  onChunk(`$ ssh ${host} … ONLY=${REMOTE_ADAPTER_BIN[engine]} bash remote-bootstrap.sh\n`);
+  const run = await new Promise<{ code: number | null; tail: string; error?: string }>((resolve) => {
+    const child = spawn('ssh', buildSshArgs(remote, remoteInstallCommand(remoteTmp, engine)), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
+    let tail = '';
+    const onData = (b: Buffer) => {
+      const t = b.toString('utf-8');
+      tail = (tail + t).slice(-4000);
+      onChunk(t);
+    };
+    child.stdout.on('data', onData);
+    child.stderr.on('data', onData);
+    child.stdin.write(script);
+    child.stdin.end();
+    /* 没有 node 时要先装 node，给 10 分钟 */
+    const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已经退了 */ } }, 10 * 60 * 1000);
+    child.on('error', (err) => { clearTimeout(killer); resolve({ code: null, tail, error: err?.message || tr('ssh would not start') }); });
+    child.on('close', (code) => { clearTimeout(killer); resolve({ code, tail }); });
+  });
+  logger.info('remote', `会话里安装适配器结束 ${host} ${engine} code=${run.code}${run.error ? ` error=${run.error}` : ''}`);
+  const result = { code: run.code, output: run.tail, error: run.error };
+  /* ssh 起不来 / 没连上（255）：脚本根本没跑，不用验证 */
+  if (run.error || run.code === 255) return remoteInstallOutcome(engine, host, result);
+  const v = await verifyRemoteAdapter(remote, engine);
+  const line = adapterVerifyMessage(host, engine, v);
+  logger.info('remote', `会话里安装适配器 验证 ${host} ${engine}: ${v.ok ? 'ok' : line}`);
+  onChunk(`\n${line}\n`);
+  /* 失败原因（含脚本带回来的 npm 那几行）由调用方写进会话和日志 */
+  return remoteInstallOutcome(engine, host, result, { ok: v.ok, line });
 }
 
 function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
@@ -11885,6 +11939,56 @@ app.whenReady().then(async () => {
   };
   ipcMain.handle('acp:load-session', async (_event, sessionId: string, cwd: string, model: string) =>
     loadSessionImpl(sessionId, cwd, model));
+
+  /**
+   * **会话里「没连上：没有 … 的 ACP 适配器」那条提示上的「安装」** —— 原来只叫人去设置里找。
+   *
+   * 本机：`npm install -g <包>`，cwd 是家目录（`runLocalAdapterInstall`）—— 绝不在 KiroLex 自己的目录里装
+   * （重装官方 Electron 会被 Falcon 当 malware 杀掉）。装完重新找入口（含 fnm / nvm / Volta / asdf 的全局目录）。
+   * 远端：「安装 AI 工具」那个脚本只装缺的那一个（`installRemoteAdapter`）。
+   * 机器和引擎以记录为准；新建失败的会话还没有记录，用渲染层带来的 engine / remoteId。
+   * 输出边跑边推给界面（`acp:adapter-install-output`）；装不上把原因写进会话（有记录时）和日志。重连由渲染层做。
+   */
+  const adapterInstallsInFlight = new Map<string, Promise<{ ok: boolean; error?: string }>>();
+  ipcMain.handle('acp:install-adapter', async (event, sessionId: string, engineArg?: string, remoteId?: string) => {
+    const sid = String(sessionId || '').trim();
+    const rec = sid ? store.readRecord(sid) : null;
+    const engine = rec ? engineOf(rec.profile) : engineOf({ engine: engineArg });
+    if (engine === 'kiro') return { ok: false, error: tr('This session does not use Claude Code or Codex.') };
+    const remote = rec ? rec.profile.remote : (remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined);
+    if (!rec && remoteId && !remote) {
+      return { ok: false, error: tr('Remote target {id} not found (did the remotes in your config change?). KiroLex did not guess a machine, so this session was not created.', { id: String(remoteId) }) };
+    }
+    const host = remote?.sshHost || undefined;
+    const send = (chunk: string) => { try { event.sender.send('acp:adapter-install-output', { sessionId: sid, chunk }); } catch { /* 窗口没了 */ } };
+    const key = `${host || 'local'}|${engine}`;
+    logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'}${adapterInstallsInFlight.has(key) ? '（已经在装了，等那一次）' : ''}`);
+    let job = adapterInstallsInFlight.get(key);
+    if (!job) {
+      job = (host
+        ? installRemoteAdapter(remote!, engine, send)
+        : runLocalAdapterInstall(engine, {
+          spawn: spawn as any,
+          platform: process.platform,
+          home: os.homedir(),
+          env: shellEnv,
+          onOutput: send,
+          findEntry: () => { forgetAdapterCache(); return findAdapterEntry(engine, shellEnv); },
+          binOnPath: (bin) => binOnPath(bin, shellEnv, (p) => { try { return fs.existsSync(p); } catch { return false; } }),
+        })
+      ).finally(() => { adapterInstallsInFlight.delete(key); });
+      adapterInstallsInFlight.set(key, job);
+    }
+    const r = await job;
+    if (r.ok) {
+      logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'} 装好了${(r as any).entry ? `（${(r as any).entry}）` : ''}`);
+      return { ok: true };
+    }
+    const error = r.error || adapterInstallFailedMessage(engine, host, '?');
+    logger.warn('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'} 没装上：${error}`);
+    const noted = rec ? noteInSession(sid, error, undefined, `adapter-install:${host || 'local'}:${engine}`) : false;
+    return { ok: false, error, noted };
+  });
 
   /**
    * 把一条会话挂起来（主进程自己调）—— **改写之前先挂回来**。

@@ -1,7 +1,7 @@
 import { createPortal } from 'react-dom';
 import { useReviewQueue } from '../reviewQueue';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
-import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo } from 'react';
+import React, { useRef, useEffect, useLayoutEffect, useState, useCallback, useMemo, memo, useSyncExternalStore } from 'react';
 import { KiroConfigPanel, type KiroConfigCategory } from './KiroConfigPanel';
 import { EngineLoginPane } from './LoginSettings.tsx';
 import { McpCombosPane } from './McpCombosPane.tsx';
@@ -29,6 +29,9 @@ import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
+import { isConnectFailureNotice } from '../connectFailure.ts';
+import { adapterInstallOffer } from '../adapterInstallOffer.ts';
+import { adapterInstallStore, startAdapterInstall } from '../adapterInstallState.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
@@ -845,6 +848,43 @@ function AssistantBody({ body, toolTailFrom, realToolAfter }: { body: string; to
         <div className="notice-detail-body">{detail}</div>
       </details>
     </>
+  );
+}
+
+/**
+ * 「没连上：没有 Claude Code / Codex 的 ACP 适配器」那条提示上的「安装」——原来只叫人去设置里找。
+ * 点了：本机全局 npm 装 / 远端只装缺的那一个（主进程 `acp:install-adapter`），输出边跑边显示在这里，
+ * 装好了自动重连这条会话（`useAcp` 的 `reconnectAfterInstall`，连上后这条提示换成「装好了、已连上」）。
+ */
+function AdapterInstallAction({ sessionId, message }: { sessionId?: string | null; message: Message }) {
+  const t = useT();
+  const state = useSyncExternalStore(adapterInstallStore.subscribe, () => (sessionId ? adapterInstallStore.get(sessionId) : undefined));
+  const offer = isConnectFailureNotice(message) ? adapterInstallOffer(message.content) : null;
+  if (!offer || !sessionId) return null;
+  const engine = offer.engine === 'codex' ? 'Codex' : 'Claude Code';
+  const phase = state?.engine === offer.engine ? state.phase : undefined;
+  const busy = phase === 'installing' || phase === 'reconnecting';
+  const tail = state && (busy || phase === 'failed')
+    ? state.output.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim()).slice(-6).join('\n')
+    : '';
+  const status = phase === 'installing' ? t('Installing the {engine} adapter…', { engine })
+    : phase === 'reconnecting' ? t('Installed. Reconnecting this chat…')
+    : phase === 'failed' ? (state?.error ? t('Install failed: {why}', { why: state.error }) : t('Install failed (the reason is in the note below).'))
+    : phase === 'reconnect-failed' ? t('Installed, but this chat still could not connect.')
+    : t('Installs only this adapter, then reconnects this chat.');
+  return (
+    <div className="adapter-install" data-phase={phase || 'idle'}>
+      <button
+        type="button"
+        className="adapter-install-btn"
+        disabled={busy}
+        onClick={() => { void startAdapterInstall(sessionId, offer.engine); }}
+      >
+        {busy ? t('Installing…') : phase === 'failed' || phase === 'reconnect-failed' ? t('Try installing again') : t('Install {engine} adapter', { engine })}
+      </button>
+      <span className="adapter-install-status">{status}</span>
+      {tail && <pre className="adapter-install-output">{tail}</pre>}
+    </div>
   );
 }
 
@@ -4388,6 +4428,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               foldTools={autoFoldTools}
             />
           )}
+          {group.kind === 'assistant' && group.segments.filter(isConnectFailureNotice).slice(-1).map((m) => (
+            <AdapterInstallAction key={`install:${m.id}`} sessionId={currentSessionId} message={m} />
+          ))}
           </div>
         ))}
 

@@ -76,6 +76,8 @@ declare global {
       /** 某条会话的运行位置/工作目录变了 —— 徽标、菜单那句话、会话里那个 📂 都靠它更新。 */
       onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => () => void;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
+      installAdapter?: (sessionId: string, engine: string, remoteId?: string) => Promise<{ ok: boolean; error?: string; noted?: boolean }>;
+      onAdapterInstallOutput?: (cb: (d: { sessionId: string; chunk: string }) => void) => () => void;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
       persistNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
       readEvents?: (sessionId: string, limit?: number) => Promise<{ events: any[]; path: string; truncated: boolean }>;

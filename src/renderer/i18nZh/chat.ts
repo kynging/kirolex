@@ -288,4 +288,14 @@ export const ZH_CHAT: Record<string, string> = {
   // 回复里把工具调用写成了文字（main/textToolCall.ts）
   "⚠️ Tool call written as text, not executed: {tools}": "⚠️ 工具调用被写成了文字，未执行：{tools}",
   "⚠️ Tool call written as text, not executed": "⚠️ 工具调用被写成了文字，未执行",
+  // 「没连上：缺 ACP 适配器」提示上的「安装」（ChatArea AdapterInstallAction / connectFailure.ts）
+  'Install {engine} adapter': '安装 {engine} 适配器',
+  'Try installing again': '重新安装',
+  'Installing the {engine} adapter…': '正在安装 {engine} 适配器…',
+  'Installed. Reconnecting this chat…': '装好了，正在重新连接这条会话…',
+  'Install failed: {why}': '安装失败：{why}',
+  'Install failed (the reason is in the note below).': '安装失败（原因见下面那条）。',
+  'Installed, but this chat still could not connect.': '装好了，但这条会话还是没连上。',
+  'Installs only this adapter, then reconnects this chat.': '只装这一个适配器，装完自动重连这条会话。',
+  '✅ The {engine} ACP adapter is installed and this chat is connected.': '✅ {engine} 的 ACP 适配器装好了，这条会话已连上。',
 };
