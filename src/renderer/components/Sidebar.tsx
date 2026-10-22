@@ -224,6 +224,11 @@ interface SidebarProps {
   /** 右键「运行位置 → ＋ 添加机器…」：打开设置 → 机器页，直接进入添加新机器。 */
   onAddMachine?: () => void;
   /**
+   * 还没发过消息的会话（`pending_*`）换机器：主进程那边还没有它的记录，只能改渲染层记下的机器
+   * （见 useAcp `retargetPendingSession`）。返回 false = 不是 pending 会话，照旧走主进程。
+   */
+  onRetargetPending?: (sessionId: string, remoteId: string | null, label?: string) => boolean;
+  /**
    * 打开 ☁️「从备份恢复」——「这个同步应该在左侧下方有一个入口按钮」，
    * 而「这个云按钮只保留恢复」：配置在 设置 → ☁️ 备份。
    *
@@ -584,6 +589,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onArchiveSession,
   onSettings,
   onAddMachine,
+  onRetargetPending,
   onOpenBackup,
   backupState,
   workspaceOpen,
@@ -868,6 +874,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
   const onSetTarget = async (sessionId: string, remoteId: string | null): Promise<void> => {
     const api = (window as any).kiroApi;
+    /* 分叉 / 新开、还没发过消息的会话：只改它首条消息要用的机器（审计 10b：源会话的机器删了就在这里改） */
+    if (onRetargetPending?.(sessionId, remoteId, remoteId ? remoteTargets.find((t) => t.id === remoteId)?.label : undefined)) return;
     if (!api?.setRemoteTarget) return;
     setPendingTarget(sessionId, remoteId ? (remoteTargets.find((t) => t.id === remoteId)?.label || remoteId) : null);
     const r = await api.setRemoteTarget(sessionId, remoteId, undefined, coldHintFor(sessionId))
@@ -1335,6 +1343,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   </div>
                 ))}
               </Submenu>
+            </>
+          )}
+          {/*
+            还没发过消息的会话（分叉出来的 `pending_*`）也给「运行位置」：它首条消息才建后端，机器改的是渲染层记下的那台
+            （`onRetargetPending`）。审计 10b：源会话的机器在设置里删了，提示里说的「右键改」就是这里。
+          */}
+          {(!ctxSession.id.startsWith('pending_') || !!onRetargetPending) && (
+            <>
               {/*
                 **换机器** ——「AI角色扮演这个应该是远程的」：一条已有会话应该能改成在远端跑，
                 而不是"只能重新建一条"（重建会把这条对话在后端的历史扔掉）。
@@ -1373,6 +1389,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
                   ＋ {t('Add machine…')}
                 </div>
               </Submenu>
+            </>
+          )}
+          {!ctxSession.id.startsWith('pending_') && (
+            <>
               <div className="context-menu-divider" />
               <div
                 className="context-menu-item"

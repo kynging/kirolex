@@ -75,7 +75,7 @@ import { createControlServer, type ControlServer, type ControlSessionAccess } fr
 import { isControlMessageId, tailEntries } from './controlSessions.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
-import { attachFailureLine, coldProfileBits, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
+import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
@@ -9909,6 +9909,9 @@ app.whenReady().then(async () => {
     return rec;
   };
 
+  /* 机器的 id 也随 `session:targets-changed` 发过去（审计 10b）：渲染层的会话行要它，分叉时才知道在哪台机器上建 */
+  const remoteIdOf = (t?: RemoteTarget): string | null => ((t as { id?: string } | undefined)?.id || null);
+
   const applySessionTarget = async (
     sessionId: string,
     target: RemoteTarget | undefined,
@@ -9981,7 +9984,7 @@ app.whenReady().then(async () => {
         tr('The conversation is unchanged.')));
       logger.info('remote', `切换目标（未连接）sessionId=${sessionId} -> ${target?.sshHost || '本地'}`);
       /* 渲染层收到后发现它没连着，会按新记录立刻 attach（见 useAcp 的 reconnectAfterRetarget） */
-      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
+      mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), remoteId: remoteIdOf(target), localDir: nextLocalDir });
       return { ok: true, remoteHost: hostLabelOf(target), cold: true };
     }
 
@@ -10052,7 +10055,7 @@ app.whenReady().then(async () => {
           NOTE_DETAIL_SEP,
           tr('The backend session is new; the context goes along with your next message. The conversation is unchanged.')));
         logger.info('remote', `切换目标 sessionId=${sessionId} -> ${target?.sshHost || '本地'} dir=${nextLocalDir}`);
-        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), localDir: nextLocalDir });
+        mainWindow?.webContents.send('session:targets-changed', { sessionId, remoteHost: hostLabelOf(target), remoteId: remoteIdOf(target), localDir: nextLocalDir });
         return { ok: true, remoteHost: hostLabelOf(target) };
       } catch (err) {
         try { await client.disconnect(); } catch {}
@@ -13610,6 +13613,8 @@ app.whenReady().then(async () => {
     // work, so this mark separates "renderer booting" from "renderer hydrating".
     startupMark('hydrate: list-durable-sessions requested');
     const tombstoned = new Set([...loadSessionTombstones(), ...deletedSessionIds]);
+    /* 设置里现有的机器 —— 只读一次，下面每条远程会话按它认回 remote id */
+    const remoteTargetsNow = listRemoteTargets(KIROLEX_CONFIG_PATH);
     return store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((rec) => ({
       id: rec.id,
       title: rec.title,
@@ -13641,6 +13646,11 @@ app.whenReady().then(async () => {
       ...(rec.profile?.remote?.sshHost
         ? { remoteHost: labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) }
         : null),
+      /**
+       * **以及那台机器的 id**（审计 10b）—— 显示名不能拿来建会话；分叉 / 复制一条远程会话时渲染层靠它
+       * 在同一台机器上建，而不是退回「新会话默认机器」。机器在设置里删掉了就标 `remoteMissing`（见 `durableRemoteId`）。
+       */
+      ...durableRemoteId(rec.profile?.remote as any, remoteTargetsNow, (id) => findRemoteTarget(KIROLEX_CONFIG_PATH, id)),
       /**
        * **这条会话在哪棵树上干活** ——「工作目录这个东西放到右侧会话」。
        *

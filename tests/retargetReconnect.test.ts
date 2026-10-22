@@ -41,7 +41,7 @@ describe('没连上的会话换机器：立刻在新机器上连，旧报错不�
     const at = MAIN.indexOf('if (!oldEntry) {', MAIN.indexOf('const applySessionTarget = async ('));
     const branch = MAIN.slice(at, MAIN.indexOf('await awaitAttachIdle(sessionId);', at));
     assert.doesNotMatch(branch, /下次打开会跑在/);
-    assert.match(branch, /'session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir \}/);
+    assert.match(branch, /'session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), remoteId: remoteIdOf\(target\), localDir: nextLocalDir \}/);
   });
 
   test('渲染层收到换机器事件就对没连着的会话按新记录重连，成功清失败状态和旧提示，失败换成新报错', () => {

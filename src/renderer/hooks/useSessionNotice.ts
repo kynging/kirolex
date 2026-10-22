@@ -1,6 +1,6 @@
 import { useEffect, useState } from 'react';
 import { mergeNotice } from '../noticeMerge.ts';
-import { createNoticeHub, type SessionNotice } from '../sessionNoticeHub.ts';
+import { createNoticeHub, type RawSessionNotice, type SessionNotice } from '../sessionNoticeHub.ts';
 
 /**
  * **KiroLex 自己对你说的那句话** ——「你自己写的那个提示什么的不要中断弄回对话框」。
@@ -26,8 +26,18 @@ export type { SessionNotice } from '../sessionNoticeHub.ts';
 const hub = createNoticeHub((fn) => (window as any).kiroApi?.onSessionNotice?.(fn));
 
 /** 渲染端自己要在状态行说的一句（例如「这一轮已经结束，刚才那条作为新消息发出」）—— 和主进程发来的同一个落点。 */
-export function noteSessionLocally(sessionId: string, text: string, variants?: { zh: string; en: string }): void {
-  hub.ingest({ sessionId, text, ts: Date.now(), ...(variants ? { variants } : {}) });
+export function noteSessionLocally(
+  sessionId: string,
+  text: string,
+  variants?: { zh: string; en: string },
+  extra?: Pick<RawSessionNotice, 'pinned' | 'sticky' | 'group'>,
+): void {
+  hub.ingest({ ...extra, sessionId, text, ts: Date.now(), ...(variants ? { variants } : {}) });
+}
+
+/** 撤掉渲染端自己钉住的那句（group 以 `group` 开头的）—— 例如分叉会话右键选好了机器，「机器找不到」那句就不成立了。 */
+export function unpinSessionLocally(sessionId: string, group: string): void {
+  hub.ingest({ sessionId, text: '', ts: Date.now(), unpin: group });
 }
 
 export function useSessionNotice(sessionId: string | null): { notice: SessionNotice | null; dismiss: () => void } {

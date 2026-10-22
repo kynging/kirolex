@@ -1052,7 +1052,7 @@ describe('切换一条已有会话的机器', () => {
   /* 锚在**那段机械**上，不是 IPC 名字上：换机器和只换目录现在共用它（`applySessionTarget`），
      两个 IPC 都只剩几行解析参数 —— 锚在 IPC 上会切到一段几乎空的代码，然后每条断言都"过了"。 */
   const at = M.indexOf('const applySessionTarget = async (');
-  const body = M.slice(at, at + 7000); /* 英文提示比中文长，窗口放宽一点 */
+  const body = M.slice(at, at + 7500); /* 英文提示比中文长，窗口放宽一点（10b 往事件里加了 remoteId，又放宽了一点） */
 
   test('**右键菜单优先于正在跑的任务**：照切，只是明确说那一轮被打断了', () => {
     assert.ok(at > 0, 'IPC 要存在');
@@ -1187,7 +1187,7 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
 
   test('两条路都把新位置发给界面（事件里带 remoteHost + 工作目录）', () => {
     /* 工作目录也在事件里：切远端时可以顺带换目录，记录和界面要一起变 */
-    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), localDir: nextLocalDir \}/g) || [];
+    const sent = body.match(/session:targets-changed', \{ sessionId, remoteHost: hostLabelOf\(target\), remoteId: remoteIdOf\(target\), localDir: nextLocalDir \}/g) || [];
     assert.equal(sent.length, 2, `只有 ${sent.length} 处发了完整的新位置`);
   });
 
@@ -1195,9 +1195,9 @@ describe('换机器：没连上也能切；切完界面要跟着变', () => {
     const P = fs.readFileSync(path.join(process.cwd(), 'src/main/preload.ts'), 'utf8');
     const HK = fs.readFileSync(path.join(process.cwd(), 'src/renderer/hooks/useAcp.ts'), 'utf8');
     assert.match(P, /onTargetsChanged:/);
-    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; localDir\?: string \}\)/);
+    assert.match(HK, /onTargetsChanged\?\.\(\(d: \{ sessionId: string; remoteHost: string \| null; remoteId\?: string \| null; localDir\?: string \}\)/);
     /* 徽标和右键菜单那句话看的是同一份状态，所以改一处就够 */
-    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, localDir: d\.localDir \|\| s\.localDir \}/);
+    assert.match(HK, /\{ \.\.\.s, remoteHost: d\.remoteHost \|\| undefined, remoteId: d\.remoteId \|\| undefined, remoteMissing: undefined, localDir: d\.localDir \|\| s\.localDir \}/);
   });
 });
 
@@ -1595,7 +1595,8 @@ describe('远程会话建失败不许静默变本地', () => {
     const at = HK.indexOf('if (!sid || sid.startsWith(\'pending_\')) {', HK.indexOf('const pendingId = sid;'));
     assert.ok(at > 0);
     const body = HK.slice(at, at + 1600);
-    assert.match(body, /intendedRemoteRef\.current\.get\(pendingId\)/);
+    /* 记过的优先（审计 10b：本机也算记过，见 forkTarget.firstSendRemoteId） */
+    assert.match(body, /firstSendRemoteId\(intendedRemoteRef\.current, pendingId,/);
     assert.match(body, /远程会话\*\*不许悄悄变本地\*\*/);
   });
 

@@ -42,7 +42,7 @@
 | 9 | 用量：上下文占比 `used/size` 口径对 | 正常（F3 已修） | — | — |
 | 9b | 「管理上下文」确认框写的是「Kiro CLI 会…」 | 有 bug（只记录） | 低 | 未修 |
 | 10 | 编辑并重发 / 重试：只截 KiroLex 自己的记录，Claude 后端里旧的那几轮还在 | 有 bug（只记录） | 中 | 待拍板 |
-| 10b | 分叉不带源会话的机器（远程会话分叉后落到「新会话默认机器」上） | 有 bug（只记录） | 中 | 未修 |
+| 10b | 分叉不带源会话的机器（远程会话分叉后落到「新会话默认机器」上） | 有 bug | 中 | **已修** |
 | 11 | 会话恢复：session/load 回来完整历史，模型记得之前的对话 | 本机正常；远程无法验证 | — | — |
 | 12 | 子代理：Task 派出去的工具调用带 `parentToolUseId`，界面上和主线混在一起、不分组 | 有 bug（只记录） | 中 | 待拍板 |
 | 13 | 其他写死 kiro 的地方 | 见第 13 节 | — | — |
@@ -93,7 +93,7 @@
   而 `duplicateSession` 从来不往里记 → 主进程按「没传 = kiro」建；侧栏那一行也没有引擎徽标。
 - **现在**：源会话是 Claude Code / Codex 时记进 `intendedEngineRef`，侧栏行带上 `engine`。kiro 会话的分叉不变。
 - **测试**：`tests/claudeFeatureAudit.test.ts` F3（源码接线）。
-- 没修的另一半见 10b（机器）。
+- 另一半（机器）见 10b，已修。
 
 ### F3 「0.00 credits」（低）
 
@@ -220,8 +220,16 @@
   被编辑掉的那几轮**一直留在 Claude 的上下文里**，重启后也还在。适配器声明了 `sessionCapabilities.fork`，理论上可以从某一轮分叉出新的后端会话，
   但那是新的后端交互，改动面大 → 拍板。
 - **分叉**：引擎已修（F2）。历史作为一个 `<hidden>` 块随首条消息带过去，对 Claude 成立。
-- **10b 只记录**：分叉不带源会话的机器 —— `duplicateSession` 不记 `intendedRemoteRef`，首条消息时退到「新会话默认机器」（`kirolex-new-chat-remote`）。
-  渲染层的会话行只有机器的显示名（`remoteHost`）没有 id，要补得先让 `listDurableSessions` 带出 remote id；kiro 会话也一样受影响，没在这次改。
+- **10b 已修**：分叉不带源会话的机器 —— `duplicateSession` 不记 `intendedRemoteRef`，首条消息时退到「新会话默认机器」（`kirolex-new-chat-remote`）。
+  渲染层的会话行只有机器的显示名（`remoteHost`）没有 id，kiro / Claude Code / Codex 三种会话都受影响。
+  **怎么修的**：`listDurableSessions` 和 `session:targets-changed` 给会话行带上 `remoteId`（`coldRecord.ts` `durableRemoteId`：记录里存了 id 就只认这个 id，设置里删了就标 `remoteMissing`，不换成同地址的另一台；没存 id 的老记录才按 host + 端口认回）；
+  `duplicateSession` 在记引擎（F2）的同一处把源会话的机器记进 `intendedRemoteRef`（本机记成空串，算「记过」），侧栏行同时带上机器名；
+  首条消息建后端改用 `firstSendRemoteId`（`src/renderer/forkTarget.ts`）：记过的优先，没记过才用默认机器。
+  源会话的机器在设置里已经删了：照样记原来的 id（主进程报「找不到、没替你猜」，不换机器），会话里钉一句「设置里已经没有这台机器了…右键 →『运行位置』选一台」（说法同 `coldRecordFor`）；
+  还没发过消息的会话右键菜单原来没有「运行位置」、调了也会报「找不到记录」：现在菜单里有，改的是渲染层记下的机器（`retargetPendingSession`）。
+  分叉后没发消息就重启：`intendedRemoteRef` 只在内存里，所以机器意图同时记在会话行上（`forkRemoteId`，`''` = 本机，行整份存进 `kirolex-sessions`），启动时由 `restoredForkIntents` 灌回去，机器已删的再钉一次提示。
+  工作目录：每条会话的 cwd 本来就是它自己的文件夹，项目（及项目设的工作目录）随 `duplicateProjectRef` 沿用，未改、加了测试。
+  测试：`tests/forkRemote.test.ts`（纯函数）、`tests/claudeFeatureAudit.test.ts` 10b（接线）。
 
 ### 11 会话恢复
 

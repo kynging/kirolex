@@ -50,6 +50,8 @@ import { chatHistoryBody } from '../historyBlock.ts';
 import { mergeAssistantFinal } from '../assistantFinal.ts';
 import { connectFailureNotice, adapterInstalledNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 import { adapterInstallOffer } from '../adapterInstallOffer';
+import { forkRemoteIntent, firstSendRemoteId, forkMachineMissingText, restoredForkIntents, FORK_MACHINE_MISSING_GROUP } from '../forkTarget';
+import { noteSessionLocally, unpinSessionLocally } from './useSessionNotice';
 import { adapterInstallStore, setAdapterInstallRunner } from '../adapterInstallState';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
@@ -1787,11 +1789,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
   const reconnectAfterRetargetRef = useRef<((sid: string) => Promise<void>) | null>(null);
   useEffect(() => {
-    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; localDir?: string }) => {
+    const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; remoteId?: string | null; localDir?: string }) => {
       if (!d?.sessionId) return;
       setSessions((prev) => prev.map((s) => (s.id === d.sessionId
         /* 工作目录也在这个事件里 —— 会话界面上那个 📂 显示的就是它，换完必须当场变 */
-        ? { ...s, remoteHost: d.remoteHost || undefined, localDir: d.localDir || s.localDir }
+        ? { ...s, remoteHost: d.remoteHost || undefined, remoteId: d.remoteId || undefined, remoteMissing: undefined, localDir: d.localDir || s.localDir }
         : s)));
       /* 没连着的那条：换完立刻在新机器上连（已连着的主进程已经换好执行器了，函数里会跳过） */
       void reconnectAfterRetargetRef.current?.(d.sessionId);
@@ -2153,6 +2155,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                  * `remoteHost`，而侧栏那个 🌐 徽标从来没出现过 —— 因为它在这一步被丢了。
                  */
                 remoteHost: rec.remoteHost ?? (existing as any).remoteHost,
+                /* 机器的 id 跟着显示名从同一处来（审计 10b：分叉靠它在同一台机器上建） */
+                ...(rec.remoteHost
+                  ? { remoteId: rec.remoteId, remoteMissing: rec.remoteMissing }
+                  : { remoteId: (existing as any).remoteId, remoteMissing: (existing as any).remoteMissing }),
                 /* 工作目录同理：白名单里不列就会被丢掉，而会话界面上那个 📂 显示的就是它 */
                 localDir: rec.localDir ?? (existing as any).localDir,
               });
@@ -2170,6 +2176,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 engine: rec.engine,
                 remoteHost: rec.remoteHost,
                 localDir: rec.localDir,
+                remoteId: rec.remoteId,
+                remoteMissing: rec.remoteMissing,
                 timestamp: rec.updatedAt,
               });
             }
@@ -3118,6 +3126,24 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const intendedRemoteRef = useRef<Map<string, string>>(new Map());
   /** 同上，引擎：兜底重建那条路也不许把 Claude/Codex 会话悄悄建成 kiro。 */
   const intendedEngineRef = useRef<Map<string, string>>(new Map());
+  /**
+   * **重启后找回分叉记下的机器**（审计 10b）—— 上面那张表只活在内存里；分叉后没发消息就重启的话，
+   * 首条消息原来退回新会话默认机器。会话行（带 `forkRemoteId`）整份落盘，启动时从这里灌回去；
+   * 源会话机器已删的那种，那句「设置里已经没有这台机器了」也再钉一次。
+   */
+  useEffect(() => {
+    for (const r of restoredForkIntents(sessions)) {
+      if (!intendedRemoteRef.current.has(r.id)) intendedRemoteRef.current.set(r.id, r.remoteId);
+      if (r.missingHost) {
+        const host = r.missingHost;
+        noteSessionLocally(r.id, forkMachineMissingText(uiLangNow(), host),
+          { zh: forkMachineMissingText('zh', host), en: forkMachineMissingText('en', host) },
+          { sticky: true, pinned: true, group: FORK_MACHINE_MISSING_GROUP });
+      }
+    }
+    // 只在启动时跑一次：之后的分叉 / 右键都直接写这张表
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
 
   const newSession = useCallback(async (
     cwd: string,
@@ -3185,7 +3211,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       {
         id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, kiroAgent, timestamp: Date.now(),
         /* 徽标当场就要有：等下一次 hydrate 才出现的话，你刚建的远程会话看起来像本地的 */
-        ...(opts?.remoteId ? { remoteHost: opts.remoteLabel || opts.remoteId } : null),
+        ...(opts?.remoteId ? { remoteHost: opts.remoteLabel || opts.remoteId, remoteId: opts.remoteId } : null),
         ...(opts?.engine && opts.engine !== 'kiro' ? { engine: opts.engine } : null),
       },
       ...prev,
@@ -3233,6 +3259,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // the copied history is injected as a <hidden> priming block on the first send
   // (reusing the same context-rebuild pattern used for stale sessions), so the
   // model treats the duplicate as a seamless continuation with full context.
+  /**
+   * **还没发过消息的会话，右键换机器** —— pending 会话在主进程那边还没有记录（`acp:set-remote-target` 会报
+   * 「找不到这条会话的记录」），它的机器只活在 `intendedRemoteRef` 里，首条消息建后端时才用。所以这里只改那张表
+   * 和侧栏那一行。分叉出来、源会话的机器已经删掉的那种（审计 10b）就靠这个改好，「机器找不到」那句跟着撤掉。
+   * 不是 pending 会话返回 false（照旧走主进程）。
+   */
+  const retargetPendingSession = useCallback((sessionId: string, remoteId: string | null, label?: string): boolean => {
+    if (!String(sessionId).startsWith('pending_')) return false;
+    intendedRemoteRef.current.set(sessionId, remoteId || '');
+    setSessions((prev) => prev.map((s) => (s.id === sessionId
+      ? { ...s, remoteHost: remoteId ? (label || remoteId) : undefined, remoteId: remoteId || undefined, remoteMissing: undefined, forkRemoteId: remoteId || '' }
+      : s)));
+    unpinSessionLocally(sessionId, FORK_MACHINE_MISSING_GROUP);
+    return true;
+  }, []);
+
   const duplicateSession = useCallback((
     sessionId: string,
     throughMessageId?: string,
@@ -3305,6 +3347,20 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       原来这里不记，主进程按「没传 = kiro」建，于是分叉出来的悄悄成了 Kiro 会话。
     */
     if (src.engine && src.engine !== 'kiro') intendedEngineRef.current.set(newId, src.engine);
+    /*
+      **机器也跟着源会话**（审计 10b）—— 原来这里不记，首条消息建后端时退回「新会话默认机器」
+      （`kirolex-new-chat-remote`），跑在 tokyo-arm 上的会话分叉出来悄悄跑到了本机 / 别的机器上。
+      本机也明确记（空串），这样才不会被默认机器顶掉。源会话的机器在设置里已经删了：照样记原来的 id
+      （建后端时主进程报找不到、不替你猜），并在会话里说一句，让人右键改。
+    */
+    const forkRemote = forkRemoteIntent(src);
+    intendedRemoteRef.current.set(newId, forkRemote.remoteId);
+    if (forkRemote.missingHost) {
+      const host = forkRemote.missingHost;
+      noteSessionLocally(newId, forkMachineMissingText(uiLangNow(), host),
+        { zh: forkMachineMissingText('zh', host), en: forkMachineMissingText('en', host) },
+        { sticky: true, pinned: true, group: FORK_MACHINE_MISSING_GROUP });
+    }
 
     // Copy the per-session model routing
     const model = sessionModelRef.current.get(sessionId) || DEFAULT_MODEL;
@@ -3333,6 +3389,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         folderId: src.folderId ?? null,
         timestamp: Date.now(),
         ...(src.engine && src.engine !== 'kiro' ? { engine: src.engine } : null),
+        /* 侧栏那一行当场显示机器名（同上，10b） */
+        ...(src.remoteHost ? { remoteHost: src.remoteHost } : null),
+        ...(forkRemote.remoteId ? { remoteId: forkRemote.remoteId } : null),
+        ...(forkRemote.missingHost ? { remoteMissing: true } : null),
+        /* 记在行上（行整份落盘）：没发消息就重启时靠它找回机器，见上面 restoredForkIntents */
+        forkRemoteId: forkRemote.remoteId,
       };
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx === -1) return [dup, ...prev];
@@ -3702,7 +3764,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   useEffect(() => {
     setAdapterInstallRunner({
       install: (sid, engine) => window.kiroApi.installAdapter
-        ? window.kiroApi.installAdapter(sid, engine, intendedRemoteRef.current.get(sid))
+        ? window.kiroApi.installAdapter(sid, engine, intendedRemoteRef.current.get(sid) || undefined)
           /* 主进程已经写进会话了就不在按钮旁再说一遍 */
           .then((r) => (r.ok || !r.noted ? r : { ok: false, error: '' }))
         : Promise.resolve({ ok: false, error: 'installAdapter unavailable' }),
@@ -3928,8 +3990,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               「为什么新会话又变成本地了」：这条路原来只看 `intendedRemoteRef`，而一个从侧栏
               直接开出来的 pending 会话从没经过 `createSession`，那张表里自然没有它 → 建成本地。
             */
-            (pendingId && intendedRemoteRef.current.get(pendingId))
-              || (() => { try { return uiGet('kirolex-new-chat-remote') || undefined; } catch { return undefined; } })(),
+            /*
+              **记过的优先，记的是本机也算记过**（审计 10b）：分叉出来的会话记的是源会话的机器（本机 = 空串），
+              原来写成 `get(pendingId) || 默认机器`，本机那种就被默认机器顶掉了。
+            */
+            firstSendRemoteId(intendedRemoteRef.current, pendingId,
+              () => { try { return uiGet('kirolex-new-chat-remote') || undefined; } catch { return undefined; } }),
             (pendingId && intendedEngineRef.current.get(pendingId)) || undefined,
           );
           const prevId = sid;
@@ -5432,6 +5498,7 @@ ${text}`,
     forceStop,
     newSession,
     duplicateSession,
+    retargetPendingSession,
     rerunFromMessage,
     switchSession,
     warmSession,

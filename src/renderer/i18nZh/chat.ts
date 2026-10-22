@@ -305,4 +305,5 @@ export const ZH_CHAT: Record<string, string> = {
   '⚠️ Switching the combo failed: {why}': '⚠️ 切换组合失败：{why}',
   'Switch failed': '切换失败',
   '{why}\nClick to dismiss.': '{why}\n点一下关掉。',
+  '⚠ The source chat ran on remote target {host}, which is no longer in your settings. KiroLex did not move this copy to another machine: right-click it → Runs on to pick one before sending.': '⚠ 源会话跑在远程目标 {host} 上，但设置里已经没有这台机器了。KiroLex 没有把这份副本换到别的机器上：发消息前先右键它 →「运行位置」选一台。',
 };

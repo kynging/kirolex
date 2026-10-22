@@ -690,7 +690,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('session:engine-changed', handler);
     return () => ipcRenderer.removeListener('session:engine-changed', handler);
   },
-  onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => {
+  onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null; remoteId?: string | null; localDir?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('session:targets-changed', handler);
     return () => ipcRenderer.removeListener('session:targets-changed', handler);

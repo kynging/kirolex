@@ -75,7 +75,7 @@ declare global {
       setRemoteTarget?: (sessionId: string, remoteId: string | null, localDir?: string) =>
         Promise<{ ok: boolean; remoteHost?: string | null; unchanged?: boolean; cold?: boolean; error?: string }>;
       /** 某条会话的运行位置/工作目录变了 —— 徽标、菜单那句话、会话里那个 📂 都靠它更新。 */
-      onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; localDir?: string }) => void) => () => void;
+      onTargetsChanged?: (cb: (d: { sessionId: string; remoteHost: string | null; remoteId?: string | null; localDir?: string }) => void) => () => void;
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
       installAdapter?: (sessionId: string, engine: string, remoteId?: string) => Promise<{ ok: boolean; error?: string; noted?: boolean }>;
       onAdapterInstallOutput?: (cb: (d: { sessionId: string; chunk: string }) => void) => () => void;
@@ -194,7 +194,7 @@ declare global {
       readTranscript: (sessionId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       truncateTranscriptBefore: (sessionId: string, messageId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }>) => Promise<{ ok: boolean }>;
-      listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean }[]>;
+      listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean; remoteHost?: string; remoteId?: string; remoteMissing?: boolean }[]>;
       listSessions: () => Promise<any>;
       listKiroAgents: (machine?: string) => Promise<{ agents: Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>; error?: string }>;
       openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => Promise<{ opened: boolean; path?: string; content?: string; error?: string }>;
@@ -562,6 +562,18 @@ export interface Session {
    */
   remoteHost?: string;
   /**
+   * 同一台机器在设置里的 **id**（`listDurableSessions` 带出来的；本地 = undefined）—— 审计 10b：
+   * 分叉 / 复制一条远程会话要在同一台机器上建，显示名不能拿来建会话。
+   */
+  remoteId?: string;
+  /** 记录里的那台机器在设置里已经找不到了（删掉了）—— 分叉时据此明说，不换机器。 */
+  remoteMissing?: boolean;
+  /**
+   * 还没发过消息的分叉会话（`pending_*`）首条消息要用的机器：`''` = 明确是本机，没有这个字段 = 没记过。
+   * 记在行上是因为行整份落盘 —— 分叉后没发消息就重启，靠它找回机器，而不是退回新会话默认机器（审计 10b）。
+   */
+  forkRemoteId?: string;
+  /**
    * **这条会话在哪棵树上干活**（记录为准；没归项目的会话是它自己的会话目录）。
    *
    * 会话界面上常驻显示它 ——「工作目录这个东西放到右侧会话」。远程会话尤其需要：远端只看得见
@@ -908,6 +920,7 @@ const App: React.FC = () => {
     forceStop,
     newSession,
     duplicateSession,
+    retargetPendingSession,
     rerunFromMessage,
     switchSession,
     taskListFor,
@@ -4165,6 +4178,7 @@ const App: React.FC = () => {
               onArchiveSession={archiveSession}
               onSettings={() => { setSettingsTab(undefined); setSettingsNewMachine(false); setShowSettings(true); }}
               onAddMachine={() => { setSettingsTab('machines'); setSettingsNewMachine(true); setShowSettings(true); }}
+              onRetargetPending={retargetPendingSession}
               /*
                 ☁️ 只管**恢复** ——「这个云按钮只保留恢复，这个界面应该展示所有已经备份的会话，
                 然后留一个多选/恢复按钮即可」。配置回到 设置 → ☁️ 备份。

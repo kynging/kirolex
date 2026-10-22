@@ -87,3 +87,31 @@ export function attachFailureLine(
   const reason = String((err as any)?.message || err || '(无原因)').replace(/\s+/g, ' ').trim();
   return `attach 失败 sessionId=${sessionId} engine=${engine} remote=${remote}: ${reason}`;
 }
+
+/**
+ * **给渲染层的会话行带上机器的 id**（审计 10b）—— 行上原来只有显示名（`remoteHost`），分叉一条远程会话时
+ * 渲染层不知道该在哪台机器上建，只好退回「新会话默认机器」。
+ *
+ * 记录里存了 id：只认这个 id（设置里还在就用它；同 host:port 去重掉的那几条由 `resolveId` 认到留下来的那条 ——
+ * 那台机器其实没删）；认不出就是**删了**，带出原来的 id 并标 `remoteMissing`，**不**按地址换成另一条同地址的目标
+ * （那是另一份配置：别的私钥 / 跳板 / 启动命令）。只有没存 id 的老记录才按 host + 端口认回设置里那台；
+ * 也认不出就带出 host 并标 `remoteMissing`。渲染层据此明说，而不是换一台机器。本地会话什么都不带。
+ */
+export function durableRemoteId(
+  remote: { id?: string; sshHost?: string; sshPort?: number } | null | undefined,
+  targets: ReadonlyArray<{ id: string; sshHost: string; sshPort?: number }>,
+  resolveId?: (id: string) => { id: string } | undefined,
+): { remoteId?: string; remoteMissing?: true } {
+  const host = String(remote?.sshHost || '').trim();
+  if (!host) return {};
+  const id = typeof remote?.id === 'string' && remote.id ? remote.id : '';
+  if (id) {
+    if (targets.some((t) => t.id === id)) return { remoteId: id };
+    const kept = resolveId?.(id);
+    return kept ? { remoteId: kept.id } : { remoteId: id, remoteMissing: true };
+  }
+  const port = Number(remote?.sshPort) > 0 ? Number(remote?.sshPort) : 22;
+  const byHost = targets.find((t) => t.sshHost === host && (Number(t.sshPort) > 0 ? Number(t.sshPort) : 22) === port);
+  if (byHost) return { remoteId: byHost.id };
+  return { remoteId: host, remoteMissing: true };
+}
