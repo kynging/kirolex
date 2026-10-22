@@ -2909,6 +2909,8 @@ interface ChatAreaProps {
    *  before these existed a job's only exits were its run budget and editing the store. */
   onPauseSchedule?: (id: string, paused: boolean) => void;
   onCancelSchedule?: (id: string) => void;
+  /** 聊天顶部那条定时任务上的「延长 7 天 / 不过期」（只有用户能设成不过期）。 */
+  onSetScheduleExpiry?: (id: string, mode: 'extend' | 'never') => void;
   /** Stop whatever automation currently owns this session. */
   onStopLoop: () => void;
   /** Split-pane monitor mode: transcript + live indicators + permission bar,
@@ -3027,6 +3029,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   projectName,
   onPauseSchedule,
   onCancelSchedule,
+  onSetScheduleExpiry,
   onStopLoop,
   readOnly = false,
   paneFocused = true,
@@ -4286,12 +4289,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           read history — including when the composer is collapsed. */}
       {scheduleSummary && (
         <div
-          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
+          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}${scheduleSummary.goal ? ' has-goal' : ''}`}
           title={scheduleSummary.text}
         >
           <span className="schedule-banner-icon">{scheduleSummary.paused ? '⏸️' : '⏰'}</span>
           {scheduleSummary.byModel && (
             <span className="schedule-banner-by-model" title={t('The model in this chat set this up itself (schedule_create). Pause or cancel it like any other job.')}>{t('🤖 Created by the model')}</span>
+          )}
+          {scheduleSummary.goal && (
+            <span className="schedule-banner-goal" title={t('Goal (the job stops once this is reached): {goal}', { goal: scheduleSummary.goal })}>
+              {t('🎯 Goal: {goal}', { goal: scheduleSummary.goal })}
+            </span>
           )}
           <span className="schedule-banner-text">{scheduleSummary.text}</span>
           {scheduleSummary.next && (
@@ -4303,6 +4311,21 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 onClick={() => onPauseSchedule?.(scheduleSummary.next!.id, !scheduleSummary.paused)}
                 title={scheduleSummary.paused ? t('Resume: keep running on the original schedule') : t('Pause: keep the job, stop it firing')}
               >{scheduleSummary.paused ? t('▶️ Resume') : t('⏸️ Pause')}</button>
+              {/* 过期时间：延长 7 天，或改成不过期 —— 只有带过期时间的（模型建的循环任务）才有 */}
+              {scheduleSummary.expiresAt !== null && (
+                <>
+                  <button
+                    className="schedule-banner-extend"
+                    onClick={() => onSetScheduleExpiry?.(scheduleSummary.next!.id, 'extend')}
+                    title={t('Push the expiry back by 7 days')}
+                  >{t('⏳ Extend 7 days')}</button>
+                  <button
+                    className="schedule-banner-never"
+                    onClick={() => onSetScheduleExpiry?.(scheduleSummary.next!.id, 'never')}
+                    title={t('Keep it until the goal is reached or you cancel it (only you can set this; the model cannot)')}
+                  >{t('♾️ Never expire')}</button>
+                </>
+              )}
               {/* Cancel is NOT reversible (the prompt and trigger are deleted), so it arms
                   first. The armed state resets on its own so a forgotten click cannot sit
                   there waiting to delete a job days later. */}
@@ -5048,7 +5071,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <h3 id="schedule-dialog-title">{t('⏰ Scheduled job')}</h3>
             <div className="loop-dialog-preview">{scheduleSetup.text}</div>
             <div className="loop-dialog-level level-0">
-              {describeSchedule(draftSchedule, findLang)} · {t('up to {n} times', { n: draftSchedule.maxRuns })}
+              {describeSchedule(draftSchedule, findLang)} · {t('up to {n} times', { n: Number(draftSchedule.maxRuns) })}
               {/* 英文两句之间要断开；中文原样紧挨着 */}
               {findLang === 'en' ? '. ' : ''}
               <span className="schedule-note">

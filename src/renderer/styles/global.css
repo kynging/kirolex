@@ -2205,6 +2205,8 @@ button, input, select, textarea {
 }
 /* The banner's own controls. Quiet by default — this bar is read far more often than acted on. */
 .schedule-banner-pause,
+.schedule-banner-extend,
+.schedule-banner-never,
 .schedule-banner-cancel {
   flex-shrink: 0;
   padding: 2px 8px;
@@ -2217,6 +2219,8 @@ button, input, select, textarea {
   opacity: 0.75;
 }
 .schedule-banner-pause:hover,
+.schedule-banner-extend:hover,
+.schedule-banner-never:hover,
 .schedule-banner-cancel:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
 /* Armed cancel must not look like the same button it was a moment ago: the next click deletes. */
 .schedule-banner-cancel.armed {
@@ -2236,6 +2240,20 @@ button, input, select, textarea {
   background: rgba(239, 83, 80, 0.10);
   border-color: rgba(239, 83, 80, 0.30);
   color: var(--error);
+}
+/* 目标型任务的「🎯 目标：…」：在横幅里单独占第二行（order 排到最后 + 占满一行），
+   不和次数 / 倒计时 / 按钮挤在同一行把它们截没；长了截断，全文在 title 里 */
+.schedule-banner.has-goal { flex-wrap: wrap; row-gap: 2px; }
+.schedule-banner-goal {
+  order: 1;
+  flex: 0 0 100%;
+  min-width: 0;
+  padding-left: 26px;
+  box-sizing: border-box;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-weight: 600;
 }
 /* 「由模型创建」：一个小标签，让人一眼看出这不是自己设的 */
 .schedule-banner-by-model,

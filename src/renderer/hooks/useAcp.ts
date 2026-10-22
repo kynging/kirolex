@@ -4342,6 +4342,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     try { await window.kiroApi.schedulePause?.(id, paused); } catch {}
   }, []);
 
+  /** 「延长 7 天 / 不过期」：同样只是转给 main，改完 main 广播、这里重读。 */
+  const setScheduleExpiry = useCallback(async (id: string, mode: 'extend' | 'never') => {
+    if (!id) return;
+    try { await window.kiroApi.scheduleSetExpiry?.(id, mode); } catch {}
+  }, []);
+
   const cancelSchedule = useCallback(async (id: string) => {
     if (!id) return;
     try { await window.kiroApi.scheduleRemove?.(id); } catch {}
@@ -5546,6 +5552,7 @@ ${text}`,
     scheduleNow,
     pauseSchedule,
     cancelSchedule,
+    setScheduleExpiry,
     bgJobs,
     stopBgJob,
     stopLoop,

@@ -24,7 +24,8 @@ export interface ScheduleView {
    *  `describeSchedule`, so the two surfaces cannot word it differently. */
   describe: string;
   runs: number;
-  maxRuns: number;
+  /** `null`：目标型任务（模型的 `schedule_create` 带 `until`），不按次数停。 */
+  maxRuns: number | null;
   paused: boolean;
   terminal?: string | null;
   lastRunAt: number | null;
@@ -33,6 +34,9 @@ export interface ScheduleView {
   /** `'model'` = 会话里的模型用 `schedule_create` 自己建的（横幅 / 侧栏标「由模型创建」）。 */
   createdBy?: string | null;
   expiresAt?: number | null;
+  /** 目标型任务的目标（文字）。 */
+  until?: string | null;
+  checkCommand?: string | null;
 }
 
 export interface ScheduleSummary {
@@ -48,6 +52,10 @@ export interface ScheduleSummary {
   next: ScheduleView | null;
   /** 横幅描述的那一个（`next`）是模型自己建的 —— 标「由模型创建」，人一眼能看出这不是自己设的。 */
   byModel: boolean;
+  /** `next` 的目标（目标型任务），横幅上单独显示「🎯 目标：…」；没有就是 null。 */
+  goal: string | null;
+  /** `next` 的过期时间；有它横幅才给「延长 / 不过期」。 */
+  expiresAt: number | null;
 }
 
 /**
@@ -75,7 +83,7 @@ export function countdownText(at: number | null, now: number, lang: Lang = 'zh')
 /** Is this job still going to run again? */
 function isLive(job: ScheduleView): boolean {
   if (job.terminal) return false;
-  if (job.runs >= job.maxRuns) return false;
+  if (typeof job.maxRuns === 'number' && job.runs >= job.maxRuns) return false;
   return true;
 }
 
@@ -102,7 +110,9 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
 
   const allPaused = active.length === 0;
   const hasError = live.some((job) => !!job.lastError);
-  const budget = next ? `${next.runs}/${next.maxRuns}` : '';
+  const byGoal = !!next && typeof next.maxRuns !== 'number';
+  const budget = next && !byGoal ? `${next.runs}/${next.maxRuns}` : '';
+  const expiresAt = typeof next?.expiresAt === 'number' && Number.isFinite(next.expiresAt) ? next.expiresAt : null;
   const countdown = allPaused ? null : countdownText(next?.nextRunAt ?? null, now, lang);
 
   const parts: string[] = [];
@@ -110,6 +120,10 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
   if (allPaused) parts.push(t(lang, 'Paused'));
   else if (countdown) parts.push(countdown);
   if (budget) parts.push(t(lang, 'Ran {budget}', { budget }));
+  if (byGoal) parts.push(t(lang, 'Ran {n} · stops when the goal is reached', { n: next!.runs }));
+  if (expiresAt !== null) {
+    parts.push(t(lang, 'Expires {when}', { when: new Date(expiresAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }));
+  }
   if (live.length > 1) parts.push(t(lang, '{n} jobs in total', { n: live.length }));
   // The error goes LAST but is never dropped: a daily job that has failed every morning
   // must not read the same as one that has been working.
@@ -126,6 +140,8 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
     hasError,
     next,
     byModel: next?.createdBy === 'model',
+    goal: next?.until?.trim() || null,
+    expiresAt,
   };
 }
 

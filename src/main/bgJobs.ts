@@ -21,12 +21,14 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
+import { createHash, type Hash } from 'crypto';
 import fs from 'fs';
 import path from 'path';
 import { WinJobHost, type JobHost } from './winJob.ts';
 import { trIn, uiLang, type UiLang } from './uiText.ts';
 
-export type BgKind = 'run' | 'watch';
+/** `check`：定时任务的 `checkCommand`（`runCheck`）—— 结果交回调用方，不唤醒会话、不进列表 / 登记 / 名额。 */
+export type BgKind = 'run' | 'watch' | 'check';
 export type BgState = 'running' | 'exited' | 'failed' | 'timeout' | 'stopped' | 'rate-limited';
 
 /** 唤醒消息里输出末尾的上限。 */
@@ -93,6 +95,14 @@ export interface BgJobDeps {
   jobHost?: JobHost;
 }
 
+/** `runCheck` 的结果（同 schedule.ts 的 `ScheduleCheckResult`）。`stopped`：退出 KiroLex / 删会话时被结束了。 */
+export type BgCheckResult =
+  /** `fingerprint`：**完整**输出（不是只看末尾 `output`）的 SHA-256，末尾的空白不算 —— 定时任务据此判断「输出变了没有」。 */
+  | { status: 'exited'; code: number | null; output: string; fingerprint: string }
+  | { status: 'timeout'; output: string }
+  | { status: 'failed'; output: string }
+  | { status: 'stopped'; output: string };
+
 export interface BgStartInput {
   sessionId: string;
   kind: BgKind;
@@ -119,7 +129,14 @@ interface Job extends BgJobView {
   timeoutTimer: NodeJS.Timeout | null;
   eventTimes: number[];
   timeoutMs: number;
+  /** `check`：完整输出的流式指纹（`out` 只留最后 64KB，展示也只给末尾 4KB，不能拿它们比较「变了没有」）。 */
+  hash?: Hash;
+  /** `check`：还没喂进指纹的末尾空白（输出末尾多一个换行不算变化）。 */
+  wsTail?: Buffer;
 }
+
+/** 末尾空白最多压着这么多字节不喂进指纹，超过就照算（一直只输出空白的命令不能让它无限涨）。 */
+const CHECK_WS_HOLD = 64 * 1024;
 
 const head = (command: string): string => command.replace(/\s+/g, ' ').trim().slice(0, COMMAND_HEAD);
 
@@ -145,6 +162,8 @@ export function outputTail(buf: Buffer, max: number, lang: UiLang = uiLang()): s
 
 export class BgJobManager {
   private readonly jobs = new Map<string, Job>();
+  /** `check` 任务结束时把结果交给谁（`runCheck` 的 Promise）。 */
+  private readonly checkWaiters = new Map<string, (r: BgCheckResult) => void>();
   private seq = 0;
   private readonly deps: BgJobDeps;
 
@@ -158,8 +177,8 @@ export class BgJobManager {
     const lang = this.lang();
     const command = String(input.command || '');
     if (!command.trim()) return { ok: false, error: trIn(lang, 'command is empty') };
-    const live = [...this.jobs.values()].filter((j) => j.sessionId === input.sessionId && j.state === 'running').length;
-    if (live >= MAX_JOBS_PER_SESSION) {
+    const live = [...this.jobs.values()].filter((j) => j.sessionId === input.sessionId && j.state === 'running' && j.kind !== 'check').length;
+    if (input.kind !== 'check' && live >= MAX_JOBS_PER_SESSION) {
       return { ok: false, error: trIn(lang, 'This session already has {n} background commands / watches running (the limit is {n}). Stop one with bg_stop first', { n: MAX_JOBS_PER_SESSION }) };
     }
     try {
@@ -168,13 +187,14 @@ export class BgJobManager {
       return { ok: false, error: trIn(lang, 'The working directory does not exist: {dir}', { dir: input.cwd }) };
     }
     this.seq += 1;
-    const jobId = `${input.kind === 'watch' ? 'watch' : 'bg'}_${Date.now().toString(36)}${this.seq}`;
+    const jobId = `${input.kind === 'watch' ? 'watch' : input.kind === 'check' ? 'check' : 'bg'}_${Date.now().toString(36)}${this.seq}`;
     const job: Job = {
       jobId, sessionId: input.sessionId, kind: input.kind,
       label: String(input.label || '').trim() || head(command).slice(0, 40),
       command: head(command), state: 'running', startedAt: Date.now(), endedAt: null, exitCode: null, pid: null, events: 0,
       child: null, out: Buffer.alloc(0), pendingLines: [], partial: '', flushTimer: null, timeoutTimer: null, eventTimes: [],
       timeoutMs: input.timeoutMs,
+      ...(input.kind === 'check' ? { hash: createHash('sha256'), wsTail: Buffer.alloc(0) } : {}),
     };
     let started: { child: ChildProcess; owner: ProcessOwner };
     try {
@@ -219,9 +239,37 @@ export class BgJobManager {
     return { ok: true, job: this.view(job) };
   }
 
+  /**
+   * 定时任务的 `checkCommand`：**同一套**起进程（进程组 / 作业对象）、收尾和超时，跑完把退出码 + 输出末尾交回来。
+   * 不唤醒会话（叫不叫醒模型由调用方按结果决定）、不进 `list` / 重启登记、不占单会话的名额。
+   */
+  runCheck(input: { sessionId: string; command: string; cwd: string; timeoutMs: number }): Promise<BgCheckResult> {
+    const r = this.start({ ...input, kind: 'check', label: 'schedule check' });
+    if (!r.ok) return Promise.resolve({ status: 'failed', output: r.error });
+    return new Promise((resolve) => { this.checkWaiters.set(r.job.jobId, resolve); });
+  }
+
+  /** 喂进完整输出的指纹；末尾的空白先压着（之后来了非空白才一起喂），结束时丢掉。 */
+  private feedFingerprint(job: Job, chunk: Buffer): void {
+    const buf = job.wsTail?.length ? Buffer.concat([job.wsTail, chunk]) : chunk;
+    let end = buf.length;
+    while (end > 0 && (buf[end - 1] === 0x20 || buf[end - 1] === 0x09 || buf[end - 1] === 0x0a || buf[end - 1] === 0x0d)) end -= 1;
+    if (buf.length - end > CHECK_WS_HOLD) end = buf.length;
+    job.hash!.update(buf.subarray(0, end));
+    job.wsTail = Buffer.from(buf.subarray(end));
+  }
+
+  /** `check` 任务结束：把结果交回去，从表里拿掉（它不出现在列表里，留着没用）。 */
+  private settleCheck(job: Job, result: BgCheckResult): void {
+    const resolve = this.checkWaiters.get(job.jobId);
+    this.checkWaiters.delete(job.jobId);
+    this.jobs.delete(job.jobId);
+    resolve?.(result);
+  }
+
   status(sessionId: string, jobId: string): BgJobView | null {
     const job = this.jobs.get(jobId);
-    if (!job || job.sessionId !== sessionId) return null;
+    if (!job || job.sessionId !== sessionId || job.kind === 'check') return null;
     return this.view(job);
   }
 
@@ -234,13 +282,13 @@ export class BgJobManager {
 
   list(sessionId?: string): BgJobView[] {
     return [...this.jobs.values()]
-      .filter((j) => !sessionId || j.sessionId === sessionId)
+      .filter((j) => j.kind !== 'check' && (!sessionId || j.sessionId === sessionId))
       .sort((a, b) => a.startedAt - b.startedAt)
       .map((j) => this.view(j));
   }
 
   running(): BgJobRecord[] {
-    return [...this.jobs.values()].filter((j) => j.state === 'running')
+    return [...this.jobs.values()].filter((j) => j.state === 'running' && j.kind !== 'check')
       .map(({ jobId, sessionId, kind, label, command, startedAt }) => ({ jobId, sessionId, kind, label, command, startedAt }));
   }
 
@@ -251,7 +299,7 @@ export class BgJobManager {
   async stop(jobId: string, by: 'user' | 'model', sessionId?: string): Promise<{ ok: boolean; error?: string }> {
     const job = this.jobs.get(jobId);
     const lang = this.lang();
-    if (!job || (sessionId && job.sessionId !== sessionId)) return { ok: false, error: trIn(lang, 'No such background task: {id}', { id: jobId }) };
+    if (!job || job.kind === 'check' || (sessionId && job.sessionId !== sessionId)) return { ok: false, error: trIn(lang, 'No such background task: {id}', { id: jobId }) };
     if (job.state !== 'running') return { ok: true };
     await this.terminate(job, 'stopped');
     if (by === 'user') {
@@ -283,6 +331,7 @@ export class BgJobManager {
       this.clearTimers(job);
       this.deps.log(`end ${job.jobId} state=stopped(quit) exit=n/a cmd=${job.command}`);
       job.owner?.killAllSync();
+      if (job.kind === 'check') this.settleCheck(job, { status: 'stopped', output: '' });
     }
     /* Windows：结束辅助进程 —— 它握着的作业句柄一关，所有作业里剩下的进程都由系统结束（含已经在收尾的那些） */
     if (process.platform === 'win32') (this.deps.jobHost ?? sharedJobHost)?.killAllSync();
@@ -301,6 +350,7 @@ export class BgJobManager {
   }
 
   private onOutput(job: Job, chunk: Buffer, isStdout: boolean): void {
+    if (job.kind === 'check' && job.hash) this.feedFingerprint(job, chunk);
     job.out = Buffer.concat([job.out, chunk]);
     if (job.out.length > KEEP_BYTES) job.out = job.out.subarray(job.out.length - KEEP_BYTES);
     if (job.kind !== 'watch' || !isStdout || job.state !== 'running') return;
@@ -357,6 +407,11 @@ export class BgJobManager {
     this.deps.log(`end ${job.jobId} state=${why} exit=n/a cmd=${job.command}`);
     this.announce(quiet);
     const lang = this.lang();
+    if (job.kind === 'check') {
+      await killAndWait(job);
+      this.settleCheck(job, { status: why === 'timeout' ? 'timeout' : 'stopped', output: outputTail(job.out, BG_TAIL_BYTES, lang) });
+      return;
+    }
     const dur = formatDuration(job.endedAt - job.startedAt, lang);
     if (why === 'timeout') {
       const text = job.kind === 'watch'
@@ -393,6 +448,11 @@ export class BgJobManager {
     this.deps.log(`end ${job.jobId} state=${state} exit=${code ?? 'n/a'} cmd=${job.command}`);
     this.announce();
     const lang = this.lang();
+    if (job.kind === 'check') {
+      const output = state === 'failed' ? String(error || '') : outputTail(job.out, BG_TAIL_BYTES, lang);
+      this.settleCheck(job, state === 'failed' ? { status: 'failed', output } : { status: 'exited', code, output, fingerprint: `sha256:${job.hash!.digest('hex')}` });
+      return;
+    }
     const dur = formatDuration(job.endedAt - job.startedAt, lang);
     let text: string;
     if (state === 'failed') {

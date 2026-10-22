@@ -48,13 +48,14 @@ import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectCha
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
-import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, scheduleDeliveryBlocker, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec } from './schedule.ts';
+import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, SCHEDULE_EXTEND_MS, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
+import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { canRetrySame, decidePromptDedupe, DUPLICATE_MESSAGE, DUPLICATE_STARTED, InFlightPrompts, reviseMessageId, turnCompletedNormally } from './promptDedupe.ts';
-import { BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
+import { BG_DEFAULT_TIMEOUT_SEC, BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
 import { callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
@@ -4484,6 +4485,7 @@ const wakeHost: WakeHost = {
       id: job.id, describe: describeSchedule(job.state.spec), prompt: job.state.spec.prompt, runs: job.state.runs,
       maxRuns: job.state.spec.maxRuns, paused: job.state.paused, terminal: job.state.terminal, nextRunAt: nextRunAt(job.state),
       createdBy: job.state.createdBy, expiresAt: job.state.expiresAt ?? null,
+      until: job.state.spec.until, checkCommand: job.state.spec.checkCommand,
     })),
   deleteSchedule: (sessionId, id) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
@@ -8968,10 +8970,20 @@ app.whenReady().then(async () => {
   /* Jobs currently mid-run (`schedulesInFlight`, module level), so a slow turn is never re-entered by the next tick. */
 
   async function runScheduledJob(job: scheduleStore.StoredSchedule): Promise<void> {
-    const { id, state } = job;
+    const { id } = job;
+    let state = job.state;
     if (schedulesInFlight.has(id)) return;
     schedulesInFlight.set(id, state.sessionId);
     try {
+      const at = nextRunAt(state) ?? Date.now();
+      /* 目标型任务的 `checkCommand`：先在本机跑一次检查，没变化就到此为止（不花模型）；要叫醒的话把检查结果附在消息里 */
+      let check = '';
+      if (state.spec.checkCommand) {
+        const checked = await runScheduleCheck(id, state);
+        if (!checked) return;
+        state = checked.state;
+        check = checked.text;
+      }
       // CHARGE THE RUN FIRST, and flush it. Recording only on completion means a process
       // killed mid-run forgets it paid -- the shape of a job that bills a turn per restart.
       const charged = recordRun(state, Date.now());
@@ -8982,7 +8994,7 @@ app.whenReady().then(async () => {
         白白记掉一次），作为新的一条，不进排队卡片；同一会话里几个同时到期的按到点时间逐条发。
       */
       const delivered = await wakeDispatcher.enqueue({
-        sessionId: state.sessionId, text: state.spec.prompt, at: nextRunAt(state) ?? Date.now(), source: 'schedule', ref: id,
+        sessionId: state.sessionId, text: state.spec.prompt + scheduleGoalSuffix(state, id, check), at, source: 'schedule', ref: id,
       });
       // Re-read: the user may have paused or removed the job during the turn.
       const latest = scheduleStore.readSchedule(id, os.homedir());
@@ -8990,7 +9002,10 @@ app.whenReady().then(async () => {
         /* 排着等会话空下来的时候被删 / 暂停 / 过期了：这一次没发，记的账退回去（删掉的就什么都不用写） */
         logger.info('schedule', `run skipped id=${id} session=${state.sessionId}: ${delivered.error}`);
         if (latest) {
-          const back = refundRun(latest.state, state);
+          /* 带检查结果的那一次没发出去：检查的结论也退回去（不然同样的输出下次会被当成「没变化」跳过，「已达成」也不会再报） */
+          const back = check
+            ? { ...refundRun(latest.state, state), lastCheckHash: job.state.lastCheckHash ?? null, terminal: job.state.terminal }
+            : refundRun(latest.state, state);
           scheduleStore.writeSchedule(id, back, os.homedir(), store.isAdvancedOnlySession);
           mainWindow?.webContents.send('schedule:changed', { id, state: back });
         }
@@ -9002,7 +9017,7 @@ app.whenReady().then(async () => {
       const terminal = scheduleTerminal(settled, Date.now());
       const final = terminal ? { ...settled, terminal } : settled;
       scheduleStore.writeSchedule(id, final, os.homedir(), store.isAdvancedOnlySession);
-      logger.info('schedule', `run id=${id} session=${state.sessionId} runs=${final.runs}/${final.spec.maxRuns}`
+      logger.info('schedule', `run id=${id} session=${state.sessionId} runs=${final.runs}/${final.spec.maxRuns ?? 'goal'}`
         + ` error=${failure ? JSON.stringify(failure) : 'none'} terminal=${terminal ?? 'none'}`);
 
       if (terminal) {
@@ -9010,7 +9025,8 @@ app.whenReady().then(async () => {
           store.appendMessage(state.sessionId, {
             id: `sched_end_${Date.now()}`,
             role: 'assistant',
-            content: tr('Scheduled task ended: {why} ({schedule}, ran {n} time(s))', { why: scheduleTerminalLabel(terminal), schedule: describeSchedule(final.spec), n: final.runs }),
+            content: final.spec.until ? scheduleEndedText(final, terminal)
+              : tr('Scheduled task ended: {why} ({schedule}, ran {n} time(s))', { why: scheduleTerminalLabel(terminal), schedule: describeSchedule(final.spec), n: final.runs }),
             ts: Date.now(),
           });
         } catch {}
@@ -9019,6 +9035,27 @@ app.whenReady().then(async () => {
     } finally {
       schedulesInFlight.delete(id);
     }
+  }
+
+  /**
+   * 目标型任务的 `checkCommand`：在**本机**跑（同 `bg_run`：同一套起进程 / 超时，cwd = 会话的本地工作目录，远程会话也不例外）。
+   * 流程在 `scheduleCheckRun.ts`（有测试）：跳过的那次也广播；连续出错自动暂停时提示用户、同时照样把错误汇报交回来叫醒模型。
+   */
+  function runScheduleCheck(id: string, state: ScheduleState): Promise<{ state: ScheduleState; text: string } | null> {
+    return runScheduleCheckWith(id, state, {
+      now: () => Date.now(),
+      read: (jobId) => scheduleStore.readSchedule(jobId, os.homedir())?.state ?? null,
+      write: (jobId, s) => scheduleStore.writeSchedule(jobId, s, os.homedir(), store.isAdvancedOnlySession),
+      runCheck: (s) => bgJobs.runCheck({
+        sessionId: s.sessionId,
+        command: String(s.spec.checkCommand),
+        cwd: wakeHost.cwdFor(s.sessionId, os.homedir()),
+        timeoutMs: BG_DEFAULT_TIMEOUT_SEC * 1000,
+      }),
+      changed: (jobId, s) => mainWindow?.webContents.send('schedule:changed', { id: jobId, state: s }),
+      noteUser: (sid, text) => { noteInSession(sid, text); sessionNotice(sid, text); },
+      log: (m) => logger.info('schedule', m),
+    });
   }
 
   const scheduleTicker = setInterval(() => {
@@ -9038,8 +9075,9 @@ app.whenReady().then(async () => {
     if (job.state.terminal || schedulesInFlight.has(job.id) || scheduleTerminal(job.state, now) !== 'expired') return false;
     const final = { ...job.state, terminal: 'expired' as const };
     try { scheduleStore.writeSchedule(job.id, final, os.homedir(), store.isAdvancedOnlySession); } catch { return false; }
-    logger.info('schedule', `expired id=${job.id} session=${job.state.sessionId} runs=${final.runs}/${final.spec.maxRuns}`);
-    noteInSession(job.state.sessionId, tr('Scheduled task ended: {why} ({schedule}, ran {n} time(s))', { why: scheduleTerminalLabel('expired'), schedule: describeSchedule(final.spec), n: final.runs }));
+    logger.info('schedule', `expired id=${job.id} session=${job.state.sessionId} runs=${final.runs}/${final.spec.maxRuns ?? 'goal'}`);
+    /* 目标型任务到期时明说「目标还没达成」（`scheduleEndedText`），不悄悄消失 */
+    noteInSession(job.state.sessionId, scheduleEndedText(final, 'expired'));
     mainWindow?.webContents.send('schedule:changed', { id: job.id, state: final });
     return true;
   }
@@ -9153,19 +9191,39 @@ app.whenReady().then(async () => {
     nextRunAt: nextRunAt(job.state),
     createdBy: job.state.createdBy ?? null,
     expiresAt: job.state.expiresAt ?? null,
+    until: job.state.spec.until ?? null,
+    checkCommand: job.state.spec.checkCommand ?? null,
   })));
 
   ipcMain.handle('schedule:pause', (_event, id: string, paused: boolean) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
     if (!job) return { ok: false, error: tr('This scheduled task was not found') };
     { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:pause'); if (advRefused) return { ok: false, error: advRefused }; }
-    const state = { ...job.state, paused };
+    /* 用户按的暂停 / 继续：清掉「检查出错自动暂停」的标记（那种暂停下排着的错误汇报才照发） */
+    const state = { ...job.state, paused, pausedBy: null };
     scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
     /* 正排着等会话空下来的那一次也撤掉 */
     if (paused) wakeDispatcher.dropRef(id, 'paused');
     logger.info('schedule', `${paused ? 'paused' : 'resumed'} id=${id}`);
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true };
+  });
+
+  /**
+   * 聊天顶部那条定时任务上的「延长 / 不过期」：只有**用户**能把过期时间改成不过期（模型的 `expiresInDays` 最多 30 天）。
+   * `extend` 从「现在和原到期时间里较晚的那个」起加 7 天。只对还没结束、带着过期时间的任务。
+   */
+  ipcMain.handle('schedule:set-expiry', (_event, id: string, mode: 'extend' | 'never') => {
+    const job = scheduleStore.readSchedule(id, os.homedir());
+    if (!job) return { ok: false, error: tr('This scheduled task was not found') };
+    { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:set-expiry'); if (advRefused) return { ok: false, error: advRefused }; }
+    if (job.state.terminal || typeof job.state.expiresAt !== 'number') return { ok: false, error: tr('This scheduled task has no expiry to change') };
+    const expiresAt = mode === 'never' ? null : Math.max(Date.now(), job.state.expiresAt) + SCHEDULE_EXTEND_MS;
+    const state = { ...job.state, expiresAt };
+    scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
+    logger.info('schedule', `expiry ${mode} id=${id} expiresAt=${expiresAt ?? 'never'}`);
+    mainWindow?.webContents.send('schedule:changed', { id, state });
+    return { ok: true, expiresAt };
   });
 
   ipcMain.handle('schedule:remove', (_event, id: string) => {

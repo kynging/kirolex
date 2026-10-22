@@ -209,3 +209,40 @@ describe('bg_* / watch', () => {
     assert.deepEqual(h.marked, []);
   });
 });
+
+describe('schedule_* 的目标型任务（until / checkCommand / expiresInDays）', () => {
+  test('schema 里有 until / checkCommand / expiresInDays，说明写清「盯到某件事结束」用 until + checkCommand、checkCommand 只在本机跑', () => {
+    const d = wakeToolDefs().find((x) => x.name === 'schedule_create')!;
+    for (const k of ['until', 'checkCommand', 'expiresInDays']) assert.ok(d.inputSchema.properties[k], k);
+    assert.match(d.description, /until/);
+    assert.match(d.description, /checkCommand/);
+    assert.match(d.description, /别[^。]*拍[^。]*maxRuns|不要[^。]*拍[^。]*maxRuns/);
+    assert.match(d.description, /本机/);
+    assert.match(d.description, /不[^。]*远程|远程[^。]*也是本机|远程会话也/);
+    assert.match(d.inputSchema.properties.expiresInDays.description, /1[^0-9]+30/);
+  });
+
+  test('create：给了 until 不给 maxRuns 也能建，回复里说按目标停', async () => {
+    const h = fakeHost();
+    const r = await call('schedule_create', { prompt: '查看板', kind: 'interval', everySec: 1800, until: 'a、b 都 done', checkCommand: 'node c.js', expiresInDays: 3 }, h.host);
+    assert.ok(!r.isError, r.text);
+    assert.equal(h.created[0].spec.maxRuns, null);
+    assert.equal(h.created[0].spec.until, 'a、b 都 done');
+    assert.equal(h.created[0].spec.checkCommand, 'node c.js');
+    assert.equal(h.created[0].expiresAt, 1_000_000 + 3 * 24 * 3600 * 1000);
+    assert.match(r.text, /按目标停|目标/);
+  });
+
+  test('list：显示目标，以及「按目标停」或「已跑 n/maxRuns」', async () => {
+    const h = fakeHost({
+      listSchedules: () => [
+        { id: 'g1', describe: '每 30 分钟', prompt: 'p', runs: 4, maxRuns: null, paused: false, terminal: null, nextRunAt: 0, createdBy: 'model', expiresAt: null, until: '都 done', checkCommand: 'node c.js' },
+        { id: 'n1', describe: '每 1 分钟', prompt: 'p', runs: 1, maxRuns: 3, paused: false, terminal: null, nextRunAt: 0, createdBy: 'model', expiresAt: null },
+      ],
+    });
+    const r = await call('schedule_list', {}, h.host);
+    assert.match(r.text, /g1[^\n]*按目标停/);
+    assert.match(r.text, /目标：都 done/);
+    assert.match(r.text, /n1[^\n]*已跑 1\/3/);
+  });
+});

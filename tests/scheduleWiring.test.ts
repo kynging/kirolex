@@ -208,7 +208,7 @@ describe('a scheduled task can be called off, and the UI keeps up', () => {
       const next = MAIN.indexOf('ipcMain.handle(', start + 20);
       return MAIN.slice(start, next > 0 ? next : undefined);
     };
-    for (const channel of ['schedule:create', 'schedule:pause', 'schedule:remove']) {
+    for (const channel of ['schedule:create', 'schedule:pause', 'schedule:set-expiry', 'schedule:remove']) {
       assert.match(bodyOf(channel), /schedule:changed/, `${channel} changes state silently`);
     }
   });

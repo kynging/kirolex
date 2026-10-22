@@ -26,6 +26,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   'The previous check has not finished yet': '上一次校验尚未结束',
   'Scheduled task ended: {why} ({schedule}, ran {n} time(s))': '定时任务结束：{why}（{schedule}，共运行 {n} 次）',
   'This scheduled task was not found': '找不到这个定时任务',
+  'This scheduled task has no expiry to change': '这个定时任务没有可以改的过期时间',
   'Refused: this check command is not declared in the flow': '校验命令不在流程声明中，已拒绝执行',
   'No session specified': '没有指定会话',
   'No session id': '没有会话 id',

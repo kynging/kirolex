@@ -491,3 +491,59 @@ describe('重启：跑着的任务留下「已中断」', () => {
     assert.equal(seen[seen.length - 1], 0);
   });
 });
+
+/**
+ * 定时任务的 `checkCommand`：和 bg_run 同一套起进程 / 结束 / 超时，但结果交回调用方（不唤醒会话、
+ * 不出现在后台任务列表里、不占单会话 10 个的名额、不进重启登记）。
+ */
+describe('runCheck（定时任务的检查命令）', () => {
+  test('退出码和输出交回调用方，不唤醒会话', async () => {
+    const h = harness();
+    const r = await h.m.runCheck({ sessionId: 's1', command: nodeCmd("console.log('2 open');process.exit(1)"), cwd, timeoutMs: 30_000 });
+    assert.equal(r.status, 'exited');
+    assert.equal(r.status === 'exited' && r.code, 1);
+    assert.match(r.output, /2 open/);
+    assert.equal(h.wakes.length, 0);
+  });
+
+  test('超时 → timeout，进程被结束', async () => {
+    const h = harness();
+    const r = await h.m.runCheck({ sessionId: 's1', command: nodeCmd('setInterval(()=>{},1000)'), cwd, timeoutMs: 1500 });
+    assert.equal(r.status, 'timeout');
+    assert.equal(h.wakes.length, 0);
+  });
+
+  test('工作目录不存在 → failed', async () => {
+    const h = harness();
+    const r = await h.m.runCheck({ sessionId: 's1', command: 'echo x', cwd: path.join(cwd, 'no-such-dir-kirolex-xyz'), timeoutMs: 1000 });
+    assert.equal(r.status, 'failed');
+  });
+
+  test('不出现在列表 / 重启登记里，不占名额', async () => {
+    const seen: number[] = [];
+    const h = harness({ changed: (running) => { seen.push(running.length); } });
+    const p = h.m.runCheck({ sessionId: 's1', command: nodeCmd('setTimeout(()=>{},400)'), cwd, timeoutMs: 30_000 });
+    assert.equal(h.m.list('s1').length, 0);
+    for (let i = 0; i < MAX_JOBS_PER_SESSION; i += 1) {
+      assert.ok(h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setTimeout(()=>{},300)'), label: `j${i}`, cwd, timeoutMs: 30_000 }).ok);
+    }
+    await p;
+    assert.ok(seen.every((n) => n <= MAX_JOBS_PER_SESSION));
+  });
+});
+
+describe('runCheck：输出很长时按完整输出判断有没有变化', () => {
+  const long = (head: string) => nodeCmd(`process.stdout.write('${head}\\n'+'x'.repeat(5000)+'\\n');process.exit(1)`);
+  test('开头变了、后面 5000 字一样：指纹不同（末尾 4KB 一样也不算没变化）', async () => {
+    const h = harness();
+    const a = await h.m.runCheck({ sessionId: 's1', command: long('task-A:open'), cwd, timeoutMs: 30_000 });
+    const b = await h.m.runCheck({ sessionId: 's1', command: long('task-A:done'), cwd, timeoutMs: 30_000 });
+    const c = await h.m.runCheck({ sessionId: 's1', command: long('task-A:done'), cwd, timeoutMs: 30_000 });
+    assert.equal(a.status, 'exited');
+    assert.ok(a.status === 'exited' && b.status === 'exited' && c.status === 'exited');
+    assert.equal(a.output.slice(-1000), b.output.slice(-1000), '展示给模型的末尾一样');
+    assert.ok(a.fingerprint && b.fingerprint);
+    assert.notEqual(a.fingerprint, b.fingerprint);
+    assert.equal(b.fingerprint, c.fingerprint, '完全一样的输出指纹一样');
+  });
+});

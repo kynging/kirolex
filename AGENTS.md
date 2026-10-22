@@ -162,7 +162,7 @@ docs/            设计文档（§1）
 
 | 文件 | 关键点 |
 |---|---|
-| `src/main/schedule.ts` | 纯逻辑：`ScheduleKind = interval/daily/weekly/once`，`maxRuns` 必填，`dueAt`、`isDue`、`recordRun`、`validateSchedule` |
+| `src/main/schedule.ts` | 纯逻辑：`ScheduleKind = interval/daily/weekly/once`，`maxRuns` 必填（唯一例外：模型建的目标型任务带 `until` 时可为 `null`，按目标停），`dueAt`、`isDue`、`recordRun`、`validateSchedule`；`planScheduleCheck`（`checkCommand` 退出码 0 达成 / 1 没变化不叫醒 / 其他出错，连续 3 次暂停） |
 | `src/main/scheduleStore.ts` | `~/.kirolex/schedules/<id>.json`，函数都收 `home` 参数（测试传临时目录） |
 | `index.ts` | `scheduleTicker`（20 s 一跳）、`runScheduledJob`（**先记账再发** → `sendPromptOnce`）、`schedulesInFlight`、`schedule:create/list/pause/remove` + 广播 `schedule:changed` |
 | `src/main/loopStore.ts` | `~/.kirolex/loop-runs/<sid>.json`，主进程持有的轮次计数器，`beginRound` 发送前先落盘；IPC `loop:persist / begin-round / read / list-live / clear` |

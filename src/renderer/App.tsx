@@ -96,9 +96,10 @@ declare global {
       loopClear?: (sessionId: string) => Promise<{ ok: boolean }>;
       /** SCHEDULED TASKS. The ticker is in main, so a job fires with no window open. */
       scheduleCreate?: (sessionId: string, spec: any) => Promise<{ ok: boolean; id?: string; error?: string; nextRunAt?: number | null; describe?: string }>;
-      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null }>>;
+      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null }>>;
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
+      scheduleSetExpiry?: (id: string, mode: 'extend' | 'never') => Promise<{ ok: boolean; error?: string; expiresAt?: number | null }>;
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
       /** 模型起的后台命令 / 监视（进程在 main 里）。 */
       bgList?: () => Promise<BgJobRow[]>;
@@ -966,6 +967,7 @@ const App: React.FC = () => {
     scheduleNow,
     pauseSchedule,
     cancelSchedule,
+    setScheduleExpiry,
     bgJobs,
     stopBgJob,
     stopLoop,
@@ -4023,6 +4025,7 @@ const App: React.FC = () => {
         scheduleSummary={scheduleSummaryFor(sid)}
         onPauseSchedule={(id, paused) => void pauseSchedule(id, paused)}
         onCancelSchedule={(id) => void cancelSchedule(id)}
+        onSetScheduleExpiry={(id, mode) => void setScheduleExpiry(id, mode)}
         bgJobs={bgJobsFor(sid)}
         onStopBgJob={(jobId) => void stopBgJob(jobId)}
         onStopLoop={() => { if (sid) void stopLoop(sid); }}

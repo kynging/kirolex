@@ -4,6 +4,25 @@ export const ZH_WAKE: Record<string, string> = {
   'kind must be one of interval / daily / weekly / once': 'kind 只能是 interval / daily / weekly / once',
   'maxRuns is required for a recurring job (how many times it may run at most)': '循环任务必须给 maxRuns（最多跑几次）',
   'Expired': '已过期',
+  'Goal reached': '目标达成',
+  'checkCommand needs until (what counts as reached)': 'checkCommand 需要配 until（写清什么情况算达成）',
+  '✅ The check command exited with 0: the goal is reached and this scheduled task has ended. Give the final report.':
+    '✅ 检查命令退出码 0：目标已达成，这个定时任务已自动结束。请做最终汇报。',
+  '🔎 The check command exited with 1 (not reached yet), and its output changed:': '🔎 检查命令退出码 1（还没达成），输出和上次不同：',
+  'timed out': '超时',
+  'could not run': '没能运行',
+  'exit code {code}': '退出码 {code}',
+  '⏸️ The check command of a scheduled task failed {n} times in a row ({why}), so the task was paused. Fix the command, then resume it at the top of the chat, or cancel it.':
+    '⏸️ 定时任务的检查命令连续出错 {n} 次（{why}），任务已自动暂停。修好命令后在聊天顶部继续它，或者取消它。',
+  '⚠️ The check command failed ({why}) {n} times in a row, so this scheduled task paused itself until the user resumes it:':
+    '⚠️ 检查命令连续出错 {n} 次（{why}），这个定时任务已自动暂停，等用户修好命令后继续：',
+  '⚠️ The check command failed ({why}), {n} time(s) in a row; after {max} the task pauses itself:':
+    '⚠️ 检查命令出错（{why}），已连续 {n} 次；连续 {max} 次会自动暂停任务：',
+  '🎯 Goal: {until}': '🎯 目标：{until}',
+  '(This is scheduled task {id}. Once the goal is reached, call schedule_delete with id {id} to end it; until then just finish this turn and you will be called again on schedule.)':
+    '（这是定时任务 {id}。目标达成后调用 schedule_delete（id {id}）结束它；还没达成就照常结束这一轮，到点会再叫你。）',
+  'Scheduled task ended: {why}, but the goal was not reached yet ({schedule}, ran {n} time(s)). Goal: {until}':
+    '定时任务结束：{why}，但目标还没达成（{schedule}，共运行 {n} 次）。目标：{until}',
   // ── bgJobs.ts ──
   '{n} sec': '{n} 秒',
   '{m} min {s} sec': '{m} 分 {s} 秒',

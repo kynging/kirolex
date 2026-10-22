@@ -14,6 +14,15 @@ export const ZH_CHAT: Record<string, string> = {
   'Ran {budget}': '已运行 {budget}',
   '{n} jobs in total': '共 {n} 个任务',
   'Last failure: {error}': '上次失败：{error}',
+  'Ran {n} · stops when the goal is reached': '已运行 {n} 次 · 按目标停',
+  'Expires {when}': '{when} 到期',
+  // ── 聊天顶部定时任务横幅：目标 / 延长 / 不过期 ──
+  '🎯 Goal: {goal}': '🎯 目标：{goal}',
+  'Goal (the job stops once this is reached): {goal}': '目标（达成后任务就结束）：{goal}',
+  '⏳ Extend 7 days': '⏳ 延长 7 天',
+  'Push the expiry back by 7 days': '把到期时间往后推 7 天',
+  '♾️ Never expire': '♾️ 不过期',
+  'Keep it until the goal is reached or you cancel it (only you can set this; the model cannot)': '一直留着，直到目标达成或你取消它（只有你能这样设，模型不能）',
   // ── bgJobsView.ts / 后台任务行 / 由模型创建 ──
   '{n}s': '{n} 秒',
   '{h}h {m}m': '{h} 小时 {m} 分钟',

@@ -3,7 +3,8 @@
  *
  *   · `schedule_create / schedule_list / schedule_delete`：定时提示。**复用**现有的定时任务
  *     （`schedule.ts` / `scheduleStore.ts` / index.ts 的 `runScheduledJob` 和 20 秒一跳的计时器）——
- *     关窗也触发、按次计费、重启保留，只是多标一句「由模型创建」、循环类默认 7 天过期。
+ *     关窗也触发、按次计费、重启保留，只是多标一句「由模型创建」、循环类默认 7 天过期（`expiresInDays` 1–30）。
+ *     目标型任务（`until` + 可选 `checkCommand`）：按目标停，检查命令在本机跑、没变化不叫醒模型。
  *     到点把 prompt 发进**创建它的那条会话**。`once` + `delaySec` 就是「N 秒后叫醒我继续」。
  *   · `bg_run / bg_status / bg_stop`：后台命令，退出时把退出码 + 输出末尾发回会话（`bgJobs.ts`）。
  *   · `watch`：长期运行的命令，每行 stdout 一个事件唤醒会话。
@@ -12,7 +13,7 @@
  * 纯逻辑，不 import electron。
  */
 
-import { modelScheduleFromArgs, type ScheduleSpec } from './schedule.ts';
+import { CHECK_ERROR_LIMIT, MODEL_SCHEDULE_MAX_DAYS, MODEL_SCHEDULE_MIN_DAYS, modelScheduleFromArgs, type ScheduleSpec } from './schedule.ts';
 import {
   BG_DEFAULT_TIMEOUT_SEC, BG_MAX_TIMEOUT_SEC, MAX_JOBS_PER_SESSION, WATCH_DEFAULT_TIMEOUT_SEC, WATCH_MAX_TIMEOUT_SEC,
   WATCH_COALESCE_MS, WATCH_RATE_LIMIT, formatDuration, type BgJobView, type BgStartInput,
@@ -27,12 +28,15 @@ export interface WakeScheduleRow {
   describe: string;
   prompt: string;
   runs: number;
-  maxRuns: number;
+  /** `null`：目标型任务，不按次数停。 */
+  maxRuns: number | null;
   paused: boolean;
   terminal: string | null;
   nextRunAt: number | null;
   createdBy?: 'model';
   expiresAt?: number | null;
+  until?: string;
+  checkCommand?: string;
 }
 
 export interface WakeHost {
@@ -66,8 +70,14 @@ export function wakeToolDefs(): Array<{ name: string; description: string; input
       description: `安排一条**定时提示**：到点把 prompt 作为一条新消息发进这条会话，你带着上下文继续。${WHEN}\n`
         + '用法：`once` + `delaySec` = 「N 秒后叫醒我继续」；`interval` + `everySec`（最短 60 秒）= 每隔一段时间看一次；'
         + '`daily` / `weekly` + `atTime`（HH:MM，本地时间）+ `weekday`（0=周日）。'
-        + `循环类必须给 maxRuns（最多跑几次，每次都要花一轮），默认 7 天后过期；单会话最多 ${MAX_SCHEDULES_PER_SESSION} 个。`
-        + '用户能在聊天顶部看到并停掉它（标「由模型创建」）。',
+        + `循环类要给 maxRuns（最多跑几次，每次都要花一轮），默认 7 天后过期（\`expiresInDays\` 可设 ${MODEL_SCHEDULE_MIN_DAYS}–${MODEL_SCHEDULE_MAX_DAYS} 天）；单会话最多 ${MAX_SCHEDULES_PER_SESSION} 个。\n`
+        + '**要「盯到某件事结束」**（例如每 30 分钟查一次，直到几个任务都合并）：用 `until` 写清什么情况算达成，**不要拍一个 maxRuns**'
+        + '（事先不知道要跑几次；给了 until 就可以不给 maxRuns，按目标停）。每次到点的消息里会带上这条目标，达成后你调用 schedule_delete 结束它。'
+        + '能用一条命令判断的，再给 `checkCommand`：到点先跑这条命令、不叫醒你 —— 退出码 0 = 已达成（任务自动结束，叫醒你做最终汇报）；'
+        + '1 = 还没达成（输出和上次一样就跳过这一次、不叫醒你，输出变了才带着新输出叫醒你）；其他退出码 / 超时算出错（叫醒你并附上错误输出，'
+        + `连续 ${CHECK_ERROR_LIMIT} 次出错自动暂停）。所以命令的输出只打印「状态」，别带时间戳之类每次都变的东西。`
+        + '`checkCommand` **只在用户本机跑**（同 bg_run：cwd = 这条会话的本地工作目录，远程会话也是本机，不在远程机器上跑），超时同 bg_run 的默认值。\n'
+        + '用户能在聊天顶部看到并停掉它（标「由模型创建」），也能延长过期时间或改成不过期。',
       inputSchema: {
         type: 'object',
         properties: {
@@ -78,7 +88,10 @@ export function wakeToolDefs(): Array<{ name: string; description: string; input
           weekday: { type: 'number', description: 'weekly：0 = 周日 … 6 = 周六' },
           atEpoch: { type: 'number', description: 'once：触发时刻（epoch 毫秒）' },
           delaySec: { type: 'number', description: 'once：多少秒之后触发（和 atEpoch 二选一）' },
-          maxRuns: { type: 'number', description: '最多跑几次。interval / daily / weekly 必填；once 默认 1' },
+          maxRuns: { type: 'number', description: '最多跑几次。interval / daily / weekly 必填（给了 until 时可不填，按目标停）；once 默认 1' },
+          until: { type: 'string', description: '目标：写清什么情况算达成，例如「d0a22e82、66540cd0 都 done 或 cancelled」。达成后调用 schedule_delete' },
+          checkCommand: { type: 'string', description: '可选，需配 until：到点先在用户本机跑的检查命令（语法同 local_bash）。退出码 0 = 达成，1 = 还没达成，其他 = 出错' },
+          expiresInDays: { type: 'number', description: `循环类多少天后过期，${MODEL_SCHEDULE_MIN_DAYS}–${MODEL_SCHEDULE_MAX_DAYS}，默认 7（不能设成不过期）` },
         },
         required: ['prompt', 'kind'],
       },
@@ -187,7 +200,9 @@ export async function callWakeTool(
       const r = host.createSchedule(sessionId, parsed.spec, parsed.expiresAt);
       if (!r.ok) return err(`没建：${r.error || '未知原因'}`);
       return {
-        text: `已建定时任务 ${r.id}：${r.describe || ''}，最多 ${parsed.spec.maxRuns} 次`
+        text: `已建定时任务 ${r.id}：${r.describe || ''}，${parsed.spec.maxRuns === null ? '不按次数停、按目标停' : `最多 ${parsed.spec.maxRuns} 次`}`
+          + `${parsed.spec.until ? `，目标：${parsed.spec.until}` : ''}`
+          + `${parsed.spec.checkCommand ? '，到点先在本机跑检查命令（没变化不叫醒你）' : ''}`
           + `${r.nextRunAt ? `，下一次 ${when(r.nextRunAt)}` : r.nextRunAt === 0 ? '，马上第一次' : ''}`
           + `${parsed.expiresAt ? `，${when(parsed.expiresAt)} 过期` : ''}。到点会作为一条新消息发进这条会话；现在可以结束这一轮了。`,
       };
@@ -196,9 +211,12 @@ export async function callWakeTool(
       const rows = host.listSchedules(sessionId);
       if (!rows.length) return { text: '这条会话没有定时任务。' };
       return {
-        text: rows.map((s) => `${s.id} · ${s.describe} · 已跑 ${s.runs}/${s.maxRuns}`
+        text: rows.map((s) => `${s.id} · ${s.describe} · ${s.maxRuns === null || s.maxRuns === undefined ? `按目标停（已跑 ${s.runs} 次）` : `已跑 ${s.runs}/${s.maxRuns}`}`
           + `${s.terminal ? ` · 已结束（${s.terminal}）` : s.paused ? ' · 已暂停' : ` · 下一次 ${when(s.nextRunAt)}`}`
+          + `${s.expiresAt ? ` · ${when(s.expiresAt)} 过期` : ''}`
           + `${s.createdBy === 'model' ? ' · 由模型创建' : ' · 用户建的'}`
+          + `${s.until ? `\n  目标：${s.until.replace(/\s+/g, ' ').slice(0, 200)}` : ''}`
+          + `${s.checkCommand ? `\n  检查命令：${s.checkCommand.replace(/\s+/g, ' ').slice(0, 200)}` : ''}`
           + `\n  prompt: ${s.prompt.replace(/\s+/g, ' ').slice(0, 200)}`).join('\n'),
       };
     }

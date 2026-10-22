@@ -119,3 +119,22 @@ describe('one chat, one line — even with several jobs', () => {
     assert.equal(summary!.hasError, true);
   });
 });
+
+describe('目标型任务（until）在聊天顶部那条上', () => {
+  const now = 1_000_000;
+  test('显示目标；不按次数停时写「按目标停」而不是 n/null', () => {
+    const s = sessionScheduleSummary([view({ maxRuns: null, runs: 300, until: 'd0a22e82 done', createdBy: 'model', expiresAt: now + 3 * 86400_000 })], now, 'zh');
+    assert.ok(s, '跑了很多次也还活着');
+    assert.equal(s!.goal, 'd0a22e82 done');
+    assert.match(s!.text, /按目标停/);
+    assert.doesNotMatch(s!.text, /null/);
+    assert.equal(s!.expiresAt, now + 3 * 86400_000, '带着过期时间（横幅据此给「延长 / 不过期」）');
+    assert.match(s!.text, /到期/);
+  });
+
+  test('普通任务没有目标；不过期的任务不给过期时间', () => {
+    const s = sessionScheduleSummary([view()], now, 'zh');
+    assert.equal(s!.goal, null);
+    assert.equal(s!.expiresAt, null);
+  });
+});
