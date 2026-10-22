@@ -19,9 +19,13 @@ export interface SessionInfo {
   dir?: string;
   /**
    * 远程会话这一回实际拿到的本机工具（主进程 `ensureLocalTools` 最近一次准备的结果）。本地会话为 null / 没有。
-   * `forwarded` 不含 kirolex-local（它总在）；`skipped` 是组合 / 设置名单里没转发成的，带原因。
+   * `forwarded` 不含 kirolex-local（它总在）；`skipped` 是组合 / 设置名单里没转发成的，带原因；
+   * `unavailable` 是转发了但探测失败的（`forwarded` 里也有它，显示时标「不可用（原因）」，重试成功后主进程清掉）。
    */
-  localTools?: { state: 'ready' | 'not-ready' | 'failed'; forwarded: string[]; skipped: Array<{ name: string; reason: string }> } | null;
+  localTools?: {
+    state: 'ready' | 'not-ready' | 'failed'; forwarded: string[]; skipped: Array<{ name: string; reason: string }>;
+    unavailable?: Array<{ name: string; reason: string }>;
+  } | null;
 }
 
 export interface InfoRow {
@@ -74,11 +78,19 @@ function localToolsRow(lt: NonNullable<SessionInfo['localTools']>, t: T): InfoRo
         : t('Not prepared yet (shown after the session connects)'),
     };
   }
-  const names = ['kirolex-local', ...lt.forwarded];
+  const down = lt.unavailable || [];
+  const names = usableLocalTools(lt);
+  const broken = down.map((u) => t('{name} (unavailable: {reason})', { name: u.name, reason: u.reason }));
   const skipped = lt.skipped.length
     ? t('; not forwarded: {list}', { list: lt.skipped.map((s) => `${s.name} (${s.reason})`).join(', ') })
     : '';
-  return { key: 'tools', label, value: `${names.join(', ')}${skipped}`, copy: names.join(', ') };
+  return { key: 'tools', label, value: `${[...names, ...broken].join(', ')}${skipped}`, copy: names.join(', ') };
+}
+
+/** 眼下能用的本机工具名（kirolex-local 打头，去掉探测失败的）。 */
+function usableLocalTools(lt: NonNullable<SessionInfo['localTools']>): string[] {
+  const down = new Set((lt.unavailable || []).map((u) => u.name));
+  return ['kirolex-local', ...lt.forwarded.filter((n) => !down.has(n))];
 }
 
 /**
@@ -93,6 +105,6 @@ export function sessionInfoText(info: SessionInfo): string {
     `where=${remote ? remote.sshHost : 'local'}`,
     `engine=${info.engine || 'kiro'}`,
     `dir=${info.dir || ''}`,
-    ...(info.localTools?.state === 'ready' ? [`localTools=${['kirolex-local', ...info.localTools.forwarded].join(',')}`] : []),
+    ...(info.localTools?.state === 'ready' ? [`localTools=${usableLocalTools(info.localTools).join(',')}`] : []),
   ].join('\n');
 }

@@ -79,6 +79,7 @@ import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './session
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward, httpProbeNotice,
   remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, type ForwardListItem,
+  markForwardUnavailable, clearForwardUnavailable, type ForwardUnavailable,
 } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
@@ -1923,7 +1924,34 @@ function unpinSessionNotice(sessionId: string, prefix: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }> }>();
+type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[] };
+const localToolsBySession = new Map<string, LocalToolsSpec>();
+
+/**
+ * 一个中转 HTTP MCP 的探测结果记到**这份** spec 上 —— 以前失败只发一句提示，会话信息和运行环境说明照旧列为可用。
+ * spec 已被换掉（重连 / 换组合又准备了一遍）就不记：那一轮有它自己的探测。成功清掉（重连重探的那次）；
+ * 失败不摘代理，远端下次调用成功时由 local MCP 服务的 `onProxyOk` 清掉（见 `forwardRecovered`）。
+ * 返回 true = 这次失败记下了，调用方在会话里说一句（`httpProbeNotice`）。
+ */
+function noteHttpProbe(sessionId: string, spec: LocalToolsSpec, name: string, r: { ok: boolean; toolCount: number; error?: string }): boolean {
+  if (localToolsBySession.get(sessionId) !== spec) return false;
+  if (r.ok) {
+    clearForwardUnavailable(spec, name);
+    logger.info('localmcp', `中转 MCP「${name}」探测通过：${r.toolCount} 个工具 sessionId=${sessionId}`);
+    return false;
+  }
+  markForwardUnavailable(spec, name, r.error || '');
+  logger.warn('localmcp', `中转 MCP「${name}」探测失败 sessionId=${sessionId}: ${r.error}`);
+  return true;
+}
+
+/** `onProxyOk`：远端再调通了一个记成不可用的中转 MCP：清掉（会话信息、下一轮的运行环境说明跟着恢复），说一句。 */
+function forwardRecovered(sessionId: string, name: string): void {
+  const lt = localToolsBySession.get(sessionId);
+  if (!lt || !clearForwardUnavailable(lt, name)) return;
+  logger.info('localmcp', `中转 MCP「${name}」调用成功，恢复为可用 sessionId=${sessionId}`);
+  sessionNotice(sessionId, tr('✅ The MCP "{name}" forwarded from this machine works again.', { name }));
+}
 
 /**
  * **只起一个** MCP server ——「重复利用」顺手挖出来的一个真 bug。
@@ -1952,6 +1980,7 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
       call: (name, args, sid) => localBrowser().tools.call(name, args, sid),
     },
     wake: wakeMcpTools,   /* schedule_* / bg_* / watch（见 wakeTools.ts） */
+    onProxyOk: forwardRecovered,
   }).then((srv) => { localMcpServer = srv; return srv; })
     .finally(() => { localMcpStarting = undefined; });
   return localMcpStarting;
@@ -2229,7 +2258,7 @@ async function ensureLocalTools(
       }
       server.setProxies(sessionId, entries);
       const http = entries.filter(isHttpForward);
-      const spec = {
+      const spec: LocalToolsSpec = {
         remotePort, localPort: server.port(), agentOverride,
         forwarded: entries.filter((e) => !isHttpForward(e)).map((e) => e.name),
         forwardedHttp: http.map((e) => e.name),
@@ -2243,19 +2272,14 @@ async function ensureLocalTools(
       if (skippedReasons.length) {
         logger.info('localmcp', `没转发 sessionId=${sessionId}：${skippedReasons.map((s) => `${s.name}（${s.reason}）`).join('; ')}`);
       }
-      /* 探测，但不挡会话（同 Kiro 分支） */
-      for (const h of http) {
-        void probeHttpMcp(h, { log: (level, message) => logger[level]('localmcp', message) }).then((r) => {
-          if (r.ok) {
-            logger.info('localmcp', `中转 MCP「${h.name}」探测通过：${r.toolCount} 个工具 sessionId=${sessionId}`);
-            return;
-          }
-          sessionNotice(sessionId, httpProbeNotice(h.name, r.error || ''));
-          logger.warn('localmcp', `中转 MCP「${h.name}」探测失败 sessionId=${sessionId}: ${r.error}`);
-        }).catch(() => { /* 探测永远不能让会话准备失败 */ });
-      }
       localToolsBySession.set(sessionId, spec);
       toollessSessions.delete(sessionId);
+      /* 探测，但不挡会话（同 Kiro 分支）；先登记 spec，失败才记得到它上面（`noteHttpProbe`） */
+      for (const h of http) {
+        void probeHttpMcp(h, { log: (level, message) => logger[level]('localmcp', message) })
+          .then((r) => { if (noteHttpProbe(sessionId, spec, h.name, r)) sessionNotice(sessionId, httpProbeNotice(h.name, r.error || '')); })
+          .catch(() => { /* 探测永远不能让会话准备失败 */ });
+      }
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
       return spec;
     }
@@ -2278,17 +2302,8 @@ async function ensureLocalTools(
     /*
       **探测，但不挡会话**：密钥错 / 上游连不上时在会话里说一句（同「本地工具通道没起来」那种提示），
       会话照常起来 —— local_* 和别的转发都不受影响，调到这个 MCP 时也会拿到同样可读的错误。
+      （探测放在下面 spec 登记之后：失败要记到那份 spec 上，见 `noteHttpProbe`。）
     */
-    for (const spec of forwardable.filter(isHttpForward)) {
-      void probeHttpMcp(spec, { log: (level, message) => logger[level]('localmcp', message) }).then((r) => {
-        if (r.ok) {
-          logger.info('localmcp', `中转 MCP「${spec.name}」探测通过：${r.toolCount} 个工具 sessionId=${sessionId}`);
-          return;
-        }
-        sessionNotice(sessionId, httpProbeNotice(spec.name, r.error || ''));
-        logger.warn('localmcp', `中转 MCP「${spec.name}」探测失败 sessionId=${sessionId}: ${r.error}`);
-      }).catch(() => { /* 探测永远不能让会话准备失败 */ });
-    }
     const usedBase = parseAgentBase(agentOut);
     if (profile.kiroAgent && usedBase === 'default') {
       sessionNotice(sessionId, tr('⚠️ {host} has no agent "{agent}", so the default agent is used. To use it, create a config with that name on that machine.', { host: remote.sshHost, agent: profile.kiroAgent }));
@@ -2296,13 +2311,18 @@ async function ensureLocalTools(
     } else if (usedBase && usedBase !== 'default') {
       logger.info('localmcp', `远端用它自己的 agent「${usedBase}」做底子 sessionId=${sessionId}`);
     }
-    const spec = {
+    const spec: LocalToolsSpec = {
       remotePort, localPort: server.port(), agentOverride,
       forwarded: plan.stdioNames,
       forwardedHttp: plan.httpNames,
     };
     localToolsBySession.set(sessionId, spec);
     toollessSessions.delete(sessionId);
+    for (const h of forwardable.filter(isHttpForward)) {
+      void probeHttpMcp(h, { log: (level, message) => logger[level]('localmcp', message) })
+        .then((r) => { if (noteHttpProbe(sessionId, spec, h.name, r)) sessionNotice(sessionId, httpProbeNotice(h.name, r.error || '')); })
+        .catch(() => { /* 探测永远不能让会话准备失败 */ });
+    }
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
     return spec;
   } catch (err: any) {
@@ -2768,6 +2788,8 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     /* 从本机转发过去的那些（`playwright`…）—— 它们作用在用户机器上，这件事必须说 */
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
     forwardedHttp: localToolsBySession.get(sessionId)?.forwardedHttp,
+    /* 探测失败的：不再列为可用，另说一句当前不可用（重试成功后清掉，下一轮就恢复） */
+    unavailable: localToolsBySession.get(sessionId)?.unavailable,
   });
 }
 
@@ -13373,7 +13395,7 @@ app.whenReady().then(async () => {
           localTools: !sshHost ? null : (() => {
             const lt = localToolsBySession.get(sessionId);
             if (!lt) return { state: toollessSessions.has(sessionId) ? 'failed' : 'not-ready', forwarded: [], skipped: [] };
-            return { state: 'ready', forwarded: [...(lt.forwarded || []), ...(lt.forwardedHttp || [])], skipped: lt.skipped || [] };
+            return { state: 'ready', forwarded: [...(lt.forwarded || []), ...(lt.forwardedHttp || [])], skipped: lt.skipped || [], unavailable: lt.unavailable || [] };
           })(),
         },
       };

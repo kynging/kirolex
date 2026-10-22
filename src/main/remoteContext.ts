@@ -16,7 +16,7 @@
 
 import { localActionHelp } from './localAction.ts';
 import { localToolsHelp } from './remoteLocalTools.ts';
-import { forwardHelp, forwardHttpHelp } from './forwardMcp.ts';
+import { forwardHelp, forwardHttpHelp, unavailableForwardHelp, type ForwardUnavailable } from './forwardMcp.ts';
 
 export interface RemoteContextInput {
   /** 给人看的机器名（设置里的 label）。 */
@@ -60,6 +60,11 @@ export interface RemoteContextInput {
    * 别在远端另配同名的直连（那里没有密钥，出口 IP 也不对）。
    */
   forwardedHttp?: string[];
+  /**
+   * 转发了、但探测失败的那些（名字 + 原因）。上面两份里同名的不再列为可用，另起一句注明当前不可用；
+   * 重试成功后主进程会清掉它，下一轮注入就恢复。
+   */
+  unavailable?: ForwardUnavailable[];
 }
 
 /**
@@ -70,6 +75,8 @@ export function remoteContextBlock(input: RemoteContextInput): string {
   const remoteDir = String(input?.remoteDir || '').trim();
   const localDir = String(input?.localDir || '').trim();
   if (!host || !remoteDir) return '';
+  const down = new Set((input.unavailable || []).map((u) => u.name));
+  const usable = (names?: string[]) => (names || []).filter((n) => !down.has(n));
   return [
     '[运行环境：远程]',
     `你现在跑在远端机器 ${host} 上，不是用户的 Mac。你的工具（读写文件、执行命令）都在这台机器上生效。`,
@@ -171,9 +178,10 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     '· 用户的浏览器在**他自己的机器**上，不在这里。'
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
     localActionHelp(),
-    localMachineHelp([...(input.forwarded || []), ...(input.forwardedHttp || [])]),
-    forwardHelp(input.forwarded || []),
-    forwardHttpHelp(input.forwardedHttp || []),
+    localMachineHelp([...usable(input.forwarded), ...usable(input.forwardedHttp)]),
+    forwardHelp(usable(input.forwarded)),
+    forwardHttpHelp(usable(input.forwardedHttp)),
+    unavailableForwardHelp(input.unavailable || []),
     /* 这条只在**他那边真有工程**时成立；没有的话它会把人往错的机器上引 */
     input.hasLocalProject === false ? ''
       : '· 在**他的工程**上跑构建 / 测试 / git 要用 `local_bash` —— 那里才有他的 `node_modules`、'

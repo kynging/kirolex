@@ -225,6 +225,7 @@ export const ZH_SHELL: Record<string, string> = {
   'The local tools connection is not up (it reconnects automatically)': '本地工具通道没起来（会自动重连）',
   'Not prepared yet (shown after the session connects)': '还没准备（会话连上后显示）',
   '; not forwarded: {list}': '；没转发：{list}',
+  '{name} (unavailable: {reason})': '{name}（不可用：{reason}）',
   'Copy all': '全部复制',
   'Copied: {what}': '已复制：{what}',
   'Could not copy: {reason}': '没能复制：{reason}',

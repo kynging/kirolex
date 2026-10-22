@@ -212,6 +212,11 @@ export interface LocalMcpDeps {
   wake?: {
     call(name: string, args: any, sessionId: string, workdir: string): Promise<{ text: string; isError?: boolean }>;
   };
+  /**
+   * 一个 HTTP 转发拿到了上游的正常答复（不是 JSON-RPC error）。主进程据此把探测失败记下的「当前不可用」清掉 ——
+   * 探测失败不摘代理，远端下次调用 / 重连时的 initialize 照样转过去，成功了就算恢复。
+   */
+  onProxyOk?(sessionId: string, name: string): void;
 }
 
 export interface ToolResult {
@@ -1297,7 +1302,12 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
       }
       try {
         /* 转发的那些：**原样**送进本机那个 server，把它的答复原样送回 —— 中间不解释语义 */
-        const route = (one: any): Promise<any | null> => (proxy ? proxy.call(one) : handleRpc(one, session, deps));
+        const route = (one: any): Promise<any | null> => (proxy ? proxy.call(one).then((r) => {
+          if (proxy instanceof HttpProxy && r && typeof r === 'object' && !r.error && deps.onProxyOk) {
+            try { deps.onProxyOk(session.sessionId, proxyName!); } catch { /* 记状态出错不能连累转发 */ }
+          }
+          return r;
+        }) : handleRpc(one, session, deps));
         const out = Array.isArray(msg)
           ? (await Promise.all(msg.map(route))).filter(Boolean)
           : await route(msg);

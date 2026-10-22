@@ -26,6 +26,7 @@ export const ZH_INDEX_A: Record<string, string> = {
   "⚠️ MCP \"{mcp}\" in combo \"{combo}\" can't be forwarded from this machine ({reason}); it is skipped this time.": '⚠️ 组合「{combo}」的 MCP「{mcp}」没法从本机转发（{reason}），这次先不挂。',
   "⚠️ MCP \"{mcp}\" in the \"forward from this machine\" list can't be forwarded ({reason}); it is skipped this time.": '⚠️ 设置里「远程会话从本机转发的 MCP」名单中的「{mcp}」没法转发（{reason}），这次先不挂。',
   'missing environment variable(s) {vars}': '缺环境变量 {vars}',
+  '✅ The MCP "{name}" forwarded from this machine works again.': '✅ 本机转发的 MCP「{name}」又能用了。',
   '⚠️ {host} has no agent "{agent}", so the default agent is used. To use it, create a config with that name on that machine.': '⚠️ {host} 上没有 agent「{agent}」，改用默认 agent；要用它，请在那台机器上建同名配置。',
   "⚠️ The local tools connection failed ({error}); this remote session can't read or write your files for now. It reconnects automatically.": '⚠️ 本机工具连接没建起来（{error}），这条远程会话暂时读写不了你的文件，会自动重连。',
   "Can't find this machine ({machine}). Was it removed in Settings?": '找不到这台机器（{machine}）—— 设置里删掉了？',

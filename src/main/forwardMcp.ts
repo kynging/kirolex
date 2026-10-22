@@ -225,6 +225,39 @@ export function forwardHttpHelp(names: string[]): string {
     + `报「本机→上游 …」的错是用户本机那头的问题（密钥 / 网络），原样告诉他，别在这里绕。`;
 }
 
+/* ---------------------------------------------- 探测失败：记成「当前不可用」 */
+
+/** 转发了、但探测失败的那些（名字 + 原因）。挂在 `localToolsBySession` 那份 spec 上。 */
+export interface ForwardUnavailable { name: string; reason: string }
+
+/**
+ * 记一条「当前不可用」—— 以前探测失败只发一句提示，会话信息和运行环境说明照旧当它拿到了。
+ * 同名再失败只更新原因。不从 setProxies 里摘掉：代理照留，下次调用 / 重连时自然重试。
+ */
+export function markForwardUnavailable(spec: { unavailable?: ForwardUnavailable[] }, name: string, reason: string): void {
+  const why = String(reason || tr('Unknown error'));
+  const list = (spec.unavailable ||= []);
+  const hit = list.find((u) => u.name === name);
+  if (hit) hit.reason = why;
+  else list.push({ name, reason: why });
+}
+
+/** 重试成功：清掉那条。返回有没有变化（变了才值得在会话里说一句"又能用了"）。 */
+export function clearForwardUnavailable(spec: { unavailable?: ForwardUnavailable[] }, name: string): boolean {
+  const list = spec.unavailable;
+  if (!list?.some((u) => u.name === name)) return false;
+  spec.unavailable = list.filter((u) => u.name !== name);
+  return true;
+}
+
+/** 运行环境说明里那一句：哪些转发的 MCP 现在用不了、为什么（它们已从"可用"的几句里拿掉）。 */
+export function unavailableForwardHelp(list: ForwardUnavailable[]): string {
+  if (!list.length) return '';
+  return `· 这些从用户机器转发的 MCP **当前不可用**（KiroLex 探测失败）：`
+    + `${list.map((u) => `\`${u.name}\`（${u.reason}）`).join('、')}。`
+    + `别指望用它们完成任务；用到时把原因原样告诉用户（多半要他改本机配置），别在这台机器上另配一份去绕。`;
+}
+
 /* ---------------------------------------------- Claude Code / Codex 的「组合」 */
 
 /** 隧道上 `/mcp/<token>/<名字>` 那一段能认的名字（同 `localMcp.ts` 的路由正则）。 */
