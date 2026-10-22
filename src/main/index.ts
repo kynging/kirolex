@@ -89,6 +89,7 @@ import {
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
+import { createAdapterNotes } from './adapterNotes.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
 import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, reviewBackupPrefix, reviewBackupsToPrune, type ReviewTarget } from './reviewAccess.ts';
 import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
@@ -1908,6 +1909,13 @@ function stickySessionNotice(sessionId: string, text: string, group?: string, op
   logger.info('notice', `${sessionId}: ${text.replace(/\s+/g, ' ').slice(0, 160)}`);
 }
 
+/** 撤掉这条会话 group 以 `prefix` 开头的钉住提示 —— 换了机器 / 引擎，旧的那句说的已经不是现状（见 `adapterNotes.forgetPinned`） */
+function unpinSessionNotice(sessionId: string, prefix: string): void {
+  try {
+    mainWindow?.webContents.send('session:notice', { sessionId, text: '', ts: Date.now(), unpin: prefix });
+  } catch { /* 提示永远不能让主流程失败 */ }
+}
+
 /**
  * **本地工具通道** ——「把镜像去掉，给远程配一些能调用本地 MCP 的能力」。
  *
@@ -3163,31 +3171,14 @@ async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'code
  * 进记录的那句（「还没登录」）重启后 `said` 是空的：记录里同组最新那条已经是这句就不再追加（`noteAlreadyInTranscript`）。
  */
 const adapterNotes = (() => {
-  const said = new Set<string>();
-  const staged = new Map<string, Array<{ how: 'note' | 'status'; text: string; group: string }>>();
   const emit = (sid: string, how: 'note' | 'status', text: string, group: string): boolean => {
     if (how === 'status') { stickySessionNotice(sid, text, group, { pinned: true }); return true; }
     const v = textVariants(text);
     if (noteAlreadyInTranscript(store.readTranscript(sid), group, [text, v?.zh || '', v?.en || ''])) return true;
     return noteInSession(sid, text, undefined, group);
   };
-  return {
-    say(sid: string, how: 'note' | 'status', text: string, group: string): void {
-      const key = `${sid}|${group}`;
-      if (said.has(key)) return;
-      if (!store.readRecord(sid)) {
-        const list = (staged.get(sid) || []).filter((x) => x.group !== group);
-        staged.set(sid, [...list, { how, text, group }]);
-        return;
-      }
-      if (emit(sid, how, text, group)) said.add(key);
-    },
-    commit(sid: string): void {
-      const list = staged.get(sid) || [];
-      staged.delete(sid);
-      for (const x of list) if (emit(sid, x.how, x.text, x.group)) said.add(`${sid}|${x.group}`);
-    },
-  };
+  /* 记账（说过了 / 攒着 / 换机器换引擎时 `forgetPinned` 撤掉旧机器那句钉住提示）在 adapterNotes.ts */
+  return createAdapterNotes({ hasRecord: (sid) => !!store.readRecord(sid), emit, unpin: (sid, prefix) => unpinSessionNotice(sid, prefix) });
 })();
 
 /**
@@ -9818,6 +9809,7 @@ app.whenReady().then(async () => {
       rec.profile = { ...rec.profile, remote: target ? { ...target } : undefined } as AgentProfile;
       rec.localDir = nextLocalDir;
       store.writeRecord(rec);
+      adapterNotes.forgetPinned(sessionId);   // 旧机器的钉住提示
       const where = target ? tr('remote machine {host}', { host: String(hostLabelOf(target)) }) : tr('the local machine');
       sessionNotice(sessionId, trConcat(
         tr('🔀 This session now runs on **{where}** (working directory `{dir}`); it connects there next time.', { where, dir: nextLocalDir }),
@@ -9833,6 +9825,7 @@ app.whenReady().then(async () => {
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
     const profile: AgentProfile = { ...oldEntry.profile, remote: target ? { ...target } : undefined };
+    adapterNotes.forgetPinned(sessionId);   // 旧机器的起法说明不再是现状；新机器要的话下面的探测重新钉上
     try {
       if (target) {
         if (engineOf(profile) !== 'kiro') {
@@ -10288,6 +10281,8 @@ app.whenReady().then(async () => {
       if (!rec0) throw new Error(tr('Could not find the record for this session.'));
       rec0.profile = reshape(rec0.profile);
       store.writeRecord(rec0);
+      /* 旧引擎那句钉住的起法说明不再是现状（同换机器） */
+      adapterNotes.forgetPinned(sessionId);
       sessionNotice(sessionId, tr('🔀 This session will run on **{engine}** the next time it opens.', { engine: label }));
       mainWindow?.webContents.send('session:engine-changed', { sessionId, engine });
       logger.info('engine', `切换引擎（未连接）sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`);
@@ -10301,6 +10296,8 @@ app.whenReady().then(async () => {
     const profile = reshape(oldEntry.profile);
     let client: AcpClient | undefined;
     let remoteModels: string[] | undefined;
+    /* 旧引擎那句钉住的起法说明撤掉；新引擎要的话下面的探测重新钉上 */
+    adapterNotes.forgetPinned(sessionId);
     try {
       if (profile.remote?.sshHost) {
         if (engine !== 'kiro') await remoteAdapterCheck(profile.remote, engine, sessionId);

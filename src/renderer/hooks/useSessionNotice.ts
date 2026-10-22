@@ -39,6 +39,10 @@ export function useSessionNotice(sessionId: string | null): { notice: SessionNot
       if (noticeSessionId !== sessionId) return;
       /* 还挂着的那句和新来的同类（同 group，没有 group 就一字不差）→ 显示新的这句、计数（「×3」），不刷屏 */
       setNotice((prev) => mergeNotice(prev, next));
+    }, (noticeSessionId, dropped) => {
+      /* 钉住的那句被撤掉（换了机器 / 引擎）：正显示着它就换下来（还挂着的 sticky 回来，没有就空着）；盖在上面的别的提示不动 */
+      if (noticeSessionId !== sessionId) return;
+      setNotice((prev) => (prev?.pinned && prev.group === dropped.group ? hub.stickyFor(noticeSessionId) ?? null : prev));
     });
   }, [sessionId]);
 

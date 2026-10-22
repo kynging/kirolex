@@ -14,6 +14,7 @@ import { connectFailureNotice } from '../src/renderer/connectFailure.ts';
 import { cleanIpcError } from '../src/renderer/sessionRequestStatus.ts';
 import { notesAfterReload } from '../src/renderer/noticeMerge.ts';
 import { createNoticeHub } from '../src/renderer/sessionNoticeHub.ts';
+import { createAdapterNotes } from '../src/main/adapterNotes.ts';
 
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', ...p), 'utf8');
 const MISSING = 'graviton 上没有 Claude Code 的 ACP 适配器（claude-agent-acp）。设置 → 🖥 机器 → 选中这台机器 →「安装 AI 工具」会装上它。';
@@ -135,5 +136,99 @@ describe('3. 「还没登录」同一个原因只记一条', () => {
     const body = A.slice(at, at + 2200);
     assert.match(body, /notesAfterReload\(/);
     assert.match(body, /readTranscript\(sid\)/);
+  });
+});
+
+/**
+ * 跟进 9432ab38：「已直接用 fnm 的 node 起」钉住以后，换到另一台不需要 fnm 回退的机器（或换了引擎）还挂着旧机器那句 ——
+ * 把旧状态当成了现状。换位置 / 换引擎时清掉这条会话的 adapter-hidden 钉住提示，新机器要的话由新的探测重新钉上。
+ */
+describe('4. 换机器 / 换引擎清掉旧的钉住提示', () => {
+  const GROUP_A = 'adapter-hidden:graviton:claude';
+  const HIDDEN_A = 'graviton 的登录 shell 找不到 Claude Code 适配器，已直接用 fnm 的 node 起。';
+  /* 主进程那半（adapterNotes 的记账）+ 渲染端那半（hub），中间就是 session:notice 那条 IPC */
+  const wire = () => {
+    let cb: ((d: any) => void) | null = null;
+    const hub = createNoticeHub((fn) => { cb = fn; return () => { cb = null; }; });
+    const shown: Array<string | null> = [];
+    const off = hub.subscribe((_sid, n) => shown.push(n.text), (_sid) => shown.push(null));
+    const notes = createAdapterNotes({
+      hasRecord: () => true,
+      emit: (sid, how, text, group) => { if (how === 'status') cb!({ sessionId: sid, text, ts: Date.now(), sticky: true, pinned: true, group }); return true; },
+      unpin: (sid, prefix) => cb!({ sessionId: sid, text: '', ts: Date.now(), unpin: prefix }),
+    });
+    return { hub, notes, shown, off };
+  };
+
+  test('换到不需要 fnm 回退的机器 → 旧机器那句钉住提示消失', () => {
+    const { hub, notes, shown, off } = wire();
+    notes.say('S', 'status', HIDDEN_A, GROUP_A);
+    assert.equal(hub.pinnedFor('S')?.text, HIDDEN_A);
+    notes.forgetPinned('S');   // 换机器（新机器的探测判出来不用回退：什么都不说）
+    assert.equal(hub.pinnedFor('S'), undefined);
+    assert.equal(shown.at(-1), null, '正显示着的那句也要撤掉');
+    assert.equal(hub.stickyFor('S'), undefined, '它也记在 sticky 里：切回这条会话时不能从那儿又冒出来');
+    off();
+  });
+
+  test('同一台机器重连 → 提示还在（也不重复钉）', () => {
+    const { hub, notes, shown, off } = wire();
+    notes.say('S', 'status', HIDDEN_A, GROUP_A);
+    notes.say('S', 'status', HIDDEN_A, GROUP_A);   // 重连又探测了一次
+    assert.equal(hub.pinnedFor('S')?.text, HIDDEN_A);
+    assert.deepEqual(shown, [HIDDEN_A]);
+    off();
+  });
+
+  test('换走再换回来（或新机器也要回退）→ 新的探测重新钉上；别的会话不受影响', () => {
+    const { hub, notes, off } = wire();
+    notes.say('S', 'status', HIDDEN_A, GROUP_A);
+    notes.say('T', 'status', HIDDEN_A, GROUP_A);
+    notes.forgetPinned('S');
+    assert.equal(hub.pinnedFor('T')?.text, HIDDEN_A, '别的会话的钉住提示不动');
+    notes.say('S', 'status', HIDDEN_A, GROUP_A);
+    assert.equal(hub.pinnedFor('S')?.text, HIDDEN_A, '回到原来那台：重新钉上（不是被「说过了」挡掉）');
+    off();
+  });
+
+  test('只清 adapter-hidden 那类：「还没登录」那句的「说过了」不动；别的钉住提示也不动', () => {
+    const said: string[] = [];
+    const notes = createAdapterNotes({ hasRecord: () => true, emit: (_s, _h, text) => { said.push(text); return true; }, unpin: () => {} });
+    notes.say('S', 'note', '还没登录', 'remote-login:graviton:claude');
+    notes.forgetPinned('S');
+    notes.say('S', 'note', '还没登录', 'remote-login:graviton:claude');
+    assert.deepEqual(said, ['还没登录']);
+
+    let cb: ((d: any) => void) | null = null;
+    const hub = createNoticeHub((fn) => { cb = fn; });
+    hub.subscribe(() => {});
+    cb!({ sessionId: 'S', text: '别的钉住', ts: 1, pinned: true, group: 'other:x' });
+    cb!({ sessionId: 'S', text: '', ts: 2, unpin: 'adapter-hidden:' });
+    assert.equal(hub.pinnedFor('S')?.text, '别的钉住');
+  });
+
+  test('新建会话时攒着还没发的那句也作废（换了就不该再钉旧机器的）', () => {
+    let has = false;
+    const said: string[] = [];
+    const notes = createAdapterNotes({ hasRecord: () => has, emit: (_s, _h, text) => { said.push(text); return true; }, unpin: () => {} });
+    notes.say('S', 'status', HIDDEN_A, GROUP_A);
+    notes.forgetPinned('S');
+    has = true;
+    notes.commit('S');
+    assert.deepEqual(said, []);
+  });
+
+  test('接线：换机器、换引擎（连着的、没连着的）都先清掉', () => {
+    const M = read('src', 'main', 'index.ts');
+    const at = M.indexOf('const adapterNotes = (() => {');
+    const body = M.slice(at, at + 2500);
+    assert.match(body, /createAdapterNotes\(/);
+    assert.match(body, /unpinSessionNotice\(/);
+    const target = M.slice(M.indexOf('const hostLabelOf = (t?: RemoteTarget)'), M.indexOf("ipcMain.handle('acp:set-remote-target'"));
+    assert.equal(target.match(/adapterNotes\.forgetPinned\(sessionId\)/g)?.length, 2, '换机器：没连着 / 连着 两条路');
+    const eng = M.slice(M.indexOf("const before = engineOf(oldEntry?.profile || rec0?.profile);"), M.indexOf("const before = engineOf(oldEntry?.profile || rec0?.profile);") + 2500);
+    assert.equal(eng.match(/adapterNotes\.forgetPinned\(sessionId\)/g)?.length, 2, '换引擎：没连着 / 连着 两条路');
+    const U = read('src', 'renderer', 'hooks', 'useSessionNotice.ts');
+    assert.match(U, /prev\?\.pinned/);
   });
 });

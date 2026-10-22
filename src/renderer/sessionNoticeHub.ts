@@ -39,6 +39,11 @@ export interface SessionNotice {
 export interface RawSessionNotice {
   sessionId: string; text: string; ts: number;
   copyRemote?: string[]; sticky?: boolean; pinned?: boolean; variants?: { zh: string; en: string }; group?: string;
+  /**
+   * 不是一句话，是**撤掉**这条会话 group 以它开头的钉住提示（主进程 `unpinSessionNotice`）——
+   * 换了机器 / 引擎，旧机器那句「已直接用 fnm 的 node 起」说的已经不是现状。
+   */
+  unpin?: string;
 }
 
 export function toSessionNotice(d: RawSessionNotice): SessionNotice {
@@ -53,6 +58,8 @@ export function toSessionNotice(d: RawSessionNotice): SessionNotice {
 }
 
 export type NoticeListener = (sessionId: string, next: SessionNotice) => void;
+/** 这条会话钉住的那句被撤掉了（`unpin`）—— 正显示着它的要换下来 */
+export type UnpinListener = (sessionId: string, dropped: SessionNotice) => void;
 
 export function createNoticeHub(attach: (fn: (d: RawSessionNotice) => void) => (() => void) | void) {
   /** 每条会话还挂着的那句 sticky 提示（合并后的）—— **所有会话的都记**：切走再切回来它要还在 */
@@ -60,9 +67,19 @@ export function createNoticeHub(attach: (fn: (d: RawSessionNotice) => void) => (
   /** 每条会话钉住的那句（`pinned`）—— 别的提示不换掉它 */
   const pinnedBySession = new Map<string, SessionNotice>();
   const listeners = new Set<NoticeListener>();
+  const unpinListeners = new Set<UnpinListener>();
   let detach: (() => void) | null = null;
 
   function ingest(d: RawSessionNotice): void {
+    if (d?.sessionId && typeof d.unpin === 'string' && d.unpin) {
+      const cur = pinnedBySession.get(d.sessionId);
+      if (!cur?.group?.startsWith(d.unpin)) return;
+      pinnedBySession.delete(d.sessionId);
+      /* 钉住的那句也是 sticky：它后面还没来过别的话时 sticky 记的就是它，一起撤 */
+      if (stickyBySession.get(d.sessionId)?.group === cur.group) stickyBySession.delete(d.sessionId);
+      for (const fn of unpinListeners) { try { fn(d.sessionId, cur); } catch { /* 一个监听坏了不影响别的 */ } }
+      return;
+    }
     if (!d?.text) return;
     const next = toSessionNotice(d);
     /* 这条会话的下一句提示（不管是不是 sticky）都把上一句 sticky 换掉；同类的 sticky 接着计数 */
@@ -74,13 +91,15 @@ export function createNoticeHub(attach: (fn: (d: RawSessionNotice) => void) => (
 
   return {
     ingest,
-    subscribe(fn: NoticeListener): () => void {
+    subscribe(fn: NoticeListener, onUnpin?: UnpinListener): () => void {
       listeners.add(fn);
+      if (onUnpin) unpinListeners.add(onUnpin);
       if (!detach) {
         try { detach = attach(ingest) || (() => {}); } catch { detach = () => {}; }
       }
       return () => {
         listeners.delete(fn);
+        if (onUnpin) unpinListeners.delete(onUnpin);
         if (!listeners.size && detach) {
           const off = detach; detach = null;
           try { off(); } catch { /* 卸载时 preload 可能已经没了 */ }
