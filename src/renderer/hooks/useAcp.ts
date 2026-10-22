@@ -3288,6 +3288,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       duplicateHistoryRef.current.set(newId, copied);
     }
     duplicateProjectRef.current.set(newId, src.projectId);
+    /*
+      **引擎跟着源会话** —— 分叉 / 复制一条 Claude Code（或 Codex）会话，首条消息建后端时读的是 intendedEngineRef，
+      原来这里不记，主进程按「没传 = kiro」建，于是分叉出来的悄悄成了 Kiro 会话。
+    */
+    if (src.engine && src.engine !== 'kiro') intendedEngineRef.current.set(newId, src.engine);
 
     // Copy the per-session model routing
     const model = sessionModelRef.current.get(sessionId) || DEFAULT_MODEL;
@@ -3315,6 +3320,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         projectId: src.projectId,
         folderId: src.folderId ?? null,
         timestamp: Date.now(),
+        ...(src.engine && src.engine !== 'kiro' ? { engine: src.engine } : null),
       };
       const idx = prev.findIndex((s) => s.id === sessionId);
       if (idx === -1) return [dup, ...prev];

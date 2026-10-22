@@ -75,6 +75,8 @@ import { createControlServer, type ControlServer, type ControlSessionAccess } fr
 import { isControlMessageId, tailEntries } from './controlSessions.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
+import { attachFailureLine, coldProfileBits, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
+import { settleCancelledToolCalls } from './cancelSettle.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import {
@@ -3478,6 +3480,11 @@ function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session
 // closed (it reappears after restart via disk hydrate). In-memory only: after a
 // restart the dir is gone so hydrate never re-adds it.
 const deletedSessionIds = new Set<string>();
+/**
+ * 新建时选的引擎 / 机器：`acp:new-session` 一进来就记、建成才清 —— 建不成的新会话没有记录，
+ * 之后右键换机器 / 目录 / 引擎时 `coldRecordFor` 靠它把这两样补回来（见 `coldRecord.ts`）。
+ */
+const newSessionIntents = new Map<string, NewSessionIntent>();
 // Soft cap on ATTACHED executors (design §8). Dormant sessions are unbounded.
 // Default is a fixed 10 (「默认会话数设为 10」). It used to be auto-sized from RAM/CPU
 // into [4, 16], which on most machines simply meant 16 -- more kiro-cli processes
@@ -7267,6 +7274,8 @@ app.whenReady().then(async () => {
       这边没认）要查的地方完全不同，而这一行就把它们分开。留着不删：这条路以后还会被改。
     */
     logger.info('remote', `new-session ${kiroLexId}: remoteId=${remoteId ?? '(没传)'} project=${projectId || '(无)'} model=${model}`);
+    /* 先记下选了什么：下面任何一步失败，这条会话都没有记录，右键切换时靠它补（`coldRecordFor`） */
+    newSessionIntents.set(kiroLexId, { engine, remoteId: remoteId || undefined, projectId: projectId ?? null });
     { const advRefused = refuseAdvancedProject(projectId, 'new-session'); if (advRefused) throw new Error(advRefused); }
     if (!ensureExecutorCapacity()) {
       throw new Error(tr('All live sessions are busy; cannot start another right now.'));
@@ -7279,6 +7288,7 @@ app.whenReady().then(async () => {
       出现在列表里（`remoteTargets`），选不选由这一次新建决定。
     */
     const remote = findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId);
+    if (remote) newSessionIntents.set(kiroLexId, { engine, remote, remoteId, projectId: projectId ?? derived ?? null });
     if (remoteId && !remote) {
       throw new Error(tr('Remote target {id} not found (did the remotes in your config change?). KiroLex did not guess a machine, so this session was not created.', { id: String(remoteId) }));
     }
@@ -7382,6 +7392,7 @@ app.whenReady().then(async () => {
        以它为准的话每次重连都会把家目录当项目（远程会话就是把整个家目录推上远端）。见 `localDir`。 */
     rec.localDir = resolvedCwd;
     store.writeRecord(rec);
+    newSessionIntents.delete(kiroLexId);
     /* 会话建成、记录落盘了：连接时记下的那句「改用了备用模型」现在写进对话记录 */
     modelFallback.commit(kiroLexId);
     /* 远端适配器探测攒下的那几句（登录 shell 看不到适配器 / 那家 CLI 没登录）同理 */
@@ -8003,6 +8014,14 @@ app.whenReady().then(async () => {
               但会留一个"远端有未取回的改动"并在会话里说一句 —— 绝不让人以为本地是新的。
             */
             const producedOutput = !!(entry.assistantBuf || entry.fileChanges.length);
+            /* Claude / Codex 被停掉的这一轮：被打断的工具不会再有最终状态，落盘前收成 failed、界面同步（`cancelSettle.ts`；kiro 不走） */
+            {
+              const settled = settleCancelledToolCalls(engineOf(entry.profile), result?.stopReason, entry.fileChanges);
+              entry.fileChanges = settled.calls;
+              for (const id of settled.settled) {
+                mainWindow?.webContents.send('acp:update', { sessionId, update: { sessionUpdate: 'tool_call_update', toolCallId: id, status: 'failed' } });
+              }
+            }
             /*
               侧栏 review 的「✓ 确认」在等这一轮的完整回复（见 `askWaiters`）—— 在 flush 清空之前取，
               只取模型自己写的那部分（`wedgeNote` 是 KiroLex 加的说明，不是正文）。
@@ -9807,25 +9826,45 @@ app.whenReady().then(async () => {
    * 而那正是最想把它换个引擎 / 换台机器的时候。这里给它建一份最小的（默认模型 + 渲染层告诉我们的项目），
    * 切换写进去，下次连接就按新的来。删掉过的会话（墓碑）不建 —— 否则会把它复活。
    */
-  const coldRecordFor = (sessionId: string, hint?: { projectId?: string | null }): store.SessionRecord | null => {
+  /*
+    **新建时选的引擎和机器也要进这份记录** —— 原来只带 projectId，一条「远程 Codex」的新会话
+    （远端没装适配器、没建成）右键换个目录就悄悄成了本机 kiro（s_1792637464721_r0sfi7）。
+    先用主进程自己记下的（`newSessionIntents`），再用渲染层 hint 带的；都没有就明说（`coldProfileBits`）。
+  */
+  const coldRecordFor = (sessionId: string, hint?: ColdRecordHint): store.SessionRecord | null => {
     const existing = store.readRecord(sessionId);
     if (existing) return existing;
     if (!/^s_[\w-]+$/.test(sessionId)) return null;
     if (deletedSessionIds.has(sessionId) || loadSessionTombstones().includes(sessionId)) return null;
+    const bits = coldProfileBits(newSessionIntents.get(sessionId), hint, (id) => findRemoteTarget(KIROLEX_CONFIG_PATH, id));
+    const engine = bits.engine;
     const profile: AgentProfile = {
-      model: DEFAULT_MODEL, preferredModel: DEFAULT_MODEL, permissionMode: 'auto-approve',
+      model: engine === 'kiro' ? DEFAULT_MODEL : 'default',
+      preferredModel: engine === 'kiro' ? DEFAULT_MODEL : 'default',
+      permissionMode: 'auto-approve',
       /* KiroLex Advanced 专属的 flow 项目不放进去：建成未分组 */
-      ...(hint?.projectId && !refuseAdvancedProject(hint.projectId, 'cold-record') ? { projectId: hint.projectId } : {}),
+      ...(bits.projectId && !refuseAdvancedProject(bits.projectId, 'cold-record') ? { projectId: bits.projectId } : {}),
+      ...(engine !== 'kiro' ? { engine } : {}),
+      ...(bits.remote ? { remote: { ...bits.remote } } : {}),
     };
-    logger.info('session', `新会话还没有记录（没连上过），切换前先建一份 sessionId=${sessionId} project=${hint?.projectId || '(无)'}`);
-    return store.createSession(sessionId, profile);
+    logger.info('session', `新会话还没有记录（没连上过），切换前先建一份 sessionId=${sessionId} project=${bits.projectId || '(无)'} engine=${engine} remote=${bits.remote?.sshHost || 'local'} 来源=${bits.source}${bits.lost ? '（补不全）' : ''}`);
+    const rec = store.createSession(sessionId, profile);
+    if (bits.remoteMissing) {
+      sessionNotice(sessionId, tr('⚠ This new chat was created for remote target {id}, which is no longer in your settings. It was saved as a local session.', { id: bits.remoteMissing }));
+    } else if (bits.lost) {
+      sessionNotice(sessionId, tr('⚠ KiroLex could not tell which engine / machine this new chat was created with, so it was saved as {engine} on {where}. Switch it in the right-click menu if that is wrong.', {
+        engine: ENGINE_LABEL[engine],
+        where: bits.remote ? String(labelForHost(KIROLEX_CONFIG_PATH, bits.remote.sshHost) || bits.remote.sshHost) : tr('the local machine'),
+      }));
+    }
+    return rec;
   };
 
   const applySessionTarget = async (
     sessionId: string,
     target: RemoteTarget | undefined,
     localDir?: string,
-    hint?: { projectId?: string | null },
+    hint?: ColdRecordHint,
   ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
     /* 先等在飞的 attach 落定：它按旧记录在本机起，不等的话徽标是远端、执行器是本机（见 attachGate.ts） */
     await settleInFlightAttach(attachInFlight, sessionId);
@@ -9991,7 +10030,7 @@ app.whenReady().then(async () => {
     sessionId: string,
     remoteId: string | null,
     localDir?: string,
-    hint?: { projectId?: string | null },
+    hint?: ColdRecordHint,
   ) => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'set-remote-target'); if (advRefused) throw new Error(advRefused); }
     const target = remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined;
@@ -10340,7 +10379,7 @@ app.whenReady().then(async () => {
     }
     return next;
   };
-  const switchEngineImpl = async (sessionId: string, engineArg: string, hint?: { projectId?: string | null }, fromPending?: boolean): Promise<any> => {
+  const switchEngineImpl = async (sessionId: string, engineArg: string, hint?: ColdRecordHint, fromPending?: boolean): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-engine'); if (advRefused) throw new Error(advRefused); }
     const engine = engineOf({ engine: engineArg });
     const label = ENGINE_LABEL[engine];
@@ -10425,7 +10464,7 @@ app.whenReady().then(async () => {
       emitSessionBusy(sessionId);
     }
   };
-  ipcMain.handle('acp:switch-engine', (_event, sessionId: string, engineArg: string, hint?: { projectId?: string | null }) =>
+  ipcMain.handle('acp:switch-engine', (_event, sessionId: string, engineArg: string, hint?: ColdRecordHint) =>
     switchEngineImpl(sessionId, engineArg, hint));
 
   /**
@@ -11917,6 +11956,13 @@ app.whenReady().then(async () => {
     /* 连上、resume / 新起后端会话、记录都成了：连接时记下的「改用了备用模型」现在写 */
     modelFallback.commit(sessionId);
     return { ok: true, freshBackend: freshBackendResult };
+    } catch (err) {
+      /*
+        **失败要进日志** —— 原来一行都没有：本机 Claude Code 适配器没装（adapterMissingMessage）时，
+        日志停在「本地会话挂上 kirolex-local」就没下文了，看着像卡住。只在这一份 attach 里记一次（跟进来的不重复记）。
+      */
+      logger.warn('attach', attachFailureLine(sessionId, store.readRecord(sessionId)?.profile, err));
+      throw err;
     } finally {
       /* 没走到上面那一步（中途失败 / 被删）：记下的那句作废 */
       modelFallback.discard(sessionId);

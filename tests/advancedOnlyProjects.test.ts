@@ -353,7 +353,7 @@ describe('index.ts: the send / sync / restore paths use the shared project crite
 
   test('a cold record never lands in a hidden project', () => {
     const fn = main.slice(main.indexOf('const coldRecordFor = ('));
-    assert.match(fn.slice(0, 900), /hint\?\.projectId && !refuseAdvancedProject\(hint\.projectId, 'cold-record'\)/);
+    assert.match(fn.slice(0, 900), /bits\.projectId && !refuseAdvancedProject\(bits\.projectId, 'cold-record'\)/);
   });
 });
 

@@ -151,7 +151,7 @@ describe('自动改用备用模型：进对话记录，说清实际用的是哪�
     assert.match(M, /modelFallback\.discard\(sessionId\);   \/\/ 没换成：连上时记下的那句作废\s*\n\s*logger\.warn\('engine'/);
     assert.match(M, /modelFallback\.discard\(sessionId\);   \/\/ 没换成：连上时记下的那句作废\s*\n\s*logger\.warn\('mcp-combo'/);
     /* attach：成功返回前 commit，finally 里 discard（中途失败 / 被删） */
-    assert.match(M, /modelFallback\.commit\(sessionId\);\s*\n\s*return \{ ok: true, freshBackend: freshBackendResult \};\s*\n\s*\} finally \{[\s\S]{0,80}modelFallback\.discard\(sessionId\);/);
+    assert.match(M, /modelFallback\.commit\(sessionId\);\s*\n\s*return \{ ok: true, freshBackend: freshBackendResult \};\s*\n\s*\} catch \(err\) \{[\s\S]{0,600}?throw err;\s*\n\s*\} finally \{[\s\S]{0,80}modelFallback\.discard\(sessionId\);/);
     /* 候选循环里不直接写 */
     const fAt = M.indexOf('async function connectWithModelFallback(');
     const fBody = M.slice(fAt, M.indexOf('\n}\n', fAt));

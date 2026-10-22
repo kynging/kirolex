@@ -4139,6 +4139,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     <PathSessionContext.Provider value={currentSessionId || ''}>
     <div
       className={`chat-main ${isDragOver ? 'drag-over' : ''}${readOnly ? ' chat-main-pane' : ''}`}
+      /* Claude / Codex 会话的样式钩子（命令面板「失败」标红，见 global.css）；kiro 会话不带，样式不变 */
+      data-engine={nonKiro ? engine : undefined}
       onDrop={readOnly ? undefined : handleDrop}
       onDragOver={readOnly ? undefined : handleDragOver}
       onDragEnter={readOnly ? undefined : handleDragEnter}
@@ -4896,15 +4898,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         </span>
                         <span className="composer-usage-label">{usage.contextPercent.toFixed(0)}%</span>
                       </button>
-                      <button
-                        type="button"
-                        className="composer-credits composer-usage-action"
-                        onClick={onResetCredits}
-                        disabled={!currentSessionId || isStreaming}
-                        title={t("Reset this session's local Credits counter")}
-                      >
-                        {usage.credits.toFixed(2)} {t('credits')}
-                      </button>
+                      {/* Credits 是 kiro 的计费口径（`_kiro.dev/metadata`）；Claude Code / Codex 不报它，原来永远显示「0.00 credits」 */}
+                      {!nonKiro && (
+                        <button
+                          type="button"
+                          className="composer-credits composer-usage-action"
+                          onClick={onResetCredits}
+                          disabled={!currentSessionId || isStreaming}
+                          title={t("Reset this session's local Credits counter")}
+                        >
+                          {usage.credits.toFixed(2)} {t('credits')}
+                        </button>
+                      )}
                     </>
                   ) : null}
 

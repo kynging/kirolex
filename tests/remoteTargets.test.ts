@@ -477,7 +477,7 @@ describe('侧栏那个 🌐 徽标真的到得了界面', () => {
     /* 「点切换了之后没有立刻打上 tag」：真 tag 要等远端探完、执行器起完才来 */
     const at = SB.indexOf('const onSetTarget = async');
     const body = SB.slice(at, at + 900);
-    assert.ok(body.indexOf('setPendingTarget(sessionId, remoteId ?') < body.indexOf('api.setRemoteTarget(sessionId, remoteId, undefined, { projectId })'), '先挂 tag 再等 IPC');
+    assert.ok(body.indexOf('setPendingTarget(sessionId, remoteId ?') < body.indexOf('api.setRemoteTarget(sessionId, remoteId, undefined, coldHintFor(sessionId))'), '先挂 tag 再等 IPC');
     assert.match(body, /\.finally\(\(\) => setPendingTarget\(sessionId, undefined\)\)/);
     assert.match(SB, /⏳ \{pendingTarget \|\| t\('Local'\)\}/);
   });

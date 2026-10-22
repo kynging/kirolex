@@ -607,7 +607,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * **把一条已有会话切到另一台机器（或切回本地）**。`remoteId` 传 null = 本地。
    * 切到远端时要给项目目录（没给就用记录里的那个；都没有会报错 —— 远端要镜像的就是它）。
    */
-  setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string, hint?: { projectId?: string | null }) =>
+  setRemoteTarget: (sessionId: string, remoteId: string | null, localDir?: string, hint?: { projectId?: string | null; engine?: string; remoteId?: string | null }) =>
     ipcRenderer.invoke('acp:set-remote-target', sessionId, remoteId, localDir, hint),
   /**
    * **KiroLex 自己对你说的一句话**（推/拉进度、冲突、换机器…）。
@@ -684,7 +684,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('ai-login:exit', handler);
   },
   /** 给已有的会话换引擎（kiro / claude / codex）。没连着的只改记录。 */
-  switchEngine: (sessionId: string, engine: string, hint?: { projectId?: string | null }) => ipcRenderer.invoke('acp:switch-engine', sessionId, engine, hint),
+  switchEngine: (sessionId: string, engine: string, hint?: { projectId?: string | null; engine?: string; remoteId?: string | null }) => ipcRenderer.invoke('acp:switch-engine', sessionId, engine, hint),
   onEngineChanged: (callback: (d: { sessionId: string; engine: 'kiro' | 'claude' | 'codex' }) => void) => {
     const handler = (_event: any, d: any) => callback(d);
     ipcRenderer.on('session:engine-changed', handler);

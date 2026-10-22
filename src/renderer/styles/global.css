@@ -2372,6 +2372,8 @@ button, input, select, textarea {
 .files-item-stat { flex: none; font-variant-numeric: tabular-nums; font-size: 11px; }
 .files-item-stat .stat-add { color: #4caf82; margin-right: 4px; }
 .files-item-stat .stat-del { color: #e5534b; }
+/* 命令 / 浏览器面板里的「失败」标记不在 .files-item-stat 下，原来不是红的；先只给 Claude / Codex 会话补上（kiro 不变） */
+.chat-main[data-engine] .files-item-row > .stat-del { color: #e5534b; }
 .files-item-peek {
   flex: none; font-size: 11px; color: var(--text-secondary); background: var(--bg-hover);
   border: 1px solid var(--border); border-radius: 5px; padding: 1px 7px; cursor: pointer;
@@ -3740,6 +3742,13 @@ button, input, select, textarea {
   gap: 6px;
   margin-left: auto;
   flex-wrap: wrap;
+}
+
+/* 逐个列出 agent 自己的选项时（批准计划有五个、名字很长）：占满一行、可换行，不然会被挤出格子右边 */
+.permission-bar-actions.named {
+  flex: 1 1 100%;
+  justify-content: flex-end;
+  min-width: 0;
 }
 
 .permission-bar-actions button {

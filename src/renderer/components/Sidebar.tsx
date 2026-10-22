@@ -852,13 +852,22 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * "必须先指定一个项目目录"是上一版加错的要求，把"必须镜像点什么"和"必须有个项目"混成了一件事。
    */
   const remoteTargets = useRemoteTargets().targets;
+  /**
+   * 还没连上过的新会话没有记录，主进程要给它建一份（见主进程 coldRecordFor）—— 项目、引擎、机器都带上，
+   * 否则一条没建成的「远程 Codex」新会话右键一换就成了本机 kiro。认不出是哪台机器时 remoteId 不填（= 不知道）。
+   */
+  const coldHintFor = (sessionId: string): { projectId: string | null; engine: string; remoteId?: string | null } => {
+    const s = sessions.find((x) => x.id === sessionId);
+    const host = s?.remoteHost;
+    const rid = host ? remoteTargets.find((t) => t.id === host || t.label === host)?.id : null;
+    return { projectId: s?.projectId ?? null, engine: s?.engine || 'kiro', ...(rid !== undefined ? { remoteId: rid } : {}) };
+  };
   /** 换引擎（kiro / Claude Code / Codex）。失败要说出来 —— 它会换执行器，静悄悄失败只会被当成"点了没反应"。 */
   const onSetEngine = async (sessionId: string, engine: 'kiro' | 'claude' | 'codex'): Promise<void> => {
     const api = (window as any).kiroApi;
     if (!api?.switchEngine) return;
-    /* 带上项目：还没连上过的新会话没有记录，主进程要给它建一份（见主进程 coldRecordFor） */
-    const projectId = sessions.find((s) => s.id === sessionId)?.projectId ?? null;
-    const r = await api.switchEngine(sessionId, engine, { projectId }).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    /* 带上项目 / 引擎 / 机器：还没连上过的新会话没有记录，主进程要给它建一份（见 coldHintFor） */
+    const r = await api.switchEngine(sessionId, engine, coldHintFor(sessionId)).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
     /* 这一轮还在跑：主进程记下来了，跑完再换（会话输入框下面那一排标「⏳」；等待时不弹"跑完再切"之类的话） */
     if (r?.pending) return;
     if (!r?.ok) showToast(t('✗ Could not switch engine: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));
@@ -867,8 +876,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     const api = (window as any).kiroApi;
     if (!api?.setRemoteTarget) return;
     setPendingTarget(sessionId, remoteId ? (remoteTargets.find((t) => t.id === remoteId)?.label || remoteId) : null);
-    const projectId = sessions.find((s) => s.id === sessionId)?.projectId ?? null;
-    const r = await api.setRemoteTarget(sessionId, remoteId, undefined, { projectId })
+    const r = await api.setRemoteTarget(sessionId, remoteId, undefined, coldHintFor(sessionId))
       .catch((e: any) => ({ ok: false, error: e?.message || String(e) }))
       .finally(() => setPendingTarget(sessionId, undefined));
     /* 失败要让人看见：这个动作会换执行器，静悄悄失败的话人只会以为"点了没反应" */

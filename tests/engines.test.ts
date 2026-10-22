@@ -263,7 +263,7 @@ describe('已有会话换引擎 ——「我还需要现有会话也能切换 ag
   test('界面：右键「运行引擎」三选一，换完 tag 当场变', () => {
     const SB = read('src', 'renderer', 'components', 'Sidebar.tsx');
     assert.match(SB, /<Submenu label=\{t\('🤖 Engine: \{engine\}', \{ engine: ENGINE_NAMES\[ctxSession\.engine \|\| 'kiro'\] \}\)\}>/);
-    assert.match(SB, /api\.switchEngine\(sessionId, engine, \{ projectId \}\)/);
+    assert.match(SB, /api\.switchEngine\(sessionId, engine, coldHintFor\(sessionId\)\)/);
     const HK = read('src', 'renderer', 'hooks', 'useAcp.ts');
     assert.match(HK, /onEngineChanged\?\.\(/);
   });
@@ -281,13 +281,15 @@ describe('远端 node 用最新 LTS ——「把脚本改成运行最新的 LTS 
 describe('还没连上过的新会话也能切引擎 / 运行位置', () => {
   test('没有记录时先建一份（带渲染层给的项目），删过的不建', () => {
     const M = read('src', 'main', 'index.ts');
-    assert.ok(M.includes('const coldRecordFor = (sessionId: string, hint?: { projectId?: string | null }): store.SessionRecord | null => {'));
+    assert.ok(M.includes('const coldRecordFor = (sessionId: string, hint?: ColdRecordHint): store.SessionRecord | null => {'));
     assert.ok(M.includes(String.raw`if (!/^s_[\w-]+$/.test(sessionId)) return null;`));
     assert.ok(M.includes('if (deletedSessionIds.has(sessionId) || loadSessionTombstones().includes(sessionId)) return null;'));
     assert.ok(M.includes('const rec0 = oldEntry ? store.readRecord(sessionId) : coldRecordFor(sessionId, hint);'));
     assert.equal((M.match(/coldRecordFor\(sessionId, hint\)/g) || []).length, 2, '换引擎和换运行位置两条路都要');
     const S = read('src', 'renderer', 'components', 'Sidebar.tsx');
-    assert.ok(S.includes('api.switchEngine(sessionId, engine, { projectId })'));
-    assert.ok(S.includes('api.setRemoteTarget(sessionId, remoteId, undefined, { projectId })'));
+    assert.ok(S.includes('api.switchEngine(sessionId, engine, coldHintFor(sessionId))'));
+    assert.ok(S.includes('api.setRemoteTarget(sessionId, remoteId, undefined, coldHintFor(sessionId))'));
+    /* hint 里照旧带着项目（引擎 / 机器是这次加的，见 coldRecordEngine.test.ts） */
+    assert.ok(S.includes('return { projectId: s?.projectId ?? null, engine:'));
   });
 });

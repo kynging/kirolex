@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import type { PermissionRequest } from '../hooks/useAcp';
 import { useT } from '../hooks/useLang';
+import { permissionButtons } from '../permissionButtons';
 
 interface PermissionBarProps {
   request: PermissionRequest;
@@ -31,11 +32,9 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
     }
   };
 
-  const allowOnce = request.options.find((option) => option.kind === 'allow_once');
-  const allowAlways = request.options.find((option) => option.kind === 'allow_always');
-  const reject = request.options.find((option) => option.kind === 'reject_once')
-    || request.options.find((option) => option.kind === 'reject_always')
-    || request.options.find((option) => option.kind?.startsWith('reject'));
+  /* 同一种 kind 有好几个选项（Claude Code 批准计划）时逐个列出、用它们自己的名字，见 permissionButtons.ts */
+  const buttons = permissionButtons(request.options);
+  const generic = { allow_once: `✓ ${t('Allow once')}`, allow_always: `⟲ ${t('Always allow')}`, reject: `⊘ ${t('Reject')}` };
 
   return (
     <div className="permission-bar" role="region" aria-live="polite" aria-label={t('Tool permission required')}>
@@ -47,26 +46,17 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
             <code title={request.description}>{request.description}</code>
           )}
         </div>
-        <div className="permission-bar-actions">
-          {allowOnce && (
-            <button disabled={submitting} onClick={() => void respond(allowOnce.optionId)}>
-              {`✓ ${t('Allow once')}`}
-            </button>
-          )}
-          {allowAlways && (
-            <button disabled={submitting} onClick={() => void respond(allowAlways.optionId)}>
-              {`⟲ ${t('Always allow')}`}
-            </button>
-          )}
-          {reject && (
+        <div className={`permission-bar-actions${buttons.some((b) => b.label) ? ' named' : ''}`}>
+          {buttons.map((b) => (
             <button
-              className="reject"
+              key={b.optionId}
+              className={b.role === 'reject' ? 'reject' : undefined}
               disabled={submitting}
-              onClick={() => void respond(reject.optionId)}
+              onClick={() => void respond(b.optionId)}
             >
-              {`⊘ ${t('Reject')}`}
+              {b.label || generic[b.role]}
             </button>
-          )}
+          ))}
         </div>
       </div>
       {error && <div className="permission-bar-error">⚠ {error} {t('Try again.')}</div>}
