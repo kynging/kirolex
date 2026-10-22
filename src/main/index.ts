@@ -78,7 +78,7 @@ import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward, httpProbeNotice,
-  forwardableFromCombo, remoteComboMcpServers, type ForwardListItem,
+  remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, type ForwardListItem,
 } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
@@ -1915,7 +1915,7 @@ function stickySessionNotice(sessionId: string, text: string, group?: string, op
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] }>();
+const localToolsBySession = new Map<string, { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }> }>();
 
 /**
  * **只起一个** MCP server ——「重复利用」顺手挖出来的一个真 bug。
@@ -2194,12 +2194,30 @@ async function ensureLocalTools(
         每次准备都 setProxies 一遍（没有就是空表）：换组合 / 换机器 / 重连时上一批代理和本机进程先停掉，
         会话结束时 `releaseLocalTools` → `forget` 停掉 —— 和 Kiro 同一条生命周期。
       */
+      /*
+        **设置里那份「远程会话从本机转发的 MCP」名单也算进来** ——「远程 Claude Code / Codex 会话没有本地工具」。
+        以前这里只看组合，没选组合（内置「通用」是空的）就只剩 kirolex-local。名单只存名字，定义去本机 Kiro 配置里找；
+        和组合按名字去重，同名以组合为准（规则见 `adapterForwardPlan`）。Claude Code 和 Codex 都走这里。
+      */
       const combo = sessionCombo(sessionId, profile);
-      const { entries, skipped } = forwardableFromCombo(combo.mcpServers, shellEnv as Record<string, string | undefined>);
+      const { entries, skipped, fromCombo, fromList } = adapterForwardPlan({
+        comboServers: combo.mcpServers,
+        list: loadForwardMcpList(),
+        sources: localKiroMcpSources(os.homedir(), profile.kiroAgent),
+        env: shellEnv as Record<string, string | undefined>,
+      });
+      /* 跳过的记下来给「会话信息」（`acp:session-info` 的 localTools）；会话里照旧一条一条说 */
+      const skippedReasons: Array<{ name: string; reason: string }> = [];
       for (const s of skipped) {
+        if (s.origin === 'list') {
+          sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in the "forward from this machine" list can\'t be forwarded ({reason}); it is skipped this time.', { mcp: s.name, reason: String(s.reason) }));
+          skippedReasons.push({ name: s.name, reason: String(s.reason) });
+          continue;
+        }
         sessionNotice(sessionId, s.missing
           ? tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) })
           : tr('⚠️ MCP "{mcp}" in combo "{combo}" can\'t be forwarded from this machine ({reason}); it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
+        skippedReasons.push({ name: s.name, reason: s.missing ? tr('missing environment variable(s) {vars}', { vars: trList(s.missing) }) : String(s.reason) });
       }
       server.setProxies(sessionId, entries);
       const http = entries.filter(isHttpForward);
@@ -2208,9 +2226,14 @@ async function ensureLocalTools(
         forwarded: entries.filter((e) => !isHttpForward(e)).map((e) => e.name),
         forwardedHttp: http.map((e) => e.name),
         mcpServers: [mcp, ...remoteComboMcpServers(entries, mcpUrl(remotePort, urlPath))],
+        skipped: skippedReasons,
       };
       if (entries.length) {
-        logger.info('localmcp', `组合「${combo.name}」经本机转发给 sessionId=${sessionId}：${entries.map((e) => e.name).join(', ')}`);
+        logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${entries.map((e) => e.name).join(', ')}`
+          + `（组合「${combo.name}」：${fromCombo.join(', ') || '无'}；设置名单：${fromList.join(', ') || '无'}）`);
+      }
+      if (skippedReasons.length) {
+        logger.info('localmcp', `没转发 sessionId=${sessionId}：${skippedReasons.map((s) => `${s.name}（${s.reason}）`).join('; ')}`);
       }
       /* 探测，但不挡会话（同 Kiro 分支） */
       for (const h of http) {
@@ -13346,6 +13369,15 @@ app.whenReady().then(async () => {
           engine: rec.profile?.engine || 'kiro',
           remote: sshHost ? { label: labelForHost(KIROLEX_CONFIG_PATH, sshHost), sshHost } : null,
           dir,
+          /*
+            远程会话这一回实际拿到的本机工具 ——「会话里能看到这条会话实际拿到了哪些本机工具」。
+            看的是 `ensureLocalTools` 最近一次准备的结果；还没连过 / 通道没起来时分开说。本地会话没有这一项。
+          */
+          localTools: !sshHost ? null : (() => {
+            const lt = localToolsBySession.get(sessionId);
+            if (!lt) return { state: toollessSessions.has(sessionId) ? 'failed' : 'not-ready', forwarded: [], skipped: [] };
+            return { state: 'ready', forwarded: [...(lt.forwarded || []), ...(lt.forwardedHttp || [])], skipped: lt.skipped || [] };
+          })(),
         },
       };
     } catch (error: any) {

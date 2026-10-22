@@ -298,3 +298,101 @@ export function remoteComboMcpServers(
 ): Array<{ type: 'http'; name: string; url: string; headers: never[] }> {
   return entries.map((e) => ({ type: 'http' as const, name: e.name, url: `${tunnelBase}/${e.name}`, headers: [] }));
 }
+
+/* ------------------------------ Claude Code / Codex：设置里那份「从本机转发」名单 */
+
+/** 本机一处 MCP 定义（`servers` 是 `mcpServers` 那张表，`from` 是给人看的出处）。 */
+export interface McpDefSource { from: string; servers: Record<string, any> }
+
+/**
+ * **名单里的名字去哪找定义** —— 名单只存名字（和 Kiro agent 文件 `mcpServers` 的键一致，见文件头），
+ * Claude Code / Codex 会话又没有 Kiro agent，所以按这个顺序在本机 Kiro 配置里找：
+ * 会话自己记着的 agent（`profile.kiroAgent`，有的话）→ `~/.kiro/settings/mcp.json`（内建默认 agent 用的那份）
+ * → 其余 `~/.kiro/agents/*.json`（按文件名）。`kirolex-local-*` 是 KiroLex 给远端会话生成的，跳过；
+ * 读不了 / 不是 JSON 的跳过 —— 这里只是找定义，不该拦住会话。
+ */
+export function localKiroMcpSources(home: string, preferredAgent?: string): McpDefSource[] {
+  const out: McpDefSource[] = [];
+  const read = (file: string, from: string) => {
+    try {
+      const j = JSON.parse(fs.readFileSync(file, 'utf-8'));
+      if (j && typeof j === 'object' && j.mcpServers && typeof j.mcpServers === 'object') out.push({ from, servers: j.mcpServers });
+    } catch { /* 没有 / 坏了：当它不存在 */ }
+  };
+  const agentsDir = path.join(home, '.kiro', 'agents');
+  if (preferredAgent) read(path.join(agentsDir, `${preferredAgent}.json`), `~/.kiro/agents/${preferredAgent}.json`);
+  read(path.join(home, '.kiro', 'settings', 'mcp.json'), '~/.kiro/settings/mcp.json');
+  let files: string[] = [];
+  try { files = fs.readdirSync(agentsDir).filter((f) => f.endsWith('.json')).sort(); } catch { /* 没有 agents 目录 */ }
+  for (const f of files) {
+    const name = f.slice(0, -'.json'.length);
+    if (name === preferredAgent || name.startsWith('kirolex-local-')) continue;
+    read(path.join(agentsDir, f), `~/.kiro/agents/${f}`);
+  }
+  return out;
+}
+
+export interface AdapterForwardSkip { name: string; origin: 'combo' | 'list'; missing?: string[]; reason?: string }
+
+/**
+ * **Claude Code / Codex 远程会话最终从本机转发哪些 MCP**：所选组合的 `forwardableFromCombo` + 设置里那份名单，按名字去重。
+ *
+ *   · 组合里有同名的（没关掉）—— 用组合那份定义（组合优先）；名单点了名就当它标了「从本机转发」；
+ *   · 组合里同名的被关掉了 —— 不从名单补回来（组合说了算），记为跳过；
+ *   · 组合里没有 —— 按 `sources` 的顺序找第一份定义，形状判断同 Kiro 那条（`forwardableFrom`：
+ *     名单里的 http 由本机代发、stdio 一律本机起）；找不到 / disabled / 既没 command 也没 url 的记为跳过。
+ *
+ * 名单外的不像 Kiro 那样按"命令是本机路径"自动挑 —— 这里没有一份"会话的 agent"可挑。
+ * `fromCombo` / `fromList` 给会话信息说"这个是哪来的"。
+ */
+export function adapterForwardPlan(input: {
+  comboServers: Record<string, McpComboServer>;
+  list: ForwardListItem[];
+  sources: McpDefSource[];
+  env: Record<string, string | undefined>;
+}): { entries: ForwardEntry[]; skipped: AdapterForwardSkip[]; fromCombo: string[]; fromList: string[] } {
+  const listed = new Map(input.list.map((it) => [it.name, it]));
+  const combo: Record<string, McpComboServer> = {};
+  for (const [name, s] of Object.entries(input.comboServers || {})) {
+    combo[name] = s && !s.disabled && listed.has(name) ? { ...s, forwardFromLocal: true } : s;
+  }
+  const fromCombo = forwardableFromCombo(combo, input.env);
+  const entries: ForwardEntry[] = [...fromCombo.entries];
+  const skipped: AdapterForwardSkip[] = fromCombo.skipped.map((s) => ({ ...s, origin: 'combo' as const }));
+  const fromList: string[] = [];
+  for (const item of input.list) {
+    const inCombo = input.comboServers?.[item.name];
+    if (inCombo) {
+      if (inCombo.disabled) skipped.push({ name: item.name, origin: 'list', reason: tr('it is turned off in the current combo') });
+      continue;
+    }
+    if (entries.some((e) => e.name === item.name)) continue;
+    const src = input.sources.find((s) => s.servers && Object.prototype.hasOwnProperty.call(s.servers, item.name));
+    if (!src) {
+      skipped.push({ name: item.name, origin: 'list', reason: tr('no definition for it in the local Kiro agent files or ~/.kiro/settings/mcp.json') });
+      continue;
+    }
+    const raw = src.servers[item.name];
+    if (raw && typeof raw === 'object' && raw.disabled) {
+      skipped.push({ name: item.name, origin: 'list', reason: tr('it is disabled in {from}', { from: src.from }) });
+      continue;
+    }
+    if (!TUNNEL_NAME.test(item.name)) {
+      skipped.push({ name: item.name, origin: 'list', reason: tr('Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL') });
+      continue;
+    }
+    if (item.name === 'kirolex-local') {
+      skipped.push({ name: item.name, origin: 'list', reason: tr('Clashes with the local tool channel kirolex-local') });
+      continue;
+    }
+    const picked = forwardableFrom({ mcpServers: { [item.name]: raw } }, [item]);
+    if (!picked.length) {
+      skipped.push({ name: item.name, origin: 'list', reason: tr('it has neither command nor url in {from}', { from: src.from }) });
+      continue;
+    }
+    entries.push(...picked);
+    fromList.push(item.name);
+  }
+  const listOnly = new Set(fromList);
+  return { entries, skipped, fromCombo: entries.filter((e) => !listOnly.has(e.name)).map((e) => e.name), fromList };
+}

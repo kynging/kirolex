@@ -171,6 +171,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     '· 用户的浏览器在**他自己的机器**上，不在这里。'
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
     localActionHelp(),
+    localMachineHelp([...(input.forwarded || []), ...(input.forwardedHttp || [])]),
     forwardHelp(input.forwarded || []),
     forwardHttpHelp(input.forwardedHttp || []),
     /* 这条只在**他那边真有工程**时成立；没有的话它会把人往错的机器上引 */
@@ -179,4 +180,26 @@ export function remoteContextBlock(input: RemoteContextInput): string {
         + '工具链和仓库；把他的项目拷到这台机器上重装一遍是在做无用功。'
         + '而与他的工程无关的事（装个工具、拉个数据、跑个脚本）就在这台机器上做。',
   ].filter(Boolean).join('\n');
+}
+
+/**
+ * **碰用户机器上的东西走 `local_bash`，以及这一轮到底接过来了哪些本机工具** ——
+ * 「远程 Claude Code 和 Codex 会话似乎没有本地工具，不能正常访问 agent board」。
+ *
+ * 看板客户端只听用户机器的 `127.0.0.1:9333`，操作它的脚本也在他机器上；模型在远端 curl 127.0.0.1
+ * 连的是远端自己，于是"连不上"被它当成"看板没开"。所以点名这几样，并把这一轮实际的本机工具列出来：
+ * 不列的话它只能从历史里猜自己有什么（见上面"看你这一轮的工具清单"那条）。
+ */
+function localMachineHelp(forwarded: string[]): string {
+  const names = [...new Set(forwarded.filter(Boolean))];
+  return '· **碰用户机器上的东西，一律用 `kirolex-local` 的 `local_bash`**：这台是远端，'
+      + '`127.0.0.1` / `localhost` 在这里指的是**这台**机器。用户的 agent board 看板客户端（`http://127.0.0.1:9333`）、'
+      + '`~/.kirolex/tools/board-cdp.mjs`、`~/agent-board`、`~/.kirolex` 都在他机器上 —— '
+      + '要用就在 `local_bash` 里跑（例如 `node ~/.kirolex/tools/board-cdp.mjs …`），'
+      + '别在这台机器上 curl 9333、找这些路径或另装一份。\n'
+    + '· 这一轮从用户机器接过来的工具：'
+    + (names.length
+      ? `\`kirolex-local\`（\`local_*\` 那组）、${names.map((n) => `\`${n}\``).join('、')}。`
+      : '只有 `kirolex-local`（`local_*` 那组），没有别的本机 MCP。')
+    + '工具清单里的名字可能带前缀（例如 `mcp__kirolex-local__local_bash`），是同一个。';
 }

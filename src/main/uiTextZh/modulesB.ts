@@ -72,6 +72,10 @@ export const ZH_MODULES_B: Record<string, string> = {
   '⚠️ The MCP "{name}" forwarded from this machine is unavailable: {msg}. Fix the local config and reopen the session.': '⚠️ 本机转发的 MCP「{name}」暂时用不了：{msg}。改好本机配置后重开会话。',
   'Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL': '名字只能用字母、数字、_ . -（最多 40 个），否则放不进转发地址',
   'Clashes with the local tool channel kirolex-local': '和本地工具通道 kirolex-local 重名',
+  'it is turned off in the current combo': '当前组合里把它关掉了',
+  'no definition for it in the local Kiro agent files or ~/.kiro/settings/mcp.json': '本机的 Kiro agent 文件和 ~/.kiro/settings/mcp.json 里都没有它的定义',
+  'it is disabled in {from}': '它在 {from} 里是关掉的',
+  'it has neither command nor url in {from}': '{from} 里它既没有 command 也没有 url',
   // ── kiroCliLog.ts ──
   'The service returned an empty reply, unrelated to your message and this history. Try again in a few minutes, or switch models.': '服务端返回了空回复，与你的消息和这段历史都无关。过几分钟再试，或换个模型。',
   "Can't reach the model service. Check your network/VPN.": '连不上模型服务，检查网络/VPN。',

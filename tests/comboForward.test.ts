@@ -111,7 +111,8 @@ describe('接线（源码扫描）', () => {
   const nonKiro = body.slice(body.indexOf("if (engineOf(profile) !== 'kiro') {"), body.indexOf('const forwardable = profile.kiroAgent'));
 
   test('非 Kiro 分支：读组合、setProxies、隧道地址追加进 mcpServers、填 forwarded', () => {
-    assert.match(nonKiro, /forwardableFromCombo\(/);
+    /* 组合规则在 adapterForwardPlan 里（内部走 forwardableFromCombo，再并上设置名单，见 adapterForwardList.test.ts） */
+    assert.match(nonKiro, /adapterForwardPlan\(/);
     assert.match(nonKiro, /server\.setProxies\(sessionId, /);
     assert.match(nonKiro, /remoteComboMcpServers\(/);
     assert.match(nonKiro, /forwardedHttp/);
