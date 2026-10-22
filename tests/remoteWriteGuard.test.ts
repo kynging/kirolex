@@ -491,7 +491,7 @@ describe('审查回归：复制稍大的文件（> 1 MB）不能撞上 execFile 
 
   test('接线：远端读按上限放宽 stdout，复制那条路给 64 MB 和更长的超时', () => {
     const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
-    assert.match(M, /function runRemoteCapture\(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer\?: number\)/);
+    assert.match(M, /function runRemoteCapture\(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer\?: number, stdin\?: string\)/);
     assert.match(M, /\.\.\.\(maxBuffer \? \{ maxBuffer \} : \{\}\)/);
     assert.match(M, /runRemoteCapture\(target, script, timeoutMs, captureBufferFor\(max\)\)/);
     const at = M.indexOf("ipcMain.handle('workspace:copy-remote-to-local'");

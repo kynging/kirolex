@@ -102,9 +102,10 @@ describe('模型可用性：清单、挑选、钉进 agent', () => {
   });
 
   test('助手模型先按本机清单筛 —— 否则那个循环把同一个失败付两遍', () => {
-    assert.match(M, /const usable = models\.filter\(\(m\) => available\.includes\(m\)\)/);
-    /* 两个都退役时要说清是谁替了谁（悄悄换掉才是那个查了很久的病） */
-    assert.match(M, /在本机 kiro-cli 上都没有 -> 用/);
+    /* 现在由 `planHelperRoute`（helperModels.ts，有单测）按本机清单 + 远程清单排尝试顺序 */
+    assert.match(M, /planHelperRoute\(\{\s*wanted: models, local: available,/);
+    /* 都没有时要说清是谁替了谁（悄悄换掉才是那个查了很久的病） */
+    assert.match(M, /本机和远程机器上都没有 -> 用/);
   });
 
   test('本机会话不必用"跑一轮失败"去发现模型退役', () => {

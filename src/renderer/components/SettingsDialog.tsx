@@ -9,6 +9,7 @@ import { LocalBrowserSettings } from './LocalBrowserSettings';
 import { useT } from '../hooks/useLang';
 import { fontSelectOptions } from '../fontOptions';
 import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
+import { mergeHelperModelLists, planHelperRoute, helperChoiceText, LOCAL_MACHINE, type MachineModelList } from '../../main/helperModels.ts';
 import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
@@ -244,22 +245,50 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   // first, fallback only if it cannot answer.
   const [helperModel, setHelperModel] = useState('');
   const [helperFallback, setHelperFallback] = useState('');
-  const [modelChoices, setModelChoices] = useState<string[]>([]);
+  /*
+    Offer every model kiro-cli reports on ANY machine: this machine + each remote in
+    Settings (helperModels.ts). This machine's list can be region-filtered down to no
+    Claude at all while a remote reports them, and runLiteOneShot runs the call on the
+    machine that has the model. Until the live lists arrive, model-meta.json ids stand in.
+  */
+  const [helperLists, setHelperLists] = useState<{ lists: MachineModelList[]; cachedIds: string[]; fallbackOrder: string[] } | null>(null);
+  const [helperListsLoading, setHelperListsLoading] = useState(false);
+  const helperLiveSeq = React.useRef(0);
+  const refreshHelperLists = () => {
+    const seq = ++helperLiveSeq.current;
+    setHelperListsLoading(true);
+    window.kiroApi.listHelperModels?.()
+      .then((res) => { if (res && seq === helperLiveSeq.current) setHelperLists(res); })
+      .catch(() => {})
+      .finally(() => { if (seq === helperLiveSeq.current) setHelperListsLoading(false); });
+  };
   useEffect(() => {
     window.kiroApi.getHelperModels?.().then((h: any) => {
       if (!h) return;
       setHelperModel(h.model || '');
       setHelperFallback(h.fallback || '');
     }).catch(() => {});
-    // Offer the models kiro-cli actually reports, so a retired name can't be picked.
-    window.kiroApi.listModels?.().then((res: any) => {
-      const list = Array.isArray(res) ? res : (res?.models || []);
-      const names = list
-        .map((m: any) => m?.model_name || m?.modelName)
-        .filter((n: any): n is string => !!n && n !== 'auto');
-      if (names.length) setModelChoices(names);
-    }).catch(() => {});
+    window.kiroApi.listHelperModels?.({ cachedOnly: true })
+      .then((res) => { if (res) setHelperLists((prev) => prev || res); })
+      .catch(() => {});
+    refreshHelperLists();
   }, []);
+  const helperChoices = mergeHelperModelLists(helperLists?.lists || [], helperLists?.cachedIds || []);
+  const helperPending = !helperLists || helperLists.lists.some((l) => l.status === 'pending');
+  const helperFailed = (helperLists?.lists || []).filter((l) => l.status === 'failed');
+  const helperRoute = helperLists && !helperPending
+    ? planHelperRoute({
+        wanted: [helperModel, helperFallback],
+        local: helperLists.lists.find((l) => l.machine === LOCAL_MACHINE && l.status === 'ok')?.ids || [],
+        remotes: helperLists.lists.filter((l) => l.machine !== LOCAL_MACHINE && l.status === 'ok'),
+        fallbackOrder: helperLists.fallbackOrder,
+      })
+    : null;
+  const helperOptions = (current: string) => [
+    ...(current && !helperChoices.some((c) => c.id === current) ? [<option key={current} value={current}>{current}</option>] : []),
+    ...helperChoices.map((c) => <option key={c.id} value={c.id}>{helperChoiceText(c, t('This machine'), t('cached'))}</option>),
+  ];
+  const helperUnavailable = (m: string) => !!m && !!helperLists && !helperPending && !helperChoices.some((c) => c.id === m);
   /*
     **新会话默认组合**（Claude Code / Codex）——「帮我做一个默认通用的吧」。全局一个，项目在侧栏项目菜单里覆盖。
     只影响之后新建的会话（本机和远端），已有会话不动。设的那个本机没有时下拉里明说按通用。
@@ -597,10 +626,28 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   onChange={(e) => saveHelper(e.target.value, helperFallback)}
                   style={{ minWidth: 180 }}
                 >
-                  {[helperModel, ...modelChoices]
-                    .filter((m, i, arr) => !!m && arr.indexOf(m) === i)
-                    .map((m) => <option key={m} value={m}>{m}</option>)}
+                  {helperOptions(helperModel)}
                 </select>
+                <button
+                  type="button"
+                  className="settings-btn"
+                  onClick={refreshHelperLists}
+                  disabled={helperListsLoading}
+                  style={{ whiteSpace: 'nowrap', flexShrink: 0 }}
+                  title={t('Fetch the model list again from this machine and every remote machine')}
+                >
+                  {helperListsLoading ? t('Refreshing…') : t('Refresh')}
+                </button>
+                {((helperRoute && helperRoute.effective && helperRoute.effective !== helperModel) || (helperFailed.length > 0 && !helperListsLoading)) && (
+                  <span className="settings-hint" style={{ minWidth: 240 }}>
+                    {helperRoute && helperRoute.effective && helperRoute.effective !== helperModel && (
+                      <div>{t('{model} is not reported by this machine or any remote; actually using {actual}', { model: helperModel, actual: helperRoute.effective })}</div>
+                    )}
+                    {helperFailed.length > 0 && !helperListsLoading && (
+                      <div>{t('Could not get the list from: {machines}', { machines: helperFailed.map((l) => (l.machine === LOCAL_MACHINE ? t('This machine') : l.label)).join(', ') })}</div>
+                    )}
+                  </span>
+                )}
               </div>
             </div>
 
@@ -613,10 +660,13 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   style={{ minWidth: 180 }}
                 >
                   <option value="">{t('No fallback')}</option>
-                  {[helperFallback, ...modelChoices]
-                    .filter((m, i, arr) => !!m && arr.indexOf(m) === i)
-                    .map((m) => <option key={m} value={m}>{m}</option>)}
+                  {helperOptions(helperFallback)}
                 </select>
+                {helperUnavailable(helperFallback) && (
+                  <span className="settings-hint">
+                    {t('{model} is not reported by this machine or any remote; it will be skipped', { model: helperFallback })}
+                  </span>
+                )}
               </div>
             </div>
 

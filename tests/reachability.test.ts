@@ -281,7 +281,10 @@ describe('kiro-cli 版本：报出来，更新交给人', () => {
     /* 没有 model_id 的条目不要 —— 它进了缓存就是把"没信息"固化成"信息是空的" */
     assert.deepEqual(parseModelListJson('{"models":[{"model_name":"x"}]}'), []);
 
-    const at = M.indexOf("ipcMain.handle('acp:list-models'");
+    /* 远程分支抽成了 `listModelsRemote`（`acp:list-models` 和辅助模型的多机清单共用） */
+    const at = M.indexOf('const listModelsRemote = async');
+    assert.ok(at > 0);
+    assert.match(M, /if \(machine && machine !== 'local'\) return listModelsRemote\(machine\);/);
     const body = M.slice(at, at + 4000);
     assert.match(body, /chat --list-models --format json 2>\/dev\/null \|\| true/);
     /* 顺序：能问就问，问不到才退回那条"从报错里抠 id" */

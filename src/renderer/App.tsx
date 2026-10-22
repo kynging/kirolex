@@ -268,6 +268,7 @@ declare global {
       persistSteer?: (sessionId: string, text: string, messageId?: string, attachments?: { id?: string; name: string; path: string; isImage?: boolean }[]) => Promise<{ ok: boolean; merged?: boolean; error?: string }>;
       respondPermission: (requestId: number | string, optionId: string, sessionId: string) => Promise<void>;
       listModels: (machine?: string) => Promise<any>;
+      listHelperModels?: (opts?: { cachedOnly?: boolean }) => Promise<{ lists: import('../main/helperModels').MachineModelList[]; cachedIds: string[]; fallbackOrder: string[] }>;
       getUsage: () => Promise<{ text: string }>;
       generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => Promise<{ title?: string; error?: string; skipped?: boolean | 'engine' }>;
       generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => Promise<{ suggestions: string[]; error?: string }>;

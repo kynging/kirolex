@@ -439,6 +439,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
    * 远程会话必须问**它自己那台机器** —— 两边 kiro-cli 版本不同，模型集就不同。
    */
   listModels: (machine?: string) => ipcRenderer.invoke('acp:list-models', machine),
+  listHelperModels: (opts?: { cachedOnly?: boolean }) => ipcRenderer.invoke('acp:list-helper-models', opts),
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
   generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant, sessionId),
   generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),

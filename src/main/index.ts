@@ -22,6 +22,7 @@ import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { isReplayOutsideTurn } from './replayGuard';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
+import { planHelperRoute, remoteLiteScript, parseRemoteLiteOutput, LOCAL_MACHINE as HELPER_LOCAL_MACHINE, type MachineModelList } from './helperModels.ts';
 import { parseAgentList } from './kiroAgentList.ts';
 import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } from './reachability.ts';
 import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
@@ -810,6 +811,69 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
  *  credits and starts no MCP process at all. Lives in ~/.kiro/agents/. */
 const LITE_AGENT = 'kirolex-lite';
 
+/** 远程机器上的那份 lite agent：同样没工具、没 MCP、不读 legacy mcp.json（`model` 由 `remoteLiteScript` 钉）。 */
+const REMOTE_LITE_AGENT: Record<string, unknown> = {
+  name: LITE_AGENT,
+  description: 'KiroLex: background text chores (titles, suggestions, memory)',
+  mcpServers: {},
+  tools: [],
+  allowedTools: [],
+  resources: [],
+  hooks: {},
+  useLegacyMcpJson: false,
+};
+
+/**
+ * **每台远程机器的模型 id 清单**（辅助模型用）。按机器缓存 10 分钟、按机器 single-flight、
+ * 每台各自超时 —— 单台慢 / 挂了只少那台。`force` 跳过缓存（设置里打开 / 点刷新），
+ * 但仍复用正在跑的那次，不会并发打爆。实际怎么问由 `acp:list-models` 的远程分支决定（`remoteModelLister`）。
+ */
+const HELPER_REMOTE_TTL_MS = 10 * 60_000;
+const HELPER_REMOTE_TIMEOUT_MS = 45_000;
+const helperRemoteCache = new Map<string, { ids: string[]; at: number }>();
+const helperRemoteInFlight = new Map<string, Promise<string[]>>();
+/* 刚失败过的机器 2 分钟内不再问（不 force 时）：否则一台挂了的机器让每次生成标题都先白等 45 秒 */
+const HELPER_REMOTE_FAIL_MS = 2 * 60_000;
+const helperRemoteFailedAt = new Map<string, number>();
+let remoteModelLister: ((machine: string) => Promise<string[]>) | null = null;
+let helperListsInFlight: Promise<MachineModelList[]> | null = null;
+
+function helperRemoteIds(machine: string, force: boolean): Promise<string[]> {
+  const hit = helperRemoteCache.get(machine);
+  if (!force && hit && Date.now() - hit.at < HELPER_REMOTE_TTL_MS) return Promise.resolve(hit.ids);
+  const failedAt = helperRemoteFailedAt.get(machine);
+  if (!force && !hit && failedAt && Date.now() - failedAt < HELPER_REMOTE_FAIL_MS) return Promise.reject(new Error('failed recently'));
+  let p = helperRemoteInFlight.get(machine);
+  if (!p) {
+    const lister = remoteModelLister;
+    p = new Promise<string[]>((resolve, reject) => {
+      if (!lister) { reject(new Error('model lister not ready')); return; }
+      const timer = setTimeout(() => reject(new Error(`timed out after ${HELPER_REMOTE_TIMEOUT_MS / 1000}s`)), HELPER_REMOTE_TIMEOUT_MS);
+      lister(machine).then((ids) => {
+        clearTimeout(timer);
+        if (ids.length) { helperRemoteCache.set(machine, { ids, at: Date.now() }); helperRemoteFailedAt.delete(machine); }
+        resolve(ids);
+      }, (err) => { clearTimeout(timer); reject(err); });
+    }).catch((err) => { helperRemoteFailedAt.set(machine, Date.now()); throw err; }).finally(() => { helperRemoteInFlight.delete(machine); });
+    helperRemoteInFlight.set(machine, p);
+  }
+  return p;
+}
+
+/** 设置里每台远程机器的清单，并发拉，单台失败只标那台 `failed`。 */
+function helperRemoteModelLists(force: boolean): Promise<MachineModelList[]> {
+  return Promise.all(listRemoteTargets(KIROLEX_CONFIG_PATH).map(async (t): Promise<MachineModelList> => {
+    const label = t.label || t.sshHost;
+    if (!remoteKiroBin(t)) return { machine: t.id, label, status: 'failed', ids: [], error: tr('No kiro launch command is set for {host} yet (Settings → 🖥 Machines).', { host: t.sshHost }) };
+    try {
+      const ids = await helperRemoteIds(t.id, force);
+      return ids.length ? { machine: t.id, label, status: 'ok', ids } : { machine: t.id, label, status: 'failed', ids: [], error: 'empty' };
+    } catch (err: any) {
+      return { machine: t.id, label, status: 'failed', ids: [], error: String(err?.message || err) };
+    }
+  }));
+}
+
 /** Run a short text-only one-shot through the lite agent, trying the configured
  *  helper model first and the configured fallback second. Both live in Settings.
  *  If the lite agent itself is absent (it lives in the user's ~/.kiro, not in this
@@ -833,26 +897,49 @@ async function runLiteOneShot(prompt: string, label: string): Promise<string> {
   const run = promisify(execFile);
   const opts = { env: shellEnv, timeout: 60000, maxBuffer: 1024 * 1024 };
   const { model, fallback } = loadHelperModels();
-  let models = [model, fallback].filter((m, i, arr) => !!m && arr.indexOf(m) === i);
+  const models = [model, fallback].filter((m, i, arr) => !!m && arr.indexOf(m) === i);
   /*
-    **先按本机真实清单筛一遍** —— 否则这个循环只是把同一个失败付两遍（每次最多 60 秒）。
-    清单问不到就原样保留：没依据的时候照旧试，慢总比不做好。
+    **先按真实清单筛一遍** —— 否则这个循环只是把同一个失败付两遍（每次最多 60 秒）。
+    本机清单问不到就原样保留：没依据的时候照旧试，慢总比不做好。
+
+    **本机没有的去远程机器上找**（`helperModels.ts`）：本机 kiro-cli 会被地域过滤（一个 Claude 都不报），
+    同一个账号在远程机器上是全的。设置里选的模型只有远程有 → 到报了它的那台上跑同一条一次性调用；
+    远程也失败才走备用 / MODEL_FALLBACK_ORDER。远程清单只在本机缺、或本机清单问不到的时候才去问（有缓存）。
   */
   const available = await localModelIds();
-  if (available.length) {
-    const usable = models.filter((m) => available.includes(m));
-    if (!usable.length) {
-      /* 两个都退役了：挑一个清单里真有的，并说清是谁替了谁 —— 悄悄换掉才是那个查了很久的病 */
-      const picked = pickAvailableModel(models[0] || '', available, MODEL_FALLBACK_ORDER);
-      logger.warn(label, `设置里的辅助模型（${models.join('、')}）在本机 kiro-cli 上都没有 -> 用 ${picked}`
-        + `（清单：${available.join(', ')}）`);
-      models = [picked];
-    } else {
-      models = usable;
-    }
+  /* 本机清单问不到（超时 / 没配启动命令）也要看远程：下拉里已经确认在远程能用的模型，不能因为本机问不到就只在本机白试 */
+  const needRemote = models.some((m) => !available.includes(m));
+  const remotes = needRemote ? await helperRemoteModelLists(false) : [];
+  const route = planHelperRoute({
+    wanted: models, local: available, fallbackOrder: MODEL_FALLBACK_ORDER,
+    remotes: remotes.filter((l) => l.status === 'ok').map((l) => ({ machine: l.machine, ids: l.ids })),
+  });
+  if (route.substituted) {
+    /* 都没有：挑一个本机清单里真有的，并说清是谁替了谁 —— 悄悄换掉才是那个查了很久的病（设置里也会写出来） */
+    logger.warn(label, `设置里的辅助模型（${models.join('、')}）本机和远程机器上都没有 -> 用 ${route.effective}`
+      + `（本机清单：${available.join(', ')}）`);
   }
   let lastError: any = null;
-  for (const m of models) {
+  for (const attempt of route.attempts) {
+    const m = attempt.model;
+    if (attempt.machine !== HELPER_LOCAL_MACHINE) {
+      try {
+        const target = findRemoteTarget(KIROLEX_CONFIG_PATH, attempt.machine);
+        const bin = target ? remoteKiroBin(target) : undefined;
+        if (!target?.sshHost || !bin) throw new Error(`找不到机器 ${attempt.machine} 或它没配 kiro 启动命令`);
+        /* 和本机一样靠 agent JSON 钉模型（`--model` 不生效）；prompt 走 stdin */
+        const raw = await runRemoteCapture(target, remoteLiteScript(bin, LITE_AGENT, REMOTE_LITE_AGENT, m), 90_000, undefined, prompt);
+        const out = parseRemoteLiteOutput(raw);
+        if (out === null) throw new Error(`没有正常输出：${raw.trim().slice(0, 200) || '（空）'}`);
+        logger.info(label, `辅助模型 '${m}' 本机没有 -> 在 ${target.label || target.sshHost} 上跑`);
+        if (m !== route.attempts[0].model) logger.warn(label, `helper model '${route.attempts[0].model}' unusable -> answered with fallback '${m}'`);
+        return out;
+      } catch (err: any) {
+        lastError = err;
+        logger.warn(label, `model '${m}' on ${attempt.machine} failed: ${err?.message || err}`);
+        continue; // next attempt
+      }
+    }
     for (const withAgent of [true, false]) {
       /*
         **`--model` 在 `chat --no-interactive` 上是空操作** —— 实测：它一律先打一行
@@ -2670,12 +2757,13 @@ function runProbe(machine: string, script: string): Promise<string> {
 }
 
 /** 在远端跑一条命令并**拿回 stdout**（`writeRemoteFile` 丢掉输出）。 */
-function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer?: number): Promise<string> {
+function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer?: number, stdin?: string): Promise<string> {
   return once(false);
   function once(sparedOnce: boolean): Promise<string> {
     const socket = sshMux.liveSocketFor(remote);
     return new Promise((resolve, reject) => {
-      execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
+      /* `stdin`：正文太长 / 带引号时从这里送（辅助模型的远程一次性调用把 prompt 走这条） */
+      const child = execFile('ssh', [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)],
         /* 默认 60 秒够所有探测用；`kiro-cli update` 要下一个几十 MB 的二进制，调用方会放宽 */
         /* `maxBuffer`：读大文件的调用方（「复制到本机」）要放宽，默认 1 MiB 装不下 base64 之后的正文 */
         { timeout: timeoutMs, encoding: 'utf8', env: sshEnv(remote), ...(maxBuffer ? { maxBuffer } : {}) },
@@ -2695,6 +2783,7 @@ function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_0
             reject(new Error(real || String(err.message)));
           } else resolve(String(stdout || ''));
         });
+      if (stdin !== undefined) { try { child.stdin?.end(stdin); } catch { /* 命令已经退了 */ } }
     });
   }
 }
@@ -11584,7 +11673,7 @@ app.whenReady().then(async () => {
     return listModelsInFlight;
   };
 
-  ipcMain.handle('acp:list-models', async (_event, machine?: string) => {
+  const listModelsRemote = async (machine: string): Promise<any> => {
     /*
       **模型列表按机器分** ——「确认下右侧界面远程会话显示的是远程的 agent 和模型」。
 
@@ -11596,66 +11685,70 @@ app.whenReady().then(async () => {
       远端那边用的是同一个探测（`preflightScript` 里那段：故意传一个不存在的模型，
       kiro-cli 在参数校验就会把可用列表打出来 —— 不真调模型、不花额度）。
     */
-    if (machine && machine !== 'local') {
-      const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
-      if (!target?.sshHost) throw new Error(tr('Machine not found ({machine}). Was it removed in Settings?', { machine }));
-      const bin = remoteKiroBin(target);
-      if (!bin) throw new Error(tr('No kiro launch command is set for {host} yet (Settings → 🖥 Machines).', { host: target.sshHost }));
-    /*
-      **先问那台机器自己要完整清单** —— 2.24.1 起远端的 kiro-cli 认
-      `chat --list-models --format json`，回的是和本机**一模一样**的结构
-      （`model_id` / `model_name` / `rate_multiplier` / `context_window_tokens`）。
+    const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
+    if (!target?.sshHost) throw new Error(tr('Machine not found ({machine}). Was it removed in Settings?', { machine }));
+    const bin = remoteKiroBin(target);
+    if (!bin) throw new Error(tr('No kiro launch command is set for {host} yet (Settings → 🖥 Machines).', { host: target.sshHost }));
+  /*
+    **先问那台机器自己要完整清单** —— 2.24.1 起远端的 kiro-cli 认
+    `chat --list-models --format json`，回的是和本机**一模一样**的结构
+    （`model_id` / `model_name` / `rate_multiplier` / `context_window_tokens`）。
 
-      这比下面那条"故意传一个不存在的模型、从参数校验的报错里抠 id"强的地方不是少一次调用，
-      而是**倍率终于来自真正提供这些模型的那台机器**：实测远端更新到 2.24.1 之后
-      `claude-opus-5.5` 报的是 2.00x，而那个数字本机给不出来（本机清单被地域过滤，
-      一个 Claude 都没有，内置兜底表里也没有 5.5）—— 也就是用户看到的"没有乘数"。
+    这比下面那条"故意传一个不存在的模型、从参数校验的报错里抠 id"强的地方不是少一次调用，
+    而是**倍率终于来自真正提供这些模型的那台机器**：实测远端更新到 2.24.1 之后
+    `claude-opus-5.5` 报的是 2.00x，而那个数字本机给不出来（本机清单被地域过滤，
+    一个 Claude 都没有，内置兜底表里也没有 5.5）—— 也就是用户看到的"没有乘数"。
 
-      旧的探测留着做兜底：远端可能还是老版本（这条路上见过 1.27.0，它连 `--list-models`
-      都不认）。顺序是"能问就问，问不到才猜"。
-    */
-      const jsonOut = await runRemoteCapture(target,
-        `${shellQuote(bin)} chat --list-models --format json 2>/dev/null || true`).catch(() => '');
-      const remoteList = parseModelListJson(jsonOut);
-      if (remoteList.length) {
-        /* 真实元数据进缓存 —— 它是按 model_id 存的，所以本机那边的显示也跟着修好了 */
-        const cache0 = readMetaCache(MODEL_META_PATH);
-        if (mergeMeta(cache0, remoteList)) writeMetaCache(MODEL_META_PATH, cache0);
-        const liveRemote: Record<string, any> = {};
-        for (const m of remoteList) if (m?.model_id) liveRemote[m.model_id] = m;
-        logger.info('model', `${target.sshHost}: 自己报出了 ${remoteList.length} 个模型（带倍率）`);
-        return { models: enrichModels(remoteList.map((m) => m.model_id!), liveRemote, cache0) };
-      }
-      const out = await runRemoteCapture(target,
-        `${shellQuote(bin)} chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1`)
-        .catch((err) => { throw new Error(tr('Could not get the model list from {host}: {err}', { host: target.sshHost, err: String(err?.message || err) })); });
-      const ids = parseModels(out);
-      if (!ids.length) throw new Error(tr('{host} did not report a model list (does its kiro-cli version not support this probe?)', { host: target.sshHost }));
-      /*
-        远端只给得出 **id**：那台机器的 kiro-cli（实测 1.27.0）连 `--list-models` 都不认
-        （`error: unexpected argument '--list-models'`），所以唯一的来源就是上面那条参数校验的
-        错误信息，而它只列 id。
-        
-        **名字/上下文窗口/乘数从本机那份补上** —— 我先前的说法（"不跨机器借用"）是错的：
-        机器决定的是**有哪些模型**（版本不同、集合不同），而"claude-opus-5 的计费倍率是 2.2、
-        上下文窗口多大"是**模型自己的属性**，不随机器变。本机不认识的 id 就留裸的 —— 
-        那种情况下少一点信息，总好过编一个。
-      */
-      /*
-        **元数据三层兜底** ——「这个远程会话为什么又看不到模型乘数了」。
-
-        远端只给得出一串 id（1.27.0 没有 `--list-models`），名字/倍率/上下文窗口一直是按 id
-        从本机那份补的。本机出口被地域过滤之后清单里一个 Claude 都没有，于是补不到东西、
-        `· 2.2x` 就消失了。现在：实时清单 → 持久缓存 → 内置快照（见 `modelMeta.ts`）。
-      */
-      const localList: any[] = await listModelsLocal().then((d) => d?.models || []).catch(() => []);
-      const live: Record<string, any> = {};
-      for (const m of localList) if (m?.model_id) live[m.model_id] = m;
-      const cache = readMetaCache(MODEL_META_PATH);
-      /* 顺手把这次拿到的真实元数据记下来 —— "某台机器暂时不报它"不该等于"这个模型的属性丢了" */
-      if (mergeMeta(cache, localList)) writeMetaCache(MODEL_META_PATH, cache);
-      return { models: enrichModels(ids, live, cache) };
+    旧的探测留着做兜底：远端可能还是老版本（这条路上见过 1.27.0，它连 `--list-models`
+    都不认）。顺序是"能问就问，问不到才猜"。
+  */
+    const jsonOut = await runRemoteCapture(target,
+      `${shellQuote(bin)} chat --list-models --format json 2>/dev/null || true`).catch(() => '');
+    const remoteList = parseModelListJson(jsonOut);
+    if (remoteList.length) {
+      /* 真实元数据进缓存 —— 它是按 model_id 存的，所以本机那边的显示也跟着修好了 */
+      const cache0 = readMetaCache(MODEL_META_PATH);
+      if (mergeMeta(cache0, remoteList)) writeMetaCache(MODEL_META_PATH, cache0);
+      const liveRemote: Record<string, any> = {};
+      for (const m of remoteList) if (m?.model_id) liveRemote[m.model_id] = m;
+      logger.info('model', `${target.sshHost}: 自己报出了 ${remoteList.length} 个模型（带倍率）`);
+      return { models: enrichModels(remoteList.map((m) => m.model_id!), liveRemote, cache0) };
     }
+    const out = await runRemoteCapture(target,
+      `${shellQuote(bin)} chat --model ${MODEL_PROBE} --no-interactive x 2>&1 | grep -o 'Available models:.*' | head -1`)
+      .catch((err) => { throw new Error(tr('Could not get the model list from {host}: {err}', { host: target.sshHost, err: String(err?.message || err) })); });
+    const ids = parseModels(out);
+    if (!ids.length) throw new Error(tr('{host} did not report a model list (does its kiro-cli version not support this probe?)', { host: target.sshHost }));
+    /*
+      远端只给得出 **id**：那台机器的 kiro-cli（实测 1.27.0）连 `--list-models` 都不认
+      （`error: unexpected argument '--list-models'`），所以唯一的来源就是上面那条参数校验的
+      错误信息，而它只列 id。
+      
+      **名字/上下文窗口/乘数从本机那份补上** —— 我先前的说法（"不跨机器借用"）是错的：
+      机器决定的是**有哪些模型**（版本不同、集合不同），而"claude-opus-5 的计费倍率是 2.2、
+      上下文窗口多大"是**模型自己的属性**，不随机器变。本机不认识的 id 就留裸的 —— 
+      那种情况下少一点信息，总好过编一个。
+    */
+    /*
+      **元数据三层兜底** ——「这个远程会话为什么又看不到模型乘数了」。
+
+      远端只给得出一串 id（1.27.0 没有 `--list-models`），名字/倍率/上下文窗口一直是按 id
+      从本机那份补的。本机出口被地域过滤之后清单里一个 Claude 都没有，于是补不到东西、
+      `· 2.2x` 就消失了。现在：实时清单 → 持久缓存 → 内置快照（见 `modelMeta.ts`）。
+    */
+    const localList: any[] = await listModelsLocal().then((d) => d?.models || []).catch(() => []);
+    const live: Record<string, any> = {};
+    for (const m of localList) if (m?.model_id) live[m.model_id] = m;
+    const cache = readMetaCache(MODEL_META_PATH);
+    /* 顺手把这次拿到的真实元数据记下来 —— "某台机器暂时不报它"不该等于"这个模型的属性丢了" */
+    if (mergeMeta(cache, localList)) writeMetaCache(MODEL_META_PATH, cache);
+    return { models: enrichModels(ids, live, cache) };
+  };
+  /* 辅助模型的多机清单（`helperRemoteIds`）也走这一条 —— 同一套"先问完整清单、问不到再探"。 */
+  remoteModelLister = (m) => listModelsRemote(m).then((r) => (r?.models || []).map((x: any) => String(x?.model_id || '')).filter(Boolean));
+
+  ipcMain.handle('acp:list-models', async (_event, machine?: string) => {
+    if (machine && machine !== 'local') return listModelsRemote(machine);
     /**
      * SINGLE-FLIGHT，而且超时给足 —— 两者都是实测逼出来的。
      *
@@ -11670,6 +11763,43 @@ app.whenReady().then(async () => {
      * 该由渲染层用 `shouldReplaceModelCache` 决定要不要落盘。
      */
     return listModelsLocal();
+  });
+
+  /*
+    **设置里「辅助模型」下拉的清单** = 本机 + 设置里每台远程机器（`helperModels.ts`）。
+    `cachedOnly`：马上回 —— 已经问过的机器给缓存、没问过的标 `pending`，渲染端先用 `cachedIds`
+    （`model-meta.json` 里的 id）占位；随后不带它再调一次拿实时清单。整个调用 single-flight：
+    设置窗口反复开、连点刷新，都只会有一轮在跑。
+  */
+  ipcMain.handle('acp:list-helper-models', async (_event, opts?: { cachedOnly?: boolean }) => {
+    const cachedIds = Object.keys(readMetaCache(MODEL_META_PATH));
+    const localLabel = HELPER_LOCAL_MACHINE; // 显示名由渲染端按语言给（「本机」）
+    if (opts?.cachedOnly) {
+      const lists: MachineModelList[] = [
+        localModelIdsCache?.length
+          ? { machine: HELPER_LOCAL_MACHINE, label: localLabel, status: 'ok', ids: localModelIdsCache }
+          : { machine: HELPER_LOCAL_MACHINE, label: localLabel, status: 'pending', ids: [] },
+        ...listRemoteTargets(KIROLEX_CONFIG_PATH).map((t): MachineModelList => {
+          const hit = helperRemoteCache.get(t.id);
+          return hit
+            ? { machine: t.id, label: t.label || t.sshHost, status: 'ok', ids: hit.ids }
+            : { machine: t.id, label: t.label || t.sshHost, status: 'pending', ids: [] };
+        }),
+      ];
+      return { lists, cachedIds, fallbackOrder: MODEL_FALLBACK_ORDER };
+    }
+    if (!helperListsInFlight) {
+      helperListsInFlight = (async () => {
+        localModelIdsCache = null; // 刷新 = 本机也重问一遍
+        const [local, remotes] = await Promise.all([localModelIds(), helperRemoteModelLists(true)]);
+        const localList: MachineModelList = local.length
+          ? { machine: HELPER_LOCAL_MACHINE, label: localLabel, status: 'ok', ids: local }
+          : { machine: HELPER_LOCAL_MACHINE, label: localLabel, status: 'failed', ids: [] };
+        for (const l of remotes) if (l.status === 'failed') logger.warn('helper-models', `${l.label}: 模型清单拉不到（${l.error}）`);
+        return [localList, ...remotes];
+      })().finally(() => { helperListsInFlight = null; });
+    }
+    return { lists: await helperListsInFlight, cachedIds, fallbackOrder: MODEL_FALLBACK_ORDER };
   });
 
   ipcMain.handle('acp:get-usage', async () => {
