@@ -19,7 +19,10 @@ export const IconRobot: React.FC<IconProps> = ({ size = 16, className }) => (
 /**
  * Claude Code / Codex 会话左下角那颗按钮的图标 ——「claude code 和 codex 应该和 kiro-cli 在界面上有所区别，
  * 至少左下角不应该再用那个机器人的图标了」。机器人留给 kiro；Claude Code 是一朵放射状的星芒（它 logo 的那个意思），
- * Codex 是一个终端提示符 `>_`。线宽、圆角和机器人那颗一致，放在同一排里不突兀。
+ * Codex 是 OpenAI 那个六瓣交织的结（「>_ 都看不出是 Codex」）。线宽、圆角和机器人那颗一致，放在同一排里不突兀。
+ *
+ * Codex 的结 = 同一片瓣（半径 3.4 的圆弧瓣头 + 外侧直边 + 往里折的一小段）绕中心转 6 次。往里折的那段
+ * 只画六成、不伸到圆心 —— 中间留一个六边形的空，15px 下才不会在圆心挤成一团（画满就是一个糊掉的风车）。
  */
 export const IconClaudeSpark: React.FC<IconProps> = ({ size = 16, className }) => (
   <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true">
@@ -28,11 +31,9 @@ export const IconClaudeSpark: React.FC<IconProps> = ({ size = 16, className }) =
   </svg>
 );
 
-export const IconCodexPrompt: React.FC<IconProps> = ({ size = 16, className }) => (
+export const IconCodex: React.FC<IconProps> = ({ size = 16, className }) => (
   <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <rect x="3" y="4.5" width="18" height="15" rx="3.5" />
-    <path d="M7.5 9.5l3 2.5-3 2.5" />
-    <path d="M12.5 15h4" />
+    <path d="M11.41 18.76A3.4 3.4 0 0 0 18 17.6V12.8L14.28 10.65M5.85 14.87A3.4 3.4 0 0 0 10.15 20L14.31 17.6V13.3M6.44 8.11A3.4 3.4 0 0 0 4.15 14.4L8.31 16.8L12.03 14.65M12.59 5.24A3.4 3.4 0 0 0 6 6.4V11.2L9.72 13.35M18.15 9.13A3.4 3.4 0 0 0 13.85 4L9.69 6.4V10.7M17.56 15.89A3.4 3.4 0 0 0 19.85 9.6L15.69 7.2L11.97 9.35" />
   </svg>
 );
 

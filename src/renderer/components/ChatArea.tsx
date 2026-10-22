@@ -46,7 +46,7 @@ import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC,
 import type { ScheduleSummary } from '../scheduleView';
 import { bgElapsedText, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
-import { IconClaudeSpark, IconCodexPrompt, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
+import { IconClaudeSpark, IconCodex, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
@@ -4707,7 +4707,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         aria-label={t('{engine} config', { engine: engineLabel })}
                       >
                         {/* 不用机器人 —— 那是 kiro 的（「左下角不应该再用那个机器人的图标了」） */}
-                        {engine === 'claude' ? <IconClaudeSpark size={15} /> : <IconCodexPrompt size={15} />}
+                        {engine === 'claude' ? <IconClaudeSpark size={15} /> : <IconCodex size={15} />}
                       </button>
                       {/*
                         **组合** —— 取代原来的 effort 下拉：组合里带着 MCP 和 effort（「不同对话挂不同的 MCP」）。
@@ -5240,7 +5240,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <div className="agent-config-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="engine-config-title">
             <div className="settings-header">
               <div className="agent-config-editor-title">
-                {engine === 'claude' ? <IconClaudeSpark size={17} /> : <IconCodexPrompt size={17} />}
+                {engine === 'claude' ? <IconClaudeSpark size={17} /> : <IconCodex size={17} />}
                 <h3 id="engine-config-title">{t('{engine} config', { engine: engineLabel })}</h3>
               </div>
               <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label={t('Close')}>✕</button>
