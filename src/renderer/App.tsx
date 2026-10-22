@@ -38,7 +38,7 @@ import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
-import { busyEnterRoute, composerRunning, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { busyEnterRoute, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
 import { carryControlMark, controlMessageId, isControlMessageId } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
@@ -3317,13 +3317,33 @@ const App: React.FC = () => {
         }),
       }));
     };
-    if (busyEnterRoute({ busy: busyBySessionRef.current[sessionId] }) === 'after-rebuild') { parkUntilRebuilt(); return; }
+    // 引擎不支持 steer（Claude Code / Codex）：忙时 Enter 就是排队 —— 和 ⌘/Ctrl+Enter 同一种卡片，排在队尾，
+    // 这一轮结束后自动作为下一条发出。不先试 steer、不标红。
+    const queueAsNext = () => {
+      const queuedId = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      ctl?.report({ routed: 'queued', messageId: queuedId });
+      setQueuesBySession((prev) => ({
+        ...prev,
+        [sessionId]: [...(prev[sessionId] || []), {
+          id: queuedId,
+          content: pastes?.length ? shown : content,
+          attachments,
+          ...(pastes?.length ? { pastes } : {}),
+          createdAt: Date.now(),
+        }],
+      }));
+    };
+    const canSteer = engineCanSteer(sessions.find((s) => s.id === sessionId)?.engine);
+    const busyRoute = busyEnterRoute({ busy: busyBySessionRef.current[sessionId], canSteer });
+    if (busyRoute === 'after-rebuild') { parkUntilRebuilt(); return; }
+    if (busyRoute === 'queue') { queueAsNext(); return; }
 
     const steerId = ctl ? controlMessageId('steer') : undefined;
     const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments), msgId: steerId });
     if (res.steered) { if (ctl) ctl.report({ routed: 'steer', messageId: steerId! }); return; }
     const route = steerFailureRoute(res.reason);
     if (route === 'after-rebuild') { parkUntilRebuilt(); return; }
+    if (route === 'queue') { queueAsNext(); return; }
     if (route === 'send-now') {
       // The turn already ended: there is no "current turn" to add to, so this IS
       // the next message. Sent straight away unless a queued item is already on
@@ -3335,7 +3355,7 @@ const App: React.FC = () => {
     // Anything else: never silently queue. Mark it red on the turn and let the user choose.
     const failedId = addFailedSteer(sessionId, content, attachments, res.reason, ctl ? controlMessageId('steer') : undefined);
     ctl?.report({ routed: 'steer', messageId: failedId, steerFailed: res.reason || 'unknown' });
-  }, [currentSessionId, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds, sendNowOrNext, addFailedSteer]);
+  }, [currentSessionId, sessions, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds, sendNowOrNext, addFailedSteer]);
 
   const handleQueueMessage = useCallback((text: string, pastes?: PastedBlock[], paneSid?: string, ctl?: ControlSendCtx) => {
     const content = text.trim();
@@ -3366,7 +3386,7 @@ const App: React.FC = () => {
    * **控制入口发来的一条**（主进程 `control:send`，见 controlServer.ts 的 `POST /sessions/:id/send`）。
    *
    * 和你在输入框按 Enter **走同一套路由**（`steerRoute.enterRoute`）：空闲就发；这一轮在跑就追加指令
-   * （失败照样标红等你选）；重建历史中就「重建后发送」；`mode:'next'` 等于 ⌘/Ctrl+Enter（排队卡片）。
+   * （失败照样标红等你选；引擎不支持追加的 Claude Code / Codex 就排队）；重建历史中就「重建后发送」；`mode:'next'` 等于 ⌘/Ctrl+Enter（排队卡片）。
    * 不同的只有：不切你的焦点、不带走你输入框里的附件、消息 id 带标记（气泡上显示「经控制入口发送」）。
    * 一决定走哪条路就回话（`report`），不等这一轮跑完。
    */
@@ -3379,7 +3399,7 @@ const App: React.FC = () => {
     const busy = busyBySessionRef.current[sid];
     const route = enterRoute({
       streaming: streamingIds.includes(sid), busy, occupied: isBackendOccupied(busy),
-      looping: loopingIds.includes(sid), next: req.mode === 'next',
+      looping: loopingIds.includes(sid), next: req.mode === 'next', canSteer: engineCanSteer(session.engine),
     });
     if (route === 'blocked') return Promise.resolve({ ok: false, status: 409, error: 'loop-running' });
     return new Promise<ControlSendReply>((resolve) => {

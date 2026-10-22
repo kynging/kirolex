@@ -3,6 +3,8 @@ import assert from 'node:assert/strict';
 import {
   steerPayload,
   busyEnterRoute,
+  enterRoute,
+  engineCanSteer,
   steerFailureRoute,
   steerFailureReasonKey,
   isRebuildingHistory,
@@ -43,8 +45,12 @@ describe('steer 失败怎么办：不再静默转排队', () => {
     assert.equal(steerFailureRoute('priming'), 'after-rebuild');
   });
 
+  test('引擎不支持 steer（unsupported，渲染端引擎状态没同步时的兜底）→ 排队，作为下一条', () => {
+    assert.equal(steerFailureRoute('unsupported'), 'queue');
+  });
+
   test('其余原因一律交给用户选：标红 + 两个按钮', () => {
-    for (const r of ['unsupported', 'write-failed', 'not-connected', 'reconfiguring', 'ipc-error', undefined, 'whatever']) {
+    for (const r of ['write-failed', 'not-connected', 'reconfiguring', 'ipc-error', undefined, 'whatever']) {
       assert.equal(steerFailureRoute(r), 'ask', String(r));
     }
   });
@@ -58,13 +64,49 @@ describe('steer 失败怎么办：不再静默转排队', () => {
 
 describe('忙时普通 Enter 先走哪条路', () => {
   test('正在跑一轮 → steer（不管队列里有没有东西、带不带附件 / 粘贴 —— 这些都不在判据里）', () => {
-    assert.equal(busyEnterRoute({ busy: 'turn' }), 'steer');
-    assert.equal(busyEnterRoute({ busy: undefined }), 'steer');
+    assert.equal(busyEnterRoute({ busy: 'turn', canSteer: true }), 'steer');
+    assert.equal(busyEnterRoute({ busy: undefined, canSteer: true }), 'steer');
     assert.equal(busyEnterRoute.length, 1);
   });
   test('重建历史中 → 重建结束后发', () => {
-    assert.equal(busyEnterRoute({ busy: 'priming' }), 'after-rebuild');
-    assert.equal(busyEnterRoute({ busy: 'prime-pending' }), 'after-rebuild');
+    assert.equal(busyEnterRoute({ busy: 'priming', canSteer: true }), 'after-rebuild');
+    assert.equal(busyEnterRoute({ busy: 'prime-pending', canSteer: true }), 'after-rebuild');
+  });
+  test('引擎不支持 steer（Claude Code / Codex）→ 直接排队，不先试 steer', () => {
+    assert.equal(busyEnterRoute({ busy: 'turn', canSteer: false }), 'queue');
+    assert.equal(busyEnterRoute({ busy: undefined, canSteer: false }), 'queue');
+    // 重建历史还是「重建后发送」那条（它本来就是重建一结束的下一条）
+    assert.equal(busyEnterRoute({ busy: 'priming', canSteer: false }), 'after-rebuild');
+  });
+});
+
+describe('哪些引擎能 steer（判据只有这一处）', () => {
+  test('kiro（含没有 engine 字段的老会话）能；claude / codex 不能', () => {
+    assert.equal(engineCanSteer('kiro'), true);
+    assert.equal(engineCanSteer(undefined), true);
+    assert.equal(engineCanSteer('claude'), false);
+    assert.equal(engineCanSteer('codex'), false);
+  });
+});
+
+describe('enterRoute（输入框 Enter 和控制入口 send 共用）带上引擎能力', () => {
+  const base = { streaming: false, occupied: false, looping: false };
+  test('canSteer=false 且这一轮在跑 → queue', () => {
+    assert.equal(enterRoute({ ...base, streaming: true, canSteer: false }), 'queue');
+    assert.equal(enterRoute({ ...base, busy: 'turn', occupied: true, canSteer: false }), 'queue');
+  });
+  test('canSteer=true 维持 steer（kiro 不变）', () => {
+    assert.equal(enterRoute({ ...base, streaming: true, canSteer: true }), 'steer');
+    assert.equal(enterRoute({ ...base, busy: 'turn', occupied: true, canSteer: true }), 'steer');
+    assert.equal(enterRoute({ ...base, busy: 'priming', occupied: true, canSteer: true }), 'steer');
+  });
+  test('重建历史中、canSteer=false → 仍走 steer 那条（handleSteerMessage 里停到「重建后发送」）', () => {
+    assert.equal(enterRoute({ ...base, busy: 'priming', occupied: true, canSteer: false }), 'steer');
+  });
+  test('空闲 / 循环 / next 不受引擎影响', () => {
+    assert.equal(enterRoute({ ...base, canSteer: false }), 'send');
+    assert.equal(enterRoute({ ...base, looping: true, canSteer: false }), 'blocked');
+    assert.equal(enterRoute({ ...base, streaming: true, next: true, canSteer: true }), 'queue');
   });
 });
 

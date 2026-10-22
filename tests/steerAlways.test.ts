@@ -55,7 +55,7 @@ describe('用户这次的根因：粘贴块在 ChatArea → App 这一跳被丢�
   });
 
   test('忙碌状态从 ref 读：回调里 await 过 focusSession，闭包里的值会过期', () => {
-    assert.match(steer, /busyEnterRoute\(\{ busy: busyBySessionRef\.current\[sessionId\] \}\)/);
+    assert.match(steer, /busyEnterRoute\(\{ busy: busyBySessionRef\.current\[sessionId\], canSteer \}\)/);
     assert.doesNotMatch(steer, /busyBySession\[sessionId\]/);
   });
 });

@@ -38,7 +38,7 @@ function timeline(ipc: { steered: boolean; reason?: string }, turnEndsFirst: boo
 }
 
 describe('IPC 结果晚到、期间这一轮结束', () => {
-  for (const reason of ['unsupported', 'write-failed', 'not-connected', 'ipc-error']) {
+  for (const reason of ['write-failed', 'not-connected', 'ipc-error']) {
     test(`失败（${reason}）→ 不进队列，交给 App 标红让用户选`, () => {
       const r = timeline({ steered: false, reason }, true);
       assert.deepEqual(r.requeued, [], '轮末不许把结果还没回来的挪进队列');
@@ -91,8 +91,9 @@ describe('主进程 acp:steer 的检查顺序', () => {
     assert.equal(steerFailureRoute(steerRefusal({ ...base, busy: false, supportsSteer: false })!), 'send-now');
   });
 
-  test('不支持 steer 的引擎、这一轮还在跑 → unsupported（标红让用户选）', () => {
+  test('不支持 steer 的引擎、这一轮还在跑 → unsupported（渲染端兜底：排队作为下一条，不标红）', () => {
     assert.equal(steerRefusal({ ...base, supportsSteer: false }), 'unsupported');
+    assert.equal(steerFailureRoute('unsupported'), 'queue');
   });
 
   test('重建历史 / 换执行器 / 没连上 排在「这一轮已结束」前面', () => {

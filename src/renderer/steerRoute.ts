@@ -9,6 +9,9 @@
  *   · steer 失败 → 消息标红，用户自己选「作为下一条发送」或「放回输入框」；
  *     只有「这一轮已经结束」（idle）没有可追加的那一轮了，直接作为新消息发出。
  * 想排队的用 ⌘/Ctrl+Enter（不变）。
+ *
+ * 例外：**引擎不支持 steer**（`_session/steer` 是 kiro-cli 的扩展，Claude Code / Codex 的适配器都没有）——
+ * 忙时普通 Enter 直接排队（和 ⌘/Ctrl+Enter 同一条路），这一轮结束后自动作为下一条发出；不先试 steer、不标红。
  */
 
 export interface SteerAttachmentRef { path: string; name?: string; isImage?: boolean }
@@ -22,7 +25,13 @@ export function steerPayload(content: string, attachments: SteerAttachmentRef[])
   return text ? `${refs}\n\n${text}` : refs;
 }
 
-export type SteerFailureRoute = 'send-now' | 'after-rebuild' | 'ask';
+export type SteerFailureRoute = 'send-now' | 'after-rebuild' | 'queue' | 'ask';
+
+/** 这个引擎能不能往正在跑的一轮里追加（steer）。和主进程 `AcpClient.supportsSteer` 同一个判据；
+ *  没有 engine 字段的老会话就是 kiro。 */
+export function engineCanSteer(engine?: string | null): boolean {
+  return !engine || engine === 'kiro';
+}
 
 /** `acp:steer` 拒绝之后怎么办。 */
 export function steerFailureRoute(reason?: string): SteerFailureRoute {
@@ -30,6 +39,8 @@ export function steerFailureRoute(reason?: string): SteerFailureRoute {
   if (reason === 'idle') return 'send-now';
   // 渲染端还不知道、主进程已经在重建历史：和渲染端自己看到重建时同一条路。
   if (reason === 'priming') return 'after-rebuild';
+  // 引擎不支持 steer（渲染端的引擎状态还没同步就先试了）：和 canSteer=false 时一样，排队作为下一条。
+  if (reason === 'unsupported') return 'queue';
   return 'ask';
 }
 
@@ -45,10 +56,12 @@ export function steerFailureReasonKey(reason?: string): string {
   }
 }
 
-/** 忙时普通 Enter 先走哪条路。只看「是不是在重建历史」：队列里有没有东西、带不带附件、有没有粘贴
- *  **都不在判据里** —— 那几样以前各自把 Enter 变成了排队。 */
-export function busyEnterRoute(s: { busy?: string | null }): 'steer' | 'after-rebuild' {
-  return isRebuildingHistory(s.busy) ? 'after-rebuild' : 'steer';
+/** 忙时普通 Enter 先走哪条路。只看「是不是在重建历史」和「引擎能不能 steer」：队列里有没有东西、带不带附件、
+ *  有没有粘贴 **都不在判据里** —— 那几样以前各自把 Enter 变成了排队。
+ *  `canSteer` = `engineCanSteer(session.engine)`；不能 steer 的引擎直接排队。 */
+export function busyEnterRoute(s: { busy?: string | null; canSteer: boolean }): 'steer' | 'after-rebuild' | 'queue' {
+  if (isRebuildingHistory(s.busy)) return 'after-rebuild';
+  return s.canSteer === false ? 'queue' : 'steer';
 }
 
 /** 输入框眼里「这一轮在跑」—— 这时普通 Enter 走 steer（`ChatInputBox` 的 `isStreaming`）。
@@ -64,11 +77,12 @@ export type EnterRoute = 'blocked' | 'steer' | 'queue' | 'send';
  * （循环占着 → 不发；后端被占着但不是在跑一轮 → 排队；在跑一轮 → steer）合起来的那一套。
  * 控制入口的 `send` 用的就是它，和你在输入框按 Enter 一模一样；`mode:'next'` 等于 ⌘/Ctrl+Enter（排队）。
  * `occupied` = `isBackendOccupied(busy)`（在 useAcp 里，测试 import 不了，所以由调用方算好传进来）。
+ * `canSteer` = `engineCanSteer(session.engine)`：不能 steer 的引擎在跑一轮时就排队（`busyEnterRoute` 同一个判据）。
  */
-export function enterRoute(s: { streaming: boolean; busy?: string | null; occupied: boolean; looping: boolean; next?: boolean }): EnterRoute {
+export function enterRoute(s: { streaming: boolean; busy?: string | null; occupied: boolean; looping: boolean; next?: boolean; canSteer: boolean }): EnterRoute {
   if (s.looping) return 'blocked';
   if (s.next) return 'queue';
-  if (composerRunning(s.streaming, s.busy)) return 'steer';
+  if (composerRunning(s.streaming, s.busy)) return busyEnterRoute(s) === 'queue' ? 'queue' : 'steer';
   if (s.occupied) return 'queue';
   return 'send';
 }

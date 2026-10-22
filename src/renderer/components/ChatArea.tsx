@@ -19,7 +19,7 @@ import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHi
 import { useLang, useT } from '../hooks/useLang';
 import { displayTitle, shownIn } from '../i18n';
 import { pickVariant } from '../../main/uiText.ts';
-import { steerFailureReasonKey } from '../steerRoute';
+import { engineCanSteer, steerFailureReasonKey } from '../steerRoute';
 // 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
 import { shouldApplyHandoff } from '../handoffDraft';
 import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
@@ -1749,6 +1749,8 @@ const ChatInputBox = memo<{
   permissionPending?: { onCancel: () => void } | null;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteer: (text: string, pastes?: PastedBlock[]) => void;
+  /** 引擎能不能追加到正在跑的一轮（`engineCanSteer`）。不能（Claude Code / Codex）：忙时 Enter 是排队，文案也说排队 */
+  canSteer: boolean;
   onCancel: () => void;
   onStopLoop: () => void;
   onQueueCommand: (text: string, pastes?: PastedBlock[]) => void;
@@ -1775,7 +1777,7 @@ const ChatInputBox = memo<{
    * 只有 `session/request_permission`），所以这些只能从回复文字里认。
    */
   choiceChips: ChoiceChip[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, permissionPending, onSend, onSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, permissionPending, onSend, onSteer, canSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
@@ -2206,6 +2208,8 @@ const ChatInputBox = memo<{
             ? t('Looping this message — click Stop to end it')
             : status !== 'connected'
             ? t('Connecting... (type /stop to force reconnect)')
+            : isStreaming && !canSteer
+            ? t('Agent is working — Enter queues it to send after this turn')
             : isStreaming
             ? t('Agent is working — Enter steers the running turn · {key}+Enter queues', { key: MOD_KEY })
             : t('Type a message...')
@@ -2300,6 +2304,8 @@ const ChatInputBox = memo<{
             <span className="composer-shortcut-full">
               {isLooping
                 ? t('Loop running · Stop to end it')
+                : isStreaming && !canSteer
+                ? t('Enter queue (sends after this turn) · Shift+Enter newline')
                 : isStreaming
                 ? t('Enter steer running turn · Shift+Enter newline · {key}+Enter queue', { key: MOD_KEY })
                 : t('Enter send · Shift+Enter newline · {key}+Enter queue', { key: MOD_KEY })}
@@ -2325,7 +2331,7 @@ const ChatInputBox = memo<{
         ) : (
           <button
             className={`composer-send${
-              queueModifierHeld
+              queueModifierHeld || (isStreaming && !canSteer)
                 ? ' queue'
                 : isStreaming
                 ? ' steer'
@@ -2337,11 +2343,13 @@ const ChatInputBox = memo<{
             disabled={status !== 'connected'}
             title={queueModifierHeld
               ? t('Add a new queued message ({key}+Enter)', { key: MOD_KEY })
+              : isStreaming && !canSteer
+              ? t('Queue to send after this turn (Enter)')
               : isStreaming
               ? t('Steer the running turn (Enter)')
               : t('Send (Enter)')}
           >
-            {queueModifierHeld ? (
+            {queueModifierHeld || (isStreaming && !canSteer) ? (
               <IconQueue size={17} />
             ) : isStreaming ? (
               <IconSteer size={17} />
@@ -4647,6 +4655,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 } : null}
                 onSend={onSend}
                 onSteer={onSteerMessage}
+                canSteer={engineCanSteer(engine)}
                 onCancel={onCancel}
                 onStopLoop={onStopLoop}
                 onQueueCommand={onQueueMessage}
