@@ -17,6 +17,11 @@ import { isReplayOutsideTurn } from '../src/main/replayGuard.ts';
     **没有任何对话正文**；
   - session/load 旧 id：`user_message_chunk` + `agent_message_chunk`（旧对话）**在响应之前**，然后响应、命令表。
   另加一种实测里**没出现**、但别的版本可能有的形状：session/new 响应**之后**才吐旧对话 —— 只有这种能走到界面。
+
+  等待不靠固定 sleep：测试借 `client.steer()`（公开的裸写请求）给假 agent 递一个 `_session/steer` 暗号，
+  假 agent 按序回一条 `_kiro.dev/test/pong`；stdout 是有序的，收到 pong 就说明它之前的帧都已分发完。
+  「响应之后才回放」也由暗号触发（见 replay-after-new）：原来和响应同一拍写出，常和响应落在同一个 stdout 块里，
+  AcpClient 同步解析完整块、`await newSession` 之后的代码才跑，回放就早于监听 —— 约 1/3 次挂。
 */
 
 const FAKE_AGENT = String.raw`
@@ -42,7 +47,11 @@ process.stdin.on('data', (d) => {
       kiro('_kiro.dev/subagent/list_update', { subagents: [] });
       out({ jsonrpc: '2.0', id: m.id, result: { sessionId: sid } });
       kiro('_kiro.dev/commands/available', { sessionId: sid, commands: [{ name: 'help' }] });
-      if (MODE === 'replay-after-new') replay(OLD);
+    }
+    /* 测试暗号（走 client.steer）：replay-after-new 下带 replay 的暗号 = 「响应之后、监听已接上」才吐旧对话；随后按序回 pong */
+    if (m.method === '_session/steer') {
+      if (MODE === 'replay-after-new' && m.params.message.includes('replay')) replay(OLD);
+      kiro('_kiro.dev/test/pong', { token: m.params.message });
     }
     if (m.method === 'session/load') {
       kiro('_kiro.dev/subagent/list_update', { subagents: [] });
@@ -81,7 +90,21 @@ function wire(client: AcpClient, guard: boolean) {
   });
   return forwarded;
 }
-const settle = () => new Promise((r) => setTimeout(r, 300));
+/** 屏障：等假 agent 把这之前的帧都发完、AcpClient 都分发完（收到对应 pong），超时就挂 */
+let pings = 0;
+function barrier(client: AcpClient, what = 'ping', timeoutMs = 10000): Promise<void> {
+  const token = `${what}-${++pings}`;
+  return new Promise((resolve, reject) => {
+    const onUpdate = (data: any) => {
+      const u = data?.update;
+      if (u?.method !== '_kiro.dev/test/pong' || !String(u.token).includes(token)) return;
+      clearTimeout(timer); client.off('update', onUpdate); resolve();
+    };
+    const timer = setTimeout(() => { client.off('update', onUpdate); reject(new Error(`等不到 ${token} 的 pong`)); }, timeoutMs);
+    client.on('update', onUpdate);
+    if (!client.steer('test', token)) { clearTimeout(timer); client.off('update', onUpdate); reject(new Error('暗号写不出去')); }
+  });
+}
 
 test('实测形状（kiro-cli 2.13）：session/new 不吐对话正文 —— 新建会话这条路上没有回放可转发（守卫开不开都一样）', async () => {
   const client = await startClient('kiro-2.13');
@@ -89,7 +112,7 @@ test('实测形状（kiro-cli 2.13）：session/new 不吐对话正文 —— �
     for (const guard of [false, true]) {
       await client.newSession(dir);
       const forwarded = wire(client, guard);
-      await settle();
+      await barrier(client);
       assert.deepEqual(forwarded, []);
       client.removeAllListeners('update');
     }
@@ -102,13 +125,13 @@ test('实测形状（kiro-cli 2.13）：session/load 的回放在响应之前 �
     /* 先证明回放确实发生了：响应之前就接着听的话能收到 */
     const early = wire(client, false);
     await client.loadSession('old-cli-session', dir);
-    await settle();
+    await barrier(client);
     assert.equal(early.length, 2, '假 agent 确实回放了旧对话');
     client.removeAllListeners('update');
     /* 主进程的顺序：await loadSession → wireSession */
     await client.loadSession('old-cli-session', dir);
     const late = wire(client, false);
-    await settle();
+    await barrier(client);
     assert.deepEqual(late, []);
   } finally { await client.disconnect(); }
 });
@@ -118,7 +141,7 @@ test('响应之后才回放（实测没出现、别的版本可能有）：没�
   try {
     await client.newSession(dir);
     const unguarded = wire(client, false);
-    await settle();
+    await barrier(client, 'replay');
     assert.deepEqual(unguarded, [
       'user_message_chunk:OLD QUESTION from another chat',
       'agent_message_chunk:OLD ANSWER from another chat',
@@ -126,7 +149,7 @@ test('响应之后才回放（实测没出现、别的版本可能有）：没�
     client.removeAllListeners('update');
     await client.newSession(dir);
     const guarded = wire(client, true);
-    await settle();
+    await barrier(client, 'replay');
     assert.deepEqual(guarded, []);
   } finally { await client.disconnect(); }
 });
