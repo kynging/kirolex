@@ -422,7 +422,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       <label className="settings-label">{t('Machines & launch commands')}</label>
       <p className="settings-hint" style={{ marginTop: 0 }}>
         {t('Which command launches kiro / claude / codex on each machine. They can be auto-detected and tested one by one.')}
-        {t(' Once a remote machine is set up, ')}<b>{t('New chat')}</b>{t(' or right-click → "Run on" lets a session run its kiro-cli on that machine. ')}
+        {t(' Once a remote machine is set up, ')}<b>{t('New chat')}</b>{t(' or right-click → "Run on" lets a session run on that machine. ')}
         <b>{t('Files are not copied over')}</b>{t(': it reads and writes through a reverse tunnel back to the tools on your machine.')}
       </p>
       <select

@@ -87,7 +87,7 @@ export const ZH_CHAT: Record<string, string> = {
   '⏳ No response this turn; interrupted and resending…': '⏳ 这一轮没有响应已中断，正在自动重发…',
   '⏳ The connection dropped mid-turn; reconnecting and resending this turn…': '⏳ 连接中途断了，正在重连并重发这一轮…',
   'Connecting to chat…': '正在连接会话…',
-  'Sent, waiting for Kiro to respond…': '已发送，等待 Kiro 响应…',
+  'Sent, waiting for {engine} to respond…': '已发送，等待 {engine} 响应…',
   '⏳ The current turn is still running (maybe compacting context); send after it finishes.': '⏳ 当前这一轮还在跑（可能在压缩上下文），等它结束再发。',
   'Reconnecting to chat…': '正在重新连接会话…',
   'Reconnected, resending…': '已重连，重新发送…',
@@ -204,7 +204,7 @@ export const ZH_CHAT: Record<string, string> = {
   '🔑 Login': '🔑 登录',
   '🧩 Combos': '🧩 组合',
   // ── components/ChatArea.tsx (round 2: English literals) ──
-  "Estimated from the visible question and answer; Kiro CLI does not expose exact per-turn token counts.": "按可见的提问和回答估算；Kiro CLI 不提供每一轮的精确 token 数。",
+  "Estimated from the visible question and answer; the engine does not report exact per-turn token counts.": "按可见的提问和回答估算；引擎不提供每一轮的精确 token 数。",
   "Copied!": "已复制！",
   "Copy message": "复制消息",
   "Fork conversation from here": "从这里分叉会话",
@@ -298,4 +298,11 @@ export const ZH_CHAT: Record<string, string> = {
   'Installed, but this chat still could not connect.': '装好了，但这条会话还是没连上。',
   'Installs only this adapter, then reconnects this chat.': '只装这一个适配器，装完自动重连这条会话。',
   '✅ The {engine} ACP adapter is installed and this chat is connected.': '✅ {engine} 的 ACP 适配器装好了，这条会话已连上。',
+  // Claude Code / Codex 下拉旁的切换失败标记（sessionRequestStatus.ts）
+  '⚠️ Switching the model failed: {why}': '⚠️ 切换模型失败：{why}',
+  '⚠️ Switching the effort failed: {why}': '⚠️ 切换 effort 失败：{why}',
+  '⚠️ Switching the permission mode failed: {why}': '⚠️ 切换权限模式失败：{why}',
+  '⚠️ Switching the combo failed: {why}': '⚠️ 切换组合失败：{why}',
+  'Switch failed': '切换失败',
+  '{why}\nClick to dismiss.': '{why}\n点一下关掉。',
 };

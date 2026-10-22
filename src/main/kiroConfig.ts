@@ -208,7 +208,7 @@ export function entryPath(home: string, spec: CategorySpec, name?: string): stri
 
 /** 保存前的内容校验。返回一句给人看的错误，或 `null`。 */
 export function validateContent(spec: CategorySpec, content: string): string | null {
-  if (spec.readOnly) return tr('{label} is managed by kiro-cli and cannot be edited here.', { label: spec.label });
+  if (spec.readOnly) return tr('{label} is managed by {owner} and cannot be edited here.', { label: spec.label, owner: spec.engine === 'claude' ? 'Claude Code' : spec.engine === 'codex' ? 'Codex' : 'kiro-cli' });
   if (content.length > 1024 * 1024) return tr('Larger than 1 MB. A config this big is most likely something pasted by mistake.');
   if (spec.json) {
     try {

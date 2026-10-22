@@ -53,6 +53,7 @@ import { adapterInstallOffer } from '../adapterInstallOffer';
 import { adapterInstallStore, setAdapterInstallRunner } from '../adapterInstallState';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
+import { engineLabel } from '../engineLabel';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -4062,7 +4063,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     recoveryCancelledRef.current.delete(sid!);
     addAttached(sid!); // first use -> live
     lastPromptedSessionRef.current = sid;
-    setSessionActivity(sid, t('Sent, waiting for Kiro to respond…'));
+    setSessionActivity(sid, t('Sent, waiting for {engine} to respond…', { engine: engineLabel(sessionsRef.current.find((s) => s.id === sid)?.engine) }));
 
     try {
       const res = await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });

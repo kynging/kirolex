@@ -19,7 +19,7 @@ function fallbackBranch(): string {
   const code = src.replace(/\/\*[\s\S]*?\*\//g, '').split('\n').map((l) => l.replace(/\/\/.*$/, '')).join('\n');
   const at = code.indexOf('private handleAgentRequest');
   assert.ok(at > 0);
-  return code.slice(at, at + 1800);
+  return code.slice(at, at + 2400);
 }
 
 test('不认识的请求：先 emit error（进日志也进界面），再回 {}', () => {

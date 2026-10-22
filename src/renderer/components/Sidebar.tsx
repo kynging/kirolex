@@ -34,6 +34,7 @@ import type { ScheduleSummary } from '../scheduleView';
 import { IconLogs, IconWorkspaceFolder } from './Icons';
 import { showToast } from './Toasts';
 import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
+import { engineCliName } from '../engineLabel';
 
 type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
 
@@ -380,7 +381,7 @@ const SessionItem: React.FC<{
       ) : session.remoteHost && (
         <span
           className="session-remote"
-          title={t('This chat’s kiro-cli runs on {host}; the files stay on this machine. It reads and writes them by calling local tools over a reverse tunnel (no files are copied).', { host: session.remoteHost })}
+          title={t('This chat’s {engine} runs on {host}; the files stay on this machine. It reads and writes them by calling local tools over a reverse tunnel (no files are copied).', { engine: engineCliName(session.engine), host: session.remoteHost })}
         >
           🌐 {session.remoteHost}
         </span>

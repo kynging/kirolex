@@ -25,8 +25,8 @@ export const ZH_SHELL: Record<string, string> = {
     '用 {engine} 自己的登录和默认模型；选远端机器的话，那台机器上要装好它的 ACP 适配器（设置 → 机器 →「安装 AI 工具」）并登录过。',
   'Which machine to run on': '在哪台机器上跑',
   'Local': '本地',
-  'Files stay local. The remote kiro-cli reads and writes the files on this machine through a tunnel (nothing is copied).':
-    '文件仍然在本地 —— 远端那个 kiro-cli 通过隧道读写你这台机器上的文件（不复制）。',
+  'Files stay local. The remote {engine} reads and writes the files on this machine through a tunnel (nothing is copied).':
+    '文件仍然在本地 —— 远端那个 {engine} 通过隧道读写你这台机器上的文件（不复制）。',
   'Open log file': '打开日志文件',
   '⋯ Loading older logs…': '⋯ 加载更早的日志…',
   '↑ Scroll up to load older logs': '↑ 上拉加载更早的日志',
@@ -34,8 +34,8 @@ export const ZH_SHELL: Record<string, string> = {
 
   // ── components/Sidebar.tsx ──
   'Switching where this runs…': '正在切换运行位置…',
-  'This chat’s kiro-cli runs on {host}; the files stay on this machine. It reads and writes them by calling local tools over a reverse tunnel (no files are copied).':
-    '这条会话的 kiro-cli 跑在 {host} 上；文件仍然在你这台机器上 ——它通过一条反向隧道调本地工具来读写（不复制文件）。',
+  'This chat’s {engine} runs on {host}; the files stay on this machine. It reads and writes them by calling local tools over a reverse tunnel (no files are copied).':
+    '这条会话的 {engine} 跑在 {host} 上；文件仍然在你这台机器上 ——它通过一条反向隧道调本地工具来读写（不复制文件）。',
   '✗ Could not switch engine: {reason}': '✗ 切换引擎失败：{reason}',
   '✗ Could not switch where this runs: {reason}': '✗ 切换运行位置失败：{reason}',
   'reason unknown': '原因不明',
@@ -159,10 +159,10 @@ export const ZH_SHELL: Record<string, string> = {
   'Compact context?': '压缩上下文？',
   'Clear context?': '清空上下文？',
   'Reset Credits counter?': '重置 Credits 计数？',
-  'Kiro CLI will summarize older conversation context to free context-window capacity. The original full context cannot be restored inside this active Kiro session.':
-    'Kiro CLI 会把较早的对话上下文压缩成摘要，腾出上下文窗口。在当前这个 Kiro 会话里，原来的完整上下文无法再恢复。',
-  'Kiro CLI will discard the active conversation context, and KiroLex will clear the currently displayed history. This cannot be undone inside this active chat.':
-    'Kiro CLI 会丢弃当前的对话上下文，KiroLex 也会清掉当前显示的历史记录。在这个会话里无法撤销。',
+  '{engine} will summarize older conversation context to free context-window capacity. The original full context cannot be restored inside this active {engine} session.':
+    '{engine} 会把较早的对话上下文压缩成摘要，腾出上下文窗口。在当前这个 {engine} 会话里，原来的完整上下文无法再恢复。',
+  '{engine} will discard the active conversation context, and KiroLex will clear the currently displayed history. This cannot be undone inside this active chat.':
+    '{engine} 会丢弃当前的对话上下文，KiroLex 也会清掉当前显示的历史记录。在这个会话里无法撤销。',
   'This resets the Credits counter for the current KiroLex session to 0. It does not change actual account usage, billing, or Kiro credit records.':
     '这会把当前 KiroLex 会话的 Credits 计数清零。不会改变实际的账户用量、账单或 Kiro 的 credit 记录。',
   '🗑️ Delete Session': '🗑️ 删除会话',

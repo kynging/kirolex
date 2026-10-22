@@ -47,6 +47,7 @@ import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
+import { engineLabel, engineCliName } from './engineLabel';
 
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
 const RUN_DONE_CARD_KEY = 'kirolex-run-done-card';
@@ -2873,6 +2874,13 @@ const App: React.FC = () => {
   }, [currentSessionId, sessions]);
 
   const currentSession = sessions.find((session) => session.id === currentSessionId) || null;
+  /** 「管理上下文」确认框里说谁去压缩 / 清空：kiro 会话仍说 Kiro CLI，Claude Code / Codex 说自己 */
+  const usageEngineName = currentSession?.engine && currentSession.engine !== 'kiro' ? engineLabel(currentSession.engine) : 'Kiro CLI';
+  /** 每条会话的「连上且挂好」（和下面 sessionConnected 同一个判据）—— 后台恢复的会话也要清掉它的切换失败 ✗ */
+  const readySessionIds = useMemo(
+    () => attachedSessionIds.filter((id) => !connectingSessionIds.includes(id)),
+    [attachedSessionIds, connectingSessionIds],
+  );
   const selectedKiroAgent = currentSession?.kiroAgent
     || kiroAgents.find((agent) => agent.isDefault)?.name
     || 'kiro_default';
@@ -3893,6 +3901,7 @@ const App: React.FC = () => {
         isStreaming={!!sid && composerRunning(streamingIds.includes(sid), busyBySession[sid])}
         status={status}
         sessionConnected={!!sid && attachedSessionIds.includes(sid) && !connectingSessionIds.includes(sid)}
+        readySessionIds={readySessionIds}
         // Per CHAT, not per focus. Previously this was one app-wide string shown only
         // in the focused pane, so a failure in chat A appeared over chat B once focus
         // moved, and every focus switch mounted the banner in one pane and unmounted it
@@ -4669,7 +4678,7 @@ const App: React.FC = () => {
                 </select>
                 {newChatRemoteId && (
                   <p style={{ fontSize: 11, color: 'var(--text-muted)', marginBottom: 12, lineHeight: 1.5 }}>
-                    {t('Files stay local. The remote kiro-cli reads and writes the files on this machine through a tunnel (nothing is copied).')}
+                    {t('Files stay local. The remote {engine} reads and writes the files on this machine through a tunnel (nothing is copied).', { engine: engineCliName(newChatEngine) })}
                   </p>
                 )}
               </>
@@ -4801,9 +4810,9 @@ const App: React.FC = () => {
                 </h3>
                 <p>
                   {usageActionConfirm === 'compact'
-                    ? t('Kiro CLI will summarize older conversation context to free context-window capacity. The original full context cannot be restored inside this active Kiro session.')
+                    ? t('{engine} will summarize older conversation context to free context-window capacity. The original full context cannot be restored inside this active {engine} session.', { engine: usageEngineName })
                     : usageActionConfirm === 'clear'
-                    ? t('Kiro CLI will discard the active conversation context, and KiroLex will clear the currently displayed history. This cannot be undone inside this active chat.')
+                    ? t('{engine} will discard the active conversation context, and KiroLex will clear the currently displayed history. This cannot be undone inside this active chat.', { engine: usageEngineName })
                     : t('This resets the Credits counter for the current KiroLex session to 0. It does not change actual account usage, billing, or Kiro credit records.')}
                 </p>
                 <div className="actions">

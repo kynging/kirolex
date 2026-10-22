@@ -62,7 +62,7 @@ export function ForwardMcpSettings(): React.ReactElement {
     <div className="settings-item settings-item-wide" data-testid="forward-mcp-settings">
       <label className="settings-label">{t('MCPs forwarded from this machine to remote sessions')}</label>
       <p className="settings-hint" style={{ marginTop: 0 }}>
-        {t('Enter the names used under mcpServers in your Kiro agent file (e.g. mx-ds-mcp). In remote Kiro sessions their requests are sent from this machine: an HTTP upstream sees your local outbound IP, ${env:…} in request headers is expanded from your local environment, and keys never reach the remote. The timeout only applies to HTTP entries (at least 120 seconds). Changes apply to the next remote session; local sessions are not affected.')}
+        {t('Enter the names used under mcpServers in your Kiro agent file (e.g. mx-ds-mcp). In remote sessions (Kiro, Claude Code and Codex alike) their requests are sent from this machine: an HTTP upstream sees your local outbound IP, ${env:…} in request headers is expanded from your local environment, and keys never reach the remote. The timeout only applies to HTTP entries (at least 120 seconds). Changes apply to the next remote session; local sessions are not affected.')}
       </p>
       {rows.map((r, i) => (
         <div key={i} className="settings-control" style={{ gap: 8, marginBottom: 6 }}>

@@ -137,7 +137,7 @@ const ZH_BASE: Record<string, string> = {
   'Auto-approve all tools (click to require approval)': '自动批准所有工具（点一下改为逐个批准）',
   'Ask before each tool (click to auto-approve)': '每个工具都先问（点一下改为自动批准）',
 
-  'Kiro CLI commands': 'Kiro CLI 命令',
+  'Slash commands': '斜杠命令',
   'Remove attachment': '移除附件',
   'Starter prompts': '起步提示',
   'Stop looping': '停止循环重发',
@@ -178,8 +178,8 @@ const ZH_BASE: Record<string, string> = {
   'Confirm before deleting chats': '删除会话前确认',
   'Close': '关闭',
   'MCPs forwarded from this machine to remote sessions': '远程会话从本机转发的 MCP',
-  'Enter the names used under mcpServers in your Kiro agent file (e.g. mx-ds-mcp). In remote Kiro sessions their requests are sent from this machine: an HTTP upstream sees your local outbound IP, ${env:…} in request headers is expanded from your local environment, and keys never reach the remote. The timeout only applies to HTTP entries (at least 120 seconds). Changes apply to the next remote session; local sessions are not affected.':
-    '填 Kiro agent 文件里 mcpServers 的名字（例如 mx-ds-mcp）。远程 Kiro 会话里，这些 MCP 的请求从你这台机器发出：HTTP 型的上游看到的是你本机的出口 IP，请求头里的 ${env:…} 用你本机的环境变量展开，密钥不会出现在远端。超时只对 HTTP 型生效（最少按 120 秒算）。改动对下一条远程会话生效；本地会话不受影响。',
+  'Enter the names used under mcpServers in your Kiro agent file (e.g. mx-ds-mcp). In remote sessions (Kiro, Claude Code and Codex alike) their requests are sent from this machine: an HTTP upstream sees your local outbound IP, ${env:…} in request headers is expanded from your local environment, and keys never reach the remote. The timeout only applies to HTTP entries (at least 120 seconds). Changes apply to the next remote session; local sessions are not affected.':
+    '填 Kiro agent 文件里 mcpServers 的名字（例如 mx-ds-mcp）。远程会话里（Kiro、Claude Code、Codex 都一样），这些 MCP 的请求从你这台机器发出：HTTP 型的上游看到的是你本机的出口 IP，请求头里的 ${env:…} 用你本机的环境变量展开，密钥不会出现在远端。超时只对 HTTP 型生效（最少按 120 秒算）。改动对下一条远程会话生效；本地会话不受影响。',
   'MCP name': 'MCP 名字',
   'Timeout (seconds)': '超时（秒）',
   'sec': '秒',

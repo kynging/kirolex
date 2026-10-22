@@ -895,6 +895,11 @@ export class AcpClient extends EventEmitter {
     }
   }
 
+  /** 提示里怎么叫这个执行器：kiro 说 kiro-cli，另外两家说引擎名 */
+  private get cliName(): string {
+    return this.engine === 'kiro' ? 'kiro-cli' : ENGINE_LABEL[this.engine];
+  }
+
   private handleAgentRequest(msg: any) {
     const { method, id, params } = msg;
     
@@ -957,7 +962,7 @@ export class AcpClient extends EventEmitter {
       */
       this.emit('error', {
         type: 'unknown-request',
-        message: tr('kiro-cli sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.', { method }),
+        message: tr('{engine} sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.', { engine: this.cliName, method }),
         method,
         params,
       });

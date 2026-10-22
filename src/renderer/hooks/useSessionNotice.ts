@@ -26,8 +26,8 @@ export type { SessionNotice } from '../sessionNoticeHub.ts';
 const hub = createNoticeHub((fn) => (window as any).kiroApi?.onSessionNotice?.(fn));
 
 /** 渲染端自己要在状态行说的一句（例如「这一轮已经结束，刚才那条作为新消息发出」）—— 和主进程发来的同一个落点。 */
-export function noteSessionLocally(sessionId: string, text: string): void {
-  hub.ingest({ sessionId, text, ts: Date.now() });
+export function noteSessionLocally(sessionId: string, text: string, variants?: { zh: string; en: string }): void {
+  hub.ingest({ sessionId, text, ts: Date.now(), ...(variants ? { variants } : {}) });
 }
 
 export function useSessionNotice(sessionId: string | null): { notice: SessionNotice | null; dismiss: () => void } {

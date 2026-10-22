@@ -35,8 +35,8 @@ export const ZH_MODULES_B: Record<string, string> = {
   'This engine did not provide a model list': '这个引擎没有给出 模型清单',
   'This engine did not provide permission modes': '这个引擎没有给出 权限模式',
   'This engine did not provide effort options': '这个引擎没有给出 effort 选项',
-  'kiro-cli sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.':
-    'kiro-cli 发来一个 KiroLex 不认识的请求 `{method}`，已回空对象 {} —— 如果它是在"问你"，那这一轮是按一个没人给过的答案继续跑的。请把这条报给 KiroLex。',
+  '{engine} sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.':
+    '{engine} 发来一个 KiroLex 不认识的请求 `{method}`，已回空对象 {} —— 如果它是在"问你"，那这一轮是按一个没人给过的答案继续跑的。请把这条报给 KiroLex。',
   // ── aiLogin.ts ──
   'Claude Code is not installed': '没装 Claude Code',
   'Could not get the login status': '问不到登录状态',
@@ -100,7 +100,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   "User-level standing instructions: every session reads it.": "用户级的常驻说明：每个会话都会读它。",
   "Custom prompts: the file name is the command name (/prompts:name).": "自定义提示词：文件名就是命令名（/prompts:名字）。",
   "Each skill's SKILL.md.": "每个 skill 的 SKILL.md。",
-  '{label} is managed by kiro-cli and cannot be edited here.': '{label} 由 kiro-cli 管理，这里不能改。',
+  '{label} is managed by {owner} and cannot be edited here.': '{label} 由 {owner} 管理，这里不能改。',
   'Larger than 1 MB. A config this big is most likely something pasted by mistake.': '超过 1 MB —— 这么大的配置多半是贴错了东西。',
   'Must be a JSON object.': '必须是一个 JSON 对象。',
   'JSON error: {err}': 'JSON 有错：{err}',

@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { useT } from '../hooks/useLang';
 import { formatJsonOnOpen, formatJsonText, jsonErrorAt } from '../jsonText.ts';
 import { JsonCodeEditor } from './JsonCodeEditor';
+import { engineCliName } from '../engineLabel';
 
 /**
  * **机器人按钮里 Agent 之外的那几个 tab** —— 每个 tab 都是"文件列表 + 编辑器"，
@@ -24,6 +25,8 @@ export interface KiroConfigCategory {
   creatable?: boolean;
   ext?: string;
   hint: string;
+  /** 哪个引擎的配置（main `CategorySpec.engine`，不写 = kiro） */
+  engine?: 'kiro' | 'claude' | 'codex';
 }
 
 /** `label` / `readOnly`：插件带的条目（Claude Code）—— 显示「插件 · 名字」，只读。 */
@@ -150,7 +153,7 @@ export const KiroConfigPanel: React.FC<{
       <div className="agent-config-editor-workspace kiro-config-workspace">
         <aside className="agent-config-agent-list" aria-label={category.label}>
           <div className="agent-config-group-head">
-            <span title={t('This is the copy the kiro-cli on this machine reads')}>{where || '…'}</span>
+            <span title={t('This is the copy the {engine} on this machine reads', { engine: engineCliName(category.engine) })}>{where || '…'}</span>
             {category.kind === 'list' && <span>{entries.length}</span>}
           </div>
           {listError && <div className="agent-config-readonly-note"><span>{listError}</span></div>}

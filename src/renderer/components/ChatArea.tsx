@@ -36,7 +36,7 @@ import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 
-import { useSessionNotice } from '../hooks/useSessionNotice';
+import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import { userTurnBubbles } from '../steerSplit';
@@ -57,7 +57,7 @@ import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts'
 import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
-import { runSessionRequest, setErr, statusFor, cleanIpcError, type RequestStatusMap } from '../sessionRequestStatus.ts';
+import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, switchFailureNotice, cleanIpcError, type RequestStatusMap, type SwitchWhat } from '../sessionRequestStatus.ts';
 import { comboSelectView, type ComboListView } from '../comboPick.ts';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
@@ -1065,7 +1065,7 @@ const MessageItem = memo<{
         {estimatedTokens !== null && (
           <span
             className="message-token-count"
-            title={t('Estimated from the visible question and answer; Kiro CLI does not expose exact per-turn token counts.')}
+            title={t('Estimated from the visible question and answer; the engine does not report exact per-turn token counts.')}
           >
             · ≈ {estimatedTokens.toLocaleString()} {t('tokens')}
           </span>
@@ -2204,7 +2204,7 @@ const ChatInputBox = memo<{
 
       <div className="composer">
         {cmdMatches.length > 0 && (
-        <div className="slash-command-menu" role="listbox" aria-label={t('Kiro CLI commands')}>
+        <div className="slash-command-menu" role="listbox" aria-label={t('Slash commands')}>
           {cmdMatches.slice(0, 8).map((command, index) => (
             <button
               key={command.name}
@@ -2791,6 +2791,8 @@ interface ChatAreaProps {
   isStreaming: boolean;
   status: 'disconnected' | 'connecting' | 'connected';
   sessionConnected: boolean;
+  /** 所有「执行器挂着、不在连接中」的会话（不只这一格这条）—— 后台恢复的会话也要清掉它的切换失败 ✗ */
+  readySessionIds?: readonly string[];
   connectionError: string | null;
   onDismissError?: () => void;
   attachedFiles: AttachedFile[];
@@ -2955,6 +2957,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   isStreaming,
   status,
   sessionConnected,
+  readySessionIds,
   connectionError,
   onDismissError,
   attachedFiles,
@@ -3411,18 +3414,38 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   */
   const [requestStatus, setRequestStatus] = useState<RequestStatusMap>({});
   const { engineBusy: engineModelBusy, comboBusy: mcpComboBusy, err: engineModelErr } = statusFor(requestStatus, currentSessionId);
-  /** 同一条会话的引擎 / 连接状态变了：清掉它上次的错误（原来的行为）；换成别的会话时不清，留着切回来看 */
-  const engineErrSidRef = useRef(currentSessionId);
+  /** 同一条会话换了引擎：清掉它上次的错误；换成别的会话时不清，留着切回来看 */
+  const engineErrSidRef = useRef({ sid: currentSessionId, engine });
   /** 这一格现在是哪条会话 —— 下拉切换的结果回来时核对，换了会话就不写（A 的清单不能出现在 B 的下拉里） */
   const engineSidRef = useRef(currentSessionId);
   engineSidRef.current = currentSessionId;
+  /*
+    **之后成功连上就清掉 ✗**：**按会话**看谁从没连上变成「连上且后端挂好」（clearErrOnReady）。
+    不能只看这一格当前那条：A 失败后切到 B、A 在后台断线又恢复，切回 A 时旧的 ✗ 要已经没了。
+    原来是连接状态一变就清 —— 掉线也会把 ✗ 清掉，一直连着时又一直挂着。
+  */
+  /* 会话 id 只有 [A-Za-z0-9_-]（safeId），用逗号拼成一个键，effect 只在集合真的变了时跑 */
+  const readyKey = status === 'connected' ? (readySessionIds || []).join(',') : '';
+  const engineReadyRef = useRef<string[]>(readyKey ? readyKey.split(',') : []);
+  useEffect(() => {
+    const prev = engineReadyRef.current;
+    const next = readyKey ? readyKey.split(',') : [];
+    engineReadyRef.current = next;
+    setRequestStatus((m) => clearErrOnReady(m, prev, next));
+  }, [readyKey]);
+  /** 切换失败：✗ 旁说「切换失败」，原因同时在这条会话的状态行说一句（发起切换的那条，不看此刻这一格是谁） */
+  const describeSwitchFailure = (sid: string, what: SwitchWhat) => (err: unknown): string => {
+    const n = switchFailureNotice(what, err, findLang);
+    noteSessionLocally(sid, n.text, n.variants);
+    return cleanIpcError(err);
+  };
   useEffect(() => {
     setEngineModels(null);
-    if (engineErrSidRef.current === currentSessionId && currentSessionId) {
+    if (engineErrSidRef.current.sid === currentSessionId && engineErrSidRef.current.engine !== engine && currentSessionId) {
       const sid = currentSessionId;
       setRequestStatus((m) => setErr(m, sid, ''));
     }
-    engineErrSidRef.current = currentSessionId;
+    engineErrSidRef.current = { sid: currentSessionId, engine };
     if (!nonKiro || !currentSessionId) return;
     const api = (window as any).kiroApi;
     let alive = true;
@@ -3463,7 +3486,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         /* pending = 这一轮跑完再换：实际值不动，下拉显示 pending 的那个 */
         if (!d?.pending && engineSidRef.current === sid) setMcpCombos((prev) => (prev ? { ...prev, current: d?.current || comboId, missing: undefined } : prev));
       },
-      cleanIpcError);
+      describeSwitchFailure(sid, 'combo'));
   };
   const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
   const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode', value: string): Promise<void> => {
@@ -3476,7 +3499,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         /* pending = 这一轮跑完再设：返回的不是清单，别拿它覆盖 */
         if (d && !d.pending && engineSidRef.current === sid) setEngineModels(d);
       },
-      cleanIpcError);
+      describeSwitchFailure(sid, category === 'model' ? 'model' : category === 'mode' ? 'mode' : 'effort'));
   };
 
   /* Claude Code / Codex 面板的 tab：按这条会话的引擎从 main 拿（换了引擎就重新拿） */
@@ -4991,7 +5014,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   {(nonKiro ? pendingSwitch?.engineModel : pendingSwitch?.model) !== undefined && (
                     <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.(nonKiro ? 'engineModel' : 'model')} />
                   )}
-                  {engineModelErr && <span className="composer-engine-err" title={engineModelErr}>✗</span>}
+                  {/* 切换失败的标记：原因已在状态行说过，这里说「切换失败」、悬停看原因、点一下关掉；之后连上 / 切换成功自动清 */}
+                  {engineModelErr && <span className="composer-engine-err"
+                    role="button"
+                    tabIndex={0}
+                    title={t('{why}\nClick to dismiss.', { why: engineModelErr })}
+                    onClick={() => { const sid = currentSessionId; if (sid) setRequestStatus((m) => dismissErr(m, sid)); }}
+                    onKeyDown={(e) => { if (e.key !== 'Enter' && e.key !== ' ') return; e.preventDefault(); const sid = currentSessionId; if (sid) setRequestStatus((m) => dismissErr(m, sid)); }}
+                  >✗ {t('Switch failed')}</span>}
                 </div>
               </div>
             </>

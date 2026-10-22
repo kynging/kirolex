@@ -124,10 +124,10 @@ describe('deck 脚本的报错跟着界面语言', () => {
 describe('还挂着的状态行 / 后台会话恢复：切语言后也是当前语言', () => {
   test('活动状态行：生成时是中文，切到英文显示英文；占位符里嵌的译文一起换', async () => {
     const { t, pinShown, shownIn } = await import('../src/renderer/i18n.ts');
-    const text = t('zh', 'Sent, waiting for Kiro to respond…');
-    assert.equal(text, '已发送，等待 Kiro 响应…');
+    const text = t('zh', 'Sent, waiting for {engine} to respond…', { engine: 'Claude Code' });
+    assert.equal(text, '已发送，等待 Claude Code 响应…');
     pinShown(text);
-    assert.equal(shownIn('en', text), 'Sent, waiting for Kiro to respond…');
+    assert.equal(shownIn('en', text), 'Sent, waiting for Claude Code to respond…');
     assert.equal(shownIn('zh', text), text);
     // 带占位符的
     const retry = t('zh', '⟳ Resending the unfinished turn automatically… (attempt {n}/{max})', { n: 2, max: 10 });

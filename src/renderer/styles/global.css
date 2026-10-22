@@ -8701,8 +8701,9 @@ button, input, select, textarea {
 .remote-btn.remote-btn-danger { background: var(--error); border-color: var(--error); color: #fff; }
 .remote-btn.remote-btn-danger:hover:not(:disabled) { filter: brightness(1.08); }
 
-/* Claude Code / Codex 换模型失败：一个红叉，原因在 title 里（下拉的 title 也有） */
-.composer-engine-err { color: var(--error); font-size: 12px; cursor: help; }
+/* Claude Code / Codex 切换模型 / 组合失败：「✗ 切换失败」，原因在 title 里（状态行也说了一句），点一下关掉 */
+.composer-engine-err { color: var(--error); font-size: 12px; cursor: pointer; white-space: nowrap; user-select: none; }
+.composer-engine-err:hover { text-decoration: underline; }
 
 /* 不阻塞的错误提示（代替 window.alert —— 那个是模态的，弹着时整个界面的 JS 都停住） */
 .kx-toasts {
