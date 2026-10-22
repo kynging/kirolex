@@ -10,14 +10,43 @@ memory, permission approval, file-change tracking and more.
 
 What it is **not**: a model provider, an agent framework or a multi-user server. The agent's
 intelligence, tools and login all come from the CLI underneath. KiroLex is a single-user desktop
-app (Electron + React + TypeScript), and all of its state lives in `~/.kirolex/` on your machine.
-It is for people who already use Kiro CLI, Claude Code or Codex every day and want to keep many
+app (Electron + React + TypeScript). It is for people who already use Kiro CLI, Claude Code or Codex every day and want to keep many
 long-running agent sessions organised, recoverable and running in parallel, locally or on a
 remote box, without babysitting a stack of terminals.
 
 ![License](https://img.shields.io/badge/license-MIT-blue.svg)
 
 ![KiroLex main window: sessions grouped by project in the sidebar, a finished turn with its changed files, commands run and task list](docs/screenshots/overview.png)
+
+## Highlights
+
+- **Private by design, local-first.** KiroLex has no server, no account and no telemetry. All of
+  its state (sessions, transcripts, memory, queues, settings) is plain files under `~/.kirolex/`,
+  and model calls go through your own CLI with your own login. The only other network traffic
+  is what you set up or click: S3 sync (off by default, your own bucket), HTTP MCP servers you
+  configure, ssh to your remote machines, and the install / login buttons.
+- **Memory you can read and edit.** The three memory layers are three Markdown files
+  (`global.md`, a project `memory.md`, a session `memory.md` under `~/.kirolex/memory/`), with no
+  vector store behind them. The memory dialog shows and edits each one, and the context snapshot
+  a session was given is kept in `last-injection.md` and can be replaced by hand.
+- **A harness, not another agent.** KiroLex has no model or agent logic of its own: it drives
+  the Kiro CLI, Claude Code or Codex you already use. The engine is chosen per session and can be
+  switched later; the history is rebuilt for the new engine from the session's transcript.
+- **Sessions that survive restarts.** A session is a record on disk, and the executor is a
+  process that can be replaced at any time. After a restart, crash or engine switch the
+  conversation is still there, and an interrupted turn is never resent over and over
+  (`auto-resent.json` remembers which ones already were).
+- **Remote compute, local files.** A session can run its executor on another machine over ssh
+  while the transcript, memory and project files stay on your computer. The remote agent reaches
+  them through `local_*` tools over a reverse ssh tunnel to a loopback-only, token-protected
+  server, so nothing is copied over first.
+- **Everything is auditable.** The files each turn edited (with diffs) and the commands it ran
+  are saved with that turn in `transcript.jsonl`, and permission requests and answers are logged
+  with timestamps in `events.jsonl`. Both are plain-text JSON lines you can grep.
+- **Local control, off by default.** The control endpoint listens only on `127.0.0.1` and needs
+  the token from `~/.kirolex/control.json`. Reading or sending messages through it stays
+  disabled until you turn on `controlSessionAccess` (see
+  [`docs/CONTROL_ENTRY.md`](./docs/CONTROL_ENTRY.md)).
 
 ## Features
 
