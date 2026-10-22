@@ -8,7 +8,7 @@ import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, type Engine } from './engines.ts';
-import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath } from './adapterInstall.ts';
+import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath, remoteInstallReason } from './adapterInstall.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
@@ -36,6 +36,8 @@ import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcri
 import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
+import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
+import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
 import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, getObject, getObjectIfExists, getObjectWithEtag, listObjects } from './s3Client.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, remoteHomeDir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -4712,6 +4714,8 @@ const S3_STATE_PATH = path.join(KIROLEX_HOME, 's3-sync-state.json');
 const S3_MARKS_PATH = path.join(KIROLEX_HOME, 's3-session-sync.json');
 /** 组合文件上次同步完两边的内容摘要（`mcpCombosSync.ts` 的 `ComboSyncMark`） */
 const S3_COMBOS_MARK_PATH = path.join(KIROLEX_HOME, 's3-combos-sync.json');
+/** agent-profiles 每个文件上次同步完两边的内容摘要（`agentProfileSync.ts` 的 `ProfileMarks`） */
+const S3_PROFILES_MARK_PATH = path.join(KIROLEX_HOME, 's3-agent-profiles-sync.json');
 
 function loadSyncConfig(): SyncConfig {
   try {
@@ -5134,6 +5138,64 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
   }
 }
 
+/**
+ * **`~/.kirolex/agent-profiles/` 和桶里那份对一下**（判据在 `agentProfileSync.ts` 的 `syncProfileFiles`）——
+ * 远程机器的 AI 工具配置跨电脑共用，和组合文件一样。两边都改过 → 不覆盖：桶里那份存成 `.conflicts/<时间>/…`。
+ * 拉会改本机文件：改之前把本机那份挪进 trash。出错：这一轮不传。返回传了几个文件。
+ */
+async function syncAgentProfilesWithBucket(creds: S3Creds, prefix: string | undefined): Promise<number> {
+  const root = path.join(KIROLEX_HOME, AGENT_PROFILES_REL);
+  const keyOf = (rel: string) => keyFor(prefix, path.join(AGENT_PROFILES_REL, ...rel.split('/')));
+  const absOf = (rel: string) => containedPath(root, path.join(...rel.split('/')));
+  const stamp = new Date().toISOString().replace(/[:.]/g, '-');
+  try {
+    const r = await syncProfileFiles({
+      listRemote: async () => {
+        const out: string[] = [];
+        for (const o of await listObjects(creds, `${keyFor(prefix, AGENT_PROFILES_REL)}/`)) {
+          const rel = relFor(prefix, o.key);
+          if (rel) out.push(path.relative(AGENT_PROFILES_REL, rel).split(path.sep).join('/'));
+        }
+        return out;
+      },
+      get: async (rel) => getObjectWithEtag(creds, keyOf(rel)),
+      put: (rel, body, cond) => putObjectIf(creds, keyOf(rel), body, contentTypeFor(rel), cond),
+      listLocal: () => listLocalProfileFiles(root),
+      readLocal: (rel) => { const abs = absOf(rel); try { return abs ? fs.readFileSync(abs) : undefined; } catch { return undefined; } },
+      writeLocal: (rel, body) => {
+        const abs = absOf(rel);
+        if (!abs) return;
+        if (fs.existsSync(abs)) {
+          const bak = path.join(KIROLEX_HOME, 'trash', `agent-profiles-sync-${Date.now()}`, ...rel.split('/'));
+          fs.mkdirSync(path.dirname(bak), { recursive: true });
+          fs.copyFileSync(abs, bak);
+        }
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        const tmp = `${abs}.kirolex-${process.pid}.tmp`;
+        fs.writeFileSync(tmp, body);
+        fs.renameSync(tmp, abs);
+      },
+      writeConflictCopy: (rel, body) => {
+        const abs = path.join(root, PROFILE_CONFLICTS_DIR, stamp, ...rel.split('/'));
+        fs.mkdirSync(path.dirname(abs), { recursive: true });
+        fs.writeFileSync(abs, body);
+        return abs;
+      },
+      readMarks: () => readProfileMarks(S3_PROFILES_MARK_PATH),
+      writeMarks: (m) => writeProfileMarks(S3_PROFILES_MARK_PATH, m),
+    });
+    if (r.pulled.length) logger.info('s3', `AI 工具配置：从桶里拉回 ${r.pulled.join('、')}（别的电脑改的 / 本机第一次同步）`);
+    if (r.uploaded.length) logger.info('s3', `AI 工具配置：传了 ${r.uploaded.join('、')}`);
+    for (const c of r.conflicts) logger.warn('s3', `AI 工具配置 ${c.rel} 两边都改过，没有覆盖任何一边：本机这份留着，桶里那份存到 ${c.copy}`);
+    if (r.raced.length) logger.warn('s3', `AI 工具配置 ${r.raced.join('、')} 同步途中有一边又变了（别的电脑抢先传了，或本机刚保存），这一轮没动它，下一轮再比`);
+    if (r.pulled.length || r.conflicts.length) mainWindow?.webContents.send('agent-profile:changed');
+    return r.uploaded.length;
+  } catch (err: any) {
+    logger.warn('s3', `AI 工具配置同步没成功（这一轮不传）：${err?.message || err}`);
+    return 0;
+  }
+}
+
 function walkDirs(dir: string): string[] {
   try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; }
 }
@@ -5310,6 +5372,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     }
     /* 组合文件（mcp-combos.json）：多台电脑共用一份，两边都改过时合并、不静默覆盖 */
     uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix);
+    /* 远程机器的 AI 工具配置（agent-profiles/）：同样跨电脑共用，两边都改过时留冲突副本、不静默覆盖 */
+    uploaded += await syncAgentProfilesWithBucket(creds!, cfg.prefix);
     /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
     const uploadList = [
       ...plan.upload.filter((r) => !isMemoryRel(r)),
@@ -14004,6 +14068,199 @@ app.whenReady().then(async () => {
         });
       });
     });
+  });
+
+  /**
+   * **远程机器的 AI 工具配置**（设置 → 🖥 机器 →「AI 工具配置」；纯逻辑在 `agentProfile.ts`）——
+   * 「统一定义远程机器上 Claude Code 的配置并同步过去；本机专用的 MCP 不同步」。
+   *
+   *   · `agent-profile:read` / `save`：读写 `~/.kirolex/agent-profiles/<claude|codex>/profile.json`（坏 JSON 不保存）；
+   *   · `agent-profile:diff`：ssh 跑一次只读探测，算「与配置的差异」（凭证类 env 只回键名）；
+   *   · `agent-profile:plan`：同上，再列出同步会做什么（确认框里给人看）；
+   *   · `agent-profile:sync`：备份 → 装/升级版本 → 写入 → 重新比较，输出边跑边推 `agent-profile:sync-output`，全程写日志。
+   * 这是在别人的机器上改东西，所以只在你按下按钮、确认之后发生。**不碰本机的 ~/.claude**（只读本机 known_marketplaces.json 查市场来源）。
+   */
+  const profileHome = os.homedir();
+  const loadAgentProfiles = (): { claude: ClaudeProfile | null; codex: CodexProfile | null; errors: string[] } => {
+    const errors: string[] = [];
+    const c = readProfileFile(profileHome, 'claude');
+    const x = readProfileFile(profileHome, 'codex');
+    const cp = c.exists ? parseClaudeProfile(c.text) : null;
+    const xp = x.exists ? parseCodexProfile(x.text) : null;
+    if (cp && !cp.ok) errors.push(`claude/profile.json: ${cp.error}`);
+    if (xp && !xp.ok) errors.push(`codex/profile.json: ${xp.error}`);
+    return { claude: cp?.ok ? cp.profile : null, codex: xp?.ok ? xp.profile : null, errors };
+  };
+  const profileRemote = (id: string): RemoteTarget | null => {
+    const found = findRemoteTarget(KIROLEX_CONFIG_PATH, String(id || ''));
+    return found?.sshHost ? found : null;
+  };
+  const probeAgentProfile = async (remote: RemoteTarget): Promise<ProbeResult> => {
+    const out = await runRemoteCapture(remote, probeScript(), 90_000, 8 * 1024 * 1024);
+    const p = parseProbeOutput(out);
+    if (!p) throw new Error(tr('The remote probe did not return a result: {tail}', { tail: out.trim().split('\n').slice(-3).join(' | ').slice(0, 300) || '?' }));
+    return p;
+  };
+  const diffFor = (loaded: ReturnType<typeof loadAgentProfiles>, probe: ProbeResult): DiffItem[] => computeDiff({
+    claude: loaded.claude, codex: loaded.codex, localRules: readLocalRules(profileHome), probe, localHome: profileHome,
+  });
+  const localKnownMarketplaces = (): Record<string, any> | null => {
+    try { return JSON.parse(fs.readFileSync(path.join(profileHome, '.claude', 'plugins', 'known_marketplaces.json'), 'utf-8')); } catch { return null; }
+  };
+  const planFor = (loaded: ReturnType<typeof loadAgentProfiles>, probe: ProbeResult, items: DiffItem[]): SyncPlan => buildSyncPlan({
+    claude: loaded.claude, codex: loaded.codex, localRules: readLocalRules(profileHome), localRulesFull: readLocalRules(profileHome),
+    probe, items, now: new Date(), localHome: profileHome, localKnownMarketplaces: localKnownMarketplaces(),
+  });
+  const planSummary = (plan: SyncPlan) => ({
+    backupDir: plan.backupDir,
+    items: plan.items,
+    pins: plan.pins.map((p) => ({ bin: p.bin, pkg: p.pkg, version: p.version })),
+    rules: plan.rules.map((r) => r.name),
+    plugins: plan.plugins,
+    marketplaces: plan.marketplaces.map((m) => ({ name: m.name, copy: !!m.copy })),
+    codexEntries: plan.codexEntries.map((e) => e.key),
+    warnings: plan.warnings,
+    hasWork: planHasWork(plan),
+  });
+  const profileSyncsInFlight = new Set<string>();
+
+  ipcMain.handle('agent-profile:read', () => {
+    const root = agentProfilesRoot(profileHome);
+    const one = (engine: ProfileEngine) => ({ ...readProfileFile(profileHome, engine), template: engine === 'claude' ? CLAUDE_PROFILE_TEMPLATE : CODEX_PROFILE_TEMPLATE });
+    return {
+      root,
+      claude: one('claude'),
+      codex: one('codex'),
+      rules: readLocalRules(profileHome).map((r) => ({ name: r.name, bytes: Buffer.byteLength(r.content) })),
+      conflicts: listConflictCopies(root),
+    };
+  });
+
+  ipcMain.handle('agent-profile:save', (_event, engine: string, text: string, expected?: string | null) => {
+    if (!PROFILE_ENGINES.includes(engine as ProfileEngine)) return { ok: false, error: `unknown engine ${engine}` };
+    const r = saveProfileText(profileHome, engine as ProfileEngine, String(text ?? ''), expected === undefined ? {} : { expected: expected === null ? null : String(expected) });
+    logger.info('agent-profile', `保存 ${engine}/profile.json：${r.ok ? 'ok' : `没存（${r.error}）`}`);
+    return r;
+  });
+
+  ipcMain.handle('agent-profile:open-dir', async () => {
+    const root = agentProfilesRoot(profileHome);
+    try { fs.mkdirSync(path.join(root, 'claude', 'rules'), { recursive: true }); } catch { /* 打开时再报 */ }
+    const err = await shell.openPath(root);
+    return err ? { ok: false, error: err } : { ok: true };
+  });
+
+  ipcMain.handle('agent-profile:diff', async (_event, remoteId: string) => {
+    const remote = profileRemote(remoteId);
+    if (!remote) return { ok: false, error: tr('Can\'t find this machine ({machine}). Was it removed in Settings?', { machine: String(remoteId) }) };
+    const loaded = loadAgentProfiles();
+    if (!loaded.claude && !loaded.codex) return { ok: false, error: loaded.errors.join('\n') || tr('There is no AI tool config yet: save one above first.') };
+    try {
+      const probe = await probeAgentProfile(remote);
+      const items = diffFor(loaded, probe);
+      logger.info('agent-profile', `差异 ${remote.sshHost}：${items.length} 处${probe.secretEnvKeys.length ? `（远端凭证类 env：${probe.secretEnvKeys.join('、')}，只看了键名）` : ''}`);
+      return { ok: true, items, home: probe.home, region: probe.region, secretEnvKeys: probe.secretEnvKeys, errors: loaded.errors, at: Date.now() };
+    } catch (err: any) {
+      logger.warn('agent-profile', `差异 ${remote.sshHost} 没拿到：${err?.message || err}`);
+      return { ok: false, error: String(err?.message || err) };
+    }
+  });
+
+  ipcMain.handle('agent-profile:plan', async (_event, remoteId: string) => {
+    const remote = profileRemote(remoteId);
+    if (!remote) return { ok: false, error: tr('Can\'t find this machine ({machine}). Was it removed in Settings?', { machine: String(remoteId) }) };
+    const loaded = loadAgentProfiles();
+    if (!loaded.claude && !loaded.codex) return { ok: false, error: loaded.errors.join('\n') || tr('There is no AI tool config yet: save one above first.') };
+    try {
+      const probe = await probeAgentProfile(remote);
+      const items = diffFor(loaded, probe);
+      return { ok: true, plan: planSummary(planFor(loaded, probe, items)) };
+    } catch (err: any) {
+      return { ok: false, error: String(err?.message || err) };
+    }
+  });
+
+  ipcMain.handle('agent-profile:sync', async (event, remoteId: string) => {
+    const remote = profileRemote(remoteId);
+    if (!remote) return { ok: false, error: tr('Can\'t find this machine ({machine}). Was it removed in Settings?', { machine: String(remoteId) }) };
+    const host = remote.sshHost || '';
+    if (profileSyncsInFlight.has(host)) return { ok: false, error: tr('A sync to {host} is already running', { host }) };
+    const loaded = loadAgentProfiles();
+    if (!loaded.claude && !loaded.codex) return { ok: false, error: loaded.errors.join('\n') || tr('There is no AI tool config yet: save one above first.') };
+    profileSyncsInFlight.add(host);
+    const send = (chunk: string) => { try { event.sender.send('agent-profile:sync-output', { remoteId, chunk }); } catch { /* 窗口没了不影响同步 */ } };
+    const log = (line: string) => { logger.info('agent-profile', `${host} ${line}`); send(`${line}\n`); };
+    /* 远端脚本走 stdin 落到临时文件再跑（理由同 remote:bootstrap）；输出边跑边推 */
+    const sshStdin = (cmd: string, stdin: string, timeoutMs: number) => new Promise<{ code: number | null; output: string; error?: string }>((resolve) => {
+      const child = spawn('ssh', buildSshArgs(remote, cmd), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
+      let output = '';
+      const onData = (b: Buffer) => {
+        const s = b.toString('utf-8');
+        output = (output + s).slice(-200_000);
+        /* 结构化的结果行不刷给人看（下面按步骤说人话） */
+        const shown = s.split('\n').filter((l) => !/^KX_APPLY/.test(l)).join('\n');
+        if (shown.trim()) send(shown);
+      };
+      child.stdout.on('data', onData);
+      child.stderr.on('data', onData);
+      const killer = setTimeout(() => { try { child.kill('SIGKILL'); } catch { /* 已经退了 */ } }, timeoutMs);
+      child.on('error', (err) => { clearTimeout(killer); resolve({ code: null, output, error: err?.message || tr('ssh would not start') }); });
+      child.on('close', (code) => { clearTimeout(killer); resolve({ code, output }); });
+      try { child.stdin.end(stdin); } catch { /* close 会报 */ }
+    });
+    try {
+      log(`开始同步 AI 工具配置到 ${host}`);
+      const probe = await probeAgentProfile(remote);
+      const items = diffFor(loaded, probe);
+      const plan = planFor(loaded, probe, items);
+      for (const w of plan.warnings) log(`⚠️ ${w}`);
+      if (!planHasWork(plan)) {
+        log('和配置一致，没有要改的');
+        return { ok: true, steps: [], applied: [], after: items };
+      }
+      const outcome = await runProfileSync(plan, {
+        log,
+        backup: async (script) => {
+          log(`备份到 ${plan.backupDir}`);
+          try {
+            const out = await runRemoteCapture(remote, script, 5 * 60_000);
+            return { ok: /KX_BACKUP_OK/.test(out), output: out };
+          } catch (err: any) { return { ok: false, output: '', error: String(err?.message || err) }; }
+        },
+        installVersions: async (pins) => {
+          const script = readBootstrapScript();
+          if (!script) return { ok: false, error: tr('remote-bootstrap.sh not found (it should be under the app’s scripts/)') };
+          const r = await sshStdin(remotePinCommand(`/tmp/kirolex-pins-${Date.now()}.sh`, pins), script, 15 * 60_000);
+          if (r.error) return { ok: false, error: r.error };
+          return r.code === 0 ? { ok: true } : { ok: false, error: remoteInstallReason(r.output, r.code) };
+        },
+        payloadExtras: async () => {
+          const files: Array<{ rel: string; b64: string }> = [];
+          const errors: string[] = [];
+          for (const m of plan.marketplaces) {
+            if (!m.copy) continue;
+            const c = collectMarketplaceFiles(m.copy.localDir, m.copy.remoteDir, profileHome, probe.home);
+            if (c.ok) { files.push(...c.files); log(`从本机拷市场 ${m.name}：${m.copy.localDir} → ~/${m.copy.remoteDir}（${c.files.length} 个文件，本机家目录换成 ${probe.home}）`); }
+            else errors.push(`${m.name}: ${c.error}`);
+          }
+          return { files, errors };
+        },
+        apply: async (js) => {
+          const r = await sshStdin(remoteApplyCommand(`/tmp/kirolex-profile-${Date.now()}.js`), js, 20 * 60_000);
+          return { ok: !r.error && r.code === 0, output: r.output, error: r.error };
+        },
+        reprobe: async () => {
+          try { return diffFor(loadAgentProfiles(), await probeAgentProfile(remote)); } catch (err: any) { log(`重新探测失败：${err?.message || err}`); return null; }
+        },
+      });
+      logger.info('agent-profile', `同步 ${host} 结束：${outcome.ok ? 'ok' : outcome.steps.filter((s) => !s.ok).map((s) => `${s.step}: ${s.detail}`).join(' / ')}`);
+      return { ok: outcome.ok, steps: outcome.steps, applied: outcome.applied, after: outcome.after };
+    } catch (err: any) {
+      log(`同步没做成：${err?.message || err}`);
+      return { ok: false, error: String(err?.message || err) };
+    } finally {
+      profileSyncsInFlight.delete(host);
+    }
   });
 
   /**

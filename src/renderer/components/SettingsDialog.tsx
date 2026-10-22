@@ -3,6 +3,7 @@ import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN 
 import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
+import { AgentProfileSettings } from './AgentProfileSettings';
 import { ForwardMcpSettings } from './ForwardMcpSettings';
 import { LocalBrowserSettings } from './LocalBrowserSettings';
 import { useT } from '../hooks/useLang';
@@ -335,6 +336,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           */}
           {tab === 'machines' && <RemoteSettings startNew={newMachinePending} />}
           {tab === 'machines' && <ForwardMcpSettings />}
+          {tab === 'machines' && <AgentProfileSettings />}
 
           {tab === 'appearance' && (
           <div className="settings-item settings-item-wide">

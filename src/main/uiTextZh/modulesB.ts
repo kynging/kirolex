@@ -252,4 +252,16 @@ export const ZH_MODULES_B: Record<string, string> = {
   '❌ Installing the {engine} ACP adapter ({pkg}) on this machine failed: {why}': '❌ 在本机安装 {engine} 的 ACP 适配器（{pkg}）没成功：{why}',
   'npm reported success, but KiroLex cannot find {pkg} in any global node_modules folder it knows about.': 'npm 说装好了，但 KiroLex 在它知道的全局 node_modules 目录里都找不到 {pkg}。',
   'This session does not use Claude Code or Codex.': '这条会话用的不是 Claude Code / Codex。',
+
+  // ── agentProfile.ts / index.ts agent-profile:* ──
+  "Not valid JSON: {error}": "不是合法的 JSON：{error}",
+  "The top level must be a JSON object { … }": "最外层必须是一个 JSON 对象 { … }",
+  "\"{key}\" must be an object": "「{key}」必须是一个对象",
+  "Do not know where to install marketplace {name} from (add its source under \"marketplaces\"); plugins from it are skipped.": "不知道插件市场 {name} 从哪装（在 \"marketplaces\" 里写上它的来源）；这次先跳过它下面的插件。",
+  "{dir} is larger than {mb} MB; not copied": "{dir} 超过 {mb} MB，没有拷",
+  "{dir} does not exist on this computer": "本机没有 {dir}",
+  "The remote probe did not return a result: {tail}": "远端探测没有给出结果：{tail}",
+  "There is no AI tool config yet: save one above first.": "还没有 AI 工具配置：先在上面存一份。",
+  "A sync to {host} is already running": "已经在往 {host} 同步了",
+  "{file} was changed on disk after you opened it (for example pulled in by S3 sync from another computer). Not saved, so the newer file is not overwritten.": "{file} 在你打开之后被改过了（比如 S3 同步从别的电脑拉回了新版本）。这次没保存，免得把更新的那份盖掉。",
 };

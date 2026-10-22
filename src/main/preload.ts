@@ -603,6 +603,23 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('remote:bootstrap-output', handler);
     return () => ipcRenderer.removeListener('remote:bootstrap-output', handler);
   },
+  /** 远程机器的 AI 工具配置（`~/.kirolex/agent-profiles/`）：读 / 存 / 和某台机器比 / 同步过去（index.ts `agent-profile:*`）。 */
+  agentProfileRead: () => ipcRenderer.invoke('agent-profile:read'),
+  agentProfileSave: (engine: 'claude' | 'codex', text: string, expected?: string | null) => ipcRenderer.invoke('agent-profile:save', engine, text, expected),
+  agentProfileOpenDir: () => ipcRenderer.invoke('agent-profile:open-dir'),
+  agentProfileDiff: (remoteId: string) => ipcRenderer.invoke('agent-profile:diff', remoteId),
+  agentProfilePlan: (remoteId: string) => ipcRenderer.invoke('agent-profile:plan', remoteId),
+  agentProfileSync: (remoteId: string) => ipcRenderer.invoke('agent-profile:sync', remoteId),
+  onAgentProfileSyncOutput: (callback: (d: { remoteId: string; chunk: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('agent-profile:sync-output', handler);
+    return () => ipcRenderer.removeListener('agent-profile:sync-output', handler);
+  },
+  onAgentProfileChanged: (callback: () => void) => {
+    const handler = () => callback();
+    ipcRenderer.on('agent-profile:changed', handler);
+    return () => ipcRenderer.removeListener('agent-profile:changed', handler);
+  },
   /**
    * **把一条已有会话切到另一台机器（或切回本地）**。`remoteId` 传 null = 本地。
    * 切到远端时要给项目目录（没给就用记录里的那个；都没有会报错 —— 远端要镜像的就是它）。

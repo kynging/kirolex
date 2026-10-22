@@ -35,6 +35,10 @@ KIRO_RELEASE_BASE="${KIRO_RELEASE_BASE:-https://desktop-release.q.us-east-1.amaz
 # 「安装」按钮用（src/main/adapterInstall.ts 的 remoteInstallCommand）。只跑 Node（没有才装）、PATH、那一个适配器和它的
 # 登录 shell 可见性，其余（系统包 / kiro-cli / claude / codex / 默认模型 / 登录 / sshd）都跳过。不设 = 全装（「安装 AI 工具」）。
 ONLY="${ONLY:-}"
+# 按「AI 工具配置」装 / 升级到指定版本（src/main/agentProfile.ts 的 remotePinCommand）：`包@版本=命令名`，空格分隔。
+# 和 ONLY 一样只跑 Node（没有才装）、PATH、这几个包（适配器再加登录 shell 可见性），其余都跳过。
+PINS="${PINS:-}"
+[ -n "$PINS" ] && [ -z "$ONLY" ] && ONLY=pins
 
 say()  { printf '%s\n' "$*"; }
 step() { printf '\n== %s ==\n' "$*"; }
@@ -199,6 +203,8 @@ fi
 # ------------------------------------------------- claude code / codex
 if full; then
 step "claude code / codex（npm 全局）"
+elif [ -n "$PINS" ]; then
+step "按 AI 工具配置装 / 升级（npm 全局）"
 else
 step "ACP 适配器 $ONLY（npm 全局）"
 fi
@@ -280,6 +286,59 @@ WEOF
 }
 want claude-agent-acp && login_visible claude-agent-acp '@agentclientprotocol/claude-agent-acp'
 want codex-acp && login_visible codex-acp '@agentclientprotocol/codex-acp'
+
+# 按配置钉版本（PINS）：已经是那个版本的不动；claude 是官方安装脚本装的原生版时用它自己的 `claude install <版本>`
+# （npm 装的会被 ~/.local/bin 里那份挡住）。装完再问一次版本，对不上算失败（带上 PATH 上是哪一份）。
+pin_cur() {
+  local pkg="$1" bin="$2" r
+  case "$bin" in
+    claude|codex) "$bin" --version </dev/null 2>/dev/null | grep -oE '[0-9]+\.[0-9]+\.[0-9]+([-+][0-9A-Za-z.-]+)?' | head -1 ;;
+    *) r="$(npm root -g 2>/dev/null)"
+       [ -n "$r" ] && [ -f "$r/$pkg/package.json" ] && node -p 'require(process.argv[1]).version' "$r/$pkg/package.json" 2>/dev/null ;;
+  esac
+}
+npm_pin() {
+  local spec="$1" bin="$2" pkg ver cur real FORCE=1
+  pkg="${spec%@*}"; ver="${spec##*@}"
+  cur="$(pin_cur "$pkg" "$bin")"
+  if [ "$cur" = "$ver" ]; then say "→ $bin 已是 $ver"; return 0; fi
+  say "→ $bin ${cur:-没装} → $ver"
+  real="$(readlink -f "$(command -v "$bin" 2>/dev/null)" 2>/dev/null)"
+  case "$bin:$real" in
+    "claude:$HOME/.local/share/claude/"*)
+      local ilog; ilog="$(mktemp 2>/dev/null || echo "/tmp/kirolex-claude-$$.log")"
+      say "→ claude install $ver（原生版）"
+      if ! claude install "$ver" >"$ilog" 2>&1 </dev/null; then
+        tail -n 12 "$ilog" | tr -d '\r' | grep -v '^[[:space:]]*$' | sed 's/^/  npm: /'
+        rm -f "$ilog"; note_fail "claude $ver 装不上"; return 1
+      fi
+      rm -f "$ilog" ;;
+    *) npm_i "$pkg@$ver" "$bin" || return 1 ;;
+  esac
+  hash -r 2>/dev/null
+  cur="$(pin_cur "$pkg" "$bin")"
+  if [ "$cur" != "$ver" ]; then note_fail "$bin 装完是 ${cur:-?}，不是 $ver（PATH 上的是 $(command -v "$bin" 2>/dev/null)）"; return 1; fi
+  say "✓ $bin $ver"
+}
+if [ -n "$PINS" ]; then
+  for kx_spec in $PINS; do
+    case "$kx_spec" in *@*=*) ;; *) note_fail "看不懂的 PINS 项：$kx_spec"; continue ;; esac
+    npm_pin "${kx_spec%%=*}" "${kx_spec##*=}"
+  done
+  for kx_spec in $PINS; do
+    case "${kx_spec##*=}" in
+      claude-agent-acp) login_visible claude-agent-acp '@agentclientprotocol/claude-agent-acp' ;;
+      codex-acp) login_visible codex-acp '@agentclientprotocol/codex-acp' ;;
+    esac
+  done
+  step "自检（按配置的版本）"
+  for kx_spec in $PINS; do
+    kx_b="${kx_spec##*=}"; kx_p="${kx_spec%%=*}"
+    say "$(printf '%-16s' "$kx_b"): $(pin_cur "${kx_p%@*}" "$kx_b")（要 ${kx_p##*@}）"
+  done
+  if [ "$rc" -eq 0 ]; then say "✓ 都是配置里的版本了。"; else say "✗ 还差上面标 ✗ 的那几项。"; fi
+  exit "$rc"
+fi
 
 # 只装一个适配器（ONLY）到这里就完了：KiroLex 装完会再按会话的起法（bash -lc）真起一次验证（index.ts verifyRemoteAdapter）。
 if [ -n "$ONLY" ]; then

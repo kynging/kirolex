@@ -9400,3 +9400,20 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   background: var(--bg-hover);
   color: var(--text-primary);
 }
+
+/* 设置 → 机器 →「AI 工具配置」（AgentProfileSettings.tsx）：编辑框给固定高度（设置页不是撑满的 flex 容器） */
+.agent-profile-tabs { display: flex; align-items: center; gap: 6px; margin-bottom: 6px; min-width: 0; }
+.agent-profile-tabs .agent-config-editor-path { margin-left: auto; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; font-size: 11px; color: var(--text-muted); }
+.agent-profile-editor { height: 320px; flex: none; }
+.agent-profile-actions { justify-content: flex-end; flex-wrap: wrap; align-items: center; margin-top: 4px; }
+.agent-profile-actions > .settings-hint { margin: 0 auto 0 0; min-width: 0; }
+.agent-profile-ok { color: var(--success, #4caf50); }
+.agent-profile-bad { color: var(--error); }
+.agent-profile-machine { border: 1px solid var(--border); border-radius: 6px; padding: 8px; margin-top: 6px; }
+.agent-profile-machine-head { display: flex; align-items: center; gap: 8px; }
+.agent-profile-machine-head .settings-hint { margin: 0; }
+.agent-profile-diff { list-style: none; margin: 6px 0 0; padding: 0; max-height: 260px; overflow: auto; font-size: 12px; }
+.agent-profile-diff li { display: flex; gap: 8px; padding: 2px 0; border-bottom: 1px dashed color-mix(in srgb, var(--border) 60%, transparent); }
+.agent-profile-diff li.warn .agent-profile-text { color: var(--warning, #e0a030); }
+.agent-profile-area { flex: 0 0 92px; color: var(--text-muted); font-size: 11px; }
+.agent-profile-text { min-width: 0; word-break: break-all; font-family: var(--mono-font); }
