@@ -2,6 +2,7 @@ import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, joinSshHost, splitSshHost } from '../remotePick.ts';
 import { notifyRemoteTargetsChanged } from '../hooks/useRemoteTargets.ts';
 import { useT } from '../hooks/useLang';
+import { EngineStatusPanel } from './EngineStatusPanel';
 
 /**
  * **在界面上配一台远端机器** ——「界面上甚至没有配置远程EC2的地方」。
@@ -445,6 +446,8 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       */}
       {localOnly && (
         <div className="remote-form">
+          {/* 三个引擎在本机能不能用（版本、登没登录），❌ 直接装、⚠️ 直接登录 —— 和远端那页「测试连接」报的是同一类事 */}
+          <EngineStatusPanel machine="local" title={t('The three AI tools on this computer')} />
           <p className="settings-hint" style={{ marginTop: 0 }}>
             {t('Empty = look in the usual install locations. An absolute path or a different name both work. This machine may have two kiro-cli installs, and which one runs decides the model list, agents and MCP behavior.')}
             {' '}<b>★</b>{t(' = has actually started a session before; ')}<b>✗</b>{t(' = found but does not start (or is not this tool).')}

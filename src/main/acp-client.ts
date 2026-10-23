@@ -129,6 +129,8 @@ export function kiroCliCandidates(): string[] {
     local && `${local}\\Kiro-Cli\\kiro-cli.exe`,
     local && `${local}\\Programs\\kiro-cli\\kiro-cli.exe`,
     roaming && `${roaming}\\kiro-cli\\kiro-cli.exe`,
+    /* 官方安装器（`irm https://cli.kiro.dev/install.ps1 | iex`，MSI）装到这里 */
+    process.env.ProgramFiles && `${process.env.ProgramFiles}\\Kiro-Cli\\kiro-cli.exe`,
     // macOS/Linux
     home && `${home}/.local/bin/kiro-cli`,
     '/usr/local/bin/kiro-cli',

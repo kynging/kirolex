@@ -49,6 +49,17 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 会话里「缺 ACP 适配器」提示上的「安装」：本机全局 npm / 远端只装那一个。engine / remoteId 只在还没有记录（新建失败）时用。 */
   installAdapter: (sessionId: string, engine: string, remoteId?: string) =>
     ipcRenderer.invoke('acp:install-adapter', sessionId, engine, remoteId),
+  /** 三个引擎在一台机器上的状态（'local' = 本机）：✅ / ⚠️ 没登录 / ❌ 没装；5 分钟缓存，force 跳过。 */
+  enginesStatus: (machine: string, opts?: { force?: boolean }) => ipcRenderer.invoke('engines:status', machine, opts),
+  /** ❌ → 直接装（本机 kiro-cli / 适配器；远端适配器只装那一个）。进度从 onEnginesInstallOutput 出来。 */
+  enginesInstall: (machine: string, engine: string) => ipcRenderer.invoke('engines:install', machine, engine),
+  onEnginesInstallOutput: (callback: (d: { machine: string; engine: string; chunk: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('engines:install-output', handler);
+    return () => ipcRenderer.removeListener('engines:install-output', handler);
+  },
+  /** ⚠️ → 登录：本机开终端跑登录命令（{opened}）；远端回去哪登（{how}）。 */
+  enginesLogin: (machine: string, engine: string) => ipcRenderer.invoke('engines:login', machine, engine),
   onAdapterInstallOutput: (callback: (d: { sessionId: string; chunk: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:adapter-install-output', handler);

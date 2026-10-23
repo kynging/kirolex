@@ -11,8 +11,10 @@
 import { cleanIpcError } from './sessionRequestStatus.ts';
 import type { AdapterEngine } from './adapterInstallOffer.ts';
 
-export type InstallPhase = 'installing' | 'reconnecting' | 'connected' | 'failed' | 'reconnect-failed';
-export interface InstallState { phase: InstallPhase; engine: AdapterEngine; output: string; error?: string }
+export type InstallPhase = 'installing' | 'reconnecting' | 'connected' | 'failed' | 'reconnect-failed'
+  /* 「登录」（本机没登录）：终端开了、等你登上 / 没开成或等不到 */
+  | 'logging-in' | 'login-failed';
+export interface InstallState { phase: InstallPhase; engine: AdapterEngine; output: string; error?: string; via?: 'install' | 'login' }
 
 const OUTPUT_MAX = 6000;
 
@@ -79,12 +81,79 @@ export function runAdapterInstall(store: AdapterInstallStore, sessionId: string,
   return p;
 }
 
+/**
+ * 等到 `check()` 为真（每 `intervalMs` 问一次，最多 `timeoutMs`）。登录那种"人在另一个窗口里操作"的事只能轮询。
+ * `check` 抛错当作"还没好"。
+ */
+export async function waitUntil(
+  check: () => Promise<boolean>,
+  opts: { intervalMs: number; timeoutMs: number; sleep?: (ms: number) => Promise<void>; now?: () => number; cancelled?: () => boolean },
+): Promise<boolean> {
+  const sleep = opts.sleep || ((ms: number) => new Promise<void>((r) => setTimeout(r, ms)));
+  const now = opts.now || Date.now;
+  const end = now() + opts.timeoutMs;
+  for (;;) {
+    if (opts.cancelled?.()) return false;
+    try { if (await check()) return true; } catch { /* 当作还没好 */ }
+    if (now() >= end) return false;
+    await sleep(opts.intervalMs);
+  }
+}
+
+export interface LoginDeps {
+  /** 本机开终端跑登录命令。 */
+  login: (engine: AdapterEngine) => Promise<{ ok: boolean; opened?: boolean; error?: string }>;
+  /** 现在登上了没有（主进程强制重新问一次本机状态）。 */
+  loggedIn: (engine: AdapterEngine) => Promise<boolean>;
+  reconnect: (sessionId: string) => Promise<{ ok: boolean; error?: string }>;
+  intervalMs?: number;
+  timeoutMs?: number;
+  sleep?: (ms: number) => Promise<void>;
+  now?: () => number;
+}
+
+/** 登录：开终端 → 轮询到登上 → 重连这条会话（「登录完自动重试」）。返回最后连上了没有。 */
+export function runEngineLogin(store: AdapterInstallStore, sessionId: string, engine: AdapterEngine, deps: LoginDeps): Promise<boolean> {
+  let running = inFlight.get(store);
+  if (!running) { running = new Map(); inFlight.set(store, running); }
+  const existing = running.get(sessionId);
+  if (existing) return existing;
+  const p = (async () => {
+    store.set(sessionId, { phase: 'logging-in', engine, output: '', via: 'login' });
+    let opened: { ok: boolean; error?: string };
+    try { opened = await deps.login(engine); } catch (err) { opened = { ok: false, error: cleanIpcError(err) }; }
+    if (!opened.ok) { store.patch(sessionId, { phase: 'login-failed', error: opened.error || '' }); return false; }
+    const ok = await waitUntil(() => deps.loggedIn(engine), {
+      intervalMs: deps.intervalMs ?? 5000, timeoutMs: deps.timeoutMs ?? 10 * 60_000, sleep: deps.sleep, now: deps.now,
+    });
+    if (!ok) { store.patch(sessionId, { phase: 'login-failed', error: '' }); return false; }
+    store.patch(sessionId, { phase: 'reconnecting' });
+    let rc: { ok: boolean; error?: string };
+    try { rc = await deps.reconnect(sessionId); } catch (err) { rc = { ok: false, error: cleanIpcError(err) }; }
+    store.patch(sessionId, rc.ok ? { phase: 'connected' } : { phase: 'reconnect-failed', error: rc.error || '' });
+    return rc.ok;
+  })().finally(() => { running!.delete(sessionId); });
+  running.set(sessionId, p);
+  return p;
+}
+
 /* ─────────── 整个窗口共用的那一份 ─────────── */
 
 export const adapterInstallStore = createAdapterInstallStore();
 let runner: InstallDeps | null = null;
+let loginRunner: Omit<LoginDeps, 'reconnect'> | null = null;
 /** `useAcp` 登记真正的安装 / 重连。 */
 export function setAdapterInstallRunner(deps: InstallDeps | null): void { runner = deps; }
+/** 登录那两件事（开终端、问状态）—— 重连借用安装那份 runner 的 `reconnect`。 */
+export function setEngineLoginRunner(deps: Omit<LoginDeps, 'reconnect'> | null): void { loginRunner = deps; }
+/** 「登录」按钮点下去。 */
+export function startEngineLogin(sessionId: string, engine: AdapterEngine): Promise<boolean> {
+  if (!runner || !loginRunner) {
+    adapterInstallStore.set(sessionId, { phase: 'login-failed', engine, output: '', error: 'not ready' });
+    return Promise.resolve(false);
+  }
+  return runEngineLogin(adapterInstallStore, sessionId, engine, { ...loginRunner, reconnect: runner.reconnect });
+}
 /** 按钮点下去。没登记（不该发生）就当失败说一句。 */
 export function startAdapterInstall(sessionId: string, engine: AdapterEngine): Promise<boolean> {
   if (!runner) {

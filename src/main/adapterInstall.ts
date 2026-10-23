@@ -58,9 +58,30 @@ export function localInstallCommand(
   return { command: '/bin/bash', args: ['-lc', localInstallScript(pkg)], cwd: opts.home };
 }
 
-/** 远端那一条：脚本从 stdin 落到临时文件再跑（理由见 index.ts `remote:bootstrap`），只装 `ONLY` 点名的那个。 */
-export function remoteInstallCommand(remoteTmp: string, engine: AdapterEngine): string {
-  return `cat > ${remoteTmp} && ONLY=${REMOTE_ADAPTER_BIN[engine]} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`;
+/** 远端那一条：脚本从 stdin 落到临时文件再跑（理由见 index.ts `remote:bootstrap`），只装 `ONLY` 点名的那个（kiro → `kiro-cli`）。 */
+export function remoteInstallCommand(remoteTmp: string, engine: AdapterEngine | 'kiro'): string {
+  const only = engine === 'kiro' ? 'kiro-cli' : REMOTE_ADAPTER_BIN[engine];
+  return `cat > ${remoteTmp} && ONLY=${only} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`;
+}
+
+/**
+ * 远端「只装 kiro-cli」跑完之后的结论（index.ts `installRemoteKiro`）：装完按设置里「自动检测」那套在那台机器上找一遍，
+ * 找到能起的 kiro-cli 才算装好（`found`）；那台机器还没配 kiro 启动命令的，调用方把找到的这条存进去（`saveAs`），
+ * 不然会话照样报「还没有设置 {host} 上的 kiro 启动命令」。已经配过的不动（那是人选的）。
+ */
+export function remoteKiroInstallOutcome(
+  host: string,
+  run: { code: number | null; output: string; error?: string },
+  found: { command: string; version?: string } | undefined,
+  configured: string | undefined,
+): { ok: true; saveAs?: string } | { ok: false; error: string } {
+  if (run.error) return { ok: false, error: tr('❌ Installing kiro-cli on {host} failed: {why}', { host, why: run.error }) };
+  if (run.code === 255) return { ok: false, error: tr('❌ Installing kiro-cli on {host} failed: {why}', { host, why: installFailureReason(run.output, run.code) }) };
+  if (found) return { ok: true, ...(configured ? {} : { saveAs: found.command }) };
+  const why = run.code === 0
+    ? tr('the install script finished, but no kiro-cli that starts was found on that machine')
+    : remoteInstallReason(run.output, run.code);
+  return { ok: false, error: tr('❌ Installing kiro-cli on {host} failed: {why}', { host, why }) };
 }
 
 /** npm 输出 → 一句原因。认得出的说人话，认不出的给最后几行。 */

@@ -35,6 +35,8 @@ KIRO_RELEASE_BASE="${KIRO_RELEASE_BASE:-https://desktop-release.q.us-east-1.amaz
 # 「安装」按钮用（src/main/adapterInstall.ts 的 remoteInstallCommand）。只跑 Node（没有才装）、PATH、那一个适配器和它的
 # 登录 shell 可见性，其余（系统包 / kiro-cli / claude / codex / 默认模型 / 登录 / sshd）都跳过。不设 = 全装（「安装 AI 工具」）。
 ONLY="${ONLY:-}"
+# `ONLY=kiro-cli`：新建会话框 / 设置页状态里 kiro 的「❌ 没装 → 安装」（index.ts installRemoteKiro）。
+# 只跑系统包（解 kiro-cli 的 zip 要 unzip / tar）、PATH、kiro-cli 本身；不碰 node / claude / codex / 登录 / sshd。
 # 按「AI 工具配置」装 / 升级到指定版本（src/main/agentProfile.ts 的 remotePinCommand）：`包@版本=命令名`，空格分隔。
 # 和 ONLY 一样只跑 Node（没有才装）、PATH、这几个包（适配器再加登录 shell 可见性），其余都跳过。
 PINS="${PINS:-}"
@@ -50,7 +52,7 @@ rc=0
 note_fail() { say "✗ $*"; rc=1; }
 
 # ---------------------------------------------------------------- 系统包
-if full; then
+if want kiro-cli; then
 step "系统包（git / unzip / tar）"
 PKG=""
 if have dnf; then PKG="dnf"
@@ -92,7 +94,9 @@ load_fnm
 # 不是它就装上并设成默认（已经有一个老的 node 也一样升 —— 系统自带的、或者以前装的 22）。
 # 拿不到远端版本列表（离线 / 被墙）时退回 `--lts`，再不行就沿用现有的 node，不因为这一步把整个安装弄挂。
 # 只装一个适配器时（ONLY）已经有 node 就不动它：升级 node 会换掉全局 node_modules 所在的版本目录，已经装好的另一家适配器会跟着"消失"。
-if [ -n "$ONLY" ] && have node; then
+if [ "$ONLY" = kiro-cli ]; then
+  say "→ 只装 kiro-cli，不需要 node"
+elif [ -n "$ONLY" ] && have node; then
   say "→ 已有 node $(node -v)（$(command -v node)），只装 $ONLY，不升级 node"
 else
 if ! have fnm && [ ! -x "$HOME/.local/share/fnm/fnm" ]; then
@@ -116,7 +120,7 @@ if [ -n "$FNM" ]; then
   load_fnm
 fi
 fi
-if have node; then say "→ 现在用的 node：$(node -v)（$(command -v node)）"; else note_fail "node 没装上 —— claude-code / codex 都要它"; fi
+if have node; then say "→ 现在用的 node：$(node -v)（$(command -v node)）"; elif [ "$ONLY" != kiro-cli ]; then note_fail "node 没装上 —— claude-code / codex 都要它"; fi
 
 # ------------------------------------------- 以后的登录 shell 也要找得到 node / npm 全局命令
 # KiroLex 起远程会话用的是 `ssh … bash -lc '<命令>'`：一个**非交互的登录 shell**。fnm 是用 --skip-shell
@@ -148,7 +152,7 @@ fi
 #   curl … desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip
 # 解出来是 kirocli/{install.sh,bin/}，install.sh 把三个二进制放进 ~/.local/bin 再跑
 # `kiro-cli setup`（参数透传，所以给 --no-confirm）。
-if full; then
+if want kiro-cli; then
 step "kiro-cli"
 if have kiro-cli && [ "$FORCE" != "1" ]; then
   say "→ kiro-cli 已在 $(kiro-cli --version 2>/dev/null | head -1)"
@@ -205,6 +209,8 @@ if full; then
 step "claude code / codex（npm 全局）"
 elif [ -n "$PINS" ]; then
 step "按 AI 工具配置装 / 升级（npm 全局）"
+elif [ "$ONLY" = kiro-cli ]; then
+:
 else
 step "ACP 适配器 $ONLY（npm 全局）"
 fi

@@ -30,8 +30,8 @@ import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { isConnectFailureNotice } from '../connectFailure.ts';
-import { adapterInstallOffer } from '../adapterInstallOffer.ts';
-import { adapterInstallStore, startAdapterInstall } from '../adapterInstallState.ts';
+import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer.ts';
+import { adapterInstallStore, startAdapterInstall, startEngineLogin } from '../adapterInstallState.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { livePendingNoteId, pendingTargetText, waitedSeconds, type PendingKind } from '../../main/pendingSwitch.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
@@ -861,21 +861,42 @@ function AssistantBody({ body, toolTailFrom, realToolAfter }: { body: string; to
  * 点了：本机全局 npm 装 / 远端只装缺的那一个（主进程 `acp:install-adapter`），输出边跑边显示在这里，
  * 装好了自动重连这条会话（`useAcp` 的 `reconnectAfterInstall`，连上后这条提示换成「装好了、已连上」）。
  */
-function AdapterInstallAction({ sessionId, message }: { sessionId?: string | null; message: Message }) {
+function AdapterInstallAction({ sessionId, message, remote }: { sessionId?: string | null; message: Message; remote?: boolean }) {
   const t = useT();
   const state = useSyncExternalStore(adapterInstallStore.subscribe, () => (sessionId ? adapterInstallStore.get(sessionId) : undefined));
-  const offer = isConnectFailureNotice(message) ? adapterInstallOffer(message.content) : null;
-  if (!offer || !sessionId) return null;
-  const engine = offer.engine === 'codex' ? 'Codex' : 'Claude Code';
-  const phase = state?.engine === offer.engine ? state.phase : undefined;
-  const busy = phase === 'installing' || phase === 'reconnecting';
-  const tail = state && (busy || phase === 'failed')
+  const isNotice = isConnectFailureNotice(message);
+  const offer = isNotice ? adapterInstallOffer(message.content) : null;
+  /* 「没登录」：只给本机会话（远端会话照旧用会话面板里的 🔑 登录） */
+  const login = isNotice && !offer && !remote ? engineLoginOffer(message.content) : null;
+  const want = offer || login;
+  if (!want || !sessionId) return null;
+  const engine = want.engine === 'codex' ? 'Codex' : want.engine === 'kiro' ? 'kiro-cli' : 'Claude Code';
+  const phase = state?.engine === want.engine ? state.phase : undefined;
+  const busy = phase === 'installing' || phase === 'reconnecting' || phase === 'logging-in';
+  const tail = state && (phase === 'installing' || phase === 'failed')
     ? state.output.split(/\r?\n/).map((l) => l.trimEnd()).filter((l) => l.trim()).slice(-6).join('\n')
     : '';
-  const status = phase === 'installing' ? t('Installing the {engine} adapter…', { engine })
+  if (login) {
+    const status = phase === 'logging-in' ? t('A terminal window opened with the login command. Finish logging in there; this chat reconnects by itself.')
+      : phase === 'reconnecting' ? t('Logged in. Reconnecting this chat…')
+      : phase === 'login-failed' ? (state?.error || t('Did not see a login yet. Click Log in to try again.'))
+      : phase === 'reconnect-failed' ? t('Logged in, but this chat still could not connect.')
+      : t('Opens a terminal with the login command; when you are logged in this chat reconnects by itself.');
+    return (
+      <div className="adapter-install" data-phase={phase || 'idle'}>
+        <button type="button" className="adapter-install-btn" disabled={busy} onClick={() => { void startEngineLogin(sessionId, login.engine); }}>
+          {phase === 'logging-in' ? t('Waiting for login…') : t('Log in to {engine}', { engine })}
+        </button>
+        <span className="adapter-install-status">{status}</span>
+      </div>
+    );
+  }
+  const kiro = want.engine === 'kiro';
+  const status = phase === 'installing' ? (kiro ? t('Installing kiro-cli…') : t('Installing the {engine} adapter…', { engine }))
     : phase === 'reconnecting' ? t('Installed. Reconnecting this chat…')
     : phase === 'failed' ? (state?.error ? t('Install failed: {why}', { why: state.error }) : t('Install failed (the reason is in the note below).'))
     : phase === 'reconnect-failed' ? t('Installed, but this chat still could not connect.')
+    : kiro ? t('Finds an existing kiro-cli on this machine, or installs it with the official installer, then reconnects this chat.')
     : t('Installs only this adapter, then reconnects this chat.');
   return (
     <div className="adapter-install" data-phase={phase || 'idle'}>
@@ -883,11 +904,16 @@ function AdapterInstallAction({ sessionId, message }: { sessionId?: string | nul
         type="button"
         className="adapter-install-btn"
         disabled={busy}
-        onClick={() => { void startAdapterInstall(sessionId, offer.engine); }}
+        onClick={() => { void startAdapterInstall(sessionId, want.engine); }}
       >
-        {busy ? t('Installing…') : phase === 'failed' || phase === 'reconnect-failed' ? t('Try installing again') : t('Install {engine} adapter', { engine })}
+        {busy ? t('Installing…') : phase === 'failed' || phase === 'reconnect-failed' ? t('Try installing again') : kiro ? t('Install kiro-cli') : t('Install {engine} adapter', { engine })}
       </button>
       <span className="adapter-install-status">{status}</span>
+      {kiro && phase === 'failed' && (
+        <button type="button" className="engine-status-link" onClick={() => { void (window as any).kiroApi?.openExternal?.('https://kiro.dev/docs/cli/installation/'); }}>
+          {t('Open the official download page')}
+        </button>
+      )}
       {tail && <pre className="adapter-install-output">{tail}</pre>}
     </div>
   );
@@ -4684,7 +4710,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             />
           )}
           {group.kind === 'assistant' && group.segments.filter(isConnectFailureNotice).slice(-1).map((m) => (
-            <AdapterInstallAction key={`install:${m.id}`} sessionId={currentSessionId} message={m} />
+            <AdapterInstallAction key={`install:${m.id}`} sessionId={currentSessionId} message={m} remote={!!remoteHostLabel} />
           ))}
           </div>
         ))}

@@ -50,10 +50,10 @@ import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { chatHistoryBody } from '../historyBlock.ts';
 import { mergeAssistantFinal } from '../assistantFinal.ts';
 import { connectFailureNotice, adapterInstalledNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
-import { adapterInstallOffer } from '../adapterInstallOffer';
+import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer';
 import { forkRemoteIntent, firstSendRemoteId, forkMachineMissingText, restoredForkIntents, FORK_MACHINE_MISSING_GROUP } from '../forkTarget';
 import { noteSessionLocally, unpinSessionLocally } from './useSessionNotice';
-import { adapterInstallStore, setAdapterInstallRunner } from '../adapterInstallState';
+import { adapterInstallStore, setAdapterInstallRunner, setEngineLoginRunner } from '../adapterInstallState';
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
 import { engineLabel } from '../engineLabel';
@@ -3868,7 +3868,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 其余的普通 attach。不看 attachedIds：发消息那条路会先 `addAttached` 再发，失败了它也还在集合里。
    * 连上：「没连上」那条（带安装按钮的）换成「装好了、已连上」；连不上：换成新的那条原因。
    */
-  const reconnectAfterInstall = async (sessionId: string, engine: 'claude' | 'codex'): Promise<{ ok: boolean; error?: string }> => {
+  const reconnectAfterInstall = async (sessionId: string, engine: 'claude' | 'codex' | 'kiro', via: 'install' | 'login' = 'install'): Promise<{ ok: boolean; error?: string }> => {
     const retryCreate = failedCreateRef.current.get(sessionId);
     markConnecting(sessionId);
     try {
@@ -3880,7 +3880,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
       addAttached(sessionId);
       clearFailed(sessionId);
-      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, adapterInstalledNotice(engine, Date.now(), uiLangNow())));
+      mutateSessionMessages(sessionId, (cur) => replaceConnectFailureNotices(cur, adapterInstalledNotice(engine, Date.now(), uiLangNow(), via)));
       void window.kiroApi.ensureContext?.(sessionId).catch(() => {});
       return { ok: true };
     } catch (err: any) {
@@ -3901,10 +3901,18 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           /* 主进程已经写进会话了就不在按钮旁再说一遍 */
           .then((r) => (r.ok || !r.noted ? r : { ok: false, error: '' }))
         : Promise.resolve({ ok: false, error: 'installAdapter unavailable' }),
-      reconnect: (sid) => reconnectAfterInstallRef.current(sid, adapterInstallStore.get(sid)?.engine || 'claude'),
+      reconnect: (sid) => reconnectAfterInstallRef.current(sid, adapterInstallStore.get(sid)?.engine || 'claude', adapterInstallStore.get(sid)?.via || 'install'),
+    });
+    /* 本机没登录的「登录」：开终端跑登录命令，然后轮询本机状态（跳过 5 分钟缓存）到这一家登上 */
+    setEngineLoginRunner({
+      login: (engine) => window.kiroApi.enginesLogin ? window.kiroApi.enginesLogin('local', engine) : Promise.resolve({ ok: false, error: 'enginesLogin unavailable' }),
+      loggedIn: async (engine) => {
+        const r = await window.kiroApi.enginesStatus?.('local', { force: true });
+        return !!r?.ok && r.statuses?.find((s) => s.engine === engine)?.state === 'ok';
+      },
     });
     const off = window.kiroApi.onAdapterInstallOutput?.((d) => { if (d?.sessionId) adapterInstallStore.append(d.sessionId, String(d.chunk || '')); });
-    return () => { setAdapterInstallRunner(null); try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+    return () => { setAdapterInstallRunner(null); setEngineLoginRunner(null); try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
 
   /**
@@ -4326,7 +4334,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           }
           turnOutcomeRef.current.set(sid!, { kind: 'error', message: retryErr?.message || t('Failed to send message.') });
           /* 连不上是因为缺 Claude Code / Codex 的适配器：给「没连上」那条（带「安装」按钮），不给一个答不了的助手气泡 */
-          if (adapterInstallOffer(cleanIpcError(retryErr))) {
+          /* 「没登录」同理（本机会话那条上有「登录」按钮） */
+          if (adapterInstallOffer(cleanIpcError(retryErr)) || engineLoginOffer(cleanIpcError(retryErr))) {
             markFailed(sid!);
             mutateSessionMessages(sid!, (prev) => replaceConnectFailureNotices(prev, connectFailureNotice(String(retryErr?.message || retryErr), undefined, uiLangNow())));
             return;

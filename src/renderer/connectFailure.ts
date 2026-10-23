@@ -31,8 +31,13 @@ export const connectFailureNotice = (rawWhy: string, now: number = Date.now(), l
 };
 
 /** 会话里点「安装」装好适配器、重连上之后换上的那一条（同样只在界面上）。 */
-export const adapterInstalledNotice = (engine: 'claude' | 'codex', now: number = Date.now(), lang: Lang = 'zh'): Message => {
-  const say = (l: Lang) => t(l, '✅ The {engine} ACP adapter is installed and this chat is connected.', { engine: engine === 'codex' ? 'Codex' : 'Claude Code' });
+export const adapterInstalledNotice = (engine: 'claude' | 'codex' | 'kiro', now: number = Date.now(), lang: Lang = 'zh', via: 'install' | 'login' = 'install'): Message => {
+  const name = engine === 'codex' ? 'Codex' : engine === 'kiro' ? 'kiro-cli' : 'Claude Code';
+  const say = (l: Lang) => via === 'login'
+    ? t(l, '✅ {engine} is logged in and this chat is connected.', { engine: name })
+    : engine === 'kiro'
+      ? t(l, '✅ kiro-cli is installed and this chat is connected.')
+      : t(l, '✅ The {engine} ACP adapter is installed and this chat is connected.', { engine: name });
   return {
     id: `msg_${now}_adapter_installed`,
     role: 'kirolex' as any,

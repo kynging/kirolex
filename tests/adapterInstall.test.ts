@@ -16,7 +16,7 @@ import path from 'node:path';
 import { EventEmitter } from 'node:events';
 import { execFileSync } from 'node:child_process';
 import {
-  localInstallCommand, runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, installFailureReason,
+  localInstallCommand, runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, remoteKiroInstallOutcome, adapterInstallFailedMessage, installFailureReason,
 } from '../src/main/adapterInstall.ts';
 import { managerModuleRoots, findAdapterEntry, resolveAdapter, adapterMissingMessage } from '../src/main/engines.ts';
 import { adapterProblemMessage } from '../src/main/remoteAdapterProbe.ts';
@@ -194,12 +194,13 @@ describe('远端：「安装 AI 工具」那个脚本，只装缺的那一个', 
     assert.match(sh, /^want codex-acp && npm_i '@agentclientprotocol\/codex-acp' codex-acp$/m);
     assert.match(sh, /^want claude-agent-acp && login_visible claude-agent-acp/m);
     assert.match(sh, /^want codex-acp && login_visible codex-acp/m);
-    /* 适配器之前的那几步只在全装时跑 */
-    for (const step of ['step "系统包', 'step "kiro-cli"', 'step "claude code / codex']) {
+    /* 适配器之前的那几步：claude / codex CLI 只在全装时跑；系统包和 kiro-cli 只在全装或 ONLY=kiro-cli 时跑（只装一个适配器时都跳过） */
+    for (const [step, guard] of [['step "系统包', /if want kiro-cli; then\s*$/], ['step "kiro-cli"', /if want kiro-cli; then\s*$/], ['step "claude code / codex', /if full; then\s*$/]] as const) {
       const at = sh.indexOf(step);
       assert.ok(at > 0, step);
-      assert.match(sh.slice(at - 40, at), /if full; then\s*$/, `${step} 前面要有 if full; then`);
+      assert.match(sh.slice(at - 40, at), guard, `${step} 前面要有 ${guard}`);
     }
+    assert.match(sh, /^want\(\) \{ \[ -z "\$ONLY" \] \|\| \[ "\$ONLY" = "\$1" \]; \}$/m, 'ONLY=codex-acp 时 want kiro-cli 为假');
     assert.match(sh, /^if full; then\nif have claude/m, 'claude CLI 只在全装时装');
     assert.match(sh, /npm_i '@openai\/codex' codex\nfi\n/, 'codex CLI 只在全装时装');
     /* ONLY 模式装完那一个就收尾（退出码只看它），后面的默认模型 / 登录 / sshd / 全量自检都到不了 */
@@ -249,6 +250,77 @@ describe('远端：「安装 AI 工具」那个脚本，只装缺的那一个', 
     } finally {
       fs.rmSync(dir, { recursive: true, force: true });
     }
+  });
+
+  test('真跑一遍：ONLY=kiro-cli 只装 kiro-cli（下载 → 解包 → install.sh），装完登录 shell 里找得到；node / npm / 适配器都不碰', { skip: (() => { try { execFileSync('bash', ['-c', 'true']); return false; } catch { return '这台机器没有 bash'; } })() }, () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kirolex-only-kiro-'));
+    try {
+      const bin = path.join(dir, 'bin');
+      fs.mkdirSync(bin);
+      const log = path.join(dir, 'calls.log').replace(/\\/g, '/');
+      /* 假的 curl：把 -o 那个文件建出来；假的 unzip：解出一个 kirocli/install.sh，它把 kiro-cli 放进 ~/.local/bin（和官方包一样） */
+      fs.writeFileSync(path.join(bin, 'curl'), [
+        '#!/bin/sh',
+        `echo "curl $*" >> "${log}"`,
+        'while [ $# -gt 0 ]; do if [ "$1" = -o ]; then : > "$2"; fi; shift; done',
+        'exit 0',
+      ].join('\n') + '\n', { mode: 0o755 });
+      fs.writeFileSync(path.join(bin, 'unzip'), [
+        '#!/bin/sh',
+        `echo "unzip $*" >> "${log}"`,
+        'd=""; while [ $# -gt 0 ]; do if [ "$1" = -d ]; then d="$2"; fi; shift; done',
+        'mkdir -p "$d/kirocli"',
+        `printf '%s\\n' 'mkdir -p "$HOME/.local/bin"' 'printf "#!/bin/sh\\necho kiro-cli 9.9.9\\n" > "$HOME/.local/bin/kiro-cli"' 'chmod +x "$HOME/.local/bin/kiro-cli"' > "$d/kirocli/install.sh"`,
+        'exit 0',
+      ].join('\n') + '\n', { mode: 0o755 });
+      /* 这台「远端」没有 node：只装 kiro-cli 时不该去装 node（fnm）、也不该跑 npm —— 碰了就会记进 calls.log */
+      for (const t of ['npm', 'fnm']) {
+        fs.writeFileSync(path.join(bin, t), `#!/bin/sh\necho "${t} $*" >> "${log}"\nexit 1\n`, { mode: 0o755 });
+      }
+      fs.writeFileSync(path.join(bin, 'git'), '#!/bin/sh\necho git version 2\n', { mode: 0o755 });
+      const toPosix = (p: string) => p.replace(/\\/g, '/').replace(/^([A-Za-z]):/, (_m, d) => `/${d.toLowerCase()}`);
+      let out = '';
+      let code = 0;
+      try {
+        out = execFileSync('bash', ['-c', `export HOME="$1" PATH="$2:/usr/bin:/bin" ONLY=kiro-cli; bash "$3" </dev/null 2>&1`, 'x', toPosix(dir), toPosix(bin), toPosix(path.join(REPO, 'scripts', 'remote-bootstrap.sh'))], { encoding: 'utf8' });
+      } catch (e: any) { out = String(e.stdout || ''); code = e.status; }
+      assert.equal(code, 0, out);
+      assert.ok(fs.existsSync(path.join(dir, '.local', 'bin', 'kiro-cli')), 'install.sh 把 kiro-cli 放进了 ~/.local/bin');
+      assert.match(out, /kiro-cli : 登录 shell 里找得到/);
+      const calls = fs.existsSync(log) ? fs.readFileSync(log, 'utf8') : '';
+      assert.match(calls, /curl .*kirocli-[a-z0-9_]+-linux(-musl)?\.zip/, '下载的是官方 kiro-cli 包');
+      assert.ok(!/^(npm|fnm) /m.test(calls), `不该碰 node / npm：\n${calls}`);
+      assert.ok(!/fnm\.vercel\.app/.test(calls), '不该去下 fnm / node');
+      assert.ok(!/npm i -g|claude-agent-acp|codex-acp 装|node 没装上/.test(out), '不装适配器、没有 node 也不算失败');
+    } finally {
+      fs.rmSync(dir, { recursive: true, force: true });
+    }
+  });
+
+  test('远端只装 kiro-cli：命令带 ONLY=kiro-cli；装完找到了才算装好，没配过启动命令就存成找到的那条，配过的不动', () => {
+    assert.match(remoteInstallCommand('/tmp/kx.sh', 'kiro'), /^cat > \/tmp\/kx\.sh && ONLY=kiro-cli bash \/tmp\/kx\.sh;/);
+    const okNew = remoteKiroInstallOutcome('h', { code: 0, output: '✓ kiro-cli 装好了。' }, { command: '~/.local/bin/kiro-cli', version: 'kiro-cli 2.25.0' }, undefined);
+    assert.deepEqual(okNew, { ok: true, saveAs: '~/.local/bin/kiro-cli' });
+    assert.deepEqual(remoteKiroInstallOutcome('h', { code: 0, output: '' }, { command: 'kiro-cli' }, '/opt/kiro/kiro-cli'), { ok: true });
+    const notFound = remoteKiroInstallOutcome('h', { code: 0, output: '' }, undefined, undefined) as any;
+    assert.equal(notFound.ok, false);
+    assert.match(notFound.error, /h/);
+    const failed = remoteKiroInstallOutcome('h', { code: 1, output: '→ 下载 kirocli-x86_64-linux.zip\n✗ 下载失败（这台机器连不上 https://desktop-release…？）\n' }, undefined, undefined) as any;
+    assert.match(failed.error, /下载失败/);
+    assert.match((remoteKiroInstallOutcome('h', { code: 255, output: 'ssh: connect to host h port 22: Connection refused' }, undefined, undefined) as any).error, /Connection refused/);
+  });
+
+  test('接线：状态里远端 kiro 的「安装」走 installRemoteKiro（ONLY 脚本 → 自动检测 → 存启动命令），不再只叫人去设置', () => {
+    const M = read('src', 'main', 'index.ts');
+    const fn = M.slice(M.indexOf('function runEngineInstall('), M.indexOf('function runEngineInstall(') + 2500);
+    assert.match(fn, /job = host \? installRemoteKiro\(remote!, broadcast\) : installLocalKiro\(broadcast\);/);
+    const k = M.slice(M.indexOf('async function installRemoteKiro('), M.indexOf('async function installRemoteKiro(') + 2500);
+    assert.match(k, /runRemoteOnlyInstall\(remote, 'kiro', onChunk\)/);
+    assert.match(k, /parseDetect\(await runProbe\(id, detectScript\(\)\)\)/);
+    assert.match(k, /remoteKiroInstallOutcome\(/);
+    assert.match(k, /saveRemoteTarget\(KIROLEX_CONFIG_PATH, \{ id, sshHost: [^}]*bins: \{ \.\.\.\(cur\?\.bins \|\| \{\}\), kiro: r\.saveAs \} \}/);
+    /* 装好了清掉那台机器的状态缓存（面板随后 force 重新检测） */
+    assert.match(fn, /engineStatusCache\.invalidate\(/);
   });
 
   test('远端结论：npm 那几行（权限 / 网络）进失败提示；验证通过才算装好；ssh 没连上不验证', () => {
@@ -475,10 +547,13 @@ describe('同一机器、同一引擎的安装复用：进度和结果广播给�
     const M = read('src', 'main', 'index.ts');
     const at = M.indexOf("ipcMain.handle('acp:install-adapter'");
     const body = M.slice(at, at + 4000);
-    assert.match(M, /const adapterInstallsInFlight = createSharedInstalls(<[^>]*>)?\(\)/);
-    assert.match(body, /adapterInstallsInFlight\.join\(key, send,/);
-    assert.match(body, /installRemoteAdapter\(remote!, engine, broadcast\)/);
-    assert.match(body, /onOutput: broadcast,/);
+    /* 会话里的「安装」和新建会话框 / 设置页的 ❌ 共用 `runEngineInstall`（同一份 createSharedInstalls） */
+    assert.match(body, /runEngineInstall\(remote, engine, send\)/);
+    const fn = M.slice(M.indexOf('function runEngineInstall('), M.indexOf('function runEngineInstall(') + 2500);
+    assert.match(M, /const engineInstalls = createSharedInstalls(<[^>]*>)?\(\)/);
+    assert.match(fn, /engineInstalls\.join\(engineInstallKey\(remote, engine\), onChunk,/);
+    assert.match(fn, /installRemoteAdapter\(remote!, engine, broadcast\)/);
+    assert.match(fn, /onOutput: broadcast,/);
   });
 });
 
@@ -492,14 +567,19 @@ describe('接线', () => {
     const at = M.indexOf("ipcMain.handle('acp:install-adapter'");
     assert.ok(at > 0);
     const body = M.slice(at, at + 4000);
-    assert.match(body, /runLocalAdapterInstall\(/);
-    assert.match(body, /home: os\.homedir\(\)/);
-    assert.match(body, /installRemoteAdapter\(/);
+    assert.match(body, /runEngineInstall\(/);
+    const inst = M.slice(M.indexOf('function runEngineInstall('), M.indexOf('function runEngineInstall(') + 2500);
+    assert.match(inst, /runLocalAdapterInstall\(/);
+    assert.match(inst, /home: os\.homedir\(\)/);
+    assert.match(inst, /installRemoteAdapter\(/);
     assert.match(body, /noteInSession\(/);
     assert.match(body, /logger\.(warn|error)\(/);
     const fn = M.slice(M.indexOf('async function installRemoteAdapter('), M.indexOf('async function installRemoteAdapter(') + 3000);
-    assert.match(fn, /remoteInstallCommand\(/);
+    /* ssh 那一段抽成了 runRemoteOnlyInstall（远端只装 kiro-cli 也用它） */
+    assert.match(fn, /runRemoteOnlyInstall\(remote, engine, onChunk\)/);
     assert.match(fn, /verifyRemoteAdapter\(/);
+    const run = M.slice(M.indexOf('async function runRemoteOnlyInstall('), M.indexOf('async function runRemoteOnlyInstall(') + 2500);
+    assert.match(run, /remoteInstallCommand\(remoteTmp, engine\)/);
   });
 
   test('preload 暴露 installAdapter 和进度事件', () => {

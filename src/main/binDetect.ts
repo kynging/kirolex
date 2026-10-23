@@ -60,6 +60,8 @@ export const TOOLS: ToolSpec[] = [
       '%LOCALAPPDATA%\\Kiro-Cli\\kiro-cli.exe',
       '%LOCALAPPDATA%\\Programs\\kiro-cli\\kiro-cli.exe',
       '%APPDATA%\\kiro-cli\\kiro-cli.exe',
+      /* 官方安装器（install.ps1 → MSI）的位置 */
+      '%ProgramFiles%\\Kiro-Cli\\kiro-cli.exe',
     ],
     versionArg: '--version',
     verify: /kiro[-_ ]?cli/i,

@@ -264,4 +264,12 @@ export const ZH_MODULES_B: Record<string, string> = {
   "There is no AI tool config yet: save one above first.": "还没有 AI 工具配置：先在上面存一份。",
   "A sync to {host} is already running": "已经在往 {host} 同步了",
   "{file} was changed on disk after you opened it (for example pulled in by S3 sync from another computer). Not saved, so the newer file is not overwritten.": "{file} 在你打开之后被改过了（比如 S3 同步从别的电脑拉回了新版本）。这次没保存，免得把更新的那份盖掉。",
+  "kiro-cli is not installed on {host}.": "{host} 上没装 kiro-cli。",
+  "The {engine} adapter is installed on {host}, but there is no node to run it.": "{host} 上装了 {engine} 的适配器，但没有能跑它的 node。",
+  "The {engine} ACP adapter is not installed on {host}.": "{host} 上没装 {engine} 的 ACP 适配器。",
+  "❌ Installing kiro-cli on this machine failed: {why}\nYou can download and install it yourself from the official page: {url} — then click Install again (KiroLex will find it).": "❌ 在本机安装 kiro-cli 没成功：{why}\n可以到官方页面自己下载安装：{url} —— 装好后再点一次「安装」（KiroLex 会找到它）。",
+  "kiro-cli on {host} is not logged in: Settings → 🖥 Machines → that machine → \"Install AI tools\" walks you through logging in (device flow), or run `kiro-cli login` on that machine.": "{host} 上的 kiro-cli 还没登录：设置 → 🖥 机器 → 那台机器 →「安装 AI 工具」会带你登录（device flow），或者在那台机器上跑 `kiro-cli login`。",
+  "{engine} on {host} is not logged in: create the chat, then use 🔑 Login at the bottom left of the chat (official login, Bedrock or an API key).": "{host} 上的 {engine} 还没登录：建好会话后，用会话左下角的 🔑 登录（官方登录、Bedrock 或 API key）。",
+  "❌ Installing kiro-cli on {host} failed: {why}": "❌ 在 {host} 上安装 kiro-cli 没成功：{why}",
+  "the install script finished, but no kiro-cli that starts was found on that machine": "安装脚本跑完了，但在那台机器上找不到能起来的 kiro-cli",
 };

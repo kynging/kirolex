@@ -7,8 +7,9 @@ import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, she
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
-import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, type Engine } from './engines.ts';
-import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath, remoteInstallReason } from './adapterInstall.ts';
+import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, adapterMissingMessage, adapterAuthMessage, type Engine } from './engines.ts';
+import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, remoteInstallOutcome, adapterInstallFailedMessage, binOnPath, remoteInstallReason, installFailureReason, remoteKiroInstallOutcome } from './adapterInstall.ts';
+import { createStatusCache, judgeEngineStatus, localAuthFromFiles, remoteEngineStatuses, kiroInstallCommand, kiroInstallFailedMessage, terminalLaunches, LOGIN_ARGS, remoteLoginHow, type EngineStatus } from './engineStatus.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
@@ -3451,12 +3452,58 @@ function readBootstrapScript(): string | null {
  */
 async function installRemoteAdapter(remote: RemoteTarget, engine: 'claude' | 'codex', onChunk: (s: string) => void): Promise<{ ok: boolean; error?: string }> {
   const host = remote.sshHost || '';
-  const script = readBootstrapScript();
-  if (!script) return { ok: false, error: adapterInstallFailedMessage(engine, host, tr('remote-bootstrap.sh not found (it should be under the app’s scripts/)')) };
-  const remoteTmp = `/tmp/kirolex-adapter-${Date.now()}.sh`;
   logger.info('remote', `会话里安装适配器 ${host} ${engine}（只装 ${REMOTE_ADAPTER_BIN[engine]}）`);
-  onChunk(`$ ssh ${host} … ONLY=${REMOTE_ADAPTER_BIN[engine]} bash remote-bootstrap.sh\n`);
-  const run = await new Promise<{ code: number | null; tail: string; error?: string }>((resolve) => {
+  const run = await runRemoteOnlyInstall(remote, engine, onChunk);
+  if (run.noScript) return { ok: false, error: adapterInstallFailedMessage(engine, host, tr('remote-bootstrap.sh not found (it should be under the app’s scripts/)')) };
+  logger.info('remote', `会话里安装适配器结束 ${host} ${engine} code=${run.code}${run.error ? ` error=${run.error}` : ''}`);
+  const result = { code: run.code, output: run.tail, error: run.error };
+  /* ssh 起不来 / 没连上（255）：脚本根本没跑，不用验证 */
+  if (run.error || run.code === 255) return remoteInstallOutcome(engine, host, result);
+  const v = await verifyRemoteAdapter(remote, engine);
+  const line = adapterVerifyMessage(host, engine, v);
+  logger.info('remote', `会话里安装适配器 验证 ${host} ${engine}: ${v.ok ? 'ok' : line}`);
+  onChunk(`\n${line}\n`);
+  /* 失败原因（含脚本带回来的 npm 那几行）由调用方写进会话和日志 */
+  return remoteInstallOutcome(engine, host, result, { ok: v.ok, line });
+}
+
+/**
+ * **远端缺 kiro-cli 时，状态里的「❌ 没装 → 安装」直接装** —— 原来只叫人去设置里点「安装 AI 工具」。
+ * 同一个脚本带 `ONLY=kiro-cli`（系统包 + kiro-cli 本身，不碰 node / claude / codex / 登录 / sshd），
+ * 装完按设置里「自动检测」那套在那台机器上找一遍（`detectScript`），找到能起的才算装好；
+ * 那台机器还没配 kiro 启动命令就把找到的存进去（`remoteKiroInstallOutcome`）。登录照旧是另一步（状态里的 ⚠️）。
+ */
+async function installRemoteKiro(remote: RemoteTarget, onChunk: (s: string) => void): Promise<{ ok: boolean; error?: string }> {
+  const host = remote.sshHost || '';
+  const id = (remote as any).id || findRemoteIdForHost(host);
+  logger.info('remote', `安装 kiro-cli ${host}（只装 kiro-cli）`);
+  const run = await runRemoteOnlyInstall(remote, 'kiro', onChunk);
+  if (run.noScript) return { ok: false, error: tr('❌ Installing kiro-cli on {host} failed: {why}', { host, why: tr('remote-bootstrap.sh not found (it should be under the app’s scripts/)') }) };
+  logger.info('remote', `安装 kiro-cli 结束 ${host} code=${run.code}${run.error ? ` error=${run.error}` : ''}`);
+  let found: { command: string; version?: string } | undefined;
+  if (!run.error && run.code !== 255 && id) {
+    onChunk(`\n${tr('Looking for kiro-cli on {host}…', { host })}\n`);
+    try { found = parseDetect(await runProbe(id, detectScript())).kiro.find((c) => c.ok); } catch { /* 找不到就按没装好说 */ }
+    if (found) onChunk(`✓ ${found.command}  ${found.version || ''}\n`);
+  }
+  const configured = remoteKiroBin(remote);
+  const r = remoteKiroInstallOutcome(host, { code: run.code, output: run.tail, error: run.error }, found, configured);
+  if (r.ok && r.saveAs && id) {
+    const cur = findRemoteTarget(KIROLEX_CONFIG_PATH, id);
+    saveRemoteTarget(KIROLEX_CONFIG_PATH, { id, sshHost: cur?.sshHost || host, bins: { ...(cur?.bins || {}), kiro: r.saveAs } } as RemoteTargetInput);
+    logger.info('remote', `${host} 的 kiro 启动命令存为 ${r.saveAs}`);
+  }
+  return r.ok ? { ok: true } : r;
+}
+
+/** 远端跑「安装 AI 工具」那个脚本、只装 `engine` 那一个（ONLY），输出边跑边给 `onChunk`。 */
+async function runRemoteOnlyInstall(remote: RemoteTarget, engine: 'claude' | 'codex' | 'kiro', onChunk: (s: string) => void): Promise<{ code: number | null; tail: string; error?: string; noScript?: boolean }> {
+  const host = remote.sshHost || '';
+  const script = readBootstrapScript();
+  if (!script) return { code: null, tail: '', noScript: true };
+  const remoteTmp = `/tmp/kirolex-adapter-${Date.now()}.sh`;
+  onChunk(`$ ssh ${host} … ONLY=${engine === 'kiro' ? 'kiro-cli' : REMOTE_ADAPTER_BIN[engine]} bash remote-bootstrap.sh\n`);
+  return await new Promise<{ code: number | null; tail: string; error?: string }>((resolve) => {
     const child = spawn('ssh', buildSshArgs(remote, remoteInstallCommand(remoteTmp, engine)), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
     let tail = '';
     const onData = (b: Buffer) => {
@@ -3473,16 +3520,257 @@ async function installRemoteAdapter(remote: RemoteTarget, engine: 'claude' | 'co
     child.on('error', (err) => { clearTimeout(killer); resolve({ code: null, tail, error: err?.message || tr('ssh would not start') }); });
     child.on('close', (code) => { clearTimeout(killer); resolve({ code, tail }); });
   });
-  logger.info('remote', `会话里安装适配器结束 ${host} ${engine} code=${run.code}${run.error ? ` error=${run.error}` : ''}`);
-  const result = { code: run.code, output: run.tail, error: run.error };
-  /* ssh 起不来 / 没连上（255）：脚本根本没跑，不用验证 */
-  if (run.error || run.code === 255) return remoteInstallOutcome(engine, host, result);
-  const v = await verifyRemoteAdapter(remote, engine);
-  const line = adapterVerifyMessage(host, engine, v);
-  logger.info('remote', `会话里安装适配器 验证 ${host} ${engine}: ${v.ok ? 'ok' : line}`);
-  onChunk(`\n${line}\n`);
-  /* 失败原因（含脚本带回来的 npm 那几行）由调用方写进会话和日志 */
-  return remoteInstallOutcome(engine, host, result, { ok: v.ok, line });
+}
+
+/* ─────────── 三个引擎在一台机器上的状态（新建会话选引擎处 / 设置 → 机器 → 本机，`engineStatus.ts`） ─────────── */
+
+const engineStatusCache = createStatusCache();
+const engineStatusInFlight = new Map<string, Promise<EngineStatus[]>>();
+
+function readTextOrNull(p: string): string | null {
+  try { return fs.readFileSync(p, 'utf8'); } catch { return null; }
+}
+
+/** 本机的 kiro / claude / codex 候选 —— 和设置里「自动检测」同一套（Windows 走 Node，别处走 bash 脚本）。 */
+async function detectLocalBins() {
+  return process.platform === 'win32' ? detectWindows(probeOneLocal) : parseDetect(await runProbe('local', detectScript()));
+}
+
+/** 本机 PATH 上的某个 CLI（找不到 = undefined）。 */
+function findLocalCli(name: string): string | undefined {
+  if (process.platform === 'win32') return whichAll(name, shellEnv)[0];
+  return String(shellEnv.PATH || '').split(':').filter(Boolean).map((d) => path.join(d, name)).find((p) => { try { return fs.statSync(p).isFile(); } catch { return false; } });
+}
+
+/** 跑一个本机命令拿输出（不抛；`.cmd` 经 shell）。 */
+function runLocalCapture(cmd: string, args: string[], timeoutMs: number): Promise<{ ok: boolean; out: string; timedOut: boolean }> {
+  const needsShell = /\.(cmd|bat)$/i.test(cmd);
+  return new Promise((resolve) => {
+    execFile(needsShell ? `"${cmd}"` : cmd, args, { timeout: timeoutMs, encoding: 'utf8', shell: needsShell, windowsHide: true, env: shellEnv, cwd: os.homedir() }, (err: any, stdout, stderr) => {
+      resolve({ ok: !err, out: `${stdout || ''}${stderr || ''}`, timedOut: !!err?.killed });
+    });
+  });
+}
+
+/** 本机三个引擎的事实 → 状态。 */
+async function localEngineStatuses(): Promise<EngineStatus[]> {
+  const kiro = async (): Promise<EngineStatus> => {
+    const notSet = kiroBinProblem();
+    const cli = notSet ? null : resolveKiroCli();
+    if (!cli) {
+      return judgeEngineStatus('kiro', { installed: false, detail: notSet
+        ? tr('kiro-cli is not set up on this machine yet (no launch command). Install finds an existing kiro-cli or installs it.')
+        : tr('kiro-cli was not found at the configured launch command.') });
+    }
+    const ver = await probeOneLocal(cli, '--version');
+    if (!ver.ok) return judgeEngineStatus('kiro', { installed: false, detail: tr('kiro-cli does not start: {why}', { why: ver.first.slice(0, 160) }) });
+    /* 未登录时 `whoami` 非零退出（远端预检也是这么判的）；超时 = 看不出来 */
+    const who = await runLocalCapture(cli, ['whoami'], 20_000);
+    return judgeEngineStatus('kiro', {
+      installed: true,
+      version: /(\d+\.\d+\.\d+)/.exec(ver.first)?.[1],
+      loggedIn: who.timedOut ? undefined : who.ok,
+      detail: who.ok || who.timedOut ? undefined : tr('Run `kiro-cli login` on this machine (the Login button opens a terminal for it).'),
+    });
+  };
+  const adapter = async (engine: 'claude' | 'codex'): Promise<EngineStatus> => {
+    const override = shellEnv[`KIROLEX_${engine.toUpperCase()}_ACP`];
+    const entry = override || findAdapterEntry(engine, shellEnv);
+    const installed = !!entry || (process.platform !== 'win32' && !!findLocalCli(REMOTE_ADAPTER_BIN[engine]));
+    if (!installed) return judgeEngineStatus(engine, { installed: false, detail: adapterMissingMessage(engine) });
+    let version: string | undefined;
+    if (entry && /index\.js$/.test(entry)) {
+      try { version = JSON.parse(readTextOrNull(path.join(path.dirname(entry), '..', 'package.json')) || '{}').version; } catch { /* 没有就不写版本 */ }
+    }
+    let loggedIn: boolean | undefined = localAuthFromFiles(engine, readTextOrNull, os.homedir(), shellEnv) || undefined;
+    if (!loggedIn) {
+      /* 文件里看不出来：问那个 CLI（macOS 上 Claude Code 的凭据在钥匙串里）；CLI 也没有 —— macOS 上看不出来，别处就是没登录 */
+      const cli = findLocalCli(engine);
+      if (cli) {
+        const r = await runLocalCapture(cli, engine === 'claude' ? ['auth', 'status', '--json'] : ['login', 'status'], 20_000);
+        loggedIn = r.timedOut ? undefined : (engine === 'claude' ? parseClaudeStatus(r.out) : parseCodexStatus(r.out)).loggedIn;
+      } else {
+        loggedIn = process.platform === 'darwin' ? undefined : false;
+      }
+    }
+    return judgeEngineStatus(engine, {
+      installed: true, version, loggedIn,
+      detail: loggedIn === false ? adapterAuthMessage(engine) : undefined,
+    });
+  };
+  return Promise.all([kiro(), adapter('claude'), adapter('codex')]);
+}
+
+/** 远端：和「测试连接」同一次 ssh（kiro 预检 + 两家适配器探测）。 */
+async function remoteEngineStatusesFor(target: RemoteTarget): Promise<EngineStatus[]> {
+  const host = target.sshHost || '';
+  const args = buildSshArgs(target, `bash -lc ${shellQuote(testConnectionScript(preflightScript(undefined, { models: false })))}`);
+  const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
+    execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
+      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || ''),
+    }));
+  });
+  const sections = splitTestOutput(out.stdout);
+  const pre = judgePreflight(out.code, sections.kiro, out.stderr, target);
+  return remoteEngineStatuses(host, { code: out.code, ...sections }, pre.code === 'unreachable' ? pre.message : undefined);
+}
+
+/** 一台机器的状态（`'local'` = 本机）：5 分钟缓存 + 同一台同时只问一次。 */
+async function engineStatusesFor(machine: string, force = false): Promise<EngineStatus[]> {
+  const key = machine || 'local';
+  if (!force) {
+    const cached = engineStatusCache.get(key);
+    if (cached) return cached;
+  }
+  const running = engineStatusInFlight.get(key);
+  if (running) return running;
+  const job = (async () => {
+    let statuses: EngineStatus[];
+    if (key === 'local') statuses = await localEngineStatuses();
+    else {
+      const target = findRemoteTarget(KIROLEX_CONFIG_PATH, key);
+      if (!target) throw new Error(tr('Machine not found'));
+      statuses = await remoteEngineStatusesFor(target);
+    }
+    engineStatusCache.set(key, statuses);
+    logger.info('engines', `状态 ${key}: ${statuses.map((s) => `${s.engine}=${s.state}${s.version ? `@${s.version}` : ''}`).join(' ')}`);
+    return statuses;
+  })().finally(() => { engineStatusInFlight.delete(key); });
+  engineStatusInFlight.set(key, job);
+  return job;
+}
+
+/**
+ * **本机装 kiro-cli** —— 原来只叫人去设置里填路径。
+ * 先找一遍本机已有的（和设置里「自动检测」同一套）：找到能跑的就直接存成本机启动命令（不重装）；
+ * 没有才跑官方安装器（`kiroInstallCommand`，cwd 家目录），装完再找一遍、存起来。装不上给官方下载链接。
+ */
+async function installLocalKiro(onChunk: (s: string) => void): Promise<{ ok: boolean; error?: string }> {
+  const save = (cmd: string) => {
+    const saved = saveLocalBins(KIROLEX_CONFIG_PATH, { ...(localBins(KIROLEX_CONFIG_PATH) || {}), kiro: cmd });
+    setLocalKiroBin(saved?.kiro);
+    logger.info('engines', `本机 kiro 启动命令存为 ${saved?.kiro}`);
+  };
+  const pick = async () => { try { return (await detectLocalBins()).kiro.find((c) => c.ok); } catch { return undefined; } };
+  onChunk(`${tr('Looking for an existing kiro-cli on this machine…')}\n`);
+  let found = await pick();
+  if (found) {
+    onChunk(`✓ ${found.command}  ${found.version || ''}\n`);
+    save(found.command);
+    return { ok: true };
+  }
+  const cmd = kiroInstallCommand(process.platform, os.homedir(), shellEnv);
+  onChunk(`$ ${cmd.display}  (cwd: ${cmd.cwd})\n`);
+  logger.info('engines', `本机安装 kiro-cli：${cmd.display}`);
+  const run = await new Promise<{ code: number | null; output: string; error?: string; timedOut?: boolean }>((resolve) => {
+    let output = '';
+    let timedOut = false;
+    let child: ChildProcess;
+    try {
+      child = spawn(cmd.command, cmd.args, { cwd: cmd.cwd, env: shellEnv, windowsHide: true, stdio: ['ignore', 'pipe', 'pipe'] });
+    } catch (err: any) { resolve({ code: null, output, error: String(err?.message || err) }); return; }
+    const onData = (b: Buffer) => { const s = b.toString('utf-8'); output = (output + s).slice(-8000); onChunk(s); };
+    child.stdout?.on('data', onData);
+    child.stderr?.on('data', onData);
+    const killer = setTimeout(() => { timedOut = true; try { child.kill('SIGKILL'); } catch { /* 已经退了 */ } }, 15 * 60_000);
+    child.on('error', (err) => { clearTimeout(killer); resolve({ code: null, output, error: String(err?.message || err) }); });
+    child.on('close', (code) => { clearTimeout(killer); resolve({ code, output, timedOut }); });
+  });
+  if (run.error || run.code !== 0) {
+    return { ok: false, error: kiroInstallFailedMessage(run.error || installFailureReason(run.output, run.code, { timedOut: run.timedOut })) };
+  }
+  found = await pick();
+  if (found) {
+    onChunk(`✓ ${found.command}  ${found.version || ''}\n`);
+    save(found.command);
+    return { ok: true };
+  }
+  return { ok: false, error: kiroInstallFailedMessage(tr('the installer finished, but KiroLex still cannot find a kiro-cli that starts')) };
+}
+
+/**
+ * 装一个引擎（本机：kiro-cli / 适配器；远端：适配器只装缺的那一个）。会话里的「安装」和新建会话框 / 设置页的 ❌ 走同一份：
+ * 同一机器、同一引擎只装一次，后来的订阅那一次（`createSharedInstalls`，进度和结果都广播）。装好了清掉那台机器的状态缓存。
+ */
+const engineInstalls = createSharedInstalls<{ ok: boolean; error?: string }>();
+function engineInstallKey(remote: RemoteTarget | undefined, engine: Engine): string {
+  return `${remote?.sshHost || 'local'}|${engine}`;
+}
+function runEngineInstall(remote: RemoteTarget | undefined, engine: Engine, onChunk: (s: string) => void): Promise<{ ok: boolean; error?: string }> {
+  const host = remote?.sshHost || undefined;
+  return engineInstalls.join(engineInstallKey(remote, engine), onChunk, (broadcast) => {
+    let job: Promise<{ ok: boolean; error?: string }>;
+    if (engine === 'kiro') {
+      job = host ? installRemoteKiro(remote!, broadcast) : installLocalKiro(broadcast);
+    } else if (host) {
+      job = installRemoteAdapter(remote!, engine, broadcast);
+    } else {
+      job = runLocalAdapterInstall(engine, {
+        spawn: spawn as any,
+        platform: process.platform,
+        home: os.homedir(),
+        env: shellEnv,
+        onOutput: broadcast,
+        findEntry: () => { forgetAdapterCache(); return findAdapterEntry(engine, shellEnv); },
+        binOnPath: (bin) => binOnPath(bin, shellEnv, (p) => { try { return fs.existsSync(p); } catch { return false; } }),
+      });
+    }
+    return job.then((r) => {
+      if (r.ok) engineStatusCache.invalidate(host ? findRemoteIdForHost(host) : 'local');
+      return r;
+    });
+  }).promise;
+}
+
+/** 状态缓存按远端 id 记：装完按 host 找回 id 清掉（找不到就全清）。 */
+function findRemoteIdForHost(host: string): string | undefined {
+  try { return listRemoteTargets(KIROLEX_CONFIG_PATH).find((t: any) => t.sshHost === host)?.id; } catch { return undefined; }
+}
+
+/** 本机这一家的登录命令（数组：程序 + 参数）+ 要叠加的环境变量；做不到就是一句原因。 */
+function localLoginArgv(engine: Engine): { argv: string[]; env?: Record<string, string> } | { error: string } {
+  if (engine === 'kiro') {
+    const cli = kiroBinProblem() ? null : resolveKiroCli();
+    return cli ? { argv: [cli, ...LOGIN_ARGS.kiro] } : { error: tr('Install kiro-cli first.') };
+  }
+  const cli = findLocalCli(engine);
+  if (cli) return { argv: [cli, ...LOGIN_ARGS[engine]] };
+  if (engine === 'claude') {
+    /* 没装 claude CLI：适配器自带的 Claude Agent SDK 里有 cli.js，用 KiroLex 自己的 node 跑它的登录 */
+    const entry = findAdapterEntry('claude', shellEnv);
+    if (entry) {
+      const pkgDir = path.dirname(path.dirname(entry));
+      const sdk = [
+        path.join(pkgDir, 'node_modules', '@anthropic-ai', 'claude-agent-sdk', 'cli.js'),
+        path.join(pkgDir, '..', '..', '@anthropic-ai', 'claude-agent-sdk', 'cli.js'),
+      ].find((p) => { try { return fs.existsSync(p); } catch { return false; } });
+      if (sdk) return { argv: [process.execPath, sdk, ...LOGIN_ARGS.claude], env: { ELECTRON_RUN_AS_NODE: '1' } };
+    }
+    return { error: tr('Logging in to Claude Code needs the claude command: install Claude Code (https://claude.ai/install), or put a Bedrock / API key setup in ~/.claude/settings.json.') };
+  }
+  return { error: tr('Logging in to Codex needs the codex command: run `npm i -g @openai/codex` first, or set OPENAI_API_KEY.') };
+}
+
+/** 在一个新终端窗口里跑（Linux 按顺序试几个终端）。 */
+function openLoginTerminal(argv: string[], env: Record<string, string> = {}): Promise<boolean> {
+  const script = process.platform === 'win32'
+    ? path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kirolex-login-')), 'login.cmd')
+    : undefined;
+  const tries = terminalLaunches(process.platform, argv, env, script);
+  return new Promise((resolve) => {
+    const next = (i: number) => {
+      if (i >= tries.length) { resolve(false); return; }
+      const t = tries[i];
+      try {
+        if (t.script) fs.writeFileSync(t.script.path, t.script.content);
+        const command = t.command === 'cmd.exe' ? (shellEnv.ComSpec || 'cmd.exe') : t.command;
+        const child = spawn(command, t.args, { detached: true, stdio: 'ignore', cwd: os.homedir(), env: shellEnv, windowsVerbatimArguments: !!t.verbatim });
+        child.once('error', () => next(i + 1));
+        child.once('spawn', () => { child.unref(); resolve(true); });
+      } catch { next(i + 1); }
+    };
+    next(0);
+  });
 }
 
 function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Promise<string[]> {
@@ -13176,42 +13464,79 @@ app.whenReady().then(async () => {
    * 机器和引擎以记录为准；新建失败的会话还没有记录，用渲染层带来的 engine / remoteId。
    * 输出边跑边推给界面（`acp:adapter-install-output`）；装不上把原因写进会话（有记录时）和日志。重连由渲染层做。
    */
-  /* 同一机器、同一引擎只装一次；后点的会话订阅那一次，进度（含已经出来的）和结果都广播给它（`createSharedInstalls`） */
-  const adapterInstallsInFlight = createSharedInstalls<{ ok: boolean; error?: string }>();
+  /* 同一机器、同一引擎只装一次；后点的会话订阅那一次，进度（含已经出来的）和结果都广播给它（`runEngineInstall` → `createSharedInstalls`） */
   ipcMain.handle('acp:install-adapter', async (event, sessionId: string, engineArg?: string, remoteId?: string) => {
     const sid = String(sessionId || '').trim();
     const rec = sid ? store.readRecord(sid) : null;
     const engine = rec ? engineOf(rec.profile) : engineOf({ engine: engineArg });
-    if (engine === 'kiro') return { ok: false, error: tr('This session does not use Claude Code or Codex.') };
     const remote = rec ? rec.profile.remote : (remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined);
+    /* kiro：只有本机的「没装 kiro-cli」走这里（`installLocalKiro`）；远端的 kiro-cli 照旧在设置里「安装 AI 工具」 */
+    if (engine === 'kiro' && remote?.sshHost) return { ok: false, error: tr('This session does not use Claude Code or Codex.') };
     if (!rec && remoteId && !remote) {
       return { ok: false, error: tr('Remote target {id} not found (did the remotes in your config change?). KiroLex did not guess a machine, so this session was not created.', { id: String(remoteId) }) };
     }
     const host = remote?.sshHost || undefined;
     const send = (chunk: string) => { try { event.sender.send('acp:adapter-install-output', { sessionId: sid, chunk }); } catch { /* 窗口没了 */ } };
-    const key = `${host || 'local'}|${engine}`;
-    logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'}${adapterInstallsInFlight.has(key) ? '（已经在装了，等那一次）' : ''}`);
-    const { promise: job } = adapterInstallsInFlight.join(key, send, (broadcast) => (host
-      ? installRemoteAdapter(remote!, engine, broadcast)
-      : runLocalAdapterInstall(engine, {
-        spawn: spawn as any,
-        platform: process.platform,
-        home: os.homedir(),
-        env: shellEnv,
-        onOutput: broadcast,
-        findEntry: () => { forgetAdapterCache(); return findAdapterEntry(engine, shellEnv); },
-        binOnPath: (bin) => binOnPath(bin, shellEnv, (p) => { try { return fs.existsSync(p); } catch { return false; } }),
-      })
-    ));
-    const r = await job;
+    logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'}${engineInstalls.has(engineInstallKey(remote, engine)) ? '（已经在装了，等那一次）' : ''}`);
+    const r = await runEngineInstall(remote, engine, send);
     if (r.ok) {
       logger.info('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'} 装好了${(r as any).entry ? `（${(r as any).entry}）` : ''}`);
       return { ok: true };
     }
-    const error = r.error || adapterInstallFailedMessage(engine, host, '?');
+    const error = r.error || (engine === 'kiro' ? kiroInstallFailedMessage('?') : adapterInstallFailedMessage(engine, host, '?'));
     logger.warn('engine', `install-adapter ${sid}: ${ENGINE_LABEL[engine]} @ ${host || '本机'} 没装上：${error}`);
     const noted = rec ? noteInSession(sid, error, undefined, `adapter-install:${host || 'local'}:${engine}`) : false;
     return { ok: false, error, noted };
+  });
+
+  /**
+   * **三个引擎在一台机器上的状态**（`'local'` = 本机，否则远端 id）—— 新建会话选引擎处、设置 → 机器 → 本机那页用。
+   * 5 分钟缓存（`force` 跳过）；回 `{ ok, statuses: EngineStatus[] }`。
+   */
+  ipcMain.handle('engines:status', async (_event, machine?: string, opts?: { force?: boolean }) => {
+    try {
+      return { ok: true, statuses: await engineStatusesFor(String(machine || 'local'), !!opts?.force) };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /** 状态里的 ❌：直接装（和会话里「安装」同一份，`runEngineInstall`）。进度推 `engines:install-output`。 */
+  ipcMain.handle('engines:install', async (event, machine: string, engineArg: string) => {
+    const engine = engineArg === 'claude' || engineArg === 'codex' || engineArg === 'kiro' ? engineArg : null;
+    if (!engine) return { ok: false, error: tr('Unknown engine') };
+    const key = String(machine || 'local');
+    const remote = key === 'local' ? undefined : findRemoteTarget(KIROLEX_CONFIG_PATH, key);
+    if (key !== 'local' && !remote) return { ok: false, error: tr('Machine not found') };
+    const send = (chunk: string) => { try { event.sender.send('engines:install-output', { machine: key, engine, chunk }); } catch { /* 窗口没了 */ } };
+    logger.info('engines', `install ${engine} @ ${remote?.sshHost || '本机'}`);
+    const r = await runEngineInstall(remote, engine, send);
+    if (!r.ok) logger.warn('engines', `install ${engine} @ ${remote?.sshHost || '本机'} 没装上：${r.error}`);
+    return r;
+  });
+
+  /**
+   * 状态里的 ⚠️ / 会话里「没登录」的「登录」。
+   * 本机：开一个终端窗口跑那家的登录命令（登录要问的几句人自己答），回 `{ ok, opened: true }` —— 渲染层随后轮询状态，登上了自动重试。
+   * 远端：回 `{ ok, how }` —— 远端的登录在 KiroLex 里另有入口（🔑 登录 / 安装 AI 工具），这里给出去哪登。
+   */
+  ipcMain.handle('engines:login', async (_event, machine: string, engineArg: string) => {
+    const engine = engineArg === 'claude' || engineArg === 'codex' || engineArg === 'kiro' ? engineArg : null;
+    if (!engine) return { ok: false, error: tr('Unknown engine') };
+    const key = String(machine || 'local');
+    if (key !== 'local') {
+      const remote = findRemoteTarget(KIROLEX_CONFIG_PATH, key);
+      if (!remote) return { ok: false, error: tr('Machine not found') };
+      return { ok: true, how: remoteLoginHow(engine, remote.label || remote.sshHost || key) };
+    }
+    const cmd = localLoginArgv(engine);
+    if ('error' in cmd) return { ok: false, error: cmd.error };
+    const opened = await openLoginTerminal(cmd.argv, cmd.env);
+    logger.info('engines', `本机登录 ${engine}：${opened ? '开了终端' : '没能开终端'}（${cmd.argv.join(' ')}）`);
+    engineStatusCache.invalidate('local');
+    return opened
+      ? { ok: true, opened: true }
+      : { ok: false, error: tr('Could not open a terminal. Run this in a terminal yourself: {cmd}', { cmd: cmd.argv.join(' ') }) };
   });
 
   /**
@@ -14981,6 +15306,8 @@ app.whenReady().then(async () => {
     try {
       const saved = saveLocalBins(KIROLEX_CONFIG_PATH, bins || {});
       setLocalKiroBin(saved?.kiro);
+      /* 启动命令变了：本机引擎状态重新问 */
+      engineStatusCache.invalidate('local');
       logger.info('app', `本机启动命令：kiro=${saved?.kiro || '(默认)'} claude=${saved?.claude || '(默认)'} codex=${saved?.codex || '(默认)'}`);
       return { ok: true, bins: saved };
     } catch (err: any) {

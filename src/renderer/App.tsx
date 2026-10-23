@@ -50,6 +50,7 @@ import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
 import { engineLabel, engineCliName } from './engineLabel';
+import { EngineStatusPanel } from './components/EngineStatusPanel';
 
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
 const RUN_DONE_CARD_KEY = 'kirolex-run-done-card';
@@ -81,6 +82,10 @@ declare global {
       loadSession: (sessionId: string, cwd: string, model: string) => Promise<any>;
       installAdapter?: (sessionId: string, engine: string, remoteId?: string) => Promise<{ ok: boolean; error?: string; noted?: boolean }>;
       onAdapterInstallOutput?: (cb: (d: { sessionId: string; chunk: string }) => void) => () => void;
+      enginesStatus?: (machine: string, opts?: { force?: boolean }) => Promise<{ ok: boolean; statuses?: import('./engineStatusView').EngineStatusLite[]; error?: string }>;
+      enginesInstall?: (machine: string, engine: string) => Promise<{ ok: boolean; error?: string }>;
+      onEnginesInstallOutput?: (cb: (d: { machine: string; engine: string; chunk: string }) => void) => () => void;
+      enginesLogin?: (machine: string, engine: string) => Promise<{ ok: boolean; opened?: boolean; how?: string; error?: string }>;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
       persistNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
       readEvents?: (sessionId: string, limit?: number) => Promise<{ events: any[]; path: string; truncated: boolean }>;
@@ -4905,6 +4910,21 @@ const App: React.FC = () => {
                 )}
               </>
             )}
+            {/*
+              **提前标出能不能用** —— 原来都是建了会话、发了消息失败了才知道。按「将要运行的那台机器」（本机 / 选中的远端）问，
+              主进程缓存 5 分钟；❌ 点了直接装、⚠️ 点了登录（见 EngineStatusPanel）。
+            */}
+            {(() => {
+              const target = newChatRemoteId ? remoteTargets.targets.find((r) => r.id === newChatRemoteId) : undefined;
+              return (
+                <EngineStatusPanel
+                  compact
+                  machine={target ? target.id : 'local'}
+                  selected={newChatEngine}
+                  title={target ? t('Status on {machine}', { machine: target.label }) : t('Status on this computer')}
+                />
+              );
+            })()}
             <div className="actions">
               <button className="btn deny" onClick={() => setShowNewChat(false)}>{t('Cancel')}</button>
               <button className="btn allow" onClick={handleCreateChat}>{t('Create')}</button>
