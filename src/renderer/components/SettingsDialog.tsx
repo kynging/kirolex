@@ -622,7 +622,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             </div>
 
             <div className="settings-item">
-              <label className="settings-label">{t('Helper model (titles and prompt suggestions; does not affect the chat)')}</label>
+              <label className="settings-label">{t('Helper model, run by kiro-cli (titles and prompt suggestions for Kiro sessions; does not affect the chat)')}</label>
               <div className="settings-control">
                 <select
                   value={helperModel}
@@ -655,7 +655,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
             </div>
 
             <div className="settings-item">
-              <label className="settings-label">{t('Helper-model fallback (used when the main one is unavailable)')}</label>
+              <label className="settings-label">{t('Helper-model fallback, run by kiro-cli (used when the main one is unavailable)')}</label>
               <div className="settings-control">
                 <select
                   value={helperFallback}

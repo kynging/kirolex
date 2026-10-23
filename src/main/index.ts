@@ -15,6 +15,7 @@ import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockO
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
+import { pickEngineModel, reshapeProfileForEngine, withEngineModelUsed } from './engineModelPick.ts';
 import {
   CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
   remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
@@ -6193,6 +6194,20 @@ function wantedEngineOptions(profile: AgentProfile, comboEffort?: string): Array
   return out;
 }
 
+/** 适配器接受了这条会话记住的模型：记成「上次成功用的」（`engineModelsUsed`），没变就不写盘 */
+function rememberEngineModelUsed(sessionId: string, entry: SessionEntry, engine: 'claude' | 'codex', value: string): void {
+  const next = withEngineModelUsed(entry.profile, engine, value);
+  if (next === entry.profile) return;
+  entry.profile = next;
+  try {
+    const rec = store.readRecord(sessionId);
+    if (rec && engineOf(rec.profile) === engine) {
+      rec.profile = { ...rec.profile, engineModelsUsed: entry.profile.engineModelsUsed };
+      store.writeRecord(rec);
+    }
+  } catch (err) { logger.warn('engine-model', `记不住上次成功用的模型 sessionId=${sessionId}`, err); }
+}
+
 async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise<void> {
   const engine = engineOf(entry.profile);
   if (engine === 'kiro') return;
@@ -6210,6 +6225,33 @@ async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise
       });
       logger.info('mcp-combo', `组合「${combo.name}」effort -> ${r.value || '(未变)'} sessionId=${sessionId}`);
       if (r.notice) sessionNotice(sessionId, r.notice);
+      continue;
+    }
+    /*
+      **记住的模型这台机器的适配器没有** —— 原来静默跳过（审计 1b）。现在只在**本引擎清单**里兜底
+      （上次成功用的 → 适配器的 default / 当前值，`pickEngineModel`），并照 kiro 那句说一句；绝不拿 kiro 的兜底链来填。
+    */
+    if (cat === 'model') {
+      const pick = pickEngineModel(engine, want, entry.profile.engineModelsUsed?.[engine], opts);
+      if (!pick) continue;
+      try {
+        if (opts!.current !== pick.value) await entry.client.setSelectOption(entry.cliSessionId, 'model', pick.value);
+      } catch (err) {
+        logger.warn('engine-model', `重设 ${ENGINE_LABEL[engine]} model=${pick.value} 失败 sessionId=${sessionId}`, err);
+        continue;
+      }
+      if (pick.fallbackFrom) {
+        logger.info('engine-model', `${ENGINE_LABEL[engine]} 清单里没有记住的 ${want}（清单：${opts!.options.map((o) => o.value).join(', ')}）-> ${pick.value} sessionId=${sessionId}`);
+        modelFallback.note(sessionId, want, pick.value, trConcat(
+          tr('⚠️ {engine} here has no model "{wanted}", so this session uses "{model}" instead.', { engine: ENGINE_LABEL[engine], wanted: want, model: pick.value }),
+          NOTE_DETAIL_SEP,
+          tr('{engine} can use here: {list}{more}', { engine: ENGINE_LABEL[engine], list: trList(opts!.options.slice(0, 8).map((o) => o.value)), more: opts!.options.length > 8 ? '…' : '' })));
+        modelFallback.commit(sessionId);
+      } else {
+        modelFallback.wantedInUse(sessionId);   // 又用上你选的那个了：下次再换要重新说
+      }
+      /* 适配器接受了（或本来就是）这个 = 「上次成功用的」—— 兜底挑的也记，下次换到有它的机器先退回它；engineModels 里你选的不动 */
+      rememberEngineModelUsed(sessionId, entry, engine, pick.value);
       continue;
     }
     if (!opts || opts.current === want || !opts.options.some((o) => o.value === want)) continue;
@@ -11423,7 +11465,8 @@ app.whenReady().then(async () => {
     if (engine === 'kiro') throw new Error(tr('kiro sessions do not go through this path'));
     await entry.client.setSelectOption(entry.cliSessionId, category, value);
     entry.profile = category === 'model'
-      ? { ...entry.profile, engineModels: { ...entry.profile.engineModels, [engine]: value } }
+      /* 适配器刚接受了它 = 「上次成功用的」（记住的那个以后在别处没有时先退回它，`pickEngineModel`） */
+      ? { ...entry.profile, engineModels: { ...entry.profile.engineModels, [engine]: value }, engineModelsUsed: { ...entry.profile.engineModelsUsed, [engine]: value } }
       : {
         ...entry.profile,
         engineOptions: { ...entry.profile.engineOptions, [engine]: { ...entry.profile.engineOptions?.[engine], [category]: value } },
@@ -11717,22 +11760,8 @@ app.whenReady().then(async () => {
    * 自己的记录重建（随下一条消息带过去）。对话一条都不动。没连着的会话只改记录 —— 下次打开时
    * 按新引擎起（和「运行位置」那条路一样，「没连上也应该能切」）。
    */
-  /* kiro 的模型 id / agent 对另外两家没意义；切回 kiro 时用你选过的偏好模型 */
-  const reshapeForEngine = (p: AgentProfile, engine: Engine): AgentProfile => {
-    const next: AgentProfile = { ...p };
-    if (engine === 'kiro') {
-      delete (next as any).engine;
-      const pref = p.preferredModel && p.preferredModel !== 'default' ? p.preferredModel : DEFAULT_MODEL;
-      next.model = pref;
-      next.preferredModel = pref;
-      next.modelEarnedOn = undefined;
-    } else {
-      (next as any).engine = engine;
-      next.model = 'default';
-      next.kiroAgent = undefined;
-    }
-    return next;
-  };
+  /* kiro 的模型 id / agent 对另外两家没意义；切回 kiro 时用你选过的偏好模型；各引擎记住的模型互不覆盖（engineModelPick.ts） */
+  const reshapeForEngine = (p: AgentProfile, engine: Engine): AgentProfile => reshapeProfileForEngine(p, engine, DEFAULT_MODEL);
   const switchEngineImpl = async (sessionId: string, engineArg: string, hint?: ColdRecordHint, fromPending?: boolean): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-engine'); if (advRefused) throw new Error(advRefused); }
     const engine = engineOf({ engine: engineArg });
@@ -13194,8 +13223,15 @@ app.whenReady().then(async () => {
       const derived = derivedProjectFor(sessionId, resolvedCwd);
       /* 你亲手移出项目的，不按目录再反推回去（见 `AgentProfile.unassigned`） */
       const projectId = existing?.profile.projectId ?? (existing?.profile.unassigned ? undefined : derived);
+      /*
+        **Claude Code / Codex 会话不采信渲染层带来的模型名** —— 渲染层 attach 带的是 kiro 的（没记过就是 DEFAULT_MODEL），
+        原来它会被当成"实际起来的模型"写进这条会话的记录（连 `modelEarnedOn` 一起）。它们的模型由 `engineModels` +
+        适配器清单定（`applyEngineModel`）；记录里的旧值（老记录可能是个 kiro id）只是读着忽略，不改写 ——
+        这里用记录里的值，下面「persist effective model」那段比对相等，就什么都不写。
+      */
+      const nonKiroAttach = engineOf(existing.profile) !== 'kiro';
       const profile: AgentProfile = {
-        model: model || existing?.profile.model || DEFAULT_MODEL,
+        model: nonKiroAttach ? (existing.profile.model || 'default') : (model || existing?.profile.model || DEFAULT_MODEL),
         // ONLY a recorded preference, else the default. Deliberately does NOT fall
         // back to `model` or `existing.profile.model`: both carry the EFFECTIVE
         // model, which after an automatic fallback is a model the user never chose.
@@ -13218,6 +13254,7 @@ app.whenReady().then(async () => {
         ...(existing?.profile.engine ? { engine: existing.profile.engine } : {}),
         /* 同一张白名单：漏了的话手选的模型 / effort / 模式一重连就丢（实测：选了 sonnet，重启后回到 opus） */
         ...(existing?.profile.engineModels ? { engineModels: existing.profile.engineModels } : {}),
+        ...(existing?.profile.engineModelsUsed ? { engineModelsUsed: existing.profile.engineModelsUsed } : {}),
         ...(existing?.profile.engineOptions ? { engineOptions: existing.profile.engineOptions } : {}),
         /* 同一张白名单：所选「组合」（漏了的话一重启就回到「通用」） */
         ...(existing?.profile.mcpCombo ? { mcpCombo: existing.profile.mcpCombo } : {}),

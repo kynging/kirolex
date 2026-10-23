@@ -5,6 +5,8 @@ export const ZH_INDEX_A: Record<string, string> = {
   'The model/Agent switch for this session has not finished after 30 seconds, so it cannot connect right now.': '会话切换模型/Agent 超过 30 秒仍未完成，暂时无法连接。',
   '⚠️ This machine has no model "{wanted}", so this session uses "{model}" instead.': '⚠️ 本机没有模型「{wanted}」，这条会话改用「{model}」。',
   'Available here: {list}{more}': '本机可用：{list}{more}',
+  '⚠️ {engine} here has no model "{wanted}", so this session uses "{model}" instead.': '⚠️ 这台机器上的 {engine} 没有模型「{wanted}」，这条会话改用「{model}」。',
+  '{engine} can use here: {list}{more}': '这台机器上的 {engine} 可选：{list}{more}',
   '\nNo Claude model and no `auto` in the list: usually your outbound IP is region-filtered (switching kiro-cli versions won\'t help). To use Claude, move this session to a remote machine.': '\n清单里没有任何 Claude 和 `auto`：通常是出口 IP 被按地区过滤（换 kiro-cli 版本没用）。要用 Claude，把这条会话切到远端。',
   '\n…[{n} characters omitted]…\n': '\n…[省略 {n} 字符]…\n',
   ' (the largest tool output was {k}K characters, likely what broke it; next time add `--query` / `| head` to that command)': '（最大一次工具输出 {k}K 字符，多半是它导致的；下次给那条命令加 `--query` / `| head` 截短）',

@@ -43,6 +43,7 @@ import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
 import { busyEnterKind, busyEnterRoute, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
 import { carryControlMark, controlMessageId, isControlMessageId, type MarkOrigin } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
+import { newChatModel } from '../main/engineModelPick.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
 import { pickQueuedBatch, sealRetryBatch, editQueuedItem, QueueBackoff, isDuplicateMessageError, type RetryBatch } from './queueRetry';
 import { noteSessionLocally } from './hooks/useSessionNotice';
@@ -2596,17 +2597,13 @@ const App: React.FC = () => {
    * 清单问不到（还没探过那台机器）时就直接用候选第一个：那时候没有依据说它不可用，
    * 而主进程起会话时还会再验一遍（`pickRemoteModel`），不会静默跑错。
    */
+  /* 只对 kiro 挑（`engineModelPick.ts` newChatModel）：Claude Code / Codex 不塞 kiro 的模型 id，由 engineModels + 适配器清单定 */
   const modelForNewChat = useCallback((targetId?: string): string => {
-    let wanted = 'claude-opus-5';   // 必须等于主进程的 DEFAULT_MODEL
-    try { wanted = uiGet('kirolex-last-model') || wanted; } catch {}
-    /* 兜底链和主进程的 MODEL_FALLBACK_ORDER 一致 */
-    const candidates = [wanted, 'claude-opus-5', 'gpt-5.6-sol', 'gpt-5.6-terra', 'deepseek-3.2']
-      .filter((m, i, a) => m && a.indexOf(m) === i);
+    let wanted: string | undefined;
+    try { wanted = uiGet('kirolex-last-model') || undefined; } catch {}
     const list = targetId ? (modelsByMachine[targetId] || []) : models;
-    if (!list.length) return candidates[0];
-    const ids = new Set(list.map((m: any) => m?.model_id).filter(Boolean));
-    return candidates.find((m) => ids.has(m)) || candidates[0];
-  }, [models, modelsByMachine]);
+    return newChatModel(newChatEngine, wanted, list.map((m: any) => m?.model_id).filter(Boolean));
+  }, [models, modelsByMachine, newChatEngine]);
 
   const handleNewSessionInProject = useCallback((project: string) => {
     const target = remoteTargets.targets.find((t) => t.id === newChatRemoteId);

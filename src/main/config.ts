@@ -104,6 +104,9 @@ export interface AgentProfile {
   /** Claude Code / Codex 会话里手动选的模型（按引擎分开记：换引擎不会把 claude 的模型名塞给 codex）。
    *  每次连上之后重新设一次 —— 适配器进程是新的，它只记得自己 CLI 的默认值。 */
   engineModels?: { claude?: string; codex?: string };
+  /** 上面那个上次**真设上了**的值（适配器接受了）—— 记住的那个在这台机器的适配器清单里没有时，先退回它
+   *  （`engineModelPick.ts` `pickEngineModel`）。只记本引擎清单里的值，不碰 kiro 的 `model` / `preferredModel`。 */
+  engineModelsUsed?: { claude?: string; codex?: string };
   /** 同上，effort（`thought_level`）和权限模式（`mode`）—— 顶上那颗按钮在这两家就是 mode 下拉。 */
   engineOptions?: {
     claude?: { thought_level?: string; mode?: string };

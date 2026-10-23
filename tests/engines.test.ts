@@ -265,8 +265,9 @@ describe('已有会话换引擎 ——「我还需要现有会话也能切换 ag
     assert.ok(body.indexOf('await client.newSession(') < body.indexOf('await retireExecutor(oldEntry.client)'), '先起新的、再断旧的');
     assert.match(body, /restoreContextAfterExecutorSwap\(sessionId, 'switch-engine'\);/);
     assert.match(body, /webContents\.send\('session:engine-changed', \{ sessionId, engine \}\)/);
-    /* kiro 的模型 / agent 对另外两家没意义；切回 kiro 用偏好模型 */
-    assert.match(body, /next\.model = 'default';\s*next\.kiroAgent = undefined;/);
+    /* kiro 的模型 / agent 对另外两家没意义；切回 kiro 用偏好模型（实现挪到了 engineModelPick.ts，行为测试在 engineModelPick.test.ts） */
+    assert.match(body, /reshapeProfileForEngine\(p, engine, DEFAULT_MODEL\)/);
+    assert.match(read('src', 'main', 'engineModelPick.ts'), /next\.model = 'default';\s*next\.kiroAgent = undefined;/);
   });
 
   test('界面：右键「运行引擎」三选一，换完 tag 当场变', () => {
