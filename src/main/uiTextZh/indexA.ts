@@ -78,6 +78,7 @@ export const ZH_INDEX_A: Record<string, string> = {
   'No sessions selected.': '没选会话。',
   'None of the selected sessions are in the bucket any more.': '选的这些桶里已经没有了。',
   'Invalid session id.': '会话 id 不合法。',
+  'Not confirmed.': '没有确认。',
   'This session is in the middle of a turn. Wait for it to finish before restoring, or the unsaved part of this turn will be lost.':
     '这条会话正在跑一轮 —— 等它跑完再恢复，不然这一轮还没落盘的内容会丢。',
   'This backup has already been deleted ({when}); the catalog had not been cleaned up. It has now been removed from the list.': '这条备份已经被删除（{when}），目录没清干净 —— 已经从列表里移除。',

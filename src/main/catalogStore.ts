@@ -106,7 +106,11 @@ export async function updateCatalog(
     let before = emptyCatalog();
     if (got) {
       try { before = parseCatalog(got.text); }
-      catch (err) { if (opts.onCorrupt !== 'empty') throw err; }
+      catch (err) {
+        if (opts.onCorrupt !== 'empty') throw err;
+        /* 读不懂、当空的重建：记下重建的时刻 —— 重建前的设备清单丢了，云端自动清理要据此停一阵（见 cloudTrash.ts 的 rebuiltAt） */
+        before = { ...emptyCatalog(), rebuiltAt: now() };
+      }
     }
     before = normalizeCatalog(before, now());
     const next = normalizeCatalog(await mutate(before), now());
@@ -242,12 +246,24 @@ export async function missingEntries(
  */
 export async function writeSyncCatalog(
   bucket: CatalogBucket, prefix: string | undefined, fresh: CatalogEntry[], now = Date.now(),
+  /** 同一次写里再改一点（云端自动清理：并进本机的现存会话清单，见 cloudTrash.ts）。作用在合并之后的那份上，每次重试都重做。 */
+  decorate?: (c: Catalog) => Catalog,
 ): Promise<UpdateResult & { removed: Array<{ id: string; title: string; deletedAt: number }> }> {
   let present: Set<string> | null = null;
   try { present = await bucket.sessionIds(); } catch { present = null; }   // 列不出来就不清理，照常写
   let candidates: Array<{ id: string; title: string; deletedAt: number }> = [];
   const r = await updateCatalog(catalogIO(bucket, prefix), async (latest) => {
+    /*
+      **catalog 不见了、桶里却已经有备份 / 云端回收站** → 当成重建处理，记 rebuiltAt（和读不懂时一样）：
+      各设备的清单都没了，云端自动清理要停一阵（见 cloudTrash.ts）。全新的桶（什么都没有）不算。
+    */
+    if (latest.rebuiltAt === undefined && !(latest.entries || []).length && !latest.devices && !(latest.deleted || []).length) {
+      let hasData = !!present?.size;
+      if (!hasData) { try { hasData = (await bucket.list(`${joinPrefix(prefix)}${LAYOUT}/trash/`)).length > 0; } catch { hasData = true; } }
+      if (hasData) latest = { ...latest, rebuiltAt: now };
+    }
     let next = mergeCatalog(latest, fresh);
+    if (decorate) next = decorate(next);
     candidates = [];
     if (present) {
       /*

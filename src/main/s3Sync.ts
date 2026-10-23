@@ -83,6 +83,13 @@ export interface SyncConfig {
    * 存"排除"，新会话默认跟着同步；已经传上去的不删，只是不再继续传。
    */
   excludeSessions?: string[];
+  /**
+   * **云端自动清理**（见 `cloudTrash.ts`）：所有活跃设备上都没有了的会话移进云端回收站，到期彻底删除。
+   * 缺省 = 开；活跃设备 = 最近 `activeDeviceDays`（缺省 90）天同步过的；回收站保留 `cloudTrashDays`（缺省 30）天。
+   */
+  autoCleanCloud?: boolean;
+  activeDeviceDays?: number;
+  cloudTrashDays?: number;
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;
@@ -149,6 +156,11 @@ export interface CatalogEntry {
    * 老条目没有 → 0（有删除记录时一律当删除更新）。
    */
   uploadedAt?: number;
+  /**
+   * 这条是什么时候从**云端回收站**恢复回来的（见 `cloudTrash.ts`）。在这之前写下的删除记录不再算数 ——
+   * 不然刚恢复回来，下一轮同步又按同一批旧删除记录把它移回回收站。
+   */
+  restoredFromTrashAt?: number;
 }
 
 /**
@@ -158,11 +170,35 @@ export interface CatalogEntry {
  */
 export interface Tombstone { id: string; at: number }
 
+/**
+ * 一台机器的「本机现存会话清单」——「所有设备上都已不存在的会话，自动移进云端回收站」的判据。
+ * 只记 id + 位置 + 这台机器上次同步的时间，外加本机的删除记录（id + 删除时刻）。判定逻辑在 `cloudTrash.ts`。
+ */
+export interface DeviceManifest {
+  /** 设备 ID（每个本机数据目录一个，见 `cloudTrash.loadOrCreateDeviceId`）—— 也是 `Catalog.devices` 里的键。 */
+  machine: string;
+  /** 主机名标签（`machineTag`），只用来显示。 */
+  host?: string;
+  /** 这台机器最后一次同步（写这份清单）的时刻 —— 它自己的时钟。 */
+  syncedAt: number;
+  /** 这台机器上现在有的会话：项目里的、未分组的、已归档的都在（不同步的也在 —— 它们仍然存在）。 */
+  sessions: Array<{ id: string; project?: string; archived?: boolean }>;
+  /** 本机删过的会话和删除时刻（tombstone）。 */
+  deleted: Tombstone[];
+}
+
 export interface Catalog {
   version: 1;
   entries: CatalogEntry[];
   /** 删除记录。老 catalog 没有。 */
   deleted?: Tombstone[];
+  /**
+   * 这份 catalog 是什么时候因为读不懂、被当成空的**重建**的（`catalogStore.updateCatalog` 的 onCorrupt: 'empty'）。
+   * 重建前各设备的清单都丢了：云端自动清理在之后一个活跃期限内整个停下（见 `cloudTrash.ts`）。
+   */
+  rebuiltAt?: number;
+  /** 每台机器的现存会话清单（按设备 ID）。老 catalog 没有。 */
+  devices?: Record<string, DeviceManifest>;
 }
 
 /**
@@ -489,7 +525,10 @@ export function mergeCatalog(old: Catalog | null, fresh: CatalogEntry[]): Catalo
   for (const e of old?.entries || []) byId.set(e.id, e);
   for (const e of fresh) byId.set(e.id, e);
   const entries = Array.from(byId.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  /* 别的字段（删除记录 deleted 等）原样带着 —— 丢了删除记录，删掉的条目就会被别的机器的旧条目复活 */
+  /*
+    别的字段原样带着：删除记录 deleted（丢了，删掉的条目就会被别的机器的旧条目复活）、
+    各机器的现存会话清单 devices（丢了就等于"清单读不到"，云端清理会停下来）
+  */
   return { ...(old || {}), version: 1, entries };
 }
 

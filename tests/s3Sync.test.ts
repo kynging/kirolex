@@ -327,11 +327,11 @@ describe('接线', () => {
     const body = M.slice(at, M.indexOf('rescheduleS3Sync', at));
     /* **写** catalog 在文件之后。注意现在 catalog 还会被**先读一次**（冲突检测要在覆盖之前
        知道桶里是什么），所以判据是写 catalog 那一步（`writeSyncCatalog`，写前重读再合并）的位置，不是 `catalogKey(` 的位置。 */
-    assert.ok(body.indexOf('writeSyncCatalog(') > 0, '同步写 catalog 走 writeSyncCatalog');
-    assert.ok(
-      body.indexOf('for (const rel of plan.upload)') < body.indexOf('writeSyncCatalog('),
-      '写 catalog 要排在文件之后',
-    );
+    const upload = body.indexOf('for (const rel of uploadList)');
+    const write = body.indexOf('writeSyncCatalog(');
+    assert.ok(write > 0, '同步写 catalog 走 writeSyncCatalog');
+    assert.ok(upload > 0, '找得到传文件那一步 —— 找不到时 -1 < n 恒为真，这条就成了空过');
+    assert.ok(upload < write, '写 catalog 要排在文件之后');
   });
 
   test('同步不可重入（定时器和按钮会同时点）', () => {
@@ -840,8 +840,11 @@ describe('配置页只留有信息量的文字', () => {
   });
 
   test('Secret 那条只留"需要哪些权限"——那是你真要去授的东西', () => {
-    assert.match(shown, /t\('Needs s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject\.'\)/);
+    assert.match(shown, /t\('Needs s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject\./);
     assert.match(ZHP, /需要 s3:PutObject \/ GetObject \/ ListBucket \/ DeleteObject。/);
+    /* 开了版本控制的桶，云端回收站按版本删原件 / 回收站文件，还要这两条（见 cloudTrash.ts 的 deleteAllVersions） */
+    assert.match(shown, /s3:ListBucketVersions \/ DeleteObjectVersion/);
+    assert.match(ZHP, /s3:ListBucketVersions \/ DeleteObjectVersion/);
     /* DeleteObject 要在里面：测连通现在写完会删掉那个对象 */
     assert.match(shown, /DeleteObject/);
   });
@@ -945,7 +948,8 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
   });
 
   test('两个 tab，而且恢复那张表是切过去才拉', () => {
-    assert.match(UI5, /useState<'sync' \| 'restore'>\('sync'\)/);
+    /* 第三个 tab 是「云端回收站」（cloudTrash.test.ts）；默认仍停在同步 */
+    assert.match(UI5, /useState<'sync' \| 'restore' \| 'trash'>\('sync'\)/);
     assert.match(UI5, /className="backup-tabs"/);
     /* 列表是一次网络请求，只开同步 tab 的人不该付这个钱 */
     assert.match(UI5, /if \(tab === 'restore' && !entries\) void loadBackups\(\);/);

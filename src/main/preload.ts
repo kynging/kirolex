@@ -101,6 +101,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
   deleteS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:delete-sessions', ids),
   forgetS3Backups: (ids: string[]) => ipcRenderer.invoke('s3:forget-backups', ids),
   keepLocalS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:keep-local', ids),
+  /** 云端自动清理：参与判定 / 已忽略的设备；云端回收站的列出、恢复到云端备份、立即彻底删除（要把目录名原样传回来） */
+  s3CloudDevices: () => ipcRenderer.invoke('s3:cloud-devices'),
+  listS3CloudTrash: () => ipcRenderer.invoke('s3:list-cloud-trash'),
+  restoreS3CloudTrash: (dir: string) => ipcRenderer.invoke('s3:restore-cloud-trash', dir),
+  purgeS3CloudTrash: (dir: string, confirm: string) => ipcRenderer.invoke('s3:purge-cloud-trash', dir, confirm),
   /** 同步时自动合并改了这条会话的 transcript —— 界面缓存要扔掉重读 */
   onSessionHistoryChanged: (callback: (d: { sessionId: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

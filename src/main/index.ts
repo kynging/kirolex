@@ -40,13 +40,19 @@ import {
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
   decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
+import {
+  cleanupSettings, buildDeviceManifest, withDeviceManifest, describeDevices, runCloudCleanup, listCloudTrash,
+  restoreFromCloudTrash, purgeCloudTrashItem, noteDeletion, forgetDeletion, readDeletionMarks, writeDeletionMarks,
+  pruneDeletionMarks, deletionsFromTrashNames, loadOrCreateDeviceId,
+  type BucketOps, type CleanupResult,
+} from './cloudTrash.ts';
 import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
 import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
 import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
-import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
+import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
 import {
   serialQueue, catalogIO, updateCatalog, readCatalog, deleteSessionBackups, writeSyncCatalog, forgetMissingEntries,
   missingEntries, markMissing, sessionIdsFromPrefixes, sessionKeyPrefix, entryUploadedAt, syncMark, type CatalogBucket,
@@ -5315,6 +5321,52 @@ const S3_MARKS_PATH = path.join(KIROLEX_HOME, 's3-session-sync.json');
 const S3_COMBOS_MARK_PATH = path.join(KIROLEX_HOME, 's3-combos-sync.json');
 /** agent-profiles 每个文件上次同步完两边的内容摘要（`agentProfileSync.ts` 的 `ProfileMarks`） */
 const S3_PROFILES_MARK_PATH = path.join(KIROLEX_HOME, 's3-agent-profiles-sync.json');
+/**
+ * 本机删过哪些会话、什么时候删的（`cloudTrash.ts` 的删除记录）—— 云端自动清理靠它区分「删掉了」和「没见过」。
+ * 不能用 `deleted-sessions.json`：那份在会话目录真的移走之后就清掉了。
+ */
+const S3_DELETED_AT_PATH = path.join(KIROLEX_HOME, 's3-deleted-at.json');
+/** 本机数据目录的设备 ID（清单按它存；主机名只用来显示）—— 同名电脑不会互相覆盖清单，见 `cloudTrash.loadOrCreateDeviceId`。 */
+const DEVICE_ID_PATH = path.join(KIROLEX_HOME, 'device-id.json');
+function thisDeviceId(): string {
+  return loadOrCreateDeviceId(DEVICE_ID_PATH, machineTag(os.hostname()), () => crypto.randomUUID().replace(/-/g, '').slice(0, 16));
+}
+
+/** 云端清理用的 S3 操作（`cloudTrash.ts` 的 `BucketOps`）。 */
+function bucketOps(creds: S3Creds): BucketOps {
+  return {
+    list: (p) => listObjects(creds, p),
+    get: (k) => getObjectIfExists(creds, k),
+    put: (k, body, type) => putObject(creds, k, body, type),
+    del: (k) => deleteObject(creds, k),
+    getWithEtag: (k) => getObjectWithEtag(creds, k),
+    putIf: (k, body, type, cond) => putObjectIf(creds, k, body, type, cond),
+    delIf: (k, etag) => deleteObjectIf(creds, k, etag),
+    delVersion: (k, versionId) => deleteObjectVersion(creds, k, versionId),
+    listVersions: (k) => listObjectVersions(creds, k),
+    listVersionKeys: (p) => listVersionedKeys(creds, p),
+  };
+}
+
+/**
+ * 这台机器的「本机现存会话清单」：项目里的、未分组的、已归档的、设成不同步的、KiroLex Advanced 的都算"有"——
+ * 再加上 sessions/ 下所有目录（记录读不出来的也算有：宁可多报"有"，不可少报）。
+ * 删除记录：本机那张表 + 本机回收站里 `<id>__<时间>` 的目录名（补上这张表出现之前删的）。
+ */
+function thisDeviceManifest(deviceId: string, host: string, now: number) {
+  const recs = store.listSessions();
+  const sessions: Array<{ id: string; project?: string; archived?: boolean }> = recs.map((r) => ({ id: r.id, project: projectOf(r) || undefined, archived: !!r.archived }));
+  for (const id of store.listAdvancedOnlyIds()) sessions.push({ id });
+  for (const id of walkDirs(path.join(KIROLEX_HOME, 'sessions'))) if (/^[\w.-]{1,120}$/.test(id)) sessions.push({ id });
+  const marks = pruneDeletionMarks(readDeletionMarks(S3_DELETED_AT_PATH), now);
+  writeDeletionMarks(S3_DELETED_AT_PATH, marks);
+  let trashNames: string[] = [];
+  try { trashNames = fs.readdirSync(SESSION_TRASH_DIR); } catch { /* 没有回收站 */ }
+  const fromTrash = deletionsFromTrashNames(trashNames);
+  const deletions = { ...fromTrash };
+  for (const [id, at] of Object.entries(marks)) deletions[id] = Math.max(deletions[id] || 0, at);
+  return buildDeviceManifest(deviceId, now, sessions, deletions, host);
+}
 
 function loadSyncConfig(): SyncConfig {
   try {
@@ -5399,7 +5451,7 @@ let syncTimer: NodeJS.Timeout | null = null;
  */
 let syncFailures = 0;
 let syncNextAllowedAt = 0;
-let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string } | null = null;
+let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number } | null = null;
 
 /**
  * 跑一轮同步。
@@ -5453,6 +5505,30 @@ function refuseAdvancedOnly(sessionId: string, what: string): string | null {
  */
 function cloudAdvancedBackups(creds: S3Creds, prefix: string | undefined, ids: Iterable<string>) {
   return findAdvancedBackups(ids, (id) => getObjectIfExists(creds, keyFor(prefix, path.join('sessions', id, 'record.json'))));
+}
+
+/**
+ * **云端自动清理不动的那些** —— KiroLex Advanced 的会话（本机藏着的、云上 record.json 是 advanced 的、
+ * 归在 advanced 专属项目里的），以及 record.json 读不出来的（确认不了用途 = 不清）。只对候选查，不是每条都读。
+ */
+async function cloudCleanupSpare(creds: S3Creds, prefix: string | undefined, ids: string[]): Promise<Set<string>> {
+  const hidden = store.listAdvancedOnlyIds();
+  /* 和 cloudAdvancedBackups 同一个判据，但桶里**没有** record.json 也算读不出来（拿不准 = 不清） */
+  const cloud = await findAdvancedBackups(ids.filter((id) => !hidden.has(id)), async (id) => {
+    const b = await getObjectIfExists(creds, keyFor(prefix, path.join('sessions', id, 'record.json')));
+    if (!b) throw new Error('no record.json');
+    return b;
+  });
+  let inAdvancedProject = new Set<string>();
+  try {
+    const raw = await getObjectIfExists(creds, catalogKey(prefix));
+    const catalog = raw ? JSON.parse(raw.toString('utf-8')) as Catalog : null;
+    const want = new Set(ids);
+    const mine = (catalog?.entries || []).filter((e) => want.has(e.id));
+    const advanced = store.advancedOnlyProjectsAmong(mine.map((e) => e.project || ''));
+    inAdvancedProject = new Set(mine.filter((e) => advanced.has(e.project || '')).map((e) => e.id));
+  } catch { return new Set(ids); }   // 读不懂 catalog：这一轮全都不动
+  return new Set(ids.filter((id) => hidden.has(id) || cloud.advanced.has(id) || cloud.unreadable.has(id) || inAdvancedProject.has(id)));
 }
 
 /**
@@ -5852,7 +5928,7 @@ function walkDirs(dir: string): string[] {
   try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; }
 }
 
-async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string }> {
+async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
     logger.info('s3', `跳过这一次定时同步（连续失败 ${syncFailures} 次，退避到 ${new Date(syncNextAllowedAt).toLocaleTimeString()}）`);
@@ -6076,7 +6152,10 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       const at = entryUploadedAt(e.id, uploadedAtBySession, marks);
       return at ? { ...e, uploadedAt: at } : e;
     });
-    const wrote = await catalogQueue(() => writeSyncCatalog(catalogBucket(creds!, cfg.prefix), cfg.prefix, fresh));
+    /* 本机现存会话清单跟着同一次条件写一起写（云端自动清理的判据，见 cloudTrash.ts）—— 并进的是桶里现在那份 */
+    const manifest = thisDeviceManifest(thisDeviceId(), thisMachine, Date.now());
+    const wrote = await catalogQueue(() => writeSyncCatalog(catalogBucket(creds!, cfg.prefix), cfg.prefix, fresh, Date.now(),
+      (c) => withDeviceManifest(c, manifest)));
     for (const r of wrote.removed) {
       logger.warn('s3', `catalog 里「${r.title}」(${r.id}) 在桶里已经没有文件（${new Date(r.deletedAt).toLocaleString()} 删掉的），从目录里移除`);
     }
@@ -6110,16 +6189,39 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       }
       writeSessionMarks(S3_MARKS_PATH, marks);
     }
+    /*
+      **云端自动清理** —— 所有活跃设备上都没有了的会话移进云端回收站，到期的彻底删除（`cloudTrash.ts`）。
+      放在 catalog 写完之后：判定要用到本机这一轮的清单。出错不算同步失败，只写日志。
+    */
+    const clean = cleanupSettings(cfg);
+    let cleanup: CleanupResult | null = null;
+    if (clean.enabled) {
+      try {
+        cleanup = await runCloudCleanup(bucketOps(creds!), {
+          prefix: cfg.prefix, now: Date.now(), settings: clean, thisMachine, deviceId: thisDeviceId(),
+          spare: (cand) => cloudCleanupSpare(creds!, cfg.prefix, cand),
+          log: (level, msg) => logger[level]('s3', msg),
+        });
+        if (cleanup.blocked) logger.info('s3', `云端清理这一轮不移任何会话：${cleanup.blocked}`);
+      } catch (err: any) {
+        logger.warn('s3', `云端清理没跑成（不影响备份）：${err?.message || err}`);
+      }
+    }
     syncFailures = 0;
     syncNextAllowedAt = 0;
     lastSyncSummary = {
       at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
       ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
+      ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
     };
     logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`
-      + `${memoryPulled ? `，从桶里拉回 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步）` : ''}`);
+      + `${memoryPulled ? `，从桶里拉回 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步）` : ''}`
+      + `${cleanup ? `；这次有 ${cleanup.trashed.length} 条移进云端回收站、${cleanup.purged.length} 条到期清空` : ''}`);
     mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
-    return { ok: true, uploaded, skipped: plan.skippedUnchanged };
+    return {
+      ok: true, uploaded, skipped: plan.skippedUnchanged,
+      ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
+    };
   } catch (err: any) {
     const hint = err instanceof S3Error ? `\n${err.hint}` : '';
     const message = `${err?.message || err}${hint}`;
@@ -7684,6 +7786,10 @@ app.whenReady().then(async () => {
       hasSecret: !!cfg.secretCipher,
       encryptionAvailable: safeStorage.isEncryptionAvailable(),
       last: lastSyncSummary,
+      /* 云端自动清理（cloudTrash.ts）：开关默认开、活跃设备 90 天、回收站保留 30 天 */
+      autoCleanCloud: cleanupSettings(cfg).enabled,
+      activeDeviceDays: cleanupSettings(cfg).activeDays,
+      cloudTrashDays: cleanupSettings(cfg).trashDays,
     };
   });
 
@@ -7726,6 +7832,10 @@ app.whenReady().then(async () => {
       next.secretCipher = encryptSecret(input.secretAccessKey.trim());
     }
     if (input?.clearSecret) delete next.secretCipher;
+    /* 云端自动清理的三项，同样"键在 input 里才动它"；天数按 cleanupSettings 的规矩收（1–3650，乱填回默认） */
+    if (input?.autoCleanCloud !== undefined) next.autoCleanCloud = !!input.autoCleanCloud;
+    if (input?.activeDeviceDays !== undefined) next.activeDeviceDays = cleanupSettings({ activeDeviceDays: input.activeDeviceDays }).activeDays;
+    if (input?.cloudTrashDays !== undefined) next.cloudTrashDays = cleanupSettings({ cloudTrashDays: input.cloudTrashDays }).trashDays;
     saveSyncConfig(next);
     rescheduleS3Sync();
     logger.info('s3', `配置已保存 bucket=${next.bucket} region=${next.region} key=${maskKeyId(next.accessKeyId)}`
@@ -8072,6 +8182,73 @@ app.whenReady().then(async () => {
   });
 
   /**
+   * **参与云端清理判定的设备 / 已忽略的设备** —— 设置页列出来（catalog 里每台机器的清单，见 cloudTrash.ts）。
+   */
+  ipcMain.handle('s3:cloud-devices', async () => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { devices: [], unknown: [], error: problem };
+    const cfg = loadSyncConfig();
+    try {
+      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+      const catalog = raw ? JSON.parse(raw.toString('utf-8')) as Catalog : null;
+      const r = describeDevices(catalog, Date.now(), cleanupSettings(cfg).activeDays);
+      return { ...r, thisDevice: thisDeviceId() };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { devices: [], unknown: [], error: `${err?.message || err}${hint ? `
+${hint}` : ''}` };
+    }
+  });
+
+  /** 云端回收站里有什么、进回收站的时间、还剩几天。 */
+  ipcMain.handle('s3:list-cloud-trash', async () => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { items: [], error: problem };
+    const cfg = loadSyncConfig();
+    const clean = cleanupSettings(cfg);
+    try {
+      const items = await listCloudTrash(bucketOps(creds!), cfg.prefix, Date.now(), clean.trashDays);
+      return { items: items.map(({ keys: _keys, meta: _meta, ...x }) => x), trashDays: clean.trashDays, enabled: clean.enabled };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { items: [], error: `${err?.message || err}${hint ? `
+${hint}` : ''}` };
+    }
+  });
+
+  /** 云端回收站 → 恢复到云端备份（移回原位置）。只动桶里的东西，本地不动。 */
+  ipcMain.handle('s3:restore-cloud-trash', async (_event, dir: string) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    if (typeof dir !== 'string' || !dir) return { ok: false, error: tr('Invalid session id.') };
+    const cfg = loadSyncConfig();
+    try {
+      const r = await restoreFromCloudTrash(bucketOps(creds!), cfg.prefix, dir, Date.now(), (level, msg) => logger[level]('s3', msg));
+      return { ok: true, ...r };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `
+${hint}` : ''}` };
+    }
+  });
+
+  /** 云端回收站 → 立即彻底删除。界面确认过一次，这一层再要求把目录名原样传回来（同 s3:delete-project）。 */
+  ipcMain.handle('s3:purge-cloud-trash', async (_event, dir: string, confirm?: string) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    if (typeof dir !== 'string' || !dir || confirm !== dir) return { ok: false, error: tr('Not confirmed.') };
+    const cfg = loadSyncConfig();
+    try {
+      const r = await purgeCloudTrashItem(bucketOps(creds!), cfg.prefix, dir, (level, msg) => logger[level]('s3', msg));
+      return { ok: true, ...r };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `
+${hint}` : ''}` };
+    }
+  });
+
+  /**
    * 把一条会话恢复回本地。**覆盖同 id**（用户选的），但覆盖前先挪进 trash。
    *
    * 不恢复正在连着的那条：它的执行器手上握着 transcript，覆盖文件只会让内存和磁盘打架。
@@ -8279,6 +8456,7 @@ app.whenReady().then(async () => {
       /* 以前在这台机器上删过它的话，墓碑会让它在水化时继续隐身 —— 恢复就是要它回来 */
       clearSessionTombstone(sessionId);
       deletedSessionIds.delete(sessionId);
+      forgetDeletion(S3_DELETED_AT_PATH, sessionId);   // 本机又有它了，之前的删除记录作废（云端清理的判据）
 
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
@@ -10841,6 +11019,8 @@ app.whenReady().then(async () => {
     // transcript open — disconnect is asynchronous) the chat used to come back on
     // the next boot. The tombstone hides it and gets the removal retried.
     addSessionTombstone(sessionId);
+    // 带时间的删除记录（不随墓碑清掉）：别的机器同步时据此认出「这条是被删掉的」，见 cloudTrash.ts
+    noteDeletion(S3_DELETED_AT_PATH, sessionId, Date.now());
     // WAIT for the executor to really be gone before touching the directory.
     // kiro-cli's working directory is sessions/<id>/files, and on Windows a live
     // process (or a shell it started) keeps that directory from being moved --

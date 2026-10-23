@@ -31,8 +31,9 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { intervalChoices, intervalLabel } from '../backupIntervals.ts';
+import { intervalChoices, intervalLabel, dayChoices, ACTIVE_DEVICE_DAY_CHOICES, CLOUD_TRASH_DAY_CHOICES } from '../backupIntervals.ts';
 import { ToggleButton } from './ToggleButton.tsx';
+import { cleanupSentence } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
 interface Cfg {
@@ -45,8 +46,16 @@ interface Cfg {
   accessKeyId: string;
   hasSecret: boolean;
   encryptionAvailable: boolean;
-  last?: { at: number; uploaded: number; skipped: number; bytes: number; error?: string } | null;
+  last?: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number } | null;
+  /** 云端自动清理（主进程 cloudTrash.ts）：开关、活跃设备天数、回收站保留天数。 */
+  autoCleanCloud: boolean;
+  activeDeviceDays: number;
+  cloudTrashDays: number;
 }
+
+/** 桶里每台机器的清单（`describeDevices`）。 */
+/** `machine` 是设备 ID（清单的键），`name` 是显示用的主机名 —— 同名电脑是两行。 */
+interface DeviceRow { machine: string; name: string; syncedAt: number; active: boolean; readable: boolean; sessions: number }
 
 const api = (): any => (window as any).kiroApi;
 const when = (ms?: number): string => (ms ? new Date(ms).toLocaleString() : '—');
@@ -73,10 +82,17 @@ export const BackupSettings: React.FC = () => {
     try { setCfg(await api()?.getS3Config?.()); } catch { /* 拿不到就留空表单 */ }
   }, []);
   useEffect(() => { void load(); }, [load]);
+
+  /* 参与云端清理判定的设备 / 已忽略的设备 —— 一次 GET catalog；没配好桶时拿到的是一句 error */
+  const [devices, setDevices] = useState<{ devices: DeviceRow[]; unknown: string[]; thisDevice?: string; error?: string } | null>(null);
+  const loadDevices = useCallback(async () => {
+    try { setDevices(await api()?.s3CloudDevices?.()); } catch (e: any) { setDevices({ devices: [], unknown: [], error: String(e?.message || e) }); }
+  }, []);
+  useEffect(() => { void loadDevices(); }, [loadDevices]);
   useEffect(() => {
-    const off = api()?.onS3SyncDone?.(() => { void load(); });
+    const off = api()?.onS3SyncDone?.(() => { void load(); void loadDevices(); });
     return () => { try { off?.(); } catch { /* 已经解绑了 */ } };
-  }, [load]);
+  }, [load, loadDevices]);
 
   const patch = (next: Partial<Cfg>): void => setCfg((prev) => (prev ? { ...prev, ...next } : prev));
 
@@ -98,6 +114,7 @@ export const BackupSettings: React.FC = () => {
       });
       setSecret('');
       await load();
+      void loadDevices();      // 桶 / 凭据可能刚改过：设备列表跟着重读
       setMsg({ kind: 'ok', text: t('Saved.') });
     } catch (err: any) {
       setMsg({ kind: 'bad', text: String(err?.message || err) });
@@ -122,7 +139,7 @@ export const BackupSettings: React.FC = () => {
           kind: 'ok',
           text: what === 'test'
             ? (leftover || '✅')
-            : t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }),
+            : [t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }), cleanupSentence(r, lang)].filter(Boolean).join(' '),
         });
       } else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
       await load();
@@ -166,7 +183,7 @@ export const BackupSettings: React.FC = () => {
       </Field>
       <Field
         label={t('Secret')}
-        hint={t('Needs s3:PutObject / GetObject / ListBucket / DeleteObject.')}
+        hint={t('Needs s3:PutObject / GetObject / ListBucket / DeleteObject. If the bucket has versioning on, cloud trash cleanup also needs s3:ListBucketVersions / DeleteObjectVersion (to delete each original and trash file by version, old versions included).')}
       >
         <input className="settings-input" type="password" value={secret}
                placeholder={cfg.hasSecret ? t('Saved (leave empty to keep)') : t('Enter once; it will not be shown again')}
@@ -212,10 +229,78 @@ export const BackupSettings: React.FC = () => {
         </select>
       </Field>
 
+      {/*
+        **云端自动清理** ——「所有设备上都已不存在的会话，自动移进云端回收站，保留一段时间后彻底删除」。
+        判据和回收站在主进程 cloudTrash.ts；回收站本身在侧栏 ☁️ 的「云端回收站」那一页。
+      */}
+      <Field
+        label={t('Auto-clean cloud backups')}
+        hint={t('When every active device has deleted a session, its cloud backup is moved to the cloud trash at the next sync; anything uncertain is left alone.')}
+      >
+        <ToggleButton
+          on={cfg.autoCleanCloud}
+          ariaLabel={t('Auto-clean cloud backups')}
+          onChange={(next) => { patch({ autoCleanCloud: next }); void save({ autoCleanCloud: next }); }}
+        />
+      </Field>
+      <Field label={t('Active devices')} hint={t('Only devices that synced within this many days take part; older ones are ignored so a lost computer cannot block cleanup forever.')}>
+        <select className="settings-select backup-interval" aria-label={t('Active devices')}
+                value={String(cfg.activeDeviceDays)}
+                onChange={(e) => { const n = Number(e.target.value); patch({ activeDeviceDays: n }); void save({ activeDeviceDays: n }); }}>
+          {dayChoices(ACTIVE_DEVICE_DAY_CHOICES, cfg.activeDeviceDays).map((n) => (
+            <option key={n} value={n}>{intervalLabel(n * 1440, lang)}</option>
+          ))}
+        </select>
+      </Field>
+      <Field label={t('Keep cloud trash for')}>
+        <select className="settings-select backup-interval" aria-label={t('Keep cloud trash for')}
+                value={String(cfg.cloudTrashDays)}
+                onChange={(e) => { const n = Number(e.target.value); patch({ cloudTrashDays: n }); void save({ cloudTrashDays: n }); }}>
+          {dayChoices(CLOUD_TRASH_DAY_CHOICES, cfg.cloudTrashDays).map((n) => (
+            <option key={n} value={n}>{intervalLabel(n * 1440, lang)}</option>
+          ))}
+        </select>
+      </Field>
+      {devices && (
+        <div className="backup-devices">
+          {devices.error ? <div className="settings-hint">{devices.error.split('\n')[0]}</div> : (
+            <>
+              <div className="settings-hint">{t('Devices taking part in the decision:')}</div>
+              {devices.devices.filter((d) => d.active).map((d) => (
+                <div key={d.machine} className="backup-device-row">
+                  <span className="backup-restore-title" title={d.machine}>{d.name || d.machine}{d.machine === devices.thisDevice ? ` ${t('(this machine)')}` : ''}</span>
+                  <span className="backup-restore-meta">{t('Last synced {at}', { at: when(d.syncedAt) })}{d.readable ? ` · ${t('{n} sessions', { n: d.sessions })}` : ''}</span>
+                  {!d.readable && <span className="backup-tag warn">{t('List unreadable: nothing is cleaned')}</span>}
+                </div>
+              ))}
+              {devices.unknown.map((m) => (
+                <div key={m} className="backup-device-row">
+                  <span className="backup-restore-title">{m}</span>
+                  <span className="backup-tag warn">{t('Synced recently but has no session list (older KiroLex?): nothing is cleaned until it updates')}</span>
+                </div>
+              ))}
+              {!devices.devices.some((d) => d.active) && !devices.unknown.length && <div className="settings-hint">{t('None yet (each device registers at its next sync).')}</div>}
+              {devices.devices.some((d) => !d.active) && (
+                <>
+                  <div className="settings-hint">{t('Ignored devices (no sync for more than {n} days):', { n: cfg.activeDeviceDays })}</div>
+                  {devices.devices.filter((d) => !d.active).map((d) => (
+                    <div key={d.machine} className="backup-device-row muted">
+                      <span className="backup-restore-title" title={d.machine}>{d.name || d.machine}</span>
+                      <span className="backup-restore-meta">{t('Last synced {at}', { at: when(d.syncedAt) })}</span>
+                    </div>
+                  ))}
+                </>
+              )}
+            </>
+          )}
+        </div>
+      )}
+
       {cfg.last && (
         <div className="settings-value backup-note">
           {t('Last run: {at} · uploaded {n} / {size}', { at: when(cfg.last.at), n: cfg.last.uploaded, size: kb(cfg.last.bytes) })}
           {' · '}{t('skipped {n}', { n: cfg.last.skipped })}{cfg.last.error ? ` · ${t('failed')}` : ''}
+          {cleanupSentence(cfg.last, lang) ? ` · ${cleanupSentence(cfg.last, lang)}` : ''}
         </div>
       )}
       {cfg.last?.error && (

@@ -8731,6 +8731,13 @@ button, input, select, textarea {
 .backup-restore-row.picked { background: color-mix(in srgb, var(--accent, #7c6fe0) 12%, transparent); }
 /* 正连着的：恢复会被主进程拒，所以连勾都不给 —— 灰掉并说明原因（title 里） */
 .backup-restore-row.disabled { opacity: 0.5; cursor: default; }
+/* 云端回收站那一页的行：不是多选，按钮在行尾 */
+.backup-trash-row { cursor: default; }
+.backup-trash-row .remote-btn { flex: 0 0 auto; padding: 2px 8px; font-size: 11px; }
+/* 设置页「参与判定的设备 / 已忽略的设备」 */
+.backup-devices { display: flex; flex-direction: column; gap: 3px; margin: 2px 0 8px; }
+.backup-device-row { display: flex; align-items: center; gap: 8px; padding: 2px 7px; min-width: 0; }
+.backup-device-row.muted { opacity: 0.6; }
 
 .backup-restore-title {
   font-size: 12px;

@@ -190,6 +190,21 @@ export async function deleteObject(creds: S3Creds, key: string): Promise<void> {
   check(await request(creds, 'DELETE', `/${key}`, {}, Buffer.alloc(0)), tr('Delete {key}', { key }));
 }
 
+/**
+ * **按版本删**：只有对象还是 `etag` 那一版才删（DELETE 带 `If-Match`）。被别人改过 → 412 → `'conflict'`，不删。
+ * 云端自动清理删原件用它：只删自己复制进回收站的那一版，别的设备后来传的新内容不会被删掉。
+ * 存储不支持条件删除（501 / NotImplemented）→ `'unsupported'`，调用方自己决定怎么退。
+ */
+export async function deleteObjectIf(creds: S3Creds, key: string, etag: string): Promise<'ok' | 'conflict' | 'unsupported'> {
+  const r = await request(creds, 'DELETE', `/${key}`, {}, Buffer.alloc(0), { 'if-match': etag });
+  if (r.status === 412) return 'conflict';
+  if (r.status === 404) return 'ok';                // 已经没了
+  const code = parseS3ErrorCode(r.body.toString('utf-8'));
+  if (r.status === 501 || code === 'NotImplemented') return 'unsupported';
+  check(r, tr('Delete {key}', { key }));
+  return 'ok';
+}
+
 /** 对象不存在时返回 `null`（而不是抛）—— "还没有"是正常状态，不是错误。 */
 export async function getObjectIfExists(creds: S3Creds, key: string): Promise<Buffer | null> {
   const r = await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0));
@@ -198,12 +213,84 @@ export async function getObjectIfExists(creds: S3Creds, key: string): Promise<Bu
 }
 
 /** 和 `getObjectIfExists` 一样，另外带回 ETag —— 给条件写入（`putObjectIf`）用。 */
-export async function getObjectWithEtag(creds: S3Creds, key: string): Promise<{ body: Buffer; etag: string } | null> {
+export async function getObjectWithEtag(creds: S3Creds, key: string): Promise<{ body: Buffer; etag: string; versionId?: string } | null> {
   const r = await request(creds, 'GET', `/${key}`, {}, Buffer.alloc(0));
   if (r.status === 404) return null;
   const ok = check(r, tr('Download {key}', { key }));
   const etag = ok.headers.etag;
-  return { body: ok.body, etag: String(Array.isArray(etag) ? etag[0] : etag || '') };
+  /*
+    桶开过版本控制才有这个头。"null" 也原样带回：那是开版本控制**之前**写进去的那一版（或者暂停时写的），它是一个真实存在的版本，
+    要删干净就得按 versionId=null 删 —— 丢了它，调用方只能按 ETag 删，开着版本控制的桶里那只会加一个删除标记。
+    要判断"桶开着没有"的调用方自己把 "null" 当成没开（见 cloudTrash.ts 的 realVersionId）。
+  */
+  const vid = String((Array.isArray(ok.headers['x-amz-version-id']) ? ok.headers['x-amz-version-id'][0] : ok.headers['x-amz-version-id']) || '');
+  return { body: ok.body, etag: String(Array.isArray(etag) ? etag[0] : etag || ''), ...(vid ? { versionId: vid } : null) };
+}
+
+/**
+ * **删一个具体版本**（DELETE ?versionId=）—— 云端自动清理删原件用：只删复制进回收站的那一版（和更早的），
+ * 之后别的设备 / 恢复写进来的是新版本，VersionId 不同，碰不到。
+ */
+export async function deleteObjectVersion(creds: S3Creds, key: string, versionId: string): Promise<void> {
+  check(await request(creds, 'DELETE', `/${key}`, { versionId }, Buffer.alloc(0)), tr('Delete {key}', { key }));
+}
+
+/**
+ * 一个前缀下**所有有版本的 key**（包括当前是删除标记、普通列表里看不见的那些）—— 回收站彻底删除用：
+ * 中途失败过的话，有的 key 只剩"删除标记 + 旧版本"，普通列表里没有它，不这样枚举就永远没人清。翻不完 → 抛。
+ */
+export async function listVersionedKeys(creds: S3Creds, prefix: string, maxPages = 50): Promise<string[]> {
+  const keys = new Set<string>();
+  let keyMarker: string | undefined;
+  let versionMarker: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const query: Record<string, string> = { versions: '', prefix };
+    if (keyMarker) query['key-marker'] = keyMarker;
+    if (versionMarker) query['version-id-marker'] = versionMarker;
+    const xml = check(await request(creds, 'GET', '/', query, Buffer.alloc(0)), tr('List {prefix}', { prefix })).body.toString('utf-8');
+    for (const m of xml.matchAll(/<(Version|DeleteMarker)>([\s\S]*?)<\/\1>/g)) {
+      const k = unescapeXml((m[2].match(/<Key>([^<]*)<\/Key>/) || [])[1] || '');
+      if (k.startsWith(prefix)) keys.add(k);
+    }
+    if (!/<IsTruncated>true<\/IsTruncated>/.test(xml)) return [...keys];
+    keyMarker = (xml.match(/<NextKeyMarker>([^<]*)<\/NextKeyMarker>/) || [])[1];
+    versionMarker = (xml.match(/<NextVersionIdMarker>([^<]*)<\/NextVersionIdMarker>/) || [])[1];
+    if (!keyMarker) return [...keys];
+    keyMarker = unescapeXml(keyMarker);
+  }
+  throw new Error(`${prefix} 下的版本太多，列不完`);
+}
+
+/**
+ * 这一个 key 的所有版本和删除标记（\`isDeleteMarker\`），**从新到旧**（S3 ListObjectVersions 对同一个 key 就是这个顺序，
+ * Version 和 DeleteMarker 按时间交错排在一起）。版本太多、翻页翻不完 → 抛（拿不准，调用方别删）。
+ */
+export async function listObjectVersions(creds: S3Creds, key: string, maxPages = 20): Promise<Array<{ versionId: string; isLatest: boolean; lastModified: string; isDeleteMarker?: boolean }>> {
+  const out: Array<{ versionId: string; isLatest: boolean; lastModified: string; isDeleteMarker?: boolean }> = [];
+  let keyMarker: string | undefined;
+  let versionMarker: string | undefined;
+  for (let page = 0; page < maxPages; page++) {
+    const query: Record<string, string> = { versions: '', prefix: key };
+    if (keyMarker) query['key-marker'] = keyMarker;
+    if (versionMarker) query['version-id-marker'] = versionMarker;
+    const xml = check(await request(creds, 'GET', '/', query, Buffer.alloc(0)), tr('List {prefix}', { prefix: key })).body.toString('utf-8');
+    for (const m of xml.matchAll(/<(Version|DeleteMarker)>([\s\S]*?)<\/\1>/g)) {
+      const block = m[2];
+      if (unescapeXml((block.match(/<Key>([^<]*)<\/Key>/) || [])[1] || '') !== key) continue;   // 前缀碰巧相同的别的 key
+      out.push({
+        versionId: (block.match(/<VersionId>([^<]*)<\/VersionId>/) || [])[1] || '',
+        isLatest: /<IsLatest>true<\/IsLatest>/.test(block),
+        lastModified: (block.match(/<LastModified>([^<]*)<\/LastModified>/) || [])[1] || '',
+        ...(m[1] === 'DeleteMarker' ? { isDeleteMarker: true } : null),
+      });
+    }
+    if (!/<IsTruncated>true<\/IsTruncated>/.test(xml)) return out;
+    keyMarker = (xml.match(/<NextKeyMarker>([^<]*)<\/NextKeyMarker>/) || [])[1];
+    versionMarker = (xml.match(/<NextVersionIdMarker>([^<]*)<\/NextVersionIdMarker>/) || [])[1];
+    if (!keyMarker) return out;
+    keyMarker = unescapeXml(keyMarker);
+  }
+  throw new Error(`${key} 的版本太多，列不完`);
 }
 
 /**
@@ -223,7 +310,7 @@ export async function putObjectIf(
   return 'ok';
 }
 
-export interface S3Entry { key: string; size: number; lastModified: string }
+export interface S3Entry { key: string; size: number; lastModified: string; /** 对象的 ETag（带引号，和 GET 回的一样）。 */ etag?: string }
 
 /** 列一个前缀下的所有对象（自动翻页 —— 一页 1000 个，超了不翻就是静默少数据）。 */
 export async function listObjects(creds: S3Creds, prefix: string): Promise<S3Entry[]> {
@@ -241,6 +328,7 @@ export async function listObjects(creds: S3Creds, prefix: string): Promise<S3Ent
         key,
         size: Number((block.match(/<Size>(\d+)<\/Size>/) || [, '0'])[1]),
         lastModified: (block.match(/<LastModified>([^<]*)<\/LastModified>/) || [, ''])[1],
+        etag: ((block.match(/<ETag>([^<]*)<\/ETag>/) || [, ''])[1] || '').replace(/&quot;/g, '"') || undefined,
       });
     }
     const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);

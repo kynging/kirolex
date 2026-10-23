@@ -1,5 +1,5 @@
 /**
- * **☁️ 备份** —— 两个 tab：同步 / 恢复。
+ * **☁️ 备份** —— 三个 tab：同步 / 恢复 / 云端回收站。
  *
  * 「云那里分同步和恢复两个tab好了」「你得按 project 整理，有些project可以选择不同步」。
  *
@@ -25,6 +25,8 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
+import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
+import { cleanupSentence } from '../backupGroups.ts';
 import { groupBackups, groupSyncProjects, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
@@ -50,6 +52,23 @@ interface Backup {
   missing?: boolean;
   /** 文件是什么时候被删的（桶开了版本控制才知道）。 */
   deletedAt?: number;
+}
+
+/** 云端回收站里的一份（主进程 `listCloudTrash`，见 cloudTrash.ts）。 */
+interface TrashRow {
+  dir: string;
+  id: string;
+  title: string;
+  project?: string;
+  archived?: boolean;
+  /** 0 = 时间未知（说明文件读不到）—— 不会自动到期，只能手动删。 */
+  trashedAt: number;
+  daysLeft: number;
+  by?: string;
+  deletedBy: string[];
+  reason?: string;
+  objects: number;
+  bytes: number;
 }
 
 interface SessionRow {
@@ -95,7 +114,7 @@ const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFix
 export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const lang = useLang();
   const t = useT();
-  const [tab, setTab] = useState<'sync' | 'restore'>('sync');
+  const [tab, setTab] = useState<'sync' | 'restore' | 'trash'>('sync');
   const [where, setWhere] = useState<{ bucket?: string; region?: string; last?: any } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: 'ok' | 'bad'; text: string } | null>(null);
@@ -115,6 +134,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   const [err, setErr] = useState('');
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+
+  /* --- 云端回收站 tab --- */
+  const [trash, setTrash] = useState<TrashRow[] | null>(null);
+  const [trashDays, setTrashDays] = useState(30);
+  const [trashEnabled, setTrashEnabled] = useState(true);
+  const [trashErr, setTrashErr] = useState('');
+  const [confirm, setConfirm] = useState<ConfirmRequest | null>(null);
 
   const loadConfig = useCallback(async () => {
     try {
@@ -147,9 +173,24 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     } finally { setBusy(null); }
   }, []);
 
+  const loadTrash = useCallback(async () => {
+    setBusy('trash'); setTrashErr('');
+    try {
+      const r = await api()?.listS3CloudTrash?.();
+      setTrash(r?.items || []);
+      if (r?.trashDays) setTrashDays(r.trashDays);
+      if (r?.enabled !== undefined) setTrashEnabled(!!r.enabled);
+      if (r?.error) setTrashErr(String(r.error));
+    } catch (e: any) {
+      setTrash([]);
+      setTrashErr(String(e?.message || e));
+    } finally { setBusy(null); }
+  }, []);
+
   useEffect(() => { void loadConfig(); void loadProjects(); }, [loadConfig, loadProjects]);
   /* 切到恢复那个 tab 才去拉列表 —— 它是一次网络请求，只开同步 tab 的人不该付这个钱 */
   useEffect(() => { if (tab === 'restore' && !entries) void loadBackups(); }, [tab, entries, loadBackups]);
+  useEffect(() => { if (tab === 'trash' && !trash) void loadTrash(); }, [tab, trash, loadTrash]);
 
   useEffect(() => {
     const onKey = (e: KeyboardEvent): void => { if (e.key === 'Escape') onClose(); };
@@ -192,13 +233,14 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setBusy('sync'); setMsg(null);
     try {
       const r = await api()?.syncS3Now?.();
-      if (r?.ok) setMsg({ kind: 'ok', text: t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }) });
+      if (r?.ok) setMsg({ kind: 'ok', text: [t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }), cleanupSentence(r, lang)].filter(Boolean).join(' ') });
       else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
       await loadConfig();
       /* 同步时间变了，项目那张表也要重新算 */
       await loadProjects();
-      /* 同步过后桶里的东西变了，恢复那张表要重新拉 */
+      /* 同步过后桶里的东西变了，恢复那张表（和云端回收站）要重新拉 */
       setEntries(null);
+      setTrash(null);
     } finally { setBusy(null); }
   };
 
@@ -342,6 +384,39 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     });
   };
 
+  /** 「恢复到云端备份」：移回原位置，恢复页又能看到它。本地不动。 */
+  const restoreTrash = async (x: TrashRow): Promise<void> => {
+    setBusy(`trash:${x.dir}`); setMsg(null);
+    try {
+      const r = await api()?.restoreS3CloudTrash?.(x.dir);
+      if (r?.ok) setMsg({ kind: 'ok', text: t('"{title}" is back in the cloud backup (see the Recover tab).', { title: x.title }) });
+      else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
+      setEntries(null);
+      await loadTrash();
+    } catch (e: any) {
+      setMsg({ kind: 'bad', text: String(e?.message || e) });
+    } finally { setBusy(null); }
+  };
+
+  /** 「立即彻底删除」：先弹确认框（不可恢复），确认后才发；主进程还要求把目录名原样传回去。 */
+  const askPurge = (x: TrashRow): void => setConfirm({
+    title: t('Delete permanently'),
+    message: t('Permanently delete the cloud backup of "{title}"? This cannot be undone.', { title: x.title }),
+    confirmLabel: t('Delete permanently'),
+    destructive: true,
+    onConfirm: () => { void (async () => {
+      setBusy(`trash:${x.dir}`); setMsg(null);
+      try {
+        const r = await api()?.purgeS3CloudTrash?.(x.dir, x.dir);
+        if (r?.ok) setMsg({ kind: 'ok', text: t('Permanently deleted "{title}" from the cloud.', { title: x.title }) });
+        else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
+        await loadTrash();
+      } catch (e: any) {
+        setMsg({ kind: 'bad', text: String(e?.message || e) });
+      } finally { setBusy(null); }
+    })(); },
+  });
+
   const syncingCount = (projects || []).filter((p) => !p.excluded).length;
 
   return (
@@ -365,6 +440,9 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
           <button className={`memory-tab ${tab === 'restore' ? 'active' : ''}`} onClick={() => setTab('restore')}>
             {t('Recover')}{entries ? ` (${entries.length})` : ''}
           </button>
+          <button className={`memory-tab ${tab === 'trash' ? 'active' : ''}`} onClick={() => setTab('trash')}>
+            {t('Cloud trash')}{trash ? ` (${trash.length})` : ''}
+          </button>
         </div>
 
         <div className="backup-body">
@@ -383,6 +461,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                   <span className="settings-hint">
                     {t('Last run {at} · uploaded {n}', { at: when(where.last.at), n: where.last.uploaded })}
                     {where.last.error ? ` · ${t('failed')}` : ''}
+                    {cleanupSentence(where.last, lang) ? ` · ${cleanupSentence(where.last, lang)}` : ''}
                   </span>
                 )}
               </div>
@@ -636,8 +715,60 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
               )}
             </>
           )}
+
+          {/*
+            **云端回收站** ——「所有设备上都已不存在的会话，自动移进云端回收站，保留一段时间后彻底删除」。
+            同步时自动移进来（判据见 cloudTrash.ts），保留 M 天；这里可以移回原位置，或者确认后立即彻底删除。
+          */}
+          {tab === 'trash' && (
+            <>
+              <div className="backup-actions">
+                <button className="remote-btn" disabled={!!busy} onClick={() => void loadTrash()}>
+                  {busy === 'trash' ? t('Reading…') : t('Refresh')}
+                </button>
+                <span className="settings-hint">
+                  {trashEnabled
+                    ? t('Cloud sessions that no active device has any more (every device deleted them) are moved here when syncing, and deleted for good after {n} days.', { n: trashDays })
+                    : t('Auto-clean is off (Settings → ☁️ Backup): nothing new is moved here and nothing expires.')}
+                </span>
+              </div>
+              {trashErr && <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{trashErr}</div>}
+              {!trash && !trashErr && <div className="settings-hint backup-note">{t('Reading…')}</div>}
+              {trash && !trash.length && !trashErr && (
+                <div className="settings-hint backup-note">{t('The cloud trash is empty.')}</div>
+              )}
+              {!!trash?.length && (
+                <div className="backup-restore-list">
+                  {trash.map((x) => (
+                    <div key={x.dir} className="backup-restore-row backup-trash-row"
+                         title={[x.id, x.deletedBy.length ? t('Deleted on: {machines}', { machines: x.deletedBy.join(', ') }) : '', x.by ? t('Moved by: {machine}', { machine: x.by }) : ''].filter(Boolean).join('\n')}>
+                      <span className="backup-restore-title">{x.title}</span>
+                      <span className="backup-restore-meta">{projectLabel(x.project, t)}{x.archived ? ` · ${t('Archived')}` : ''}</span>
+                      <span className="backup-restore-meta">{t('Moved to trash {at}', { at: when(x.trashedAt) })}</span>
+                      <span className={`backup-tag ${!x.trashedAt || x.daysLeft <= 3 ? 'warn' : 'over'}`}
+                            title={x.trashedAt ? '' : t('The time is unknown, so it never expires on its own; delete it by hand')}>
+                        {x.trashedAt ? t('{n} days left', { n: x.daysLeft }) : t('Time unknown')}
+                      </span>
+                      <span className="backup-restore-meta">{kb(x.bytes)}</span>
+                      <button className="remote-btn" disabled={!!busy} onClick={() => void restoreTrash(x)}
+                              title={t('Move it back to where it was in the cloud backup; local sessions are untouched')}>
+                        {busy === `trash:${x.dir}` ? t('Working…') : t('Restore to cloud backup')}
+                      </button>
+                      <button className="remote-btn remote-btn-danger" disabled={!!busy} onClick={() => askPurge(x)}>
+                        {t('Delete permanently')}
+                      </button>
+                    </div>
+                  ))}
+                </div>
+              )}
+              <div className="settings-hint backup-note">
+                {t('Only sessions are moved here automatically, and only when every active device has deleted them; anything uncertain stays. Restoring puts it back into the cloud backup (it shows up on the Recover tab again) and does not touch local sessions.')}
+              </div>
+            </>
+          )}
         </div>
       </div>
+      <ConfirmDialog request={confirm} onClose={() => setConfirm(null)} />
     </>
   );
 };

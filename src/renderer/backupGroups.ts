@@ -173,3 +173,12 @@ export function toggleGroupPick<T extends Pickable>(picked: ReadonlySet<string>,
   else for (const e of ok) next.add(e.id);
   return next;
 }
+
+/**
+ * 同步摘要里关于云端清理的那一句 ——「这次有 X 条移进云端回收站、Y 条到期清空」。
+ * 这一轮没跑清理（开关关着 / 出错）时主进程不给这两个字段 → 不说。
+ */
+export function cleanupSentence(r: { cloudTrashed?: number; cloudPurged?: number } | null | undefined, lang: Lang = 'zh'): string {
+  if (!r || (r.cloudTrashed === undefined && r.cloudPurged === undefined)) return '';
+  return t(lang, '{trashed} moved to the cloud trash and {purged} expired and cleared this time.', { trashed: r.cloudTrashed || 0, purged: r.cloudPurged || 0 });
+}

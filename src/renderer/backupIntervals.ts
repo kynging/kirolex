@@ -39,3 +39,16 @@ export function intervalLabel(minutes: number, lang: Lang = 'zh'): string {
   if (minutes % 60 === 0) { const n = minutes / 60; return n === 1 ? t(lang, '1 hour') : t(lang, '{n} hours', { n }); }
   return t(lang, '{n} min', { n: minutes });
 }
+
+/**
+ * 云端自动清理的两个天数（「活跃设备 = 最近 N 天同步过」「云端回收站保留 M 天」）—— 和间隔同一个理由给下拉不给输入框。
+ * 当前值不在表里（手改过配置）也列出来，同 `intervalChoices`。
+ */
+export const ACTIVE_DEVICE_DAY_CHOICES = [30, 60, 90, 180, 365];
+export const CLOUD_TRASH_DAY_CHOICES = [7, 14, 30, 60, 90];
+
+export function dayChoices(base: number[], current?: number): number[] {
+  const cur = Math.floor(Number(current));
+  const extra = Number.isFinite(cur) && cur >= 1 && !base.includes(cur) ? [cur] : [];
+  return [...base, ...extra].sort((a, b) => a - b);
+}
