@@ -430,3 +430,37 @@ KiroLex 两处都认。Codex 适配器（codex-acp 2.1.1）同样在顶层 `_met
 所以 Codex 忙时 Enter 走 `_session/steering`。碰上这一轮刚结束（`startedNewTurn`）：前一轮收尾时 busy 先不放（steering 还在途），
 那段时间的输出先攒着；结果一回来就把 Codex 自己起的那一轮认成这条消息的正常一轮 —— 用户消息作为新的一条落盘、进对话，
 输出归它，见到 `threadStatus: idle` 就收尾（`busyEnterCaps.detachedTurnEnded`）。消息不会再发一遍。
+
+### 一轮之外的自发轮：CronCreate 到点（2026-10-23 看板机器实跑）
+
+背景：Claude Code 的 `CronCreate` 到点、后台 Bash / 后台子代理完成后的跟进，都是适配器在**没有在途 `session/prompt`** 时
+自己起一轮（适配器源码里叫 autonomous cycle，`AUTONOMOUS_RESULT_ORIGINS`）。原来 `replayGuard.isReplayOutsideTurn`
+把一轮之外的正文一律当回放丢 —— 回复用户看不到、也不落盘。现在分开（`replayGuard.outsideTurnVerdict`）：
+
+- **回放窗口**（`entry.replayWindow`）：挂上执行器（`wireSession`）/ 同一 client 上换后端会话（`recreateBackendSession`）时开，
+  KiroLex 发起的第一轮开始时关。窗口内一轮之外的正文照旧当回放丢（「远程新会话出现历史内容」的防护不变）。
+- 窗口外、不在一轮里的助手正文 / 思考块（Claude Code / Codex）→ 后端自发的一轮（`autonomousTurn.ts`）：会话里先落一条
+  KiroLex 提示「⏰ 后台触发：Claude Code 自己起了这一轮…」，界面接管这一轮的流，busy 报 turn；见到带 `cost` 的 `usage_update`
+  （或 Codex 的 `threadStatus: idle`、或 90 s 没有新帧）就收尾，落盘一条带 `origin: 'autonomous'` 的助手消息。
+  窗口外的 `user_message_chunk` 仍丢；kiro 会话不变。
+- Claude Code / Codex 会话每轮注入一句：定时 / 稍后再看用 `schedule_create`，不要用 `CronCreate` / `ScheduleWakeup`（`wakeTools.ADAPTER_SCHEDULE_NOTE`）。
+- 有待触发的 Claude cron（调用过 `CronCreate`、没有对应的 `CronDelete`，`claudeCron.ts`）的执行器被 LRU 回收时，在那条会话里提示一句。
+
+**实跑**：`PROBE_STEPS=cron node scripts/claude-feature-probe.mjs`（claude-agent-acp 0.88.0，本机 Claude Code 2.1.293，haiku）。
+脚本让模型用 `CronCreate` 定一个约 2 分钟后的一次性提示（「Reply with exactly: PONG」），那一轮 `end_turn` 之后，把没有在途 prompt 时收到的帧
+逐条交给 KiroLex 的真判据（`outsideTurnVerdict`，回放窗口已关、`engine: 'claude'`；`autonomousTurnEnded`；`claudeCron`）：
+
+| 看到的 | KiroLex 的判定 |
+|---|---|
+| CronCreate 的 tool_call：`rawInput` 先是 `{}`，后面的 update 里才补全（`cron` / `prompt` / `recurring`）；结果在 `_meta.claudeCode.toolResponse`：`{"id":"7fd20cad","humanSchedule":"…","recurring":false,"durable":false}` | 有待触发的 Claude cron（LRU 回收时会提示）；`CronDelete` 按这个 id 对 |
+| 定时那一轮结束后 91 s：`usage_update`（无 cost） | 照常转发 |
+| `agent_thought_chunk` × 30（"The user is asking me to reply with exactly: PONG…"） | 第一块起 **自发轮**，其余在这一轮里 |
+| `agent_message_chunk "PONG"` | 在自发轮里（显示、进 assistantBuf） |
+| `usage_update`（无 cost）→ `usage_update` 带 `cost: {"amount":0.0434,"currency":"USD"}` | 带 cost 那帧 → **收尾落盘** |
+
+注意：这次自发轮先来的是思考块（10-22 远端那次只有 message chunk），两种都起自发轮；cron 这一轮的 result 上**没有** `_meta["_claude/origin"]`
+（适配器只给 `AUTONOMOUS_RESULT_ORIGINS` 那几类带），所以判据不能靠 origin，只能靠「回放窗口外、没有在途 prompt」。
+另外模型自己算 cron 时间不可靠（第一次 haiku 把「1 分钟后」写成了 9 小时后的 `01 14 23 10 *`），脚本改成直接给 cron 表达式。
+
+**已知限制**：Claude 的 cron 仍然只活在适配器进程里 —— LRU 回收、换模型 / 换机器、重启都会让它消失（KiroLex 只提示、不阻止）；
+一次性 cron 到点后 Claude Code 自己删掉，KiroLex 看不到，所以那之后回收仍会提示一次（宁多勿漏）。

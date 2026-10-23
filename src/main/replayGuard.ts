@@ -25,3 +25,34 @@ export function isReplayOutsideTurn(update: { sessionUpdate?: unknown } | null |
   if (inTurn) return false;
   return MESSAGE_CHUNKS.has(String(update?.sessionUpdate ?? ''));
 }
+
+/**
+ * **回放和后端自己起的一轮要分开** ——「Claude Code 自发的一轮（CronCreate 到点 / 后台任务跟进）被当回放丢掉」。
+ *
+ * 上面那个判据的前提「KiroLex 不发 prompt 就不会有正文」对 kiro-cli 成立，对 Claude Code 不成立：
+ * 2026-10-22 远端实测（claude-agent-acp 0.88.0 + Claude Code 2.1.284），`CronCreate` 定的一次性提示到点时，
+ * **没有任何在途的 session/prompt**，适配器自己推了 `usage_update` → `agent_message_chunk "PONG"` → `usage_update`（带 cost）。
+ * 适配器源码管这叫 autonomous cycle（`AUTONOMOUS_RESULT_ORIGINS`），后台 Bash / 后台子代理完成后的跟进也这样到。
+ *
+ * **回放窗口**（`SessionEntry.replayWindow`）：回放只会在 attach / `session/load`（远端 kiro-cli 按目录或 id 恢复同理）之后、
+ * KiroLex 发起的第一轮之前出现 —— ACP 的回放是对 load 的响应，而 load 只发生在挂执行器那一下
+ * （`acpReplayTiming.test.ts` 钉着：活着的 client 上没有别的 load）。所以判据是**状态**而不是时长：
+ *   · 开：`wireSession`（每次挂上执行器），以及 `recreateBackendSession`（同一 client 上 session/new，「响应之后才回放」那种形状）；
+ *   · 关：`sendPromptOnce` 真正开始一轮（`entry.busy = true` 那一下）。
+ * 不用「load 响应 + 几秒」：回放可能晚于响应任意久（`acpReplayTiming` 的 replay-after-new），按时长关会把它放出来。
+ * 代价是窗口里来的自发正文也丢 —— 但那时这个后端进程里还没跑过任何一轮，不可能有它自己定的 cron / 后台任务。
+ *
+ * 窗口外、不在一轮里的**助手正文 / 思考块** → `autonomous`：调用方按「后端自己起了一轮」走正常路径（`autonomousTurn.ts`）。
+ * 窗口外的 `user_message_chunk` 仍按回放丢（不伪造用户消息）。
+ * **kiro 会话行为不变**：kiro-cli 不会自己起一轮，一轮之外的正文照旧全按回放丢（没有引擎信息也按 kiro）。
+ */
+export type OutsideTurnVerdict = 'replay' | 'autonomous' | null;
+
+export function outsideTurnVerdict(
+  update: { sessionUpdate?: unknown } | null | undefined,
+  s: { inTurn: boolean; replayWindow: boolean; engine?: string },
+): OutsideTurnVerdict {
+  if (!isReplayOutsideTurn(update, s.inTurn)) return null;
+  if (s.replayWindow || !s.engine || s.engine === 'kiro') return 'replay';
+  return update?.sessionUpdate === 'user_message_chunk' ? 'replay' : 'autonomous';
+}

@@ -59,6 +59,18 @@ export interface WakeHost {
 const WHEN = '要过一段时间再看结果，或等某个后台过程结束，用这些工具（schedule_create / bg_run / watch）；'
   + '**不要在一轮里 sleep 轮询**（那会一直占着这一轮，而且会被超时打断）。结果会作为一条新消息自动发回这条会话，'
   + '那时你再接着处理。会话正忙时会等这一轮结束再发。';
+/**
+ * **Claude Code / Codex 会话：定时用 KiroLex 的，不用后端自带的** —— Claude Code 的 `CronCreate` / `ScheduleWakeup`
+ * 只活在适配器进程里，LRU 回收、换模型 / 换机器（换后端）、重启都会让它无声消失；`schedule_create` 由主进程定时、落盘。
+ * 每轮注入给模型（index.ts `sendPromptOnce`，和文件位置说明同一处），kiro 会话不说（它没有那两个工具）。
+ */
+export const ADAPTER_SCHEDULE_NOTE = '[定时] 要定时提醒、过一会儿再看、或等某件事结束再继续，用 kirolex-local 的 schedule_create'
+  + '（会话被换后端也还在）；不要用 Claude Code 自带的 CronCreate / ScheduleWakeup —— 它们只活在后端进程里，后端一换就没了。';
+
+export function adapterScheduleNote(engine: string | undefined): string {
+  return engine === 'claude' || engine === 'codex' ? ADAPTER_SCHEDULE_NOTE : '';
+}
+
 /** 已知限制（不改实现）：POSIX 上只按任务的进程组结束，主动脱离进程组的漏在外面；Windows 的作业对象能覆盖到。 */
 const DETACH_LIMIT = '别用它起要长期留着的服务。会自己脱离进程组的程序（`setsid`、`daemonize`、Node `detached: true` 等）'
   + '在 macOS/Linux 上不在任务的进程组里，任务结束 / 被停止 / 退出 KiroLex 时都不会被自动结束（Windows 上会）。';

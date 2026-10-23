@@ -23,7 +23,9 @@ import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
 import { detachedTurnEnded, steerDisplay, steeringPromptBlocks } from './busyEnterCaps';
 import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persistThenRelease, readPendingHandoffs, recoverableHandoffs, removePendingHandoff, restoreStartedHandoffs, restoredUserMessage, type PendingHandoff } from './pendingHandoffs';
-import { isReplayOutsideTurn } from './replayGuard';
+import { isReplayOutsideTurn, outsideTurnVerdict } from './replayGuard';
+import { autonomousFrame, beginAutonomousTurn, endAutonomousTurn, type AutonomousDeps, type AutonomousTurn } from './autonomousTurn';
+import { hasPendingClaudeCron, noteClaudeCronTool, type ClaudeCronTrack } from './claudeCron';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { planHelperRoute, remoteLiteScript, parseRemoteLiteOutput, LOCAL_MACHINE as HELPER_LOCAL_MACHINE, type MachineModelList } from './helperModels.ts';
 import { parseAgentList } from './kiroAgentList.ts';
@@ -63,7 +65,7 @@ import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, fold
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { canRetrySame, decidePromptDedupe, DUPLICATE_MESSAGE, DUPLICATE_STARTED, InFlightPrompts, reviseMessageId, turnCompletedNormally } from './promptDedupe.ts';
 import { BG_DEFAULT_TIMEOUT_SEC, BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
-import { callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
+import { adapterScheduleNote, callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
@@ -294,6 +296,12 @@ interface SessionEntry {
   suppressCancellationChunks?: boolean;
   /** true while a prompt turn is in flight — a busy executor is never evicted. */
   busy?: boolean;
+  /** **回放窗口**：挂上执行器（`wireSession`）/ 换后端会话之后、KiroLex 发起的第一轮之前 —— 这段时间一轮之外的正文是回放（判据见 `replayGuard.outsideTurnVerdict`） */
+  replayWindow?: boolean;
+  /** 后端自己起的那一轮（Claude Code 的 cron 到点 / 后台任务跟进，`autonomousTurn.ts`）：界面上算一轮（busy 报 turn），不被 LRU 回收 */
+  autonomous?: AutonomousTurn;
+  /** 这个后端里 Claude 自己定的 cron（`claudeCron.ts`）：LRU 驱逐时提示一句 */
+  claudeCrons?: ClaudeCronTrack;
   /** monotonic turn tag: only the invocation that set `busy` may clear it. */
   turnSeq?: number;
   /** ms timestamp of the last inbound stream activity (stall watchdog). */
@@ -1187,7 +1195,8 @@ function busyReasonFor(sessionId: string): BusyReason {
   if (attachingSessions.has(sessionId)) return 'attaching';
   const entry = sessionClients.get(sessionId);
   if (entry?.priming) return 'priming';
-  if (entry?.busy) return 'turn';
+  /* 后端自己起的那一轮（autonomousTurn.ts）界面上也是一轮：渲染端接管它的流，结束信号就是这里不再报 turn */
+  if (entry?.busy || entry?.autonomous) return 'turn';
   // Context owed. This OCCUPIES the session on purpose: a chat whose backend has
   // no history must not accept a new message that would be answered from nothing.
   // New messages queue behind the rebuild instead.
@@ -4270,7 +4279,8 @@ const pendingSwitches = new PendingSwitchBook();
 let applyPendingSwitchBatch: (sessionId: string, entries: PendingSwitch[]) => Promise<unknown> = async () => {};
 /** 轮次结束 `kick`（sendPromptOnce 的 finally）、发送前 `settle`（sendPromptOnce 开头）。 */
 const pendingSwitchRunner = new PendingSwitchRunner(pendingSwitches, {
-  isBusy: (sessionId) => !!sessionClients.get(sessionId)?.busy,
+  /* 后端自己起的那一轮（autonomousTurn.ts）也算：切换等它收尾（收尾时 kick，见 autonomousDeps.finish） */
+  isBusy: (sessionId) => { const e = sessionClients.get(sessionId); return !!e?.busy || !!e?.autonomous; },
   apply: (sessionId, entries) => applyPendingSwitchBatch(sessionId, entries),
 });
 function emitPendingSwitches(sessionId: string): void {
@@ -4284,7 +4294,9 @@ function emitPendingSwitches(sessionId: string): void {
 function queueSwitchWhileBusy(
   sessionId: string, kind: PendingKind, value: any, label: string, fromPending?: boolean,
 ): { ok: true; pending: true } | null {
-  if (!shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending })) return null;
+  /* 后端自己起的那一轮（autonomousTurn.ts）在跑也算忙：现在换执行器会截断正在输出的回复，收尾时 kick 再切 */
+  const autonomousRunning = !!sessionClients.get(sessionId)?.autonomous && !fromPending;
+  if (!shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending }) && !autonomousRunning) return null;
   const firstOfThisWait = !pendingSwitches.has(sessionId);
   pendingSwitches.set(sessionId, { kind, value, label });
   logger.info('pending-switch', `忙时切换先记下 sessionId=${sessionId} ${kind} -> ${label}（这一轮跑完再切）`);
@@ -4434,6 +4446,8 @@ async function recreateBackendSession(sessionId: string, entry: SessionEntry, tr
   const cwd = entry.cwd || sessionCwd(entry.profile, os.homedir());
   const made = await entry.client.newSession(cwd);
   entry.cliSessionId = made.sessionId;
+  /* 同一 client 上的 session/new：「响应之后才回放」那种形状也要丢（`replayGuard.outsideTurnVerdict`）—— 回放窗口重新打开 */
+  entry.replayWindow = true;
   const rec2 = store.readRecord(sessionId);
   if (rec2) { rec2.cliSessionId = made.sessionId; store.writeRecord(rec2); }
   /* 新会话里当然什么都没有 —— 清掉"已建立"，让上下文跟着下一次发送带过去 */
@@ -5251,7 +5265,7 @@ function followBucketPlacements(cfg: SyncConfig, catalog: Catalog | null, sessio
     /* 换了项目要换 memory scope、归档要把执行器让出来 —— 和 move-session / archive-session 一样 */
     if (projectChanged || p.archived) {
       const live = sessionClients.get(r.id);
-      if (live?.busy) pendingProjectReset.add(r.id);
+      if (live?.busy || live?.autonomous) pendingProjectReset.add(r.id);
       else if (live) void detachExecutor(r.id);
     }
     mainWindow?.webContents.send('session:placement-changed', { sessionId: r.id, projectId: p.projectId || null, archived: p.archived });
@@ -5955,6 +5969,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
   }
   /** 一轮之外收到、已丢掉的回放块数（见下面 isReplayOutsideTurn）—— 只为每一段记一行日志 */
   let replayDropped = 0;
+  /* 回放窗口从挂上执行器开始，到 KiroLex 发起的第一轮为止（`replayGuard.outsideTurnVerdict`） */
+  entry.replayWindow = true;
   /* Claude Code / Codex 自己改了模型 / 模式（`config_option_update` / `current_mode_update`）：下拉跟着变 */
   client.on('config-options', () => {
     if (superseded()) return;
@@ -5997,13 +6013,19 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       **一轮之外的对话正文是后端回放的旧对话，丢掉**（判据和理由见 `replayGuard.ts`）——
       「远程新建会话界面仍出现历史会话内容」。不丢的话它进了渲染层这条会话的缓存，切到它时就画出来。
       每一段只记一行：哪条会话、多少块、后端那边的会话 id（来源）。
+      **例外：回放窗口之外的、Claude Code / Codex 自己起的一轮**（cron 到点 / 后台任务跟进，`outsideTurnVerdict`）——
+      按正常的一轮走（`beginAutonomous`）：显示、进 assistantBuf、结束时落盘。
     */
     if (isReplayOutsideTurn(data?.update, !!entry.busy)) {
-      if (!replayDropped++) {
-        const origin = typeof data?.sessionId === 'string' ? data.sessionId : '?';
-        logger.warn('acp', `dropped replayed ${data?.update?.sessionUpdate} outside a turn sessionId=${sessionId} backend=${origin} (current backend=${entry.cliSessionId}) —— 不显示、不落盘`);
+      const verdict = outsideTurnVerdict(data?.update, { inTurn: !!entry.busy || !!entry.autonomous, replayWindow: !!entry.replayWindow, engine: engineOf(entry.profile) });
+      if (verdict === 'replay') {
+        if (!replayDropped++) {
+          const origin = typeof data?.sessionId === 'string' ? data.sessionId : '?';
+          logger.warn('acp', `dropped replayed ${data?.update?.sessionUpdate} outside a turn sessionId=${sessionId} backend=${origin} (current backend=${entry.cliSessionId}) —— 不显示、不落盘`);
+        }
+        return;
       }
-      return;
+      if (verdict === 'autonomous') beginAutonomous(sessionId, entry);
     }
     if (replayDropped) {
       logger.info('acp', `replay outside a turn ended sessionId=${sessionId} dropped=${replayDropped}`);
@@ -6032,6 +6054,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       }
       if (u?.sessionUpdate === 'tool_call' || u?.sessionUpdate === 'tool_call_update') {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
+        /* Claude 自己定的 cron（CronCreate / CronDelete）：它只活在这个后端进程里，LRU 驱逐时要提示（`claudeCron.ts`） */
+        entry.claudeCrons = noteClaudeCronTool(entry.claudeCrons, u);
         /* 只数新开的调用（不数 update）—— 这是"这一轮动过东西没有"的依据，见 `toolsThisTurn`。 */
         if (u?.sessionUpdate === 'tool_call') entry.toolsThisTurn = (entry.toolsThisTurn || 0) + 1;
         /* 跑了工具 = 模型已经开始做这一条了：同一个 messageId 不能再被自动发一遍（`noteTurnStarted`） */
@@ -6229,6 +6253,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     const childSessionId = originAcpSessionId && entry.cliSessionId && originAcpSessionId !== entry.cliSessionId
       ? originAcpSessionId
       : undefined;
+    /* 后端自己起的那一轮：见到结束信号（带 cost 的 usage_update / Codex idle）就收尾落盘，否则重新计时（`autonomousTurn.ts`） */
+    if (entry.autonomous) autonomousFrame(entry, data?.update, autonomousDeps(sessionId, entry));
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
   entry.replayUpdates = (list) => { for (const d of list) onUpdate(d, true); };
@@ -6275,6 +6301,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     还没轮到的那几条放弃（渲染端放回 KiroLex 队列）。排在上面那个之后：它的身份守卫只管会话记录，这里两种都要收。
   */
   client.on('disconnected', () => {
+    if (entry.autonomous) endAutonomousTurn(entry, autonomousDeps(sessionId, entry), 'disconnected');
     for (const f of [...(entry.followUps || [])]) {
       if (f.started) f.failDetached?.(new Error(tr('Session not connected')));
       else f.abort(new Error(tr('Session not connected')));
@@ -6284,8 +6311,10 @@ function wireSession(sessionId: string, entry: SessionEntry) {
 
 /** Flush the accumulated assistant message to the durable transcript (called on
  *  turn completion). No-op if nothing accumulated. */
-function flushAssistant(sessionId: string) {
-  const entry = sessionClients.get(sessionId);
+/*  `autonomous`：后端自己起的那一轮（`autonomousTurn.ts`）—— 带来源标记 `origin: 'autonomous'`。
+ *  `entry`：执行器已经摘下来（断开时收尾）也要落到它身上攒的那份。 */
+function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?: SessionEntry }) {
+  const entry = opts?.entry ?? sessionClients.get(sessionId);
   /* 只管这一次 flush：先取出来清掉（下面提前 return 时也不能留给下一次的半截） */
   const completedFor = entry?.completedReplyTo;
   if (entry) entry.completedReplyTo = undefined;
@@ -6308,6 +6337,8 @@ function flushAssistant(sessionId: string) {
     /* 回的是哪一条用户消息；只有正常收尾的那一份带 `replyComplete`（出错 / 取消 flush 的半截不算"答过了"，同一条还可以重试） */
     ...(replyTo ? { replyTo } : {}),
     ...(replyTo && completedFor === replyTo ? { replyComplete: true as const } : {}),
+    /* 后端自己起的那一轮：来源标记（这一轮没有用户消息，`currentUserMessageId` 在 autonomousDeps 里摘掉了，上面两项不会有） */
+    ...(opts?.autonomous ? { origin: 'autonomous' as const } : {}),
   });
   // Keep the rendered history.md in step with the conversation, so the path the
   // backend was given never points at a frozen snapshot of an older turn.
@@ -6333,6 +6364,58 @@ function flushAssistant(sessionId: string) {
   entry.assistantMsgId = null;
   entry.fileChanges = [];
   entry.wedgeNote = undefined;
+}
+
+/**
+ * **后端自己起的那一轮**（判据 `replayGuard.outsideTurnVerdict`，生命周期 `autonomousTurn.ts`）——
+ * 「Claude Code 自发的一轮（CronCreate 到点 / 后台任务跟进）被当回放丢掉」。
+ *
+ * 开始：会话里落一条来源标记（KiroLex 提示「⏰ 后台触发」—— 不是伪造的用户消息，也不发给模型），`acp:main-turn` 让界面像接管
+ * 定时提示那一轮一样接管它的流，busy 报 turn（`busyReasonFor`）。输出照常进 assistantBuf / 渲染层。
+ * 这一轮没有用户消息：`currentUserMessageId` 先摘掉（回复不带 replyTo、工具事件不记在上一轮名下），收尾时还回去。
+ * 结束：`flushAssistant(…, { autonomous: true })` 落盘一条带 `origin: 'autonomous'` 的助手消息，busy 不再报 turn（界面收流）。
+ */
+const autonomousPrevUser = new WeakMap<SessionEntry, string | undefined>();
+function beginAutonomous(sessionId: string, entry: SessionEntry): void {
+  if (entry.autonomous) return;
+  beginAutonomousTurn(entry, autonomousDeps(sessionId, entry));
+}
+function autonomousDeps(sessionId: string, entry: SessionEntry): AutonomousDeps {
+  return {
+    now: () => Date.now(),
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+    clearTimer: (h) => clearTimeout(h as ReturnType<typeof setTimeout>),
+    hasOpenTools: () => (entry.openToolCalls?.size || 0) > 0,
+    announce: (turn) => {
+      logger.info('acp', `autonomous turn BEGIN sessionId=${sessionId} backend=${entry.cliSessionId} —— 后端自己起了一轮（cron 到点 / 后台任务跟进），按正常的一轮显示、落盘`);
+      autonomousPrevUser.set(entry, entry.currentUserMessageId);
+      entry.currentUserMessageId = undefined;
+      if (!entry.assistantBuf) { entry.assistantMsgId = null; entry.bufAtLastTool = 0; }
+      const text = tr('⏰ Background trigger: {engine} started this turn on its own (a scheduled task it set itself, or a background-task follow-up)', { engine: ENGINE_LABEL[engineOf(entry.profile)] });
+      const v = textVariants(text);
+      const ts = Date.now();
+      /* 会话已经删了就不写（appendMessage 会先建目录，删掉的会话会重新长出来） */
+      if (!deletedSessionIds.has(sessionId) && store.readRecord(sessionId)) {
+        try {
+          store.appendMessage(sessionId, { id: turn.noteId, role: 'user', content: text, ts, kirolex: true, ...(v ? { variants: v } : {}) });
+        } catch (err: any) { logger.warn('acp', `autonomous note not saved sessionId=${sessionId}: ${err?.message || err}`); }
+      }
+      mainWindow?.webContents.send('acp:main-turn', { sessionId, messageId: turn.noteId, content: text, ts, kirolex: true });
+      emitSessionBusy(sessionId);
+    },
+    finish: (turn, why) => {
+      flushAssistant(sessionId, { autonomous: true, entry });
+      if (entry.currentUserMessageId === undefined) entry.currentUserMessageId = autonomousPrevUser.get(entry);
+      autonomousPrevUser.delete(entry);
+      logger.info('acp', `autonomous turn END sessionId=${sessionId} why=${why} after=${((Date.now() - turn.startedAt) / 1000).toFixed(1)}s`);
+      emitSessionBusy(sessionId);
+      /* 这一轮期间换了项目 / 归档（`acp:move-session` 推迟的执行器重置）：回复已经落盘，现在断开 */
+      /* 只对还挂着的这个执行器做（断开时收尾的话，这个会话可能已经挂上了新的执行器，别把新的断掉） */
+      if (sessionClients.get(sessionId) === entry) consumePendingProjectReset(sessionId, '后端自己起的一轮结束，执行下推的执行器重置');
+      /* 这一轮期间记下的切换（模型 / agent / 运行位置…）现在应用 —— 回复已经完整落盘 */
+      void pendingSwitchRunner.kick(sessionId);
+    },
+  };
 }
 
 /** Actively detach one session's executor: free the slot immediately, kill the
@@ -6394,7 +6477,7 @@ function ensureExecutorCapacity(excludeId?: string): boolean {
     let victim: string | null = null;
     let best: { cost: number; used: number } | null = null;
     for (const [id, e] of sessionClients) {
-      if (id === excludeId || e.busy) continue;
+      if (id === excludeId || e.busy || e.autonomous) continue;
       const candidate = { cost: evictionCost(id), used: e.lastUsedAt ?? 0 };
       if (!best || candidate.cost < best.cost || (candidate.cost === best.cost && candidate.used < best.used)) {
         best = candidate;
@@ -6404,6 +6487,11 @@ function ensureExecutorCapacity(excludeId?: string): boolean {
     if (!victim) return false; // all remaining executors are busy — cannot evict
     // 记下代价:一条对话「为什么突然要重建」必须查得出来
     logger.info('executor', `evicting ${victim} for ${excludeId || 'a new session'} (cost=${best?.cost}, idle since ${best?.used})`);
+    /* Claude 自己定的 cron 只活在这个后端进程里（`claudeCron.ts`）：回收了就没了 —— 在那条会话里说一句，不阻止回收 */
+    if (hasPendingClaudeCron(sessionClients.get(victim)?.claudeCrons)) {
+      logger.info('executor', `evicting ${victim} with pending Claude cron(s) —— 随后端一起消失`);
+      noteInSession(victim, tr("⚠️ This chat's backend was recycled to make room for another chat. Scheduled tasks Claude set up itself in this chat (CronCreate) went away with it. For timers that must survive, have it use KiroLex's schedule_create."));
+    }
     detachExecutor(victim);
   }
   return true;
@@ -7652,7 +7740,7 @@ app.whenReady().then(async () => {
           /* 换了项目要换 memory scope、归档要把执行器让出来 —— 和 followBucketPlacements 一样 */
           if (rp.before.projectId !== want.projectId || want.archived) {
             const cl = sessionClients.get(sessionId);
-            if (cl?.busy) pendingProjectReset.add(sessionId);
+            if (cl?.busy || cl?.autonomous) pendingProjectReset.add(sessionId);
             else if (cl) void detachExecutor(sessionId);
           }
           mainWindow?.webContents.send('session:placement-changed', { sessionId, projectId: want.projectId || null, archived: want.archived });
@@ -8237,6 +8325,8 @@ app.whenReady().then(async () => {
       别的情况照旧拒绝，不让排队的消息和正在跑的那一轮重叠。
     */
     if (handoff?.kind === 'queued') {
+      /* 在跑的是后端自己起的那一轮：没有 session/prompt 可排在后面，退回 KiroLex 队列（它收尾后发） */
+      if (entry.autonomous) throw new HandoffRefused('unsupported');
       /* 这一轮已经结束了：没有可排在后面的那一轮，按普通消息发（渲染端改走 sendNowOrNext） */
       if (!entry.busy) throw new HandoffRefused('idle');
       /* 占着 busy 的不是一轮普通对话（没有人会来交棒）、或者适配器没声明 promptQueueing：退回 KiroLex 队列 */
@@ -8259,6 +8349,10 @@ app.whenReady().then(async () => {
     }
     if (entry.busy && !handoff) {
       /* 带错误码：后台唤醒据此判「撞上忙、空了再发」，不靠这句随界面语言变的文字 */
+      throw Object.assign(new Error(tr('Wait for the active turn (including context compaction) to finish before sending the queued message.')), { code: SESSION_BUSY });
+    }
+    /* 后端自己起的那一轮（autonomousTurn.ts）还没收尾：一样算忙 —— 定时提示 / 后台唤醒等它收完再发，两轮的输出不串在一起 */
+    if (entry.autonomous && !handoff) {
       throw Object.assign(new Error(tr('Wait for the active turn (including context compaction) to finish before sending the queued message.')), { code: SESSION_BUSY });
     }
     /*
@@ -8382,6 +8476,9 @@ app.whenReady().then(async () => {
     try {
       const note = workdirNoteFor(sessionId, entry);
       if (note) prompt = [{ type: 'text', text: note }, ...prompt];
+      /* Claude Code / Codex：定时用 schedule_create，别用后端自带的 CronCreate / ScheduleWakeup（它们只活在后端进程里，见 wakeTools.ts） */
+      const sched = adapterScheduleNote(engineOf(entry.profile));
+      if (sched) prompt = [{ type: 'text', text: sched }, ...prompt];
     } catch {}
     try {
       const rc = remoteContextFor(sessionId, entry);
@@ -8497,6 +8594,8 @@ app.whenReady().then(async () => {
     let myTurnSeq = -1;
     try {
       entry.busy = true; // in-flight turn — exempt from LRU eviction
+      /* KiroLex 发起的第一轮开始了：回放窗口关（`replayGuard.outsideTurnVerdict`）—— 之后一轮之外的正文是后端自己起的一轮 */
+      entry.replayWindow = false;
       entry.turnRunning = true;
       entry.turnStartedAt = Date.now();   // 控制入口 `GET /sessions/:id/status` 的 turnStartedAt
       emitSessionBusy(sessionId);
@@ -9200,6 +9299,10 @@ app.whenReady().then(async () => {
     // `priming` is a turn KIROLEX issued (a history rebuild), and its output is suppressed
     // everywhere -- not forwarded, not accumulated, not persisted. Reporting it as live would
     // be the one way that internal reply could still reach the user's chat.
+    /* 后端自己起的那一轮（autonomousTurn.ts）：重载后的窗口没收到它的 acp:main-turn，靠这里接管它的流（结束信号同样是 busy 不再报 turn） */
+    if (entry?.autonomous && !entry.busy && !entry.priming) {
+      return { live: true, messageId: entry.assistantMsgId, text: entry.assistantBuf || '', startedAt: entry.autonomous.startedAt };
+    }
     if (!entry || !entry.busy || entry.priming) {
       return { live: false, messageId: null, text: '', startedAt: null };
     }
@@ -9263,6 +9366,8 @@ app.whenReady().then(async () => {
       await entry.client.cancelPrompt(entry.cliSessionId);
       /* 适配器自己起的那一轮（detached）没有响应可等：停了就算这一轮结束 */
       entry.detachedEnd?.();
+      /* 后端自己起的那一轮（autonomousTurn.ts）也没有响应可等：停了就收尾，已经出来的落盘 */
+      if (entry.autonomous) endAutonomousTurn(entry, autonomousDeps(sessionId, entry), 'cancelled');
 
       // session/cancel is a notification, so wait for the in-flight prompt RPC to
       // settle before allowing an interrupt-and-steer prompt onto the same client.
@@ -9391,6 +9496,11 @@ app.whenReady().then(async () => {
 
   ipcMain.handle('acp:steer', async (_event, sessionId: string, message: string, steerMsgId?: string) => {
     const entry = sessionClients.get(sessionId);
+    /*
+      在跑的是后端自己起的那一轮（autonomousTurn.ts）：busy 为假（下面会判成 idle、当新消息立刻发），可它还没收尾，
+      也没有用户消息可并进去 —— 排进 KiroLex 队列（`unsupported` → 渲染端 queue），它收尾后发。
+    */
+    if (entry?.autonomous) return { steered: false, reason: 'unsupported' };
     // Order matters (see steerGate.ts): a history rebuild is a LOCKED task, not a
     // conversational turn -- steering into it would inject the user's text into a
     // hidden priming turn, so the renderer parks it until the rebuild finishes.
@@ -14307,6 +14417,13 @@ app.whenReady().then(async () => {
       rec.placementChangedAt = Date.now(); // 多台机器之间位置按它跟随（placementToFollow）
       store.writeRecord(rec);
     }
+    /* 后端自己起的那一轮（autonomousTurn.ts）在输出：一样推迟 —— 现在 detach 会截断它；由它的收尾（autonomousDeps.finish）先落盘再消化 */
+    if (!busy && sessionClients.get(sessionId)?.autonomous) {
+      pendingProjectReset.add(sessionId);
+      sessionNotice(sessionId, tr('Project changed to **{project}**; the memory scope switches after this turn ends.', { project: projectId || tr('Unassigned') }));
+      logger.info('session', `移动项目 sessionId=${sessionId} -> ${projectId || '(未分组)'}（后端自己起的一轮在输出，执行器重置推迟到它结束）`);
+      return { sessionId, projectId: projectId ?? null, deferredReset: true };
+    }
     if (busy) {
       /* 这一轮结束再重置：`pendingProjectReset` 由 prompt 的收尾去消化 */
       pendingProjectReset.add(sessionId);
@@ -15626,7 +15743,8 @@ let controlServer: ControlServer | null = null;
 /** 现在忙的会话（带标题）—— 判据见 busySessions.ts */
 function getBusySessions(): BusySession[] {
   const turns = new Set<string>([...attachingSessions, ...reconfiguringSessions]);
-  for (const [id, e] of sessionClients) if (e.busy) turns.add(id);
+  /* 后端自己起的那一轮（autonomousTurn.ts）也是在跑的一轮：等待退出要等它收尾落盘 */
+  for (const [id, e] of sessionClients) if (e.busy || e.autonomous) turns.add(id);
   return collectBusySessions({
     turns,
     scheduleRuns: schedulesInFlight.values(),

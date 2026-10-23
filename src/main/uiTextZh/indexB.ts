@@ -228,4 +228,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   'its current setting': '原来的设置',
   'Switch cancelled; this session keeps its current setting.': '已取消切换，这条会话保持原来的设置。',
   '⏳ This message will be sent once the switch finishes.': '⏳ 这条消息会在切换完成后发出。',
+  // ── index.ts：后端自己起的一轮（autonomousTurn.ts）/ Claude 自己定的 cron ──
+  '⏰ Background trigger: {engine} started this turn on its own (a scheduled task it set itself, or a background-task follow-up)': '⏰ 后台触发：{engine} 自己起了这一轮（它自己定的定时任务到点，或后台任务的跟进）',
+  '⚠️ This chat\'s backend was recycled to make room for another chat. Scheduled tasks Claude set up itself in this chat (CronCreate) went away with it. For timers that must survive, have it use KiroLex\'s schedule_create.': '⚠️ 这条会话的后端被回收了（给别的会话腾位置）。这条会话里 Claude 自己定的定时任务（CronCreate）会随后端一起消失；要可靠的定时，请让它用 KiroLex 的 schedule_create。',
 };

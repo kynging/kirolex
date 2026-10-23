@@ -62,6 +62,8 @@ export interface StoredMessage {
   /** 助手消息：这一轮最后一次**真实**工具调用开始时正文的长度。判「把工具调用写成了文字」只看这之后（`textToolCall.ts`），
    *  一轮结束时的判定、界面折叠、历史折叠用同一个口径。没调过工具就没有。 */
   toolTailFrom?: number;
+  /** 助手消息：`'autonomous'` = 后端自己起的那一轮（Claude Code 的 cron 到点 / 后台任务跟进，`autonomousTurn.ts`），不是在回哪条用户消息。 */
+  origin?: 'autonomous';
   /** Files/images the user attached to THIS message. Persisted so the chips
    *  survive a restart AND so history priming can re-point a fresh backend at
    *  them (otherwise an image sent earlier is forgotten entirely). */

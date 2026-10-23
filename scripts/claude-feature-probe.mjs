@@ -15,6 +15,8 @@
  * Env:
  *   PROBE_STEPS   comma list (default: all) — init, model, tools, todo, tasks, think, effort, image, slash,
  *                 compact, compactPrefixed, cancelTool, cancelPerm, cancelTask, plan, task, web, load, steering, queueing
+ *                 (+ `cron`, opt-in only — not in the default list: CronCreate a one-shot prompt and wait ~1–2 min for it to fire,
+ *                 then run KiroLex's own outside-a-turn classification on the frames)
  *                 (cancelPerm switches the session to Manual mode first: the adapter starts in
  *                 bypassPermissions on this machine, which never asks)
  *   PROBE_MODEL   substring of the model id/name to switch to (default: haiku — cheapest)
@@ -310,6 +312,44 @@ async function main() {
       else if (u.sessionUpdate === 'tool_call') line += `<tool:${u.title}>`;
     }
     console.log('\n=== queueing: second session/prompt while the first runs ===' + line);
+  }
+  if (STEPS.includes('cron')) {
+    /*
+      Claude 自己定的 cron 到点（autonomous cycle）：没有在途的 session/prompt 时适配器自己推的那几帧，
+      用 KiroLex 的**真判据**过一遍（replayGuard.outsideTurnVerdict / autonomousTurn.autonomousTurnEnded / claudeCron）——
+      这时已经跑过一轮，回放窗口是关的。只在 PROBE_STEPS 里点名时跑（要等 1–2 分钟）。
+    */
+    const { outsideTurnVerdict } = await import('../src/main/replayGuard.ts');
+    const { autonomousTurnEnded } = await import('../src/main/autonomousTurn.ts');
+    const { noteClaudeCronTool, hasPendingClaudeCron } = await import('../src/main/claudeCron.ts');
+    /* 模型猜不准本机时间（实测 haiku 猜成了 9 小时以后）：直接给 cron 表达式（本机时区，约 2 分钟后） */
+    const at = new Date(Date.now() + 120000);
+    const cronExpr = `${at.getMinutes()} ${at.getHours()} ${at.getDate()} ${at.getMonth() + 1} *`;
+    const r = await prompt(a, sid, `cron: CronCreate a one-shot prompt at "${cronExpr}"`, `Use the CronCreate tool (load it with ToolSearch first if needed) with cron "${cronExpr}", recurring false, prompt "Reply with exactly: PONG". Then reply with exactly: scheduled`);
+    let crons;
+    for (const p of r.updates) crons = noteClaudeCronTool(crons, p.update);
+    console.log('  KiroLex sees a pending Claude cron (LRU notice would fire):', hasPendingClaudeCron(crons));
+    const endedAt = Date.now();
+    const from = a.updates.length;
+    const firstText = await new Promise((res) => {
+      const timer = setTimeout(() => res(null), 240000);
+      a.onUpdate = (p) => { if (p.update?.sessionUpdate === 'agent_message_chunk') { clearTimeout(timer); res(Date.now()); } };
+    });
+    a.onUpdate = null;
+    await new Promise((res) => setTimeout(res, 8000));
+    const frames = a.updates.slice(from);
+    console.log(`\n=== cron: frames with NO session/prompt in flight (${frames.length}) ===`);
+    if (firstText) console.log(`  first text ${((firstText - endedAt) / 1000).toFixed(1)}s after the scheduling turn ended`);
+    let inAuto = false;
+    for (const p of frames) {
+      const u = p.update || {};
+      const verdict = outsideTurnVerdict(u, { inTurn: inAuto, replayWindow: false, engine: 'claude' });
+      if (verdict === 'autonomous') inAuto = true;
+      const ends = inAuto && autonomousTurnEnded(u);
+      console.log(`  ${u.sessionUpdate}${u.content?.text ? ` ${JSON.stringify(u.content.text.slice(0, 40))}` : ''}${u.cost ? ` cost=${JSON.stringify(u.cost)}` : ''}${u._meta?.['_claude/origin'] ? ` origin=${JSON.stringify(u._meta['_claude/origin'])}` : ''} → ${verdict === 'autonomous' ? 'BEGIN autonomous turn' : verdict === 'replay' ? 'DROPPED as replay' : inAuto ? 'in autonomous turn' : 'passed through'}${ends ? ' → END (flush + persist)' : ''}`);
+      if (ends) inAuto = false;
+    }
+    if (inAuto) console.log('  (no end signal — KiroLex would close it after the quiet timeout)');
   }
   if (STEPS.includes('cancelPerm')) {
     console.log('\nset_mode default:', JSON.stringify(await a.request('session/set_mode', { sessionId: sid, modeId: 'default' }).catch((e) => ({ error: e.message }))).slice(0, 200));
