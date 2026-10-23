@@ -25,7 +25,7 @@
 
 import React, { useCallback, useEffect, useMemo, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
-import { groupBackups, groupSyncProjects, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick } from '../backupGroups.ts';
+import { groupBackups, groupSyncProjects, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
 interface Backup {
@@ -46,6 +46,10 @@ interface Backup {
   localUpdatedAt?: number;
   /** 恢复后会按云上的位置改到别的项目 / 改变归档状态（谁后挪用谁，主进程算的）。 */
   placementWillChange?: boolean;
+  /** 桶里已经没有这条的文件（catalog 没清干净）—— 恢复不了，不给勾，给「从目录里移除」。 */
+  missing?: boolean;
+  /** 文件是什么时候被删的（桶开了版本控制才知道）。 */
+  deletedAt?: number;
 }
 
 interface SessionRow {
@@ -137,7 +141,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       setBucketMemory(r?.memoryByProject || {});
       if (r?.error) setErr(String(r.error));
       /* 列表换了就把勾掉的收一收 —— 留着一个已经不在表里的 id，到恢复时才发现它没了 */
-      setPicked((prev) => new Set([...prev].filter((id) => list.some((e) => e.id === id && !e.busy))));
+      setPicked((prev) => new Set([...prev].filter((id) => list.some((e) => e.id === id && isPickable(e)))));
     } catch (e: any) {
       setErr(String(e?.message || e));
     } finally { setBusy(null); }
@@ -210,7 +214,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   /* ---------- 恢复：按云上分组（云上归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
   const groups = useMemo(() => groupBackups(entries || [], lang), [entries, lang]);
 
-  const selectable = useMemo(() => (entries || []).filter((e) => !e.busy), [entries]);
+  const selectable = useMemo(() => (entries || []).filter(isPickable), [entries]);
   const chosen = useMemo(() => selectable.filter((e) => picked.has(e.id)), [selectable, picked]);
   const merging = useMemo(() => chosen.filter((e) => e.existsLocally), [chosen]);
 
@@ -242,6 +246,22 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     if (armGroup !== key) { setArmGroup(key); return; }
     setArmGroup(null);
     await deleteBackups(ids, `del:${key}`);
+  };
+  /* 「从目录里移除」：只对桶里已经没有文件的条目（主进程会再核对一遍，有文件的不动） */
+  const forgetBackups = async (ids: string[]): Promise<void> => {
+    setBusy(`forget:${ids.join(',')}`); setMsg(null);
+    try {
+      const r = await api()?.forgetS3Backups?.(ids);
+      if (!r?.ok) { setMsg({ kind: 'bad', text: r?.error || t('Failed') }); return; }
+      setMsg({
+        kind: r.kept?.length ? 'bad' : 'ok',
+        text: t('Removed {n} entries with no backup files from the catalog.', { n: r.removed?.length || 0 })
+          + (r.kept?.length ? ' ' + t('{n} still have files in the bucket and were kept.', { n: r.kept.length }) : ''),
+      });
+      await loadBackups();
+    } catch (x: any) {
+      setMsg({ kind: 'bad', text: String(x?.message || x) });
+    } finally { setBusy(null); }
   };
   const deleteBackups = async (ids: string[], busyKey: string): Promise<void> => {
     setBusy(busyKey); setMsg(null);
@@ -563,25 +583,42 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                           return (
                           <label
                             key={e.id}
-                            className={`backup-restore-row${e.busy ? ' disabled' : ''}${picked.has(e.id) ? ' picked' : ''}`}
-                            title={e.busy
+                            className={`backup-restore-row${e.busy || e.missing ? ' disabled' : ''}${picked.has(e.id) ? ' picked' : ''}`}
+                            title={e.missing
+                              ? t('This catalog entry has no files left in the bucket (deleted earlier, but the catalog was not cleaned up). It cannot be restored.')
+                              : e.busy
                               ? t('This session is in the middle of a turn. Wait for it to finish before restoring, or whatever has not been written to disk yet will be lost')
                               : `${e.id}\n${e.from ? t('Backed up {at} (from {from})', { at: when(e.syncedAt), from: e.from }) : t('Backed up {at}', { at: when(e.syncedAt) })}`}
                           >
-                            <input type="checkbox" checked={picked.has(e.id)} disabled={!!e.busy || !!busy}
+                            <input type="checkbox" checked={picked.has(e.id)} disabled={!isPickable(e) || !!busy}
                                    onChange={() => toggle(e.id)} />
                             <span className="backup-restore-title">{e.title || e.id}</span>
                             {archived && (
                               <span className="backup-restore-meta">{t('From "{project}"', { project: projectLabel(e.project, t) })}</span>
                             )}
                             {e.busy && <span className="backup-tag warn">{t('Running now')}</span>}
+                            {/*
+                              桶里已经没有文件的条目（老版本删除时 catalog 没清干净）：不显示成可恢复，
+                              说清「备份文件已删除」，给一颗「从目录里移除」。新旧对比对它没意义，不显示。
+                            */}
+                            {e.missing && (
+                              <span className="backup-tag warn">
+                                {e.deletedAt ? t('Backup files deleted ({at})', { at: when(e.deletedAt) }) : t('Backup files deleted')}
+                              </span>
+                            )}
+                            {e.missing && (
+                              <button className="remote-btn backup-forget" disabled={!!busy}
+                                      onClick={(ev) => { ev.preventDefault(); void forgetBackups([e.id]); }}>
+                                {busy === `forget:${e.id}` ? t('Removing…') : t('Remove from list')}
+                              </button>
+                            )}
                             {/* 新旧对比：本机记录的 updatedAt 和云上那份比 */}
-                            <span
+                            {!e.missing && <span
                               className={`backup-tag ${fresh === 'cloud-newer' ? 'over' : 'new'}`}
                               title={fresh === 'missing'
                                 ? t('Not on this machine; restoring simply adds it')
                                 : t('This machine {local} · cloud {cloud}', { local: when(e.localUpdatedAt), cloud: when(e.updatedAt) }) + '\n' + t('Restoring merges it with the local copy (deduplicated by message id, sorted by time)')}
-                            >{freshnessLabel(fresh, lang)}</span>
+                            >{freshnessLabel(fresh, lang)}</span>}
                             <span className="backup-restore-meta">{kb(e.bytes)} · {when(e.updatedAt)}</span>
                           </label>
                           );

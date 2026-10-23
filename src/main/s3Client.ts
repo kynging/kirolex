@@ -248,3 +248,67 @@ export async function listObjects(creds: S3Creds, prefix: string): Promise<S3Ent
   } while (token);
   return out;
 }
+
+/** ListObjectsV2 带 delimiter 的那一页里的 CommonPrefixes。 */
+export function parseCommonPrefixes(xml: string): string[] {
+  return [...xml.matchAll(/<CommonPrefixes>\s*<Prefix>([^<]*)<\/Prefix>\s*<\/CommonPrefixes>/g)].map((m) => unescapeXml(m[1]));
+}
+
+const unescapeXml = (s: string): string => s.replace(/&lt;/g, '<').replace(/&gt;/g, '>').replace(/&quot;/g, '"').replace(/&apos;/g, "'").replace(/&amp;/g, '&');
+
+/** 一个前缀下一层的"子目录"（`delimiter=/` 的 CommonPrefixes，自动翻页）—— 一次 list 就知道哪些会话还有文件。 */
+export async function listCommonPrefixes(creds: S3Creds, prefix: string): Promise<string[]> {
+  const out: string[] = [];
+  let token: string | undefined;
+  do {
+    const query: Record<string, string> = { 'list-type': '2', prefix, delimiter: '/' };
+    if (token) query['continuation-token'] = token;
+    const xml = check(await request(creds, 'GET', '/', query, Buffer.alloc(0)), tr('List {prefix}', { prefix })).body.toString('utf-8');
+    out.push(...parseCommonPrefixes(xml));
+    const truncated = /<IsTruncated>true<\/IsTruncated>/.test(xml);
+    token = truncated ? (xml.match(/<NextContinuationToken>([^<]*)<\/NextContinuationToken>/) || [])[1] : undefined;
+  } while (token);
+  return out;
+}
+
+/**
+ * ListObjectVersions 的一页：最新版本里有没有活的对象、最新的 delete marker 是什么时候打的。
+ * 只看 `IsLatest`：一个 key 删了又传回来，它的旧 delete marker 不算数。
+ */
+export function parseVersionsPage(xml: string): { live: boolean; latestMarkerAt: number } {
+  let live = false;
+  let latestMarkerAt = 0;
+  for (const m of xml.matchAll(/<(Version|DeleteMarker)>([\s\S]*?)<\/\1>/g)) {
+    if (!/<IsLatest>true<\/IsLatest>/.test(m[2])) continue;
+    if (m[1] === 'Version') { live = true; continue; }
+    const t = Date.parse((m[2].match(/<LastModified>([^<]*)<\/LastModified>/) || [])[1] || '');
+    if (Number.isFinite(t)) latestMarkerAt = Math.max(latestMarkerAt, t);
+  }
+  return { live, latestMarkerAt };
+}
+
+/**
+ * 一个前缀下的东西是什么时候被删掉的（桶开了版本控制才看得出来）：还有活的对象 → `'live'`；
+ * 最新版本全是 delete marker → 最晚那个的时刻；什么都没有（没开版本控制）→ null。
+ * 一条会话的 transcript 每轮一个版本，版本可能很多 —— 最多翻 `maxPages` 页，翻不完就当看不出来（null）。
+ */
+export async function prefixDeletedAt(creds: S3Creds, prefix: string, maxPages = 5): Promise<number | 'live' | null> {
+  let keyMarker: string | undefined;
+  let versionMarker: string | undefined;
+  let latestMarkerAt = 0;
+  for (let page = 0; page < maxPages; page++) {
+    const query: Record<string, string> = { versions: '', prefix };
+    if (keyMarker) query['key-marker'] = keyMarker;
+    if (versionMarker) query['version-id-marker'] = versionMarker;
+    const xml = check(await request(creds, 'GET', '/', query, Buffer.alloc(0)), tr('List {prefix}', { prefix })).body.toString('utf-8');
+    const p = parseVersionsPage(xml);
+    if (p.live) return 'live';
+    latestMarkerAt = Math.max(latestMarkerAt, p.latestMarkerAt);
+    if (!/<IsTruncated>true<\/IsTruncated>/.test(xml)) return latestMarkerAt || null;
+    keyMarker = (xml.match(/<NextKeyMarker>([^<]*)<\/NextKeyMarker>/) || [])[1];
+    versionMarker = (xml.match(/<NextVersionIdMarker>([^<]*)<\/NextVersionIdMarker>/) || [])[1];
+    if (!keyMarker) return latestMarkerAt || null;
+    keyMarker = unescapeXml(keyMarker);
+  }
+  return null;
+}

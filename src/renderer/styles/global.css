@@ -8742,6 +8742,8 @@ button, input, select, textarea {
 /* 「删除备份」——删云上那份，不动本地。危险动作用红字标出来，别和别的按钮一个样。 */
 .backup-del { color: var(--error); border-color: color-mix(in srgb, var(--error) 40%, transparent); }
 .backup-del:hover:not(:disabled) { border-color: var(--error); background: color-mix(in srgb, var(--error) 12%, transparent); }
+/* 「从目录里移除」—— 只清目录里那条没有文件的条目，不是删东西，按钮小一点、不用红色 */
+.backup-restore-row .backup-forget { padding: 1px 8px; font-size: 11px; }
 
 /*
   模型在回复里列出来的选项 ——「有一些问题会给用户提问并提供多个选项，这个怎么处理的」。

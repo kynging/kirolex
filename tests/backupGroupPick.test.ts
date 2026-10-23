@@ -71,3 +71,14 @@ describe('BackupDialog 恢复页组头', () => {
     assert.match(ZHP, /'Delete \{n\} selected': '删除选中的 \{n\} 条'/);
   });
 });
+
+describe('桶里没有文件的行（missing）', () => {
+  const rows2 = [{ id: 'a' }, { id: 'b', missing: true }, { id: 'c', busy: true }];
+  test('不算能选的：全选跳过它，只勾 a 就是全选', () => {
+    assert.equal(groupPickState(rows2, new Set(['a'])).state, 'all');
+    assert.deepEqual([...toggleGroupPick(new Set(), rows2)], ['a']);
+  });
+  test('就算在 picked 里也不算勾选', () => {
+    assert.deepEqual(groupPickState(rows2, new Set(['b'])).pickedIds, []);
+  });
+});

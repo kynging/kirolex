@@ -88,6 +88,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   syncS3Now: () => ipcRenderer.invoke('s3:sync-now'),
   listS3Backups: () => ipcRenderer.invoke('s3:list-backups'),
   deleteS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:delete-sessions', ids),
+  forgetS3Backups: (ids: string[]) => ipcRenderer.invoke('s3:forget-backups', ids),
   keepLocalS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:keep-local', ids),
   /** 同步时自动合并改了这条会话的 transcript —— 界面缓存要扔掉重读 */
   onSessionHistoryChanged: (callback: (d: { sessionId: string }) => void) => {

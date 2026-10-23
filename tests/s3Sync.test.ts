@@ -326,9 +326,10 @@ describe('接线', () => {
     const at = M.indexOf('async function runS3Sync');
     const body = M.slice(at, M.indexOf('rescheduleS3Sync', at));
     /* **写** catalog 在文件之后。注意现在 catalog 还会被**先读一次**（冲突检测要在覆盖之前
-       知道桶里是什么），所以判据是 `putObject(... catalogKey` 的位置，不是 `catalogKey(` 的位置。 */
+       知道桶里是什么），所以判据是写 catalog 那一步（`writeSyncCatalog`，写前重读再合并）的位置，不是 `catalogKey(` 的位置。 */
+    assert.ok(body.indexOf('writeSyncCatalog(') > 0, '同步写 catalog 走 writeSyncCatalog');
     assert.ok(
-      body.indexOf('for (const rel of plan.upload)') < body.indexOf('putObject(creds!, catalogKey('),
+      body.indexOf('for (const rel of plan.upload)') < body.indexOf('writeSyncCatalog('),
       '写 catalog 要排在文件之后',
     );
   });
@@ -527,8 +528,11 @@ describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
   });
 
   test('正在跑的不给勾 —— 主进程会拒，让人勾上再被拒是最差的', () => {
-    assert.match(UI, /disabled=\{!!e\.busy \|\| !!busy\}/);
-    assert.match(UI, /\(entries \|\| \[\]\)\.filter\(\(e\) => !e\.busy\)/);
+    assert.match(UI, /disabled=\{!isPickable\(e\) \|\| !!busy\}/);
+    assert.match(UI, /\(entries \|\| \[\]\)\.filter\(isPickable\)/);
+    const GB = fs.readFileSync(path.join(process.cwd(), 'src/renderer/backupGroups.ts'), 'utf8');
+    /* 能不能勾统一由 isPickable 判（正在跑的、桶里没文件的都不给勾） */
+    assert.match(GB, /export const isPickable = \(e: Pickable\): boolean => !e\.busy && !e\.missing;/);
     /* 这个标记是主进程给的（它才知道谁在跑） */
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     assert.match(M, /busy: !!sessionClients\.get\(e\.id\)\?\.busy/);
@@ -968,7 +972,7 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
 
   test('"正在跑"的那些连勾都不给', () => {
     /* 那些恢复会被主进程拒 —— 夹在一堆成功里最容易被漏掉 */
-    assert.match(UI5, /disabled=\{!!e\.busy \|\| !!busy\}/);
+    assert.match(UI5, /disabled=\{!isPickable\(e\) \|\| !!busy\}/);
   });
 
   test('同步完把恢复那张表作废 —— 桶里的东西变了', () => {
@@ -1054,11 +1058,12 @@ describe('每条会话的最新同步时间', () => {
     /* 到函数尾（`rescheduleS3Sync` 是紧跟其后的那个）—— 中间有几段长注释 */
     const body = M.slice(at, M.indexOf('function rescheduleS3Sync', at));
     assert.match(body, /const touchedSessions = new Set<string>\(\);/);
-    assert.match(body, /if \(sid\) touchedSessions\.add\(sid\);/);
+    assert.match(body, /if \(sid\) \{ touchedSessions\.add\(sid\);/);
     /* 给所有会话盖一个 now 就又回到 catalog 那个毛病了 */
     assert.match(body, /if \(touchedSessions\.size\) \{/);
     /* `updatedAt` 一起记 —— 之后本地再动过就能算出"有改动还没备份" */
-    assert.match(body, /marks\[id\] = \{ at: now, updatedAt: byId\.get\(id\)\?\.updatedAt \|\| 0 \}/);
+    /* 另外存真传完的时刻（uploadedAt）—— 和删除记录比谁新用的是它，不是整轮的 at（见 catalogConcurrency.test.ts） */
+    assert.match(body, /marks\[id\] = syncMark\(now, byId\.get\(id\)\?\.updatedAt \|\| 0, uploadedAtBySession\.get\(id\)\)/);
   });
 
   test('界面上"时间未知"和"没备份过"要分开说', () => {
@@ -1081,7 +1086,7 @@ describe('每条会话的最新同步时间', () => {
     assert.ok(at > 0);
     const body = M.slice(at, at + 4200);
     /* 删对象 / 写 catalog / 清状态表这三步挪进了 deleteBackupsOf（删会话的入口也用它） */
-    assert.match(body, /await deleteBackupsOf\(creds!, cfg\.prefix, catalog,/);
+    assert.match(body, /await deleteBackupsOf\(creds!, cfg\.prefix, new Set/);
     const h = M.indexOf('async function deleteBackupsOf(');
     const helper = M.slice(h, M.indexOf('\n}\n', h));
     /*
@@ -1090,8 +1095,11 @@ describe('每条会话的最新同步时间', () => {
     */
     assert.match(helper, /if \(sid && goneIds\.has\(sid\)\) delete state\[rel\];/);
     assert.match(helper, /for \(const id of goneIds\) delete marks\[id\];/);
-    /* catalog 最后写：先写的话中途失败会留下一个指向已删对象的 catalog */
-    assert.ok(helper.indexOf('await deleteObject') < helper.indexOf('putObject(creds, catalogKey'));
+    /* catalog 最后写：先写的话中途失败会留下一个指向已删对象的 catalog（删对象 + 写删除记录在 catalogStore.ts） */
+    assert.match(helper, /await deleteSessionBackups\(/);
+    const CS = fs.readFileSync(path.join(process.cwd(), 'src/main/catalogStore.ts'), 'utf8');
+    const d = CS.slice(CS.indexOf('export async function deleteSessionBackups('));
+    assert.ok(d.indexOf('await bucket.del(') > 0 && d.indexOf('await bucket.del(') < d.indexOf('await updateCatalog('));
     /* 两道确认：界面弹一次，IPC 层还要求原样传回项目名（防手滑点到别的行） */
     assert.match(body, /if \(confirm !== project\) return \{ ok: false/);
   });

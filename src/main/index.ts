@@ -31,7 +31,7 @@ import { Breaker, BREAKER_MS, PREFLIGHT_ATTEMPTS, backoffMs, worthRetrying } fro
 import { readMetaCache, writeMetaCache, mergeMeta, enrichModels } from './modelMeta.ts';
 import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
-  planUpload, keyFor, relFor, catalogKey, contentTypeFor, mergeCatalog, readState, writeState, walk,
+  planUpload, keyFor, relFor, catalogKey, contentTypeFor, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
   decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
@@ -42,7 +42,11 @@ import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudg
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
 import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
-import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, getObject, getObjectIfExists, getObjectWithEtag, listObjects } from './s3Client.ts';
+import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
+import {
+  serialQueue, catalogIO, updateCatalog, readCatalog, deleteSessionBackups, writeSyncCatalog, forgetMissingEntries,
+  missingEntries, markMissing, sessionIdsFromPrefixes, sessionKeyPrefix, entryUploadedAt, syncMark, type CatalogBucket,
+} from './catalogStore.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, remoteHomeDir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
@@ -5031,6 +5035,41 @@ function syncCredsOrProblem(): { creds?: S3Creds; problem?: string } {
 }
 
 let syncRunning = false;
+
+/**
+ * **本机对 catalog.json 的操作排成一队**（删除 / 同步写 catalog / 恢复时清目录 / 以本机为准 / 从目录里移除）——
+ * 连点几次删除、或删除和定时同步交错时，各自读到的快照互相覆盖，删掉的条目又复活了（见 `catalogStore.ts`）。
+ * 每次写还会重读最新的再条件写（防别的机器），这个队列防的是同一台机器自己打自己。**别在队列里再进队列**。
+ */
+const catalogQueue = serialQueue();
+
+/** 本机删过哪些会话的备份、什么时候 —— 正在跑的那一轮同步写状态表时要把它们去掉（见 runS3Sync）。 */
+const backupDeletedAt = new Map<string, number>();
+
+/** 有的 S3 兼容存储不认条件写（回 501）—— 认出来之后这个进程里就直接写（仍有队列 + 写前重读）。 */
+let catalogCondUnsupported = false;
+
+/** catalogStore 要的桶操作，接到真 S3 上。 */
+function catalogBucket(creds: S3Creds, prefix: string | undefined): CatalogBucket {
+  return {
+    get: (key) => getObjectWithEtag(creds, key),
+    put: async (key, body, cond) => {
+      if (!cond || catalogCondUnsupported) { await putObject(creds, key, body, 'application/json'); return 'ok'; }
+      try { return await putObjectIf(creds, key, body, 'application/json', cond); }
+      catch (err: any) {
+        if (!(err instanceof S3Error) || err.status !== 501) throw err;
+        catalogCondUnsupported = true;
+        logger.warn('s3', '这个存储不认条件写（If-Match），catalog 改成本机排队 + 写前重读');
+        await putObject(creds, key, body, 'application/json');
+        return 'ok';
+      }
+    },
+    list: async (pfx) => (await listObjects(creds, pfx)).map((o) => o.key),
+    del: (key) => deleteObject(creds, key),
+    sessionIds: async () => sessionIdsFromPrefixes(prefix, await listCommonPrefixes(creds, `${keyFor(prefix, 'sessions')}/`)),
+    deletedAt: (id) => prefixDeletedAt(creds, sessionKeyPrefix(prefix, id)),
+  };
+}
 let syncTimer: NodeJS.Timeout | null = null;
 /**
  * **连续失败之后退避**（参考 Tabby 那个云同步插件：`improved retry behavior after repeated failures`）。
@@ -5303,27 +5342,53 @@ async function keepLocalSession(creds: S3Creds, prefix: string | undefined, sess
   ].filter((rel) => { try { return fs.statSync(path.join(KIROLEX_HOME, rel)).isFile(); } catch { return false; } });
   const state = readState(S3_STATE_PATH);
   let uploaded = 0;
+  /** 最后一个文件真传完的时刻 —— catalog 条目和 marks 的 uploadedAt（和删除记录比谁新） */
+  let lastPutAt = 0;
   for (const rel of rels) {
     const abs = path.join(KIROLEX_HOME, rel);
     const st = fs.statSync(abs);
     if (st.size > MAX_FILE_BYTES) continue;
     await putObject(creds, keyFor(prefix, rel), fs.readFileSync(abs), contentTypeFor(rel));
+    lastPutAt = Date.now();
     state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
     uploaded += 1;
   }
   writeState(S3_STATE_PATH, state);
-  /* catalog：这一条换成本机的 —— 不换的话下一轮还是"别的机器传的、更新"，又判冲突 */
-  const raw = await getObjectIfExists(creds, catalogKey(prefix));
-  let catalog: Catalog = { version: 1, entries: [] };
-  try { if (raw) catalog = JSON.parse(raw.toString('utf-8')); } catch { /* 坏了就当空的 */ }
+  /* catalog：这一条换成本机的 —— 不换的话下一轮还是"别的机器传的、更新"，又判冲突。排队 + 写前重读，坏了就当空的 */
   const rec = store.readRecord(sessionId);
-  const fresh = rec ? catalogEntriesFor([rec], thisMachine) : [];
-  const next: Catalog = { version: 1, entries: [...(catalog.entries || []).filter((e) => e.id !== sessionId), ...fresh] };
-  await putObject(creds, catalogKey(prefix), Buffer.from(JSON.stringify(next, null, 2)), 'application/json');
+  const fresh = rec ? catalogEntriesFor([rec], thisMachine).map((e) => (lastPutAt ? { ...e, uploadedAt: lastPutAt } : e)) : [];
+  await catalogQueue(() => updateCatalog(catalogIO(catalogBucket(creds, prefix), prefix),
+    (c) => ({ ...c, entries: [...(c.entries || []).filter((e) => e.id !== sessionId), ...fresh] }), { onCorrupt: 'empty' }));
   const marks = readSessionMarks(S3_MARKS_PATH);
-  marks[sessionId] = { at: Date.now(), updatedAt: rec?.updatedAt || 0 };
+  marks[sessionId] = syncMark(Date.now(), rec?.updatedAt || 0, lastPutAt || undefined);
   writeSessionMarks(S3_MARKS_PATH, marks);
   return { deleted, uploaded };
+}
+
+/**
+ * **恢复列表核对桶里真的有这条的文件** ——「点恢复报『桶里没有 <id> 的文件』」。一次 list（CommonPrefixes）就知道哪些会话还有文件；
+ * 没有的返回 id → 删除时刻（有 delete marker 才知道，否则 0）。界面上不给勾、显示「备份文件已删除」+「从目录里移除」。
+ * 列不出来就当都有，照旧列（不挡恢复）。
+ */
+async function listMissing(bucket: CatalogBucket, catalog: Catalog): Promise<Map<string, number>> {
+  try { return await missingEntries(bucket, catalog, await bucket.sessionIds()); }
+  catch (err: any) { logger.warn('s3', `恢复列表：核对桶里有没有文件没成功（照旧列出）：${err?.message || err}`); return new Map(); }
+}
+
+/**
+ * **点恢复时桶里没有这条的文件** —— catalog 里有、文件没了（老版本删除时 catalog 没写对留下的）。
+ * 说人话（什么时候删的，有 delete marker 才知道），并顺手把这条从 catalog 移掉（排队 + 只移确实没文件的），
+ * 恢复页刷新之后就不再列它。
+ */
+async function backupGoneReply(creds: S3Creds, prefix: string | undefined, sessionId: string): Promise<{ ok: false; gone: true; error: string }> {
+  const bucket = catalogBucket(creds, prefix);
+  let at: number | 'live' | null = null;
+  try { at = await bucket.deletedAt(sessionId); } catch { at = null; }
+  try { await catalogQueue(() => forgetMissingEntries(bucket, prefix, [sessionId])); }
+  catch (err: any) { logger.warn('s3', `恢复 ${sessionId}：桶里没文件，想从 catalog 移掉也没成功：${err?.message || err}`); }
+  logger.warn('s3', `恢复 ${sessionId}：桶里已经没有它的文件（${typeof at === 'number' ? new Date(at).toISOString() : '删除时间不详'}），从 catalog 移除`);
+  const when = typeof at === 'number' ? new Date(at).toLocaleString() : tr('time unknown');
+  return { ok: false, gone: true, error: tr('This backup has already been deleted ({when}); the catalog had not been cleaned up. It has now been removed from the list.', { when }) };
 }
 
 /**
@@ -5331,23 +5396,15 @@ async function keepLocalSession(creds: S3Creds, prefix: string | undefined, sess
  * `s3:delete-project` 和 `s3:delete-sessions` 共用 —— 顺序和理由见下面每一步。
  */
 async function deleteBackupsOf(
-  creds: any, prefix: string | undefined, catalog: Catalog, goneIds: Set<string>,
+  creds: S3Creds, prefix: string | undefined, goneIds: Set<string>,
 ): Promise<{ deleted: number; failed: string[] }> {
-  let deleted = 0;
-  const failed: string[] = [];
-  for (const id of goneIds) {
-    const pfx = `${keyFor(prefix, path.join('sessions', id))}/`;
-    for (const obj of await listObjects(creds, pfx)) {
-      try { await deleteObject(creds, obj.key); deleted += 1; }
-      catch (err: any) { failed.push(tr('{key}: {error}', { key: obj.key, error: String(err?.message || err) })); }
-    }
-  }
   /*
-    catalog 最后写：先写的话中途失败会留下一个"指向已删对象"的 catalog，
-    而那比"多列了几条还在的"更糟 —— 点恢复只会得到一句看不懂的错误。
+    对象先删、catalog 最后写（写删除记录，重读最新的再条件写 —— 见 catalogStore.ts）：
+    不再拿开头读到的快照整份写回，连点几次删除不会把前一次删掉的条目复活。
+    调用方已经在 catalogQueue 里。
   */
-  const nextCatalog: Catalog = { version: 1, entries: (catalog.entries || []).filter((e) => !goneIds.has(e.id)) };
-  await putObject(creds, catalogKey(prefix), Buffer.from(JSON.stringify(nextCatalog, null, 2)), 'application/json');
+  const { deleted, failed, at } = await deleteSessionBackups(catalogBucket(creds, prefix), prefix, goneIds);
+  for (const id of goneIds) backupDeletedAt.set(id, at);
   /*
     **本地那张"传过什么"的状态表也要清掉这几条** —— 不清的话下一轮同步会认为
     "这些文件没变、跳过"，于是本地还在的那些**再也不会被重新传上去**。
@@ -5490,6 +5547,9 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
   const marks = readSessionMarks(S3_MARKS_PATH);
   /** 这一轮真的传了文件的那些会话 —— 只给它们更新"最后同步时间"。 */
   const touchedSessions = new Set<string>();
+  /** 这一轮每条会话最后一个文件真的传上去的时刻 —— catalog 条目的 `uploadedAt`（和删除记录比谁新）。 */
+  const uploadedAtBySession = new Map<string, number>();
+  const syncStartedAt = Date.now();
   let uploaded = 0;
   let bytes = 0;
   try {
@@ -5677,7 +5737,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         一条一周没动过的会话也会被说成"刚刚同步过"（见 `readSessionMarks` 那段）。
       */
       const sid = sessionIdOfRel(rel);
-      if (sid) touchedSessions.add(sid);
+      if (sid) { touchedSessions.add(sid); uploadedAtBySession.set(sid, Date.now()); }
       /* 项目记忆也记一笔「什么时候真的传上去的」—— 备份/恢复界面的项目行要显示它 */
       const pm = /^memory[\\/]projects[\\/]([^\\/]+)[\\/]memory\.md$/.exec(rel);
       if (pm) touchedProjectMemory.set(pm[1], Math.floor(st.mtimeMs));
@@ -5687,8 +5747,31 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       **冲突的那几条不进 catalog** —— 它们传到了 conflicts/ 下，让 catalog 指向它们
       等于把"可恢复"这件事说错了。
     */
-    const merged = mergeCatalog(oldCatalog, freshEntries.filter((e) => !conflictIds.has(e.id)));
-    await putObject(creds!, catalogKey(cfg.prefix), Buffer.from(JSON.stringify(merged, null, 2)), 'application/json');
+    /*
+      **写之前重读最新的再合并**（排队 + 条件写，见 catalogStore.ts）：开头读到的 oldCatalog 只用来做冲突检测 /
+      位置跟随，不再拿它整份写回 —— 那会把这一轮期间的删除、别的机器写的都盖掉。
+      `uploadedAt`：这一轮真传了文件的用这一轮的时刻，没传的用本机上次真传它的时刻（marks）——
+      这样删除记录之后没有重新上传的条目不会被这一轮复活。
+    */
+    const fresh = freshEntries.filter((e) => !conflictIds.has(e.id)).map((e) => {
+      const at = entryUploadedAt(e.id, uploadedAtBySession, marks);
+      return at ? { ...e, uploadedAt: at } : e;
+    });
+    const wrote = await catalogQueue(() => writeSyncCatalog(catalogBucket(creds!, cfg.prefix), cfg.prefix, fresh));
+    for (const r of wrote.removed) {
+      logger.warn('s3', `catalog 里「${r.title}」(${r.id}) 在桶里已经没有文件（${new Date(r.deletedAt).toLocaleString()} 删掉的），从目录里移除`);
+    }
+    if (wrote.attempts > 1) logger.info('s3', `catalog 写之前别处刚改过，重读合并了 ${wrote.attempts - 1} 次`);
+    /*
+      这一轮期间本机删掉的备份：开头读的状态表里还记着它们"传过了"，原样写回去就把删除那边清掉的记录盖回来了 ——
+      本地还在的那几条就再也不会被重新传上去。去掉它们，下一轮照常重传（和不交错时一样）。
+    */
+    for (const [id, at] of backupDeletedAt) {
+      if (at < syncStartedAt) continue;
+      for (const rel of Object.keys(state)) if (sessionIdOfRel(rel) === id) delete state[rel];
+      delete marks[id];
+      touchedSessions.delete(id);
+    }
     writeState(S3_STATE_PATH, state);
     /*
       **只更新这一轮真的传过的那些**。给所有会话盖一个 now 就又回到 catalog 那个毛病了：
@@ -5704,7 +5787,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       const now = Date.now();
       const byId = new Map(sessions.map((r) => [r.id, r]));
       for (const id of touchedSessions) {
-        marks[id] = { at: now, updatedAt: byId.get(id)?.updatedAt || 0 };
+        marks[id] = syncMark(now, byId.get(id)?.updatedAt || 0, uploadedAtBySession.get(id));
       }
       writeSessionMarks(S3_MARKS_PATH, marks);
     }
@@ -7225,9 +7308,11 @@ app.whenReady().then(async () => {
     if (problem) return { entries: [], error: problem };
     const cfg = loadSyncConfig();
     try {
-      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
-      if (!raw) return { entries: [], error: tr('There are no backups in this bucket yet (sync once first).') };
-      const catalog = JSON.parse(raw.toString('utf-8')) as Catalog;
+      /* 先按删除记录收拾一遍（删掉的不列），再核对桶里真有文件（见 listMissing） */
+      const bucket = catalogBucket(creds!, cfg.prefix);
+      const catalog = await readCatalog(catalogIO(bucket, cfg.prefix));
+      if (!catalog) return { entries: [], error: tr('There are no backups in this bucket yet (sync once first).') };
+      const missing = await listMissing(bucket, catalog);
       const localRecs = store.listSessions();
       const local = new Set(localRecs.map((r) => r.id));
       /*
@@ -7261,7 +7346,7 @@ app.whenReady().then(async () => {
       return {
         memoryByProject,
         /* 分组 / 归档按 catalog 自己的（恢复页显示的是云上那份），本机归档了没有不管 */
-        entries: (catalog.entries || []).filter((e) => !hidden.has(e.id)).map((e) => ({
+        entries: markMissing((catalog.entries || []).filter((e) => !hidden.has(e.id)), missing).map((e) => ({
           ...e,
           project: catalogProject(e, projectById.get(e.id)),
           existsLocally: local.has(e.id),
@@ -7309,15 +7394,16 @@ app.whenReady().then(async () => {
     if (confirm !== project) return { ok: false, error: tr('Not confirmed: the project to delete must be passed back exactly.') };
     { const advRefused = refuseAdvancedProject(project, 's3:delete-project'); if (advRefused) return { ok: false, error: advRefused }; }
     const cfg = loadSyncConfig();
-    try {
+    /* 整个删除排进 catalog 队列：catalog 在队列里现读，不拿排队之前的快照 */
+    return catalogQueue(async () => { try {
       /*
         **桶里有哪些会话属于这个项目**：catalog 是权威的（它记的是"备份时属于哪个项目"）。
         本地记录只用来补 catalog 里缺 project 的老条目 —— 和恢复列表同一条规则。
       */
-      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
-      if (!raw) return { ok: false, error: tr('The bucket has no catalog yet (never synced).') };
-      let catalog: Catalog;
-      try { catalog = JSON.parse(raw.toString('utf-8')) as Catalog; } catch { return { ok: false, error: tr('The catalog could not be read.') }; }
+      let catalog: Catalog | null;
+      try { catalog = await readCatalog(catalogIO(catalogBucket(creds!, cfg.prefix), cfg.prefix)); }
+      catch (err: any) { if (err instanceof S3Error) throw err; return { ok: false, error: tr('The catalog could not be read.') }; }
+      if (!catalog) return { ok: false, error: tr('The bucket has no catalog yet (never synced).') };
       const projectById = new Map(store.listSessions().map((r) => [r.id, projectOf(r)]));
       /* 本机藏起来的 advanced 会话（flow / skill）不算这个项目的、不删 —— 它们由 advanced 自己同步 */
       const hidden = store.listAdvancedOnlyIds();
@@ -7327,14 +7413,14 @@ app.whenReady().then(async () => {
       const mine = candidates.filter((e) => !cloud.advanced.has(e.id) && !cloud.unreadable.has(e.id));
       if (!mine.length) return { ok: false, error: tr('The bucket has no backups belonging to "{project}".', { project: project || tr('Unassigned') }) };
 
-      const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, catalog, new Set(mine.map((e) => e.id)));
+      const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, new Set(mine.map((e) => e.id)));
       logger.warn('s3', `删掉了「${project || '未分组'}」在桶里的备份：${mine.length} 条会话 / ${deleted} 个对象`
         + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地一个字都没动）`);
       return { ok: true, sessions: mine.length, deleted, failed };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
-    }
+    } });
   });
 
   /**
@@ -7379,11 +7465,15 @@ app.whenReady().then(async () => {
     const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id));
     if (!want.length) return { ok: false, error: tr('No sessions selected.') };
     const cfg = loadSyncConfig();
-    try {
-      const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
-      if (!raw) return { ok: false, error: tr('The bucket has no catalog yet (never synced).') };
-      let catalog: Catalog;
-      try { catalog = JSON.parse(raw.toString('utf-8')) as Catalog; } catch { return { ok: false, error: tr('The catalog could not be read.') }; }
+    /*
+      整个删除排进 catalog 队列，catalog 在队列里现读 ——「连点 8 次删除」时后一次不再拿着前一次之前的快照，
+      写回时把前一次刚删的复活（见 catalogStore.ts）。
+    */
+    return catalogQueue(async () => { try {
+      let catalog: Catalog | null;
+      try { catalog = await readCatalog(catalogIO(catalogBucket(creds!, cfg.prefix), cfg.prefix)); }
+      catch (err: any) { if (err instanceof S3Error) throw err; return { ok: false, error: tr('The catalog could not be read.') }; }
+      if (!catalog) return { ok: false, error: tr('The bucket has no catalog yet (never synced).') };
       const inBucket = new Set((catalog.entries || []).map((e) => e.id));
       /* 本机藏起来的 advanced 会话（flow / skill）：恢复页不列它们，这里也绝不删它们在桶里的备份 */
       const hidden = store.listAdvancedOnlyIds();
@@ -7393,14 +7483,34 @@ app.whenReady().then(async () => {
       const gone = new Set(want.filter((id) => inBucket.has(id) && !hidden.has(id) && !cloud.advanced.has(id) && !cloud.unreadable.has(id)));
       if (!gone.size) return { ok: false, error: tr('None of the selected sessions are in the bucket any more.') };
       const willReturn = [...gone].filter((id) => local.has(id));
-      const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, catalog, gone);
+      const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, gone);
       logger.warn('s3', `删掉了 ${gone.size} 条会话的备份 / ${deleted} 个对象`
         + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地没动；其中 ${willReturn.length} 条本地还在，下次同步会再传）`);
       return { ok: true, sessions: gone.size, deleted, failed, willReturn };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
-    }
+    } });
+  });
+
+  /**
+   * **从目录里移除** —— 恢复页里「备份文件已删除」那几条的按钮：catalog 里有、桶里已经没有文件的条目
+   * （老版本删除时 catalog 写回出了并发问题留下的）。只移确实没文件的；还有文件的不动（见 `forgetMissingEntries`）。
+   */
+  ipcMain.handle('s3:forget-backups', async (_event, ids: string[]) => {
+    const { creds, problem } = syncCredsOrProblem();
+    if (problem) return { ok: false, error: problem };
+    const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id));
+    if (!want.length) return { ok: false, error: tr('No sessions selected.') };
+    const cfg = loadSyncConfig();
+    return catalogQueue(async () => { try {
+      const r = await forgetMissingEntries(catalogBucket(creds!, cfg.prefix), cfg.prefix, want);
+      if (r.removed.length) logger.info('s3', `从 catalog 移除了 ${r.removed.length} 条已经没有备份文件的条目：${r.removed.join('、')}`);
+      return { ok: true, ...r };
+    } catch (err: any) {
+      const hint = err instanceof S3Error ? err.hint : '';
+      return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    } });
   });
 
   /**
@@ -7431,7 +7541,7 @@ app.whenReady().then(async () => {
     try {
       const prefix = `${keyFor(cfg.prefix, path.join('sessions', sessionId))}/`;
       const objects = await listObjects(creds!, prefix);
-      if (!objects.length) return { ok: false, error: tr('The bucket has no files for {id}.', { id: sessionId }) };
+      if (!objects.length) return backupGoneReply(creds!, cfg.prefix, sessionId);
       const vetted = await refuseAdvancedBackup(creds!, prefix, objects, sessionId); if ('refused' in vetted) return { ok: false, error: vetted.refused };
 
       const localDir = path.join(KIROLEX_HOME, 'sessions', sessionId);

@@ -22,7 +22,11 @@ test('按会话删：id 过白名单，只删桶里有的', () => {
 test('删项目和删会话共用一段：catalog 最后写、本地状态表一起清', () => {
   const at = M.indexOf('async function deleteBackupsOf(');
   const body = M.slice(at, M.indexOf('\n}\n', at));
-  assert.ok(body.indexOf('deleteObject') < body.indexOf('putObject(creds, catalogKey'), 'catalog 必须在删完对象之后写');
+  /* 删对象 + 写删除记录在 catalogStore.ts 的 deleteSessionBackups（写前重读最新的 catalog） */
+  assert.match(body, /await deleteSessionBackups\(/);
+  const CS = fs.readFileSync(new URL('../src/main/catalogStore.ts', import.meta.url), 'utf8');
+  const d = CS.slice(CS.indexOf('export async function deleteSessionBackups('));
+  assert.ok(d.indexOf('await bucket.del(') > 0 && d.indexOf('await bucket.del(') < d.indexOf('await updateCatalog('), 'catalog 必须在删完对象之后写');
   assert.match(body, /writeState\(S3_STATE_PATH, state\)/);
   assert.match(body, /writeSessionMarks\(S3_MARKS_PATH, marks\)/);
   /* 两个入口都走它，不是各抄一份 */

@@ -143,9 +143,27 @@ export interface CatalogEntry {
    * 老条目没有 → 0（永远不会被拿去跟随）。
    */
   placementChangedAt?: number;
+  /**
+   * 这条会话的文件**真的**传到桶里的最后时刻（上传那台机器的时钟）——和删除记录比谁新用（见 `catalogStore.ts`）。
+   * 不能用 `syncedAt`：那个每一轮给所有条目盖同一个 now，没传文件的条目也会显得"刚传过"，删掉的就又复活了。
+   * 老条目没有 → 0（有删除记录时一律当删除更新）。
+   */
+  uploadedAt?: number;
 }
 
-export interface Catalog { version: 1; entries: CatalogEntry[] }
+/**
+ * **删除记录（tombstone）** —— 某条会话的备份在 `at`（删除那台机器的时钟）被删掉了。
+ * 格式和云端回收站（DeviceManifest.deleted）共用：`{ id, at }`。
+ * 合并时删除记录比条目新（`at >= uploadedAt`）→ 条目不许复活；之后真的又上传过（`uploadedAt > at`）→ 条目回来、记录作废。
+ */
+export interface Tombstone { id: string; at: number }
+
+export interface Catalog {
+  version: 1;
+  entries: CatalogEntry[];
+  /** 删除记录。老 catalog 没有。 */
+  deleted?: Tombstone[];
+}
 
 /**
  * 一条会话"放在哪儿"：哪个项目、归没归档、这个位置是什么时候被用户改的。
@@ -471,7 +489,8 @@ export function mergeCatalog(old: Catalog | null, fresh: CatalogEntry[]): Catalo
   for (const e of old?.entries || []) byId.set(e.id, e);
   for (const e of fresh) byId.set(e.id, e);
   const entries = Array.from(byId.values()).sort((a, b) => (b.updatedAt || 0) - (a.updatedAt || 0));
-  return { version: 1, entries };
+  /* 别的字段（删除记录 deleted 等）原样带着 —— 丢了删除记录，删掉的条目就会被别的机器的旧条目复活 */
+  return { ...(old || {}), version: 1, entries };
 }
 
 /**
@@ -510,6 +529,12 @@ export interface SessionSyncMark {
   at: number;
   /** 上传那一刻它的 `record.updatedAt` —— 用来判断之后有没有新改动。 */
   updatedAt: number;
+  /**
+   * 这条会话最后一个文件**真的传完**的时刻 —— catalog 条目的 `uploadedAt`，和删除记录比谁新（见 catalogStore.ts）。
+   * 不能用 `at`：那是整轮同步结束时才盖的，传完之后、这一轮结束之前别的机器删了它，`at` 会晚于删除记录，
+   * 下一轮没上传也会被当成"删除之后又传过"，把没文件的条目复活。老的 marks 没有这个字段。
+   */
+  uploadedAt?: number;
 }
 export type SessionSyncMarks = Record<string, SessionSyncMark>;
 
