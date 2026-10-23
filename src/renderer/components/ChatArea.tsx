@@ -60,6 +60,8 @@ import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, a
 import { visit } from 'unist-util-visit';
 import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, switchFailureNotice, cleanIpcError, type RequestStatusMap, type SwitchWhat } from '../sessionRequestStatus.ts';
 import { comboSelectView, type ComboListView } from '../comboPick.ts';
+import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
+import { engineLabel as engineDisplayName } from '../engineLabel.ts';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -1646,6 +1648,59 @@ const HandoffStack = memo<{ items: QueuedMessage[]; engineName: string }>(({ ite
 /** Queued follow-ups panel. Rendered as its own in-flow row between the message
  *  list and the composer (NOT an absolute overlay) so it never covers the chat
  *  or the input box -- the message list shrinks to give the queue its own space. */
+/**
+ * **新建会话的启动阶段条** —— 会话顶部：「连接远端 → 检查环境 → 启动 <引擎> → 就绪」+ 已用秒数；
+ * 失败时说清原因，给「重试」（远程会话再加「改成本机运行」）。判据在 `createStages.ts`。
+ */
+function StartupBanner({ info, onRetry }: { info: CreateStageInfo; onRetry?: (local: boolean) => void }) {
+  const t = useT();
+  const [now, setNow] = useState(() => Date.now());
+  const running = info.stage !== 'ready' && info.stage !== 'failed';
+  useEffect(() => {
+    if (!running) return;
+    setNow(Date.now());
+    const timer = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [running, info.startedAt]);
+  const engine = engineDisplayName(info.engine);
+  const label = (key: string) => key === 'connect' ? t('Connect to remote')
+    : key === 'check' ? t('Check environment')
+    : key === 'start' ? t('Start {engine}', { engine })
+    : t('Ready');
+  const secs = startupElapsedSeconds(info, now);
+  return (
+    <div className={`startup-banner ${info.stage}`} role={info.stage === 'failed' ? 'alert' : 'status'} aria-live="polite">
+      <span className="startup-banner-title">
+        {info.stage === 'failed' ? t('⚠️ This chat could not start')
+          : info.stage === 'ready' ? t('✅ {engine} is ready', { engine })
+          : t('⏳ Starting {engine}… {s}s', { engine, s: secs })}
+      </span>
+      <span className="startup-steps">
+        {startupSteps(info).map((step, i) => (
+          <span key={step.key} className={`startup-step ${step.state}`}>
+            {i > 0 && <span className="startup-step-arrow" aria-hidden="true">→</span>}
+            {step.state === 'done' ? '✓ ' : step.state === 'failed' ? '✕ ' : ''}{label(step.key)}
+          </span>
+        ))}
+      </span>
+      {info.stage === 'failed' && (
+        <div className="startup-banner-failure">
+          <span className="startup-banner-error">{cleanIpcError(info.error || '') || t('Unknown error')}</span>
+          {onRetry && (
+            <span className="startup-banner-actions">
+              <button type="button" className="startup-banner-btn" onClick={() => onRetry(false)}>{t('Retry')}</button>
+              {info.remote && (
+                <button type="button" className="startup-banner-btn" onClick={() => onRetry(true)}
+                  title={t('Create this chat again on this machine instead of the remote one')}>{t('Run on this machine instead')}</button>
+              )}
+            </span>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
+
 const QueueStack = memo<{
   queuedMessages: QueuedMessage[];
   onCancelQueuedMessage: (queueId: string) => void;
@@ -1653,7 +1708,9 @@ const QueueStack = memo<{
   onMoveQueuedMessage: (queueId: string, direction: -1 | 1) => void;
   /** Whether the whole queue will be sent as ONE merged turn (Settings toggle). */
   mergeQueued: boolean;
-}>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued }) => {
+  /** 新建的会话引擎还没就绪：标题换成「排队中，<引擎> 就绪后自动发出」（引擎名） */
+  waitingForEngine?: string;
+}>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued, waitingForEngine }) => {
   const t = useT();
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = useState('');
@@ -1662,7 +1719,7 @@ const QueueStack = memo<{
     <div className="queue-row">
       <div className="queue-stack">
         <div className="queue-stack-header">
-          <span>{t('Queued follow-ups')}</span>
+          <span>{waitingForEngine ? t('Queued — sends automatically once {engine} is ready', { engine: waitingForEngine }) : t('Queued follow-ups')}</span>
           {/* The merge setting CHANGES the meaning of this queue (one turn vs N
               turns), so it has to be visible right here — not only in Settings. */}
           <span
@@ -2929,6 +2986,10 @@ interface ChatAreaProps {
   scheduleSummary?: ScheduleSummary | null;
   /** 模型起的、**还在跑**的后台命令 / 监视（`runningBgJobs` 过滤好的）。空数组 = 那一行不出现。 */
   bgJobs?: BgJobRow[];
+  /** 新建的会话正在启动 / 启动失败 / 刚就绪（`createStages.ts`）—— 没有 = 那一条不出现 */
+  startup?: CreateStageInfo | null;
+  /** 启动失败时的「重试」/「改成本机运行」（local = true） */
+  onRetryStartup?: (local: boolean) => void;
   /** 停掉一个（主进程只结束它自己起的那个进程，并在会话里说一声）。 */
   onStopBgJob?: (jobId: string) => void;
 
@@ -3059,6 +3120,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   scheduleSummary,
   bgJobs,
   onStopBgJob,
+  startup,
+  onRetryStartup,
   projectName,
   onPauseSchedule,
   onCancelSchedule,
@@ -4249,6 +4312,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
       )}
 
+      {/* 新建会话的启动阶段：放最上面 —— 这时候整条会话就在等它 */}
+      {startup && <StartupBanner info={startup} onRetry={onRetryStartup} />}
+
       {connectionError && messages.length > 0 && (
         <div className="chat-error-banner" role="alert">
           <span className="chat-error-banner-text"><NoticeBody text={bannerText(shownIn(findLang, connectionError) ?? '')} /></span>
@@ -4631,6 +4697,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           onEditQueuedMessage={onEditQueuedMessage}
           onMoveQueuedMessage={onMoveQueuedMessage}
           mergeQueued={mergeQueuedMessages}
+          waitingForEngine={startup && startup.stage !== 'ready' ? engineDisplayName(startup.engine) : undefined}
         />
       )}
 

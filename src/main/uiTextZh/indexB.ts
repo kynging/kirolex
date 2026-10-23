@@ -200,6 +200,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   'Failed to get usage': '获取用量失败',
   'Session was deleted; not re-attaching.': '会话已被删除，不再重新连接。',
   'Session was deleted during attach; aborted.': '连接过程中会话被删除了，已中止。',
+  'This chat could not be started: {error}': '这条会话没能启动：{error}',
   'projectId is write-once; it cannot be changed once set.': 'projectId 只能设置一次，设置后不能再改。',
   'This session belongs to KiroLex Advanced; the standard edition does not modify it.': '这条会话属于 KiroLex Advanced（流程 / skill），标准版不显示也不改它。',
   'This project belongs to KiroLex Advanced; the standard edition does not modify it.': '这个项目属于 KiroLex Advanced（流程项目），标准版不显示也不改它。',

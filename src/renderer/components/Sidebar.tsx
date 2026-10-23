@@ -305,6 +305,7 @@ const SessionItem: React.FC<{
   const dotTitle =
     busyReason === 'reconfiguring' ? t('Busy: switching model / agent…')
     : busyReason === 'attaching' ? t('Busy: connecting / reconnecting the backend…')
+    : busyReason === 'creating' ? t('Busy: starting the engine; messages queue until it is ready')
     : busyReason === 'priming' ? t('Busy: rebuilding history (press Stop to give up)')
     : busyReason === 'prime-pending' ? t('Busy: history missing, about to rebuild it; new messages wait')
     : busyReason === 'turn' ? t('Busy: turn in progress…')
@@ -820,7 +821,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
     // Backend occupancy reported by main: the dot must show it even when this
     // renderer has no local streaming/connecting state for that session.
     if (busy === 'turn') return 'streaming';
-    if (busy === 'reconfiguring' || busy === 'attaching') return 'connecting';
+    if (busy === 'reconfiguring' || busy === 'attaching' || busy === 'creating') return 'connecting';
     if (connectingSessionIds.includes(id)) return 'connecting';
     /*
       **连不上 → 红**（在 unread/dormant 之前判）。下面那段注释说的"还没 attach 不该报警"仍然成立 ——

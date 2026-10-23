@@ -329,4 +329,18 @@ export const ZH_CHAT: Record<string, string> = {
   'Switch failed': '切换失败',
   '{why}\nClick to dismiss.': '{why}\n点一下关掉。',
   '⚠ The source chat ran on remote target {host}, which is no longer in your settings. KiroLex did not move this copy to another machine: right-click it → Runs on to pick one before sending.': '⚠ 源会话跑在远程目标 {host} 上，但设置里已经没有这台机器了。KiroLex 没有把这份副本换到别的机器上：发消息前先右键它 →「运行位置」选一台。',
+  /* 新建会话的启动阶段条 / 就绪前的排队（createStages.ts） */
+  'Connect to remote': '连接远端',
+  'Check environment': '检查环境',
+  'Start {engine}': '启动 {engine}',
+  'Ready': '就绪',
+  '⚠️ This chat could not start': '⚠️ 这条会话没能启动',
+  '✅ {engine} is ready': '✅ {engine} 已就绪',
+  '⏳ Starting {engine}… {s}s': '⏳ 正在启动 {engine}… 已用 {s} 秒',
+  'Unknown error': '未知错误',
+  'Retry': '重试',
+  'Run on this machine instead': '改成本机运行',
+  'Create this chat again on this machine instead of the remote one': '不用远端了，在本机重新建这条会话',
+  'Queued — sends automatically once {engine} is ready': '排队中，{engine} 引擎就绪后自动发出',
+  'Busy: starting the engine; messages queue until it is ready': '占用中：正在启动引擎，消息先排队、就绪后自动发出',
 };

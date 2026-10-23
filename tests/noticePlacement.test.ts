@@ -126,7 +126,7 @@ describe('自动改用备用模型：进对话记录，说清实际用的是哪�
   });
 
   test('新建会话：记录落盘（createSession + writeRecord）之后才 commit 那句；session/new 失败就 discard；界面把它插进这条正在新建的会话', () => {
-    const at = M.indexOf("const rec = store.createSession(kiroLexId, profile);");
+    const at = M.indexOf("const rec = store.readRecord(kiroLexId) || store.createSession(kiroLexId, profile);");
     assert.ok(at > 0);
     assert.match(M.slice(at, at + 900), /store\.writeRecord\(rec\);[\s\S]{0,200}modelFallback\.commit\(kiroLexId\);/);
     assert.match(M, /try \{ await client\.disconnect\(\); \} catch \{ \/\* 已经没了 \*\/ \}\s*\n\s*modelFallback\.discard\(kiroLexId\);/);

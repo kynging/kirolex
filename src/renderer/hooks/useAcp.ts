@@ -57,6 +57,7 @@ import { adapterInstallStore, setAdapterInstallRunner } from '../adapterInstallS
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
 import { engineLabel } from '../engineLabel';
+import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -154,7 +155,7 @@ export const APP_ERROR_KEY = '__app__';
  *  would otherwise answer from nothing, so new messages QUEUE behind the rebuild.
  *  The rebuild has no attempt limit, so the ONLY releases are the user pressing
  *  Stop (abandon) or clearing the history. */
-export const OCCUPYING_BUSY_REASONS = new Set(['turn', 'reconfiguring', 'attaching', 'priming', 'prime-pending']);
+export const OCCUPYING_BUSY_REASONS = new Set(['turn', 'reconfiguring', 'attaching', 'priming', 'prime-pending', 'creating']);
 export function isBackendOccupied(reason: string | null | undefined): boolean {
   return !!reason && OCCUPYING_BUSY_REASONS.has(reason);
 }
@@ -640,6 +641,31 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  'attaching' | 'priming'. Rendered on the sidebar dot + composer so an
    *  occupied session is visible BEFORE the user tries to act on it. */
   const [busyBySession, setBusyBySession] = useState<Record<string, string>>({});
+  /**
+   * **新建会话的启动阶段**（`createStages.ts` / main 的 `creationGate.ts`）：会话顶部那条「连接远端 → 检查环境 →
+   * 启动引擎 → 就绪」、以及这时候发的消息进排队、就绪后自动发。点「新建」当场先填一份（主进程第一次推送前也看得见），
+   * 之后以主进程推来的为准；窗口刷新后拿一次快照。「就绪」留一小会儿再摘掉。
+   */
+  const [createStages, setCreateStages] = useState<Record<string, CreateStageInfo>>({});
+  /**
+   * 刷新后的那份快照到了没有 —— 没到之前排空不能动：窗口刷新时恢复出来的排队消息会抢在快照前面发出去，
+   * 而那条会话可能正失败着（实测：失败后刷新，横幅回来之前那条排队消息已经去连了一次）。
+   */
+  const [createStagesLoaded, setCreateStagesLoaded] = useState(!window.kiroApi?.getCreateStages);
+  useEffect(() => {
+    const timers = new Set<ReturnType<typeof setTimeout>>();
+    const take = (info: CreateStageInfo) => {
+      setCreateStages((prev) => applyCreateStage(prev, info));
+      if (info?.stage === 'ready') {
+        const timer = setTimeout(() => { timers.delete(timer); setCreateStages((prev) => clearCreateStage(prev, info.sessionId, true)); }, 2500);
+        timers.add(timer);
+      }
+    };
+    const off = window.kiroApi.onCreateStage?.(take);
+    void window.kiroApi.getCreateStages?.().then((list) => { for (const info of list || []) take(info); }).catch(() => {})
+      .finally(() => setCreateStagesLoaded(true));
+    return () => { off?.(); for (const timer of timers) clearTimeout(timer); };
+  }, []);
   // Connecting (attaching) set (mirrors connectingSessionIds state).
   const connectingRef = useRef<Set<string>>(new Set());
   // When sessionId is missing from an update, use the last session we prompted
@@ -725,6 +751,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const creatingRef = useRef<Map<string, Promise<string>>>(new Map());
   /** 新建没成的会话（主进程那边还没有记录）：怎么再建一次 —— 会话里点「安装」装好适配器之后用它重连（`reconnectAfterInstall`）。 */
   const failedCreateRef = useRef<Map<string, () => Promise<unknown>>>(new Map());
+  /** 新建时传给主进程的那几样 —— 阶段条上「重试 / 改成本机运行」照它再建一次（`retryCreateSession`） */
+  const createArgsRef = useRef<Map<string, CreateArgs>>(new Map());
   // Mid-turn steers written into a running turn but NOT yet consumed by the
   // agent, keyed by sessionId. Each entry keeps its optimistic user-message id
   // so `steer_consumed` can flip the badge to 'consumed', and turn-end can
@@ -1004,6 +1032,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
   const addAttached = (sid: string) => {
     if (!sid) return;
+    /* 连上了（不管经哪条路）：启动失败的横幅收掉，排队的才能发（`settleStageOnAttach`） */
+    setCreateStages((prev) => settleStageOnAttach(prev, sid, creatingRef.current.has(sid)));
     if (!attachedIdsRef.current.has(sid)) {
       attachedIdsRef.current.add(sid);
       setAttachedSessionIds(Array.from(attachedIdsRef.current));
@@ -3270,12 +3300,49 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       },
       ...prev,
     ]);
-    markConnecting(id); // flash while the executor spawns
 
     // Register the in-flight creation so a send before connect finishes awaits
     // this same attach (id is already stable, so no swap — just gate readiness).
     if (opts?.remoteId) intendedRemoteRef.current.set(id, opts.remoteId);
     if (opts?.engine && opts.engine !== 'kiro') intendedEngineRef.current.set(id, opts.engine);
+    const args: CreateArgs = { cwd, model, projectId, kiroAgent, remoteId: opts?.remoteId, engine: opts?.engine };
+    createArgsRef.current.set(id, args);
+    void startCreate(id, args).catch(() => { /* 失败已经在会话里说了（阶段条 + 提示） */ });
+    return id;
+  }, [connect]);
+
+  /**
+   * **再建一次没建成的新会话**（阶段条上的「重试」/「改成本机运行」）。改成本机：侧栏那一行的机器徽标摘掉，
+   * 按本机再建（主进程那份先写的记录跟着改成本机，见 acp:new-session）。正在建的不重复建。
+   */
+  const retryCreateSession = useCallback(async (sid: string, opts?: { local?: boolean }) => {
+    if (creatingRef.current.has(sid)) return;
+    /* 窗口刷新过的话本窗口没记这份参数：用主进程留的那份（建成之前一直在） */
+    const mine = createArgsRef.current.get(sid);
+    let fromMain: CreateArgs | null = null;
+    if (!mine) { try { fromMain = (await window.kiroApi.getCreateArgs?.(sid)) || null; } catch { /* 拿不到就当没有 */ } }
+    const next = retryCreateArgs(mine, fromMain, !!opts?.local);
+    if (!next || creatingRef.current.has(sid)) return;
+    if (opts?.local) {
+      intendedRemoteRef.current.delete(sid);
+      setSessions((list) => list.map((s) => (s.id === sid ? { ...s, remoteHost: undefined, remoteId: undefined } : s)));
+    }
+    createArgsRef.current.set(sid, next);
+    failedCreateRef.current.delete(sid);
+    clearFailed(sid);
+    mutateSessionMessages(sid, (cur) => replaceConnectFailureNotices(cur));
+    try { await startCreate(sid, next); } catch { /* 同上：失败已经说了 */ }
+  }, []);
+
+  /**
+   * 跑一次新建（`acp:new-session`）：阶段条当场先亮（主进程第一次推送前也看得见），登记进 `creatingRef`
+   * （发送 / 切会话 / 预热据此等它，不去 attach 一条还没建完的会话）。
+   */
+  function startCreate(id: string, a: CreateArgs): Promise<string> {
+    const { cwd, model, projectId, kiroAgent } = a;
+    const opts = { remoteId: a.remoteId, engine: a.engine };
+    setCreateStages((prev) => applyCreateStage(prev, { sessionId: id, stage: a.remoteId ? 'connect' : 'check', engine: a.engine || 'kiro', remote: !!a.remoteId, startedAt: Date.now() }));
+    markConnecting(id); // flash while the executor spawns
     const createPromise = (async (): Promise<string> => {
       try {
         await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId, opts?.engine);
@@ -3296,6 +3363,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         const why = String(err?.message || err);
         /* 缺适配器的那种：提示上有「安装」，装好后照原样再建一次 */
         failedCreateRef.current.set(id, () => window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId, opts?.engine));
+        /* 阶段条换成「失败」+ 原因（主进程一般已经推过；IPC 本身失败时只有这里知道） */
+        setCreateStages((prev) => {
+          const cur = prev[id];
+          if (!cur || cur.stage === 'failed') return prev;
+          return applyCreateStage(prev, { ...cur, stage: 'failed', error: why, failedAt: cur.stage === 'ready' ? undefined : cur.stage });
+        });
         /* 和换机器重连失败那条同一个构造：整句（含 KiroLex 自己给的原因）都带中英两版 */
         mutateSessionMessages(id, (cur) => [...cur, connectFailureNotice(why, Date.now(), uiLangNow())]);
         throw err;                       // 让 await 这个 promise 的那一侧知道它失败了
@@ -3305,8 +3378,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       return id;
     })();
     creatingRef.current.set(id, createPromise);
-    return id;
-  }, [connect]);
+    return createPromise;
+  }
 
   // Duplicate a session: create a full copy at the same folder level, preserving
   // all messages and context. The backend kiro-cli session is NOT created yet;
@@ -3677,7 +3750,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // history, so cached messages are never duplicated.
     const isArchived = !!sessions.find((s) => s.id === sessionId)?.archived;
     const needsLoad = !attachedIdsRef.current.has(sessionId) || !cached || cached.length === 0;
-    if (!isArchived && needsLoad) {
+    /*
+      **还在新建的不 attach** —— 实测（s_1792726606826_e2mprs）：新建远程会话的第 10 秒这里就去 loadSession，
+      主进程那边记录还没写完，于是按默认值（本机 kiro）去连、报「该会话在磁盘上不存在」。新建自己会把执行器起好。
+    */
+    if (!isArchived && needsLoad && !creatingRef.current.has(sessionId)) {
       try {
         lastPromptedSessionRef.current = sessionId;
         markConnecting(sessionId); // flash while the executor attaches
@@ -3729,6 +3806,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const warmSession = useCallback(async (sessionId: string) => {
     const record = sessions.find((s) => s.id === sessionId);
     if (!record || record.archived || String(sessionId).startsWith('pending_')) return;
+    /* 还在新建：新建自己会起执行器，这里再 attach 就是按默认值去连一条还没写完的会话（见 switchSession 那段） */
+    if (creatingRef.current.has(sessionId)) return;
     if (!attachedIdsRef.current.has(sessionId)) {
       markConnecting(sessionId);
       try {
@@ -5483,6 +5562,10 @@ ${text}`,
     streamingIds,
     attachedSessionIds,
     busyBySession,
+    /** 新建会话的启动阶段（阶段条 + 就绪前的消息进排队），见 createStages.ts */
+    createStages,
+    createStagesLoaded,
+    retryCreateSession,
     usageBySession,
     /**
      * 某条会话**此刻**的用量读数 —— 读的是权威那份（`usageMapRef`），不是反应式镜像。

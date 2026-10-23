@@ -13,6 +13,7 @@ import { autoFoldPanels, filePanelMax } from './panelFit';
 // Both lines come from this one pure module so they cannot word the same job differently.
 import { schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
 import { runningBgJobs, type BgJobRow } from './bgJobsView';
+import { startupBlocksSend } from './createStages';
 // 给主会话的交底 —— 它原本对流程一无所知，连执行会话都不知道
 import { consumeHandoff } from './handoffDraft';
 // 哪几步共用一条会话 —— 和画布同源（草稿声明的泳道），驱动器不再各算一套
@@ -417,6 +418,9 @@ declare global {
       onTurnQuiet: (callback: (data: { sessionId: string; quietSeconds: number; openTools?: number; toolIdleSeconds?: number; interruptInSeconds?: number | null; boundBy?: 'tool' | 'quiet'; boundSeconds?: number }) => void) => () => void;
       onTurnWedged: (callback: (data: { sessionId: string; produced: boolean }) => void) => () => void;
       getBusyMap: () => Promise<Record<string, string>>;
+      getCreateStages?: () => Promise<import('./createStages').CreateStageInfo[]>;
+      getCreateArgs?: (sessionId: string) => Promise<import('./createStages').CreateArgs | null>;
+      onCreateStage?: (callback: (data: import('./createStages').CreateStageInfo) => void) => () => void;
       /** Is a turn running for this chat right now, and what has it produced? Lets a reloaded
        *  window adopt a turn that never stopped instead of resending the question. */
       peekTurn?: (sessionId: string) => Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }>;
@@ -905,6 +909,9 @@ const App: React.FC = () => {
     streamingIds,
     attachedSessionIds,
     busyBySession,
+    createStages,
+    createStagesLoaded,
+    retryCreateSession,
     usageBySession,
     usageOf,
     rebuildContext,
@@ -3016,8 +3023,9 @@ const App: React.FC = () => {
     // A switch takes seconds and ends with the chat ready, so the message simply
     // waits: the drain effect below already waits on `isBackendOccupied`, so it
     // leaves on its own the moment the switch completes.
-    if (sid && !text.trim().startsWith('/') && isBackendOccupied(busyBySession[sid])
-        && busyBySession[sid] !== 'turn') {
+    /* 新建的会话引擎还没就绪（或启动失败、还没重试）：同样进排队，界面上显示「排队中，引擎就绪后自动发出」 */
+    if (sid && !text.trim().startsWith('/') && ((isBackendOccupied(busyBySession[sid])
+        && busyBySession[sid] !== 'turn') || startupBlocksSend(createStages[sid]))) {
       // Via ref: handleQueueMessage is declared BELOW this callback, and a
       // later-declared const in a dependency array is evaluated during render and
       // would hit TDZ, crashing the whole tree.
@@ -3113,7 +3121,7 @@ const App: React.FC = () => {
       // focused -- see its own comment on why that is wrong in split view.
       sid || undefined,
     );
-  }, [attachedFor, clearAttachments, focusSession, sendMessage, currentSessionId, forceStop, selectedModel, discardUnconsumedSteers, clearConversation, busyBySession, loopingIds, streamingIds, cancelAutoResend]);
+  }, [attachedFor, clearAttachments, focusSession, sendMessage, currentSessionId, forceStop, selectedModel, discardUnconsumedSteers, clearConversation, busyBySession, createStages, loopingIds, streamingIds, cancelAutoResend]);
 
   // Explicit user Stop (composer stop button). Discard this session's un-consumed
   // steers FIRST so the turn-end reconcile finds nothing to re-queue (no phantom
@@ -3707,6 +3715,8 @@ const App: React.FC = () => {
   // the background after the user switches chats, matching MeshClaw slots.
   useEffect(() => {
     if (quitPending) return;
+    /* 刷新后先等新建阶段的快照：不然恢复出来的排队消息会抢在「这条会话启动失败了」之前发出去 */
+    if (!createStagesLoaded) return;
     for (const [sessionId, queue] of Object.entries(queuesBySession)) {
       if (
         queue.length === 0 ||
@@ -3715,6 +3725,8 @@ const App: React.FC = () => {
         // Draining into a rebuild would be rejected by main as "active turn";
         // the queue simply waits until the backend is free.
         isBackendOccupied(busyBySession[sessionId]) ||
+        /* 新建的会话还没就绪（或启动失败）：就绪后自动发；失败了等你点「重试 / 改成本机运行」 */
+        startupBlocksSend(createStages[sessionId]) ||
         // A loop owns its session, and it is idle BETWEEN iterations — exactly when
         // this drain would fire and slip a queued message between two loop turns.
         loopingIds.includes(sessionId) ||
@@ -3802,6 +3814,8 @@ const App: React.FC = () => {
     queuesBySession,
     streamingIds,
     busyBySession,
+    createStages,
+    createStagesLoaded,
     settings.mergeQueuedMessages,
     sendQueuedMessage,
     currentSessionId,
@@ -4197,6 +4211,8 @@ const App: React.FC = () => {
         onCancelSchedule={(id) => void cancelSchedule(id)}
         onSetScheduleExpiry={(id, change) => setScheduleExpiry(id, change)}
         bgJobs={bgJobsFor(sid)}
+        startup={sid ? createStages[sid] || null : null}
+        onRetryStartup={(local) => { if (sid) void retryCreateSession(sid, { local }); }}
         onStopBgJob={(jobId) => void stopBgJob(jobId)}
         onStopLoop={() => { if (sid) void stopLoop(sid); }}
       />

@@ -2182,6 +2182,43 @@ button, input, select, textarea {
 /* Standing schedule notice, above the transcript. Aligned with the error banner's gutters so
    the two stack cleanly when a scheduled chat is also showing an error. Quiet on purpose: it
    is a persistent fact about the chat, not an event. */
+/* 新建会话的启动阶段条（ChatArea 的 StartupBanner）：和定时任务横幅同一个位置、同一套样式 */
+.startup-banner {
+  margin: 10px 48px 0;
+  padding: 6px 12px;
+  border-radius: 8px;
+  background: rgba(124, 111, 224, 0.10);
+  border: 1px solid rgba(124, 111, 224, 0.26);
+  color: var(--accent);
+  font-size: 12px;
+  line-height: 1.5;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 4px 12px;
+}
+.startup-banner.ready { color: var(--success); border-color: rgba(76, 175, 80, 0.35); background: rgba(76, 175, 80, 0.10); }
+.startup-banner.failed { color: var(--error); border-color: rgba(239, 83, 80, 0.35); background: rgba(239, 83, 80, 0.12); }
+.startup-banner-title { font-weight: 600; font-variant-numeric: tabular-nums; }
+.startup-steps { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; }
+.startup-step { color: var(--text-muted); white-space: nowrap; }
+.startup-step.active { color: inherit; font-weight: 600; }
+.startup-step.done { color: inherit; opacity: 0.8; }
+.startup-step.failed { color: var(--error); font-weight: 600; }
+.startup-step-arrow { margin-right: 4px; color: var(--text-muted); }
+.startup-banner-failure { flex-basis: 100%; display: flex; align-items: flex-start; gap: 8px; }
+.startup-banner-error { flex: 1; min-width: 0; white-space: pre-wrap; word-break: break-word; }
+.startup-banner-actions { display: flex; gap: 6px; flex-shrink: 0; }
+.startup-banner-btn {
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.startup-banner-btn:hover { background: rgba(255, 255, 255, 0.06); }
 .schedule-banner {
   margin: 10px 48px 0;
   padding: 6px 12px;

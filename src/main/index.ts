@@ -83,6 +83,7 @@ import { isControlMessageId, tailEntries } from './controlSessions.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
+import { createCreationGate } from './creationGate.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
@@ -1159,8 +1160,10 @@ function cleanLiteOutput(stdout: string): string {
 /** Why a session's backend is currently occupied (null = free). The renderer
  *  renders this so an occupied session is VISIBLE up front instead of only
  *  surfacing as a "still in progress" / "Internal error" banner afterwards. */
-type BusyReason = 'turn' | 'reconfiguring' | 'attaching' | 'priming' | 'prime-pending' | null;
+type BusyReason = 'creating' | 'turn' | 'reconfiguring' | 'attaching' | 'priming' | 'prime-pending' | null;
 function busyReasonFor(sessionId: string): BusyReason {
+  /* 还在新建（执行器没起来）：占用 —— 这时发的消息进排队，就绪后自动发出 */
+  if (creations.creating(sessionId)) return 'creating';
   if (reconfiguringSessions.has(sessionId)) return 'reconfiguring';
   if (attachingSessions.has(sessionId)) return 'attaching';
   const entry = sessionClients.get(sessionId);
@@ -3645,6 +3648,21 @@ const deletedSessionIds = new Set<string>();
  * 之后右键换机器 / 目录 / 引擎时 `coldRecordFor` 靠它把这两样补回来（见 `coldRecord.ts`）。
  */
 const newSessionIntents = new Map<string, NewSessionIntent>();
+/**
+ * **正在新建的会话**（`creationGate.ts`）：阶段推给界面（`acp:create-stage`），忙闲报 `creating`（新消息进排队），
+ * attach 遇到它先等它建完 —— 不按默认值（本机 kiro）去 attach 一条记录还没写完的会话。
+ */
+/**
+ * 新建时渲染层传来的参数 —— 建成就删；没建成的留着，窗口刷新后阶段条上的「重试 / 改成本机运行」靠它照原样再建
+ * （渲染层自己记的那份随窗口刷新没了，见 `acp:get-create-args`）。只在内存里：重启之后记录已经在盘上，普通 attach 就行。
+ */
+const newSessionArgs = new Map<string, { cwd: string; model: string; projectId?: string; kiroAgent?: string; remoteId?: string; engine?: 'kiro' | 'claude' | 'codex' }>();
+const creations = createCreationGate({
+  onChange: (info) => {
+    mainWindow?.webContents.send('acp:create-stage', info);
+    emitSessionBusy(info.sessionId);
+  },
+});
 // Soft cap on ATTACHED executors (design §8). Dormant sessions are unbounded.
 // Default is a fixed 10 (「默认会话数设为 10」). It used to be auto-sized from RAM/CPU
 // into [4, 16], which on most machines simply meant 16 -- more kiro-cli processes
@@ -7527,7 +7545,8 @@ app.whenReady().then(async () => {
     remoteId?: string,
     /** 哪个引擎跑这条会话（`engines.ts`）；不传 = kiro，和所有老调用点一样。 */
     engineArg?: string,
-  ) => {
+  /* 整段登记成「正在新建」（`creations`）：阶段推给界面、忙闲报 creating、attach 等它建完 */
+  ) => creations.run(kiroLexId, { engine: engineOf({ engine: engineArg }), remote: !!remoteId }, async () => {
     const engine = engineOf({ engine: engineArg });
     /*
       **渲染层到底传了没有** ——「新会话就没有远程 tag」查了两轮都没抓到：`kirolex-new-chat-remote`
@@ -7537,6 +7556,7 @@ app.whenReady().then(async () => {
     logger.info('remote', `new-session ${kiroLexId}: remoteId=${remoteId ?? '(没传)'} project=${projectId || '(无)'} model=${model}`);
     /* 先记下选了什么：下面任何一步失败，这条会话都没有记录，右键切换时靠它补（`coldRecordFor`） */
     newSessionIntents.set(kiroLexId, { engine, remoteId: remoteId || undefined, projectId: projectId ?? null });
+    newSessionArgs.set(kiroLexId, { cwd, model, projectId: projectId || undefined, kiroAgent: kiroAgent || undefined, remoteId: remoteId || undefined, engine });
     { const advRefused = refuseAdvancedProject(projectId, 'new-session'); if (advRefused) throw new Error(advRefused); }
     if (!ensureExecutorCapacity()) {
       throw new Error(tr('All live sessions are busy; cannot start another right now.'));
@@ -7569,7 +7589,8 @@ app.whenReady().then(async () => {
       projectId: projectId ?? derived,
       kiroAgent: engine === 'kiro' ? (kiroAgent || undefined) : undefined,
       remote,
-      ...(engine !== 'kiro' ? { engine } : {}),
+      /* 引擎**写明**（kiro 也写）：记录里没有 engine 原来等于「按 kiro 算」，看日志时分不清是选了 kiro 还是丢了 */
+      engine,
       ...(newCombo.mcpCombo ? { mcpCombo: newCombo.mcpCombo } : {}),
     };
     // Remote sessions run kiro-cli on the remote host, so its working directory
@@ -7594,6 +7615,25 @@ app.whenReady().then(async () => {
       以及连那台机器用的私钥本身。挡在**建会话**这一步，因为等到第一次推送才报错时，
       那一轮已经等了几分钟、而且人根本不知道在等什么。
     */
+    /*
+      **记录在起执行器之前就落盘**（引擎、机器、工作目录都在里面）—— 原来要等执行器起来、session/new 回来
+      （远程实测 34 秒后）才写：这期间重启 / 窗口刷新，这条会话就没了，之后靠渲染层的兜底重建又会按默认值建成本机 kiro。
+      先写一份还没有 `cliSessionId` 的：重启后 attach 照它在对的机器上、用对的引擎新起；建成后下面再补上 cliSessionId。
+      已经有 cliSessionId 的（不该出现）不碰。
+    */
+    {
+      const early = store.readRecord(kiroLexId);
+      if (!early) {
+        const pre = store.createSession(kiroLexId, profile);
+        pre.localDir = profile.remote?.sshHost ? localDirOrSessionDir(kiroLexId, resolvedCwd) : resolvedCwd;
+        store.writeRecord(pre);
+      } else if (!early.cliSessionId) {
+        /* 失败后重试 / 改成本机再建：机器和引擎按这一次的 */
+        early.profile = { ...profile };
+        early.localDir = profile.remote?.sshHost ? localDirOrSessionDir(kiroLexId, resolvedCwd) : resolvedCwd;
+        store.writeRecord(early);
+      }
+    }
     /* 远端那台的模型清单 —— 交给 `connectWithModelFallback`，候选只留它有的 */
     let remoteModels: string[] | undefined;
     if (profile.remote?.sshHost) {
@@ -7615,6 +7655,7 @@ app.whenReady().then(async () => {
         profile.model = pickRemoteModel(kiroLexId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
       }
     }
+    creations.stage(kiroLexId, 'check');
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
       /* 本地：新会话也可能一建出来就带组合（新会话默认组合），组合里的 MCP 要在 session/new 时就交出去 —— 和重连那条路（`ensureLocalTools`）一样 */
@@ -7628,6 +7669,7 @@ app.whenReady().then(async () => {
     const cliCwd = profile.remote?.sshHost
       ? sessionCwd(profile, resolvedCwd)
       : resolvedCwd;
+    creations.stage(kiroLexId, 'start');
     const started = await connectWithModelFallback(profile, 'new-session', startLocalTools, kiroLexId, remoteModels);
     const client = started.client;
     profile.model = started.model;
@@ -7646,7 +7688,9 @@ app.whenReady().then(async () => {
     /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
     wireSession(kiroLexId, entry);
     // Durable record (design §4), keyed by the KiroLex id; store the cli mapping.
-    const rec = store.createSession(kiroLexId, profile);
+    /* 上面已经先写过一份（没有 cliSessionId 的）：在它上面补，期间到的标题 / 标记不丢 */
+    const rec = store.readRecord(kiroLexId) || store.createSession(kiroLexId, profile);
+    rec.profile = profile;
     rec.cliSessionId = cliSessionId;
     rec.executorState = 'attached';
     /* **本地工作目录进记录** —— 渲染层 attach 时传的是 `'~'`（三处硬写），
@@ -7654,13 +7698,19 @@ app.whenReady().then(async () => {
     rec.localDir = resolvedCwd;
     store.writeRecord(rec);
     newSessionIntents.delete(kiroLexId);
+    newSessionArgs.delete(kiroLexId);
     /* 会话建成、记录落盘了：连接时记下的那句「改用了备用模型」现在写进对话记录 */
     modelFallback.commit(kiroLexId);
     /* 远端适配器探测攒下的那几句（登录 shell 看不到适配器 / 那家 CLI 没登录）同理 */
     adapterNotes.commit(kiroLexId);
     mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId: kiroLexId, projectId: profile.projectId });
     return { sessionId: kiroLexId };
-  });
+  }));
+
+  /** 正在新建的那些会话走到哪一步了 —— 窗口刷新后渲染层拿一次快照（之后靠 `acp:create-stage` 推送） */
+  ipcMain.handle('acp:get-create-stages', async () => creations.snapshot());
+  /** 没建成的那条新会话当初是怎么建的（窗口刷新后「重试 / 改成本机运行」用）；建成了 / 不认识的给 null */
+  ipcMain.handle('acp:get-create-args', async (_event, sessionId: string) => newSessionArgs.get(String(sessionId || '')) || null);
 
   ipcMain.handle('acp:prompt', async (_event, sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => {
     /**
@@ -9896,6 +9946,9 @@ app.whenReady().then(async () => {
    */
   const purgeSession = async (sessionId: string): Promise<{ ok: boolean; tombstoned?: boolean; error?: string }> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'delete'); if (advRefused) return { ok: false, error: advRefused }; }
+    /* 没建成就删了：失败记录和创建参数一起作废 */
+    creations.clearFailed(sessionId);
+    newSessionArgs.delete(sessionId);
     // Kill this chat's executor first (frees a slot, stops the kiro-cli process)
     // so deleting a chat never leaves an orphaned process running.
     //
@@ -12326,6 +12379,17 @@ app.whenReady().then(async () => {
   const loadSessionImpl = async (sessionId: string, cwd: string, model: string): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'attach'); if (advRefused) throw new Error(advRefused); }
     if (!firstAttachMarked) { firstAttachMarked = true; startupMark('attach: first loadSession', `sessionId=${sessionId}`); }
+    /*
+      **还在新建的会话不 attach，等它建完** —— 实测（s_1792726606826_e2mprs）：新建远程会话的第 10 秒，
+      渲染层切会话 / 预热就来 attach 它，记录还没写完 → 按默认值（本机 kiro）去连 → 「该会话在磁盘上不存在」。
+      新建本身就会把执行器起好，建成了这里直接返回；建失败就说新建失败了（原因由新建那条路报），不另起一个。
+    */
+    if (creations.creating(sessionId)) {
+      logger.info('attach', `sessionId=${sessionId} 还在新建中 —— 不按默认值 attach，等新建结束`);
+      const created = await creations.settle(sessionId);
+      if (sessionClients.get(sessionId)) return { ok: true, freshBackend: false };
+      if (created && !created.ok) throw new Error(tr('This chat could not be started: {error}', { error: created.error || '' }));
+    }
     const askedCwd = cwd === '~' ? os.homedir() : cwd;
     /*
       **一条已存在会话的工作目录，以记录为准** ——「为什么会话不是远程的？」查出来的根因。
@@ -12614,6 +12678,9 @@ app.whenReady().then(async () => {
       store.writeRecord(rec);
       mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId, projectId: profile.projectId });
     }
+    /* 连上了：之前没建成留下的失败记录作废（窗口刷新后的快照里不能再有那条失败横幅） */
+    creations.clearFailed(sessionId);
+    newSessionArgs.delete(sessionId);
     /* 连上、resume / 新起后端会话、记录都成了：连接时记下的「改用了备用模型」现在写 */
     modelFallback.commit(sessionId);
     return { ok: true, freshBackend: freshBackendResult };
@@ -13779,6 +13846,7 @@ app.whenReady().then(async () => {
       ...sessionClients.keys(),
       ...reconfiguringSessions,
       ...attachingSessions,
+      ...creations.ids(),
     ]);
     for (const id of ids) {
       const reason = busyReasonFor(id);

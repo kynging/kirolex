@@ -59,7 +59,7 @@ export interface RecoveryInput {
 }
 
 /** Busy reasons that are not a conversation turn and cannot be adopted or prompted into. */
-const NON_TURN_BUSY = new Set(['attaching', 'priming', 'prime-pending', 'reconfiguring', 'compacting']);
+const NON_TURN_BUSY = new Set(['attaching', 'priming', 'prime-pending', 'reconfiguring', 'compacting', 'creating']);
 
 export function decideTurnRecovery(input: RecoveryInput): RecoveryAction {
   const { peek, busyReason, streaming, cancelled, resendDisabled, attempts, maxAttempts } = input;

@@ -802,6 +802,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('acp:user-message', handler);
   },
   getBusyMap: (): Promise<Record<string, string>> => ipcRenderer.invoke('acp:get-busy-map'),
+  /** 新建会话走到哪一步了（连接远端 / 检查环境 / 启动引擎 / 就绪 / 失败）—— 见 main/creationGate.ts */
+  getCreateStages: (): Promise<any[]> => ipcRenderer.invoke('acp:get-create-stages'),
+  getCreateArgs: (sessionId: string): Promise<any> => ipcRenderer.invoke('acp:get-create-args', sessionId),
+  onCreateStage: (callback: (data: any) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:create-stage', handler);
+    return () => ipcRenderer.removeListener('acp:create-stage', handler);
+  },
   /** Is a turn RUNNING for this chat, and what has it produced so far? Lets a reloaded window
    *  adopt a turn that never stopped, instead of resending the question and billing it twice. */
   peekTurn: (sessionId: string): Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }> =>
