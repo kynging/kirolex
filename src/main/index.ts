@@ -63,7 +63,7 @@ import { callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
-import { shouldConsolidate, buildConsolidationPrompt, consolidatedSessionMemory, CONSOLIDATE_EVERY } from './sessionMemory.ts';
+import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
@@ -1057,6 +1057,14 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
     memoryConsolidating.add(sessionId);
     const projectId = (record.profile as any)?.projectId || undefined;
     const existing = readMemory(projectId, sessionId).session || '';
+    /* 已有记忆超过上限（多半是用户手写的大份记忆）：不自动整理 —— 整理只产出 ≤12 行，写回就把它压没了；也不花这次模型调用。
+       进度照记，不然每一轮都来判一次、写一行日志 */
+    const skip = autoConsolidationSkipReason(existing);
+    if (skip) {
+      logger.info('memory', `session ${sessionId}: ${skip}`);
+      store.patchRecord(sessionId, { memoryConsolidatedAt: messages.length } as any);
+      return;
+    }
     /* 只喂最近这一段:更早的已经被上一次压缩吸收进 existing 了,再喂一遍是重复付钱 */
     const recent = messages
       .slice(-CONSOLIDATE_EVERY * 2)
@@ -1078,11 +1086,17 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
       cliSessionId、profile 等改回旧值。
     */
     if (deletedSessionIds.has(sessionId) || !store.readRecord(sessionId)) return;
-    const merged = consolidatedSessionMemory(existing, produced);
-    if (merged !== null) {
-      writeMemory('session', projectId, sessionId, merged);
-      logger.info('memory', `session ${sessionId}: consolidated at ${messages.length} messages (${merged.length} chars)`);
-    }
+    /* 写回前先备份原文件（和手动压缩同一套 backupMemoryLayer）；新结果行数变少时只追加、不删旧行（sessionMemory.ts） */
+    applyAutoConsolidation(existing, produced, {
+      /* 等模型那几秒里用户可能刚保存了手写记忆：和调用前读的不一样就不写，大小判断 / 合并 / 备份都得针对当前文件 */
+      readCurrent: () => readMemory(projectId, sessionId).session || '',
+      backup: () => backupMemoryLayer('session', projectId, sessionId, new Date().toISOString().replace(/[:.]/g, '-')),
+      write: (merged) => {
+        writeMemory('session', projectId, sessionId, merged);
+        logger.info('memory', `session ${sessionId}: consolidated at ${messages.length} messages (${merged.length} chars)`);
+      },
+      log: (message) => logger.info('memory', `session ${sessionId}: ${message}`),
+    });
     store.patchRecord(sessionId, { memoryConsolidatedAt: messages.length } as any);
   } catch (err: any) {
     logger.warn('memory', `session ${sessionId}: consolidation failed (${err?.message || err})`);

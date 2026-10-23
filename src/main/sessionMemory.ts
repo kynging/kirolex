@@ -83,13 +83,85 @@ export function mergeSessionMemory(existing: string, produced: string, cap = MAX
  * 已有记忆和这次产出里的文字版调用块（`<invoke …>`）都清掉 —— 记忆每一轮都注入，留着就是一轮一轮喂回模型。
  *   · 没变化 → 不写；
  *   · 已有记忆**没清理什么**、这次也没产出 → 不写（`mergeSessionMemory` 保持原样，别把记忆清成空）；
- *   · 已有记忆全是调用块、清完是空的、这次也没产出 → 写回空 —— 不然旧调用块会一直留着被注入。
+ *   · 已有记忆全是调用块、清完是空的、这次也没产出 → 写回空 —— 不然旧调用块会一直留着被注入；
+ *   · 新结果的行数比已有记忆（清过的）少 → 原记忆原样保留，只把新行追加上去（`appendNewMemoryLines`）。
  */
 export function consolidatedSessionMemory(existing: string, produced: string, cap = MAX_CHARS): string | null {
   const before = String(existing || '');
   const clean = stripTextToolCalls(before);
-  const merged = mergeSessionMemory(clean, stripTextToolCalls(String(produced || '')), cap);
+  let merged = mergeSessionMemory(clean, stripTextToolCalls(String(produced || '')), cap);
+  /* 新结果行数比原记忆少 → 不整份替换，只把新事实追加到原记忆后面（旧行一条不删） */
+  if (clean.trim() && memoryLines(merged).length < memoryLines(clean).length) merged = appendNewMemoryLines(clean, merged);
   if (merged === before) return null;
   if (!merged && clean === before) return null;
   return merged;
+}
+
+function memoryLines(text: string): string[] {
+  return String(text || '').split(/\r?\n/).filter((line) => line.trim());
+}
+
+/** 按行比较用的键：去掉列表符号和首尾空白，「- 用 opus」和「用 opus」算同一条。 */
+function memoryLineKey(line: string): string {
+  return line.replace(/^\s*[-*•]\s*/, '').trim();
+}
+
+/** 「只追加新事实、不删旧行」—— 和 `mergeMemoryText`（s3Sync.ts）同一个思路：原文原样保留，按行去重后把新行接在后面。 */
+export function appendNewMemoryLines(existing: string, produced: string): string {
+  const base = String(existing || '');
+  const have = new Set(memoryLines(base).map(memoryLineKey));
+  const extra: string[] = [];
+  for (const line of memoryLines(produced)) {
+    const key = memoryLineKey(line);
+    if (!key || have.has(key)) continue;
+    have.add(key);
+    extra.push(line);
+  }
+  if (!extra.length) return base;
+  return `${base.replace(/\s*$/, '')}\n${extra.join('\n')}`;
+}
+
+/**
+ * 自动整理要不要跳过；`null` = 照常整理。
+ *
+ * 已有会话记忆（清掉调用块之后）超过 `MAX_CHARS` 的，多半是用户手写的大份记忆 —— 自动整理只产出 ≤12 行，
+ * 写回就是把它整份压没。所以超过上限就不自动整理；用户手动点「压缩」那条路不走这里，不受影响。
+ */
+export function autoConsolidationSkipReason(existing: string, cap = MAX_CHARS): string | null {
+  const size = stripTextToolCalls(String(existing || '')).trim().length;
+  return size > cap ? `existing memory is ${size} chars (> ${cap}), skip auto consolidation to protect it` : null;
+}
+
+export interface AutoConsolidationIo {
+  /** 模型调用返回后**重新读一次**当前的会话记忆 —— 等待那几秒里用户可能刚保存了一份手写记忆 */
+  readCurrent(): string;
+  /** 用 `backupMemoryLayer` 备份原文件，返回备份路径；没有可备份的 / 失败返回 null */
+  backup(): string | null;
+  write(text: string): void;
+  log(message: string): void;
+}
+
+/**
+ * 自动整理的写回：超上限跳过 → 算出要写的 → **先备份再写**。
+ *
+ * `existing` 是模型调用**之前**读的；返回后文件和它不一样（等待期间用户改过）就不写 —— 这次的结果是按旧内容算的，
+ * 写回会盖掉刚保存的那份（哪怕原来是空的、连备份都不会做）。
+ * 原记忆不空、备份却没成功的，不写 —— 写回之后就找不回原文了。
+ * 返回 'skipped'（跳过 / 没备份上）、'unchanged'（不需要写）、'written'。
+ */
+export function applyAutoConsolidation(existing: string, produced: string, io: AutoConsolidationIo): 'skipped' | 'unchanged' | 'written' {
+  const skip = autoConsolidationSkipReason(existing);
+  if (skip) { io.log(skip); return 'skipped'; }
+  if (io.readCurrent() !== String(existing || '')) {
+    io.log('session memory changed while consolidating, skip writing (keep the current file)');
+    return 'skipped';
+  }
+  const merged = consolidatedSessionMemory(existing, produced);
+  if (merged === null) return 'unchanged';
+  const hadMemory = !!String(existing || '').trim();
+  const at = hadMemory ? io.backup() : null;
+  if (hadMemory && !at) { io.log('could not back up existing memory, skip writing consolidation'); return 'skipped'; }
+  if (at) io.log(`backed up session memory -> ${at}`);
+  io.write(merged);
+  return 'written';
 }

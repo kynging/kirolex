@@ -206,8 +206,8 @@ describe('接线（index.ts）', () => {
   test('会话记忆整理：已有记忆、新产出都清掉文字版调用块；最近消息照旧折叠', () => {
     const c = slice(M, 'async function maybeConsolidateSessionMemory(', 3500);
     assert.match(c, /buildConsolidationPrompt\(recent, stripTextToolCalls\(existing\)\)/);
-    assert.match(c, /const merged = consolidatedSessionMemory\(existing, produced\);/);
-    assert.match(c, /if \(merged !== null\) \{\s*writeMemory\('session', projectId, sessionId, merged\)/, '清理后为空也要写回');
+    assert.match(c, /applyAutoConsolidation\(existing, produced, \{/);
+    assert.match(c, /write: \(merged\) => \{\s*writeMemory\('session', projectId, sessionId, merged\)/, '清理后为空也要写回');
     assert.match(c, /foldTextToolCall\(m\.content \|\| '', m\.toolTailFrom\)/);
   });
 
