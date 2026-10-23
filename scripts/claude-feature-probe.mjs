@@ -14,7 +14,7 @@
  *
  * Env:
  *   PROBE_STEPS   comma list (default: all) — init, model, tools, todo, tasks, think, effort, image, slash,
- *                 compact, compactPrefixed, cancelTool, cancelPerm, cancelTask, plan, task, web, load
+ *                 compact, compactPrefixed, cancelTool, cancelPerm, cancelTask, plan, task, web, load, steering, queueing
  *                 (cancelPerm switches the session to Manual mode first: the adapter starts in
  *                 bypassPermissions on this machine, which never asks)
  *   PROBE_MODEL   substring of the model id/name to switch to (default: haiku — cheapest)
@@ -28,7 +28,7 @@ import os from 'node:os';
 import path from 'node:path';
 
 const LOG = process.env.PROBE_LOG || path.join(os.tmpdir(), 'claude-feature-probe.log');
-const ALL = ['init', 'model', 'tools', 'todo', 'tasks', 'think', 'effort', 'image', 'slash', 'compact', 'compactPrefixed', 'cancelTool', 'cancelPerm', 'cancelTask', 'plan', 'task', 'web', 'load'];
+const ALL = ['init', 'model', 'tools', 'todo', 'tasks', 'think', 'effort', 'image', 'slash', 'compact', 'compactPrefixed', 'cancelTool', 'cancelPerm', 'cancelTask', 'plan', 'task', 'web', 'load', 'steering', 'queueing'];
 const STEPS = (process.env.PROBE_STEPS || ALL.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
 const WANT_MODEL = (process.env.PROBE_MODEL || 'haiku').toLowerCase();
 fs.writeFileSync(LOG, '');
@@ -171,6 +171,7 @@ async function main() {
   let a = startAdapter();
   const init = await a.request('initialize', { protocolVersion: 1, clientCapabilities: { fs: { readTextFile: false, writeTextFile: false }, terminal: false }, clientInfo: { name: 'kirolex-probe', version: '0' } });
   console.log('agentCapabilities:', JSON.stringify(init.agentCapabilities));
+  console.log('top-level _meta:', JSON.stringify(init._meta));
   const ns = await a.request('session/new', { cwd, mcpServers: [] });
   const sid = ns.sessionId;
   console.log('sessionId:', sid);
@@ -251,6 +252,64 @@ async function main() {
     });
     a.onUpdate = null;
     await prompt(a, sid, 'cancelTool: next message after cancel', 'Reply with exactly: ok');
+  }
+  if (STEPS.includes('steering')) {
+    /* 忙时 Enter 交给适配器（busyEnterCaps.ts）：Bash 还在跑时发 `_session/steering`，看模型在**同一轮**里有没有看到追加的内容 */
+    let steerRes = null, steerAt = null, endAt = null;
+    await prompt(a, sid, 'steering: _session/steering while Bash sleeps', 'Run the shell command: sleep 12 && echo finished . Then reply with its output.', {
+      during: (pp) => { pp.finally(() => { endAt = a.updates.length; }).catch(() => {}); a.onUpdate = (p) => { if (p.update?.sessionUpdate === 'tool_call') { a.onUpdate = null; setTimeout(() => {
+        steerAt = a.updates.length;
+        a.request('_session/steering', { sessionId: sid, prompt: [{ type: 'text', text: 'Also: end your final reply with the word PINEAPPLE.' }], _meta: { steering: { idleBehavior: 'promptRequired' } } })
+          .then((x) => { steerRes = x; }, (e) => { steerRes = { error: e.message, code: e.code }; });
+      }, 2500); } }; },
+    });
+    a.onUpdate = null;
+    const after = steerAt === null ? [] : a.updates.slice(steerAt, endAt ?? a.updates.length);
+    const textAfter = after.filter((p) => p.update?.sessionUpdate === 'agent_message_chunk').map((p) => p.update.content?.text || '').join('');
+    console.log('  steering response:', JSON.stringify(steerRes));
+    console.log('  PINEAPPLE in the same turn (before session/prompt returned):', /PINEAPPLE/.test(textAfter));
+    /* 空闲时：带 promptRequired 应该原样退回、不起新的一轮 */
+    const idle = await a.request('_session/steering', { sessionId: sid, prompt: [{ type: 'text', text: 'Reply with exactly: idle' }], _meta: { steering: { idleBehavior: 'promptRequired' } } }).catch((e) => ({ error: e.message }));
+    console.log('  steering while idle:', JSON.stringify(idle));
+    if (idle?.outcome === 'startedNewTurn') {
+      /* 适配器自己起了一轮（Codex）：它没有 session/prompt 响应 —— 看它流了什么、拿什么当结束信号（KiroLex 认 threadStatus idle） */
+      const from = a.updates.length;
+      const ended = await new Promise((res) => {
+        const timer = setTimeout(() => res(false), 90000);
+        a.onUpdate = (p) => { if (p.update?._meta?.codex?.threadStatus?.type === 'idle') { clearTimeout(timer); res(true); } };
+      });
+      a.onUpdate = null;
+      const seq = a.updates.slice(from).map((p) => p.update?._meta?.codex?.threadStatus ? `threadStatus:${p.update._meta.codex.threadStatus.type}` : p.update?.sessionUpdate);
+      const squeezed = seq.filter((k, i) => k !== seq[i - 1]);
+      console.log('  detached turn updates:', squeezed.join(' > '), ended ? '' : '(no idle within 90s)');
+    }
+  }
+  if (STEPS.includes('queueing')) {
+    /* promptQueueing（busyEnterCaps 的 prompt-queue 档）：Bash 还在跑时再发一个 session/prompt。看两个响应的先后、
+       第二条的输出是不是都在第一条的响应之后（KiroLex 按「第一条响应 = 第一轮结束」切分归属） */
+    const from = a.updates.length;
+    const marks = [];
+    const mark = (what) => marks.push({ what, at: a.updates.length - from });
+    const p1 = a.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'Run the shell command: sleep 10 && echo first-done . Then reply with exactly: ONE' }] }).then((r) => { mark('response#1 ' + r?.stopReason); return r; });
+    let p2;
+    await new Promise((res) => { a.onUpdate = (u) => { if (u.update?.sessionUpdate === 'tool_call') { a.onUpdate = null; setTimeout(() => {
+      mark('sent#2');
+      p2 = a.request('session/prompt', { sessionId: sid, prompt: [{ type: 'text', text: 'Reply with exactly: TWO' }] }).then((r) => { mark('response#2 ' + r?.stopReason); return r; }, (e) => { mark('error#2 ' + e.message); });
+      res();
+    }, 2000); } }; });
+    await p1; await p2;
+    await new Promise((r) => setTimeout(r, 400));
+    const ups = a.updates.slice(from);
+    let line = '';
+    let mi = 0;
+    for (let i = 0; i <= ups.length; i++) {
+      while (mi < marks.length && marks[mi].at === i) { line += `\n  [[${marks[mi].what}]]\n  `; mi++; }
+      const u = ups[i]?.update; if (!u) continue;
+      if (u.sessionUpdate === 'agent_message_chunk') line += u.content?.text || '';
+      else if (u.sessionUpdate === 'user_message_chunk') line += `<user:${(u.content?.text || '').slice(0, 30)}>`;
+      else if (u.sessionUpdate === 'tool_call') line += `<tool:${u.title}>`;
+    }
+    console.log('\n=== queueing: second session/prompt while the first runs ===' + line);
   }
   if (STEPS.includes('cancelPerm')) {
     console.log('\nset_mode default:', JSON.stringify(await a.request('session/set_mode', { sessionId: sid, modeId: 'default' }).catch((e) => ({ error: e.message }))).slice(0, 200));

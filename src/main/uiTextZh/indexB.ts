@@ -176,6 +176,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   'All live sessions are busy; cannot start another right now.': '同时在跑的会话已经满了，现在开不了新的。',
   'All live sessions are busy; cannot attach another right now.': '同时在跑的会话已经满了，现在连不上新的。',
   'Session not connected': '会话没连着',
+  'This message could not be saved to the conversation record; it is kept for recovery after a restart.': '这条消息没能写进对话记录；已经留着，重启后会放回排队。',
   'Wait for the active turn (including context compaction) to finish before sending the queued message.': '要等当前这一轮（包括上下文压缩）跑完，才能发送排队的消息。',
   'Timed out waiting for the active turn to stop.': '等当前这一轮停下来超时了。',
   'Invalid Agent name.': 'Agent 名称不合法。',

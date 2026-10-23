@@ -106,7 +106,7 @@ describe('接线', () => {
     const fn = ACP.slice(ACP.indexOf('const steerMessage = useCallback'), ACP.indexOf('const takeUnconsumedSteers = useCallback'));
     const cap = fn.indexOf('await window.kiroApi.capSteerText?.(sent)');
     const reg = fn.indexOf('pendingSteersRef.current.set(sid, [');
-    const send = fn.indexOf('await window.kiroApi.steer(sid, sent)');
+    const send = fn.indexOf('await window.kiroApi.steer(sid, sent, msgId)');
     assert.ok(cap > 0 && reg > cap && send > reg, `顺序不对：cap=${cap} reg=${reg} send=${send}`);
   });
 });

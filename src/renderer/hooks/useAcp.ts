@@ -10,6 +10,7 @@ import { messageVariants, normalizeLang, pinShown, t as translate, type Lang } f
 import { toSlashCommands, type SlashCommand } from '../slashCommands';
 import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
+import { onBusyChange, onHandoffMainTurn, onOwnTurnEnd, type AdoptionState } from '../handoffAdoption';
 import {
   advance,
   beginIteration,
@@ -853,6 +854,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   };
   const removeStreaming = (sid: string | null) => {
     if (!sid) return;
+    /*
+      排在后面的那一轮已经接手了（onMainTurn 的 handoff 那段）、而且还没结束：这一轮收尾，流转给它，不放掉。
+      它要是已经结束了（busy 先一步不再是 'turn'），pending 在那时就作废了，这里照常收掉（`handoffAdoption.ts`）。
+    */
+    if (onOwnTurnEnd(adoptionRef.current, sid, streamingIdsRef.current.has(sid)) === 'keep-streaming') {
+      setSessionActiveTool(sid, null);
+      setSessionStall(sid, null);
+      return;
+    }
     // A turn cannot have a tool in flight once it is over. Clearing here is the
     // authoritative fix for a stale "Running: ..." label that outlived its turn
     // (kiro-cli does not always send a terminal tool_call_update).
@@ -1189,6 +1199,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * it the chat would stream forever with its composer locked.
    */
   const adoptedTurnsRef = useRef<Set<string>>(new Set());
+  /** 交给适配器排着的那一轮已经接手、而这个窗口自己的上一轮还没收尾 —— 收尾时转成接管（`removeStreaming`） */
+  const handoffAdoptRef = useRef<Set<string>>(new Set());
+  /** 上面两样合起来交给 `handoffAdoption.ts` 的判据（同一对 Set，不是拷贝） */
+  const adoptionRef = useRef<AdoptionState>({ pending: handoffAdoptRef.current, adopted: adoptedTurnsRef.current });
 
   /** Take over an in-flight turn: show what it has produced, and let its chunks through. */
   const adoptTurn = (sid: string, peek: TurnPeek) => {
@@ -1607,7 +1621,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     content: string,
     targetSid?: string,
     opts?: { attachments?: AttachedFile[]; sendText?: string; /** 调用方指定的 id（控制入口发的带标记，见 controlSessions.isControlMessageId） */ msgId?: string },
-  ): Promise<{ steered: boolean; reason?: string }> => {
+  ): Promise<{ steered: boolean; reason?: string; /** reason 是 handed-off 时：适配器自己起的那一轮的用户消息 id（主进程 acp:steer） */ messageId?: string }> => {
     // Explicit target: a split pane can steer its own running turn without
     // depending on which chat happens to be focused.
     const sid = targetSid || currentSessionRef.current;
@@ -1652,9 +1666,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       { msgId, content: text, attachments, ...(sent !== text ? { sent } : {}), inFlight: true },
     ]);
 
-    let res: { steered: boolean; reason?: string };
+    let res: { steered: boolean; reason?: string; messageId?: string };
     try {
-      res = await window.kiroApi.steer(sid, sent);
+      /* msgId 跟着走：适配器把它变成单独一轮时（Codex 的 startedNewTurn）那条用户消息的 id 由它推出来，控制入口的标记不丢 */
+      res = await window.kiroApi.steer(sid, sent, msgId);
     } catch {
       res = { steered: false, reason: 'ipc-error' };
     }
@@ -1672,10 +1687,43 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     else pendingSteersRef.current.delete(sid);
     if (settled.outcome.kind === 'failed') {
       mutateSessionMessages(sid, (prev) => prev.filter((m) => m.id !== msgId));
-      return { steered: false, reason: settled.outcome.reason };
+      return { steered: false, reason: settled.outcome.reason, ...(res.messageId ? { messageId: res.messageId } : {}) };
     }
     return { steered: true };
   }, [mutateSessionMessages]);
+
+  /**
+   * **忙时 Enter 交给适配器排队**（执行器声明了 promptQueueing，`busyEnter === 'prompt-queue'`，或者 steering 出错降级）：
+   * 现在就把这条交给 CLI，排在正在跑的那一轮后面（主进程 `acp:handoff-prompt`）。prompt 的组装和普通发送一样
+   * （附件引用块 + 正文）。界面上这时不插消息：前一轮还在流，插进去会把它后面的输出接到这条消息底下；
+   * 轮到它的时候主进程发 `acp:main-turn`，那时才插进来并接管它的流（见下面 onMainTurn 的 handoff 那段）。
+   * 返回 `accepted`；没交出去时按 `reason` 由调用方改走普通发送（`idle`）或 KiroLex 队列（其余）。
+   */
+  const handOffMessage = useCallback(async (
+    sid: string,
+    content: string,
+    opts: { attachments?: AttachedFile[]; displayText?: string; pastes?: any[]; msgId: string },
+  ): Promise<{ accepted: boolean; reason?: string }> => {
+    const text = content.trim();
+    const attachments = opts.attachments || [];
+    if (!sid || (!text && !attachments.length)) return { accepted: false, reason: 'empty' };
+    const prompt: any[] = [];
+    if (attachments.length > 0) {
+      prompt.push({ type: 'text', text: `<hidden>${attachments.map((f) => `file:${f.path}`).join('\n')}\n请读取这些文件内容</hidden>` });
+    }
+    if (text || attachments.length === 0) prompt.push({ type: 'text', text });
+    try {
+      const res = await window.kiroApi.handoffPrompt?.(sid, prompt, modelForSession(sid), projectForSession(sid), {
+        messageId: opts.msgId,
+        displayText: opts.displayText ?? text,
+        ...(attachments.length ? { attachments: attachments.map((a) => ({ id: a.id, name: a.name, path: a.path, isImage: a.isImage })) } : {}),
+        ...(opts.pastes?.length ? { pastes: opts.pastes } : {}),
+      });
+      return res ? { accepted: !!res.accepted, reason: res.reason } : { accepted: false, reason: 'unsupported' };
+    } catch {
+      return { accepted: false, reason: 'ipc-error' };
+    }
+  }, []);
 
   // Remove and return a session's un-consumed steers (the turn ended before the
   // agent consumed them). Strips their optimistic messages so the caller (App)
@@ -2749,8 +2797,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
       // AN ADOPTED TURN ENDS HERE, and nowhere else. This window never held its promise, so
       // main's "no longer a turn" is the only signal that can release the stream.
-      if (adoptedTurnsRef.current.has(sid) && reason !== 'turn') {
-        adoptedTurnsRef.current.delete(sid);
+      if (onBusyChange({ pending: handoffAdoptRef.current, adopted: adoptedTurnsRef.current }, sid, reason).endAdopted) {
         removeStreaming(sid);
         if (activityMapRef.current.get(sid)?.includes('已接回') || activityMapRef.current.get(sid)?.includes('reattached')) setSessionActivity(sid, null);
       }
@@ -2772,13 +2819,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
      * 回复的流被挡在门外（只进缓存），切走再回来才看得见。所以：按 id 去重插进这条消息，再像「接回」那样
      * 接管这一轮的流 —— 结束信号是主进程的 busy 不再是 'turn'（见上面 `adoptedTurnsRef` 那段）。
      */
-    const removeMainTurn = window.kiroApi.onMainTurn?.(({ sessionId: sid, messageId, content, ts, kirolex }) => {
+    const removeMainTurn = window.kiroApi.onMainTurn?.(({ sessionId: sid, messageId, content, ts, kirolex, handoff, attachments }) => {
       if (!sid || !messageId) return;
       const add = (list: Message[]): Message[] => (
         list.some((m) => m.id === messageId)
           ? list
           /* `kirolex`：KiroLex 自己补发的（「写成文字」的纠正）—— 画成 KiroLex 提示，不画成你的气泡 */
-          : [...list, { id: messageId, role: 'user' as const, content: String(content || ''), timestamp: Number(ts) || Date.now(), ...(kirolex ? { kirolex: true as const } : {}) }]
+          : [...list, { id: messageId, role: 'user' as const, content: String(content || ''), timestamp: Number(ts) || Date.now(), ...(kirolex ? { kirolex: true as const } : {}), ...(Array.isArray(attachments) && attachments.length ? { attachments } : {}) }]
       );
       if (sid === currentSessionRef.current) setMessages((prev) => add(prev));
       const cached = messagesCacheRef.current.get(sid);
@@ -2786,6 +2833,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (!streamingIdsRef.current.has(sid)) {
         adoptedTurnsRef.current.add(sid);
         addStreaming(sid);
+      } else if (handoff && !adoptedTurnsRef.current.has(sid)) {
+        onHandoffMainTurn(adoptionRef.current, sid, true);
+        /*
+          **交给适配器排着的那一轮接手了**（`acp:handoff-prompt` / Codex 自己起的那一轮），而这个窗口自己发的上一轮
+          还没收尾（它的 acp:prompt 结果还在路上）。那一轮收尾时别把流放掉，直接转成「接管」：中间不留空档，
+          排队消息不会趁空档抢着发出去；这一轮的结束信号是主进程的 busy 不再是 'turn'。
+        */
       }
     });
 
@@ -4520,7 +4574,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     sessionId: string,
     text: string,
     attachments: any[] = [],
-    options?: { mergeIntoMessageId?: string; onStarted?: () => void; displayText?: string; pastes?: any[]; /** 调用方指定的用户消息 id（控制入口发的带标记） */ messageId?: string },
+    options?: { mergeIntoMessageId?: string; onStarted?: () => void; displayText?: string; pastes?: any[]; /** 调用方指定的用户消息 id（控制入口发的带标记） */ messageId?: string;
+      /** 这一批里放回队列的 handoff 原来的 id（App 排空时从排队条目的 fromHandoff 收的）—— 落盘时记上，重启恢复据此不再放回 */
+      fromHandoff?: string[] },
   ) => {
     const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
     if (!session || session.archived || sessionId.startsWith('pending_')) return;
@@ -4659,6 +4715,7 @@ ${text}`,
       displayText: shownText,
       ...(options?.pastes?.length ? { pastes: options.pastes } : {}),
       ...(options?.mergeIntoMessageId ? { mergeIntoMessageId: options.mergeIntoMessageId } : {}),
+      ...(options?.fromHandoff?.length ? { fromHandoff: options.fromHandoff } : {}),
     };
     let deliveryError: any = null;
     try {
@@ -5537,6 +5594,7 @@ ${text}`,
     sendMessage,
     sendQueuedMessage,
     steerMessage,
+    handOffMessage,
     addFailedSteer,
     takeFailedSteer,
     takeUnconsumedSteers,

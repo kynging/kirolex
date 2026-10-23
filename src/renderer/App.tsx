@@ -38,7 +38,8 @@ import { IconClose, IconLogs } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
-import { busyEnterRoute, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
+import { busyEnterKind, busyEnterRoute, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
 import { carryControlMark, controlMessageId, isControlMessageId } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
@@ -106,7 +107,7 @@ declare global {
       bgStop?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
       onBgChanged?: (cb: () => void) => () => void;
       /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件）。 */
-      onMainTurn?: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true }) => void) => () => void;
+      onMainTurn?: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true; handoff?: true; attachments?: any[] }) => void) => () => void;
       getPendingQuit?: () => Promise<boolean>;
       onPendingQuit?: (cb: (pending: boolean) => void) => () => void;
       /** 控制入口（controlServer `POST /sessions/:id/send`）：主进程转来一条，界面按 Enter 的同一套路由处理后回话 */
@@ -259,10 +260,18 @@ declare global {
       memoryBytes: (projectId?: string, sessionId?: string) => Promise<{ global: number; project: number; session: number }>;
       backupMemory: (scope: 'global' | 'project' | 'session', projectId?: string, sessionId?: string) => Promise<{ ok: boolean; at: string | null }>;
       onMemoryBytes: (callback: (data: { sessionId: string; projectId: string | null; global: number; project: number; session: number }) => void) => () => void;
-      prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }) => Promise<any>;
+      prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => Promise<any>;
       cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean) => Promise<void>;
-      steer: (sessionId: string, message: string) => Promise<{ steered: boolean; reason?: string }>;
+      steer: (sessionId: string, message: string, msgId?: string) => Promise<{ steered: boolean; reason?: string; messageId?: string }>;
+      /** 忙时 Enter 交给适配器排队（promptQueueing，主进程 acp:handoff-prompt） */
+      handoffPrompt?: (sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; attachments?: any[]; pastes?: any[] }) => Promise<{ accepted: boolean; reason?: string; error?: string }>;
+      takePendingHandoffs?: () => Promise<{ recover: Record<string, Array<{ id: string; content: string; attachments?: any[]; pastes?: any[]; ts: number }>>; live: Record<string, Array<{ id: string; content: string; attachments?: any[]; pastes?: any[]; ts: number }>> }>;
+      ackHandoffFailed?: (sessionId: string, messageId: string) => Promise<{ ok: boolean }>;
+      onHandoffFailed?: (cb: (d: { sessionId: string; messageId?: string; notStarted: boolean; error: string; content?: string; attachments?: any[]; pastes?: any[] }) => void) => () => void;
       capSteerText?: (message: string) => Promise<string>;
+      /** Claude Code / Codex 的下拉清单 + 忙时 Enter 交给谁（`busyEnter`，main/busyEnterCaps.ts）；kiro 会话回 null */
+      engineModels?: (sessionId: string) => Promise<{ sessionId: string; busyEnter?: string } | null>;
+      onEngineModels?: (cb: (d: { sessionId: string; busyEnter?: string }) => void) => () => void;
       /** Persist a CONSUMED steer into the durable transcript (its only writer:
        *  steers never go through `prompt`). Merges into the turn's base user
        *  message, which is also how it is rendered. */
@@ -521,6 +530,8 @@ export interface QueuedMessage {
   afterRebuild?: boolean;
   /** 这一批发失败、放回了队头：重试时原样（同一批、同一个 messageId）再发，见 `queueRetry.pickQueuedBatch`。 */
   retryBatch?: RetryBatch;
+  /** 交给适配器却没轮到、放回来的那条原来的消息 id（主进程 pendingHandoffs）—— 重启恢复时据此不再放回第二遍 */
+  fromHandoff?: string;
 }
 
 /** 远程会话的同步状态（`docs/DESIGN_remote_sessions.md`）。 */
@@ -953,6 +964,7 @@ const App: React.FC = () => {
     sendMessage,
     sendQueuedMessage,
     steerMessage,
+    handOffMessage,
     addFailedSteer,
     takeFailedSteer,
     takeUnconsumedSteers,
@@ -3171,6 +3183,7 @@ const App: React.FC = () => {
             // 没发成的那一批的 id 和边界也跟着回来：重启后重试照样是同一次提交（`queueRetry.pickQueuedBatch`）
             ...(item.retryBatch && typeof item.retryBatch.id === 'string' && Number(item.retryBatch.size) > 0
               ? { retryBatch: { id: item.retryBatch.id, size: Number(item.retryBatch.size) } } : null),
+            ...(typeof item.fromHandoff === 'string' ? { fromHandoff: item.fromHandoff } : null),
           })) as QueuedMessage[];
         if (kept.length) out[sid] = kept;
       }
@@ -3309,6 +3322,124 @@ const App: React.FC = () => {
     }
   }, [sendQueuedMessage, addFailedSteer]);
 
+  /*
+    **忙时 Enter 交给谁** —— 主进程按执行器 initialize 的能力声明算好（`main/busyEnterCaps.ts`），随 `session:engine-models`
+    推过来（`busyEnter`）。kiro 不用问；Claude Code / Codex 还没收到时现问一次（`acp:engine-models`），问不到就按引擎名兜底。
+  */
+  const busyEnterRef = useRef<Record<string, string>>({});
+  useEffect(() => window.kiroApi.onEngineModels?.((d) => {
+    if (d?.sessionId && d.busyEnter) busyEnterRef.current[d.sessionId] = d.busyEnter;
+  }), []);
+  const busyEnterFor = useCallback(async (sid: string, engine?: string): Promise<string | undefined> => {
+    const known = busyEnterRef.current[sid];
+    if (known || engineCanSteer(engine)) return known;
+    try {
+      const d = await window.kiroApi.engineModels?.(sid);
+      if (d?.busyEnter) busyEnterRef.current[sid] = d.busyEnter;
+      return d?.busyEnter;
+    } catch { return undefined; }
+  }, []);
+
+  /*
+    **已经交给适配器、排在这一轮后面的那几条**（`acp:handoff-prompt`，适配器声明了 promptQueueing）。显示成排队卡片
+    「已交给 … ，这一轮结束后执行」，不能编辑 / 撤回（字节已经在 CLI 那边了）。轮到它的时候主进程发 `acp:main-turn`，
+    这条消息进对话、卡片撤掉；没轮到它就失败了（`acp:handoff-failed` 带 notStarted）→ 放回 KiroLex 队列队头，不丢。
+  */
+  const [handoffsBySession, setHandoffsBySession] = useState<Record<string, QueuedMessage[]>>({});
+  const handoffsRef = useRef(handoffsBySession);
+  handoffsRef.current = handoffsBySession;
+  const dropHandoff = useCallback((sid: string, id?: string) => {
+    if (!sid || !id) return;
+    setHandoffsBySession((prev) => {
+      const list = prev[sid];
+      if (!list?.some((i) => i.id === id)) return prev;
+      const rest = list.filter((i) => i.id !== id);
+      const next = { ...prev };
+      if (rest.length) next[sid] = rest; else delete next[sid];
+      return next;
+    });
+  }, []);
+  useEffect(() => window.kiroApi.onMainTurn?.((d) => {
+    if (d?.handoff) dropHandoff(d.sessionId, d.messageId);
+  }), [dropHandoff]);
+  useEffect(() => window.kiroApi.onHandoffFailed?.((d) => {
+    if (!d?.sessionId || !d.messageId) return;
+    const sid = d.sessionId;
+    const handoffId = d.messageId;
+    const card = handoffsRef.current[sid]?.find((i) => i.id === handoffId);
+    dropHandoff(sid, handoffId);
+    if (!d.notStarted) return;
+    /*
+      **没轮到它就失败了：放回 KiroLex 队列队头，不丢。** 整条消息主进程随事件带来了（窗口刷新过的话这里已经没有那张卡片）；
+      先把队列直接写进 ui-state，再告诉主进程（它把 ui-state 写盘之后才摘掉盘上的记录）。同一条已经放回过就不再放。
+    */
+    const current = queuesBySessionRef.current;
+    const newId = () => carryControlMark(handoffId, 'queue') ?? `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+    const list = requeueFailedHandoff(current[sid] || [], { ...d, messageId: handoffId }, card, newId);
+    if (list !== (current[sid] || [])) {
+      const next = { ...current, [sid]: list };
+      queuesBySessionRef.current = next;
+      try { uiSet(QUEUES_KEY, JSON.stringify(Object.fromEntries(Object.entries(next).filter(([, items]) => items.length)))); } catch { /* 下面的 effect 还会再写 */ }
+      const item = list[0];
+      setQueuesBySession((prev) => ((prev[sid] || []).some((i) => i.fromHandoff === handoffId) ? prev : { ...prev, [sid]: [item, ...(prev[sid] || [])] }));
+    }
+    void window.kiroApi.ackHandoffFailed?.(sid, handoffId);
+  }), [dropHandoff]);
+
+  /* 上一次运行交给了适配器、却没轮到就退出 / 崩溃了的那几条（主进程 pendingHandoffs.ts）：放回各自会话的 KiroLex 队列头 */
+  const pendingHandoffsTakenRef = useRef(false);
+  useEffect(() => {
+    if (pendingHandoffsTakenRef.current) return;
+    pendingHandoffsTakenRef.current = true;
+    void window.kiroApi.takePendingHandoffs?.().then((res) => {
+      const recover = res?.recover || {};
+      const live = res?.live || {};
+      /* 主进程还排着的（只是窗口刷新了）：把「已交给 …」卡片画回来 —— 轮到它时照常撤掉，没轮到就失败时照常放回队列 */
+      const liveSids = Object.keys(live).filter((sid) => live[sid]?.length);
+      if (liveSids.length) {
+        setHandoffsBySession((prev) => {
+          const next = { ...prev };
+          for (const sid of liveSids) {
+            const have = new Set((next[sid] || []).map((i) => i.id));
+            next[sid] = [...(next[sid] || []), ...live[sid].filter((h) => !have.has(h.id)).map((h) => ({
+              id: h.id,
+              content: h.content,
+              attachments: Array.isArray(h.attachments) ? h.attachments : [],
+              ...(Array.isArray(h.pastes) && h.pastes.length ? { pastes: h.pastes } : {}),
+              createdAt: Number(h.ts) || Date.now(),
+            }))];
+          }
+          return next;
+        });
+      }
+      const sids = Object.keys(recover).filter((sid) => recover[sid]?.length);
+      if (!sids.length) return;
+      /*
+        放回队列 → 队列直接写进 ui-state → 逐条确认（主进程把 ui-state 写盘之后才摘盘上的记录）。
+        确认之前窗口刷新 / 崩溃 / 应用退出：记录还在，下次启动照样放回；已经写进队列的按 fromHandoff 认出来，不放第二遍。
+      */
+      const current = queuesBySessionRef.current;
+      const next = { ...current };
+      for (const sid of sids) {
+        next[sid] = recoverPendingHandoffs(current[sid] || [], recover[sid],
+          (fromId) => carryControlMark(fromId, 'queue') ?? `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+      }
+      queuesBySessionRef.current = next;
+      try { uiSet(QUEUES_KEY, JSON.stringify(Object.fromEntries(Object.entries(next).filter(([, items]) => items.length)))); } catch { /* 下面的 effect 还会再写 */ }
+      setQueuesBySession((prev) => {
+        const merged = { ...prev };
+        for (const sid of sids) {
+          const ids = new Set(recover[sid].map((h) => h.id));
+          const add = next[sid].filter((i) => i.fromHandoff && ids.has(i.fromHandoff)
+            && !(prev[sid] || []).some((p) => p.fromHandoff === i.fromHandoff));
+          if (add.length) merged[sid] = [...add, ...(prev[sid] || [])];
+        }
+        return merged;
+      });
+      for (const sid of sids) for (const h of recover[sid]) void window.kiroApi.ackHandoffFailed?.(sid, h.id);
+    }).catch(() => {});
+  }, []);
+
   const handleSteerMessage = useCallback(async (text: string, pastes?: PastedBlock[], paneSid?: string, ctl?: ControlSendCtx) => {
     const steerSid = paneSid || currentSessionId;
     if (steerSid && loopingIds.includes(steerSid)) return;   // loop owns the session
@@ -3343,8 +3474,8 @@ const App: React.FC = () => {
         }),
       }));
     };
-    // 引擎不支持 steer（Claude Code / Codex）：忙时 Enter 就是排队 —— 和 ⌘/Ctrl+Enter 同一种卡片，排在队尾，
-    // 这一轮结束后自动作为下一条发出。不先试 steer、不标红。
+    // 执行器没法把消息插进正在跑的一轮（能力声明里没有 steering，见 main/busyEnterCaps.ts）：忙时 Enter 就是排队 ——
+    // 和 ⌘/Ctrl+Enter 同一种卡片，排在队尾，这一轮结束后自动作为下一条发出。不先试 steer、不标红。
     const queueAsNext = () => {
       const queuedId = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       ctl?.report({ routed: 'queued', messageId: queuedId });
@@ -3359,10 +3490,39 @@ const App: React.FC = () => {
         }],
       }));
     };
-    const canSteer = engineCanSteer(sessions.find((s) => s.id === sessionId)?.engine);
+    /*
+      交给适配器排在这一轮后面（`busyEnterKind` = handoff：只声明了 promptQueueing，或 steering 出错降级）：
+      先放一张「已交给 …」的卡片，再发；没交出去就按原因改走普通发送（这一轮已经结束）或 KiroLex 队列。
+    */
+    const handOff = async () => {
+      const handoffId = ctl ? controlMessageId('user') : `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      setHandoffsBySession((prev) => ({
+        ...prev,
+        [sessionId]: [...(prev[sessionId] || []), {
+          id: handoffId,
+          content: pastes?.length ? shown : content,
+          attachments,
+          ...(pastes?.length ? { pastes } : {}),
+          createdAt: Date.now(),
+        }],
+      }));
+      const r = await handOffMessage(sessionId, content, { attachments, msgId: handoffId, ...(pastes?.length ? { displayText: shown, pastes } : {}) });
+      if (r.accepted) { ctl?.report({ routed: 'queued', messageId: handoffId }); return; }
+      dropHandoff(sessionId, handoffId);
+      if (r.reason === 'idle') {
+        noteSessionLocally(sessionId, tRef.current('This turn had already ended, so your message was sent as a new one.'));
+        await sendNowOrNext(sessionId, content, attachments, pastes?.length ? { displayText: shown, pastes } : undefined, ctl);
+        return;
+      }
+      queueAsNext();
+    };
+    const steerEngine = sessions.find((s) => s.id === sessionId)?.engine;
+    const enterKind = busyEnterKind(steerEngine, await busyEnterFor(sessionId, steerEngine));
+    const canSteer = enterKind !== 'queue';
     const busyRoute = busyEnterRoute({ busy: busyBySessionRef.current[sessionId], canSteer });
     if (busyRoute === 'after-rebuild') { parkUntilRebuilt(); return; }
     if (busyRoute === 'queue') { queueAsNext(); return; }
+    if (enterKind === 'handoff') { await handOff(); return; }
 
     const steerId = ctl ? controlMessageId('steer') : undefined;
     const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments), msgId: steerId });
@@ -3370,6 +3530,9 @@ const App: React.FC = () => {
     const route = steerFailureRoute(res.reason);
     if (route === 'after-rebuild') { parkUntilRebuilt(); return; }
     if (route === 'queue') { queueAsNext(); return; }
+    if (route === 'handoff') { await handOff(); return; }
+    // 这一轮刚好结束、适配器自己起了一轮（Codex）：主进程把那一轮认成这条消息的（acp:main-turn 会把它插进对话）
+    if (route === 'handed-off') { if (ctl && res.messageId) ctl.report({ routed: 'sent', messageId: res.messageId }); return; }
     if (route === 'send-now') {
       // The turn already ended: there is no "current turn" to add to, so this IS
       // the next message. Sent straight away unless a queued item is already on
@@ -3381,7 +3544,7 @@ const App: React.FC = () => {
     // Anything else: never silently queue. Mark it red on the turn and let the user choose.
     const failedId = addFailedSteer(sessionId, content, attachments, res.reason, ctl ? controlMessageId('steer') : undefined);
     ctl?.report({ routed: 'steer', messageId: failedId, steerFailed: res.reason || 'unknown' });
-  }, [currentSessionId, sessions, attachedFor, clearAttachments, focusSession, steerMessage, loopingIds, sendNowOrNext, addFailedSteer]);
+  }, [currentSessionId, sessions, busyEnterFor, attachedFor, clearAttachments, focusSession, steerMessage, handOffMessage, dropHandoff, loopingIds, sendNowOrNext, addFailedSteer]);
 
   const handleQueueMessage = useCallback((text: string, pastes?: PastedBlock[], paneSid?: string, ctl?: ControlSendCtx) => {
     const content = text.trim();
@@ -3422,23 +3585,26 @@ const App: React.FC = () => {
     // 界面里还没有这条（还在 hydrate）—— 不在主进程里绕过界面直接发
     if (!session) return Promise.resolve({ ok: false, status: 503, error: 'ui-not-ready' });
     if (session.archived) return Promise.resolve({ ok: false, status: 409, error: 'archived' });
-    const busy = busyBySessionRef.current[sid];
-    const route = enterRoute({
-      streaming: streamingIds.includes(sid), busy, occupied: isBackendOccupied(busy),
-      looping: loopingIds.includes(sid), next: req.mode === 'next', canSteer: engineCanSteer(session.engine),
-    });
-    if (route === 'blocked') return Promise.resolve({ ok: false, status: 409, error: 'loop-running' });
-    return new Promise<ControlSendReply>((resolve) => {
-      let done = false;
-      const ctl: ControlSendCtx = { report: (r) => { if (!done) { done = true; resolve({ ok: true, ...r }); } } };
-      const run = route === 'steer' ? handleSteerMessage(req.text, undefined, sid, ctl)
-        : route === 'queue' ? handleQueueMessage(req.text, undefined, sid, ctl)
-        : sendNowOrNext(sid, req.text, [], undefined, ctl);
-      Promise.resolve(run).catch(() => {}).finally(() => {
-        if (!done) { done = true; resolve({ ok: false, status: 500, error: 'not-routed' }); }
+    return busyEnterFor(sid, session.engine).then((busyEnter) => {
+      const busy = busyBySessionRef.current[sid];
+      const route = enterRoute({
+        streaming: streamingIds.includes(sid), busy, occupied: isBackendOccupied(busy),
+        /* 「能不能不进 KiroLex 队列」：插进当前轮（steer）和交给适配器排（handoff）都走 handleSteerMessage，和输入框一样 */
+        looping: loopingIds.includes(sid), next: req.mode === 'next', canSteer: busyEnterKind(session.engine, busyEnter) !== 'queue',
+      });
+      if (route === 'blocked') return { ok: false, status: 409, error: 'loop-running' } as ControlSendReply;
+      return new Promise<ControlSendReply>((resolve) => {
+        let done = false;
+        const ctl: ControlSendCtx = { report: (r) => { if (!done) { done = true; resolve({ ok: true, ...r }); } } };
+        const run = route === 'steer' ? handleSteerMessage(req.text, undefined, sid, ctl)
+          : route === 'queue' ? handleQueueMessage(req.text, undefined, sid, ctl)
+          : sendNowOrNext(sid, req.text, [], undefined, ctl);
+        Promise.resolve(run).catch(() => {}).finally(() => {
+          if (!done) { done = true; resolve({ ok: false, status: 500, error: 'not-routed' }); }
+        });
       });
     });
-  }, [sessions, streamingIds, loopingIds, handleSteerMessage, handleQueueMessage, sendNowOrNext]);
+  }, [sessions, busyEnterFor, streamingIds, loopingIds, handleSteerMessage, handleQueueMessage, sendNowOrNext]);
   const controlSendRef = useRef(handleControlSend);
   controlSendRef.current = handleControlSend;
   useEffect(() => {
@@ -3596,9 +3762,12 @@ const App: React.FC = () => {
         主进程认得出这是同一次提交 —— 已经落过盘的不再追加一条（原来每次现生成，同一条消息在会话里一遍遍出现）。
         经控制入口排进来的那张 id 带标记，发出去时气泡上照样标「经控制入口发送」。
       */
+      /* 这一批里有从「交给适配器却没轮到」放回来的：它们原来的 id 跟着发出去、落进 transcript（重启恢复据此不再放回第二遍） */
+      const fromHandoff = consumed.map((item) => item.fromHandoff).filter((x): x is string => !!x);
       const sendOpts = {
         ...(queuedPastes.length ? { displayText: content, pastes: queuedPastes } : null),
         messageId: picked.messageId,
+        ...(fromHandoff.length ? { fromHandoff } : null),
       };
       Promise.resolve(sendQueuedMessage(sessionId, deliveredContent, attachments, sendOpts))
         .then(() => { queueBackoffRef.current.ok(sessionId); })
@@ -3993,6 +4162,7 @@ const App: React.FC = () => {
         isArchived={!!session?.archived}
         onUnarchive={() => { if (sid) archiveSession(sid, false); }}
         queuedMessages={sid ? queuesBySession[sid] || EMPTY_QUEUE : EMPTY_QUEUE}
+        handedOffMessages={sid ? handoffsBySession[sid] || EMPTY_QUEUE : EMPTY_QUEUE}
         mergeQueuedMessages={settings.mergeQueuedMessages}
         /**
          * 「还没读出来」和「真的没有内容」要分开 —— 「这个会话为什么在分屏显示是空的」。

@@ -140,7 +140,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   engineModels: (sessionId: string) => ipcRenderer.invoke('acp:engine-models', sessionId),
   setEngineModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:set-engine-model', sessionId, model),
   setEngineOption: (sessionId: string, category: 'thought_level' | 'mode', value: string) => ipcRenderer.invoke('acp:set-engine-option', sessionId, category, value),
-  onEngineModels: (cb: (d: { sessionId: string; current: string; options: Array<{ value: string; name: string }>; effort?: any; mode?: any }) => void) => {
+  onEngineModels: (cb: (d: { sessionId: string; current: string; options: Array<{ value: string; name: string }>; effort?: any; mode?: any; busyEnter?: string }) => void) => {
     const handler = (_e: any, d: any) => cb(d);
     ipcRenderer.on('session:engine-models', handler);
     return () => ipcRenderer.removeListener('session:engine-models', handler);
@@ -245,14 +245,28 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('acp:backup-memory', scope, projectId, sessionId),
 
   // Chat
-  prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }) => ipcRenderer.invoke('acp:prompt', sessionId, prompt, model, projectId, display),
+  prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => ipcRenderer.invoke('acp:prompt', sessionId, prompt, model, projectId, display),
   cancel: (sessionId: string, model: string, suppressInterruptionNotice = false) =>
     ipcRenderer.invoke('acp:cancel', sessionId, model, suppressInterruptionNotice),
   // Mid-turn steer: inject text into the running turn (kiro-cli _session/steer).
   // Resolves to { steered, reason } — the renderer falls back to the queue when
   // steered is false so the message is never dropped.
-  steer: (sessionId: string, message: string) =>
-    ipcRenderer.invoke('acp:steer', sessionId, message),
+  // `msgId`: the optimistic steer's id -- if the adapter turns it into a turn of its own
+  // (Codex `startedNewTurn`), that turn's user message id derives from it (detachedTurnMessageId).
+  steer: (sessionId: string, message: string, msgId?: string) =>
+    ipcRenderer.invoke('acp:steer', sessionId, message, msgId),
+  /** 忙时 Enter 交给适配器排队（promptQueueing）：发出去就回 { accepted }（见主进程 acp:handoff-prompt） */
+  handoffPrompt: (sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; attachments?: any[]; pastes?: any[] }) =>
+    ipcRenderer.invoke('acp:handoff-prompt', sessionId, prompt, model, projectId, display),
+  /** 上一次运行留下的、交给了适配器却没轮到的那几条（窗口启动时取一次，放回 KiroLex 队列） */
+  takePendingHandoffs: () => ipcRenderer.invoke('acp:take-pending-handoffs'),
+  /** 没轮到就失败的那条已经放回 KiroLex 队列：主进程把队列写盘后摘掉它的记录 */
+  ackHandoffFailed: (sessionId: string, messageId: string) => ipcRenderer.invoke('acp:ack-handoff-failed', sessionId, messageId),
+  onHandoffFailed: (cb: (d: { sessionId: string; messageId?: string; notStarted: boolean; error: string; content?: string; attachments?: any[]; pastes?: any[] }) => void) => {
+    const handler = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('acp:handoff-failed', handler);
+    return () => ipcRenderer.removeListener('acp:handoff-failed', handler);
+  },
   /** The exact text acp:steer will write (oversized image paths swapped for their capped copies),
    *  so the renderer can match the CONSUMED snapshot against it exactly. */
   capSteerText: (message: string) =>
@@ -354,7 +368,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('bg:changed', handler);
   },
   /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件 / 「写成文字」的纠正）：插进这条消息，接管这一轮的流。`kirolex` = 显示成 KiroLex 提示。 */
-  onMainTurn: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true }) => void) => {
+  onMainTurn: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true; handoff?: true; attachments?: any[] }) => void) => {
     const handler = (_e: any, data: any) => cb(data);
     ipcRenderer.on('acp:main-turn', handler);
     return () => ipcRenderer.removeListener('acp:main-turn', handler);

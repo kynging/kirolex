@@ -91,7 +91,7 @@ describe('带附件也 steer：附件按本机路径写进 steer 文字', () => 
     const fn = slice(ACP, 'const steerMessage = useCallback');
     // let：随后换成主进程会真正写出去的那份（大图路径换成缩小副本，见 tests/steerConsumeMatch.test.ts）
     assert.match(fn, /let sent = \(opts\?\.sendText \?\? text\)\.trim\(\);/);
-    assert.match(fn, /window\.kiroApi\.steer\(sid, sent\)/);
+    assert.match(fn, /window\.kiroApi\.steer\(sid, sent, msgId\)/);
     assert.match(fn, /\.\.\.\(attachments\.length \? \{ attachments \} : \{\}\)/);
   });
 

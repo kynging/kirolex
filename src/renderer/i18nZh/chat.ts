@@ -234,6 +234,7 @@ export const ZH_CHAT: Record<string, string> = {
   "Agent is working — Enter queues it to send after this turn": "Agent 正在工作 —— Enter 排队，这一轮结束后发出",
   "Enter queue (sends after this turn) · Shift+Enter newline": "Enter 排队（这一轮结束后发出）· Shift+Enter 换行",
   "Queue to send after this turn (Enter)": "排队，这一轮结束后发出（Enter）",
+  "Handed to {engine}, runs after this turn": "已交给 {engine}，这一轮结束后执行",
   "Could not add this to the current turn: {reason}": "没能追加到这一轮：{reason}",
   "Send as the next message": "作为下一条发送",
   "Put back in the input box": "放回输入框",

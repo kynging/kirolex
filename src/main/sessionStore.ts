@@ -51,6 +51,9 @@ export interface StoredMessage {
   ts: number;
   /** Append-only event: materialize this text into an earlier user message. */
   mergeIntoMessageId?: string;
+  /** 这条用户消息发出去的是哪几条「交给了适配器却没轮到、放回 KiroLex 队列」的消息（原来的 id，合并发送时可以有几条）——
+   *  重启恢复（pendingHandoffs）据此认出它们已经发过了，不再放回第二遍。 */
+  fromHandoff?: string[];
   /** Read-side only: the merge events `readTranscript` folded into this user message, in order,
    *  so the view can show each steer as its own bubble again. `content` already includes them. */
   steerParts?: { id: string; content: string; ts: number }[];

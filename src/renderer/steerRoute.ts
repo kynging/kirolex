@@ -10,8 +10,11 @@
  *     只有「这一轮已经结束」（idle）没有可追加的那一轮了，直接作为新消息发出。
  * 想排队的用 ⌘/Ctrl+Enter（不变）。
  *
- * 例外：**引擎不支持 steer**（`_session/steer` 是 kiro-cli 的扩展，Claude Code / Codex 的适配器都没有）——
- * 忙时普通 Enter 直接排队（和 ⌘/Ctrl+Enter 同一条路），这一轮结束后自动作为下一条发出；不先试 steer、不标红。
+ * 「能不能插进当前这一轮」按执行器 initialize 的能力声明定（`main/busyEnterCaps.ts`，主进程随 engine-models 推 `busyEnter`）：
+ * kiro 走 `_session/steer`；声明了 `_meta.steering.supported` 的适配器（Claude Code / Codex）走 `_session/steering`；只声明 `promptQueueing` 的再发一个 `session/prompt` 交给 CLI 排（`followUpTurns.ts`），
+ * 界面和 kiro 的追加指令一模一样。
+ * 例外：**执行器插不进去**（没声明 steering）—— 忙时普通 Enter 直接排队（和 ⌘/Ctrl+Enter 同一条路），
+ * 这一轮结束后自动作为下一条发出；不先试 steer、不标红。
  */
 
 export interface SteerAttachmentRef { path: string; name?: string; isImage?: boolean }
@@ -25,11 +28,25 @@ export function steerPayload(content: string, attachments: SteerAttachmentRef[])
   return text ? `${refs}\n\n${text}` : refs;
 }
 
-export type SteerFailureRoute = 'send-now' | 'after-rebuild' | 'queue' | 'ask';
+export type SteerFailureRoute = 'send-now' | 'after-rebuild' | 'queue' | 'handoff' | 'handed-off' | 'ask';
 
-/** 这个引擎能不能往正在跑的一轮里追加（steer）。和主进程 `AcpClient.supportsSteer` 同一个判据；
- *  没有 engine 字段的老会话就是 kiro。 */
-export function engineCanSteer(engine?: string | null): boolean {
+/**
+ * 忙时普通 Enter 交给谁（渲染端这一侧）：
+ *   · `steer`   插进正在跑的这一轮（kiro 的 `_session/steer` / 适配器的 `_session/steering`）；
+ *   · `handoff` 交给适配器排在这一轮后面（只声明了 promptQueueing：主进程 `acp:handoff-prompt`）；
+ *   · `queue`   KiroLex 自己的队列。
+ * `busyEnter` 是主进程按能力声明算好的（`AcpClient.busyEnter`）；还没拿到时按引擎兜底（kiro 能 steer，另外两家排队）。
+ */
+export function busyEnterKind(engine?: string | null, busyEnter?: string | null): 'steer' | 'handoff' | 'queue' {
+  if (busyEnter === 'prompt-queue') return 'handoff';
+  return engineCanSteer(engine, busyEnter) ? 'steer' : 'queue';
+}
+
+/** 这条会话能不能往正在跑的一轮里追加（steer）。`busyEnter` 是主进程按能力声明算好的（`AcpClient.busyEnter`，
+ *  和 `supportsSteer` 同一个判据）：`steer`（kiro）/ `steering` 能；`prompt-queue` / `queue` 不能。
+ *  还没拿到能力声明时按引擎兜底：没有 engine 字段的老会话就是 kiro。 */
+export function engineCanSteer(engine?: string | null, busyEnter?: string | null): boolean {
+  if (busyEnter) return busyEnter === 'steer' || busyEnter === 'steering';
   return !engine || engine === 'kiro';
 }
 
@@ -41,6 +58,10 @@ export function steerFailureRoute(reason?: string): SteerFailureRoute {
   if (reason === 'priming') return 'after-rebuild';
   // 引擎不支持 steer（渲染端的引擎状态还没同步就先试了）：和 canSteer=false 时一样，排队作为下一条。
   if (reason === 'unsupported') return 'queue';
+  // steering 出错、但适配器声明了 promptQueueing：交给它排在这一轮后面（不退回 KiroLex 队列）。
+  if (reason === 'handoff') return 'handoff';
+  // 这一轮刚好结束、适配器自己起了一轮（Codex 的 startedNewTurn）：消息已经在它手里，主进程把那一轮认成这条的 —— 什么都不用再做。
+  if (reason === 'handed-off') return 'handed-off';
   return 'ask';
 }
 

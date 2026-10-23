@@ -1613,6 +1613,35 @@ const ReviewQueueStack: React.FC<{ sessionId: string | null }> = ({ sessionId })
   );
 };
 
+/**
+ * **已经交给适配器、排在这一轮后面的那几条**（适配器声明了 promptQueueing，见 main/busyEnterCaps.ts）。
+ * 和排队卡片同一种样子，但只显示：字节已经在 CLI 那边了，没法编辑 / 撤回 / 调顺序。轮到它时这条消息进对话、卡片消失。
+ */
+const HandoffStack = memo<{ items: QueuedMessage[]; engineName: string }>(({ items, engineName }) => {
+  const t = useT();
+  return (
+    <div className="queue-row">
+      <div className="queue-stack">
+        <div className="queue-stack-header">
+          <span>{t('Handed to {engine}, runs after this turn', { engine: engineName })}</span>
+          <span>{items.length}</span>
+        </div>
+        {items.map((item, index) => (
+          <div key={item.id} className="queue-card">
+            <span className="queue-card-order">{index + 1}</span>
+            <div className="queue-card-body">
+              <span className="queue-card-text" title={item.content}>{item.content}</span>
+              {item.attachments.length > 0 && (
+                <span className="queue-card-attachments">📎 {item.attachments.length}</span>
+              )}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+});
+
 /** Queued follow-ups panel. Rendered as its own in-flow row between the message
  *  list and the composer (NOT an absolute overlay) so it never covers the chat
  *  or the input box -- the message list shrinks to give the queue its own space. */
@@ -1789,7 +1818,7 @@ const ChatInputBox = memo<{
   permissionPending?: { onCancel: () => void } | null;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteer: (text: string, pastes?: PastedBlock[]) => void;
-  /** 引擎能不能追加到正在跑的一轮（`engineCanSteer`）。不能（Claude Code / Codex）：忙时 Enter 是排队，文案也说排队 */
+  /** 能不能追加到正在跑的一轮（`engineCanSteer`，按执行器的能力声明）。不能：忙时 Enter 是排队，文案也说排队 */
   canSteer: boolean;
   onCancel: () => void;
   onStopLoop: () => void;
@@ -2871,6 +2900,8 @@ interface ChatAreaProps {
   /** History for this session is still being read from disk. */
   historyLoading: boolean;
   queuedMessages: QueuedMessage[];
+  /** 已经交给适配器、排在这一轮后面的那几条（App `handoffsBySession`）：只显示，不能编辑 / 撤回 */
+  handedOffMessages?: QueuedMessage[];
   restoredQueueDraft: { id: number; text: string } | null;
   /** 搜索条开着吗 —— 开着就把整份记录挂上（`findInPage` 只搜已渲染的 DOM，见 App 那段注释）。 */
   searchOpen?: boolean;
@@ -3008,6 +3039,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   mergeQueuedMessages,
   historyLoading,
   queuedMessages,
+  handedOffMessages,
   restoredQueueDraft,
   searchOpen,
   restoredInputDraft,
@@ -3410,7 +3442,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   */
   type EngineSelect = { current: string; options: Array<{ value: string; name: string }> };
   /** 模型清单（`current`/`options`）+ effort + 权限模式 —— 三样都来自适配器的 configOptions。 */
-  const [engineModels, setEngineModels] = useState<(EngineSelect & { effort?: EngineSelect | null; mode?: EngineSelect | null }) | null>(null);
+  const [engineModels, setEngineModels] = useState<(EngineSelect & { effort?: EngineSelect | null; mode?: EngineSelect | null; /** 忙时 Enter 交给谁（main/busyEnterCaps.ts） */ busyEnter?: string }) | null>(null);
   /*
     **忙 / 失败原因按会话记**（sessionRequestStatus.ts）：在 A 发起切换、等待期间这一格换成 B，A 的结果（尤其是失败）
     写回 A，不落到 B 的模型栏上；切回 A 时 A 的状态原样回来。界面只读当前会话那一份。
@@ -4596,6 +4628,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           ))}
         </div>
       )}
+      {!readOnly && handedOffMessages && handedOffMessages.length > 0 && (
+        <HandoffStack items={handedOffMessages} engineName={engine === 'codex' ? 'Codex' : 'Claude Code'} />
+      )}
       {!readOnly && (
         <QueueStack
           queuedMessages={plainQueue}
@@ -4746,7 +4781,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 } : null}
                 onSend={onSend}
                 onSteer={onSteerMessage}
-                canSteer={engineCanSteer(engine)}
+                canSteer={engineCanSteer(engine, engineModels?.busyEnter)}
                 onCancel={onCancel}
                 onStopLoop={onStopLoop}
                 onQueueCommand={onQueueMessage}

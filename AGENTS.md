@@ -111,7 +111,7 @@ docs/            设计文档（§1）
 
 | 文件 | 关键点 |
 |---|---|
-| `src/main/acp-client.ts` | `class AcpClient`：`connect()`（本机 kiro：`kiro-cli acp [--agent] --model`，路径由 `resolveKiroCli()` / `kiroCliCandidates()` 解析，顺序 `KIRO_CLI_PATH` → 已知安装位置 → PATH；远端：`ssh … buildRemoteKiroCommand`；claude/codex：`resolveAdapter`）、`initialize`、`newSession`、`loadSession`、`sendPrompt`（`session/prompt`，无超时）、`cancelPrompt`、`steer`（`_session/steer`，只有 kiro 支持，`supportsSteer`）、`handleAgentRequest`（权限请求）、`disconnect()`（§4.1）。`sendRequest` 默认 120 s 空闲超时 |
+| `src/main/acp-client.ts` | `class AcpClient`：`connect()`（本机 kiro：`kiro-cli acp [--agent] --model`，路径由 `resolveKiroCli()` / `kiroCliCandidates()` 解析，顺序 `KIRO_CLI_PATH` → 已知安装位置 → PATH；远端：`ssh … buildRemoteKiroCommand`；claude/codex：`resolveAdapter`）、`initialize`、`newSession`、`loadSession`、`sendPrompt`（`session/prompt`，无超时）、`cancelPrompt`、`steer`（kiro 的 `_session/steer`）、`steering`（适配器的 `_session/steering`，按 initialize 能力声明，`busyEnter` / `supportsSteer`，判据在 `busyEnterCaps.ts`）、`handleAgentRequest`（权限请求）、`disconnect()`（§4.1）。`sendRequest` 默认 120 s 空闲超时 |
 | `src/main/engines.ts` | `Engine`、`ENGINE_LABEL`、`engineOf(profile)`、`resolveAdapter`（用 Electron 自带 Node 跑 npm 适配器，`ELECTRON_RUN_AS_NODE=1`，避开 Windows 上 `.cmd` 的 `spawn EINVAL`；可用 `KIROLEX_<ENGINE>_ACP` 覆盖） |
 | `index.ts` | `sessionClients: Map<sessionId, SessionEntry>`（活着的执行器）、`connectWithModelFallback`、`detachExecutor`、`ensureExecutorCapacity`（满了先回收最便宜的空闲执行器，**从不回收忙的**）、`DEFAULT_EXECUTOR_CAP = 10` / `MAX_CONCURRENT_SESSIONS`（`config.json` 的 `executorCap` 可覆盖，1–64）、`sendPromptOnce`（一次发送：拼记忆 / 远程上下文 / 图片截尺寸 / 看门狗） |
 | `src/main/busySessions.ts` | `collectBusySessions`：忙的理由 `turn` / `schedule` / `revise` / `queued`；`blocksQuit`：只有 `queued` 不挡退出 |
@@ -279,7 +279,7 @@ docs/            设计文档（§1）
 - 每个会话的队列独立 FIFO、在后台独立排空（`sendQueuedMessage` 按目标会话发）；分屏下读的必须是**那一格自己的**队列
   （`queuesBySessionRef.current[sessionId]`，不能用跟着焦点走的 `currentQueue`——曾经导致输入文字静默消失）。
 - 排空时要跳过：正在流式 / 后端被占（含重建历史）/ 被循环占用 / 正在发送 / 自动恢复中 / 正在换模型或 agent / 等待退出中。
-- 引擎只有 kiro 支持 steer（`AcpClient.supportsSteer`）；claude / codex 上运行中的 Enter 会走"失败 → 标红让用户选"那条路。
+- 忙时 Enter 能不能插进当前这一轮按执行器 initialize 的能力声明定（`busyEnterCaps.ts`、`AcpClient.busyEnter`）：kiro 走 `_session/steer`；声明了 `_meta.steering.supported` 的适配器（Claude Code / Codex）走 `_session/steering`；只声明 `promptQueueing` 的再发一个 `session/prompt` 交给 CLI 排（`followUpTurns.ts`）；都没有的直接进 KiroLex 队列。
 - 队列落盘在 ui-state 的 `kirolex-queues`，未消费 steer 在 `kirolex-pending-steers`；重启后恢复（恢复的排队项带 `restored: true`）。
   控制入口把 `queued` 报为"忙"但**不挡退出**，正因为它已经落盘。
 

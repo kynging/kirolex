@@ -371,3 +371,62 @@ pm-global`）新建 Claude Code 会话，日志停在「本地会话挂上 kirol
 
 **load 那一步的 session/load 结果**（脚本摘要）：`{"modes":"default","configOptions":["mode=default","model=opus","effort=default"]}` —— 适配器在新进程里把模型 / 模式退回默认，靠 KiroLex 重新设回去。
 
+
+## 忙时 Enter 交给适配器：`_session/steering` 实跑（2026-10-22）
+
+脚本：`PROBE_STEPS=steering node scripts/claude-feature-probe.mjs`（claude-agent-acp **0.88.0**，模型切到 haiku，看板机器 `D:\ab\tools\npm-global` 里已登录的那份）。
+KiroLex 的判据和发法在 `src/main/busyEnterCaps.ts` / `AcpClient.steering`，测试 `tests/busyEnterCaps.test.ts`。
+
+**能力声明在哪**（initialize 响应原文）：
+
+```json
+"agentCapabilities": {"_meta":{"claudeCode":{"promptQueueing":true},"authStatus":{}}, …}
+"_meta": {"steering":{"supported":true}}
+```
+
+`steering.supported` 在响应**顶层**的 `_meta`（和 `agentCapabilities` 同级），不在 `agentCapabilities._meta` 下；
+KiroLex 两处都认。Codex 适配器（codex-acp 2.1.1）同样在顶层 `_meta` 声明了 steering，没有声明 promptQueueing，
+而且**不认** `idleBehavior:"promptRequired"`：没有在跑的一轮时它自己起一轮（`startedNewTurn`）。见下面「Codex 实跑」。
+
+**实跑结果**：
+
+| 步骤 | 看到的 |
+|---|---|
+| 一轮在跑、Bash `sleep 12` 进行中（tool_call 之后 2.5 s）发 `_session/steering`，`_meta.steering.idleBehavior:"promptRequired"` | 响应 `{"outcome":"injected"}`，在 `session/prompt` 的响应**之前**回来 |
+| 模型有没有在同一轮里看到追加内容 | 看到了：steering 之后、同一个 `session/prompt` 结束之前的 thought 原文是 "They've also asked me to end my final reply with the word PINEAPPLE." |
+| 这一轮怎么结束 | 适配器按它的注释把正在跑的 Bash **挪到后台**（"A steer during a foreground tool call moves that tool to the background"），haiku 读了一次后台输出、调了 `ScheduleWakeup`，回「命令还在跑」就 `end_turn` 了 —— 最后那句没带 PINEAPPLE，因为它没写出最终答复，不是没看到 |
+| 空闲时再发同样的请求 | `{"outcome":"promptRequired","reason":"noRunningTurn"}`，没有起新的一轮、没有任何 session/update |
+
+**和 replayGuard 的关系**：插进去之后的输出（thought / message / tool_call）全部落在原来那个 `session/prompt` 返回之前，
+也就是 KiroLex 的 `entry.busy` 还是 true 的时候 —— 在「一轮之内」，`isReplayOutsideTurn` 不会丢掉它们。
+
+**已知限制**：
+- 工具跑到一半时 steering 会让 Claude Code 把那个工具挪到后台，这一轮可能在工具跑完之前就结束（上面那次就是）。这是 Claude Code 自己的行为。
+- Codex 不认 `promptRequired`：碰上这一轮刚结束，它自己起一轮（见下面「Codex 实跑」），KiroLex 把那一轮认成这条消息的一轮。
+
+### promptQueueing：一轮在跑时再发 `session/prompt`（2026-10-22 实跑）
+
+`PROBE_STEPS=queueing node scripts/claude-feature-probe.mjs`（claude-agent-acp 0.88.0，haiku）：Bash `sleep 10` 在跑时再发一个 `session/prompt`（"Reply with exactly: TWO"）。
+收到的顺序：`tool_call` → 发第二个 → **第一个的响应**（`end_turn`）→ 第二轮的输出（"ONE" —— Claude Code 把两条一起答了）→ **第二个的响应**（`end_turn`）。
+也就是「前一个 `session/prompt` 的响应 = 前一轮结束，之后流过来的都属于下一个」。KiroLex 就按这个切分（`AcpClient` 给每条输出标上当时最老的在途 prompt id；
+`followUpTurns.ts` 把下一轮的输出攒到它接手为止）：
+
+- 只声明 promptQueueing 的执行器（或 steering 出错、而声明了 promptQueueing）：忙时 Enter 直接再发 `session/prompt`（主进程 `acp:handoff-prompt`），
+  界面上是一张「已交给 Claude Code，这一轮结束后执行」的卡片；前一轮收尾时同步交棒 —— 用户消息这时落盘、进对话，它的输出 / 结束 / 看门狗 / 落盘都归它。
+- 有一轮排在后面时，前一轮出错不自己重发、不换后端会话（重发会排到它后面去）；还没轮到它就失败了 → 放回 KiroLex 队列队头。
+- 点停止：Claude Code 把排着的一起取消；排着的那一轮接手时也补一个 cancel。
+
+### Codex 实跑（codex-acp 2.1.1，2026-10-22）
+
+同一个脚本，`KIROLEX_CLAUDE_ACP=<codex-acp>/dist/index.js PROBE_STEPS=steering`：
+
+| 步骤 | 看到的 |
+|---|---|
+| initialize | `agentCapabilities._meta` 只有 `authStatus`（**没有** promptQueueing）；顶层 `_meta: {"steering":{"supported":true}}` |
+| 一轮在跑、`sleep 12` 进行中发 `_session/steering` | `{"outcome":"injected"}`；最后的回复是 `finished\n\nPINEAPPLE`，同一个 `session/prompt` 之内 |
+| 空闲时再发 | `{"outcome":"startedNewTurn"}` —— 它不读 `_meta`（`dist/index.js` 的 `performSteeringRequest` → `startNewTurnFromExternalPrompt`：先等上一个 prompt 收完，再自己起一轮） |
+| 每一轮开始 / 结束 | `session_info_update`，`_meta.codex.threadStatus` 是 `{"type":"active"}` / `{"type":"idle"}`（`thread/status/changed` → `createCodexSessionInfoUpdate`） |
+
+所以 Codex 忙时 Enter 走 `_session/steering`。碰上这一轮刚结束（`startedNewTurn`）：前一轮收尾时 busy 先不放（steering 还在途），
+那段时间的输出先攒着；结果一回来就把 Codex 自己起的那一轮认成这条消息的正常一轮 —— 用户消息作为新的一条落盘、进对话，
+输出归它，见到 `threadStatus: idle` 就收尾（`busyEnterCaps.detachedTurnEnded`）。消息不会再发一遍。

@@ -6,9 +6,9 @@ import * as path from 'node:path';
 /**
  * Claude Code / Codex 会话忙时按 Enter 提示「不支持追加」—— 接线测试（判据本身在 tests/steerRoute.test.ts）。
  *
- * `_session/steer` 是 kiro-cli 的扩展，那两家的适配器没有（主进程 `supportsSteer` 只对 kiro 为真）。以前渲染端
- * 不看引擎一律先 steer，主进程回 'unsupported'，消息标红让用户选。现在：引擎能力传进路由函数，不能 steer 就直接排队；
- * 万一还是回了 'unsupported'（引擎状态没同步），也排队。
+ * 以前渲染端不看引擎一律先 steer，主进程回 'unsupported'，消息标红让用户选。现在：执行器的能力（主进程按 initialize
+ * 的能力声明算的 `busyEnter`，见 tests/busyEnterCaps.test.ts；还没拿到时按引擎兜底）传进路由函数，不能 steer 就直接排队；
+ * 万一还是回了 'unsupported'（能力状态没同步 / steering 请求报错），也排队。
  */
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', 'src', ...p), 'utf8');
 const APP = read('renderer', 'App.tsx');
@@ -24,8 +24,10 @@ const steer = stripComments(between(APP, 'const handleSteerMessage = useCallback
 const control = stripComments(between(APP, 'const handleControlSend = useCallback', 'const controlSendRef = useRef'));
 
 describe('输入框按 Enter（handleSteerMessage）', () => {
-  test('引擎能力从会话的 engine 算，传进 busyEnterRoute', () => {
-    assert.match(steer, /const canSteer = engineCanSteer\(sessions\.find\(\(s\) => s\.id === sessionId\)\?\.engine\);/);
+  test('能力从会话的 engine + 执行器的 busyEnter 算，传进 busyEnterRoute', () => {
+    assert.match(steer, /const steerEngine = sessions\.find\(\(s\) => s\.id === sessionId\)\?\.engine;/);
+    assert.ok(steer.includes('const enterKind = busyEnterKind(steerEngine, await busyEnterFor(sessionId, steerEngine));'));
+    assert.match(steer, /const canSteer = enterKind !== 'queue';/);
     assert.match(steer, /busyEnterRoute\(\{ busy: busyBySessionRef\.current\[sessionId\], canSteer \}\)/);
   });
 
@@ -47,7 +49,7 @@ describe('输入框按 Enter（handleSteerMessage）', () => {
   });
 
   test('sessions 在依赖里（引擎是从它读的）', () => {
-    assert.match(APP, /\}, \[currentSessionId, sessions, attachedFor, clearAttachments, focusSession, steerMessage,/);
+    assert.match(APP, /\}, \[currentSessionId, sessions, busyEnterFor, attachedFor, clearAttachments, focusSession, steerMessage,/);
   });
 
   test('不在 App 里散写 engine === kiro', () => {
@@ -58,13 +60,14 @@ describe('输入框按 Enter（handleSteerMessage）', () => {
 
 describe('控制入口 send（handleControlSend）', () => {
   test('同一个 enterRoute，带上 canSteer', () => {
-    assert.match(control, /enterRoute\(\{[\s\S]*canSteer: engineCanSteer\(session\.engine\),[\s\S]*\}\)/);
+    assert.match(control, /busyEnterFor\(sid, session\.engine\)\.then\(\(busyEnter\) =>/);
+    assert.match(control, /enterRoute\(\{[\s\S]*canSteer: busyEnterKind\(session\.engine, busyEnter\) !== 'queue',[\s\S]*\}\)/);
   });
 });
 
 describe('输入框文案：Claude Code / Codex 忙时说排队', () => {
   test('ChatArea 把引擎能力交给输入框', () => {
-    assert.match(CHAT, /canSteer=\{engineCanSteer\(engine\)\}/);
+    assert.match(CHAT, /canSteer=\{engineCanSteer\(engine, engineModels\?\.busyEnter\)\}/);
   });
 
   test('占位提示 / 快捷键提示 / 按钮提示都有不能 steer 的分支，kiro 原文案不变', () => {

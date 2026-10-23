@@ -12,6 +12,7 @@ import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './
 import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 import { tr } from './uiText.ts';
+import { busyEnterMode, isMethodNotFound, steeringParams, steeringVerdict, withoutSteering, type BusyEnterMode } from './busyEnterCaps.ts';
 import { sshErrorKind, sessionsFullMessage } from './sshMux.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
 
@@ -502,6 +503,7 @@ export class AcpClient extends EventEmitter {
             clientInfo: { name: 'KiroLex', version: '0.1.0' },
             capabilities: {},
           }, INITIALIZE_TIMEOUT_MS);
+          this.initializeResult = result;
           resolve(result);
         } catch (err) {
           reject(err);
@@ -664,6 +666,28 @@ export class AcpClient extends EventEmitter {
     return this.configOptions.find((x) => x?.category === category) || this.configOptions.find((x) => x?.id === category);
   }
 
+  /**
+   * 在途的 `session/prompt` 请求 id，按发出顺序。一轮在跑时再发一个（适配器声明了 promptQueueing，交给 CLI 自己排）
+   * 就会有两个：CLI 一条一条跑，**最老那个的响应就是它那一轮的结束**，之后流过来的输出属于下一个。
+   * 每条 session/update（和权限请求）都带上当时最老那个的 id（`promptId`），主进程据此把输出归到对的那一轮。
+   */
+  private inflightPrompts: number[] = [];
+  /** 有没有在途的 session/prompt（没有的话，流过来的输出不属于任何一个 —— 前一个的响应已经到了） */
+  get promptInFlight(): boolean {
+    return this.inflightPrompts.length > 0;
+  }
+  /** 最近一次发出的 session/prompt 的 id（发完马上读，就是这一次的） */
+  lastPromptId: number | undefined;
+  /** 适配器声明了 `agentCapabilities._meta.claudeCode.promptQueueing`：一轮在跑时可以再发 session/prompt */
+  get supportsPromptQueueing(): boolean {
+    return this.engine !== 'kiro' && this.initializeResult?.agentCapabilities?._meta?.claudeCode?.promptQueueing === true;
+  }
+  /** 给流出来的事件标上它属于哪个在途的 session/prompt（没有在途的就原样） */
+  private tagPrompt<T extends object>(data: T): T & { promptId?: number } {
+    const id = this.inflightPrompts[0];
+    return id === undefined ? data : { ...data, promptId: id };
+  }
+
   async sendPrompt(sessionId: string, prompt: any[]): Promise<any> {
     // NO client-side idle abort for prompts. kiro-cli performs context
     // compaction (and long silent tool steps) INSIDE session/prompt while
@@ -675,7 +699,7 @@ export class AcpClient extends EventEmitter {
     return this.sendRequest('session/prompt', {
       sessionId,
       prompt,
-    }, 0);
+    }, 0, (id) => { this.inflightPrompts.push(id); this.lastPromptId = id; });
   }
 
   async cancelPrompt(sessionId: string) {
@@ -739,15 +763,68 @@ export class AcpClient extends EventEmitter {
   }
 
   /**
-   * Whether this backend supports mid-turn steer (`_session/steer`). KiroLex
-   * targets kiro-cli only, whose ACP implements the ext-method from v2.7. An
-   * older binary answers -32601 to the fire-and-forget request, which is
-   * ignored (no steer, no crash); callers still fall back to the queue on a
-   * false `steered` result so a message is never dropped.
+   * Whether this backend can take a message into the RUNNING turn: kiro-cli via
+   * `_session/steer` (v2.7+; an older binary answers -32601 to the
+   * fire-and-forget request, which is ignored), or an adapter that declares
+   * `_meta.steering.supported` via `_session/steering` (see `steering()`).
+   * Callers still fall back to the queue on a false `steered` result so a
+   * message is never dropped.
    */
   get supportsSteer(): boolean {
-    /* `_session/steer` 是 kiro-cli 的扩展；适配器那两家没有（会回 -32601，消息就丢了） */
-    return this.engine === 'kiro';
+    /* 按 initialize 的能力声明（`busyEnterCaps.ts`）：kiro 走 `_session/steer`，声明了 `_meta.steering.supported` 的适配器走
+       `_session/steering`；都没有就不能插进当前这一轮（只声明 promptQueueing 的也算不能 —— 见 `busyEnter`） */
+    const m = this.busyEnter;
+    return m === 'steer' || m === 'steering';
+  }
+
+  /** initialize 的响应（能力声明在里面）。连上之前是 undefined。 */
+  private initializeResult: any;
+  /** `_session/steering` 回过「没有这个方法」：这个执行器以后往下退一档 */
+  private steeringUnavailable = false;
+
+  /** 忙时普通 Enter 交给谁（`busyEnterCaps.busyEnterMode`）。 */
+  get busyEnter(): BusyEnterMode {
+    return this.steeringUnavailable
+      ? withoutSteering(this.engine, this.initializeResult)
+      : busyEnterMode(this.engine, this.initializeResult);
+  }
+
+  /**
+   * 把一条消息插进**正在跑的那一轮**：适配器的 `_session/steering` 扩展请求（声明了 `_meta.steering.supported` 的适配器，
+   * Claude Code / Codex，见 busyEnterCaps.ts）。和 kiro 的 `steer()` 不同，这是要等响应的普通请求 —— 响应按 id 落到
+   * pendingRequests，和正在跑的 `session/prompt` 互不干扰（上面那段「不能 await」说的是 kiro 那条老路）。
+   *
+   *   · `injected`（插进去了）→ 先发一条和 kiro 一样的 `steer_consumed`（渲染端据此把气泡标成已追加、落盘），再回 steered；
+   *   · `promptRequired`（这一轮刚好结束了，内容原样退回）→ reason `idle`，渲染端改成普通发送；
+   *   · `startedNewTurn`（Codex：这一轮刚好结束，它自己起了一轮）→ reason `handed-off`，主进程把那一轮认成这条消息的；
+   *   · 报错 / `failed` → 声明了 promptQueueing 的回 `handoff`（交给 CLI 排），否则 `unsupported`（KiroLex 队列），都不标红；
+   *     -32601 之后这个执行器不再试。
+   * 从不抛。`detail` 只给日志用。
+   */
+  async steering(sessionId: string, message: string): Promise<{ steered: boolean; reason?: string; detail?: string }> {
+    const text = (message || '').trim();
+    if (!text) return { steered: false, reason: 'write-failed' };
+    let result: any;
+    let error: any;
+    try {
+      result = await this.sendRequest('_session/steering', steeringParams(sessionId, text), 30000);
+    } catch (err) {
+      error = err || new Error('steering failed');
+    }
+    const verdict = steeringVerdict(result, error);
+    if (verdict === 'injected') {
+      this.emit('update', this.tagPrompt({ sessionId, update: { sessionUpdate: 'steer_consumed', text: `<user_message>\n${text}\n</user_message>` } }));
+      return { steered: true };
+    }
+    /* 这一轮刚好结束、适配器自己起了一轮（Codex）：消息已经在它手里，不再重发；那一轮由主进程认成这条消息的一轮 */
+    if (verdict === 'detached') return { steered: false, reason: 'handed-off', detail: `outcome=${result?.outcome}` };
+    if (verdict === 'prompt-required') return { steered: false, reason: 'idle' };
+    if (error && isMethodNotFound(error) && !this.steeringUnavailable) {
+      this.steeringUnavailable = true;
+      this.emit('config-options');   // 界面重拿 engine-models，里面的 busyEnter 已经退了一档
+    }
+    /* 退到下一档：声明了 promptQueueing 的交给 CLI 排（`handoff`），否则 KiroLex 队列（`unsupported`） */
+    return { steered: false, reason: this.supportsPromptQueueing ? 'handoff' : 'unsupported', detail: error ? String(error?.message || error) : `outcome=${result?.outcome}` };
   }
 
   /** OS pid of the kiro-cli child, or undefined once it has exited. Used to bind
@@ -789,7 +866,7 @@ export class AcpClient extends EventEmitter {
   }
 
   /** idleMs <= 0 means the request NEVER expires locally (see sendPrompt). */
-  private sendRequest(method: string, params: any, idleMs: number = 120000): Promise<any> {
+  private sendRequest(method: string, params: any, idleMs: number = 120000, onSent?: (id: number) => void): Promise<any> {
     return new Promise((resolve, reject) => {
       const id = this.nextId++;
 
@@ -812,6 +889,7 @@ export class AcpClient extends EventEmitter {
       };
 
       this.send(request);
+      onSent?.(id);
     });
   }
 
@@ -859,6 +937,8 @@ export class AcpClient extends EventEmitter {
       if (pending) {
         clearTimeout(pending.timer);
         this.pendingRequests.delete(msg.id);
+        /* 这个 session/prompt 结束了：同步摘掉，紧跟着流过来的输出就标成下一个在途的那个 */
+        { const at = this.inflightPrompts.indexOf(msg.id); if (at >= 0) this.inflightPrompts.splice(at, 1); }
         if ('error' in msg) {
           // Attach the JSON-RPC error.data so callers can surface WHY (kiro-cli
           // often sends a bare "Internal error" message with the real reason in
@@ -914,7 +994,7 @@ export class AcpClient extends EventEmitter {
           : 'steer_cleared';
         const rawContent = update.content ?? update.message;
         const text = typeof rawContent === 'string' ? rawContent : (rawContent?.text || '');
-        this.emit('update', { sessionId: params?.sessionId, update: { sessionUpdate: kind, text } });
+        this.emit('update', this.tagPrompt({ sessionId: params?.sessionId, update: { sessionUpdate: kind, text } }));
         return;
       }
     }
@@ -939,7 +1019,7 @@ export class AcpClient extends EventEmitter {
       /* 权限请求只带 toolCallId / title；写文件闸要的 kind / rawInput 在这里（只有远程会话接了闸才记） */
       const su = params?.update?.sessionUpdate;
       if (this.remoteWriteGuard && (su === 'tool_call' || su === 'tool_call_update')) this.toolLedger.remember(params.update);
-      this.emit('update', params);
+      this.emit('update', this.tagPrompt(params || {}));
     } else if (method.startsWith('_kiro.dev/')) {
       // Kiro-specific notifications (mcp init, commands, etc.)
       this.emit('update', { 
@@ -992,14 +1072,14 @@ export class AcpClient extends EventEmitter {
       }
 
       this.pendingPermissions.set(id, options);
-      this.emit('update', {
+      this.emit('update', this.tagPrompt({
         sessionId: params?.sessionId,
         update: {
           sessionUpdate: 'permission_request',
           requestId: id,
           ...params,
         },
-      });
+      }));
     } else {
       /*
         **代用户回答之前必须先说出来**。
@@ -1033,6 +1113,7 @@ export class AcpClient extends EventEmitter {
     }
     this.pendingRequests.clear();
     this.pendingPermissions.clear();
+    this.inflightPrompts = [];
   }
 }
 

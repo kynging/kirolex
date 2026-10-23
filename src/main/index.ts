@@ -20,6 +20,9 @@ import {
 } from './kiroConfig';
 import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
+import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
+import { detachedTurnEnded, steerDisplay, steeringPromptBlocks } from './busyEnterCaps';
+import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persistThenRelease, readPendingHandoffs, recoverableHandoffs, removePendingHandoff, restoreStartedHandoffs, restoredUserMessage, type PendingHandoff } from './pendingHandoffs';
 import { isReplayOutsideTurn } from './replayGuard';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { planHelperRoute, remoteLiteScript, parseRemoteLiteOutput, LOCAL_MACHINE as HELPER_LOCAL_MACHINE, type MachineModelList } from './helperModels.ts';
@@ -349,6 +352,22 @@ interface SessionEntry {
    *  their own on disk; this is the id they merge into once the backend reports
    *  them CONSUMED (see acp:persist-steer). */
   currentUserMessageId?: string;
+  /** 交给适配器、排在当前这一轮后面的那几轮（`followUpTurns.ts`）：忙时 Enter 走 promptQueueing，或 steering 碰上这一轮刚结束 */
+  followUps?: FollowUp[];
+  /** `_session/steering` 请求还在途的条数 —— 结果可能是适配器自己起了一轮（`startedNewTurn`），前一轮收尾时 busy 先别放 */
+  steeringInFlight?: number;
+  /** 前一轮收完了、还在等 steering 结果：这段时间的输出先攒着（`followUpTurns.holdTarget`） */
+  limbo?: { held: any[] };
+  /** 把攒着的输出按原顺序交给 wireSession 的那个处理函数（接手的那一轮清零计数之后调） */
+  replayUpdates?: (list: any[]) => void;
+  /** 正在跑的是适配器自己起的那一轮（detached）：收到它的结束信号时调 */
+  detachedEnd?: () => void;
+  /** 那一轮已经有过动静（active / 输出）—— 之后的 idle 才算它的结束 */
+  detachedSeen?: boolean;
+  /** sendPromptOnce 的那一轮循环正在跑（它收尾时会交棒给排着的下一轮） */
+  turnRunning?: boolean;
+  /** 最近一次点「停止」的时间 —— 排在后面的那几轮接手时据此一并停掉 */
+  cancelRequestedAt?: number;
   /** 这一轮**正常收尾**了：下一次 flush 的助手消息是回这一条用户消息的**完整**回复 —— 落盘成 `replyComplete`，去重按它认"答过了"（`promptDedupe.ts`）。flush 时取走。 */
   completedReplyTo?: string;
   /** 已经记过"模型开始做这一条了"的那个用户消息 id（`noteTurnStarted`）—— 一轮只记一次。 */
@@ -3837,15 +3856,22 @@ function setUiStateKey(key: string, value: string | null): void {
   if (key === 'kirolex-settings') syncUiLangFromSettings();
   // Coalesced: widths and drafts can change on every mouse move.
   if (uiStateFlush) clearTimeout(uiStateFlush);
-  uiStateFlush = setTimeout(() => {
-    uiStateFlush = null;
-    try {
-      fs.mkdirSync(path.dirname(UI_STATE_PATH), { recursive: true });
-      const tmp = `${UI_STATE_PATH}.tmp`;
-      fs.writeFileSync(tmp, JSON.stringify(uiState(), null, 2));
-      fs.renameSync(tmp, UI_STATE_PATH);
-    } catch { /* best-effort */ }
-  }, 400);
+  uiStateFlush = setTimeout(flushUiStateNow, 400);
+}
+
+/** 现在就把 ui-state 写盘（平时攒 400ms 一次）。要「写到盘上了才能删另一份」的地方用（acp:ack-handoff-failed）。 */
+function flushUiStateNow(): boolean {
+  if (uiStateFlush) { clearTimeout(uiStateFlush); uiStateFlush = null; }
+  try {
+    fs.mkdirSync(path.dirname(UI_STATE_PATH), { recursive: true });
+    const tmp = `${UI_STATE_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(uiState(), null, 2));
+    fs.renameSync(tmp, UI_STATE_PATH);
+    return true;
+  } catch (err: any) {
+    logger.warn('ui-state', `flush failed: ${err?.message || err}`);
+    return false;
+  }
 }
 
 /** Keys that were persisted by code that no longer exists.
@@ -5595,6 +5621,8 @@ function engineModelsPayload(sessionId: string, entry: SessionEntry) {
     effort: entry.client.selectOptions('thought_level'),
     /* 「claude code 那个就不应该叫 auto 了」—— 顶上那颗按钮在这两家是它们自己的权限模式 */
     mode: entry.client.selectOptions('mode'),
+    /* 忙时普通 Enter 交给谁（按 initialize 的能力声明，`busyEnterCaps.ts`）—— 渲染端的路由和输入框文案按它走 */
+    busyEnter: entry.client.busyEnter,
   };
 }
 
@@ -5690,8 +5718,18 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     if (superseded()) return;
     mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
   });
-  client.on('update', (data: any) => {
+  let onUpdate: (data: any, replayed?: boolean) => void;
+  /*
+    **属于排在后面那一轮的输出先攒着**（`followUpTurns.holdTarget`）：前一轮的响应到了以后、接手的那一轮清零计数之前流过来的，
+    不能算进前一轮（会被它的 flush 写成它的回复），也不能在 busy 的空档里被当成一轮之外的回放丢掉。
+    `replayed`：攒着的输出交给接手的那一轮（`entry.replayUpdates`），不再问一遍。
+  */
+  client.on('update', onUpdate = (data: any, replayed?: boolean) => {
     if (superseded()) return;
+    if (!replayed) {
+      const hold = holdTarget(entry, data, client.promptInFlight);
+      if (hold) { hold.held.push(data); return; }
+    }
     // A background history-priming turn's output must never surface: don't
     // forward to the UI, accumulate, or persist it.
     //
@@ -5705,6 +5743,14 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // one. Anything added here later that sends a prompt the user did not type must
     // suppress it the same way.
     if (entry.priming) return;
+    /*
+      适配器自己起的那一轮（detached）的结束信号（busyEnterCaps.detachedTurnEnded）—— 它没有 session/prompt 响应。
+      只认这一轮自己有过动静（threadStatus active / 任何输出）之后的那个 idle：实测 Codex 先回 startedNewTurn、再发 active。
+    */
+    if (entry.detachedEnd) {
+      if (detachedTurnEnded(data?.update)) { if (entry.detachedSeen) entry.detachedEnd(); }
+      else entry.detachedSeen = true;
+    }
     /*
       **一轮之外的对话正文是后端回放的旧对话，丢掉**（判据和理由见 `replayGuard.ts`）——
       「远程新建会话界面仍出现历史会话内容」。不丢的话它进了渲染层这条会话的缓存，切到它时就画出来。
@@ -5943,6 +5989,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       : undefined;
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
+  entry.replayUpdates = (list) => { for (const d of list) onUpdate(d, true); };
   /*
     后端 stderr 里**值得看的那几行**送到界面上（判据在 `stderrNotice`）—— 原来这里只进日志，
     渲染层的 `onError` 只 `console.error`，于是 MCP server 起不来时界面上什么都没说。
@@ -5980,6 +6027,16 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       渲染层那次自动重连只试一次，网络没回来就放弃了。主动 detach 的不走这里（上面那道身份守卫）。
     */
     if (entry.profile.remote?.sshHost && !isQuitting) startRemoteRecovery(sessionId);
+  });
+  /*
+    执行器没了（意外断开，或者被换下来）：适配器自己起的那一轮（detached）没有响应会被拒，要在这里让它收场；
+    还没轮到的那几条放弃（渲染端放回 KiroLex 队列）。排在上面那个之后：它的身份守卫只管会话记录，这里两种都要收。
+  */
+  client.on('disconnected', () => {
+    for (const f of [...(entry.followUps || [])]) {
+      if (f.started) f.failDetached?.(new Error(tr('Session not connected')));
+      else f.abort(new Error(tr('Session not connected')));
+    }
   });
 }
 
@@ -7605,7 +7662,7 @@ app.whenReady().then(async () => {
     return { sessionId: kiroLexId };
   });
 
-  ipcMain.handle('acp:prompt', async (_event, sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[] }) => {
+  ipcMain.handle('acp:prompt', async (_event, sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => {
     /**
      * 已经删掉的会话不许再发东西进去 —— 否则那一发**会把它复活**。
      *
@@ -7664,9 +7721,22 @@ app.whenReady().then(async () => {
     }
   });
 
+  /** `followUpTurns.enlistFollowUp` / `handOverTurn` 要的那几样副作用（这条会话的） */
+  const followUpDeps = (sessionId: string, entry: SessionEntry): FollowUpDeps => ({
+    isCurrent: () => sessionClients.get(sessionId) === entry,
+    emitBusy: () => emitSessionBusy(sessionId),
+    afterRelease: () => { void pendingSwitchRunner.kick(sessionId); },
+    log: (line) => logger.info('prompt', `${line} sessionId=${sessionId}`),
+    notConnected: () => new Error(tr('Session not connected')),
+  });
+  const enlistFollowUp = (sessionId: string, entry: SessionEntry, spec: HandoffSpec, prompt: any[], messageId: string, onBegin: () => void) =>
+    enlistFollowUpTurn(entry, spec, prompt, messageId, onBegin, followUpDeps(sessionId, entry));
+  const handOverTurn = (sessionId: string, entry: SessionEntry) => handOverFollowUp(entry, followUpDeps(sessionId, entry));
+
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
-  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean }, _model?: string, attempt = 0): Promise<any> {
+  type PromptDisplay = { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean; handoff?: HandoffSpec; fromHandoff?: string[] };
+  async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: PromptDisplay, _model?: string, attempt = 0): Promise<any> {
     /* 同一次提交只发一次（`promptDedupeFor`） */
     const dedupe = promptDedupeFor(sessionId, display?.messageId, attempt);
     /*
@@ -7688,6 +7758,11 @@ app.whenReady().then(async () => {
     // session's executor, and the rest of the turn must continue on the new one.
     let entry = sessionClients.get(sessionId);
     if (!entry) throw new Error(tr('Session not connected'));
+    /*
+      **交给适配器、排在当前这一轮后面的那一轮**（`followUpTurns.ts`）：不拒绝「正忙」，而是登记成下一轮，
+      等前一轮收尾时同步交棒，再像普通的一轮那样跑完（落盘、看门狗、自动重发、收尾都归这一条）。只在第一次发送时生效。
+    */
+    const handoff = attempt === 0 ? display?.handoff : undefined;
     /* 不许借一次发送把会话放进 KiroLex Advanced 专属的 flow 项目 —— 在任何副作用（拷附件、写记录）之前 */
     if (refusesProjectChange(projectId, entry.profile.projectId, store.isAdvancedOnlyProjectName)) {
       throw new Error(refuseAdvancedProject(projectId, 'prompt') || tr('This project belongs to KiroLex Advanced; the standard edition does not modify it.'));
@@ -7771,7 +7846,9 @@ app.whenReady().then(async () => {
       && !entry.priming
       && !entry.needsHistoryPrime
       && store.readRecord(sessionId)?.primeMode !== 'full'
-      && store.transcriptFileSize(sessionId) > 0;
+      && store.transcriptFileSize(sessionId) > 0
+      /* handoff 不带历史快照：它排在一轮正在跑的会话后面，前一轮要么已经带过、要么不需要 —— 再带一份就重复了 */
+      && !handoff;
     /*
       **Claude Code / Codex：这一轮开始时后端已经握着这条会话的全部历史**（之前建立过，或者这是第一轮、盘上还什么都没有）
       → 这一轮成功结束就把「上下文已建立」记到这个后端会话 id 上。不记的话只聊过一轮就重启，
@@ -7806,6 +7883,7 @@ app.whenReady().then(async () => {
       }
     }
     markContextOwedIfUnverified(sessionId, 'prompt');
+    if (handoff && (entry.priming || entry.needsHistoryPrime)) throw new HandoffRefused('priming');
     if (entry.priming || entry.needsHistoryPrime) {
       const primed = await primeHistoryNow(sessionId);
       /*
@@ -7853,12 +7931,19 @@ app.whenReady().then(async () => {
       只对 KiroLex 自己刚判卡死的那一轮等（最多 20 秒，teardown 本身 15 秒封顶），
       别的情况照旧拒绝，不让排队的消息和正在跑的那一轮重叠。
     */
+    if (handoff?.kind === 'queued') {
+      /* 这一轮已经结束了：没有可排在后面的那一轮，按普通消息发（渲染端改走 sendNowOrNext） */
+      if (!entry.busy) throw new HandoffRefused('idle');
+      /* 占着 busy 的不是一轮普通对话（没有人会来交棒）、或者适配器没声明 promptQueueing：退回 KiroLex 队列 */
+      if (!entry.turnRunning || !entry.client.supportsPromptQueueing) throw new HandoffRefused('unsupported');
+    }
     if (entry.busy && entry.wedgedAt && Date.now() - entry.wedgedAt < 30000) {
       const waitUntil = Date.now() + 20000;
-      while (entry.busy && Date.now() < waitUntil) await new Promise((r) => setTimeout(r, 200));
+      /* handoff 不等：它本来就是要排在正在跑的那一轮后面 */
+      while (!handoff && entry.busy && Date.now() < waitUntil) await new Promise((r) => setTimeout(r, 200));
       logger.info('prompt', `waited for wedged turn to release sessionId=${sessionId} busy=${entry.busy}`);
     }
-    if (entry.busy) {
+    if (entry.busy && !handoff) {
       /* 带错误码：后台唤醒据此判「撞上忙、空了再发」，不靠这句随界面语言变的文字 */
       throw Object.assign(new Error(tr('Wait for the active turn (including context compaction) to finish before sending the queued message.')), { code: SESSION_BUSY });
     }
@@ -7882,7 +7967,12 @@ app.whenReady().then(async () => {
     const effectiveProjectId = projectId ?? entry.profile.projectId;
     // Persist the user message the instant it is sent (asymmetric durability, §7).
     const userMessageId = display?.messageId || `u_${Date.now()}`;
-    entry.currentUserMessageId = userMessageId;
+    /* handoff：前一轮还在跑，它的 steer 还要并进它自己的用户消息 —— 交棒时再换 */
+    if (!handoff) entry.currentUserMessageId = userMessageId;
+    const fromHandoffIds = Array.isArray(display?.fromHandoff) ? display!.fromHandoff.filter((x) => typeof x === 'string' && x) : [];
+    /* handoff 推迟到交棒那一刻（前一轮的回复先落盘，对话记录的顺序才对）；其余照旧马上落盘 */
+    /* 返回「这条用户消息在盘上了」：已经在盘上（重发 / 去重）也算；追加失败返回 false（handoff 据此保留恢复记录） */
+    const persistUserMessage = (): boolean => {
     /**
      * **自动重发的那几次不能再落一遍盘** —— `appendMessage` 是无条件追加（见 sessionStore），
      * 所以重发一次 transcript 里就多一条同样的用户消息；而 ride-along 快照正是从 transcript 建的，
@@ -7890,12 +7980,17 @@ app.whenReady().then(async () => {
      */
     if (attempt > 0) {
       /* 这一条早就在盘上了（见上面）—— 什么都不做 */
+      return true;
     } else if (!dedupe.persist) {
       /* 同一个 messageId 上一次没发成：它也已经在盘上了（`promptDedupe.ts`）—— 不再追加一条 */
-    } else try {
-      const promptText = Array.isArray(prompt)
-        ? prompt.map((p: any) => (typeof p === 'string' ? p : p?.text || '')).join('')
-        : String(prompt ?? '');
+      return true;
+    }
+    let persisted = false;
+    /* handoff 推迟到交棒时才落盘，那时 prompt 前面已经拼上了记忆等注入块 —— 所以 handoff 一律带 displayText（渲染端 / acp:steer 都给），不走这个兜底 */
+    const promptText = Array.isArray(prompt)
+      ? prompt.map((p: any) => (typeof p === 'string' ? p : p?.text || '')).join('')
+      : String(prompt ?? '');
+    try {
       store.appendMessage(sessionId, {
         id: userMessageId,
         role: 'user',
@@ -7906,6 +8001,8 @@ app.whenReady().then(async () => {
         ...(display?.mergeIntoMessageId ? { mergeIntoMessageId: display.mergeIntoMessageId } : {}),
         // 经控制入口发出的（id 带标记，见 controlSessions.isControlMessageId）：对话记录里显式记一笔
         ...(isControlMessageId(userMessageId) ? { via: 'control' as const } : {}),
+        /* 放回 KiroLex 队列的那几条 handoff 原来的 id：重启恢复据此认出已经发过了（pendingHandoffs） */
+        ...(fromHandoffIds.length ? { fromHandoff: fromHandoffIds } : {}),
         ...(display?.attachments?.length
           ? {
               attachments: display.attachments.map((a: any) => ({
@@ -7925,14 +8022,25 @@ app.whenReady().then(async () => {
             }
           : {}),
       });
-      /*
-        **主进程自己发起的这一轮**（定时到点 / 后台命令退出 / 监视事件）—— 界面原来不知道有这一轮：
-        用户消息只在盘上、回复不流式，切走再回来才看得见。告诉渲染端：插进这条消息，并接管这一轮的流。
-      */
-      if (display?.announce) {
-        mainWindow?.webContents.send('acp:main-turn', { sessionId, messageId: userMessageId, content: display?.displayText ?? promptText, ts: Date.now(), ...(display?.kirolexNote ? { kirolex: true } : {}) });
-      }
-    } catch {}
+      persisted = true;
+    } catch (err: any) {
+      logger.warn('prompt', `user message NOT persisted sessionId=${sessionId} messageId=${userMessageId}: ${err?.message || err}`);
+    }
+    /* 落进 transcript 了：那几条 handoff 的恢复记录现在可以摘（摘之前崩了也不怕：transcript 里的 fromHandoff 认得出它们）。没落上就留着 */
+    if (persisted && fromHandoffIds.length) {
+      for (const hid of fromHandoffIds) { try { removePendingHandoff(store.sessionDirPath(sessionId), hid); } catch { /* 重启时按 fromHandoff 判 */ } }
+    }
+    /*
+      **主进程自己发起的这一轮**（定时到点 / 后台命令退出 / 监视事件 / 交给适配器排着的那一轮）—— 界面原来不知道有这一轮：
+      用户消息只在盘上、回复不流式，切走再回来才看得见。告诉渲染端：插进这条消息，并接管这一轮的流。
+      落盘失败也照样说：这一轮已经在跑了，界面上不能没有它（恢复记录留着，重启时还能放回）。
+    */
+    if (display?.announce) {
+      mainWindow?.webContents.send('acp:main-turn', { sessionId, messageId: userMessageId, content: display?.displayText ?? promptText, ts: Date.now(), ...(display?.kirolexNote ? { kirolex: true } : {}), ...(handoff ? { handoff: true } : {}), ...(display?.attachments?.length ? { attachments: display.attachments } : {}) });
+    }
+    return persisted;
+    };
+    if (!handoff) persistUserMessage();
     // Inject layered memory (global ⊕ project ⊕ this chat) on EVERY turn.
     //
     // It used to go out only when the block's CONTENT changed, which is right for
@@ -8020,13 +8128,67 @@ app.whenReady().then(async () => {
         store.writeLastInjection(sessionId, sentContextSnapshot);
       } catch { /* diagnostics must never block a send */ }
     }
+    /*
+      **handoff：登记成排在后面的那一轮，等前一轮交棒**（`enlistFollowUp`）。交棒那一刻同步：接 busy、换
+      currentUserMessageId（这之后的 steer 并进这一条）、落盘用户消息、告诉界面（`acp:main-turn`，渲染端接管这一轮的流）。
+    */
+    let preResponse: Promise<any> | undefined;
+    let followUp: FollowUp | undefined;
+    const enlistedAt = Date.now();
+    if (handoff) {
+      /*
+        **发之前先记在盘上**（`pendingHandoffs.ts`）：交出去之后、交棒落盘之前这段时间退出 / 崩溃，适配器跟着没了、那条也没跑，
+        重启时从这里放回 KiroLex 队列。交棒时先落盘 transcript 再摘（中间崩了，transcript 里有它，重启不会再放回）；没轮到就失败也摘。
+      */
+      const dir = store.sessionDirPath(sessionId);
+      if (handoff.kind === 'queued') {
+        try {
+          addPendingHandoff(dir, {
+            id: userMessageId,
+            content: display?.displayText ?? '',
+            ...(display?.attachments?.length ? { attachments: display.attachments } : {}),
+            ...(display?.pastes?.length ? { pastes: display.pastes } : {}),
+            ts: Date.now(),
+          });
+        } catch (err: any) {
+          logger.warn('prompt', `pending handoff not recorded sessionId=${sessionId}: ${err?.message || err} —— 退回 KiroLex 队列`);
+          throw new HandoffRefused('unsupported');
+        }
+      }
+      try {
+        const enlisted = await enlistFollowUp(sessionId, entry, handoff, prompt, userMessageId, () => {
+          entry!.currentUserMessageId = userMessageId;
+          /* 先记一笔「已经交给适配器在跑了」：下面落盘要是失败，重启时它只补写进对话记录、不自动重发（不会重复执行） */
+          try { markHandoffStarted(dir, userMessageId); } catch { /* 记不上：重启时还按 transcript 里的 replyTo 认 */ }
+          /* 确认用户消息落上了 transcript 才摘恢复记录（`pendingHandoffs.persistThenRelease`）；没落上就留着、明说出来 */
+          const released = persistThenRelease(dir, userMessageId, persistUserMessage);
+          if (!released && handoff.kind === 'queued') {
+            sessionNotice(sessionId, tr('This message could not be saved to the conversation record; it is kept for recovery after a restart.'));
+          }
+        });
+        followUp = enlisted.followUp;
+        preResponse = enlisted.response;
+      } catch (err: any) {
+        /*
+          没轮到它就失败了（`handoffNotStarted`）：盘上的记录**先留着**，等渲染端把它放回 KiroLex 队列、队列写了盘
+          再摘（`acp:ack-handoff-failed`）—— 中间窗口没了 / 崩了，重启时照样从这里放回，不丢。别的失败（压根没发出去）渲染端当场处理，直接摘。
+        */
+        if (!err?.handoffNotStarted) { try { removePendingHandoff(dir, userMessageId); } catch { /* 重启时按 transcript 判 */ } }
+        throw err;
+      }
+    }
+    /* 这一轮收尾时 busy 留给了排在后面的那一轮 —— 最外层 finally 里交棒 */
+    let ownsHandOver = false;
+    let myTurnSeq = -1;
     try {
       entry.busy = true; // in-flight turn — exempt from LRU eviction
+      entry.turnRunning = true;
       entry.turnStartedAt = Date.now();   // 控制入口 `GET /sessions/:id/status` 的 turnStartedAt
       emitSessionBusy(sessionId);
       // Tag this turn so a *rejected duplicate* invocation can never clear the
       // busy flag belonging to the turn that is actually running.
       const myTurn = (entry.turnSeq = (entry.turnSeq || 0) + 1);
+      myTurnSeq = myTurn;
       try {
         // QUIET MONITOR — OBSERVE ONLY, NEVER INTERRUPT. An earlier version
         // cancelled a turn after 3 minutes of silence and resent it, on the theory
@@ -8204,7 +8366,32 @@ app.whenReady().then(async () => {
             chars: prompt.reduce((sum: number, block: any) => sum + (typeof block?.text === 'string' ? block.text.length : 0), 0),
           });
           try {
-            const result = await entry.client.sendPrompt(entry.cliSessionId, prompt);
+            /*
+              handoff 的第一次：字节早就发出去了（queued 的 session/prompt / detached 的 steering），等它自己的结束；
+              这一轮的计数刚清零，现在把攒着的输出按原顺序交出去，之后的直接处理（`live`）。
+            */
+            const adoptPreResponse = async (pending: Promise<any>): Promise<any> => {
+              const ent = entry!;
+              if (followUp?.kind === 'detached') {
+                const fu = followUp;
+                ent.detachedSeen = false;
+                ent.detachedEnd = () => { ent.detachedEnd = undefined; fu.endDetached?.({ stopReason: 'end_turn' }); };
+              }
+              /* 你点了停止之后才轮到它：一接手就停（Claude Code 本来就会把排着的一起取消，这是兜底） */
+              if (ent.cancelRequestedAt && ent.cancelRequestedAt >= enlistedAt) {
+                try { await ent.client.cancelPrompt(ent.cliSessionId); } catch { /* 进程已经没了 */ }
+                ent.detachedEnd?.();
+              }
+              if (followUp) {
+                followUp.live = true;
+                const held = followUp.held.splice(0);
+                if (held.length) ent.replayUpdates?.(held);
+              }
+              return pending;
+            };
+            const pre = preResponse;
+            preResponse = undefined;
+            const result = pre ? await adoptPreResponse(pre) : await entry.client.sendPrompt(entry.cliSessionId, prompt);
             // Our OWN cancel ended this turn. kiro-cli does not always label it
             // A turn now ends ONLY because kiro-cli ended it or because the user
             // pressed Stop. There is no automatic cancel/retry any more, so any
@@ -8412,7 +8599,12 @@ app.whenReady().then(async () => {
         }
       } finally {
         const e = sessionClients.get(sessionId);
-        if (e && e.turnSeq === myTurn) { e.busy = false; e.lastUsedAt = Date.now(); }
+        if (followUp) { dropFollowUp(entry, followUp); if (entry.detachedEnd) entry.detachedEnd = undefined; }
+        if (e && e.turnSeq === myTurn) {
+          /* 有人排在后面（或者还在等 steering 的结果）：busy 留着，下面最外层收尾时交棒（`handOverTurn`） */
+          if (keepsBusy(e)) ownsHandOver = true;
+          else { e.busy = false; e.lastUsedAt = Date.now(); }
+        }
         emitSessionBusy(sessionId);
         /**
          * 一轮对话结束 —— 如果这条会话正在替某个 flow 节点干活，**在这里**把账记上。
@@ -8528,6 +8720,11 @@ app.whenReady().then(async () => {
       if (isBareInternalError(`${err?.message || ''}${detail}`)) {
         bareFailStreak.set(sessionId, (bareFailStreak.get(sessionId) || 0) + 1);
       }
+      /*
+        **有一轮排在后面（适配器那边已经收下了）时不自己重发、不换后端会话**：重发的这一条会排到它后面去、或者落到一个它不在的新会话上，
+        两轮就对不上了。照实报这个错；排着的那一轮照常接手。
+      */
+      if (ownsHandOver) throw err;
       const verdict = staleVerdict({
         error: `${err?.message || ''}${detail}`,
         contextPid: store.readRecord(sessionId)?.contextEstablishedPid,
@@ -8657,6 +8854,15 @@ app.whenReady().then(async () => {
         成功那条路已经消化过（再调是空操作）；自动重发那条路由里层那次调用消化。
         别的一轮正在跑（busy）就不动 —— 它收尾时会消化。
       */
+      /* busy 留给了排在后面的那一轮：现在交棒（前一轮的回复 / 半截回复都已经落盘了） */
+      if (entry.turnSeq === myTurnSeq) entry.turnRunning = false;
+      if (ownsHandOver) handOverTurn(sessionId, entry);
+      else if (entry.limbo && !entry.turnRunning && !(entry.steeringInFlight || 0) && !entry.followUps?.length) {
+        /* limbo 里还攒着输出（steering 在这一轮收尾前就有了结果、不是「自己起了一轮」）：原样交还给处理函数，busy 不动 */
+        const held = entry.limbo.held;
+        entry.limbo = undefined;
+        if (held.length) entry.replayUpdates?.(held);
+      }
       if (!sessionClients.get(sessionId)?.busy) consumePendingProjectReset(sessionId, '本轮报错结束，执行下推的执行器重置');
       /* 这一轮（正常结束 / 报错 / 被 Stop）收场：忙时记下的切换现在应用（还有别的一轮在跑就等它收尾） */
       void pendingSwitchRunner.kick(sessionId);
@@ -8737,7 +8943,11 @@ app.whenReady().then(async () => {
     }
     entry.suppressCancellationChunks = suppressInterruptionNotice;
     try {
+      /* 排在后面、已经交给适配器的那几轮也一起停：它们接手时再补一个 cancel（见 sendPromptOnce 的 handoff 那段） */
+      entry.cancelRequestedAt = Date.now();
       await entry.client.cancelPrompt(entry.cliSessionId);
+      /* 适配器自己起的那一轮（detached）没有响应可等：停了就算这一轮结束 */
+      entry.detachedEnd?.();
 
       // session/cancel is a notification, so wait for the in-flight prompt RPC to
       // settle before allowing an interrupt-and-steer prompt onto the same client.
@@ -8774,7 +8984,97 @@ app.whenReady().then(async () => {
    *  同一个函数、按路径+mtime+大小缓存，所以 acp:steer 再处理一遍得到的是同一份文字。 */
   ipcMain.handle('acp:cap-steer-text', async (_event, message: string) => capImageRefsInText(String(message || '')));
 
-  ipcMain.handle('acp:steer', async (_event, sessionId: string, message: string) => {
+  /**
+   * **忙时 Enter 交给适配器排队**（适配器声明了 `agentCapabilities._meta.claudeCode.promptQueueing`，见 busyEnterCaps.ts）：
+   * 现在就把这条的 session/prompt 发出去，由 CLI 自己排在正在跑的那一轮后面；KiroLex 把它登记成下一轮（`followUpTurns.ts`），
+   * 前一轮收尾时交棒 —— 用户消息那时落盘、界面那时插进这条消息并接管它的流（`acp:main-turn`）。
+   * 一发出去就回话（`accepted`）；没发成回 `{accepted:false, reason}`，渲染端按 reason 改走普通发送 / KiroLex 队列。
+   * 发出去了、却没轮到它就失败了（执行器没了…）→ `acp:handoff-failed`（`notStarted`），渲染端把它放回 KiroLex 队列。
+   */
+  ipcMain.handle('acp:handoff-prompt', async (_event, sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; attachments?: any[]; pastes?: any[] }) => {
+    { const advRefused = refuseAdvancedOnly(sessionId, 'prompt'); if (advRefused) return { accepted: false, reason: 'refused', error: advRefused }; }
+    if (deletedSessionIds.has(sessionId) || store.readRecord(sessionId)?.archived) return { accepted: false, reason: 'refused' };
+    return await new Promise<{ accepted: boolean; reason?: string; error?: string }>((resolve) => {
+      let answered = false;
+      const answer = (r: { accepted: boolean; reason?: string; error?: string }) => { if (!answered) { answered = true; resolve(r); } };
+      sendPromptOnce(sessionId, prompt, projectId, {
+        ...(display || {}),
+        announce: true,
+        handoff: { kind: 'queued', onAccepted: answer },
+      }, model).catch((err: any) => {
+        if (err instanceof HandoffRefused) { answer({ accepted: false, reason: err.reason }); return; }
+        if (!answered) { answer({ accepted: false, reason: 'error', error: String(err?.message || err) }); return; }
+        const notStarted = !!err?.handoffNotStarted;
+        logger.warn('prompt', `handoff turn failed sessionId=${sessionId} messageId=${display?.messageId} notStarted=${notStarted}: ${err?.message || err}`);
+        /* 整条消息跟着走：窗口刷新过的话它手里已经没有那张卡片了，靠这份放回 KiroLex 队列 */
+        mainWindow?.webContents.send('acp:handoff-failed', {
+          sessionId, messageId: display?.messageId, notStarted, error: String(err?.message || err),
+          content: display?.displayText ?? '',
+          ...(display?.attachments?.length ? { attachments: display.attachments } : {}),
+          ...(display?.pastes?.length ? { pastes: display.pastes } : {}),
+        });
+        if (!notStarted) sessionNotice(sessionId, String(err?.message || err));
+      });
+    });
+  });
+
+  /**
+   * 窗口启动时取上一次运行留下的、交给了适配器却没轮到的那几条（`pendingHandoffs.recoverableHandoffs`，只读不摘：
+   * 窗口放进队列、队列写盘之后逐条 `acp:ack-handoff-failed`，那时才摘），
+   * 渲染端放回 KiroLex 队列。transcript 里已经有的（交棒时落过盘）不给；主进程内存里还排着的（只是窗口刷新了）不动。
+   */
+  /** 渲染端把没轮到的那条放回 KiroLex 队列了：先把 ui-state（队列就在里面）写盘，再摘掉盘上的记录 */
+  ipcMain.handle('acp:ack-handoff-failed', (_event, sessionId: string, messageId: string) => {
+    if (!sessionId || !messageId) return { ok: false };
+    /* 只有 ui-state 真的写上了盘、写上去的队列里也有它，才摘（`pendingHandoffs.ackRequeued`）；否则留着，下次启动照样放回 */
+    try {
+      const ok = ackRequeued(store.sessionDirPath(sessionId), sessionId, messageId, {
+        flush: flushUiStateNow,
+        queuesRaw: () => uiState()['kirolex-queues'],
+      });
+      if (!ok) logger.warn('prompt', `handoff requeue NOT confirmed sessionId=${sessionId} messageId=${messageId} —— 记录留着，下次启动再放回`);
+      return { ok };
+    } catch { return { ok: false }; }
+  });
+
+  ipcMain.handle('acp:take-pending-handoffs', () => {
+    const out: Record<string, PendingHandoff[]> = {};
+    /* 主进程还排着的（只是窗口刷新了）：交回去让窗口把「已交给 …」卡片画回来 */
+    const liveCards: Record<string, PendingHandoff[]> = {};
+    const live = new Set<string>();
+    for (const e of sessionClients.values()) for (const f of e.followUps || []) live.add(f.messageId);
+    let ids: string[] = [];
+    try { ids = fs.readdirSync(path.dirname(store.sessionDirPath('x'))); } catch { return out; }
+    for (const id of ids) {
+      let dir: string;
+      try { dir = store.sessionDirPath(id); } catch { continue; }
+      if (!fs.existsSync(path.join(dir, 'pending-handoffs.json'))) continue;
+      try {
+        /* 已经发过的：transcript 里的消息 id，加上放回队列后发出去的那条带着的原 handoff id（`fromHandoff`，合并发送可以有几条） */
+        /* 分开判：用户消息在盘上了（可以摘） / 执行过了（不能重发）—— 有回复却没有用户消息的，补写原文 */
+        const known = handoffFacts(store.readTranscript(id, { raw: true }) || []);
+        /* 交棒过、用户消息没写上的：补写进对话记录（原来的 id），不自动重发 —— 要不要重跑你来定 */
+        /* 和 persistUserMessage 同一个形状（原文、附件、粘贴块），见 pendingHandoffs.restoredUserMessage */
+        const restored = restoreStartedHandoffs(dir, known, live, (h) => store.appendMessage(id, {
+          ...restoredUserMessage(h),
+          ...(isControlMessageId(h.id) ? { via: 'control' as const } : {}),
+        }));
+        if (restored.length) logger.info('prompt', `started handoffs restored into transcript sessionId=${id} count=${restored.length} —— 已经执行过，不自动重发`);
+        const back = recoverableHandoffs(dir, known, live);
+        const still = readPendingHandoffs(dir).filter((h) => live.has(h.id));
+        if (still.length) liveCards[id] = still;
+        if (back.length) {
+          out[id] = back;
+          logger.info('prompt', `pending handoffs recovered sessionId=${id} count=${back.length} —— 放回 KiroLex 队列`);
+        }
+      } catch (err: any) {
+        logger.warn('prompt', `pending handoffs unreadable sessionId=${id}: ${err?.message || err}`);
+      }
+    }
+    return { recover: out, live: liveCards };
+  });
+
+  ipcMain.handle('acp:steer', async (_event, sessionId: string, message: string, steerMsgId?: string) => {
     const entry = sessionClients.get(sessionId);
     // Order matters (see steerGate.ts): a history rebuild is a LOCKED task, not a
     // conversational turn -- steering into it would inject the user's text into a
@@ -8792,6 +9092,61 @@ app.whenReady().then(async () => {
     if (refused === 'priming') logger.info('prime', `steer REFUSED during rebuild sessionId=${sessionId} -> renderer should wait for it`);
     if (refused || !entry) return { steered: false, reason: refused || 'not-connected' };
     entry.lastUsedAt = Date.now();
+    /*
+      **适配器声明了 `_meta.steering.supported`**（Claude Code / Codex，`busyEnterCaps.ts`）：`_session/steering` 请求，
+      插进当前这一轮。没有在跑的一轮 → `idle`（渲染端改普通发送）；报错 → `unsupported`（渲染端排队，不标红）。
+    */
+    if (entry.client.busyEnter === 'steering') {
+      const capped = capImageRefsInText(message);
+      /* 结果可能是「适配器自己起了一轮」：这一轮要是在等结果的时候收尾了，busy 先别放（`followUpTurns.keepsBusy`） */
+      entry.steeringInFlight = (entry.steeringInFlight || 0) + 1;
+      /* 「在途」一直算到那一轮登记好为止（handed-off 时）：中间前一轮收尾了也不会把 busy 放掉、把攒着的输出当回放丢掉 */
+      let settled = false;
+      const settle = () => {
+        if (settled) return;
+        settled = true;
+        entry.steeringInFlight = Math.max(0, (entry.steeringInFlight || 1) - 1);
+      };
+      let res: { steered: boolean; reason?: string; detail?: string };
+      try {
+        res = await entry.client.steering(entry.cliSessionId, capped);
+      } catch (err: any) {
+        res = { steered: false, reason: 'unsupported', detail: String(err?.message || err) };
+      }
+      if (res.reason !== 'handed-off') settle();
+      if (!res.steered || res.detail) logger.info('prompt', `_session/steering sessionId=${sessionId} steered=${res.steered} reason=${res.reason || '-'} ${res.detail || ''}`);
+      if (res.reason === 'handed-off') {
+        /*
+          **这一轮刚好结束，适配器自己起了一轮**（Codex 的 `startedNewTurn`）：把那一轮认成这条消息的正常一轮 ——
+          用户消息作为一条新消息落盘（不并进上一轮），输出 / 结束 / 落盘都归它。从现在起没标 prompt 的输出先攒着（limbo），
+          登记好之后交给它。消息已经在适配器手里了，绝不再发一遍。
+        */
+        entry.limbo ||= { held: [] };
+        /* 由渲染端那条 steer 的 id 推出来（`steer_ctl_…` → `user_ctl_…_turn`）：控制入口发的照样带标记、落盘成 via:'control' */
+        const turnMessageId = detachedTurnMessageId(typeof steerMsgId === 'string' && /^steer_[A-Za-z0-9_-]+$/.test(steerMsgId) ? steerMsgId : `steer_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`);
+        /* 显示 / 落盘：渲染端拼的 steer 文字里带着附件引用块（steerRoute.steerPayload），拆回正文 + 附件，和普通消息一样 */
+        const shown = steerDisplay(message);
+        void sendPromptOnce(sessionId, steeringPromptBlocks(capped), entry.profile.projectId, {
+          messageId: turnMessageId,
+          displayText: shown.text,
+          ...(shown.files.length ? { attachments: shown.files } : {}),
+          announce: true,
+          handoff: { kind: 'detached', held: [], onEnlisted: settle },
+        }).catch((err: any) => {
+          /* 没登记上就失败了：别让 busy 一直留着 */
+          if (!settled) {
+            settle();
+            if (entry.limbo && !entry.turnRunning && !(entry.steeringInFlight || 0)) handOverTurn(sessionId, entry);
+          }
+          logger.warn('prompt', `detached turn failed sessionId=${sessionId} messageId=${turnMessageId}: ${err?.message || err}`);
+          sessionNotice(sessionId, String(err?.message || err));
+        });
+        return { steered: false, reason: 'handed-off', messageId: turnMessageId };
+      }
+      /* 前一轮在等这个结果才肯交棒：不是「自己起了一轮」，那就放开（或者交给排着的下一个） */
+      if (entry.limbo && !entry.turnRunning && !(entry.steeringInFlight || 0)) handOverTurn(sessionId, entry);
+      return { steered: res.steered, reason: res.reason };
+    }
     // Same cap as the prompt path: a steer can carry attachments too.
     const steered = entry.client.steer(entry.cliSessionId, capImageRefsInText(message));
     return { steered, reason: steered ? undefined : 'write-failed' };

@@ -47,9 +47,18 @@ describe('适配器怎么起', () => {
 });
 
 describe('kiro 专有的东西对另外两家关掉', () => {
-  test('_session/steer 只给 kiro', () => {
+  test('_session/steer 只给 kiro；适配器能不能插进当前轮看 initialize 的能力声明（tests/busyEnterCaps.test.ts）', () => {
     assert.equal(new AcpClient('m').supportsSteer, true);
-    assert.equal(new AcpClient('m', undefined, undefined, 'auto-approve', undefined, undefined, 'claude').supportsSteer, false);
+    assert.equal(new AcpClient('m').busyEnter, 'steer');
+    const claude: any = new AcpClient('m', undefined, undefined, 'auto-approve', undefined, undefined, 'claude');
+    assert.equal(claude.supportsSteer, false, '还没 initialize：没有能力声明就不能插');
+    // claude-agent-acp 0.88.0 的 initialize 响应（只留相关字段）
+    claude.initializeResult = {
+      agentCapabilities: { _meta: { claudeCode: { promptQueueing: true } } },
+      _meta: { steering: { supported: true } },
+    };
+    assert.equal(claude.supportsSteer, true);
+    assert.equal(claude.busyEnter, 'steering', '走 _session/steering，不是 kiro 的 _session/steer');
   });
 
   test('远程也能跑 ——「只要 remote 也安装 ACP 不就行了吗」：ssh 起远端的适配器，先报 PID', async () => {
