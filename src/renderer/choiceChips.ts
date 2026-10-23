@@ -9,6 +9,10 @@
  * `session/request_user_input` / `ask` / `choice` 这类一个都没有。
  * 所以模型想让你选，它只能把选项**写进回复文字**里。
  *
+ * 2026-10-23 用 kiro-cli 2.13.0 重新核实：二进制里多了 ACP 的 elicitation 类型定义（sacp 11），但没有任何
+ * "问用户"的工具，它自己的终端界面也没实现 `elicitation/create` —— 还是只能靠认文本。这一排片现在**只给 kiro**：
+ * Claude Code / Codex 走真的提问表单（`components/QuestionCard.tsx`，`main/elicitation.ts`），不再从正文里猜第二套。
+ *
  * 也就是说：这里没有任何结构化信息可用，只能从 markdown 里认。而"认"必然会误判，
  * 所以判据要保守 —— 下面每一条都在挡一种具体的误判。
  *

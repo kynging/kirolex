@@ -51,6 +51,7 @@ import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
 import { engineLabel, engineCliName } from './engineLabel';
+import type { QuestionCard } from '../main/elicitation.ts';
 import { EngineStatusPanel } from './components/EngineStatusPanel';
 
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
@@ -285,6 +286,10 @@ declare global {
        *  message, which is also how it is rendered. */
       persistSteer?: (sessionId: string, text: string, messageId?: string, attachments?: { id?: string; name: string; path: string; isImage?: boolean }[]) => Promise<{ ok: boolean; merged?: boolean; error?: string }>;
       respondPermission: (requestId: number | string, optionId: string, sessionId: string) => Promise<void>;
+      answerQuestion?: (sessionId: string, cardId: string, action: 'accept' | 'decline', values?: Record<string, unknown>) =>
+        Promise<{ ok: true; card: QuestionCard } | { ok: false; error: string; missing?: string[]; invalid?: string[] }>;
+      pendingQuestions?: () => Promise<QuestionCard[]>;
+      cancelQuestions?: (sessionId: string) => Promise<number>;
       listModels: (machine?: string) => Promise<any>;
       listHelperModels?: (opts?: { cachedOnly?: boolean }) => Promise<{ lists: import('../main/helperModels').MachineModelList[]; cachedIds: string[]; fallbackOrder: string[] }>;
       getUsage: () => Promise<{ text: string }>;
@@ -469,6 +474,8 @@ export interface Message {
    *  只是原样带着 —— 读回来、整份重写时都不能丢。 */
   replyTo?: string;
   replyComplete?: true;
+  /** 模型向用户的一次提问（提问卡片，`main/elicitation.ts`）。这种消息正文是空的，在这一轮的回复气泡里画成卡片。 */
+  question?: QuestionCard;
   /** 只活在界面里：排队那条发出去时这一次插进来的气泡的记号 —— 发送失败只撤它，不撤原来就在的同 id 历史（`queueRetry.removeOptimistic`）。 */
   sendToken?: string;
 }

@@ -10,6 +10,7 @@
  */
 
 import { isKirolexNote } from './kirolexNote.ts';
+import { questionTailText, type QuestionCard } from './elicitation.ts';
 
 /** `GET /sessions/:id/tail?n=` 的上限 */
 export const CONTROL_TAIL_MAX = 50;
@@ -95,6 +96,8 @@ export interface TranscriptLike {
   kirolex?: true | boolean;
   ts?: number;
   toolCalls?: Array<{ title?: string; kind?: string; status?: string; content?: string }>;
+  /** 模型向用户的提问（`elicitation.ts`）：落盘的是关掉的，还挂着的由 index.ts 接在最后 */
+  question?: QuestionCard;
 }
 
 export interface ControlTailEntry { id: string; role: string; ts: number; text: string }
@@ -125,10 +128,12 @@ function oneLine(s: string, max = 200): string {
  * - 正文截到 8000 字；
  * - KiroLex 自己插进对话的提示（换模型等）落盘是 `role: 'user'`，这里给 `role: 'kirolex'` ——
  *   外部调用方不能把它当成用户发的。
+ * - 提问卡片给 `role: 'question'`，正文是问题、选项、状态（`[question pending]` 就是还在等人回答）和答案。
  */
 export function tailEntries(transcript: TranscriptLike[], n: number): ControlTailEntry[] {
   const count = Math.min(CONTROL_TAIL_MAX, Math.max(1, Math.floor(n) || CONTROL_TAIL_DEFAULT));
   return transcript.slice(-count).map((m) => {
+    if (m.question) return { id: String(m.id), role: 'question', ts: Number(m.ts) || 0, text: clip(questionTailText(m.question)) };
     const body = String(m.content ?? '').replace(/<hidden>[\s\S]*?<\/hidden>/g, '').trim();
     const tools = (Array.isArray(m.toolCalls) ? m.toolCalls : [])
       .map((tc) => `[tool] ${oneLine(String(tc?.title || tc?.kind || 'tool'))}`);
@@ -162,4 +167,29 @@ export function checkSendBody(body: unknown): SendBodyCheck {
   const mode = b.mode === undefined || b.mode === null ? 'auto' : b.mode;
   if (mode !== 'auto' && mode !== 'next') return { ok: false, error: 'bad-mode' };
   return { ok: true, text, mode };
+}
+
+/* ───────────────────────── answer ───────────────────────── */
+
+export type AnswerBodyCheck =
+  | { ok: true; questionId?: string; action: 'accept' | 'decline'; answers: Record<string, unknown> }
+  | { ok: false; error: string };
+
+export type ControlAnswerResult =
+  | { ok: true; questionId: string; status: string }
+  | { ok: false; status: number; error: string; missing?: string[]; invalid?: string[] };
+
+/**
+ * `POST /sessions/:id/answer` 的请求体：`{questionId?, action?: 'accept'|'decline', answers?: {字段: 值}}`。
+ * `questionId` 不给 = 这条会话唯一挂着的那一张（tail 里 `role:'question'` 那条的 id）；`action` 默认 accept。
+ * 值的校验（选项、必填、数字）和界面提交走同一个 `buildAcceptContent`，在 index.ts 里做。
+ */
+export function checkAnswerBody(body: unknown): AnswerBodyCheck {
+  if (!body || typeof body !== 'object' || Array.isArray(body)) return { ok: false, error: 'bad-json' };
+  const b = body as { questionId?: unknown; action?: unknown; answers?: unknown };
+  const action = b.action === undefined || b.action === null ? 'accept' : b.action;
+  if (action !== 'accept' && action !== 'decline') return { ok: false, error: 'bad-action' };
+  if (b.questionId !== undefined && (typeof b.questionId !== 'string' || !b.questionId)) return { ok: false, error: 'bad-question-id' };
+  if (b.answers !== undefined && (!b.answers || typeof b.answers !== 'object' || Array.isArray(b.answers))) return { ok: false, error: 'bad-answers' };
+  return { ok: true, ...(b.questionId ? { questionId: b.questionId as string } : {}), action, answers: (b.answers as Record<string, unknown>) || {} };
 }

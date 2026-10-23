@@ -110,7 +110,8 @@ export interface AgentProfile {
   /** 同上，effort（`thought_level`）和权限模式（`mode`）—— 顶上那颗按钮在这两家就是 mode 下拉。 */
   engineOptions?: {
     claude?: { thought_level?: string; mode?: string };
-    codex?: { thought_level?: string; mode?: string };
+    /** `collaboration_mode`：Codex 的 default / plan（Plan 模式下它才能用 request_user_input 向你提问） */
+    codex?: { thought_level?: string; mode?: string; collaboration_mode?: string };
   };
   /** Claude Code / Codex 会话选的「组合」id（`~/.kirolex/mcp-combos.json`，见 `mcpCombos.ts`）。没有 = 内置「通用」。 */
   mcpCombo?: string;

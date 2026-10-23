@@ -151,7 +151,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   switchModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:switch-model', sessionId, model),
   engineModels: (sessionId: string) => ipcRenderer.invoke('acp:engine-models', sessionId),
   setEngineModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:set-engine-model', sessionId, model),
-  setEngineOption: (sessionId: string, category: 'thought_level' | 'mode', value: string) => ipcRenderer.invoke('acp:set-engine-option', sessionId, category, value),
+  setEngineOption: (sessionId: string, category: 'thought_level' | 'mode' | 'collaboration_mode', value: string) => ipcRenderer.invoke('acp:set-engine-option', sessionId, category, value),
   onEngineModels: (cb: (d: { sessionId: string; current: string; options: Array<{ value: string; name: string }>; effort?: any; mode?: any; busyEnter?: string }) => void) => {
     const handler = (_e: any, d: any) => cb(d);
     ipcRenderer.on('session:engine-models', handler);
@@ -318,6 +318,13 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('loop:verify', sessionId, command, timeoutSec),
   respondPermission: (requestId: number | string, optionId: string, sessionId: string) =>
     ipcRenderer.invoke('acp:request-permission-response', requestId, optionId, sessionId),
+  /** 回答 / 跳过模型的一次提问（提问卡片，main/elicitation.ts）。 */
+  answerQuestion: (sessionId: string, cardId: string, action: 'accept' | 'decline', values?: Record<string, unknown>) =>
+    ipcRenderer.invoke('acp:answer-question', sessionId, cardId, action, values),
+  /** 切走一条会话时取消它挂着的提问（回 cancel、关卡片、落盘）。 */
+  cancelQuestions: (sessionId: string) => ipcRenderer.invoke('acp:cancel-questions', sessionId),
+  /** 还挂着的提问卡片（窗口重载后补回来）。 */
+  pendingQuestions: () => ipcRenderer.invoke('acp:pending-questions'),
 
   /* ── DURABLE LOOPS ──
    *

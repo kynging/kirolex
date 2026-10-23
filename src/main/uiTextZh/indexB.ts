@@ -213,6 +213,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   'Model': '模型',
   'Effort': '思考强度',
   'Permission mode': '权限模式',
+  'Plan mode': 'Plan 模式',
   ', ': '、',
   "kiro-cli is not set up on this machine yet (no launch command). Install finds an existing kiro-cli or installs it.": "本机还没配好 kiro-cli（没有启动命令）。点「安装」会先找本机已有的 kiro-cli，没有再装。",
   "kiro-cli was not found at the configured launch command.": "按设置里的启动命令找不到 kiro-cli。",

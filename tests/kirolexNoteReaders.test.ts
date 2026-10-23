@@ -51,7 +51,8 @@ describe('控制入口 GET /sessions/:id/tail：提示不能冒充你发的', ()
   });
 
   test('接线：tail 读的是 transcript 原样（含 kirolex 字段），由 tailEntries 判', () => {
-    assert.match(M, /tail: \(id, n\) => tailEntries\(store\.readTranscript\(id\), n\)/);
+    /* 后面还接着挂着的提问卡片（controlQuestion.test.ts），transcript 本身仍然原样交给 tailEntries */
+    assert.match(M, /tail: \(id, n\) => tailEntries\(\[\s*\.\.\.store\.readTranscript\(id\),/);
   });
 });
 

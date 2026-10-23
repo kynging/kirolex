@@ -22,6 +22,7 @@ KiroLex 启动时在 `127.0.0.1` 的一个随机端口上开一个很小的 HTTP
 | `GET /sessions/:id/status` | 是 + 开关 | 这条会话忙不忙 |
 | `POST /sessions/:id/send` | 是 + 开关 | 往这条会话发一条消息 |
 | `POST /sessions/:id/new-backend` | 是 + 开关 | 给这条会话换新的后端会话（会话卡住时用） |
+| `POST /sessions/:id/answer` | 是 + 开关 | 回答模型的提问（提问卡片） |
 
 ### 读会话 / 发消息：先在设置里打开
 
@@ -44,7 +45,12 @@ KiroLex 启动时在 `127.0.0.1` 的一个随机端口上开一个很小的 HTTP
 - `role` 是 `user`（你发的）、`assistant`，或 `kirolex`（KiroLex 自己插进对话的提示，例如换了模型 —— 不是你发的）；
 - `text` 截到 8000 字；
 - 工具调用只给一行标题（`[tool] 标题`），**不给工具输出原文**（读到的文件、命令输出都不出去）；
-- 附件引用这类给模型看的隐藏块（`<hidden>…</hidden>`）不给。
+- 附件引用这类给模型看的隐藏块（`<hidden>…</hidden>`）不给；
+- 模型向你的提问（界面上的提问卡片）是 `role: "question"`：`text` 第一行是 `[question <状态>] 问题`，
+  后面每题一行 `- 标题 [字段key] (single|multi|text|boolean|number|integer[, required]): 选项值 (标题) / …`，
+  这一题带「其他 / 自由填写」框的再跟一行 `  + free text [字段key]`；答过的再加 `→ 标题 = 答案`。
+  状态 `pending` = 还在等你回答（这种的排在最后，它还没落盘），其余：`answered` / `declined`（跳过）/ `cancelled`（这一轮被停止）/
+  `timeout`（30 分钟没人回答，按取消）/ `withdrawn`（模型自己撤回）。
 
 **`GET /sessions/:id/status`** → `{busy, turnStartedAt, queued, lastMessageAt}`
 
@@ -95,6 +101,19 @@ KiroLex 启动时在 `127.0.0.1` 的一个随机端口上开一个很小的 HTTP
 | 这一轮正在跑 / 正在重建历史 / 正在换模型 | `409 {"error":"busy"}`（等 `status` 不忙了再试） |
 | 连不上执行器 | `502 {"error":"not-connected"}` |
 | 换的时候出错 | `502 {"error":"swap-failed"}` |
+
+**`POST /sessions/:id/answer`** `{"questionId"?: "q_…", "action"?: "accept"|"decline", "answers"?: {"字段": 值}}` → `200 {"ok": true, "questionId": "q_…", "status": "answered"}`
+
+回答 `tail` 里那条 `[question pending]`。`questionId` 就是那条的 `id`（这条会话只挂着一张时可以不给）；`action` 默认 `accept`，
+`decline` = 界面上的「跳过」。`answers` 的键是字段 key（不是标题）：单选给选项的值、多选给数组、数字给数字。校验和界面提交是同一套。
+字段 key 就是 `tail` 里方括号中的那个。
+
+| 情况 | 返回 |
+|---|---|
+| 没有挂着的提问 / `questionId` 不对 | `404 {"error":"no-question"}` |
+| 挂着好几张又没给 `questionId` | `409 {"error":"ambiguous"}` |
+| 必填没填 / 值不合要求 | `400 {"error":"invalid", "missing": [...], "invalid": [...]}` |
+| 请求体不对 | `400 {"error":"bad-json" | "bad-action" | "bad-answers" | "bad-question-id"}` |
 
 ## 例子
 

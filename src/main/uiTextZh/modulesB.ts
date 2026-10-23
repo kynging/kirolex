@@ -25,6 +25,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   '⚠️ After installing, tried to start the {engine} adapter on {host} the way sessions do (bash -lc), and it did not start: {why}.{stderr}':
     '⚠️ 装完按会话的启动方式（bash -lc）在 {host} 上试起 {engine} 的适配器，没起来：{why}。{stderr}',
   // ── acp-client.ts ──
+  '{engine} asked for input in a way KiroLex does not support (`{mode}`); it was cancelled.': '{engine} 用 KiroLex 不支持的方式（`{mode}`）请求你输入，已取消。',
   "No kiro launch command is set for **this machine** yet. Open Settings → 🖥 Machines → 💻 This machine and click \"Auto-detect the three tools on this machine\", or enter a path by hand. Without this setting KiroLex won't guess a binary.":
     '还没有设置**本机**的 kiro 启动命令。打开 设置 → 🖥 机器 → 💻 本机，点「自动检测这台机器上的三个工具」，或者手填一个路径 —— 没有这个设置 KiroLex 不会去猜一个二进制。',
   "No kiro launch command is set for {host} yet. Open Settings → 🖥 Machines, select this machine and click \"Auto-detect the three tools on this machine\". Without this setting KiroLex won't guess the remote binary (a wrong guess shows up as \"it starts, but behaves oddly\").":
@@ -35,6 +36,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   'This engine did not provide a model list': '这个引擎没有给出 模型清单',
   'This engine did not provide permission modes': '这个引擎没有给出 权限模式',
   'This engine did not provide effort options': '这个引擎没有给出 effort 选项',
+  'This engine does not have a Plan mode': '这个引擎没有 Plan 模式',
   '{engine} sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.':
     '{engine} 发来一个 KiroLex 不认识的请求 `{method}`，已回空对象 {} —— 如果它是在"问你"，那这一轮是按一个没人给过的答案继续跑的。请把这条报给 KiroLex。',
   // ── aiLogin.ts ──

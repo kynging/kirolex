@@ -112,6 +112,7 @@ import { parseWhoami, loginEnv } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { createAdapterNotes } from './adapterNotes.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
+import { newQuestionCard, closeQuestionCard, buildAcceptContent, elicitationResult, questionTailText, type QuestionCard, type QuestionStatus, type QuestionValue } from './elicitation.ts';
 import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, reviewBackupPrefix, reviewBackupsToPrune, type ReviewTarget } from './reviewAccess.ts';
 import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
 import { applyRevision, type ReviewApply } from './reviewApply.ts';
@@ -397,6 +398,11 @@ const reconfiguringSessions = new Set<string>();
  *  long the turn was blocked. Lives here (not on the entry) because a permission may
  *  be answered after a model swap replaced the executor. */
 const permissionWaitStartedAt = new Map<string, number>();
+/**
+ * 挂着的提问卡片（模型向用户提问，见 `elicitation.ts`）：卡片 id → 卡片 + 哪个执行器在等它的回答 + 超时计时器。
+ * 放在模块级、不挂在 entry 上：执行器被换下来时（`rejectAllPending`）也要能找到它、记成「已取消」落盘。
+ */
+const openQuestions = new Map<string, { card: QuestionCard; client: AcpClient; timer: ReturnType<typeof setTimeout> }>();
 /** Sessions with an attach (acp:load-session) in flight. kiro-cli owns a session
  *  from ONE process only, so an attach and a model/Agent switch racing on the
  *  same session both try to session/load it and the loser gets a bare
@@ -1324,8 +1330,11 @@ function historyLine(m: {
   attachments?: { name: string; path: string }[];
   toolCalls?: { title?: string; kind?: string; status?: string; locations?: string[] }[];
   toolTailFrom?: number;
+  question?: QuestionCard;
 }, forExecutor: (p: string) => string = (p) => p): string {
   const who = m.role === 'user' ? 'User' : 'Assistant';
+  /* 提问卡片（正文是空的）：重建历史时把「问了什么、答了什么」交代给模型 */
+  if (m.question) return `${who}: ${questionTailText(m.question)}`;
   // Every historical attachment is re-emitted here on EVERY turn, so an oversized
   // image referenced once keeps failing every later request in the chat. Resolve
   // each one to a copy within the backend's dimension limit -- see safeImageRef.
@@ -4612,6 +4621,7 @@ function pendingKindName(kind: PendingKind): string {
     case 'model': case 'engineModel': return tr('Model');
     case 'engineEffort': return tr('Effort');
     case 'engineMode': case 'permission': return tr('Permission mode');
+    case 'engineCollab': return tr('Plan mode');
   }
 }
 /** 组合在 pending 里记的是 id（下拉按 id 对）：说给人看时换成当前语言的显示名 */
@@ -6168,6 +6178,8 @@ function engineModelsPayload(sessionId: string, entry: SessionEntry) {
     mode: entry.client.selectOptions('mode'),
     /* 忙时普通 Enter 交给谁（按 initialize 的能力声明，`busyEnterCaps.ts`）—— 渲染端的路由和输入框文案按它走 */
     busyEnter: entry.client.busyEnter,
+    /* Codex 的协作模式（default / plan）：输入框旁的「Plan」开关。Plan 模式下它才会用 request_user_input 向你提问（提问卡片） */
+    plan: entry.client.selectOptions('collaboration_mode'),
   };
 }
 
@@ -6191,6 +6203,9 @@ function wantedEngineOptions(profile: AgentProfile, comboEffort?: string): Array
   if (effort) out.push(['thought_level', effort]);
   const mode = saved.mode || DEFAULT_ENGINE_MODE[engine];
   if (mode) out.push(['mode', mode]);
+  /* Codex 的 Plan 开关（没有这一项的引擎在 applyEngineModel 里自然跳过） */
+  const collab = (saved as { collaboration_mode?: string }).collaboration_mode;
+  if (collab) out.push(['collaboration_mode', collab]);
   return out;
 }
 
@@ -6305,6 +6320,24 @@ function wireSession(sessionId: string, entry: SessionEntry) {
   client.on('config-options', () => {
     if (superseded()) return;
     mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
+  });
+  /*
+    **模型向用户提问**（`elicitation/create`，见 openQuestion）。被换下来的执行器、后台重建历史的那一轮里来的
+    没人能看见 —— 直接回 cancel，别让它挂着。
+  */
+  client.on('elicitation', (d: { requestId: string | number; params: unknown }) => {
+    if (superseded() || entry.priming) {
+      client.respondToElicitation(d.requestId, elicitationResult('cancel'));
+      return;
+    }
+    entry.lastStreamAt = Date.now();
+    openQuestion(sessionId, entry, client, d.requestId, d.params);
+  });
+  /* 停止 / 断开（代理那边已经回过 cancel 或进程没了）/ 代理撤回：关卡片，不再回包。不看 superseded：被换下来时也要落盘 */
+  client.on('elicitation-closed', (d: { requestId: string | number; reason: 'cancelled' | 'withdrawn' }) => {
+    for (const [id, q] of openQuestions) {
+      if (q.client === client && q.card.requestId === d.requestId) closeQuestion(id, d.reason === 'withdrawn' ? 'withdrawn' : 'cancelled');
+    }
   });
   let onUpdate: (data: any, replayed?: boolean) => void;
   /*
@@ -6694,6 +6727,84 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   entry.assistantMsgId = null;
   entry.fileChanges = [];
   entry.wedgeNote = undefined;
+}
+
+/* ───────────── 模型向用户提问（ACP elicitation，见 elicitation.ts） ─────────────
+ *
+ * 主进程是卡片的权威：收到 `elicitation/create` 建卡片、推给界面（`acp:update` 的 `question`），
+ * 答了 / 跳过 / 停止 / 断开 / 超时 / 代理撤回都在 `closeQuestion` 收口：回包（只回一次）、落盘、再推一次。
+ * 界面只按卡片 id 覆盖显示，不自己改状态。 */
+
+function pushQuestion(card: QuestionCard) {
+  mainWindow?.webContents.send('acp:update', { sessionId: card.sessionId, update: { sessionUpdate: 'question', card } });
+}
+
+function openQuestion(sessionId: string, entry: SessionEntry, client: AcpClient, requestId: string | number, params: unknown) {
+  const now = Date.now();
+  const card = newQuestionCard({
+    id: `q_${now.toString(36)}_${Math.random().toString(36).slice(2, 8)}`,
+    sessionId, requestId, params, now, engine: engineOf(entry.profile),
+  });
+  /* 超时兜底：没人回答就按 cancel 回给代理，卡片上写明是超时 —— 这一轮不能一直挂着 */
+  const timer = setTimeout(() => closeQuestion(card.id, 'timeout', { action: 'cancel' }), Math.max(0, card.expiresAt - now));
+  openQuestions.set(card.id, { card, client, timer });
+  logger.info('question', `asked sessionId=${sessionId} id=${card.id} engine=${card.engine} fields=${card.fields.length} timeout=${Math.round((card.expiresAt - now) / 1000)}s`);
+  pushQuestion(card);
+}
+
+/** 关一张挂着的卡片。`respond` 不传 = 代理那边已经不等了（撤回 / 进程没了），不再回包。 */
+function closeQuestion(
+  cardId: string,
+  status: Exclude<QuestionStatus, 'pending'>,
+  respond?: { action: 'accept'; content: Record<string, QuestionValue> } | { action: 'decline' } | { action: 'cancel' },
+  content?: Record<string, QuestionValue>,
+  cancelledBy?: 'switch',
+): QuestionCard | null {
+  const open = openQuestions.get(cardId);
+  if (!open) return null;
+  openQuestions.delete(cardId);
+  clearTimeout(open.timer);
+  if (respond) open.client.respondToElicitation(open.card.requestId, respond);
+  const card = closeQuestionCard(open.card, status, Date.now(), content, cancelledBy);
+  /* 关掉的卡片才完整：这时落盘（重启后看得到「问了什么、选了什么」）。会话已经删了就不写（别把目录建回来）。 */
+  try {
+    if (store.readRecord(card.sessionId)) {
+      store.appendMessage(card.sessionId, { id: card.id, role: 'assistant', content: '', ts: card.askedAt, question: card });
+    }
+  } catch (err: any) {
+    logger.warn('question', `persist failed sessionId=${card.sessionId} id=${card.id}: ${err?.message || err}`);
+  }
+  logger.info('question', `closed sessionId=${card.sessionId} id=${card.id} status=${status} waited=${(((card.closedAt || Date.now()) - card.askedAt) / 1000).toFixed(1)}s`);
+  pushQuestion(card);
+  return card;
+}
+
+/** 用户（界面或控制入口）回答 / 跳过一张卡片。 */
+function answerQuestion(sessionId: string, cardId: string, action: 'accept' | 'decline', values?: Record<string, unknown>):
+  { ok: true; card: QuestionCard } | { ok: false; error: 'not-pending' | 'invalid'; missing?: string[]; invalid?: string[] } {
+  const open = openQuestions.get(cardId);
+  if (!open || open.card.sessionId !== sessionId) return { ok: false, error: 'not-pending' };
+  if (action === 'decline') {
+    const card = closeQuestion(cardId, 'declined', elicitationResult('decline'));
+    return card ? { ok: true, card } : { ok: false, error: 'not-pending' };
+  }
+  const check = buildAcceptContent(open.card.fields, values || {});
+  if (!check.ok) return { ok: false, error: 'invalid', missing: check.missing, invalid: check.invalid };
+  const card = closeQuestion(cardId, 'answered', elicitationResult('accept', check.content), check.content);
+  return card ? { ok: true, card } : { ok: false, error: 'not-pending' };
+}
+
+/** 你切走了这条会话（界面上看不到它了）：它挂着的提问一律回 cancel、关卡片、落盘 —— 不让旧执行器一直等到你回来或超时。 */
+function cancelQuestionsFor(sessionId: string): number {
+  let n = 0;
+  for (const card of pendingQuestionsFor(sessionId)) {
+    if (closeQuestion(card.id, 'cancelled', elicitationResult('cancel'), undefined, 'switch')) n++;
+  }
+  return n;
+}
+
+function pendingQuestionsFor(sessionId?: string): QuestionCard[] {
+  return [...openQuestions.values()].map((q) => q.card).filter((c) => !sessionId || c.sessionId === sessionId);
 }
 
 /**
@@ -8978,6 +9089,11 @@ app.whenReady().then(async () => {
               一个没人点的权限请求原来会被静默上限当成卡死、取消、再自动续一轮（又来问一次）。等着的时候把计时往后推。
             */
             if (engineOf(e.profile) !== 'kiro' && e.client.awaitingPermission) {
+              e.lastStreamAt = Date.now();
+              return;
+            }
+            /* 等人回答提问（三家都可能问）同理：超时由提问自己的兜底管（`openQuestion`），不归看门狗 */
+            if (e.client.awaitingQuestion) {
               e.lastStreamAt = Date.now();
               return;
             }
@@ -11453,7 +11569,7 @@ app.whenReady().then(async () => {
    * 不用像 kiro 那样换执行器。选了就记在会话上，下次连上（`applyEngineModel`）设回去。
    */
   const engineKindFor = (category: EngineOptionCategory): PendingKind =>
-    (category === 'model' ? 'engineModel' : category === 'thought_level' ? 'engineEffort' : 'engineMode');
+    (category === 'model' ? 'engineModel' : category === 'thought_level' ? 'engineEffort' : category === 'collaboration_mode' ? 'engineCollab' : 'engineMode');
   const setEngineOption = async (sessionId: string, category: EngineOptionCategory, value: string, fromPending?: boolean): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'set-engine-option'); if (advRefused) throw new Error(advRefused); }
     /* 这一轮还在跑、或者上一批 pending 正在应用（执行器可能刚被拿掉）：记下来，落定后再设（同一类只留最后一次） */
@@ -11479,6 +11595,8 @@ app.whenReady().then(async () => {
   };
   ipcMain.handle('acp:set-engine-model', (_event, sessionId: string, model: string) => setEngineOption(sessionId, 'model', model));
   ipcMain.handle('acp:set-engine-option', (_event, sessionId: string, category: string, value: string) => {
+    /* Codex 的「Plan」开关（协作模式 default / plan）：Plan 模式下它才能用 request_user_input 向你提问 */
+    if (category === 'collaboration_mode') return setEngineOption(sessionId, category, value);
     if (category !== 'thought_level' && category !== 'mode') throw new Error(tr('Unknown option {category}', { category }));
     return setEngineOption(sessionId, category, value);
   });
@@ -12068,6 +12186,7 @@ app.whenReady().then(async () => {
       case 'engineModel': return (engine !== 'kiro' && p.engineModels?.[engine]) || tr('its current setting');
       case 'engineEffort': return (engine !== 'kiro' && p.engineOptions?.[engine]?.thought_level) || tr('its current setting');
       case 'engineMode': return (engine !== 'kiro' && p.engineOptions?.[engine]?.mode) || tr('its current setting');
+      case 'engineCollab': return (engine !== 'kiro' && (p.engineOptions?.[engine] as { collaboration_mode?: string } | undefined)?.collaboration_mode) || tr('its current setting');
     }
   };
   applyPendingSwitchBatch = async (sessionId: string, entries: PendingSwitch[]) => {
@@ -14697,6 +14816,14 @@ app.whenReady().then(async () => {
     return entry.client.respondToPermission(requestId, optionId);
   });
 
+  /** 回答 / 跳过一张提问卡片（`answerQuestion`）。 */
+  ipcMain.handle('acp:answer-question', (_event, sessionId: string, cardId: string, action: 'accept' | 'decline', values?: Record<string, unknown>) =>
+    answerQuestion(String(sessionId || ''), String(cardId || ''), action === 'decline' ? 'decline' : 'accept', values && typeof values === 'object' ? values : {}));
+  /** 切走一条会话时：取消它挂着的提问（`cancelQuestionsFor`）。 */
+  ipcMain.handle('acp:cancel-questions', (_event, sessionId: string) => cancelQuestionsFor(String(sessionId || '')));
+  /** 还挂着的提问卡片（窗口重载后补回来）。 */
+  ipcMain.handle('acp:pending-questions', () => pendingQuestionsFor());
+
   /** Read this session's run event log (timeline + event stream views). */
   ipcMain.handle('acp:read-events', (_event, sessionId: string, limit?: number) => {
     if (!sessionId) return { events: [], path: '', truncated: false };
@@ -16158,7 +16285,26 @@ const controlSessionAccess: ControlSessionAccess = {
     }));
   },
   exists: (id) => !!controlVisibleRecord(id),
-  tail: (id, n) => tailEntries(store.readTranscript(id), n),
+  /* 还挂着的提问接在最后（落盘的只有关掉的）—— 外部能看到「它在等我回答什么」 */
+  tail: (id, n) => tailEntries([
+    ...store.readTranscript(id),
+    ...pendingQuestionsFor(id).map((c) => ({ id: c.id, role: 'assistant', content: '', ts: c.askedAt, question: c })),
+  ], n),
+  answer: (id, body) => {
+    const pending = pendingQuestionsFor(id);
+    const target = body.questionId ? pending.find((c) => c.id === body.questionId) : pending.length === 1 ? pending[0] : undefined;
+    if (!target) {
+      return pending.length > 1 && !body.questionId
+        ? { ok: false, status: 409, error: 'ambiguous' }
+        : { ok: false, status: 404, error: 'no-question' };
+    }
+    const r = answerQuestion(id, target.id, body.action, body.answers);
+    if (!r.ok) return r.error === 'invalid'
+      ? { ok: false, status: 400, error: 'invalid', missing: r.missing, invalid: r.invalid }
+      : { ok: false, status: 404, error: 'no-question' };
+    logger.info('question', `answered via control sessionId=${id} id=${target.id} status=${r.card.status}`);
+    return { ok: true, questionId: target.id, status: r.card.status };
+  },
   status: (id) => {
     const entry = sessionClients.get(id);
     const last = store.readTranscript(id).slice(-1)[0];

@@ -57,6 +57,7 @@ import { adapterInstallStore, setAdapterInstallRunner, setEngineLoginRunner } fr
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
 import { engineLabel } from '../engineLabel';
+import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
 
 export type { LoopSpec } from '../loopMachine';
@@ -351,8 +352,14 @@ function messageFromStored(m: any): Message {
     ...replyMarksOf(m),
     ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
     ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
+    ...questionOf(m),
     timestamp: m.ts,
   };
+}
+
+/** 提问卡片（问了什么、答了什么）—— 读盘的每一处都要带上，重启后显示成只读摘要。 */
+function questionOf(m: any): { question?: Message['question'] } {
+  return m?.question && typeof m.question === 'object' ? { question: m.question } : {};
 }
 
 /** 助手消息的去重标记（`replyTo` / `replyComplete`，见 `main/promptDedupe.ts`）—— 读回来、写回去都原样带着。 */
@@ -366,6 +373,8 @@ function toStoredTranscript(messages: Message[]) {
     .filter((m) => !(m.role === 'assistant' && m.content.startsWith('💭 ')))
     /* 没能追加进去的 steer 模型从没见过，不进记录（它在等用户选「作为下一条发送 / 放回输入框」） */
     .filter((m) => m.steer !== 'failed')
+    /* 还挂着的提问卡片不写：它关掉时主进程会追加那一条（写了就成了同 id 两条） */
+    .filter((m) => m.question?.status !== 'pending')
     /* 从盘上读回来、折叠着追加指令的那条拆回「原消息 + mergeIntoMessageId 事件」写回去，下次读回来还能分开显示 */
     .flatMap((m) => toStoredUserLines({
       id: m.id,
@@ -382,6 +391,8 @@ function toStoredTranscript(messages: Message[]) {
       ...replyMarksOf(m),
       ...(m.variants ? { variants: m.variants } : {}),
       ...(m.steerParts ? { steerParts: m.steerParts } : {}),
+      /* 提问卡片：整份重写时原样写回去 */
+      ...(m.question ? { question: m.question } : {}),
       // 经控制入口发的（id 带标记）：整份重写时显式来源照样写回去
       ...viaFor(m.id),
     }));
@@ -1613,7 +1624,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
       let assistantIndex = -1;
       for (let index = current.length - 1; index > lastUserIndex; index--) {
-        if (current[index].role === 'assistant') {
+        if (current[index].role === 'assistant' && !isQuestionMessage(current[index])) {
           assistantIndex = index;
           break;
         }
@@ -1923,6 +1934,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
+          ...questionOf(m),
           timestamp: m.ts,
         }));
         // 还没处理的失败 steer 挂回这一轮（标红 + 两个按钮），不进队列
@@ -1954,6 +1966,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(typeof (m as any).toolTailFrom === 'number' ? { toolTailFrom: (m as any).toolTailFrom } : {}),
             ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
+            ...questionOf(m),
           }));
           const msgsWithFailed = withFailed(sid, msgs);
           messagesCacheRef.current.set(sid, msgsWithFailed);
@@ -2425,7 +2438,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               const last = prev[prev.length - 1];
               // Append to the last assistant message during streaming, UNLESS it is
               // a 💭 thinking segment — reply text must start a fresh message.
-              if (last?.role === 'assistant' && !last.content.startsWith('💭 ')) {
+              if (last?.role === 'assistant' && !last.content.startsWith('💭 ') && !isQuestionMessage(last)) {
                 return [
                   ...prev.slice(0, -1),
                   { ...last, content: last.content + text },
@@ -2450,7 +2463,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             // session happens to be on screen.
             const cached = messagesCacheRef.current.get(targetSid) || [];
             const last = cached[cached.length - 1];
-            if (last?.role === 'assistant' && !last.content.startsWith('💭 ')) {
+            if (last?.role === 'assistant' && !last.content.startsWith('💭 ') && !isQuestionMessage(last)) {
               const updated = [...cached.slice(0, -1), { ...last, content: last.content + text }];
               commitBackgroundMessages(targetSid, updated);
             } else {
@@ -2564,6 +2577,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // A pane that is not the focused chat gets it too, so the panel no longer
           // appears/disappears (and reflows the transcript) on a focus switch.
           patchPane(targetSid, { plan: entries });
+          break;
+        }
+
+        case 'question': {
+          /* 模型向用户的提问（主进程 `openQuestion` / `closeQuestion` 推的整张卡片）：按 id 插入或覆盖 */
+          const card = update.card;
+          if (!card?.id) break;
+          markLocalOnly(targetSid, [card.id]);
+          mutateSessionMessagesRef.current?.(targetSid, (list) => upsertQuestionCard(list, card));
           break;
         }
 
@@ -2880,7 +2902,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         let idx = list.findIndex((m) => m.id === messageId);
         if (idx < 0) {
           for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i].role === 'assistant' && !list[i].content.startsWith('💭 ')) { idx = i; break; }
+            if (list[i].role === 'assistant' && !list[i].content.startsWith('💭 ') && !isQuestionMessage(list[i])) { idx = i; break; }
           }
         }
         if (idx < 0) return list;
@@ -2922,7 +2944,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         let idx = -1;
         for (let i = list.length - 1; i >= 0; i--) {
           if (list[i].role === 'user' && !isKirolexNote(list[i])) break;   // reached this turn's prompt
-          if (list[i].role === 'assistant') { idx = i; break; }
+          if (list[i].role === 'assistant' && !isQuestionMessage(list[i])) { idx = i; break; }
         }
         if (idx < 0) return list;
         /* KiroLex 的提示不是半截回复，留着 */
@@ -3133,6 +3155,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       addAttached(sid);
       setSessionActivity(sid, null);
     });
+
+    /* 窗口重载时还挂着的提问（主进程那边还在等回答）：补回来 */
+    window.kiroApi.pendingQuestions?.().then((cards) => {
+      for (const card of Array.isArray(cards) ? cards : []) {
+        if (!card?.id || !card.sessionId) continue;
+        markLocalOnly(card.sessionId, [card.id]);
+        mutateSessionMessagesRef.current?.(card.sessionId, (list) => upsertQuestionCard(list, card));
+      }
+    }).catch(() => {});
 
     return () => {
       removeReattached?.();
@@ -3449,6 +3480,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
+            ...questionOf(m),
             timestamp: m.ts,
           }));
           // Only fill if nothing has been written to the fork meanwhile.
@@ -3562,10 +3594,28 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  Seeds each pane's live view from the message cache, and reads the
    *  transcript from disk for a pane that was never opened this run — the same
    *  cold path switchSession uses, so a pane is never blank-but-loaded. */
+  /**
+   * **切走的会话：它挂着的提问回 cancel**（需求：「这一轮被 Stop / 会话切走 → cancel」）。等 `LEAVE_CONFIRM_MS` 再确认一次
+   * 它确实不在屏幕上（不是焦点、也不在任何一格里）才取消 —— 屏幕集合在启动 / 换布局时会短暂抖动，切走马上切回来也不该丢掉问题。
+   * 回包、关卡片、落盘都在主进程 `cancelQuestionsFor`（没有挂着的提问就什么都不做）。
+   */
+  const cancelQuestionsIfGone = (ids: string[]) => {
+    if (!ids.length) return;
+    setTimeout(() => {
+      for (const id of ids) {
+        if (!id || id === currentSessionRef.current || onScreenPaneIdsRef.current.has(id)) continue;
+        void window.kiroApi.cancelQuestions?.(id).catch(() => {});
+      }
+    }, LEAVE_CONFIRM_MS);
+  };
+
   const setPaneSessions = useCallback(async (ids: string[]) => {
     const wanted = ids.filter((id) => !!id && !id.startsWith('pending_'));
     paneSessionIdsRef.current = new Set(wanted);
+    const wasOnScreen = onScreenPaneIdsRef.current;
     onScreenPaneIdsRef.current = new Set([...wanted, currentSessionRef.current].filter(Boolean) as string[]);
+    /* 分屏里被换掉的那一格（不是焦点）：它挂着的提问同样取消（见 switchSession 那段） */
+    cancelQuestionsIfGone(leftScreen(wasOnScreen, onScreenPaneIdsRef.current));
     setPaneViews((prev) => {
       const next: Record<string, PaneView> = {};
       for (const id of wanted) {
@@ -3601,6 +3651,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
+            ...questionOf(m),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(id) || [];
@@ -3659,6 +3710,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               : paneFallback(outgoing),
           }));
     }
+    /*
+      **切走一条会话 = 取消它挂着的提问**（需求：「这一轮被 Stop / 会话切走 → cancel」）。还在分屏里看得见的那格不算切走
+      （它的卡片照样能答）。判据在 `questionCards.shouldCancelOnLeave`，实际的回包 / 关卡片 / 落盘在主进程 `cancelQuestionsFor`。
+    */
+    if (shouldCancelOnLeave(outgoing, sessionId, onScreenPaneIdsRef.current)) cancelQuestionsIfGone([outgoing!]);
     currentSessionRef.current = sessionId; // sync immediately to avoid leaked updates
     setCurrentSessionId(sessionId);
     currentMessageRef.current = '';

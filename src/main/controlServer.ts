@@ -27,6 +27,9 @@
  *     （`{accepted:true, messageId, routed:'sent'|'steer'|'queued'}`）；界面没就绪 503 `{error:'ui-not-ready'}`。
  *   - `POST /sessions/:id/new-backend` → 换新的后端会话（和 EmptyResponse / 「写成文字」反复发作同一套，上下文带过去），
  *     `{ok:true, backendSessionId}`；这一轮还在跑 409 `{error:'busy'}`，换不了 502 `{error:'swap-failed'}`。
+ *   - `POST /sessions/:id/answer` `{questionId?, action?:'accept'|'decline', answers?}` → 回答模型的提问（tail 里
+ *     `role:'question'`、`[question pending]` 的那条），`{ok:true, questionId, status}`；没有挂着的 404 `{error:'no-question'}`，
+ *     挂着好几张又没给 questionId 409 `{error:'ambiguous'}`，答案不合要求 400 `{error:'invalid', missing, invalid}`。
  *   会话不存在 / KiroLex Advanced 的会话 → 404。日志只记路由、会话 id、字数，不记正文、不记 token。
  * - 其它一律 404。
  *
@@ -44,8 +47,8 @@ import os from 'node:os';
 import path from 'node:path';
 import { blocksQuit, type BusySession } from './busySessions.ts';
 import {
-  checkSendBody, filterByTitle, parseTailCount,
-  type ControlRouted, type ControlSendMode, type ControlSessionSummary, type ControlTailEntry,
+  checkAnswerBody, checkSendBody, filterByTitle, parseTailCount,
+  type AnswerBodyCheck, type ControlAnswerResult, type ControlRouted, type ControlSendMode, type ControlSessionSummary, type ControlTailEntry,
 } from './controlSessions.ts';
 
 export const CONTROL_FILE = path.join(os.homedir(), '.kirolex', 'control.json');
@@ -198,6 +201,8 @@ export interface ControlSessionAccess {
   send: (id: string, text: string, mode: ControlSendMode) => Promise<ControlSendResult>;
   /** 换新的后端会话；不传 = 501 */
   newBackend?: (id: string) => Promise<ControlNewBackendResult>;
+  /** 回答模型的提问；不传 = 501 */
+  answer?: (id: string, body: Extract<AnswerBodyCheck, { ok: true }>) => ControlAnswerResult;
 }
 
 export type ControlNewBackendResult =
@@ -257,7 +262,7 @@ function readBody(req: http.IncomingMessage): Promise<string | null> {
 
 /** 和 sessionStore.safeId 同一个形状；别的一律当不存在 */
 const SESSION_ID_RE = /^[A-Za-z0-9_-]{1,120}$/;
-const SESSION_ROUTE_RE = /^\/sessions\/([^/]+)\/(tail|status|send|new-backend)$/;
+const SESSION_ROUTE_RE = /^\/sessions\/([^/]+)\/(tail|status|send|new-backend|answer)$/;
 
 /**
  * `/sessions…`：已过 token。返回 false = 不是这几条路由。
@@ -272,7 +277,7 @@ async function handleSessions(
   const m = SESSION_ROUTE_RE.exec(u.pathname);
   if (!isList && !m) return false;
   const action = isList ? 'list' : m![2];
-  const wantMethod = action === 'send' || action === 'new-backend' ? 'POST' : 'GET';
+  const wantMethod = action === 'send' || action === 'new-backend' || action === 'answer' ? 'POST' : 'GET';
   if (method !== wantMethod) return false;
   let enabled = false;
   try { enabled = access.enabled(); } catch { enabled = false; }
@@ -307,6 +312,24 @@ async function handleSessions(
     log(`POST /sessions/:id/new-backend session=${id} -> ${r.ok ? 'ok' : `${r.status} ${r.error}`}`);
     if (!r.ok) send(res, r.status, { ok: false, error: r.error });
     else send(res, 200, { ok: true, backendSessionId: r.backendSessionId });
+    return true;
+  }
+  if (action === 'answer') {
+    if (!access.answer) { send(res, 501, { ok: false, error: 'not-supported' }); return true; }
+    const rawAnswer = await readBody(req);
+    let parsed: unknown = null;
+    try { parsed = rawAnswer === null ? null : JSON.parse(rawAnswer); } catch { parsed = null; }
+    const checkedAnswer = checkAnswerBody(parsed);
+    if (!checkedAnswer.ok) {
+      log(`POST /sessions/:id/answer session=${id} -> 400 ${checkedAnswer.error}`);
+      send(res, 400, { ok: false, error: checkedAnswer.error });
+      return true;
+    }
+    let r: ControlAnswerResult;
+    try { r = access.answer(id, checkedAnswer); } catch { r = { ok: false, status: 500, error: 'answer-failed' }; }
+    log(`POST /sessions/:id/answer session=${id} action=${checkedAnswer.action} -> ${r.ok ? r.status : `${r.status} ${r.error}`}`);
+    if (!r.ok) send(res, r.status, { ok: false, error: r.error, ...(r.missing ? { missing: r.missing } : null), ...(r.invalid ? { invalid: r.invalid } : null) });
+    else send(res, 200, { ok: true, questionId: r.questionId, status: r.status });
     return true;
   }
   const raw = await readBody(req);

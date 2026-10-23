@@ -8,6 +8,7 @@ import { projectDirName } from './projectStore.ts';
 import { logger } from './logger.ts';
 import { isKirolexNote } from './kirolexNote.ts';
 import { carryReplyMarks, completedReplyInText, messageIdStatusInText, type MessageIdStatus } from './promptDedupe.ts';
+import type { QuestionCard } from './elicitation.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -100,6 +101,9 @@ export interface StoredMessage {
   /** 助手消息：这是那一轮**正常收尾**的完整回复（出错 / 取消时 flush 的半截没有这一项）。
    *  发送去重按 `replyTo` + 它认"这一条答过了"（`promptDedupe.ts`），而不是看后面有没有随便哪条助手消息。 */
   replyComplete?: true;
+  /** 模型向用户的一次提问（`elicitation.ts` 的卡片，含状态和答案）。这种消息正文是空的，卡片关掉（答了 / 跳过 /
+   *  取消 / 超时 / 撤回）时由主进程追加 —— 那时它才是完整的（§7 的 durability）。 */
+  question?: QuestionCard;
   // additive: future fields (model, etc.) may be appended safely
 }
 

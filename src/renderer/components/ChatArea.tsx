@@ -56,6 +56,8 @@ import { IconClaudeSpark, IconCodex, IconCopy, IconEdit, IconFork, IconPaperclip
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
+import { QuestionCardView } from './QuestionCard';
+import { turnHasQuestion } from '../questionCards';
 import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts';
 import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
@@ -990,8 +992,8 @@ const MessageItem = memo<{
   }), [segments]);
   // Copy excludes tool + thinking segments — only the actual reply text.
   const combinedText = useMemo(
-    () => parts.filter((p) => p.variant !== 'tool' && p.variant !== 'thinking').map((p) => p.body).join('\n\n'),
-    [parts],
+    () => parts.filter((p, i) => p.variant !== 'tool' && p.variant !== 'thinking' && !segments[i]?.question).map((p) => p.body).join('\n\n'),
+    [parts, segments],
   );
   // Tool segments are collapsed by default (only a chip shows); the user expands
   // them on demand. The actively-streaming last turn stays expanded so live tool
@@ -1025,6 +1027,15 @@ const MessageItem = memo<{
     <div className="message assistant">
       <div className="message-content">
         {parts.map((p, idx) => {
+          /* 模型向你的提问（`QuestionCard`）：这一轮里的一段，挂着时是表单，答完是只读摘要 */
+          const asked = segments[idx]?.question;   // parts 和 segments 一一对应
+          if (asked) {
+            return (
+              <div key={p.id} className="turn-segment variant-question">
+                <QuestionCardView card={asked} />
+              </div>
+            );
+          }
           const streamThis = isStreaming && isLastAssistant && idx === parts.length - 1;
           const isCollapsible = p.variant === 'tool' || p.variant === 'thinking';
           // When the matching auto-fold setting is ON, a thinking/tool segment
@@ -1973,6 +1984,11 @@ const ChatInputBox = memo<{
    * 默认是 bypass 就好」。给了就显示下拉，不给就是 kiro 的 Auto/Ask。
    */
   engineMode?: { current: string; options: Array<{ value: string; name: string }>; busy: boolean; onChange: (value: string) => void } | null;
+  /**
+   * Codex 的「Plan」开关（它的 `collaboration_mode`）：Plan 模式下 Codex 才能用 request_user_input 向你提问（提问卡片）。
+   * 引擎没给这一项（Claude Code / kiro）就不显示。`pending` = 这一轮跑完再切。
+   */
+  enginePlan?: { on: boolean; busy: boolean; pending: boolean; onToggle: () => void } | null;
   /** 权限（kiro 的 Auto/Ask 或那两家的权限模式）是这一轮跑完再换的：给了就显示「⏳」和 ✕ */
   permissionPending?: { target: string; onCancel: () => void } | null;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
@@ -2005,7 +2021,7 @@ const ChatInputBox = memo<{
    * 只有 `session/request_permission`），所以这些只能从回复文字里认。
    */
   choiceChips: ChoiceChip[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, permissionPending, onSend, onSteer, canSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, enginePlan, permissionPending, onSend, onSteer, canSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
@@ -2509,6 +2525,20 @@ const ChatInputBox = memo<{
               </>
             )}
           </button>
+          )}
+          {enginePlan && (
+            <button
+              type="button"
+              className={`composer-mode composer-plan${enginePlan.on ? ' on' : ''}`}
+              onClick={enginePlan.onToggle}
+              disabled={status !== 'connected' || enginePlan.busy}
+              aria-pressed={enginePlan.on}
+              title={enginePlan.on
+                ? t('Plan mode is on: Codex plans first and can ask you questions with a form (click to turn off)')
+                : t('Plan mode is off (click to turn on: Codex plans first and can ask you questions with a form)')}
+            >
+              {t('Plan')}{enginePlan.pending ? ' ⏳' : ''}
+            </button>
           )}
           {permissionPending && <PendingSwitchBadge target={permissionPending.target} onCancel={permissionPending.onCancel} />}
           {/* Deliberately NOT disabled on empty content, only on states the user can
@@ -3292,17 +3322,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     只看最后一条、而且只在这一轮结束之后：流式过程中那份文字是半截的，
     编号列表会一项一项冒出来，片也就跟着闪 —— 那比没有更烦。
     判据在 `choiceChips.ts`。
+
+    **只给 kiro**：Claude Code / Codex 有真的提问表单（`QuestionCard`，ACP elicitation），再从正文里猜一排片，
+    同一个问题就出现两套选项。kiro-cli 没有这种协议（见 `acp-client.ts` 的 `handleElicitationRequest`），只能猜。
   */
   const choiceChips = React.useMemo<ChoiceChip[]>(() => {
     if (isStreaming) return [];
+    if (engine && engine !== 'kiro') return [];
     for (let i = messages.length - 1; i >= 0; i -= 1) {
       const msg = messages[i];
       if (msg.role === 'user' && !isKirolexNote(msg)) return [];   // 最后说话的是你 → 没有待答的问题（KiroLex 的提示不算）
+      if (msg.question) return [];               // 这一轮已经用提问卡片问过了：不再猜第二套
       if (msg.role !== 'assistant') continue;    // 工具/子代理那些跳过
+      if (turnHasQuestion(messages, i)) return [];
       return extractChoiceChips(String(msg.content || ''));
     }
     return [];
-  }, [messages, isStreaming]);
+  }, [messages, isStreaming, engine]);
 
   /**
    * **这条会话跑在哪台机器上** ——「看起来工具调用是在本地？」。
@@ -3610,7 +3646,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   */
   type EngineSelect = { current: string; options: Array<{ value: string; name: string }> };
   /** 模型清单（`current`/`options`）+ effort + 权限模式 —— 三样都来自适配器的 configOptions。 */
-  const [engineModels, setEngineModels] = useState<(EngineSelect & { effort?: EngineSelect | null; mode?: EngineSelect | null; /** 忙时 Enter 交给谁（main/busyEnterCaps.ts） */ busyEnter?: string }) | null>(null);
+  const [engineModels, setEngineModels] = useState<(EngineSelect & { effort?: EngineSelect | null; mode?: EngineSelect | null; /** Codex 的协作模式（default / plan） */ plan?: EngineSelect | null; /** 忙时 Enter 交给谁（main/busyEnterCaps.ts） */ busyEnter?: string }) | null>(null);
   /*
     **忙 / 失败原因按会话记**（sessionRequestStatus.ts）：在 A 发起切换、等待期间这一格换成 B，A 的结果（尤其是失败）
     写回 A，不落到 B 的模型栏上；切回 A 时 A 的状态原样回来。界面只读当前会话那一份。
@@ -3692,7 +3728,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       describeSwitchFailure(sid, 'combo'));
   };
   const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
-  const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode', value: string): Promise<void> => {
+  const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode' | 'collaboration_mode', value: string): Promise<void> => {
     if (!currentSessionId) return;
     const sid = currentSessionId;
     const api = (window as any).kiroApi;
@@ -4179,6 +4215,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       case 'model': case 'engineModel': return t('Model');
       case 'engineEffort': return t('Effort');
       case 'engineMode': case 'permission': return t('Permission mode');
+      case 'engineCollab': return t('Plan mode');
     }
   };
   /** `only` 给了就只说这几类（徽标各管各的）；不给就是这段等待欠着的全部（提示卡） */
@@ -4984,6 +5021,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   busy: engineModelBusy,
                   onChange: (v) => void onEngineOptionChange('mode', v),
                 } : null}
+                enginePlan={nonKiro && engineModels?.plan?.options.some((o) => o.value === 'plan') ? (() => {
+                  const plan = engineModels.plan!;
+                  const on = (pendingSwitch?.engineCollab ?? plan.current) === 'plan';
+                  const off = plan.options.find((o) => o.value !== 'plan')?.value || 'default';
+                  return {
+                    on,
+                    busy: engineModelBusy,
+                    pending: pendingSwitch?.engineCollab !== undefined,
+                    onToggle: () => void onEngineOptionChange('collaboration_mode', on ? off : 'plan'),
+                  };
+                })() : null}
                 onSend={onSend}
                 onSteer={onSteerMessage}
                 canSteer={engineCanSteer(engine, engineModels?.busyEnter)}

@@ -3966,6 +3966,120 @@ button, input, select, textarea {
   border-radius: 0 0 16px 16px;
 }
 
+/* 提问卡片（QuestionCard.tsx）：模型向你提问 / 让你选。在回复气泡里的一段；和权限条同一族的配色，
+   但用 accent 色（它在等你的答案，不是在等你批准一个动作）。答完变成只读摘要（.closed）。 */
+.turn-segment.variant-question { margin: 6px 0; }
+.question-card {
+  display: flex;
+  flex-direction: column;
+  gap: 10px;
+  padding: 10px 12px;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--border));
+  border-radius: 12px;
+  background: color-mix(in srgb, var(--accent) 9%, var(--input-bg));
+  font-size: 13px;
+  animation: permission-bar-in 0.2s ease-out;
+}
+.question-card.closed {
+  gap: 6px;
+  border-color: var(--border);
+  background: color-mix(in srgb, var(--accent) 4%, var(--bg-tertiary));
+  animation: none;
+}
+.question-card-head { display: flex; align-items: flex-start; gap: 8px; min-width: 0; }
+.question-card-icon { flex: 0 0 auto; line-height: 1.5; }
+.question-card-copy { display: flex; flex-direction: column; gap: 2px; min-width: 0; flex: 1 1 auto; }
+.question-card-who { color: var(--text-secondary); font-size: 11px; }
+.question-card-message { color: var(--text-primary); font-weight: 600; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-card-desc { color: var(--text-secondary); font-size: 12px; white-space: pre-wrap; overflow-wrap: anywhere; }
+.question-card-status {
+  flex: 0 0 auto;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px solid var(--border);
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+}
+.question-card-status.answered { color: var(--success); border-color: color-mix(in srgb, var(--success) 45%, var(--border)); }
+.question-card-status.timeout,
+.question-card-status.cancelled { color: var(--warning); border-color: color-mix(in srgb, var(--warning) 45%, var(--border)); }
+.question-field { display: flex; flex-direction: column; gap: 6px; padding-left: 22px; }
+.question-field.bad .question-field-title { color: var(--error); }
+.question-field-label { display: flex; flex-direction: column; gap: 1px; }
+.question-field-title { color: var(--text-primary); font-weight: 600; font-size: 12px; }
+.question-field-required { color: var(--error); }
+.question-field-desc { color: var(--text-secondary); font-size: 12px; overflow-wrap: anywhere; }
+.question-options { display: flex; flex-wrap: wrap; gap: 6px; }
+.question-option {
+  display: inline-flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 1px;
+  max-width: 100%;
+  min-height: 28px;
+  padding: 4px 10px;
+  border: 1px solid var(--border);
+  border-radius: 8px;
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px;
+  text-align: left;
+  cursor: pointer;
+  transition: background 0.15s, border-color 0.15s;
+}
+.question-option.check { flex-direction: row; align-items: center; gap: 6px; flex-wrap: wrap; }
+.question-option.check input { margin: 0; accent-color: var(--accent); }
+.question-option:hover:not(:disabled) { border-color: var(--border-strong); background: var(--bg-hover); }
+.question-option.on {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 22%, var(--bg-secondary));
+}
+.question-option:disabled { opacity: 0.55; cursor: default; }
+.question-option-title { font-weight: 500; overflow-wrap: anywhere; }
+.question-option-desc { color: var(--text-secondary); font-size: 11px; overflow-wrap: anywhere; }
+.question-option.check .question-option-desc { flex-basis: 100%; padding-left: 20px; }
+.question-input {
+  box-sizing: border-box;
+  width: 100%;
+  max-width: 520px;
+  padding: 5px 8px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-primary);
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px;
+}
+.question-input.number { max-width: 160px; }
+.question-input:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-soft); }
+.question-input.bad { border-color: var(--error); }
+.question-toggle { display: inline-flex; align-items: center; gap: 6px; color: var(--text-secondary); font-size: 12px; cursor: pointer; }
+.question-toggle input { accent-color: var(--accent); }
+.question-card-actions { display: flex; align-items: center; justify-content: flex-end; gap: 6px; flex-wrap: wrap; }
+.question-card-deadline { margin-right: auto; color: var(--text-muted); font-size: 11px; }
+.question-card-actions button {
+  min-height: 28px;
+  padding: 3px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: transparent;
+  color: var(--text-primary);
+  font-family: inherit;
+  font-size: 12px;
+  cursor: pointer;
+}
+.question-card-actions button.question-submit { border-color: var(--accent); background: var(--accent); color: #fff; }
+.question-card-actions button.question-submit:hover:not(:disabled) { background: var(--accent-hover); }
+.question-card-actions button.question-skip:hover:not(:disabled) { background: var(--bg-hover); }
+.question-card-actions button:disabled { opacity: 0.55; cursor: default; }
+.question-card-error { color: var(--error); font-size: 12px; text-align: right; }
+.question-card-summary { margin: 0; padding: 0 0 0 22px; list-style: none; display: flex; flex-direction: column; gap: 3px; }
+.question-card-summary li { display: flex; gap: 8px; flex-wrap: wrap; font-size: 12px; }
+.question-card-summary-label { color: var(--text-secondary); }
+.question-card-summary-value { color: var(--text-primary); font-weight: 500; overflow-wrap: anywhere; }
+
 .composer {
   width: 80%; /* match .message width so the composer aligns with messages */
   margin: 0 auto;
@@ -4352,6 +4466,13 @@ button, input, select, textarea {
 }
 
 .composer-mode.yolo {
+  color: var(--accent);
+  border-color: var(--accent);
+  background: var(--accent-soft);
+}
+
+/* Codex 的「Plan」开关（ChatInputBox 的 enginePlan）：开着时和 Auto 一样用 accent 色 */
+.composer-mode.composer-plan.on {
   color: var(--accent);
   border-color: var(--accent);
   background: var(--accent-soft);

@@ -15,7 +15,7 @@
 /** 要换执行器的几类，按"谁的重连能把别的一起带上"从强到弱排 —— 运行位置 / 引擎先于 agent / 模型 / 组合。 */
 export const RECONNECT_ORDER = ['remote', 'engine', 'combo', 'agent', 'model'] as const;
 /** 在活着的执行器上就能改的几类（不重连），排在重连之后。 */
-export const INSTANT_ORDER = ['engineModel', 'engineEffort', 'engineMode', 'permission'] as const;
+export const INSTANT_ORDER = ['engineModel', 'engineEffort', 'engineMode', 'engineCollab', 'permission'] as const;
 
 export type ReconnectKind = typeof RECONNECT_ORDER[number];
 export type InstantKind = typeof INSTANT_ORDER[number];

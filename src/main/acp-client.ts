@@ -12,6 +12,7 @@ import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './
 import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 import { tr } from './uiText.ts';
+import { CLIENT_CAPABILITIES } from './elicitation.ts';
 import { busyEnterMode, isMethodNotFound, steeringParams, steeringVerdict, withoutSteering, type BusyEnterMode } from './busyEnterCaps.ts';
 import { sshErrorKind, sessionsFullMessage } from './sshMux.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
@@ -160,7 +161,8 @@ export function resolveKiroCli(): string | null {
 }
 
 /** Claude Code / Codex 在 configOptions 里给的那几类下拉（ACP 的 category）。 */
-export type EngineOptionCategory = 'model' | 'thought_level' | 'mode';
+/** `collaboration_mode`：Codex 的协作模式（default / plan）—— 它的 request_user_input（向你提问）只在 plan 里能用。 */
+export type EngineOptionCategory = 'model' | 'thought_level' | 'mode' | 'collaboration_mode';
 export interface EngineSelect { current: string; options: Array<{ value: string; name: string }> }
 
 export class AcpClient extends EventEmitter {
@@ -173,6 +175,8 @@ export class AcpClient extends EventEmitter {
   private kiroAgent?: string;
   private permissionMode: PermissionMode;
   private pendingPermissions = new Map<JsonRpcId, PermissionOption[]>();
+  /** 挂着的 `elicitation/create`（模型向用户的提问）：请求 id → 带没带 elicitationId。见 `handleAgentRequest`。 */
+  private pendingElicitations = new Map<JsonRpcId, { elicitationId?: string }>();
   private buffer = '';
   private env: Record<string, string>;
   private remote?: RemoteTarget;
@@ -503,7 +507,12 @@ export class AcpClient extends EventEmitter {
           const result = await this.sendRequest('initialize', {
             protocolVersion: 1,
             clientInfo: { name: 'KiroLex', version: '0.1.0' },
-            capabilities: {},
+            /*
+              ACP 的字段名是 `clientCapabilities`（原来发的 `capabilities: {}` 谁都不认，等于什么都没声明）。
+              声明 `elicitation.form`：Claude Code 才放出 AskUserQuestion、Codex 的 request_user_input 才不回空答案
+              （见 `elicitation.ts` 头注释）。三家都发；fs / terminal 不声明（和原来一样：都是 false）。
+            */
+            clientCapabilities: CLIENT_CAPABILITIES,
           }, INITIALIZE_TIMEOUT_MS);
           this.initializeResult = result;
           resolve(result);
@@ -657,7 +666,7 @@ export class AcpClient extends EventEmitter {
   /** 设一类的值。返回的 configOptions 整份记下来 —— 换模型时 effort 的可选值可能跟着变。 */
   async setSelectOption(sessionId: string, category: EngineOptionCategory, value: string): Promise<void> {
     const o = this.findOption(category);
-    if (!o) throw new Error(category === 'model' ? tr('This engine did not provide a model list') : category === 'mode' ? tr('This engine did not provide permission modes') : tr('This engine did not provide effort options'));
+    if (!o) throw new Error(category === 'model' ? tr('This engine did not provide a model list') : category === 'mode' ? tr('This engine did not provide permission modes') : category === 'collaboration_mode' ? tr('This engine does not have a Plan mode') : tr('This engine did not provide effort options'));
     const r = await this.sendRequest('session/set_config_option', { sessionId, configId: o.id, value });
     this.noteConfigOptions(r?.configOptions);
   }
@@ -717,11 +726,28 @@ export class AcpClient extends EventEmitter {
         try { this.send({ jsonrpc: '2.0', id, result: { outcome: { outcome: 'cancelled' } } }); } catch { /* 进程已经没了 */ }
       }
     }
+    /* 挂着的提问同理（三家都一样）：停止 = 回 cancel，卡片记成「已取消」 */
+    for (const id of [...this.pendingElicitations.keys()]) {
+      this.respondToElicitation(id, { action: 'cancel' });
+      this.emit('elicitation-closed', { requestId: id, reason: 'cancelled' });
+    }
   }
 
   /** 有没有权限请求在等人回答（看门狗据此不把「等人」当成卡死）。 */
   get awaitingPermission(): boolean {
     return this.pendingPermissions.size > 0;
+  }
+
+  /** 有没有提问（`elicitation/create`）在等人回答 —— 同上，等人不算卡死。 */
+  get awaitingQuestion(): boolean {
+    return this.pendingElicitations.size > 0;
+  }
+
+  /** 回答一个挂着的提问。已经答过 / 被撤回 / 不认识的 id → false，什么都不发（只回一次）。 */
+  respondToElicitation(requestId: JsonRpcId, result: { action: 'accept'; content: Record<string, unknown> } | { action: 'decline' } | { action: 'cancel' }): boolean {
+    if (!this.pendingElicitations.delete(requestId)) return false;
+    try { this.send({ jsonrpc: '2.0', id: requestId, result }); } catch { /* 进程已经没了 */ }
+    return true;
   }
 
   /**
@@ -977,6 +1003,22 @@ export class AcpClient extends EventEmitter {
   private handleNotification(msg: any) {
     const { method, params } = msg;
 
+    /*
+      **代理自己收回了提问**：`elicitation/complete`（按 elicitationId）、`$/cancel_request`（ACP SDK 取消一个请求，
+      Codex 的 autoResolutionMs 到点就这样撤）。都不再回答它，卡片关掉。
+    */
+    if (method === 'elicitation/complete' || method === '$/cancel_request') {
+      for (const [id, info] of [...this.pendingElicitations]) {
+        const hit = method === '$/cancel_request'
+          ? params?.requestId === id
+          : !!info.elicitationId && params?.elicitationId === info.elicitationId;
+        if (!hit) continue;
+        this.pendingElicitations.delete(id);
+        this.emit('elicitation-closed', { requestId: id, reason: 'withdrawn' });
+      }
+      return;
+    }
+
     // Mid-turn steer lifecycle rides on `session/update` (kiro-cli v2.9) or
     // `_kiro.dev/session/update` (v2.7); the `update.sessionUpdate` discriminant
     // distinguishes it from ordinary updates / subagent activity. Normalize BOTH
@@ -1082,13 +1124,15 @@ export class AcpClient extends EventEmitter {
           ...params,
         },
       }));
+    } else if (method === 'elicitation/create') {
+      this.handleElicitationRequest(id, params);
     } else {
       /*
         **代用户回答之前必须先说出来**。
 
         这里原来一句注释 `Auto-approve unknown requests` 就把任何不认识的请求回成 `{}`。
-        今天只有 `session/request_permission` 会向客户端要答案（翻过那个二进制里所有方法名，
-        `session/request_user_input` / `ask` / `choice` 一个都没有），所以这条分支现在走不到。
+        向客户端要答案的只有 `session/request_permission` 和 `elicitation/create`（上面两段）；kiro-cli 里
+        `session/request_user_input` / `ask` / `choice` 一个都没有，所以这条分支现在走不到。
 
         但它是个**静默**的兜底：kiro-cli 哪天加了一种"问用户"的请求，KiroLex 会替用户答一个
         空对象，而用户、日志、界面三处都看不到发生过这件事 —— 那一轮就是按一个没人给过的
@@ -1108,6 +1152,32 @@ export class AcpClient extends EventEmitter {
     }
   }
 
+  /**
+   * **模型向用户提问**（ACP `elicitation/create`，form 模式）。只声明了 form（见 initialize）：别的模式（url）回 cancel
+   * 并说一声，不替用户打开任何链接。form 的交给 index.ts（`elicitation` 事件）画成提问卡片，回答走
+   * `respondToElicitation`；停止 / 断开 / 超时都会回 cancel，这一轮不会一直挂着。
+   *
+   * kiro-cli（2.13.0 核实）：二进制里带着 ACP 的 elicitation 类型定义（sacp 11 的 ClientCapabilities.elicitation），
+   * 但没有任何"问用户"的工具，它自己的终端界面也没实现 createElicitation —— 实际上不会发这个请求。
+   * 所以 kiro 照样保留 `choiceChips.ts` 的猜测做法；它哪天真发了，走的就是这同一张卡片。
+   */
+  private handleElicitationRequest(id: JsonRpcId, params: any) {
+    if (params?.mode !== undefined && params?.mode !== 'form') {
+      this.emit('error', {
+        type: 'unsupported-elicitation',
+        message: tr('{engine} asked for input in a way KiroLex does not support (`{mode}`); it was cancelled.', { engine: this.cliName, mode: String(params?.mode) }),
+        method: 'elicitation/create',
+        params,
+      });
+      this.send({ jsonrpc: '2.0', id, result: { action: 'cancel' } });
+      return;
+    }
+    this.pendingElicitations.set(id, {
+      elicitationId: typeof params?.elicitationId === 'string' ? params.elicitationId : undefined,
+    });
+    this.emit('elicitation', { requestId: id, params });
+  }
+
   private rejectAllPending(error: Error) {
     for (const [, { reject, timer }] of this.pendingRequests) {
       clearTimeout(timer);
@@ -1116,6 +1186,11 @@ export class AcpClient extends EventEmitter {
     this.pendingRequests.clear();
     this.pendingPermissions.clear();
     this.inflightPrompts = [];
+    /* 进程没了：挂着的提问没法再回答了，卡片记成「已取消」 */
+    for (const id of [...this.pendingElicitations.keys()]) {
+      this.pendingElicitations.delete(id);
+      this.emit('elicitation-closed', { requestId: id, reason: 'cancelled' });
+    }
   }
 }
 
