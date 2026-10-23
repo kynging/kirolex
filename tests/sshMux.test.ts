@@ -311,7 +311,8 @@ describe('本地 MCP server 只起一个', () => {
     assert.match(M, /let localMcpStarting: Promise<LocalMcpServer> \| undefined;/);
     const at = M.indexOf('function ensureLocalMcpServer()');
     assert.ok(at > 0);
-    const body = M.slice(at, at + 700);
+    // 截到这个函数结束为止（原来是固定 700 字，deps 多一项就截不到末尾的 .finally）
+    const body = M.slice(at, M.indexOf('\n}\n', at));
     /* 三条分支：已经有了 / 正在起 / 自己起 —— 少中间那条就是七个 server */
     assert.match(body, /if \(localMcpServer\) return Promise\.resolve\(localMcpServer\);/);
     assert.match(body, /if \(localMcpStarting\) return localMcpStarting;/);

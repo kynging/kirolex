@@ -140,3 +140,13 @@ Invoke-RestMethod -Method Post -Headers $h -ContentType 'application/json' `
 ```
 
 不要把 token 写进脚本或命令历史里——每次从 `control.json` 现读（它每次启动都会变）。
+
+## 会话之间互相调用（不经这个 HTTP 入口）
+
+一条会话要把事情转交给另一条会话、或问它要它掌握的事实，**不用**这里的 HTTP 路由（不要 token、不受 `controlSessionAccess` 开关影响）：
+会话自己的 kirolex-local 工具里有 `sessions_list` / `session_read` / `session_send`（本地会话、远程会话都有，实现在 `src/main/sessionCalls.ts`）。
+
+- `session_send {id, text, mode?, waitReply?, timeoutSec?}`：路由和在对方输入框按 Enter 一样；对方会话里显示「📨 来自会话「<标题>」」并能点回发起会话，
+  发起方会话里留一行「📤 已发给会话…」。`waitReply: true` 不阻塞这一轮，对方这一轮结束后把回复作为新消息唤醒发起方；超时（默认 30 分钟、上限 2 小时）也唤醒并说明。
+- 限制：不能发给自己；来回转发最多 3 层；同一对会话 1 分钟最多 10 次；已删除 / 已归档的不能发；斜杠命令照旧拒绝。
+- 设置 → 开关 → 安全 →「允许会话之间互相调用」，默认开；关掉时三个工具都回一句清楚的错误。

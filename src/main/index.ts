@@ -78,8 +78,9 @@ import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, p
 import { probeHttpMcp, releaseSessionTools, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
 import { LocalBrowserHost, browserActionTitle, createQuitGuard } from './localBrowserHost.ts';
 import { isBrowserKind, type BrowserAction } from './localBrowser.ts';
-import { createControlServer, type ControlServer, type ControlSessionAccess } from './controlServer.ts';
-import { isControlMessageId, tailEntries } from './controlSessions.ts';
+import { createControlServer, type ControlServer, type ControlSessionAccess, type ControlSendResult } from './controlServer.ts';
+import { controlMessageId, isControlMessageId, isSessionMessageId, tailEntries, type MarkOrigin } from './controlSessions.ts';
+import { PairRateLimiter, ReplyWatcher, callSessionTool, type ReplyWatch, type SessionCallsHost, type SessionInfo } from './sessionCalls.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
@@ -2109,6 +2110,7 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
       call: (name, args, sid) => localBrowser().tools.call(name, args, sid),
     },
     wake: wakeMcpTools,   /* schedule_* / bg_* / watch（见 wakeTools.ts） */
+    sessions: sessionMcpTools,
     onProxyOk: forwardRecovered,
   }).then((srv) => { localMcpServer = srv; return srv; })
     .finally(() => { localMcpStarting = undefined; });
@@ -4227,6 +4229,9 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   /** 控制入口的「列会话 / 读最近消息 / 发消息」（controlServer.ts 的 `/sessions…`）。**默认关**：
    *  关着时那几条路由一律 403，`/ping` `/quit` `/reload` 不受影响。 */
   controlSessionAccess: false,
+  /** 会话之间互相调用（kirolex-local 的 `sessions_list` / `session_read` / `session_send`，sessionCalls.ts）。默认开；
+   *  关着时工具照样列出，调用时回一句清楚的错误（叫模型请用户自己转）。 */
+  sessionCalls: true,
 };
 function loadFeatureFlags(): Record<string, boolean> {
   const out = { ...FEATURE_DEFAULTS };
@@ -4555,6 +4560,92 @@ function wakeCarryOverFor(sessionId: string): string {
 const wakeMcpTools = {
   call: (name: string, args: any, sid: string, workdir: string) => callWakeTool(name, args, sid, workdir, wakeHost),
 };
+
+/*
+  **会话之间互相调用**（kirolex-local 的 `sessions_list` / `session_read` / `session_send`，纯逻辑在 sessionCalls.ts）。
+  走主进程，不经控制入口的 HTTP、不要 token。发送交给界面按 Enter 的同一套路由（`forwardToUi`，和控制入口共用那条内部 IPC）；
+  界面没就绪就进唤醒队列，对方空了再发。`waitReply` 的回复由 `replyWatcher` 发现、经 `wakeDispatcher` 唤醒发起方。
+  删掉的（墓碑）和 KiroLex Advanced 的会话一律当不存在。
+*/
+const sessionCallLimiter = new PairRateLimiter();
+function sessionCallInfo(rec: store.SessionRecord, busy: Set<string>): SessionInfo {
+  const host = rec.profile?.remote?.sshHost;
+  return {
+    id: rec.id,
+    title: rec.title || 'New Chat',
+    ...(rec.profile?.projectId ? { projectId: rec.profile.projectId } : {}),
+    engine: rec.profile?.engine || 'kiro',
+    location: host ? (labelForHost(KIROLEX_CONFIG_PATH, host) || host) : null,
+    busy: busy.has(rec.id),
+    archived: !!rec.archived,
+  };
+}
+const sessionCallsHost: SessionCallsHost = {
+  now: () => Date.now(),
+  enabled: () => isFeatureEnabled('sessionCalls'),
+  list: () => {
+    const busy = controlBusyIds();
+    const tombstoned = new Set([...loadSessionTombstones(), ...deletedSessionIds]);
+    return store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((rec) => sessionCallInfo(rec, busy));
+  },
+  get: (id) => {
+    const rec = controlVisibleRecord(id);
+    return rec ? sessionCallInfo(rec, controlBusyIds()) : null;
+  },
+  transcript: (id) => store.readTranscript(id),
+  send: async ({ from, to, text, mode }) => {
+    const r = await forwardToUi(to, text, mode, 'xs');
+    logger.info('sessions', `session_send ${from} -> ${to} chars=${text.length} mode=${mode} -> ${r.ok ? r.routed : `${r.status} ${r.error}`}`);
+    /* 追加失败（对方引擎不收 / 写不进去）：界面已经把它标红等用户选；把原因交给 session_send，别当成发成功 */
+    if (r.ok) return { ok: true, routed: r.routed, messageId: r.messageId, ...(r.steerFailed ? { steerFailed: r.steerFailed } : {}) };
+    if (r.error === 'ui-not-ready') {
+      /* 窗口没开 / 正在刷新：主进程的唤醒队列接着，对方空了再发（同后台唤醒：作为新的一条，不 steer） */
+      const ref = controlMessageId('queue', Date.now(), 'xs');
+      void wakeDispatcher.enqueue({ sessionId: to, text, at: Date.now(), source: 'session', ref })
+        .then((w) => { if (!w.ok) logger.warn('sessions', `session_send 经唤醒队列没发出去 ${from} -> ${to}: ${w.error}`); });
+      return { ok: true, routed: 'queued', messageId: ref };
+    }
+    const why: Record<string, string> = {
+      archived: '对方已归档',
+      'loop-running': '对方正被一个循环占着（循环跑完或用户停掉之后再发）',
+      'ui-timeout': '界面 15 秒没回应 —— 可能已经发出去了，先用 session_read 看一眼再决定要不要重发',
+    };
+    return { ok: false, error: why[r.error] || r.error };
+  },
+  /* 发起方会话里的记录行：KiroLex 提示，落盘（noteInSession）；不发给模型 */
+  note: (sid, text) => { noteInSession(sid, text); },
+  watchReply: (w) => replyWatcher.add(w),
+};
+const sessionMcpTools = {
+  call: (name: string, args: any, sid: string) => callSessionTool(name, args, sid, sessionCallsHost, sessionCallLimiter),
+};
+
+/** 等对方回复的登记落在这里（重启后接着等）。tmp + rename 写。 */
+const SESSION_CALLS_FILE = path.join(os.homedir(), '.kirolex', 'session-calls.json');
+const replyWatcher = new ReplyWatcher({
+  now: () => Date.now(),
+  transcript: (id) => store.readTranscript(id),
+  /* 还在跑一轮 / 换执行器 / 重建历史，或者唤醒队列里还有要发给它的 —— 都还没「这一轮结束」 */
+  isBusy: (id) => !!busyReasonFor(id) || wakeDispatcher.pending(id).length > 0,
+  exists: (id) => !!controlVisibleRecord(id),
+  title: (id) => store.readRecord(id)?.title || null,
+  deliver: (sid, text, w) => {
+    void wakeDispatcher.enqueue({ sessionId: sid, text, at: Date.now(), source: 'session', ref: w.id })
+      .then((r) => { if (!r.ok) logger.warn('sessions', `回复没能唤醒发起方 ${w.id} session=${sid}: ${r.error}`); });
+  },
+  changed: (list) => {
+    try {
+      fs.mkdirSync(path.dirname(SESSION_CALLS_FILE), { recursive: true });
+      if (!list.length) { fs.rmSync(SESSION_CALLS_FILE, { force: true }); return; }
+      const tmp = `${SESSION_CALLS_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ watches: list }, null, 2));
+      fs.renameSync(tmp, SESSION_CALLS_FILE);
+    } catch (err: any) {
+      logger.warn('sessions', `session-calls.json 写不进去: ${err?.message || err}`);
+    }
+  },
+  log: (m) => logger.info('sessions', m),
+});
 
 /** kirolex-local 上那组工具的落地：定时任务就是现有的定时任务（同一个存储、同一个计时器）。 */
 const wakeHost: WakeHost = {
@@ -8114,6 +8205,7 @@ app.whenReady().then(async () => {
         ...(display?.mergeIntoMessageId ? { mergeIntoMessageId: display.mergeIntoMessageId } : {}),
         // 经控制入口发出的（id 带标记，见 controlSessions.isControlMessageId）：对话记录里显式记一笔
         ...(isControlMessageId(userMessageId) ? { via: 'control' as const } : {}),
+        ...(isSessionMessageId(userMessageId) ? { via: 'session' as const } : {}),
         /* 放回 KiroLex 队列的那几条 handoff 原来的 id：重启恢复据此认出已经发过了（pendingHandoffs） */
         ...(fromHandoffIds.length ? { fromHandoff: fromHandoffIds } : {}),
         ...(display?.attachments?.length
@@ -9298,6 +9390,7 @@ app.whenReady().then(async () => {
       store.appendMessage(sessionId, {
         id: messageId || `steer_${Date.now()}`,
         ...(isControlMessageId(messageId) ? { via: 'control' as const } : {}),
+        ...(isSessionMessageId(messageId) ? { via: 'session' as const } : {}),
         role: 'user',
         content: text || '',
         ts: Date.now(),
@@ -9569,6 +9662,7 @@ app.whenReady().then(async () => {
     { const blocked = stillWanted(); if (blocked) throw new WakeSkipped(blocked); }
     /* 后台输出要进会话了：先记下来，之后这条会话的故障诊断包都不抄会话内容 */
     const nudge = item.source === 'nudge';   // 「写成文字」的纠正（handleTextToolCall）：不是后台输出，显示成 KiroLex 提示
+    /* 会话间的（`source: 'session'`，别的会话的回复）也算：别人的会话内容进来了，之后的诊断包同样不抄会话内容 */
     if (item.source !== 'schedule' && !nudge) markBgOutputSeen(sid);
     /*
       **反复写成文字 → 先换新的后端会话，再续发那一步**（textToolRecovery.ts）—— 和 EmptyResponse 同一套换法，
@@ -9583,7 +9677,8 @@ app.whenReady().then(async () => {
     }
     const prefix = item.source === 'schedule' ? `sched_${item.ref}` : nudge ? (item.swap ? TEXT_TOOL_SWAP_ID_PREFIX : TEXT_TOOL_NUDGE_ID_PREFIX).slice(0, -1) : `wake_${item.ref || item.source}`;
     await sendPromptOnce(sid, [{ type: 'text', text: item.text }], undefined, {
-      messageId: `${prefix}_${Date.now()}`,
+      /* 会话间的（对方的回复 / 等回复超时 / 界面没就绪时转发的那条）：id 带 `xs` 标记，落盘时记 via:'session' */
+      messageId: item.source === 'session' ? controlMessageId('user', Date.now(), 'xs') : `${prefix}_${Date.now()}`,
       /* 换后端那一条在会话里带 🔀（只给你看；发给模型的是原话） */
       displayText: nudge && item.swap ? `🔀 ${item.text}` : item.text,
       announce: true,
@@ -9598,6 +9693,20 @@ app.whenReady().then(async () => {
       throw err;
     });
   };
+
+  /*
+    会话间 `session_send` 的 `waitReply`：重启前还在等的接着等（期限照旧）；每 2 秒看一遍对方结束了没有
+    （没有登记时什么都不做）。看到了就经 wakeDispatcher 唤醒发起方。
+  */
+  try {
+    const saved = JSON.parse(fs.readFileSync(SESSION_CALLS_FILE, 'utf-8'));
+    if (Array.isArray(saved?.watches)) replyWatcher.restore(saved.watches as ReplyWatch[]);
+  } catch { /* 没有文件 = 没有在等的 */ }
+  const replyTicker = setInterval(() => {
+    try { replyWatcher.tick(); } catch (err: any) { logger.warn('sessions', `reply watcher tick failed: ${err?.message || err}`); }
+  }, 2000);
+  replyTicker.unref?.();
+  app.on('before-quit', () => clearInterval(replyTicker));
 
   /* 上次退出（或崩溃）时还在跑的后台命令 / 监视：不静默消失，在各自的会话里补一句「已中断」 */
   for (const job of takeInterruptedJobs(os.homedir())) {
@@ -10030,6 +10139,8 @@ app.whenReady().then(async () => {
     /* 它的后台命令 / 监视一起停掉，排着没发的唤醒作废 */
     void bgJobs.stopSession(sessionId);
     wakeDispatcher.drop(sessionId, 'session deleted');
+    /* 它发出去、还在等回复的那几条不再等（对方那边由 ReplyWatcher 自己发现「对方被删了」） */
+    replyWatcher.dropFrom(sessionId);
     // Durable tombstone FIRST: `deletedSessionIds` is in-memory only, so if the
     // directory cannot be removed right now (kiro-cli may still hold the
     // transcript open — disconnect is asynchronous) the chat used to come back on
@@ -14347,7 +14458,7 @@ app.whenReady().then(async () => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'rewrite-transcript'); if (advRefused) throw new Error(advRefused); }
     // 经控制入口发的（id 带标记）：渲染层漏带了显式来源 via 也补回去
     const next = (Array.isArray(messages) ? messages : [])
-      .map((m) => ({ ...m, ...(isControlMessageId(m?.id) ? { via: 'control' as const } : {}) }));
+      .map((m) => ({ ...m, ...(isControlMessageId(m?.id) ? { via: 'control' as const } : {}), ...(isSessionMessageId(m?.id) ? { via: 'session' as const } : {}) }));
     /*
       **保留的消息必须本来就是这条会话的** ——「有的会话似乎内容混了」。
       重跑 / 打断后覆盖都是"保留前面一段、丢掉后面"，所以 next 里的消息 id 一定出现在现有 transcript 里。
@@ -15471,26 +15582,7 @@ const controlSessionAccess: ControlSessionAccess = {
     const rec = controlVisibleRecord(id);
     if (!rec) return Promise.resolve({ ok: false, status: 404, error: 'not-found' });
     if (rec.archived) return Promise.resolve({ ok: false, status: 409, error: 'archived' });
-    const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
-    if (!wc || wc !== controlUiContents || wc.isLoading() || wc.isCrashed()) {
-      return Promise.resolve({ ok: false, status: 503, error: 'ui-not-ready' });
-    }
-    const reqId = `ctl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        controlSendWaiters.delete(reqId);
-        resolve({ ok: false, status: 504, error: 'ui-timeout' });
-      }, CONTROL_SEND_TIMEOUT_MS);
-      controlSendWaiters.set(reqId, (reply) => {
-        clearTimeout(timer);
-        if (reply?.ok && typeof reply.messageId === 'string' && ['sent', 'steer', 'queued'].includes(reply.routed)) {
-          resolve({ ok: true, messageId: reply.messageId, routed: reply.routed, ...(reply.steerFailed ? { steerFailed: String(reply.steerFailed) } : {}) });
-        } else {
-          resolve({ ok: false, status: Number(reply?.status) || 500, error: String(reply?.error || 'renderer-error') });
-        }
-      });
-      wc.send('control:send', { reqId, sessionId: id, text, mode });
-    });
+    return forwardToUi(id, text, mode, 'ctl');
   },
   /*
     **经控制入口换新的后端会话** —— 本机工具发现会话卡住（比如反复把工具调用写成文字）时不用叫你去点。
@@ -15523,6 +15615,33 @@ const controlSessionAccess: ControlSessionAccess = {
     }
   },
 };
+/**
+ * **交给界面按 Enter 的同一套路由发**（`App.tsx` 的 `handleControlSend`）—— 控制入口的 `send` 和会话间的 `session_send` 共用。
+ * `origin` 决定消息 id 带哪种来源标记（`ctl` = 经控制入口，`xs` = 来自别的会话，见 controlSessions.markOrigin）。
+ * 界面没开、正在刷新、还没说过 `control:ready` → 503 `ui-not-ready`；界面 15 秒没回 → 504。
+ */
+function forwardToUi(id: string, text: string, mode: 'auto' | 'next', origin: MarkOrigin): Promise<ControlSendResult> {
+  const wc = mainWindow && !mainWindow.isDestroyed() ? mainWindow.webContents : null;
+  if (!wc || wc !== controlUiContents || wc.isLoading() || wc.isCrashed()) {
+    return Promise.resolve({ ok: false, status: 503, error: 'ui-not-ready' });
+  }
+  const reqId = `ctl_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      controlSendWaiters.delete(reqId);
+      resolve({ ok: false, status: 504, error: 'ui-timeout' });
+    }, CONTROL_SEND_TIMEOUT_MS);
+    controlSendWaiters.set(reqId, (reply) => {
+      clearTimeout(timer);
+      if (reply?.ok && typeof reply.messageId === 'string' && ['sent', 'steer', 'queued'].includes(reply.routed)) {
+        resolve({ ok: true, messageId: reply.messageId, routed: reply.routed, ...(reply.steerFailed ? { steerFailed: String(reply.steerFailed) } : {}) });
+      } else {
+        resolve({ ok: false, status: Number(reply?.status) || 500, error: String(reply?.error || 'renderer-error') });
+      }
+    });
+    wc.send('control:send', { reqId, sessionId: id, text, mode, origin });
+  });
+}
 app.whenReady().then(async () => {
   try {
     controlServer = await createControlServer({

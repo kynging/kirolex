@@ -118,6 +118,9 @@ const SWITCHES: Array<{
   { key: 'controlSessionAccess', store: 'feature', group: 'Safety',
     label: 'Allow local tools to read and send messages through the control entry',
     help: 'On: tools on this computer that hold the token in ~/.kirolex/control.json (e.g. your local Claude Code, a script) can list chats, read the latest messages and send a message into a chat; such messages are marked "Sent via control entry". It never opens a debugging port and cannot run commands or change settings. Off (default): those requests are refused.' },
+  { key: 'sessionCalls', store: 'feature', group: 'Safety',
+    label: 'Allow sessions to call each other',
+    help: 'On: a chat can find your other chats, read their latest messages and send one a message (sessions_list / session_read / session_send), e.g. to hand a task over to the chat that owns it or to ask another chat for a fact it knows; the receiving chat shows "📨 From session …" with a link back, and the reply can come back automatically. Chains are limited to 3 hops and 10 messages a minute per pair. Off: those tools refuse with a clear error.' },
 ];
 
 /**

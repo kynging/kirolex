@@ -41,7 +41,7 @@ import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
 import { busyEnterKind, busyEnterRoute, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
-import { carryControlMark, controlMessageId, isControlMessageId } from '../main/controlSessions';
+import { carryControlMark, controlMessageId, isControlMessageId, type MarkOrigin } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
 import { pickQueuedBatch, sealRetryBatch, editQueuedItem, QueueBackoff, isDuplicateMessageError, type RetryBatch } from './queueRetry';
@@ -112,7 +112,7 @@ declare global {
       getPendingQuit?: () => Promise<boolean>;
       onPendingQuit?: (cb: (pending: boolean) => void) => () => void;
       /** 控制入口（controlServer `POST /sessions/:id/send`）：主进程转来一条，界面按 Enter 的同一套路由处理后回话 */
-      onControlSend?: (cb: (req: { reqId: string; sessionId: string; text: string; mode: 'auto' | 'next' }) => void) => () => void;
+      onControlSend?: (cb: (req: { reqId: string; sessionId: string; text: string; mode: 'auto' | 'next'; origin?: MarkOrigin }) => void) => () => void;
       controlSendResult?: (reqId: string, reply: ControlSendReply) => Promise<void>;
       /** 界面就绪、能接控制入口的 send 了 */
       controlReady?: () => Promise<void>;
@@ -506,6 +506,8 @@ export interface AttachedFile {
 /** 控制入口发来的一条：`report` 在决定走哪条路的那一刻告诉主进程（`sent` / `steer` / `queued` + 消息 id）。 */
 interface ControlSendCtx {
   report: (r: { routed: 'sent' | 'steer' | 'queued'; messageId: string; steerFailed?: string }) => void;
+  /** 消息 id 带哪种来源标记：`ctl` = 经控制入口（标「经控制入口发送」），`xs` = 别的会话经 session_send（显示「📨 来自会话」） */
+  origin: MarkOrigin;
 }
 export type ControlSendReply =
   | { ok: true; routed: 'sent' | 'steer' | 'queued'; messageId: string; steerFailed?: string }
@@ -2488,6 +2490,18 @@ const App: React.FC = () => {
     return () => window.removeEventListener('kirolex:open-file', handler as EventListener);
   }, [openFileInApp]);
 
+  // 「📨 来自会话「…」」上的跳转（ChatArea 的 SessionFromChip）：打开那条会话
+  useEffect(() => {
+    const handler = (e: Event) => {
+      const id = (e as CustomEvent).detail?.sessionId;
+      if (typeof id !== 'string' || !id) return;
+      if (!sessions.some((s) => s.id === id)) { showToast(tRef.current('That session no longer exists.')); return; }
+      handleSwitchSession(id);
+    };
+    window.addEventListener('kirolex:open-session', handler as EventListener);
+    return () => window.removeEventListener('kirolex:open-session', handler as EventListener);
+  }, [sessions, handleSwitchSession]);
+
   const handleForkMessage = useCallback((messageId: string, paneSid?: string) => {
     const sid = paneSid || currentSessionId;
     if (!sid) return;
@@ -3308,7 +3322,7 @@ const App: React.FC = () => {
     display?: { displayText?: string; pastes?: PastedBlock[] }, ctl?: ControlSendCtx,
   ) => {
     if (queueSendingRef.current.has(sessionId)) {
-      const id = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const id = ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       ctl?.report({ routed: 'queued', messageId: id });
       setQueuesBySession((prev) => ({
         ...prev,
@@ -3319,7 +3333,7 @@ const App: React.FC = () => {
       }));
       return;
     }
-    const messageId = ctl ? controlMessageId('user') : undefined;
+    const messageId = ctl ? controlMessageId('user', undefined, ctl.origin) : undefined;
     if (ctl) ctl.report({ routed: 'sent', messageId: messageId! });
     queueSendingRef.current.add(sessionId);
     try {
@@ -3470,7 +3484,7 @@ const App: React.FC = () => {
     // is to restore the context, so steering into it would be answered without
     // that context and would never be visible. Park it as "send after rebuild".
     const parkUntilRebuilt = () => {
-      const parkedId = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const parkedId = ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       ctl?.report({ routed: 'queued', messageId: parkedId });
       setQueuesBySession((prev) => ({
         ...prev,
@@ -3487,7 +3501,7 @@ const App: React.FC = () => {
     // 执行器没法把消息插进正在跑的一轮（能力声明里没有 steering，见 main/busyEnterCaps.ts）：忙时 Enter 就是排队 ——
     // 和 ⌘/Ctrl+Enter 同一种卡片，排在队尾，这一轮结束后自动作为下一条发出。不先试 steer、不标红。
     const queueAsNext = () => {
-      const queuedId = ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const queuedId = ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       ctl?.report({ routed: 'queued', messageId: queuedId });
       setQueuesBySession((prev) => ({
         ...prev,
@@ -3505,7 +3519,7 @@ const App: React.FC = () => {
       先放一张「已交给 …」的卡片，再发；没交出去就按原因改走普通发送（这一轮已经结束）或 KiroLex 队列。
     */
     const handOff = async () => {
-      const handoffId = ctl ? controlMessageId('user') : `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
+      const handoffId = ctl ? controlMessageId('user', undefined, ctl.origin) : `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       setHandoffsBySession((prev) => ({
         ...prev,
         [sessionId]: [...(prev[sessionId] || []), {
@@ -3534,7 +3548,7 @@ const App: React.FC = () => {
     if (busyRoute === 'queue') { queueAsNext(); return; }
     if (enterKind === 'handoff') { await handOff(); return; }
 
-    const steerId = ctl ? controlMessageId('steer') : undefined;
+    const steerId = ctl ? controlMessageId('steer', undefined, ctl.origin) : undefined;
     const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments), msgId: steerId });
     if (res.steered) { if (ctl) ctl.report({ routed: 'steer', messageId: steerId! }); return; }
     const route = steerFailureRoute(res.reason);
@@ -3552,7 +3566,7 @@ const App: React.FC = () => {
       return;
     }
     // Anything else: never silently queue. Mark it red on the turn and let the user choose.
-    const failedId = addFailedSteer(sessionId, content, attachments, res.reason, ctl ? controlMessageId('steer') : undefined);
+    const failedId = addFailedSteer(sessionId, content, attachments, res.reason, ctl ? controlMessageId('steer', undefined, ctl.origin) : undefined);
     ctl?.report({ routed: 'steer', messageId: failedId, steerFailed: res.reason || 'unknown' });
   }, [currentSessionId, sessions, busyEnterFor, attachedFor, clearAttachments, focusSession, steerMessage, handOffMessage, dropHandoff, loopingIds, sendNowOrNext, addFailedSteer]);
 
@@ -3562,7 +3576,7 @@ const App: React.FC = () => {
     if (!content || !sessionId) return;
     if (loopingIds.includes(sessionId)) return;   // loop owns the session
     const item: QueuedMessage = {
-      id: ctl ? controlMessageId('queue') : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
+      id: ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
       content,
       // 控制入口发来的不带走你输入框里的附件
       attachments: ctl ? [] : [...attachedFor(sessionId)],
@@ -3589,7 +3603,7 @@ const App: React.FC = () => {
    * 不同的只有：不切你的焦点、不带走你输入框里的附件、消息 id 带标记（气泡上显示「经控制入口发送」）。
    * 一决定走哪条路就回话（`report`），不等这一轮跑完。
    */
-  const handleControlSend = useCallback((req: { sessionId: string; text: string; mode: 'auto' | 'next' }): Promise<ControlSendReply> => {
+  const handleControlSend = useCallback((req: { sessionId: string; text: string; mode: 'auto' | 'next'; origin?: MarkOrigin }): Promise<ControlSendReply> => {
     const sid = req.sessionId;
     const session = sessions.find((s) => s.id === sid);
     // 界面里还没有这条（还在 hydrate）—— 不在主进程里绕过界面直接发
@@ -3605,7 +3619,8 @@ const App: React.FC = () => {
       if (route === 'blocked') return { ok: false, status: 409, error: 'loop-running' } as ControlSendReply;
       return new Promise<ControlSendReply>((resolve) => {
         let done = false;
-        const ctl: ControlSendCtx = { report: (r) => { if (!done) { done = true; resolve({ ok: true, ...r }); } } };
+        // 别的会话发来的（session_send）和经控制入口的走同一套，只是 id 标记不同
+        const ctl: ControlSendCtx = { origin: req.origin === 'xs' ? 'xs' : 'ctl', report: (r) => { if (!done) { done = true; resolve({ ok: true, ...r }); } } };
         const run = route === 'steer' ? handleSteerMessage(req.text, undefined, sid, ctl)
           : route === 'queue' ? handleQueueMessage(req.text, undefined, sid, ctl)
           : sendNowOrNext(sid, req.text, [], undefined, ctl);

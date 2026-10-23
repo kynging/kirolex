@@ -45,6 +45,7 @@ import path from 'path';
 import { tr } from './uiText.ts';
 import { browserToolDefs, isBrowserTool } from './localBrowser.ts';
 import { isWakeTool, wakeToolDefs } from './wakeTools.ts';
+import { isSessionTool, sessionToolDefs } from './sessionCalls.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -213,6 +214,13 @@ export interface LocalMcpDeps {
     call(name: string, args: any, sessionId: string, workdir: string): Promise<{ text: string; isError?: boolean }>;
   };
   /**
+   * 会话之间互相调用（`sessions_list` / `session_read` / `session_send`，见 `sessionCalls.ts`）。不给 = 不列、调到了说没有。
+   * 本地会话和远程会话都列（`browserOnly` 也列）；设置里关掉时照样列，调用时回一句清楚的错误。
+   */
+  sessions?: {
+    call(name: string, args: any, sessionId: string): Promise<{ text: string; isError?: boolean }>;
+  };
+  /**
    * 一个 HTTP 转发拿到了上游的正常答复（不是 JSON-RPC error）。主进程据此把探测失败记下的「当前不可用」清掉 ——
    * 探测失败不摘代理，远端下次调用 / 重连时的 initialize 照样转过去，成功了就算恢复。
    */
@@ -228,11 +236,12 @@ export interface ToolResult {
  * 工具清单 —— 给模型看的描述里要写清"这是用户那台机器"。
  * `browser`：总开关开着才把 `local_browser_*` 列进去；`browserOnly`：本地会话只列那几个。
  */
-export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean; wake?: boolean } = {}): Array<{ name: string; description: string; inputSchema: any }> {
+export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean; wake?: boolean; sessions?: boolean } = {}): Array<{ name: string; description: string; inputSchema: any }> {
   const browser = opts.browser ? browserToolDefs() : [];
   const wake = opts.wake ? wakeToolDefs() : [];
-  if (opts.browserOnly) return [...browser, ...wake];
-  return [...fileToolDefs(), ...browser, ...wake];
+  const sessions = opts.sessions ? sessionToolDefs() : [];
+  if (opts.browserOnly) return [...browser, ...wake, ...sessions];
+  return [...fileToolDefs(), ...browser, ...wake, ...sessions];
 }
 
 function fileToolDefs(): Array<{ name: string; description: string; inputSchema: any }> {
@@ -392,6 +401,11 @@ export async function callTool(
     const r = await deps.wake.call(name, args, session.sessionId, session.workdir);
     return text(r.text, !!r.isError);
   }
+  if (isSessionTool(name)) {
+    if (!deps.sessions) return text(`没有这个工具：${name}`, true);
+    const r = await deps.sessions.call(name, args, session.sessionId);
+    return text(r.text, !!r.isError);
+  }
   if (session.browserOnly) return text(`没有这个工具：${name}`, true);
   switch (name) {
     case 'local_read': {
@@ -527,7 +541,7 @@ export async function handleRpc(
     case 'notifications/cancelled':
       return null;
     case 'tools/list':
-      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly, wake: !!deps.wake }) });
+      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly, wake: !!deps.wake, sessions: !!deps.sessions }) });
     case 'tools/call': {
       const r = await callTool(String(msg?.params?.name || ''), msg?.params?.arguments || {}, session, deps);
       return reply(r);
@@ -1221,7 +1235,7 @@ export const RETIRED_RELEASED = '这条会话的执行器已经断开，工具�
 
 /** 拿着作废 token 调工具时给模型的那句。`local_*` 那几个（远程会话）换个说法，别说成「后台任务工具」。 */
 export function unavailableText(tool: string, reason: string): string {
-  const what = isWakeTool(tool) || !tool ? '后台任务工具' : 'KiroLex 本地工具';
+  const what = isSessionTool(tool) ? '会话间工具' : isWakeTool(tool) || !tool ? '后台任务工具' : 'KiroLex 本地工具';
   return `${what}在这条会话暂时不可用：${reason}。`;
 }
 

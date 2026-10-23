@@ -348,7 +348,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     return () => ipcRenderer.removeListener('control:pending-quit', handler);
   },
   /** 控制入口的 `POST /sessions/:id/send`：主进程转来，界面按 Enter 的同一套路由处理，再用 controlSendResult 回话 */
-  onControlSend: (cb: (req: { reqId: string; sessionId: string; text: string; mode: 'auto' | 'next' }) => void) => {
+  onControlSend: (cb: (req: { reqId: string; sessionId: string; text: string; mode: 'auto' | 'next'; origin?: 'ctl' | 'xs' }) => void) => {
     const handler = (_e: any, req: any) => cb(req);
     ipcRenderer.on('control:send', handler);
     return () => ipcRenderer.removeListener('control:send', handler);

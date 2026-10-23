@@ -42,6 +42,7 @@ import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
 import { userTurnBubbles } from '../steerSplit';
 import { isControlMessageId } from '../../main/controlSessions';
+import { sessionSegments } from '../../main/sessionCalls';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // Scheduling replaced loop mode. `schedule.ts` lives under src/main because the DRIVER
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
@@ -1267,6 +1268,27 @@ const CollapsibleUserBlock = memo<{ content: string }>(({ content }) => {
 });
 CollapsibleUserBlock.displayName = 'CollapsibleUserBlock';
 
+/** 别的会话经 session_send 发来的（或它回过来的）：每一行 📨 来源标记拆成一段（合并排队消息时一条里可能有好几个，见 sessionCalls.sessionSegments） */
+const sessionFromSegments = (text: string) => sessionSegments(text);
+
+/** 「📨 来自会话「A」」+ 跳回那条会话的按钮（App 收 `kirolex:open-session` 去切换）。 */
+const SessionFromChip: React.FC<{ label: string; sessionId: string }> = ({ label, sessionId }) => {
+  const t = useT();
+  return (
+    <div className="session-from-chip">
+      <span className="session-from-label">{label}</span>
+      <button
+        type="button"
+        className="session-from-open"
+        title={t('Open that session')}
+        onClick={() => window.dispatchEvent(new CustomEvent('kirolex:open-session', { detail: { sessionId } }))}
+      >
+        {t('↩ Open that session')}
+      </button>
+    </div>
+  );
+};
+
 // Renders a turn's original user message and every mid-turn steer. Each steer is
 // its OWN bubble right after the original (own time, own Copy, an "追加指令" tag),
 // grouped tightly with it; the reply below still belongs to the whole turn. The
@@ -1517,12 +1539,19 @@ const UserGroupItem = memo<{
   if (!merged && !editing) {
     return (
       <div className="user-turn-group">
-        {bubbles.map((bubble) => (
-          <div key={bubble.id} className={`message user${bubble.isSteer ? ' steer-message' : ''}`}>
+        {bubbles.map((bubble) => {
+          // 别的会话经 session_send 发来的（或它的回复）：第一行换成「📨 来自会话「…」」+ 跳回去的按钮，正文照常
+          const segs = sessionFromSegments(bubble.text);
+          return (
+          <div key={bubble.id} className={`message user${bubble.isSteer ? ' steer-message' : ''}${segs ? ' from-session' : ''}`}>
             {renderAttachments(bubble.attachments || [])}
             {bubble.text || !bubble.isSteer ? (
               <div className="message-content">
-                {bubble.text ? renderParagraph({ text: bubble.text, isSteer: false }, `${bubble.id}:paragraph`) : null}
+                {segs
+                  ? segs.map((seg, i) => (seg.kind === 'from'
+                    ? <SessionFromChip key={`${bubble.id}:from${i}`} label={seg.label} sessionId={seg.sessionId} />
+                    : renderParagraph({ text: seg.text, isSteer: false }, `${bubble.id}:paragraph${i}`)))
+                  : bubble.text ? renderParagraph({ text: bubble.text, isSteer: false }, `${bubble.id}:paragraph`) : null}
               </div>
             ) : null}
             <div className="message-actions">
@@ -1535,7 +1564,8 @@ const UserGroupItem = memo<{
               {!bubble.isSteer && turnActions}
             </div>
           </div>
-        ))}
+          );
+        })}
         {failedBlock}
       </div>
     );

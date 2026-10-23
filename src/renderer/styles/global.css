@@ -1645,6 +1645,32 @@ button, input, select, textarea {
 }
 
 /* 「经控制入口发送」：本机工具经控制入口发的消息（controlSessions.isControlMessageId） */
+/* 「📨 来自会话「A」」：别的会话经 session_send 发来的（ChatArea 的 SessionFromChip） */
+.session-from-chip {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  margin-bottom: 6px;
+  padding: 3px 4px 3px 10px;
+  border-radius: 8px;
+  font-size: 12px;
+  color: #3b6fb6;
+  background: rgba(70, 130, 210, 0.12);
+  border: 1px solid rgba(70, 130, 210, 0.32);
+}
+.session-from-label { flex: 1; min-width: 0; overflow-wrap: anywhere; }
+.session-from-open {
+  flex: none;
+  border: none;
+  background: transparent;
+  color: inherit;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 1px 6px;
+  border-radius: 6px;
+}
+.session-from-open:hover { background: rgba(70, 130, 210, 0.18); }
+
 .control-tag {
   margin-right: 4px;
   white-space: nowrap;

@@ -18,6 +18,7 @@ export function queueRetryDelay(failures: number): number {
 }
 
 const CONTROL_PREFIX = /^(user|steer|queue)_ctl_/;
+const SESSION_PREFIX = /^(user|steer|queue)_xs_/;
 
 /**
  * 这一批排队条目发出去时用的 messageId。单条就是它自己的 id；合并的一批由各条 id 拼出来
@@ -27,9 +28,11 @@ const CONTROL_PREFIX = /^(user|steer|queue)_ctl_/;
 export function queuedBatchMessageId(items: readonly { id: string }[]): string {
   if (items.length === 1) return items[0].id;
   const viaControl = items.some((it) => CONTROL_PREFIX.test(it.id));
+  // 别的会话经 session_send 排进来的（`_xs_`，见 controlSessions.isSessionMessageId）—— 合并后的那条也带
+  const viaSession = !viaControl && items.some((it) => SESSION_PREFIX.test(it.id));
   let h = 0;
   for (const it of items) for (let i = 0; i < it.id.length; i++) h = (Math.imul(h, 31) + it.id.charCodeAt(i)) | 0;
-  return `queue_${viaControl ? 'ctl_' : ''}batch_${items.length}_${(h >>> 0).toString(36)}`;
+  return `queue_${viaControl ? 'ctl_' : viaSession ? 'xs_' : ''}batch_${items.length}_${(h >>> 0).toString(36)}`;
 }
 
 /** 每条会话：连着失败了几次、什么时候之前别再试。成功一次就清零。 */

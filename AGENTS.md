@@ -219,6 +219,10 @@ docs/            设计文档（§1）
   等待退出期间 `quitPending` 为真，排队消息和定时 / 循环任务不开始新一轮（`control:pending-quit` 推给渲染端）。
 - 忙不忙由 `getBusySessions()`（`index.ts`）→ `collectBusySessions` 判定。
 - 外部调用方是 agent-board 的"拉取并重启"，不在本仓库。
+- **会话之间互相调用**不走这里的 HTTP：kirolex-local 上的 `sessions_list` / `session_read` / `session_send`（`sessionCalls.ts`，
+  本地、远程会话都挂，开关 `sessionCalls` 默认开）在主进程里实现；`session_send` 借同一条 `control:send` IPC（`index.ts` 的 `forwardToUi`，
+  `origin: 'xs'`）交给 `handleControlSend` 按 Enter 分流，id 带 `_xs_`（`isSessionMessageId`），界面显示「📨 来自会话」，transcript 里 `via: 'session'`。
+  `waitReply` 由 `ReplyWatcher` 盯对方这一轮结束，经 `wakeDispatcher`（`source: 'session'`）唤醒发起方；等待登记在 `~/.kirolex/session-calls.json`。
 
 ### 3.12 其他常碰到的
 

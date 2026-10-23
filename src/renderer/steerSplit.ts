@@ -73,7 +73,7 @@ export function userTurnBubbles<A extends AttachmentLike>(base: TurnMsg<A>, stee
 /** 一条要写盘的消息：带着可信边界的，拆回「原消息 + mergeIntoMessageId 事件」；其余原样。 */
 export function toStoredUserLines<T extends { id: string; role: string; content: string; ts: number; steerParts?: SteerPart[] }>(
   m: T,
-): Array<Omit<T, 'steerParts'> | { id: string; role: 'user'; content: string; ts: number; mergeIntoMessageId: string; via?: 'control' }> {
+): Array<Omit<T, 'steerParts'> | { id: string; role: 'user'; content: string; ts: number; mergeIntoMessageId: string; via?: 'control' | 'session' }> {
   const { steerParts, ...rest } = m;
   const folded = m.role === 'user' ? splitFoldedSteers(m.content, steerParts) : null;
   if (!folded) return [rest];

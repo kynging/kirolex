@@ -129,8 +129,11 @@ describe('接线：控制入口走 Enter 的同一套 handler', () => {
     const at = main.indexOf('const controlSessionAccess: ControlSessionAccess = {');
     const body = main.slice(at, at + 4000);
     assert.match(body, /enabled: \(\) => isFeatureEnabled\('controlSessionAccess'\)/);
-    assert.match(body, /error: 'ui-not-ready'/);
-    assert.match(body, /wc\.send\('control:send'/);
+    // 交给界面的那一段抽成了 forwardToUi（会话间的 session_send 也用它）：控制入口按 'ctl' 标记交过去
+    assert.match(body, /return forwardToUi\(id, text, mode, 'ctl'\);/);
+    const fwd = main.slice(main.indexOf('function forwardToUi('), main.indexOf('function forwardToUi(') + 1500);
+    assert.match(fwd, /error: 'ui-not-ready'/);
+    assert.match(fwd, /wc\.send\('control:send', \{ reqId, sessionId: id, text, mode, origin \}\)/);
     // advanced 的会话不碰
     assert.match(main, /return rec && !isAdvancedOnly\(rec\) \? rec : null;/);
     // 开关默认关
@@ -175,7 +178,8 @@ describe('空闲时发送失败 → 标红 → 「作为下一条发送」：一
     const app = read('renderer', 'App.tsx');
     const at = app.indexOf('const sendNowOrNext = useCallback(');
     const body = app.slice(at, app.indexOf('const handleSteerMessage = useCallback('));
-    assert.match(body, /const messageId = ctl \? controlMessageId\('user'\) : undefined;/);
+    // 来源标记跟着 ctl.origin 走（控制入口 = ctl，别的会话 = xs）
+    assert.match(body, /const messageId = ctl \? controlMessageId\('user', undefined, ctl\.origin\) : undefined;/);
     assert.match(body, /addFailedSteer\(sessionId, content, attachments, String\(error\?\.message \|\| error \|\| ''\), carryControlMark\(messageId, 'steer'\)\);/);
     // 「作为下一条发送」按失败那条的 id 带过去，排空时按卡片 id 给出带标记的用户消息 id，主进程据此写 via
     assert.match(app, /id: carryControlMark\(msgId, 'queue'\) \?\? `queue_/);

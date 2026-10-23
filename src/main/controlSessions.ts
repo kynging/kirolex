@@ -27,27 +27,42 @@ export const CONTROL_SEND_MAX = 20000;
  * 主进程落盘时另外写一个显式的 `via: 'control'`，对话记录里看得见。
  */
 const CONTROL_ID_RE = /^(user|steer|queue)_ctl_/;
+/** `xs`：会话间工具（`session_send`，sessionCalls.ts）发的 —— 界面显示「📨 来自会话」而不是「经控制入口发送」。 */
+const SESSION_ID_RE = /^(user|steer|queue)_xs_/;
 export type ControlIdKind = 'user' | 'steer' | 'queue';
+/** 消息从哪来：`ctl` = 本机工具经控制入口（HTTP），`xs` = 另一条会话经 `session_send`。 */
+export type MarkOrigin = 'ctl' | 'xs';
 
-export function controlMessageId(kind: ControlIdKind, now = Date.now()): string {
-  return `${kind}_ctl_${now}_${Math.random().toString(36).slice(2, 8)}`;
+export function controlMessageId(kind: ControlIdKind, now = Date.now(), origin: MarkOrigin = 'ctl'): string {
+  return `${kind}_${origin}_${now}_${Math.random().toString(36).slice(2, 8)}`;
 }
 
 export function isControlMessageId(id: unknown): boolean {
   return typeof id === 'string' && CONTROL_ID_RE.test(id);
 }
 
-/**
- * **一条消息换了 id 也不丢来源** —— 失败的追加指令「作为下一条发送」、启动时把没被吃掉的追加指令放回队列、
- * 中断后自动重发，都会给同一段话一个新 id。原来那条是经控制入口发的，新 id 也带标记；否则返回 undefined（调用方用普通 id）。
- */
-export function carryControlMark(fromId: unknown, kind: ControlIdKind, now = Date.now()): string | undefined {
-  return isControlMessageId(fromId) ? controlMessageId(kind, now) : undefined;
+export function isSessionMessageId(id: unknown): boolean {
+  return typeof id === 'string' && SESSION_ID_RE.test(id);
 }
 
-/** 写盘那一行要带的显式来源：id 带标记就是 `{via:'control'}`，否则什么都不加 */
-export function viaFor(id: unknown): { via: 'control' } | Record<string, never> {
-  return isControlMessageId(id) ? { via: 'control' } : {};
+/** 这条 id 带的是哪种来源标记；没带就是 null */
+export function markOrigin(id: unknown): MarkOrigin | null {
+  return isControlMessageId(id) ? 'ctl' : isSessionMessageId(id) ? 'xs' : null;
+}
+
+/**
+ * **一条消息换了 id 也不丢来源** —— 失败的追加指令「作为下一条发送」、启动时把没被吃掉的追加指令放回队列、
+ * 中断后自动重发，都会给同一段话一个新 id。原来那条带标记（控制入口 / 别的会话），新 id 带同一种；否则返回 undefined（调用方用普通 id）。
+ */
+export function carryControlMark(fromId: unknown, kind: ControlIdKind, now = Date.now()): string | undefined {
+  const origin = markOrigin(fromId);
+  return origin ? controlMessageId(kind, now, origin) : undefined;
+}
+
+/** 写盘那一行要带的显式来源：控制入口 `{via:'control'}`、别的会话 `{via:'session'}`，否则什么都不加 */
+export function viaFor(id: unknown): { via: 'control' | 'session' } | Record<string, never> {
+  const origin = markOrigin(id);
+  return origin === 'ctl' ? { via: 'control' } : origin === 'xs' ? { via: 'session' } : {};
 }
 
 /* ───────────────────────── 列表 ───────────────────────── */

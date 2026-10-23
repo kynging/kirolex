@@ -325,6 +325,9 @@ const ZH_BASE: Record<string, string> = {
   'Send history context along with the message (no extra turn)': '历史上下文随消息附带（零额外回合）',
   'Fold large pastes to disk': '大段粘贴折叠到磁盘',
   'Allow local tools to read and send messages through the control entry': '允许本机工具通过控制入口读取和发送消息',
+  'Allow sessions to call each other': '允许会话之间互相调用',
+  'On: a chat can find your other chats, read their latest messages and send one a message (sessions_list / session_read / session_send), e.g. to hand a task over to the chat that owns it or to ask another chat for a fact it knows; the receiving chat shows "📨 From session …" with a link back, and the reply can come back automatically. Chains are limited to 3 hops and 10 messages a minute per pair. Off: those tools refuse with a clear error.':
+    '开：一条会话可以找到你的其他会话、读它们最近的消息、给某一条发消息（sessions_list / session_read / session_send）—— 例如把一件事转交给专管它的会话，或者问另一条会话要它掌握的事实；对方会话里显示「📨 来自会话 …」并能点回来，回复可以自动转回来。来回转发最多 3 层，同一对会话每分钟最多 10 条。关：这些工具一律拒绝并说明原因。',
   'On: tools on this computer that hold the token in ~/.kirolex/control.json (e.g. your local Claude Code, a script) can list chats, read the latest messages and send a message into a chat; such messages are marked "Sent via control entry". It never opens a debugging port and cannot run commands or change settings. Off (default): those requests are refused.':
     '开：本机持有 ~/.kirolex/control.json 里 token 的工具（例如你本机的 Claude Code、脚本）可以列出会话、读最近的消息、往某条会话里发消息；这样发的消息标「经控制入口发送」。不会打开调试端口，也不能执行命令或改设置。关（默认）：这些请求一律拒绝。',
   'Tool stall threshold (seconds without progress)': '工具无进度多久判定卡死（秒）',

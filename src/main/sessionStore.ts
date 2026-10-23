@@ -90,8 +90,9 @@ export interface StoredMessage {
    */
   noteGroup?: string;
   /** 这条是本机工具经控制入口发的（controlServer `POST /sessions/:id/send`），界面上标「经控制入口发送」。
-   *  id 里也带着标记（`controlSessions.isControlMessageId`），界面认的是 id。 */
-  via?: 'control';
+   *  id 里也带着标记（`controlSessions.isControlMessageId`），界面认的是 id。
+   *  `'session'`：另一条会话经 `session_send` 发来的（sessionCalls.ts），界面显示「📨 来自会话」。 */
+  via?: 'control' | 'session';
   /** 助手消息：它回的是哪一条用户消息（id）。 */
   replyTo?: string;
   /** 助手消息：这是那一轮**正常收尾**的完整回复（出错 / 取消时 flush 的半截没有这一项）。

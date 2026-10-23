@@ -16,6 +16,7 @@ import { ZH_INDEX_B } from './uiTextZh/indexB.ts';
 import { ZH_MODULES_A } from './uiTextZh/modulesA.ts';
 import { ZH_MODULES_B } from './uiTextZh/modulesB.ts';
 import { ZH_WAKE } from './uiTextZh/wake.ts';
+import { ZH_SESSION_CALLS } from './uiTextZh/sessionCalls.ts';
 
 export type UiLang = 'zh' | 'en';
 
@@ -46,6 +47,7 @@ export const ZH_MAIN_PARTS: Record<string, Record<string, string>> = {
   modulesA: ZH_MODULES_A,
   modulesB: ZH_MODULES_B,
   wake: ZH_WAKE,
+  sessionCalls: ZH_SESSION_CALLS,
 };
 
 /** 主进程文案的中文表（各分表合起来）。key 是英文原文。 */
