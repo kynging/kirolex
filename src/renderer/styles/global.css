@@ -2206,7 +2206,6 @@ button, input, select, textarea {
 /* The banner's own controls. Quiet by default — this bar is read far more often than acted on. */
 .schedule-banner-pause,
 .schedule-banner-extend,
-.schedule-banner-never,
 .schedule-banner-cancel {
   flex-shrink: 0;
   padding: 2px 8px;
@@ -2220,7 +2219,6 @@ button, input, select, textarea {
 }
 .schedule-banner-pause:hover,
 .schedule-banner-extend:hover,
-.schedule-banner-never:hover,
 .schedule-banner-cancel:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
 /* Armed cancel must not look like the same button it was a moment ago: the next click deletes. */
 .schedule-banner-cancel.armed {
@@ -2241,6 +2239,45 @@ button, input, select, textarea {
   border-color: rgba(239, 83, 80, 0.30);
   color: var(--error);
 }
+/* 「⏳ 延长…」弹层：贴着按钮往下展开，不是整页对话框 */
+.schedule-expiry { position: relative; flex-shrink: 0; display: inline-flex; }
+.schedule-expiry-popover {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 50;
+  width: 420px;
+  padding: 10px 12px;
+  border-radius: 8px;
+  border: 1px solid var(--border-strong);
+  background: var(--bg-secondary);
+  color: var(--text-primary);
+  box-shadow: 0 8px 24px rgba(0, 0, 0, 0.35);
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  font-size: 12px;
+  white-space: normal;
+}
+.schedule-expiry-current { color: var(--text-secondary); }
+.schedule-expiry-row { display: flex; align-items: center; flex-wrap: wrap; gap: 6px; margin: 0; }
+.schedule-expiry-label { color: var(--text-secondary); min-width: 64px; }
+.schedule-expiry-row button,
+.schedule-expiry-row select,
+.schedule-expiry-row input {
+  font-size: 12px;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--input-bg);
+  color: inherit;
+}
+.schedule-expiry-row button { cursor: pointer; background: transparent; }
+.schedule-expiry-row button:hover { background: var(--bg-hover); }
+.schedule-expiry-amount { width: 56px; }
+.schedule-expiry-error { color: var(--error); }
+.schedule-expiry-never { border-color: var(--accent) !important; color: var(--accent) !important; }
+
 /* 目标型任务的「🎯 目标：…」：在横幅里单独占第二行（order 排到最后 + 占满一行），
    不和次数 / 倒计时 / 按钮挤在同一行把它们截没；长了截断，全文在 title 里 */
 .schedule-banner.has-goal { flex-wrap: wrap; row-gap: 2px; }

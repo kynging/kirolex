@@ -336,8 +336,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   scheduleList: () => ipcRenderer.invoke('schedule:list'),
   schedulePause: (id: string, paused: boolean) => ipcRenderer.invoke('schedule:pause', id, paused),
   scheduleRemove: (id: string) => ipcRenderer.invoke('schedule:remove', id),
-  /* 聊天顶部那条定时任务上的「延长 / 不过期」（只有用户能设成不过期） */
-  scheduleSetExpiry: (id: string, mode: 'extend' | 'never') => ipcRenderer.invoke('schedule:set-expiry', id, mode),
+  /* 聊天顶部那条定时任务上的「⏳ 延长…」弹层：{ mode:'extend', ms } / { mode:'until', at } / { mode:'never' }（只有用户能设成不过期） */
+  scheduleSetExpiry: (id: string, change: { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' }) => ipcRenderer.invoke('schedule:set-expiry', id, change),
   /** 控制入口的「等待退出」（agent-board「拉取并重启」）：为真时排队消息先不发，等正在跑的那几轮结束后退出 */
   getPendingQuit: () => ipcRenderer.invoke('control:pending-quit'),
   onPendingQuit: (cb: (pending: boolean) => void) => {

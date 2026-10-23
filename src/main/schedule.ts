@@ -275,8 +275,32 @@ export const MODEL_SCHEDULE_TTL_MS = 7 * 24 * 3600 * 1000;
 /** `expiresInDays` 夹在这个范围里。模型不能设成不过期 —— 只有用户能（聊天顶部那条定时任务上）。 */
 export const MODEL_SCHEDULE_MIN_DAYS = 1;
 export const MODEL_SCHEDULE_MAX_DAYS = 30;
-/** 用户在聊天顶部点一次「延长」加多少。 */
-export const SCHEDULE_EXTEND_MS = MODEL_SCHEDULE_TTL_MS;
+/** 聊天顶部「⏳ 延长…」弹层交给 `schedule:set-expiry` 的具体值（延长多久由用户定）。 */
+export type ScheduleExpiryChange = { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' };
+
+/**
+ * 用户改过期时间：`extend` 从「现在和原到期时间里较晚的那个」起加 `ms`；`until` 设成那个时刻（必须晚于现在）；
+ * `never` 不过期。**用户设的没有 30 天上限**（那只约束模型的 `expiresInDays`）。
+ * 只对还没结束、带着过期时间的任务；参数不合法返回给人看的错误，什么都不改。
+ */
+export function computeScheduleExpiry(state: ScheduleState, change: unknown, now: number, lang: UiLang = uiLang()):
+  { expiresAt: number | null } | { error: string } {
+  if (state.terminal || typeof state.expiresAt !== 'number') return { error: trIn(lang, 'This scheduled task has no expiry to change') };
+  const c = (change && typeof change === 'object' ? change : {}) as Record<string, unknown>;
+  if (c.mode === 'never') return { expiresAt: null };
+  if (c.mode === 'extend') {
+    const ms = c.ms;
+    if (typeof ms !== 'number' || !Number.isFinite(ms) || ms <= 0) return { error: trIn(lang, 'The extension must be a positive length of time') };
+    return { expiresAt: Math.max(now, state.expiresAt) + ms };
+  }
+  if (c.mode === 'until') {
+    const at = c.at;
+    if (typeof at !== 'number' || !Number.isFinite(at)) return { error: trIn(lang, 'Choose a valid expiry time') };
+    if (at <= now) return { error: trIn(lang, 'The expiry time must be later than now') };
+    return { expiresAt: at };
+  }
+  return { error: trIn(lang, 'Unknown expiry change') };
+}
 /** `checkCommand` 连续出错这么多次就自动暂停（并提示用户）。 */
 export const CHECK_ERROR_LIMIT = 3;
 

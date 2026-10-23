@@ -100,7 +100,7 @@ declare global {
       scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null }>>;
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
-      scheduleSetExpiry?: (id: string, mode: 'extend' | 'never') => Promise<{ ok: boolean; error?: string; expiresAt?: number | null }>;
+      scheduleSetExpiry?: (id: string, change: { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' }) => Promise<{ ok: boolean; error?: string; expiresAt?: number | null }>;
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
       /** 模型起的后台命令 / 监视（进程在 main 里）。 */
       bgList?: () => Promise<BgJobRow[]>;
@@ -4195,7 +4195,7 @@ const App: React.FC = () => {
         scheduleSummary={scheduleSummaryFor(sid)}
         onPauseSchedule={(id, paused) => void pauseSchedule(id, paused)}
         onCancelSchedule={(id) => void cancelSchedule(id)}
-        onSetScheduleExpiry={(id, mode) => void setScheduleExpiry(id, mode)}
+        onSetScheduleExpiry={(id, change) => setScheduleExpiry(id, change)}
         bgJobs={bgJobsFor(sid)}
         onStopBgJob={(jobId) => void stopBgJob(jobId)}
         onStopLoop={() => { if (sid) void stopLoop(sid); }}

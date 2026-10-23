@@ -4396,10 +4396,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     try { await window.kiroApi.schedulePause?.(id, paused); } catch {}
   }, []);
 
-  /** 「延长 7 天 / 不过期」：同样只是转给 main，改完 main 广播、这里重读。 */
-  const setScheduleExpiry = useCallback(async (id: string, mode: 'extend' | 'never') => {
-    if (!id) return;
-    try { await window.kiroApi.scheduleSetExpiry?.(id, mode); } catch {}
+  /** 「⏳ 延长…」弹层：同样只是转给 main（延长多久 / 到期时间 / 不过期），改完 main 广播、这里重读；错误交回弹层就地显示。 */
+  const setScheduleExpiry = useCallback(async (
+    id: string,
+    change: { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' },
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!id) return { ok: false };
+    try { return (await window.kiroApi.scheduleSetExpiry?.(id, change)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
   }, []);
 
   const cancelSchedule = useCallback(async (id: string) => {

@@ -47,6 +47,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // imports the same module rather than keeping a second copy of the rules.
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
 import type { ScheduleSummary } from '../scheduleView';
+import { ScheduleExpiryPopover, type ScheduleExpiryChange } from './ScheduleExpiryPopover';
 import { bgElapsedText, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
 import { IconClaudeSpark, IconCodex, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
@@ -2940,8 +2941,8 @@ interface ChatAreaProps {
    *  before these existed a job's only exits were its run budget and editing the store. */
   onPauseSchedule?: (id: string, paused: boolean) => void;
   onCancelSchedule?: (id: string) => void;
-  /** 聊天顶部那条定时任务上的「延长 7 天 / 不过期」（只有用户能设成不过期）。 */
-  onSetScheduleExpiry?: (id: string, mode: 'extend' | 'never') => void;
+  /** 聊天顶部那条定时任务上的「⏳ 延长…」弹层：延长多久 / 到期时间 / 不过期由用户定（只有用户能设成不过期）。 */
+  onSetScheduleExpiry?: (id: string, change: ScheduleExpiryChange) => Promise<{ ok: boolean; error?: string }>;
   /** Stop whatever automation currently owns this session. */
   onStopLoop: () => void;
   /** Split-pane monitor mode: transcript + live indicators + permission bar,
@@ -4343,20 +4344,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 onClick={() => onPauseSchedule?.(scheduleSummary.next!.id, !scheduleSummary.paused)}
                 title={scheduleSummary.paused ? t('Resume: keep running on the original schedule') : t('Pause: keep the job, stop it firing')}
               >{scheduleSummary.paused ? t('▶️ Resume') : t('⏸️ Pause')}</button>
-              {/* 过期时间：延长 7 天，或改成不过期 —— 只有带过期时间的（模型建的循环任务）才有 */}
+              {/* 过期时间：「⏳ 延长…」弹层里由用户定延长多久 / 到期时间 / 不过期 —— 只有带过期时间的（模型建的循环任务）才有 */}
               {scheduleSummary.expiresAt !== null && (
-                <>
-                  <button
-                    className="schedule-banner-extend"
-                    onClick={() => onSetScheduleExpiry?.(scheduleSummary.next!.id, 'extend')}
-                    title={t('Push the expiry back by 7 days')}
-                  >{t('⏳ Extend 7 days')}</button>
-                  <button
-                    className="schedule-banner-never"
-                    onClick={() => onSetScheduleExpiry?.(scheduleSummary.next!.id, 'never')}
-                    title={t('Keep it until the goal is reached or you cancel it (only you can set this; the model cannot)')}
-                  >{t('♾️ Never expire')}</button>
-                </>
+                <ScheduleExpiryPopover
+                  expiresAt={scheduleSummary.expiresAt}
+                  onApply={(change) => onSetScheduleExpiry?.(scheduleSummary.next!.id, change) ?? Promise.resolve({ ok: false })}
+                />
               )}
               {/* Cancel is NOT reversible (the prompt and trigger are deleted), so it arms
                   first. The armed state resets on its own so a forgotten click cannot sit

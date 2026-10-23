@@ -155,3 +155,26 @@ export function schedulesBySession(jobs: ScheduleView[]): Map<string, ScheduleVi
   }
   return out;
 }
+
+/** 聊天顶部「⏳ 延长…」弹层里的常用档（天）。点一下就从「现在和原到期时间里较晚的那个」起延长这么久。 */
+export const EXPIRY_PRESET_DAYS = [1, 3, 7, 14, 30] as const;
+
+/**
+ * 弹层里「自定义延长」那一格：正整数的天或小时 → 毫秒，或者一句就地提示。
+ * 用户设的没有 30 天上限（那只约束模型的 `expiresInDays`）。
+ */
+export function parseExtendInput(text: string, unit: 'day' | 'hour', lang: Lang = 'zh'): { ms: number } | { error: string } {
+  const raw = String(text ?? '').trim();
+  if (!/^\d+$/.test(raw) || Number(raw) <= 0) return { error: t(lang, 'Enter a whole number greater than 0') };
+  return { ms: Number(raw) * (unit === 'hour' ? 3600_000 : 24 * 3600_000) };
+}
+
+/** 弹层里「直接选到期时间」那一格（`<input type="datetime-local">` 的值，本地时间）→ epoch 毫秒；必须晚于现在。 */
+export function parseUntilInput(text: string, now: number, lang: Lang = 'zh'): { at: number } | { error: string } {
+  const m = /^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})$/.exec(String(text ?? '').trim());
+  if (!m) return { error: t(lang, 'Choose a date and time') };
+  const at = new Date(Number(m[1]), Number(m[2]) - 1, Number(m[3]), Number(m[4]), Number(m[5]), 0, 0).getTime();
+  if (!Number.isFinite(at)) return { error: t(lang, 'Choose a date and time') };
+  if (at <= now) return { error: t(lang, 'The expiry time must be later than now') };
+  return { at };
+}

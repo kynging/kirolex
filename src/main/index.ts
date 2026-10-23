@@ -51,7 +51,7 @@ import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectCha
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
-import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, SCHEDULE_EXTEND_MS, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
+import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
@@ -9565,18 +9565,19 @@ app.whenReady().then(async () => {
   });
 
   /**
-   * 聊天顶部那条定时任务上的「延长 / 不过期」：只有**用户**能把过期时间改成不过期（模型的 `expiresInDays` 最多 30 天）。
-   * `extend` 从「现在和原到期时间里较晚的那个」起加 7 天。只对还没结束、带着过期时间的任务。
+   * 聊天顶部那条定时任务上的「⏳ 延长…」弹层：延长多久由用户定 —— `{ mode:'extend', ms }` / `{ mode:'until', at }` / `{ mode:'never' }`。
+   * 只有**用户**能设成不过期、也没有 30 天上限（那只约束模型的 `expiresInDays`）。计算和校验在 `computeScheduleExpiry`。
    */
-  ipcMain.handle('schedule:set-expiry', (_event, id: string, mode: 'extend' | 'never') => {
+  ipcMain.handle('schedule:set-expiry', (_event, id: string, change: unknown) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
     if (!job) return { ok: false, error: tr('This scheduled task was not found') };
     { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:set-expiry'); if (advRefused) return { ok: false, error: advRefused }; }
-    if (job.state.terminal || typeof job.state.expiresAt !== 'number') return { ok: false, error: tr('This scheduled task has no expiry to change') };
-    const expiresAt = mode === 'never' ? null : Math.max(Date.now(), job.state.expiresAt) + SCHEDULE_EXTEND_MS;
+    const computed = computeScheduleExpiry(job.state, change, Date.now());
+    if ('error' in computed) return { ok: false, error: computed.error };
+    const { expiresAt } = computed;
     const state = { ...job.state, expiresAt };
     scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
-    logger.info('schedule', `expiry ${mode} id=${id} expiresAt=${expiresAt ?? 'never'}`);
+    logger.info('schedule', `expiry ${String((change as any)?.mode)} id=${id} expiresAt=${expiresAt ?? 'never'}`);
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true, expiresAt };
   });
