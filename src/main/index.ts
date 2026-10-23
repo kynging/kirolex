@@ -94,6 +94,8 @@ import { settleInFlightAttach } from './attachGate.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
 import { createCreationGate } from './creationGate.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
+import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from './toolTrace.ts';
+import { forkPointMeta, mainlineAcpMessageId, planEditFork, supportsForkPoint } from './editFork.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import {
@@ -128,7 +130,7 @@ import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
-import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
+import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, modelOffersEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -198,6 +200,10 @@ interface SessionEntry {
    *  store only when the turn completes (asymmetric durability, §7). */
   assistantBuf: string;
   assistantMsgId: string | null;
+  /** Claude Code / Codex：这一轮主线最后一个 ACP messageId —— 落盘成 `acpMessageId`，编辑重发从这里分叉（`editFork.ts`） */
+  lastAcpMessageId?: string;
+  /** 编辑重发刚 fork + load 了新的后端会话：load 回放的工具调用 / 正文在下一轮开始前一律丢掉（不能当成这条会话的新输出记下来） */
+  dropReplayUntilTurn?: boolean;
   /** File-changing tool calls accumulated for the in-flight assistant turn. */
   fileChanges: store.StoredToolCall[];
   /** Tool calls the backend has OPENED and not yet closed, by toolCallId.
@@ -6234,6 +6240,11 @@ async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise
       重连加载的会话可能带着旧档位回来，光跳过等于沿用它（见 `applyComboEffort`）。
     */
     if (cat === 'thought_level' && combo.effort) {
+      /* 当前模型根本不给 effort（实测 haiku）：不设、不在会话里报，界面在组合旁边说（审计 1b，`comboEffortNote`） */
+      if (!modelOffersEffort(opts)) {
+        logger.info('mcp-combo', `组合「${combo.name}」effort=${combo.effort}：当前模型不支持 effort，暂不生效 sessionId=${sessionId}`);
+        continue;
+      }
       const r = await applyComboEffort(combo.effort, combo.name, {
         options: () => entry.client.selectOptions('thought_level'),
         set: (v) => entry.client.setSelectOption(entry.cliSessionId, 'thought_level', v),
@@ -6364,6 +6375,11 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // one. Anything added here later that sends a prompt the user did not type must
     // suppress it the same way.
     if (entry.priming) return;
+    /* 编辑重发 fork 之后 session/load 回放的旧内容（含工具调用 —— 下面的 isReplayOutsideTurn 只认正文）：下一轮开始前都不要 */
+    if (entry.dropReplayUntilTurn) {
+      if (!entry.busy) return;
+      entry.dropReplayUntilTurn = false;
+    }
     /*
       适配器自己起的那一轮（detached）的结束信号（busyEnterCaps.detachedTurnEnded）—— 它没有 session/prompt 响应。
       只认这一轮自己有过动静（threadStatus active / 任何输出）之后的那个 idle：实测 Codex 先回 startedNewTurn、再发 active。
@@ -6415,6 +6431,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
            （一轮可能还要跑几分钟，而"让我看看进度"的价值就在于**现在**看） */
         if (entry.profile.remote?.sshHost) runLocalActions(sessionId, entry, u?.content?.text || '');
       }
+      /* 编辑重发的分叉锚点：主线助手消息（正文 / 思考）最后一个 messageId（只记 Claude Code / Codex） */
+      { const mid = engineOf(entry.profile) !== 'kiro' ? mainlineAcpMessageId(u) : undefined; if (mid) entry.lastAcpMessageId = mid; }
       if (u?.sessionUpdate === 'tool_call' || u?.sessionUpdate === 'tool_call_update') {
         const toolCallId = u?.toolCallId || `tool_${Date.now()}`;
         /* Claude 自己定的 cron（CronCreate / CronDelete）：它只活在这个后端进程里，LRU 驱逐时要提示（`claudeCron.ts`） */
@@ -6465,6 +6483,10 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           locations: locations.length > 0 ? locations : previous?.locations,
           diffs: diffs.length > 0 ? diffs : previous?.diffs,
           content: output ? clampToolOutput(output) : previous?.content,
+          /* Claude Code / Codex：工具名、入参摘要、父调用（子代理）、起止时间（`toolTrace.ts`）；kiro 的记录形状不变 */
+          ...(engineOf(entry.profile) !== 'kiro'
+            ? { ...mergeToolTrace(previous, toolTraceFields(u)), ...toolTimes(previous, status, Date.now()) }
+            : {}),
         };
         /* 远程会话：这次写已经落在远端缓存以外（没经过权限闸）—— 说出来，给「复制到本机」。每个调用只说一次。 */
         if (remoteHost && status === 'completed') {
@@ -6542,7 +6564,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           logger.info('tool', `tool_call with no locations/diffs kind=${next.kind || '<none>'} recorded=${ranSomething} title=${String(next.title).slice(0, 120)}`);
         }
         /* `browser` = local_browser 的操作记录（`noteBrowserAction`），进回合面板也要落盘 */
-        if (next.locations?.length || next.diffs?.length || ranSomething || kindLower === 'browser') {
+        /* Claude Code / Codex 每条都记：只读的调用要在对话里留痕、子代理的调用要能归到 Task 下（审计 3a / 12）。kiro 判据不变 */
+        if (shouldRecordToolCall(engineOf(entry.profile), next)) {
           const index = entry.fileChanges.findIndex((change) => change.toolCallId === toolCallId);
           if (index >= 0) entry.fileChanges[index] = next;
           else entry.fileChanges.push(next);
@@ -6684,7 +6707,10 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   const replyTo = entry?.currentUserMessageId;
   // A wedge note alone is enough to persist: a turn cut before it produced
   // anything still owes the user an explanation for why it stopped.
-  if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote)) return;
+  if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote)) {
+    if (entry) entry.lastAcpMessageId = undefined;   // 这一轮没落盘的东西：锚点也别留给下一轮
+    return;
+  }
   const finalId = entry.assistantMsgId || `a_${Date.now()}`;
   const finalText = entry.wedgeNote
     ? (entry.assistantBuf ? `${entry.assistantBuf}\n\n${entry.wedgeNote}` : entry.wedgeNote)
@@ -6700,6 +6726,8 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
     /* 回的是哪一条用户消息；只有正常收尾的那一份带 `replyComplete`（出错 / 取消 flush 的半截不算"答过了"，同一条还可以重试） */
     ...(replyTo ? { replyTo } : {}),
     ...(replyTo && completedFor === replyTo ? { replyComplete: true as const } : {}),
+    /* 分叉锚点（编辑重发用，`editFork.ts`）：这一轮主线最后一个 ACP messageId + 当时的后端会话 */
+    ...(entry.lastAcpMessageId ? { acpMessageId: entry.lastAcpMessageId, acpSessionId: entry.cliSessionId } : {}),
     /* 后端自己起的那一轮：来源标记（这一轮没有用户消息，`currentUserMessageId` 在 autonomousDeps 里摘掉了，上面两项不会有） */
     ...(opts?.autonomous ? { origin: 'autonomous' as const } : {}),
   });
@@ -6725,6 +6753,7 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   }
   entry.assistantBuf = '';
   entry.assistantMsgId = null;
+  entry.lastAcpMessageId = undefined;
   entry.fileChanges = [];
   entry.wedgeNote = undefined;
 }
@@ -11580,6 +11609,27 @@ app.whenReady().then(async () => {
     const engine = engineOf(entry.profile);
     if (engine === 'kiro') throw new Error(tr('kiro sessions do not go through this path'));
     await entry.client.setSelectOption(entry.cliSessionId, category, value);
+    /*
+      **换了模型，组合里的 effort 跟着重新对一遍**（审计 1b）—— 换到不支持 effort 的模型（haiku）时不硬塞、不报错；
+      换回支持的模型时把组合要的档位设回去（适配器换模型会带回它自己的默认档位）。失败只记日志，不挡这次换模型。
+    */
+    if (category === 'model') {
+      const combo = pickCombo(readMcpCombos(os.homedir()).combos, entry.profile.mcpCombo);
+      if (combo.effort && modelOffersEffort(entry.client.selectOptions('thought_level'))) {
+        try {
+          const r = await applyComboEffort(combo.effort, combo.name, {
+            options: () => entry.client.selectOptions('thought_level'),
+            set: (v) => entry.client.setSelectOption(entry.cliSessionId, 'thought_level', v),
+          });
+          logger.info('mcp-combo', `换到 ${value}：组合「${combo.name}」effort -> ${r.value || '(未变)'} sessionId=${sessionId}`);
+          if (r.notice) sessionNotice(sessionId, r.notice);
+        } catch (err) {
+          logger.warn('mcp-combo', `换模型后重设组合 effort 失败 sessionId=${sessionId}`, err);
+        }
+      } else if (combo.effort) {
+        logger.info('mcp-combo', `换到 ${value}：当前模型不支持 effort，组合「${combo.name}」的 effort=${combo.effort} 暂不生效 sessionId=${sessionId}`);
+      }
+    }
     entry.profile = category === 'model'
       /* 适配器刚接受了它 = 「上次成功用的」（记住的那个以后在别处没有时先退回它，`pickEngineModel`） */
       ? { ...entry.profile, engineModels: { ...entry.profile.engineModels, [engine]: value }, engineModelsUsed: { ...entry.profile.engineModelsUsed, [engine]: value } }
@@ -13719,6 +13769,91 @@ app.whenReady().then(async () => {
   };
   /* 断线恢复（`remoteRecovery`）在模块级，它要用的就是这一份挂载实现 */
   reattachSession = ensureAttached;
+
+  /**
+   * **编辑重发：让 Claude Code / Codex 的后端真正忘掉被编辑之后的内容**（审计 10，判据在 `editFork.ts`）。
+   * 渲染层在截短 transcript **之前**调它，`keepIds` 是编辑后保留下来的那些消息。
+   *   fork  → `session/fork`（带分叉点）+ `session/load` 新的那个，后端会话 id 换成它，记录跟着写；
+   *   fresh → 编辑的是第一条：直接换一个新的后端会话；
+   *   snapshot → 分不了，但当前后端本来就没被确认握着历史：下一条带的快照是按截短后的记录建的，不说什么；
+   *   其余 / 失败 → 照原来的做法（同一个后端会话里重发），会话里说一句「后端仍记得旧内容」。
+   * kiro 不走这里（渲染层也不调）。永远不抛：这一步失败不能挡住重发本身。
+   */
+  ipcMain.handle('acp:fork-backend-for-edit', async (_event, sessionId: string, keepIds: string[]) => {
+    const sid = String(sessionId || '').trim();
+    const rec = sid ? store.readRecord(sid) : null;
+    const engine = engineOf(rec?.profile);
+    if (!sid || !rec || engine === 'kiro') return { mode: 'none' };
+    const label = ENGINE_LABEL[engine];
+    const fallback = (why: string, reason: string) => {
+      logger.info('edit-fork', `fallback sessionId=${sid} reason=${reason}`);
+      sessionNotice(sid, tr('ℹ️ Edit & resend: {why}, so it was resent the old way — the {engine} backend still remembers the part you edited away.', { why, engine: label }));
+      return { mode: 'fallback', reason };
+    };
+    if (!(await ensureAttached(sid))) return fallback(tr('the session could not be connected'), 'not-connected');
+    const entry = sessionClients.get(sid)!;
+    /* 欠着重建（prime-pending）不算忙：那正是「后端没握着历史」，交给下面的判据（和 swapBackendSessionWhenIdle 同一个口径） */
+    { const busy = busyReasonFor(sid); if (busy && busy !== 'prime-pending') return fallback(tr('the session was still busy'), 'busy'); }
+    const plan = planEditFork({
+      engine,
+      forkPoint: supportsForkPoint(engine, entry.client.agentCapabilities),
+      cliSessionId: entry.cliSessionId,
+      transcript: store.readTranscript(sid) as any,
+      keepIds: Array.isArray(keepIds) ? keepIds.map(String) : [],
+      contextHeld: contextEstablished(sid, entry),
+    });
+    if (plan.mode === 'none') return plan;
+    if (plan.mode === 'snapshot') {
+      logger.info('edit-fork', `snapshot sessionId=${sid} reason=${plan.reason} —— 当前后端没握着历史，下一条按截短后的记录带快照，不用提示`);
+      return plan;
+    }
+    if (plan.mode === 'fallback') {
+      return fallback(
+        plan.reason === 'unsupported' ? tr('this adapter cannot fork from a given message')
+          : plan.reason === 'no-anchor' ? tr('the earlier replies were saved before KiroLex recorded fork points')
+            : tr('the earlier replies belong to a different backend session (engine / machine / backend was switched since)'),
+        plan.reason,
+      );
+    }
+    if (plan.mode === 'fresh') {
+      try {
+        const r = await swapBackendSessionWhenIdle(sid, 'edit-rerun');
+        logger.info('edit-fork', `fresh backend sessionId=${sid} ${r.oldId} -> ${r.newId}`);
+        return { mode: 'fresh' };
+      } catch (err: any) {
+        return fallback(tr('starting a new backend session failed ({err})', { err: String(err?.message || err) }), 'fresh-failed');
+      }
+    }
+    reconfiguringSessions.add(sid);
+    emitSessionBusy(sid);
+    try {
+      const oldId = entry.cliSessionId;
+      const forked = await entry.client.forkSession(oldId, entry.cwd, forkPointMeta(plan.messageId));
+      /* load 会把分出来的那段历史回放一遍：下一轮开始前一律丢掉（工具调用也是，见 wireSession） */
+      entry.dropReplayUntilTurn = true;
+      await withLoadTimeout(entry.client.loadSession(forked.sessionId, entry.cwd), loadTimeoutFor(entry.profile.remote));
+      entry.cliSessionId = forked.sessionId;
+      const rec2 = store.readRecord(sid);
+      if (rec2) { rec2.cliSessionId = forked.sessionId; store.writeRecord(rec2); }
+      /* 保留下来的回复在新后端里也在（messageId 原样拷过去）：锚点改到新后端，否则连着第二次编辑同一条会判成 other-backend */
+      const remapped = store.remapBackendAnchors(sid, Array.isArray(keepIds) ? keepIds.map(String) : [], oldId, forked.sessionId);
+      /* 分出来的后端握着保留下来的那段历史：不用再随下一条带快照 */
+      markContextEstablished(sid, entry);
+      /* load 回来是适配器默认的模型 / 模式（实测：opus / default）—— 设回这条会话记着的 */
+      entry.engineOptionsReady = applyEngineModel(sid, entry).catch(() => {});
+      await entry.engineOptionsReady;
+      cliFailStreak.delete(oldId);
+      logger.info('edit-fork', `forked sessionId=${sid} ${oldId} -> ${forked.sessionId} at ${plan.messageId} anchors-remapped=${remapped}`);
+      return { mode: 'fork', newId: forked.sessionId };
+    } catch (err: any) {
+      entry.dropReplayUntilTurn = false;
+      logger.warn('edit-fork', `fork failed sessionId=${sid}`, err);
+      return fallback(tr('forking from before that message failed ({err})', { err: String(err?.message || err) }), 'fork-failed');
+    } finally {
+      reconfiguringSessions.delete(sid);
+      emitSessionBusy(sid);
+    }
+  });
 
   /** 改写前的整份副本**每份文件**留多少份。要回滚也只会回到最近几版。 */
   const REVIEW_BACKUPS_KEPT = 12;

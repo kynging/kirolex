@@ -411,3 +411,11 @@ export async function applyComboEffort(
       : tr('{base}; falling back to the default level "{fb}" also failed ({err}), keeping the current level.', { base, fb, err: e }) };
   }
 }
+
+/**
+ * **当前模型给不给 effort**（审计 1b）—— 实测 Claude Code 切到 haiku 后 configOptions 里根本没有 effort 那一项，
+ * 硬设会回 `Internal error`。组合里的 effort 这时**不设、不报错**，界面在组合旁边说一声（`renderer/comboPick.comboEffortNote`）。
+ */
+export function modelOffersEffort(opts: EffortSelect): boolean {
+  return !!opts && opts.options.length > 0;
+}

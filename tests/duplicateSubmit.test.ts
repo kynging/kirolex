@@ -268,7 +268,7 @@ describe('接线：回复的去重标记贯通渲染层的读、写和整份重�
   });
   test('主进程整份重写时按盘上的补回去（渲染层那份没带也不丢）', () => {
     const rw = ST.slice(ST.indexOf('export function rewriteTranscript('), ST.indexOf('export function rewriteTranscript(') + 2000);
-    assert.match(rw, /const kept = carryReplyMarks\(onDisk, messages\);/);
+    assert.match(rw, /const kept = carryBackendAnchors\(onDisk, carryReplyMarks\(onDisk, messages\)\);/);
     assert.match(rw, /\.\.\.kept\.map\(\(m\) => JSON\.stringify\(m\)\)/);
   });
 });

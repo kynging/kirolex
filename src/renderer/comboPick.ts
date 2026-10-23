@@ -70,3 +70,20 @@ export function defaultComboOptions(
   }
   return out;
 }
+
+/**
+ * **组合里设了 effort、当前模型却不支持**（审计 1b）：返回组合旁边那句说明；不需要说就是 null。
+ * `effort` 是 engine-models 里那一格（适配器 configOptions 的 thought_level；没有这一项 = null）。
+ * 连接还没回来（engineModels 还没到）时不说 —— 那时还不知道支不支持。
+ */
+export function comboEffortNote(
+  list: ComboListView | null,
+  comboId: string,
+  engineModels: { effort?: { options: unknown[] } | null } | null,
+  t: T,
+): string | null {
+  const effort = list?.combos.find((c) => c.id === comboId)?.effort;
+  if (!effort || !engineModels) return null;
+  if (engineModels.effort && engineModels.effort.options.length > 0) return null;
+  return t('The current model does not support effort, so this combo’s effort ({effort}) is not applied for now', { effort });
+}

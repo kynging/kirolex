@@ -163,6 +163,12 @@ test('源码：index.ts 里每一处 wireSession 都在同一段里 await 过 ne
     const before = lines.slice(Math.max(0, i - 90), i).join('\n');
     assert.match(before, /await [^\n]*\.(newSession|loadSession)\(|await withLoadTimeout\([^\n]*\.(newSession|loadSession)\(|\.loadSession\(cliSessionId, cliCwd\)/, `index.ts:${i + 1}`);
   }
-  /* 除了 wireSession 和 recreateBackendSession（同一 client 上的 session/new，实测不吐正文），没有别处在活着的 client 上 load */
-  assert.doesNotMatch(M, /entry\.client\.loadSession\(/);
+  /* 除了 wireSession 和 recreateBackendSession（同一 client 上的 session/new，实测不吐正文），没有别处在活着的 client 上 load ——
+     唯一的例外是编辑重发的分叉（acp:fork-backend-for-edit）：load 之前先挂上 dropReplayUntilTurn，回放在下一轮开始前一律丢掉 */
+  const liveLoads = [...M.matchAll(/entry\.client\.loadSession\(/g)].map((m) => m.index!);
+  assert.equal(liveLoads.length, 1, '只有分叉那一处');
+  const forkAt = M.indexOf("ipcMain.handle('acp:fork-backend-for-edit'");
+  assert.ok(forkAt > 0 && liveLoads[0] > forkAt && liveLoads[0] - forkAt < 6000, '在分叉的 handler 里');
+  assert.ok(M.lastIndexOf('entry.dropReplayUntilTurn = true;', liveLoads[0]) > forkAt, 'load 之前先挂上丢回放的标记');
+  assert.match(M, /if \(entry\.dropReplayUntilTurn\) \{\n\s+if \(!entry\.busy\) return;/, 'wireSession 真的按它丢');
 });

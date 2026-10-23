@@ -203,6 +203,7 @@ declare global {
       setPrimeMode?: (sessionId: string, primeMode: 'snapshot' | 'full') => Promise<{ ok: boolean; primeMode?: 'snapshot' | 'full'; error?: string }>;
       readTranscript: (sessionId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       truncateTranscriptBefore: (sessionId: string, messageId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
+      forkBackendForEdit?: (sessionId: string, keepIds: string[]) => Promise<{ mode: 'none' | 'fork' | 'fresh' | 'snapshot' | 'fallback'; reason?: string; newId?: string }>;
       rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }>) => Promise<{ ok: boolean }>;
       listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean; remoteHost?: string; remoteId?: string; remoteMissing?: boolean }[]>;
       listSessions: () => Promise<any>;
@@ -491,6 +492,12 @@ export interface ToolCall {
   locations?: string[];
   /** File diffs carried by the tool call (ACP content blocks of type 'diff'). */
   diffs?: FileDiff[];
+  /* 只有 Claude Code / Codex 的调用带（`main/toolTrace.ts`，和落盘的 StoredToolCall 同名） */
+  toolName?: string;
+  input?: string;
+  parentToolCallId?: string;
+  startedAt?: number;
+  endedAt?: number;
 }
 
 export interface FileDiff {

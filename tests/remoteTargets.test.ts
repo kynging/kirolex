@@ -502,7 +502,7 @@ describe('工具调用要标出跑在哪台机器上', () => {
   test('「运行的命令」和「改动的文件」两个面板都带 🌐 host', () => {
     assert.equal((CA.match(/className="turn-panel-remote"/g) || []).length, 2);
     assert.match(CA, /const CommandsPanel = memo<\{ fileChanges: ToolCall\[\]; live\?: boolean; remoteHost\?: string \}>/);
-    assert.match(CA, /const FileChangesPanel = memo<\{ fileChanges: ToolCall\[\]; remoteHost\?: string \}>/);
+    assert.match(CA, /const FileChangesPanel = memo<\{ fileChanges: ToolCall\[\]; remoteHost\?: string; engine\?: string \}>/);
   });
 
   test('host 取自**会话状态**（`session.remoteHost`），不是同步状态', () => {

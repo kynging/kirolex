@@ -35,3 +35,25 @@ export function permissionButtons(options: PermissionOptionLike[]): PermissionBu
   if (reject) out.push({ optionId: reject.optionId, role: 'reject' });
   return out;
 }
+
+/**
+ * **批准计划时的计划正文**（审计 2b）—— Claude Code 的 ExitPlanMode 权限请求：标题只是「Approve Plan」，
+ * 正文在 `toolCall.rawInput.plan`，同一份也在 `toolCall.content[0].content.text`（实测附录 A12）。
+ * 只认这一种请求（工具名 ExitPlanMode，或 kind `switch_mode`）—— 普通工具的 content 是它的入参说明，不是计划。
+ */
+export function planTextOf(toolCall: any): string | undefined {
+  if (!toolCall || typeof toolCall !== 'object') return undefined;
+  const isPlan = toolCall.name === 'ExitPlanMode' || toolCall.kind === 'switch_mode'
+    || toolCall._meta?.claudeCode?.toolName === 'ExitPlanMode';
+  if (!isPlan) return undefined;
+  const raw = typeof toolCall.rawInput?.plan === 'string' ? toolCall.rawInput.plan : '';
+  if (raw.trim()) return raw.trim();
+  const block = Array.isArray(toolCall.content) ? toolCall.content.find((c: any) => typeof c?.content?.text === 'string') : undefined;
+  const text = block?.content?.text || '';
+  return text.trim() || undefined;
+}
+
+/** 计划长了默认折起来（超过这么多行或字） */
+export function planIsLong(plan: string): boolean {
+  return plan.length > 700 || plan.split('\n').length > 14;
+}

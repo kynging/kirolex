@@ -2559,6 +2559,49 @@ button, input, select, textarea {
   background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
   padding: 8px; font-size: 12px; line-height: 1.45;
 }
+/* Claude Code / Codex 的 diff：按行 - / + 着色（审计 3b，ChatArea DiffLines）；kiro 那份 <code>newText</code> 不变 */
+.files-item-diff.diff-lines { padding: 6px 0; font-family: var(--mono-font); white-space: pre; }
+.diff-line { padding: 0 8px; min-height: 1.45em; }
+.diff-line.diff-del { color: #e5534b; background: color-mix(in srgb, #e5534b 12%, transparent); }
+.diff-line.diff-add { color: #4caf82; background: color-mix(in srgb, #4caf82 12%, transparent); }
+.diff-line.diff-ctx { color: var(--text-secondary); }
+.diff-line.diff-skip { color: var(--text-muted); font-style: italic; text-align: center; }
+.files-item-new {
+  flex: none; font-size: 10px; font-weight: 600; color: #4caf82;
+  background: color-mix(in srgb, #4caf82 14%, transparent); padding: 1px 5px; border-radius: 5px;
+}
+/* 「🔧 用过的工具」（审计 3a / 12）：和「运行的命令」同一套行样式 */
+.tools-failed-count { flex: none; font-size: 11px; color: #e5534b; }
+.tool-row-title {
+  flex: 1 1 auto; min-width: 10ch; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-family: var(--mono-font, ui-monospace, SFMono-Regular, Menlo, monospace); font-size: 12px;
+  color: var(--text-secondary, #a8b3c4); text-align: left;
+  background: none; border: none; padding: 0; cursor: pointer;
+}
+.tool-row-child .tool-row-title { cursor: default; }
+.tool-row-title .turn-panel-caret { margin-right: 4px; }
+.tool-row[data-state="failed"] > .files-item-row .tool-row-title { color: #e5534b; }
+.tool-row-input, .tool-row-result {
+  flex: 0 1 auto; min-width: 0; max-width: 28%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;
+  font-size: 11px; color: var(--text-muted); font-family: var(--mono-font);
+}
+/* 状态标记 / 用时不换行（窄格子里「失败」原来竖着折成两行） */
+.tool-row .files-item-row > .stat-del, .tool-row .files-item-row > .stat-add { flex: none; white-space: nowrap; }
+.tool-row-sub, .tool-row-time { flex: none; white-space: nowrap; font-size: 11px; color: var(--text-muted); font-variant-numeric: tabular-nums; }
+.tool-row-detail { margin: 2px 4px 6px 22px; display: flex; flex-direction: column; gap: 4px; }
+.tool-row-field { display: flex; gap: 8px; font-size: 11px; align-items: baseline; }
+.tool-row-field-label { flex: none; color: var(--text-muted); }
+.tool-row-field code { font-family: var(--mono-font); color: var(--text-secondary); overflow-wrap: anywhere; }
+.tool-row-output {
+  margin: 0; max-height: 220px; overflow: auto; white-space: pre-wrap; overflow-wrap: anywhere;
+  background: var(--bg-secondary); border: 1px solid var(--border); border-radius: 6px;
+  padding: 6px 8px; font-size: 11px; line-height: 1.45; font-family: var(--mono-font);
+}
+.tool-row-children {
+  list-style: none; margin: 0; padding: 2px 0 2px 10px;
+  border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
+  display: flex; flex-direction: column; gap: 1px;
+}
 
 /* Input area */
 .chat-input-area {
@@ -3909,6 +3952,26 @@ button, input, select, textarea {
   white-space: pre-wrap;
   word-break: break-word;
 }
+
+/* 批准计划时的计划正文（审计 2b）：占满一行，开着时可滚动，长了默认折起来 */
+.permission-plan {
+  flex: 1 1 100%; min-width: 0; margin: 2px 0 2px 21px;
+  border: 1px solid var(--border); border-radius: 8px; background: var(--input-bg);
+  padding: 6px 10px; font-size: 12px; color: var(--text-primary);
+}
+.permission-plan-body { max-height: 320px; overflow: auto; }
+.permission-plan.collapsed .permission-plan-body {
+  max-height: 120px; overflow: hidden;
+  -webkit-mask-image: linear-gradient(to bottom, #000 60%, transparent);
+  mask-image: linear-gradient(to bottom, #000 60%, transparent);
+}
+.permission-plan-body h1, .permission-plan-body h2, .permission-plan-body h3 { font-size: 13px; margin: 6px 0 4px; }
+.permission-plan-body p, .permission-plan-body ul, .permission-plan-body ol { margin: 4px 0; }
+.permission-plan-toggle {
+  margin-top: 4px; font-size: 11px; color: var(--text-secondary); background: none;
+  border: none; padding: 0; cursor: pointer;
+}
+.permission-plan-toggle:hover { color: var(--text-primary); text-decoration: underline; }
 
 .permission-bar-actions {
   display: flex;
@@ -9671,6 +9734,12 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .agent-profile-diff li.warn .agent-profile-text { color: var(--warning, #e0a030); }
 .agent-profile-area { flex: 0 0 92px; color: var(--text-muted); font-size: 11px; }
 .agent-profile-text { min-width: 0; word-break: break-all; font-family: var(--mono-font); }
+
+/* 组合里设了 effort、当前模型不支持（审计 1b）：组合下拉旁边的一小句 */
+.composer-combo-effort-note {
+  flex: none; font-size: 11px; color: var(--warning); white-space: nowrap; cursor: help;
+  border: 1px dashed color-mix(in srgb, var(--warning) 55%, transparent); border-radius: 5px; padding: 0 5px;
+}
 /* 三个引擎在那台机器上能不能用（新建会话框 / 设置 → 机器 → 本机，EngineStatusPanel） */
 .engine-status-panel {
   margin: 4px 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;

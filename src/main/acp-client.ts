@@ -514,6 +514,8 @@ export class AcpClient extends EventEmitter {
             */
             clientCapabilities: CLIENT_CAPABILITIES,
           }, INITIALIZE_TIMEOUT_MS);
+          /* 适配器声明了什么（`sessionCapabilities.fork` 等）—— 编辑重发要不要分叉看它（`editFork.ts`） */
+          this.agentCapabilities = result?.agentCapabilities;
           this.initializeResult = result;
           resolve(result);
         } catch (err) {
@@ -626,6 +628,24 @@ export class AcpClient extends EventEmitter {
       mcpServers: this.mcpServers,
     });
     this.noteConfigOptions(r?.configOptions);
+    return r;
+  }
+
+  /** initialize 回来的 `agentCapabilities`（没起来 / 老 agent 没给就是 undefined） */
+  agentCapabilities: any;
+
+  /**
+   * `session/fork`：从后端会话 `sessionId` 分出一个新的。`meta` 原样放进 `_meta`（Claude Code 的分叉点写法见
+   * `editFork.forkPointMeta`）。只返回新 id —— 要用它得再 `loadSession`。
+   */
+  async forkSession(sessionId: string, cwd: string, meta?: Record<string, unknown>): Promise<{ sessionId: string }> {
+    const r = await this.sendRequest('session/fork', {
+      sessionId,
+      cwd,
+      mcpServers: this.mcpServers,
+      ...(meta ? { _meta: meta } : {}),
+    });
+    if (!r || typeof r.sessionId !== 'string' || !r.sessionId) throw new Error(tr('The adapter did not return a session id for the fork'));
     return r;
   }
 

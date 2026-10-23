@@ -78,7 +78,7 @@ describe('kiro 专有的东西对另外两家关掉', () => {
   test('远程会话的本地工具通道：kiro 走 agent 文件，另外两家走 ACP 的 mcpServers', () => {
     const AC = read('src', 'main', 'acp-client.ts');
     assert.match(AC, /return this\.engine !== 'kiro' \? \(this\.localTools\?\.mcpServers \|\| \[\]\) : \[\];/);
-    assert.equal((AC.match(/mcpServers: this\.mcpServers,/g) || []).length, 2, 'session/new 和 session/load 都要带');
+    assert.equal((AC.match(/mcpServers: this\.mcpServers,/g) || []).length, 3, 'session/new、session/load、session/fork（编辑重发分叉）都要带');
     assert.match(M, /const mcp = \{ type: 'http', name: 'kirolex-local', url: mcpUrl\(remotePort, urlPath\), headers: \[\] \};/);
   });
 

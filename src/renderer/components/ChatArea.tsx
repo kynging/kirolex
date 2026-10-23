@@ -63,7 +63,9 @@ import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
 import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, switchFailureNotice, cleanIpcError, type RequestStatusMap, type SwitchWhat } from '../sessionRequestStatus.ts';
-import { comboSelectView, type ComboListView } from '../comboPick.ts';
+import { comboSelectView, comboEffortNote, type ComboListView } from '../comboPick.ts';
+import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall } from '../toolRows.ts';
+import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
 
@@ -966,7 +968,9 @@ const MessageItem = memo<{
    * 必须一眼看得出来，不能靠推。
    */
   remoteHost?: string;
-}>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools, remoteHost }) => {
+  /** 这条会话的引擎：Claude Code / Codex 的工具行、diff 显示和 kiro 分开（kiro 的面板不变） */
+  engine?: string;
+}>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools, remoteHost, engine }) => {
   const t = useT();
   const [copied, setCopied] = useState(false);
   const actionLocked = isLastAssistant && isStreaming;
@@ -1087,12 +1091,14 @@ const MessageItem = memo<{
         })}
         {turnFileChanges.length > 0 && (
           <div className="message-turn-panels">
-            <FileChangesPanel fileChanges={turnFileChanges} remoteHost={remoteHost} />
+            <FileChangesPanel fileChanges={turnFileChanges} remoteHost={remoteHost} engine={engine} />
             {/* `live` = this turn is the one still running. The panel is open while it
                 runs and closes itself when it ends, so a finished turn does not leave a
                 wall of shell text in the transcript. */}
             <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} remoteHost={remoteHost} />
             <BrowserPanel fileChanges={turnFileChanges} />
+            {/* Claude Code / Codex：只读的调用（Read / Grep / WebFetch …）和子代理（Task 下面挂它的调用）。只给非 kiro：kiro 也落盘带 locations 的 Read，不能让它们冒出一块新面板 */}
+            {!!engine && engine !== 'kiro' && <ToolsPanel calls={turnFileChanges} live={isStreaming && isLastAssistant} />}
           </div>
         )}
       </div>
@@ -2733,13 +2739,8 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
   const collapsed = pinned ?? !live;
   /** Multi-line commands the user asked to see in full, by tool-call id. */
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
-  const cmds = useMemo(() => {
-    const byId = new Map<string, ToolCall>();
-    for (const tc of fileChanges) {
-      if (RUN_KINDS.has((tc.kind || '').toLowerCase())) byId.set(tc.toolCallId, tc);
-    }
-    return Array.from(byId.values());
-  }, [fileChanges]);
+  /* 子代理（Task）里跑的命令挂在它的 Task 行下面（ToolsPanel），不混进主线；kiro 没有父调用，结果和原来一样 */
+  const cmds = useMemo(() => mainlineCommands(fileChanges), [fileChanges]);
   if (!cmds.length) return null;
   const preview = commandFirstLine(cmds[0].title);
   return (
@@ -2919,7 +2920,139 @@ const RemoteCopyButtons: React.FC<{ sessionId: string; paths: string[] }> = ({ s
     </span>
   );
 };
-const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(({ fileChanges, remoteHost }) => {
+/** 一段 diff 按行显示：`-` 原来的、`+` 改成的、上下文行、中间折掉的「…」（审计 3b，判定在 `diffView.ts`） */
+const DiffLines: React.FC<{ diff: FileDiff }> = ({ diff }) => {
+  const t = useT();
+  const view = useMemo(() => diffView(diff.oldText, diff.newText), [diff]);
+  if (!view.lines.length) return null;
+  return (
+    <pre className="files-item-diff diff-lines">
+      {view.lines.map((l, i) => (
+        <div key={i} className={`diff-line diff-${l.op === '-' ? 'del' : l.op === '+' ? 'add' : l.op === '…' ? 'skip' : 'ctx'}`}>
+          {l.op === '…' ? t('… unchanged lines …') : `${l.op} ${l.text}`}
+        </div>
+      ))}
+    </pre>
+  );
+};
+
+/** 权限卡里计划正文的渲染：和聊天里同一套 Markdown（审计 2b） */
+const renderPlanMarkdown = (md: string): React.ReactNode => <MarkdownView content={md} />;
+
+/** 工具行的标题：去掉后端「Running: …」那种前缀，多行只取第一行 */
+const toolRowTitle = (c: ToolCall): string => commandFirstLine(c.title).head;
+
+/**
+ * 「🔧 用过的工具」—— Claude Code / Codex 这一轮里不归别的面板管的调用（Read / Grep / Glob / WebFetch / WebSearch / Task …），
+ * 一条一行：工具名 + 标题 + 入参摘要 + 结果摘要 + 状态 / 用时，点开看入参和输出（审计 3a）。
+ * Task（子代理）那一行下面挂它派出去的调用，折叠显示，行上写子代理的进度和用时（审计 12）。
+ * 行的样式和「运行的命令」同一套（files-item-row + kind 徽章）；失败标红。只给非 kiro 会话画（kiro 也落盘带 locations 的 Read，见 MessageItem 那一处判断）。
+ */
+const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live }) => {
+  const t = useT();
+  const rows = useMemo(() => toolRowsOf(calls), [calls]);
+  /* null = 跟着这一轮（跑着时展开、跑完收起）；点过就按你的 —— 和「运行的命令」一样 */
+  const [pinned, setPinned] = useState<boolean | null>(null);
+  const collapsed = pinned ?? !live;
+  const [openIds, setOpenIds] = useState<Set<string>>(new Set());
+  const anyRunning = rows.some((r) => toolState(r.call.status) === 'running' || r.children.some((c) => toolState(c.status) === 'running'));
+  const [now, setNow] = useState(() => Date.now());
+  /* 还有调用在跑：用时每秒走一下（跑完就停） */
+  useEffect(() => {
+    if (!live || !anyRunning) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [live, anyRunning]);
+  if (!rows.length) return null;
+  const failed = rows.reduce((n, r) => n + (toolState(r.call.status) === 'failed' ? 1 : 0) + r.children.filter((c) => toolState(c.status) === 'failed').length, 0);
+  const toggle = (id: string) => setOpenIds((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const badge = (c: ToolCall) => {
+    const st = toolState(c.status);
+    return st === 'failed' ? <span className="stat-del">{t('Failed')}</span>
+      : st === 'running' ? <span className="stat-add">{t('Running')}</span> : null;
+  };
+  return (
+    <div className="turn-panel tools-panel">
+      <button className="turn-panel-head" onClick={() => setPinned(!collapsed)}>
+        <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
+        <span className="turn-panel-label">{t('🔧 Tools used')}</span>
+        <span className="turn-panel-count">{rows.length}</span>
+        {failed > 0 && <span className="tools-failed-count">{t('{n} failed', { n: failed })}</span>}
+        {collapsed && (
+          <span className="commands-preview" title={rows[0].call.title}>
+            {toolRowTitle(rows[0].call)}
+            {rows.length > 1 ? ` … +${rows.length - 1}` : ''}
+          </span>
+        )}
+      </button>
+      {!collapsed && (
+        <ul className="files-list">
+          {rows.map(({ call, children }) => {
+            const open = openIds.has(call.toolCallId);
+            const title = toolRowTitle(call);
+            const showInput = !!call.input && !title.includes(call.input);
+            const summary = toolState(call.status) === 'running' ? '' : toolResultSummary(call.content);
+            const sub = isSubagentCall(call) || children.length > 0;
+            const progress = sub ? childProgress(children) : null;
+            const took = toolDuration(call, now);
+            return (
+              <li key={call.toolCallId} className="files-item tool-row" data-state={toolState(call.status)}>
+                <div className="files-item-row">
+                  <span className="files-item-kind">{call.toolName || call.kind || t('tool')}</span>
+                  <button type="button" className="tool-row-title" title={call.title} onClick={() => toggle(call.toolCallId)}>
+                    <span className="turn-panel-caret">{open ? '▾' : '▸'}</span>{title}
+                  </button>
+                  {showInput && <span className="tool-row-input" title={call.input}>{call.input}</span>}
+                  {summary && <span className="tool-row-result" title={summary}>→ {summary}</span>}
+                  {progress && (
+                    <span className="tool-row-sub" title={t('Subagent calls: {done} done, {failed} failed, {running} running', { done: progress.done, failed: progress.failed, running: progress.running })}>
+                      🤖 {t('{n} calls', { n: children.length })}
+                    </span>
+                  )}
+                  {took && <span className="tool-row-time">{took}</span>}
+                  {badge(call)}
+                </div>
+                {open && (
+                  <div className="tool-row-detail">
+                    {call.input && (
+                      <div className="tool-row-field"><span className="tool-row-field-label">{t('Input')}</span><code>{call.input}</code></div>
+                    )}
+                    {call.content && <pre className="tool-row-output">{call.content.length > 4000 ? `${call.content.slice(0, 4000)}…` : call.content}</pre>}
+                    {children.length > 0 && (
+                      <ul className="tool-row-children">
+                        {children.map((c) => {
+                          const cSummary = toolState(c.status) === 'running' ? '' : toolResultSummary(c.content);
+                          const cTook = toolDuration(c, now);
+                          return (
+                            <li key={c.toolCallId} className="tool-row tool-row-child" data-state={toolState(c.status)}>
+                              <div className="files-item-row">
+                                <span className="files-item-kind">{c.toolName || c.kind || t('tool')}</span>
+                                <span className="tool-row-title" title={c.title}>{toolRowTitle(c)}</span>
+                                {cSummary && <span className="tool-row-result" title={c.content}>→ {cSummary}</span>}
+                                {cTook && <span className="tool-row-time">{cTook}</span>}
+                                {badge(c)}
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    )}
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+});
+
+const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string; engine?: string }>(({ fileChanges, remoteHost, engine }) => {
   const t = useT();
   const [collapsed, setCollapsed] = useState(false);
   const [openPath, setOpenPath] = useState<string | null>(null);
@@ -2929,7 +3062,7 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(
     // but they are NOT changes — only entries that carry a real diff, or whose
     // tool kind is mutating (edit/create/write/delete/move), count here.
     const MUTATING = new Set(['edit', 'create', 'write', 'delete', 'move', 'rename']);
-    const map = new Map<string, { path: string; kind?: string; diff?: FileDiff }>();
+    const map = new Map<string, { path: string; kind?: string; diff?: FileDiff; diffs?: FileDiff[] }>();
     // Same file, two spellings: on macOS /tmp and /var are symlinks into /private,
     // and a tool may report either. Keyed on the raw string, one edit to
     // /tmp/x.py showed up as TWO rows (/tmp/x.py and /private/tmp/x.py, same
@@ -2939,9 +3072,11 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(
     const put = (fp: string, v: { kind?: string; diff?: FileDiff }) => {
       const k = dedupKey(fp);
       const prev = map.get(k);
-      if (!prev) map.set(k, { path: fp, ...v });
+      if (!prev) map.set(k, { path: fp, ...v, ...(v.diff ? { diffs: [v.diff] } : {}) });
       // A later entry may carry the diff the earlier bare location lacked.
-      else if (!prev.diff && v.diff) map.set(k, { ...prev, diff: v.diff, kind: v.kind || prev.kind });
+      else if (!prev.diff && v.diff) map.set(k, { ...prev, diff: v.diff, diffs: [v.diff], kind: v.kind || prev.kind });
+      /* 同一个文件这一轮改了好几次（Claude Code 每次 Edit 一段）：都留着，非 kiro 的显示按段列出、合计增删 */
+      else if (v.diff && prev.diffs && !prev.diffs.includes(v.diff)) prev.diffs.push(v.diff);
     };
     for (const tc of fileChanges) {
       // A carried diff is always a genuine change.
@@ -2955,6 +3090,7 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(
   }, [fileChanges]);
   if (!files.length) return null;
   const base = (p: string) => p.split(/[/\\]/).pop() || p;
+  const nonKiro = !!engine && engine !== 'kiro';
   return (
     <div className="turn-panel files-panel">
       <button className="turn-panel-head" onClick={() => setCollapsed((c) => !c)}>
@@ -2971,13 +3107,17 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(
       {!collapsed && (
         <ul className="files-list">
           {files.map((f) => {
-            const stats = f.diff ? diffStats(f.diff) : null;
+            /* Claude Code / Codex：按行比出真实的增删（审计 3b，`diffView.ts`）；kiro 照旧 */
+            const lineDiff = nonKiro && !!f.diffs?.length;
+            const lineStats = lineDiff ? sumDiffStats(f.diffs!) : null;
+            const stats = lineStats || (f.diff ? diffStats(f.diff) : null);
             const expanded = openPath === f.path;
             return (
               <li key={f.path} className="files-item">
                 <div className="files-item-row">
                   {f.kind && <span className="files-item-kind">{f.kind}</span>}
                   <FileChangePath path={f.path} label={base(f.path)} />
+                  {lineStats?.isNew && <span className="files-item-new">{t('new file')}</span>}
                   {stats && (stats.added > 0 || stats.removed > 0) && (
                     <span className="files-item-stat">
                       {stats.added > 0 && <span className="stat-add">+{stats.added}</span>}
@@ -2990,11 +3130,12 @@ const FileChangesPanel = memo<{ fileChanges: ToolCall[]; remoteHost?: string }>(
                     </button>
                   )}
                 </div>
-                {f.diff && expanded && (
+                {f.diff && expanded && !lineDiff && (
                   <pre className="files-item-diff">
                     <code>{f.diff.newText}</code>
                   </pre>
                 )}
+                {expanded && lineDiff && f.diffs!.map((d, i) => <DiffLines key={i} diff={d} />)}
               </li>
             );
           })}
@@ -3703,6 +3844,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const [mcpCombos, setMcpCombos] = useState<McpComboList | null>(null);
   /* 记住的组合本机没有时，下拉选中一条明说的提示项（comboPick.ts），不悄悄显示「通用」 */
   const comboView = comboSelectView(mcpCombos, pendingSwitch?.combo, t);
+  /* 组合里设了 effort、当前模型（例如 haiku）不支持：组合旁边说一声，effort 暂不生效（审计 1b） */
+  const effortNote = comboEffortNote(mcpCombos, comboView.value, engineModels, t);
   useEffect(() => {
     setMcpCombos(null);
     if (!nonKiro || !currentSessionId) return;
@@ -4736,6 +4879,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           ) : (
             <MessageItem
               remoteHost={remoteHostLabel}
+              engine={engine}
               key={`${currentSessionId ?? 'none'}:${group.segments[group.segments.length - 1].id}`}
               segments={group.segments}
               questionContent={group.question}
@@ -4915,7 +5059,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           until you switched to it, which stalled that session indefinitely. */}
       {readOnly && permissionRequest && (
         <div className="chat-input-area pane-permission-only">
-          <PermissionBar request={permissionRequest} onRespond={onRespondPermission} />
+          <PermissionBar request={permissionRequest} onRespond={onRespondPermission} renderMarkdown={renderPlanMarkdown} />
         </div>
       )}
 
@@ -4976,6 +5120,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <PermissionBar
                   request={permissionRequest}
                   onRespond={onRespondPermission}
+                  renderMarkdown={renderPlanMarkdown}
                 />
               )}
               {/*
@@ -5112,6 +5257,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.name })}</option>
                         ))}
                       </select>
+                      {effortNote && (
+                        <span className="composer-combo-effort-note" title={effortNote} role="note">
+                          {t('effort not applied')}
+                        </span>
+                      )}
                       {pendingSwitch?.combo !== undefined && <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['combo'])} onCancel={() => onCancelPendingSwitch?.('combo')} />}
                     </div>
                   ) : (

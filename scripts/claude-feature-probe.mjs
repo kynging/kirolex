@@ -14,7 +14,10 @@
  *
  * Env:
  *   PROBE_STEPS   comma list (default: all) — init, model, tools, todo, tasks, think, effort, image, slash,
- *                 compact, compactPrefixed, cancelTool, cancelPerm, cancelTask, plan, task, web, load, steering, queueing
+ *                 compact, compactPrefixed, cancelTool, cancelPerm, cancelTask, plan, task, web, load, steering, queueing, fork
+ *                 (fork = what KiroLex edit & resend does: fork at an earlier assistant messageId, load the fork,
+ *                 check the model forgot the later turn; see src/main/editFork.ts; fork2 = the same message edited twice:
+ *                 the 2nd fork starts from the 1st fork at the same anchor)
  *                 (+ `cron`, opt-in only — not in the default list: CronCreate a one-shot prompt and wait ~1–2 min for it to fire,
  *                 then run KiroLex's own outside-a-turn classification on the frames)
  *                 (cancelPerm switches the session to Manual mode first: the adapter starts in
@@ -23,6 +26,7 @@
  *   PROBE_LOG     verbatim frame log (default: <tmp>/claude-feature-probe.log)
  *   PROBE_CWD     working dir for the session (default: a fresh temp dir with hello.txt)
  *   KIROLEX_CLAUDE_ACP  adapter entry (.js) — same override KiroLex itself honours (`engines.ts`)
+ *   PROBE_ENGINE  claude (default) | codex — codex runs the steps against codex-acp (KIROLEX_CODEX_ACP overrides)
  */
 import { spawn, execFileSync } from 'node:child_process';
 import fs from 'node:fs';
@@ -30,15 +34,19 @@ import os from 'node:os';
 import path from 'node:path';
 
 const LOG = process.env.PROBE_LOG || path.join(os.tmpdir(), 'claude-feature-probe.log');
-const ALL = ['init', 'model', 'tools', 'todo', 'tasks', 'think', 'effort', 'image', 'slash', 'compact', 'compactPrefixed', 'cancelTool', 'cancelPerm', 'cancelTask', 'plan', 'task', 'web', 'load', 'steering', 'queueing'];
+const ALL = ['init', 'model', 'tools', 'todo', 'tasks', 'think', 'effort', 'image', 'slash', 'compact', 'compactPrefixed', 'cancelTool', 'cancelPerm', 'cancelTask', 'plan', 'task', 'web', 'load', 'steering', 'queueing', 'fork', 'fork2'];
 const STEPS = (process.env.PROBE_STEPS || ALL.join(',')).split(',').map((s) => s.trim()).filter(Boolean);
 const WANT_MODEL = (process.env.PROBE_MODEL || 'haiku').toLowerCase();
 fs.writeFileSync(LOG, '');
 const t0 = Date.now();
 const rec = (dir, obj) => fs.appendFileSync(LOG, `[${String(Date.now() - t0).padStart(7)}ms] ${dir} ${JSON.stringify(obj)}\n`);
 
+/* PROBE_ENGINE=codex runs the same steps against @agentclientprotocol/codex-acp (KIROLEX_CODEX_ACP overrides) —
+   used to check which Claude-side fields Codex also sends (rawInput, diff blocks, parent ids, sessionCapabilities.fork) */
+const ENGINE = process.env.PROBE_ENGINE === 'codex' ? 'codex' : 'claude';
+const PKG = ENGINE === 'codex' ? 'codex-acp' : 'claude-agent-acp';
 function adapterEntry() {
-  const o = process.env.KIROLEX_CLAUDE_ACP;
+  const o = ENGINE === 'codex' ? process.env.KIROLEX_CODEX_ACP : process.env.KIROLEX_CLAUDE_ACP;
   if (o) return o;
   const roots = [];
   if (process.env.APPDATA) roots.push(path.join(process.env.APPDATA, 'npm', 'node_modules'));
@@ -48,10 +56,10 @@ function adapterEntry() {
     roots.unshift(out.trim().split(/\r?\n/).pop());
   } catch { /* fall through */ }
   for (const r of roots) {
-    const e = path.join(r, '@agentclientprotocol', 'claude-agent-acp', 'dist', 'index.js');
+    const e = path.join(r, '@agentclientprotocol', PKG, 'dist', 'index.js');
     if (fs.existsSync(e)) return e;
   }
-  throw new Error('claude-agent-acp not found (npm i -g @agentclientprotocol/claude-agent-acp, or set KIROLEX_CLAUDE_ACP)');
+  throw new Error(`${PKG} not found (npm i -g @agentclientprotocol/${PKG}, or set KIROLEX_${ENGINE.toUpperCase()}_ACP)`);
 }
 
 const cwd = process.env.PROBE_CWD || fs.mkdtempSync(path.join(os.tmpdir(), 'cc-probe-'));
@@ -391,6 +399,45 @@ async function main() {
     await new Promise((r) => setTimeout(r, 800));
     summarize('load: session/load replay in a fresh process', a.updates.slice(from), { result: le ? `ERROR ${le.message}` : { models: lr?.models?.currentModelId, modes: lr?.modes?.currentModeId, configOptions: (lr?.configOptions || []).map((o) => `${o.id}=${o.currentValue}`) } });
     await prompt(a, sid, 'load: does the model remember? ', 'What exact text did I first ask you to reply with in this conversation? Reply with it only.');
+  }
+  if (STEPS.includes('fork')) {
+    /* the anchor KiroLex persists: the LAST main-line messageId of a turn (agent_message_chunk / agent_thought_chunk) */
+    const lastMid = (ups) => ups.map((p) => p.update).filter((u) => (u?.sessionUpdate === 'agent_message_chunk' || u?.sessionUpdate === 'agent_thought_chunk') && u.messageId && !u?._meta?.claudeCode?.parentToolUseId).map((u) => u.messageId).at(-1);
+    const t1 = await prompt(a, sid, 'fork: turn 1', 'Remember the word APPLE. Reply with exactly: ok');
+    const anchor = lastMid(t1.updates);
+    await prompt(a, sid, 'fork: turn 2 (to be edited away)', 'Also remember the word BANANA. Reply with exactly: ok');
+    console.log('\nfork anchor (turn 1 last messageId):', anchor, ' caps.fork:', JSON.stringify(init.agentCapabilities?.sessionCapabilities?.fork));
+    const forked = await a.request('session/fork', { sessionId: sid, cwd, mcpServers: [], _meta: { jetbrains: { air: { fork: { version: 1, messageId: anchor } } } } }).catch((e) => ({ error: e.message }));
+    console.log('session/fork ->', JSON.stringify(forked));
+    if (forked.sessionId) {
+      const lr = await a.request('session/load', { sessionId: forked.sessionId, cwd, mcpServers: [] }).catch((e) => ({ error: e.message }));
+      console.log('session/load(fork) ->', lr?.error ? lr.error : 'ok');
+      const m = (lr?.configOptions || []).find((o) => o.category === 'model');
+      if (m && pick) await a.request('session/set_config_option', { sessionId: forked.sessionId, configId: m.id, value: pick.value }).catch(() => {});
+      await prompt(a, forked.sessionId, 'fork: in the FORK — which words? (expect APPLE only)', 'Which words did I ask you to remember in this conversation? List them, nothing else.');
+      await prompt(a, sid, 'fork: in the ORIGINAL — which words? (expect APPLE and BANANA)', 'Which words did I ask you to remember in this conversation? List them, nothing else.');
+    }
+  }
+  if (STEPS.includes('fork2')) {
+    /* editing the SAME message twice: the 2nd fork starts from the 1st fork, at the same anchor (turn 1's messageId,
+       copied into the fork). Checks the anchor is still found there and the 2nd edit's content is forgotten too. */
+    const lastMid = (ups) => ups.map((p) => p.update).filter((u) => (u?.sessionUpdate === 'agent_message_chunk' || u?.sessionUpdate === 'agent_thought_chunk') && u.messageId && !u?._meta?.claudeCode?.parentToolUseId).map((u) => u.messageId).at(-1);
+    const t1 = await prompt(a, sid, 'fork2: turn 1', 'Remember the word APPLE. Reply with exactly: ok');
+    const anchor = lastMid(t1.updates);
+    await prompt(a, sid, 'fork2: turn 2 (1st version, edited away)', 'Also remember the word BANANA. Reply with exactly: ok');
+    const meta = { jetbrains: { air: { fork: { version: 1, messageId: anchor } } } };
+    const f1 = await a.request('session/fork', { sessionId: sid, cwd, mcpServers: [], _meta: meta }).catch((e) => ({ error: e.message }));
+    console.log('\nfork2: 1st fork ->', JSON.stringify(f1));
+    await a.request('session/load', { sessionId: f1.sessionId, cwd, mcpServers: [] });
+    const m = modelOpt && pick ? a.request('session/set_config_option', { sessionId: f1.sessionId, configId: modelOpt.id, value: pick.value }).catch(() => {}) : null; await m;
+    await prompt(a, f1.sessionId, 'fork2: turn 2 (2nd version, in fork 1, edited away again)', 'Also remember the word CHERRY. Reply with exactly: ok');
+    const f2 = await a.request('session/fork', { sessionId: f1.sessionId, cwd, mcpServers: [], _meta: meta }).catch((e) => ({ error: e.message }));
+    console.log('fork2: 2nd fork (from fork 1, same anchor) ->', JSON.stringify(f2));
+    if (f2.sessionId) {
+      await a.request('session/load', { sessionId: f2.sessionId, cwd, mcpServers: [] });
+      if (modelOpt && pick) await a.request('session/set_config_option', { sessionId: f2.sessionId, configId: modelOpt.id, value: pick.value }).catch(() => {});
+      await prompt(a, f2.sessionId, 'fork2: in fork 2 — which words? (expect APPLE only: no BANANA, no CHERRY)', 'Which words did I ask you to remember in this conversation? List them, nothing else.');
+    }
   }
   await a.close();
   console.log('\ndone. verbatim frames:', LOG);

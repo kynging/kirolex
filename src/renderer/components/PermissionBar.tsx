@@ -1,24 +1,30 @@
 import React, { useEffect, useState } from 'react';
 import type { PermissionRequest } from '../hooks/useAcp';
 import { useT } from '../hooks/useLang';
-import { permissionButtons } from '../permissionButtons';
+import { permissionButtons, planIsLong } from '../permissionButtons';
 
 interface PermissionBarProps {
   request: PermissionRequest;
   onRespond: (optionId: string) => Promise<void>;
+  /** 计划正文怎么渲染（Markdown）—— ChatArea 传它自己的 MarkdownView，避免这里反过来 import ChatArea */
+  renderMarkdown?: (markdown: string) => React.ReactNode;
 }
 
 export const PermissionBar: React.FC<PermissionBarProps> = ({
   request,
   onRespond,
+  renderMarkdown,
 }) => {
   const t = useT();
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  /* 批准计划时的计划正文（审计 2b）：长了默认折起来，换一个请求重新按长短定 */
+  const [planOpen, setPlanOpen] = useState(() => !request.plan || !planIsLong(request.plan));
 
   useEffect(() => {
     setSubmitting(false);
     setError(null);
+    setPlanOpen(!request.plan || !planIsLong(request.plan));
   }, [request.requestId]);
 
   const respond = async (optionId: string) => {
@@ -46,6 +52,18 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
             <code title={request.description}>{request.description}</code>
           )}
         </div>
+        {request.plan && (
+          <div className={`permission-plan${planOpen ? '' : ' collapsed'}`}>
+            <div className="permission-plan-body">
+              {renderMarkdown ? renderMarkdown(request.plan) : <pre>{request.plan}</pre>}
+            </div>
+            {planIsLong(request.plan) && (
+              <button type="button" className="permission-plan-toggle" onClick={() => setPlanOpen((o) => !o)}>
+                {planOpen ? t('Collapse the plan') : t('Show the whole plan')}
+              </button>
+            )}
+          </div>
+        )}
         <div className={`permission-bar-actions${buttons.some((b) => b.label) ? ' named' : ''}`}>
           {buttons.map((b) => (
             <button

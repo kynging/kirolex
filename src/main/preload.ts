@@ -200,6 +200,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   setDraftPastes: (sessionId: string, blocks: any[]) => ipcRenderer.invoke('app:set-draft-pastes', sessionId, blocks),
   truncateTranscriptBefore: (sessionId: string, messageId: string) =>
     ipcRenderer.invoke('acp:truncate-transcript-before', sessionId, messageId),
+  /** 编辑重发：Claude Code / Codex 从保留下来的最后一条回复处分出新的后端会话（审计 10，main `acp:fork-backend-for-edit`） */
+  forkBackendForEdit: (sessionId: string, keepIds: string[]) => ipcRenderer.invoke('acp:fork-backend-for-edit', sessionId, keepIds),
   rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: any[] }>) =>
     ipcRenderer.invoke('acp:rewrite-transcript', sessionId, messages),
   // Durable on-disk session index (source of truth for the sidebar).

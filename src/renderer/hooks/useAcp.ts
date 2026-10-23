@@ -57,6 +57,9 @@ import { adapterInstallStore, setAdapterInstallRunner, setEngineLoginRunner } fr
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
 import { engineLabel } from '../engineLabel';
+import { wantsEditFork } from '../../main/editFork.ts';
+import { planTextOf } from '../permissionButtons.ts';
+import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
 import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
 
@@ -97,6 +100,8 @@ export interface PermissionRequest {
   toolTitle: string;
   description?: string;
   options: PermissionOption[];
+  /** 批准计划（Claude Code 的 ExitPlanMode）时的计划正文，Markdown（审计 2b，`permissionButtons.planTextOf`） */
+  plan?: string;
 }
 
 /** A running turn that has gone quiet, re-sent by main on every watchdog tick.
@@ -2505,6 +2510,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         case 'tool_call': {
           const locations = extractLocations(update);
           const diffs = extractDiffs(update);
+          /* Claude Code / Codex：工具名 / 入参摘要 / 父调用 / 起止时间，每条都挂到这一轮上（审计 3a / 12，和主进程落盘同一个判据） */
+          const traceEngine = sessionsRef.current.find((s) => s.id === targetSid)?.engine;
+          const traced = !!traceEngine && traceEngine !== 'kiro';
           const tc: ToolCall = {
             toolCallId: update.toolCallId,
             title: update.title || t('Tool call'),
@@ -2513,12 +2521,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             locations,
             diffs,
             content: extractToolOutput(update) || undefined,
+            ...(traced ? { ...toolTraceFields(update), ...toolTimes(undefined, update.status, Date.now()) } : {}),
           };
           toolCallsRef.current.set(update.toolCallId, tc);
           // Track per session so it is cleared even if you switch away mid-tool
           setSessionActiveTool(targetSid, tc.title);
           /* `browser` = local_browser 的操作记录（主进程 `noteBrowserAction`）—— 进「🌐 浏览器操作」回合面板 */
-          if (locations.length || diffs.length || RUN_KINDS.has((tc.kind || '').toLowerCase()) || tc.kind === 'browser') attachFileChangeToLatestTurn(targetSid, tc, isActiveSession);
+          if (shouldRecordToolCall(traceEngine, tc)) attachFileChangeToLatestTurn(targetSid, tc, isActiveSession);
           break;
         }
 
@@ -2543,9 +2552,14 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             if (newDiffs.length) existing.diffs = newDiffs;
             const output = extractToolOutput(update);
             if (output) existing.content = output;
+            const traceEngine = sessionsRef.current.find((s) => s.id === targetSid)?.engine;
+            if (traceEngine && traceEngine !== 'kiro') {
+              Object.assign(existing, mergeToolTrace(existing, toolTraceFields(update)), toolTimes(existing, existing.status, Date.now()));
+            }
             toolCallsRef.current.set(update.toolCallId, existing);
-            if (existing.locations?.length || existing.diffs?.length
-                || RUN_KINDS.has((existing.kind || '').toLowerCase())) {
+            /* kiro：原来的判据（动过文件 / 跑过东西）；Claude Code / Codex：每条都挂（审计 3a） */
+            if (traceEngine && traceEngine !== 'kiro' ? true : (existing.locations?.length || existing.diffs?.length
+                || RUN_KINDS.has((existing.kind || '').toLowerCase()))) {
               attachFileChangeToLatestTurn(targetSid, existing, isActiveSession);
             }
 
@@ -2606,14 +2620,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 kind: option.kind,
               })).filter((option: PermissionOption) => !!option.optionId)
             : [];
+          const plan = planTextOf(update.toolCall);
           setPermissionRequests((current) => ({
             ...current,
             [requestSessionId]: {
               requestId: update.requestId,
               sessionId: requestSessionId,
               toolTitle,
-              description,
+              /* 计划正文单独显示：同一份不要再塞进 description 那一行 code 里 */
+              description: plan && description === plan ? undefined : description,
               options,
+              ...(plan ? { plan } : {}),
             },
           }));
           break;
@@ -4622,6 +4639,14 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // never persisted there, e.g. mid-turn steers). Thinking (💭) segments are
       // live-only and never belong in the transcript.
       const storedRetained = toStoredTranscript(retained);
+      /*
+        **Claude Code / Codex：后端也要忘掉被编辑之后的那段**（审计 10）—— 它们的后端会话是持久的，只截 KiroLex 的记录
+        的话模型照样记得。主进程按盘上**还没截短**的记录找分叉点，所以在 rewriteTranscript 之前调。自动重发（carryMark）
+        不分叉：那一轮通常什么都没产出。分不了时主进程会在会话里说一句，这里照常重发。kiro 不走。
+      */
+      if (!override?.carryMark && wantsEditFork(sessionsRef.current.find((s) => s.id === sid)?.engine)) {
+        try { await window.kiroApi.forkBackendForEdit?.(sid, storedRetained.map((m) => m.id)); } catch { /* 主进程不抛；IPC 本身失败也照常重发 */ }
+      }
       await window.kiroApi.rewriteTranscript(sid, storedRetained);
 
       /*

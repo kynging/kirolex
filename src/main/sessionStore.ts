@@ -8,6 +8,7 @@ import { projectDirName } from './projectStore.ts';
 import { logger } from './logger.ts';
 import { isKirolexNote } from './kirolexNote.ts';
 import { carryReplyMarks, completedReplyInText, messageIdStatusInText, type MessageIdStatus } from './promptDedupe.ts';
+import { carryBackendAnchors, remapAnchorsToFork } from './editFork.ts';
 import type { QuestionCard } from './elicitation.ts';
 
 /**
@@ -43,6 +44,15 @@ export interface StoredToolCall {
   kind?: string;
   locations?: string[];
   diffs?: StoredFileDiff[];
+  /* 下面几个只有 Claude Code / Codex 会话的调用才带（`toolTrace.ts`；kiro 的记录形状不变） */
+  /** 工具真名（`Read` / `Grep` / `Agent` …） */
+  toolName?: string;
+  /** 入参摘要（一行） */
+  input?: string;
+  /** 子代理里的调用：派它出去的那条 Task 的 toolCallId */
+  parentToolCallId?: string;
+  startedAt?: number;
+  endedAt?: number;
 }
 
 export interface StoredMessage {
@@ -63,6 +73,9 @@ export interface StoredMessage {
   /** 助手消息：这一轮最后一次**真实**工具调用开始时正文的长度。判「把工具调用写成了文字」只看这之后（`textToolCall.ts`），
    *  一轮结束时的判定、界面折叠、历史折叠用同一个口径。没调过工具就没有。 */
   toolTailFrom?: number;
+  /** 助手消息（Claude Code / Codex）：这一轮主线最后一个 ACP messageId 和当时的后端会话 id —— 编辑重发时从这里分叉（`editFork.ts`） */
+  acpMessageId?: string;
+  acpSessionId?: string;
   /** 助手消息：`'autonomous'` = 后端自己起的那一轮（Claude Code 的 cron 到点 / 后台任务跟进，`autonomousTurn.ts`），不是在回哪条用户消息。 */
   origin?: 'autonomous';
   /** Files/images the user attached to THIS message. Persisted so the chips
@@ -767,6 +780,22 @@ export function deleteSession(id: string): void {
   if (fs.existsSync(d)) fs.rmSync(d, { recursive: true, force: true });
 }
 
+/**
+ * 编辑重发分叉成功后：保留下来的回复的锚点改到新的后端会话（`editFork.remapAnchorsToFork`）。tmp + rename；返回改了几条。
+ */
+export function remapBackendAnchors(id: string, keepIds: Iterable<string>, oldId: string, newId: string): number {
+  refuseAdvancedOnlyWrite(id);
+  const file = transcriptPath(id);
+  let raw = '';
+  try { raw = fs.readFileSync(file, 'utf-8'); } catch { return 0; }
+  const r = remapAnchorsToFork(raw, keepIds, oldId, newId);
+  if (!r.changed) return 0;
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, r.text);
+  fs.renameSync(tmp, file);
+  return r.changed;
+}
+
 /** Atomically overwrite the transcript with exactly the given messages. Robust
  *  alternative to truncateTranscriptBefore for edit-and-rerun: the renderer knows
  *  precisely which messages to retain, so no id lookup (which fails for un-persisted
@@ -797,7 +826,8 @@ export function rewriteTranscript(id: string, messages: StoredMessage[]): void {
   /* 回复的去重标记（replyTo / replyComplete）以盘上为准补回去 —— 渲染层那一份可能没带（`carryReplyMarks`） */
   let onDisk = '';
   try { onDisk = fs.readFileSync(file, 'utf-8'); } catch { /* 还没有这份文件 */ }
-  const kept = carryReplyMarks(onDisk, messages);
+  /* 分叉锚点同样以盘上为准补回去（`editFork.carryBackendAnchors`） */
+  const kept = carryBackendAnchors(onDisk, carryReplyMarks(onDisk, messages));
   const body = [...before, ...kept.map((m) => JSON.stringify(m))].join('\n');
   fs.writeFileSync(tmp, body ? `${body}\n` : '');
   fs.renameSync(tmp, file);
