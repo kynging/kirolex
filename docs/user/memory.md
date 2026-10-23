@@ -57,7 +57,7 @@ snapshot, and **放弃修改** (*Discard changes*) throws away unsaved edits.
 ## Size warnings and Compact
 
 Because memory is sent with **every** turn, a large memory costs tokens on every message. When a
-layer grows past its limit (global 1 KB, project 16 KB, this chat 10 KB), a banner appears above the
+layer grows past its limit (global 1 KB, project 16 KB, this chat 32 KB), a banner appears above the
 chat: ⚠ … 每轮对话都会完整发送 (*… is sent in full with every turn*). It offers three buttons:
 
 - **Compact**: first backs the file up, then sends a visible message to the current chat asking it to

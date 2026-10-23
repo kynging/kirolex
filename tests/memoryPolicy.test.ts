@@ -16,8 +16,8 @@ describe('三层各有自己的阈值，因为每字节的代价不同', () => {
     assert.ok(MEMORY_WARN_BYTES.global < MEMORY_WARN_BYTES.project);
   });
 
-  test('数值：全局 1 KB、项目 16 KB、会话 10 KB（「把会话记忆提示的阈值设置为 10KB」「全局记忆的阈值……就 1KB」）', () => {
-    assert.deepEqual(MEMORY_WARN_BYTES, { global: 1024, project: 16 * 1024, session: 10 * 1024 });
+  test('数值：全局 1 KB、项目 16 KB、会话 32 KB（2026-10-23「会话记忆 10 KB 太小……设为 32 KB」「全局记忆的阈值……就 1KB」）', () => {
+    assert.deepEqual(MEMORY_WARN_BYTES, { global: 1024, project: 16 * 1024, session: 32 * 1024 });
     /* 全局仍然是三层里最严的 —— 它注入进每一个会话 */
     assert.ok(MEMORY_WARN_BYTES.global < MEMORY_WARN_BYTES.session && MEMORY_WARN_BYTES.global < MEMORY_WARN_BYTES.project);
   });
@@ -35,6 +35,22 @@ describe('三层各有自己的阈值，因为每字节的代价不同', () => {
   test('正好等于阈值不报警，超出一个字节才报警', () => {
     assert.equal(memoryWarnings({ bytes: { ...none, global: MEMORY_WARN_BYTES.global } }).length, 0);
     assert.equal(memoryWarnings({ bytes: { ...none, global: MEMORY_WARN_BYTES.global + 1 } }).length, 1);
+  });
+
+  test('会话层：32 KB 及以下不报（包括原来会报的 10–32 KB），超过 32 KB 才报', () => {
+    const s = (session: number) => memoryWarnings({ sessionId: 's_1', bytes: { ...none, session } }).map((x) => x.scope);
+    assert.deepEqual(s(10 * 1024 + 1), [], '原来的 10 KB 线不再报');
+    assert.deepEqual(s(20 * 1024), []);
+    assert.deepEqual(s(32 * 1024), [], '正好 32 KB 不报');
+    assert.deepEqual(s(32 * 1024 + 1), ['session']);
+  });
+
+  test('全局 / 项目阈值不变：全局超 1 KB、项目超 16 KB 才报', () => {
+    const w = (bytes: typeof none) => memoryWarnings({ projectId: 'Dev', sessionId: 's_1', bytes }).map((x) => x.scope);
+    assert.deepEqual(w({ ...none, global: 1024 }), []);
+    assert.deepEqual(w({ ...none, global: 1024 + 1 }), ['global']);
+    assert.deepEqual(w({ ...none, project: 16 * 1024 }), []);
+    assert.deepEqual(w({ ...none, project: 16 * 1024 + 1 }), ['project']);
   });
 });
 
