@@ -162,13 +162,15 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('acp:switch-permission-mode', sessionId, permissionMode),
   /** 忙时记下、这一轮跑完再切的那些切换（`pendingSwitch.ts`）：`{ [sessionId]: { kind: 新值 } }` */
   getPendingSwitches: (sessionId?: string) => ipcRenderer.invoke('acp:get-pending-switches', sessionId),
+  /** `{ [sessionId]: 这段等待的开始时刻 }` —— 会话里那张卡片的「已等 N 秒」 */
+  getPendingSwitchSince: () => ipcRenderer.invoke('acp:get-pending-switch-since'),
   cancelPendingSwitch: (sessionId: string, kind?: string) => ipcRenderer.invoke('acp:cancel-pending-switch', sessionId, kind),
-  onPendingSwitches: (cb: (d: { sessionId: string; pending: Record<string, string> }) => void) => {
+  onPendingSwitches: (cb: (d: { sessionId: string; pending: Record<string, string>; since?: number | null }) => void) => {
     const handler = (_e: any, d: any) => cb(d);
     ipcRenderer.on('acp:pending-switches', handler);
     return () => ipcRenderer.removeListener('acp:pending-switches', handler);
   },
-  onPendingSwitchResult: (cb: (d: { sessionId: string; applied: string[]; failed: Array<{ kind: string; label: string; error: string }>; profile: any; pending: Record<string, string> }) => void) => {
+  onPendingSwitchResult: (cb: (d: { sessionId: string; applied: string[]; failed: Array<{ kind: string; label: string; error: string }>; profile: any; pending: Record<string, string>; since?: number | null }) => void) => {
     const handler = (_e: any, d: any) => cb(d);
     ipcRenderer.on('acp:pending-switch-result', handler);
     return () => ipcRenderer.removeListener('acp:pending-switch-result', handler);

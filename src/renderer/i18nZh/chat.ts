@@ -329,6 +329,13 @@ export const ZH_CHAT: Record<string, string> = {
   'Switch failed': '切换失败',
   '{why}\nClick to dismiss.': '{why}\n点一下关掉。',
   '⚠ The source chat ran on remote target {host}, which is no longer in your settings. KiroLex did not move this copy to another machine: right-click it → Runs on to pick one before sending.': '⚠ 源会话跑在远程目标 {host} 上，但设置里已经没有这台机器了。KiroLex 没有把这份副本换到别的机器上：发消息前先右键它 →「运行位置」选一台。',
+  /* 忙时选的切换：说清楚在等什么（负责人反馈 2026-10-23） */
+  "⏳ Switches to {target} after this turn": "⏳ 本轮结束后切到 {target}",
+  "This turn is still running. To avoid interrupting it, KiroLex switches to {target} as soon as it finishes. Click Cancel to stay as you are.": "这一轮还在跑。为了不打断它，等它跑完立刻切到 {target}。点「取消」就保持现在的设置。",
+  "⏳ This turn is still running; will switch to {target} once it finishes (waited {n}s).": "⏳ 这一轮还在跑，跑完后切到 {target}（已等 {n} 秒）",
+  "{n} queued message(s) will be sent once the switch finishes.": "排队的 {n} 条消息会在切换完成后发出。",
+  "Stop this turn and switch now": "停止这一轮并立即切换",
+  "Cancel switch": "取消切换",
   /* 新建会话的启动阶段条 / 就绪前的排队（createStages.ts） */
   'Connect to remote': '连接远端',
   'Check environment': '检查环境',

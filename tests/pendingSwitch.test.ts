@@ -9,6 +9,10 @@ import {
   isReconnectKind,
   withEngineOption,
   shouldQueueSwitch,
+  pendingTargetText,
+  waitedSeconds,
+  livePendingNoteId,
+  PENDING_SWITCH_NOTE_GROUP,
   type PendingSwitch,
 } from '../src/main/pendingSwitch.ts';
 
@@ -248,7 +252,8 @@ describe('接线：每一种切换忙时登记 pending、不再 throw', () => {
   });
 
   test('发送前先应用 pending（新消息用新的 agent / 模型）', () => {
-    const head = sliceFrom('async function sendPromptOnce(', 1500);
+    /* 2500：settle 前面还有一句「这条消息会在切换完成后发出」的提示（pendingSwitchVisibility.test.ts） */
+    const head = sliceFrom('async function sendPromptOnce(', 2500);
     assert.ok(/attempt === 0\)\s*await pendingSwitchRunner\.settle\(sessionId\)/.test(head), 'sendPromptOnce 开头要 settle');
     assert.ok(head.indexOf('pendingSwitchRunner.settle') < head.indexOf('let entry = sessionClients.get(sessionId)'), '要在取 entry 之前');
   });
@@ -467,8 +472,9 @@ describe('MCP 组合：pending 记 id，下拉按 id 显示新选择（和界面
   test('主进程登记组合时 label 就是组合 id；提示里才换成当前语言的显示名', () => {
     assert.ok(M.includes("queueSwitchWhileBusy(sessionId, 'combo', { comboId: combo.id }, combo.id, fromPending)"));
     assert.ok(!M.includes("queueSwitchWhileBusy(sessionId, 'combo', { comboId: combo.id }, comboDisplayName(combo)"));
-    const batch = sliceFrom('applyPendingSwitchBatch = async', 9000);
-    assert.ok(/if \(kind !== 'combo'\) return label;[\s\S]{0,200}comboDisplayName\(c\)/.test(batch));
+    /* 换显示名挪到了模块级的 pendingLabelForPeople（登记时插的提示也要用） */
+    const fn = sliceFrom('function pendingLabelForPeople(', 400);
+    assert.ok(/if \(kind !== 'combo'\) return label;[\s\S]{0,200}comboDisplayName\(c\)/.test(fn));
   });
 
   test('下拉只按 id 对 pending（不再按 name 找）', () => {
@@ -743,25 +749,3 @@ describe('重连进行中再选：登记成下一批 pending，最后一次选�
   });
 });
 
-describe('等待时不显示"这一轮跑完后切换"之类的字眼（用户要求）', () => {
-  const C = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'ChatArea.tsx'), 'utf-8');
-  const S = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'Sidebar.tsx'), 'utf-8');
-  const Z = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'i18nZh', 'chat.ts'), 'utf-8');
-  test('⏳ 小标只有图标（和"切的是什么 → 新值"）+ ✕，不带"跑完后切换"的文字和悬停说明', () => {
-    const at = C.indexOf('function PendingSwitchBadge(');
-    const badge = C.slice(at, C.indexOf('\n}\n', at));
-    assert.ok(badge.includes('⏳'));
-    assert.ok(badge.includes("aria-label={t('Cancel')}"), '✕ 还在，提示只说「取消」');
-    for (const words of ['Switches after this turn', 'as soon as it finishes', 'after this turn', 'Cancel this pending switch']) {
-      assert.ok(!badge.includes(words), `小标里不该有：${words}`);
-    }
-    assert.ok(!/<span className="composer-pending-switch" title=/.test(badge), '不要悬停说明');
-  });
-  test('侧栏换引擎 / 运行位置：pending 时不弹"跑完立刻切换"的提示', () => {
-    assert.ok(!S.includes('the switch will happen as soon as it finishes'));
-    assert.equal((S.match(/if \(r\?\.pending\) return;/g) || []).length, 2);
-  });
-  test('中文表里也不再有这几句', () => {
-    for (const zh of ['这一轮跑完后切换', '跑完会立刻切换', '跑完立刻切换', '取消这次待切换']) assert.ok(!Z.includes(zh), zh);
-  });
-});

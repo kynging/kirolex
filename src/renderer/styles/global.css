@@ -1871,6 +1871,18 @@ button, input, select, textarea {
   letter-spacing: .03em;
 }
 .kirolex-message-body { min-width: 0; overflow-wrap: anywhere; white-space: pre-wrap; }
+/* 忙时选的切换：会话里那张「⏳ 这一轮还在跑，跑完后切到 ___（已等 N 秒）」提示卡（ChatArea PendingSwitchCard） */
+.pending-switch-card .kirolex-message-card { border-color: rgba(124, 111, 224, 0.5); }
+.pending-switch-card .kirolex-message-body { display: flex; flex-direction: column; align-items: center; gap: 5px; white-space: normal; }
+.pending-switch-text { color: var(--text-primary); font-size: 12px; }
+.pending-switch-queued { color: var(--text-tertiary); font-size: 10.5px; }
+.pending-switch-actions { display: flex; flex-wrap: wrap; justify-content: center; gap: 6px; }
+.pending-switch-actions button {
+  padding: 3px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: transparent; color: var(--text-secondary); font-size: 11px; cursor: pointer;
+}
+.pending-switch-actions button.pending-switch-stop-now { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 600; }
+.pending-switch-actions button:hover { filter: brightness(1.1); }
 .kirolex-message-time { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; }
 /* 「没连上：缺 ACP 适配器」提示上的「安装」（ChatArea AdapterInstallAction） */
 .adapter-install {
@@ -4281,8 +4293,9 @@ button, input, select, textarea {
   font-size: 11px;
   line-height: 1;
   cursor: pointer;
-  color: inherit;
-  opacity: 0.7;
+  color: var(--accent);
+  text-decoration: underline;
+  opacity: 0.85;
 }
 
 .composer-pending-switch-cancel:hover {

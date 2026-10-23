@@ -42,11 +42,19 @@ export class PendingSwitchBook {
    * 重连要好几秒，这期间退出应用的话，它们既不在 `map` 里、也还没写进记录 —— 不留这份账就会静默丢掉。
    */
   private readonly applying = new Map<string, Map<PendingKind, PendingSwitch>>();
+  /** 这一段等待从什么时候开始（第一次登记）——界面上「已等 N 秒」从这里算 */
+  private readonly started = new Map<string, number>();
+
+  /** 这条会话现在这段等待的开始时刻；没有待切换就是 undefined */
+  sinceOf(sessionId: string): number | undefined {
+    return this.has(sessionId) ? this.started.get(sessionId) : undefined;
+  }
 
   /** 记一次；同类已有的被这一次顶掉（只保留最后一次）。 */
-  set(sessionId: string, sw: PendingSwitch): void {
+  set(sessionId: string, sw: PendingSwitch, now: number = Date.now()): void {
     let m = this.map.get(sessionId);
-    if (!m) { m = new Map(); this.map.set(sessionId, m); }
+    /* 一段等待从第一次登记算起：同一段里再改选不重新计时（「已等 N 秒」） */
+    if (!m) { m = new Map(); this.map.set(sessionId, m); this.started.set(sessionId, now); }
     m.delete(sw.kind);
     m.set(sw.kind, sw);
   }
@@ -272,4 +280,52 @@ export function withEngineOption<P extends EngineOptionFields>(profile: P, engin
 export function shouldQueueSwitch(s: { busy: boolean; applying: boolean; fromPending?: boolean }): boolean {
   if (s.fromPending) return false; // 正在应用 pending 的那一次调用自己，不能再记回去
   return s.busy || s.applying;
+}
+
+/* ─────────────── 等待时说清楚：会话里的提示卡 / 输入框下的徽标（负责人反馈 2026-10-23） ─────────────── */
+
+/** 新值本身就说明了是什么（本机 / Claude Code / agent 名 / 模型 id / 组合）——单独一项时不用再加类别名。 */
+const SELF_DESCRIBING: readonly PendingKind[] = ['remote', 'engine', 'combo', 'agent', 'model', 'engineModel'];
+
+/**
+ * 「跑完后切到 ___」里那几个字。一项：「本机」「Claude Code」「思考强度 high」；
+ * 几项一起：「运行位置 本机、模型 opus」（按依赖顺序，和真正应用的顺序一致）。
+ */
+export function pendingTargetText(
+  pending: Partial<Record<PendingKind, string>>,
+  kindName: (kind: PendingKind) => string,
+  sep: string,
+): string {
+  const kinds = ORDER.filter((k) => pending[k] !== undefined);
+  if (kinds.length === 1 && SELF_DESCRIBING.includes(kinds[0])) return String(pending[kinds[0]]);
+  return kinds.map((k) => `${kindName(k)} ${pending[k]}`).join(sep);
+}
+
+/** 「已等 N 秒」：从插那条提示（= 这一段等待第一次登记）算起，整秒、不为负。 */
+export function waitedSeconds(since: number, now: number): number {
+  return Math.max(0, Math.floor((now - since) / 1000));
+}
+
+/** 会话里那条「⏳ 这一轮还在跑…」提示的分组键（主进程插、渲染端认）。 */
+export const PENDING_SWITCH_NOTE_GROUP = 'pending-switch';
+
+/**
+ * 哪一条提示画成**活的**卡片（秒数在走、带「停止这一轮并立即切换」「取消切换」）：
+ * 还有待切换（`since` = 这段等待的开始时刻）时，属于这段等待的最后那条 pending-switch 提示；
+ * 没有待切换了（已切 / 已取消）就没有 —— 它退回成普通的一句话。
+ * 返回 null 而还有待切换 = 那条提示还没进列表（这一轮正在流式输出时提示先攒着，见 useAcp 的 heldNotesRef）：
+ * 界面把卡片画在列表最底下，跟在正在输出的回复后面，不拆开回复。
+ */
+export function livePendingNoteId(
+  messages: ReadonlyArray<{ id: string; kirolex?: boolean; noteGroup?: string; timestamp?: number }>,
+  since: number | undefined,
+): string | null {
+  if (since === undefined) return null;
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const m = messages[i];
+    if (!(m.kirolex && m.noteGroup === PENDING_SWITCH_NOTE_GROUP)) continue;
+    /* 早于这段等待的那条是上一段等待留下的（已经切完 / 取消了），不算；留几秒余量给两边的时钟和落盘 */
+    return (m.timestamp ?? 0) >= since - 5000 ? m.id : null;
+  }
+  return null;
 }

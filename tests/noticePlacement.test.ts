@@ -57,9 +57,22 @@ describe('状态行提示不进对话记录', () => {
     assert.match(lineOf(M, "tr('⚠️ Refused to open `{target}`"), /^\s*sessionNotice\(sessionId, /);
   });
 
-  test('忙时选的切换：生效了只走状态行；没生效进对话记录', () => {
-    assert.match(lineOf(M, "tr('🔀 The turn finished; applied the switch you picked"), /^\s*sessionNotice\(sessionId, /);
-    assert.match(lineOf(M, "tr('⚠️ The switch you picked did not take effect"), /^\s*noteInSession\(sessionId, /);
+  /*
+    负责人反馈（2026-10-23）「后台让我在等，但会话没有提示」：等待本身要在对话里有一张卡片，
+    所以它的收尾（已切到 / 已取消 / 没切成）也进对话记录，否则卡片看着像一直在等；
+    执行中的过程（正在启动 / 正在交历史 / 这条消息会等切换）只需知道 → 状态行。
+  */
+  test('忙时选的切换：等待卡片和它的收尾进对话记录；执行中的过程走状态行', () => {
+    assert.match(lineOf(M, "tr('⏳ This turn is still running; will switch to {target} once it finishes.'"), /^\s*noteInSession\(sessionId, /);
+    assert.match(lineOf(M, "tr('✅ Switched to {target}.'"), /^\s*: tr\(/);
+    assert.match(M, /const doneText = historyRidesAlong\s*\? tr\('✅ Switched to \{target\}\./);
+    assert.match(M, /noteInSession\(sessionId, doneText, undefined, 'pending-switch-done'\);/);
+    assert.match(lineOf(M, "tr('⚠️ Could not switch: {list}."), /^\s*const failText = tr\(/);
+    assert.match(M, /noteInSession\(sessionId, failText, undefined,/);
+    assert.match(lineOf(M, "tr('Switch cancelled; this session keeps its current setting.')"), /^\s*noteInSession\(sessionId, /);
+    assert.match(M, /if \(startNote\) sessionNotice\(sessionId, startNote\);/);
+    assert.match(lineOf(M, "tr('Handing the conversation history to the new backend…')"), /^\s*sessionNotice\(sessionId, /);
+    assert.match(lineOf(M, "tr('⏳ This message will be sent once the switch finishes.')"), /^\s*sessionNotice\(sessionId, /);
   });
 
   test('换了模型 / 换了后端会话：进对话记录，诊断细节折进详情', () => {

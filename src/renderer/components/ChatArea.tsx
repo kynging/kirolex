@@ -33,6 +33,7 @@ import { isConnectFailureNotice } from '../connectFailure.ts';
 import { adapterInstallOffer } from '../adapterInstallOffer.ts';
 import { adapterInstallStore, startAdapterInstall } from '../adapterInstallState.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
+import { livePendingNoteId, pendingTargetText, waitedSeconds, type PendingKind } from '../../main/pendingSwitch.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 
@@ -1842,19 +1843,63 @@ function stashComposerDraft(sessionId: string | null, text: string) {
 }
 
 /**
- * 「⏳ ✕」—— 这一轮还在跑时选的 agent / 模型 / 权限 / 引擎……主进程先记下来（pending），
- * 跑完立刻切（见 main/pendingSwitch.ts）。✕ = 不切了。`what` 给了就带上"切的是什么 → 新值"（没有自己下拉的那几类用）。
- * **等待时不说"这一轮跑完后切换"之类的话**（用户要求）：下拉里已经是新选择，只留一个 ⏳ 和取消。
+ * 「⏳ 本轮结束后切到 本机 · 取消」—— 这一轮还在跑时选的 agent / 模型 / 权限 / 引擎……主进程先记下来（pending），
+ * 跑完立刻切（见 main/pendingSwitch.ts）。
+ *
+ * 负责人反馈（2026-10-23）「后台让我在等，但会话没有提示」：原来这里只有一个很小的「⏳ ✕」，不写原因 ——
+ * 现在字要看得懂，悬停写全原因；「取消」= 不切了。会话里另有一张提示卡（`PendingSwitchCard`）。
  */
-function PendingSwitchBadge({ what, onCancel }: { what?: string; onCancel?: () => void }) {
+function PendingSwitchBadge({ target, onCancel }: { target: string; onCancel?: () => void }) {
   const t = useT();
   return (
-    <span className="composer-pending-switch">
-      ⏳{what ? ` ${what}` : ''}
+    <span
+      className="composer-pending-switch"
+      title={t('This turn is still running. To avoid interrupting it, KiroLex switches to {target} as soon as it finishes. Click Cancel to stay as you are.', { target })}
+    >
+      {t('⏳ Switches to {target} after this turn', { target })}
       {onCancel && (
-        <button type="button" className="composer-pending-switch-cancel" onClick={onCancel} aria-label={t('Cancel')} title={t('Cancel')}>✕</button>
+        <>
+          {' · '}
+          <button type="button" className="composer-pending-switch-cancel" onClick={onCancel}>{t('Cancel')}</button>
+        </>
       )}
     </span>
+  );
+}
+
+/**
+ * **会话里那张「⏳ 这一轮还在跑，跑完后切到 ___（已等 N 秒）」提示卡** —— 等待秒数每秒走一次；
+ * 「停止这一轮并立即切换」= 按停止（这一轮一结束，记下的切换就应用）；「取消切换」= 不切了。
+ * 有排队消息时说清它们会在切换完成后发出（忙时按 Enter 的插话进的是**这一轮**，不在此列）。
+ */
+function PendingSwitchCard({ since, target, queued, onStopNow, onCancel }: {
+  since: number; target: string; queued: number; onStopNow?: () => void; onCancel?: () => void;
+}) {
+  const t = useT();
+  const [now, setNow] = useState(() => Date.now());
+  useEffect(() => {
+    const h = setInterval(() => setNow(Date.now()), 1000);
+    return () => clearInterval(h);
+  }, []);
+  const waited = waitedSeconds(since, now);
+  return (
+    <div className="kirolex-message pending-switch-card" role="status">
+      <div className="kirolex-message-card">
+        <span className="kirolex-message-label">KiroLex</span>
+        <span className="kirolex-message-body">
+          <span className="pending-switch-text">
+            {t('⏳ This turn is still running; will switch to {target} once it finishes (waited {n}s).', { target, n: waited })}
+          </span>
+          {queued > 0 && (
+            <span className="pending-switch-queued">{t('{n} queued message(s) will be sent once the switch finishes.', { n: queued })}</span>
+          )}
+          <span className="pending-switch-actions">
+            {onStopNow && <button type="button" className="pending-switch-stop-now" onClick={onStopNow}>{t('Stop this turn and switch now')}</button>}
+            {onCancel && <button type="button" className="pending-switch-cancel-all" onClick={onCancel}>{t('Cancel switch')}</button>}
+          </span>
+        </span>
+      </div>
+    </div>
   );
 }
 
@@ -1873,7 +1918,7 @@ const ChatInputBox = memo<{
    */
   engineMode?: { current: string; options: Array<{ value: string; name: string }>; busy: boolean; onChange: (value: string) => void } | null;
   /** 权限（kiro 的 Auto/Ask 或那两家的权限模式）是这一轮跑完再换的：给了就显示「⏳」和 ✕ */
-  permissionPending?: { onCancel: () => void } | null;
+  permissionPending?: { target: string; onCancel: () => void } | null;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteer: (text: string, pastes?: PastedBlock[]) => void;
   /** 能不能追加到正在跑的一轮（`engineCanSteer`，按执行器的能力声明）。不能：忙时 Enter 是排队，文案也说排队 */
@@ -2409,7 +2454,7 @@ const ChatInputBox = memo<{
             )}
           </button>
           )}
-          {permissionPending && <PendingSwitchBadge onCancel={permissionPending.onCancel} />}
+          {permissionPending && <PendingSwitchBadge target={permissionPending.target} onCancel={permissionPending.onCancel} />}
           {/* Deliberately NOT disabled on empty content, only on states the user can
               actually reason about (looping / not connected). A button greyed out
               purely because the composer is empty explains nothing, and it read as
@@ -2939,6 +2984,8 @@ interface ChatAreaProps {
   onKiroAgentChange: (agentName: string) => void;
   /** 这一轮还在跑时选的、跑完再切的那些：`{ agent: 'x', model: 'y', … }`（main/pendingSwitch.ts 的 kind → 新值） */
   pendingSwitch?: Record<string, string>;
+  /** 这段等待从什么时候开始（主进程记的）—— 会话里那张提示卡的「已等 N 秒」 */
+  pendingSwitchSince?: number;
   onCancelPendingSwitch?: (kind?: string) => void;
   onForkMessage: (messageId: string) => void;
   onRerunMessage: (messageId: string, editedText: string) => void;
@@ -3086,6 +3133,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onPermissionModeChange,
   onKiroAgentChange,
   pendingSwitch,
+  pendingSwitchSince,
   onCancelPendingSwitch,
   onForkMessage,
   onRerunMessage,
@@ -4062,6 +4110,42 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return collapseAdjacent(groups, (g) => (g.kind === 'kirolex' ? noticeKey({ group: g.message.noteGroup, text: g.message.content }) : null))
       .map(({ item, count }) => (item.kind === 'kirolex' && count > 1 ? { ...item, count } : item));
   }, [orderedMessages]);
+  /**
+   * 忙时选的切换：会话里那张提示卡（负责人反馈 2026-10-23「后台让我在等，但会话没有提示」）。
+   * 属于这段等待的那条 pending-switch 提示画成活的；它还没进列表就画在最底下（见 `livePendingNoteId`）。
+   */
+  const pendingKindLabel = (kind: PendingKind): string => {
+    switch (kind) {
+      case 'remote': return t('Run location');
+      case 'engine': return t('Engine');
+      case 'combo': return t('Combo');
+      case 'agent': return t('Agent');
+      case 'model': case 'engineModel': return t('Model');
+      case 'engineEffort': return t('Effort');
+      case 'engineMode': case 'permission': return t('Permission mode');
+    }
+  };
+  /** `only` 给了就只说这几类（徽标各管各的）；不给就是这段等待欠着的全部（提示卡） */
+  const pendingTargetForPeople = (pending: Record<string, string>, only?: PendingKind[]): string => {
+    const view: Partial<Record<PendingKind, string>> = {};
+    for (const [k, v] of Object.entries(pending)) {
+      if (only && !only.includes(k as PendingKind)) continue;
+      const combo = k === 'combo' ? mcpCombos?.combos.find((c) => c.id === v) : undefined;
+      view[k as PendingKind] = k === 'combo' && (v === 'default' || combo) ? (v === 'default' ? t('General purpose') : combo!.name) : v;
+    }
+    return pendingTargetText(view, pendingKindLabel, t(', '));
+  };
+  const hasPendingSwitch = !!pendingSwitch && Object.keys(pendingSwitch).length > 0;
+  const livePendingId = useMemo(() => (hasPendingSwitch
+    ? livePendingNoteId(orderedMessages.map((m) => ({ id: m.id, kirolex: m.role === 'user' && isKirolexNote(m), noteGroup: m.noteGroup, timestamp: m.timestamp })), pendingSwitchSince ?? Date.now())
+    : null), [hasPendingSwitch, orderedMessages, pendingSwitchSince]);
+  const pendingCard = hasPendingSwitch ? {
+    since: pendingSwitchSince ?? Date.now(),
+    target: pendingTargetForPeople(pendingSwitch!),
+    queued: queuedMessages.length,
+    onStopNow: onCancel,
+    onCancel: () => onCancelPendingSwitch?.(),
+  } : null;
   /** 切会话回到原位置用的锚点 id。回复组取**第一段**：流式输出只往后追加段，第一段的 id 不会变。 */
   const groupAnchorId = (g: RenderGroup): string =>
     g.kind === 'user' ? g.base.id : g.kind === 'kirolex' ? g.message.id : g.segments[0].id;
@@ -4533,6 +4617,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <div className="chat-clear-line" key={`${currentSessionId ?? 'none'}:${group.base.id}`}>
               <span>{clearNoteText(hiddenGroupCount, findLang)}</span>
             </div>
+          ) : group.kind === 'kirolex' && group.message.id === livePendingId && pendingCard ? (
+            <PendingSwitchCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} {...pendingCard} />
           ) : group.kind === 'kirolex' ? (
             <KirolexMessageItem
               key={`${currentSessionId ?? 'none'}:${group.message.id}`}
@@ -4572,6 +4658,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           ))}
           </div>
         ))}
+
+        {/* 等待提示卡：那条提示还没进列表（这一轮正在流式输出时提示先攒着，插在中间会把回复拆成两段）—— 跟在回复后面画 */}
+        {pendingCard && !livePendingId && <PendingSwitchCard {...pendingCard} />}
 
         {plan.length > 0 && (
           <div className="turn-panels">
@@ -4831,7 +4920,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 permissionMode={(pendingSwitch?.permission as 'auto-approve' | 'ask' | undefined) ?? permissionMode}
                 onPermissionModeChange={onPermissionModeChange}
                 permissionPending={(nonKiro ? pendingSwitch?.engineMode : pendingSwitch?.permission) !== undefined
-                  ? { onCancel: () => onCancelPendingSwitch?.(nonKiro ? 'engineMode' : 'permission') }
+                  ? { target: pendingTargetForPeople(pendingSwitch!, [nonKiro ? 'engineMode' : 'permission']), onCancel: () => onCancelPendingSwitch?.(nonKiro ? 'engineMode' : 'permission') }
                   : null}
                 engineMode={nonKiro ? {
                   current: pendingSwitch?.engineMode ?? (engineModels?.mode?.current || ''),
@@ -4869,13 +4958,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 <div className="composer-belowbar-left">
                   {/* 引擎 / 运行位置 / effort 在这一排没有自己的下拉（在侧栏右键菜单里换）：忙时选了就在这里说一声 */}
                   {pendingSwitch?.engine !== undefined && (
-                    <PendingSwitchBadge what={`${t('Engine')} → ${pendingSwitch.engine}`} onCancel={() => onCancelPendingSwitch?.('engine')} />
+                    <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['engine'])} onCancel={() => onCancelPendingSwitch?.('engine')} />
                   )}
                   {pendingSwitch?.remote !== undefined && (
-                    <PendingSwitchBadge what={`${t('Run location')} → ${pendingSwitch.remote}`} onCancel={() => onCancelPendingSwitch?.('remote')} />
+                    <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['remote'])} onCancel={() => onCancelPendingSwitch?.('remote')} />
                   )}
                   {pendingSwitch?.engineEffort !== undefined && (
-                    <PendingSwitchBadge what={`${t('Effort')} → ${pendingSwitch.engineEffort}`} onCancel={() => onCancelPendingSwitch?.('engineEffort')} />
+                    <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['engineEffort'])} onCancel={() => onCancelPendingSwitch?.('engineEffort')} />
                   )}
 
                   {/* kiro 的 agent 只对 Kiro 会话有意义；Claude Code / Codex 会话在这儿显示引擎名 */}
@@ -4919,7 +5008,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.name })}</option>
                         ))}
                       </select>
-                      {pendingSwitch?.combo !== undefined && <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.('combo')} />}
+                      {pendingSwitch?.combo !== undefined && <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['combo'])} onCancel={() => onCancelPendingSwitch?.('combo')} />}
                     </div>
                   ) : (
                   <div
@@ -4966,7 +5055,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         ))}
                       </select>
                       {switchingAgent && <span className="composer-agent-spinner">⏳</span>}
-                      {pendingSwitch?.agent !== undefined && <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.('agent')} />}
+                      {pendingSwitch?.agent !== undefined && <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['agent'])} onCancel={() => onCancelPendingSwitch?.('agent')} />}
                     </div>
                   )}
 
@@ -5130,7 +5219,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   )}
                   {(switchingModel || engineModelBusy) && <span className="composer-agent-spinner">⏳</span>}
                   {(nonKiro ? pendingSwitch?.engineModel : pendingSwitch?.model) !== undefined && (
-                    <PendingSwitchBadge onCancel={() => onCancelPendingSwitch?.(nonKiro ? 'engineModel' : 'model')} />
+                    <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch!, [nonKiro ? 'engineModel' : 'model'])} onCancel={() => onCancelPendingSwitch?.(nonKiro ? 'engineModel' : 'model')} />
                   )}
                   {/* 切换失败的标记：原因已在状态行说过，这里说「切换失败」、悬停看原因、点一下关掉；之后连上 / 切换成功自动清 */}
                   {engineModelErr && <span className="composer-engine-err"

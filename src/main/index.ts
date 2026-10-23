@@ -119,7 +119,7 @@ import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
 import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
-import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
+import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
 // It fires because the Vite dev server is served without a CSP (a strict CSP would
@@ -4251,7 +4251,8 @@ const pendingSwitchRunner = new PendingSwitchRunner(pendingSwitches, {
   apply: (sessionId, entries) => applyPendingSwitchBatch(sessionId, entries),
 });
 function emitPendingSwitches(sessionId: string): void {
-  mainWindow?.webContents.send('acp:pending-switches', { sessionId, pending: pendingSwitches.view(sessionId) });
+  /* `since`：这段等待的开始时刻 —— 会话里那张卡片的「已等 N 秒」从它算 */
+  mainWindow?.webContents.send('acp:pending-switches', { sessionId, pending: pendingSwitches.view(sessionId), since: pendingSwitches.sinceOf(sessionId) ?? null });
 }
 /**
  * 忙时（一轮在跑，或上一批 pending 正在应用）把这次切换记成 pending，返回 `{ ok: true, pending: true }`；
@@ -4261,10 +4262,45 @@ function queueSwitchWhileBusy(
   sessionId: string, kind: PendingKind, value: any, label: string, fromPending?: boolean,
 ): { ok: true; pending: true } | null {
   if (!shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending })) return null;
+  const firstOfThisWait = !pendingSwitches.has(sessionId);
   pendingSwitches.set(sessionId, { kind, value, label });
   logger.info('pending-switch', `忙时切换先记下 sessionId=${sessionId} ${kind} -> ${label}（这一轮跑完再切）`);
   emitPendingSwitches(sessionId);
+  /*
+    **立刻在会话里说一声在等什么** ——「切换到本地 Claude Code 的时候不知为什么被拒绝或失败？也可能是后台让我在等，
+    但会话没有提示」（实测那一轮又跑了 66 秒，期间只有输入框下方一个很小的 ⏳）。
+    一段等待只插一条：同一段等待里再改选，界面上那张卡片（这条提示的活版本，见 ChatArea）跟着变，不刷屏。
+    这条不进模型历史（noteInSession 那一套）。
+  */
+  if (firstOfThisWait) {
+    noteInSession(sessionId, tr('⏳ This turn is still running; will switch to {target} once it finishes.', { target: pendingTargetForPeople(sessionId) }),
+      undefined, PENDING_SWITCH_NOTE_GROUP);
+  }
   return { ok: true, pending: true };
+}
+/** 每一类切换在提示里怎么称呼 */
+function pendingKindName(kind: PendingKind): string {
+  switch (kind) {
+    case 'remote': return tr('Run location');
+    case 'engine': return tr('Engine');
+    case 'combo': return tr('Combo');
+    case 'agent': return tr('Agent');
+    case 'model': case 'engineModel': return tr('Model');
+    case 'engineEffort': return tr('Effort');
+    case 'engineMode': case 'permission': return tr('Permission mode');
+  }
+}
+/** 组合在 pending 里记的是 id（下拉按 id 对）：说给人看时换成当前语言的显示名 */
+function pendingLabelForPeople(kind: PendingKind, label: string): string {
+  if (kind !== 'combo') return label;
+  const c = findCombo(readMcpCombos(os.homedir()).combos, label);
+  return c ? comboDisplayName(c) : label;
+}
+/** 「跑完后切到 ___」：这条会话现在欠着的那几项 */
+function pendingTargetForPeople(sessionId: string, only?: PendingSwitch[]): string {
+  const view: Partial<Record<PendingKind, string>> = {};
+  for (const sw of only || pendingSwitches.list(sessionId)) view[sw.kind] = pendingLabelForPeople(sw.kind, sw.label);
+  return pendingTargetText(view, pendingKindName, tr(', '));
 }
 /** 消化欠下的执行器重置。必须在这一轮的回复落盘之后调：detachExecutor 会立刻把 entry 拿掉。 */
 function consumePendingProjectReset(sessionId: string, why: string): void {
@@ -7793,6 +7829,10 @@ app.whenReady().then(async () => {
       **忙时记下的切换先应用，再发这一条** —— 新消息要用新的 agent / 模型；不先切的话一轮接一轮
       （排队消息、定时任务）会一直抢在前面，切换永远排不上。自动重发（attempt > 0）是同一轮，不切。
     */
+    /* 有切换欠着 / 正在切（这一轮刚结束）：这条要等它 —— 说一声，别让人以为消息卡住了 */
+    if (attempt === 0 && !sessionClients.get(sessionId)?.busy && (pendingSwitches.has(sessionId) || pendingSwitchRunner.isApplying(sessionId))) {
+      sessionNotice(sessionId, tr('⏳ This message will be sent once the switch finishes.'));
+    }
     if (attempt === 0) await pendingSwitchRunner.settle(sessionId);
     /* 开过几轮（纠正那一轮不算）—— 排着的「写成文字」纠正据此判过时，见 `textToolNudgeStale` */
     if (attempt === 0 && !isTextToolNudgeId(display?.messageId)) turnStarts.set(sessionId, (turnStarts.get(sessionId) || 0) + 1);
@@ -7986,6 +8026,15 @@ app.whenReady().then(async () => {
       if (!entry.busy) throw new HandoffRefused('idle');
       /* 占着 busy 的不是一轮普通对话（没有人会来交棒）、或者适配器没声明 promptQueueing：退回 KiroLex 队列 */
       if (!entry.turnRunning || !entry.client.supportsPromptQueueing) throw new HandoffRefused('unsupported');
+      /*
+        **有切换欠着（忙时选的 agent / 模型 / 运行位置……）就别交给适配器** —— 交过去它会在**旧执行器、旧设置**上
+        紧接着这一轮跑，抢在切换前面；会话里那张提示卡还说「排队的消息会在切换完成后发出」。
+        退回 KiroLex 队列（和没声明 promptQueueing 同一条退路）：这一轮结束 → 切换 → 再发。没有切换欠着时照旧交给适配器。
+      */
+      if (pendingSwitches.has(sessionId) || pendingSwitchRunner.isApplying(sessionId)) {
+        logger.info('pending-switch', `有切换欠着，这条不交给适配器排、退回 KiroLex 队列（切换完再发）sessionId=${sessionId}`);
+        throw new HandoffRefused('unsupported');
+      }
     }
     if (entry.busy && entry.wedgedAt && Date.now() - entry.wedgedAt < 30000) {
       const waitUntil = Date.now() + 20000;
@@ -10712,7 +10761,7 @@ app.whenReady().then(async () => {
       现在不打断也不拒绝 —— 那一轮跑完立刻切过去。
     */
     {
-      const where = target ? (labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost || remoteId || '') : tr('the local machine');
+      const where = target ? (labelForHost(KIROLEX_CONFIG_PATH, target.sshHost) || target.sshHost || remoteId || '') : tr('This computer');
       const queued = queueSwitchWhileBusy(sessionId, 'remote', { remoteId: remoteId || null, localDir, hint }, localDir ? `${where} · ${localDir}` : where);
       if (queued) return queued;
     }
@@ -11300,17 +11349,6 @@ app.whenReady().then(async () => {
    * 跟着那次重连一起生效（例如 换 agent + 换模型 = 一次 `--agent X --model Y`）。
    * 会话这时候没连着（休眠 / 断开）：各条路本来就会只写记录，下次挂起时按记录起。
    */
-  const pendingKindName = (kind: PendingKind): string => {
-    switch (kind) {
-      case 'remote': return tr('Run location');
-      case 'engine': return tr('Engine');
-      case 'combo': return tr('Combo');
-      case 'agent': return tr('Agent');
-      case 'model': case 'engineModel': return tr('Model');
-      case 'engineEffort': return tr('Effort');
-      case 'engineMode': case 'permission': return tr('Permission mode');
-    }
-  };
   /** 把比 head 弱的几类先写进 profile（跟着这次重连一起生效）；最终引擎上没意义的字段不带。 */
   const carryIntoProfile = (p: AgentProfile, head: PendingSwitch, carry: PendingSwitch[]): AgentProfile => {
     const engineSw = head.kind === 'engine' ? head : carry.find((c) => c.kind === 'engine');
@@ -11339,6 +11377,37 @@ app.whenReady().then(async () => {
       default: return switchModelImpl(sessionId, v.model, true);
     }
   };
+  /** 「正在启动本机 Claude Code 适配器…」—— 这一批要换执行器时的第一句；只有即时项（权限等）时没有这一步。 */
+  const startingNoteFor = (sessionId: string, entries: PendingSwitch[]): string | null => {
+    const recon = entries.filter((e) => isReconnectKind(e.kind));
+    if (!recon.length) return null;
+    const p = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile;
+    const remoteSw = entries.find((e) => e.kind === 'remote');
+    const engineSw = entries.find((e) => e.kind === 'engine');
+    if (!remoteSw && !engineSw) return tr('Restarting the executor for {target}…', { target: pendingTargetForPeople(sessionId, recon) });
+    const engine = engineSw ? engineOf({ engine: engineSw.value?.engine }) : engineOf(p);
+    const engineName = engine === 'kiro' ? ENGINE_LABEL[engine] : tr('{engine} adapter', { engine: ENGINE_LABEL[engine] });
+    const local = remoteSw ? !remoteSw.value?.remoteId : !p?.remote?.sshHost;
+    if (local) return tr('Starting {engine} on this computer…', { engine: engineName });
+    const host = remoteSw ? remoteSw.label.split(' · ')[0] : (labelForHost(KIROLEX_CONFIG_PATH, p!.remote!.sshHost) || p!.remote!.sshHost);
+    return tr('Starting {engine} on {host}…', { engine: engineName, host: String(host) });
+  };
+  /** 失败时说"还在原来的 ___ 上"：这一类现在实际的值 */
+  const currentValueForPeople = (kind: PendingKind, p: AgentProfile | undefined): string => {
+    if (!p) return tr('its current setting');
+    const engine = engineOf(p);
+    switch (kind) {
+      case 'remote': return p.remote?.sshHost ? String(labelForHost(KIROLEX_CONFIG_PATH, p.remote.sshHost) || p.remote.sshHost) : tr('This computer');
+      case 'engine': return ENGINE_LABEL[engine];
+      case 'agent': return p.kiroAgent || 'kiro_default';
+      case 'model': return p.model;
+      case 'combo': return comboDisplayName(pickCombo(readMcpCombos(os.homedir()).combos, p.mcpCombo));
+      case 'permission': return p.permissionMode || 'auto-approve';
+      case 'engineModel': return (engine !== 'kiro' && p.engineModels?.[engine]) || tr('its current setting');
+      case 'engineEffort': return (engine !== 'kiro' && p.engineOptions?.[engine]?.thought_level) || tr('its current setting');
+      case 'engineMode': return (engine !== 'kiro' && p.engineOptions?.[engine]?.mode) || tr('its current setting');
+    }
+  };
   applyPendingSwitchBatch = async (sessionId: string, entries: PendingSwitch[]) => {
     if (!entries.length) return;
     /* 删掉的会话不再动它（否则写记录会把目录复活） */
@@ -11346,6 +11415,12 @@ app.whenReady().then(async () => {
     /* 用户刚点的一次立即切换可能还没落定 —— 等它，别撞上「另一个切换还没完成」 */
     try { await awaitReconfigureIdle(sessionId); } catch { /* 等不到就照试，失败会报出来 */ }
     logger.info('pending-switch', `本轮结束，应用忙时记下的切换 sessionId=${sessionId} ${entries.map((e) => `${e.kind}->${e.label}`).join(', ')}`);
+    /*
+      **切换真正执行时的几个阶段也要看得见**：「正在启动本机 Claude Code…」→「正在把对话历史交给新后端…」→「✅ 已切到本机」。
+      实测那次从这一轮结束到能发下一条之间有 8 秒，会话里一句话都没有。只换权限这类即时项没有"启动"这一步，直接说结果。
+    */
+    const startNote = startingNoteFor(sessionId, entries);
+    if (startNote) sessionNotice(sessionId, startNote); // 过程：状态行（一句接一句地换），结果才进对话记录
     let engineChangedBy: string | undefined;
     const report = await runPendingSwitches(entries, {
       /*
@@ -11389,27 +11464,49 @@ app.whenReady().then(async () => {
     });
     /* 只有重连、没有即时项时也等配置恢复落定：settle 等的是这一整批，下一条消息不能抢在恢复前面发 */
     try { await sessionClients.get(sessionId)?.engineOptionsReady; } catch { /* 已在 applyEngineModel 里记日志 */ }
+    /*
+      换了执行器 = 新后端是空的：对话历史要交过去。逐段重放（primeMode full）在这里等它做完，失败要说出来；
+      快照模式（默认）随下一条消息带过去 —— ✅ 那句里说清。
+    */
+    let historyRidesAlong = false;
+    if (report.reconnects > 0 && sessionClients.get(sessionId)) {
+      const fresh = sessionClients.get(sessionId)!;
+      if (fresh.priming || fresh.needsHistoryPrime || fresh.primePromise) {
+        /* 只在这一刻真的在交接时说（逐段重放）；快照模式这一刻什么都没发生，说了反而挂在状态行上误导 */
+        sessionNotice(sessionId, tr('Handing the conversation history to the new backend…'));
+        const primed = await primeHistoryNow(sessionId).catch((err: any) => ({ ok: false, error: String(err?.message || err) } as any));
+        if (!primed.ok && !primed.skipped) {
+          noteInSession(sessionId, tr('⚠️ The switch is done, but handing the conversation history to the new backend did not finish ({why}). The next message will retry it.', { why: primed.error || tr('unknown reason') }),
+            undefined, 'pending-switch-history-failed');
+        }
+      } else historyRidesAlong = true;
+    }
     /* 引擎是跟着换机器那次一起换的：界面上的引擎徽标要跟着变（单独换引擎那条路自己会发） */
     if (engineChangedBy) mainWindow?.webContents.send('session:engine-changed', { sessionId, engine: engineOf({ engine: engineChangedBy }) });
-    /* 组合记的是 id（见 switchMcpComboImpl）：说给人看时换成当前语言的显示名 */
-    const shown = (kind: PendingKind, label: string): string => {
-      if (kind !== 'combo') return label;
-      const c = findCombo(readMcpCombos(os.homedir()).combos, label);
-      return c ? comboDisplayName(c) : label;
-    };
-    const describe = (kinds: PendingKind[]) => entries.filter((e) => kinds.includes(e.kind))
-      .map((e) => `${pendingKindName(e.kind)} → ${shown(e.kind, e.label)}`).join(tr(', '));
-    if (report.applied.length) {
-      sessionNotice(sessionId, tr('🔀 The turn finished; applied the switch you picked: {list}', { list: describe(report.applied) }));
+    const p = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile;
+    const appliedEntries = entries.filter((e) => report.applied.includes(e.kind));
+    if (appliedEntries.length) {
+      const target = pendingTargetForPeople(sessionId, appliedEntries);
+      const doneText = historyRidesAlong
+        ? tr('✅ Switched to {target}. The conversation history goes along with your next message.', { target })
+        : tr('✅ Switched to {target}.', { target });
+      noteInSession(sessionId, doneText, undefined, 'pending-switch-done');
+      /* 状态行最后一句换成结果：把「正在启动…」顶掉，别让过程那句在切完之后还挂着 */
+      if (!report.failed.length) sessionNotice(sessionId, doneText);
     }
     if (report.failed.length) {
-      const list = report.failed.map((f) => `${pendingKindName(f.kind)} → ${shown(f.kind, f.label)}（${f.error}）`).join(tr(', '));
-      /* 没生效 = 影响结果 → 进对话记录；生效了只是告知 → 上面那句留在状态行 */
-      noteInSession(sessionId, tr('⚠️ The switch you picked did not take effect: {list}. The current setting is kept.', { list }), undefined,
+      /*
+        **哪一步、为什么、现在还能不能用** —— 不只写日志。失败的那几类没动（各条路失败时都保留 / 恢复原来的执行器），
+        所以说清"还在原来的 ___ 上，可以继续用"。
+      */
+      const list = report.failed.map((f) => `${pendingKindName(f.kind)} → ${pendingLabelForPeople(f.kind, f.label)}（${f.error}）`).join(tr(', '));
+      const current = report.failed.map((f) => `${pendingKindName(f.kind)} ${currentValueForPeople(f.kind, p)}`).join(tr(', '));
+      const failText = tr('⚠️ Could not switch: {list}. This session stays on {current}, and you can keep using it.', { list, current });
+      noteInSession(sessionId, failText, undefined,
         `pending-switch-failed:${report.failed.map((f) => `${f.kind}→${f.label}`).join(',')}`);
+      sessionNotice(sessionId, failText); // 状态行同样以结果收尾（失败优先）
       logger.warn('pending-switch', `应用失败 sessionId=${sessionId} ${list}`);
     }
-    const p = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile;
     mainWindow?.webContents.send('acp:pending-switch-result', {
       sessionId,
       applied: report.applied,
@@ -11420,6 +11517,7 @@ app.whenReady().then(async () => {
         engine: engineOf(p), mcpCombo: p.mcpCombo || BUILTIN_COMBO_ID,
       } : null,
       pending: pendingSwitches.view(sessionId),
+      since: pendingSwitches.sinceOf(sessionId) ?? null,
     });
     if (report.applied.includes('combo')) mainWindow?.webContents.send('acp:mcp-combos-changed');
   };
@@ -11429,10 +11527,20 @@ app.whenReady().then(async () => {
     for (const id of pendingSwitches.sessions()) all[id] = pendingSwitches.view(id);
     return all;
   });
+  /** 窗口重载后补拿「这段等待从什么时候开始」（卡片的计时接着走，不从 0 重来） */
+  ipcMain.handle('acp:get-pending-switch-since', () => {
+    const all: Record<string, number> = {};
+    for (const id of pendingSwitches.sessions()) { const t = pendingSwitches.sinceOf(id); if (t !== undefined) all[id] = t; }
+    return all;
+  });
   ipcMain.handle('acp:cancel-pending-switch', (_event, sessionId: string, kind?: PendingKind) => {
     const cancelled = pendingSwitches.cancel(sessionId, kind);
     if (cancelled) logger.info('pending-switch', `取消 sessionId=${sessionId} ${kind || '(全部)'}`);
     emitPendingSwitches(sessionId);
+    /* 这一段等待整个取消了：卡片退回成普通提示，下面接一句结果 */
+    if (cancelled && !pendingSwitches.has(sessionId)) {
+      noteInSession(sessionId, tr('Switch cancelled; this session keeps its current setting.'), undefined, 'pending-switch-cancelled');
+    }
     return { ok: true, cancelled, pending: pendingSwitches.view(sessionId) };
   });
   /**

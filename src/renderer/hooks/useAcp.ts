@@ -5116,14 +5116,24 @@ ${text}`,
    * 内存态在主进程，窗口重载后从 `getPendingSwitches` 补。
    */
   const [pendingSwitches, setPendingSwitches] = useState<Record<string, Record<string, string>>>({});
+  /** 每条会话这段等待从什么时候开始（主进程记的）—— 会话里那张卡片的「已等 N 秒」 */
+  const [pendingSwitchSince, setPendingSwitchSince] = useState<Record<string, number>>({});
   useEffect(() => {
     const api = window.kiroApi as any;
     void api?.getPendingSwitches?.().then((all: any) => { if (all && typeof all === 'object') setPendingSwitches(all); }).catch(() => {});
-    const offPending = api?.onPendingSwitches?.((d: { sessionId: string; pending: Record<string, string> }) => {
-      setPendingSwitches((prev) => ({ ...prev, [d.sessionId]: d.pending || {} }));
+    void api?.getPendingSwitchSince?.().then((all: any) => { if (all && typeof all === 'object') setPendingSwitchSince(all); }).catch(() => {});
+    const noteSince = (sid: string, since: number | null | undefined) => setPendingSwitchSince((prev) => {
+      if (typeof since === 'number') return prev[sid] === since ? prev : { ...prev, [sid]: since };
+      if (!(sid in prev)) return prev;
+      const next = { ...prev }; delete next[sid]; return next;
     });
-    const offResult = api?.onPendingSwitchResult?.((d: { sessionId: string; profile: any; pending: Record<string, string> }) => {
+    const offPending = api?.onPendingSwitches?.((d: { sessionId: string; pending: Record<string, string>; since?: number | null }) => {
       setPendingSwitches((prev) => ({ ...prev, [d.sessionId]: d.pending || {} }));
+      noteSince(d.sessionId, d.since);
+    });
+    const offResult = api?.onPendingSwitchResult?.((d: { sessionId: string; profile: any; pending: Record<string, string>; since?: number | null }) => {
+      setPendingSwitches((prev) => ({ ...prev, [d.sessionId]: d.pending || {} }));
+      noteSince(d.sessionId, d.since);
       const prof = d.profile;
       if (!prof) return;
       /* 实际生效的值回填（失败的那几类就是原来的值，界面跟着回退） */
@@ -5552,6 +5562,7 @@ ${text}`,
     status,
     errorBySession,
     pendingSwitches,
+    pendingSwitchSince,
     cancelPendingSwitch,
     /** Dismiss ONE chat's banner. Takes the id because the banner is per chat now. */
     clearSessionError: (sid?: string | null) => noteError(sid ?? null, null),

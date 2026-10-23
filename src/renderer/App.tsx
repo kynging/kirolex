@@ -207,9 +207,10 @@ declare global {
       switchModel: (sessionId: string, model: string) => Promise<{ ok: boolean; model: string; dormant?: boolean; pending?: boolean }>;
       switchPermissionMode: (sessionId: string, permissionMode: 'auto-approve' | 'ask') => Promise<{ ok: boolean; permissionMode: 'auto-approve' | 'ask'; dormant?: boolean; pending?: boolean }>;
       getPendingSwitches?: (sessionId?: string) => Promise<Record<string, Record<string, string>>>;
+      getPendingSwitchSince?: () => Promise<Record<string, number>>;
       cancelPendingSwitch?: (sessionId: string, kind?: string) => Promise<{ ok: boolean; cancelled: boolean; pending: Record<string, string> }>;
-      onPendingSwitches?: (cb: (d: { sessionId: string; pending: Record<string, string> }) => void) => () => void;
-      onPendingSwitchResult?: (cb: (d: { sessionId: string; applied: string[]; failed: Array<{ kind: string; label: string; error: string }>; profile: any; pending: Record<string, string> }) => void) => () => void;
+      onPendingSwitches?: (cb: (d: { sessionId: string; pending: Record<string, string>; since?: number | null }) => void) => () => void;
+      onPendingSwitchResult?: (cb: (d: { sessionId: string; applied: string[]; failed: Array<{ kind: string; label: string; error: string }>; profile: any; pending: Record<string, string>; since?: number | null }) => void) => () => void;
       deleteSession: (sessionId: string) => Promise<{ ok: boolean; tombstoned?: boolean; error?: string }>;
       assignProject: (sessionId: string, projectId: string) => Promise<{ sessionId: string; projectId: string }>;
       setProject: (sessionId: string, projectId: string | null) => Promise<{ sessionId: string; projectId: string | null }>;
@@ -955,6 +956,7 @@ const App: React.FC = () => {
     changeSessionAgent,
     changeSessionPermissionMode,
     pendingSwitches,
+    pendingSwitchSince,
     cancelPendingSwitch,
     assignProject,
     moveSession,
@@ -4142,6 +4144,7 @@ const App: React.FC = () => {
         onPermissionModeChange={(mode) => { void handlePermissionModeChange(mode, sid || undefined); }}
         /* 忙时选的、这一轮跑完再切的那些（agent / 模型 / 权限 / 引擎 / 组合 / 运行位置） */
         pendingSwitch={sid ? pendingSwitches[sid] : undefined}
+        pendingSwitchSince={sid ? pendingSwitchSince[sid] : undefined}
         onCancelPendingSwitch={(kind) => { if (sid) void cancelPendingSwitch(sid, kind); }}
         /* 这条会话当前还在跑的子代理 —— 侧栏那个 `🤖 N` 用的是同一份数据，只是它只有 tooltip。
            会话里原来只能看到子代理**说过的话**，看不到"现在有几个在跑、各自卡在哪"。 */
