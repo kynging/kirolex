@@ -28,10 +28,22 @@ const NODE = `"${process.execPath}"`;
 /** 一条跑 node 脚本的 shell 命令（脚本里只用单引号）。 */
 const nodeCmd = (js: string) => `${NODE} -e "${js}"`;
 
-async function waitFor(cond: () => boolean, what: string, timeoutMs = 15000): Promise<void> {
+/*
+ * 真起进程的等待上限按看板那台 Windows 机实测给足：那里 `node -e 0` 2–8 s、作业对象辅助进程
+ * （PowerShell + Add-Type）冷启动 8 s 起、忙时 15 s+，原来 15 s 的固定上限时好时坏。
+ * 这些只是「等多久算真卡住」，不是被测行为；被测的超时（1500 / 8000 / 12_000 那些）不跟着改。
+ */
+const SLOW_SPAWN_MS = 120_000;
+/** 不是在测超时的任务：任务自己的 timeoutMs 也给足，别让慢启动把「正常退出」变成「超时」。 */
+const LONG_JOB_MS = 300_000;
+
+/** `detail`：超时时一并打印的现场（例如任务当时的状态），好看出卡在哪一步。 */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = SLOW_SPAWN_MS, detail?: () => unknown): Promise<void> {
   const start = Date.now();
   while (!cond()) {
-    if (Date.now() - start > timeoutMs) assert.fail(`等不到：${what}`);
+    if (Date.now() - start > timeoutMs) {
+      assert.fail(`等不到：${what}（等了 ${Date.now() - start} ms，上限 ${timeoutMs} ms）${detail ? `；当时：${JSON.stringify(detail())}` : ''}`);
+    }
     await new Promise((r) => setTimeout(r, 10));
   }
 }
@@ -61,7 +73,7 @@ const cwd = os.tmpdir();
 
 /** 一个放到后台、把自己 pid 写进文件、然后一直活着的 node（模拟 `nohup x &`）。 */
 const bgChild = (pidFile: string, redirect: boolean) => {
-  const js = "require('fs').writeFileSync(process.argv[1],String(process.pid));setTimeout(()=>{},60000)";
+  const js = "require('fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)";
   const node = `${NODE} -e "${js}" "${pidFile}"`;
   /* 命令本身等到后台那个写下 pid 才退：结束时的清理很快，不等的话它还没来得及写 pid 就被收掉了，测试就看不到它 */
   const waitPid = `${NODE} -e "const t=setInterval(()=>{if(require('fs').existsSync(process.argv[1]))clearInterval(t)},50)" "${pidFile}"`;
@@ -85,11 +97,11 @@ describe('bg_run', () => {
   test('立即返回 jobId；退出时唤醒，带退出码和输出', async () => {
     const h = harness();
     const t0 = Date.now();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("setTimeout(()=>{console.log('done');process.exit(3)},300)"), label: '等一下', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("setTimeout(()=>{console.log('done');process.exit(3)},300)"), label: '等一下', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok, JSON.stringify(r));
     assert.ok(Date.now() - t0 < 1000, 'start 必须立即返回');
     assert.equal(h.m.list('s1')[0].state, 'running');
-    await waitFor(() => h.wakes.length === 1, '退出唤醒');
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
     assert.match(h.wakes[0].text, /等一下/);
     assert.match(h.wakes[0].text, /3/);
     assert.match(h.wakes[0].text, /done/);
@@ -100,9 +112,9 @@ describe('bg_run', () => {
 
   test('输出末尾截到 4KB，保留的是**最后**那段', async () => {
     const h = harness();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("process.stdout.write('A'.repeat(20000)+'TAILEND')"), label: '大输出', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("process.stdout.write('A'.repeat(20000)+'TAILEND')"), label: '大输出', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
-    await waitFor(() => h.wakes.length === 1, '退出唤醒');
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
     assert.match(h.wakes[0].text, /TAILEND/);
     const as = (h.wakes[0].text.match(/A/g) || []).length;
     assert.ok(as <= BG_TAIL_BYTES, `A 有 ${as} 个，超过 4KB`);
@@ -120,7 +132,7 @@ describe('bg_run', () => {
 
   test('用户停止：进程被结束，会话里说一声，不再唤醒模型', async () => {
     const h = harness();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: '长跑', cwd, timeoutMs: 60_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: '长跑', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = r.job.pid!;
     assert.ok(pid > 0);
@@ -136,7 +148,7 @@ describe('bg_run', () => {
 
   test('只能看 / 停自己会话的任务', async () => {
     const h = harness();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: 'x', cwd, timeoutMs: 60_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: 'x', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     assert.equal(h.m.status('s2', r.job.jobId), null);
     const s = await h.m.stop(r.job.jobId, 'model', 's2');
@@ -147,45 +159,45 @@ describe('bg_run', () => {
   test('上限：单会话同时最多 10 个，超出返回错误；别的会话不受影响', async () => {
     const h = harness();
     for (let i = 0; i < MAX_JOBS_PER_SESSION; i += 1) {
-      assert.ok(h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: `j${i}`, cwd, timeoutMs: 60_000 }).ok);
+      assert.ok(h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: `j${i}`, cwd, timeoutMs: LONG_JOB_MS }).ok);
     }
-    const over = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd('setInterval(()=>{},1000)'), label: 'over', cwd, timeoutMs: 60_000 });
+    const over = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd('setInterval(()=>{},1000)'), label: 'over', cwd, timeoutMs: LONG_JOB_MS });
     assert.equal(over.ok, false);
     assert.match((over as any).error, /10/);
-    assert.ok(h.m.start({ sessionId: 's2', kind: 'run', command: nodeCmd('1'), label: 'other', cwd, timeoutMs: 60_000 }).ok);
+    assert.ok(h.m.start({ sessionId: 's2', kind: 'run', command: nodeCmd('1'), label: 'other', cwd, timeoutMs: LONG_JOB_MS }).ok);
   });
 
   test('命令自己退了、但它放到后台的进程还占着管道（nohup x &）：照样按退出唤醒，而且那个子进程被清掉、不在任务结束后继续跑', async () => {
     const h = harness();
     const pidFile = pidFileFor();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: bgChild(pidFile, false), label: '放后台', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: bgChild(pidFile, false), label: '放后台', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
-    await waitFor(() => h.wakes.length === 1, '退出唤醒', 12000);
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
     assert.match(h.wakes[0].text, /parent-done/);
-    await waitFor(() => !alive(pid), '任务结束时它留下的子进程也被结束', 10000);
+    await waitFor(() => !alive(pid), '任务结束时它留下的子进程也被结束');
   });
 
   test('放到后台、输出重定向走了（不占管道）的子进程：任务结束时同样清掉', async () => {
     const h = harness();
     const pidFile = pidFileFor();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: bgChild(pidFile, true), label: '放后台2', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: bgChild(pidFile, true), label: '放后台2', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
-    await waitFor(() => h.wakes.length === 1, '退出唤醒', 12000);
-    await waitFor(() => !alive(pid), '子进程被结束', 10000);
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
+    await waitFor(() => !alive(pid), '子进程被结束');
   });
 
   test('退出 KiroLex（stopAllSync）时：命令已退、子进程还占着管道的那种也清掉', async () => {
     const h = harness();
     const pidFile = pidFileFor();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: bgChild(pidFile, false), label: '放后台3', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: bgChild(pidFile, false), label: '放后台3', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
     const job = (h.m as any).jobs.get(r.job.jobId);
     await waitFor(() => job.child.exitCode !== null, 'shell 已经退了');
     h.m.stopAllSync();
-    await waitFor(() => !alive(pid), '退出时子进程被结束', 10000);
+    await waitFor(() => !alive(pid), '退出时子进程被结束');
   });
 
   test('工作目录不存在：直接报错，不起进程', () => {
@@ -197,9 +209,9 @@ describe('bg_run', () => {
   test('日志只记 jobId、命令前 80 字和退出码 —— 不记输出', async () => {
     const h = harness();
     const long = nodeCmd(`console.log('SECRET_'+'TOKEN_123');/*${'x'.repeat(200)}*/`);
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: long, label: 'x', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: long, label: 'x', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
-    await waitFor(() => h.wakes.length === 1, '退出');
+    await waitFor(() => h.wakes.length === 1, '退出', undefined, () => h.m.status('s1', r.job.jobId));
     assert.ok(h.wakes[0].text.includes('SECRET_TOKEN_123'), '输出原样回到会话');
     for (const line of h.logs) {
       assert.ok(!line.includes('SECRET_TOKEN_123'), `日志里出现了输出：${line}`);
@@ -212,7 +224,7 @@ describe('bg_run', () => {
 describe('watch：结束 / 超时那一刻的最后一批输出恰好触发限流', () => {
   test('命令退出时：只通知一次（限流那条），状态保留 rate-limited，不再补一条「已结束」', async () => {
     const h = harness({ coalesceMs: 10_000, rateLimit: { events: 0, windowMs: 60_000 } });
-    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd("console.log('last')"), label: '退出时限流', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd("console.log('last')"), label: '退出时限流', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => h.m.status('s1', r.job.jobId)?.state !== 'running', '结束');
     await new Promise((res) => setTimeout(res, 2500));   // 留出 close / 管道排空那条路
@@ -229,7 +241,7 @@ describe('watch：结束 / 超时那一刻的最后一批输出恰好触发限�
     const job = (h.m as any).jobs.get(r.job.jobId);
     await waitFor(() => job.pendingLines.length > 0, '那一行已经攒着、还没发', 11_000);
     assert.equal(h.m.status('s1', r.job.jobId)?.state, 'running');
-    await waitFor(() => h.m.status('s1', r.job.jobId)?.state !== 'running', '超时结束', 20_000);
+    await waitFor(() => h.m.status('s1', r.job.jobId)?.state !== 'running', '超时结束');
     await new Promise((res) => setTimeout(res, 2500));
     assert.equal(h.m.status('s1', r.job.jobId)?.state, 'rate-limited');
     assert.equal(h.wakes.length, 1, h.wakes.map((w) => w.text).join('\n---\n'));
@@ -240,7 +252,7 @@ describe('watch：一直输出但不换行', () => {
   test('半行到上限就截成一个事件（每个事件不超过 4KB 多一点），照样走限流、内存不无限涨', async () => {
     const h = harness({ coalesceMs: 5, rateLimit: { events: 3, windowMs: 60_000 } });
     const js = "const s='x'.repeat(65536);setInterval(()=>process.stdout.write(s),20)";
-    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '不换行', cwd, timeoutMs: 60_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '不换行', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => h.m.status('s1', r.job.jobId)?.state === 'rate-limited', '不换行的刷屏也被限流停掉');
     const events = h.wakes.filter((w) => /x{100}/.test(w.text));
@@ -256,7 +268,7 @@ describe('watch', () => {
   test('每行 stdout 一个事件：间隔打印 3 行 → 3 次唤醒，退出再说一声', async () => {
     const h = harness({ coalesceMs: 20 });
     const js = "let i=0;const t=setInterval(()=>{console.log('line'+(++i));if(i===3){clearInterval(t)}},150)";
-    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '三行', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '三行', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => h.wakes.length === 4, '3 次事件 + 结束');
     assert.match(h.wakes[0].text, /line1/);
@@ -268,7 +280,7 @@ describe('watch', () => {
 
   test('200ms 内的几行合并成一条', async () => {
     const h = harness();
-    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd("console.log('a1');console.log('a2');console.log('a3');setTimeout(()=>{},400)"), label: '一起', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd("console.log('a1');console.log('a2');console.log('a3');setTimeout(()=>{},400)"), label: '一起', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => h.wakes.length === 2, '一条事件 + 结束');
     assert.match(h.wakes[0].text, /a1[\s\S]*a2[\s\S]*a3/);
@@ -276,7 +288,7 @@ describe('watch', () => {
 
   test('刷屏：超过限流（窗口内事件数）就停掉，并在会话里说明原因', async () => {
     const h = harness({ coalesceMs: 5, rateLimit: { events: 5, windowMs: 60_000 } });
-    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd("setInterval(()=>console.log('spam'),30)"), label: '刷屏', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd("setInterval(()=>console.log('spam'),30)"), label: '刷屏', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => h.m.status('s1', r.job.jobId)?.state === 'rate-limited', '被限流');
     await waitFor(() => h.wakes.some((w) => /限流|too many|rate/i.test(w.text)), '说明原因');
@@ -321,13 +333,13 @@ describe('进程归属只靠进程组 / 作业对象：不按 pid / ppid / 出�
     const bystander = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
     try {
       const h = harness();
-      const a = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("console.log('x')"), label: 'a', cwd, timeoutMs: 30_000 });
-      const b = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: 'b', cwd, timeoutMs: 60_000 });
+      const a = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("console.log('x')"), label: 'a', cwd, timeoutMs: LONG_JOB_MS });
+      const b = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: 'b', cwd, timeoutMs: LONG_JOB_MS });
       const c = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setInterval(()=>{},1000)'), label: 'c', cwd, timeoutMs: 1500 });
       assert.ok(a.ok && b.ok && c.ok);
-      await waitFor(() => h.m.status('s1', a.job.jobId)?.state === 'exited', 'a 结束', 30_000);
+      await waitFor(() => h.m.status('s1', a.job.jobId)?.state === 'exited', 'a 结束');
       await h.m.stop(b.job.jobId, 'user');
-      await waitFor(() => h.m.status('s1', c.job.jobId)?.state === 'timeout', 'c 超时', 30_000);
+      await waitFor(() => h.m.status('s1', c.job.jobId)?.state === 'timeout', 'c 超时');
       h.m.stopAllSync();
       await new Promise((r) => setTimeout(r, 1500));
       assert.ok(bystander.exitCode === null && alive(bystander.pid!), '无关进程被误杀了');
@@ -347,21 +359,21 @@ describe('放到后台的子进程：停止 / 超时时连带结束', () => {
     const leaf = "require('fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)";
     fs.writeFileSync(script, `require('child_process').spawn(process.execPath,['-e',${JSON.stringify(leaf)},process.argv[2]],{detached:true,stdio:'ignore'}).unref();`
       + `const t=setInterval(()=>{if(require('fs').existsSync(process.argv[2]))clearInterval(t)},50)`);
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${NODE} "${script}" "${pidFile}"`, label: '守护', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${NODE} "${script}" "${pidFile}"`, label: '守护', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
-    await waitFor(() => h.wakes.length === 1, '退出唤醒', 20_000);
-    await waitFor(() => !alive(pid), 'detached 起的子进程也被结束', 15_000);
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
+    await waitFor(() => !alive(pid), 'detached 起的子进程也被结束');
   });
 
   test('用户停止：命令还在跑、它放到后台的子进程也一起结束', async () => {
     const h = harness();
     const pidFile = pidFileFor();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${bgChild(pidFile, true)} & ${NODE} -e "setInterval(()=>{},1000)"`, label: '停我', cwd, timeoutMs: 60_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${bgChild(pidFile, true)} & ${NODE} -e "setInterval(()=>{},1000)"`, label: '停我', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
     await h.m.stop(r.job.jobId, 'user');
-    await waitFor(() => !alive(pid), '停止时后台子进程也被结束', 15_000);
+    await waitFor(() => !alive(pid), '停止时后台子进程也被结束');
   });
 
   test('超时：同样连带结束', async () => {
@@ -370,18 +382,18 @@ describe('放到后台的子进程：停止 / 超时时连带结束', () => {
     const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${bgChild(pidFile, true)} & ${NODE} -e "setInterval(()=>{},1000)"`, label: '超时', cwd, timeoutMs: 8000 });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
-    await waitFor(() => h.m.status('s1', r.job.jobId)?.state === 'timeout', '超时', 30_000);
-    await waitFor(() => !alive(pid), '超时时后台子进程也被结束', 15_000);
+    await waitFor(() => h.m.status('s1', r.job.jobId)?.state === 'timeout', '超时');
+    await waitFor(() => !alive(pid), '超时时后台子进程也被结束');
   });
 
   test('退出 KiroLex（stopAllSync）时命令还在跑：命令和它放到后台的子进程都结束', async () => {
     const h = harness();
     const pidFile = pidFileFor();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${bgChild(pidFile, true)} & ${NODE} -e "setInterval(()=>{},1000)"`, label: '退出', cwd, timeoutMs: 60_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: `${bgChild(pidFile, true)} & ${NODE} -e "setInterval(()=>{},1000)"`, label: '退出', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     const pid = await readPid(pidFile);
     h.m.stopAllSync();
-    await waitFor(() => !alive(pid), '退出时后台子进程被结束', 15_000);
+    await waitFor(() => !alive(pid), '退出时后台子进程被结束');
   });
 });
 
@@ -403,7 +415,7 @@ describe('Windows：作业还没放好的时候停止 / 超时（辅助进程启
   test('停止发生在 assign 答复之前：闸门一直活到答复（pid 不会空出来被复用）；放好之后按作业结束，命令根本没起', async () => {
     const s = slowHost(true);
     const h = harness({ jobHost: s.host });
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("console.log('SHOULD-NOT-RUN')"), label: '慢', cwd, timeoutMs: 60_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("console.log('SHOULD-NOT-RUN')"), label: '慢', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => s.calls.length === 1, '开始 assign');
     const stopping = h.m.stop(r.job.jobId, 'user');
@@ -427,7 +439,7 @@ describe('Windows：作业还没放好的时候停止 / 超时（辅助进程启
     await new Promise((res) => setTimeout(res, 1500));
     assert.ok(alive(s.calls[0].pid), '答复之前闸门还活着');
     s.release();
-    await waitFor(() => !alive(s.calls[0].pid), '答复之后闸门退出', 15_000);
+    await waitFor(() => !alive(s.calls[0].pid), '答复之后闸门退出');
     assert.equal(h.m.status('s1', r.job.jobId)?.state, 'timeout');
     assert.deepEqual(s.terminated, [], '没放进作业就没有作业可结束');
     assert.ok(!(h.m.tail('s1', r.job.jobId) || '').includes('SHOULD-NOT-RUN'));
@@ -438,14 +450,14 @@ describe('放不进作业对象（极端失败）：只结束自己握着句柄�
   test('命令照常跑、输出照常回来；停止时命令被结束', { skip: process.platform !== 'win32' }, async () => {
     const failing = { assign: async () => false, terminate: async () => {}, killAllSync: () => {} };
     const h = harness({ jobHost: failing });
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("console.log('still-runs')"), label: 'fallback', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("console.log('still-runs')"), label: 'fallback', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
-    await waitFor(() => h.wakes.length === 1, '退出唤醒');
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
     assert.match(h.wakes[0].text, /still-runs/);
 
     const pidFile = pidFileFor();
     const js = "require('fs').writeFileSync(process.argv[1],String(process.pid));setInterval(()=>{},1000)";
-    const s = h.m.start({ sessionId: 's1', kind: 'run', command: `${NODE} -e "${js}" "${pidFile}"`, label: 'fallback-stop', cwd, timeoutMs: 60_000 });
+    const s = h.m.start({ sessionId: 's1', kind: 'run', command: `${NODE} -e "${js}" "${pidFile}"`, label: 'fallback-stop', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(s.ok);
     const pid = await readPid(pidFile);
     await h.m.stop(s.job.jobId, 'user');
@@ -484,9 +496,9 @@ describe('重启：跑着的任务留下「已中断」', () => {
   test('manager 每次变化都把正在跑的交给 changed（index.ts 据此落盘）', async () => {
     const seen: number[] = [];
     const h = harness({ changed: (running) => { seen.push(running.length); } });
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("setTimeout(()=>{},200)"), label: 'x', cwd, timeoutMs: 30_000 });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("setTimeout(()=>{},200)"), label: 'x', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
-    await waitFor(() => h.wakes.length === 1, '退出');
+    await waitFor(() => h.wakes.length === 1, '退出', undefined, () => h.m.status('s1', r.job.jobId));
     assert.ok(seen.includes(1));
     assert.equal(seen[seen.length - 1], 0);
   });
@@ -499,7 +511,7 @@ describe('重启：跑着的任务留下「已中断」', () => {
 describe('runCheck（定时任务的检查命令）', () => {
   test('退出码和输出交回调用方，不唤醒会话', async () => {
     const h = harness();
-    const r = await h.m.runCheck({ sessionId: 's1', command: nodeCmd("console.log('2 open');process.exit(1)"), cwd, timeoutMs: 30_000 });
+    const r = await h.m.runCheck({ sessionId: 's1', command: nodeCmd("console.log('2 open');process.exit(1)"), cwd, timeoutMs: LONG_JOB_MS });
     assert.equal(r.status, 'exited');
     assert.equal(r.status === 'exited' && r.code, 1);
     assert.match(r.output, /2 open/);
@@ -522,10 +534,10 @@ describe('runCheck（定时任务的检查命令）', () => {
   test('不出现在列表 / 重启登记里，不占名额', async () => {
     const seen: number[] = [];
     const h = harness({ changed: (running) => { seen.push(running.length); } });
-    const p = h.m.runCheck({ sessionId: 's1', command: nodeCmd('setTimeout(()=>{},400)'), cwd, timeoutMs: 30_000 });
+    const p = h.m.runCheck({ sessionId: 's1', command: nodeCmd('setTimeout(()=>{},400)'), cwd, timeoutMs: LONG_JOB_MS });
     assert.equal(h.m.list('s1').length, 0);
     for (let i = 0; i < MAX_JOBS_PER_SESSION; i += 1) {
-      assert.ok(h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setTimeout(()=>{},300)'), label: `j${i}`, cwd, timeoutMs: 30_000 }).ok);
+      assert.ok(h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd('setTimeout(()=>{},300)'), label: `j${i}`, cwd, timeoutMs: LONG_JOB_MS }).ok);
     }
     await p;
     assert.ok(seen.every((n) => n <= MAX_JOBS_PER_SESSION));
@@ -536,9 +548,9 @@ describe('runCheck：输出很长时按完整输出判断有没有变化', () =>
   const long = (head: string) => nodeCmd(`process.stdout.write('${head}\\n'+'x'.repeat(5000)+'\\n');process.exit(1)`);
   test('开头变了、后面 5000 字一样：指纹不同（末尾 4KB 一样也不算没变化）', async () => {
     const h = harness();
-    const a = await h.m.runCheck({ sessionId: 's1', command: long('task-A:open'), cwd, timeoutMs: 30_000 });
-    const b = await h.m.runCheck({ sessionId: 's1', command: long('task-A:done'), cwd, timeoutMs: 30_000 });
-    const c = await h.m.runCheck({ sessionId: 's1', command: long('task-A:done'), cwd, timeoutMs: 30_000 });
+    const a = await h.m.runCheck({ sessionId: 's1', command: long('task-A:open'), cwd, timeoutMs: LONG_JOB_MS });
+    const b = await h.m.runCheck({ sessionId: 's1', command: long('task-A:done'), cwd, timeoutMs: LONG_JOB_MS });
+    const c = await h.m.runCheck({ sessionId: 's1', command: long('task-A:done'), cwd, timeoutMs: LONG_JOB_MS });
     assert.equal(a.status, 'exited');
     assert.ok(a.status === 'exited' && b.status === 'exited' && c.status === 'exited');
     assert.equal(a.output.slice(-1000), b.output.slice(-1000), '展示给模型的末尾一样');

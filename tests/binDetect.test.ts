@@ -19,6 +19,25 @@ import {
  *   · 验证 —— **找到文件 ≠ 能跑**。
  *   · 记住 —— 一个曾经真的起过会话的命令，比任何检测结果都可信。
  */
+/*
+ * 端到端那两条真起 `bash -lc`：看板那台 Windows 机上 Git Bash 的登录 shell 冷启动 12–35 s，脚本里再起一串探测，
+ * 原来 60 s / 30 s 的固定上限时好时坏；和整套 npm test 并发时实测探测脚本 300 s 还没跑完（单跑 35 s）。
+ * 上限放宽到真卡住才会碰到的程度（不跳过），超时时说清等了多久、跑到哪一行。
+ * 脚本里每个探测自己的 `timeout ${PROBE_TIMEOUT_SEC}` 是被测行为，不动。
+ */
+const BASH_E2E_MS = 900_000;
+function runBashLc(script: string): Promise<{ stdout: string; ms: number; err: Error | null }> {
+  const start = Date.now();
+  return new Promise((resolve) => {
+    execFile('bash', ['-lc', script], { timeout: BASH_E2E_MS, encoding: 'utf8', maxBuffer: 16 * 1024 * 1024 },
+      (err, stdout) => resolve({ stdout: String(stdout || ''), ms: Date.now() - start, err }));
+  });
+}
+const where = (r: { stdout: string; ms: number; err: Error | null }) => {
+  const last = r.stdout.trim().split('\n').pop() || '（没有任何输出）';
+  return `等了 ${r.ms} ms（上限 ${BASH_E2E_MS} ms）${r.err ? `，${r.err.message.split('\n')[0]}` : ''}；最后一行：${last.slice(0, 200)}`;
+};
+
 describe('探测脚本：一份判据，两台机器', () => {
   test('每个被测命令都 `< /dev/null` —— 有的 CLI 读 stdin，不给 EOF 就会挂住', () => {
     /* 实测踩过：远端 `claude-code-acp --version` 读 stdin，把用 `bash -s` 喂进去的脚本
@@ -87,11 +106,9 @@ describe('探测脚本：一份判据，两台机器', () => {
   });
 
   test('**脚本真的能在本机跑**（这条是端到端的：拼错一个引号就会在这里露出来）', async () => {
-    const out = await new Promise<string>((resolve, reject) => {
-      execFile('bash', ['-lc', detectScript()], { timeout: 60_000, encoding: 'utf8' },
-        (err, stdout) => (String(stdout || '').includes('KX_BIN_DONE') ? resolve(String(stdout)) : reject(err || new Error(stdout))));
-    });
-    assert.match(out, /KX_BIN_DONE/);
+    const run = await runBashLc(detectScript());
+    const out = run.stdout;
+    assert.ok(out.includes('KX_BIN_DONE'), `探测脚本没跑完：${where(run)}`);
     /* 这台机器上装了 kiro-cli，所以至少要认出它 —— 认不出说明探测逻辑坏了 */
     const r = parseDetect(out);
     assert.ok(r.kiro.length > 0, `没检测到 kiro-cli：${out.slice(0, 400)}`);
@@ -99,12 +116,10 @@ describe('探测脚本：一份判据，两台机器', () => {
   });
 
   test('bash -lc 跑单条测试也要真的能跑（版本号能拿到）', async () => {
-    const out = await new Promise<string>((resolve) => {
-      execFile('bash', ['-lc', testScript('bash')], { timeout: 30_000, encoding: 'utf8' },
-        (_e, stdout) => resolve(String(stdout || '')));
-    });
+    const run = await runBashLc(testScript('bash'));
+    const out = run.stdout;
     const r = parseTest(out);
-    assert.equal(r.ok, true, out);
+    assert.equal(r.ok, true, `${where(run)}\n${out}`);
     assert.match(r.version || '', /bash/i);
   });
 });

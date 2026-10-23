@@ -194,16 +194,21 @@ test('后台唤醒：两条会话同时有后台任务，结果各回各的（�
   });
   const node = `"${process.execPath}"`;
   const run = (sid: string, ms: number, word: string) => m.start({
-    sessionId: sid, kind: 'run', command: `${node} -e "setTimeout(()=>console.log('${word}'),${ms})"`, label: word, cwd: process.cwd(), timeoutMs: 30_000,
+    sessionId: sid, kind: 'run', command: `${node} -e "setTimeout(()=>console.log('${word}'),${ms})"`, label: word, cwd: process.cwd(), timeoutMs: 300_000,
   });
   try {
     /* A 的任务后结束、B 的先结束：交错着回来 */
     const a = run('sA', 600, 'from-A');
     const b = run('sB', 100, 'from-B');
     assert.ok(a.ok && b.ok);
+    /* 上限按看板那台 Windows 机给足（作业对象辅助进程 PowerShell + Add-Type 冷启动 8 s 起、忙时 15 s+）；超时说清卡在哪 */
     const start = Date.now();
+    const limit = 120_000;
     while (wakes.length < 2) {
-      if (Date.now() - start > 15000) assert.fail('等不到两条唤醒');
+      if (Date.now() - start > limit) {
+        assert.fail(`等不到两条唤醒（等了 ${Date.now() - start} ms，上限 ${limit} ms）；已到 ${wakes.length} 条：`
+          + JSON.stringify({ wakes: wakes.map((w) => w.sessionId), A: m.status('sA', (a as any).job.jobId), B: m.status('sB', (b as any).job.jobId) }));
+      }
       await new Promise((r) => setTimeout(r, 10));
     }
     for (const w of wakes) {
