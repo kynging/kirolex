@@ -2955,6 +2955,13 @@ button, input, select, textarea {
   color: #fff;
 }
 
+/* 「有待你选择 ↓」：往上翻着历史时出现了等你选的提问，比「↓ 最新」更醒目 */
+.ask-below-btn {
+  background: var(--accent);
+  border-color: var(--accent);
+  color: #fff;
+}
+
 /* Queued follow-ups occupy their OWN in-flow row between the message list and
    the composer -- never an absolute overlay, so it can't cover the chat or the
    input box. The message list (flex:1) shrinks to make room. */

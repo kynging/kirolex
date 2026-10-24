@@ -71,3 +71,24 @@ export function upsertQuestionCard(messages: Message[], card: QuestionCard): Mes
   while (i < messages.length && (messages[i].role === 'user' || isQuestionMessage(messages[i]))) i++;
   return [...messages.slice(0, i), questionMessage(card), ...messages.slice(i)];
 }
+
+/**
+ * **画的时候**还挂着的卡片排到这一轮的最下面（在正文和工具块后面）——「选择永远应该在下方」。
+ * 只挪画法、不挪数据（上面说的「放在开头」照旧）；答完的卡片回到原位置，读历史时顺序和发生的顺序一致。
+ * 返回两组下标：`flow` 按原顺序画，`asks` 画在最后。
+ */
+export function splitTurnAsks(segments: readonly Pick<Message, 'question'>[]): { flow: number[]; asks: number[] } {
+  const flow: number[] = [];
+  const asks: number[] = [];
+  segments.forEach((s, i) => (s.question?.status === 'pending' ? asks : flow).push(i));
+  return { flow, asks };
+}
+
+/** 列表里最后一张还挂着的提问卡片的 id（没有就是 null）：ChatArea 拿它决定滚过去还是显示「有待你选择 ↓」 */
+export function pendingQuestionId(messages: readonly Pick<Message, 'question'>[]): string | null {
+  for (let i = messages.length - 1; i >= 0; i--) {
+    const card = messages[i].question;
+    if (card?.status === 'pending') return card.id;
+  }
+  return null;
+}

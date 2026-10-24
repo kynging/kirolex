@@ -1,4 +1,4 @@
-import React, { useEffect, useMemo, useRef, useState } from 'react';
+import React, { useMemo, useRef, useState } from 'react';
 import { useT } from '../hooks/useLang';
 import { engineLabel } from '../engineLabel';
 import {
@@ -23,10 +23,7 @@ export const QuestionCardView: React.FC<{ card: QuestionCard }> = ({ card }) => 
   const pending = card.status === 'pending';
   const engine = engineLabel(card.engine);
 
-  /* 刚问出来的那一张滚到眼前（它在这一轮开头，前面的正文可能把它推出了视野）。只滚它所在的那一格（见 `revealInPane`） */
-  useEffect(() => {
-    if (pending && Date.now() - card.askedAt < 15_000) requestAnimationFrame(() => revealInPane(rootRef.current));
-  }, [card.id]);
+  /* 滚不滚到眼前由 ChatArea 决定（挂着的卡片画在这一轮最下面；你在往上翻历史时不抢滚动，改为底部浮标），见 `revealPendingAsk` */
 
   const mainFields = useMemo(() => card.fields.filter((f) => !f.customFor), [card.fields]);
   const customOf = (key: string) => card.fields.filter((f) => f.customFor === key);
@@ -156,19 +153,6 @@ export const QuestionCardView: React.FC<{ card: QuestionCard }> = ({ card }) => 
     </form>
   );
 };
-
-/**
- * 和 ChatArea 的 `revealInContainer` 同一个做法：只动这一格的 `.chat-messages`。不用 `scrollIntoView` ——
- * 它会连带滚动分屏共用的 overflow:hidden 外层，把别的格子一起挪走（`tests/scrollIsolation.test.ts`）。
- */
-function revealInPane(el: HTMLElement | null): void {
-  const container = el?.closest('.chat-messages') as HTMLElement | null;
-  if (!el || !container) return;
-  const box = el.getBoundingClientRect();
-  const view = container.getBoundingClientRect();
-  if (box.bottom > view.bottom) container.scrollTop += Math.min(box.bottom - view.bottom, box.top - view.top);
-  else if (box.top < view.top) container.scrollTop -= view.top - box.top;
-}
 
 const FieldControl: React.FC<{ field: QuestionField; value: QuestionValue | undefined; onChange: (v: QuestionValue) => void; disabled: boolean }> = ({ field: f, value, onChange, disabled }) => {
   const t = useT();

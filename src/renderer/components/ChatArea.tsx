@@ -58,14 +58,15 @@ import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
 import { QuestionCardView } from './QuestionCard';
-import { turnHasQuestion } from '../questionCards';
+import { turnHasQuestion, splitTurnAsks, pendingQuestionId } from '../questionCards';
+import { revealPendingAsk } from '../askReveal.ts';
 import { slashIntent, resolveChoice, type SlashIntent } from '../slashPicker.ts';
 import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
 import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, switchFailureNotice, cleanIpcError, type RequestStatusMap, type SwitchWhat } from '../sessionRequestStatus.ts';
 import { comboSelectView, comboEffortNote, type ComboListView } from '../comboPick.ts';
-import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall } from '../toolRows.ts';
+import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall, toolsSummaryOf } from '../toolRows.ts';
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
@@ -1011,6 +1012,7 @@ const MessageItem = memo<{
       return next;
     });
   }, []);
+  const { flow, asks } = useMemo(() => splitTurnAsks(segments), [segments]);
   const turnFileChanges = useMemo(() => {
     const byId = new Map<string, ToolCall>();
     for (const segment of segments) {
@@ -1031,8 +1033,9 @@ const MessageItem = memo<{
   return (
     <div className="message assistant">
       <div className="message-content">
-        {parts.map((p, idx) => {
-          /* 模型向你的提问（`QuestionCard`）：这一轮里的一段，挂着时是表单，答完是只读摘要 */
+        {flow.map((idx) => {
+          const p = parts[idx];
+          /* 模型向你的提问（`QuestionCard`）：这一轮里的一段，答完是只读摘要（挂着时的表单画在最下面，见 `asks`） */
           const asked = segments[idx]?.question;   // parts 和 segments 一一对应
           if (asked) {
             return (
@@ -1102,6 +1105,12 @@ const MessageItem = memo<{
             {!!engine && engine !== 'kiro' && <ToolsPanel calls={turnFileChanges} live={isStreaming && isLastAssistant} />}
           </div>
         )}
+        {/* 还挂着的提问（等你选 / 填）永远画在这一轮的最下面：正文、工具块都在它上面，不会把它挤出视野（`splitTurnAsks`） */}
+        {asks.map((idx) => (
+          <div key={parts[idx].id} className="turn-segment variant-question" data-pending-ask={segments[idx].question!.id}>
+            <QuestionCardView card={segments[idx].question!} />
+          </div>
+        ))}
       </div>
       <div className="message-actions">
         <time
@@ -2949,12 +2958,21 @@ const toolRowTitle = (c: ToolCall): string => commandFirstLine(c.title).head;
  * Task（子代理）那一行下面挂它派出去的调用，折叠显示，行上写子代理的进度和用时（审计 12）。
  * 行的样式和「运行的命令」同一套（files-item-row + kind 徽章）；失败标红。只给非 kiro 会话画（kiro 也落盘带 locations 的 Read，见 MessageItem 那一处判断）。
  */
+/** 「用过的工具」你点开（true）/ 收起（false）过的那些，按消息记（键见 ToolsPanel 里的 memoKey）；只在这次运行里记 */
+const toolsPanelOpen = new Map<string, boolean>();
+
 const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live }) => {
   const t = useT();
   const rows = useMemo(() => toolRowsOf(calls), [calls]);
-  /* null = 跟着这一轮（跑着时展开、跑完收起）；点过就按你的 —— 和「运行的命令」一样 */
-  const [pinned, setPinned] = useState<boolean | null>(null);
-  const collapsed = pinned ?? !live;
+  /*
+    **默认折叠成一行摘要，跑着的这一轮也一样**（展开会占很大一块，把下面等你选的东西挤出视野）；跑着时摘要里带最近一条在跑的工具。
+    点开 / 收起过就按你的，按消息记（键 = 这一轮第一条工具调用的 id）：消息组件在新一段到达时会重新挂载，组件里的 state 留不住。
+  */
+  const memoKey = rows[0]?.call.toolCallId || '';
+  const [pinned, setPinnedState] = useState<boolean | null>(() => toolsPanelOpen.get(memoKey) ?? null);
+  const setPinned = (open: boolean) => { if (memoKey) toolsPanelOpen.set(memoKey, open); setPinnedState(open); };
+  const collapsed = !(pinned ?? false);
+  const summary = toolsSummaryOf(rows);
   const [openIds, setOpenIds] = useState<Set<string>>(new Set());
   const anyRunning = rows.some((r) => toolState(r.call.status) === 'running' || r.children.some((c) => toolState(c.status) === 'running'));
   const [now, setNow] = useState(() => Date.now());
@@ -2978,15 +2996,17 @@ const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live })
   };
   return (
     <div className="turn-panel tools-panel">
-      <button className="turn-panel-head" onClick={() => setPinned(!collapsed)}>
+      <button className="turn-panel-head" onClick={() => setPinned(collapsed)} aria-expanded={!collapsed}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
-        <span className="turn-panel-label">{t('🔧 Tools used')}</span>
-        <span className="turn-panel-count">{rows.length}</span>
+        <span className="turn-panel-label">
+          {summary.subagents > 0
+            ? t('🔧 Used {n} tools · {s} subagents', { n: summary.tools, s: summary.subagents })
+            : t('🔧 Used {n} tools', { n: summary.tools })}
+        </span>
         {failed > 0 && <span className="tools-failed-count">{t('{n} failed', { n: failed })}</span>}
-        {collapsed && (
-          <span className="commands-preview" title={rows[0].call.title}>
-            {toolRowTitle(rows[0].call)}
-            {rows.length > 1 ? ` … +${rows.length - 1}` : ''}
+        {collapsed && live && summary.running && (
+          <span className="commands-preview" title={summary.running.title}>
+            {t('Running: {tool}', { tool: toolRowTitle(summary.running) })}
           </span>
         )}
       </button>
@@ -4180,6 +4200,31 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     scrollContainerToBottom(chatMessagesRef.current, () => stickToBottomRef.current);
   }, []);
 
+  /*
+    **出现等你选 / 填的提问时保证它在眼前**（它画在这一轮最下面，见 MessageItem 的 `asks`）。
+    停在底部：滚过去。正在往上翻历史：不抢滚动，底部显示「有待你选择 ↓」，点了跳过去；自己滚回底部、或提问关了，浮标就收起。
+    选项按钮和权限 / 批准计划卡片画在输入区里（消息列表外面），本来就一直看得见，不用滚。
+  */
+  const pendingAsk = useMemo(() => pendingQuestionId(messages), [messages]);
+  const [askBelow, setAskBelow] = useState(false);
+  const pendingAskRef = useRef(pendingAsk);
+  pendingAskRef.current = pendingAsk;
+  useEffect(() => {
+    if (!pendingAsk) { setAskBelow(false); return; }
+    if (stickToBottomRef.current) {
+      setAskBelow(false);
+      requestAnimationFrame(() => revealPendingAsk(chatMessagesRef.current, pendingAsk));
+    } else {
+      setAskBelow(true);
+    }
+  }, [pendingAsk]);
+  const jumpToAsk = useCallback(() => {
+    stickToBottomRef.current = true;
+    setShowJumpToBottom(false);
+    setAskBelow(false);
+    revealPendingAsk(chatMessagesRef.current, pendingAskRef.current);
+  }, []);
+
   // Ctrl+A only selects chat messages content
   useEffect(() => {
     const handleSelectAll = (e: KeyboardEvent) => {
@@ -4798,6 +4843,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           const atBottom = distanceFromBottom <= 60;
           stickToBottomRef.current = atBottom;
           setShowJumpToBottom((visible) => (visible === !atBottom ? visible : !atBottom));
+          if (atBottom) setAskBelow(false);
           if (el.scrollTop <= 80 && hiddenGroupCount > 0 && preExpandHeightRef.current == null) {
             loadOlder();
           }
@@ -4990,7 +5036,16 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       </div>
 
       <div className="jump-to-bottom-anchor">
-        {showJumpToBottom && (
+        {askBelow && pendingAsk ? (
+          <button
+            className="jump-to-bottom-btn ask-below-btn"
+            onClick={jumpToAsk}
+            title={t('Jump to what is waiting for your choice')}
+            aria-label={t('Jump to what is waiting for your choice')}
+          >
+            {t('Waiting for your choice ↓')}
+          </button>
+        ) : showJumpToBottom && (
           <button
             className="jump-to-bottom-btn"
             onClick={jumpToBottom}

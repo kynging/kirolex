@@ -117,3 +117,17 @@ export function childProgress(children: ToolCallLike[]): { done: number; failed:
   }
   return { done, failed, running };
 }
+
+/**
+ * 「用过的工具」折叠时那一行摘要：一共几个调用（含子代理派出去的）、几个子代理、最近一条还在跑的（没有就是 null）。
+ */
+export function toolsSummaryOf<T extends ToolCallLike>(rows: ToolRow<T>[]): { tools: number; subagents: number; running: T | null } {
+  let tools = 0, subagents = 0;
+  let running: T | null = null;
+  for (const { call, children } of rows) {
+    tools += 1 + children.length;
+    if (isSubagentCall(call) || children.length > 0) subagents++;
+    for (const c of [call, ...children]) if (toolState(c.status) === 'running') running = c;
+  }
+  return { tools, subagents, running };
+}
