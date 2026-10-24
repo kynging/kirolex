@@ -19,6 +19,8 @@ export const ZH_INDEX_A: Record<string, string> = {
   'Rebuilding history {i}/{total}{retry}': '重建历史 {i}/{total}{retry}',
   'Rebuilding history{retry}': '重建历史{retry}',
   'Model unavailable, switched to {to}; rebuilding history starts over ({msg})': '模型不可用，已换成 {to}，重建历史从头开始（{msg}）',
+  '🔀 Model "{from}" is unavailable, so this session switched to "{to}"; rebuilding history starts over.': '🔀 模型「{from}」不可用，这条会话已换成「{to}」，重建历史从头开始。',
+  'Error while rebuilding history: {msg}': '重建历史时的报错：{msg}',
   'Rebuilding history {i}/{total} failed, retrying in {s}s': '重建历史 {i}/{total} 失败，{s} 秒后重试',
 
   // ── index.ts：MCP 组合 / 本地工具通道 / 远程 ──

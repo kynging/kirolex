@@ -109,6 +109,10 @@ export const ZH_INDEX_B: Record<string, string> = {
   'Revision': '改写',
   'Cannot connect to this session. Click it to connect, then try again': '这条会话连不上 —— 点一下它让它连上再试',
   'This session is still busy after waiting 20 minutes ({busy})': '等了 20 分钟这条会话还在忙（{busy}）',
+  '⚠️ Waited 20 minutes and this revision never got its turn, so it was dropped: {label}. Your comment is below; click ✓ on it in the file preview to send it again.':
+    '⚠️ 等了 20 分钟还没轮到，已放弃这次改写：{label}。原文在下面，在文件预览里对它再点 ✓ 即可重发。',
+  'Your comment: {note}': '原文：{note}',
+  'The session stayed busy: {busy}': '会话一直在忙：{busy}',
   'A revision is already waiting for a reply in this session': '这条会话上已经有一次改写在等回复',
   'The text was not included, so it cannot be edited by line number': '没有带上正文 —— 没法按行号改',
   'Could not splice it back in (the position does not match), so nothing was written': '拼不回去（位置不对）—— 没写',

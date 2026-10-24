@@ -31,6 +31,7 @@
  */
 
 import { t, type Lang } from './i18n.ts';
+import { withNoteDetail } from '../main/kirolexNote.ts';
 
 /** Verification strength, following the usual ladder. Only 0 and 1–3 are
  *  implemented; 4 (model-as-judge) and 5 (human checkpoint) are named so the level
@@ -592,5 +593,58 @@ export function terminalSummary(run: LoopRun, terminal: LoopTerminal, now: numbe
   if (run.spec.verifier.level === 0) {
     facts.push(t(lang, 'No check ever ran, so there is no way to tell whether the goal was reached'));
   }
-  return `${t(lang, '🔁 Loop finished: {reason}', { reason: terminalLabel(terminal, lang) })}\n${facts.join(' · ')}`;
+  /* notices-glossary emoji only: reached / nothing to do = done (✅); every other ending needs a look (⚠️) */
+  const head = terminal === 'success' || terminal === 'no-op'
+    ? t(lang, '✅ Loop finished: {reason}', { reason: terminalLabel(terminal, lang) })
+    : t(lang, '⚠️ Loop finished: {reason}', { reason: terminalLabel(terminal, lang) });
+  return `${head}\n${facts.join(' · ')}`;
+}
+
+/** One round's verdict as ONE line, for the folded per-loop card (`foldVerdicts`).
+ *  Emoji are the notices-glossary set only (⚠️ ⏳ 🔀 ✅): a failing round and a broken
+ *  checker both need attention (⚠️), a tolerated flake that will be retried is waiting
+ *  (⏳), a pass is done (✅). The distinctions the old ❌ / ⛔ carried stay in the words. */
+export function verdictRoundLine(run: LoopRun, verdict: LoopVerdict, lang: Lang = 'zh'): string {
+  const tolerance = Math.max(1, run.spec.stop.maxUnrunnableRounds);
+  if (verdict.unrunnable) {
+    // A flake and a broken verifier read the same otherwise, and the whole point of
+    // tolerating one is that the user can tell them apart.
+    return run.unrunnableRounds < tolerance
+      ? t(lang, '⏳ Round {i} check could not run ({n}/{max} in a row; not stopping yet, will retry)', { i: run.iteration, n: run.unrunnableRounds, max: tolerance })
+      : t(lang, '⚠️ Round {i} check could not run ({n}/{max} in a row; tolerance limit reached)', { i: run.iteration, n: run.unrunnableRounds, max: tolerance });
+  }
+  return verdict.pass
+    ? t(lang, '✅ Round {i} check passed (exit={code})', { i: run.iteration, code: verdict.exitCode ?? 0 })
+    : t(lang, '⚠️ Round {i} check failed (exit={code}) · output fed into the next round', { i: run.iteration, code: verdict.exitCode ?? '?' });
+}
+
+/** One round in the folded card: its line plus the (clipped) checker output. */
+export type VerdictRound = { line: string; output: string };
+
+/** Output kept per round on SCREEN (the next prompt carries the full one). */
+export const VERDICT_SCREEN_OUTPUT = 1200;
+
+export function verdictRound(run: LoopRun, verdict: LoopVerdict, lang: Lang = 'zh'): VerdictRound {
+  return { line: verdictRoundLine(run, verdict, lang), output: verdict.output.trim().slice(0, VERDICT_SCREEN_OUTPUT) };
+}
+
+/** ALL of one loop's verdicts as ONE notice (loop-engineering-notes §11 #6: twenty rounds
+ *  used to be twenty separate messages). The main line is the LATEST round plus how many
+ *  were checked; every round, with its output, is folded into the notice's 详情
+ *  (`withNoteDetail` -> the KiroLex card's collapsible details), oldest first. */
+export function foldVerdicts(rounds: readonly VerdictRound[], lang: Lang = 'zh'): string {
+  if (!rounds.length) return '';
+  const last = rounds[rounds.length - 1];
+  const main = rounds.length > 1
+    ? `${last.line}${t(lang, ' · {n} rounds checked', { n: rounds.length })}`
+    : last.line;
+  const detail = rounds.length > 1 || last.output
+    ? rounds.map((r) => (r.output ? `${r.line}\n${r.output}` : r.line)).join('\n\n')
+    : '';
+  return withNoteDetail(main, detail);
+}
+
+/** The id of a run's folded verdict card: stable for the whole run, distinct per run. */
+export function loopVerdictsId(run: Pick<LoopRun, 'sessionId' | 'startedAt'>): string {
+  return `loop_verdicts_${run.sessionId}_${run.startedAt}`;
 }

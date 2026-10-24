@@ -37,18 +37,47 @@ export const KIROLEX_NOTE_OPENINGS = [
   "⚠️ Error invoking remote method 'acp:",
 ];
 
+/**
+ * **以 `role: 'assistant'` 写下的旧提示**：定时任务结束那句（`runScheduledJob`）原来不是 KiroLex 提示，
+ * 而是冒充助手的话落盘（历代写法：`⏰ 定时任务结束：…` / `定时任务结束：…`，英文同）。现在走 `noteInSession`，
+ * 旧记录只能按开头认 —— 只认 `assistant` 那一侧：你自己打的「定时任务结束：」照旧是你的话。
+ */
+export const LEGACY_ASSISTANT_NOTE_OPENINGS = [
+  '⏰ 定时任务结束：',
+  '定时任务结束：',
+  '⏰ Scheduled task ended: ',
+  'Scheduled task ended: ',
+];
+
 export interface MaybeNote {
   content?: string;
   /** 新写下的通知都带这个标记；老的只能靠开头认。 */
   kirolex?: true | boolean;
+  role?: string;
+}
+
+/** 旧记录里冒充助手的 KiroLex 提示（见 `LEGACY_ASSISTANT_NOTE_OPENINGS`）。 */
+export function isLegacyAssistantNote(m: MaybeNote | null | undefined): boolean {
+  if (!m || m.role !== 'assistant') return false;
+  const t = String(m.content || '').trim();
+  return LEGACY_ASSISTANT_NOTE_OPENINGS.some((head) => t.startsWith(head));
 }
 
 /** 这条消息是 KiroLex 对人说的话吗（不是你说的）。 */
 export function isKirolexNote(m: MaybeNote | null | undefined): boolean {
   if (!m) return false;
   if (m.kirolex) return true;
+  if (isLegacyAssistantNote(m)) return true;
   const t = String(m.content || '').trim();
   return KIROLEX_NOTE_OPENINGS.some((head) => t.startsWith(head));
+}
+
+/**
+ * 读盘时把旧记录里冒充助手的提示**当成 KiroLex 提示**（`role: 'user'` + `kirolex: true`，和 `noteInSession` 写的一样）：
+ * 界面按 KiroLex 卡片显示，「最后一条是不是助手的回复」之类的判断也不再把它当成回复。其余消息原样返回。
+ */
+export function normalizeLegacyNote<T extends MaybeNote>(m: T): T {
+  return isLegacyAssistantNote(m) ? { ...m, role: 'user', kirolex: true } : m;
 }
 
 /**
@@ -74,7 +103,7 @@ export function stripKirolexNotes(convo: string): string {
   return blocks
     .filter((b) => {
       const body = b.replace(/^(User|Assistant):\s*/, '').trim();
-      return !isKirolexNote({ content: body });
+      return !isKirolexNote({ content: body, ...(/^Assistant:/.test(b) ? { role: 'assistant' } : {}) });
     })
     .join('\n\n');
 }

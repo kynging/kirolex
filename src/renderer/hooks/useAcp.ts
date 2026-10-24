@@ -24,6 +24,10 @@ import {
   TOLERATED_RETRY_FLOOR_SEC,
   validateSpec,
   verdictFromCommand,
+  verdictRound,
+  foldVerdicts,
+  loopVerdictsId,
+  type VerdictRound,
   type LoopRun,
   type LoopSpec,
   type LoopTerminal,
@@ -41,7 +45,7 @@ import { carryControlMark, viaFor } from '../../main/controlSessions';
 import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { insertOptimistic, isDuplicateMessageError, removeOptimistic } from '../queueRetry';
-import { isKirolexNote } from '../../main/kirolexNote.ts';
+import { isKirolexNote, normalizeLegacyNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
 import { withLiveNote, notesAfterReload } from '../noticeMerge.ts';
 import { cleanIpcError } from '../sessionRequestStatus.ts';
@@ -342,7 +346,9 @@ function autoResendKey(text: string): string {
 }
 
 /** transcript 里的一条 → 界面的 Message（switchSession 读盘、对账共用）。 */
-function messageFromStored(m: any): Message {
+function messageFromStored(raw: any): Message {
+  /* 旧记录里冒充助手的 KiroLex 提示（定时任务结束那句）读回来就是 KiroLex 提示 */
+  const m = normalizeLegacyNote(raw);
   return {
     id: m.id,
     role: m.role,
@@ -1926,7 +1932,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         if (!lastSid) throw new Error('no last session');
         const transcript = await window.kiroApi.readTranscript?.(lastSid);
         if (!Array.isArray(transcript) || transcript.length === 0) throw new Error('empty transcript');
-        const restored: Message[] = transcript.map((m: any) => ({
+        const restored: Message[] = transcript.map(normalizeLegacyNote).map((m: any) => ({
           id: m.id,
           role: m.role,
           content: m.content,
@@ -1961,7 +1967,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           if (!sid || sid === lastSid || sid.startsWith('pending_')) continue;
           const transcript = await window.kiroApi.readTranscript?.(sid);
           if (!transcript?.length) continue;
-          const msgs: Message[] = transcript.map((m: any) => ({
+          const msgs: Message[] = transcript.map(normalizeLegacyNote).map((m: any) => ({
             id: m.id, role: m.role, content: m.content,
             toolCalls: m.toolCalls, attachments: m.attachments,
             pastes: (m as any).pastes, timestamp: m.ts,
@@ -4442,29 +4448,28 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    *  `acp:prompt` writes to the transcript verbatim (see `nextPromptText`). Writing
    *  it twice would put the same verifier output in the record under two different
    *  authors. Only the run's TERMINAL is persisted separately, because nothing else
-   *  carries it. */
+   *  carries it.
+   *
+   *  ONE card per loop, not one message per round (loop-engineering-notes §11 #6: twenty
+   *  rounds were twenty messages of noise). Each round is added to this run's list and the
+   *  same card is replaced in place (`foldVerdicts`: latest round on top, every round in
+   *  its 详情). It is a KiroLex card (`kirolex: true`), not an assistant message: the
+   *  checker said this, not the model. */
+  const loopVerdictRoundsRef = useRef<Map<string, VerdictRound[]>>(new Map());
   const showVerdict = useCallback((sessionId: string, run: LoopRun, verdict: LoopVerdict) => {
     if (verdict.noEvidence) return;      // level 0: there is nothing to show
-    const tolerance = Math.max(1, run.spec.stop.maxUnrunnableRounds);
-    const head = verdict.unrunnable
-      // A flake and a broken verifier read the same in the log otherwise, and the
-      // whole point of tolerating one is that the user can tell them apart.
-      ? (run.unrunnableRounds < tolerance
-        ? t('⚠️ Round {i} check could not run ({n}/{max} in a row; not stopping yet, will retry)', { i: run.iteration, n: run.unrunnableRounds, max: tolerance })
-        : t('⛔ Round {i} check could not run ({n}/{max} in a row; tolerance limit reached)', { i: run.iteration, n: run.unrunnableRounds, max: tolerance }))
-      : verdict.pass
-        ? t('✅ Round {i} check passed (exit={code})', { i: run.iteration, code: verdict.exitCode ?? 0 })
-        : t('❌ Round {i} check failed (exit={code}) · output fed into the next round', { i: run.iteration, code: verdict.exitCode ?? '?' });
-    const tail = verdict.output.trim() ? `\n\n\u0060\u0060\u0060\n${verdict.output.trim().slice(0, 1200)}\n\u0060\u0060\u0060` : '';
-    mutateSessionMessages(sessionId, (current) => [
-      ...current,
-      {
-        id: `loop_verdict_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-        role: 'assistant',
-        content: `${head}${tail}`,
-        timestamp: Date.now(),
-      },
-    ]);
+    const id = loopVerdictsId(run);
+    const rounds = [...(loopVerdictRoundsRef.current.get(id) || []), verdictRound(run, verdict, uiLangNow())];
+    loopVerdictRoundsRef.current.set(id, rounds);
+    const content = foldVerdicts(rounds, uiLangNow());
+    const now = Date.now();
+    mutateSessionMessages(sessionId, (current) => {
+      const at = current.findIndex((m) => m.id === id);
+      if (at < 0) return [...current, { id, role: 'user', kirolex: true, content, timestamp: now }];
+      const next = current.slice();
+      next[at] = { ...next[at], content };
+      return next;
+    });
   }, [mutateSessionMessages]);
 
   /**

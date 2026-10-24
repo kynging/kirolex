@@ -264,9 +264,14 @@ describe('creating and cancelling a job say nothing in the transcript', () => {
   });
 
   test('the terminal note is still durable, and still main\'s job', () => {
-    // `store.appendMessage`, not the renderer's screen-only mutation: it must survive a reload,
-    // because it is the only record that a job ended and why.
-    assert.match(MAIN, /store\.appendMessage[\s\S]{0,300}Scheduled task ended/);
+    // `noteInSession` (which `store.appendMessage`s with `kirolex: true`), not the renderer's
+    // screen-only mutation: it must survive a reload, because it is the only record that a job
+    // ended and why. And it is KiroLex speaking, not the assistant (notices-audit #86).
+    const at = MAIN.indexOf('async function runScheduledJob');
+    const body = MAIN.slice(at, MAIN.indexOf('function runScheduleCheck', at));
+    assert.ok(at > 0 && body.length > 0, 'runScheduledJob moved — update this guard');
+    assert.match(body, /if \(terminal\) \{[\s\S]{0,600}noteInSession\(state\.sessionId, scheduleEndedText\(final, terminal\)/);
+    assert.doesNotMatch(body, /role: 'assistant'/, 'the end-of-schedule line is written as the assistant again');
     assert.doesNotMatch(HOOK, /定时任务结束|Scheduled task ended/, 'the renderer must not duplicate main\'s note');
   });
 });

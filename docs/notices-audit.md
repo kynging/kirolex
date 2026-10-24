@@ -77,7 +77,7 @@
 | 51 | src/main/index.ts:1550 | 手动重建时会话没连上（重建失败原因） | 该会话尚未连接后端，先打开它再重建 | 会话还没连上，先打开它再重建历史。 | 改写 |  |
 | 52 | src/main/index.ts:1650 | 重建中执行器被换掉（重建失败原因） | 后端已被替换，将重新开始重建 | 会话重连了，重建历史将从头开始。 | 改写 |  |
 | 53 | src/main/index.ts:1654 | 用户放弃重建（重建失败原因） | 用户已放弃重建 | 已放弃重建历史 | 改写 |  |
-| 54 | src/main/index.ts:1706 | 重建中模型不可用、换了模型（重建失败原因） | 模型不可用，已切换后端（{msg}） | 模型不可用，已换成 {to}，重建历史从头开始（{msg}） | 改写；带上换成了哪个模型（`{to}`） | 旧文案说「已切换后端」，实际做的是 swapSessionModel（换模型）。另：这是"悄悄换模型"的一处，目前只在重建失败原因里提到，没有单独在会话里说一句（行为问题，不在这一波改）。 |
+| 54 | src/main/index.ts:1706 | 重建中模型不可用、换了模型（重建失败原因） | 模型不可用，已切换后端（{msg}） | 模型不可用，已换成 {to}，重建历史从头开始（{msg}） | 改写；带上换成了哪个模型（`{to}`） | 旧文案说「已切换后端」，实际做的是 swapSessionModel（换模型）。另：这是"悄悄换模型"的一处，原来只在重建失败原因里提到。**已修（2026-10-24）**：换成之后在会话里说一句「🔀 模型「{from}」不可用，这条会话已换成「{to}」，重建历史从头开始。」（报错原文折进「详情」），走 `modelFallback`，同一对每条会话只说一次。 |
 | 55 | src/renderer/components/Sidebar.tsx:300 | 侧栏 / 输入框的占用 tooltip | 占用中：正在重建历史上下文（会重试到完成；按 Stop 可放弃） | 占用中：正在重建历史（按「停止」可放弃） | 改写 |  |
 | 56 | src/renderer/components/Sidebar.tsx:301 | 侧栏 / 输入框的占用 tooltip | 占用中：历史上下文缺失，重建即将/正在进行；新消息会排队 | 占用中：缺历史，即将重建历史；新消息会等它完成 | 改写 |  |
 | 57 | src/main/index.ts（sshMux `onHealing`）<br>src/main/remoteRecovery.ts（`RECONNECTING_TEXT`） | 远程会话的本机工具连接中断、正在重连（状态行，挂着不消失） | ⚠️ 本机工具连接中断，正在重连（第 {n} 次）—— 这期间这条远程会话读写不了你机器上的文件。<br>——<br>⚠️ 本机工具连接中断，正在重连（第 {n} 次）—— 这期间这条远程会话读写不了你机器上的文件。 | ⚠️ 本机工具连接中断，正在重连（第 {n} 次），这期间读写不了你的文件。 | **合并**：两处各写一遍的同一件事用同一个 key |  |
@@ -106,10 +106,10 @@
 | 80 | src/main/index.ts:9650 | 换组合失败（组合下拉旁的 ✗ / tooltip） | ⚠️ 换组合「{name}」没成功（{err}），这条会话还是原来的组合。执行器已经断开，下一条消息会按原来的组合重新接上（包括你本机的工具）。 | 换组合「{name}」失败（{err}），仍用原来的组合，下一条消息会按原组合重新连接。 | 改写；**只说一处**：原来状态行一条 + 抛错又在组合下拉旁显示一次，现在说明（仍用原组合、下一条消息重新连接）随抛出的错误给界面，不再另发状态行；去掉 ⚠️（那里已有 ✗） |  |
 | 81 | src/main/index.ts:12136 | 一轮进行中改了项目（状态行） | 📁 项目已改为**{project}**。这一轮还在跑，所以执行器（memory scope）会在它结束之后再重置 —— 这一轮剩下的部分仍用原来的范围。 | 项目已改为**{project}**，记忆范围在这一轮结束后切换。 | 改写；去掉 📁 |  |
 | 82 | src/main/mcpCombos.ts:285 | 组合要的 effort 当前引擎不支持（状态行） | ℹ️ {who}要的 effort「{want}」当前引擎 / 模型不支持{avail} | ⚠️ {who}要的 effort「{want}」当前引擎 / 模型不支持{avail} | ℹ️ → ⚠️（只用固定的几个 emoji） |  |
-| 83 | src/main/index.ts:3951<br>src/main/index.ts:3953 | 侧栏改写在这条会话里排队 | ⏳ 已排队：{label} —— 前面还有 {n} 条改写没跑完，轮到它会自动发出去。<br>——<br>⏳ 已排队：{label} —— 这条会话正忙（{busy}），空下来会自动发出去。 | ⏳ 已排队：{label}（{why}），轮到时自动发出。 ／ 前面还有 {n} 条改写 ／ 会话正忙：{busy} | **合并**为一条带参数的；**从对话记录降为状态行**（只需知道） | 「轮到时自动发出」：会话忙超过 20 分钟会放弃并报「等了 20 分钟这条会话还在忙」，不是无限等（行为未改，文案按常见情况说）。 |
+| 83 | src/main/index.ts:3951<br>src/main/index.ts:3953 | 侧栏改写在这条会话里排队 | ⏳ 已排队：{label} —— 前面还有 {n} 条改写没跑完，轮到它会自动发出去。<br>——<br>⏳ 已排队：{label} —— 这条会话正忙（{busy}），空下来会自动发出去。 | ⏳ 已排队：{label}（{why}），轮到时自动发出。 ／ 前面还有 {n} 条改写 ／ 会话正忙：{busy} | **合并**为一条带参数的；**从对话记录降为状态行**（只需知道） | 「轮到时自动发出」：会话忙超过 20 分钟会放弃，不是无限等。**已修（2026-10-24）**：放弃时在对话记录里说「⚠️ 等了 20 分钟还没轮到，已放弃这次改写：{label}。原文在下面，在文件预览里对它再点 ✓ 即可重发。」并附「原文：{意见}」（一直在忙的原因折进「详情」）；意见照旧放回文件预览那一处、按同一次（`retrySame`）重发（`src/main/reviseGiveUp.ts`，三处等空闲超时共用）。 |
 | 84 | src/main/index.ts:11385 | 侧栏改写落盘（对话记录） | ✅ 已按意见改了{what}（现在 {chars} 字）⏎文件：{path}⏎KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。 | ✅ 已按意见改好{what}（现在 {chars} 字）⏎文件：{path}⏎写前已备份到 ~/.kirolex/backups/review-files/。 | 改写；删掉「KiroLex 落盘完成」 |  |
 | 85 | src/main/index.ts:11427 | 侧栏改写落盘（对话记录） | ✅ 已按意见改了{what}（{n} 处，现在 {chars} 字）⏎文件：{path}⏎KiroLex 落盘完成（写前已备份到 ~/.kirolex/backups/review-files/）。 | ✅ 已按意见改好{what}（{n} 处，现在 {chars} 字）⏎文件：{path}⏎写前已备份到 ~/.kirolex/backups/review-files/。 | 改写 |  |
-| 86 | src/main/index.ts:8004 | 定时任务结束（写进对话记录） | ⏰ 定时任务结束：{why}⏎{schedule} · 共运行 {n} 次 | 定时任务结束：{why}（{schedule}，共运行 {n} 次） | 改写；去掉 ⏰，压成一行 | 这句是以 `role: 'assistant'` 写进 transcript 的（`runScheduledJob`），不是带 `kirolex: true` 的 KiroLex 提示——它会被当成助手的话进快照 / history.md（行为问题，不在这一波改）。 |
+| 86 | src/main/index.ts:8004 | 定时任务结束（写进对话记录） | ⏰ 定时任务结束：{why}⏎{schedule} · 共运行 {n} 次 | 定时任务结束：{why}（{schedule}，共运行 {n} 次） | 改写；去掉 ⏰，压成一行 | 这句原来以 `role: 'assistant'` 写进 transcript（`runScheduledJob`），不是带 `kirolex: true` 的 KiroLex 提示，会被当成助手的话进快照 / history.md。**已修（2026-10-24）**：改走 `noteInSession`（中英两版）；旧记录按开头（`LEGACY_ASSISTANT_NOTE_OPENINGS`，只认 assistant 那侧）认成 KiroLex 提示，发给模型的路径都跳过，读盘时按 KiroLex 卡片显示。 |
 | 87 | src/renderer/App.tsx:3283 | 追加指令时这一轮已结束，改作新消息发出（状态行） | 这一轮已经结束了 —— 刚才那条作为新消息发出。 | 这一轮已经结束，刚才那条作为新消息发出。 | 改写 |  |
 | 88 | src/renderer/components/ChatArea.tsx:1353 | 被中断那一轮的提示条 | 这一轮已被中断 — 请在下方输入框重新提交，新消息会覆盖被中断的这一轮 | 这一轮已中断，在下方重新提交会替换它 | 改写 |  |
 
@@ -124,16 +124,16 @@
 5. 重建中「已切换后端」实际是换了模型（#54）。
 6. 远程写文件被拦时说「它会改用 local_write」，KiroLex 只能拦下并要求，不能保证（#65）。
 
-**行为本身有问题、这一波不改逻辑**（记下来，留给后续任务）：
+**行为本身有问题、这一波不改逻辑**（记下来，留给后续任务；2026-10-24 那一波已全部修掉）：
 
-- **定时任务结束那句以 `role: 'assistant'` 写进 transcript**（`runScheduledJob`），没有 `kirolex: true`，会被当成助手的话进快照 / history.md / 逐段重建。
-- **重建历史时模型不可用会悄悄换模型**（`primeHistoryNow` → `swapSessionModel`），只出现在重建失败原因里，没有在会话里单独说一句（AGENTS.md §4.6 要求"悄悄换了的地方都要说一句"）。
-- 改写排队最多等 20 分钟，之后放弃并报错；「轮到时自动发出」说的是常见情况。
+- （已修，2026-10-24）**定时任务结束那句以 `role: 'assistant'` 写进 transcript**（`runScheduledJob`），没有 `kirolex: true`，会被当成助手的话进快照 / history.md / 逐段重建。现在走 `noteInSession`；旧记录按开头认出来同样排除（`kirolexNote.ts` 的 `isLegacyAssistantNote` / `normalizeLegacyNote`）。测试：`tests/noticesAuditFollowups.test.ts`、`tests/scheduleWiring.test.ts`。
+- （已修，2026-10-24）**重建历史时模型不可用会悄悄换模型**（`primeHistoryNow` → `swapSessionModel`），只出现在重建失败原因里，没有在会话里单独说一句（AGENTS.md §4.6 要求"悄悄换了的地方都要说一句"）。现在换成后经 `modelFallback.note` / `commit` 写进对话记录，同一对每条会话只说一次。测试：`tests/noticesAuditFollowups.test.ts`。
+- （已修，2026-10-24）改写排队最多等 20 分钟，之后放弃并报错；「轮到时自动发出」说的是常见情况。现在放弃时在会话里明说并附原文，意见留在文件预览里可再点 ✓ 重发（见 #83）。测试：`tests/noticesAuditFollowups.test.ts`。
 - （已修，属于提示的呈现）`noteInSession` 写进对话记录的提示原来不会当场显示，只有重新打开会话才看得见；现在当场插入。流式输出期间到达的那几条在这一轮结束后才插，所以当场看到的位置在这一轮回复之后，盘上（重新打开后）在回复之前。
 
 ## 这一波没动的（留给下一波）
 
-- 循环（loop）每轮的校验结果（`✅ / ❌ / ⛔ 第 N 轮校验…`、`🔁 循环结束`）：是以助手消息写进会话的，`loopMachine` 有自己的一组测试守着格式；emoji 还没收敛。
+- （已修，2026-10-24）循环（loop）每轮的校验结果（`✅ / ❌ / ⛔ 第 N 轮校验…`、`🔁 循环结束`）：原来每轮一条助手消息。现在同一个 loop 的校验结果是**一张** KiroLex 卡片、原地更新：主句是最新一轮 +「共校验 N 轮」，每一轮和它的输出折进「详情」（`loopMachine.ts` 的 `verdictRoundLine` / `foldVerdicts`，`useAcp.ts` 的 `showVerdict`）；emoji 收敛为 ✅（通过 / 循环达成）、⚠️（未通过、校验跑不起来到上限、其余结束原因）、⏳（容错重试）。测试：`tests/noticesAuditFollowups.test.ts`。
 - 侧栏文件预览（`ReviewPane.tsx`）写进会话的三句「✅ …已落盘」：渲染层拼的，要带「详情」得另做一份双语拼接，这一波只改了主进程那两句同类的。
 - 连接失败卡片「⚠️ 这条会话没连上：」：渲染层按这个开头认、替换旧的那张（`connectFailure.ts`），改开头要连判据一起改。
 - `Wait for the active turn (including context compaction)…` 等几句被渲染端按关键词匹配（`context compaction` / `当前这一轮`），这一波保持原样。

@@ -15,6 +15,7 @@ import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockO
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
+import { reviseGaveUpNote, reviseGaveUpGroup } from './reviseGiveUp.ts';
 import { pickEngineModel, reshapeProfileForEngine, withEngineModelUsed } from './engineModelPick.ts';
 import {
   CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
@@ -65,7 +66,7 @@ import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectCha
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
-import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, scheduleTerminalLabel, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
+import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
@@ -1922,9 +1923,20 @@ async function primeHistoryNow(
             tried.add(entry.profile.model);
             primeModelsTried.set(sessionId, tried);
             if (tried.size <= PRIME_MAX_MODEL_SWAPS) {
-              const swapped = await swapSessionModel(sessionId, entry.profile.model, `prime ${sessionId}`, tried);
+              const failedModel = entry.profile.model;
+              const swapped = await swapSessionModel(sessionId, failedModel, `prime ${sessionId}`, tried);
               if (swapped) {
                 logger.info('prime', `model unavailable during rebuild sessionId=${sessionId} swapped=${swapped} tried=${Array.from(tried).join(',')}`);
+                /*
+                  **换了模型要在会话里说一句**（AGENTS.md §4.6「悄悄换了的地方都要说一句」）—— 原来只出现在重建失败原因里。
+                  走 `modelFallback`：同一对「失败的 → 换成的」每条会话只说一次（重建每次重来都会走到这里）。
+                */
+                modelFallback.note(sessionId, failedModel, swapped, trConcat(
+                  tr('🔀 Model "{from}" is unavailable, so this session switched to "{to}"; rebuilding history starts over.', { from: failedModel, to: swapped }),
+                  NOTE_DETAIL_SEP,
+                  tr('Error while rebuilding history: {msg}', { msg }),
+                ));
+                modelFallback.commit(sessionId);
                 return { ok: false, error: tr('Model unavailable, switched to {to}; rebuilding history starts over ({msg})', { msg, to: swapped }) };
               }
             }
@@ -5211,6 +5223,16 @@ function enqueueRevise<T>(sessionId: string, job: () => Promise<T>, label?: stri
     next.finally(() => { if (revisesInFlight.get(key) === next) revisesInFlight.delete(key); }).catch(() => {});
   }
   return next;
+}
+
+/**
+ * 改写等空闲等了 20 分钟、放弃了：**在对话记录里说**，带上原文（`reviseGaveUp.ts`）。意见本身照旧交回文件预览、
+ * 放回那一处（`retrySame`），再点 ✓ 按同一次重发。写不进记录（advanced 会话等）就在状态行说。
+ */
+function noteReviseGaveUp(sessionId: string, label: string, original: string, busy: string): void {
+  const text = reviseGaveUpNote(label, original, busy);
+  const group = reviseGaveUpGroup(label);
+  if (!noteInSession(sessionId, text, undefined, group)) sessionNotice(sessionId, text, { group });
 }
 
 /** 等这条会话空下来 —— 轮到自己之后还要等它自己那一轮跑完（用户手动发的那些）。返回还忙的原因，空了是 null。 */
@@ -10455,15 +10477,14 @@ ${hint}` : ''}` };
         + ` error=${failure ? JSON.stringify(failure) : 'none'} terminal=${terminal ?? 'none'}`);
 
       if (terminal) {
-        try {
-          store.appendMessage(state.sessionId, {
-            id: `sched_end_${Date.now()}`,
-            role: 'assistant',
-            content: final.spec.until ? scheduleEndedText(final, terminal)
-              : tr('Scheduled task ended: {why} ({schedule}, ran {n} time(s))', { why: scheduleTerminalLabel(terminal), schedule: describeSchedule(final.spec), n: final.runs }),
-            ts: Date.now(),
-          });
-        } catch {}
+        /*
+          **KiroLex 提示（`noteInSession` → `kirolex: true`），不是助手的话**：原来以 `role: 'assistant'` 落盘，
+          快照 / history.md / 逐段重建都把它当成模型说过的话带过去。旧记录里那几条按开头认（`isKirolexNote`）。
+          中英两版一起落盘（`scheduleEndedText` 走的是 `trIn`，`tr()` 的记账认不出来）。
+        */
+        noteInSession(state.sessionId, scheduleEndedText(final, terminal), {
+          zh: scheduleEndedText(final, terminal, 'zh'), en: scheduleEndedText(final, terminal, 'en'),
+        });
       }
       mainWindow?.webContents.send('schedule:changed', { id, state: final });
     } finally {
@@ -14390,7 +14411,7 @@ ${hint}` : ''}` };
       */
       if (!sessionClients.get(sessionId)) return { ok: false, error: tr('Cannot connect to this session. Click it to connect, then try again'), retrySame: true };
       const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
-      if (stillBusy) return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }), retrySame: true };
+      if (stillBusy) { noteReviseGaveUp(sessionId, input?.label || tr('Revision'), note, stillBusy); return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }), retrySame: true }; }
       if (askWaiters.has(sessionId)) return { ok: false, error: tr('A revision is already waiting for a reply in this session'), retrySame: true };
       /* 等它空下来的那段时间里被取消了 —— 同样不发 */
       if (tk.cancelled()) return { ok: false, cancelled: true };
@@ -14514,7 +14535,7 @@ ${hint}` : ''}` };
     async function followUpPatch(followUp: string, base: string, started: number) {
       const stillBusy = await waitIdle(sessionId, 20 * 60 * 1000);
       /* 追问那一问还没发出去就停下：同上，带 `retrySame`（第一问答过了，重试时用盘上那份，追问照常再问） */
-      if (stillBusy) return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but the session is still busy after 20 minutes ({busy})', { busy: stillBusy }), retrySame: true };
+      if (stillBusy) { noteReviseGaveUp(sessionId, input?.label || tr('Revision'), note, stillBusy); return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but the session is still busy after 20 minutes ({busy})', { busy: stillBusy }), retrySame: true }; }
       if (tk.cancelled()) return { ok: false, cancelled: true };
       if (askWaiters.has(sessionId)) return { ok: false, error: tr('The reply was in the wrong format. KiroLex wanted to ask once more, but another revision is already waiting for a reply in this session'), retrySame: true };
       tk.asking(true);
@@ -14946,7 +14967,7 @@ ${hint}` : ''}` };
       await ensureAttached(sid);
       if (!sessionClients.get(sid)) { tk.close(); return { ok: false, error: tr('Cannot connect to this session. Click it to connect, then try again'), retrySame: true }; }
       const stillBusy = await waitIdle(sid, 20 * 60 * 1000);
-      if (stillBusy) { tk.close(); return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }), retrySame: true }; }
+      if (stillBusy) { tk.close(); noteReviseGaveUp(sid, tr('{file} slide {page} text', { file: path.basename(want), page }), note, stillBusy); return { ok: false, error: tr('This session is still busy after waiting 20 minutes ({busy})', { busy: stillBusy }), retrySame: true }; }
       if (askWaiters.has(sid)) { tk.close(); return { ok: false, error: tr('A revision is already waiting for a reply in this session'), retrySame: true }; }
       if (tk.cancelled()) { tk.close(); return { ok: false, cancelled: true }; }
       try {

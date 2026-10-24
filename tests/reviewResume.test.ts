@@ -261,7 +261,8 @@ describe('连续断网：首次已落盘后网络失败 → 沿用 ticket 重试
     const at = M.indexOf('async function reviseOnce()');
     const body = M.slice(at, at + 4500);
     assert.match(body, /if \(!sessionClients\.get\(sessionId\)\) return \{ ok: false, error: tr\('Cannot connect to this session[^']*'\), retrySame: true \};/);
-    assert.match(body, /if \(stillBusy\) return \{ ok: false, error: tr\('This session is still busy after waiting 20 minutes \(\{busy\}\)', \{ busy: stillBusy \}\), retrySame: true \};/);
+    /* 放弃时先在会话里说一句、带上原文（notices-audit #83，`noteReviseGaveUp`），照样 retrySame */
+    assert.match(body, /if \(stillBusy\) \{ noteReviseGaveUp\(sessionId, [^;]*\); return \{ ok: false, error: tr\('This session is still busy after waiting 20 minutes \(\{busy\}\)', \{ busy: stillBusy \}\), retrySame: true \}; \}/);
     assert.match(body, /if \(askWaiters\.has\(sessionId\)\) return \{ ok: false, error: tr\('A revision is already waiting for a reply in this session'\), retrySame: true \};/);
     assert.match(body, /if \(gate && !gate\.ok\) return \{ ok: false, error: gate\.error, retrySame: true \};/);
     const fu = M.slice(M.indexOf('async function followUpPatch('), M.indexOf('async function followUpPatch(') + 1500);
