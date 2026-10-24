@@ -380,7 +380,7 @@ agent 报告自己的工作 = L4 冒充 L1。带外的含义不变，只是实�
 关键失败窗口（副作用已落地、完成状态未写入）会被报成 `in-doubt` 而拒绝重发，
 不会静默重复写入。
 
-**#8 持久化 —— 计数器已经移到 main，driver 还没有。**
+**#8 持久化 —— 计数器已经移到 main，driver 还没有。**（2026-10-24：driver 也已移到 main，迭代边界幂等、定时 / 事件触发已做，见 §13。）
 `src/main/loopStore.ts` 拥有轮数计数器：`beginRound()` 先扣费再 flush，然后才把这一轮交出去
 （§4 的第 1、2 条）。这修掉了一个真实的 bug：计数器原先活在 renderer 的 `loopsRef` 里，
 **刷新窗口就归零**，所以"最多 20 轮"在每次重启后都重新获得 20 轮——那根本不是预算。
@@ -395,3 +395,89 @@ agent 报告自己的工作 = L4 冒充 L1。带外的含义不变，只是实�
   但没有"运行中的 run 不跟随文件改动"这一保证——`flow:approve` 会重读文件，
   文件在暂停期间被改过就会用新定义继续。这是已知的、尚未关闭的口子。
 - **§8 cost per accepted change** 的分子（token 计数）仍不可得。
+
+---
+
+## 13. 设计：loop driver 移到主进程（2026-10-24）
+
+§12 #8 写的是"计数器在 main，driver 还在 renderer"。动手前先核对了代码，**前提已经变了**：
+renderer 里已经没有任何启动 loop 的入口（`startLoop` 被定时任务取代，见 `useAcp.ts` 的 `createSchedule` 注释），
+`loopsRef` 只剩停止 / 清理 / 几处"被循环占着"的守卫，`sendLoopBackground` / `showVerdict` 是没人调的死代码。
+"68 处引用"指的是那个已经不存在的驱动。所以这次不是"把发送路径从 renderer 拆出来"，
+而是**在 main 里建一个完整的 driver**，renderer 那半边改成只读镜像 + 停止按钮。
+
+### 13.1 模块划分
+
+| 模块 | 职责 |
+|---|---|
+| `src/main/loopMachine.ts` | 纯状态机（`advance` / `beginIteration` / `nextPromptText` / 终止摘要……），**从 renderer 原样搬过来**。main 的 `rootDir` 是 `src/main`，不能 import renderer；反过来 renderer import main 的纯模块是现成惯例（`memoryPolicy.ts`）。`src/renderer/loopMachine.ts` 只剩一行 re-export，现有测试照旧 import 它 |
+| `src/main/loopStore.ts` | 计数器 + **幂等账本**：`tryStartRound`（扣轮次 + 写 in-flight，一次原子写）、`commitRound` |
+| `src/main/loopDriver.ts` | driver（纯，不 import electron；发送 / 校验 / 读 transcript / 写提示全部注入）。`tick()` 每 2 s 一跳，决定每个活着的 loop 下一步做什么 |
+| `index.ts` | 接线：`loop:start` / `loop:stop`、广播 `loop:changed`、tick 定时器、删会话时 `discarded` |
+| renderer | `loopingIds` 改成 main 的镜像（`loop:list-live` + `loop:changed`）；Stop（包括 /stop、强制停止）转成 `loop:stop`；原来的 `sendLoopBackground` / `showVerdict` / `reportLoopEnd` 删掉 |
+
+### 13.2 发送路径
+
+一轮 = `wakeDispatcher.enqueue({ source: 'loop', ref: <这一轮的 messageId> })` → `loopDeliver`（与 `wakeDeliver` 同一套挂执行器，只是用确定的消息 id、发之前按循环记录再判一次）→ `sendPromptOnce`。
+这是 `session_send` 在界面没就绪时走的那条、也是定时任务走的那条：主进程自己挂执行器、会话忙就等这一轮结束、
+作为新的一条发（不 steer、不进排队卡片），`announce` 让界面（如果开着）插进这条消息并接管流。
+
+**不走 `forwardToUi`**（控制入口 / `session_send` 的第一选择）：它要界面在线（不在线就 `ui-not-ready`），
+会话忙时会按 Enter 规则 steer 进当前那一轮——这两点都和"刷新窗口不中断""一轮是一个独立的 model turn"冲突。
+`session_send` 自己在界面不在时也是退到唤醒队列，所以说"同一条"指的是主进程这一半。
+
+### 13.3 持久状态（`~/.kirolex/loop-runs/<sid>.json`，在原 `LoopRun` 上加字段）
+
+- `driver: 'main'` —— 只有带这个标记的记录才由 main 驱动。旧版本 renderer 留下的记录不会在升级后被突然续跑（那会是一轮没人要的计费 turn）。
+- `phase: 'wait' | 'verify'` + `nextAt` —— 等触发 / 等（重新）校验；`nextAt` 落盘，重启后按原时间继续。
+- `inFlight: { iteration, messageId, at } | null` —— 账本的"已开始"那一半。
+- `lastTriggerSeen` —— 事件触发：上一次消费到的那条完整回复的 id。
+- `inDoubt` —— 因 in-doubt 停下时记下是哪一轮、哪条消息。
+
+### 13.4 迭代边界幂等（§4 第 3 条）
+
+一轮的 messageId 是确定的：`loop_<startedAt>_<iteration>`。顺序：
+
+1. `tryStartRound`：预算检查 → **在同一次 tmp+rename 写里**扣一轮并写 `inFlight`。分两次写的话，中间崩掉就是"扣了钱但不知道发没发"——下一次又扣一轮。
+2. 发送（`sendPromptOnce` 先把用户消息落盘、再交给执行器；助手回复完整结束才落盘并带 `replyTo` + `replyComplete`）。
+3. 发送返回成功 → `commitRound`：清 `inFlight`、`phase = 'verify'`。
+
+恢复（main 重启后，或者 driver 发现一个不在自己手里的 `inFlight`）按 `promptDedupe.messageIdStatus` 的四态判：
+
+| 盘上状态 | 含义 | 动作 |
+|---|---|---|
+| `answered` | 这一轮已完整落地 | 不重发，直接 commit、去校验（**不再扣轮次**） |
+| `absent` | 用户消息都没落盘 = 根本没交给模型 | 原 iteration 重发（不再扣轮次） |
+| `unanswered` | 落盘了但模型什么都没做（没出字、没跑工具） | 同上：重发，不再追加用户消息（`promptDedupe` 本来就这样处理同 id 重发） |
+| `started` | 模型已经出过字 / 跑过工具，但没有完整收尾 | **in-doubt：停下（`blocked`），在会话里说清是第几轮、为什么不重发**。副作用可能已经落地，重发可能做两遍 |
+
+**发送返回之后也只认盘上状态**：唤醒队列的 ok 只表示 `sendPromptOnce` 没抛，被 max_tokens 截断 / 被取消 / 被看门狗打断的一轮也会正常返回，但盘上没有 `replyComplete`。所以提交（`commitRound`）只在 `answered` 时做；`started` 报 in-doubt，其余报"没有完整回复 / 发送失败"，都是 `blocked`，不自动重试。
+
+**窗口那边不许绕过账本**：重载后的「自动重发没答完的提问」和看门狗判卡死后的「自动续写」都会换一个新 id 发，所以对被循环占着的会话、循环的一轮（`isLoopRoundMessageId`）一律不做，只认领还在跑的那一轮。
+
+窗口刷新**不触发任何恢复**：driver 在 main 里，正在等的那一轮照常等，renderer 回来后从 `loop:list-live` 重建镜像。
+
+### 13.5 触发（`LoopSpec.trigger`，缺省 = 立即）
+
+- `{ kind: 'immediate' }`：老语义，一轮结束后隔 `everySec` 开下一轮。
+- `{ kind: 'schedule', schedule: { kind: 'interval' | 'daily' | 'weekly', everySec, atTime, weekday } }`：
+  每一轮在 schedule 到点时开始，到点时间**直接用 `schedule.ts` 的 `dueAt`** 算（锚点 = 上一轮开始时间，首轮锚点 = loop 创建时间），
+  所以每天 09:00 不会因为每轮耗时漂移、晚上建的"每天 09:00"不会立刻跑。`once` 不收（多轮 loop 的"只跑一次"没有意义）。
+- `{ kind: 'turn-end', sessionId }`：另一条会话**一轮完整结束**（transcript 里出现一条新的 `replyComplete` 助手回复）时开一轮。
+  启动时记下对方当前最后一条完整回复，之前的不算；本轮还在跑时对方又结束了几轮，只记成"有新事件"，下一次空了只跑一轮（合并，不排队）。
+  不能指向自己（会自己触发自己）。
+
+触发只决定"什么时候开下一轮"；轮数上限、时长上限、停滞、连续通过这些停止规则不变。等待退出（`quitPending`）期间不开新一轮。
+
+### 13.6 终止
+
+- 用户 Stop / /stop / 强制停止 → `loop:stop` → `aborted`；还排在唤醒队列里没发的那一条撤掉（`dropRef`）。正在跑的那一轮由 renderer 照旧 cancel。
+- 删会话 → `discarded`（不写进会话，记录删掉）。
+- 新 loop 覆盖旧的 → `superseded`。
+- **KiroLex 退出 / 窗口刷新不再是终止**：`torn-down` 不再由 renderer 的断开路径写；重启后接着跑（in-flight 的那一轮按 13.4 判）。
+- 每轮校验结果不再每轮一条消息（§12 #6）：driver 把每一轮记在 run 上（`verdictRounds`，中英两版），窗口按它画成**一张**原地替换的 KiroLex 卡片（`showVerdict`，刷新后从 `loop:list-live` 画回来）；结束时 `noteInSession` 落盘一条终止提示，每一轮的结果和输出折在它的「详情」里。in-doubt、重启后发现已落地、发送失败各落盘一句（KiroLex 提示，不进喂给模型的历史）。
+
+### 13.7 这次不做
+
+- **界面上启动 loop 的入口**：之前那次改动刻意移除了 loop 的启动界面（`tests/scheduleWiring.test.ts` 守着"没有 startLoop"），这次不加回来；启动只有主进程 IPC `loop:start`（preload 的 `loopStart`）。要不要、以什么形式（弹窗字段、触发方式怎么选）加回入口需要产品决定。
+- §5 版本化、§8 token 分子：不在本次范围。

@@ -20,9 +20,10 @@ export interface WakeItem {
   /** 什么时候该发（到点时间 / 事件发生时间，epoch ms）—— 同一会话里按它排序。 */
   at: number;
   /** `nudge`：「把工具调用写成了文字」的那一次纠正（index.ts `handleTextToolCall`，判据见 textToolCall.ts）。
-   *  `session`：会话之间互相调用（sessionCalls.ts）—— 对方的回复 / 等回复超时唤醒发起方；界面没就绪时 session_send 也走这里。 */
-  source: 'schedule' | 'bg' | 'watch' | 'nudge' | 'session';
-  /** 定时任务的 id（`source = 'schedule'`）—— 发送时拿它当消息 id 的一部分。 */
+   *  `session`：会话之间互相调用（sessionCalls.ts）—— 对方的回复 / 等回复超时唤醒发起方；界面没就绪时 session_send 也走这里。
+   *  `loop`：主进程里的循环 driver 发的一轮（loopDriver.ts）—— `ref` 就是这一轮确定的消息 id（幂等账本靠它在 transcript 里认这一轮）。 */
+  source: 'schedule' | 'bg' | 'watch' | 'nudge' | 'session' | 'loop';
+  /** 定时任务的 id（`source = 'schedule'`）—— 发送时拿它当消息 id 的一部分；`source = 'loop'` 时就是消息 id 本身。 */
   ref?: string;
   /** `nudge` 才有：发之前先换新的后端会话（「写成文字」反复发作，见 index.ts `handleTextToolCall` / textToolRecovery.ts）。 */
   swap?: boolean;

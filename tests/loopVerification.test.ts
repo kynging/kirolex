@@ -24,6 +24,8 @@ const src = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '
 const MAIN = src('main', 'index.ts');
 const VERIFY = src('main', 'loopVerify.ts');
 const HOOK = src('renderer', 'hooks', 'useAcp.ts');
+/** The loop driver moved to main (docs/loop-engineering-notes.md §13). */
+const DRIVER = src('main', 'loopDriver.ts');
 const CHAT = src('renderer', 'components', 'ChatArea.tsx');
 
 /** Source with comments removed. Needed because these files EXPLAIN the rules they
@@ -230,7 +232,10 @@ describe('the agent cannot choose its own check', () => {
     assert.match(body, /registeredVerifiers\.get\(sessionId\)/);
     assert.match(body, /approved\.command !== command/);
     assert.match(body, /ran: false/);                    // refusal is a result, not a throw
-    assert.match(body, /verifiersInFlight/);             // one check at a time per chat
+    // One check at a time per chat. The guard moved into the helper both `loop:verify` and
+    // the main-process driver use, so it still covers every caller.
+    assert.match(body, /return runLoopVerifier\(sessionId, command, timeoutSec\)/);
+    assert.match(bodyOf(MAIN, 'async function runLoopVerifier('), /verifiersInFlight/);
   });
 
 
@@ -263,22 +268,26 @@ describe('every way a loop can end names its reason', () => {
   });
 
   test('the reason is persisted, not just shown', () => {
-    const report = bodyOf(HOOK, 'const reportLoopEnd = useCallback(');
-    // mutateSessionMessages alone only touches setMessages and the in-memory cache,
-    // so the reason used to live exactly as long as the window did.
-    assert.match(report, /mutateSessionMessages/);
-    assert.match(report, /persistNote/);
+    // The reason used to be pushed into the window's message list, so it lived exactly as
+    // long as the window did. The driver is in main now and reports through `note`,
+    // which index.ts wires to `noteInSession` -- a durable transcript append.
+    const report = bodyOf(DRIVER, 'private report(');
     assert.match(report, /shouldReportTerminal/);
+    assert.match(report, /this\.deps\.note\(/);
+    assert.match(bodyOf(MAIN, 'loopDriver = new LoopDriver('), /note: \(sid, text, variants\) => \{ noteInSession\(sid, text, variants\); \}/);
     const persist = bodyOf(MAIN, "ipcMain.handle('acp:persist-note'");
     assert.match(persist, /store\.appendMessage/);
     assert.match(persist, /role: 'assistant'/);
   });
 
   test('the terminal is written before the run is unregistered', () => {
-    const body = bodyOf(HOOK, 'const endLoop = useCallback(');
-    const wrote = body.indexOf('endWith(handle.run, terminal)');
-    const deleted = body.indexOf('loopsRef.current.delete(sid)');
-    assert.ok(wrote !== -1 && deleted !== -1 && wrote < deleted,
-      'the reason must be recorded on the run before it leaves the map');
+    // In main now: the ended run is written (terminal included) before the window is told
+    // the loop is gone, so the live list can never drop a run whose reason was not kept.
+    const body = bodyOf(DRIVER, '  stop(sessionId: string, terminal: StopReason): boolean {');
+    const ended = body.indexOf('endWith(run, terminal)');
+    const wrote = body.indexOf('this.write(ended)');
+    const gone = body.indexOf('this.broadcast(sessionId, null)');
+    assert.ok(ended !== -1 && wrote > ended && gone > wrote,
+      'the reason must be recorded on the run before it leaves the live list');
   });
 });

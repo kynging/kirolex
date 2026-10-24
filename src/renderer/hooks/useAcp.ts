@@ -11,28 +11,8 @@ import { toSlashCommands, type SlashCommand } from '../slashCommands';
 import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
 import { onBusyChange, onHandoffMainTurn, onOwnTurnEnd, type AdoptionState } from '../handoffAdoption';
-import {
-  advance,
-  beginIteration,
-  createRun,
-  endWith,
-  levelLabel,
-  nextPromptText,
-  noEvidenceVerdict,
-  shouldReportTerminal,
-  terminalSummary,
-  TOLERATED_RETRY_FLOOR_SEC,
-  validateSpec,
-  verdictFromCommand,
-  verdictRound,
-  foldVerdicts,
-  loopVerdictsId,
-  type VerdictRound,
-  type LoopRun,
-  type LoopSpec,
-  type LoopTerminal,
-  type LoopVerdict,
-} from '../loopMachine';
+// The loop's spec / terminals. The driver itself is in main (loopDriver.ts); this hook only mirrors it.
+import { foldVerdicts, isLoopRoundMessageId, loopVerdictsId, type LoopRun, type LoopSpec, type LoopTerminal, type VerdictRound } from '../loopMachine';
 // Scheduling replaced loop mode. Pure module, shared with main (which owns the ticker)
 // rather than duplicated here, so the rules cannot drift between the two.
 import type { ScheduleSpec } from '../../main/schedule';
@@ -78,19 +58,6 @@ export type { ScheduleSpec } from '../../main/schedule';
 const RUN_KINDS = new Set(['execute', 'run', 'bash', 'shell', 'command', 'terminal']);
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected';
-
-/** The loop's live driver state, kept SEPARATE from `LoopRun`.
- *
- *  `LoopRun` (loopMachine.ts) is the serializable per-round record; the two fields
- *  here are the ones that can never be written down -- a pending timer handle and
- *  the flag that stops a scheduled round that is already in flight. They used to sit
- *  in the same type as the user's declaration (`text`, `intervalSec`), which is why
- *  the specification could not be stored or reused at all. */
-type LoopHandle = {
-  run: LoopRun;
-  stopped: boolean;
-  timer: ReturnType<typeof setTimeout> | null;
-};
 
 export type { SlashCommand } from '../slashCommands';
 
@@ -622,8 +589,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // Cross-session context sync: the current session's linked sources (0..n).
   // Persistent per-session; each send injects only each source's NEW messages.
   const [contextLinks, setContextLinks] = useState<{ sourceId: string; sourceTitle: string }[]>([]);
-  // Session IDs with an active single-prompt resend loop.
+  /* Chats a loop is running on -- a MIRROR of main (`loop:list-live` + `loop:changed`). The driver is in
+     main (loopDriver.ts), so a reload does not stop it; this list is re-read rather than kept here. */
   const [loopingIds, setLoopingIds] = useState<string[]>([]);
+  const loopingIdsRef = useRef<Set<string>>(new Set());
 
   const currentMessageRef = useRef<string>('');
   const toolCallsRef = useRef<Map<string, ToolCall>>(new Map());
@@ -816,8 +785,14 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch { /* 写不进去就只在内存里 */ }
   };
   /** 从盘上读回来的会话记录：把这条会话还没处理的失败 steer 作为标红消息挂回去（重启 / 刷新后仍由用户选） */
-  const withFailed = (sid: string, msgs: Message[]): Message[] =>
-    withFailedSteers(msgs, failedSteersRef.current!.get(sid), failedSteerMessage, steerInsertIndex);
+  /** 循环正在跑时那张折叠的校验卡片（每会话一张，见 `showVerdict`）：只在界面上，读盘时也要接回去。 */
+  const liveLoopCardsRef = useRef<Map<string, Message>>(new Map());
+  const withFailed = (sid: string, msgs: Message[]): Message[] => {
+    const out = withFailedSteers(msgs, failedSteersRef.current!.get(sid), failedSteerMessage, steerInsertIndex);
+    /* 循环的校验卡片不落盘（落盘的是结束那条提示）：从盘上读回这条会话时把它接在最后，不然一打开会话它就没了 */
+    const card = liveLoopCardsRef.current.get(sid);
+    return card && !out.some((m) => m.id === card.id) ? [...out, card] : out;
+  };
   const pendingSteersRef = useRef<Map<string, PendingSteer<AttachedFile>[]>>(new PersistedSteerMap());
   /** 上一次运行留下、没被吃的 steer（每个会话一组）。只给一次：App 启动时把它们放进队列。 */
   const takeOrphanSteers = useCallback((): Record<string, { content: string; attachments: AttachedFile[]; msgId?: string }[]> => {
@@ -825,7 +800,6 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     orphanSteersRef.current = {};
     return out;
   }, []);
-  const loopsRef = useRef<Map<string, LoopHandle>>(new Map());
   /** Must equal `DEFAULT_MODEL` in src/main/config.ts.
    *
    *  It cannot be imported: main's tsconfig pins `rootDir: ./src/main`, so a shared
@@ -1371,7 +1345,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch { /* default: enabled */ }
     if (streamingIdsRef.current.has(sid)) return;      // still running — not interrupted
     if (overwriteTargetRef.current.has(sid)) return;   // already flagged
-    if (loopsRef.current.has(sid)) return;             // a loop is already resending this
+    // A loop owns this chat (main drives its rounds): never re-send here -- see below.
+    const loopOwned = loopingIdsRef.current.has(sid);
     if (sessionsRef.current.find((s) => s.id === sid)?.archived) return; // archived chats are inert
     // Walk back over live-only thinking segments AND KiroLex's own notes (「✅ 已按意见改了…」
     // is not a question); a real assistant reply means the turn completed. With `interrupted`
@@ -1400,6 +1375,19 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Anchored to the turn's BASE user message (steers are merged into it on disk, separate in memory).
     const base = found.base;
     const target = msgs[base];
+    /*
+      **循环的一轮（id `loop_…`）、或者被循环占着的会话：不重发，只认领还在跑的那一轮**。
+      循环的轮次归主进程的幂等账本（loopDriver.ts）：重启后「已落地 / 没开始 / in-doubt」由它按 transcript 判；
+      这里重发会换一个新 id，正好绕过账本，把一轮可能已经做过的事再做一遍。窗口刷新时那一轮多半还在主进程里跑 —— 照样认领显示。
+    */
+    if (loopOwned || isLoopRoundMessageId(target?.id)) {
+      void (async () => {
+        let peek: TurnPeek | null = null;
+        try { peek = (await window.kiroApi.peekTurn?.(sid)) ?? null; } catch { peek = null; }
+        if (peek?.live && !streamingIdsRef.current.has(sid)) adoptTurn(sid, peek);
+      })();
+      return;
+    }
     /* 侧栏 review 的改写中断了不回填 —— 见 `isReviseRequest`。要改就回侧栏再按一次「✓ 确认」 */
     if (isReviseRequest(target.content)) return;
     /* 重发的是**基础那条 + 这一轮已经吃进去的 steer**（原来只发基础那条，steer 就丢了）；KiroLex 的提示不拼进去 */
@@ -1573,79 +1561,90 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
   mutateSessionMessagesRef.current = mutateSessionMessages;
 
-  /** Report a finished loop into the chat AND onto disk.
-   *
-   *  Both halves are required. The screen half alone is what the old code had --
-   *  `mutateSessionMessages` only updates `setMessages` and the in-memory cache, so
-   *  the reason a loop ended lived exactly as long as the window did. The durable
-   *  half goes through a dedicated IPC for the same reason steers do: the renderer
-   *  has no other way into the append-only transcript, and that transcript is what
-   *  the context snapshot and history.md are rendered from. */
-  const reportLoopEnd = useCallback((run: LoopRun, terminal: LoopTerminal) => {
-    if (!shouldReportTerminal(terminal)) return;   // the chat itself is gone
+  /*
+    The live-loop MIRROR. Main owns the loops (loopDriver.ts): it decides, sends and verifies
+    every round, and writes the reason a loop ended into the chat itself, durably (with every
+    round's verdict in that note's 详情). This side only DRAWS: the list of chats a loop owns,
+    and the run's folded verdict card. After a reload it re-reads both from main -- the loop
+    kept running while the window was gone.
+  */
+  /** The run's verdicts as ONE KiroLex card, replaced in place (loop-engineering-notes §11 #6:
+   *  twenty rounds used to be twenty messages). Drawn from the rounds main recorded on the run
+   *  (`verdictRounds`, both languages), so a reload re-draws the same card. Screen-only on
+   *  purpose: the durable copy is main's terminal note, which folds every round into 详情. */
+  const showVerdict = useCallback((sessionId: string, run: LoopRun & { verdictRounds?: Array<{ zh: VerdictRound; en: VerdictRound }> }) => {
+    const id = loopVerdictsId(run);
+    const lang = uiLangNow();
+    const rounds = (Array.isArray(run.verdictRounds) ? run.verdictRounds : []).map((r) => r[lang] ?? r.zh).filter(Boolean);
+    if (!rounds.length) return;      // level 0, or nothing measured yet: there is nothing to show
+    const content = foldVerdicts(rounds, uiLangNow());
     const now = Date.now();
-    const text = terminalSummary(run, terminal, now, uiLangNow());
-    /* 这句是 KiroLex 写的：中英两版都留着，显示时按界面语言挑（切语言、重新打开都跟着换） */
-    const variants = { zh: terminalSummary(run, terminal, now, 'zh'), en: terminalSummary(run, terminal, now, 'en') };
-    mutateSessionMessages(run.sessionId, (current) => [
-      ...current,
-      {
-        id: `loop_end_${now}_${Math.random().toString(36).slice(2, 6)}`,
-        role: 'assistant',
-        content: text,
-        variants,
-        timestamp: now,
-      },
-    ]);
-    void window.kiroApi.persistNote?.(run.sessionId, text, variants).catch(() => {});
+    const prev = liveLoopCardsRef.current.get(sessionId);
+    liveLoopCardsRef.current.set(sessionId, { id, role: 'user', kirolex: true, content, timestamp: prev?.id === id ? prev.timestamp : now });
+    mutateSessionMessages(sessionId, (current) => {
+      /* 还没读过历史（列表是空的）就不插：会让历史看起来像没了 —— 读盘时 `withFailed` 会把它接上（同 `withLiveNote`） */
+      if (!current.length) return current;
+      const at = current.findIndex((m) => m.id === id);
+      if (at < 0) return [...current, { id, role: 'user', kirolex: true, content, timestamp: now }];
+      const next = current.slice();
+      next[at] = { ...next[at], content };
+      return next;
+    });
+  }, [mutateSessionMessages]);
+  /** The loop ended: its live card goes (main's terminal note carries the same rounds, durably). */
+  const dropVerdictCard = useCallback((sessionId: string) => {
+    const id = liveLoopCardsRef.current.get(sessionId)?.id;
+    if (!id) return;
+    liveLoopCardsRef.current.delete(sessionId);
+    mutateSessionMessages(sessionId, (current) => current.filter((m) => m.id !== id));
   }, [mutateSessionMessages]);
 
+  useEffect(() => {
+    const refresh = () => {
+      void window.kiroApi.loopListLive?.()
+        .then((list) => {
+          const runs = Array.isArray(list) ? list : [];
+          const ids = Array.from(new Set(runs.map((r: any) => String(r?.sessionId || '')).filter(Boolean)));
+          for (const sid of [...liveLoopCardsRef.current.keys()]) if (!ids.includes(sid)) dropVerdictCard(sid);
+          for (const r of runs) if (r?.sessionId) showVerdict(String(r.sessionId), r);
+          loopingIdsRef.current = new Set(ids);
+          setLoopingIds(ids);
+        })
+        .catch(() => {});
+    };
+    refresh();
+    const off = window.kiroApi.onLoopChanged?.(refresh);
+    return () => { off?.(); };
+  }, [showVerdict, dropVerdictCard]);
+
   /**
-   * End a loop and SAY WHY. Replaces `clearLoopState`.
+   * End a loop because the USER said so -- and only then.
    *
-   *  `terminal` is a required positional parameter, deliberately: there were six
-   *  call sites deleting the map entry and the reason with it, so "the user pressed
-   *  Stop", "the send failed" and "the app is shutting down" were indistinguishable
-   *  afterwards. Making the reason a convention that each call site is supposed to
-   *  remember would leave a seventh call site free to default to `aborted`, i.e. to
-   *  record a real failure as a user action. As a required argument, the compiler
-   *  forces every present and future caller to state what happened.
+   *  The driver is in main, so most endings are no longer decided here: a send failure, an
+   *  executor dying under a round, a spent budget are all seen (and reported) by main. What
+   *  only this side knows is a person's Stop -- the loop's own button, /stop, a background
+   *  pane, force-stop -- and that is relayed as `aborted`. Any other terminal a caller passes
+   *  is deliberately NOT relayed: `torn-down` on a renderer disconnect, or `blocked` when an
+   *  idle executor is recycled, would end a loop main can still continue (it re-attaches on
+   *  the next round). Deletion is handled by main's `acp:delete-session` (`discarded`).
    *
-   *  Order inside the loop matters: the terminal is written INTO the run before the
-   *  entry is unregistered, so the reported summary is the run's own final state
-   *  rather than something reconstructed after the fact.
-   *
-   *  Passing no session ends every loop -- only correct for teardown, where each
-   *  loop genuinely ends for the same reason.
+   *  `terminal` stays a required argument so every call site still states what happened.
+   *  No session = every loop (only meaningful for force-stop). Returns whether a loop was
+   *  running on the target.
    */
   const endLoop = useCallback((sessionId: string | undefined, terminal: LoopTerminal): boolean => {
-    const targets = sessionId ? [sessionId] : Array.from(loopsRef.current.keys());
+    const targets = sessionId ? [sessionId] : Array.from(loopingIdsRef.current);
     let ended = false;
     for (const sid of targets) {
-      const handle = loopsRef.current.get(sid);
-      if (!handle) continue;
-      handle.stopped = true;
-      if (handle.timer) clearTimeout(handle.timer);
-      handle.timer = null;
-      // `endWith` keeps a terminal the state machine already decided (success,
-      // stalled, ...) instead of overwriting it with the caller's guess.
-      handle.run = endWith(handle.run, terminal);
-      loopsRef.current.delete(sid);
+      if (!loopingIdsRef.current.has(sid)) continue;
       ended = true;
-      reportLoopEnd(handle.run, handle.run.terminal as LoopTerminal);
-      // Record the ENDING durably before dropping the record, so the reason a run
-      // stopped is not lost with the process that decided it -- then clear it, so a
-      // finished loop does not leave this session looking busy after a restart.
-      void window.kiroApi.loopPersist?.(sid, handle.run)
-        .then(() => window.kiroApi.loopClear?.(sid))
-        .catch(() => {});
-      // Withdraw main's standing approval for this session's verifier command: it
-      // exists only for the duration of a run the user started.
-      void window.kiroApi.loopRegisterVerifier?.(sid, '', 0).catch(() => {});
+      if (terminal !== 'aborted') continue;
+      loopingIdsRef.current.delete(sid);
+      void window.kiroApi.loopStop?.(sid).catch(() => {});
     }
-    if (ended) setLoopingIds(Array.from(loopsRef.current.keys()));
+    if (ended && terminal === 'aborted') setLoopingIds(Array.from(loopingIdsRef.current));
     return ended;
-  }, [reportLoopEnd]);
+  }, []);
 
   const attachFileChangeToLatestTurn = useCallback((sid: string, tc: ToolCall, isActive: boolean) => {
     upsertFileChange(sid, tc, isActive);
@@ -3049,6 +3048,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       /* 卡死的是侧栏 review 的改写那一轮：不自动续写、不自动重发（见 `isReviseRequest`） */
       const lastUser = [...(messagesCacheRef.current.get(sid) || [])].reverse().find((m) => m.role === 'user' && !isKirolexNote(m));
       if (lastUser && isReviseRequest(lastUser.content)) return;
+      /*
+        **循环的一轮卡死了：这里不续写、不重发**。轮次归主进程的 driver（loopDriver.ts）：被看门狗打断的那一轮没有完整回复，
+        driver 按盘上状态判成 in-doubt、停下并在会话里说清楚。这里再发一句「接着做」会换一个新 id，不经账本、不扣轮数，
+        还会和 driver 的校验 / 下一轮抢这条会话 —— 而且窗口开着和刷新后行为不一样。
+      */
+      if (loopingIdsRef.current.has(sid) || isLoopRoundMessageId(lastUser?.id)) return;
       if (produced) {
         // A partial reply exists, so resending would duplicate it -- but the turn was
         // still CUT SHORT by us, and it used to be left looking completed: no banner, an
@@ -3139,7 +3144,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           这期间队列先别发。
         */
         const autoRecover = wasStreaming && !recoveryCancelledRef.current.has(sid)
-          && autoRetryMax() > 0 && !loopsRef.current.has(sid);
+          && autoRetryMax() > 0 && !loopingIdsRef.current.has(sid);
         if (wasStreaming && !autoRecover) {
           // Deliberately NOT also reported through the error banner. One state, one
           // place: the interrupted bar is derived from the same flag that disables the
@@ -4067,74 +4072,6 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => window.removeEventListener('kirolex:sessions-restored', onRestored);
   }, []);
 
-  // Send one loop iteration to a session that is not currently visible.
-  // The response continues streaming into that session's cache while the user
-  // works elsewhere; the durable transcript remains owned by the main process.
-  const sendLoopBackground = useCallback(async (sessionId: string, text: string): Promise<boolean> => {
-    const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
-    const appendStopped = (reason: string) => {
-      mutateSessionMessages(sessionId, (current) => [
-        ...current,
-        {
-          id: `loop_err_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`,
-          role: 'assistant',
-          content: `⚠️ Loop stopped: ${reason}`,
-          timestamp: Date.now(),
-        },
-      ]);
-    };
-
-    if (!session || session.archived || sessionId.startsWith('pending_')) {
-      appendStopped('session is unavailable');
-      return false;
-    }
-
-    const activeModel = modelForSession(sessionId);
-    const userMessageId = `user_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
-    /* 这条是为这条会话写的：发送失败没落盘时，切会话对账也认它（见 messageReconcile） */
-    markLocalOnly(sessionId, [userMessageId]);
-    mutateSessionMessages(sessionId, (current) => [
-      ...current,
-      { id: userMessageId, role: 'user', content: text, timestamp: Date.now() },
-    ]);
-
-    try {
-      if (creatingRef.current.has(sessionId)) {
-        try { await creatingRef.current.get(sessionId); } catch {}
-      }
-      if (!attachedIdsRef.current.has(sessionId)) {
-        markConnecting(sessionId);
-        try {
-          await window.kiroApi.loadSession(sessionId, attachCwdFor(sessionId), activeModel);
-          addAttached(sessionId);
-        } finally {
-          clearConnecting(sessionId);
-        }
-      }
-
-      const turnToken = beginStreamingTurn(sessionId);
-      addAttached(sessionId);
-      lastPromptedSessionRef.current = sessionId;
-      try {
-        await window.kiroApi.prompt(
-          sessionId,
-          [{ type: 'text', text }],
-          activeModel,
-          projectForSession(sessionId),
-          { messageId: userMessageId, displayText: text },
-        );
-        return true;
-      } finally {
-        finishStreamingTurn(sessionId, turnToken);
-      }
-    } catch (error: any) {
-      if (loopsRef.current.has(sessionId)) {
-        appendStopped(error?.message || 'send failed');
-      }
-      return false;
-    }
-  }, [mutateSessionMessages]);
-
   const sendMessage = useCallback(async (prompt: any[], localResponse?: string, attachments?: any[], model?: string, display?: { text?: string; pastes?: any[]; /** 调用方指定的用户消息 id（自动重发经控制入口发的那条时带标记） */ messageId?: string }, targetSid?: string) => {
     // `targetSid` makes this send TARGET-ADDRESSED. Without it this function always
     // sent to whatever chat was focused, which is wrong for every caller that acts
@@ -4488,36 +4425,6 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   /** 每个会话试过几次自动命名 —— 连着失败三次才退回截断（见 sendMessage 末尾那段） */
   const sendMessageRef = useRef(sendMessage);
   sendMessageRef.current = sendMessage;
-
-  /** Show this round's verdict in the chat WITHOUT persisting it.
-   *
-   *  On purpose: the verdict's durable copy is the next round's prompt, which
-   *  `acp:prompt` writes to the transcript verbatim (see `nextPromptText`). Writing
-   *  it twice would put the same verifier output in the record under two different
-   *  authors. Only the run's TERMINAL is persisted separately, because nothing else
-   *  carries it.
-   *
-   *  ONE card per loop, not one message per round (loop-engineering-notes §11 #6: twenty
-   *  rounds were twenty messages of noise). Each round is added to this run's list and the
-   *  same card is replaced in place (`foldVerdicts`: latest round on top, every round in
-   *  its 详情). It is a KiroLex card (`kirolex: true`), not an assistant message: the
-   *  checker said this, not the model. */
-  const loopVerdictRoundsRef = useRef<Map<string, VerdictRound[]>>(new Map());
-  const showVerdict = useCallback((sessionId: string, run: LoopRun, verdict: LoopVerdict) => {
-    if (verdict.noEvidence) return;      // level 0: there is nothing to show
-    const id = loopVerdictsId(run);
-    const rounds = [...(loopVerdictRoundsRef.current.get(id) || []), verdictRound(run, verdict, uiLangNow())];
-    loopVerdictRoundsRef.current.set(id, rounds);
-    const content = foldVerdicts(rounds, uiLangNow());
-    const now = Date.now();
-    mutateSessionMessages(sessionId, (current) => {
-      const at = current.findIndex((m) => m.id === id);
-      if (at < 0) return [...current, { id, role: 'user', kirolex: true, content, timestamp: now }];
-      const next = current.slice();
-      next[at] = { ...next[at], content };
-      return next;
-    });
-  }, [mutateSessionMessages]);
 
   /**
    * THE JOBS MAIN IS HOLDING, mirrored here only so the UI can state them.

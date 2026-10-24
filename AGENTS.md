@@ -166,9 +166,10 @@ docs/            设计文档（§1）
 | `src/main/schedule.ts` | 纯逻辑：`ScheduleKind = interval/daily/weekly/once`，`maxRuns` 必填（唯一例外：模型建的目标型任务带 `until` 时可为 `null`，按目标停），`dueAt`、`isDue`、`recordRun`、`validateSchedule`；`planScheduleCheck`（`checkCommand` 退出码 0 达成 / 1 没变化不叫醒 / 其他出错，连续 3 次暂停） |
 | `src/main/scheduleStore.ts` | `~/.kirolex/schedules/<id>.json`，函数都收 `home` 参数（测试传临时目录） |
 | `index.ts` | `scheduleTicker`（20 s 一跳）、`runScheduledJob`（**先记账再发** → `sendPromptOnce`）、`schedulesInFlight`、`schedule:create/list/pause/remove` + 广播 `schedule:changed` |
-| `src/main/loopStore.ts` | `~/.kirolex/loop-runs/<sid>.json`，主进程持有的轮次计数器，`beginRound` 发送前先落盘；IPC `loop:persist / begin-round / read / list-live / clear` |
+| `src/main/loopStore.ts` | `~/.kirolex/loop-runs/<sid>.json`，主进程持有的轮次计数器 + 幂等账本：`tryStartRound`（扣轮次和 in-flight 一次写）→ 发送 → `commitRound`；IPC `loop:persist / begin-round / read / list-live / clear` |
+| `src/main/loopDriver.ts` | **loop 的 driver 在主进程**（纯，依赖注入）：决定下一轮、经唤醒队列（`source: 'loop'`）发送、等结果、校验；触发方式 立即 / 定时（`schedule.ts` 的 `dueAt`）/ 某会话一轮结束；重启后按账本续跑（in-doubt 不重发）。`index.ts` 接 `loop:start / stop`、2 s 一跳、广播 `loop:changed`；渲染端只镜像 + 停止。设计见 `docs/loop-engineering-notes.md` §13 |
 | `src/main/loopVerify.ts` | 跑校验命令只看退出码；远程会话在同一台远端上跑；`loop:verify` 只接受先 `loop:register-verifier` 登记过的命令（这是一个执行任意命令的口子） |
-| `src/renderer/loopMachine.ts` | 循环规格 / 状态机（纯，`LoopRun` 必须可 JSON 序列化，有测试守着）。`useAcp.ts` 里 `createSchedule` 注释说它取代了 `startLoop`——渲染端循环入口是否还在用，改之前自己确认 |
+| `src/main/loopMachine.ts` | 循环规格 / 状态机（纯，`LoopRun` 必须可 JSON 序列化，有测试守着）。`src/renderer/loopMachine.ts` 只是 re-export。界面上没有启动循环的入口（刻意移除过，`tests/scheduleWiring.test.ts` 守着）；启动只有主进程 IPC `loop:start`（preload `loopStart`） |
 | `src/renderer/scheduleView.ts` | 倒计时 / 摘要的纯展示逻辑 |
 
 ### 3.8 记忆

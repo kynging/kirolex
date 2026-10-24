@@ -17,6 +17,7 @@ import { ZH_MODULES_A } from './uiTextZh/modulesA.ts';
 import { ZH_MODULES_B } from './uiTextZh/modulesB.ts';
 import { ZH_WAKE } from './uiTextZh/wake.ts';
 import { ZH_SESSION_CALLS } from './uiTextZh/sessionCalls.ts';
+import { ZH_LOOP } from './uiTextZh/loop.ts';
 
 export type UiLang = 'zh' | 'en';
 
@@ -47,6 +48,7 @@ export const ZH_MAIN_PARTS: Record<string, Record<string, string>> = {
   modulesA: ZH_MODULES_A,
   modulesB: ZH_MODULES_B,
   wake: ZH_WAKE,
+  loop: ZH_LOOP,
   sessionCalls: ZH_SESSION_CALLS,
 };
 

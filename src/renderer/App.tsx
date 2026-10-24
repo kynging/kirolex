@@ -103,6 +103,10 @@ declare global {
       loopRead?: (sessionId: string) => Promise<any | null>;
       loopListLive?: () => Promise<any[]>;
       loopClear?: (sessionId: string) => Promise<{ ok: boolean }>;
+      /** THE LOOP DRIVER is in main too (loopDriver.ts): this window only starts, stops and mirrors. */
+      loopStart?: (sessionId: string, spec: any) => Promise<{ ok: boolean; error?: string }>;
+      loopStop?: (sessionId: string) => Promise<{ ok: boolean }>;
+      onLoopChanged?: (cb: (payload: { sessionId: string; run: any | null }) => void) => () => void;
       /** SCHEDULED TASKS. The ticker is in main, so a job fires with no window open. */
       scheduleCreate?: (sessionId: string, spec: any) => Promise<{ ok: boolean; id?: string; error?: string; nextRunAt?: number | null; describe?: string }>;
       scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null }>>;

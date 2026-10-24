@@ -12,7 +12,7 @@
  *
  *   1. the counter is owned by the runtime, not the process   <- this file
  *   2. every round is checkpointed before the next begins     <- this file
- *   3. iteration boundaries are idempotent
+ *   3. iteration boundaries are idempotent                   <- this file (the ledger) + loopDriver
  *   4. termination is explicit                                <- already in loopMachine
  *
  * `beginRound` delivers 1 and 2 together, and the order matters: the round is charged
@@ -20,10 +20,9 @@
  * mean a process that dies mid-round forgets it paid — the shape of a crash loop that
  * bills a model turn per restart, forever.
  *
- * WHAT THIS IS NOT. It is not the loop driver. The send path still lives in the
- * renderer, where the streaming state, attach bookkeeping and message list are; moving
- * that here is a separate change. What moved is the thing that must not be lost: the
- * count, the budget decision, and the record of why a run ended.
+ * WHAT THIS IS NOT. It is not the loop driver -- that is `loopDriver.ts`, also in main. This
+ * file owns what must not be lost: the count, the budget decision, the iteration ledger
+ * (`tryStartRound` / `commitRound`) and the record of why a run ended.
  *
  * `home` is a PARAMETER for the same reason as in flowStore: a module that reads
  * `os.homedir()` internally can only be tested by writing into the user's real data.
@@ -32,6 +31,7 @@
 import fs from 'fs';
 import path from 'path';
 import { tr } from './uiText.ts';
+import { loopRoundMessageId } from './loopMachine.ts';
 
 /** Structurally `LoopRun` from the renderer's loopMachine, kept as a loose shape on
  *  purpose. main's tsconfig pins `rootDir: ./src/main`, so importing the renderer's
@@ -139,6 +139,77 @@ export function beginRound(
   const charged = { ...run, iteration: run.iteration + 1 };
   writeLoop(sessionId, charged, home);
   return { run: charged, terminal: null };
+}
+
+/** The "started" half of the iteration ledger (§4 property 3): which round was handed to
+ *  the backend, under which message id, and when. Cleared by `commitRound`. */
+export interface LoopInFlight {
+  iteration: number;
+  messageId: string;
+  at: number;
+}
+
+/** The message id round `iteration` of this run is sent under. DETERMINISTIC on purpose:
+ *  after a crash the ledger finds the round in the transcript by this id, and a re-send
+ *  reuses it so `promptDedupe` neither appends a second user message nor re-runs a round
+ *  that already answered. `startedAt` keeps two loops on the same chat apart. */
+export function roundMessageId(run: Pick<StoredLoopRun, 'startedAt'>, iteration: number): string {
+  return loopRoundMessageId(run, iteration);
+}
+
+/**
+ * `beginRound` + the ledger's TryStart, in ONE atomic write.
+ *
+ * Two writes ("charge", then "mark in flight") would leave a window where a crash records
+ * a round as paid for without any trace of whether it was sent -- the next start would
+ * charge another round for the same work. Written together, every charged round either
+ * has its `inFlight` entry or has been committed.
+ */
+export function tryStartRound(
+  sessionId: string,
+  home: string,
+  now: number,
+  isProtected?: Protected,
+  /** Fields the caller needs written in the SAME write (e.g. the trigger event this round
+   *  consumes): split into a second write, a crash in between would replay the event. */
+  extra?: Record<string, unknown>,
+): { run: StoredLoopRun | null; terminal: string | null; inFlight?: LoopInFlight; error?: string } {
+  if (isProtected?.(sessionId)) {
+    return { run: null, terminal: null, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+  }
+  const run = readLoop(sessionId, home);
+  if (!run) return { run: null, terminal: null, error: tr('No loop record found for this session') };
+  if (run.terminal) return { run, terminal: run.terminal };
+  // A round already in flight is never charged twice: hand back the SAME round.
+  const open = run.inFlight as LoopInFlight | null | undefined;
+  if (open) return { run, terminal: null, inFlight: open };
+
+  const settle = (terminal: string) => {
+    const ended = { ...run, terminal };
+    writeLoop(sessionId, ended, home);
+    return { run: ended, terminal };
+  };
+  if (run.iteration >= run.spec.stop.maxIterations) return settle('exhausted');
+  const budget = run.spec.stop.maxWallClockSec;
+  if (budget && now - run.startedAt >= budget * 1000) return settle('exhausted');
+
+  const iteration = run.iteration + 1;
+  const inFlight: LoopInFlight = { iteration, messageId: roundMessageId(run, iteration), at: now };
+  const charged = { ...run, ...(extra || {}), iteration, inFlight, lastRoundAt: now };
+  writeLoop(sessionId, charged, home);
+  return { run: charged, terminal: null, inFlight };
+}
+
+/** The "completed" half of the ledger: the round landed, so the next step is to verify
+ *  it. Only clears the entry it was given -- a stale commit cannot close a newer round. */
+export function commitRound(sessionId: string, home: string, messageId: string, now: number): StoredLoopRun | null {
+  const run = readLoop(sessionId, home);
+  if (!run) return null;
+  const open = run.inFlight as LoopInFlight | null | undefined;
+  if (!open || open.messageId !== messageId) return run;
+  const committed = { ...run, inFlight: null, phase: 'verify', nextAt: now, committedIteration: open.iteration };
+  writeLoop(sessionId, committed, home);
+  return committed;
 }
 
 /** Every loop still running. The way to find a loop that was in flight when the app

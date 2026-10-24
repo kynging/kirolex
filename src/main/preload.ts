@@ -345,9 +345,19 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  the updated run, or a terminal when the budget is spent. */
   loopBeginRound: (sessionId: string) => ipcRenderer.invoke('loop:begin-round', sessionId),
   loopRead: (sessionId: string) => ipcRenderer.invoke('loop:read', sessionId),
-  /** Loops that were still running when the app last closed. */
+  /** Loops main is driving right now (they survive a reload and a restart). */
   loopListLive: () => ipcRenderer.invoke('loop:list-live'),
   loopClear: (sessionId: string) => ipcRenderer.invoke('loop:clear', sessionId),
+  /** Start a loop: main drives it from here on (loopDriver.ts). */
+  loopStart: (sessionId: string, spec: any) => ipcRenderer.invoke('loop:start', sessionId, spec),
+  /** The user stopped it (Stop, /stop, force-stop). */
+  loopStop: (sessionId: string) => ipcRenderer.invoke('loop:stop', sessionId, 'aborted'),
+  /** A loop started, advanced or ended: re-read `loopListLive`. */
+  onLoopChanged: (cb: (payload: any) => void) => {
+    const handler = (_e: any, payload: any) => cb(payload);
+    ipcRenderer.on('loop:changed', handler);
+    return () => ipcRenderer.removeListener('loop:changed', handler);
+  },
 
   /* ── SKILL FLOWS ──
    *

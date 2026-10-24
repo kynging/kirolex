@@ -67,6 +67,7 @@ import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectCha
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
+import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
@@ -4748,8 +4749,12 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants,
  * 真正发送的那一下（`wakeDeliver`）要用 `sendPromptOnce` / `ensureAttached`，它们在 whenReady 里，到时候再挂上。
  */
 let wakeDeliver: ((item: WakeItem) => Promise<void>) | null = null;
+/** 循环的一轮（`source: 'loop'`）真正发出去的那一下 —— 同 `wakeDeliver`，在 whenReady 里挂上。 */
+let loopDeliver: ((item: WakeItem) => Promise<void>) | null = null;
 /** 控制入口 `new-backend` 要先挂上执行器 —— `ensureAttached` 在 whenReady 里，到时候再挂上。 */
 let attachForControl: ((sessionId: string) => Promise<unknown>) | null = null;
+/** 主进程里的循环 driver（loopDriver.ts）—— 它的发送 / 校验要用 whenReady 里的东西，到时候再建；删会话时要用它记 discarded。 */
+let loopDriver: LoopDriver | null = null;
 /**
  * 每条会话开过几轮（`sendPromptOnce` 每次新发一条 +1，纠正那一轮不算）。
  * 「把工具调用写成了文字」的纠正排着的时候又开了别的一轮（你自己发了一条、排队的、后台唤醒），
@@ -4766,6 +4771,8 @@ const wakeDispatcher = new WakeDispatcher({
   isBusy: (sid) => quitPending || !!busyReasonFor(sid),
   deliver: (item) => {
     if (!wakeDeliver) return Promise.reject(Object.assign(new Error('KiroLex is still starting'), { code: SESSION_BUSY }));
+    /* 循环的一轮有自己的发法（确定的消息 id、发之前按循环记录再判一次，见 `loopDeliver`） */
+    if (item.source === 'loop' && loopDeliver) return loopDeliver(item);
     return wakeDeliver(item);
   },
   /* 定时任务那一次排着的时候被删 / 暂停 / 过期了就不发（盘上的状态为准，见 `scheduleDeliveryBlocker`） */
@@ -10438,6 +10445,12 @@ ${hint}` : ''}` };
     }
     const rejected = loopVerify.rejectRequest(command, timeoutSec);
     if (rejected) return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: rejected };
+    return runLoopVerifier(sessionId, command, timeoutSec);
+  });
+
+  /** Run one loop check on the session's host -- shared by `loop:verify` and the main-process
+   *  loop driver, so both launch the check by the same rules (and share the one-at-a-time guard). */
+  async function runLoopVerifier(sessionId: string, command: string, timeoutSec: number) {
     if (verifiersInFlight.has(sessionId)) {
       return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: tr('The previous check has not finished yet') };
     }
@@ -10462,7 +10475,7 @@ ${hint}` : ''}` };
     } finally {
       verifiersInFlight.delete(sessionId);
     }
-  });
+  }
 
   /* ─────────────────────────── SCHEDULED TASKS ───────────────────────────
    *
@@ -10647,6 +10660,36 @@ ${hint}` : ''}` };
   };
 
   /*
+    **循环的一轮**（loopDriver.ts 经唤醒队列发的）：和上面同一套挂执行器 → `sendPromptOnce` → `announce`，差别只有三处：
+      · 消息 id 用 driver 给的那个（`loop_<开始时间>_<轮次>`）—— 重启后幂等账本按它在 transcript 里认这一轮，
+        同 id 重发时 promptDedupe 也不会再追加一条用户消息；
+      · 发之前（挂完执行器、提交之前）按盘上的循环记录再判一次：排着等的时候循环被停 / 被替换了就不发；
+      · 不是后台输出（那是用户自己写的任务加上一轮的校验结果），不打 bgOutput 标记。
+  */
+  loopDeliver = async (item) => {
+    const sid = item.sessionId;
+    if (deletedSessionIds.has(sid)) throw new Error(tr('This session has been deleted. Nothing more will be sent to it.'));
+    if (refuseAdvancedOnly(sid, 'wake')) throw new Error(tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.'));
+    if (store.readRecord(sid)?.archived) throw new Error(tr('This session is archived. Unarchive it to keep chatting.'));
+    const stillWanted = () => loopRoundBlocker(os.homedir(), sid, item.ref);
+    { const blocked = stillWanted(); if (blocked) throw new WakeSkipped(blocked); }
+    await ensureAttached(sid);
+    if (!sessionClients.get(sid)) throw new Error(tr('Session not connected'));
+    { const blocked = stillWanted(); if (blocked) throw new WakeSkipped(blocked); }
+    await sendPromptOnce(sid, [{ type: 'text', text: item.text }], undefined, {
+      messageId: String(item.ref),
+      displayText: item.text,
+      announce: true,
+      stillWanted,
+    }).catch((err) => {
+      /* 同 wakeDeliver：没发出去就把随行快照的标记收回，下一条照常带上历史 */
+      const e = sessionClients.get(sid);
+      if (e?.rideAlongUnconfirmed) { e.rideAlongUnconfirmed = false; clearContextEstablished(sid); }
+      throw err;
+    });
+  };
+
+  /*
     会话间 `session_send` 的 `waitReply`：重启前还在等的接着等（期限照旧）；每 2 秒看一遍对方结束了没有
     （没有登记时什么都不做）。看到了就经 wakeDispatcher 唤醒发起方。
   */
@@ -10777,9 +10820,8 @@ ${hint}` : ''}` };
    * reset it to zero -- so a loop declared "at most 20 rounds" got a fresh 20 on every
    * restart, and its budget was not a budget at all.
    *
-   * The send path is still driven from the renderer (it needs the streaming state and
-   * the message list). What moved is the part that must survive: the count, the budget
-   * decision, and the recorded reason a run ended. */
+   * The driver that spends this counter is in main as well now (see THE LOOP DRIVER
+   * below); these handlers stay for the record file itself. */
   ipcMain.handle('loop:persist', (_event, sessionId: string, run: any) => {
     if (!sessionId || !run?.spec?.stop) return { ok: false, error: 'no run' };
     { const advRefused = refuseAdvancedOnly(sessionId, 'loop:persist'); if (advRefused) return { ok: false, error: advRefused }; }
@@ -10805,8 +10847,65 @@ ${hint}` : ''}` };
   });
 
   ipcMain.handle('loop:read', (_event, sessionId: string) => loopStore.readLoop(sessionId, os.homedir()));
-  /* advanced 会话的循环不交给标准版去续跑（它们的会话标准版本来就看不见、也发不进去） */
-  ipcMain.handle('loop:list-live', () => loopStore.listLiveLoops(os.homedir()).filter((r) => !store.isAdvancedOnlySession(r.sessionId)));
+
+  /* ────────────────────── THE LOOP DRIVER (loopDriver.ts) ──────────────────────
+   *
+   * The driver itself now lives here too: deciding the next round, sending it, waiting
+   * for it and verifying it. A window reload no longer interrupts a loop, and a restart
+   * resumes it from the record (docs/loop-engineering-notes.md §13). The renderer only
+   * mirrors `loop:changed` and relays Stop.
+   *
+   * A round is sent through the wake queue (`source: 'loop'`) -- the main-process half of
+   * `session_send`'s path, also used by scheduled tasks: it attaches the executor, waits
+   * for a busy turn to end, sends a NEW message (never a steer) and announces it to the
+   * window if one is open. Not `forwardToUi`: that needs the window, which is the point. */
+  loopDriver = new LoopDriver({
+    home: os.homedir(),
+    now: () => Date.now(),
+    canStart: (sid) => !quitPending && !deletedSessionIds.has(sid) && !store.readRecord(sid)?.archived && !!store.readRecord(sid),
+    send: (sid, text, messageId) => wakeDispatcher.enqueue({ sessionId: sid, text, at: Date.now(), source: 'loop', ref: messageId }),
+    verify: (sid, command, timeoutSec) => {
+      const rejected = loopVerify.rejectRequest(command, timeoutSec);
+      if (rejected) return Promise.resolve({ ran: false, exitCode: null, output: '', error: rejected });
+      return runLoopVerifier(sid, command, timeoutSec);
+    },
+    messageStatus: (sid, messageId) => store.messageIdStatusOnDisk(sid, messageId),
+    lastCompletedReply: (sid) => {
+      const msgs = store.readTranscript(sid);
+      for (let i = msgs.length - 1; i >= 0; i--) if (msgs[i].role === 'assistant' && msgs[i].replyComplete) return msgs[i].id;
+      return null;
+    },
+    sessionExists: (sid) => !!controlVisibleRecord(sid),
+    note: (sid, text, variants) => { noteInSession(sid, text, variants); },
+    changed: (sid, run) => { mainWindow?.webContents.send('loop:changed', { sessionId: sid, run }); },
+    dropPending: (messageId) => { wakeDispatcher.dropRef(messageId, 'loop stopped'); },
+    isProtected: store.isAdvancedOnlySession,
+    log: (m) => logger.info('loop', m),
+  });
+  const LOOP_TICK_MS = 2000;
+  const loopTicker = setInterval(() => { if (!quitPending) void loopDriver?.tick(); }, LOOP_TICK_MS);
+  app.on('before-quit', () => clearInterval(loopTicker));
+
+  ipcMain.handle('loop:start', (_event, sessionId: string, spec: any) => {
+    if (!sessionId || !spec || typeof spec !== 'object') return { ok: false, error: 'no spec' };
+    { const advRefused = refuseAdvancedOnly(sessionId, 'loop:start'); if (advRefused) return { ok: false, error: advRefused }; }
+    const rec = controlVisibleRecord(sessionId);
+    if (!rec) return { ok: false, error: tr('Select a session that has already been created first') };
+    if (rec.archived) return { ok: false, error: tr('This session is archived. Unarchive it to keep chatting.') };
+    /* spec 来自渲染端：形状不对（缺 stop / verifier）时校验本身会抛 —— 按「没启动」回，不让 IPC 报异常 */
+    let result: ReturnType<LoopDriver['start']>;
+    try { result = loopDriver!.start(sessionId, spec); } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+    if (result.ok) void loopDriver!.tick();
+    return result.ok ? { ok: true } : { ok: false, error: result.error };
+  });
+  /* 只收「用户停的」：删会话走 acp:delete-session 那边（discarded），其他终止由 driver 自己判 */
+  ipcMain.handle('loop:stop', (_event, sessionId: string, terminal?: LoopStopReason) => {
+    if (!sessionId) return { ok: false };
+    if (terminal !== undefined && terminal !== 'aborted') return { ok: false, error: 'bad terminal' };
+    return { ok: loopDriver!.stop(sessionId, 'aborted') };
+  });
+  /* 只列主进程在驱动的（旧版本留下的记录不续跑，也就不该显示成"被循环占着"）；advanced 会话的不在里面 */
+  ipcMain.handle('loop:list-live', () => loopDriver!.list().filter((r) => !store.isAdvancedOnlySession(r.sessionId)));
   ipcMain.handle('loop:clear', (_event, sessionId: string) => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'loop:clear'); if (advRefused) return { ok: false, error: advRefused }; }
     loopStore.clearLoop(sessionId, os.homedir(), store.isAdvancedOnlySession);
@@ -11093,6 +11192,8 @@ ${hint}` : ''}` };
     /* 它的后台命令 / 监视一起停掉，排着没发的唤醒作废 */
     void bgJobs.stopSession(sessionId);
     wakeDispatcher.drop(sessionId, 'session deleted');
+    /* 它身上的循环一起结束（discarded：记录删掉，不往要删的会话里写） */
+    loopDriver?.stop(sessionId, 'discarded');
     /* 它发出去、还在等回复的那几条不再等（对方那边由 ReplyWatcher 自己发现「对方被删了」） */
     replyWatcher.dropFrom(sessionId);
     // Durable tombstone FIRST: `deletedSessionIds` is in-memory only, so if the
