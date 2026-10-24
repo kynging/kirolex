@@ -70,7 +70,7 @@ src/renderer/    React 渲染端（Vite，root 就是这个目录，输出 dist/
   components/ChatArea.tsx ≈4600 行：一个聊天格（消息列表、输入框、排队卡片）
   components/*.tsx 其余 UI；*.ts 是抽出来能单测的纯逻辑
 tests/           node:test，约 110 个 *.test.ts
-scripts/         dev-hot.mjs（dev 监管）、remote-bootstrap.sh（管道给远端 bash）、acp-probe.mjs / steer-smoke.mjs（真 kiro-cli 冒烟，花额度）、skill-validate.mjs
+scripts/         dev-hot.mjs（dev 监管）、remote-bootstrap.sh（管道给远端 bash）、acp-probe.mjs / steer-smoke.mjs（真 kiro-cli 冒烟，花额度）、kiro-multisession-probe.mjs（一个 kiro-cli 进程多会话互不干扰的实测，`--turns` 花额度）、skill-validate.mjs
 docs/            设计文档（§1）
 ```
 

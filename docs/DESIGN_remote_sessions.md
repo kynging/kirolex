@@ -222,9 +222,81 @@ kiro-cli 对不存在的模型是**静默退回**（日志里见过 `Model 'gpt-
 
 该治的是浪费本身：
 * **两端都扫孤儿**（上一节）—— 那才是把机器打爆的东西；
-* **复用**（还没做）：`kiro-cli acp` 一个进程能承载多条 ACP 会话（`session/new` 每次返回一个新
+* **复用**（还没做，**卡在实测**）：`kiro-cli acp` 一个进程能承载多条 ACP 会话（`session/new` 每次返回一个新
   session id），所以理论上一台机器一条 ssh + 一个 kiro-cli 就够，现在是每条会话各占一套。
-  这是省资源的正路，也是下一步。
+  这是省资源的正路；先决条件和已测到的结论见下一节。
+
+## 一个 kiro-cli 进程带多条会话（复用）—— 实测结论与没过的那道门
+
+目标：同一台机器 + 同一 kiro agent + 同一 MCP 组合的远程会话共用一个 `kiro-cli acp`（每进程上限默认 8），
+一条出错 / 被停 / 换模型不牵连别的，进程崩了大家各走断线重连，孤儿清扫照样认得它。
+**动手的前提是先实测"一个进程里多条会话互不干扰"，测不过就不改代码** —— 这一版停在这里。
+
+### 测到了什么（2026-10-24，kiro-cli 2.13.0，本机 Windows；脚本 `scripts/kiro-multisession-probe.mjs`）
+
+| 检查 | 结果 |
+|---|---|
+| 一个进程里两次 `session/new` | ✅ 两个不同 id |
+| 每条会话自己的 MCP：`session/new` 的 `mcpServers` 各给一个 http URL | ✅ 两条会话各自 `initialize` + `tools/list` 了**自己那个**路径，没串 |
+| A 上 `session/set_model` | ✅ 回 `{}`；B 照常 |
+| `session/set_model` 给一个不存在的模型 | ⚠️ 也回 `{}`（**静默接受**，和 `--model` 一样）—— 模型合不合法只能 KiroLex 自己判（`pickRemoteModel` 那条路照旧要走） |
+| 同一进程里再 `session/load` 一条正在用的会话 | ✅ 正常回 |
+| 另一个进程去 load A（X 进程还拿着 A） | ✅ 照旧拒：`Session is active in another process (PID …)` |
+| `_kiro.dev/session/terminate` A | ✅ 回 `{}`；之后**另一个进程能 load A** 了，X 上的 B 照常答话 |
+| `session/close` / `session/unload` / `session/delete` | `Method not found` —— 释放一条会话只有 `_kiro.dev/session/terminate` 这一个口子 |
+| 不带 `sessionId` 的通知 | ⚠️ `_kiro.dev/subagent/list_update`（子代理名单）**只有进程级**，不说是哪条会话的 |
+
+能下的结论：**"停一条"有办法**（terminate 只放那一条，不用杀进程，也解了跨进程锁），
+**"每条会话一个 token"也有办法**（`kirolex-local` 和转发的 MCP 从 agent JSON 挪到 `session/new` 的 `mcpServers`，
+共用的那份 agent JSON 里就不再带会话 token）。
+
+### 没测到、而正是要求里点名的那几件
+
+本机 kiro-cli 没登录（`kiro-cli whoami` → Not logged in），这台机器也连不到任何远端，所以**一轮都跑不起来**
+（`session/prompt` 回 `dispatch failure`）。下面这些只能在登录过的远端上测：
+
+1. **取消**：C、D 同时在跑，`session/cancel` C —— C 停、D 不停？（要求原文点名的一项）
+2. **terminate 一条正在跑的会话**时，同进程另一条正在跑的那一轮会不会被带走（探针让 C、D 一起跑，两条都出过字**而且两条的
+   prompt 都还没回**才 terminate C，看 terminate 成不成、C 那一轮会不会收尾、D 能不能跑完；任何一条在重叠出现之前
+   就结束了，记 UNVERIFIED —— 那时释放的是一条空闲会话，什么都没测到）。
+3. **换模型之后真跑一轮**：只看 `set_model` 的回包说明不了"另一条没跟着换"（不存在的模型也回 `{}`）。探针从会话
+   **自己报的模型**核对：先看通知里带不带模型，没有就把两条 terminate 掉、换一个进程 load 回来读 `currentModelId`。
+   两条路都分不出来时记 **UNVERIFIED** —— 那**不算通过**，这一项就还是没测成。
+4. **子代理归属**：`acp-probe.mjs` 实测过一轮里 68% 的通知来自子代理自己的 session id；而子代理名单这条通知
+   顶层没有 sessionId。两条会话同时派子代理时，KiroLex 得靠名单里每一项的 `parentSessionId`
+   （kiro-cli 自己的 TUI 读这个字段，二进制里看得到）把子会话归回父会话 —— 远端 1.27 / 2.24 带不带它没测过。
+   归错的后果是**一条会话的工具调用和权限请求出现在另一条会话里**，比多占一点内存贵得多。
+5. **共用 agent 的 `tools` 白名单**认不认 `session/new` 给的 MCP（现在 `@kirolex-local` 是靠 agent JSON 并进去的）——
+   不认的话表现是"远端说它没有 local_read"，而隧道是通的（「它有哪些工具，不能靠历史推断」那节的老坑）。
+6. 远端两台的版本（1.27.0 / 2.24.0）和本机 2.13.0 不同，`_kiro.dev/session/terminate` 在老版本上有没有也要现查。
+
+在远端跑一遍（会花一点额度）：
+
+```
+node scripts/kiro-multisession-probe.mjs --turns --mcp-port 39555 -- \
+  ssh -R 127.0.0.1:39555:127.0.0.1:39555 <host> 'kiro-cli acp'
+```
+
+远端那条命令要**整个加引号、作为最后一个参数**：探针给它包一层（先报 PID、带 `KIROLEX_EXECUTOR=kirolex-probe`），
+退出时（Ctrl-C 也一样）逐条 terminate 自己拿着的会话、关 stdin 等它正常退出，再另开一条 ssh 按 PID 把远端那棵树收掉 ——
+只杀本机的 ssh 会把远端 kiro-cli 和它手上的会话锁留在那儿（见「远端那台机器需要什么」）。
+第 4 项要选一个开了 delegate 的 agent（`'kiro-cli acp --agent <名字>'`）；第 5 项探针不测，要在 app 里手动看。
+全是 PASS（没有 FAIL、也没有 UNVERIFIED）才往下做。
+
+### 测过之后的做法（留给下一步，现在没有一行代码）
+
+* **共用的单位是进程，不是会话**：`AcpClient` 拆成"进程宿主"（spawn / stdout 缓冲 / 请求 id / 断开）和
+  "会话成员"（权限模式、在途 prompt、待答的权限请求和提问、configOptions）。`index.ts` 的 `sessionClients`
+  仍然一条会话一个成员，`wireSession` 不用改形状。
+* **分组键** = `sshHost` + kiro 启动命令 + agent 名 + 转发 MCP 组合（不含模型：模型在成员 load 之后用
+  `session/set_model` 切）。组满 8 条就另起一个进程。
+* **路由**：回包按请求 id 回到发请求的成员；通知和权限请求按 `params.sessionId` 找成员，子会话按名单里的
+  `parentSessionId` 记一张子→父的表；**认不出归属的不广播**（广播 = 串会话），记日志丢掉。stderr 是进程级的，发给每个成员。
+* **停一条** = 成员 `_kiro.dev/session/terminate` 自己那条会话然后摘掉；最后一个成员走才真断开（关 stdin、按
+  `KIROLEX_REMOTE_PID` 杀远端）。**进程崩了** = 宿主对每个成员发 `disconnected`，各自走现在的 `startRemoteRecovery`。
+* **孤儿清扫**：共用进程的 `--agent` 用 `kirolex-local-<owner>-pool-<组键哈希>`，前缀不变，所以
+  `orphanSweepScript`（PPID == 1 + 前缀）照样认；`staleExecutorSweepScript` 的 `keep` 是各成员的 `remotePid`
+  （同一个 PID），还没报 PID 的启动期要把这个 pool 名加进 `skip`，否则会被当成"没人认领的执行器"杀掉。
 
 ## 新会话默认跑在哪台机器上
 
