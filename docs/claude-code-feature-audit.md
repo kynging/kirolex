@@ -102,7 +102,10 @@
   于是 Claude / Codex 会话永远显示「0.00 credits」，旁边还能点「重置」。
 - **现在**：非 kiro 会话不显示这个按钮；上下文占比条照旧（口径 `used/size`，对）。
 - **测试**：`tests/claudeFeatureAudit.test.ts` F4。截图里 Claude Code 会话的底栏都只有上下文占比条和模型、没有 Credits（例如 `04-edit-resend-forgets.png` 右边那一格）。
-- 要不要改成显示 `usage_update.cost`（美元）见「需要拍板」。
+- **2026-10-24 负责人定：显示花费**。Claude Code 会话在原来 Credits 的位置显示本会话累计花费（如「$0.42」），悬停给本轮花费和上下文 token；
+  适配器不报 cost 的（Codex）显示 token 用量，也没有就不显示。协议里 `cost` 是累计值，但 claude-agent-acp 填的是**适配器进程内**的
+  `total_cost_usd`，进程一换就从 0 数起 —— 主进程跨进程累计后存进会话记录 `sessionCost`（`src/main/sessionCost.ts`），显示逻辑在
+  `src/renderer/usageChip.ts`。测试：`tests/sessionCost.test.ts`。
 
 ---
 
@@ -317,7 +320,7 @@ pm-global`）新建 Claude Code 会话，日志停在「本地会话挂上 kirol
 4. ~~effort（1b）~~ → 不恢复独立下拉；不支持时不设、不报错、组合旁边说明。**已修**。
 5. ~~编辑重发对 Claude 后端（10）~~ → 用 `session/fork` 分叉；不支持时退回并说明。**已修**。
 6. ~~`/model`、`/usage` 在 Claude 会话里（7c）~~ → **不做**，保持现状。
-7. **用量栏显示 Claude 的花费**（F3）：要不要把 `usage_update.cost`（美元）显示在原来 Credits 的位置 —— 还没定。
+7. ~~用量栏显示 Claude 的花费（F3）~~ → 显示（负责人 2026-10-24）。**已做**，见 F3。
 
 ---
 

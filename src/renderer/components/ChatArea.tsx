@@ -36,6 +36,7 @@ import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { livePendingNoteId, pendingTargetText, waitedSeconds, type PendingKind } from '../../main/pendingSwitch.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
+import { usageChip, type UsageView } from '../usageChip.ts';
 
 import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
@@ -3187,7 +3188,7 @@ interface ChatAreaProps {
   onCompactMemory: (scope: MemoryScope) => void;
   /** 打开记忆编辑器；给了 scope 就直接落在那一层（记忆太大横幅的「编辑」） */
   onOpenMemory: (scope?: 'global' | 'project' | 'session') => void;
-  usage: { contextPercent: number; credits: number; turnMs?: number } | null;
+  usage: UsageView | null;
   plan: PlanEntry[];
   autoFoldThinking: boolean;
   autoFoldTools: boolean;
@@ -3495,6 +3496,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
   const remoteHostLabel = remoteHost ? remoteHost.replace(/^[^@]*@/, '') : undefined;
   const nonKiro = !!engine && engine !== 'kiro';
+  /* 用量栏右边那一格（非 kiro）：本会话花费 / token / 不显示 —— kiro 的 credits 按钮另走 */
+  const usageChipNow = nonKiro ? usageChip(engine, usage, t) : null;
   const engineLabel = engine === 'claude' ? 'Claude Code' : engine === 'codex' ? 'Codex' : 'Kiro';
   const [isDragOver, setIsDragOver] = useState(false);
   // Conversation-aware prompt suggestions: regenerate a few contextual follow-up
@@ -5393,6 +5396,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         >
                           {usage.credits.toFixed(2)} {t('credits')}
                         </button>
+                      )}
+                      {/* Claude Code：本会话累计花费；没报 cost 的（Codex）显示 token；都没有就不显示（`usageChip`） */}
+                      {nonKiro && usageChipNow && (
+                        <span className="composer-session-cost" title={usageChipNow.title}>{usageChipNow.text}</span>
                       )}
                     </>
                   ) : null}

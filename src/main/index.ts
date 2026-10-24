@@ -28,6 +28,7 @@ import { detachedTurnEnded, steerDisplay, steeringPromptBlocks } from './busyEnt
 import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persistThenRelease, readPendingHandoffs, recoverableHandoffs, removePendingHandoff, restoreStartedHandoffs, restoredUserMessage, type PendingHandoff } from './pendingHandoffs';
 import { isReplayOutsideTurn, outsideTurnVerdict } from './replayGuard';
 import { autonomousFrame, beginAutonomousTurn, endAutonomousTurn, type AutonomousDeps, type AutonomousTurn } from './autonomousTurn';
+import { costOfUpdate, foldSessionCost, type SessionCost } from './sessionCost.ts';
 import { hasPendingClaudeCron, noteClaudeCronTool, type ClaudeCronTrack } from './claudeCron';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { planHelperRoute, remoteLiteScript, parseRemoteLiteOutput, LOCAL_MACHINE as HELPER_LOCAL_MACHINE, type MachineModelList } from './helperModels.ts';
@@ -317,6 +318,10 @@ interface SessionEntry {
   replayWindow?: boolean;
   /** 后端自己起的那一轮（Claude Code 的 cron 到点 / 后台任务跟进，`autonomousTurn.ts`）：界面上算一轮（busy 报 turn），不被 LRU 回收 */
   autonomous?: AutonomousTurn;
+  /** 本会话花费（`sessionCost.ts`）的内存副本 —— 记录也存一份；这份比别处"读-改-写"记录时手里那份新 */
+  sessionCost?: SessionCost;
+  /** 上一帧花费是哪个后端会话报的 —— 和 `cliSessionId` 不同（这个执行器里第一次 / 换了后端会话）就是新计数器，从 0 数起 */
+  costCounterFor?: string;
   /** 这个后端里 Claude 自己定的 cron（`claudeCron.ts`）：LRU 驱逐时提示一句 */
   claudeCrons?: ClaudeCronTrack;
   /** monotonic turn tag: only the invocation that set `busy` may clear it. */
@@ -6798,6 +6803,24 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       : undefined;
     /* 后端自己起的那一轮：见到结束信号（带 cost 的 usage_update / Codex idle）就收尾落盘，否则重新计时（`autonomousTurn.ts`） */
     if (entry.autonomous) autonomousFrame(entry, data?.update, autonomousDeps(sessionId, entry));
+    /*
+      本会话花费（审计 F3）：Claude Code 的 `usage_update.cost` 是**这个适配器进程**的累计值，进程一换就从 0 数起 ——
+      在这里跨进程累计、落进会话记录（`sessionCost.ts`），渲染层直接显示 `kirolexCost`。kiro 不发这个，照旧走 credits。
+    */
+    const sessionCostNow = costOfUpdate(data?.update);
+    if (sessionCostNow && engineOf(entry.profile) !== 'kiro') {
+      /*
+        适配器的计数器一个后端会话一份、跟着进程走：新执行器（entry 一个进程一份）或者换了后端会话（新建 / fork），
+        第一帧就是从 0 数起的 —— 明确告诉 fold，不靠读数变小去猜（新进程第一轮比旧进程整段还贵时读数不变小）。
+      */
+      const counterKey = entry.cliSessionId ?? '';
+      const freshCounter = entry.costCounterFor !== counterKey;
+      const next = foldSessionCost(entry.sessionCost ?? store.readRecord(sessionId)?.sessionCost, sessionCostNow, Date.now(), freshCounter);
+      entry.costCounterFor = counterKey;
+      entry.sessionCost = next;
+      try { store.patchRecord(sessionId, { sessionCost: next }); } catch (e: any) { logger.warn('session', `sessionCost 落盘失败 sessionId=${sessionId}: ${e?.message || e}`); }
+      data = { ...data, update: { ...data.update, kirolexCost: { total: next.total, turn: next.turn, currency: next.currency } } };
+    }
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
   entry.replayUpdates = (list) => { for (const d of list) onUpdate(d, true); };
@@ -15672,6 +15695,8 @@ ${hint}` : ''}` };
        * 恰恰是远程会话最容易搞错的一件事（远端只看得见被镜像的那一个目录）。
        */
       ...(rec.localDir ? { localDir: rec.localDir } : null),
+      /* 本会话花费（Claude Code）—— 重开窗口 / 别的设备上也接着显示累计值，不从 0 数起 */
+      ...(rec.sessionCost ? { sessionCost: rec.sessionCost } : null),
     }));
   });
 

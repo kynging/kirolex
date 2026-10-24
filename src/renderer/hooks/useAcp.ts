@@ -42,6 +42,7 @@ import type { BgJobRow } from '../bgJobsView';
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { asSteerParts, toStoredUserLines } from '../steerSplit';
 import { carryControlMark, viaFor } from '../../main/controlSessions';
+import type { UsageView } from '../usageChip.ts';
 import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { insertOptimistic, isDuplicateMessageError, removeOptimistic } from '../queueRetry';
@@ -135,7 +136,7 @@ export interface PaneView {
   activeTool: string | null;
   /** Per-session context/credits meter — the focused chat keeps this in plain
    *  state, a pane needs its own copy or the widget disappears in split view. */
-  usage: { contextPercent: number; credits: number; turnMs?: number } | null;
+  usage: UsageView | null;
   /** Per-session context-sync links (Context Engineering). */
   contextLinks: { sourceId: string; sourceTitle: string }[];
   /** Live "this turn has stopped producing" state; drives the stall warning. */
@@ -292,7 +293,7 @@ export function withConsumedSteers(msgs: Message[], baseIndex: number): string {
 /** Per-session usage, persisted so the context gauge is not blank until the next
  *  turn. Stored as entries (not an object) to keep session ids opaque. */
 const USAGE_MAP_KEY = 'kirolex-usage-by-session';
-type UsageEntry = { contextPercent: number; credits: number; turnMs?: number };
+type UsageEntry = UsageView;
 function readUsageMap(): [string, UsageEntry][] {
   try {
     const raw = uiGet(USAGE_MAP_KEY);
@@ -304,6 +305,17 @@ function readUsageMap(): [string, UsageEntry][] {
 }
 function writeUsageMap(map: Map<string, UsageEntry>): void {
   try { uiSet(USAGE_MAP_KEY, JSON.stringify([...map.entries()])); } catch {}
+}
+/** 会话记录里的累计花费（主进程 `sessionCost.ts` 写的，比 ui-state 这份新）进用量表 —— 重开窗口 / 换设备不从 0 数起。变了才返回 true */
+function seedSessionCost(map: Map<string, UsageEntry>, id: string, sc: any): boolean {
+  if (!sc || typeof sc.total !== 'number' || !Number.isFinite(sc.total)) return false;
+  const prev = map.get(id);
+  if (prev?.cost === sc.total) return false;
+  map.set(id, {
+    ...prev, contextPercent: prev?.contextPercent ?? 0, credits: prev?.credits ?? 0,
+    cost: sc.total, turnCost: typeof sc.turn === 'number' ? sc.turn : undefined, currency: typeof sc.currency === 'string' ? sc.currency : 'USD',
+  });
+  return true;
 }
 
 /** The durable-session listing, fetched at most ONCE per window.
@@ -595,7 +607,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // rebuild, executor attach, awaiting reply). Rendered in the chat so a slow
   // phase is never a silent UI freeze.
   const [activityStatus, setActivityStatus] = useState<string | null>(null);
-  const [usage, setUsage] = useState<{ contextPercent: number; credits: number; turnMs?: number } | null>(null);
+  const [usage, setUsage] = useState<UsageView | null>(null);
   // Agent execution plan (ACP `plan` update) for the viewed session. Replaced
   // wholesale on each plan update (ACP resends the full plan each time).
   const [plan, setPlan] = useState<PlanEntry[]>(() => (
@@ -704,7 +716,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // of the conversation, not of the current window, so it is read back from disk.
   // Note the old on-disk copy was keyed by kiro-cli's UUID, which no longer maps to
   // anything the UI knows; this one is keyed by the stable KiroLex session id.
-  const usageMapRef = useRef<Map<string, { contextPercent: number; credits: number; turnMs?: number }>>(new Map(readUsageMap()));
+  const usageMapRef = useRef<Map<string, UsageView>>(new Map(readUsageMap()));
   /**
    * 上面那个 ref 的**反应式镜像** —— 流程图上每个节点要显示它那条会话的上下文占用
    * （「再加一个节点记录会话上下文占用情况的功能」），而 ref 变了不会触发重渲染。
@@ -2211,6 +2223,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             sessionModelRef.current.set(rec.id, rec.model);
           }
         }
+        /* 记录里的本会话花费（Claude Code）—— 见 `seedSessionCost` */
+        let costSeeded = false;
+        for (const rec of disk) {
+          if (rec?.id && seedSessionCost(usageMapRef.current, rec.id, rec.sessionCost)) {
+            costSeeded = true;
+            if (rec.id === currentSessionRef.current) setUsage(usageMapRef.current.get(rec.id) || null);
+          }
+        }
+        if (costSeeded) writeUsageMap(usageMapRef.current);
         setSessions((prev) => {
           const byId = new Map(prev.map((s) => [s.id, s]));
           for (const rec of disk) {
@@ -2697,10 +2718,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             标准 ACP 的用量（kiro-cli 不发，它走 `_kiro.dev/metadata`）。Claude Code / Codex 的适配器
             每轮都发 `{ used, size }`（上下文已用 token / 窗口大小）—— 正好喂给同一个上下文百分比。
             它们没有 kiro 的 credits，所以 credits 原样保留（一直是 0）。
+            花费：主进程把跨适配器进程累计好的值挂在 `kirolexCost` 上（`main/sessionCost.ts`）；token 留着给用量栏显示（`usageChip`）。
           */
-          if (sessionId && typeof update.used === 'number' && typeof update.size === 'number' && update.size > 0) {
+          const ctx = typeof update.used === 'number' && typeof update.size === 'number' && update.size > 0
+            ? { contextPercent: (update.used / update.size) * 100, usedTokens: update.used, sizeTokens: update.size }
+            : null;
+          const sessionCost = update.kirolexCost && typeof update.kirolexCost.total === 'number' ? update.kirolexCost : null;
+          if (sessionId && (ctx || sessionCost)) {
             const prev = usageMapRef.current.get(sessionId);
-            const next = { contextPercent: (update.used / update.size) * 100, credits: prev?.credits || 0, turnMs: prev?.turnMs };
+            const next: UsageEntry = {
+              ...prev,
+              contextPercent: prev?.contextPercent || 0,
+              credits: prev?.credits || 0,
+              turnMs: prev?.turnMs,
+              ...ctx,
+              ...(sessionCost ? { cost: sessionCost.total, turnCost: sessionCost.turn, currency: sessionCost.currency } : null),
+            };
             usageMapRef.current.set(sessionId, next);
             writeUsageMap(usageMapRef.current);
             setUsageBySession((cur) => ({ ...cur, [sessionId]: { contextPercent: next.contextPercent, credits: next.credits } }));

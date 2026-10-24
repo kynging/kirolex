@@ -4366,7 +4366,7 @@ button, input, select, textarea {
   .prompt-suggestions,
   .composer-belowbar,
   .archived-composer-banner { width: 100%; }
-  .composer-credits { display: none; }
+  .composer-credits, .composer-session-cost { display: none; }
   .composer-model-select { max-width: 132px; }
 }
 
@@ -4658,7 +4658,7 @@ button, input, select, textarea {
 .composer-usage.mid .composer-usage-label { color: var(--warning); }
 .composer-usage.high .composer-usage-label { color: var(--error); }
 
-.composer-credits {
+.composer-credits, .composer-session-cost {
   color: var(--text-muted);
   font-size: 10px;
   white-space: nowrap;
@@ -4703,7 +4703,7 @@ button, input, select, textarea {
   /* .composer-shortcut is deliberately NOT hidden here: a <900px window means the
      pane is also <900px, so the container queries above already picked the short
      form. Hiding it by window width on top of that just brought the bug back. */
-  .composer-credits { display: none; }
+  .composer-credits, .composer-session-cost { display: none; }
   .composer-model-select { max-width: 128px; }
 }
 

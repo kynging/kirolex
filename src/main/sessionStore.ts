@@ -10,6 +10,7 @@ import { isKirolexNote } from './kirolexNote.ts';
 import { carryReplyMarks, completedReplyInText, messageIdStatusInText, type MessageIdStatus } from './promptDedupe.ts';
 import { carryBackendAnchors, remapAnchorsToFork } from './editFork.ts';
 import type { QuestionCard } from './elicitation.ts';
+import type { SessionCost } from './sessionCost.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -231,6 +232,8 @@ export interface SessionRecord {
    *  'full': replay every chunk verbatim. Exact, but costs one model turn per
    *  chunk on every restart, because kiro-cli cannot restore an ACP session. */
   primeMode?: 'snapshot' | 'full';
+  /** Claude Code / Codex 会话的累计花费（`sessionCost.ts`）—— 换后端 / 重开会话不清零。kiro 会话没有。 */
+  sessionCost?: SessionCost;
 }
 
 const baseDir = path.join(os.homedir(), '.kirolex', 'sessions');
