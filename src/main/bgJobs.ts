@@ -23,6 +23,7 @@
 import { spawn, type ChildProcess } from 'child_process';
 import { createHash, type Hash } from 'crypto';
 import fs from 'fs';
+import os from 'os';
 import path from 'path';
 import { WinJobHost, type JobHost } from './winJob.ts';
 import { trIn, uiLang, type UiLang } from './uiText.ts';
@@ -319,6 +320,11 @@ export class BgJobManager {
     await Promise.all([...this.jobs.values()].filter((j) => j.state === 'running').map((j) => this.terminate(j, 'stopped', true)));
   }
 
+  /** Windows：KiroLex 启动后提前起好作业对象辅助进程，第一个后台命令就不用等 PowerShell 启动 / 编译。 */
+  warmUp(): void {
+    if (process.platform === 'win32') (this.deps.jobHost ?? defaultJobHost(this.deps.log)).warm?.();
+  }
+
   /**
    * 退出路径用的**同步**版：`before-quit` 不等 Promise，异步的结束来不及做完进程就退了，
    * 留下没人管的命令。登记不清（见 `stopAll`）。
@@ -576,7 +582,8 @@ process.stdin.on('end', () => stop(child ? 137 : 0));
 
 let sharedJobHost: JobHost | null = null;
 function defaultJobHost(log: (m: string) => void): JobHost {
-  if (!sharedJobHost) sharedJobHost = new WinJobHost((m) => log(`job: ${m}`));
+  /* 编译好的 C#（dll）缓存在 ~/.kirolex/cache，下次启动直接加载 */
+  if (!sharedJobHost) sharedJobHost = new WinJobHost((m) => log(`job: ${m}`), undefined, path.join(os.homedir(), '.kirolex', 'cache'));
   return sharedJobHost;
 }
 

@@ -98,4 +98,73 @@ describe('WinJobHost', { skip: !win }, () => {
       h.killAllSync();
     }
   });
+
+  test('辅助进程复用：连续放 3 个进程只起一次辅助进程；它挂了下一次自动重起', async () => {
+    const h = new WinJobHost(() => {}, 60_000, fs.mkdtempSync(path.join(os.tmpdir(), 'kx-jobcache-')));
+    const kids = [1, 2, 3].map(() => spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' }));
+    try {
+      for (const [i, k] of kids.entries()) assert.equal(await h.assign(`r${i}`, k.pid!), true);
+      assert.equal(h.starts, 1, '第 2、3 个不该再起辅助进程');
+      /* 模拟它挂了：作业句柄随之关闭，作业里的进程由系统结束 */
+      process.kill(h.helperPid!);
+      await waitFor(() => kids.every((k) => !alive(k.pid!)), '辅助进程没了，作业里的进程都结束');
+      const again = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+      try {
+        assert.equal(await h.assign('r4', again.pid!), true, '下一次自动重起辅助进程');
+        assert.equal(h.starts, 2);
+        await h.terminate('r4');
+        await waitFor(() => !alive(again.pid!), '重起后的作业照样能结束');
+      } finally {
+        try { again.kill(); } catch {}
+      }
+    } finally {
+      for (const k of kids) { try { k.kill(); } catch {} }
+      h.killAllSync();
+    }
+  });
+
+  test('编译结果缓存成 dll（按源码哈希命名）：下一个辅助进程直接加载，不再编译', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-jobcache-'));
+    const a = new WinJobHost(() => {}, 60_000, dir);
+    const b = new WinJobHost(() => {}, 60_000, dir);
+    const k = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    try {
+      a.warm();
+      assert.equal(a.starts, 1, 'warm 就把辅助进程起起来');
+      assert.equal(await a.assign('c1', k.pid!), true);
+      assert.equal(a.starts, 1);
+      assert.equal(a.loadedFrom, 'compiled');
+      const dlls = fs.readdirSync(dir).filter((f) => /^winjob-[0-9a-f]{16}\.dll$/.test(f));
+      assert.equal(dlls.length, 1, `缓存目录里该有一个 dll：${fs.readdirSync(dir).join(', ')}`);
+      assert.equal(await b.assign('c2', process.pid), false, '自己不是自己的子进程：拒绝（但辅助进程起来了）');
+      assert.equal(b.loadedFrom, 'dll', '第二个辅助进程直接加载缓存的 dll');
+      await a.terminate('c1');
+      await waitFor(() => !alive(k.pid!), '加载 dll 的作业照样能结束');
+    } finally {
+      try { k.kill(); } catch {}
+      a.killAllSync();
+      b.killAllSync();
+    }
+  });
+
+  test('缓存的 dll 坏了：退回当场编译，照常能用', async () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-jobcache-'));
+    const a = new WinJobHost(() => {}, 60_000, dir);
+    assert.equal(await a.assign('d1', process.pid), false);
+    a.killAllSync();
+    const dll = fs.readdirSync(dir).find((f) => f.endsWith('.dll'));
+    assert.ok(dll, '第一次编译后留下了 dll');
+    await waitFor(() => { try { fs.writeFileSync(path.join(dir, dll), 'not a dll'); return true; } catch { return false; } }, '辅助进程退出、dll 不再被占用');
+    const b = new WinJobHost(() => {}, 60_000, dir);
+    const k = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
+    try {
+      assert.equal(await b.assign('d2', k.pid!), true);
+      assert.equal(b.loadedFrom, 'compiled');
+      await b.terminate('d2');
+      await waitFor(() => !alive(k.pid!), '作业结束');
+    } finally {
+      try { k.kill(); } catch {}
+      b.killAllSync();
+    }
+  });
 });

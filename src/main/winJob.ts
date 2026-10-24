@@ -9,6 +9,9 @@
  * TerminateJobObject），按行收命令：
  *   `new <id> <pid> <父pid>`  核对它还在运行、父进程就是 <父pid>（= KiroLex 自己），再建一个作业（设 `JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE`）并把 pid 放进去 → `ok <id>` / `err <id> <原因>`
  *   `kill <id>`       结束作业里的全部进程并关掉句柄 → `ok <id>`
+ * 辅助进程每个 WinJobHost 只起一个、之后一直复用（KiroLex 启动后由 `warm()` 提前起好）；它挂了下一次用到时自动重起。
+ * C# 编译一次就缓存成 dll（`<缓存目录>/winjob-<源码哈希>.dll`），之后的辅助进程直接加载，不再每次 Add-Type 现编译；
+ * dll 坏了 / 加载不了就退回当场编译。
  * 句柄都在辅助进程手里，**KiroLex 退出或崩溃时**它的 stdin 断开、它退出，句柄随之关闭，`KILL_ON_JOB_CLOSE`
  * 让作业里剩下的进程全部结束 —— 不需要 KiroLex 自己在退出路径上做任何事。
  *
@@ -16,6 +19,8 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
+import { createHash } from 'crypto';
+import fs from 'fs';
 import os from 'os';
 import path from 'path';
 
@@ -57,13 +62,37 @@ public static class KxJob {
 }
 `;
 
+/** 缓存的 dll 按 C# 源码哈希命名：源码一改就是新文件，旧的不会被误加载。 */
+const DLL_NAME = `winjob-${createHash('sha256').update(CS).digest('hex').slice(0, 16)}.dll`;
+
+/* 先加载缓存的 dll；没有就编译到一个临时 dll 再换上去（换不上 = 别的辅助进程正占着同名文件，就直接加载临时那个）；
+   缓存的坏了：同一路径加载失败过一次 .NET 就记住了、再加载还是失败，所以拷一份新的回缓存给下次用、这次加载临时那个
+   （它被占着删不掉，下次起辅助进程时清掉）。不给缓存路径或者编译到文件失败才在内存里编译。
+   ready 后面跟着这次是从哪来的（dll / compiled / memory）。 */
 const PS = `
 $ErrorActionPreference = 'Stop'
-Add-Type -TypeDefinition @'
+$src = @'
 ${CS}
 '@
+$dll = $env:KX_JOB_DLL
+$from = 'memory'
+if ($dll) {
+  $bad = $false
+  if (Test-Path -LiteralPath $dll) { try { Add-Type -Path $dll; $from = 'dll' } catch { $bad = $true } }
+  if ($from -eq 'memory') {
+    $tmp = $dll -replace '\\.dll$', ('.' + $PID + '.tmp.dll')
+    try {
+      Add-Type -TypeDefinition $src -OutputAssembly $tmp -OutputType Library
+      $load = $tmp
+      if ($bad) { try { Copy-Item -LiteralPath $tmp -Destination $dll -Force } catch { } }
+      else { try { Move-Item -LiteralPath $tmp -Destination $dll -Force; $load = $dll } catch { } }
+      Add-Type -Path $load; $from = 'compiled'
+    } catch { }
+  }
+}
+if ($from -eq 'memory') { Add-Type -TypeDefinition $src }
 $jobs = @{}
-[Console]::Out.WriteLine('ready')
+[Console]::Out.WriteLine('ready ' + $from)
 [Console]::Out.Flush()
 while ($true) {
   $line = [Console]::In.ReadLine()
@@ -85,56 +114,94 @@ export interface JobHost {
   terminate(id: string): Promise<void>;
   /** 退出路径：同步结束辅助进程 —— 它的句柄一关，所有作业里的进程都由系统结束。 */
   killAllSync(): void;
+  /** 提前把辅助进程起好（可选）。 */
+  warm?(): void;
 }
 
 export class WinJobHost implements JobHost {
   private proc: ChildProcess | null = null;
   private ready: Promise<boolean> | null = null;
-  private buf = '';
+  /** 当前这个辅助进程的回话等待表（每个辅助进程一份：旧的那个晚退出时只清它自己的）。 */
   private waiters = new Map<string, Array<(line: string) => void>>();
   private readonly log: (m: string) => void;
   private readonly startTimeoutMs: number;
+  private readonly cacheDir: string | null;
+  /** 一共起过几次辅助进程（测试据此断言复用）。 */
+  starts = 0;
+  /** 当前这个辅助进程的类型是从哪来的：`dll` = 加载缓存，`compiled` = 当场编译并写进缓存，`memory` = 只在内存里编译。 */
+  loadedFrom: 'dll' | 'compiled' | 'memory' | null = null;
 
-  constructor(log: (m: string) => void = () => {}, startTimeoutMs = 60_000) {
+  /** `cacheDir`：编译好的 dll 放哪（不给就不缓存，每个辅助进程都当场编译）。 */
+  constructor(log: (m: string) => void = () => {}, startTimeoutMs = 60_000, cacheDir: string | null = null) {
     this.log = log;
     this.startTimeoutMs = startTimeoutMs;
+    this.cacheDir = cacheDir;
+  }
+
+  get helperPid(): number | null {
+    return this.proc?.pid ?? null;
+  }
+
+  /** 提前把辅助进程起好（KiroLex 启动后调一次），第一个后台任务就不用等它。 */
+  warm(): void {
+    void this.ensure();
   }
 
   private ensure(): Promise<boolean> {
     if (this.ready && this.proc && this.proc.exitCode === null && this.proc.signalCode === null) return this.ready;
-    this.buf = '';
+    /* 起过但没起成功（超时）还活着的那个：收掉，重起一个 */
+    try { this.proc?.kill(); } catch { /* 已经没了 */ }
+    this.loadedFrom = null;
+    let buf = '';
+    const waiters = new Map<string, Array<(line: string) => void>>();
+    let dll = '';
+    if (this.cacheDir) {
+      try { fs.mkdirSync(this.cacheDir, { recursive: true }); dll = path.join(this.cacheDir, DLL_NAME); } catch (err: any) { this.log(`job dll cache unavailable: ${err?.message || err}`); }
+      /* 之前留下的临时 dll（还被某个辅助进程占着的删不掉，跳过） */
+      try {
+        for (const f of fs.readdirSync(this.cacheDir)) if (/^winjob-[0-9a-f]+\.\d+\.tmp\.dll$/.test(f)) { try { fs.unlinkSync(path.join(this.cacheDir, f)); } catch { /* 占着 */ } }
+      } catch { /* 读不了目录就算了 */ }
+    }
     const encoded = Buffer.from(PS, 'utf16le').toString('base64');
     let proc: ChildProcess;
     try {
       /* cwd 放到临时目录：PowerShell 找不到本地 AppData 时会把模块缓存写进当前目录 —— 别写进 KiroLex 碰巧所在的地方 */
       /* 绝对路径：按 PATH 找 powershell.exe 的第一次 spawn 会同步卡好几秒 */
       const exe = process.env.SystemRoot ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe';
-      proc = spawn(exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], cwd: os.tmpdir() });
+      proc = spawn(exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], cwd: os.tmpdir(), env: { ...process.env, KX_JOB_DLL: dll } });
+      this.starts += 1;
     } catch (err: any) {
       this.log(`job helper spawn failed: ${err?.message || err}`);
       this.ready = Promise.resolve(false);
       return this.ready;
     }
     this.proc = proc;
+    this.waiters = waiters;
     /* 它不该拖着主进程不退（退出时 KiroLex 会主动收掉它；崩溃时 stdin 断开它自己退） */
     try { proc.unref(); (proc.stdin as any)?.unref?.(); (proc.stdout as any)?.unref?.(); (proc.stderr as any)?.unref?.(); } catch {}
-    this.ready = new Promise<boolean>((resolve) => {
-      const t = setTimeout(() => { this.log('job helper did not start in time'); resolve(false); }, this.startTimeoutMs);
+    const ready = new Promise<boolean>((resolve) => {
+      const t = setTimeout(() => {
+        this.log('job helper did not start in time');
+        resolve(false);
+        /* 下一次用到时重起（ensure 只复用起成功的那个） */
+        if (this.ready === ready) this.ready = null;
+      }, this.startTimeoutMs);
       const onLine = (line: string) => {
-        if (line === 'ready') { clearTimeout(t); resolve(true); return; }
+        const r = /^ready (dll|compiled|memory)$/.exec(line);
+        if (r) { clearTimeout(t); this.loadedFrom = r[1] as 'dll' | 'compiled' | 'memory'; resolve(true); return; }
         const m = /^(ok|err) (\S+)/.exec(line);
         if (!m) return;
-        const q = this.waiters.get(m[2]);
+        const q = waiters.get(m[2]);
         const w = q?.shift();
-        if (q && !q.length) this.waiters.delete(m[2]);
+        if (q && !q.length) waiters.delete(m[2]);
         w?.(line);
       };
       proc.stdout?.on('data', (d: Buffer) => {
-        this.buf += d.toString('utf8');
+        buf += d.toString('utf8');
         let i: number;
-        while ((i = this.buf.indexOf('\n')) >= 0) {
-          const line = this.buf.slice(0, i).replace(/\r$/, '').trim();
-          this.buf = this.buf.slice(i + 1);
+        while ((i = buf.indexOf('\n')) >= 0) {
+          const line = buf.slice(0, i).replace(/\r$/, '').trim();
+          buf = buf.slice(i + 1);
           if (line) onLine(line);
         }
       });
@@ -148,11 +215,12 @@ export class WinJobHost implements JobHost {
         clearTimeout(t);
         resolve(false);
         /* 还在等回话的全部当失败（作业里的进程已经随句柄关闭被系统结束了） */
-        for (const [, q] of this.waiters) for (const w of q) w('err gone');
-        this.waiters.clear();
+        for (const [, q] of waiters) for (const w of q) w('err gone');
+        waiters.clear();
       });
     });
-    return this.ready;
+    this.ready = ready;
+    return ready;
   }
 
   private request(id: string, line: string): Promise<string> {

@@ -10588,6 +10588,8 @@ ${hint}` : ''}` };
   }
   /* 后台命令 / 监视随 KiroLex 退出结束（同步杀：before-quit 不会等 Promise）；登记留着，下次启动据此补「已中断」 */
   app.on('before-quit', () => bgJobs.stopAllSync());
+  /* Windows：启动后稍等一下（别和窗口抢）就把作业对象辅助进程起好，第一个 bg_run / watch 不再白等 PowerShell 启动 + 编译 */
+  setTimeout(() => { try { bgJobs.warmUp(); } catch (err: any) { logger.warn('bg', `job helper warm-up failed: ${err?.message || err}`); } }, 3000).unref?.();
 
   ipcMain.handle('bg:list', () => bgJobs.list());
   ipcMain.handle('bg:stop', (_event, jobId: string) => bgJobs.stop(String(jobId || ''), 'user'));

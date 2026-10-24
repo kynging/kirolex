@@ -15,6 +15,7 @@ import {
   writeRunningJobs,
   type BgJobDeps,
 } from '../src/main/bgJobs.ts';
+import { WinJobHost } from '../src/main/winJob.ts';
 
 /**
  * 后台命令（`bg_run`）和监视（`watch`）—— 真起进程跑（用本机这个 node），不 mock。
@@ -443,6 +444,26 @@ describe('Windows：作业还没放好的时候停止 / 超时（辅助进程启
     assert.equal(h.m.status('s1', r.job.jobId)?.state, 'timeout');
     assert.deepEqual(s.terminated, [], '没放进作业就没有作业可结束');
     assert.ok(!(h.m.tail('s1', r.job.jobId) || '').includes('SHOULD-NOT-RUN'));
+  });
+});
+
+describe('Windows：作业对象辅助进程只起一个，之后的后台任务复用它', { skip: process.platform !== 'win32' }, () => {
+  test('连续起 3 个后台任务：只起了 1 次辅助进程（第 2、3 个不再新起 PowerShell、不再编译）', async () => {
+    const hostLogs: string[] = [];
+    const host = new WinJobHost((m) => hostLogs.push(m), SLOW_SPAWN_MS, fs.mkdtempSync(path.join(os.tmpdir(), 'kx-jobcache-')));
+    try {
+      const h = harness({ jobHost: host });
+      for (let i = 1; i <= 3; i++) {
+        const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd(`console.log('run-${i}')`), label: `r${i}`, cwd, timeoutMs: LONG_JOB_MS });
+        assert.ok(r.ok);
+        await waitFor(() => h.wakes.length === i, `第 ${i} 个结束`, undefined, () => h.m.status('s1', r.job.jobId));
+        assert.match(h.wakes[i - 1].text, new RegExp(`run-${i}`));
+      }
+      assert.equal(host.starts, 1, '辅助进程只该起一次');
+      assert.ok(!hostLogs.some((l) => /assign failed|did not start/.test(l)), `3 个都该放进了作业：${hostLogs.join(' | ')}`);
+    } finally {
+      host.killAllSync();
+    }
   });
 });
 
