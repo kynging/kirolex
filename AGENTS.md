@@ -363,6 +363,10 @@ docs/            设计文档（§1）
 - **Win32-OpenSSH 没有连接复用**（ControlMaster / unix socket）→ `sshMux.muxSupported()` 在 win32 返回 false。
 - **不要用 bash / POSIX shell 做本机探测**：`binDetect.ts` 在 Windows 上走 `detectWindows`（PATH × PATHEXT，`.exe` / `.cmd` 都认，真跑 `--version` 校验）；
   `localMcp.ts` 的 find / grep / bash 有 Node 原生实现（`globNative` / `grepNative`）和 `%ComSpec% /d /s /c`；`loopVerify.ts` 同理。
+- **代码页**：cmd 启动时就记下代码页，同一个 cmd 里 chcp 对它自己的 echo / 重定向不生效，所以 chcp 必须在 cmd 起来之前。
+  `local_bash` 经 `winShell.ts` 的 `cmdUtf8Args` 跑（外层 cmd 先 `chcp 65001`、再起内层 cmd 跑命令；超时用 `taskkill /T` 结束整棵树）；
+  `bg_run` / `watch` / `checkCommand` 由闸门在自己的控制台上先 chcp、再起共用控制台的 cmd（`bgJobs.ts` 不准用 taskkill）。
+  输出用 `decodeLocalOutput` 解（不是合法 UTF-8 的行按本机 OEM / ANSI 代码页解）。
 - **`.cmd` shim**：Node 18.20.2 / 20.12.2 以后 `spawn()` 不带 `shell: true` 起 `.cmd` 会同步抛 `spawn EINVAL`。
   做法是用 Node 直接跑工具的入口脚本（`dev-hot.mjs` 的 `tool()`、`engines.ts` 的 `resolveAdapter`），或者 `shell: true` + 给路径加引号（`localMcp.ts`）。
 - **路径**：

@@ -46,6 +46,7 @@ import { tr } from './uiText.ts';
 import { browserToolDefs, isBrowserTool } from './localBrowser.ts';
 import { isWakeTool, wakeToolDefs } from './wakeTools.ts';
 import { isSessionTool, sessionToolDefs } from './sessionCalls.ts';
+import { CMD_UTF8_VAR, cmdUtf8Args, decodeLocalOutput, powershellArgs } from './winShell.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -304,12 +305,20 @@ function fileToolDefs(): Array<{ name: string; description: string; inputSchema:
     {
       name: 'local_bash',
       description: '在用户本机上跑一条 shell 命令（cwd = 这条会话的工作目录）。'
-        + '构建、测试、git 提交这类事都在这里做 —— 你所在的那台远端机器上没有用户的文件。',
+        + '构建、测试、git 提交这类事都在这里做 —— 你所在的那台远端机器上没有用户的文件。'
+        /* Windows 上不是 bash：说清楚，并给一个 PowerShell 的选项 —— 免得模型为了引号把命令都写成脚本文件 */
+        + (process.platform === 'win32'
+          ? '\n这台是 **Windows**：默认用 cmd.exe 跑（cmd 语法，代码页已设成 UTF-8）；'
+            + '要用 PowerShell 就传 shell: "powershell"（-NoProfile -NonInteractive，输出同样是 UTF-8，命令原样交给它、不用另外转义引号）。'
+          : ''),
       inputSchema: {
         type: 'object',
         properties: {
           command: { type: 'string' },
           timeoutMs: { type: 'number', description: `默认 ${BASH_TIMEOUT_MS}` },
+          ...(process.platform === 'win32'
+            ? { shell: { type: 'string', enum: ['cmd', 'powershell'], description: '默认 cmd（cmd.exe）；powershell = Windows PowerShell' } }
+            : {}),
         },
         required: ['command'],
       },
@@ -371,14 +380,36 @@ function text(t: string, isError = false): ToolResult {
  * 于是 `local_grep` 把"这台机器上没装 ripgrep"读成了"没有匹配"，直接返回"（没有匹配）"
  * 而根本没去试 grep（单测里抓到的）。"没搜到"和"没法搜"必须分得开。
  */
-function run(file: string, args: string[], cwd: string, timeoutMs: number, verbatim = false): Promise<{ code: number | null; out: string; spawnFailed?: boolean }> {
+function run(file: string, args: string[], cwd: string, timeoutMs: number, verbatim = false, env?: NodeJS.ProcessEnv, killTree = false): Promise<{ code: number | null; out: string; spawnFailed?: boolean }> {
   return new Promise((resolve) => {
-    execFile(file, args, { cwd, timeout: timeoutMs, maxBuffer: 32 * 1024 * 1024, encoding: 'utf8', windowsVerbatimArguments: verbatim, windowsHide: true },
-      (err: any, stdout, stderr) => resolve({
-        code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
-        spawnFailed: !!err && typeof err.code === 'string',
-        out: `${String(stdout || '')}${stderr ? `\n[stderr]\n${stderr}` : ''}`,
-      }));
+    /*
+      `killTree`（Windows 上的 cmd，见 `cmdUtf8Args`）：命令跑在外层 cmd 起的**内层** cmd 里，execFile 自己的超时
+      只结束外层 —— 内层和命令会接着跑（审查实测）。所以超时由这里来：`taskkill /T /F` 结束整棵进程树。
+      结果照旧：超时 = 退出码 1（原来 execFile 结束进程后 `err.code` 是 null，折成 1）。
+    */
+    let timedOut = false;
+    let timer: NodeJS.Timeout | null = null;
+    /* 按字节收、自己解：Windows 上有的程序写 UTF-8、有的写本机代码页（`decodeLocalOutput`，见 winShell.ts） */
+    const child = execFile(file, args, { cwd, ...(killTree ? {} : { timeout: timeoutMs }), maxBuffer: 32 * 1024 * 1024, encoding: 'buffer', windowsVerbatimArguments: verbatim, windowsHide: true, ...(env ? { env } : {}) },
+      (err: any, stdoutBuf, stderrBuf) => {
+        if (timer) clearTimeout(timer);
+        const stdout = stdoutBuf?.length ? decodeLocalOutput(stdoutBuf) : '';
+        const stderr = stderrBuf?.length ? decodeLocalOutput(stderrBuf) : '';
+        resolve({
+          code: timedOut ? 1 : err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+          spawnFailed: !!err && typeof err.code === 'string',
+          out: `${stdout}${stderr ? `\n[stderr]\n${stderr}` : ''}`,
+        });
+      });
+    if (killTree && child.pid) {
+      const pid = child.pid;
+      timer = setTimeout(() => {
+        timedOut = true;
+        execFile(path.join(process.env.SystemRoot || 'C:\\Windows', 'System32', 'taskkill.exe'), ['/T', '/F', '/PID', String(pid)], { windowsHide: true }, (e) => {
+          if (e) { try { child.kill(); } catch { /* 已经没了 */ } }
+        });
+      }, timeoutMs);
+    }
   });
 }
 
@@ -508,10 +539,13 @@ export async function callTool(
         已经是这个写法，这里跟它一致）。注意这意味着模型写的命令要是 **cmd 语法**:
         那件事在注入里说过（「运行环境」那段会说清这是哪台机器），而这里的替代方案是
         "这个工具完全不可用"，那更糟。
+        cmd 先 `chcp 65001` 再跑命令（`cmdUtf8Args`）、PowerShell 把输出编码设成 UTF-8（winShell.ts）—— 中文输出和 `echo x>>f` 都按 UTF-8。
       */
-      const r = process.platform === 'win32'
-        ? await run(process.env.ComSpec || 'cmd.exe', cmdShellArgs(command), cwd, timeoutMs, true)
-        : await run('bash', ['-lc', command], cwd, timeoutMs);
+      const r = process.platform !== 'win32'
+        ? await run('bash', ['-lc', command], cwd, timeoutMs)
+        : args?.shell === 'powershell'
+          ? await run('powershell.exe', powershellArgs(command), cwd, timeoutMs)
+          : await run(process.env.ComSpec || 'cmd.exe', cmdUtf8Args(), cwd, timeoutMs, true, { ...process.env, [CMD_UTF8_VAR]: command }, true);
       return text(`[exit ${r.code}]\n${r.out.trim()}`);
     }
     default:

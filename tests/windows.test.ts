@@ -191,7 +191,8 @@ describe('本地工具在 Windows 上不能是 ENOENT', () => {
     assert.match(L, /process\.env\.ComSpec \|\| 'cmd\.exe'/);
     /* 整条命令包一层引号 + windowsVerbatimArguments 原样交给 cmd —— Node 的 `\"` 转义 cmd.exe 不认 */
     assert.match(L, /export function cmdShellArgs\(command: string\): string\[\] \{\s*return \['\/d', '\/s', '\/c', `"\$\{command\}"`\];/);
-    assert.match(L, /run\(process\.env\.ComSpec \|\| 'cmd\.exe', cmdShellArgs\(command\), cwd, timeoutMs, true\)/);
+    /* local_bash 先 chcp 65001 再起跑命令的 cmd（内层照旧是 `/d /s /c "命令"`，见 winShell.ts 的 cmdUtf8Args） */
+    assert.match(L, /run\(process\.env\.ComSpec \|\| 'cmd\.exe', cmdUtf8Args\(\), cwd, timeoutMs, true, \{ \.\.\.process\.env, \[CMD_UTF8_VAR\]: command \}, true\)/);
     assert.match(L, /windowsVerbatimArguments: verbatim/);
   });
 

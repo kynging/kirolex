@@ -27,6 +27,7 @@ import os from 'os';
 import path from 'path';
 import { WinJobHost, type JobHost } from './winJob.ts';
 import { trIn, uiLang, type UiLang } from './uiText.ts';
+import { decodeLocalOutput } from './winShell.ts';
 
 /** `check`：定时任务的 `checkCommand`（`runCheck`）—— 结果交回调用方，不唤醒会话、不进列表 / 登记 / 名额。 */
 export type BgKind = 'run' | 'watch' | 'check';
@@ -126,6 +127,8 @@ interface Job extends BgJobView {
   /** `watch`：还没凑成事件的那几行 / 半行。 */
   pendingLines: string[];
   partial: string;
+  /** `watch`：最后那半行的原始字节 —— 凑成整行再解码（Windows 上要按行判断是 UTF-8 还是本机代码页，见 winShell.ts）。 */
+  partialBytes: Buffer;
   flushTimer: NodeJS.Timeout | null;
   timeoutTimer: NodeJS.Timeout | null;
   eventTimes: number[];
@@ -154,10 +157,13 @@ export function formatDuration(ms: number, lang: UiLang = uiLang()): string {
   return trIn(lang, '{h} h {m} min', { h: Math.floor(mins / 60), m: mins % 60 });
 }
 
-/** 末尾 `max` 字节（UTF-8），被截掉了就在前面说一声。 */
+/** 末尾 `max` 字节（UTF-8；Windows 上不是合法 UTF-8 的行按本机代码页解），被截掉了就在前面说一声。 */
 export function outputTail(buf: Buffer, max: number, lang: UiLang = uiLang()): string {
-  if (buf.length <= max) return buf.toString('utf8').replace(/\s+$/, '');
-  const body = buf.subarray(buf.length - max).toString('utf8').replace(/^�+/, '').replace(/\s+$/, '');
+  if (buf.length <= max) return decodeLocalOutput(buf).replace(/\s+$/, '');
+  let start = buf.length - max;
+  /* 从一个字的中间切开的：先跳过那几个 UTF-8 续字节，不然 Windows 上这一行会被当成「不是 UTF-8」整行按代码页解 */
+  if (process.platform === 'win32') for (let i = 0; i < 3 && start < buf.length && (buf[start] & 0xc0) === 0x80; i++) start++;
+  const body = decodeLocalOutput(buf.subarray(start)).replace(/^�+/, '').replace(/\s+$/, '');
   return `${trIn(lang, '…(earlier output omitted, showing the last {n} bytes)', { n: max })}\n${body}`;
 }
 
@@ -193,7 +199,7 @@ export class BgJobManager {
       jobId, sessionId: input.sessionId, kind: input.kind,
       label: String(input.label || '').trim() || head(command).slice(0, 40),
       command: head(command), state: 'running', startedAt: Date.now(), endedAt: null, exitCode: null, pid: null, events: 0,
-      child: null, out: Buffer.alloc(0), pendingLines: [], partial: '', flushTimer: null, timeoutTimer: null, eventTimes: [],
+      child: null, out: Buffer.alloc(0), pendingLines: [], partial: '', partialBytes: Buffer.alloc(0), flushTimer: null, timeoutTimer: null, eventTimes: [],
       timeoutMs: input.timeoutMs,
       ...(input.kind === 'check' ? { hash: createHash('sha256'), wsTail: Buffer.alloc(0) } : {}),
     };
@@ -360,7 +366,14 @@ export class BgJobManager {
     job.out = Buffer.concat([job.out, chunk]);
     if (job.out.length > KEEP_BYTES) job.out = job.out.subarray(job.out.length - KEEP_BYTES);
     if (job.kind !== 'watch' || !isStdout || job.state !== 'running') return;
-    const text = job.partial + chunk.toString('utf8');
+    /* 按字节凑整行再解码：一个字被拆在两块里时不会解坏；还没换行的那半行留在 `partialBytes` */
+    const bytes = job.partialBytes.length ? Buffer.concat([job.partialBytes, chunk]) : chunk;
+    let whole = bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1);
+    let rest = bytes.subarray(whole.length);
+    /* 半行太长（字节数超过字数上限）：整块交给下面按字数截的那段 */
+    if (rest.length > WATCH_MAX_LINE_CHARS) { whole = bytes; rest = Buffer.alloc(0); }
+    job.partialBytes = Buffer.from(rest);
+    const text = job.partial + decodeLocalOutput(whole);
     const lines = text.split(/\r?\n/);
     job.partial = lines.pop() ?? '';
     /*
@@ -442,6 +455,7 @@ export class BgJobManager {
   private finish(job: Job, state: 'exited' | 'failed', code: number | null, error?: string): void {
     if (job.state !== 'running') return;
     if (job.kind === 'watch') {
+      if (job.partialBytes.length) { job.partial += decodeLocalOutput(job.partialBytes); job.partialBytes = Buffer.alloc(0); }
       if (job.partial.trim()) { job.pendingLines.push(job.partial); job.partial = ''; }
       this.flushWatch(job);
       /* 同上：最后一批触发了限流就以限流为准，只通知那一次 */
@@ -559,7 +573,7 @@ function startInGroup(command: string, cwd: string): { child: ChildProcess; owne
  * 我们这边断开（KiroLex 退出 / 崩溃）时同样结束它，不碰别的。
  */
 const GATE = `
-const { spawn } = require('child_process');
+const { spawn, spawnSync } = require('child_process');
 let child = null; let buf = '';
 const env = Object.assign({}, process.env);
 const command = env.KX_BG_COMMAND || '';
@@ -571,7 +585,11 @@ process.stdin.on('data', (d) => {
   while ((i = buf.indexOf('\\n')) >= 0) {
     const line = buf.slice(0, i).trim(); buf = buf.slice(i + 1);
     if (line === 'go' && !child) {
-      child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', '"' + command + '"'], { stdio: ['ignore', 'inherit', 'inherit'], windowsVerbatimArguments: true, windowsHide: true, env });
+      /* UTF-8 代码页：闸门自己有一个（隐藏的）控制台 —— 先在它上面 chcp 65001，再起 cmd 并**共用**这个控制台
+         （不带 windowsHide：带了会给 cmd 另开一个新控制台，代码页又回到默认）。cmd 启动时就记下代码页，所以 chcp 必须在它之前。
+         路径要是反斜杠：chcp 自己解析整条命令行，「C:/Windows/...」 里的 「/Windows」 会被当成参数而报错 */
+      try { spawnSync(require('path').join(process.env.SystemRoot || 'C:/Windows', 'System32', 'chcp.com'), ['65001'], { stdio: 'ignore' }); } catch (e) {}
+      child = spawn(process.env.ComSpec || 'cmd.exe', ['/d', '/s', '/c', '"' + command + '"'], { stdio: ['ignore', 'inherit', 'inherit'], windowsVerbatimArguments: true, env });
       child.on('exit', (c) => process.exit(typeof c === 'number' ? c : 1));
       child.on('error', (e) => { process.stderr.write(String(e && e.message) + '\\n'); process.exit(127); });
     } else if (line === 'kill') stop(137);
