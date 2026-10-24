@@ -896,9 +896,11 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
 
   test('同步时按项目筛，而且说出跳过了多少条', () => {
     const at = M5.indexOf('async function runS3Sync');
-    const body = M5.slice(at, at + 2600);
+    /* 到函数尾 —— 中间加了「删掉的备份不重传」那一段（见 deletedNoReupload.test.ts） */
+    const body = M5.slice(at, M5.indexOf('function rescheduleS3Sync', at));
     /* 先按项目、再按单条会话（「我是说单独会话级别的同步与否」） */
-    assert.match(body, /const sessions = allSessions\.filter\(\(r\) => !projectExcluded\(cfg, projectOf\(r\)\) && !sessionExcluded\(cfg, r\.id\)\);/);
+    assert.match(body, /const syncable = allSessions\.filter\(\(r\) => !projectExcluded\(cfg, projectOf\(r\)\) && !sessionExcluded\(cfg, r\.id\)\);/);
+    assert.match(body, /const excludedCount = allSessions\.length - syncable\.length;/);
     /* "少备份了一些东西"必须能解释，否则那是静默的数据缺失 */
     assert.match(body, /跳过 \$\{excludedCount\} 条会话/);
   });

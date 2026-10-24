@@ -626,6 +626,17 @@ export function sessionSyncState(
 }
 
 /** 从上传的相对路径里认出会话 id（`sessions/<id>/…`）。不是会话文件就返回空。 */
+/**
+ * 一条会话的**对话**最后一次真的变了的时刻：`sessions/<id>/transcript.jsonl` 的修改时间（本机时钟）。没有 transcript → 0。
+ *
+ * 「删掉的云端备份只有删除之后有了新改动才重传」用它判（见 catalogStore.deletedSessionPlan）。不用 `record.updatedAt`：
+ * 执行器断开 / 被回收这类状态记账（executorState）也走 writeRecord，会把它改成现在 —— 一条没人碰过的会话
+ * 只是断开了一下，就会被当成"有新改动"整条重传。新消息、合并恢复都会写 transcript。
+ */
+export function sessionChangedAt(root: string, sessionId: string): number {
+  try { return Math.floor(fs.statSync(path.join(root, 'sessions', sessionId, 'transcript.jsonl')).mtimeMs); } catch { return 0; }
+}
+
 export function sessionIdOfRel(rel: string): string {
   const parts = String(rel || '').split(/[\\/]/);
   return parts[0] === 'sessions' && parts[1] ? parts[1] : '';

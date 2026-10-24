@@ -15,7 +15,7 @@ test('按会话删：id 过白名单，只删桶里有的', () => {
   const body = M.slice(at, at + 2400);
   assert.ok(body.includes('w.-]+$/.test(id)'), '会话 id 要过白名单（它被拼进对象 key）');
   assert.match(body, /inBucket\.has\(id\)/);
-  /* 本地还在的要说出来：下次同步会再传 */
+  /* 本地还在的要说出来：之后有新改动才会重传 */
   assert.match(body, /willReturn/);
 });
 

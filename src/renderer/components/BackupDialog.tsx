@@ -314,7 +314,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       setMsg({
         kind: r.failed?.length ? 'bad' : 'ok',
         text: t('Deleted the backups of {n} sessions.', { n: r.sessions })
-          + (back ? ' ' + t('{back} of them still exist locally and will be uploaded again on the next sync. To get rid of one for good, delete the local copy in the sidebar too.', { back }) : '')
+          + (back ? ' ' + t('{back} of them still exist locally; they are only backed up again if they change after this deletion.', { back }) : '')
           + (r.failed?.length ? '\n' + t('{n} objects could not be deleted: {list}', { n: r.failed.length, list: r.failed.slice(0, 3).join(t('; ')) }) : ''),
       });
       /* 只清掉删了的那几条的勾 —— 别的组还勾着的留着 */
@@ -584,7 +584,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                     : chosen.length ? t('Delete {n} selected', { n: chosen.length }) : t('Delete selected')}
                 </button>
                 {armDelete && !!stillLocal.length && (
-                  <span className="settings-hint">{t('{n} of them still exist locally and will be uploaded again on the next sync', { n: stillLocal.length })}</span>
+                  <span className="settings-hint">{t('{n} of them still exist locally; they are only backed up again if they change later', { n: stillLocal.length })}</span>
                 )}
                 {!armDelete && !!merging.length && (
                   <span className="settings-hint">{t('{n} of them will be merged with the local copy', { n: merging.length })}</span>

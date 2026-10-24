@@ -38,7 +38,7 @@ import {
   SyncConfig, Catalog, CatalogEntry, SESSION_FILES, MAX_FILE_BYTES, DEFAULT_INTERVAL_MINUTES,
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, detectConflicts, conflictKeyFor, backoffMultiplier,
-  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
+  readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, sessionChangedAt, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
   decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import {
@@ -56,7 +56,7 @@ import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfil
 import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
 import {
   serialQueue, catalogIO, updateCatalog, readCatalog, deleteSessionBackups, writeSyncCatalog, forgetMissingEntries,
-  missingEntries, markMissing, sessionIdsFromPrefixes, sessionKeyPrefix, entryUploadedAt, syncMark, type CatalogBucket,
+  missingEntries, markMissing, sessionIdsFromPrefixes, sessionKeyPrefix, entryUploadedAt, syncMark, deletedSessionPlan, dropSessionState, type CatalogBucket,
 } from './catalogStore.ts';
 import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, canAssignProjectId, keepRecordPlacement, sessionCwd, resolveRemoteWorkdir, remoteHomeDir, type ExecutorBins, type RemoteTarget } from './config';
 import * as loopVerify from './loopVerify';
@@ -5987,8 +5987,20 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
     followBucketPlacements(cfg, oldCatalog, store.listSessions());   // 侧栏按 session:placement-changed 逐条改
     const allSessions = store.listSessions();
-    const sessions = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)) && !sessionExcluded(cfg, r.id));
-    const excludedCount = allSessions.length - sessions.length;
+    const syncable = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)) && !sessionExcluded(cfg, r.id));
+    /*
+      **删掉的云端备份不再被重新传上去**（判据见 catalogStore.deletedSessionPlan）—— 所有电脑一样：
+      有删除记录、而会话的最后修改时间不晚于删除时刻 → 这一轮不传、不进 catalog（恢复页不显示）；
+      删除之后又有了新改动 → 整条重传（先清掉它在状态表里的记录，桶里那份已经没了）。
+    */
+    /** 每条会话的对话最后一次变的时刻 —— 开头按它筛，写 catalog 时再按最新的删除记录核对一遍（writeSyncCatalog） */
+    const changedAtById = new Map(syncable.map((r) => [r.id, sessionChangedAt(KIROLEX_HOME, r.id)]));
+    const deletedPlan = deletedSessionPlan(syncable.map((r) => ({ id: r.id, changedAt: changedAtById.get(r.id) })), oldCatalog);
+    dropSessionState(state, deletedPlan.reupload);
+    const sessions = syncable.filter((r) => !deletedPlan.skip.has(r.id));
+    if (deletedPlan.skip.size) logger.info('s3', `${deletedPlan.skip.size} 条会话的云端备份删掉之后没有新改动，不重新上传：${[...deletedPlan.skip].join('、')}`);
+    if (deletedPlan.reupload.size) logger.info('s3', `${deletedPlan.reupload.size} 条会话的云端备份删掉之后又有了新改动，整条重新上传：${[...deletedPlan.reupload].join('、')}`);
+    const excludedCount = allSessions.length - syncable.length;
     if (excludedCount) {
       logger.info('s3', `跳过 ${excludedCount} 条会话（项目设成了不同步：`
         + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、') || '无'}；单独设成不同步的会话 ${(cfg.excludeSessions || []).length} 条）`);
@@ -6138,6 +6150,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       let st: fs.Stats;
       try { body = fs.readFileSync(abs); st = fs.statSync(abs); } catch { continue; }
       const owner = rel.startsWith(`sessions${path.sep}`) ? rel.split(path.sep)[1] : '';
+      /* 这一轮开始之后本机删掉了它的备份：剩下的文件不再传（传上去也是没人认的旧文件，见 deletedSessionPlan） */
+      if (owner && (backupDeletedAt.get(owner) ?? 0) >= syncStartedAt) continue;
       const key = owner && conflictIds.has(owner)
         ? conflictKeyFor(cfg.prefix, owner, thisMachine, rel)
         : keyFor(cfg.prefix, rel);
@@ -6177,14 +6191,17 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     /* 本机现存会话清单跟着同一次条件写一起写（云端自动清理的判据，见 cloudTrash.ts）—— 并进的是桶里现在那份 */
     const manifest = thisDeviceManifest(thisDeviceId(), thisMachine, Date.now());
     const wrote = await catalogQueue(() => writeSyncCatalog(catalogBucket(creds!, cfg.prefix), cfg.prefix, fresh, Date.now(),
-      (c) => withDeviceManifest(c, manifest)));
+      (c) => withDeviceManifest(c, manifest), changedAtById));
+    if (wrote.blocked.length) {
+      logger.info('s3', `${wrote.blocked.length} 条会话的云端备份在这一轮同步期间被删掉了、之后没有新改动，不写回目录：${wrote.blocked.join('、')}`);
+    }
     for (const r of wrote.removed) {
       logger.warn('s3', `catalog 里「${r.title}」(${r.id}) 在桶里已经没有文件（${new Date(r.deletedAt).toLocaleString()} 删掉的），从目录里移除`);
     }
     if (wrote.attempts > 1) logger.info('s3', `catalog 写之前别处刚改过，重读合并了 ${wrote.attempts - 1} 次`);
     /*
       这一轮期间本机删掉的备份：开头读的状态表里还记着它们"传过了"，原样写回去就把删除那边清掉的记录盖回来了 ——
-      本地还在的那几条就再也不会被重新传上去。去掉它们，下一轮照常重传（和不交错时一样）。
+      之后有了新改动时就少传文件。去掉它们，和不交错时一样：删除之后没改动就不传（deletedSessionPlan），有改动就整条重传。
     */
     for (const [id, at] of backupDeletedAt) {
       if (at < syncStartedAt) continue;
@@ -8120,7 +8137,7 @@ app.whenReady().then(async () => {
    * 那些没用的大多是**本地早就删了、桶里还留着**的：同步只往上传，从不删桶里的东西，
    * 所以本地删过的会话会一直挂在恢复列表里。
    *
-   * 只删备份，本地一个字不动。本地还在的那几条，下一轮同步会再传上去（状态表已清）——
+   * 只删备份，本地一个字不动。本地还在的那几条，删除之后有了新改动才会再传上去（所有电脑一样，见 catalogStore.deletedSessionPlan）——
    * 那是诚实的结果：要它彻底消失，得在侧栏把本地那条也删掉。界面上会把这几条单独说出来。
    */
   /**
@@ -8175,7 +8192,7 @@ app.whenReady().then(async () => {
       const willReturn = [...gone].filter((id) => local.has(id));
       const { deleted, failed } = await deleteBackupsOf(creds!, cfg.prefix, gone);
       logger.warn('s3', `删掉了 ${gone.size} 条会话的备份 / ${deleted} 个对象`
-        + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地没动；其中 ${willReturn.length} 条本地还在，下次同步会再传）`);
+        + `${failed.length ? `，${failed.length} 个没删掉` : ''}（本地没动；其中 ${willReturn.length} 条本地还在，之后有新改动才会重传）`);
       return { ok: true, sessions: gone.size, deleted, failed, willReturn };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';

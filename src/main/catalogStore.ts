@@ -21,11 +21,9 @@
  * 不 import electron、S3 操作经 `CatalogBucket` 注入 —— 测试用内存里的假桶跑端到端。
  */
 
-import type { Catalog, CatalogEntry, Tombstone } from './s3Sync.ts';
-import { catalogKey, joinPrefix, LAYOUT, mergeCatalog } from './s3Sync.ts';
+import type { Catalog, CatalogEntry, SyncState, Tombstone } from './s3Sync.ts';
+import { catalogKey, joinPrefix, LAYOUT, mergeCatalog, sessionIdOfRel } from './s3Sync.ts';
 
-/** 删除记录留多久。过了这么久，还拿着那条旧条目来写的机器也早该同步过了。 */
-export const TOMBSTONE_KEEP_MS = 365 * 86_400_000;
 /** 条件写连着冲突这么多次就放弃这一次（没有覆盖对方）。 */
 export const MAX_CATALOG_TRIES = 6;
 
@@ -53,7 +51,12 @@ export function normalizeCatalog(c: Catalog, now = Date.now()): Catalog {
   for (const t of c.deleted || []) {
     if (!t || typeof t.id !== 'string' || !SAFE_ID.test(t.id)) continue;
     const at = Number(t.at) || 0;
-    if (at <= 0 || now - at > TOMBSTONE_KEEP_MS) continue;
+    /*
+      删除记录**不过期**：它同时是「删除之后没新改动就不重传」的判据（deletedSessionPlan）——
+      过期了，点删除那台（状态表已清）下一次同步就会把没改过的会话整条传回去。只有之后真的重新上传过才作废（下面）。
+      一条记录几十个字节。
+    */
+    if (at <= 0) continue;
     tomb.set(t.id, Math.max(tomb.get(t.id) || 0, at));
   }
   const entries: CatalogEntry[] = [];
@@ -143,6 +146,41 @@ export function serialQueue(): <T>(fn: () => Promise<T>) => Promise<T> {
  * 本机这一轮要写进 catalog 的条目用哪个 `uploadedAt`：这一轮真传过的用这一轮的时刻；没传的用上次**真传完**的时刻
  * （marks 的 `uploadedAt`）。marks 的 `at` 是整轮结束的时刻，不可信 —— 老的 marks 只有它，就不给（有删除记录时按删除更新算）。
  */
+/**
+ * **删掉的云端备份不再被重新传上去** ——「删掉的云端备份还会被重新传上去，要统一」（2026-10-24）。
+ *
+ * 所有电脑同一条规则：catalog 里有这条会话的删除记录（`at` = 删除时刻）时，比较本机这条会话的对话最后一次变的时刻
+ * （`changedAt` = `s3Sync.sessionChangedAt`，transcript 的修改时间；不用 record.updatedAt，执行器断开也会改它）——
+ *   · 不晚于删除时刻 → `skip`：这一轮不传它的任何文件，也不给它写 catalog 条目（恢复页不显示）；
+ *   · 晚于删除时刻（删除之后又有了新改动）→ `reupload`：整条重传（桶里那份已经删了，只传变了的文件会缺东西），
+ *     调用方先用 `dropSessionState` 清掉它在状态表里的记录。
+ * 以前点删除的那台电脑会马上整条重传（删除时清了它的状态表），别的电脑要等有新改动 —— 两边不一样。
+ * 删除记录用删除那台电脑的时钟，changedAt 用本机的时钟。删除记录不过期（见 normalizeCatalog）。catalog 读不到 → 都不筛。
+ */
+export function deletedSessionPlan(
+  sessions: Array<{ id: string; changedAt?: number }>, catalog: Catalog | null, now = Date.now(),
+): { skip: Set<string>; reupload: Set<string> } {
+  const skip = new Set<string>();
+  const reupload = new Set<string>();
+  if (!catalog) return { skip, reupload };
+  let tombs: Tombstone[] = [];
+  try { tombs = normalizeCatalog({ ...catalog, entries: catalog.entries || [] }, now).deleted || []; } catch { tombs = []; }
+  const at = new Map(tombs.map((t) => [t.id, t.at]));
+  for (const r of sessions) {
+    const t = at.get(r.id);
+    if (t === undefined) continue;
+    ((Number(r.changedAt) || 0) > t ? reupload : skip).add(r.id);
+  }
+  return { skip, reupload };
+}
+
+/** 把这几条会话在状态表（`s3-sync-state.json`）里的记录去掉 —— 下一次上传计划会把它们的文件全部当成要传。 */
+export function dropSessionState(state: SyncState, ids: Iterable<string>): void {
+  const gone = new Set(ids);
+  if (!gone.size) return;
+  for (const rel of Object.keys(state)) if (gone.has(sessionIdOfRel(rel))) delete state[rel];
+}
+
 export function entryUploadedAt(
   id: string, thisRound: ReadonlyMap<string, number>, marks: Record<string, { uploadedAt?: number } | undefined>,
 ): number | undefined {
@@ -248,10 +286,18 @@ export async function writeSyncCatalog(
   bucket: CatalogBucket, prefix: string | undefined, fresh: CatalogEntry[], now = Date.now(),
   /** 同一次写里再改一点（云端自动清理：并进本机的现存会话清单，见 cloudTrash.ts）。作用在合并之后的那份上，每次重试都重做。 */
   decorate?: (c: Catalog) => Catalog,
-): Promise<UpdateResult & { removed: Array<{ id: string; title: string; deletedAt: number }> }> {
+  /**
+   * 本机这一轮每条会话的对话最后一次变的时刻（`s3Sync.sessionChangedAt`）。给了就按**刚重读的**删除记录再核对一遍：
+   * 有删除记录、而对话从那以后没变过的，这一轮的条目不写进去（`blocked` 里带回来）——
+   * 同步开始时读的目录里还没有这条删除记录（删除是这一轮中途完成的）、这一轮又在删除之后把旧文件传了上去时，
+   * 不能凭"上传时间晚于删除"就让它复活。
+   */
+  changedAt?: ReadonlyMap<string, number>,
+): Promise<UpdateResult & { removed: Array<{ id: string; title: string; deletedAt: number }>; blocked: string[] }> {
   let present: Set<string> | null = null;
   try { present = await bucket.sessionIds(); } catch { present = null; }   // 列不出来就不清理，照常写
   let candidates: Array<{ id: string; title: string; deletedAt: number }> = [];
+  let blocked: string[] = [];
   const r = await updateCatalog(catalogIO(bucket, prefix), async (latest) => {
     /*
       **catalog 不见了、桶里却已经有备份 / 云端回收站** → 当成重建处理，记 rebuiltAt（和读不懂时一样）：
@@ -262,7 +308,11 @@ export async function writeSyncCatalog(
       if (!hasData) { try { hasData = (await bucket.list(`${joinPrefix(prefix)}${LAYOUT}/trash/`)).length > 0; } catch { hasData = true; } }
       if (hasData) latest = { ...latest, rebuiltAt: now };
     }
-    let next = mergeCatalog(latest, fresh);
+    const tomb0 = new Map((latest.deleted || []).map((t) => [t.id, t.at]));
+    blocked = changedAt
+      ? fresh.filter((e) => tomb0.has(e.id) && (changedAt.get(e.id) ?? 0) <= tomb0.get(e.id)!).map((e) => e.id)
+      : [];
+    let next = mergeCatalog(latest, blocked.length ? fresh.filter((e) => !blocked.includes(e.id)) : fresh);
     if (decorate) next = decorate(next);
     candidates = [];
     if (present) {
@@ -294,7 +344,7 @@ export async function writeSyncCatalog(
     return next;
   }, { onCorrupt: 'empty', now: () => now });
   const kept = new Set(r.catalog.entries.map((e) => e.id));
-  return { ...r, removed: candidates.filter((c) => !kept.has(c.id)) };
+  return { ...r, removed: candidates.filter((c) => !kept.has(c.id)), blocked };
 }
 
 /**

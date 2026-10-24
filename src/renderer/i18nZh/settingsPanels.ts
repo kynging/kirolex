@@ -59,8 +59,8 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Ignored devices (no sync for more than {n} days):': '已忽略的设备（超过 {n} 天没同步）：',
   'Could not delete': '没删掉',
   'Deleted the backups of {n} sessions.': '删掉了 {n} 条会话的备份。',
-  '{back} of them still exist locally and will be uploaded again on the next sync. To get rid of one for good, delete the local copy in the sidebar too.':
-    '其中 {back} 条本地还在，下次同步会再传上去 —— 要它彻底消失，在侧栏把本地那条也删掉。',
+  '{back} of them still exist locally; they are only backed up again if they change after this deletion.':
+    '其中 {back} 条本地还在：之后有新改动才会重新备份。',
   '{n} objects could not be deleted: {list}': '{n} 个对象没删掉：{list}',
   'About to restore {n} sessions.': '要恢复 {n} 条会话。',
   '{n} of them will move to another project or change archive state to match the cloud (it was moved there more recently).':
@@ -116,7 +116,7 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Confirm deleting {n} backups': '确认删除 {n} 条备份',
   'Delete {n} selected': '删除选中的 {n} 条',
   'Delete selected': '删除选中的',
-  '{n} of them still exist locally and will be uploaded again on the next sync': '其中 {n} 条本地还在，下次同步会再传上去',
+  '{n} of them still exist locally; they are only backed up again if they change later': '其中 {n} 条本地还在，之后有新改动才会重新备份',
   '{n} of them will be merged with the local copy': '其中 {n} 条会和本地合并',
   'No backups in the bucket yet. Click "Sync now" on the Sync tab first.': '桶里还没有备份 —— 先在「同步」那个 tab 点一次「立即同步」。',
   'Archived in the cloud': '云上那份是归档的',

@@ -14,7 +14,7 @@ import fs from 'node:fs';
 import path from 'node:path';
 import {
   normalizeCatalog, withTombstones, updateCatalog, serialQueue, catalogIO, deleteSessionBackups,
-  writeSyncCatalog, forgetMissingEntries, missingEntries, sessionIdsFromPrefixes, markMissing, TOMBSTONE_KEEP_MS,
+  writeSyncCatalog, forgetMissingEntries, missingEntries, sessionIdsFromPrefixes, markMissing,
   type CatalogBucket,
 } from '../src/main/catalogStore.ts';
 import { catalogKey, type Catalog, type CatalogEntry } from '../src/main/s3Sync.ts';
@@ -89,11 +89,11 @@ describe('删除记录（tombstone）的合并规则', () => {
     const c: Catalog = { version: 1, entries: [entry('a', { uploadedAt: undefined })], deleted: [{ id: 'a', at: 1 }] };
     assert.equal(normalizeCatalog(c, 10).entries.length, 0);
   });
-  test('同一个 id 多条记录取最新；太老的记录丢掉；别的字段（devices 等）原样带着', () => {
-    const now = TOMBSTONE_KEEP_MS + 10_000;
+  test('同一个 id 多条记录取最新；很老的记录也留着（不过期，见 deletedNoReupload.test.ts）；别的字段（devices 等）原样带着', () => {
+    const now = 1000 * 86_400_000;
     const c: any = { version: 1, entries: [], devices: { mac: { x: 1 } }, deleted: [{ id: 'a', at: now - 9000 }, { id: 'a', at: now - 1000 }, { id: 'old', at: 1 }] };
     const n: any = normalizeCatalog(c, now);
-    assert.deepEqual(n.deleted, [{ id: 'a', at: now - 1000 }]);
+    assert.deepEqual(n.deleted, [{ id: 'a', at: now - 1000 }, { id: 'old', at: 1 }]);
     assert.deepEqual(n.devices, { mac: { x: 1 } });
   });
   test('withTombstones：去掉条目、写记录，别的条目不动', () => {
