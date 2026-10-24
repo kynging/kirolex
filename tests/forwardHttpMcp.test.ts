@@ -201,15 +201,27 @@ describe('接线（源码扫描）', () => {
   test('Kiro 分支按名单挑、http 规格一起交给 setProxies、只把隧道地址写进远端 agent', () => {
     assert.match(body, /forwardableFrom\(localAgentJson\(profile\.kiroAgent\), loadForwardMcpList\(\)\)/);
     assert.match(body, /server\.setProxies\(sessionId, forwardable\);/);
-    assert.match(body, /remoteForwardPlan\(forwardable, mcpUrl\(remotePort, urlPath\)\)/);
+    /* 只写这次交得出去的（没就绪的 stdio、没探测通过过的 http 不写，见 forwardMcpReady.test.ts）；同上游剔除按全部算 */
+    assert.match(body, /const handedK = forwardable\.filter\(\(e\) => forwardHandedNow\(e, notReady\)\);/);
+    assert.match(body, /remoteForwardPlan\(handedK, mcpUrl\(remotePort, urlPath\)\)/);
+    assert.match(body, /dropUpstream: remoteForwardPlan\(forwardable, mcpUrl\(remotePort, urlPath\)\)\.dropUpstream/);
     assert.match(body, /remoteAgentScript\(agentOverride, profile\.kiroAgent, mcpUrl\(remotePort, urlPath\), plan\.forwarded, plan\.dropUpstream\)/);
     assert.match(body, /parseDroppedDupes\(agentOut\)/);
   });
 
   test('每个 http 转发条目都探测，失败只提示不阻断（不 await）', () => {
-    assert.match(body, /probeHttpMcp\(/);
-    assert.match(body, /httpProbeNotice\(/);
-    assert.equal(/await\s+probeHttpMcp/.test(body), false, '探测不能挡住会话准备');
+    /* 探测挪进 watchHttpForwards：两个分支都调它、都不 await（探测不能挡住会话准备） */
+    assert.equal([...body.matchAll(/\n\s*watchHttpForwards\(sessionId, spec, /g)].length, 2);
+    assert.equal(/await\s+(probeHttpMcp|watchHttpForwards)/.test(body), false, '探测不能挡住会话准备');
+    const at = M.indexOf('function watchHttpForwards(');
+    const w = M.slice(at, M.indexOf('\n}\n', at));
+    assert.match(w, /^function watchHttpForwards\([^)]*\): void \{/);
+    const sa = M.indexOf('function startHttpWatch(');
+    const sw = M.slice(sa, M.indexOf('\n}\n', sa));
+    assert.match(sw, /^function startHttpWatch\([^)]*\): void \{/);
+    assert.match(sw, /probeHttpMcp\(/);
+    assert.match(sw, /httpPendingNotice\(/);
+    assert.equal(/await\s+probeHttpMcp/.test(sw), false, '探测不能挡住会话准备');
   });
 
   test('名单存在 config.json，有读写 IPC', () => {

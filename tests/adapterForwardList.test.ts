@@ -198,7 +198,9 @@ describe('接线（源码扫描）', () => {
     assert.match(nonKiro, /localKiroMcpSources\(/);
     assert.match(nonKiro, /server\.setProxies\(sessionId, entries\);/);
     assert.match(nonKiro, /const mcp = \{ type: 'http', name: 'kirolex-local', url: mcpUrl\(remotePort, urlPath\), headers: \[\] \};/);
-    assert.match(nonKiro, /mcpServers: \[mcp, \.\.\.remoteComboMcpServers\(entries, mcpUrl\(remotePort, urlPath\)\)\]/);
+    /* 交给适配器的是就绪过的那些（stdio 先 readyProxies，没就绪的先不交，见 forwardMcpReady.test.ts） */
+    assert.match(nonKiro, /const handed = entries\.filter\(\(e\) => forwardHandedNow\(e, notReady\)\);/);
+    assert.match(nonKiro, /mcpServers: \[mcp, \.\.\.remoteComboMcpServers\(handed, mcpUrl\(remotePort, urlPath\)\)\]/);
     assert.match(nonKiro, /转发本机 MCP 给 sessionId=/);
   });
 

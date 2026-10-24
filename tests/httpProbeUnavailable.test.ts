@@ -139,13 +139,22 @@ describe('接线（源码扫描）', () => {
   const body = M.slice(at, M.indexOf('\n}\n', at));
 
   test('两条分支的探测都在 localToolsBySession.set 之后、结果都交给 noteHttpProbe（失败才能记到这份 spec 上）', () => {
-    const calls = [...body.matchAll(/void probeHttpMcp\(/g)];
+    /* 探测挪进 watchHttpForwards（两条分支各调一次）：调用都在 spec 登记之后，里面的结果都交给 noteHttpProbe */
+    const calls = [...body.matchAll(/\n\s*watchHttpForwards\(sessionId, spec, /g)];
     assert.equal(calls.length, 2);
     for (const c of calls) {
       const before = body.slice(0, c.index);
       assert.ok(before.lastIndexOf('localToolsBySession.set(sessionId, spec);') > before.lastIndexOf('const spec'), '先登记 spec 再探测');
-      assert.match(body.slice(c.index, c.index + 400), /if \(noteHttpProbe\(sessionId, spec, h\.name, r\)\) sessionNotice\(sessionId, httpProbeNotice\(/);
     }
+    const at = M.indexOf('function startHttpWatch(');
+    const w = M.slice(at, M.indexOf('\n}\n', at));
+    assert.match(w, /const probe = \(\) => probeHttpMcp\(h, log\);/);
+    assert.match(w, /\n\s*probe,\n/);
+    assert.match(w, /noteResult: \(r\) => noteHttpProbe\(sessionId, spec, h\.name, r\)/);
+    /* 失败记下了（noteHttpProbe 回 true）才说，且只在第一次失败时说（规则在 watchHttpForward） */
+    const rf = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'forwardReconnect.ts'), 'utf8');
+    assert.match(rf, /if \(d\.noteResult\(r\) && failures === 1\) d\.noticeFailed\(r, d\.mounted\);/);
+    assert.match(w, /noticeFailed: \(r, isMounted\) => noteInSession\(sessionId,\n\s*isMounted \? httpDroppedNotice\(h\.name, r\.error \|\| ''\) : httpPendingNotice\(h\.name, r\.error \|\| ''\)/);
   });
 
   test('noteHttpProbe：失败记到当前这份 spec 并要求提示（被重连换掉的不记、不提示），成功清掉', () => {

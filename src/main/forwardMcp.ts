@@ -31,7 +31,7 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { expandEnvRefs as expandComboEnv, type McpComboServer } from './mcpCombos.ts';
-import { tr, trConcat } from './uiText.ts';
+import { tr, trConcat, trList } from './uiText.ts';
 import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
 
 /**
@@ -257,6 +257,71 @@ export function unavailableForwardHelp(list: ForwardUnavailable[]): string {
   return `· 这些从用户机器转发的 MCP **当前不可用**（KiroLex 探测失败）：`
     + `${list.map((u) => `\`${u.name}\`（${u.reason}）`).join('、')}。`
     + `别指望用它们完成任务；用到时把原因原样告诉用户（多半要他改本机配置），别在这台机器上另配一份去绕。`;
+}
+
+/* ------------------------------ 转发的 stdio MCP：就绪 / 掉线 / 起不来（写法按 docs/notices-glossary.md） */
+
+/**
+ * 会话准备时它没就绪（`starting` = 还在起，只是慢；否则是连续起不来）——进对话记录：这条会话现在少了它的工具。
+ * 还在起的那种 KiroLex 接着等，好了自动重连把它挂上；起不来的要用户去看本机那条命令。原因放「详情」。
+ */
+export function forwardNotReadyNotice(name: string, reason: string, starting: boolean): string {
+  return trConcat(
+    starting
+      ? tr('⚠️ The MCP "{name}" forwarded from this machine is still starting, so this session doesn\'t have its tools yet. It reconnects automatically to add them once it is ready.', { name })
+      : tr('⚠️ The MCP "{name}" forwarded from this machine failed to start, so this session doesn\'t have its tools. Check that its command runs on this machine, then reopen the session.', { name }),
+    NOTE_DETAIL_SEP,
+    String(reason || tr('Unknown error')));
+}
+
+/**
+ * HTTP 型转发第一次探测没通过：这次没交给执行器，KiroLex 在后台接着探（`HTTP_PROBE_BACKOFF_MS`），通过了自动挂上。
+ * 进对话记录（这条会话少了它）；原因放「详情」。
+ */
+export function httpPendingNotice(name: string, error: string): string {
+  return trConcat(
+    tr('⚠️ The MCP "{name}" forwarded from this machine is not available yet, so this session doesn\'t have it for now. KiroLex keeps checking and adds it automatically once it works; if it is a config problem, fix the local config.', { name }),
+    NOTE_DETAIL_SEP,
+    String(error || tr('Unknown error')));
+}
+
+/**
+ * 已挂上的 HTTP 型转发中途连不上上游了（远端经它转发失败、随后探测也没通过）：调用它会失败，KiroLex 在后台接着探，
+ * 恢复后说一声。进对话记录（影响这条会话的结果）；原因放「详情」。
+ */
+export function httpDroppedNotice(name: string, error: string): string {
+  return trConcat(
+    tr('⚠️ The MCP "{name}" forwarded from this machine can\'t reach its upstream right now, so calls to it fail. KiroLex keeps checking and tells you once it works again.', { name }),
+    NOTE_DETAIL_SEP,
+    String(error || tr('Unknown error')));
+}
+
+/** HTTP 型转发后台探测通过了：说一句「已恢复可用」，等会话空闲重连挂上（状态行）。 */
+export function httpForwardBackNotice(name: string): string {
+  return tr('✅ The MCP "{name}" forwarded from this machine is available again; it is added when this session is idle.', { name });
+}
+
+/** 会话准备时在等它们起来（几秒还没好才说，状态行）。 */
+export function forwardStartingNotice(names: string[]): string {
+  return tr('⏳ Starting the MCP(s) forwarded from this machine: {names}…', { names: trList(names) });
+}
+
+/** 用着用着本机进程退了：正在自动拉起（状态行，不用你做什么）。 */
+export function forwardRestartingNotice(name: string): string {
+  return tr('⏳ The MCP "{name}" forwarded from this machine exited; restarting it automatically.', { name });
+}
+
+/** 退了之后连续拉不起来，停止自动重启 —— 进对话记录：说清是谁、为什么（详情）、怎么办。 */
+export function forwardGaveUpNotice(name: string, reason: string): string {
+  return trConcat(
+    tr('⚠️ The MCP "{name}" forwarded from this machine keeps exiting, so automatic restarts have stopped. Check that its command runs on this machine; the next call to it tries again.', { name }),
+    NOTE_DETAIL_SEP,
+    String(reason || tr('Unknown error')));
+}
+
+/** 准备时没就绪的那个后来好了：自动重连这条会话把它挂上（状态行）。 */
+export function forwardReadyReconnectNotice(name: string): string {
+  return tr('⏳ The MCP "{name}" forwarded from this machine is ready; reconnecting this session to add it…', { name });
 }
 
 /* ---------------------------------------------- Claude Code / Codex 的「组合」 */

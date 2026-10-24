@@ -120,9 +120,18 @@ describe('接线（源码扫描）', () => {
   });
 
   test('非 Kiro 分支：http 中转条目探测，失败只提示不阻断', () => {
-    assert.match(nonKiro, /probeHttpMcp\(/);
-    assert.match(nonKiro, /httpProbeNotice\(/);
-    assert.equal(/await\s+probeHttpMcp/.test(nonKiro), false);
+    /* 探测挪进 watchHttpForwards（不阻塞会话准备：它返回 void，调用处不 await，里面也不 await 探测） */
+    assert.match(nonKiro, /\n\s*watchHttpForwards\(sessionId, spec, http\);/);
+    assert.equal(/await\s+(probeHttpMcp|watchHttpForwards)/.test(nonKiro), false);
+    const at = M.indexOf('function watchHttpForwards(');
+    const w = M.slice(at, M.indexOf('\n}\n', at));
+    assert.match(w, /^function watchHttpForwards\([^)]*\): void \{/);
+    const sa = M.indexOf('function startHttpWatch(');
+    const sw = M.slice(sa, M.indexOf('\n}\n', sa));
+    assert.match(sw, /^function startHttpWatch\([^)]*\): void \{/);
+    assert.match(sw, /probeHttpMcp\(/);
+    assert.match(sw, /httpPendingNotice\(/);
+    assert.equal(/await\s+probeHttpMcp/.test(sw), false);
   });
 
   test('切换组合后不再说「远程会话暂时还不挂组合里的 MCP」', () => {

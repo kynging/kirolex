@@ -47,6 +47,7 @@ import { browserToolDefs, isBrowserTool } from './localBrowser.ts';
 import { isWakeTool, wakeToolDefs } from './wakeTools.ts';
 import { isSessionTool, sessionToolDefs } from './sessionCalls.ts';
 import { CMD_UTF8_VAR, cmdUtf8Args, decodeLocalOutput, powershellArgs } from './winShell.ts';
+import { taskkillTree } from './procTree.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -226,6 +227,15 @@ export interface LocalMcpDeps {
    * 探测失败不摘代理，远端下次调用 / 重连时的 initialize 照样转过去，成功了就算恢复。
    */
   onProxyOk?(sessionId: string, name: string): void;
+  /** 一个 HTTP 转发这次没转成（连不上上游 / 超时 / 鉴权失败…，`error` 是给人看的原因，密钥已抹掉）。 */
+  onProxyFail?(sessionId: string, name: string, error: string): void;
+  /**
+   * 一个转发的 stdio MCP 状态变了：`up` = 握手 + tools/list 通过（含退出后自动拉起成功）；
+   * `down` = 就绪之后进程退了（正在按退避拉起）；`failed` = 连续起不来、停止自动重启（`reason` 是最后一次的原因）。
+   */
+  onProxyState?(sessionId: string, name: string, state: ForwardProxyState, reason?: string): void;
+  /** 转发 stdio MCP 的重试节奏（默认 `FORWARD_RETRY`；测试调小）。 */
+  forwardRetry?: ForwardRetry;
 }
 
 export interface ToolResult {
@@ -635,25 +645,72 @@ interface ForwardProxy {
   stop(): void;
 }
 
-/** 一个被代理的 stdio MCP：懒启动、按 id 配对、会话结束时杀掉。 */
+/** 转发的 stdio MCP 起不来 / 退了之后的重试节奏（退避：`baseMs` 起翻倍，封顶 `maxMs`；连续 `maxFails` 次失败就停下）。 */
+export interface ForwardRetry { baseMs: number; maxMs: number; maxFails: number }
+export const FORWARD_RETRY: ForwardRetry = { baseMs: 1000, maxMs: 30_000, maxFails: 6 };
+/**
+ * 会话准备时最多等转发的 stdio MCP 就绪多久。这段时间里起不来（一起就退）会按 `FORWARD_RETRY` 重试；
+ * 到期还没好就先不交给适配器（交了也只是 CONNECT_TIMEOUT），进程不杀，后台接着起。
+ */
+export const FORWARD_READY_DEADLINE_MS = 90_000;
+/** 一次握手（initialize + tools/list）的上限：慢启动要给够，但不能无限等一个卡死的进程。 */
+export const FORWARD_HANDSHAKE_TIMEOUT_MS = 120_000;
+/** 执行器重建时停放着的转发进程留多久（新执行器在这段时间里来认领就不用冷启动）。 */
+export const FORWARD_PARK_MS = 60_000;
+/** 进程就绪后撑过这么久才退，才算"偶尔退一次"（失败计数清零）；更快就退的算连续失败。 */
+const FORWARD_STABLE_MS = 60_000;
+
+export type ForwardProxyState = 'up' | 'down' | 'failed';
+/** `readyProxies` 的一项结果。`starting` = 到期时它还在起（没失败，只是慢）。 */
+export interface ProxyReady { name: string; ok: boolean; toolCount: number; error?: string; starting?: boolean }
+
+/**
+ * 一个被代理的 stdio MCP：**先就绪再交出去**、按内部 id 配对、退了自动拉起、会话结束时杀掉。
+ *
+ * 「远程会话里从本机转发的 MCP 间歇连不上：CONNECT_TIMEOUT」的根因就在原来的写法：**懒启动** ——
+ * 远端适配器的第一个 initialize 到了才 spawn，进程起得慢（Windows 上经 cmd 起 builder-mcp 这类）
+ * 就超过适配器的建连超时（Claude Code 默认 30 秒）。同一条隧道上的 kirolex-local 是进程内直接回的，所以它一直好好的。
+ *
+ * 现在：
+ *   · 会话准备时 `ready()` 就把进程起起来，**KiroLex 自己**跟它握手（initialize + notifications/initialized
+ *     + tools/list 做健康检查），过了才把它写进适配器的 `mcpServers`（见 index.ts `ensureLocalTools`）；
+ *   · 远端的 initialize 直接回缓存的那份结果（换成远端的 id），它的 notifications/initialized 吞掉 ——
+ *     stdio 那头本来就只有一个会话，已经握过了；
+ *   · 往子进程发的 id 一律换成内部自增 id：远端重连 / 超时重试会复用同一个 id（Claude Code 每条连接都从 0 数），
+ *     原来按远端 id 配对时，旧请求的超时会把新请求的登记删掉、新请求永远等不到；
+ *   · 进程退了（不是我们停的）：按退避自动拉起并**重新握手** —— 远端还拿着原来那条 MCP 连接、不会再发 initialize，
+ *     严格的 server 没握手就调工具会报错。连续失败 `maxFails` 次停下，报 `failed`；之后再有调用会重新试一轮。
+ */
 class StdioProxy implements ForwardProxy {
   private spec: StdioProxySpec;
   private log: LocalMcpDeps['log'];
+  private retry: ForwardRetry;
+  private onState: (state: ForwardProxyState, reason?: string) => void;
+  private winShim: boolean;
   private child: ChildProcess | null = null;
   private buf = '';
-  private pending = new Map<string | number, (msg: any) => void>();
+  /** 内部 id -> 等答复的那个。 */
+  private pending = new Map<number, (msg: any) => void>();
+  /** 远端 id（JSON 串）-> 最近一次对应的内部 id —— `notifications/cancelled` 要换成内部 id 才指得到。 */
+  private byRemoteId = new Map<string, number>();
+  private seq = 0;
+  private handshake: Promise<{ init: any; toolCount: number }> | null = null;
+  private initResult: any = null;
+  private toolCount = 0;
+  private up = false;
+  private upAt = 0;
+  private fails = 0;
+  private gaveUp = false;
+  private lastError = '';
+  private stopped = false;
+  private retryTimer: NodeJS.Timeout | null = null;
+  private waiters = new Set<() => void>();
 
-  constructor(spec: StdioProxySpec, log: LocalMcpDeps['log']) {
+  constructor(spec: StdioProxySpec, log: LocalMcpDeps['log'], opts: { retry?: ForwardRetry; onState?: (state: ForwardProxyState, reason?: string) => void } = {}) {
     this.spec = spec;
     this.log = log;
-  }
-
-  private ensure(): ChildProcess {
-    if (this.child && !this.child.killed && this.child.exitCode === null) return this.child;
-    /*
-      **懒启动**：这些 server 很重（playwright 会拉起一个浏览器），没人调就不该起。
-      `env` 合并进当前环境：那些 server 常常靠 PATH / HOME 找自己的东西。
-    */
+    this.retry = opts.retry || FORWARD_RETRY;
+    this.onState = (state, reason) => { try { opts.onState?.(state, reason); } catch { /* 记状态出错不能连累转发 */ } };
     /*
       **Windows 上 `npx` / `uvx` 是 `.cmd` shim，`spawn` 直接执行不了**
       ——「看一下有没有 windows 上不能跑的东西」。`spawn('npx', …)` 在 Windows 上
@@ -664,19 +721,29 @@ class StdioProxy implements ForwardProxy {
       走 shell 时命令要加引号（路径里有空格是常态：`C:\Program Files\…`）。
       非 Windows 一律不走 shell —— 那边不需要，而走 shell 会把参数里的特殊字符变成语法。
     */
-    const winShim = process.platform === 'win32' && !/\.(exe|com)$/i.test(this.spec.command);
+    this.winShim = process.platform === 'win32' && !/\.(exe|com)$/i.test(spec.command);
+  }
+
+  private notify(): void {
+    for (const w of [...this.waiters]) w();
+  }
+
+  private spawnChild(): ChildProcess {
+    /* `env` 合并进当前环境：那些 server 常常靠 PATH / HOME 找自己的东西。 */
     const child = spawn(
-      winShim ? `"${this.spec.command}"` : this.spec.command,
+      this.winShim ? `"${this.spec.command}"` : this.spec.command,
       this.spec.args || [],
       {
         stdio: ['pipe', 'pipe', 'pipe'],
         env: { ...process.env, ...(this.spec.env || {}) },
-        shell: winShim,
+        shell: this.winShim,
         windowsHide: true,
       },
     );
     this.child = child;
+    this.buf = '';
     child.stdout?.on('data', (d: Buffer) => {
+      if (this.child !== child) return;
       this.buf += d.toString('utf-8');
       let i: number;
       while ((i = this.buf.indexOf('\n')) >= 0) {
@@ -685,8 +752,12 @@ class StdioProxy implements ForwardProxy {
         if (!line) continue;
         let msg: any;
         try { msg = JSON.parse(line); } catch { continue; }
-        /* 对不上 id 的是它主动推的通知 —— 我们没有地方送，丢掉（不能当成某个请求的答复） */
-        const resolve = msg?.id !== undefined ? this.pending.get(msg.id) : undefined;
+        if (msg?.method !== undefined) {
+          /* 它主动发来的请求（roots/list 之类）：我们没有地方送 —— 回一句"不支持"，别让它干等；通知丢掉 */
+          if (msg.id !== undefined) this.write(child, { jsonrpc: '2.0', id: msg.id, error: { code: -32601, message: 'not supported by the KiroLex forwarder' } });
+          continue;
+        }
+        const resolve = typeof msg?.id === 'number' ? this.pending.get(msg.id) : undefined;
         if (resolve) { this.pending.delete(msg.id); resolve(msg); }
       }
     });
@@ -694,45 +765,194 @@ class StdioProxy implements ForwardProxy {
       const t = d.toString('utf-8').trim();
       if (t) this.log('info', `[${this.spec.name}] ${t.slice(0, 300)}`);
     });
-    child.on('close', (code) => {
-      this.log('warn', `[${this.spec.name}] 退了（code ${code}）—— 下一次调用会重新起它`);
-      for (const [, r] of this.pending) r({ jsonrpc: '2.0', error: { code: -32000, message: `${this.spec.name} 退出了（code ${code}）` } });
-      this.pending.clear();
+    const gone = (why: string) => {
+      if (this.child !== child) return;      // 我们自己停 / 换掉的那个：不算掉线
       this.child = null;
       this.buf = '';
-    });
+      this.failPending(why);
+      this.lastError = why;
+      if (this.stopped) return;
+      this.log('warn', `[${this.spec.name}] ${why}`);
+      if (!this.up) return;                  // 握手中途退的：由握手那条路记失败、排重试
+      this.up = false;
+      this.handshake = null;
+      if (Date.now() - this.upAt >= FORWARD_STABLE_MS) this.fails = 0;
+      this.onState('down', why);
+      this.countFailure();
+    };
+    child.on('error', (err) => gone(`${this.spec.name} 起不来：${err?.message || err}`));
+    child.on('close', (code) => gone(`${this.spec.name} 退出了（code ${code}）`));
     this.log('info', `[${this.spec.name}] 起在本机：${this.spec.command} ${(this.spec.args || []).join(' ')}`);
     return child;
   }
 
-  /** 转发一条 JSON-RPC。通知（没有 id）不等回复。 */
-  call(msg: any, timeoutMs = PROXY_TIMEOUT_MS): Promise<any | null> {
-    const child = this.ensure();
-    const line = `${JSON.stringify(msg)}\n`;
-    if (msg?.id === undefined) {
-      try { child.stdin?.write(line); } catch { /* 它刚退了；下一次调用会重起 */ }
-      return Promise.resolve(null);
-    }
+  private write(child: ChildProcess, msg: any): boolean {
+    try { child.stdin?.write(`${JSON.stringify(msg)}\n`); return true; } catch { return false; }
+  }
+
+  private failPending(why: string): void {
+    const all = [...this.pending.values()];
+    this.pending.clear();
+    this.byRemoteId.clear();
+    for (const r of all) r({ jsonrpc: '2.0', error: { code: -32000, message: why } });
+  }
+
+  /** 发一条请求给子进程（内部 id），等它的答复；超时 / 写不进 / 进程退了都回一个 error 形状的答复，不抛。 */
+  private request(method: string, params: any, timeoutMs: number, remoteId?: any): Promise<any> {
+    const child = this.child;
+    const id = ++this.seq;
+    if (!child) return Promise.resolve({ jsonrpc: '2.0', id, error: { code: -32000, message: `${this.spec.name} 没在运行` } });
+    const rkey = remoteId === undefined ? undefined : JSON.stringify(remoteId);
+    if (rkey !== undefined) this.byRemoteId.set(rkey, id);
     return new Promise((resolve) => {
-      const timer = setTimeout(() => {
-        if (!this.pending.has(msg.id)) return;
-        this.pending.delete(msg.id);
-        resolve({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: `${this.spec.name} 超时（${timeoutMs}ms 没回）` } });
-      }, timeoutMs);
-      this.pending.set(msg.id, (answer) => { clearTimeout(timer); resolve(answer); });
-      try { child.stdin?.write(line); } catch {
+      const done = (answer: any) => {
         clearTimeout(timer);
-        this.pending.delete(msg.id);
-        resolve({ jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: `写不进 ${this.spec.name} 的 stdin` } });
+        if (rkey !== undefined && this.byRemoteId.get(rkey) === id) this.byRemoteId.delete(rkey);
+        resolve(answer);
+      };
+      const timer = setTimeout(() => {
+        if (!this.pending.delete(id)) return;
+        done({ jsonrpc: '2.0', id, error: { code: -32000, message: `${this.spec.name} 超时（${timeoutMs}ms 没回）` } });
+      }, timeoutMs);
+      this.pending.set(id, done);
+      if (!this.write(child, { jsonrpc: '2.0', id, method, ...(params === undefined ? {} : { params }) })) {
+        this.pending.delete(id);
+        done({ jsonrpc: '2.0', id, error: { code: -32000, message: `写不进 ${this.spec.name} 的 stdin` } });
       }
     });
   }
 
-  stop(): void {
+  /** 一次失败记一笔：没到上限就按退避排下一次，到了就停下报 `failed`。 */
+  private countFailure(): void {
+    this.fails += 1;
+    if (this.fails >= this.retry.maxFails) {
+      this.gaveUp = true;
+      this.log('warn', `[${this.spec.name}] 连续 ${this.fails} 次没起来，停止自动重启：${this.lastError}`);
+      this.onState('failed', this.lastError);
+      this.notify();
+      return;
+    }
+    const delay = Math.min(this.retry.maxMs, this.retry.baseMs * 2 ** (this.fails - 1));
+    this.log('info', `[${this.spec.name}] ${delay}ms 后重新拉起（第 ${this.fails} 次失败）`);
+    this.retryTimer = setTimeout(() => {
+      this.retryTimer = null;
+      if (!this.stopped) this.startHandshake().catch(() => { /* 结果走状态，不走这里 */ });
+    }, delay);
+    this.retryTimer.unref?.();
+    this.notify();
+  }
+
+  private killChild(): void {
     const c = this.child;
     this.child = null;
-    try { c?.stdin?.end(); } catch {}
-    try { c?.kill(); } catch {}
+    this.buf = '';
+    if (!c) return;
+    try { c.stdin?.end(); } catch {}
+    /* 走了 shell（Windows）时 `kill` 只杀 cmd.exe，真正的 MCP 进程会留下来 —— 整棵树一起结束 */
+    if (this.winShim && c.pid) void taskkillTree(c.pid);
+    else { try { c.kill(); } catch {} }
+  }
+
+  /** 起进程 + 握手 + tools/list。并发的调用共用同一次。 */
+  private startHandshake(): Promise<{ init: any; toolCount: number }> {
+    if (this.handshake) return this.handshake;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    const p = (async () => {
+      if (!this.child) this.spawnChild();
+      const init = await this.request('initialize', {
+        protocolVersion: MCP_PROTOCOL_VERSION,
+        capabilities: {},
+        clientInfo: { name: 'kirolex-forward', version: '1' },
+      }, FORWARD_HANDSHAKE_TIMEOUT_MS);
+      if (init?.error || !init?.result) throw new Error(String(init?.error?.message || `${this.spec.name} 的 initialize 没有结果`));
+      if (this.child) this.write(this.child, { jsonrpc: '2.0', method: 'notifications/initialized' });
+      const list = await this.request('tools/list', {}, FORWARD_HANDSHAKE_TIMEOUT_MS);
+      if (list?.error) throw new Error(String(list.error.message || JSON.stringify(list.error)));
+      return { init: init.result, toolCount: Array.isArray(list?.result?.tools) ? list.result.tools.length : 0 };
+    })();
+    this.handshake = p;
+    p.then((r) => {
+      if (this.handshake !== p || this.stopped) return;
+      this.initResult = r.init;
+      this.toolCount = r.toolCount;
+      this.up = true;
+      this.upAt = Date.now();
+      this.gaveUp = false;
+      this.lastError = '';
+      this.log('info', `[${this.spec.name}] 就绪：${r.toolCount} 个工具`);
+      this.onState('up');
+      this.notify();
+    }, (err: any) => {
+      if (this.handshake !== p) return;
+      this.handshake = null;
+      if (this.stopped) return;
+      this.lastError = String(err?.message || err);
+      this.killChild();   // 握手失败 / 超时：这个进程不可信了，下一次换一个新的
+      this.countFailure();
+    });
+    return p;
+  }
+
+  /**
+   * 等它就绪，最多 `deadlineMs`。之前停下过（`failed`）就重新试一轮 —— 会话准备、远端来调用都算"有人要它"。
+   * 到期还在起：返回 `starting: true`，进程不杀（慢启动的那种过一会儿自己就好了，会报 `up`）。
+   */
+  async ready(deadlineMs: number): Promise<ProxyReady> {
+    const name = this.spec.name;
+    if (this.stopped) return { name, ok: false, toolCount: 0, error: tr('Forwarding stopped (the session has ended)') };
+    if (this.up) return { name, ok: true, toolCount: this.toolCount };
+    if (this.gaveUp) { this.gaveUp = false; this.fails = 0; }
+    if (!this.retryTimer) this.startHandshake().catch(() => { /* 结果走状态 */ });
+    const t0 = Date.now();
+    while (true) {
+      if (this.up) return { name, ok: true, toolCount: this.toolCount };
+      if (this.gaveUp || this.stopped) return { name, ok: false, toolCount: 0, error: this.lastError || tr('Unknown error') };
+      const left = deadlineMs - (Date.now() - t0);
+      if (left <= 0) {
+        return { name, ok: false, toolCount: 0, starting: true, error: this.lastError || `${name} 等了 ${Math.round(deadlineMs / 1000)} 秒还没就绪` };
+      }
+      await new Promise<void>((resolve) => {
+        const w = () => { clearTimeout(timer); this.waiters.delete(w); resolve(); };
+        const timer = setTimeout(w, left);
+        this.waiters.add(w);
+      });
+    }
+  }
+
+  /** 转发一条 JSON-RPC。通知（没有 id）不等回复。 */
+  async call(msg: any, timeoutMs = PROXY_TIMEOUT_MS): Promise<any | null> {
+    const isNote = msg?.id === undefined;
+    const method = String(msg?.method ?? '');
+    /* 握手是我们替它做过的：远端那句 initialized 不再转（同一个 stdio 会话里发两次，严格的 server 会报错） */
+    if (method === 'notifications/initialized') return null;
+    const r = await this.ready(timeoutMs);
+    if (!r.ok) {
+      if (isNote) return null;
+      return { jsonrpc: '2.0', id: msg.id, error: { code: -32000, message: `${this.spec.name} 当前不可用：${r.error}` } };
+    }
+    if (method === 'initialize') return { jsonrpc: '2.0', id: msg.id, result: this.initResult };
+    if (isNote) {
+      let out = msg;
+      if (method === 'notifications/cancelled' && msg?.params?.requestId !== undefined) {
+        const inner = this.byRemoteId.get(JSON.stringify(msg.params.requestId));
+        if (inner === undefined) return null;   // 对应的请求已经答完了 / 不是这条连接上的
+        out = { ...msg, params: { ...msg.params, requestId: inner } };
+      }
+      if (this.child) this.write(this.child, out);
+      return null;
+    }
+    const answer = await this.request(method, msg.params, timeoutMs, msg.id);
+    return { ...answer, id: msg.id };
+  }
+
+  stop(): void {
+    this.stopped = true;
+    if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+    this.handshake = null;
+    this.up = false;
+    this.failPending(`${this.spec.name} 已停止`);
+    this.killChild();
+    this.notify();
   }
 }
 
@@ -1244,6 +1464,16 @@ export interface LocalMcpServer {
    * 重复调用会把上一批停掉 —— 换 agent 时转发的集合可能变。
    */
   setProxies(sessionId: string, specs: ProxySpec[]): void;
+  /**
+   * 等这条会话转发的 **stdio** MCP 就绪（起进程 + 握手 + tools/list），最多 `deadlineMs`；期间起不来的按退避重试。
+   * 只返回 stdio 那几个（HTTP 型照旧由 `probeHttpMcp` 在后台探测，不挡会话）。
+   */
+  readyProxies(sessionId: string, opts?: { deadlineMs?: number }): Promise<ProxyReady[]>;
+  /**
+   * 执行器要重建（断开再接）之前调：这条会话的转发进程先停放 `FORWARD_PARK_MS`，接下来的 `forget` 不杀它们；
+   * 新执行器的 `setProxies` 同一份配置来认领，就不用再冷启动一次。没人认领到点停掉。
+   */
+  parkProxies(sessionId: string): void;
   /** 登记一条会话，拿到它的 token（URL 里用）。 */
   register(session: LocalMcpSession): string;
   /**
@@ -1293,6 +1523,12 @@ export function releaseSessionTools(
   else server.forget(sessionId, opts.reason);
 }
 
+/** 一份 stdio 转发配置的指纹：命令 / 参数 / env 有一处变了就得换进程。 */
+function stdioKey(spec: StdioProxySpec): string {
+  const env = Object.entries(spec.env || {}).sort(([a], [b]) => (a < b ? -1 : a > b ? 1 : 0));
+  return JSON.stringify([spec.command, spec.args || [], env]);
+}
+
 export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpServer> {
   const sessions = new Map<string, LocalMcpSession>();   // token -> session
   /** 作废的 token -> 哪条会话、为什么（只为给还拿着它的后端一句看得懂的错误）。 */
@@ -1304,6 +1540,10 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
   };
   /** `<sessionId>\0<名字>` -> 那个被代理的本机 MCP。 */
   const proxies = new Map<string, ForwardProxy>();
+  /** 每个 stdio 代理是按哪份配置起的（`setProxies` 据此判断能不能接着用）。 */
+  const proxyKeys = new WeakMap<ForwardProxy, string>();
+  /** 执行器重建期间停放着的 stdio 代理（见 `parkProxies`）。 */
+  const parked = new Map<string, { proxy: StdioProxy; timer: NodeJS.Timeout }>();
   const stopProxies = (sessionId: string): void => {
     for (const [k, v] of proxies) {
       if (k.startsWith(`${sessionId}\u0000`)) { v.stop(); proxies.delete(k); }
@@ -1350,12 +1590,22 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
       }
       try {
         /* 转发的那些：**原样**送进本机那个 server，把它的答复原样送回 —— 中间不解释语义 */
-        const route = (one: any): Promise<any | null> => (proxy ? proxy.call(one).then((r) => {
-          if (proxy instanceof HttpProxy && r && typeof r === 'object' && !r.error && deps.onProxyOk) {
-            try { deps.onProxyOk(session.sessionId, proxyName!); } catch { /* 记状态出错不能连累转发 */ }
-          }
-          return r;
-        }) : handleRpc(one, session, deps));
+        /*
+          HTTP 型：上游答了（不是 JSON-RPC error）→ `onProxyOk`；**转发本身失败**（连不上 / 超时 / 鉴权 / 会话重建失败，
+          `send` 的 error）→ `onProxyFail`，主进程据此重新开始退避探测（已挂上的上游中途掉线也能自己恢复）。
+          上游正常答了一个 JSON-RPC error（工具自己报错）不算掉线。
+        */
+        const route = (one: any): Promise<any | null> => {
+          if (!proxy) return handleRpc(one, session, deps);
+          if (!(proxy instanceof HttpProxy)) return proxy.call(one);
+          return proxy.send(one).then(({ answer, error }) => {
+            try {
+              if (error) deps.onProxyFail?.(session.sessionId, proxyName!, error);
+              else if (answer && typeof answer === 'object' && !answer.error) deps.onProxyOk?.(session.sessionId, proxyName!);
+            } catch { /* 记状态出错不能连累转发 */ }
+            return answer;
+          });
+        };
         const out = Array.isArray(msg)
           ? (await Promise.all(msg.map(route))).filter(Boolean)
           : await route(msg);
@@ -1384,16 +1634,65 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
           return token;
         },
         setProxies(sessionId, specs) {
-          stopProxies(sessionId);
+          /*
+            同一份配置的 stdio 代理**接着用**（还活着的、或者执行器重建前停放着的）：重连 / 重新准备时
+            不再把热着的进程杀掉重起 —— 慢启动的 MCP 每重起一次就是又一次可能的 CONNECT_TIMEOUT。
+          */
+          const keep = new Map<string, ForwardProxy>();
+          for (const spec of specs) {
+            if (!spec?.name || spec.type === 'http' || !spec.command) continue;
+            const k = `${sessionId}\u0000${spec.name}`;
+            const fp = stdioKey(spec);
+            const live = proxies.get(k);
+            if (live instanceof StdioProxy && proxyKeys.get(live) === fp) { keep.set(k, live); continue; }
+            const parkedOne = parked.get(k);
+            if (parkedOne && proxyKeys.get(parkedOne.proxy) === fp) {
+              clearTimeout(parkedOne.timer);
+              parked.delete(k);
+              keep.set(k, parkedOne.proxy);
+            }
+          }
+          for (const [k, v] of proxies) {
+            if (k.startsWith(`${sessionId}\u0000`) && keep.get(k) !== v) { v.stop(); proxies.delete(k); }
+          }
           for (const spec of specs) {
             if (!spec?.name) continue;
+            const k = `${sessionId}\u0000${spec.name}`;
             if (spec.type === 'http') {
               if (!spec.url) continue;
-              proxies.set(`${sessionId}\u0000${spec.name}`, new HttpProxy(spec, deps.log));
+              proxies.set(k, new HttpProxy(spec, deps.log));
               continue;
             }
             if (!spec.command) continue;
-            proxies.set(`${sessionId}\u0000${spec.name}`, new StdioProxy(spec, deps.log));
+            const kept = keep.get(k);
+            if (kept) { proxies.set(k, kept); continue; }
+            const name = spec.name;
+            const p: StdioProxy = new StdioProxy(spec, deps.log, {
+              retry: deps.forwardRetry,
+              onState: (state, reason) => {
+                /* 已经被换掉 / 停放着的那个报的不算：会话现在用的不是它 */
+                if (proxies.get(k) !== p) return;
+                deps.onProxyState?.(sessionId, name, state, reason);
+              },
+            });
+            proxyKeys.set(p, stdioKey(spec));
+            proxies.set(k, p);
+          }
+        },
+        async readyProxies(sessionId, opts = {}) {
+          const deadline = opts.deadlineMs ?? FORWARD_READY_DEADLINE_MS;
+          const mine = [...proxies].filter(([k, v]) => k.startsWith(`${sessionId}\u0000`) && v instanceof StdioProxy);
+          return Promise.all(mine.map(([, v]) => (v as StdioProxy).ready(deadline)));
+        },
+        parkProxies(sessionId) {
+          for (const [k, v] of proxies) {
+            if (!k.startsWith(`${sessionId}\u0000`) || !(v instanceof StdioProxy)) continue;
+            proxies.delete(k);
+            const old = parked.get(k);
+            if (old) { clearTimeout(old.timer); old.proxy.stop(); }
+            const timer = setTimeout(() => { if (parked.get(k)?.proxy === v) { parked.delete(k); v.stop(); } }, FORWARD_PARK_MS);
+            timer.unref?.();
+            parked.set(k, { proxy: v, timer });
           }
         },
         forget(sessionId, reason) {
@@ -1408,6 +1707,8 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
         stop() {
           for (const [, v] of proxies) v.stop();
           proxies.clear();
+          for (const [, v] of parked) { clearTimeout(v.timer); v.proxy.stop(); }
+          parked.clear();
           try { server.close(); } catch {}
         },
       });

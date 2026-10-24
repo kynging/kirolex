@@ -94,7 +94,7 @@ import { remoteContextBlock } from './remoteContext.ts';
 import { remoteWriteVerdict, strayRemoteDeliverables, blockedWriteNotice, strayWriteNotice, saveRemoteCopy, captureBufferFor } from './remoteWriteGuard.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
-import { probeHttpMcp, releaseSessionTools, startLocalMcp, type LocalMcpServer } from './localMcp.ts';
+import { probeHttpMcp, releaseSessionTools, startLocalMcp, type LocalMcpServer, type ForwardProxyState } from './localMcp.ts';
 import { LocalBrowserHost, browserActionTitle, createQuitGuard } from './localBrowserHost.ts';
 import { isBrowserKind, type BrowserAction } from './localBrowser.ts';
 import { createControlServer, type ControlServer, type ControlSessionAccess, type ControlSendResult } from './controlServer.ts';
@@ -109,10 +109,13 @@ import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from
 import { forkPointMeta, mainlineAcpMessageId, planEditFork, supportsForkPoint } from './editFork.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
+import { forwardReconnectVerdict, retryUntilIdle, watchHttpForward, reconnectBlockedBy, httpHandedNow } from './forwardReconnect.ts';
 import {
-  forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward, httpProbeNotice,
+  forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward,
   remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedNotice, type ForwardListItem,
   markForwardUnavailable, clearForwardUnavailable, type ForwardUnavailable,
+  forwardNotReadyNotice, forwardStartingNotice, forwardRestartingNotice, forwardGaveUpNotice, forwardReadyReconnectNotice,
+  httpPendingNotice, httpForwardBackNotice, httpDroppedNotice, type HttpMcpEntry, type ForwardEntry,
 } from './forwardMcp.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
@@ -2114,14 +2117,16 @@ function unpinSessionNotice(sessionId: string, prefix: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[] };
+type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[]; awaitingForward?: string[]; httpEntries?: HttpMcpEntry[] };
 const localToolsBySession = new Map<string, LocalToolsSpec>();
+/** 正在 `ensureLocalTools` 里等转发 MCP 就绪的会话：这段时间的状态变化由那边统一说，`forwardProxyState` 不重复说。 */
+const forwardGating = new Set<string>();
 
 /**
  * 一个中转 HTTP MCP 的探测结果记到**这份** spec 上 —— 以前失败只发一句提示，会话信息和运行环境说明照旧列为可用。
  * spec 已被换掉（重连 / 换组合又准备了一遍）就不记：那一轮有它自己的探测。成功清掉（重连重探的那次）；
  * 失败不摘代理，远端下次调用成功时由 local MCP 服务的 `onProxyOk` 清掉（见 `forwardRecovered`）。
- * 返回 true = 这次失败记下了，调用方在会话里说一句（`httpProbeNotice`）。
+ * 返回 true = 这次失败记下了，调用方在会话里说一句（`httpPendingNotice`，见 `watchHttpForwards`）。
  */
 function noteHttpProbe(sessionId: string, spec: LocalToolsSpec, name: string, r: { ok: boolean; toolCount: number; error?: string }): boolean {
   if (localToolsBySession.get(sessionId) !== spec) return false;
@@ -2138,9 +2143,212 @@ function noteHttpProbe(sessionId: string, spec: LocalToolsSpec, name: string, r:
 /** `onProxyOk`：远端再调通了一个记成不可用的中转 MCP：清掉（会话信息、下一轮的运行环境说明跟着恢复），说一句。 */
 function forwardRecovered(sessionId: string, name: string): void {
   const lt = localToolsBySession.get(sessionId);
+  const h = lt?.httpEntries?.find((e) => e.name === name);
+  if (h) markHttpFresh(h, true);
   if (!lt || !clearForwardUnavailable(lt, name)) return;
+  /* 远端调通了 = 适配器手里那条连接是好的：不必再为它重连（`reconnectForForward` 看到它不在名单里就放弃） */
+  if (lt.awaitingForward?.includes(name)) lt.awaitingForward = lt.awaitingForward.filter((n) => n !== name);
   logger.info('localmcp', `中转 MCP「${name}」调用成功，恢复为可用 sessionId=${sessionId}`);
   sessionNotice(sessionId, tr('✅ The MCP "{name}" forwarded from this machine works again.', { name }));
+}
+
+/**
+ * **转发的 stdio MCP 状态变了**（`localMcp.ts` 的 `onProxyState`）——「中途掉线后能自动恢复，不需要用户新建会话」。
+ *
+ *   · `down`：就绪后本机进程退了，代理正在按退避自己拉起并重新握手 —— 状态行说一句，远端那条 MCP 连接不用动；
+ *   · `up`：又好了。准备时没就绪、没交给适配器的那个（`awaitingForward`）要重连执行器才挂得上：
+ *     不忙就停放进程（`parkProxies`，免得重连再冷启动一次）→ 断开 → 按断线恢复那条路接回来；忙就过一会儿再看。
+ *     其余的（掉线后拉起来了）清掉「当前不可用」；
+ *   · `failed`：连续拉不起来，停止自动重启 —— 记成当前不可用，进对话记录说清是谁、为什么、怎么办。
+ */
+function forwardProxyState(sessionId: string, name: string, state: ForwardProxyState, reason?: string): void {
+  const lt = localToolsBySession.get(sessionId);
+  if (!lt || forwardGating.has(sessionId)) return;
+  if (state === 'down') {
+    logger.warn('localmcp', `转发 MCP「${name}」本机进程退了，自动拉起中 sessionId=${sessionId}: ${reason}`);
+    sessionNotice(sessionId, forwardRestartingNotice(name), { group: `forward-mcp-restart:${name}` });
+    return;
+  }
+  if (state === 'failed') {
+    markForwardUnavailable(lt, name, reason || '');
+    logger.warn('localmcp', `转发 MCP「${name}」连续拉不起来，停止自动重启 sessionId=${sessionId}: ${reason}`);
+    noteInSession(sessionId, forwardGaveUpNotice(name, reason || ''), undefined, `forward-mcp-failed:${name}`);
+    return;
+  }
+  if (lt.awaitingForward?.includes(name)) {
+    reconnectForForward(sessionId, name, lt);
+    return;
+  }
+  forwardRecovered(sessionId, name);
+}
+
+/**
+ * 准备时没就绪的转发 MCP 后来好了：重连这条会话的执行器把它挂上。
+ * 忙的不打断、执行器还没接上（刚准备完正在连）的等它接上 —— 15 秒后再看，**一直等到空闲**（忙多久都等）；
+ * 会话删了、在退出、这期间又准备过一遍（spec 换了，那一遍自己等过它）才放弃（判据见 `forwardReconnectVerdict`）。
+ */
+function reconnectForForward(
+  sessionId: string, name: string, lt: LocalToolsSpec,
+  opts: { confirm?: () => Promise<boolean>; onConfirmFail?: () => void } = {},
+): void {
+  const check = () => {
+    const entry = sessionClients.get(sessionId);
+    return forwardReconnectVerdict({
+      specCurrent: localToolsBySession.get(sessionId) === lt,
+      awaiting: !!lt.awaitingForward?.includes(name),
+      deleted: deletedSessionIds.has(sessionId),
+      quitting: isQuitting,
+      attached: !!entry,
+      /* 跟着 busyReasonFor：后端自己起的那一轮（entry.autonomous）、重建历史中、挂载中都算忙（判据见 reconnectBlockedBy） */
+      busy: reconnectBlockedBy(busyReasonFor(sessionId)),
+      reconfiguring: reconfiguringSessions.has(sessionId),
+    });
+  };
+  retryUntilIdle(check, () => {
+    if (!opts.confirm) { reconnectForwardNow(sessionId, name, lt); return; }
+    /* 确认那几秒里又忙起来了（或被换掉）：回去接着等，到空闲时再确认一次 */
+    void opts.confirm().then((ok) => {
+      if (!ok) { opts.onConfirmFail?.(); return; }
+      const v = check();
+      if (v === 'go') reconnectForwardNow(sessionId, name, lt);
+      else if (v === 'wait') reconnectForForward(sessionId, name, lt, opts);
+    });
+  });
+}
+
+function reconnectForwardNow(sessionId: string, name: string, lt: LocalToolsSpec): void {
+  lt.awaitingForward = [];                    // 一次重连把等着的都挂上；别的 up 再来不重复重连
+  logger.info('localmcp', `转发 MCP「${name}」后来就绪了，重连执行器把它挂上 sessionId=${sessionId}`);
+  sessionNotice(sessionId, forwardReadyReconnectNotice(name), { group: `forward-mcp-ready:${name}` });
+  localMcpServer?.parkProxies(sessionId);
+  void detachExecutor(sessionId).finally(() => {
+    toollessSessions.delete(sessionId);
+    startRemoteRecovery(sessionId, { quiet: true });
+  });
+}
+
+type ForwardNotReady = { name: string; reason: string; starting: boolean };
+
+/**
+ * **转发的 stdio MCP 先就绪、再交给执行器**（两个分支共用：Claude Code / Codex 写进 mcpServers，Kiro 写进远端 agent）。
+ * 起进程、握手、tools/list 通过才算（`readyProxies`，期间起不来的按退避重试，最多 `FORWARD_READY_DEADLINE_MS`）；
+ * 3 秒还没好在状态行说一句。返回没就绪的那些 —— 调用方把它们从这次交出去的配置里拿掉。
+ */
+async function gateForwardStdio(server: LocalMcpServer, sessionId: string, stdioNames: string[]): Promise<ForwardNotReady[]> {
+  if (!stdioNames.length) return [];
+  forwardGating.add(sessionId);
+  const slow = setTimeout(() => sessionNotice(sessionId, forwardStartingNotice(stdioNames), { group: 'forward-mcp-starting' }), 3_000);
+  try {
+    const ready = await server.readyProxies(sessionId);
+    for (const r of ready) {
+      logger.info('localmcp', r.ok
+        ? `转发 MCP「${r.name}」就绪：${r.toolCount} 个工具 sessionId=${sessionId}`
+        : `转发 MCP「${r.name}」没就绪（${r.starting ? '还在启动' : '起不来'}），这次不交给执行器 sessionId=${sessionId}: ${r.error}`);
+    }
+    return ready.filter((r) => !r.ok).map((r) => ({ name: r.name, reason: String(r.error || ''), starting: !!r.starting }));
+  } finally {
+    clearTimeout(slow);
+    forwardGating.delete(sessionId);
+  }
+}
+
+/**
+ * spec 登记之后：没就绪的记成当前不可用、进对话记录说清楚；还在起的那几个，若在到期到登记之间刚好好了
+ * （那次 `up` 被 forwardGating 挡掉了），补一次 `up` —— 否则就靠它自己报 `up` 时 `reconnectForForward`。
+ */
+function noteForwardNotReady(server: LocalMcpServer, sessionId: string, spec: LocalToolsSpec, notReady: ForwardNotReady[]): void {
+  for (const n of notReady) {
+    markForwardUnavailable(spec, n.name, n.reason);
+    noteInSession(sessionId, forwardNotReadyNotice(n.name, n.reason, n.starting), undefined, `forward-mcp-not-ready:${n.name}`);
+  }
+  if (!spec.awaitingForward?.length) return;
+  void server.readyProxies(sessionId, { deadlineMs: 0 }).then((rs) => {
+    for (const r of rs) if (r.ok && spec.awaitingForward?.includes(r.name)) forwardProxyState(sessionId, r.name, 'up');
+  }).catch(() => { /* 只是补一次，失败了等它自己报 up */ });
+}
+
+/**
+ * **每个 HTTP 型转发上游最近一次被证实是好的时刻**（键 = 配置指纹）—— 负责人 2026-10-24：HTTP 型维持「不挡会话启动」，
+ * 但这次的探测没通过前不交给执行器。准备时只有 `HTTP_FRESH_MS` 以内证实过的（探测通过 / 远端经它转发成功）才直接交；
+ * 其余的先不交，后台探（`startHttpWatch`），通过后等会话空闲、**再探一次确认**后重连 —— 重连那次准备离确认只有几秒，于是直接挂上。
+ * 失败就作废。原来是「历史上通过过就交」：同一上游后来停了，再开会话 / 重连时把不可用的地址交给适配器，又是 CONNECT_TIMEOUT。
+ */
+const httpForwardOkAt = new Map<string, number>();
+function httpForwardKey(h: HttpMcpEntry): string {
+  return JSON.stringify([h.name, h.url, h.headers, h.timeoutMs]);
+}
+function markHttpFresh(h: HttpMcpEntry, ok: boolean): void {
+  if (ok) httpForwardOkAt.set(httpForwardKey(h), Date.now());
+  else httpForwardOkAt.delete(httpForwardKey(h));
+}
+
+/** 这一次准备交不交出去：stdio 看就绪结果，HTTP 看最近（`HTTP_FRESH_MS` 内）有没有证实过是好的。 */
+function forwardHandedNow(e: ForwardEntry, notReady: ForwardNotReady[]): boolean {
+  if (isHttpForward(e)) return httpHandedNow(httpForwardOkAt.get(httpForwardKey(e)), Date.now());
+  return !notReady.some((n) => n.name === e.name);
+}
+
+/** 每份 spec 正在看护的 HTTP 转发名字：同一份 spec 上同一个只起一个看护（换了 spec 的旧看护自己会停）。 */
+const httpWatching = new WeakMap<LocalToolsSpec, Set<string>>();
+
+/**
+ * spec 登记之后对 HTTP 型转发探测，**不 await**（不挡会话准备）：每个起一个看护（`startHttpWatch`）。
+ * 这次交出去了的（spec.forwardedHttp 里有）按「挂着」看护，没交的按「等着挂上」。
+ */
+function watchHttpForwards(sessionId: string, spec: LocalToolsSpec, http: HttpMcpEntry[]): void {
+  for (const h of http) startHttpWatch(sessionId, spec, h, !!spec.forwardedHttp?.includes(h.name));
+}
+
+/**
+ * **一个 HTTP 转发的看护**：按 `HTTP_PROBE_BACKOFF_MS` 一直探到通过（规则在 `forwardReconnect.ts` 的 `watchHttpForward`）。
+ *
+ *   没通过：作废「最近证实是好的」、登记 awaitingForward、记成当前不可用，第一次失败进对话记录
+ *   （挂着的说「连不上上游、调用会失败」，没挂上的说「先不挂」）；
+ *   通过（且没挂上 / 中间失败过）：说「已恢复可用」，等会话空闲、再探一次确认后重连挂上（`reconnectForForward`）。
+ *   起点：会话准备（`watchHttpForwards`），以及**已挂上的上游中途掉线**（远端经它转发失败，`httpForwardFailed`）。
+ *   spec 换了 / 会话删了 / 在退出就不再探。
+ */
+function startHttpWatch(sessionId: string, spec: LocalToolsSpec, h: HttpMcpEntry, mounted: boolean): void {
+  const watching = httpWatching.get(spec) || new Set<string>();
+  httpWatching.set(spec, watching);
+  if (watching.has(h.name)) return;
+  watching.add(h.name);
+  const log = { log: (level: 'info' | 'warn', message: string) => logger[level]('localmcp', message) };
+  const probe = () => probeHttpMcp(h, log);
+  watchHttpForward({
+    probe,
+    alive: () => localToolsBySession.get(sessionId) === spec && !deletedSessionIds.has(sessionId) && !isQuitting,
+    mounted,
+    markFresh: (ok) => markHttpFresh(h, ok),
+    addAwaiting: () => { if (!spec.awaitingForward?.includes(h.name)) (spec.awaitingForward ||= []).push(h.name); },
+    noteResult: (r) => noteHttpProbe(sessionId, spec, h.name, r),
+    noticeFailed: (r, isMounted) => noteInSession(sessionId,
+      isMounted ? httpDroppedNotice(h.name, r.error || '') : httpPendingNotice(h.name, r.error || ''),
+      undefined, `forward-mcp-http-${isMounted ? 'dropped' : 'pending'}:${h.name}`),
+    /* 远端在这期间已经调通（`forwardRecovered` 说过「又能用了」、移出了等着的名单）：不再说、也不会重连 */
+    noticeBack: () => { if (spec.awaitingForward?.includes(h.name)) sessionNotice(sessionId, httpForwardBackNotice(h.name), { group: `forward-mcp-back:${h.name}` }); },
+    /* 重连前再探一次：等空闲可能等了很久，交给新执行器的必须是刚证实过的；没通过就回到看护 */
+    reconnect: () => reconnectForForward(sessionId, h.name, spec, {
+      confirm: () => probe().then((r) => { markHttpFresh(h, r.ok); return r.ok; }, () => false),
+      onConfirmFail: () => startHttpWatch(sessionId, spec, h, false),
+    }),
+    done: () => watching.delete(h.name),
+    log: (message) => logger.info('localmcp', `HTTP 转发「${h.name}」${message} sessionId=${sessionId}`),
+  });
+}
+
+/**
+ * `onProxyFail`：远端经一个**已挂上**的 HTTP 转发调用失败了（连不上上游 / 超时 / 鉴权…）——「运行中掉线后自动恢复」。
+ * 作废「最近证实是好的」，起一个看护（同一份 spec 上已经在看护就不重复起）：退避探测、第一次失败在会话里说清楚，
+ * 恢复后说「已恢复可用」；远端在这期间又调通了的（`forwardRecovered`）不重连，否则等空闲重连挂上。
+ */
+function httpForwardFailed(sessionId: string, name: string, error: string): void {
+  const lt = localToolsBySession.get(sessionId);
+  const h = lt?.httpEntries?.find((e) => e.name === name);
+  if (!lt || !h) return;
+  markHttpFresh(h, false);
+  logger.warn('localmcp', `HTTP 转发「${name}」转发失败，开始后台探测 sessionId=${sessionId}: ${error}`);
+  startHttpWatch(sessionId, lt, h, !!lt.forwardedHttp?.includes(name));
 }
 
 /**
@@ -2172,6 +2380,8 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
     wake: wakeMcpTools,   /* schedule_* / bg_* / watch（见 wakeTools.ts） */
     sessions: sessionMcpTools,
     onProxyOk: forwardRecovered,
+    onProxyFail: httpForwardFailed,
+    onProxyState: forwardProxyState,
   }).then((srv) => { localMcpServer = srv; return srv; })
     .finally(() => { localMcpStarting = undefined; });
   return localMcpStarting;
@@ -2458,13 +2668,28 @@ async function ensureLocalTools(
       }
       if (notForwarded.length) logger.info('localmcp', `组合里没带进远程会话 sessionId=${sessionId}：${notForwarded.map((n) => `${n.name}（${n.kind}）`).join(', ')}`);
       server.setProxies(sessionId, entries);
+      /*
+        **转发的 stdio MCP 先就绪、再交给适配器** ——「builder-mcp / agentcore-websearch 间歇 CONNECT_TIMEOUT」。
+        原来进程是远端第一个 initialize 到了才起（懒启动），起得慢就超过适配器的建连超时，而适配器不会再连第二次。
+        现在在这里起进程、握手、tools/list 通过才写进 mcpServers（`readyProxies`，期间起不来的按退避重试）；
+        到期没好的先不交（交了也只是 CONNECT_TIMEOUT），在会话里说清楚，后台接着起，好了自动重连挂上（`forwardProxyState`）。
+        同一份配置的进程重连时接着用（`setProxies` 复用），所以只有第一次要等。
+      */
+      const notReady = await gateForwardStdio(server, sessionId, entries.filter((e) => !isHttpForward(e)).map((e) => e.name));
+      /* HTTP 型：探测通过过的才交（`forwardHandedNow`）；没通过的后台探，通过后自动重连挂上（`watchHttpForwards`） */
+      const handed = entries.filter((e) => forwardHandedNow(e, notReady));
       const http = entries.filter(isHttpForward);
       const spec: LocalToolsSpec = {
         remotePort, localPort: server.port(), agentOverride,
-        forwarded: entries.filter((e) => !isHttpForward(e)).map((e) => e.name),
-        forwardedHttp: http.map((e) => e.name),
-        mcpServers: [mcp, ...remoteComboMcpServers(entries, mcpUrl(remotePort, urlPath))],
+        forwarded: handed.filter((e) => !isHttpForward(e)).map((e) => e.name),
+        forwardedHttp: handed.filter(isHttpForward).map((e) => e.name),
+        mcpServers: [mcp, ...remoteComboMcpServers(handed, mcpUrl(remotePort, urlPath))],
         skipped: skippedReasons,
+        httpEntries: http,
+        awaitingForward: [
+          ...notReady.filter((n) => n.starting).map((n) => n.name),
+          ...http.filter((h) => !handed.includes(h)).map((h) => h.name),
+        ],
       };
       if (entries.length) {
         logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${entries.map((e) => e.name).join(', ')}`
@@ -2475,12 +2700,9 @@ async function ensureLocalTools(
       }
       localToolsBySession.set(sessionId, spec);
       toollessSessions.delete(sessionId);
+      noteForwardNotReady(server, sessionId, spec, notReady);
       /* 探测，但不挡会话（同 Kiro 分支）；先登记 spec，失败才记得到它上面（`noteHttpProbe`） */
-      for (const h of http) {
-        void probeHttpMcp(h, { log: (level, message) => logger[level]('localmcp', message) })
-          .then((r) => { if (noteHttpProbe(sessionId, spec, h.name, r)) sessionNotice(sessionId, httpProbeNotice(h.name, r.error || '')); })
-          .catch(() => { /* 探测永远不能让会话准备失败 */ });
-      }
+      watchHttpForwards(sessionId, spec, http);
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
       return spec;
     }
@@ -2490,7 +2712,11 @@ async function ensureLocalTools(
     */
     const forwardable = profile.kiroAgent ? forwardableFrom(localAgentJson(profile.kiroAgent), loadForwardMcpList()) : [];
     server.setProxies(sessionId, forwardable);
-    const plan = remoteForwardPlan(forwardable, mcpUrl(remotePort, urlPath));
+    /* 同 Claude Code / Codex 分支：转发的 stdio MCP 就绪了才写进远端 agent，没就绪的这次不写（见 `gateForwardStdio`） */
+    const notReady = await gateForwardStdio(server, sessionId, forwardable.filter((e) => !isHttpForward(e)).map((e) => e.name));
+    /* HTTP 型同上：探测通过过的才写进去；没写进去的那些在远端底子 agent 里的同上游直连照样剔掉（dropUpstream 按全部算） */
+    const handedK = forwardable.filter((e) => forwardHandedNow(e, notReady));
+    const plan = { ...remoteForwardPlan(handedK, mcpUrl(remotePort, urlPath)), dropUpstream: remoteForwardPlan(forwardable, mcpUrl(remotePort, urlPath)).dropUpstream };
     const forwarded = plan.forwarded;
     const agentOut = await runRemoteCapture(remote,
       remoteAgentScript(agentOverride, profile.kiroAgent, mcpUrl(remotePort, urlPath), plan.forwarded, plan.dropUpstream));
@@ -2516,14 +2742,16 @@ async function ensureLocalTools(
       remotePort, localPort: server.port(), agentOverride,
       forwarded: plan.stdioNames,
       forwardedHttp: plan.httpNames,
+      httpEntries: forwardable.filter(isHttpForward),
+      awaitingForward: [
+        ...notReady.filter((n) => n.starting).map((n) => n.name),
+        ...forwardable.filter(isHttpForward).filter((h) => !handedK.includes(h)).map((h) => h.name),
+      ],
     };
     localToolsBySession.set(sessionId, spec);
     toollessSessions.delete(sessionId);
-    for (const h of forwardable.filter(isHttpForward)) {
-      void probeHttpMcp(h, { log: (level, message) => logger[level]('localmcp', message) })
-        .then((r) => { if (noteHttpProbe(sessionId, spec, h.name, r)) sessionNotice(sessionId, httpProbeNotice(h.name, r.error || '')); })
-        .catch(() => { /* 探测永远不能让会话准备失败 */ });
-    }
+    noteForwardNotReady(server, sessionId, spec, notReady);
+    watchHttpForwards(sessionId, spec, forwardable.filter(isHttpForward));
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
     return spec;
   } catch (err: any) {
