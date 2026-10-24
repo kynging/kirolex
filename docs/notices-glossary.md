@@ -29,6 +29,7 @@
    | ✅ | 完成 |
 
    其余（♻️ 🤖 🧩 🔌 🌐 📁 ⟳ 🗜️ 🛡 ❌ ⛔ ⏰ 🔁 …）在会话内提示里不再用。
+   例外：定时任务的卡片（到点唤醒、结束 / 暂停）标题固定以「⏰ 定时」开头（`src/main/scheduleWakeView.ts`、ChatArea `ScheduleWakeCard`），卡片里的状态行不再另加 emoji。
    状态行的醒目样式和停留时长仍按「有没有 ⚠️」判断（`useSessionNotice`）。
 
 ## 2. 用词

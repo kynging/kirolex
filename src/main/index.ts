@@ -70,6 +70,7 @@ import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
+import { scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
@@ -4708,6 +4709,18 @@ const cliRecreatedAt = new Map<string, number>();
  */
 const bareFailStreak = new Map<string, number>();
 
+/**
+ * 删掉一个还在跑的定时任务（你在聊天顶部删 / 模型 `schedule_delete`）：会话里留一句结局，界面画成「⏰ 定时」的收尾卡片。
+ * 一次都没跑过的不说（会话里本来就没有它）；已经结束了的那句早说过了，不再说第二遍。
+ */
+function noteScheduleRemoved(job: scheduleStore.StoredSchedule | null): void {
+  if (!job || job.state.terminal || job.state.runs <= 0) return;
+  const final = { ...job.state, terminal: 'cancelled' as const };
+  noteInSession(job.state.sessionId, scheduleEndedText(final, 'cancelled'), {
+    zh: scheduleEndedText(final, 'cancelled', 'zh'), en: scheduleEndedText(final, 'cancelled', 'en'),
+  }, scheduleEndGroup(job.id));
+}
+
 function noteInSession(sessionId: string, body: string, variants?: TextVariants, group?: string): boolean {
   const sid = String(sessionId || '').trim();
   const text = String(body || '').trim();
@@ -5045,6 +5058,7 @@ const wakeHost: WakeHost = {
     if (!job || job.state.sessionId !== sessionId) return { ok: false, error: tr('This scheduled task was not found') };
     scheduleStore.removeSchedule(id, os.homedir(), store.isAdvancedOnlySession);
     wakeDispatcher.dropRef(id, 'removed');
+    noteScheduleRemoved(job);
     logger.info('schedule', `removed by model id=${id}`);
     mainWindow?.webContents.send('schedule:changed', { id, state: null });
     return { ok: true };
@@ -10521,7 +10535,7 @@ ${hint}` : ''}` };
         白白记掉一次），作为新的一条，不进排队卡片；同一会话里几个同时到期的按到点时间逐条发。
       */
       const delivered = await wakeDispatcher.enqueue({
-        sessionId: state.sessionId, text: state.spec.prompt + scheduleGoalSuffix(state, id, check), at, source: 'schedule', ref: id,
+        sessionId: state.sessionId, text: state.spec.prompt + scheduleGoalSuffix(state, id, check), at, source: 'schedule', ref: id, run: charged.runs,
       });
       // Re-read: the user may have paused or removed the job during the turn.
       const latest = scheduleStore.readSchedule(id, os.homedir());
@@ -10555,7 +10569,7 @@ ${hint}` : ''}` };
         */
         noteInSession(state.sessionId, scheduleEndedText(final, terminal), {
           zh: scheduleEndedText(final, terminal, 'zh'), en: scheduleEndedText(final, terminal, 'en'),
-        });
+        }, scheduleEndGroup(id));
       }
       mainWindow?.webContents.send('schedule:changed', { id, state: final });
     } finally {
@@ -10579,7 +10593,7 @@ ${hint}` : ''}` };
         timeoutMs: BG_DEFAULT_TIMEOUT_SEC * 1000,
       }),
       changed: (jobId, s) => mainWindow?.webContents.send('schedule:changed', { id: jobId, state: s }),
-      noteUser: (sid, text) => { noteInSession(sid, text); sessionNotice(sid, text); },
+      noteUser: (sid, text) => { noteInSession(sid, text, undefined, scheduleEndGroup(id)); sessionNotice(sid, text); },
       log: (m) => logger.info('schedule', m),
     });
   }
@@ -10603,7 +10617,7 @@ ${hint}` : ''}` };
     try { scheduleStore.writeSchedule(job.id, final, os.homedir(), store.isAdvancedOnlySession); } catch { return false; }
     logger.info('schedule', `expired id=${job.id} session=${job.state.sessionId} runs=${final.runs}/${final.spec.maxRuns ?? 'goal'}`);
     /* 目标型任务到期时明说「目标还没达成」（`scheduleEndedText`），不悄悄消失 */
-    noteInSession(job.state.sessionId, scheduleEndedText(final, 'expired'));
+    noteInSession(job.state.sessionId, scheduleEndedText(final, 'expired'), undefined, scheduleEndGroup(job.id));
     mainWindow?.webContents.send('schedule:changed', { id: job.id, state: final });
     return true;
   }
@@ -10640,10 +10654,13 @@ ${hint}` : ''}` };
       /* 换完、发的那一下撞上忙被放回队头：下次只续发，不再换一次 */
       textToolSwapDone.add(item.id);
     }
-    const prefix = item.source === 'schedule' ? `sched_${item.ref}` : nudge ? (item.swap ? TEXT_TOOL_SWAP_ID_PREFIX : TEXT_TOOL_NUDGE_ID_PREFIX).slice(0, -1) : `wake_${item.ref || item.source}`;
+    const prefix = nudge ? (item.swap ? TEXT_TOOL_SWAP_ID_PREFIX : TEXT_TOOL_NUDGE_ID_PREFIX).slice(0, -1) : `wake_${item.ref || item.source}`;
     await sendPromptOnce(sid, [{ type: 'text', text: item.text }], undefined, {
       /* 会话间的（对方的回复 / 等回复超时 / 界面没就绪时转发的那条）：id 带 `xs` 标记，落盘时记 via:'session' */
-      messageId: item.source === 'session' ? controlMessageId('user', Date.now(), 'xs') : `${prefix}_${Date.now()}`,
+      messageId: item.source === 'session' ? controlMessageId('user', Date.now(), 'xs')
+        /* 定时的那条：id 里带定时 id 和第几次（`sched_<id>_r<N>_<时间>`），界面据此画「⏰ 定时 · 第 N 次」卡片 —— 正文照旧是发给模型的原文 */
+        : item.source === 'schedule' ? scheduleWakeMessageId(item.ref, item.run, Date.now())
+        : `${prefix}_${Date.now()}`,
       /* 换后端那一条在会话里带 🔀（只给你看；发给模型的是原话） */
       displayText: nudge && item.swap ? `🔀 ${item.text}` : item.text,
       announce: true,
@@ -10802,10 +10819,12 @@ ${hint}` : ''}` };
   });
 
   ipcMain.handle('schedule:remove', (_event, id: string) => {
-    { const owner = scheduleStore.readSchedule(id, os.homedir())?.state.sessionId;
+    const removing = scheduleStore.readSchedule(id, os.homedir());
+    { const owner = removing?.state.sessionId;
       const advRefused = owner ? refuseAdvancedOnly(owner, 'schedule:remove') : null; if (advRefused) return { ok: false, error: advRefused }; }
     scheduleStore.removeSchedule(id, os.homedir(), store.isAdvancedOnlySession);
     wakeDispatcher.dropRef(id, 'removed');
+    noteScheduleRemoved(removing);
     logger.info('schedule', `removed id=${id}`);
     // `state: null` says GONE. The renderer re-reads the list either way, but a payload that
     // omitted the outcome would make "removed" indistinguishable from "changed somehow".

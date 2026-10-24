@@ -171,6 +171,7 @@ docs/            设计文档（§1）
 | `src/main/loopVerify.ts` | 跑校验命令只看退出码；远程会话在同一台远端上跑；`loop:verify` 只接受先 `loop:register-verifier` 登记过的命令（这是一个执行任意命令的口子） |
 | `src/main/loopMachine.ts` | 循环规格 / 状态机（纯，`LoopRun` 必须可 JSON 序列化，有测试守着）。`src/renderer/loopMachine.ts` 只是 re-export。界面上没有启动循环的入口（刻意移除过，`tests/scheduleWiring.test.ts` 守着）；启动只有主进程 IPC `loop:start`（preload `loopStart`） |
 | `src/renderer/scheduleView.ts` | 倒计时 / 摘要的纯展示逻辑 |
+| `src/main/scheduleWakeView.ts` | 定时唤醒在会话里的「⏰ 定时」卡片：纯解析（新消息按 id `sched_<id>_r<N>_<时间>`，旧记录按正文特征），只改显示、不改发给模型的原文；结束 / 暂停那句带 `noteGroup: schedule-end:<id>` |
 
 ### 3.8 记忆
 

@@ -25,6 +25,8 @@ export interface WakeItem {
   source: 'schedule' | 'bg' | 'watch' | 'nudge' | 'session' | 'loop';
   /** 定时任务的 id（`source = 'schedule'`）—— 发送时拿它当消息 id 的一部分；`source = 'loop'` 时就是消息 id 本身。 */
   ref?: string;
+  /** 定时任务这是第几次（`source = 'schedule'`，记账后的 `runs`）—— 只进消息 id，界面的「⏰ 定时」卡片据此显示「第 N 次」（scheduleWakeView.ts）。 */
+  run?: number;
   /** `nudge` 才有：发之前先换新的后端会话（「写成文字」反复发作，见 index.ts `handleTextToolCall` / textToolRecovery.ts）。 */
   swap?: boolean;
 }

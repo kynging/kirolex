@@ -33,6 +33,7 @@ import { isConnectFailureNotice } from '../connectFailure.ts';
 import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer.ts';
 import { adapterInstallStore, startAdapterInstall, startEngineLogin } from '../adapterInstallState.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
+import { parseScheduleEnd, scheduleWakeCards, SCHEDULE_CARD_LINES, type ScheduleEndCard as ScheduleEndView, type ScheduleWakeCard as ScheduleWakeView } from '../../main/scheduleWakeView.ts';
 import { livePendingNoteId, pendingTargetText, waitedSeconds, type PendingKind } from '../../main/pendingSwitch.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
@@ -942,6 +943,102 @@ const KirolexMessageItem = memo<{ message: Message; count?: number }>(({ message
     </div>
   </div>
 ));
+
+/**
+ * 定时到点发进会话的那条（`runScheduledJob`）：紧凑的「⏰ 定时」卡片，不画成用户气泡。
+ * 一行标题（哪个定时、第几次）+ 一行状态 + 检查输出里变了的行（最多 `SCHEDULE_CARD_LINES` 行，其余「展开」）；
+ * 完整 prompt、目标、完整输出、给模型的说明都在「详情」里。正文（发给模型的原文）不动，拆法见 `main/scheduleWakeView`。
+ */
+const ScheduleWakeCard = memo<{ message: Message; card: ScheduleWakeView }>(({ message, card }) => {
+  const t = useT();
+  const [allLines, setAllLines] = useState(false);
+  const extra = card.changedLines.length - SCHEDULE_CARD_LINES;
+  const lines = allLines ? card.changedLines : card.changedLines.slice(0, SCHEDULE_CARD_LINES);
+  const status = card.status === 'changed' ? t('Check output changed')
+    : card.status === 'achieved' ? t('Goal has been reached')
+    : card.status === 'error' ? (card.paused ? t('Check failed; the task paused itself') : t('Check failed'))
+    : t('Woke on schedule');
+  const title = [t('⏰ Scheduled'), card.name, card.run ? t('Run {n}', { n: card.run }) : ''].filter(Boolean).join(' · ');
+  const d = card.details;
+  return (
+    <div className="kirolex-message schedule-card" data-status={card.status} role="status">
+      <div className="kirolex-message-card schedule-card-box">
+        <div className="schedule-card-head">
+          <span className="schedule-card-title">{title}</span>
+          <time
+            className="kirolex-message-time"
+            dateTime={new Date(message.timestamp).toISOString()}
+            title={new Date(message.timestamp).toLocaleString()}
+          >
+            {formatMessageTime(message.timestamp)}
+          </time>
+        </div>
+        <div className="schedule-card-status">{status}</div>
+        {lines.length > 0 && (
+          <pre className="schedule-card-lines">
+            {/* 上一次有、这一次没了的行：标「−」+ 删除线（不只是列新出现的） */}
+            {lines.map((l, i) => (l.removed
+              ? <div key={i} className="schedule-card-line-removed" title={t('Gone since the last check')}>{`− ${l.text}`}</div>
+              : <div key={i}>{l.text}</div>))}
+          </pre>
+        )}
+        {extra > 0 && (
+          <button type="button" className="schedule-card-more" onClick={() => setAllLines((v) => !v)}>
+            {allLines ? t('Show fewer lines') : t('Show {n} more lines', { n: extra })}
+          </button>
+        )}
+        <details className="notice-detail schedule-card-detail">
+          <summary>{t('Details')}</summary>
+          <div className="notice-detail-body">
+            <div className="schedule-card-section"><b>{t('Full prompt')}</b>{'\n'}{withPathLinks(d.prompt, message.id)}</div>
+            {d.until && <div className="schedule-card-section"><b>{t('Goal')}</b>{'\n'}{d.until}</div>}
+            {d.checkHeader && (
+              <div className="schedule-card-section">
+                <b>{t('Check output')}</b>{'\n'}{d.checkHeader}
+                {d.checkOutput ? <pre className="schedule-card-lines">{d.checkOutput}</pre> : null}
+              </div>
+            )}
+            {d.note && <div className="schedule-card-section"><b>{t('Note to the model')}</b>{'\n'}{d.note}</div>}
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+});
+
+/** 定时结束 / 自动暂停那句 KiroLex 提示：同一种卡片的收尾样式，一行说清结局（`parseScheduleEnd`）。 */
+const ScheduleEndCard = memo<{ message: Message; end: ScheduleEndView; name?: string; count?: number }>(({ message, end, name, count }) => {
+  const t = useT();
+  const badge = repeatBadge(count);
+  const title = [t('⏰ Scheduled'), name || '', end.kind === 'paused' ? t('Paused') : t('Ended')].filter(Boolean).join(' · ');
+  return (
+    <div className="kirolex-message schedule-card schedule-card-end" data-status={end.kind} role="status">
+      <div className="kirolex-message-card schedule-card-box">
+        <div className="schedule-card-head">
+          <span className="schedule-card-title">{title}</span>
+          {badge && <span className="notice-repeat" title={t('Repeated {n} times in a row', { n: count ?? 1 })}>{badge}</span>}
+          <time
+            className="kirolex-message-time"
+            dateTime={new Date(message.timestamp).toISOString()}
+            title={new Date(message.timestamp).toLocaleString()}
+          >
+            {formatMessageTime(message.timestamp)}
+          </time>
+        </div>
+        <div className="schedule-card-status">{end.outcome}</div>
+        {(end.until || end.output) && (
+          <details className="notice-detail schedule-card-detail">
+            <summary>{t('Details')}</summary>
+            <div className="notice-detail-body">
+              {end.until && <div className="schedule-card-section"><b>{t('Goal')}</b>{'\n'}{end.until}</div>}
+              {end.output && <pre className="schedule-card-lines">{end.output}</pre>}
+            </div>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+});
 
 // Kiro CLI does not expose exact per-turn token counts. Estimate the visible
 // question + answer, treating CJK characters as roughly one token and the
@@ -4312,6 +4409,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   type RenderGroup =
     | { kind: 'user'; base: Message; steers: Message[] }
     | { kind: 'kirolex'; message: Message; count?: number }
+    /* 定时到点发进来的那条：「⏰ 定时」卡片，不是用户气泡（main/scheduleWakeView） */
+    | { kind: 'schedule'; message: Message; card: ScheduleWakeView }
     | { kind: 'assistant'; segments: Message[]; isLast: boolean; question: string };
   // Heal stranded steers before grouping: a steer that ended up AFTER this
   // turn's assistant/tool messages (ordering slip, or restored history) is moved
@@ -4345,12 +4444,38 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     return out;
   }, [messages, findLang]);
 
+  /**
+   * 定时唤醒（消息 id → 卡片）和定时结束 / 暂停那句 KiroLex 提示（消息 id → 收尾卡片 + 定时的名字）。
+   * 结束那句照旧是 `kirolex` 一组（同类合并照旧），只是画成收尾样式。
+   */
+  const scheduleView = useMemo(() => {
+    const cards = scheduleWakeCards(orderedMessages);
+    const names = new Map<string, string>();
+    for (const c of cards.values()) if (c.scheduleId && c.name) names.set(c.scheduleId, c.name);
+    const ends = new Map<string, { end: ScheduleEndView; name?: string }>();
+    for (const m of orderedMessages) {
+      if (m.role !== 'user' || !isKirolexNote(m)) continue;
+      const end = parseScheduleEnd(m);
+      if (end) ends.set(m.id, { end, name: end.scheduleId ? names.get(end.scheduleId) : undefined });
+    }
+    return { cards, ends };
+  }, [orderedMessages]);
+
   const renderGroups = useMemo<RenderGroup[]>(() => {
     const groups: RenderGroup[] = [];
     let lastQuestion = '';
     const messages = orderedMessages;
+    /* 同 scheduleView.cards（都只依赖 orderedMessages）；这里自己算一遍，分组只跟着消息变 */
+    const scheduleCards = scheduleWakeCards(messages);
     for (let i = 0; i < messages.length; i++) {
       const m = messages[i];
+      /* 定时唤醒：画成「⏰ 定时」卡片，不收 steer（这一轮里追加的指令照旧单独显示） */
+      const wake = scheduleCards.get(m.id);
+      if (wake) {
+        lastQuestion = m.content;
+        groups.push({ kind: 'schedule', message: m, card: wake });
+        continue;
+      }
       /* KiroLex 自己的话单独成组：不是提问（不进 lastQuestion），也不收 steer */
       if (m.role === 'user' && isKirolexNote(m)) {
         groups.push({ kind: 'kirolex', message: m });
@@ -4432,7 +4557,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   } : null;
   /** 切会话回到原位置用的锚点 id。回复组取**第一段**：流式输出只往后追加段，第一段的 id 不会变。 */
   const groupAnchorId = (g: RenderGroup): string =>
-    g.kind === 'user' ? g.base.id : g.kind === 'kirolex' ? g.message.id : g.segments[0].id;
+    g.kind === 'user' ? g.base.id : g.kind === 'assistant' ? g.segments[0].id : g.message.id;
   // The interrupted turn the next composer submit overwrites is the LAST base user
   // message (same anchor as markTurnInterrupted). Only that group shows its
   // original + steers merged into one bubble; earlier turns keep them separate.
@@ -4904,6 +5029,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
           ) : group.kind === 'kirolex' && group.message.id === livePendingId && pendingCard ? (
             <PendingSwitchCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} {...pendingCard} />
+          ) : group.kind === 'schedule' ? (
+            <ScheduleWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
+          ) : group.kind === 'kirolex' && scheduleView.ends.has(group.message.id) ? (
+            <ScheduleEndCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} {...scheduleView.ends.get(group.message.id)!} count={group.count} />
           ) : group.kind === 'kirolex' ? (
             <KirolexMessageItem
               key={`${currentSessionId ?? 'none'}:${group.message.id}`}
