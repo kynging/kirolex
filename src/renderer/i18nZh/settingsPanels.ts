@@ -319,6 +319,20 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Plugin · read-only': '插件 · 只读',
   'No {label} here yet.': '这里还没有{label}。',
   ' Click "+ New" on the left.': '点左边「＋ 新建」。',
+  'These are long-term instructions the engine reads itself; KiroLex memory (Settings → Memory) is injected separately on every turn, and both take effect.':
+    '这些是引擎自己读的长期指令；KiroLex 记忆（设置 → 记忆）会另外每轮注入，两边都生效。',
+  'Open KiroLex memory': '打开 KiroLex 记忆',
+  'User level': '用户级',
+  'Project level': '项目级',
+  'Subdirectory': '子目录',
+  'Import': '引用',
+  'Parent folder': '上层目录',
+  'Imported by {name}': '被 {name} 引用',
+  'Not read: {name} in the same folder takes precedence': '不生效：同一层的 {name} 优先',
+  'Fallback file name (project_doc_fallback_filenames)': '备用文件名（project_doc_fallback_filenames）',
+  'Empty file: not read': '空文件：引擎不读',
+  'Not created': '未创建',
+  'Not found': '没找到',
 
   // ── components/McpCombosPane.tsx ──
   'The file on disk has errors, so only "General" is used for now: {error}': '盘上的文件有错，现在按只有「通用」处理：{error}',

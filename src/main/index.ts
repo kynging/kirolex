@@ -21,6 +21,7 @@ import {
   CATEGORIES as KIRO_CONFIG_CATEGORIES, categoriesFor as kiroCategoriesFor, categorySpec, LocalKiroConfig, pickEntries, validateContent,
   remoteListScript, remoteReadScript, parseRemoteRead, remoteWriteScript, relPath, parseRemoteList, pluginWriteError,
 } from './kiroConfig';
+import { createRemoteInstructionFs, listInstructionFiles, localInstructionFs, writeInstructionFile } from './instructionFiles';
 import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
@@ -11789,6 +11790,23 @@ ${hint}` : ''}` };
   const kiroConfigWhere = (t?: RemoteTarget): string =>
     (t ? (labelForHost(KIROLEX_CONFIG_PATH, t.sshHost) || t.sshHost) : tr('This computer'));
 
+  /*
+    **指令文件 tab（CLAUDE.md / AGENTS.md）**：列出这条会话的引擎实际会读的全部指令文件
+    （`instructionFiles.ts`，按引擎自己的查找规则）。工作目录是**执行器用的那个**：远程会话是远端那个缓存目录，
+    家目录也是那台机器的。读 / 写只认上一次列出来的路径（名字是渲染层传来的绝对路径，不能借它碰任意文件）。
+  */
+  const instructionPathsListed = new Map<string, Set<string>>();
+  const instructionCwdFor = (sessionId?: string): string | undefined => {
+    if (!sessionId) return undefined;
+    const live = sessionClients.get(sessionId);
+    if (live?.cwd) return live.cwd;
+    const rec = store.readRecord(sessionId);
+    if (!rec?.localDir) return undefined;
+    return rec.profile?.remote?.sshHost ? sessionCwd(rec.profile, rec.localDir) : rec.localDir;
+  };
+  const instructionListedOk = (sessionId: string | undefined, category: string, name?: string): boolean =>
+    !!name && !!instructionPathsListed.get(`${sessionId || ''}|${category}`)?.has(name);
+
   ipcMain.handle('kiro:config-categories', (_event, engine?: string) =>
     /* RegExp 过不了 IPC，渲染层也用不到它。按会话的引擎给 tab（不传 = kiro，和原来一样） */
     kiroCategoriesFor(engineOf({ engine })).map(({ match: _m, ...rest }) => rest));
@@ -11798,6 +11816,19 @@ ${hint}` : ''}` };
     if (!spec) return { ok: false, error: tr('Unknown category {category}', { category }) };
     const target = kiroConfigTargetFor(sessionId);
     try {
+      if (spec.kind === 'instructions') {
+        const cwd = instructionCwdFor(sessionId);
+        const fsx = target
+          ? await createRemoteInstructionFs(cwd, (script) => runRemoteCapture(target, script, 30_000, 32 * 1024 * 1024), shellQuote)
+          /* 本机执行器就是用 shellEnv 起的：它里面的 CODEX_HOME / CLAUDE_CONFIG_DIR 决定引擎去哪找用户级那份 */
+          : localInstructionFs(os.homedir(), path, { CODEX_HOME: shellEnv.CODEX_HOME, CLAUDE_CONFIG_DIR: shellEnv.CLAUDE_CONFIG_DIR });
+        const list = await listInstructionFiles(spec.instructions || 'claude', cwd, fsx);
+        instructionPathsListed.set(`${sessionId || ''}|${category}`, new Set(list.map((e) => e.path)));
+        return {
+          ok: true, where: kiroConfigWhere(target), cwd: cwd || null,
+          entries: list.map((e) => ({ ...e, name: e.path, label: fsx.pm.basename(e.path) })),
+        };
+      }
       if (!target) return { ok: true, where: kiroConfigWhere(), entries: new LocalKiroConfig(os.homedir()).list(spec) };
       const out = await runRemoteCapture(target, remoteListScript(spec, shellQuote), 30_000);
       const lines = String(out || '').split('\n').filter(Boolean);
@@ -11815,6 +11846,17 @@ ${hint}` : ''}` };
     if (!spec) return { ok: false, error: tr('Unknown category {category}', { category }) };
     const target = kiroConfigTargetFor(sessionId);
     try {
+      if (spec.kind === 'instructions') {
+        if (!instructionListedOk(sessionId, category, name)) return { ok: false, error: tr('Invalid name.') };
+        if (!target) {
+          try { return { ok: true, path: name, where: kiroConfigWhere(), exists: true, content: fs.readFileSync(name!, 'utf-8') }; } catch (e: any) {
+            if (e?.code === 'ENOENT') return { ok: true, path: name, where: kiroConfigWhere(), exists: false, content: '' };
+            throw e;
+          }
+        }
+        const got = parseRemoteRead(await runRemoteCapture(target, remoteReadScript(name!, shellQuote), 30_000));
+        return { ok: true, path: name, where: kiroConfigWhere(target), exists: got.exists, content: got.content };
+      }
       if (!target) {
         const r = new LocalKiroConfig(os.homedir()).read(spec, name);
         return 'error' in r ? { ok: false, error: r.error } : { ok: true, ...r, where: kiroConfigWhere() };
@@ -11840,6 +11882,17 @@ ${hint}` : ''}` };
     if (why) return { ok: false, error: why };
     const target = kiroConfigTargetFor(sessionId);
     try {
+      if (spec.kind === 'instructions') {
+        if (!instructionListedOk(sessionId, category, name)) return { ok: false, error: tr('Invalid name.') };
+        if (!target) {
+          writeInstructionFile(name!, String(content));
+          logger.info('kiro-config', `本机 ${spec.id} 已保存 ${name}`);
+          return { ok: true, path: name };
+        }
+        await writeRemoteFile(target, remoteWriteScript(name!, shellQuote), Buffer.from(String(content), 'utf-8').toString('base64'));
+        logger.info('kiro-config', `${target.sshHost} ${spec.id} 已保存 ${name}`);
+        return { ok: true, path: name };
+      }
       if (!target) {
         const r = new LocalKiroConfig(os.homedir()).write(spec, name, String(content));
         if ('error' in r) return { ok: false, error: r.error };

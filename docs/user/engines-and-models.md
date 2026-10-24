@@ -99,6 +99,58 @@ suggests running the chat on a remote machine instead.
   chat runs: `.claude` (settings, CLAUDE.md, agents, commands, skills, plugins) or `.codex`
   (config.toml, AGENTS.md, prompts, skills).
 
+### Instruction files (the CLAUDE.md and AGENTS.md tabs)
+
+The **CLAUDE.md** tab (Claude Code) and the **AGENTS.md** tab (Codex) list **every instruction file
+the engine reads in this chat**. The list follows the engine's own lookup rules, for the machine and
+working folder of this chat. For a remote chat, it lists the files on the remote machine, starting
+from that chat's working folder there.
+
+Each row shows the file name, a category (**用户级** *User level*, **项目级** *Project level*,
+**本地** *Local*, **子目录** *Subdirectory* or **引用** *Import*) and the full path. Files in a folder
+above the working folder are also tagged **上层目录** (*Parent folder*). Standard locations that don't
+exist yet are greyed out and marked **未创建** (*Not created*). Click **创建** (*Create*) to make one.
+They are listed for the user level and for every folder from the working folder up to the repository
+root. Without a repository, they go up to your home folder, and up to the root of the drive if the
+working folder isn't inside your home folder. For Codex, this covers both `AGENTS.override.md` and
+`AGENTS.md`. Files that already exist are listed at any level the engine reads.
+Click any row to edit it on the right; saving writes back to that file.
+
+What each engine reads (checked against claude-agent-acp 0.95 and codex 0.164):
+
+| | Claude Code | Codex |
+|---|---|---|
+| User level | `~/.claude/CLAUDE.md` (or `$CLAUDE_CONFIG_DIR/CLAUDE.md` if that variable is set) | In the Codex home folder (`$CODEX_HOME` if set, otherwise `~/.codex`): the first non-empty one of `AGENTS.override.md` and `AGENTS.md`. An empty override falls back to `AGENTS.md` |
+| Project level | `CLAUDE.md` and `.claude/CLAUDE.md` in the working folder **and every folder above it**, up to the root of the drive | From the repository root (the nearest folder above with `.git`; without one, only the working folder) down to the working folder, one file per folder: the first that **exists** of `AGENTS.override.md`, `AGENTS.md`, then the names in `project_doc_fallback_filenames` in the Codex home folder's `config.toml`. If that file is empty, nothing is read for that folder; an empty override still blocks the `AGENTS.md` next to it |
+| Local | `CLAUDE.local.md` in the same folders | — |
+| Subdirectories | `CLAUDE.md` / `CLAUDE.local.md` in folders below the working folder, loaded when Claude works with files there. The tab shows up to 3 levels deep and skips `node_modules` and `.git` | Not read |
+| Imports | `@path` lines in any of these files, relative to the file that contains them (`~/` means your home folder). Not inside code blocks or code spans. Up to 5 levels deep | No imports |
+
+Claude Code doesn't read `AGENTS.md`, and Codex doesn't read `CLAUDE.md`. Both engines skip files
+that contain only whitespace; the tab marks those **空文件：引擎不读** (*Empty file: not read*). Files
+that lose to another file in the same folder say which one is read instead. `CODEX_HOME` and
+`CLAUDE_CONFIG_DIR` are taken from the environment the engine is started with: KiroLex's own
+environment on this computer, or the login shell on a remote machine.
+
+**Two kinds of long-term instructions, and both apply.** The files above are read by the engine
+itself. [KiroLex memory](memory.md) (Settings → Memory: global, project and this-chat layers) is
+separate: KiroLex adds it to every turn, for every engine. The top of each tab says so and links to
+KiroLex memory. A `CLAUDE.md` / `AGENTS.md` in a project folder is usually the repository's own
+instructions for agents (how to build, test and so on). The user-level files apply to every chat
+with that engine on that machine.
+
+**Do the engines write memory themselves in KiroLex chats?** KiroLex only records this; it doesn't
+turn anything off.
+
+- **Claude Code: yes, by default.** Its *auto memory* is on unless you disable it. It writes notes
+  to `~/.claude/projects/<folder>/memory/` and reads them back in later sessions on that machine.
+  You can turn it off yourself with `autoMemoryEnabled: false` in `~/.claude/settings.json`, or the
+  environment variable `CLAUDE_CODE_DISABLE_AUTO_MEMORY=1`. The `#` shortcut that saves a line into
+  CLAUDE.md exists only in Claude Code's terminal UI, not in KiroLex chats. Like any agent, it can
+  still edit a CLAUDE.md with its file tools if you ask it to.
+- **Codex: not by default.** Its *memories* feature is off unless you turn it on in
+  `~/.codex/config.toml` (`[features] memories = true`). Then it writes under `~/.codex/memories`.
+
 ## Kiro agents
 
 In a Kiro chat, the composer bar also has an **agent** picker. It lists the built-in agents

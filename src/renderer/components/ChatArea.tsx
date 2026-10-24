@@ -5998,7 +5998,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               : (() => {
                 const cat = engineConfigCats.find((c) => c.id === engineConfigTab);
                 return cat
-                  ? <KiroConfigPanel key={cat.id} sessionId={currentSessionId} category={cat} onClose={() => setEngineConfigOpen(false)} />
+                  ? <KiroConfigPanel key={cat.id} sessionId={currentSessionId} category={cat} onClose={() => setEngineConfigOpen(false)} onOpenMemory={() => { setEngineConfigOpen(false); onOpenMemory(); }} />
                   : null;
               })()}
           </div>

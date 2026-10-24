@@ -15,7 +15,9 @@ test('六个类别都在，单文件的有 file，列表的有 match', () => {
   assert.deepEqual(categoriesFor('kiro').map((c) => c.id), ['mcp', 'steering', 'prompts', 'skills', 'powers', 'settings']);
   for (const c of CATEGORIES) {
     if (c.kind === 'single') assert.ok(c.file, c.id);
-    else assert.ok(c.match, c.id);
+    else if (c.kind === 'list') assert.ok(c.match, c.id);
+    /* 指令文件那两类：按引擎规则现算，没有 file / match，要说清按哪家的规则 */
+    else assert.ok(c.kind === 'instructions' && c.instructions, c.id);
   }
   assert.equal(categorySpec('powers')!.readOnly, true, 'Powers 由 kiro-cli 管理，只读');
 });

@@ -41,9 +41,13 @@ export interface CategorySpec {
   root: string;
   /**
    * `single`：就一个文件（`file` 是它相对 root 的名字）；
-   * `list`：一棵树里的一批文件（按 `match` 认）。
+   * `list`：一棵树里的一批文件（按 `match` 认）；
+   * `instructions`：这条会话的引擎实际会读的全部指令文件（用户级 / 项目级 / 上层 / 本地 / 子目录 / @引用），
+   * 按会话的机器和工作目录现算（`instructionFiles.ts`），条目名是那台机器上的绝对路径。
    */
-  kind: 'single' | 'list';
+  kind: 'single' | 'list' | 'instructions';
+  /** instructions 类：按哪个引擎的规则找 */
+  instructions?: 'claude' | 'codex';
   file?: string;
   /** list 类：哪些相对路径算这一类的文件 */
   match?: RegExp;
@@ -108,8 +112,8 @@ CATEGORIES.push(
     hint: "Claude Code user settings (env holds the gateway URL and key; also permissions, model...). For remote sessions this edits the copy on that machine.",
   },
   {
-    id: 'claude-memory', engine: 'claude', base: '.claude', label: 'CLAUDE.md', root: '', kind: 'single', file: 'CLAUDE.md',
-    hint: "User-level standing instructions: every session reads it (same purpose as kiro's Steering).",
+    id: 'claude-memory', engine: 'claude', base: '.claude', label: 'CLAUDE.md', root: '', kind: 'instructions', instructions: 'claude',
+    hint: 'Every instruction file Claude Code reads in this chat (by its own lookup rules, on the machine and in the working folder of this chat). Saving writes back to that file.',
   },
   {
     id: 'claude-agents', engine: 'claude', base: '.claude', label: 'Agents', root: 'agents', kind: 'list', match: /\.md$/i, depth: 1,
@@ -136,8 +140,8 @@ CATEGORIES.push(
     hint: "Codex config (model, model_provider, [model_providers.*], MCP, sandbox...). It is TOML, not JSON.",
   },
   {
-    id: 'codex-agents', engine: 'codex', base: '.codex', label: 'AGENTS.md', root: '', kind: 'single', file: 'AGENTS.md',
-    hint: "User-level standing instructions: every session reads it.",
+    id: 'codex-agents', engine: 'codex', base: '.codex', label: 'AGENTS.md', root: '', kind: 'instructions', instructions: 'codex',
+    hint: 'Every instruction file Codex reads in this chat (by its own lookup rules, on the machine and in the working folder of this chat). Saving writes back to that file.',
   },
   {
     id: 'codex-prompts', engine: 'codex', base: '.codex', label: 'Prompts', root: 'prompts', kind: 'list', match: /\.md$/i, depth: 1,
@@ -425,7 +429,8 @@ export function parseRemoteList(spec: CategorySpec, out: string): ConfigEntry[] 
 
 /** 远程读：先打一行 `EXISTS 0|1`，再是 base64 的内容。 */
 export function remoteReadScript(rel: string, q: (s: string) => string): string {
-  return `f="$HOME"/${q(rel)}; if [ -f "$f" ]; then echo "EXISTS 1"; base64 -w0 < "$f"; else echo "EXISTS 0"; fi`;
+  /* 以 `/` 开头的是那台机器上的绝对路径（指令文件 tab），原样用；其余相对家目录 —— 和 remoteWriteScript 一样 */
+  return `${rel.startsWith('/') ? `f=${q(rel)}` : `f="$HOME"/${q(rel)}`}; if [ -f "$f" ]; then echo "EXISTS 1"; base64 -w0 < "$f"; else echo "EXISTS 0"; fi`;
 }
 
 /** 解析 `remoteReadScript` 的输出。 */

@@ -18,7 +18,8 @@ import { engineCliName } from '../engineLabel';
 export interface KiroConfigCategory {
   id: string;
   label: string;
-  kind: 'single' | 'list';
+  /** `instructions`：引擎实际会读的全部指令文件（CLAUDE.md / AGENTS.md tab，main `instructionFiles.ts`） */
+  kind: 'single' | 'list' | 'instructions';
   file?: string;
   json?: boolean;
   readOnly?: boolean;
@@ -30,7 +31,22 @@ export interface KiroConfigCategory {
 }
 
 /** `label` / `readOnly`：插件带的条目（Claude Code）—— 显示「插件 · 名字」，只读。 */
-interface Entry { name: string; size: number; label?: string; readOnly?: boolean }
+interface Entry {
+  name: string; size: number; label?: string; readOnly?: boolean;
+  /* 指令文件 tab 才有：分类、在不在、标准位置可新建、被谁引用、上层目录、被同目录的 override 盖住 */
+  kind?: 'user' | 'project' | 'local' | 'subdir' | 'import';
+  exists?: boolean; creatable?: boolean; importedBy?: string; ancestor?: boolean; shadowedBy?: string;
+  /** 只有空白（引擎不读）；Codex 的备用文件名 */
+  empty?: boolean; fallback?: boolean;
+}
+
+/** 指令文件的分类标签 */
+const INSTRUCTION_KIND_LABEL: Record<NonNullable<Entry['kind']>, string> = {
+  user: 'User level', project: 'Project level', local: 'Local', subdir: 'Subdirectory', import: 'Import',
+};
+
+/** 路径的最后一段（两种分隔符都认） */
+const baseOf = (p: string) => p.split(/[\\/]/).filter(Boolean).pop() || p;
 
 const api = () => (window as any).kiroApi;
 
@@ -51,7 +67,10 @@ export const KiroConfigPanel: React.FC<{
   sessionId?: string;
   category: KiroConfigCategory;
   onClose: () => void;
-}> = ({ sessionId, category, onClose }) => {
+  /** 指令文件 tab 顶上那行说明里「KiroLex 记忆」的链接 */
+  onOpenMemory?: () => void;
+}> = ({ sessionId, category, onClose, onOpenMemory }) => {
+  const instructions = category.kind === 'instructions';
   const t = useT();
   const [where, setWhere] = useState('');
   const [entries, setEntries] = useState<Entry[]>([]);
@@ -95,11 +114,12 @@ export const KiroConfigPanel: React.FC<{
     if (!r?.ok) { setListError(r?.error || t('Could not list')); setEntries([]); return; }
     const list: Entry[] = r.entries || [];
     setEntries(list);
-    /* 打开刚建的那个，或者第一个 */
+    /* 打开刚建的那个，或者第一个（指令文件 tab：第一个已存在的） */
+    const first = instructions ? (list.find((e) => e.exists) || list[0]) : list[0];
     if (pick) void open(pick);
-    else if (list.length) void open(list[0].name);
+    else if (first) void open(first.name);
     else { setSelected(undefined); setContent(''); setInitial(''); setPath(''); }
-  }, [sessionId, category.id, category.kind, open, t]);
+  }, [sessionId, category.id, category.kind, instructions, open, t]);
 
   /* 换 tab 就是换一个组件实例（key=category.id），所以这里只在挂载时拉一次 */
   useEffect(() => { void refresh(); }, [refresh]);
@@ -124,7 +144,8 @@ export const KiroConfigPanel: React.FC<{
       if (!r?.ok) { setStatus({ text: r?.error || t('Not saved'), ok: false }); return; }
       setContent(text); setInitial(text); setExists(true); setPath(r.path || path);
       setStatus({ text: where ? t('Saved ({where})', { where }) : t('Saved'), ok: true });
-      if (category.kind === 'list') void api().kiroConfigList(sessionId, category.id).then((x: any) => x?.ok && setEntries(x.entries || []));
+      /* 指令文件 tab 也重列：「未创建」变成已存在，新写的 @引用 也要出来 */
+      if (category.kind !== 'single') void api().kiroConfigList(sessionId, category.id).then((x: any) => x?.ok && setEntries(x.entries || []));
     } finally { setSaving(false); }
   }, [canEdit, invalid, saving, dirty, exists, sessionId, category.id, category.kind, category.json, selected, content, path, where, t]);
 
@@ -138,6 +159,13 @@ export const KiroConfigPanel: React.FC<{
     setNewName(null);
     await refresh(n);
   }, [newName, category.ext, category.id, entries, sessionId, refresh, t]);
+
+  /** 「未创建」的标准位置一键新建：写一个只有标题的文件，再重列并打开它 */
+  const createInstruction = useCallback(async (name: string) => {
+    const r = await api().kiroConfigWrite(sessionId, category.id, name, `# ${baseOf(name).replace(/\.[^.]+$/, '')}\n\n`);
+    if (!r?.ok) { setStatus({ text: r?.error || t('Could not create'), ok: false }); return; }
+    await refresh(name);
+  }, [sessionId, category.id, refresh, t]);
 
   const format = () => {
     const r = formatJsonText(content);
@@ -157,7 +185,49 @@ export const KiroConfigPanel: React.FC<{
             {category.kind === 'list' && <span>{entries.length}</span>}
           </div>
           {listError && <div className="agent-config-readonly-note"><span>{listError}</span></div>}
-          {entries.map((e) => {
+          {instructions && (
+            <div className="kiro-config-instr-note">
+              {t('These are long-term instructions the engine reads itself; KiroLex memory (Settings → Memory) is injected separately on every turn, and both take effect.')}
+              {onOpenMemory && <> <button className="kiro-config-link" onClick={onOpenMemory}>{t('Open KiroLex memory')}</button></>}
+            </div>
+          )}
+          {instructions && entries.map((e) => (
+            <div
+              key={e.name}
+              className={`agent-config-row kiro-config-instr-row ${selected === e.name ? 'active' : ''} ${e.exists ? '' : 'missing'}`}
+              role="button"
+              tabIndex={0}
+              onClick={() => !loading && void open(e.name)}
+              onKeyDown={(ev) => { if (ev.key === 'Enter' && !loading) void open(e.name); }}
+              title={e.name}
+            >
+              <span className="kiro-config-instr-head">
+                <span className="agent-config-row-name">{e.label || baseOf(e.name)}</span>
+                {e.kind && <span className={`kiro-config-instr-kind ${e.kind}`}>{t(INSTRUCTION_KIND_LABEL[e.kind])}</span>}
+                {selected === e.name && dirty && <span className="agent-config-row-dirty" title={t('Unsaved changes')} />}
+                <span className="kiro-config-row-size">{e.exists ? (e.size < 1024 ? `${e.size} B` : `${(e.size / 1024).toFixed(1)} KB`) : ''}</span>
+              </span>
+              <span className="kiro-config-instr-path">{e.name}</span>
+              {e.ancestor && <span className="kiro-config-instr-sub">{t('Parent folder')}</span>}
+              {e.importedBy && <span className="kiro-config-instr-sub">{t('Imported by {name}', { name: baseOf(e.importedBy) })}</span>}
+              {e.shadowedBy && <span className="kiro-config-instr-sub">{t('Not read: {name} in the same folder takes precedence', { name: baseOf(e.shadowedBy) })}</span>}
+              {e.fallback && <span className="kiro-config-instr-sub">{t('Fallback file name (project_doc_fallback_filenames)')}</span>}
+              {e.empty && <span className="kiro-config-instr-sub">{t('Empty file: not read')}</span>}
+              {!e.exists && (
+                <span className="kiro-config-instr-sub">
+                  {e.creatable ? t('Not created') : t('Not found')}
+                  {e.creatable && (
+                    <button
+                      className="kiro-config-link"
+                      onClick={(ev) => { ev.stopPropagation(); void createInstruction(e.name); }}
+                      disabled={loading}
+                    >{t('Create')}</button>
+                  )}
+                </span>
+              )}
+            </div>
+          ))}
+          {!instructions && entries.map((e) => {
             /* 只显示文件名；所在子目录放成灰色小字 —— 否则 steering 那一排全是同一个前缀，被截得只剩前缀 */
             const slash = e.name.lastIndexOf('/');
             const dir = slash >= 0 ? e.name.slice(0, slash) : '';
@@ -201,14 +271,14 @@ export const KiroConfigPanel: React.FC<{
 
         <div className="agent-config-editor-body">
           <div className="agent-config-editor-selection">
-            <strong>{category.kind === 'single' ? category.file : (selectedEntry?.label || selected || t('(pick one)'))}</strong>
+            <strong>{category.kind === 'single' ? category.file : (selectedEntry?.label || (selected && instructions ? baseOf(selected) : selected) || t('(pick one)'))}</strong>
             {selectedEntry?.readOnly && <span className="kiro-config-ro-tag">{t('Plugin · read-only')}</span>}
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">{category.hint}{!exists && ` · ${t('This file does not exist yet; saving will create it.')}`}</div>
           {loading ? (
             <div className="agent-config-editor-message">{t('Loading…')}</div>
-          ) : category.kind === 'list' && !selected ? (
+          ) : category.kind !== 'single' && !selected ? (
             <div className="agent-config-editor-message"><span>{t('No {label} here yet.', { label: category.label })}{category.creatable ? t(' Click "+ New" on the left.') : ''}</span></div>
           ) : (
             <>
