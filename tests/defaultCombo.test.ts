@@ -185,7 +185,7 @@ describe('组合编辑器：示例和真实内容分得清', () => {
   });
 
   test('编辑器：文件不存在、也没插入示例时显示「还没有自定义组合」+「插入示例」，不把示例当内容', () => {
-    assert.match(PANE, /No custom combos yet/);
+    assert.match(PANE, /No custom MCP profiles yet/);
     assert.match(PANE, /Insert example/);
     assert.match(PANE, /setContent\(formatJsonOnOpen\(template\)\)/);
   });

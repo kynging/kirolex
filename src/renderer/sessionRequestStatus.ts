@@ -54,8 +54,8 @@ export function clearErrOnReady(map: RequestStatusMap, prev: readonly string[], 
 
 export type SwitchWhat = 'model' | 'effort' | 'mode' | 'combo';
 
-/** 主进程的报错本身已经是「换组合「x」失败（…）」那一整句时，不再套「切换组合失败：」 */
-const SAYS_COMBO_FAILED = /^Switching to the combo "[^"]*" failed /;
+/** 主进程的报错本身已经是「换 MCP 配置「x」失败（…）」那一整句时，不再套「切换 MCP 配置失败：」 */
+const SAYS_COMBO_FAILED = /^Switching to the MCP profile "[^"]*" failed /;
 
 /**
  * 切换失败时**在会话状态行说的那一句**（✗ 只是个标记，原因要说出来）。
@@ -66,8 +66,8 @@ export function switchFailureNotice(what: SwitchWhat, err: unknown, lang: Lang):
   const reason = messageVariants(why);
   const say = (l: Lang): string => {
     const r = reason?.[l] ?? why;
-    if (SAYS_COMBO_FAILED.test(why) || /^换组合「/.test(why)) return `⚠️ ${r}`;
-    if (what === 'combo') return t(l, '⚠️ Switching the combo failed: {why}', { why: r });
+    if (SAYS_COMBO_FAILED.test(why) || /^换 MCP 配置「/.test(why)) return `⚠️ ${r}`;
+    if (what === 'combo') return t(l, '⚠️ Switching the MCP profile failed: {why}', { why: r });
     if (what === 'effort') return t(l, '⚠️ Switching the effort failed: {why}', { why: r });
     if (what === 'mode') return t(l, '⚠️ Switching the permission mode failed: {why}', { why: r });
     return t(l, '⚠️ Switching the model failed: {why}', { why: r });

@@ -121,13 +121,13 @@ describe('主进程文案跟着界面语言走', () => {
     try {
       setUiLang('zh');
       const used = tr('General');
-      const text = tr('⚠️ Combo "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: 'research', used });
-      assert.match(text, /找不到组合/);
+      const text = tr('⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: 'research', used });
+      assert.match(text, /找不到 MCP 配置/);
       const both = bothLangs(text);
       assert.ok(both, '刚 tr() 出去的句子要认得');
       assert.equal(both!.zh, text);
       // 嵌在占位符里的、本身也是 tr() 出来的那段（内置组合名「通用」）同样换成英文
-      assert.equal(both!.en, '⚠️ Combo "research" not found (it may have been deleted), so this time it starts as "General".');
+      assert.equal(both!.en, '⚠️ MCP profile "research" not found (it may have been deleted), so this time it starts as "General".');
       // 不是 tr() 出来的（例如拼接出来的、或别处来的原文）不猜，原样由调用方处理
       assert.equal(bothLangs('some text nobody translated'), null);
     } finally {

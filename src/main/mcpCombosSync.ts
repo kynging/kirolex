@@ -51,8 +51,8 @@ export function planComboSync(local: string | undefined, remote: string | undefi
   if (local !== undefined && remote !== undefined && local === remote) return plan('none');
   const localChanged = local !== undefined && (!last || comboHash(local) !== last.localHash);
   const remoteChanged = remote !== undefined && (!last || comboHash(remote) !== last.remoteHash);
-  const checkLocal = (): string | null => { const r = parseMcpCombos(local!); return r.ok ? null : tr('The combo file on this machine has an error: {error}', { error: r.error }); };
-  const checkRemote = (): string | null => { const r = parseMcpCombos(remote!); return r.ok ? null : tr('The combo file in the bucket has an error: {error}', { error: r.error }); };
+  const checkLocal = (): string | null => { const r = parseMcpCombos(local!); return r.ok ? null : tr('The MCP profile file on this machine has an error: {error}', { error: r.error }); };
+  const checkRemote = (): string | null => { const r = parseMcpCombos(remote!); return r.ok ? null : tr('The MCP profile file in the bucket has an error: {error}', { error: r.error }); };
   const upload = (): ComboSyncPlan => { const e = checkLocal(); return e ? plan('skip', { error: e }) : plan('upload', { upload: local }); };
   const pull = (): ComboSyncPlan => { const e = checkRemote(); return e ? plan('skip', { error: e }) : plan('pull', { writeLocal: remote }); };
   if (remote === undefined) return upload();            // 桶里没有（新桶 / 被删了）：传
@@ -120,9 +120,9 @@ export type ComboMerge =
  */
 export function mergeComboTexts(localText: string, remoteText: string): ComboMerge {
   const lp = parseMcpCombos(localText);
-  if (!lp.ok) return { ok: false, error: tr('The combo file on this machine has an error: {error}', { error: lp.error }) };
+  if (!lp.ok) return { ok: false, error: tr('The MCP profile file on this machine has an error: {error}', { error: lp.error }) };
   const rp = parseMcpCombos(remoteText);
-  if (!rp.ok) return { ok: false, error: tr('The combo file in the bucket has an error: {error}', { error: rp.error }) };
+  if (!rp.ok) return { ok: false, error: tr('The MCP profile file in the bucket has an error: {error}', { error: rp.error }) };
   const local = rawList(localText);
   const remote = rawList(remoteText);
   /*
@@ -180,7 +180,7 @@ export function mergeComboTexts(localText: string, remoteText: string): ComboMer
   if (!added.length) return { ok: true, text: localText, added, conflicts };
   const text = `${JSON.stringify(out, null, 2)}\n`;
   const check = parseMcpCombos(text);
-  if (!check.ok) return { ok: false, error: tr('The merged combo file did not pass validation: {error}', { error: check.error }) };
+  if (!check.ok) return { ok: false, error: tr('The merged MCP profile file did not pass validation: {error}', { error: check.error }) };
   return { ok: true, text, added, conflicts };
 }
 

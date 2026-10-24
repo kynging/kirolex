@@ -200,7 +200,7 @@ export function parseMcpCombos(text: string): ParseResult {
   try { raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch {
     return { ok: false, error: jsonSyntaxError(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text) };
   }
-  if (!Array.isArray(raw)) return { ok: false, error: tr('The file must contain a list of combos ([ ... ])') };
+  if (!Array.isArray(raw)) return { ok: false, error: tr('The file must contain a list of MCP profiles ([ ... ])') };
   const hasOverride = raw.some((c) => isObj(c) && c.id === BUILTIN_COMBO_ID);
   const generalAt = hasOverride ? -1 : findGeneralLikeCombo(raw);
   const replaced = hasOverride || generalAt >= 0;
@@ -209,7 +209,7 @@ export function parseMcpCombos(text: string): ParseResult {
   const names = new Set<string>(replaced ? [] : [BUILTIN_COMBO.name]);
   for (let i = 0; i < raw.length; i += 1) {
     const c = raw[i];
-    const at = tr('Combo #{n}', { n: i + 1 });
+    const at = tr('MCP profile #{n}', { n: i + 1 });
     if (!isObj(c)) return { ok: false, error: tr('{at} must be an object', { at }) };
     if (typeof c.id !== 'string' || !COMBO_ID.test(c.id)) return { ok: false, error: tr('{at}: id must be 1-64 letters, digits, - or _', { at }) };
     if (ids.has(c.id)) return { ok: false, error: tr('{at}: id "{id}" is a duplicate', { at, id: c.id }) };
@@ -354,7 +354,7 @@ export function planComboEffort(
   comboName = '',
 ): { apply: boolean; notice?: string } {
   if (opts && opts.options.some((o) => o.value === want)) return { apply: true };
-  const who = comboName ? tr('Combo "{name}"', { name: comboName }) : tr('The combo');
+  const who = comboName ? tr('MCP profile "{name}"', { name: comboName }) : tr('The MCP profile');
   const avail = opts?.options.length
     ? tr(' (options: {list})', { list: opts.options.map((o) => o.value).join(' / ') })
     : tr(' (this engine offers no effort options)');
@@ -389,7 +389,7 @@ export async function applyComboEffort(
   if (plan.apply) {
     if (io.options()?.current === want) return { value: want };
     try { await io.set(want); return { value: want }; } catch (err: any) {
-      base = tr('⚠️ Could not set effort "{want}" for combo "{name}" ({err})', { want, name: comboName, err: String(err?.message || err) });
+      base = tr('⚠️ Could not set effort "{want}" for MCP profile "{name}" ({err})', { want, name: comboName, err: String(err?.message || err) });
     }
   }
   const now = io.options();

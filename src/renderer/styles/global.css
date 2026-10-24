@@ -8973,6 +8973,8 @@ button, input, select, textarea {
   margin-bottom: -1px; cursor: pointer; white-space: nowrap;
 }
 .agent-config-editor-dialog .kiro-config-tab:hover { color: var(--text-primary); }
+/* 「🧩 MCP 配置」标题旁那句说明：小一号、淡一点，不和标题抢 */
+.agent-config-editor-dialog .kiro-config-tab-hint { margin-left: 6px; font-size: 11.5px; color: var(--text-secondary); opacity: 0.8; }
 .agent-config-editor-dialog .kiro-config-tab.active { color: var(--text-primary); border-bottom-color: var(--accent); }
 .agent-config-editor-dialog .kiro-config-tab:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; border-radius: 4px; }
 

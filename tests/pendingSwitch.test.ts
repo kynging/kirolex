@@ -223,7 +223,7 @@ describe('接线：每一种切换忙时登记 pending、不再 throw', () => {
       'Wait for the current response to finish before switching agents.',
       'Wait for the current response to finish before switching models.',
       'This turn is still running. Wait for it to finish before switching engines.',
-      'This turn is still running. Wait for it to finish before switching combos.',
+      'This turn is still running. Wait for it to finish before switching MCP profiles.',
       'Wait for this reply to finish before switching.',
     ]) assert.equal(M.includes(`throw new Error(tr('${msg}'))`), false, msg);
   });

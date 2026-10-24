@@ -245,8 +245,8 @@ describe('4.1 组合里的 MCP 没带进远程会话：说一句原因 + 怎么�
       assert.match(main, /web/);
       assert.match(main, /forwardFromLocal/);
       assert.ok(detail);
-      const zh = trIn('zh', '⚠️ This remote session does not have MCP "{mcp}" from combo "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 Combos and reopen the session.', { mcp: 'web', combo: '投研' });
-      assert.match(zh, /没带上组合「投研」的 MCP「web」/);
+      const zh = trIn('zh', '⚠️ This remote session does not have MCP "{mcp}" from MCP profile "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 MCP profiles and reopen the session.', { mcp: 'web', combo: '投研' });
+      assert.match(zh, /没带上 MCP 配置「投研」的 MCP「web」/);
     }
   });
 

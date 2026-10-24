@@ -2293,10 +2293,10 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   if (error) {
     logger.warn('mcp-combo', `${mcpCombosPath(os.homedir())} 读不了：${error}`);
     if (profile.mcpCombo && profile.mcpCombo !== BUILTIN_COMBO_ID) {
-      sessionNotice(sessionId, tr('⚠️ The combo file has an error ({error}), so this time it starts as "General" with no MCP attached.', { error }));
+      sessionNotice(sessionId, tr('⚠️ The MCP profile file has an error ({error}), so this time it starts as "General" with no MCP attached.', { error }));
     }
   } else if (profile.mcpCombo && combo !== findCombo(combos, profile.mcpCombo)) {
-    sessionNotice(sessionId, tr('⚠️ Combo "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
+    sessionNotice(sessionId, tr('⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
   }
   return combo;
 }
@@ -2315,7 +2315,7 @@ function localComboTools(
   const combo = sessionCombo(sessionId, profile);
   const { servers, skipped } = buildAcpMcpServers(combo, shellEnv as Record<string, string | undefined>);
   for (const s of skipped) {
-    sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) }));
+    sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in MCP profile "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) }));
   }
   if (!servers.length) return undefined;
   logger.info('mcp-combo', `组合「${combo.name}」挂 ${servers.length} 个 MCP sessionId=${sessionId}: ${JSON.stringify(maskAcpServers(servers))}`);
@@ -2442,8 +2442,8 @@ async function ensureLocalTools(
           continue;
         }
         sessionNotice(sessionId, s.missing
-          ? tr('⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) })
-          : tr('⚠️ MCP "{mcp}" in combo "{combo}" can\'t be forwarded from this machine ({reason}); it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
+          ? tr('⚠️ MCP "{mcp}" in MCP profile "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) })
+          : tr('⚠️ MCP "{mcp}" in MCP profile "{combo}" can\'t be forwarded from this machine ({reason}); it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
         skippedReasons.push({ name: s.name, reason: s.missing ? tr('missing environment variable(s) {vars}', { vars: trList(s.missing) }) : String(s.reason) });
       }
       /* 组合里没标「从本机转发」、远程会话里就没有的那些（审计 4.1）：同一会话同一个只说一次，说成了才记 */
@@ -4661,7 +4661,7 @@ function pendingKindName(kind: PendingKind): string {
   switch (kind) {
     case 'remote': return tr('Run location');
     case 'engine': return tr('Engine');
-    case 'combo': return tr('Combo');
+    case 'combo': return tr('MCP profile');
     case 'agent': return tr('Agent');
     case 'model': case 'engineModel': return tr('Model');
     case 'engineEffort': return tr('Effort');
@@ -12459,9 +12459,9 @@ ${hint}` : ''}` };
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-mcp-combo'); if (advRefused) throw new Error(advRefused); }
     const { combos } = readMcpCombos(os.homedir());
     const combo = findCombo(combos, comboId);
-    if (!combo) throw new Error(tr('Combo "{id}" not found (did the combo file change? Reopen the dropdown and check).', { id: comboId }));
+    if (!combo) throw new Error(tr('MCP profile "{id}" not found (did the MCP profile file change? Reopen the dropdown and check).', { id: comboId }));
     const nextCombo = combo.id === BUILTIN_COMBO_ID ? undefined : combo.id;
-    const onlyEngines = tr('Combos only apply to Claude Code / Codex sessions.');
+    const onlyEngines = tr('MCP profiles only apply to Claude Code / Codex sessions.');
     const oldEntry = sessionClients.get(sessionId);
     /* 忙、或者上一批 pending 正在应用（那次重连会先把执行器拿掉）：先登记，别掉进下面"没连着只写记录"那条路 ——
        那样写下的记录会被正在进行的那次重连用旧 profile 盖掉。登记的这一次在那一批落定后接着应用。
@@ -12512,7 +12512,7 @@ ${hint}` : ''}` };
       markContextOwedIfUnverified(sessionId, 'switch-mcp-combo');
       restoreContextAfterExecutorSwap(sessionId, 'switch-mcp-combo');
       modelFallback.commit(sessionId);   // 换成了：记下的「改用了备用模型」现在写
-      sessionNotice(sessionId, tr('🔀 Switched to the combo "{name}"; the context goes along with your next message.', { name: comboDisplayName(combo) }));
+      sessionNotice(sessionId, tr('🔀 Switched to the MCP profile "{name}"; the context goes along with your next message.', { name: comboDisplayName(combo) }));
       logger.info('mcp-combo', `切换组合 sessionId=${sessionId} -> ${combo.id}`);
       return { ok: true, current: combo.id };
     } catch (err) {
@@ -12527,7 +12527,7 @@ ${hint}` : ''}` };
       if (toolsSwapped && sessionClients.get(sessionId) === oldEntry) {
         void detachExecutor(sessionId);
         /* 同一次失败只说一处：把"仍用原组合、下一条消息重新连接"放进抛出去的错误里（界面显示在组合下拉旁），不再另发状态行 */
-        throw new Error(tr('Switching to the combo "{name}" failed ({err}); the previous combo is kept and your next message reconnects with it.', { name: comboDisplayName(combo), err: String((err as any)?.message || err) }));
+        throw new Error(tr('Switching to the MCP profile "{name}" failed ({err}); the previous MCP profile is kept and your next message reconnects with it.', { name: comboDisplayName(combo), err: String((err as any)?.message || err) }));
       }
       throw err;
     } finally {

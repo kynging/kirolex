@@ -69,7 +69,7 @@ test('改过的英文原文都有中文（渲染层 t()）', () => {
     '⚠️ Switching the model failed: {why}',
     '⚠️ Switching the effort failed: {why}',
     '⚠️ Switching the permission mode failed: {why}',
-    '⚠️ Switching the combo failed: {why}',
+    '⚠️ Switching the MCP profile failed: {why}',
     'Switch failed',
     '{why}\nClick to dismiss.',
   ];

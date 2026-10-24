@@ -508,7 +508,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           {tab === 'session' && (
           <div className="settings-col">
             <div className="settings-item">
-              <label className="settings-label">{t('Default combo for new sessions (Claude Code / Codex)')}</label>
+              <label className="settings-label">{t('Default MCP profile for new sessions (Claude Code / Codex)')}</label>
               <div className="settings-control">
                 <select
                   value={comboInfo ? (defaultComboOptions(comboInfo, 'global', t).find((o) => o.selected)?.value ?? 'default') : 'default'}
@@ -520,7 +520,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                     .map((o) => <option key={o.value} value={o.value} disabled={o.disabled}>{o.label}</option>)}
                 </select>
               </div>
-              <p className="settings-hint">{t('New Claude Code / Codex sessions (on this machine or remote) start with this combo; existing sessions are not changed. A project can override it from its menu in the sidebar. The combos themselves are edited on the 🧩 Combos page of the Claude Code / Codex config panel.')}</p>
+              <p className="settings-hint">{t('New Claude Code / Codex sessions (on this machine or remote) start with this MCP profile; existing sessions are not changed. A project can override it from its menu in the sidebar. The MCP profiles themselves are edited on the 🧩 MCP profiles page of the Claude Code / Codex config panel.')}</p>
               {comboErr && <p className="settings-hint error">{t('Could not set it: {reason}', { reason: comboErr })}</p>}
             </div>
             {/* 「重试次数默认是 10，可以在 setting 中调整」 */}

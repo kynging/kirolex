@@ -25,12 +25,12 @@ describe('组合下拉显示', () => {
   test('id 在本机不存在：选中一条明说的提示项，而不是「通用」', () => {
     const v = comboSelectView(list({ missing: 'research' }), undefined, zh);
     assert.equal(v.value, 'research');
-    assert.equal(v.missing?.label, '组合「research」在本机不存在，已按通用运行');
+    assert.equal(v.missing?.label, 'MCP 配置「research」在本机不存在，已按通用运行');
   });
 
   test('组合文件有错时：说是读不到（文件有错），不说「不存在」', () => {
     const v = comboSelectView(list({ missing: 'research', error: 'JSON 写错了' }), undefined, zh);
-    assert.equal(v.missing?.label, '组合「research」读不到（组合文件有错），已按通用运行');
+    assert.equal(v.missing?.label, 'MCP 配置「research」读不到（MCP 配置文件有错），已按通用运行');
   });
 
   test('有待应用的切换时显示那一个，不显示缺失提示', () => {
@@ -66,11 +66,11 @@ describe('「新会话默认组合」下拉', () => {
     const last = opts[opts.length - 1];
     assert.deepEqual(sel(opts), ['mac-only']);
     assert.equal(last.disabled, true);
-    assert.equal(last.label, '组合「mac-only」在本机不存在，新会话按通用');
+    assert.equal(last.label, 'MCP 配置「mac-only」在本机不存在，新会话按通用');
   });
   test('组合文件有错：说读不到，不说不存在', () => {
     const opts = defaultComboOptions({ combos: [{ id: 'default', name: '通用' }], global: 'general', error: 'x' }, 'global', zh);
-    assert.equal(opts[opts.length - 1].label, '组合「general」读不到（组合文件有错），新会话按通用');
+    assert.equal(opts[opts.length - 1].label, 'MCP 配置「general」读不到（MCP 配置文件有错），新会话按通用');
   });
   test('项目：第一项是「跟随全局（全局那个的名字）」，没覆盖时选中它', () => {
     const opts = defaultComboOptions(info({ global: 'general', project: '' }), 'project', zh);
@@ -79,13 +79,13 @@ describe('「新会话默认组合」下拉', () => {
   });
   test('项目跟随全局、全局那个本机没有：「跟随全局」里写明缺的是哪个、新会话按通用', () => {
     const opts = defaultComboOptions(info({ global: 'mac-only', project: '' }), 'project', zh);
-    assert.equal(opts[0].label, '跟随全局（组合「mac-only」在本机不存在，新会话按通用）');
+    assert.equal(opts[0].label, '跟随全局（MCP 配置「mac-only」在本机不存在，新会话按通用）');
     assert.deepEqual(sel(opts), ['']);
     assert.equal(opts.some((o) => o.disabled), false);
   });
   test('项目跟随全局、组合文件有错：「跟随全局」里说读不到', () => {
     const opts = defaultComboOptions({ combos: [{ id: 'default', name: '通用' }], global: 'general', project: '', error: 'x' }, 'project', zh);
-    assert.equal(opts[0].label, '跟随全局（组合「general」读不到（组合文件有错），新会话按通用）');
+    assert.equal(opts[0].label, '跟随全局（MCP 配置「general」读不到（MCP 配置文件有错），新会话按通用）');
   });
   test('项目跟随全局、全局没设：仍是「跟随全局（通用）」', () => {
     assert.equal(defaultComboOptions(info({ project: '' }), 'project', zh)[0].label, '跟随全局（通用）');

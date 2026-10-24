@@ -4356,7 +4356,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     switch (kind) {
       case 'remote': return t('Run location');
       case 'engine': return t('Engine');
-      case 'combo': return t('Combo');
+      case 'combo': return t('MCP profile');
       case 'agent': return t('Agent');
       case 'model': case 'engineModel': return t('Model');
       case 'engineEffort': return t('Effort');
@@ -5250,14 +5250,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         title={comboView.missing
                           ? comboView.missing.label
                           : mcpCombos?.error
-                            ? t('The combo file has an error: {error}', { error: mcpCombos.error })
-                            : t("{engine} combo (MCP + effort). Switching restarts this chat's executor", { engine: engineLabel })}
-                        aria-label={t('Combo')}
+                            ? t('The MCP profile file has an error: {error}', { error: mcpCombos.error })
+                            : t("{engine} MCP profile: which MCP tools this chat gets and how much effort it uses. Switching restarts this chat's executor", { engine: engineLabel })}
+                        aria-label={t('MCP profile')}
                       >
                         {comboView.missing && <option value={comboView.missing.id} disabled>{comboView.missing.label}</option>}
                         {(mcpCombos?.combos || [{ id: 'default', name: t('General purpose') }]).map((c) => (
                           /* 内置组合的名字在这里按当前语言取：清单是进会话时拉的，那一刻的语言不一定是现在的 */
-                          <option key={c.id} value={c.id}>{t('Combo · {name}', { name: c.name })}</option>
+                          <option key={c.id} value={c.id}>{t('MCP profile · {name}', { name: c.name })}</option>
                         ))}
                       </select>
                       {effortNote && (
@@ -5792,15 +5792,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label={t('Close')}>✕</button>
             </div>
             <div className="kiro-config-tabs" role="tablist">
-              {[{ id: 'login', label: t('🔑 Login') }, { id: 'mcp-combos', label: t('🧩 Combos') }, ...engineConfigCats].map((c) => (
+              {/* 「MCP 配置」光看名字不一定懂：标题旁带一句它管什么 */}
+              {[{ id: 'login', label: t('🔑 Login') }, { id: 'mcp-combos', label: t('🧩 MCP profiles'), tabHint: t('Which MCP tools this chat gets, and how much effort it uses') }, ...engineConfigCats].map((c: { id: string; label: string; tabHint?: string }) => (
                 <button
                   key={c.id}
                   role="tab"
                   aria-selected={engineConfigTab === c.id}
                   className={`kiro-config-tab ${engineConfigTab === c.id ? 'active' : ''}`}
+                  title={c.tabHint}
                   onClick={() => setEngineConfigTab(c.id)}
                 >
                   {c.label}
+                  {c.tabHint && <span className="kiro-config-tab-hint">{c.tabHint}</span>}
                 </button>
               ))}
             </div>

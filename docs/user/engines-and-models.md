@@ -88,12 +88,13 @@ suggests running the chat on a remote machine instead.
   **默认模型** (*Default model*) or **连接中…** (*Connecting…*).
 - Changing it takes effect immediately in the same process and is remembered for that chat. The chat
   must be connected.
-- Next to it is a **组合 · …** (*Combo*) picker. A combo is a named set of MCP servers plus an
-  effort level, defined in `~/.kirolex/mcp-combos.json`. The built-in **组合 · 通用** (*General*) has
-  no MCP servers. Changing the combo restarts that chat's engine, so it is disabled while a reply is
-  in progress.
-- To edit the combos, click the engine icon at the bottom-left of the composer. That opens the
-  engine's configuration dialog. Use its **🧩 组合** (*Combos*) tab, which edits the JSON file and
+- Next to it is a **MCP 配置 · …** (*MCP profile*) picker. An MCP profile decides which MCP tools
+  the chat gets and how much effort it uses: a named set of MCP servers plus an optional effort
+  level, defined in `~/.kirolex/mcp-combos.json`. The built-in **MCP 配置 · 通用** (*General*) has
+  no MCP servers. Changing the MCP profile restarts that chat's engine, so it is disabled while a
+  reply is in progress.
+- To edit the MCP profiles, click the engine icon at the bottom-left of the composer. That opens the
+  engine's configuration dialog. Use its **🧩 MCP 配置** (*MCP profiles*) tab, which edits the JSON file and
   validates it before saving. The other tabs edit the engine's own files on the machine where the
   chat runs: `.claude` (settings, CLAUDE.md, agents, commands, skills, plugins) or `.codex`
   (config.toml, AGENTS.md, prompts, skills).

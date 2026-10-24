@@ -103,7 +103,7 @@ describe('换组合失败只说一处', () => {
   test('说明随抛出的错误交给渲染端：组合下拉旁的 ✗ + 渲染端发的那一句状态行（describeSwitchFailure）；主进程不再另发一句', () => {
     const h = M.indexOf('const switchMcpComboImpl = async');
     const caught = M.slice(M.indexOf('} catch (err) {', h), M.indexOf('\n  };\n', h));
-    assert.match(caught, /throw new Error\(tr\('Switching to the combo "\{name\}" failed/);
+    assert.match(caught, /throw new Error\(tr\('Switching to the MCP profile "\{name\}" failed/);
     assert.doesNotMatch(caught, /sessionNotice\(/);
     const CA = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.match(CA, /kiroApi\.switchMcpCombo\(sid, comboId\),[\s\S]{0,400}describeSwitchFailure\(sid, 'combo'\)\);/);

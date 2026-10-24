@@ -1484,8 +1484,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
             const opts = defaultComboOptions(projectCombo.info, 'project', t);
             const cur = opts.find((o) => o.selected);
             return (
-              <Submenu label={t('🧩 New-session combo: {name}', { name: cur?.label || t('General purpose') })}>
-                <div className="context-menu-hint" style={{ padding: '4px 12px' }}>{t('Combo for new Claude Code / Codex sessions in this project; existing sessions are not changed')}</div>
+              <Submenu label={t('🧩 New-session MCP profile: {name}', { name: cur?.label || t('General purpose') })}>
+                <div className="context-menu-hint" style={{ padding: '4px 12px' }}>{t('MCP profile for new Claude Code / Codex sessions in this project; existing sessions are not changed')}</div>
                 {opts.map((o) => (
                   <div
                     key={o.value || '(follow)'}

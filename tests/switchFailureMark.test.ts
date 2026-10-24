@@ -65,18 +65,18 @@ test('切换成功：上次的 ✗ 被清掉', async () => {
 
 test('失败提示：带上原因（去掉 Electron 那层前缀），中英两版都有', () => {
   const n = switchFailureNotice('combo', "Error invoking remote method 'acp:switch-mcp-combo': Error: Session open refused by peer", 'zh');
-  assert.equal(n.text, '⚠️ 切换组合失败：Session open refused by peer');
-  assert.equal(n.variants.en, '⚠️ Switching the combo failed: Session open refused by peer');
+  assert.equal(n.text, '⚠️ 切换 MCP 配置失败：Session open refused by peer');
+  assert.equal(n.variants.en, '⚠️ Switching the MCP profile failed: Session open refused by peer');
   assert.equal(switchFailureNotice('model', 'boom', 'en').text, '⚠️ Switching the model failed: boom');
   assert.match(switchFailureNotice('effort', 'boom', 'zh').text, /^⚠️ 切换 effort 失败：boom$/);
   assert.match(switchFailureNotice('mode', 'boom', 'zh').text, /^⚠️ 切换权限模式失败：boom$/);
 });
 
 test('失败提示：主进程的报错本身已经说了「换组合失败」时不再套一层', () => {
-  const raw = 'Switching to the combo "web" failed (ssh died); the previous combo is kept and your next message reconnects with it.';
+  const raw = 'Switching to the MCP profile "web" failed (ssh died); the previous MCP profile is kept and your next message reconnects with it.';
   const n = switchFailureNotice('combo', raw, 'zh');
   assert.equal(n.variants.en, `⚠️ ${raw}`);
-  assert.match(n.variants.zh, /^⚠️ 换组合「web」失败（ssh died），仍用原来的组合/);
+  assert.match(n.variants.zh, /^⚠️ 换 MCP 配置「web」失败（ssh died），仍用原来的 MCP 配置/);
   assert.equal(n.text, n.variants.zh);
 });
 

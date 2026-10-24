@@ -23,11 +23,11 @@ export const ZH_INDEX_A: Record<string, string> = {
   'Error while rebuilding history: {msg}': '重建历史时的报错：{msg}',
   'Rebuilding history {i}/{total} failed, retrying in {s}s': '重建历史 {i}/{total} 失败，{s} 秒后重试',
 
-  // ── index.ts：MCP 组合 / 本地工具通道 / 远程 ──
-  '⚠️ The combo file has an error ({error}), so this time it starts as "General" with no MCP attached.': '⚠️ 组合文件有错（{error}），这次按「通用」起，不挂 MCP。',
-  '⚠️ Combo "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".': '⚠️ 找不到组合「{wanted}」（可能被删了），这次按「{used}」起。',
-  '⚠️ MCP "{mcp}" in combo "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.': '⚠️ 组合「{combo}」的 MCP「{mcp}」缺本机环境变量 {vars}，这次先不挂。',
-  "⚠️ MCP \"{mcp}\" in combo \"{combo}\" can't be forwarded from this machine ({reason}); it is skipped this time.": '⚠️ 组合「{combo}」的 MCP「{mcp}」没法从本机转发（{reason}），这次先不挂。',
+  // ── index.ts：MCP 配置 / 本地工具通道 / 远程 ──
+  '⚠️ The MCP profile file has an error ({error}), so this time it starts as "General" with no MCP attached.': '⚠️ MCP 配置文件有错（{error}），这次按「通用」起，不挂 MCP。',
+  '⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".': '⚠️ 找不到 MCP 配置「{wanted}」（可能被删了），这次按「{used}」起。',
+  '⚠️ MCP "{mcp}" in MCP profile "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.': '⚠️ MCP 配置「{combo}」的 MCP「{mcp}」缺本机环境变量 {vars}，这次先不挂。',
+  "⚠️ MCP \"{mcp}\" in MCP profile \"{combo}\" can't be forwarded from this machine ({reason}); it is skipped this time.": '⚠️ MCP 配置「{combo}」的 MCP「{mcp}」没法从本机转发（{reason}），这次先不挂。',
   "⚠️ MCP \"{mcp}\" in the \"forward from this machine\" list can't be forwarded ({reason}); it is skipped this time.": '⚠️ 设置里「远程会话从本机转发的 MCP」名单中的「{mcp}」没法转发（{reason}），这次先不挂。',
   'missing environment variable(s) {vars}': '缺环境变量 {vars}',
   '✅ The MCP "{name}" forwarded from this machine works again.': '✅ 本机转发的 MCP「{name}」又能用了。',

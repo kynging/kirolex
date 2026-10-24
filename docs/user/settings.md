@@ -83,10 +83,10 @@ S3 backup settings. See [Data and privacy → S3 backup and sync](data-and-priva
 
 ## Settings that live elsewhere
 
-- **Model, agent, combo and Auto / Ask**: per chat, in the composer bar. See
+- **Model, agent, MCP profile and Auto / Ask**: per chat, in the composer bar. See
   [Engines and models](engines-and-models.md) and [Chat](chat.md#tool-approval).
 - **Kiro agent files** (`~/.kiro`): the robot icon next to the agent picker (**Edit agent config (global)**).
-- **Claude Code / Codex files and combos**: the engine icon at the bottom-left of the composer.
+- **Claude Code / Codex files and MCP profiles**: the engine icon at the bottom-left of the composer.
 
 ## Proxy
 

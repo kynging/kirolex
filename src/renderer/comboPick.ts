@@ -24,8 +24,8 @@ export function comboSelectView(
   const id = list?.missing;
   if (id && !list!.combos.some((c) => c.id === id)) {
     const label = list!.error
-      ? t('Combo "{id}" could not be read (the combo file has an error); running as General', { id })
-      : t('Combo "{id}" does not exist on this machine; running as General', { id });
+      ? t('MCP profile "{id}" could not be read (the MCP profile file has an error); running as General', { id })
+      : t('MCP profile "{id}" does not exist on this machine; running as General', { id });
     return { value: id, missing: { id, label } };
   }
   return { value: list?.current || 'default' };
@@ -55,8 +55,8 @@ export function defaultComboOptions(
   const chosen = scope === 'global' ? (info.global || 'default') : (info.project || '');
   const nameOf = (id: string) => info.combos.find((c) => c.id === id)?.name;
   const missingLabel = (id: string) => info.error
-    ? t('Combo "{id}" could not be read (the combo file has an error); new sessions use General', { id })
-    : t('Combo "{id}" does not exist on this machine; new sessions use General', { id });
+    ? t('MCP profile "{id}" could not be read (the MCP profile file has an error); new sessions use General', { id })
+    : t('MCP profile "{id}" does not exist on this machine; new sessions use General', { id });
   const out: DefaultComboOption[] = [];
   if (scope === 'project') {
     /* 全局设的那个本机没有时，「跟随全局」里就写明缺哪个、新会话按通用；内置的 default 不在清单里也算通用 */
@@ -85,5 +85,5 @@ export function comboEffortNote(
   const effort = list?.combos.find((c) => c.id === comboId)?.effort;
   if (!effort || !engineModels) return null;
   if (engineModels.effort && engineModels.effort.options.length > 0) return null;
-  return t('The current model does not support effort, so this combo’s effort ({effort}) is not applied for now', { effort });
+  return t('The current model does not support effort, so this MCP profile’s effort ({effort}) is not applied for now', { effort });
 }

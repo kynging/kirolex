@@ -339,11 +339,11 @@ export interface NotForwarded { name: string; kind: 'http' | 'stdio' }
  */
 export function notForwardedNotice(n: NotForwarded, comboName: string): string {
   return trConcat(
-    tr('⚠️ This remote session does not have MCP "{mcp}" from combo "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 Combos and reopen the session.', { mcp: n.name, combo: comboName }),
+    tr('⚠️ This remote session does not have MCP "{mcp}" from MCP profile "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 MCP profiles and reopen the session.', { mcp: n.name, combo: comboName }),
     NOTE_DETAIL_SEP,
     n.kind === 'http'
-      ? tr('An HTTP MCP in a combo reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.')
-      : tr('A stdio MCP in a combo reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.', { names: FORWARD_BY_NAME.join(' / ') }));
+      ? tr('An HTTP MCP in an MCP profile reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.')
+      : tr('A stdio MCP in an MCP profile reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.', { names: FORWARD_BY_NAME.join(' / ') }));
 }
 
 /**
@@ -420,7 +420,7 @@ export function adapterForwardPlan(input: {
   for (const item of input.list) {
     const inCombo = input.comboServers?.[item.name];
     if (inCombo) {
-      if (inCombo.disabled) skipped.push({ name: item.name, origin: 'list', reason: tr('it is turned off in the current combo') });
+      if (inCombo.disabled) skipped.push({ name: item.name, origin: 'list', reason: tr('it is turned off in the current MCP profile') });
       continue;
     }
     if (entries.some((e) => e.name === item.name)) continue;

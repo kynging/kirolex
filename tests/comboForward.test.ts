@@ -139,7 +139,7 @@ describe('接线（源码扫描）', () => {
     const caught = handler.slice(handler.indexOf('} catch (err) {'));
     assert.match(caught, /if \(toolsSwapped && sessionClients\.get\(sessionId\) === oldEntry\) \{\s*void detachExecutor\(sessionId\);/);
     /* 同一次失败只说一处：说明（仍用原组合、下一条消息重新连接）随抛出的错误给界面（组合下拉旁的 ✗），不另发状态行 */
-    assert.match(caught, /throw new Error\(tr\('Switching to the combo "\{name\}" failed \(\{err\}\); the previous combo is kept and your next message reconnects with it\.'/);
+    assert.match(caught, /throw new Error\(tr\('Switching to the MCP profile "\{name\}" failed \(\{err\}\); the previous MCP profile is kept and your next message reconnects with it\.'/);
     assert.doesNotMatch(caught, /sessionNotice\(sessionId, /);
     assert.match(caught, /throw err;/);
     /* 失败时记录不能被改成新组合：写记录只在成功那段（catch 之前） */
