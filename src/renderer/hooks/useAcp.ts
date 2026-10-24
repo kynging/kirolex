@@ -66,6 +66,7 @@ import { planTextOf } from '../permissionButtons.ts';
 import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
 import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
+import { withoutPermissionCard } from '../permissionCards';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -930,6 +931,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       showLiveNotes(sid, held);
     }
   };
+  /**
+   * 这一轮结束 / 被停止：还挂着的权限卡片收掉（审计 2.1）—— 它答的那个请求已经没人等了。
+   * 只在这一轮真的结束了才收（`removeStreaming` 把流转给了接手的那一轮时不收：卡片可能是那一轮的）。
+   * 不放进 `removeStreaming` 本身：「上一轮还在收尾、这条没发出去」那条也调它，那时上一轮可能正等你批准。
+   */
+  const dropPermissionCardIfEnded = (sid: string | null) => {
+    if (!sid || streamingIdsRef.current.has(sid)) return;
+    setPermissionRequests((current) => withoutPermissionCard(current, sid));
+  };
   /** 流式输出期间到达的 KiroLex 提示，按会话攒着，这一轮结束再插（`removeStreaming`） */
   const heldNotesRef = useRef<Map<string, Message[]>>(new Map());
   /** 把几条 KiroLex 提示插进那条会话的消息列表（判据在 `noticeMerge.withLiveNote`：重复的、没读过历史的不插） */
@@ -1049,6 +1059,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (!sid || activePromptTokenRef.current.get(sid) !== token) return;
     activePromptTokenRef.current.delete(sid);
     removeStreaming(sid);
+    dropPermissionCardIfEnded(sid);
     maybeAutoTitle(sid);
   };
 
@@ -2874,6 +2885,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // main's "no longer a turn" is the only signal that can release the stream.
       if (onBusyChange({ pending: handoffAdoptRef.current, adopted: adoptedTurnsRef.current }, sid, reason).endAdopted) {
         removeStreaming(sid);
+        dropPermissionCardIfEnded(sid);
         if (activityMapRef.current.get(sid)?.includes('已接回') || activityMapRef.current.get(sid)?.includes('reattached')) setSessionActivity(sid, null);
       }
       setBusyBySession((prev) => {
@@ -3075,6 +3087,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (sid) {
         const wasStreaming = streamingIdsRef.current.has(sid);
         streamingIdsRef.current.delete(sid);
+        /* 执行器没了：它问的那个权限再也答不了，卡片收掉（审计 2.1） */
+        setPermissionRequests((current) => withoutPermissionCard(current, sid));
         removeAttached(sid); // executor gone -> dormant
         clearConnecting(sid);
         // BLOCKED, not aborted: the executor died under the loop. Recording this as
@@ -4586,6 +4600,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       await window.kiroApi.cancel(sessionId, modelForSession(sessionId), true);
     } catch {}
     removeStreaming(sessionId);
+    dropPermissionCardIfEnded(sessionId);
   }, [endLoop]);
 
   const rerunFromMessage = useCallback(async (messageId: string, editedText: string, override?: RerunOverride, targetSid?: string) => {
@@ -4603,6 +4618,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         await window.kiroApi.cancel(sid, modelForSession(sid), true);
       } catch { /* best-effort; truncation + resend still discards it */ }
       removeStreaming(sid);
+      dropPermissionCardIfEnded(sid);
     }
 
     const current = messagesCacheRef.current.get(sid) || [];
@@ -4959,6 +4975,7 @@ ${text}`,
         options?.suppressInterruptionNotice,
       );
       removeStreaming(sessionForCancel);
+      dropPermissionCardIfEnded(sessionForCancel);
       // Put the interrupted turn's prompt back in the composer (including any
       // same-turn steers, which are merged into the one user bubble), and mark
       // that user message so the next submit OVERWRITES (reruns) this turn.

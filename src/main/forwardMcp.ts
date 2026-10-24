@@ -31,7 +31,8 @@ import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { expandEnvRefs as expandComboEnv, type McpComboServer } from './mcpCombos.ts';
-import { tr } from './uiText.ts';
+import { tr, trConcat } from './uiText.ts';
+import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
 
 /**
  * 按名字就该转发的那些 —— 它们的意义就是"操作我这台机器"。
@@ -274,12 +275,15 @@ const TUNNEL_NAME = /^[\w.-]{1,40}$/;
  * 头和 env 里的 `${env:…}` 在这里按传进来的环境（登录 shell 的）展开，和本地会话挂组合同一个口径；
  * 缺变量的那条跳过。名字要能放进隧道 URL、不能和 `kirolex-local` 撞，不然也跳过。
  * 跳过的都记进 `skipped`，由调用方在会话里说一句。
+ * 没被挑中（http 没标、stdio 不是本机路径也不在白名单）的记进 `notForwarded`（审计 4.1）：远程会话里就是少了它，
+ * 原来不说一声；调用方按会话、按名字只说一次（`notForwardedNotice`）。
  */
 export function forwardableFromCombo(
   servers: Record<string, McpComboServer>, env: Record<string, string | undefined>,
-): { entries: ForwardEntry[]; skipped: Array<{ name: string; missing?: string[]; reason?: string }> } {
+): { entries: ForwardEntry[]; skipped: Array<{ name: string; missing?: string[]; reason?: string }>; notForwarded: NotForwarded[] } {
   const entries: ForwardEntry[] = [];
   const skipped: Array<{ name: string; missing?: string[]; reason?: string }> = [];
+  const notForwarded: NotForwarded[] = [];
   const expand = (m: Record<string, string> | undefined, missing: string[]): Record<string, string> => {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(m || {})) {
@@ -296,7 +300,11 @@ export function forwardableFromCombo(
     const pick = isHttp
       ? !!s.forwardFromLocal
       : !!command && (!!s.forwardFromLocal || FORWARD_BY_NAME.includes(name) || isLocalPathCommand(command));
-    if (!pick) continue;
+    if (!pick) {
+      /* 既没 url 也没 command 的不是一个能起的 MCP，不算「没带上」 */
+      if (isHttp || command) notForwarded.push({ name, kind: isHttp ? 'http' : 'stdio' });
+      continue;
+    }
     if (!TUNNEL_NAME.test(name)) {
       skipped.push({ name, reason: tr('Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL') });
       continue;
@@ -319,7 +327,23 @@ export function forwardableFromCombo(
       entries.push({ name, command, args: Array.isArray(s.args) ? s.args.map(String) : [], ...(childEnv ? { env: childEnv } : {}) });
     }
   }
-  return { entries, skipped };
+  return { entries, skipped, notForwarded };
+}
+
+/** 组合里没带进远程会话的那条：http 型没标 `forwardFromLocal`；stdio 型不是本机路径、不在 `FORWARD_BY_NAME`，也没标。 */
+export interface NotForwarded { name: string; kind: 'http' | 'stdio' }
+
+/**
+ * 那一句（写法按 docs/notices-glossary.md：主句 = 没带上谁 + 怎么改；为什么放「详情」）。
+ * 进对话记录 —— 模型这条会话里就是少了这个工具，影响结果。
+ */
+export function notForwardedNotice(n: NotForwarded, comboName: string): string {
+  return trConcat(
+    tr('⚠️ This remote session does not have MCP "{mcp}" from combo "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 Combos and reopen the session.', { mcp: n.name, combo: comboName }),
+    NOTE_DETAIL_SEP,
+    n.kind === 'http'
+      ? tr('An HTTP MCP in a combo reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.')
+      : tr('A stdio MCP in a combo reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.', { names: FORWARD_BY_NAME.join(' / ') }));
 }
 
 /**
@@ -383,7 +407,7 @@ export function adapterForwardPlan(input: {
   list: ForwardListItem[];
   sources: McpDefSource[];
   env: Record<string, string | undefined>;
-}): { entries: ForwardEntry[]; skipped: AdapterForwardSkip[]; fromCombo: string[]; fromList: string[] } {
+}): { entries: ForwardEntry[]; skipped: AdapterForwardSkip[]; fromCombo: string[]; fromList: string[]; notForwarded: NotForwarded[] } {
   const listed = new Map(input.list.map((it) => [it.name, it]));
   const combo: Record<string, McpComboServer> = {};
   for (const [name, s] of Object.entries(input.comboServers || {})) {
@@ -427,5 +451,5 @@ export function adapterForwardPlan(input: {
     fromList.push(item.name);
   }
   const listOnly = new Set(fromList);
-  return { entries, skipped, fromCombo: entries.filter((e) => !listOnly.has(e.name)).map((e) => e.name), fromList };
+  return { entries, skipped, fromCombo: entries.filter((e) => !listOnly.has(e.name)).map((e) => e.name), fromList, notForwarded: fromCombo.notForwarded };
 }

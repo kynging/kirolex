@@ -37,8 +37,10 @@ export const ZH_MODULES_B: Record<string, string> = {
   'This engine did not provide permission modes': '这个引擎没有给出 权限模式',
   'This engine did not provide effort options': '这个引擎没有给出 effort 选项',
   'This engine does not have a Plan mode': '这个引擎没有 Plan 模式',
-  '{engine} sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.':
-    '{engine} 发来一个 KiroLex 不认识的请求 `{method}`，已回空对象 {} —— 如果它是在"问你"，那这一轮是按一个没人给过的答案继续跑的。请把这条报给 KiroLex。',
+  '⚠️ {engine} sent a request KiroLex does not know (`{method}`) and got an empty answer; please report this to KiroLex.':
+    '⚠️ {engine} 发来 KiroLex 不认识的请求（`{method}`），已回了空答案；请把这条报给 KiroLex。',
+  'If it was asking you something, this turn went on with an answer nobody gave.':
+    '如果它是在问你，这一轮是按一个没人给过的答案继续跑的。',
   // ── aiLogin.ts ──
   'Claude Code is not installed': '没装 Claude Code',
   'Could not get the login status': '问不到登录状态',
@@ -74,6 +76,12 @@ export const ZH_MODULES_B: Record<string, string> = {
   '⚠️ The MCP "{name}" forwarded from this machine is unavailable: {msg}. Fix the local config and reopen the session.': '⚠️ 本机转发的 MCP「{name}」暂时用不了：{msg}。改好本机配置后重开会话。',
   'Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL': '名字只能用字母、数字、_ . -（最多 40 个），否则放不进转发地址',
   'Clashes with the local tool channel kirolex-local': '和本地工具通道 kirolex-local 重名',
+  '⚠️ This remote session does not have MCP "{mcp}" from combo "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 Combos and reopen the session.':
+    '⚠️ 这条远程会话没带上组合「{combo}」的 MCP「{mcp}」。要用的话在「🧩 组合」里给它加上 "forwardFromLocal": true，再重新打开会话。',
+  'An HTTP MCP in a combo reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.':
+    '组合里的 HTTP 型 MCP 只有标了 forwardFromLocal 才会带进远程会话（由本机代发请求）；把名字加进设置里「从本机转发」的名单也行。',
+  'A stdio MCP in a combo reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.':
+    '组合里的 stdio 型 MCP 只有在本机起、经隧道转发时才会带进远程会话：命令是本机路径、名字是 {names} 之一，或者标了 forwardFromLocal。',
   'it is turned off in the current combo': '当前组合里把它关掉了',
   'no definition for it in the local Kiro agent files or ~/.kiro/settings/mcp.json': '本机的 Kiro agent 文件和 ~/.kiro/settings/mcp.json 里都没有它的定义',
   'it is disabled in {from}': '它在 {from} 里是关掉的',

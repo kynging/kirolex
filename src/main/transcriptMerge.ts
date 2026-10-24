@@ -151,6 +151,9 @@ export function mergeRecords(local: any, remote: any): any {
   /* 这台机器的东西不许被另一台的覆盖 */
   if ('cliSessionId' in local) out.cliSessionId = local.cliSessionId;
   else delete out.cliSessionId;
+  /* 它旁边那笔「属于哪个引擎 / 哪台机器」（`cliSessionOwner.ts`）跟着 id 走 */
+  if ('cliSessionOwner' in local) out.cliSessionOwner = local.cliSessionOwner;
+  else delete out.cliSessionOwner;
   out.executorState = 'detached';   // 刚合并完，谁也没连着
   /* 合并本身是一次改动 */
   out.updatedAt = Math.max(Number(local.updatedAt) || 0, Number(remote.updatedAt) || 0, Date.now());

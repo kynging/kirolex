@@ -7,9 +7,9 @@ Codex（`@agentclientprotocol/codex-acp`）测得少。这份文档把这两种�
 - **状态**一栏只有四种写法：**已修**（本次改了代码，配了测试）/ **未修**（确认有问题，但改动面大或要先拍板，写了原因）/
   **待实测**（读代码看到风险，但取决于适配器的真实行为，本机没装适配器、没法验证）/ **已查，无问题**。
 - 行号是本次提交后的行号（会漂；函数名可以直接 grep）。
-- 已修的每一条都在 `tests/engineAuditFixes.test.ts`（A1–A8）/ `tests/engineAuditFixes2.test.ts`（A4b、A9–A13）/ `tests/engineAuditFixes3.test.ts`（A14、A15）（后两份是审查后补的）里有对应的 `A<n>` 用例：在修复前的代码上全部失败，修复后通过；
+- 已修的每一条都在 `tests/engineAuditFixes.test.ts`（A1–A8）/ `tests/engineAuditFixes2.test.ts`（A4b、A9–A13）/ `tests/engineAuditFixes3.test.ts`（A14、A15）（后两份是审查后补的）里有对应的 `A<n>` 用例；第四轮（原来标「未修」的 1.1 / 1.2 / 2.1 / 2.4 / 2.5 / 4.1 / 5.1，记作 B1–B6）在 `tests/engineAuditFixes4.test.ts`：在修复前的代码上全部失败，修复后通过；
   另有几条「kiro 行为不变」的用例，修复前后都通过（守的是「没顺手改 kiro」）。
-- 修复都只对 `engine !== 'kiro'` 生效，kiro-cli 的现有行为一处没动。
+- A 系列修复都只对 `engine !== 'kiro'` 生效，kiro-cli 的现有行为一处没动。B 系列里引擎无关的几条（B1 换过引擎 / 机器后不拿别人家的 id 去 load、B2 渲染层收卡片、B3、B4 的文案）对 kiro 会话同样生效；B1 只在记录里那笔「属于谁」算数且对不上时才跳过 load，kiro 会话没换过引擎 / 机器时 attach 一步不变。
 
 ## 总表（按严重程度）
 
@@ -31,6 +31,7 @@ Codex（`@agentclientprotocol/codex-acp`）测得少。这份文档把这两种�
 | U5 | 斜杠命令菜单对 Claude/Codex 是空的（只认 kiro 的 `_kiro.dev/commands/available`，没接 ACP 标准的 `available_commands_update`） | 中低 | 已修（A11） |
 | A12（原 3.1） | 适配器一起来就退出时只报退出码，stderr 里的原因没进界面 | 中 | 已修 |
 | A13（原 3.4） | 远程 Claude/Codex 会话照样去远端问 kiro 的模型清单 | 低 | 已修 |
+| B1–B6（原 1.1 / 1.2 / 2.1 / 2.4 / 2.5 / 4.1 / 5.1） | 换引擎 / 机器后拿旧 id 去 load；权限卡片残留；等待时长串会话；未知请求提示写死 kiro-cli；组合里的 MCP 没带进远程会话不说；控制入口 auto 发给不能 steer 的会话 | 低 / 低中 | 已修 |
 | 其余 | 见各节 | 低 | 未修（写了原因）/ 待实测 |
 
 ---
@@ -47,8 +48,8 @@ kiro-cli **不持久化** ACP 会话（`loadSessionImpl` 注释里的实测：`s
 | A2 | `index.ts:694` `swapSessionModel`；调用点 `:7675`（连着空回复）、`:7711`（模型不可用）、`:1724`（重建历史） | Claude/Codex 一轮连着 ≥2 次笼统 `Internal error`（适配器对 API 异常就回 -32603）且没产出 | 断开适配器、按 kiro 的 `MODEL_FALLBACK_ORDER` 重起（适配器不认 `--model`，等于原样重起），把 kiro 的模型 id 和 `modelEarnedOn` 写进 Claude 会话的记录，把 `default` 记成死模型，跑 kiro 的 `--list-models` 检查（远端没 kiro-cli 时还会失败），并在对话里写一句「已把模型从 default 换成 …」——都是假的 | 这条 kiro 专有的恢复对另外两家不走 | 中高 | **已修**：两处条件先判 `engineOf(...) === 'kiro'`，`swapSessionModel` 对非 kiro 直接 `return null`。测试 A2 |
 | A3 | `src/main/staleSession.ts` `staleVerdict`；调用 `index.ts:7864` | Claude/Codex 会话重启 / 重连过（pid 变了）后，一轮回了一次笼统 `Internal error` | 「pid 不一致 → 这个 id 在新进程里没有上下文」→ 换新后端会话：适配器里那段真实存在的历史被扔掉，靠快照随行补（有损），提示词还说是「kiro-cli 不持久化」 | 只报错；连着坏两次（`consecutiveFailures`）那条照旧换 | 中 | **已修**：`StaleInput.persistentBackend`（`backendPersistsSessions(engine)`）为真时跳过 pid 判据。测试 A3 |
 | A4 | `index.ts:1228` `contextEstablished`、`:11325` attach 时的判据 | Claude/Codex 会话重启 app、被 LRU 回收后再打开、ssh 断线恢复 —— `session/load` 成功 | 「上下文已建立」标记要求 pid 相同，新进程必然不同 → 下一条消息前面带一份最多 1.8 万字的历史快照（`primeMode='full'` 时还会逐段重建），而适配器已经 load 回了全部历史：上下文重复、白花 token、模型可能把旧问题再答一遍 | 适配器只认后端会话 id：同一个 id load 成功就算建立 | 中 | **已修**：纯判据 `contextMarkerHolds`（`engines.ts`）——kiro 仍要求同 id 同 pid，适配器同 id 即可；两处判据都走它。**补（审查意见 1）**：新会话第一轮成功结束原来不写标记，只聊一轮就重启时适配器 load 回了历史，判据仍找不到标记、照样带快照 —— 现在 Claude/Codex 一轮开始时后端已握着全部历史（之前的标记仍算数，或盘上还一条都没有）就在这一轮成功结束时记标记（`backendHeldAtTurnStart`，`index.ts` 发送前的 `heldBackendAtStart`；一轮中后端会话换了 id 不记）。kiro 不走这条。测试 A4、A4b（按主进程顺序走「第一轮完成 → 重启 → load 成功 → 发送」） |
-| 1.1 | `index.ts:9893` `switchEngineImpl`（休眠分支）、`:11271` `cliSessionId = existing?.cliSessionId \|\| sessionId` | 会话没连着时换引擎（kiro→claude 等），再打开 | 记录里留着旧引擎的 `cliSessionId`，新引擎拿它去 `session/load`。适配器回 `Resource not found` 就立刻退回新建（白一次请求）；换成 kiro 时它对陌生 id 的回答没实测，最坏两次 `RESUME_TIMEOUT_MS`（20–90 s）才退回 | 换引擎后直接 `session/new` | 低 | 未修：清掉 `cliSessionId` 后 attach 会退到「用 KiroLex id 去 load」那条老兼容路，效果一样，要改 attach 的兜底，牵涉 kiro，不在本次范围 |
-| 1.2 | `index.ts` `applySessionTarget`（休眠分支） | 没连着的 Claude/Codex 会话换运行位置（本机↔远程） | 同上：拿另一台机器上的会话 id 去 load，白一次请求后退回新建 + 快照随行 | 同上 | 低 | 未修（同 1.1） |
+| 1.1 | `index.ts:9893` `switchEngineImpl`（休眠分支）、`:11271` `cliSessionId = existing?.cliSessionId \|\| sessionId` | 会话没连着时换引擎（kiro→claude 等），再打开 | 记录里留着旧引擎的 `cliSessionId`，新引擎拿它去 `session/load`。适配器回 `Resource not found` 就立刻退回新建（白一次请求）；换成 kiro 时它对陌生 id 的回答没实测，最坏两次 `RESUME_TIMEOUT_MS`（20–90 s）才退回 | 换引擎后直接 `session/new` | 低 | **已修（B1）**：记录里给 `cliSessionId` 旁边记一笔 `cliSessionOwner = { id, engine, machine }`（`src/main/cliSessionOwner.ts`；写 id 的 11 处都跟着记，S3 合并时跟着本地的 id 走）。没连着时换引擎，改 profile 之前先按旧 profile 记下（`pinCliSessionOwnerBeforeRetarget`）；attach 时这笔算数（`id` 就是当前这个）且引擎对不上 → 不 load，直接 `session/new` + 标成欠上下文（快照随下一条）。没记过的老记录判不出来，照旧走 load —— KiroLex id 那条老兼容路一行没动。三种引擎都按这笔判（换成 kiro 时省掉的正是那 20–90 s） | |
+| 1.2 | `index.ts` `applySessionTarget`（休眠分支） | 没连着的 Claude/Codex 会话换运行位置（本机↔远程） | 同上：拿另一台机器上的会话 id 去 load，白一次请求后退回新建 + 快照随行 | 同上 | 低 | **已修（B1）**：同 1.1，`applySessionTarget` 休眠分支改 `remote` 之前先记下；attach 时机器（`sshHost:端口`，端口缺省 22；本机是 `local`）对不上就直接新建 | |
 | 1.3 | `index.ts:5053` `wireSession` 里 `engineOptionsReady` 不被等待 | 刚连上就发第一条 | `sendPromptOnce` 不等 `applyEngineModel`，第一轮可能跑在适配器默认模式上（忙时切换那条 `runPendingSwitches` 是等的） | 第一轮前设好 | 低 | 待实测（适配器设选项很快，窗口很小） |
 | 1.4 | 换组合（`switchMcpComboImpl`） | Claude/Codex 换 MCP 组合 | 起新进程后 `session/new`，扔掉适配器里持久化的会话，靠快照补 | 带新 `mcpServers` 去 `session/load` 也许能保住原历史 | 低 | 未修（设计取舍，要实测 load 时换 MCP 是否生效） |
 | 1.5 | `index.ts:7135` ride-along 判据（**引擎无关**） | 任何引擎的新会话发第二条 | 读代码看：新会话第一轮正常跑完后没有任何地方打「上下文已建立」标记，第二条会带上第一轮的快照 | 不带 | — | 待实测（影响 kiro，不在本次范围；看日志里新会话第二条有没有 `context RIDE-ALONG`） |
@@ -65,11 +66,11 @@ kiro-cli **不持久化** ACP 会话（`loadSessionImpl` 注释里的实测：`s
 |---|---|---|---|---|---|---|
 | A6 | `src/main/acp-client.ts:621` `cancelPrompt` | Claude/Codex 有权限请求在等（它们永远是 ask；Codex 默认就问，Claude 非 bypass 模式也问），用户点停止 / 看门狗取消 | 只发 `session/cancel`，挂着的 `session/request_permission` 不回答。ACP 规定客户端此时**必须**答 `cancelled`；适配器那一轮等着这个回答，停止按钮等到 10 s 超时，这一轮继续占着「忙」 | 发 cancel 的同时把挂着的每个请求答成 `cancelled` | 中高 | **已修**：非 kiro 在 `cancelPrompt` 里逐个答 `cancelled` 并清掉；kiro 原样。测试 A6 |
 | A7 | `index.ts:7420` 看门狗；`permissionWaitStartedAt`（`:5277`）只记日志，看门狗不读 | Claude/Codex 的权限请求超过 `WEDGE_CONFIRM_MS`（默认 600 s）没人点 | 被判卡死 → `session/cancel` → 自动发 `WEDGE_CONTINUE_PROMPT` 续一轮 → 通常又来问一次 | 等人的时候不计静默 | 中 | **已修**：`AcpClient.awaitingPermission`；非 kiro 有请求在等时把 `lastStreamAt` 往后推、不打断。kiro 的 ask 模式有同样的问题，按「不改 kiro 行为」没动。测试 A7 |
-| 2.1 | `src/renderer/hooks/useAcp.ts:2450` 设权限卡片，只在点了之后清 | 一轮结束 / 停止 / 断线时还有卡片 | 卡片留在屏幕上，`awaitingPermission` 一直为真（影响空闲提醒），点它答的是一个已经作废的请求 id | 轮次结束 / 断线时清掉 | 低 | 未修（引擎无关，kiro 的 ask 模式同样如此；A6 修好后点旧卡片只是答一个没人等的 id，无害） |
+| 2.1 | `src/renderer/hooks/useAcp.ts:2450` 设权限卡片，只在点了之后清 | 一轮结束 / 停止 / 断线时还有卡片 | 卡片留在屏幕上，`awaitingPermission` 一直为真（影响空闲提醒），点它答的是一个已经作废的请求 id | 轮次结束 / 断线时清掉 | 低 | **已修（B2）**：渲染层 `permissionCards.ts` 的 `withoutPermissionCard`；`useAcp.ts` 在这一轮结束（`finishStreamingTurn`、接手的那一轮结束）、停止（`cancelPrompt` / `stopLoop` / 重跑前取消）时收掉（流转给接手的那一轮时不收），断线时直接收；`removeStreaming` 本身不收（「上一轮还在收尾、这条没发出去」也调它）。主进程 `AcpClient`：Claude Code / Codex 最后一个在途 `session/prompt` 结束时清掉挂着的请求，`awaitingPermission` 复位（还有别的 prompt 在途时不清；kiro 不变） | |
 | 2.2 | `useAcp.ts:2450` 每会话只存一个权限请求 | Claude 子代理 / Codex 并行执行同时来问 | 后来的覆盖先来的，先来的那个永远没人答，那一轮挂住 | 每会话一个列表 | 中 | 待实测（不确定两个适配器会不会并发发权限请求） |
 | 2.3 | `index.ts:5167` 工具状态缺省成 `pending` | `tool_call_update` 不带 `status`（Claude 常见） | 落盘的状态退回 `pending`；如果发生在 `completed` 之后，这个调用会被重新算作「开着」（日志多一行 start，看门狗按工具上限多等） | 缺省沿用上一次的状态 | 低 | 待实测（没确认适配器会在完成后再发无 status 的更新） |
-| 2.4 | `index.ts:5277` `permissionWaitStartedAt` 按 JSON-RPC 请求 id 全局记 | 两条会话的适配器各自从 0 开始编 id | 等待时长日志可能串（只影响日志里的 waited=…） | 按会话 + id 记 | 低 | 未修（只影响日志） |
-| 2.5 | `acp-client.ts:956` 未知请求的提示 | 适配器发来 KiroLex 不认识的请求 | 提示文字写死「kiro-cli sent an unknown request」 | 说对是哪个引擎 | 低 | 未修（只是措辞；按要求不改提示文案） |
+| 2.4 | `index.ts:5277` `permissionWaitStartedAt` 按 JSON-RPC 请求 id 全局记 | 两条会话的适配器各自从 0 开始编 id | 等待时长日志可能串（只影响日志里的 waited=…） | 按会话 + id 记 | 低 | **已修（B3）**：键改成 `permissionWaitKey(会话 id, 请求 id)`，记和取用同一个 | |
+| 2.5 | `acp-client.ts:956` 未知请求的提示 | 适配器发来 KiroLex 不认识的请求 | 提示文字写死「kiro-cli sent an unknown request」 | 说对是哪个引擎 | 低 | **已修（B4）**：引擎名按会话的引擎说（`cliName`：kiro-cli / Claude Code / Codex）；文案按 `docs/notices-glossary.md` 改成「⚠️ 主句（谁发了什么、已回空答案、请报给 KiroLex）+ 详情（如果它在问你，这一轮按没人给过的答案继续了）」；原来 `acp:error` 渲染层只打控制台，现在另外记进那条会话的对话记录（group `unknown-request:<方法>`） | |
 
 **已查，无问题**：
 - 流式：`agent_message_chunk` 累积 / 一轮结束才落盘、`usage_update`（两个适配器都发，喂上下文百分比，`useAcp.ts`）、`isReplayOutsideTurn`（只丢一轮之外的正文块，不影响适配器在 `session/new` 后推的命令表等）、`noticeForStopReason` / 空回复提示。
@@ -101,7 +102,7 @@ Windows 上 `resolveAdapter` 找不到包时给的是能照着做的那句。
 | # | 文件:行号 | 触发条件 | 实际表现 | 该有的表现 | 严重 | 状态 |
 |---|---|---|---|---|---|---|
 | U4 | `index.ts:7307-7330` `sendPromptOnce` 给每一轮前面拼目录说明 / 远程运行环境 / 记忆块 | Claude/Codex 会话里发 `/compact`（上下文用量菜单里就有，`App.tsx:3088`）或 `/clear` | 第一个文本块不是 `/compact` 而是 `<hidden>…` / `[文件位置]…`；适配器多半只在 prompt 以 `/` 开头时当命令，于是当普通文字发给模型，什么都没压缩 / 清空 | 斜杠命令原样送到 | 中 | 待实测（本机没装适配器；kiro 对同样的拼接怎么处理也没验证） |
-| 4.1 | `src/main/forwardMcp.ts:245` `forwardableFromCombo` | 远程 Claude/Codex 会话用一个本机能用的组合，其中 http server 没标 `forwardFromLocal`、stdio server 不是本机路径也不在白名单 | 静默跳过，不进 `skipped`，没有提示；模型就是少了这个工具 | 说一声为什么没带上 | 低中 | 未修（代码注释说是有意为之，提示要新文案） |
+| 4.1 | `src/main/forwardMcp.ts:245` `forwardableFromCombo` | 远程 Claude/Codex 会话用一个本机能用的组合，其中 http server 没标 `forwardFromLocal`、stdio server 不是本机路径也不在白名单 | 静默跳过，不进 `skipped`，没有提示；模型就是少了这个工具 | 说一声为什么没带上 | 低中 | **已修（B5）**：`forwardableFromCombo` / `adapterForwardPlan` 多返回 `notForwarded`（http 没标 / stdio 不是本机路径也不在白名单；关掉的、既没 url 也没 command 的不算；设置名单里点了名的算标了）。远程 Claude/Codex 那条分支对每个说一句 `notForwardedNotice`：主句「这条远程会话没带上组合「X」的 MCP「Y」，要用就加 `forwardFromLocal: true` 再重新打开」，为什么放详情；进对话记录，同一会话同一个只说一次（说成了才记） | |
 | 4.2 | `acp-client.ts:443` initialize 结果不看 | 某个适配器版本没声明 `mcpCapabilities.http` | 照样发 `type: 'http'` 的 `kirolex-local`；按规范对方可以拒绝 `session/new` 或忽略，后台任务 / 浏览器 / 本地文件工具没了也没提示 | 看能力再发，或者说一声 | 低 | 待实测（现有注释说两个适配器都声明了） |
 | 4.3 | `src/main/memory.ts:214-255`、`src/main/remoteContext.ts` | Claude Code 会话 | 提示词里写的工具名是 `local_write` 等，Claude Code 里实际叫 `mcp__kirolex-local__local_write`；`remoteContext.ts` 还提到 kiro 的 `fs_write` | 按引擎写准 | 低 | 待实测（模型通常能对上，没观察到失败） |
 
@@ -117,7 +118,7 @@ Windows 上 `resolveAdapter` 找不到包时给的是能照着做的那句。
 | # | 文件:行号 | 触发条件 | 实际表现 | 该有的表现 | 严重 | 状态 |
 |---|---|---|---|---|---|---|
 | — | `POST /sessions/:id/new-backend` → `swapBackendSessionWhenIdle` → `recreateBackendSession` | 对 Claude/Codex 会话换新后端 | 新后端丢了模型 / effort / 模式 | — | 高 | **已修**（即 A1） |
-| 5.1 | `src/renderer/App.tsx:3350` `handleControlSend` → `steerRoute.enterRoute` | 外部调用方 `mode: 'auto'` 往一条正在跑的 Claude/Codex 会话发消息 | 和在输入框按 Enter 一样走 steer → 被拒 `unsupported` → 标红等人点「作为下一条发送」；调用方拿到 `{routed:'steer', steerFailed:'unsupported'}`，消息不丢但要人手处理 | 自动调用方可能更想要「排进队列」 | 低 | 未修（和 AGENTS.md §4.2「Enter 永远 steer」的既定语义一致，要不要对控制入口例外需要拍板） |
+| 5.1 | `src/renderer/App.tsx:3350` `handleControlSend` → `steerRoute.enterRoute` | 外部调用方 `mode: 'auto'` 往一条正在跑的 Claude/Codex 会话发消息 | 和在输入框按 Enter 一样走 steer → 被拒 `unsupported` → 标红等人点「作为下一条发送」；调用方拿到 `{routed:'steer', steerFailed:'unsupported'}`，消息不丢但要人手处理 | 自动调用方可能更想要「排进队列」 | 低 | **已修（B6，d0a22e82 之后已是这样，本次只补测试）**：`handleControlSend` 用 `busyEnterKind(engine, busyEnter)` 算 `canSteer`，不能 steer 的引擎在跑一轮时 `enterRoute` 直接给 `queue` → `handleQueueMessage` 排进 KiroLex 队列（队尾，这一轮结束后作为下一条发出），立刻回 `{routed:'queued'}`；先试了 steer 才被拒 `unsupported` 的也走 `queueAsNext`、回 `queued`，不标红。输入框按 Enter 的语义没变 | |
 
 **已查，无问题**：`controlSessions.ts` 的 list / status / tail 不看引擎，读的是 KiroLex 自己的记录和 transcript；`newBackend` 按 id 现取 entry（除 A1 外无引擎相关逻辑）；
 `busySessions.collectBusySessions` 引擎无关；`src/renderer/sessionRequestStatus.ts` 的忙 / 失败原因按会话记，Claude/Codex 的模型 / 组合下拉都经它（`docs/session-isolation-audit.md` §1 那次修的），本次复核无问题。
@@ -152,6 +153,12 @@ Windows 上 `resolveAdapter` 找不到包时给的是能照着做的那句。
 | A12 | `acp-client.ts` `adapterExitDetail`，只拼在非 kiro 的退出码后面 | `engineAuditFixes2`「A12 …」 |
 | A13 | `App.tsx` `modelsFor` 远程分支先看引擎 | `engineAuditFixes2`「A13 …」 |
 | A11 | 新文件 `src/main/acpCommands.ts`；`index.ts` `wireSession` 换形状 | `engineAuditFixes2`「A11 …」 |
+| B1 | 新文件 `src/main/cliSessionOwner.ts`；`sessionStore.ts` 记录加 `cliSessionOwner`；`index.ts` 写 id 处 `stampCliSessionOwner`、两条休眠分支 `pinCliSessionOwnerBeforeRetarget`、attach `cliSessionOwnerMismatch`；`transcriptMerge.ts` 保留本地那笔 | `engineAuditFixes4`「1.1 / 1.2 …」 |
+| B2 | 新文件 `src/renderer/permissionCards.ts`；`useAcp.ts` `dropPermissionCardIfEnded` + 断线；`acp-client.ts` 最后一轮结束清 `pendingPermissions`（非 kiro） | `engineAuditFixes4`「2.1 …」（真 `AcpClient`，含 kiro 不变） |
+| B3 | `index.ts` `permissionWaitKey` | `engineAuditFixes4`「2.4 …」 |
+| B4 | `acp-client.ts` 未知请求文案；`index.ts` `client.on('error')` 记进对话记录；中文表 | `engineAuditFixes4`「2.5 …」 |
+| B5 | `forwardMcp.ts` `notForwarded` / `notForwardedNotice`；`index.ts` 非 kiro 远程分支按会话只说一次；中文表 | `engineAuditFixes4`「4.1 …」 |
+| B6 | 无代码改动（已是这样） | `engineAuditFixes4`「5.1 …」 |
 | A8 | `engines.ts` 新增 `isAuthRequiredError` / `adapterAuthMessage` / `adapterMissingMessage`；`acp-client.ts` 请求错误和 spawn ENOENT 两处换成能照着做的那句；中文表 `uiTextZh/modulesB.ts` 补一条 | 「A8 …」纯函数 + 真 `AcpClient`（含 kiro 不变） |
 
 ## 截图（模拟数据）
@@ -172,4 +179,4 @@ Windows 上 `resolveAdapter` 找不到包时给的是能照着做的那句。
 
 1. **辅助小任务要不要改用会话自己的引擎跑**（A14 现在是「跳过并说一声」）：改的话每个标题 / 追问建议 / 记忆整理都要另起一个 Claude Code / Codex 适配器进程、记在那家的额度上；不改则这三样对这两种会话一直关着（标题取第一条消息，记忆可以手动编辑）。
 2. **适配器自己换的模式要不要写回会话偏好**（A5 现在只刷新显示）：写回的话下次连上沿用它换过的模式（例如批准计划后离开 plan）；不写回则每次连上都回到你在下拉里选的那个。
-3. **控制入口往正在跑的 Claude Code / Codex 会话发 `auto`**（5.1）：现在和按 Enter 一样标红等人处理；要不要对控制入口例外、直接排进队列。
+3. ~~**控制入口往正在跑的 Claude Code / Codex 会话发 `auto`**（5.1）~~：已定（2026-10-24）—— 自动排进 KiroLex 队列，回 `{routed:'queued'}`（见 5.1）。

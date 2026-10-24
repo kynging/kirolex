@@ -11,7 +11,8 @@ import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, adapterAuthMessage, adapterMissingMes
 import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
 import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
-import { tr } from './uiText.ts';
+import { tr, trConcat } from './uiText.ts';
+import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
 import { CLIENT_CAPABILITIES } from './elicitation.ts';
 import { busyEnterMode, isMethodNotFound, steeringParams, steeringVerdict, withoutSteering, type BusyEnterMode } from './busyEnterCaps.ts';
 import { sshErrorKind, sessionsFullMessage } from './sshMux.ts';
@@ -986,7 +987,9 @@ export class AcpClient extends EventEmitter {
         clearTimeout(pending.timer);
         this.pendingRequests.delete(msg.id);
         /* 这个 session/prompt 结束了：同步摘掉，紧跟着流过来的输出就标成下一个在途的那个 */
-        { const at = this.inflightPrompts.indexOf(msg.id); if (at >= 0) this.inflightPrompts.splice(at, 1); }
+        { const at = this.inflightPrompts.indexOf(msg.id); if (at >= 0) this.inflightPrompts.splice(at, 1);
+          /* 最后一轮也结束了：还挂着的权限请求已经没人等（审计 2.1），`awaitingPermission` 复位 —— 不然下一轮的看门狗一直当它在等人。kiro 那条不动 */
+          if (at >= 0 && !this.inflightPrompts.length && this.engine !== 'kiro') this.pendingPermissions.clear(); }
         if ('error' in msg) {
           // Attach the JSON-RPC error.data so callers can surface WHY (kiro-cli
           // often sends a bare "Internal error" message with the real reason in
@@ -1164,7 +1167,11 @@ export class AcpClient extends EventEmitter {
       */
       this.emit('error', {
         type: 'unknown-request',
-        message: tr('{engine} sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.', { engine: this.cliName, method }),
+        /* 写法按 docs/notices-glossary.md：主句说发生了什么 + 要你做什么，后果放「详情」；引擎名按这条会话的引擎说（审计 2.5） */
+        message: trConcat(
+          tr('⚠️ {engine} sent a request KiroLex does not know (`{method}`) and got an empty answer; please report this to KiroLex.', { engine: this.cliName, method }),
+          NOTE_DETAIL_SEP,
+          tr('If it was asking you something, this turn went on with an answer nobody gave.')),
         method,
         params,
       });

@@ -78,7 +78,8 @@ test('改过的英文原文都有中文（渲染层 t()）', () => {
 
 test('改过的英文原文都有中文（主进程 tr()）', () => {
   for (const k of [
-    '{engine} sent an unknown request `{method}`; KiroLex replied {}. If it was asking you something, this turn went on with an answer nobody gave. Please report this to KiroLex.',
+    '⚠️ {engine} sent a request KiroLex does not know (`{method}`) and got an empty answer; please report this to KiroLex.',
+    'If it was asking you something, this turn went on with an answer nobody gave.',
     '{label} is managed by {owner} and cannot be edited here.',
   ]) assert.ok(ZH_MAIN[k], `缺中文：${k}`);
 });

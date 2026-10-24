@@ -80,6 +80,7 @@ import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSes
 import type { MemoryScope } from './memoryPolicy.ts';
 import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
+import { stampCliSessionOwner, pinCliSessionOwnerBeforeRetarget, cliSessionOwnerMismatch } from './cliSessionOwner.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
@@ -107,7 +108,7 @@ import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward, httpProbeNotice,
-  remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, type ForwardListItem,
+  remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedNotice, type ForwardListItem,
   markForwardUnavailable, clearForwardUnavailable, type ForwardUnavailable,
 } from './forwardMcp.ts';
 import {
@@ -407,10 +408,14 @@ const sessionClients: Map<string, SessionEntry> = new Map();
 // Serializes model/Agent replacement per session. Renderer locks are UX only;
 // this guard is authoritative against racing IPC calls and background queues.
 const reconfiguringSessions = new Set<string>();
-/** requestId -> when the permission prompt was raised, so the answer can record how
+/** (sessionId, requestId) -> when the permission prompt was raised, so the answer can record how
  *  long the turn was blocked. Lives here (not on the entry) because a permission may
  *  be answered after a model swap replaced the executor. */
 const permissionWaitStartedAt = new Map<string, number>();
+/** 远程会话里「组合里的 MCP 没带上」已经说过的：会话 id → 名字（`notForwardedNotice`，同一会话同一个只说一次）。 */
+const notForwardedNoticed = new Map<string, Set<string>>();
+/** `permissionWaitStartedAt` 的键：会话 + 请求 id。 */
+const permissionWaitKey = (sessionId: string, requestId: string): string => `${sessionId}:${requestId}`;
 /**
  * 挂着的提问卡片（模型向用户提问，见 `elicitation.ts`）：卡片 id → 卡片 + 哪个执行器在等它的回答 + 超时计时器。
  * 放在模块级、不挂在 entry 上：执行器被换下来时（`rejectAllPending`）也要能找到它、记成「已取消」落盘。
@@ -831,7 +836,7 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       /* 项目归属以盘上为准：这一轮中途移出项目时 entry 里还是旧项目，整份写回就把移出撤销了 */
       rec.profile = keepRecordPlacement(profile, rec.profile);
-      rec.cliSessionId = cliSessionId;
+      rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
       logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`
@@ -2416,7 +2421,7 @@ async function ensureLocalTools(
         和组合按名字去重，同名以组合为准（规则见 `adapterForwardPlan`）。Claude Code 和 Codex 都走这里。
       */
       const combo = sessionCombo(sessionId, profile);
-      const { entries, skipped, fromCombo, fromList } = adapterForwardPlan({
+      const { entries, skipped, fromCombo, fromList, notForwarded } = adapterForwardPlan({
         comboServers: combo.mcpServers,
         list: loadForwardMcpList(),
         sources: localKiroMcpSources(os.homedir(), profile.kiroAgent),
@@ -2435,6 +2440,16 @@ async function ensureLocalTools(
           : tr('⚠️ MCP "{mcp}" in combo "{combo}" can\'t be forwarded from this machine ({reason}); it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
         skippedReasons.push({ name: s.name, reason: s.missing ? tr('missing environment variable(s) {vars}', { vars: trList(s.missing) }) : String(s.reason) });
       }
+      /* 组合里没标「从本机转发」、远程会话里就没有的那些（审计 4.1）：同一会话同一个只说一次，说成了才记 */
+      for (const n of notForwarded) {
+        const said = notForwardedNoticed.get(sessionId) || new Set<string>();
+        if (said.has(n.name)) continue;
+        if (noteInSession(sessionId, notForwardedNotice(n, comboDisplayName(combo)), undefined, `mcp-not-forwarded:${n.name}`)) {
+          said.add(n.name);
+          notForwardedNoticed.set(sessionId, said);
+        }
+      }
+      if (notForwarded.length) logger.info('localmcp', `组合里没带进远程会话 sessionId=${sessionId}：${notForwarded.map((n) => `${n.name}（${n.kind}）`).join(', ')}`);
       server.setProxies(sessionId, entries);
       const http = entries.filter(isHttpForward);
       const spec: LocalToolsSpec = {
@@ -4772,7 +4787,7 @@ async function recreateBackendSession(sessionId: string, entry: SessionEntry, tr
   /* 同一 client 上的 session/new：「响应之后才回放」那种形状也要丢（`replayGuard.outsideTurnVerdict`）—— 回放窗口重新打开 */
   entry.replayWindow = true;
   const rec2 = store.readRecord(sessionId);
-  if (rec2) { rec2.cliSessionId = made.sessionId; store.writeRecord(rec2); }
+  if (rec2) { rec2.cliSessionId = made.sessionId; stampCliSessionOwner(rec2, rec2.profile); store.writeRecord(rec2); }
   /* 新会话里当然什么都没有 —— 清掉"已建立"，让上下文跟着下一次发送带过去 */
   clearContextEstablished(sessionId);
   markContextOwedIfUnverified(sessionId, trigger);
@@ -6720,8 +6735,9 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // (`data.update`, not the `u` above: that one is scoped to the try block.)
     const pending = data?.update;
     if (pending?.sessionUpdate === 'permission_request') {
+      /* 按「会话 + 请求 id」记：每个执行器各自从 0 编 JSON-RPC id，两条会话同时在等时只按 id 记会串（审计 2.4） */
       const requestKey = String(pending?.requestId ?? '');
-      if (requestKey) permissionWaitStartedAt.set(requestKey, Date.now());
+      if (requestKey) permissionWaitStartedAt.set(permissionWaitKey(sessionId, requestKey), Date.now());
       eventLog.appendEvent(sessionId, {
         ts: Date.now(),
         type: 'permission_request',
@@ -6803,6 +6819,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     if (superseded()) return;
     if (error?.type === 'stderr') reportStderr(String(error.message || ''));
     mainWindow?.webContents.send('acp:error', { ...error, sessionId });
+    /* 替你回答了一个不认识的请求：影响这一轮的结果，记进对话记录（acp:error 渲染层只打控制台） */
+    if (error?.type === 'unknown-request') noteInSession(sessionId, String(error.message || ''), undefined, `unknown-request:${String(error.method || '')}`);
   });
   /* 接线之前（connect / newSession / loadSession 期间）的 stderr —— MCP 初始化失败就在这一段 */
   for (const message of client.takeEarlyStderr()) reportStderr(message);
@@ -8717,7 +8735,7 @@ ${hint}` : ''}` };
     /* 上面已经先写过一份（没有 cliSessionId 的）：在它上面补，期间到的标题 / 标记不丢 */
     const rec = store.readRecord(kiroLexId) || store.createSession(kiroLexId, profile);
     rec.profile = profile;
-    rec.cliSessionId = cliSessionId;
+    rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
     rec.executorState = 'attached';
     /* **本地工作目录进记录** —— 渲染层 attach 时传的是 `'~'`（三处硬写），
        以它为准的话每次重连都会把家目录当项目（远程会话就是把整个家目录推上远端）。见 `localDir`。 */
@@ -11682,6 +11700,8 @@ ${hint}` : ''}` };
     */
     if (!oldEntry) {
       const rec = rec0!;
+      /* 记录里的后端会话 id 是旧机器上的：先记下它属于谁，下次打开时就不拿它去新机器上 load（审计 1.2） */
+      pinCliSessionOwnerBeforeRetarget(rec);
       rec.profile = { ...rec.profile, remote: target ? { ...target } : undefined } as AgentProfile;
       rec.localDir = nextLocalDir;
       store.writeRecord(rec);
@@ -11745,7 +11765,7 @@ ${hint}` : ''}` };
 
         const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
         rec.profile = profile;
-        rec.cliSessionId = made.sessionId;
+        rec.cliSessionId = made.sessionId; stampCliSessionOwner(rec, rec.profile);
         rec.localDir = nextLocalDir;
         rec.executorState = 'attached';
         store.writeRecord(rec);
@@ -12006,7 +12026,7 @@ ${hint}` : ''}` };
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.profile = profile;
-      rec.cliSessionId = cliSessionId;
+      rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
       // A model switch means a NEW kiro-cli process, i.e. a blank backend even
@@ -12054,7 +12074,7 @@ ${hint}` : ''}` };
     const rec = store.readRecord(sessionId)
       || store.createSession(sessionId, entry.profile);
     rec.profile = { ...rec.profile, permissionMode: normalizedMode };
-    rec.cliSessionId = entry.cliSessionId;
+    rec.cliSessionId = entry.cliSessionId; stampCliSessionOwner(rec, rec.profile);
     rec.executorState = 'attached';
     store.writeRecord(rec);
 
@@ -12116,7 +12136,7 @@ ${hint}` : ''}` };
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.profile = profile;
-      rec.cliSessionId = created.sessionId;
+      rec.cliSessionId = created.sessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
       mainWindow?.webContents.send('session:ready-for-first-prompt', {
@@ -12165,6 +12185,8 @@ ${hint}` : ''}` };
 
     if (!oldEntry) {
       if (!rec0) throw new Error(tr('Could not find the record for this session.'));
+      /* 记录里的后端会话 id 是旧引擎发的：先记下它属于谁，下次打开时就不拿它去新引擎那里 load（审计 1.1） */
+      pinCliSessionOwnerBeforeRetarget(rec0);
       rec0.profile = reshape(rec0.profile);
       store.writeRecord(rec0);
       /* 旧引擎那句钉住的起法说明不再是现状（同换机器） */
@@ -12214,7 +12236,7 @@ ${hint}` : ''}` };
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.profile = profile;
-      rec.cliSessionId = created.sessionId;
+      rec.cliSessionId = created.sessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
       clearContextEstablished(sessionId);
@@ -12359,7 +12381,7 @@ ${hint}` : ''}` };
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.profile = profile;
-      rec.cliSessionId = created.sessionId;
+      rec.cliSessionId = created.sessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
       clearContextEstablished(sessionId);
@@ -13718,9 +13740,20 @@ ${hint}` : ''}` };
         放弃"。那里本来就什么都没有：直接起一条新的，也不欠重建。
       */
       const skipResume = engineOf(profile) !== 'kiro' && historyBytes === 0;
+      /*
+        **记录里的 id 是别的引擎 / 别的机器发的**（没连着时换过引擎或运行位置，审计 1.1 / 1.2）：拿去 load 只会白一次请求
+        （kiro 对陌生 id 最坏要等两次 RESUME_TIMEOUT_MS）。直接新起，上下文按快照随下一条消息带过去。
+        没记过「属于谁」的老记录判不出来，照旧走下面的 load。
+      */
+      const ownerMismatch = skipResume ? null : cliSessionOwnerMismatch(existing, profile);
       if (skipResume) {
         cliSessionId = (await client.newSession(cliCwd)).sessionId;
         logger.info('attach', `${ENGINE_LABEL[engineOf(profile)]} 会话还没聊过，不 resume，直接新起 sessionId=${sessionId} cli=${cliSessionId}`);
+      } else if (ownerMismatch) {
+        const staleId = cliSessionId;
+        cliSessionId = (await client.newSession(cliCwd)).sessionId;
+        freshBackend = true;
+        logger.info('attach', `记录里的后端会话 id 属于别的${ownerMismatch === 'engine' ? '引擎' : '机器'}，不 resume，直接新起 sessionId=${sessionId} stale=${staleId} cli=${cliSessionId} -> history rides along`);
       } else try {
         try {
           await tryResume();
@@ -13777,7 +13810,7 @@ ${hint}` : ''}` };
       /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
       wireSession(sessionId, entry);
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-      rec.cliSessionId = cliSessionId;
+      rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       /*
         老会话补写目录，但**只在渲染层给了具体目录时**才写。
@@ -14054,7 +14087,7 @@ ${hint}` : ''}` };
       await withLoadTimeout(entry.client.loadSession(forked.sessionId, entry.cwd), loadTimeoutFor(entry.profile.remote));
       entry.cliSessionId = forked.sessionId;
       const rec2 = store.readRecord(sid);
-      if (rec2) { rec2.cliSessionId = forked.sessionId; store.writeRecord(rec2); }
+      if (rec2) { rec2.cliSessionId = forked.sessionId; stampCliSessionOwner(rec2, rec2.profile); store.writeRecord(rec2); }
       /* 保留下来的回复在新后端里也在（messageId 原样拷过去）：锚点改到新后端，否则连着第二次编辑同一条会判成 other-backend */
       const remapped = store.remapBackendAnchors(sid, Array.isArray(keepIds) ? keepIds.map(String) : [], oldId, forked.sessionId);
       /* 分出来的后端握着保留下来的那段历史：不用再随下一条带快照 */
@@ -15154,7 +15187,7 @@ ${hint}` : ''}` };
     if (!entry) throw new Error(tr('Session not connected'));
     // Close the wait span. Measured from the REQUEST, not from when the dialog was
     // rendered: the wait the user cares about is the whole time the turn was blocked.
-    const requestKey = String(requestId ?? '');
+    const requestKey = permissionWaitKey(sessionId, String(requestId ?? ''));
     const startedAt = permissionWaitStartedAt.get(requestKey);
     permissionWaitStartedAt.delete(requestKey);
     eventLog.appendEvent(sessionId, {

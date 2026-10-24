@@ -143,6 +143,8 @@ export interface SessionRecord {
    *  KiroLex owns `id` (dir key); this maps to the backend session for resume.
    *  Absent on legacy records where id WAS the kiro-cli id (treat id as fallback). */
   cliSessionId?: string;
+  /** `cliSessionId` 是哪个引擎、哪台机器发的（`cliSessionOwner.ts`）；`id` 不等于 `cliSessionId` 时这笔不算数。 */
+  cliSessionOwner?: { id: string; engine: 'kiro' | 'claude' | 'codex'; machine: string };
   /** 这条会话收到过模型起的后台命令 / 监视的输出（可能带凭证）：之后的故障诊断包不再抄会话内容（见 failureBundle.ts）。 */
   bgOutputSeen?: boolean;
   /**

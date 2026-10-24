@@ -194,7 +194,7 @@ describe('接线（源码扫描）', () => {
   test('非 Kiro 分支（Claude Code 和 Codex 共用）：读名单、合并组合，kirolex-local + 转发项交给 mcpServers', () => {
     assert.match(body, /if \(engineOf\(profile\) !== 'kiro'\) \{/);
     assert.match(nonKiro, /loadForwardMcpList\(\)/);
-    assert.match(nonKiro, /const \{ entries, skipped, fromCombo, fromList \} = adapterForwardPlan\(/);
+    assert.match(nonKiro, /const \{ entries, skipped, fromCombo, fromList, notForwarded \} = adapterForwardPlan\(/);
     assert.match(nonKiro, /localKiroMcpSources\(/);
     assert.match(nonKiro, /server\.setProxies\(sessionId, entries\);/);
     assert.match(nonKiro, /const mcp = \{ type: 'http', name: 'kirolex-local', url: mcpUrl\(remotePort, urlPath\), headers: \[\] \};/);
