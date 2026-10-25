@@ -116,13 +116,14 @@ import { forwardReconnectVerdict, retryUntilIdle, watchHttpForward, reconnectBlo
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward,
   remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedWhy, type ForwardListItem,
+  remoteDirectMcpServers, httpDirectProbeNotice, type DirectHttpEntry,
   markForwardUnavailable, clearForwardUnavailable, type ForwardUnavailable,
   forwardNotReadyNotice, forwardStartingNotice, forwardRestartingNotice, forwardGaveUpNotice, forwardReadyReconnectNotice,
   httpPendingNotice, httpForwardBackNotice, httpDroppedNotice, type HttpMcpEntry, type ForwardEntry, type McpEntry,
 } from './forwardMcp.ts';
 import {
   placeForwardStdio, placeEligible, normalizeRunOn, remoteWhichScript, parseRemoteWhich, remoteStdioServer,
-  remoteMcpProbeScript, parseRemoteProbe, REMOTE_PROBE_TIMEOUT_SEC, type PlacedRemote, type RemoteProbeResult,
+  remoteMcpProbeScript, remoteHttpProbeScript, parseRemoteProbe, REMOTE_PROBE_TIMEOUT_SEC, type PlacedRemote, type RemoteProbeResult,
 } from './remoteMcpPlace.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
@@ -2138,7 +2139,7 @@ function unpinSessionNotice(sessionId: string, prefix: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[]; awaitingForward?: string[]; httpEntries?: HttpMcpEntry[] };
+type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[]; awaitingForward?: string[]; httpEntries?: HttpMcpEntry[]; direct?: string[] };
 const localToolsBySession = new Map<string, LocalToolsSpec>();
 /** 正在 `ensureLocalTools` 里等转发 MCP 就绪的会话：这段时间的状态变化由那边统一说，`forwardProxyState` 不重复说。 */
 const forwardGating = new Set<string>();
@@ -2420,6 +2421,28 @@ function httpForwardFailed(sessionId: string, name: string, error: string): void
   markHttpFresh(h, false);
   logger.warn('localmcp', `HTTP 转发「${name}」转发失败，开始后台探测 sessionId=${sessionId}: ${error}`);
   startHttpWatch(sessionId, lt, h, !!lt.forwardedHttp?.includes(name));
+}
+
+/**
+ * **远端直连的 http MCP**（组合里没标 forwardFromLocal、不带本机环境变量的，`comboHttpDirect`）：spec 登记之后在远端机器上
+ * 各敲一次 initialize，**不 await**（不挡会话准备）。连不上就记成当前不可用（会话信息照实显示）、进对话记录说清是远端连不上、
+ * 可以改标 forwardFromLocal 走本机（同 `httpProbeNotice` 那一套：说出来，不阻断）。交给适配器的那份照样交 —— 它是远端自己的连接。
+ */
+function watchDirectHttp(sessionId: string, spec: LocalToolsSpec, remote: RemoteTarget, direct: DirectHttpEntry[]): void {
+  for (const d of direct) {
+    void runRemoteCapture(remote, remoteHttpProbeScript(d), (REMOTE_PROBE_TIMEOUT_SEC + 20) * 1000)
+      .then(parseRemoteProbe, (err: any) => ({ ok: false, toolCount: 0, error: String(err?.message || err) }) as RemoteProbeResult)
+      .then((r) => {
+        if (localToolsBySession.get(sessionId) !== spec || deletedSessionIds.has(sessionId)) return;
+        if (r.ok) {
+          logger.info('localmcp', `远端直连的 MCP「${d.name}」在 ${remote.sshHost} 上探测通过 sessionId=${sessionId}`);
+          return;
+        }
+        markForwardUnavailable(spec, d.name, r.error || '');
+        logger.warn('localmcp', `远端直连的 MCP「${d.name}」在 ${remote.sshHost} 上连不上 sessionId=${sessionId}: ${r.error}`);
+        noteInSession(sessionId, httpDirectProbeNotice(d.name, remote.sshHost, r.error || ''), undefined, `mcp-direct-failed:${d.name}`);
+      });
+  }
 }
 
 /* ------------------------------ 「从本机转发」的 stdio MCP 这台电脑上没有：改在远端跑（`remoteMcpPlace.ts`） */
@@ -2811,7 +2834,7 @@ async function ensureLocalTools(
         和组合按名字去重，同名以组合为准（规则见 `adapterForwardPlan`）。Claude Code 和 Codex 都走这里。
       */
       const combo = sessionCombo(sessionId, profile);
-      const { entries, skipped, fromCombo, fromList, notForwarded } = adapterForwardPlan({
+      const { entries, skipped, fromCombo, fromList, notForwarded, direct } = adapterForwardPlan({
         comboServers: combo.mcpServers,
         list: loadForwardMcpList(),
         sources: localKiroMcpSources(os.homedir(), profile.kiroAgent),
@@ -2832,6 +2855,8 @@ async function ensureLocalTools(
       }
       for (const n of notForwarded) unavailable.push(notForwardedItem(n.name, n.kind, notForwardedWhy(n)));
       if (notForwarded.length) logger.info('localmcp', `组合里没带进远程会话 sessionId=${sessionId}：${notForwarded.map((n) => `${n.name}（${n.kind}）`).join(', ')}`);
+      /* 组合里没标 forwardFromLocal、不带本机环境变量的 http：原样交给远端适配器，远端自己连（同 Kiro 远程那条） */
+      if (direct.length) logger.info('localmcp', `组合里交给远端直连的 http MCP sessionId=${sessionId}：${direct.map((d) => d.name).join(', ')}`);
       /*
         **「从本机转发」的 stdio 项这台电脑上没有：远端有就直接在远端跑，都没有就安静跳过**（`placeComboForwardStdio`）。
         本机起的照旧交给 setProxies；远端起的不走转发，作为普通 stdio MCP 交给远端适配器（就绪了才交，见下）；
@@ -2877,7 +2902,8 @@ async function ensureLocalTools(
         remotePort, localPort: server.port(), agentOverride,
         forwarded: handed.filter((e) => !isHttpForward(e)).map((e) => e.name),
         forwardedHttp: handed.filter(isHttpForward).map((e) => e.name),
-        mcpServers: [mcp, ...remoteComboMcpServers(handed, mcpUrl(remotePort, urlPath)), ...remoteHanded.map(remoteStdioServer)],
+        mcpServers: [mcp, ...remoteComboMcpServers(handed, mcpUrl(remotePort, urlPath)), ...remoteHanded.map(remoteStdioServer), ...remoteDirectMcpServers(direct)],
+        direct: direct.map((d) => d.name),
         skipped: skippedReasons,
         httpEntries: http,
         awaitingForward: [
@@ -2900,9 +2926,11 @@ async function ensureLocalTools(
       announceMcpUnavailable(sessionId, combo.id, unavailable, [
         ...localEntries.filter((e) => !notReady.some((n) => n.name === e.name)).map((e) => e.name),
         ...remoteHanded.map((p) => p.entry.name),
+        ...direct.map((d) => d.name),
       ]);
       /* 探测，但不挡会话（同 Kiro 分支）；先登记 spec，失败才记得到它上面（`noteHttpProbe`） */
       watchHttpForwards(sessionId, spec, http);
+      watchDirectHttp(sessionId, spec, remote, direct);
       /* 远端起的那几条没就绪的：后台接着在远端试，好了等空闲重连挂上 */
       for (const { p, r } of remoteReady) if (!r.ok) startRemoteRunWatch(sessionId, spec, remote, p, r);
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
@@ -3436,7 +3464,8 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
     forwarded: localToolsBySession.get(sessionId)?.forwarded,
     forwardedHttp: localToolsBySession.get(sessionId)?.forwardedHttp,
     /* 探测失败的：不再列为可用，另说一句当前不可用（重试成功后清掉，下一轮就恢复） */
-    unavailable: localToolsBySession.get(sessionId)?.unavailable,
+    /* 远端直连的那些（`watchDirectHttp` 也记在这份上）不是「从用户机器转发」的，这一句不提它们 */
+    unavailable: localToolsBySession.get(sessionId)?.unavailable?.filter((u) => !localToolsBySession.get(sessionId)?.direct?.includes(u.name)),
   });
 }
 
@@ -16497,7 +16526,7 @@ ${hint}` : ''}` };
           localTools: !sshHost ? null : (() => {
             const lt = localToolsBySession.get(sessionId);
             if (!lt) return { state: toollessSessions.has(sessionId) ? 'failed' : 'not-ready', forwarded: [], skipped: [] };
-            return { state: 'ready', forwarded: [...(lt.forwarded || []), ...(lt.forwardedHttp || [])], skipped: lt.skipped || [], unavailable: lt.unavailable || [] };
+            return { state: 'ready', forwarded: [...(lt.forwarded || []), ...(lt.forwardedHttp || [])], direct: lt.direct || [], skipped: lt.skipped || [], unavailable: lt.unavailable || [] };
           })(),
         },
       };

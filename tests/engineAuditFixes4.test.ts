@@ -217,7 +217,7 @@ describe('2.5 未知请求的提示说对引擎，写法按 notices-glossary', (
 
 describe('4.1 组合里的 MCP 没带进远程会话：说一句原因 + 怎么改，同一会话同一个只说一次', () => {
   const combo = {
-    web: { url: 'https://x.example/mcp' },                       // http 没标
+    web: { url: 'https://x.example/mcp', headers: { Authorization: 'Bearer ${env:WEB_KEY}' } }, // http 没标、带本机环境变量（没带的交给远端直连，见 comboHttpDirect.test.ts）
     tool: { command: 'uvx', args: ['thing'] },                   // stdio：不是本机路径、不在白名单
     marked: { url: 'https://y.example/mcp', forwardFromLocal: true },
     playwright: { command: 'npx', args: ['@playwright/mcp'] },  // 白名单
@@ -255,7 +255,7 @@ describe('4.1 组合里的 MCP 没带进远程会话：说一句原因 + 怎么�
    * 「只说一次」从「同一会话同一个」放宽成更严的「同一台电脑 + 同一个 MCP 配置 + 同一原因」（新会话也不重复），说成了才记。
    */
   test('接线：远程 Claude Code / Codex 那条分支把没带上的并进合并提示，同一原因只说一次，说成了才记', () => {
-    const body = slice(M, 'const { entries, skipped, fromCombo, fromList, notForwarded } = adapterForwardPlan({', 6000);
+    const body = slice(M, 'const { entries, skipped, fromCombo, fromList, notForwarded, direct } = adapterForwardPlan({', 6000);
     assert.match(body, /for \(const n of notForwarded\) unavailable\.push\(notForwardedItem\(n\.name, n\.kind, notForwardedWhy\(n\)\)\);/);
     assert.match(body, /announceMcpUnavailable\(sessionId, combo\.id, unavailable,/);
     const fn = slice(M, 'function announceMcpUnavailable', 2200);

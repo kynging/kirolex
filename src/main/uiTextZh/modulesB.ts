@@ -83,12 +83,14 @@ export const ZH_MODULES_B: Record<string, string> = {
   '✅ The MCP "{name}" forwarded from this machine is available again; it is added when this session is idle.': '✅ 本机转发的 MCP「{name}」已恢复可用，这条会话空闲时会自动重连挂上。',
   '⏳ Starting the MCP(s) forwarded from this machine: {names}…':'⏳ 正在启动本机转发的 MCP：{names}…',
   '⚠️ The MCP "{name}" forwarded from this machine is unavailable: {msg}. Fix the local config and reopen the session.': '⚠️ 本机转发的 MCP「{name}」暂时用不了：{msg}。改好本机配置后重开会话。',
+  '⚠️ The MCP "{name}" is unavailable: {host} (where this session runs) can\'t reach it ({error}). If only this computer can reach that address, add "forwardFromLocal": true to it in 🧩 MCP profiles and reopen the session; KiroLex then sends its requests from this computer.':
+    '⚠️ MCP「{name}」暂时用不了：跑这条会话的远端机器 {host} 连不上它（{error}）。如果只有这台电脑连得上那个地址，在「🧩 MCP 配置」里给它加上 "forwardFromLocal": true 再重开会话，改由本机代发请求。',
   'Names may only use letters, digits, _ . - (at most 40), otherwise they cannot go into the forwarding URL': '名字只能用字母、数字、_ . -（最多 40 个），否则放不进转发地址',
   'Clashes with the local tool channel kirolex-local': '和本地工具通道 kirolex-local 重名',
   '⚠️ This remote session does not have MCP "{mcp}" from MCP profile "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 MCP profiles and reopen the session.':
     '⚠️ 这条远程会话没带上 MCP 配置「{combo}」的 MCP「{mcp}」。要用的话在「🧩 MCP 配置」里给它加上 "forwardFromLocal": true，再重新打开会话。',
-  'An HTTP MCP in an MCP profile reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.':
-    'MCP 配置里的 HTTP 型 MCP 只有标了 forwardFromLocal 才会带进远程会话（由本机代发请求）；把名字加进设置里「从本机转发」的名单也行。',
+  'Its URL or headers use environment variables of this computer (${env:…}), and keys from this computer\'s environment are not sent to the remote machine by default. Marked forwardFromLocal, KiroLex sends its requests from this computer and the key stays here. Adding it to the "forward from this machine" list in Settings works too.':
+    '它的地址或请求头用了本机的环境变量（${env:…}）；带本机环境变量的密钥默认不发到远端机器。标上 forwardFromLocal 后由本机代发请求，密钥留在本机；把名字加进设置里「从本机转发」的名单也行。',
   'A stdio MCP in an MCP profile reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.':
     'MCP 配置里的 stdio 型 MCP 只有在本机起、经隧道转发时才会带进远程会话：命令是本机路径、名字是 {names} 之一，或者标了 forwardFromLocal。',
   'it is turned off in the current MCP profile': '当前 MCP 配置里把它关掉了',

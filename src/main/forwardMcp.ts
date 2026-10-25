@@ -333,22 +333,25 @@ const TUNNEL_NAME = /^[\w.-]{1,40}$/;
  * **Claude Code / Codex 远程会话：组合里哪些 MCP 经本机中转**（组合见 `mcpCombos.ts`）。
  *
  *   · http 型、标了 `forwardFromLocal` —— 产出 http 规格，由 `HttpProxy` 在本机代发（超时 `timeoutSec`，默认 180 秒）；
- *   · http 型没标 —— 不出现（远程会话里没有它；要它就标上）；
+ *   · http 型没标、url 和头里都没有 `${env:…}`（`comboHttpDirect`）—— 进 `direct`：原样交给远端适配器，远端自己连
+ *     （同 Kiro 远程那条 `forwardableFrom`：那种本来就是某个地址上的服务，远端自己也能敲同一个地址）；
+ *   · http 型没标、但引用了本机环境变量 —— 不出现：在本机展开再交出去等于把本机的密钥送到远端机器，要它就标上；
  *   · stdio 型标了、或命令符合上面那两条老规则（本机路径 / `FORWARD_BY_NAME`）—— 本机起进程转发；
  *   · 其余 stdio —— 不出现。
  *
  * 头和 env 里的 `${env:…}` 在这里按传进来的环境（登录 shell 的）展开，和本地会话挂组合同一个口径；
  * 缺变量的那条跳过。名字要能放进隧道 URL、不能和 `kirolex-local` 撞，不然也跳过。
  * 跳过的都记进 `skipped`，由调用方在会话里说一句。
- * 没被挑中（http 没标、stdio 不是本机路径也不在白名单）的记进 `notForwarded`（审计 4.1）：远程会话里就是少了它，
+ * 没被挑中（http 没标且引用了本机环境变量、stdio 不是本机路径也不在白名单）的记进 `notForwarded`（审计 4.1）：远程会话里就是少了它，
  * 原来不说一声；调用方按会话、按名字只说一次（`notForwardedNotice`）。
  */
 export function forwardableFromCombo(
   servers: Record<string, McpComboServer>, env: Record<string, string | undefined>,
-): { entries: ForwardEntry[]; skipped: Array<{ name: string; missing?: string[]; reason?: string }>; notForwarded: NotForwarded[] } {
+): { entries: ForwardEntry[]; skipped: Array<{ name: string; missing?: string[]; reason?: string }>; notForwarded: NotForwarded[]; direct: DirectHttpEntry[] } {
   const entries: ForwardEntry[] = [];
   const skipped: Array<{ name: string; missing?: string[]; reason?: string }> = [];
   const notForwarded: NotForwarded[] = [];
+  const direct: DirectHttpEntry[] = [];
   const expand = (m: Record<string, string> | undefined, missing: string[]): Record<string, string> => {
     const out: Record<string, string> = {};
     for (const [k, v] of Object.entries(m || {})) {
@@ -362,6 +365,14 @@ export function forwardableFromCombo(
     if (!s || typeof s !== 'object' || s.disabled) continue;
     const isHttp = s.url !== undefined;
     const command = typeof s.command === 'string' ? s.command.trim() : '';
+    if (comboHttpDirect(s)) {
+      if (name === 'kirolex-local') {
+        skipped.push({ name, reason: tr('Clashes with the local tool channel kirolex-local') });
+        continue;
+      }
+      direct.push({ name, url: String(s.url).trim(), headers: { ...(s.headers || {}) } });
+      continue;
+    }
     const pick = isHttp
       ? !!s.forwardFromLocal
       : !!command && (!!s.forwardFromLocal || FORWARD_BY_NAME.includes(name) || isLocalPathCommand(command));
@@ -392,10 +403,27 @@ export function forwardableFromCombo(
       entries.push({ name, command, args: Array.isArray(s.args) ? s.args.map(String) : [], ...(childEnv ? { env: childEnv } : {}) });
     }
   }
-  return { entries, skipped, notForwarded };
+  return { entries, skipped, notForwarded, direct };
 }
 
-/** 组合里没带进远程会话的那条：http 型没标 `forwardFromLocal`；stdio 型不是本机路径、不在 `FORWARD_BY_NAME`，也没标。 */
+/** 组合里交给远端直连的 http MCP：url、头都原样（里面没有 `${env:…}`，见 `comboHttpDirect`）。 */
+export interface DirectHttpEntry { name: string; url: string; headers: Record<string, string> }
+
+const HAS_ENV_REF = /\$\{env:/;
+
+/**
+ * **组合里这条 http MCP 能不能直接交给远端适配器、由远端自己连**：http 型、没关、没标 `forwardFromLocal`，
+ * 而且 url 和头里都没有 `${env:…}` —— 有的话得在本机展开才交得出去，那就是把本机环境变量里的密钥送到远端机器，
+ * 默认不做（照旧要标 `forwardFromLocal`，由本机代发）。不带引用的头（或者没有头）原样交。
+ */
+export function comboHttpDirect(s: McpComboServer | undefined): boolean {
+  if (!s || typeof s !== 'object' || s.disabled || s.forwardFromLocal) return false;
+  if (typeof s.url !== 'string' || !s.url.trim()) return false;
+  if (HAS_ENV_REF.test(s.url)) return false;
+  return !Object.values(s.headers || {}).some((v) => HAS_ENV_REF.test(String(v)));
+}
+
+/** 组合里没带进远程会话的那条：http 型没标 `forwardFromLocal` 且引用了本机环境变量；stdio 型不是本机路径、不在 `FORWARD_BY_NAME`，也没标。 */
 export interface NotForwarded { name: string; kind: 'http' | 'stdio' }
 
 /**
@@ -413,7 +441,7 @@ export function notForwardedNotice(n: NotForwarded, comboName: string): string {
 export function notForwardedWhy(n: NotForwarded): string {
   return (
     n.kind === 'http'
-      ? tr('An HTTP MCP in an MCP profile reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.')
+      ? tr('Its URL or headers use environment variables of this computer (${env:…}), and keys from this computer\'s environment are not sent to the remote machine by default. Marked forwardFromLocal, KiroLex sends its requests from this computer and the key stays here. Adding it to the "forward from this machine" list in Settings works too.')
       : tr('A stdio MCP in an MCP profile reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.', { names: FORWARD_BY_NAME.join(' / ') }));
 }
 
@@ -425,6 +453,24 @@ export function remoteComboMcpServers(
   entries: ForwardEntry[], tunnelBase: string,
 ): Array<{ type: 'http'; name: string; url: string; headers: never[] }> {
   return entries.map((e) => ({ type: 'http' as const, name: e.name, url: `${tunnelBase}/${e.name}`, headers: [] }));
+}
+
+/**
+ * 交给远端适配器的直连项：url 原样（不是隧道地址），头转成 ACP 的 `[{ name, value }]`。
+ */
+export function remoteDirectMcpServers(
+  direct: DirectHttpEntry[],
+): Array<{ type: 'http'; name: string; url: string; headers: Array<{ name: string; value: string }> }> {
+  return direct.map((d) => ({
+    type: 'http' as const, name: d.name, url: d.url,
+    headers: Object.entries(d.headers).map(([name, value]) => ({ name, value: String(value) })),
+  }));
+}
+
+/** 远端直连的那条在远端机器上探测失败（同 `httpProbeNotice` 那种：说出来，不阻断）：说清是远端连不上、可以改走本机。 */
+export function httpDirectProbeNotice(name: string, host: string, error: string): string {
+  return tr('⚠️ The MCP "{name}" is unavailable: {host} (where this session runs) can\'t reach it ({error}). If only this computer can reach that address, add "forwardFromLocal": true to it in 🧩 MCP profiles and reopen the session; KiroLex then sends its requests from this computer.',
+    { name, host, error: String(error || tr('Unknown error')) });
 }
 
 /* ------------------------------ Claude Code / Codex：设置里那份「从本机转发」名单 */
@@ -471,14 +517,14 @@ export interface AdapterForwardSkip { name: string; origin: 'combo' | 'list'; mi
  *     名单里的 http 由本机代发、stdio 一律本机起）；找不到 / disabled / 既没 command 也没 url 的记为跳过。
  *
  * 名单外的不像 Kiro 那样按"命令是本机路径"自动挑 —— 这里没有一份"会话的 agent"可挑。
- * `fromCombo` / `fromList` 给会话信息说"这个是哪来的"。
+ * `fromCombo` / `fromList` 给会话信息说"这个是哪来的"。组合里交给远端直连的那些在 `direct`（名单点了名的不算，那是要本机代发）。
  */
 export function adapterForwardPlan(input: {
   comboServers: Record<string, McpComboServer>;
   list: ForwardListItem[];
   sources: McpDefSource[];
   env: Record<string, string | undefined>;
-}): { entries: ForwardEntry[]; skipped: AdapterForwardSkip[]; fromCombo: string[]; fromList: string[]; notForwarded: NotForwarded[] } {
+}): { entries: ForwardEntry[]; skipped: AdapterForwardSkip[]; fromCombo: string[]; fromList: string[]; notForwarded: NotForwarded[]; direct: DirectHttpEntry[] } {
   const listed = new Map(input.list.map((it) => [it.name, it]));
   const combo: Record<string, McpComboServer> = {};
   for (const [name, s] of Object.entries(input.comboServers || {})) {
@@ -522,5 +568,5 @@ export function adapterForwardPlan(input: {
     fromList.push(item.name);
   }
   const listOnly = new Set(fromList);
-  return { entries, skipped, fromCombo: entries.filter((e) => !listOnly.has(e.name)).map((e) => e.name), fromList, notForwarded: fromCombo.notForwarded };
+  return { entries, skipped, fromCombo: entries.filter((e) => !listOnly.has(e.name)).map((e) => e.name), fromList, notForwarded: fromCombo.notForwarded, direct: fromCombo.direct };
 }

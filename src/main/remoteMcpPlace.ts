@@ -200,3 +200,18 @@ export function parseRemoteProbe(out: string): RemoteProbeResult {
   try { const j = JSON.parse(why); if (typeof j === 'string') why = j; } catch { /* 原样 */ }
   return { ok: false, toolCount: 0, error: why || tr('Unknown error') };
 }
+
+/**
+ * **远端直连的 http MCP 在远端机器上敲一次 `initialize`**（组合里没标 forwardFromLocal 的那种，见 `comboHttpDirect`）：
+ * 2xx 算通，别的状态码 / curl 报错算连不上（`KXPROBE fail <原因>`，同 `parseRemoteProbe`）。
+ * 远端没有 curl 就当通（查不了不报警 —— 交给适配器的那份照样交，它自己连）。头里没有 `${env:…}`，原样带上。
+ */
+export function remoteHttpProbeScript(d: { url: string; headers: Record<string, string> }, timeoutSec = REMOTE_PROBE_TIMEOUT_SEC): string {
+  const init = JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'initialize', params: { protocolVersion: '2024-11-05', capabilities: {}, clientInfo: { name: 'kirolex-probe', version: '1' } } });
+  const headers = Object.entries(d.headers || {}).map(([k, v]) => `-H ${sq(`${k}: ${v}`)}`).join(' ');
+  return `command -v curl >/dev/null 2>&1 || { echo 'KXPROBE ok 0'; exit 0; }
+kxerr=$(mktemp 2>/dev/null || echo "/tmp/kxhttp.$$")
+kxcode=$(curl -sS -o /dev/null -w '%{http_code}' --max-time ${Math.max(1, Math.floor(timeoutSec))} -X POST -H 'Content-Type: application/json' -H 'Accept: application/json, text/event-stream' ${headers} --data ${sq(init)} ${sq(d.url)} 2>"$kxerr")
+kxmsg=$(tail -c 300 "$kxerr" 2>/dev/null | tr '\n' ' '); rm -f "$kxerr"
+case "$kxcode" in 2??) echo 'KXPROBE ok 0';; 000|'') echo "KXPROBE fail ${'$'}{kxmsg:-no response}";; *) echo "KXPROBE fail HTTP $kxcode";; esac`;
+}

@@ -21,9 +21,11 @@ export interface SessionInfo {
    * 远程会话这一回实际拿到的本机工具（主进程 `ensureLocalTools` 最近一次准备的结果）。本地会话为 null / 没有。
    * `forwarded` 不含 kirolex-local（它总在）；`skipped` 是组合 / 设置名单里没转发成的，带原因；
    * `unavailable` 是转发了但探测失败的（`forwarded` 里也有它，显示时标「不可用（原因）」，重试成功后主进程清掉）。
+   * `direct` 是组合里交给远端直连的 http MCP（不经本机，远端自己连；远端探测失败的也进 `unavailable`）。
    */
   localTools?: {
     state: 'ready' | 'not-ready' | 'failed'; forwarded: string[]; skipped: Array<{ name: string; reason: string }>;
+    direct?: string[];
     unavailable?: Array<{ name: string; reason: string }>;
   } | null;
 }
@@ -80,11 +82,13 @@ function localToolsRow(lt: NonNullable<SessionInfo['localTools']>, t: T): InfoRo
   }
   const down = lt.unavailable || [];
   const names = usableLocalTools(lt);
+  const downNames = new Set(down.map((u) => u.name));
+  const direct = (lt.direct || []).filter((n) => !downNames.has(n)).map((name) => t('{name} (direct from the remote machine)', { name }));
   const broken = down.map((u) => t('{name} (unavailable: {reason})', { name: u.name, reason: u.reason }));
   const skipped = lt.skipped.length
     ? t('; not forwarded: {list}', { list: lt.skipped.map((s) => `${s.name} (${s.reason})`).join(', ') })
     : '';
-  return { key: 'tools', label, value: `${[...names, ...broken].join(', ')}${skipped}`, copy: names.join(', ') };
+  return { key: 'tools', label, value: `${[...names, ...direct, ...broken].join(', ')}${skipped}`, copy: names.join(', ') };
 }
 
 /** 眼下能用的本机工具名（kirolex-local 打头，去掉探测失败的）。 */
@@ -106,5 +110,6 @@ export function sessionInfoText(info: SessionInfo): string {
     `engine=${info.engine || 'kiro'}`,
     `dir=${info.dir || ''}`,
     ...(info.localTools?.state === 'ready' ? [`localTools=${usableLocalTools(info.localTools).join(',')}`] : []),
+    ...(info.localTools?.state === 'ready' && info.localTools.direct?.length ? [`directMcp=${info.localTools.direct.join(',')}`] : []),
   ].join('\n');
 }

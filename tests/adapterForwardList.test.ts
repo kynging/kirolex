@@ -194,13 +194,13 @@ describe('接线（源码扫描）', () => {
   test('非 Kiro 分支（Claude Code 和 Codex 共用）：读名单、合并组合，kirolex-local + 转发项交给 mcpServers', () => {
     assert.match(body, /if \(engineOf\(profile\) !== 'kiro'\) \{/);
     assert.match(nonKiro, /loadForwardMcpList\(\)/);
-    assert.match(nonKiro, /const \{ entries, skipped, fromCombo, fromList, notForwarded \} = adapterForwardPlan\(/);
+    assert.match(nonKiro, /const \{ entries, skipped, fromCombo, fromList, notForwarded, direct \} = adapterForwardPlan\(/);
     assert.match(nonKiro, /localKiroMcpSources\(/);
     assert.match(nonKiro, /server\.setProxies\(sessionId, localEntries\);/);
     assert.match(nonKiro, /const mcp = \{ type: 'http', name: 'kirolex-local', url: mcpUrl\(remotePort, urlPath\), headers: \[\] \};/);
     /* 交给适配器的是就绪过的那些（stdio 先 readyProxies，没就绪的先不交，见 forwardMcpReady.test.ts） */
     assert.match(nonKiro, /const handed = localEntries\.filter\(\(e\) => forwardHandedNow\(e, notReady\)\);/);
-    assert.match(nonKiro, /mcpServers: \[mcp, \.\.\.remoteComboMcpServers\(handed, mcpUrl\(remotePort, urlPath\)\), \.\.\.remoteHanded\.map\(remoteStdioServer\)\]/);
+    assert.match(nonKiro, /mcpServers: \[mcp, \.\.\.remoteComboMcpServers\(handed, mcpUrl\(remotePort, urlPath\)\), \.\.\.remoteHanded\.map\(remoteStdioServer\), \.\.\.remoteDirectMcpServers\(direct\)\]/);
     assert.match(nonKiro, /转发本机 MCP 给 sessionId=/);
   });
 
