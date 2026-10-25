@@ -89,9 +89,9 @@ export function parseWakeId(id: string | undefined): { scheduleId: string; run?:
 
 const esc = (s: string) => s.replace(/[.*+?^${}()|[\]\\]/g, '\\$&');
 
-/** 模板（`{name}` 占位）→ 整行匹配的正则；同名占位第二次出现用反向引用。 */
+/** 模板（`{name}` 占位）→ 整行匹配的正则；同名占位第二次出现用反向引用。缓存按模板 + 语言：同一个模板别换着 `caps` 用。 */
 const reCache = new Map<string, RegExp>();
-function templateRe(key: string, lang: UiLang, caps: Record<string, string> = {}): RegExp {
+export function templateRe(key: string, lang: UiLang, caps: Record<string, string> = {}): RegExp {
   const k = `${lang}\u0000${key}`;
   const hit = reCache.get(k);
   if (hit) return hit;

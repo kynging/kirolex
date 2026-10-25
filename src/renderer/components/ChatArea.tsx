@@ -34,6 +34,7 @@ import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer.ts
 import { adapterInstallStore, startAdapterInstall, startEngineLogin } from '../adapterInstallState.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { parseScheduleEnd, scheduleWakeCards, SCHEDULE_CARD_LINES, type ScheduleEndCard as ScheduleEndView, type ScheduleWakeCard as ScheduleWakeView } from '../../main/scheduleWakeView.ts';
+import { parseBgWake, type BgWakeCard as BgWakeView } from '../../main/bgWakeView.ts';
 import { livePendingNoteId, pendingTargetText, waitedSeconds, type PendingKind } from '../../main/pendingSwitch.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
@@ -1112,6 +1113,55 @@ const ScheduleWakeCard = memo<{ message: Message; card: ScheduleWakeView }>(({ m
               </div>
             )}
             {d.note && <div className="schedule-card-section"><b>{t('Note to the model')}</b>{'\n'}{d.note}</div>}
+          </div>
+        </details>
+      </div>
+    </div>
+  );
+});
+
+/**
+ * 后台命令 / 监视结束发进会话的那条（bgJobs.ts）：和「⏰ 定时」同一套紧凑卡片，不画成用户气泡。
+ * 一行摘要（图标 + 标签 + 状态徽标 + 用时）；内部 id 只在悬停提示和「详情」里；输出末尾默认折叠。
+ * 正文（发给模型的原文）不动，拆法见 `main/bgWakeView`。
+ */
+const BgWakeCard = memo<{ message: Message; card: BgWakeView }>(({ message, card }) => {
+  const t = useT();
+  const badge = card.status === 'ok' ? t('✓ Done')
+    : card.status === 'exit' ? t('✗ Exit code {code}', { code: card.exitCode ?? '?' })
+    : card.status === 'failed' ? t('⚠ Could not run')
+    : t('⏹ Stopped');
+  const why = card.stop === 'timeout' ? (card.kind === 'watch' ? t('Reached its time limit') : t('Timed out'))
+    : card.stop === 'rate-limited' ? t('Too many events') : card.reason;
+  const title = [card.kind === 'watch' ? t('👀 Watch') : t('🔔 Background command'), card.label].join(' · ');
+  const lines = card.output ? card.output.split('\n').length : 0;
+  return (
+    <div className="kirolex-message schedule-card bg-wake-card" data-status={card.status} role="status">
+      <div className="kirolex-message-card schedule-card-box">
+        <div className="schedule-card-head" title={card.jobId}>
+          <span className="schedule-card-title">{title}</span>
+          <span className="bg-wake-badge">{badge}</span>
+          {card.duration && <span className="bg-wake-dur">{card.duration}</span>}
+          <time
+            className="kirolex-message-time"
+            dateTime={new Date(message.timestamp).toISOString()}
+            title={new Date(message.timestamp).toLocaleString()}
+          >
+            {formatMessageTime(message.timestamp)}
+          </time>
+        </div>
+        {why && <div className="schedule-card-status">{why}</div>}
+        {card.output ? (
+          <details className="notice-detail bg-wake-output">
+            <summary>{t('Output ({n} lines)', { n: lines })}</summary>
+            <pre className="schedule-card-lines">{card.output}</pre>
+          </details>
+        ) : null}
+        <details className="notice-detail schedule-card-detail">
+          <summary>{t('Details')}</summary>
+          <div className="notice-detail-body">
+            <div className="schedule-card-section"><b>{t('Task id')}</b>{'\n'}{card.jobId}</div>
+            {card.reason && <div className="schedule-card-section"><b>{t('Reason')}</b>{'\n'}{withPathLinks(card.reason, message.id)}</div>}
           </div>
         </details>
       </div>
@@ -4623,6 +4673,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     | { kind: 'kirolex'; message: Message; count?: number }
     /* 定时到点发进来的那条：「⏰ 定时」卡片，不是用户气泡（main/scheduleWakeView） */
     | { kind: 'schedule'; message: Message; card: ScheduleWakeView }
+    /* 后台命令 / 监视结束发进来的那条：同一套紧凑卡片，不是用户气泡（main/bgWakeView） */
+    | { kind: 'bgWake'; message: Message; card: BgWakeView }
     | { kind: 'assistant'; segments: Message[]; isLast: boolean; question: string };
   // Heal stranded steers before grouping: a steer that ended up AFTER this
   // turn's assistant/tool messages (ordering slip, or restored history) is moved
@@ -4686,6 +4738,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       if (wake) {
         lastQuestion = m.content;
         groups.push({ kind: 'schedule', message: m, card: wake });
+        continue;
+      }
+      /* 后台命令 / 监视结束：同上，画成卡片、不收 steer */
+      const bgWake = parseBgWake(m);
+      if (bgWake) {
+        lastQuestion = m.content;
+        groups.push({ kind: 'bgWake', message: m, card: bgWake });
         continue;
       }
       /* KiroLex 自己的话单独成组：不是提问（不进 lastQuestion），也不收 steer */
@@ -5266,6 +5325,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <PendingSwitchCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} {...pendingCard} />
           ) : group.kind === 'schedule' ? (
             <ScheduleWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
+          ) : group.kind === 'bgWake' ? (
+            <BgWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
           ) : group.kind === 'kirolex' && parseDeniedNoteGroup(group.message.noteGroup) ? (
             <BedrockDeniedCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} />
           ) : group.kind === 'kirolex' && scheduleView.ends.has(group.message.id) ? (
