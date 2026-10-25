@@ -44,11 +44,14 @@ export interface McpComboServer {
    * 按机器覆盖（`localizeServer`）：键是主机名（`os.hostname()`，不分大小写、不看 `.local`）或系统
    * （`darwin` / `win32` / `linux`）；主机名优先。这份文件跟着 S3 同步到别的电脑，一台电脑上的路径在另一台上没有。
    * stdio 型可覆盖 command / args，两种都可写 `disabled: true`（在那台电脑上不用它）。不写 = 和原来一样。
+   * stdio 型还可写 `runOn`：远程会话里「总是在远端运行」（`remote`）/「总是本机转发」（`local`）；不写 = 自动（见 `remoteMcpPlace.ts`）。
    */
   perMachine?: Record<string, McpMachineOverride>;
+  /** 只由 `localizeServer` 从这台电脑的 `perMachine` 里带出来（文件顶层不写它） */
+  runOn?: 'remote' | 'local';
 }
 
-export interface McpMachineOverride { command?: string; args?: string[]; disabled?: boolean }
+export interface McpMachineOverride { command?: string; args?: string[]; disabled?: boolean; runOn?: 'remote' | 'local' }
 
 /** `perMachine` 里按系统写的那几个键（`process.platform` 的值）。 */
 export const MACHINE_OS_KEYS = ['darwin', 'win32', 'linux'] as const;
@@ -82,6 +85,7 @@ export function localizeServer(s: McpComboServer, m: MachineIdentity): McpComboS
     ...(stdio && typeof o.command === 'string' && o.command.trim() ? { command: o.command } : {}),
     ...(stdio && Array.isArray(o.args) ? { args: o.args.map(String) } : {}),
     ...(typeof o.disabled === 'boolean' ? { disabled: o.disabled } : {}),
+    ...(stdio && (o.runOn === 'remote' || o.runOn === 'local') ? { runOn: o.runOn } : {}),
   };
 }
 
@@ -171,7 +175,7 @@ function checkStringMap(v: unknown, what: string): string | null {
 function checkPerMachine(where: string, v: unknown, isHttp: boolean): string | null {
   if (v === undefined) return null;
   if (!isObj(v)) return tr('{where}: perMachine must be an object (hostname or darwin / win32 / linux → override)', { where });
-  const allowed = isHttp ? ['disabled'] : ['command', 'args', 'disabled'];
+  const allowed = isHttp ? ['disabled'] : ['command', 'args', 'disabled', 'runOn'];
   for (const [key, o] of Object.entries(v)) {
     if (!key.trim()) return tr('{where}: a perMachine key cannot be empty', { where });
     if (!isObj(o)) return tr('{where}: perMachine "{key}" must be an object', { where, key });
@@ -181,6 +185,7 @@ function checkPerMachine(where: string, v: unknown, isHttp: boolean): string | n
     if (o.command !== undefined && (typeof o.command !== 'string' || !o.command.trim())) return tr('{where}: perMachine "{key}" command cannot be empty', { where, key });
     if (o.args !== undefined && (!Array.isArray(o.args) || o.args.some((a) => typeof a !== 'string'))) return tr('{where}: perMachine "{key}" args must be a list of strings', { where, key });
     if (o.disabled !== undefined && typeof o.disabled !== 'boolean') return tr('{where}: perMachine "{key}" disabled must be true / false', { where, key });
+    if (o.runOn !== undefined && o.runOn !== 'remote' && o.runOn !== 'local') return tr('{where}: perMachine "{key}" runOn must be "remote" or "local"', { where, key });
   }
   return null;
 }

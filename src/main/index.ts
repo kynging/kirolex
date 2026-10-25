@@ -118,8 +118,12 @@ import {
   remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedWhy, type ForwardListItem,
   markForwardUnavailable, clearForwardUnavailable, type ForwardUnavailable,
   forwardNotReadyNotice, forwardStartingNotice, forwardRestartingNotice, forwardGaveUpNotice, forwardReadyReconnectNotice,
-  httpPendingNotice, httpForwardBackNotice, httpDroppedNotice, type HttpMcpEntry, type ForwardEntry,
+  httpPendingNotice, httpForwardBackNotice, httpDroppedNotice, type HttpMcpEntry, type ForwardEntry, type McpEntry,
 } from './forwardMcp.ts';
+import {
+  placeForwardStdio, placeEligible, normalizeRunOn, remoteWhichScript, parseRemoteWhich, remoteStdioServer,
+  remoteMcpProbeScript, parseRemoteProbe, REMOTE_PROBE_TIMEOUT_SEC, type PlacedRemote, type RemoteProbeResult,
+} from './remoteMcpPlace.ts';
 import {
   allocateRemotePort, localToolsHelp, mcpUrl, parseAgentBase, parseDroppedDupes,
   remoteAgentScript, removeAgentScript, sessionAgentName, SESSION_AGENT_PREFIX,
@@ -149,10 +153,10 @@ import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVar
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
 import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, modelOffersEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
 import { resolveCommand, commandMissingReason } from './commandResolve.ts';
-import { comboLocalAvailability, setMachineOverride } from './comboAvailability.ts';
+import { comboLocalAvailability, comboForwardStdio, setMachineOverride } from './comboAvailability.ts';
 import {
   mcpUnavailableNotice, mcpUnavailableLabel, notForwardedItem, missingCommandItem, failedItem, skippedItem,
-  planMcpNotice, mcpNoticeScope, readMcpNoticeSeen, writeMcpNoticeSeen, type McpUnavailable,
+  planMcpNotice, mcpNoticeScope, readMcpNoticeSeen, writeMcpNoticeSeen, splitQuietMcpItems, type McpUnavailable,
 } from './mcpUnavailable.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
@@ -2264,16 +2268,18 @@ function forwardNotReadyItems(notReady: ForwardNotReady[]): McpUnavailable[] {
  * `scopeId` = 用的哪个 MCP 配置（组合 id；Kiro 远程会话是 agent）；`okNames` = 这次正常带上的（清掉它们「说过了」的记录）。
  * 有第一次出现 / 原因变了的 → 进对话记录（`noteGroup: mcp-unavailable:<scopeId>`，界面的「不再提醒」按它记）；
  * 全都说过了 → 不进对话记录，只把列表交给界面挂徽标（`acp:mcp-unavailable`）。
+ * 找不到程序的（`splitQuietMcpItems`）从来不进对话记录，只在徽标里列出来。
  */
 function announceMcpUnavailable(sessionId: string, scopeId: string, items: McpUnavailable[], okNames: string[]): void {
   const home = os.homedir();
   const seen = readMcpNoticeSeen(home);
-  const plan = planMcpNotice(items, seen, mcpNoticeScope(os.hostname(), scopeId), okNames);
+  const { loud, quiet } = splitQuietMcpItems(items);
+  const plan = planMcpNotice(loud, seen, mcpNoticeScope(os.hostname(), scopeId), okNames);
   const text = mcpUnavailableNotice(items);
   const group = `mcp-unavailable:${scopeId}`;
   let noted = false;
   if (plan.say) {
-    noted = noteInSession(sessionId, text, undefined, group);
+    noted = noteInSession(sessionId, mcpUnavailableNotice(loud), undefined, group);
     logger.info('localmcp', `没带上的 MCP 进对话记录 sessionId=${sessionId}（第一次 / 原因变了：${plan.fresh.join(', ')}）`);
   } else if (items.length) {
     logger.info('localmcp', `没带上的 MCP 之前说过，只挂徽标 sessionId=${sessionId}：${items.map((i) => i.name).join(', ')}`);
@@ -2285,8 +2291,8 @@ function announceMcpUnavailable(sessionId: string, scopeId: string, items: McpUn
     items: items.map((i) => ({ name: i.name, label: mcpUnavailableLabel(i.kind), detail: i.detail })),
     text,
     group,
-    /* 同一条会话重连又准备一遍：前面已经在这条会话里说过同样的，照旧算说过 */
-    noted: noted || (!!prev?.noted && prev.text === text),
+    /* 同一条会话重连又准备一遍：前面已经在这条会话里说过同样的，照旧算说过；有只进徽标的就一直挂着 */
+    noted: !quiet.length && (noted || (!!prev?.noted && prev.text === text)),
   };
   if (items.length) mcpUnavailableBySession.set(sessionId, view); else mcpUnavailableBySession.delete(sessionId);
   mainWindow?.webContents.send('acp:mcp-unavailable', { sessionId, ...(items.length ? view : { items: [], text: '', noted: false, group }) });
@@ -2414,6 +2420,96 @@ function httpForwardFailed(sessionId: string, name: string, error: string): void
   markHttpFresh(h, false);
   logger.warn('localmcp', `HTTP 转发「${name}」转发失败，开始后台探测 sessionId=${sessionId}: ${error}`);
   startHttpWatch(sessionId, lt, h, !!lt.forwardedHttp?.includes(name));
+}
+
+/* ------------------------------ 「从本机转发」的 stdio MCP 这台电脑上没有：改在远端跑（`remoteMcpPlace.ts`） */
+
+/**
+ * 面板里那句「这台电脑没有，已改在 <远端机器> 上运行」的数据：最近一次会话准备把哪个组合的哪条 MCP 放到了哪台远端
+ * （`组合 id \0 名字` → 远端机器）。改回本机 / 两边都没有时删掉。只在内存里（重启后下一次准备再记）。
+ */
+const remoteRunPlaced = new Map<string, string>();
+
+/** 远端起的那条最近一次握手通过的时刻（同 HTTP 转发的 `HTTP_FRESH_MS` 口径：重连那次准备离确认只有几秒，直接交）。 */
+const remoteRunOkAt = new Map<string, number>();
+function remoteRunKey(remote: RemoteTarget, p: PlacedRemote): string {
+  return JSON.stringify([remote.sshHost, remote.sshPort, p.entry.name, p.remoteCommand, p.entry.args || [], p.entry.env || {}]);
+}
+function markRemoteRunFresh(remote: RemoteTarget, p: PlacedRemote, ok: boolean): void {
+  if (ok) remoteRunOkAt.set(remoteRunKey(remote, p), Date.now());
+  else remoteRunOkAt.delete(remoteRunKey(remote, p));
+}
+
+/** 在远端起一次、握手 + tools/list（`remoteMcpProbeScript`）。ssh 本身失败也算没就绪。 */
+function probeRemoteRun(remote: RemoteTarget, p: PlacedRemote): Promise<RemoteProbeResult> {
+  return runRemoteCapture(remote, remoteMcpProbeScript(p), (REMOTE_PROBE_TIMEOUT_SEC + 20) * 1000)
+    .then(parseRemoteProbe, (err: any) => ({ ok: false, toolCount: 0, error: String(err?.message || err) }));
+}
+
+/**
+ * 组合里「从本机转发」的 stdio 项各放哪（规则见 `placeForwardStdio`）：本机有 → 照旧转发；本机没有、远端有 → 远端起；
+ * 都没有 → 不起。只有需要时才去远端查（一次 ssh 查完所有名字），查不了当远端没有。设置名单里来的（`fromList`）不动。
+ */
+async function placeComboForwardStdio(
+  sessionId: string, remote: RemoteTarget, combo: McpCombo, entries: ForwardEntry[], fromList: string[],
+): Promise<ReturnType<typeof placeForwardStdio>> {
+  const input = {
+    entries: entries.filter((e): e is McpEntry => !isHttpForward(e)),
+    eligible: (name: string) => !fromList.includes(name) && placeEligible(name, combo.mcpServers[name]),
+    runOn: (name: string) => normalizeRunOn(combo.mcpServers[name]?.runOn),
+    /* 和 localMcp 起之前那次查的口径一样（`StdioProxy.missingReason`） */
+    localHas: (e: McpEntry) => !!resolveCommand(e.command, { env: { ...process.env, ...(e.env || {}) } }),
+    remoteHost: remote.sshHost,
+  };
+  let r = placeForwardStdio(input);
+  if (r.needRemote.length) {
+    const found = await runRemoteCapture(remote, remoteWhichScript(r.needRemote), 15_000).then(parseRemoteWhich, (err: any) => {
+      logger.warn('localmcp', `远端查命令失败（当远端没有）sessionId=${sessionId}: ${err?.message || err}`);
+      return new Map<string, string>();
+    });
+    r = placeForwardStdio({ ...input, remoteFound: found });
+  }
+  for (const e of input.entries) {
+    if (!input.eligible(e.name)) continue;
+    const key = `${combo.id}\u0000${e.name}`;
+    const onRemote = r.remote.find((p) => p.entry.name === e.name);
+    if (onRemote) {
+      remoteRunPlaced.set(key, remote.sshHost);
+      logger.info('localmcp', `MCP「${e.name}」改在远端 ${remote.sshHost} 上运行：${onRemote.remoteCommand}（${input.runOn(e.name) === 'remote' ? '设置为总是在远端' : '这台电脑上找不到 ' + e.command}）sessionId=${sessionId}`);
+    } else {
+      remoteRunPlaced.delete(key);
+    }
+  }
+  for (const m of r.missing) logger.warn('localmcp', `MCP「${m.entry.name}」不起：${m.reason} sessionId=${sessionId}`);
+  return r;
+}
+
+/**
+ * **远端起的那条没就绪：后台按退避接着在远端试，好了等会话空闲重连挂上**（同 HTTP 转发的看护，`watchHttpForward`）。
+ * 准备时那条合并提示已经说过它起不来，这里不再另说。第一次用准备时那次的结果（不重复起一遍）。
+ */
+function startRemoteRunWatch(sessionId: string, spec: LocalToolsSpec, remote: RemoteTarget, p: PlacedRemote, first: RemoteProbeResult): void {
+  let pending: RemoteProbeResult | null = first;
+  const probe = (): Promise<RemoteProbeResult> => {
+    if (pending) { const r = pending; pending = null; return Promise.resolve(r); }
+    return probeRemoteRun(remote, p);
+  };
+  const name = p.entry.name;
+  watchHttpForward({
+    probe,
+    alive: () => localToolsBySession.get(sessionId) === spec && !deletedSessionIds.has(sessionId) && !isQuitting,
+    mounted: false,
+    markFresh: (ok) => markRemoteRunFresh(remote, p, ok),
+    addAwaiting: () => { if (!spec.awaitingForward?.includes(name)) (spec.awaitingForward ||= []).push(name); },
+    noteResult: () => false,
+    noticeFailed: () => {},
+    noticeBack: () => {},
+    reconnect: () => reconnectForForward(sessionId, name, spec, {
+      confirm: () => probeRemoteRun(remote, p).then((r) => { markRemoteRunFresh(remote, p, r.ok); return r.ok; }, () => false),
+      onConfirmFail: () => startRemoteRunWatch(sessionId, spec, remote, p, { ok: false, toolCount: 0, error: '' }),
+    }),
+    log: (message) => logger.info('localmcp', `远端运行的 MCP「${name}」（${remote.sshHost}）${message} sessionId=${sessionId}`),
+  });
 }
 
 /**
@@ -2736,7 +2832,19 @@ async function ensureLocalTools(
       }
       for (const n of notForwarded) unavailable.push(notForwardedItem(n.name, n.kind, notForwardedWhy(n)));
       if (notForwarded.length) logger.info('localmcp', `组合里没带进远程会话 sessionId=${sessionId}：${notForwarded.map((n) => `${n.name}（${n.kind}）`).join(', ')}`);
-      server.setProxies(sessionId, entries);
+      /*
+        **「从本机转发」的 stdio 项这台电脑上没有：远端有就直接在远端跑，都没有就安静跳过**（`placeComboForwardStdio`）。
+        本机起的照旧交给 setProxies；远端起的不走转发，作为普通 stdio MCP 交给远端适配器（就绪了才交，见下）；
+        两边都没有的只进徽标（`missingCommandItem` 不进对话记录）。
+      */
+      const placed = await placeComboForwardStdio(sessionId, remote, combo, entries, fromList);
+      for (const m of placed.missing) {
+        unavailable.push(missingCommandItem(m.entry.name, m.entry.command, m.reason));
+        skippedReasons.push({ name: m.entry.name, reason: m.reason });
+      }
+      const movedOff = new Set([...placed.remote, ...placed.missing].map((x) => x.entry.name));
+      const localEntries = entries.filter((e) => !movedOff.has(e.name));
+      server.setProxies(sessionId, localEntries);
       /*
         **转发的 stdio MCP 先就绪、再交给适配器** ——「builder-mcp / agentcore-websearch 间歇 CONNECT_TIMEOUT」。
         原来进程是远端第一个 initialize 到了才起（懒启动），起得慢就超过适配器的建连超时，而适配器不会再连第二次。
@@ -2744,24 +2852,42 @@ async function ensureLocalTools(
         到期没好的先不交（交了也只是 CONNECT_TIMEOUT），在会话里说清楚，后台接着起，好了自动重连挂上（`forwardProxyState`）。
         同一份配置的进程重连时接着用（`setProxies` 复用），所以只有第一次要等。
       */
-      const notReady = await gateForwardStdio(server, sessionId, entries.filter((e) => !isHttpForward(e)).map((e) => e.name));
+      /* 远端起的那几条同时在远端试一次握手（61004ec5 同一个口径：就绪了才交）；最近刚通过的直接交 */
+      const [notReady, remoteReady] = await Promise.all([
+        gateForwardStdio(server, sessionId, localEntries.filter((e) => !isHttpForward(e)).map((e) => e.name)),
+        Promise.all(placed.remote.map(async (p) => {
+          const cached = httpHandedNow(remoteRunOkAt.get(remoteRunKey(remote, p)), Date.now());
+          return { p, cached, r: cached ? { ok: true, toolCount: 0 } as RemoteProbeResult : await probeRemoteRun(remote, p) };
+        })),
+      ]);
+      for (const { p, r, cached } of remoteReady) {
+        /* 用的是最近那次的结果就不续期（同 HTTP：只信 HTTP_FRESH_MS 内真证实过的） */
+        if (!cached) markRemoteRunFresh(remote, p, r.ok);
+        if (r.ok) logger.info('localmcp', `远端运行的 MCP「${p.entry.name}」就绪${cached ? '（最近刚通过）' : `：${r.toolCount} 个工具`} sessionId=${sessionId}`);
+        else {
+          logger.warn('localmcp', `远端运行的 MCP「${p.entry.name}」没就绪，这次不交给适配器 sessionId=${sessionId}: ${r.error}`);
+          unavailable.push(failedItem(p.entry.name, tr('on {host}: {error}', { host: remote.sshHost, error: r.error || tr('Unknown error') })));
+        }
+      }
+      const remoteHanded = remoteReady.filter((x) => x.r.ok).map((x) => x.p);
       /* HTTP 型：探测通过过的才交（`forwardHandedNow`）；没通过的后台探，通过后自动重连挂上（`watchHttpForwards`） */
-      const handed = entries.filter((e) => forwardHandedNow(e, notReady));
-      const http = entries.filter(isHttpForward);
+      const handed = localEntries.filter((e) => forwardHandedNow(e, notReady));
+      const http = localEntries.filter(isHttpForward);
       const spec: LocalToolsSpec = {
         remotePort, localPort: server.port(), agentOverride,
         forwarded: handed.filter((e) => !isHttpForward(e)).map((e) => e.name),
         forwardedHttp: handed.filter(isHttpForward).map((e) => e.name),
-        mcpServers: [mcp, ...remoteComboMcpServers(handed, mcpUrl(remotePort, urlPath))],
+        mcpServers: [mcp, ...remoteComboMcpServers(handed, mcpUrl(remotePort, urlPath)), ...remoteHanded.map(remoteStdioServer)],
         skipped: skippedReasons,
         httpEntries: http,
         awaitingForward: [
           ...notReady.filter((n) => n.starting).map((n) => n.name),
           ...http.filter((h) => !handed.includes(h)).map((h) => h.name),
+          ...remoteReady.filter((x) => !x.r.ok).map((x) => x.p.entry.name),
         ],
       };
-      if (entries.length) {
-        logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${entries.map((e) => e.name).join(', ')}`
+      if (localEntries.length) {
+        logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${localEntries.map((e) => e.name).join(', ')}`
           + `（组合「${combo.name}」：${fromCombo.join(', ') || '无'}；设置名单：${fromList.join(', ') || '无'}）`);
       }
       if (skippedReasons.length) {
@@ -2771,9 +2897,14 @@ async function ensureLocalTools(
       toollessSessions.delete(sessionId);
       noteForwardNotReady(server, sessionId, spec, notReady);
       unavailable.push(...forwardNotReadyItems(notReady));
-      announceMcpUnavailable(sessionId, combo.id, unavailable, entries.filter((e) => !notReady.some((n) => n.name === e.name)).map((e) => e.name));
+      announceMcpUnavailable(sessionId, combo.id, unavailable, [
+        ...localEntries.filter((e) => !notReady.some((n) => n.name === e.name)).map((e) => e.name),
+        ...remoteHanded.map((p) => p.entry.name),
+      ]);
       /* 探测，但不挡会话（同 Kiro 分支）；先登记 spec，失败才记得到它上面（`noteHttpProbe`） */
       watchHttpForwards(sessionId, spec, http);
+      /* 远端起的那几条没就绪的：后台接着在远端试，好了等空闲重连挂上 */
+      for (const { p, r } of remoteReady) if (!r.ok) startRemoteRunWatch(sessionId, spec, remote, p, r);
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
       return spec;
     }
@@ -12955,15 +13086,24 @@ ${hint}` : ''}` };
    */
   ipcMain.handle('acp:mcp-combos-local-check', (_event, text: string) => {
     const machine = thisMachine();
-    return { ...machine, items: comboLocalAvailability(String(text ?? ''), machine) };
+    /*
+      `forwardStdio`：「从本机转发」的 stdio 项和这台电脑上选的「在哪跑」（自动 / 总是在远端运行 / 总是本机转发）；
+      `ranOnRemote`：最近一次远程会话准备时这台电脑没有、已改在远端跑的那条在哪台远端（`placeComboForwardStdio`）
+    */
+    const forwardStdio = comboForwardStdio(String(text ?? ''), machine).map((row) => {
+      const host = remoteRunPlaced.get(`${row.comboId}\u0000${row.server}`);
+      return host ? { ...row, ranOnRemote: host } : row;
+    });
+    return { ...machine, items: comboLocalAvailability(String(text ?? ''), machine), forwardStdio };
   });
   /** 改编辑框里的文本：给一条 MCP 写上这台电脑的覆盖（`setMachineOverride`）；找不到那条 → null。保存仍走 `acp:save-mcp-combos`。 */
-  ipcMain.handle('acp:mcp-combos-machine-override', (_event, text: string, fileId: string, server: string, override: { command?: string; args?: string[]; disabled?: boolean }) => {
+  ipcMain.handle('acp:mcp-combos-machine-override', (_event, text: string, fileId: string, server: string, override: { command?: string; args?: string[]; disabled?: boolean; runOn?: string }) => {
     const o = override && typeof override === 'object' ? override : {};
     return setMachineOverride(String(text ?? ''), String(fileId ?? ''), String(server ?? ''), os.hostname(), {
       ...(typeof o.command === 'string' ? { command: o.command.trim() } : {}),
       ...(Array.isArray(o.args) ? { args: o.args.map(String) } : {}),
       ...(typeof o.disabled === 'boolean' ? { disabled: o.disabled } : {}),
+      ...(o.runOn !== undefined ? { runOn: normalizeRunOn(o.runOn) } : {}),
     });
   });
   /** 输入框上方「⚠ N 个 MCP 不可用」徽标：这条会话最近一次准备时没带上的（`announceMcpUnavailable`；界面重载后来取）。 */

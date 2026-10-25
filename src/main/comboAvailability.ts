@@ -7,6 +7,7 @@
  */
 import { localizeServer, perMachineKey, parseMcpCombos, type MachineIdentity } from './mcpCombos.ts';
 import { resolveCommand, commandMissingReason, type ResolveOpts } from './commandResolve.ts';
+import { placeEligible, normalizeRunOn, type McpRunOn } from './remoteMcpPlace.ts';
 
 export interface ComboUnavailable {
   comboId: string;
@@ -46,7 +47,7 @@ export function comboLocalAvailability(text: string, machine: MachineIdentity, o
  */
 export function setMachineOverride(
   text: string, fileId: string, server: string, hostname: string,
-  override: { command?: string; args?: string[]; disabled?: boolean },
+  override: { command?: string; args?: string[]; disabled?: boolean; runOn?: McpRunOn },
 ): string | null {
   let raw: unknown;
   try { raw = JSON.parse(text.charCodeAt(0) === 0xfeff ? text.slice(1) : text); } catch { return null; }
@@ -60,6 +61,41 @@ export function setMachineOverride(
   if (override.command !== undefined) next.command = override.command;
   if (override.args !== undefined) next.args = override.args;
   if (override.disabled !== undefined) { if (override.disabled) next.disabled = true; else delete next.disabled; }
-  s.perMachine = { ...pm, [key]: next };
+  /* 「自动」= 不写 runOn（不留一个空壳的主机名键） */
+  if (override.runOn !== undefined) { if (override.runOn === 'auto') delete next.runOn; else next.runOn = override.runOn; }
+  if (!Object.keys(next).length) {
+    const rest = { ...pm };
+    delete rest[key];
+    if (Object.keys(rest).length) s.perMachine = rest; else delete s.perMachine;
+  } else {
+    s.perMachine = { ...pm, [key]: next };
+  }
   return `${JSON.stringify(raw, null, 2)}\n`;
+}
+
+export interface ForwardStdioRow {
+  comboId: string;
+  fileId: string;
+  comboName: string;
+  server: string;
+  /** 这台电脑上的设置（`perMachine` 的 runOn；不写 = auto） */
+  runOn: McpRunOn;
+}
+
+/**
+ * 面板里「远程会话里在哪跑」那几条：每个组合里会走「从本机转发」回退的 stdio MCP（`placeEligible`，已套上本机覆盖）
+ * 和它在这台电脑上的设置（自动 / 总是在远端运行 / 总是本机转发）。
+ */
+export function comboForwardStdio(text: string, machine: MachineIdentity): ForwardStdioRow[] {
+  const r = parseMcpCombos(text);
+  if (!r.ok) return [];
+  const out: ForwardStdioRow[] = [];
+  for (const c of r.combos) {
+    for (const [name, raw] of Object.entries(c.mcpServers || {})) {
+      const s = localizeServer(raw, machine);
+      if (!placeEligible(name, s)) continue;
+      out.push({ comboId: c.id, fileId: c.aliases?.[0] ?? c.id, comboName: c.name, server: name, runOn: normalizeRunOn(s.runOn) });
+    }
+  }
+  return out;
 }

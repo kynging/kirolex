@@ -92,6 +92,17 @@ export function mcpUnavailableNotice(items: McpUnavailable[]): string {
   );
 }
 
+/**
+ * 哪些**只进徽标、不进对话记录**：找不到程序的（这台电脑上没有 / 远程会话里本机和远端都没有）——
+ * 「别逼用户装」：程序本来就不在这台电脑上，不起、不重试，安静跳过；输入框上方的「⚠ N 个 MCP 不可用」里照样列出来。
+ */
+export function splitQuietMcpItems(items: McpUnavailable[]): { loud: McpUnavailable[]; quiet: McpUnavailable[] } {
+  return {
+    loud: items.filter((i) => i.kind !== 'missing-command'),
+    quiet: items.filter((i) => i.kind === 'missing-command'),
+  };
+}
+
 /** 「说过了」记录的作用域：哪台电脑 + 哪个 MCP 配置（Kiro 远程会话用 agent 名）。 */
 export function mcpNoticeScope(machine: string, comboId: string): string {
   return `${String(machine || '').toLowerCase()}|${comboId}`;

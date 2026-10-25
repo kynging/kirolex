@@ -155,7 +155,7 @@ describe('接线：HTTP 型这次探测没通过前不交给执行器，后台�
     const fn = M.slice(M.indexOf('function forwardHandedNow('), M.indexOf('function forwardHandedNow(') + 300);
     assert.match(fn, /if \(isHttpForward\(e\)\) return httpHandedNow\(httpForwardOkAt\.get\(httpForwardKey\(e\)\), Date\.now\(\)\);/);
     assert.equal(/httpForwardOk\.has/.test(M), false, '不再有「历史上通过过就交」的那份缓存');
-    assert.match(body, /const handed = entries\.filter\(\(e\) => forwardHandedNow\(e, notReady\)\);/);
+    assert.match(body, /const handed = localEntries\.filter\(\(e\) => forwardHandedNow\(e, notReady\)\);/);
     assert.match(body, /forwardedHttp: handed\.filter\(isHttpForward\)/);
     assert.match(body, /const handedK = forwardable\.filter\(\(e\) => forwardHandedNow\(e, notReady\)\);/);
     assert.match(body, /httpEntries: http,/);

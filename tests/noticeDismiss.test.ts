@@ -182,8 +182,8 @@ describe('主进程接线：合并 + 只说一次 + 本机覆盖', () => {
 
   test('只说一次：说过的不进对话记录，只发给界面挂徽标；没说成不记', () => {
     const fn = idx.slice(idx.indexOf('function announceMcpUnavailable'), idx.indexOf('function announceMcpUnavailable') + 2200);
-    assert.match(fn, /planMcpNotice\(items, seen, mcpNoticeScope\(os\.hostname\(\), scopeId\), okNames\)/);
-    assert.match(fn, /if \(plan\.say\) \{\s*noted = noteInSession\(sessionId, text, undefined, group\)/);
+    assert.match(fn, /planMcpNotice\(loud, seen, mcpNoticeScope\(os\.hostname\(\), scopeId\), okNames\)/);
+    assert.match(fn, /if \(plan\.say\) \{\s*noted = noteInSession\(sessionId, mcpUnavailableNotice\(loud\), undefined, group\)/);
     assert.match(fn, /if \(\(!plan\.say \|\| noted\) && .*writeMcpNoticeSeen/);
     assert.match(fn, /webContents\.send\('acp:mcp-unavailable'/);
     assert.match(preload, /mcpUnavailable: \(sessionId: string\) => ipcRenderer\.invoke\('acp:mcp-unavailable'/);

@@ -259,7 +259,7 @@ describe('4.1 组合里的 MCP 没带进远程会话：说一句原因 + 怎么�
     assert.match(body, /for \(const n of notForwarded\) unavailable\.push\(notForwardedItem\(n\.name, n\.kind, notForwardedWhy\(n\)\)\);/);
     assert.match(body, /announceMcpUnavailable\(sessionId, combo\.id, unavailable,/);
     const fn = slice(M, 'function announceMcpUnavailable', 2200);
-    assert.match(fn, /if \(plan\.say\) \{\s*noted = noteInSession\(sessionId, text, undefined, group\)/);
+    assert.match(fn, /if \(plan\.say\) \{\s*noted = noteInSession\(sessionId, mcpUnavailableNotice\(loud\), undefined, group\)/);
     assert.match(fn, /if \(\(!plan\.say \|\| noted\) && .*writeMcpNoticeSeen/);
   });
 });

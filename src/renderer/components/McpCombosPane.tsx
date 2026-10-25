@@ -15,9 +15,15 @@ import { JsonCodeEditor } from './JsonCodeEditor';
  * 文件跟着 S3 同步到别的电脑：编辑框里哪条 stdio MCP 的命令在**这台电脑**上找不到（主进程 `comboLocalAvailability`，
  * 已套上本机的 `perMachine` 覆盖），就标「这台电脑不可用」，给「为这台电脑设置命令 / 在这台电脑上禁用」——
  * 写进那条的 `perMachine["<主机名>"]`（`setMachineOverride`）然后直接保存；别的电脑上的配置不动。
+ *
+ * 「从本机转发」的 stdio MCP 另有一块「远程会话里在哪跑」：自动（默认：本机有就本机转发，没有就在远端找同名命令）/
+ * 总是在远端运行 / 总是本机转发，存成这台电脑的 `perMachine["<主机名>"].runOn`。最近一次远程会话已经把它挪到远端跑的，
+ * 标「这台电脑没有，已改在 <远端机器> 上运行」（主进程 `placeComboForwardStdio`）。
  */
 
 type Unavailable = { comboId: string; fileId: string; comboName: string; server: string; command: string; reason: string; overrideKey?: string };
+type RunOn = 'auto' | 'remote' | 'local';
+type ForwardStdio = { comboId: string; fileId: string; comboName: string; server: string; runOn: RunOn; ranOnRemote?: string };
 
 const api = () => (window as any).kiroApi;
 
@@ -37,7 +43,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
-  const [machine, setMachine] = useState<{ hostname: string; items: Unavailable[] } | null>(null);
+  const [machine, setMachine] = useState<{ hostname: string; items: Unavailable[]; forwardStdio: ForwardStdio[] } | null>(null);
   /* 正在填「为这台电脑设置命令」的那条（`fileId\u0000server`）和填的内容 */
   const [editing, setEditing] = useState<{ key: string; command: string } | null>(null);
 
@@ -60,8 +66,8 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     if (loading || !content.trim() || jsonErrorAt(content)) { setMachine(null); return; }
     let alive = true;
     const timer = setTimeout(() => {
-      void api()?.mcpCombosLocalCheck?.(content).then((r: { hostname: string; items: Unavailable[] }) => {
-        if (alive && r) setMachine({ hostname: r.hostname, items: Array.isArray(r.items) ? r.items : [] });
+      void api()?.mcpCombosLocalCheck?.(content).then((r: { hostname: string; items: Unavailable[]; forwardStdio?: ForwardStdio[] }) => {
+        if (alive && r) setMachine({ hostname: r.hostname, items: Array.isArray(r.items) ? r.items : [], forwardStdio: Array.isArray(r.forwardStdio) ? r.forwardStdio : [] });
       }).catch(() => { /* 查不了就不标 */ });
     }, 400);
     return () => { alive = false; clearTimeout(timer); };
@@ -98,7 +104,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   };
 
   /** 「为这台电脑设置命令 / 在这台电脑上禁用」：写进 perMachine["<主机名>"]，然后直接保存（别的电脑的配置不动） */
-  const applyMachineOverride = async (u: Unavailable, override: { command?: string; disabled?: boolean }) => {
+  const applyMachineOverride = async (u: { fileId: string; server: string }, override: { command?: string; disabled?: boolean; runOn?: RunOn }) => {
     const next: string | null = await api()?.mcpCombosMachineOverride?.(content, u.fileId, u.server, override);
     if (!next) { setStatus({ ok: false, text: t('Not saved: could not find MCP "{name}" in the editor', { name: u.server }) }); return; }
     setEditing(null);
@@ -124,9 +130,12 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
               {machine.items.map((u) => {
                 const key = `${u.fileId}\u0000${u.server}`;
                 const isEditing = editing?.key === key;
+                const ranOn = machine.forwardStdio.find((f) => f.comboId === u.comboId && f.server === u.server)?.ranOnRemote;
                 return (
                   <div key={key} className="mcp-combos-unavailable-row">
-                    <span className="mcp-combos-unavailable-tag">{t('Not available on this computer')}</span>
+                    {ranOn
+                      ? <span className="mcp-combos-unavailable-tag ran-on-remote">{t('Not on this computer; now runs on {host}', { host: ranOn })}</span>
+                      : <span className="mcp-combos-unavailable-tag">{t('Not available on this computer')}</span>}
                     <strong>{u.comboName} / {u.server}</strong>
                     <span className="mcp-combos-unavailable-reason">{u.reason}</span>
                     {isEditing ? (
@@ -153,6 +162,27 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
                   </div>
                 );
               })}
+            </div>
+          )}
+          {!!machine?.forwardStdio.length && (
+            <div className="mcp-combos-runon" role="group" aria-label={t('Where it runs in remote sessions')}>
+              <div>{t('Where it runs in remote sessions (stdio MCPs forwarded from this computer; this setting is only for this computer, {host})', { host: machine.hostname })}</div>
+              {machine.forwardStdio.map((f) => (
+                <div key={`${f.fileId}\u0000${f.server}`} className="mcp-combos-unavailable-row">
+                  <strong>{f.comboName} / {f.server}</strong>
+                  <select
+                    value={f.runOn}
+                    disabled={saving}
+                    aria-label={t('Where {name} runs', { name: f.server })}
+                    onChange={(e) => void applyMachineOverride(f, { runOn: e.target.value as RunOn })}
+                  >
+                    <option value="auto">{t('Auto (default)')}</option>
+                    <option value="remote">{t('Always run on the remote machine')}</option>
+                    <option value="local">{t('Always forward from this computer')}</option>
+                  </select>
+                  {f.ranOnRemote && <span className="mcp-combos-unavailable-tag ran-on-remote">{t('Not on this computer; now runs on {host}', { host: f.ranOnRemote })}</span>}
+                </div>
+              ))}
             </div>
           )}
           {loading ? (

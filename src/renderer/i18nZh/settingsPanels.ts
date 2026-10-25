@@ -493,4 +493,12 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Command on this computer, for example C:\\tools\\builder-mcp.exe': '这台电脑上的命令，例如 C:\\tools\\builder-mcp.exe',
   'Set a command for this computer': '为这台电脑设置命令',
   'Turn off on this computer': '在这台电脑上禁用',
+  // ── McpCombosPane：远程会话里在哪跑 ──
+  'Not on this computer; now runs on {host}': '这台电脑没有，已改在 {host} 上运行',
+  'Where it runs in remote sessions': '远程会话里在哪跑',
+  'Where it runs in remote sessions (stdio MCPs forwarded from this computer; this setting is only for this computer, {host})': '远程会话里在哪跑（从本机转发的 stdio MCP；这个设置只对这台电脑 {host} 生效）',
+  'Where {name} runs': '{name} 在哪跑',
+  'Auto (default)': '自动（默认）',
+  'Always run on the remote machine': '总是在远端运行',
+  'Always forward from this computer': '总是本机转发',
 };

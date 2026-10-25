@@ -320,4 +320,10 @@ export const ZH_MODULES_B: Record<string, string> = {
   '{where}: perMachine "{key}" command cannot be empty': '{where} 的 perMachine「{key}」command 不能是空的',
   '{where}: perMachine "{key}" args must be a list of strings': '{where} 的 perMachine「{key}」args 要是字符串列表',
   '{where}: perMachine "{key}" disabled must be true / false': '{where} 的 perMachine「{key}」disabled 要是 true / false',
+  '{where}: perMachine "{key}" runOn must be "remote" or "local"': '{where} 的 perMachine「{key}」runOn 只能是 "remote" 或 "local"',
+  // ── remoteMcpPlace.ts：「从本机转发」的 stdio MCP 这台电脑上没有，改在远端跑 ──
+  '{host} has no {cmd} (set to always run on the remote machine)': '{host} 上找不到 {cmd}（设成了总是在远端运行）',
+  'Neither this computer nor {host} has {cmd}': '这台电脑和 {host} 上都找不到 {cmd}',
+  'No result from the readiness check on the remote machine': '远端机器上的就绪检查没有返回结果',
+  'on {host}: {error}': '在 {host} 上：{error}',
 };

@@ -262,8 +262,8 @@ describe('接线：远程会话先等转发的 stdio MCP 就绪，再交给执�
   });
 
   test('Claude Code / Codex：setProxies → 等就绪 → 只把就绪的拼进 mcpServers', () => {
-    const set = nonKiro.indexOf('server.setProxies(sessionId, entries);');
-    const ready = nonKiro.indexOf('await gateForwardStdio(server, sessionId,');
+    const set = nonKiro.indexOf('server.setProxies(sessionId, localEntries);');
+    const ready = nonKiro.indexOf('gateForwardStdio(server, sessionId, localEntries');
     const servers = nonKiro.indexOf('mcpServers: [mcp, ...remoteComboMcpServers(handed,');
     assert.ok(set >= 0 && ready > set && servers > ready, '顺序：setProxies → 等就绪 → 才拼 mcpServers');
     assert.match(nonKiro, /awaitingForward: \[\s*\.\.\.notReady\.filter\(\(n\) => n\.starting\)\.map\(\(n\) => n\.name\),\s*\.\.\.http\.filter\(\(h\) => !handed\.includes\(h\)\)/);

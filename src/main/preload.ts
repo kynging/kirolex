@@ -169,7 +169,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 编辑框里的组合哪些 MCP「这台电脑不可用」（命令找不到）+ 这台电脑的主机名 / 系统 */
   mcpCombosLocalCheck: (text: string) => ipcRenderer.invoke('acp:mcp-combos-local-check', text),
   /** 给一条 MCP 写上这台电脑的覆盖（perMachine），返回新文本（不存盘） */
-  mcpCombosMachineOverride: (text: string, fileId: string, server: string, override: { command?: string; args?: string[]; disabled?: boolean }) =>
+  mcpCombosMachineOverride: (text: string, fileId: string, server: string, override: { command?: string; args?: string[]; disabled?: boolean; runOn?: 'auto' | 'remote' | 'local' }) =>
     ipcRenderer.invoke('acp:mcp-combos-machine-override', text, fileId, server, override),
   /** 这条会话最近一次准备时没带上的 MCP（输入框上方的徽标） */
   mcpUnavailable: (sessionId: string) => ipcRenderer.invoke('acp:mcp-unavailable', sessionId),
