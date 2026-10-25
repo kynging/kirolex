@@ -75,14 +75,14 @@ describe('接线：完成事件带 toolTailFrom、渲染端并进消息', () => 
     assert.ok(i > 0);
     assert.match(M.slice(i, i + 500), /\.\.\.\(entry\.bufAtLastTool \? \{ toolTailFrom: entry\.bufAtLastTool \} : \{\}\)/);
   });
-  test('useAcp 的完成事件处理用 mergeAssistantFinal（正文相同也会更新位置）', () => {
+  test('useAcp 的完成事件处理用 mergeAssistantFinalIntoTurn（按段并，只有一段时就是 mergeAssistantFinal；正文相同也会更新位置）', () => {
     const r = read('renderer', 'hooks', 'useAcp.ts');
     const i = r.indexOf('const removeAssistantFinal = window.kiroApi.onAssistantFinal');
     assert.ok(i > 0);
     const body = r.slice(i, i + 1500);
     /* 另外带着回复的去重标记（replyTo / replyComplete，见 duplicateSubmit.test.ts） */
-    assert.match(body, /\(\{ sessionId: sid, messageId, text, toolTailFrom, replyTo, replyComplete \}\)/);
-    assert.match(body, /const merged = mergeAssistantFinal\(list\[idx\], text, toolTailFrom\);/);
+    assert.match(body, /\(\{ sessionId: sid, messageId, text, toolTailFrom, replyTo, replyComplete, segmentBreaks \}\)/);
+    assert.match(body, /const merged = mergeAssistantFinalIntoTurn\(list, messageId, text, toolTailFrom, segmentBreaks\);/);
     assert.doesNotMatch(body, /if \(list\[idx\]\.content === text\) return list;/);
   });
 });

@@ -264,7 +264,7 @@ describe('接线：回复的去重标记贯通渲染层的读、写和整份重�
     const fl = M.slice(M.indexOf("mainWindow?.webContents.send('acp:assistant-final'"), M.indexOf("mainWindow?.webContents.send('acp:assistant-final'") + 700);
     assert.match(fl, /\.\.\.\(replyTo \? \{ replyTo \} : \{\}\),/);
     assert.match(fl, /\.\.\.\(replyTo && completedFor === replyTo \? \{ replyComplete: true as const \} : \{\}\),/);
-    assert.match(HK, /next\[idx\] = \{ \.\.\.next\[idx\], \.\.\.\(merged \|\| \{\}\), \.\.\.marks \};/);
+    assert.match(HK, /const next = \[\.\.\.merged\.list\];\s*next\[idx\] = \{ \.\.\.next\[idx\], \.\.\.marks \};/);
   });
   test('主进程整份重写时按盘上的补回去（渲染层那份没带也不丢）', () => {
     const rw = ST.slice(ST.indexOf('export function rewriteTranscript('), ST.indexOf('export function rewriteTranscript(') + 2000);

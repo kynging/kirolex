@@ -426,7 +426,7 @@ declare global {
       onUpdate: (callback: (data: any) => void) => () => void;
       onError: (callback: (error: any) => void) => () => void;
       onNotice?: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => () => void;
-      onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true }) => void) => () => void;
+      onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true; segmentBreaks?: number[] }) => void) => () => void;
       onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;

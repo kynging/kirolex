@@ -103,6 +103,7 @@ import { controlMessageId, isControlMessageId, isSessionMessageId, tailEntries, 
 import { PairRateLimiter, ReplyWatcher, callSessionTool, type ReplyWatch, type SessionCallsHost, type SessionInfo } from './sessionCalls.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { settleInFlightAttach } from './attachGate.ts';
+import { trackReplySegments, type ReplySegments } from './replySegments.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
 import { createCreationGate } from './creationGate.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
@@ -253,6 +254,8 @@ interface SessionEntry {
   textThisTurn?: boolean;
   /** 这一轮最后一次开工具调用那一刻 `assistantBuf` 的长度 —— 判「把工具调用写成了文字」只看这之后的正文（`textToolCall.ts`）。 */
   bufAtLastTool?: number;
+  /** 界面上这一轮回复被思考块切成的几段在 `assistantBuf` 里的起点（`replySegments.ts`） */
+  replySegments?: ReplySegments;
   /**
    * **这一轮有没有工具可能写过文件**（只远程会话用）。
    *
@@ -6834,6 +6837,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       ) {
         return;
       }
+      /* 界面上这一轮被思考块切成了几段、每段从哪开始（`replySegments.ts`）—— 一轮结束时随 acp:assistant-final 发过去 */
+      entry.replySegments = trackReplySegments(entry.replySegments, u, entry.assistantBuf.length);
       if (u?.sessionUpdate === 'agent_message_chunk') {
         entry.assistantBuf += u?.content?.text || '';
         if (u?.content?.text) { entry.textThisTurn = true; noteTurnStarted(sessionId, entry); }
@@ -7171,6 +7176,7 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   // streaming). Ship the complete text so the on-screen message can never end up
   // shorter than what was actually produced (observed: reply cut mid-sentence in
   // the UI while the transcript on disk was complete).
+  const segmentBreaks = (entry.replySegments?.breaks ?? []).filter((b) => b > 0 && b <= entry.assistantBuf.length);
   if (finalText && !entry.priming) {
     mainWindow?.webContents.send('acp:assistant-final', {
       sessionId,
@@ -7181,8 +7187,11 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
       /* 去重标记也给界面一份：之后整份重写 transcript（编辑后重跑）时它原样写回去（主进程那边也会按盘上的补） */
       ...(replyTo ? { replyTo } : {}),
       ...(replyTo && completedFor === replyTo ? { replyComplete: true as const } : {}),
+      /* 界面按段对上权威正文（中间漏收的也补回来，不重复）：每段的起点（`replySegments.ts`） */
+      ...(segmentBreaks.length ? { segmentBreaks } : {}),
     });
   }
+  entry.replySegments = undefined;
   entry.assistantBuf = '';
   entry.assistantMsgId = null;
   entry.lastAcpMessageId = undefined;

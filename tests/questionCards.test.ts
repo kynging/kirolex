@@ -113,8 +113,14 @@ describe('接线（源码）', () => {
   });
 
   test('流式追加、一轮结束的权威正文、工具调用、重发丢半截：都跳过卡片', () => {
-    assert.equal((ACP.match(/!last\.content\.startsWith\('💭 '\) && !isQuestionMessage\(last\)/g) || []).length, 2);
-    assert.match(ACP, /list\[i\]\.role === 'assistant' && !list\[i\]\.content\.startsWith\('💭 '\) && !isQuestionMessage\(list\[i\]\)/);
+    /* 流式追加（前台 / 后台缓存两处）和一轮结束的权威正文搬进了纯函数（liveReply.ts / assistantFinal.ts） */
+    const LIVE = read('renderer', 'liveReply.ts');
+    const FINAL = read('renderer', 'assistantFinal.ts');
+    assert.equal((ACP.match(/appendAgentText\(/g) || []).length, 2);
+    assert.match(LIVE, /!last\.content\.startsWith\('💭 '\) && !isQuestionMessage\(last\)/);
+    assert.match(ACP, /mergeAssistantFinalIntoTurn\(list, messageId, text, toolTailFrom, segmentBreaks\)/);
+    assert.match(FINAL, /list\[i\]\.role === 'assistant' && !list\[i\]\.content\.startsWith\('💭 '\) && !isQuestionMessage\(list\[i\]\)/);
+    assert.match(FINAL, /const isReplySegment = \(m: TurnMsg\) => m\.role === 'assistant' && !m\.content\.startsWith\('💭 '\) && !isQuestionMessage\(m\)/);
     assert.match(ACP, /current\[index\]\.role === 'assistant' && !isQuestionMessage\(current\[index\]\)/);
     assert.match(ACP, /list\[i\]\.role === 'assistant' && !isQuestionMessage\(list\[i\]\)\) \{ idx = i; break; \}/);
   });

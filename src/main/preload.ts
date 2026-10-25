@@ -853,7 +853,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   peekTurn: (sessionId: string): Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }> =>
     ipcRenderer.invoke('acp:peek-turn', sessionId),
   /** Authoritative full assistant text at turn end (heals dropped chunks). */
-  onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true }) => void) => {
+  onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true; segmentBreaks?: number[] }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:assistant-final', handler);
     return () => ipcRenderer.removeListener('acp:assistant-final', handler);

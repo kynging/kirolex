@@ -33,7 +33,8 @@ import { cleanIpcError } from '../sessionRequestStatus.ts';
 import { firstUserText } from '../titleSource.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { chatHistoryBody } from '../historyBlock.ts';
-import { mergeAssistantFinal } from '../assistantFinal.ts';
+import { mergeAssistantFinalIntoTurn } from '../assistantFinal.ts';
+import { appendAgentText, appendAgentThought } from '../liveReply.ts';
 import { connectFailureNotice, adapterInstalledNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
 import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer';
 import { forkRemoteIntent, firstSendRemoteId, forkMachineMissingText, restoredForkIntents, FORK_MACHINE_MISSING_GROUP } from '../forkTarget';
@@ -2476,44 +2477,22 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // Safety: only write to active session if it's actually streaming.
           // This prevents stale chunks from leaking into a freshly created session.
           if (isActiveSession && streamingIdsRef.current.has(targetSid)) {
-            setMessages((prev) => {
-              const last = prev[prev.length - 1];
-              // Append to the last assistant message during streaming, UNLESS it is
-              // a 💭 thinking segment — reply text must start a fresh message.
-              if (last?.role === 'assistant' && !last.content.startsWith('💭 ') && !isQuestionMessage(last)) {
-                return [
-                  ...prev.slice(0, -1),
-                  { ...last, content: last.content + text },
-                ];
-              } else {
-                // Create new assistant message
-                return [
-                  ...prev,
-                  {
-                    id: update.messageId || `msg_${Date.now()}`,
-                    role: 'assistant',
-                    content: text,
-                    toolCalls: [],
-                    timestamp: Date.now(),
-                  },
-                ];
-              }
-            });
+            // Append to the last assistant message during streaming, UNLESS it is
+            // a 💭 thinking segment — reply text must start a fresh message (liveReply.ts).
+            setMessages((prev) => appendAgentText(prev, text, (content) => ({
+              id: update.messageId || `msg_${Date.now()}`,
+              role: 'assistant',
+              content,
+              toolCalls: [],
+              timestamp: Date.now(),
+            })));
           } else if (targetSid) {
             // Buffer message for background session (or active session that isn't streaming).
             // commitBackgroundMessages also keeps a split pane live if this
             // session happens to be on screen.
-            const cached = messagesCacheRef.current.get(targetSid) || [];
-            const last = cached[cached.length - 1];
-            if (last?.role === 'assistant' && !last.content.startsWith('💭 ') && !isQuestionMessage(last)) {
-              const updated = [...cached.slice(0, -1), { ...last, content: last.content + text }];
-              commitBackgroundMessages(targetSid, updated);
-            } else {
-              commitBackgroundMessages(targetSid, [
-                ...cached,
-                { id: update.messageId || `msg_${Date.now()}`, role: 'assistant' as const, content: text, timestamp: Date.now() },
-              ]);
-            }
+            commitBackgroundMessages(targetSid, appendAgentText(messagesCacheRef.current.get(targetSid) || [], text, (content) => (
+              { id: update.messageId || `msg_${Date.now()}`, role: 'assistant' as const, content, timestamp: Date.now() }
+            )));
           }
           break;
         }
@@ -2524,18 +2503,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           // separate from the reply; live-only, not persisted to the transcript).
           const text = update.content?.text || '';
           if (!text) break;
-          const applyThink = (arr: Message[]): Message[] => {
-            const lastM = arr[arr.length - 1];
-            if (lastM?.role === 'assistant' && lastM.content.startsWith('💭 ')) {
-              return [...arr.slice(0, -1), { ...lastM, content: lastM.content + text }];
-            }
-            return [...arr, {
-              id: update.messageId || `think_${Date.now()}`,
-              role: 'assistant' as const,
-              content: '💭 ' + text,
-              timestamp: Date.now(),
-            }];
-          };
+          const applyThink = (arr: Message[]): Message[] => appendAgentThought(arr, text, (content) => ({
+            id: update.messageId || `think_${Date.now()}`,
+            role: 'assistant' as const,
+            content,
+            timestamp: Date.now(),
+          }));
           if (isActiveSession && streamingIdsRef.current.has(targetSid)) {
             setMessages(applyThink);
           } else if (targetSid) {
@@ -2962,30 +2935,30 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       }
     });
 
-    const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text, toolTailFrom, replyTo, replyComplete }) => {
+    const removeAssistantFinal = window.kiroApi.onAssistantFinal?.(({ sessionId: sid, messageId, text, toolTailFrom, replyTo, replyComplete, segmentBreaks }) => {
       if (!sid || !text) return;
       const patch = (list: Message[]): Message[] => {
-        // Prefer the id main used; fall back to the last assistant message.
-        let idx = list.findIndex((m) => m.id === messageId);
-        if (idx < 0) {
-          for (let i = list.length - 1; i >= 0; i--) {
-            if (list[i].role === 'assistant' && !list[i].content.startsWith('💭 ') && !isQuestionMessage(list[i])) { idx = i; break; }
-          }
-        }
-        if (idx < 0) return list;
-        /* 正文只增不减（never shrink）；toolTailFrom 正文一样也要更新（见 assistantFinal.ts） */
-        const merged = mergeAssistantFinal(list[idx], text, toolTailFrom);
+        /*
+          Prefer the id main used; fall back to the last assistant message. 正文只增不减（never shrink）；
+          toolTailFrom 正文一样也要更新。**按段并**：这一轮被思考块切成几段时，权威正文是几段拼起来的整份，
+          不能整份塞进第一段（Codex 的 final_answer 显示两遍，见 assistantFinal.mergeAssistantFinalIntoTurn）；
+          主进程给了每段的起点（segmentBreaks）就一段对一段，哪一段漏收的块都补回来。
+        */
+        const merged = mergeAssistantFinalIntoTurn(list, messageId, text, toolTailFrom, segmentBreaks);
+        if (!merged) return list;
+        const { idx } = merged;
         /* 去重标记（回的是哪一条、是不是完整回复）跟着这条走 —— 整份重写时原样写回去（`replyMarksOf`） */
         const marks = replyMarksOf({ role: 'assistant', replyTo, replyComplete });
         const marksNew = !!marks.replyTo && (list[idx].replyTo !== marks.replyTo || list[idx].replyComplete !== marks.replyComplete);
-        if (!merged && !marksNew) return list;
-        if (merged && merged.content !== list[idx].content) {
+        if (merged.list === list && !marksNew) return list;
+        const healed = merged.list.reduce((n, m, i) => n + m.content.length - list[i].content.length, 0);
+        if (healed) {
           console.warn('[kirolex] healed truncated assistant message', {
-            sid, rendered: list[idx].content.length, authoritative: text.length,
+            sid, rendered: text.length - healed, authoritative: text.length,
           });
         }
-        const next = [...list];
-        next[idx] = { ...next[idx], ...(merged || {}), ...marks };
+        const next = [...merged.list];
+        next[idx] = { ...next[idx], ...marks };
         return next;
       };
       const cached = messagesCacheRef.current.get(sid);
