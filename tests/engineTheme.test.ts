@@ -7,7 +7,7 @@
  *   2. 开关关掉时三个引擎取的都是统一强调色（就是现在的 --accent），界面回到原样；
  *   3. 颜色不是唯一区分手段：每个引擎都有名字可显示；
  *   4. Kiro 是真正的紫（HSL 色相 255°–275°），三个引擎两两 ΔE2000 ≥ 20；
- *   5. 接线：侧栏行 / 分屏标题 / 会话区挂了 data-accent-engine，CSS 只在那几个小元素上用 --engine-accent。
+ *   5. 接线：侧栏行 / 分屏标题 / 会话区挂了 data-accent-engine，CSS 只在那几个小元素上用 --engine-accent，按钮（发送 / 排队等）一律不用。
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -253,16 +253,30 @@ describe('接线', () => {
     const re = /([^{}]+)\{([^}]*)\}/g;
     let m: RegExpExecArray | null;
     while ((m = re.exec(css))) {
-      if (/var\(--engine-accent/.test(m[2])) for (const s of m[1].split(',')) users.add(s.replace(/\/\*[\s\S]*?\*\//g, '').trim());
+      if (/var\(--engine-/.test(m[2])) for (const s of m[1].split(',')) users.add(s.replace(/\/\*[\s\S]*?\*\//g, '').trim());
     }
     const allowed = [
       '.session-accent-strip', '.engine-badge', '.engine-icon', '.composer:focus-within',
-      '.composer-send', '.composer-send:hover:not(:disabled)', '.thinking-dots span', '.agent-activity-pulse',
+      '.thinking-dots span', '.agent-activity-pulse',
     ];
     assert.deepEqual([...users].filter((s) => !allowed.includes(s)), [], '强调色用到了允许范围之外');
-    for (const s of ['.session-accent-strip', '.engine-badge', '.composer:focus-within', '.composer-send', '.thinking-dots span']) {
+    for (const s of ['.session-accent-strip', '.engine-badge', '.composer:focus-within', '.thinking-dots span']) {
       assert.ok(users.has(s), `${s} 没用 --engine-accent`);
     }
+  });
+  test('发送 / 排队 / 追加 / 停止按钮（.composer-send 各状态）不随引擎变色', () => {
+    const css = read('styles', 'global.css');
+    const re = /([^{}]+)\{([^}]*)\}/g;
+    let m: RegExpExecArray | null;
+    let seen = 0;
+    while ((m = re.exec(css))) {
+      if (!m[1].includes('.composer-send')) continue;
+      seen++;
+      assert.ok(!/--engine-/.test(m[2]), `${m[1].trim()} 还在用 --engine-* 变量`);
+    }
+    assert.ok(seen >= 2, '没找到 .composer-send 的规则');
+    const i = css.indexOf('.composer-send {');
+    assert.match(css.slice(i, css.indexOf('}', i)), /background: var\(--accent\);/);
   });
 });
 

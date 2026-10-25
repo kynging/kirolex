@@ -4419,15 +4419,15 @@ button, input, select, textarea {
   padding: 0;
   border: none;
   border-radius: 50%;
-  background: var(--engine-accent, var(--accent));
-  color: var(--engine-on-accent, #fff);
+  background: var(--accent);
+  color: #fff;
   cursor: pointer;
   transition: filter 0.15s, box-shadow 0.15s, opacity 0.15s;
 }
 
 .composer-send:hover:not(:disabled) {
   filter: brightness(1.1);
-  box-shadow: 0 3px 12px var(--engine-accent-soft, var(--accent-soft));
+  box-shadow: 0 3px 12px var(--accent-soft);
 }
 
 .composer-send:disabled {
