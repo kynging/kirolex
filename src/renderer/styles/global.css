@@ -1391,6 +1391,19 @@ button, input, select, textarea {
   text-align: center;
 }
 
+/* 引擎图标（Icons.tsx 的 EngineIcon）：三个引擎形状不同（engineIcons.ts），颜色是各自的强调色，开关关掉时统一 */
+.engine-icon {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  flex: 0 0 auto;
+  line-height: 0;
+  vertical-align: middle;
+  color: var(--engine-accent, var(--accent));
+}
+.context-menu-engine-icon,
+.agent-profile-tab-icon { margin-right: 5px; }
+
 /* 分屏标题旁的引擎徽标：图标 + 引擎名，颜色只是额外的线索（engineTheme.ts） */
 .engine-badge {
   flex: 0 0 auto;
@@ -1398,8 +1411,8 @@ button, input, select, textarea {
   align-items: center;
   gap: 3px;
   padding: 0 6px;
-  height: 16px;
-  border-radius: 8px;
+  height: 18px;
+  border-radius: 9px;
   border: 1px solid var(--engine-accent, var(--accent));
   color: var(--engine-accent-text, var(--text-secondary));
   font-size: 10px;

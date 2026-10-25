@@ -1,41 +1,31 @@
 import React from 'react';
+import { accentEngine } from '../engineTheme.ts';
+import { ENGINE_ICON_SHAPES } from '../engineIcons.ts';
 
 interface IconProps {
   size?: number;
   className?: string;
 }
 
-export const IconRobot: React.FC<IconProps> = ({ size = 16, className }) => (
-  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <path d="M12 3v3" />
-    <circle cx="12" cy="2.5" r="1" fill="currentColor" stroke="none" />
-    <rect x="4" y="6" width="16" height="13" rx="4" />
-    <circle cx="9" cy="12" r="1.2" fill="currentColor" stroke="none" />
-    <circle cx="15" cy="12" r="1.2" fill="currentColor" stroke="none" />
-    <path d="M9 16h6" />
-  </svg>
-);
-
 /**
- * Claude Code / Codex 会话左下角那颗按钮的图标 ——「claude code 和 codex 应该和 kiro-cli 在界面上有所区别，
- * 至少左下角不应该再用那个机器人的图标了」。机器人留给 kiro；Claude Code 是一朵放射状的星芒（它 logo 的那个意思），
- * Codex 是 OpenAI 那个六瓣交织的结（「>_ 都看不出是 Codex」）。线宽、圆角和机器人那颗一致，放在同一排里不突兀。
- *
- * Codex 的结 = 同一片瓣（半径 3.4 的圆弧瓣头 + 外侧直边 + 往里折的一小段）绕中心转 6 次。往里折的那段
- * 只画六成、不伸到圆心 —— 中间留一个六边形的空，15px 下才不会在圆心挤成一团（画满就是一个糊掉的风车）。
+ * **引擎图标** —— 所有代表「这是哪个引擎」的地方都用它（分屏标题旁徽标、会话左下角那颗按钮、引擎配置面板标题、
+ * 新建会话 / 设置里的引擎状态行、Claude Code / Codex 配置 tab、侧栏右键「引擎」子菜单）。
+ * 三个形状类型不同（Kiro 方头机器人描边 / Claude Code 实心星芒 / Codex 空心结），见 `engineIcons.ts`；
+ * 颜色是这个引擎的强调色（`engineTheme.ts`，设置「按引擎区分颜色」关掉时三者同色，形状照样不同）。
  */
-export const IconClaudeSpark: React.FC<IconProps> = ({ size = 16, className }) => (
-  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.9" strokeLinecap="round" aria-hidden="true">
-    <path d="M12 3.5v5.5M12 15v5.5M3.5 12H9M15 12h5.5M6 6l3.9 3.9M14.1 14.1L18 18M18 6l-3.9 3.9M9.9 14.1L6 18" />
-    <circle cx="12" cy="12" r="1.3" fill="currentColor" stroke="none" />
-  </svg>
-);
-
-export const IconCodex: React.FC<IconProps> = ({ size = 16, className }) => (
-  <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="1.8" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-    <path d="M11.41 18.76A3.4 3.4 0 0 0 18 17.6V12.8L14.28 10.65M5.85 14.87A3.4 3.4 0 0 0 10.15 20L14.31 17.6V13.3M6.44 8.11A3.4 3.4 0 0 0 4.15 14.4L8.31 16.8L12.03 14.65M12.59 5.24A3.4 3.4 0 0 0 6 6.4V11.2L9.72 13.35M18.15 9.13A3.4 3.4 0 0 0 13.85 4L9.69 6.4V10.7M17.56 15.89A3.4 3.4 0 0 0 19.85 9.6L15.69 7.2L11.97 9.35" />
-  </svg>
-);
+export const EngineIcon: React.FC<{ engine?: string | null; size?: number; className?: string }> = ({ engine, size = 16, className }) => {
+  const e = accentEngine(engine);
+  const shape = ENGINE_ICON_SHAPES[e];
+  return (
+    <span className={`engine-icon${className ? ` ${className}` : ''}`} data-accent-engine={e} data-engine-icon={e} aria-hidden="true">
+      <svg width={size} height={size} viewBox="0 0 24 24" strokeLinecap="round" strokeLinejoin="round">
+        {shape.parts.map((p, i) => (
+          <path key={i} d={p.d} fill={p.filled ? 'currentColor' : 'none'} stroke={p.filled ? 'none' : 'currentColor'} strokeWidth={p.filled ? undefined : shape.strokeWidth} />
+        ))}
+      </svg>
+    </span>
+  );
+};
 
 export const IconPaperclip: React.FC<IconProps> = ({ size = 17, className }) => (
   <svg className={className} width={size} height={size} viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">

@@ -5,6 +5,7 @@
  */
 import React, { useEffect, useSyncExternalStore } from 'react';
 import { useT } from '../hooks/useLang';
+import { EngineIcon } from './Icons';
 import {
   createEngineStatusStore, ENGINE_NAMES, ENGINE_ORDER, outputTail, stateIcon,
   type EngineId, type EngineStatusLite, type EngineStatusStore, type MachineState,
@@ -77,6 +78,7 @@ export function EngineStatusPanel({ machine, selected, compact, title }: {
           <div key={e} className={`engine-status-row${selected === e ? ' selected' : ''}`} data-engine={e} data-state={s?.state || 'loading'}>
             <div className="engine-status-line" title={s?.detail || ''}>
               <span className="engine-status-icon">{loadingFirst ? '…' : stateIcon(s?.state)}</span>
+              <EngineIcon engine={e} size={14} />
               <span className="engine-status-name">{ENGINE_NAMES[e]}</span>
               {s?.version && <span className="engine-status-ver">{s.version}</span>}
               <span className="engine-status-text">{s ? <StateText s={s} /> : loadingFirst ? t('Checking…') : ''}</span>

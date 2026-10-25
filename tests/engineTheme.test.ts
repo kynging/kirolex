@@ -125,7 +125,7 @@ describe('颜色不是唯一区分手段', () => {
     const i = app.indexOf('className="engine-badge"');
     assert.ok(i > 0, '没找到 engine-badge');
     const seg = app.slice(i - 300, i + 600);
-    assert.match(seg, /EngineBadgeIcon|IconClaudeSpark|IconCodex/);
+    assert.match(seg, /EngineIcon|EngineBadgeIcon|IconClaudeSpark|IconCodex/);
     assert.match(seg, /engineLabel\(/);
   });
 });
@@ -153,7 +153,7 @@ describe('接线', () => {
       if (/var\(--engine-accent/.test(m[2])) for (const s of m[1].split(',')) users.add(s.replace(/\/\*[\s\S]*?\*\//g, '').trim());
     }
     const allowed = [
-      '.session-accent-strip', '.engine-badge', '.composer:focus-within',
+      '.session-accent-strip', '.engine-badge', '.engine-icon', '.composer:focus-within',
       '.composer-send', '.composer-send:hover:not(:disabled)', '.thinking-dots span', '.agent-activity-pulse',
     ];
     assert.deepEqual([...users].filter((s) => !allowed.includes(s)), [], '强调色用到了允许范围之外');

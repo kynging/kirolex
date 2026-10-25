@@ -112,8 +112,9 @@ describe('引擎跟着会话走（每一处白名单都要带上它）', () => {
     const ca = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.match(ca, /\{nonKiro \? \(/);
     assert.match(ca, /\{!nonKiro && \(/);
-    /* 「左下角不应该再用那个机器人的图标了」 */
-    assert.match(ca, /engine === 'claude' \? <IconClaudeSpark size=\{15\} \/> : <IconCodex size=\{15\} \/>/);
+    /* 「左下角不应该再用那个机器人的图标了」：Claude Code / Codex 分支用各自引擎的图标（形状见 engineIcons.ts） */
+    assert.match(ca, /<EngineIcon engine=\{engine\} size=\{15\} \/>/);
+    assert.doesNotMatch(ca, /\{engine === 'claude' \? <IconClaudeSpark[^}]*\} : <IconRobot/);
     /* 「我点到 setting 之类根本无法回到原先那个配置界面」：tab 栏在限高的 flex 列里不能被压成 0 高 */
     const css = read('src', 'renderer', 'styles', 'global.css');
     assert.match(css, /\.agent-config-editor-dialog \.kiro-config-tabs \{\s*flex: none;/);

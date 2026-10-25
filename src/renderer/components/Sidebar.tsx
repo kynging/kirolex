@@ -31,7 +31,7 @@ import {
 import { CSS } from '@dnd-kit/utilities';
 import type { Session } from '../App';
 import type { ScheduleSummary } from '../scheduleView';
-import { IconLogs, IconWorkspaceFolder } from './Icons';
+import { EngineIcon, IconLogs, IconWorkspaceFolder } from './Icons';
 import { showToast } from './Toasts';
 import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
 import { engineCliName, engineLabel } from '../engineLabel';
@@ -1344,7 +1344,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     onClick={() => { void onSetEngine(ctxSession.id, eng); setContextMenu(null); }}
                     title={eng === 'kiro' ? t('Run with kiro-cli (kiro’s models and agents)') : t('Run with {engine} (its own login and default model)', { engine: ENGINE_NAMES[eng] })}
                   >
-                    {`${(ctxSession.engine || 'kiro') === eng ? '✓ ' : '　'}${ENGINE_NAMES[eng]}`}
+                    {(ctxSession.engine || 'kiro') === eng ? '✓ ' : '　'}<EngineIcon engine={eng} size={14} className="context-menu-engine-icon" />{ENGINE_NAMES[eng]}
                   </div>
                 ))}
               </Submenu>

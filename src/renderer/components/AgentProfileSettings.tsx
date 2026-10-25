@@ -5,6 +5,7 @@ import { formatJsonOnOpen, formatJsonText, jsonErrorAt } from '../jsonText.ts';
 import { areaLabel, confirmText, diffText, type DiffItemView, type PlanView } from '../agentProfileView.ts';
 import { JsonCodeEditor } from './JsonCodeEditor';
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
+import { EngineIcon } from './Icons';
 
 /**
  * **设置 → 🖥 机器 →「AI 工具配置」** ——「统一定义远程机器上 Claude Code 的配置并同步过去」。
@@ -201,6 +202,7 @@ export const AgentProfileSettings: React.FC = () => {
       <div className="agent-profile-tabs" role="tablist">
         {(['claude', 'codex'] as const).map((e) => (
           <button key={e} role="tab" aria-selected={engine === e} className={`remote-btn${engine === e ? ' remote-btn-primary' : ''}`} onClick={() => switchEngine(e)}>
+            <EngineIcon engine={e} size={14} className="agent-profile-tab-icon" />
             {e === 'claude' ? 'Claude Code' : 'Codex'}
           </button>
         ))}

@@ -35,7 +35,7 @@ import { ReviewPane, isDeckPath } from './components/ReviewPane';
 import { PreviewFind } from './components/PreviewFind';
 import { findOwner, isInPreview, previewSearchable } from './previewFind';
 import { savedScrollOf, scrollHostOf, restoreScroll } from './tabScroll';
-import { IconClose, IconLogs, IconRobot, IconClaudeSpark, IconCodex } from './components/Icons';
+import { IconClose, IconLogs, EngineIcon } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
@@ -899,9 +899,6 @@ const isMac =
 /** Windows / Linux：系统白标题栏去掉了（见主进程 createWindow），这里自己画一条深色的、可拖动的。 */
 const isWinFrame = typeof navigator !== 'undefined' && !isMac;
 
-/** 分屏标题旁引擎徽标的图标：和会话左下角那颗同一套（机器人是 kiro 的） */
-const EngineBadgeIcon: React.FC<{ engine?: string }> = ({ engine }) =>
-  engine === 'claude' ? <IconClaudeSpark size={11} /> : engine === 'codex' ? <IconCodex size={11} /> : <IconRobot size={11} />;
 
 const App: React.FC = () => {
   /*
@@ -4283,7 +4280,7 @@ const App: React.FC = () => {
           {/* 引擎徽标：颜色之外同时有图标和引擎名（色弱也分得清） */}
           {session && (
             <span className="engine-badge" title={engineLabel(session.engine)}>
-              <EngineBadgeIcon engine={session.engine} />
+              <EngineIcon engine={session.engine} size={14} />
               <span className="engine-badge-name">{engineLabel(session.engine)}</span>
             </span>
           )}

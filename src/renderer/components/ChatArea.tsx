@@ -54,7 +54,7 @@ import type { ScheduleSummary } from '../scheduleView';
 import { ScheduleExpiryPopover, type ScheduleExpiryChange } from './ScheduleExpiryPopover';
 import { bgElapsedText, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
-import { IconClaudeSpark, IconCodex, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconRobot, IconSteer } from './Icons';
+import { EngineIcon, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
@@ -5421,7 +5421,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         aria-label={t('{engine} config', { engine: engineLabel })}
                       >
                         {/* 不用机器人 —— 那是 kiro 的（「左下角不应该再用那个机器人的图标了」） */}
-                        {engine === 'claude' ? <IconClaudeSpark size={15} /> : <IconCodex size={15} />}
+                        <EngineIcon engine={engine} size={15} />
                       </button>
                       {/*
                         **组合** —— 取代原来的 effort 下拉：组合里带着 MCP 和 effort（「不同对话挂不同的 MCP」）。
@@ -5474,7 +5474,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         aria-label={t('Edit agent config (global)')}
                       >
                         {/* 还是那个机器人图标 —— 它在侧栏用了很久，认的是它，不是一个新的齿轮 */}
-                        <IconRobot size={15} />
+                        <EngineIcon engine="kiro" size={15} />
                       </button>
                       {agentConfigLoading && <span className="composer-agent-spinner">⏳</span>}
                       <select
@@ -5803,7 +5803,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           >
             <div className="settings-header">
               <div className="agent-config-editor-title">
-                <IconRobot size={17} />
+                <EngineIcon engine="kiro" size={17} />
                 <h3 id="agent-config-editor-title">{t('Kiro Agent configurations')}</h3>
               </div>
               <button className="settings-close" onClick={closeAgentConfig} aria-label={t('Close')}>✕</button>
@@ -5973,7 +5973,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           <div className="agent-config-editor-dialog" role="dialog" aria-modal="true" aria-labelledby="engine-config-title">
             <div className="settings-header">
               <div className="agent-config-editor-title">
-                {engine === 'claude' ? <IconClaudeSpark size={17} /> : <IconCodex size={17} />}
+                <EngineIcon engine={engine} size={17} />
                 <h3 id="engine-config-title">{t('{engine} config', { engine: engineLabel })}</h3>
               </div>
               <button className="settings-close" onClick={() => setEngineConfigOpen(false)} aria-label={t('Close')}>✕</button>
