@@ -1202,6 +1202,14 @@ button, input, select, textarea {
      overlapped each other. */
   container-type: inline-size;
   container-name: pane;
+  /* 对话列：消息、KiroLex 提示卡、权限条、提示条、排队卡片、输入框……全用下面这一个宽度，
+     左右边缘对齐。按这一格的宽度（cqw）算，所以挂在消息列表、输入区还是直接挂在这里都一样宽、
+     同一条中线；min(100%, …) 兜住父容器更窄的时候（例如右侧面板打开）不横向溢出。
+     窄的一格见下面 `@container pane (max-width: 900px)`。tests/chatColumnWidth.test.ts 守着。 */
+  --chat-col-gutter: 48px;
+}
+.chat-main > * {
+  --chat-col-width: min(100%, (100cqw - 2 * var(--chat-col-gutter)) * 0.8);
 }
 
 .chat-main.drag-over {
@@ -1484,7 +1492,10 @@ button, input, select, textarea {
      scrollbar at the bottom. Pin it hidden; wide code still scrolls inside its
      own `pre { overflow-x: auto }`. */
   overflow-x: hidden;
-  padding: 24px 48px;
+  /* 滚动条（6px，见 ::-webkit-scrollbar）的位置一直留着、算进右边留白：内容区始终正好是
+     左右各 --chat-col-gutter，对话列的中线和下面输入区的一致，出不出滚动条都不左右跳。 */
+  padding: 24px calc(var(--chat-col-gutter) - 6px) 24px var(--chat-col-gutter);
+  scrollbar-gutter: stable;
   -webkit-user-drag: none;
 }
 
@@ -1499,7 +1510,7 @@ button, input, select, textarea {
 
 .message {
   margin-bottom: 20px;
-  width: 80%;
+  width: var(--chat-col-width);
   margin-left: auto;
   margin-right: auto;
 }
@@ -1912,15 +1923,17 @@ button, input, select, textarea {
 .kirolex-message {
   display: flex;
   justify-content: center;
-  margin: 12px 0;
-  padding: 0 16px;
+  width: var(--chat-col-width);
+  margin: 12px auto;
+  box-sizing: border-box;
 }
 .kirolex-message-card {
   display: inline-flex;
   align-items: baseline;
   justify-content: center;
   gap: 7px;
-  max-width: min(92%, 760px);
+  width: 100%;
+  box-sizing: border-box;
   padding: 5px 10px;
   border: 1px solid rgba(124, 111, 224, 0.28);
   border-radius: 12px;
@@ -1983,7 +1996,7 @@ button, input, select, textarea {
 /* 空会话中央那张连接错误卡片的 ×（右上角） */
 .chat-empty-error-close { position: absolute; top: 8px; right: 6px; margin-left: 0; }
 /* 输入框上方「⚠ N 个 MCP 不可用」徽标（ChatArea McpUnavailableBadge） */
-.mcp-unavailable-badge-wrap { position: relative; display: flex; align-items: center; gap: 2px; margin: 0 12px 6px; }
+.mcp-unavailable-badge-wrap { position: relative; display: flex; align-items: center; gap: 2px; width: var(--chat-col-width); margin: 0 auto 6px; box-sizing: border-box; }
 .mcp-unavailable-badge {
   padding: 2px 9px; border: 1px solid rgba(220,120,60,0.45); border-radius: 10px;
   background: rgba(220,120,60,0.12); color: var(--text-secondary); font-size: 11px; cursor: pointer;
@@ -2029,7 +2042,7 @@ button, input, select, textarea {
 /* 定时唤醒 / 定时结束：同一种紧凑卡片（ChatArea ScheduleWakeCard / ScheduleEndCard），不是用户气泡 */
 .schedule-card-box {
   display: flex; flex-direction: column; align-items: stretch; gap: 3px;
-  min-width: min(320px, 92%); text-align: left; padding: 6px 12px;
+  text-align: left; padding: 6px 12px;
 }
 .schedule-card-head { display: flex; align-items: baseline; gap: 8px; }
 .schedule-card-title { flex: 1 1 auto; min-width: 0; color: var(--text-primary); font-size: 12px; font-weight: 600; overflow-wrap: anywhere; }
@@ -2346,7 +2359,7 @@ button, input, select, textarea {
 
 /* Live agent/subagent activity banner (shown while streaming with an active tool) */
 .agent-activity {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 4px auto 12px;
   display: flex;
   align-items: center;
@@ -2612,7 +2625,7 @@ button, input, select, textarea {
   margin-top: 10px;
 }
 .turn-panels {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 12px auto 0;
   display: flex;
   flex-direction: column;
@@ -2842,7 +2855,7 @@ button, input, select, textarea {
 }
 
 .attached-files {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 0 auto;
   display: flex;
   flex-wrap: wrap;
@@ -2901,7 +2914,7 @@ button, input, select, textarea {
 }
 
 .chat-input-wrapper {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 0 auto;
   position: relative;
   flex: 1;
@@ -3034,7 +3047,7 @@ button, input, select, textarea {
 
 /* Input model row */
 .input-model-row {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 6px auto 0;
   display: flex;
   align-items: center;
@@ -3134,7 +3147,7 @@ button, input, select, textarea {
 }
 
 .queue-stack {
-  width: 80%; /* align with .message / .composer */
+  width: var(--chat-col-width); /* align with .message / .composer */
   display: flex;
   flex-direction: column;
   gap: 5px;
@@ -3990,7 +4003,7 @@ button, input, select, textarea {
 }
 
 .permission-bar {
-  width: 80%; /* match .message width so the composer aligns with messages */
+  width: var(--chat-col-width); /* match .message width so the composer aligns with messages */
   margin: 0 auto -1px;
   box-sizing: border-box;
   padding: 9px 12px;
@@ -4012,7 +4025,7 @@ button, input, select, textarea {
    two read as one unit. Warning-tinted, not error-tinted — nothing has been
    interrupted yet, and long commands land here legitimately. */
 .stall-notice {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 0 auto 12px;
   box-sizing: border-box;
   display: flex;
@@ -4041,7 +4054,7 @@ button, input, select, textarea {
    error-tinted: it marks an unanswered ACTION (the turn is waiting to be resubmitted),
    not a failure. */
 .interrupted-bar {
-  width: 80%;
+  width: var(--chat-col-width);
   margin: 0 auto 6px;
   box-sizing: border-box;
   display: flex;
@@ -4310,7 +4323,7 @@ button, input, select, textarea {
 .question-card-summary-value { color: var(--text-primary); font-weight: 500; overflow-wrap: anywhere; }
 
 .composer {
-  width: 80%; /* match .message width so the composer aligns with messages */
+  width: var(--chat-col-width); /* match .message width so the composer aligns with messages */
   margin: 0 auto;
   flex: 1;
   min-height: 76px;
@@ -4488,7 +4501,7 @@ button, input, select, textarea {
 }
 
 .composer-belowbar {
-  width: 80%; /* match .message width so the composer aligns with messages */
+  width: var(--chat-col-width); /* match .message width so the composer aligns with messages */
   min-height: 28px;
   margin: 7px auto 0;
   padding: 0 4px;
@@ -4529,10 +4542,8 @@ button, input, select, textarea {
 /* Pane-width (container) breakpoints: drop the least useful items first, so the
    row stays on ONE line for as long as possible before wrapping. */
 @container pane (max-width: 900px) {
-  .composer,
-  .prompt-suggestions,
-  .composer-belowbar,
-  .archived-composer-banner { width: 100%; }
+  /* 窄的一格：整列（消息、提示卡、权限条、输入框……）一起用满留白以内的宽度，不再只让输入框变宽 */
+  .chat-main > * { --chat-col-width: min(100%, 100cqw - 2 * var(--chat-col-gutter)); }
   .composer-credits, .composer-session-cost { display: none; }
   .composer-model-select { max-width: 132px; }
 }
@@ -4856,17 +4867,13 @@ button, input, select, textarea {
 }
 
 .archived-composer-banner {
-  width: 80%; /* match .message width so the composer aligns with messages */
+  width: var(--chat-col-width); /* match .message width so the composer aligns with messages */
   margin: auto;
   box-sizing: border-box;
 }
 
 @media (max-width: 900px) {
   .chat-input-area { padding-left: 18px; padding-right: 18px; }
-  .composer,
-  .prompt-suggestions,
-  .composer-belowbar,
-  .archived-composer-banner { width: 100%; }
   /* .composer-shortcut is deliberately NOT hidden here: a <900px window means the
      pane is also <900px, so the container queries above already picked the short
      form. Hiding it by window width on top of that just brought the bug back. */
@@ -4876,7 +4883,7 @@ button, input, select, textarea {
 
 /* Empty-chat helpers and Kiro CLI command autocomplete */
 .prompt-suggestions {
-  width: 80%; /* match .message width so the composer aligns with messages */
+  width: var(--chat-col-width); /* match .message width so the composer aligns with messages */
   display: flex;
   flex-wrap: wrap;
   gap: 6px;
@@ -8616,7 +8623,9 @@ button, input, select, textarea {
   display: flex;
   align-items: flex-start;
   gap: 8px;
-  margin: 0 12px 6px;
+  width: var(--chat-col-width);
+  box-sizing: border-box;
+  margin: 0 auto 6px;
   padding: 6px 10px;
   border: 1px solid var(--border);
   border-radius: 6px;
@@ -9814,7 +9823,7 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   box-sizing: border-box;
 }
 .rebuild-pending-item {
-  width: 80%;
+  width: var(--chat-col-width);
   display: flex;
   align-items: center;
   gap: 8px;
