@@ -258,4 +258,14 @@ export const ZH_INDEX_B: Record<string, string> = {
   // ── index.ts：后端自己起的一轮（autonomousTurn.ts）/ Claude 自己定的 cron ──
   '⏰ Background trigger: {engine} started this turn on its own (a scheduled task it set itself, or a background-task follow-up)': '⏰ 后台触发：{engine} 自己起了这一轮（它自己定的定时任务到点，或后台任务的跟进）',
   '⚠️ This chat\'s backend was recycled to make room for another chat. Scheduled tasks Claude set up itself in this chat (CronCreate) went away with it. For timers that must survive, have it use KiroLex\'s schedule_create.': '⚠️ 这条会话的后端被回收了（给别的会话腾位置）。这条会话里 Claude 自己定的定时任务（CronCreate）会随后端一起消失；要可靠的定时，请让它用 KiroLex 的 schedule_create。',
+  "this computer": "本机",
+  "⚠️ Codex on {machine} lacks the AWS permission for web search ({actions}), so this turn stopped. Add the policy below to its IAM identity, or turn off Codex web search on that machine.": "⚠️ {machine} 上的 Codex 缺网页搜索的 AWS 权限（{actions}），这一轮断了。把下面的策略加到它的 IAM 身份上，或者在那台机器上关掉 Codex 网页搜索。",
+  "⚠️ Codex on {machine} lacks the AWS permission to call the model ({actions}), so this turn stopped. Add the policy below to its IAM identity.": "⚠️ {machine} 上的 Codex 缺调用模型的 AWS 权限（{actions}），这一轮断了。把下面的策略加到它的 IAM 身份上。",
+  "Identity: {arn}\nOriginal error: {err}": "身份：{arn}\n原始报错：{err}",
+  "unknown (run `aws sts get-caller-identity` on that machine)": "不知道（在那台机器上跑 `aws sts get-caller-identity` 查）",
+  "Codex on {machine} lacks AWS permission {actions}. See the KiroLex card in this session for the fix.": "{machine} 上的 Codex 缺 AWS 权限 {actions}，怎么补见会话里的 KiroLex 提示卡。",
+  "⚠️ Codex on {machine} is missing the AWS permission to call the model ({actions}), so it cannot answer. Add the policy below to its IAM identity.": "⚠️ {machine} 上的 Codex 缺调用模型的 AWS 权限（{actions}），回答不了。把下面的策略加到它的 IAM 身份上。",
+  "⚠️ Codex on {machine} is missing the AWS permission for web search ({actions}); a turn that searches the web will stop. Add the policy below to its IAM identity, or turn off Codex web search on that machine.": "⚠️ {machine} 上的 Codex 缺网页搜索的 AWS 权限（{actions}），一用网页搜索这一轮就会断。把下面的策略加到它的 IAM 身份上，或者在那台机器上关掉 Codex 网页搜索。",
+  "Found by the permission check when this session started. Identity: {arn}": "会话启动时的权限检查发现的。身份：{arn}",
+  "Codex on that machine does not use Amazon Bedrock.": "那台机器上的 Codex 没走 Amazon Bedrock。",
 };

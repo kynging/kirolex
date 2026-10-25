@@ -10,7 +10,11 @@ import { waitUntil } from './adapterInstallState.ts';
 export type EngineId = 'kiro' | 'claude' | 'codex';
 export type EngineStateId = 'ok' | 'not-logged-in' | 'missing' | 'unknown';
 /** 和主进程 `EngineStatus` 同形。 */
-export interface EngineStatusLite { engine: EngineId; state: EngineStateId; version?: string; detail?: string; loginUnknown?: boolean }
+/* `bedrock`：Codex 走 Bedrock 时主进程挂上的权限预检（`main/bedrockIam.ts` 的 BedrockIamCheck，这里只用到这几项） */
+export interface EngineStatusLite {
+  engine: EngineId; state: EngineStateId; version?: string; detail?: string; loginUnknown?: boolean;
+  bedrock?: { model: 'ok' | 'denied' | 'unknown'; webSearch: 'ok' | 'denied' | 'unknown'; missing: string[]; webSearchDisabled?: boolean };
+}
 
 export const ENGINE_NAMES: Record<EngineId, string> = { kiro: 'Kiro', claude: 'Claude Code', codex: 'Codex' };
 export const ENGINE_ORDER: EngineId[] = ['kiro', 'claude', 'codex'];

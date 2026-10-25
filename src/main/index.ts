@@ -12,6 +12,7 @@ import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, rem
 import { createStatusCache, judgeEngineStatus, localAuthFromFiles, remoteEngineStatuses, kiroInstallCommand, kiroInstallFailedMessage, terminalLaunches, LOGIN_ARGS, remoteLoginHow, type EngineStatus } from './engineStatus.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
+import { bedrockCheckScript, bedrockRegionOf, localBedrockCheckOutput, codexWebSearchDisabled, toggleCodexWebSearch, readLocalConfig, parseRemoteConfigRead, REMOTE_CONFIG_READ_SCRIPT, parseIamPrecheck, parseAccessDenied, roleArnOf, deniedNoteGroup, setCodexWebSearch, withBedrockCheck, type BedrockIamCheck } from './bedrockIam.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
@@ -614,6 +615,8 @@ async function connectWithModelFallback(
     const client = new AcpClient(profile.model, shellEnv, undefined, profile.permissionMode, profile.remote, localTools, engine);
     await client.connect();
     logger.info('engine', `${label}: ${ENGINE_LABEL[engine]} 适配器起来了（${client.launchedWith || '?'}）`);
+    /* 远程 Codex：起来就在后台查一下 Bedrock 权限（不挡连接；缺了就先在会话里说） */
+    if (engine === 'codex' && sessionId) precheckCodexBedrock(sessionId, profile.remote?.sshHost ? profile.remote : undefined);
     return { client, model: profile.model };
   }
   const machine = machineKeyOf(profile);
@@ -3907,7 +3910,7 @@ function runLocalCapture(cmd: string, args: string[], timeoutMs: number): Promis
 }
 
 /** 本机三个引擎的事实 → 状态。 */
-async function localEngineStatuses(): Promise<EngineStatus[]> {
+async function localEngineStatuses(force = false): Promise<EngineStatus[]> {
   const kiro = async (): Promise<EngineStatus> => {
     const notSet = kiroBinProblem();
     const cli = notSet ? null : resolveKiroCli();
@@ -3952,11 +3955,20 @@ async function localEngineStatuses(): Promise<EngineStatus[]> {
       detail: loggedIn === false ? adapterAuthMessage(engine) : undefined,
     });
   };
-  return Promise.all([kiro(), adapter('claude'), adapter('codex')]);
+  const statuses = await Promise.all([kiro(), adapter('claude'), adapter('codex')]);
+  /* 本机 Codex 走 Bedrock 时也做同一份权限预检（不走 Bedrock 的读一下配置就结束；最多等 20 秒，同远端） */
+  if (statuses.some((st) => st.engine === 'codex' && st.state === 'ok')) {
+    const check = ensureBedrockCheck(undefined, force).catch((err: any) => {
+      logger.warn('engines', `Codex Bedrock 权限预检没跑成（本机）：${err?.message || err}`);
+      return null;
+    });
+    await Promise.race([check, new Promise((r) => setTimeout(r, 20_000))]);
+  }
+  return statuses;
 }
 
 /** 远端：和「测试连接」同一次 ssh（kiro 预检 + 两家适配器探测）。 */
-async function remoteEngineStatusesFor(target: RemoteTarget): Promise<EngineStatus[]> {
+async function remoteEngineStatusesFor(target: RemoteTarget, force = false): Promise<EngineStatus[]> {
   const host = target.sshHost || '';
   const args = buildSshArgs(target, `bash -lc ${shellQuote(testConnectionScript(preflightScript(undefined, { models: false })))}`);
   const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
@@ -3966,7 +3978,27 @@ async function remoteEngineStatusesFor(target: RemoteTarget): Promise<EngineStat
   });
   const sections = splitTestOutput(out.stdout);
   const pre = judgePreflight(out.code, sections.kiro, out.stderr, target);
-  return remoteEngineStatuses(host, { code: out.code, ...sections }, pre.code === 'unreachable' ? pre.message : undefined);
+  const statuses = remoteEngineStatuses(host, { code: out.code, ...sections }, pre.code === 'unreachable' ? pre.message : undefined);
+  /*
+    Codex 能用（装了、配过）：顺带做 Bedrock 权限预检（只走 Bedrock 的机器才真查，见 bedrockCheckScript）。
+    模拟那条路几秒就完；没权限模拟时那次试调用最多 60 秒 —— 这里最多等 20 秒，没完就在后台跑完，结果记在 bedrockChecks，
+    下次取状态（`engines:status` 每次都按最新的挂上）/ 登录页都能看到。
+  */
+  if (statuses.some((s) => s.engine === 'codex' && s.state === 'ok')) {
+    const check = ensureBedrockCheck(target, force).catch((err: any) => {
+      logger.warn('engines', `Codex Bedrock 权限预检没跑成（${host}）：${err?.message || err}`);
+      return null;
+    });
+    await Promise.race([check, new Promise((r) => setTimeout(r, 20_000))]);
+  }
+  return statuses;
+}
+
+/** 状态里 Codex 那一项挂上这台机器最近一次的 Bedrock 权限预检（不走 Bedrock 的不挂）。 */
+function withBedrockStatuses(machine: string, statuses: EngineStatus[]): EngineStatus[] {
+  const check = bedrockChecks.get(machine);
+  if (!check || check.notBedrock) return statuses;
+  return statuses.map((s) => (s.engine === 'codex' ? withBedrockCheck(s, check) : s));
 }
 
 /** 一台机器的状态（`'local'` = 本机）：5 分钟缓存 + 同一台同时只问一次。 */
@@ -3980,11 +4012,11 @@ async function engineStatusesFor(machine: string, force = false): Promise<Engine
   if (running) return running;
   const job = (async () => {
     let statuses: EngineStatus[];
-    if (key === 'local') statuses = await localEngineStatuses();
+    if (key === 'local') statuses = await localEngineStatuses(force);
     else {
       const target = findRemoteTarget(KIROLEX_CONFIG_PATH, key);
       if (!target) throw new Error(tr('Machine not found'));
-      statuses = await remoteEngineStatusesFor(target);
+      statuses = await remoteEngineStatusesFor(target, force);
     }
     engineStatusCache.set(key, statuses);
     logger.info('engines', `状态 ${key}: ${statuses.map((s) => `${s.engine}=${s.state}${s.version ? `@${s.version}` : ''}`).join(' ')}`);
@@ -5051,6 +5083,141 @@ function noteInSession(sessionId: string, body: string, variants?: TextVariants,
     });
     return true;
   } catch { return false; }
+}
+
+/**
+ * **Codex 走 Bedrock 的权限预检结果**（按机器 id；`ai-login:bedrock-check` 写，登录页 / 引擎面板读）。
+ * 只在内存里：换了权限点「重新检查」就是新的，没必要落盘。
+ */
+const bedrockChecks = new Map<string, BedrockIamCheck>();
+/** 预检结果的键：那台机器在设置里的 id（老记录里的 remote 没带 id 时按 sshHost 找回；找不到就用 sshHost）。 */
+function bedrockCheckKey(remote: RemoteTarget): string {
+  return durableRemoteId(remote as any, listRemoteTargets(KIROLEX_CONFIG_PATH), (id) => findRemoteTarget(KIROLEX_CONFIG_PATH, id)).remoteId || remote.sshHost;
+}
+const bedrockCheckInFlight = new Map<string, Promise<BedrockIamCheck>>();
+/**
+ * **在那台机器上跑一次权限预检**（`bedrockIam.ts` 的 bedrockCheckScript，只读）—— 同一台同时只跑一次，结果记进 `bedrockChecks`。
+ * 不走 Bedrock 的也记着（`notBedrock`），免得每次检测都 ssh 一趟。`force` = 不用上次的结果。
+ * 谁来调：引擎检测（`remoteEngineStatusesFor`）、远程 Codex 会话起执行器时（`precheckCodexBedrock`）、登录页。
+ */
+/**
+ * 本机跑 aws / codex（不经 bash：Windows 上没有）。`.cmd` 只能经 shell，那时把带空格 / 引号的参数加上引号。
+ * 找不到命令回 null。
+ */
+function runLocalTool(tool: 'aws' | 'codex', args: string[], timeoutMs: number): Promise<{ code: number | null; out: string; timedOut?: boolean } | null> {
+  const cmd = findLocalCli(tool);
+  if (!cmd) return Promise.resolve(null);
+  const needsShell = /\.(cmd|bat)$/i.test(cmd);
+  const q = (a: string): string => (needsShell && /[\s"&|<>^]/.test(a) ? `"${a.replace(/"/g, '""')}"` : a);
+  return new Promise((resolve) => {
+    execFile(needsShell ? `"${cmd}"` : cmd, args.map(q), { timeout: timeoutMs, encoding: 'utf8', shell: needsShell, windowsHide: true, env: shellEnv, cwd: os.homedir() }, (err: any, stdout, stderr) => {
+      resolve({ code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, out: `${stdout || ''}${stderr || ''}`, timedOut: !!err?.killed });
+    });
+  });
+}
+const LOCAL_CODEX_TOML = (): string => path.join(os.homedir(), '.codex', 'config.toml');
+
+function ensureBedrockCheck(remote: RemoteTarget | undefined, force = false): Promise<BedrockIamCheck> {
+  /* 本机的键是 'local'（和 engines:status 的机器键一致） */
+  const key = remote ? bedrockCheckKey(remote) : 'local';
+  const prev = bedrockChecks.get(key);
+  if (prev && !force) return Promise.resolve(prev);
+  const running = bedrockCheckInFlight.get(key);
+  if (running) return running;
+  const run = remote
+    ? runRemoteCapture(remote, bedrockCheckScript(), 120_000)
+    : localBedrockCheckOutput(() => { try { return fs.readFileSync(LOCAL_CODEX_TOML(), 'utf-8'); } catch { return ''; } }, runLocalTool);
+  const job = run.then((out) => {
+    const check = parseIamPrecheck(out);
+    bedrockChecks.set(key, check);
+    if (!check.notBedrock) {
+      logger.info('ai-login', `Codex Bedrock 权限预检（${remote?.sshHost || '本机'}，${check.method}）：模型调用=${check.model} 网页搜索=${check.webSearch} 身份=${check.roleArn || check.identity || '?'}${check.missing.length ? ` 缺=${check.missing.join(',')}` : ''}`);
+    }
+    return check;
+  }).finally(() => { bedrockCheckInFlight.delete(key); });
+  bedrockCheckInFlight.set(key, job);
+  return job;
+}
+
+/**
+ * **远程 Codex 会话起执行器时的权限预检** —— 不用先打开登录页：查出缺权限就在会话里先放一张同样的提示卡
+ * （哪台机器、身份、缺的动作、最小策略、关网页搜索），而不是等到一轮断掉才知道。
+ * 同一条会话里同一张卡（同机器同动作）只放一次；网页搜索已经在那台机器上关掉的，只缺网页搜索时不说。
+ */
+function precheckCodexBedrock(sessionId: string, remote: RemoteTarget | undefined): void {
+  void ensureBedrockCheck(remote).then((check) => {
+    if (check.notBedrock || !check.missing.length) return;
+    const modelMissing = check.model === 'denied';
+    if (!modelMissing && check.webSearchDisabled) return;
+    const target = remote ? findRemoteTarget(KIROLEX_CONFIG_PATH, bedrockCheckKey(remote)) : undefined;
+    /* 本机的机器 id 是 'local'：提示卡上「关掉网页搜索」写的是本机 ~/.codex/config.toml */
+    const group = deniedNoteGroup({ machineId: remote ? target?.id : 'local', region: check.region, actions: check.missing, ...(check.resource ? { resource: check.resource } : {}) });
+    if (store.readTranscript(sessionId).some((m: any) => m?.kirolex && m.noteGroup === group)) return;
+    const machine = remote ? (target?.label || remote.sshHost) : tr('this computer');
+    const actions = check.missing.join(', ');
+    const main = modelMissing
+      ? tr('⚠️ Codex on {machine} is missing the AWS permission to call the model ({actions}), so it cannot answer. Add the policy below to its IAM identity.', { machine, actions })
+      : tr('⚠️ Codex on {machine} is missing the AWS permission for web search ({actions}); a turn that searches the web will stop. Add the policy below to its IAM identity, or turn off Codex web search on that machine.', { machine, actions });
+    const detail = tr('Found by the permission check when this session started. Identity: {arn}', {
+      arn: check.roleArn || check.identity || tr('unknown (run `aws sts get-caller-identity` on that machine)'),
+    });
+    noteInSession(sessionId, trConcat(main, NOTE_DETAIL_SEP, detail), undefined, group);
+  }).catch((err: any) => {
+    logger.warn('ai-login', `Codex Bedrock 权限预检没跑成（${remote?.sshHost || '本机'}）：${err?.message || err}`);
+  });
+}
+
+/**
+ * **Codex 这一轮被 AWS 拒了（缺 IAM 权限）** —— 原来会话里只有一句「stream disconnected before completion:
+ * Access denied: web search is not authorized for this identity.」。换成一张提示卡：哪台机器、哪个身份、缺哪个动作、
+ * 可以直接贴进 IAM 的最小策略、「这台机器暂时关掉 Codex 网页搜索」（界面见 ChatArea 的 BedrockDeniedCard）。
+ * 不是这一类的错误回 null，照原样往下走。KiroLex 不改 IAM，只说怎么改。
+ */
+async function noteBedrockDenied(sessionId: string, profile: AgentProfile, errText: string): Promise<string | null> {
+  if (engineOf(profile) !== 'codex') return null;
+  const denied = parseAccessDenied(errText);
+  if (!denied) return null;
+  const remote = profile.remote?.sshHost ? profile.remote : undefined;
+  const key = remote ? bedrockCheckKey(remote) : 'local';
+  const target = remote ? findRemoteTarget(KIROLEX_CONFIG_PATH, key) : undefined;
+  const machine = remote ? (target?.label || remote.sshHost) : tr('this computer');
+  const cached = bedrockChecks.get(key);
+  /* 错误里常常不带身份（网页搜索那句就没有）：用预检记下的，没有就去那台机器上问一下（只读） */
+  let roleArn = denied.roleArn || cached?.roleArn;
+  /*
+    网页搜索策略的资源带区域，要用那台机器 Codex 配置里的 Bedrock 区域（不是 us-east-1 写死）：
+    有预检结果用它的；没有就和身份一起去那台机器上读一下 ~/.codex/config.toml（只读）。本机会话读本机那份。
+  */
+  let region = cached && !cached.notBedrock ? cached.region : undefined;
+  if ((!roleArn || !region) && remote) {
+    try {
+      const out = await runRemoteCapture(remote, 'aws sts get-caller-identity --query Arn --output text 2>/dev/null </dev/null; echo KX_IAM_TOML; cat ~/.codex/config.toml 2>/dev/null || true', 15_000);
+      const at = out.indexOf('KX_IAM_TOML');
+      if (!roleArn) roleArn = roleArnOf((at >= 0 ? out.slice(0, at) : out).trim().split(/\s+/).pop());
+      if (!region && at >= 0) region = bedrockRegionOf(out.slice(at + 'KX_IAM_TOML'.length));
+    } catch { /* 问不到就说不知道 */ }
+  }
+  if (!remote) {
+    if (!region) { try { region = bedrockRegionOf(fs.readFileSync(LOCAL_CODEX_TOML(), 'utf-8')); } catch { /* 没有就用默认 */ } }
+    /* 本机会话：用本机的 aws 问身份（只读，不经 shell） */
+    if (!roleArn) {
+      const id = await runLocalTool('aws', ['sts', 'get-caller-identity', '--query', 'Arn', '--output', 'text'], 15_000);
+      if (id?.code === 0) roleArn = roleArnOf(id.out.trim().split(/\s+/).pop());
+    }
+  }
+  region = region || denied.region || BEDROCK_DEFAULTS.codex.region;
+  const actions = denied.actions.join(', ');
+  const main = denied.webSearch
+    ? tr('⚠️ Codex on {machine} lacks the AWS permission for web search ({actions}), so this turn stopped. Add the policy below to its IAM identity, or turn off Codex web search on that machine.', { machine, actions })
+    : tr('⚠️ Codex on {machine} lacks the AWS permission to call the model ({actions}), so this turn stopped. Add the policy below to its IAM identity.', { machine, actions });
+  const detail = tr('Identity: {arn}\nOriginal error: {err}', {
+    arn: roleArn || tr('unknown (run `aws sts get-caller-identity` on that machine)'),
+    err: errText.slice(0, 400),
+  });
+  noteInSession(sessionId, trConcat(main, NOTE_DETAIL_SEP, detail), undefined,
+    deniedNoteGroup({ machineId: remote ? target?.id : 'local', region, actions: denied.actions, ...(denied.resource ? { resource: denied.resource } : {}) }));
+  logger.warn('prompt', `Codex 缺 AWS 权限 sessionId=${sessionId} machine=${remote?.sshHost || 'local'} identity=${roleArn || '?'} actions=${actions}`);
+  return tr('Codex on {machine} lacks AWS permission {actions}. See the KiroLex card in this session for the fix.', { machine, actions });
 }
 
 /* ─────────────── 模型自己安排的「过一会儿再看」：定时提示 / 后台命令 / 监视 ───────────────
@@ -10167,6 +10334,9 @@ ${hint}` : ''}` };
       if (/prompt already in progress/i.test(`${err?.message || ''}${detail}`)) {
         throw new Error(tr('The previous turn is still running (active turn, maybe compacting context). Wait for it, or press Stop, then send again.'));
       }
+      /* Codex 被 AWS 拒了（缺 IAM 权限）：重发、换后端会话都没用 —— 会话里给一张说清怎么补的提示卡，报错换成一句人话 */
+      const deniedMsg = await noteBedrockDenied(sessionId, entry.profile, `${err?.message || ''}${detail}`);
+      if (deniedMsg) throw new Error(deniedMsg);
       // NOTE: an oversized image is deliberately NOT recovered from here.
       //
       // It genuinely poisons the backend's conversation -- Bedrock re-validates every
@@ -13224,8 +13394,66 @@ ${hint}` : ''}` };
       return {
         ok: true,
         claude: cb && claude.installed ? { ...claude, loggedIn: true, detail: tr('Via Amazon Bedrock (global, {region})', { region: cb.region || '?' }), gateway: undefined } : claude,
-        codex: xb && codex.installed ? { ...codex, loggedIn: true, detail: tr('Via Amazon Bedrock ({model} @ {region})', { model: xb.model || '?', region: xb.region || '?' }), gateway: undefined } : codex,
+        /* `viaBedrock`：界面据此去跑权限预检（`ai-login:bedrock-check`），上次的结果先带上 */
+        codex: xb && codex.installed ? { ...codex, loggedIn: true, detail: tr('Via Amazon Bedrock ({model} @ {region})', { model: xb.model || '?', region: xb.region || '?' }), gateway: undefined, viaBedrock: true, ...(bedrockChecks.has(bedrockCheckKey(remote)) && !bedrockChecks.get(bedrockCheckKey(remote))!.notBedrock ? { bedrock: bedrockChecks.get(bedrockCheckKey(remote)) } : {}) } : codex,
       };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /**
+   * **Codex 走 Bedrock 的权限预检**：在那台机器上用它自己的身份做一次只读检查（`bedrockIam.ts` 的 bedrockCheckScript：
+   * sts get-caller-identity → iam simulate-principal-policy；没权限模拟时一次极短的 codex exec，60 秒封顶）。
+   * 结果按机器记在 `bedrockChecks`（会话里报权限错时也用它给出身份）。`force` = 不用上次的结果。
+   */
+  ipcMain.handle('ai-login:bedrock-check', async (_event, machine: string, opts?: { force?: boolean }) => {
+    try {
+      const remote = aiLoginTarget(machine);
+      const key = bedrockCheckKey(remote);
+      const check = await ensureBedrockCheck(remote, !!opts?.force);
+      if (check.notBedrock) return { ok: false, error: tr('Codex on that machine does not use Amazon Bedrock.') };
+      return { ok: true, check };
+    } catch (err: any) {
+      return { ok: false, error: err?.message || String(err) };
+    }
+  });
+
+  /**
+   * **这台机器暂时关掉 / 重新打开 Codex 网页搜索**：只改那台机器 ~/.codex/config.toml 顶层的 `web_search`
+   * （`"disabled"` / 删掉回到默认），其余逐字保留，写前备份 `.kirolex-bak`。正在跑的会话重连后才读到新配置。
+   */
+  ipcMain.handle('ai-login:codex-web-search', async (_event, machine: string, enabled: boolean) => {
+    try {
+      /*
+        **本机**（提示卡上的机器 id 是 'local'）：改这台电脑的 ~/.codex/config.toml —— 只动顶层 web_search 这一行，
+        先备份成 .kirolex-bak，写临时文件 + rename。
+      */
+      /* 读不干净（不是「文件不存在」的读错误 / 远端输出不完整）就不写：toggleCodexWebSearch 抛错，原文件不动 */
+      if (machine === 'local') {
+        const file = LOCAL_CODEX_TOML();
+        const next = await toggleCodexWebSearch(async () => readLocalConfig(file, (p) => fs.readFileSync(p, 'utf-8')), async (text, existed) => {
+          fs.mkdirSync(path.dirname(file), { recursive: true });
+          if (existed) fs.copyFileSync(file, `${file}.kirolex-bak`);
+          const tmp = `${file}.kirolex-tmp`;
+          fs.writeFileSync(tmp, text, { mode: 0o600 });
+          fs.renameSync(tmp, file);
+        }, enabled);
+        const prev = bedrockChecks.get('local');
+        if (prev) bedrockChecks.set('local', { ...prev, webSearchDisabled: codexWebSearchDisabled(next) });
+        logger.info('ai-login', `Codex 网页搜索${enabled ? '重新打开' : '关掉'}（本机 ${file}）`);
+        return { ok: true };
+      }
+      const remote = aiLoginTarget(machine);
+      const key = bedrockCheckKey(remote);
+      const file = '~/.codex/config.toml';
+      /* 先写临时文件再 mv：ssh 半路断掉也不会留下半个 config.toml */
+      await toggleCodexWebSearch(async () => parseRemoteConfigRead(await runRemoteCapture(remote, REMOTE_CONFIG_READ_SCRIPT, 30_000)), (text) => writeRemoteFile(remote,
+        `mkdir -p ~/.codex && { [ -f ${file} ] && cp -p ${file} ${file}.kirolex-bak || true; } && cat > ${file}.kirolex-tmp && chmod 600 ${file}.kirolex-tmp && mv ${file}.kirolex-tmp ${file}`, text), enabled);
+      const prev = bedrockChecks.get(key);
+      if (prev) bedrockChecks.set(key, { ...prev, webSearchDisabled: !enabled });
+      logger.info('ai-login', `Codex 网页搜索${enabled ? '重新打开' : '关掉'}（${remote.sshHost}）`);
+      return { ok: true };
     } catch (err: any) {
       return { ok: false, error: err?.message || String(err) };
     }
@@ -13276,6 +13504,8 @@ ${hint}` : ''}` };
         } else {
           const existing = await runRemoteCapture(remote, 'cat ~/.codex/config.toml 2>/dev/null || true', 30_000);
           await writeTo('~/.codex/config.toml', codexBedrockToml(existing));
+          /* 换了配置：上次的权限预检作废，界面下次取状态时重新检查 */
+          bedrockChecks.delete(bedrockCheckKey(remote));
           logger.info('ai-login', `Codex 改成走 Amazon Bedrock（${remote.sshHost}，${BEDROCK_DEFAULTS.codex.model} @ ${BEDROCK_DEFAULTS.codex.region}）`);
         }
         return { ok: true };
@@ -14472,7 +14702,8 @@ ${hint}` : ''}` };
    */
   ipcMain.handle('engines:status', async (_event, machine?: string, opts?: { force?: boolean }) => {
     try {
-      return { ok: true, statuses: await engineStatusesFor(String(machine || 'local'), !!opts?.force) };
+      const key = String(machine || 'local');
+      return { ok: true, statuses: withBedrockStatuses(key, await engineStatusesFor(key, !!opts?.force)) };
     } catch (err: any) {
       return { ok: false, error: err?.message || String(err) };
     }

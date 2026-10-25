@@ -563,6 +563,93 @@ if have kiro-cli; then
   fi
 fi
 
+# Codex 走 Bedrock 时的 IAM 权限（只读检查，KiroLex 不改 IAM；判据和 src/main/bedrockIam.ts 同一套）：
+# 模型调用 bedrock-mantle:CreateInference；Codex 自带的网页搜索另要 bedrock-websearch:InvokeSearch / InvokeFetch /
+# ExternalWebAccess —— 缺了它一用网页搜索整轮就断（「Access denied: web search is not authorized for this identity」）。
+# 能用 iam simulate-principal-policy 就用它；没权限模拟时跑一次极短的 codex exec（60 秒封顶）。不影响退出码。
+if full && have codex && grep -qE '^\s*model_provider\s*=\s*"amazon-bedrock"' "$HOME/.codex/config.toml" 2>/dev/null; then
+  KX_M="bedrock-mantle:CreateInference"
+  KX_W="bedrock-websearch:InvokeSearch bedrock-websearch:InvokeFetch bedrock-websearch:ExternalWebAccess"
+  KX_REGION=$(awk '/^[ \t]*\[model_providers\."?amazon-bedrock"?\.aws\]/{f=1;next} /^[ \t]*\[/{f=0} f&&/^[ \t]*region[ \t]*=/{gsub(/.*=[ \t]*"|".*/,"");print;exit}' "$HOME/.codex/config.toml" 2>/dev/null)
+  KX_REGION="${KX_REGION:-us-east-1}"
+  kx_mark() { case "$1" in ok) printf '✓' ;; denied) printf '✗' ;; *) printf '?' ;; esac; }
+  KX_MV=unknown; KX_WV=unknown; KX_MISS=""; KX_P=""; KX_RES=""
+  if have aws; then
+    KX_ARN=$(aws sts get-caller-identity --query Arn --output text 2>/dev/null </dev/null)
+    KX_P="$KX_ARN"
+    case "$KX_ARN" in arn:aws*:sts::*:assumed-role/*)
+      KX_RN=$(printf %s "$KX_ARN" | cut -d/ -f2)
+      KX_P=$(aws iam get-role --role-name "$KX_RN" --query Role.Arn --output text 2>/dev/null </dev/null) || KX_P=""
+      case "$KX_P" in arn:*) ;; *) KX_P="arn:$(printf %s "$KX_ARN" | cut -d: -f2):iam::$(printf %s "$KX_ARN" | cut -d: -f5):role/$KX_RN" ;; esac ;;
+    esac
+    KX_SIM=""
+    # 两次模拟、各用自己的资源：模型调用按 *；网页搜索按那个区的 tool/*（不传 --resource-arns 时模拟的是 *，
+    # 只按 tool/* 授权的策略会被误判成缺权限）
+    # shellcheck disable=SC2086
+    if [ -n "$KX_P" ] \
+      && KX_S1=$(aws iam simulate-principal-policy --policy-source-arn "$KX_P" --action-names $KX_M \
+        --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text 2>/dev/null </dev/null) \
+      && KX_S2=$(aws iam simulate-principal-policy --policy-source-arn "$KX_P" --action-names $KX_W \
+        --resource-arns "arn:aws:bedrock-websearch:${KX_REGION}:aws:tool/*" \
+        --query 'EvaluationResults[].[EvalActionName,EvalDecision]' --output text 2>/dev/null </dev/null) \
+      && [ -n "$KX_S1" ] && [ -n "$KX_S2" ]; then
+      KX_SIM=$(printf '%s\n%s\n' "$KX_S1" "$KX_S2")
+    fi
+  fi
+  if [ -n "${KX_SIM:-}" ]; then
+    KX_HOW="IAM 策略模拟"
+    for a in $KX_M $KX_W; do
+      printf '%s\n' "$KX_SIM" | grep -qE "^$a\s+allowed" || KX_MISS="$KX_MISS $a"
+    done
+    case "$KX_MISS" in *bedrock-mantle*) KX_MV=denied ;; *) KX_MV=ok ;; esac
+    case "$KX_MISS" in *bedrock-websearch*) KX_WV=denied ;; *) KX_WV=ok ;; esac
+  else
+    KX_HOW="一次极短的试调用"
+    KX_D=$(mktemp -d 2>/dev/null || echo /tmp)
+    KX_OUT=$(set -o pipefail; cd "$KX_D" && timeout 60 codex exec --ephemeral --skip-git-repo-check -s read-only --json -c 'web_search="live"' \
+      'Use the web search tool exactly once to look up example.com, then reply with only the word OK.' </dev/null 2>&1 | tail -c 6000)
+    KX_PRC=$?
+    [ "$KX_D" != /tmp ] && rm -rf "$KX_D"
+    # 判据和 bedrockIam.ts 的 parseAccessDenied / parseIamPrecheck 一致：
+    #   · 被拒：先认明确的动作名 —— bedrock-websearch:* 或「web search」那句 = 网页搜索被拒（说明模型那一下已经通了）；
+    #     bedrock / bedrock-mantle 的其他动作，或只说了 model / inference = 模型调用被拒；别的服务的拒绝 = 判不了
+    #   · 没被拒：只有退出码 0 且输出里有 web_search 事件才算网页搜索 ✓；退出码 0 没搜 = 模型 ✓、网页搜索 ?；
+    #     超时（124）或别的失败 = 两样都 ?
+    if printf '%s' "$KX_OUT" | grep -qiE 'not authorized|access ?denied|AccessDeniedException'; then
+      if printf '%s' "$KX_OUT" | grep -qiE 'bedrock-websearch:[A-Za-z*]|web ?search'; then KX_MV=ok; KX_WV=denied; KX_MISS=" $KX_W"
+      elif printf '%s' "$KX_OUT" | grep -qE '(^|[^:A-Za-z0-9_])bedrock(-[a-z]+)?:[A-Z*]' \
+        || { ! printf '%s' "$KX_OUT" | grep -qE 'perform:? +[a-z0-9-]+:[A-Za-z*]' && printf '%s' "$KX_OUT" | grep -qiE 'bedrock|model|inference'; }; then
+        KX_MV=denied
+        # 报错里点名的动作 / 资源（bedrock:InvokeModel on resource: arn:…）照用；没点名就是 CreateInference、资源 *
+        KX_ACTS=$(printf '%s' "$KX_OUT" | grep -oE '(^|[^:A-Za-z0-9_])bedrock(-[a-z]+)?:[A-Z*][A-Za-z*]*' | sed 's/^[^b]*//' | grep -v '^bedrock-websearch:' | sort -u | tr '\n' ' ')
+        KX_MISS=" ${KX_ACTS:-$KX_M}"; KX_MISS="${KX_MISS% }"
+        KX_RES=$(printf '%s' "$KX_OUT" | grep -oiE 'on resource:? *arn:[^ "'"'"'，。)）]+' | head -1 | sed -E 's/^[^a]*(arn:)/\1/; s/[.,;:]+$//')
+      fi
+    elif [ "$KX_PRC" -eq 0 ] && [ -n "$KX_OUT" ]; then
+      KX_MV=ok
+      printf '%s' "$KX_OUT" | grep -q 'web_search' && KX_WV=ok
+    fi
+  fi
+  say "Codex Bedrock 权限: 模型调用 $(kx_mark "$KX_MV") · 网页搜索 $(kx_mark "$KX_WV")   （${KX_HOW}；身份 ${KX_P:-不知道}；区域 $KX_REGION）"
+  if [ -n "$KX_MISS" ]; then
+    say "                  缺:${KX_MISS}"
+    say "                  最小策略（贴进这个身份的 IAM 策略；KiroLex 不会自己改 IAM）："
+    KX_ST=""
+    KX_MA=""
+    for a in $KX_MISS; do case "$a" in bedrock-websearch:*) ;; *) KX_MA="${KX_MA:+$KX_MA, }\"$a\"" ;; esac; done
+    [ -n "$KX_MA" ] && KX_ST="    { \"Sid\": \"KiroLexCodexBedrockModel\", \"Effect\": \"Allow\", \"Action\": [$KX_MA], \"Resource\": \"${KX_RES:-*}\" }"
+    case "$KX_MISS" in *bedrock-websearch*)
+      KX_WS="    { \"Sid\": \"KiroLexCodexWebSearch\", \"Effect\": \"Allow\", \"Action\": [\"bedrock-websearch:InvokeSearch\", \"bedrock-websearch:InvokeFetch\", \"bedrock-websearch:ExternalWebAccess\"], \"Resource\": \"arn:aws:bedrock-websearch:${KX_REGION}:aws:tool/*\" }"
+      KX_ST="${KX_ST:+$KX_ST,
+}$KX_WS" ;;
+    esac
+    printf '{\n  "Version": "2012-10-17",\n  "Statement": [\n%s\n  ]\n}\n' "$KX_ST"
+    case "$KX_MISS" in *bedrock-websearch*)
+      say "                  不想补权限：在 ~/.codex/config.toml 顶层加 web_search = \"disabled\"（或在 KiroLex「🔑 登录」页点「这台机器暂时关掉 Codex 网页搜索」）" ;;
+    esac
+  fi
+fi
+
 say ""
 if [ "$rc" -eq 0 ]; then
   say "✓ 这台机器可以跑远程会话了。文件仍然在你本地 —— 远端通过隧道读写你这台机器上的文件（不复制）。"

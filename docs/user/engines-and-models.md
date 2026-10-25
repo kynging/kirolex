@@ -99,6 +99,75 @@ suggests running the chat on a remote machine instead.
   chat runs: `.claude` (settings, CLAUDE.md, agents, commands, skills, plugins) or `.codex`
   (config.toml, AGENTS.md, prompts, skills).
 
+### IAM permissions Codex needs on Amazon Bedrock
+
+When a remote machine is set up with **用 Amazon Bedrock（推荐）** (*Use Amazon Bedrock*, see
+[Remote sessions](remote-sessions.md#signing-in-to-claude-code--codex-on-a-remote-machine)), Codex
+runs as that machine's own AWS identity, usually the EC2 instance role. No keys are written. That
+identity needs two groups of IAM permissions:
+
+| What | IAM actions | Resource |
+|---|---|---|
+| Calling the model | `bedrock-mantle:CreateInference` | `*` (or the model resource your account uses) |
+| Codex's built-in web search | `bedrock-websearch:InvokeSearch`, `bedrock-websearch:InvokeFetch`, `bedrock-websearch:ExternalWebAccess` | `arn:aws:bedrock-websearch:<region>:aws:tool/*` |
+
+**Region:** `<region>` is the Bedrock region in that machine's `~/.codex/config.toml`
+(`[model_providers.amazon-bedrock.aws] region`). KiroLex writes `us-east-1`, because OpenAI models on
+Bedrock are currently in US East. It is not the region the machine itself runs in. A machine in
+Tokyo still needs `arn:aws:bedrock-websearch:us-east-1:aws:tool/*`. The full list of actions is in
+the AWS service reference (<https://servicereference.us-east-1.amazonaws.com/>, services
+`bedrock-websearch` and `bedrock-mantle`).
+
+A minimal policy for an identity that can already call the model but cannot search:
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "KiroLexCodexWebSearch",
+      "Effect": "Allow",
+      "Action": ["bedrock-websearch:InvokeSearch", "bedrock-websearch:InvokeFetch", "bedrock-websearch:ExternalWebAccess"],
+      "Resource": "arn:aws:bedrock-websearch:us-east-1:aws:tool/*"
+    }
+  ]
+}
+```
+
+If the web search permissions are missing, Codex works until it tries to search. Then the whole
+turn stops with `Access denied: web search is not authorized for this identity`.
+
+**How KiroLex checks.** KiroLex only reads permissions. It never changes IAM.
+
+- On the **🔑 登录** (*Login*) tab, a Codex machine on Bedrock shows a **Bedrock 权限**
+  (*Bedrock permissions*) line, for example **模型调用 ✓ · 网页搜索 ✗** (*Model calls ✓ · Web
+  search ✗*). It also shows the identity (role ARN), the missing actions and a policy you can copy.
+  The check runs on that machine as its own identity. It uses `aws sts get-caller-identity` and then
+  `aws iam simulate-principal-policy`: model calls against `*`, and web search against
+  `arn:aws:bedrock-websearch:<region>:aws:tool/*` for the region in that machine's Codex config.
+  If the identity cannot run that simulation, KiroLex makes one very short `codex exec` call with
+  web search turned on (60-second limit) and reads the error. Click **重新检查** (*Check again*)
+  after you change the policy.
+- You don't have to open that tab for the check to run. KiroLex also checks when it detects the
+  engines on a machine (the engine status in the **💬 New Chat** dialog and on the machine settings
+  page shows the same **Bedrock 权限** line), and when a Codex chat starts. If a permission is
+  missing, the chat gets the card described below before any turn fails.
+- The same check and card also apply when Codex on **this computer** uses Bedrock
+  (`model_provider = "amazon-bedrock"` in your own `~/.codex/config.toml`). There it runs your local
+  `aws` and `codex` directly, without a shell script. The card's button changes your own
+  `~/.codex/config.toml`.
+- If a Codex turn is still denied, the chat shows a card instead of the bare English error. The card
+  shows which machine and identity were denied, the missing actions and a minimal policy with
+  **复制策略** (*Copy policy*). For web search it also has a button: **这台机器暂时关掉 Codex 网页搜索**
+  (*Turn off Codex web search on this machine for now*). Click **✕** to close the card.
+- **安装 AI 工具** (*Install AI tools*, `remote-bootstrap.sh`) prints the same check at the end of its
+  self-check, under **Codex Bedrock 权限**.
+
+**Turning web search off instead.** The button writes `web_search = "disabled"` at the top level of
+that machine's `~/.codex/config.toml`. The rest of the file is unchanged, and the original is backed
+up as `.kirolex-bak`. To turn it back on, use the button on the 🔑 登录 tab or delete that line.
+Running chats use the change after they reconnect.
+
 ### Instruction files (the CLAUDE.md and AGENTS.md tabs)
 
 The **CLAUDE.md** tab (Claude Code) and the **AGENTS.md** tab (Codex) list **every instruction file

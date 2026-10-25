@@ -409,6 +409,9 @@ export const ZH_CHAT: Record<string, string> = {
   'Create this chat again on this machine instead of the remote one': '不用远端了，在本机重新建这条会话',
   'Queued — sends automatically once {engine} is ready': '排队中，{engine} 引擎就绪后自动发出',
   'Busy: starting the engine; messages queue until it is ready': '占用中：正在启动引擎，消息先排队、就绪后自动发出',
+  "Identity": "身份",
+  "Missing": "缺的权限",
+  "Minimal policy (paste into IAM)": "最小策略（贴进 IAM）",
   // ── KiroLex 提示的 × / 不再提醒、「⚠ N 个 MCP 不可用」徽标（noticeDismiss.ts、McpUnavailableBadge）──
   'Hide this kind of notice from now on (display only; the conversation is unchanged)': '以后不再显示这一类提示（只改显示，对话记录不变）',
   "Don't remind me (this computer, this MCP profile)": '不再提醒（这台电脑 / 这个 MCP 配置）',

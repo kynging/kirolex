@@ -752,6 +752,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 🔑 登录：远端机器上 Claude Code / Codex 的登录状态 / 写网关配置 / 官方账号登录。 */
   aiLoginStatus: (machine: string) => ipcRenderer.invoke('ai-login:status', machine),
   aiLoginApply: (machine: string, input: any) => ipcRenderer.invoke('ai-login:apply', machine, input),
+  aiLoginBedrockCheck: (machine: string, opts?: { force?: boolean }) => ipcRenderer.invoke('ai-login:bedrock-check', machine, opts),
+  aiLoginCodexWebSearch: (machine: string, enabled: boolean) => ipcRenderer.invoke('ai-login:codex-web-search', machine, enabled),
   /** 本机那份配置变成编辑器文本（「拷入本机配置」）；只读本机，不写任何地方。 */
   aiLoginLocalConfig: (tool: 'claude' | 'codex') => ipcRenderer.invoke('ai-login:local-config', tool),
   aiLoginRun: (machine: string, tool: 'claude' | 'codex', opts?: { console?: boolean }) => ipcRenderer.invoke('ai-login:run', machine, tool, opts),

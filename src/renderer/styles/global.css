@@ -2044,6 +2044,13 @@ button, input, select, textarea {
 .schedule-card-section { white-space: pre-wrap; overflow-wrap: anywhere; }
 .schedule-card-section + .schedule-card-section { margin-top: 6px; }
 .schedule-card-section > b { color: var(--text-secondary); font-weight: 600; }
+/* Codex 缺 AWS 权限：会话里的提示卡（ChatArea BedrockDeniedCard）和登录页的权限检查（BedrockIam.tsx） */
+.bedrock-card .kirolex-message-card { border-color: rgba(210, 153, 34, 0.55); }
+.bedrock-card .schedule-card-section { font-size: 11.5px; color: var(--text-secondary); }
+.bedrock-card-actions { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; white-space: normal; }
+.bedrock-policy { display: flex; align-items: flex-start; gap: 6px; }
+.bedrock-policy-json { flex: 1 1 auto; min-width: 0; margin: 0; max-height: 220px; overflow: auto; font-size: 10.5px; white-space: pre; text-align: left; }
+.bedrock-check { display: flex; flex-direction: column; gap: 4px; margin: 4px 0 6px; }
 /* 「没连上：缺 ACP 适配器」提示上的「安装」（ChatArea AdapterInstallAction） */
 .adapter-install {
   display: flex; flex-wrap: wrap; align-items: center; justify-content: center; gap: 6px 8px;

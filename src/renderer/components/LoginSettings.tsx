@@ -14,9 +14,12 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { defaultPick } from '../remotePick.ts';
 import { useT } from '../hooks/useLang';
+import { BedrockCheckRow } from './BedrockIam';
+import type { BedrockIamCheck } from '../../main/bedrockIam.ts';
 
 type Tool = 'claude' | 'codex';
-interface ToolStatus { installed: boolean; loggedIn: boolean; detail: string; gateway?: string }
+/* `viaBedrock` / `bedrock`：Codex 走 Bedrock 时主进程带上的权限预检（`main/bedrockIam.ts`） */
+interface ToolStatus { installed: boolean; loggedIn: boolean; detail: string; gateway?: string; viaBedrock?: boolean; bedrock?: BedrockIamCheck }
 interface Target { id: string; label: string; sshHost: string; editedAt?: number }
 
 const api = (): any => (window as any).kiroApi;
@@ -99,6 +102,9 @@ export const ToolCard: React.FC<{ machine: string; tool: Tool; status: ToolStatu
                 : `✗ ${status.detail}`}
         </span>
       </div>
+
+      {/* Codex 走 Bedrock：模型调用 / 网页搜索的 IAM 权限（缺网页搜索权限时一用就整轮断掉） */}
+      {tool === 'codex' && status?.installed && status.viaBedrock && <BedrockCheckRow machine={machine} initial={status.bedrock} />}
 
       {status?.installed && (
         <div className="remote-row-actions">

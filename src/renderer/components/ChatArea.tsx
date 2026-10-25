@@ -72,6 +72,8 @@ import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummar
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
+import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy } from '../../main/bedrockIam.ts';
+import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
@@ -1164,6 +1166,69 @@ const ScheduleEndCard = memo<{ message: Message; end: ScheduleEndView; name?: st
               {end.until && <div className="schedule-card-section"><b>{t('Goal')}</b>{'\n'}{end.until}</div>}
               {end.output && <pre className="schedule-card-lines">{end.output}</pre>}
             </div>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+});
+
+/**
+ * **Codex 被 AWS 拒了（缺 IAM 权限）** 的提示卡（主进程 `noteBedrockDenied` 写的那条，group 见 `main/bedrockIam`）：
+ * 主句说哪台机器缺什么；身份（role ARN）、缺的动作、可以直接贴进 IAM 的最小策略、「这台机器暂时关掉 Codex 网页搜索」；
+ * 原始报错在「详情」里。和别的 KiroLex 提示一样能关 / 不再提醒（只改显示，同一份记录，见 noticeDismiss.ts）。
+ */
+const BedrockDeniedCard = memo<{ message: Message; count?: number }>(({ message, count }) => {
+  const t = useT();
+  const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
+  const g = parseDeniedNoteGroup(message.noteGroup);
+  if (!g || isNoticeHidden({ id: message.id, noteGroup: message.noteGroup }, hide)) return null;
+  const { main, detail } = splitNoteDetail(message.content);
+  const badge = repeatBadge(count);
+  const roleArn = deniedRoleArn(message.content);
+  const webSearch = g.actions.some((a) => a.startsWith('bedrock-websearch:'));
+  return (
+    <div className="kirolex-message schedule-card bedrock-card" data-status="error" role="status">
+      <div className="kirolex-message-card schedule-card-box">
+        <div className="schedule-card-head">
+          <span className="schedule-card-title">{main}</span>
+          {badge && <span className="notice-repeat" title={t('Repeated {n} times in a row', { n: count ?? 1 })}>{badge}</span>}
+          <time
+            className="kirolex-message-time"
+            dateTime={new Date(message.timestamp).toISOString()}
+            title={new Date(message.timestamp).toLocaleString()}
+          >
+            {formatMessageTime(message.timestamp)}
+          </time>
+          {muteKeyOf(message.noteGroup) && (
+            <button
+              type="button"
+              className="kirolex-message-mute"
+              onClick={() => muteNotice(message.noteGroup)}
+              title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}
+            >
+              {t("Don't remind me (this computer)")}
+            </button>
+          )}
+          <button
+            type="button"
+            className="kirolex-message-close"
+            onClick={() => dismissNotice(message.id)}
+            title={t('Close notice (display only; the conversation is unchanged)')}
+            aria-label={t('Close notice')}
+          >✕</button>
+        </div>
+        <div className="schedule-card-section"><b>{t('Identity')}</b>{' '}{roleArn || t('unknown (run `aws sts get-caller-identity` on that machine)')}</div>
+        <div className="schedule-card-section"><b>{t('Missing')}</b>{' '}{g.actions.join(', ')}</div>
+        <div className="schedule-card-section"><b>{t('Minimal policy (paste into IAM)')}</b></div>
+        <PolicyBox policy={deniedCardPolicy(message.noteGroup)!} />
+        {webSearch && g.machineId && (
+          <div className="bedrock-card-actions"><WebSearchToggle machine={g.machineId} disabled={false} /></div>
+        )}
+        {detail && (
+          <details className="notice-detail schedule-card-detail">
+            <summary>{t('Details')}</summary>
+            <div className="notice-detail-body">{detail}</div>
           </details>
         )}
       </div>
@@ -5201,6 +5266,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <PendingSwitchCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} {...pendingCard} />
           ) : group.kind === 'schedule' ? (
             <ScheduleWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
+          ) : group.kind === 'kirolex' && parseDeniedNoteGroup(group.message.noteGroup) ? (
+            <BedrockDeniedCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} />
           ) : group.kind === 'kirolex' && scheduleView.ends.has(group.message.id) ? (
             <ScheduleEndCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} {...scheduleView.ends.get(group.message.id)!} count={group.count} />
           ) : group.kind === 'kirolex' ? (

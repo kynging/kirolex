@@ -45,6 +45,18 @@ function StateText({ s }: { s: EngineStatusLite }) {
   return <>{t('Unknown')}</>;
 }
 
+const verdictMark = (v: string): string => (v === 'ok' ? '✓' : v === 'denied' ? '✗' : '?');
+function BedrockLine({ b }: { b: NonNullable<EngineStatusLite['bedrock']> }) {
+  const t = useT();
+  return (
+    <div className={`engine-status-detail${b.missing.length && !(b.model !== 'denied' && b.webSearchDisabled) ? ' engine-status-fail' : ''}`} data-testid="engine-bedrock">
+      {t('Bedrock permissions')}{': '}{t('Model calls {m}', { m: verdictMark(b.model) })}{' · '}{t('Web search {m}', { m: verdictMark(b.webSearch) })}
+      {b.webSearchDisabled ? ` ${t('(web search is turned off on that machine)')}` : ''}
+      {b.missing.length > 0 && ` — ${t('missing {actions}; the policy to add is under 🔑 Login', { actions: b.missing.join(', ') })}`}
+    </div>
+  );
+}
+
 export function EngineStatusPanel({ machine, selected, compact, title }: {
   /** `'local'` = 本机，否则远端 id。 */
   machine: string;
@@ -94,6 +106,8 @@ export function EngineStatusPanel({ machine, selected, compact, title }: {
               )}
             </div>
             {s?.detail && s.state !== 'ok' && (!compact || selected === e) && !a && <div className="engine-status-detail">{s.detail}</div>}
+            {/* Codex 走 Bedrock：IAM 权限预检（缺网页搜索权限时一用就整轮断；怎么补在 🔑 登录 里） */}
+            {e === 'codex' && s?.bedrock && <BedrockLine b={s.bedrock} />}
             {a?.phase === 'installing' && (
               <pre className="adapter-install-output">{outputTail(a.output) || t('Starting…')}</pre>
             )}
