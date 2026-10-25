@@ -42,16 +42,17 @@ export const UNIFIED_ACCENT: Record<ThemeMode, AccentSet> = {
 
 export const ENGINE_ACCENTS: Record<ThemeMode, Record<AccentEngine, AccentSet>> = {
   dark: {
-    /* Kiro 品牌紫（参考 #9046ff）：#9046ff 本身和统一色 #7c6fe0 的 ΔE2000 只有 ≈10，在暗底上也不到 3:1，
-       所以往更艳、略偏洋红的紫罗兰挪，和统一色拉开到 ΔE ≥ 15（测试算） */
-    kiro: { accent: '#cc2cfa', text: '#de8cff', onAccent: '#ffffff' },
+    /* Kiro 品牌紫（参考 #9046ff，HSL 色相 264°）：#9046ff 本身在暗底上不到 3:1，所以色相不动、只提亮度。
+       色相守在 255°–275°（再往上就读成粉 / 洋红了），和 Claude 橙、Codex 青绿两两 ΔE2000 ≥ 20（测试算）；
+       和统一色 #7c6fe0 相近没关系 —— Kiro 本来就是紫 */
+    kiro: { accent: '#a274ff', text: '#c4a8ff', onAccent: '#ffffff' },
     /* Claude Code 赤陶橙 */
     claude: { accent: '#d97757', text: '#e8987a', onAccent: '#ffffff' },
     /* Codex 青绿 */
     codex: { accent: '#119e8a', text: '#4fd1b8', onAccent: '#ffffff' },
   },
   light: {
-    kiro: { accent: '#c200f8', text: '#9c00cc', onAccent: '#ffffff' },
+    kiro: { accent: '#6f3fe0', text: '#5a2fc4', onAccent: '#ffffff' },
     claude: { accent: '#b4532f', text: '#9a4526', onAccent: '#ffffff' },
     codex: { accent: '#0b7a6b', text: '#08695c', onAccent: '#ffffff' },
   },

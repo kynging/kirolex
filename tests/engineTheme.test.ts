@@ -6,7 +6,8 @@
  *      当图形用的那一档（色条、边框、发送按钮底、进度点）≥ 3:1，发送按钮上的图标对按钮底 ≥ 3:1；
  *   2. 开关关掉时三个引擎取的都是统一强调色（就是现在的 --accent），界面回到原样；
  *   3. 颜色不是唯一区分手段：每个引擎都有名字可显示；
- *   4. 接线：侧栏行 / 分屏标题 / 会话区挂了 data-accent-engine，CSS 只在那几个小元素上用 --engine-accent。
+ *   4. Kiro 是真正的紫（HSL 色相 255°–275°），三个引擎两两 ΔE2000 ≥ 20；
+ *   5. 接线：侧栏行 / 分屏标题 / 会话区挂了 data-accent-engine，CSS 只在那几个小元素上用 --engine-accent。
  */
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
@@ -139,20 +140,49 @@ describe('色差：Kiro 和统一强调色、三个引擎之间一眼可分（Δ
     assert.ok(Math.abs(hexToLab('#ffffff')[0] - 100) < 1e-3);
     assert.ok(Math.abs(hexToLab('#000000')[0]) < 1e-9);
   });
+  // 不要求 Kiro 和统一强调色拉开：Kiro 本来就是紫，统一色也是紫，相近可以接受
+  // （以前那条「和统一色 ΔE ≥ 15」把 Kiro 推到了洋红，侧栏看着像粉色）
   for (const mode of THEME_MODES) {
-    test(`${mode}：Kiro 和统一强调色拉开（accent ΔE ≥ 15）`, () => {
-      const d = deltaE(ENGINE_ACCENTS[mode].kiro.accent, UNIFIED_ACCENT[mode].accent);
-      assert.ok(d >= 15, `${ENGINE_ACCENTS[mode].kiro.accent} 对 ${UNIFIED_ACCENT[mode].accent} 只有 ΔE ${d.toFixed(1)}`);
-    });
-    test(`${mode}：三个引擎两两 ΔE ≥ 15`, () => {
-      for (let i = 0; i < ACCENT_ENGINES.length; i++) {
-        for (let j = i + 1; j < ACCENT_ENGINES.length; j++) {
-          const [x, y] = [ENGINE_ACCENTS[mode][ACCENT_ENGINES[i]].accent, ENGINE_ACCENTS[mode][ACCENT_ENGINES[j]].accent];
-          const d = deltaE(x, y);
-          assert.ok(d >= 15, `${ACCENT_ENGINES[i]} ${x} / ${ACCENT_ENGINES[j]} ${y} 只有 ΔE ${d.toFixed(1)}`);
+    for (const key of ['accent', 'text'] as const) {
+      test(`${mode}：三个引擎的 ${key} 两两 ΔE ≥ 20`, () => {
+        for (let i = 0; i < ACCENT_ENGINES.length; i++) {
+          for (let j = i + 1; j < ACCENT_ENGINES.length; j++) {
+            const [x, y] = [ENGINE_ACCENTS[mode][ACCENT_ENGINES[i]][key], ENGINE_ACCENTS[mode][ACCENT_ENGINES[j]][key]];
+            const d = deltaE(x, y);
+            assert.ok(d >= 20, `${ACCENT_ENGINES[i]} ${x} / ${ACCENT_ENGINES[j]} ${y} 只有 ΔE ${d.toFixed(1)}`);
+          }
         }
-      }
-    });
+      });
+    }
+  }
+});
+
+/** sRGB hex → HSL 色相（度，0–360）。Kiro 「是不是紫」用这个口径。 */
+function hslHue(hex: string): number {
+  const n = parseInt(hex.replace('#', ''), 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => v / 255);
+  const max = Math.max(r, g, b), d = max - Math.min(r, g, b);
+  if (d === 0) return 0;
+  const h = max === r ? ((g - b) / d) % 6 : max === g ? (b - r) / d + 2 : (r - g) / d + 4;
+  return (h * 60 + 360) % 360;
+}
+
+describe('Kiro 一眼就是紫（HSL 色相 255°–275°），不是粉 / 洋红', () => {
+  test('色相算法本身是对的', () => {
+    assert.equal(hslHue('#ff0000'), 0);
+    assert.equal(hslHue('#0000ff'), 240);
+    assert.equal(hslHue('#ff00ff'), 300);
+    assert.ok(Math.abs(hslHue('#9046ff') - 264) < 0.1, `Kiro 品牌紫 #9046ff：${hslHue('#9046ff')}`);
+    assert.ok(hslHue('#cc2cfa') > 275, '以前那个偏洋红的 #cc2cfa 应该落在范围外');
+  });
+  for (const mode of THEME_MODES) {
+    for (const key of ['accent', 'text'] as const) {
+      test(`${mode} · kiro.${key} 的色相在 255°–275°`, () => {
+        const c = ENGINE_ACCENTS[mode].kiro[key];
+        const h = hslHue(c);
+        assert.ok(h >= 255 && h <= 275, `${c} 色相 ${h.toFixed(1)}°，不在 255°–275°`);
+      });
+    }
   }
 });
 
