@@ -76,13 +76,84 @@ describe('三引擎 × 明暗主题都满足 WCAG AA', () => {
       assert.ok(THEME_SURFACES.dark.includes(m![1].toLowerCase()), `${name}=${m![1]} 不在 THEME_SURFACES.dark 里`);
     }
   });
-  test('Kiro 沿用现在的品牌紫；统一色就是现在的 --accent / --accent-soft', () => {
+  test('统一色就是现在的 --accent / --accent-soft（全局强调色不改）', () => {
     const css = read('styles', 'global.css');
     assert.match(css, new RegExp(`--accent:\\s*${UNIFIED_ACCENT.dark.accent}`, 'i'));
     assert.match(css, /--accent-soft:\s*rgba\(124, 111, 224, 0\.22\)/);
     assert.equal(softOf(UNIFIED_ACCENT.dark.accent), 'rgba(124, 111, 224, 0.22)');
-    assert.equal(ENGINE_ACCENTS.dark.kiro.accent, UNIFIED_ACCENT.dark.accent);
+    assert.deepEqual(UNIFIED_ACCENT.dark, { accent: '#7c6fe0', text: '#a99ff0', onAccent: '#ffffff' });
   });
+});
+
+/** CIEDE2000（Sharma, Wu & Dalal 2005），输入 CIELAB。 */
+function deltaE2000([L1, a1, b1]: number[], [L2, a2, b2]: number[]): number {
+  const rad = Math.PI / 180;
+  const C1 = Math.hypot(a1, b1), C2 = Math.hypot(a2, b2), Cbar = (C1 + C2) / 2;
+  const G = 0.5 * (1 - Math.sqrt(Cbar ** 7 / (Cbar ** 7 + 25 ** 7)));
+  const ap1 = a1 * (1 + G), ap2 = a2 * (1 + G);
+  const Cp1 = Math.hypot(ap1, b1), Cp2 = Math.hypot(ap2, b2);
+  const hue = (b: number, a: number) => (a === 0 && b === 0 ? 0 : (Math.atan2(b, a) / rad + 360) % 360);
+  const h1 = hue(b1, ap1), h2 = hue(b2, ap2);
+  let dh = 0;
+  if (Cp1 * Cp2 !== 0) { dh = h2 - h1; if (dh > 180) dh -= 360; else if (dh < -180) dh += 360; }
+  const dL = L2 - L1, dC = Cp2 - Cp1, dH = 2 * Math.sqrt(Cp1 * Cp2) * Math.sin((dh / 2) * rad);
+  const Lbar = (L1 + L2) / 2, Cpbar = (Cp1 + Cp2) / 2;
+  let hbar = h1 + h2;
+  if (Cp1 * Cp2 !== 0) hbar = Math.abs(h1 - h2) > 180 ? (h1 + h2 < 360 ? (h1 + h2 + 360) / 2 : (h1 + h2 - 360) / 2) : (h1 + h2) / 2;
+  const T = 1 - 0.17 * Math.cos((hbar - 30) * rad) + 0.24 * Math.cos(2 * hbar * rad)
+    + 0.32 * Math.cos((3 * hbar + 6) * rad) - 0.2 * Math.cos((4 * hbar - 63) * rad);
+  const dTheta = 30 * Math.exp(-(((hbar - 275) / 25) ** 2));
+  const RC = 2 * Math.sqrt(Cpbar ** 7 / (Cpbar ** 7 + 25 ** 7));
+  const SL = 1 + (0.015 * (Lbar - 50) ** 2) / Math.sqrt(20 + (Lbar - 50) ** 2);
+  const SC = 1 + 0.045 * Cpbar, SH = 1 + 0.015 * Cpbar * T, RT = -Math.sin(2 * dTheta * rad) * RC;
+  return Math.sqrt((dL / SL) ** 2 + (dC / SC) ** 2 + (dH / SH) ** 2 + RT * (dC / SC) * (dH / SH));
+}
+/** sRGB hex → CIELAB（D65）。 */
+function hexToLab(hex: string): number[] {
+  const n = parseInt(hex.replace('#', ''), 16);
+  const [r, g, b] = [(n >> 16) & 255, (n >> 8) & 255, n & 255].map((v) => {
+    const c = v / 255;
+    return c <= 0.04045 ? c / 12.92 : ((c + 0.055) / 1.055) ** 2.4;
+  });
+  const f = (t: number) => (t > 216 / 24389 ? Math.cbrt(t) : (24389 / 27 * t + 16) / 116);
+  const x = f((r * 0.4124564 + g * 0.3575761 + b * 0.1804375) / 0.95047);
+  const y = f(r * 0.2126729 + g * 0.7151522 + b * 0.072175);
+  const z = f((r * 0.0193339 + g * 0.119192 + b * 0.9503041) / 1.08883);
+  return [116 * y - 16, 500 * (x - y), 200 * (y - z)];
+}
+const deltaE = (a: string, b: string) => deltaE2000(hexToLab(a), hexToLab(b));
+
+describe('色差：Kiro 和统一强调色、三个引擎之间一眼可分（ΔE2000 ≥ 15）', () => {
+  test('ΔE2000 实现对得上 Sharma 2005 的官方测试数据', () => {
+    const cases: [number[], number[], number][] = [
+      [[50, 2.6772, -79.7751], [50, 0, -82.7485], 2.0425],
+      [[50, 2.5, 0], [50, 0, -2.5], 4.3065],
+      [[50, 2.5, 0], [73, 25, -18], 27.1492],
+      [[60.2574, -34.0099, 36.2677], [60.4626, -34.1751, 39.4387], 1.2644],
+      [[2.0776, 0.0795, -1.135], [0.9033, -0.0636, -0.5514], 0.9082],
+    ];
+    for (const [a, b, want] of cases) {
+      const got = deltaE2000(a, b);
+      assert.ok(Math.abs(got - want) < 1e-4, `${a} / ${b}: ${got} ≠ ${want}`);
+    }
+    assert.ok(Math.abs(hexToLab('#ffffff')[0] - 100) < 1e-3);
+    assert.ok(Math.abs(hexToLab('#000000')[0]) < 1e-9);
+  });
+  for (const mode of THEME_MODES) {
+    test(`${mode}：Kiro 和统一强调色拉开（accent ΔE ≥ 15）`, () => {
+      const d = deltaE(ENGINE_ACCENTS[mode].kiro.accent, UNIFIED_ACCENT[mode].accent);
+      assert.ok(d >= 15, `${ENGINE_ACCENTS[mode].kiro.accent} 对 ${UNIFIED_ACCENT[mode].accent} 只有 ΔE ${d.toFixed(1)}`);
+    });
+    test(`${mode}：三个引擎两两 ΔE ≥ 15`, () => {
+      for (let i = 0; i < ACCENT_ENGINES.length; i++) {
+        for (let j = i + 1; j < ACCENT_ENGINES.length; j++) {
+          const [x, y] = [ENGINE_ACCENTS[mode][ACCENT_ENGINES[i]].accent, ENGINE_ACCENTS[mode][ACCENT_ENGINES[j]].accent];
+          const d = deltaE(x, y);
+          assert.ok(d >= 15, `${ACCENT_ENGINES[i]} ${x} / ${ACCENT_ENGINES[j]} ${y} 只有 ΔE ${d.toFixed(1)}`);
+        }
+      }
+    });
+  }
 });
 
 describe('开关', () => {
@@ -111,6 +182,8 @@ describe('开关', () => {
     const off = engineAccentCss(false);
     assert.ok(!off.includes(ENGINE_ACCENTS.dark.claude.accent));
     assert.ok(!off.includes(ENGINE_ACCENTS.dark.codex.accent));
+    assert.ok(!off.includes(ENGINE_ACCENTS.dark.kiro.accent));
+    assert.ok(!off.includes(ENGINE_ACCENTS.light.kiro.accent));
     assert.ok(off.includes(UNIFIED_ACCENT.dark.accent));
     assert.match(off, /\.session-accent-strip\s*\{\s*display:\s*none/);
   });
