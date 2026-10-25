@@ -19,6 +19,10 @@
    - 连续的同类提示只显示一条并计数（「×3」），内容取最新那条：发提示时带 group（`noteInSession(…, group)` /
      `sessionNotice(…, { group })`），写成「类型:对象[→结果]」，例如 `local-tools-reconnect`、`model-fallback:想要→实际`、
      `revise-queued:<文件>`。对象或结果不同就是不同的 group，分开显示。没带 group 的按整句一字不差合并（`src/renderer/noticeMerge.ts`）。
+   - 聊天区的 KiroLex 卡片右上角都有 ×（只改显示，不删对话记录）；带 group 的再给「不再提醒」（这台电脑，按 group 冒号前的类型记；
+     `mcp-unavailable:<MCP 配置>` 按整个 group，即「这个 MCP 配置」）—— `src/renderer/noticeDismiss.ts`。
+   - 会话准备时没带上的 MCP（没标转发 / 这台电脑上找不到程序 / 起不来 / 缺环境变量）合并成一条，同一台电脑 + 同一个 MCP 配置 + 同一原因
+     只在第一次进对话记录，之后只在输入框上方挂「⚠ N 个 MCP 不可用」徽标（`src/main/mcpUnavailable.ts`）。
 6. **emoji 只用四个**，一条最多一个，放在开头：
 
    | emoji | 含义 |

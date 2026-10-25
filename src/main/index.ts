@@ -114,7 +114,7 @@ import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './session
 import { forwardReconnectVerdict, retryUntilIdle, watchHttpForward, reconnectBlockedBy, httpHandedNow } from './forwardReconnect.ts';
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward,
-  remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedNotice, type ForwardListItem,
+  remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedWhy, type ForwardListItem,
   markForwardUnavailable, clearForwardUnavailable, type ForwardUnavailable,
   forwardNotReadyNotice, forwardStartingNotice, forwardRestartingNotice, forwardGaveUpNotice, forwardReadyReconnectNotice,
   httpPendingNotice, httpForwardBackNotice, httpDroppedNotice, type HttpMcpEntry, type ForwardEntry,
@@ -146,7 +146,13 @@ import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
-import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, modelOffersEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, type McpCombo } from './mcpCombos.ts';
+import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, modelOffersEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
+import { resolveCommand, commandMissingReason } from './commandResolve.ts';
+import { comboLocalAvailability, setMachineOverride } from './comboAvailability.ts';
+import {
+  mcpUnavailableNotice, mcpUnavailableLabel, notForwardedItem, missingCommandItem, failedItem, skippedItem,
+  planMcpNotice, mcpNoticeScope, readMcpNoticeSeen, writeMcpNoticeSeen, type McpUnavailable,
+} from './mcpUnavailable.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
@@ -426,8 +432,12 @@ const reconfiguringSessions = new Set<string>();
  *  long the turn was blocked. Lives here (not on the entry) because a permission may
  *  be answered after a model swap replaced the executor. */
 const permissionWaitStartedAt = new Map<string, number>();
-/** 远程会话里「组合里的 MCP 没带上」已经说过的：会话 id → 名字（`notForwardedNotice`，同一会话同一个只说一次）。 */
-const notForwardedNoticed = new Map<string, Set<string>>();
+/**
+ * 每条会话最近一次准备时没带上的 MCP（`announceMcpUnavailable`）：输入框上方那个「⚠ N 个 MCP 不可用」徽标的数据。
+ * `noted` = 这条会话的对话记录里已经说过（说过的就不再挂徽标 —— 同一件事只说一处）。
+ */
+type McpUnavailableView = { items: Array<{ name: string; label: string; detail: string }>; text: string; noted: boolean; group: string };
+const mcpUnavailableBySession = new Map<string, McpUnavailableView>();
 /** `permissionWaitStartedAt` 的键：会话 + 请求 id。 */
 const permissionWaitKey = (sessionId: string, requestId: string): string => `${sessionId}:${requestId}`;
 /**
@@ -2231,7 +2241,53 @@ function reconnectForwardNow(sessionId: string, name: string, lt: LocalToolsSpec
   });
 }
 
-type ForwardNotReady = { name: string; reason: string; starting: boolean };
+type ForwardNotReady = { name: string; reason: string; starting: boolean; missing?: string };
+
+/** 这台电脑（`perMachine` 按它挑覆盖；「说过了」的记录按它分）。 */
+function thisMachine(): MachineIdentity {
+  return { hostname: os.hostname(), platform: process.platform };
+}
+
+/** 没就绪里「找不到程序 / 起不来」的那些 → 合并提示的条目（还在起的不算：好了会自动挂上，单独说）。 */
+function forwardNotReadyItems(notReady: ForwardNotReady[]): McpUnavailable[] {
+  return notReady.filter((n) => !n.starting).map((n) => (n.missing
+    ? missingCommandItem(n.name, n.missing, n.reason)
+    : failedItem(n.name, n.reason)));
+}
+
+/**
+ * **这次会话准备没带上的 MCP：合并成一条，同一原因只说一次**（规则见 `mcpUnavailable.ts`）。
+ *
+ * `scopeId` = 用的哪个 MCP 配置（组合 id；Kiro 远程会话是 agent）；`okNames` = 这次正常带上的（清掉它们「说过了」的记录）。
+ * 有第一次出现 / 原因变了的 → 进对话记录（`noteGroup: mcp-unavailable:<scopeId>`，界面的「不再提醒」按它记）；
+ * 全都说过了 → 不进对话记录，只把列表交给界面挂徽标（`acp:mcp-unavailable`）。
+ */
+function announceMcpUnavailable(sessionId: string, scopeId: string, items: McpUnavailable[], okNames: string[]): void {
+  const home = os.homedir();
+  const seen = readMcpNoticeSeen(home);
+  const plan = planMcpNotice(items, seen, mcpNoticeScope(os.hostname(), scopeId), okNames);
+  const text = mcpUnavailableNotice(items);
+  const group = `mcp-unavailable:${scopeId}`;
+  let noted = false;
+  if (plan.say) {
+    noted = noteInSession(sessionId, text, undefined, group);
+    logger.info('localmcp', `没带上的 MCP 进对话记录 sessionId=${sessionId}（第一次 / 原因变了：${plan.fresh.join(', ')}）`);
+  } else if (items.length) {
+    logger.info('localmcp', `没带上的 MCP 之前说过，只挂徽标 sessionId=${sessionId}：${items.map((i) => i.name).join(', ')}`);
+  }
+  /* 没说成（会话删了…）就不记「说过了」：下次照样说 */
+  if ((!plan.say || noted) && JSON.stringify(plan.next) !== JSON.stringify(seen)) writeMcpNoticeSeen(home, plan.next);
+  const prev = mcpUnavailableBySession.get(sessionId);
+  const view: McpUnavailableView = {
+    items: items.map((i) => ({ name: i.name, label: mcpUnavailableLabel(i.kind), detail: i.detail })),
+    text,
+    group,
+    /* 同一条会话重连又准备一遍：前面已经在这条会话里说过同样的，照旧算说过 */
+    noted: noted || (!!prev?.noted && prev.text === text),
+  };
+  if (items.length) mcpUnavailableBySession.set(sessionId, view); else mcpUnavailableBySession.delete(sessionId);
+  mainWindow?.webContents.send('acp:mcp-unavailable', { sessionId, ...(items.length ? view : { items: [], text: '', noted: false, group }) });
+}
 
 /**
  * **转发的 stdio MCP 先就绪、再交给执行器**（两个分支共用：Claude Code / Codex 写进 mcpServers，Kiro 写进远端 agent）。
@@ -2249,7 +2305,7 @@ async function gateForwardStdio(server: LocalMcpServer, sessionId: string, stdio
         ? `转发 MCP「${r.name}」就绪：${r.toolCount} 个工具 sessionId=${sessionId}`
         : `转发 MCP「${r.name}」没就绪（${r.starting ? '还在启动' : '起不来'}），这次不交给执行器 sessionId=${sessionId}: ${r.error}`);
     }
-    return ready.filter((r) => !r.ok).map((r) => ({ name: r.name, reason: String(r.error || ''), starting: !!r.starting }));
+    return ready.filter((r) => !r.ok).map((r) => ({ name: r.name, reason: String(r.error || ''), starting: !!r.starting, ...(r.missing ? { missing: r.missing } : {}) }));
   } finally {
     clearTimeout(slow);
     forwardGating.delete(sessionId);
@@ -2257,13 +2313,15 @@ async function gateForwardStdio(server: LocalMcpServer, sessionId: string, stdio
 }
 
 /**
- * spec 登记之后：没就绪的记成当前不可用、进对话记录说清楚；还在起的那几个，若在到期到登记之间刚好好了
- * （那次 `up` 被 forwardGating 挡掉了），补一次 `up` —— 否则就靠它自己报 `up` 时 `reconnectForForward`。
+ * spec 登记之后：没就绪的记成当前不可用。还在起的（`starting`，好了会自动挂上）照旧各说一句；
+ * 找不到程序 / 起不来的不在这里说，交给调用方并进那一条合并提示（`forwardNotReadyItems` → `announceMcpUnavailable`）。
+ * 还在起的那几个，若在到期到登记之间刚好好了（那次 `up` 被 forwardGating 挡掉了），补一次 `up` ——
+ * 否则就靠它自己报 `up` 时 `reconnectForForward`。
  */
 function noteForwardNotReady(server: LocalMcpServer, sessionId: string, spec: LocalToolsSpec, notReady: ForwardNotReady[]): void {
   for (const n of notReady) {
     markForwardUnavailable(spec, n.name, n.reason);
-    noteInSession(sessionId, forwardNotReadyNotice(n.name, n.reason, n.starting), undefined, `forward-mcp-not-ready:${n.name}`);
+    if (n.starting) noteInSession(sessionId, forwardNotReadyNotice(n.name, n.reason, n.starting), undefined, `forward-mcp-not-ready:${n.name}`);
   }
   if (!spec.awaitingForward?.length) return;
   void server.readyProxies(sessionId, { deadlineMs: 0 }).then((rs) => {
@@ -2513,7 +2571,8 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   } else if (profile.mcpCombo && combo !== findCombo(combos, profile.mcpCombo)) {
     sessionNotice(sessionId, tr('⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
   }
-  return combo;
+  /* 文件跟着 S3 同步到别的电脑：按这台电脑套上 `perMachine` 的覆盖（主机名 / 系统），交出去的是本机那份 */
+  return localizeCombo(combo, thisMachine());
 }
 
 /**
@@ -2528,10 +2587,21 @@ function localComboTools(
 ): { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] } | undefined {
   if (engineOf(profile) === 'kiro') return undefined;
   const combo = sessionCombo(sessionId, profile);
-  const { servers, skipped } = buildAcpMcpServers(combo, shellEnv as Record<string, string | undefined>);
-  for (const s of skipped) {
-    sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in MCP profile "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) }));
-  }
+  const built = buildAcpMcpServers(combo, shellEnv as Record<string, string | undefined>);
+  /*
+    缺环境变量的、这台电脑上找不到程序的（跨电脑同步过来的路径，`resolveCommand`）不交给适配器 —— 交了也只是起不来。
+    合并成一条说（`announceMcpUnavailable`：同一台电脑 + 同一个 MCP 配置 + 同一原因只说一次）。
+  */
+  const unavailable: McpUnavailable[] = built.skipped.map((s) => skippedItem(s.name, tr('missing environment variable(s) {vars}', { vars: trList(s.missing) })));
+  const servers = built.servers.filter((s) => {
+    if ('url' in s) return true;
+    const env = { ...shellEnv, ...Object.fromEntries(s.env.map((e) => [e.name, e.value])) } as Record<string, string | undefined>;
+    if (resolveCommand(s.command, { env })) return true;
+    logger.warn('mcp-combo', `组合「${combo.name}」的 MCP「${s.name}」在这台电脑上找不到命令 ${s.command}，这次不交给适配器 sessionId=${sessionId}`);
+    unavailable.push(missingCommandItem(s.name, s.command, commandMissingReason(s.command)));
+    return false;
+  });
+  announceMcpUnavailable(sessionId, combo.id, unavailable, servers.map((s) => s.name));
   if (!servers.length) return undefined;
   logger.info('mcp-combo', `组合「${combo.name}」挂 ${servers.length} 个 MCP sessionId=${sessionId}: ${JSON.stringify(maskAcpServers(servers))}`);
   return { remotePort: 0, localPort: 0, agentOverride: '', mcpServers: servers };
@@ -2648,28 +2718,20 @@ async function ensureLocalTools(
         sources: localKiroMcpSources(os.homedir(), profile.kiroAgent),
         env: shellEnv as Record<string, string | undefined>,
       });
-      /* 跳过的记下来给「会话信息」（`acp:session-info` 的 localTools）；会话里照旧一条一条说 */
+      /*
+        跳过的记下来给「会话信息」（`acp:session-info` 的 localTools）。跳过的、组合里没标「从本机转发」的（审计 4.1）、
+        下面找不到程序 / 起不来的，**合并成一条**说（`announceMcpUnavailable`：同一台电脑 + 同一个 MCP 配置 + 同一原因只说一次）。
+      */
       const skippedReasons: Array<{ name: string; reason: string }> = [];
+      const unavailable: McpUnavailable[] = [];
       for (const s of skipped) {
-        if (s.origin === 'list') {
-          sessionNotice(sessionId, tr('⚠️ MCP "{mcp}" in the "forward from this machine" list can\'t be forwarded ({reason}); it is skipped this time.', { mcp: s.name, reason: String(s.reason) }));
-          skippedReasons.push({ name: s.name, reason: String(s.reason) });
-          continue;
-        }
-        sessionNotice(sessionId, s.missing
-          ? tr('⚠️ MCP "{mcp}" in MCP profile "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), vars: trList(s.missing) })
-          : tr('⚠️ MCP "{mcp}" in MCP profile "{combo}" can\'t be forwarded from this machine ({reason}); it is skipped this time.', { mcp: s.name, combo: comboDisplayName(combo), reason: String(s.reason) }));
-        skippedReasons.push({ name: s.name, reason: s.missing ? tr('missing environment variable(s) {vars}', { vars: trList(s.missing) }) : String(s.reason) });
+        const reason = s.missing ? tr('missing environment variable(s) {vars}', { vars: trList(s.missing) }) : String(s.reason);
+        skippedReasons.push({ name: s.name, reason });
+        unavailable.push(skippedItem(s.name, s.origin === 'list'
+          ? tr('it is in the "forward from this machine" list but can\'t be forwarded ({reason})', { reason })
+          : reason));
       }
-      /* 组合里没标「从本机转发」、远程会话里就没有的那些（审计 4.1）：同一会话同一个只说一次，说成了才记 */
-      for (const n of notForwarded) {
-        const said = notForwardedNoticed.get(sessionId) || new Set<string>();
-        if (said.has(n.name)) continue;
-        if (noteInSession(sessionId, notForwardedNotice(n, comboDisplayName(combo)), undefined, `mcp-not-forwarded:${n.name}`)) {
-          said.add(n.name);
-          notForwardedNoticed.set(sessionId, said);
-        }
-      }
+      for (const n of notForwarded) unavailable.push(notForwardedItem(n.name, n.kind, notForwardedWhy(n)));
       if (notForwarded.length) logger.info('localmcp', `组合里没带进远程会话 sessionId=${sessionId}：${notForwarded.map((n) => `${n.name}（${n.kind}）`).join(', ')}`);
       server.setProxies(sessionId, entries);
       /*
@@ -2705,6 +2767,8 @@ async function ensureLocalTools(
       localToolsBySession.set(sessionId, spec);
       toollessSessions.delete(sessionId);
       noteForwardNotReady(server, sessionId, spec, notReady);
+      unavailable.push(...forwardNotReadyItems(notReady));
+      announceMcpUnavailable(sessionId, combo.id, unavailable, entries.filter((e) => !notReady.some((n) => n.name === e.name)).map((e) => e.name));
       /* 探测，但不挡会话（同 Kiro 分支）；先登记 spec，失败才记得到它上面（`noteHttpProbe`） */
       watchHttpForwards(sessionId, spec, http);
       logger.info('localmcp', `本地工具已备好（${ENGINE_LABEL[engineOf(profile)]}，走 mcpServers）sessionId=${sessionId} 远端端口=${remotePort} workdir=${localDir}`);
@@ -2755,6 +2819,8 @@ async function ensureLocalTools(
     localToolsBySession.set(sessionId, spec);
     toollessSessions.delete(sessionId);
     noteForwardNotReady(server, sessionId, spec, notReady);
+    announceMcpUnavailable(sessionId, `kiro-agent:${profile.kiroAgent || 'default'}`, forwardNotReadyItems(notReady),
+      forwardable.filter((e) => !notReady.some((n) => n.name === e.name)).map((e) => e.name));
     watchHttpForwards(sessionId, spec, forwardable.filter(isHttpForward));
     logger.info('localmcp', `本地工具已备好 sessionId=${sessionId} 远端端口=${remotePort} 本地端口=${spec.localPort} workdir=${localDir}`);
     return spec;
@@ -12713,6 +12779,25 @@ ${hint}` : ''}` };
     const r = readMcpCombos(os.homedir());
     return { path: mcpCombosPath(os.homedir()), exists: r.exists, text: r.exists ? r.text : '', template: MCP_COMBOS_TEMPLATE, error: r.error };
   });
+  /**
+   * 面板里标「这台电脑不可用」：给它的文本（编辑框里的）里哪些 stdio MCP 套上本机覆盖后命令还是找不到（`comboLocalAvailability`）。
+   * 主机名一起给 —— 「为这台电脑设置命令 / 在这台电脑上禁用」写的是 `perMachine["<主机名>"]`。
+   */
+  ipcMain.handle('acp:mcp-combos-local-check', (_event, text: string) => {
+    const machine = thisMachine();
+    return { ...machine, items: comboLocalAvailability(String(text ?? ''), machine) };
+  });
+  /** 改编辑框里的文本：给一条 MCP 写上这台电脑的覆盖（`setMachineOverride`）；找不到那条 → null。保存仍走 `acp:save-mcp-combos`。 */
+  ipcMain.handle('acp:mcp-combos-machine-override', (_event, text: string, fileId: string, server: string, override: { command?: string; args?: string[]; disabled?: boolean }) => {
+    const o = override && typeof override === 'object' ? override : {};
+    return setMachineOverride(String(text ?? ''), String(fileId ?? ''), String(server ?? ''), os.hostname(), {
+      ...(typeof o.command === 'string' ? { command: o.command.trim() } : {}),
+      ...(Array.isArray(o.args) ? { args: o.args.map(String) } : {}),
+      ...(typeof o.disabled === 'boolean' ? { disabled: o.disabled } : {}),
+    });
+  });
+  /** 输入框上方「⚠ N 个 MCP 不可用」徽标：这条会话最近一次准备时没带上的（`announceMcpUnavailable`；界面重载后来取）。 */
+  ipcMain.handle('acp:mcp-unavailable', (_event, sessionId: string) => mcpUnavailableBySession.get(String(sessionId ?? '')) ?? null);
   /**
    * **新会话默认组合**（`defaultCombo.ts`）：全局一个（config.json），项目可覆盖（project.json）。
    * 只影响之后新建的 Claude Code / Codex 会话（`acp:new-session`），已有会话不动。

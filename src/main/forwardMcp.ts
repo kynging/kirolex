@@ -406,6 +406,12 @@ export function notForwardedNotice(n: NotForwarded, comboName: string): string {
   return trConcat(
     tr('⚠️ This remote session does not have MCP "{mcp}" from MCP profile "{combo}". To use it, add "forwardFromLocal": true to it in 🧩 MCP profiles and reopen the session.', { mcp: n.name, combo: comboName }),
     NOTE_DETAIL_SEP,
+    notForwardedWhy(n));
+}
+
+/** 为什么远程会话里没有它（合并提示的「详情」里也用这一句，见 `mcpUnavailable.notForwardedItem`）。 */
+export function notForwardedWhy(n: NotForwarded): string {
+  return (
     n.kind === 'http'
       ? tr('An HTTP MCP in an MCP profile reaches a remote session only when it is marked forwardFromLocal (KiroLex then sends its requests from this machine). Adding it to the "forward from this machine" list in Settings works too.')
       : tr('A stdio MCP in an MCP profile reaches a remote session only when it runs on this machine and is forwarded: its command is a path on this machine, it is one of {names}, or it is marked forwardFromLocal.', { names: FORWARD_BY_NAME.join(' / ') }));

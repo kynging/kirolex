@@ -48,6 +48,7 @@ import { isWakeTool, wakeToolDefs } from './wakeTools.ts';
 import { isSessionTool, sessionToolDefs } from './sessionCalls.ts';
 import { CMD_UTF8_VAR, cmdUtf8Args, decodeLocalOutput, powershellArgs } from './winShell.ts';
 import { taskkillTree } from './procTree.ts';
+import { commandMissingReason, resolveCommand } from './commandResolve.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -236,6 +237,8 @@ export interface LocalMcpDeps {
   onProxyState?(sessionId: string, name: string, state: ForwardProxyState, reason?: string): void;
   /** 转发 stdio MCP 的重试节奏（默认 `FORWARD_RETRY`；测试调小）。 */
   forwardRetry?: ForwardRetry;
+  /** 转发 stdio MCP 的 stderr 怎么解（默认 `decodeLocalOutput`：Windows 上按本机代码页兜底；测试换成指定代码页）。 */
+  decodeStderr?: (buf: Buffer) => string;
 }
 
 export interface ToolResult {
@@ -662,7 +665,11 @@ const FORWARD_STABLE_MS = 60_000;
 
 export type ForwardProxyState = 'up' | 'down' | 'failed';
 /** `readyProxies` 的一项结果。`starting` = 到期时它还在起（没失败，只是慢）。 */
-export interface ProxyReady { name: string; ok: boolean; toolCount: number; error?: string; starting?: boolean }
+export interface ProxyReady {
+  name: string; ok: boolean; toolCount: number; error?: string; starting?: boolean;
+  /** 这台电脑上找不到它的命令（`resolveCommand`）：没起、也不重试。值是配置里写的那条命令。 */
+  missing?: string;
+}
 
 /**
  * 一个被代理的 stdio MCP：**先就绪再交出去**、按内部 id 配对、退了自动拉起、会话结束时杀掉。
@@ -681,6 +688,9 @@ export interface ProxyReady { name: string; ok: boolean; toolCount: number; erro
  *   · 进程退了（不是我们停的）：按退避自动拉起并**重新握手** —— 远端还拿着原来那条 MCP 连接、不会再发 initialize，
  *     严格的 server 没握手就调工具会报错。连续失败 `maxFails` 次停下，报 `failed`；之后再有调用会重新试一轮。
  */
+/** 命令在这台电脑上找不到（`StdioProxy.missingReason`）：握手那条路据此直接停下、不重试。 */
+class MissingCommandError extends Error {}
+
 class StdioProxy implements ForwardProxy {
   private spec: StdioProxySpec;
   private log: LocalMcpDeps['log'];
@@ -705,11 +715,17 @@ class StdioProxy implements ForwardProxy {
   private stopped = false;
   private retryTimer: NodeJS.Timeout | null = null;
   private waiters = new Set<() => void>();
+  private decode: (buf: Buffer) => string;
+  /** 最近一行 stderr（按本机代码页解过）：进程退了时拼进原因 —— 原来只剩「退出了（code 1）」。 */
+  private lastStderr = '';
+  /** 上一次失败是因为找不到命令（`ready` 据此带上 `missing`）。 */
+  private missingNow = false;
 
-  constructor(spec: StdioProxySpec, log: LocalMcpDeps['log'], opts: { retry?: ForwardRetry; onState?: (state: ForwardProxyState, reason?: string) => void } = {}) {
+  constructor(spec: StdioProxySpec, log: LocalMcpDeps['log'], opts: { retry?: ForwardRetry; onState?: (state: ForwardProxyState, reason?: string) => void; decodeStderr?: (buf: Buffer) => string } = {}) {
     this.spec = spec;
     this.log = log;
     this.retry = opts.retry || FORWARD_RETRY;
+    this.decode = opts.decodeStderr || decodeLocalOutput;
     this.onState = (state, reason) => { try { opts.onState?.(state, reason); } catch { /* 记状态出错不能连累转发 */ } };
     /*
       **Windows 上 `npx` / `uvx` 是 `.cmd` shim，`spawn` 直接执行不了**
@@ -726,6 +742,16 @@ class StdioProxy implements ForwardProxy {
 
   private notify(): void {
     for (const w of [...this.waiters]) w();
+  }
+
+  /**
+   * 命令在这台电脑上找不到 → 给人看的原因；找得到 → null。**spawn 之前**查（`resolveCommand`，按子进程的 PATH）——
+   * 「跨电脑同步的配置路径在本机不存在」：原来照样起，得到乱码的「系统找不到指定的路径」，再重拉 6 次。
+   * 每次要起之前都重新查（便宜）：程序后来装上了，下一次就能起。
+   */
+  private missingReason(): string | null {
+    const env = { ...process.env, ...(this.spec.env || {}) };
+    return resolveCommand(this.spec.command, { env }) ? null : commandMissingReason(this.spec.command);
   }
 
   private spawnChild(): ChildProcess {
@@ -761,9 +787,13 @@ class StdioProxy implements ForwardProxy {
         if (resolve) { this.pending.delete(msg.id); resolve(msg); }
       }
     });
+    this.lastStderr = '';
     child.stderr?.on('data', (d: Buffer) => {
-      const t = d.toString('utf-8').trim();
-      if (t) this.log('info', `[${this.spec.name}] ${t.slice(0, 300)}`);
+      /* 按本机代码页解（同 local_bash）：Windows 上 cmd 的报错是 936，按 UTF-8 解就是「ϵͳ�Ҳ���ָ����·����」 */
+      const t = this.decode(d).trim();
+      if (!t) return;
+      this.log('info', `[${this.spec.name}] ${t.slice(0, 300)}`);
+      if (this.child === child) this.lastStderr = t.split(/\r?\n/).map((l) => l.trim()).filter(Boolean).pop()!.slice(0, 200);
     });
     const gone = (why: string) => {
       if (this.child !== child) return;      // 我们自己停 / 换掉的那个：不算掉线
@@ -781,7 +811,7 @@ class StdioProxy implements ForwardProxy {
       this.countFailure();
     };
     child.on('error', (err) => gone(`${this.spec.name} 起不来：${err?.message || err}`));
-    child.on('close', (code) => gone(`${this.spec.name} 退出了（code ${code}）`));
+    child.on('close', (code) => gone(`${this.spec.name} 退出了（code ${code}）${this.lastStderr ? `：${this.lastStderr}` : ''}`));
     this.log('info', `[${this.spec.name}] 起在本机：${this.spec.command} ${(this.spec.args || []).join(' ')}`);
     return child;
   }
@@ -858,7 +888,12 @@ class StdioProxy implements ForwardProxy {
     if (this.handshake) return this.handshake;
     if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
     const p = (async () => {
-      if (!this.child) this.spawnChild();
+      if (!this.child) {
+        const missing = this.missingReason();
+        if (missing) throw new MissingCommandError(missing);
+        this.missingNow = false;
+        this.spawnChild();
+      }
       const init = await this.request('initialize', {
         protocolVersion: MCP_PROTOCOL_VERSION,
         capabilities: {},
@@ -888,6 +923,15 @@ class StdioProxy implements ForwardProxy {
       if (this.stopped) return;
       this.lastError = String(err?.message || err);
       this.killChild();   // 握手失败 / 超时：这个进程不可信了，下一次换一个新的
+      /* 程序都不在：重试没有意义，直接停下（下一次有人要它时 `ready` 再查一次） */
+      if (err instanceof MissingCommandError) {
+        this.gaveUp = true;
+        this.missingNow = true;
+        this.log('warn', `[${this.spec.name}] ${this.lastError}，不拉起、不重试`);
+        this.onState('failed', this.lastError);
+        this.notify();
+        return;
+      }
       this.countFailure();
     });
     return p;
@@ -901,12 +945,24 @@ class StdioProxy implements ForwardProxy {
     const name = this.spec.name;
     if (this.stopped) return { name, ok: false, toolCount: 0, error: tr('Forwarding stopped (the session has ended)') };
     if (this.up) return { name, ok: true, toolCount: this.toolCount };
+    if (!this.child && !this.handshake) {
+      const missing = this.missingReason();
+      if (missing) {
+        if (this.lastError !== missing) this.log('warn', `[${name}] ${missing}，不拉起、不重试`);
+        this.lastError = missing;
+        this.missingNow = true;
+        if (this.retryTimer) { clearTimeout(this.retryTimer); this.retryTimer = null; }
+        return { name, ok: false, toolCount: 0, error: missing, missing: this.spec.command };
+      }
+    }
     if (this.gaveUp) { this.gaveUp = false; this.fails = 0; }
     if (!this.retryTimer) this.startHandshake().catch(() => { /* 结果走状态 */ });
     const t0 = Date.now();
     while (true) {
       if (this.up) return { name, ok: true, toolCount: this.toolCount };
-      if (this.gaveUp || this.stopped) return { name, ok: false, toolCount: 0, error: this.lastError || tr('Unknown error') };
+      if (this.gaveUp || this.stopped) {
+        return { name, ok: false, toolCount: 0, error: this.lastError || tr('Unknown error'), ...(this.missingNow ? { missing: this.spec.command } : {}) };
+      }
       const left = deadlineMs - (Date.now() - t0);
       if (left <= 0) {
         return { name, ok: false, toolCount: 0, starting: true, error: this.lastError || `${name} 等了 ${Math.round(deadlineMs / 1000)} 秒还没就绪` };
@@ -1669,6 +1725,7 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
             const name = spec.name;
             const p: StdioProxy = new StdioProxy(spec, deps.log, {
               retry: deps.forwardRetry,
+              decodeStderr: deps.decodeStderr,
               onState: (state, reason) => {
                 /* 已经被换掉 / 停放着的那个报的不算：会话现在用的不是它 */
                 if (proxies.get(k) !== p) return;

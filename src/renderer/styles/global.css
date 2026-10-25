@@ -1951,6 +1951,75 @@ button, input, select, textarea {
 .pending-switch-actions button.pending-switch-stop-now { border-color: var(--accent); background: var(--accent); color: #fff; font-weight: 600; }
 .pending-switch-actions button:hover { filter: brightness(1.1); }
 .kirolex-message-time { flex: 0 0 auto; color: var(--text-tertiary); font-size: 10px; }
+/* 连接失败那张卡片下面挂着「安装」：卡片和按钮上下排 */
+.kirolex-message:has(> .adapter-install) { flex-direction: column; align-items: center; gap: 8px; }
+/* KiroLex 提示右上角的 × / 「不再提醒」（只改显示，见 noticeDismiss.ts） */
+/* 有 × / 不再提醒的卡片：窄格里正文优先占宽度，按钮放不下就折到下一行（不能把正文挤成一列一个字） */
+.kirolex-message-card:has(.kirolex-message-close) { flex-wrap: wrap; }
+.kirolex-message-card:has(.kirolex-message-close) .kirolex-message-body { flex: 1 1 14em; }
+.kirolex-message-close, .kirolex-message-mute {
+  flex: 0 0 auto; align-self: flex-start;
+  background: none; border: 0; padding: 0 2px; cursor: pointer;
+  color: var(--text-tertiary); font-size: 10.5px; line-height: 1.45;
+}
+.kirolex-message-mute { text-decoration: underline dotted; text-align: left; }
+.kirolex-message-close:hover, .kirolex-message-mute:hover { color: var(--text-primary); }
+/* 「这条会话没能启动」横幅的 ×（只改显示） */
+.startup-banner { position: relative; }
+.startup-banner-close {
+  position: absolute; top: 4px; right: 6px; padding: 0 4px; border: 0; background: none;
+  color: var(--error); opacity: .75; cursor: pointer; font-size: 12px; line-height: 1.4;
+}
+.startup-banner-close:hover { opacity: 1; }
+.startup-banner.failed { padding-right: 26px; }
+/* 启动失败横幅 / 错误横幅 / 空会话错误卡片的「不再提醒（这台电脑）」 */
+.startup-banner-mute, .chat-error-banner-mute {
+  flex: 0 0 auto; background: none; border: 0; padding: 0 4px; cursor: pointer;
+  color: var(--error); opacity: .75; font-size: 11px; line-height: 1.4; text-decoration: underline dotted;
+}
+.startup-banner-mute:hover, .chat-error-banner-mute:hover { opacity: 1; }
+.startup-banner-mute { margin-left: auto; margin-right: 14px; }
+.chat-empty-error-mute { display: block; margin-top: 6px; padding: 0; }
+/* 空会话中央那张连接错误卡片的 ×（右上角） */
+.chat-empty-error-close { position: absolute; top: 8px; right: 6px; margin-left: 0; }
+/* 输入框上方「⚠ N 个 MCP 不可用」徽标（ChatArea McpUnavailableBadge） */
+.mcp-unavailable-badge-wrap { position: relative; display: flex; align-items: center; gap: 2px; margin: 0 12px 6px; }
+.mcp-unavailable-badge {
+  padding: 2px 9px; border: 1px solid rgba(220,120,60,0.45); border-radius: 10px;
+  background: rgba(220,120,60,0.12); color: var(--text-secondary); font-size: 11px; cursor: pointer;
+}
+.mcp-unavailable-badge:hover { filter: brightness(1.15); }
+.mcp-unavailable-badge-close { background: none; border: 0; color: var(--text-muted); cursor: pointer; font-size: 11px; padding: 2px 4px; }
+.mcp-unavailable-badge-close:hover { color: var(--text-primary); }
+.mcp-unavailable-pop {
+  position: absolute; left: 0; right: 0; bottom: calc(100% + 4px); z-index: 30;
+  max-width: 640px; max-height: 50vh; overflow: auto;
+  padding: 8px 12px; border: 1px solid var(--border); border-radius: 8px;
+  background: var(--bg-secondary, #1e1e24); box-shadow: 0 6px 24px rgba(0,0,0,0.35);
+  color: var(--text-secondary); font-size: 11.5px; line-height: 1.5;
+}
+.mcp-unavailable-list { margin: 0; padding: 0; list-style: none; display: flex; flex-direction: column; gap: 6px; }
+.mcp-unavailable-list strong { color: var(--text-primary); }
+.mcp-unavailable-label { color: var(--text-tertiary); margin-left: 4px; }
+.mcp-unavailable-list div { white-space: pre-wrap; overflow-wrap: anywhere; }
+.mcp-unavailable-mute { display: block; margin-top: 8px; }
+/* 「🧩 MCP 配置」面板：这台电脑不可用的 MCP（McpCombosPane） */
+.mcp-combos-unavailable { margin: 6px 0; padding: 6px 10px; border: 1px solid rgba(220,120,60,0.45); border-radius: 6px; background: rgba(220,120,60,0.10); font-size: 11.5px; }
+.mcp-combos-unavailable-row { display: flex; flex-wrap: wrap; align-items: center; gap: 6px; padding: 3px 0; }
+.mcp-combos-unavailable-tag { padding: 0 6px; border-radius: 8px; background: rgba(220,120,60,0.25); color: var(--text-primary); font-size: 10.5px; }
+.mcp-combos-unavailable-reason { flex: 1 1 260px; min-width: 0; color: var(--text-secondary); overflow-wrap: anywhere; }
+.mcp-combos-unavailable-row input {
+  flex: 1 1 240px; min-width: 0; font-size: 11.5px; padding: 3px 6px;
+  border: 1px solid var(--border); border-radius: 5px; background: var(--bg-primary, #16161a); color: var(--text-primary);
+}
+.mcp-combos-unavailable-actions { display: inline-flex; gap: 6px; margin-left: auto; }
+.mcp-combos-unavailable-row button {
+  padding: 2px 10px; border: 1px solid rgba(255,255,255,0.28); border-radius: 6px;
+  background: transparent; color: var(--text-secondary); font-size: 11px; cursor: pointer; white-space: nowrap;
+}
+.mcp-combos-unavailable-row button:hover:not(:disabled) { color: var(--text-primary); border-color: var(--accent); }
+.mcp-combos-unavailable-row button.allow { border-color: var(--accent); background: var(--accent); color: #fff; }
+.mcp-combos-unavailable-row button:disabled { opacity: .5; cursor: default; }
 /* 定时唤醒 / 定时结束：同一种紧凑卡片（ChatArea ScheduleWakeCard / ScheduleEndCard），不是用户气泡 */
 .schedule-card-box {
   display: flex; flex-direction: column; align-items: stretch; gap: 3px;

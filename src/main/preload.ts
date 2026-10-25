@@ -166,6 +166,18 @@ contextBridge.exposeInMainWorld('kiroApi', {
   mcpCombos: (sessionId?: string) => ipcRenderer.invoke('acp:mcp-combos', sessionId),
   mcpCombosFile: () => ipcRenderer.invoke('acp:mcp-combos-file'),
   saveMcpCombos: (text: string) => ipcRenderer.invoke('acp:save-mcp-combos', text),
+  /** 编辑框里的组合哪些 MCP「这台电脑不可用」（命令找不到）+ 这台电脑的主机名 / 系统 */
+  mcpCombosLocalCheck: (text: string) => ipcRenderer.invoke('acp:mcp-combos-local-check', text),
+  /** 给一条 MCP 写上这台电脑的覆盖（perMachine），返回新文本（不存盘） */
+  mcpCombosMachineOverride: (text: string, fileId: string, server: string, override: { command?: string; args?: string[]; disabled?: boolean }) =>
+    ipcRenderer.invoke('acp:mcp-combos-machine-override', text, fileId, server, override),
+  /** 这条会话最近一次准备时没带上的 MCP（输入框上方的徽标） */
+  mcpUnavailable: (sessionId: string) => ipcRenderer.invoke('acp:mcp-unavailable', sessionId),
+  onMcpUnavailable: (cb: (d: { sessionId: string; items: Array<{ name: string; label: string; detail: string }>; text: string; noted: boolean }) => void) => {
+    const handler = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('acp:mcp-unavailable', handler);
+    return () => ipcRenderer.removeListener('acp:mcp-unavailable', handler);
+  },
   /** 新会话默认组合：不传 project = 全局；传了 = 那个项目的覆盖（'' = 跟随全局） */
   defaultCombo: (project?: string) => ipcRenderer.invoke('acp:default-combo', project),
   setDefaultCombo: (comboId: string, project?: string) => ipcRenderer.invoke('acp:set-default-combo', comboId, project),

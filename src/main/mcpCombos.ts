@@ -40,6 +40,56 @@ export interface McpComboServer {
   /** 从本机转发（给远程会话用；本地会话里不起作用） */
   forwardFromLocal?: boolean;
   disabled?: boolean;
+  /**
+   * 按机器覆盖（`localizeServer`）：键是主机名（`os.hostname()`，不分大小写、不看 `.local`）或系统
+   * （`darwin` / `win32` / `linux`）；主机名优先。这份文件跟着 S3 同步到别的电脑，一台电脑上的路径在另一台上没有。
+   * stdio 型可覆盖 command / args，两种都可写 `disabled: true`（在那台电脑上不用它）。不写 = 和原来一样。
+   */
+  perMachine?: Record<string, McpMachineOverride>;
+}
+
+export interface McpMachineOverride { command?: string; args?: string[]; disabled?: boolean }
+
+/** `perMachine` 里按系统写的那几个键（`process.platform` 的值）。 */
+export const MACHINE_OS_KEYS = ['darwin', 'win32', 'linux'] as const;
+
+export interface MachineIdentity { hostname: string; platform: string }
+
+const hostKey = (h: string): string => String(h || '').trim().toLowerCase().replace(/\.local$/, '');
+
+/** 这台电脑用 `perMachine` 里的哪个键：主机名优先，其次系统；都没有 → undefined。 */
+export function perMachineKey(s: Pick<McpComboServer, 'perMachine'>, m: MachineIdentity): string | undefined {
+  const pm = s?.perMachine;
+  if (!pm || typeof pm !== 'object') return undefined;
+  const keys = Object.keys(pm);
+  const host = hostKey(m.hostname);
+  return (host ? keys.find((k) => hostKey(k) === host) : undefined) ?? keys.find((k) => k === m.platform);
+}
+
+/**
+ * 这台电脑上实际用的那份：套上 `perMachine` 的覆盖，去掉 `perMachine` 本身（交出去的配置里不该有它）。
+ * 没写 `perMachine` 的原样返回（同一个对象）。
+ */
+export function localizeServer(s: McpComboServer, m: MachineIdentity): McpComboServer {
+  if (!s || typeof s !== 'object' || s.perMachine === undefined) return s;
+  const { perMachine, ...rest } = s;
+  const key = perMachineKey(s, m);
+  const o = key !== undefined ? perMachine![key] : undefined;
+  if (!o) return rest;
+  const stdio = rest.url === undefined;
+  return {
+    ...rest,
+    ...(stdio && typeof o.command === 'string' && o.command.trim() ? { command: o.command } : {}),
+    ...(stdio && Array.isArray(o.args) ? { args: o.args.map(String) } : {}),
+    ...(typeof o.disabled === 'boolean' ? { disabled: o.disabled } : {}),
+  };
+}
+
+/** 整个组合按这台电脑套一遍（`localizeServer`）。 */
+export function localizeCombo<T extends { mcpServers: Record<string, McpComboServer> }>(combo: T, m: MachineIdentity): T {
+  const servers: Record<string, McpComboServer> = {};
+  for (const [name, s] of Object.entries(combo.mcpServers || {})) servers[name] = localizeServer(s, m);
+  return { ...combo, mcpServers: servers };
 }
 
 export interface McpCombo {
@@ -117,6 +167,24 @@ function checkStringMap(v: unknown, what: string): string | null {
   return null;
 }
 
+/** `perMachine`：键 → `{ command?, args?, disabled? }`；http 型只能写 disabled。 */
+function checkPerMachine(where: string, v: unknown, isHttp: boolean): string | null {
+  if (v === undefined) return null;
+  if (!isObj(v)) return tr('{where}: perMachine must be an object (hostname or darwin / win32 / linux → override)', { where });
+  const allowed = isHttp ? ['disabled'] : ['command', 'args', 'disabled'];
+  for (const [key, o] of Object.entries(v)) {
+    if (!key.trim()) return tr('{where}: a perMachine key cannot be empty', { where });
+    if (!isObj(o)) return tr('{where}: perMachine "{key}" must be an object', { where, key });
+    for (const k of Object.keys(o)) {
+      if (!allowed.includes(k)) return tr('{where}: perMachine "{key}" can only set {allowed}', { where, key, allowed: allowed.join(' / ') });
+    }
+    if (o.command !== undefined && (typeof o.command !== 'string' || !o.command.trim())) return tr('{where}: perMachine "{key}" command cannot be empty', { where, key });
+    if (o.args !== undefined && (!Array.isArray(o.args) || o.args.some((a) => typeof a !== 'string'))) return tr('{where}: perMachine "{key}" args must be a list of strings', { where, key });
+    if (o.disabled !== undefined && typeof o.disabled !== 'boolean') return tr('{where}: perMachine "{key}" disabled must be true / false', { where, key });
+  }
+  return null;
+}
+
 function checkServer(name: string, s: unknown): string | null {
   const where = tr('MCP "{name}"', { name });
   if (!name.trim()) return tr('The MCP name cannot be empty');
@@ -131,6 +199,8 @@ function checkServer(name: string, s: unknown): string | null {
   for (const flag of ['forwardFromLocal', 'disabled'] as const) {
     if (s[flag] !== undefined && typeof s[flag] !== 'boolean') return tr('{where}: {flag} must be true / false', { where, flag });
   }
+  const pm = checkPerMachine(where, s.perMachine, hasUrl);
+  if (pm) return pm;
   if (hasUrl) {
     if (typeof s.url !== 'string' || !/^https?:\/\/\S+$/i.test(s.url)) return tr('{where}: url must start with http:// or https://', { where });
     const h = checkStringMap(s.headers, tr('{where} headers', { where }));

@@ -33,7 +33,8 @@ describe('KiroLex 自己的提示', () => {
   test('ChatArea 把它们分成独立的一组，用居中的 KirolexMessageItem 画', () => {
     const chat = source('src/renderer/components/ChatArea.tsx');
     assert.match(chat, /\{ kind: 'kirolex'; message: Message; count\?: number \}/);
-    assert.match(chat, /if \(m\.role === 'user' && isKirolexNote\(m\)\) \{\s*groups\.push\(\{ kind: 'kirolex', message: m \}\);/);
+    /* 只在界面上的 role: 'kirolex'（连接失败 / 装好了）也进同一组（2026-10-25：要能关） */
+    assert.match(chat, /if \(\(m\.role === 'user' && isKirolexNote\(m\)\) \|\| \(m\.role as string\) === 'kirolex'\) \{\s*groups\.push\(\{ kind: 'kirolex', message: m \}\);/);
     assert.match(chat, /const KirolexMessageItem = memo/);
     assert.match(chat, /<KirolexMessageItem/);
     assert.match(chat, /<NoticeBody text=\{message\.content\} count=\{count\} render=\{\(s\) => withPathLinks\(s, message\.id\)\} \/>/);

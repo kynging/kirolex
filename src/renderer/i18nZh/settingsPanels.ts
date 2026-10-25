@@ -467,4 +467,11 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   "Credential env on that machine (names only, kept as they are): {keys}": "那台机器上的凭证类 env（只看了键名，原样保留）：{keys}",
   "This file was updated by S3 sync from another computer; the editor now shows the new version.": "S3 同步从别的电脑拉回了这份配置的新版本，编辑框里已经换成新内容。",
   "This file was updated by S3 sync from another computer while you had unsaved changes. Saving is blocked so the new version is not overwritten; click Discard changes to load it.": "你还有没保存的改动时，S3 同步从别的电脑拉回了这份配置的新版本。为了不把新版本盖掉，现在不能保存；点「放弃修改」载入新版本。",
+  // ── McpCombosPane：这台电脑不可用 ──
+  'Not saved: could not find MCP "{name}" in the editor': '没存上：编辑框里找不到 MCP「{name}」',
+  '⚠️ Not available on this computer ({host}): the command is not found here. This MCP profile file may come from another computer.': '⚠️ 这台电脑（{host}）上不可用：找不到命令，这份 MCP 配置可能来自另一台电脑。',
+  'Not available on this computer': '这台电脑不可用',
+  'Command on this computer, for example C:\\tools\\builder-mcp.exe': '这台电脑上的命令，例如 C:\\tools\\builder-mcp.exe',
+  'Set a command for this computer': '为这台电脑设置命令',
+  'Turn off on this computer': '在这台电脑上禁用',
 };

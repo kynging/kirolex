@@ -58,6 +58,15 @@ import { EngineStatusPanel } from './components/EngineStatusPanel';
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
 const RUN_DONE_CARD_KEY = 'kirolex-run-done-card';
 
+/** 主进程 `McpUnavailableView`：没带上的 MCP（名字 + 简短原因 + 详情那句）、合并提示的全文、对话记录里说过没有。 */
+export interface McpUnavailableView {
+  items: Array<{ name: string; label: string; detail: string }>;
+  text: string;
+  noted: boolean;
+  /** `mcp-unavailable:<MCP 配置>`（「不再提醒」按它记） */
+  group?: string;
+}
+
 declare global {
   interface Window {
     kiroApi: {
@@ -432,6 +441,9 @@ declare global {
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
       onUserMessage?: (callback: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true; variants?: { zh: string; en: string }; noteGroup?: string }) => void) => () => void;
       onSessionModel: (callback: (data: { sessionId: string; model: string }) => void) => () => void;
+      /** 这条会话最近一次准备时没带上的 MCP（输入框上方「⚠ N 个 MCP 不可用」徽标，主进程 `announceMcpUnavailable`） */
+      mcpUnavailable?: (sessionId: string) => Promise<McpUnavailableView | null>;
+      onMcpUnavailable?: (callback: (data: McpUnavailableView & { sessionId: string }) => void) => () => void;
       onTurnRestart: (callback: (data: { sessionId: string }) => void) => () => void;
       onTurnQuiet: (callback: (data: { sessionId: string; quietSeconds: number; openTools?: number; toolIdleSeconds?: number; interruptInSeconds?: number | null; boundBy?: 'tool' | 'quiet'; boundSeconds?: number }) => void) => () => void;
       onTurnWedged: (callback: (data: { sessionId: string; produced: boolean }) => void) => () => void;

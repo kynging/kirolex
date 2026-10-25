@@ -250,12 +250,17 @@ describe('4.1 组合里的 MCP 没带进远程会话：说一句原因 + 怎么�
     }
   });
 
-  test('接线：远程 Claude Code / Codex 那条分支按会话 + 名字只说一次，说成了才记', () => {
-    const body = slice(M, 'const { entries, skipped, fromCombo, fromList, notForwarded } = adapterForwardPlan({', 3600);
-    const loop = slice(body, 'for (const n of notForwarded) {', 600);
-    assert.match(loop, /if \(said\.has\(n\.name\)\) continue;/);
-    assert.match(loop, /if \(noteInSession\(sessionId, notForwardedNotice\(n, comboDisplayName\(combo\)\), undefined, `mcp-not-forwarded:\$\{n\.name\}`\)\) \{\s*said\.add\(n\.name\);/);
-    assert.match(M, /const notForwardedNoticed = new Map<string, Set<string>>\(\);/);
+  /*
+   * 2026-10-25「提示刷屏」：没带上的不再一条一条说，并进那一条合并提示（`announceMcpUnavailable`）；
+   * 「只说一次」从「同一会话同一个」放宽成更严的「同一台电脑 + 同一个 MCP 配置 + 同一原因」（新会话也不重复），说成了才记。
+   */
+  test('接线：远程 Claude Code / Codex 那条分支把没带上的并进合并提示，同一原因只说一次，说成了才记', () => {
+    const body = slice(M, 'const { entries, skipped, fromCombo, fromList, notForwarded } = adapterForwardPlan({', 6000);
+    assert.match(body, /for \(const n of notForwarded\) unavailable\.push\(notForwardedItem\(n\.name, n\.kind, notForwardedWhy\(n\)\)\);/);
+    assert.match(body, /announceMcpUnavailable\(sessionId, combo\.id, unavailable,/);
+    const fn = slice(M, 'function announceMcpUnavailable', 2200);
+    assert.match(fn, /if \(plan\.say\) \{\s*noted = noteInSession\(sessionId, text, undefined, group\)/);
+    assert.match(fn, /if \(\(!plan\.say \|\| noted\) && .*writeMcpNoticeSeen/);
   });
 });
 

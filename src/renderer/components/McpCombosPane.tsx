@@ -11,7 +11,13 @@ import { JsonCodeEditor } from './JsonCodeEditor';
  * 校验不过就不写盘，把原因原样显示出来。这里只做一个即时的 JSON 语法提示。
  *
  * 关闭 = 丢弃未保存的改动（和其他 tab 同一条规则）。
+ *
+ * 文件跟着 S3 同步到别的电脑：编辑框里哪条 stdio MCP 的命令在**这台电脑**上找不到（主进程 `comboLocalAvailability`，
+ * 已套上本机的 `perMachine` 覆盖），就标「这台电脑不可用」，给「为这台电脑设置命令 / 在这台电脑上禁用」——
+ * 写进那条的 `perMachine["<主机名>"]`（`setMachineOverride`）然后直接保存；别的电脑上的配置不动。
  */
+
+type Unavailable = { comboId: string; fileId: string; comboName: string; server: string; command: string; reason: string; overrideKey?: string };
 
 const api = () => (window as any).kiroApi;
 
@@ -31,6 +37,9 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [status, setStatus] = useState<{ ok: boolean; text: string } | null>(null);
+  const [machine, setMachine] = useState<{ hostname: string; items: Unavailable[] } | null>(null);
+  /* 正在填「为这台电脑设置命令」的那条（`fileId\u0000server`）和填的内容 */
+  const [editing, setEditing] = useState<{ key: string; command: string } | null>(null);
 
   useEffect(() => {
     let alive = true;
@@ -46,20 +55,34 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     return () => { alive = false; };
   }, []);
 
+  /* 编辑框里的内容是合法 JSON 时（停手 400ms 后）查一次这台电脑上哪些命令找不到 */
+  useEffect(() => {
+    if (loading || !content.trim() || jsonErrorAt(content)) { setMachine(null); return; }
+    let alive = true;
+    const timer = setTimeout(() => {
+      void api()?.mcpCombosLocalCheck?.(content).then((r: { hostname: string; items: Unavailable[] }) => {
+        if (alive && r) setMachine({ hostname: r.hostname, items: Array.isArray(r.items) ? r.items : [] });
+      }).catch(() => { /* 查不了就不标 */ });
+    }, 400);
+    return () => { alive = false; clearTimeout(timer); };
+  }, [content, loading]);
+
   /* 文件不存在、编辑框也还是空的：显示「还没有自定义组合」，不是一个空编辑框（空文本也不是合法 JSON） */
   const empty = !exists && !content.trim();
   const invalid = empty ? null : syntaxError(content, t);
   const errorLine = invalid ? jsonErrorAt(content)?.line : null;
   const dirty = content !== initial;
 
-  const save = async () => {
-    if (saving || empty) return;
+  const save = async (override?: string) => {
+    if (saving || (empty && override === undefined)) return;
+    const content0 = override ?? content;
+    const invalid = syntaxError(content0, t);
     /* Ctrl+S 绕过了禁用的保存按钮：JSON 有错时也要明说没存，不能什么都不发生 */
     if (invalid) { setStatus({ ok: false, text: t('Not saved: {error}', { error: invalid }) }); return; }
     setSaving(true); setStatus(null);
     try {
       /* 按格式化后的样子写盘（只动空白，不改语义；校验仍在 main 那边） */
-      const text = formatJsonText(content).text ?? content;
+      const text = formatJsonText(content0).text ?? content0;
       const r = await api().saveMcpCombos(text);
       if (r?.ok) {
         setContent(text); setInitial(text); setExists(true);
@@ -74,6 +97,15 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     }
   };
 
+  /** 「为这台电脑设置命令 / 在这台电脑上禁用」：写进 perMachine["<主机名>"]，然后直接保存（别的电脑的配置不动） */
+  const applyMachineOverride = async (u: Unavailable, override: { command?: string; disabled?: boolean }) => {
+    const next: string | null = await api()?.mcpCombosMachineOverride?.(content, u.fileId, u.server, override);
+    if (!next) { setStatus({ ok: false, text: t('Not saved: could not find MCP "{name}" in the editor', { name: u.server }) }); return; }
+    setEditing(null);
+    setContent(next);
+    await save(next);
+  };
+
   return (
     <>
       <div className="agent-config-editor-workspace kiro-config-workspace mcp-combos-workspace">
@@ -86,6 +118,43 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
           <div className="kiro-config-hint">
             {t('A list of MCP profiles: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed; an MCP profile with id default replaces the built-in "General".')}
           </div>
+          {!!machine?.items.length && (
+            <div className="mcp-combos-unavailable" role="status">
+              <div>{t('⚠️ Not available on this computer ({host}): the command is not found here. This MCP profile file may come from another computer.', { host: machine.hostname })}</div>
+              {machine.items.map((u) => {
+                const key = `${u.fileId}\u0000${u.server}`;
+                const isEditing = editing?.key === key;
+                return (
+                  <div key={key} className="mcp-combos-unavailable-row">
+                    <span className="mcp-combos-unavailable-tag">{t('Not available on this computer')}</span>
+                    <strong>{u.comboName} / {u.server}</strong>
+                    <span className="mcp-combos-unavailable-reason">{u.reason}</span>
+                    {isEditing ? (
+                      <>
+                        <input
+                          autoFocus
+                          value={editing!.command}
+                          placeholder={t('Command on this computer, for example C:\\tools\\builder-mcp.exe')}
+                          onChange={(e) => setEditing({ key, command: e.target.value })}
+                          onKeyDown={(e) => {
+                            if (e.key === 'Enter' && editing!.command.trim()) { e.preventDefault(); void applyMachineOverride(u, { command: editing!.command.trim(), disabled: false }); }
+                            else if (e.key === 'Escape') { e.preventDefault(); e.stopPropagation(); setEditing(null); }
+                          }}
+                        />
+                        <button className="btn allow" disabled={saving || !editing!.command.trim()} onClick={() => void applyMachineOverride(u, { command: editing!.command.trim(), disabled: false })}>{t('Save')}</button>
+                        <button className="btn deny" onClick={() => setEditing(null)}>{t('Cancel')}</button>
+                      </>
+                    ) : (
+                      <span className="mcp-combos-unavailable-actions">
+                        <button className="btn deny" disabled={saving} onClick={() => setEditing({ key, command: '' })}>{t('Set a command for this computer')}</button>
+                        <button className="btn deny" disabled={saving} onClick={() => void applyMachineOverride(u, { disabled: true })}>{t('Turn off on this computer')}</button>
+                      </span>
+                    )}
+                  </div>
+                );
+              })}
+            </div>
+          )}
           {loading ? (
             <div className="agent-config-editor-message">{t('Loading…')}</div>
           ) : empty ? (

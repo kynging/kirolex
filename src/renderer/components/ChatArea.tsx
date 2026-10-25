@@ -37,11 +37,12 @@ import { parseScheduleEnd, scheduleWakeCards, SCHEDULE_CARD_LINES, type Schedule
 import { livePendingNoteId, pendingTargetText, waitedSeconds, type PendingKind } from '../../main/pendingSwitch.ts';
 import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts';
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
+import { dismissNotice, isMuted, isNoticeHidden, muteKeyOf, muteNotice, muteScope, noticeHideStore, CONNECT_FAILURE_GROUP, SESSION_ERROR_GROUP, STARTUP_FAILED_GROUP } from '../noticeDismiss.ts';
 import { usageChip, type UsageView } from '../usageChip.ts';
 
 import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
-import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff } from '../App';
+import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff, McpUnavailableView } from '../App';
 import { userTurnBubbles } from '../steerSplit';
 import { isControlMessageId } from '../../main/controlSessions';
 import { sessionSegments } from '../../main/sessionCalls';
@@ -927,23 +928,132 @@ function AdapterInstallAction({ sessionId, message, remote }: { sessionId?: stri
   );
 }
 
-const KirolexMessageItem = memo<{ message: Message; count?: number }>(({ message, count }) => (
-  <div className="kirolex-message" role="status">
-    <div className="kirolex-message-card">
-      <span className="kirolex-message-label">KiroLex</span>
-      <span className="kirolex-message-body">
-        <NoticeBody text={message.content} count={count} render={(s) => withPathLinks(s, message.id)} />
-      </span>
-      <time
-        className="kirolex-message-time"
-        dateTime={new Date(message.timestamp).toISOString()}
-        title={new Date(message.timestamp).toLocaleString()}
-      >
-        {formatMessageTime(message.timestamp)}
-      </time>
+/**
+ * 右上角 ×：关掉这条（`dismissNotice`）；有类型的再给「不再提醒」（`muteNotice`，这台电脑 / 这个 MCP 配置）。
+ * **只改显示状态** —— 不删对话记录、不改发给模型的内容（KiroLex 提示本来就不发给模型）。规则见 `noticeDismiss.ts`。
+ */
+/**
+ * 只在界面上的 `role: 'kirolex'` 提示（连接失败，原因是主进程的报错原文）里有 `**本机**` 这种加粗 ——
+ * 原来它混在回复组里按 markdown 画；进了 KiroLex 卡片后照样把 `**…**` 画成粗体，其余照旧认路径。
+ */
+function boldWithPathLinks(text: string, keyBase: string): React.ReactNode {
+  const parts = text.split(/\*\*([^*\n]+?)\*\*/);
+  if (parts.length === 1) return withPathLinks(text, keyBase);
+  return parts.map((part, i) => (i % 2 === 1
+    ? <strong key={`${keyBase}:b${i}`}>{part}</strong>
+    : <React.Fragment key={`${keyBase}:t${i}`}>{withPathLinks(part, `${keyBase}:${i}`)}</React.Fragment>));
+}
+
+const KirolexMessageItem = memo<{ message: Message; count?: number; after?: React.ReactNode }>(({ message, count, after }) => {
+  const t = useT();
+  const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
+  /* 「这条会话没连上」（只在界面上，没有 noteGroup）按 `connect-failure` 这一类记「不再提醒」 */
+  const group = message.noteGroup ?? (isConnectFailureNotice(message) ? CONNECT_FAILURE_GROUP : undefined);
+  if (isNoticeHidden({ id: message.id, noteGroup: group }, hide)) return null;
+  const scope = muteScope(group);
+  return (
+    <div className="kirolex-message" role="status">
+      <div className="kirolex-message-card">
+        <span className="kirolex-message-label">KiroLex</span>
+        <span className="kirolex-message-body">
+          {(message.role as string) === 'kirolex'
+            ? <NoticeBody text={message.content} count={count} render={(s) => boldWithPathLinks(s, message.id)} />
+            : <NoticeBody text={message.content} count={count} render={(s) => withPathLinks(s, message.id)} />}
+        </span>
+        <time
+          className="kirolex-message-time"
+          dateTime={new Date(message.timestamp).toISOString()}
+          title={new Date(message.timestamp).toLocaleString()}
+        >
+          {formatMessageTime(message.timestamp)}
+        </time>
+        {scope && muteKeyOf(group) && (
+          <button
+            type="button"
+            className="kirolex-message-mute"
+            onClick={() => muteNotice(group)}
+            title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}
+          >
+            {scope === 'profile' ? t("Don't remind me (this computer, this MCP profile)") : t("Don't remind me (this computer)")}
+          </button>
+        )}
+        <button
+          type="button"
+          className="kirolex-message-close"
+          onClick={() => dismissNotice(message.id)}
+          title={t('Close notice (display only; the conversation is unchanged)')}
+          aria-label={t('Close notice')}
+        >✕</button>
+      </div>
+      {after}
     </div>
-  </div>
-));
+  );
+});
+
+/**
+ * **输入框上方的「⚠ N 个 MCP 不可用」徽标** —— 同一台电脑 + 同一个 MCP 配置 + 同一原因，对话记录里只在第一次说
+ * （主进程 `announceMcpUnavailable`）；之后的会话只挂这个小徽标，点开看同一份详情（每个的原因和怎么改）。
+ * 这条会话的对话记录里已经说过的（`noted`）不挂 —— 同一件事只说一处。× 只关掉这条会话的徽标（只改显示）；
+ * 这个 MCP 配置点过「不再提醒」的也不挂。
+ */
+function McpUnavailableBadge({ sessionId }: { sessionId: string | null }) {
+  const t = useT();
+  const [view, setView] = useState<McpUnavailableView | null>(null);
+  const [open, setOpen] = useState(false);
+  const [closedFor, setClosedFor] = useState<string | null>(null);
+  const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
+  useEffect(() => {
+    setView(null); setOpen(false);
+    if (!sessionId) return;
+    let alive = true;
+    void window.kiroApi.mcpUnavailable?.(sessionId).then((v) => { if (alive) setView(v ?? null); }).catch(() => {});
+    const off = window.kiroApi.onMcpUnavailable?.((d) => { if (alive && d.sessionId === sessionId) setView(d.items.length ? d : null); });
+    return () => { alive = false; off?.(); };
+  }, [sessionId]);
+  if (!sessionId || !view || !view.items.length || view.noted) return null;
+  if (closedFor === `${sessionId}\u0000${view.text}`) return null;
+  const k = muteKeyOf(view.group);
+  if (k && hide.muted.has(k)) return null;
+  return (
+    <div className="mcp-unavailable-badge-wrap">
+      <button
+        type="button"
+        className="mcp-unavailable-badge"
+        aria-expanded={open}
+        onClick={() => setOpen((o) => !o)}
+        title={view.items.map((i) => `${i.name}（${i.label}）`).join('\n')}
+      >
+        {t('⚠ {n} MCP(s) unavailable', { n: view.items.length })}
+      </button>
+      <button
+        type="button"
+        className="mcp-unavailable-badge-close"
+        onClick={() => setClosedFor(`${sessionId}\u0000${view.text}`)}
+        title={t('Close notice (display only; the conversation is unchanged)')}
+        aria-label={t('Close notice')}
+      >✕</button>
+      {open && (
+        <div className="mcp-unavailable-pop" role="dialog">
+          <ul className="mcp-unavailable-list">
+            {view.items.map((i) => (
+              <li key={i.name}><strong>{i.name}</strong> <span className="mcp-unavailable-label">{i.label}</span><div>{i.detail}</div></li>
+            ))}
+          </ul>
+          {k && (
+            <button
+              type="button"
+              className="kirolex-message-mute mcp-unavailable-mute"
+              onClick={() => { muteNotice(view.group); setOpen(false); }}
+              title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}
+            >
+              {t("Don't remind me (this computer, this MCP profile)")}
+            </button>
+          )}
+        </div>
+      )}
+    </div>
+  );
+}
 
 /**
  * 定时到点发进会话的那条（`runScheduledJob`）：紧凑的「⏰ 定时」卡片，不画成用户气泡。
@@ -1012,6 +1122,9 @@ const ScheduleEndCard = memo<{ message: Message; end: ScheduleEndView; name?: st
   const t = useT();
   const badge = repeatBadge(count);
   const title = [t('⏰ Scheduled'), name || '', end.kind === 'paused' ? t('Paused') : t('Ended')].filter(Boolean).join(' · ');
+  /* 和别的 KiroLex 提示一样能关 / 不再提醒（只改显示，见 noticeDismiss.ts） */
+  const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
+  if (isNoticeHidden({ id: message.id, noteGroup: message.noteGroup }, hide)) return null;
   return (
     <div className="kirolex-message schedule-card schedule-card-end" data-status={end.kind} role="status">
       <div className="kirolex-message-card schedule-card-box">
@@ -1025,6 +1138,23 @@ const ScheduleEndCard = memo<{ message: Message; end: ScheduleEndView; name?: st
           >
             {formatMessageTime(message.timestamp)}
           </time>
+          {muteKeyOf(message.noteGroup) && (
+            <button
+              type="button"
+              className="kirolex-message-mute"
+              onClick={() => muteNotice(message.noteGroup)}
+              title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}
+            >
+              {t("Don't remind me (this computer)")}
+            </button>
+          )}
+          <button
+            type="button"
+            className="kirolex-message-close"
+            onClick={() => dismissNotice(message.id)}
+            title={t('Close notice (display only; the conversation is unchanged)')}
+            aria-label={t('Close notice')}
+          >✕</button>
         </div>
         <div className="schedule-card-status">{end.outcome}</div>
         {(end.until || end.output) && (
@@ -1837,6 +1967,8 @@ const HandoffStack = memo<{ items: QueuedMessage[]; engineName: string }>(({ ite
 function StartupBanner({ info, onRetry }: { info: CreateStageInfo; onRetry?: (local: boolean) => void }) {
   const t = useT();
   const [now, setNow] = useState(() => Date.now());
+  const [closedAt, setClosedAt] = useState<number | null>(null);
+  const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
   const running = info.stage !== 'ready' && info.stage !== 'failed';
   useEffect(() => {
     if (!running) return;
@@ -1850,6 +1982,10 @@ function StartupBanner({ info, onRetry }: { info: CreateStageInfo; onRetry?: (lo
     : key === 'start' ? t('Start {engine}', { engine })
     : t('Ready');
   const secs = startupElapsedSeconds(info, now);
+  /* 失败那一张能关（只改显示：不重试、不动对话记录）；按这次启动的时刻记，下一次失败照样显示 */
+  if (info.stage === 'failed' && closedAt === info.startedAt) return null;
+  /* 「不再提醒」过启动失败这一类（这台电脑）：失败那张不再画；启动中 / 就绪照常显示，重试照旧走提示卡片里的入口 */
+  if (info.stage === 'failed' && isMuted(STARTUP_FAILED_GROUP, hide)) return null;
   return (
     <div className={`startup-banner ${info.stage}`} role={info.stage === 'failed' ? 'alert' : 'status'} aria-live="polite">
       <span className="startup-banner-title">
@@ -1857,6 +1993,14 @@ function StartupBanner({ info, onRetry }: { info: CreateStageInfo; onRetry?: (lo
           : info.stage === 'ready' ? t('✅ {engine} is ready', { engine })
           : t('⏳ Starting {engine}… {s}s', { engine, s: secs })}
       </span>
+      {info.stage === 'failed' && (
+        <button type="button" className="startup-banner-close" onClick={() => setClosedAt(info.startedAt)}
+          title={t('Close notice (display only; the conversation is unchanged)')} aria-label={t('Close notice')}>✕</button>
+      )}
+      {info.stage === 'failed' && (
+        <button type="button" className="startup-banner-mute" onClick={() => muteNotice(STARTUP_FAILED_GROUP)}
+          title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}>{t("Don't remind me (this computer)")}</button>
+      )}
       <span className="startup-steps">
         {startupSteps(info).map((step, i) => (
           <span key={step.key} className={`startup-step ${step.state}`}>
@@ -3612,6 +3756,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    * `session.remoteHost` —— 现在两处看同一份事实（那套同步状态已经随镜像一起删掉了）。
    */
   const { notice: sessionNotice, dismiss: dismissNotice } = useSessionNotice(currentSessionId || null);
+  /* 会话错误横幅 / 空会话错误卡片「不再提醒」过（这台电脑）就不画 —— 只改显示，错误照旧记着（noticeDismiss.ts） */
+  const errorNoticeMuted = isMuted(SESSION_ERROR_GROUP, useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get));
   const remoteHostLabel = remoteHost ? remoteHost.replace(/^[^@]*@/, '') : undefined;
   const nonKiro = !!engine && engine !== 'kiro';
   /* 用量栏右边那一格（非 kiro）：本会话花费 / token / 不显示 —— kiro 的 credits 按钮另走 */
@@ -4478,7 +4624,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         continue;
       }
       /* KiroLex 自己的话单独成组：不是提问（不进 lastQuestion），也不收 steer */
-      if (m.role === 'user' && isKirolexNote(m)) {
+      /* 只在界面上的 KiroLex 提示（`role: 'kirolex'`：连接失败 / 装好了，见 connectFailure.ts）也单独成组 —— 原来混进回复组里，没有 × */
+      if ((m.role === 'user' && isKirolexNote(m)) || (m.role as string) === 'kirolex') {
         groups.push({ kind: 'kirolex', message: m });
       } else if (m.role === 'user') {
         if (!m.steer) {
@@ -4811,9 +4958,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       {/* 新建会话的启动阶段：放最上面 —— 这时候整条会话就在等它 */}
       {startup && <StartupBanner info={startup} onRetry={onRetryStartup} />}
 
-      {connectionError && messages.length > 0 && (
+      {connectionError && !errorNoticeMuted && messages.length > 0 && (
         <div className="chat-error-banner" role="alert">
           <span className="chat-error-banner-text"><NoticeBody text={bannerText(shownIn(findLang, connectionError) ?? '')} /></span>
+          <button
+            className="chat-error-banner-mute"
+            onClick={() => muteNotice(SESSION_ERROR_GROUP)}
+            title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}
+          >{t("Don't remind me (this computer)")}</button>
           {onDismissError && (
             <button
               className="chat-error-banner-close"
@@ -4989,14 +5141,29 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <h2 style={{ fontSize: 20, fontWeight: 500, marginBottom: 8, color: 'var(--text-secondary)' }}>
               KiroLex
             </h2>
-            {connectionError ? (
-              <div style={{ 
-                maxWidth: 500, margin: '16px auto', padding: '12px 16px',
+            {connectionError && !errorNoticeMuted ? (
+              <div className="chat-empty-error" style={{
+                position: 'relative',
+                maxWidth: 500, margin: '16px auto', padding: '12px 28px 12px 16px',
                 background: 'rgba(239, 83, 80, 0.1)', border: '1px solid rgba(239, 83, 80, 0.3)',
                 borderRadius: 8, textAlign: 'left', fontSize: 13, lineHeight: 1.6,
                 color: 'var(--error)', whiteSpace: 'pre-wrap',
               }}>
                 <NoticeBody text={bannerText(shownIn(findLang, connectionError) ?? '')} />
+                {/* 空会话里的连接错误也要能关（和上面那条横幅同一个 onDismissError：只清显示状态，不动对话记录） */}
+                <button
+                  className="chat-error-banner-mute chat-empty-error-mute"
+                  onClick={() => muteNotice(SESSION_ERROR_GROUP)}
+                  title={t('Hide this kind of notice from now on (display only; the conversation is unchanged)')}
+                >{t("Don't remind me (this computer)")}</button>
+                {onDismissError && (
+                  <button
+                    className="chat-error-banner-close chat-empty-error-close"
+                    onClick={onDismissError}
+                    title={t('Dismiss')}
+                    aria-label={t('Dismiss')}
+                  >✕</button>
+                )}
               </div>
             ) : (
               <p style={{ fontSize: 14 }}>
@@ -5041,6 +5208,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               key={`${currentSessionId ?? 'none'}:${group.message.id}`}
               message={group.message}
               count={group.count}
+              after={isConnectFailureNotice(group.message)
+                ? <AdapterInstallAction sessionId={currentSessionId} message={group.message} remote={!!remoteHostLabel} />
+                : undefined}
             />
           ) : group.kind === 'user' ? (
             <UserGroupItem
@@ -5337,6 +5507,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   <button className="session-notice-close" onClick={dismissNotice} title={t('Close notice')}>✕</button>
                 </div>
               )}
+              <McpUnavailableBadge sessionId={currentSessionId || null} />
               <ChatInputBox
                 choiceChips={choiceChips}
                 onSlashPicker={handleSlashPicker}
