@@ -71,6 +71,7 @@ import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummar
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
+import { accentEngine } from '../engineTheme.ts';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -4756,6 +4757,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       className={`chat-main ${isDragOver ? 'drag-over' : ''}${readOnly ? ' chat-main-pane' : ''}`}
       /* Claude / Codex 会话的样式钩子（命令面板「失败」标红，见 global.css）；kiro 会话不带，样式不变 */
       data-engine={nonKiro ? engine : undefined}
+      /* 按引擎区分的强调色（输入框焦点边框 / 发送按钮 / 进度点），见 engineTheme.ts */
+      data-accent-engine={accentEngine(engine)}
       onDrop={readOnly ? undefined : handleDrop}
       onDragOver={readOnly ? undefined : handleDragOver}
       onDragEnter={readOnly ? undefined : handleDragEnter}

@@ -35,7 +35,7 @@ import { ReviewPane, isDeckPath } from './components/ReviewPane';
 import { PreviewFind } from './components/PreviewFind';
 import { findOwner, isInPreview, previewSearchable } from './previewFind';
 import { savedScrollOf, scrollHostOf, restoreScroll } from './tabScroll';
-import { IconClose, IconLogs } from './components/Icons';
+import { IconClose, IconLogs, IconRobot, IconClaudeSpark, IconCodex } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
@@ -51,6 +51,7 @@ import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
 import { engineLabel, engineCliName } from './engineLabel';
+import { accentEngine, engineAccentCss } from './engineTheme.ts';
 import type { QuestionCard } from '../main/elicitation.ts';
 import { EngineStatusPanel } from './components/EngineStatusPanel';
 
@@ -656,6 +657,8 @@ export interface Settings {
    * 关了只活过窗口 reload（见 `uiRestore`）。默认开。
    */
   restoreUiState?: boolean;
+  /** 按引擎区分强调色（Kiro 紫 / Claude Code 橙 / Codex 青绿，只用在几个小元素上，见 `engineTheme.ts`）。默认开；关 = 统一强调色。 */
+  engineAccents?: boolean;
   /** Auto-fold 💭 thinking segments once thinking finishes (default on). */
   autoFoldThinking: boolean;
   /** Auto-fold 🔧 tool segments once the tool call finishes (default on). */
@@ -683,7 +686,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: true, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -895,6 +898,10 @@ const isMac =
   navigator.platform.toUpperCase().includes('MAC');
 /** Windows / Linux：系统白标题栏去掉了（见主进程 createWindow），这里自己画一条深色的、可拖动的。 */
 const isWinFrame = typeof navigator !== 'undefined' && !isMac;
+
+/** 分屏标题旁引擎徽标的图标：和会话左下角那颗同一套（机器人是 kiro 的） */
+const EngineBadgeIcon: React.FC<{ engine?: string }> = ({ engine }) =>
+  engine === 'claude' ? <IconClaudeSpark size={11} /> : engine === 'codex' ? <IconCodex size={11} /> : <IconRobot size={11} />;
 
 const App: React.FC = () => {
   /*
@@ -4260,6 +4267,7 @@ const App: React.FC = () => {
       <div
         key={sid || 'empty'}
         className={`chat-pane${focused ? ' focused' : ''}`}
+        data-accent-engine={accentEngine(session?.engine)}
         style={paneStyle}
         // Clicking anywhere in a pane (including its composer) focuses that
         // session, so Enter always sends to the pane you are looking at.
@@ -4272,6 +4280,13 @@ const App: React.FC = () => {
         }}
       >
         <div className="chat-pane-header">
+          {/* 引擎徽标：颜色之外同时有图标和引擎名（色弱也分得清） */}
+          {session && (
+            <span className="engine-badge" title={engineLabel(session.engine)}>
+              <EngineBadgeIcon engine={session.engine} />
+              <span className="engine-badge-name">{engineLabel(session.engine)}</span>
+            </span>
+          )}
           <span className="chat-pane-title" title={displayTitle(settings.language, session?.title)}>{displayTitle(settings.language, session?.title) || t('Untitled')}</span>
           <button
             className="chat-pane-btn"
@@ -4324,6 +4339,8 @@ const App: React.FC = () => {
 
   return (
     <LangProvider lang={settings.language}>
+      {/* 按引擎区分的强调色（设置「按引擎区分颜色」，见 engineTheme.ts）：给挂了 data-accent-engine 的元素定义 --engine-accent* */}
+      <style>{engineAccentCss(settings.engineAccents !== false)}</style>
       {/* One line, because 「什么都没出现」 is the one thing a registration must never do silently. */}
       <div className={`app-layout no-toolbar${isMac ? ' mac' : ''}${isWinFrame ? ' win' : ''}${isWinFrame && winMaxed ? ' maxed' : ''}`}>
         {isMac && <div className="mac-titlebar" />}

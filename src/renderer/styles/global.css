@@ -651,6 +651,7 @@ button, input, select, textarea {
 }
 
 .session-item {
+  position: relative; /* 给 .session-accent-strip 定位 */
   padding: 9px 10px;
   border-radius: 6px;
   cursor: pointer;
@@ -664,6 +665,17 @@ button, input, select, textarea {
 
 .session-item:hover {
   background: var(--bg-hover);
+}
+
+/* 引擎强调色的细色条：绝对定位在行的左边缘里，不占位、不改布局（engineTheme.ts） */
+.session-accent-strip {
+  position: absolute;
+  left: 3px;
+  top: 28%;
+  bottom: 28%;
+  width: 3px;
+  border-radius: 2px;
+  background: var(--engine-accent, var(--accent));
 }
 
 .session-item.active {
@@ -1377,6 +1389,22 @@ button, input, select, textarea {
   font-weight: 600;
   line-height: 14px;
   text-align: center;
+}
+
+/* 分屏标题旁的引擎徽标：图标 + 引擎名，颜色只是额外的线索（engineTheme.ts） */
+.engine-badge {
+  flex: 0 0 auto;
+  display: inline-flex;
+  align-items: center;
+  gap: 3px;
+  padding: 0 6px;
+  height: 16px;
+  border-radius: 8px;
+  border: 1px solid var(--engine-accent, var(--accent));
+  color: var(--engine-accent-text, var(--text-secondary));
+  font-size: 10px;
+  line-height: 1;
+  white-space: nowrap;
 }
 
 .chat-pane-title {
@@ -2196,7 +2224,7 @@ button, input, select, textarea {
 .thinking-dots span {
   width: 6px;
   height: 6px;
-  background: var(--accent);
+  background: var(--engine-accent, var(--accent));
   border-radius: 50%;
   animation: thinking 1.4s infinite ease-in-out;
 }
@@ -2227,7 +2255,7 @@ button, input, select, textarea {
   width: 8px;
   height: 8px;
   border-radius: 50%;
-  background: var(--accent);
+  background: var(--engine-accent, var(--accent));
   flex-shrink: 0;
   animation: agent-activity-pulse 1.2s ease-in-out infinite;
 }
@@ -4191,8 +4219,9 @@ button, input, select, textarea {
 }
 
 .composer:focus-within {
-  border-color: color-mix(in srgb, var(--accent) 58%, var(--border));
-  box-shadow: 0 0 0 3px var(--accent-soft);
+  /* 按引擎区分颜色开着时是纯的引擎色（≥ 3:1，engineTheme.ts）；关着时退回原来的混色 */
+  border-color: var(--engine-accent-border, color-mix(in srgb, var(--accent) 58%, var(--border)));
+  box-shadow: 0 0 0 3px var(--engine-accent-soft, var(--accent-soft));
   background: color-mix(in srgb, var(--input-bg) 94%, var(--accent) 6%);
 }
 
@@ -4295,15 +4324,15 @@ button, input, select, textarea {
   padding: 0;
   border: none;
   border-radius: 50%;
-  background: var(--accent);
-  color: #fff;
+  background: var(--engine-accent, var(--accent));
+  color: var(--engine-on-accent, #fff);
   cursor: pointer;
   transition: filter 0.15s, box-shadow 0.15s, opacity 0.15s;
 }
 
 .composer-send:hover:not(:disabled) {
   filter: brightness(1.1);
-  box-shadow: 0 3px 12px var(--accent-soft);
+  box-shadow: 0 3px 12px var(--engine-accent-soft, var(--accent-soft));
 }
 
 .composer-send:disabled {

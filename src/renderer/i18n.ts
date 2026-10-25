@@ -335,6 +335,9 @@ const ZH_BASE: Record<string, string> = {
   'Concurrent connection limit (most chats connected at once)': '并发连接上限（最多同时连接的会话数）',
   'Auto-fold thinking when it finishes (💭 thinking)': '思考结束后自动折叠（💭 thinking）',
   'Merge queued messages into one': '排队消息合并成一条发送',
+  'Color by engine': '按引擎区分颜色',
+  'On: a few small elements take the engine’s accent color (Kiro purple / Claude Code orange / Codex teal): the thin bar on the left of each chat in the sidebar, the engine badge next to a split pane’s title, the composer’s focus border, the send button and the progress dots while a reply streams. Everything else keeps the usual colors. Off: all of these go back to the single accent color.':
+    '开：几个小地方用引擎自己的强调色（Kiro 紫 / Claude Code 橙 / Codex 青绿）—— 侧栏每条会话左边的细色条、分屏标题旁的引擎徽标、输入框获得焦点时的边框、发送按钮、回复流式输出时的进度点；其余界面颜色不变。关：这些地方全部回到统一的强调色。',
   'Refresh history.md every turn': '每回合刷新 history.md',
   'Inject memory (global / project / this chat)': '注入记忆（全局/项目/本会话）',
   'Show starter prompts when the composer is empty': '空输入框显示提示建议',

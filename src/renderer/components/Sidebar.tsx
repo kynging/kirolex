@@ -34,7 +34,8 @@ import type { ScheduleSummary } from '../scheduleView';
 import { IconLogs, IconWorkspaceFolder } from './Icons';
 import { showToast } from './Toasts';
 import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
-import { engineCliName } from '../engineLabel';
+import { engineCliName, engineLabel } from '../engineLabel';
+import { accentEngine } from '../engineTheme.ts';
 
 type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
 
@@ -322,6 +323,7 @@ const SessionItem: React.FC<{
       ref={setNodeRef}
       style={style}
       className={`session-item ${isActive ? 'active' : ''}${splitOrder > 0 ? ' in-split' : ''}`}
+      data-accent-engine={accentEngine(session.engine)}
       // One gesture only: clicking a chat opens it (and, in split view, puts it in
       // the next free slot). "Add without switching focus" was a made-up gesture
       // with no real use case; removing a chat lives on the pane's ✕ / right-click.
@@ -330,6 +332,8 @@ const SessionItem: React.FC<{
       {...attributes}
       {...listeners}
     >
+      {/* 引擎强调色的细色条（不是 tag ——「左侧会话框不要显示 claude 这个 tag」）；提示里有引擎名，不只靠颜色 */}
+      <span className="session-accent-strip" title={engineLabel(session.engine)} />
       {splitOrder > 0 && (
         <span
           className="session-split-order"
