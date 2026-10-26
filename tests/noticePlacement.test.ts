@@ -158,11 +158,14 @@ describe('自动改用备用模型：进对话记录，说清实际用的是哪�
     assert.ok(started > 0 && newSess > started && written > newSess && committed > written, '顺序：记下 → session/new → 写记录 → commit');
     assert.match(tBody, /catch \(err\) \{\s*\n\s*try \{ await client\.disconnect\(\); \} catch \{\}\s*\n\s*modelFallback\.discard\(sessionId\);/);
     /* 换引擎、换组合：commit 在 restoreContextAfterExecutorSwap 之后，catch 里 discard */
-    for (const tag of ['switch-engine', 'switch-mcp-combo']) {
-      assert.match(M, new RegExp(`restoreContextAfterExecutorSwap\\(sessionId, '${tag}'\\);\\s*\\n\\s*modelFallback\\.commit\\(sessionId\\);`));
+    /* 换组合的那段在 remountWithProfile 里（组合文件改了 / 换新的后端会话也走它），trigger 由调用方给 */
+    for (const tag of ["'switch-engine'", 'trigger']) {
+      assert.match(M, new RegExp(`restoreContextAfterExecutorSwap\\(sessionId, ${tag}\\);\\s*\\n\\s*modelFallback\\.commit\\(sessionId\\);`));
     }
     assert.match(M, /modelFallback\.discard\(sessionId\);   \/\/ 没换成：连上时记下的那句作废\s*\n\s*logger\.warn\('engine'/);
-    assert.match(M, /modelFallback\.discard\(sessionId\);   \/\/ 没换成：连上时记下的那句作废\s*\n\s*logger\.warn\('mcp-combo'/);
+    const rAt = M.indexOf('async function remountWithProfile(');
+    const rBody = M.slice(rAt, M.indexOf('\n  }\n', rAt));
+    assert.match(rBody, /\} catch \(err\) \{\s*\n\s*if \(client\) \{ try \{ await client\.disconnect\(\); \} catch \{\} \}\s*\n\s*modelFallback\.discard\(sessionId\);/);
     /* attach：成功返回前 commit，finally 里 discard（中途失败 / 被删） */
     assert.match(M, /modelFallback\.commit\(sessionId\);\s*\n\s*return \{ ok: true, freshBackend: freshBackendResult \};\s*\n\s*\} catch \(err\) \{[\s\S]{0,600}?throw err;\s*\n\s*\} finally \{[\s\S]{0,80}modelFallback\.discard\(sessionId\);/);
     /* 候选循环里不直接写 */

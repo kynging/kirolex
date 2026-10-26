@@ -191,7 +191,7 @@ describe('主进程接线：合并 + 只说一次 + 本机覆盖', () => {
   });
 
   test('组合按这台电脑套 perMachine；本地会话找不到命令的不交给适配器', () => {
-    assert.match(idx, /return localizeCombo\(combo, thisMachine\(\)\);/);
+    assert.match(idx, /const localized = localizeCombo\(combo, thisMachine\(\)\);[\s\S]{0,300}?return localized;/);
     const local = idx.slice(idx.indexOf('function localComboTools'), idx.indexOf('async function ensureLocalTools'));
     assert.match(local, /if \(resolveCommand\(s\.command, \{ env \}\)\) return true;/);
     assert.match(local, /missingCommandItem\(s\.name, s\.command, commandMissingReason\(s\.command\)\)/);

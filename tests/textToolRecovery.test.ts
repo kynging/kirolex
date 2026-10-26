@@ -175,8 +175,10 @@ describe('接线（index.ts）', () => {
     assert.match(h, /clearContextEstablished\(sessionId\)/);
     assert.match(h, /markContextOwedIfUnverified\(sessionId, trigger\)/);
     assert.match(slice(M, "if (verdict === 'recreate')", 800), /recreateBackendSession\(sessionId, entry, 'stale-session-recreate'\)/);
-    const idle = slice(M, 'async function swapBackendSessionWhenIdle(', 1500);
+    const idle = slice(M, 'async function swapBackendSessionWhenIdle(', 5000);
     assert.match(idle, /recreateBackendSession\(sessionId, entry, trigger\)/);
+    /* Claude Code / Codex：先按当前组合文件重新准备 MCP 再换（和组合文件改了自动重挂同一份，见 mcpComboWatch.test.ts） */
+    assert.match(idle, /if \(engineOf\(entry\.profile\) !== 'kiro' && remountMcpForSession\) \{\s*try \{\s*const r = await remountMcpForSession\(sessionId, trigger\);/);
     /* 换的那一下占住会话（同换模型），别让同一刻的新消息落到旧的后端会话上 */
     assert.match(idle, /reconfiguringSessions\.add\(sessionId\)/);
     assert.match(idle, /finally \{\s*reconfiguringSessions\.delete\(sessionId\)/);

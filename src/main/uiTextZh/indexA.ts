@@ -25,6 +25,11 @@ export const ZH_INDEX_A: Record<string, string> = {
 
   // ── index.ts：MCP 配置 / 本地工具通道 / 远程 ──
   '⚠️ The MCP profile file has an error ({error}), so this time it starts as "General" with no MCP attached.': '⚠️ MCP 配置文件有错（{error}），这次按「通用」起，不挂 MCP。',
+  '🔌 The MCP profile "{name}" changed; reconnected with the new configuration. The context goes along with your next message.': '🔌 MCP 配置「{name}」改了，已按新配置重新连接，上下文随下一条消息带过去。',
+  '⚠️ The MCP profile "{name}" changed, but reconnecting with the new configuration failed.': '⚠️ MCP 配置「{name}」改了，但按新配置重新连接失败。',
+  'Reason: {err}. The session keeps its previous connection; switching to a new backend session retries with the current file.': '原因：{err}。会话先保持原来的连接；换新的后端会话会按当前文件再试一次。',
+  'Reason: {err}. The next message reconnects with the current file.': '原因：{err}。下一条消息会按当前文件重新连接。',
+  '⚠️ The MCP profile file has an error, so the existing configuration is kept.': '⚠️ MCP 配置文件有错，已保持原来的配置。',
   '⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".': '⚠️ 找不到 MCP 配置「{wanted}」（可能被删了），这次按「{used}」起。',
   '⚠️ MCP "{mcp}" in MCP profile "{combo}" needs environment variable(s) {vars}, not set on this machine; it is skipped this time.': '⚠️ MCP 配置「{combo}」的 MCP「{mcp}」缺本机环境变量 {vars}，这次先不挂。',
   "⚠️ MCP \"{mcp}\" in MCP profile \"{combo}\" can't be forwarded from this machine ({reason}); it is skipped this time.": '⚠️ MCP 配置「{combo}」的 MCP「{mcp}」没法从本机转发（{reason}），这次先不挂。',

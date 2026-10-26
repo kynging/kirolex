@@ -274,12 +274,15 @@ describe('远程会话的模型回退按那台机器的清单', () => {
   });
 
   test('接线：每条经 connectWithModelFallback 起远程 kiro 的路都把远端清单传进去', () => {
-    /* 换「组合」那一条只给 Claude Code / Codex（不走 kiro 的模型清单）：单独核对它前面拦了 kiro */
+    /* 换「组合」/ 按组合文件重挂那一条（remountWithProfile）只给 Claude Code / Codex（不走 kiro 的模型清单）：单独核对调它的两处前面都拦了 kiro */
     const all = M.match(/await connectWithModelFallback\([^;]*\);/g) || [];
-    const calls = all.filter((c) => !c.includes("'switch-mcp-combo'"));
+    const calls = all.filter((c) => !c.includes('(profile, trigger, localTools, sessionId)'));
     assert.equal(all.length - calls.length, 1);
-    const combo = M.slice(M.indexOf('const switchMcpComboImpl = async'), M.indexOf("'switch-mcp-combo', localTools"));
+    const combo = M.slice(M.indexOf('const switchMcpComboImpl = async'), M.indexOf("await remountWithProfile(sessionId, oldEntry, profile, 'switch-mcp-combo')"));
     assert.match(combo, /if \(engineOf\(oldEntry\.profile\) === 'kiro'\) throw/);
+    const reload = M.slice(M.indexOf('remountMcpForSession = (sessionId: string, trigger: string)'), M.indexOf('await remountWithProfile(sessionId, entry, entry.profile, trigger)'));
+    assert.match(reload, /if \(engineOf\(entry\.profile\) === 'kiro'\) return new Error/);
+    assert.equal((M.match(/await remountWithProfile\(/g) || []).length, 2, '只有这两处调它');
     assert.equal(calls.length, 3, '新建 / 换引擎 / attach');
     for (const c of calls) assert.match(c, /, remoteModels\);$/, `没传远端清单：${c}`);
   });

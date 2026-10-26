@@ -139,19 +139,26 @@ describe('接线（源码扫描）', () => {
   });
 
   test('切换组合时新执行器起不来：旧执行器的工具通道已被换掉，要把它收掉（下一条消息按原组合重接），不能留一条工具全失效的会话', () => {
-    /* acp:switch-mcp-combo 的实现抽成了 switchMcpComboImpl（忙时记下的切换跑完后也走它） */
+    /* acp:switch-mcp-combo 的实现抽成了 switchMcpComboImpl（忙时记下的切换跑完后也走它）；
+       重挂执行器那段抽成了 remountWithProfile（组合文件改了 / 换新的后端会话也走它） */
+    const r = M.indexOf('async function remountWithProfile(');
+    const remount = M.slice(r, M.indexOf('\n  }\n', r));
+    const tools = remount.indexOf('await ensureLocalTools(');
+    const flag = remount.indexOf('toolsSwapped = !!profile.remote?.sshHost;');
+    assert.ok(flag > 0 && flag < tools, '要在换通道之前记下"通道换了"');
+    const caughtR = remount.slice(remount.indexOf('} catch (err) {'));
+    assert.match(caughtR, /if \(toolsSwapped && sessionClients\.get\(sessionId\) === oldEntry\) \{\s*void detachExecutor\(sessionId\);/);
+    assert.match(caughtR, /throw err;/);
+    assert.doesNotMatch(caughtR, /sessionNotice\(sessionId, /);
+    /* 失败时记录不能被改成新组合：写记录只在成功那段（catch 之前） */
+    assert.equal(/rec\.profile = profile/.test(caughtR), false);
     const h = M.indexOf('const switchMcpComboImpl = async');
     const handler = M.slice(h, M.indexOf('\n  };\n', h));
-    const tools = handler.indexOf('await ensureLocalTools(');
-    const flag = handler.indexOf('toolsSwapped = !!profile.remote?.sshHost;');
-    assert.ok(flag > 0 && flag < tools, '要在换通道之前记下"通道换了"');
+    assert.match(handler, /await remountWithProfile\(sessionId, oldEntry, profile, 'switch-mcp-combo'\)/);
     const caught = handler.slice(handler.indexOf('} catch (err) {'));
-    assert.match(caught, /if \(toolsSwapped && sessionClients\.get\(sessionId\) === oldEntry\) \{\s*void detachExecutor\(sessionId\);/);
     /* 同一次失败只说一处：说明（仍用原组合、下一条消息重新连接）随抛出的错误给界面（组合下拉旁的 ✗），不另发状态行 */
-    assert.match(caught, /throw new Error\(tr\('Switching to the MCP profile "\{name\}" failed \(\{err\}\); the previous MCP profile is kept and your next message reconnects with it\.'/);
+    assert.match(caught, /if \(\(err as any\)\?\.oldExecutorDetached\) \{[\s\S]*?throw new Error\(tr\('Switching to the MCP profile "\{name\}" failed \(\{err\}\); the previous MCP profile is kept and your next message reconnects with it\.'/);
     assert.doesNotMatch(caught, /sessionNotice\(sessionId, /);
     assert.match(caught, /throw err;/);
-    /* 失败时记录不能被改成新组合：写记录只在成功那段（catch 之前） */
-    assert.equal(/rec\.profile = profile/.test(caught), false);
   });
 });

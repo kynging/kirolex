@@ -55,6 +55,7 @@ import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcri
 import { restorePlacement, catalogProject } from './restoreArchive.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
+import { McpComboWatcher, comboFingerprint, remountExclusive, COMBO_FILE_BROKEN } from './mcpComboWatch.ts';
 import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
 import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
@@ -1273,6 +1274,8 @@ function emitSessionBusy(sessionId: string) {
   /* 重建进度是 tr() 出来的：两版一起带过去，界面切了语言这一行也跟着换 */
   const detailVariants = detail ? bothLangs(detail) : null;
   mainWindow?.webContents.send('acp:session-busy', { sessionId, reason, detail, ...(detailVariants ? { detailVariants } : {}) });
+  /* 空下来了：组合文件改了、因为正忙而等着重挂的，现在重挂（`McpComboWatcher.idle`，自己再判一次忙不忙） */
+  if (!reason || reason === 'prime-pending') mcpComboWatcher?.idle(sessionId);
   /*
     只要还在报 prime-pending,就确保有一次重建排着 —— 「这次还是没有重试」。
 
@@ -2690,7 +2693,9 @@ const muxDownNoticed = new Map<string, Set<string>>();
 
 /** 这条会话所选的组合（读不了 / 找不到时退回「通用」并在会话里说一句）。本地和远程会话共用。 */
 function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
-  const { combos, error } = readMcpCombos(os.homedir());
+  /* 按组合文件重挂的那一次：用开始时校验过的那份（`remountMcpForSession`），期间文件又被改坏也不降级成「通用」 */
+  const pinned = pinnedCombos.get(sessionId);
+  const { combos, error } = pinned ? { combos: pinned, error: undefined } : readMcpCombos(os.homedir());
   const combo = pickCombo(combos, profile.mcpCombo);
   if (error) {
     logger.warn('mcp-combo', `${mcpCombosPath(os.homedir())} 读不了：${error}`);
@@ -2701,8 +2706,18 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
     sessionNotice(sessionId, tr('⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
   }
   /* 文件跟着 S3 同步到别的电脑：按这台电脑套上 `perMachine` 的覆盖（主机名 / 系统），交出去的是本机那份 */
-  return localizeCombo(combo, thisMachine());
+  const localized = localizeCombo(combo, thisMachine());
+  /* 每次起执行器都经这里准备 MCP：记下这次交出去的那份，组合文件改了时据此判断要不要重挂（`McpComboWatcher`） */
+  mountedComboFp.set(sessionId, comboFingerprint(localized));
+  /* 挂好、空下来之后再和那时的文件对一次：挂的过程中文件又被改 / 撤回的，按当前文件纠正（`McpComboWatcher.noteMounted`） */
+  mcpComboWatcher?.noteMounted(sessionId);
+  return localized;
 }
+
+/** 每条会话的执行器挂上时那份组合的指纹（`comboFingerprint`）—— 只在内存里，`sessionCombo` 每次准备 MCP 时更新。 */
+const mountedComboFp = new Map<string, string>();
+/** 正在按组合文件重挂的会话 → 开始时读到、校验过的那份组合（`sessionCombo` 优先用它）。 */
+const pinnedCombos = new Map<string, McpCombo[]>();
 
 /**
  * **本地 Claude Code / Codex 会话的「组合」** ——「不同对话挂不同的 MCP」。
@@ -5422,6 +5437,10 @@ let wakeDeliver: ((item: WakeItem) => Promise<void>) | null = null;
 let loopDeliver: ((item: WakeItem) => Promise<void>) | null = null;
 /** 控制入口 `new-backend` 要先挂上执行器 —— `ensureAttached` 在 whenReady 里，到时候再挂上。 */
 let attachForControl: ((sessionId: string) => Promise<unknown>) | null = null;
+/** 按当前组合文件重挂一条会话的 MCP（重起执行器）—— 要用 whenReady 里的 connectWithModelFallback / wireSession，到时候再挂上。 */
+let remountMcpForSession: ((sessionId: string, trigger: string) => Promise<{ oldId: string; newId: string }>) | null = null;
+/** 组合文件改了 → 受影响的已连会话重挂（`mcpComboWatch.ts`）；whenReady 里建。 */
+let mcpComboWatcher: McpComboWatcher | null = null;
 /** 主进程里的循环 driver（loopDriver.ts）—— 它的发送 / 校验要用 whenReady 里的东西，到时候再建；删会话时要用它记 discarded。 */
 let loopDriver: LoopDriver | null = null;
 /**
@@ -5495,6 +5514,34 @@ async function swapBackendSessionWhenIdle(sessionId: string, trigger: string): P
   const busy = busyReasonFor(sessionId);
   if (busy && busy !== 'prime-pending') {
     throw Object.assign(new Error(tr('This session is busy, so the backend session was not switched. Try again when it is idle.')), { code: SESSION_BUSY });
+  }
+  /*
+    **Claude Code / Codex：重新读组合、重新准备 MCP 再换** ——「改了 mcp-combos.json，new-backend 还是旧的 MCP」。
+    同一个进程里 session/new 只能沿用起进程时交出去的 mcpServers，所以按当前文件重挂执行器（新执行器 = 新的后端会话）；
+    和组合文件改了自动重挂同一份实现（`remountMcpForSession`）。kiro 不用组合，照旧在原进程里 session/new。
+  */
+  if (engineOf(entry.profile) !== 'kiro' && remountMcpForSession) {
+    try {
+      const r = await remountMcpForSession(sessionId, trigger);
+      textToolRecovery.set(sessionId, afterBackendSwap(textToolRecovery.get(sessionId)));
+      logger.warn('prompt', `backend session swapped with MCP re-prepared (${trigger}) sessionId=${sessionId} ${r.oldId} -> ${r.newId}`);
+      return r;
+    } catch (err: any) {
+      if (err?.code !== COMBO_FILE_BROKEN) throw err;
+      /*
+        **组合文件坏了：不按它重挂**（那样会退回不带 MCP 的「通用」、把原来的 MCP 清掉）。旧执行器原样留着，
+        说一句、附上错误，然后照旧在原进程里换后端会话（沿用原来的 MCP）。
+      */
+      logger.warn('mcp-combo', `组合文件有错，换后端会话不重挂 MCP、保持原来的配置 sessionId=${sessionId}: ${err.detail}`);
+      noteInSession(sessionId, trConcat(String(err.message), NOTE_DETAIL_SEP, `${mcpCombosPath(os.homedir())}: ${err.detail}`), undefined, 'mcp-combo-file-error');
+      /* 等着的时候会话可能被别的事占了：和开头同一个口径再判一次 */
+      const again = busyReasonFor(sessionId);
+      if (again && again !== 'prime-pending') {
+        throw Object.assign(new Error(tr('This session is busy, so the backend session was not switched. Try again when it is idle.')), { code: SESSION_BUSY });
+      }
+      if (sessionClients.get(sessionId) !== entry) throw new Error(tr('Session not connected'));
+      if (reconfiguringSessions.has(sessionId)) throw new Error(tr('Another switch (model / agent / machine) has not finished yet.'));
+    }
   }
   reconfiguringSessions.add(sessionId);
   emitSessionBusy(sessionId);
@@ -6565,6 +6612,7 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
         }
         writeMcpCombosText(os.homedir(), text);
         mainWindow?.webContents.send('acp:mcp-combos-changed');
+        mcpComboWatcher?.changed();
         logger.info('s3', `组合文件：${plan.action === 'pull' ? '从桶里拉回（别的电脑改的 / 本机第一次同步）' : `按合并结果改写（从桶里并进 ${plan.added.length} 个组合）`}`);
       },
       readMark: () => readComboMark(S3_COMBOS_MARK_PATH),
@@ -13277,6 +13325,7 @@ ${hint}` : ''}` };
     if (!r.ok) { logger.warn('mcp-combo', `保存组合没成功：${r.error}`); return { ok: false, error: r.error }; }
     logger.info('mcp-combo', `保存了 ${r.combos.length - 1} 个组合（不含内置「通用」）`);
     mainWindow?.webContents.send('acp:mcp-combos-changed');
+    mcpComboWatcher?.changed();
     return { ok: true };
   });
 
@@ -13310,14 +13359,42 @@ ${hint}` : ''}` };
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
     const profile: AgentProfile = { ...oldEntry.profile, mcpCombo: nextCombo };
+    try {
+      await remountWithProfile(sessionId, oldEntry, profile, 'switch-mcp-combo');
+      sessionNotice(sessionId, tr('🔀 Switched to the MCP profile "{name}"; the context goes along with your next message.', { name: comboDisplayName(combo) }));
+      logger.info('mcp-combo', `切换组合 sessionId=${sessionId} -> ${combo.id}`);
+      return { ok: true, current: combo.id };
+    } catch (err) {
+      logger.warn('mcp-combo', `切换组合失败 sessionId=${sessionId} -> ${combo.id}`, err);
+      if ((err as any)?.oldExecutorDetached) {
+        /* 同一次失败只说一处：把"仍用原组合、下一条消息重新连接"放进抛出去的错误里（界面显示在组合下拉旁），不再另发状态行 */
+        throw new Error(tr('Switching to the MCP profile "{name}" failed ({err}); the previous MCP profile is kept and your next message reconnects with it.', { name: comboDisplayName(combo), err: String((err as any)?.message || err) }));
+      }
+      throw err;
+    } finally {
+      reconfiguringSessions.delete(sessionId);
+      emitSessionBusy(sessionId);
+    }
+  };
+  ipcMain.handle('acp:switch-mcp-combo', (_event, sessionId: string, comboId: string) => switchMcpComboImpl(sessionId, comboId));
+
+  /**
+   * **按 `profile` 重新准备 MCP、起新执行器、换下旧的** —— 换组合、组合文件改了（`McpComboWatcher`）、
+   * 换新的后端会话（`swapBackendSessionWhenIdle`）共用这一份：每次都重新读组合文件、重新 `ensureLocalTools`，
+   * 不沿用旧执行器手里的 mcpServers。后端会话是新的，上下文从 KiroLex 自己的记录重建（随下一条消息带过去）。
+   * 调用方已经占住会话（`reconfiguringSessions`）。失败时新起的收掉；旧执行器的工具通道已经被换掉的（远程）也收掉，
+   * 抛出去的错误带 `oldExecutorDetached`。
+   */
+  async function remountWithProfile(sessionId: string, oldEntry: SessionEntry, profile: AgentProfile, trigger: string): Promise<{ oldId: string; newId: string }> {
     let client: AcpClient | undefined;
     /* 远程会话：ensureLocalTools 会换掉这条会话的 token、停掉旧的中转 —— 旧执行器手里那个隧道地址从这一刻起就失效了 */
     let toolsSwapped = false;
+    const prevFp = mountedComboFp.get(sessionId);
     try {
       if (profile.remote?.sshHost) await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex', sessionId);
       toolsSwapped = !!profile.remote?.sshHost;
       const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
-      const started = await connectWithModelFallback(profile, 'switch-mcp-combo', localTools, sessionId);
+      const started = await connectWithModelFallback(profile, trigger, localTools, sessionId);
       client = started.client;
       const created = await client.newSession(oldEntry.cwd);
       const nextEntry: SessionEntry = {
@@ -13341,16 +13418,17 @@ ${hint}` : ''}` };
       rec.executorState = 'attached';
       store.writeRecord(rec);
       clearContextEstablished(sessionId);
-      markContextOwedIfUnverified(sessionId, 'switch-mcp-combo');
-      restoreContextAfterExecutorSwap(sessionId, 'switch-mcp-combo');
+      markContextOwedIfUnverified(sessionId, trigger);
+      restoreContextAfterExecutorSwap(sessionId, trigger);
       modelFallback.commit(sessionId);   // 换成了：记下的「改用了备用模型」现在写
-      sessionNotice(sessionId, tr('🔀 Switched to the MCP profile "{name}"; the context goes along with your next message.', { name: comboDisplayName(combo) }));
-      logger.info('mcp-combo', `切换组合 sessionId=${sessionId} -> ${combo.id}`);
-      return { ok: true, current: combo.id };
+      return { oldId: oldEntry.cliSessionId, newId: created.sessionId };
     } catch (err) {
       if (client) { try { await client.disconnect(); } catch {} }
       modelFallback.discard(sessionId);   // 没换成：连上时记下的那句作废
-      logger.warn('mcp-combo', `切换组合失败 sessionId=${sessionId} -> ${combo.id}`, err);
+      /* 旧执行器还挂着旧的那份：挂上时的指纹退回去，组合文件再变时照样认得出它是旧的 */
+      if (sessionClients.get(sessionId) === oldEntry) {
+        if (prevFp === undefined) mountedComboFp.delete(sessionId); else mountedComboFp.set(sessionId, prevFp);
+      }
       /*
         **新执行器没起来，旧的也已经没有工具通道了**（token 换了、旧中转停了）—— 留着它就是一条
         local_* 和转发 MCP 全部 404 的会话。所以把旧执行器也收掉（顺带收掉刚建的通道和本机进程）：
@@ -13358,16 +13436,101 @@ ${hint}` : ''}` };
       */
       if (toolsSwapped && sessionClients.get(sessionId) === oldEntry) {
         void detachExecutor(sessionId);
-        /* 同一次失败只说一处：把"仍用原组合、下一条消息重新连接"放进抛出去的错误里（界面显示在组合下拉旁），不再另发状态行 */
-        throw new Error(tr('Switching to the MCP profile "{name}" failed ({err}); the previous MCP profile is kept and your next message reconnects with it.', { name: comboDisplayName(combo), err: String((err as any)?.message || err) }));
+        if (err && typeof err === 'object') (err as any).oldExecutorDetached = true;
       }
       throw err;
-    } finally {
-      reconfiguringSessions.delete(sessionId);
-      emitSessionBusy(sessionId);
     }
-  };
-  ipcMain.handle('acp:switch-mcp-combo', (_event, sessionId: string, comboId: string) => switchMcpComboImpl(sessionId, comboId));
+  }
+
+  /**
+   * **按当前的组合文件重挂这条会话的 MCP**（组合没换、文件内容变了 / 换新的后端会话）：
+   * 同换组合，先等挂载锁（`mountLock`）和在飞的 attach，再占住会话、走 `remountWithProfile`。
+   */
+  remountMcpForSession = (sessionId: string, trigger: string): Promise<{ oldId: string; newId: string }> => remountExclusive({
+    settle: async () => { await mountLock.settle(sessionId); await awaitAttachIdle(sessionId); },
+    current: () => sessionClients.get(sessionId),
+    /* 所有等待之后同步判、紧接着占住（中间没有 await）：同时到达的两次重挂只有一个能占住 */
+    refuse: (entry) => {
+      if (!entry) return new Error(tr('Session not connected'));
+      if (engineOf(entry.profile) === 'kiro') return new Error(tr('MCP profiles only apply to Claude Code / Codex sessions.'));
+      if (reconfiguringSessions.has(sessionId)) return new Error(tr('Another switch (model / agent / machine) has not finished yet.'));
+      const busy = busyReasonFor(sessionId);
+      if (busy && busy !== 'prime-pending') {
+        return Object.assign(new Error(tr('This session is busy, so the backend session was not switched. Try again when it is idle.')), { code: SESSION_BUSY });
+      }
+      return null;
+    },
+    claim: () => { reconfiguringSessions.add(sessionId); emitSessionBusy(sessionId); },
+    release: () => { reconfiguringSessions.delete(sessionId); emitSessionBusy(sessionId); },
+    readCombos: () => readMcpCombos(os.homedir()),
+    brokenError: (error) => Object.assign(new Error(tr('⚠️ The MCP profile file has an error, so the existing configuration is kept.')), { code: COMBO_FILE_BROKEN, detail: error }),
+    remount: async (entry, combos) => {
+      /* 准备 MCP 期间（远程要好几秒）文件又被改坏也不降级：sessionCombo 用占住那一刻校验过的这份 */
+      pinnedCombos.set(sessionId, combos);
+      try {
+        const r = await remountWithProfile(sessionId, entry, entry.profile, trigger);
+        logger.info('mcp-combo', `按当前组合文件重挂 MCP（${trigger}）sessionId=${sessionId} ${r.oldId} -> ${r.newId}`);
+        return r;
+      } finally {
+        pinnedCombos.delete(sessionId);
+      }
+    },
+  });
+
+  /*
+    **组合文件改了 → 用到受影响组合的已连会话按新配置重挂**（`mcpComboWatch.ts`）：设置页保存、S3 拉下来、外部编辑器 / 脚本改的都算。
+    盯的是 `~/.kirolex` 目录（写文件是 tmp + rename，盯文件本身会在第一次 rename 后失效），按文件名筛；
+    自己保存 / S3 写完也直接喊一声（`changed`），重复的由内容指纹去掉。
+  */
+  mcpComboWatcher = new McpComboWatcher({
+    read: () => readMcpCombos(os.homedir()),
+    sessions: () => [...sessionClients.entries()]
+      .filter(([sid, e]) => engineOf(e.profile) !== 'kiro' && !deletedSessionIds.has(sid))
+      .map(([sid, e]) => ({ sessionId: sid, comboId: e.profile.mcpCombo, mountedFp: mountedComboFp.get(sid) })),
+    resolve: (combos, id) => localizeCombo(pickCombo(combos, id), thisMachine()),
+    isBusy: (sid) => {
+      /* 正在退出：不再起新执行器 */
+      if (isQuitting) return true;
+      const reason = busyReasonFor(sid);
+      return (!!reason && reason !== 'prime-pending') || pendingSwitchRunner.isApplying(sid) || mountLock.busy(sid);
+    },
+    remount: async (sid) => { await remountMcpForSession!(sid, 'mcp-combos-changed'); },
+    noteReloaded: (sid, combo) => {
+      noteInSession(sid, tr('🔌 The MCP profile "{name}" changed; reconnected with the new configuration. The context goes along with your next message.', { name: comboDisplayName(combo) }), undefined, 'mcp-combo-reloaded');
+    },
+    noteReloadFailed: (sid, combo, error) => {
+      noteInSession(sid, trConcat(
+        tr('⚠️ The MCP profile "{name}" changed, but reconnecting with the new configuration failed.', { name: comboDisplayName(combo) }),
+        NOTE_DETAIL_SEP,
+        /* 远程会话旧执行器的工具通道已经换掉、被收掉了（`oldExecutorDetached`）：下一条消息按当前文件重新接上 */
+        sessionClients.has(sid)
+          ? tr('Reason: {err}. The session keeps its previous connection; switching to a new backend session retries with the current file.', { err: error.slice(0, 300) })
+          : tr('Reason: {err}. The next message reconnects with the current file.', { err: error.slice(0, 300) })),
+      undefined, 'mcp-combo-reload-failed');
+    },
+    noteFileError: (sid, error) => {
+      noteInSession(sid, trConcat(
+        tr('⚠️ The MCP profile file has an error, so the existing configuration is kept.'),
+        NOTE_DETAIL_SEP,
+        `${mcpCombosPath(os.homedir())}: ${error}`),
+      undefined, 'mcp-combo-file-error');
+    },
+    onFileChanged: () => { mainWindow?.webContents.send('acp:mcp-combos-changed'); },
+    log: (m) => logger.info('mcp-combo', m),
+  });
+  mcpComboWatcher.prime();
+  try {
+    const comboFile = path.basename(mcpCombosPath(os.homedir()));
+    fs.mkdirSync(KIROLEX_HOME, { recursive: true });
+    const w = fs.watch(KIROLEX_HOME, (_event, filename) => {
+      /* 有的平台不给文件名：当作可能改了（读一遍很便宜，内容没变什么都不做） */
+      if (!filename || String(filename) === comboFile) mcpComboWatcher?.changed();
+    });
+    w.on('error', (err) => logger.warn('mcp-combo', `盯不住 ${KIROLEX_HOME}（组合文件改了不会自动重挂）：${err?.message || err}`));
+    w.unref();
+  } catch (err: any) {
+    logger.warn('mcp-combo', `盯不住 ${KIROLEX_HOME}（组合文件改了不会自动重挂）：${err?.message || err}`);
+  }
 
   /**
    * **应用忙时记下的切换**（`pendingSwitch.ts`）—— 这一轮结束（正常 / 出错 / Stop）、或者发新消息之前。
