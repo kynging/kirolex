@@ -77,7 +77,7 @@ import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy, bedrockNoteActiv
 import { bedrockCheckStore } from '../bedrockCheckStore.ts';
 import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
-import { modeTone, toneClass, TONE_ICONS, type PermissionTone } from '../permissionTone';
+import { modeTone, permissionIcon, toneClass, type PermissionTone } from '../permissionTone';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -2405,11 +2405,11 @@ const ChatInputBox = memo<{
   const t = useT();
   /* 权限模式的风险档和悬停提示（permissionTone.ts）：只管颜色 / 图标 / 提示，不碰模式本身 */
   const currentModeTone = engineMode ? modeTone(engineMode.engine, engineMode.current, engineMode.options.find((o) => o.value === engineMode.current)?.name) : 'normal';
-  const riskHint = (tone: PermissionTone) => tone === 'danger'
+  const riskHint = (tone: PermissionTone, mode?: string) => tone === 'danger'
     ? t('⚠ Skips all permission prompts: the model can edit files and run commands without asking you')
     : tone === 'caution'
       ? t('Partly automatic: some actions (such as file edits) go ahead without asking you')
-      : tone === 'neutral'
+      : mode === 'plan'
         ? t('Plan only: nothing is changed until you approve the plan')
         : '';
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
@@ -2877,16 +2877,16 @@ const ChatInputBox = memo<{
               value={engineMode.current}
               onChange={(e) => engineMode.onChange(e.target.value)}
               disabled={status !== 'connected' || engineMode.busy || !engineMode.options.length}
-              title={[t("Permission mode (this engine's own): whether to ask you before acting"), riskHint(currentModeTone)].filter(Boolean).join('\n')}
+              title={[t("Permission mode (this engine's own): whether to ask you before acting"), riskHint(currentModeTone, engineMode.current)].filter(Boolean).join('\n')}
               aria-label={t('Permission mode')}
             >
               {engineMode.options.length
                 ? engineMode.options.map((o) => {
-                  /* 权限风险色（permissionTone.ts）：每一项前面一个图标，危险的那几项是 ⚠，颜色不是唯一区分 */
+                  /* 权限风险色（permissionTone.ts）：每一项前面一个按模式区分的图标（⚠ / ● / ◐ / ○ / ◌），颜色不是唯一区分 */
                   const tone = modeTone(engineMode.engine, o.value, o.name);
                   return (
-                    <option key={o.value} value={o.value} className={toneClass(tone) || undefined} title={riskHint(tone) || undefined}>
-                      {`${TONE_ICONS[tone]} ${o.name}`}
+                    <option key={o.value} value={o.value} className={toneClass(tone) || undefined} title={riskHint(tone, o.value) || undefined}>
+                      {`${permissionIcon(engineMode.engine, o.value, o.name)} ${o.name}`}
                     </option>
                   );
                 })
@@ -2917,10 +2917,8 @@ const ChatInputBox = memo<{
               </>
             ) : (
               <>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
-                  <path d="M12 3l7 3v5c0 4.5-3 8-7 10-4-2-7-5.5-7-10V6z" />
-                  <polyline points="9 12 11.5 14.5 15.5 10" />
-                </svg>
+                {/* 安全的一档：和下拉里 default / read-only 同一个 ○（permissionIcon），绿色 */}
+                <span aria-hidden="true">{permissionIcon('kiro', permissionMode)}</span>
                 {t('Ask')}
               </>
             )}

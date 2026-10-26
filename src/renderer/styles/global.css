@@ -37,6 +37,9 @@
   --perm-caution: #e8b85a;
   --perm-caution-border: #d9a441;
   --perm-caution-bg: rgba(217, 164, 65, 0.12);
+  --perm-safe: #8fd16a;
+  --perm-safe-border: #5cb85c;
+  --perm-safe-bg: rgba(92, 184, 92, 0.12);
   --perm-neutral: #a8a8a8;
   --sidebar-width: 240px;
   --toolbar-height: 42px;
@@ -54,6 +57,9 @@
   --perm-caution: #7a5000;
   --perm-caution-border: #a06a00;
   --perm-caution-bg: rgba(160, 106, 0, 0.12);
+  --perm-safe: #2b6312;
+  --perm-safe-border: #4a8a1c;
+  --perm-safe-bg: rgba(74, 138, 28, 0.12);
   --perm-neutral: #555555;
 }
 
@@ -4765,6 +4771,13 @@ button, input, select, textarea {
   border-color: var(--perm-caution-border);
   background-color: var(--perm-caution-bg);
 }
+/* 安全的模式（default / ask / read-only / plan）：绿。只用在模式上，权限条的按钮不用（见 permissionTone.ts 头注释） */
+.composer-mode.perm-safe,
+.composer-mode.perm-safe:hover:not(:disabled) {
+  color: var(--perm-safe);
+  border-color: var(--perm-safe-border);
+  background-color: var(--perm-safe-bg);
+}
 .composer-mode.perm-neutral {
   color: var(--perm-neutral);
 }
@@ -9318,6 +9331,7 @@ button, input, select, textarea {
 /* 下拉弹出来的每一项也按风险档上色（前面还有图标，颜色不是唯一区分） */
 .composer-mode-select option.perm-danger { color: var(--perm-danger); }
 .composer-mode-select option.perm-caution { color: var(--perm-caution); }
+.composer-mode-select option.perm-safe { color: var(--perm-safe); }
 .composer-mode-select option.perm-neutral { color: var(--perm-neutral); }
 /* 原来显示引擎名的那一格，现在是 effort */
 .composer-effort-select { max-width: 120px; }
