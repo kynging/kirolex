@@ -753,6 +753,13 @@ contextBridge.exposeInMainWorld('kiroApi', {
   aiLoginStatus: (machine: string) => ipcRenderer.invoke('ai-login:status', machine),
   aiLoginApply: (machine: string, input: any) => ipcRenderer.invoke('ai-login:apply', machine, input),
   aiLoginBedrockCheck: (machine: string, opts?: { force?: boolean }) => ipcRenderer.invoke('ai-login:bedrock-check', machine, opts),
+  /** 各台机器最近一次的 Codex Bedrock 权限预检（机器 id → 结果）；`onBedrockCheck` 是之后每跑完一次的推送 —— 会话里的缺权限卡据此撤掉。 */
+  bedrockChecks: (): Promise<Record<string, any>> => ipcRenderer.invoke('bedrock:checks'),
+  onBedrockCheck: (callback: (data: { machine: string; check: any }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('bedrock:check', handler);
+    return () => ipcRenderer.removeListener('bedrock:check', handler);
+  },
   aiLoginCodexWebSearch: (machine: string, enabled: boolean) => ipcRenderer.invoke('ai-login:codex-web-search', machine, enabled),
   /** 本机那份配置变成编辑器文本（「拷入本机配置」）；只读本机，不写任何地方。 */
   aiLoginLocalConfig: (tool: 'claude' | 'codex') => ipcRenderer.invoke('ai-login:local-config', tool),

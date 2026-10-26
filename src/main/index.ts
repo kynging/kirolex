@@ -12,7 +12,7 @@ import { runLocalAdapterInstall, createSharedInstalls, remoteInstallCommand, rem
 import { createStatusCache, judgeEngineStatus, localAuthFromFiles, remoteEngineStatuses, kiroInstallCommand, kiroInstallFailedMessage, terminalLaunches, LOGIN_ARGS, remoteLoginHow, type EngineStatus } from './engineStatus.ts';
 import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProbeScript, parseAdapterProbe, judgeAdapterProbe, adapterProblemMessage, adapterHiddenNotice, remoteAuthConfigured, remoteLoginHint, rememberRemoteAdapterLaunch, judgeAdapterVerify, adapterVerifyMessage, ACP_INITIALIZE_LINE, type AdapterVerifyResult } from './remoteAdapterProbe.ts';
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
-import { bedrockCheckScript, bedrockRegionOf, localBedrockCheckOutput, codexWebSearchDisabled, toggleCodexWebSearch, readLocalConfig, parseRemoteConfigRead, REMOTE_CONFIG_READ_SCRIPT, parseIamPrecheck, parseAccessDenied, roleArnOf, deniedNoteGroup, setCodexWebSearch, withBedrockCheck, type BedrockIamCheck } from './bedrockIam.ts';
+import { bedrockCheckScript, bedrockRegionOf, localBedrockCheckOutput, codexWebSearchDisabled, toggleCodexWebSearch, readLocalConfig, parseRemoteConfigRead, REMOTE_CONFIG_READ_SCRIPT, parseIamPrecheck, parseAccessDenied, roleArnOf, deniedNoteGroup, setCodexWebSearch, withBedrockCheck, bedrockProbeScript, localBedrockProbeOutput, staleBedrockCheck, type BedrockIamCheck } from './bedrockIam.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
@@ -5295,18 +5295,28 @@ function ensureBedrockCheck(remote: RemoteTarget | undefined, force = false): Pr
   /* 本机的键是 'local'（和 engines:status 的机器键一致） */
   const key = remote ? bedrockCheckKey(remote) : 'local';
   const prev = bedrockChecks.get(key);
-  if (prev && !force) return Promise.resolve(prev);
+  /* 旧判据（implicitDeny 也算缺）记下的 denied 不沿用：按新判据重算 */
+  if (prev && !force && !staleBedrockCheck(prev)) return Promise.resolve(prev);
   const running = bedrockCheckInFlight.get(key);
   if (running) return running;
   const run = remote
     ? runRemoteCapture(remote, bedrockCheckScript(), 120_000)
     : localBedrockCheckOutput(() => { try { return fs.readFileSync(LOCAL_CODEX_TOML(), 'utf-8'); } catch { return ''; } }, runLocalTool);
-  const job = run.then((out) => {
-    const check = parseIamPrecheck(out);
+  const job = run.then(async (out) => {
+    let check = parseIamPrecheck(out);
+    /* 模拟只给出 implicitDeny（不可信，见 judgeWebSearch）：补一次极短的试调用，以它为准 */
+    if (check.probeNeeded) {
+      const probe = remote
+        ? await runRemoteCapture(remote, bedrockProbeScript(), 90_000).catch((err: any) => { logger.warn('ai-login', `Codex Bedrock 试调用没跑成（${remote.sshHost}）：${err?.message || err}`); return ''; })
+        : await localBedrockProbeOutput(runLocalTool);
+      check = parseIamPrecheck(`${probe}\n${out}`);
+    }
     bedrockChecks.set(key, check);
     if (!check.notBedrock) {
-      logger.info('ai-login', `Codex Bedrock 权限预检（${remote?.sshHost || '本机'}，${check.method}）：模型调用=${check.model} 网页搜索=${check.webSearch} 身份=${check.roleArn || check.identity || '?'}${check.missing.length ? ` 缺=${check.missing.join(',')}` : ''}`);
+      logger.info('ai-login', `Codex Bedrock 权限预检（${remote?.sshHost || '本机'}，${check.method}，判据=${check.basis || '-'}）：模型调用=${check.model} 网页搜索=${check.webSearch} 身份=${check.roleArn || check.identity || '?'}${check.missing.length ? ` 缺=${check.missing.join(',')}` : ''}`);
     }
+    /* 界面上已经显示的缺权限卡按这份结果撤（bedrockNoteActive） */
+    try { mainWindow?.webContents.send('bedrock:check', { machine: key, check }); } catch { /* 提示永远不能让主流程失败 */ }
     return check;
   }).finally(() => { bedrockCheckInFlight.delete(key); });
   bedrockCheckInFlight.set(key, job);
@@ -5323,9 +5333,14 @@ function precheckCodexBedrock(sessionId: string, remote: RemoteTarget | undefine
     if (check.notBedrock || !check.missing.length) return;
     const modelMissing = check.model === 'denied';
     if (!modelMissing && check.webSearchDisabled) return;
-    const target = remote ? findRemoteTarget(KIROLEX_CONFIG_PATH, bedrockCheckKey(remote)) : undefined;
-    /* 本机的机器 id 是 'local'：提示卡上「关掉网页搜索」写的是本机 ~/.codex/config.toml */
-    const group = deniedNoteGroup({ machineId: remote ? target?.id : 'local', region: check.region, actions: check.missing, ...(check.resource ? { resource: check.resource } : {}) });
+    const key = remote ? bedrockCheckKey(remote) : 'local';
+    const target = remote ? findRemoteTarget(KIROLEX_CONFIG_PATH, key) : undefined;
+    /*
+      本机的机器 id 是 'local'：提示卡上「关掉网页搜索」写的是本机 ~/.codex/config.toml。
+      远程：设置里找得到就用它的 id，找不到用 bedrockCheckKey（和界面上会话的 remoteId 同一套 durableRemoteId）——
+      卡上必须记着机器，界面才能在换机器时撤掉它（bedrockNoteActive）。
+    */
+    const group = deniedNoteGroup({ machineId: remote ? (target?.id || key) : 'local', region: check.region, actions: check.missing, ...(check.resource ? { resource: check.resource } : {}) });
     if (store.readTranscript(sessionId).some((m: any) => m?.kirolex && m.noteGroup === group)) return;
     const machine = remote ? (target?.label || remote.sshHost) : tr('this computer');
     const actions = check.missing.join(', ');
@@ -5389,7 +5404,8 @@ async function noteBedrockDenied(sessionId: string, profile: AgentProfile, errTe
     err: errText.slice(0, 400),
   });
   noteInSession(sessionId, trConcat(main, NOTE_DETAIL_SEP, detail), undefined,
-    deniedNoteGroup({ machineId: remote ? target?.id : 'local', region, actions: denied.actions, ...(denied.resource ? { resource: denied.resource } : {}) }));
+    /* 机器 id 同 precheckCodexBedrock：找不到设置里那台时用 key（和会话的 remoteId 一致） */
+    deniedNoteGroup({ machineId: remote ? (target?.id || key) : 'local', region, actions: denied.actions, ...(denied.resource ? { resource: denied.resource } : {}) }));
   logger.warn('prompt', `Codex 缺 AWS 权限 sessionId=${sessionId} machine=${remote?.sshHost || 'local'} identity=${roleArn || '?'} actions=${actions}`);
   return tr('Codex on {machine} lacks AWS permission {actions}. See the KiroLex card in this session for the fix.', { machine, actions });
 }
@@ -13617,6 +13633,9 @@ ${hint}` : ''}` };
       return { ok: false, error: err?.message || String(err) };
     }
   });
+
+  /** 各台机器最近一次的预检结果（机器 id → BedrockIamCheck）：界面启动时取一份，之后听 `bedrock:check`（缺权限卡据此撤掉）。 */
+  ipcMain.handle('bedrock:checks', () => Object.fromEntries([...bedrockChecks].filter(([, c]) => !c.notBedrock)));
 
   /**
    * **这台机器暂时关掉 / 重新打开 Codex 网页搜索**：只改那台机器 ~/.codex/config.toml 顶层的 `web_search`

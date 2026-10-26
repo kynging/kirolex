@@ -124,6 +124,82 @@ export interface BedrockIamCheck {
   notBedrock?: boolean;
   /** 试调用的报错点名的资源（例如具体的模型 ARN）：策略 / 启动提示卡照它收窄，不给成 *。 */
   resource?: string;
+  /** 网页搜索那一半用的判据（日志里记下；见 `judgeWebSearch`）。 */
+  basis?: IamBasis;
+  /** 模拟给不出结论（只有 implicitDeny）、还没试调用：调用方再跑一次 `bedrockProbeScript` / `localBedrockProbeOutput`。 */
+  probeNeeded?: boolean;
+}
+
+/**
+ * 网页搜索判据：带 `--resource-arns tool/*` 的模拟 / 不带资源的模拟 / 一次极短的 codex exec。
+ *
+ * 2026-10-26 实测误报：tokyo-graviton 的角色挂着 AdministratorAccess（`"Action":"*","Resource":"*"`），模拟器带资源时把
+ * `bedrock-websearch:ExternalWebAccess` 判成 implicitDeny、不带资源是 allowed，真跑 codex 网页搜索 4 次都没被拒。
+ * 所以 implicitDeny 不算缺权限：只有 explicitDeny、或试调用真的被拒（`parseAccessDenied` 认出动作）才算。
+ */
+export type IamBasis = 'simulate-with-resource' | 'simulate-no-resource' | 'probe';
+
+/** 一次试调用（`codex exec`）的结论。 */
+export interface ProbeVerdict { model: Verdict; webSearch: Verdict; missing: string[]; resource?: string; note?: string }
+
+/** 试调用的输出 + 退出码 → 结论（`rc` 124 = 超时）。 */
+export function parseProbe(body: string, rc: number): ProbeVerdict {
+  const denied = parseAccessDenied(body);
+  /* 网页搜索被拒说明模型那一下已经通了（是模型发起的搜索） */
+  if (denied?.webSearch) return { model: 'ok', webSearch: 'denied', missing: WEB_SEARCH_ACTIONS.slice() };
+  if (denied) return { model: 'denied', webSearch: 'unknown', missing: denied.actions, ...(denied.resource ? { resource: denied.resource } : {}) };
+  if (rc === 124) return { model: 'unknown', webSearch: 'unknown', missing: [], note: tr('The test call did not finish within 60 seconds, so permissions could not be determined.') };
+  if (rc === 0) {
+    /* 模型不一定真的搜了：只有输出里有 web_search 事件才算网页搜索 ✓ */
+    if (/web_search/.test(body)) return { model: 'ok', webSearch: 'ok', missing: [] };
+    return { model: 'ok', webSearch: 'unknown', missing: [], note: tr('The model did not run a web search in the test call, so web search could not be confirmed.') };
+  }
+  const last = body.split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
+  return { model: 'unknown', webSearch: 'unknown', missing: [], note: tr('The test call failed (exit code {code}): {err}', { code: Number.isFinite(rc) ? rc : '?', err: last.slice(0, 200) }) };
+}
+
+export interface WebSearchJudgement {
+  verdict: Verdict;
+  /** 只在 denied 时有：两次模拟都没 allowed 的那几项 / 试调用报的那几项。 */
+  missing: string[];
+  basis?: IamBasis;
+  /** 模拟只有 implicitDeny、又没给试调用结果：要再跑一次试调用才能下结论。 */
+  probeNeeded: boolean;
+  note?: string;
+}
+
+/**
+ * **网页搜索那一半的判定**（模型调用那一半不走这里）：
+ * - 任何一次模拟里有 explicitDeny → denied（策略真的拒了）；
+ * - 带资源全部 allowed → ok（simulate-with-resource）；每项至少在一次模拟里 allowed → ok（simulate-no-resource：
+ *   不带资源 = 资源 *，按 * 授权的策略对 tool/* 一样有效）；
+ * - 剩下的只是 implicitDeny（模拟器对 ExternalWebAccess + tool/* 的判定不可信）：以试调用为准 —— 没给就 `probeNeeded`；
+ *   试调用被拒 → denied，真的搜了 → ok，别的（超时、没去搜、笼统的失败）→ unknown，都不报缺。
+ */
+export function judgeWebSearch(sim: { withResource: Record<string, string>; noResource?: Record<string, string> }, probe?: ProbeVerdict): WebSearchJudgement {
+  const w = sim.withResource;
+  const n = sim.noResource || {};
+  const notAllowed = WEB_SEARCH_ACTIONS.filter((a) => (a in w || a in n) && w[a] !== 'allowed' && n[a] !== 'allowed');
+  const explicitW = WEB_SEARCH_ACTIONS.some((a) => w[a] === 'explicitDeny');
+  if (explicitW || WEB_SEARCH_ACTIONS.some((a) => n[a] === 'explicitDeny')) {
+    /* 显式拒绝压过另一次的 allowed */
+    const missing = WEB_SEARCH_ACTIONS.filter((a) => notAllowed.includes(a) || w[a] === 'explicitDeny' || n[a] === 'explicitDeny');
+    return { verdict: 'denied', missing, basis: explicitW ? 'simulate-with-resource' : 'simulate-no-resource', probeNeeded: false };
+  }
+  if (WEB_SEARCH_ACTIONS.every((a) => w[a] === 'allowed')) return { verdict: 'ok', missing: [], basis: 'simulate-with-resource', probeNeeded: false };
+  if (!notAllowed.length) return { verdict: 'ok', missing: [], basis: 'simulate-no-resource', probeNeeded: false };
+  if (!probe) return { verdict: 'unknown', missing: [], probeNeeded: true };
+  if (probe.webSearch === 'denied') {
+    const ws = probe.missing.filter((a) => a.startsWith('bedrock-websearch:'));
+    return { verdict: 'denied', missing: ws.length ? ws : WEB_SEARCH_ACTIONS.slice(), basis: 'probe', probeNeeded: false };
+  }
+  if (probe.webSearch === 'ok') return { verdict: 'ok', missing: [], basis: 'probe', probeNeeded: false };
+  return { verdict: 'unknown', missing: [], basis: 'probe', probeNeeded: false, ...(probe.note ? { note: probe.note } : {}) };
+}
+
+/** 旧判据（不分 implicitDeny / explicitDeny）记下的结论：没记判据、却判了网页搜索 denied —— 不沿用，下次按新判据重算。 */
+export function staleBedrockCheck(c: BedrockIamCheck): boolean {
+  return !c.notBedrock && !c.basis && c.webSearch === 'denied';
 }
 
 const PROBE_PROMPT = 'Use the web search tool exactly once to look up example.com, then reply with only the word OK.';
@@ -160,22 +236,35 @@ export function bedrockCheckScript(): string {
     */
     `    SIM1=$(aws iam simulate-principal-policy --policy-source-arn "$P" --action-names ${MODEL_ACTIONS.join(' ')} ${query}); RC1=$?`,
     `    SIM2=$(aws iam simulate-principal-policy --policy-source-arn "$P" --action-names ${WEB_SEARCH_ACTIONS.join(' ')} --resource-arns "arn:aws:bedrock-websearch:$R:aws:tool/*" ${query}); RC2=$?`,
+    /* 网页搜索再模拟一次、不带资源：带资源的那次对 ExternalWebAccess 会误判 implicitDeny（见 judgeWebSearch） */
+    `    SIM3=$(aws iam simulate-principal-policy --policy-source-arn "$P" --action-names ${WEB_SEARCH_ACTIONS.join(' ')} ${query}); RC3=$?`,
     '    if [ "$RC1" -eq 0 ] && [ "$RC2" -eq 0 ] && [ -n "$SIM1" ] && [ -n "$SIM2" ]; then printf \'%s\\n%s\\n\' "$SIM1" "$SIM2" | sed \'s/^/KX_IAM_SIM /\'; PROBE=0;',
+    '      if [ "$RC3" -eq 0 ] && [ -n "$SIM3" ]; then printf \'%s\\n\' "$SIM3" | sed \'s/^/KX_IAM_SIMNR /\'; fi',
     `    else echo "KX_IAM_SIM_ERR ${one('$SIM1 $SIM2')}"; fi`,
     '  fi',
     'fi',
     'if [ "$PROBE" = 1 ]; then',
-    '  if command -v codex >/dev/null 2>&1; then',
-    '    echo KX_IAM_PROBE_BEGIN',
-    '    D=$(mktemp -d 2>/dev/null || echo /tmp)',
-    `    (cd "$D" && timeout 60 codex exec --ephemeral --skip-git-repo-check -s read-only --json -c 'web_search="live"' '${PROBE_PROMPT}' </dev/null 2>&1) | tail -c 6000; PRC=\${PIPESTATUS[0]}`,
-    '    echo; echo "KX_IAM_PROBE_END $PRC"',
-    '    [ "$D" != /tmp ] && rm -rf "$D"',
-    '  else echo KX_IAM_NO_CODEX; fi',
+    bedrockProbeScript(),
     'fi',
     'fi',
     'echo KX_IAM_TOML',
     'cat ~/.codex/config.toml 2>/dev/null || true',
+  ].join('\n');
+}
+
+/**
+ * 只跑那一次极短的试调用（60 秒封顶、强制打开网页搜索）。预检的模拟给不出结论（`probeNeeded`）时单独补跑；
+ * 输出接在预检输出前面交给 `parseIamPrecheck`。
+ */
+export function bedrockProbeScript(): string {
+  return [
+    'if command -v codex >/dev/null 2>&1; then',
+    '  echo KX_IAM_PROBE_BEGIN',
+    '  D=$(mktemp -d 2>/dev/null || echo /tmp)',
+    `  (cd "$D" && timeout 60 codex exec --ephemeral --skip-git-repo-check -s read-only --json -c 'web_search="live"' '${PROBE_PROMPT}' </dev/null 2>&1) | tail -c 6000; PRC=\${PIPESTATUS[0]}`,
+    '  echo; echo "KX_IAM_PROBE_END $PRC"',
+    '  [ "$D" != /tmp ] && rm -rf "$D"',
+    'else echo KX_IAM_NO_CODEX; fi',
   ].join('\n');
 }
 
@@ -214,22 +303,28 @@ export async function localBedrockCheckOutput(readConfig: () => string, run: Loc
       const s1 = await run('aws', ['iam', 'simulate-principal-policy', '--policy-source-arn', principal, '--action-names', ...MODEL_ACTIONS, ...q], 30_000);
       const s2 = await run('aws', ['iam', 'simulate-principal-policy', '--policy-source-arn', principal, '--action-names', ...WEB_SEARCH_ACTIONS,
         '--resource-arns', `arn:aws:bedrock-websearch:${region}:aws:tool/*`, ...q], 30_000);
+      /* 网页搜索再模拟一次、不带资源（见 judgeWebSearch） */
+      const s3 = await run('aws', ['iam', 'simulate-principal-policy', '--policy-source-arn', principal, '--action-names', ...WEB_SEARCH_ACTIONS, ...q], 30_000);
       if (s1?.code === 0 && s2?.code === 0 && s1.out.trim() && s2.out.trim()) {
         for (const l of `${s1.out.trim()}\n${s2.out.trim()}`.split(/\r?\n/)) if (l.trim()) out.push(`KX_IAM_SIM ${l.trim()}`);
+        if (s3?.code === 0) for (const l of s3.out.trim().split(/\r?\n/)) if (l.trim()) out.push(`KX_IAM_SIMNR ${l.trim()}`);
         probe = false;
       } else {
         out.push(`KX_IAM_SIM_ERR ${one(`${s1?.out || ''} ${s2?.out || ''}`)}`);
       }
     }
-    if (probe) {
-      /* `web_search=live`：值不是合法 TOML 时 codex 按原样字符串用 —— 省掉引号，Windows 上 .cmd 经 shell 也不会被拆 */
-      const r = await run('codex', ['exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '--json', '-c', 'web_search=live', PROBE_PROMPT], 60_000);
-      if (!r) out.push('KX_IAM_NO_CODEX');
-      else out.push('KX_IAM_PROBE_BEGIN', r.out.slice(-6000), `KX_IAM_PROBE_END ${r.timedOut ? 124 : (r.code ?? 1)}`);
-    }
+    if (probe) out.push(await localBedrockProbeOutput(run));
   }
   out.push('KX_IAM_TOML', toml);
   return out.join('\n');
+}
+
+/** 本机的那一次试调用（同 `bedrockProbeScript`，不经 shell）。 */
+export async function localBedrockProbeOutput(run: LocalToolRun): Promise<string> {
+  /* `web_search=live`：值不是合法 TOML 时 codex 按原样字符串用 —— 省掉引号，Windows 上 .cmd 经 shell 也不会被拆 */
+  const r = await run('codex', ['exec', '--ephemeral', '--skip-git-repo-check', '-s', 'read-only', '--json', '-c', 'web_search=live', PROBE_PROMPT], 60_000);
+  if (!r) return 'KX_IAM_NO_CODEX';
+  return ['KX_IAM_PROBE_BEGIN', r.out.slice(-6000), `KX_IAM_PROBE_END ${r.timedOut ? 124 : (r.code ?? 1)}`].join('\n');
 }
 
 /** config.toml 里 Codex 的 Bedrock 区域（`[model_providers.amazon-bedrock.aws] region`）；没写就是默认的 us-east-1。 */
@@ -267,43 +362,36 @@ export function parseIamPrecheck(out: string, now = Date.now()): BedrockIamCheck
   let webSearch: Verdict = 'unknown';
   let missing: string[] = [];
   let resource: string | undefined;
+  let basis: IamBasis | undefined;
+  let probeNeeded = false;
 
-  const sims = lines.filter((l) => l.startsWith('KX_IAM_SIM ')).map((l) => l.slice('KX_IAM_SIM '.length).trim().split(/\s+/));
-  if (sims.length) {
+  const simOf = (tag: string): Record<string, string> => Object.fromEntries(lines.filter((l) => l.startsWith(`${tag} `))
+    .map((l) => l.slice(tag.length + 1).trim().split(/\s+/)).filter((x) => x.length >= 2).map(([a, d]) => [a, d]));
+  const decided = simOf('KX_IAM_SIM');
+  const b = lines.indexOf('KX_IAM_PROBE_BEGIN');
+  const e = lines.findIndex((l) => l.startsWith('KX_IAM_PROBE_END'));
+  const probe = b >= 0 && e > b ? parseProbe(lines.slice(b + 1, e).join('\n'), Number(lines[e].split(/\s+/)[1])) : undefined;
+  const noCodex = lines.includes('KX_IAM_NO_CODEX');
+  if (Object.keys(decided).length) {
     method = 'simulate';
-    const decided = new Map(sims.map(([a, d]) => [a, d]));
-    const verdictOf = (acts: string[]): Verdict => (acts.every((a) => decided.get(a) === 'allowed') ? 'ok'
-      : acts.some((a) => decided.has(a) && decided.get(a) !== 'allowed') ? 'denied' : 'unknown');
-    model = verdictOf(MODEL_ACTIONS);
-    webSearch = verdictOf(WEB_SEARCH_ACTIONS);
-    missing = [...MODEL_ACTIONS, ...WEB_SEARCH_ACTIONS].filter((a) => decided.has(a) && decided.get(a) !== 'allowed');
-  } else {
-    const b = lines.indexOf('KX_IAM_PROBE_BEGIN');
-    const e = lines.findIndex((l) => l.startsWith('KX_IAM_PROBE_END'));
-    if (b >= 0 && e > b) {
-      method = 'probe';
-      const rc = Number(lines[e].split(/\s+/)[1]);
-      const body = lines.slice(b + 1, e).join('\n');
-      const denied = parseAccessDenied(body);
-      if (denied?.webSearch) {
-        /* 网页搜索被拒说明模型那一下已经通了（是模型发起的搜索） */
-        model = 'ok'; webSearch = 'denied'; missing = WEB_SEARCH_ACTIONS.slice();
-      } else if (denied) {
-        model = 'denied'; missing = denied.actions; resource = denied.resource;
-      } else if (rc === 124) {
-        notes.push(tr('The test call did not finish within 60 seconds, so permissions could not be determined.'));
-      } else if (rc === 0) {
-        model = 'ok';
-        /* 模型不一定真的搜了：只有输出里有 web_search 事件才算网页搜索 ✓ */
-        if (/web_search/.test(body)) webSearch = 'ok';
-        else notes.push(tr('The model did not run a web search in the test call, so web search could not be confirmed.'));
-      } else {
-        const last = body.split('\n').map((l) => l.trim()).filter(Boolean).pop() || '';
-        notes.push(tr('The test call failed (exit code {code}): {err}', { code: Number.isFinite(rc) ? rc : '?', err: last.slice(0, 200) }));
-      }
-    } else if (lines.includes('KX_IAM_NO_CODEX')) {
-      notes.push(tr('Codex is not installed on that machine.'));
-    }
+    /* 模型调用那一半：照旧按（不带资源的）模拟 */
+    model = MODEL_ACTIONS.every((a) => decided[a] === 'allowed') ? 'ok'
+      : MODEL_ACTIONS.some((a) => a in decided && decided[a] !== 'allowed') ? 'denied' : 'unknown';
+    /* 网页搜索那一半：implicitDeny 不算数，要么不带资源的模拟 allowed、要么以试调用为准（judgeWebSearch） */
+    const ws = judgeWebSearch({ withResource: decided, noResource: simOf('KX_IAM_SIMNR') }, probe);
+    webSearch = ws.verdict;
+    basis = ws.basis;
+    probeNeeded = ws.probeNeeded && !noCodex;
+    if (ws.probeNeeded && noCodex) notes.push(tr('Codex is not installed on that machine.'));
+    if (ws.note) notes.push(ws.note);
+    missing = [...MODEL_ACTIONS.filter((a) => a in decided && decided[a] !== 'allowed'), ...ws.missing];
+  } else if (probe) {
+    method = 'probe';
+    basis = 'probe';
+    ({ model, webSearch, missing, resource } = probe);
+    if (probe.note) notes.push(probe.note);
+  } else if (noCodex) {
+    notes.push(tr('Codex is not installed on that machine.'));
   }
   return {
     ...(identity ? { identity } : {}),
@@ -311,6 +399,8 @@ export function parseIamPrecheck(out: string, now = Date.now()): BedrockIamCheck
     method, model, webSearch, missing,
     ...(missing.length ? { policy: minimalPolicy(missing, region, resource) } : {}),
     ...(resource ? { resource } : {}),
+    ...(basis ? { basis } : {}),
+    ...(probeNeeded ? { probeNeeded: true } : {}),
     region,
     webSearchDisabled: codexWebSearchDisabled(toml),
     ...(lines.includes('KX_IAM_NOT_BEDROCK') ? { notBedrock: true } : {}),
@@ -423,6 +513,31 @@ export function parseDeniedNoteGroup(group: string | undefined): { machineId?: s
     ...(machineId ? { machineId } : {}), region: m[2] || DEFAULT_REGION, actions: m[3].split(',').filter(Boolean),
     ...(resource ? { resource } : {}),
   };
+}
+
+/** 界面判断缺权限卡显不显示要用的那几项预检结果（主进程 `bedrock:check` 推过来的 BedrockIamCheck）。 */
+export type NoteCheck = Pick<BedrockIamCheck, 'checkedAt' | 'model' | 'webSearch' | 'missing'>;
+
+/**
+ * **缺权限卡此刻还算不算数** —— 卡只跟 Codex、只跟卡上那台机器有关：
+ * - 会话当前引擎不是 Codex → 不显示（切到 Claude Code / kiro 立即撤掉）；
+ * - 会话当前机器不是卡上那台（`machineId`：设置里的机器 id，本机 'local'）→ 不显示；认不出是哪台（卡上没记机器、会话远程但不知道 id）也不显示；
+ * - 那台机器在这张卡之后的预检里通过了（卡上的动作都不缺、对应那一半 ok）→ 不显示。
+ * 不是这类卡（group 认不出来）→ true，不管。只改显示，记录不动；切回来、又缺了照样显示。
+ */
+export function bedrockNoteActive(group: string | undefined, at: number, ctx: { engine?: string; machineId?: string; check?: NoteCheck }): boolean {
+  const g = parseDeniedNoteGroup(group);
+  if (!g) return true;
+  if (ctx.engine !== 'codex') return false;
+  /* 只有能确认「就是那台」才显示：卡上没记机器、或认不出会话当前在哪台（远程但不知道 id）都不显示 */
+  if (!g.machineId || !ctx.machineId || g.machineId !== ctx.machineId) return false;
+  const c = ctx.check;
+  if (c && c.checkedAt > at && !g.actions.some((a) => c.missing.includes(a))) {
+    const web = g.actions.some((a) => a.startsWith('bedrock-websearch:'));
+    const model = g.actions.some((a) => !a.startsWith('bedrock-websearch:'));
+    if ((!web || c.webSearch === 'ok') && (!model || c.model === 'ok')) return false;
+  }
+  return true;
 }
 
 /** 卡上那段策略：动作 + 区域 + 报错里点名的资源（`deniedNoteGroup` 带过来的）。 */

@@ -73,7 +73,8 @@ import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummar
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
-import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy } from '../../main/bedrockIam.ts';
+import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy, bedrockNoteActive } from '../../main/bedrockIam.ts';
+import { bedrockCheckStore } from '../bedrockCheckStore.ts';
 import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
 
@@ -1227,12 +1228,17 @@ const ScheduleEndCard = memo<{ message: Message; end: ScheduleEndView; name?: st
  * **Codex 被 AWS 拒了（缺 IAM 权限）** 的提示卡（主进程 `noteBedrockDenied` 写的那条，group 见 `main/bedrockIam`）：
  * 主句说哪台机器缺什么；身份（role ARN）、缺的动作、可以直接贴进 IAM 的最小策略、「这台机器暂时关掉 Codex 网页搜索」；
  * 原始报错在「详情」里。和别的 KiroLex 提示一样能关 / 不再提醒（只改显示，同一份记录，见 noticeDismiss.ts）。
+ *
+ * **只跟 Codex、只跟卡上那台机器有关**：会话切到别的引擎 / 别的机器，或那台机器之后的预检通过了，就不画（bedrockNoteActive）。
+ * `machineId`：会话当前机器在设置里的 id（本机 'local'；远程但不知道 id 时 undefined）。
  */
-const BedrockDeniedCard = memo<{ message: Message; count?: number }>(({ message, count }) => {
+const BedrockDeniedCard = memo<{ message: Message; count?: number; engine?: string; machineId?: string }>(({ message, count, engine, machineId }) => {
   const t = useT();
   const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
+  const checks = useSyncExternalStore(bedrockCheckStore.subscribe, bedrockCheckStore.get);
   const g = parseDeniedNoteGroup(message.noteGroup);
   if (!g || isNoticeHidden({ id: message.id, noteGroup: message.noteGroup }, hide)) return null;
+  if (!bedrockNoteActive(message.noteGroup, message.timestamp, { engine, machineId, check: g.machineId ? checks[g.machineId] : undefined })) return null;
   const { main, detail } = splitNoteDetail(message.content);
   const badge = repeatBadge(count);
   const roleArn = deniedRoleArn(message.content);
@@ -3578,6 +3584,8 @@ interface ChatAreaProps {
    * 命令/文件面板要标出机器，而这件事必须跟着**会话状态**走，不能跟着同步状态走。
    */
   remoteHost?: string;
+  /** 同一台机器在设置里的 id（本地 = undefined）—— Codex 缺权限卡只在会话当前就在卡上那台机器时显示。 */
+  remoteId?: string;
   /** 哪个引擎跑这条会话；undefined = kiro。 */
   engine?: 'kiro' | 'claude' | 'codex';
   kiroAgent: string;
@@ -3729,6 +3737,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   commands,
   onModelChange,
   remoteHost,
+  remoteId,
   engine,
   kiroAgent,
   kiroAgents,
@@ -3874,6 +3883,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   /* 会话错误横幅 / 空会话错误卡片「不再提醒」过（这台电脑）就不画 —— 只改显示，错误照旧记着（noticeDismiss.ts） */
   const errorNoticeMuted = isMuted(SESSION_ERROR_GROUP, useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get));
   const remoteHostLabel = remoteHost ? remoteHost.replace(/^[^@]*@/, '') : undefined;
+  /* Codex 缺权限卡认的机器 id：本机 'local'；远程但记录里没有 id → undefined（只认不出是哪台） */
+  const noteMachineId = remoteId || (remoteHost ? undefined : 'local');
   const nonKiro = !!engine && engine !== 'kiro';
   /* 用量栏右边那一格（非 kiro）：本会话花费 / token / 不显示 —— kiro 的 credits 按钮另走 */
   const usageChipNow = nonKiro ? usageChip(engine, usage, t) : null;
@@ -5328,7 +5339,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           ) : group.kind === 'bgWake' ? (
             <BgWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
           ) : group.kind === 'kirolex' && parseDeniedNoteGroup(group.message.noteGroup) ? (
-            <BedrockDeniedCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} />
+            <BedrockDeniedCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} engine={engine} machineId={noteMachineId} />
           ) : group.kind === 'kirolex' && scheduleView.ends.has(group.message.id) ? (
             <ScheduleEndCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} {...scheduleView.ends.get(group.message.id)!} count={group.count} />
           ) : group.kind === 'kirolex' ? (

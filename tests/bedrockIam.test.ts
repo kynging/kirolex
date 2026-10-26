@@ -16,6 +16,7 @@ import {
   parseIamPrecheck, bedrockCheckScript, withBedrockCheck, setCodexWebSearch, codexWebSearchDisabled,
   deniedNoteGroup, parseDeniedNoteGroup, deniedRoleArn, bedrockRegionOf, localBedrockCheckOutput, deniedCardPolicy,
   parseRemoteConfigRead, readLocalConfig, toggleCodexWebSearch, REMOTE_CONFIG_READ_SCRIPT,
+  judgeWebSearch, parseProbe, bedrockProbeScript, localBedrockProbeOutput, bedrockNoteActive, staleBedrockCheck,
 } from '../src/main/bedrockIam.ts';
 
 const TOKYO = 'stream disconnected before completion: Access denied: web search is not authorized for this identity.';
@@ -187,7 +188,7 @@ describe('预检输出 → 结果', () => {
 
   test('预检结果挂到引擎状态上', () => {
     const status = { installed: true, loggedIn: true, detail: 'Via Amazon Bedrock' };
-    const c = parseIamPrecheck(out('KX_IAM_ARN arn:aws:sts::1:assumed-role/r/s\nKX_IAM_SIM bedrock-mantle:CreateInference\tallowed\nKX_IAM_SIM bedrock-websearch:InvokeSearch\timplicitDeny'));
+    const c = parseIamPrecheck(out('KX_IAM_ARN arn:aws:sts::1:assumed-role/r/s\nKX_IAM_SIM bedrock-mantle:CreateInference\tallowed\nKX_IAM_SIM bedrock-websearch:InvokeSearch\texplicitDeny'));
     const s = withBedrockCheck(status, c);
     assert.equal(s.bedrock?.model, 'ok');
     assert.equal(s.bedrock?.webSearch, 'denied');
@@ -285,13 +286,18 @@ describe('预检脚本：按资源模拟（只按 tool/* 授权的策略不能�
     assert.equal(c.region, 'ap-northeast-1');
   });
 
-  test('区域对不上（授权在别的区）→ 判 ✗，给的策略资源是配置里的区域', (t) => {
+  test('区域对不上（授权在别的区）→ 模拟只是 implicitDeny，不直接判 ✗、要试调用；试调用被拒才 ✗，策略资源是配置里的区域', (t) => {
     const out = run(t, 'model_provider = "amazon-bedrock"\n\n[model_providers.amazon-bedrock.aws]\nregion = "us-west-2"\n');
     if (out === null) return;
     const c = parseIamPrecheck(out);
-    assert.equal(c.webSearch, 'denied');
+    assert.equal(c.webSearch, 'unknown');
+    assert.equal(c.probeNeeded, true);
+    assert.deepEqual(c.missing, []);
     assert.equal(c.model, 'ok');
-    assert.equal(JSON.parse(c.policy!).Statement[0].Resource, 'arn:aws:bedrock-websearch:us-west-2:aws:tool/*');
+    const p = parseIamPrecheck(`KX_IAM_PROBE_BEGIN\n${TOKYO}\nKX_IAM_PROBE_END 1\n${out}`);
+    assert.equal(p.webSearch, 'denied');
+    assert.equal(p.basis, 'probe');
+    assert.equal(JSON.parse(p.policy!).Statement[0].Resource, 'arn:aws:bedrock-websearch:us-west-2:aws:tool/*');
   });
 
   test('Codex 没走 Bedrock：不查', (t) => {
@@ -372,7 +378,7 @@ describe('预检试调用被拒、报错点名了模型 → 预检策略和启�
   test('index.ts 的启动提示卡把预检里的资源带进 group', () => {
     const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
     const pre = M.slice(M.indexOf('function precheckCodexBedrock('), M.indexOf('async function noteBedrockDenied('));
-    assert.match(pre, /const group = deniedNoteGroup\(\{ machineId: remote \? target\?\.id : 'local', region: check\.region, actions: check\.missing, \.\.\.\(check\.resource \? \{ resource: check\.resource \} : \{\}\) \}\);/);
+    assert.match(pre, /const group = deniedNoteGroup\(\{ machineId: remote \? \(target\?\.id \|\| key\) : 'local', region: check\.region, actions: check\.missing, \.\.\.\(check\.resource \? \{ resource: check\.resource \} : \{\}\) \}\);/);
   });
 });
 
@@ -676,9 +682,11 @@ describe('本机的预检（不经 bash，逐条跑同样的只读调用）', ()
     assert.equal(c.identity, 'arn:aws:sts::123456789012:assumed-role/local-role/me');
     assert.equal(c.roleArn, 'arn:aws:iam::123456789012:role/dev/local-role');
     const sims = calls.filter((x) => x.args[1] === 'simulate-principal-policy');
-    assert.equal(sims.length, 2);
+    assert.equal(sims.length, 3);
     assert.ok(!sims[0].args.includes('--resource-arns'));
     assert.ok(sims[1].args.includes('arn:aws:bedrock-websearch:eu-west-1:aws:tool/*'));
+    /* 网页搜索另有一次不带资源的模拟（带资源的结论不可信时用它） */
+    assert.ok(!sims[2].args.includes('--resource-arns') && sims[2].args.includes('bedrock-websearch:ExternalWebAccess'));
     assert.ok(!calls.some((x) => x.tool === 'codex'));
     /* 只读：没有任何改 IAM 的调用 */
     assert.ok(!calls.some((x) => /^(put|attach|create|update|delete)-/.test(x.args[1] || '')));
@@ -731,7 +739,7 @@ describe('接线（源码断言）', () => {
     /* 报错卡：本机也问身份；机器 id 是 'local'（卡上才有「关掉网页搜索」） */
     const fn = M.slice(M.indexOf('async function noteBedrockDenied('), M.indexOf('/* ─────────────── 模型自己安排的'));
     assert.match(fn, /const id = await runLocalTool\('aws', \['sts', 'get-caller-identity', '--query', 'Arn', '--output', 'text'\], 15_000\);/);
-    assert.match(fn, /deniedNoteGroup\(\{ machineId: remote \? target\?\.id : 'local', region, actions: denied\.actions, \.\.\.\(denied\.resource \? \{ resource: denied\.resource \} : \{\}\) \}\)\)/);
+    assert.match(fn, /deniedNoteGroup\(\{ machineId: remote \? \(target\?\.id \|\| key\) : 'local', region, actions: denied\.actions, \.\.\.\(denied\.resource \? \{ resource: denied\.resource \} : \{\}\) \}\)\)/);
     /* 关网页搜索：'local' 写本机 ~/.codex/config.toml（备份 + 临时文件 + rename） */
     const ws = M.slice(M.indexOf("ipcMain.handle('ai-login:codex-web-search'"));
     assert.match(ws, /if \(machine === 'local'\) \{\n\s*const file = LOCAL_CODEX_TOML\(\);/);
@@ -837,10 +845,10 @@ describe('接线（源码断言）', () => {
   test('index.ts：Codex 一轮被拒 → 提示卡 + 一句人话；预检 / 关网页搜索两条 IPC；不调用改 IAM 的接口', () => {
     const M = read('src', 'main', 'index.ts');
     assert.match(M, /const deniedMsg = await noteBedrockDenied\(sessionId, entry\.profile, `\$\{err\?\.message \|\| ''\}\$\{detail\}`\);\n\s*if \(deniedMsg\) throw new Error\(deniedMsg\);/);
-    assert.match(M, /deniedNoteGroup\(\{ machineId: remote \? target\?\.id : 'local', region, actions: denied\.actions, \.\.\.\(denied\.resource \? \{ resource: denied\.resource \} : \{\}\) \}\)\)/);
+    assert.match(M, /deniedNoteGroup\(\{ machineId: remote \? \(target\?\.id \|\| key\) : 'local', region, actions: denied\.actions, \.\.\.\(denied\.resource \? \{ resource: denied\.resource \} : \{\}\) \}\)\)/);
     assert.match(M, /ipcMain\.handle\('ai-login:bedrock-check'/);
     assert.match(M, /\? runRemoteCapture\(remote, bedrockCheckScript\(\), 120_000\)\n/);
-    assert.match(M, /const job = run\.then\(\(out\) => \{\n\s*const check = parseIamPrecheck\(out\);\n\s*bedrockChecks\.set\(key, check\);/);
+    assert.match(M, /const job = run\.then\(async \(out\) => \{\n\s*let check = parseIamPrecheck\(out\);[\s\S]*?check = parseIamPrecheck\(`\$\{probe\}\\n\$\{out\}`\);\n\s*\}\n\s*bedrockChecks\.set\(key, check\);/);
     assert.match(M, /const check = await ensureBedrockCheck\(remote, !!opts\?\.force\);/);
     assert.match(M, /ipcMain\.handle\('ai-login:codex-web-search'/);
     assert.match(M, /await toggleCodexWebSearch\(async \(\) => parseRemoteConfigRead\(/);
@@ -896,5 +904,239 @@ describe('接线（源码断言）', () => {
     const B = read('src', 'renderer', 'components', 'BedrockIam.tsx');
     assert.match(B, /t\('Model calls \{m\}', \{ m: mark\(check\.model\) \}\)/);
     assert.match(B, /t\('Web search \{m\}', \{ m: mark\(check\.webSearch\) \}\)/);
+  });
+});
+
+/**
+ * 2026-10-26 实测误报：tokyo-graviton 的 ec2-admin 角色挂着 AdministratorAccess，模拟器带 `--resource-arns tool/*` 时把
+ * ExternalWebAccess 判成 implicitDeny（不带资源是 allowed），真跑 codex 网页搜索 4 次都没被拒。
+ * 新判据：只有 explicitDeny、或试调用真的被拒才算缺权限；带资源 implicitDeny + 不带资源 allowed = 有权限。
+ */
+describe('网页搜索判据（judgeWebSearch）', () => {
+  const all = (d: string): Record<string, string> => Object.fromEntries(WEB_SEARCH_ACTIONS.map((a) => [a, d]));
+  const ADMIN_WITH_RES = { 'bedrock-websearch:InvokeSearch': 'allowed', 'bedrock-websearch:InvokeFetch': 'allowed', 'bedrock-websearch:ExternalWebAccess': 'implicitDeny' };
+
+  test('带资源全部 allowed → ok（simulate-with-resource）', () => {
+    const j = judgeWebSearch({ withResource: all('allowed') });
+    assert.deepEqual([j.verdict, j.basis, j.probeNeeded, j.missing], ['ok', 'simulate-with-resource', false, []]);
+  });
+
+  test('带资源 implicitDeny + 不带资源 allowed → 不判 denied（simulate-no-resource，ok）', () => {
+    const j = judgeWebSearch({ withResource: ADMIN_WITH_RES, noResource: all('allowed') });
+    assert.notEqual(j.verdict, 'denied');
+    assert.equal(j.verdict, 'ok');
+    assert.equal(j.basis, 'simulate-no-resource');
+    assert.deepEqual(j.missing, []);
+  });
+
+  test('两次模拟都只是 implicitDeny → 不判 denied，要试调用确认', () => {
+    const j = judgeWebSearch({ withResource: all('implicitDeny'), noResource: all('implicitDeny') });
+    assert.equal(j.verdict, 'unknown');
+    assert.equal(j.probeNeeded, true);
+    assert.deepEqual(j.missing, []);
+    /* 没有不带资源的那次也一样 */
+    assert.equal(judgeWebSearch({ withResource: ADMIN_WITH_RES }).probeNeeded, true);
+  });
+
+  test('explicitDeny → denied（不用试调用）', () => {
+    const j = judgeWebSearch({ withResource: { ...ADMIN_WITH_RES, 'bedrock-websearch:ExternalWebAccess': 'explicitDeny' }, noResource: all('allowed') });
+    assert.equal(j.verdict, 'denied');
+    assert.equal(j.probeNeeded, false);
+    assert.deepEqual(j.missing, ['bedrock-websearch:ExternalWebAccess']);
+    assert.equal(j.basis, 'simulate-with-resource');
+    assert.equal(judgeWebSearch({ withResource: all('implicitDeny'), noResource: { ...all('allowed'), 'bedrock-websearch:InvokeFetch': 'explicitDeny' } }).basis, 'simulate-no-resource');
+  });
+
+  test('要试调用时：试调用被拒（parseAccessDenied 认出动作）→ denied（probe）', () => {
+    const probe = parseProbe(`{"type":"error","message":"${TOKYO}"}`, 1);
+    const j = judgeWebSearch({ withResource: all('implicitDeny'), noResource: all('implicitDeny') }, probe);
+    assert.deepEqual([j.verdict, j.basis, j.probeNeeded], ['denied', 'probe', false]);
+    assert.deepEqual(j.missing, WEB_SEARCH_ACTIONS);
+  });
+
+  test('要试调用时：试调用成功、真的搜了 → ok（probe）；没搜 / 超时 → unknown，不报缺', () => {
+    const ok = judgeWebSearch({ withResource: ADMIN_WITH_RES }, parseProbe('{"type":"item.completed","item":{"type":"web_search"}}\nOK', 0));
+    assert.deepEqual([ok.verdict, ok.basis, ok.missing], ['ok', 'probe', []]);
+    const noSearch = judgeWebSearch({ withResource: ADMIN_WITH_RES }, parseProbe('OK', 0));
+    assert.deepEqual([noSearch.verdict, noSearch.missing], ['unknown', []]);
+    assert.ok(noSearch.note);
+    const timeout = judgeWebSearch({ withResource: ADMIN_WITH_RES }, parseProbe('', 124));
+    assert.deepEqual([timeout.verdict, timeout.missing], ['unknown', []]);
+  });
+
+  test('试调用只有笼统的失败（没有动作可认）→ 不算缺权限', () => {
+    const j = judgeWebSearch({ withResource: all('implicitDeny') }, parseProbe('stream disconnected: connection reset', 1));
+    assert.equal(j.verdict, 'unknown');
+    assert.deepEqual(j.missing, []);
+  });
+});
+
+describe('预检输出：tokyo-graviton 那次误报（带资源 implicitDeny、不带资源 allowed）', () => {
+  const TOML = 'model_provider = "amazon-bedrock"\n';
+  const SIM = [
+    'KX_IAM_ARN arn:aws:sts::843493563478:assumed-role/ec2-admin/i-1',
+    'KX_IAM_PRINCIPAL arn:aws:iam::843493563478:role/ec2-admin',
+    'KX_IAM_SIM bedrock-mantle:CreateInference\tallowed',
+    'KX_IAM_SIM bedrock-websearch:InvokeSearch\tallowed',
+    'KX_IAM_SIM bedrock-websearch:InvokeFetch\tallowed',
+    'KX_IAM_SIM bedrock-websearch:ExternalWebAccess\timplicitDeny',
+  ];
+  test('有不带资源的模拟且 allowed → 网页搜索 ok，不缺、不要试调用；判据 simulate-no-resource', () => {
+    const c = parseIamPrecheck([...SIM, ...WEB_SEARCH_ACTIONS.map((a) => `KX_IAM_SIMNR ${a}\tallowed`), 'KX_IAM_TOML', TOML].join('\n'));
+    assert.equal(c.model, 'ok');
+    assert.equal(c.webSearch, 'ok');
+    assert.deepEqual(c.missing, []);
+    assert.equal(c.policy, undefined);
+    assert.equal(c.basis, 'simulate-no-resource');
+    assert.ok(!c.probeNeeded);
+  });
+
+  test('只有带资源的 implicitDeny → 不报缺，标出要试调用；补上试调用（成功）→ ok，判据 probe', () => {
+    const c = parseIamPrecheck([...SIM, 'KX_IAM_TOML', TOML].join('\n'));
+    assert.equal(c.webSearch, 'unknown');
+    assert.deepEqual(c.missing, []);
+    assert.equal(c.probeNeeded, true);
+    const p = parseIamPrecheck(['KX_IAM_PROBE_BEGIN', '{"type":"item.completed","item":{"type":"web_search"}}', 'OK', 'KX_IAM_PROBE_END 0', ...SIM, 'KX_IAM_TOML', TOML].join('\n'));
+    assert.equal(p.method, 'simulate');
+    assert.equal(p.model, 'ok');
+    assert.equal(p.webSearch, 'ok');
+    assert.equal(p.basis, 'probe');
+    assert.ok(!p.probeNeeded);
+  });
+
+  test('补上试调用（被拒）→ denied，判据 probe，策略照配置区域', () => {
+    const p = parseIamPrecheck(['KX_IAM_PROBE_BEGIN', TOKYO, 'KX_IAM_PROBE_END 1', ...SIM, 'KX_IAM_TOML', TOML].join('\n'));
+    assert.equal(p.webSearch, 'denied');
+    assert.equal(p.basis, 'probe');
+    assert.deepEqual(p.missing, WEB_SEARCH_ACTIONS);
+    assert.equal(JSON.parse(p.policy!).Statement[0].Resource, 'arn:aws:bedrock-websearch:us-east-1:aws:tool/*');
+  });
+
+  test('只有模拟（没法试调用：没装 codex）→ 判不了，不报缺', () => {
+    const c = parseIamPrecheck(['KX_IAM_NO_CODEX', ...SIM, 'KX_IAM_TOML', TOML].join('\n'));
+    assert.equal(c.webSearch, 'unknown');
+    assert.deepEqual(c.missing, []);
+    assert.ok(!c.probeNeeded);
+  });
+
+  test('没权限模拟、直接试调用的那条路：判据 probe', () => {
+    const c = parseIamPrecheck(['KX_IAM_SIM_ERR denied', 'KX_IAM_PROBE_BEGIN', TOKYO, 'KX_IAM_PROBE_END 1', 'KX_IAM_TOML', TOML].join('\n'));
+    assert.equal(c.method, 'probe');
+    assert.equal(c.basis, 'probe');
+  });
+
+  test('试调用脚本（只读，单独跑的那一段）', () => {
+    const P = bedrockProbeScript();
+    assert.match(P, /KX_IAM_PROBE_BEGIN/);
+    assert.match(P, /timeout 60 codex exec/);
+    assert.match(P, /KX_IAM_NO_CODEX/);
+    assert.doesNotMatch(P, /iam (put|attach|create|update|delete)-/i);
+    /* 预检脚本里网页搜索另做一次不带资源的模拟 */
+    assert.match(bedrockCheckScript(), /--action-names bedrock-websearch:InvokeSearch bedrock-websearch:InvokeFetch bedrock-websearch:ExternalWebAccess --query[^\n]*\); RC3=/);
+    assert.match(bedrockCheckScript(), /KX_IAM_SIMNR/);
+  });
+
+  test('本机试调用（localBedrockProbeOutput）：一次 codex exec，60 秒；没装 codex → KX_IAM_NO_CODEX', async () => {
+    const calls: Array<{ tool: string; args: string[]; timeoutMs: number }> = [];
+    const out = await localBedrockProbeOutput(async (tool, args, timeoutMs) => { calls.push({ tool, args, timeoutMs }); return { code: 0, out: '{"type":"web_search"}\nOK' }; });
+    assert.deepEqual(calls.map((c) => [c.tool, c.timeoutMs]), [['codex', 60_000]]);
+    assert.ok(calls[0].args.includes('web_search=live'));
+    assert.match(out, /KX_IAM_PROBE_BEGIN[\s\S]*KX_IAM_PROBE_END 0/);
+    assert.equal(await localBedrockProbeOutput(async () => null), 'KX_IAM_NO_CODEX');
+  });
+});
+
+describe('缺权限提示卡只在「当前引擎是 Codex、当前机器就是卡上那台」时显示（bedrockNoteActive）', () => {
+  const WS = deniedNoteGroup({ machineId: 'tokyo-graviton', region: 'us-east-1', actions: WEB_SEARCH_ACTIONS });
+  const MODEL = deniedNoteGroup({ machineId: 'local', region: 'us-east-1', actions: MODEL_ACTIONS });
+  const AT = 1000;
+
+  test('Codex + 同一台 → 显示', () => {
+    assert.equal(bedrockNoteActive(WS, AT, { engine: 'codex', machineId: 'tokyo-graviton' }), true);
+    assert.equal(bedrockNoteActive(MODEL, AT, { engine: 'codex', machineId: 'local' }), true);
+  });
+
+  test('会话引擎从 codex 切到 claude / kiro → 撤掉', () => {
+    assert.equal(bedrockNoteActive(WS, AT, { engine: 'claude', machineId: 'tokyo-graviton' }), false);
+    assert.equal(bedrockNoteActive(WS, AT, { engine: 'kiro', machineId: 'tokyo-graviton' }), false);
+    assert.equal(bedrockNoteActive(WS, AT, { engine: undefined, machineId: 'tokyo-graviton' }), false);
+  });
+
+  test('换了机器（别的远程 / 切回本机）→ 撤掉', () => {
+    assert.equal(bedrockNoteActive(WS, AT, { engine: 'codex', machineId: 'aws-tokyo' }), false);
+    assert.equal(bedrockNoteActive(WS, AT, { engine: 'codex', machineId: 'local' }), false);
+    assert.equal(bedrockNoteActive(MODEL, AT, { engine: 'codex', machineId: 'tokyo-graviton' }), false);
+  });
+
+  test('认不出是哪台 → 不显示：会话远程但不知道机器 id；卡上没记机器（切回本机也不显示）', () => {
+    /* 会话当前机器认不出（远程、没有 id） */
+    assert.equal(bedrockNoteActive(WS, AT, { engine: 'codex', machineId: undefined }), false);
+    assert.equal(bedrockNoteActive(MODEL, AT, { engine: 'codex', machineId: undefined }), false);
+    /* 卡上没记机器（老记录 / 主进程当时没找到那台） */
+    const NO_MACHINE = deniedNoteGroup({ region: 'us-east-1', actions: WEB_SEARCH_ACTIONS });
+    assert.equal(parseDeniedNoteGroup(NO_MACHINE)?.machineId, undefined);
+    assert.equal(bedrockNoteActive(NO_MACHINE, AT, { engine: 'codex', machineId: 'local' }), false);
+    assert.equal(bedrockNoteActive(NO_MACHINE, AT, { engine: 'codex', machineId: 'tokyo-graviton' }), false);
+    assert.equal(bedrockNoteActive(NO_MACHINE, AT, { engine: 'codex', machineId: undefined }), false);
+  });
+
+  test('主进程写卡时总记着机器：设置里找不到那台就用 bedrockCheckKey（和会话的 remoteId 同一套）', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
+    assert.equal(M.split("machineId: remote ? (target?.id || key) : 'local'").length - 1, 2);
+    assert.doesNotMatch(M, /machineId: remote \? target\?\.id : 'local'/);
+    const pre = M.slice(M.indexOf('function precheckCodexBedrock('), M.indexOf('async function noteBedrockDenied('));
+    assert.match(pre, /const key = remote \? bedrockCheckKey\(remote\) : 'local';/);
+    /* 会话的 remoteId 也是 durableRemoteId 给的（找不到那台时是 sshHost），bedrockCheckKey 同样 */
+    assert.match(M, /\.\.\.durableRemoteId\(rec\.profile\?\.remote as any, remoteTargetsNow,/);
+    assert.match(M, /function bedrockCheckKey\(remote: RemoteTarget\): string \{\n\s*return durableRemoteId\(/);
+  });
+
+  test('之后那台机器的预检通过 → 撤掉；预检早于这张卡 / 还是缺 / 判不了 → 照旧显示', () => {
+    const ctx = { engine: 'codex', machineId: 'tokyo-graviton' };
+    const pass = { checkedAt: AT + 1, model: 'ok' as const, webSearch: 'ok' as const, missing: [] };
+    assert.equal(bedrockNoteActive(WS, AT, { ...ctx, check: pass }), false);
+    assert.equal(bedrockNoteActive(WS, AT, { ...ctx, check: { ...pass, checkedAt: AT - 1 } }), true);
+    assert.equal(bedrockNoteActive(WS, AT, { ...ctx, check: { ...pass, webSearch: 'denied', missing: WEB_SEARCH_ACTIONS } }), true);
+    assert.equal(bedrockNoteActive(WS, AT, { ...ctx, check: { ...pass, webSearch: 'unknown' } }), true);
+    /* 模型调用那张看 model */
+    assert.equal(bedrockNoteActive(MODEL, AT, { engine: 'codex', machineId: 'local', check: { ...pass, webSearch: 'unknown' } }), false);
+  });
+
+  test('不是这类卡 → 不管（true）', () => {
+    assert.equal(bedrockNoteActive('model-fallback:x', AT, { engine: 'claude' }), true);
+  });
+});
+
+describe('接线：提示卡跟着会话的引擎 / 机器 / 预检结果走', () => {
+  const read = (...p: string[]): string => fs.readFileSync(path.join(import.meta.dirname, '..', ...p), 'utf8');
+  test('ChatArea 按会话当前引擎、机器 id、那台机器最新的预检结果判断显不显示', () => {
+    const C = read('src', 'renderer', 'components', 'ChatArea.tsx');
+    const card = C.slice(C.indexOf('const BedrockDeniedCard = memo'), C.indexOf('const estimateVisibleTokens'));
+    assert.match(card, /bedrockNoteActive\(message\.noteGroup, message\.timestamp, \{ engine, machineId, check: g\.machineId \? checks\[g\.machineId\] : undefined \}\)/);
+    assert.match(card, /useSyncExternalStore\(bedrockCheckStore\.subscribe, bedrockCheckStore\.get\)/);
+    assert.match(C, /<BedrockDeniedCard key=\{.+?\} message=\{group\.message\} count=\{group\.count\} engine=\{engine\} machineId=\{noteMachineId\} \/>/);
+    assert.match(C, /const noteMachineId = remoteId \|\| \(remoteHost \? undefined : 'local'\);/);
+    const A = read('src', 'renderer', 'App.tsx');
+    assert.match(A, /remoteId=\{session\?\.remoteId\}/);
+  });
+
+  test('主进程每次预检完都把结果推给界面；旧判据记下的 denied 不沿用', () => {
+    const M = read('src', 'main', 'index.ts');
+    const fn = M.slice(M.indexOf('function ensureBedrockCheck('), M.indexOf('function precheckCodexBedrock('));
+    assert.match(fn, /mainWindow\?\.webContents\.send\('bedrock:check', \{ machine: key, check \}\)/);
+    assert.match(fn, /if \(prev && !force && !staleBedrockCheck\(prev\)\) return Promise\.resolve\(prev\);/);
+    assert.match(fn, /if \(check\.probeNeeded\)/);
+    assert.match(fn, /判据=\$\{check\.basis \|\| '-'\}/);
+    assert.match(M, /ipcMain\.handle\('bedrock:checks'/);
+    const P = read('src', 'main', 'preload.ts');
+    assert.match(P, /ipcRenderer\.on\('bedrock:check', handler\)/);
+    assert.match(P, /ipcRenderer\.invoke\('bedrock:checks'\)/);
+  });
+
+  test('旧判据的结果（没记判据、判了 denied）算过期；新判据的结果不算', () => {
+    const base = { method: 'simulate' as const, model: 'ok' as const, missing: [], region: 'us-east-1', webSearchDisabled: false, checkedAt: 1 };
+    assert.equal(staleBedrockCheck({ ...base, webSearch: 'denied', missing: WEB_SEARCH_ACTIONS }), true);
+    assert.equal(staleBedrockCheck({ ...base, webSearch: 'denied', missing: WEB_SEARCH_ACTIONS, basis: 'probe' }), false);
+    assert.equal(staleBedrockCheck({ ...base, webSearch: 'ok' }), false);
   });
 });
