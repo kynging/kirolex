@@ -7,39 +7,27 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { modelOffersEffort } from '../src/main/mcpCombos.ts';
-import { comboEffortNote } from '../src/renderer/comboPick.ts';
+import { planEffortForModel } from '../src/main/engineEffort.ts';
+import { effortPickerView } from '../src/renderer/effortPick.ts';
 import { planTextOf, planIsLong } from '../src/renderer/permissionButtons.ts';
 
 const read = (...p: string[]) => fs.readFileSync(path.join(import.meta.dirname, '..', 'src', ...p), 'utf8');
 const tt = (k: string, v?: Record<string, string | number>) => (v ? k.replace(/\{(\w+)\}/g, (_, n) => String(v[n])) : k);
 
-describe('1b effort：当前模型不支持时不设、不报错，组合旁边说一句', () => {
-  test('modelOffersEffort：haiku（没有 effort 那一项）= false', () => {
-    assert.equal(modelOffersEffort(null), false);
-    assert.equal(modelOffersEffort({ current: '', options: [] }), false);
-    assert.equal(modelOffersEffort({ current: 'default', options: [{ value: 'high', name: 'High' }] }), true);
+/* 2026-10-26 用户改了口径：effort 单独一个下拉（模型下拉左边），不再放在 MCP 配置里 —— 细节见 tests/engineEffort.test.ts */
+describe('1b effort：当前模型不支持时不设、不报错，界面明说（独立的 effort 下拉）', () => {
+  test('haiku（没有 effort 那一项）：不设；下拉禁用并写着不支持', () => {
+    assert.deepEqual(planEffortForModel('high', null), { kind: 'unsupported', wanted: 'high' });
+    const v = effortPickerView(null, { connected: true }, tt);
+    assert.equal(v.disabled, true);
+    assert.match(v.title, /does not support adjusting reasoning effort/);
   });
-  const list = { combos: [{ id: 'default', name: '通用' }, { id: 'deep', name: '深度', effort: 'high' }], current: 'deep' };
-  test('组合设了 effort + 模型不支持 → 说明；支持 / 组合没设 effort / 还没连上 → 不说', () => {
-    assert.match(comboEffortNote(list, 'deep', { effort: null }, tt)!, /does not support effort.*\(high\)/);
-    assert.match(comboEffortNote(list, 'deep', {}, tt)!, /high/);
-    assert.equal(comboEffortNote(list, 'deep', { effort: { options: [{ value: 'high' }] } }, tt), null);
-    assert.equal(comboEffortNote(list, 'default', { effort: null }, tt), null);
-    assert.equal(comboEffortNote(list, 'deep', null, tt), null);
-    assert.equal(comboEffortNote(null, 'deep', { effort: null }, tt), null);
-  });
-  test('接线：applyEngineModel 遇到不支持就跳过；换模型后按组合重新对 effort；组合旁边显示说明', () => {
+  test('接线：组合旁边不再有「effort 暂不生效」；换模型后按会话记住的 effort 重对', () => {
     const M = read('main', 'index.ts');
-    const a = M.slice(M.indexOf('async function applyEngineModel('), M.indexOf('async function applyEngineModel(') + 2500);
-    assert.ok(a.indexOf('if (!modelOffersEffort(opts)) {') > 0);
-    assert.ok(a.indexOf('if (!modelOffersEffort(opts)) {') < a.indexOf('await applyComboEffort('), '先判支不支持，再设');
     const s = M.slice(M.indexOf('const setEngineOption = async ('), M.indexOf("ipcMain.handle('acp:set-engine-model'"));
-    assert.match(s, /if \(category === 'model'\) \{[\s\S]*?if \(combo\.effort && modelOffersEffort\(entry\.client\.selectOptions\('thought_level'\)\)\) \{[\s\S]*?applyComboEffort\(/);
-    assert.match(s, /\} catch \(err\) \{\n\s+logger\.warn\('mcp-combo', `换模型后重设组合 effort 失败/, '设不上只记日志，不挡换模型');
+    assert.match(s, /if \(category === 'model'\) \{[\s\S]*?await reconcileEffort\(/);
     const C = read('renderer', 'components', 'ChatArea.tsx');
-    assert.match(C, /const effortNote = comboEffortNote\(mcpCombos, comboView\.value, engineModels, t\);/);
-    assert.match(C, /\{effortNote && \(\n\s+<span className="composer-combo-effort-note" title=\{effortNote\}/);
+    assert.doesNotMatch(C, /comboEffortNote|composer-combo-effort-note/);
   });
 });
 

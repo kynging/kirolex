@@ -88,9 +88,15 @@ suggests running the chat on a remote machine instead.
   **默认模型** (*Default model*) or **连接中…** (*Connecting…*).
 - Changing it takes effect immediately in the same process and is remembered for that chat. The chat
   must be connected.
+- To the left of the model picker is a **推理强度** (*Reasoning effort*) picker. Its levels come from the
+  adapter for the current model (Claude sonnet: default / low / medium / high / xhigh / max; Codex:
+  low / medium / high / xhigh / max). Models without effort levels (such as Claude haiku) show it
+  greyed out with **这个模型不支持调推理强度** (*This model does not support adjusting reasoning effort*).
+  The choice is remembered for that chat. If you switch to a model that does not have the remembered
+  level, the chat falls back to that model's default and says so in the conversation.
 - Next to it is a **MCP 配置 · …** (*MCP profile*) picker. An MCP profile decides which MCP tools
-  the chat gets and how much effort it uses: a named set of MCP servers plus an optional effort
-  level, defined in `~/.kirolex/mcp-combos.json`. The built-in **MCP 配置 · 通用** (*General*) has
+  the chat gets: a named set of MCP servers, defined in `~/.kirolex/mcp-combos.json`. (Older files
+  may still have an `effort` field; it is only used once, as the starting effort of a chat.) The built-in **MCP 配置 · 通用** (*General*) has
   no MCP servers. Changing the MCP profile restarts that chat's engine, so it is disabled while a
   reply is in progress.
 - To edit the MCP profiles, click the engine icon at the bottom-left of the composer. That opens the

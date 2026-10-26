@@ -5,13 +5,13 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   BUILTIN_COMBO, BUILTIN_COMBO_ID, parseMcpCombos, readMcpCombos, saveMcpCombos, mcpCombosPath, pickCombo, findCombo, findGeneralLikeCombo, comboDisplayName,
-  buildAcpMcpServers, expandEnvRefs, maskAcpServers, planComboEffort, applyComboEffort, defaultEffort,
+  buildAcpMcpServers, expandEnvRefs, maskAcpServers, defaultEffort,
 } from '../src/main/mcpCombos.ts';
 
 /**
  * Claude Code / Codex 的「组合」——不同对话挂不同的 MCP（普通对话不挂，投研对话挂妙想）。
  * 守的是：文件的解析和校验（校验不过要给人看得懂的原因）、交给 ACP 的 mcpServers 长什么样、
- * effort 不支持时退回默认而不是报错。
+ * 老文件里的 effort 照样读得进来（只读兼容：会话第一次接上时迁进会话一次，见 tests/engineEffort.test.ts）。
  */
 const sample = [
   {
@@ -220,95 +220,11 @@ describe('ACP mcpServers 生成', () => {
   });
 });
 
-describe('effort：组合设了 effort 时怎么设', () => {
-  const opts = { current: 'medium', options: [{ value: 'low', name: 'Low' }, { value: 'medium', name: 'Medium' }, { value: 'high', name: 'High' }] };
-
-  test('支持 → 设成它', () => {
-    assert.deepEqual(planComboEffort('high', opts), { apply: true });
-  });
-
-  test('当前引擎 / 模型不支持这个值 → 不设（退回默认档位）并给一句提示', () => {
-    const r = planComboEffort('xhigh', opts);
-    assert.equal(r.apply, false);
-    assert.match(r.notice || '', /xhigh/);
-  });
-
-  test('引擎根本没有 effort 选项 → 同样退回并提示，不报错', () => {
-    const r = planComboEffort('high', null);
-    assert.equal(r.apply, false);
-    assert.ok(r.notice);
-  });
-});
-
-/** 假的适配器 effort 清单：记下每次 set，`reject` 里的值 set 时抛错（模拟适配器拒绝） */
-function fakeEffort(current: string, values: string[], reject: string[] = []) {
-  const state = { current, sets: [] as string[] };
-  return {
-    state,
-    io: {
-      options: () => ({ current: state.current, options: values.map((v) => ({ value: v, name: v })) }),
-      set: async (v: string) => {
-        state.sets.push(v);
-        if (reject.includes(v)) throw new Error(`rejected ${v}`);
-        state.current = v;
-      },
-    },
-  };
-}
 const CLAUDE_LEVELS = ['default', 'low', 'medium', 'high', 'xhigh', 'max'];
 const CODEX_LEVELS = ['low', 'medium', 'high', 'xhigh'];
 
-describe('effort：设不上时主动退回默认档位（applyComboEffort）', () => {
-  test('支持 → 设成它，不提示', async () => {
-    const f = fakeEffort('default', CLAUDE_LEVELS);
-    assert.deepEqual(await applyComboEffort('high', '投研', f.io), { value: 'high' });
-    assert.equal(f.state.current, 'high');
-  });
-
-  test('已经是这个值 → 不重复 set', async () => {
-    const f = fakeEffort('high', CLAUDE_LEVELS);
-    assert.deepEqual(await applyComboEffort('high', '投研', f.io), { value: 'high' });
-    assert.deepEqual(f.state.sets, []);
-  });
-
-  test('**加载会话带着旧档位**（上次是 max）+ 组合要的不支持 → 主动设回默认档位，不沿用旧的', async () => {
-    const f = fakeEffort('max', CLAUDE_LEVELS);
-    const r = await applyComboEffort('ultra', '投研', f.io);
-    assert.equal(f.state.current, 'default');
-    assert.equal(r.value, 'default');
-    assert.match(r.notice || '', /ultra/);
-    assert.match(r.notice || '', /已退回默认档位「default」/);
-  });
-
-  test('Codex 没有 default 这一项：退回 medium（它自己的默认）', async () => {
-    const f = fakeEffort('xhigh', CODEX_LEVELS);
-    const r = await applyComboEffort('max', '投研', f.io);
-    assert.equal(f.state.current, 'medium');
-    assert.match(r.notice || '', /medium/);
-  });
-
-  test('**适配器拒绝了 set** → 不报错，退回默认档位，并提示（带上拒绝原因）', async () => {
-    const f = fakeEffort('max', CLAUDE_LEVELS, ['high']);
-    const r = await applyComboEffort('high', '投研', f.io);
-    assert.deepEqual(f.state.sets, ['high', 'default']);
-    assert.equal(f.state.current, 'default');
-    assert.match(r.notice || '', /没设上（rejected high）/);
-    assert.match(r.notice || '', /已退回默认档位「default」/);
-  });
-
-  test('退回默认档位也被拒绝 → 不抛错，说清楚保持当前档位', async () => {
-    const f = fakeEffort('max', CLAUDE_LEVELS, ['high', 'default']);
-    const r = await applyComboEffort('high', '投研', f.io);
-    assert.equal(r.value, undefined);
-    assert.match(r.notice || '', /也没成功/);
-    assert.match(r.notice || '', /保持当前档位「max」/);
-  });
-
-  test('引擎根本没有 effort 选项 → 不抛错，提示一句', async () => {
-    const r = await applyComboEffort('high', '投研', { options: () => null, set: async () => { throw new Error('不该调'); } });
-    assert.match(r.notice || '', /没有可以退回的默认档位/);
-  });
-
+/* effort 不归组合管了（2026-10-26，输入区独立的 effort 下拉）；换模型后记住的档位不支持时退到这个默认值（engineEffort.ts） */
+describe('effort 的默认档位', () => {
   test('defaultEffort：default 优先，其次 medium，都没有就不猜', () => {
     assert.equal(defaultEffort({ current: '', options: CLAUDE_LEVELS.map((v) => ({ value: v, name: v })) }), 'default');
     assert.equal(defaultEffort({ current: '', options: CODEX_LEVELS.map((v) => ({ value: v, name: v })) }), 'medium');
@@ -333,10 +249,10 @@ describe('接线（源码扫描）', () => {
     assert.match(M, /\} else \{\s*\/\*[^*]*「组合」[^*]*\*\/\s*localTools = await ensureLocalTools\(sessionId, profile, resolvedCwd\);/);
   });
 
-  test('effort：连上之后按组合设，不支持就退回并提示', () => {
+  test('effort：组合里老的 effort 只在会话第一次接上时迁进会话，不再按组合设', () => {
     const fn = M.slice(M.indexOf('async function applyEngineModel('), M.indexOf('function wireSession('));
-    assert.match(fn, /applyComboEffort\(combo\.effort, combo\.name, \{/);
-    assert.match(fn, /if \(r\.notice\) sessionNotice\(sessionId, r\.notice\);/);
+    assert.match(fn, /migrateComboEffort\(entry\.profile, engine, combo\.effort\)/);
+    assert.doesNotMatch(fn, /applyComboEffort/);
   });
 
   test('换组合：回复中不拒绝、记成 pending 跑完再换（pendingSwitch.ts），先起新的再断旧的', () => {

@@ -24,7 +24,7 @@
 | F2 | 分叉 / 复制一条 Claude Code 会话，新会话建成了 Kiro 会话 | 有 bug | 中高 | **已修** |
 | F3 | Claude Code / Codex 会话的用量栏永远显示「0.00 credits」（kiro 的计费口径） | 有 bug | 低 | **已修** |
 | 1 | 模型下拉（来自 configOptions）、切换生效、重连保持 | 正常 | — | — |
-| 1b | effort：组合里设了 effort、当前模型不支持（haiku）时，换模型 / 重连不再把它塞过去、不报错，组合旁边说明「暂不生效」 | 有 bug | 低 | **已修**（2026-10-23） |
+| 1b | effort：单独一个下拉（模型下拉左边），选项跟着当前模型；haiku 等不支持的模型下拉禁用并说明；换模型后记住的档位不支持就退到默认并在会话里说一句；MCP 配置不再承载 effort | 有 bug | 低 | **已修**（2026-10-23；2026-10-26 改成独立下拉） |
 | 2 | 权限模式 default / acceptEdits / plan / bypassPermissions 的切换和显示；批准计划后离开 plan，下拉跟着变 | 正常（显示）；离开 plan 不写回偏好 | 低 | 上轮已列入拍板 |
 | 2b | 批准计划时看不到计划正文（权限条只有标题「Approve Plan」）→ 权限卡里渲染计划 Markdown，长了可折叠 | 有 bug | 中 | **已修**（2026-10-23） |
 | 3 | 工具调用标题 / 状态 / locations / 文件链接 | 部分正常 | — | — |
@@ -117,7 +117,17 @@
   `acp-client.ts` `noteConfigOptions`），切换走 `session/set_config_option`，返回的新 `configOptions` 立即生效（实测切到 haiku 后
   `usage_update._meta._claude/model` 就是 haiku）。重连：实测 `session/load` 之后适配器把模型退回 `opus`、模式退回 `default`（附录末尾的 load 结果），
   KiroLex 在 `wireSession` → `applyEngineModel` 里按记录（`profile.engineModels` / `engineOptions`）重新设回去，上一轮 A1 已覆盖新后端会话那条路。
-- **1b 已修（2026-10-23，负责人定：不恢复独立下拉，effort 留在「组合」里）**：
+- **1b 已修（2026-10-26 改口径：effort 单独一个下拉，放在模型下拉左边，不再放在 MCP 配置里）**：
+  - 输入区 Claude Code / Codex 会话：模型下拉**左边**一个 effort 下拉。选项 / 当前值来自适配器 configOptions 里当前模型的 effort 那一项
+    （`src/main/engineEffort.ts` `findEffortOption`：先按 category `thought_level`，再按 id `thought_level` / `effort` / `reasoning_effort`；`AcpClient` 读 / 设都用它）。
+    当前模型没有 effort（haiku）：下拉禁用、悬停「这个模型不支持调推理强度」，不隐藏（`renderer/effortPick.ts` `effortPickerView`）。
+  - 切换走 `session/set_config_option`（和模型同一条 `acp:set-engine-option`，忙时先 pending），记进 `profile.engineOptions[engine].thought_level`，重连 / 换后端由 `applyEngineModel` 设回去。
+  - 换模型后（`reconcileEffort` / `planEffortForModel`）：新模型支持记住的档位 → 设回去；不支持那一档 → 退到新模型的默认值（default / medium，都没有就用适配器报的当前值）、记住它，并在会话里说一句（⚠️ 一句 + 详情里列出可选档位）；
+    新模型根本没有 effort（haiku）→ 不硬设（硬设回 `Internal error`），换模型时说一句，记住的档位留着、换回支持的模型时设回去。
+  - MCP 配置：`McpCombo.effort` 只读兼容 —— 老文件里有的，在会话第一次接上（或新建）时当作初始 effort 一次性迁进会话（`migrateComboEffort`，打 `comboEffortMigrated` 标记），之后不再从组合读；
+    设置页说明 / 插入示例 / 组合下拉旁都不再出现 effort（原来的「effort 暂不生效」小标和 `comboEffortNote`、`applyComboEffort` 已去掉）。
+  - 测试：`tests/engineEffort.test.ts`（Claude sonnet / haiku、Codex 三种 configOptions → 下拉；换模型退默认；迁移一次）、`tests/claudeDesignItems.test.ts`「1b」。
+- 2026-10-23 那一版（负责人当时定：不恢复独立下拉，effort 留在「组合」里；已被上面那条取代）：
   - 实测 effort 跟着模型走：sonnet 上有 `default/low/medium/high/xhigh/max`；**切到 haiku 后适配器的 configOptions 里没有 effort 那一项，硬设回 `Internal error`**。
   - 原来：重连（`applyEngineModel`）时组合要的 effort 在 haiku 上走 `applyComboEffort` 的退回分支，会话里冒一句「没有默认档位可退」；**换模型**（`acp:set-engine-model`）根本不重对 effort，
     换回 sonnet 之后组合的档位就丢了；界面上组合照样显示，看不出 effort 没生效。
@@ -317,7 +327,7 @@ pm-global`）新建 Claude Code 会话，日志停在「本地会话挂上 kirol
 1. ~~工具调用要不要单独列出来（3a、12）~~ → 列：「🔧 用过的工具」，子代理按 Task 归组。**已修**。
 2. ~~Edit diff 怎么显示（3b）~~ → `-` / `+` 按行着色，只对非 kiro。**已修**。
 3. ~~批准计划时显示计划正文（2b）~~ → 权限卡里渲染 Markdown，长了可折叠。**已修**。
-4. ~~effort（1b）~~ → 不恢复独立下拉；不支持时不设、不报错、组合旁边说明。**已修**。
+4. ~~effort（1b）~~ → 2026-10-26 改为单独一个 effort 下拉（模型下拉左边），不再放在 MCP 配置里；不支持的模型下拉禁用并说明。**已修**。
 5. ~~编辑重发对 Claude 后端（10）~~ → 用 `session/fork` 分叉；不支持时退回并说明。**已修**。
 6. ~~`/model`、`/usage` 在 Claude 会话里（7c）~~ → **不做**，保持现状。
 7. ~~用量栏显示 Claude 的花费（F3）~~ → 显示（负责人 2026-10-24）。**已做**，见 F3。

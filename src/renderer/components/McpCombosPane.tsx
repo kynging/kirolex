@@ -122,7 +122,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">
-            {t('A list of MCP profiles: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed; an MCP profile with id default replaces the built-in "General".')}
+            {t('A list of MCP profiles: each has id, name and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ')}{'${env:NAME}'}{t('. The built-in "General" (no MCP) does not need to be listed; an MCP profile with id default replaces the built-in "General".')}
           </div>
           {!!machine?.items.length && (
             <div className="mcp-combos-unavailable" role="status">

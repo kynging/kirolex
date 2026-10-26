@@ -6,7 +6,7 @@
  * 「组合那里明明写的投研，为什么显示是通用」。现在选中一条不可选的提示项，明说找不到、按通用在跑。
  */
 export type ComboListView = {
-  combos: Array<{ id: string; name: string; effort?: string }>;
+  combos: Array<{ id: string; name: string }>;
   current: string;
   missing?: string;
   error?: string;
@@ -69,21 +69,4 @@ export function defaultComboOptions(
     out.push({ value: chosen, label: missingLabel(chosen), selected: true, disabled: true });
   }
   return out;
-}
-
-/**
- * **组合里设了 effort、当前模型却不支持**（审计 1b）：返回组合旁边那句说明；不需要说就是 null。
- * `effort` 是 engine-models 里那一格（适配器 configOptions 的 thought_level；没有这一项 = null）。
- * 连接还没回来（engineModels 还没到）时不说 —— 那时还不知道支不支持。
- */
-export function comboEffortNote(
-  list: ComboListView | null,
-  comboId: string,
-  engineModels: { effort?: { options: unknown[] } | null } | null,
-  t: T,
-): string | null {
-  const effort = list?.combos.find((c) => c.id === comboId)?.effort;
-  if (!effort || !engineModels) return null;
-  if (engineModels.effort && engineModels.effort.options.length > 0) return null;
-  return t('The current model does not support effort, so this MCP profile’s effort ({effort}) is not applied for now', { effort });
 }

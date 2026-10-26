@@ -16,6 +16,7 @@ import { bedrockCheckScript, bedrockRegionOf, localBedrockCheckOutput, codexWebS
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
+import { planEffortForModel, migrateComboEffort } from './engineEffort.ts';
 import { reviseGaveUpNote, reviseGaveUpGroup } from './reviseGiveUp.ts';
 import { pickEngineModel, reshapeProfileForEngine, withEngineModelUsed } from './engineModelPick.ts';
 import {
@@ -152,7 +153,7 @@ import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
-import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, applyComboEffort, modelOffersEffort, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
+import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
 import { resolveCommand, commandMissingReason } from './commandResolve.ts';
 import { comboLocalAvailability, comboForwardStdio, setMachineOverride } from './comboAvailability.ts';
 import {
@@ -7034,15 +7035,15 @@ function engineModelsPayload(sessionId: string, entry: SessionEntry) {
 const DEFAULT_ENGINE_MODE: Partial<Record<'claude' | 'codex', string>> = { claude: 'bypassPermissions' };
 
 /** 这条会话记着的那几个值（模型 / effort / 模式），按"先模型后 effort"的顺序 —— 换模型可能会换掉 effort 的可选值。 */
-function wantedEngineOptions(profile: AgentProfile, comboEffort?: string): Array<[EngineOptionCategory, string]> {
+function wantedEngineOptions(profile: AgentProfile): Array<[EngineOptionCategory, string]> {
   const engine = engineOf(profile);
   if (engine === 'kiro') return [];
   const saved = profile.engineOptions?.[engine] || {};
   const out: Array<[EngineOptionCategory, string]> = [];
   const model = profile.engineModels?.[engine];
   if (model) out.push(['model', model]);
-  /* 所选「组合」设了 effort 就用它；没设才沿用会话记住的（再没有就是引擎默认） */
-  const effort = comboEffort || saved.thought_level;
+  /* 会话记住的 effort（输入区那个下拉选的；老的 MCP 配置里的 effort 已一次性迁进来，`migrateComboEffort`） */
+  const effort = saved.thought_level;
   if (effort) out.push(['thought_level', effort]);
   const mode = saved.mode || DEFAULT_ENGINE_MODE[engine];
   if (mode) out.push(['mode', mode]);
@@ -7066,28 +7067,92 @@ function rememberEngineModelUsed(sessionId: string, entry: SessionEntry, engine:
   } catch (err) { logger.warn('engine-model', `记不住上次成功用的模型 sessionId=${sessionId}`, err); }
 }
 
+/** 这条会话的 effort 记成 `value`（`engineOptions[engine].thought_level`），记录里同一引擎时一起写 */
+function rememberEngineEffort(sessionId: string, entry: SessionEntry, engine: 'claude' | 'codex', value: string): void {
+  if (entry.profile.engineOptions?.[engine]?.thought_level === value) return;
+  entry.profile = withEngineOption(entry.profile, engine, 'thought_level', value);
+  try {
+    const rec = store.readRecord(sessionId);
+    if (rec && engineOf(rec.profile) === engine) {
+      rec.profile = { ...rec.profile, engineOptions: entry.profile.engineOptions };
+      store.writeRecord(rec);
+    }
+  } catch (err) { logger.warn('engine-effort', `记不住 effort sessionId=${sessionId}`, err); }
+}
+
+/**
+ * **模型定下来之后，会话记住的 effort 跟着对一遍**（`planEffortForModel`）—— effort 的可选值跟着模型走。
+ *   · 新模型支持记住的那一档：设回去（适配器换模型 / 重连会带回它自己的默认档位）；
+ *   · 不支持那一档：退到新模型的默认值，记住它，并在会话里说一句（同 modelFallback 那句的写法：⚠️ 一句 + 详情里的可选档位）；
+ *   · 新模型根本不给 effort（haiku）：不设（硬设回 Internal error），记住的那一档留着、换回支持的模型时设回去。
+ *     `announce`（用户刚换了模型）时说一句；重连时不说 —— 输入区那个下拉已经禁用并写着「这个模型不支持调推理强度」。
+ * 失败只记日志 / 说一句，不抛 —— 这一步不能挡住换模型或重连。
+ */
+async function reconcileEffort(sessionId: string, entry: SessionEntry, engine: 'claude' | 'codex', how: { announce: boolean; model?: string }): Promise<void> {
+  const opts = entry.client.selectOptions('thought_level');
+  const plan = planEffortForModel(entry.profile.engineOptions?.[engine]?.thought_level, opts);
+  const model = how.model || entry.client.modelOptions?.current || '';
+  const say = (text: string, group: string) => {
+    if (!noteInSession(sessionId, text, undefined, group)) sessionNotice(sessionId, text, { group });
+  };
+  const set = (v: string) => entry.client.setSelectOption(entry.cliSessionId, 'thought_level', v);
+  if (plan.kind === 'keep') return;
+  if (plan.kind === 'set') {
+    try { await set(plan.value); } catch (err) { logger.warn('engine-effort', `重设 ${ENGINE_LABEL[engine]} effort=${plan.value} 失败 sessionId=${sessionId}`, err); }
+    return;
+  }
+  if (plan.kind === 'unsupported') {
+    logger.info('engine-effort', `${ENGINE_LABEL[engine]} 模型 ${model} 不给 effort：记住的 ${plan.wanted} 暂不设 sessionId=${sessionId}`);
+    if (how.announce) {
+      say(tr('⚠️ {engine} model "{model}" does not support adjusting reasoning effort, so the effort "{wanted}" is not used while on this model; it is set again when you switch back to a model that supports it.', { engine: ENGINE_LABEL[engine], model, wanted: plan.wanted }),
+        `effort-unsupported:${model}`);
+    }
+    return;
+  }
+  let used = plan.value;
+  let failed = '';
+  if (plan.setNeeded) {
+    try { await set(plan.value); } catch (err: any) {
+      failed = String(err?.message || err);
+      used = entry.client.selectOptions('thought_level')?.current || '';
+      logger.warn('engine-effort', `退回 ${ENGINE_LABEL[engine]} effort=${plan.value} 失败 sessionId=${sessionId}`, err);
+    }
+  }
+  logger.info('engine-effort', `${ENGINE_LABEL[engine]} 模型 ${model} 没有 effort ${plan.wanted} -> ${used || '(未变)'} sessionId=${sessionId}`);
+  if (used) rememberEngineEffort(sessionId, entry, engine, used);
+  const head = failed
+    ? tr('⚠️ {engine} model "{model}" has no reasoning effort "{wanted}"; switching to its default "{fallback}" failed ({err}).', { engine: ENGINE_LABEL[engine], model, wanted: plan.wanted, fallback: plan.value, err: failed })
+    : tr('⚠️ {engine} model "{model}" has no reasoning effort "{wanted}", so this session uses its default "{fallback}" instead.', { engine: ENGINE_LABEL[engine], model, wanted: plan.wanted, fallback: plan.value });
+  say(trConcat(head, NOTE_DETAIL_SEP, tr('Effort levels for this model: {list}', { list: trList((opts?.options || []).map((o) => o.value)) })),
+    `effort-fallback:${plan.wanted}→${used}`);
+}
+
 async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise<void> {
   const engine = engineOf(entry.profile);
   if (engine === 'kiro') return;
-  const combo = pickCombo(readMcpCombos(os.homedir()).combos, entry.profile.mcpCombo);
-  for (const [cat, want] of wantedEngineOptions(entry.profile, combo.effort)) {
-    const opts = entry.client.selectOptions(cat);
-    /*
-      组合要的 effort：设不上（不支持 / 适配器拒绝）就**主动退回默认档位**并说一句，不报错 ——
-      重连加载的会话可能带着旧档位回来，光跳过等于沿用它（见 `applyComboEffort`）。
-    */
-    if (cat === 'thought_level' && combo.effort) {
-      /* 当前模型根本不给 effort（实测 haiku）：不设、不在会话里报，界面在组合旁边说（审计 1b，`comboEffortNote`） */
-      if (!modelOffersEffort(opts)) {
-        logger.info('mcp-combo', `组合「${combo.name}」effort=${combo.effort}：当前模型不支持 effort，暂不生效 sessionId=${sessionId}`);
-        continue;
+  /*
+    **MCP 配置里老的 effort 一次性迁进会话**（`migrateComboEffort`）：effort 现在是输入区自己的下拉，组合不再承载它。
+    原地改 entry.profile，而且在第一个 await 之前 —— 好几条重连路紧接着 wireSession 就把 `profile` 整份写回记录，
+    原地改才不会被那一下盖掉；那些不写回的路由下面补写。
+  */
+  if (!entry.profile.comboEffortMigrated) {
+    const combo = pickCombo(readMcpCombos(os.homedir()).combos, entry.profile.mcpCombo);
+    const migrated = migrateComboEffort(entry.profile, engine, combo.effort);
+    Object.assign(entry.profile, migrated);
+    if (combo.effort) logger.info('engine-effort', `MCP 配置「${combo.name}」的 effort=${combo.effort} 迁进会话 -> ${migrated.engineOptions?.[engine]?.thought_level} sessionId=${sessionId}`);
+    try {
+      const rec = store.readRecord(sessionId);
+      if (rec && engineOf(rec.profile) === engine) {
+        rec.profile = { ...rec.profile, comboEffortMigrated: true, ...(migrated.engineOptions ? { engineOptions: migrated.engineOptions } : {}) };
+        store.writeRecord(rec);
       }
-      const r = await applyComboEffort(combo.effort, combo.name, {
-        options: () => entry.client.selectOptions('thought_level'),
-        set: (v) => entry.client.setSelectOption(entry.cliSessionId, 'thought_level', v),
-      });
-      logger.info('mcp-combo', `组合「${combo.name}」effort -> ${r.value || '(未变)'} sessionId=${sessionId}`);
-      if (r.notice) sessionNotice(sessionId, r.notice);
+    } catch (err) { logger.warn('engine-effort', `迁移 MCP 配置里的 effort 没写进记录 sessionId=${sessionId}`, err); }
+  }
+  for (const [cat, want] of wantedEngineOptions(entry.profile)) {
+    const opts = entry.client.selectOptions(cat);
+    /* effort 跟着模型走：模型先设好了，再按新模型的清单对一遍（不支持就退到默认并说一句，`reconcileEffort`） */
+    if (cat === 'thought_level') {
+      await reconcileEffort(sessionId, entry, engine, { announce: false });
       continue;
     }
     /*
@@ -9342,6 +9407,8 @@ ${hint}` : ''}` };
       engine,
       ...(newCombo.mcpCombo ? { mcpCombo: newCombo.mcpCombo } : {}),
     };
+    /* 默认组合在老文件里带着 effort：当作这条新会话的初始 effort 迁进 engineOptions（之后不再从组合读，`migrateComboEffort`） */
+    if (engine !== 'kiro') Object.assign(profile, migrateComboEffort(profile, engine, pickCombo(readMcpCombos(os.homedir()).combos, profile.mcpCombo).effort));
     // Remote sessions run kiro-cli on the remote host, so its working directory
     // must be a REMOTE path, not the local per-session scratch dir.
     /*
@@ -12709,25 +12776,11 @@ ${hint}` : ''}` };
     if (engine === 'kiro') throw new Error(tr('kiro sessions do not go through this path'));
     await entry.client.setSelectOption(entry.cliSessionId, category, value);
     /*
-      **换了模型，组合里的 effort 跟着重新对一遍**（审计 1b）—— 换到不支持 effort 的模型（haiku）时不硬塞、不报错；
-      换回支持的模型时把组合要的档位设回去（适配器换模型会带回它自己的默认档位）。失败只记日志，不挡这次换模型。
+      **换了模型，会话记住的 effort 跟着重新对一遍**（审计 1b）—— 新模型支持就设回去（适配器换模型会带回它自己的默认档位）；
+      不支持那一档就退到新模型的默认值并在会话里说一句；新模型根本不给 effort（haiku）就不硬塞、说一句。不挡这次换模型。
     */
     if (category === 'model') {
-      const combo = pickCombo(readMcpCombos(os.homedir()).combos, entry.profile.mcpCombo);
-      if (combo.effort && modelOffersEffort(entry.client.selectOptions('thought_level'))) {
-        try {
-          const r = await applyComboEffort(combo.effort, combo.name, {
-            options: () => entry.client.selectOptions('thought_level'),
-            set: (v) => entry.client.setSelectOption(entry.cliSessionId, 'thought_level', v),
-          });
-          logger.info('mcp-combo', `换到 ${value}：组合「${combo.name}」effort -> ${r.value || '(未变)'} sessionId=${sessionId}`);
-          if (r.notice) sessionNotice(sessionId, r.notice);
-        } catch (err) {
-          logger.warn('mcp-combo', `换模型后重设组合 effort 失败 sessionId=${sessionId}`, err);
-        }
-      } else if (combo.effort) {
-        logger.info('mcp-combo', `换到 ${value}：当前模型不支持 effort，组合「${combo.name}」的 effort=${combo.effort} 暂不生效 sessionId=${sessionId}`);
-      }
+      await reconcileEffort(sessionId, entry, engine, { announce: true, model: value });
     }
     entry.profile = category === 'model'
       /* 适配器刚接受了它 = 「上次成功用的」（记住的那个以后在别处没有时先退回它，`pickEngineModel`） */
@@ -13142,7 +13195,7 @@ ${hint}` : ''}` };
     const live = sessionId ? sessionClients.get(sessionId) : undefined;
     const picked = (live?.profile || (sessionId ? store.readRecord(sessionId)?.profile : undefined))?.mcpCombo;
     return {
-      combos: combos.map((c) => ({ id: c.id, name: comboDisplayName(c), ...(c.effort ? { effort: c.effort } : {}) })),
+      combos: combos.map((c) => ({ id: c.id, name: comboDisplayName(c) })),
       current: pickCombo(combos, picked).id,
       ...(picked && !findCombo(combos, picked) ? { missing: picked } : {}),
       ...(error ? { error } : {}),
@@ -14637,6 +14690,8 @@ ${hint}` : ''}` };
         ...(existing?.profile.engineOptions ? { engineOptions: existing.profile.engineOptions } : {}),
         /* 同一张白名单：所选「组合」（漏了的话一重启就回到「通用」） */
         ...(existing?.profile.mcpCombo ? { mcpCombo: existing.profile.mcpCombo } : {}),
+        /* 同一张白名单：组合里老的 effort 已迁进 engineOptions（漏了的话下次又从组合读一遍，`migrateComboEffort`） */
+        ...(existing?.profile.comboEffortMigrated ? { comboEffortMigrated: true as const } : {}),
       };
       if (!profile.remote?.sshHost) resolvedCwd = localCwdFor(sessionId, resolvedCwd);
       // For a remote session the executor's working directory is a REMOTE path,

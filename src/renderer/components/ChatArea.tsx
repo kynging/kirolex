@@ -68,7 +68,8 @@ import { browserActionsOf } from '../localBrowserView.ts';
 import { ScrollMemory, PaneScroll, snapshotPosition, planRestore, restoreGate, anchorScrollTop, type AnchorBox, type ScrollMemo } from '../scrollMemory.ts';
 import { visit } from 'unist-util-visit';
 import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, switchFailureNotice, cleanIpcError, type RequestStatusMap, type SwitchWhat } from '../sessionRequestStatus.ts';
-import { comboSelectView, comboEffortNote, type ComboListView } from '../comboPick.ts';
+import { comboSelectView, type ComboListView } from '../comboPick.ts';
+import { effortPickerView } from '../effortPick.ts';
 import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall, toolsSummaryOf } from '../toolRows.ts';
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
@@ -4240,15 +4241,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   /* sessionConnected：新会话的记录（带默认组合）是连上之后才写的，连上时再读一遍 */
   }, [nonKiro, currentSessionId, engine, status, sessionConnected]);
   /*
-    **「组合」下拉**（取代原来的 effort 下拉）——「不同对话挂不同的 MCP」。清单是本机全局的
+    **「组合」下拉**（MCP 配置）——「不同对话挂不同的 MCP」。effort 不归它管，是模型下拉左边那个独立下拉。清单是本机全局的
     `~/.kirolex/mcp-combos.json`（面板里「🧩 组合」那页改），每条会话记自己选的那个；换了要重启执行器（main 做）。
   */
   type McpComboList = ComboListView;
   const [mcpCombos, setMcpCombos] = useState<McpComboList | null>(null);
   /* 记住的组合本机没有时，下拉选中一条明说的提示项（comboPick.ts），不悄悄显示「通用」 */
   const comboView = comboSelectView(mcpCombos, pendingSwitch?.combo, t);
-  /* 组合里设了 effort、当前模型（例如 haiku）不支持：组合旁边说一声，effort 暂不生效（审计 1b） */
-  const effortNote = comboEffortNote(mcpCombos, comboView.value, engineModels, t);
   useEffect(() => {
     setMcpCombos(null);
     if (!nonKiro || !currentSessionId) return;
@@ -5716,15 +5715,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
               <div className="composer-belowbar">
                 <div className="composer-belowbar-left">
-                  {/* 引擎 / 运行位置 / effort 在这一排没有自己的下拉（在侧栏右键菜单里换）：忙时选了就在这里说一声 */}
+                  {/* 引擎 / 运行位置在这一排没有自己的下拉（在侧栏右键菜单里换）：忙时选了就在这里说一声 */}
                   {pendingSwitch?.engine !== undefined && (
                     <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['engine'])} onCancel={() => onCancelPendingSwitch?.('engine')} />
                   )}
                   {pendingSwitch?.remote !== undefined && (
                     <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['remote'])} onCancel={() => onCancelPendingSwitch?.('remote')} />
-                  )}
-                  {pendingSwitch?.engineEffort !== undefined && (
-                    <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['engineEffort'])} onCancel={() => onCancelPendingSwitch?.('engineEffort')} />
                   )}
 
                   {/* kiro 的 agent 只对 Kiro 会话有意义；Claude Code / Codex 会话在这儿显示引擎名 */}
@@ -5745,7 +5741,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         <EngineIcon engine={engine} size={15} />
                       </button>
                       {/*
-                        **组合** —— 取代原来的 effort 下拉：组合里带着 MCP 和 effort（「不同对话挂不同的 MCP」）。
+                        **组合**（MCP 配置）—— 这条会话挂哪些 MCP（「不同对话挂不同的 MCP」）。effort 是模型下拉左边那个独立下拉，不在组合里。
                         换组合会重启这条会话的执行器，所以回复中不让换。
                       */}
                       <select
@@ -5759,7 +5755,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           ? comboView.missing.label
                           : mcpCombos?.error
                             ? t('The MCP profile file has an error: {error}', { error: mcpCombos.error })
-                            : t("{engine} MCP profile: which MCP tools this chat gets and how much effort it uses. Switching restarts this chat's executor", { engine: engineLabel })}
+                            : t("{engine} MCP profile: which MCP tools this chat gets. Switching restarts this chat's executor", { engine: engineLabel })}
                         aria-label={t('MCP profile')}
                       >
                         {comboView.missing && <option value={comboView.missing.id} disabled>{comboView.missing.label}</option>}
@@ -5768,11 +5764,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           <option key={c.id} value={c.id}>{t('MCP profile · {name}', { name: c.name })}</option>
                         ))}
                       </select>
-                      {effortNote && (
-                        <span className="composer-combo-effort-note" title={effortNote} role="note">
-                          {t('effort not applied')}
-                        </span>
-                      )}
                       {pendingSwitch?.combo !== undefined && <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['combo'])} onCancel={() => onCancelPendingSwitch?.('combo')} />}
                     </div>
                   ) : (
@@ -5965,6 +5956,34 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                         <option value={selectedModel || 'auto'}>{selectedModel || 'auto'}</option>
                       )}
                     </select>
+                  )}
+                  {/*
+                    **effort（推理强度）下拉，在模型下拉左边**（用户 2026-10-26：「不再放到 MCP 配置里面」）。清单 / 当前值是适配器
+                    configOptions 里当前模型的 effort 那一项（main 的 `engineEffort.ts`）；当前模型没有（haiku）就禁用并说不支持，不隐藏 —— 免得模型下拉跳。
+                    切换和模型同一条路（`session/set_config_option`，忙时先 pending）。
+                  */}
+                  {nonKiro && (() => {
+                    const ev = effortPickerView(engineModels ? (engineModels.effort ?? null) : undefined, {
+                      connected: status === 'connected' && !!currentSessionId,
+                      busy: engineModelBusy,
+                      pending: pendingSwitch?.engineEffort,
+                    }, t);
+                    return (
+                      <select
+                        className="composer-select composer-effort-select"
+                        data-unsupported={ev.unsupported ? '1' : undefined}
+                        value={ev.value}
+                        onChange={(event) => void onEngineOptionChange('thought_level', event.target.value)}
+                        disabled={ev.disabled}
+                        title={ev.title}
+                        aria-label={t('Reasoning effort')}
+                      >
+                        {ev.options.map((o) => <option key={o.value} value={o.value} disabled={o.disabled}>{o.name}</option>)}
+                      </select>
+                    );
+                  })()}
+                  {nonKiro && pendingSwitch?.engineEffort !== undefined && (
+                    <PendingSwitchBadge target={pendingTargetForPeople(pendingSwitch, ['engineEffort'])} onCancel={() => onCancelPendingSwitch?.('engineEffort')} />
                   )}
                   {nonKiro && (
                     <select
@@ -6301,7 +6320,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </div>
             <div className="kiro-config-tabs" role="tablist">
               {/* 「MCP 配置」光看名字不一定懂：标题旁带一句它管什么 */}
-              {[{ id: 'login', label: t('🔑 Login') }, { id: 'mcp-combos', label: t('🧩 MCP profiles'), tabHint: t('Which MCP tools this chat gets, and how much effort it uses') }, ...engineConfigCats].map((c: { id: string; label: string; tabHint?: string }) => (
+              {[{ id: 'login', label: t('🔑 Login') }, { id: 'mcp-combos', label: t('🧩 MCP profiles'), tabHint: t('Which MCP tools this chat gets') }, ...engineConfigCats].map((c: { id: string; label: string; tabHint?: string }) => (
                 <button
                   key={c.id}
                   role="tab"

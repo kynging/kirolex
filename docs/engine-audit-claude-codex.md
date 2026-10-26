@@ -109,7 +109,7 @@ Windows 上 `resolveAdapter` 找不到包时给的是能照着做的那句。
 **已查，无问题**：
 - 本机 Claude/Codex：`withLocalBrowser` / `ensureLocalTools` 把 `kirolex-local`（`bg_*` / `watch` / `schedule_*` 唤醒工具 + 浏览器工具）作为 ACP `mcpServers` 交给 `session/new` 和 `session/load`（`acp-client.ts` 的 `mcpServers` getter；`tests/engines.test.ts` 守着两处都带），`bg_run` 的 cwd 按会话的 `localDir`。
 - 远程 Claude/Codex：不写 kiro 的 agent JSON，`kirolex-local` 走反向隧道 URL，转发的本机 MCP 经 `remoteComboMcpServers` 一起交给适配器；格式符合 ACP（http：`{type,name,url,headers:[{name,value}]}`，stdio：`{name,command,args,env:[{name,value}]}`）。
-- 组合（mcpCombos）只作用于非 kiro（`setDormantProfile` 的 notKiro 判断）；组合里的 effort 经 `applyComboEffort` 设，设不上会退回默认并说一句。
+- 组合（mcpCombos）只作用于非 kiro（`setDormantProfile` 的 notKiro 判断）；effort 不归组合管了（2026-10-26：输入区独立的 effort 下拉，`engineEffort.ts`），组合里老的 effort 只在会话第一次接上时迁进会话一次。
 - 记忆注入：`buildMemoryInjection` 每一轮都拼，和引擎无关；远程会话的记忆块写的是「用 `local_write` 写」（记忆文件在本机）。
 - 远程写文件闸 `remoteWriteGuard` 对非 kiro 远程会话同样接上（权限那一层拒 + 不来问的模式事后认出来给「复制到本机」）。
 

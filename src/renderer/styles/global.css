@@ -9333,8 +9333,8 @@ button, input, select, textarea {
 .composer-mode-select option.perm-caution { color: var(--perm-caution); }
 .composer-mode-select option.perm-safe { color: var(--perm-safe); }
 .composer-mode-select option.perm-neutral { color: var(--perm-neutral); }
-/* 原来显示引擎名的那一格，现在是 effort */
-.composer-effort-select { max-width: 120px; }
+/* 原来显示引擎名的那一格，现在是 effort（模型下拉左边；「推理强度：Medium」要放得下） */
+.composer-effort-select { max-width: 160px; }
 .composer-combo-select { max-width: 140px; }
 /* 记住的组合本机没有：提示项要整句看得见（comboPick.ts），用和「需要注意」同一种琥珀色 */
 .composer-combo-select[data-missing] { max-width: 360px; color: #d9a441; border-color: rgba(217, 164, 65, 0.6); }
@@ -10007,11 +10007,8 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .agent-profile-area { flex: 0 0 92px; color: var(--text-muted); font-size: 11px; }
 .agent-profile-text { min-width: 0; word-break: break-all; font-family: var(--mono-font); }
 
-/* 组合里设了 effort、当前模型不支持（审计 1b）：组合下拉旁边的一小句 */
-.composer-combo-effort-note {
-  flex: none; font-size: 11px; color: var(--warning); white-space: nowrap; cursor: help;
-  border: 1px dashed color-mix(in srgb, var(--warning) 55%, transparent); border-radius: 5px; padding: 0 5px;
-}
+/* 输入区 effort（推理强度）下拉：当前模型不支持（haiku）时禁用、照样占位（不跳布局），悬停看原因 */
+.composer-effort-select[data-unsupported] { cursor: help; }
 /* 三个引擎在那台机器上能不能用（新建会话框 / 设置 → 机器 → 本机，EngineStatusPanel） */
 .engine-status-panel {
   margin: 4px 0 12px; padding: 8px 10px; border: 1px solid var(--border); border-radius: 8px;

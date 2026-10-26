@@ -57,10 +57,11 @@ describe('文案：不再叫「组合」/ combo', () => {
 describe('配置面板第一个 tab：标题旁一句 hint', () => {
   const C = read('src/renderer/components/ChatArea.tsx');
   test('hint 文案', () => {
-    assert.equal(t('zh', 'Which MCP tools this chat gets, and how much effort it uses'), '这条会话挂哪些 MCP 工具、用多高的 effort');
+    /* effort 不归 MCP 配置管了（2026-10-26，独立的 effort 下拉），hint 里不再提它 */
+    assert.equal(t('zh', 'Which MCP tools this chat gets'), '这条会话挂哪些 MCP 工具');
   });
   test('接线：mcp-combos 那个 tab 用新标题并带上 hint', () => {
-    assert.match(C, /\{ id: 'mcp-combos', label: t\('🧩 MCP profiles'\), tabHint: t\('Which MCP tools this chat gets, and how much effort it uses'\) \}/);
+    assert.match(C, /\{ id: 'mcp-combos', label: t\('🧩 MCP profiles'\), tabHint: t\('Which MCP tools this chat gets'\) \}/);
     assert.match(C, /<span className="kiro-config-tab-hint">\{c\.tabHint\}<\/span>/);
   });
   test('只有这个 tab 带 hint：别的类别自己的 hint（面板里的说明）不挤到 tab 上', () => {

@@ -184,7 +184,7 @@ export const ZH_CHAT: Record<string, string> = {
   'MCP profile "{id}" does not exist on this machine; new sessions use General': 'MCP 配置「{id}」在本机不存在，新会话按通用',
   'MCP profile "{id}" could not be read (the MCP profile file has an error); new sessions use General': 'MCP 配置「{id}」读不到（MCP 配置文件有错），新会话按通用',
   'Follow global ({name})': '跟随全局（{name}）',
-  "{engine} MCP profile: which MCP tools this chat gets and how much effort it uses. Switching restarts this chat's executor": '{engine} 的 MCP 配置：这条会话挂哪些 MCP 工具、用多高的 effort —— 换了会重启这条会话的执行器',
+  "{engine} MCP profile: which MCP tools this chat gets. Switching restarts this chat's executor": '{engine} 的 MCP 配置：这条会话挂哪些 MCP 工具 —— 换了会重启这条会话的执行器',
   'MCP profile': 'MCP 配置',
   'General purpose': '通用',
   'MCP profile · {name}': 'MCP 配置 · {name}',
@@ -217,7 +217,7 @@ export const ZH_CHAT: Record<string, string> = {
   '{engine} config': '{engine} 配置',
   '🔑 Login': '🔑 登录',
   '🧩 MCP profiles': '🧩 MCP 配置',
-  'Which MCP tools this chat gets, and how much effort it uses': '这条会话挂哪些 MCP 工具、用多高的 effort',
+  'Which MCP tools this chat gets': '这条会话挂哪些 MCP 工具',
   // ── components/ChatArea.tsx (round 2: English literals) ──
   "Estimated from the visible question and answer; the engine does not report exact per-turn token counts.": "按可见的提问和回答估算；引擎不提供每一轮的精确 token 数。",
   "Copied!": "已复制！",
@@ -344,8 +344,13 @@ export const ZH_CHAT: Record<string, string> = {
   "new file": "新文件",
   'Collapse the plan': '收起计划',
   'Show the whole plan': '展开整份计划',
-  'effort not applied': 'effort 暂不生效',
-  'The current model does not support effort, so this MCP profile’s effort ({effort}) is not applied for now': '当前模型不支持 effort，MCP 配置里的 effort（{effort}）暂不生效',
+  // ── effortPick.ts（输入区 effort 下拉，模型下拉左边）──
+  'Effort: n/a': '推理强度：—',
+  'Effort: …': '推理强度：…',
+  'Effort: {level}': '推理强度：{level}',
+  'Reasoning effort': '推理强度',
+  'Reasoning effort (this model)': '推理强度（当前模型）',
+  'This model does not support adjusting reasoning effort': '这个模型不支持调推理强度',
   // ── QuestionCard.tsx（模型向你提问 / 让你选）──
   'Plan': 'Plan',
   'Plan mode': 'Plan 模式',

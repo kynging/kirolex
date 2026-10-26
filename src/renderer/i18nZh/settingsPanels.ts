@@ -342,8 +342,8 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.': '还没保存：文件还不存在，上面只是样板，点「保存」才会建出来。',
   'Validation failed': '校验没通过',
   'Shared by all sessions; with S3 sync on, also synced to your other computers': '所有会话共用；开了 S3 同步时也同步到你的其他电脑',
-  'A list of MCP profiles: each has id, name, an optional effort (such as high) and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ':
-    'MCP 配置列表：每个 MCP 配置有 id、name、可选 effort（如 high）和 mcpServers。http 型写 url / headers（可选 timeoutSec），stdio 型写 command / args / env；可选 disabled、forwardFromLocal。headers 和 env 的值可以用 ',
+  'A list of MCP profiles: each has id, name and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ':
+    'MCP 配置列表：每个 MCP 配置有 id、name 和 mcpServers。http 型写 url / headers（可选 timeoutSec），stdio 型写 command / args / env；可选 disabled、forwardFromLocal。headers 和 env 的值可以用 ',
   '. The built-in "General" (no MCP) does not need to be listed; an MCP profile with id default replaces the built-in "General".': ' 引用本机环境变量。内置「通用」（不挂 MCP）不用写；写 id default 就是替换内置的通用。',
   'No custom MCP profiles yet: right now there is only the built-in "General" (no MCP). mcp-combos.json does not exist.': '还没有自定义 MCP 配置：现在只有内置的「通用」（不挂 MCP），mcp-combos.json 还不存在。',
   'Insert example puts an example in the editor (a "General" MCP profile with local tools using forwardFromLocal, plus a "Research" MCP profile); writing id default replaces the built-in "General". Edit it, then Save to create the file.': '「插入示例」会把一份示例放进编辑框（一条用 forwardFromLocal 带上本机工具的「通用」，一条「投研」）；写 id default 就是替换内置的通用。改好后点「保存」才会建出文件。',

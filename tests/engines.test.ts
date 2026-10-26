@@ -153,8 +153,9 @@ describe('Claude Code / Codex：effort 和权限模式', () => {
   test('引擎名那一格换成 effort；顶上 Auto/Ask 换成它们自己的 mode（Claude 默认 bypass）', () => {
     const ca = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.doesNotMatch(ca, /className="composer-engine"/, '「改成 effort 吧」');
-    /* effort 下拉后来换成了「组合」下拉（组合里带 effort，见 mcpCombos.test.ts） */
+    /* 「组合」（MCP 配置）下拉还在；effort 是模型下拉左边单独一个下拉（2026-10-26，见 engineEffort.test.ts） */
     assert.match(ca, /onMcpComboChange\(event\.target\.value\)/);
+    assert.match(ca, /onEngineOptionChange\('thought_level', event\.target\.value\)/);
     assert.match(ca, /engineMode=\{nonKiro \? \{/);
     assert.match(ca, /\{engineMode \? \(\s*<select/);
     const M = read('src', 'main', 'index.ts');

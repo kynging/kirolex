@@ -107,7 +107,7 @@ export interface AgentProfile {
   /** 上面那个上次**真设上了**的值（适配器接受了）—— 记住的那个在这台机器的适配器清单里没有时，先退回它
    *  （`engineModelPick.ts` `pickEngineModel`）。只记本引擎清单里的值，不碰 kiro 的 `model` / `preferredModel`。 */
   engineModelsUsed?: { claude?: string; codex?: string };
-  /** 同上，effort（`thought_level`）和权限模式（`mode`）—— 顶上那颗按钮在这两家就是 mode 下拉。 */
+  /** 同上，effort（`thought_level`，输入区模型下拉左边那个）和权限模式（`mode`）—— 顶上那颗按钮在这两家就是 mode 下拉。 */
   engineOptions?: {
     claude?: { thought_level?: string; mode?: string };
     /** `collaboration_mode`：Codex 的 default / plan（Plan 模式下它才能用 request_user_input 向你提问） */
@@ -115,6 +115,8 @@ export interface AgentProfile {
   };
   /** Claude Code / Codex 会话选的「组合」id（`~/.kirolex/mcp-combos.json`，见 `mcpCombos.ts`）。没有 = 内置「通用」。 */
   mcpCombo?: string;
+  /** MCP 配置（组合）里老的 `effort` 已经一次性迁进 `engineOptions` 了：之后不再从组合读 effort（`engineEffort.ts` `migrateComboEffort`） */
+  comboEffortMigrated?: boolean;
 
   /**
    * Project identity for the layered memory store. WRITE-ONCE:

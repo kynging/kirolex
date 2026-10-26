@@ -13,6 +13,7 @@ import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
 import { isSshTransportExit, sshDropMessage } from './transientError.ts';
 import { tr, trConcat } from './uiText.ts';
 import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
+import { findEffortOption } from './engineEffort.ts';
 import { CLIENT_CAPABILITIES } from './elicitation.ts';
 import { busyEnterMode, isMethodNotFound, steeringParams, steeringVerdict, withoutSteering, type BusyEnterMode } from './busyEnterCaps.ts';
 import { sshErrorKind, sessionsFullMessage } from './sshMux.ts';
@@ -695,6 +696,8 @@ export class AcpClient extends EventEmitter {
     return this.setSelectOption(sessionId, 'model', value);
   }
   private findOption(category: EngineOptionCategory): any {
+    /* effort 两家的 id / category 写法不一样，认法统一在 `engineEffort.ts`（输入区 effort 下拉读 / 设的就是这一项） */
+    if (category === 'thought_level') return findEffortOption(this.configOptions);
     return this.configOptions.find((x) => x?.category === category) || this.configOptions.find((x) => x?.id === category);
   }
 

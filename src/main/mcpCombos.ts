@@ -9,7 +9,7 @@
  *
  * ```json
  * [
- *   { "id": "research", "name": "投研", "effort": "high",
+ *   { "id": "research", "name": "投研",
  *     "mcpServers": {
  *       "miaoxiang": { "url": "https://…", "headers": { "Authorization": "Bearer ${env:MX_KEY}" } },
  *       "local": { "command": "node", "args": ["srv.js"], "env": { "TOKEN": "${env:TOKEN}" } }
@@ -17,7 +17,9 @@
  * ]
  * ```
  *
- * 内置一个「通用」（id `default`，没有 MCP、不设 effort）永远排第一；文件不存在时就只有它。
+ * 内置一个「通用」（id `default`，没有 MCP）永远排第一；文件不存在时就只有它。
+ * effort 不归组合管了：它是输入区模型下拉左边那个独立下拉，按会话记（`engineEffort.ts`）。老文件里的 `effort` 照样读得进来，
+ * 只在每条会话第一次接上时当作初始 effort 迁进会话一次（`migrateComboEffort`），之后不再从组合读。
  * 文件里写了 `id: "default"` 的条目就用它**取代**内置那条（同样排第一）；没写 default、但恰好有一条照「插入示例」
  * 建的自建通用（`findGeneralLikeCombo`）时，也让它顶替内置那条 —— 下拉里只留一条通用（见 `parseMcpCombos`）。
  * 这个模块不碰 electron，路径作为参数传入（测试用临时目录）。
@@ -99,7 +101,10 @@ export function localizeCombo<T extends { mcpServers: Record<string, McpComboSer
 export interface McpCombo {
   id: string;
   name: string;
-  /** 对应 ACP `thought_level` 的值；不写 = 沿用会话记住的 / 引擎默认 */
+  /**
+   * **老字段，只读兼容**：对应 ACP `thought_level` 的值。现在只在会话第一次接上时当作初始 effort 迁进会话一次
+   * （`engineEffort.ts` `migrateComboEffort`）；设置页 / 插入示例里不再出现它。
+   */
   effort?: string;
   mcpServers: Record<string, McpComboServer>;
   /**
@@ -141,7 +146,6 @@ export const MCP_COMBOS_TEMPLATE = `[
   {
     "id": "research",
     "name": "投研",
-    "effort": "high",
     "mcpServers": {
       "miaoxiang": {
         "url": "https://example.com/mcp",
@@ -419,78 +423,5 @@ export function maskAcpServers(servers: AcpMcpServer[]): unknown[] {
   return servers.map((s) => ('headers' in s ? { ...s, headers: mask(s.headers) } : { ...s, env: mask(s.env) }));
 }
 
-/**
- * 组合要的 effort 能不能设：当前引擎 / 模型的 `thought_level` 清单里有它就设；
- * 没有（或者引擎根本不给 effort 选项）就**不设**（退回默认档位），给一句提示 —— 不报错、不阻断。
- */
-export function planComboEffort(
-  want: string,
-  opts: { current: string; options: Array<{ value: string; name: string }> } | null,
-  comboName = '',
-): { apply: boolean; notice?: string } {
-  if (opts && opts.options.some((o) => o.value === want)) return { apply: true };
-  const who = comboName ? tr('MCP profile "{name}"', { name: comboName }) : tr('The MCP profile');
-  const avail = opts?.options.length
-    ? tr(' (options: {list})', { list: opts.options.map((o) => o.value).join(' / ') })
-    : tr(' (this engine offers no effort options)');
-  return { apply: false, notice: tr('⚠️ {who} wants effort "{want}", which the current engine / model does not support{avail}', { who, want, avail }) };
-}
-
-type EffortSelect = { current: string; options: Array<{ value: string; name: string }> } | null;
-
-/**
- * 「默认档位」是哪个：Claude Code 的清单里有一项 `default`；Codex 没有这一项，它自己的默认是 `medium`。
- * 两个都没有就是 undefined（不猜，保持当前档位并说出来）。
- */
-export function defaultEffort(opts: EffortSelect): string | undefined {
-  if (!opts) return undefined;
-  return ['default', 'medium'].find((v) => opts.options.some((o) => o.value === v));
-}
-
-/**
- * **把组合要的 effort 设上；设不上就主动退回默认档位** —— 光"跳过不设"不够：重连加载已有会话（session/load）时
- * 适配器可能带着上一次的档位回来（比如上个组合的 high），跳过就等于沿用了它。
- *
- * 两种设不上：清单里没有这个值（不支持）、适配器拒绝了 set。两种都退回 `defaultEffort`，并返回一句给会话的提示。
- * 不抛错 —— 这一步永远不该阻断会话。`io.options()` 每次重读：set 之后可选值可能变。
- */
-export async function applyComboEffort(
-  want: string,
-  comboName: string,
-  io: { options: () => EffortSelect; set: (value: string) => Promise<void> },
-): Promise<{ value?: string; notice?: string }> {
-  const plan = planComboEffort(want, io.options(), comboName);
-  let base = plan.notice || '';
-  if (plan.apply) {
-    if (io.options()?.current === want) return { value: want };
-    try { await io.set(want); return { value: want }; } catch (err: any) {
-      base = tr('⚠️ Could not set effort "{want}" for MCP profile "{name}" ({err})', { want, name: comboName, err: String(err?.message || err) });
-    }
-  }
-  const now = io.options();
-  const fb = defaultEffort(now);
-  const cur = now?.current || '';
-  if (!fb) {
-    return { notice: cur
-      ? tr('{base}; this engine has no default level to fall back to, keeping the current level "{cur}".', { base, cur })
-      : tr('{base}; this engine has no default level to fall back to, keeping the current level.', { base }) };
-  }
-  if (now?.current === fb) return { value: fb, notice: tr('{base}; using the default level "{fb}".', { base, fb }) };
-  try {
-    await io.set(fb);
-    return { value: fb, notice: tr('{base}; fell back to the default level "{fb}".', { base, fb }) };
-  } catch (err: any) {
-    const e = String(err?.message || err);
-    return { notice: cur
-      ? tr('{base}; falling back to the default level "{fb}" also failed ({err}), keeping the current level "{cur}".', { base, fb, err: e, cur })
-      : tr('{base}; falling back to the default level "{fb}" also failed ({err}), keeping the current level.', { base, fb, err: e }) };
-  }
-}
-
-/**
- * **当前模型给不给 effort**（审计 1b）—— 实测 Claude Code 切到 haiku 后 configOptions 里根本没有 effort 那一项，
- * 硬设会回 `Internal error`。组合里的 effort 这时**不设、不报错**，界面在组合旁边说一声（`renderer/comboPick.comboEffortNote`）。
- */
-export function modelOffersEffort(opts: EffortSelect): boolean {
-  return !!opts && opts.options.length > 0;
-}
+/* 「默认档位」挪到了 engineEffort.ts（effort 不归组合管了）；这里转出去，老的 import 照旧能用 */
+export { defaultEffort } from './engineEffort.ts';
