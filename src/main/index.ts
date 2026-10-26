@@ -103,7 +103,7 @@ import { createControlServer, type ControlServer, type ControlSessionAccess, typ
 import { controlMessageId, isControlMessageId, isSessionMessageId, tailEntries, type MarkOrigin } from './controlSessions.ts';
 import { PairRateLimiter, ReplyWatcher, callSessionTool, type ReplyWatch, type SessionCallsHost, type SessionInfo } from './sessionCalls.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
-import { settleInFlightAttach } from './attachGate.ts';
+import { SessionMountLock, mountDrift, adoptRecordFields, MountDriftError } from './attachGate.ts';
 import { trackReplySegments, type ReplySegments } from './replySegments.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
 import { createCreationGate } from './creationGate.ts';
@@ -2243,10 +2243,16 @@ function reconnectForwardNow(sessionId: string, name: string, lt: LocalToolsSpec
   logger.info('localmcp', `转发 MCP「${name}」后来就绪了，重连执行器把它挂上 sessionId=${sessionId}`);
   sessionNotice(sessionId, forwardReadyReconnectNotice(name), { group: `forward-mcp-ready:${name}` });
   localMcpServer?.parkProxies(sessionId);
-  void detachExecutor(sessionId).finally(() => {
+  /*
+    整段登记进挂载锁：detach 完到断线恢复那一轮挂上之前，这条会话不在 `sessionClients` 里 ——
+    这时来的冷切换要等它，不然切换和 detach 交错着改记录。之后断线恢复那一轮只是排着定时器：
+    到点时按**当时的记录**起（断线恢复 → ensureAttached → loadSessionImpl 开头读记录，落定前再对一遍），
+    不沿用旧执行器的参数；它真跑起来以后由 `remoteRecovery.inFlight` 接着算进锁里。
+  */
+  void mountLock.hold(sessionId, detachExecutor(sessionId).finally(() => {
     toollessSessions.delete(sessionId);
     startRemoteRecovery(sessionId, { quiet: true });
-  });
+  })).catch(() => {});
 }
 
 type ForwardNotReady = { name: string; reason: string; starting: boolean; missing?: string };
@@ -3749,6 +3755,14 @@ const remoteRecovery = new RemoteRecovery<{ key: string; remote: RemoteTarget }>
 function startRemoteRecovery(sessionId: string, opts: { quiet?: boolean } = {}): void {
   remoteRecovery.start(sessionId, opts);
 }
+/**
+ * **这条会话的挂载锁**（`attachGate.ts`）：attach 在飞、断线恢复正在跑的那一轮、MCP 晚就绪的重连（`reconnectForwardNow` 里 hold）。
+ * 冷切换（引擎 / 运行位置 / 组合 / 模型）先等它落定，再判断走「已连着」还是「未连接」。
+ */
+const mountLock = new SessionMountLock([
+  (sid) => attachInFlight.get(sid),
+  (sid) => remoteRecovery.inFlight(sid),
+]);
 /** 「这个平台不支持复用」只说一次 —— 每条会话都说一遍就是噪音。 */
 let muxWarned = false;
 /* 每条 ssh 都先问一句"这台机器有没有现成的连接" —— 有就当 channel 走，没有照旧建新的 */
@@ -12474,8 +12488,8 @@ ${hint}` : ''}` };
     localDir?: string,
     hint?: ColdRecordHint,
   ): Promise<{ ok: boolean; unchanged?: boolean; remoteHost?: string | null; cold?: boolean }> => {
-    /* 先等在飞的 attach 落定：它按旧记录在本机起，不等的话徽标是远端、执行器是本机（见 attachGate.ts） */
-    await settleInFlightAttach(attachInFlight, sessionId);
+    /* 先等这条会话的挂载落定（attach 在飞 / 断线恢复那一轮 / MCP 晚就绪重连）：它按旧记录起，不等的话徽标是远端、执行器是本机（见 attachGate.ts） */
+    await mountLock.settle(sessionId);
     const oldEntry = sessionClients.get(sessionId);
     /*
       **右键菜单优先于正在跑的任务** ——「这些右键菜单应该优先级大于正在跑的任务」。
@@ -12751,6 +12765,8 @@ ${hint}` : ''}` };
 
   const switchModelImpl = async (sessionId: string, model: string, fromPending?: boolean): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-model'); if (advRefused) throw new Error(advRefused); }
+    /* 同换引擎：先等挂载锁，再判断连没连着 */
+    await mountLock.settle(sessionId);
     const oldEntry = sessionClients.get(sessionId);
     /* 模型下拉是 kiro 的清单；Claude Code / Codex 用它们自己 CLI 配的模型（界面上也不显示这个下拉） */
     const notKiroModel = (p: AgentProfile) => tr('The model of a {engine} session is configured in its own CLI; it cannot be switched here yet.', { engine: ENGINE_LABEL[engineOf(p)] });
@@ -13003,6 +13019,8 @@ ${hint}` : ''}` };
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-engine'); if (advRefused) throw new Error(advRefused); }
     const engine = engineOf({ engine: engineArg });
     const label = ENGINE_LABEL[engine];
+    /* 先等挂载锁（自动重连 / attach 在飞）：它手里是旧 profile，不等的话这里走「未连接」只改记录，它挂上后又是旧引擎（见 attachGate.ts） */
+    await mountLock.settle(sessionId);
     const oldEntry = sessionClients.get(sessionId);
     /* 这一轮还在跑：记下来，跑完再换（选回原来的引擎也照记 —— 它会顶掉之前记下的那一次） */
     { const queued = queueSwitchWhileBusy(sessionId, 'engine', { engine, hint }, label, fromPending); if (queued) return { ...queued, engine }; }
@@ -13080,6 +13098,16 @@ ${hint}` : ''}` };
       if (client) { try { await client.disconnect(); } catch {} }
       modelFallback.discard(sessionId);   // 没换成：连上时记下的那句作废
       logger.warn('engine', `切换引擎失败 sessionId=${sessionId} ${ENGINE_LABEL[before]} -> ${label}`, err);
+      /*
+        没换成：界面回到实际在跑的引擎（侧栏 tag、模型下拉都跟 engine-changed 走），会话里说一句为什么。
+        忙时记下的那一批（fromPending）失败由 applyPendingSwitchBatch 统一说，这里不重复。
+      */
+      mainWindow?.webContents.send('session:engine-changed', { sessionId, engine: before });
+      if (!fromPending) {
+        sessionNotice(sessionId, tr('⚠️ Could not switch this session to {engine} ({reason}); it still runs on {current}.', {
+          engine: label, reason: String((err as any)?.message || err), current: ENGINE_LABEL[before],
+        }));
+      }
       throw err;
     } finally {
       reconfiguringSessions.delete(sessionId);
@@ -13195,6 +13223,8 @@ ${hint}` : ''}` };
     if (!combo) throw new Error(tr('MCP profile "{id}" not found (did the MCP profile file change? Reopen the dropdown and check).', { id: comboId }));
     const nextCombo = combo.id === BUILTIN_COMBO_ID ? undefined : combo.id;
     const onlyEngines = tr('MCP profiles only apply to Claude Code / Codex sessions.');
+    /* 同换引擎：先等挂载锁，再判断连没连着 */
+    await mountLock.settle(sessionId);
     const oldEntry = sessionClients.get(sessionId);
     /* 忙、或者上一批 pending 正在应用（那次重连会先把执行器拿掉）：先登记，别掉进下面"没连着只写记录"那条路 ——
        那样写下的记录会被正在进行的那次重连用旧 profile 盖掉。登记的这一次在那一批落定后接着应用。
@@ -14529,10 +14559,12 @@ ${hint}` : ''}` };
     // faster than serialising behind it.
     const inFlight = attachInFlight.get(sessionId);
     if (inFlight) return inFlight;
-    const attachPromise = (async () => {
+    const attachOnce = async () => {
     attachingSessions.add(sessionId);
     emitSessionBusy(sessionId);
     try {
+    /* 重起的那一次（MountDriftError）按新记录的目录来：换机器时冷路径会改 localDir */
+    resolvedCwd = store.readRecord(sessionId)?.localDir || askedCwd;
     let entry = sessionClients.get(sessionId);
     let freshBackendResult = false;
     if (!entry) {
@@ -14723,6 +14755,26 @@ ${hint}` : ''}` };
         try { await client.disconnect(); } catch {}
         throw new Error(tr('Session was deleted during attach; aborted.'));
       }
+      /*
+        **落定前按记录再对一遍**（`mountDrift`，attachGate.ts）——「我都切到 claude code 了右侧的模型列表也没变」：
+        这次挂载开头读的记录（`existing`）是几秒到几十秒之前的；这期间用户冷切了引擎 / 机器 / 组合 / kiro 模型的话，
+        这个执行器就不是记录要的那个 —— 丢掉它，由外面按记录重起（不把旧的挂上、也不把旧快照写回记录）。
+        不用重起的（engineModels）以记录为准。从这里到下面写记录之间没有 await，记录不会再变。
+      */
+      const latestProfile = store.readRecord(sessionId)?.profile;
+      const drift = mountDrift(existing.profile, profile, latestProfile);
+      if (drift) {
+        logger.info('attach', `挂载途中记录被改了（${drift}）：丢掉按 ${ENGINE_LABEL[engineOf(profile)]} @ ${profile.remote?.sshHost || '本机'} 起的执行器，`
+          + `按记录（${ENGINE_LABEL[engineOf(latestProfile)]} @ ${latestProfile?.remote?.sshHost || '本机'}）重起 sessionId=${sessionId}`);
+        try { await client.disconnect(); } catch {}
+        /* 同 detachExecutor：这次备的本地工具通道跟着收掉（重起那次按新记录再备一份） */
+        releaseLocalTools(sessionId, profile.remote);
+        throw new MountDriftError(drift);
+      }
+      /* 落到 `profile` 本身（entry.profile 就是它）：下面「persist effective model」拿它和记录比，旧值才不会写回 */
+      const adopted = adoptRecordFields(profile, latestProfile);
+      if (!adopted.engineModels) delete profile.engineModels;
+      Object.assign(profile, adopted);
       sessionClients.set(sessionId, entry);
       /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
       wireSession(sessionId, entry);
@@ -14806,7 +14858,8 @@ ${hint}` : ''}` };
         **失败要进日志** —— 原来一行都没有：本机 Claude Code 适配器没装（adapterMissingMessage）时，
         日志停在「本地会话挂上 kirolex-local」就没下文了，看着像卡住。只在这一份 attach 里记一次（跟进来的不重复记）。
       */
-      logger.warn('attach', attachFailureLine(sessionId, store.readRecord(sessionId)?.profile, err));
+      /* 漂移不是失败：外面按记录重起，那边记过日志了 */
+      if (!(err instanceof MountDriftError)) logger.warn('attach', attachFailureLine(sessionId, store.readRecord(sessionId)?.profile, err));
       throw err;
     } finally {
       /* 没走到上面那一步（中途失败 / 被删）：记下的那句作废 */
@@ -14814,6 +14867,24 @@ ${hint}` : ''}` };
       attachingSessions.delete(sessionId);
       emitSessionBusy(sessionId);
     }
+    };
+    /*
+      挂载途中记录被改了（`MountDriftError`）：丢掉那次、按记录重起（最多再起两次，免得两边来回改时没完没了）。
+      重起成功后把实际引擎告诉界面 —— 侧栏 tag、模型下拉都跟 `session:engine-changed` 走。
+    */
+    const attachPromise = (async () => {
+      for (let attempt = 0; ; attempt++) {
+        try {
+          const result = await attachOnce();
+          if (attempt > 0) {
+            const live = sessionClients.get(sessionId);
+            if (live) mainWindow?.webContents.send('session:engine-changed', { sessionId, engine: engineOf(live.profile) });
+          }
+          return result;
+        } catch (err) {
+          if (!(err instanceof MountDriftError) || attempt >= 2) throw err;
+        }
+      }
     })();
     attachInFlight.set(sessionId, attachPromise);
     try {

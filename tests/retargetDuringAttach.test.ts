@@ -127,13 +127,15 @@ describe('切换运行位置时有 attach 在飞：先等它落定，不让本�
     assert.equal(s.record.profile.model, 'claude-opus-5');
   });
 
-  test('applySessionTarget 在看 sessionClients 之前先等 attach 落定', () => {
+  test('applySessionTarget 在看 sessionClients 之前先等 attach 落定（公共挂载锁）', () => {
     const MAIN = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
     const at = MAIN.indexOf('const applySessionTarget = async (');
     assert.ok(at > 0);
     const head = MAIN.slice(at, MAIN.indexOf('const oldEntry = sessionClients.get(sessionId);', at));
-    assert.match(head, /await settleInFlightAttach\(attachInFlight, sessionId\);/);
-    assert.match(MAIN, /import \{ settleInFlightAttach \} from '\.\/attachGate\.ts';/);
+    /* 等的是公共的挂载锁，attachInFlight 是它的来源之一（见 tests/mountLock.test.ts） */
+    assert.match(head, /await mountLock\.settle\(sessionId\);/);
+    assert.match(MAIN, /const mountLock = new SessionMountLock\(\[\s*\(sid\) => attachInFlight\.get\(sid\),/);
+    assert.match(MAIN, /import \{ SessionMountLock[^}]*\} from '\.\/attachGate\.ts';/);
   });
 
   /*

@@ -68,6 +68,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   '⚠️ The model switch failed and so did the rollback; this session is disconnected. Click it to reconnect.': '⚠️ 换模型失败，回滚也没成功，会话已断开。点一下这条会话即可重连。',
   'A kiro agent only applies to Kiro sessions.': 'kiro agent 只对 Kiro 会话有用。',
   '🔀 This session will run on **{engine}** the next time it opens.': '🔀 这条会话下次打开时改由 **{engine}** 运行。',
+  '⚠️ Could not switch this session to {engine} ({reason}); it still runs on {current}.': '⚠️ 没能把这条会话换成 {engine}（{reason}），它仍由 {current} 运行。',
   '⚠ This new chat was created for remote target {id}, which is no longer in your settings. It was saved as a local session.': '⚠ 这条新会话建时选的是远程目标 {id}，但设置里已经没有这台机器了，所以先按本机会话记下。',
   '⚠ KiroLex could not tell which engine / machine this new chat was created with, so it was saved as {engine} on {where}. Switch it in the right-click menu if that is wrong.': '⚠ 找不回这条新会话建时选的引擎 / 机器，先按「{engine} · {where}」记下；不对的话在右键菜单里改。',
   'This turn is still running. Wait for it to finish before switching engines.': '这一轮还在跑 —— 等它结束再换引擎。',

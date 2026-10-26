@@ -54,7 +54,7 @@ export const LOCAL_TOOLS_RESTORED_GROUP = 'local-tools-restored';
 /** 按当前界面语言取（所以是函数，不是常量） */
 export const RECOVERED_TEXT = (): string => tr('Local tools connection restored.');
 
-interface State { attempt: number; timer?: NodeJS.Timeout; running?: boolean }
+interface State { attempt: number; timer?: NodeJS.Timeout; running?: boolean; done?: Promise<void> }
 
 export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
   private states = new Map<string, State>();
@@ -65,6 +65,14 @@ export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
   has(sessionId: string): boolean { return this.states.has(sessionId); }
   keys(): string[] { return [...this.states.keys()]; }
   attemptOf(sessionId: string): number { return this.states.get(sessionId)?.attempt || 0; }
+  /**
+   * 正在跑的那一轮（detach → 连接 → 挂载）—— 冷切换前要等它（`SessionMountLock` 的来源之一）。
+   * 只排着定时器的不算：到点时它会按当时的记录挂。
+   */
+  inFlight(sessionId: string): Promise<void> | undefined {
+    const st = this.states.get(sessionId);
+    return st?.running ? st.done : undefined;
+  }
 
   /** 这台机器上在等的会话（给复用连接的"还有没有人要用"那个判据）。 */
   waitingOn(key: string): string[] {
@@ -117,6 +125,8 @@ export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
     const target = this.deps.target(sessionId);
     if (!target) { this.stop(sessionId); return; }
     st.running = true;
+    let release!: () => void;
+    st.done = new Promise<void>((r) => { release = r; });
     /*
       **每一次 await 之后都要重新判**：等连接 / 挂载的那几秒里用户可能归档了、删了、切回本地了，
       或者 KiroLex 在退出（`stopAll`）。只在开头判一次的话，那条会话会在用户关掉之后被重新挂上。
@@ -153,6 +163,8 @@ export class RemoteRecovery<T extends RecoveryTarget = RecoveryTarget> {
       }
     } finally {
       st.running = false;
+      st.done = undefined;
+      release();
       if (cancelled) {
         this.deps.log?.(`恢复途中这条会话被关掉了（归档 / 删除 / 切回本地 / 退出），不再挂上 sessionId=${sessionId}`);
         if (this.states.get(sessionId) === st) this.stop(sessionId);

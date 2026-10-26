@@ -19,3 +19,123 @@ export async function settleInFlightAttach(
     try { await pending; } catch { /* attach 失败由它自己报 */ }
   }
 }
+
+/** 一段正在进行的挂载（没有就 undefined）。 */
+export type MountSource = (sessionId: string) => Promise<unknown> | undefined;
+
+/**
+ * **一条会话的挂载锁** —— 冷切换（引擎 / 运行位置 / 组合 / 模型）之前统一等它，不在每处各写一份。
+ *
+ * 「我都切到 claude code 了右侧的模型列表也没变」（2026-10-26）：转发 MCP 后来就绪 → 重连执行器，
+ * 那次重连（断线恢复 → attach）在切换之前就读了记录；切换看 `sessionClients` 里没有这条，走「未连接」只改记录，
+ * 重连随后按旧的 Codex 挂上、记录又被写回 codex。所以切换先等这里所有的挂载落定，再判断走哪条分支。
+ *
+ * 来源两种：构造时给的（`attachInFlight`、断线恢复正在跑的那一轮）和 `hold` 临时登记的（晚就绪重连的 detach 窗口）。
+ * 挂载失败不往外抛（那是它自己的事）。等完又冒出新的也一起等，但只等几轮、总时长有上限 ——
+ * 等不完就返回 `timedOut`，由挂载那一侧落定前的重读（`mountDrift`）兜底，不让切换卡死在一条一直连不上的会话上。
+ */
+export class SessionMountLock {
+  private held = new Map<string, Set<Promise<unknown>>>();
+  private sources: MountSource[];
+
+  constructor(sources: MountSource[] = []) { this.sources = sources; }
+
+  /** 登记一段挂载，结束（成功或失败）自动注销；原样返回它。 */
+  hold<T>(sessionId: string, p: Promise<T>): Promise<T> {
+    let set = this.held.get(sessionId);
+    if (!set) { set = new Set(); this.held.set(sessionId, set); }
+    set.add(p);
+    const off = (): void => {
+      const s = this.held.get(sessionId);
+      if (!s) return;
+      s.delete(p);
+      if (!s.size) this.held.delete(sessionId);
+    };
+    p.then(off, off);
+    return p;
+  }
+
+  pending(sessionId: string): Promise<unknown>[] {
+    const out = [...(this.held.get(sessionId) || [])];
+    for (const src of this.sources) {
+      const p = src(sessionId);
+      if (p && !out.includes(p)) out.push(p);
+    }
+    return out;
+  }
+
+  busy(sessionId: string): boolean { return this.pending(sessionId).length > 0; }
+
+  async settle(sessionId: string, opts: { maxRounds?: number; timeoutMs?: number } = {}): Promise<{ waited: boolean; timedOut: boolean }> {
+    const maxRounds = opts.maxRounds ?? 3;
+    const deadline = Date.now() + (opts.timeoutMs ?? 60_000);
+    let waited = false;
+    for (let i = 0; i < maxRounds; i++) {
+      const list = this.pending(sessionId);
+      if (!list.length) return { waited, timedOut: false };
+      waited = true;
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      const late = new Promise<'late'>((r) => { timer = setTimeout(() => r('late'), Math.max(0, deadline - Date.now())); });
+      const r = await Promise.race([Promise.allSettled(list).then(() => 'ok' as const), late]);
+      if (timer) clearTimeout(timer);
+      if (r === 'late') return { waited, timedOut: true };
+    }
+    return { waited, timedOut: false };
+  }
+}
+
+/** 挂载关心的那几样（AgentProfile 的子集；这里不 import config.ts，免得测试拖进一串依赖）。 */
+export interface MountProfile {
+  engine?: string;
+  remote?: { sshHost?: string; sshPort?: number };
+  mcpCombo?: string;
+  model?: string;
+  preferredModel?: string;
+  engineModels?: Record<string, string> | Partial<Record<string, string>>;
+}
+
+export type MountDriftKind = 'engine' | 'remote' | 'mcpCombo' | 'model';
+
+const engineKey = (p: MountProfile): string => (p.engine === 'claude' || p.engine === 'codex' ? p.engine : 'kiro');
+const remoteKey = (p: MountProfile): string => (p.remote?.sshHost ? `${p.remote.sshHost}:${p.remote.sshPort ?? ''}` : '');
+
+/**
+ * **挂载落定前重读记录：这次起来的执行器还是不是记录要的那个**。
+ *
+ * `snapshot` = 挂载开头读到的记录，`started` = 按它起来的执行器的 profile，`latest` = 现在盘上的记录。
+ * 引擎 / 机器 / 组合（MCP 是起执行器时交出去的）和执行器不一致 → 这次挂载作废，按记录重起。
+ * kiro 的模型是起进程时绑的：期间用户换过（记录的 model / preferredModel 和开头不同）也算；
+ * `started.model` 是挂载自己挑的（降级 / 远端清单），和记录不同不算。记录没了返回 null（删除由 attach 自己判）。
+ */
+export function mountDrift(snapshot: MountProfile, started: MountProfile, latest: MountProfile | undefined): MountDriftKind | null {
+  if (!latest) return null;
+  if (engineKey(latest) !== engineKey(started)) return 'engine';
+  if (remoteKey(latest) !== remoteKey(started)) return 'remote';
+  if ((latest.mcpCombo || '') !== (started.mcpCombo || '')) return 'mcpCombo';
+  if (engineKey(latest) === 'kiro'
+    && ((latest.model || '') !== (snapshot.model || '') || (latest.preferredModel || '') !== (snapshot.preferredModel || ''))) return 'model';
+  return null;
+}
+
+/**
+ * 不用重起的那几样以记录为准，不让这次挂载的旧快照写回去：
+ * `engineModels`；Claude / Codex 的 `model`（它们的模型由 engineModels 定，记录里这一格期间被改过就用改过的）。
+ * kiro 的 `model` 不动 —— 那是挂载自己挑的（降级 / 远端清单），期间被改由 `mountDrift` 判重起。
+ */
+export function adoptRecordFields<P extends MountProfile>(started: P, latest: MountProfile | undefined): P {
+  if (!latest) return started;
+  const next = { ...started };
+  if (latest.engineModels) next.engineModels = { ...latest.engineModels };
+  else delete next.engineModels;
+  if (engineKey(started) !== 'kiro' && latest.model) next.model = latest.model;
+  return next;
+}
+
+/** 挂载途中记录被改了（`mountDrift`）：这次挂载丢掉，由 attach 按记录重起。 */
+export class MountDriftError extends Error {
+  drift: MountDriftKind;
+  constructor(drift: MountDriftKind) {
+    super(`mount drifted: ${drift}`);
+    this.drift = drift;
+  }
+}
