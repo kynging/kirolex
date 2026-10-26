@@ -77,6 +77,7 @@ import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy, bedrockNoteActiv
 import { bedrockCheckStore } from '../bedrockCheckStore.ts';
 import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
+import { modeTone, toneClass, TONE_ICONS, type PermissionTone } from '../permissionTone';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -2362,7 +2363,7 @@ const ChatInputBox = memo<{
    * Claude Code / Codex：那颗 Auto/Ask 按钮换成它们自己的权限模式 ——「claude code 那个就不应该叫 auto 了啊，
    * 默认是 bypass 就好」。给了就显示下拉，不给就是 kiro 的 Auto/Ask。
    */
-  engineMode?: { current: string; options: Array<{ value: string; name: string }>; busy: boolean; onChange: (value: string) => void } | null;
+  engineMode?: { engine?: string; current: string; options: Array<{ value: string; name: string }>; busy: boolean; onChange: (value: string) => void } | null;
   /**
    * Codex 的「Plan」开关（它的 `collaboration_mode`）：Plan 模式下 Codex 才能用 request_user_input 向你提问（提问卡片）。
    * 引擎没给这一项（Claude Code / kiro）就不显示。`pending` = 这一轮跑完再切。
@@ -2402,6 +2403,15 @@ const ChatInputBox = memo<{
   choiceChips: ChoiceChip[];
 }>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, enginePlan, permissionPending, onSend, onSteer, canSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
+  /* 权限模式的风险档和悬停提示（permissionTone.ts）：只管颜色 / 图标 / 提示，不碰模式本身 */
+  const currentModeTone = engineMode ? modeTone(engineMode.engine, engineMode.current, engineMode.options.find((o) => o.value === engineMode.current)?.name) : 'normal';
+  const riskHint = (tone: PermissionTone) => tone === 'danger'
+    ? t('⚠ Skips all permission prompts: the model can edit files and run commands without asking you')
+    : tone === 'caution'
+      ? t('Partly automatic: some actions (such as file edits) go ahead without asking you')
+      : tone === 'neutral'
+        ? t('Plan only: nothing is changed until you approve the plan')
+        : '';
   const [input, setInput] = useState(() => (sessionId ? composerDrafts[sessionId] || '' : ''));
   // Live switches; a Settings toggle re-renders this composer immediately.
   const featureFlags = useFeatureFlags();
@@ -2863,34 +2873,45 @@ const ChatInputBox = memo<{
           </button>
           {engineMode ? (
             <select
-              className={`composer-mode composer-mode-select ${engineModeTone(engineMode.current)}`}
+              className={`composer-mode composer-mode-select ${toneClass(currentModeTone)}`}
               value={engineMode.current}
               onChange={(e) => engineMode.onChange(e.target.value)}
               disabled={status !== 'connected' || engineMode.busy || !engineMode.options.length}
-              title={t("Permission mode (this engine's own): whether to ask you before acting")}
+              title={[t("Permission mode (this engine's own): whether to ask you before acting"), riskHint(currentModeTone)].filter(Boolean).join('\n')}
               aria-label={t('Permission mode')}
             >
               {engineMode.options.length
-                ? engineMode.options.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)
+                ? engineMode.options.map((o) => {
+                  /* 权限风险色（permissionTone.ts）：每一项前面一个图标，危险的那几项是 ⚠，颜色不是唯一区分 */
+                  const tone = modeTone(engineMode.engine, o.value, o.name);
+                  return (
+                    <option key={o.value} value={o.value} className={toneClass(tone) || undefined} title={riskHint(tone) || undefined}>
+                      {`${TONE_ICONS[tone]} ${o.name}`}
+                    </option>
+                  );
+                })
                 : <option value="">…</option>}
             </select>
           ) : (
           <button
             type="button"
-            className={`composer-mode ${permissionMode === 'auto-approve' ? 'yolo' : ''}`}
+            className={`composer-mode ${toneClass(modeTone('kiro', permissionMode))}`}
             onClick={() => onPermissionModeChange(
               permissionMode === 'auto-approve' ? 'ask' : 'auto-approve'
             )}
             disabled={status !== 'connected'}
             aria-pressed={permissionMode === 'auto-approve'}
             title={permissionMode === 'auto-approve'
-              ? t('Auto-approve all tools (click to require approval)')
+              ? `${riskHint('danger')}\n${t('Auto-approve all tools (click to require approval)')}`
               : t('Ask before each tool (click to auto-approve)')}
           >
             {permissionMode === 'auto-approve' ? (
               <>
-                <svg width="13" height="13" viewBox="0 0 24 24" fill="currentColor" aria-hidden="true">
-                  <polygon points="13 2 4 14 11 14 10 22 20 9 13 9" />
+                {/* 全放是权限风险最大的一档：⚠ 三角，不只靠红色区分（窄屏只剩图标时也看得出） */}
+                <svg width="13" height="13" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2" strokeLinecap="round" strokeLinejoin="round" aria-hidden="true">
+                  <path d="M10.3 3.9 1.8 18a2 2 0 0 0 1.7 3h17a2 2 0 0 0 1.7-3L13.7 3.9a2 2 0 0 0-3.4 0z" />
+                  <line x1="12" y1="9" x2="12" y2="13" />
+                  <line x1="12" y1="17" x2="12.01" y2="17" />
                 </svg>
                 {t('Auto')}
               </>
@@ -2916,7 +2937,8 @@ const ChatInputBox = memo<{
                 ? t('Plan mode is on: Codex plans first and can ask you questions with a form (click to turn off)')
                 : t('Plan mode is off (click to turn on: Codex plans first and can ask you questions with a form)')}
             >
-              {t('Plan')}{enginePlan.pending ? ' ⏳' : ''}
+              {/* 开着时灰色（权限风险的 neutral 档），再加一个 ✓，不只靠底色区分开 / 关 */}
+              {enginePlan.on ? '✓ ' : ''}{t('Plan')}{enginePlan.pending ? ' ⏳' : ''}
             </button>
           )}
           {permissionPending && <PendingSwitchBadge target={permissionPending.target} onCancel={permissionPending.onCancel} />}
@@ -3695,16 +3717,6 @@ function cacheSuggestions(key: string, list: string[]) {
     const oldest = suggestionCache.keys().next().value;
     if (oldest) suggestionCache.delete(oldest);
   }
-}
-
-/**
- * 权限模式的颜色 —— 按"放手的程度"分三档：全放（bypass / full access）用强调色，和 kiro 的 Auto 一样；
- * 半放（自动批编辑 / 自动审 / 能写工作区）用暖色；要问 / 只读 / 只做计划用默认的灰。
- */
-function engineModeTone(mode: string): string {
-  if (/^(bypassPermissions|agent-full-access)$/.test(mode)) return 'yolo';
-  if (/^(acceptEdits|auto|agent|workspace-write)$/.test(mode)) return 'semi';
-  return '';
 }
 
 export const ChatArea: React.FC<ChatAreaProps> = ({
@@ -5661,6 +5673,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   ? { target: pendingTargetForPeople(pendingSwitch!, [nonKiro ? 'engineMode' : 'permission']), onCancel: () => onCancelPendingSwitch?.(nonKiro ? 'engineMode' : 'permission') }
                   : null}
                 engineMode={nonKiro ? {
+                  engine,
                   current: pendingSwitch?.engineMode ?? (engineModels?.mode?.current || ''),
                   options: engineModels?.mode?.options || [],
                   busy: engineModelBusy,

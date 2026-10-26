@@ -30,12 +30,31 @@
   --error: #ef5350;
   --warning: #ff9800;
   --input-bg: #2a2a2a;
+  /* 权限风险色（src/renderer/permissionTone.ts 的 TONE_COLORS，测试核对两边一致）：不随引擎变色 */
+  --perm-danger: #ff8f8a;
+  --perm-danger-border: #ef5350;
+  --perm-danger-bg: rgba(239, 83, 80, 0.12);
+  --perm-caution: #e8b85a;
+  --perm-caution-border: #d9a441;
+  --perm-caution-bg: rgba(217, 164, 65, 0.12);
+  --perm-neutral: #a8a8a8;
   --sidebar-width: 240px;
   --toolbar-height: 42px;
   --mac-titlebar-height: 34px;
   /* Overridden at runtime by Settings > Font (App.tsx). */
   --app-font: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
   --mono-font: 'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
+}
+
+/* 权限风险色的亮色那组（和 engineTheme 一样先配好，将来有亮色主题时直接生效） */
+[data-theme="light"] {
+  --perm-danger: #a51d17;
+  --perm-danger-border: #c62828;
+  --perm-danger-bg: rgba(198, 40, 40, 0.12);
+  --perm-caution: #7a5000;
+  --perm-caution-border: #a06a00;
+  --perm-caution-bg: rgba(160, 106, 0, 0.12);
+  --perm-neutral: #555555;
 }
 
 * {
@@ -4186,10 +4205,36 @@ button, input, select, textarea {
   background: color-mix(in srgb, var(--warning) 25%, transparent);
 }
 
-.permission-bar-actions button.reject:hover:not(:disabled) {
-  border-color: color-mix(in srgb, var(--error) 45%, var(--border));
-  background: color-mix(in srgb, var(--error) 10%, transparent);
-  color: var(--error);
+/* 权限风险色（permissionTone.ts）：跳过权限红、总是允许 / auto 琥珀、允许一次照旧、拒绝低调。
+   红色只留给真正危险的那几项，拒绝悬停也不再变红；不用引擎强调色 */
+.permission-bar-actions button.perm-danger {
+  color: var(--perm-danger);
+  border-color: var(--perm-danger-border);
+  background: var(--perm-danger-bg);
+}
+.permission-bar-actions button.perm-caution {
+  color: var(--perm-caution);
+  border-color: var(--perm-caution-border);
+  background: var(--perm-caution-bg);
+}
+.permission-bar-actions button.perm-danger:hover:not(:disabled) {
+  border-color: var(--perm-danger-border);
+  background: var(--perm-danger-bg);
+  box-shadow: 0 0 0 1px var(--perm-danger-border);
+}
+.permission-bar-actions button.perm-caution:hover:not(:disabled) {
+  border-color: var(--perm-caution-border);
+  background: var(--perm-caution-bg);
+  box-shadow: 0 0 0 1px var(--perm-caution-border);
+}
+.permission-bar-actions button.perm-neutral {
+  color: var(--perm-neutral);
+  background: transparent;
+}
+.permission-bar-actions button.perm-neutral:hover:not(:disabled) {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+  background: transparent;
 }
 
 .permission-bar-actions button:disabled {
@@ -4706,17 +4751,30 @@ button, input, select, textarea {
   border-color: var(--border-strong);
 }
 
-.composer-mode.yolo {
-  color: var(--accent);
-  border-color: var(--accent);
-  background: var(--accent-soft);
+/* 权限风险色（permissionTone.ts）：kiro 的 Auto/Ask 和 Claude Code / Codex 的权限模式下拉共用。
+   悬停也保持本档的颜色，只把边框加实；不用引擎强调色 */
+.composer-mode.perm-danger,
+.composer-mode.perm-danger:hover:not(:disabled) {
+  color: var(--perm-danger);
+  border-color: var(--perm-danger-border);
+  background-color: var(--perm-danger-bg);
+}
+.composer-mode.perm-caution,
+.composer-mode.perm-caution:hover:not(:disabled) {
+  color: var(--perm-caution);
+  border-color: var(--perm-caution-border);
+  background-color: var(--perm-caution-bg);
+}
+.composer-mode.perm-neutral {
+  color: var(--perm-neutral);
 }
 
-/* Codex 的「Plan」开关（ChatInputBox 的 enginePlan）：开着时和 Auto 一样用 accent 色 */
+/* Codex 的「Plan」开关（ChatInputBox 的 enginePlan）：plan 是权限风险里低调的一档（permissionTone.ts 的 neutral），
+   开着时灰字 + 灰边框 + 灰底，前面再有个 ✓（ChatArea），不用强调色 */
 .composer-mode.composer-plan.on {
-  color: var(--accent);
-  border-color: var(--accent);
-  background: var(--accent-soft);
+  color: var(--perm-neutral);
+  border-color: var(--text-muted);
+  background: var(--bg-hover);
 }
 
 .composer-mode:disabled {
@@ -9256,16 +9314,11 @@ button, input, select, textarea {
   background-size: 4px 4px;
   background-repeat: no-repeat;
 }
-.composer-mode.composer-mode-select.yolo {
-  background-color: var(--accent-soft);
-}
-/* 半放：自动批编辑 / 自动审 / 能写工作区 */
-.composer-mode.semi {
-  color: #d9a441;
-  border-color: rgba(217, 164, 65, 0.6);
-  background-color: rgba(217, 164, 65, 0.12);
-}
 .composer-mode-select option { color: var(--text-primary); background: var(--bg-secondary, #1e1e22); }
+/* 下拉弹出来的每一项也按风险档上色（前面还有图标，颜色不是唯一区分） */
+.composer-mode-select option.perm-danger { color: var(--perm-danger); }
+.composer-mode-select option.perm-caution { color: var(--perm-caution); }
+.composer-mode-select option.perm-neutral { color: var(--perm-neutral); }
 /* 原来显示引擎名的那一格，现在是 effort */
 .composer-effort-select { max-width: 120px; }
 .composer-combo-select { max-width: 140px; }

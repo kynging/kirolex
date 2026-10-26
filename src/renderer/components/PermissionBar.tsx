@@ -2,6 +2,7 @@ import React, { useEffect, useState } from 'react';
 import type { PermissionRequest } from '../hooks/useAcp';
 import { useT } from '../hooks/useLang';
 import { permissionButtons, planIsLong } from '../permissionButtons';
+import { optionTone, toneClass } from '../permissionTone';
 
 interface PermissionBarProps {
   request: PermissionRequest;
@@ -41,6 +42,15 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
   /* 同一种 kind 有好几个选项（Claude Code 批准计划）时逐个列出、用它们自己的名字，见 permissionButtons.ts */
   const buttons = permissionButtons(request.options);
   const generic = { allow_once: `✓ ${t('Allow once')}`, allow_always: `⟲ ${t('Always allow')}`, reject: `⊘ ${t('Reject')}` };
+  /* 权限风险色（permissionTone.ts）：跳过权限的红 + ⚠、总是允许琥珀、允许一次正常、拒绝低调 */
+  const toneOf = (optionId: string) => {
+    const o = request.options.find((x) => x.optionId === optionId);
+    return optionTone(o || { optionId });
+  };
+  const hints = {
+    danger: t('⚠ Skips all permission prompts: the model can edit files and run commands without asking you'),
+    caution: t('Partly automatic: some actions (such as file edits) go ahead without asking you'),
+  };
 
   return (
     <div className="permission-bar" role="region" aria-live="polite" aria-label={t('Tool permission required')}>
@@ -65,16 +75,21 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
           </div>
         )}
         <div className={`permission-bar-actions${buttons.some((b) => b.label) ? ' named' : ''}`}>
-          {buttons.map((b) => (
-            <button
-              key={b.optionId}
-              className={b.role === 'reject' ? 'reject' : undefined}
-              disabled={submitting}
-              onClick={() => void respond(b.optionId)}
-            >
-              {b.label || generic[b.role]}
-            </button>
-          ))}
+          {buttons.map((b) => {
+            const tone = toneOf(b.optionId);
+            const label = b.label || generic[b.role];
+            return (
+              <button
+                key={b.optionId}
+                className={[b.role === 'reject' ? 'reject' : '', toneClass(tone)].filter(Boolean).join(' ') || undefined}
+                disabled={submitting}
+                onClick={() => void respond(b.optionId)}
+                title={tone === 'danger' || tone === 'caution' ? hints[tone] : undefined}
+              >
+                {tone === 'danger' ? `⚠ ${label}` : label}
+              </button>
+            );
+          })}
         </div>
       </div>
       {error && <div className="permission-bar-error">⚠ {error} {t('Try again.')}</div>}

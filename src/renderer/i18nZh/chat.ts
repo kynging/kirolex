@@ -431,4 +431,8 @@ export const ZH_CHAT: Record<string, string> = {
   "Don't remind me (this computer)": '不再提醒（这台电脑）',
   'Close notice (display only; the conversation is unchanged)': '关闭提示（只改显示，对话记录不变）',
   '⚠ {n} MCP(s) unavailable': '⚠ {n} 个 MCP 不可用',
+  // ── permissionTone.ts：权限风险色的悬停提示 ──
+  '⚠ Skips all permission prompts: the model can edit files and run commands without asking you': '⚠ 跳过所有权限确认：模型可以直接改文件、跑命令，不再问你',
+  'Partly automatic: some actions (such as file edits) go ahead without asking you': '半自动：部分操作（例如改文件）不再问你就直接做',
+  'Plan only: nothing is changed until you approve the plan': '只做计划：你批准计划之前不会改任何东西',
 };
