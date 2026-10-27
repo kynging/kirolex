@@ -10022,6 +10022,10 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .engine-status-refresh:disabled { color: var(--text-tertiary); cursor: progress; }
 .engine-status-row { padding: 3px 4px; border-radius: 6px; }
 .engine-status-row.selected { background: rgba(124, 111, 224, 0.14); }
+/* 新建会话框里整行可点（设置页不传 onSelect，没有这个类） */
+.engine-status-row.selectable { cursor: pointer; }
+.engine-status-row.selectable:hover:not(.selected) { background: var(--bg-hover); }
+.engine-status-row.selectable:focus-visible { outline: 2px solid var(--accent); outline-offset: -2px; }
 .engine-status-line { display: flex; align-items: center; gap: 6px; min-height: 22px; }
 .engine-status-icon { width: 16px; text-align: center; flex: none; }
 .engine-status-name { font-weight: 600; color: var(--text-primary, var(--text)); }

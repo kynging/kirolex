@@ -216,6 +216,28 @@ describe('接线', () => {
     assert.match(R.slice(at, at + 600), /<EngineStatusPanel machine="local"/);
   });
 
+  test('新建会话框：点状态面板的一行直接选中那家（onSelect=setNewChatEngine）；设置页不传、不可点', () => {
+    assert.match(A, /<EngineStatusPanel\s+compact\s+machine=\{target \? target\.id : 'local'\}\s+selected=\{newChatEngine\}\s+onSelect=\{setNewChatEngine\}/);
+    const at = R.indexOf('<EngineStatusPanel');
+    assert.doesNotMatch(R.slice(at, R.indexOf('/>', at)), /onSelect/);
+    const S = read('src', 'renderer', 'components', 'EngineStatusPanel.tsx');
+    assert.match(S, /onSelect\?: \(e: EngineId\) => void;/);
+    // 传了 onSelect 才是 radiogroup / radio、可聚焦、Enter / 空格选中
+    assert.match(S, /role=\{onSelect \? 'radiogroup' : undefined\}/);
+    assert.match(S, /role: 'radio', 'aria-checked': selected === e, tabIndex: 0,\s*onClick: \(\) => onSelect\(e\),/);
+    assert.match(S, /if \(ev\.key === 'Enter' \|\| ev\.key === ' '\) \{ ev\.preventDefault\(\); onSelect\(e\); \}/);
+    assert.match(S, /engine-status-row\$\{selected === e \? ' selected' : ''\}\$\{onSelect \? ' selectable' : ''\}/);
+    // 行里的安装 / 登录 / 官方下载按钮不能顺带切换引擎
+    assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); void store\.install\(machine, e\); \}\}/);
+    assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); void store\.login\(machine, e\); \}\}/);
+    assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); void \(window as any\)\.kiroApi\?\.openExternal\?\.\(KIRO_DOWNLOAD_URL\); \}\}/);
+    // 按钮上按 Enter / 空格是按按钮本身，不冒泡到行上去选引擎
+    assert.match(S, /onKeyDown: \(ev: React\.KeyboardEvent\) => \{\s*if \(ev\.target !== ev\.currentTarget\) return;/);
+    const css = read('src', 'renderer', 'styles', 'global.css');
+    assert.match(css, /\.engine-status-row\.selectable \{ cursor: pointer; \}/);
+    assert.match(css, /\.engine-status-row\.selectable:hover/);
+  });
+
   test('会话里：本机会话的「没登录」给登录按钮；useAcp 登记登录 runner（轮询本机状态）', () => {
     assert.match(C, /remote=\{!!remoteHostLabel\}/);
     assert.match(C, /startEngineLogin\(sessionId, login\.engine\)/);

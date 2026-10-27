@@ -57,20 +57,22 @@ function BedrockLine({ b }: { b: NonNullable<EngineStatusLite['bedrock']> }) {
   );
 }
 
-export function EngineStatusPanel({ machine, selected, compact, title }: {
+export function EngineStatusPanel({ machine, selected, compact, title, onSelect }: {
   /** `'local'` = 本机，否则远端 id。 */
   machine: string;
   /** 新建会话框里选中的那一家（高亮）。 */
   selected?: EngineId;
   compact?: boolean;
   title?: string;
+  /** 传了就整行可点：点 / Enter / 空格选中那一家（新建会话框，和上面的下拉同步）。没装 / 没登录的也能选。 */
+  onSelect?: (e: EngineId) => void;
 }) {
   const t = useT();
   const store = engineStatusStore();
   const st = useEngineStatuses(machine);
   const loadingFirst = !st?.statuses && (st?.loading ?? true);
   return (
-    <div className={`engine-status-panel${compact ? ' compact' : ''}`} data-machine={machine}>
+    <div className={`engine-status-panel${compact ? ' compact' : ''}`} data-machine={machine} role={onSelect ? 'radiogroup' : undefined}>
       <div className="engine-status-head">
         <span className="engine-status-title">{title || t('Status on this machine')}</span>
         <button
@@ -86,8 +88,16 @@ export function EngineStatusPanel({ machine, selected, compact, title }: {
         const s = st?.statuses?.find((x) => x.engine === e);
         const a = st?.actions[e];
         const busy = a?.phase === 'installing' || a?.phase === 'logging-in';
+        const pick = onSelect ? {
+          role: 'radio', 'aria-checked': selected === e, tabIndex: 0,
+          onClick: () => onSelect(e),
+          onKeyDown: (ev: React.KeyboardEvent) => {
+            if (ev.target !== ev.currentTarget) return; // 行里按钮上的 Enter / 空格是按按钮本身
+            if (ev.key === 'Enter' || ev.key === ' ') { ev.preventDefault(); onSelect(e); }
+          },
+        } as const : {};
         return (
-          <div key={e} className={`engine-status-row${selected === e ? ' selected' : ''}`} data-engine={e} data-state={s?.state || 'loading'}>
+          <div key={e} className={`engine-status-row${selected === e ? ' selected' : ''}${onSelect ? ' selectable' : ''}`} data-engine={e} data-state={s?.state || 'loading'} {...pick}>
             <div className="engine-status-line" title={s?.detail || ''}>
               <span className="engine-status-icon">{loadingFirst ? '…' : stateIcon(s?.state)}</span>
               <EngineIcon engine={e} size={14} />
@@ -95,12 +105,12 @@ export function EngineStatusPanel({ machine, selected, compact, title }: {
               {s?.version && <span className="engine-status-ver">{s.version}</span>}
               <span className="engine-status-text">{s ? <StateText s={s} /> : loadingFirst ? t('Checking…') : ''}</span>
               {s?.state === 'missing' && (
-                <button type="button" className="engine-status-btn" disabled={busy} onClick={() => { void store.install(machine, e); }}>
+                <button type="button" className="engine-status-btn" disabled={busy} onClick={(ev) => { ev.stopPropagation(); void store.install(machine, e); }}>
                   {a?.phase === 'installing' ? t('Installing…') : a?.phase === 'install-failed' ? t('Try installing again') : t('Install')}
                 </button>
               )}
               {s?.state === 'not-logged-in' && (
-                <button type="button" className="engine-status-btn" disabled={busy} onClick={() => { void store.login(machine, e); }}>
+                <button type="button" className="engine-status-btn" disabled={busy} onClick={(ev) => { ev.stopPropagation(); void store.login(machine, e); }}>
                   {a?.phase === 'logging-in' ? t('Waiting for login…') : t('Log in')}
                 </button>
               )}
@@ -115,7 +125,7 @@ export function EngineStatusPanel({ machine, selected, compact, title }: {
               <div className="engine-status-detail engine-status-fail">
                 {a.error || t('Install failed.')}
                 {e === 'kiro' && (
-                  <button type="button" className="engine-status-link" onClick={() => { void (window as any).kiroApi?.openExternal?.(KIRO_DOWNLOAD_URL); }}>
+                  <button type="button" className="engine-status-link" onClick={(ev) => { ev.stopPropagation(); void (window as any).kiroApi?.openExternal?.(KIRO_DOWNLOAD_URL); }}>
                     {t('Open the official download page')}
                   </button>
                 )}

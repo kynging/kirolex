@@ -4963,6 +4963,7 @@ const App: React.FC = () => {
                   compact
                   machine={target ? target.id : 'local'}
                   selected={newChatEngine}
+                  onSelect={setNewChatEngine}
                   title={target ? t('Status on {machine}', { machine: target.label }) : t('Status on this computer')}
                 />
               );
