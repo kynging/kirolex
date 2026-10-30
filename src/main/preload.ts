@@ -150,6 +150,15 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('s3:sync-done', h);
     return () => ipcRenderer.removeListener('s3:sync-done', h);
   },
+  /* 久未使用的会话移到云端（sessionOffload.ts）：侧栏 ☁ 占位、下载回本机、「保留在本机」 */
+  offloadList: () => ipcRenderer.invoke('offload:list'),
+  offloadRestore: (sessionId: string, keepLocal?: boolean) => ipcRenderer.invoke('offload:restore', sessionId, keepLocal),
+  offloadSetKeepLocal: (sessionId: string, keep: boolean) => ipcRenderer.invoke('offload:set-keep-local', sessionId, keep),
+  onOffloadChanged: (cb: (d: any) => void) => {
+    const h = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('offload:changed', h);
+    return () => ipcRenderer.removeListener('offload:changed', h);
+  },
   openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => ipcRenderer.invoke('kiro:open-agent-config', sessionId, agentName, source),
   saveKiroAgentConfig: (sessionId: string, agentName: string, source: 'built-in' | 'global' | 'local' | undefined, content: string) => ipcRenderer.invoke('kiro:save-agent-config', sessionId, agentName, source, content),
   switchKiroAgent: (sessionId: string, agentName: string) => ipcRenderer.invoke('acp:switch-kiro-agent', sessionId, agentName),

@@ -501,4 +501,11 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Auto (default)': '自动（默认）',
   'Always run on the remote machine': '总是在远端运行',
   'Always forward from this computer': '总是本机转发',
+  // ── 久未使用的会话移到云端（BackupSettings）──
+  'Set up the bucket and keys above first.': '先在上面配好桶和密钥。',
+  'Turn on scheduled sync first.': '先打开定时同步。',
+  'Move idle sessions to the cloud': '闲置会话移到云端',
+  'Automatically moves sessions you have not used for a while to the cloud: after a successful sync, sessions not used for this long are removed from this computer once their cloud copy is confirmed up to date. They stay in the sidebar with ☁ and download automatically when opened. Nothing is deleted from the cloud.': '自动把久未使用的会话移到云端：每次同步成功后，这么久没用、并且确认云端那份是最新的会话，会删掉本机副本；侧栏照样留着（带 ☁），点开自动下载回来。云端不删任何东西。',
+  'Unused for': '未使用超过',
+  'Unused for {n} days': '{n} 天未使用',
 };

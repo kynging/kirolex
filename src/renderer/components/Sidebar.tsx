@@ -36,6 +36,7 @@ import { showToast } from './Toasts';
 import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
 import { engineCliName, engineLabel } from '../engineLabel';
 import { accentEngine } from '../engineTheme.ts';
+import { offloadTooltip } from '../offloadView.ts';
 
 type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
 
@@ -238,6 +239,17 @@ interface SidebarProps {
    * 放在工具栏上（v1.8.0 的 changelog：`Added toolbar and command-palette actions for syncing`）。
    */
   onOpenBackup: () => void;
+  /**
+   * **已移到云端的会话**（☁ 占位，主进程 sessionOffload.ts）—— 和真会话并排画在原来的项目分组里、一起被搜索，
+   * 但不进 `sessions`（拖动 / 排序 / 预热都只认真会话）。点开走 `onSwitchSession`，由 App 先下载回来。
+   */
+  offloadedSessions?: Session[];
+  /** 右键「下载回本机」/「保留在本机，不再自动移走」（占位：下载 + 打标记） */
+  onOffloadRestore?: (id: string, keepLocal: boolean) => void;
+  /** 真会话的右键：打上 / 去掉「保留在本机，不再自动移走」；`offloadEnabled` 为假（功能没开）时不显示 */
+  keepLocalIds?: string[];
+  offloadEnabled?: boolean;
+  onSetKeepLocal?: (id: string, keep: boolean) => void;
   /** 上一次同步的结果 —— 给这个按钮上色和写 title 用。 */
   backupState?: { at: number; uploaded: number; error?: string } | null;
   workspaceOpen: boolean;
@@ -303,6 +315,9 @@ const SessionItem: React.FC<{
     transition,
     opacity: isDragging ? 0.5 : 1,
   };
+  /* ☁ 占位（已移到云端）：灰一点、标题前一朵云、悬停说多少天没用 / 点开会下载；不能删、没有状态灯 */
+  const off = session.offloaded;
+  const offTitle = off ? offloadTooltip(off, Date.now(), lang) : '';
   const dotTitle =
     busyReason === 'reconfiguring' ? t('Busy: switching model / agent…')
     : busyReason === 'attaching' ? t('Busy: connecting / reconnecting the backend…')
@@ -322,7 +337,8 @@ const SessionItem: React.FC<{
     <div
       ref={setNodeRef}
       style={style}
-      className={`session-item ${isActive ? 'active' : ''}${splitOrder > 0 ? ' in-split' : ''}`}
+      className={`session-item ${isActive ? 'active' : ''}${splitOrder > 0 ? ' in-split' : ''}${off ? ' offloaded' : ''}`}
+      title={off ? offTitle : undefined}
       data-accent-engine={accentEngine(session.engine)}
       // One gesture only: clicking a chat opens it (and, in split view, puts it in
       // the next free slot). "Add without switching focus" was a made-up gesture
@@ -346,12 +362,14 @@ const SessionItem: React.FC<{
         左边这一段是「这一行本身」的东西（分屏序号、📌、状态灯），而 flow 的身份和 worker 的 tag、子代理计数、
         定时器一样，都属于右边那排「它现在是什么状态」。
       */}
-      <span className={`session-dot ${sessionStatus}`} title={dotTitle}>
+      {off ? (
+        <span className={`session-offload-icon${off.restoring ? ' restoring' : ''}`} title={offTitle}>{off.restoring ? '⏳' : '☁'}</span>
+      ) : <span className={`session-dot ${sessionStatus}`} title={dotTitle}>
         {sessionStatus === 'streaming' && <><span /><span /><span /></>}
         {/* Rotating arc: unmistakably "work in progress on the history", and not
             the green idle light nor the green reply animation. */}
         {sessionStatus === 'rebuilding' && <span className="session-dot-arc" />}
-      </span>
+      </span>}
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {displayTitle(lang, session.title)}
       </span>
@@ -396,9 +414,11 @@ const SessionItem: React.FC<{
           🌐 {session.remoteHost}
         </span>
       )}
-      <button className="session-delete-btn" onClick={(e) => onDelete(e, session.id)} title={t('Delete')}>
-        ✕
-      </button>
+      {!off && (
+        <button className="session-delete-btn" onClick={(e) => onDelete(e, session.id)} title={t('Delete')}>
+          ✕
+        </button>
+      )}
     </div>
   );
 };
@@ -596,6 +616,11 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onAddMachine,
   onRetargetPending,
   onOpenBackup,
+  offloadedSessions,
+  onOffloadRestore,
+  keepLocalIds,
+  offloadEnabled,
+  onSetKeepLocal,
   backupState,
   workspaceOpen,
   onOpenWorkspace,
@@ -1009,9 +1034,13 @@ export const Sidebar: React.FC<SidebarProps> = ({
    * override matters because most projects are folded (untouched for a week), so a match inside one would
    * otherwise be invisible and the search would read as 「找不到」.
    */
+  /* 真会话 + ☁ 占位：分组、搜索都按这份（占位的标题也搜得到）；拖动 / 排序仍只认 `sessions` */
+  const offRows = (offloadedSessions || []).filter((o) => !sessions.some((s) => s.id === o.id));
+  const rows = offRows.length ? [...sessions, ...offRows] : sessions;
   const search = searchSessions(sessions, query);
-  const visible = search.idle ? sessions : search.hits;
-  const hiddenByQuery = sessions.length - visible.length;
+  const offSearch = searchSessions(offRows, query);
+  const visible = search.idle ? rows : [...search.hits, ...offSearch.hits];
+  const hiddenByQuery = rows.length - visible.length;
   /**
    * 搜索期间全部展开。上一版按「命中落在哪个 project」来决定展开谁，而那个 key 和会话身上的 projectId 并不总是
    * 同一个字符串 —— 于是「命中 1 个」的那一条留在收起的组里，你看到的是「什么都没找到」。搜索时把折叠这件事
@@ -1058,6 +1087,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
   };
 
   const ctxSession = contextMenu ? sessions.find((s) => s.id === contextMenu.targetId) : undefined;
+  /* ☁ 占位的右键（它不在 sessions 里，菜单也是另一份） */
+  const ctxOffloaded = contextMenu && !ctxSession ? offRows.find((s) => s.id === contextMenu.targetId) : undefined;
 
   const handleProjectMenu = (e: React.MouseEvent, project: string) => {
     e.preventDefault();
@@ -1139,7 +1170,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
           )}
 
           {/* 搜了但一条都没中：明说，空白列表会被当成「侧栏坏了 / 会话没了」 */}
-          {!search.idle && search.hits.length === 0 && (
+          {!search.idle && visible.length === 0 && (
             <div className="sidebar-search-empty">{t('No matching chats')}</div>
           )}
 
@@ -1236,6 +1267,24 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Session context menu: Rename / Pin-Unpin / Delete （归档的多一条「恢复」，且在最上面） */}
+      {/* ☁ 占位的右键：只有下载回本机这两条（它在本机没有记录，别的操作都无从谈起） */}
+      {contextMenu && ctxOffloaded && (
+        <Menu x={contextMenu.x} y={contextMenu.y}>
+          <div
+            className="context-menu-item"
+            onClick={() => { onOffloadRestore?.(ctxOffloaded.id, false); setContextMenu(null); }}
+          >
+            {`⬇️ ${t('Download back to this computer')}`}
+          </div>
+          <div
+            className="context-menu-item"
+            title={t('Download it back and never move it to the cloud automatically again')}
+            onClick={() => { onOffloadRestore?.(ctxOffloaded.id, true); setContextMenu(null); }}
+          >
+            {`📍 ${t('Keep on this computer; do not move it automatically again')}`}
+          </div>
+        </Menu>
+      )}
       {contextMenu && ctxSession && (
         <Menu x={contextMenu.x} y={contextMenu.y}>
           {/*
@@ -1271,6 +1320,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             {`📌 ${ctxSession.pinned ? t('Unpin') : t('Pin')}`}
           </div>
+          {/* 「保留在本机，不再自动移走」—— 自动移到云端（设置 → 备份）开着时才有意义 */}
+          {offloadEnabled && !ctxSession.id.startsWith('pending_') && (
+            <div
+              className="context-menu-item"
+              onClick={() => { onSetKeepLocal?.(ctxSession.id, !keepLocalIds?.includes(ctxSession.id)); setContextMenu(null); }}
+            >
+              {keepLocalIds?.includes(ctxSession.id) ? `☁ ${t('Allow moving it to the cloud when idle')}` : `📍 ${t('Keep on this computer; do not move it automatically again')}`}
+            </div>
+          )}
           {/* 会话 id ——「会话能查看/复制 id」：排查时日志按 `sessionId=` 过滤、给看板提 bug、控制入口 `/sessions/:id/…`
               都要这串，原来只能靠标题去猜。还没落盘的 `pending_` 没有真 id，不给。 */}
           {!ctxSession.id.startsWith('pending_') && (

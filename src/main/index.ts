@@ -46,6 +46,11 @@ import {
   decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import {
+  offloadSettings, offloadBlocked, planOffloadRound, offloadSession, finishOffloadRestore, readOffloadState, readOffloadStateStrict, setKeepLocal, strictSessionRefs, scheduleRefs, loopRefs, offloadedIdsInTrash,
+  manifestSessionsWithOffloaded, filesMatchSyncState, offloadedPasteRefs, lastMessageTs, idsWithItems, restoreOffloadedSession, OFFLOAD_STATE_FILE,
+  type OffloadFacts,
+} from './sessionOffload.ts';
+import {
   cleanupSettings, buildDeviceManifest, withDeviceManifest, describeDevices, runCloudCleanup, listCloudTrash,
   restoreFromCloudTrash, purgeCloudTrashItem, noteDeletion, forgetDeletion, readDeletionMarks, writeDeletionMarks,
   pruneDeletionMarks, deletionsFromTrashNames, loadOrCreateDeviceId,
@@ -6094,6 +6099,8 @@ const S3_PROFILES_MARK_PATH = path.join(KIROLEX_HOME, 's3-agent-profiles-sync.js
 const S3_DELETED_AT_PATH = path.join(KIROLEX_HOME, 's3-deleted-at.json');
 /** 本机数据目录的设备 ID（清单按它存；主机名只用来显示）—— 同名电脑不会互相覆盖清单，见 `cloudTrash.loadOrCreateDeviceId`。 */
 const DEVICE_ID_PATH = path.join(KIROLEX_HOME, 'device-id.json');
+/** 已移到云端的会话的占位 + 「保留在本机」名单（`sessionOffload.ts`）—— 只在本机，不同步。 */
+const OFFLOAD_STATE_PATH = path.join(KIROLEX_HOME, OFFLOAD_STATE_FILE);
 function thisDeviceId(): string {
   return loadOrCreateDeviceId(DEVICE_ID_PATH, machineTag(os.hostname()), () => crypto.randomUUID().replace(/-/g, '').slice(0, 16));
 }
@@ -6124,6 +6131,9 @@ function thisDeviceManifest(deviceId: string, host: string, now: number) {
   const sessions: Array<{ id: string; project?: string; archived?: boolean }> = recs.map((r) => ({ id: r.id, project: projectOf(r) || undefined, archived: !!r.archived }));
   for (const id of store.listAdvancedOnlyIds()) sessions.push({ id });
   for (const id of walkDirs(path.join(KIROLEX_HOME, 'sessions'))) if (/^[\w.-]{1,120}$/.test(id)) sessions.push({ id });
+  /* 已移到云端的（sessionOffload.ts）本机仍算持有 —— 不然它们会被当成「这台删掉了」，进云端回收站 */
+  for (const s of manifestSessionsWithOffloaded([], readOffloadState(OFFLOAD_STATE_PATH))) sessions.push(s);
+  for (const id of offloadedIdsInTrash(SESSION_TRASH_DIR)) sessions.push({ id });   // 占位文件读不了时也不漏报（宁可多报「有」）
   const marks = pruneDeletionMarks(readDeletionMarks(S3_DELETED_AT_PATH), now);
   writeDeletionMarks(S3_DELETED_AT_PATH, marks);
   let trashNames: string[] = [];
@@ -6217,7 +6227,7 @@ let syncTimer: NodeJS.Timeout | null = null;
  */
 let syncFailures = 0;
 let syncNextAllowedAt = 0;
-let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number } | null = null;
+let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number; offloaded?: number; offloadedBytes?: number; offloadDays?: number } | null = null;
 
 /**
  * 跑一轮同步。
@@ -6695,6 +6705,171 @@ function walkDirs(dir: string): string[] {
   try { return fs.readdirSync(dir, { withFileTypes: true }).filter((e) => e.isDirectory()).map((e) => e.name); } catch { return []; }
 }
 
+/**
+ * 这条会话是不是已经移到云端了：**只看占位** —— 占位只在整份下载回来、发布完、收尾时才删（`restoreOffloadedSession`），
+ * 所以有占位就不许挂载 / 当成本机会话用。
+ */
+function isOffloadedPlaceholder(id: string): boolean {
+  const st = readOffloadStateStrict(OFFLOAD_STATE_PATH);
+  /* 占位文件坏了：本机没有这条的记录就当它是占位（不许在这里建一条空会话出来） */
+  if (!st) return !fs.existsSync(path.join(KIROLEX_HOME, 'sessions', id, 'record.json'));
+  return !!st.offloaded[id];
+}
+
+/**
+ * **把已移到云端的会话下载回本机**（侧栏占位、右键、备份页恢复都走这里）：先审桶里那份（和 s3:restore 同一道
+ * `refuseAdvancedBackup`），再整份下到暂存目录、全部成功才发布成 sessions/<id> 并删占位（`restoreOffloadedSession`）。
+ * 中途失败：暂存目录删掉、正式目录不出现、占位保留，下次可以再点。返回值和 s3:restore 同形状。
+ */
+async function offloadRestoreImpl(id: string): Promise<any> {
+  const { creds, problem } = syncCredsOrProblem();
+  if (problem) return { ok: false, error: problem };
+  const placeholder = readOffloadState(OFFLOAD_STATE_PATH).offloaded[id];
+  if (!placeholder) return { ok: false, error: tr('This session is not in the cloud-only list.') };
+  logger.info('offload', `下载回本机 ${id}（先下到暂存目录，全部成功才放进 sessions/）`);
+  const r = await restoreOffloadedSession(bucketOps(creds!), {
+    home: KIROLEX_HOME, id, stateFile: OFFLOAD_STATE_PATH, now: Date.now(),
+    /* 按占位记下的云端位置审（移走之后改了前缀也一样）—— 和 s3:restore 同一道 */
+    vet: async (objects, cloudKey) => refuseAdvancedBackup(creds!, cloudKey, objects, id),
+  });
+  if (!r.ok) {
+    logger.warn('offload', `下载回本机 ${id} 失败（占位保留，本机没留半份）：${r.why}`);
+    return { ok: false, error: r.why, ...(r.gone ? { gone: true } : null) };
+  }
+  /*
+    运行位置按**本机**移走之前的那份记录（回收站里）：云端那份如果是别的电脑后来改过的，里面的机器配置是那台的。
+    回收站里那份读不到 → 和 s3:restore 一样，远程会话改成在本机跑。
+  */
+  let madeLocal = false;
+  const cur = store.readRecord(id);
+  if (cur) {
+    let before: any = null;
+    try { before = placeholder.trashDir ? JSON.parse(fs.readFileSync(path.join(placeholder.trashDir, 'record.json'), 'utf-8')) : null; } catch { before = null; }
+    const want = before ? before.profile?.remote : undefined;
+    if (JSON.stringify(cur.profile?.remote ?? null) !== JSON.stringify(want ?? null)) {
+      const profile = { ...cur.profile } as any;
+      if (want) profile.remote = want; else delete profile.remote;
+      store.writeRecordKeepUpdatedAt({ ...cur, profile, id });
+      madeLocal = !want;
+    }
+  }
+  forgetDeletion(S3_DELETED_AT_PATH, id);
+  logger.info('offload', `已从云端下载回本机 ${id}：${r.alreadyLocal ? '上次已经下完，只补了收尾' : `${r.files} 个文件 / ${(r.bytes / 1024 / 1024).toFixed(1)} MB`}，占位删掉，最后活动重新计时`);
+  mainWindow?.webContents.send('offload:changed', {});
+  return { ok: true, restored: r.files, backedUp: null, memoryFiles: 0, madeLocal, projectId: cur?.profile?.projectId || undefined };
+}
+
+/**
+ * **久未使用的会话移到云端**（`sessionOffload.ts`）—— 每轮同步**成功**之后跑一次。
+ * 判定要的运行时状态（打开的 / 分屏的 / 在跑的 / 排队的 / 定时 / 循环 / 后台命令 / 未消费的 steer）在这里收集；
+ * 任何一项读不懂就给 null，那一条（或整轮）不移。出错不算同步失败，只写日志。
+ */
+async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog | null): Promise<{ moved: Array<{ id: string; title: string }>; bytes: number; days: number } | null> {
+  const blocked = offloadBlocked(cfg, null);
+  if (blocked) return null;
+  const { days } = offloadSettings(cfg);
+  const now = Date.now();
+  /* 占位文件（含「保留在本机」名单）读不了：这一轮一条都不移、也不写它（写回会盖掉里面的东西） */
+  if (!readOffloadStateStrict(OFFLOAD_STATE_PATH)) {
+    logger.warn('offload', `${OFFLOAD_STATE_PATH} 读不了 / 坏了，判断不了哪些要保留在本机，这一轮不移任何会话`);
+    return null;
+  }
+  /*
+    判定事实。整轮算一次；每条**挪目录之前**再按 id 重算一次（核对期间可能被置顶、打上「保留在本机」、挂上定时任务、
+    设置改了…），见 offloadSession 的 refacts。排除的项目 / 会话按最新的配置读。
+  */
+  const factsNow = (only?: string): OffloadFacts[] => {
+    const cfgNow = only ? loadSyncConfig() : cfg;
+    const ui = uiState();
+    const opened = new Set<string>();
+    let openKnown = true;
+    if (ui['kirolex-last-session']) opened.add(ui['kirolex-last-session']);
+    try {
+      const split = ui['kirolex-split-session'] ? JSON.parse(ui['kirolex-split-session']) : [];
+      if (Array.isArray(split)) for (const id of split) if (typeof id === 'string') opened.add(id); else openKnown = false;
+      else openKnown = false;
+    } catch { openKnown = false; }
+    for (const id of sessionClients.keys()) opened.add(id);           // 连着执行器的也当打开着
+    const busy = new Set<string>([...attachingSessions, ...reconfiguringSessions, ...schedulesInFlight.values()]);
+    for (const [id, e] of sessionClients) if (e.busy || e.autonomous) busy.add(id);
+    for (const [id, n] of revisePending) if (n > 0) busy.add(id);
+    const queued = idsWithItems(ui['kirolex-queues']);
+    const pend = idsWithItems(ui['kirolex-pending-steers']);
+    const failed = idsWithItems(ui['kirolex-failed-steers']);
+    const steers = pend && failed ? new Set([...pend, ...failed]) : null;
+    /* 严格读：目录读不了、任何一份记录读不了 / 形状不对 = null（判断不了 → 不移），见 strictSessionRefs */
+    const scheduled = strictSessionRefs(scheduleStore.scheduleDir(os.homedir()), scheduleRefs);
+    const looping = strictSessionRefs(path.join(os.homedir(), '.kirolex', 'loop-runs'), loopRefs);
+    const off = readOffloadStateStrict(OFFLOAD_STATE_PATH);
+    const keep = off ? new Set(off.keepLocal) : null;
+    const inCatalog = catalog ? new Set((catalog.entries || []).map((e) => e.id)) : null;
+    const state = readState(S3_STATE_PATH);
+    const marks = readSessionMarks(S3_MARKS_PATH);
+    const has = (s: Set<string> | null, id: string): boolean | null => (s ? s.has(id) : null);
+    const recs = only ? [store.readRecord(only)].filter((r): r is NonNullable<typeof r> => !!r) : store.listSessions();
+    const facts: OffloadFacts[] = recs.filter((r) => !deletedSessionIds.has(r.id)).map((r) => ({
+      id: r.id,
+      updatedAt: Number.isFinite(Number(r.updatedAt)) ? Number(r.updatedAt) : null,
+      lastMessageAt: lastMessageTs(path.join(KIROLEX_HOME, 'sessions', r.id, 'transcript.jsonl')),
+      inCatalog: has(inCatalog, r.id),
+      mark: marks[r.id],
+      filesClean: filesMatchSyncState(KIROLEX_HOME, r.id, state),
+      open: openKnown ? opened.has(r.id) : null,
+      busy: busy.has(r.id),
+      queued: has(queued, r.id),
+      scheduled: has(scheduled, r.id),
+      looping: has(looping, r.id),
+      bgJobs: bgJobs.list(r.id).some((j) => j.state === 'running'),
+      pendingSteers: has(steers, r.id),
+      pinned: !!r.pinned,
+      advancedOnly: isAdvancedOnly(r),
+      excludedProject: projectExcluded(cfgNow, projectOf(r)),
+      excludedSession: sessionExcluded(cfgNow, r.id),
+      keepLocal: has(keep, r.id),
+      offloaded: off ? !!off.offloaded[r.id] : null,
+    }));
+    return facts;
+  };
+  const facts = factsNow();
+  const plan = planOffloadRound(facts, { now, idleDays: days });
+  if (!plan.picked.length) return { moved: [], bytes: 0, days };
+  const moved: Array<{ id: string; title: string }> = [];
+  let bytes = 0;
+  for (const p of plan.picked) {
+    const rec = store.readRecord(p.id);
+    const r = await offloadSession(bucketOps(creds), {
+      prefix: cfg.prefix, home: KIROLEX_HOME, id: p.id, stateFile: OFFLOAD_STATE_PATH, now: Date.now(), lastActiveAt: p.lastActiveAt,
+      remoteHost: rec?.profile?.remote?.sshHost ? labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) || undefined : undefined,
+      /* 核对要读文件、走网络，这段时间里可能被打开 / 开始跑 —— 挪目录之前最后再问一次 */
+      recheck: () => {
+        if (sessionClients.has(p.id) || attachingSessions.has(p.id) || reconfiguringSessions.has(p.id)) return 'it was opened meanwhile';
+        const u = uiState();
+        if (u['kirolex-last-session'] === p.id || String(u['kirolex-split-session'] || '').includes(`"${p.id}"`)) return 'it was opened meanwhile';
+        if (idsWithItems(u['kirolex-queues'])?.has(p.id) !== false) return 'it has queued messages (or the queue is unreadable)';
+        if (deletedSessionIds.has(p.id)) return 'it was deleted meanwhile';
+        if (offloadBlocked(loadSyncConfig(), null)) return 'auto offload was turned off meanwhile';
+        return null;
+      },
+      /* 判定事实整份重算（置顶 / 保留在本机 / 定时 / 循环 / 后台命令 / 同步状态 / 不备份…），重算后不满足就不移 */
+      refacts: () => factsNow(p.id)[0] ?? null,
+      /* 天数按挪目录那一刻的设置现读：核对期间调高了门槛、或者关掉了（= 0），按新的判 */
+      idleDays: () => offloadSettings(loadSyncConfig()).days,
+    });
+    if (r.ok) {
+      moved.push({ id: p.id, title: r.placeholder.title });
+      bytes += r.placeholder.bytes;
+      logger.info('offload', `移到云端 ${p.id}「${r.placeholder.title}」：最后活动 ${new Date(p.lastActiveAt).toLocaleString()}，`
+        + `${r.placeholder.files} 个文件 / ${(r.placeholder.bytes / 1024 / 1024).toFixed(1)} MB，本机目录挪到 ${r.placeholder.trashDir}`);
+    } else {
+      logger.warn('offload', `没移 ${p.id}：${r.why}`);
+    }
+  }
+  logger.info('offload', `这一轮移到云端 ${moved.length} 条（${moved.map((m) => m.id).join('、') || '无'}），腾出 ${(bytes / 1024 / 1024).toFixed(1)} MB`
+    + `；${plan.skipped.length} 条不移`);
+  if (moved.length) mainWindow?.webContents.send('offload:changed', { moved: moved.length, bytes, days });
+  return { moved, bytes, days };
+}
+
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
@@ -6991,12 +7166,20 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         logger.warn('s3', `云端清理没跑成（不影响备份）：${err?.message || err}`);
       }
     }
+    /* **久未使用的会话移到云端**（sessionOffload.ts）—— 同步成功才跑；判据用刚写完的 catalog 和状态表 */
+    let offloaded: Awaited<ReturnType<typeof runOffloadRound>> = null;
+    try {
+      offloaded = await runOffloadRound(creds!, cfg, wrote.catalog);
+    } catch (err: any) {
+      logger.warn('offload', `没跑成（不影响备份）：${err?.message || err}`);
+    }
     syncFailures = 0;
     syncNextAllowedAt = 0;
     lastSyncSummary = {
       at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
       ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
       ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
+      ...(offloaded?.moved.length ? { offloaded: offloaded.moved.length, offloadedBytes: offloaded.bytes, offloadDays: offloaded.days } : null),
     };
     logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`
       + `${memoryPulled ? `，从桶里拉回 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步）` : ''}`
@@ -8567,8 +8750,12 @@ app.whenReady().then(async () => {
       path.join(home, '.kirolex', 'pasted'),  // images
       path.join(home, '.kirolex', 'pastes'),  // text blobs
     ].filter((d) => fs.existsSync(d));
-    if (dirs.length) {
+    /* 已移到云端的会话（sessionOffload.ts）引用的粘贴也是活的 —— 占位文件读不了就这一次一个都不删 */
+    const offloadedRefs = offloadedPasteRefs(OFFLOAD_STATE_PATH);
+    if (!offloadedRefs) logger.warn('pastes', `${OFFLOAD_STATE_PATH} 读不了 / 坏了，判断不了已移到云端的会话还用着哪些粘贴，这次不清理`);
+    if (dirs.length && offloadedRefs) {
       const referenced = new Set<string>();
+      for (const r of offloadedRefs) referenced.add(r);
       /* advanced 的会话（flow / skill）不在 listSessions() 里，但它们引用的粘贴也是活的 —— 只读，一起算上 */
       const advanced = [...store.listAdvancedOnlyIds()].map((id) => ({ id }));
       for (const rec of [...store.listSessions(), ...advanced]) {
@@ -8665,6 +8852,11 @@ app.whenReady().then(async () => {
       autoCleanCloud: cleanupSettings(cfg).enabled,
       activeDeviceDays: cleanupSettings(cfg).activeDays,
       cloudTrashDays: cleanupSettings(cfg).trashDays,
+      /* 久未使用的会话移到云端（sessionOffload.ts）：开关默认开、30 天 */
+      autoOffload: offloadSettings(cfg).enabled,
+      offloadIdleDays: offloadSettings(cfg).days || offloadSettings({}).days,
+      /* 凭据现在用不用得了（缺字段 / 密钥解不开）—— 「移到云端」那项据此置灰并说原因 */
+      credsProblem: syncCredsOrProblem().problem || '',   // 0（不移）在界面上显示成开关关、天数默认
     };
   });
 
@@ -8711,6 +8903,9 @@ app.whenReady().then(async () => {
     if (input?.autoCleanCloud !== undefined) next.autoCleanCloud = !!input.autoCleanCloud;
     if (input?.activeDeviceDays !== undefined) next.activeDeviceDays = cleanupSettings({ activeDeviceDays: input.activeDeviceDays }).activeDays;
     if (input?.cloudTrashDays !== undefined) next.cloudTrashDays = cleanupSettings({ cloudTrashDays: input.cloudTrashDays }).trashDays;
+    /* 久未使用的会话移到云端：开关 + 天数（按 offloadSettings 的规矩收；0 = 不移） */
+    if (input?.autoOffload !== undefined) next.autoOffload = !!input.autoOffload;
+    if (input?.offloadIdleDays !== undefined) next.offloadIdleDays = offloadSettings({ offloadIdleDays: input.offloadIdleDays }).days;
     saveSyncConfig(next);
     rescheduleS3Sync();
     logger.info('s3', `配置已保存 bucket=${next.bucket} region=${next.region} key=${maskKeyId(next.accessKeyId)}`
@@ -9128,11 +9323,15 @@ ${hint}` : ''}` };
    *
    * 不恢复正在连着的那条：它的执行器手上握着 transcript，覆盖文件只会让内存和磁盘打架。
    */
-  ipcMain.handle('s3:restore', async (_event, sessionId: string) => {
+  /* 同一份实现也给侧栏 ☁ 占位的「下载回本机」用（offload:restore） */
+  let s3RestoreImpl: (_event: unknown, sessionId: string) => Promise<any>;
+  ipcMain.handle('s3:restore', s3RestoreImpl = async (_event, sessionId: string) => {
     const { creds, problem } = syncCredsOrProblem();
     if (problem) return { ok: false, error: problem };
     if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
     { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
+    /* ☁ 占位：暂存下载，全成功才发布 */
+    if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId);
     /*
       **连着的先断开，不再让人手动去断** —— 恢复现在是合并（同 id 去重、按时间排），
       断开之后执行器手上那份不会再写盘，合并完下次打开按记录重新接上。
@@ -9344,6 +9543,39 @@ ${hint}` : ''}` };
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
     }
+  });
+
+  /** 侧栏的 ☁ 占位：已移到云端的会话（只在本机记着）。 */
+  ipcMain.handle('offload:list', () => {
+    const st = readOffloadState(OFFLOAD_STATE_PATH);
+    const tomb = new Set([...loadSessionTombstones(), ...deletedSessionIds]);
+    /* 占位只在整份下载回来、收尾时才删 —— 本机目录在不在不作数（侧栏另按真会话去重） */
+    const list = Object.values(st.offloaded).filter((p) => !tomb.has(p.id));
+    return { placeholders: list, keepLocal: st.keepLocal, ...offloadSettings(loadSyncConfig()) };
+  });
+
+  /**
+   * 点开占位 / 右键「下载回本机」：走 `s3:restore` 同一份实现拉回来，成功了收尾（删占位、最后活动重新计时）。
+   * 失败就把原因带回去（网络 / 凭证 / 云端已没有），占位保留，什么都不删。`keepLocal` = 同时打上「不再自动移走」。
+   */
+  ipcMain.handle('offload:restore', async (_event, sessionId: string, keepLocal?: boolean) => {
+    const id = String(sessionId || '');
+    if (keepLocal) logger.info('offload', `${id}：下载回本机，并保留在本机，不再自动移走`);
+    const r = await offloadRestoreImpl(id);
+    if (r?.ok && keepLocal) setKeepLocal(OFFLOAD_STATE_PATH, id, true);
+    return r;
+  });
+
+  /** 右键「保留在本机，不再自动移走」/「允许自动移到云端」 */
+  ipcMain.handle('offload:set-keep-local', (_event, sessionId: string, keep: boolean) => {
+    const id = String(sessionId || '');
+    if (!setKeepLocal(OFFLOAD_STATE_PATH, id, !!keep)) {
+      logger.warn('offload', `${id} 没能${keep ? '标成保留在本机' : '取消保留在本机'}：${OFFLOAD_STATE_PATH} 读不了 / 坏了，没去覆盖它`);
+      return { ok: false, error: tr('The cloud-offload list file is unreadable, so it was not changed.') };
+    }
+    logger.info('offload', `${id} ${keep ? '保留在本机，不再自动移走' : '允许自动移到云端'}`);
+    mainWindow?.webContents.send('offload:changed', {});
+    return { ok: true };
   });
 
   /** 无边框窗口自己画的最小化 / 最大化 / 关闭（见 createWindow 的 frame: false）。关闭走窗口自己的 close —— 托盘那套逻辑照旧。 */
@@ -14741,6 +14973,8 @@ ${hint}` : ''}` };
    */
   const loadSessionImpl = async (sessionId: string, cwd: string, model: string): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'attach'); if (advRefused) throw new Error(advRefused); }
+    /* 已移到云端（本机只剩占位）：不能在这里建一条空会话出来，要先从侧栏点开下载回来 */
+    if (isOffloadedPlaceholder(sessionId)) throw new Error(tr('This session has been moved to the cloud. Click it in the sidebar to download it back first.'));
     if (!firstAttachMarked) { firstAttachMarked = true; startupMark('attach: first loadSession', `sessionId=${sessionId}`); }
     /*
       **还在新建的会话不 attach，等它建完** —— 实测（s_1792726606826_e2mprs）：新建远程会话的第 10 秒，

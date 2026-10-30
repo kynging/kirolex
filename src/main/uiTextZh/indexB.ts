@@ -269,4 +269,8 @@ export const ZH_INDEX_B: Record<string, string> = {
   "⚠️ Codex on {machine} is missing the AWS permission for web search ({actions}); a turn that searches the web will stop. Add the policy below to its IAM identity, or turn off Codex web search on that machine.": "⚠️ {machine} 上的 Codex 缺网页搜索的 AWS 权限（{actions}），一用网页搜索这一轮就会断。把下面的策略加到它的 IAM 身份上，或者在那台机器上关掉 Codex 网页搜索。",
   "Found by the permission check when this session started. Identity: {arn}": "会话启动时的权限检查发现的。身份：{arn}",
   "Codex on that machine does not use Amazon Bedrock.": "那台机器上的 Codex 没走 Amazon Bedrock。",
+  // ── 久未使用的会话移到云端（sessionOffload.ts）──
+  "This session is not in the cloud-only list.": "这条会话不在「已移到云端」的名单里。",
+  "This session has been moved to the cloud. Click it in the sidebar to download it back first.": "这条会话已经移到云端了。先在侧栏点它，下载回本机再用。",
+  "The cloud-offload list file is unreadable, so it was not changed.": "「已移到云端」的名单文件读不了，没有改它。",
 };

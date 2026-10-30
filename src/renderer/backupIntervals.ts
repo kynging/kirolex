@@ -46,6 +46,8 @@ export function intervalLabel(minutes: number, lang: Lang = 'zh'): string {
  */
 export const ACTIVE_DEVICE_DAY_CHOICES = [30, 60, 90, 180, 365];
 export const CLOUD_TRASH_DAY_CHOICES = [7, 14, 30, 60, 90];
+/** 「自动把久未使用的会话移到云端」的天数（主进程 sessionOffload.ts 的 OFFLOAD_DAY_CHOICES 同一张表）。 */
+export const OFFLOAD_DAY_CHOICES = [14, 30, 60, 90, 180];
 
 export function dayChoices(base: number[], current?: number): number[] {
   const cur = Math.floor(Number(current));

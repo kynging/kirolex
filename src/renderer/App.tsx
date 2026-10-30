@@ -54,6 +54,7 @@ import { engineLabel, engineCliName } from './engineLabel';
 import { accentEngine, engineAccentCss } from './engineTheme.ts';
 import type { QuestionCard } from '../main/elicitation.ts';
 import { EngineStatusPanel } from './components/EngineStatusPanel';
+import { placeholderRows, offloadSummary, offloadFailureText, type OffloadPlaceholderRow, type OffloadedMark } from './offloadView.ts';
 
 /** 已经推过收尾卡的运行（`project\u0000runId`）。落盘去重 —— ref 只管到下次刷新。 */
 const RUN_DONE_CARD_KEY = 'kirolex-run-done-card';
@@ -637,6 +638,8 @@ export interface Session {
    * 被镜像的那一个目录，所以"它读哪棵树"不该是要靠猜的事。
    */
   localDir?: string;
+  /** 侧栏的 ☁ 占位才有（已移到云端，本机没有记录；见 offloadView.ts）。真会话永远没有这一项。 */
+  offloaded?: OffloadedMark;
   /** User-archived: hidden from the main list into a collapsible Archived group. */
   archived?: boolean;
   folderId?: string | null; // legacy — retained for back-compat, no longer surfaced
@@ -1502,6 +1505,39 @@ const App: React.FC = () => {
   tRef.current = t;
 
   /**
+   * **已移到云端的会话**（☁ 占位，主进程 sessionOffload.ts）—— 只在侧栏并排画，不进 `sessions`。
+   * 点开 / 右键「下载回本机」→ `offload:restore`（走 s3:restore 同一份实现）→ 侧栏对一遍磁盘 → 打开它。
+   * 失败就说原因（网络 / 凭证 / 云端已没有），占位保留。同步移走了一批时提示一句（点一下就关）。
+   */
+  const settingsLangRef = useRef(settings.language);
+  settingsLangRef.current = settings.language;
+  const [offloadInfo, setOffloadInfo] = useState<{ placeholders: OffloadPlaceholderRow[]; keepLocal: string[]; enabled: boolean }>({ placeholders: [], keepLocal: [], enabled: false });
+  const [offloadRestoring, setOffloadRestoring] = useState<Set<string>>(() => new Set());
+  const offloadInfoRef = useRef(offloadInfo);
+  offloadInfoRef.current = offloadInfo;
+  const loadOffloaded = useCallback(async () => {
+    try {
+      const r = await (window as any).kiroApi?.offloadList?.();
+      if (r) setOffloadInfo({ placeholders: Array.isArray(r.placeholders) ? r.placeholders : [], keepLocal: Array.isArray(r.keepLocal) ? r.keepLocal : [], enabled: !!r.enabled });
+    } catch { /* 拿不到就不画占位 */ }
+  }, []);
+  useEffect(() => {
+    void loadOffloaded();
+    const api = (window as any).kiroApi;
+    const off = api?.onOffloadChanged?.((d: any) => {
+      void loadOffloaded();
+      if (d?.moved > 0) {
+        /* 侧栏对一遍磁盘：移走的那几条本机已经没有记录，从 sessions 里去掉，换成 ☁ 占位（同一个水化入口，不预热任何会话） */
+        window.dispatchEvent(new CustomEvent('kirolex:sessions-restored', { detail: { ids: [], unarchived: [] } }));
+        showToast(offloadSummary(d.moved, d.bytes, d.days, settingsLangRef.current));
+      }
+    });
+    /* 设置里改了开关 / 天数：右键菜单那一项跟着变 */
+    const offSync = api?.onS3SyncDone?.(() => { void loadOffloaded(); });
+    return () => { try { off?.(); offSync?.(); } catch { /* 已解绑 */ } };
+  }, [loadOffloaded]);
+
+  /**
    * ONE summary per chat, computed HERE and handed to both surfaces.
    *
    * The banner above a transcript and the next-run time on a sidebar row are the same fact seen
@@ -2113,10 +2149,47 @@ const App: React.FC = () => {
   }, [streamingIds, currentSessionId, loopingIds]);
 
   // Clear unread when user switches to a session
+  const sessionsLatestRef = useRef(sessions);
+  sessionsLatestRef.current = sessions;
+  /** ☁ 占位 → 从云端下载回本机，成功了（`open`）就打开它。同一条同时只下一次。 */
+  const restoreOffloaded = useCallback(async (sessionId: string, keepLocal: boolean, open: boolean) => {
+    const row = offloadInfoRef.current.placeholders.find((p) => p.id === sessionId);
+    if (!row) return;
+    let already = false;
+    setOffloadRestoring((prev) => { already = prev.has(sessionId); return already ? prev : new Set(prev).add(sessionId); });
+    if (already) return;
+    showToast(tRef.current('Downloading "{title}" from the cloud…', { title: row.title }));
+    let r: any;
+    try { r = await (window as any).kiroApi?.offloadRestore?.(sessionId, keepLocal); }
+    catch (e: any) { r = { ok: false, error: String(e?.message || e) }; }
+    if (r?.ok) {
+      /* 侧栏对一遍磁盘 + 连上（和备份页恢复完同一条路），等它出现在列表里再打开 */
+      window.dispatchEvent(new CustomEvent('kirolex:sessions-restored', { detail: { ids: [sessionId], unarchived: [] } }));
+      await loadOffloaded();
+      if (open) {
+        for (let i = 0; i < 50 && !sessionsLatestRef.current.some((x) => x.id === sessionId); i++) await new Promise((res) => setTimeout(res, 100));
+        if (sessionsLatestRef.current.some((x) => x.id === sessionId)) switchSession(sessionId);
+      }
+      showToast(tRef.current('"{title}" is back on this computer.', { title: row.title }));
+    } else {
+      showToast(offloadFailureText(row.title, r, settingsLangRef.current));
+    }
+    setOffloadRestoring((prev) => { const n = new Set(prev); n.delete(sessionId); return n; });
+  }, [loadOffloaded, switchSession]);
   const handleSwitchSession = useCallback((sessionId: string) => {
+    /* ☁ 占位：先从云端下载回来，再打开 */
+    /* 有占位就先下载（本机就算有个目录，也可能是证明不了完整的旧副本 —— 下载那边会把它挪开） */
+    if (offloadInfoRef.current.placeholders.some((p) => p.id === sessionId)) {
+      void restoreOffloaded(sessionId, false, true);
+      return;
+    }
     setUnreadSessionIds((prev) => prev.filter((id) => id !== sessionId));
     switchSession(sessionId);
-  }, [switchSession]);
+  }, [switchSession, restoreOffloaded]);
+  const offloadedSessions = useMemo(
+    () => placeholderRows(offloadInfo.placeholders, sessions, offloadRestoring) as Session[],
+    [offloadInfo.placeholders, sessions, offloadRestoring],
+  );
 
   /**
    * EXPLICITLY OPEN A PROJECT RUN — the user's navigation wins over the chat that happened to be focused.
@@ -4439,6 +4512,11 @@ const App: React.FC = () => {
                 然后留一个多选/恢复按钮即可」。配置回到 设置 → ☁️ 备份。
               */
               onOpenBackup={() => setShowBackup(true)}
+              offloadedSessions={offloadedSessions}
+              onOffloadRestore={(id, keepLocal) => { void restoreOffloaded(id, keepLocal, false); }}
+              keepLocalIds={offloadInfo.keepLocal}
+              offloadEnabled={offloadInfo.enabled}
+              onSetKeepLocal={(id, keep) => { void (window as any).kiroApi?.offloadSetKeepLocal?.(id, keep).then((r: any) => { if (r && !r.ok && r.error) showToast(String(r.error)); return loadOffloaded(); }).catch(() => {}); }}
               backupState={backupState}
               workspaceOpen={showWorkspace}
               onOpenWorkspace={() => setShowWorkspace((visible) => !visible)}

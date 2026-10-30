@@ -90,6 +90,12 @@ export interface SyncConfig {
   autoCleanCloud?: boolean;
   activeDeviceDays?: number;
   cloudTrashDays?: number;
+  /**
+   * **久未使用的会话移到云端**（见 `sessionOffload.ts`）：最后活动早于 `offloadIdleDays` 天、云端那份确定是最新的，
+   * 就删掉本机副本、侧栏留占位。缺省 = 开、30 天；`autoOffload: false` 或 `offloadIdleDays: 0` = 不移。
+   */
+  autoOffload?: boolean;
+  offloadIdleDays?: number;
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;

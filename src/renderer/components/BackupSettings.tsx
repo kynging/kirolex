@@ -31,7 +31,7 @@
  */
 
 import React, { useCallback, useEffect, useState } from 'react';
-import { intervalChoices, intervalLabel, dayChoices, ACTIVE_DEVICE_DAY_CHOICES, CLOUD_TRASH_DAY_CHOICES } from '../backupIntervals.ts';
+import { intervalChoices, intervalLabel, dayChoices, ACTIVE_DEVICE_DAY_CHOICES, CLOUD_TRASH_DAY_CHOICES, OFFLOAD_DAY_CHOICES } from '../backupIntervals.ts';
 import { ToggleButton } from './ToggleButton.tsx';
 import { cleanupSentence } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
@@ -51,6 +51,11 @@ interface Cfg {
   autoCleanCloud: boolean;
   activeDeviceDays: number;
   cloudTrashDays: number;
+  /** 久未使用的会话移到云端（主进程 sessionOffload.ts）：开关（默认开）、天数（默认 30）。 */
+  autoOffload: boolean;
+  offloadIdleDays: number;
+  /** 凭据现在用不用得了（主进程 syncCredsOrProblem）：缺字段 / 密钥解不开 → 原因；可用 → 空 */
+  credsProblem?: string;
 }
 
 /** 桶里每台机器的清单（`describeDevices`）。 */
@@ -261,6 +266,40 @@ export const BackupSettings: React.FC = () => {
           ))}
         </select>
       </Field>
+      {/*
+        **久未使用的会话移到云端** ——「超过 30 天不用的会话要不要直接删掉丢远程」：不是删除，确认云端那份是最新的之后
+        删掉本机副本，侧栏留 ☁ 占位，点开自动下载回来（主进程 sessionOffload.ts）。备份没开 / 没配好时整个不跑，这里置灰说原因。
+      */}
+      {(() => {
+        /* 没配好 = 缺字段，或者密钥解不开了（换过机器 / 重装）—— 以主进程说的为准 */
+        const configured = !!(cfg.bucket && cfg.region && cfg.accessKeyId && cfg.hasSecret) && !cfg.credsProblem;
+        const why = !configured
+          ? (cfg.credsProblem ? cfg.credsProblem.split('\n')[0] : t('Set up the bucket and keys above first.'))
+          : !cfg.enabled ? t('Turn on scheduled sync first.') : '';
+        return (
+          <Field
+            label={t('Move idle sessions to the cloud')}
+            hint={why || t('Automatically moves sessions you have not used for a while to the cloud: after a successful sync, sessions not used for this long are removed from this computer once their cloud copy is confirmed up to date. They stay in the sidebar with ☁ and download automatically when opened. Nothing is deleted from the cloud.')}
+          >
+            <span className={why ? 'backup-offload-disabled' : undefined} style={why ? { opacity: 0.5, pointerEvents: 'none' } : undefined}>
+              <ToggleButton
+                on={!why && cfg.autoOffload}
+                disabled={!!why}
+                ariaLabel={t('Move idle sessions to the cloud')}
+                onChange={(next) => { patch({ autoOffload: next }); void save({ autoOffload: next, offloadIdleDays: cfg.offloadIdleDays }); }}
+              />
+            </span>
+            <select className="settings-select backup-interval" aria-label={t('Unused for')}
+                    disabled={!!why || !cfg.autoOffload}
+                    value={String(cfg.offloadIdleDays)}
+                    onChange={(e) => { const n = Number(e.target.value); patch({ offloadIdleDays: n }); void save({ offloadIdleDays: n }); }}>
+              {dayChoices(OFFLOAD_DAY_CHOICES, cfg.offloadIdleDays).map((n) => (
+                <option key={n} value={n}>{t('Unused for {n} days', { n })}</option>
+              ))}
+            </select>
+          </Field>
+        );
+      })()}
       {devices && (
         <div className="backup-devices">
           {devices.error ? <div className="settings-hint">{devices.error.split('\n')[0]}</div> : (

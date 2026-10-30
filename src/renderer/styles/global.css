@@ -350,6 +350,19 @@ button, input, select, textarea {
   opacity: 0.8;
 }
 
+/* ☁ 占位：已移到云端的会话（本机没有副本，点开会下载）—— 灰一点，状态灯的位置换成一朵云 */
+.session-item.offloaded {
+  color: var(--text-secondary);
+  opacity: 0.6;
+}
+.session-item.offloaded:hover { opacity: 0.85; }
+.session-offload-icon {
+  font-size: 11px;
+  flex-shrink: 0;
+  width: 12px;
+  text-align: center;
+}
+
 /* Next-run badge on a chat's row. Sits between the title and the ✕, and never shrinks the
    title away: the countdown is short by construction (scheduleView keeps it minute-grained,
    and past a day it becomes a date). */
