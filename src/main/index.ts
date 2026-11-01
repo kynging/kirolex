@@ -155,6 +155,7 @@ import {
 } from './deckPreview.ts';
 import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.ts';
 import { logger } from './logger';
+import { applyDockIcon, dockIconPath } from './dockIcon';
 import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
@@ -8356,6 +8357,8 @@ function createWindow() {
     */
     titleBarStyle: process.platform === 'darwin' ? 'hiddenInset' : 'default',
     ...(process.platform === 'darwin' ? {} : { frame: false }),
+    // Windows / Linux 的窗口 / 任务栏图标：和 Dock 同一个文件；打包版 dist 里没有 build/ 时不设，照旧用 exe 的图标。
+    ...(process.platform !== 'darwin' && fs.existsSync(dockIconPath(app.getAppPath())) ? { icon: dockIconPath(app.getAppPath()) } : {}),
     backgroundColor: '#1a1a1a',
     autoHideMenuBar: true,
     show: false, // Hidden until connected
@@ -8625,6 +8628,8 @@ function showMainWindow() {
 
 app.whenReady().then(async () => {
   startupMark('app ready');
+  // Mac：npm start 时 Dock 上默认是 Electron 的图标 —— 换成 build/icon.png（见 dockIcon.ts）。
+  applyDockIcon({ platform: process.platform, app, nativeImage, existsSync: fs.existsSync, warn: (m) => logger.warn('app', m) });
   // Carry the UI state off the origin-scoped localStorage BEFORE any window opens:
   // preload hands the renderer a synchronous snapshot, so the shared store has to
   // be populated by then or the first paint uses defaults (no project groups, 1x1
