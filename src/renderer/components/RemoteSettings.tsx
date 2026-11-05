@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, joinSshHost, splitSshHost } from '../remotePick.ts';
+import { DEFAULT_SSM_USER, DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, joinSshHost, splitSshHost } from '../remotePick.ts';
 import { notifyRemoteTargetsChanged } from '../hooks/useRemoteTargets.ts';
 import { useT } from '../hooks/useLang';
 import { EngineStatusPanel } from './EngineStatusPanel';
@@ -56,6 +56,12 @@ export interface RemoteRow {
   editedAt?: number;
   /** 这台机器存了密码没有（密码本身永远不到界面这一层）。 */
   hasPassword?: boolean;
+  /** 怎么连：缺省 ssh；`ssm` = SSH over AWS SSM（不开 22 端口、不要公网 IP，按实例 ID 连）。 */
+  connectVia?: 'ssh' | 'ssm';
+  ssmInstanceId?: string;
+  ssmRegion?: string;
+  /** 空 = 默认凭证链。 */
+  ssmProfile?: string;
 }
 
 
@@ -250,7 +256,8 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
   /** 一条目标的可比较签名（只含真正会被存下去的字段）。 */
   const sig = (d: Draft | null): string => (d
     ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.proxyJump || '', d.remoteWorkdir || '',
-      d.bins?.kiro || '', d.bins?.claude || '', d.bins?.codex || '', d.password || '', !!d.clearPassword])
+      d.bins?.kiro || '', d.bins?.claude || '', d.bins?.codex || '', d.password || '', !!d.clearPassword,
+      d.connectVia || 'ssh', d.ssmInstanceId || '', d.ssmRegion || '', d.ssmProfile || ''])
     : '');
 
   const reload = async (keep?: string): Promise<void> => {
@@ -407,6 +414,21 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
     setResult({ ok: true, text: `${t('Installed. The self-check output is above.')}${kiro ? `\n${kiro}` : ''}` });
   };
 
+  /**
+   * **切换连接方式**。SSM 时 `sshHost` 是 `<登录用户>@<实例 ID>`（主机名 + HostKeyAlias），
+   * 所以 IP 那一栏不要了；切回 SSH 时实例 ID 不是一个能连的地址，主机那一半清空让你重填。
+   */
+  const setVia = (via: 'ssh' | 'ssm'): void => {
+    if (!draft) return;
+    const user = splitSshHost(draft.sshHost).user;
+    if (via === 'ssm') {
+      setDraft({ ...draft, connectVia: 'ssm', proxyJump: '', sshHost: joinSshHost(user || DEFAULT_SSM_USER, draft.ssmInstanceId || '') });
+    } else {
+      setDraft({ ...draft, connectVia: 'ssh', sshHost: joinSshHost(user, '') });
+    }
+  };
+  const ssm = draft?.connectVia === 'ssm';
+
   const locked = busy || installing;
   const canAct = !!draft && !!splitSshHost(draft.sshHost).host.trim();
   /* 「安装 AI 工具」要求这组连接参数**测过且通过** —— 改了任何一项就得重测 */
@@ -434,7 +456,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       >
         <option value={LOCAL}>{t('💻 Local (this computer)')}</option>
         {rows.map((r) => (
-          <option key={r.id} value={r.id}>{`🌐 ${r.label} — ${r.sshHost}`}</option>
+          <option key={r.id} value={r.id}>{`🌐 ${r.label} — ${r.sshHost}${r.connectVia === 'ssm' ? '  [SSM]' : ''}`}</option>
         ))}
         <option value={NEW}>{t('+ Add a machine…')}</option>
       </select>
@@ -474,20 +496,69 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
               onChange={(e) => setDraft({ ...draft, label: e.target.value })}
             />
           </Field>
-          <Field label={t('IP address')} hint={t('IP or hostname of that machine')}>
-            <input
-              className="settings-input"
-              value={splitSshHost(draft.sshHost).host}
-              onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(splitSshHost(draft.sshHost).user, e.target.value) })}
-            />
+          {/*
+            **连接方式** ——「通过 AWS SSM 连接」：机器不用开 22 端口、不用公网 IP，按实例 ID 连。
+            只换传输层（ProxyCommand = aws ssm start-session），反向隧道 / 本机工具 / ACP 全都照旧。
+          */}
+          <Field label={t('Connect via')} hint={t('SSH connects to an IP directly. AWS SSM tunnels SSH through Session Manager: no open port 22, no public IP, and the IP may change (needs aws + session-manager-plugin on this computer)')}>
+            <div className="remote-via">
+              <label><input type="radio" name="remote-via" checked={!ssm} disabled={locked} onChange={() => setVia('ssh')} /> SSH</label>
+              <label><input type="radio" name="remote-via" checked={ssm} disabled={locked} onChange={() => setVia('ssm')} /> AWS SSM</label>
+              {ssm && <span className="remote-badge-ssm">SSM</span>}
+            </div>
           </Field>
-          <Field label={t('Username')} hint={t('Username for ssh login to that machine. Empty = use your local username')}>
-            <input
-              className="settings-input"
-              value={splitSshHost(draft.sshHost).user}
-              onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, splitSshHost(draft.sshHost).host) })}
-            />
-          </Field>
+          {ssm ? (
+            <>
+              <Field label={t('Instance ID')} hint={t('EC2 instance ID, e.g. i-0123456789abcdef0 (or mi-… for a managed instance)')}>
+                <input
+                  className="settings-input"
+                  spellCheck={false}
+                  value={draft.ssmInstanceId || ''}
+                  onChange={(e) => setDraft({ ...draft, ssmInstanceId: e.target.value.trim(), sshHost: joinSshHost(splitSshHost(draft.sshHost).user || DEFAULT_SSM_USER, e.target.value.trim()) })}
+                />
+              </Field>
+              <Field label={t('Region')} hint={t('AWS region of that instance, e.g. us-east-1')}>
+                <input
+                  className="settings-input"
+                  spellCheck={false}
+                  value={draft.ssmRegion || ''}
+                  onChange={(e) => setDraft({ ...draft, ssmRegion: e.target.value.trim() })}
+                />
+              </Field>
+              <Field label={t('AWS profile')} hint={t('Profile in ~/.aws/config. Empty = the default credential chain')}>
+                <input
+                  className="settings-input"
+                  spellCheck={false}
+                  value={draft.ssmProfile || ''}
+                  onChange={(e) => setDraft({ ...draft, ssmProfile: e.target.value.trim() })}
+                />
+              </Field>
+              <Field label={t('Login user')} hint={t('User that SSH logs in as on that instance (ec2-user on Amazon Linux, ubuntu on Ubuntu)')}>
+                <input
+                  className="settings-input"
+                  value={splitSshHost(draft.sshHost).user}
+                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, draft.ssmInstanceId || '') })}
+                />
+              </Field>
+            </>
+          ) : (
+            <>
+              <Field label={t('IP address')} hint={t('IP or hostname of that machine')}>
+                <input
+                  className="settings-input"
+                  value={splitSshHost(draft.sshHost).host}
+                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(splitSshHost(draft.sshHost).user, e.target.value) })}
+                />
+              </Field>
+              <Field label={t('Username')} hint={t('Username for ssh login to that machine. Empty = use your local username')}>
+                <input
+                  className="settings-input"
+                  value={splitSshHost(draft.sshHost).user}
+                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, splitSshHost(draft.sshHost).host) })}
+                />
+              </Field>
+            </>
+          )}
           <Field label={t('Port')} hint={t('Defaults to 22')}>
             <input
               className="settings-input"

@@ -23,7 +23,7 @@ import os from 'os';
 import path from 'path';
 import type { ExecutorBins, RemoteTarget } from './config';
 import { rememberBin, type BinHistoryMap, type ToolId } from './binDetect.ts';
-import { validJump } from './sshProxy.ts';
+import { validJump, ssmFieldError } from './sshProxy.ts';
 import { tr } from './uiText.ts';
 
 export interface RemoteTargetEntry extends RemoteTarget {
@@ -74,6 +74,13 @@ function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntr
     bins: normalizeBins(raw?.bins),
     passwordCipher: typeof raw?.passwordCipher === 'string' && raw.passwordCipher ? raw.passwordCipher : undefined,
     editedAt: Number.isFinite(Number(raw?.editedAt)) && Number(raw?.editedAt) > 0 ? Number(raw.editedAt) : undefined,
+    /* SSM 那几个字段只在 `connectVia: 'ssm'` 时出现 —— 老配置读出来的形状一个键都不多 */
+    ...(raw?.connectVia === 'ssm' ? {
+      connectVia: 'ssm' as const,
+      ssmInstanceId: typeof raw?.ssmInstanceId === 'string' ? raw.ssmInstanceId.trim() : '',
+      ssmRegion: typeof raw?.ssmRegion === 'string' ? raw.ssmRegion.trim() : '',
+      ...(typeof raw?.ssmProfile === 'string' && raw.ssmProfile.trim() ? { ssmProfile: raw.ssmProfile.trim() } : {}),
+    } : {}),
   };
 }
 
@@ -257,6 +264,12 @@ export interface RemoteTargetInput {
   bins?: ExecutorBins;
   /** 已加密的密码；主进程在 `remote:save` 里把界面给的明文加密后放这里。空串 = 清除。 */
   passwordCipher?: string;
+  /** 怎么连（缺省 ssh）。`ssm` 时下面三个字段生效，`sshHost` 是 `user@<instance-id>`。 */
+  connectVia?: 'ssh' | 'ssm';
+  ssmInstanceId?: string;
+  ssmRegion?: string;
+  /** 空 = 默认凭证链。 */
+  ssmProfile?: string;
 }
 
 /** 新建时的 id：按 label/host 生成一个稳定的可读 id（不用时间戳 —— 那种 id 在配置文件里没法认）。 */
@@ -285,11 +298,43 @@ export function validateTarget(input: RemoteTargetInput): string | null {
     （见 `sshProxy.ts`）。只拦空格是不够的：`;` / `$(…)` / 反引号都能过。
   */
   if (jump && !validJump(jump)) return tr('The jump host must be `user@host` or `user@host:port` (letters, digits, `@ . - _ :` and IPv6 brackets).');
+  const via = input?.connectVia;
+  if (via !== undefined && via !== null && (via as any) !== '' && via !== 'ssh' && via !== 'ssm') return tr('Connection method must be ssh or ssm.');
+  if (via === 'ssm') {
+    /* 这几个值都会拼进交给 shell 跑的 ProxyCommand（sshProxy.ts `ssmProxyCommand`），所以全是白名单 */
+    if (jump) return tr('A jump host and AWS SSM cannot be used together.');
+    const ssmWhy = ssmFieldError({
+      ssmInstanceId: String(input.ssmInstanceId || '').trim(),
+      ssmRegion: String(input.ssmRegion || '').trim(),
+      ssmProfile: String(input.ssmProfile || '').trim() || undefined,
+    });
+    if (ssmWhy) return ssmWhy;
+    /* SSM 模式下 sshHost 只是 `user@<instance-id>`（主机名 + HostKeyAlias），不是一个能解析的地址 */
+    const at = host.lastIndexOf('@');
+    const user = at > 0 ? host.slice(0, at) : '';
+    if (!/^[A-Za-z0-9._][A-Za-z0-9._-]*$/.test(user) || host.slice(at + 1) !== String(input.ssmInstanceId || '').trim()) {
+      return tr('In AWS SSM mode the address must be <login user>@<instance ID>.');
+    }
+  }
   if (input.remoteWorkdir && !String(input.remoteWorkdir).startsWith('/') && !String(input.remoteWorkdir).startsWith('~')) {
     /* 相对路径会落在登录 shell 的当前目录上 —— 那是"看起来能用，但镜像跑到了别处" */
     return tr('The working directory must be an absolute path (starting with `/` or `~`).');
   }
   return null;
+}
+
+/**
+ * 界面给的一份草稿里 SSM 那几个字段（「测试连接」「安装 AI 工具」这类按草稿直接连的路要带上）。
+ * 不是 SSM 返回空对象 —— 直连那条路拼出来的目标一个键都不多。
+ */
+export function ssmFieldsOf(input: Partial<RemoteTargetInput> | undefined): Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'> {
+  if (input?.connectVia !== 'ssm') return {};
+  return {
+    connectVia: 'ssm',
+    ssmInstanceId: String(input.ssmInstanceId || '').trim(),
+    ssmRegion: String(input.ssmRegion || '').trim(),
+    ...(String(input.ssmProfile || '').trim() ? { ssmProfile: String(input.ssmProfile).trim() } : {}),
+  };
 }
 
 function readConfigObject(configPath: string): any {
@@ -353,8 +398,18 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
     bins: has('bins') ? normalizeBins(input.bins) : normalizeBins(old?.bins),
     /* 同一条规则：没给就不动（界面拿不到密文，所以它永远"没给"，除非你改了或清了密码） */
     passwordCipher: has('passwordCipher') ? (String(input.passwordCipher) || undefined) : old?.passwordCipher,
+    /* 同一条规则；`ssh`（缺省）不写进文件 —— 老配置存一次之后形状不变 */
+    connectVia: (has('connectVia') ? input.connectVia : old?.connectVia) === 'ssm' ? 'ssm' as const : undefined,
+    ssmInstanceId: has('ssmInstanceId') ? (String(input.ssmInstanceId).trim() || undefined) : old?.ssmInstanceId,
+    ssmRegion: has('ssmRegion') ? (String(input.ssmRegion).trim() || undefined) : old?.ssmRegion,
+    ssmProfile: has('ssmProfile') ? (String(input.ssmProfile).trim() || undefined) : old?.ssmProfile,
     editedAt: Date.now(),
   };
+  /* 合并后的那一条再验一次：只改了一部分字段（比如只给了 proxyJump）也不能拼出"跳板 + SSM" */
+  if (row.connectVia === 'ssm') {
+    const merged = validateTarget(row as RemoteTargetInput);
+    if (merged) throw new Error(merged);
+  }
   if (at >= 0) list[at] = row; else list.push(row);
   cfg.remotes = list;
   writeConfigObject(configPath, cfg);

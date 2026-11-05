@@ -59,6 +59,17 @@ export interface RemoteTarget {
   bins?: ExecutorBins;
   /** SSH 密码，`safeStorage` 加密后的 base64（见 sshAuth.ts）。没有 = 只用密钥/ssh 自己的配置。 */
   passwordCipher?: string;
+  /**
+   * 怎么连：`ssh`（缺省，直连 / 跳板）或 `ssm`（SSH over AWS SSM，见 sshProxy.ts `ssmProxyCommand`）。
+   * `ssm` 时 `sshHost` 是 `user@<instance-id>`，SSH 认证照旧用 `identityFile`。
+   */
+  connectVia?: 'ssh' | 'ssm';
+  /** SSM：实例 ID（`i-…` / `mi-…`）。 */
+  ssmInstanceId?: string;
+  /** SSM：区域（`us-east-1`）。 */
+  ssmRegion?: string;
+  /** SSM：AWS CLI profile；没有 = 默认凭证链。 */
+  ssmProfile?: string;
 }
 
 export interface AgentProfile {

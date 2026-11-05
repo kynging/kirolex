@@ -51,9 +51,13 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
+import { transportArgs, connectTimeoutFor, assertSafeSshHost, isSsm } from './sshProxy.ts';
 import { batchModeFor, sshEnv } from './sshAuth.ts';
 import { tr } from './uiText.ts';
+import type { RemoteTarget } from './config';
+
+/** SSM 那几个字段跟着目标一路传到 master（`transportArgs` 靠它们拼 ProxyCommand）。 */
+type MuxSsm = Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'>;
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -145,12 +149,12 @@ export function masterArgs(opts: {
    * 远端那个端口对这台机器上所有进程都通，走哪条连接起的执行器都能用它。
    */
   forward?: boolean;
-}): string[] {
+} & MuxSsm): string[] {
   assertSafeSshHost(opts.sshHost);
   const args = [
     '-N',
     '-o', batchModeFor(opts),
-    '-o', 'ConnectTimeout=10',
+    '-o', `ConnectTimeout=${connectTimeoutFor(opts)}`,
     /*
       15 秒 × 3 次：死连接 45 秒内认出来、master 退出、排重建 ——「断网再恢复后一分钟内回来」
       靠的就是这一档。正常退出时 ssh 会给对端发断开，远端那条 sshd-session 当场就走。
@@ -170,8 +174,8 @@ export function masterArgs(opts: {
   if (opts.passwordCipher) args.push('-o', 'NumberOfPasswordPrompts=1');
   if (opts.identityFile) args.push('-i', opts.identityFile);
   if (opts.sshPort && opts.sshPort !== 22) args.push('-p', String(opts.sshPort));
-  /* master 是**唯一**真正建连接的那条，跳板必须在它身上 */
-  args.push(...proxyArgs({ proxyJump: opts.proxyJump, identityFile: opts.identityFile }));
+  /* master 是**唯一**真正建连接的那条，跳板 / SSM 的 ProxyCommand 必须在它身上 */
+  args.push(...transportArgs(opts));
   args.push(opts.sshHost);
   return args;
 }
@@ -330,7 +334,7 @@ export interface MuxDeps {
   /** 平台（默认 `process.platform`）。可注入只为测试。 */
   platform?: string;
   /**
-   * 等 socket 出现的上限（毫秒，默认 12 秒）。
+   * 等 socket 出现的上限（毫秒；默认直连 12 秒、SSM 45 秒，见 `masterWaitMs`）。
    *
    * 做成可注入的**只为测试**：真机上这个值要够大（跨洋 ssh 握手 + 跳板两跳），
    * 而测试里没有真 socket，照 12 秒等就是让整个测试套慢 12 秒。
@@ -361,7 +365,7 @@ export class SshMux {
   private healTimers = new Map<string, NodeJS.Timeout>();
   private healAttempts = new Map<string, number>();
   /** 最后一次用过的目标（自愈时要用同一把钥匙、同一个跳板）。 */
-  private lastTarget = new Map<string, { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string }>();
+  private lastTarget = new Map<string, { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string } & MuxSsm>();
   private deps: MuxDeps;
   private dir: string;
   /**
@@ -427,7 +431,7 @@ export class SshMux {
    * 返回能用的那条 socket；开不了（第一条都不在、备用到顶、建不起来）返回 undefined，
    * 调用方据此把报错说成人话（`sessionsFullMessage`）。几条会话同时撞上满时共用同一次建立。
    */
-  async openSpare(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<string | undefined> {
+  async openSpare(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string } & MuxSsm): Promise<string | undefined> {
     if (!muxSupported(this.deps.platform)) return undefined;
     const key = muxKey(target.sshHost, target.sshPort);
     const main = this.entries.get(key);
@@ -441,7 +445,7 @@ export class SshMux {
     return p;
   }
 
-  private async startSpare(key: string, base: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<string | undefined> {
+  private async startSpare(key: string, base: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string } & MuxSsm): Promise<string | undefined> {
     const list = (this.spares.get(key) || []).filter(alive);
     this.spares.set(key, list);
     if (list.length >= MAX_SPARES) {
@@ -470,7 +474,7 @@ export class SshMux {
       clearStaleSocket(socket);
       this.deps.log('info', `${key} 的备用复用连接 ${socket} 退出了（code=${code}）`);
     });
-    const ok = await waitFor(async () => exited || await this.probe(socket), this.deps.socketWaitMs ?? 12_000);
+    const ok = await waitFor(async () => exited || await this.probe(socket), masterWaitMs(target, this.deps.socketWaitMs));
     /* 等的时候这台机器被 close 了（第一条也没了）：不登记 */
     if (!this.entries.has(key)) {
       try { proc.kill(); } catch { /* 已经没了 */ }
@@ -505,7 +509,7 @@ export class SshMux {
    * 会话会各起一个 master，而第 2 个开始全部因为 socket 已存在而失败，
    * 表现是"只有第一条会话有工具"。
    */
-  async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<MuxEntry> {
+  async ensure(target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string } & MuxSsm): Promise<MuxEntry> {
     /*
       **Windows 上直接说"没有"** —— 见 `muxSupported`。抛出去而不是返回 undefined:
       调用方要据此走"每条会话自己一条连接"那条路，而一个 undefined 很容易被当成
@@ -569,7 +573,7 @@ export class SshMux {
     this.healTimers.set(key, t);
   }
 
-  private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string }): Promise<MuxEntry> {
+  private async start(key: string, target: { sshHost: string; sshPort?: number; identityFile?: string; proxyJump?: string; passwordCipher?: string } & MuxSsm): Promise<MuxEntry> {
     /* 上一次留下的：进程记录先清掉，僵尸 socket 也删 —— 否则 master 会因为"文件已存在"直接退 */
     const old = this.entries.get(key);
     if (old) { try { old.proc.kill(); } catch { /* 已经没了 */ } this.entries.delete(key); }
@@ -632,7 +636,7 @@ export class SshMux {
     */
     const ok = await waitFor(
       async () => exited || (entry.remotePort > 0 && await this.probe(socket)),
-      this.deps.socketWaitMs ?? 12_000,
+      masterWaitMs(target, this.deps.socketWaitMs),
     );
     /* 等的这段时间里被 `close` 了（退出、这台机器不要了）：不许再登记、不许 onReady */
     const cancelled = this.startingProcs.get(key) !== proc;
@@ -711,6 +715,18 @@ function alive(e: MuxEntry): boolean {
 }
 
 /** 轮着等一个条件成立。`probeSocket` 本身就有超时，所以这里间隔可以短。 */
+/** 直连 / 跳板：等主连接（socket + 隧道）就绪的上限。 */
+export const MASTER_WAIT_MS = 12_000;
+/**
+ * SSM：ssh 的 `ConnectTimeout` 放宽到了 30 秒（start-session 握手比直连慢），外面这层等待要盖得住它，
+ * 再加上 `-R` 隧道回话的时间 —— 否则 12 秒一到就把一条还在握手的连接 kill 掉，自愈重试也次次撞同一堵墙。
+ */
+export const SSM_MASTER_WAIT_MS = 45_000;
+/** 等主连接就绪的上限：测试注入的值优先，否则按连接方式。 */
+export function masterWaitMs(target: Pick<RemoteTarget, 'connectVia'>, override?: number): number {
+  return override ?? (isSsm(target) ? SSM_MASTER_WAIT_MS : MASTER_WAIT_MS);
+}
+
 export async function waitFor(check: () => Promise<boolean>, timeoutMs: number, stepMs = 150): Promise<boolean> {
   const until = Date.now() + timeoutMs;
   for (;;) {

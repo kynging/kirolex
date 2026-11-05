@@ -8670,6 +8670,18 @@ button, input, select, textarea {
 }
 .remote-field-control { flex: 1 1 auto; min-width: 0; }
 .remote-field-control .settings-input { width: 100%; }
+/* 「连接方式：SSH / AWS SSM」单选 + SSM 小徽标 */
+.remote-via { display: flex; align-items: center; gap: 14px; font-size: 12px; }
+.remote-via label { display: inline-flex; align-items: center; gap: 4px; cursor: pointer; }
+.remote-badge-ssm {
+  font-size: 10px;
+  font-weight: 600;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: rgba(255, 153, 0, 0.18);
+  color: #ffb84d;
+  border: 1px solid rgba(255, 153, 0, 0.45);
+}
 
 /* 右键菜单的子菜单（「运行位置」那条 → 右侧展开）。
    面板挂在父项上、`left: 100%`：父菜单已经被 placeMenu 摆进视口了，子菜单跟着它走就行 ——

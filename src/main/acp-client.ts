@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
 import { ToolCallLedger } from './remoteWriteGuard.ts';
-import { proxyArgs, assertSafeSshHost } from './sshProxy.ts';
+import { transportArgs, connectTimeoutFor, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, adapterAuthMessage, adapterMissingMessage, isAuthRequiredError, resolveAdapter, type Engine } from './engines.ts';
 import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
@@ -1419,7 +1419,7 @@ export function buildSshArgs(
   }
   const args: string[] = [
     '-o', batchModeFor(remote),
-    '-o', 'ConnectTimeout=10',
+    '-o', `ConnectTimeout=${connectTimeoutFor(remote)}`,
     '-o', 'ServerAliveInterval=30',
     '-o', 'ServerAliveCountMax=3',
     '-o', 'StrictHostKeyChecking=accept-new',
@@ -1434,8 +1434,9 @@ export function buildSshArgs(
   if (remote.sshPort && remote.sshPort !== 22) args.push('-p', String(remote.sshPort));
   /*
     跳板要在**建连接**的这一路上（复用路径上面已经 return 了 —— 走已有连接时那一跳早就跳过了）。
+    SSM 模式的 ProxyCommand 也在这里（同一个分支点，见 sshProxy.ts `transportArgs`）。
   */
-  args.push(...proxyArgs(remote));
+  args.push(...transportArgs(remote));
   args.push(remote.sshHost, remoteCommand);
   return args;
 }

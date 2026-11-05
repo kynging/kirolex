@@ -17,6 +17,7 @@
  * 跳板可以带端口：`ec2-user@1.2.3.4:2222`。
  */
 
+import fs from 'fs';
 import type { RemoteTarget } from './config';
 import { tr } from './uiText.ts';
 
@@ -99,4 +100,143 @@ export function proxyArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile
   */
   parts.push('-W', '%h:%p', shq(dest));
   return ['-o', `ProxyCommand=${parts.join(' ')}`];
+}
+
+/* ------------------------------------------------------------------ AWS SSM */
+
+/**
+ * **通过 AWS SSM 连（SSH over SSM）** —— 机器不开 22 端口、没有公网 IP，按 instance-id 连。
+ *
+ * 只换**传输层**：`ProxyCommand = aws ssm start-session … AWS-StartSSHSession`，ssh 自己照旧跑在上面。
+ * 所以 ControlMaster 复用、`-R` 反向隧道（本机 MCP 全靠它）、stdio 上的 ACP、保活全都不变。
+ *
+ * 为什么不用纯 SSM（start-session 直接 exec 引擎）：SSM 端口转发只有本机→远端方向，没有反向隧道，
+ * 本机工具全挂；start-session 默认还带 pty，stdio 不是二进制干净的，ACP 跑不了。
+ *
+ * 下面三个值都会拼进交给 shell 跑的 `ProxyCommand`，所以是**白名单**（和 `validJump` 同一个理由）。
+ */
+export const SSM_INSTANCE_RE = /^(i|mi)-[0-9a-f]{8,17}$/;
+export const SSM_REGION_RE = /^[a-z]{2}(-[a-z]+)+-\d$/;
+export const SSM_PROFILE_RE = /^[A-Za-z0-9_.+-]{1,64}$/;
+
+/** start-session 握手比直连慢（要先过 SSM 的 websocket），直连那个 10 秒不够。 */
+export const SSM_CONNECT_TIMEOUT_S = 30;
+
+type SsmFields = Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile' | 'sshPort'>;
+
+export function isSsm(remote: Pick<RemoteTarget, 'connectVia'> | undefined): boolean {
+  return remote?.connectVia === 'ssm';
+}
+
+/** SSM 的三个字段对不对。返回一句给人看的错误，或者 `null`。 */
+export function ssmFieldError(remote: SsmFields): string | null {
+  if (!SSM_INSTANCE_RE.test(String(remote.ssmInstanceId || ''))) return tr('The instance ID must look like i-0123456789abcdef0 (i- or mi- followed by 8-17 hex digits).');
+  if (!SSM_REGION_RE.test(String(remote.ssmRegion || ''))) return tr('The region must look like us-east-1 or ap-northeast-1.');
+  if (remote.ssmProfile && !SSM_PROFILE_RE.test(String(remote.ssmProfile))) return tr('The AWS profile may only contain letters, digits and `_ . + -` (at most 64).');
+  return null;
+}
+
+/**
+ * 在本机找 `aws` / `session-manager-plugin` 的**绝对路径**。
+ *
+ * 先 PATH，再试 `/usr/local/bin`、`/opt/homebrew/bin` —— 从 Finder / Dock 启动的 app 拿到的 PATH
+ * 只有 `/usr/bin:/bin:/usr/sbin:/sbin`，而官方安装包恰好装在 `/usr/local/bin`。找不到返回 `undefined`。
+ */
+export function findLocalTool(
+  name: string,
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = defaultExists,
+  platform: NodeJS.Platform = process.platform,
+): string | undefined {
+  const win = platform === 'win32';
+  const sep = win ? ';' : ':';
+  const dirs = String(env.PATH || env.Path || '').split(sep).filter(Boolean);
+  const extra = win
+    ? [`${env.ProgramFiles || 'C:\\Program Files'}\\Amazon\\AWSCLIV2`, `${env.ProgramFiles || 'C:\\Program Files'}\\Amazon\\SessionManagerPlugin\\bin`]
+    : ['/usr/local/bin', '/opt/homebrew/bin'];
+  const names = win ? [`${name}.exe`, name] : [name];
+  for (const d of [...dirs, ...extra]) {
+    for (const n of names) {
+      const p = win ? `${d.replace(/[\\/]+$/, '')}\\${n}` : `${d.replace(/\/+$/, '')}/${n}`;
+      if (exists(p)) return p;
+    }
+  }
+  return undefined;
+}
+
+function defaultExists(p: string): boolean {
+  try { return fs.statSync(p).isFile(); } catch { return false; }
+}
+
+/** 目录名（两种分隔符都认）。 */
+function dirOf(p: string): string {
+  const i = Math.max(p.lastIndexOf('/'), p.lastIndexOf('\\'));
+  return i > 0 ? p.slice(0, i) : p;
+}
+
+/**
+ * `ProxyCommand` 的值：`aws ssm start-session --target <id> --document-name AWS-StartSSHSession
+ * --parameters portNumber=<port> --region <r> [--profile <p>]`。
+ *
+ * `aws` 用绝对路径并包单引号（路径里可能有空格）。三个 SSM 值过了白名单才拼 —— 不对就抛，
+ * 不要退回直连：退回去的那条 ssh 会去连一个叫 `i-…` 的主机名，报出来的是看不懂的 DNS 错。
+ *
+ * `pluginDir`：session-manager-plugin 所在目录**不在** PATH 上时传进来（aws 是按 PATH 找它的），
+ * 这时前面套一层 `env PATH=…`。ssh 是 `exec <ProxyCommand>` 跑的，所以必须用 `env` 而不是 `PATH=… aws`。
+ */
+export function ssmProxyCommand(
+  remote: SsmFields,
+  opts: { aws?: string; pluginDir?: string } = {},
+): string {
+  const why = ssmFieldError(remote);
+  if (why) throw new Error(why);
+  const aws = opts.aws || findLocalTool('aws') || 'aws';
+  const port = remote.sshPort && remote.sshPort > 0 ? remote.sshPort : 22;
+  const parts = [
+    shq(aws), 'ssm', 'start-session',
+    '--target', String(remote.ssmInstanceId),
+    '--document-name', 'AWS-StartSSHSession',
+    '--parameters', `portNumber=${port}`,
+    '--region', String(remote.ssmRegion),
+  ];
+  if (remote.ssmProfile) parts.push('--profile', String(remote.ssmProfile));
+  const cmd = parts.join(' ');
+  return opts.pluginDir ? `env PATH=${shq(opts.pluginDir)}:"$PATH" ${cmd}` : cmd;
+}
+
+/** 本机 session-manager-plugin 的目录 —— 只在它不在当前 PATH 上时返回（见 `ssmProxyCommand`）。 */
+export function pluginDirIfOffPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
+  if (process.platform === 'win32') return undefined;
+  const plugin = findLocalTool('session-manager-plugin', env);
+  if (!plugin) return undefined;
+  const dir = dirOf(plugin);
+  const onPath = String(env.PATH || '').split(':').some((d) => d.replace(/\/+$/, '') === dir);
+  return onPath ? undefined : dir;
+}
+
+/**
+ * **建连接那一路的传输参数**：SSM 时是 ProxyCommand + HostKeyAlias，否则就是原来的跳板参数
+ * （没跳板 = 空数组，直连那条路一个字节都不变）。`buildSshArgs` 和 mux 的 master 都走这里。
+ *
+ * `HostKeyAlias=<instance-id>`：known_hosts 按实例记主机密钥 —— IP 怎么变都是同一台。
+ */
+export function transportArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile'> & SsmFields): string[] {
+  if (!isSsm(remote)) return proxyArgs(remote);
+  return [
+    '-o', `ProxyCommand=${ssmProxyCommand(remote, { pluginDir: pluginDirIfOffPath() })}`,
+    '-o', `HostKeyAlias=${remote.ssmInstanceId}`,
+  ];
+}
+
+/**
+ * 一次性 ssh 命令（预检 / 测试连接）外层的 `execFile` 超时（毫秒）：直连照旧 30 秒；
+ * SSM 多给 30 秒 —— 光握手就可能用满 `ConnectTimeout=30`，外层同样 30 秒的话握手一慢就被杀。
+ */
+export function execTimeoutFor(remote: Pick<RemoteTarget, 'connectVia'>, base = 30_000): number {
+  return isSsm(remote) ? base + SSM_CONNECT_TIMEOUT_S * 1000 : base;
+}
+
+/** 建连接的超时（秒）：SSM 放宽到 30，直连照旧 10。 */
+export function connectTimeoutFor(remote: Pick<RemoteTarget, 'connectVia'>): number {
+  return isSsm(remote) ? SSM_CONNECT_TIMEOUT_S : 10;
 }

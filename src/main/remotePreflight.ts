@@ -11,6 +11,7 @@
 import type { RemoteTarget } from './config';
 import { tr, trList } from './uiText.ts';
 import { userInfo } from 'node:os';
+import { isSsm } from './sshProxy.ts';
 
 export type PreflightCode = 'ok' | 'unreachable' | 'missing-tools' | 'not-logged-in';
 
@@ -354,6 +355,11 @@ export function parseModelMeta(stdout: string): Record<string, { rate?: number; 
  */
 function sshFailure(stderr: string, remote: RemoteTarget): { why: string; hint: string } | null {
   const s = String(stderr || '');
+  /* SSM 模式下 ProxyCommand（aws ssm start-session）的报错也落在 ssh 的 stderr 里，先认它 */
+  if (isSsm(remote)) {
+    const ssm = ssmFailure(s, remote);
+    if (ssm) return ssm;
+  }
   if (/UNPROTECTED PRIVATE KEY FILE|bad permissions/i.test(s)) {
     const key = remote.identityFile || tr('<private key path>');
     const cmd = process.platform === 'win32'
@@ -402,4 +408,145 @@ function escape(s: string): string {
 function baseName(p: string): string {
   const parts = String(p).split('/');
   return parts[parts.length - 1] || p;
+}
+
+/* ------------------------------------------------------------------ AWS SSM */
+
+/**
+ * **SSM 的报错翻成人话** ——「通过 AWS SSM 连接」（sshProxy.ts `ssmProxyCommand`）。
+ *
+ * 来源有两处：ssh 的 stderr（ProxyCommand 里 `aws ssm start-session` 的错误会原样落在这里），
+ * 以及预检里 `aws sts` / `aws ssm describe-instance-information` 的输出。认不出返回 `null`。
+ *
+ * 顺序是故意的：插件没装时 aws 什么都没开始，后面的判断都无从谈起；凭证过期时 aws 也可能顺带说 AccessDenied。
+ */
+export function ssmFailure(stderr: string, remote: Pick<RemoteTarget, 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'>): { why: string; hint: string } | null {
+  const s = String(stderr || '');
+  const id = remote.ssmInstanceId || 'i-…';
+  if (/SessionManagerPlugin is not found|session-manager-plugin.*(not found|No such file)/i.test(s)) {
+    return {
+      why: tr('the AWS Session Manager plugin (session-manager-plugin) is not installed on this computer'),
+      hint: pluginInstallHint(),
+    };
+  }
+  if (/ExpiredToken|security token included in the request is expired|Token has expired|SSO session .*expired|Error when retrieving token from sso/i.test(s)) {
+    return {
+      why: tr('the AWS credentials have expired'),
+      hint: tr('Log in again or refresh them: `{cmd}` (or renew the temporary keys you use), then retry.', { cmd: awsLoginCmd(remote.ssmProfile) }),
+    };
+  }
+  if (/Unable to locate credentials|config profile .* could not be found|NoCredentialProviders|InvalidClientTokenId|UnrecognizedClientException/i.test(s)) {
+    return {
+      why: tr('no usable AWS credentials on this computer (profile: {profile})', { profile: remote.ssmProfile || 'default' }),
+      hint: tr('Run `{cmd}` (or fill in the right profile), then retry.', { cmd: remote.ssmProfile ? `aws configure --profile ${remote.ssmProfile}` : 'aws configure' }),
+    };
+  }
+  if (/TargetNotConnected/i.test(s)) {
+    return {
+      why: tr('{id} is not connected to SSM', { id }),
+      hint: ssmAgentHint(),
+    };
+  }
+  if (/AccessDenied|not authorized to perform/i.test(s)) {
+    return {
+      why: tr('your AWS identity is not allowed to start an SSM session on {id} (missing ssm:StartSession)', { id }),
+      hint: tr('Add this minimal permission to your IAM user/role: {policy}', { policy: ssmPolicySnippet(remote) }),
+    };
+  }
+  return null;
+}
+
+/** 最小权限片段：`ssm:StartSession`，资源是这台实例 + `AWS-StartSSHSession` 文档。 */
+export function ssmPolicySnippet(remote: Pick<RemoteTarget, 'ssmInstanceId' | 'ssmRegion'>): string {
+  const id = remote.ssmInstanceId || 'i-…';
+  const region = remote.ssmRegion || '*';
+  /* 混合激活的托管实例（`mi-`）ARN 不在 ec2 下 */
+  const target = id.startsWith('mi-')
+    ? `arn:aws:ssm:${region}:*:managed-instance/${id}`
+    : `arn:aws:ec2:${region}:*:instance/${id}`;
+  return JSON.stringify({ Effect: 'Allow', Action: 'ssm:StartSession', Resource: [target, 'arn:aws:ssm:*:*:document/AWS-StartSSHSession'] });
+}
+
+function awsLoginCmd(profile?: string): string {
+  return profile ? `aws sso login --profile ${profile}` : 'aws sso login';
+}
+
+function ssmAgentHint(): string {
+  return tr('The instance needs the SSM Agent running, an instance role with AmazonSSMManagedInstanceCore, and a network path to the SSM endpoints (internet/NAT or VPC endpoints for ssm, ssmmessages, ec2messages). Check it under Systems Manager → Fleet Manager.');
+}
+
+function pluginInstallHint(): string {
+  const how = process.platform === 'darwin'
+    ? '`brew install --cask session-manager-plugin`'
+    : 'https://docs.aws.amazon.com/systems-manager/latest/userguide/session-manager-working-with-install-plugin.html';
+  return tr('Install it: {how}', { how });
+}
+
+export interface SsmTools {
+  /** 本机 aws 的绝对路径（sshProxy.ts `findLocalTool`）；没找到为空。 */
+  aws?: string;
+  /** 本机 session-manager-plugin 的绝对路径；没找到为空。 */
+  plugin?: string;
+}
+
+/** 跑一条本机命令（注入，测试用假的）。 */
+export type SsmRun = (file: string, args: string[]) => Promise<{ code: number | null; stdout: string; stderr: string }>;
+
+/**
+ * **SSM 模式连接前的检查** —— 按顺序：本机工具 → 凭证 → 实例在不在线。
+ * 返回 `null` = 都过了（接下来照旧走一次 ssh）；否则返回一条 `unreachable` 的结论，话里说清原因和修法。
+ *
+ * 只读：`sts get-caller-identity` 和 `ssm describe-instance-information`，不改任何 AWS 资源。
+ */
+export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: SsmRun): Promise<Preflight | null> {
+  const host = remote.sshHost || remote.ssmInstanceId || 'remote';
+  const fail = (why: string, hint: string): Preflight => ({
+    code: 'unreachable',
+    message: tr('Cannot connect to {host} over AWS SSM: {why}. {hint}', { host, why, hint }),
+    raw: why,
+  });
+  if (!tools.aws) {
+    const how = process.platform === 'darwin'
+      ? '`brew install awscli`'
+      : 'https://docs.aws.amazon.com/cli/latest/userguide/getting-started-install.html';
+    return fail(tr('the AWS CLI (aws) is not installed on this computer'), tr('Install it: {how}', { how }));
+  }
+  if (!tools.plugin) return fail(tr('the AWS Session Manager plugin (session-manager-plugin) is not installed on this computer'), pluginInstallHint());
+  const common = ['--region', String(remote.ssmRegion || ''), ...(remote.ssmProfile ? ['--profile', remote.ssmProfile] : []), '--output', 'json'];
+  const who = await run(tools.aws, ['sts', 'get-caller-identity', ...common]);
+  if (who.code !== 0) {
+    const known = ssmFailure(who.stderr, remote);
+    if (known) return fail(known.why, known.hint);
+    const cmd = `aws sts get-caller-identity${remote.ssmProfile ? ` --profile ${remote.ssmProfile}` : ''}`;
+    return fail(tr('the AWS credentials do not work ({err})', { err: firstLine(who.stderr) || `exit ${who.code}` }), tr('Run `{cmd}` to see why.', { cmd }));
+  }
+  const info = await run(tools.aws, ['ssm', 'describe-instance-information', '--filters', `Key=InstanceIds,Values=${remote.ssmInstanceId}`, ...common]);
+  if (info.code !== 0) {
+    /*
+      **没有 describe 权限不算失败**：我们给的最小权限只有 `ssm:StartSession`，照着配的人这里一定被拒，
+      而连接本身照样能通。只有认得出的硬伤（凭证过期之类）才拦；其余交给接下来那次 ssh 说话。
+    */
+    if (/AccessDenied|not authorized to perform/i.test(info.stderr)) return null;
+    const known = ssmFailure(info.stderr, remote);
+    return known ? fail(known.why, known.hint) : null;
+  }
+  const ping = ssmPingStatus(info.stdout);
+  if (ping !== 'Online') {
+    return fail(
+      ping
+        ? tr('{id} is registered in SSM but its status is {status}', { id: remote.ssmInstanceId || '', status: ping })
+        : tr('{id} is not registered in SSM in {region}', { id: remote.ssmInstanceId || '', region: remote.ssmRegion || '' }),
+      ssmAgentHint(),
+    );
+  }
+  return null;
+}
+
+/** `describe-instance-information` 的 JSON 里那台的 PingStatus；列表空 / 解析不了返回 `undefined`。 */
+export function ssmPingStatus(stdout: string): string | undefined {
+  try {
+    const list = JSON.parse(String(stdout || ''))?.InstanceInformationList;
+    const st = Array.isArray(list) && list[0]?.PingStatus;
+    return typeof st === 'string' && st ? st : undefined;
+  } catch { return undefined; }
 }

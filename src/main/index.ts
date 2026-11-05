@@ -5,6 +5,7 @@ import os from 'os';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
+import { isSsm, findLocalTool, execTimeoutFor } from './sshProxy.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, adapterMissingMessage, adapterAuthMessage, type Engine } from './engines.ts';
@@ -98,7 +99,7 @@ import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { bundleOmitsSessionContent, diagnosticPromptText, writeFailureBundle } from './failureBundle.ts';
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
-import { judgePreflight, preflightScript, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
+import { judgePreflight, preflightScript, ssmPreflight, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
 import { remoteWriteVerdict, strayRemoteDeliverables, blockedWriteNotice, strayWriteNotice, saveRemoteCopy, captureBufferFor } from './remoteWriteGuard.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
@@ -140,7 +141,7 @@ import {
   ownerTag, ownedAgentPrefix, LISTENING_PORTS_SCRIPT, parseListeningPorts,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
+import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, ssmFieldsOf, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
 import { createAdapterNotes } from './adapterNotes.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
 import { newQuestionCard, closeQuestionCard, buildAcceptContent, elicitationResult, questionTailText, type QuestionCard, type QuestionStatus, type QuestionValue } from './elicitation.ts';
@@ -4168,7 +4169,7 @@ async function remoteEngineStatusesFor(target: RemoteTarget, force = false): Pro
   const host = target.sshHost || '';
   const args = buildSshArgs(target, `bash -lc ${shellQuote(testConnectionScript(preflightScript(undefined, { models: false })))}`);
   const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-    execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
+    execFile('ssh', args, { timeout: execTimeoutFor(target), encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
       code: err ? (typeof err.code === 'number' ? err.code : 1) : 0, stdout: String(stdout || ''), stderr: String(stderr || ''),
     }));
   });
@@ -4396,7 +4397,7 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
   for (let attempt = 1; attempt <= PREFLIGHT_ATTEMPTS; attempt += 1) {
     const socket = sshMux.liveSocketFor(remote);
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(remote) }, (err: any, stdout, stderr) => resolve({
+      execFile('ssh', args, { timeout: execTimeoutFor(remote), encoding: 'utf8', env: sshEnv(remote) }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
         stdout: String(stdout || ''),
         stderr: String(stderr || ''),
@@ -4480,9 +4481,32 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
     logger.info('remote', `preflight ${host}: ${wait}ms 后再试一次（这类失败常在几秒内自愈）`);
     await new Promise((r) => setTimeout(r, wait));
   }
+  if (verdict.code === 'unreachable' && isSsm(remote) && !/SSM/.test(verdict.message)) {
+    const ssm = await checkSsm(remote).catch(() => null);
+    if (ssm) verdict = ssm;
+  }
   /* 记进熔断器：紧接着的那些会话直接复用，别把 sshd 压得更死 */
   reachability.fail(host, verdict.message);
   throw new Error(verdict.message);
+}
+
+/**
+ * **SSM 模式本机这一侧的检查**（remotePreflight.ts `ssmPreflight`）：aws / session-manager-plugin 在不在、
+ * 凭证能不能用、实例在 SSM 里是否在线。只跑只读命令。`null` = 都过了。
+ *
+ * 「测试连接」先跑它：这几样不对时那次 ssh 只会报 "Connection closed by UNKNOWN port 65535"，看不出是哪一环。
+ */
+async function checkSsm(remote: RemoteTarget): Promise<ReturnType<typeof judgePreflight> | null> {
+  const tools = { aws: findLocalTool('aws'), plugin: findLocalTool('session-manager-plugin') };
+  const verdict = await ssmPreflight(remote, tools, (file, args) => new Promise((resolve) => {
+    execFile(file, args, { timeout: 20_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
+      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+      stdout: String(stdout || ''),
+      stderr: String(stderr || (err && typeof err.code !== 'number' ? err.message : '') || ''),
+    }));
+  }));
+  logger.info('remote', `ssm 预检 ${remote.sshHost}（aws=${tools.aws || '无'}，plugin=${tools.plugin || '无'}）：${verdict ? verdict.message : '通过'}`);
+  return verdict;
 }
 
 /**
@@ -17232,6 +17256,11 @@ ${hint}` : ''}` };
         identityFile: t.identityFile,
         proxyJump: t.proxyJump,
         remoteWorkdir: t.remoteWorkdir,
+        /* 通过 AWS SSM 连（缺省 ssh）—— 同一条：漏发 = 自动保存把它抹掉 */
+        connectVia: t.connectVia,
+        ssmInstanceId: t.ssmInstanceId,
+        ssmRegion: t.ssmRegion,
+        ssmProfile: t.ssmProfile,
         /* 三个 CLI 的启动命令 —— 漏发一个字段 = 自动保存把它抹掉（见上面那段） */
         bins: t.bins,
         /* 设置页靠它决定默认显示哪一台（最近编辑的） */
@@ -17347,7 +17376,7 @@ ${hint}` : ''}` };
       const { password: _pw, clearPassword: _clr, ...rest } = input as any;
       const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, { ...rest, ...passwordFields(input) });
       logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})${saved.passwordCipher ? '，带密码' : ''}`);
-      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher } };
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher, connectVia: saved.connectVia, ssmInstanceId: saved.ssmInstanceId, ssmRegion: saved.ssmRegion, ssmProfile: saved.ssmProfile } };
     } catch (err: any) {
       return { ok: false, error: err?.message || tr('Save failed') };
     }
@@ -17386,6 +17415,7 @@ ${hint}` : ''}` };
       identityFile: input.identityFile ? expandHome(String(input.identityFile)) : undefined,
       proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
       passwordCipher: passwordCipherForUse(input),
+      ...ssmFieldsOf(input),
     } as RemoteTarget;
     /* 脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里 */
     const candidates = [
@@ -17822,12 +17852,15 @@ ${hint}` : ''}` };
       proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
       remoteWorkdir: input.remoteWorkdir || undefined,
       passwordCipher: passwordCipherForUse(input),
+      ...ssmFieldsOf(input),
     } as RemoteTarget;
+    const ssm = isSsm(target) ? await checkSsm(target) : null;
+    if (ssm) return { ok: false, code: ssm.code, message: ssm.message };
     /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */
     /* kiro 的预检之后顺带探两家适配器（同一次 ssh）：只为 Claude Code / Codex 配的机器也要能测通 */
     const args = buildSshArgs(target, `bash -lc ${shellQuote(testConnectionScript(preflightScript(undefined, { models: false })))}`);
     const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
-      execFile('ssh', args, { timeout: 30_000, encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
+      execFile('ssh', args, { timeout: execTimeoutFor(target), encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
         code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
         stdout: String(stdout || ''),
         stderr: String(stderr || ''),

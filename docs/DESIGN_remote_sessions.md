@@ -178,6 +178,60 @@ kiro-cli 对不存在的模型是**静默退回**（日志里见过 `Model 'gpt-
   复用同一个端口会撞上还没退出的旧 ssh —— `ExitOnForwardFailure=yes` 让它直接失败（ssh exit 255），
   看起来像掉线，其实必然发生、重试也必然再撞。
 
+## 通过 AWS SSM 连接（SSH over SSM）
+
+设置 → 机器 →「连接方式：SSH / AWS SSM」。选 SSM 时机器**不用开 22 端口、不用公网 IP**，按实例 ID 连，IP 变了也不受影响。
+
+### 原理：只换传输层
+
+```
+ProxyCommand = '<aws 绝对路径>' ssm start-session --target <instance-id> --document-name AWS-StartSSHSession
+               --parameters portNumber=<sshPort> --region <region> [--profile <profile>]
+```
+
+ssh 照旧跑在这条 SSM 会话上，所以 **ControlMaster 复用、`-R` 反向隧道（`kirolex-local` 等本机 MCP 全靠它）、
+stdio 上的 ACP、ServerAliveInterval 保活全都不变**。`buildSshArgs`（acp-client.ts）和 mux 主连接 `masterArgs`（sshMux.ts）
+在跳板那个分支点上调 `transportArgs`（sshProxy.ts）：SSM 时给 ProxyCommand + `HostKeyAlias=<instance-id>`
+（known_hosts 按实例记），直连 / 跳板照旧走 `proxyArgs`。SSM 时 `ConnectTimeout` 放宽到 30 秒（start-session 握手比直连慢）。
+
+**不做纯 SSM**（start-session 直接 exec 引擎）：SSM 端口转发只有本机→远端方向，没有反向隧道，本机工具全挂；
+start-session 默认带 pty，stdio 不是二进制干净的，ACP 跑不了。
+
+配置（`remotes[]`）：`connectVia: 'ssm'`（缺省 `ssh`，老配置不变）、`ssmInstanceId`（必填）、`ssmRegion`（必填）、`ssmProfile`（可选，
+缺省走默认凭证链）；`sshHost` 是 `<登录用户>@<instance-id>`（默认 `ec2-user`），SSH 认证照旧用 `identityFile`。
+这几个值会拼进交给 shell 跑的 ProxyCommand，`validateTarget` 用白名单校验：instance-id `^(i|mi)-[0-9a-f]{8,17}$`、
+region `^[a-z]{2}(-[a-z]+)+-\d$`、profile `^[A-Za-z0-9_.+-]{1,64}$`；跳板和 SSM 不能同时设。`aws` 用绝对路径
+（PATH 里找不到时试 `/usr/local/bin`、`/opt/homebrew/bin` —— 从 Finder 启动的 app 的 PATH 里没有它们），包单引号；
+`session-manager-plugin` 不在当前 PATH 上时，ProxyCommand 前面套 `env PATH=<插件目录>:"$PATH"`（aws 是按 PATH 找插件的）。
+
+### 要求
+
+* **EC2 侧**：SSM Agent 在跑（Amazon Linux 2/2023、Ubuntu 官方 AMI 自带）；实例角色带 `AmazonSSMManagedInstanceCore`；
+  能连到 SSM 终端节点（公网 / NAT，或 `ssm`、`ssmmessages`、`ec2messages` 三个 VPC 终端节点）。sshd 照常在跑（只在本机回环上被 SSM 连）。
+* **本机**：`aws` CLI v2 + `session-manager-plugin`；能用的凭证（`aws sts get-caller-identity` 能过）。
+* **IAM 最小权限**：
+  ```json
+  { "Effect": "Allow", "Action": "ssm:StartSession",
+    "Resource": ["arn:aws:ec2:<region>:<account>:instance/<instance-id>", "arn:aws:ssm:*:*:document/AWS-StartSSHSession"] }
+  ```
+  （预检里的 `ssm:DescribeInstanceInformation` 没有权限时只是跳过那一步，不拦。）
+
+### 连接前检查（remotePreflight.ts `ssmPreflight`）
+
+「测试连接」先按顺序查本机这一侧，再走一次 ssh：aws / session-manager-plugin 在不在（没装给安装命令或官方链接）→
+`aws sts get-caller-identity`（过期提示 `aws sso login` / 刷新）→ `aws ssm describe-instance-information`（PingStatus 不是 Online 时
+说明需要 SSM Agent + 实例角色 + 终端节点）。会话启动的预检照旧只走一次 ssh；失败时 ssh stderr 里 ProxyCommand 的报错
+（`TargetNotConnected`、`AccessDeniedException`（给出上面那段最小权限）、`SessionManagerPlugin is not found`、`ExpiredToken`）
+先翻成人话（`ssmFailure`），认不出来再补跑一遍上面的检查说出是哪一环。全部只读，不改任何 AWS 资源。
+
+### 已知限制
+
+* SSM 会话受账号的 **Session Manager 首选项**约束（空闲超时默认 20 分钟、最长会话时长）。ssh 每 15 / 30 秒的
+  ServerAlive 保活通常让它不算"空闲"，但到了最长时长 SSM 会把会话断掉 —— 断开后按现有的断线重挂机制恢复
+  （主连接自愈 `scheduleHeal`、执行器断线重连），跟网络抖断一样。
+* Windows 上没验证过（ProxyCommand 的单引号写法是给 `/bin/sh` 的）；目标环境是 macOS。
+* 不做 EC2 Instance Connect 自动推临时公钥（以后可以单独做），SSH 认证仍用 `identityFile`。
+
 ## 会话可以选多个目录
 
 一条会话带的是一**组**目录（第一个是主目录 = `local_bash` 的 cwd、相对路径的基准）。
