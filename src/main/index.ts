@@ -64,6 +64,7 @@ import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './
 import { McpComboWatcher, comboFingerprint, remountExclusive, COMBO_FILE_BROKEN } from './mcpComboWatch.ts';
 import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
+import { AwsCredsResolver, resolveSyncSnapshot, lockThenResolve, type RunLock, syncConfigProblem, credentialSourceOf, credsLogLabel, validProfileName, type SyncCredsResult } from './awsProfileCreds.ts';
 import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
 import {
   serialQueue, catalogIO, updateCatalog, readCatalog, deleteSessionBackups, writeSyncCatalog, forgetMissingEntries,
@@ -6184,29 +6185,40 @@ function saveSyncConfig(next: SyncConfig): void {
   fs.writeFileSync(KIROLEX_CONFIG_PATH, JSON.stringify(cfg, null, 2));
 }
 
-/** 配好了没有 —— 缺哪一项就说哪一项（"同步没生效"必须能查）。 */
-function syncCredsOrProblem(): { creds?: S3Creds; problem?: string } {
-  const cfg = loadSyncConfig();
-  const missing = [
-    !cfg.bucket && 'bucket',
-    !cfg.region && 'region',
-    !cfg.accessKeyId && 'Access Key ID',
-    !cfg.secretCipher && 'Secret Access Key',
-  ].filter(Boolean) as string[];
-  if (missing.length) return { problem: tr('S3 backup is not fully set up: missing {fields} (Settings → ☁️ Backup).', { fields: trList(missing) }) };
-  const secretAccessKey = decryptSecret(cfg.secretCipher);
-  if (!secretAccessKey) {
-    return { problem: tr('The S3 secret can\'t be decrypted any more: the key in the keychain has changed (new machine or reinstall?). Enter it again.') };
-  }
-  return {
-    creds: {
-      accessKeyId: cfg.accessKeyId!, secretAccessKey,
-      region: cfg.region!, bucket: cfg.bucket!, endpoint: cfg.endpoint,
+/**
+ * 临时凭证（AWS profile / 默认凭证链）的内存缓存。跑 aws 用登录 shell 的环境（Dock 启动时 PATH 才全）。
+ * 凭证只在内存里，不写 config.json、不进日志。
+ */
+const awsCreds = new AwsCredsResolver({ env: () => shellEnv });
+/** 最近一次取凭证是不是 SSO 过期（设置页据此给「打开终端登录」）。`profile` undefined = 默认凭证链。 */
+let lastSsoExpired: { profile?: string } | null = null;
+
+/**
+ * 配好了没有 —— 缺哪一项就说哪一项（"同步没生效"必须能查）。
+ * 凭证来源缺省 = AK/SK（和原来一模一样）；profile / 默认凭证链从 aws CLI 取临时凭证（`awsProfileCreds.ts`）。
+ * 返回的 `cfg` 是取凭证时用的那份配置快照 —— **调用方后面的请求都用它，不要再 loadSyncConfig()**
+ * （取凭证要等 aws CLI，期间配置被改的话，再读一次就是「旧凭证 + 新桶 / 新前缀」）。
+ */
+async function resolveSyncCredsNow(): Promise<SyncCredsResult & { cfg: SyncConfig }> {
+  const r = await resolveSyncSnapshot(loadSyncConfig, {
+    decrypt: decryptSecret, resolver: awsCreds,
+    /* 操作途中 S3 拒了旧 token、重取时 SSO 过期：同样让设置页给「打开终端登录」 */
+    onRefreshSso: (login) => {
+      lastSsoExpired = login;
+      if (login) logger.warn('s3', `重取 AWS 凭证时 SSO 过期（${login.profile ? `profile=${login.profile}` : '默认凭证链'}）`);
     },
-  };
+  });
+  const cfg = r.cfg;
+  if (credentialSourceOf(cfg) !== 'keys') {
+    lastSsoExpired = r.ssoLogin || null;
+    if (r.problem) logger.warn('s3', `取 AWS 凭证失败（${credsLogLabel(cfg, maskKeyId)}）：${r.problem.split('\n')[0]}`);
+  }
+  return r;
 }
 
 let syncRunning = false;
+/** 同步一次只跑一轮：`lockThenResolve` 经它占 / 放 `syncRunning`（取凭证之前就占住）。 */
+const syncLock: RunLock = { get held() { return syncRunning; }, set held(v: boolean) { syncRunning = v; } };
 
 /**
  * **本机对 catalog.json 的操作排成一队**（删除 / 同步写 catalog / 恢复时清目录 / 以本机为准 / 从目录里移除）——
@@ -6747,7 +6759,7 @@ function isOffloadedPlaceholder(id: string): boolean {
  * 中途失败：暂存目录删掉、正式目录不出现、占位保留，下次可以再点。返回值和 s3:restore 同形状。
  */
 async function offloadRestoreImpl(id: string): Promise<any> {
-  const { creds, problem } = syncCredsOrProblem();
+  const { creds, problem } = await resolveSyncCredsNow();
   if (problem) return { ok: false, error: problem };
   const placeholder = readOffloadState(OFFLOAD_STATE_PATH).offloaded[id];
   if (!placeholder) return { ok: false, error: tr('This session is not in the cloud-only list.') };
@@ -6901,10 +6913,11 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     logger.info('s3', `跳过这一次定时同步（连续失败 ${syncFailures} 次，退避到 ${new Date(syncNextAllowedAt).toLocaleTimeString()}）`);
     return { ok: false, uploaded: 0, skipped: 0, error: tr('Backing off') };
   }
-  const { creds, problem } = syncCredsOrProblem();
+  /* 取凭证（aws CLI，可能好几秒）之前就占住锁；没取到凭证时 lockThenResolve 自己放掉，取到了由下面整轮的 finally 放 */
+  const resolved = await lockThenResolve(syncLock, resolveSyncCredsNow);
+  if (!resolved) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
+  const { creds, problem, cfg } = resolved;
   if (problem) return { ok: false, uploaded: 0, skipped: 0, error: problem };
-  syncRunning = true;
-  const cfg = loadSyncConfig();
   const state = readState(S3_STATE_PATH);
   const marks = readSessionMarks(S3_MARKS_PATH);
   /** 这一轮真的传了文件的那些会话 —— 只给它们更新"最后同步时间"。 */
@@ -7001,7 +7014,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     }
     logger.info('s3', `同步开始（${reason}）：${plan.upload.length} 个要传、${plan.skippedUnchanged} 个没变`
       + `${plan.skippedTooBig.length ? `、${plan.skippedTooBig.length} 个太大跳过` : ''}`
-      + ` bucket=${cfg.bucket} key=${maskKeyId(cfg.accessKeyId)}`);
+      + ` bucket=${cfg.bucket} ${credsLogLabel(cfg, maskKeyId)}`);
     for (const rel of plan.skippedTooBig) {
       logger.warn('s3', `跳过（超过 ${MAX_FILE_BYTES / 1024 / 1024}MB）：${rel}`);
     }
@@ -8875,6 +8888,11 @@ app.whenReady().then(async () => {
       intervalMinutes: Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES,
       accessKeyId: cfg.accessKeyId || '',
       hasSecret: !!cfg.secretCipher,
+      /* 凭证来源（AK/SK / AWS profile / 默认凭证链）—— 临时凭证本身不回渲染层 */
+      credentialSource: credentialSourceOf(cfg),
+      awsProfile: cfg.awsProfile || '',
+      /* 最近一次取凭证 SSO 过期了 → 界面给「打开终端登录」 */
+      ssoLogin: credentialSourceOf(cfg) !== 'keys' ? lastSsoExpired : null,
       encryptionAvailable: safeStorage.isEncryptionAvailable(),
       last: lastSyncSummary,
       /* 云端自动清理（cloudTrash.ts）：开关默认开、活跃设备 90 天、回收站保留 30 天 */
@@ -8885,7 +8903,7 @@ app.whenReady().then(async () => {
       autoOffload: offloadSettings(cfg).enabled,
       offloadIdleDays: offloadSettings(cfg).days || offloadSettings({}).days,
       /* 凭据现在用不用得了（缺字段 / 密钥解不开）—— 「移到云端」那项据此置灰并说原因 */
-      credsProblem: syncCredsOrProblem().problem || '',   // 0（不移）在界面上显示成开关关、天数默认
+      credsProblem: syncConfigProblem(cfg, decryptSecret),   // 0（不移）在界面上显示成开关关、天数默认
     };
   });
 
@@ -8928,6 +8946,12 @@ app.whenReady().then(async () => {
       next.secretCipher = encryptSecret(input.secretAccessKey.trim());
     }
     if (input?.clearSecret) delete next.secretCipher;
+    /* 凭证来源：切到 profile / 默认凭证链**不删**已存的 AK/SK（切回来还能用） */
+    if (input?.credentialSource !== undefined) {
+      next.credentialSource = input.credentialSource === 'profile' || input.credentialSource === 'default' ? input.credentialSource : 'keys';
+    }
+    if (input?.awsProfile !== undefined) next.awsProfile = String(input.awsProfile).trim();
+    if (next.credentialSource !== cur.credentialSource || next.awsProfile !== cur.awsProfile) lastSsoExpired = null;
     /* 云端自动清理的三项，同样"键在 input 里才动它"；天数按 cleanupSettings 的规矩收（1–3650，乱填回默认） */
     if (input?.autoCleanCloud !== undefined) next.autoCleanCloud = !!input.autoCleanCloud;
     if (input?.activeDeviceDays !== undefined) next.activeDeviceDays = cleanupSettings({ activeDeviceDays: input.activeDeviceDays }).activeDays;
@@ -8937,7 +8961,7 @@ app.whenReady().then(async () => {
     if (input?.offloadIdleDays !== undefined) next.offloadIdleDays = offloadSettings({ offloadIdleDays: input.offloadIdleDays }).days;
     saveSyncConfig(next);
     rescheduleS3Sync();
-    logger.info('s3', `配置已保存 bucket=${next.bucket} region=${next.region} key=${maskKeyId(next.accessKeyId)}`
+    logger.info('s3', `配置已保存 bucket=${next.bucket} region=${next.region} ${credsLogLabel(next, maskKeyId)}`
       + ` 定时=${next.enabled ? `${next.intervalMinutes}分钟` : '关'}`);
     return { ok: true };
   });
@@ -8949,9 +8973,8 @@ app.whenReady().then(async () => {
    * 是两条独立的权限 —— 只列成功的话，人会以为配好了，然后在第一次定时同步时才发现不能写。
    */
   ipcMain.handle('s3:test', async () => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
-    const cfg = loadSyncConfig();
     const key = `${keyFor(cfg.prefix, '.kirolex-write-test')}`;
     const stamp = new Date().toISOString();
     try {
@@ -8972,7 +8995,9 @@ app.whenReady().then(async () => {
       } catch (delErr: any) {
         leftover = tr(' (the test object could not be deleted: {error}. {key} was left in the bucket; this key may lack s3:DeleteObject)', { error: String(delErr?.message || delErr), key });
       }
-      return { ok: true, message: tr('Read and write OK ({bucket} / {region}){leftover}', { bucket: String(cfg.bucket), region: String(cfg.region), leftover }) };
+      /* 实际用的是哪个身份（sts get-caller-identity）—— 没有 aws CLI / 自定义 endpoint 就不显示 */
+      const identity = cfg.endpoint ? '' : await awsCreds.callerIdentity(creds!, creds!.region).catch(() => '');
+      return { ok: true, identity, message: tr('Read and write OK ({bucket} / {region}){leftover}', { bucket: String(cfg.bucket), region: String(cfg.region), leftover }) };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
@@ -8980,6 +9005,24 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('s3:sync-now', async () => runS3Sync('手动'));
+
+  /** 「AWS Profile」下拉的候选：~/.aws/config 和 ~/.aws/credentials 里的 profile 名（只读）。 */
+  ipcMain.handle('s3:list-profiles', async () => ({ profiles: awsCreds.listProfiles(), cliFound: !!awsCreds.cliPath() }));
+
+  /** SSO 过期时的「打开终端登录」：和引擎登录同一套开终端（openLoginTerminal），跑 aws sso login。 */
+  ipcMain.handle('s3:aws-sso-login', async () => {
+    const cfg = loadSyncConfig();
+    const profile = credentialSourceOf(cfg) === 'profile' ? cfg.awsProfile : undefined;
+    if (profile !== undefined && !validProfileName(profile)) return { ok: false, error: syncConfigProblem(cfg, decryptSecret) };
+    const cli = awsCreds.cliPath();
+    const argv = ['sso', 'login', ...(profile ? ['--profile', profile] : [])];
+    const manual = tr('Could not open a terminal. Run this in a terminal yourself: {cmd}', { cmd: ['aws', ...argv].join(' ') });
+    if (!cli) return { ok: false, error: manual };
+    const opened = await openLoginTerminal([cli, ...argv]);
+    logger.info('s3', `aws sso login（${profile ? `profile=${profile}` : '默认凭证链'}）：${opened ? '开了终端' : '没能开终端'}`);
+    awsCreds.invalidate(profile);
+    return opened ? { ok: true } : { ok: false, error: manual };
+  });
 
   /** 恢复列表：一次 GET 拿到 catalog，不 LIST 整个桶。 */
   /**
@@ -9071,9 +9114,8 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('s3:list-backups', async () => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { entries: [], error: problem };
-    const cfg = loadSyncConfig();
     try {
       /* 先按删除记录收拾一遍（删掉的不列），再核对桶里真有文件（见 listMissing） */
       const bucket = catalogBucket(creds!, cfg.prefix);
@@ -9155,12 +9197,11 @@ app.whenReady().then(async () => {
    *    "删除备份"和"删除会话"只差两个字，而后者不可挽回。
    */
   ipcMain.handle('s3:delete-project', async (_event, project: string, confirm?: string) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     if (typeof project !== 'string') return { ok: false, error: tr('Invalid project name.') };
     if (confirm !== project) return { ok: false, error: tr('Not confirmed: the project to delete must be passed back exactly.') };
     { const advRefused = refuseAdvancedProject(project, 's3:delete-project'); if (advRefused) return { ok: false, error: advRefused }; }
-    const cfg = loadSyncConfig();
     /* 整个删除排进 catalog 队列：catalog 在队列里现读，不拿排队之前的快照 */
     return catalogQueue(async () => { try {
       /*
@@ -9205,12 +9246,11 @@ app.whenReady().then(async () => {
    * （见 `keepLocalSession`）。「先删掉 windows 那里上传的版本重新弄 mac 版上去」。
    */
   ipcMain.handle('s3:keep-local', async (_event, ids: string[]) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id) && store.readRecord(id)
       && !refuseAdvancedOnly(id, 's3:keep-local'));   // advanced 的会话由 advanced 自己同步
     if (!want.length) return { ok: false, error: tr('No sessions selected, or none of them exist on this machine.') };
-    const cfg = loadSyncConfig();
     const thisMachine = machineTag(os.hostname());
     const done: Array<{ id: string; deleted: number; uploaded: number }> = [];
     try {
@@ -9227,11 +9267,10 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('s3:delete-sessions', async (_event, ids: string[]) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id));
     if (!want.length) return { ok: false, error: tr('No sessions selected.') };
-    const cfg = loadSyncConfig();
     /*
       整个删除排进 catalog 队列，catalog 在队列里现读 ——「连点 8 次删除」时后一次不再拿着前一次之前的快照，
       写回时把前一次刚删的复活（见 catalogStore.ts）。
@@ -9265,11 +9304,10 @@ app.whenReady().then(async () => {
    * （老版本删除时 catalog 写回出了并发问题留下的）。只移确实没文件的；还有文件的不动（见 `forgetMissingEntries`）。
    */
   ipcMain.handle('s3:forget-backups', async (_event, ids: string[]) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     const want = (Array.isArray(ids) ? ids : []).filter((id) => typeof id === 'string' && /^[\w.-]+$/.test(id));
     if (!want.length) return { ok: false, error: tr('No sessions selected.') };
-    const cfg = loadSyncConfig();
     return catalogQueue(async () => { try {
       const r = await forgetMissingEntries(catalogBucket(creds!, cfg.prefix), cfg.prefix, want);
       if (r.removed.length) logger.info('s3', `从 catalog 移除了 ${r.removed.length} 条已经没有备份文件的条目：${r.removed.join('、')}`);
@@ -9284,9 +9322,8 @@ app.whenReady().then(async () => {
    * **参与云端清理判定的设备 / 已忽略的设备** —— 设置页列出来（catalog 里每台机器的清单，见 cloudTrash.ts）。
    */
   ipcMain.handle('s3:cloud-devices', async () => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { devices: [], unknown: [], error: problem };
-    const cfg = loadSyncConfig();
     try {
       const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
       const catalog = raw ? JSON.parse(raw.toString('utf-8')) as Catalog : null;
@@ -9301,9 +9338,8 @@ ${hint}` : ''}` };
 
   /** 云端回收站里有什么、进回收站的时间、还剩几天。 */
   ipcMain.handle('s3:list-cloud-trash', async () => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { items: [], error: problem };
-    const cfg = loadSyncConfig();
     const clean = cleanupSettings(cfg);
     try {
       const items = await listCloudTrash(bucketOps(creds!), cfg.prefix, Date.now(), clean.trashDays);
@@ -9317,10 +9353,9 @@ ${hint}` : ''}` };
 
   /** 云端回收站 → 恢复到云端备份（移回原位置）。只动桶里的东西，本地不动。 */
   ipcMain.handle('s3:restore-cloud-trash', async (_event, dir: string) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     if (typeof dir !== 'string' || !dir) return { ok: false, error: tr('Invalid session id.') };
-    const cfg = loadSyncConfig();
     try {
       const r = await restoreFromCloudTrash(bucketOps(creds!), cfg.prefix, dir, Date.now(), (level, msg) => logger[level]('s3', msg));
       return { ok: true, ...r };
@@ -9333,10 +9368,9 @@ ${hint}` : ''}` };
 
   /** 云端回收站 → 立即彻底删除。界面确认过一次，这一层再要求把目录名原样传回来（同 s3:delete-project）。 */
   ipcMain.handle('s3:purge-cloud-trash', async (_event, dir: string, confirm?: string) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     if (typeof dir !== 'string' || !dir || confirm !== dir) return { ok: false, error: tr('Not confirmed.') };
-    const cfg = loadSyncConfig();
     try {
       const r = await purgeCloudTrashItem(bucketOps(creds!), cfg.prefix, dir, (level, msg) => logger[level]('s3', msg));
       return { ok: true, ...r };
@@ -9355,7 +9389,7 @@ ${hint}` : ''}` };
   /* 同一份实现也给侧栏 ☁ 占位的「下载回本机」用（offload:restore） */
   let s3RestoreImpl: (_event: unknown, sessionId: string) => Promise<any>;
   ipcMain.handle('s3:restore', s3RestoreImpl = async (_event, sessionId: string) => {
-    const { creds, problem } = syncCredsOrProblem();
+    const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
     { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
@@ -9375,7 +9409,6 @@ ${hint}` : ''}` };
       detachExecutor(sessionId);
       mainWindow?.webContents.send('session:detached-for-restore', { sessionId });
     }
-    const cfg = loadSyncConfig();
     try {
       const prefix = `${keyFor(cfg.prefix, path.join('sessions', sessionId))}/`;
       const objects = await listObjects(creds!, prefix);

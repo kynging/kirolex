@@ -45,6 +45,11 @@ interface Cfg {
   intervalMinutes: number;
   accessKeyId: string;
   hasSecret: boolean;
+  /** 凭证来源：AK/SK（缺省）/ ~/.aws/config 里的 profile / AWS 默认凭证链（主进程 awsProfileCreds.ts）。 */
+  credentialSource: CredSource;
+  awsProfile: string;
+  /** 最近一次取凭证 SSO 过期了（`profile` 缺 = 默认凭证链）→ 给「打开终端登录」。 */
+  ssoLogin?: { profile?: string } | null;
   encryptionAvailable: boolean;
   last?: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number } | null;
   /** 云端自动清理（主进程 cloudTrash.ts）：开关、活跃设备天数、回收站保留天数。 */
@@ -57,6 +62,8 @@ interface Cfg {
   /** 凭据现在用不用得了（主进程 syncCredsOrProblem）：缺字段 / 密钥解不开 → 原因；可用 → 空 */
   credsProblem?: string;
 }
+
+type CredSource = 'keys' | 'profile' | 'default';
 
 /** 桶里每台机器的清单（`describeDevices`）。 */
 /** `machine` 是设备 ID（清单的键），`name` 是显示用的主机名 —— 同名电脑是两行。 */
@@ -82,11 +89,19 @@ export const BackupSettings: React.FC = () => {
   const [secret, setSecret] = useState('');
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: 'ok' | 'bad'; text: string } | null>(null);
+  /* 「AWS Profile」下拉的候选（~/.aws/config + ~/.aws/credentials），以及这台电脑上有没有 aws CLI */
+  const [awsProfiles, setAwsProfiles] = useState<{ profiles: string[]; cliFound: boolean } | null>(null);
+  /* 下拉里选了「手填…」 */
+  const [manualProfile, setManualProfile] = useState(false);
 
   const load = useCallback(async () => {
     try { setCfg(await api()?.getS3Config?.()); } catch { /* 拿不到就留空表单 */ }
   }, []);
   useEffect(() => { void load(); }, [load]);
+  useEffect(() => {
+    if (cfg?.credentialSource === 'keys' || !cfg || awsProfiles) return;
+    void api()?.listS3AwsProfiles?.().then((r: any) => setAwsProfiles(r || { profiles: [], cliFound: false })).catch(() => setAwsProfiles({ profiles: [], cliFound: false }));
+  }, [cfg?.credentialSource, !!cfg, awsProfiles]);
 
   /* 参与云端清理判定的设备 / 已忽略的设备 —— 一次 GET catalog；没配好桶时拿到的是一句 error */
   const [devices, setDevices] = useState<{ devices: DeviceRow[]; unknown: string[]; thisDevice?: string; error?: string } | null>(null);
@@ -114,6 +129,8 @@ export const BackupSettings: React.FC = () => {
         endpoint: cfg.endpoint,
         intervalMinutes: cfg.intervalMinutes,
         accessKeyId: cfg.accessKeyId,
+        credentialSource: cfg.credentialSource,
+        awsProfile: cfg.awsProfile,
         ...(secret.trim() ? { secretAccessKey: secret.trim() } : null),
         ...extra,
       });
@@ -143,7 +160,8 @@ export const BackupSettings: React.FC = () => {
         setMsg({
           kind: 'ok',
           text: what === 'test'
-            ? (leftover || '✅')
+            /* 实际用的是哪个身份（sts get-caller-identity 的 ARN；没有 aws CLI 就没有）—— 换了凭证来源时这是新信息 */
+            ? (leftover || '✅') + (r.identity ? ` ${t('Identity: {arn}', { arn: r.identity })}` : '')
             : [t('Uploaded {uploaded} files, {skipped} unchanged.', { uploaded: r.uploaded, skipped: r.skipped }), cleanupSentence(r, lang)].filter(Boolean).join(' '),
         });
       } else setMsg({ kind: 'bad', text: String(r?.error || t('Failed')) });
@@ -182,25 +200,92 @@ export const BackupSettings: React.FC = () => {
         <input className="settings-input" value={cfg.region}
                onChange={(e) => patch({ region: e.target.value })} onBlur={() => void save()} />
       </Field>
-      <Field label="Access Key ID">
-        <input className="settings-input" value={cfg.accessKeyId}
-               onChange={(e) => patch({ accessKeyId: e.target.value })} onBlur={() => void save()} />
-      </Field>
+      {/*
+        **凭证三选一** ——「云同步也要能用 AWS profile，不能只有 AK/SK」。切到 profile / 默认凭证链只是**不显示** AK/SK，
+        已存的那份不删（切回来还能用）。临时凭证在主进程内存里，从不回到这一页。
+      */}
       <Field
-        label={t('Secret')}
-        hint={t('Needs s3:PutObject / GetObject / ListBucket / DeleteObject. If the bucket has versioning on, cloud trash cleanup also needs s3:ListBucketVersions / DeleteObjectVersion (to delete each original and trash file by version, old versions included).')}
+        label={t('Credentials')}
+        hint={cfg.credentialSource === 'keys' ? undefined
+          : cfg.credentialSource === 'default'
+            ? t('Uses the AWS default credential chain: environment variables, then the default profile (SSO included). Needs s3:PutObject / GetObject / ListBucket / DeleteObject.')
+            : t('SSO, assume-role and credential_process profiles are handled by the AWS CLI. Needs s3:PutObject / GetObject / ListBucket / DeleteObject.')}
       >
-        <input className="settings-input" type="password" value={secret}
-               placeholder={cfg.hasSecret ? t('Saved (leave empty to keep)') : t('Enter once; it will not be shown again')}
-               disabled={!cfg.encryptionAvailable}
-               onChange={(e) => setSecret(e.target.value)}
-               onBlur={() => { if (secret.trim()) void save(); }} />
-        {cfg.hasSecret && (
-          <button className="remote-btn" disabled={!!busy}
-                  onClick={() => void save({ clearSecret: true })}
-                  title={t('Remove the saved secret from the config')}>{t('Clear saved')}</button>
-        )}
+        <div className="remote-via">
+          {([['keys', 'Access Key'], ['profile', 'AWS Profile'], ['default', t('Default credential chain')]] as Array<[CredSource, string]>).map(([v, label]) => (
+            <label key={v}>
+              <input type="radio" name="backup-cred-source" checked={cfg.credentialSource === v}
+                     onChange={() => { patch({ credentialSource: v }); void save({ credentialSource: v }); }} /> {label}
+            </label>
+          ))}
+        </div>
       </Field>
+      {cfg.credentialSource === 'keys' && (
+        <>
+          <Field label="Access Key ID">
+            <input className="settings-input" value={cfg.accessKeyId}
+                   onChange={(e) => patch({ accessKeyId: e.target.value })} onBlur={() => void save()} />
+          </Field>
+          <Field
+            label={t('Secret')}
+            hint={t('Needs s3:PutObject / GetObject / ListBucket / DeleteObject. If the bucket has versioning on, cloud trash cleanup also needs s3:ListBucketVersions / DeleteObjectVersion (to delete each original and trash file by version, old versions included).')}
+          >
+            <input className="settings-input" type="password" value={secret}
+                   placeholder={cfg.hasSecret ? t('Saved (leave empty to keep)') : t('Enter once; it will not be shown again')}
+                   disabled={!cfg.encryptionAvailable}
+                   onChange={(e) => setSecret(e.target.value)}
+                   onBlur={() => { if (secret.trim()) void save(); }} />
+            {cfg.hasSecret && (
+              <button className="remote-btn" disabled={!!busy}
+                      onClick={() => void save({ clearSecret: true })}
+                      title={t('Remove the saved secret from the config')}>{t('Clear saved')}</button>
+            )}
+          </Field>
+        </>
+      )}
+      {cfg.credentialSource === 'profile' && (() => {
+        const list = awsProfiles?.profiles || [];
+        const manual = manualProfile || (!!cfg.awsProfile && !list.includes(cfg.awsProfile));
+        return (
+          <Field
+            label="AWS Profile"
+            hint={awsProfiles && !awsProfiles.cliFound
+              ? t('The AWS CLI (aws) was not found on this computer: only static keys in ~/.aws/credentials can be used. SSO / assume-role profiles need AWS CLI v2.')
+              : undefined}
+          >
+            <select className="settings-select" aria-label="AWS Profile"
+                    value={manual ? '__manual__' : cfg.awsProfile}
+                    onChange={(e) => {
+                      if (e.target.value === '__manual__') { setManualProfile(true); return; }
+                      setManualProfile(false);
+                      patch({ awsProfile: e.target.value }); void save({ awsProfile: e.target.value });
+                    }}>
+              {!cfg.awsProfile && !manual && <option value="">{t('Choose a profile')}</option>}
+              {list.map((p) => <option key={p} value={p}>{p}</option>)}
+              <option value="__manual__">{t('Type a name…')}</option>
+            </select>
+            {manual && (
+              <input className="settings-input" value={cfg.awsProfile} spellCheck={false} aria-label={t('Profile name')}
+                     placeholder={t('Profile name')}
+                     onChange={(e) => patch({ awsProfile: e.target.value })} onBlur={() => void save()} />
+            )}
+          </Field>
+        );
+      })()}
+      {cfg.credentialSource !== 'keys' && cfg.ssoLogin && (
+        <div className="settings-warn backup-note">
+          {cfg.ssoLogin.profile
+            ? t('The SSO login for profile {profile} has expired.', { profile: cfg.ssoLogin.profile })
+            : t('The SSO login for the default AWS credentials has expired.')}
+          {' '}
+          <button className="remote-btn" disabled={!!busy} onClick={() => void (async () => {
+            const r = await api()?.s3AwsSsoLogin?.();
+            setMsg(r?.ok
+              ? { kind: 'ok', text: t('A terminal is running aws sso login. After logging in, click Test connectivity to retry.') }
+              : { kind: 'bad', text: String(r?.error || t('Failed')) });
+          })()}>{t('Open a terminal to log in')}</button>
+        </div>
+      )}
       {/* 唯一可选的那个，所以标在**标签**上而不是塞进 placeholder ——
           placeholder 一填东西就消失了，而"这栏可以不填"是一直成立的事 */}
       <Field label={t('Key prefix (optional)')}>
@@ -272,7 +357,7 @@ export const BackupSettings: React.FC = () => {
       */}
       {(() => {
         /* 没配好 = 缺字段，或者密钥解不开了（换过机器 / 重装）—— 以主进程说的为准 */
-        const configured = !!(cfg.bucket && cfg.region && cfg.accessKeyId && cfg.hasSecret) && !cfg.credsProblem;
+        const configured = !!(cfg.bucket && cfg.region && (cfg.credentialSource !== 'keys' || (cfg.accessKeyId && cfg.hasSecret))) && !cfg.credsProblem;
         const why = !configured
           ? (cfg.credsProblem ? cfg.credsProblem.split('\n')[0] : t('Set up the bucket and keys above first.'))
           : !cfg.enabled ? t('Turn on scheduled sync first.') : '';

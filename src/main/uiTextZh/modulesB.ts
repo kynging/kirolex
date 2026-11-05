@@ -352,4 +352,17 @@ export const ZH_MODULES_B: Record<string, string> = {
   'Run `{cmd}` to see why.': '运行 `{cmd}` 看看是什么原因。',
   '{id} is registered in SSM but its status is {status}': '{id} 在 SSM 里登记了，但状态是 {status}',
   '{id} is not registered in SSM in {region}': '{id} 在 {region} 的 SSM 里没有登记',
+  // ── awsProfileCreds.ts：S3 同步用 AWS profile / 默认凭证链
+  'AWS profile {profile} was not found in ~/.aws/config or ~/.aws/credentials. Existing profiles: {list}': '~/.aws/config 和 ~/.aws/credentials 里都没有 profile {profile}。现有的 profile：{list}',
+  'AWS profile {profile} was not found, and ~/.aws/config / ~/.aws/credentials have no profiles at all.': '没有 profile {profile}，~/.aws/config / ~/.aws/credentials 里也一个 profile 都没有。',
+  'The SSO login for profile {profile} has expired. Run `aws sso login --profile {profile}` in a terminal, then click Retry.': 'profile {profile} 的 SSO 登录过期了，在终端运行 `aws sso login --profile {profile}` 后点重试。',
+  'The SSO login for the default AWS credentials has expired. Run `aws sso login` in a terminal, then click Retry.': '默认 AWS 凭证的 SSO 登录过期了，在终端运行 `aws sso login` 后点重试。',
+  'Getting AWS credentials ({profile}) failed: {error}': '取 AWS 凭证（{profile}）失败：{error}',
+  'default credential chain': '默认凭证链',
+  'unknown error': '未知错误',
+  'unexpected output from aws configure export-credentials': 'aws configure export-credentials 的输出认不出来',
+  'The AWS profile name {profile} is not valid (only letters, digits and _ . + - are allowed, up to 64 characters).': 'AWS profile 名 {profile} 不合法（只能用字母、数字和 _ . + -，最多 64 个字符）。',
+  'Your AWS CLI is too old: `aws configure export-credentials` needs AWS CLI v2. Upgrade it, then retry.': 'aws CLI 版本太旧：`aws configure export-credentials` 需要 AWS CLI v2。升级后再试。',
+  'No AWS credentials were found in the environment or ~/.aws/credentials, and the AWS CLI (aws) was not found on this computer. Install AWS CLI v2, then retry.': '环境变量和 ~/.aws/credentials 里都没有 AWS 凭证，这台电脑上也没找到 aws CLI。安装 AWS CLI v2 后再试。',
+  'Profile {profile} has no static keys in ~/.aws/credentials, and the AWS CLI (aws) was not found on this computer. Install AWS CLI v2 (it handles SSO / assume-role / credential_process), then retry.': '~/.aws/credentials 里没有 profile {profile} 的静态 key，这台电脑上也没找到 aws CLI。安装 AWS CLI v2（SSO / assume-role / credential_process 都靠它）后再试。',
 };

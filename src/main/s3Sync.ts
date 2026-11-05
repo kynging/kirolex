@@ -99,6 +99,13 @@ export interface SyncConfig {
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;
+  /**
+   * **凭证从哪来**（`awsProfileCreds.ts`）：`keys` = 上面的 AK/SK；`profile` = `~/.aws/config` 里的 `awsProfile`
+   * （SSO / assume-role / credential_process 由 aws CLI 处理）；`default` = AWS 默认凭证链。缺省 = `keys`。
+   * 切到另外两种时**不删**已存的 AK/SK（切回来还能用）。
+   */
+  credentialSource?: 'keys' | 'profile' | 'default';
+  awsProfile?: string;
   endpoint?: string;
 }
 

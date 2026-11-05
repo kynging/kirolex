@@ -97,6 +97,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 测连通：真写一个小对象再读回来 —— ListBucket 通不代表 PutObject 通。 */
   testS3: () => ipcRenderer.invoke('s3:test'),
   syncS3Now: () => ipcRenderer.invoke('s3:sync-now'),
+  listS3AwsProfiles: (): Promise<{ profiles: string[]; cliFound: boolean }> => ipcRenderer.invoke('s3:list-profiles'),
+  s3AwsSsoLogin: (): Promise<{ ok: boolean; error?: string }> => ipcRenderer.invoke('s3:aws-sso-login'),
   listS3Backups: () => ipcRenderer.invoke('s3:list-backups'),
   deleteS3Sessions: (ids: string[]) => ipcRenderer.invoke('s3:delete-sessions', ids),
   forgetS3Backups: (ids: string[]) => ipcRenderer.invoke('s3:forget-backups', ids),

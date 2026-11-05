@@ -25,6 +25,19 @@ export interface S3Creds {
   bucket: string;
   /** 自定义 endpoint（MinIO / S3 兼容存储）。不填按 AWS 规则拼。 */
   endpoint?: string;
+  /**
+   * 临时凭证（AWS profile / 默认凭证链）才有：S3 说凭证过期 / 无效时，清掉缓存重取一份（`awsProfileCreds.ts`）。
+   * 参数是失败的那个 AccessKeyId —— 并发失败的请求只让缓存清一次。
+   */
+  refresh?: (failedKeyId: string) => Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken?: string }>;
+}
+
+/** 这些错误码说明是凭证本身（过期 / 被换掉了），值得重取一次再试。 */
+export const REFRESH_CODES = new Set(['ExpiredToken', 'InvalidToken', 'TokenRefreshRequired', 'SignatureDoesNotMatch']);
+
+/** 这个失败要不要重取凭证再试（只看 400 / 403 + 上面那几个码）。 */
+export function shouldRefreshCreds(status: number, xml: string): boolean {
+  return (status === 400 || status === 403) && REFRESH_CODES.has(parseS3ErrorCode(xml));
 }
 
 export class S3Error extends Error {
@@ -118,7 +131,29 @@ export function hostFor(creds: S3Creds): string {
 
 interface RawResult { status: number; body: Buffer; headers: Record<string, string | string[] | undefined> }
 
-function request(
+/**
+ * 发一个请求。临时凭证（有 `creds.refresh`）被 S3 以 ExpiredToken / InvalidToken / SignatureDoesNotMatch 拒掉时，
+ * 重取一份凭证（写回 `creds`，同一轮后面的请求直接用新的）再发**一次**。AK/SK 没有 refresh，行为不变。
+ */
+async function request(
+  creds: S3Creds,
+  method: 'GET' | 'PUT' | 'HEAD' | 'DELETE',
+  path: string,
+  query: Record<string, string>,
+  payload: Buffer,
+  extraHeaders: Record<string, string> = {},
+  timeoutMs = 120_000,
+): Promise<RawResult> {
+  const r = await requestOnce(creds, method, path, query, payload, extraHeaders, timeoutMs);
+  if (!creds.refresh || !shouldRefreshCreds(r.status, r.body.toString('utf-8'))) return r;
+  const fresh = await creds.refresh(creds.accessKeyId);
+  creds.accessKeyId = fresh.accessKeyId;
+  creds.secretAccessKey = fresh.secretAccessKey;
+  creds.sessionToken = fresh.sessionToken;
+  return requestOnce(creds, method, path, query, payload, extraHeaders, timeoutMs);
+}
+
+function requestOnce(
   creds: S3Creds,
   method: 'GET' | 'PUT' | 'HEAD' | 'DELETE',
   path: string,

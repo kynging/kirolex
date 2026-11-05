@@ -518,4 +518,17 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Automatically moves sessions you have not used for a while to the cloud: after a successful sync, sessions not used for this long are removed from this computer once their cloud copy is confirmed up to date. They stay in the sidebar with ☁ and download automatically when opened. Nothing is deleted from the cloud.': '自动把久未使用的会话移到云端：每次同步成功后，这么久没用、并且确认云端那份是最新的会话，会删掉本机副本；侧栏照样留着（带 ☁），点开自动下载回来。云端不删任何东西。',
   'Unused for': '未使用超过',
   'Unused for {n} days': '{n} 天未使用',
+  // ── 备份：凭证来源（AK/SK / AWS profile / 默认凭证链）
+  'Credentials': '凭证',
+  'Default credential chain': '默认凭证链',
+  'Uses the AWS default credential chain: environment variables, then the default profile (SSO included). Needs s3:PutObject / GetObject / ListBucket / DeleteObject.': '按 AWS 默认凭证链取：环境变量 → default profile（含 SSO）。需要 s3:PutObject / GetObject / ListBucket / DeleteObject。',
+  'SSO, assume-role and credential_process profiles are handled by the AWS CLI. Needs s3:PutObject / GetObject / ListBucket / DeleteObject.': 'SSO、assume-role、credential_process 这些 profile 由 aws CLI 处理。需要 s3:PutObject / GetObject / ListBucket / DeleteObject。',
+  'The AWS CLI (aws) was not found on this computer: only static keys in ~/.aws/credentials can be used. SSO / assume-role profiles need AWS CLI v2.': '这台电脑上没找到 aws CLI：只能用 ~/.aws/credentials 里的静态 key。SSO / assume-role 的 profile 需要安装 AWS CLI v2。',
+  'Choose a profile': '选一个 profile',
+  'Type a name…': '手动填写…',
+  'Profile name': 'profile 名',
+  'The SSO login for profile {profile} has expired.': 'profile {profile} 的 SSO 登录过期了。',
+  'The SSO login for the default AWS credentials has expired.': '默认 AWS 凭证的 SSO 登录过期了。',
+  'A terminal is running aws sso login. After logging in, click Test connectivity to retry.': '已在终端里运行 aws sso login，登录完点「测连通」重试。',
+  'Open a terminal to log in': '打开终端登录',
 };
