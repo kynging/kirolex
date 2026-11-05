@@ -17313,6 +17313,7 @@ ${hint}` : ''}` };
         ssmInstanceId: t.ssmInstanceId,
         ssmRegion: t.ssmRegion,
         ssmProfile: t.ssmProfile,
+        ssmUseOwnKey: t.ssmUseOwnKey,
         /* 三个 CLI 的启动命令 —— 漏发一个字段 = 自动保存把它抹掉（见上面那段） */
         bins: t.bins,
         /* 设置页靠它决定默认显示哪一台（最近编辑的） */
@@ -17430,7 +17431,7 @@ ${hint}` : ''}` };
       const { password: _pw, clearPassword: _clr, ...rest } = input as any;
       const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, { ...rest, ...passwordFields(input) });
       logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})${saved.passwordCipher ? '，带密码' : ''}${saved.droppedLegacy ? `，切到 SSM：删掉老 agents[].remote ${saved.droppedLegacy.join(',')}` : ''}`);
-      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher, connectVia: saved.connectVia, ssmInstanceId: saved.ssmInstanceId, ssmRegion: saved.ssmRegion, ssmProfile: saved.ssmProfile }, droppedLegacy: saved.droppedLegacy };
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher, connectVia: saved.connectVia, ssmInstanceId: saved.ssmInstanceId, ssmRegion: saved.ssmRegion, ssmProfile: saved.ssmProfile, ssmUseOwnKey: saved.ssmUseOwnKey }, droppedLegacy: saved.droppedLegacy };
     } catch (err: any) {
       return { ok: false, error: err?.message || tr('Save failed') };
     }
@@ -17470,6 +17471,8 @@ ${hint}` : ''}` };
       proxyJump: input.proxyJump ? String(input.proxyJump).trim() : undefined,
       passwordCipher: passwordCipherForUse(input),
       ...ssmFieldsOf(input),
+      /* 临时公钥按机器放（~/.kirolex/ssm-keys/<id>/），和会话那条路用同一把 */
+      ...(input.id ? { id: String(input.id) } : {}),
     } as RemoteTarget;
     /* 脚本跟着 app 走：dev 下在仓库里，打包后在 resources 里 */
     const candidates = [

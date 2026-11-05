@@ -43,13 +43,13 @@ export function joinSshHost(user: string, host: string): string {
  * 「测试连接」那一次结果属于**哪一组连接参数**。改了 IP / 用户名 / 端口 / 私钥 / 跳板，
  * 上一次的"连得上"就不再算数 ——「你得测试连接通过才能安装 AI 工具啊」。
  */
-export function connectionKey(d: { sshHost?: string; sshPort?: number; identityFile?: string; proxyJump?: string; password?: string; clearPassword?: boolean; connectVia?: string; ssmInstanceId?: string; ssmRegion?: string; ssmProfile?: string } | null): string {
+export function connectionKey(d: { sshHost?: string; sshPort?: number; identityFile?: string; proxyJump?: string; password?: string; clearPassword?: boolean; connectVia?: string; ssmInstanceId?: string; ssmRegion?: string; ssmProfile?: string; ssmUseOwnKey?: boolean } | null): string {
   /* 不含 id：新建那台第一次自动保存才拿到 id，那不是"连接参数变了"。换机器由 pick() 清掉结果。
      含密码：改了密码就得重测（只在内存里比较，不存不发）。 */
   if (!d) return '';
   const base = [(d.sshHost || '').trim(), d.sshPort ?? 22, d.identityFile || '', d.proxyJump || '', d.password || '', !!d.clearPassword];
   /* SSM 的区域 / profile 变了也得重测；直连那条的 key 和原来一样 */
-  if (d.connectVia === 'ssm') base.push('ssm', d.ssmInstanceId || '', d.ssmRegion || '', d.ssmProfile || '');
+  if (d.connectVia === 'ssm') base.push('ssm', d.ssmInstanceId || '', d.ssmRegion || '', d.ssmProfile || '', !!d.ssmUseOwnKey);
   return JSON.stringify(base);
 }
 

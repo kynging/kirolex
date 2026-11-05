@@ -7,6 +7,10 @@ import { createRequire } from 'node:module';
 import { parseRemoteTargets, listRemoteTargets, saveRemoteTarget } from '../src/main/remoteTargets.ts';
 import { defaultPick, switchVia } from '../src/renderer/remotePick.ts';
 import { ssmPreflight, type SsmRun } from '../src/main/remotePreflight.ts';
+import { setSsmKeyRoot } from '../src/main/sshProxy.ts';
+
+/* SSM 默认推临时公钥，预检会生成密钥 —— 放进临时目录，不碰真的 ~/.kirolex */
+setSsmKeyRoot(fs.mkdtempSync(path.join(os.tmpdir(), 'ssm-keys-')));
 
 /*
  * 「SSM 机器设置：老 agents[].remote 冒出名称为 IP 的 SSH 幽灵机器且被默认选中」。
@@ -186,24 +190,51 @@ describe('RemoteSettings：SSM 模式隐藏端口 / 密码', async () => {
   };
   const SSM_DRAFT = { sshHost: 'ec2-user@i-0123456789abcdef0', connectVia: 'ssm', ssmInstanceId: 'i-0123456789abcdef0', ssmRegion: 'ap-northeast-1', sshPort: 2222, password: 'pw', remoteWorkdir: '~/kirolex' };
 
-  test('SSM：没有「密码」，「端口」默认折叠在「高级」里', () => {
-    const html = render({ draft: SSM_DRAFT, advancedOpen: false });
+  /*
+    「SSM 模式根本不该让人填登录用户和私钥」（任务 698fb826）：默认推临时公钥，
+    登录用户 / 端口 / 「改用自己的私钥」都收进默认折叠的「高级」。
+  */
+  test('SSM：默认视图没有「登录用户」「私钥」「端口」「密码」，都在折叠的「高级」后面', () => {
+    const html = render({ draft: { ...SSM_DRAFT, identityFile: '/Users/me/k.pem' }, advancedOpen: false });
     assert.equal(/type="password"/.test(html), false, '没有密码框');
-    assert.deepEqual(inputs(html, '密码'), []);
-    assert.deepEqual(inputs(html, '端口'), [], '端口折叠着');
+    for (const label of ['密码', '端口', '登录用户', '私钥']) assert.deepEqual(inputs(html, label), [], `默认视图里不该有 ${label}`);
+    assert.equal(html.includes('改用自己的私钥'), false);
+    assert.equal(html.includes('k.pem'), false, '老配置里的私钥路径不显示');
     assert.match(html, /高级/);
     /* 「名称」在 ConnectionFields 外面；AWS profile 的中文标签是「Profile」 */
-    for (const label of ['连接方式', '实例 ID', '区域（Region）', 'Profile', '登录用户', '私钥', '工作目录']) {
+    for (const label of ['连接方式', '实例 ID', '区域（Region）', 'Profile', '工作目录']) {
       assert.ok(html.includes(`>${label}</label>`), `缺 ${label}`);
     }
   });
 
-  test('SSM：展开「高级」后才出现端口，值还在', () => {
+  test('SSM：展开「高级」后有登录用户、端口和「改用自己的私钥」，值还在', () => {
     const html = render({ draft: SSM_DRAFT, advancedOpen: true });
     const [port] = inputs(html, '端口');
     assert.ok(port, '展开后有端口');
     assert.match(port, /value="2222"/);
+    assert.match(inputs(html, '登录用户')[0] || '', /value="ec2-user"/);
+    assert.match(html, /type="checkbox"[^>]*\/?>[^<]*改用自己的私钥（不推临时公钥）/);
+    const box = (h: string): string => /<input type="checkbox"[^>]*>/.exec(h)?.[0] || '';
+    assert.ok(box(html));
+    assert.equal(/checked=""/.test(box(html)), false, '缺省不勾');
+    assert.deepEqual(inputs(html, '私钥'), [], '没勾时不显示选私钥');
     assert.equal(/type="password"/.test(html), false);
+  });
+
+  test('SSM：勾了「改用自己的私钥」才显示私钥（老配置里的路径还在）', () => {
+    const html = render({ draft: { ...SSM_DRAFT, ssmUseOwnKey: true, identityFile: '/Users/me/k.pem' }, advancedOpen: true });
+    assert.match(/<input type="checkbox"[^>]*>/.exec(html)?.[0] || '', /checked=""/);
+    assert.match(inputs(html, '私钥')[0] || '', /\/Users\/me\/k\.pem/);
+  });
+
+  test('SSH 模式不受影响：登录用户（用户名）/ 端口 / 密码 / 私钥都在主区域', () => {
+    const d = { sshHost: 'ec2-user@1.2.3.4', sshPort: 22, identityFile: '/k.pem', remoteWorkdir: '~/kirolex' };
+    const html = render({ draft: d, advancedOpen: false });
+    for (const label of ['IP 地址', '用户名', '端口', '密码', '私钥', '工作目录']) {
+      assert.ok(html.includes(`>${label}</label>`), `缺 ${label}`);
+    }
+    assert.equal(/高级/.test(html), false);
+    assert.equal(html.includes('改用自己的私钥'), false);
   });
 
   test('SSM：AWS profile 是下拉，留空显示「默认凭证链（default）」，列出本机 profile', () => {

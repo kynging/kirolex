@@ -12,7 +12,10 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { SshMux, masterWaitMs, MASTER_WAIT_MS, SSM_MASTER_WAIT_MS } from '../src/main/sshMux.ts';
-import { execTimeoutFor } from '../src/main/sshProxy.ts';
+import { execTimeoutFor, setSsmKeyRoot } from '../src/main/sshProxy.ts';
+
+/* SSM 默认推临时公钥，会生成密钥 —— 放进临时目录，不碰真的 ~/.kirolex */
+setSsmKeyRoot(fs.mkdtempSync(path.join(os.tmpdir(), 'ssm-keys-')));
 
 /** 假 ssh：`allocAfterMs` 之后在 stderr 上报 `Allocated port`（不给就一直不报）。 */
 function fakeProc(allocAfterMs?: number): any {

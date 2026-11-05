@@ -61,7 +61,8 @@ export interface RemoteTarget {
   passwordCipher?: string;
   /**
    * 怎么连：`ssh`（缺省，直连 / 跳板）或 `ssm`（SSH over AWS SSM，见 sshProxy.ts `ssmProxyCommand`）。
-   * `ssm` 时 `sshHost` 是 `user@<instance-id>`，SSH 认证照旧用 `identityFile`。
+   * `ssm` 时 `sshHost` 是 `user@<instance-id>`；SSH 认证默认用 EC2 Instance Connect 推的临时公钥
+   * （sshProxy.ts `usesSsmTempKey`），`identityFile` 只在 `ssmUseOwnKey` 时才用。
    */
   connectVia?: 'ssh' | 'ssm';
   /** SSM：实例 ID（`i-…` / `mi-…`）。 */
@@ -70,6 +71,11 @@ export interface RemoteTarget {
   ssmRegion?: string;
   /** SSM：AWS CLI profile；没有 = 默认凭证链。 */
   ssmProfile?: string;
+  /**
+   * SSM：「改用自己的私钥（不推临时公钥）」。缺省 false = 每次新建连接前用
+   * `aws ec2-instance-connect send-ssh-public-key` 推一把临时公钥；true = 用 `identityFile`（老路径）。
+   */
+  ssmUseOwnKey?: boolean;
 }
 
 export interface AgentProfile {

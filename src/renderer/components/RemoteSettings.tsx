@@ -62,6 +62,8 @@ export interface RemoteRow {
   ssmRegion?: string;
   /** 空 = 默认凭证链。 */
   ssmProfile?: string;
+  /** SSM：「改用自己的私钥（不推临时公钥）」。缺省 false = 连接前用 EC2 Instance Connect 推临时公钥。 */
+  ssmUseOwnKey?: boolean;
   /** 来自老形状 `agents[].remote`（打开设置时不默认选它）。 */
   legacy?: boolean;
 }
@@ -242,6 +244,20 @@ export const ConnectionFields: React.FC<{
   const list = awsProfiles || [];
   /* 存着一个列表里没有的名字：照样作为一项显示出来（不能显示成「默认凭证链」—— 那是在说谎） */
   const profileChoices = draft.ssmProfile && !list.includes(draft.ssmProfile) ? [...list, draft.ssmProfile] : list;
+  /* 密钥用 Finder 选 —— 手写路径错一个字母，表现是"认证失败"，跟机器没开长得一样。SSH 在主区域，SSM 只在「改用自己的私钥」下 */
+  const keyField = (
+    <Field label={t('Private key')} hint={t('Fill in either the private key or the password; leave both empty to use your own ssh config (~/.ssh/config, ssh-agent)')}>
+      <div className="remote-key">
+        <span className={`remote-key-path${draft.identityFile ? '' : ' empty'}`} title={draft.identityFile || ''}>
+          🔑 {draft.identityFile || t('No private key selected (use it or a password; with neither, your own ssh config is used)')}
+        </span>
+        <button className="remote-btn" disabled={locked} onClick={() => void pickKey()}>{t('Choose key…')}</button>
+        {draft.identityFile && (
+          <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>{t('Clear')}</button>
+        )}
+      </div>
+    </Field>
+  );
   return (
     <>
       {/*
@@ -304,13 +320,6 @@ export const ConnectionFields: React.FC<{
               />
             )}
           </Field>
-          <Field label={t('Login user')} hint={t('User that SSH logs in as on that instance (ec2-user on Amazon Linux, ubuntu on Ubuntu)')}>
-            <input
-              className="settings-input"
-              value={splitSshHost(draft.sshHost).user}
-              onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, draft.ssmInstanceId || '') })}
-            />
-          </Field>
         </>
       ) : (
         <>
@@ -361,17 +370,8 @@ export const ConnectionFields: React.FC<{
           </Field>
         </>
       )}
-      <Field label={t('Private key')} hint={t('Fill in either the private key or the password; leave both empty to use your own ssh config (~/.ssh/config, ssh-agent)')}>
-      <div className="remote-key">
-        <span className={`remote-key-path${draft.identityFile ? '' : ' empty'}`} title={draft.identityFile || ''}>
-          🔑 {draft.identityFile || t('No private key selected (use it or a password; with neither, your own ssh config is used)')}
-        </span>
-        <button className="remote-btn" disabled={locked} onClick={() => void pickKey()}>{t('Choose key…')}</button>
-        {draft.identityFile && (
-          <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>{t('Clear')}</button>
-        )}
-      </div>
-      </Field>
+      {/* SSM 下私钥不在这里：默认推临时公钥，「改用自己的私钥」在下面的「高级」里 */}
+      {!ssm && keyField}
       <Field label={t('Working directory')} hint={t('A directory on that machine; ~ is the login user\'s home. KiroLex creates a scratch directory for each session here')}>
         <input
           className="settings-input"
@@ -380,8 +380,11 @@ export const ConnectionFields: React.FC<{
         />
       </Field>
       {/*
-        **SSM 的「高级」** —— 端口不直接删：极少数实例的 sshd 不在 22，这个值作为
-        AWS-StartSSHSession 的 portNumber 传下去（sshProxy.ts）。默认折叠，因为几乎没人要改它。
+        **SSM 的「高级」** —— 默认折叠，因为几乎没人要改：
+          · 登录用户：缺省 ec2-user（Ubuntu 是 ubuntu）。
+          · 端口：极少数实例的 sshd 不在 22，作为 AWS-StartSSHSession 的 portNumber 传下去（sshProxy.ts）。
+          · 「改用自己的私钥」：默认每次连接前用 EC2 Instance Connect 推临时公钥，不要私钥文件；
+            勾了才走老路径（`-i` 自己的私钥、不推公钥）。老配置里的私钥路径不勾也留着，勾上就能直接用。
       */}
       {ssm && (
         <>
@@ -391,13 +394,36 @@ export const ConnectionFields: React.FC<{
             </button>
           </div>
           {advancedOpen && (
-            <Field label={t('Port')} hint={t('Port of sshd on that instance, forwarded by AWS-StartSSHSession. Defaults to 22')}>
-              <input
-                className="settings-input"
-                value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
-                onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
-              />
-            </Field>
+            <>
+              <Field label={t('Login user')} hint={t('User that SSH logs in as on that instance (ec2-user on Amazon Linux, ubuntu on Ubuntu)')}>
+                <input
+                  className="settings-input"
+                  value={splitSshHost(draft.sshHost).user}
+                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, draft.ssmInstanceId || '') })}
+                />
+              </Field>
+              <Field label={t('Port')} hint={t('Port of sshd on that instance, forwarded by AWS-StartSSHSession. Defaults to 22')}>
+                <input
+                  className="settings-input"
+                  value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
+                  onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
+                />
+              </Field>
+              <Field label={t('Authentication')} hint={t('By default KiroLex creates a temporary key and pushes it with EC2 Instance Connect before each connection (no key file needed; needs ec2-instance-connect:SendSSHPublicKey). Tick this to use your own private key instead')}>
+                <div className="remote-via">
+                  <label>
+                    <input
+                      type="checkbox"
+                      checked={!!draft.ssmUseOwnKey}
+                      disabled={locked}
+                      onChange={(e) => setDraft({ ...draft, ssmUseOwnKey: e.target.checked })}
+                    />{' '}
+                    {t('Use my own private key (no temporary key)')}
+                  </label>
+                </div>
+              </Field>
+              {draft.ssmUseOwnKey && keyField}
+            </>
           )}
         </>
       )}
@@ -449,7 +475,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
   const sig = (d: Draft | null): string => (d
     ? JSON.stringify([d.id || '', d.label || '', d.sshHost || '', d.sshPort ?? 22, d.identityFile || '', d.proxyJump || '', d.remoteWorkdir || '',
       d.bins?.kiro || '', d.bins?.claude || '', d.bins?.codex || '', d.password || '', !!d.clearPassword,
-      d.connectVia || 'ssh', d.ssmInstanceId || '', d.ssmRegion || '', d.ssmProfile || ''])
+      d.connectVia || 'ssh', d.ssmInstanceId || '', d.ssmRegion || '', d.ssmProfile || '', !!d.ssmUseOwnKey])
     : '');
 
   const reload = async (keep?: string): Promise<void> => {

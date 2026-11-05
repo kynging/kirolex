@@ -84,6 +84,8 @@ function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntr
       ssmInstanceId: typeof raw?.ssmInstanceId === 'string' ? raw.ssmInstanceId.trim() : '',
       ssmRegion: typeof raw?.ssmRegion === 'string' ? raw.ssmRegion.trim() : '',
       ...(typeof raw?.ssmProfile === 'string' && raw.ssmProfile.trim() ? { ssmProfile: raw.ssmProfile.trim() } : {}),
+      /* 缺省 false = 推临时公钥；老配置里的 identityFile 原样保留，只有勾了这个才用 */
+      ...(raw?.ssmUseOwnKey === true ? { ssmUseOwnKey: true } : {}),
     } : {}),
   };
 }
@@ -291,6 +293,8 @@ export interface RemoteTargetInput {
   ssmRegion?: string;
   /** 空 = 默认凭证链。 */
   ssmProfile?: string;
+  /** SSM：「改用自己的私钥（不推临时公钥）」。缺省 false。 */
+  ssmUseOwnKey?: boolean;
 }
 
 /** 新建时的 id：按 label/host 生成一个稳定的可读 id（不用时间戳 —— 那种 id 在配置文件里没法认）。 */
@@ -348,13 +352,14 @@ export function validateTarget(input: RemoteTargetInput): string | null {
  * 界面给的一份草稿里 SSM 那几个字段（「测试连接」「安装 AI 工具」这类按草稿直接连的路要带上）。
  * 不是 SSM 返回空对象 —— 直连那条路拼出来的目标一个键都不多。
  */
-export function ssmFieldsOf(input: Partial<RemoteTargetInput> | undefined): Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'> {
+export function ssmFieldsOf(input: Partial<RemoteTargetInput> | undefined): Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile' | 'ssmUseOwnKey'> {
   if (input?.connectVia !== 'ssm') return {};
   return {
     connectVia: 'ssm',
     ssmInstanceId: String(input.ssmInstanceId || '').trim(),
     ssmRegion: String(input.ssmRegion || '').trim(),
     ...(String(input.ssmProfile || '').trim() ? { ssmProfile: String(input.ssmProfile).trim() } : {}),
+    ...(input.ssmUseOwnKey === true ? { ssmUseOwnKey: true } : {}),
   };
 }
 
@@ -424,6 +429,8 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
     ssmInstanceId: has('ssmInstanceId') ? (String(input.ssmInstanceId).trim() || undefined) : old?.ssmInstanceId,
     ssmRegion: has('ssmRegion') ? (String(input.ssmRegion).trim() || undefined) : old?.ssmRegion,
     ssmProfile: has('ssmProfile') ? (String(input.ssmProfile).trim() || undefined) : old?.ssmProfile,
+    /* false 不写进文件（缺省就是 false）；identityFile 不管勾没勾都原样留着 */
+    ssmUseOwnKey: (has('ssmUseOwnKey') ? input.ssmUseOwnKey === true : old?.ssmUseOwnKey === true) || undefined,
     editedAt: Date.now(),
   };
   /* 合并后的那一条再验一次：只改了一部分字段（比如只给了 proxyJump）也不能拼出"跳板 + SSM" */

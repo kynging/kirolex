@@ -51,13 +51,16 @@
  */
 
 import { spawn, type ChildProcess } from 'child_process';
-import { transportArgs, connectTimeoutFor, assertSafeSshHost, isSsm } from './sshProxy.ts';
+import { transportArgs, identityArgs, connectTimeoutFor, assertSafeSshHost, isSsm, ssmKeyPushFailure } from './sshProxy.ts';
 import { batchModeFor, sshEnv } from './sshAuth.ts';
 import { tr } from './uiText.ts';
 import type { RemoteTarget } from './config';
 
-/** SSM 那几个字段跟着目标一路传到 master（`transportArgs` 靠它们拼 ProxyCommand）。 */
-type MuxSsm = Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'>;
+/**
+ * SSM 那几个字段跟着目标一路传到 master（`transportArgs` 靠它们拼 ProxyCommand）。
+ * `id` / `ssmUseOwnKey`：临时公钥放在哪个目录、推不推（sshProxy.ts `usesSsmTempKey`）。
+ */
+type MuxSsm = Pick<RemoteTarget, 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile' | 'ssmUseOwnKey'> & { id?: string };
 import fs from 'fs';
 import net from 'net';
 import os from 'os';
@@ -172,7 +175,8 @@ export function masterArgs(opts: {
   ];
   /* 和 buildSshArgs 同一条：密码错了就失败，别让 askpass 用同一个答案被问三次 */
   if (opts.passwordCipher) args.push('-o', 'NumberOfPasswordPrompts=1');
-  if (opts.identityFile) args.push('-i', opts.identityFile);
+  /* SSM 默认是临时私钥 + IdentitiesOnly，公钥由下面的 ProxyCommand 在建连接前推上去 */
+  args.push(...identityArgs(opts));
   if (opts.sshPort && opts.sshPort !== 22) args.push('-p', String(opts.sshPort));
   /* master 是**唯一**真正建连接的那条，跳板 / SSM 的 ProxyCommand 必须在它身上 */
   args.push(...transportArgs(opts));
@@ -653,7 +657,10 @@ export class SshMux {
         没有任何东西再试（当时网络还在抖），于是会话永久没有工具。
       */
       this.scheduleHeal(key);
-      throw new Error(tr('The shared connection to {host} could not be set up. {detail}', { host: key, detail: entry.stderr.trim() || tr('(ssh printed nothing)') }));
+      /* 临时公钥没推上去（缺 SendSSHPublicKey 权限之类）：原文是一段 aws 报错 + "Connection closed"，翻成人话 */
+      const push = isSsm(target) ? ssmKeyPushFailure(entry.stderr, target) : null;
+      const detail = push ? `${push.why}. ${push.hint}` : (entry.stderr.trim() || tr('(ssh printed nothing)'));
+      throw new Error(tr('The shared connection to {host} could not be set up. {detail}', { host: key, detail }));
     }
     readyAt = Date.now();
     this.entries.set(key, entry);

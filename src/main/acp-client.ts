@@ -5,7 +5,7 @@ import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
 import { ToolCallLedger } from './remoteWriteGuard.ts';
-import { transportArgs, connectTimeoutFor, assertSafeSshHost } from './sshProxy.ts';
+import { transportArgs, identityArgs, connectTimeoutFor, assertSafeSshHost } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, adapterAuthMessage, adapterMissingMessage, isAuthRequiredError, resolveAdapter, type Engine } from './engines.ts';
 import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
@@ -1430,7 +1430,8 @@ export function buildSshArgs(
     args.push('-o', 'ExitOnForwardFailure=yes');
     args.push('-R', `127.0.0.1:${forward.remotePort}:127.0.0.1:${forward.localPort}`);
   }
-  if (remote.identityFile) args.push('-i', remote.identityFile);
+  /* SSM 默认是临时私钥 + IdentitiesOnly（sshProxy.ts `identityArgs`）；其余照旧 `-i identityFile` */
+  args.push(...identityArgs(remote));
   if (remote.sshPort && remote.sshPort !== 22) args.push('-p', String(remote.sshPort));
   /*
     跳板要在**建连接**的这一路上（复用路径上面已经 return 了 —— 走已有连接时那一跳早就跳过了）。

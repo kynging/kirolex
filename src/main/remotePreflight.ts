@@ -11,7 +11,7 @@
 import type { RemoteTarget } from './config';
 import { tr, trList } from './uiText.ts';
 import { userInfo } from 'node:os';
-import { isSsm } from './sshProxy.ts';
+import { isSsm, ssmKeyPushFailure, usesSsmTempKey, ssmKeyUnusable, ensureSsmKey, sendKeyArgs } from './sshProxy.ts';
 
 export type PreflightCode = 'ok' | 'unreachable' | 'missing-tools' | 'not-logged-in';
 
@@ -420,7 +420,7 @@ function baseName(p: string): string {
  *
  * 顺序是故意的：插件没装时 aws 什么都没开始，后面的判断都无从谈起；凭证过期时 aws 也可能顺带说 AccessDenied。
  */
-export function ssmFailure(stderr: string, remote: Pick<RemoteTarget, 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'>): { why: string; hint: string } | null {
+export function ssmFailure(stderr: string, remote: Pick<RemoteTarget, 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile'> & Partial<Pick<RemoteTarget, 'sshHost'>>): { why: string; hint: string } | null {
   const s = String(stderr || '');
   const id = remote.ssmInstanceId || 'i-…';
   if (/SessionManagerPlugin is not found|session-manager-plugin.*(not found|No such file)/i.test(s)) {
@@ -447,6 +447,9 @@ export function ssmFailure(stderr: string, remote: Pick<RemoteTarget, 'ssmInstan
       hint: ssmAgentHint(),
     };
   }
+  /* 推临时公钥那一步（ProxyCommand 里先跑它）的报错 —— 要在下面那个 StartSession 的 AccessDenied 之前认 */
+  const push = ssmKeyPushFailure(s, { ...remote, sshHost: remote.sshHost || '' });
+  if (push) return push;
   if (/AccessDenied|not authorized to perform/i.test(s)) {
     return {
       why: tr('your AWS identity is not allowed to start an SSM session on {id} (missing ssm:StartSession)', { id }),
@@ -496,7 +499,8 @@ export type SsmRun = (file: string, args: string[]) => Promise<{ code: number | 
  * **SSM 模式连接前的检查** —— 按顺序：本机工具 → 凭证 → 实例在不在线。
  * 返回 `null` = 都过了（接下来照旧走一次 ssh）；否则返回一条 `unreachable` 的结论，话里说清原因和修法。
  *
- * 只读：`sts get-caller-identity` 和 `ssm describe-instance-information`，不改任何 AWS 资源。
+ * 只读：`sts get-caller-identity` 和 `ssm describe-instance-information`，不改任何 AWS 资源；
+ * 临时公钥模式下再推一次公钥（`ec2-instance-connect send-ssh-public-key`，60 秒后自己失效）。
  */
 /** `seen.arn`：`sts get-caller-identity` 问到的身份（「测试连接」要给人看实际用的是谁）。 */
 export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: SsmRun, seen?: { arn?: string }): Promise<Preflight | null> {
@@ -506,6 +510,9 @@ export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: S
     message: tr('Cannot connect to {host} over AWS SSM: {why}. {hint}', { host, why, hint }),
     raw: why,
   });
+  /* mi- 托管实例推不了临时公钥：没勾「改用自己的私钥」就先说清楚，不往下连 */
+  const unusable = ssmKeyUnusable(remote);
+  if (unusable) return { code: 'unreachable', message: unusable, raw: unusable };
   if (!tools.aws) {
     const how = process.platform === 'darwin'
       ? '`brew install awscli`'
@@ -530,18 +537,40 @@ export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: S
       **没有 describe 权限不算失败**：我们给的最小权限只有 `ssm:StartSession`，照着配的人这里一定被拒，
       而连接本身照样能通。只有认得出的硬伤（凭证过期之类）才拦；其余交给接下来那次 ssh 说话。
     */
-    if (/AccessDenied|not authorized to perform/i.test(info.stderr)) return null;
-    const known = ssmFailure(info.stderr, remote);
-    return known ? fail(known.why, known.hint) : null;
+    if (!/AccessDenied|not authorized to perform/i.test(info.stderr)) {
+      const known = ssmFailure(info.stderr, remote);
+      if (known) return fail(known.why, known.hint);
+    }
+  } else {
+    const ping = ssmPingStatus(info.stdout);
+    if (ping !== 'Online') {
+      return fail(
+        ping
+          ? tr('{id} is registered in SSM but its status is {status}', { id: remote.ssmInstanceId || '', status: ping })
+          : tr('{id} is not registered in SSM in {region}', { id: remote.ssmInstanceId || '', region: remote.ssmRegion || '' }),
+        ssmAgentHint(),
+      );
+    }
   }
-  const ping = ssmPingStatus(info.stdout);
-  if (ping !== 'Online') {
-    return fail(
-      ping
-        ? tr('{id} is registered in SSM but its status is {status}', { id: remote.ssmInstanceId || '', status: ping })
-        : tr('{id} is not registered in SSM in {region}', { id: remote.ssmInstanceId || '', region: remote.ssmRegion || '' }),
-      ssmAgentHint(),
-    );
+  /*
+    **推临时公钥这一步也查** ——「测试连接也要检查这一步」。真连接时它在 ProxyCommand 里跑，
+    失败了 ssh 只会说 "Connection closed"；这里单独跑一次，缺 SendSSHPublicKey 权限就直接说清楚。
+    （推上去的公钥 60 秒后自己失效，紧接着那次 ssh 会再推一次。）
+  */
+  if (usesSsmTempKey(remote)) {
+    let args: string[];
+    try { args = sendKeyArgs(remote, ensureSsmKey(remote).publicKey); } catch (err: any) {
+      return fail(tr('the temporary SSH key could not be prepared ({err})', { err: String(err?.message || err) }), tr('Or, under Advanced, choose "Use my own private key (no temporary key)".'));
+    }
+    const sent = await run(tools.aws, args);
+    if (sent.code !== 0) {
+      const known = ssmFailure(sent.stderr, remote);
+      if (known) return fail(known.why, known.hint);
+      return fail(
+        tr('pushing the temporary SSH key with EC2 Instance Connect failed ({err})', { err: firstLine(sent.stderr) || `exit ${sent.code}` }),
+        tr('Or, under Advanced, choose "Use my own private key (no temporary key)".'),
+      );
+    }
   }
   return null;
 }
