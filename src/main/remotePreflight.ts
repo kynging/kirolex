@@ -498,7 +498,8 @@ export type SsmRun = (file: string, args: string[]) => Promise<{ code: number | 
  *
  * 只读：`sts get-caller-identity` 和 `ssm describe-instance-information`，不改任何 AWS 资源。
  */
-export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: SsmRun): Promise<Preflight | null> {
+/** `seen.arn`：`sts get-caller-identity` 问到的身份（「测试连接」要给人看实际用的是谁）。 */
+export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: SsmRun, seen?: { arn?: string }): Promise<Preflight | null> {
   const host = remote.sshHost || remote.ssmInstanceId || 'remote';
   const fail = (why: string, hint: string): Preflight => ({
     code: 'unreachable',
@@ -519,6 +520,9 @@ export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: S
     if (known) return fail(known.why, known.hint);
     const cmd = `aws sts get-caller-identity${remote.ssmProfile ? ` --profile ${remote.ssmProfile}` : ''}`;
     return fail(tr('the AWS credentials do not work ({err})', { err: firstLine(who.stderr) || `exit ${who.code}` }), tr('Run `{cmd}` to see why.', { cmd }));
+  }
+  if (seen) {
+    try { const arn = JSON.parse(String(who.stdout || ''))?.Arn; if (typeof arn === 'string' && arn) seen.arn = arn; } catch { /* 只是少显示一行 */ }
   }
   const info = await run(tools.aws, ['ssm', 'describe-instance-information', '--filters', `Key=InstanceIds,Values=${remote.ssmInstanceId}`, ...common]);
   if (info.code !== 0) {

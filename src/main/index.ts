@@ -4497,7 +4497,9 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
  *
  * 「测试连接」先跑它：这几样不对时那次 ssh 只会报 "Connection closed by UNKNOWN port 65535"，看不出是哪一环。
  */
+const ssmArnOf = new WeakMap<RemoteTarget, string>();
 async function checkSsm(remote: RemoteTarget): Promise<ReturnType<typeof judgePreflight> | null> {
+  const seen: { arn?: string } = {};
   const tools = { aws: findLocalTool('aws'), plugin: findLocalTool('session-manager-plugin') };
   const verdict = await ssmPreflight(remote, tools, (file, args) => new Promise((resolve) => {
     execFile(file, args, { timeout: 20_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
@@ -4505,9 +4507,26 @@ async function checkSsm(remote: RemoteTarget): Promise<ReturnType<typeof judgePr
       stdout: String(stdout || ''),
       stderr: String(stderr || (err && typeof err.code !== 'number' ? err.message : '') || ''),
     }));
-  }));
+  }), seen);
+  if (seen.arn) ssmArnOf.set(remote, seen.arn);
   logger.info('remote', `ssm 预检 ${remote.sshHost}（aws=${tools.aws || '无'}，plugin=${tools.plugin || '无'}）：${verdict ? verdict.message : '通过'}`);
   return verdict;
+}
+
+/**
+ * 「测试连接」结果里说清 SSM **实际用的** profile 和身份 ——「AWS profile 留空，用户看不出实际用的是哪个」。
+ * 留空时 aws CLI 按默认凭证链取（`AWS_PROFILE` 环境变量，没有就是 default）；ARN 来自 `sts get-caller-identity`。
+ */
+function ssmIdentityNote(remote: RemoteTarget, message: string): string {
+  if (!isSsm(remote)) return message;
+  const profile = remote.ssmProfile || tr('default credential chain ({name})', { name: process.env.AWS_PROFILE || 'default' });
+  const arn = ssmArnOf.get(remote);
+  return trConcat(message, '\n', tr('AWS profile: {profile}', { profile }), arn ? `\n${tr('Identity (ARN): {arn}', { arn })}` : '');
+}
+/** 「测试连接」用的 `checkSsm`：没过时也说一句用的是哪个 profile。 */
+async function checkSsmNoted(remote: RemoteTarget): Promise<ReturnType<typeof judgePreflight> | null> {
+  const v = await checkSsm(remote);
+  return v && { ...v, message: ssmIdentityNote(remote, v.message) };
 }
 
 /**
@@ -17300,6 +17319,8 @@ ${hint}` : ''}` };
         editedAt: t.editedAt,
         /* 密码只说"有没有"，密文和明文都不出主进程 */
         hasPassword: !!t.passwordCipher,
+        /* 老形状 agents[].remote：打开设置时不默认选它（defaultPick） */
+        legacy: t.legacy,
       })),
       /** 本机那份（和远端同样三个字段）——「不管是本地还是远程必须要配置」。 */
       localBins: localBins(KIROLEX_CONFIG_PATH),
@@ -17408,8 +17429,8 @@ ${hint}` : ''}` };
       /* 明文密码不往下传：saveRemoteTarget 只见密文 */
       const { password: _pw, clearPassword: _clr, ...rest } = input as any;
       const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, { ...rest, ...passwordFields(input) });
-      logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})${saved.passwordCipher ? '，带密码' : ''}`);
-      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher, connectVia: saved.connectVia, ssmInstanceId: saved.ssmInstanceId, ssmRegion: saved.ssmRegion, ssmProfile: saved.ssmProfile } };
+      logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})${saved.passwordCipher ? '，带密码' : ''}${saved.droppedLegacy ? `，切到 SSM：删掉老 agents[].remote ${saved.droppedLegacy.join(',')}` : ''}`);
+      return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher, connectVia: saved.connectVia, ssmInstanceId: saved.ssmInstanceId, ssmRegion: saved.ssmRegion, ssmProfile: saved.ssmProfile }, droppedLegacy: saved.droppedLegacy };
     } catch (err: any) {
       return { ok: false, error: err?.message || tr('Save failed') };
     }
@@ -17887,7 +17908,7 @@ ${hint}` : ''}` };
       passwordCipher: passwordCipherForUse(input),
       ...ssmFieldsOf(input),
     } as RemoteTarget;
-    const ssm = isSsm(target) ? await checkSsm(target) : null;
+    const ssm = isSsm(target) ? await checkSsmNoted(target) : null;
     if (ssm) return { ok: false, code: ssm.code, message: ssm.message };
     /* 「测试连接」不问模型列表 —— 那是最慢的一段，而它不改变"连不连得上"这个结论 */
     /* kiro 的预检之后顺带探两家适配器（同一次 ssh）：只为 Claude Code / Codex 配的机器也要能测通 */
@@ -17909,7 +17930,7 @@ ${hint}` : ''}` };
     */
     if (verdict.code === 'ok') reachability.ok(target.sshHost || '');
     logger.info('remote', `test ${target.sshHost}: ${verdict.code}`);
-    return { ok: verdict.code === 'ok', code: verdict.code, message: verdict.message, missing: verdict.missing };
+    return { ok: verdict.code === 'ok', code: verdict.code, message: ssmIdentityNote(target, verdict.message), missing: verdict.missing };
   });
 
   ipcMain.handle('app:get-features', () => ({

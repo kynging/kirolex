@@ -29,7 +29,8 @@ describe('可选远端的解析', () => {
     });
     assert.equal(list.length, 1, '不兼容读的话得手改配置才能用');
     assert.equal(list[0].id, 'agent_1');
-    assert.equal(list[0].label, '9.9.9.9');
+    /* 没写 label 的老条目不再只叫一个 IP ——「冒出一台名称是 IP 的幽灵机器」（ssmLegacyRemote.test.ts） */
+    assert.match(list[0].label, /^9\.9\.9\.9 \((旧配置|old config)\)$/);
   });
 
   test('`enabled: false` 照样出现在列表里 —— 那个字段原来的意思是"全局开关关着"', () => {
@@ -787,7 +788,8 @@ describe('私钥/端口不能在来回传的路上丢掉', () => {
     const { defaultPick, LOCAL } = await import('../src/renderer/remotePick.ts');
     assert.equal(defaultPick([]), LOCAL);
     assert.equal(defaultPick([{ id: 'a', editedAt: 5 }, { id: 'b', editedAt: 9 }, { id: 'c', editedAt: 1 }]), 'b');
-    assert.equal(defaultPick([{ id: 'a' }, { id: 'b' }]), 'b', '老配置没有 editedAt：最近加的那台');
+    /* 都没有 editedAt：新列表里的第一台（最后一条往往是老形状 agents[].remote 那台幽灵机器） */
+    assert.equal(defaultPick([{ id: 'a' }, { id: 'b' }]), 'a', '老配置没有 editedAt：新列表第一台');
     /* 设置页真的用它，而不是原来那句「第一台，没有就新建」 */
     const RS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/RemoteSettings.tsx'), 'utf8');
     assert.match(RS, /: defaultPick\(list\);/);

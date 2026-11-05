@@ -33,6 +33,10 @@ export interface RemoteTargetEntry extends RemoteTarget {
   label: string;
   /** 最后一次在设置里存它的时间（ms）。打开设置时默认显示最近编辑的那台；老配置里没有。 */
   editedAt?: number;
+  /** 来自老形状 `agents[].remote`（不在 `remotes[]` 里，界面上改不了也删不了）。 */
+  legacy?: true;
+  /** 只在 `saveRemoteTarget` 的返回值上：这次 SSH→SSM 顺手删掉的老 `agents[].remote` 的 id。 */
+  droppedLegacy?: string[];
 }
 
 /** `~` 要展开 —— 配置里写 `~/k.pem` 的人不该因此连不上。 */
@@ -208,9 +212,25 @@ export function parseRemoteTargets(cfg: any, home = os.homedir()): RemoteTargetE
   /* 兼容读老形状。`enabled: false` 照样收 —— 那个字段原来的意思是"全局开关关着"，
      而现在选不选由会话决定，所以它不再能决定一台机器要不要出现在列表里。 */
   const agents = Array.isArray(cfg?.agents) ? cfg.agents : [];
+  /*
+    **SSM 机器的老地址** ——「冒出一台名称是 IP、连接方式是 SSH 的幽灵机器」。
+    一台机器切到 SSM 后 sshHost 变成 `user@<实例ID>`，上面按 host:port 去重就认不出它的老条目了
+    （老条目里还是 IP）。所以对 SSM 机器再按"私钥 + 工作目录都一样"或"名字一样"认一次。
+    只是私钥一样不算：同一把密钥常给好几台机器用。
+  */
+  const ssmRows = out.filter((t) => t.connectVia === 'ssm');
+  const sameAsSsm = (t: RemoteTargetEntry, name: string): boolean => ssmRows.some((s) =>
+    (!!t.identityFile && t.identityFile === s.identityFile && (t.remoteWorkdir || '') === (s.remoteWorkdir || ''))
+    || (!!name && name.toLowerCase() === s.label.toLowerCase()));
   agents.forEach((a: any, i: number) => {
     if (!a?.remote?.sshHost) return;
-    add(normalize({ ...a.remote, id: a.id || `agent${i + 1}`, label: a.remote.label || a.name }, a.id || `agent${i + 1}`, home));
+    const own = typeof a.remote.label === 'string' ? a.remote.label.trim() : '';
+    const name = String(a.name || '').trim();
+    /* 没写 label 的老条目：不要只给一个 IP —— 那看起来像一台凭空多出来的机器 */
+    const label = own || tr('{name} (old config)', { name: name || String(a.kind || '').trim() || deriveLabel(String(a.remote.sshHost)) });
+    const t = normalize({ ...a.remote, id: a.id || `agent${i + 1}`, label }, a.id || `agent${i + 1}`, home);
+    if (!t || sameAsSsm(t, own || name)) return;
+    add({ ...t, legacy: true });
   });
   return out;
 }
@@ -251,6 +271,7 @@ export function findRemoteTarget(configPath: string, id: string | undefined, hom
  *   · 只动 `remotes` 这一个键，配置里别的东西**原样保留**（这份文件里还有 agents、features…）
  *   · 先写临时文件再 rename —— 这是用户唯一的配置文件，写一半被中断就等于把它弄坏了
  *   · 老形状 `agents[].remote` **不改写**：它照旧被读出来当一个可选目标，但编辑动的是新列表
+ *     （唯一的例外：一台机器从 SSH 切到 SSM 时，删掉和它切换前同地址的老条目，见 saveRemoteTarget）
  */
 export interface RemoteTargetInput {
   id?: string;
@@ -412,8 +433,24 @@ export function saveRemoteTarget(configPath: string, input: RemoteTargetInput, h
   }
   if (at >= 0) list[at] = row; else list.push(row);
   cfg.remotes = list;
+  /*
+    **SSH → SSM 时把这台的老 `agents[].remote` 一起删掉**（同一次原子写）。切换前它和这台同地址、
+    被去重藏着；切换后地址变成实例 ID，它就会以"一台叫 IP 的 SSH 机器"冒出来。
+    只删 `remote` 这个键，agent 本身的其它字段不动。
+  */
+  const droppedLegacy: string[] = [];
+  const oldHost = String(old?.sshHost || '').trim();
+  if (row.connectVia === 'ssm' && old && old.connectVia !== 'ssm' && oldHost && Array.isArray(cfg.agents)) {
+    cfg.agents.forEach((a: any, i: number) => {
+      if (a?.remote && String(a.remote.sshHost || '').trim() === oldHost) {
+        delete a.remote;
+        droppedLegacy.push(String(a.id || `agent${i + 1}`));
+      }
+    });
+  }
   writeConfigObject(configPath, cfg);
-  return normalize(row, id, home)!;
+  const entry = normalize(row, id, home)!;
+  return droppedLegacy.length ? { ...entry, droppedLegacy } : entry;
 }
 
 /** 删一条。删不掉（id 不在新列表里）时返回 false —— 老 `agents[].remote` 那条不在这里管。 */

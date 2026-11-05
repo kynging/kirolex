@@ -7,16 +7,18 @@ export const LOCAL = '__local__';
  * Which machine Settings → 机器 shows when it opens ——「默认显示本机，如果有远程机器就显示
  * 最近编辑的那台的配置信息，而不是新加机器界面」.
  *
- * No remote machines = 本机. Otherwise the one with the newest `editedAt`; old configs
- * saved before `editedAt` existed count as oldest, so among those the LAST in the list
- * (= most recently added) wins. 「+ 添加一台机器…」 is never the default — it appears only
- * when you pick it.
+ * No remote machines = 本机. Otherwise the one with the newest `editedAt`. When nothing has
+ * an `editedAt` (configs saved before it existed), the FIRST machine of the new `remotes[]`
+ * list wins —「一打开机器配置就是 SSH、名称是 IP」：old-shape `agents[].remote` entries
+ * (`legacy`) sit at the end of the list, so "the last one" used to pick exactly that ghost.
+ * 「+ 添加一台机器…」 is never the default — it appears only when you pick it.
  */
-export function defaultPick(list: { id: string; editedAt?: number }[]): string {
+export function defaultPick(list: { id: string; editedAt?: number; legacy?: boolean }[]): string {
   if (!list.length) return LOCAL;
-  let best = list.length - 1;
-  list.forEach((x, i) => { if ((x.editedAt || 0) > (list[best].editedAt || 0)) best = i; });
-  return list[best].id;
+  let best = -1;
+  list.forEach((x, i) => { if ((x.editedAt || 0) > (best < 0 ? 0 : (list[best].editedAt || 0))) best = i; });
+  if (best >= 0) return list[best].id;
+  return (list.find((x) => !x.legacy) || list[0]).id;
 }
 
 /**
@@ -53,3 +55,21 @@ export function connectionKey(d: { sshHost?: string; sshPort?: number; identityF
 
 /** SSM 模式下默认的登录用户（Amazon Linux 的默认用户）。 */
 export const DEFAULT_SSM_USER = 'ec2-user';
+
+/**
+ * **切换连接方式**。SSM 时 `sshHost` 是 `<登录用户>@<实例 ID>`（主机名 + HostKeyAlias），
+ * 所以 IP 那一栏不要了；切回 SSH 时实例 ID 不是一个能连的地址，主机那一半清空让你重填。
+ * 端口 / 密码**不清**：SSM 下只是不显示（端口仍是 AWS-StartSSHSession 的 portNumber），切回 SSH 还在。
+ */
+export function switchVia<D extends { sshHost: string; connectVia?: 'ssh' | 'ssm'; ssmInstanceId?: string; proxyJump?: string }>(draft: D, via: 'ssh' | 'ssm'): D {
+  const user = splitSshHost(draft.sshHost).user;
+  return via === 'ssm'
+    ? { ...draft, connectVia: 'ssm', proxyJump: '', sshHost: joinSshHost(user || DEFAULT_SSM_USER, draft.ssmInstanceId || '') }
+    : { ...draft, connectVia: 'ssh', sshHost: joinSshHost(user, '') };
+}
+
+/** 机器下拉里那一行。SSM 的显示「实例ID · 区域」——整串 `ec2-user@i-…` 又长又看不出在哪个区。 */
+export function machineOptionText(r: { label: string; sshHost: string; connectVia?: string; ssmInstanceId?: string; ssmRegion?: string }): string {
+  if (r.connectVia === 'ssm') return `🌐 ${r.label} — ${[r.ssmInstanceId, r.ssmRegion].filter(Boolean).join(' · ')}  [SSM]`;
+  return `🌐 ${r.label} — ${r.sshHost}`;
+}

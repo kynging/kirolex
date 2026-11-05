@@ -1,5 +1,5 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
-import { DEFAULT_SSM_USER, DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, joinSshHost, splitSshHost } from '../remotePick.ts';
+import { DEFAULT_SSM_USER, DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, joinSshHost, machineOptionText, splitSshHost, switchVia } from '../remotePick.ts';
 import { notifyRemoteTargetsChanged } from '../hooks/useRemoteTargets.ts';
 import { useT } from '../hooks/useLang';
 import { EngineStatusPanel } from './EngineStatusPanel';
@@ -62,6 +62,8 @@ export interface RemoteRow {
   ssmRegion?: string;
   /** 空 = 默认凭证链。 */
   ssmProfile?: string;
+  /** 来自老形状 `agents[].remote`（打开设置时不默认选它）。 */
+  legacy?: boolean;
 }
 
 
@@ -217,6 +219,192 @@ const BinFields: React.FC<{ bins: ExecBins; machine: string; onChange: (b: ExecB
   );
 };
 
+/**
+ * 一台机器的连接字段（连接方式 → 工作目录）。单独成一个组件，好在测试里直接渲染出来看
+ * （SSM 时有哪些栏、没有哪些栏），不用起整个设置页。
+ */
+export const ConnectionFields: React.FC<{
+  draft: Draft;
+  setDraft: (d: Draft) => void;
+  locked: boolean;
+  setVia: (via: 'ssh' | 'ssm') => void;
+  pickKey: () => void;
+  /** 本机 ~/.aws 里的 profile 名（SSM 的 AWS profile 下拉）。 */
+  awsProfiles?: string[];
+  /** SSM 的「高级」（端口）展开没有。 */
+  advancedOpen?: boolean;
+  onToggleAdvanced: () => void;
+}> = ({ draft, setDraft, locked, setVia, pickKey, awsProfiles, advancedOpen, onToggleAdvanced }) => {
+  const t = useT();
+  const ssm = draft.connectVia === 'ssm';
+  /* 下拉里选了「手动填写…」 */
+  const [manualProfile, setManualProfile] = useState(false);
+  const list = awsProfiles || [];
+  /* 存着一个列表里没有的名字：照样作为一项显示出来（不能显示成「默认凭证链」—— 那是在说谎） */
+  const profileChoices = draft.ssmProfile && !list.includes(draft.ssmProfile) ? [...list, draft.ssmProfile] : list;
+  return (
+    <>
+      {/*
+        **连接方式** ——「通过 AWS SSM 连接」：机器不用开 22 端口、不用公网 IP，按实例 ID 连。
+        只换传输层（ProxyCommand = aws ssm start-session），反向隧道 / 本机工具 / ACP 全都照旧。
+      */}
+      <Field label={t('Connect via')} hint={t('SSH connects to an IP directly. AWS SSM tunnels SSH through Session Manager: no open port 22, no public IP, and the IP may change (needs aws + session-manager-plugin on this computer)')}>
+        <div className="remote-via">
+          <label><input type="radio" name="remote-via" checked={!ssm} disabled={locked} onChange={() => setVia('ssh')} /> SSH</label>
+          <label><input type="radio" name="remote-via" checked={ssm} disabled={locked} onChange={() => setVia('ssm')} /> AWS SSM</label>
+          {ssm && <span className="remote-badge-ssm">SSM</span>}
+        </div>
+      </Field>
+      {ssm ? (
+        <>
+          <Field label={t('Instance ID')} hint={t('EC2 instance ID, e.g. i-0123456789abcdef0 (or mi-… for a managed instance)')}>
+            <input
+              className="settings-input"
+              spellCheck={false}
+              value={draft.ssmInstanceId || ''}
+              onChange={(e) => setDraft({ ...draft, ssmInstanceId: e.target.value.trim(), sshHost: joinSshHost(splitSshHost(draft.sshHost).user || DEFAULT_SSM_USER, e.target.value.trim()) })}
+            />
+          </Field>
+          <Field label={t('Region')} hint={t('AWS region of that instance, e.g. us-east-1')}>
+            <input
+              className="settings-input"
+              spellCheck={false}
+              value={draft.ssmRegion || ''}
+              onChange={(e) => setDraft({ ...draft, ssmRegion: e.target.value.trim() })}
+            />
+          </Field>
+          {/*
+            **下拉，不是空输入框** ——「留空就用 default 凭证链，用户看不出实际用的是哪个」。
+            候选是本机 ~/.aws/config + ~/.aws/credentials 里的 profile（和云同步那个下拉同一份）；
+            列表里没有的名字照样能手填。留空那一项直接写明「默认凭证链（default）」。
+          */}
+          <Field label={t('AWS profile')} hint={t('Profile in ~/.aws/config or ~/.aws/credentials. Empty = the default credential chain')}>
+            <select
+              className="settings-select"
+              aria-label={t('AWS profile')}
+              disabled={locked}
+              value={manualProfile ? '__manual__' : (draft.ssmProfile || '')}
+              onChange={(e) => {
+                if (e.target.value === '__manual__') { setManualProfile(true); return; }
+                setManualProfile(false);
+                setDraft({ ...draft, ssmProfile: e.target.value });
+              }}
+            >
+              <option value="">{t('Default credential chain (default)')}</option>
+              {profileChoices.map((p) => <option key={p} value={p}>{p}</option>)}
+              <option value="__manual__">{t('Type a name…')}</option>
+            </select>
+            {manualProfile && (
+              <input
+                className="settings-input"
+                spellCheck={false}
+                aria-label={t('Profile name')}
+                value={draft.ssmProfile || ''}
+                onChange={(e) => setDraft({ ...draft, ssmProfile: e.target.value.trim() })}
+              />
+            )}
+          </Field>
+          <Field label={t('Login user')} hint={t('User that SSH logs in as on that instance (ec2-user on Amazon Linux, ubuntu on Ubuntu)')}>
+            <input
+              className="settings-input"
+              value={splitSshHost(draft.sshHost).user}
+              onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, draft.ssmInstanceId || '') })}
+            />
+          </Field>
+        </>
+      ) : (
+        <>
+          <Field label={t('IP address')} hint={t('IP or hostname of that machine')}>
+            <input
+              className="settings-input"
+              value={splitSshHost(draft.sshHost).host}
+              onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(splitSshHost(draft.sshHost).user, e.target.value) })}
+            />
+          </Field>
+          <Field label={t('Username')} hint={t('Username for ssh login to that machine. Empty = use your local username')}>
+            <input
+              className="settings-input"
+              value={splitSshHost(draft.sshHost).user}
+              onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, splitSshHost(draft.sshHost).host) })}
+            />
+          </Field>
+        </>
+      )}
+      {/* SSM 下没有「端口」「密码」：端口挪进下面的「高级」，密码不适用（值都留在 draft 里，切回 SSH 还在） */}
+      {!ssm && (
+        <>
+          <Field label={t('Port')} hint={t('Defaults to 22')}>
+            <input
+              className="settings-input"
+              value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
+              onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
+            />
+          </Field>
+          {/* 密钥用 Finder 选 —— 手写路径错一个字母，表现是"认证失败"，跟机器没开长得一样 */}
+          {/* 密码可以不填 ——「除了用户名应该还有密码，不过密码可以是空的」。存的是加密后的，界面只知道"有没有" */}
+          <Field label={t('Password')} hint={t('Fill in either the password or the private key; leave both empty to use your own ssh config. Stored encrypted')}>
+            <div className="remote-key">
+              <input
+                className="settings-input"
+                type="password"
+                autoComplete="new-password"
+                value={draft.password || ''}
+                onChange={(e) => setDraft({ ...draft, password: e.target.value, clearPassword: false })}
+              />
+              {draft.hasPassword && !draft.password && !draft.clearPassword && (
+                <>
+                  <span className="settings-hint">{t('Saved')}</span>
+                  <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, password: '', clearPassword: true })}>{t('Clear')}</button>
+                </>
+              )}
+            </div>
+          </Field>
+        </>
+      )}
+      <Field label={t('Private key')} hint={t('Fill in either the private key or the password; leave both empty to use your own ssh config (~/.ssh/config, ssh-agent)')}>
+      <div className="remote-key">
+        <span className={`remote-key-path${draft.identityFile ? '' : ' empty'}`} title={draft.identityFile || ''}>
+          🔑 {draft.identityFile || t('No private key selected (use it or a password; with neither, your own ssh config is used)')}
+        </span>
+        <button className="remote-btn" disabled={locked} onClick={() => void pickKey()}>{t('Choose key…')}</button>
+        {draft.identityFile && (
+          <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>{t('Clear')}</button>
+        )}
+      </div>
+      </Field>
+      <Field label={t('Working directory')} hint={t('A directory on that machine; ~ is the login user\'s home. KiroLex creates a scratch directory for each session here')}>
+        <input
+          className="settings-input"
+          value={draft.remoteWorkdir || ''}
+          onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
+        />
+      </Field>
+      {/*
+        **SSM 的「高级」** —— 端口不直接删：极少数实例的 sshd 不在 22，这个值作为
+        AWS-StartSSHSession 的 portNumber 传下去（sshProxy.ts）。默认折叠，因为几乎没人要改它。
+      */}
+      {ssm && (
+        <>
+          <div className="remote-row-actions">
+            <button type="button" className="remote-btn" aria-expanded={!!advancedOpen} onClick={onToggleAdvanced}>
+              {advancedOpen ? '▾' : '▸'} {t('Advanced')}
+            </button>
+          </div>
+          {advancedOpen && (
+            <Field label={t('Port')} hint={t('Port of sshd on that instance, forwarded by AWS-StartSSHSession. Defaults to 22')}>
+              <input
+                className="settings-input"
+                value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
+                onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
+              />
+            </Field>
+          )}
+        </>
+      )}
+    </>
+  );
+};
+
 /** `startNew`：打开时直接停在「+ 添加一台机器…」、给一张空表（侧栏右键「运行位置 → ＋ 添加机器…」）。 */
 export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) => {
   const t = useT();
@@ -237,6 +425,10 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
   const [result, setResult] = useState<{ ok: boolean; text: string } | null>(null);
   /** 最近一次「测试连接」**通过**时的连接参数（`connectionKey`）；没测过或没通过 = 空。 */
   const [testedOk, setTestedOk] = useState('');
+  /** 本机 ~/.aws 里的 profile 名；切到 SSM 才去读。 */
+  const [awsProfiles, setAwsProfiles] = useState<string[] | undefined>(undefined);
+  /** SSM 的「高级」（端口）—— 默认折叠。 */
+  const [advancedOpen, setAdvancedOpen] = useState(false);
   /** 安装脚本的实时输出。装东西要几分钟（kiro-cli 那个包几百 MB），一个字不给看就像卡死了。 */
   const [log, setLog] = useState('');
   const logRef = useRef<HTMLPreElement | null>(null);
@@ -314,6 +506,9 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       setRows((prev) => (prev.some((x) => x.id === saved.id)
         ? prev.map((x) => (x.id === saved.id ? saved : x))
         : [...prev, saved]));
+      /* 切到 SSM 时主进程顺手删掉的老 agents[].remote：下拉里也就地去掉 */
+      const dropped: string[] = Array.isArray(r.droppedLegacy) ? r.droppedLegacy : [];
+      if (dropped.length) setRows((prev) => prev.filter((x) => !dropped.includes(x.id)));
       /* 新建那条落地了：认领这个 id，之后的编辑是"改它"而不是"再插一条" */
       setDraft((d) => (d ? { ...d, id: saved.id, clearPassword: false, hasPassword: saved.hasPassword } : d));
       if (!draft.id) setPicked(saved.id);
@@ -419,15 +614,16 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
    * 所以 IP 那一栏不要了；切回 SSH 时实例 ID 不是一个能连的地址，主机那一半清空让你重填。
    */
   const setVia = (via: 'ssh' | 'ssm'): void => {
-    if (!draft) return;
-    const user = splitSshHost(draft.sshHost).user;
-    if (via === 'ssm') {
-      setDraft({ ...draft, connectVia: 'ssm', proxyJump: '', sshHost: joinSshHost(user || DEFAULT_SSM_USER, draft.ssmInstanceId || '') });
-    } else {
-      setDraft({ ...draft, connectVia: 'ssh', sshHost: joinSshHost(user, '') });
-    }
+    if (draft) setDraft(switchVia(draft, via));
   };
   const ssm = draft?.connectVia === 'ssm';
+  /* SSM 的 AWS profile 下拉：候选和云同步那个下拉同一份（s3:list-profiles，只读 ~/.aws 的两个文件） */
+  useEffect(() => {
+    if (!ssm || awsProfiles) return;
+    void (window as any).kiroApi?.listS3AwsProfiles?.()
+      .then((r: any) => setAwsProfiles(Array.isArray(r?.profiles) ? r.profiles : []))
+      .catch(() => setAwsProfiles([]));
+  }, [ssm, awsProfiles]);
 
   const locked = busy || installing;
   const canAct = !!draft && !!splitSshHost(draft.sshHost).host.trim();
@@ -456,7 +652,7 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
       >
         <option value={LOCAL}>{t('💻 Local (this computer)')}</option>
         {rows.map((r) => (
-          <option key={r.id} value={r.id}>{`🌐 ${r.label} — ${r.sshHost}${r.connectVia === 'ssm' ? '  [SSM]' : ''}`}</option>
+          <option key={r.id} value={r.id}>{machineOptionText(r)}</option>
         ))}
         <option value={NEW}>{t('+ Add a machine…')}</option>
       </select>
@@ -496,113 +692,16 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
               onChange={(e) => setDraft({ ...draft, label: e.target.value })}
             />
           </Field>
-          {/*
-            **连接方式** ——「通过 AWS SSM 连接」：机器不用开 22 端口、不用公网 IP，按实例 ID 连。
-            只换传输层（ProxyCommand = aws ssm start-session），反向隧道 / 本机工具 / ACP 全都照旧。
-          */}
-          <Field label={t('Connect via')} hint={t('SSH connects to an IP directly. AWS SSM tunnels SSH through Session Manager: no open port 22, no public IP, and the IP may change (needs aws + session-manager-plugin on this computer)')}>
-            <div className="remote-via">
-              <label><input type="radio" name="remote-via" checked={!ssm} disabled={locked} onChange={() => setVia('ssh')} /> SSH</label>
-              <label><input type="radio" name="remote-via" checked={ssm} disabled={locked} onChange={() => setVia('ssm')} /> AWS SSM</label>
-              {ssm && <span className="remote-badge-ssm">SSM</span>}
-            </div>
-          </Field>
-          {ssm ? (
-            <>
-              <Field label={t('Instance ID')} hint={t('EC2 instance ID, e.g. i-0123456789abcdef0 (or mi-… for a managed instance)')}>
-                <input
-                  className="settings-input"
-                  spellCheck={false}
-                  value={draft.ssmInstanceId || ''}
-                  onChange={(e) => setDraft({ ...draft, ssmInstanceId: e.target.value.trim(), sshHost: joinSshHost(splitSshHost(draft.sshHost).user || DEFAULT_SSM_USER, e.target.value.trim()) })}
-                />
-              </Field>
-              <Field label={t('Region')} hint={t('AWS region of that instance, e.g. us-east-1')}>
-                <input
-                  className="settings-input"
-                  spellCheck={false}
-                  value={draft.ssmRegion || ''}
-                  onChange={(e) => setDraft({ ...draft, ssmRegion: e.target.value.trim() })}
-                />
-              </Field>
-              <Field label={t('AWS profile')} hint={t('Profile in ~/.aws/config. Empty = the default credential chain')}>
-                <input
-                  className="settings-input"
-                  spellCheck={false}
-                  value={draft.ssmProfile || ''}
-                  onChange={(e) => setDraft({ ...draft, ssmProfile: e.target.value.trim() })}
-                />
-              </Field>
-              <Field label={t('Login user')} hint={t('User that SSH logs in as on that instance (ec2-user on Amazon Linux, ubuntu on Ubuntu)')}>
-                <input
-                  className="settings-input"
-                  value={splitSshHost(draft.sshHost).user}
-                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, draft.ssmInstanceId || '') })}
-                />
-              </Field>
-            </>
-          ) : (
-            <>
-              <Field label={t('IP address')} hint={t('IP or hostname of that machine')}>
-                <input
-                  className="settings-input"
-                  value={splitSshHost(draft.sshHost).host}
-                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(splitSshHost(draft.sshHost).user, e.target.value) })}
-                />
-              </Field>
-              <Field label={t('Username')} hint={t('Username for ssh login to that machine. Empty = use your local username')}>
-                <input
-                  className="settings-input"
-                  value={splitSshHost(draft.sshHost).user}
-                  onChange={(e) => setDraft({ ...draft, sshHost: joinSshHost(e.target.value, splitSshHost(draft.sshHost).host) })}
-                />
-              </Field>
-            </>
-          )}
-          <Field label={t('Port')} hint={t('Defaults to 22')}>
-            <input
-              className="settings-input"
-              value={draft.sshPort === undefined ? '' : String(draft.sshPort)}
-              onChange={(e) => setDraft({ ...draft, sshPort: e.target.value === '' ? undefined : Number(e.target.value) })}
-            />
-          </Field>
-          {/* 密钥用 Finder 选 —— 手写路径错一个字母，表现是"认证失败"，跟机器没开长得一样 */}
-          {/* 密码可以不填 ——「除了用户名应该还有密码，不过密码可以是空的」。存的是加密后的，界面只知道"有没有" */}
-          <Field label={t('Password')} hint={t('Fill in either the password or the private key; leave both empty to use your own ssh config. Stored encrypted')}>
-            <div className="remote-key">
-              <input
-                className="settings-input"
-                type="password"
-                autoComplete="new-password"
-                value={draft.password || ''}
-                onChange={(e) => setDraft({ ...draft, password: e.target.value, clearPassword: false })}
-              />
-              {draft.hasPassword && !draft.password && !draft.clearPassword && (
-                <>
-                  <span className="settings-hint">{t('Saved')}</span>
-                  <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, password: '', clearPassword: true })}>{t('Clear')}</button>
-                </>
-              )}
-            </div>
-          </Field>
-          <Field label={t('Private key')} hint={t('Fill in either the private key or the password; leave both empty to use your own ssh config (~/.ssh/config, ssh-agent)')}>
-          <div className="remote-key">
-            <span className={`remote-key-path${draft.identityFile ? '' : ' empty'}`} title={draft.identityFile || ''}>
-              🔑 {draft.identityFile || t('No private key selected (use it or a password; with neither, your own ssh config is used)')}
-            </span>
-            <button className="remote-btn" disabled={locked} onClick={() => void pickKey()}>{t('Choose key…')}</button>
-            {draft.identityFile && (
-              <button className="remote-btn" disabled={locked} onClick={() => setDraft({ ...draft, identityFile: '' })}>{t('Clear')}</button>
-            )}
-          </div>
-          </Field>
-          <Field label={t('Working directory')} hint={t('A directory on that machine; ~ is the login user\'s home. KiroLex creates a scratch directory for each session here')}>
-            <input
-              className="settings-input"
-              value={draft.remoteWorkdir || ''}
-              onChange={(e) => setDraft({ ...draft, remoteWorkdir: e.target.value })}
-            />
-          </Field>
+          <ConnectionFields
+            draft={draft}
+            setDraft={setDraft}
+            locked={locked}
+            setVia={setVia}
+            pickKey={() => void pickKey()}
+            awsProfiles={awsProfiles}
+            advancedOpen={advancedOpen}
+            onToggleAdvanced={() => setAdvancedOpen((v) => !v)}
+          />
           {/*
             **机器级的动作排在工具之前** ——「测试连接那几个按钮应该在上面，连接能行才能测试工具」。
 
