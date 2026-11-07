@@ -753,27 +753,74 @@ export async function deleteOriginalVersion(bucket: BucketOps, o: OriginalVersio
  * 那样的存储上删原件没法保证不删掉别的设备刚传的新版本，云端清理就不移任何会话。
  */
 export async function probeConditionalDelete(bucket: BucketOps, prefix: string | undefined): Promise<boolean> {
-  return (await probeDeleteMode(bucket, prefix)) !== 'none';
+  const mode = await probeDeleteMode(bucket, prefix);
+  return mode === 'versioned' || mode === 'conditional';
 }
 
 /**
  * 删原件能走哪条路：'versioned' = 桶**现在开着**版本控制（新写进去的对象带真实 VersionId）→ 按版本删；
- * 'conditional' = 没开 / 暂停，但支持 If-Match 条件删除；'none' = 都不行（不移任何会话）。
+ * 'conditional' = 没开 / 暂停，但支持 If-Match 条件删除；'none' = 都不行（不移任何会话）；
+ * 'denied' = 开着版本控制，但按版本列 / 删探测对象失败（多半缺 s3:ListBucketVersions 等，不移任何会话）。
  */
-export async function probeDeleteMode(bucket: BucketOps, prefix: string | undefined): Promise<'versioned' | 'conditional' | 'none'> {
+export type DeleteMode = 'versioned' | 'conditional' | 'none' | 'denied';
+
+export async function probeDeleteMode(bucket: BucketOps, prefix: string | undefined): Promise<DeleteMode> {
+  return (await probeDeleteModeDetail(bucket, prefix)).mode;
+}
+
+/** 同 `probeDeleteMode`；'denied' 时带上失败的错误码和一句说明（给日志 / 同步状态用）。 */
+export async function probeDeleteModeDetail(bucket: BucketOps, prefix: string | undefined): Promise<{ mode: DeleteMode; code?: string; why?: string }> {
   const key = `${joinPrefix(prefix)}${LAYOUT}/.kirolex-conditional-delete-probe`;
   await bucket.put(key, Buffer.from(new Date().toISOString()), 'text/plain');
   /* 桶开了版本控制（写进去有真实 VersionId）→ 删原件走按 VersionId 删，不需要 If-Match；探测对象按版本删干净 */
   const got = await bucket.getWithEtag(key);
   if (realVersionId(got?.versionId)) {
-    try { for (const v of await bucket.listVersions(key)) await bucket.delVersion(key, v.versionId); } catch { /* 探测对象留着也无害 */ }
-    return 'versioned';
+    /*
+      按版本列 / 删探测对象失败**不能吞**：删原件走的是同样的 listVersions + delVersion，这里不行那边也不行 ——
+      移进回收站之后原件删不掉，会话一直卡在 moving。当成不能删，这一轮不移任何会话。
+    */
+    try { for (const v of await bucket.listVersions(key)) await bucket.delVersion(key, v.versionId); } catch (err) {
+      return { mode: 'denied', code: errorCode(err), why: describeDeleteFailure(err, key, VERSION_ACTIONS) };
+    }
+    return { mode: 'versioned' };
   }
   let r: 'ok' | 'conflict' | 'unsupported';
   try { r = await bucket.delIf(key, '"kirolex-not-this-version"'); } finally {
     try { await deleteAllVersions(bucket, key); } catch { /* 探测对象留着也无害，下次同 key 覆盖 */ }
   }
-  return r === 'conflict' ? 'conditional' : 'none';
+  return { mode: r === 'conflict' ? 'conditional' : 'none' };
+}
+
+/** 开了版本控制的桶上按版本删原件要的 IAM action —— 只有 ListBucket / GetObject / PutObject / DeleteObject 不够。 */
+export const VERSION_ACTIONS = ['s3:ListBucketVersions', 's3:GetObjectVersion', 's3:DeleteObjectVersion'];
+
+/** 错误码（S3Error.code，例如 AccessDenied）；没有就从消息里认 AccessDenied，再没有返回空串。 */
+export function errorCode(err: any): string {
+  if (typeof err?.code === 'string' && err.code) return err.code;
+  return /AccessDenied|Access Denied/i.test(String(err?.message || err || '')) ? 'AccessDenied' : '';
+}
+
+/** 一次删除失败说成一句：「AccessDenied v1/sessions/s1/x（缺 IAM 权限：…）：原始消息」。 */
+export function describeDeleteFailure(err: any, key: string, actions: string[]): string {
+  const code = errorCode(err);
+  const lack = code === 'AccessDenied' ? `（缺 IAM 权限：${actions.join(' / ')}）` : '';
+  return `${code || '出错'} ${key}${lack}：${err?.message || err}`;
+}
+
+/**
+ * 权限提示里的**最小策略片段**：只补按版本删要的那三个 action（同步本来就要的 ListBucket / GetObject / PutObject / DeleteObject 不重复列）。
+ * 分区按区域推（cn-* → aws-cn），对象限定在同步前缀下。
+ */
+export function cleanupVersionPolicy(bucket: string, region: string, prefix?: string): string {
+  const partition = /^cn-/.test(region || '') ? 'aws-cn' : /^us-gov-/.test(region || '') ? 'aws-us-gov' : 'aws';
+  const arn = `arn:${partition}:s3:::${bucket || '<bucket>'}`;
+  return JSON.stringify({
+    Version: '2012-10-17',
+    Statement: [
+      { Effect: 'Allow', Action: ['s3:ListBucketVersions'], Resource: arn },
+      { Effect: 'Allow', Action: ['s3:GetObjectVersion', 's3:DeleteObjectVersion'], Resource: `${arn}/${joinPrefix(prefix)}*` },
+    ],
+  }, null, 2);
 }
 
 /**
@@ -831,7 +878,7 @@ const copiedVersions = (m: TrashMeta | null | undefined): Map<string, OriginalVe
 export async function deleteOriginalsOfMove(
   bucket: BucketOps, prefix: string | undefined, dir: string, originals: OriginalVersion[], by: string, log: CleanupLog,
   versioningEnabled = false,
-): Promise<{ result: 'done' | 'changed' | 'locked'; failed: OriginalVersion[]; deleted: number }> {
+): Promise<{ result: 'done' | 'changed' | 'locked'; failed: OriginalVersion[]; deleted: number; reason?: string }> {
   /* 只有真实版本号才不需要锁；没记到的、和 "null"（开版本控制之前的那一版）都要锁 */
   const needLock = originals.some((o) => !realVersionId(o.versionId));
   if (needLock) {
@@ -857,18 +904,24 @@ export async function deleteOriginalsOfMove(
   const failed: OriginalVersion[] = [];
   let deleted = 0;
   let changed = false;
+  /* 第一个删不掉的原因（错误码 + key，权限不足时写上缺的 action）—— 调用方写进 warn，不然只看得到"删不掉" */
+  let reason: string | undefined;
   for (const o of originals) {
     try {
       const r = await deleteOriginalVersion(bucket, o, versioningEnabled);
       if (r === 'deleted') deleted += 1;
       else if (r === 'changed') { changed = true; break; }
-      else failed.push(o);                                  // 确认不了版本：不删，留着
-    } catch { failed.push(o); }
+      else { failed.push(o); reason ??= `${o.key}：确认不了版本（没记到 ETag，或存储不支持条件删除）`; }   // 确认不了版本：不删，留着
+    } catch (err) {
+      failed.push(o);
+      const byVersion = realVersionId(o.versionId) || (o.versionId === 'null' && versioningEnabled);
+      reason ??= describeDeleteFailure(err, o.key, byVersion ? VERSION_ACTIONS : ['s3:DeleteObject']);
+    }
   }
   if (changed && needLock) {
     try { await patchTrashMeta(bucket, prefix, dir, (m) => { const { deleting: _d, ...rest } = m; return rest; }); } catch { /* 锁过一阵算失效，撤回照样能拿到 */ }
   }
-  return { result: changed ? 'changed' : 'done', failed, deleted };
+  return { result: changed ? 'changed' : 'done', failed, deleted, ...(reason && failed.length ? { reason } : null) };
 }
 
 /**
@@ -1024,6 +1077,8 @@ export async function retryPendingOriginals(
   };
   let deleted = 0;
   let left = 0;
+  /* 删不掉的原件按原因归在一起，最后一种原因一条 warn */
+  const undeletable = new Map<string, { ids: string[]; n: number; reason: string }>();
   for (const item of items) {
     if (!item.meta) continue;
     /* 上次没撤回完的：接着撤回（只补原位置缺的，不盖新的 —— 不管能不能按版本删都安全） */
@@ -1045,7 +1100,13 @@ export async function retryPendingOriginals(
     /* 拿不到锁：一个都没删，记录原样留着，下轮再试 */
     if (d.result === 'locked') { left += item.pendingOriginals.length; continue; }
     const rest = d.failed;
-    if (rest.length) opts.log('warn', `云端清理：${item.id} 还有 ${rest.length} 个原件删不掉，下次再试`);
+    if (rest.length) {
+      /* 同样的原因（例如每条都是同一个 AccessDenied）合并成一条 warn，key 换成占位再比 */
+      const reason = d.reason || '原因不明';
+      const kind = reason.replace(rest[0].key, '<key>');
+      const g = undeletable.get(kind);
+      if (g) { g.ids.push(item.id); g.n += rest.length; } else undeletable.set(kind, { ids: [item.id], n: rest.length, reason });
+    }
     left += rest.length;
     /* 还有删不掉的：留着 moving 和待删记录；全删完：去掉 moving，这次移动做完了。deleting 锁一起去掉 */
     try {
@@ -1060,6 +1121,9 @@ export async function retryPendingOriginals(
       opts.log('warn', `云端清理：${item.id} 的说明文件改不了，下次再试（这一份照样受保护）：${err?.message || err}`);
     }
   }
+  for (const g of undeletable.values()) {
+    opts.log('warn', `云端清理：${g.ids.join('、')} 还有 ${g.n} 个原件删不掉，下次再试 —— 第一个失败：${g.reason}${g.ids.length > 1 ? '（其余同样原因）' : ''}`);
+  }
   return { deleted, left, undoFailed };
 }
 
@@ -1069,6 +1133,11 @@ export interface CleanupResult {
   blocked: string | null;
   undecided: Array<{ id: string; why: string }>;
   errors: string[];
+  /**
+   * 探测出"开着版本控制、但这份凭证按版本删不了"：给同步状态的提示（缺哪些 action、第一个失败的原因）。
+   * `key` 只由错误码和 action 组成 —— 调用方下一轮把它当 `lastNotice` 传回来，一样就不再重复 warn。
+   */
+  notice?: { key: string; code: string; actions: string[]; why: string };
 }
 
 /**
@@ -1087,6 +1156,8 @@ export async function runCloudCleanup(bucket: BucketOps, opts: {
   deviceId?: string;
   spare?: (ids: string[]) => Promise<Set<string>>;
   log: CleanupLog;
+  /** 上一轮的 `notice.key`：这一轮还是同样的权限问题 → 不再 warn 一遍（状态里的提示照样给）。 */
+  lastNotice?: string;
 }): Promise<CleanupResult> {
   const res: CleanupResult = { trashed: [], purged: [], blocked: null, undecided: [], errors: [] };
   if (!opts.settings.enabled) return res;
@@ -1132,16 +1203,27 @@ export async function runCloudCleanup(bucket: BucketOps, opts: {
     let bucketVersioned = false;
     const ensureCanDelete = async (): Promise<boolean> => {
       if (canDelete === null) {
-        try { const mode = await probeDeleteMode(bucket, prefix); canDelete = mode !== 'none'; bucketVersioned = mode === 'versioned'; } catch (err: any) {
+        let denied: { code?: string; why?: string } | null = null;
+        try {
+          const p = await probeDeleteModeDetail(bucket, prefix);
+          canDelete = p.mode === 'versioned' || p.mode === 'conditional'; bucketVersioned = p.mode === 'versioned';
+          if (p.mode === 'denied') denied = p;
+        } catch (err: any) {
           canDelete = false;
           log('warn', `云端清理：探测存储能不能按版本删除时出错，当作不能：${err?.message || err}`);
         }
-        if (!canDelete) res.blocked = '云存储不支持按版本删除（DELETE 带 If-Match），删原件时没法保证不删掉别的设备刚传的新版本';
+        if (denied) {
+          const code = denied.code || '出错';
+          res.notice = { key: `${code}:${VERSION_ACTIONS.join(',')}`, code, actions: [...VERSION_ACTIONS], why: denied.why || '' };
+          res.blocked = `桶开着版本控制，但这份凭证按版本列 / 删不了（${denied.why}）—— 删原件要 ${VERSION_ACTIONS.join(' / ')}`;
+          /* 同样的权限问题上一轮已经说过了：不再 warn（状态里的提示照样有） */
+          if (opts.lastNotice !== res.notice.key) log('warn', `云端清理：${res.blocked}，补上权限之前不移任何会话`);
+        } else if (!canDelete) res.blocked = '云存储不支持按版本删除（DELETE 带 If-Match），删原件时没法保证不删掉别的设备刚传的新版本';
       }
       return canDelete;
     };
     if (cands.length && !await ensureCanDelete()) {
-      log('info', `云端清理：${res.blocked}，这一轮不移任何会话（${cands.length} 条候选都留着）`);
+      if (!res.notice) log('info', `云端清理：${res.blocked}，这一轮不移任何会话（${cands.length} 条候选都留着）`);
       cands = [];
     }
     const copied: Array<{ c: CleanupCandidate } & NonNullable<Awaited<ReturnType<typeof copySessionToCloudTrash>>>> = [];
@@ -1212,7 +1294,7 @@ export async function runCloudCleanup(bucket: BucketOps, opts: {
         }
         res.trashed.push({ id: x.c.entry.id, title: x.c.entry.title || x.c.entry.id, dir: x.dir, reason: x.c.reason });
         log('info', `云端清理：${x.c.entry.id}（${x.c.entry.title || 'New Chat'}）移进云端回收站 trash/${x.dir}/，原因：${x.c.reason}`
-          + `${failed.length ? `（${failed.length} 个原件没删掉，记进回收站的说明文件，之后每轮同步重试）` : ''}`);
+          + `${failed.length ? `（${failed.length} 个原件没删掉，记进回收站的说明文件，之后每轮同步重试；第一个失败：${d.reason || '原因不明'}）` : ''}`);
         /*
           删完了 → 去掉 moving；还有删不掉的 → 待删记录换成删不掉的那几个（moving 留着）。
           这一步写不进去：说明文件还是复制时那份（moving + 全部原件待删），照样受保护，下一轮按版本接着删（已删的算删掉了）。

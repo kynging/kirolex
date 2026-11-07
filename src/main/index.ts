@@ -54,7 +54,7 @@ import {
 import {
   cleanupSettings, buildDeviceManifest, withDeviceManifest, describeDevices, runCloudCleanup, listCloudTrash,
   restoreFromCloudTrash, purgeCloudTrashItem, noteDeletion, forgetDeletion, readDeletionMarks, writeDeletionMarks,
-  pruneDeletionMarks, deletionsFromTrashNames, loadOrCreateDeviceId,
+  pruneDeletionMarks, deletionsFromTrashNames, loadOrCreateDeviceId, cleanupVersionPolicy,
   type BucketOps, type CleanupResult,
 } from './cloudTrash.ts';
 import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
@@ -6283,7 +6283,11 @@ let syncTimer: NodeJS.Timeout | null = null;
  */
 let syncFailures = 0;
 let syncNextAllowedAt = 0;
-let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number; offloaded?: number; offloadedBytes?: number; offloadDays?: number } | null = null;
+let lastSyncSummary: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number; offloaded?: number; offloadedBytes?: number; offloadDays?: number; cloudCleanupNotice?: CloudCleanupNotice } | null = null;
+/** 云端清理探测出权限不足（开着版本控制、凭证按版本删不了）：同步状态里给的提示 + 最小策略片段。 */
+type CloudCleanupNotice = { code: string; actions: string[]; why: string; policy: string };
+/** 上一轮云端清理权限提示的 key —— 每轮都是同样的 AccessDenied 时不再刷一遍日志（runCloudCleanup 的 lastNotice）。 */
+let lastCloudCleanupNoticeKey = '';
 
 /**
  * 跑一轮同步。
@@ -7217,8 +7221,11 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
           prefix: cfg.prefix, now: Date.now(), settings: clean, thisMachine, deviceId: thisDeviceId(),
           spare: (cand) => cloudCleanupSpare(creds!, cfg.prefix, cand),
           log: (level, msg) => logger[level]('s3', msg),
+          lastNotice: lastCloudCleanupNoticeKey,
         });
-        if (cleanup.blocked) logger.info('s3', `云端清理这一轮不移任何会话：${cleanup.blocked}`);
+        /* 同样的权限问题上一轮已经说过（runCloudCleanup 也没再 warn）：这一句也不重复 */
+        if (cleanup.blocked && !(cleanup.notice && cleanup.notice.key === lastCloudCleanupNoticeKey)) logger.info('s3', `云端清理这一轮不移任何会话：${cleanup.blocked}`);
+        lastCloudCleanupNoticeKey = cleanup.notice?.key || '';
       } catch (err: any) {
         logger.warn('s3', `云端清理没跑成（不影响备份）：${err?.message || err}`);
       }
@@ -7236,6 +7243,10 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
       ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
       ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
+      ...(cleanup?.notice ? { cloudCleanupNotice: {
+        code: cleanup.notice.code, actions: cleanup.notice.actions, why: cleanup.notice.why,
+        policy: cleanupVersionPolicy(cfg.bucket || '', cfg.region || '', cfg.prefix),
+      } } : null),
       ...(offloaded?.moved.length ? { offloaded: offloaded.moved.length, offloadedBytes: offloaded.bytes, offloadDays: offloaded.days } : null),
     };
     logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`

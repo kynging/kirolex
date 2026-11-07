@@ -13,7 +13,7 @@ import {
   lastUploadOf, UPLOAD_MARGIN_MS,
   sessionsInUse, rebuiltHold,
   updateTrashMeta, RESTORE_LOCK_STALE_MS,
-  deleteAllVersions,
+  deleteAllVersions, probeDeleteMode, deleteOriginalsOfMove, retryPendingOriginals, cleanupVersionPolicy,
 } from '../src/main/cloudTrash.ts';
 import { mergeCatalog, catalogKey, type Catalog, type CatalogEntry } from '../src/main/s3Sync.ts';
 import { writeSyncCatalog, updateCatalog as updateCatalogStore, catalogIO, type CatalogBucket } from '../src/main/catalogStore.ts';
@@ -2213,5 +2213,91 @@ describe('暂停版本控制的桶：新上传覆盖 null 版本，版本号还�
     assert.equal(b.data.get('v1/sessions/s1/transcript.jsonl')!.toString(), '另一台设备后来传的新内容');
     assert.ok(b.data.has('v1/sessions/s1/record.json'));
     assert.deepEqual(keysUnder(b, `v1/trash/${dir}/`), [], '撤回做完');
+  });
+});
+
+describe('开了版本控制，但凭证没有按版本删的权限（AccessDenied）', () => {
+  const denied = (what: string) => Object.assign(new Error(`${what} failed (403 AccessDenied)`), { status: 403, code: 'AccessDenied' });
+  const setup = async () => {
+    const b = fakeBucket(); b.versioning = true;
+    const A = machine('A');
+    A.create('s1', T0); await A.sync(b, T0);
+    A.remove('s1', T0 + H);
+    return { b, A };
+  };
+
+  test('探测：listVersions 被拒 → 判为权限不足（不当成能按版本删）', async () => {
+    const { b } = await setup();
+    b.listVersions = async () => { throw denied('列版本'); };
+    assert.equal(await probeDeleteMode(b, ''), 'denied');
+    assert.equal(await probeConditionalDelete(b, ''), false);
+  });
+
+  test('探测：delVersion 被拒 → 同样判为权限不足', async () => {
+    const { b } = await setup();
+    b.delVersion = async () => { throw denied('删版本'); };
+    assert.equal(await probeDeleteMode(b, ''), 'denied');
+  });
+
+  test('权限不足：这一轮一条都不移、不新增待删原件；状态里给出缺的 action；同样的情况下一轮不再重复 warn', async () => {
+    const { b, A } = await setup();
+    b.listVersions = async () => { throw denied('列版本'); };
+    const logs: string[] = [];
+    const r = await A.sync(b, T0 + 2 * H, logs);
+    assert.deepEqual(r.trashed, []);
+    assert.equal(keysUnder(b, 'v1/sessions/s1/').length, 2, '原件都在');
+    assert.deepEqual(keysUnder(b, 'v1/trash/'), [], '没复制、没有待删原件');
+    assert.ok(readCat(b).entries.some((e) => e.id === 's1'), 'catalog 没动');
+    assert.match(String(r.blocked), /AccessDenied/);
+    assert.ok(r.notice, '给出提示');
+    assert.equal(r.notice!.code, 'AccessDenied');
+    assert.deepEqual(r.notice!.actions, ['s3:ListBucketVersions', 's3:GetObjectVersion', 's3:DeleteObjectVersion']);
+    assert.ok(logs.some((l) => /AccessDenied/.test(l) && l.includes('s3:ListBucketVersions')), '日志里说清缺哪个 action');
+
+    const again: string[] = [];
+    const r2 = await runCloudCleanup(b, { now: T0 + 3 * H, settings: cleanupSettings({}), thisMachine: 'A', log: (_l, m) => again.push(m), lastNotice: r.notice!.key });
+    assert.equal(r2.notice?.key, r.notice!.key, '同一个提示');
+    assert.equal(again.filter((l) => l.includes('s3:ListBucketVersions')).length, 0, '同样的 AccessDenied 不再刷一遍');
+    assert.deepEqual(keysUnder(b, 'v1/trash/'), []);
+  });
+
+  test('最小策略片段：只加这三个 action，资源按分区 / 桶 / 前缀', () => {
+    const p = JSON.parse(cleanupVersionPolicy('kyn-files', 'cn-northwest-1', 'kirolex'));
+    assert.deepEqual(p.Statement.flatMap((s: any) => s.Action).sort(), ['s3:DeleteObjectVersion', 's3:GetObjectVersion', 's3:ListBucketVersions']);
+    assert.ok(JSON.stringify(p).includes('arn:aws-cn:s3:::kyn-files'));
+    assert.ok(JSON.stringify(p).includes('arn:aws-cn:s3:::kyn-files/kirolex/*'));
+    assert.ok(JSON.stringify(JSON.parse(cleanupVersionPolicy('b', 'us-east-1', ''))).includes('arn:aws:s3:::b/*'));
+  });
+
+  test('删原件 listVersions 被拒：返回第一个失败的错误码 + key，重试的 warn 里写清缺的 action（多条会话合并成一条）', async () => {
+    const b = fakeBucket(); b.versioning = true;
+    const A = machine('A');
+    A.create('s1', T0); A.create('s2', T0); await A.sync(b, T0);
+    A.remove('s1', T0 + H); A.remove('s2', T0 + H);
+    b.failDelOn = (k) => k.endsWith('/transcript.jsonl');
+    const t = await A.sync(b, T0 + 2 * H);
+    b.failDelOn = undefined;
+    assert.equal(t.trashed.length, 2);
+    const listVersions = b.listVersions.bind(b);
+    b.listVersions = async (k) => { if (k.startsWith('v1/sessions/')) throw denied('列版本'); return listVersions(k); };
+
+    const item = (await listCloudTrash(b, '', T0 + 3 * H, 30)).find((i) => i.id === 's1')!;
+    const d = await deleteOriginalsOfMove(b, '', item.dir, item.pendingOriginals, 'A#x', () => {}, true);
+    assert.equal(d.failed.length, 1);
+    assert.match(String(d.reason), /AccessDenied/);
+    assert.ok(String(d.reason).includes('v1/sessions/s1/transcript.jsonl'), '带 key');
+    assert.ok(String(d.reason).includes('s3:ListBucketVersions') && String(d.reason).includes('s3:DeleteObjectVersion'), '带缺的 action');
+
+    const logs: Array<[string, string]> = [];
+    const items = await listCloudTrash(b, '', T0 + 3 * H, 30);
+    const r = await retryPendingOriginals(b, '', readCat(b), items,
+      { now: T0 + 3 * H, activeDays: 90, log: (l, m) => logs.push([l, m]), canDelete: true, by: 'A#y', versioned: true });
+    assert.equal(r.left, 2);
+    const warns = logs.filter(([l, m]) => l === 'warn' && m.includes('删不掉'));
+    assert.equal(warns.length, 1, '同样的原因合并成一条');
+    assert.match(warns[0][1], /AccessDenied/);
+    assert.ok(warns[0][1].includes('s3:ListBucketVersions'));
+    assert.ok(warns[0][1].includes('s1') && warns[0][1].includes('s2'));
+    for (const i of await listCloudTrash(b, '', T0 + 3 * H, 30)) assert.ok(i.moving && i.pendingOriginals.length === 1, '待删记录原样留着');
   });
 });

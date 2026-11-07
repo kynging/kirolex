@@ -35,6 +35,7 @@ import { intervalChoices, intervalLabel, dayChoices, ACTIVE_DEVICE_DAY_CHOICES, 
 import { ToggleButton } from './ToggleButton.tsx';
 import { cleanupSentence } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
+import { PolicyBox } from './BedrockIam.tsx';
 
 interface Cfg {
   enabled: boolean;
@@ -51,7 +52,9 @@ interface Cfg {
   /** 最近一次取凭证 SSO 过期了（`profile` 缺 = 默认凭证链）→ 给「打开终端登录」。 */
   ssoLogin?: { profile?: string } | null;
   encryptionAvailable: boolean;
-  last?: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number } | null;
+  last?: { at: number; uploaded: number; skipped: number; bytes: number; error?: string; cloudTrashed?: number; cloudPurged?: number;
+    /* 云端清理探测出开着版本控制、凭证按版本删不了：不移任何会话，这里说缺哪些 action、给最小策略 */
+    cloudCleanupNotice?: { code: string; actions: string[]; why: string; policy: string } } | null;
   /** 云端自动清理（主进程 cloudTrash.ts）：开关、活跃设备天数、回收站保留天数。 */
   autoCleanCloud: boolean;
   activeDeviceDays: number;
@@ -429,6 +432,14 @@ export const BackupSettings: React.FC = () => {
       )}
       {cfg.last?.error && (
         <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{cfg.last.error}</div>
+      )}
+      {cfg.last?.cloudCleanupNotice && (
+        <div className="settings-warn backup-note">
+          <div>{t('Cloud cleanup is paused: the bucket has versioning on, but these credentials cannot delete by version ({code}). No sessions are moved to the cloud trash until the role also allows: {actions}', { code: cfg.last.cloudCleanupNotice.code, actions: cfg.last.cloudCleanupNotice.actions.join(' / ') })}</div>
+          <div className="settings-hint" style={{ whiteSpace: 'normal', overflowWrap: 'anywhere' }}>{cfg.last.cloudCleanupNotice.why}</div>
+          <div className="settings-hint">{t('Add this statement to the IAM policy used for S3 sync:')}</div>
+          <PolicyBox policy={cfg.last.cloudCleanupNotice.policy} />
+        </div>
       )}
       {msg && (
         <div className={`backup-note ${msg.kind === 'bad' ? 'settings-warn' : 'backup-ok'}`}

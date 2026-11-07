@@ -484,6 +484,8 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   "This file was updated by S3 sync from another computer; the editor now shows the new version.": "S3 同步从别的电脑拉回了这份配置的新版本，编辑框里已经换成新内容。",
   "This file was updated by S3 sync from another computer while you had unsaved changes. Saving is blocked so the new version is not overwritten; click Discard changes to load it.": "你还有没保存的改动时，S3 同步从别的电脑拉回了这份配置的新版本。为了不把新版本盖掉，现在不能保存；点「放弃修改」载入新版本。",
   "Copy policy": "复制策略",
+  "Cloud cleanup is paused: the bucket has versioning on, but these credentials cannot delete by version ({code}). No sessions are moved to the cloud trash until the role also allows: {actions}": "云端清理暂停：桶开着版本控制，但这份凭证按版本删不了（{code}）。补上下面这些权限之前，不会把任何会话移进云端回收站：{actions}",
+  "Add this statement to the IAM policy used for S3 sync:": "把这一段加进 S3 同步用的 IAM 策略：",
   "Codex web search is back on for that machine. Running sessions pick it up after they reconnect.": "那台机器的 Codex 网页搜索已重新打开。正在跑的会话重连后生效。",
   "Codex web search is off on that machine. Running sessions pick it up after they reconnect.": "那台机器的 Codex 网页搜索已关掉。正在跑的会话重连后生效。",
   "Sets web_search = \"disabled\" at the top of ~/.codex/config.toml on that machine (the original is backed up as .kirolex-bak)": "在那台机器 ~/.codex/config.toml 顶层写 web_search = \"disabled\"（原文件备份成 .kirolex-bak）",
