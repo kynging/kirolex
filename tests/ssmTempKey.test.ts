@@ -16,7 +16,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   setSsmKeyRoot, ensureSsmKey, ssmKeyDir, transportArgs, identityArgs, usesSsmTempKey, ssmKeyPushFailure,
-  generateEd25519, SSM_KEY_TTL_MS,
+  generateEd25519, SSM_KEY_TTL_MS, setProxyFlavorOverride,
 } from '../src/main/sshProxy.ts';
 import { buildSshArgs } from '../src/main/acp-client.ts';
 import { masterArgs, SshMux } from '../src/main/sshMux.ts';
@@ -27,6 +27,8 @@ import { setUiLang } from '../src/main/uiText.ts';
 setUiLang('en');
 const ROOT = fs.mkdtempSync(path.join(os.tmpdir(), 'ssm-keys-'));
 setSsmKeyRoot(ROOT);
+/* 这一份测的是 POSIX（sh 跑 ProxyCommand）那一支；Win32-OpenSSH 那一支在 sshSsmWin32.test.ts */
+setProxyFlavorOverride('posix');
 
 const ID = 'i-0123456789abcdef0';
 const SSM = {

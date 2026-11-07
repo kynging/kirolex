@@ -7,7 +7,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ssmProxyCommand, transportArgs, findLocalTool, ssmFieldError, setSsmKeyRoot } from '../src/main/sshProxy.ts';
+import { ssmProxyCommand, transportArgs, findLocalTool, ssmFieldError, setSsmKeyRoot, setProxyFlavorOverride } from '../src/main/sshProxy.ts';
 import { buildSshArgs } from '../src/main/acp-client.ts';
 import { masterArgs } from '../src/main/sshMux.ts';
 import { validateTarget, saveRemoteTarget, parseRemoteTargets } from '../src/main/remoteTargets.ts';
@@ -17,6 +17,8 @@ import { setUiLang } from '../src/main/uiText.ts';
 setUiLang('en');
 /* SSM 默认推临时公钥，会生成密钥 —— 放进临时目录，不碰真的 ~/.kirolex */
 setSsmKeyRoot(fs.mkdtempSync(path.join(os.tmpdir(), 'ssm-keys-')));
+/* 这一份测的是 POSIX（sh 跑 ProxyCommand）那一支；Win32-OpenSSH 那一支在 sshSsmWin32.test.ts */
+setProxyFlavorOverride('posix');
 
 const SSM = {
   sshHost: 'ec2-user@i-0123456789abcdef0',

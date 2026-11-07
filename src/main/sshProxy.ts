@@ -17,6 +17,7 @@
  * 跳板可以带端口：`ec2-user@1.2.3.4:2222`。
  */
 
+import { execFile } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -157,7 +158,8 @@ export function findLocalTool(
   const extra = win
     ? [`${env.ProgramFiles || 'C:\\Program Files'}\\Amazon\\AWSCLIV2`, `${env.ProgramFiles || 'C:\\Program Files'}\\Amazon\\SessionManagerPlugin\\bin`]
     : ['/usr/local/bin', '/opt/homebrew/bin'];
-  const names = win ? [`${name}.exe`, name] : [name];
+  /* `.cmd`：pip / 某些包管理器装的 aws 是 `aws.cmd`；Win32 分支经 cmd.exe 跑，它照样能起（见 `winProxyCommand`） */
+  const names = win ? [`${name}.exe`, `${name}.cmd`, name] : [name];
   for (const d of [...dirs, ...extra]) {
     for (const n of names) {
       const p = win ? `${d.replace(/[\\/]+$/, '')}\\${n}` : `${d.replace(/\/+$/, '')}/${n}`;
@@ -177,6 +179,124 @@ function dirOf(p: string): string {
   return i > 0 ? p.slice(0, i) : p;
 }
 
+/* --------------------------------------------- 谁来跑 ProxyCommand：sh 还是 CreateProcessW */
+
+/**
+ * **ProxyCommand 的语法跟着实际选中的 ssh 走**，不是只看 `process.platform`：
+ *
+ *   · `posix`：OpenSSH / MSYS（Git 自带的 `usr\bin\ssh.exe`）/ Cygwin —— 经 `$SHELL -c "exec <ProxyCommand>"` 跑，
+ *     单引号、`&&`、`exec`、`>/dev/null` 都认。
+ *   · `win32`：Windows 自带的 Win32-OpenSSH（`C:\Windows\System32\OpenSSH\ssh.exe`）—— **不经 shell**，
+ *     直接 `CreateProcessW` 执行 ProxyCommand 那一整行。POSIX 写法的第一个 token（`9>/dev/null;`）找不到，
+ *     报 `CreateProcessW failed error:2`（KYN-DESKTOP 实测）。所以这里要套一层 `cmd.exe /d /s /c "…"`。
+ *
+ * 判法：照 libuv `spawn('ssh')` 的找法，按 PATH 顺序找第一个 `ssh.exe`；同目录有 `sh.exe` / `bash.exe`
+ * 的是 MSYS / Cygwin（它们的 ssh 用 sh 跑 ProxyCommand）→ `posix`，否则（包括一个都没找到）→ `win32`。
+ */
+export type ProxyFlavor = 'posix' | 'win32';
+
+let flavorOverride: ProxyFlavor | undefined;
+/** 测试用：固定成某一种（不传 = 恢复按 PATH 判断）。 */
+export function setProxyFlavorOverride(f?: ProxyFlavor): void {
+  flavorOverride = f;
+}
+
+export function sshFlavor(
+  env: NodeJS.ProcessEnv = process.env,
+  exists: (p: string) => boolean = defaultExists,
+  platform: NodeJS.Platform = process.platform,
+): ProxyFlavor {
+  if (flavorOverride) return flavorOverride;
+  if (platform !== 'win32') return 'posix';
+  const dirs = String(env.PATH || env.Path || '').split(';').filter(Boolean);
+  for (const d of dirs) {
+    const dir = d.replace(/[\\/]+$/, '');
+    if (!exists(`${dir}\\ssh.exe`)) continue;
+    return exists(`${dir}\\sh.exe`) || exists(`${dir}\\bash.exe`) ? 'posix' : 'win32';
+  }
+  return 'win32';
+}
+
+/** `%SystemRoot%\System32\cmd.exe` 的绝对路径（ProxyCommand 不经 shell，`cmd` 这个名字未必找得到）。 */
+export function winCmdPath(env: NodeJS.ProcessEnv = process.env): string {
+  const root = String(env.SystemRoot || env.SYSTEMROOT || env.windir || 'C:\\Windows').replace(/[\\/]+$/, '');
+  return `${root}\\System32\\cmd.exe`;
+}
+
+/** cmd 里的一个参数：有空格 / 特殊字符就包双引号（Windows 路径里不会有 `"`）。 */
+function winq(s: string): string {
+  return /^[A-Za-z0-9_.:\\/+=@-]+$/.test(s) ? s : `"${s}"`;
+}
+
+/**
+ * cmd 里起一个程序：路径一律双引号。`.cmd` / `.bat` 前面加 `call` —— 不加的话批处理 `exit /b 1`
+ * 的退出码 `&&` 看不见（本机实测：推送失败了照样往下 start-session）。
+ */
+function winRun(exe: string): string {
+  return /\.(cmd|bat)$/i.test(exe) ? `call "${exe}"` : `"${exe}"`;
+}
+
+/**
+ * **本机直接跑一个工具（aws 预检）时怎么起它**。`findLocalTool` 在 Windows 上可能给出 `aws.cmd`，
+ * 而 Node 的 `execFile` 不能直接起 `.cmd` / `.bat`（报 EINVAL）—— 于是「测试连接」的预检还没走到 ssh 就失败了。
+ * 这种时候改成 `cmd.exe /d /s /c "call "<aws.cmd>" <参数>"`，`windowsVerbatimArguments` 让 Node 原样交出这一行：
+ *   · `call`：不加的话批处理的 `exit /b N` 退出码丢掉（见 `winRun`），cmd 的退出码就是 call 回来的 errorlevel；
+ *   · 参数里只要有字母数字和 `_ . : \ / + @ -` 以外的字符（空格、`=`、`,` 在 cmd 里都是分隔符）就包双引号；
+ *     `"` 和 `%` 在 cmd 命令行里没有可靠的转义，带这两种字符的参数直接拒绝（我们拼的参数都过了白名单，不会有）。
+ * `.exe` 和非 Windows 照旧直接起，一个字节不变。
+ */
+export function localToolSpawn(
+  file: string,
+  args: string[],
+  platform: NodeJS.Platform = process.platform,
+  env: NodeJS.ProcessEnv = process.env,
+): { file: string; args: string[]; windowsVerbatimArguments?: true } {
+  if (platform !== 'win32' || !/\.(cmd|bat)$/i.test(file)) return { file, args };
+  const q = (a: string): string => {
+    if (/["%]/.test(a)) throw new Error(tr('Cannot pass {arg} to {file} through cmd.exe (it contains " or %).', { arg: a.slice(0, 60), file }));
+    return /^[A-Za-z0-9_.:\\/+@-]+$/.test(a) ? a : `"${a}"`;
+  };
+  if (/["%]/.test(file)) throw new Error(tr('Cannot pass {arg} to {file} through cmd.exe (it contains " or %).', { arg: file, file }));
+  return {
+    file: winCmdPath(env),
+    args: ['/d', '/s', '/c', `"call "${file}" ${args.map(q).join(' ')}"`],
+    windowsVerbatimArguments: true,
+  };
+}
+
+/** 跑一条本机命令（aws 预检用，`ssmPreflight` 的 `run`）：失败也 resolve，把退出码和输出交回去。 */
+export function runLocalTool(file: string, args: string[], timeoutMs = 20_000): Promise<{ code: number | null; stdout: string; stderr: string }> {
+  return new Promise((resolve) => {
+    let spec: ReturnType<typeof localToolSpawn>;
+    try { spec = localToolSpawn(file, args); } catch (err: any) {
+      resolve({ code: 1, stdout: '', stderr: String(err?.message || err) });
+      return;
+    }
+    execFile(spec.file, spec.args, { timeout: timeoutMs, encoding: 'utf8', windowsVerbatimArguments: spec.windowsVerbatimArguments }, (err: any, stdout, stderr) => resolve({
+      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
+      stdout: String(stdout || ''),
+      stderr: String(stderr || (err && typeof err.code !== 'number' ? err.message : '') || ''),
+    }));
+  });
+}
+
+/**
+ * 把几段 cmd 命令（`&&` 串起来）包成 Win32-OpenSSH 能直接 `CreateProcessW` 的 ProxyCommand：
+ * `C:\Windows\System32\cmd.exe /d /s /c "<seg1> && <seg2>"`。
+ *
+ *   · `/s`：cmd 只去掉**最外层**那对引号、里面原样执行 —— 不用 `/s` 时 cmd 会按"恰好两个引号、没有特殊字符…"
+ *     那套启发式决定剥不剥，里面带 `"<aws.exe>"` 时结果难猜。`/d`：不跑 AutoRun（注册表里用户的 cmd 初始化脚本）。
+ *   · `pluginDir`：session-manager-plugin 不在 PATH 上时前面加 `set "PATH=<dir>;%PATH%"`（这是 cmd 的写法，不是 `env`）。
+ *   · **`%` 全部写成 `%%`**：Win32-OpenSSH 和别的 OpenSSH 一样会展开 ProxyCommand 里的 `%h` / `%p` / `%%`，
+ *     路径里的 `%`（以及 `%PATH%`）不转义会被当成占位符。转义后 ssh 交给 cmd 的是单个 `%`，
+ *     `%PATH%` 再由 cmd 展开；路径里字面的 `%name%` 恰好是个已定义变量时 cmd 也会展开它 —— cmd 命令行里没有转义 `%` 的办法，这种路径不支持。
+ */
+export function winProxyCommand(segments: string[], opts: { pluginDir?: string; env?: NodeJS.ProcessEnv } = {}): string {
+  const segs = opts.pluginDir ? [`set "PATH=${opts.pluginDir};%PATH%"`, ...segments] : segments;
+  const line = `${winq(winCmdPath(opts.env))} /d /s /c "${segs.join(' && ')}"`;
+  return line.replace(/%/g, '%%');
+}
+
 /**
  * `ProxyCommand` 的值：`aws ssm start-session --target <id> --document-name AWS-StartSSHSession
  * --parameters portNumber=<port> --region <r> [--profile <p>]`。
@@ -189,31 +309,44 @@ function dirOf(p: string): string {
  */
 export function ssmProxyCommand(
   remote: SsmFields,
-  opts: { aws?: string; pluginDir?: string } = {},
+  opts: { aws?: string; pluginDir?: string; flavor?: ProxyFlavor; env?: NodeJS.ProcessEnv } = {},
 ): string {
+  const aws = opts.aws || findLocalTool('aws') || 'aws';
+  const args = startSessionArgs(remote);
+  /* Win32-OpenSSH：不经 shell，套 cmd.exe（见 `winProxyCommand`）；aws 路径一律双引号 */
+  if (opts.flavor === 'win32') return winProxyCommand([`${winRun(aws)} ${args.join(' ')}`], { pluginDir: opts.pluginDir, env: opts.env });
+  const cmd = [shq(aws), ...args].join(' ');
+  return opts.pluginDir ? `env PATH=${shq(opts.pluginDir)}:"$PATH" ${cmd}` : cmd;
+}
+
+/** `ssm start-session …` 的参数（不含 `aws`）。三个 SSM 值过了白名单才拼，不对就抛。 */
+function startSessionArgs(remote: SsmFields): string[] {
   const why = ssmFieldError(remote);
   if (why) throw new Error(why);
-  const aws = opts.aws || findLocalTool('aws') || 'aws';
   const port = remote.sshPort && remote.sshPort > 0 ? remote.sshPort : 22;
   const parts = [
-    shq(aws), 'ssm', 'start-session',
+    'ssm', 'start-session',
     '--target', String(remote.ssmInstanceId),
     '--document-name', 'AWS-StartSSHSession',
     '--parameters', `portNumber=${port}`,
     '--region', String(remote.ssmRegion),
   ];
   if (remote.ssmProfile) parts.push('--profile', String(remote.ssmProfile));
-  const cmd = parts.join(' ');
-  return opts.pluginDir ? `env PATH=${shq(opts.pluginDir)}:"$PATH" ${cmd}` : cmd;
+  return parts;
 }
 
-/** 本机 session-manager-plugin 的目录 —— 只在它不在当前 PATH 上时返回（见 `ssmProxyCommand`）。 */
-export function pluginDirIfOffPath(env: NodeJS.ProcessEnv = process.env): string | undefined {
-  if (process.platform === 'win32') return undefined;
-  const plugin = findLocalTool('session-manager-plugin', env);
+/**
+ * 本机 session-manager-plugin 的目录 —— 只在它不在当前 PATH 上时返回（见 `ssmProxyCommand`）。
+ * `win32`（Win32-OpenSSH）按 `;` 分、不分大小写比；Windows 上的 MSYS ssh 照旧不补（它的 PATH 是另一套写法）。
+ */
+export function pluginDirIfOffPath(env: NodeJS.ProcessEnv = process.env, flavor: ProxyFlavor = sshFlavor(env)): string | undefined {
+  if (process.platform === 'win32' && flavor !== 'win32') return undefined;
+  const win = flavor === 'win32';
+  const plugin = findLocalTool('session-manager-plugin', env, defaultExists, win ? 'win32' : process.platform);
   if (!plugin) return undefined;
   const dir = dirOf(plugin);
-  const onPath = String(env.PATH || '').split(':').some((d) => d.replace(/\/+$/, '') === dir);
+  const norm = (d: string): string => (win ? d.replace(/[\\/]+$/, '').toLowerCase() : d.replace(/\/+$/, ''));
+  const onPath = String(env.PATH || env.Path || '').split(win ? ';' : ':').some((d) => norm(d) === norm(dir));
   return onPath ? undefined : dir;
 }
 
@@ -438,12 +571,31 @@ export function ssmKeyPushFailure(stderr: string, remote: SsmFields & Pick<Remot
  * 不替换 shell、只把重定向留在当前 shell 上，于是后面的 `;` / `&&` 照常执行 ——
  * 所以值以 `9>/dev/null;` 开头（fd 9 没人用）。推送的输出（一段 JSON）丢进 /dev/null：
  * ProxyCommand 的 stdout 就是 ssh 的传输通道，不能有杂字节；报错走 stderr，留给 `ssmKeyPushFailure` 认。
+ *
+ * 上面这套是 `posix`（sh 跑 ProxyCommand）的写法；选中的 ssh 是 Win32-OpenSSH 时换成 cmd.exe 的写法（`sshFlavor`）。
  */
 export function transportArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile' | 'sshHost'> & SsmFields & KeyFields): string[] {
   if (!isSsm(remote)) return proxyArgs(remote);
   assertSsmKeyUsable(remote);
   const aws = findLocalTool('aws') || 'aws';
-  let proxy = ssmProxyCommand(remote, { aws, pluginDir: pluginDirIfOffPath() });
+  const flavor = sshFlavor();
+  const pluginDir = pluginDirIfOffPath(process.env, flavor);
+  if (flavor === 'win32') {
+    /*
+      Win32-OpenSSH：`cmd.exe /d /s /c ""<aws>" ec2-instance-connect … >NUL && "<aws>" ssm start-session …"`。
+      公钥用 `file://<k-….pub>` 传：公钥那行有空格，放进 cmd 的引号里不如给一个路径省心。
+      推送失败 `&&` 后面不跑，报错走 stderr（`ssmKeyPushFailure` 照样认）。
+    */
+    const start = `${winRun(aws)} ${startSessionArgs(remote).join(' ')}`;
+    const segs = usesSsmTempKey(remote)
+      ? [`${winRun(aws)} ${sendKeyArgs(remote, `file://${ensureSsmKey(remote).privateKey}.pub`).map((a) => (a.startsWith('file://') ? `"${a}"` : winq(a))).join(' ')} >NUL`, start]
+      : [start];
+    return [
+      '-o', `ProxyCommand=${winProxyCommand(segs, { pluginDir })}`,
+      '-o', `HostKeyAlias=${remote.ssmInstanceId}`,
+    ];
+  }
+  let proxy = ssmProxyCommand(remote, { aws, pluginDir });
   if (usesSsmTempKey(remote)) {
     const push = [shq(aws), ...sendKeyArgs(remote, ensureSsmKey(remote).publicKey).map(shq)].join(' ');
     proxy = `9>/dev/null; ${push} >/dev/null && exec ${proxy}`;

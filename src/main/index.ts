@@ -5,7 +5,7 @@ import os from 'os';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
-import { isSsm, findLocalTool, execTimeoutFor } from './sshProxy.ts';
+import { isSsm, findLocalTool, runLocalTool as runSsmTool, execTimeoutFor } from './sshProxy.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, adapterMissingMessage, adapterAuthMessage, type Engine } from './engines.ts';
@@ -4501,13 +4501,8 @@ const ssmArnOf = new WeakMap<RemoteTarget, string>();
 async function checkSsm(remote: RemoteTarget): Promise<ReturnType<typeof judgePreflight> | null> {
   const seen: { arn?: string } = {};
   const tools = { aws: findLocalTool('aws'), plugin: findLocalTool('session-manager-plugin') };
-  const verdict = await ssmPreflight(remote, tools, (file, args) => new Promise((resolve) => {
-    execFile(file, args, { timeout: 20_000, encoding: 'utf8' }, (err: any, stdout, stderr) => resolve({
-      code: err ? (typeof err.code === 'number' ? err.code : 1) : 0,
-      stdout: String(stdout || ''),
-      stderr: String(stderr || (err && typeof err.code !== 'number' ? err.message : '') || ''),
-    }));
-  }), seen);
+  /* Windows 上的 aws 可能是 aws.cmd：execFile 起不了它，runSsmTool（sshProxy.ts `runLocalTool`）会经 cmd.exe 起（sshProxy.ts `localToolSpawn`） */
+  const verdict = await ssmPreflight(remote, tools, (file, args) => runSsmTool(file, args, 20_000), seen);
   if (seen.arn) ssmArnOf.set(remote, seen.arn);
   logger.info('remote', `ssm 预检 ${remote.sshHost}（aws=${tools.aws || '无'}，plugin=${tools.plugin || '无'}）：${verdict ? verdict.message : '通过'}`);
   return verdict;

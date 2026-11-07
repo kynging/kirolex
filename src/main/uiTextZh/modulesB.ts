@@ -356,6 +356,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   'AWS profile {profile} was not found in ~/.aws/config or ~/.aws/credentials. Existing profiles: {list}': '~/.aws/config 和 ~/.aws/credentials 里都没有 profile {profile}。现有的 profile：{list}',
   'AWS profile {profile} was not found, and ~/.aws/config / ~/.aws/credentials have no profiles at all.': '没有 profile {profile}，~/.aws/config / ~/.aws/credentials 里也一个 profile 都没有。',
   'The SSO login for profile {profile} has expired. Run `aws sso login --profile {profile}` in a terminal, then click Retry.': 'profile {profile} 的 SSO 登录过期了，在终端运行 `aws sso login --profile {profile}` 后点重试。',
+  'Cannot pass {arg} to {file} through cmd.exe (it contains " or %).': '没法经 cmd.exe 把 {arg} 传给 {file}（里面有 " 或 %）。',
   'The SSO login for the default AWS credentials has expired. Run `aws sso login` in a terminal, then click Retry.': '默认 AWS 凭证的 SSO 登录过期了，在终端运行 `aws sso login` 后点重试。',
   'Getting AWS credentials ({profile}) failed: {error}': '取 AWS 凭证（{profile}）失败：{error}',
   'default credential chain': '默认凭证链',
