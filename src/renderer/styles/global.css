@@ -10069,3 +10069,26 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   color: var(--accent); text-decoration: underline; font-size: 11px; cursor: pointer;
 }
 .engine-status-panel .adapter-install-output { margin-left: 22px; }
+/* 「登录 kiro」卡片（会话里的提示下面 / kiro 会话的 🔑 登录 / 设置 → 机器，KiroLoginCard） */
+.kiro-login-card {
+  margin: 8px auto; padding: 10px 12px; max-width: 640px; border: 1px solid rgba(124, 111, 224, 0.35); border-radius: 10px;
+  background: rgba(124, 111, 224, 0.07); font-size: 12px; text-align: left; display: flex; flex-direction: column; gap: 6px;
+}
+.kiro-login-card.compact { margin: 6px 0 0; }
+.kiro-login-title { font-weight: 600; color: var(--text-primary, var(--text)); }
+.kiro-login-hint { color: var(--text-tertiary); font-size: 11px; line-height: 1.45; }
+.kiro-login-licenses { display: flex; gap: 16px; flex-wrap: wrap; }
+.kiro-login-licenses label { display: inline-flex; align-items: center; gap: 5px; cursor: pointer; color: var(--text-secondary); }
+.kiro-login-fields { display: flex; flex-direction: column; gap: 5px; }
+.kiro-login-actions { display: flex; align-items: center; gap: 10px; flex-wrap: wrap; }
+.kiro-login-btn {
+  padding: 4px 14px; border: 1px solid var(--accent); border-radius: 8px; background: var(--accent);
+  color: #fff; font-size: 12px; font-weight: 600; cursor: pointer;
+}
+.kiro-login-btn:disabled { opacity: .55; cursor: default; }
+.kiro-login-status { color: var(--text-secondary); font-size: 11px; white-space: pre-wrap; overflow-wrap: anywhere; flex: 1; min-width: 200px; }
+.kiro-login-card[data-phase="failed"] .kiro-login-status { color: var(--error, #d9534f); }
+.kiro-login-card[data-phase="done"] .kiro-login-status { color: var(--success, #4caf50); }
+.kiro-login-pane { padding: 16px; overflow: auto; }
+.kiro-login-entry { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
+.kiro-login-entry .kiro-login-card { margin: 0; max-width: none; align-self: stretch; }

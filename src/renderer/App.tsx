@@ -99,6 +99,8 @@ declare global {
       enginesInstall?: (machine: string, engine: string) => Promise<{ ok: boolean; error?: string }>;
       onEnginesInstallOutput?: (cb: (d: { machine: string; engine: string; chunk: string }) => void) => () => void;
       enginesLogin?: (machine: string, engine: string) => Promise<{ ok: boolean; opened?: boolean; how?: string; error?: string }>;
+      kiroLoginInfo?: (target: { machine?: string; sessionId?: string }) => Promise<{ ok: boolean; machine?: string; remote?: boolean; host?: string; choice?: import('./kiroLoginView').KiroLoginChoice; source?: 'remembered' | 'local' | 'none'; error?: string }>;
+      kiroLogin?: (target: { machine?: string; sessionId?: string }, choice: import('./kiroLoginView').KiroLoginChoice) => Promise<{ ok: boolean; opened?: boolean; machine?: string; error?: string }>;
       primeHistory: (sessionId: string, force?: boolean) => Promise<any>;
       persistNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
       readEvents?: (sessionId: string, limit?: number) => Promise<{ events: any[]; path: string; truncated: boolean }>;

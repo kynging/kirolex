@@ -229,7 +229,8 @@ describe('接线', () => {
     assert.match(S, /engine-status-row\$\{selected === e \? ' selected' : ''\}\$\{onSelect \? ' selectable' : ''\}/);
     // 行里的安装 / 登录 / 官方下载按钮不能顺带切换引擎
     assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); void store\.install\(machine, e\); \}\}/);
-    assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); void store\.login\(machine, e\); \}\}/);
+    /* kiro 的「登录」展开「登录 kiro」卡片，另外两家照旧走 store.login —— 都先 stopPropagation */
+    assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); if \(e === 'kiro'\) setKiroLoginOpen\(\(v\) => !v\); else void store\.login\(machine, e\); \}\}/);
     assert.match(S, /onClick=\{\(ev\) => \{ ev\.stopPropagation\(\); void \(window as any\)\.kiroApi\?\.openExternal\?\.\(KIRO_DOWNLOAD_URL\); \}\}/);
     // 按钮上按 Enter / 空格是按按钮本身，不冒泡到行上去选引擎
     assert.match(S, /onKeyDown: \(ev: React\.KeyboardEvent\) => \{\s*if \(ev\.target !== ev\.currentTarget\) return;/);

@@ -188,8 +188,8 @@ export const ZH_MODULES_B: Record<string, string> = {
   'Check that the configured private key belongs to this machine and that the user name is right': '检查配置里的私钥是不是这台机器的、用户名对不对',
   '{host} is missing {tools}. Run the bootstrap script on the remote once to install everything: `{cmd}` (KiroLex does not install things on the remote for you).':
     '{host} 上缺 {tools}。在远端跑一次预置脚本装齐：`{cmd}`（KiroLex 不替你在远端装东西）。',
-  'kiro-cli on {host} is not logged in. Run `kiro-cli login` on that machine once. Without a login the executor starts, but every turn comes back empty, which looks just like the server returning empty responses.':
-    '{host} 上的 kiro-cli 没登录。去那台机器跑一次 `kiro-cli login`——没登录的话执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。',
+  'kiro-cli on {host} is not logged in. Click "Log in to kiro" on the card below (it is also under 🔑 Login in the chat and in Settings → 🖥 Machines): it opens a terminal that logs in on that machine with a device code. Without a login the executor starts, but every turn comes back empty, which looks just like the server returning empty responses.':
+    '{host} 上的 kiro-cli 没登录。点下面卡片上的「登录 kiro」（会话的 🔑 登录、设置 → 🖥 机器里也有）：会开一个终端，用设备码在那台机器上登录。没登录的话执行器起得来、但每一轮都空回，看起来就像服务端在返空响应。',
   '{host}: kiro-cli is installed and logged in, {n} models available.': '{host}：kiro-cli 在，也登录了，{n} 个可用模型。',
   '{host}: kiro-cli is installed and logged in.': '{host}：kiro-cli 在，也登录了。',
   // ── remoteRecovery.ts ──（「本机工具连接中断，正在重连」「本机工具连接已恢复」和 index.ts 用同一个 key，文案在 indexA）
@@ -289,7 +289,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   "The {engine} adapter is installed on {host}, but there is no node to run it.": "{host} 上装了 {engine} 的适配器，但没有能跑它的 node。",
   "The {engine} ACP adapter is not installed on {host}.": "{host} 上没装 {engine} 的 ACP 适配器。",
   "❌ Installing kiro-cli on this machine failed: {why}\nYou can download and install it yourself from the official page: {url} — then click Install again (KiroLex will find it).": "❌ 在本机安装 kiro-cli 没成功：{why}\n可以到官方页面自己下载安装：{url} —— 装好后再点一次「安装」（KiroLex 会找到它）。",
-  "kiro-cli on {host} is not logged in: Settings → 🖥 Machines → that machine → \"Install AI tools\" walks you through logging in (device flow), or run `kiro-cli login` on that machine.": "{host} 上的 kiro-cli 还没登录：设置 → 🖥 机器 → 那台机器 →「安装 AI 工具」会带你登录（device flow），或者在那台机器上跑 `kiro-cli login`。",
+  "kiro-cli on {host} is not logged in: click \"Log in to kiro\" (here, under 🔑 Login in a chat on that machine, or in Settings → 🖥 Machines → that machine). It opens a terminal that logs in on that machine with a device code.": "{host} 上的 kiro-cli 还没登录：点「登录 kiro」（这里、那台机器上会话的 🔑 登录、或 设置 → 🖥 机器 → 那台机器）。会开一个终端，用设备码在那台机器上登录。",
   "{engine} on {host} is not logged in: create the chat, then use 🔑 Login at the bottom left of the chat (official login, Bedrock or an API key).": "{host} 上的 {engine} 还没登录：建好会话后，用会话左下角的 🔑 登录（官方登录、Bedrock 或 API key）。",
   "❌ Installing kiro-cli on {host} failed: {why}": "❌ 在 {host} 上安装 kiro-cli 没成功：{why}",
   "the install script finished, but no kiro-cli that starts was found on that machine": "安装脚本跑完了，但在那台机器上找不到能起来的 kiro-cli",

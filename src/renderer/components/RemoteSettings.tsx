@@ -3,6 +3,7 @@ import { DEFAULT_SSM_USER, DEFAULT_WORKDIR, LOCAL, connectionKey, defaultPick, j
 import { notifyRemoteTargetsChanged } from '../hooks/useRemoteTargets.ts';
 import { useT } from '../hooks/useLang';
 import { EngineStatusPanel } from './EngineStatusPanel';
+import { KiroLoginCard } from './KiroLoginCard';
 
 /**
  * **在界面上配一台远端机器** ——「界面上甚至没有配置远程EC2的地方」。
@@ -692,6 +693,8 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
         <div className="remote-form">
           {/* 三个引擎在本机能不能用（版本、登没登录），❌ 直接装、⚠️ 直接登录 —— 和远端那页「测试连接」报的是同一类事 */}
           <EngineStatusPanel machine="local" title={t('The three AI tools on this computer')} />
+          {/* 每台机器一个「登录 kiro」入口（和会话里那张卡片同一个） */}
+          <KiroLoginEntry machine="local" />
           <p className="settings-hint" style={{ marginTop: 0 }}>
             {t('Empty = look in the usual install locations. An absolute path or a different name both work. This machine may have two kiro-cli installs, and which one runs decides the model list, agents and MCP behavior.')}
             {' '}<b>★</b>{t(' = has actually started a session before; ')}<b>✗</b>{t(' = found but does not start (or is not this tool).')}
@@ -747,6 +750,8 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
             >{installing ? t('Installing…') : t('Install AI tools')}</button>
             {draft.id && <button className="remote-btn" disabled={locked} onClick={() => void remove()}>{t('Delete')}</button>}
           </div>
+          {/* 登录这台机器上的 kiro-cli：开终端经同一条连接 ssh -t 跑 device flow（只对已保存的机器） */}
+          {draft.id && <KiroLoginEntry key={draft.id} machine={draft.id} />}
           {/* 这台远端机器上那三个 CLI 怎么起（空 = 用 PATH 上的那个） */}
           <BinFields bins={draft.bins || {}} machine={draft.id || ''} onChange={(bins) => setDraft({ ...draft, bins })} />
         </div>
@@ -771,3 +776,17 @@ export const RemoteSettings: React.FC<{ startNew?: boolean }> = ({ startNew }) =
     </div>
   );
 };
+
+/** 设置 → 机器里的「登录 kiro」：点开才挂卡片（卡片一挂就会问一次默认登录方式）。 */
+function KiroLoginEntry({ machine }: { machine: string }) {
+  const t = useT();
+  const [open, setOpen] = useState(false);
+  return (
+    <div className="kiro-login-entry">
+      <button type="button" className="remote-btn" onClick={() => setOpen((v) => !v)}>
+        {open ? t('Hide') : t('🔑 Log in to kiro on this machine')}
+      </button>
+      {open && <KiroLoginCard target={{ machine }} />}
+    </div>
+  );
+}

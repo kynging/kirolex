@@ -274,4 +274,5 @@ export const ZH_INDEX_B: Record<string, string> = {
   "This session has been moved to the cloud. Click it in the sidebar to download it back first.": "这条会话已经移到云端了。先在侧栏点它，下载回本机再用。",
   "The cloud-offload list file is unreadable, so it was not changed.": "「已移到云端」的名单文件读不了，没有改它。",
   'This machine ({name}) has been removed from Settings, so this session will not connect to its old address. Add it back in Settings → 🖥 Machines, or move this session to another machine.': '这台机器（{name}）已从设置里删除，这条会话不会再去连它的旧地址。到「设置 → 🖥 机器」把它加回来，或者把这条会话换到别的机器上。',
+  "Choose Free or Pro first (Pro: the start URL must start with https://, the region looks like us-east-1).": "先选免费或 Pro（Pro 的 start URL 要以 https:// 开头，区形如 us-east-1）。",
 };

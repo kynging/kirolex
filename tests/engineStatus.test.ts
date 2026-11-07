@@ -163,6 +163,8 @@ describe('本机登录：开一个终端跑登录命令', () => {
   });
   test('远端没登录：给 KiroLex 里的登录方法', () => {
     assert.match(remoteLoginHow('claude', 'h'), /🔑/);
-    assert.match(remoteLoginHow('kiro', 'h'), /kiro-cli login/);
+    /* kiro：指向「登录 kiro」按钮（开终端经同一条连接跑 device flow），不再叫人自己去那台机器跑命令 */
+    assert.match(remoteLoginHow('kiro', 'h'), /Log in to kiro|登录 kiro/);
+    assert.doesNotMatch(remoteLoginHow('kiro', 'h'), /run `kiro-cli login` on that machine|在那台机器上跑 `kiro-cli login`/);
   });
 });

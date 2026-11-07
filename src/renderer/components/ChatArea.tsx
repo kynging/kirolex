@@ -31,6 +31,8 @@ import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { isConnectFailureNotice } from '../connectFailure.ts';
 import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer.ts';
+import { kiroLoginOffer } from '../kiroLoginView.ts';
+import { KiroLoginCard } from './KiroLoginCard';
 import { adapterInstallStore, startAdapterInstall, startEngineLogin } from '../adapterInstallState.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { parseScheduleEnd, scheduleWakeCards, SCHEDULE_CARD_LINES, type ScheduleEndCard as ScheduleEndView, type ScheduleWakeCard as ScheduleWakeView } from '../../main/scheduleWakeView.ts';
@@ -883,6 +885,8 @@ function AdapterInstallAction({ sessionId, message, remote }: { sessionId?: stri
   const offer = isNotice ? adapterInstallOffer(message.content) : null;
   /* 「没登录」：只给本机会话（远端会话照旧用会话面板里的 🔑 登录） */
   const login = isNotice && !offer && !remote ? engineLoginOffer(message.content) : null;
+  /* kiro-cli 没登录（远端预检 not-logged-in）：挂「登录 kiro」卡片（选 free / pro → 开终端 ssh -t 跑 device flow → 登上自动重连） */
+  if (isNotice && !offer && sessionId && kiroLoginOffer(message.content)) return <KiroLoginCard target={{ sessionId }} compact />;
   const want = offer || login;
   if (!want || !sessionId) return null;
   const engine = want.engine === 'codex' ? 'Codex' : want.engine === 'kiro' ? 'kiro-cli' : 'Claude Code';
@@ -6149,7 +6153,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <button className="settings-close" onClick={closeAgentConfig} aria-label={t('Close')}>✕</button>
             </div>
             <div className="kiro-config-tabs" role="tablist">
-              {[{ id: 'agents', label: t('Agents') }, ...kiroConfigCats].map((c) => (
+              {/* 「🔑 登录」对 kiro 会话也有（远端 + 本机）：和提示下面那张卡片是同一个 */}
+              {[{ id: 'agents', label: t('Agents') }, ...kiroConfigCats, { id: 'kiro-login', label: t('🔑 Login') }].map((c) => (
                 <button
                   key={c.id}
                   role="tab"
@@ -6297,6 +6302,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               </button>
             </div>
             </>) : (() => {
+              if (agentConfigTab === 'kiro-login') {
+                return currentSessionId
+                  ? <div className="kiro-login-pane"><KiroLoginCard target={{ sessionId: currentSessionId }} /></div>
+                  : null;
+              }
               const cat = kiroConfigCats.find((c) => c.id === agentConfigTab);
               /* key = 类别：换 tab 就换一个实例，上一个 tab 的草稿随之丢掉（关闭即丢弃那条规则） */
               return cat

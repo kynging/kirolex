@@ -3,9 +3,10 @@
  * ✅ 可用 / ⚠️ 没登录（点「登录」：本机开终端跑登录命令、登上了自动刷新；远端给去哪登）/ ❌ 没装（点「安装」直接装）。
  * 状态主进程缓存 5 分钟（`engines:status`），这里不会每次打开都卡一下；「重新检测」跳过缓存。
  */
-import React, { useEffect, useSyncExternalStore } from 'react';
+import React, { useEffect, useState, useSyncExternalStore } from 'react';
 import { useT } from '../hooks/useLang';
 import { EngineIcon } from './Icons';
+import { KiroLoginCard } from './KiroLoginCard';
 import {
   createEngineStatusStore, ENGINE_NAMES, ENGINE_ORDER, outputTail, stateIcon,
   type EngineId, type EngineStatusLite, type EngineStatusStore, type MachineState,
@@ -70,6 +71,8 @@ export function EngineStatusPanel({ machine, selected, compact, title, onSelect 
   const t = useT();
   const store = engineStatusStore();
   const st = useEngineStatuses(machine);
+  /* kiro 没登录：「登录」在这一行下面展开「登录 kiro」卡片（选 free / pro → 开终端；远端经同一条连接 ssh -t 跑 device flow） */
+  const [kiroLoginOpen, setKiroLoginOpen] = useState(false);
   const loadingFirst = !st?.statuses && (st?.loading ?? true);
   return (
     <div className={`engine-status-panel${compact ? ' compact' : ''}`} data-machine={machine} role={onSelect ? 'radiogroup' : undefined}>
@@ -110,7 +113,7 @@ export function EngineStatusPanel({ machine, selected, compact, title, onSelect 
                 </button>
               )}
               {s?.state === 'not-logged-in' && (
-                <button type="button" className="engine-status-btn" disabled={busy} onClick={(ev) => { ev.stopPropagation(); void store.login(machine, e); }}>
+                <button type="button" className="engine-status-btn" disabled={busy} onClick={(ev) => { ev.stopPropagation(); if (e === 'kiro') setKiroLoginOpen((v) => !v); else void store.login(machine, e); }}>
                   {a?.phase === 'logging-in' ? t('Waiting for login…') : t('Log in')}
                 </button>
               )}
@@ -134,6 +137,9 @@ export function EngineStatusPanel({ machine, selected, compact, title, onSelect 
             {a?.phase === 'logging-in' && <div className="engine-status-detail">{t('A terminal window opened with the login command. Finish logging in there; this updates by itself.')}</div>}
             {a?.phase === 'login-failed' && <div className="engine-status-detail engine-status-fail">{a.error || t('Did not see a login yet. Click Log in to try again.')}</div>}
             {a?.phase === 'login-how' && <div className="engine-status-detail">{a.how}</div>}
+            {e === 'kiro' && s?.state === 'not-logged-in' && kiroLoginOpen && (
+              <div className="engine-status-detail" onClick={(ev) => ev.stopPropagation()}><KiroLoginCard target={{ machine }} compact onDone={() => { void store.load(machine, true); }} /></div>
+            )}
           </div>
         );
       })}

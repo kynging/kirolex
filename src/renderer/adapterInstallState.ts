@@ -154,6 +154,18 @@ export function startEngineLogin(sessionId: string, engine: AdapterEngine): Prom
   }
   return runEngineLogin(adapterInstallStore, sessionId, engine, { ...loginRunner, reconnect: runner.reconnect });
 }
+/**
+ * 登录 / 安装之外别处登上之后（「登录 kiro」卡片）重连这条会话：和安装后同一条重连（`useAcp` 的 `reconnectAfterInstall`），
+ * 连上后「没连上」那条换成「xx 登录好了、已连上」。
+ */
+export function reconnectAfterLogin(sessionId: string, engine: AdapterEngine): Promise<{ ok: boolean; error?: string }> {
+  if (!runner) return Promise.resolve({ ok: false, error: 'not ready' });
+  adapterInstallStore.set(sessionId, { phase: 'reconnecting', engine, output: '', via: 'login' });
+  return runner.reconnect(sessionId).then((r) => {
+    adapterInstallStore.patch(sessionId, r.ok ? { phase: 'connected' } : { phase: 'reconnect-failed', error: r.error || '' });
+    return r;
+  });
+}
 /** 按钮点下去。没登记（不该发生）就当失败说一句。 */
 export function startAdapterInstall(sessionId: string, engine: AdapterEngine): Promise<boolean> {
   if (!runner) {

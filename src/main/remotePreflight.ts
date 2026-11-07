@@ -174,7 +174,8 @@ export function judgePreflight(
   if (/AUTH no/.test(out)) {
     return {
       code: 'not-logged-in',
-      message: tr('kiro-cli on {host} is not logged in. Run `kiro-cli login` on that machine once. Without a login the executor starts, but every turn comes back empty, which looks just like the server returning empty responses.', { host }),
+      /* 指向按钮（会话里的卡片 / 🔑 登录 / 设置 → 机器），不再叫人「去那台机器跑」—— 没人知道怎么去 */
+      message: tr('kiro-cli on {host} is not logged in. Click "Log in to kiro" on the card below (it is also under 🔑 Login in the chat and in Settings → 🖥 Machines): it opens a terminal that logs in on that machine with a device code. Without a login the executor starts, but every turn comes back empty, which looks just like the server returning empty responses.', { host }),
     };
   }
   const models = parseModels(out);

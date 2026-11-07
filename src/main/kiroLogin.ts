@@ -56,3 +56,74 @@ export function loginEnv(hints: KiroLoginHints): Record<string, string> {
     ...(hints.region ? { KIRO_LOGIN_REGION: hints.region } : {}),
   };
 }
+
+/* ─────────── 会话里 / 设置里的「登录 kiro」（远端经同一条连接 ssh -t 跑 device flow；本机直接开终端） ─────────── */
+
+export type KiroLicense = 'free' | 'pro';
+/** 用户在登录卡片里选 / 填的：免费（Builder ID）还是 Pro（Identity Center，start URL + 区）。 */
+export interface KiroLoginChoice { license: KiroLicense; identityProvider?: string; region?: string }
+
+const START_URL_RE = /^https:\/\/[^\s'"]+$/;
+const REGION_RE = /^[a-z]{2}(-[a-z]+)+-\d$/;
+
+/** 渲染层传来的选择 → 干净的一份；不合法返回 `null`（start URL 只认 https、区只认 `ap-northeast-1` 这种）。 */
+export function normalizeKiroLoginChoice(raw: unknown): KiroLoginChoice | null {
+  const r = (raw || {}) as Record<string, unknown>;
+  if (r.license !== 'free' && r.license !== 'pro') return null;
+  if (r.license === 'free') return { license: 'free' };
+  const idp = String(r.identityProvider || '').trim();
+  const region = String(r.region || '').trim();
+  if (idp && !START_URL_RE.test(idp)) return null;
+  if (region && !REGION_RE.test(region)) return null;
+  return { license: 'pro', ...(idp ? { identityProvider: idp } : {}), ...(region ? { region } : {}) };
+}
+
+/**
+ * `kiro-cli login` 的参数。远端没有浏览器，必须 `--use-device-flow`（打印 URL + code，在本机浏览器里授权）。
+ * Pro 没填 start URL / 区的就不带 —— 终端是交互的（ssh -t），kiro-cli 会自己问。
+ */
+export function kiroLoginArgs(c: KiroLoginChoice, opts: { deviceFlow: boolean }): string[] {
+  return [
+    'login',
+    '--license', c.license,
+    ...(c.license === 'pro' && c.identityProvider ? ['--identity-provider', c.identityProvider] : []),
+    ...(c.license === 'pro' && c.region ? ['--region', c.region] : []),
+    ...(opts.deviceFlow ? ['--use-device-flow'] : []),
+  ];
+}
+
+function shq(s: string): string { return `'${String(s).replace(/'/g, `'\\''`)}'`; }
+
+/** 远端跑的那一条：`bash -lc '<kiro 启动命令> login … --use-device-flow'`（登录 shell 才找得到 ~/.local/bin 里的 kiro-cli）。 */
+export function remoteKiroLoginCommand(bin: string, c: KiroLoginChoice): string {
+  return `bash -lc ${shq([shq(bin || 'kiro-cli'), ...kiroLoginArgs(c, { deviceFlow: true }).map(shq)].join(' '))}`;
+}
+
+/**
+ * `buildSshArgs` 的结果加 `-t`（device flow 要交互、要显示 code）。`buildSshArgs` 的最后两项永远是 `host, 远端命令`，
+ * `-t` 插在 host 前面 —— SSM 的 ProxyCommand、临时公钥、跳板这些传输参数原样保留（同一条连接）。
+ */
+export function withTty(sshArgs: string[]): string[] {
+  if (sshArgs.length < 2) throw new Error('ssh args must end with host and command');
+  return [...sshArgs.slice(0, -2), '-t', ...sshArgs.slice(-2)];
+}
+
+/**
+ * 卡片打开时默认选什么：这台机器上次在 KiroLex 里怎么登的（记住的那份）→ 本机 kiro-cli 是 Identity Center 登录的
+ * （start URL 当 Pro 的默认；区不跟：whoami 里那个是 profile ARN 的区，不一定是 IdC 的区，见上面 `parseWhoami`）→ 都没有就不选，让用户选 free / pro。
+ */
+export function kiroLoginDefaults(remembered: KiroLoginChoice | undefined, local: KiroLoginHints | undefined): { choice?: KiroLoginChoice; source: 'remembered' | 'local' | 'none' } {
+  if (remembered) return { choice: remembered, source: 'remembered' };
+  if (local?.identityProvider) return { choice: { license: 'pro', identityProvider: local.identityProvider }, source: 'local' };
+  return { source: 'none' };
+}
+
+/** 记住的登录方式：`~/.kirolex/kiro-login.json`，`{ <机器>: KiroLoginChoice }`（机器 = 'local' 或远端 id）。 */
+export function readKiroLoginChoices(file: string, read: (p: string) => string | null): Record<string, KiroLoginChoice> {
+  try {
+    const j = JSON.parse(read(file) || '{}');
+    const out: Record<string, KiroLoginChoice> = {};
+    for (const [k, v] of Object.entries(j || {})) { const c = normalizeKiroLoginChoice(v); if (c) out[k] = c; }
+    return out;
+  } catch { return {}; }
+}

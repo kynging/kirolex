@@ -210,6 +210,6 @@ export function terminalLaunches(
 /** 远端那台机器没登录时给的登录方法（在 KiroLex 里怎么登）。 */
 export function remoteLoginHow(engine: Engine, host: string): string {
   return engine === 'kiro'
-    ? tr('kiro-cli on {host} is not logged in: Settings → 🖥 Machines → that machine → "Install AI tools" walks you through logging in (device flow), or run `kiro-cli login` on that machine.', { host })
+    ? tr('kiro-cli on {host} is not logged in: click "Log in to kiro" (here, under 🔑 Login in a chat on that machine, or in Settings → 🖥 Machines → that machine). It opens a terminal that logs in on that machine with a device code.', { host })
     : tr('{engine} on {host} is not logged in: create the chat, then use 🔑 Login at the bottom left of the chat (official login, Bedrock or an API key).', { engine: ENGINE_LABEL[engine], host });
 }

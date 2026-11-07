@@ -60,6 +60,10 @@ contextBridge.exposeInMainWorld('kiroApi', {
   },
   /** ⚠️ → 登录：本机开终端跑登录命令（{opened}）；远端回去哪登（{how}）。 */
   enginesLogin: (machine: string, engine: string) => ipcRenderer.invoke('engines:login', machine, engine),
+  /** 「登录 kiro」：目标是会话（按它的机器）或机器（'local' / 远端 id）。info 给默认的登录方式；login 开终端（远端经同一条连接 ssh -t 跑 device flow）。 */
+  kiroLoginInfo: (target: { machine?: string; sessionId?: string }) => ipcRenderer.invoke('kiro:login-info', target),
+  kiroLogin: (target: { machine?: string; sessionId?: string }, choice: { license: 'free' | 'pro'; identityProvider?: string; region?: string }) =>
+    ipcRenderer.invoke('kiro:login', target, choice),
   onAdapterInstallOutput: (callback: (d: { sessionId: string; chunk: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:adapter-install-output', handler);

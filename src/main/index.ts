@@ -141,7 +141,7 @@ import {
   staleExecutorSweepScript, parseStaleSweep, adapterSweepScript, parseAdapterSweep,
   ownerTag, ownedAgentPrefix, LISTENING_PORTS_SCRIPT, parseListeningPorts,
 } from './remoteLocalTools.ts';
-import { parseWhoami, loginEnv } from './kiroLogin.ts';
+import { parseWhoami, loginEnv, normalizeKiroLoginChoice, kiroLoginArgs, remoteKiroLoginCommand, withTty, kiroLoginDefaults, readKiroLoginChoices } from './kiroLogin.ts';
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, ssmFieldsOf, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, readRemoteTargets, resolveSessionRemote, refreshedSnapshot, deriveLabel, type RemoteTargetInput, type SessionRemoteResolution } from './remoteTargets.ts';
 import { createAdapterNotes } from './adapterNotes.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
@@ -4191,6 +4191,11 @@ async function remoteEngineStatusesFor(target: RemoteTarget, force = false): Pro
   const sections = splitTestOutput(out.stdout);
   const pre = judgePreflight(out.code, sections.kiro, out.stderr, target);
   const statuses = remoteEngineStatuses(host, { code: out.code, ...sections }, pre.code === 'unreachable' ? pre.message : undefined);
+  /*
+    kiro 在那台机器上已经能用（例如刚在「登录 kiro」的终端里登上）：清掉熔断里记着的「没登录」，
+    紧接着的重连就会重新预检，而不是在熔断窗口里复用上一次的结论（和「测试连接」通了时一样）。
+  */
+  if (statuses.some((s) => s.engine === 'kiro' && s.state === 'ok')) reachability.ok(host);
   /*
     Codex 能用（装了、配过）：顺带做 Bedrock 权限预检（只走 Bedrock 的机器才真查，见 bedrockCheckScript）。
     模拟那条路几秒就完；没权限模拟时那次试调用最多 60 秒 —— 这里最多等 20 秒，没完就在后台跑完，结果记在 bedrockChecks，
@@ -15671,6 +15676,75 @@ ${hint}` : ''}` };
     return opened
       ? { ok: true, opened: true }
       : { ok: false, error: tr('Could not open a terminal. Run this in a terminal yourself: {cmd}', { cmd: cmd.argv.join(' ') }) };
+  });
+
+  /*
+    ─────────── 「登录 kiro」（会话里的卡片 / 🔑 登录 tab / 设置 → 机器）───────────
+    远端：本机开一个终端，经**同一条连接**（`buildSshArgs`：SSM ProxyCommand + 临时公钥 / 跳板 / 密钥都在里面）
+    `ssh -t` 过去跑 `kiro-cli login … --use-device-flow`（远端没有浏览器）；本机：直接开终端跑 `kiro-cli login …`。
+    登录方式（free / pro + start URL / 区）由卡片里选；记住每台机器上次选的（`~/.kirolex/kiro-login.json`）。
+    登上之后渲染层轮询 `engines:status`（跳过缓存）到 kiro 可用，再自己重连会话。
+  */
+  const KIRO_LOGIN_FILE = path.join(os.homedir(), '.kirolex', 'kiro-login.json');
+  /** 目标：给了会话就按会话记录里的机器（本机 / 远端），给了机器就按机器（'local' 或远端 id）。 */
+  const kiroLoginTarget = (t: { machine?: string; sessionId?: string } | undefined): { machine: string; remote?: RemoteTarget } | { error: string } => {
+    const sid = String(t?.sessionId || '').trim();
+    if (sid) {
+      const snap = store.readRecord(sid)?.profile.remote;
+      if (!snap?.sshHost) return { machine: 'local' };
+      const id = (snap as any).id || findRemoteIdForHost(snap.sshHost);
+      const fresh = id ? findRemoteTarget(KIROLEX_CONFIG_PATH, id) : undefined;
+      return { machine: id || snap.sshHost, remote: fresh || snap };
+    }
+    const key = String(t?.machine || 'local');
+    if (key === 'local') return { machine: 'local' };
+    const remote = findRemoteTarget(KIROLEX_CONFIG_PATH, key);
+    return remote ? { machine: key, remote } : { error: tr('Machine not found') };
+  };
+
+  ipcMain.handle('kiro:login-info', async (_event, target?: { machine?: string; sessionId?: string }) => {
+    const r = kiroLoginTarget(target);
+    if ('error' in r) return { ok: false, error: r.error };
+    const remembered = readKiroLoginChoices(KIRO_LOGIN_FILE, readTextOrNull)[r.machine];
+    /* 没记过：看本机 kiro-cli 是怎么登的（Identity Center 的 start URL 当 Pro 的默认） */
+    let local: ReturnType<typeof parseWhoami> | undefined;
+    if (!remembered) {
+      const cli = kiroBinProblem() ? null : resolveKiroCli();
+      if (cli) {
+        const who = await runLocalCapture(cli, ['whoami'], 15_000);
+        if (who.ok) local = parseWhoami(who.out);
+      }
+    }
+    return { ok: true, machine: r.machine, remote: !!r.remote, host: r.remote ? ((r.remote as any).label || r.remote.sshHost) : undefined, ...kiroLoginDefaults(remembered, local) };
+  });
+
+  ipcMain.handle('kiro:login', async (_event, target: { machine?: string; sessionId?: string } | undefined, rawChoice: unknown) => {
+    const r = kiroLoginTarget(target);
+    if ('error' in r) return { ok: false, error: r.error };
+    const choice = normalizeKiroLoginChoice(rawChoice);
+    if (!choice) return { ok: false, error: tr('Choose Free or Pro first (Pro: the start URL must start with https://, the region looks like us-east-1).') };
+    let argv: string[];
+    if (r.remote) {
+      /* 密码登录的机器不把密码放进环境变量：终端是交互的，ssh 会自己在窗口里问（Windows 上命令会写进临时 .cmd，不能带明文） */
+      argv = ['ssh', ...withTty(buildSshArgs(r.remote, remoteKiroLoginCommand(remoteKiroBin(r.remote) || 'kiro-cli', choice)))];
+    } else {
+      const cli = kiroBinProblem() ? null : resolveKiroCli();
+      if (!cli) return { ok: false, error: tr('Install kiro-cli first.') };
+      argv = [cli, ...kiroLoginArgs(choice, { deviceFlow: false })];
+    }
+    try {
+      const all = { ...readKiroLoginChoices(KIRO_LOGIN_FILE, readTextOrNull), [r.machine]: choice };
+      fs.mkdirSync(path.dirname(KIRO_LOGIN_FILE), { recursive: true });
+      const tmp = `${KIRO_LOGIN_FILE}.tmp-${process.pid}`;
+      fs.writeFileSync(tmp, `${JSON.stringify(all, null, 2)}\n`);
+      fs.renameSync(tmp, KIRO_LOGIN_FILE);
+    } catch (err: any) { logger.warn('engines', `记不下 kiro 登录方式：${err?.message || err}`); }
+    const opened = await openLoginTerminal(argv);
+    engineStatusCache.invalidate(r.machine);
+    logger.info('engines', `登录 kiro @ ${r.remote ? r.remote.sshHost : '本机'}（${choice.license}）：${opened ? '开了终端' : '没能开终端'}`);
+    return opened
+      ? { ok: true, opened: true, machine: r.machine }
+      : { ok: false, error: tr('Could not open a terminal. Run this in a terminal yourself: {cmd}', { cmd: argv.join(' ') }) };
   });
 
   /**
