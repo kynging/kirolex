@@ -142,7 +142,7 @@ import {
   ownerTag, ownedAgentPrefix, LISTENING_PORTS_SCRIPT, parseListeningPorts,
 } from './remoteLocalTools.ts';
 import { parseWhoami, loginEnv } from './kiroLogin.ts';
-import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, ssmFieldsOf, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, type RemoteTargetInput } from './remoteTargets.ts';
+import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, ssmFieldsOf, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, readRemoteTargets, resolveSessionRemote, refreshedSnapshot, deriveLabel, type RemoteTargetInput, type SessionRemoteResolution } from './remoteTargets.ts';
 import { createAdapterNotes } from './adapterNotes.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
 import { newQuestionCard, closeQuestionCard, buildAcceptContent, elicitationResult, questionTailText, type QuestionCard, type QuestionStatus, type QuestionValue } from './elicitation.ts';
@@ -817,6 +817,18 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
   /* 回退链、模型清单、死模型表都是 kiro 的：Claude Code / Codex 的模型由适配器自己管，换不了也不该换 */
   if (!entry || engineOf(entry.profile) !== 'kiro') return null;
   const candidates = MODEL_FALLBACK_ORDER.filter((m) => m && m !== failedModel && !exclude?.has(m));
+  /*
+    新执行器按设置里现在的那台连（清单、cwd、记哪台机器都跟着它）；机器被删了就不换（返回 null = 调用方照原样报那次失败）。
+    这个 entry 下面马上就从 sessionClients 里拿掉、换成新的那个，所以直接改它的 remote / cwd。
+  */
+  try {
+    const live = liveRemountTarget(sessionId, entry);
+    entry.profile = { ...entry.profile, remote: live.remote };
+    entry.cwd = live.cwd;
+  } catch (err: any) {
+    logger.warn('model', `${label}: 不换模型 —— ${err?.message || err}`);
+    return null;
+  }
   const cliSessionId = entry.cliSessionId;
   const cwd = entry.cwd;
   /*
@@ -3761,7 +3773,9 @@ const remoteRecovery = new RemoteRecovery<{ key: string; remote: RemoteTarget }>
   target: (sid) => {
     if (isQuitting || deletedSessionIds.has(sid)) return undefined;
     const rec = store.readRecord(sid);
-    const remote = rec && !rec.archived ? rec.profile.remote : undefined;
+    /* 按设置里现在的那台重连；机器被删了就不重连（再点开时 attach 会明说为什么） */
+    const resolved = rec && !rec.archived ? sessionRemote(rec.profile.remote) : undefined;
+    const remote = resolved && !resolved.deleted ? resolved.remote : undefined;
     return remote?.sshHost ? { key: muxKey(remote.sshHost, remote.sshPort), remote } : undefined;
   },
   attached: (sessionId) => sessionClients.has(sessionId),
@@ -4626,6 +4640,67 @@ setLocalKiroBin(localBins(KIROLEX_CONFIG_PATH)?.kiro);
 */
 setRemoteBinResolver((sshHost) => listRemoteTargets(KIROLEX_CONFIG_PATH)
   .find((t) => t.sshHost === sshHost)?.bins?.kiro);
+
+/**
+ * **会话记录里的 `profile.remote` → 现在该连的那台**（按 id 取设置里的最新配置，见 `resolveSessionRemote`）。
+ * 上面那条只现查了 bins；sshHost 本身变了（直连 → SSM）按 host 也查不到。凡是拿记录里的 remote
+ * 去连接 / preflight / 显示名字的地方都走这一个，不要各处各写。attach 时解析一次放进 `entry.profile`，
+ * 之后按 entry 走的路径拿到的就已经是新的。
+ */
+function sessionRemote(remote: RemoteTarget | null | undefined): SessionRemoteResolution {
+  return resolveSessionRemote(remote as any, readRemoteTargets(KIROLEX_CONFIG_PATH), (id) => findRemoteTarget(KIROLEX_CONFIG_PATH, id));
+}
+
+/** 机器在设置里删掉了：明说，不悄悄连旧地址。 */
+function deletedMachineMessage(remote: { label?: string; sshHost?: string } | undefined): string {
+  const name = String(remote?.label || '').trim() || deriveLabel(String(remote?.sshHost || ''));
+  return tr('This machine ({name}) has been removed from Settings, so this session will not connect to its old address. Add it back in Settings → 🖥 Machines, or move this session to another machine.', { name });
+}
+
+/** 连接用：设置里现在的那台；机器被删了就抛 `deletedMachineMessage`。本地会话 = undefined。 */
+function liveSessionRemote(remote: RemoteTarget | null | undefined): RemoteTarget | undefined {
+  const r = sessionRemote(remote);
+  if (r.deleted) throw new Error(deletedMachineMessage(r.remote));
+  return r.remote;
+}
+
+/**
+ * 把会话记录里的 `profile.remote` 快照换成 `remote` —— **只动这一个字段**，不改 updatedAt（不是用户的编辑，
+ * 不该把会话顶到侧栏最上面）。一样就不写。返回写了没有。
+ */
+function writeRecordRemote(sessionId: string, remote: RemoteTarget): boolean {
+  try {
+    const rec = store.readRecord(sessionId);
+    if (!rec?.profile?.remote?.sshHost || rec.id !== sessionId) return false;
+    if (JSON.stringify(rec.profile.remote) === JSON.stringify(remote)) return false;
+    store.writeRecordKeepUpdatedAt({ ...rec, profile: { ...rec.profile, remote } });
+    return true;
+  } catch (err: any) {
+    logger.warn('remote', `更新会话 ${sessionId} 的机器快照失败：${err?.message || err}`);
+    return false;
+  }
+}
+
+/**
+ * **换执行器时（切模型 / Agent / 组合、自动换模型）该连哪台、cwd 是什么** —— 活着的 entry 里那份 remote
+ * 是挂上那一刻的；之后在设置里改了地址 / 连法，新起的执行器要按现在的配置连（机器被删了就抛 `deletedMachineMessage`）。
+ * 地址变了（登录用户可能跟着变）cwd 按新配置重算，没变照旧用 entry 的。
+ */
+function liveRemountTarget(sessionId: string, entry: { profile: AgentProfile; cwd: string; localDir?: string }): { remote: RemoteTarget | undefined; cwd: string } {
+  const remote = liveSessionRemote(entry.profile.remote);
+  const before = entry.profile.remote?.sshHost || '';
+  const cwd = remote?.sshHost && remote.sshHost !== before
+    ? sessionCwd({ ...entry.profile, remote }, entry.localDir || localDirOrSessionDir(sessionId))
+    : entry.cwd;
+  return { remote, cwd };
+}
+
+/** 显示用：设置里现在的名字（删了 / 认不出就退回快照里的名字或 host）。 */
+function sessionRemoteLabel(remote: RemoteTarget | null | undefined): string {
+  const r = sessionRemote(remote).remote;
+  if (!r?.sshHost) return '';
+  return String(r.label || '').trim() || labelForHost(KIROLEX_CONFIG_PATH, r.sshHost);
+}
 
 /** ONE shared copy of the renderer's UI state (project groups, split layout,
  *  settings, panel widths…).
@@ -5704,7 +5779,7 @@ function sessionCallInfo(rec: store.SessionRecord, busy: Set<string>): SessionIn
     title: rec.title || 'New Chat',
     ...(rec.profile?.projectId ? { projectId: rec.profile.projectId } : {}),
     engine: rec.profile?.engine || 'kiro',
-    location: host ? (labelForHost(KIROLEX_CONFIG_PATH, host) || host) : null,
+    location: host ? (sessionRemoteLabel(rec.profile?.remote) || host) : null,
     busy: busy.has(rec.id),
     archived: !!rec.archived,
   };
@@ -6894,7 +6969,7 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
     const rec = store.readRecord(p.id);
     const r = await offloadSession(bucketOps(creds), {
       prefix: cfg.prefix, home: KIROLEX_HOME, id: p.id, stateFile: OFFLOAD_STATE_PATH, now: Date.now(), lastActiveAt: p.lastActiveAt,
-      remoteHost: rec?.profile?.remote?.sshHost ? labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) || undefined : undefined,
+      remoteHost: sessionRemoteLabel(rec?.profile?.remote) || undefined,
       /* 核对要读文件、走网络，这段时间里可能被打开 / 开始跑 —— 挪目录之前最后再问一次 */
       recheck: () => {
         if (sessionClients.has(p.id) || attachingSessions.has(p.id) || reconfiguringSessions.has(p.id)) return 'it was opened meanwhile';
@@ -11569,11 +11644,14 @@ ${hint}` : ''}` };
     const record = store.readRecord(sessionId);
     const profile = record?.profile;
     const entry = sessionClients.get(sessionId);
-    const remote = profile?.remote?.sshHost ? profile.remote : undefined;
+    /* 设置里现在的那台（机器被删了就明说，不连旧地址） */
+    const resolved = sessionRemote(profile?.remote);
+    if (resolved.deleted) return { ran: false, exitCode: null, output: '', host: 'local', durationMs: 0, timedOut: false, error: deletedMachineMessage(resolved.remote) };
+    const remote = resolved.remote?.sshHost ? resolved.remote : undefined;
     // Prefer the LIVE executor's cwd for a local session: that is the directory the
     // agent is actually working in. Fall back to the profile's resolved session cwd.
     const cwd = remote
-      ? sessionCwd(profile!, os.homedir())
+      ? sessionCwd({ ...profile!, remote }, os.homedir())
       : (entry?.cwd || (profile ? sessionCwd(profile, os.homedir()) : os.homedir()));
     verifiersInFlight.add(sessionId);
     try {
@@ -12064,9 +12142,11 @@ ${hint}` : ''}` };
     const record = store.readRecord(sessionId);
     const profile = record?.profile;
     const entry = sessionClients.get(sessionId);
-    const remote = profile?.remote?.sshHost ? profile.remote : undefined;
+    const resolved = sessionRemote(profile?.remote);
+    if (resolved.deleted) return { ran: false, exitCode: null, output: '', error: deletedMachineMessage(resolved.remote) };
+    const remote = resolved.remote?.sshHost ? resolved.remote : undefined;
     const cwd = remote
-      ? sessionCwd(profile!, os.homedir())
+      ? sessionCwd({ ...profile!, remote }, os.homedir())
       : (entry?.cwd || (profile ? sessionCwd(profile, os.homedir()) : os.homedir()));
     const result = await loopVerify.runVerifier(
       { command, timeoutSec, cwd, remote }, shellEnv, { buildSshArgs, shellQuote });
@@ -12641,9 +12721,15 @@ ${hint}` : ''}` };
     **跟着会话所在的机器走**：远程会话的执行器读的是那台机器上的 `~/.kiro`，在这台 Mac 上改
     等于什么都没改（而且看起来改成功了 —— 最难查的那种）。没有会话时按本机。
   */
+  /** 这条会话的机器在设置里被删了 → 那句删除提示；没删 / 本地 → null。 */
+  const sessionMachineGone = (sessionId?: string): string | null => {
+    if (!sessionId) return null;
+    try { kiroConfigTargetFor(sessionId); return null; } catch (err: any) { return String(err?.message || err); }
+  };
   const kiroConfigTargetFor = (sessionId?: string): RemoteTarget | undefined => {
     if (!sessionId) return undefined;
-    const r = sessionClients.get(sessionId)?.profile.remote || store.readRecord(sessionId)?.profile?.remote;
+    /* 按设置里现在的那台（连着的和没连着的都一样）；机器被删了就抛 `deletedMachineMessage`，不连旧地址 */
+    const r = liveSessionRemote(sessionClients.get(sessionId)?.profile.remote || store.readRecord(sessionId)?.profile?.remote);
     return r?.sshHost ? r : undefined;
   };
   /**
@@ -12671,6 +12757,8 @@ ${hint}` : ''}` };
     if (live?.cwd) return live.cwd;
     const rec = store.readRecord(sessionId);
     if (!rec?.localDir) return undefined;
+    /* 本地副本：remote 换成设置里现在的那台（不写回） */
+    rec.profile = { ...rec.profile, remote: sessionRemote(rec.profile?.remote).remote };
     return rec.profile?.remote?.sshHost ? sessionCwd(rec.profile, rec.localDir) : rec.localDir;
   };
   const instructionListedOk = (sessionId: string | undefined, category: string, name?: string): boolean =>
@@ -12683,6 +12771,8 @@ ${hint}` : ''}` };
   ipcMain.handle('kiro:config-list', async (_event, sessionId: string | undefined, category: string) => {
     const spec = categorySpec(category);
     if (!spec) return { ok: false, error: tr('Unknown category {category}', { category }) };
+    /* 机器在设置里删掉了：明说，不 ssh 旧地址 */
+    { const gone = sessionMachineGone(sessionId); if (gone) return { ok: false, error: gone }; }
     const target = kiroConfigTargetFor(sessionId);
     try {
       if (spec.kind === 'instructions') {
@@ -12713,6 +12803,8 @@ ${hint}` : ''}` };
   ipcMain.handle('kiro:config-read', async (_event, sessionId: string | undefined, category: string, name?: string) => {
     const spec = categorySpec(category);
     if (!spec) return { ok: false, error: tr('Unknown category {category}', { category }) };
+    /* 机器在设置里删掉了：明说，不 ssh 旧地址 */
+    { const gone = sessionMachineGone(sessionId); if (gone) return { ok: false, error: gone }; }
     const target = kiroConfigTargetFor(sessionId);
     try {
       if (spec.kind === 'instructions') {
@@ -12749,6 +12841,8 @@ ${hint}` : ''}` };
     if (!spec) return { ok: false, error: tr('Unknown category {category}', { category }) };
     const why = validateContent(spec, String(content ?? '')) || pluginWriteError(name);
     if (why) return { ok: false, error: why };
+    /* 机器在设置里删掉了：明说，不 ssh 旧地址 */
+    { const gone = sessionMachineGone(sessionId); if (gone) return { ok: false, error: gone }; }
     const target = kiroConfigTargetFor(sessionId);
     try {
       if (spec.kind === 'instructions') {
@@ -12789,6 +12883,8 @@ ${hint}` : ''}` };
       原来这里永远读写本机 `~/.kiro/agents`，而远程会话的执行器用的是那台机器上的 agent：
       在这里改了、看着保存成功了，远端什么都没变。
     */
+    /* 机器在设置里删掉了：明说，不 ssh 旧地址 */
+    { const gone = sessionMachineGone(sessionId); if (gone) return { opened: false, error: gone }; }
     const remoteT = kiroConfigTargetFor(sessionId);
     if (remoteT) {
       if (!/^[A-Za-z0-9_.-]+$/.test(agentName)) return { opened: false, error: tr('Invalid Agent name.') };
@@ -12834,6 +12930,8 @@ ${hint}` : ''}` };
       return { saved: false, error: tr('Agent configuration must be a JSON object.') };
     }
 
+    /* 机器在设置里删掉了：明说，不 ssh 旧地址 */
+    { const gone = sessionMachineGone(sessionId); if (gone) return { saved: false, error: gone }; }
     const remoteT = kiroConfigTargetFor(sessionId);
     if (remoteT) {
       if (!/^[A-Za-z0-9_.-]+$/.test(agentName) || source === 'built-in') return { saved: false, error: tr('This agent cannot be edited.') };
@@ -12953,7 +13051,7 @@ ${hint}` : ''}` };
 
     const rec0 = oldEntry ? store.readRecord(sessionId) : coldRecordFor(sessionId, hint);
     if (!oldEntry && !rec0) throw new Error(tr('Could not find the record for this session.'));
-    const currentRemote = oldEntry?.profile.remote?.sshHost || rec0?.profile?.remote?.sshHost || '';
+    const currentRemote = oldEntry?.profile.remote?.sshHost || sessionRemote(rec0?.profile?.remote).remote?.sshHost || '';
     const wasRemote = !!currentRemote;
     /*
       目标没变**而且目录也没变**才算没变化 —— 切机器时可以顺带给一个新的本地目录，
@@ -13220,7 +13318,7 @@ ${hint}` : ''}` };
       return {
         ...setDormantProfile(sessionId, {
           model: normalizedModel, preferredModel: normalizedModel,
-          modelEarnedOn: machineKeyOf(rec?.profile || {}),
+          modelEarnedOn: machineKeyOf({ remote: sessionRemote(rec?.profile?.remote).remote }),
         }, `model -> ${normalizedModel}`, rec ? notKiroModel(rec.profile) : undefined),
         model: normalizedModel,
       };
@@ -13228,6 +13326,7 @@ ${hint}` : ''}` };
     if (reconfiguringSessions.has(sessionId)) throw new Error(tr('Another model, Agent, or permission change is still in progress.'));
 
     if (oldEntry.profile.model === normalizedModel) return { ok: true, model: normalizedModel, unchanged: true };
+    const live = liveRemountTarget(sessionId, oldEntry);
 
     // Never release/reload a session while an attach is mid-flight on it --
     // that race is what produced the bare "Internal error" from kiro-cli.
@@ -13240,9 +13339,11 @@ ${hint}` : ''}` };
       ...oldEntry.profile, model: normalizedModel, preferredModel: normalizedModel,
       /* 手动选的也记机器：它同时进了 `preferredModel`，所以换机器时仍然会先试它 */
       modelEarnedOn: machineKeyOf(oldEntry.profile),
+      remote: live.remote,
     };
+    profile.modelEarnedOn = machineKeyOf(profile);
     const cliSessionId = oldEntry.cliSessionId;
-    const cwd = oldEntry.cwd;
+    const cwd = live.cwd;
     // kiro-cli enforces single-process ownership of a session: session/load on an
     // id still held by another process fails with
     //   "Failed to start session: Session is active in another process (PID n)".
@@ -13252,13 +13353,13 @@ ${hint}` : ''}` };
     const restoreOldExecutor = async () => {
       const previous = new AcpClient(
         oldEntry.profile.model, shellEnv, oldEntry.profile.kiroAgent,
-        oldEntry.profile.permissionMode, oldEntry.profile.remote, undefined, engineOf(oldEntry.profile),
+        oldEntry.profile.permissionMode, live.remote, undefined, engineOf(oldEntry.profile),
       );
       try {
         await previous.connect();
-        await withLoadTimeout(previous.loadSession(cliSessionId, cwd), loadTimeoutFor(oldEntry.profile.remote));
+        await withLoadTimeout(previous.loadSession(cliSessionId, cwd), loadTimeoutFor(live.remote));
         const restored: SessionEntry = {
-          ...oldEntry, client: previous, lastUsedAt: Date.now(),
+          ...oldEntry, profile: { ...oldEntry.profile, remote: live.remote }, cwd, client: previous, lastUsedAt: Date.now(),
           assistantBuf: '', assistantMsgId: null, fileChanges: [],
         };
         sessionClients.set(sessionId, restored);
@@ -13391,21 +13492,23 @@ ${hint}` : ''}` };
       return { ok: true, kiroAgent: normalizedAgent || '', unchanged: true };
     }
 
+    /* 新执行器按设置里现在的那台连；机器被删了就明说（旧执行器不动） */
+    const live = liveRemountTarget(sessionId, oldEntry);
     await awaitAttachIdle(sessionId);
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
-    const profile: AgentProfile = { ...oldEntry.profile, kiroAgent: normalizedAgent };
+    const profile: AgentProfile = { ...oldEntry.profile, kiroAgent: normalizedAgent, remote: live.remote };
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
     const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
-      const created = await client.newSession(oldEntry.cwd);
+      const created = await client.newSession(live.cwd);
       const nextEntry: SessionEntry = {
         client,
         cliSessionId: created.sessionId,
         profile,
-        cwd: oldEntry.cwd,
+        cwd: live.cwd,
         assistantBuf: '',
         assistantMsgId: null,
         fileChanges: [],
@@ -13481,10 +13584,12 @@ ${hint}` : ''}` };
     }
     if (reconfiguringSessions.has(sessionId)) throw new Error(tr('Another switch (model / agent / machine) has not finished yet.'));
 
+    /* 新执行器按设置里现在的那台连；机器被删了就明说（旧执行器不动） */
+    const live = liveRemountTarget(sessionId, oldEntry);
     await awaitAttachIdle(sessionId);
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
-    const profile = reshape(oldEntry.profile);
+    const profile = reshape({ ...oldEntry.profile, remote: live.remote });
     let client: AcpClient | undefined;
     let remoteModels: string[] | undefined;
     /* 旧引擎那句钉住的起法说明撤掉；新引擎要的话下面的探测重新钉上 */
@@ -13501,11 +13606,12 @@ ${hint}` : ''}` };
       const started = await connectWithModelFallback(profile, 'switch-engine', localTools, sessionId, remoteModels);
       client = started.client;
       profile.model = started.model;
-      const created = await client.newSession(oldEntry.cwd);
+      const created = await client.newSession(live.cwd);
       const nextEntry: SessionEntry = {
         ...oldEntry,
         client,
         cliSessionId: created.sessionId,
+        cwd: live.cwd,
         profile,
         assistantBuf: '',
         assistantMsgId: null,
@@ -13710,16 +13816,20 @@ ${hint}` : ''}` };
     let toolsSwapped = false;
     const prevFp = mountedComboFp.get(sessionId);
     try {
+      /* 按设置里现在的那台连（机器被删了就在这里抛，旧执行器和工具通道都还没动） */
+      const live = liveRemountTarget(sessionId, { ...oldEntry, profile });
+      profile = { ...profile, remote: live.remote };
       if (profile.remote?.sshHost) await remoteAdapterCheck(profile.remote, engineOf(profile) as 'claude' | 'codex', sessionId);
       toolsSwapped = !!profile.remote?.sshHost;
       const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
       const started = await connectWithModelFallback(profile, trigger, localTools, sessionId);
       client = started.client;
-      const created = await client.newSession(oldEntry.cwd);
+      const created = await client.newSession(live.cwd);
       const nextEntry: SessionEntry = {
         ...oldEntry,
         client,
         cliSessionId: created.sessionId,
+        cwd: live.cwd,
         profile,
         assistantBuf: '',
         assistantMsgId: null,
@@ -14489,6 +14599,8 @@ ${hint}` : ''}` };
    */
   function remoteFileFor(sessionId: string | null | undefined, rawPath: string): { target: RemoteTarget; path: string } | null {
     if (!sessionId) return null;
+    /* 机器在设置里删掉了：不当远端文件（不 ssh 旧地址） */
+    if (sessionMachineGone(sessionId)) return null;
     const target = kiroConfigTargetFor(sessionId);
     if (!target?.sshHost) return null;
     const p = stripFileUrl(rawPath).trim();
@@ -15146,6 +15258,13 @@ ${hint}` : ''}` };
         这里用记录里的值，下面「persist effective model」那段比对相等，就什么都不写。
       */
       const nonKiroAttach = engineOf(existing.profile) !== 'kiro';
+      /* 机器在设置里删掉了：在会话里明说（点开会话时 attach 的错误界面是吞掉的），不拿快照去连旧地址 */
+      const resolvedRemote = sessionRemote(existing.profile.remote);
+      if (resolvedRemote.deleted) {
+        const why = deletedMachineMessage(resolvedRemote.remote);
+        stickySessionNotice(sessionId, why, 'remote-deleted');
+        throw new Error(why);
+      }
       const profile: AgentProfile = {
         model: nonKiroAttach ? (existing.profile.model || 'default') : (model || existing?.profile.model || DEFAULT_MODEL),
         // ONLY a recorded preference, else the default. Deliberately does NOT fall
@@ -15164,8 +15283,9 @@ ${hint}` : ''}` };
         ...(existing?.profile.unassigned ? { unassigned: true as const } : {}),
         kiroAgent: existing?.profile.kiroAgent,
         // Persisted remote target survives restarts; a remote session re-attaches
-        // over SSH exactly as it was created.
-        remote: existing?.profile.remote,
+        // over SSH to the SAME machine (by id) —— 但地址、连法按设置里现在的配置（`liveSessionRemote`）：
+        // 记录里那份是建会话那一刻的快照，改成 SSM 之后还拿它去连就是连旧 IP（`sessionRemote`）。
+        remote: resolvedRemote.remote,
         /* 引擎也归记录所有 —— 这里是白名单，漏了它的话 Claude/Codex 会话一重启就变回 kiro */
         ...(existing?.profile.engine ? { engine: existing.profile.engine } : {}),
         /* 同一张白名单：漏了的话手选的模型 / effort / 模式一重连就丢（实测：选了 sonnet，重启后回到 opus） */
@@ -15177,6 +15297,8 @@ ${hint}` : ''}` };
         /* 同一张白名单：组合里老的 effort 已迁进 engineOptions（漏了的话下次又从组合读一遍，`migrateComboEffort`） */
         ...(existing?.profile.comboEffortMigrated ? { comboEffortMigrated: true as const } : {}),
       };
+      /* 设置里的配置和记录里的快照不一样了：顺手把快照换成新的（只改 profile.remote） */
+      if (profile.remote) writeRecordRemote(sessionId, profile.remote);
       if (!profile.remote?.sshHost) resolvedCwd = localCwdFor(sessionId, resolvedCwd);
       // For a remote session the executor's working directory is a REMOTE path,
       // not the local `cwd` the renderer passed in.
@@ -15320,7 +15442,8 @@ ${hint}` : ''}` };
         不用重起的（engineModels）以记录为准。从这里到下面写记录之间没有 await，记录不会再变。
       */
       const latestProfile = store.readRecord(sessionId)?.profile;
-      const drift = mountDrift(existing.profile, profile, latestProfile);
+      /* 记录里的 remote 可能还是旧快照：按同一个解析比（否则改过地址的机器每次都被当成「挂载途中换了机器」） */
+      const drift = mountDrift(existing.profile, profile, latestProfile && { ...latestProfile, remote: sessionRemote(latestProfile.remote).remote });
       if (drift) {
         logger.info('attach', `挂载途中记录被改了（${drift}）：丢掉按 ${ENGINE_LABEL[engineOf(profile)]} @ ${profile.remote?.sshHost || '本机'} 起的执行器，`
           + `按记录（${ENGINE_LABEL[engineOf(latestProfile)]} @ ${latestProfile?.remote?.sshHost || '本机'}）重起 sessionId=${sessionId}`);
@@ -15474,7 +15597,12 @@ ${hint}` : ''}` };
     const sid = String(sessionId || '').trim();
     const rec = sid ? store.readRecord(sid) : null;
     const engine = rec ? engineOf(rec.profile) : engineOf({ engine: engineArg });
-    const remote = rec ? rec.profile.remote : (remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined);
+    let remote: RemoteTarget | undefined;
+    try {
+      remote = rec ? liveSessionRemote(rec.profile.remote) : (remoteId ? findRemoteTarget(KIROLEX_CONFIG_PATH, remoteId) : undefined);
+    } catch (err: any) {
+      return { ok: false, error: String(err?.message || err) };
+    }
     /* kiro：只有本机的「没装 kiro-cli」走这里（`installLocalKiro`）；远端的 kiro-cli 照旧在设置里「安装 AI 工具」 */
     if (engine === 'kiro' && remote?.sshHost) return { ok: false, error: tr('This session does not use Claude Code or Codex.') };
     if (!rec && remoteId && !remote) {
@@ -17139,14 +17267,15 @@ ${hint}` : ''}` };
       const dir = store.sessionDirPath(sessionId);
       const rec = store.readRecord(sessionId);
       if (!rec) return { ok: false, error: tr('Session not found') };
-      const sshHost = rec.profile?.remote?.sshHost;
+      const liveRemote = sessionRemote(rec.profile?.remote).remote;
+      const sshHost = liveRemote?.sshHost;
       return {
         ok: true,
         info: {
           id: rec.id || sessionId,
           cliSessionId: sessionClients.get(sessionId)?.cliSessionId || rec.cliSessionId || undefined,
           engine: rec.profile?.engine || 'kiro',
-          remote: sshHost ? { label: labelForHost(KIROLEX_CONFIG_PATH, sshHost), sshHost } : null,
+          remote: sshHost ? { label: sessionRemoteLabel(rec.profile?.remote), sshHost } : null,
           dir,
           /*
             远程会话这一回实际拿到的本机工具 ——「会话里能看到这条会话实际拿到了哪些本机工具」。
@@ -17435,7 +17564,19 @@ ${hint}` : ''}` };
     try {
       /* 明文密码不往下传：saveRemoteTarget 只见密文 */
       const { password: _pw, clearPassword: _clr, ...rest } = input as any;
+      /* 改之前的地址：没存 id 的老会话记录只能按它认 */
+      const before = input?.id ? listRemoteTargets(KIROLEX_CONFIG_PATH).find((t) => t.id === input.id) : undefined;
       const saved = saveRemoteTarget(KIROLEX_CONFIG_PATH, { ...rest, ...passwordFields(input) });
+      /*
+        **引用这台机器的会话记录，快照跟着换** —— 连接时本来就按 id 取最新配置（`liveSessionRemote`），
+        这一步是让「配置读不了、只能用快照」那条兜底也是新的。只改 profile.remote，别的字段不碰。
+      */
+      let refreshed = 0;
+      for (const rec of store.listSessions()) {
+        const next = refreshedSnapshot(rec.profile?.remote as any, saved, before);
+        if (next && writeRecordRemote(rec.id, next)) refreshed += 1;
+      }
+      if (refreshed) logger.info('remote', `${saved.id}：${refreshed} 条会话记录里的机器快照换成了新配置`);
       logger.info('remote', `保存远端 ${saved.id} (${saved.sshHost})${saved.passwordCipher ? '，带密码' : ''}${saved.droppedLegacy ? `，切到 SSM：删掉老 agents[].remote ${saved.droppedLegacy.join(',')}` : ''}`);
       return { ok: true, target: { id: saved.id, label: saved.label, sshHost: saved.sshHost, sshPort: saved.sshPort, identityFile: saved.identityFile, proxyJump: saved.proxyJump, remoteWorkdir: saved.remoteWorkdir, bins: saved.bins, editedAt: saved.editedAt, hasPassword: !!saved.passwordCipher, connectVia: saved.connectVia, ssmInstanceId: saved.ssmInstanceId, ssmRegion: saved.ssmRegion, ssmProfile: saved.ssmProfile, ssmUseOwnKey: saved.ssmUseOwnKey }, droppedLegacy: saved.droppedLegacy };
     } catch (err: any) {
@@ -17444,8 +17585,8 @@ ${hint}` : ''}` };
   });
 
   ipcMain.handle('remote:delete', (_event, id: string) => {
-    /* 正在用这台机器的会话不受影响：它们的 remote 存在自己的 profile 里（按会话固定），
-       删掉只是让它不再出现在"新建会话"的列表里。 */
+    /* 正在连着的会话这一次不打断；之后再连（重开 / 断线重连）时按 id 找不到它，会明说
+       「这台机器已从设置里删除」（`liveSessionRemote`），不会拿记录里的快照悄悄连旧地址。 */
     const gone = deleteRemoteTarget(KIROLEX_CONFIG_PATH, id);
     logger.info('remote', `删除远端 ${id} -> ${gone ? 'ok' : '不在列表里（可能是老 agents[].remote）'}`);
     return { ok: gone, error: gone ? undefined : tr('This entry is not in the editable list (it comes from the old agents[].remote config; remove it by hand)') };
@@ -18230,7 +18371,7 @@ const controlSessionAccess: ControlSessionAccess = {
       title: rec.title,
       projectId: rec.profile?.projectId ?? null,
       busy: busy.has(rec.id),
-      remote: rec.profile?.remote?.sshHost ? (labelForHost(KIROLEX_CONFIG_PATH, rec.profile.remote.sshHost) || rec.profile.remote.sshHost) : null,
+      remote: rec.profile?.remote?.sshHost ? (sessionRemoteLabel(rec.profile.remote) || rec.profile.remote.sshHost) : null,
       archived: !!rec.archived,
       updatedAt: rec.updatedAt,
     }));

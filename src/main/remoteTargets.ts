@@ -487,3 +487,81 @@ export function labelForHost(configPath: string, sshHost: string | undefined, ho
   const hit = listRemoteTargets(configPath, home).find((t) => t.sshHost === host);
   return hit?.label || deriveLabel(host);
 }
+
+/* ------------------------------------------------- 会话里那份 remote 快照 → 设置里现在的那台 */
+
+/**
+ * 读配置里的机器列表；**读不了 / 解析不了返回 null**（和"读到了、一台都没有"分开）——
+ * `resolveSessionRemote` 靠这个区分"机器被删了"和"配置这会儿读不了，只能先用快照"。
+ */
+export function readRemoteTargets(configPath: string, home = os.homedir()): RemoteTargetEntry[] | null {
+  try {
+    return parseRemoteTargets(JSON.parse(fs.readFileSync(configPath, 'utf-8')), home);
+  } catch {
+    return null;
+  }
+}
+
+export interface SessionRemoteResolution {
+  /** 该拿去连的那份；本地会话 = undefined */
+  remote?: RemoteTarget & { id?: string; label?: string };
+  /** `config` = 设置里现在的那台；`snapshot` = 只能用会话记录里那份 */
+  source?: 'config' | 'snapshot';
+  /** 记录里的 id 在设置里已经没有了（机器被删了）—— 调用方要明说，**不许**拿快照去连旧地址 */
+  deleted?: true;
+}
+
+const portOf = (p: unknown): number => (Number(p) > 0 ? Number(p) : 22);
+
+/**
+ * **会话该连哪台：按 id 取设置里现在的配置** ——「改了设置里的机器（如切 SSM），老会话仍连旧地址」。
+ *
+ * 会话记录里的 `profile.remote` 是建会话那一刻整份目标的快照。`remoteKiroBin` 早就学过「会变的东西不要存进会话、
+ * 按 host 反查」，但只对 bins 做了；而 sshHost 本身也是会变的（直连 IP → SSM 实例 ID），按 host 反查那时也失效。
+ * 实测：aws-tokyo-4 切到 SSM 之后，老会话 preflight 还在连 99.83.165.184:22。
+ *
+ *   · 有 id：设置里有它（或被 host:port 去重成了另一条，`resolveId`）→ 整份用设置里的（连接字段一个不留快照的）；
+ *     设置里读到了、但没有这个 id → **被删了**（`deleted`），不按地址换成另一台同地址的目标（那是另一份配置）。
+ *   · 没 id 的老记录：按 sshHost + 端口认回设置里那台；认不出就用快照（判断不了是不是删了，维持原来的行为）。
+ *   · 配置读不了（`targets` 为 null）：只能用快照。
+ */
+export function resolveSessionRemote(
+  snapshot: (RemoteTarget & { id?: string }) | null | undefined,
+  targets: ReadonlyArray<RemoteTargetEntry> | null,
+  resolveId?: (id: string) => RemoteTargetEntry | undefined,
+): SessionRemoteResolution {
+  const host = String(snapshot?.sshHost || '').trim();
+  if (!snapshot || !host) return {};
+  if (!targets) return { remote: snapshot, source: 'snapshot' };
+  const id = typeof snapshot.id === 'string' && snapshot.id ? snapshot.id : '';
+  const live = id
+    ? (targets.find((t) => t.id === id) || resolveId?.(id))
+    : targets.find((t) => t.sshHost === host && portOf(t.sshPort) === portOf(snapshot.sshPort));
+  if (live) {
+    const { droppedLegacy: _d, ...rest } = live;
+    return { remote: rest, source: 'config' };
+  }
+  return id ? { remote: snapshot, source: 'snapshot', deleted: true } : { remote: snapshot, source: 'snapshot' };
+}
+
+/**
+ * **设置里存了一台机器之后，会话记录里的快照跟着换** —— 返回新快照；这条会话不引用它就返回 null。
+ *
+ * 认的是：记录里的 id 等于存下的这台，或者等于这次顺手删掉的老 `agents[].remote`（`droppedLegacy`，同一台机器）；
+ * 没 id 的老记录按**改之前**的 host + 端口认（改之后的地址它当然还不认识）。
+ */
+export function refreshedSnapshot(
+  snapshot: (RemoteTarget & { id?: string }) | null | undefined,
+  saved: RemoteTargetEntry,
+  before?: { sshHost?: string; sshPort?: number },
+): RemoteTargetEntry | null {
+  const host = String(snapshot?.sshHost || '').trim();
+  if (!snapshot || !host) return null;
+  const id = typeof snapshot.id === 'string' && snapshot.id ? snapshot.id : '';
+  const hit = id
+    ? (id === saved.id || (saved.droppedLegacy || []).includes(id))
+    : !!before?.sshHost && host === String(before.sshHost).trim() && portOf(snapshot.sshPort) === portOf(before.sshPort);
+  if (!hit) return null;
+  const { droppedLegacy: _d, ...rest } = saved;
+  return rest;
+}
