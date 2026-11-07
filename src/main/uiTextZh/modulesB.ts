@@ -239,6 +239,9 @@ export const ZH_MODULES_B: Record<string, string> = {
   // ── transientError.ts ──
   'SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools connection was not set up; retrying on another port. If it keeps happening, a leftover kiro-cli on that machine may hold the port.': 'SSH connection closed（ssh exit {code}）：远端端口 {port} 被占用，本机工具连接没建起来，会换端口重试。反复出现的话，可能是那台机器上残留的 kiro-cli 占着端口。',
   'SSH connection closed (ssh exit {code}): lost the connection to the remote. KiroLex reconnects; the turn is resent automatically only if it had produced nothing yet.': 'SSH connection closed（ssh exit {code}）：和远端的连接断了。会自动重连；这一轮还没产出时才自动重发。',
+  // ── remotePortRetry.ts ──
+  'Could not set up the local tools connection: the remote ports were all in use on that machine (tried {ports}). This is a port problem on the remote machine, not the AI. Close leftover KiroLex / kiro-cli processes there (or wait a minute), then reconnect.':
+    '本机工具连接没建起来：那台机器上的远端端口都被占着（试过 {ports}）。这是远端机器的端口问题，不是 AI 的问题。把那台机器上残留的 KiroLex / kiro-cli 进程关掉（或等一分钟），再重新连接。',
   // ── projectStore.ts ──
   'Must be an absolute path (like C:\\Users\\you\\project)': '要写绝对路径（像 C:\\Users\\你\\项目）',
   'Must be an absolute path (starting with /)': '要写绝对路径（从 / 开始）',

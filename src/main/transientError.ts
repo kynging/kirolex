@@ -40,11 +40,17 @@ export function isSshTransportExit(code: number | null | undefined): boolean {
  * 而那句 warning 就在手边。
  */
 export function sshDropMessage(code: number | null | undefined, stderr = ''): string {
-  const fwd = /remote port forwarding failed for listen port (\d+)/i.exec(String(stderr || ''));
-  if (fwd) {
-    return tr('SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools connection was not set up; retrying on another port. If it keeps happening, a leftover kiro-cli on that machine may hold the port.', { code: String(code), port: fwd[1] });
+  const port = remotePortBusyFromStderr(stderr);
+  if (port !== null) {
+    return tr('SSH connection closed (ssh exit {code}): remote port {port} is in use, so the local tools connection was not set up; retrying on another port. If it keeps happening, a leftover kiro-cli on that machine may hold the port.', { code: String(code), port: String(port) });
   }
   return tr('SSH connection closed (ssh exit {code}): lost the connection to the remote. KiroLex reconnects; the turn is resent automatically only if it had produced nothing yet.', { code: String(code) });
+}
+
+/** ssh 的 stderr 里那句「远端端口转发失败」说的是哪个端口；没有就 null（见 `remotePortRetry.ts`）。 */
+export function remotePortBusyFromStderr(stderr: string): number | null {
+  const fwd = /remote port forwarding failed for listen port (\d+)/i.exec(String(stderr || ''));
+  return fwd ? Number(fwd[1]) : null;
 }
 
 export function isTransientTransportError(text: string): boolean {

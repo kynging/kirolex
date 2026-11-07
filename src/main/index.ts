@@ -96,6 +96,7 @@ import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReaso
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { stampCliSessionOwner, pinCliSessionOwnerBeforeRetarget, cliSessionOwnerMismatch } from './cliSessionOwner.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
+import { RemotePortRetry } from './remotePortRetry.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
 import { bundleOmitsSessionContent, diagnosticPromptText, writeFailureBundle } from './failureBundle.ts';
@@ -737,7 +738,19 @@ async function connectWithModelFallback(
       try { rememberBinSuccess(KIROLEX_CONFIG_PATH, machine, 'kiro' as ToolId, client.launchedWith); } catch { /* 记不住不该影响连接 */ }
     }
   };
-  for (const model of candidates) {
+  /*
+    **远端端口被占：换端口重试同一个模型，不换模型候选**（`remotePortRetry.ts`）——
+    实测一次 attach 里三个候选都撞同一个 39100，白等 ~30 秒后整体失败。换端口要重备本地工具
+    （端口写在远端配置里），用的是这条会话上次 `ensureLocalTools` 的那个目录。
+  */
+  const toolsDir = sessionId ? localToolsDirBySession.get(sessionId) : undefined;
+  const portRetry = new RemotePortRetry({
+    localTools,
+    rearm: sessionId && toolsDir !== undefined ? remotePortRearm(sessionId, profile, toolsDir) : undefined,
+    log: (m) => logger.warn('model', `${label}: ${m}`),
+  });
+  for (let i = 0; i < candidates.length; i += 1) {
+    const model = candidates[i];
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
@@ -771,8 +784,16 @@ async function connectWithModelFallback(
       return { client, model };
     } catch (err: any) {
       lastError = err;
-      logger.warn('model', `${label}: model '${model}' failed to start: ${err?.message || err}`);
       try { await client.disconnect(); } catch {}
+      /* 端口被占：换了端口就再试**同一个**模型；端口试完了就停（别的候选也一样撞那几个端口） */
+      try {
+        if (await portRetry.retryOnNewPort(err)) { localTools = portRetry.localTools; i -= 1; continue; }
+      } catch (busy) {
+        lastError = busy;
+        logger.warn('model', `${label}: ${(busy as Error)?.message || busy}`);
+        break;
+      }
+      logger.warn('model', `${label}: model '${model}' failed to start: ${err?.message || err}`);
     }
   }
   /* 一个都没起来：挑过的备用模型也不算数，不写"改用了 X" */
@@ -2165,6 +2186,8 @@ function unpinSessionNotice(sessionId: string, prefix: string): void {
 let localMcpServer: LocalMcpServer | undefined;
 type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[]; awaitingForward?: string[]; httpEntries?: HttpMcpEntry[]; direct?: string[] };
 const localToolsBySession = new Map<string, LocalToolsSpec>();
+/** 远程会话上次备本地工具时用的本机目录：远端端口被占、要换端口重备一次时用（`remotePortRearm`）。 */
+const localToolsDirBySession = new Map<string, string>();
 /** 正在 `ensureLocalTools` 里等转发 MCP 就绪的会话：这段时间的状态变化由那边统一说，`forwardProxyState` 不重复说。 */
 const forwardGating = new Set<string>();
 
@@ -2775,10 +2798,13 @@ async function ensureLocalTools(
   sessionId: string,
   profile: AgentProfile,
   localDir: string,
+  /** 这次启动里已经撞过「远端端口被占」的端口：分端口时一并避开（见 `remotePortRearm`） */
+  avoidPorts: number[] = [],
 ): Promise<{ remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[] } | undefined> {
   const remote = profile.remote;
   /* 本地会话：组合里的 MCP 之外再挂 kirolex-local（定时 / 后台命令，开关开着时还有浏览器，见 `withLocalBrowser`） */
   if (!remote?.sshHost) return withLocalBrowser(sessionId, localComboTools(sessionId, profile));
+  localToolsDirBySession.set(sessionId, localDir);
   try {
     const server = await ensureLocalMcpServer();
     const agentOverride = sessionAgentName(sessionId, OWNER);
@@ -2830,6 +2856,7 @@ async function ensureLocalTools(
       const used = [
         ...[...localToolsBySession.values()].map((v) => v.remotePort),
         ...[...sessionClients.values()].map((e) => e.client.forwardedRemotePort).filter((p): p is number => typeof p === 'number'),
+        ...avoidPorts,
         ...remoteBusy,
       ];
       remotePort = allocateRemotePort(used);
@@ -3040,6 +3067,27 @@ async function ensureLocalTools(
     logger.warn('localmcp', `准备失败 sessionId=${sessionId}: ${err?.message || err}`);
     return undefined;
   }
+}
+
+/**
+ * **远端端口被占时换一个** —— 交给 `connectWithModelFallback`（`remotePortRetry.ts`）：撞了就换端口重试同一个模型。
+ *
+ * 端口写在远端那份会话 agent / mcpServers 的 URL 里，所以换端口 = 避开撞过的那些、把 `ensureLocalTools` 重跑一遍。
+ * 第一次换之前顺手清一次远端残留（`sweepRemoteExecutors`：只认本机标签、不碰正连着的和正在 attach 的那条）。
+ * 复用连接的端口由 sshd 分，撞不上同一个，不走这里；本地会话没有远端端口。
+ */
+function remotePortRearm(sessionId: string, profile: AgentProfile, localDir: string)
+  : ((avoid: number[]) => ReturnType<typeof ensureLocalTools>) | undefined {
+  const remote = profile.remote;
+  if (!remote?.sshHost || muxSupported()) return undefined;
+  let swept = false;
+  return async (avoid) => {
+    if (!swept) {
+      swept = true;
+      await sweepRemoteExecutors(remote, `远端端口 ${avoid.join(', ')} 被占`);
+    }
+    return ensureLocalTools(sessionId, profile, localDir, avoid);
+  };
 }
 
 /**
@@ -3262,6 +3310,7 @@ setInterval(() => {
 function releaseLocalTools(sessionId: string, remote?: RemoteTarget, opts: { keepToken?: boolean } = {}): void {
   const spec = localToolsBySession.get(sessionId);
   localToolsBySession.delete(sessionId);
+  localToolsDirBySession.delete(sessionId);
   muxUsers.delete(sessionId);
   /* 换运行位置（远程 → 本机）时 token 已经交给了新执行器：只停中转，不作废（见 `releaseSessionTools`） */
   releaseSessionTools(localMcpServer, sessionId, { keepToken: opts.keepToken });

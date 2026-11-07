@@ -1,4 +1,4 @@
-import { spawn, execFile, ChildProcess } from 'child_process';
+import { spawn as nodeSpawn, execFile, ChildProcess } from 'child_process';
 import { EventEmitter } from 'events';
 import * as fs from 'fs';
 import * as os from 'os';
@@ -10,7 +10,7 @@ import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, adapterAuthMessage, adapterMissingMessage, isAuthRequiredError, resolveAdapter, type Engine } from './engines.ts';
 import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
 import { ADAPTER_TAG_ENV } from './remoteLocalTools.ts';
-import { isSshTransportExit, sshDropMessage } from './transientError.ts';
+import { isSshTransportExit, remotePortBusyFromStderr, sshDropMessage } from './transientError.ts';
 import { tr, trConcat } from './uiText.ts';
 import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
 import { findEffortOption } from './engineEffort.ts';
@@ -94,6 +94,12 @@ let remoteBinResolver: ((sshHost: string) => string | undefined) | undefined;
 
 export function setRemoteBinResolver(fn?: (sshHost: string) => string | undefined): void {
   remoteBinResolver = fn;
+}
+
+/** 起执行器进程用的 `spawn`。只给测试换成假 ssh（`tests/remotePortRetry.test.ts`）；不传就恢复。 */
+let spawn: typeof nodeSpawn = nodeSpawn;
+export function setSpawnForTests(fn?: typeof nodeSpawn): void {
+  spawn = fn || nodeSpawn;
 }
 
 /** 这台远端机器该用哪条命令：先看配置（现查），再退回记录里那份快照。 */
@@ -478,12 +484,24 @@ export class AcpClient extends EventEmitter {
           那是掉线，不是"这条对话在后端坏了" —— 说成后者会让恢复逻辑去重建会话，而重建对掉线
           毫无用处，只会把后端那段历史白扔一次。判据在 `transientError.ts`。
         */
-        this.rejectAllPending(new Error(code === 0
+        const sshDrop = !!this.remote?.sshHost && isSshTransportExit(code);
+        const exitErr = new Error(code === 0
           ? tr('The executor exited normally (code 0); KiroLex reconnects automatically.')
-          : this.remote?.sshHost && isSshTransportExit(code)
+          : sshDrop
             ? sshDropMessage(code, this.lastStderr)
             /* Claude Code / Codex 一起来就退（没 node、node 版本不对、配置坏了）：原因只在 stderr 里，带上最后几行 */
-            : `Process exited with code ${code}${this.engine !== 'kiro' ? adapterExitDetail(this.lastStderr) : ''}`));
+            : `Process exited with code ${code}${this.engine !== 'kiro' ? adapterExitDetail(this.lastStderr) : ''}`);
+        /* 远端反向端口被占：挂上端口，启动那边据此换端口重试同一个模型（`remotePortRetry.ts`） */
+        const busyPort = sshDrop ? remotePortBusyFromStderr(this.lastStderr) : null;
+        if (busyPort !== null) Object.assign(exitErr, { remotePortBusy: busyPort });
+        this.rejectAllPending(exitErr);
+        /*
+          **initialize 还没发出去就退了也要把这个错交给 `connect`** —— initialize 要等 500ms 才发，
+          端口被占时 ssh 几十毫秒就退，那时没有在飞的请求，上面那句什么都拒不到；不在这里拒的话
+          500ms 后拿到的是一句不带端口的"没连着"，换端口那一步认不出来，又去换模型撞同一个端口。
+          连上之后再退出时这个 promise 早已定了，这里是空操作。
+        */
+        reject(exitErr);
       });
 
       this.process.on('error', (err: NodeJS.ErrnoException) => {
@@ -540,8 +558,9 @@ export class AcpClient extends EventEmitter {
     this.process = null;
     if (proc) {
       const exited = new Promise<void>((resolve) => {
-        // 删除时进程可能早就退了（close 已经发过），别白等 5 秒
-        if (opts.killTree && (proc.exitCode !== null || proc.signalCode !== null)) { resolve(); return; }
+        /* 进程可能早就退了（close 已经发过），别白等 5 秒 —— 删除时如此，启动失败后收尾也如此
+           （远端端口被占时 ssh 秒退，候选循环接着 disconnect 再换端口，见 `remotePortRetry.ts`）。活进程照旧等它干净退出。 */
+        if (proc.exitCode !== null || proc.signalCode !== null) { resolve(); return; }
         proc.once('close', () => resolve());
       });
       /*
