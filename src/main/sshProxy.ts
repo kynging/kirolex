@@ -17,13 +17,14 @@
  * 跳板可以带端口：`ec2-user@1.2.3.4:2222`。
  */
 
-import { execFile } from 'child_process';
+import { execFile, execFileSync } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import type { RemoteTarget } from './config';
 import { tr, trConcat } from './uiText.ts';
+import { logger } from './logger.ts';
 
 /**
  * 包一层单引号给 `/bin/sh` —— `ProxyCommand` 的值是交给 shell 跑的，
@@ -442,12 +443,96 @@ export function generateEd25519(comment = 'kirolex-ssm'): { pem: string; pub: st
   };
 }
 
+/* ------------------------------------------------- Windows：临时私钥的 ACL */
+
+/**
+ * **Windows 上 0600 不算数** —— KYN-DESKTOP 实测：私钥继承了 `~/.kirolex` 的 ACL（里面有 `CodexSandboxUsers:(RX)`），
+ * Win32-OpenSSH 报 `Bad permissions … This private key will be ignored`，然后 `Permission denied (publickey)`。
+ * 手动 `icacls <key> /inheritance:r /grant:r <自己>:F` 之后同一条命令就通了。
+ *
+ * 所以 win32 下：先建一个**空**私钥文件 → `icacls` 去掉继承、只留当前用户 / SYSTEM / Administrators 完全控制
+ * （Win32-OpenSSH 认这三个）→ 再把内容写进去（`r+` 打开已有文件，ACL 不变）。没有"内容已写入、ACL 还宽"的窗口。
+ *
+ * 账号一律用 **SID**（`*S-1-5-…`）：中文系统里组名是本地化的，按名字写会对不上。当前用户的 SID 来自
+ * `whoami /user`；问不到才退回 `%USERDOMAIN%\%USERNAME%`。`icacls` / `whoami` 用 `%SystemRoot%\System32` 下的绝对路径。
+ */
+export interface SsmKeyDeps {
+  platform: NodeJS.Platform;
+  env: NodeJS.ProcessEnv;
+  /** 同步跑一条命令，返回 stdout；失败就抛（`ensureSsmKey` 是同步的 —— `buildSshArgs` 是同步的）。 */
+  execFileSync: (file: string, args: string[]) => string;
+  log: (message: string) => void;
+}
+const DEFAULT_KEY_DEPS: SsmKeyDeps = {
+  platform: process.platform,
+  env: process.env,
+  execFileSync: (file, args) => String(execFileSync(file, args, { encoding: 'utf8', windowsHide: true, timeout: 15_000 })),
+  log: (message) => logger.warn('remote', message),
+};
+let keyDeps: SsmKeyDeps = DEFAULT_KEY_DEPS;
+/** 已经收紧过 ACL 的私钥（这个进程里每把只做一次）。 */
+const aclTightened = new Set<string>();
+let userSidCache: string | undefined;
+
+/** 测试用：换掉平台 / 跑命令 / 写日志（不传 = 恢复默认）。 */
+export function setSsmKeyDeps(d?: Partial<SsmKeyDeps>): void {
+  keyDeps = { ...DEFAULT_KEY_DEPS, ...(d || {}) };
+  aclTightened.clear();
+  userSidCache = undefined;
+  keyCache.clear();
+}
+
+function system32(name: string): string {
+  const root = String(keyDeps.env.SystemRoot || keyDeps.env.SYSTEMROOT || keyDeps.env.windir || 'C:\\Windows').replace(/[\\/]+$/, '');
+  return `${root}\\System32\\${name}`;
+}
+
+/** `icacls` 里的"当前用户"：`*<SID>`，问不到 SID 时 `<域>\<用户名>`。 */
+function currentUserPrincipal(): string {
+  if (!userSidCache) {
+    try {
+      const out = keyDeps.execFileSync(system32('whoami.exe'), ['/user', '/fo', 'csv', '/nh']);
+      userSidCache = /S-1-5-[0-9-]+/.exec(out)?.[0];
+    } catch { /* 退回用户名 */ }
+  }
+  if (userSidCache) return `*${userSidCache}`;
+  const user = keyDeps.env.USERNAME || os.userInfo().username;
+  return keyDeps.env.USERDOMAIN ? `${keyDeps.env.USERDOMAIN}\\${user}` : user;
+}
+
+/**
+ * 把一个文件的 ACL 收紧成"只有当前用户（+ SYSTEM、Administrators）完全控制、不继承"。
+ * 非 win32 什么都不做（那边靠 0600）。失败就抛。
+ */
+export function tightenKeyAcl(file: string): void {
+  if (keyDeps.platform !== 'win32') return;
+  keyDeps.execFileSync(system32('icacls.exe'), [
+    file, '/inheritance:r',
+    '/grant:r', `${currentUserPrincipal()}:F`, '*S-1-5-18:F', '*S-1-5-32-544:F',
+  ]);
+  aclTightened.add(file);
+}
+
+/** 写一把新私钥：win32 下先建空文件、收紧 ACL，再写内容。收紧失败就抛（调用方删掉它）。 */
+function writePrivateKey(file: string, pem: string): void {
+  if (keyDeps.platform !== 'win32') {
+    fs.writeFileSync(file, pem, { mode: 0o600 });
+    try { fs.chmodSync(file, 0o600); } catch { /* 只认只读位的文件系统 */ }
+    return;
+  }
+  fs.writeFileSync(file, '', { flag: 'wx' });
+  tightenKeyAcl(file);
+  /* `r+`：打开已有文件写入，不重建 —— ACL 保持刚收紧的样子 */
+  fs.writeFileSync(file, pem, { flag: 'r+' });
+}
+
 /**
  * 这台机器的临时密钥：12 小时内复用同一把，过期（或文件不见了）就换一把。
  *
- * 目录 0700、私钥 0600（ssh 对太宽的私钥权限直接拒用）。**文件名带时间戳、换钥匙不覆盖旧文件**：
- * 一条连接的 ProxyCommand 推的公钥和它 `-i` 读的私钥必须是同一把，原地覆盖的话换钥匙那一瞬
- * 正在建的连接会对不上。旧文件过了两个周期再删。私钥内容不进日志、不进 config.json。
+ * 目录 0700、私钥 0600（ssh 对太宽的私钥权限直接拒用）；Windows 上 0600 无效，改用 ACL（见上面 `tightenKeyAcl`）——
+ * 复用期内的旧私钥也先收紧一次（老版本写出来的那几把就是继承了宽 ACL 的），收紧失败就换一把新的并写日志。
+ * **文件名带时间戳、换钥匙不覆盖旧文件**：一条连接的 ProxyCommand 推的公钥和它 `-i` 读的私钥必须是同一把，
+ * 原地覆盖的话换钥匙那一瞬正在建的连接会对不上。旧文件过了两个周期再删。私钥内容不进日志、不进 config.json。
  */
 export function ensureSsmKey(remote: KeyFields, now = Date.now()): SsmKey {
   const dir = ssmKeyDir(remote);
@@ -461,17 +546,34 @@ export function ensureSsmKey(remote: KeyFields, now = Date.now()): SsmKey {
   const stamps = names.map((n) => /^k-(\d+)$/.exec(n)).filter(Boolean).map((m) => Number(m![1])).sort((a, b) => b - a);
   /* 重启之后接着用盘上那把还没过期的 */
   const fresh = stamps.find((t) => t <= now && now - t < SSM_KEY_TTL_MS && fs.existsSync(path.join(dir, `k-${t}.pub`)));
-  let key: SsmKey;
+  let key: SsmKey | undefined;
   if (fresh !== undefined) {
     const privateKey = path.join(dir, `k-${fresh}`);
-    key = { privateKey, publicKey: fs.readFileSync(`${privateKey}.pub`, 'utf8').trim(), createdAt: fresh };
-  } else {
+    let usable = true;
+    if (keyDeps.platform === 'win32' && !aclTightened.has(privateKey)) {
+      try { tightenKeyAcl(privateKey); } catch (err: any) {
+        usable = false;
+        keyDeps.log(`SSM 临时私钥 ${privateKey} 的权限收紧失败（${String(err?.message || err).trim().slice(0, 200)}）—— 换一把新的`);
+      }
+    }
+    if (usable) key = { privateKey, publicKey: fs.readFileSync(`${privateKey}.pub`, 'utf8').trim(), createdAt: fresh };
+  }
+  if (!key) {
     const { pem, pub } = generateEd25519();
-    const privateKey = path.join(dir, `k-${now}`);
-    fs.writeFileSync(privateKey, pem, { mode: 0o600 });
-    try { fs.chmodSync(privateKey, 0o600); } catch { /* 同上 */ }
+    /* 刚收紧失败换钥匙时，同一毫秒的文件名可能就是那把旧的 —— 往后挪到一个没人用的 */
+    let at = now;
+    while (fs.existsSync(path.join(dir, `k-${at}`))) at += 1;
+    const privateKey = path.join(dir, `k-${at}`);
+    try {
+      writePrivateKey(privateKey, pem);
+    } catch (err: any) {
+      /* 新的也收紧不了：别留一把权限宽的私钥在盘上，照实报出去（ssh 反正会拒用它） */
+      try { fs.rmSync(privateKey, { force: true }); } catch { /* 删不掉也只能这样 */ }
+      keyDeps.log(`SSM 临时私钥 ${privateKey} 的权限收紧失败：${String(err?.message || err).trim().slice(0, 200)}`);
+      throw new Error(tr('Could not restrict the permissions of the temporary SSH key {file} ({err}).', { file: privateKey, err: String(err?.message || err).trim().slice(0, 200) }));
+    }
     fs.writeFileSync(`${privateKey}.pub`, `${pub}\n`, { mode: 0o600 });
-    key = { privateKey, publicKey: pub, createdAt: now };
+    key = { privateKey, publicKey: pub, createdAt: at };
   }
   for (const t of stamps) {
     if (now - t >= 2 * SSM_KEY_TTL_MS) {

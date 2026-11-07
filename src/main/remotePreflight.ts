@@ -361,7 +361,12 @@ function sshFailure(stderr: string, remote: RemoteTarget): { why: string; hint: 
     if (ssm) return ssm;
   }
   if (/UNPROTECTED PRIVATE KEY FILE|bad permissions/i.test(s)) {
-    const key = remote.identityFile || tr('<private key path>');
+    /*
+      ssh 自己说了是哪个文件（`Permissions for '<file>' are too open`）就用它 —— SSM 的临时私钥不是 identityFile。
+      用户自己的私钥 KiroLex 不去改它的权限，只把命令给出来。
+    */
+    const named = /Permissions for '([^']+)' are too open/i.exec(s)?.[1];
+    const key = named || remote.identityFile || tr('<private key path>');
     const cmd = process.platform === 'win32'
       ? `icacls "${key}" /inheritance:r /grant:r "${currentUser()}:R"`
       : `chmod 600 "${key}"`;
