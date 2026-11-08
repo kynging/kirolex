@@ -145,6 +145,7 @@ export const ZH_MODULES_A: Record<string, string> = {
   'Authentication failed: HTTP {status}. Check the key configured on this machine': '鉴权失败：HTTP {status}，请检查本机配置的密钥',
   'Upstream asked for a redirect (HTTP {status}), which is not followed for security. Check the URL configured on this machine': '上游要求跳转（HTTP {status}），出于安全不跟随，请检查本机配置的网址',
   'Request failed: HTTP {status}': '请求失败：HTTP {status}',
+  'Upstream rejected this request: HTTP {status} (JSON-RPC {code})': '上游拒绝了这一条请求：HTTP {status}（JSON-RPC {code}）',
   'Timed out: no reply from upstream within {ms}ms': '超时：{ms}ms 内上游没有回复',
   'Bad response: the upstream reply exceeds {n} bytes': '响应解析失败：上游回复超过 {n} 字节',
   'Bad response: disconnected while reading the upstream reply ({why})': '响应解析失败：读取上游回复时断开（{why}）',

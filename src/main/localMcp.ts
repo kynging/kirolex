@@ -1074,11 +1074,33 @@ class UpstreamError extends Error {
   sessionGone: boolean;
   /** 失效时这条请求**实际带着的** session id —— 用来分辨"失效的是不是当前这个会话"。 */
   staleSession: string | null;
-  constructor(message: string, sessionGone = false, staleSession: string | null = null) {
+  /**
+   * 这次失败能不能说明**上游不可用**（交给 `onProxyFail` → 后台探测 → 会话提示）。网络错误 / 超时 / 5xx / 配置错误 /
+   * 会话重建后仍被拒 = 是；上游对**这一条请求**回 4xx（方法不支持、协议版本不支持、参数不对、鉴权…）= 不是 ——
+   * 它好好地在答话，只是不接这一条（见 `HttpProxy.send`：initialize 失败另算）。
+   */
+  unavailable: boolean;
+  /** 上游回的是 4xx + JSON-RPC 错误体：原样（状态码 + 正文，密钥抹掉）转回给远端，让它自己处理（例如 server/discover 被拒就退回 initialize）。 */
+  passthrough?: ProxyPassthrough;
+  constructor(message: string, sessionGone = false, staleSession: string | null = null, extra: { unavailable?: boolean; passthrough?: ProxyPassthrough } = {}) {
     super(message);
     this.sessionGone = sessionGone;
     this.staleSession = staleSession;
+    this.unavailable = extra.unavailable ?? true;
+    this.passthrough = extra.passthrough;
   }
+}
+
+/** 原样转回给远端的那份上游回复。 */
+export interface ProxyPassthrough { status: number; contentType: string; body: string }
+
+/** 正文是不是一条（或一批）JSON-RPC 错误回复 —— 是的话它是上游的**业务**回答，不是「上游挂了」。 */
+export function jsonRpcErrorBody(text: string): any | null {
+  let j: any;
+  try { j = JSON.parse(String(text || '')); } catch { return null; }
+  const one = (x: any) => !!x && typeof x === 'object' && x.jsonrpc === '2.0' && !!x.error && typeof x.error.code === 'number';
+  if (Array.isArray(j) ? j.length > 0 && j.every(one) : one(j)) return j;
+  return null;
 }
 
 /**
@@ -1230,7 +1252,7 @@ export class HttpProxy implements ForwardProxy {
    * 和 `call` 一样转发，但同时交出失败原因。远端的通知没处可回错（本地服务照样回 202），
    * 而探测必须知道 `notifications/initialized` 有没有真的发成功 —— 否则握手失败会被报成可用。
    */
-  async send(msg: any, timeoutMs = this.timeoutMs): Promise<{ answer: any | null; error: string | null }> {
+  async send(msg: any, timeoutMs = this.timeoutMs): Promise<{ answer: any | null; error: string | null; unavailable?: boolean; passthrough?: ProxyPassthrough }> {
     const id = msg?.id;
     const isNote = id === undefined;
     try {
@@ -1273,7 +1295,7 @@ export class HttpProxy implements ForwardProxy {
         try {
           out = await this.post(msg, headers, timeoutMs);
         } catch (e2: any) {
-          if (e2 instanceof UpstreamError && e2.sessionGone) throw new UpstreamError(tr('Session expired, and upstream still rejects it after re-creating'));
+          if (e2 instanceof UpstreamError && e2.sessionGone) throw new UpstreamError(tr('Session expired, and upstream still rejects it after re-creating'), false, null, { unavailable: true });
           throw e2;
         }
       }
@@ -1282,8 +1304,14 @@ export class HttpProxy implements ForwardProxy {
     } catch (e: any) {
       const reason = e instanceof UpstreamError ? e.message : tr('Forwarding failed: {why}', { why: String(e?.message || e) });
       const answer = this.fail(id, reason);
-      this.say('warn', `${isNote ? `通知 ${msg?.method} ` : ''}${answer.error.message}`);
-      return { answer: isNote ? null : answer, error: answer.error.message };
+      const passthrough = e instanceof UpstreamError ? e.passthrough : undefined;
+      /*
+        算不算上游不可用：网络 / 超时 / 5xx / 配置 / 重建后仍被拒（`UpstreamError.unavailable`），以及 initialize 本身失败
+        （没有 JSON-RPC 错误体的那种：连握手都不成）。上游对这一条请求的业务回答（passthrough）一律不算。
+      */
+      const unavailable = !passthrough && (!(e instanceof UpstreamError) || e.unavailable || msg?.method === 'initialize');
+      this.say(unavailable ? 'warn' : 'info', `${isNote ? `通知 ${msg?.method} ` : ''}${answer.error.message}${unavailable ? '' : '（这一条不成，不算上游不可用）'}`);
+      return { answer: isNote ? null : (passthrough ? (jsonRpcErrorBody(passthrough.body) ?? answer) : answer), error: answer.error.message, unavailable, passthrough };
     }
   }
 
@@ -1346,11 +1374,36 @@ export class HttpProxy implements ForwardProxy {
       if (res.status < 200 || res.status >= 300) {
         const text = await this.readText(res, ac, timeoutMs).catch(() => '');
         this.say('warn', `上游回 HTTP ${res.status}（${msg?.method ?? '?'}${sentSession ? '，带着 session id' : '，没带 session id'}）：${upstreamErrorKind(text)}`);
-        if (msg?.method !== 'initialize' && ((res.status === 404 && sentSession) || ((res.status === 400 || res.status === 404) && sessionGoneText(text)))) {
+        /*
+          **会话失效只在确认时才认**：这条请求带了 session id，并且正文明确说会话无效 / 过期 / 未初始化，或者是裸 404（见下）。
+          第 8 轮：context7 对一条**没带** session id 的 server/discover 回 400（协议版本不支持），上一轮的判据会把它也往
+          「会话失效」上靠 —— 没带 session id 就没有会话可失效，重建只是多余的一来一回。
+        */
+        /*
+          **4xx + JSON-RPC 错误体 = 上游对这一条请求的业务回答**（-32020 协议版本不支持、-32601 方法不存在、-32602 参数不对…）。
+          原样转回（状态码 + 正文；正文里出现过的本机密钥抹掉），不算上游不可用：它在好好答话。
+          远端客户端拿到原样的 400 才能走它自己的降级（server/discover 不行就 initialize）。
+          **先认它、再认会话失效**：带着 session id 的 404 + -32601（方法不存在）也是业务回答，不能被当成会话没了去重建。
+        */
+        const rpcErr = res.status >= 400 && res.status < 500 ? jsonRpcErrorBody(text) : null;
+        /* 会话失效：带了 session id，并且正文明确说会话无效 / 过期 / 未初始化（400 / 404），或者是一个没有 JSON-RPC 错误体的裸 404 */
+        if (msg?.method !== 'initialize' && sentSession
+          && (((res.status === 400 || res.status === 404) && sessionGoneText(text)) || (res.status === 404 && !rpcErr))) {
           throw new UpstreamError(tr('Session expired: HTTP {status}', { status: res.status }), true, sentSession);
         }
+        if (rpcErr) {
+          const code = Array.isArray(rpcErr) ? rpcErr[0]?.error?.code : rpcErr.error.code;
+          throw new UpstreamError(tr('Upstream rejected this request: HTTP {status} (JSON-RPC {code})', { status: res.status, code: String(code) }), false, null, {
+            unavailable: false,
+            passthrough: { status: res.status, contentType: 'application/json', body: this.scrub(text) },
+          });
+        }
         if (res.status === 401 || res.status === 403) {
-          throw new UpstreamError(tr('Authentication failed: HTTP {status}. Check the key configured on this machine', { status: res.status }));
+          throw new UpstreamError(tr('Authentication failed: HTTP {status}. Check the key configured on this machine', { status: res.status }), false, null, { unavailable: false });
+        }
+        if (res.status >= 400 && res.status < 500) {
+          /* 其余 4xx（没有 JSON-RPC 错误体）：这一条不成，也不说明上游挂了 */
+          throw new UpstreamError(tr('Request failed: HTTP {status}', { status: res.status }), false, null, { unavailable: false });
         }
         if (res.status >= 300 && res.status < 400) {
           throw new UpstreamError(tr('Upstream asked for a redirect (HTTP {status}), which is not followed for security. Check the URL configured on this machine', { status: res.status }));
@@ -1695,20 +1748,25 @@ export function startLocalMcp(deps: LocalMcpDeps, port = 0): Promise<LocalMcpSer
           `send` 的 error）→ `onProxyFail`，主进程据此重新开始退避探测（已挂上的上游中途掉线也能自己恢复）。
           上游正常答了一个 JSON-RPC error（工具自己报错）不算掉线。
         */
+        /* 单条请求被上游业务性拒绝（4xx + JSON-RPC 错误体）时，原样写回的那份 */
+        let passBack: ProxyPassthrough | undefined;
         const route = (one: any): Promise<any | null> => {
           if (!proxy) return handleRpc(one, session, deps);
           if (!(proxy instanceof HttpProxy)) return proxy.call(one);
-          return proxy.send(one).then(({ answer, error }) => {
+          return proxy.send(one).then(({ answer, error, unavailable, passthrough }) => {
             try {
-              if (error) deps.onProxyFail?.(session.sessionId, proxyName!, error);
-              else if (answer && typeof answer === 'object' && !answer.error) deps.onProxyOk?.(session.sessionId, proxyName!);
+              /* 只有真的说明上游不可用的失败才进「转发失败 → 后台探测 → 提示」；这一条被上游拒了不算 */
+              if (error && unavailable) deps.onProxyFail?.(session.sessionId, proxyName!, error);
+              else if (!error && answer && typeof answer === 'object' && !answer.error) deps.onProxyOk?.(session.sessionId, proxyName!);
             } catch { /* 记状态出错不能连累转发 */ }
+            if (passthrough && !Array.isArray(msg)) passBack = passthrough;
             return answer;
           });
         };
         const out = Array.isArray(msg)
           ? (await Promise.all(msg.map(route))).filter(Boolean)
           : await route(msg);
+        if (passBack) { res.writeHead(passBack.status, { 'content-type': passBack.contentType }).end(passBack.body); return; }
         if (out === null || (Array.isArray(out) && out.length === 0)) { res.writeHead(202).end(); return; }
         res.writeHead(200, { 'content-type': 'application/json' }).end(JSON.stringify(out));
       } catch (err: any) {

@@ -93,11 +93,15 @@ describe('上游会话过期（400「session 失效」）：转发层透明重�
     try {
       const token = server.register({ sessionId: 's1', workdir: process.cwd() });
       server.setProxies('s1', [{ type: 'http', name: 'context7', url: up.url }]);
-      const r: any = await (await fetch(`http://127.0.0.1:${server.port()}/mcp/${token}/context7`, {
-        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify({ jsonrpc: '2.0', id: 1, method: 'tools/list' }),
-      })).json();
+      const post = async (body: any) => (await fetch(`http://127.0.0.1:${server.port()}/mcp/${token}/context7`, {
+        method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
+      })).json() as any;
+      /* 先握手拿到 session id（第 8 轮起，没带 session id 的 400 不算会话失效，见下面的 server/discover 那组） */
+      await post({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'cc', version: '1' } } });
+      const r = await post({ jsonrpc: '2.0', id: 1, method: 'tools/list' });
       assert.ok(r.error);
-      assert.deepEqual(fails, ['context7']);
+      assert.equal(up.inits(), 2, '重建了一次');
+      assert.deepEqual(fails, ['context7'], '重建后仍被拒：这才算上游不可用');
     } finally { server.stop(); await up.close(); }
   });
 

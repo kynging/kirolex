@@ -257,19 +257,24 @@ describe('HttpProxy：只在明确的会话失效时重建', () => {
     } finally { await up.close(); }
   });
 
-  test('400「No valid session ID provided」是明确的会话失效：重建一次再重试', async () => {
+  test('400「No valid session ID provided」是明确的会话失效（这条请求带着 session id）：重建一次再重试', async () => {
     let inits = 0;
+    let rejected = 0;
     const up = await fakeUpstream((req, body, res) => {
       if (body?.method === 'initialize') inits++;
-      if (body?.method === 'tools/list' && inits < 1) { res.writeHead(400).end('Bad Request: No valid session ID provided'); return; }
-      wellBehaved()(req, body, res, []);
+      /* 第一个会话（sess-1）在第一次 tools/list 时被上游作废 */
+      if (body?.method === 'tools/list' && inits < 2 && req.headers['mcp-session-id'] === 'sess-1') { rejected++; res.writeHead(400).end('Bad Request: No valid session ID provided'); return; }
+      wellBehaved({ sessionId: `sess-${inits}` })(req, body, res, []);
     });
     try {
       const p = new HttpProxy({ type: 'http', name: 'mx', url: up.url }, () => {});
+      await p.call({ jsonrpc: '2.0', id: 0, method: 'initialize', params: { protocolVersion: '2025-06-18', capabilities: {}, clientInfo: { name: 'x', version: '1' } } });
       const r = await p.call({ jsonrpc: '2.0', id: 9, method: 'tools/list' });
       assert.equal(r.id, 9);
       assert.equal(r.result.tools.length, 2);
-      assert.equal(up.seen.filter((s) => s.body?.method === 'initialize').length, 1);
+      assert.equal(rejected, 1);
+      assert.equal(up.seen.filter((s) => s.body?.method === 'initialize').length, 2, '远端那次 + 重建那次');
+      assert.equal(up.seen.filter((s) => s.body?.method === 'tools/list').at(-1)!.headers['mcp-session-id'], 'sess-2', '重放带新 session id');
     } finally { await up.close(); }
   });
 });
