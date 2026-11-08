@@ -1089,8 +1089,33 @@ export function sessionGoneText(text: string): boolean {
   const t = String(text || '');
   return /\bsession(?:[\s_-]*id)?\b[^.\n]{0,20}?\b(?:not\s+found|expired|invalid|terminated|unknown|does\s+not\s+exist|is\s+required|missing)\b/i.test(t)
     || /\b(?:no\s+valid|invalid|unknown|expired|missing|no)\s+(?:mcp[\s-]*)?session(?:[\s_-]*id)?\b/i.test(t)
-    || /会话.{0,10}(?:失效|过期|不存在|无效)/.test(t);
+    || /会话.{0,10}(?:失效|过期|不存在|无效)/.test(t)
+    /* 换到了一个不认识这条会话的上游实例（负载均衡粘滞过期 / 实例重启）：MCP TS SDK 回「Server not initialized」 */
+    || /\bserver\s+not\s+initiali[sz]ed\b/i.test(t);
 }
+
+/**
+ * 上游非 2xx 正文的**类别**（给日志看）—— 正文本身不进日志（可能回显密钥），只说它像哪一类、JSON-RPC 错误码是多少。
+ * 「每 18 分钟一次 HTTP 400」那次日志里只有状态码，看不出是会话失效、协议版本还是请求体不对。
+ */
+export function upstreamErrorKind(text: string): string {
+  const t = String(text || '');
+  let code = '';
+  try { const j = JSON.parse(t); if (typeof j?.error?.code === 'number') code = `，JSON-RPC 错误码 ${j.error.code}`; } catch { /* 不是 JSON */ }
+  const kind = sessionGoneText(t) ? '像是会话失效'
+    : /protocol\s+version/i.test(t) ? '像是协议版本不被接受'
+    : /not\s+a\s+valid\s+json-?rpc|parse\s+error|invalid\s+request/i.test(t) ? '像是请求体不是合法的 JSON-RPC'
+    : t.trim() ? '正文没认出类别' : '没有正文';
+  return `${kind}${code}（正文 ${t.length} 字节，不记原文）`;
+}
+
+/**
+ * HTTP 转发的空闲续期阈值：空闲超过这么久，下一次请求前先重新 initialize（见 `HttpProxy.send`）。
+ * 实测 context7 那次的间隔约 18 分钟，取 10 分钟留足余量。选「空闲后续期」而不是定时保活：
+ * 空闲几个小时的会话不产生任何后台流量；保活 ping 也不一定能延长按创建时间算寿命 / 负载均衡粘滞的那种会话，
+ * 而重新 initialize 一定拿到新会话。代价只是长时间空闲后的第一次请求多一个来回。
+ */
+export const HTTP_SESSION_RENEW_IDLE_MS = 10 * 60_000;
 
 /** fetch 抛出来的网络错误 → 一句人话。 */
 function describeNetError(err: any): string {
@@ -1126,13 +1151,19 @@ export class HttpProxy implements ForwardProxy {
   private announced = false;
   private stopped = false;
   private reinitSeq = 0;
+  /** 最近一次上游正常答复的时刻（续期判断用，见 `HTTP_SESSION_RENEW_IDLE_MS`）。0 = 还没成功过。 */
+  private lastOkAt = 0;
+  private renewIdleMs: number;
+  private now: () => number;
   /** 这一轮实际用到的密钥（展开后的请求头值、URL query 的值）—— 日志和错误文案里都要抹掉。 */
   private secrets: string[] = [];
 
-  constructor(spec: HttpProxySpec, log: LocalMcpDeps['log']) {
+  constructor(spec: HttpProxySpec, log: LocalMcpDeps['log'], opts: { renewIdleMs?: number; now?: () => number } = {}) {
     this.spec = spec;
     this.log = log;
     this.timeoutMs = httpProxyTimeout(spec);
+    this.renewIdleMs = opts.renewIdleMs ?? HTTP_SESSION_RENEW_IDLE_MS;
+    this.now = opts.now ?? Date.now;
   }
 
 
@@ -1209,6 +1240,17 @@ export class HttpProxy implements ForwardProxy {
         this.initParams = msg?.params ?? null;
         /* 远端重新握手 = 一个新会话；带着旧的 session id 去 initialize 会被上游拒 */
         this.sessionId = null;
+      } else if (this.lastOkAt && this.now() - this.lastOkAt > this.renewIdleMs) {
+        /*
+          **空闲续期** ——「context7 大约每 18 分钟报一次 HTTP 400」。空闲超过阈值（比上游会话寿命短）后，
+          先用远端当初的 initialize 参数重新握手、换一个新会话，再发这次真实请求：不等它撞上过期。
+          并发的几条共用同一次（`reinitialize`）。续期失败不拦这次请求：照常发，该失败就按原样失败、走原来的路。
+        */
+        this.lastOkAt = this.now();
+        this.say('info', `空闲 ${Math.round(this.renewIdleMs / 60_000)} 分钟以上，先重新 initialize 续期会话再转发 ${msg?.method}`);
+        try { await this.reinitialize(headers, timeoutMs); } catch (e: any) {
+          this.say('warn', `续期没成功（照常转发这次请求）：${e?.message || e}`);
+        }
       }
       let out: any;
       try {
@@ -1235,6 +1277,7 @@ export class HttpProxy implements ForwardProxy {
           throw e2;
         }
       }
+      this.lastOkAt = this.now();
       return { answer: isNote ? null : out, error: null };
     } catch (e: any) {
       const reason = e instanceof UpstreamError ? e.message : tr('Forwarding failed: {why}', { why: String(e?.message || e) });
@@ -1302,6 +1345,7 @@ export class HttpProxy implements ForwardProxy {
 
       if (res.status < 200 || res.status >= 300) {
         const text = await this.readText(res, ac, timeoutMs).catch(() => '');
+        this.say('warn', `上游回 HTTP ${res.status}（${msg?.method ?? '?'}${sentSession ? '，带着 session id' : '，没带 session id'}）：${upstreamErrorKind(text)}`);
         if (msg?.method !== 'initialize' && ((res.status === 404 && sentSession) || ((res.status === 400 || res.status === 404) && sessionGoneText(text)))) {
           throw new UpstreamError(tr('Session expired: HTTP {status}', { status: res.status }), true, sentSession);
         }

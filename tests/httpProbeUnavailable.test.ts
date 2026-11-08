@@ -153,8 +153,9 @@ describe('接线（源码扫描）', () => {
     assert.match(w, /noteResult: \(r\) => noteHttpProbe\(sessionId, spec, h\.name, r\)/);
     /* 失败记下了（noteHttpProbe 回 true）才说，且只在第一次失败时说（规则在 watchHttpForward） */
     const rf = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'forwardReconnect.ts'), 'utf8');
-    assert.match(rf, /if \(d\.noteResult\(r\) && failures === 1\) d\.noticeFailed\(r, d\.mounted\);/);
-    assert.match(w, /noticeFailed: \(r, isMounted\) => noteInSession\(sessionId,\n\s*isMounted \? httpDroppedNotice\(h\.name, r\.error \|\| ''\) : httpPendingNotice\(h\.name, r\.error \|\| ''\)/);
+    /* 失败记下了（noteHttpProbe 回 true）才说、只说一次；连续不可用越过静默窗口才说（HTTP_FLAP_QUIET_MS，见 httpSessionRenew.test.ts） */
+    assert.match(rf, /if \(d\.noteResult\(r\) && !noticed && now\(\) - firstFailAt >= quiet\) \{\n\s*noticed = true;\n\s*d\.noticeFailed\(r, d\.mounted\);/);
+    assert.match(w, /noticeFailed: \(r, isMounted\) => \{\n\s*noteHttpNoticed\(spec, h\.name, true\);\n\s*noteInSession\(sessionId,\n\s*isMounted \? httpDroppedNotice\(h\.name, r\.error \|\| ''\) : httpPendingNotice\(h\.name, r\.error \|\| ''\)/);
   });
 
   test('noteHttpProbe：失败记到当前这份 spec 并要求提示（被重连换掉的不记、不提示），成功清掉', () => {

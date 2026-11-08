@@ -2219,6 +2219,8 @@ function forwardRecovered(sessionId: string, name: string): void {
   /* 远端调通了 = 适配器手里那条连接是好的：不必再为它重连（`reconnectForForward` 看到它不在名单里就放弃） */
   if (lt.awaitingForward?.includes(name)) lt.awaitingForward = lt.awaitingForward.filter((n) => n !== name);
   logger.info('localmcp', `中转 MCP「${name}」调用成功，恢复为可用 sessionId=${sessionId}`);
+  /* HTTP 型：没跟用户说过「连不上」的（短暂抖一下、在静默窗口里，见 `HTTP_FLAP_QUIET_MS`），恢复时也不说 */
+  if (h && !httpNoticed.get(lt)?.delete(name)) return;
   sessionNotice(sessionId, tr('✅ The MCP "{name}" forwarded from this machine works again.', { name }));
 }
 
@@ -2414,6 +2416,19 @@ function forwardHandedNow(e: ForwardEntry, notReady: ForwardNotReady[]): boolean
   return !notReady.some((n) => n.name === e.name);
 }
 
+/**
+ * 每份 spec 上已经跟用户说过「连不上」的 HTTP 转发（看护越过静默窗口才说，见 `HTTP_FLAP_QUIET_MS`）。
+ * 说过的才在恢复时说「已恢复可用 / 又能用了」—— 两条恢复路（看护探通 / 远端先调通）谁先到谁说，只说一次。
+ */
+const httpNoticed = new WeakMap<LocalToolsSpec, Set<string>>();
+/** `on` = 记下说过；否则取走这条记录，返回之前有没有说过。 */
+function noteHttpNoticed(spec: LocalToolsSpec, name: string, on: boolean): boolean {
+  const set = httpNoticed.get(spec) || new Set<string>();
+  httpNoticed.set(spec, set);
+  if (on) { set.add(name); return true; }
+  return set.delete(name);
+}
+
 /** 每份 spec 正在看护的 HTTP 转发名字：同一份 spec 上同一个只起一个看护（换了 spec 的旧看护自己会停）。 */
 const httpWatching = new WeakMap<LocalToolsSpec, Set<string>>();
 
@@ -2448,11 +2463,14 @@ function startHttpWatch(sessionId: string, spec: LocalToolsSpec, h: HttpMcpEntry
     markFresh: (ok) => markHttpFresh(h, ok),
     addAwaiting: () => { if (!spec.awaitingForward?.includes(h.name)) (spec.awaitingForward ||= []).push(h.name); },
     noteResult: (r) => noteHttpProbe(sessionId, spec, h.name, r),
-    noticeFailed: (r, isMounted) => noteInSession(sessionId,
-      isMounted ? httpDroppedNotice(h.name, r.error || '') : httpPendingNotice(h.name, r.error || ''),
-      undefined, `forward-mcp-http-${isMounted ? 'dropped' : 'pending'}:${h.name}`),
+    noticeFailed: (r, isMounted) => {
+      noteHttpNoticed(spec, h.name, true);
+      noteInSession(sessionId,
+        isMounted ? httpDroppedNotice(h.name, r.error || '') : httpPendingNotice(h.name, r.error || ''),
+        undefined, `forward-mcp-http-${isMounted ? 'dropped' : 'pending'}:${h.name}`);
+    },
     /* 远端在这期间已经调通（`forwardRecovered` 说过「又能用了」、移出了等着的名单）：不再说、也不会重连 */
-    noticeBack: () => { if (spec.awaitingForward?.includes(h.name)) sessionNotice(sessionId, httpForwardBackNotice(h.name), { group: `forward-mcp-back:${h.name}` }); },
+    noticeBack: () => { if (noteHttpNoticed(spec, h.name, false) && spec.awaitingForward?.includes(h.name)) sessionNotice(sessionId, httpForwardBackNotice(h.name), { group: `forward-mcp-back:${h.name}` }); },
     /* 重连前再探一次：等空闲可能等了很久，交给新执行器的必须是刚证实过的；没通过就回到看护 */
     reconnect: () => reconnectForForward(sessionId, h.name, spec, {
       confirm: () => probe().then((r) => { markHttpFresh(h, r.ok); return r.ok; }, () => false),

@@ -97,11 +97,19 @@ export function httpHandedNow(lastOkAt: number | undefined, now: number, freshMs
  * 和**已挂上的上游中途掉线**（远端经它转发失败，`mounted: true`）。
  *
  *   · 没通过：作废「最近证实是好的」（下次准备不再直接交）、登记成等着挂上（`addAwaiting`）、记成当前不可用；
- *     第一次失败说一句（`noticeFailed` 拿到 `mounted`，挂着的和没挂上的说法不同）；
- *   · 通过：记成刚证实是好的；挂着、而且一次都没失败过的，什么都不用做；
- *     其余（没挂上 / 中间失败过）说「已恢复可用」，等会话空闲重连挂上（`reconnect`；远端在这期间又调通了的，
+ *     连续不可用超过静默窗口（`HTTP_FLAP_QUIET_MS`）才说一句（`noticeFailed` 拿到 `mounted`，挂着的和没挂上的说法不同）；
+ *   · 通过：记成刚证实是好的；说过「连不上」的才说「已恢复可用」；
+ *     挂着、没久到说过话的：什么都不做（本机转发端点一直在，上游好了调用自然就通）；
+ *     其余（没挂上 / 挂着但久到说过话）等会话空闲重连挂上（`reconnect`；远端在这期间又调通了的，
  *     调用方已经把它移出等着的名单，重连自然取消 —— 那就是「按需」）。
  */
+/**
+ * **提示的静默窗口** ——「context7 大约每 18 分钟报一次 400，然后又『已恢复可用』，用户看到一直有 MCP 报错」。
+ * 一个 HTTP 转发从第一次失败起，连续不可用超过这么久才在会话里说「连不上」；没说过「连不上」的，恢复时也不说「已恢复可用」。
+ * 状态照常记（新鲜度、当前不可用、日志），只是短暂抖一下不插提示。退避节奏下第 5 次探测（约 52 秒）时才会越过它。
+ */
+export const HTTP_FLAP_QUIET_MS = 30_000;
+
 export function watchHttpForward<R extends { ok: boolean }>(d: {
   probe: () => Promise<R>;
   alive: () => boolean;
@@ -117,7 +125,14 @@ export function watchHttpForward<R extends { ok: boolean }>(d: {
   done?: () => void;
   log?: (message: string) => void;
   setTimer?: (fn: () => void, ms: number) => void;
+  /** 静默窗口（默认 `HTTP_FLAP_QUIET_MS`）和时钟（测试注入）。 */
+  quietMs?: number;
+  now?: () => number;
 }): void {
+  const quiet = d.quietMs ?? HTTP_FLAP_QUIET_MS;
+  const now = d.now ?? Date.now;
+  let firstFailAt: number | undefined;
+  let noticed = false;
   probeUntilOk({
     probe: d.probe,
     alive: () => { const a = d.alive(); if (!a) d.done?.(); return a; },
@@ -126,15 +141,25 @@ export function watchHttpForward<R extends { ok: boolean }>(d: {
       if (!r.ok) {
         d.markFresh(false);
         d.addAwaiting();
-        if (d.noteResult(r) && failures === 1) d.noticeFailed(r, d.mounted);
+        firstFailAt ??= now();
+        /* 只说一次，而且要连续不可用超过静默窗口才说 —— 失败一两次马上又好的不打扰 */
+        if (d.noteResult(r) && !noticed && now() - firstFailAt >= quiet) {
+          noticed = true;
+          d.noticeFailed(r, d.mounted);
+        }
         d.log?.(`第 ${failures} 次探测没通过，${httpProbeDelay(failures)}ms 后再探`);
         return;
       }
       d.markFresh(true);
       d.noteResult(r);
       d.done?.();
-      if (d.mounted && failures === 0) return;
-      d.noticeBack();
+      /* 说过「连不上」才说「已恢复可用」 */
+      if (noticed) d.noticeBack();
+      /*
+        挂着的：适配器连的是本机这个转发端点（它一直在），上游好了调用自然就通 —— 只有不可用久到说过一句的才重连一次兜底；
+        没挂上的：要重连才挂得上，照样重连（不说话，重连那句状态行照旧）。
+      */
+      if (d.mounted && !noticed) return;
       d.reconnect();
     },
   });

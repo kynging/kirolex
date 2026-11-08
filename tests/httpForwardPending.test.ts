@@ -219,6 +219,7 @@ describe('新鲜度：历史上探测成功过、当前上游不可用 → 这�
       noticeBack: () => {},
       reconnect: () => { st.reconnects++; },
       setTimer: fast,
+      quietMs: 0,   // 这里测恢复流程；静默窗口在 httpSessionRenew.test.ts 里单独测
     });
     await until(() => st.results.length >= 2);
     assert.equal(lastOkAt, undefined, '探测失败：作废');
@@ -254,6 +255,7 @@ describe('watchHttpForward：先成功挂载 → 中途掉线 → 恢复（真�
         ),
         done: () => { st.watching = false; },
         setTimer: fast,
+        quietMs: 0,   // 同上
       });
     };
     return { st, start };
