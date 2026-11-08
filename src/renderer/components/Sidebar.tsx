@@ -419,8 +419,9 @@ const SessionItem: React.FC<{
   );
 };
 
-// A project group. Real projects are drop targets for write-once assignment;
-// the Unassigned bucket is NOT (you cannot un-assign — design §6.4).
+// A project group. Real projects get kebab + new-chat; the Unassigned bucket
+// does not. Both are drop targets — dropping on Unassigned un-assigns the chat
+// (so does the right-click 「移到项目 → 未分组」), see design §6.4.
 const ProjectGroup: React.FC<{
   name: string;
   projectKey: string;
@@ -1348,8 +1349,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
               <div className="context-menu-divider" />
               {/* 项目一多，平铺的话菜单在屏幕里放不下 —— 收进一个右侧展开的子菜单（面板自己限高、滚动）。
                   入口名字固定，不带当前项目名：带上的话它看起来就像左边一个能点的项目，其实只是入口。
-                  这里不放「移到未分组」，只列其他项目。 */}
+                  顶部是「📥 未分组」（会话在某个项目里时才有）：和拖到 Unassigned 同一条路径 moveInto(id, null)，
+                  下面再列其他项目。 */}
               <Submenu label={t('🏷️ Move to project')}>
+                {ctxSession.projectId && (
+                  <>
+                    <div
+                      className="context-menu-item"
+                      onClick={() => { moveInto(ctxSession.id, null); setContextMenu(null); }}
+                    >
+                      📥 {t('Unassigned')}
+                    </div>
+                    {projects.some((p) => p !== ctxSession.projectId) && <div className="context-menu-divider" />}
+                  </>
+                )}
                 {projects.filter((p) => p !== ctxSession.projectId).map((p) => (
                   <div
                     key={p}
@@ -1359,7 +1372,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
                     🏷️ {p}
                   </div>
                 ))}
-                {!projects.some((p) => p !== ctxSession.projectId) && (
+                {!ctxSession.projectId && !projects.some((p) => p !== ctxSession.projectId) && (
                   <div className="context-menu-item disabled" onClick={(e) => e.stopPropagation()}>{t('No other projects')}</div>
                 )}
               </Submenu>

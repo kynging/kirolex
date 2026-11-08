@@ -25,7 +25,8 @@ describe('子菜单竖直方向留在屏幕内', () => {
 });
 
 /*
- * 「名字应该叫移动项目。里面不应该有移动到未分组的选项。而且现在第一个项目怎么显示在左边了，根本点不了」：
+ * 「名字应该叫移动项目。……而且现在第一个项目怎么显示在左边了，根本点不了」（当时还说「里面不应该有移动到
+ * 未分组的选项」，2026-11-08 被用户推翻，见下）：
  * 入口原来写「🏷️ 移到项目：<当前项目>」，看起来就像左边菜单里一个能点的项目 —— 其实只是入口，点了没反应。
  */
 describe('「移动项目」是一个子菜单入口', () => {
@@ -39,14 +40,32 @@ describe('「移动项目」是一个子菜单入口', () => {
   test('不再平铺 Move to project / Assign to project 标题', () => {
     assert.equal(/'Move to project'|'Assign to project'/.test(SB), false);
   });
-  test('子菜单里没有「移到未分组」，只有其他项目', () => {
-    assert.equal(block.includes("t('Unassign')"), false);
-    assert.equal(block.includes('moveInto(ctxSession.id, null)'), false);
+  /*
+   * 2026-11-08 用户口径改了：「右键移到项目里没有未分组」—— 拖到 Unassigned 早就能取消分组，归档菜单也有
+   * 「恢复到未分组」，只有右键子菜单不行，规则自相矛盾。现在子菜单顶部加「📥 未分组」。
+   */
+  const unassign = block.indexOf("📥 {t('Unassigned')}");
+  const list = block.indexOf('projects.filter(');
+  test('在项目里的会话：子菜单顶部有「📥 未分组」，点了走 moveInto(id, null)', () => {
+    assert.ok(unassign > 0, '子菜单里要有「📥 未分组」');
+    assert.ok(unassign < list, '「未分组」在项目列表上面');
+    const item = block.slice(block.lastIndexOf('<div', unassign), unassign);
+    assert.match(item, /onClick=\{\(\) => \{ moveInto\(ctxSession\.id, null\); setContextMenu\(null\); \}\}/,
+      '和拖到未分组同一条路径（moveInto），点完关菜单');
+  });
+  test('已在未分组的会话不出现该项：只在有 projectId 时渲染；和项目列表之间有分隔线', () => {
+    assert.match(block.slice(0, unassign), /^[^]*\{ctxSession\.projectId && \(\s*<>\s*<div[^<]*$/,
+      '「未分组」那一项被 ctxSession.projectId 包着');
+    assert.match(block.slice(unassign, list), /context-menu-divider/);
+  });
+  test('其他项目照旧列出', () => {
     assert.ok(block.includes('projects.filter((p) => p !== ctxSession.projectId)'));
     assert.ok(block.includes('moveInto(ctxSession.id, p)'));
   });
-  test('没有其他项目时显示一行灰色、不能点的提示', () => {
+  test('既没有其他项目、也不能移到未分组时，才显示一行灰色、不能点的提示', () => {
     assert.match(block, /context-menu-item disabled[^]*t\('No other projects'\)/);
+    assert.match(block, /\{!ctxSession\.projectId && !projects\.some\(\(p\) => p !== ctxSession\.projectId\) && \(/,
+      '会话在项目里时「未分组」本身就是可选项，不该再说"没有其他项目"');
   });
 });
 

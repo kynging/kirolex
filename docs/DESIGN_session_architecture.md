@@ -312,6 +312,14 @@ mechanism's job, §6.2b). Tracked via `lastMemoryInjection`.
     already in the live conversation and cannot be un-injected (§6.4 removal), so
     it would leave a context mix. Disallowing it avoids the mess entirely.
   - A chat that "should" belong to a different project = start a new chat there.
+  - **Superseded in the shipped UI (user decision, 2026-11-08):** an explicit
+    user *move* is allowed in both directions — `project → null` (un-assign) and
+    `project X → project Y` — via drag onto a group (incl. Unassigned), the
+    right-click 「🏷️ 移到项目」 submenu (top item 「📥 未分组」 when the chat is in a
+    project), and archive's 「恢复到未分组」. All go through the same move path
+    (`moveSession`): the backend resets the executor (deferred to the end of a
+    running turn) so the next attach uses the new memory scope instead of mixing.
+    The one-time `null → project` *assign* control keeps its write-once check.
 - A session with **no `projectId`** (unassigned/scratch chat) receives only the
   global layer. On one-time assignment, the project layer begins injecting at the
   next lifecycle boundary — cleanly, since only global was present before.
