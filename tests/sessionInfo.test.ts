@@ -63,11 +63,13 @@ const MAIN = read('main', 'index.ts');
 const PRELOAD = read('main', 'preload.ts');
 
 describe('接线：菜单项、信息面板、按 id 找会话', () => {
-  test('会话右键菜单里有「复制会话 id」，复制的就是这条会话的 id', () => {
-    const at = SIDEBAR.indexOf("t('Copy session id')");
-    assert.ok(at > 0, '菜单里要有这一项');
-    const block = SIDEBAR.slice(Math.max(0, at - 600), at);
-    assert.match(block, /copyToClipboard\(ctxSession\.id/);
+  test('会话右键菜单里不再有「复制会话 id」和「保留在本机 / 允许移到云端」（用户 2026-11-08 要求删掉）', () => {
+    assert.ok(!SIDEBAR.includes("t('Copy session id')"), '「复制会话 id」应已删掉');
+    assert.ok(!SIDEBAR.includes("t('Allow moving it to the cloud when idle')"), '「允许空闲时移到云端」应已删掉');
+    assert.ok(!SIDEBAR.includes('onSetKeepLocal'), '真会话右键里的「保留在本机」开关应已删掉');
+    assert.ok(!SIDEBAR.includes('copyToClipboard(ctxSession.id'), '右键菜单不再直接复制会话 id');
+    // ☁ 占位的「下载回来并保留在本机」是另一份菜单，留着
+    assert.ok(SIDEBAR.includes('onOffloadRestore?.(ctxOffloaded.id, true)'));
   });
 
   test('会话右键菜单里有「会话信息…」，打开的是这条会话的信息', () => {

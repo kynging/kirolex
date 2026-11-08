@@ -246,10 +246,6 @@ interface SidebarProps {
   offloadedSessions?: Session[];
   /** 右键「下载回本机」/「保留在本机，不再自动移走」（占位：下载 + 打标记） */
   onOffloadRestore?: (id: string, keepLocal: boolean) => void;
-  /** 真会话的右键：打上 / 去掉「保留在本机，不再自动移走」；`offloadEnabled` 为假（功能没开）时不显示 */
-  keepLocalIds?: string[];
-  offloadEnabled?: boolean;
-  onSetKeepLocal?: (id: string, keep: boolean) => void;
   /** 上一次同步的结果 —— 给这个按钮上色和写 title 用。 */
   backupState?: { at: number; uploaded: number; error?: string } | null;
   workspaceOpen: boolean;
@@ -618,9 +614,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenBackup,
   offloadedSessions,
   onOffloadRestore,
-  keepLocalIds,
-  offloadEnabled,
-  onSetKeepLocal,
   backupState,
   workspaceOpen,
   onOpenWorkspace,
@@ -1320,33 +1313,14 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             {`📌 ${ctxSession.pinned ? t('Unpin') : t('Pin')}`}
           </div>
-          {/* 「保留在本机，不再自动移走」—— 自动移到云端（设置 → 备份）开着时才有意义 */}
-          {offloadEnabled && !ctxSession.id.startsWith('pending_') && (
+          {/* 会话信息（里面能查看/复制 id）。还没落盘的 `pending_` 没有真 id，不给。 */}
+          {!ctxSession.id.startsWith('pending_') && (
             <div
               className="context-menu-item"
-              onClick={() => { onSetKeepLocal?.(ctxSession.id, !keepLocalIds?.includes(ctxSession.id)); setContextMenu(null); }}
+              onClick={() => { setInfoFor(ctxSession.id); setContextMenu(null); }}
             >
-              {keepLocalIds?.includes(ctxSession.id) ? `☁ ${t('Allow moving it to the cloud when idle')}` : `📍 ${t('Keep on this computer; do not move it automatically again')}`}
+              {`ℹ️ ${t('Session info…')}`}
             </div>
-          )}
-          {/* 会话 id ——「会话能查看/复制 id」：排查时日志按 `sessionId=` 过滤、给看板提 bug、控制入口 `/sessions/:id/…`
-              都要这串，原来只能靠标题去猜。还没落盘的 `pending_` 没有真 id，不给。 */}
-          {!ctxSession.id.startsWith('pending_') && (
-            <>
-              <div
-                className="context-menu-item"
-                title={ctxSession.id}
-                onClick={() => { copyToClipboard(ctxSession.id, t('Session id')); setContextMenu(null); }}
-              >
-                {`🆔 ${t('Copy session id')}`}
-              </div>
-              <div
-                className="context-menu-item"
-                onClick={() => { setInfoFor(ctxSession.id); setContextMenu(null); }}
-              >
-                {`ℹ️ ${t('Session info…')}`}
-              </div>
-            </>
           )}
           {/* Deliberately NOT exposed here: 「重建上下文」(snapshot / full replay).
               It is a recovery lever for internal state -- which backend holds which

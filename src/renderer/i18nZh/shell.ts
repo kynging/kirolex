@@ -212,7 +212,6 @@ export const ZH_SHELL: Record<string, string> = {
   'New Chat': '新会话',
   'this session': '这个会话',
   /* 会话信息 / 复制会话 id / 找会话（Sidebar.tsx、sessionInfo.ts） */
-  'Copy session id': '复制会话 id',
   'Session info…': '会话信息…',
   'Session info': '会话信息',
   'Session id': '会话 id',
@@ -239,7 +238,6 @@ export const ZH_SHELL: Record<string, string> = {
   'Download back to this computer': '下载回本机',
   'Download it back and never move it to the cloud automatically again': '下载回本机，以后不再自动移到云端',
   'Keep on this computer; do not move it automatically again': '保留在本机，不再自动移走',
-  'Allow moving it to the cloud when idle': '允许久未使用时自动移到云端',
   'Downloading it back from the cloud…': '正在从云端下载回本机…',
   'Moved to the cloud (unused for {n} days). Click to download it automatically.': '已移到云端（{n} 天未使用），点开会自动下载',
   'Moved {n} sessions unused for {days} days to the cloud, freeing {size}.': '已把 {n} 条 {days} 天未使用的会话移到云端，腾出 {size}',

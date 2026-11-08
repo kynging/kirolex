@@ -4516,9 +4516,6 @@ const App: React.FC = () => {
               onOpenBackup={() => setShowBackup(true)}
               offloadedSessions={offloadedSessions}
               onOffloadRestore={(id, keepLocal) => { void restoreOffloaded(id, keepLocal, false); }}
-              keepLocalIds={offloadInfo.keepLocal}
-              offloadEnabled={offloadInfo.enabled}
-              onSetKeepLocal={(id, keep) => { void (window as any).kiroApi?.offloadSetKeepLocal?.(id, keep).then((r: any) => { if (r && !r.ok && r.error) showToast(String(r.error)); return loadOffloaded(); }).catch(() => {}); }}
               backupState={backupState}
               workspaceOpen={showWorkspace}
               onOpenWorkspace={() => setShowWorkspace((visible) => !visible)}
