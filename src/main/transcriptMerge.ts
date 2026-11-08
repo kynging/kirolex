@@ -133,15 +133,28 @@ export function mergeRecords(local: any, remote: any): any {
   /*
     **位置（项目 / 归档）按 `placementChangedAt` 谁新用谁** —— 不跟着整份记录的 `updatedAt` 走：
     A 移过项目、B 之后又聊过一句，按 updatedAt 就是 B 的旧项目赢，A 的移动被盖掉。
-    一样新（包括两边都是没有这个字段的老记录）就保持上面按 updatedAt 的结果。
+    两边都是没有这个字段的老记录（都是 0）就保持上面按 updatedAt 的结果。
+
+    **一样新（且不是 0）→ 用本机的位置** ——「恢复后默认在未分组，另一台只是继续聊天，同步一合并又回到 Blog」：
+    恢复成未分组时位置时间戳沿用云上的（不取现在，免得别的设备跟着挪），两边就一样新；这时再按 updatedAt
+    选整份 profile，另一台聊一句就把本机的未分组换成它的项目。位置一样新说明谁都没在对方之后挪过，聊天不算挪动。
+    「移出项目」的标记（`unassigned`）跟着位置走，不然拿了未分组却丢了标记，attach 又会按目录反推。
   */
   const placedA = Number(local.placementChangedAt) || 0;
   const placedB = Number(remote.placementChangedAt) || 0;
-  if (placedA !== placedB) {
-    const src = placedA > placedB ? local : remote;
+  /*
+    两边都是 0 的老记录里，任一边标着「移出项目」（`unassigned`）就用本机的位置：恢复到未分组 / 纠正假项目都会标它，
+    而备份和 catalog 没有位置时间戳时恢复出来的仍是 0 —— 不认这个标记，另一台聊一句就把它拉回原项目。
+    反过来另一台合并这台的记录时也用它自己的，恢复不改别的设备的分组。两边都没标的老记录照旧按 updatedAt。
+  */
+  const localUnassignedOld = placedA === 0 && placedB === 0 && (!!local.profile?.unassigned || !!remote.profile?.unassigned);
+  if (placedA !== placedB || placedA > 0 || localUnassignedOld) {
+    const src = placedA >= placedB ? local : remote;
     const profile = { ...(out.profile || {}) };
     if (src.profile && src.profile.projectId !== undefined) profile.projectId = src.profile.projectId;
     else delete profile.projectId;
+    if (src.profile?.unassigned) profile.unassigned = true;
+    else delete profile.unassigned;
     out.profile = profile;
     if (src.archived !== undefined) out.archived = src.archived;
     else delete out.archived;

@@ -58,7 +58,8 @@ import {
   type BucketOps, type CleanupResult,
 } from './cloudTrash.ts';
 import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
-import { restorePlacement, catalogProject } from './restoreArchive.ts';
+import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restoreRemote } from './restoreArchive.ts';
+import { knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from './projectSanity.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
 import { McpComboWatcher, comboFingerprint, remountExclusive, COMBO_FILE_BROKEN } from './mcpComboWatch.ts';
@@ -3575,7 +3576,39 @@ function derivedProjectFor(sessionId: string, dir: string): string | undefined {
   const d = String(dir || '');
   if (!d || d === os.homedir()) return undefined;
   if (d === getSessionDir(sessionId) || d.startsWith(path.join(os.homedir(), '.kirolex'))) return undefined;
+  /* 别的电脑上的 `.kirolex/sessions/<id>`（恢复回来的记录带着它）、会话 id 形状、本机不存在的目录：都不推（`derivableProjectDir`） */
+  if (!derivableProjectDir(d, (p) => fs.existsSync(p))) return undefined;
   return deriveProjectId(d);
+}
+
+/**
+ * 本机的项目（`knownProjects`）：只认侧栏的项目列表 `kirolex-projects`。空列表也照判（都算不认识）；
+ * 读不出来（没有这个键 / 坏了）→ null，只按 `s_` 前缀判。
+ */
+function localKnownProjects(): Set<string> | null {
+  return knownProjects(uiState()['kirolex-projects']);
+}
+
+/**
+ * 记录里的 projectId 不是真项目（`bogusProjectReason`）→ 改成未分组写回，活着的执行器一起改。
+ * 不动 updatedAt / placementChangedAt：这不是用户的挪动，侧栏排序不该变，别的设备也不该跟着挪。
+ * 返回纠正后的记录（没问题就原样返回）。
+ */
+function fixBogusProject<T extends store.SessionRecord>(rec: T, known: Set<string> | null, via: string): T {
+  const why = bogusProjectReason(rec?.profile?.projectId, rec?.id, known);
+  if (!why) return rec;
+  const { projectId: bad, ...rest } = rec.profile;
+  const next = { ...rec, profile: { ...rest, unassigned: true as const } };
+  try {
+    store.writeRecordKeepUpdatedAt(next);
+  } catch (err: any) {
+    logger.warn('session', `${via}: ${rec.id} 的项目纠正没写进记录：${err?.message || err}`);
+  }
+  const entry = sessionClients.get(rec.id);
+  if (entry) { delete entry.profile.projectId; entry.profile.unassigned = true; }
+  logger.warn('session', `${via}: ${rec.id} 的项目 ${JSON.stringify(bad)} 不是真项目`
+    + `（${why === 'session-id' ? '形如会话 id' : '不在本机的项目列表里'}），改成未分组`);
+  return next;
 }
 
 /**
@@ -6905,7 +6938,7 @@ function isOffloadedPlaceholder(id: string): boolean {
  * `refuseAdvancedBackup`），再整份下到暂存目录、全部成功才发布成 sessions/<id> 并删占位（`restoreOffloadedSession`）。
  * 中途失败：暂存目录删掉、正式目录不出现、占位保留，下次可以再点。返回值和 s3:restore 同形状。
  */
-async function offloadRestoreImpl(id: string): Promise<any> {
+async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Promise<any> {
   const { creds, problem } = await resolveSyncCredsNow();
   if (problem) return { ok: false, error: problem };
   const placeholder = readOffloadState(OFFLOAD_STATE_PATH).offloaded[id];
@@ -6924,23 +6957,56 @@ async function offloadRestoreImpl(id: string): Promise<any> {
     运行位置按**本机**移走之前的那份记录（回收站里）：云端那份如果是别的电脑后来改过的，里面的机器配置是那台的。
     回收站里那份读不到 → 和 s3:restore 一样，远程会话改成在本机跑。
   */
+  /*
+    候选机器：本机移走之前那份（回收站）记录里的；那份读不到就用云端这份里的。再按**本机现在的设置**判
+    （`restoreRunPlan`，和 s3:restore 同一条）：认得就留在那台、提示「仍在 <机器名> 上跑」，不认得才改本机跑 ——
+    否则设置里已经删掉的机器会被留下、attach 时拒连，或者设置里还在的机器被白白清掉。
+  */
   let madeLocal = false;
+  let keptRemote: string | undefined;
   const cur = store.readRecord(id);
   if (cur) {
     let before: any = null;
     try { before = placeholder.trashDir ? JSON.parse(fs.readFileSync(path.join(placeholder.trashDir, 'record.json'), 'utf-8')) : null; } catch { before = null; }
-    const want = before ? before.profile?.remote : undefined;
-    if (JSON.stringify(cur.profile?.remote ?? null) !== JSON.stringify(want ?? null)) {
+    const want = before ? before.profile?.remote : cur.profile?.remote;
+    const plan = restoreRunPlan(want ? sessionRemote(want) : undefined, !!want?.sshHost, (h) => labelForHost(KIROLEX_CONFIG_PATH, h));
+    const next = plan.kind === 'keep' ? want : undefined;
+    if (plan.kind === 'keep') keptRemote = plan.label;
+    if (plan.kind === 'local') madeLocal = true;
+    if (JSON.stringify(cur.profile?.remote ?? null) !== JSON.stringify(next ?? null)) {
       const profile = { ...cur.profile } as any;
-      if (want) profile.remote = want; else delete profile.remote;
+      if (next) profile.remote = next; else delete profile.remote;
       store.writeRecordKeepUpdatedAt({ ...cur, profile, id });
-      madeLocal = !want;
     }
   }
+  /*
+    **放在哪儿：和 s3:restore 同一条规则**（`restoreTarget`）—— 从云端下载回来的一律进「未分组」并标 unassigned，
+    只有恢复对话框里勾了「放回原项目」、本机侧栏也有那个项目才放回。这里本机没有记录（占位），按新恢复算。
+  */
+  let origin: string | undefined;
+  const placedRec = store.readRecord(id);
+  if (placedRec) {
+    const rt = restoreTarget({
+      localBefore: null, backup: placedRec, entry: undefined,
+      putBack: !!opts?.putBack,
+      localProjects: knownProjects(uiState()['kirolex-projects']) || new Set<string>(),
+      refuseProject: store.isAdvancedOnlyProjectName,
+    });
+    origin = rt.origin;
+    const next = applyPlacement(placedRec, rt.placement);
+    if (rt.unassigned) next.profile = { ...next.profile, unassigned: true };
+    else if (next.profile?.unassigned) { const { unassigned: _u, ...rest } = next.profile; next.profile = rest; }
+    if (JSON.stringify(next) !== JSON.stringify(placedRec)) store.writeRecordKeepUpdatedAt({ ...next, id });
+    logger.info('offload', `${id}：放进「${rt.placement.projectId || '未分组'}」${origin && origin !== rt.placement.projectId ? `（原来在「${origin}」）` : ''}`);
+  }
+  const placedNow = store.readRecord(id);
   forgetDeletion(S3_DELETED_AT_PATH, id);
   logger.info('offload', `已从云端下载回本机 ${id}：${r.alreadyLocal ? '上次已经下完，只补了收尾' : `${r.files} 个文件 / ${(r.bytes / 1024 / 1024).toFixed(1)} MB`}，占位删掉，最后活动重新计时`);
   mainWindow?.webContents.send('offload:changed', {});
-  return { ok: true, restored: r.files, backedUp: null, memoryFiles: 0, madeLocal, projectId: cur?.profile?.projectId || undefined };
+  return {
+    ok: true, restored: r.files, backedUp: null, memoryFiles: 0, madeLocal, keptRemote, projectId: placedNow?.profile?.projectId || undefined,
+    ...(origin ? { origin } : {}),
+  };
 }
 
 /**
@@ -9541,14 +9607,14 @@ ${hint}` : ''}` };
    * 不恢复正在连着的那条：它的执行器手上握着 transcript，覆盖文件只会让内存和磁盘打架。
    */
   /* 同一份实现也给侧栏 ☁ 占位的「下载回本机」用（offload:restore） */
-  let s3RestoreImpl: (_event: unknown, sessionId: string) => Promise<any>;
-  ipcMain.handle('s3:restore', s3RestoreImpl = async (_event, sessionId: string) => {
+  let s3RestoreImpl: (_event: unknown, sessionId: string, opts?: { putBack?: boolean }) => Promise<any>;
+  ipcMain.handle('s3:restore', s3RestoreImpl = async (_event, sessionId: string, opts?: { putBack?: boolean }) => {
     const { creds, problem, cfg } = await resolveSyncCredsNow();
     if (problem) return { ok: false, error: problem };
     if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
     { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
     /* ☁ 占位：暂存下载，全成功才发布 */
-    if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId);
+    if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId, opts);
     /*
       **连着的先断开，不再让人手动去断** —— 恢复现在是合并（同 id 去重、按时间排），
       断开之后执行器手上那份不会再写盘，合并完下次打开按记录重新接上。
@@ -9573,9 +9639,9 @@ ${hint}` : ''}` };
       const existed = fs.existsSync(localDir);
       /* 合并**之前**本机这条的位置（项目 / 归档）—— 合并完按「谁后挪用谁」定恢复后放在哪儿 */
       const localBefore = existed ? store.readRecord(sessionId) : null;
-      /* catalog 里这条（它的 placementChangedAt 是判据）。读不到就当没有 → 保持本机的位置 */
+      /* catalog 里这条（它的 placementChangedAt 是判据；新恢复的「原项目」也看它）。读不到就当没有 → 合并的保持本机的位置 */
       let catalogEntry: CatalogEntry | undefined;
-      if (localBefore) {
+      {
         try {
           const raw = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
           if (raw) catalogEntry = ((JSON.parse(raw.toString('utf-8')) as Catalog).entries || []).find((e) => e.id === sessionId);
@@ -9647,35 +9713,53 @@ ${hint}` : ''}` };
       }
       /* 合并之后重建 history.md —— 它是渲染产物，不是数据 */
       if (merged) refreshHistoryFile(sessionId);
+      /* 桶里那份 record.json（合并之前的）：「放回原项目」按它 / catalog 认原项目，不按合并结果（vetted 里有缓存） */
+      let backupRec: any;
+      {
+        const o = objects.find((x) => { const r = relFor(cfg.prefix, x.key); return !!r && path.join(KIROLEX_HOME, r) === path.join(localDir, 'record.json'); });
+        try { if (o) backupRec = JSON.parse((await vetted.get(o.key)).toString('utf-8')); } catch { backupRec = undefined; }
+        if (!backupRec || typeof backupRec !== 'object') backupRec = undefined;
+      }
 
       const recordPath = path.join(localDir, 'record.json');
       let recAfter: any;
       try { recAfter = JSON.parse(fs.readFileSync(recordPath, 'utf-8')); } catch { recAfter = undefined; }
 
       /*
-        **恢复后放在哪儿：谁后挪用谁** —— catalog 里这条的 placementChangedAt 比本机（合并前）新，
-        就用云上的项目和归档；否则保持本机原来的（本机归档的继续归档）。合并完的记录里位置可能是
-        备份那份 record.json 的，要按这里算出来的写回去。本机原来没有这条的不管（直接用备份里的）。
+        **恢复后放在哪儿** ——「一恢复就该默认在未分组」（规则见 `restoreTarget`）：
+        恢复的一律未分组（标 unassigned，attach 不再按目录反推），不继承 catalog / 别的设备上的项目，
+        本机已有、走合并的也一样。只有恢复对话框里勾了「放回原项目」、本机也有那个项目，才放回去 /
+        按「谁后挪用谁」跟云上。合并完的记录里位置可能是备份那份 record.json 的，要按这里算出来的写回去。
         放在记忆前面：项目记忆要按恢复后的项目拉。
       */
       const describePlacement = (projectId: string | undefined, archived: boolean) => `「${projectId || '未分组'}」${archived ? '·已归档' : ''}`;
       let placement: { projectId?: string; archived: boolean; fromProjectId?: string; fromArchived: boolean } | undefined;
-      const rp = restorePlacement(localBefore, catalogEntry, store.isAdvancedOnlyProjectName);   // 不跟进 advanced 专属项目
-      if (rp && recAfter) {
+      const rt = recAfter ? restoreTarget({
+        localBefore, backup: backupRec || recAfter, entry: catalogEntry,   // 「原项目」看备份那份，不看合并结果
+        putBack: !!opts?.putBack,
+        localProjects: knownProjects(uiState()['kirolex-projects']) || new Set<string>(),
+        refuseProject: store.isAdvancedOnlyProjectName,   // 不跟进 advanced 专属项目
+      }) : null;
+      if (rt && recAfter) {
         const cur = placementOf(recAfter);
-        const want = rp.placement;
-        if (cur.projectId !== want.projectId || cur.archived !== want.archived || cur.placementChangedAt !== want.placementChangedAt) {
+        const want = rt.placement;
+        /* 合并后没项目的：本机原来那个「移出项目」的标记要留着（合并可能拿了备份那份 profile） */
+        const wantUnassigned = rt.unassigned || (!want.projectId && !!localBefore?.profile?.unassigned);
+        if (cur.projectId !== want.projectId || cur.archived !== want.archived || cur.placementChangedAt !== want.placementChangedAt
+          || wantUnassigned !== !!recAfter.profile?.unassigned) {
           const next = applyPlacement(recAfter, want);
+          if (wantUnassigned) next.profile = { ...next.profile, unassigned: true };
+          else if (next.profile?.unassigned) { const { unassigned: _u, ...rest } = next.profile; next.profile = rest; }
           store.writeRecordKeepUpdatedAt({ ...next, id: sessionId });   // 写盘那道关兜底：不进 advanced 专属项目
           recAfter = store.readRecord(sessionId) || next;
         }
-        if (rp.changed) {
+        if (rt.changed && rt.before) {
           placement = {
             projectId: want.projectId || undefined, archived: want.archived,
-            fromProjectId: rp.before.projectId || undefined, fromArchived: rp.before.archived,
+            fromProjectId: rt.before.projectId || undefined, fromArchived: rt.before.archived,
           };
           /* 换了项目要换 memory scope、归档要把执行器让出来 —— 和 followBucketPlacements 一样 */
-          if (rp.before.projectId !== want.projectId || want.archived) {
+          if (rt.before.projectId !== want.projectId || want.archived) {
             const cl = sessionClients.get(sessionId);
             if (cl?.busy || cl?.autonomous) pendingProjectReset.add(sessionId);
             else if (cl) void detachExecutor(sessionId);
@@ -9733,15 +9817,24 @@ ${hint}` : ''}` };
       }
 
       /*
-        **恢复回来默认在本机跑** ——「恢复的会话应该默认在本地，不应该弄到一个本机可能不知道的远程 host 上」。
-        记录里那份 `profile.remote` 是**备份它的那台机器**的配置（主机、密钥路径都是那边的），在这台
-        机器上多半连不上。要跑远端的话右键「运行位置」选一台这台机器认识的。合并那条路本地记录说了算，不动。
+        **恢复后在哪儿跑：本机设置里有那台机器就留在那台，没有才改本机**（规则见 `restoreRunPlan`）——
+        「恢复说『改成在本机跑』却仍连远端」。原来这里一律删掉 `profile.remote` 并说「改成在本机跑」，
+        而记录里那台机器（按 id）在本机设置里就有，attach 按设置里那台照样连了远端：说的和做的对不上。
+        现在：认得的保留远端、提示「仍在 <机器名> 上跑」（attach 按设置里现在的地址连，不用快照）；
+        不认得的（备份它的那台机器的配置，主机、密钥路径都是那边的）才删掉、改成本机跑。
+        合并那条路按本机原来的运行位置（不用合并带回来的云端 remote），同样过一遍本机设置。
       */
       let madeLocal = false;
-      if (!existed && recAfter?.profile?.remote) {
-        delete recAfter.profile.remote;
-        store.writeRecordKeepUpdatedAt({ ...recAfter, id: sessionId });
-        madeLocal = true;
+      let keptRemote: string | undefined;
+      /* 合并的也管：候选是本机原来的运行位置（合并可能带回云端较新那份的 remote），见 `restoreRemote` */
+      if (recAfter?.profile) {
+        const rr = restoreRemote(localBefore, recAfter, sessionRemote, (h) => labelForHost(KIROLEX_CONFIG_PATH, h));
+        if (rr.plan.kind === 'keep') keptRemote = rr.plan.label;
+        if (rr.plan.kind === 'local') madeLocal = true;
+        if (JSON.stringify(recAfter.profile.remote ?? null) !== JSON.stringify(rr.remote ?? null)) {
+          if (rr.remote) recAfter.profile.remote = rr.remote; else delete recAfter.profile.remote;
+          store.writeRecordKeepUpdatedAt({ ...recAfter, id: sessionId });
+        }
       }
       /* 以前在这台机器上删过它的话，墓碑会让它在水化时继续隐身 —— 恢复就是要它回来 */
       clearSessionTombstone(sessionId);
@@ -9750,11 +9843,16 @@ ${hint}` : ''}` };
 
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
-        + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}`
-        + `${placement ? `，位置按云上改成${describePlacement(placement.projectId, placement.archived)}`
+        + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}${keptRemote ? `，仍在 ${keptRemote} 上跑` : ''}`
+        + `${!localBefore && rt ? `，放进${describePlacement(rt.placement.projectId || undefined, rt.placement.archived)}${rt.origin && rt.origin !== rt.placement.projectId ? `（原来在「${rt.origin}」${opts?.putBack ? '，本机没有这个项目' : '，没勾「放回原项目」'}）` : ''}` : ''}`
+        + `${placement ? `，位置改成${describePlacement(placement.projectId, placement.archived)}`
           + `（原来${describePlacement(placement.fromProjectId, placement.fromArchived)}）` : ''}`
         + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
-      return { ok: true, restored, backedUp, merged, memoryFiles, madeLocal, projectId: project || undefined, placement };
+      return {
+        ok: true, restored, backedUp, merged, memoryFiles, madeLocal, keptRemote, projectId: project || undefined, placement,
+        /* 新恢复：云上 / 备份里原来的项目（放进未分组时界面上说一声原来在哪） */
+        ...(!localBefore && rt?.origin ? { origin: rt.origin } : {}),
+      };
     } catch (err: any) {
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
@@ -10340,6 +10438,18 @@ ${hint}` : ''}` };
     entry.lastUsedAt = Date.now();
     // Reconcile the renderer's authoritative projectId onto the executor + record
     // (covers assignment after attach, and executor/profile drift).
+    /*
+      **假项目不进记录、不按它注入记忆** —— 现场：渲染层带来的 projectId 是这条会话自己的 id，
+      记忆按一个不存在的项目注入（`[memory] injected … project=s_1790502638964_in82ze`）。
+      会话 id 形状 / 本机不认识的项目一律当未分组：记录里的纠正写回，记忆按未分组注入。
+    */
+    const knownNow = localKnownProjects();
+    if (projectId !== undefined && bogusProjectReason(projectId, sessionId, knownNow)) {
+      logger.warn('session', `prompt: ${sessionId} 带来的项目 ${JSON.stringify(projectId)} 不是真项目，按未分组`);
+      projectId = undefined;
+    }
+    { const r = store.readRecord(sessionId); if (r) fixBogusProject(r, knownNow, 'prompt'); }
+    if (bogusProjectReason(entry.profile.projectId, sessionId, knownNow)) { delete entry.profile.projectId; entry.profile.unassigned = true; }
     if (projectId !== undefined && projectId !== entry.profile.projectId) {
       entry.profile.projectId = projectId;
       const r = store.readRecord(sessionId);
@@ -15303,8 +15413,11 @@ ${hint}` : ''}` };
         throw new Error(tr('This session does not exist on disk (it may have been deleted), so it will not be rebuilt.'));
       }
       const derived = derivedProjectFor(sessionId, resolvedCwd);
-      /* 你亲手移出项目的，不按目录再反推回去（见 `AgentProfile.unassigned`） */
-      const projectId = existing?.profile.projectId ?? (existing?.profile.unassigned ? undefined : derived);
+      /* 记录里的项目不是真项目（会话 id 形状 / 本机不认识）→ 先纠正成未分组写回（`fixBogusProject`） */
+      const known = localKnownProjects();
+      const placed = fixBogusProject(existing, known, 'attach').profile;
+      /* 你亲手移出项目的，不按目录再反推回去（见 `AgentProfile.unassigned`）；推出来的也得是本机认的项目 */
+      const projectId = sanitizeProjectId(placed.projectId ?? (placed.unassigned ? undefined : derived), sessionId, known);
       /*
         **Claude Code / Codex 会话不采信渲染层带来的模型名** —— 渲染层 attach 带的是 kiro 的（没记过就是 DEFAULT_MODEL），
         原来它会被当成"实际起来的模型"写进这条会话的记录（连 `modelEarnedOn` 一起）。它们的模型由 `engineModels` +
@@ -15334,7 +15447,7 @@ ${hint}` : ''}` };
         permissionMode: existing?.profile.permissionMode || 'auto-approve',
         projectId,
         /* 白名单：漏了的话下一次把 entry.profile 整份写回记录（切模型等）就把这个标记丢了 */
-        ...(existing?.profile.unassigned ? { unassigned: true as const } : {}),
+        ...(placed.unassigned ? { unassigned: true as const } : {}),
         kiroAgent: existing?.profile.kiroAgent,
         // Persisted remote target survives restarts; a remote session re-attaches
         // over SSH to the SAME machine (by id) —— 但地址、连法按设置里现在的配置（`liveSessionRemote`）：
@@ -15510,6 +15623,18 @@ ${hint}` : ''}` };
       const adopted = adoptRecordFields(profile, latestProfile);
       if (!adopted.engineModels) delete profile.engineModels;
       Object.assign(profile, adopted);
+      /*
+        **项目归属也按记录来** ——「那个会话老往 Blog 项目里跑」：挂载开头读的那份记录可能是几十秒前的（远端连接慢），
+        这期间用户把它移出 / 换了项目的话（`acp:move-session` 只改盘，这时还没有执行器可重置），执行器拿着旧项目，
+        下面的 session-ready 把旧项目发给渲染层，渲染层又把它放回旧项目、下一轮发消息再写回盘上。
+        只在记录里的位置**真的变了**时跟（没变就保留这次按目录推出来的）。
+      */
+      if (latestProfile && ((latestProfile.projectId ?? '') !== (placed.projectId ?? '') || !!latestProfile.unassigned !== !!placed.unassigned)) {
+        const now = keepRecordPlacement(profile, latestProfile);
+        const pid = sanitizeProjectId(now.projectId, sessionId, known);
+        if (pid) profile.projectId = pid; else delete profile.projectId;
+        if (now.unassigned) profile.unassigned = true; else delete profile.unassigned;
+      }
       sessionClients.set(sessionId, entry);
       /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
       wireSession(sessionId, entry);
@@ -17427,7 +17552,9 @@ ${hint}` : ''}` };
     const tombstoned = new Set([...loadSessionTombstones(), ...deletedSessionIds]);
     /* 设置里现有的机器 —— 只读一次，下面每条远程会话按它认回 remote id */
     const remoteTargetsNow = listRemoteTargets(KIROLEX_CONFIG_PATH);
-    return store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((rec) => ({
+    /* 项目不是真项目的（会话 id 形状 / 本机不认识）读的时候就纠正成未分组并写回（`fixBogusProject`） */
+    const known = localKnownProjects();
+    return store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((r) => fixBogusProject(r, known, 'hydrate')).map((rec) => ({
       id: rec.id,
       title: rec.title,
       projectId: rec.profile?.projectId,

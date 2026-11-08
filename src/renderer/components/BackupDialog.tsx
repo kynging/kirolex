@@ -133,6 +133,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   const [bucketMemory, setBucketMemory] = useState<Record<string, { bytes: number; lastModified: string }>>({});
   const [err, setErr] = useState('');
   const [picked, setPicked] = useState<Set<string>>(new Set());
+  /** 「放回原项目」—— 默认不勾：从云端恢复的一律进「未分组」（本机有同名项目、勾了才放回去，见主进程 `restoreTarget`） */
+  const [putBack, setPutBack] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
 
   /* --- 云端回收站 tab --- */
@@ -327,9 +329,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
   const restore = async (): Promise<void> => {
     if (!chosen.length) return;
-    const moving = chosen.filter((e) => e.existsLocally && e.placementWillChange);
+    /* 不勾「放回原项目」时本机已有的保持本机的位置，不跟云上挪 */
+    const moving = putBack ? chosen.filter((e) => e.existsLocally && e.placementWillChange) : [];
     const lines = [
       t('About to restore {n} sessions.', { n: chosen.length }),
+      '', putBack
+        ? t('Restored sessions go back into their original project if a project with that name exists on this machine; otherwise into "Unassigned".')
+        : t('Restored sessions go into "Unassigned", including ones that already exist locally (tick "Put back into original project" to keep their project).'),
       ...(moving.length
         ? ['', t('{n} of them will move to another project or change archive state to match the cloud (it was moved there more recently).', { n: moving.length })]
         : []),
@@ -352,7 +358,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     /* 一条一条来：并发恢复会同时写 trash 和 sessions，而失败要能说清是**哪一条** */
     for (const e of chosen) {
       try {
-        const r = await api()?.restoreS3Session?.(e.id);
+        const r = await api()?.restoreS3Session?.(e.id, { putBack });
         if (r?.ok) {
           restoredIds.push(e.id);
           /* 位置变成"不归档"的：侧栏水化要等它的 archived 落定再预热（见 useAcp 的 onRestored） */
@@ -361,9 +367,18 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
               ? t(' (merged {added} messages, kept the local copy of {clashed} with the same id)', { added: r.merged.added, clashed: r.merged.clashed })
               : t(' (merged {added} messages)', { added: r.merged.added })}`
             + (r.placement
-              ? t(', moved to "{to}"{toArchived} to match the cloud', { to: projectLabel(r.placement.projectId, t), toArchived: r.placement.archived ? t(' (archived)') : '' })
+              ? (putBack
+                ? t(', moved to "{to}"{toArchived} to match the cloud', { to: projectLabel(r.placement.projectId, t), toArchived: r.placement.archived ? t(' (archived)') : '' })
+                : t(', moved to "{to}"{toArchived}', { to: projectLabel(r.placement.projectId, t), toArchived: r.placement.archived ? t(' (archived)') : '' }))
                 + t(' (was in "{from}"{fromArchived})', { from: projectLabel(r.placement.fromProjectId, t), fromArchived: r.placement.fromArchived ? t(', archived') : '' })
-              : ''));
+              : '')
+            /* 新恢复的放在哪儿、在哪儿跑 —— 和主进程实际做的一致（见 s3:restore） */
+            + (!e.existsLocally
+              ? (r.projectId
+                ? t(', put back into "{project}"', { project: r.projectId })
+                : r.origin ? t(', put in "Unassigned" (was in "{project}")', { project: r.origin }) : '')
+              : '')
+            + (r.keptRemote ? t(', still runs on {machine}', { machine: r.keptRemote }) : r.madeLocal ? t(', now runs on this machine') : ''));
           files += Number(r.restored) || 0;
         } else bad.push(`${e.title || e.id}${t(': ')}${r?.error || t('Failed')}`);
       } catch (x: any) {
@@ -378,7 +393,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     setMsg({
       kind: bad.length ? 'bad' : 'ok',
       text: [
-        ok.length ? t('Processed {n} sessions ({files} files):', { n: ok.length, files }) + `\n${ok.map((x) => `  · ${x}`).join('\n')}\n` + t('They are back in the sidebar and connecting (running on this machine; to run remotely, right-click and pick a machine under "Run on").') : '',
+        ok.length ? t('Processed {n} sessions ({files} files):', { n: ok.length, files }) + `\n${ok.map((x) => `  · ${x}`).join('\n')}\n` + t('They are back in the sidebar and connecting. To change where one runs, right-click it and pick a machine under "Run on".') : '',
         bad.length ? t('{n} failed:', { n: bad.length }) + `\n${bad.join('\n')}` : '',
       ].filter(Boolean).join('\n'),
     });
@@ -586,6 +601,10 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 {armDelete && !!stillLocal.length && (
                   <span className="settings-hint">{t('{n} of them still exist locally; they are only backed up again if they change later', { n: stillLocal.length })}</span>
                 )}
+                <label className="settings-hint" title={t('Only when a project with the same name exists on this machine. Off: restored sessions go into "Unassigned".')}>
+                  <input type="checkbox" checked={putBack} disabled={!!busy} onChange={(ev) => setPutBack(ev.target.checked)} />
+                  {' '}{t('Put back into original project')}
+                </label>
                 {!armDelete && !!merging.length && (
                   <span className="settings-hint">{t('{n} of them will be merged with the local copy', { n: merging.length })}</span>
                 )}

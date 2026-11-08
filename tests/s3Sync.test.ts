@@ -1150,8 +1150,9 @@ describe('恢复 ——「我尝试恢复但没有生效」', () => {
     assert.doesNotMatch(body, /overwrite: true/, '会话记忆不再直接覆盖');
   });
 
-  test('新恢复的默认在本机跑（远端那份是备份它的那台机器的配置）；墓碑清掉', () => {
-    assert.match(body, /if \(!existed && recAfter\?\.profile\?\.remote\) \{\s*delete recAfter\.profile\.remote;/);
+  test('新恢复的：本机设置里不认得那台机器就改本机跑（认得的保留，见 restoreRunPlan）；墓碑清掉', () => {
+    assert.match(body, /const rr = restoreRemote\(localBefore, recAfter, sessionRemote,/);
+    assert.match(body, /if \(rr\.remote\) recAfter\.profile\.remote = rr\.remote; else delete recAfter\.profile\.remote;/);
     assert.match(body, /clearSessionTombstone\(sessionId\);/);
   });
 

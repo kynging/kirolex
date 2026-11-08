@@ -79,8 +79,20 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   ' (was in "{from}"{fromArchived})': '（原来在「{from}」{fromArchived}）',
   ', archived': '·已归档',
   'Processed {n} sessions ({files} files):': '已处理 {n} 条（{files} 个文件）：',
-  'They are back in the sidebar and connecting (running on this machine; to run remotely, right-click and pick a machine under "Run on").':
-    '已经放回侧栏、正在连接（在本机跑 —— 要跑远端，右键「运行位置」选一台）。',
+  'They are back in the sidebar and connecting. To change where one runs, right-click it and pick a machine under "Run on".':
+    '已经放回侧栏、正在连接。要换运行的机器，右键「运行位置」选一台。',
+  ', put back into "{project}"': '，放回「{project}」',
+  ', put in "Unassigned" (was in "{project}")': '，放进「未分组」（原来在「{project}」）',
+  ', still runs on {machine}': '，仍在 {machine} 上跑',
+  ', now runs on this machine': '，改成在本机跑',
+  'Restored sessions go back into their original project if a project with that name exists on this machine; otherwise into "Unassigned".':
+    '恢复的会话：本机有同名项目的放回原项目，没有的放进「未分组」。',
+  'Restored sessions go into "Unassigned", including ones that already exist locally (tick "Put back into original project" to keep their project).':
+    '恢复的会话一律放进「未分组」，本机已有的也一样（要放回原项目，勾上「放回原项目」）。',
+  ', moved to "{to}"{toArchived}': '，放进「{to}」{toArchived}',
+  'Put back into original project': '放回原项目',
+  'Only when a project with the same name exists on this machine. Off: restored sessions go into "Unassigned".':
+    '只在本机有同名项目时放回去。不勾：恢复的会话放进「未分组」。',
   '{n} failed:': '有 {n} 条没成：',
   'No bucket configured yet (Settings → ☁️ Backup)': '还没配桶（设置 → ☁️ 备份）',
   'Sync': '同步',

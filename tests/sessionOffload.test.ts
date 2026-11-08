@@ -505,7 +505,7 @@ describe('接线：占位下载走暂存实现', () => {
   const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
   test('s3:restore 碰到占位就转给 offloadRestoreImpl（在写任何文件之前）；有占位就不许挂载', () => {
     const h = M.slice(M.indexOf("ipcMain.handle('s3:restore'"));
-    const redirect = h.indexOf('if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId);');
+    const redirect = h.indexOf('if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId, opts);');
     assert.ok(redirect > 0 && redirect < h.indexOf('listObjects('), '要在动本地文件之前');
     const fn = M.slice(M.indexOf('function isOffloadedPlaceholder('), M.indexOf('async function offloadRestoreImpl('));
     /* 占位文件读得了：只看占位（半份目录不会让它消失）；只有占位文件坏了才退回看本机有没有记录 */

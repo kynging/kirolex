@@ -209,7 +209,8 @@ describe('接线', () => {
 
   test('s3:restore 按 restorePlacement 定位置、写回、通知侧栏，不再一律取消归档', () => {
     const b = body('s3:restore');
-    assert.match(b, /restorePlacement\(/);
+    /* 位置由 restoreTarget 定（合并且勾了「放回原项目」时它内部走 restorePlacement 的「谁后挪用谁」） */
+    assert.match(b, /restoreTarget\(\{/);
     assert.match(b, /applyPlacement\(/);
     assert.match(b, /session:placement-changed/);
     assert.doesNotMatch(b, /unarchiveRestoredRecord|wasArchived/);

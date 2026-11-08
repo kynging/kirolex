@@ -43,6 +43,8 @@ import { adapterInstallStore, setAdapterInstallRunner, setEngineLoginRunner } fr
 import { visibleProjects, projectMembershipKey } from '../projectVisibility';
 import { reconcileWithStore } from '../messageReconcile';
 import { engineLabel } from '../engineLabel';
+import { looksLikeSessionId } from '../../main/projectSanity.ts';
+import { initialProjects, initialSessions, seedProjectsFromSessions } from '../projectSeed.ts';
 import { wantsEditFork } from '../../main/editFork.ts';
 import { planTextOf } from '../permissionButtons.ts';
 import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
@@ -438,7 +440,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Load persisted sessions
     try {
       const saved = uiGet('kirolex-sessions');
-      if (saved) return JSON.parse(saved);
+      /* 旧缓存里 s_ 开头的归属（会话自己的 id）当未分组 —— 见 projectSeed.ts */
+      if (saved) return initialSessions(JSON.parse(saved));
     } catch {}
     return [];
   });
@@ -451,10 +454,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   });
   // Projects: explicit, user-created grouping (write-once memory scope §6.4).
   // A project is just a name; membership is a session's projectId.
+  /*
+    列表里 s_ 开头的假项目去掉（下面持久化的 effect 会把纠正后的列表写回）；列表读不到时才从旧的会话缓存补
+    —— 列表在的时候它就是权威，旧缓存里的归属不自动注册成项目（见 projectSeed.ts）。
+  */
   const [projects, setProjects] = useState<string[]>(() => {
+    let cached: { projectId?: string }[] = [];
+    try { const raw = uiGet('kirolex-sessions'); if (raw) cached = JSON.parse(raw); } catch {}
     try {
-      const saved = uiGet('kirolex-projects');
-      if (saved) return JSON.parse(saved);
+      return seedProjectsFromSessions(initialProjects(uiGet('kirolex-projects')), Array.isArray(cached) ? cached : []);
     } catch {}
     return [];
   });
@@ -2337,7 +2345,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // Rebuild the projects list from disk projectIds so restored projects
         // (e.g. test/test2) reappear as groups instead of collapsing to Unassigned.
         const diskProjects = Array.from(
-          new Set(disk.map((r) => r.projectId).filter(Boolean) as string[])
+          new Set(disk.map((r) => r.projectId).filter((p: any) => p && !looksLikeSessionId(p)) as string[])
         );
         if (diskProjects.length) {
           setProjects((prev) => Array.from(new Set([...prev, ...diskProjects])));
@@ -2419,15 +2427,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   }, [projects, membership]);
   const shownProjects = useMemo(() => visibleProjects(projects, hiddenProjects), [projects, hiddenProjects]);
 
-  // Seed the projects list from any projectIds already present on sessions.
-  useEffect(() => {
-    const fromSessions = Array.from(
-      new Set(sessions.map((s) => s.projectId).filter(Boolean) as string[])
-    );
-    if (fromSessions.length) {
-      setProjects((prev) => Array.from(new Set([...prev, ...fromSessions])));
-    }
-  }, []);
+  // 从会话补项目列表：挪进了上面 projects 的初始化（只在列表读不到时补，见 projectSeed.ts）。
 
   useEffect(() => {
     if (!window.kiroApi) return;
@@ -3188,7 +3188,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const sid = data?.sessionId;
       if (!sid) return;
       clearConnecting(sid);
-      if (data.projectId) {
+      /* 形如会话 id 的不是项目（「侧栏冒出一个叫 s_… 的项目」，见 projectSanity.ts）—— 主进程已经不发了，这里再挡一道 */
+      if (data.projectId && !looksLikeSessionId(data.projectId)) {
         setSessions((prev) =>
           prev.map((s) => (s.id === sid && !s.projectId ? { ...s, projectId: data.projectId } : s))
         );

@@ -26,13 +26,15 @@ describe('移出项目要留得住', () => {
   });
 
   test('attach 不再无条件反推', () => {
-    assert.match(MAIN, /existing\?\.profile\.projectId \?\? \(existing\?\.profile\.unassigned \? undefined : derived\)/);
+    /* placed = 记录（先纠正掉假项目，见 projectSanity.ts）的 profile —— 有 unassigned 就不按目录反推 */
+    assert.match(MAIN, /const placed = fixBogusProject\(existing, known, 'attach'\)\.profile;/);
+    assert.match(MAIN, /placed\.projectId \?\? \(placed\.unassigned \? undefined : derived\)/);
     /* 会话创建时照旧反推：在项目目录里开的新对话本来就属于那个项目 */
     assert.ok(MAIN.includes('projectId: projectId ?? derived,'), '创建那处保持原样');
   });
 
   test('attach 的 profile 白名单带上这个标记 —— 否则下一次把 entry.profile 写回记录就丢了', () => {
-    assert.match(MAIN, /existing\?\.profile\.unassigned \? \{ unassigned: true as const \} : \{\}/);
+    assert.match(MAIN, /placed\.unassigned \? \{ unassigned: true as const \} : \{\}/);
   });
 
   test('两条"移出去"的路都记这一笔', () => {

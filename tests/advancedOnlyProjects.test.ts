@@ -327,7 +327,7 @@ describe('index.ts: the send / sync / restore paths use the shared project crite
     const h = main.slice(main.indexOf("ipcMain.handle('s3:restore'"));
     const body = h.slice(0, h.indexOf('\n  });'));
     assert.ok(body.indexOf("if ('refused' in vetted) return") < body.indexOf('backedUp = trashDirFor('));
-    assert.match(body, /restorePlacement\(localBefore, catalogEntry, store\.isAdvancedOnlyProjectName\)/);
+    assert.match(body, /restoreTarget\(\{[\s\S]*?refuseProject: store\.isAdvancedOnlyProjectName,/);
     assert.match(body, /!store\.isAdvancedOnlyProjectName\(project\) \? \[`\$\{keyFor\(cfg\.prefix, path\.join\('memory', 'projects', project\)\)\}\/`\]/);
   });
 

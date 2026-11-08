@@ -150,7 +150,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ok: boolean; error?: string; sessions?: number; deleted?: number; failed?: string[];
   }> => ipcRenderer.invoke('s3:delete-project', project, confirm),
   /** 恢复一条会话（覆盖同 id，覆盖前本地那份会被挪进 trash）。 */
-  restoreS3Session: (sessionId: string) => ipcRenderer.invoke('s3:restore', sessionId),
+  restoreS3Session: (sessionId: string, opts?: { putBack?: boolean }) => ipcRenderer.invoke('s3:restore', sessionId, opts),
   onS3SyncDone: (cb: (d: any) => void) => {
     const h = (_e: any, d: any) => cb(d);
     ipcRenderer.on('s3:sync-done', h);
