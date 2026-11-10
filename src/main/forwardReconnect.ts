@@ -25,6 +25,18 @@ export function forwardReconnectVerdict(s: {
   return 'go';
 }
 
+/**
+ * **执行器交配置之前再对一遍等着挂上的名单**（接线在 index.ts 的 `promoteReadyForwards`）——
+ * 准备到 session/new 之间隔着整段 ssh + 适配器启动（远端要二三十秒），这期间就绪了的（HTTP 探测通过、stdio 起来了）
+ * 直接交给这个执行器，从名单里拿掉；不然它空闲后还要白断开重连一次（`forwardReconnectVerdict` 见到不在名单里就 cancel）。
+ */
+export function takeReadyAwaiting(awaiting: string[] | undefined, readyNow: (name: string) => boolean): { promoted: string[]; rest: string[] } {
+  const promoted: string[] = [];
+  const rest: string[] = [];
+  for (const n of awaiting || []) (readyNow(n) ? promoted : rest).push(n);
+  return { promoted, rest };
+}
+
 export function retryUntilIdle(
   check: () => ReconnectCheck,
   run: () => void,

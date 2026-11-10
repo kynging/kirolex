@@ -188,7 +188,7 @@ export class AcpClient extends EventEmitter {
   private buffer = '';
   private env: Record<string, string>;
   private remote?: RemoteTarget;
-  private localTools?: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[] };
+  private localTools?: { remotePort: number; localPort: number; agentOverride: string; mcpServers?: any[]; refreshHanded?: () => Promise<void> };
   /** 最近一点 stderr —— ssh 退出码 255 的**原因**在里面（见 stderr 处理那一段）。 */
   private lastStderr = '';
   /** 这次起执行器走的复用连接（`ControlPath`）；没走复用是 undefined。 */
@@ -239,6 +239,8 @@ export class AcpClient extends EventEmitter {
       remotePort: number; localPort: number; agentOverride: string;
       /** 非 kiro 引擎：本地工具通道直接作为 ACP 的 `mcpServers` 交给 session/new / load（kiro 走 agent JSON）。 */
       mcpServers?: any[];
+      /** 交出 `mcpServers` 之前调：准备之后才就绪的转发补进去（index.ts `promoteReadyForwards`）。 */
+      refreshHanded?: () => Promise<void>;
     },
     engine: Engine = 'kiro',
   ) {
@@ -643,7 +645,13 @@ export class AcpClient extends EventEmitter {
     return this.engine !== 'kiro' ? (this.localTools?.mcpServers || []) : [];
   }
 
+  /** 交 session/new / load / fork 之前：先让本地工具通道把准备之后才就绪的转发补进 `mcpServers`（补不了照旧交原来那份）。 */
+  private async refreshHanded(): Promise<void> {
+    try { await this.localTools?.refreshHanded?.(); } catch { /* 只是补一次 */ }
+  }
+
   async newSession(cwd: string): Promise<{ sessionId: string }> {
+    await this.refreshHanded();
     const r = await this.sendRequest('session/new', {
       cwd,
       mcpServers: this.mcpServers,
@@ -660,6 +668,7 @@ export class AcpClient extends EventEmitter {
    * `editFork.forkPointMeta`）。只返回新 id —— 要用它得再 `loadSession`。
    */
   async forkSession(sessionId: string, cwd: string, meta?: Record<string, unknown>): Promise<{ sessionId: string }> {
+    await this.refreshHanded();
     const r = await this.sendRequest('session/fork', {
       sessionId,
       cwd,
@@ -671,6 +680,7 @@ export class AcpClient extends EventEmitter {
   }
 
   async loadSession(sessionId: string, cwd: string): Promise<any> {
+    await this.refreshHanded();
     const r = await this.sendRequest('session/load', {
       sessionId,
       cwd,

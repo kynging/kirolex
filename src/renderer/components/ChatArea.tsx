@@ -72,6 +72,7 @@ import { visit } from 'unist-util-visit';
 import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, switchFailureNotice, cleanIpcError, type RequestStatusMap, type SwitchWhat } from '../sessionRequestStatus.ts';
 import { comboSelectView, type ComboListView } from '../comboPick.ts';
 import { effortPickerView } from '../effortPick.ts';
+import { engineModelPlaceholder, engineModelsReaskDelay, shouldReaskEngineModels } from '../engineModelView.ts';
 import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall, toolsSummaryOf } from '../toolRows.ts';
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
@@ -4237,11 +4238,26 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (!nonKiro || !currentSessionId) return;
     const api = (window as any).kiroApi;
     let alive = true;
+    /* 推送和问回来的哪个先到都算拿到；连着却没拿到（问早了：主进程那边还没挂上）就过一会儿再问，直到拿到（engineModelView.ts） */
+    let got = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const connected = status === 'connected';
+    const take = (d: any) => { got = true; if (timer) clearTimeout(timer); setEngineModels(d); };
     const off = api?.onEngineModels?.((d: any) => {
-      if (d?.sessionId === currentSessionId) setEngineModels(d);
+      if (d?.sessionId === currentSessionId) take(d);
     });
-    void api?.engineModels?.(currentSessionId).then((d: any) => { if (alive && d) setEngineModels(d); }).catch(() => {});
-    return () => { alive = false; try { off?.(); } catch { /* 卸载 */ } };
+    const ask = (n: number) => {
+      void api?.engineModels?.(currentSessionId).then((d: any) => {
+        if (got) return;
+        if (alive && d) setEngineModels(d);
+        if (d) { got = true; return; }
+        if (alive && shouldReaskEngineModels(d, connected)) timer = setTimeout(() => ask(n + 1), engineModelsReaskDelay(n));
+      }).catch(() => {
+        if (alive && !got && connected) timer = setTimeout(() => ask(n + 1), engineModelsReaskDelay(n));
+      });
+    };
+    ask(0);
+    return () => { alive = false; if (timer) clearTimeout(timer); try { off?.(); } catch { /* 卸载 */ } };
   /* sessionConnected：新会话的记录（带默认组合）是连上之后才写的，连上时再读一遍 */
   }, [nonKiro, currentSessionId, engine, status, sessionConnected]);
   /*
@@ -6005,7 +6021,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           {engineModels.options.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)}
                         </>
                       ) : (
-                        <option value="">{status === 'connected' ? t('Default model') : t('Connecting…')}</option>
+                        <option value="">{engineModelPlaceholder(engineModels, status === 'connected') === 'Default model' ? t('Default model') : t('Connecting…')}</option>
                       )}
                     </select>
                   )}

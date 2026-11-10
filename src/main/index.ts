@@ -123,7 +123,7 @@ import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from
 import { forkPointMeta, mainlineAcpMessageId, planEditFork, supportsForkPoint } from './editFork.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
-import { forwardReconnectVerdict, retryUntilIdle, watchHttpForward, reconnectBlockedBy, httpHandedNow } from './forwardReconnect.ts';
+import { forwardReconnectVerdict, retryUntilIdle, watchHttpForward, reconnectBlockedBy, httpHandedNow, takeReadyAwaiting } from './forwardReconnect.ts';
 import {
   forwardableFrom, localAgentJson, normalizeForwardList, remoteForwardPlan, isHttpForward,
   remoteComboMcpServers, adapterForwardPlan, localKiroMcpSources, notForwardedWhy, type ForwardListItem,
@@ -2185,7 +2185,7 @@ function unpinSessionNotice(sessionId: string, prefix: string): void {
  * server 懒启动：没有远程会话的时候不开端口。
  */
 let localMcpServer: LocalMcpServer | undefined;
-type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[]; awaitingForward?: string[]; httpEntries?: HttpMcpEntry[]; direct?: string[] };
+type LocalToolsSpec = { remotePort: number; localPort: number; agentOverride: string; forwarded?: string[]; forwardedHttp?: string[]; mcpServers?: any[]; skipped?: Array<{ name: string; reason: string }>; unavailable?: ForwardUnavailable[]; awaitingForward?: string[]; httpEntries?: HttpMcpEntry[]; direct?: string[]; refreshHanded?: () => Promise<void> };
 const localToolsBySession = new Map<string, LocalToolsSpec>();
 /** 远程会话上次备本地工具时用的本机目录：远端端口被占、要换端口重备一次时用（`remotePortRearm`）。 */
 const localToolsDirBySession = new Map<string, string>();
@@ -2393,6 +2393,49 @@ function noteForwardNotReady(server: LocalMcpServer, sessionId: string, spec: Lo
   void server.readyProxies(sessionId, { deadlineMs: 0 }).then((rs) => {
     for (const r of rs) if (r.ok && spec.awaitingForward?.includes(r.name)) forwardProxyState(sessionId, r.name, 'up');
   }).catch(() => { /* 只是补一次，失败了等它自己报 up */ });
+}
+
+/**
+ * **执行器交 mcpServers 之前（session/new / load / fork），准备之后才就绪的转发补进去**（Claude Code / Codex 分支的 `spec.refreshHanded`）——
+ * 「远程 Claude Code 会话：回复完又白重连一次」（s_1792550354705_bq53af）：06:38:20 准备时 context7 还没探过、没交；
+ * 06:38:22 探测通过；06:38:47 新执行器 session/new 交的仍是准备时那份，于是回复完空闲后又断开重连一次挂它。
+ * 现在这一刻已就绪的（HTTP / 远端起的：`HTTP_FRESH_MS` 内证实过；stdio：代理已 up）直接交、移出 awaitingForward，
+ * 那次「后来就绪 → 等空闲重连」见到不在名单里就取消（`forwardReconnectVerdict`）。spec 已被换掉就不动。
+ */
+async function promoteReadyForwards(
+  server: LocalMcpServer, sessionId: string, spec: LocalToolsSpec, remote: RemoteTarget,
+  local: ForwardEntry[], remoteRun: PlacedRemote[], tunnelBase: string,
+): Promise<void> {
+  if (localToolsBySession.get(sessionId) !== spec || !spec.awaitingForward?.length) return;
+  const waiting = spec.awaitingForward;
+  const stdioUp = new Set<string>();
+  if (local.some((e) => !isHttpForward(e) && waiting.includes(e.name))) {
+    const rs = await server.readyProxies(sessionId, { deadlineMs: 0 }).catch(() => []);
+    for (const r of rs) if (r.ok) stdioUp.add(r.name);
+    if (localToolsBySession.get(sessionId) !== spec) return;
+  }
+  const now = Date.now();
+  const { promoted, rest } = takeReadyAwaiting(spec.awaitingForward, (name) => {
+    const e = local.find((x) => x.name === name);
+    if (e) return isHttpForward(e) ? httpHandedNow(httpForwardOkAt.get(httpForwardKey(e)), now) : stdioUp.has(name);
+    const p = remoteRun.find((x) => x.entry.name === name);
+    return !!p && httpHandedNow(remoteRunOkAt.get(remoteRunKey(remote, p)), now);
+  });
+  if (!promoted.length) return;
+  const added: any[] = [];
+  for (const name of promoted) {
+    const e = local.find((x) => x.name === name);
+    if (e) {
+      added.push(...remoteComboMcpServers([e], tunnelBase));
+      if (isHttpForward(e)) (spec.forwardedHttp ||= []).push(name); else (spec.forwarded ||= []).push(name);
+    } else {
+      added.push(remoteStdioServer(remoteRun.find((x) => x.entry.name === name)!));
+    }
+    clearForwardUnavailable(spec, name);
+  }
+  spec.mcpServers = [...(spec.mcpServers || []), ...added];
+  spec.awaitingForward = rest;
+  logger.info('localmcp', `准备之后就绪的转发 MCP 这次直接交给执行器（不再等空闲重连）：${promoted.join(', ')} sessionId=${sessionId}`);
 }
 
 /**
@@ -3000,6 +3043,7 @@ async function ensureLocalTools(
           ...remoteReady.filter((x) => !x.r.ok).map((x) => x.p.entry.name),
         ],
       };
+      spec.refreshHanded = () => promoteReadyForwards(server, sessionId, spec, remote, localEntries, placed.remote, mcpUrl(remotePort, urlPath));
       if (localEntries.length) {
         logger.info('localmcp', `转发本机 MCP 给 sessionId=${sessionId}：${localEntries.map((e) => e.name).join(', ')}`
           + `（组合「${combo.name}」：${fromCombo.join(', ') || '无'}；设置名单：${fromList.join(', ') || '无'}）`);
@@ -3887,7 +3931,11 @@ const remoteRecovery = new RemoteRecovery<{ key: string; remote: RemoteTarget }>
   reattach: async (sessionId) => !!(await reattachSession?.(sessionId)),
   notice: (sessionId, text, sticky, group) => (sticky ? stickySessionNotice(sessionId, text, group) : sessionNotice(sessionId, text, { group })),
   /* 渲染层只在它自己 loadSession 成功时才把会话标成"连着" —— 主进程接上的要告诉它 */
-  recovered: (sessionId) => { mainWindow?.webContents.send('acp:reattached', { sessionId }); },
+  recovered: (sessionId) => {
+    mainWindow?.webContents.send('acp:reattached', { sessionId });
+    /* 模型下拉的清单也补推一次（同一个执行器 applyEngineModel 末尾推过，渲染层那时可能还没把它当连着、清掉了） */
+    pushEngineModels(sessionId);
+  },
   log: (message) => logger.info('remote', message),
 });
 function startRemoteRecovery(sessionId: string, opts: { quiet?: boolean } = {}): void {
@@ -7696,7 +7744,20 @@ async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise
       logger.warn('engine-model', `重设 ${ENGINE_LABEL[engine]} ${cat}=${want} 失败 sessionId=${sessionId}`, err);
     }
   }
-  if (sessionClients.get(sessionId) === entry) mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
+  /* 按执行器认，不按 entry 对象认：这期间 entry 被换成别的对象（执行器没换）也要推 —— 不推的话下拉一直停在没清单 */
+  if (sessionClients.get(sessionId)?.client === entry.client) pushEngineModels(sessionId);
+}
+
+/**
+ * **把这条会话现在的模型清单推给渲染层**（`session:engine-models`）：按此刻 `sessionClients` 里那个执行器算，没连着 / kiro 不推。
+ * 挂上后（`applyEngineModel` 末尾）和断线自动恢复接回来时（`remoteRecovery` 的 `recovered`）都推一次 ——
+ * 渲染层在重连 / 切换期间清掉了清单（`setEngineModels(null)`），不推它就一直停在「连接中…」。
+ */
+function pushEngineModels(sessionId: string): boolean {
+  const entry = sessionClients.get(sessionId);
+  if (!entry || engineOf(entry.profile) === 'kiro') return false;
+  mainWindow?.webContents.send('session:engine-models', engineModelsPayload(sessionId, entry));
+  return true;
 }
 
 /**
@@ -10234,7 +10295,12 @@ ${hint}` : ''}` };
       entry 还不在 —— 等这次切换落定再发，别报「Session not connected」把循环打断。
     */
     if (attempt === 0 && reconfiguringSessions.has(sessionId)) {
-      try { await awaitReconfigureIdle(sessionId); } catch { /* 等不到就照常往下走，下面会说清楚 */ }
+      try { await awaitReconfigureIdle(sessionId); } catch { /* 等不到：下面不交给正被换下来的那个执行器 */ }
+      /*
+        **还在换执行器就不发** —— 这时 `sessionClients` 里还是旧的那个（本机 → 远端时就是本机那个），
+        往下走等于把这条消息在旧位置上跑一轮、马上又被换掉打断。明说，让人等切换落定再发。
+      */
+      if (reconfiguringSessions.has(sessionId)) throw new Error(tr('Another switch (model / agent / machine) has not finished yet.'));
     }
     // `let`, not `const`: a mid-flight model swap (retired model) replaces this
     // session's executor, and the rest of the turn must continue on the new one.
