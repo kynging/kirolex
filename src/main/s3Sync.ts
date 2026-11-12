@@ -349,6 +349,9 @@ export function memoryRelsFor(root: string, sessionIds: string[], projects: stri
  *
  * "桶里动过"的判据：记着上次看到的 LastModified 就比它；刚传完还没读到（`remoteAt` 为 0）就比大小 ——
  * 不拿本机时钟去比服务器时钟，两边差一秒就会把自己刚传的当成"别人改的"再拉回来。
+ *
+ * 两边都有这份时，这里的 pull / upload 只说明「这一轮要动」—— 真正怎么动由 `memorySyncStep` 比过内容再定
+ * （一边空白才整份拿，都有内容就合并）。
  */
 export function decideMemory(
   local: { size: number; mtimeMs: number } | undefined,
@@ -373,6 +376,66 @@ export function decideMemory(
 }
 
 /**
+ * **一份记忆这一轮怎么同步 —— 两边都有就先比内容，不整份覆盖** —— 实测撞过：kyn-desktop 把 Dev 从不同步的
+ * 项目里拿出来后第一轮，「本机第一次同步就拉」把本机 32855 B 的会话记忆盖成桶里 11921 B 的那份；两台各自往
+ * 同一条会话的记忆里记过东西，本机这半个月记的就只剩 trash 里那一份了。
+ *
+ *   · `decideMemory` 说什么都不用做（两边都没动）→ `none`。
+ *   · 只有一边有这份文件 → 照它说的直接拉 / 直接传。
+ *   · 两边都有（不论是不是第一次同步、哪边动过）→ 先要内容（`fetch`：调用方去桶里拿回来再问一次），
+ *     然后：本机空白 → `pull`；桶里空白 → `upload`；桶里有本机没有的行 → `merge`（本机为底补上，写回再传）；
+ *     桶里没有本机缺的 → `upload`；一模一样 → `same`（只记下状态）。
+ */
+export type MemoryStep =
+  | { kind: 'none' | 'fetch' | 'pull' | 'upload' | 'same' }
+  | { kind: 'merge'; text: string; extraLines: number };
+
+export function memorySyncStep(
+  local: { size: number; mtimeMs: number } | undefined,
+  remote: { size: number; at: number } | undefined,
+  last: FileState | undefined,
+  texts?: { local: string; remote: string },
+): MemoryStep {
+  const action = decideMemory(local, remote, last);
+  if (action === 'none') return { kind: 'none' };
+  if (!local || !remote) return { kind: action };
+  if (!texts) return { kind: 'fetch' };
+  const r = reconcileMemoryText(texts.local, texts.remote);
+  if (r.use === 'remote') return { kind: 'pull' };
+  if (r.use === 'merged') return { kind: 'merge', text: r.text, extraLines: r.extraLines };
+  return { kind: texts.local === texts.remote ? 'same' : 'upload' };
+}
+
+/**
+ * 两边内容都拿到手之后怎么办：
+ *   · 本机只有空白 → 用桶里的（`remote`，直接拉）；桶里只有空白 → 用本机的（`local`，直接传）。
+ *   · 都有内容 → `mergeMemoryText`：本机为底、桶里独有的行按顺序补在后面。补了东西 = `merged`
+ *     （写回本机再上传）；桶里没有独有行 = `local`（本机已经包含桶里的一切，传本机的就行）。
+ */
+export function reconcileMemoryText(local: string, remote: string): {
+  use: 'local' | 'remote' | 'merged'; text: string; extraLines: number;
+} {
+  if (!remote.trim()) return { use: 'local', text: local, extraLines: 0 };
+  if (!local.trim()) return { use: 'remote', text: remote, extraLines: 0 };
+  const extra = memoryExtraLines(local, remote);
+  if (!extra.length) return { use: 'local', text: local, extraLines: 0 };
+  return { use: 'merged', text: mergeMemoryText(local, remote), extraLines: extra.length };
+}
+
+/** 桶里 / 备份里有、本机没有的行（按去掉首尾空白的整行比，空行不算，自身重复的只算一次）。 */
+function memoryExtraLines(local: string, backup: string): string[] {
+  const have = new Set(local.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
+  const extra: string[] = [];
+  for (const l of backup.split(/\r?\n/)) {
+    const k = l.trim();
+    if (!k || have.has(k)) continue;
+    have.add(k);
+    extra.push(l);
+  }
+  return extra;
+}
+
+/**
  * 项目记忆在 mark 表里的键。和会话 id 共用一张表（`s3-session-sync.json`）——
  * 加 `memory:` 前缀，会话 id 永远不会以它开头，所以不会撞。
  */
@@ -382,14 +445,7 @@ export function projectMemoryMarkKey(project: string): string {
 
 export function mergeMemoryText(local: string, backup: string): string {
   if (!local.trim()) return backup;
-  const have = new Set(local.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
-  const extra: string[] = [];
-  for (const l of backup.split(/\r?\n/)) {
-    const k = l.trim();
-    if (!k || have.has(k)) continue;
-    have.add(k);
-    extra.push(l);
-  }
+  const extra = memoryExtraLines(local, backup);
   if (!extra.length) return local;
   return `${local.replace(/\s*$/, '')}\n${extra.join('\n')}\n`;
 }

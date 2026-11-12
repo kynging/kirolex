@@ -45,7 +45,7 @@ import {
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, conflictKeyFor, backoffMultiplier,
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, sessionChangedAt, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
-  decideMemory, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
+  decideMemory, memorySyncStep, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import {
   offloadSettings, offloadBlocked, planOffloadRound, offloadSession, finishOffloadRestore, readOffloadState, readOffloadStateStrict, setKeepLocal, strictSessionRefs, scheduleRefs, loopRefs, offloadedIdsInTrash,
@@ -7445,7 +7445,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     }
     const touchedProjectMemory = new Map<string, number>();
     /*
-      **记忆：谁新用谁，本机第一次先拉**（判据在 `decideMemory`）。planUpload 只看本地改没改，
+      **记忆：谁新用谁，本机第一次先拉；两边都有内容就合并**（判据在 `decideMemory` / `memorySyncStep`）。planUpload 只看本地改没改，
       而记忆还要看桶里那份是不是别的机器改过 —— 所以这里先把记忆从计划里拿出来单独决定。
       桶里的列表读不到就**这一轮一份记忆都不传**：不知道桶里是什么就传，正是把真记忆盖成空壳的那条路。
     */
@@ -7487,23 +7487,58 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         try { const st = fs.statSync(abs); local = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* 本机没有 */ }
         const remote = memRemote.get(rel);
         const firstTime = !state[rel];
-        const action = decideMemory(local, remote, state[rel]);
-        if (action === 'upload') { memUpload.add(rel); continue; }
-        if (action === 'pull' && remote) {
+        /* 本机原来那份先挪进 trash 再写 —— 拉 / 合并都是改本机文件，改之前留一份 */
+        const replaceLocalMemory = (data: Buffer | string): fs.Stats => {
+          if (local && local.size > 0) {
+            const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, rel);
+            fs.mkdirSync(path.dirname(bak), { recursive: true });
+            fs.copyFileSync(abs, bak);
+          }
+          fs.mkdirSync(path.dirname(abs), { recursive: true });
+          const tmp = `${abs}.kirolex-${process.pid}.tmp`;
+          fs.writeFileSync(tmp, data);
+          fs.renameSync(tmp, abs);
+          return fs.statSync(abs);
+        };
+        /*
+          **两边都有就先比内容，不整份覆盖**（判据在 `memorySyncStep`）：不论是不是第一次同步、哪边动过，
+          本机和桶里都有这份时先把桶里那份拿回来比 —— 一边空白才整份拿；都有内容就本机为底、补上桶里独有的行，
+          写回本机，再走下面的上传把合并结果传上去。
+        */
+        let step = memorySyncStep(local, remote, state[rel]);
+        let buf: Buffer | null = null;
+        if (step.kind === 'fetch' || step.kind === 'pull') {
           try {
-            const buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
+            buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
             if (!buf) continue;
-            /* 被换掉的那份先挪进 trash —— 拉是覆盖，覆盖之前留一份 */
-            if (local && local.size > 0) {
-              const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, rel);
-              fs.mkdirSync(path.dirname(bak), { recursive: true });
-              fs.copyFileSync(abs, bak);
+            if (step.kind === 'fetch') {
+              step = memorySyncStep(local, remote, state[rel], { local: fs.readFileSync(abs, 'utf-8'), remote: buf.toString('utf-8') });
             }
-            fs.mkdirSync(path.dirname(abs), { recursive: true });
-            const tmp = `${abs}.kirolex-${process.pid}.tmp`;
-            fs.writeFileSync(tmp, buf);
-            fs.renameSync(tmp, abs);
-            const st = fs.statSync(abs);
+          } catch (err: any) {
+            logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
+            continue;
+          }
+        }
+        if (step.kind === 'upload') { memUpload.add(rel); continue; }
+        if (step.kind === 'merge') {
+          try {
+            replaceLocalMemory(step.text);
+            memUpload.add(rel);
+            memoryPulled += 1;
+            logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B + 桶里独有 ${step.extraLines} 行 → ${Buffer.byteLength(step.text)} B（${firstTime ? '本机第一次同步，' : ''}桶里 ${remote!.size} B）`);
+          } catch (err: any) {
+            logger.warn('s3', `记忆 ${rel} 合并不了：${err?.message || err}`);
+          }
+          continue;
+        }
+        if (step.kind === 'same') {
+          const st = fs.statSync(abs);             // 一模一样：只记下状态
+          state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote!.at, remoteSize: remote!.size };
+          continue;
+        }
+        if (step.kind === 'pull' && remote && buf) {
+          try {
+            const st = replaceLocalMemory(buf);
             state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote.at, remoteSize: remote.size };
             memoryPulled += 1;
             logger.info('s3', `记忆 ${rel}：从桶里拉回（${firstTime ? '本机第一次同步，' : '桶里那份更新，'}桶里 ${remote.size} B，本机原来 ${local?.size ?? 0} B）`);
@@ -7652,7 +7687,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       ...(offloaded?.moved.length ? { offloaded: offloaded.moved.length, offloadedBytes: offloaded.bytes, offloadDays: offloaded.days } : null),
     };
     logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`
-      + `${memoryPulled ? `，从桶里拉回 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步）` : ''}`
+      + `${memoryPulled ? `，从桶里拉回 / 合并 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步 / 两边都改过）` : ''}`
       + `${cleanup ? `；这次有 ${cleanup.trashed.length} 条移进云端回收站、${cleanup.purged.length} 条到期清空` : ''}`);
     mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
     return {
