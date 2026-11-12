@@ -246,6 +246,8 @@ interface SidebarProps {
   offloadedSessions?: Session[];
   /** 右键「下载回本机」/「保留在本机，不再自动移走」（占位：下载 + 打标记） */
   onOffloadRestore?: (id: string, keepLocal: boolean) => void;
+  /** 从别的电脑来的占位：从这台电脑的列表里移除（主进程写删除记录，下一轮不再建回来） */
+  onOffloadDismiss?: (id: string) => void;
   /** 上一次同步的结果 —— 给这个按钮上色和写 title 用。 */
   backupState?: { at: number; uploaded: number; error?: string } | null;
   workspaceOpen: boolean;
@@ -398,6 +400,12 @@ const SessionItem: React.FC<{
         常驻：任何时候都不该去猜这一轮在哪台机器上跑 —— 猜错的代价是对着另一台机器的文件下结论。
       */}
       {/* 不挂引擎 tag ——「左侧会话框不要显示 claude 这个 tag，你应该显示的仍然是远程 tag」。引擎在会话界面左下角看 */}
+      {/* 从别的电脑来的占位（主进程 s3Pull.ts）：说清它在哪台电脑上 —— 本机从来没有过它，点开才下载 */}
+      {off?.remote && (
+        <span className="session-remote session-remote-elsewhere" title={offTitle}>
+          💻 {off.remote.host || t('On another computer ({host})', { host: '?' })}
+        </span>
+      )}
       {pendingTarget !== undefined ? (
         <span className="session-remote session-remote-switching" title={t('Switching where this runs…')}>
           ⏳ {pendingTarget || t('Local')}
@@ -615,6 +623,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenBackup,
   offloadedSessions,
   onOffloadRestore,
+  onOffloadDismiss,
   backupState,
   workspaceOpen,
   onOpenWorkspace,
@@ -1261,7 +1270,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Session context menu: Rename / Pin-Unpin / Delete （归档的多一条「恢复」，且在最上面） */}
-      {/* ☁ 占位的右键：只有下载回本机这两条（它在本机没有记录，别的操作都无从谈起） */}
+      {/* ☁ 占位的右键：只有下载回本机这两条（它在本机没有记录，别的操作都无从谈起）；从别的电脑来的多一条「从列表里移除」 */}
       {contextMenu && ctxOffloaded && (
         <Menu x={contextMenu.x} y={contextMenu.y}>
           <div
@@ -1277,6 +1286,15 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             {`📍 ${t('Keep on this computer; do not move it automatically again')}`}
           </div>
+          {ctxOffloaded.offloaded?.remote && (
+            <div
+              className="context-menu-item"
+              title={t('The session stays on the other computer and in the cloud; it just stops showing here.')}
+              onClick={() => { onOffloadDismiss?.(ctxOffloaded.id); setContextMenu(null); }}
+            >
+              {`🗑️ ${t('Remove from this computer’s list')}`}
+            </div>
+          )}
         </Menu>
       )}
       {contextMenu && ctxSession && (

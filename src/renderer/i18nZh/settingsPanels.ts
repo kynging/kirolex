@@ -538,6 +538,9 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   'Automatically moves sessions you have not used for a while to the cloud: after a successful sync, sessions not used for this long are removed from this computer once their cloud copy is confirmed up to date. They stay in the sidebar with ☁ and download automatically when opened. Nothing is deleted from the cloud.': '自动把久未使用的会话移到云端：每次同步成功后，这么久没用、并且确认云端那份是最新的会话，会删掉本机副本；侧栏照样留着（带 ☁），点开自动下载回来。云端不删任何东西。',
   'Unused for': '未使用超过',
   'Unused for {n} days': '{n} 天未使用',
+  'Show sessions from other computers': '自动显示其他电脑上的会话',
+  'Sessions from other computers': '其他电脑上的会话',
+  'Sessions that exist on your other computers (same bucket) appear in the sidebar; they download only when you open them. Turning this off only stops that: sessions already on this computer still pick up new messages from the other computers.': '别的电脑（同一个桶）上有、这台没有的会话，会出现在侧栏里，点开才下载。关掉只停这一项：这台电脑上已有的会话照常拉回别的电脑上的新消息。',
   // ── 备份：凭证来源（AK/SK / AWS profile / 默认凭证链）
   'Credentials': '凭证',
   'Default credential chain': '默认凭证链',

@@ -10,7 +10,7 @@ import { conflictPrefixFor } from '../src/main/s3Sync.ts';
 const M = fs.readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
 
 test('冲突先自动合并；只有正在跑的、合并出错的才走旁路', () => {
-  const at = M.indexOf('const conflicts = detectConflicts(');
+  const at = M.indexOf('const conflicts = planBucketMerges(');
   const body = M.slice(at, at + 3200);
   assert.match(body, /if \(live\?\.busy\) \{ conflictIds\.add\(c\.id\); continue; \}/);
   assert.match(body, /await mergeBucketSession\(creds!, cfg\.prefix, c\.id\)/);

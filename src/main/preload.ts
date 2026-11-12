@@ -160,6 +160,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   offloadList: () => ipcRenderer.invoke('offload:list'),
   offloadRestore: (sessionId: string, keepLocal?: boolean) => ipcRenderer.invoke('offload:restore', sessionId, keepLocal),
   offloadSetKeepLocal: (sessionId: string, keep: boolean) => ipcRenderer.invoke('offload:set-keep-local', sessionId, keep),
+  offloadDismiss: (sessionId: string) => ipcRenderer.invoke('offload:dismiss', sessionId),
   onOffloadChanged: (cb: (d: any) => void) => {
     const h = (_e: any, d: any) => cb(d);
     ipcRenderer.on('offload:changed', h);

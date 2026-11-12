@@ -4516,6 +4516,14 @@ const App: React.FC = () => {
               onOpenBackup={() => setShowBackup(true)}
               offloadedSessions={offloadedSessions}
               onOffloadRestore={(id, keepLocal) => { void restoreOffloaded(id, keepLocal, false); }}
+              onOffloadDismiss={(id) => {
+                /* 从别的电脑来的占位：从这台电脑的列表里移除（主进程写删除记录，下一轮不再建回来） */
+                void (async () => {
+                  const r = await (window as any).kiroApi?.offloadDismiss?.(id).catch((e: any) => ({ ok: false, error: String(e?.message || e) }));
+                  if (r?.ok) await loadOffloaded();
+                  else showToast(String(r?.error || 'failed').split('\n')[0]);
+                })();
+              }}
               backupState={backupState}
               workspaceOpen={showWorkspace}
               onOpenWorkspace={() => setShowWorkspace((visible) => !visible)}

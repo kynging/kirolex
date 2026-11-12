@@ -406,6 +406,11 @@ button, input, select, textarea {
 /* `stale` / `conflict`：本地那份可能不是最新的。这一个必须比"在同步"显眼得多 ——
    它的后果是你对着旧内容下结论，而不是等一会儿就好。 */
 /* 切换中：点下去就出现，切完换成真 tag（见 Sidebar 的 pendingTargets） */
+/* 从别的电脑来的占位（s3Pull.ts）：「💻 主机名」（悬停说「在另一台电脑上（主机名）」）—— 窄一点给标题留地方，颜色灰一点 */
+.session-remote.session-remote-elsewhere {
+  max-width: 76px;
+  background: rgba(150,150,150,0.2);
+}
 .session-remote.session-remote-switching {
   background: rgba(220,180,60,0.18);
   animation: session-remote-pulse 1.2s ease-in-out infinite;

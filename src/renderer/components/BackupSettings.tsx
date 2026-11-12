@@ -62,6 +62,8 @@ interface Cfg {
   /** 久未使用的会话移到云端（主进程 sessionOffload.ts）：开关（默认开）、天数（默认 30）。 */
   autoOffload: boolean;
   offloadIdleDays: number;
+  /** 自动显示其他电脑上的会话（主进程 s3Pull.ts）：缺省开；关掉只停「建占位」 */
+  autoShowRemoteSessions: boolean;
   /** 凭据现在用不用得了（主进程 syncCredsOrProblem）：缺字段 / 密钥解不开 → 原因；可用 → 空 */
   credsProblem?: string;
 }
@@ -388,6 +390,17 @@ export const BackupSettings: React.FC = () => {
           </Field>
         );
       })()}
+      {/* **自动显示其他电脑上的会话**（主进程 s3Pull.ts）：别的电脑上有、本机没有的会话在侧栏留占位，点开才下载。关掉只停这一项 */}
+      <Field
+        label={t('Sessions from other computers')}
+        hint={t('Sessions that exist on your other computers (same bucket) appear in the sidebar; they download only when you open them. Turning this off only stops that: sessions already on this computer still pick up new messages from the other computers.')}
+      >
+        <ToggleButton
+          on={cfg.autoShowRemoteSessions !== false}
+          ariaLabel={t('Show sessions from other computers')}
+          onChange={(next) => { patch({ autoShowRemoteSessions: next }); void save({ autoShowRemoteSessions: next }); }}
+        />
+      </Field>
       {devices && (
         <div className="backup-devices">
           {devices.error ? <div className="settings-hint">{devices.error.split('\n')[0]}</div> : (

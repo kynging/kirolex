@@ -96,6 +96,11 @@ export interface SyncConfig {
    */
   autoOffload?: boolean;
   offloadIdleDays?: number;
+  /**
+   * **自动显示其他电脑上的会话**（见 `s3Pull.ts`）：别的电脑上有、本机没有的会话在侧栏建一个占位，点开才下载。
+   * 缺省 = 开；关掉只停这一项（本机已有的会话照常拉回别的电脑的新消息）。
+   */
+  autoShowRemoteSessions?: boolean;
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;
