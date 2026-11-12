@@ -30,6 +30,7 @@ import os from 'os';
 import path from 'path';
 import type { RemoteTarget } from './config';
 import { sshEnv } from './sshAuth.ts';
+import { prepareSshFor } from './sshProxy.ts';
 
 export interface FileSize {
   name: string;
@@ -134,6 +135,8 @@ export class LocalHost implements HostOps {
 export interface SshDeps {
   buildSshArgs(remote: RemoteTarget, remoteCommand: string): string[];
   shellQuote(s: string): string;
+  /** 起 ssh 之前等一下（Windows 上 SSM 机器的共享隧道 + 公钥，见 sshProxy `prepareSshFor`）。不传 = 用 sshProxy 的 `prepareSshFor`（主进程注入的那个钩子）。 */
+  prepare?(remote: RemoteTarget): Promise<unknown>;
 }
 
 /** 一次诊断 SSH 的上限。取证宁可拿不到，也不能让失败路径挂在这儿。 */
@@ -157,6 +160,11 @@ export class SshHost implements HostOps {
 
   /** 跑一条远端命令，拿 stdout；任何失败（连不上、非零退出、超时）都返回 `''`。 */
   private run(script: string): Promise<string> {
+    const ready = this.deps.prepare ? this.deps.prepare(this.remote).catch(() => undefined) : prepareSshFor(this.remote);
+    return ready.then(() => this.runNow(script));
+  }
+
+  private runNow(script: string): Promise<string> {
     const args = this.deps.buildSshArgs(this.remote, `bash -lc ${this.deps.shellQuote(script)}`);
     return new Promise((resolve) => {
       try {

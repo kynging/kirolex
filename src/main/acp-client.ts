@@ -5,7 +5,8 @@ import * as os from 'os';
 import * as path from 'path';
 import type { PermissionMode, RemoteTarget } from './config';
 import { ToolCallLedger } from './remoteWriteGuard.ts';
-import { transportArgs, identityArgs, connectTimeoutFor, assertSafeSshHost } from './sshProxy.ts';
+import { transportArgs, identityArgs, connectTimeoutFor, assertSafeSshHost, isSsm, ssmOsUser, prepareSshFor, setSshPrepareHook } from './sshProxy.ts';
+export { prepareSshFor } from './sshProxy.ts';
 import { batchModeFor, hasPassword, sshEnv } from './sshAuth.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, adapterAuthMessage, adapterMissingMessage, isAuthRequiredError, resolveAdapter, type Engine } from './engines.ts';
 import { adapterExecLine, remoteAdapterLaunchFor, type AdapterVerdict } from './remoteAdapterProbe.ts';
@@ -288,6 +289,8 @@ export class AcpClient extends EventEmitter {
    * 还不行就把那句 `Session open refused by peer` 换成人话。
    */
   async connect(): Promise<any> {
+    /* Windows 上的 SSM 机器：先把共享隧道拉起来、推好公钥（失败也不挡 —— buildSshArgs 会照旧走 ProxyCommand） */
+    await prepareSshFor(this.remote);
     try {
       return await this.connectOnce();
     } catch (err) {
@@ -606,10 +609,14 @@ export class AcpClient extends EventEmitter {
     if (this.remote?.sshHost && this.remotePid) {
       const pid = this.remotePid;
       this.remotePid = undefined;
-      try {
-        execFile('ssh', [...buildSshArgs(this.remote, remoteKillTree(pid))],
-          { timeout: 15_000, env: sshEnv(this.remote) }, () => {});
-      } catch { /* 收尾失败不该影响断开本身 */ }
+      /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+      void prepareSshFor(this.remote).then(() => {
+        if (!this.remote) return;
+        try {
+          execFile('ssh', [...buildSshArgs(this.remote, remoteKillTree(pid))],
+            { timeout: 15_000, env: sshEnv(this.remote) }, () => {});
+        } catch { /* 收尾失败不该影响断开本身 */ }
+      });
     }
     this.rejectAllPending(new Error('Disconnected'));
   }
@@ -1395,6 +1402,17 @@ export function setMuxSocketResolver(fn?: (remote: RemoteTarget) => string | und
 }
 
 /**
+ * **Windows 上 SSM 机器的共享隧道**（`ssmTunnel.ts` `SsmTunnels.liveFor`）：同步给出能直连的本机端口，没有就 undefined。
+ * `prepare`：起 ssh 之前先等隧道就绪 + 推好公钥（`SsmTunnels.ensure`；钩子放在 sshProxy.ts `prepareSshFor`，hostOps / loopVerify 也用它）。
+ * 两个都由主进程注入；不注入（Mac / Linux、开关关了）时这里一个字节都不变。
+ */
+let ssmTunnelResolver: ((remote: RemoteTarget) => { host: string; port: number } | undefined) | undefined;
+export function setSsmTunnelResolver(fn?: (remote: RemoteTarget) => { host: string; port: number } | undefined, prepare?: (remote: RemoteTarget) => Promise<unknown>): void {
+  ssmTunnelResolver = fn;
+  setSshPrepareHook(prepare);
+}
+
+/**
  * **复用连接 session 满了怎么办** —— 由主进程注入（它手上有 `sshMux` 和机器名）。
  *
  * `final = false`：把那条连接标成满的、试着再开一条主连接；`retry: true` 就在新连接上重起一次。
@@ -1461,6 +1479,17 @@ export function buildSshArgs(
   }
   /* SSM 默认是临时私钥 + IdentitiesOnly（sshProxy.ts `identityArgs`）；其余照旧 `-i identityFile` */
   args.push(...identityArgs(remote));
+  /*
+    **Windows 上的 SSM 共享隧道**（`ssmTunnel.ts`）：这台机器已经有一条就绪的本机端口转发、推送也新鲜时，
+    直连 `127.0.0.1:<端口>`，不带 SSM ProxyCommand。`HostKeyAlias=<实例 ID>`：所有机器都叫 127.0.0.1，
+    不设的话 known_hosts 里会互相打架（accept-new 照旧）。没有就照旧走下面每会话一条 ProxyCommand。
+  */
+  const tunnel = isSsm(remote) ? ssmTunnelResolver?.(remote) : undefined;
+  if (tunnel) {
+    args.push('-p', String(tunnel.port), '-o', `HostKeyAlias=${remote.ssmInstanceId}`);
+    args.push(`${ssmOsUser(remote)}@${tunnel.host}`, remoteCommand);
+    return args;
+  }
   if (remote.sshPort && remote.sshPort !== 22) args.push('-p', String(remote.sshPort));
   /*
     跳板要在**建连接**的这一路上（复用路径上面已经 return 了 —— 走已有连接时那一跳早就跳过了）。

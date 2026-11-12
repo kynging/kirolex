@@ -3,7 +3,7 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
-import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
+import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, setSsmTunnelResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
 import { isSsm, findLocalTool, runLocalTool as runSsmTool, execTimeoutFor } from './sshProxy.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
@@ -15,6 +15,7 @@ import { testConnectionScript, splitTestOutput, judgeTestConnection, adapterProb
 import { claudeBedrockSettings, codexBedrockToml, claudeBedrockOf, codexBedrockOf, BEDROCK_DEFAULTS, applyCodexProvider, claudeEditorText, codexEditorText, codexGateway, mergeClaudeSettings, parseClaudeEditor, parseClaudeStatus, parseCodexEditor, parseCodexStatus, pickClaudeEnv } from './aiLogin.ts';
 import { bedrockCheckScript, bedrockRegionOf, localBedrockCheckOutput, codexWebSearchDisabled, toggleCodexWebSearch, readLocalConfig, parseRemoteConfigRead, REMOTE_CONFIG_READ_SCRIPT, parseIamPrecheck, parseAccessDenied, roleArnOf, deniedNoteGroup, setCodexWebSearch, withBedrockCheck, bedrockProbeScript, localBedrockProbeOutput, staleBedrockCheck, type BedrockIamCheck } from './bedrockIam.ts';
 import { SshMux, muxKey, muxSupported, MUX_DIR, sshErrorKind, sessionsFullMessage } from './sshMux';
+import { SsmTunnels, defaultTunnelDeps, tunnelApplies, sharedTunnelEnabled } from './ssmTunnel.ts';
 import { RemoteRecovery, LOCAL_TOOLS_RECONNECT_GROUP, LOCAL_TOOLS_RESTORED_GROUP } from './remoteRecovery.ts';
 import { ModelFallbackNotes } from './modelFallbackNote.ts';
 import { planEffortForModel, migrateComboEffort } from './engineEffort.ts';
@@ -2907,6 +2908,8 @@ async function ensureLocalTools(
       muxUsers.set(sessionId, muxKey(remote.sshHost, remote.sshPort));
       remotePort = (await sshMux.ensure(remote)).remotePort;
     } else {
+      /* Windows 上的 SSM 机器：这条会话占用那台机器的共享隧道（引用计数；最后一条走了空闲 5 分钟再关） */
+      if (ssmTunnelApplies(remote)) ssmTunnels.acquire(sessionId, remote);
       /* 按会话分端口：把**自己当前那个**也算进"已占用"，避免"先起新的再关旧的"时撞上自己 */
       /*
         **还活着的 ssh 占着的端口也算** —— 实测：两条会话前后两秒各切到 Claude Code，第一条把自己那格
@@ -3380,6 +3383,7 @@ function releaseLocalTools(sessionId: string, remote?: RemoteTarget, opts: { kee
   localToolsBySession.delete(sessionId);
   localToolsDirBySession.delete(sessionId);
   muxUsers.delete(sessionId);
+  ssmTunnels.release(sessionId);
   /* 换运行位置（远程 → 本机）时 token 已经交给了新执行器：只停中转，不作废（见 `releaseSessionTools`） */
   releaseSessionTools(localMcpServer, sessionId, { keepToken: opts.keepToken });
   if (spec && remote?.sshHost) {
@@ -3470,7 +3474,8 @@ function runProbe(machine: string, script: string): Promise<string> {
   }
   const target = findRemoteTarget(KIROLEX_CONFIG_PATH, machine);
   if (!target?.sshHost) return Promise.reject(new Error(tr('Can\'t find this machine ({machine}). Was it removed in Settings?', { machine })));
-  return new Promise((resolve, reject) => {
+  /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+  return prepareSsmTunnel(target).then(() => new Promise<string>((resolve, reject) => {
     execFile('ssh', [...buildSshArgs(target, `bash -lc ${shellQuote(script)}`)],
       { timeout, encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, env: sshEnv(target) }, (err, stdout, stderr) => {
         if (err && !String(stdout || '').includes('KX_BIN')) {
@@ -3481,12 +3486,13 @@ function runProbe(machine: string, script: string): Promise<string> {
           reject(new Error(real || tr('ssh exit code {code}', { code: String((err as any).code) })));
         } else resolve(String(stdout || ''));
       });
-  });
+  }));
 }
 
 /** 在远端跑一条命令并**拿回 stdout**（`writeRemoteFile` 丢掉输出）。 */
 function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_000, maxBuffer?: number, stdin?: string): Promise<string> {
-  return once(false);
+  /* Windows 上的 SSM 机器先等共享隧道（ssmTunnel.ts）；别的平台 / 机器立刻往下走 */
+  return prepareSsmTunnel(remote).then(() => once(false));
   function once(sparedOnce: boolean): Promise<string> {
     const socket = sshMux.liveSocketFor(remote);
     return new Promise((resolve, reject) => {
@@ -3518,11 +3524,11 @@ function runRemoteCapture(remote: RemoteTarget, script: string, timeoutMs = 60_0
 
 /** 在远端跑一条 shell 命令，内容从 stdin 送进去（JSON 走命令行是引号地狱）。 */
 function writeRemoteFile(remote: RemoteTarget, script: string, stdin: string): Promise<void> {
-  return new Promise((resolve, reject) => {
+  return prepareSsmTunnel(remote).then(() => new Promise<void>((resolve, reject) => {
     const args = [...buildSshArgs(remote, `bash -lc ${shellQuote(script)}`)];
     const child = execFile('ssh', args, { timeout: 60_000, env: sshEnv(remote) }, (err) => (err ? reject(err) : resolve()));
     try { child.stdin?.end(stdin); } catch { /* 命令已经退了 */ }
-  });
+  }));
 }
 
 
@@ -3960,6 +3966,32 @@ let muxWarned = false;
 setMuxSocketResolver((remote) => (remote?.sshHost ? sshMux.liveSocketFor(remote) : undefined));
 
 /**
+ * **Windows 上每台 SSM 机器只开一条 SSM 隧道**（`ssmTunnel.ts`）——「SSM 就一条，SSH 多个没关系」。
+ * 没有 ControlMaster 的平台才用；`config.json` 的 `"ssmSharedTunnel": false` 回到每会话一条 ProxyCommand。
+ */
+const ssmTunnels = new SsmTunnels(defaultTunnelDeps((level, message) => logger[level]('ssm-tunnel', message)));
+let tunnelSwitch = { at: 0, on: true };
+function ssmTunnelApplies(remote: RemoteTarget | undefined): boolean {
+  if (muxSupported() || remote?.connectVia !== 'ssm') return false;
+  /* 开关几秒读一次就够（buildSshArgs 每条 ssh 都问） */
+  if (Date.now() - tunnelSwitch.at > 5_000) {
+    let cfg: any = {};
+    try { cfg = JSON.parse(fs.readFileSync(KIROLEX_CONFIG_PATH, 'utf-8')); } catch { /* 没有配置 = 缺省开 */ }
+    tunnelSwitch = { at: Date.now(), on: sharedTunnelEnabled(cfg) };
+  }
+  return tunnelApplies(remote, { muxSupported: muxSupported(), enabled: tunnelSwitch.on });
+}
+/** 要连这台机器之前：Windows 上的 SSM 机器先把共享隧道拉起来、推好公钥；别的什么都不做。失败不抛（照旧走 ProxyCommand）。 */
+function prepareSsmTunnel(remote: RemoteTarget | undefined): Promise<unknown> {
+  if (!remote || !ssmTunnelApplies(remote)) return Promise.resolve();
+  return ssmTunnels.ensure(remote).catch(() => undefined);
+}
+setSsmTunnelResolver(
+  (remote) => (ssmTunnelApplies(remote) ? ssmTunnels.liveFor(remote) : undefined),
+  prepareSsmTunnel,
+);
+
+/**
  * **复用连接的 session 满了**（sshd `MaxSessions`，默认 10）——「Session open refused by peer」。
  *
  * 2026-10-22 实测（tokyo-arm）：那条主连接下正好 10 个执行器，切换组合、远端清理全报这句英文。
@@ -4123,6 +4155,8 @@ async function verifyRemoteAdapter(remote: RemoteTarget, engine: 'claude' | 'cod
   rememberRemoteAdapterLaunch(remote, engine, verdict);
   const problem = adapterProblemMessage(host, engine, verdict);
   if (problem) return { ok: false, problem };
+  /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+  await prepareSsmTunnel(remote);
   return await new Promise<AdapterVerifyResult>((resolve) => {
     const child = spawn('ssh', buildSshArgs(remote, buildRemoteAdapterCommand(REMOTE_ADAPTER_BIN[engine], verdict)), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
     let stdout = '';
@@ -4225,6 +4259,8 @@ async function runRemoteOnlyInstall(remote: RemoteTarget, engine: 'claude' | 'co
   if (!script) return { code: null, tail: '', noScript: true };
   const remoteTmp = `/tmp/kirolex-adapter-${Date.now()}.sh`;
   onChunk(`$ ssh ${host} … ONLY=${engine === 'kiro' ? 'kiro-cli' : REMOTE_ADAPTER_BIN[engine]} bash remote-bootstrap.sh\n`);
+  /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+  await prepareSsmTunnel(remote);
   return await new Promise<{ code: number | null; tail: string; error?: string }>((resolve) => {
     const child = spawn('ssh', buildSshArgs(remote, remoteInstallCommand(remoteTmp, engine)), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
     let tail = '';
@@ -4335,6 +4371,8 @@ async function localEngineStatuses(force = false): Promise<EngineStatus[]> {
 /** 远端：和「测试连接」同一次 ssh（kiro 预检 + 两家适配器探测）。 */
 async function remoteEngineStatusesFor(target: RemoteTarget, force = false): Promise<EngineStatus[]> {
   const host = target.sshHost || '';
+  /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+  await prepareSsmTunnel(target);
   const args = buildSshArgs(target, `bash -lc ${shellQuote(testConnectionScript(preflightScript(undefined, { models: false })))}`);
   const out = await new Promise<{ code: number | null; stdout: string; stderr: string }>((resolve) => {
     execFile('ssh', args, { timeout: execTimeoutFor(target), encoding: 'utf8', env: sshEnv(target) }, (err: any, stdout, stderr) => resolve({
@@ -4563,6 +4601,8 @@ async function runPreflight(remote: RemoteTarget, opts?: { force?: boolean }): P
       throw new Error(recent);
     }
   }
+  /* Windows 上的 SSM 机器：先把共享隧道拉起来（ssmTunnel.ts），这次 ssh 就直连它，不再单独走一遍 SSM 握手 */
+  await prepareSsmTunnel(remote);
   let args = buildSshArgs(remote, `bash -lc ${shellQuote(preflightScript())}`);
   let verdict = { code: 'unreachable', message: tr('Can\'t connect to {host}', { host }) } as ReturnType<typeof judgePreflight>;
   /** session 满了换连接重试过没有（只重试一次，见 `onMuxSessionsFull`） */
@@ -4690,9 +4730,13 @@ function ssmIdentityNote(remote: RemoteTarget, message: string): string {
   const arn = ssmArnOf.get(remote);
   return trConcat(message, '\n', tr('AWS profile: {profile}', { profile }), arn ? `\n${tr('Identity (ARN): {arn}', { arn })}` : '');
 }
-/** 「测试连接」用的 `checkSsm`：没过时也说一句用的是哪个 profile。 */
+/**
+ * 「测试连接」用的 `checkSsm`：没过时也说一句用的是哪个 profile。
+ * 过了就顺手等共享隧道 + 刷新公钥（Windows，ssmTunnel.ts）—— 紧接着那次 ssh 就直连隧道，不另起一条 SSM 连接。
+ */
 async function checkSsmNoted(remote: RemoteTarget): Promise<ReturnType<typeof judgePreflight> | null> {
   const v = await checkSsm(remote);
+  if (!v) await prepareSsmTunnel(remote);
   return v && { ...v, message: ssmIdentityNote(remote, v.message) };
 }
 
@@ -14809,6 +14853,8 @@ ${hint}` : ''}` };
       const remote = aiLoginTarget(machine);
       const cmd = tool === 'claude' ? `claude auth login${opts?.console ? ' --console' : ''}` : 'codex login --device-auth';
       const runId = `login_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+      /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+      await prepareSsmTunnel(remote);
       const child = spawn('ssh', buildSshArgs(remote, `bash -lc ${shellQuote(cmd)}`), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
       loginRuns.set(runId, child);
       /* ANSI 颜色/光标码去掉 —— 界面上是一段纯文本 */
@@ -16144,6 +16190,8 @@ ${hint}` : ''}` };
     let argv: string[];
     if (r.remote) {
       /* 密码登录的机器不把密码放进环境变量：终端是交互的，ssh 会自己在窗口里问（Windows 上命令会写进临时 .cmd，不能带明文） */
+      /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+      await prepareSsmTunnel(r.remote);
       argv = ['ssh', ...withTty(buildSshArgs(r.remote, remoteKiroLoginCommand(remoteKiroBin(r.remote) || 'kiro-cli', choice)))];
     } else {
       const cli = kiroBinProblem() ? null : resolveKiroCli();
@@ -18164,6 +18212,8 @@ ${hint}` : ''}` };
       if (loginEnvStr) logger.info('remote', `bootstrap 会带上登录参数（${env.KIRO_LOGIN_PROVIDER}）`);
       else logger.info('remote', 'bootstrap 没读到本机的登录参数 —— 远端没登录时只会提示');
     } catch { /* 读不到就只提示，不猜 */ }
+    /* Windows 上的 SSM 机器：先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时这条 ssh 会另起一条 SSM 连接 */
+    await prepareSsmTunnel(target);
     const args = buildSshArgs(
       target,
       `cat > ${remoteTmp} && ${loginEnvStr}FORCE=${input.force ? 1 : 0} bash ${remoteTmp}; rc=$?; rm -f ${remoteTmp}; exit $rc`,
@@ -18337,7 +18387,7 @@ ${hint}` : ''}` };
     const send = (chunk: string) => { try { event.sender.send('agent-profile:sync-output', { remoteId, chunk }); } catch { /* 窗口没了不影响同步 */ } };
     const log = (line: string) => { logger.info('agent-profile', `${host} ${line}`); send(`${line}\n`); };
     /* 远端脚本走 stdin 落到临时文件再跑（理由同 remote:bootstrap）；输出边跑边推 */
-    const sshStdin = (cmd: string, stdin: string, timeoutMs: number) => new Promise<{ code: number | null; output: string; error?: string }>((resolve) => {
+    const sshStdinNow = (cmd: string, stdin: string, timeoutMs: number) => new Promise<{ code: number | null; output: string; error?: string }>((resolve) => {
       const child = spawn('ssh', buildSshArgs(remote, cmd), { stdio: ['pipe', 'pipe', 'pipe'], env: sshEnv(remote) });
       let output = '';
       const onData = (b: Buffer) => {
@@ -18354,6 +18404,8 @@ ${hint}` : ''}` };
       child.on('close', (code) => { clearTimeout(killer); resolve({ code, output }); });
       try { child.stdin.end(stdin); } catch { /* close 会报 */ }
     });
+    /* Windows 上的 SSM 机器：每条 ssh 之前先等共享隧道 + 刷新公钥（ssmTunnel.ts），否则推送过期时会另起一条 SSM 连接 */
+    const sshStdin = (cmd: string, stdin: string, timeoutMs: number) => prepareSsmTunnel(remote).then(() => sshStdinNow(cmd, stdin, timeoutMs));
     try {
       log(`开始同步 AI 工具配置到 ${host}`);
       const probe = await probeAgentProfile(remote);
@@ -18807,13 +18859,14 @@ app.on('before-quit', () => {
   /* 断线恢复也停掉：退出时被收掉的执行器不该再被拉回来 */
   try { remoteRecovery.stopAll(); } catch { /* 退出路径不抛 */ }
   try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ }
+  try { ssmTunnels.closeAll(); } catch { /* 退出路径不抛 */ }
 });
 /*
   **兜底**：没走 before-quit 的退出（`process.exit`、SIGTERM 那条 5 秒的后备）也要把自己的反向隧道
   明确关掉 —— 不然 ssh 子进程被收养、还连着远端，远端那个端口和那条 sshd-session 就一直被它占着。
   `kill` 是同步发信号，可以放在 `exit` 里。
 */
-process.on('exit', () => { try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ } });
+process.on('exit', () => { try { sshMux.closeAll(); } catch { /* 退出路径不抛 */ } try { ssmTunnels.closeAll(); } catch { /* 同上 */ } });
 
 /** 本机控制入口（agent-board「拉取并重启」）：`POST /quit` 走的就是托盘「Quit」那条路径。 */
 let controlServer: ControlServer | null = null;

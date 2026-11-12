@@ -720,3 +720,20 @@ export function execTimeoutFor(remote: Pick<RemoteTarget, 'connectVia'>, base = 
 export function connectTimeoutFor(remote: Pick<RemoteTarget, 'connectVia'>): number {
   return isSsm(remote) ? SSM_CONNECT_TIMEOUT_S : 10;
 }
+
+/* ---------------------------------------------------- 起 ssh 之前的钩子（Windows SSM 共享隧道） */
+
+let sshPrepareHook: ((remote: RemoteTarget) => Promise<unknown>) | undefined;
+/** 主进程注入（`ssmTunnel.ts` 的 `ensure`）；不注入时 `prepareSshFor` 什么都不做。 */
+export function setSshPrepareHook(fn?: (remote: RemoteTarget) => Promise<unknown>): void {
+  sshPrepareHook = fn;
+}
+/**
+ * 起一条 ssh 之前调：Windows 上的 SSM 机器先等共享隧道就绪、推送新鲜（`SsmTunnels.ensure`），
+ * 这样 `buildSshArgs` 才会给出隧道端口；推送过期（> 45 秒）时不等就会另起一条每会话 ProxyCommand。不抛。
+ * acp-client（connect / 断开时清理）、hostOps（诊断取证）、loopVerify（校验）都走它。
+ */
+export function prepareSshFor(remote: RemoteTarget | undefined): Promise<void> {
+  if (!remote?.sshHost || !sshPrepareHook) return Promise.resolve();
+  return sshPrepareHook(remote).then(() => undefined, () => undefined);
+}

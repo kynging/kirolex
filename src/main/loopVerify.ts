@@ -33,6 +33,7 @@
 import { execFile } from 'child_process';
 import type { RemoteTarget } from './config';
 import { sshEnv } from './sshAuth.ts';
+import { prepareSshFor } from './sshProxy.ts';
 import { tr } from './uiText.ts';
 
 /** The SSH argument builders, INJECTED rather than imported.
@@ -48,6 +49,8 @@ import { tr } from './uiText.ts';
 export interface SshTools {
   buildSshArgs(remote: RemoteTarget, remoteCommand: string): string[];
   shellQuote(value: string): string;
+  /** Await before spawning ssh (Windows SSM shared tunnel + key push, see sshProxy `prepareSshFor`). Optional; defaults to sshProxy `prepareSshFor` (the hook the main process installs). */
+  prepare?(remote: RemoteTarget): Promise<unknown>;
 }
 
 /** Verifier output kept. Larger than the renderer's per-round cap so truncation is
@@ -174,6 +177,13 @@ export function rejectRequest(command: string, timeoutSec: number): string | nul
  * check is broken" and an exception at this boundary erases that difference.
  */
 export function runVerifier(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: SshTools): Promise<VerifyResult> {
+  // Remote: let the shared SSM tunnel (Windows) get ready and the key push be fresh before
+  // the argv is built, or this ssh would open its own SSM session.
+  const ready = !req.remote?.sshHost ? Promise.resolve() : ssh.prepare ? ssh.prepare(req.remote).catch(() => undefined) : prepareSshFor(req.remote);
+  return ready.then(() => runVerifierNow(req, env, ssh));
+}
+
+function runVerifierNow(req: VerifyRequest, env: NodeJS.ProcessEnv, ssh: SshTools): Promise<VerifyResult> {
   const host: 'local' | 'remote' = req.remote?.sshHost ? 'remote' : 'local';
   const { file, args, cwd } = buildVerifierArgv(req, ssh);
   const startedAt = Date.now();
