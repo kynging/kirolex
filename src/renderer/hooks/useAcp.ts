@@ -1907,6 +1907,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
 
+  /* 「在其他电脑上同步」开关变了（右键 / 设置里关掉 / 同步时跟随了别的电脑）—— 侧栏的小标识跟着改 */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onSessionCrossDeviceChanged?.((d: { sessionId: string; crossDevice: boolean }) => {
+      if (!d?.sessionId) return;
+      setSessions((prev) => prev.map((s) => (s.id === d.sessionId ? { ...s, crossDevice: !!d.crossDevice } : s)));
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
   /* 同步时跟随了别的机器挪过的项目 / 归档（主进程已经改了记录）—— 侧栏按新位置分组 */
   useEffect(() => {
     const off = (window as any).kiroApi?.onSessionPlacementChanged?.((d: { sessionId: string; projectId: string | null; archived: boolean }) => {
@@ -2278,6 +2287,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 // chats reappear in the normal list instead of the Archived group.
                 archived: rec.archived ?? existing.archived,
                 pinned: existing.pinned ?? rec.pinned, // durable pin survives origin/localStorage change
+                crossDevice: rec.crossDevice === true,   // 「在其他电脑上同步」只认记录（主进程拥有）
                 /**
                  * 角色标记也归记录所有 —— 「重启之后 flow 注册的那个 tag 就没有了」。
                  *
@@ -2312,6 +2322,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 projectId: rec.projectId,
                 archived: rec.archived,
                 pinned: rec.pinned,
+                crossDevice: rec.crossDevice === true,
                 purpose: rec.purpose,
                 flow: rec.flow,
                 kiroAgent: rec.kiroAgent,
@@ -3853,7 +3864,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // and is ready to prompt — regardless of whether messages are cached. (Archived
     // chats stay inert.) loadSession resumes the backend session WITHOUT re-streaming
     // history, so cached messages are never duplicated.
-    const isArchived = !!sessions.find((s) => s.id === sessionId)?.archived;
+    /* 读最新的列表（sessionsRef）：刚从云端下载回来就打开的那条，闭包里的 sessions 还没有它 —— 按「没归档」去 attach 过（第 3 轮实测：点归档的会话又能连接了） */
+    const isArchived = !!(sessionsRef.current.find((s) => s.id === sessionId) ?? sessions.find((s) => s.id === sessionId))?.archived;
     const needsLoad = !attachedIdsRef.current.has(sessionId) || !cached || cached.length === 0;
     /*
       **还在新建的不 attach** —— 实测（s_1792726606826_e2mprs）：新建远程会话的第 10 秒这里就去 loadSession，
@@ -5505,6 +5517,13 @@ ${text}`,
     });
   }, []);
 
+  /** 右键「在其他电脑上同步」：主进程写记录；侧栏的小标识按回来的 session:cross-device-changed 改 */
+  const setCrossDevice = useCallback(async (sessionId: string, on: boolean) => {
+    if (sessionId.startsWith('pending_')) return { ok: false };
+    try { return await (window as any).kiroApi?.setCrossDevice?.(sessionId, on); }
+    catch (e: any) { return { ok: false, error: String(e?.message || e) }; }
+  }, []);
+
   // Clear a conversation's VISIBLE history (messages + local cache). Used by
   // /clear so the KiroLex view empties in step with the backend context reset.
   //
@@ -5712,6 +5731,7 @@ ${text}`,
     renameProject,
     deleteProject,
     togglePin,
+    setCrossDevice,
     clearConversation,
     resetSessionCredits,
     sendMessage,

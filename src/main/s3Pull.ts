@@ -1,5 +1,6 @@
 /**
- * **把别的电脑上的新会话、新消息拉回本机** ——「S3 同步：自动把别的电脑上的新会话和新消息拉回本机（双向同步）」。
+ * **把别的电脑上的新消息拉回本机已有的会话** ——「S3 同步：自动把别的电脑上的新会话和新消息拉回本机（双向同步）」，
+ * 第 3 轮收窄成：只对开了「在其他电脑上同步」的会话、只拉本机已有会话的新内容。
  *
  * 原来的拉回只有冲突合并一处（`detectConflicts`：桶里那条来自别的机器、而且 `updatedAt` 比本机新）。实测两件事：
  *
@@ -14,19 +15,22 @@
  *   · **要不要合并**（`bucketMergeVerdict`）：桶里这条来自别的设备，而且它的 `uploadedAt`（那台机器**真的**上传文件的时刻）
  *     比本机上次合并时**从同一台设备**看到的那个新。按设备分开记（`BucketSeen`：id → 来源 → uploadedAt），
  *     比较的两边永远是同一台机器的时钟。合并完（哪怕并进 0 条）就记下，下一轮同一份桶内容不再合。
- *   · **建「来自别的电脑」的占位**（`planRemotePlaceholders`）：catalog 里来自别的设备、本机没有、没被本机删过、
- *     项目没设成不同步、不是 advanced 专属、不在云端回收站里的条目 —— 复用「移到云端」的占位（`sessionOffload.ts`），
- *     只是 `origin: 'remote'`。不下载，点开才拉。
- *   · **删除跟着走**：catalog 里已经没有这条（别的电脑删了它的备份、或者它进了云端回收站）→ 去掉这条外来占位；
- *     本机真有内容的会话不在这里处理。外来占位**不算本机持有**（`manifestSessionsWithOffloaded` 跳过它们），
- *     否则别的电脑删了它，云端回收站永远等不到「所有设备都没有了」。
+ *   · **不给本机没有的会话建占位**：上一版（b720c90）会给 catalog 里所有来自别的电脑、本机没有的会话建「云端占位」，
+ *     实测一下子冒出 16 条用户不需要的会话、点开就整条下载 —— 这个功能取消了，启动时清掉留下的（`clearRemotePlaceholders`）。
+ *     只拉**本机已有的**会话在别的电脑上的新消息。
+ *
+ * **只对开了「在其他电脑上同步」的会话**（第 3 轮，用户实测：「很多我不需要的会话都被下载下来了，其实应该是按照我的要求
+ * 只对特定的会话开启同步」）：会话记录上的 `crossDevice`（跟着 catalog 条目的 `crossDevice` 传）。缺省关 ——
+ * 没开的会话只备份、不自动合并。手动「从备份恢复」成功后自动开启（`withCrossDeviceOn`）。两台都有的会话，开 / 关按
+ * `crossDeviceChangedAt`「谁后改听谁」跟随（`crossDeviceToFollow`，和项目 / 归档的 placementChangedAt 同一套）。
  *
  * 不 import electron；文件路径都由参数传入。
  */
 
 import fs from 'fs';
 import path from 'path';
-import { sessionPrefix, type Catalog, type CatalogEntry } from './s3Sync.ts';
+import { placementOf, type Catalog, type CatalogEntry, type Placement } from './s3Sync.ts';
+import { looksLikeSessionId } from './projectSanity.ts';
 import { normalizeCatalog, uploadedAtOf } from './catalogStore.ts';
 import { readOffloadStateStrict, writeOffloadState, type OffloadPlaceholder } from './sessionOffload.ts';
 
@@ -35,8 +39,6 @@ export const BUCKET_SEEN_FILE = 's3-bucket-seen.json';
 
 /** 会话 id → 来源设备（catalog 的 `from`）→ 上次合并时看到的那条的 `uploadedAt`（那台设备的时钟）。 */
 export type BucketSeen = Record<string, Record<string, number>>;
-
-const SAFE_ID = /^[A-Za-z0-9_-]{1,120}$/;
 
 export function readBucketSeen(file: string): BucketSeen {
   try {
@@ -72,15 +74,23 @@ export function noteBucketSeen(seen: BucketSeen, id: string, entry: Pick<Catalog
   row[from] = Math.max(row[from] ?? at, at);
 }
 
-/** 设置里「自动显示其他电脑上的会话」（`s3Sync.autoShowRemoteSessions`，缺省开）。 */
-export function showRemoteSessions(cfg: { autoShowRemoteSessions?: unknown } | null | undefined): boolean {
-  return cfg?.autoShowRemoteSessions !== false;
+/** 这条 catalog 条目 / 会话记录开了「在其他电脑上同步」没有（缺省关）。 */
+export function isShared(x: { crossDevice?: unknown } | null | undefined): boolean {
+  return x?.crossDevice === true;
 }
 
-/** catalog 的 `from`（`machineTag`：`<6 位摘要>-<主机名>`）→ 显示用的主机名。 */
-export function hostOfTag(from: string | undefined): string {
-  const s = String(from || '');
-  return s.replace(/^[0-9a-f]{6}-/, '') || s;
+/**
+ * 本机这条要不要跟随桶里那条的「在其他电脑上同步」开关 —— 要就返回跟随成什么，不要就 `null`。
+ * 和 `placementToFollow` 同一个口径：只看 `crossDeviceChangedAt`，桶里的严格更新才跟（老条目没有 = 0，永远不跟）。
+ */
+export function crossDeviceToFollow(
+  local: { crossDevice?: unknown; crossDeviceChangedAt?: unknown } | null | undefined,
+  theirs: { crossDevice?: unknown; crossDeviceChangedAt?: unknown } | null | undefined,
+): { crossDevice: boolean; crossDeviceChangedAt: number } | null {
+  if (!local || !theirs) return null;
+  const at = Number(theirs.crossDeviceChangedAt) || 0;
+  if (at <= (Number(local.crossDeviceChangedAt) || 0)) return null;
+  return { crossDevice: isShared(theirs), crossDeviceChangedAt: at };
 }
 
 export type MergeSkip = 'none' | 'no-source' | 'own' | 'seen';
@@ -101,9 +111,25 @@ export function bucketMergeVerdict(
   return { merge: true };
 }
 
-/** 本机这几条会话里，这一轮要从桶里合并的那些（catalog 先按删除记录收拾过）。 */
+/** 本机这条和桶里那条合起来，「在其他电脑上同步」到底开没开：桶里改得严格更晚听桶里的，否则听本机的（本机没有 = 听桶里的）。 */
+export function effectiveShared(
+  local: { crossDevice?: unknown; crossDeviceChangedAt?: unknown } | null | undefined,
+  theirs: { crossDevice?: unknown; crossDeviceChangedAt?: unknown } | null | undefined,
+): boolean {
+  if (!local) return isShared(theirs);
+  const f = crossDeviceToFollow(local, theirs);
+  return f ? f.crossDevice : isShared(local);
+}
+
+/**
+ * 本机这几条会话里，这一轮要从桶里合并的那些（catalog 先按删除记录收拾过）。
+ * **只合开了「在其他电脑上同步」的**，开没开按「谁后改听谁」算（`effectiveShared`）：桶里那条的开关改得比本机晚就听桶里的，
+ * 否则听本机的 —— 本机后关掉的，桶里还留着旧的「开」也不合；另一台后开的（任一台开了就算开），本机还没跟上也照合。
+ * 都没开 → 只备份，不自动合并（回到双向同步之前的行为）。
+ */
 export function planBucketMerges(
   catalog: Catalog | null, localIds: Iterable<string>, thisMachine: string, seen: BucketSeen, now = Date.now(),
+  localFlags: ReadonlyMap<string, { crossDevice?: unknown; crossDeviceChangedAt?: unknown }> = new Map(),
 ): CatalogEntry[] {
   if (!catalog || !Array.isArray(catalog.entries)) return [];
   let c: Catalog;
@@ -112,161 +138,34 @@ export function planBucketMerges(
   const out: CatalogEntry[] = [];
   for (const id of localIds) {
     const e = byId.get(id);
-    if (e && bucketMergeVerdict(e, thisMachine, seen).merge) out.push(e);
+    if (!e || !effectiveShared(localFlags.get(id), e)) continue;
+    if (bucketMergeVerdict(e, thisMachine, seen).merge) out.push(e);
   }
   return out;
 }
 
-/* ------------------------------------------------------------------ 外来占位 */
+/* ------------------------------------------------------------------ 上一版的外来占位 */
 
-export type RemoteSkip = 'own' | 'no-source' | 'local' | 'placeholder' | 'deleted' | 'excluded' | 'advanced' | 'cloud-trash' | 'bad-id';
-export type RemoteRemoveWhy = 'gone' | 'deleted' | 'excluded' | 'advanced' | 'turned-off' | 'cloud-trash';
-
-export interface RemotePlanInput {
-  /** 这一轮最新的 catalog（读不到 = null：这一轮不建也不删） */
-  catalog: Catalog | null;
-  thisMachine: string;
-  prefix: string | undefined;
-  now: number;
-  /** 设置「自动显示其他电脑上的会话」 */
-  enabled: boolean;
-  /** 本机有的会话（记录 + sessions/ 下的目录 + advanced 的） */
-  localIds: ReadonlySet<string>;
-  /** 现有的占位（本机移到云端的 + 来自别的电脑的） */
-  placeholders: Record<string, OffloadPlaceholder>;
-  /** 本机删过的（deleted-sessions.json、s3-deleted-at.json、回收站里的 `<id>__<时间>`、这次运行里删的） */
-  deleted: ReadonlySet<string>;
-  /** 这一轮云端清理刚移进云端回收站的 */
-  inCloudTrash?: ReadonlySet<string>;
-  /** 项目 / 会话设成了不同步 */
-  excluded: (e: { id: string; project?: string }) => boolean;
-  /** KiroLex Advanced 专属的项目（`isAdvancedOnlyProjectName`） */
-  advanced: (project: string) => boolean;
-}
-
-export interface RemotePlan {
-  create: OffloadPlaceholder[];
-  /** 已有的外来占位：标题 / 项目 / 归档 / 最后活动跟着 catalog 走 */
-  update: OffloadPlaceholder[];
-  remove: Array<{ id: string; why: RemoteRemoveWhy }>;
-  skipped: Array<{ id: string; reason: RemoteSkip }>;
-}
-
-/** 这条占位是不是「从别的电脑来的」（不是本机移到云端的）。 */
+/**
+ * 这条占位是不是上一版（b720c90）建的「从别的电脑来的」占位（`origin: 'remote'`）。
+ * 那个功能已经取消（「很多我不需要的会话都被下载下来了」）：不再给本机没有的会话建占位，启动时把留下的清掉。
+ */
 export function isRemotePlaceholder(p: OffloadPlaceholder | undefined | null): boolean {
   return !!p && p.origin === 'remote';
 }
 
-/** catalog 条目 → 外来占位。打开时按 `cloudKey` 下载（`restoreOffloadedSession`）。 */
-export function remotePlaceholderFor(e: CatalogEntry, prefix: string | undefined, now: number): OffloadPlaceholder {
-  const project = typeof e.project === 'string' ? e.project.trim() : '';
-  return {
-    id: e.id,
-    title: typeof e.title === 'string' && e.title ? e.title : 'New Chat',
-    ...(project ? { project } : null),
-    ...(e.archived ? { archived: true } : null),
-    lastActiveAt: Number(e.updatedAt) || 0,
-    offloadedAt: now,
-    cloudKey: sessionPrefix(prefix || '', e.id),
-    bytes: Number(e.bytes) || 0,
-    files: 0,
-    origin: 'remote',
-    fromMachine: String(e.from || ''),
-    fromHost: hostOfTag(e.from),
-    seenUploadedAt: uploadedAtOf(e),
-  };
-}
-
-/** **这一轮要建 / 改 / 去掉哪些外来占位**。纯函数；本机移到云端的占位一概不碰。 */
-export function planRemotePlaceholders(i: RemotePlanInput): RemotePlan {
-  const plan: RemotePlan = { create: [], update: [], remove: [], skipped: [] };
-  if (!i.catalog || !Array.isArray(i.catalog.entries)) return plan;
-  let c: Catalog;
-  try { c = normalizeCatalog(i.catalog, i.now); } catch { return plan; }
-  const byId = new Map(c.entries.map((e) => [e.id, e]));
-  const trash = i.inCloudTrash || new Set<string>();
-  const projectOf = (e: { project?: string }): string => (typeof e.project === 'string' ? e.project.trim() : '');
-
-  for (const p of Object.values(i.placeholders)) {
-    if (!isRemotePlaceholder(p)) continue;
-    /* 本机已经有了（下载回来了、收尾前中断）：占位交给下载那一路收尾，这里不动 */
-    if (i.localIds.has(p.id)) continue;
-    const e = byId.get(p.id);
-    const why: RemoteRemoveWhy | null = !i.enabled ? 'turned-off'
-      : i.deleted.has(p.id) ? 'deleted'
-      : trash.has(p.id) ? 'cloud-trash'
-      : !e ? 'gone'
-      : i.excluded({ id: p.id, project: projectOf(e) }) ? 'excluded'
-      : projectOf(e) && i.advanced(projectOf(e)) ? 'advanced'
-      : null;
-    if (why) { plan.remove.push({ id: p.id, why }); continue; }
-    const next = { ...remotePlaceholderFor(e!, i.prefix, p.offloadedAt), ...(p.trashDir ? { trashDir: p.trashDir } : null) };
-    /* 云端位置不跟着现在的前缀改：建占位时记下的那个才是这份所在的地方（和本机移走的占位同一条） */
-    next.cloudKey = p.cloudKey;
-    if (JSON.stringify(next) !== JSON.stringify(p)) plan.update.push(next);
-  }
-
-  if (!i.enabled) return plan;
-  for (const e of c.entries) {
-    const skip = (reason: RemoteSkip): void => { plan.skipped.push({ id: e.id, reason }); };
-    if (!e?.id || !SAFE_ID.test(e.id)) { if (e?.id) skip('bad-id'); continue; }
-    const from = String(e.from || '');
-    if (!from) { skip('no-source'); continue; }
-    if (from === i.thisMachine) { skip('own'); continue; }
-    if (i.localIds.has(e.id)) { skip('local'); continue; }
-    if (i.placeholders[e.id]) { skip('placeholder'); continue; }
-    if (i.deleted.has(e.id)) { skip('deleted'); continue; }
-    if (trash.has(e.id)) { skip('cloud-trash'); continue; }
-    const project = projectOf(e);
-    if (i.excluded({ id: e.id, project })) { skip('excluded'); continue; }
-    if (project && i.advanced(project)) { skip('advanced'); continue; }
-    plan.create.push(remotePlaceholderFor(e, i.prefix, i.now));
-  }
-  return plan;
-}
-
 /**
- * 把计划写进占位文件（严格读：文件坏了就不写，返回 null —— 写回会盖掉里面的「保留在本机」名单和本机移走的占位）。
- * 只动外来占位：要去掉 / 更新的那条在文件里已经不是外来的（期间被本机移到云端了）就不动。
+ * **启动时清掉上一版建的外来占位**：只删 `origin: 'remote'` 的那些（它们只是指向云端的指针，本机从来没有过内容，删了什么都不丢），
+ * 本机移到云端的占位一条不碰。占位文件读不了 / 坏了 → 不写（写回会盖掉里面的「保留在本机」名单和本机移走的占位），返回 null。
  */
-export function applyRemotePlaceholders(stateFile: string, plan: RemotePlan): { created: string[]; updated: string[]; removed: string[] } | null {
-  if (!plan.create.length && !plan.update.length && !plan.remove.length) return { created: [], updated: [], removed: [] };
+export function clearRemotePlaceholders(stateFile: string): string[] | null {
   const st = readOffloadStateStrict(stateFile);
   if (!st) return null;
-  const created: string[] = [];
-  const updated: string[] = [];
-  const removed: string[] = [];
-  for (const r of plan.remove) {
-    if (!isRemotePlaceholder(st.offloaded[r.id])) continue;
-    delete st.offloaded[r.id];
-    removed.push(r.id);
-  }
-  for (const p of plan.update) {
-    if (!isRemotePlaceholder(st.offloaded[p.id])) continue;
-    st.offloaded[p.id] = p;
-    updated.push(p.id);
-  }
-  for (const p of plan.create) {
-    if (st.offloaded[p.id]) continue;
-    st.offloaded[p.id] = p;
-    created.push(p.id);
-  }
-  if (created.length || updated.length || removed.length) writeOffloadState(stateFile, st);
-  return { created, updated, removed };
-}
-
-/**
- * 本机删掉一条外来占位（侧栏右键「从这台电脑的列表里移除」）。只删外来的；本机移到云端的不走这里。
- * 调用方接着写删除记录（`noteDeletion`）—— 下一轮不会又建回来，云端回收站也知道这台删过它。
- */
-export function dismissRemotePlaceholder(stateFile: string, id: string): { ok: true } | { ok: false; why: string } {
-  if (!SAFE_ID.test(id)) return { ok: false, why: 'invalid session id' };
-  const st = readOffloadStateStrict(stateFile);
-  if (!st) return { ok: false, why: 'the placeholder file is unreadable; not overwriting it' };
-  if (!isRemotePlaceholder(st.offloaded[id])) return { ok: false, why: 'not a session from another computer' };
-  delete st.offloaded[id];
+  const gone = Object.values(st.offloaded).filter((p) => isRemotePlaceholder(p)).map((p) => p.id);
+  if (!gone.length) return [];
+  for (const id of gone) delete st.offloaded[id];
   writeOffloadState(stateFile, st);
-  return { ok: true };
+  return gone;
 }
 
 /* ------------------------------------------------------------------ 合并的顺序 */
@@ -300,4 +199,49 @@ export async function runBucketMerge(io: BucketMergeIO): Promise<BucketMergeResu
   const pulledFiles = got.missingFiles ? await io.pullFiles() : 0;
   if (io.isBusy()) return { added: 0, pulledFiles, deferred: true };
   return { added: io.apply(), pulledFiles };
+}
+
+/* ------------------------------------------------------------------ 下载回本机时放在哪儿 */
+
+/**
+ * **占位下载回本机之后放在哪儿**（第 3 轮：「两条在 catalog 里 archived=true，下载后『放进未分组』、record 里 archived 丢了」）。
+ *
+ * 原来占位下载走的是 s3:restore 那条规则（`restoreTarget`，6165543「从云端恢复的默认进未分组」）：
+ *   · 传的是 `entry: undefined`、`putBack: false` —— 项目一律清掉、标 unassigned；
+ *   · 归档只取**下载下来的那份 record.json**，侧栏上看到的（占位记下的、catalog 里的）位置完全不参与 ——
+ *     桶里的 record.json 比 catalog 条目旧（catalog 每轮按上传那台**现在的**记录重写，record.json 只在它本身被重传时才变）时，
+ *     侧栏里在「已归档」的那条，下载回来就成了未分组里一条能连接的普通会话。
+ * 占位不是「从备份恢复」：它就是侧栏里那一行，点开只是把内容拿回来，位置应当和点开之前一样。所以：
+ *   · 位置按「谁的 placementChangedAt 新听谁」取占位（catalog）和下载下来的记录里较新的那份；一样新（或占位没记时间）时，
+ *     归档取两边的「或」—— 宁可多留在归档里（取消归档是一下的事），不能把归档的放出来自动连接；
+ *   · 项目本机侧栏有（不是会话 id 形状、不是 advanced 专属）就放回去，没有才进未分组（标 unassigned）。
+ */
+export function placeholderPlacement(
+  record: { profile?: any; archived?: any; placementChangedAt?: any } | null | undefined,
+  placeholder: Pick<OffloadPlaceholder, 'project' | 'archived' | 'placementChangedAt'> | null | undefined,
+  localProjects: ReadonlySet<string>,
+  refuseProject?: (projectId: string) => boolean,
+): { placement: Placement; unassigned: boolean; origin?: string } {
+  const r = placementOf(record);
+  const pAt = Number(placeholder?.placementChangedAt) || 0;
+  const pProject = typeof placeholder?.project === 'string' ? placeholder.project.trim() : '';
+  const pArchived = !!placeholder?.archived;
+  const placeholderNewer = !!placeholder && pAt > r.placementChangedAt;
+  const recordNewer = !placeholder || (pAt > 0 && r.placementChangedAt > pAt);
+  const archived = placeholderNewer ? pArchived : recordNewer ? r.archived : (r.archived || pArchived);
+  const wanted = placeholderNewer ? pProject : recordNewer ? r.projectId : (r.projectId || pProject);
+  const ok = !!wanted && localProjects.has(wanted) && !looksLikeSessionId(wanted) && !refuseProject?.(wanted);
+  return {
+    placement: { projectId: ok ? wanted : '', archived, placementChangedAt: Math.max(pAt, r.placementChangedAt) },
+    unassigned: !ok,
+    ...(wanted ? { origin: wanted } : null),
+  };
+}
+
+/**
+ * **手动「从备份恢复」成功 = 开启「在其他电脑上同步」**：恢复回来就是要在这台接着用、并拿到另一台后来的新消息。
+ * 开关时间记成现在（比另一台的旧开关新 —— 另一台下一轮也跟着开，谁后改听谁）。只动这两个字段。
+ */
+export function withCrossDeviceOn<T extends { crossDevice?: boolean; crossDeviceChangedAt?: number }>(rec: T, now: number): T {
+  return { ...rec, crossDevice: true, crossDeviceChangedAt: Math.max(now, (Number(rec.crossDeviceChangedAt) || 0) + 1) };
 }

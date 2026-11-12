@@ -209,6 +209,8 @@ interface SidebarProps {
   onRebuildContext?: (id: string, mode?: 'snapshot' | 'full') => void;
   onRenameSession: (id: string, title: string) => void;
   onTogglePin: (id: string) => void;
+  /** 右键「在其他电脑上同步」开 / 关（主进程 s3Pull.ts；缺省关 = 只备份） */
+  onToggleCrossDevice?: (id: string, on: boolean) => void;
   /** 1-based grid position per session (0 = not in the split), so the sidebar
    *  can highlight the visible chats in grid order. */
   splitOrder?: (id: string) => number;
@@ -246,8 +248,6 @@ interface SidebarProps {
   offloadedSessions?: Session[];
   /** 右键「下载回本机」/「保留在本机，不再自动移走」（占位：下载 + 打标记） */
   onOffloadRestore?: (id: string, keepLocal: boolean) => void;
-  /** 从别的电脑来的占位：从这台电脑的列表里移除（主进程写删除记录，下一轮不再建回来） */
-  onOffloadDismiss?: (id: string) => void;
   /** 上一次同步的结果 —— 给这个按钮上色和写 title 用。 */
   backupState?: { at: number; uploaded: number; error?: string } | null;
   workspaceOpen: boolean;
@@ -355,6 +355,8 @@ const SessionItem: React.FC<{
         >{splitOrder}</span>
       )}
       {session.pinned && <span className="session-pin" title={t('Pinned')}>📌</span>}
+      {/* 开了「在其他电脑上同步」：其他电脑上也有这条时，新消息两边合并（不会让它出现在没有它的电脑上） */}
+      {session.crossDevice && <span className="session-pin session-cross-device" title={t('Syncing new messages with your other computers')}>🔗</span>}
       {/*
         画布会话那个 🧩 挪到了**右边**那排标记里 —— 「你把 flow 那个 tag 加到会话的右侧，不是左侧」。
         左边这一段是「这一行本身」的东西（分屏序号、📌、状态灯），而 flow 的身份和 worker 的 tag、子代理计数、
@@ -400,12 +402,6 @@ const SessionItem: React.FC<{
         常驻：任何时候都不该去猜这一轮在哪台机器上跑 —— 猜错的代价是对着另一台机器的文件下结论。
       */}
       {/* 不挂引擎 tag ——「左侧会话框不要显示 claude 这个 tag，你应该显示的仍然是远程 tag」。引擎在会话界面左下角看 */}
-      {/* 从别的电脑来的占位（主进程 s3Pull.ts）：说清它在哪台电脑上 —— 本机从来没有过它，点开才下载 */}
-      {off?.remote && (
-        <span className="session-remote session-remote-elsewhere" title={offTitle}>
-          💻 {off.remote.host || t('On another computer ({host})', { host: '?' })}
-        </span>
-      )}
       {pendingTarget !== undefined ? (
         <span className="session-remote session-remote-switching" title={t('Switching where this runs…')}>
           ⏳ {pendingTarget || t('Local')}
@@ -610,6 +606,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onRebuildContext,
   onRenameSession,
   onTogglePin,
+  onToggleCrossDevice,
   splitOrder = () => 0,
   onToggleSplit,
   scheduleFor,
@@ -623,7 +620,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
   onOpenBackup,
   offloadedSessions,
   onOffloadRestore,
-  onOffloadDismiss,
   backupState,
   workspaceOpen,
   onOpenWorkspace,
@@ -1270,7 +1266,7 @@ export const Sidebar: React.FC<SidebarProps> = ({
       </div>
 
       {/* Session context menu: Rename / Pin-Unpin / Delete （归档的多一条「恢复」，且在最上面） */}
-      {/* ☁ 占位的右键：只有下载回本机这两条（它在本机没有记录，别的操作都无从谈起）；从别的电脑来的多一条「从列表里移除」 */}
+      {/* ☁ 占位的右键：只有下载回本机这两条（它在本机没有记录，别的操作都无从谈起） */}
       {contextMenu && ctxOffloaded && (
         <Menu x={contextMenu.x} y={contextMenu.y}>
           <div
@@ -1286,15 +1282,6 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             {`📍 ${t('Keep on this computer; do not move it automatically again')}`}
           </div>
-          {ctxOffloaded.offloaded?.remote && (
-            <div
-              className="context-menu-item"
-              title={t('The session stays on the other computer and in the cloud; it just stops showing here.')}
-              onClick={() => { onOffloadDismiss?.(ctxOffloaded.id); setContextMenu(null); }}
-            >
-              {`🗑️ ${t('Remove from this computer’s list')}`}
-            </div>
-          )}
         </Menu>
       )}
       {contextMenu && ctxSession && (
@@ -1332,6 +1319,16 @@ export const Sidebar: React.FC<SidebarProps> = ({
           >
             {`📌 ${ctxSession.pinned ? t('Unpin') : t('Pin')}`}
           </div>
+          {/* 「在其他电脑上同步」：缺省关（只备份）；开了，才自动合并其他电脑上同一条会话的新消息 */}
+          {!ctxSession.id.startsWith('pending_') && onToggleCrossDevice && (
+            <div
+              className="context-menu-item"
+              title={t('When on, new messages for this chat are merged in from your other computers that also have it (same backup bucket). It does not make the chat appear on computers that do not have it. When off, it is only backed up.')}
+              onClick={() => { onToggleCrossDevice(ctxSession.id, !ctxSession.crossDevice); setContextMenu(null); }}
+            >
+              {`🔗 ${ctxSession.crossDevice ? t('Stop syncing to other computers') : t('Sync to other computers')}`}
+            </div>
+          )}
           {/* 会话信息（里面能查看/复制 id）。还没落盘的 `pending_` 没有真 id，不给。 */}
           {!ctxSession.id.startsWith('pending_') && (
             <div

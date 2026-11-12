@@ -204,6 +204,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   'Download failed.': '下载失败。',
   'Failed to get usage': '获取用量失败',
   'Session was deleted; not re-attaching.': '会话已被删除，不再重新连接。',
+  'This chat is archived. Unarchive it to continue chatting.': '这条会话已归档（只读）。要继续聊，先取消归档。',
   'Session was deleted during attach; aborted.': '连接过程中会话被删除了，已中止。',
   'This chat could not be started: {error}': '这条会话没能启动：{error}',
   'projectId is write-once; it cannot be changed once set.': 'projectId 只能设置一次，设置后不能再改。',

@@ -174,6 +174,12 @@ export interface SessionRecord {
   /** User-archived: hidden from the main list, never eager-attached. Not deleted. */
   archived?: boolean;
   /**
+   * 「在其他电脑上同步」（s3Pull.ts）：开着的会话，才自动合并其他电脑（同一个桶）上同一条会话的新消息；手动从备份恢复会自动开。缺省关 = 只备份。
+   * `crossDeviceChangedAt` 是用户最后一次改这个开关的时刻（两台都有时谁后改听谁）。
+   */
+  crossDevice?: boolean;
+  crossDeviceChangedAt?: number;
+  /**
    * 项目（`profile.projectId`）或归档状态最后一次被**用户**改动的时刻 ——
    * 「同步时让会话的项目和归档状态在多台机器间自动跟随」。多台机器之间位置按它谁新用谁
    * （`placementToFollow` / `mergeRecords`），不跟着每条消息都会动的 `updatedAt` 走。老记录没有 → 当 0。

@@ -96,11 +96,6 @@ export interface SyncConfig {
    */
   autoOffload?: boolean;
   offloadIdleDays?: number;
-  /**
-   * **自动显示其他电脑上的会话**（见 `s3Pull.ts`）：别的电脑上有、本机没有的会话在侧栏建一个占位，点开才下载。
-   * 缺省 = 开；关掉只停这一项（本机已有的会话照常拉回别的电脑的新消息）。
-   */
-  autoShowRemoteSessions?: boolean;
   accessKeyId?: string;
   /** `safeStorage` 加密后的 secret（base64）。**明文永不落盘**。 */
   secretCipher?: string;
@@ -179,6 +174,12 @@ export interface CatalogEntry {
    * 不然刚恢复回来，下一轮同步又按同一批旧删除记录把它移回回收站。
    */
   restoredFromTrashAt?: number;
+  /**
+   * 这条会话开了「在其他电脑上同步」（`record.crossDevice`，见 s3Pull.ts）：别的电脑据此自动合并新消息。
+   * 没有 = 没开（只备份）。`crossDeviceChangedAt` = 开关最后一次被用户改的时刻，两台都有时「谁后改听谁」。
+   */
+  crossDevice?: boolean;
+  crossDeviceChangedAt?: number;
 }
 
 /**

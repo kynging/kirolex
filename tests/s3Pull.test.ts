@@ -4,11 +4,11 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  bucketMergeVerdict, planBucketMerges, noteBucketSeen, readBucketSeen, writeBucketSeen, planRemotePlaceholders,
-  applyRemotePlaceholders, dismissRemotePlaceholder, remotePlaceholderFor, showRemoteSessions, hostOfTag, isRemotePlaceholder,
-  runBucketMerge, type BucketMergeIO, type BucketSeen, type RemotePlanInput,
+  bucketMergeVerdict, planBucketMerges, noteBucketSeen, readBucketSeen, writeBucketSeen, clearRemotePlaceholders, isRemotePlaceholder,
+  isShared, crossDeviceToFollow, placeholderPlacement, withCrossDeviceOn,
+  runBucketMerge, type BucketMergeIO, type BucketSeen,
 } from '../src/main/s3Pull.ts';
-import { manifestSessionsWithOffloaded, readOffloadState, readOffloadStateStrict, writeOffloadState, type OffloadPlaceholder } from '../src/main/sessionOffload.ts';
+import { readOffloadState, writeOffloadState, type OffloadPlaceholder } from '../src/main/sessionOffload.ts';
 import { buildDeviceManifest, decideCleanup, withDeviceManifest, DAY_MS } from '../src/main/cloudTrash.ts';
 import { mergeCatalog, type Catalog, type CatalogEntry } from '../src/main/s3Sync.ts';
 
@@ -23,8 +23,9 @@ const A = 'aaaaaa-mac';
 const B = 'bb0f24-b0be83784d7d';
 const NOW = Date.parse('2026-11-12T00:00:00Z');
 
+/* 缺省是开了「在其他电脑上同步」的条目（下面大部分用例讲的是开着的会话）；没开的单独测 */
 const entry = (over: Partial<CatalogEntry> = {}): CatalogEntry => ({
-  id: 's_1', title: 'T', updatedAt: NOW - 1000, bytes: 10, from: B, syncedAt: NOW - 500, uploadedAt: NOW - 600, ...over,
+  id: 's_1', title: 'T', updatedAt: NOW - 1000, bytes: 10, from: B, syncedAt: NOW - 500, uploadedAt: NOW - 600, crossDevice: true, crossDeviceChangedAt: NOW - 2000, ...over,
 });
 const cat = (entries: CatalogEntry[], extra: Partial<Catalog> = {}): Catalog => ({ version: 1, entries, ...extra });
 
@@ -32,100 +33,35 @@ const tmps: string[] = [];
 const mkHome = (): string => { const d = fs.mkdtempSync(path.join(os.tmpdir(), 'kirolex-s3pull-')); tmps.push(d); return d; };
 afterEach(() => { for (const d of tmps.splice(0)) fs.rmSync(d, { recursive: true, force: true }); });
 
-const planInput = (over: Partial<RemotePlanInput> = {}): RemotePlanInput => ({
-  catalog: cat([entry()]), thisMachine: A, prefix: 'kx', now: NOW, enabled: true,
-  localIds: new Set(), placeholders: {}, deleted: new Set(),
-  excluded: () => false, advanced: () => false,
-  ...over,
-});
-
-describe('(a) 别的电脑上的新会话 → 建占位', () => {
-  test('来自别的设备、本机没有 → 建外来占位（不下载，记下来源和云端位置）', () => {
-    const plan = planRemotePlaceholders(planInput());
-    assert.equal(plan.create.length, 1);
-    const p = plan.create[0];
-    assert.equal(p.id, 's_1');
-    assert.equal(p.origin, 'remote');
-    assert.equal(p.fromMachine, B);
-    assert.equal(p.fromHost, 'b0be83784d7d');
-    assert.equal(p.cloudKey, 'kx/v1/sessions/s_1/');
-    assert.equal(p.seenUploadedAt, NOW - 600);
-    assert.ok(isRemotePlaceholder(p));
+describe('(1) 只合并开了「在其他电脑上同步」的会话；任一台开了就算开', () => {
+  const plain = { crossDevice: undefined, crossDeviceChangedAt: undefined };
+  test('两边都没开 → 不合并（只备份）', () => {
+    assert.deepEqual(planBucketMerges(cat([entry(plain)]), ['s_1'], A, {}), []);
   });
-
-  test('排除项：自己传的 / 本机有的 / 已有占位 / 本机删过的 / 不同步的项目 / advanced / 云端回收站 / 没记来源', () => {
-    const cases: Array<[string, Partial<RemotePlanInput>, string]> = [
-      ['own', { catalog: cat([entry({ from: A })]) }, 'own'],
-      ['no-source', { catalog: cat([entry({ from: undefined })]) }, 'no-source'],
-      ['local', { localIds: new Set(['s_1']) }, 'local'],
-      ['placeholder', { placeholders: { s_1: { ...remotePlaceholderFor(entry(), 'kx', 1), origin: undefined } as OffloadPlaceholder } }, 'placeholder'],
-      ['deleted', { deleted: new Set(['s_1']) }, 'deleted'],
-      ['excluded', { catalog: cat([entry({ project: 'Secret' })]), excluded: (e) => e.project === 'Secret' }, 'excluded'],
-      ['advanced', { catalog: cat([entry({ project: 'flow-x' })]), advanced: (p) => p === 'flow-x' }, 'advanced'],
-      ['cloud-trash', { inCloudTrash: new Set(['s_1']) }, 'cloud-trash'],
-    ];
-    for (const [name, over, reason] of cases) {
-      const plan = planRemotePlaceholders(planInput(over));
-      assert.equal(plan.create.length, 0, name);
-      assert.deepEqual(plan.skipped.map((s) => s.reason), [reason], name);
-    }
+  test('桶里那条开着（另一台开的）→ 合并；本机这条开着、桶里那条还没开 → 也合并', () => {
+    assert.deepEqual(planBucketMerges(cat([entry()]), ['s_1'], A, {}).map((x) => x.id), ['s_1']);
+    assert.deepEqual(planBucketMerges(cat([entry(plain)]), ['s_1'], A, {}, NOW, new Map([['s_1', { crossDevice: true, crossDeviceChangedAt: 5 }]])).map((x) => x.id), ['s_1']);
   });
-
-  test('catalog 里删除记录比条目新（墓碑）→ 不建', () => {
-    const plan = planRemotePlaceholders(planInput({ catalog: cat([entry()], { deleted: [{ id: 's_1', at: NOW - 100 }] }) }));
-    assert.equal(plan.create.length, 0);
+  test('谁后改听谁：本机后关（20）、桶里还是旧的开（10）→ 不合并；桶里后开（30）、本机旧的关（20）→ 合并', () => {
+    const off = new Map([['s_1', { crossDeviceChangedAt: 20 }]]);
+    assert.deepEqual(planBucketMerges(cat([entry({ crossDeviceChangedAt: 10 })]), ['s_1'], A, {}, NOW, off), []);
+    assert.deepEqual(planBucketMerges(cat([entry({ crossDeviceChangedAt: 30 })]), ['s_1'], A, {}, NOW, off).map((x) => x.id), ['s_1']);
+    /* 本机开着（20）、桶里后关（30）→ 不合并 */
+    assert.deepEqual(planBucketMerges(cat([entry({ crossDevice: undefined, crossDeviceChangedAt: 30 })]), ['s_1'], A, {}, NOW, new Map([['s_1', { crossDevice: true, crossDeviceChangedAt: 20 }]])), []);
   });
-
-  test('设置关掉「自动显示其他电脑上的会话」→ 不建；已有的外来占位去掉；缺省是开', () => {
-    const p = remotePlaceholderFor(entry(), 'kx', 1);
-    const plan = planRemotePlaceholders(planInput({ enabled: false, catalog: cat([entry(), entry({ id: 's_2' })]), placeholders: { s_1: p } }));
-    assert.equal(plan.create.length, 0);
-    assert.deepEqual(plan.remove, [{ id: 's_1', why: 'turned-off' }]);
-    assert.equal(showRemoteSessions({}), true);
-    assert.equal(showRemoteSessions(undefined), true);
-    assert.equal(showRemoteSessions({ autoShowRemoteSessions: false }), false);
+  test('开关跟随：桶里改得更晚 → 跟（开 / 关都跟）；一样新或更早 → 不跟；老条目没有时间 → 不跟', () => {
+    assert.deepEqual(crossDeviceToFollow({ crossDeviceChangedAt: 5 }, { crossDevice: true, crossDeviceChangedAt: 9 }), { crossDevice: true, crossDeviceChangedAt: 9 });
+    assert.deepEqual(crossDeviceToFollow({ crossDevice: true, crossDeviceChangedAt: 5 }, { crossDeviceChangedAt: 9 }), { crossDevice: false, crossDeviceChangedAt: 9 });
+    assert.equal(crossDeviceToFollow({ crossDevice: true, crossDeviceChangedAt: 9 }, { crossDeviceChangedAt: 9 }), null);
+    assert.equal(crossDeviceToFollow({ crossDevice: true, crossDeviceChangedAt: 9 }, { crossDevice: false }), null);
   });
-
-  test('catalog 读不到 → 什么都不做', () => {
-    const p = remotePlaceholderFor(entry(), 'kx', 1);
-    const plan = planRemotePlaceholders(planInput({ catalog: null, placeholders: { s_1: p } }));
-    assert.deepEqual(plan, { create: [], update: [], remove: [], skipped: [] });
-  });
-
-  test('写进占位文件：本机移到云端的占位不被碰；本机删过的占位（删除记录）下一轮不再建', () => {
-    const home = mkHome();
-    const f = path.join(home, 'sessions-offloaded.json');
-    const local: OffloadPlaceholder = { id: 's_local', title: 'L', lastActiveAt: 1, offloadedAt: 2, cloudKey: 'kx/v1/sessions/s_local/', bytes: 1, files: 1 };
-    writeOffloadState(f, { version: 1, offloaded: { s_local: local }, keepLocal: [] });
-    const c = cat([entry(), entry({ id: 's_local' })]);
-    const r = applyRemotePlaceholders(f, planRemotePlaceholders(planInput({ catalog: c, placeholders: readOffloadState(f).offloaded })));
-    assert.deepEqual(r?.created, ['s_1']);
-    assert.deepEqual(readOffloadState(f).offloaded.s_local, local);
-    /* 本机删掉这条外来占位：去掉 + 调用方写删除记录 → 下一轮不建回来 */
-    assert.deepEqual(dismissRemotePlaceholder(f, 's_1'), { ok: true });
-    assert.equal(dismissRemotePlaceholder(f, 's_local').ok, false, '本机移走的占位不走这条');
-    const again = planRemotePlaceholders(planInput({ catalog: c, placeholders: readOffloadState(f).offloaded, deleted: new Set(['s_1']) }));
-    assert.equal(again.create.length, 0);
-    /* 占位文件坏了 → 不写 */
-    fs.writeFileSync(f, '{bad');
-    assert.equal(applyRemotePlaceholders(f, planRemotePlaceholders(planInput())), null);
-    assert.equal(fs.readFileSync(f, 'utf-8'), '{bad');
-  });
-
-  test('旧版本读得懂新字段；origin 乱填 → 整份当读不懂（不静默丢）', () => {
-    const home = mkHome();
-    const f = path.join(home, 'sessions-offloaded.json');
-    writeOffloadState(f, { version: 1, offloaded: { s_1: remotePlaceholderFor(entry(), 'kx', 1) }, keepLocal: [] });
-    assert.equal(readOffloadStateStrict(f)?.offloaded.s_1.origin, 'remote');
-    const raw = JSON.parse(fs.readFileSync(f, 'utf-8'));
-    raw.offloaded.s_1.origin = 'weird';
-    fs.writeFileSync(f, JSON.stringify(raw));
-    assert.equal(readOffloadStateStrict(f), null);
-  });
-
-  test('主机名：去掉 machineTag 前面那 6 位摘要', () => {
-    assert.equal(hostOfTag('bb0f24-b0be83784d7d'), 'b0be83784d7d');
-    assert.equal(hostOfTag('kyn-desktop'), 'kyn-desktop');
+  test('合并记录：开关按自己的改动时刻谁新用谁（不跟 updatedAt）；一样新时开着的赢', async () => {
+    const { mergeRecords } = await import('../src/main/transcriptMerge.ts');
+    const local = { id: 's', updatedAt: 100, crossDevice: true, crossDeviceChangedAt: 50 };
+    const remote = { id: 's', updatedAt: 200, crossDeviceChangedAt: 10 };
+    assert.equal(mergeRecords(local, remote).crossDevice, true, '本机后开的，对方后聊一句也不能把它关掉');
+    assert.equal(mergeRecords({ ...local, crossDeviceChangedAt: 5 }, remote).crossDevice, undefined, '对方后关的就关');
+    assert.equal(mergeRecords({ id: 's', updatedAt: 300, crossDeviceChangedAt: 10 }, { ...remote, crossDevice: true }).crossDevice, true);
   });
 });
 
@@ -244,60 +180,6 @@ describe('(c) 并进 0 条 → 不动本机、下一轮不再合；A/B 交替同
   });
 });
 
-describe('(d) 别的电脑删了 → 外来占位去掉；本机真会话不动', () => {
-  test('catalog 墓碑比条目新 → 去掉外来占位；本机移到云端的占位、本机有的会话都不在这里处理', () => {
-    const remote = remotePlaceholderFor(entry(), 'kx', 1);
-    const localOff: OffloadPlaceholder = { id: 's_off', title: 'O', lastActiveAt: 1, offloadedAt: 2, cloudKey: 'kx/v1/sessions/s_off/', bytes: 1, files: 1 };
-    const c = cat([entry(), entry({ id: 's_off' }), entry({ id: 's_real' })], {
-      deleted: [{ id: 's_1', at: NOW }, { id: 's_off', at: NOW }, { id: 's_real', at: NOW }],
-    });
-    const plan = planRemotePlaceholders(planInput({ catalog: c, placeholders: { s_1: remote, s_off: localOff }, localIds: new Set(['s_real']) }));
-    assert.deepEqual(plan.remove, [{ id: 's_1', why: 'gone' }]);
-    assert.equal(plan.create.length, 0);
-  });
-
-  test('条目从 catalog 里没了（进了云端回收站）→ 去掉；这一轮刚移进回收站的也去掉', () => {
-    const remote = remotePlaceholderFor(entry(), 'kx', 1);
-    assert.deepEqual(planRemotePlaceholders(planInput({ catalog: cat([]), placeholders: { s_1: remote } })).remove, [{ id: 's_1', why: 'gone' }]);
-    assert.deepEqual(planRemotePlaceholders(planInput({ placeholders: { s_1: remote }, inCloudTrash: new Set(['s_1']) })).remove, [{ id: 's_1', why: 'cloud-trash' }]);
-  });
-
-  test('还在：标题 / 项目跟着 catalog 改，云端位置不变', () => {
-    const remote = remotePlaceholderFor(entry(), 'kx', 1);
-    const plan = planRemotePlaceholders(planInput({ prefix: 'other', catalog: cat([entry({ title: 'Renamed', project: 'P' })]), placeholders: { s_1: remote } }));
-    assert.equal(plan.update.length, 1);
-    assert.equal(plan.update[0].title, 'Renamed');
-    assert.equal(plan.update[0].project, 'P');
-    assert.equal(plan.update[0].cloudKey, 'kx/v1/sessions/s_1/');
-    assert.equal(plan.update[0].offloadedAt, 1);
-    /* 没变就不改 */
-    assert.equal(planRemotePlaceholders(planInput({ placeholders: { s_1: remote } })).update.length, 0);
-  });
-});
-
-describe('(e) 云端回收站的设备清单不把没打开过的外来占位算成持有', () => {
-  test('manifestSessionsWithOffloaded 跳过 origin=remote；本机移走的照旧算', () => {
-    const st = {
-      version: 1 as const, keepLocal: [],
-      offloaded: {
-        s_1: remotePlaceholderFor(entry(), 'kx', 1),
-        s_off: { id: 's_off', title: 'O', lastActiveAt: 1, offloadedAt: 2, cloudKey: 'kx/v1/sessions/s_off/', bytes: 1, files: 1 } as OffloadPlaceholder,
-      },
-    };
-    assert.deepEqual(manifestSessionsWithOffloaded([], st).map((s) => s.id), ['s_off']);
-  });
-
-  test('端到端：B 删了它、A 只有外来占位 → 判成可以移进云端回收站', () => {
-    const e = entry({ uploadedAt: NOW - 10 * DAY_MS, syncedAt: NOW - 10 * DAY_MS });
-    const st = { version: 1 as const, keepLocal: [], offloaded: { s_1: remotePlaceholderFor(e, 'kx', 1) } };
-    const mA = buildDeviceManifest('devA', NOW - 1000, manifestSessionsWithOffloaded([], st), {}, A);
-    const mB = buildDeviceManifest('devB', NOW - 2000, [], { s_1: NOW - 5 * DAY_MS }, B);
-    const c = withDeviceManifest(withDeviceManifest(cat([e]), mA), mB);
-    const d = decideCleanup(c, { now: NOW, activeDays: 90 });
-    assert.deepEqual(d.candidates.map((x) => x.entry.id), ['s_1']);
-  });
-});
-
 /* 接线：index.ts 不能 import，把源码当文本读 */
 describe('接线（index.ts）', () => {
   const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
@@ -323,30 +205,6 @@ describe('接线（index.ts）', () => {
     assert.ok(loop.indexOf('if (r.noop)') < loop.indexOf('mergedIds.push(c.id)'));
   });
 
-  test('外来占位在同步成功之后建（云端清理之后，用刚写完的 catalog）', () => {
-    const call = body.indexOf('syncRemotePlaceholders(');
-    assert.ok(call > body.indexOf('runCloudCleanup('));
-    assert.ok(call < body.indexOf('syncFailures = 0;'));
-  });
-
-  test('侧栏「从这台电脑的列表里移除」写删除记录', () => {
-    const h = M.slice(M.indexOf("ipcMain.handle('offload:dismiss'"));
-    assert.match(h.slice(0, 1200), /dismissRemotePlaceholder\(OFFLOAD_STATE_PATH, id\)[\s\S]*noteDeletion\(S3_DELETED_AT_PATH, id,/);
-  });
-});
-
-describe('侧栏：外来占位说清在哪台电脑上', () => {
-  test('placeholderRows 带上 remote；悬停写「在另一台电脑上（主机名）」；本机移走的照旧', async () => {
-    const { placeholderRows, offloadTooltip } = await import('../src/renderer/offloadView.ts');
-    const rows = placeholderRows([
-      { ...remotePlaceholderFor(entry(), 'kx', 1) },
-      { id: 's_off', title: 'O', lastActiveAt: NOW - 40 * DAY_MS, offloadedAt: 2, bytes: 1 },
-    ], []);
-    assert.deepEqual(rows[0].offloaded.remote, { host: 'b0be83784d7d' });
-    assert.equal(rows[1].offloaded.remote, undefined);
-    assert.match(offloadTooltip(rows[0].offloaded, NOW, 'zh'), /在另一台电脑上（b0be83784d7d）/);
-    assert.match(offloadTooltip(rows[1].offloaded, NOW, 'zh'), /已移到云端/);
-  });
 });
 
 /*
@@ -408,5 +266,357 @@ describe('runBucketMerge：等网络期间会话从空闲变忙 → 不断开、
     const r = await runBucketMerge(io);
     if (!r.deferred) noteBucketSeen(seen, e.id, e);       // 和 index.ts 那个循环一样
     assert.deepEqual(planBucketMerges(cat([e]), ['s_1'], A, seen).map((x) => x.id), ['s_1']);
+  });
+});
+
+/*
+ * (3) 归档要保留 —— 实测：catalog 里 archived=true 的两条，下载回本机后「放进未分组」、record 里 archived 丢了，点开又能连接。
+ * 根因：占位下载走的是 s3:restore 的规则（restoreTarget，entry: undefined、putBack: false）—— 项目一律清掉进未分组，
+ * 归档只看下载下来的 record.json，侧栏上那一行（占位 / catalog）的位置不参与。
+ */
+describe('(3) 占位下载回本机：位置和侧栏里那一行一样（归档 / 项目都保留）', () => {
+  const projects = new Set(['Blog', 'Dev']);
+  test('占位（catalog）说归档、桶里的 record.json 是旧的没归档 → 下载回来仍是归档', () => {
+    const rec = { profile: { projectId: 'Blog' }, archived: false, placementChangedAt: 10 };
+    const r = placeholderPlacement(rec, { archived: true, project: 'Blog', placementChangedAt: 20 }, projects);
+    assert.equal(r.placement.archived, true);
+    assert.equal(r.placement.projectId, 'Blog', '项目本机有 → 放回去，不再一律进未分组');
+    assert.equal(r.unassigned, false);
+    assert.equal(r.placement.placementChangedAt, 20);
+  });
+  test('上一版建的外来占位没记位置时间 → 归档取两边的「或」（宁可留在归档里）', () => {
+    const rec = { profile: {}, archived: false, placementChangedAt: 10 };
+    assert.equal(placeholderPlacement(rec, { archived: true }, projects).placement.archived, true);
+    assert.equal(placeholderPlacement({ ...rec, archived: true }, { archived: false }, projects).placement.archived, true);
+  });
+  test('记录里的位置更新（下载下来的比占位新）→ 听记录的', () => {
+    const rec = { profile: { projectId: 'Dev' }, archived: false, placementChangedAt: 30 };
+    const r = placeholderPlacement(rec, { archived: true, project: 'Blog', placementChangedAt: 20 }, projects);
+    assert.equal(r.placement.archived, false);
+    assert.equal(r.placement.projectId, 'Dev');
+  });
+  test('项目本机没有 / 形如会话 id / advanced 专属 → 进未分组（标 unassigned），原项目带回来给提示', () => {
+    const rec = { profile: { projectId: 'Gone' }, placementChangedAt: 5 };
+    const r = placeholderPlacement(rec, { project: 'Gone', placementChangedAt: 5 }, projects);
+    assert.deepEqual([r.placement.projectId, r.unassigned, r.origin], ['', true, 'Gone']);
+    assert.equal(placeholderPlacement({ profile: { projectId: 's_1790000000000_abcdef' } }, null, new Set(['s_1790000000000_abcdef'])).placement.projectId, '');
+    assert.equal(placeholderPlacement({ profile: { projectId: 'Blog' } }, null, projects, (p) => p === 'Blog').placement.projectId, '');
+  });
+  test('本机移走的占位记下记录的位置时间（下载回来时和记录比谁新）', () => {
+    const S = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'sessionOffload.ts'), 'utf-8');
+    assert.ok(S.includes('...(Number(rec?.placementChangedAt) > 0 ? { placementChangedAt: Number(rec.placementChangedAt) } : null),'));
+  });
+  test('接线：offloadRestoreImpl 用 placeholderPlacement（不再走 restoreTarget 的「一律未分组」）', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+    const at = M.indexOf('async function offloadRestoreImpl(');
+    const body = M.slice(at, M.indexOf('\n}\n', at));
+    assert.ok(body.includes('const rt = placeholderPlacement(placedRec, placeholder,'));
+    assert.ok(!body.includes('restoreTarget('));
+  });
+});
+
+describe('(3) 归档的会话（含刚下载回来的）点开只读，不 attach、不起后端', () => {
+  const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+  const H = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'hooks', 'useAcp.ts'), 'utf-8');
+  test('主进程：loadSessionImpl 一进来就过检查点（归档 / 删除就拒），归档按记录现读', () => {
+    const at = M.indexOf('const loadSessionImpl = async (');
+    const head = M.slice(at, at + 900);
+    assert.ok(head.includes("attachCheckpoint(attachLive, sessionId, 'start');"));
+    assert.ok(M.includes('archived: (id) => !!store.readRecord(id)?.archived,'));
+  });
+  test('渲染端：切换会话判归档读最新列表（刚下载回来就打开的那条不在闭包里）', () => {
+    assert.ok(H.includes('const isArchived = !!(sessionsRef.current.find((s) => s.id === sessionId) ?? sessions.find((s) => s.id === sessionId))?.archived;'));
+  });
+});
+
+describe('(4) 删除后不许再 attach：路上的每一步之间都查', async () => {
+  const { attachCheckpoint, AttachCancelled } = await import('../src/main/attachCancel.ts');
+  test('模拟实测：准备本地工具期间被删 → 不选模型、不起后端，已备好的本地工具释放', async () => {
+    const deleted = new Set<string>();
+    const live = { deleted: (id: string) => deleted.has(id), archived: () => false, message: (w: string) => w };
+    const log: string[] = [];
+    const attach = async (id: string): Promise<void> => {
+      attachCheckpoint(live, id, 'start');
+      log.push('local tools');
+      await new Promise((r) => setTimeout(r, 5));          // 准备本地工具要等（实测 20 秒）
+      try { attachCheckpoint(live, id, 'local tools'); } catch (e) { log.push('release tools'); throw e; }
+      log.push('pick model + start executor');
+    };
+    const p = attach('s_1');
+    deleted.add('s_1');                                     // 用户这时删掉了它
+    await assert.rejects(p, (e: any) => e instanceof AttachCancelled && e.why === 'deleted' && e.stage === 'local tools');
+    assert.deepEqual(log, ['local tools', 'release tools']);
+    /* 删掉之后再来的 attach（排队的预热）：一进来就拒 */
+    await assert.rejects(attach('s_1'), AttachCancelled);
+    assert.deepEqual(log, ['local tools', 'release tools']);
+  });
+  test('归档了也停', () => {
+    assert.throws(() => attachCheckpoint({ deleted: () => false, archived: () => true, message: (w) => w }, 's', 'x'), (e: any) => e.why === 'archived');
+  });
+  test('接线：本地工具备好后、执行器起来后、逐个候选模型之前都有检查', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+    const at = M.indexOf('const loadSessionImpl = async (');
+    const body = M.slice(at, M.indexOf("ipcMain.handle('acp:load-session'", at));
+    const tools = body.lastIndexOf('localTools = await ensureLocalTools(');
+    const cpTools = body.indexOf("attachCheckpoint(attachLive, sessionId, 'local tools')");
+    const connect = body.indexOf('await connectWithModelFallback(');
+    const cpExec = body.indexOf("attachCheckpoint(attachLive, sessionId, 'executor started')");
+    assert.ok(tools > 0 && tools < cpTools && cpTools < connect && connect < cpExec, '顺序：备工具 → 查 → 起执行器 → 查');
+    assert.ok(body.slice(cpTools, connect).includes('releaseLocalTools(sessionId, profile.remote)'));
+    assert.ok(body.slice(cpExec, cpExec + 300).includes('client.disconnect()'));
+    const fb = M.slice(M.indexOf('async function connectWithModelFallback('));
+    const loop = fb.indexOf('for (let i = 0; i < candidates.length; i += 1) {');
+    assert.ok(fb.slice(loop, loop + 900).includes('if (sessionId && deletedSessionIds.has(sessionId)) throw'));
+  });
+});
+
+describe('(5) 本机删掉会话：只写本机的删除记录；不删另一台的备份、不让另一台删它的副本', () => {
+  test('A 删了（删除记录），B 还有 → 云端清理不把它当候选（所有活跃设备都没有才进回收站）', () => {
+    const e = entry({ uploadedAt: NOW - 10 * DAY_MS, syncedAt: NOW - 10 * DAY_MS });
+    const mA = buildDeviceManifest('devA', NOW - 1000, [], { s_1: NOW - 5 * DAY_MS }, A);
+    const mB = buildDeviceManifest('devB', NOW - 2000, [{ id: 's_1' }], {}, B);
+    const c = withDeviceManifest(withDeviceManifest(cat([e]), mA), mB);
+    assert.deepEqual(decideCleanup(c, { now: NOW, activeDays: 90 }).candidates, []);
+  });
+  test('本机删除只写本机的删除记录：purgeSession 不碰桶（不写 catalog 墓碑、不删对象）', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+    const at = M.indexOf('const purgeSession = async (');
+    const body = M.slice(at, M.indexOf('\n  };\n', at));
+    assert.ok(body.includes('noteDeletion(S3_DELETED_AT_PATH, sessionId,'));
+    for (const k of ['deleteSessionBackups(', 'deleteBackupsOf(', 'withTombstones(', 'deleteObject(']) assert.ok(!body.includes(k), k);
+  });
+});
+
+/*
+ * 范围收窄（审查转达的用户最新要求）：不再给本机没有的会话建「其他电脑上的会话」占位，上一版建的启动时清掉；
+ * 手动「从备份恢复」成功后自动开启「在其他电脑上同步」。
+ */
+describe('不再建外来占位；启动时清掉上一版建的（本机移到云端的不碰）', () => {
+  const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+  const P = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 's3Pull.ts'), 'utf-8');
+  test('同步那一轮不建、不改、不跟着删任何外来占位；建占位的那套函数和「从列表里移除」都没了', () => {
+    for (const k of ['syncRemotePlaceholders', 'planRemotePlaceholders', 'applyRemotePlaceholders', 'dismissRemotePlaceholder', "'offload:dismiss'"]) {
+      assert.ok(!M.includes(k), `index.ts 里不该再有 ${k}`);
+    }
+    for (const k of ['export function planRemotePlaceholders', 'export function remotePlaceholderFor', 'export function applyRemotePlaceholders']) assert.ok(!P.includes(k), k);
+    const R = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'offloadView.ts'), 'utf-8');
+    assert.ok(!R.includes("origin === 'remote'"), '侧栏不再画外来占位的「在另一台电脑上」');
+    const S = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'Sidebar.tsx'), 'utf-8');
+    assert.ok(!S.includes('onOffloadDismiss') && !S.includes('session-remote-elsewhere'));
+  });
+  test('启动清理：只删 origin=remote 的，本机移到云端的和「保留在本机」名单原样留着；文件坏了不写', () => {
+    const home = mkHome();
+    const f = path.join(home, 'sessions-offloaded.json');
+    const local: OffloadPlaceholder = { id: 's_local', title: 'L', lastActiveAt: 1, offloadedAt: 2, cloudKey: 'kx/v1/sessions/s_local/', bytes: 1, files: 1 };
+    const remote = { id: 's_r1', title: 'R', lastActiveAt: 1, offloadedAt: 2, cloudKey: 'kx/v1/sessions/s_r1/', bytes: 1, files: 0, origin: 'remote', fromMachine: B, fromHost: 'x', seenUploadedAt: 3 } as OffloadPlaceholder;
+    writeOffloadState(f, { version: 1, offloaded: { s_local: local, s_r1: remote, s_r2: { ...remote, id: 's_r2' } }, keepLocal: ['s_keep'] });
+    assert.ok(isRemotePlaceholder(remote) && !isRemotePlaceholder(local));
+    assert.deepEqual(clearRemotePlaceholders(f), ['s_r1', 's_r2']);
+    const st = readOffloadState(f);
+    assert.deepEqual(Object.keys(st.offloaded), ['s_local']);
+    assert.deepEqual(st.offloaded.s_local, local);
+    assert.deepEqual(st.keepLocal, ['s_keep']);
+    assert.deepEqual(clearRemotePlaceholders(f), [], '再跑一次什么都不动');
+    fs.writeFileSync(f, '{bad');
+    assert.equal(clearRemotePlaceholders(f), null);
+    assert.equal(fs.readFileSync(f, 'utf-8'), '{bad');
+  });
+  test('接线：启动时（回收站清理旁边）清一次', () => {
+    const at = M.indexOf('try { pruneSessionTrash(); } catch {}');
+    assert.ok(at > 0);
+    assert.ok(M.slice(at, at + 900).includes('clearRemotePlaceholders(OFFLOAD_STATE_PATH)'));
+  });
+});
+
+describe('手动「从备份恢复」成功 → 自动开启「在其他电脑上同步」', () => {
+  test('备份里没带标记 / 带的是关 → 都改成开，开关时间记成现在（比旧的新）', () => {
+    const NOW2 = 1_000_000;
+    assert.deepEqual(withCrossDeviceOn({ id: 's' } as any, NOW2), { id: 's', crossDevice: true, crossDeviceChangedAt: NOW2 });
+    const off = withCrossDeviceOn({ id: 's', crossDevice: false, crossDeviceChangedAt: 500 } as any, NOW2);
+    assert.equal(off.crossDevice, true);
+    assert.equal(off.crossDeviceChangedAt, NOW2);
+    /* 另一台的关比本机时钟还「晚」：也要比它新，另一台下一轮才会跟着开 */
+    assert.ok(withCrossDeviceOn({ crossDeviceChangedAt: NOW2 + 50 } as any, NOW2).crossDeviceChangedAt! > NOW2 + 50);
+    /* 开着以后另一台跟随（谁后改听谁）、合并照常 */
+    const rec = withCrossDeviceOn({} as any, NOW2);
+    assert.equal(crossDeviceToFollow({ crossDeviceChangedAt: 10 }, rec)?.crossDevice, true);
+    assert.deepEqual(planBucketMerges(cat([entry({ crossDevice: undefined, crossDeviceChangedAt: 10 })]), ['s_1'], A, {}, NOW, new Map([['s_1', rec]])).map((x) => x.id), ['s_1']);
+  });
+  test('接线：s3:restore 成功分支写记录并通知界面', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+    const at = M.indexOf("ipcMain.handle('s3:restore'");
+    const body = M.slice(at, M.indexOf("ipcMain.handle('offload:list'", at));
+    const on = body.indexOf('withCrossDeviceOn(cur, Date.now())');
+    assert.ok(on > 0);
+    assert.ok(body.slice(on, on + 400).includes("webContents.send('session:cross-device-changed', { sessionId, crossDevice: true })"));
+    assert.ok(on < body.indexOf('ok: true, restored, backedUp, merged'), '在成功返回之前');
+    assert.ok(on > body.indexOf('forgetDeletion(S3_DELETED_AT_PATH, sessionId)'), '在恢复写盘之后');
+  });
+});
+
+/*
+ * 审查意见：最后一个检查点在 resume 之前 —— 等 resume 期间删了，失败后照样重试、照样 newSession；
+ * 等 resume 期间归档了而 resume 成功，最后只查删除，执行器照样登记上去。
+ */
+describe('(4) resume 期间删除 / 归档 → 不重试、不新起、不挂上', async () => {
+  const { resumeOrFresh, attachCheckpoint, AttachCancelled } = await import('../src/main/attachCancel.ts');
+  const setup = () => {
+    const state = { deleted: false, archived: false };
+    const live = { deleted: () => state.deleted, archived: () => state.archived, message: (w: string) => w };
+    const log: string[] = [];
+    return { state, log, checkpoint: (stage: string) => attachCheckpoint(live, 's_1', stage) };
+  };
+  test('等 resume 期间被删、resume 失败 → 不重试、不新起后端会话', async () => {
+    const { state, log, checkpoint } = setup();
+    const p = resumeOrFresh({
+      tryResume: async () => { log.push('resume'); await new Promise((r) => setTimeout(r, 5)); throw new Error('session/load resume timed out'); },
+      newSession: async () => { log.push('newSession'); return 'cli-new'; },
+      checkpoint, definitiveMiss: () => false,
+    });
+    state.deleted = true;                                     // 用户在 resume 等待期间删了它
+    await assert.rejects(p, (e: any) => e instanceof AttachCancelled && e.why === 'deleted' && e.stage === 'before resume retry');
+    assert.deepEqual(log, ['resume'], '只 resume 了一次，没重试、没 newSession');
+  });
+  test('确定失败（Resource not found）期间被删 → 不新起', async () => {
+    const { state, log, checkpoint } = setup();
+    const p = resumeOrFresh({
+      tryResume: async () => { log.push('resume'); await new Promise((r) => setTimeout(r, 5)); throw new Error('Resource not found'); },
+      newSession: async () => { log.push('newSession'); return 'x'; },
+      checkpoint, definitiveMiss: (e) => /Resource not found/.test(e.message),
+    });
+    state.deleted = true;
+    await assert.rejects(p, (e: any) => e instanceof AttachCancelled && e.stage === 'before fresh backend session');
+    assert.deepEqual(log, ['resume']);
+  });
+  test('等 resume 期间被归档、resume 成功 → 抛 AttachCancelled（调用方不登记执行器）', async () => {
+    const { state, log, checkpoint } = setup();
+    const p = resumeOrFresh({
+      tryResume: async () => { log.push('resume'); await new Promise((r) => setTimeout(r, 5)); },
+      newSession: async () => { log.push('newSession'); return 'x'; },
+      checkpoint, definitiveMiss: () => false,
+    });
+    state.archived = true;
+    await assert.rejects(p, (e: any) => e instanceof AttachCancelled && e.why === 'archived' && e.stage === 'resumed');
+    assert.deepEqual(log, ['resume']);
+  });
+  test('新起后端会话期间被删 → 新起完立刻停（调用方断开）', async () => {
+    const { state, checkpoint } = setup();
+    const p = resumeOrFresh({
+      tryResume: async () => { throw new Error('Resource not found'); },
+      newSession: async () => { await new Promise((r) => setTimeout(r, 5)); return 'x'; },
+      checkpoint, definitiveMiss: () => true,
+    });
+    await new Promise((r) => setTimeout(r, 1));
+    state.deleted = true;
+    await assert.rejects(p, (e: any) => e instanceof AttachCancelled && e.stage === 'fresh backend session started');
+  });
+  test('没人动：第一次失败 → 重试成功；两次都失败 → 新起', async () => {
+    const { checkpoint } = setup();
+    let n = 0;
+    assert.deepEqual(await resumeOrFresh({ tryResume: async () => { if (++n === 1) throw new Error('t'); }, newSession: async () => 'x', checkpoint, definitiveMiss: () => false }), { fresh: false });
+    assert.deepEqual(await resumeOrFresh({ tryResume: async () => { throw new Error('t'); }, newSession: async () => 'cli-2', checkpoint, definitiveMiss: () => false }), { fresh: true, cliSessionId: 'cli-2' });
+  });
+  test('接线：loadSessionImpl 用 resumeOrFresh；取消时断开执行器、释放本地工具；登记执行器之前再查一次（删除和归档）', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+    const at = M.indexOf('const loadSessionImpl = async (');
+    const body = M.slice(at, M.indexOf("ipcMain.handle('acp:load-session'", at));
+    const r = body.indexOf('await resumeOrFresh({');
+    assert.ok(r > 0);
+    assert.ok(!body.includes('await tryResume();'), '不再有绕过检查点的 resume 重试');
+    const cancel = body.indexOf('if (err instanceof AttachCancelled) {', r);
+    assert.ok(cancel > r && body.slice(cancel, cancel + 500).includes('client.disconnect()') && body.slice(cancel, cancel + 500).includes('releaseLocalTools(sessionId, profile.remote)'));
+    const mount = body.indexOf("attachCheckpoint(attachLive, sessionId, 'before mount')");
+    const set = body.indexOf('sessionClients.set(sessionId, entry)');
+    assert.ok(mount > cancel && mount < set, '登记执行器之前');
+    assert.ok(!body.slice(mount, set).includes('await new') && !/await (?!client\.disconnect)/.test(body.slice(body.indexOf('\n', mount), set).replace(/try \{ await client\.disconnect\(\); \} catch \{[^}]*\}/g, '')), '检查点到登记之间（正常路径）不再等任何东西');
+  });
+});
+
+/*
+ * 审查意见：候选模型循环只查删除不查归档；等换配置（awaitReconfigureIdle）之后也只查删除，归档了照样准备本地工具。
+ */
+describe('(3)(4) 连接途中被归档：不再试下一个候选模型、不准备本地工具', async () => {
+  const { attachCheckpoint, AttachCancelled } = await import('../src/main/attachCancel.ts');
+  const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+  test('模拟：第一个候选模型连接失败期间被归档 → 不再试第二个，抛 AttachCancelled（调用方释放本地工具）', async () => {
+    const state = { archived: false };
+    const live = { deleted: () => false, archived: () => state.archived, message: (w: string) => w };
+    const tried: string[] = [];
+    let released = false;
+    /* 和 connectWithModelFallback 的循环同一个形状：每个候选之前过检查点 */
+    const connectAll = async (candidates: string[], checkpoint: (s: string) => void): Promise<string> => {
+      for (let i = 0; i < candidates.length; i += 1) {
+        checkpoint(`model candidate ${i + 1}/${candidates.length}`);
+        tried.push(candidates[i]);
+        await new Promise((r) => setTimeout(r, 5));
+        if (i === 0) { state.archived = true; continue; }  // 第一个连不上，这期间用户归档了它
+        return candidates[i];
+      }
+      throw new Error('No usable model');
+    };
+    try {
+      await connectAll(['m1', 'm2', 'm3'], (st) => attachCheckpoint(live, 's_1', st));
+      assert.fail('should cancel');
+    } catch (err) {
+      if (err instanceof AttachCancelled) released = true;
+      assert.ok(err instanceof AttachCancelled && err.why === 'archived' && err.stage === 'model candidate 2/3');
+    }
+    assert.deepEqual(tried, ['m1']);
+    assert.ok(released);
+  });
+  test('接线：connectWithModelFallback 每个候选之前调 checkpoint；loadSessionImpl 传进去，取消时释放本地工具', () => {
+    const fb = M.slice(M.indexOf('async function connectWithModelFallback('));
+    const loop = fb.indexOf('for (let i = 0; i < candidates.length; i += 1) {');
+    const head = fb.slice(loop, loop + 1000);
+    assert.ok(head.includes('if (sessionId) attachCheckpoints.get(sessionId)?.(`model candidate ${i + 1}/${candidates.length}`);'));
+    assert.ok(head.indexOf('attachCheckpoints.get(') < head.indexOf('new AcpClient('), '先查再起执行器');
+    assert.ok(head.indexOf('attachCheckpoints.get(') < head.indexOf('deletedSessionIds.has(sessionId)) throw new Error('), '登记的检查点先查（抛 AttachCancelled），不被普通的删除 Error 抢先');
+    const at = M.indexOf('const loadSessionImpl = async (');
+    const body = M.slice(at, M.indexOf("ipcMain.handle('acp:load-session'", at));
+    const call = body.indexOf('started = await connectWithModelFallback(');
+    const reg = body.indexOf('attachCheckpoints.set(sessionId, (stage) => attachCheckpoint(attachLive, sessionId, stage));');
+    assert.ok(call > 0 && reg > 0 && reg < call, '连之前登记');
+    assert.ok(body.slice(call, call + 700).includes('if (err instanceof AttachCancelled || deletedSessionIds.has(sessionId)) releaseLocalTools(sessionId, profile.remote);'));
+    assert.ok(body.slice(call, call + 600).includes('attachCheckpoints.delete(sessionId);'), '试完去掉');
+  });
+  test('接线：等换配置结束后查删除和归档，准备本地工具之前再查一次', () => {
+    const at = M.indexOf('const loadSessionImpl = async (');
+    const body = M.slice(at, M.indexOf("ipcMain.handle('acp:load-session'", at));
+    const wait = body.indexOf('await awaitReconfigureIdle(sessionId);');
+    const cpWait = body.indexOf("attachCheckpoint(attachLive, sessionId, 'after reconfigure wait')");
+    const cpTools = body.indexOf("attachCheckpoint(attachLive, sessionId, 'before local tools')");
+    const tools = body.indexOf('ensureLocalTools(');
+    assert.ok(wait > 0 && wait < cpWait && cpWait < cpTools && cpTools < tools, '等完 → 查 → 查 → 准备工具');
+    /* 归档按记录现读：attachLive.archived */
+    assert.ok(M.includes('archived: (id) => !!store.readRecord(id)?.archived,'));
+  });
+});
+
+/* 审查意见：第一个候选模型失败期间被删除 —— 循环先抛普通 Error，绕过检查点，调用方只在 AttachCancelled 时释放本地工具 */
+describe('(4) 候选模型失败期间被删除 → 不试下一个，本地工具释放', async () => {
+  const { attachCheckpoint, AttachCancelled } = await import('../src/main/attachCancel.ts');
+  test('模拟：和 connectWithModelFallback 同一个顺序（先登记的检查点、再删除检查），调用方和 loadSessionImpl 同一个释放判据', async () => {
+    const deleted = new Set<string>();
+    const live = { deleted: (id: string) => deleted.has(id), archived: () => false, message: (w: string) => w };
+    const checkpoints = new Map<string, (s: string) => void>([['s_1', (st) => attachCheckpoint(live, 's_1', st)]]);
+    const tried: string[] = [];
+    let released = false;
+    const connectAll = async (sessionId: string, candidates: string[]): Promise<string> => {
+      for (let i = 0; i < candidates.length; i += 1) {
+        checkpoints.get(sessionId)?.(`model candidate ${i + 1}/${candidates.length}`);
+        if (deleted.has(sessionId)) throw new Error('Session was deleted; not re-attaching.');
+        tried.push(candidates[i]);
+        await new Promise((r) => setTimeout(r, 5));
+        if (i === 0) { deleted.add(sessionId); continue; }   // 第一个连不上，这期间用户删了它
+        return candidates[i];
+      }
+      throw new Error('No usable model');
+    };
+    await assert.rejects(async () => {
+      try { await connectAll('s_1', ['m1', 'm2']); }
+      catch (err) { if (err instanceof AttachCancelled || deleted.has('s_1')) released = true; throw err; }
+    }, (e: any) => e instanceof AttachCancelled && e.why === 'deleted' && e.stage === 'model candidate 2/2');
+    assert.deepEqual(tried, ['m1'], '没试第二个');
+    assert.ok(released, '本地工具释放了');
   });
 });

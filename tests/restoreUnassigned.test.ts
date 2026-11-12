@@ -276,14 +276,15 @@ describe('云端占位（☁ 移到云端的会话）下载回本机：同一条
     const head = M.slice(at, at + 1200);
     assert.match(head, /if \(isOffloadedPlaceholder\(sessionId\)\) return offloadRestoreImpl\(sessionId, opts\);/);
   });
-  test('offloadRestoreImpl 按 restoreTarget 放（新恢复 → 默认未分组 + unassigned），返回放下后的项目', () => {
+  /* 第 3 轮（用户实测：归档的占位下载后进了未分组、能连接）改了：占位下载按 placeholderPlacement 放 —— 位置和侧栏里那一行一样，项目本机有就放回，没有才未分组 + unassigned */
+  test('offloadRestoreImpl 按 placeholderPlacement 放（项目本机没有 → 未分组 + unassigned），返回放下后的项目', () => {
     const at = M.indexOf('async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean })');
     assert.ok(at > 0);
     const body = M.slice(at, M.indexOf('\n}\n', at));
-    assert.match(body, /restoreTarget\(\{\s*localBefore: null, backup: placedRec, entry: undefined,\s*putBack: !!opts\?\.putBack,/);
+    assert.match(body, /const rt = placeholderPlacement\(placedRec, placeholder,/);
     assert.match(body, /if \(rt\.unassigned\) next\.profile = \{ \.\.\.next\.profile, unassigned: true \};/);
     assert.match(body, /projectId: placedNow\?\.profile\?\.projectId \|\| undefined/);
-    /* 侧栏的「下载回本机」不带 opts → 默认不放回 */
+    /* 侧栏的「下载回本机」不带 opts */
     assert.match(M, /const r = await offloadRestoreImpl\(id\);/);
   });
   test('规则本身：占位下载回来的记录写着 Blog，不勾 → 未分组；勾了且本机有 Blog → Blog', () => {

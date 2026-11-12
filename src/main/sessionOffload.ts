@@ -253,16 +253,12 @@ export function filesMatchSyncState(home: string, id: string, state: Record<stri
   } catch { return null; }
 }
 
-/**
- * 本机这一轮的设备清单：本机有的照旧，已移到云端的补上 —— 它们在本机「仍持有」，不能被当成删掉了。
- * **从别的电脑来、从没打开过的占位（`origin: 'remote'`，见 s3Pull.ts）不算**：本机从来没有过它，算成持有的话
- * 别的电脑删了它，云端回收站永远等不到「所有设备都没有了」。
- */
+/** 本机这一轮的设备清单：本机有的照旧，已移到云端的补上 —— 它们在本机「仍持有」，不能被当成删掉了。 */
 export function manifestSessionsWithOffloaded<T extends { id: string }>(sessions: T[], st: OffloadState): Array<T | { id: string; project?: string }> {
   const seen = new Set(sessions.map((s) => s.id));
   const out: Array<T | { id: string; project?: string }> = [...sessions];
   for (const p of Object.values(st.offloaded)) {
-    if (!p?.id || seen.has(p.id) || p.origin === 'remote') continue;
+    if (!p?.id || seen.has(p.id)) continue;
     seen.add(p.id);
     out.push({ id: p.id, ...(p.project ? { project: p.project } : null) });
   }
@@ -280,6 +276,8 @@ export interface OffloadPlaceholder {
   remoteHost?: string;
   /** 移走时是归档的（侧栏照旧放在「已归档」里） */
   archived?: boolean;
+  /** 移走时位置最后一次被用户改的时刻 —— 下载回本机时和记录比谁新（s3Pull.ts 的 placeholderPlacement） */
+  placementChangedAt?: number;
   /** 移走时算的最后活动时间 */
   lastActiveAt: number;
   offloadedAt: number;
@@ -296,15 +294,8 @@ export interface OffloadPlaceholder {
    * 恢复回来就成了点不开的卡片。所以移走时把它们记在占位里，清理时当成仍在用（`offloadedPasteRefs`）。
    */
   externalRefs?: string[];
-  /**
-   * 这条占位是怎么来的：没有 = 本机移到云端的；`remote` = 别的电脑上的会话，本机从来没有过（s3Pull.ts）。
-   * 外来的不算本机持有（`manifestSessionsWithOffloaded`），别的电脑删了它就跟着去掉。
-   */
+  /** `remote` = 上一版（b720c90）建的「其他电脑上的会话」占位 —— 功能已取消，启动时清掉（s3Pull.ts 的 clearRemotePlaceholders） */
   origin?: 'remote';
-  /** 外来占位：来自哪台设备（catalog 的 `from`）、显示用的主机名、建 / 更新占位时桶里那条的 `uploadedAt` */
-  fromMachine?: string;
-  fromHost?: string;
-  seenUploadedAt?: number;
 }
 
 /**
@@ -380,8 +371,8 @@ function validPlaceholder(p: any): boolean {
   if (typeof p.cloudKey !== 'string' || !p.cloudKey) return false;
   if (p.title !== undefined && typeof p.title !== 'string') return false;
   if (p.archived !== undefined && typeof p.archived !== 'boolean') return false;
+  if (p.placementChangedAt !== undefined && (typeof p.placementChangedAt !== 'number' || !Number.isFinite(p.placementChangedAt))) return false;
   if (p.externalRefs !== undefined && (!Array.isArray(p.externalRefs) || p.externalRefs.some((r: unknown) => typeof r !== 'string'))) return false;
-  if (p.origin !== undefined && p.origin !== 'remote') return false;
   for (const k of ['lastActiveAt', 'offloadedAt']) if (typeof p[k] !== 'number' || !Number.isFinite(p[k])) return false;
   return true;
 }
@@ -601,6 +592,7 @@ export async function offloadSession(bucket: OffloadBucket, opts: {
     ...(typeof rec?.profile?.engine === 'string' ? { engine: rec.profile.engine } : null),
     ...(opts.remoteHost ? { remoteHost: opts.remoteHost } : null),
     ...(rec?.archived ? { archived: true } : null),
+    ...(Number(rec?.placementChangedAt) > 0 ? { placementChangedAt: Number(rec.placementChangedAt) } : null),
     ...(externalRefs.length ? { externalRefs } : null),
     lastActiveAt: opts.lastActiveAt,
     offloadedAt: opts.now,

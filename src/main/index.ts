@@ -53,8 +53,7 @@ import {
   type OffloadFacts,
 } from './sessionOffload.ts';
 import {
-  planBucketMerges, noteBucketSeen, readBucketSeen, writeBucketSeen, planRemotePlaceholders, applyRemotePlaceholders,
-  dismissRemotePlaceholder, isRemotePlaceholder, showRemoteSessions, runBucketMerge, BUCKET_SEEN_FILE,
+  planBucketMerges, noteBucketSeen, readBucketSeen, writeBucketSeen, clearRemotePlaceholders, isShared, crossDeviceToFollow, placeholderPlacement, withCrossDeviceOn, runBucketMerge, BUCKET_SEEN_FILE,
   type BucketMergeResult,
 } from './s3Pull.ts';
 import {
@@ -64,6 +63,7 @@ import {
   type BucketOps, type CleanupResult,
 } from './cloudTrash.ts';
 import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
+import { attachCheckpoint, resumeOrFresh, AttachCancelled, type AttachLiveness } from './attachCancel.ts';
 import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restoreRemote } from './restoreArchive.ts';
 import { knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from './projectSanity.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
@@ -758,6 +758,13 @@ async function connectWithModelFallback(
   });
   for (let i = 0; i < candidates.length; i += 1) {
     const model = candidates[i];
+    /*
+      逐个候选模型起执行器要等：这期间会话被删了 / 被归档了就不再试下一个（attachCancel.ts）。
+      attach 那条路登记的检查点（attachCheckpoints）**先**查 —— 抛 AttachCancelled，调用方据此释放已备好的本地工具；
+      新建 / 换模型这些路没登记，只剩下面那句删除检查。
+    */
+    if (sessionId) attachCheckpoints.get(sessionId)?.(`model candidate ${i + 1}/${candidates.length}`);
+    if (sessionId && deletedSessionIds.has(sessionId)) throw new Error(tr('Session was deleted; not re-attaching.'));
     const client = new AcpClient(model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
     try {
       await client.connect();
@@ -4798,6 +4805,11 @@ function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session
 // restart the dir is gone so hydrate never re-adds it.
 const deletedSessionIds = new Set<string>();
 /**
+ * 正在 attach 的会话登记的检查点（attachCancel.ts）：`connectWithModelFallback` 每试一个候选模型之前调一次 ——
+ * 第一个连不上的那几秒里会话被删了 / 归档了，就不再试下一个。只有 loadSessionImpl 登记（试完就去掉）。
+ */
+const attachCheckpoints = new Map<string, (stage: string) => void>();
+/**
  * 新建时选的引擎 / 机器：`acp:new-session` 一进来就记、建成才清 —— 建不成的新会话没有记录，
  * 之后右键换机器 / 目录 / 引擎时 `coldRecordFor` 靠它把这两样补回来（见 `coldRecord.ts`）。
  */
@@ -6695,7 +6707,7 @@ function refuseAdvancedProject(projectId: string | null | undefined, what: strin
 }
 
 function catalogEntriesFor(
-  sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any; archived?: boolean; placementChangedAt?: number }>,
+  sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any; archived?: boolean; placementChangedAt?: number; crossDevice?: boolean; crossDeviceChangedAt?: number }>,
   machine: string,
 ): CatalogEntry[] {
   const now = Date.now();
@@ -6713,7 +6725,32 @@ function catalogEntriesFor(
     /* 位置跟随用（见 `placementToFollow`）：别的机器按它判断要不要跟着这台挪项目 / 归档 */
     archived: !!r.archived,
     placementChangedAt: placementOf(r).placementChangedAt,
+    /* 「在其他电脑上同步」（s3Pull.ts）：别的电脑只对开着的自动合并新消息；开关跟着 crossDeviceChangedAt 谁后改听谁 */
+    ...(isShared(r) ? { crossDevice: true } : null),
+    ...(Number(r.crossDeviceChangedAt) > 0 ? { crossDeviceChangedAt: Number(r.crossDeviceChangedAt) } : null),
   }));
+}
+
+/**
+ * **「在其他电脑上同步」开关跟着别的机器走**（判据 `crossDeviceToFollow`）—— 和 `followBucketPlacements` 同一个时机、同一套
+ * 「谁后改听谁」：A 开了之后 B 下一轮也开（任一台开了就算开），A 后来关了 B 也跟着关。只动这两个字段，不碰 updatedAt。
+ */
+function followBucketCrossDevice(cfg: SyncConfig, catalog: Catalog | null, sessions: store.SessionRecord[]): void {
+  const byId = new Map((catalog?.entries || []).map((e) => [e.id, e]));
+  for (const r of sessions) {
+    if (projectExcluded(cfg, projectOf(r)) || sessionExcluded(cfg, r.id)) continue;
+    const theirs = byId.get(r.id);
+    if (!crossDeviceToFollow(r, theirs)) continue;
+    const cur = store.readRecord(r.id);
+    const f = crossDeviceToFollow(cur, theirs);
+    if (!cur || !f) continue;
+    const next: store.SessionRecord = { ...cur, crossDeviceChangedAt: f.crossDeviceChangedAt };
+    if (f.crossDevice) next.crossDevice = true; else delete next.crossDevice;
+    try { store.writeRecordKeepUpdatedAt(next); } catch (err: any) { logger.warn('s3', `「在其他电脑上同步」跟随 ${r.id} 写不进记录：${err?.message || err}`); continue; }
+    if (isShared(cur) === f.crossDevice) continue;
+    logger.info('s3', `「在其他电脑上同步」跟随 ${r.id}（${cur.title || 'New Chat'}）：${f.crossDevice ? '开' : '关'}（来自 ${theirs?.from || '未知机器'}，${new Date(f.crossDeviceChangedAt).toLocaleString()} 改的）`);
+    mainWindow?.webContents.send('session:cross-device-changed', { sessionId: r.id, crossDevice: f.crossDevice });
+  }
 }
 
 /**
@@ -7107,25 +7144,6 @@ async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Pro
     logger.warn('offload', `下载回本机 ${id} 失败（占位保留，本机没留半份）：${r.why}`);
     return { ok: false, error: r.why, ...(r.gone ? { gone: true } : null) };
   }
-  if (isRemotePlaceholder(placeholder)) {
-    /*
-      **从别的电脑来的占位**：下载下来的就是桶里那份 —— 记下看到的那份（下一轮不再拿它合并），对话和 files/ 记进状态表
-      （不把刚下载的整条又传回去；record.json 下面还要改位置，照常传）。
-    */
-    const seen = readBucketSeen(S3_BUCKET_SEEN_PATH);
-    if (placeholder.fromMachine) {
-      noteBucketSeen(seen, id, { from: placeholder.fromMachine, uploadedAt: placeholder.seenUploadedAt });
-      writeBucketSeen(S3_BUCKET_SEEN_PATH, seen);
-    }
-    const state = readState(S3_STATE_PATH);
-    const rels = [...SESSION_FILES.filter((f) => f !== 'record.json').map((f) => path.join('sessions', id, f)),
-      ...walkSessionFiles(KIROLEX_HOME, path.join('sessions', id, SESSION_FILES_DIR))];
-    for (const rel of rels) {
-      try { const st = fs.statSync(path.join(KIROLEX_HOME, rel)); state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs) }; } catch { /* 桶里没有这个文件 */ }
-    }
-    writeState(S3_STATE_PATH, state);
-    logger.info('offload', `${id}：来自另一台电脑（${placeholder.fromHost || placeholder.fromMachine || '未知'}），下载回本机`);
-  }
   /*
     运行位置按**本机**移走之前的那份记录（回收站里）：云端那份如果是别的电脑后来改过的，里面的机器配置是那台的。
     回收站里那份读不到 → 和 s3:restore 一样，远程会话改成在本机跑。
@@ -7152,25 +7170,24 @@ async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Pro
       store.writeRecordKeepUpdatedAt({ ...cur, profile, id });
     }
   }
-  /*
-    **放在哪儿：和 s3:restore 同一条规则**（`restoreTarget`）—— 从云端下载回来的一律进「未分组」并标 unassigned，
-    只有恢复对话框里勾了「放回原项目」、本机侧栏也有那个项目才放回。这里本机没有记录（占位），按新恢复算。
-  */
   let origin: string | undefined;
   const placedRec = store.readRecord(id);
   if (placedRec) {
-    const rt = restoreTarget({
-      localBefore: null, backup: placedRec, entry: undefined,
-      putBack: !!opts?.putBack,
-      localProjects: knownProjects(uiState()['kirolex-projects']) || new Set<string>(),
-      refuseProject: store.isAdvancedOnlyProjectName,
-    });
+    /*
+      **位置和点开之前侧栏里那一行一样**（第 3 轮：「两条在 catalog 里 archived=true，下载后『放进未分组』、record 里 archived 丢了」）。
+      原来这里按 s3:restore 的规则（restoreTarget，entry: undefined、putBack: false）：项目一律清掉进未分组，归档只看下载下来的
+      record.json —— 桶里那份比 catalog / 占位记下的位置旧时，归档的就被放了出来、能连接了。现在按 placeholderPlacement：
+      占位（catalog）和记录谁的 placementChangedAt 新听谁，一样新时归档取「或」；项目本机有就放回，没有才进未分组。
+    */
+    const rt = placeholderPlacement(placedRec, placeholder,
+      knownProjects(uiState()['kirolex-projects']) || new Set<string>(), store.isAdvancedOnlyProjectName);
     origin = rt.origin;
     const next = applyPlacement(placedRec, rt.placement);
     if (rt.unassigned) next.profile = { ...next.profile, unassigned: true };
     else if (next.profile?.unassigned) { const { unassigned: _u, ...rest } = next.profile; next.profile = rest; }
     if (JSON.stringify(next) !== JSON.stringify(placedRec)) store.writeRecordKeepUpdatedAt({ ...next, id });
-    logger.info('offload', `${id}：放进「${rt.placement.projectId || '未分组'}」${origin && origin !== rt.placement.projectId ? `（原来在「${origin}」）` : ''}`);
+    logger.info('offload', `${id}：放进「${rt.placement.projectId || '未分组'}」${rt.placement.archived ? '（已归档：只读，不连接后端）' : ''}`
+      + `${origin && origin !== rt.placement.projectId ? `（原来在「${origin}」，本机没有这个项目）` : ''}`);
   }
   const placedNow = store.readRecord(id);
   forgetDeletion(S3_DELETED_AT_PATH, id);
@@ -7293,57 +7310,6 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
   return { moved, bytes, days };
 }
 
-/**
- * **别的电脑上的会话在本机建占位、跟着删**（判据在 `s3Pull.ts` 的 `planRemotePlaceholders`）—— 每轮同步**成功**之后跑一次，
- * 用刚写完的 catalog。占位复用「移到云端」那一套（sessions-offloaded.json + 侧栏 ☁ + 点开时 `restoreOffloadedSession` 下载），
- * 只是 `origin: 'remote'`：不整条下载，打开才拉。本机移到云端的占位、本机有内容的会话这里一概不碰。出错只写日志。
- */
-function syncRemotePlaceholders(cfg: SyncConfig, catalog: Catalog | null, thisMachine: string, trashedNow: string[]): void {
-  const st = readOffloadStateStrict(OFFLOAD_STATE_PATH);
-  if (!st) {
-    logger.warn('s3', `${OFFLOAD_STATE_PATH} 读不了 / 坏了，这一轮不建也不删其他电脑上的会话的占位（没去覆盖它）`);
-    return;
-  }
-  const localIds = new Set<string>([
-    ...store.listSessions().map((r) => r.id), ...store.listAdvancedOnlyIds(), ...walkDirs(path.join(KIROLEX_HOME, 'sessions')),
-  ]);
-  /* 本机删过的：deleted-sessions.json、s3-deleted-at.json（删外来占位也记在这里）、回收站里的 <id>__<时间>、这次运行里删的 */
-  const deleted = new Set<string>([...loadSessionTombstones(), ...deletedSessionIds, ...Object.keys(readDeletionMarks(S3_DELETED_AT_PATH))]);
-  let trashNames: string[] = [];
-  try { trashNames = fs.readdirSync(SESSION_TRASH_DIR); } catch { /* 没有回收站 */ }
-  for (const id of Object.keys(deletionsFromTrashNames(trashNames))) deleted.add(id);
-  const enabled = showRemoteSessions(cfg);
-  const plan = planRemotePlaceholders({
-    catalog, thisMachine, prefix: cfg.prefix, now: Date.now(), enabled,
-    localIds, placeholders: st.offloaded, deleted, inCloudTrash: new Set(trashedNow),
-    excluded: (e) => projectExcluded(cfg, e.project || '') || sessionExcluded(cfg, e.id),
-    advanced: (p) => store.isAdvancedOnlyProjectName(p),
-  });
-  const r = applyRemotePlaceholders(OFFLOAD_STATE_PATH, plan);
-  if (!r) {
-    logger.warn('s3', `${OFFLOAD_STATE_PATH} 写之前读不了 / 坏了，这一轮不建也不删其他电脑上的会话的占位`);
-    return;
-  }
-  const label: Record<string, string> = {
-    deleted: '本机删过', excluded: '项目 / 会话设成了不同步', advanced: 'KiroLex Advanced 专属', 'cloud-trash': '在云端回收站里', 'bad-id': 'id 不合法',
-  };
-  const skips = new Map<string, string[]>();
-  for (const s of plan.skipped) if (label[s.reason]) skips.set(s.reason, [...(skips.get(s.reason) || []), s.id]);
-  const why: Record<string, string> = {
-    gone: '那边删了 / 进了云端回收站（catalog 里没有了）', deleted: '本机删过', excluded: '项目 / 会话设成了不同步',
-    advanced: 'KiroLex Advanced 专属', 'turned-off': '设置里关掉了「自动显示其他电脑上的会话」', 'cloud-trash': '刚移进云端回收站',
-  };
-  const removedWhy = plan.remove.filter((x) => r.removed.includes(x.id)).map((x) => `${x.id}（${why[x.why] || x.why}）`);
-  if (r.created.length || r.removed.length || skips.size) {
-    logger.info('s3', `其他电脑上的会话：建了 ${r.created.length} 条占位${r.created.length ? `（${r.created.join('、')}，打开时才下载）` : ''}`
-      + `${removedWhy.length ? `；去掉 ${removedWhy.length} 条外来占位：${removedWhy.join('、')}` : ''}`
-      + `${r.updated.length ? `；${r.updated.length} 条外来占位的标题 / 位置跟着更新` : ''}`
-      + `${skips.size ? `；不建：${[...skips].map(([k, ids]) => `${label[k]} ${ids.length} 条（${ids.join('、')}）`).join('，')}` : ''}`
-      + `${enabled ? '' : '（设置里关掉了「自动显示其他电脑上的会话」，不新建）'}`);
-  }
-  if (r.created.length || r.removed.length || r.updated.length) mainWindow?.webContents.send('offload:changed', {});
-}
-
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
@@ -7381,6 +7347,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     let oldCatalog: Catalog | null = null;
     try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
     followBucketPlacements(cfg, oldCatalog, store.listSessions());   // 侧栏按 session:placement-changed 逐条改
+    followBucketCrossDevice(cfg, oldCatalog, store.listSessions());  // 「在其他电脑上同步」开关同样谁后改听谁
     const allSessions = store.listSessions();
     const syncable = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)) && !sessionExcluded(cfg, r.id));
     /*
@@ -7418,7 +7385,9 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       执行器断开 / attach 这类状态记账也会把它改成现在，本机一刷新，别的电脑的新消息就判不出来了。
     */
     const bucketSeen = readBucketSeen(S3_BUCKET_SEEN_PATH);
-    const conflicts = planBucketMerges(oldCatalog, sessions.map((r) => r.id), thisMachine, bucketSeen);
+    /* 只合开了「在其他电脑上同步」的（本机这条开着、或桶里那条开着）；没开的只备份 */
+    const localFlags = new Map(sessions.map((r) => [r.id, { crossDevice: r.crossDevice, crossDeviceChangedAt: r.crossDeviceChangedAt }]));
+    const conflicts = planBucketMerges(oldCatalog, sessions.map((r) => r.id), thisMachine, bucketSeen, Date.now(), localFlags);
     /*
       **冲突自动合并** ——「这个不对，很显然应该自动合并」（见 `mergeBucketSession`）。
       合并完本地那份就是两边的并集，照常传上去。只有两种情况退回旁路（conflicts/）：
@@ -7662,12 +7631,6 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       } catch (err: any) {
         logger.warn('s3', `云端清理没跑成（不影响备份）：${err?.message || err}`);
       }
-    }
-    /* **别的电脑上的会话在本机建占位 / 跟着删**（s3Pull.ts）—— 同步成功才跑；用刚写完的 catalog，刚移进云端回收站的一起去掉 */
-    try {
-      syncRemotePlaceholders(cfg, wrote.catalog, thisMachine, (cleanup?.trashed || []).map((t) => t.id));
-    } catch (err: any) {
-      logger.warn('s3', `其他电脑上的会话的占位没处理成（不影响备份）：${err?.message || err}`);
     }
     /* **久未使用的会话移到云端**（sessionOffload.ts）—— 同步成功才跑；判据用刚写完的 catalog 和状态表 */
     let offloaded: Awaited<ReturnType<typeof runOffloadRound>> = null;
@@ -9196,6 +9159,15 @@ app.whenReady().then(async () => {
   // Age out trashed chats (30 days). Deliberately after the migration and before
   // anything else touches the sessions tree.
   try { pruneSessionTrash(); } catch {}
+  /*
+    **上一版建的「其他电脑上的会话」占位清掉**（s3Pull.ts 的 clearRemotePlaceholders）—— 那个功能取消了（「很多我不需要的会话都被下载下来了」）。
+    只删 origin=remote 的（本机从来没有过内容，只是指向云端的指针），本机移到云端的占位一条不碰。
+  */
+  try {
+    const gone = clearRemotePlaceholders(OFFLOAD_STATE_PATH);
+    if (gone === null) logger.warn('offload', `${OFFLOAD_STATE_PATH} 读不了 / 坏了，上一版的「其他电脑上的会话」占位这次没清（没去覆盖它）`);
+    else if (gone.length) logger.info('offload', `清掉上一版建的 ${gone.length} 条「其他电脑上的会话」占位（本机没有内容，云端和别的电脑都不动）：${gone.join('、')}`);
+  } catch (err: any) { logger.warn('offload', `清「其他电脑上的会话」占位没成：${err?.message || err}`); }
   startupMark('trash pruned');
   // No executors survive a restart — reset any stale live executorState so the
   // durable records are truthful from boot.
@@ -9384,8 +9356,6 @@ app.whenReady().then(async () => {
       /* 久未使用的会话移到云端（sessionOffload.ts）：开关默认开、30 天 */
       autoOffload: offloadSettings(cfg).enabled,
       offloadIdleDays: offloadSettings(cfg).days || offloadSettings({}).days,
-      /* 自动显示其他电脑上的会话（s3Pull.ts）：缺省开 */
-      autoShowRemoteSessions: showRemoteSessions(cfg),
       /* 凭据现在用不用得了（缺字段 / 密钥解不开）—— 「移到云端」那项据此置灰并说原因 */
       credsProblem: syncConfigProblem(cfg, decryptSecret),   // 0（不移）在界面上显示成开关关、天数默认
     };
@@ -9443,8 +9413,6 @@ app.whenReady().then(async () => {
     /* 久未使用的会话移到云端：开关 + 天数（按 offloadSettings 的规矩收；0 = 不移） */
     if (input?.autoOffload !== undefined) next.autoOffload = !!input.autoOffload;
     if (input?.offloadIdleDays !== undefined) next.offloadIdleDays = offloadSettings({ offloadIdleDays: input.offloadIdleDays }).days;
-    /* 自动显示其他电脑上的会话：关掉只停「建占位」，本机已有的会话照常拉回新消息 */
-    if (input?.autoShowRemoteSessions !== undefined) next.autoShowRemoteSessions = !!input.autoShowRemoteSessions;
     saveSyncConfig(next);
     rescheduleS3Sync();
     logger.info('s3', `配置已保存 bucket=${next.bucket} region=${next.region} ${credsLogLabel(next, maskKeyId)}`
@@ -10106,6 +10074,19 @@ ${hint}` : ''}` };
       clearSessionTombstone(sessionId);
       deletedSessionIds.delete(sessionId);
       forgetDeletion(S3_DELETED_AT_PATH, sessionId);   // 本机又有它了，之前的删除记录作废（云端清理的判据）
+      /*
+        **手动恢复成功 → 开启「在其他电脑上同步」**（s3Pull.ts 的 withCrossDeviceOn）：恢复回来就是要接着用，之后定期拉回另一台的新消息。
+        备份里没带这个标记、或者带的是关，都改成开，开关时间记成现在（另一台下一轮也跟着开）。
+      */
+      {
+        const cur = store.readRecord(sessionId);
+        if (cur) {
+          try {
+            store.writeRecordKeepUpdatedAt({ ...withCrossDeviceOn(cur, Date.now()), id: sessionId });
+            mainWindow?.webContents.send('session:cross-device-changed', { sessionId, crossDevice: true });
+          } catch (err: any) { logger.warn('s3', `恢复 ${sessionId}：开启「在其他电脑上同步」没写进记录：${err?.message || err}`); }
+        }
+      }
 
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
@@ -10113,7 +10094,7 @@ ${hint}` : ''}` };
         + `${!localBefore && rt ? `，放进${describePlacement(rt.placement.projectId || undefined, rt.placement.archived)}${rt.origin && rt.origin !== rt.placement.projectId ? `（原来在「${rt.origin}」${opts?.putBack ? '，本机没有这个项目' : '，没勾「放回原项目」'}）` : ''}` : ''}`
         + `${placement ? `，位置改成${describePlacement(placement.projectId, placement.archived)}`
           + `（原来${describePlacement(placement.fromProjectId, placement.fromArchived)}）` : ''}`
-        + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}`);
+        + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}` + '，开启「在其他电脑上同步」');
       return {
         ok: true, restored, backedUp, merged, memoryFiles, madeLocal, keptRemote, projectId: project || undefined, placement,
         /* 新恢复：云上 / 备份里原来的项目（放进未分组时界面上说一声原来在哪） */
@@ -10154,23 +10135,6 @@ ${hint}` : ''}` };
       return { ok: false, error: tr('The cloud-offload list file is unreadable, so it was not changed.') };
     }
     logger.info('offload', `${id} ${keep ? '保留在本机，不再自动移走' : '允许自动移到云端'}`);
-    mainWindow?.webContents.send('offload:changed', {});
-    return { ok: true };
-  });
-
-  /**
-   * 右键「从这台电脑的列表里移除」：只对**从别的电脑来的**占位（s3Pull.ts）。去掉占位并写删除记录 ——
-   * 下一轮同步不会又建回来；设备清单里也报「这台删过」，别的电脑也删了时云端回收站才收得走。别的电脑和云端那份不动。
-   */
-  ipcMain.handle('offload:dismiss', (_event, sessionId: string) => {
-    const id = String(sessionId || '');
-    const r = dismissRemotePlaceholder(OFFLOAD_STATE_PATH, id);
-    if (!r.ok) {
-      logger.warn('offload', `${id} 没能从列表里移除：${r.why}`);
-      return { ok: false, error: r.why };
-    }
-    noteDeletion(S3_DELETED_AT_PATH, id, Date.now());
-    logger.info('offload', `${id}：其他电脑上的会话，从这台电脑的列表里移除（写了删除记录，下一轮不再显示；别的电脑和云端那份不动）`);
     mainWindow?.webContents.send('offload:changed', {});
     return { ok: true };
   });
@@ -15624,10 +15588,18 @@ ${hint}` : ''}` };
    * 挂载一条会话 —— **抽成函数是为了让主进程自己也能调**（见下面的 `ensureAttached`）。
    * 函数体就是原来那个 `acp:load-session` handler，原样搬出来，逻辑一个字节没改；IPC 那侧只是转发。
    */
+  /** attach 路上的检查点：删了（这次运行里）/ 归档了（看记录）就停（attachCancel.ts） */
+  const attachLive: AttachLiveness = {
+    deleted: (id) => deletedSessionIds.has(id),
+    archived: (id) => !!store.readRecord(id)?.archived,
+    message: (why) => (why === 'deleted' ? tr('Session was deleted; not re-attaching.') : tr('This chat is archived. Unarchive it to continue chatting.')),
+  };
   const loadSessionImpl = async (sessionId: string, cwd: string, model: string): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'attach'); if (advRefused) throw new Error(advRefused); }
     /* 已移到云端（本机只剩占位）：不能在这里建一条空会话出来，要先从侧栏点开下载回来 */
     if (isOffloadedPlaceholder(sessionId)) throw new Error(tr('This session has been moved to the cloud. Click it in the sidebar to download it back first.'));
+    /* 删了的 / 归档的不 attach、不起后端（归档的只读看记录，要继续聊先取消归档）—— 下面每一步要等的之间还会再查（attachCancel.ts） */
+    attachCheckpoint(attachLive, sessionId, 'start');
     if (!firstAttachMarked) { firstAttachMarked = true; startupMark('attach: first loadSession', `sessionId=${sessionId}`); }
     /*
       **还在新建的会话不 attach，等它建完** —— 实测（s_1792726606826_e2mprs）：新建远程会话的第 10 秒，
@@ -15673,6 +15645,8 @@ ${hint}` : ''}` };
     if (deletedSessionIds.has(sessionId)) {
       throw new Error(tr('Session was deleted; not re-attaching.'));
     }
+    /* 等换模型 / 换 agent 期间被归档了：同样不往下走（不准备本地工具、不起后端） */
+    attachCheckpoint(attachLive, sessionId, 'after reconfigure wait');
     // COALESCE concurrent attaches of the SAME session. The main window is now
     // revealed BEFORE the background warm-up finishes, so clicking a session that
     // is still attaching would otherwise start a second executor for the same
@@ -15773,6 +15747,8 @@ ${hint}` : ''}` };
       */
       let localTools: { remotePort: number; localPort: number; agentOverride: string } | undefined;
       let remoteModels: string[] | undefined;
+      /* 准备本地工具之前（含挂载漂移后重起的那次）：删了 / 归档了就不往下走 */
+      attachCheckpoint(attachLive, sessionId, 'before local tools');
       if (profile.remote?.sshHost) {
         /* 没有项目目录（记录里没记、渲染层又只给了 `'~'`）→ 用会话目录，和本地那条路一致 */
         resolvedCwd = localDirOrSessionDir(sessionId, resolvedCwd);
@@ -15787,13 +15763,31 @@ ${hint}` : ''}` };
           remoteModels = await remotePreflight(profile.remote);
           profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
         }
+        attachCheckpoint(attachLive, sessionId, 'remote preflight');
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       } else {
         /* 本地 Claude Code / Codex：所选「组合」里的 MCP（kiro 会话返回 undefined，见 `localComboTools`） */
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
       }
-      const started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId, remoteModels);
+      /* 准备本地工具要等（实测删掉 20 秒后才「本地工具已备好」）：这期间删了 / 归档了 → 释放刚备好的工具，不去选模型起后端 */
+      try { attachCheckpoint(attachLive, sessionId, 'local tools'); }
+      catch (err) { releaseLocalTools(sessionId, profile.remote); logger.info('attach', `sessionId=${sessionId} 准备本地工具期间${(err as any)?.why === 'archived' ? '被归档' : '被删除'}了，不再起后端`); throw err; }
+      /* 起执行器（逐个候选模型）期间删了 / 归档了 → 不再试下一个，释放刚备好的本地工具 */
+      let started: Awaited<ReturnType<typeof connectWithModelFallback>>;
+      attachCheckpoints.set(sessionId, (stage) => attachCheckpoint(attachLive, sessionId, stage));
+      try {
+        started = await connectWithModelFallback(profile, `attach ${sessionId}`, localTools, sessionId, remoteModels);
+      } catch (err) {
+        /* 取消了（AttachCancelled），或者失败时会话已经被删了（执行器还没登记，purgeSession 的 detachExecutor 收不到它）：释放刚备好的本地工具 */
+        if (err instanceof AttachCancelled || deletedSessionIds.has(sessionId)) releaseLocalTools(sessionId, profile.remote);
+        throw err;
+      } finally {
+        attachCheckpoints.delete(sessionId);
+      }
       const client = started.client;
+      /* 起执行器（逐个候选模型）要等：这期间删了 / 归档了 → 关掉刚起的执行器，不 resume */
+      try { attachCheckpoint(attachLive, sessionId, 'executor started'); }
+      catch (err) { try { await client.disconnect(); } catch { /* 已经退了 */ } releaseLocalTools(sessionId, profile.remote); throw err; }
       profile.model = started.model;
       // Resume the mapped kiro-cli session; fall back to id (legacy records where
       // KiroLex id WAS the cli id), and to a fresh session if resume fails.
@@ -15841,24 +15835,35 @@ ${hint}` : ''}` };
         freshBackend = true;
         logger.info('attach', `记录里的后端会话 id 属于别的${ownerMismatch === 'engine' ? '引擎' : '机器'}，不 resume，直接新起 sessionId=${sessionId} stale=${staleId} cli=${cliSessionId} -> history rides along`);
       } else try {
-        try {
-          await tryResume();
-        } catch (first: any) {
-          /* `Resource not found` 是确定的答案（那边就是没有这条），重试一次只是再等一遍 */
-          if (/Resource not found/i.test(String(first?.message || ''))) throw first;
-          logger.info('attach', `resume attempt 1 failed sessionId=${sessionId} cli=${cliSessionId} bytes=${historyBytes} budget=${RESUME_TIMEOUT_MS}ms err=${first?.message}`);
-          await tryResume();
-          logger.info('attach', `resume attempt 2 succeeded sessionId=${sessionId} cli=${cliSessionId}`);
+        /* resume（最多两次）→ 不行就新起（resumeOrFresh）：每步之间查删除 / 归档，取消了就断开执行器、释放本地工具（下面的 catch） */
+        {
+          const r = await resumeOrFresh({
+            tryResume,
+            checkpoint: (stage) => attachCheckpoint(attachLive, sessionId, stage),
+            /* `Resource not found` 是确定的答案（那边就是没有这条），重试一次只是再等一遍 */
+            /* 判定为确定失败时直接抛出 first：和返回 true 一样，resumeOrFresh 跳过重试、直接新起 */
+            definitiveMiss: (first) => { if (/Resource not found/i.test(String(first?.message || ''))) throw first; return false; },
+            onFirstFail: (first) => logger.info('attach', `resume attempt 1 failed sessionId=${sessionId} cli=${cliSessionId} bytes=${historyBytes} budget=${RESUME_TIMEOUT_MS}ms err=${first?.message}`),
+            onRetryOk: () => logger.info('attach', `resume attempt 2 succeeded sessionId=${sessionId} cli=${cliSessionId}`),
+            onGiveUp: (resumeErr) => logger.info('attach', `resume GAVE UP sessionId=${sessionId} cli=${cliSessionId} bytes=${historyBytes} budget=${RESUME_TIMEOUT_MS}ms err=${resumeErr?.message} -> fresh backend, history will be rebuilt`),
+            newSession: async () => (await client.newSession(cliCwd)).sessionId,
+          });
+          if (r.fresh) {
+            cliSessionId = r.cliSessionId;
+            // Backend is FRESH (resume failed / migrated / expired cli session).
+            // Flag it so the context is rebuilt from KiroLex's own transcript BEFORE
+            // the next user message is accepted -- the chat must remember its history
+            // independent of whether kiro-cli could resume.
+            freshBackend = true;
+          }
         }
-      } catch (resumeErr: any) {
-        logger.info('attach', `resume GAVE UP sessionId=${sessionId} cli=${cliSessionId} bytes=${historyBytes} budget=${RESUME_TIMEOUT_MS}ms err=${resumeErr?.message} -> fresh backend, history will be rebuilt`);
-        const created = await client.newSession(cliCwd);
-        cliSessionId = created.sessionId;
-        // Backend is FRESH (resume failed / migrated / expired cli session).
-        // Flag it so the context is rebuilt from KiroLex's own transcript BEFORE
-        // the next user message is accepted -- the chat must remember its history
-        // independent of whether kiro-cli could resume.
-        freshBackend = true;
+      } catch (err) {
+        if (err instanceof AttachCancelled) {
+          logger.info('attach', `sessionId=${sessionId} resume 期间${err.why === 'archived' ? '被归档' : '被删除'}了（停在 ${err.stage}），不再重试 / 新起，执行器断开`);
+          try { await client.disconnect(); } catch { /* 已经退了 */ }
+          releaseLocalTools(sessionId, profile.remote);
+        }
+        throw err;
       }
       // A resume that "succeeded" is NOT proof the context is there. Verified
       // against kiro-cli's own store: it does NOT persist ACP sessions (none of a
@@ -15886,6 +15891,9 @@ ${hint}` : ''}` };
       }
       entry = { client, cliSessionId, profile, cwd: cliCwd, localDir: resolvedCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now(), needsHistoryPrime: verbatimOwed };
       freshBackendResult = verbatimOwed;
+      /* 登记执行器之前最后再查删除 / 归档（归档时的 detachExecutor 找不到还没登记的执行器）：断开、释放本地工具，不登记 */
+      try { attachCheckpoint(attachLive, sessionId, 'before mount'); }
+      catch (err) { try { await client.disconnect(); } catch { /* 已经退了 */ } releaseLocalTools(sessionId, profile.remote); throw err; }
       // A delete may have landed during the async connect/resume above. If so,
       // tear the fresh client down and do NOT recreate the record on disk.
       if (deletedSessionIds.has(sessionId)) {
@@ -17855,6 +17863,8 @@ ${hint}` : ''}` };
       updatedAt: rec.updatedAt,
       archived: !!rec.archived,
       pinned: !!rec.pinned,
+      /* 「在其他电脑上同步」（s3Pull.ts）：侧栏标题旁的 🔗、右键菜单的开 / 关 */
+      crossDevice: rec.crossDevice === true,
       // 持久化的角色标记：删除保护和「别回收主会话」都要靠它，重启后必须还在
       ...(rec.purpose ? { purpose: rec.purpose } : null),
       ...(rec.flow ? { flow: rec.flow } : null),
@@ -17954,6 +17964,32 @@ ${hint}` : ''}` };
       } catch { /* best-effort */ }
     }
     return { sessionId, pinned: !!pinned };
+  });
+
+  /**
+   * 侧栏右键「在其他电脑上同步」开 / 关（s3Pull.ts）：开着的会话，才自动合并其他电脑（同一个桶）上同一条会话的新消息；
+   * 缺省关 = 只备份。记下改的时刻（crossDeviceChangedAt），两台都有时谁后改听谁。不动 updatedAt（不是一次对话改动）。
+   * 记录变了，下一次同步会把 record.json 和 catalog 条目一起传上去。
+   */
+  ipcMain.handle('acp:set-cross-device', async (_event, sessionId: string, on: boolean) => {
+    const id = String(sessionId || '');
+    const refused = refuseAdvancedOnly(id, 'cross-device');
+    if (refused) return { ok: false, error: refused };
+    const rec = store.readRecord(id);
+    if (!rec) return { ok: false, error: tr('This session does not exist on disk (it may have been deleted), so it will not be rebuilt.') };
+    const next: store.SessionRecord = { ...rec, id, crossDeviceChangedAt: Date.now() };
+    if (on) next.crossDevice = true; else delete next.crossDevice;
+    try { store.writeRecordKeepUpdatedAt(next); } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+    logger.info('s3', `${id}（${rec.title || 'New Chat'}）：「在其他电脑上同步」${on ? '开' : '关'}${on ? '（之后自动合并其他电脑上同一条会话的新消息）' : '（之后只备份，不自动合并）'}`);
+    mainWindow?.webContents.send('session:cross-device-changed', { sessionId: id, crossDevice: !!on });
+    return { ok: true, sessionId: id, crossDevice: !!on };
+  });
+
+  /** 设置 → 备份里「已开启同步的会话」列表（可以逐条关）。 */
+  ipcMain.handle('s3:list-cross-device', () => {
+    const list = store.listSessions().filter((r) => isShared(r) && !deletedSessionIds.has(r.id))
+      .map((r) => ({ id: r.id, title: r.title || 'New Chat', archived: !!r.archived, projectId: projectOf(r) || undefined }));
+    return { sessions: list };
   });
 
   /** User-selectable features. Reading is cheap and uncached on purpose, so the

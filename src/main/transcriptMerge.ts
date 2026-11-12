@@ -161,6 +161,15 @@ export function mergeRecords(local: any, remote: any): any {
     out.placementChangedAt = src.placementChangedAt;
   }
 
+  /* 「在其他电脑上同步」开关（s3Pull.ts）同样按它自己的改动时刻谁新用谁，不跟着 updatedAt 走；一样新时开着的赢 */
+  const sharedA = Number(local.crossDeviceChangedAt) || 0;
+  const sharedB = Number(remote.crossDeviceChangedAt) || 0;
+  if (sharedA || sharedB) {
+    const src = sharedA === sharedB ? (local.crossDevice === true ? local : remote) : (sharedA > sharedB ? local : remote);
+    if (src.crossDevice === true) out.crossDevice = true; else delete out.crossDevice;
+    out.crossDeviceChangedAt = src.crossDeviceChangedAt;
+  }
+
   /* 这台机器的东西不许被另一台的覆盖 */
   if ('cliSessionId' in local) out.cliSessionId = local.cliSessionId;
   else delete out.cliSessionId;

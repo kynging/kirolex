@@ -160,7 +160,6 @@ contextBridge.exposeInMainWorld('kiroApi', {
   offloadList: () => ipcRenderer.invoke('offload:list'),
   offloadRestore: (sessionId: string, keepLocal?: boolean) => ipcRenderer.invoke('offload:restore', sessionId, keepLocal),
   offloadSetKeepLocal: (sessionId: string, keep: boolean) => ipcRenderer.invoke('offload:set-keep-local', sessionId, keep),
-  offloadDismiss: (sessionId: string) => ipcRenderer.invoke('offload:dismiss', sessionId),
   onOffloadChanged: (cb: (d: any) => void) => {
     const h = (_e: any, d: any) => cb(d);
     ipcRenderer.on('offload:changed', h);
@@ -526,6 +525,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
   generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant, sessionId),
   generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),
   setSessionPinned: (id: string, pinned: boolean) => ipcRenderer.invoke('acp:set-session-pinned', id, pinned),
+  /* 「在其他电脑上同步」（s3Pull.ts）：按会话开 / 关；设置里列出开着的那些 */
+  setCrossDevice: (id: string, on: boolean) => ipcRenderer.invoke('acp:set-cross-device', id, on),
+  s3ListCrossDevice: () => ipcRenderer.invoke('s3:list-cross-device'),
+  onSessionCrossDeviceChanged: (cb: (d: { sessionId: string; crossDevice: boolean }) => void) => {
+    const h = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('session:cross-device-changed', h);
+    return () => ipcRenderer.removeListener('session:cross-device-changed', h);
+  },
   getHomeDir: () => ipcRenderer.invoke('app:get-home-dir'),
   getLogs: (maxLines?: number) => ipcRenderer.invoke('app:get-logs', maxLines),
   openLogs: () => ipcRenderer.invoke('app:open-logs'),

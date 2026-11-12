@@ -222,7 +222,7 @@ declare global {
       truncateTranscriptBefore: (sessionId: string, messageId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       forkBackendForEdit?: (sessionId: string, keepIds: string[]) => Promise<{ mode: 'none' | 'fork' | 'fresh' | 'snapshot' | 'fallback'; reason?: string; newId?: string }>;
       rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }>) => Promise<{ ok: boolean }>;
-      listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean; remoteHost?: string; remoteId?: string; remoteMissing?: boolean }[]>;
+      listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean; crossDevice?: boolean; remoteHost?: string; remoteId?: string; remoteMissing?: boolean }[]>;
       listSessions: () => Promise<any>;
       listKiroAgents: (machine?: string) => Promise<{ agents: Array<{ name: string; isDefault: boolean; source: 'built-in' | 'global' | 'local' }>; error?: string }>;
       openKiroAgentConfig: (sessionId: string, agentName: string, source?: 'built-in' | 'global' | 'local') => Promise<{ opened: boolean; path?: string; content?: string; error?: string }>;
@@ -596,6 +596,8 @@ export interface Session {
   projectId?: string;
   /** Pinned sessions sort to the top of their group. */
   pinned?: boolean;
+  /** 「在其他电脑上同步」开着（主进程 s3Pull.ts）：自动合并其他电脑上同一条会话的新消息。缺省关 = 只备份 */
+  crossDevice?: boolean;
   /**
    * WHAT THIS CHAT IS FOR, when it is not a conversation the user started.
    *
@@ -1015,6 +1017,7 @@ const App: React.FC = () => {
     renameProject,
     deleteProject,
     togglePin,
+    setCrossDevice,
     clearConversation,
     resetSessionCredits,
     sendMessage,
@@ -4486,6 +4489,13 @@ const App: React.FC = () => {
               onRebuildContext={(id, mode) => { void rebuildContext(id, mode); }}
               onRenameSession={renameSession}
               onTogglePin={togglePin}
+              onToggleCrossDevice={(id, on) => {
+                void (async () => {
+                  const r = await setCrossDevice(id, on);
+                  if (!r?.ok) showToast(String(r?.error || 'failed').split('\n')[0]);
+                  else showToast(on ? tRef.current('From the next sync on, new messages for this chat from your other computers are merged in here.') : tRef.current('This chat is now only backed up; new messages from your other computers are no longer merged in.'));
+                })();
+              }}
               // Only the EXPLICIT selection highlights rows. In single-chat mode
               // `panes` falls back to the focused chat, which must not look selected.
               /**
@@ -4516,14 +4526,6 @@ const App: React.FC = () => {
               onOpenBackup={() => setShowBackup(true)}
               offloadedSessions={offloadedSessions}
               onOffloadRestore={(id, keepLocal) => { void restoreOffloaded(id, keepLocal, false); }}
-              onOffloadDismiss={(id) => {
-                /* 从别的电脑来的占位：从这台电脑的列表里移除（主进程写删除记录，下一轮不再建回来） */
-                void (async () => {
-                  const r = await (window as any).kiroApi?.offloadDismiss?.(id).catch((e: any) => ({ ok: false, error: String(e?.message || e) }));
-                  if (r?.ok) await loadOffloaded();
-                  else showToast(String(r?.error || 'failed').split('\n')[0]);
-                })();
-              }}
               backupState={backupState}
               workspaceOpen={showWorkspace}
               onOpenWorkspace={() => setShowWorkspace((visible) => !visible)}

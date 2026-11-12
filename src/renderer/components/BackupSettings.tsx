@@ -62,8 +62,6 @@ interface Cfg {
   /** 久未使用的会话移到云端（主进程 sessionOffload.ts）：开关（默认开）、天数（默认 30）。 */
   autoOffload: boolean;
   offloadIdleDays: number;
-  /** 自动显示其他电脑上的会话（主进程 s3Pull.ts）：缺省开；关掉只停「建占位」 */
-  autoShowRemoteSessions: boolean;
   /** 凭据现在用不用得了（主进程 syncCredsOrProblem）：缺字段 / 密钥解不开 → 原因；可用 → 空 */
   credsProblem?: string;
 }
@@ -86,6 +84,32 @@ const Field: React.FC<{ label: string; children: React.ReactNode; hint?: string 
     {hint && <div className="settings-hint backup-field-hint">{hint}</div>}
   </div>
 );
+
+/** 「已开启同步的会话：N 条」—— 主进程 `s3:list-cross-device`；关掉一条 = 侧栏右键关掉同一件事。 */
+const CrossDeviceList: React.FC = () => {
+  const t = useT();
+  const [rows, setRows] = useState<Array<{ id: string; title: string; archived?: boolean }> | null>(null);
+  const load = useCallback(async () => {
+    try { const r = await api()?.s3ListCrossDevice?.(); setRows(Array.isArray(r?.sessions) ? r.sessions : []); } catch { setRows([]); }
+  }, []);
+  useEffect(() => {
+    void load();
+    const off = api()?.onSessionCrossDeviceChanged?.(() => { void load(); });
+    return () => { try { off?.(); } catch { /* 已经解绑了 */ } };
+  }, [load]);
+  if (!rows) return null;
+  return (
+    <div className="backup-cross-device">
+      <div className="settings-hint">{t('Chats synced to other computers: {n}', { n: rows.length })}</div>
+      {rows.map((r) => (
+        <div key={r.id} className="backup-device-row">
+          <span className="backup-restore-title" title={r.id}>🔗 {r.title}{r.archived ? ` · ${t('Archived')}` : ''}</span>
+          <button className="remote-btn" onClick={() => { void api()?.setCrossDevice?.(r.id, false).then(() => load()); }}>{t('Turn off')}</button>
+        </div>
+      ))}
+    </div>
+  );
+};
 
 export const BackupSettings: React.FC = () => {
   const lang = useLang();
@@ -390,16 +414,15 @@ export const BackupSettings: React.FC = () => {
           </Field>
         );
       })()}
-      {/* **自动显示其他电脑上的会话**（主进程 s3Pull.ts）：别的电脑上有、本机没有的会话在侧栏留占位，点开才下载。关掉只停这一项 */}
+      {/*
+        **在其他电脑上同步**（主进程 s3Pull.ts）—— 按会话开，缺省关：「其实应该是按照我的要求只对特定的会话开启同步」。
+        这里没有总开关，只说明 + 列出开着的那些（可以逐条关）；开在侧栏会话的右键菜单里。
+      */}
       <Field
         label={t('Sessions from other computers')}
-        hint={t('Sessions that exist on your other computers (same bucket) appear in the sidebar; they download only when you open them. Turning this off only stops that: sessions already on this computer still pick up new messages from the other computers.')}
+        hint={t('Only chats you turn on (right-click a chat → "Sync to other computers") pick up new messages from your other computers that also have them (same bucket). Chats that are not on this computer are not added here. Restoring a chat from backup turns this on for it. Every other chat is only backed up.')}
       >
-        <ToggleButton
-          on={cfg.autoShowRemoteSessions !== false}
-          ariaLabel={t('Show sessions from other computers')}
-          onChange={(next) => { patch({ autoShowRemoteSessions: next }); void save({ autoShowRemoteSessions: next }); }}
-        />
+        <CrossDeviceList />
       </Field>
       {devices && (
         <div className="backup-devices">

@@ -22,10 +22,6 @@ export interface OffloadPlaceholderRow {
   offloadedAt: number;
   bytes: number;
   files?: number;
-  /** `remote` = 从别的电脑来的（主进程 s3Pull.ts），本机从来没有过；没有 = 本机移到云端的 */
-  origin?: 'remote';
-  /** 来自哪台电脑（显示用的主机名） */
-  fromHost?: string;
 }
 
 /** 侧栏行上挂的那一块：有它 = 这是一个占位。 */
@@ -35,8 +31,6 @@ export interface OffloadedMark {
   bytes: number;
   /** 正在下载回本机 */
   restoring?: boolean;
-  /** 从别的电脑来的占位（不是本机移到云端的）：那台电脑的主机名 */
-  remote?: { host: string };
 }
 
 export interface PlaceholderRow { id: string; title: string; model: string; projectId?: string; engine?: 'kiro' | 'claude' | 'codex'; remoteHost?: string; archived?: boolean; timestamp: number; offloaded: OffloadedMark }
@@ -63,7 +57,7 @@ export function placeholderRows<S extends { id: string }>(
       /* 归档的照旧进「已归档」那一组（侧栏按 archived 分组） */
       ...(r.archived ? { archived: true } : null),
       timestamp: Number(r.lastActiveAt) || 0,
-      offloaded: { lastActiveAt: Number(r.lastActiveAt) || 0, offloadedAt: Number(r.offloadedAt) || 0, bytes: Number(r.bytes) || 0, ...(restoring.has(r.id) ? { restoring: true } : null), ...(r.origin === 'remote' ? { remote: { host: String(r.fromHost || '') } } : null) },
+      offloaded: { lastActiveAt: Number(r.lastActiveAt) || 0, offloadedAt: Number(r.offloadedAt) || 0, bytes: Number(r.bytes) || 0, ...(restoring.has(r.id) ? { restoring: true } : null) },
     });
   }
   return out;
@@ -85,7 +79,6 @@ export function sizeLabel(bytes: number): string {
 /** 占位行的悬停提示。 */
 export function offloadTooltip(m: OffloadedMark, now: number, lang: Lang): string {
   if (m.restoring) return t(lang, 'Downloading it back from the cloud…');
-  if (m.remote) return t(lang, 'On another computer ({host}). Click to download it to this computer.', { host: m.remote.host || '?' });
   return t(lang, 'Moved to the cloud (unused for {n} days). Click to download it automatically.', { n: idleDays(m.lastActiveAt, now) });
 }
 
