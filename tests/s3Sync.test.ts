@@ -474,26 +474,26 @@ describe('冲突检测与失败退避（借 Tabby 的做法）', () => {
  * 分工：**配置**在 设置 → ☁️ 备份（配一次就不用再看）；**恢复**在侧栏那颗 ☁️
  * （平时要回来看的那件事：桶里有哪些、要捞哪几条）。
  */
-describe('备份分成两页：配置在设置，云按钮只管恢复', () => {
+describe('备份：配置、同步、恢复都在 ☁️ 对话框里', () => {
   const CONF = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupSettings.tsx'), 'utf8');
   const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
   const SD = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/SettingsDialog.tsx'), 'utf8');
   const APP = fs.readFileSync(path.join(process.cwd(), 'src/renderer/App.tsx'), 'utf8');
   const CSS = fs.readFileSync(path.join(process.cwd(), 'src/renderer/styles/global.css'), 'utf8');
 
-  test('配置回到设置里', () => {
-    assert.match(SD, /\{ id: 'backup', label: '☁️ Backup' \}/);
-    assert.match(SD, /\{tab === 'backup' && <BackupSettings \/>\}/);
+  test('配置在 ☁️ 对话框的「设置」页签（「难道不应该在同步恢复那个里面配置吗」），设置面板里不再有', () => {
+    assert.equal(/id: 'backup'/.test(SD), false);
+    assert.match(UI, /<BackupSettings onSaved=\{\(\) => void loadConfig\(\)\} \/>/);
     /* 桶 / 凭据 / 定时都在那一页 */
     for (const f of ['label="Bucket"', "label={t('Region')}", 'label="Access Key ID"', "label={t('Secret')}", '定时同步']) {
       assert.ok(CONF.includes(f), `配置页要有 ${f}`);
     }
   });
 
-  test('云按钮那一页**没有任何配置** —— 它只管恢复', () => {
+  test('对话框自己不重写配置 —— 配置字段只在 BackupSettings 一处（「设置」页签复用它）', () => {
     for (const f of ['label="Bucket"', 'label="Region"', 'label="Access Key ID"',
       'label="Secret"', 'testS3', 'intervalMinutes']) {
-      assert.equal(UI.includes(f), false, `恢复页不该有 ${f}`);
+      assert.equal(UI.includes(f), false, `BackupDialog 里不该再写一份 ${f}`);
     }
     assert.match(APP, /onOpenBackup=\{\(\) => setShowBackup\(true\)\}/);
   });
@@ -795,9 +795,10 @@ describe('两处显示上的收口', () => {
     /* 配置搬去设置之后这一页一个桶名都不显示，"我在从哪儿恢复"没地方看，像是配置丢了 */
     assert.match(UI3, /className="backup-where"/);
     assert.match(UI3, /\{where\.bucket\}\{where\.region \? ` \/ \$\{where\.region\}` : ''\}/);
-    /* 还没配桶时也要说，而且指路到设置 */
-    assert.match(UI3, /t\('No bucket configured yet \(Settings → ☁️ Backup\)'\)/);
-    assert.match(ZHP, /还没配桶（设置 → ☁️ 备份）/);
+    /* 还没配桶时也要说，而且给一个点了就到「设置」页签的「去设置」 */
+    assert.match(UI3, /t\('No bucket configured yet'\)/);
+    assert.match(UI3, /pickTab\('settings'\)\}>\{t\('Go to settings'\)\}/);
+    assert.match(ZHP, /'No bucket configured yet': '还没配桶'/);
     /* 凭据仍然只在设置里改 —— 这一页的 saveS3Config 只用来存"哪些项目不同步" */
     assert.equal(/bucket: cfg\.bucket/.test(UI3), false);
   });
@@ -832,11 +833,11 @@ describe('配置页只留有信息量的文字', () => {
 
   test('留下的两句各有理由', () => {
     /* ① 凭据会不会被传上去，是个真问题 */
-    assert.match(shown, /\{t\('Only sessions, memory and attachments are uploaded, not '\)\}<code>config\.json<\/code>\{t\(' or logs\. Restore is under the '\)\}/);
+    assert.match(shown, /\{t\('Only sessions, memory and attachments are uploaded, not '\)\}<code>config\.json<\/code>\{t\(' or logs\. Restore is on the '\)\}<b>\{t\('Recover'\)\}<\/b>\{t\(' tab\.'\)\}/);
     assert.match(ZHP, /'Only sessions, memory and attachments are uploaded, not ': '只传会话、记忆层和附件，不含 '/);
-    assert.match(ZHP, /' or logs\. Restore is under the ': ' 和日志。恢复在侧栏那颗 '/);
-    /* ② 不说的话人会在这一页找恢复 */
-    assert.match(ZHP, /恢复在侧栏那颗/);
+    assert.match(ZHP, /' or logs\. Restore is on the ': ' 和日志。恢复在「'/);
+    /* ② 不说的话人会在这一页找恢复（配置和恢复在同一个对话框，指到「恢复」页签） */
+    assert.match(ZHP, /' tab\.': '」页签。'/);
   });
 
   test('Secret 那条只留"需要哪些权限"——那是你真要去授的东西', () => {
@@ -950,8 +951,9 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
   });
 
   test('两个 tab，而且恢复那张表是切过去才拉', () => {
-    /* 第三个 tab 是「云端回收站」（cloudTrash.test.ts）；默认仍停在同步 */
-    assert.match(UI5, /useState<'sync' \| 'restore' \| 'trash'>\('sync'\)/);
+    /* 第三个 tab 是「云端回收站」（cloudTrash.test.ts），第四个是「设置」（backupSettingsTab.test.ts）；
+       配好了默认仍停在同步，没配好停在设置 */
+    assert.match(UI5, /useState<'sync' \| 'restore' \| 'trash' \| 'settings'>\('sync'\)/);
     assert.match(UI5, /className="backup-tabs"/);
     /* 列表是一次网络请求，只开同步 tab 的人不该付这个钱 */
     assert.match(UI5, /if \(tab === 'restore' && !entries\) void loadBackups\(\);/);

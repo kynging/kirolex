@@ -1,10 +1,9 @@
 /**
- * **☁️ 备份的配置** —— 设置里的一个 tab。
+ * **☁️ 备份的配置** —— 侧栏 ☁️ 对话框（`BackupDialog`）的「设置」页签。
  *
- * 「这个备份的配置放回设置中。我的意思是这个云按钮只保留恢复」。
- *
- * 所以这一页只管**配**：桶、区域、凭据、定时。"桶里有哪些会话、要恢复哪几条"在侧栏那颗 ☁️
- * 里（`BackupDialog`）—— 那是一件**平时要回来看**的事，而配置是配一次就不用再看的。
+ * 「这个恢复功能的配置似乎有问题哦，难道不应该在同步恢复那个里面配置吗」：配置和同步 / 恢复放在
+ * 同一个对话框里，设置面板不再单独一页。这一页只管**配**：桶、区域、凭据、定时；
+ * 「已开启跨电脑同步的会话」列表（`CrossDeviceList`）在「同步」页签，和按项目的同步开关放在一起。
  *
  * ## secret 只往一个方向走
  *
@@ -33,7 +32,7 @@
 import React, { useCallback, useEffect, useState } from 'react';
 import { intervalChoices, intervalLabel, dayChoices, ACTIVE_DEVICE_DAY_CHOICES, CLOUD_TRASH_DAY_CHOICES, OFFLOAD_DAY_CHOICES } from '../backupIntervals.ts';
 import { ToggleButton } from './ToggleButton.tsx';
-import { cleanupSentence } from '../backupGroups.ts';
+import { cleanupSentence, backupConfigured } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 import { PolicyBox } from './BedrockIam.tsx';
 
@@ -77,7 +76,7 @@ const when = (ms?: number): string => (ms ? new Date(ms).toLocaleString() : '—
 const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
 /** 一行「标签 + 控件」。标签定宽，这样几个输入框的左边缘是齐的。 */
-const Field: React.FC<{ label: string; children: React.ReactNode; hint?: string }> = ({ label, children, hint }) => (
+export const Field: React.FC<{ label: string; children: React.ReactNode; hint?: string }> = ({ label, children, hint }) => (
   <div className="backup-field">
     <label className="backup-field-label">{label}</label>
     <div className="backup-field-control">{children}</div>
@@ -86,7 +85,7 @@ const Field: React.FC<{ label: string; children: React.ReactNode; hint?: string 
 );
 
 /** 「已开启同步的会话：N 条」—— 主进程 `s3:list-cross-device`；关掉一条 = 侧栏右键关掉同一件事。 */
-const CrossDeviceList: React.FC = () => {
+export const CrossDeviceList: React.FC = () => {
   const t = useT();
   const [rows, setRows] = useState<Array<{ id: string; title: string; archived?: boolean }> | null>(null);
   const load = useCallback(async () => {
@@ -111,7 +110,8 @@ const CrossDeviceList: React.FC = () => {
   );
 };
 
-export const BackupSettings: React.FC = () => {
+/** `onSaved`：存成功之后调（对话框标题上的桶名跟着重读）。 */
+export const BackupSettings: React.FC<{ onSaved?: () => void }> = ({ onSaved }) => {
   const lang = useLang();
   const t = useT();
   const [cfg, setCfg] = useState<Cfg | null>(null);
@@ -166,6 +166,7 @@ export const BackupSettings: React.FC = () => {
       setSecret('');
       await load();
       void loadDevices();      // 桶 / 凭据可能刚改过：设备列表跟着重读
+      onSaved?.();
       setMsg({ kind: 'ok', text: t('Saved.') });
     } catch (err: any) {
       setMsg({ kind: 'bad', text: String(err?.message || err) });
@@ -215,10 +216,10 @@ export const BackupSettings: React.FC = () => {
         砍掉的是"备份了什么、跳过没变的文件、启动 60 秒补一轮"那一堆 —— 那些是实现说明,
         看完也不会改变你在这一页的任何一个动作。
         留下的两句各有理由：① 不上传 `config.json`（凭据会不会被传上去是个真问题）；
-        ② 恢复在别的地方（否则人会在这一页找恢复）。
+        ② 恢复在别的页签（否则人会在这一页找恢复）。
       */}
       <div className="settings-hint backup-note">
-        {t('Only sessions, memory and attachments are uploaded, not ')}<code>config.json</code>{t(' or logs. Restore is under the ')}<b>☁️</b>{t(' button in the sidebar.')}
+        {t('Only sessions, memory and attachments are uploaded, not ')}<code>config.json</code>{t(' or logs. Restore is on the ')}<b>{t('Recover')}</b>{t(' tab.')}
       </div>
 
       <Field label="Bucket">
@@ -386,7 +387,7 @@ export const BackupSettings: React.FC = () => {
       */}
       {(() => {
         /* 没配好 = 缺字段，或者密钥解不开了（换过机器 / 重装）—— 以主进程说的为准 */
-        const configured = !!(cfg.bucket && cfg.region && (cfg.credentialSource !== 'keys' || (cfg.accessKeyId && cfg.hasSecret))) && !cfg.credsProblem;
+        const configured = backupConfigured(cfg);
         const why = !configured
           ? (cfg.credsProblem ? cfg.credsProblem.split('\n')[0] : t('Set up the bucket and keys above first.'))
           : !cfg.enabled ? t('Turn on scheduled sync first.') : '';
@@ -414,16 +415,6 @@ export const BackupSettings: React.FC = () => {
           </Field>
         );
       })()}
-      {/*
-        **在其他电脑上同步**（主进程 s3Pull.ts）—— 按会话开，缺省关：「其实应该是按照我的要求只对特定的会话开启同步」。
-        这里没有总开关，只说明 + 列出开着的那些（可以逐条关）；开在侧栏会话的右键菜单里。
-      */}
-      <Field
-        label={t('Sessions from other computers')}
-        hint={t('Only chats you turn on (right-click a chat → "Sync to other computers") pick up new messages from your other computers that also have them (same bucket). Chats that are not on this computer are not added here. Restoring a chat from backup turns this on for it. Every other chat is only backed up.')}
-      >
-        <CrossDeviceList />
-      </Field>
       {devices && (
         <div className="backup-devices">
           {devices.error ? <div className="settings-hint">{devices.error.split('\n')[0]}</div> : (

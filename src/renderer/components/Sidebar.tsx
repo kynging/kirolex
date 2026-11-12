@@ -234,7 +234,7 @@ interface SidebarProps {
   onRetargetPending?: (sessionId: string, remoteId: string | null, label?: string) => boolean;
   /**
    * 打开 ☁️「从备份恢复」——「这个同步应该在左侧下方有一个入口按钮」，
-   * 而「这个云按钮只保留恢复」：配置在 设置 → ☁️ 备份。
+   * 配置也在这个对话框里（「设置」页签）——「难道不应该在同步恢复那个里面配置吗」。
    *
    * 和 ⚙️ 分开一个按钮，而不是"进设置自己找"：备份是一件**有状态**的事（上次什么时候成的、
    * 失败了没有），而藏在四层菜单后面的状态等于没有状态。Tabby 那个云同步插件同样把它
@@ -1613,10 +1613,10 @@ export const Sidebar: React.FC<SidebarProps> = ({
             className={`sidebar-settings-btn sidebar-backup-btn${backupState?.error ? ' bad' : backupState ? ' ok' : ''}`}
             onClick={onOpenBackup}
             title={backupState?.error
-              ? t('The last backup failed ({at}): {error}\nClick to “Restore from backup”; configure it in Settings → ☁️ Backup', { at: new Date(backupState.at).toLocaleString(), error: backupState.error.split('\n')[0] })
+              ? t('The last backup failed ({at}): {error}\nClick to open ☁️ Backup (settings are on its Settings tab)', { at: new Date(backupState.at).toLocaleString(), error: backupState.error.split('\n')[0] })
               : backupState
                 ? t('Last backup: {at} · uploaded {n} files\nClick to “Restore from backup”', { at: new Date(backupState.at).toLocaleString(), n: backupState.uploaded })
-                : t('Restore chats from a backup (not set up yet: go to Settings → ☁️ Backup)')}
+                : t('Restore chats from a backup (not set up yet: click to set it up)')}
             aria-label={t('Backup')}
           >
             ☁️

@@ -182,3 +182,15 @@ export function cleanupSentence(r: { cloudTrashed?: number; cloudPurged?: number
   if (!r || (r.cloudTrashed === undefined && r.cloudPurged === undefined)) return '';
   return t(lang, '{trashed} moved to the cloud trash and {purged} expired and cleared this time.', { trashed: r.cloudTrashed || 0, purged: r.cloudPurged || 0 });
 }
+
+/**
+ * 桶 / 凭证配好了没有（`getS3Config` 的返回）：缺字段，或者主进程说密钥用不了（换过机器 / 重装）都算没配好。
+ * ☁️ 对话框据此决定一打开停在「设置」还是「同步」；配置页据此给「移到云端」置灰。
+ */
+export function backupConfigured(cfg: {
+  bucket?: string; region?: string; credentialSource?: string; accessKeyId?: string; hasSecret?: boolean; credsProblem?: string;
+} | null | undefined): boolean {
+  if (!cfg) return false;
+  const keysOk = (cfg.credentialSource || 'keys') !== 'keys' || !!(cfg.accessKeyId && cfg.hasSecret);
+  return !!(cfg.bucket && cfg.region && keysOk) && !cfg.credsProblem;
+}

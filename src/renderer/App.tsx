@@ -1140,7 +1140,7 @@ const App: React.FC = () => {
   /* ☁️ 备份自己一个弹窗（侧栏那颗 ☁️ 直接开它）—— 它是有状态、要回来看的东西，不是设置 */
   const [showBackup, setShowBackup] = useState(false);
   /** 打开设置时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。 */
-  const [settingsTab, setSettingsTab] = useState<'machines' | 'backup' | undefined>(undefined);
+  const [settingsTab, setSettingsTab] = useState<'machines' | undefined>(undefined);
   /** 打开设置时机器页直接进入「添加一台机器」（侧栏右键「运行位置 → ＋ 添加机器…」）。 */
   const [settingsNewMachine, setSettingsNewMachine] = useState(false);
   /**
@@ -4521,7 +4521,7 @@ const App: React.FC = () => {
               onRetargetPending={retargetPendingSession}
               /*
                 ☁️ 只管**恢复** ——「这个云按钮只保留恢复，这个界面应该展示所有已经备份的会话，
-                然后留一个多选/恢复按钮即可」。配置回到 设置 → ☁️ 备份。
+                然后留一个多选/恢复按钮即可」。配置也在这个对话框里（「设置」页签）。
               */
               onOpenBackup={() => setShowBackup(true)}
               offloadedSessions={offloadedSessions}

@@ -1,6 +1,5 @@
 import { LANG_OPTIONS, normalizeLang } from '../i18n';
 import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT, UI_ZOOM_MAX, UI_ZOOM_MIN } from '../uiZoom';
-import { BackupSettings } from './BackupSettings.tsx';
 import { ToggleButton } from './ToggleButton.tsx';
 import { RemoteSettings } from './RemoteSettings';
 import { AgentProfileSettings } from './AgentProfileSettings';
@@ -14,10 +13,10 @@ import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
 
-type SettingsTab = 'appearance' | 'session' | 'switches' | 'machines' | 'backup';
+type SettingsTab = 'appearance' | 'session' | 'switches' | 'machines';
 
 interface SettingsDialogProps {
-  /** 打开时停在哪一页（侧栏那个 ☁️ 直接落到备份页）。不传 = 机器页。 */
+  /** 打开时停在哪一页（「+ 添加机器」直接落到机器页）。不传 = 外观页。 */
   initialTab?: SettingsTab;
   /** 机器页一打开就停在「+ 添加一台机器…」（侧栏右键「运行位置 → ＋ 添加机器…」）。不传 = 和以前一样。 */
   startNewMachine?: boolean;
@@ -130,8 +129,9 @@ const SWITCHES: Array<{
  * 设置的分页 ——「配置里东西太多了，你可以分几个不同的 tab」+「这些内容单独弄一个 setting tab」。
  *
  * 按**你来这儿要干什么**分，不是按字段类型分。顺序 ——「第一个 tab 应该是外观然后是会话，
- * 远程和备份应该放在最后」：外观 → 会话 → 开关 → 机器 → 备份，打开设置默认是外观。
- * 从侧栏 ☁️ / 远端报错点进来的仍然直接落在机器或备份那一页（`initialTab`）。
+ * 远程和备份应该放在最后」：外观 → 会话 → 开关 → 机器，打开设置默认是外观。备份的配置在侧栏 ☁️
+ * 对话框的「设置」页签（「难道不应该在同步恢复那个里面配置吗」）。
+ * 从远端报错 / 「+ 添加机器」点进来的仍然直接落在机器那一页（`initialTab`）。
  */
 
 const TABS: Array<{ id: SettingsTab; label: string }> = [
@@ -139,8 +139,6 @@ const TABS: Array<{ id: SettingsTab; label: string }> = [
   { id: 'session', label: '💬 Chats' },
   { id: 'switches', label: '🧪 Switches' },
   { id: 'machines', label: '🖥 Machines' },
-  /* 备份的**配置**在这儿；「桶里有哪些、恢复哪几条」在侧栏那颗 ☁️ 里 */
-  { id: 'backup', label: '☁️ Backup' },
 ];
 
 export const SettingsDialog: React.FC<SettingsDialogProps> = ({
@@ -158,7 +156,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   /* 打开时停在「机器」那一页 —— 那是当前在配的东西；不记住上次选的哪一页（多一份状态，
      换来的只是"上次我在哪"，而每次打开设置的理由通常都不一样）。 */
   /*
-    **打开时停在哪一页可以被指定** —— 侧栏那个 ☁️ 按钮要直接落到备份页。
+    **打开时停在哪一页可以被指定** —— 「+ 添加机器」要直接落到机器页。
     不传就还是机器页（那是最常改的一页）。
   */
   const [tab, setTab] = useState<SettingsTab>(initialTab || 'appearance');
@@ -687,7 +685,6 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           )}
 
 
-          {tab === 'backup' && <BackupSettings />}
           {tab === 'switches' && (
           <div className="settings-col">
             <div className="settings-item" style={{ flexDirection: 'column', alignItems: 'stretch', gap: 6 }}>

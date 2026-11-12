@@ -51,10 +51,10 @@ export const ZH_SHELL: Record<string, string> = {
   'Opens Settings → Machines to add a new machine; once saved it shows up here': '打开 设置 → 机器，直接添加一台新机器；存好之后它就出现在这里',
   'Add machine…': '添加机器…',
   '{n} connected / limit {cap} chat executors': '已连接 {n} / 上限 {cap} 个会话执行器',
-  'The last backup failed ({at}): {error}\nClick to “Restore from backup”; configure it in Settings → ☁️ Backup':
-    '备份上次失败了（{at}）：{error}\n点开是「从备份恢复」；配置在 设置 → ☁️ 备份',
+  'The last backup failed ({at}): {error}\nClick to open ☁️ Backup (settings are on its Settings tab)':
+    '备份上次失败了（{at}）：{error}\n点开 ☁️ 备份（配置在里面的「设置」页签）',
   'Last backup: {at} · uploaded {n} files\nClick to “Restore from backup”': '上次备份：{at} · 传了 {n} 个文件\n点开是「从备份恢复」',
-  'Restore chats from a backup (not set up yet: go to Settings → ☁️ Backup)': '从备份恢复会话（还没配 —— 去 设置 → ☁️ 备份）',
+  'Restore chats from a backup (not set up yet: click to set it up)': '从备份恢复会话（还没配 —— 点开去配置）',
   'Backup': '备份',
   'kiro-cli trace logging is **on**: over 10 GB a day. Click to turn it off (takes effect the next time an executor starts)':
     'kiro-cli trace 日志**开着** —— 每天十几 GB。点一下关掉（下一次起执行器生效）',

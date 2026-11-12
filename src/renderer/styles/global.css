@@ -9122,6 +9122,16 @@ button, input, select, textarea {
   color: var(--text-muted);
   margin-left: 2px;
 }
+/* 没配桶时标题里那个「去设置」：切到本对话框的「设置」页签 */
+.backup-where-link {
+  font: inherit;
+  color: var(--accent);
+  background: none;
+  border: none;
+  padding: 0;
+  cursor: pointer;
+  text-decoration: underline;
+}
 
 /*
   成功那条消息用绿色 ——「测联通ok的话显示个绿色和✅就行了」。

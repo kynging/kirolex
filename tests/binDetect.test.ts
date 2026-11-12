@@ -254,10 +254,11 @@ describe('设置分页 + 文案', () => {
     const order = Array.from(D.slice(D.indexOf('const TABS'), D.indexOf('];', D.indexOf('const TABS'))).matchAll(/id: '([a-z]+)'/g)).map((m) => m[1]);
     assert.deepEqual(order.slice(0, 2), ['appearance', 'session']);
     /* 登录不在设置里了：在会话左下角那个机器人面板里（Claude Code / Codex 会话） */
-    assert.deepEqual(order.slice(-2), ['machines', 'backup']);
+    /* 备份的配置搬进了侧栏 ☁️ 对话框的「设置」页签，设置面板里机器是最后一页 */
+    assert.deepEqual(order.slice(-1), ['machines']);
     assert.deepEqual([...order].sort(), [...ids].sort(), '声明的每一页都在标签栏里');
     /* 默认页是外观；仍然可以被 `initialTab` 指定 ——
-       侧栏那个 ☁️ 要直接落到备份页（「这个同步应该在左侧下方有一个入口按钮」）。 */
+       「+ 添加机器」要直接落到机器页。 */
     assert.match(D, /useState<SettingsTab>\(initialTab \|\| 'appearance'\)/);
     assert.match(D, /initialTab\?: SettingsTab;/);
     assert.match(D, /\{tab === 'machines' && <RemoteSettings startNew=\{newMachinePending\} \/>\}/);

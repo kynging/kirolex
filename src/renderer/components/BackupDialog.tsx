@@ -1,13 +1,12 @@
 /**
- * **☁️ 备份** —— 三个 tab：同步 / 恢复 / 云端回收站。
+ * **☁️ 备份** —— 四个 tab：同步 / 恢复 / 云端回收站 / 设置。
  *
  * 「云那里分同步和恢复两个tab好了」「你得按 project 整理，有些project可以选择不同步」。
  *
- * 这里**没有凭据配置**（桶、区、AK、定时间隔都在 设置 → ☁️ 备份）。这一页管的是两件
- * 平时要回来看的事：
- *
- * · **同步**：哪些项目在备份、哪些不备份、现在同步一次；
- * · **恢复**：桶里有哪些会话（按项目分组），捞哪几条回来。
+ * · **同步**：哪些项目在备份、哪些不备份、现在同步一次；哪些会话开着跨电脑同步；
+ * · **恢复**：桶里有哪些会话（按项目分组），捞哪几条回来；
+ * · **设置**：桶、区、凭据、定时 —— 就是 `BackupSettings`（「难道不应该在同步恢复那个里面配置吗」，
+ *   原来在 设置 → ☁️ 备份）。没配好时一打开就停在这一页。
  *
  * ## 为什么按项目分组
  *
@@ -23,10 +22,11 @@
  * 否则"关了它怎么还在列表里"看起来像开关没生效。
  */
 
-import React, { useCallback, useEffect, useMemo, useState } from 'react';
+import React, { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import { ToggleButton } from './ToggleButton.tsx';
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
-import { cleanupSentence } from '../backupGroups.ts';
+import { BackupSettings, CrossDeviceList, Field } from './BackupSettings.tsx';
+import { cleanupSentence, backupConfigured } from '../backupGroups.ts';
 import { groupBackups, groupSyncProjects, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
@@ -114,7 +114,10 @@ const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFix
 export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => {
   const lang = useLang();
   const t = useT();
-  const [tab, setTab] = useState<'sync' | 'restore' | 'trash'>('sync');
+  const [tab, setTab] = useState<'sync' | 'restore' | 'trash' | 'settings'>('sync');
+  /* 默认页签只在第一次读到配置时定一次（没配好 → 设置）；人点过页签、或者在设置页刚存好，都不再跳 */
+  const tabTouched = useRef(false);
+  const pickTab = (next: typeof tab): void => { tabTouched.current = true; setTab(next); };
   const [where, setWhere] = useState<{ bucket?: string; region?: string; last?: any } | null>(null);
   const [busy, setBusy] = useState<string | null>(null);
   const [msg, setMsg] = useState<{ kind: 'ok' | 'bad'; text: string } | null>(null);
@@ -148,6 +151,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     try {
       const cfg = await api()?.getS3Config?.();
       setWhere({ bucket: cfg?.bucket, region: cfg?.region, last: cfg?.last });
+      if (!tabTouched.current) setTab(backupConfigured(cfg) ? 'sync' : 'settings');
+      tabTouched.current = true;
     } catch { /* 拿不到就只显示标题 */ }
   }, []);
 
@@ -434,20 +439,27 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
             {t('☁️ Backup')}
             {where?.bucket
               ? <span className="backup-where"> · {where.bucket}{where.region ? ` / ${where.region}` : ''}</span>
-              : where && <span className="backup-where"> · {t('No bucket configured yet (Settings → ☁️ Backup)')}</span>}
+              : where && (
+                <span className="backup-where"> · {t('No bucket configured yet')}{' '}
+                  <button className="backup-where-link" onClick={() => pickTab('settings')}>{t('Go to settings')}</button>
+                </span>
+              )}
           </h3>
           <button className="settings-close" onClick={onClose}>✕</button>
         </div>
 
         <div className="backup-tabs">
-          <button className={`memory-tab ${tab === 'sync' ? 'active' : ''}`} onClick={() => setTab('sync')}>
+          <button className={`memory-tab ${tab === 'sync' ? 'active' : ''}`} onClick={() => pickTab('sync')}>
             {t('Sync')}{projects ? ` (${syncingCount}/${projects.length})` : ''}
           </button>
-          <button className={`memory-tab ${tab === 'restore' ? 'active' : ''}`} onClick={() => setTab('restore')}>
+          <button className={`memory-tab ${tab === 'restore' ? 'active' : ''}`} onClick={() => pickTab('restore')}>
             {t('Recover')}{entries ? ` (${entries.length})` : ''}
           </button>
-          <button className={`memory-tab ${tab === 'trash' ? 'active' : ''}`} onClick={() => setTab('trash')}>
+          <button className={`memory-tab ${tab === 'trash' ? 'active' : ''}`} onClick={() => pickTab('trash')}>
             {t('Cloud trash')}{trash ? ` (${trash.length})` : ''}
+          </button>
+          <button className={`memory-tab ${tab === 'settings' ? 'active' : ''}`} onClick={() => pickTab('settings')}>
+            {t('Settings')}
           </button>
         </div>
 
@@ -565,7 +577,23 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
               <div className="settings-hint backup-note">
                 {t('Turning off a project or session ')}<b>{t('stops further backups')}</b>{t(', it does not delete existing backups. What was uploaded before stays in the bucket and can still be seen and restored on the Recover tab (deleting is done there too).')}
               </div>
+              {/*
+                **在其他电脑上同步**（主进程 s3Pull.ts）—— 按会话开，缺省关：「其实应该是按照我的要求只对特定的会话开启同步」。
+                这里没有总开关，只说明 + 列出开着的那些（可以逐条关）；开在侧栏会话的右键菜单里。
+                放在同步页：和上面按项目 / 按会话的同步开关一起看。
+              */}
+              <Field
+                label={t('Sessions from other computers')}
+                hint={t('Only chats you turn on (right-click a chat → "Sync to other computers") pick up new messages from your other computers that also have them (same bucket). Chats that are not on this computer are not added here. Restoring a chat from backup turns this on for it. Every other chat is only backed up.')}
+              >
+                <CrossDeviceList />
+              </Field>
             </>
+          )}
+
+          {/* 桶 / 凭据 / 定时 —— 原来在 设置 → ☁️ 备份，原样搬过来（同一个组件、同一套保存接口） */}
+          {tab === 'settings' && (
+            <BackupSettings onSaved={() => void loadConfig()} />
           )}
 
           {tab === 'restore' && (
@@ -725,7 +753,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 <span className="settings-hint">
                   {trashEnabled
                     ? t('Cloud sessions that no active device has any more (every device deleted them) are moved here when syncing, and deleted for good after {n} days.', { n: trashDays })
-                    : t('Auto-clean is off (Settings → ☁️ Backup): nothing new is moved here and nothing expires.')}
+                    : t('Auto-clean is off (Settings tab): nothing new is moved here and nothing expires.')}
                 </span>
               </div>
               {trashErr && <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{trashErr}</div>}
