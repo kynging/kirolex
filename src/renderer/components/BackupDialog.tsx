@@ -269,21 +269,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   });
 
   /*
-    **删除所选的备份** ——「恢复中需要有一个删除按钮，现在这里面有好多 New Chat 之类没用的会话」。
+    **删除备份**只在组头做（顶部那排只留刷新 / 恢复：「上方应该不再显示删除按钮，仅显示恢复按钮」）。
     两次点击确认（第一次变成「确认删除 N 条」）：桶里删了就回不来，而 app 里的系统确认框
-    会卡住渲染线程。只删桶里那份，本地一个字不动。
+    会卡住渲染线程。只删桶里那份，本地一个字不动。记着是哪一组点了第一下。
   */
-  const [armDelete, setArmDelete] = useState(false);
-  /* 组头的「删除选中的 N 条」同一套两次点击 —— 记着是哪一组点了第一下 */
   const [armGroup, setArmGroup] = useState<string | null>(null);
-  useEffect(() => { setArmDelete(false); setArmGroup(null); }, [picked]);
-  const stillLocal = useMemo(() => chosen.filter((e) => e.existsLocally), [chosen]);
-  const removeBackups = async (): Promise<void> => {
-    if (!chosen.length) return;
-    if (!armDelete) { setArmDelete(true); return; }
-    setArmDelete(false);
-    await deleteBackups(chosen.map((e) => e.id), 'delete');
-  };
+  useEffect(() => { setArmGroup(null); }, [picked]);
   /* 组头的删除：只删这一组里勾选的那几条（以前是一键删整个项目的备份，跟勾了什么无关，经常误点） */
   const removeGroupBackups = async (key: string, ids: string[]): Promise<void> => {
     if (!ids.length) return;
@@ -587,25 +578,11 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                         onClick={() => void restore()}>
                   {busy === 'restore' ? t('Restoring…') : chosen.length ? t('Restore {n} selected', { n: chosen.length }) : t('Restore selected')}
                 </button>
-                <button
-                  className={`remote-btn${armDelete ? ' remote-btn-danger' : ''}`}
-                  disabled={!!busy || !chosen.length}
-                  onClick={() => void removeBackups()}
-                  onBlur={() => setArmDelete(false)}
-                  title={t('Only deletes the backups in the bucket; local copies are untouched')}
-                >
-                  {busy === 'delete' ? t('Deleting…')
-                    : armDelete ? t('Confirm deleting {n} backups', { n: chosen.length })
-                    : chosen.length ? t('Delete {n} selected', { n: chosen.length }) : t('Delete selected')}
-                </button>
-                {armDelete && !!stillLocal.length && (
-                  <span className="settings-hint">{t('{n} of them still exist locally; they are only backed up again if they change later', { n: stillLocal.length })}</span>
-                )}
                 <label className="settings-hint" title={t('Only when a project with the same name exists on this machine. Off: restored sessions go into "Unassigned".')}>
                   <input type="checkbox" checked={putBack} disabled={!!busy} onChange={(ev) => setPutBack(ev.target.checked)} />
                   {' '}{t('Put back into original project')}
                 </label>
-                {!armDelete && !!merging.length && (
+                {!!merging.length && (
                   <span className="settings-hint">{t('{n} of them will be merged with the local copy', { n: merging.length })}</span>
                 )}
               </div>
@@ -662,7 +639,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             {t('Select all')}
                           </label>
                           {/*
-                            只删这一组里勾选的云上备份（不动本地）。两次点击确认，和顶上「删除选中的」同一套：
+                            只删这一组里勾选的云上备份（不动本地）—— 恢复页删备份只在这里（顶上那排只留刷新 / 恢复）。两次点击确认：
                             第一次变成「确认删除 N 条备份」，失去焦点或勾选变了就退回去。
                           */}
                           <button className={`remote-btn backup-del${armed ? ' remote-btn-danger' : ''}`}

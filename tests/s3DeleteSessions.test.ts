@@ -34,9 +34,11 @@ test('删项目和删会话共用一段：catalog 最后写、本地状态表一
 });
 
 test('界面：两次点击确认，不用系统确认框', () => {
-  const at = UI.indexOf('const removeBackups = async');
+  /* 顶部那颗「删除选中的」已去掉，删备份只在组头做（backupRestoreActions.test.ts） */
+  const at = UI.indexOf('const removeGroupBackups = async');
+  assert.ok(at > 0);
   const body = UI.slice(at, at + 400);
-  assert.match(body, /if \(!armDelete\) \{ setArmDelete\(true\); return; \}/);
+  assert.match(body, /if \(armGroup !== key\) \{ setArmGroup\(key\); return; \}/);
   assert.equal(/window\.confirm/.test(body), false);
-  assert.match(UI, /t\('Confirm deleting \{n\} backups', \{ n: chosen\.length \}\)/);
+  assert.match(UI, /t\('Confirm deleting \{n\} backups', \{ n: gp\.pickedIds\.length \}\)/);
 });
