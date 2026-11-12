@@ -373,9 +373,9 @@ const SessionItem: React.FC<{
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {displayTitle(lang, session.title)}
       </span>
-      {/* The row shows `short` (a countdown, or 已暂停) and carries the full sentence as its
-          tooltip: there is no space here for "每天 09:00 · 3 小时 12 分后 · 已运行 2/20", and a
-          row that showed nothing was the reason a scheduled chat looked ordinary from outside. */}
+      {/* The row shows only an icon (⏰, or ⏸️ when paused) and carries the full sentence as its
+          tooltip: a countdown here crowded the title out (「你就显示一个闹钟就行，具体多少时间不用
+          显示」), while a row that showed nothing made a scheduled chat look ordinary from outside. */}
       {/*
         子代理在跑的标记 —— 「如果有subagent在运行左侧的会话上也应该有一个tag，直到subagent被关掉」。
         计数只算还没 terminated 的那些；名单是 kiro 自己报的（名字 / worker agent / 状态都在 title 里）。
@@ -390,8 +390,7 @@ const SessionItem: React.FC<{
           className={`session-schedule${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
           title={scheduleSummary.byModel ? `${t('🤖 Created by the model')} · ${scheduleSummary.text}` : scheduleSummary.text}
         >
-          {scheduleSummary.paused ? '⏸️' : '⏰'} {scheduleSummary.short}
-          {scheduleSummary.byModel && <span className="session-schedule-by-model">{t('By model')}</span>}
+          {scheduleSummary.paused ? '⏸️' : '⏰'}
         </span>
       )}
       {/*

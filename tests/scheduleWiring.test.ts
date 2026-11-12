@@ -147,11 +147,16 @@ describe('a chat with a scheduled task says so, in both places you look', () => 
       'App does not compute the summary from the pure helper');
   });
 
-  test('the sidebar row states the next run', () => {
-    assert.match(SIDEBAR, /session-schedule/, 'no next-run badge on the row');
-    // `.short` is the sidebar's field -- the sentence form does not fit a row and was the
-    // reason the row previously showed nothing at all.
-    assert.match(SIDEBAR, /\.short/, 'the row must use the short form, not the full sentence');
+  test('the sidebar row shows only an alarm icon; the details live in the tooltip', () => {
+    // 「左侧闹钟把会话名称都盖没了，你就显示一个闹钟就行，具体多少时间不用显示」：the row
+    // carries just ⏰ / ⏸️ so the title keeps the width; countdown and "by model" go to `title`.
+    const badge = SIDEBAR.match(/<span\s+className=\{`session-schedule[\s\S]*?<\/span>/);
+    assert.ok(badge, 'no schedule badge on the row');
+    assert.doesNotMatch(badge[0], /scheduleSummary\.short/, 'the row must not print the countdown');
+    assert.doesNotMatch(SIDEBAR, /session-schedule-by-model/, 'the row must not print a "by model" chip');
+    assert.match(badge[0], /title=\{[^\n]*scheduleSummary\.text/, 'the full sentence must stay in the tooltip');
+    assert.match(badge[0], /'⏸️'\s*:\s*'⏰'/, 'paused / pending icon');
+    assert.doesNotMatch(CSS, /session-schedule-by-model/, 'unused "by model" chip style left behind');
   });
 
   test('no schedule means NO banner and NO badge, never an empty chip', () => {
