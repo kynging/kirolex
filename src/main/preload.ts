@@ -524,6 +524,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
   generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant, sessionId),
   generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),
+  /** Claude Code 的下一句预测到了 / 清掉了（`suggestions: []`）—— 追问建议区跟着换 */
+  onPromptSuggestions: (cb: (d: { sessionId: string; suggestions: string[] }) => void) => {
+    const handler = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('acp:prompt-suggestions', handler);
+    return () => ipcRenderer.removeListener('acp:prompt-suggestions', handler);
+  },
   setSessionPinned: (id: string, pinned: boolean) => ipcRenderer.invoke('acp:set-session-pinned', id, pinned),
   /* 「在其他电脑上同步」（s3Pull.ts）：按会话开 / 关；设置里列出开着的那些 */
   setCrossDevice: (id: string, on: boolean) => ipcRenderer.invoke('acp:set-cross-device', id, on),

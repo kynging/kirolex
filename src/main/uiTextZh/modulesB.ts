@@ -64,8 +64,8 @@ export const ZH_MODULES_B: Record<string, string> = {
   'Not detected this time (it worked before)': '这次没检测到（以前起过）',
   'Version output does not look like {label}: {output}': '版本输出不像 {label}：{output}',
   // ── engines.ts ──
-  'Auto title, follow-up suggestions and session-memory tidying run on Kiro, so they are off for this {engine} session (its content is not sent to another AI). The title is taken from your first message; session memory can still be edited by hand.':
-    '自动起标题、追问建议和会话记忆整理是用 Kiro 跑的，所以这条 {engine} 会话不用它们（会话内容不会交给另一家 AI）。标题取你的第一条消息；会话记忆仍然可以手动编辑。',
+  'Auto title and session-memory tidying run on Kiro, so they are off for this {engine} session (its content is not sent to another AI). The title is taken from your first message; session memory can still be edited by hand. Follow-up suggestions come from {engine} itself.':
+    '自动起标题和会话记忆整理是用 Kiro 跑的，所以这条 {engine} 会话不用它们（会话内容不会交给另一家 AI）。标题取你的第一条消息；会话记忆仍然可以手动编辑。追问建议由 {engine} 自己生成。',
   'Could not find the ACP adapter for {engine}. Install it: `{install}` (no need to restart KiroLex afterwards, it is looked up again when you create a session).':
     '没找到 {engine} 的 ACP 适配器。装一下：`{install}`（装完不用重启 KiroLex，新建会话时会重新找）。',
   '{engine} is not logged in on the machine running this session. Run `{login}` in a terminal on that machine (remote sessions: 🔑 Login in the session panel), then try again.':

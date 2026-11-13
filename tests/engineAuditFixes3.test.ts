@@ -43,9 +43,10 @@ describe('A14 标题 / 追问建议 / 会话记忆整理：Claude Code / Codex �
     const title = slice(M, "ipcMain.handle('app:generate-title'", 1800);
     assert.match(title, /async \(_event, firstUser: string, firstAssistant\?: string, sessionId\?: string\)/);
     assert.ok(title.indexOf("if (skipLiteHelperFor(sessionId, 'title')) return { ok: false, skipped: 'engine' };") < title.indexOf('runLiteOneShot('));
+    /* 追问建议后来改成用会话自己的引擎（tests/promptSuggestions.test.ts）：分流同样在 runLiteOneShot 之前，Claude Code / Codex 不会走到 kiro-cli */
     const sugg = slice(M, "ipcMain.handle('app:generate-suggestions'", 2500);
-    assert.ok(sugg.indexOf("if (skipLiteHelperFor(meta?.sessionId, 'suggestions'))") > 0);
-    assert.ok(sugg.indexOf("skipLiteHelperFor(meta?.sessionId, 'suggestions')") < sugg.indexOf('runLiteOneShot('));
+    assert.ok(sugg.indexOf('const own = await engineOwnSuggestions(meta?.sessionId, convo);') > 0);
+    assert.ok(sugg.indexOf('if (own) return own;') < sugg.indexOf('runLiteOneShot('));
     assert.match(read('src', 'main', 'preload.ts'), /ipcRenderer\.invoke\('app:generate-title', firstUser, firstAssistant, sessionId\)/);
   });
 

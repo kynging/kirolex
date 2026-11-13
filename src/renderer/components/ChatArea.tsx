@@ -24,6 +24,7 @@ import { engineCanSteer, steerFailureReasonKey } from '../steerRoute';
 import { shouldApplyHandoff } from '../handoffDraft';
 import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
 import { activeSubagents, type SubagentRow } from '../../main/subagents';
+import { fixedSuggestionFallback, planSuggestionLookup } from '../../main/promptSuggestions.ts';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
 import hljs from 'highlight.js';
@@ -3715,6 +3716,16 @@ function suggestionKey(sessionId: string | null, messages: Message[]): string | 
   if (!last || last.role !== 'assistant') return null;
   return `${sessionId}:${last.id}`;
 }
+/** Claude Code / Codex 这一轮问过、没拿到的（`${sessionId}:${lastAssistantMessageId}`）—— 和上面的缓存一样放模块级，
+ *  切会话 / 重新挂载后不再为同一轮起一次 codex exec。 */
+const suggestionTried = new Set<string>();
+function markSuggestionTried(key: string) {
+  suggestionTried.add(key);
+  if (suggestionTried.size > SUGGESTION_CACHE_MAX) {
+    const oldest = suggestionTried.values().next().value;
+    if (oldest) suggestionTried.delete(oldest);
+  }
+}
 function cacheSuggestions(key: string, list: string[]) {
   suggestionCache.set(key, list);
   if (suggestionCache.size > SUGGESTION_CACHE_MAX) {
@@ -3920,22 +3931,25 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   // showing follow-ups to an answer that had already been superseded. Note the
   // request guard below (`suggestionsForRef`) cannot serve this purpose: it is set
   // OPTIMISTICALLY before the async call, so it says "asked", not "arrived".
+  /* Claude Code：主进程那份（`nativeSuggestions`，推送和清空都写进去，后台会话也一样）才是准的 —— 挂载 / 切回来时
+     不拿本地缓存当「已经问过」，再读一次（只是读，不起任何进程），也不先显示本地缓存（可能已在后台被清掉）。别的引擎照旧：缓存命中 = 这一轮已经有了 */
+  const nativeEngine = engine === 'claude';
   const [dynamicSuggestions, setDynamicSuggestions] = useState<{ key: string | null; items: string[] }>(() => {
     const k = suggestionKey(currentSessionId, messages);
-    const cached = (k && suggestionCache.get(k)) || [];
+    const cached = (!nativeEngine && k && suggestionCache.get(k)) || [];
     return { key: cached.length ? k : null, items: cached };
   });
   /** The turn the chips must match to be shown. Null while a turn is unanswered or
    *  in flight, which is exactly when nothing should be offered. */
   const currentTurnKey = suggestionKey(currentSessionId, messages);
-  const suggestionsForRef = useRef<string | null>(suggestionKey(currentSessionId, messages));
+  const suggestionsForRef = useRef<string | null>(nativeEngine ? null : suggestionKey(currentSessionId, messages));
   useEffect(() => {
     // Switching chats in-place (single view): show that chat's cached chips if we
     // have them, otherwise clear — never leak one chat's suggestions into another.
     const k = suggestionKey(currentSessionId, messages);
-    const cached = (k && suggestionCache.get(k)) || [];
+    const cached = (!nativeEngine && k && suggestionCache.get(k)) || [];
     setDynamicSuggestions({ key: cached.length ? k : null, items: cached });
-    suggestionsForRef.current = cached.length ? k : null;
+    suggestionsForRef.current = cached.length && !nativeEngine ? k : null;
   }, [currentSessionId]);
   useEffect(() => {
     if (isStreaming || messages.length === 0) return;
@@ -3943,14 +3957,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     if (!last || last.role !== 'assistant') return;
     const key = `${currentSessionId || ''}:${last.id}`;
     if (suggestionsForRef.current === key) return; // already generated for this turn
-    const cachedForTurn = suggestionCache.get(key);
-    if (cachedForTurn?.length) {
+    /* 缓存 / 试过 / 去问 —— 判据在 planSuggestionLookup（Claude Code 一律问主进程，见那里） */
+    const plan = planSuggestionLookup({ engine, cached: suggestionCache.get(key), tried: suggestionTried.has(key) });
+    if (plan.kind === 'use-cache') {
       // Already generated for this exact turn (e.g. before a layout change):
       // reuse it instead of paying for the same suggestions again.
       suggestionsForRef.current = key;
-      setDynamicSuggestions({ key, items: cachedForTurn });
+      setDynamicSuggestions({ key, items: plan.items });
       return;
     }
+    /* Codex 这一轮已经试过没拿到（失败 / 超时）：不再问 —— 照旧显示固定建议 */
+    if (plan.kind === 'skip') { suggestionsForRef.current = key; return; }
     suggestionsForRef.current = key;
     const recent = messages
       .slice(-6)
@@ -3971,6 +3988,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             cacheSuggestions(key, r.suggestions);
             setDynamicSuggestions({ key, items: r.suggestions });
           }
+          /* Claude Code 这一轮现在没有预测（或在后台被清掉了）：清掉本地缓存，照旧显示固定建议；晚到的会推过来，
+             切回来 / 重新挂载时也会再读一次主进程那份 */
+          else if (r?.source === 'native-claude') { suggestionCache.delete(key); setDynamicSuggestions({ key: null, items: [] }); return; }
+          /* Codex 这一轮失败 / 超时：不再问（每轮只生成一次）。记在模块级：切走会话再切回来、分屏重新挂载也不再问 */
+          else if (r?.source === 'codex-exec') { markSuggestionTried(key); return; }
           // Nothing came back (timeout / backend hiccup): release the per-turn
           // guard so the next turn tries again instead of staying empty forever.
           else suggestionsForRef.current = null;
@@ -3979,6 +4001,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     }, 400);
     return () => { cancelled = true; clearTimeout(timer); };
   }, [messages, isStreaming, currentSessionId]);
+  /*
+    **Claude Code 的下一句预测是推过来的**（主进程 `acp:prompt-suggestions`）：它在这一轮结束后才生成，常常比上面那次
+    询问晚到。到了就作为这一轮的追问建议显示；空列表 = 清掉这一轮的。正在跑的一轮 / 还没有回复时不接（问的那一次会从主进程拿到）。
+  */
+  const pushTargetRef = useRef<{ key: string | null; streaming: boolean }>({ key: null, streaming: false });
+  pushTargetRef.current = { key: currentTurnKey, streaming: isStreaming };
+  useEffect(() => window.kiroApi.onPromptSuggestions?.((d) => {
+    if (!d || d.sessionId !== currentSessionId) return;
+    const { key, streaming } = pushTargetRef.current;
+    if (!key || streaming) return;
+    const items = Array.isArray(d.suggestions) ? d.suggestions : [];
+    suggestionsForRef.current = key;
+    if (items.length) cacheSuggestions(key, items);
+    else suggestionCache.delete(key);
+    setDynamicSuggestions({ key: items.length ? key : null, items });
+  }), [currentSessionId]);
   /** SCHEDULING replaced loop mode. The loop declared a goal and a verifier command and
    *  iterated until the check passed -- a coding shape. The real scenarios here (weekly
    *  report, SFDC logging, oncall) are time-triggered: the previous run's result does not
@@ -5727,7 +5765,9 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   // Stamp must match the current turn, else show nothing: stale chips
                   // read as current ones, and offering follow-ups to the PREVIOUS
                   // answer is worse than offering none for a moment.
-                  : (dynamicSuggestions.key && dynamicSuggestions.key === currentTurnKey ? dynamicSuggestions.items : [])}
+                  : (dynamicSuggestions.key && dynamicSuggestions.key === currentTurnKey ? dynamicSuggestions.items
+                    /* Claude Code / Codex：这一轮没有它们自己给的（没预测 / 生成失败或超时 / 还在生成）→ 照旧那几条固定的；kiro 不变 */
+                    : fixedSuggestionFallback(engine, currentTurnKey) ? PROMPT_SUGGESTIONS : [])}
                 onDropFiles={onDropFiles}
                 onRemoveFile={onRemoveFile}
                 attachedFiles={attachedFiles}

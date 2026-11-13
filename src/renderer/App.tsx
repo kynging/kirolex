@@ -312,7 +312,8 @@ declare global {
       listHelperModels?: (opts?: { cachedOnly?: boolean }) => Promise<{ lists: import('../main/helperModels').MachineModelList[]; cachedIds: string[]; fallbackOrder: string[] }>;
       getUsage: () => Promise<{ text: string }>;
       generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => Promise<{ title?: string; error?: string; skipped?: boolean | 'engine' }>;
-      generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => Promise<{ suggestions: string[]; error?: string }>;
+      generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => Promise<{ suggestions: string[]; error?: string; source?: 'native-claude' | 'codex-exec' | 'kiro'; skipped?: string }>;
+      onPromptSuggestions?: (cb: (d: { sessionId: string; suggestions: string[] }) => void) => () => void;
       setSessionPinned: (id: string, pinned: boolean) => Promise<{ sessionId: string; pinned: boolean }>;
       getHomeDir: () => Promise<string>;
       getLogs: (maxLines?: number) => Promise<{ text: string; path: string }>;

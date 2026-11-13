@@ -225,8 +225,9 @@ export function backendHeldAtTurnStart(engine: Engine, markerHolds: boolean, tra
  * **KiroLex 自己的辅助小任务**（自动标题、追问建议、会话记忆整理）是用 kiro-cli 一次性跑的（index.ts `runLiteOneShot`）。
  * Claude Code / Codex 会话不跑：只装了这两家的机器上 kiro-cli 根本起不来（原来静默失败、记忆整理每轮重试一次），
  * 装了 kiro 的机器上则是把这条会话的内容交给另一家模型、记在 Kiro 的额度上。返回要对用户说的那句（只说一次）；kiro / 不知道是哪条会话 → null（原样跑）。
+ * 追问建议后来改成了用会话自己的引擎（`promptSuggestions.ts`），不再经过这里；标题和记忆整理仍然跳过。
  */
 export function liteHelperSkipReason(engine: Engine | undefined): string | null {
   if (!engine || engine === 'kiro') return null;
-  return tr('Auto title, follow-up suggestions and session-memory tidying run on Kiro, so they are off for this {engine} session (its content is not sent to another AI). The title is taken from your first message; session memory can still be edited by hand.', { engine: ENGINE_LABEL[engine] });
+  return tr('Auto title and session-memory tidying run on Kiro, so they are off for this {engine} session (its content is not sent to another AI). The title is taken from your first message; session memory can still be edited by hand. Follow-up suggestions come from {engine} itself.', { engine: ENGINE_LABEL[engine] });
 }

@@ -16,6 +16,8 @@ import { tr, trConcat } from './uiText.ts';
 import { NOTE_DETAIL_SEP } from './kirolexNote.ts';
 import { findEffortOption } from './engineEffort.ts';
 import { CLIENT_CAPABILITIES } from './elicitation.ts';
+import { REMOTE_TAP_MARKER, remoteClaudeTapExecLine, withClaudeSuggestionTap } from './claudeSuggestionTap.ts';
+import { promptSuggestionsFromUpdate } from './promptSuggestions.ts';
 import { busyEnterMode, isMethodNotFound, steeringParams, steeringVerdict, withoutSteering, type BusyEnterMode } from './busyEnterCaps.ts';
 import { sshErrorKind, sessionsFullMessage } from './sshMux.ts';
 import { forceKillExecutorTree, listWindowsProcesses, snapshotExecutorTree, sweepExecutorChildren, taskkillOne, taskkillTree, type TreeDeps } from './procTree.ts';
@@ -211,6 +213,8 @@ export class AcpClient extends EventEmitter {
    * 主进程在连接成功后把它记进历史 —— 一个真的起过会话的命令比任何检测结果都可信。
    */
   launchedWith?: string;
+  /** Claude Code 的执行器带上了「下一句预测」旁听（`claudeSuggestionTap.ts`）；没带的（远程 / 换成了非 js 的适配器）收不到原生预测 */
+  suggestionTap = false;
   /** 哪个引擎（kiro / claude / codex）。见 `engines.ts`：只有起进程那一步和 kiro 专有的扩展不同。 */
   readonly engine: Engine;
   /**
@@ -356,8 +360,11 @@ export class AcpClient extends EventEmitter {
           );
         } else try {
           const a = resolveAdapter(this.engine, this.env as NodeJS.ProcessEnv);
-          command = a.command;
-          args = a.args;
+          /* Claude Code：预加载旁听，把 CLI 的下一句预测转成 `_meta.promptSuggestions`（`claudeSuggestionTap.ts`，不改适配器） */
+          const tap = this.engine === 'claude' ? withClaudeSuggestionTap(a) : { ...a, tapped: false };
+          this.suggestionTap = tap.tapped;
+          command = tap.command;
+          args = tap.args;
           extraEnv = a.env;
           this.launchedWith = a.args[0] || a.command;
         } catch (err) {
@@ -459,6 +466,8 @@ export class AcpClient extends EventEmitter {
         /* 远端自报的 PID：记下来，断开时要杀它（见 buildRemoteKiroCommand 那段） */
         const pid = parseRemotePid(msg);
         if (pid) this.remotePid = pid;
+        /* 远端带上了下一句预测的旁听（`remoteClaudeTapExecLine` 打的那一行） */
+        if (msg.includes(REMOTE_TAP_MARKER)) this.suggestionTap = true;
         if (msg) {
           this.noteEarlyStderr(msg);
           this.emit('error', { type: 'stderr', message: msg });
@@ -743,6 +752,9 @@ export class AcpClient extends EventEmitter {
    * 每条 session/update（和权限请求）都带上当时最老那个的 id（`promptId`），主进程据此把输出归到对的那一轮。
    */
   private inflightPrompts: number[] = [];
+  /** 在途时先到的下一句预测（等这一轮的结束响应到了再交出去） */
+  private heldSuggestions: string[] | null = null;
+  private heldSuggestionsSession: string | undefined;
   /** 有没有在途的 session/prompt（没有的话，流过来的输出不属于任何一个 —— 前一个的响应已经到了） */
   get promptInFlight(): boolean {
     return this.inflightPrompts.length > 0;
@@ -1028,7 +1040,13 @@ export class AcpClient extends EventEmitter {
         /* 这个 session/prompt 结束了：同步摘掉，紧跟着流过来的输出就标成下一个在途的那个 */
         { const at = this.inflightPrompts.indexOf(msg.id); if (at >= 0) this.inflightPrompts.splice(at, 1);
           /* 最后一轮也结束了：还挂着的权限请求已经没人等（审计 2.1），`awaitingPermission` 复位 —— 不然下一轮的看门狗一直当它在等人。kiro 那条不动 */
-          if (at >= 0 && !this.inflightPrompts.length && this.engine !== 'kiro') this.pendingPermissions.clear(); }
+          if (at >= 0 && !this.inflightPrompts.length && this.engine !== 'kiro') this.pendingPermissions.clear();
+          /* 比这一轮的结束响应先到的下一句预测（见 handleNotification）：这一轮到这里才算结束，现在交出去 */
+          if (at >= 0 && !this.inflightPrompts.length && this.heldSuggestions) {
+            const suggestions = this.heldSuggestions;
+            this.heldSuggestions = null;
+            this.emit('prompt-suggestions', { sessionId: this.heldSuggestionsSession, suggestions });
+          } }
         if ('error' in msg) {
           // Attach the JSON-RPC error.data so callers can surface WHY (kiro-cli
           // often sends a bare "Internal error" message with the real reason in
@@ -1106,6 +1124,25 @@ export class AcpClient extends EventEmitter {
     }
 
     if (method === 'session/update') {
+      /*
+        **下一句预测**（Claude Code，`_meta.promptSuggestions`，见 promptSuggestions.ts）：单独一个事件，不进这一轮的输出。
+        空列表（清掉）随时都认，也丢掉压着的那条。
+        有内容的、但 session/prompt 还在途：它可能比这一轮的结束响应先到（旁听在 CLI 的输出上，比适配器写结束响应早一步），
+        **先压着，等最后一个在途的 prompt 结束时再交出去**（见上面处理响应那段）。过时的（新一轮已经发给 CLI 之后才到的
+        上一轮预测）在旁听那一侧就丢了（claudeSuggestionTap.ts），这里不必再按 busy 判 —— 按 busy 判会把同一块数据里
+        紧跟在结束响应后面的有效预测误丢（那时主进程的收尾还没把 busy 清掉）。
+      */
+      const suggested = promptSuggestionsFromUpdate(params?.update);
+      if (suggested) {
+        if (suggested.length && this.promptInFlight) {
+          this.heldSuggestions = suggested;
+          this.heldSuggestionsSession = params?.sessionId;
+          return;
+        }
+        this.heldSuggestions = null;
+        this.emit('prompt-suggestions', { sessionId: params?.sessionId, suggestions: suggested });
+        return;
+      }
       /*
         **适配器自己改了配置**（Claude 批准 ExitPlanMode 后离开 plan 模式、`/model` 换模型…）：ACP 用
         `config_option_update`（整份清单）/ `current_mode_update`（只报模式）通知。原来没人接，下拉一直停在旧值。
@@ -1252,6 +1289,7 @@ export class AcpClient extends EventEmitter {
     this.pendingRequests.clear();
     this.pendingPermissions.clear();
     this.inflightPrompts = [];
+    this.heldSuggestions = null;
     /* 进程没了：挂着的提问没法再回答了，卡片记成「已取消」 */
     for (const id of [...this.pendingElicitations.keys()]) {
       this.pendingElicitations.delete(id);
@@ -1306,7 +1344,9 @@ export function shellQuote(value: string): string {
 export function buildRemoteAdapterCommand(bin: string, launch?: AdapterVerdict, tag?: string): string {
   /* 带上会话标记：整棵进程树都继承它，远端清扫靠它认出崩溃 / 断网留下的适配器（`adapterSweepScript`） */
   const mark = tag && /^[\w.-]+$/.test(tag) ? `export ${ADAPTER_TAG_ENV}=${tag}; ` : '';
-  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; ${mark}${adapterExecLine(bin, launch)}`)}`;
+  /* Claude Code：能带上下一句预测的旁听就带上（`claudeSuggestionTap.ts`），带不上照旧 exec。安装后的验证起的也是这同一条 */
+  const exec = bin === REMOTE_ADAPTER_BIN.claude ? remoteClaudeTapExecLine(bin, launch, adapterExecLine(bin, launch), mark) : `${mark}${adapterExecLine(bin, launch)}`;
+  return `bash -lc ${shellQuote(`echo "${REMOTE_PID_MARKER} $$" >&2; ${exec}`)}`;
 }
 
 function buildRemoteKiroCommand(model: string, kiroAgent: string | undefined, bin: string): string {

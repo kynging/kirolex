@@ -2,6 +2,7 @@ import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
+import { createHash } from 'crypto';
 import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, setSsmTunnelResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
@@ -100,6 +101,11 @@ import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
 import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
+import { PromptSuggestionStore, SuggestionTurnLedger, parseSuggestionLines, suggestionSourceFor, suggestionsPrompt, type SuggestionSource } from './promptSuggestions.ts';
+import { CODEX_SUGGEST_TIMEOUT_MS, codexFinalMessage, codexToolAttempt, codexSuggestArgs, codexTopLevelString, localCodexLaunch, parseRemoteCodexOutput, remoteCodexSuggestScript } from './codexSuggestions.ts';
+import { remoteAdapterLaunchFor } from './remoteAdapterProbe.ts';
+import { globalModuleRoots } from './engines.ts';
+import { taskkillTree } from './procTree.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { stampCliSessionOwner, pinCliSessionOwnerBeforeRetarget, cliSessionOwnerMismatch } from './cliSessionOwner.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
@@ -1166,6 +1172,127 @@ function skipLiteHelperFor(sessionId: string | null | undefined, what: string): 
     sessionNotice(sessionId, reason, { group: 'lite-helper-skip' });
   }
   return true;
+}
+
+/** 每条会话 Claude Code 最新的下一句预测（`_meta.promptSuggestions`，执行器的 'prompt-suggestions' 事件写进来） */
+const nativeSuggestions = new PromptSuggestionStore();
+/**
+ * Codex 追问建议按「会话 + 这一轮」只生成一次（成功 / 失败 / 超时都算），切走会话再切回来、分屏重新挂载都不再起 codex。
+ * 这一轮的身份 = 渲染层交过来的对话内容的哈希：同一轮每次都一样，有了新的一轮就变（`SuggestionTurnLedger`）。
+ */
+const codexSuggestTurns = new SuggestionTurnLedger<{ suggestions: string[]; skipped?: string; error?: string }>();
+
+/**
+ * **Claude Code / Codex 会话的追问建议用它们自己的**（`promptSuggestions.ts`）：kiro / 不知道是哪条会话 → null（调用方照旧走 kiro）。
+ * 这两家**不起 kiro-cli**，Claude Code 也不起 codex、Codex 也不起 claude —— 会话内容只交给它自己那一家。
+ * 拿不到（这一轮没有预测 / codex 失败或超时）就是空列表：输入框上面照旧（不重试、不回退到 kiro）。
+ */
+async function engineOwnSuggestions(sessionId: string | null | undefined, convo: string): Promise<{ suggestions: string[]; source: SuggestionSource; skipped?: string; error?: string } | null> {
+  if (!sessionId) return null;
+  let profile: AgentProfile | undefined;
+  try { profile = sessionClients.get(sessionId)?.profile || store.readRecord(sessionId)?.profile; } catch { /* 读不到 = 不知道 */ }
+  const source = suggestionSourceFor(profile ? engineOf(profile) : undefined);
+  if (source === 'kiro' || !profile) return null;
+  if (source === 'native-claude') {
+    const suggestions = nativeSuggestions.get(sessionId);
+    if (suggestions.length) {
+      logger.info('suggestions', `source=native-claude generated ${suggestions.length} sessionId=${sessionId}`);
+      return { suggestions, source };
+    }
+    const entry = sessionClients.get(sessionId);
+    const why = !entry ? 'executor not attached'
+      : !entry.client.suggestionTap ? (entry.profile.remote?.sshHost ? 'remote session: prediction relay not available on that machine (adapter entry is not a js file, or its node has no --import)' : 'adapter not launched as a js entry: no prediction relay')
+      : 'Claude Code has not predicted a next prompt for this turn (first turn / API error / plan mode / usage limit / adapter < 0.94); it is shown if one arrives';
+    logger.info('suggestions', `skipped source=native-claude sessionId=${sessionId} reason=${why} —— 不调 kiro / codex`);
+    return { suggestions: [], source, skipped: 'no-prediction' };
+  }
+  const turn = createHash('sha1').update(convo).digest('hex');
+  const { result, reused } = codexSuggestTurns.run(sessionId, turn, () => codexExecSuggestions(sessionId, convo, profile!));
+  if (reused) logger.info('suggestions', `skipped source=codex-exec sessionId=${sessionId} reason=already generated (or tried) for this turn —— 用记下的结果，不再起 codex`);
+  return { ...(await result), source };
+}
+
+/** Codex 会话：同一台机器上 `codex exec`，同一个 model / provider，effort low、只读、不联网（`codexSuggestions.ts`） */
+async function codexExecSuggestions(sessionId: string, convo: string, profile: AgentProfile): Promise<{ suggestions: string[]; skipped?: string; error?: string }> {
+  const entry = sessionClients.get(sessionId);
+  const model = entry?.client.modelOptions?.current || profile.engineModels?.codex || undefined;
+  const remote = sessionRemote(entry?.profile.remote || profile.remote).remote;
+  const prompt = suggestionsPrompt(convo);
+  const started = Date.now();
+  try {
+    let out: string;
+    let where: string;
+    let provider: string | undefined;
+    if (remote?.sshHost) {
+      /* 远程会话：在那台机器上跑（provider 读那台机器的 config.toml），prompt 走 stdin */
+      where = remote.label || remote.sshHost;
+      const raw = await runRemoteCapture(remote, remoteCodexSuggestScript({ model, codexBin: remote.bins?.codex, launch: remoteAdapterLaunchFor(remote, 'codex') }), CODEX_SUGGEST_TIMEOUT_MS, undefined, prompt);
+      const parsed = parseRemoteCodexOutput(raw);
+      if (parsed === null) throw new Error(`no output on ${where}: ${raw.trim().slice(0, 200) || '(empty)'}`);
+      out = parsed;
+    } else {
+      where = 'local';
+      const override = String(shellEnv.KIROLEX_CODEX_ACP || '');
+      const launch = localCodexLaunch({
+        env: shellEnv, adapterEntry: /\.(c|m)?js$/i.test(override) ? override : findAdapterEntry('codex', shellEnv),
+        globalRoots: globalModuleRoots(shellEnv), exists: (p) => { try { return fs.existsSync(p); } catch { return false; } },
+        execPath: process.execPath, platform: process.platform,
+      });
+      if (!launch) throw new Error('codex not found (no CODEX_PATH, no @openai/codex next to codex-acp or in the global node_modules)');
+      try {
+        const codexHome = expandHome(shellEnv.CODEX_HOME) || path.join(os.homedir(), '.codex');
+        provider = codexTopLevelString(fs.readFileSync(path.join(codexHome, 'config.toml'), 'utf-8'), 'model_provider');
+      } catch { /* 没有 config.toml：codex 用它自己的默认，和适配器一样 */ }
+      out = await runCodexExecLocal(launch, codexSuggestArgs({ model, provider, cwd: os.tmpdir() }), prompt);
+    }
+    /* 只要最后那条回答；中途调过任何工具 → 作废（codexFinalMessage 抛错） */
+    const answer = codexFinalMessage(out);
+    if (!answer.trim()) throw new Error('codex gave no answer');
+    const suggestions = parseSuggestionLines(answer);
+    logger.info('suggestions', `source=codex-exec generated ${suggestions.length} sessionId=${sessionId} on=${where} model=${model || '(default)'} provider=${remote?.sshHost ? '(remote config)' : provider || '(default)'} ${Date.now() - started}ms`);
+    return { suggestions };
+  } catch (err: any) {
+    logger.warn('suggestions', `source=codex-exec failed sessionId=${sessionId} after ${Date.now() - started}ms: ${err?.killed ? 'timeout/killed ' : ''}${err?.message || err} —— 保持固定建议，不重试、不交给 kiro`);
+    return { suggestions: [], error: err?.message || 'failed' };
+  }
+}
+
+/**
+ * 本机跑一次 `codex exec --json`：prompt 走 stdin，45 秒到点连同它起的 codex 子进程一起结束（Windows 上杀 node 不会带走子进程）。
+ * 输出里一出现工具调用的事件（`codexToolAttempt`）就当场按树结束、整次作废。
+ */
+function runCodexExecLocal(launch: { command: string; args: string[]; env: Record<string, string>; shell?: boolean }, args: string[], stdin: string): Promise<string> {
+  return new Promise((resolve, reject) => {
+    let timedOut = false;
+    let toolTried: string | null = null;
+    const child = execFile(launch.command, [...launch.args, ...args],
+      { env: { ...shellEnv, ...launch.env }, maxBuffer: 1024 * 1024, windowsHide: true, encoding: 'utf8', ...(launch.shell ? { shell: true } : {}) },
+      (err, stdout) => {
+        clearTimeout(timer);
+        if (toolTried) reject(new Error(`codex tried to call a tool (${toolTried}); stopped, result discarded`));
+        else if (timedOut) reject(Object.assign(new Error(`timed out after ${CODEX_SUGGEST_TIMEOUT_MS / 1000}s`), { killed: true }));
+        else if (err) reject(err);
+        else resolve(String(stdout || ''));
+      });
+    /* 自己计时：execFile 的 timeout 只杀 node 那一层，Windows 上它起的 codex 会留下来 —— 趁父进程还在，按树结束 */
+    const timer = setTimeout(() => {
+      timedOut = true;
+      stop();
+    }, CODEX_SUGGEST_TIMEOUT_MS);
+    const stop = () => { if (process.platform === 'win32' && child.pid) void taskkillTree(child.pid); else child.kill('SIGTERM'); };
+    let partial = '';
+    child.stdout?.on('data', (chunk: string | Buffer) => {
+      if (toolTried) return;
+      partial += String(chunk);
+      const lines = partial.split(/\r?\n/);
+      partial = lines.pop() || '';
+      for (const line of lines) {
+        const tool = codexToolAttempt(line);
+        if (tool) { toolTried = tool; stop(); return; }
+      }
+    });
+    try { child.stdin?.end(stdin); } catch { /* 已经退了 */ }
+  });
 }
 
 async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
@@ -8337,6 +8464,18 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     /* 替你回答了一个不认识的请求：影响这一轮的结果，记进对话记录（acp:error 渲染层只打控制台） */
     if (error?.type === 'unknown-request') noteInSession(sessionId, String(error.message || ''), undefined, `unknown-request:${String(error.method || '')}`);
   });
+  /*
+    **Claude Code 的下一句预测**（`_meta.promptSuggestions`，见 promptSuggestions.ts）：按会话存最新一条，推给界面换掉追问建议；
+    空列表 = 清掉。过时的（下一轮已经开始才到的）在旁听和 acp-client 那两层判掉了；这里**不按 busy 判** —— 结束响应和预测
+    同一块数据到达时，这一轮的收尾还没把 busy 清掉，按它判会把这一轮的有效预测误丢。
+  */
+  client.on('prompt-suggestions', (d: { suggestions?: string[] }) => {
+    if (superseded()) return;
+    const list = Array.isArray(d?.suggestions) ? d.suggestions.slice(0, 3) : [];
+    nativeSuggestions.set(sessionId, list);
+    logger.info('suggestions', `source=native-${engineOf(entry.profile)} received ${list.length} sessionId=${sessionId}`);
+    mainWindow?.webContents.send('acp:prompt-suggestions', { sessionId, suggestions: list });
+  });
   /* 接线之前（connect / newSession / loadSession 期间）的 stderr —— MCP 初始化失败就在这一段 */
   for (const message of client.takeEarlyStderr()) reportStderr(message);
   client.on('disconnected', () => {
@@ -10490,6 +10629,8 @@ ${hint}` : ''}` };
       sessionNotice(sessionId, tr('⏳ This message will be sent once the switch finishes.'));
     }
     if (attempt === 0) await pendingSwitchRunner.settle(sessionId);
+    /* 上一轮的下一句预测到这里就过时了（这一轮结束后 Claude Code 会再给新的） */
+    if (attempt === 0) nativeSuggestions.clear(sessionId);
     /* 开过几轮（纠正那一轮不算）—— 排着的「写成文字」纠正据此判过时，见 `textToolNudgeStale` */
     if (attempt === 0 && !isTextToolNudgeId(display?.messageId)) turnStarts.set(sessionId, (turnStarts.get(sessionId) || 0) + 1);
     if (attempt === 0 && isUserTurnMessageId(display?.messageId)) userTurnStarts.set(sessionId, (userTurnStarts.get(sessionId) || 0) + 1);
@@ -15585,21 +15726,16 @@ ${hint}` : ''}` };
       上游（渲染进程）也会过滤，但这里不能依赖它：再多一个调用点，漏的就是那一个。
     */
     const convo = stripKirolexNotes(String(recentConvo || '')).slice(0, 4000);
-    if (!convo.trim()) return { suggestions: [] };
-    /* Claude Code / Codex 会话不交给 kiro 生成追问建议（输入框上面照常是那几条固定的） */
-    if (skipLiteHelperFor(meta?.sessionId, 'suggestions')) return { suggestions: [], skipped: 'engine' };
-    const prompt = `Based on the conversation below, propose 3 short follow-up prompts the user might send next. Each must be a concrete, actionable next step in the SAME language as the conversation, max 12 words, no numbering, no quotes. Reply with ONLY the 3 prompts, one per line.\n\n${convo}`;
+    if (!convo.trim()) { logger.info('suggestions', `skipped sessionId=${meta?.sessionId || '?'} reason=nothing to base suggestions on (empty conversation)`); return { suggestions: [] }; }
+    /* Claude Code / Codex 会话用它们自己的（原生预测 / codex exec），不交给 kiro（`engineOwnSuggestions`） */
+    const own = await engineOwnSuggestions(meta?.sessionId, convo);
+    if (own) return own;
+    const prompt = suggestionsPrompt(convo);
     try {
       const stdout = await runLiteOneShot(prompt, 'suggestions');
       const clean = cleanLiteOutput(stdout);
-      const suggestions = clean
-        .split('\n')
-        // Per line, on top of the leading marker cleanLiteOutput already removed:
-        // list bullets/numbering, and a marker on any line but the first.
-        .map((l) => l.replace(/^\s*(?:>\s*)?[-*\d.)、]*\s*/, '').replace(/^["'“”「『]+|["'“”」』]+$/g, '').trim())
-        .filter((l) => l.length > 0 && l.length <= 80)
-        .slice(-3);
-      logger.info('suggestions', `generated ${suggestions.length}`);
+      const suggestions = parseSuggestionLines(clean);
+      logger.info('suggestions', `source=kiro generated ${suggestions.length}`);
       return { suggestions };
     } catch (err: any) {
       // Never fail silently: a killed/timed-out one-shot used to look exactly
