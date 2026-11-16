@@ -65,6 +65,7 @@ import {
 } from './cloudTrash.ts';
 import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
 import { attachCheckpoint, resumeOrFresh, AttachCancelled, type AttachLiveness } from './attachCancel.ts';
+import { lateEventGate, adoptUnlessDeleted } from './lateSessionEvents.ts';
 import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restoreRemote } from './restoreArchive.ts';
 import { knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from './projectSanity.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
@@ -926,7 +927,7 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
         ...entry, client, profile, lastUsedAt: Date.now(),
         assistantBuf: '', assistantMsgId: null, fileChanges: [],
       };
-      sessionClients.set(sessionId, next);
+      adoptExecutor(sessionId, next, 'model fallback');
       wireSession(sessionId, next);
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       /* 项目归属以盘上为准：这一轮中途移出项目时 entry 里还是旧项目，整份写回就把移出撤销了 */
@@ -948,6 +949,8 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       emitSessionModel(sessionId, model);
       return model;
     } catch (err: any) {
+      /* 等待期间会话被删了：不再试下一个候选 */
+      if (err instanceof SessionDeletedError) return null;
       logger.warn('model', `${label}: fallback '${model}' failed to take over: ${err?.message || err}`);
       try { await client.disconnect(); } catch {}
     }
@@ -3899,6 +3902,8 @@ function movedFilesNote(previous: string[]): string {
  */
 function sessionFilesDir(sessionId: string): string {
   const dir = path.join(getSessionDir(sessionId), SESSION_FILES_DIR);
+  /* 删掉的会话：recursive 的 mkdir 会连会话目录一起建回来 —— 不建 */
+  if (store.wouldResurrect(sessionId)) return dir;
   try { fs.mkdirSync(dir, { recursive: true }); } catch { /* 建不了就让执行器自己报 cwd 不存在 */ }
   return dir;
 }
@@ -4931,6 +4936,42 @@ function withLoadTimeout<T>(p: Promise<T>, ms = LOAD_TIMEOUT_MS, what = 'session
 // closed (it reappears after restart via disk hydrate). In-memory only: after a
 // restart the dir is gone so hydrate never re-adds it.
 const deletedSessionIds = new Set<string>();
+/*
+  **删掉的会话不许再建出记录 / 再挂上执行器**（lateSessionEvents.ts）：适配器迟到的 session/new 返回、session update
+  到的时候它已经删了 —— 直接丢掉、断开。存储层也守一道：目录不在、id 又删过的，不许写 record.json。
+*/
+store.setDeletedSessionCheck((id) => deletedSessionIds.has(id) || loadSessionTombstones().includes(id));
+/** 删掉了（这次运行里删的，或者墓碑里有）—— 不看目录在不在：删除进行中、目录还没挪走的也算 */
+function sessionDeleted(id: string): boolean {
+  return deletedSessionIds.has(id) || loadSessionTombstones().includes(id);
+}
+/** ensureAttached 用：删掉的会话（删除集合 / 墓碑）不挂、不重连；还登记着执行器的话摘掉 */
+function refuseDeletedAttach(sid: string): boolean {
+  if (sessionDeleted(sid)) deletedSessionIds.add(sid);
+  return lateEvents.drop(sid, 'ensureAttached', () => { if (sessionClients.has(sid)) void detachExecutor(sid, { killTree: true }); });
+}
+/** 等 connect / session/load 期间会话被删了：执行器不登记 —— 换模型 / 换 agent / 换机器 / 回滚 / attach 都走 `adoptExecutor` */
+class SessionDeletedError extends Error {}
+/**
+ * **登记执行器的唯一入口**（acp:new-session 在 session/new 回来那一刻另有一道门）：会话已删（删除集合 / 墓碑）→
+ * 不登记，断开这个刚起来的执行器、收掉它的本地工具通道，记 late event，抛 `SessionDeletedError`。
+ */
+function adoptExecutor(sessionId: string, entry: SessionEntry, what: string): void {
+  if (sessionDeleted(sessionId)) deletedSessionIds.add(sessionId);
+  const adopted = adoptUnlessDeleted(lateEvents, sessionId, what, {
+    register: () => { sessionClients.set(sessionId, entry); },
+    discard: () => {
+      void entry.client.disconnect().catch(() => { /* 已经没了 */ });
+      releaseLocalTools(sessionId, entry.profile.remote);
+    },
+  });
+  if (!adopted) throw new SessionDeletedError(tr('This session has been deleted'));
+}
+const lateEvents = lateEventGate({
+  /* 只看内存里的集合：每个流式块都要过这道门，不能每次读墓碑文件（启动时墓碑已经并进了 deletedSessionIds） */
+  isDeleted: (id) => deletedSessionIds.has(id),
+  log: (line) => logger.info('delete-session', line),
+});
 /**
  * 正在 attach 的会话登记的检查点（attachCancel.ts）：`connectWithModelFallback` 每试一个候选模型之前调一次 ——
  * 第一个连不上的那几秒里会话被删了 / 归档了，就不再试下一个。只有 loadSessionImpl 登记（试完就去掉）。
@@ -6959,6 +7000,8 @@ function containedPath(base: string, rel: string): string | null {
  * 但下载 / 列文件 / 拉文件都要等，这期间可能开始了新一轮 —— 断开执行器、改写之前紧挨着再查一次，忙了就不动，下一轮再合。
  */
 async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, sessionId: string): Promise<BucketMergeResult> {
+  /* 删掉的会话不合并（等网络期间删的，runBucketMerge 每次等完再问 —— isDeleted） */
+  if (sessionDeleted(sessionId)) return { added: 0, pulledFiles: 0, gone: true };
   const sdir = getSessionDir(sessionId);
   const tAbs = path.join(sdir, 'transcript.jsonl');
   const rAbs = path.join(sdir, 'record.json');
@@ -6989,12 +7032,15 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
     /* 正在跑一轮 / 后台自主轮 / 正在接上 / 正在换执行器：都不能断开、不能改写 */
     isBusy: () => !!sessionClients.get(sessionId)?.busy || !!sessionClients.get(sessionId)?.autonomous
       || attachingSessions.has(sessionId) || reconfiguringSessions.has(sessionId),
+    isDeleted: () => sessionDeleted(sessionId),
     /* 只新增本机没有的文件，不碰 transcript / record —— 这一步等网络，之后还会再查一次忙不忙 */
     pullFiles: async () => {
       let pulled = 0;
       for (const p of toPull) {
         if (fs.existsSync(p.abs)) continue;
         const body = await getObject(creds, p.key);
+        /* 下载期间会话被删了：mkdir 会把 sessions/<id>/ 重新建出来 —— 停 */
+        if (sessionDeleted(sessionId)) break;
         if (fs.existsSync(p.abs)) continue;
         fs.mkdirSync(path.dirname(p.abs), { recursive: true });
         fs.writeFileSync(p.abs, body);
@@ -7257,73 +7303,84 @@ function isOffloadedPlaceholder(id: string): boolean {
  * 中途失败：暂存目录删掉、正式目录不出现、占位保留，下次可以再点。返回值和 s3:restore 同形状。
  */
 async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Promise<any> {
-  const { creds, problem } = await resolveSyncCredsNow();
-  if (problem) return { ok: false, error: problem };
-  const placeholder = readOffloadState(OFFLOAD_STATE_PATH).offloaded[id];
-  if (!placeholder) return { ok: false, error: tr('This session is not in the cloud-only list.') };
-  logger.info('offload', `下载回本机 ${id}（先下到暂存目录，全部成功才放进 sessions/）`);
-  const r = await restoreOffloadedSession(bucketOps(creds!), {
-    home: KIROLEX_HOME, id, stateFile: OFFLOAD_STATE_PATH, now: Date.now(),
-    /* 按占位记下的云端位置审（移走之后改了前缀也一样）—— 和 s3:restore 同一道 */
-    vet: async (objects, cloudKey) => refuseAdvancedBackup(creds!, cloudKey, objects, id),
-  });
-  if (!r.ok) {
-    logger.warn('offload', `下载回本机 ${id} 失败（占位保留，本机没留半份）：${r.why}`);
-    return { ok: false, error: r.why, ...(r.gone ? { gone: true } : null) };
-  }
-  /*
-    运行位置按**本机**移走之前的那份记录（回收站里）：云端那份如果是别的电脑后来改过的，里面的机器配置是那台的。
-    回收站里那份读不到 → 和 s3:restore 一样，远程会话改成在本机跑。
-  */
-  /*
-    候选机器：本机移走之前那份（回收站）记录里的；那份读不到就用云端这份里的。再按**本机现在的设置**判
-    （`restoreRunPlan`，和 s3:restore 同一条）：认得就留在那台、提示「仍在 <机器名> 上跑」，不认得才改本机跑 ——
-    否则设置里已经删掉的机器会被留下、attach 时拒连，或者设置里还在的机器被白白清掉。
-  */
-  let madeLocal = false;
-  let keptRemote: string | undefined;
-  const cur = store.readRecord(id);
-  if (cur) {
-    let before: any = null;
-    try { before = placeholder.trashDir ? JSON.parse(fs.readFileSync(path.join(placeholder.trashDir, 'record.json'), 'utf-8')) : null; } catch { before = null; }
-    const want = before ? before.profile?.remote : cur.profile?.remote;
-    const plan = restoreRunPlan(want ? sessionRemote(want) : undefined, !!want?.sshHost, (h) => labelForHost(KIROLEX_CONFIG_PATH, h));
-    const next = plan.kind === 'keep' ? want : undefined;
-    if (plan.kind === 'keep') keptRemote = plan.label;
-    if (plan.kind === 'local') madeLocal = true;
-    if (JSON.stringify(cur.profile?.remote ?? null) !== JSON.stringify(next ?? null)) {
-      const profile = { ...cur.profile } as any;
-      if (next) profile.remote = next; else delete profile.remote;
-      store.writeRecordKeepUpdatedAt({ ...cur, profile, id });
+  /* 和 s3:restore 同一套，第一个 await 之前就登记：等凭证 / 下载期间被删（purgeSession → cancelRestore）→ 不发布、不收尾、不写记录 */
+  const restore = store.beginRestore(id);
+  try {
+    const { creds, problem } = await resolveSyncCredsNow();
+    if (problem) return { ok: false, error: problem };
+    const placeholder = readOffloadState(OFFLOAD_STATE_PATH).offloaded[id];
+    if (!placeholder) return { ok: false, error: tr('This session is not in the cloud-only list.') };
+    logger.info('offload', `下载回本机 ${id}（先下到暂存目录，全部成功才放进 sessions/）`);
+    const r = await restoreOffloadedSession(bucketOps(creds!), {
+      home: KIROLEX_HOME, id, stateFile: OFFLOAD_STATE_PATH, now: Date.now(),
+      /* 按占位记下的云端位置审（移走之后改了前缀也一样）—— 和 s3:restore 同一道 */
+      vet: async (objects, cloudKey) => refuseAdvancedBackup(creds!, cloudKey, objects, id),
+      deleted: () => restore.cancelled(),
+    });
+    if (!r.ok && r.deleted) {
+      logger.info('delete-session', `late event for deleted session ${id} (offload restore) ignored`);
+      return { ok: false, error: tr('This session has been deleted') };
     }
-  }
-  let origin: string | undefined;
-  const placedRec = store.readRecord(id);
-  if (placedRec) {
+    if (!r.ok) {
+      logger.warn('offload', `下载回本机 ${id} 失败（占位保留，本机没留半份）：${r.why}`);
+      return { ok: false, error: r.why, ...(r.gone ? { gone: true } : null) };
+    }
     /*
-      **位置和点开之前侧栏里那一行一样**（第 3 轮：「两条在 catalog 里 archived=true，下载后『放进未分组』、record 里 archived 丢了」）。
-      原来这里按 s3:restore 的规则（restoreTarget，entry: undefined、putBack: false）：项目一律清掉进未分组，归档只看下载下来的
-      record.json —— 桶里那份比 catalog / 占位记下的位置旧时，归档的就被放了出来、能连接了。现在按 placeholderPlacement：
-      占位（catalog）和记录谁的 placementChangedAt 新听谁，一样新时归档取「或」；项目本机有就放回，没有才进未分组。
+      运行位置按**本机**移走之前的那份记录（回收站里）：云端那份如果是别的电脑后来改过的，里面的机器配置是那台的。
+      回收站里那份读不到 → 和 s3:restore 一样，远程会话改成在本机跑。
     */
-    const rt = placeholderPlacement(placedRec, placeholder,
-      knownProjects(uiState()['kirolex-projects']) || new Set<string>(), store.isAdvancedOnlyProjectName);
-    origin = rt.origin;
-    const next = applyPlacement(placedRec, rt.placement);
-    if (rt.unassigned) next.profile = { ...next.profile, unassigned: true };
-    else if (next.profile?.unassigned) { const { unassigned: _u, ...rest } = next.profile; next.profile = rest; }
-    if (JSON.stringify(next) !== JSON.stringify(placedRec)) store.writeRecordKeepUpdatedAt({ ...next, id });
-    logger.info('offload', `${id}：放进「${rt.placement.projectId || '未分组'}」${rt.placement.archived ? '（已归档：只读，不连接后端）' : ''}`
-      + `${origin && origin !== rt.placement.projectId ? `（原来在「${origin}」，本机没有这个项目）` : ''}`);
+    /*
+      候选机器：本机移走之前那份（回收站）记录里的；那份读不到就用云端这份里的。再按**本机现在的设置**判
+      （`restoreRunPlan`，和 s3:restore 同一条）：认得就留在那台、提示「仍在 <机器名> 上跑」，不认得才改本机跑 ——
+      否则设置里已经删掉的机器会被留下、attach 时拒连，或者设置里还在的机器被白白清掉。
+    */
+    let madeLocal = false;
+    let keptRemote: string | undefined;
+    const cur = store.readRecord(id);
+    if (cur) {
+      let before: any = null;
+      try { before = placeholder.trashDir ? JSON.parse(fs.readFileSync(path.join(placeholder.trashDir, 'record.json'), 'utf-8')) : null; } catch { before = null; }
+      const want = before ? before.profile?.remote : cur.profile?.remote;
+      const plan = restoreRunPlan(want ? sessionRemote(want) : undefined, !!want?.sshHost, (h) => labelForHost(KIROLEX_CONFIG_PATH, h));
+      const next = plan.kind === 'keep' ? want : undefined;
+      if (plan.kind === 'keep') keptRemote = plan.label;
+      if (plan.kind === 'local') madeLocal = true;
+      if (JSON.stringify(cur.profile?.remote ?? null) !== JSON.stringify(next ?? null)) {
+        const profile = { ...cur.profile } as any;
+        if (next) profile.remote = next; else delete profile.remote;
+        store.writeRecordKeepUpdatedAt({ ...cur, profile, id });
+      }
+    }
+    let origin: string | undefined;
+    const placedRec = store.readRecord(id);
+    if (placedRec) {
+      /*
+        **位置和点开之前侧栏里那一行一样**（第 3 轮：「两条在 catalog 里 archived=true，下载后『放进未分组』、record 里 archived 丢了」）。
+        原来这里按 s3:restore 的规则（restoreTarget，entry: undefined、putBack: false）：项目一律清掉进未分组，归档只看下载下来的
+        record.json —— 桶里那份比 catalog / 占位记下的位置旧时，归档的就被放了出来、能连接了。现在按 placeholderPlacement：
+        占位（catalog）和记录谁的 placementChangedAt 新听谁，一样新时归档取「或」；项目本机有就放回，没有才进未分组。
+      */
+      const rt = placeholderPlacement(placedRec, placeholder,
+        knownProjects(uiState()['kirolex-projects']) || new Set<string>(), store.isAdvancedOnlyProjectName);
+      origin = rt.origin;
+      const next = applyPlacement(placedRec, rt.placement);
+      if (rt.unassigned) next.profile = { ...next.profile, unassigned: true };
+      else if (next.profile?.unassigned) { const { unassigned: _u, ...rest } = next.profile; next.profile = rest; }
+      if (JSON.stringify(next) !== JSON.stringify(placedRec)) store.writeRecordKeepUpdatedAt({ ...next, id });
+      logger.info('offload', `${id}：放进「${rt.placement.projectId || '未分组'}」${rt.placement.archived ? '（已归档：只读，不连接后端）' : ''}`
+        + `${origin && origin !== rt.placement.projectId ? `（原来在「${origin}」，本机没有这个项目）` : ''}`);
+    }
+    const placedNow = store.readRecord(id);
+    forgetDeletion(S3_DELETED_AT_PATH, id);
+    logger.info('offload', `已从云端下载回本机 ${id}：${r.alreadyLocal ? '上次已经下完，只补了收尾' : `${r.files} 个文件 / ${(r.bytes / 1024 / 1024).toFixed(1)} MB`}，占位删掉，最后活动重新计时`);
+    mainWindow?.webContents.send('offload:changed', {});
+    return {
+      ok: true, restored: r.files, backedUp: null, memoryFiles: 0, madeLocal, keptRemote, projectId: placedNow?.profile?.projectId || undefined,
+      ...(origin ? { origin } : {}),
+    };
+  } finally {
+    restore.end();
   }
-  const placedNow = store.readRecord(id);
-  forgetDeletion(S3_DELETED_AT_PATH, id);
-  logger.info('offload', `已从云端下载回本机 ${id}：${r.alreadyLocal ? '上次已经下完，只补了收尾' : `${r.files} 个文件 / ${(r.bytes / 1024 / 1024).toFixed(1)} MB`}，占位删掉，最后活动重新计时`);
-  mainWindow?.webContents.send('offload:changed', {});
-  return {
-    ok: true, restored: r.files, backedUp: null, memoryFiles: 0, madeLocal, keptRemote, projectId: placedNow?.profile?.projectId || undefined,
-    ...(origin ? { origin } : {}),
-  };
 }
 
 /**
@@ -7528,6 +7585,11 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       if (live?.busy) { conflictIds.add(c.id); continue; }
       try {
         const r = await mergeBucketSession(creds!, cfg.prefix, c.id);
+        if (r.gone) {
+          /* 合并期间（或之前）这条被删了：什么都没写；不记「看过了」、不走旁路 */
+          logger.info('delete-session', `late event for deleted session ${c.id} (s3 merge) ignored`);
+          continue;
+        }
         if (r.deferred) {
           /* 等网络期间开始了新一轮：没断开、没改写；不记「看过了」，和一开始就忙的一样走旁路、下一轮再合 */
           conflictIds.add(c.id);
@@ -8165,6 +8227,10 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       if (q.client === client && q.card.requestId === d.requestId) closeQuestion(id, d.reason === 'withdrawn' ? 'withdrawn' : 'cancelled');
     }
   });
+  /* 会话已经删了（available_commands_update 之类迟到的 session update）：丢掉；还挂着的执行器摘掉（lateSessionEvents.ts） */
+  const lateUpdateForDeleted = (data: any): boolean => lateEvents.drop(sessionId, String(data?.update?.sessionUpdate || data?.update?.method || 'session/update'), () => {
+    if (sessionClients.get(sessionId)?.client === client) void detachExecutor(sessionId, { killTree: true });
+  });
   let onUpdate: (data: any, replayed?: boolean) => void;
   /*
     **属于排在后面那一轮的输出先攒着**（`followUpTurns.holdTarget`）：前一轮的响应到了以后、接手的那一轮清零计数之前流过来的，
@@ -8177,6 +8243,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       const hold = holdTarget(entry, data, client.promptInFlight);
       if (hold) { hold.held.push(data); return; }
     }
+    if (lateUpdateForDeleted(data)) return;
     // A background history-priming turn's output must never surface: don't
     // forward to the UI, accumulate, or persist it.
     //
@@ -9022,6 +9089,11 @@ function getSessionDir(sessionId?: string): string {
   const id = sessionId || `session_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
   const dir = path.join(sessionsBaseDir, id);
   if (!fs.existsSync(dir)) {
+    /* 删掉的会话不重建目录（建了目录，后面写 record.json 那道关就拦不住了）：只给路径 */
+    if (sessionId && store.wouldResurrect(sessionId)) {
+      logger.warn('delete-session', `getSessionDir: ${sessionId} was deleted; not recreating its directory`);
+      return dir;
+    }
     fs.mkdirSync(dir, { recursive: true });
   }
   return dir;
@@ -9416,6 +9488,24 @@ app.whenReady().then(async () => {
         + `${skippedAdvanced.length ? `; skipped ${skippedAdvanced.length} KiroLex Advanced session(s)` : ''}`);
     }
   } catch {}
+  /*
+    **删除后又被迟到的回调建出来的空壳收回回收站**（判据见 `store.findResurrectedShells`）：修好之前留下的那几条
+    （advanced 删了「周报」的执行会话，几秒后它们以「New Chat」复活，标准版里冒出了「周报」项目）。
+    墓碑 + 压住先做（同步）：后面的 hydrate / attach 都看得见；然后挪进回收站（新时间戳）。
+  */
+  try {
+    for (const shell of store.findResurrectedShells(SESSION_TRASH_DIR)) {
+      addSessionTombstone(shell.id);
+      deletedSessionIds.add(shell.id);
+      const err = await moveDirToTrash(path.join(sessionsBaseDir, shell.id), {
+        trashDir: SESSION_TRASH_DIR,
+        name: shell.id,
+        log: (level, msg) => logger[level]('delete-session', msg),
+      });
+      logger.warn('delete-session', `${shell.id}: resurrected empty "New Chat" after a delete (trashed copy from ${new Date(shell.trashedAt).toISOString()})`
+        + ` -> ${err ? `could not move it to trash yet (${err}); tombstoned, will retry at next start` : 'moved to trash'}, not attaching`);
+    }
+  } catch (err: any) { logger.warn('delete-session', `resurrected-shell sweep failed: ${err?.message || err}`); }
 
   // Sweep leftovers nothing else owns:
   //   *.bak / *.bak.<ts>  — one-off backups from past migrations/scripts. Nothing in
@@ -10074,27 +10164,29 @@ ${hint}` : ''}` };
   /* 同一份实现也给侧栏 ☁ 占位的「下载回本机」用（offload:restore） */
   let s3RestoreImpl: (_event: unknown, sessionId: string, opts?: { putBack?: boolean }) => Promise<any>;
   ipcMain.handle('s3:restore', s3RestoreImpl = async (_event, sessionId: string, opts?: { putBack?: boolean }) => {
-    const { creds, problem, cfg } = await resolveSyncCredsNow();
-    if (problem) return { ok: false, error: problem };
-    if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
-    { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
-    /* ☁ 占位：暂存下载，全成功才发布 */
-    if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId, opts);
-    /*
-      **连着的先断开，不再让人手动去断** —— 恢复现在是合并（同 id 去重、按时间排），
-      断开之后执行器手上那份不会再写盘，合并完下次打开按记录重新接上。
-      只有**正在跑一轮**的才拒：那一轮的产出还没落盘，这时候断开会把它弄丢。
-    */
-    const live = sessionClients.get(sessionId);
-    if (live?.busy) {
-      return { ok: false, error: tr('This session is in the middle of a turn. Wait for it to finish before restoring, or the unsaved part of this turn will be lost.') };
-    }
-    if (live) {
-      logger.info('s3', `恢复前先断开 sessionId=${sessionId}（它连着执行器，内存里那份会把恢复的内容盖回去）`);
-      detachExecutor(sessionId);
-      mainWindow?.webContents.send('session:detached-for-restore', { sessionId });
-    }
+    const restore = store.beginRestore(String(sessionId || ''));
     try {
+      const { creds, problem, cfg } = await resolveSyncCredsNow();
+      if (problem) return { ok: false, error: problem };
+      if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
+      { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
+      restore.check();
+      /* ☁ 占位：暂存下载，全成功才发布 */
+      if (isOffloadedPlaceholder(sessionId)) return offloadRestoreImpl(sessionId, opts);
+      /*
+        **连着的先断开，不再让人手动去断** —— 恢复现在是合并（同 id 去重、按时间排），
+        断开之后执行器手上那份不会再写盘，合并完下次打开按记录重新接上。
+        只有**正在跑一轮**的才拒：那一轮的产出还没落盘，这时候断开会把它弄丢。
+      */
+      const live = sessionClients.get(sessionId);
+      if (live?.busy) {
+        return { ok: false, error: tr('This session is in the middle of a turn. Wait for it to finish before restoring, or the unsaved part of this turn will be lost.') };
+      }
+      if (live) {
+        logger.info('s3', `恢复前先断开 sessionId=${sessionId}（它连着执行器，内存里那份会把恢复的内容盖回去）`);
+        detachExecutor(sessionId);
+        mainWindow?.webContents.send('session:detached-for-restore', { sessionId });
+      }
       const prefix = `${keyFor(cfg.prefix, path.join('sessions', sessionId))}/`;
       const objects = await listObjects(creds!, prefix);
       if (!objects.length) return backupGoneReply(creds!, cfg.prefix, sessionId);
@@ -10118,6 +10210,7 @@ ${hint}` : ''}` };
         **动手之前先把本地那份挪走** —— 合并也一样：合并是个算法，算法会有 bug，
         而"选了合并"不等于"愿意拿这条会话赌一次"。挪进 trash 的代价只是一点磁盘。
       */
+      restore.check();
       let backedUp: string | null = null;
       if (existed) {
         backedUp = trashDirFor(KIROLEX_HOME, sessionId);
@@ -10138,6 +10231,7 @@ ${hint}` : ''}` };
         if (!rel) continue;                                  // 不属于这个布局 / 含 `..`
         const abs = path.join(KIROLEX_HOME, rel);
         const body = await vetted.get(obj.key);
+        restore.check();
         const base = path.basename(rel);
 
         if (existed && base === 'transcript.jsonl') {
@@ -10183,6 +10277,7 @@ ${hint}` : ''}` };
       {
         const o = objects.find((x) => { const r = relFor(cfg.prefix, x.key); return !!r && path.join(KIROLEX_HOME, r) === path.join(localDir, 'record.json'); });
         try { if (o) backupRec = JSON.parse((await vetted.get(o.key)).toString('utf-8')); } catch { backupRec = undefined; }
+        restore.check();
         if (!backupRec || typeof backupRec !== 'object') backupRec = undefined;
       }
 
@@ -10262,6 +10357,7 @@ ${hint}` : ''}` };
           if (pfx.endsWith('.md') && obj.key !== pfx) continue;   // global.md 那个前缀别带出 global.md.xxx
           const abs = path.join(KIROLEX_HOME, rel);
           const body = await getObject(creds!, obj.key);
+          restore.check();
           const local = fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : null;
           let next: string | Buffer | null;
           if (local === null) next = body;
@@ -10302,6 +10398,7 @@ ${hint}` : ''}` };
         }
       }
       /* 以前在这台机器上删过它的话，墓碑会让它在水化时继续隐身 —— 恢复就是要它回来 */
+      restore.check();   // 恢复途中又删了：那是新的删除，墓碑不清
       clearSessionTombstone(sessionId);
       deletedSessionIds.delete(sessionId);
       forgetDeletion(S3_DELETED_AT_PATH, sessionId);   // 本机又有它了，之前的删除记录作废（云端清理的判据）
@@ -10332,8 +10429,16 @@ ${hint}` : ''}` };
         ...(!localBefore && rt?.origin ? { origin: rt.origin } : {}),
       };
     } catch (err: any) {
+      /* 恢复途中会话又被删了（purgeSession → cancelRestore）：之后什么都没写，新的删除标记留着 */
+      if (err instanceof store.RestoreCancelled) logger.info('delete-session', `late event for deleted session ${sessionId} (s3 restore) ignored`);
       const hint = err instanceof S3Error ? err.hint : '';
       return { ok: false, error: `${err?.message || err}${hint ? `\n${hint}` : ''}` };
+    } finally {
+      /*
+        上面 beginRestore（在第一个 await、等凭证之前就登记）：删过的会话也能恢复 —— 恢复期间放行它的记录写入（isDeletedForWrite）；
+        恢复途中（包括等凭证那段）又删了 → check() 抛、作废；转给 offloadRestoreImpl 之前也 check 一次，它同一拍里登记自己的
+      */
+      restore.end();
     }
   });
 
@@ -10447,6 +10552,8 @@ ${hint}` : ''}` };
       这边没认）要查的地方完全不同，而这一行就把它们分开。留着不删：这条路以后还会被改。
     */
     logger.info('remote', `new-session ${kiroLexId}: remoteId=${remoteId ?? '(没传)'} project=${projectId || '(无)'} model=${model}`);
+    /* 删掉的会话不新建（下面 getSessionDir 会先建目录，到 createSession 那道关就晚了） */
+    if (lateEvents.drop(kiroLexId, 'new-session request')) throw new Error(tr('This session has been deleted'));
     /* 先记下选了什么：下面任何一步失败，这条会话都没有记录，右键切换时靠它补（`coldRecordFor`） */
     newSessionIntents.set(kiroLexId, { engine, remoteId: remoteId || undefined, projectId: projectId ?? null });
     newSessionArgs.set(kiroLexId, { cwd, model, projectId: projectId || undefined, kiroAgent: kiroAgent || undefined, remoteId: remoteId || undefined, engine });
@@ -10577,6 +10684,18 @@ ${hint}` : ''}` };
       modelFallback.discard(kiroLexId);   // 没建成：连上时记下的「改用了备用模型」作废
       logger.warn('session', `new-session 失败 sessionId=${kiroLexId} engine=${ENGINE_LABEL[engine]} cwd=${cliCwd}`, err);
       throw err;
+    }
+    /*
+      **session/new 回来时会话已经删了**（advanced 删 flow 执行会话就撞上过：删完 4 秒才回来）——
+      不登记执行器、不写记录（原来这里看「记录不在」就 createSession 建了一份空的「New Chat」），刚起来的执行器断开。
+    */
+    if (lateEvents.drop(kiroLexId, 'session/new', () => {
+      void client.disconnect().catch(() => { /* 已经没了 */ });
+      if (profile.remote?.sshHost) releaseLocalTools(kiroLexId, profile.remote);
+      modelFallback.discard(kiroLexId);
+      newSessionIntents.delete(kiroLexId);
+    })) {
+      throw new Error(tr('This session has been deleted'));
     }
     const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, localDir: resolvedCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now() };
     sessionClients.set(kiroLexId, entry);
@@ -13041,6 +13160,7 @@ ${hint}` : ''}` };
         + ` project=${JSON.stringify(doomed?.profile?.projectId || '')} transcriptBytes=${bytes}`);
     } catch {}
     deletedSessionIds.add(sessionId); // block any racing/subsequent load-session resurrection
+    store.cancelRestore(sessionId);   // 正在从云端恢复它：那次恢复作废（之后不再写、不清这次的墓碑）
     pendingSwitches.cancel(sessionId); // 删掉的会话不再应用欠着的切换
     /* 它的后台命令 / 监视一起停掉，排着没发的唤醒作废 */
     void bgJobs.stopSession(sessionId);
@@ -13802,7 +13922,7 @@ ${hint}` : ''}` };
           busy: false,
         };
         try { await retireExecutor(oldEntry.client); } catch { /* 旧的已经没用了 */ }
-        sessionClients.set(sessionId, nextEntry);
+        adoptExecutor(sessionId, nextEntry, 'switch remote target');
         wireSession(sessionId, nextEntry);
         /*
           **远程 → 本地：旧的转发通道收掉** —— 本地那条路不走 setProxies，不收的话上一台机器那批中转代理
@@ -14007,6 +14127,8 @@ ${hint}` : ''}` };
     // it; starting the replacement first can never succeed. On failure we restore
     // the previous executor (old model) so the chat is not left detached.
     const restoreOldExecutor = async () => {
+      /* 换的这段时间里会话被删了：不回滚（回滚 = 再起一个执行器挂回去） */
+      if (lateEvents.drop(sessionId, 'switch-model rollback')) return;
       const previous = new AcpClient(
         oldEntry.profile.model, shellEnv, oldEntry.profile.kiroAgent,
         oldEntry.profile.permissionMode, live.remote, undefined, engineOf(oldEntry.profile),
@@ -14018,11 +14140,13 @@ ${hint}` : ''}` };
           ...oldEntry, profile: { ...oldEntry.profile, remote: live.remote }, cwd, client: previous, lastUsedAt: Date.now(),
           assistantBuf: '', assistantMsgId: null, fileChanges: [],
         };
-        sessionClients.set(sessionId, restored);
+        adoptExecutor(sessionId, restored, 'switch-model rollback');
         wireSession(sessionId, restored);
       } catch (restoreError) {
-        logger.warn('switch-model', `failed to restore previous executor sessionId=${sessionId}`, restoreError);
         try { await previous.disconnect(); } catch {}
+        /* 回滚途中会话被删了（adoptExecutor 已经记过 late event）：不提示、不写记录 */
+        if (restoreError instanceof SessionDeletedError) return;
+        logger.warn('switch-model', `failed to restore previous executor sessionId=${sessionId}`, restoreError);
         /*
           **在会话里说一句** —— 只写日志的话用户看到的是"模型没换成，然后这条会话不能用了",
           而原因（那条 kiro-cli 会话的锁还被上一个进程握着）只有日志里有。
@@ -14059,7 +14183,7 @@ ${hint}` : ''}` };
         fileChanges: [],
         lastUsedAt: Date.now(),
       };
-      sessionClients.set(sessionId, nextEntry);
+      adoptExecutor(sessionId, nextEntry, 'switch model');
       wireSession(sessionId, nextEntry);
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
@@ -14170,7 +14294,7 @@ ${hint}` : ''}` };
         fileChanges: [],
         lastUsedAt: Date.now(),
       };
-      sessionClients.set(sessionId, nextEntry);
+      adoptExecutor(sessionId, nextEntry, 'switch kiro agent');
       wireSession(sessionId, nextEntry);
       try { await retireExecutor(oldEntry.client); } catch {}
 
@@ -14276,7 +14400,7 @@ ${hint}` : ''}` };
         busy: false,
       };
       try { await retireExecutor(oldEntry.client); } catch { /* 旧的已经没用了 */ }
-      sessionClients.set(sessionId, nextEntry);
+      adoptExecutor(sessionId, nextEntry, 'switch engine');
       wireSession(sessionId, nextEntry);
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
@@ -14494,7 +14618,7 @@ ${hint}` : ''}` };
         busy: false,
       };
       try { await retireExecutor(oldEntry.client); } catch { /* 旧的已经没用了 */ }
-      sessionClients.set(sessionId, nextEntry);
+      adoptExecutor(sessionId, nextEntry, 'remount');
       wireSession(sessionId, nextEntry);
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
@@ -16168,7 +16292,7 @@ ${hint}` : ''}` };
         if (pid) profile.projectId = pid; else delete profile.projectId;
         if (now.unassigned) profile.unassigned = true; else delete profile.unassigned;
       }
-      sessionClients.set(sessionId, entry);
+      sessionClients.set(sessionId, entry);   // 删了没有：上面 'before mount' 检查点刚查过（attachLive.deleted），之间没有 await
       /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
       wireSession(sessionId, entry);
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
@@ -16470,6 +16594,7 @@ ${hint}` : ''}` };
   const ensureAttached = async (sessionId: string): Promise<boolean> => {
     const sid = String(sessionId || '').trim();
     if (!sid) return false;
+    if (refuseDeletedAttach(sid)) return false;   // 删掉的先拒（登记着的执行器也不算数）
     if (sessionClients.get(sid)) return true;
     try {
       await loadSessionImpl(sid, '~', store.readRecord(sid)?.profile.model || DEFAULT_MODEL);

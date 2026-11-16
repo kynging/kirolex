@@ -424,6 +424,73 @@ function refuseAdvancedOnlyWrite(id: string): void {
   }
 }
 
+/**
+ * **删掉的会话不许再建出记录** ——「周报」在标准版冒出来：advanced 删了三条 flow 执行会话，适配器迟到的
+ * session/new 返回又把 sessions/<id>/record.json 建了出来（「New Chat」、没有 purpose、attached），
+ * 于是 advanced 专属的项目里有了「普通会话」。
+ *
+ * 判据由 index.ts 注入（`deletedSessionIds` + 墓碑）：删掉了就不许再写 record.json / 追加 transcript ——
+ * 不管目录还在不在（删除进行中、被占用没挪走的也一样：它对 app 来说已经不存在了）。
+ * 唯一的例外是用户手动「从云端恢复」这条会话（`beginRestore`）：恢复就是要它回来，恢复成功后调用方清掉墓碑。
+ */
+let deletedSessionCheck: (id: string) => boolean = () => false;
+export function setDeletedSessionCheck(check: (id: string) => boolean): void {
+  deletedSessionCheck = check;
+}
+/** 一次手动恢复。`cancelled`：恢复途中这条会话又被删了（`cancelRestore`）—— 这次恢复作废 */
+interface RestoreRun { cancelled: boolean }
+/**
+ * 同一条会话可能同时有好几次恢复在途（侧栏「下载回本机」+ 备份页「恢复」同时点 —— 下载回本机那层还会合并成同一个下载，
+ * 用的是**第一次**登记的取消判据）。所以按 id 记下**全部**在途的，删除时一起作废，谁也不漏。
+ */
+const restoring = new Map<string, Set<RestoreRun>>();
+export class RestoreCancelled extends Error {}
+/**
+ * 手动恢复期间放行这条会话的写入（恢复开始**之前**的删除不挡：恢复就是要它回来）。
+ * `check()` 在每次等网络之后、写文件之前、清墓碑之前调：恢复途中又删了就抛 `RestoreCancelled`。
+ * `end()` 恢复成功失败都要调。
+ */
+export function beginRestore(id: string): { check(): void; cancelled(): boolean; end(): void } {
+  const run: RestoreRun = { cancelled: false };
+  let runs = restoring.get(id);
+  if (!runs) { runs = new Set(); restoring.set(id, runs); }
+  runs.add(run);
+  return {
+    check() { if (run.cancelled) throw new RestoreCancelled(tr('This session has been deleted')); },
+    cancelled() { return run.cancelled; },
+    end() {
+      const cur = restoring.get(id);
+      if (!cur) return;
+      cur.delete(run);
+      if (!cur.size) restoring.delete(id);
+    },
+  };
+}
+/** 删除流程调：这条会话所有在途的恢复一起作废、不再放行写入。返回作废了几次恢复 */
+export function cancelRestore(id: string): number {
+  const runs = restoring.get(id);
+  if (!runs) return 0;
+  for (const run of runs) run.cancelled = true;
+  restoring.delete(id);
+  return runs.size;
+}
+/** 删掉了（删除集合 / 墓碑），而且不是正在手动恢复 —— 不许再写它的记录 */
+export function isDeletedForWrite(id: string): boolean {
+  try { return !restoring.has(id) && deletedSessionCheck(id); } catch { return false; }
+}
+/**
+ * 目录不在、而且删掉了 → 建目录就是把它复活。
+ * 导出给 index.ts 里自己建目录的那几处（`getSessionDir` / `sessionFilesDir` / S3 合并拉文件）在 mkdir 之前问。
+ */
+export function wouldResurrect(id: string): boolean {
+  try { return !fs.existsSync(dirFor(id)) && isDeletedForWrite(id); } catch { return false; }
+}
+function refuseResurrect(id: string, via: string): boolean {
+  if (!isDeletedForWrite(id)) return false;
+  logger.warn('delete-session', `${via} refused: ${id} was deleted; not writing sessions/${id}`);
+  return true;
+}
+
 function ensureDir(id: string): string {
   const d = dirFor(id);
   fs.mkdirSync(d, { recursive: true });
@@ -455,6 +522,7 @@ export function mergePending(rec: SessionRecord, patch: Partial<SessionRecord> |
 export function patchRecord(id: string, patch: Partial<SessionRecord>): 'written' | 'pending' | 'refused' {
   const rec = readRecord(id);
   if (isAdvancedOnly(rec)) return 'refused';   // advanced 的记录不改
+  if (isDeletedForWrite(id)) return 'refused';   // 删掉的会话：不写、不挂起、不等它「出现」
   if (rec) {
     writeRecord(mergePending(rec, patch));
     pendingPatches.delete(id);
@@ -471,6 +539,7 @@ export function pendingPatchFor(id: string): Partial<SessionRecord> | undefined 
 
 /** Create + persist a new session record. */
 export function createSession(id: string, profile: AgentProfile, title = 'New Chat'): SessionRecord {
+  if (refuseResurrect(id, 'createSession')) throw new Error(tr('This session has been deleted'));
   ensureDir(id);
   const now = Date.now();
   const base: SessionRecord = {
@@ -512,26 +581,30 @@ function keepOutOfAdvancedProject(rec: SessionRecord, via: string): void {
   logger.warn('session', `${via}: refused to put ${rec.id} into KiroLex Advanced project ${JSON.stringify(next)}; kept ${prevId ? JSON.stringify(prevId) : 'ungrouped'}`);
 }
 
-/** Overwrite record.json (metadata is small + rewritable). */
-export function writeRecord(rec: SessionRecord): void {
-  if (isAdvancedOnlySession(rec.id)) return;   // advanced 的记录：跳过，不改
+/** Overwrite record.json (metadata is small + rewritable). false = 没写（advanced 的 / 删掉的会话）。 */
+export function writeRecord(rec: SessionRecord): boolean {
+  if (isAdvancedOnlySession(rec.id)) return false;   // advanced 的记录：跳过，不改
+  if (refuseResurrect(rec.id, 'writeRecord')) return false;
   keepOutOfAdvancedProject(rec, 'writeRecord');
   ensureDir(rec.id);
   rec.updatedAt = Date.now();
   const tmp = recordPath(rec.id) + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
   fs.renameSync(tmp, recordPath(rec.id)); // atomic replace
+  return true;
 }
 
 /** Overwrite record.json WITHOUT bumping updatedAt (sync-side bookkeeping that is
  *  not a user edit, e.g. following another machine's project/archive move). */
-export function writeRecordKeepUpdatedAt(rec: SessionRecord): void {
-  if (isAdvancedOnlySession(rec.id)) return;
+export function writeRecordKeepUpdatedAt(rec: SessionRecord): boolean {
+  if (isAdvancedOnlySession(rec.id)) return false;
+  if (refuseResurrect(rec.id, 'writeRecordKeepUpdatedAt')) return false;
   keepOutOfAdvancedProject(rec, 'writeRecordKeepUpdatedAt');
   ensureDir(rec.id);
   const tmp = recordPath(rec.id) + '.tmp';
   fs.writeFileSync(tmp, JSON.stringify(rec, null, 2));
   fs.renameSync(tmp, recordPath(rec.id)); // atomic replace
+  return true;
 }
 
 export function readRecord(id: string): SessionRecord | null {
@@ -658,6 +731,7 @@ export function listAdvancedOnlyIds(): Set<string> {
  */
 export function appendMessage(id: string, msg: StoredMessage): void {
   if (isAdvancedOnlySession(id)) return;   // advanced 的 transcript 不追加
+  if (refuseResurrect(id, 'appendMessage')) return;   // 删掉的会话：不追加（目录不在的话追加会把它建回来）
   ensureDir(id);
   fs.appendFileSync(transcriptPath(id), JSON.stringify(msg) + '\n');
   const rec = readRecord(id);
@@ -783,6 +857,54 @@ export function retryPendingDeletions(pending: string[]): { suppress: string[]; 
     } catch { keep.push(id); }
   }
   return { suppress, keep, skippedAdvanced };
+}
+
+/** 回收站目录名 `<id>__<时间戳>` 里的时间戳（`sessionPurge.moveDirToTrash` 写的：ISO 里的 `:` `.` 换成了 `-`）→ 毫秒；认不出给 null */
+function trashStampMs(stamp: string): number | null {
+  const m = /^(\d{4}-\d{2}-\d{2})T(\d{2})-(\d{2})-(\d{2})-(\d{3})Z$/.exec(stamp);
+  if (!m) return null;
+  const ms = Date.parse(`${m[1]}T${m[2]}:${m[3]}:${m[4]}.${m[5]}Z`);
+  return Number.isFinite(ms) ? ms : null;
+}
+
+/**
+ * **删除以后又被建出来的空壳**（启动时查一次，只查不改）：迟到的适配器回调把删掉的会话重新写出了一份记录
+ * （修好之前留下的）。全部满足才算：
+ *  - 回收站里有同 id 的目录（`trash/<id>__<时间戳>`），而且那次删除早于现在这份的 `createdAt`；
+ *  - 现在这份 transcript 为空、没有 purpose、标题还是「New Chat」。
+ * 有一条不满足的都不算（有消息、有用途、改过名、回收站里没有、时间对不上 / 认不出）。
+ */
+export function findResurrectedShells(trashDir: string): { id: string; trashedAt: number }[] {
+  let trashNames: string[];
+  try { trashNames = fs.readdirSync(trashDir); } catch { return []; }
+  let ids: string[];
+  try { ids = fs.readdirSync(baseDir); } catch { return []; }
+  const out: { id: string; trashedAt: number }[] = [];
+  for (const id of ids) {
+    if (!ID_SHAPE.test(id)) continue;
+    const rec = readRecord(id);
+    if (!rec || rec.purpose || rec.title !== 'New Chat') continue;
+    const createdAt = Number(rec.createdAt);
+    if (!Number.isFinite(createdAt)) continue;
+    let transcript = '';
+    try { transcript = fs.readFileSync(transcriptPath(id), 'utf-8'); } catch (err: any) {
+      /* 只有「文件不存在」算空；读不了（EACCES / EPERM / I/O 错误）证明不了没有消息 —— 跳过，不动它 */
+      if (err?.code !== 'ENOENT') {
+        logger.warn('delete-session', `resurrected-shell check: cannot read transcript of ${id} (${err?.code || err?.message || err}); left alone`);
+        continue;
+      }
+    }
+    if (transcript.trim()) continue;
+    const prefix = `${id}__`;
+    let trashedAt: number | null = null;
+    for (const name of trashNames) {
+      if (!name.startsWith(prefix)) continue;
+      const at = trashStampMs(name.slice(prefix.length));
+      if (at !== null && at <= createdAt && (trashedAt === null || at < trashedAt)) trashedAt = at;
+    }
+    if (trashedAt !== null) out.push({ id, trashedAt });
+  }
+  return out;
 }
 
 export function deleteSession(id: string): void {

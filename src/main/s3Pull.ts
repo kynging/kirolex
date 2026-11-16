@@ -182,21 +182,30 @@ export interface BucketMergeIO {
   pullFiles(): Promise<number>;
   /** 断开执行器 + 备份 + 改写 transcript / record（同步完成，中间不等任何东西）。返回并进几条 */
   apply(): number;
+  /** 这条会话已经删了（删除集合 / 墓碑）—— 删了的不拉文件、不改写，免得把 sessions/<id>/ 重新建出来。不给 = 不查 */
+  isDeleted?(): boolean;
 }
 
-export type BucketMergeResult = { added: number; pulledFiles: number; noop?: boolean; deferred?: boolean };
+export type BucketMergeResult = { added: number; pulledFiles: number; noop?: boolean; deferred?: boolean; gone?: boolean };
 
 /**
  * **合并一条会话的顺序**：下载 → 空合并就什么都不动（`noop`）→ 忙了就推迟（`deferred`）→ 拉文件 → **再问一次忙不忙** →
  * 断开执行器并改写（同步完成）。调用方进来之前查过一次忙，但下载、列文件、拉文件都要等网络，这期间用户或排队任务
  * 可能已经开始了新一轮 —— 这时断开执行器、改写 transcript 会把这一轮打断、丢掉它的产出。所以真正动手前紧挨着再查一次；
  * 推迟的不算「看过了」（调用方不记 bucketSeen），下一轮再合。
+ *
+ * **等网络期间会话被删了**（`gone`）同理：每次等完都再问一次删了没有，删了就什么都不写 —— 否则拉文件的 mkdir、
+ * 合并写 record.json 会把刚进回收站的会话重新建出来。
  */
 export async function runBucketMerge(io: BucketMergeIO): Promise<BucketMergeResult> {
+  const gone = () => !!io.isDeleted?.();
+  if (gone()) return { added: 0, pulledFiles: 0, gone: true };
   const got = await io.fetch();
+  if (gone()) return { added: 0, pulledFiles: 0, gone: true };
   if (!got.missingFiles && (got.transcript === null || io.countNew(got.transcript) === 0)) return { added: 0, pulledFiles: 0, noop: true };
   if (io.isBusy()) return { added: 0, pulledFiles: 0, deferred: true };
   const pulledFiles = got.missingFiles ? await io.pullFiles() : 0;
+  if (gone()) return { added: 0, pulledFiles, gone: true };
   if (io.isBusy()) return { added: 0, pulledFiles, deferred: true };
   return { added: io.apply(), pulledFiles };
 }

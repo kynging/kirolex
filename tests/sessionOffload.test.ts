@@ -956,3 +956,119 @@ describe('移走的会话引用的粘贴 / 附件：启动清理不删，恢复�
     assert.ok(gc.includes('for (const r of offloadedRefs) referenced.add(r);'));
   });
 });
+
+/*
+  下载回本机期间会话被删了（purgeSession → cancelRestore → `deleted()` 变 true）：
+  不发布成 sessions/<id>、不收尾（不写 record.json、不删占位），暂存目录清掉。
+*/
+describe('下载回本机：下载期间会话被删 → 不重建 sessions/<id>', () => {
+  async function offloadedA() {
+    const home = mkHome(); const b = memBucket();
+    seedSession(home, b, 's_a');
+    const stateFile = path.join(home, 'sessions-offloaded.json');
+    const r = await offloadSession(b, { prefix: 'kx', home, id: 's_a', stateFile, now: NOW, lastActiveAt: OLD, recheck: () => null });
+    assert.equal(r.ok, true, (r as any).why);
+    return { home, b, stateFile };
+  }
+
+  test('下载到一半被删 → deleted、正式目录不出现、暂存清掉、占位不被收尾删掉', async () => {
+    const { home, b, stateFile } = await offloadedA();
+    let gone = false;
+    const realGet = b.get.bind(b);
+    (b as any).get = async (key: string) => { const body = await realGet(key); gone = true; return body; };   // 第一份下完时用户删了它
+    const r = await restoreOffloadedSession(b, { home, id: 's_a', stateFile, now: NOW + 1, deleted: () => gone });
+    assert.equal(r.ok, false);
+    assert.equal((r as any).deleted, true);
+    assert.equal(fs.existsSync(path.join(home, 'sessions', 's_a')), false, 'sessions/<id>/ rebuilt');
+    assert.equal(stagingLeft(home), false);
+    assert.ok(readOffloadState(stateFile).offloaded['s_a'], '收尾没跑：占位还在');
+  });
+
+  test('开始前就被删 → 什么都不下', async () => {
+    const { home, b, stateFile } = await offloadedA();
+    let gets = 0;
+    const realGet = b.get.bind(b);
+    (b as any).get = async (key: string) => { gets++; return realGet(key); };
+    const r = await restoreOffloadedSession(b, { home, id: 's_a', stateFile, now: NOW + 1, deleted: () => true });
+    assert.equal((r as any).deleted, true);
+    assert.equal(gets, 0);
+    assert.equal(fs.existsSync(path.join(home, 'sessions', 's_a')), false);
+  });
+
+  test('没被删 → 照常发布', async () => {
+    const { home, b, stateFile } = await offloadedA();
+    const r = await restoreOffloadedSession(b, { home, id: 's_a', stateFile, now: NOW + 1, deleted: () => false });
+    assert.equal(r.ok, true, (r as any).why);
+    assert.ok(fs.existsSync(path.join(home, 'sessions', 's_a', 'record.json')));
+  });
+
+  test('接线：offloadRestoreImpl 登记可被删除取消的恢复，把 deleted 交下去，被删时记 late event、不往下写', () => {
+    const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
+    const at = M.indexOf('async function offloadRestoreImpl(');
+    const body = M.slice(at, M.indexOf('\n}\n', at));
+    const begin = body.indexOf('const restore = store.beginRestore(id);');
+    assert.ok(begin > 0 && begin < body.indexOf('await restoreOffloadedSession('));
+    assert.match(body, /deleted: \(\) => restore\.cancelled\(\),/);
+    const drop = body.indexOf('if (!r.ok && r.deleted) {');
+    assert.ok(drop > 0 && drop < body.indexOf('store.writeRecordKeepUpdatedAt('));
+    assert.match(body.slice(drop, drop + 300), /late event for deleted session \$\{id\} \(offload restore\) ignored/);
+    assert.match(body, /\} finally \{\n\s*restore\.end\(\);\n\s*\}$/);
+    assert.match(M, /store\.cancelRestore\(sessionId\);/);
+  });
+});
+
+describe('下载回本机：同一条两次同时在途（侧栏 + 备份页），随后删除 → 两次都终止', () => {
+  test('合并成一个下载、用的是第一次的判据：删除作废全部登记，正式目录不出现、占位保留', async () => {
+    const store = await import('../src/main/sessionStore.ts');   // 只用恢复登记（内存），不写盘
+    const home = mkHome(); const b = memBucket();
+    seedSession(home, b, 's_a');
+    const stateFile = path.join(home, 'sessions-offloaded.json');
+    const off = await offloadSession(b, { prefix: 'kx', home, id: 's_a', stateFile, now: NOW, lastActiveAt: OLD, recheck: () => null });
+    assert.equal(off.ok, true, (off as any).why);
+    let release!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const realGet = b.get.bind(b);
+    (b as any).get = async (key: string) => { await gate; return realGet(key); };
+    // offloadRestoreImpl × 2：各自 beginRestore，把自己的 cancelled 交下去
+    const run1 = store.beginRestore('s_a');
+    const run2 = store.beginRestore('s_a');
+    const p1 = restoreOffloadedSession(b, { home, id: 's_a', stateFile, now: NOW + 1, deleted: () => run1.cancelled() });
+    const p2 = restoreOffloadedSession(b, { home, id: 's_a', stateFile, now: NOW + 2, deleted: () => run2.cancelled() });
+    assert.equal(store.cancelRestore('s_a'), 2);   // purgeSession
+    release();
+    const [r1, r2] = await Promise.all([p1, p2]);
+    run1.end(); run2.end();
+    assert.equal((r1 as any).deleted, true);
+    assert.equal((r2 as any).deleted, true);
+    assert.equal(fs.existsSync(path.join(home, 'sessions', 's_a')), false, 'sessions/<id>/ rebuilt');
+    assert.equal(stagingLeft(home), false);
+    assert.ok(readOffloadState(stateFile).offloaded['s_a'], '没收尾：占位还在');
+  });
+});
+
+describe('下载回本机：还在等云端凭证时会话被删 → 不下载、不重建', () => {
+  test('登记在等凭证之前：删除作废它，restoreOffloadedSession 一开始就停', async () => {
+    const store = await import('../src/main/sessionStore.ts');   // 只用恢复登记（内存），不写盘
+    const home = mkHome(); const b = memBucket();
+    seedSession(home, b, 's_a');
+    const stateFile = path.join(home, 'sessions-offloaded.json');
+    const off = await offloadSession(b, { prefix: 'kx', home, id: 's_a', stateFile, now: NOW, lastActiveAt: OLD, recheck: () => null });
+    assert.equal(off.ok, true, (off as any).why);
+    let gets = 0;
+    const realGet = b.get.bind(b);
+    (b as any).get = async (key: string) => { gets++; return realGet(key); };
+    // offloadRestoreImpl：beginRestore → await resolveSyncCredsNow()（这期间删了）→ restoreOffloadedSession
+    const run = store.beginRestore('s_a');
+    let creds!: () => void;
+    const credsWait = new Promise<void>((r) => { creds = r; });
+    const p = (async () => { await credsWait; return restoreOffloadedSession(b, { home, id: 's_a', stateFile, now: NOW + 1, deleted: () => run.cancelled() }); })();
+    assert.equal(store.cancelRestore('s_a'), 1);   // purgeSession
+    creds();
+    const r = await p;
+    run.end();
+    assert.equal((r as any).deleted, true);
+    assert.equal(gets, 0);
+    assert.equal(fs.existsSync(path.join(home, 'sessions', 's_a')), false);
+    assert.ok(readOffloadState(stateFile).offloaded['s_a'], '占位还在');
+  });
+});

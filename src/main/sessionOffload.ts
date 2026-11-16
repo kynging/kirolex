@@ -675,7 +675,7 @@ function completeByMark(dir: string): boolean {
 
 /** 同一条会话同时只跑一次下载：侧栏点开、右键、备份页恢复同时来，拿到的是同一个结果（按 home + id）。 */
 const restoresInFlight = new Map<string, Promise<RestoreResult>>();
-type RestoreResult = { ok: true; files: number; bytes: number; alreadyLocal?: boolean; setAside?: string } | { ok: false; why: string; gone?: boolean };
+type RestoreResult = { ok: true; files: number; bytes: number; alreadyLocal?: boolean; setAside?: string } | { ok: false; why: string; gone?: boolean; deleted?: boolean };
 
 /**
  * **把一条已移到云端的会话下载回本机** —— 先整份下载到一个独立的暂存目录，一个文件都不少、大小对得上、
@@ -688,10 +688,14 @@ type RestoreResult = { ok: true; files: number; bytes: number; alreadyLocal?: bo
  * `vet`：动任何本地文件之前审一遍桶里那份（标准版 = `refuseAdvancedBackup`：advanced 的不恢复），返回的 `get` 用来下载。
  *
  * 云端位置一律用**占位记下的** `cloudKey`（移走那一刻的前缀），不用现在设置里的前缀 —— 移走之后改了前缀，旧占位照样找得到。
+ *
+ * `deleted`：下载期间这条会话被删了（index.ts 的 purgeSession 取消了这次恢复）。每次等网络之后、发布成 sessions/<id> 之前、
+ * 收尾写 record.json 之前都问一次：删了就删掉暂存目录、不发布、不收尾（占位和删除标记都不动），返回 `deleted: true`。
  */
 export function restoreOffloadedSession(bucket: OffloadBucket, opts: {
   home: string; id: string; stateFile: string; now: number;
   vet?: (objects: Array<{ key: string; size?: number }>, cloudKey: string) => Promise<{ refused: string } | { get: (key: string) => Promise<Buffer | null> }>;
+  deleted?: () => boolean;
 }): Promise<RestoreResult> {
   const key = `${path.resolve(opts.home)}|${opts.id}`;
   const running = restoresInFlight.get(key);
@@ -711,7 +715,11 @@ async function restoreOnce(bucket: OffloadBucket, opts: Parameters<typeof restor
   const cloudPrefix = prefixFromCloudKey(cloudKey, id);
   if (cloudPrefix === null) return { ok: false, why: `the placeholder's cloud location is not recognised (${cloudKey})` };
   const finalDir = path.join(home, 'sessions', id);
+  const DELETED: RestoreResult = { ok: false, why: 'the session was deleted during the download', deleted: true };
+  const deleted = (): boolean => !!opts.deleted?.();
+  if (deleted()) return DELETED;
   const finish = (r: RestoreResult & { ok: true }): RestoreResult => {
+    if (deleted()) return DELETED;   // 收尾会直接写 record.json：删了就不写
     try { fs.rmSync(path.join(finalDir, RESTORE_COMPLETE_MARK), { force: true }); } catch { /* 留着也只是多一个文件 */ }
     const fin = finishOffloadRestore(opts.stateFile, home, id, opts.now);
     return fin.ok ? r : fin;
@@ -722,6 +730,7 @@ async function restoreOnce(bucket: OffloadBucket, opts: Parameters<typeof restor
     /* 证明不了完整：不当成已恢复。先确认云上还有，再把它整个挪进回收站（不删），下面照常重新下载 */
     let listed: unknown[] = [];
     try { listed = await bucket.list(cloudKey); } catch (err: any) { return { ok: false, why: String(err?.message || err) }; }
+    if (deleted()) return DELETED;
     if (!listed.length) return { ok: false, why: 'the cloud copy no longer exists', gone: true };
     const iso = new Date(opts.now).toISOString().replace(/[:.]/g, '-');
     setAside = path.join(home, 'trash', `offload-incomplete-${iso}`, id);
@@ -739,10 +748,12 @@ async function restoreOnce(bucket: OffloadBucket, opts: Parameters<typeof restor
     /* 同一条以前中断留下的暂存目录（这时没有别的下载在跑 —— restoresInFlight 保证）*/
     try { for (const n of fs.readdirSync(root)) if (n.startsWith(`${id}-`)) fs.rmSync(path.join(root, n), { recursive: true, force: true }); } catch { /* 没有 */ }
     const objects = await bucket.list(cloudKey);
+    if (deleted()) { cleanup(); return DELETED; }
     if (!objects.length) return { ok: false, why: 'the cloud copy no longer exists', gone: true };
     let get: (key: string) => Promise<Buffer | null> = (k) => bucket.get(k);
     if (opts.vet) {
       const v = await opts.vet(objects, cloudKey);
+      if (deleted()) { cleanup(); return DELETED; }
       if ('refused' in v) return { ok: false, why: v.refused };
       get = v.get;
     }
@@ -757,6 +768,7 @@ async function restoreOnce(bucket: OffloadBucket, opts: Parameters<typeof restor
       const abs = path.join(staging, inner);
       if (!abs.startsWith(staging + path.sep) || inner === RESTORE_COMPLETE_MARK) continue;
       const body = await get(o.key);
+      if (deleted()) { cleanup(); return DELETED; }
       if (!body) throw new Error(`${inner} could not be downloaded`);
       if (o.size !== undefined && Number(o.size) !== body.length) throw new Error(`${inner}: downloaded ${body.length} bytes, expected ${o.size}`);
       fs.mkdirSync(path.dirname(abs), { recursive: true });
@@ -767,6 +779,7 @@ async function restoreOnce(bucket: OffloadBucket, opts: Parameters<typeof restor
     try { JSON.parse(fs.readFileSync(path.join(staging, 'record.json'), 'utf-8')); }
     catch { throw new Error('record.json is missing or unreadable in the cloud copy'); }
     fs.writeFileSync(path.join(staging, RESTORE_COMPLETE_MARK), JSON.stringify({ at: opts.now, files: done }));
+    if (deleted()) { cleanup(); return DELETED; }   // 发布之前最后一次：删了就不把目录挪进 sessions/
     fs.mkdirSync(path.dirname(finalDir), { recursive: true });
     fs.renameSync(staging, finalDir);
     return finish({ ok: true, files: done.length, bytes, ...(setAside ? { setAside } : null) });
