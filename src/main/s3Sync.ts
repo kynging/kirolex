@@ -120,6 +120,11 @@ export interface FileState {
    */
   remoteAt?: number;
   remoteSize?: number;
+  /**
+   * 记忆文件专用：上次同步成功那一刻两边一致的内容（**三方合并的基准**，存在 `MEMORY_BASE_DIR` 下）的 sha256。
+   * 没有 = 老数据，还没存过基准（见 `memorySyncStep`）。
+   */
+  baseHash?: string;
 }
 export type SyncState = Record<string, FileState>;
 
@@ -351,7 +356,7 @@ export function memoryRelsFor(root: string, sessionIds: string[], projects: stri
  * 不拿本机时钟去比服务器时钟，两边差一秒就会把自己刚传的当成"别人改的"再拉回来。
  *
  * 两边都有这份时，这里的 pull / upload 只说明「这一轮要动」—— 真正怎么动由 `memorySyncStep` 比过内容再定
- * （一边空白才整份拿，都有内容就合并）。
+ * （一边空白才整份拿，只有一边动过直接拿，第一次 / 两边都动过就对着基准三方合并）。
  */
 export function decideMemory(
   local: { size: number; mtimeMs: number } | undefined,
@@ -376,50 +381,145 @@ export function decideMemory(
 }
 
 /**
- * **一份记忆这一轮怎么同步 —— 两边都有就先比内容，不整份覆盖** —— 实测撞过：kyn-desktop 把 Dev 从不同步的
- * 项目里拿出来后第一轮，「本机第一次同步就拉」把本机 32855 B 的会话记忆盖成桶里 11921 B 的那份；两台各自往
- * 同一条会话的记忆里记过东西，本机这半个月记的就只剩 trash 里那一份了。
+ * **一份记忆这一轮怎么同步** —— 两件实测撞过的事定下了这套规则：
+ *   · kyn-desktop 把 Dev 从不同步的项目里拿出来后第一轮，「本机第一次同步就拉」把本机 32855 B 的会话记忆盖成桶里
+ *     11921 B 的那份（两台各自记过东西）→ 两边都有内容时不整份覆盖，合并。
+ *   · 合并起初是没有基准的两方合并：本机精简掉的 108 行被当成「桶里独有」又补了回来（9470 B → 53436 B），
+ *     记忆只增不减 → 改成**三方合并**：每次同步成功都把那一刻的内容存成基准（`MEMORY_BASE_DIR`，不进同步），
+ *     state 里记基准的 hash；合并时对着基准分清「谁删的、谁加的」（`mergeMemoryThreeWay`）。
  *
- *   · `decideMemory` 说什么都不用做（两边都没动）→ `none`。
- *   · 只有一边有这份文件 → 照它说的直接拉 / 直接传。
- *   · 两边都有（不论是不是第一次同步、哪边动过）→ 先要内容（`fetch`：调用方去桶里拿回来再问一次），
- *     然后：本机空白 → `pull`；桶里空白 → `upload`；桶里有本机没有的行 → `merge`（本机为底补上，写回再传）；
- *     桶里没有本机缺的 → `upload`；一模一样 → `same`（只记下状态）。
+ * 判断顺序：
+ *   · `decideMemory` 说什么都不用做（两边都没动）→ `none`；只有一边有这份文件 → 照它说的直接拉 / 直接传。
+ *   · 一边是空文件 → 缺的那边直接拿另一边（本机空 → 拉，桶里空 → 传），不会把有内容的那边盖成空。
+ *   · 同步过（有 state）且只有一边动过 → 快速路径：桶里没变就直接传本机的，本机没变就直接拉 —— 不用合并。
+ *     刚传完还没读到服务器时间时，只凭大小判不了桶里变没变 → 有基准就先拿内容：桶里 = 基准才算没变。
+ *   · 第一次同步、或两边都动过 → 先要内容（`fetch`：调用方把桶里那份和基准拿来再问一次），然后 `reconcileMemoryText`：
+ *     本机空白 → `pull`；桶里空白 → `upload`；合并出新东西 → `merge`（写回本机再传）；合并结果就是本机 → `upload`；
+ *     一模一样 → `same`。基准文件的 hash 对不上 state 里记的（或者根本没有）就当没有基准，退回两方合并。
  */
 export type MemoryStep =
   | { kind: 'none' | 'fetch' | 'pull' | 'upload' | 'same' }
-  | { kind: 'merge'; text: string; extraLines: number };
+  | { kind: 'merge'; text: string; added: number; removed: number; threeWay: boolean };
 
 export function memorySyncStep(
   local: { size: number; mtimeMs: number } | undefined,
   remote: { size: number; at: number } | undefined,
   last: FileState | undefined,
-  texts?: { local: string; remote: string },
+  texts?: { local: string; remote: string; base?: string },
 ): MemoryStep {
   const action = decideMemory(local, remote, last);
-  if (action === 'none') return { kind: 'none' };
+  /*
+    **刚传完、还没读到服务器时间（`remoteAt` 为 0）时，"桶里大小没变"不等于"桶里没变"** —— 别的机器把一行改成
+    同样字节数，按大小看就是没变：本机动过会被当成「桶里没变 → 直接传」整份盖掉它，本机没动会被当成「都没动」
+    再把那次的时间补进 state、从此看不见那次修改。所以有基准时这种情况一律先拿内容，和基准比过再定。
+  */
+  const remoteUnknown = !!last && !!local && !!remote && !last.remoteAt && !!last.baseHash
+    && remote.size === (last.remoteSize ?? last.size);
+  if (action === 'none' && !remoteUnknown) return { kind: 'none' };
   if (!local || !remote) return { kind: action };
+  if (local.size === 0 || remote.size === 0) {
+    if (local.size === remote.size) return { kind: action };
+    return { kind: local.size === 0 ? 'pull' : 'upload' };
+  }
+  if (last && !remoteUnknown) {
+    const localChanged = local.size !== last.size || Math.floor(local.mtimeMs) !== last.mtimeMs;
+    const remoteChanged = last.remoteAt ? remote.at > last.remoteAt : remote.size !== (last.remoteSize ?? last.size);
+    if (!remoteChanged) return { kind: 'upload' };
+    if (!localChanged) return { kind: 'pull' };
+  }
   if (!texts) return { kind: 'fetch' };
-  const r = reconcileMemoryText(texts.local, texts.remote);
+  const base = texts.base !== undefined && last?.baseHash && memoryHash(texts.base) === last.baseHash ? texts.base : undefined;
+  if (base !== undefined) {
+    /* 按内容的快速路径：桶里还是基准 → 没人改过桶里，传本机的（或一模一样只记状态）；本机还是基准 → 直接拉 */
+    if (texts.remote === base) return { kind: texts.local === texts.remote ? 'same' : 'upload' };
+    if (texts.local === base) return { kind: 'pull' };
+  }
+  const r = reconcileMemoryText(texts.local, texts.remote, base);
   if (r.use === 'remote') return { kind: 'pull' };
-  if (r.use === 'merged') return { kind: 'merge', text: r.text, extraLines: r.extraLines };
+  if (r.use === 'merged') return { kind: 'merge', text: r.text, added: r.added, removed: r.removed, threeWay: base !== undefined };
   return { kind: texts.local === texts.remote ? 'same' : 'upload' };
 }
 
 /**
  * 两边内容都拿到手之后怎么办：
  *   · 本机只有空白 → 用桶里的（`remote`，直接拉）；桶里只有空白 → 用本机的（`local`，直接传）。
- *   · 都有内容 → `mergeMemoryText`：本机为底、桶里独有的行按顺序补在后面。补了东西 = `merged`
- *     （写回本机再上传）；桶里没有独有行 = `local`（本机已经包含桶里的一切，传本机的就行）。
+ *   · 都有内容：有基准 → `mergeMemoryThreeWay`；没有基准（老数据头一回）→ `mergeMemoryText` 两方合并。
+ *     结果和本机不一样 = `merged`（写回本机再上传）；一样 = `local`（传本机的就行）。
  */
-export function reconcileMemoryText(local: string, remote: string): {
-  use: 'local' | 'remote' | 'merged'; text: string; extraLines: number;
+export function reconcileMemoryText(local: string, remote: string, base?: string): {
+  use: 'local' | 'remote' | 'merged'; text: string; added: number; removed: number;
 } {
-  if (!remote.trim()) return { use: 'local', text: local, extraLines: 0 };
-  if (!local.trim()) return { use: 'remote', text: remote, extraLines: 0 };
-  const extra = memoryExtraLines(local, remote);
-  if (!extra.length) return { use: 'local', text: local, extraLines: 0 };
-  return { use: 'merged', text: mergeMemoryText(local, remote), extraLines: extra.length };
+  if (!remote.trim()) return { use: 'local', text: local, added: 0, removed: 0 };
+  if (!local.trim()) return { use: 'remote', text: remote, added: 0, removed: 0 };
+  const m = base !== undefined
+    ? mergeMemoryThreeWay(local, remote, base)
+    : { text: mergeMemoryText(local, remote), added: memoryExtraLines(local, remote).length, removed: 0 };
+  if (m.text === local) return { use: 'local', text: local, added: 0, removed: 0 };
+  return { use: 'merged', ...m };
+}
+
+/**
+ * **三方合并**（按去掉首尾空白的整行比，空行不算）—— 本机为底：
+ *   · 基准有、本机没有 → 本机删的，不补回；
+ *   · 基准有、桶里没有 → 别的机器删的，本机也删（本机在基准之后新加的行不在基准里，不受影响）；
+ *   · 桶里有、基准和本机都没有 → 别的机器新加的，按桶里的顺序补在本机后面；
+ *   · 本机有、基准没有 → 本机新加的，留着。
+ */
+export function mergeMemoryThreeWay(local: string, remote: string, base: string): { text: string; added: number; removed: number } {
+  const keys = (s: string): Set<string> => new Set(s.split(/\r?\n/).map((l) => l.trim()).filter(Boolean));
+  const baseKeys = keys(base);
+  const remoteKeys = keys(remote);
+  const lines = local.split(/\r?\n/);
+  const kept = lines.filter((l) => {
+    const k = l.trim();
+    return !k || !baseKeys.has(k) || remoteKeys.has(k);
+  });
+  const removed = lines.length - kept.length;
+  const have = new Set(kept.map((l) => l.trim()).filter(Boolean));
+  const extra: string[] = [];
+  for (const l of remote.split(/\r?\n/)) {
+    const k = l.trim();
+    if (!k || baseKeys.has(k) || have.has(k)) continue;
+    have.add(k);
+    extra.push(l);
+  }
+  if (!removed && !extra.length) return { text: local, added: 0, removed: 0 };
+  const nl = /\r\n/.test(local) ? '\r\n' : '\n';
+  const body = removed ? kept.join(nl) : local;
+  const text = extra.length ? `${body.replace(/\s*$/, '')}\n${extra.join('\n')}\n` : body;
+  return { text, added: extra.length, removed };
+}
+
+/**
+ * **记忆三方合并的基准放在哪** —— `~/.kirolex/s3-memory-base/<rel>`（rel 形如 `memory/sessions/<id>/memory.md`）。
+ * 不在 `SHARED_DIRS` / 会话目录里，所以 `planUpload` 不会把它传上 S3。
+ */
+export const MEMORY_BASE_DIR = 's3-memory-base';
+
+export function memoryHash(data: string | Buffer): string {
+  return crypto.createHash('sha256').update(typeof data === 'string' ? Buffer.from(data, 'utf-8') : data).digest('hex');
+}
+
+/**
+ * 把同步成功那一刻的内容存成基准，返回它的 hash（记进 state 的 `baseHash`）。
+ * 写不进去就返回 undefined —— 下次两边都改过时退回两方合并，不让同步因为它失败。
+ */
+export function writeMemoryBase(root: string, rel: string, data: string | Buffer): string | undefined {
+  try {
+    const abs = path.join(root, MEMORY_BASE_DIR, rel);
+    fs.mkdirSync(path.dirname(abs), { recursive: true });
+    const tmp = `${abs}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, data);
+    fs.renameSync(tmp, abs);
+    return memoryHash(data);
+  } catch {
+    return undefined;
+  }
+}
+
+/** 读基准；没有就 undefined（hash 对不对由 `memorySyncStep` 核）。 */
+export function readMemoryBase(root: string, rel: string): string | undefined {
+  try { return fs.readFileSync(path.join(root, MEMORY_BASE_DIR, rel), 'utf-8'); } catch { return undefined; }
 }
 
 /** 桶里 / 备份里有、本机没有的行（按去掉首尾空白的整行比，空行不算，自身重复的只算一次）。 */

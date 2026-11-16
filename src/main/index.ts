@@ -46,7 +46,7 @@ import {
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, conflictKeyFor, backoffMultiplier,
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, sessionChangedAt, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
-  decideMemory, memorySyncStep, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
+  decideMemory, memorySyncStep, writeMemoryBase, readMemoryBase, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import {
   offloadSettings, offloadBlocked, planOffloadRound, offloadSession, finishOffloadRestore, readOffloadState, readOffloadStateStrict, setKeepLocal, strictSessionRefs, scheduleRefs, loopRefs, offloadedIdsInTrash,
@@ -7572,7 +7572,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     }
     const touchedProjectMemory = new Map<string, number>();
     /*
-      **记忆：谁新用谁，本机第一次先拉；两边都有内容就合并**（判据在 `decideMemory` / `memorySyncStep`）。planUpload 只看本地改没改，
+      **记忆：谁新用谁，本机第一次先拉；两边都改过就对着基准三方合并**（判据在 `decideMemory` / `memorySyncStep`）。planUpload 只看本地改没改，
       而记忆还要看桶里那份是不是别的机器改过 —— 所以这里先把记忆从计划里拿出来单独决定。
       桶里的列表读不到就**这一轮一份记忆都不传**：不知道桶里是什么就传，正是把真记忆盖成空壳的那条路。
     */
@@ -7628,9 +7628,10 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
           return fs.statSync(abs);
         };
         /*
-          **两边都有就先比内容，不整份覆盖**（判据在 `memorySyncStep`）：不论是不是第一次同步、哪边动过，
-          本机和桶里都有这份时先把桶里那份拿回来比 —— 一边空白才整份拿；都有内容就本机为底、补上桶里独有的行，
-          写回本机，再走下面的上传把合并结果传上去。
+          **对着基准三方合并，不整份覆盖**（判据在 `memorySyncStep`）：只有一边动过就直接拿动过的那边；
+          第一次同步或两边都动过，就把桶里那份和基准（上次同步成功时存的，`s3-memory-base/`）拿来比 ——
+          本机删的不补回、别处删的本机也删、别处新加的补在后面，写回本机，再走下面的上传把合并结果传上去。
+          每次同步成功（拉 / 传 / 一样）都把那一刻的内容存成新基准。
         */
         let step = memorySyncStep(local, remote, state[rel]);
         let buf: Buffer | null = null;
@@ -7639,7 +7640,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
             buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
             if (!buf) continue;
             if (step.kind === 'fetch') {
-              step = memorySyncStep(local, remote, state[rel], { local: fs.readFileSync(abs, 'utf-8'), remote: buf.toString('utf-8') });
+              step = memorySyncStep(local, remote, state[rel], { local: fs.readFileSync(abs, 'utf-8'), remote: buf.toString('utf-8'), base: readMemoryBase(KIROLEX_HOME, rel) });
             }
           } catch (err: any) {
             logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
@@ -7652,21 +7653,23 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
             replaceLocalMemory(step.text);
             memUpload.add(rel);
             memoryPulled += 1;
-            logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B + 桶里独有 ${step.extraLines} 行 → ${Buffer.byteLength(step.text)} B（${firstTime ? '本机第一次同步，' : ''}桶里 ${remote!.size} B）`);
+            logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B，补进 ${step.added} 行、按别处删除去掉 ${step.removed} 行 → ${Buffer.byteLength(step.text)} B（${step.threeWay ? '三方合并' : (firstTime ? '本机第一次同步，没有基准，两方合并' : '没有基准，两方合并')}，桶里 ${remote!.size} B）`);
           } catch (err: any) {
             logger.warn('s3', `记忆 ${rel} 合并不了：${err?.message || err}`);
           }
           continue;
         }
         if (step.kind === 'same') {
-          const st = fs.statSync(abs);             // 一模一样：只记下状态
-          state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote!.at, remoteSize: remote!.size };
+          const st = fs.statSync(abs);             // 一模一样：只记下状态，这一刻的内容就是基准
+          const baseHash = writeMemoryBase(KIROLEX_HOME, rel, buf!);
+          state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote!.at, remoteSize: remote!.size, baseHash };
           continue;
         }
         if (step.kind === 'pull' && remote && buf) {
           try {
             const st = replaceLocalMemory(buf);
-            state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote.at, remoteSize: remote.size };
+            const baseHash = writeMemoryBase(KIROLEX_HOME, rel, buf);   // 拉成功：桶里这份就是下次三方合并的基准
+            state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote.at, remoteSize: remote.size, baseHash };
             memoryPulled += 1;
             logger.info('s3', `记忆 ${rel}：从桶里拉回（${firstTime ? '本机第一次同步，' : '桶里那份更新，'}桶里 ${remote.size} B，本机原来 ${local?.size ?? 0} B）`);
           } catch (err: any) {
@@ -7677,6 +7680,13 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         /* 都没动：把刚传完那次还没读到的服务器时间补上，下一轮就按时间比 */
         if (remote && state[rel] && !state[rel].remoteAt && remote.size === (state[rel].remoteSize ?? state[rel].size)) {
           state[rel] = { ...state[rel], remoteAt: remote.at };
+        }
+        /*
+          老数据还没有基准：两边都没动 = 本机这份就是上次同步时两边一致的那份 —— 现在补存成基准，
+          以后两边都改过时就能三方合并，不必退回两方合并（那会把本机删掉的行补回来）。
+        */
+        if (local && remote && state[rel] && !state[rel].baseHash) {
+          try { state[rel] = { ...state[rel], baseHash: writeMemoryBase(KIROLEX_HOME, rel, fs.readFileSync(abs)) }; } catch { /* 读不到：下一轮再补 */ }
         }
       }
     }
@@ -7702,8 +7712,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         : keyFor(cfg.prefix, rel);
       await putObject(creds!, key, body, contentTypeFor(rel));
       state[rel] = isMemoryRel(rel)
-        /* remoteAt=0：刚传上去、服务器时间下一轮从列表里读（见 decideMemory） */
-        ? { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: 0, remoteSize: st.size }
+        /* remoteAt=0：刚传上去、服务器时间下一轮从列表里读（见 decideMemory）；传上去的这份就是下次三方合并的基准 */
+        ? { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: 0, remoteSize: st.size, baseHash: writeMemoryBase(KIROLEX_HOME, rel, body) }
         : { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
       uploaded += 1;
       bytes += body.length;
