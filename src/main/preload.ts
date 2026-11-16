@@ -251,6 +251,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   reveal: () => ipcRenderer.invoke('acp:reveal'),
   /** 无边框窗口的三个按钮 —— 'minimize' | 'toggle-maximize' | 'close' */
   windowControl: (action: 'minimize' | 'toggle-maximize' | 'close') => ipcRenderer.invoke('window:control', action),
+  /** 只读：窗口此刻真实是否最大化 / 全屏 + 标题条高度（漏了 unmaximize 时渲染层靠它纠正） */
+  windowState: () => ipcRenderer.invoke('window:state') as Promise<{ maximized: boolean; height: number }>,
   /** 窗口是否最大化 + 标题条该留多高（Windows / Linux 自己画的那条，见 createWindow） */
   onWindowMaximized: (callback: (data: { maximized: boolean; height: number }) => void) => {
     const handler = (_event: any, data: { maximized: boolean; height: number }) => callback(data);

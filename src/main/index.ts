@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification, type WebContents } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification, screen, type WebContents } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -9031,13 +9031,33 @@ function createWindow() {
     mainWindow.setMenu(null);
     /* 最大化 / 全屏时渲染层把标题条收起来（自动隐藏），还原时放回去（kiroApi.onWindowMaximized） */
     const win = mainWindow;
-    const applyTitleBar = (): void => {
+    /*
+      光靠 maximize / unmaximize 不够：远程桌面重连 / 分辨率变化、Win+方向键贴靠、从最小化还原时，
+      窗口可能已经离开最大化却收不到 unmaximize —— 渲染层就一直以为还是最大化，普通窗口没了标题条。
+      所以 restore / show / resize / 显示器变化时都重算一次，状态变了才推（页面重载后无条件推一次）。
+    */
+    let lastTitleBarMaxed: boolean | null = null;
+    const applyTitleBar = (force = false): void => {
       if (win.isDestroyed()) return;
       const maximized = win.isMaximized() || win.isFullScreen();
+      if (!force && maximized === lastTitleBarMaxed) return;
+      lastTitleBarMaxed = maximized;
       win.webContents.send('window:maximized', { maximized, height: WIN_TITLEBAR_HEIGHT });
     };
-    for (const ev of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen'] as const) win.on(ev as any, applyTitleBar);
-    win.webContents.on('did-finish-load', applyTitleBar);
+    let titleBarCheckTimer: ReturnType<typeof setTimeout> | null = null;
+    const scheduleTitleBarCheck = (): void => {
+      if (titleBarCheckTimer) clearTimeout(titleBarCheckTimer);
+      titleBarCheckTimer = setTimeout(() => { titleBarCheckTimer = null; applyTitleBar(); }, 150);
+    };
+    for (const ev of ['maximize', 'unmaximize', 'enter-full-screen', 'leave-full-screen', 'restore', 'show'] as const) win.on(ev as any, () => applyTitleBar());
+    win.on('resize', scheduleTitleBarCheck);
+    const displayEvents = ['display-metrics-changed', 'display-added', 'display-removed'] as const;
+    for (const ev of displayEvents) screen.on(ev as any, scheduleTitleBarCheck);
+    win.on('closed', () => {
+      for (const ev of displayEvents) screen.removeListener(ev as any, scheduleTitleBarCheck);
+      if (titleBarCheckTimer) { clearTimeout(titleBarCheckTimer); titleBarCheckTimer = null; }
+    });
+    win.webContents.on('did-finish-load', () => applyTitleBar(true));
   }
 
   // EVERY web link leaves the app — always to the OS default browser, never into
@@ -10321,6 +10341,13 @@ ${hint}` : ''}` };
     else if (action === 'toggle-maximize') { if (win.isMaximized()) win.unmaximize(); else win.maximize(); }
     else if (action === 'close') win.close();
     return { maximized: win.isMaximized() || win.isFullScreen() };
+  });
+
+  /** 只读：窗口此刻真实的最大化 / 全屏状态 —— 渲染层重新拿到焦点时对一次，漏了 unmaximize 也能纠正回来 */
+  ipcMain.handle('window:state', () => {
+    const win = mainWindow;
+    if (!win || win.isDestroyed()) return { maximized: false, height: WIN_TITLEBAR_HEIGHT };
+    return { maximized: win.isMaximized() || win.isFullScreen(), height: WIN_TITLEBAR_HEIGHT };
   });
 
   ipcMain.handle('acp:reveal', async () => {

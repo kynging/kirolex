@@ -938,6 +938,29 @@ const App: React.FC = () => {
     });
     return () => { try { off?.(); } catch { /* 卸载 */ } };
   }, []);
+  /* 兜底：主进程可能漏掉 unmaximize（远程桌面重连、贴靠……），winMaxed 卡在 true 时普通窗口就没了标题条 ——
+     窗口重新拿到焦点 / 页面重新可见时问一次真实状态，对不上就纠正 */
+  const winMaxedRef = useRef(winMaxed);
+  winMaxedRef.current = winMaxed;
+  useEffect(() => {
+    if (!isWinFrame) return;
+    const syncWinState = (): void => {
+      void (window as any).kiroApi?.windowState?.()?.then((r: { maximized: boolean; height: number } | undefined) => {
+        if (!r || typeof r.maximized !== 'boolean') return;
+        if (r.maximized === winMaxedRef.current) return;
+        if (r.height) document.documentElement.style.setProperty('--win-titlebar-height', `${r.height}px`);
+        setWinMaxed(r.maximized);
+        setTitlebarShown(false);
+      }, () => { /* 查不到就保持原样 */ });
+    };
+    const onVisible = (): void => { if (document.visibilityState === 'visible') syncWinState(); };
+    window.addEventListener('focus', syncWinState);
+    document.addEventListener('visibilitychange', onVisible);
+    return () => {
+      window.removeEventListener('focus', syncWinState);
+      document.removeEventListener('visibilitychange', onVisible);
+    };
+  }, []);
   const revealTitlebar = useCallback(() => {
     if (titlebarHideTimer.current) { clearTimeout(titlebarHideTimer.current); titlebarHideTimer.current = null; }
     setTitlebarShown(true);
