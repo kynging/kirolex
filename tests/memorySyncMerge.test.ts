@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  decideMemory, projectMemoryMarkKey, memorySyncStep, reconcileMemoryText, mergeMemoryText, mergeMemoryThreeWay,
+  decideMemory, projectMemoryMarkKey, memorySyncStep, reconcileMemoryText, mergeMemoryText, mergeMemoryThreeWay, normalizeMemoryText,
   memoryHash, writeMemoryBase, readMemoryBase, MEMORY_BASE_DIR, SHARED_DIRS, planUpload,
 } from '../src/main/s3Sync.ts';
 
@@ -85,7 +85,8 @@ test('真实决策：一边是空的 → 缺的那边直接拿，不会把有内
   assert.deepEqual(memorySyncStep({ size: 0, mtimeMs: T0 }, { size: 11921, at: T0 }, undefined), { kind: 'pull' });
   assert.deepEqual(memorySyncStep({ size: 100, mtimeMs: T0 }, { size: 0, at: T0 }, undefined), { kind: 'upload' });
   assert.deepEqual(memorySyncStep({ size: 2, mtimeMs: T0 + 9_999_999 }, { size: 22042, at: T0 }, undefined, { local: ' \n', remote: '- 真记忆\n' }), { kind: 'pull' });
-  assert.deepEqual(memorySyncStep({ size: 100, mtimeMs: T0 }, { size: 3, at: T0 }, undefined, { local: '- 本机\n', remote: '\n \n' }), { kind: 'upload' });
+  /* 桶里只有空白：传本机的（没有基准，盖之前桶里那份照旧留进 trash） */
+  assert.deepEqual(memorySyncStep({ size: 100, mtimeMs: T0 }, { size: 3, at: T0 }, undefined, { local: '- 本机\n', remote: '\n \n' }), { kind: 'upload', keepRemote: true });
 });
 
 test('三方合并 ①：本机删行、桶里没变 → 结果不含被删的行', () => {
@@ -125,20 +126,118 @@ test('三方合并 ③：别处删行、本机没动这行 → 本机也删；�
   );
 });
 
-test('三方合并 ④：没有基准（老数据 / 基准 hash 对不上）→ 退回两方合并，和旧版一样', () => {
-  const texts = { local: '- 本机 A\n- 共有 B\n- 本机 C\n', remote: '- 共有 B\n- 桶里 D\n' };
-  const merged = { kind: 'merge', text: '- 本机 A\n- 共有 B\n- 本机 C\n- 桶里 D\n', added: 1, removed: 0, threeWay: false };
+/*
+  **没有基准时不取并集，谁新用谁整份取** —— 另一台电脑还没更新、本地留着 54 KB 旧版，一更新第一次同步没基准就取并集，
+  把已经删掉的 108 行又传了上去。用户口径：「最后一次修改必须生效，删掉的不能再回来」。
+*/
+test('没有基准 ④a：本机更新（删过行）、桶里是旧的更长版本 → 结果 = 本机那份，删的行不回来（桶里那份留进 trash）', () => {
+  const old = Array.from({ length: 184 }, (_, i) => `- 第 ${i + 1} 条记录`);
+  const remote = `${old.join('\n')}\n`;
+  const local = `${old.slice(0, 76).join('\n')}\n`;
+  const localStat = { size: Buffer.byteLength(local), mtimeMs: T0 + 200_000 };
+  const remoteStat = { size: Buffer.byteLength(remote), at: T0 + 100_000 };
+  const up = { kind: 'upload', keepRemote: true };
+  /* 第一次同步（没有 state） */
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, undefined), { kind: 'fetch' });
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, undefined, { local }), { kind: 'fetch' });
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, undefined, { local, remote }), up);
+  /* 有 state 但没 baseHash（老代码同步过）、两边都动过 */
   const last = { size: 100, mtimeMs: T0, remoteAt: T0 + 5, remoteSize: 100 };
-  assert.equal(mergeMemoryText(texts.local, texts.remote), merged.text);
-  /* 第一次同步 */
-  assert.deepEqual(memorySyncStep({ size: 32855, mtimeMs: T0 }, { size: 11921, at: T0 }, undefined, texts), merged);
-  /* 有 state 但没 baseHash（老数据） */
-  assert.deepEqual(memorySyncStep({ size: 110, mtimeMs: T0 + 200_000 }, { size: 130, at: T0 + 100_000 }, last, texts), merged);
-  /* 有基准文件但 hash 对不上 state 里记的 → 不信它 */
-  assert.deepEqual(memorySyncStep({ size: 110, mtimeMs: T0 + 200_000 }, { size: 130, at: T0 + 100_000 }, withBase('- 别的\n'), { ...texts, base: '- 桶里 D\n' }), merged);
-  /* 合并结果再比一次：没有新东西 → 传本机的；一模一样 → 只记状态 */
-  assert.deepEqual(memorySyncStep({ size: 32855, mtimeMs: T0 }, { size: 11921, at: T0 }, undefined, { local: merged.text, remote: texts.remote }), { kind: 'upload' });
-  assert.deepEqual(memorySyncStep({ size: 32855, mtimeMs: T0 }, { size: 11921, at: T0 }, undefined, { local: '- a\n', remote: '- a\n' }), { kind: 'same' });
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, last, { local, remote }), up);
+  /* 有基准文件但 hash 对不上 state 里记的 → 不信它，同样谁新用谁 */
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, withBase('- 别的\n'), { local, remote, base: '- 第 1 条记录\n' }), up);
+});
+
+test('没有基准：只剩标题也是内容 —— 照样谁新用谁，删掉的不回来，较新的清空版本也不被盖', () => {
+  const header = '# Chat-specific memory\n\n';
+  const full = '# Chat-specific memory\n\n- 旧记录 1\n- 旧记录 2\n';
+  const up = { kind: 'upload', keepRemote: true };
+  /* 本机删到只剩标题、比桶里新：传本机的（不能把旧记录拉回来） */
+  const trimmed = { size: Buffer.byteLength(header), mtimeMs: T0 + 200_000 };
+  const olderFull = { size: Buffer.byteLength(full), at: T0 + 100_000 };
+  assert.deepEqual(memorySyncStep(trimmed, olderFull, undefined, { local: header, remote: full }), up);
+  /* 本机同步过（有 state、没基准）也一样 */
+  const last = { size: 100, mtimeMs: T0, remoteAt: T0 + 5, remoteSize: 100 };
+  assert.deepEqual(memorySyncStep(trimmed, olderFull, last, { local: header, remote: full }), up);
+  /* 反向：桶里是别处删到只剩标题、比本机新 → 拉（不能用本机较旧的整份盖回去） */
+  const olderLocal = { size: Buffer.byteLength(full), mtimeMs: T0 + 100_000 };
+  const newerHeader = { size: Buffer.byteLength(header), at: T0 + 200_000 };
+  assert.deepEqual(memorySyncStep(olderLocal, newerHeader, undefined, { local: full, remote: header }), { kind: 'pull' });
+  assert.deepEqual(memorySyncStep(olderLocal, newerHeader, last, { local: full, remote: header }), { kind: 'pull' });
+});
+
+test('没有基准：编辑器「写新文件再替换」保存精简结果（创建时间 = 修改时间）→ 仍是较新的那份生效', () => {
+  const header = '# Chat-specific memory\n\n';
+  const full = '# Chat-specific memory\n\n- 旧记录 1\n- 旧记录 2\n';
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), 'kl-memreplace-'));
+  const abs = path.join(root, 'memory.md');
+  fs.writeFileSync(abs, full);
+  /* 编辑器的保存方式：写到临时文件再改名盖过去 —— 新文件的创建时间和修改时间几乎一样 */
+  fs.writeFileSync(`${abs}.tmp`, header);
+  fs.renameSync(`${abs}.tmp`, abs);
+  const st = fs.statSync(abs);
+  const local = { size: st.size, mtimeMs: st.mtimeMs, birthtimeMs: st.birthtimeMs } as { size: number; mtimeMs: number };
+  const olderFull = { size: Buffer.byteLength(full), at: st.mtimeMs - 100_000 };
+  assert.deepEqual(memorySyncStep(local, olderFull, undefined, { local: fs.readFileSync(abs, 'utf-8'), remote: full }), { kind: 'upload', keepRemote: true });
+  /* 审查复现的纯函数形状：last 为空、只剩标题、mtimeMs = birthtimeMs = 200000，桶里旧完整版 at = 100000 */
+  const exact = { size: Buffer.byteLength(header), mtimeMs: 200_000, birthtimeMs: 200_000 } as { size: number; mtimeMs: number };
+  assert.deepEqual(memorySyncStep(exact, { size: Buffer.byteLength(full), at: 100_000 }, undefined, { local: header, remote: full }), { kind: 'upload', keepRemote: true });
+  fs.rmSync(root, { recursive: true, force: true });
+});
+
+test('没有基准 ④b：桶里那份更新 → 结果 = 桶里那份（本机原来那份由拉取前的 trash 留底）', () => {
+  const local = '- 本机 A\n- 共有 B\n- 本机 C\n';
+  const remote = '- 共有 B\n- 桶里 D\n';
+  const localStat = { size: Buffer.byteLength(local), mtimeMs: T0 + 100_000 };
+  const remoteStat = { size: Buffer.byteLength(remote), at: T0 + 200_000 };
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, undefined, { local, remote }), { kind: 'pull' });
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, { size: 100, mtimeMs: T0, remoteAt: T0 + 5, remoteSize: 100 }, { local, remote }), { kind: 'pull' });
+  /* 一模一样 → 只记状态 */
+  assert.deepEqual(memorySyncStep(localStat, remoteStat, undefined, { local: '- a\n', remote: '- a\n' }), { kind: 'same' });
+  /* 两方合并函数本身还在（恢复备份用），只是同步不再走它 */
+  assert.equal(mergeMemoryText(local, remote), '- 本机 A\n- 共有 B\n- 本机 C\n- 桶里 D\n');
+});
+
+/*
+  **只差空行 / 行尾空白 → same，不上传** —— 实测：s_1792550941538_1eubnn/memory.md 两台每 5 分钟各传一次
+  （53962 B ↔ 53971 B，Compare-Object 只差空行），S3 版本一直在涨。
+*/
+test('只差空行 / 行尾空白 / 换行符 → same，不上传', () => {
+  const a = '# Chat-specific memory\n\n- 第一条\n- 第二条\n';
+  const b = '# Chat-specific memory\r\n\r\n\r\n- 第一条  \r\n\r\n- 第二条\t\r\n\r\n\r\n';
+  assert.equal(normalizeMemoryText(a), normalizeMemoryText(b));
+  assert.notEqual(normalizeMemoryText(a), normalizeMemoryText('# Chat-specific memory\n- 第一条\n'));
+  const sa = { size: Buffer.byteLength(a), mtimeMs: T0 + 200_000 };
+  const sb = { size: Buffer.byteLength(b), at: T0 + 100_000 };
+  /* 没有基准、第一次同步 */
+  assert.deepEqual(memorySyncStep(sa, sb, undefined, { local: a, remote: b }), { kind: 'same' });
+  /* 有基准、两边都动过 */
+  const last = withBase(a, { size: 10, remoteSize: 10 });
+  assert.deepEqual(memorySyncStep(sa, { ...sb, at: T0 + 90_000 }, last, { local: a, remote: b, base: a }), { kind: 'same' });
+  /* 桶里没变、本机只是对基准改了空白 → same（不用去桶里拿） */
+  const synced = withBase(a, { size: Buffer.byteLength(a), mtimeMs: T0, remoteSize: Buffer.byteLength(a) });
+  assert.deepEqual(memorySyncStep({ size: Buffer.byteLength(b), mtimeMs: T0 + 60_000 }, { size: Buffer.byteLength(a), at: T0 + 5 }, synced, { local: b, base: a }), { kind: 'same' });
+  /* 本机没变、桶里只是改了空白 → 先拿桶里那份，比过是 same（不拉） */
+  const remoteWs = { size: Buffer.byteLength(b), at: T0 + 90_000 };
+  assert.deepEqual(memorySyncStep({ size: Buffer.byteLength(a), mtimeMs: T0 }, remoteWs, synced, { local: a, base: a }), { kind: 'fetch' });
+  assert.deepEqual(memorySyncStep({ size: Buffer.byteLength(a), mtimeMs: T0 }, remoteWs, synced, { local: a, base: a, remote: b }), { kind: 'same' });
+  /* 老状态（有 last、没有 baseHash）、桶里没变、本机只改了空白 → 先拿桶里那份，比过是 same（不传） */
+  const old = '- A\n- B\n';
+  const oldLast = { size: Buffer.byteLength(old), mtimeMs: T0, remoteAt: T0 + 5, remoteSize: Buffer.byteLength(old) };
+  const wsLocal = { size: Buffer.byteLength('- A  \n\n- B\n'), mtimeMs: T0 + 60_000 };
+  const unchangedRemote = { size: Buffer.byteLength(old), at: T0 + 5 };
+  assert.deepEqual(memorySyncStep(wsLocal, unchangedRemote, oldLast, { local: '- A  \n\n- B\n' }), { kind: 'fetch' });
+  assert.deepEqual(memorySyncStep(wsLocal, unchangedRemote, oldLast, { local: '- A  \n\n- B\n', remote: old }), { kind: 'same' });
+  /* 基准文件 hash 对不上也算没有基准，同样核一次 */
+  assert.deepEqual(memorySyncStep(wsLocal, unchangedRemote, { ...oldLast, baseHash: memoryHash('- 别的\n') }, { local: '- A  \n\n- B\n', base: '- A\n', remote: old }), { kind: 'same' });
+  /* 真改了内容的照旧传，且上传前把桶里旧版留进 trash（keepRemote）：加行、删行都一样 */
+  assert.deepEqual(memorySyncStep(wsLocal, unchangedRemote, oldLast, { local: '- A\n- B\n- C\n', remote: old }), { kind: 'upload', keepRemote: true });
+  const deleted = { size: Buffer.byteLength('- A\n'), mtimeMs: T0 + 60_000 };
+  assert.deepEqual(memorySyncStep(deleted, unchangedRemote, oldLast, { local: '- A\n' }), { kind: 'fetch' });
+  assert.deepEqual(memorySyncStep(deleted, unchangedRemote, oldLast, { local: '- A\n', remote: old }), { kind: 'upload', keepRemote: true });
+  /* 真改了内容的照旧传 / 拉 */
+  assert.deepEqual(memorySyncStep({ size: 60, mtimeMs: T0 + 60_000 }, { size: Buffer.byteLength(a), at: T0 + 5 }, synced, { local: `${a}- 新的\n`, base: a }), { kind: 'upload' });
+  assert.deepEqual(memorySyncStep({ size: Buffer.byteLength(a), mtimeMs: T0 }, remoteWs, synced, { local: a, base: a, remote: `${a}- 新的\n` }), { kind: 'pull' });
 });
 
 test('刚传完（remoteAt=0）别处把一行改成同样字节数：不能当「桶里没变」直接传 —— 先拿内容对着基准三方合并', () => {
@@ -217,12 +316,17 @@ test('基准：存进 s3-memory-base、hash 对得上；planUpload 不会把它�
 
 test('接线：同步成功（拉 / 传 / 一样）后写基准；合并带上基准；日志写增删行数；读不到桶里列表就一份记忆都不传', () => {
   assert.match(M, /let step = memorySyncStep\(local, remote, state\[rel\]\);/);
-  assert.match(M, /step = memorySyncStep\(local, remote, state\[rel\], \{ local: fs\.readFileSync\(abs, 'utf-8'\), remote: buf\.toString\('utf-8'\), base: readMemoryBase\(KIROLEX_HOME, rel\) \}\);/);
+  /* 先给本机这份和基准，要桶里那份时再去拿 */
+  assert.match(M, /const texts = \{ local: fs\.readFileSync\(abs, 'utf-8'\), base: readMemoryBase\(KIROLEX_HOME, rel\) \};\s*step = memorySyncStep\(local, remote, state\[rel\], texts\);/);
+  assert.match(M, /step = memorySyncStep\(local, remote, state\[rel\], \{ \.\.\.texts, remote: buf\.toString\('utf-8'\) \}\);/);
+  /* 没有基准、本机那份整份盖掉桶里的：盖之前把桶里那份留进 trash/memory-pull-*；留不进就不传 */
+  assert.match(M, /if \(step\.keepRemote && buf\) \{[\s\S]{0,200}`memory-pull-\$\{Date\.now\(\)\}`, `\$\{rel\}\.bucket`\)[\s\S]{0,500}这一轮不传[\s\S]{0,80}continue;/);
   assert.match(M, /合并：本机 \$\{local!?\.size\} B，补进 \$\{step\.added\} 行、按别处删除去掉 \$\{step\.removed\} 行 → \$\{Buffer\.byteLength\(step\.text\)\} B/);
   /* 拉成功 */
   assert.match(M, /const st = replaceLocalMemory\(buf\);\s*const baseHash = writeMemoryBase\(KIROLEX_HOME, rel, buf\);[^\n]*\n\s*state\[rel\] = \{[^}]*baseHash \};/);
-  /* 一模一样 */
-  assert.match(M, /const baseHash = writeMemoryBase\(KIROLEX_HOME, rel, buf!\);\s*state\[rel\] = \{[^}]*baseHash \};/);
+  /* 一样（含只差空白）：只记状态，不进上传列表 */
+  assert.match(M, /if \(step\.kind === 'same'\) \{[^]*?const baseHash = buf \? writeMemoryBase\(KIROLEX_HOME, rel, buf\) : state\[rel\]\?\.baseHash;\s*state\[rel\] = \{[^}]*baseHash \};\s*continue;/);
+  assert.doesNotMatch(M.slice(M.indexOf("if (step.kind === 'same') {"), M.indexOf("if (step.kind === 'same') {") + 600), /memUpload\.add/);
   /* 上传成功（合并结果也走这里） */
   assert.match(M, /await putObject\(creds!, key, body, contentTypeFor\(rel\)\);\s*state\[rel\] = isMemoryRel\(rel\)[\s\S]{0,200}baseHash: writeMemoryBase\(KIROLEX_HOME, rel, body\)/);
   assert.match(M, /if \(memListed\) \{/);

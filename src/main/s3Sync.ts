@@ -381,31 +381,35 @@ export function decideMemory(
 }
 
 /**
- * **一份记忆这一轮怎么同步** —— 两件实测撞过的事定下了这套规则：
+ * **一份记忆这一轮怎么同步** —— 用户口径：「最后一次修改必须生效，删掉的不能再回来」。几件实测撞过的事定下了这套规则：
  *   · kyn-desktop 把 Dev 从不同步的项目里拿出来后第一轮，「本机第一次同步就拉」把本机 32855 B 的会话记忆盖成桶里
- *     11921 B 的那份（两台各自记过东西）→ 两边都有内容时不整份覆盖，合并。
- *   · 合并起初是没有基准的两方合并：本机精简掉的 108 行被当成「桶里独有」又补了回来（9470 B → 53436 B），
- *     记忆只增不减 → 改成**三方合并**：每次同步成功都把那一刻的内容存成基准（`MEMORY_BASE_DIR`，不进同步），
- *     state 里记基准的 hash；合并时对着基准分清「谁删的、谁加的」（`mergeMemoryThreeWay`）。
+ *     11921 B 的那份 → 有基准时两边都动过就合并，不整份覆盖；被换掉的那份一律先进 trash/memory-pull-*。
+ *   · 没有基准的两方合并（取并集）把本机精简掉的 108 行当成「桶里独有」补了回来（9470 B → 53436 B）→ 改成**三方合并**：
+ *     每次同步成功都把那一刻的内容存成基准（`MEMORY_BASE_DIR`，不进同步），state 里记基准的 hash（`mergeMemoryThreeWay`）。
+ *   · 另一台还没更新的电脑留着 54 KB 旧版，一更新、第一次同步没基准又取了并集 → **没有基准时不再取并集**，
+ *     按「谁新用谁」整份取（本机 mtime 对桶里 LastModified），旧的那份留进 trash；之后有了基准才走三方合并。
+ *   · 两台各自的版本只差空行 / 行尾空白，每 5 分钟互传一次（53962 B ↔ 53971 B）→ 规范化后相同就是 `same`，只记状态不传。
  *
- * 判断顺序：
+ * 判断顺序（`texts` 由调用方分两步给：先 `local` + `base`，需要时再加上桶里的 `remote`；缺什么就回 `fetch`）：
  *   · `decideMemory` 说什么都不用做（两边都没动）→ `none`；只有一边有这份文件 → 照它说的直接拉 / 直接传。
  *   · 一边是空文件 → 缺的那边直接拿另一边（本机空 → 拉，桶里空 → 传），不会把有内容的那边盖成空。
- *   · 同步过（有 state）且只有一边动过 → 快速路径：桶里没变就直接传本机的，本机没变就直接拉 —— 不用合并。
+ *   · 同步过（有 state）且只有一边动过 → 快速路径：桶里没变就直接传本机的（本机只是对基准改了空白 → `same`），
+ *     本机没变就直接拉（桶里只是改了空白 → `same`）—— 不用合并。
  *     刚传完还没读到服务器时间时，只凭大小判不了桶里变没变 → 有基准就先拿内容：桶里 = 基准才算没变。
- *   · 第一次同步、或两边都动过 → 先要内容（`fetch`：调用方把桶里那份和基准拿来再问一次），然后 `reconcileMemoryText`：
- *     本机空白 → `pull`；桶里空白 → `upload`；合并出新东西 → `merge`（写回本机再传）；合并结果就是本机 → `upload`；
- *     一模一样 → `same`。基准文件的 hash 对不上 state 里记的（或者根本没有）就当没有基准，退回两方合并。
+ *   · 第一次同步、或两边都动过：规范化后一样 → `same`；有基准 → 桶里还是基准就传、本机还是基准就拉、否则三方合并；
+ *     没有基准（hash 对不上 state 里记的也算）→ 一边只有空白就拿另一边，否则谁新用谁（只剩标题也算内容）。
  */
 export type MemoryStep =
-  | { kind: 'none' | 'fetch' | 'pull' | 'upload' | 'same' }
+  | { kind: 'none' | 'fetch' | 'pull' | 'same' }
+  /** `keepRemote`：没有基准时本机那份更新、整份盖掉桶里的 —— 调用方先把桶里那份留进 trash */
+  | { kind: 'upload'; keepRemote?: boolean }
   | { kind: 'merge'; text: string; added: number; removed: number; threeWay: boolean };
 
 export function memorySyncStep(
   local: { size: number; mtimeMs: number } | undefined,
   remote: { size: number; at: number } | undefined,
   last: FileState | undefined,
-  texts?: { local: string; remote: string; base?: string },
+  texts?: { local: string; base?: string; remote?: string },
 ): MemoryStep {
   const action = decideMemory(local, remote, last);
   /*
@@ -421,29 +425,57 @@ export function memorySyncStep(
     if (local.size === remote.size) return { kind: action };
     return { kind: local.size === 0 ? 'pull' : 'upload' };
   }
+  const N = normalizeMemoryText;
+  const base = texts?.base !== undefined && last?.baseHash && memoryHash(texts.base) === last.baseHash ? texts.base : undefined;
   if (last && !remoteUnknown) {
     const localChanged = local.size !== last.size || Math.floor(local.mtimeMs) !== last.mtimeMs;
     const remoteChanged = last.remoteAt ? remote.at > last.remoteAt : remote.size !== (last.remoteSize ?? last.size);
-    if (!remoteChanged) return { kind: 'upload' };
-    if (!localChanged) return { kind: 'pull' };
+    /* 只看文件状态（没给内容）时快速路径照旧；给了内容就再核一次「是不是只差空白」 */
+    if (!remoteChanged) {
+      if (!texts) return { kind: 'upload' };
+      if (base !== undefined) return N(texts.local) === N(base) ? { kind: 'same' } : { kind: 'upload' };
+      /* 没有可用的基准（老状态）：拿桶里那份比一次，只差空白就 same（顺便存下基准），不传 */
+      if (texts.remote === undefined) return { kind: 'fetch' };
+      /* 已经拿到桶里那份了：整份盖掉之前照旧留进 trash（没有基准时覆盖都留底） */
+      return N(texts.local) === N(texts.remote) ? { kind: 'same' } : { kind: 'upload', keepRemote: true };
+    }
+    if (!localChanged) {
+      if (!texts) return { kind: 'pull' };
+      if (texts.remote === undefined) return { kind: 'fetch' };
+      return N(texts.local) === N(texts.remote) ? { kind: 'same' } : { kind: 'pull' };
+    }
   }
-  if (!texts) return { kind: 'fetch' };
-  const base = texts.base !== undefined && last?.baseHash && memoryHash(texts.base) === last.baseHash ? texts.base : undefined;
-  if (base !== undefined) {
-    /* 按内容的快速路径：桶里还是基准 → 没人改过桶里，传本机的（或一模一样只记状态）；本机还是基准 → 直接拉 */
-    if (texts.remote === base) return { kind: texts.local === texts.remote ? 'same' : 'upload' };
-    if (texts.local === base) return { kind: 'pull' };
+  if (texts?.remote === undefined) return { kind: 'fetch' };
+  if (N(texts.local) === N(texts.remote)) return { kind: 'same' };
+  if (base === undefined) {
+    /*
+      只有空白 = 空（和 0 字节一样，缺的那边直接拿另一边）；只有标题不算空，照谁新用谁 ——
+      分不清「新建的空壳」和「主动删到只剩标题」，后者必须生效；被盖掉的那份由 trash 留底。
+    */
+    if (!texts.local.trim()) return { kind: 'pull' };
+    if (!texts.remote.trim()) return { kind: 'upload', keepRemote: true };
+    return local.mtimeMs >= remote.at ? { kind: 'upload', keepRemote: true } : { kind: 'pull' };
   }
+  if (N(texts.remote) === N(base)) return { kind: 'upload' };
+  if (N(texts.local) === N(base)) return { kind: 'pull' };
   const r = reconcileMemoryText(texts.local, texts.remote, base);
   if (r.use === 'remote') return { kind: 'pull' };
-  if (r.use === 'merged') return { kind: 'merge', text: r.text, added: r.added, removed: r.removed, threeWay: base !== undefined };
-  return { kind: texts.local === texts.remote ? 'same' : 'upload' };
+  if (r.use === 'merged') return { kind: 'merge', text: r.text, added: r.added, removed: r.removed, threeWay: true };
+  return { kind: 'upload' };
 }
 
 /**
+ * 比较用的规范化：统一换行、去掉行尾空白、去掉空行 —— 只差这些的两份记忆是同一份
+ * （合并本来就按去掉首尾空白的整行比、空行不算；不去掉的话两台会因为几个空行来回互传）。
+ */
+export function normalizeMemoryText(s: string): string {
+  return s.replace(/\r\n?/g, '\n').split('\n').map((l) => l.replace(/\s+$/, '')).filter(Boolean).join('\n');
+}
+/**
  * 两边内容都拿到手之后怎么办：
  *   · 本机只有空白 → 用桶里的（`remote`，直接拉）；桶里只有空白 → 用本机的（`local`，直接传）。
- *   · 都有内容：有基准 → `mergeMemoryThreeWay`；没有基准（老数据头一回）→ `mergeMemoryText` 两方合并。
+ *   · 都有内容：有基准 → `mergeMemoryThreeWay`；没有基准 → `mergeMemoryText` 两方合并（同步不再走这条，
+ *     `memorySyncStep` 没有基准时谁新用谁；留着给按内容比较的调用方）。
  *     结果和本机不一样 = `merged`（写回本机再上传）；一样 = `local`（传本机的就行）。
  */
 export function reconcileMemoryText(local: string, remote: string, base?: string): {

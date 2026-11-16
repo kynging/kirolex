@@ -7631,37 +7631,64 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
           **对着基准三方合并，不整份覆盖**（判据在 `memorySyncStep`）：只有一边动过就直接拿动过的那边；
           第一次同步或两边都动过，就把桶里那份和基准（上次同步成功时存的，`s3-memory-base/`）拿来比 ——
           本机删的不补回、别处删的本机也删、别处新加的补在后面，写回本机，再走下面的上传把合并结果传上去。
-          每次同步成功（拉 / 传 / 一样）都把那一刻的内容存成新基准。
+          没有基准（某台电脑第一次跑新代码）不取并集，谁新用谁整份取，旧的那份进 trash；规范化后一样（只差空行 /
+          行尾空白）只记状态不传。每次同步成功（拉 / 传 / 一样）都把那一刻的内容存成新基准。
         */
         let step = memorySyncStep(local, remote, state[rel]);
         let buf: Buffer | null = null;
-        if (step.kind === 'fetch' || step.kind === 'pull') {
-          try {
+        try {
+          /*
+            两边都有、这一轮要动：先给本机这份和基准（都在本地）—— 只差空白的不传；
+            还要桶里那份（第一次 / 两边都动过 / 拉之前核空白）才去拿
+          */
+          if (local && remote && (step.kind === 'fetch' || step.kind === 'upload' || step.kind === 'pull')) {
+            const texts = { local: fs.readFileSync(abs, 'utf-8'), base: readMemoryBase(KIROLEX_HOME, rel) };
+            step = memorySyncStep(local, remote, state[rel], texts);
+            if (step.kind === 'fetch') {
+              buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
+              if (!buf) continue;
+              step = memorySyncStep(local, remote, state[rel], { ...texts, remote: buf.toString('utf-8') });
+            }
+          }
+          if (step.kind === 'pull' && !buf) {
             buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
             if (!buf) continue;
-            if (step.kind === 'fetch') {
-              step = memorySyncStep(local, remote, state[rel], { local: fs.readFileSync(abs, 'utf-8'), remote: buf.toString('utf-8'), base: readMemoryBase(KIROLEX_HOME, rel) });
-            }
-          } catch (err: any) {
-            logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
-            continue;
           }
+        } catch (err: any) {
+          logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
+          continue;
         }
-        if (step.kind === 'upload') { memUpload.add(rel); continue; }
+        if (step.kind === 'upload') {
+          /* 没有基准、本机那份更新：整份盖掉桶里的 —— 盖之前把桶里那份留进 trash */
+          if (step.keepRemote && buf) {
+            try {
+              const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, `${rel}.bucket`);
+              fs.mkdirSync(path.dirname(bak), { recursive: true });
+              fs.writeFileSync(bak, buf);
+              logger.info('s3', `记忆 ${rel}：没有基准，本机那份更新，整份传上去（本机 ${local!.size} B，桶里原来 ${remote!.size} B 留在 trash）`);
+            } catch (err: any) {
+              logger.warn('s3', `记忆 ${rel} 桶里那份留不进 trash，这一轮不传：${err?.message || err}`);
+              continue;
+            }
+          }
+          memUpload.add(rel);
+          continue;
+        }
         if (step.kind === 'merge') {
           try {
             replaceLocalMemory(step.text);
             memUpload.add(rel);
             memoryPulled += 1;
-            logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B，补进 ${step.added} 行、按别处删除去掉 ${step.removed} 行 → ${Buffer.byteLength(step.text)} B（${step.threeWay ? '三方合并' : (firstTime ? '本机第一次同步，没有基准，两方合并' : '没有基准，两方合并')}，桶里 ${remote!.size} B）`);
+            logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B，补进 ${step.added} 行、按别处删除去掉 ${step.removed} 行 → ${Buffer.byteLength(step.text)} B（三方合并，桶里 ${remote!.size} B）`);
           } catch (err: any) {
             logger.warn('s3', `记忆 ${rel} 合并不了：${err?.message || err}`);
           }
           continue;
         }
         if (step.kind === 'same') {
-          const st = fs.statSync(abs);             // 一模一样：只记下状态，这一刻的内容就是基准
-          const baseHash = writeMemoryBase(KIROLEX_HOME, rel, buf!);
+          /* 一样（规范化后只差空行 / 行尾空白也算）：只记下状态、不传；拿过桶里那份就以它为基准，没拿就沿用原来的基准 */
+          const st = fs.statSync(abs);
+          const baseHash = buf ? writeMemoryBase(KIROLEX_HOME, rel, buf) : state[rel]?.baseHash;
           state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote!.at, remoteSize: remote!.size, baseHash };
           continue;
         }
@@ -7683,7 +7710,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         }
         /*
           老数据还没有基准：两边都没动 = 本机这份就是上次同步时两边一致的那份 —— 现在补存成基准，
-          以后两边都改过时就能三方合并，不必退回两方合并（那会把本机删掉的行补回来）。
+          以后两边都改过时就能三方合并，不必退回「谁新用谁」整份取。
         */
         if (local && remote && state[rel] && !state[rel].baseHash) {
           try { state[rel] = { ...state[rel], baseHash: writeMemoryBase(KIROLEX_HOME, rel, fs.readFileSync(abs)) }; } catch { /* 读不到：下一轮再补 */ }

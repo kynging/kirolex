@@ -187,7 +187,7 @@ docs/            设计文档（§1）
 
 | 文件 | 关键点 |
 |---|---|
-| `src/main/s3Sync.ts` | **白名单**：`sessions/<id>/{record.json, transcript.jsonl, history.md}` + `sessions/<id>/files/`（跳过依赖目录、仓库、压缩包）、`memory/**`、`attachments/**`、`pasted/**`、`mcp-combos.json`（组合，两边都改过时按 id 合并，`mcpCombosSync.ts`）。**不同步** `config.json`、`logs/`、`previews/`。变更检测看 size+mtime（`s3-sync-state.json`），key 带版本前缀；记忆文件用 `decideMemory`（谁变了用谁）；`memorySyncStep` 决定：一边空白直接拿另一边，只有一边动过直接拿动过的，第一次同步 / 两边都动过就对着基准（`~/.kirolex/s3-memory-base/`，上次同步成功时的内容，不上传，state 里记 `baseHash`）三方合并，没基准才退回两方合并。S3 key 做了 `path.sep` ↔ `/` 转换 |
+| `src/main/s3Sync.ts` | **白名单**：`sessions/<id>/{record.json, transcript.jsonl, history.md}` + `sessions/<id>/files/`（跳过依赖目录、仓库、压缩包）、`memory/**`、`attachments/**`、`pasted/**`、`mcp-combos.json`（组合，两边都改过时按 id 合并，`mcpCombosSync.ts`）。**不同步** `config.json`、`logs/`、`previews/`。变更检测看 size+mtime（`s3-sync-state.json`），key 带版本前缀；记忆文件用 `decideMemory`（谁变了用谁）；`memorySyncStep` 决定：一边空白直接拿另一边，只有一边动过直接拿动过的，第一次同步 / 两边都动过就对着基准（`~/.kirolex/s3-memory-base/`，上次同步成功时的内容，不上传，state 里记 `baseHash`）三方合并；没基准时谁新用谁整份取（旧的进 trash），规范化后只差空行 / 行尾空白算一样、不传。S3 key 做了 `path.sep` ↔ `/` 转换 |
 | `src/main/transcriptMerge.ts` | `mergeTranscripts`（按 `id` 去重、按 `ts` 稳定排序、同 id 内容不同时本地赢）、`mergeRecords`（`cliSessionId` / `executorState` 永远用本地的） |
 | `src/main/s3Client.ts`、`awsSigV4.ts` | 手写 https + SigV4，没有 AWS SDK |
 | `index.ts` | `mergeBucketSession`（桶里有别的机器更新的 → 自动合并，本地旧副本先进回收站）、`s3:restore`（现在是**合并**，先断开空闲执行器，正在跑一轮时拒绝；`s3Sync.ts` 头部"覆盖同 id"那句已过时） |
