@@ -194,12 +194,15 @@ export function mergeRecords(local: any, remote: any): any {
   /*
     **权限只许合并得更严，不许放宽** —— 云上那份不可信（另一台电脑 / 桶凭据都可能被人拿到）：一份 updatedAt 更新、
     `engine:'kiro'` + `permissionMode:'auto-approve'` 的记录会把本机设成「手动确认」的会话悄悄改回自动批准，之后每次工具调用都不再问。
-    实际生效的规则和 AcpClient 一样：只有 kiro 认 permissionMode（没写 = 自动批准），别的引擎一律要确认。
-    本机现在生效的是「要确认」、合并结果会变成自动批准 → 写成 ask。引擎 / 模型照旧按 updatedAt。
+    实际生效的规则和 AcpClient 一样：只有 kiro 认 permissionMode，且只有明确写着 auto-approve 才自动（没写 = 先问），
+    别的引擎一律要确认。本机现在生效的是「要确认」、合并结果可能自动批准 → 写成 ask。引擎 / 模型照旧按 updatedAt。
+    合并结果那一侧从严：没写也当成可能自动（写成 ask 和没写生效一样，只会更严）。
   */
   const autoApproves = (p: any): boolean =>
+    p?.engine !== 'claude' && p?.engine !== 'codex' && p?.permissionMode === 'auto-approve';
+  const mayAutoApprove = (p: any): boolean =>
     p?.engine !== 'claude' && p?.engine !== 'codex' && (p?.permissionMode || 'auto-approve') === 'auto-approve';
-  if (!autoApproves(local.profile) && autoApproves(out.profile)) out.profile = { ...(out.profile || {}), permissionMode: 'ask' };
+  if (!autoApproves(local.profile) && mayAutoApprove(out.profile)) out.profile = { ...(out.profile || {}), permissionMode: 'ask' };
 
   /* 这台机器的东西不许被另一台的覆盖 */
   if ('cliSessionId' in local) out.cliSessionId = local.cliSessionId;

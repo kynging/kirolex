@@ -31,6 +31,8 @@ What this means for you:
 
 - **A remote chat can read, write and run commands on your computer**, just like a local one. The
   safety boundary is the same as for a local agent, so review its actions the same way.
+- These tools are never pre-approved: every call follows the chat's **Auto / Ask** toggle (see
+  [Tool approval](chat.md#tool-approval)). New chats start in **Ask**, so you confirm each call.
 - When the remote agent changes one of your files, the chat says so: 📝 远端那条会话改了你本机的 …
   (*The remote chat changed … on your machine*).
 - The remote machine only keeps a throw-away scratch folder per chat, under `~/.cache/kirolex/`

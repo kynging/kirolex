@@ -229,7 +229,7 @@ export class AcpClient extends EventEmitter {
     model: string,
     env?: Record<string, string>,
     kiroAgent?: string,
-    permissionMode: PermissionMode = 'auto-approve',
+    permissionMode: PermissionMode = 'ask',
     remote?: RemoteTarget,
     /**
      * **本地工具通道**（`localMcp.ts`）——「给远程配一些能调用本地 MCP 的能力」。

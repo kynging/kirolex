@@ -259,7 +259,7 @@ describe('接线：远端会话 agent 不预先信任自带的写文件工具', 
     assert.match(prog, /k not in native_write/);
   });
 
-  test('真跑一遍（POSIX 且有 python3 时）：* / fs_write 被剔掉，fs_read 和本机工具留着', {
+  test('真跑一遍（POSIX 且有 python3 时）：* / fs_write 被剔掉，fs_read 留着，本机工具不预先放行', {
     skip: process.platform === 'win32' && '远端脚本（bash + python3 + HOME）只在 POSIX 上能本机冒烟',
   }, async () => {
     const { execFileSync } = await import('node:child_process');
@@ -273,7 +273,7 @@ describe('接线：远端会话 agent 不预先信任自带的写文件工具', 
       }));
       execFileSync('bash', ['-lc', remoteAgentScript('out', 'a', 'http://127.0.0.1:1/mcp/t')], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
       const j = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'out.json'), 'utf8'));
-      assert.deepEqual(j.allowedTools, ['fs_read', 'execute_bash', '@kirolex-local']);
+      assert.deepEqual(j.allowedTools, ['fs_read', 'execute_bash']);
       assert.deepEqual(Object.keys(j.toolsSettings), ['execute_bash']);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });

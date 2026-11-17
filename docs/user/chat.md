@@ -122,9 +122,9 @@ the queue.
 The **Auto / Ask** toggle in a Kiro chat decides what happens when the agent wants to use a tool.
 You can't change it while a reply is running.
 
-- **Auto** (the default): *Auto-approve all tools (click to require approval)*. Each request is
-  approved once, automatically.
-- **Ask**: *Ask before each tool (click to auto-approve)*. A **Tool permission required** bar appears
+- **Auto**: *Auto-approve all tools (click to require approval)*. Each request is
+  approved once, automatically. You have to turn this on yourself.
+- **Ask** (the default): *Ask before each tool (click to auto-approve)*. A **Tool permission required** bar appears
   above the composer with the buttons the agent offers:
   - **✓ Allow once**
   - **⟲ Always allow**: how long "always" lasts is up to `kiro-cli`, not KiroLex

@@ -3112,7 +3112,7 @@ const App: React.FC = () => {
   }, [currentSessionId, sessions, kiroAgents, switchingAgentIds, changeSessionAgent, pendingSwitches, cancelPendingSwitch]);
 
 
-  const permissionMode = currentSession?.permissionMode || 'auto-approve';
+  const permissionMode = currentSession?.permissionMode || 'ask';
   const handlePermissionModeChange = useCallback(async (
     mode: 'auto-approve' | 'ask',
     paneSid?: string,
@@ -3122,7 +3122,7 @@ const App: React.FC = () => {
     /* 这一轮还在跑（包括循环里的一轮）也能点 —— 主进程记成 pending，跑完再换（见 main/pendingSwitch.ts） */
     if (!sid) return;
     const pendingMode = pendingSwitches[sid]?.permission;
-    const actualMode = sessionForMode?.permissionMode || 'auto-approve';
+    const actualMode = sessionForMode?.permissionMode || 'ask';
     if (pendingMode !== undefined) {
       if (mode === pendingMode) return;
       if (mode === actualMode) { await cancelPendingSwitch(sid, 'permission'); return; }
@@ -4309,7 +4309,7 @@ const App: React.FC = () => {
         kiroAgents={agentsFor(session)}
         switchingAgent={focused && switchingAgent}
         switchingModel={focused && switchingModel}
-        permissionMode={session?.permissionMode || 'auto-approve'}
+        permissionMode={session?.permissionMode || 'ask'}
         onPermissionModeChange={(mode) => { void handlePermissionModeChange(mode, sid || undefined); }}
         /* 忙时选的、这一轮跑完再切的那些（agent / 模型 / 权限 / 引擎 / 组合 / 运行位置） */
         pendingSwitch={sid ? pendingSwitches[sid] : undefined}

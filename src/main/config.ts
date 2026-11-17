@@ -107,8 +107,8 @@ export interface AgentProfile {
    */
   modelEarnedOn?: string;
 
-  /** Tool permission behavior. Undefined legacy records retain the historical
-   * auto-approve behavior. KiroLex handles permission requests client-side so
+  /** Tool permission behavior. Undefined (legacy records) means 'ask': auto-approve
+   * must be an explicit user choice (secure by default). KiroLex handles permission requests client-side so
    * this mode can switch between Auto and Ask without replacing the executor. */
   permissionMode?: PermissionMode;
 

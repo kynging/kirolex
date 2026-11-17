@@ -267,7 +267,8 @@ describe('接线层：agent 配置一条会话一份，端口不撞', () => {
     assert.equal(hit.json.prompt, '你是 AWS 专家');
     assert.deepEqual(Object.keys(hit.json.mcpServers).sort(), ['local_only', MCP_SERVER_NAME].sort());
     assert.deepEqual(hit.json.tools, ['fs_read', `@${MCP_SERVER_NAME}`]);
-    assert.deepEqual(hit.json.allowedTools, ['fs_read', `@${MCP_SERVER_NAME}`]);
+    /* 本机工具进 tools（能调），但不进 allowedTools（不预先放行，每次走权限请求） */
+    assert.deepEqual(hit.json.allowedTools, ['fs_read']);
     /* ② 远端没有 → 默认 agent + 只有本地工具，而且 tools 必须显式 `["*"]`
           （缺这个字段等于一个工具都不给 —— 实测过） */
     const miss = run('nope-agent');
@@ -547,7 +548,7 @@ describe('把本机的 MCP 转发给远端会话', () => {
     assert.match(prog, /tags = \[tag\] \+ \["@" \+ k for k in json\.loads/);
   });
 
-  test('那段合并程序真跑一遍：转发项进了 mcpServers 和两个白名单', REMOTE_SCRIPT, () => {
+  test('那段合并程序真跑一遍：转发项进了 mcpServers 和 tools，但不进 allowedTools（不预先放行）', REMOTE_SCRIPT, () => {
     const home = fs.mkdtempSync(path.join(os.tmpdir(), 'fwdhome-'));
     fs.mkdirSync(path.join(home, '.kiro', 'agents'), { recursive: true });
     fs.writeFileSync(path.join(home, '.kiro', 'agents', 'a.json'), JSON.stringify({
@@ -559,7 +560,7 @@ describe('把本机的 MCP 转发给远端会话', () => {
     const j = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'out.json'), 'utf8'));
     assert.deepEqual(Object.keys(j.mcpServers).sort(), [MCP_SERVER_NAME, 'playwright'].sort());
     assert.deepEqual(j.tools, ['fs_read', `@${MCP_SERVER_NAME}`, '@playwright']);
-    assert.deepEqual(j.allowedTools, ['fs_read', `@${MCP_SERVER_NAME}`, '@playwright']);
+    assert.deepEqual(j.allowedTools, ['fs_read']);
   });
 
   test('接线：按会话登记代理，并在注入里说清"这些作用在用户机器上"', async () => {

@@ -10615,7 +10615,7 @@ ${hint}` : ''}` };
     model: string,
     projectId?: string,
     kiroAgent?: string,
-    permissionMode: 'auto-approve' | 'ask' = 'auto-approve',
+    permissionMode: 'auto-approve' | 'ask' = 'ask',
     /**
      * **这条会话在哪台机器上跑** —— `undefined` = 本地（默认）。
      *
@@ -10668,7 +10668,8 @@ ${hint}` : ''}` };
       // already be an automatic fallback, laundering a model the user never chose
       // into their "preferred" one permanently.
       preferredModel: engineModel,
-      permissionMode: permissionMode === 'ask' ? 'ask' : 'auto-approve',
+      /* 新会话默认「先问」：agent 输出是不可信输入，自动批准（能跑命令、写文件）必须是用户明确选的 */
+      permissionMode: permissionMode === 'auto-approve' ? 'auto-approve' : 'ask',
       projectId: projectId ?? derived,
       kiroAgent: engine === 'kiro' ? (kiroAgent || undefined) : undefined,
       remote,
@@ -13908,7 +13909,7 @@ ${hint}` : ''}` };
     const profile: AgentProfile = {
       model: engine === 'kiro' ? DEFAULT_MODEL : 'default',
       preferredModel: engine === 'kiro' ? DEFAULT_MODEL : 'default',
-      permissionMode: 'auto-approve',
+      permissionMode: 'ask',
       /* KiroLex Advanced 专属的 flow 项目不放进去：建成未分组 */
       ...(bits.projectId && !refuseAdvancedProject(bits.projectId, 'cold-record') ? { projectId: bits.projectId } : {}),
       ...(engine !== 'kiro' ? { engine } : {}),
@@ -14342,7 +14343,7 @@ ${hint}` : ''}` };
   ): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-permission-mode'); if (advRefused) throw new Error(advRefused); }
     const entry = sessionClients.get(sessionId);
-    const normalizedMode = permissionMode === 'ask' ? 'ask' : 'auto-approve';
+    const normalizedMode = permissionMode === 'auto-approve' ? 'auto-approve' : 'ask';
     /* 忙、或者上一批 pending 正在应用（那次重连会先把执行器拿掉）：先登记，别掉进下面"没连着只写记录"那条路 ——
        那样写下的记录会被正在进行的那次重连用旧 profile 盖掉。登记的这一次在那一批落定后接着应用。 */
     { const queued = queueSwitchWhileBusy(sessionId, 'permission', { permissionMode: normalizedMode }, normalizedMode, fromPending); if (queued) return { ...queued, permissionMode: normalizedMode }; }
@@ -14934,7 +14935,7 @@ ${hint}` : ''}` };
       case 'agent': return p.kiroAgent || 'kiro_default';
       case 'model': return p.model;
       case 'combo': return comboDisplayName(pickCombo(readMcpCombos(os.homedir()).combos, p.mcpCombo));
-      case 'permission': return p.permissionMode || 'auto-approve';
+      case 'permission': return p.permissionMode || 'ask';
       case 'engineModel': return (engine !== 'kiro' && p.engineModels?.[engine]) || tr('its current setting');
       case 'engineEffort': return (engine !== 'kiro' && p.engineOptions?.[engine]?.thought_level) || tr('its current setting');
       case 'engineMode': return (engine !== 'kiro' && p.engineOptions?.[engine]?.mode) || tr('its current setting');
@@ -15046,7 +15047,7 @@ ${hint}` : ''}` };
       failed: report.failed,
       /* 实际生效的值：界面按它回填（失败的那几类就回到原来的值） */
       profile: p ? {
-        kiroAgent: p.kiroAgent || '', model: p.model, permissionMode: p.permissionMode || 'auto-approve',
+        kiroAgent: p.kiroAgent || '', model: p.model, permissionMode: p.permissionMode || 'ask',
         engine: engineOf(p), mcpCombo: p.mcpCombo || BUILTIN_COMBO_ID,
       } : null,
       pending: pendingSwitches.view(sessionId),
@@ -15105,7 +15106,7 @@ ${hint}` : ''}` };
           } else if (sw.kind === 'combo') {
             if (engineOf(p) !== 'kiro') p.mcpCombo = v.comboId === BUILTIN_COMBO_ID ? undefined : v.comboId;
           } else if (sw.kind === 'permission') {
-            p.permissionMode = v.permissionMode === 'ask' ? 'ask' : 'auto-approve';
+            p.permissionMode = v.permissionMode === 'auto-approve' ? 'auto-approve' : 'ask';
           } else {
             const engine = engineOf(p);
             if (engine === 'kiro') continue;
@@ -16199,7 +16200,8 @@ ${hint}` : ''}` };
         preferredModel: existing?.profile.preferredModel || DEFAULT_MODEL,
         /* 带着走，否则每次 attach 都当成"没记"，那这个字段就白加了 */
         modelEarnedOn: existing?.profile.modelEarnedOn,
-        permissionMode: existing?.profile.permissionMode || 'auto-approve',
+        /* 记录里没写（老记录）= 没明确选过自动批准 → 按「先问」，只有明确的 auto-approve 才自动 */
+        permissionMode: existing?.profile.permissionMode === 'auto-approve' ? 'auto-approve' : 'ask',
         projectId,
         /* 白名单：漏了的话下一次把 entry.profile 整份写回记录（切模型等）就把这个标记丢了 */
         ...(placed.unassigned ? { unassigned: true as const } : {}),

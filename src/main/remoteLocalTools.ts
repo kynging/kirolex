@@ -218,8 +218,19 @@ export function remoteAgentScript(
     '    return str(t) == "@builtin" or any(fnmatch.fnmatchcase(w, str(t)) for w in native_write)',
     'if isinstance(cfg.get("toolsSettings"), dict):',
     '    cfg["toolsSettings"] = {k: v for k, v in cfg["toolsSettings"].items() if k not in native_write}',
-    'allowed = [t for t in (src.get("allowedTools") or []) if kept(t) and not trusts_write(t)]',
-    'cfg["allowedTools"] = allowed + [t for t in tags if t not in allowed]',
+    /*
+      **本机工具（local_bash / local_write，和转发过来的本机 MCP）不预先放行** —— 它们作用在用户自己的机器上，
+      而调它们的是不可信的模型输出。进了 `allowedTools` 的话 kiro-cli 不来问，会话选了「先问」也照样直接跑。
+      不放行 = 每次都走 session/request_permission：「先问」弹给用户，「自动」由 KiroLex 批（那是用户自己选的）。
+      远端底子里能盖到它们的条目也剔掉（转发后同一个名字指向的是本机）：按 `/` 前的服务器那一段和每个标签做
+      通配匹配 —— `@kirolex-local`、`@kirolex-local/local_bash`、`@kirolex-*`、`@` + `*` + `/local_bash`（服务器名整段通配）、
+      `@kirolex-` + `*` + `/local_write` 都算。宁可多剔（只是多问一次），不能漏。
+    */
+    'def trusts_local(t):',
+    '    server = str(t).split("/", 1)[0]',
+    '    return any(str(t) == g or fnmatch.fnmatchcase(g, server) for g in tags)',
+    'allowed = [t for t in (src.get("allowedTools") or []) if kept(t) and not trusts_write(t) and not trusts_local(t)]',
+    'cfg["allowedTools"] = allowed',
     /*
       **0600 写** —— 文件里的 url 带着 `/mcp/<token>`，而反向隧道在远端是 127.0.0.1，那台机器上谁都连得上；
       默认 umask 022 下文件是 0644，同机别的用户读到 token 就能经隧道在本机跑 local_bash。

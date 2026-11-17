@@ -29,7 +29,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
     model: string,
     projectId?: string,
     kiroAgent?: string,
-    permissionMode: 'auto-approve' | 'ask' = 'auto-approve',
+    permissionMode: 'auto-approve' | 'ask' = 'ask',
     /** 这条会话跑在哪台机器上（`undefined` = 本地）。见 docs/DESIGN_remote_sessions.md。 */
     remoteId?: string,
     /** 哪个引擎：'kiro'（默认）/ 'claude' / 'codex'。见 src/main/engines.ts。 */

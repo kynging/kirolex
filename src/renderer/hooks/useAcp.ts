@@ -829,7 +829,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const projectForSession = (sid: string | null): string | undefined =>
     sid ? sessionsRef.current.find((s) => s.id === sid)?.projectId : undefined;
   const permissionModeForSession = (sid: string | null): 'auto-approve' | 'ask' =>
-    sid ? (sessionsRef.current.find((s) => s.id === sid)?.permissionMode || 'auto-approve') : 'auto-approve';
+    /* 只用于兜底新建：找不到会话 = 新会话，按默认「先问」（auto-approve 要用户自己点开） */
+    sid ? (sessionsRef.current.find((s) => s.id === sid)?.permissionMode || 'ask') : 'ask';
   /**
    * **attach 时报这条会话真正的工作目录**，不知道才退回 `'~'`。
    *
@@ -3464,7 +3465,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
        * （已修）。新建这条路是"从来没写过"，那条是"重启后才丢"——两处都补上才算全。
        */
       {
-        id, title: 'New Chat', model, permissionMode: 'auto-approve', projectId, kiroAgent, timestamp: Date.now(),
+        id, title: 'New Chat', model, permissionMode: 'ask', projectId, kiroAgent, timestamp: Date.now(),
         /* 徽标当场就要有：等下一次 hydrate 才出现的话，你刚建的远程会话看起来像本地的 */
         ...(opts?.remoteId ? { remoteHost: opts.remoteLabel || opts.remoteId, remoteId: opts.remoteId } : null),
         ...(opts?.engine && opts.engine !== 'kiro' ? { engine: opts.engine } : null),
@@ -3516,7 +3517,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     markConnecting(id); // flash while the executor spawns
     const createPromise = (async (): Promise<string> => {
       try {
-        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId, opts?.engine);
+        await window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'ask', opts?.remoteId, opts?.engine);
         clearConnecting(id);
         // Per design: a newly created chat auto-connects. The executor is
         // spawned, so mark it attached immediately -> the sidebar dot goes green
@@ -3533,7 +3534,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         markFailed(id);
         const why = String(err?.message || err);
         /* 缺适配器的那种：提示上有「安装」，装好后照原样再建一次 */
-        failedCreateRef.current.set(id, () => window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'auto-approve', opts?.remoteId, opts?.engine));
+        failedCreateRef.current.set(id, () => window.kiroApi.newSession(id, cwd, model, projectId, kiroAgent, 'ask', opts?.remoteId, opts?.engine));
         /* 阶段条换成「失败」+ 原因（主进程一般已经推过；IPC 本身失败时只有这里知道） */
         setCreateStages((prev) => {
           const cur = prev[id];
@@ -3683,7 +3684,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         id: newId,
         title: throughMessageId ? `fork:${src.title}` : `dup:${src.title}`,
         model,
-        permissionMode: src.permissionMode || 'auto-approve',
+        permissionMode: src.permissionMode === 'auto-approve' ? 'auto-approve' : 'ask',
         projectId: src.projectId,
         folderId: src.folderId ?? null,
         timestamp: Date.now(),
