@@ -46,15 +46,18 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   const [machine, setMachine] = useState<{ hostname: string; items: Unavailable[]; forwardStdio: ForwardStdio[] } | null>(null);
   /* 正在填「为这台电脑设置命令」的那条（`fileId\u0000server`）和填的内容 */
   const [editing, setEditing] = useState<{ key: string; command: string } | null>(null);
+  /* 从 S3 同步来、这台电脑上还没确认过的 MCP（`mcpComboTrust.ts`）：看过、点保存才会挂 */
+  const [untrusted, setUntrusted] = useState<Array<{ comboId: string; server: string }>>([]);
 
   useEffect(() => {
     let alive = true;
-    void api()?.mcpCombosFile?.().then((r: { path: string; exists: boolean; text: string; template?: string; error?: string }) => {
+    void api()?.mcpCombosFile?.().then((r: { path: string; exists: boolean; text: string; template?: string; error?: string; untrusted?: Array<{ comboId: string; server: string }> }) => {
       if (!alive || !r) return;
       /* 打开就展开成 2 空格缩进（不合法的原样显示，下面标出错位置）；initial 也用展开后的，光打开不算改动 */
       const text = formatJsonOnOpen(r.text);
       setPath(r.path); setExists(r.exists); setContent(r.exists ? text : ''); setInitial(r.exists ? text : '');
       setTemplate(r.template || '');
+      setUntrusted(Array.isArray(r.untrusted) ? r.untrusted : []);
       if (r.error) setStatus({ ok: false, text: t('The file on disk has errors, so only "General" is used for now: {error}', { error: r.error }) });
     }).catch((err: any) => { if (alive) setStatus({ ok: false, text: String(err?.message || err) }); })
       .finally(() => { if (alive) setLoading(false); });
@@ -79,6 +82,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
   const errorLine = invalid ? jsonErrorAt(content)?.line : null;
   const dirty = content !== initial;
 
+  /* `override` 是只改一条的自动保存（`applyMachineOverride`）：不算确认，从 S3 来、没确认过的照样不挂 */
   const save = async (override?: string) => {
     if (saving || (empty && override === undefined)) return;
     const content0 = override ?? content;
@@ -89,9 +93,9 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
     try {
       /* 按格式化后的样子写盘（只动空白，不改语义；校验仍在 main 那边） */
       const text = formatJsonText(content0).text ?? content0;
-      const r = await api().saveMcpCombos(text);
+      const r = await api().saveMcpCombos(text, { confirm: override === undefined });
       if (r?.ok) {
-        setContent(text); setInitial(text); setExists(true);
+        setContent(text); setInitial(text); setExists(true); setUntrusted(Array.isArray(r.untrusted) ? r.untrusted : []);
         setStatus({ ok: true, text: t('Saved. Sessions using this MCP profile pick up the new content the next time they reconnect; to apply it now, switch to another MCP profile in the bottom-left and back.') });
       } else {
         setStatus({ ok: false, text: t('Not saved: {error}', { error: r?.error || t('Validation failed') }) });
@@ -218,6 +222,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
       </div>
       <div className="agent-config-editor-actions">
         {status && <span className={status.ok ? 'saved' : 'error'} title={status.text}>{status.text}</span>}
+        {(!status || status.ok) && untrusted.length > 0 && <span className="error" title={untrusted.map((u) => `${u.comboId} / ${u.server}`).join('\n')}>{t('These MCP servers came from another computer via S3 sync and are not used on this computer until you review them and click Save: {names}', { names: [...new Set(untrusted.map((u) => u.server))].join(', ') })}</span>}
         {/* 插入了示例、还没存：明说还没存，免得看着像已经有了（样板里正好有个「投研」） */}
         {!exists && !status && !loading && !empty && <span className="error">{t('Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.')}</span>}
         <button
@@ -232,7 +237,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         <button
           className="btn allow"
           onClick={() => void save()}
-          disabled={loading || empty || !!invalid || saving || (!dirty && exists)}
+          disabled={loading || empty || !!invalid || saving || (!dirty && exists && !untrusted.length)}
         >
           {saving ? t('Saving…') : t('Save')}
         </button>

@@ -180,6 +180,7 @@ import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
+import { markPulledUntrusted, carryUntrusted, trustCombosText, readUntrusted, withholdUntrusted, untrustedInText } from './mcpComboTrust.ts';
 import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
 import { resolveCommand, commandMissingReason } from './commandResolve.ts';
 import { comboLocalAvailability, comboForwardStdio, setMachineOverride } from './comboAvailability.ts';
@@ -2955,7 +2956,7 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   /* 按组合文件重挂的那一次：用开始时校验过的那份（`remountMcpForSession`），期间文件又被改坏也不降级成「通用」 */
   const pinned = pinnedCombos.get(sessionId);
   const { combos, error } = pinned ? { combos: pinned, error: undefined } : readMcpCombos(os.homedir());
-  const combo = pickCombo(combos, profile.mcpCombo);
+  let combo = pickCombo(combos, profile.mcpCombo);
   if (error) {
     logger.warn('mcp-combo', `${mcpCombosPath(os.homedir())} 读不了：${error}`);
     if (profile.mcpCombo && profile.mcpCombo !== BUILTIN_COMBO_ID) {
@@ -2964,6 +2965,13 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   } else if (profile.mcpCombo && combo !== findCombo(combos, profile.mcpCombo)) {
     sessionNotice(sessionId, tr('⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
   }
+  /* 从 S3 拉回来、这台电脑上还没确认过的 MCP 不交出去（`mcpComboTrust.ts`）：stdio 命令就是在本机 / 远端起进程 */
+  const trusted = withholdUntrusted(combo, readUntrusted(os.homedir()));
+  if (trusted.withheld.length) {
+    withheldBySession.set(sessionId, trusted.withheld);
+    logger.warn('mcp-combo', `组合「${combo.name}」里从 S3 同步来、这台电脑上还没确认的 MCP 不挂：${trusted.withheld.join(', ')} sessionId=${sessionId}`);
+  } else withheldBySession.delete(sessionId);
+  combo = trusted.combo;
   /* 文件跟着 S3 同步到别的电脑：按这台电脑套上 `perMachine` 的覆盖（主机名 / 系统），交出去的是本机那份 */
   const localized = localizeCombo(combo, thisMachine());
   /* 每次起执行器都经这里准备 MCP：记下这次交出去的那份，组合文件改了时据此判断要不要重挂（`McpComboWatcher`） */
@@ -2972,6 +2980,11 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   mcpComboWatcher?.noteMounted(sessionId);
   return localized;
 }
+
+/** 上一次 `sessionCombo` 因为没确认过（S3 同步来的）而去掉的 MCP 名字 —— 准备 MCP 时并进「没带上的 MCP」一起说。 */
+const withheldBySession = new Map<string, string[]>();
+const withheldItems = (sessionId: string): McpUnavailable[] => (withheldBySession.get(sessionId) || []).map((name) => skippedItem(name,
+  tr('synced from another computer via S3 and not confirmed on this computer yet; review it in the MCP profile settings and click Save to use it')));
 
 /** 每条会话的执行器挂上时那份组合的指纹（`comboFingerprint`）—— 只在内存里，`sessionCombo` 每次准备 MCP 时更新。 */
 const mountedComboFp = new Map<string, string>();
@@ -2995,7 +3008,7 @@ function localComboTools(
     缺环境变量的、这台电脑上找不到程序的（跨电脑同步过来的路径，`resolveCommand`）不交给适配器 —— 交了也只是起不来。
     合并成一条说（`announceMcpUnavailable`：同一台电脑 + 同一个 MCP 配置 + 同一原因只说一次）。
   */
-  const unavailable: McpUnavailable[] = built.skipped.map((s) => skippedItem(s.name, tr('missing environment variable(s) {vars}', { vars: trList(s.missing) })));
+  const unavailable: McpUnavailable[] = [...withheldItems(sessionId), ...built.skipped.map((s) => skippedItem(s.name, tr('missing environment variable(s) {vars}', { vars: trList(s.missing) })))];
   const servers = built.servers.filter((s) => {
     if ('url' in s) return true;
     const env = { ...shellEnv, ...Object.fromEntries(s.env.map((e) => [e.name, e.value])) } as Record<string, string | undefined>;
@@ -3132,7 +3145,7 @@ async function ensureLocalTools(
         下面找不到程序 / 起不来的，**合并成一条**说（`announceMcpUnavailable`：同一台电脑 + 同一个 MCP 配置 + 同一原因只说一次）。
       */
       const skippedReasons: Array<{ name: string; reason: string }> = [];
-      const unavailable: McpUnavailable[] = [];
+      const unavailable: McpUnavailable[] = withheldItems(sessionId);
       for (const s of skipped) {
         const reason = s.missing ? tr('missing environment variable(s) {vars}', { vars: trList(s.missing) }) : String(s.reason);
         skippedReasons.push({ name: s.name, reason });
@@ -7265,6 +7278,9 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
           fs.mkdirSync(path.dirname(bak), { recursive: true });
           fs.copyFileSync(abs, bak);
         }
+        /* 本机原来没有的 MCP 配置先记成「没确认过」（记不下来就抛，这一轮不改写）：确认之前不挂（`mcpComboTrust.ts`） */
+        const held = markPulledUntrusted(os.homedir(), fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : undefined, text);
+        if (held) logger.warn('s3', `组合文件：从桶里来了 ${held} 个这台电脑上没有的 MCP 配置，在设置里确认（保存）之前不挂`);
         writeMcpCombosText(os.homedir(), text);
         mainWindow?.webContents.send('acp:mcp-combos-changed');
         mcpComboWatcher?.changed();
@@ -14565,7 +14581,7 @@ ${hint}` : ''}` };
   /* 文件不存在时 text 是空的、样板单独给（`template`）：编辑器不能把样板当成已经配好的内容显示 */
   ipcMain.handle('acp:mcp-combos-file', () => {
     const r = readMcpCombos(os.homedir());
-    return { path: mcpCombosPath(os.homedir()), exists: r.exists, text: r.exists ? r.text : '', template: MCP_COMBOS_TEMPLATE, error: r.error };
+    return { path: mcpCombosPath(os.homedir()), exists: r.exists, text: r.exists ? r.text : '', template: MCP_COMBOS_TEMPLATE, error: r.error, untrusted: r.exists ? untrustedInText(os.homedir(), r.text) : [] };
   });
   /**
    * 面板里标「这台电脑不可用」：给它的文本（编辑框里的）里哪些 stdio MCP 套上本机覆盖后命令还是找不到（`comboLocalAvailability`）。
@@ -14632,14 +14648,22 @@ ${hint}` : ''}` };
     logger.info('mcp-combo', `新会话默认组合：${name ? `项目 ${name}` : '全局'} -> ${id || '(跟随 / 通用)'}`);
     return { ok: true };
   });
-  ipcMain.handle('acp:save-mcp-combos', (_event, text: string) => {
+  ipcMain.handle('acp:save-mcp-combos', (_event, text: string, opts?: { confirm?: boolean }) => {
+    /* 不算确认的保存（「在这台电脑上禁用」这类只改一条的自动保存）：改的那条原来没确认过，改完也还是；记不下来就不写 */
+    if (!opts?.confirm) {
+      try { carryUntrusted(os.homedir(), readMcpCombos(os.homedir()).text || undefined, String(text ?? '')); } catch (err: any) {
+        return { ok: false, error: tr('Could not record which MCP servers are still unconfirmed: {err}', { err: String(err?.code || err?.message || err) }) };
+      }
+    }
     const r = saveMcpCombos(os.homedir(), String(text ?? ''));
     /* 原因里不带配置原文（见 parseMcpCombos / jsonSyntaxError），可以进日志 */
     if (!r.ok) { logger.warn('mcp-combo', `保存组合没成功：${r.error}`); return { ok: false, error: r.error }; }
+    /* 用户在设置里看过、点了保存 = 确认：从 S3 同步来的那些 MCP 之后照常挂（`mcpComboTrust.ts`） */
+    if (opts?.confirm) try { trustCombosText(os.homedir(), String(text ?? '')); } catch (err: any) { logger.warn('mcp-combo', `记不下「已确认」：${err?.message || err}`); }
     logger.info('mcp-combo', `保存了 ${r.combos.length - 1} 个组合（不含内置「通用」）`);
     mainWindow?.webContents.send('acp:mcp-combos-changed');
     mcpComboWatcher?.changed();
-    return { ok: true };
+    return { ok: true, untrusted: untrustedInText(os.homedir(), String(text ?? '')) };
   });
 
   /**
@@ -14804,7 +14828,7 @@ ${hint}` : ''}` };
     sessions: () => [...sessionClients.entries()]
       .filter(([sid, e]) => engineOf(e.profile) !== 'kiro' && !deletedSessionIds.has(sid))
       .map(([sid, e]) => ({ sessionId: sid, comboId: e.profile.mcpCombo, mountedFp: mountedComboFp.get(sid) })),
-    resolve: (combos, id) => localizeCombo(pickCombo(combos, id), thisMachine()),
+    resolve: (combos, id) => localizeCombo(withholdUntrusted(pickCombo(combos, id), readUntrusted(os.homedir())).combo, thisMachine()),
     isBusy: (sid) => {
       /* 正在退出：不再起新执行器 */
       if (isQuitting) return true;

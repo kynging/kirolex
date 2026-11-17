@@ -180,7 +180,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** Claude Code / Codex 的「组合」（`~/.kirolex/mcp-combos.json`，本机全局） */
   mcpCombos: (sessionId?: string) => ipcRenderer.invoke('acp:mcp-combos', sessionId),
   mcpCombosFile: () => ipcRenderer.invoke('acp:mcp-combos-file'),
-  saveMcpCombos: (text: string) => ipcRenderer.invoke('acp:save-mcp-combos', text),
+  saveMcpCombos: (text: string, opts?: { confirm?: boolean }) => ipcRenderer.invoke('acp:save-mcp-combos', text, opts),
   /** 编辑框里的组合哪些 MCP「这台电脑不可用」（命令找不到）+ 这台电脑的主机名 / 系统 */
   mcpCombosLocalCheck: (text: string) => ipcRenderer.invoke('acp:mcp-combos-local-check', text),
   /** 给一条 MCP 写上这台电脑的覆盖（perMachine），返回新文本（不存盘） */

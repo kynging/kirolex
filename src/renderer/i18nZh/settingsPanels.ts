@@ -366,6 +366,7 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
     '已保存 —— 正在用这个 MCP 配置的会话要下次重连时才按新内容起；想马上生效，在左下角先切到别的 MCP 配置、再切回来。',
   'Not saved: {error}': '没有保存：{error}',
   'Not saved yet: the file does not exist, the text above is only a template. Click Save to create it.': '还没保存：文件还不存在，上面只是样板，点「保存」才会建出来。',
+  'These MCP servers came from another computer via S3 sync and are not used on this computer until you review them and click Save: {names}': '这些 MCP 是从别的电脑经 S3 同步来的，这台电脑上看过、点「保存」之后才会用：{names}',
   'Validation failed': '校验没通过',
   'Shared by all sessions; with S3 sync on, also synced to your other computers': '所有会话共用；开了 S3 同步时也同步到你的其他电脑',
   'A list of MCP profiles: each has id, name and mcpServers. HTTP entries use url / headers (optional timeoutSec), stdio entries use command / args / env; disabled and forwardFromLocal are optional. Values in headers and env can reference local environment variables with ':
