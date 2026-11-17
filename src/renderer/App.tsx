@@ -597,6 +597,8 @@ export interface Session {
   projectId?: string;
   /** Pinned sessions sort to the top of their group. */
   pinned?: boolean;
+  /** 记录里的 `migratedFrom`：这条会话是从哪条（几条）旧会话 id 合并过来的（跨会话上下文的关联据此跟到新 id） */
+  migratedFrom?: string | string[];
   /** 「在其他电脑上同步」开着（主进程 s3Pull.ts）：自动合并其他电脑上同一条会话的新消息。缺省关 = 只备份 */
   crossDevice?: boolean;
   /**

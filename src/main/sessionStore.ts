@@ -188,6 +188,8 @@ export interface SessionRecord {
   /** User-pinned: sorts to the top of its group. Renderer mirror of session.pinned;
    *  persisted here so it survives restart AND renderer-origin (localStorage) changes. */
   pinned?: boolean;
+  /** 这条会话是从哪条（几条）旧会话 id 合并过来的。渲染层的跨会话上下文关联据此跟到新 id。 */
+  migratedFrom?: string | string[];
   /**
    * WHAT THIS CHAT IS FOR — `flow-main` is a flow's own thread, `skill` a transient canvas session.
    *

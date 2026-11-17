@@ -33,6 +33,7 @@ import { cleanIpcError } from '../sessionRequestStatus.ts';
 import { firstUserText } from '../titleSource.ts';
 import { splitNoteDetail } from '../../main/kirolexNote.ts';
 import { chatHistoryBody } from '../historyBlock.ts';
+import { dropGoneSources, isLegacyLink, migrateLegacyLink, migrationSuccessor, normalizeSavedLinks, retargetContextLinks, takeContextDelta, type ContextLink, type SourceMessage } from '../contextLinks.ts';
 import { mergeAssistantFinalIntoTurn } from '../assistantFinal.ts';
 import { appendAgentText, appendAgentThought } from '../liveReply.ts';
 import { connectFailureNotice, adapterInstalledNotice, historyBeforeNotice, replaceConnectFailureNotices } from '../connectFailure';
@@ -729,10 +730,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const commandsMapRef = useRef<Map<string, SlashCommand[]>>(new Map());
   // Maps sessionId -> model, so every call can route to the right kiro-cli process
   const sessionModelRef = useRef<Map<string, string>>(new Map());
-  // Per-target-session context links: targetId -> array of { sourceId, sourceTitle, syncedCount }.
-  // Each source keeps its own high-water mark so every send only forwards that
-  // source's delta (new messages). A target can sync from multiple sources.
-  const contextLinksRef = useRef<Map<string, { sourceId: string; sourceTitle: string; syncedCount: number }[]>>(new Map());
+  // Per-target-session context links: targetId -> array of { sourceId, sourceTitle, injectedIds }.
+  // Each source remembers WHICH of its message ids were already injected (by id, not by
+  // position -- see contextLinks.ts), so every send only forwards that source's new messages.
+  // A target can sync from multiple sources. Local to this machine (ui-state), never synced.
+  const contextLinksRef = useRef<Map<string, ContextLink[]>>(new Map());
   // Duplicated sessions awaiting backend context injection on their first send.
   // Keyed by the duplicate's pending id -> the source session's message history.
   // On the first real send, this history is injected as a <hidden> priming block
@@ -889,6 +891,66 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const view = arr.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle }));
     if (!sid || currentSessionRef.current === sid) setContextLinks(view);
     patchPane(sid, { contextLinks: view });
+  };
+
+  /**
+   * 跨会话上下文关联的统一收尾 —— 删除会话、主进程的删除通知、启动水化、列表里冒出合并后的会话、发送前都走这里：
+   * 1. 旧格式（`syncedCount`）先按**它原来那条来源**的 transcript 换成 id（来源已经没了就按它的后继读）；
+   * 2. 来源被合并成新 id（`migratedFrom`）的，关联跟过去、已注入的 id 一起带走；
+   * 3. `gone` 里确认删掉、又没有后继可跟的来源，关联去掉，并告诉用户一句。
+   * 串行执行（每次都基于上一次的结果），`live` 是这次用来找后继的会话列表（默认当前列表）。
+   */
+  const contextSettleRef = useRef<Promise<void>>(Promise.resolve());
+  const settleContextLinks = (gone: Iterable<string> = [], live?: { id: string; title?: string; migratedFrom?: string | string[] }[]): Promise<void> => {
+    const goneIds = new Set(gone);
+    const run = async () => {
+      const all = live || sessionsRef.current;
+      const sessionsNow = all.filter((s) => !goneIds.has(s.id));
+      /* 读不到（出错）给 null：这时旧格式留着，下次再迁移 */
+      const readSource = async (id: string): Promise<SourceMessage[] | null> => {
+        try {
+          const tr = await window.kiroApi.readTranscript(id);
+          return Array.isArray(tr) && tr.length > 0 ? tr : ((messagesCacheRef.current.get(id) || []) as SourceMessage[]);
+        } catch { return null; }
+      };
+      const legacySources = new Set<string>();
+      for (const arr of contextLinksRef.current.values()) for (const l of arr) if (isLegacyLink(l)) legacySources.add(l.sourceId);
+      const transcripts = new Map<string, SourceMessage[]>();
+      for (const id of legacySources) {
+        let msgs = await readSource(id);
+        const next = msgs && msgs.length === 0 ? migrationSuccessor(id, sessionsNow) : null;
+        if (next) msgs = await readSource(next);
+        if (msgs) transcripts.set(id, msgs);
+      }
+      /* 上面有 await：从现在的关联接着改（期间可能有人开 / 关过关联） */
+      const before = contextLinksRef.current;
+      let map = before;
+      let changed = false;
+      if (transcripts.size > 0) {
+        map = new Map([...map].map(([k, arr]) => [k, arr.map((l) => {
+          if (!isLegacyLink(l) || !transcripts.has(l.sourceId)) return l;
+          changed = true;
+          return migrateLegacyLink(l, transcripts.get(l.sourceId)!);
+        })]));
+      }
+      const moved = retargetContextLinks(map, sessionsNow);
+      if (moved.changed) { map = moved.links; changed = true; }
+      const dropped = dropGoneSources(map, goneIds);
+      if (dropped.changed) { map = dropped.links; changed = true; }
+      if (!changed) return;
+      const targets = new Set([currentSessionRef.current, ...before.keys(), ...map.keys()]);
+      contextLinksRef.current = map;
+      persistContextLinks();
+      for (const target of targets) refreshContextLinks(target);
+      /* 关联悄悄没了用户看不出来 —— 说一句 */
+      for (const d of dropped.dropped) {
+        const title = all.find((s) => s.id === d.sourceId)?.title || d.sourceTitle || 'New Chat';
+        showToast(t('"{title}" was deleted, so it no longer provides cross-session context to {n} chat(s)', { title, n: d.targets }));
+      }
+    };
+    const p = contextSettleRef.current.then(run).catch(() => {});
+    contextSettleRef.current = p;
+    return p;
   };
 
   const addStreaming = (sid: string) => {
@@ -2030,11 +2092,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     try {
       const savedLinks = uiGet('kirolex-context-links');
       if (savedLinks) {
-        const entries: [string, any][] = JSON.parse(savedLinks);
-        // Normalize: earlier versions stored a single object per target
-        const normalized: [string, { sourceId: string; sourceTitle: string; syncedCount: number }[]][] =
-          entries.map(([k, v]) => [k, Array.isArray(v) ? v : [v]]);
-        contextLinksRef.current = new Map(normalized);
+        // Normalize: earlier versions stored a single object per target. Old `syncedCount`
+        // links are migrated to ids once their source transcript is read (settleContextLinks at hydrate).
+        contextLinksRef.current = new Map(normalizeSavedLinks(JSON.parse(savedLinks)));
         const lastSid = uiGet('kirolex-last-session');
         const arr = lastSid ? contextLinksRef.current.get(lastSid) : undefined;
         if (arr) setContextLinks(arr.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle })));
@@ -2313,6 +2373,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                   : { remoteId: (existing as any).remoteId, remoteMissing: (existing as any).remoteMissing }),
                 /* 工作目录同理：白名单里不列就会被丢掉，而会话界面上那个 📂 显示的就是它 */
                 localDir: rec.localDir ?? (existing as any).localDir,
+                /* 从哪条旧会话合并过来的 —— 跨会话上下文的关联据此改到新 id（`contextLinks.ts`） */
+                migratedFrom: rec.migratedFrom,
               });
             } else {
               byId.set(rec.id, {
@@ -2331,6 +2393,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 localDir: rec.localDir,
                 remoteId: rec.remoteId,
                 remoteMissing: rec.remoteMissing,
+                migratedFrom: rec.migratedFrom,
                 timestamp: rec.updatedAt,
               });
             }
@@ -2361,6 +2424,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         if (diskProjects.length) {
           setProjects((prev) => Array.from(new Set([...prev, ...diskProjects])));
         }
+        /*
+          跨会话上下文：旧格式的关联在这里迁移成 id；磁盘上已经没有的来源（别处删掉的）先跟 migratedFrom，
+          跟不上的关联去掉并提示。磁盘列表是空的（多半是没读到）就不判删除，免得把关联全清掉。
+        */
+        const goneSources = new Set<string>();
+        if (disk.length > 0) {
+          for (const arr of contextLinksRef.current.values()) {
+            for (const l of arr) if (!diskIds.has(l.sourceId) && !String(l.sourceId).startsWith('pending_')) goneSources.add(l.sourceId);
+          }
+        }
+        void settleContextLinks(goneSources, disk);
       } catch {
         /* disk hydrate is best-effort; local index still works */
       } finally {
@@ -2385,6 +2459,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (!hydratedRef.current && sessions.length === 0) return;
       uiSet('kirolex-sessions', JSON.stringify(sessions));
     } catch {}
+  }, [sessions]);
+
+  /* 跨会话上下文：列表里冒出带 `migratedFrom` 的会话（水化 / 跨电脑同步拉回来的）时，把指着旧 id 的关联改到新 id */
+  useEffect(() => {
+    if (sessions.some((s) => s.migratedFrom)) void settleContextLinks([], sessions);
   }, [sessions]);
 
   // Auto-load a session on startup. currentSessionId is restored from
@@ -3589,11 +3668,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const srcUsage = usageMapRef.current.get(sessionId);
     if (srcUsage) { usageMapRef.current.set(newId, { ...srcUsage }); writeUsageMap(usageMapRef.current); }
 
-    // Copy context-sync links (each restarts its high-water mark at 0 so the
+    // Copy context-sync links (each restarts with nothing injected so the
     // duplicate re-forwards the linked sources' history on its first send)
     const links = contextLinksRef.current.get(sessionId);
     if (links && links.length > 0) {
-      contextLinksRef.current.set(newId, links.map((l) => ({ ...l, syncedCount: 0 })));
+      contextLinksRef.current.set(newId, links.map((l) => ({ sourceId: l.sourceId, sourceTitle: l.sourceTitle, injectedIds: [] })));
       persistContextLinks();
     }
 
@@ -4274,35 +4353,40 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       contextLinksRef.current.set(sid!, moved);
       persistContextLinks();
     }
+    /* 来源会话被合并成了新 id（record 的 migratedFrom）：先把关联跟过去，已注入的 id 一起带走 */
+    if (sid && contextLinksRef.current.has(sid)) await settleContextLinks();
     const links = sid ? (contextLinksRef.current.get(sid) || []) : [];
     if (links.length > 0) {
       const sections: string[] = [];
       let changed = false;
-      const updated: { sourceId: string; sourceTitle: string; syncedCount: number }[] = [];
+      const updated: ContextLink[] = [];
       for (const link of links) {
         // Authoritative source: the durable transcript (uncapped, survives
         // restart, keyed by the stable KiroLex id). Fall back to the renderer
         // cache only if the transcript is empty/unreadable (e.g. a brand-new
         // source with nothing persisted yet).
-        let srcMsgs: { role: string; content: string }[] = [];
+        let srcMsgs: SourceMessage[] = [];
+        /* 读不到 transcript（出错）时退回缓存，但这时「缓存里没有」不代表来源里真没了 —— 已注入的 id 不清 */
+        let readFailed = false;
         try {
           const t = await window.kiroApi.readTranscript(link.sourceId);
           srcMsgs = Array.isArray(t) && t.length > 0
             ? t
-            : (messagesCacheRef.current.get(link.sourceId) || []);
+            : ((messagesCacheRef.current.get(link.sourceId) || []) as SourceMessage[]);
         } catch {
-          srcMsgs = messagesCacheRef.current.get(link.sourceId) || [];
+          readFailed = true;
+          srcMsgs = (messagesCacheRef.current.get(link.sourceId) || []) as SourceMessage[];
         }
-        const delta = srcMsgs.slice(link.syncedCount);
+        /* 按 id 认新增（不按位置）：跨电脑同步插进来的更早的消息也算，注入过的永远不再发 */
+        const step = takeContextDelta(link, srcMsgs, { keepMissing: readFailed });
+        const delta = step.delta;
         if (delta.length > 0) {
           const body = chatHistoryBody(delta);
           /* 新增的只有 KiroLex 的提示 → 没什么可同步的，只把进度记上 */
           if (body) sections.push(`【${link.sourceTitle}】\n${body}`);
-          changed = true;
-          updated.push({ ...link, syncedCount: srcMsgs.length });
-        } else {
-          updated.push(link);
         }
+        if (step.changed) changed = true;
+        updated.push(step.link);
       }
       if (sections.length > 0) {
         prompt = [
@@ -4970,17 +5054,11 @@ ${text}`,
     // map keeps an entry for a chat that can never be shown again.
     noteError(sessionId, null);
     // Clean up context links: drop this session's own links and remove it as a
-    // source from any other session (its message cache is now gone).
-    let linksChanged = contextLinksRef.current.delete(sessionId);
-    for (const [target, arr] of contextLinksRef.current) {
-      const filtered = arr.filter((l) => l.sourceId !== sessionId);
-      if (filtered.length !== arr.length) {
-        if (filtered.length > 0) contextLinksRef.current.set(target, filtered);
-        else contextLinksRef.current.delete(target);
-        linksChanged = true;
-      }
-    }
-    if (linksChanged) persistContextLinks();
+    // source from any other session (its message cache is now gone) -- unless it was
+    // merged into another session (that session's record has `migratedFrom: <this id>`),
+    // in which case the links follow it to the new id, keeping what was already injected.
+    // (Awaited before the disk delete: an old-format link is migrated from this transcript first.)
+    await settleContextLinks([sessionId], sessions);
     // Refresh the current session's link indicator (a source may have been removed)
     refreshContextLinks(currentSessionRef.current);
     // Delete session files from disk
@@ -4995,6 +5073,7 @@ ${text}`,
       if (cascaded.length) {
         const gone = new Set(cascaded);
         setSessions((prev) => prev.filter((s) => !gone.has(s.id)));
+        void settleContextLinks(gone);
         for (const id of cascaded) {
           removeStreaming(id);
           attachedIdsRef.current.delete(id);
@@ -5071,6 +5150,8 @@ ${text}`,
     const gone = new Set((ids || []).filter(Boolean));
     if (!gone.size) return;
     setSessions((prev) => prev.filter((s) => !gone.has(s.id)));
+    /* 删掉的会话是别的会话的上下文来源：先跟迁移，跟不上的关联去掉并提示 */
+    void settleContextLinks(gone);
     for (const id of gone) {
       removeStreaming(id);
       attachedIdsRef.current.delete(id);
@@ -5559,7 +5640,7 @@ ${text}`,
   }, []);
 
   // Toggle a source session in the current session's context-sync set. Adding a
-  // source starts it at syncedCount 0 (first send includes its existing history);
+  // source starts with nothing injected (first send includes its existing history);
   // toggling it off removes it. Links are persistent and per-session.
   const toggleContextSource = useCallback((sourceSessionId: string, targetSessionId?: string) => {
     const target = targetSessionId || currentSessionRef.current;
@@ -5567,13 +5648,13 @@ ${text}`,
 
     const arr = contextLinksRef.current.get(target) || [];
     const exists = arr.some((l) => l.sourceId === sourceSessionId);
-    let next: { sourceId: string; sourceTitle: string; syncedCount: number }[];
+    let next: ContextLink[];
     if (exists) {
       next = arr.filter((l) => l.sourceId !== sourceSessionId);
     } else {
       const sourceTitle =
         sessions.find((s) => s.id === sourceSessionId)?.title || 'another session';
-      next = [...arr, { sourceId: sourceSessionId, sourceTitle, syncedCount: 0 }];
+      next = [...arr, { sourceId: sourceSessionId, sourceTitle, injectedIds: [] }];
     }
     if (next.length > 0) contextLinksRef.current.set(target, next);
     else contextLinksRef.current.delete(target);

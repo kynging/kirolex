@@ -18262,6 +18262,8 @@ ${hint}` : ''}` };
       ...(rec.localDir ? { localDir: rec.localDir } : null),
       /* 本会话花费（Claude Code）—— 重开窗口 / 别的设备上也接着显示累计值，不从 0 数起 */
       ...(rec.sessionCost ? { sessionCost: rec.sessionCost } : null),
+      /* 这条会话是从哪条（几条）旧会话合并过来的 —— 跨会话上下文的关联据此从旧 id 改到新 id（`contextLinks.ts`） */
+      ...(rec.migratedFrom ? { migratedFrom: rec.migratedFrom } : null),
     }));
   });
 

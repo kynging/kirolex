@@ -272,6 +272,7 @@ export const ZH_CHAT: Record<string, string> = {
   " (default)": "（默认）",
   "Sync context from other sessions": "从其他会话同步上下文",
   "Context Engineering": "上下文工程",
+  '"{title}" was deleted, so it no longer provides cross-session context to {n} chat(s)': '「{title}」已删除，不再给 {n} 个会话提供跨会话上下文',
   "Select context to sync": "选择要同步的上下文",
   "No other sessions available": "没有其他可用的会话",
   "Untitled": "未命名",
