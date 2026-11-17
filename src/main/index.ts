@@ -110,6 +110,8 @@ import { taskkillTree } from './procTree.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { stampCliSessionOwner, pinCliSessionOwnerBeforeRetarget, cliSessionOwnerMismatch } from './cliSessionOwner.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
+import { autoRecoveryCard, STUCK_NOTE_GROUP, rollbackBackupDir } from './sessionRecovery.ts';
+import { performRollback } from './sessionRollback.ts';
 import { isSafeguardBlock, isCompactCommand, isCompactionSignal, mentionsCompactionFailure, turnFailureCard, safeguardNoteGroup, COMPACT_FAILED_NOTE_GROUP, hasReplyBeyondCompaction, TURN_TEXT_HEAD_MAX } from './safeguardError.ts';
 import { RemotePortRetry } from './remotePortRetry.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
@@ -5976,6 +5978,18 @@ function noteCompactFailed(sessionId: string, errText: string): void {
     NOTE_DETAIL_SEP,
     String(errText || '').trim().slice(0, 4000)), undefined, COMPACT_FAILED_NOTE_GROUP);
   logger.warn('prompt', `压缩失败、这一轮没有产出 sessionId=${sessionId}: ${String(errText || '').replace(/\s+/g, ' ').slice(0, 200)}`);
+}
+
+/**
+ * **连着失败、自愈（自动重发 / 换后端会话）也试过了还不行**（判据 `sessionRecovery.isStuckDeadEnd`）：会话里放一张
+ * 恢复卡（同 SafeguardCard：换模型 / 换引擎 / 回滚到某条消息 / 换后端会话），原始报错折进详情。报错照旧往下报。
+ */
+function noteSessionStuck(sessionId: string, errText: string, failures: number): void {
+  noteInSession(sessionId, trConcat(
+    tr('⚠️ This chat keeps failing ({n} times in a row), even after KiroLex retried automatically.', { n: failures }),
+    NOTE_DETAIL_SEP,
+    String(errText || '').trim().slice(0, 4000)), undefined, STUCK_NOTE_GROUP);
+  logger.warn('prompt', `连续失败、自愈后仍不行，放恢复卡 sessionId=${sessionId} failures=${failures}: ${String(errText || '').replace(/\s+/g, ' ').slice(0, 200)}`);
 }
 
 /* ─────────────── 模型自己安排的「过一会儿再看」：定时提示 / 后台命令 / 监视 ───────────────
@@ -12025,6 +12039,20 @@ ${hint}` : ''}` };
       }
       /* 压缩那一下失败了、这一轮什么都没出：不留一条空白死轮 —— 会话里放一张带恢复入口的卡片（报错照旧往下报） */
       noteCompactFailedOnExit();
+      /*
+        **连着失败、自愈也试过了还不行**：同一张恢复卡（判据 `sessionRecovery.autoRecoveryCard`，窄：笼统 Internal error、
+        连着到 POISONED_AFTER、自动重发预算用光或刚换过后端会话；网络抖动 / 一次性报错不弹）。压缩失败那张上面已经落过了。
+      */
+      const recreatedAt = cliRecreatedAt.get(sessionId);
+      const stuckFailures = bareFailStreak.get(sessionId) || 0;
+      if (autoRecoveryCard({
+        error: errText,
+        compactTurn,
+        produced: hasReplyBeyondCompaction(entry.turnTextHead, !!entry.turnTextTruncated) || (entry.toolsThisTurn || 0) > 0,
+        consecutiveFailures: stuckFailures,
+        selfHealTried: plan.reason === 'budget' || (recreatedAt !== undefined && Date.now() - recreatedAt < RECREATE_COOLDOWN_MS),
+        transient: isTransientTransportError(errText),
+      }) === 'stuck') noteSessionStuck(sessionId, errText, stuckFailures);
       /* 预算用光了：说清试过几次 —— 不然看着像"它就是不行"，而实际上已经试了 4 次。 */
       if (plan.reason === 'budget') {
         logger.warn('prompt', `自动重发用光预算（${attempt} 次）sessionId=${sessionId}: ${errText.slice(0, 160)}`);
@@ -16713,6 +16741,57 @@ ${hint}` : ''}` };
       logger.warn('prompt', `card new-backend failed sessionId=${sid}: ${err?.message || err}`);
       return { ok: false, error: String(err?.message || err) };
     }
+  });
+  /*
+    **恢复卡上的「回滚到某条消息」**（SafeguardCard）—— 选中的那条及之前留下，之后的从这条会话里去掉，换一个新的后端会话，
+    上下文（只到那一条）跟着下一条消息带过去。不顺手重发。步骤在 `sessionRollback.performRollback`（有单测），全是既有零件：
+      1. 先把会进上下文的文件（record.json / transcript.jsonl / history.md / context-override.md）原样复制进回收站
+         `trash/rollback-<时间>/<id>/`（和删除会话同一个回收站，30 天后自动清，见 pruneSessionTrash）—— 不是硬删；备份不成就什么都不动；
+      2. 截短用编辑重跑同一个 `store.rewriteTranscript`；手改保存的上下文快照用快照页同一个 `store.clearContextOverride` 作废
+         （不然 ride-along 优先用它，把回滚点之后的内容又带回去）；
+      3. 换后端会话用卡片 / 控制入口 new-backend 同一个 `swapBackendSessionWhenIdle`。**这一步失败就整个撤回**（备份放回去），报失败。
+    正在跑一轮、没连上 → 不动，说一声。
+  */
+  ipcMain.handle('acp:rollback-to-message', async (_event, sessionId: string, messageId: string) => {
+    const sid = String(sessionId || '').trim();
+    const mid = String(messageId || '').trim();
+    if (!sid || !mid || !store.readRecord(sid)) return { ok: false, error: tr('Session not found') };
+    { const advRefused = refuseAdvancedOnly(sid, 'rollback-to-message'); if (advRefused) return { ok: false, error: advRefused }; }
+    const busy = busyReasonFor(sid);
+    if (busy && busy !== 'prime-pending') return { ok: false, error: tr('This chat is busy. Roll back when the current turn has finished.') };
+    if (!(await ensureAttached(sid))) return { ok: false, error: tr('Session not connected') };
+    const backupDir = path.join(SESSION_TRASH_DIR, ...rollbackBackupDir(sid));
+    const r = await performRollback(mid, {
+      sessionDir: store.sessionDirPath(sid),
+      backupDir,
+      readTranscript: () => store.readTranscript(sid),
+      rewriteTranscript: (kept) => store.rewriteTranscript(sid, kept),
+      clearContextOverride: () => { store.clearContextOverride(sid); },
+      swapBackend: () => swapBackendSessionWhenIdle(sid, 'card-rollback'),
+    });
+    if (!r.ok) {
+      logger.warn('session', `rollback failed sessionId=${sid} to ${mid}: stage=${r.stage} restored=${r.restored ?? '-'} ${r.error}`);
+      if (r.stage === 'not-found') return { ok: false, error: tr('Message {id} was not found in the saved transcript.', { id: mid }) };
+      if (r.stage === 'backup') return { ok: false, error: tr('Could not back up this chat first, so nothing was changed: {reason}', { reason: r.error }) };
+      return {
+        ok: false,
+        error: r.restored
+          ? (r.stage === 'truncate'
+            /* 截短 / 停用手改快照没成（快照删不掉时它还会被带给新后端）：没换后端 */
+            ? tr('Rollback was undone because the chat could not be cut back or its saved context snapshot could not be set aside ({reason}). The chat is unchanged and the backend was not switched.', { reason: r.error })
+            : tr('Rollback was undone because switching to a new backend session failed ({reason}). The chat is unchanged; try again when it is idle.', { reason: r.error }))
+          : tr('Rollback failed ({reason}) and the chat could not be put back automatically. The full chat before the rollback is in the KiroLex trash: {dir}', { reason: r.error, dir: backupDir }),
+        messages: store.readTranscript(sid),
+      };
+    }
+    logger.warn('session', `rolled back sessionId=${sid} to ${mid}: removed ${r.removed} message(s), override cleared=${r.overrideCleared}, backup ${backupDir}`);
+    noteInSession(sid, trConcat(
+      tr('⏪ Rolled back this chat: {n} later message(s) were removed, and a new backend session continues from that point.', { n: r.removed }),
+      NOTE_DETAIL_SEP,
+      tr('A copy of the full chat before the rollback is in the KiroLex trash (kept 30 days): {dir}', { dir: backupDir }),
+      r.overrideCleared ? `\n${tr('The context snapshot you had saved by hand was set aside too (it is in the same backup), so the new backend gets context only up to that message.')}` : ''),
+    undefined, 'session-rollback');
+    return { ok: true, removed: r.removed, backupDir, messages: store.readTranscript(sid) };
   });
   ipcMain.handle('acp:fork-backend-for-edit', async (_event, sessionId: string, keepIds: string[]) => {
     const sid = String(sessionId || '').trim();

@@ -223,6 +223,7 @@ declare global {
       truncateTranscriptBefore: (sessionId: string, messageId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       forkBackendForEdit?: (sessionId: string, keepIds: string[]) => Promise<{ mode: 'none' | 'fork' | 'fresh' | 'snapshot' | 'fallback'; reason?: string; newId?: string }>;
       newBackendSession?: (sessionId: string) => Promise<{ ok: boolean; newId?: string; error?: string }>;
+      rollbackToMessage?: (sessionId: string, messageId: string) => Promise<{ ok: boolean; removed?: number; backupDir?: string; swapped?: boolean; error?: string; messages?: { id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[] }>;
       rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }>) => Promise<{ ok: boolean }>;
       listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean; crossDevice?: boolean; remoteHost?: string; remoteId?: string; remoteMissing?: boolean }[]>;
       listSessions: () => Promise<any>;
@@ -1020,6 +1021,7 @@ const App: React.FC = () => {
     duplicateSession,
     retargetPendingSession,
     rerunFromMessage,
+    rollbackToMessage,
     switchSession,
     taskListFor,
     taskListTick,
@@ -4337,6 +4339,7 @@ const App: React.FC = () => {
         onKiroAgentChange={(agentName) => { void handleKiroAgentChange(agentName, sid || undefined); }}
         onForkMessage={messageCallbacks.onFork}
         onRerunMessage={messageCallbacks.onRerun}
+        onRollbackToMessage={rollbackToMessage}
         onSend={(text, pastes) => { void handleSendMessage(text, pastes, sid || undefined); }}
         onSteerMessage={(text, pastes) => { void handleSteerMessage(text, pastes, sid || undefined); }}
         onCancel={() => { void handleStopStream(sid || undefined); }}

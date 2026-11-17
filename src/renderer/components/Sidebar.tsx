@@ -5,6 +5,7 @@ const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions, firstShown } from '../sessionSearch';
+import { requestRecovery } from '../recoveryRequest';
 import { sessionInfoRows, sessionInfoText, type SessionInfo } from '../sessionInfo';
 import { placeMenu, placeSubmenu } from '../menuPlacement';
 import { subagentTag, type SubagentRow } from '../../main/subagents.ts';
@@ -1338,6 +1339,20 @@ export const Sidebar: React.FC<SidebarProps> = ({
               onClick={() => { setInfoFor(ctxSession.id); setContextMenu(null); }}
             >
               {`ℹ️ ${t('Session info…')}`}
+            </div>
+          )}
+          {/* 主动调出「恢复」选择器（换模型 / 换引擎 / 回滚 / 换后端会话）：不必等出错（renderer/recoveryRequest.ts） */}
+          {!ctxSession.id.startsWith('pending_') && (
+            <div
+              className="context-menu-item"
+              title={t('Stuck or blocked? Switch model or engine, roll back to an earlier message, or start a new backend session.')}
+              onClick={() => {
+                requestRecovery(ctxSession.id);
+                window.dispatchEvent(new CustomEvent('kirolex:open-session', { detail: { sessionId: ctxSession.id } }));
+                setContextMenu(null);
+              }}
+            >
+              {`🔧 ${t('Recover this chat…')}`}
             </div>
           )}
           {/* Deliberately NOT exposed here: 「重建上下文」(snapshot / full replay).

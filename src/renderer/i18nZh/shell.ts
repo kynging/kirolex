@@ -254,4 +254,7 @@ export const ZH_SHELL: Record<string, string> = {
   'Could not download "{title}" ({why}). The placeholder is kept and nothing was deleted.': '没能下载「{title}」（{why}）。占位保留，什么都没删。',
   'Downloading "{title}" from the cloud…': '正在从云端下载「{title}」…',
   '"{title}" is back on this computer.': '「{title}」已下载回本机。',
+  /* 侧栏会话菜单：主动调出恢复选择器（recoveryRequest.ts） */
+  'Recover this chat…': '恢复这条会话…',
+  'Stuck or blocked? Switch model or engine, roll back to an earlier message, or start a new backend session.': '卡住了或被拦了？换模型或引擎、回滚到之前的某条消息，或者换一个后端会话。',
 };

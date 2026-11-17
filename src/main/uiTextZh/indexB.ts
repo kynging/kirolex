@@ -283,4 +283,14 @@ export const ZH_INDEX_B: Record<string, string> = {
   "The model's safety filter flagged this whole chat, so this turn was blocked. See the KiroLex card in this chat for what to do.": '这条会话被模型的安全过滤整条标记了，这一轮被拦下。怎么办见会话里的 KiroLex 卡片。',
   '⚠️ Context compaction failed, so this turn produced no reply.': '⚠️ 上下文压缩失败了，这一轮没有任何回复。',
   '🔀 Switched to a new backend session; the context goes along with the next message.': '🔀 已换到新的后端会话，上下文跟着下一条消息带过去。',
+  // ── 会话卡住 → 恢复卡（sessionRecovery.ts、ChatArea 的 SafeguardCard）：连续失败 / 回滚 ──
+  '⚠️ This chat keeps failing ({n} times in a row), even after KiroLex retried automatically.': '⚠️ 这条会话连着失败了（{n} 次），KiroLex 自动重试过了也不行。',
+  'This chat is busy. Roll back when the current turn has finished.': '这条会话正在忙。等这一轮结束再回滚。',
+  'Could not back up this chat first, so nothing was changed: {reason}': '没能先备份这条会话，所以什么都没改：{reason}',
+  '⏪ Rolled back this chat: {n} later message(s) were removed, and a new backend session continues from that point.': '⏪ 已回滚这条会话：去掉了后面 {n} 条消息，换了一个新的后端会话从那里接着来。',
+  'A copy of the full chat before the rollback is in the KiroLex trash (kept 30 days): {dir}': '回滚前的完整会话备份在 KiroLex 回收站里（保留 30 天）：{dir}',
+  'Rollback was undone because switching to a new backend session failed ({reason}). The chat is unchanged; try again when it is idle.': '换新的后端会话失败了（{reason}），所以回滚已经撤回，会话原样没动；等它空闲了再试一次。',
+  'Rollback was undone because the chat could not be cut back or its saved context snapshot could not be set aside ({reason}). The chat is unchanged and the backend was not switched.': '没能截短这条会话、或没能停用手动保存的上下文快照（{reason}），所以回滚已经撤回：会话原样没动，也没有换后端。',
+  'Rollback failed ({reason}) and the chat could not be put back automatically. The full chat before the rollback is in the KiroLex trash: {dir}': '回滚失败了（{reason}），而且没能自动放回原样。回滚前的完整会话在 KiroLex 回收站里：{dir}',
+  'The context snapshot you had saved by hand was set aside too (it is in the same backup), so the new backend gets context only up to that message.': '你之前手动保存的上下文快照也一并停用了（同样在这份备份里），新的后端只拿到到那一条为止的上下文。',
 };

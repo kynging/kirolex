@@ -236,6 +236,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   forkBackendForEdit: (sessionId: string, keepIds: string[]) => ipcRenderer.invoke('acp:fork-backend-for-edit', sessionId, keepIds),
   /** 会话里安全过滤 / 压缩失败卡片上的「换一个新的后端会话」（main `acp:new-backend-session`） */
   newBackendSession: (sessionId: string) => ipcRenderer.invoke('acp:new-backend-session', sessionId),
+  /** 恢复卡上的「回滚到某条消息」（main `acp:rollback-to-message`）：先备份进回收站，再截短、换后端会话 */
+  rollbackToMessage: (sessionId: string, messageId: string) => ipcRenderer.invoke('acp:rollback-to-message', sessionId, messageId),
   rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: any[] }>) =>
     ipcRenderer.invoke('acp:rewrite-transcript', sessionId, messages),
   // Durable on-disk session index (source of truth for the sidebar).

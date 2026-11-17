@@ -4775,6 +4775,24 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // circular useCallback dependency.
   rerunFromMessageRef.current = rerunFromMessage;
 
+  /**
+   * **恢复卡上的「回滚到某条消息」**：主进程先把整份记录备份进回收站、再截短（同编辑重跑的 rewriteTranscript）、
+   * 再换后端会话（同 new-backend），见 main `acp:rollback-to-message`。这里只把界面换成盘上截短后的那一份。不重发。
+   */
+  const rollbackToMessage = useCallback(async (sid: string, messageId: string): Promise<{ ok: boolean; removed?: number; error?: string }> => {
+    if (!sid || sid.startsWith('pending_') || !messageId) return { ok: false, error: t('no current chat') };
+    if (streamingIdsRef.current.has(sid)) return { ok: false, error: t('This chat is busy. Roll back when the current turn has finished.') };
+    let r: Awaited<ReturnType<NonNullable<typeof window.kiroApi.rollbackToMessage>>> | undefined;
+    try { r = await window.kiroApi.rollbackToMessage?.(sid, messageId); } catch (err: any) { return { ok: false, error: cleanIpcError(err) }; }
+    if (!r?.ok) return { ok: false, error: cleanIpcError(r?.error || '') };
+    if (Array.isArray(r.messages)) {
+      const stored = withFailed(sid, r.messages.map(messageFromStored));
+      mutateSessionMessages(sid, () => stored);
+    }
+    noteError(sid, null);
+    return { ok: true, removed: r.removed, error: r.error };
+  }, [mutateSessionMessages]);
+
   // Send one queued follow-up to a specific existing session. Unlike the normal
   // composer path, this is target-addressed so queues keep draining even when
   // the user switches to another chat. The main process owns durable transcript
@@ -5797,6 +5815,7 @@ ${text}`,
     duplicateSession,
     retargetPendingSession,
     rerunFromMessage,
+    rollbackToMessage,
     switchSession,
     warmSession,
     unfocusSession,

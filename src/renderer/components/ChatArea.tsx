@@ -80,7 +80,9 @@ import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
 import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy, bedrockNoteActive } from '../../main/bedrockIam.ts';
-import { isSafeguardNoteGroup, isCompactNoteGroup, safeguardModelChoices, cyberVerificationUrl, type ModelChoice } from '../../main/safeguardError.ts';
+import { isSafeguardNoteGroup, safeguardModelChoices, cyberVerificationUrl, type ModelChoice } from '../../main/safeguardError.ts';
+import { isStuckNoteGroup, isRecoveryNoteGroup, rollbackChoices } from '../../main/sessionRecovery.ts';
+import { takeRecoveryRequest, subscribeRecoveryRequests } from '../recoveryRequest';
 import { bedrockCheckStore } from '../bedrockCheckStore.ts';
 import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
@@ -1311,27 +1313,59 @@ interface SafeguardModelSwitch {
   disabled: boolean;
 }
 
+type RecoveryEngine = 'kiro' | 'claude' | 'codex';
+const RECOVERY_ENGINES: readonly RecoveryEngine[] = ['kiro', 'claude', 'codex'];
+
 /**
- * **模型的安全过滤把整条会话标记了**（主进程 `noteSafeguardBlock` 写的那条，group 见 `main/safeguardError`）/
- * **压缩那一下失败了、这一轮什么都没出**（`noteCompactFailed`）的提示卡。
+ * **会话卡住 / 被拦时的「恢复」选择器** —— 一张卡，四个出口（外加安全过滤那一类的申请链接）。什么时候出现：
+ *   · 会话里的提示（落盘、自动弹，判据 `main/sessionRecovery`）：模型的安全过滤把整条会话标记了（`noteSafeguardBlock`）/
+ *     压缩那一下失败了、这一轮什么都没出（`noteCompactFailed`）/ 连着失败、自愈也试过了还不行（`noteSessionStuck`）；
+ *   · 你从侧栏会话菜单「🔧 恢复这条会话…」主动调出（`onClose` 有值；不落盘，关掉就收起）。
  *
- * 三个出口，按推荐顺序：
- *   1. 换一个模型（首选）—— 同一模型上发什么都会被拦；用的是模型下拉同一个入口，换完点「重跑」；
- *   2. 换一个新的后端会话（次选）—— 写明：要是上下文内容本身触发的，换会话未必能解，优先换模型；
- *   3. 正当的安全相关工作：申请 Cyber Verification Program（链接取原文里给的，没有就用默认的）。
- * 原始报错（含 Request ID / Message ID）折在「原始报错」里，不平铺。压缩失败那张没有第 3 条。
+ * 出口全是既有入口，这里只聚合：
+ *   1. 换一个模型 —— 模型下拉同一个入口（安全过滤那一类首选：同一模型上发什么都会被拦），换完点「重跑」；
+ *   2. 换一个引擎（Claude Code / Codex / kiro）—— 侧栏会话菜单「🤖 引擎」同一个 `switchEngine`；换完模型清单跟着换，再在 1 里选；
+ *   3. 回滚到某条消息 —— 选中的那条及之前留下，之后的从这条会话里去掉（整份先备份进回收站，可找回），新的后端会话只带到那一条
+ *      （main `acp:rollback-to-message`：编辑重跑同一个 rewriteTranscript + 换后端会话同一个 swapBackendSessionWhenIdle）；
+ *   4. 换一个新的后端会话 —— 带全部上下文重建；写明：要是上下文内容本身触发的，换会话未必能解，优先换模型；
+ *   5. （只有安全过滤）正当的安全相关工作：申请 Cyber Verification Program（链接取原文里给的，没有就用默认的）。
+ * 原始报错（含 Request ID / Message ID）折在「原始报错」里，不平铺。
  */
-export const SafeguardCard = memo<{ message: Message; count?: number; sessionId?: string | null; modelSwitch: SafeguardModelSwitch }>(({ message, count, sessionId, modelSwitch }) => {
+export const SafeguardCard = memo<{
+  message: Message;
+  count?: number;
+  sessionId?: string | null;
+  modelSwitch: SafeguardModelSwitch;
+  engine?: RecoveryEngine;
+  /** 这条会话的消息（回滚能选的点从这里来） */
+  messages: Message[];
+  onRollback?: (sessionId: string, messageId: string) => Promise<{ ok: boolean; removed?: number; error?: string }>;
+  /** 主动调出的那张：关掉只是收起 */
+  onClose?: () => void;
+}>(({ message, count, sessionId, modelSwitch, engine, messages, onRollback, onClose }) => {
   const t = useT();
   const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
-  const safeguard = isSafeguardNoteGroup(message.noteGroup);
+  const manual = !!onClose;
+  const safeguard = !manual && isSafeguardNoteGroup(message.noteGroup);
+  const kind = manual ? 'manual' : safeguard ? 'safeguard' : isStuckNoteGroup(message.noteGroup) ? 'stuck' : 'compact';
   const choices = safeguardModelChoices(modelSwitch.current, modelSwitch.options);
   const [picked, setPicked] = useState('');
   const [backend, setBackend] = useState<{ phase: 'idle' | 'working' | 'done' | 'failed'; error?: string }>({ phase: 'idle' });
-  if (isNoticeHidden({ id: message.id, noteGroup: message.noteGroup }, hide)) return null;
-  const { main, detail } = splitNoteDetail(message.content);
+  const currentEngine: RecoveryEngine = engine || 'kiro';
+  const engineChoices = RECOVERY_ENGINES.filter((e) => e !== currentEngine);
+  const [pickedEngine, setPickedEngine] = useState('');
+  const [engineSwitch, setEngineSwitch] = useState<{ phase: 'idle' | 'working' | 'done' | 'pending' | 'failed'; error?: string }>({ phase: 'idle' });
+  /* 回到最新那条等于什么都不去掉（那是「换后端会话」）—— 不列 */
+  const points = useMemo(() => rollbackChoices(messages.map((m) => ({ id: m.id, role: m.role, content: m.content, kirolex: isKirolexNote(m), steer: m.steer })))
+    .filter((p) => p.after > 0), [messages]);
+  const [pickedPoint, setPickedPoint] = useState('');
+  const [rollback, setRollback] = useState<{ phase: 'idle' | 'confirm' | 'working' | 'done' | 'failed'; error?: string; removed?: number }>({ phase: 'idle' });
+  if (!manual && isNoticeHidden({ id: message.id, noteGroup: message.noteGroup }, hide)) return null;
+  const { main, detail } = manual ? { main: t('🔧 Recover this chat'), detail: '' } : splitNoteDetail(message.content);
   const badge = repeatBadge(count);
   const target = choices.some((o) => o.value === picked) ? picked : (choices[0]?.value || '');
+  const targetEngine = engineChoices.find((e) => e === pickedEngine) || engineChoices[0];
+  const point = points.find((p) => p.id === pickedPoint) || points[0];
   const url = cyberVerificationUrl(detail || message.content);
   const newBackend = async () => {
     if (!sessionId) return;
@@ -1343,34 +1377,57 @@ export const SafeguardCard = memo<{ message: Message; count?: number; sessionId?
       setBackend({ phase: 'failed', error: cleanIpcError(err) });
     }
   };
+  const switchEngine = async () => {
+    if (!sessionId || !targetEngine) return;
+    setEngineSwitch({ phase: 'working' });
+    try {
+      const r = await (window as any).kiroApi?.switchEngine?.(sessionId, targetEngine);
+      setEngineSwitch(r?.pending ? { phase: 'pending' } : r?.ok ? { phase: 'done' } : { phase: 'failed', error: cleanIpcError(r?.error || '') });
+    } catch (err) {
+      setEngineSwitch({ phase: 'failed', error: cleanIpcError(err) });
+    }
+  };
+  const runRollback = async () => {
+    if (!sessionId || !onRollback || !point) return;
+    /* 先点一下变成「确认」：要去掉几条写在按钮上 */
+    if (rollback.phase !== 'confirm') { setRollback({ phase: 'confirm' }); return; }
+    setRollback({ phase: 'working' });
+    const r = await onRollback(sessionId, point.id).catch((err) => ({ ok: false, error: cleanIpcError(err), removed: undefined }));
+    setRollback(r.ok ? { phase: 'done', removed: r.removed, error: r.error } : { phase: 'failed', error: r.error });
+  };
+  const intro = kind === 'safeguard'
+    ? t('Retrying, or sending anything else (even one word) on the same model, gets the same error, so KiroLex did not resend it or switch backend sessions automatically.')
+    : kind === 'compact'
+      ? t('Compaction is itself a model call; when it fails the turn ends with nothing. Your message is still in the chat.')
+      : kind === 'stuck'
+        ? t('KiroLex already retried and switched backend sessions where it could. Sending again will most likely fail the same way; pick a way out below.')
+        : t('If this chat is stuck or keeps getting blocked, pick a way out below.');
   return (
-    <div className="kirolex-message schedule-card safeguard-card" data-status="error" data-kind={safeguard ? 'safeguard' : 'compact'} role="status">
+    <div className="kirolex-message schedule-card safeguard-card" data-status="error" data-kind={kind} role="status">
       <div className="kirolex-message-card schedule-card-box">
         <div className="schedule-card-head">
           <span className="schedule-card-title">{main}</span>
           {badge && <span className="notice-repeat" title={t('Repeated {n} times in a row', { n: count ?? 1 })}>{badge}</span>}
-          <time
-            className="kirolex-message-time"
-            dateTime={new Date(message.timestamp).toISOString()}
-            title={new Date(message.timestamp).toLocaleString()}
-          >
-            {formatMessageTime(message.timestamp)}
-          </time>
+          {!manual && (
+            <time
+              className="kirolex-message-time"
+              dateTime={new Date(message.timestamp).toISOString()}
+              title={new Date(message.timestamp).toLocaleString()}
+            >
+              {formatMessageTime(message.timestamp)}
+            </time>
+          )}
           <button
             type="button"
             className="kirolex-message-close"
-            onClick={() => dismissNotice(message.id)}
-            title={t('Close notice (display only; the conversation is unchanged)')}
-            aria-label={t('Close notice')}
+            onClick={() => (manual ? onClose!() : dismissNotice(message.id))}
+            title={manual ? t('Close') : t('Close notice (display only; the conversation is unchanged)')}
+            aria-label={manual ? t('Close') : t('Close notice')}
           >✕</button>
         </div>
-        <div className="schedule-card-section">
-          {safeguard
-            ? t('Retrying, or sending anything else (even one word) on the same model, gets the same error, so KiroLex did not resend it or switch backend sessions automatically.')
-            : t('Compaction is itself a model call; when it fails the turn ends with nothing. Your message is still in the chat.')}
-        </div>
+        <div className="schedule-card-section">{intro}</div>
         <div className="safeguard-option">
-          <div className="safeguard-option-title"><b>① {t('Switch to another model (recommended)')}</b></div>
+          <div className="safeguard-option-title"><b>① {safeguard ? t('Switch to another model (recommended)') : t('Switch to another model')}</b></div>
           <div className="safeguard-option-body">
             {choices.length > 0 ? (
               <div className="bedrock-card-actions">
@@ -1394,7 +1451,75 @@ export const SafeguardCard = memo<{ message: Message; count?: number; sessionId?
           </div>
         </div>
         <div className="safeguard-option">
-          <div className="safeguard-option-title"><b>② {t('Start a new backend session')}</b></div>
+          <div className="safeguard-option-title"><b>② {t('Switch to another engine')}</b></div>
+          <div className="safeguard-option-body">
+            <div className="bedrock-card-actions">
+              <select
+                className="composer-select safeguard-model-select"
+                value={targetEngine}
+                onChange={(e) => setPickedEngine(e.target.value)}
+                disabled={!sessionId || engineSwitch.phase === 'working'}
+                aria-label={t('Engine')}
+              >
+                {engineChoices.map((e) => <option key={e} value={e}>{engineDisplayName(e)}</option>)}
+              </select>
+              <button type="button" className="adapter-install-btn safeguard-secondary" disabled={!sessionId || !targetEngine || engineSwitch.phase === 'working'} onClick={() => { void switchEngine(); }}>
+                {engineSwitch.phase === 'working' ? t('Switching…') : t('Switch engine')}
+              </button>
+              {engineSwitch.phase === 'failed' && <span className="safeguard-error">{engineSwitch.error || t('unknown reason')}</span>}
+            </div>
+            <span className="safeguard-hint">
+              {engineSwitch.phase === 'done'
+                ? t('Switched to {engine}. Pick its model in ① if needed, then press Rerun or send again.', { engine: engineDisplayName(currentEngine) })
+                : engineSwitch.phase === 'pending'
+                  ? t('A turn is still running; the engine switches when it finishes.')
+                  : t('Now on {engine}. The chat history goes along; the new engine uses its own model list.', { engine: engineDisplayName(currentEngine) })}
+            </span>
+          </div>
+        </div>
+        <div className="safeguard-option">
+          <div className="safeguard-option-title"><b>③ {t('Roll back to an earlier message')}</b></div>
+          <div className="safeguard-option-body">
+            {point ? (
+              <div className="bedrock-card-actions">
+                <select
+                  className="composer-select safeguard-model-select safeguard-rollback-select"
+                  value={point.id}
+                  onChange={(e) => { setPickedPoint(e.target.value); setRollback({ phase: 'idle' }); }}
+                  disabled={!sessionId || rollback.phase === 'working'}
+                  aria-label={t('Roll back to')}
+                >
+                  {points.map((p) => (
+                    <option key={p.id} value={p.id}>
+                      {`${p.role === 'user' ? t('You') : t('Reply')}: ${p.preview || '…'}  (−${p.after})`}
+                    </option>
+                  ))}
+                </select>
+                <button
+                  type="button"
+                  className="adapter-install-btn safeguard-secondary"
+                  disabled={!sessionId || !onRollback || rollback.phase === 'working'}
+                  onClick={() => { void runRollback(); }}
+                >
+                  {rollback.phase === 'working' ? t('Rolling back…')
+                    : rollback.phase === 'confirm' ? t('Confirm: remove {n} later message(s)', { n: point.after })
+                      : t('Roll back to here')}
+                </button>
+                {rollback.phase === 'failed' && <span className="safeguard-error">{rollback.error || t('unknown reason')}</span>}
+              </div>
+            ) : (
+              <span>{t('There is no earlier message to roll back to.')}</span>
+            )}
+            <span className="safeguard-hint">
+              {rollback.phase === 'done'
+                ? t('Rolled back. Send your next message to continue from there.')
+                : t('Messages after that point are removed from this chat (a full copy is kept in the KiroLex trash for 30 days); a new backend session continues with only the messages up to it.')}
+            </span>
+            {rollback.phase === 'done' && rollback.error && <span className="safeguard-error">{rollback.error}</span>}
+          </div>
+        </div>
+        <div className="safeguard-option">
+          <div className="safeguard-option-title"><b>④ {t('Start a new backend session')}</b></div>
           <div className="safeguard-option-body">
             <div className="bedrock-card-actions">
               <button type="button" className="adapter-install-btn safeguard-secondary" disabled={!sessionId || backend.phase === 'working' || backend.phase === 'done'} onClick={() => { void newBackend(); }}>
@@ -1406,13 +1531,13 @@ export const SafeguardCard = memo<{ message: Message; count?: number; sessionId?
             <span className="safeguard-hint">
               {safeguard
                 ? t('The chat history goes along to the new session. If the content of this chat itself triggered the flag, a new session may not help; switch models first.')
-                : t('The chat history goes along to the new session. If that does not help, switch models first.')}
+                : t('The chat history goes along to the new session. If the content of this chat itself is what fails (for example a safety filter), a new session may not help; switch models first.')}
             </span>
           </div>
         </div>
         {safeguard && (
           <div className="safeguard-option">
-            <div className="safeguard-option-title"><b>③ {t('Legitimate security work?')}</b></div>
+            <div className="safeguard-option-title"><b>⑤ {t('Legitimate security work?')}</b></div>
             <div className="safeguard-option-body">
               <span>{t('If this is legitimate security work, you can apply for the Cyber Verification Program.')}</span>{' '}
               <button type="button" className="engine-status-link" onClick={() => { void (window as any).kiroApi?.openExternal?.(url); }}>
@@ -3765,6 +3890,8 @@ interface ChatAreaProps {
   onCancelPendingSwitch?: (kind?: string) => void;
   onForkMessage: (messageId: string) => void;
   onRerunMessage: (messageId: string, editedText: string) => void;
+  /** 恢复卡上的「回滚到某条消息」（useAcp 的 rollbackToMessage） */
+  onRollbackToMessage?: (sessionId: string, messageId: string) => Promise<{ ok: boolean; removed?: number; error?: string }>;
   turnInterrupted?: boolean;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteerMessage: (text: string, pastes?: PastedBlock[]) => void;
@@ -3914,6 +4041,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onCancelPendingSwitch,
   onForkMessage,
   onRerunMessage,
+  onRollbackToMessage,
   turnInterrupted,
   onSend,
   onSteerMessage,
@@ -4467,6 +4595,13 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       describeSwitchFailure(sid, 'combo'));
   };
   const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
+  /* 主动调出的恢复选择器（侧栏会话菜单发的请求，renderer/recoveryRequest.ts）：显示着这条会话的聊天格认领 */
+  const [manualRecovery, setManualRecovery] = useState<string | null>(null);
+  useEffect(() => {
+    const claim = () => { if (takeRecoveryRequest(currentSessionId)) setManualRecovery(currentSessionId || null); };
+    claim();
+    return subscribeRecoveryRequests(claim);
+  }, [currentSessionId]);
   /* 安全过滤卡片上的「换一个模型」：和输入框下面的模型下拉同一个入口、同一份清单（SafeguardCard） */
   const safeguardModelSwitch: SafeguardModelSwitch = nonKiro
     ? {
@@ -5555,8 +5690,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <ScheduleWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
           ) : group.kind === 'bgWake' ? (
             <BgWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
-          ) : group.kind === 'kirolex' && (isSafeguardNoteGroup(group.message.noteGroup) || isCompactNoteGroup(group.message.noteGroup)) ? (
-            <SafeguardCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} sessionId={currentSessionId} modelSwitch={safeguardModelSwitch} />
+          ) : group.kind === 'kirolex' && isRecoveryNoteGroup(group.message.noteGroup) ? (
+            <SafeguardCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} sessionId={currentSessionId} modelSwitch={safeguardModelSwitch} engine={engine} messages={messages} onRollback={onRollbackToMessage} />
           ) : group.kind === 'kirolex' && parseDeniedNoteGroup(group.message.noteGroup) ? (
             <BedrockDeniedCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} engine={engine} machineId={noteMachineId} />
           ) : group.kind === 'kirolex' && scheduleView.ends.has(group.message.id) ? (
@@ -5607,6 +5742,20 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
         {/* 等待提示卡：那条提示还没进列表（这一轮正在流式输出时提示先攒着，插在中间会把回复拆成两段）—— 跟在回复后面画 */}
         {pendingCard && !livePendingId && <PendingSwitchCard {...pendingCard} />}
+
+        {/* 主动调出的「恢复」选择器（侧栏会话菜单「🔧 恢复这条会话…」）：和会话里那张恢复卡同一张，不落盘 */}
+        {manualRecovery && manualRecovery === currentSessionId && (
+          <SafeguardCard
+            key={`recovery:${currentSessionId}`}
+            message={{ id: `recovery:${currentSessionId}`, role: 'assistant', content: '', timestamp: Date.now() }}
+            sessionId={currentSessionId}
+            modelSwitch={safeguardModelSwitch}
+            engine={engine}
+            messages={messages}
+            onRollback={onRollbackToMessage}
+            onClose={() => setManualRecovery(null)}
+          />
+        )}
 
         {plan.length > 0 && (
           <div className="turn-panels">

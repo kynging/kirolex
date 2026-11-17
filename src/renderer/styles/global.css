@@ -10128,3 +10128,8 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .safeguard-hint { color: var(--text-tertiary); font-size: 10.5px; }
 .safeguard-error { color: var(--error, #f85149); font-size: 10.5px; white-space: pre-wrap; }
 .adapter-install-btn.safeguard-secondary { background: transparent; color: var(--accent); }
+/* 恢复选择器（同一张 SafeguardCard）：连续失败那张、主动调出那张 */
+.safeguard-card[data-kind="stuck"] .kirolex-message-card { border-color: rgba(210, 153, 34, 0.55); }
+.safeguard-card[data-kind="manual"] .kirolex-message-card { border-color: var(--accent); }
+.safeguard-option, .safeguard-option-body, .safeguard-option-body .bedrock-card-actions { min-width: 0; }
+.safeguard-option-body .safeguard-model-select { max-width: 100%; min-width: 0; text-overflow: ellipsis; }
