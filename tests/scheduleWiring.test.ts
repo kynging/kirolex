@@ -159,6 +159,18 @@ describe('a chat with a scheduled task says so, in both places you look', () => 
     assert.doesNotMatch(CSS, /session-schedule-by-model/, 'unused "by model" chip style left behind');
   });
 
+  test('the alarm icon sits LEFT of the title (status dot → ⏰ → title); the crew count stays right', () => {
+    // 用户 2026-11-17：「左侧栏中，把闹钟的图标放到文字左侧吧」.
+    const dot = SIDEBAR.indexOf('session-dot ${sessionStatus}');
+    assert.ok(dot >= 0, 'no status dot on the row');
+    const badge = SIDEBAR.indexOf('className={`session-schedule', dot);
+    const title = SIDEBAR.indexOf('{displayTitle(lang, session.title)}', dot);
+    const crew = SIDEBAR.indexOf('className="session-crew"', dot);
+    assert.ok(badge > dot, 'the schedule badge must come after the status dot');
+    assert.ok(title > badge, 'the schedule badge must come before the title');
+    assert.ok(crew > title, 'the subagent count must stay after the title');
+  });
+
   test('no schedule means NO banner and NO badge, never an empty chip', () => {
     // `sessionScheduleSummary` returns null for a chat with no live jobs, so both sites must be
     // guarded. An always-rendered empty element is worse than nothing: it reads as "scheduled".

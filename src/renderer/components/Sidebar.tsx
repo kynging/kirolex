@@ -359,8 +359,9 @@ const SessionItem: React.FC<{
       {session.crossDevice && <span className="session-pin session-cross-device" title={t('Syncing new messages with your other computers')}>🔗</span>}
       {/*
         画布会话那个 🧩 挪到了**右边**那排标记里 —— 「你把 flow 那个 tag 加到会话的右侧，不是左侧」。
-        左边这一段是「这一行本身」的东西（分屏序号、📌、状态灯），而 flow 的身份和 worker 的 tag、子代理计数、
-        定时器一样，都属于右边那排「它现在是什么状态」。
+        左边这一段是「这一行本身」的东西（分屏序号、📌、状态灯），而 flow 的身份和 worker 的 tag、子代理计数
+        一样，都属于右边那排「它现在是什么状态」。定时器例外：用户 2026-11-17 要求「把闹钟的图标放到文字左侧」，
+        所以 ⏰ 放在标题左边（见下）。
       */}
       {off ? (
         <span className={`session-offload-icon${off.restoring ? ' restoring' : ''}`} title={offTitle}>{off.restoring ? '⏳' : '☁'}</span>
@@ -370,12 +371,22 @@ const SessionItem: React.FC<{
             the green idle light nor the green reply animation. */}
         {sessionStatus === 'rebuilding' && <span className="session-dot-arc" />}
       </span>}
+      {/* The row shows only an icon (⏰, or ⏸️ when paused) and carries the full sentence as its
+          tooltip: a countdown here crowded the title out (「你就显示一个闹钟就行，具体多少时间不用
+          显示」), while a row that showed nothing made a scheduled chat look ordinary from outside.
+          位置：按用户 2026-11-17 的说法「把闹钟的图标放到文字左侧」，紧挨在标题左边（状态灯 → ⏰ → 标题）；
+          它 flex-shrink: 0，长标题只会在自己那格里省略，挤不掉它。 */}
+      {scheduleSummary && (
+        <span
+          className={`session-schedule${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
+          title={scheduleSummary.byModel ? `${t('🤖 Created by the model')} · ${scheduleSummary.text}` : scheduleSummary.text}
+        >
+          {scheduleSummary.paused ? '⏸️' : '⏰'}
+        </span>
+      )}
       <span style={{ flex: 1, overflow: 'hidden', textOverflow: 'ellipsis', whiteSpace: 'nowrap' }}>
         {displayTitle(lang, session.title)}
       </span>
-      {/* The row shows only an icon (⏰, or ⏸️ when paused) and carries the full sentence as its
-          tooltip: a countdown here crowded the title out (「你就显示一个闹钟就行，具体多少时间不用
-          显示」), while a row that showed nothing made a scheduled chat look ordinary from outside. */}
       {/*
         子代理在跑的标记 —— 「如果有subagent在运行左侧的会话上也应该有一个tag，直到subagent被关掉」。
         计数只算还没 terminated 的那些；名单是 kiro 自己报的（名字 / worker agent / 状态都在 title 里）。
@@ -383,14 +394,6 @@ const SessionItem: React.FC<{
       {crew && (
         <span className="session-crew" title={`${t('{n} subagent(s) running:', { n: crew.count })}\n${crew.title}`}>
           🤖 {crew.count}
-        </span>
-      )}
-      {scheduleSummary && (
-        <span
-          className={`session-schedule${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}`}
-          title={scheduleSummary.byModel ? `${t('🤖 Created by the model')} · ${scheduleSummary.text}` : scheduleSummary.text}
-        >
-          {scheduleSummary.paused ? '⏸️' : '⏰'}
         </span>
       )}
       {/*
