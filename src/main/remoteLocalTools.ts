@@ -160,6 +160,8 @@ export function remoteAgentScript(
 ): string {
   const program = [
     'import json, os, hashlib',
+    /* 会话 agent 里带着本机 local-MCP 的 token（远端打到本机 shell 的唯一一道锁）：只许自己读，见下面写文件那段 */
+    'os.umask(0o077)',
     'h = os.path.expanduser("~/.kiro/agents")',
     'base = os.environ.get("KX_BASE", "")',
     'out = os.environ["KX_OUT"]',
@@ -218,14 +220,31 @@ export function remoteAgentScript(
     '    cfg["toolsSettings"] = {k: v for k, v in cfg["toolsSettings"].items() if k not in native_write}',
     'allowed = [t for t in (src.get("allowedTools") or []) if kept(t) and not trusts_write(t)]',
     'cfg["allowedTools"] = allowed + [t for t in tags if t not in allowed]',
-    'os.makedirs(h, exist_ok=True)',
-    'open(os.path.join(h, out + ".json"), "w").write(json.dumps(cfg, indent=2))',
+    /*
+      **0600 写** —— 文件里的 url 带着 `/mcp/<token>`，而反向隧道在远端是 127.0.0.1，那台机器上谁都连得上；
+      默认 umask 022 下文件是 0644，同机别的用户读到 token 就能经隧道在本机跑 local_bash。
+      **不原地重写**旧文件（上次崩溃留下的、同会话重连复用的可能还是 0644）：别人早先打开着它的
+      描述符在 chmod 之后照样能读到新内容。所以同目录新建一份 0600 临时文件，写完 `os.replace` 原子换上。
+    */
+    'import tempfile',
+    'os.makedirs(h, 0o700, exist_ok=True)',
+    'p = os.path.join(h, out + ".json")',
+    'fd, tmp = tempfile.mkstemp(dir=h, prefix="." + out + ".", suffix=".tmp")',
+    'try:',
+    '    os.fchmod(fd, 0o600)',
+    '    with os.fdopen(fd, "w") as f:',
+    '        f.write(json.dumps(cfg, indent=2))',
+    '    os.replace(tmp, p)',
+    'except BaseException:',
+    '    try: os.unlink(tmp)',
+    '    except OSError: pass',
+    '    raise',
     'print("KX_AGENT " + (found or "default"))',
   ].join('\n');
   const fwd = JSON.stringify(Object.fromEntries(forwarded.map((f) => [f.name, f.url])));
   const env = `KX_OUT=${shq(sessionAgent)} KX_URL=${shq(url)} KX_BASE=${shq(baseAgent || '')} KX_FWD=${shq(fwd)}`
     + (dropUpstream.length ? ` KX_DROP=${shq(JSON.stringify(dropUpstream))}` : '');
-  return `mkdir -p ~/.kiro/agents && ${env} python3 -c '${program}'`;
+  return `umask 077 && mkdir -p ~/.kiro/agents && ${env} python3 -c '${program}'`;
 }
 
 /** 解析上面那段脚本的输出：用的是哪个底子（`default` = 远端没有同名 agent）。 */
