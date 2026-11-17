@@ -28,6 +28,7 @@ import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarge
 import { insertOptimistic, isDuplicateMessageError, removeOptimistic } from '../queueRetry';
 import { isKirolexNote, normalizeLegacyNote } from '../../main/kirolexNote.ts';
 import { asVariants } from '../../main/uiText.ts';
+import { isSafeguardReport } from '../../main/safeguardError.ts';
 import { withLiveNote, notesAfterReload } from '../noticeMerge.ts';
 import { cleanIpcError } from '../sessionRequestStatus.ts';
 import { firstUserText } from '../titleSource.ts';
@@ -4433,6 +4434,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         // leaving a dead-looking chat. Its turn-end event clears this normally.
         if (!msg.includes('change to finish')) addStreaming(sid);
         setSessionActivity(sid, t('⏳ The current turn is still running (maybe compacting context); send after it finishes.'));
+      } else if (isSafeguardReport(msg)) {
+        /*
+          **模型的安全过滤把整条会话标记了**（main 的 noteSafeguardBlock）：可操作的卡片已经落在会话里（换模型 / 换后端会话 / 申请链接），
+          这里不重连重发（同样的模型再发一遍照样被拦），也不再插一个铺着原文的助手气泡。你的那条消息已经在盘上，换完模型点「重跑」即可。
+        */
+        turnOutcomeRef.current.set(sid!, { kind: 'error', message: msg });
       } else {
         // Not attached (dormant/reopened this run) -> attach the SAME session
         // (main resumes its kiro-cli session; the KiroLex id stays stable) and retry once.
@@ -4934,6 +4941,8 @@ ${text}`,
         || message.includes('already in progress')
         || message.includes('仍在后端运行')
         || message.includes('change to finish')
+        /* 安全过滤的会话级拦截：卡片已经在会话里，重连重发照样被拦（safeguardError.ts） */
+        || isSafeguardReport(message)
       ) {
         deliveryError = firstError;
       } else {
@@ -4949,6 +4958,8 @@ ${text}`,
       finishStreamingTurn(sessionId, turnToken);
     }
 
+    /* 安全过滤拦下的那条同样已经在盘上了（卡片就挂在它后面）：气泡留着 */
+    if (deliveryError && isSafeguardReport(String(deliveryError?.message || deliveryError))) throw deliveryError;
     if (deliveryError) {
       /* 主进程说这一条已经在盘上（答过了 / 上次已经开始执行）：气泡留着 —— 它就是盘上那条，不是这一次多插的 */
       if (!isDuplicateMessageError(String(deliveryError?.message || deliveryError))) undoOptimistic();

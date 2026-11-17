@@ -80,6 +80,7 @@ import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
 import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy, bedrockNoteActive } from '../../main/bedrockIam.ts';
+import { isSafeguardNoteGroup, isCompactNoteGroup, safeguardModelChoices, cyberVerificationUrl, type ModelChoice } from '../../main/safeguardError.ts';
 import { bedrockCheckStore } from '../bedrockCheckStore.ts';
 import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
@@ -1293,6 +1294,136 @@ const BedrockDeniedCard = memo<{ message: Message; count?: number; engine?: stri
         {detail && (
           <details className="notice-detail schedule-card-detail">
             <summary>{t('Details')}</summary>
+            <div className="notice-detail-body">{detail}</div>
+          </details>
+        )}
+      </div>
+    </div>
+  );
+});
+
+/** 卡片上「换一个模型」要的东西：用的是模型下拉同一个入口（kiro 的 onModelChange / Claude Code、Codex 的 onEngineModelChange）。 */
+interface SafeguardModelSwitch {
+  current: string;
+  options: ModelChoice[];
+  pick: (model: string) => void | Promise<void>;
+  /** 正在换 / 没连上：按钮不能点 */
+  disabled: boolean;
+}
+
+/**
+ * **模型的安全过滤把整条会话标记了**（主进程 `noteSafeguardBlock` 写的那条，group 见 `main/safeguardError`）/
+ * **压缩那一下失败了、这一轮什么都没出**（`noteCompactFailed`）的提示卡。
+ *
+ * 三个出口，按推荐顺序：
+ *   1. 换一个模型（首选）—— 同一模型上发什么都会被拦；用的是模型下拉同一个入口，换完点「重跑」；
+ *   2. 换一个新的后端会话（次选）—— 写明：要是上下文内容本身触发的，换会话未必能解，优先换模型；
+ *   3. 正当的安全相关工作：申请 Cyber Verification Program（链接取原文里给的，没有就用默认的）。
+ * 原始报错（含 Request ID / Message ID）折在「原始报错」里，不平铺。压缩失败那张没有第 3 条。
+ */
+export const SafeguardCard = memo<{ message: Message; count?: number; sessionId?: string | null; modelSwitch: SafeguardModelSwitch }>(({ message, count, sessionId, modelSwitch }) => {
+  const t = useT();
+  const hide = useSyncExternalStore(noticeHideStore.subscribe, noticeHideStore.get);
+  const safeguard = isSafeguardNoteGroup(message.noteGroup);
+  const choices = safeguardModelChoices(modelSwitch.current, modelSwitch.options);
+  const [picked, setPicked] = useState('');
+  const [backend, setBackend] = useState<{ phase: 'idle' | 'working' | 'done' | 'failed'; error?: string }>({ phase: 'idle' });
+  if (isNoticeHidden({ id: message.id, noteGroup: message.noteGroup }, hide)) return null;
+  const { main, detail } = splitNoteDetail(message.content);
+  const badge = repeatBadge(count);
+  const target = choices.some((o) => o.value === picked) ? picked : (choices[0]?.value || '');
+  const url = cyberVerificationUrl(detail || message.content);
+  const newBackend = async () => {
+    if (!sessionId) return;
+    setBackend({ phase: 'working' });
+    try {
+      const r = await (window as any).kiroApi?.newBackendSession?.(sessionId);
+      setBackend(r?.ok ? { phase: 'done' } : { phase: 'failed', error: cleanIpcError(r?.error || '') });
+    } catch (err) {
+      setBackend({ phase: 'failed', error: cleanIpcError(err) });
+    }
+  };
+  return (
+    <div className="kirolex-message schedule-card safeguard-card" data-status="error" data-kind={safeguard ? 'safeguard' : 'compact'} role="status">
+      <div className="kirolex-message-card schedule-card-box">
+        <div className="schedule-card-head">
+          <span className="schedule-card-title">{main}</span>
+          {badge && <span className="notice-repeat" title={t('Repeated {n} times in a row', { n: count ?? 1 })}>{badge}</span>}
+          <time
+            className="kirolex-message-time"
+            dateTime={new Date(message.timestamp).toISOString()}
+            title={new Date(message.timestamp).toLocaleString()}
+          >
+            {formatMessageTime(message.timestamp)}
+          </time>
+          <button
+            type="button"
+            className="kirolex-message-close"
+            onClick={() => dismissNotice(message.id)}
+            title={t('Close notice (display only; the conversation is unchanged)')}
+            aria-label={t('Close notice')}
+          >✕</button>
+        </div>
+        <div className="schedule-card-section">
+          {safeguard
+            ? t('Retrying, or sending anything else (even one word) on the same model, gets the same error, so KiroLex did not resend it or switch backend sessions automatically.')
+            : t('Compaction is itself a model call; when it fails the turn ends with nothing. Your message is still in the chat.')}
+        </div>
+        <div className="safeguard-option">
+          <div className="safeguard-option-title"><b>① {t('Switch to another model (recommended)')}</b></div>
+          <div className="safeguard-option-body">
+            {choices.length > 0 ? (
+              <div className="bedrock-card-actions">
+                <select
+                  className="composer-select safeguard-model-select"
+                  value={target}
+                  onChange={(e) => setPicked(e.target.value)}
+                  disabled={modelSwitch.disabled}
+                  aria-label={t('Model')}
+                >
+                  {choices.map((o) => <option key={o.value} value={o.value}>{o.name}</option>)}
+                </select>
+                <button type="button" className="adapter-install-btn" disabled={modelSwitch.disabled || !target} onClick={() => { void modelSwitch.pick(target); }}>
+                  {t('Switch model')}
+                </button>
+              </div>
+            ) : (
+              <span>{t('No other model is available in this chat right now; pick one in the model list below once it is connected.')}</span>
+            )}
+            <span className="safeguard-hint">{t('Then press Rerun on your message, or send it again.')}</span>
+          </div>
+        </div>
+        <div className="safeguard-option">
+          <div className="safeguard-option-title"><b>② {t('Start a new backend session')}</b></div>
+          <div className="safeguard-option-body">
+            <div className="bedrock-card-actions">
+              <button type="button" className="adapter-install-btn safeguard-secondary" disabled={!sessionId || backend.phase === 'working' || backend.phase === 'done'} onClick={() => { void newBackend(); }}>
+                {backend.phase === 'working' ? t('Switching…') : t('New backend session')}
+              </button>
+              {backend.phase === 'done' && <span className="safeguard-hint">{t('Done. The context goes along with your next message.')}</span>}
+              {backend.phase === 'failed' && <span className="safeguard-error">{backend.error || t('unknown reason')}</span>}
+            </div>
+            <span className="safeguard-hint">
+              {safeguard
+                ? t('The chat history goes along to the new session. If the content of this chat itself triggered the flag, a new session may not help; switch models first.')
+                : t('The chat history goes along to the new session. If that does not help, switch models first.')}
+            </span>
+          </div>
+        </div>
+        {safeguard && (
+          <div className="safeguard-option">
+            <div className="safeguard-option-title"><b>③ {t('Legitimate security work?')}</b></div>
+            <div className="safeguard-option-body">
+              <span>{t('If this is legitimate security work, you can apply for the Cyber Verification Program.')}</span>{' '}
+              <button type="button" className="engine-status-link" onClick={() => { void (window as any).kiroApi?.openExternal?.(url); }}>
+                {t('Apply for the Cyber Verification Program')}
+              </button>
+            </div>
+          </div>
+        )}
+        {detail && (
+          <details className="notice-detail schedule-card-detail">
+            <summary>{t('Original error (for troubleshooting)')}</summary>
             <div className="notice-detail-body">{detail}</div>
           </details>
         )}
@@ -4336,6 +4467,20 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
       describeSwitchFailure(sid, 'combo'));
   };
   const onEngineModelChange = (value: string): Promise<void> => onEngineOptionChange('model', value);
+  /* 安全过滤卡片上的「换一个模型」：和输入框下面的模型下拉同一个入口、同一份清单（SafeguardCard） */
+  const safeguardModelSwitch: SafeguardModelSwitch = nonKiro
+    ? {
+      current: pendingSwitch?.engineModel ?? (engineModels?.current || ''),
+      options: (engineModels?.options || []).map((o) => ({ value: o.value, name: o.name })),
+      pick: onEngineModelChange,
+      disabled: !currentSessionId || engineModelBusy || status !== 'connected',
+    }
+    : {
+      current: pendingSwitch?.model ?? selectedModel,
+      options: (models || []).map((m: any) => ({ value: String(m.model_id), name: String(m.model_name || m.model_id) })),
+      pick: onModelChange,
+      disabled: !currentSessionId || switchingModel || status !== 'connected',
+    };
   const onEngineOptionChange = async (category: 'model' | 'thought_level' | 'mode' | 'collaboration_mode', value: string): Promise<void> => {
     if (!currentSessionId) return;
     const sid = currentSessionId;
@@ -5410,6 +5555,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             <ScheduleWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
           ) : group.kind === 'bgWake' ? (
             <BgWakeCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} card={group.card} />
+          ) : group.kind === 'kirolex' && (isSafeguardNoteGroup(group.message.noteGroup) || isCompactNoteGroup(group.message.noteGroup)) ? (
+            <SafeguardCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} sessionId={currentSessionId} modelSwitch={safeguardModelSwitch} />
           ) : group.kind === 'kirolex' && parseDeniedNoteGroup(group.message.noteGroup) ? (
             <BedrockDeniedCard key={`${currentSessionId ?? 'none'}:${group.message.id}`} message={group.message} count={group.count} engine={engine} machineId={noteMachineId} />
           ) : group.kind === 'kirolex' && scheduleView.ends.has(group.message.id) ? (

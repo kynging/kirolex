@@ -234,6 +234,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('acp:truncate-transcript-before', sessionId, messageId),
   /** 编辑重发：Claude Code / Codex 从保留下来的最后一条回复处分出新的后端会话（审计 10，main `acp:fork-backend-for-edit`） */
   forkBackendForEdit: (sessionId: string, keepIds: string[]) => ipcRenderer.invoke('acp:fork-backend-for-edit', sessionId, keepIds),
+  /** 会话里安全过滤 / 压缩失败卡片上的「换一个新的后端会话」（main `acp:new-backend-session`） */
+  newBackendSession: (sessionId: string) => ipcRenderer.invoke('acp:new-backend-session', sessionId),
   rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: any[] }>) =>
     ipcRenderer.invoke('acp:rewrite-transcript', sessionId, messages),
   // Durable on-disk session index (source of truth for the sidebar).

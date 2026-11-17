@@ -10115,3 +10115,16 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .kiro-login-pane { padding: 16px; overflow: auto; }
 .kiro-login-entry { margin: 6px 0 10px; display: flex; flex-direction: column; gap: 6px; align-items: flex-start; }
 .kiro-login-entry .kiro-login-card { margin: 0; max-width: none; align-self: stretch; }
+
+/* 模型安全过滤 / 压缩失败：会话里的提示卡（ChatArea SafeguardCard）—— 三个出口按推荐顺序 */
+.safeguard-card .kirolex-message-card { border-color: rgba(248, 81, 73, 0.5); }
+.safeguard-card[data-kind="compact"] .kirolex-message-card { border-color: rgba(210, 153, 34, 0.55); }
+.safeguard-card .schedule-card-section { font-size: 11.5px; color: var(--text-secondary); }
+.safeguard-option { margin-top: 8px; font-size: 11.5px; white-space: normal; text-align: left; }
+.safeguard-option-title { margin-bottom: 3px; }
+.safeguard-option-body { display: flex; flex-direction: column; gap: 4px; padding-left: 14px; color: var(--text-secondary); }
+.safeguard-model-select { max-width: 260px; }
+.safeguard-option-body .engine-status-link { align-self: flex-start; }
+.safeguard-hint { color: var(--text-tertiary); font-size: 10.5px; }
+.safeguard-error { color: var(--error, #f85149); font-size: 10.5px; white-space: pre-wrap; }
+.adapter-install-btn.safeguard-secondary { background: transparent; color: var(--accent); }

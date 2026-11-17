@@ -276,4 +276,11 @@ export const ZH_INDEX_B: Record<string, string> = {
   "The cloud-offload list file is unreadable, so it was not changed.": "「已移到云端」的名单文件读不了，没有改它。",
   'This machine ({name}) has been removed from Settings, so this session will not connect to its old address. Add it back in Settings → 🖥 Machines, or move this session to another machine.': '这台机器（{name}）已从设置里删除，这条会话不会再去连它的旧地址。到「设置 → 🖥 机器」把它加回来，或者把这条会话换到别的机器上。',
   "Choose Free or Pro first (Pro: the start URL must start with https://, the region looks like us-east-1).": "先选免费或 Pro（Pro 的 start URL 要以 https:// 开头，区形如 us-east-1）。",
+  // ── 模型安全过滤的会话级拦截 / 压缩失败（safeguardError.ts、ChatArea 的 SafeguardCard） ──
+  "⚠️ The model's safety filter blocked context compaction, so this turn produced nothing. It has flagged this whole chat: anything sent on the same model will keep failing.": '⚠️ 上下文压缩被模型的安全过滤拦下了，这一轮没有任何产出。这条会话已被整条标记：继续在同一个模型上发消息会一直失败。',
+  "⚠️ The model's safety filter flagged this whole chat. Anything sent on the same model will keep failing.": '⚠️ 这条会话被模型的安全过滤整条标记了。继续在同一个模型上发消息会一直失败。',
+  "The model's safety filter blocked context compaction in this chat. See the KiroLex card in this chat for what to do.": '这条会话的上下文压缩被模型的安全过滤拦下了。怎么办见会话里的 KiroLex 卡片。',
+  "The model's safety filter flagged this whole chat, so this turn was blocked. See the KiroLex card in this chat for what to do.": '这条会话被模型的安全过滤整条标记了，这一轮被拦下。怎么办见会话里的 KiroLex 卡片。',
+  '⚠️ Context compaction failed, so this turn produced no reply.': '⚠️ 上下文压缩失败了，这一轮没有任何回复。',
+  '🔀 Switched to a new backend session; the context goes along with the next message.': '🔀 已换到新的后端会话，上下文跟着下一条消息带过去。',
 };

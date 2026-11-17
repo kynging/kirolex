@@ -46,6 +46,7 @@ import { isKirolexNote } from '../main/kirolexNote.ts';
 import { newChatModel } from '../main/engineModelPick.ts';
 import { queuedBatch, joinQueuedBatch } from './queueBatch';
 import { pickQueuedBatch, sealRetryBatch, editQueuedItem, QueueBackoff, isDuplicateMessageError, type RetryBatch } from './queueRetry';
+import { isSafeguardReport } from '../main/safeguardError';
 import { noteSessionLocally } from './hooks/useSessionNotice';
 import { useFeatureFlags } from './hooks/useFeatureFlags';
 import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserView';
@@ -221,6 +222,7 @@ declare global {
       readTranscript: (sessionId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       truncateTranscriptBefore: (sessionId: string, messageId: string) => Promise<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }[]>;
       forkBackendForEdit?: (sessionId: string, keepIds: string[]) => Promise<{ mode: 'none' | 'fork' | 'fresh' | 'snapshot' | 'fallback'; reason?: string; newId?: string }>;
+      newBackendSession?: (sessionId: string) => Promise<{ ok: boolean; newId?: string; error?: string }>;
       rewriteTranscript: (sessionId: string, messages: Array<{ id: string; role: 'user' | 'assistant'; content: string; ts: number; toolCalls?: ToolCall[] }>) => Promise<{ ok: boolean }>;
       listDurableSessions: () => Promise<{ id: string; title: string; projectId?: string; model?: string; createdAt: number; updatedAt: number; archived: boolean; pinned?: boolean; crossDevice?: boolean; remoteHost?: string; remoteId?: string; remoteMissing?: boolean }[]>;
       listSessions: () => Promise<any>;
@@ -3944,6 +3946,15 @@ const App: React.FC = () => {
           /* 主进程说这一条已经发过、也答过了：再放回去发多少次都是这个结论 —— 不放回 */
           if (isDuplicateMessageError(String(error?.message || error))) {
             console.warn('Queued message already answered; not re-queued:', error);
+            queueBackoffRef.current.ok(sessionId);
+            return;
+          }
+          /*
+            **模型的安全过滤把整条会话标记了**：这一条已经落盘、卡片挂在它后面；放回队列退避重发只会被同样拦下、
+            卡片一张张叠 —— 不放回，换了模型点「重跑」（safeguardError.ts）
+          */
+          if (isSafeguardReport(String(error?.message || error))) {
+            console.warn('Queued message blocked by the model safety filter; not re-queued:', error);
             queueBackoffRef.current.ok(sessionId);
             return;
           }

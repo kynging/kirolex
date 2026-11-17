@@ -110,6 +110,7 @@ import { taskkillTree } from './procTree.ts';
 import { staleVerdict, staleRecoveryNote, isBareInternalError, POISONED_AFTER, RECREATE_COOLDOWN_MS } from './staleSession.ts';
 import { stampCliSessionOwner, pinCliSessionOwnerBeforeRetarget, cliSessionOwnerMismatch } from './cliSessionOwner.ts';
 import { isTransientTransportError as isTransientTransportErrorImpl } from './transientError.ts';
+import { isSafeguardBlock, isCompactCommand, isCompactionSignal, mentionsCompactionFailure, turnFailureCard, safeguardNoteGroup, COMPACT_FAILED_NOTE_GROUP, hasReplyBeyondCompaction, TURN_TEXT_HEAD_MAX } from './safeguardError.ts';
 import { RemotePortRetry } from './remotePortRetry.ts';
 import { planRetry, retriesExhaustedNote, MAX_AUTO_RETRIES, maxRetriesFor } from './promptRetry.ts';
 import { cliErrorContext, trimHugeCliLogs } from './kiroCliLog.ts';
@@ -289,6 +290,14 @@ interface SessionEntry {
   toolsThisTurn?: number;
   /** 这一次发送（和 `toolsThisTurn` 同一处清零）模型有没有出过字 —— `planRetry` 的 producedText 看它：flush 会清空 `assistantBuf`，这个不会。 */
   textThisTurn?: boolean;
+  /** 这一次发送里流出过「正在压缩上下文」那句（`safeguardError.isCompactionSignal`）—— 报错收尾时判「是不是压缩那一下失败了」 */
+  compactSignalThisTurn?: boolean;
+  /**
+   * 这一次发送流出的文字的开头（最多 `TURN_TEXT_HEAD_MAX` 字，`turnTextTruncated` = 超了）—— 判「压缩失败、什么都没出」时
+   * 去掉「正在压缩」状态提示再看（`hasReplyBeyondCompaction`）。`textThisTurn` 把状态提示也算成出过字，它是重发的安全闸，不动它。
+   */
+  turnTextHead?: string;
+  turnTextTruncated?: boolean;
   /** 这一轮最后一次开工具调用那一刻 `assistantBuf` 的长度 —— 判「把工具调用写成了文字」只看这之后的正文（`textToolCall.ts`）。 */
   bufAtLastTool?: number;
   /** 界面上这一轮回复被思考块切成的几段在 `assistantBuf` 里的起点（`replySegments.ts`） */
@@ -5928,6 +5937,47 @@ async function noteBedrockDenied(sessionId: string, profile: AgentProfile, errTe
   return tr('Codex on {machine} lacks AWS permission {actions}. See the KiroLex card in this session for the fix.', { machine, actions });
 }
 
+/** 流式文字进来：记「出现过压缩状态提示」和这一轮文字的开头（报错收尾时判压缩失败那张卡，见 `turnTextHead`）。 */
+function noteTurnText(entry: SessionEntry, text: string): void {
+  if (isCompactionSignal(text)) entry.compactSignalThisTurn = true;
+  if (entry.turnTextTruncated) return;
+  const head = (entry.turnTextHead || '') + text;
+  entry.turnTextTruncated = head.length > TURN_TEXT_HEAD_MAX;
+  entry.turnTextHead = entry.turnTextTruncated ? '' : head;
+}
+
+/** 一次发送的正文（prompt 块拼起来）—— 判「这一条是不是 /compact」用。 */
+function promptTextOf(prompt: unknown): string {
+  return Array.isArray(prompt)
+    ? prompt.map((p: any) => (typeof p === 'string' ? p : p?.text || '')).join('')
+    : String(prompt ?? '');
+}
+
+/**
+ * **模型的安全过滤把整条会话标记了**（`safeguardError.ts`）：会话里放一张提示卡（界面见 ChatArea 的 SafeguardCard：
+ * 换模型 / 换后端会话 / Cyber Verification Program 申请链接），原始报错（含 Request ID / Message ID）折进详情。
+ * 返回抛给界面的那句短话 —— 渲染层认得它（`isSafeguardReport`），不再重连重发、不再把原文铺成气泡。
+ */
+function noteSafeguardBlock(sessionId: string, errText: string, compact: boolean): string {
+  const main = compact
+    ? tr("⚠️ The model's safety filter blocked context compaction, so this turn produced nothing. It has flagged this whole chat: anything sent on the same model will keep failing.")
+    : tr("⚠️ The model's safety filter flagged this whole chat. Anything sent on the same model will keep failing.");
+  noteInSession(sessionId, trConcat(main, NOTE_DETAIL_SEP, String(errText || '').trim().slice(0, 4000)), undefined, safeguardNoteGroup(compact));
+  logger.warn('prompt', `模型安全过滤拦截（会话级${compact ? '，压缩那一下' : ''}），不重发、不换后端会话 sessionId=${sessionId}: ${String(errText || '').replace(/\s+/g, ' ').slice(0, 200)}`);
+  return compact
+    ? tr("The model's safety filter blocked context compaction in this chat. See the KiroLex card in this chat for what to do.")
+    : tr("The model's safety filter flagged this whole chat, so this turn was blocked. See the KiroLex card in this chat for what to do.");
+}
+
+/** **压缩那一下失败了、这一轮什么都没出**：会话里放一张带恢复入口的卡片（同 SafeguardCard，只是没有申请链接），原始报错折进详情。 */
+function noteCompactFailed(sessionId: string, errText: string): void {
+  noteInSession(sessionId, trConcat(
+    tr('⚠️ Context compaction failed, so this turn produced no reply.'),
+    NOTE_DETAIL_SEP,
+    String(errText || '').trim().slice(0, 4000)), undefined, COMPACT_FAILED_NOTE_GROUP);
+  logger.warn('prompt', `压缩失败、这一轮没有产出 sessionId=${sessionId}: ${String(errText || '').replace(/\s+/g, ' ').slice(0, 200)}`);
+}
+
 /* ─────────────── 模型自己安排的「过一会儿再看」：定时提示 / 后台命令 / 监视 ───────────────
  *
  * 工具在 kirolex-local 上（`wakeTools.ts`），结果都经 `wakeDispatcher` 作为**新的一条消息**发回会话：
@@ -8310,6 +8360,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       if (u?.sessionUpdate === 'agent_message_chunk') {
         entry.assistantBuf += u?.content?.text || '';
         if (u?.content?.text) { entry.textThisTurn = true; noteTurnStarted(sessionId, entry); }
+        if (u?.content?.text) noteTurnText(entry, u.content.text);
         if (!entry.assistantMsgId) entry.assistantMsgId = u?.messageId || `a_${Date.now()}`;
         /* 远程会话：它可能在这几行里要求"在用户机器上打开某个页面"—— 边流边认，别等到一轮结束
            （一轮可能还要跑几分钟，而"让我看看进度"的价值就在于**现在**看） */
@@ -11327,6 +11378,9 @@ ${hint}` : ''}` };
           entry.toolsThisTurn = 0;       // 这一轮的工具计数从零开始（自动重试的安全闸）
           entry.bufAtLastTool = 0;
           entry.textThisTurn = false;    // 同 toolsThisTurn：这一轮还没出过字（planRetry 的 producedText 看它）
+          entry.compactSignalThisTurn = false;
+          entry.turnTextHead = '';
+          entry.turnTextTruncated = false;
           entry.localActionsThisTurn = 0;      // 「在你机器上打开」的额度按轮给（见 localAction.ts）
           entry.localLineBuf = '';             // 上一轮的半行不能拼到这一轮的第一行上
           entry.maxToolOutputThisTurn = 0;
@@ -11634,12 +11688,13 @@ ${hint}` : ''}` };
              * 两道闸：
              *   · `bareFailStreak >= POISONED_AFTER` —— 单次 Internal error 太常见，换模型是有代价的
              *     （~30 秒静默窗口，还会换掉你选的模型）；
+             *   · 模型安全过滤的会话级拦截（适配器常把它包成 Internal error）不算 —— 交给外层那张卡片（safeguardError.ts）；
              *   · **这一轮什么都没产出** —— 跑过工具的轮子换模型重发等于把副作用再做一遍。
              */
             const bareStreak = bareFailStreak.get(sessionId) || 0;
             const producedThisTurn = !!entry.assistantBuf || (entry.toolsThisTurn || 0) > 0;
             if (engineOf(entry.profile) === 'kiro' && isBareInternalError(text) && bareStreak >= POISONED_AFTER && !producedThisTurn
-                && emptySwaps < 1 && modelSwaps < MAX_MODEL_SWAPS) {
+                && emptySwaps < 1 && modelSwaps < MAX_MODEL_SWAPS && !isSafeguardBlock(text)) {
               modelSwaps++;
               emptySwaps++;
               const failedModel = entry.profile.model;
@@ -11811,6 +11866,25 @@ ${hint}` : ''}` };
       /* Codex 被 AWS 拒了（缺 IAM 权限）：重发、换后端会话都没用 —— 会话里给一张说清怎么补的提示卡，报错换成一句人话 */
       const deniedMsg = await noteBedrockDenied(sessionId, entry.profile, `${err?.message || ''}${detail}`);
       if (deniedMsg) throw new Error(deniedMsg);
+      /**
+       * **模型的安全过滤把整条会话标记了**（safeguards flagged / [cyber]，判据在 `safeguardError.ts`）——
+       * 不重发、不换后端会话（同样的上下文、同样的模型，换了多半照样被拦），也不进下面的连续失败计数：
+       * 会话里放一张可操作的卡片（换模型 / 换后端会话 / 申请链接，原文折进详情），抛给界面的只是一句短话。
+       * 压缩那一下被挡用同一张卡。
+       */
+      const failText = `${err?.message || ''}${detail}`;
+      const compactTurn = isCompactCommand(display?.displayText ?? promptTextOf(prompt))
+        || !!entry.compactSignalThisTurn || mentionsCompactionFailure(failText);
+      const failCard = turnFailureCard({
+        error: failText,
+        compactTurn,
+        /* 只有「正在压缩」状态提示不算产出（它也让 textThisTurn 变 true）—— 去掉状态提示再看，工具照旧算 */
+        produced: hasReplyBeyondCompaction(entry.turnTextHead, !!entry.turnTextTruncated) || (entry.toolsThisTurn || 0) > 0,
+      });
+      if (failCard === 'safeguard') throw new Error(noteSafeguardBlock(sessionId, failText, compactTurn));
+      /* 压缩失败卡片：在每一个**不再重发**的出口上落一次（排着交棒、换了后端会话但不重发、最后照实报错）；自动重发的那几条路不落 */
+      let compactNoted = false;
+      const noteCompactFailedOnExit = () => { if (failCard === 'compact-failed' && !compactNoted) { compactNoted = true; noteCompactFailed(sessionId, failText); } };
       // NOTE: an oversized image is deliberately NOT recovered from here.
       //
       // It genuinely poisons the backend's conversation -- Bedrock re-validates every
@@ -11840,6 +11914,7 @@ ${hint}` : ''}` };
         **有一轮排在后面（适配器那边已经收下了）时不自己重发、不换后端会话**：重发的这一条会排到它后面去、或者落到一个它不在的新会话上，
         两轮就对不上了。照实报这个错；排着的那一轮照常接手。
       */
+      if (ownsHandOver) noteCompactFailedOnExit();
       if (ownsHandOver) throw err;
       const verdict = staleVerdict({
         error: `${err?.message || ''}${detail}`,
@@ -11917,6 +11992,7 @@ ${hint}` : ''}` };
          * `aws ssm send-command` 再跑一遍。什么都没产出时才重发 —— 那时重发是幂等的。
          */
         if (made && !plan.retry && (plan.reason === 'side-effects' || plan.reason === 'produced')) {
+          noteCompactFailedOnExit();
           logger.warn('prompt', `换了新后端会话但不重发 sessionId=${sessionId}: `
             + `这一轮已产出（文字=${!!entry.assistantBuf} 工具=${entry.toolsThisTurn || 0} `
             + `最大工具输出=${entry.maxToolOutputThisTurn || 0} 字符），重发会重复副作用`);
@@ -11947,6 +12023,8 @@ ${hint}` : ''}` };
         await new Promise((r) => setTimeout(r, plan.delayMs));
         return await sendPromptOnce(sessionId, prompt, projectId, display, _model, attempt + 1);
       }
+      /* 压缩那一下失败了、这一轮什么都没出：不留一条空白死轮 —— 会话里放一张带恢复入口的卡片（报错照旧往下报） */
+      noteCompactFailedOnExit();
       /* 预算用光了：说清试过几次 —— 不然看着像"它就是不行"，而实际上已经试了 4 次。 */
       if (plan.reason === 'budget') {
         logger.warn('prompt', `自动重发用光预算（${attempt} 次）sessionId=${sessionId}: ${errText.slice(0, 160)}`);
@@ -16615,6 +16693,27 @@ ${hint}` : ''}` };
    *   其余 / 失败 → 照原来的做法（同一个后端会话里重发），会话里说一句「后端仍记得旧内容」。
    * kiro 不走这里（渲染层也不调）。永远不抛：这一步失败不能挡住重发本身。
    */
+  /*
+    **会话里那张安全过滤 / 压缩失败卡片上的「换一个新的后端会话」**（SafeguardCard）—— 你点了才换，和控制入口 new-backend
+    同一套（`swapBackendSessionWhenIdle`），上下文跟着下一条带过去；正在跑一轮就不换。不顺手重发。
+  */
+  ipcMain.handle('acp:new-backend-session', async (_event, sessionId: string) => {
+    const sid = String(sessionId || '').trim();
+    if (!sid || !store.readRecord(sid)) return { ok: false, error: tr('Session not found') };
+    if (!(await ensureAttached(sid))) return { ok: false, error: tr('Session not connected') };
+    try {
+      const r = await swapBackendSessionWhenIdle(sid, 'card-new-backend');
+      noteInSession(sid, trConcat(
+        tr('🔀 Switched to a new backend session; the context goes along with the next message.'),
+        NOTE_DETAIL_SEP,
+        tr('New backend session: {id}…. The conversation is unchanged.', { id: r.newId.slice(0, 8) })),
+      undefined, 'backend-session-swap:card');
+      return { ok: true, newId: r.newId };
+    } catch (err: any) {
+      logger.warn('prompt', `card new-backend failed sessionId=${sid}: ${err?.message || err}`);
+      return { ok: false, error: String(err?.message || err) };
+    }
+  });
   ipcMain.handle('acp:fork-backend-for-edit', async (_event, sessionId: string, keepIds: string[]) => {
     const sid = String(sessionId || '').trim();
     const rec = sid ? store.readRecord(sid) : null;
