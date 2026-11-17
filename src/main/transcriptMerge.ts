@@ -178,7 +178,7 @@ export function mergeRecords(local: any, remote: any): any {
     agent（`profile.kiroAgent`）、本机文件目录（`localDir`：Windows 是 C:\Users\…、Mac 是 /Users/…）—— 别的电脑上不一定有同一台机器、
     同一个 agent，路径也不一样。本机没有这个字段就保持没有（本机跑 = 没有 remote），不从对方拷过来。
     同一类的还有只对这台机器上那个后端进程成立的记账：`contextEstablishedFor` / `contextEstablishedPid`（上下文灌进了这台的哪个后端会话、哪个进程）、
-    `lastExecutorError`（这台执行器上次的错误）。引擎、模型、权限模式这些照旧按 updatedAt。
+    `lastExecutorError`（这台执行器上次的错误）。引擎、模型、权限模式这些照旧按 updatedAt（权限只许变严，见下面）。
   */
   const keepLocal = (dst: any, src: any, key: string): void => {
     if (src && key in src && src[key] !== undefined) dst[key] = src[key];
@@ -190,6 +190,16 @@ export function mergeRecords(local: any, remote: any): any {
     out.profile = profile;
   }
   for (const key of ['localDir', 'contextEstablishedFor', 'contextEstablishedPid', 'lastExecutorError']) keepLocal(out, local, key);
+
+  /*
+    **权限只许合并得更严，不许放宽** —— 云上那份不可信（另一台电脑 / 桶凭据都可能被人拿到）：一份 updatedAt 更新、
+    `engine:'kiro'` + `permissionMode:'auto-approve'` 的记录会把本机设成「手动确认」的会话悄悄改回自动批准，之后每次工具调用都不再问。
+    实际生效的规则和 AcpClient 一样：只有 kiro 认 permissionMode（没写 = 自动批准），别的引擎一律要确认。
+    本机现在生效的是「要确认」、合并结果会变成自动批准 → 写成 ask。引擎 / 模型照旧按 updatedAt。
+  */
+  const autoApproves = (p: any): boolean =>
+    p?.engine !== 'claude' && p?.engine !== 'codex' && (p?.permissionMode || 'auto-approve') === 'auto-approve';
+  if (!autoApproves(local.profile) && autoApproves(out.profile)) out.profile = { ...(out.profile || {}), permissionMode: 'ask' };
 
   /* 这台机器的东西不许被另一台的覆盖 */
   if ('cliSessionId' in local) out.cliSessionId = local.cliSessionId;
