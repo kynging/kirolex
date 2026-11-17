@@ -360,7 +360,7 @@ describe('接线', () => {
     assert.ok(body.indexOf('live?.busy') < body.indexOf('detachExecutor(sessionId)'), '先判 busy 再断开');
     /* 会话 id 来自渲染层，要当输入校验（它会被拼进文件路径） */
     assert.ok(body.includes('Invalid session id.'), '缺 id 校验');
-    assert.ok(body.includes('w.-]+$'), '缺白名单正则');
+    assert.ok(body.includes('store.isValidSessionId(sessionId)'), '缺白名单校验（和落盘同一个判据，`.` 不能过）');
     /* 覆盖前挪进 trash */
     assert.match(body, /trashDirFor/);
   });

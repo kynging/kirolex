@@ -265,6 +265,11 @@ function safeId(id: string): string {
   return s;
 }
 
+/** 和落盘同一个判据，不抛 —— 自己拼路径 / 桶前缀的地方（如 `s3:restore`）先过这一道，`.` / `..` 进不来 */
+export function isValidSessionId(id: unknown): boolean {
+  return typeof id === 'string' && ID_SHAPE.test(id);
+}
+
 function dirFor(id: string): string {
   return path.join(baseDir, safeId(id));
 }

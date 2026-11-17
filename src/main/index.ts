@@ -9995,7 +9995,8 @@ app.whenReady().then(async () => {
       return {
         memoryByProject,
         /* 分组 / 归档按 catalog 自己的（恢复页显示的是云上那份），本机归档了没有不管 */
-        entries: markMissing((catalog.entries || []).filter((e) => !hidden.has(e.id)), missing).map((e) => ({
+        /* id 不合规的（如 `.`）恢复会被拒，也不列 */
+        entries: markMissing((catalog.entries || []).filter((e) => store.isValidSessionId(e.id)).filter((e) => !hidden.has(e.id)), missing).map((e) => ({
           ...e,
           project: catalogProject(e, projectById.get(e.id)),
           existsLocally: local.has(e.id),
@@ -10233,7 +10234,7 @@ ${hint}` : ''}` };
     try {
       const { creds, problem, cfg } = await resolveSyncCredsNow();
       if (problem) return { ok: false, error: problem };
-      if (!sessionId || !/^[\w.-]+$/.test(sessionId)) return { ok: false, error: tr('Invalid session id.') };
+      if (!store.isValidSessionId(sessionId)) return { ok: false, error: tr('Invalid session id.') };
       { const r = refuseAdvancedOnly(sessionId, 's3:restore'); if (r) return { ok: false, error: r }; }
       restore.check();
       /* ☁ 占位：暂存下载，全成功才发布 */
@@ -10293,8 +10294,9 @@ ${hint}` : ''}` };
       let restored = 0;
       for (const obj of objects) {
         const rel = relFor(cfg.prefix, obj.key);
-        if (!rel) continue;                                  // 不属于这个布局 / 含 `..`
+        if (!rel) continue;
         const abs = path.join(KIROLEX_HOME, rel);
+        if (!abs.startsWith(localDir + path.sep)) continue;  // 布局外 / `..` / 越出本会话
         const body = await vetted.get(obj.key);
         restore.check();
         const base = path.basename(rel);
