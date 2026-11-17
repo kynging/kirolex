@@ -479,12 +479,14 @@ describe('本机已有这条（合并恢复）：运行位置按本机原来的�
   const resolve = (r: any) => resolveSessionRemote(r, targets);
   const label = (h: string) => h;
 
-  test('本机原来本机跑、云端较新且带着已从设置删掉的机器 → 合并带回了 remote，恢复后仍本机跑', () => {
+  /* 2026-11-17 起合并本身就保留本机的运行位置（「同步功能不要同步这个会话是在哪里跑的」）；restoreRemote 这道仍然守着，两道都要对 */
+  test('本机原来本机跑、云端较新且带着已从设置删掉的机器 → 合并不带回 remote，恢复后仍本机跑', () => {
     const mine = { id: SID, updatedAt: 1000, profile: { model: 'm' } };
     const theirs = { id: SID, updatedAt: 5000, profile: { model: 'm', remote: { id: 'gone', sshHost: 'ec2-user@9.9.9.9' } } };
     const merged = mergeRecords(mine, theirs);
-    assert.equal(merged.profile.remote?.id, 'gone', '前提：合并按 updatedAt 带回了云端的 remote');
+    assert.equal(merged.profile.remote, undefined, '合并保留本机的运行位置（本机跑 = 没有 remote）');
     const rr = restoreRemote(mine, merged, resolve, label);
+    assert.equal(restoreRemote(mine, theirs, resolve, label).remote, undefined, '就算拿到带着云端 remote 的记录，restoreRemote 也清掉');
     assert.equal(rr.remote, undefined, '清掉，不留一台连不上的机器');
     assert.deepEqual(rr.plan, { kind: 'none' }, '本机原来就是本机跑：不说「改成在本机跑」');
   });

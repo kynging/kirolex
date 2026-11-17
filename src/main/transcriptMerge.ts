@@ -106,6 +106,8 @@ export function mergeTranscripts(localText: string, remoteText: string): MergeRe
  * · 数组型的（`tags` 之类）取**并集** —— 两台机器各加过一个标签时，
  *   按"新的赢"会把另一台那个丢掉，而那是用户明确加过的东西。
  *
+ * 每台电脑自己的设置（运行位置 `profile.remote`、agent `profile.kiroAgent`、`localDir`，以及后端进程的记账）一律**保留本地的**，见函数里那段。
+ *
  * `cliSessionId` / `executorState` 一律**保留本地的**：它们指向的是**这台机器上**那个后端会话,
  * 把另一台的 id 抄过来会让下一次 attach 去 load 一个这里不存在的 session。
  */
@@ -169,6 +171,25 @@ export function mergeRecords(local: any, remote: any): any {
     if (src.crossDevice === true) out.crossDevice = true; else delete out.crossDevice;
     out.crossDeviceChangedAt = src.crossDeviceChangedAt;
   }
+
+  /*
+    **每台电脑自己的设置一律保留本机的，不看 updatedAt** ——「同步功能不要同步这个会话是在哪里跑的，以及用的什么 agent」（2026-11-17）。
+    另一台只要后聊过一句，按 updatedAt 它的这些就会盖到本机：运行位置（`profile.remote`，里面还有那台电脑上的私钥路径 identityFile、bins）、
+    agent（`profile.kiroAgent`）、本机文件目录（`localDir`：Windows 是 C:\Users\…、Mac 是 /Users/…）—— 别的电脑上不一定有同一台机器、
+    同一个 agent，路径也不一样。本机没有这个字段就保持没有（本机跑 = 没有 remote），不从对方拷过来。
+    同一类的还有只对这台机器上那个后端进程成立的记账：`contextEstablishedFor` / `contextEstablishedPid`（上下文灌进了这台的哪个后端会话、哪个进程）、
+    `lastExecutorError`（这台执行器上次的错误）。引擎、模型、权限模式这些照旧按 updatedAt。
+  */
+  const keepLocal = (dst: any, src: any, key: string): void => {
+    if (src && key in src && src[key] !== undefined) dst[key] = src[key];
+    else delete dst[key];
+  };
+  if (out.profile || local.profile) {
+    const profile = { ...(out.profile || {}) };
+    for (const key of ['remote', 'kiroAgent']) keepLocal(profile, local.profile, key);
+    out.profile = profile;
+  }
+  for (const key of ['localDir', 'contextEstablishedFor', 'contextEstablishedPid', 'lastExecutorError']) keepLocal(out, local, key);
 
   /* 这台机器的东西不许被另一台的覆盖 */
   if ('cliSessionId' in local) out.cliSessionId = local.cliSessionId;
