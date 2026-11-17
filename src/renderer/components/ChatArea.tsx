@@ -43,6 +43,7 @@ import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts'
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 import { dismissNotice, isMuted, isNoticeHidden, muteKeyOf, muteNotice, muteScope, noticeHideStore, CONNECT_FAILURE_GROUP, SESSION_ERROR_GROUP, STARTUP_FAILED_GROUP } from '../noticeDismiss.ts';
 import { usageChip, type UsageView } from '../usageChip.ts';
+import { segmentFoldState, toggleSegmentFold, type SegmentFoldOverride } from '../segmentFold.ts';
 
 import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
@@ -1358,16 +1359,14 @@ const MessageItem = memo<{
     () => parts.filter((p, i) => p.variant !== 'tool' && p.variant !== 'thinking' && !segments[i]?.question).map((p) => p.body).join('\n\n'),
     [parts, segments],
   );
-  // Tool segments are collapsed by default (only a chip shows); the user expands
-  // them on demand. The actively-streaming last turn stays expanded so live tool
-  // output is visible as it happens.
-  const [expandedTools, setExpandedTools] = useState<Set<string>>(new Set());
-  const toggleTool = useCallback((segId: string) => {
-    setExpandedTools((prev) => {
-      const next = new Set(prev);
-      if (next.has(segId)) next.delete(segId); else next.add(segId);
-      return next;
-    });
+  // Tool / thinking segments fold to a chip; the user expands them on demand.
+  // With auto-fold on, the actively-streaming segment is folded too (the chip
+  // shows its command line + a running indicator; expanding shows live output).
+  // Clicks are remembered per segment together with whether it was running, so
+  // a click made while running expires once it finishes (`segmentFold.ts`).
+  const [foldOverrides, setFoldOverrides] = useState<Map<string, SegmentFoldOverride>>(new Map());
+  const toggleTool = useCallback((segId: string, cur: { open: boolean; live: boolean }) => {
+    setFoldOverrides((prev) => new Map(prev).set(segId, toggleSegmentFold(cur)));
   }, []);
   const { flow, asks } = useMemo(() => splitTurnAsks(segments), [segments]);
   const turnFileChanges = useMemo(() => {
@@ -1403,31 +1402,37 @@ const MessageItem = memo<{
           }
           const streamThis = isStreaming && isLastAssistant && idx === parts.length - 1;
           const isCollapsible = p.variant === 'tool' || p.variant === 'thinking';
-          // When the matching auto-fold setting is ON, a thinking/tool segment
-          // auto-expands ONLY while it is the actively-streaming segment; the
-          // moment a later segment begins — or the turn ends — it folds and stays
-          // folded unless the user clicks it. When OFF, the segment stays open for
-          // the whole running turn (legacy behavior).
+          // When the matching auto-fold setting is ON, a thinking/tool segment is
+          // folded by default even while it streams (the chip names what is
+          // running); it can be expanded to watch live output. When OFF, the
+          // segment stays open for the whole running turn (legacy behavior).
+          // Either way it folds once it finishes, unless the user opens it again.
           const running = isStreaming && isLastAssistant;
           const fold = p.variant === 'thinking' ? foldThinking : p.variant === 'tool' ? foldTools : false;
-          const autoExpand = isCollapsible ? (fold ? streamThis : running) : running;
-          const open = !isCollapsible || autoExpand || expandedTools.has(p.id);
+          const foldState = segmentFoldState({ collapsible: isCollapsible, fold, streamThis, running }, foldOverrides.get(p.id));
+          const { open } = foldState;
           const firstLine = isCollapsible ? (p.body.split('\n').find((l) => l.trim()) || '').trim() : '';
           const hasMore = isCollapsible && p.body.trim().length > firstLine.length;
           const chipLabel = p.variant === 'thinking' ? t('💭 Thinking') : t('🔧 Tools');
           return (
             <div key={p.id} className={`turn-segment${p.variant ? ` variant-${p.variant}` : ''}`}>
-              {isCollapsible && !autoExpand ? (
+              {isCollapsible ? (
                 <div className="tool-toggle-row">
                   <button
                     className={`msg-variant-badge ${p.variant} as-toggle`}
-                    onClick={() => toggleTool(p.id)}
+                    onClick={() => toggleTool(p.id, foldState)}
                     title={open ? t('Fold') : t('Expand')}
                   >
                     {open ? '▾' : '▸'} {chipLabel}
                   </button>
+                  {streamThis && (
+                    <span className="tool-running-indicator" title={t('Running')}>
+                      <span className="tool-running-spinner" aria-hidden="true" />
+                      {t('Running')}
+                    </span>
+                  )}
                   {!open && (
-                    <span className="tool-collapsed-preview" onClick={() => toggleTool(p.id)} title={t('Expand')}>
+                    <span className="tool-collapsed-preview" onClick={() => toggleTool(p.id, foldState)} title={t('Expand')}>
                       {firstLine}{hasMore ? ' …' : ''}
                     </span>
                   )}

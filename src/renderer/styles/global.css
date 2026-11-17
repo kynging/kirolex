@@ -1905,6 +1905,23 @@ button, input, select, textarea {
 .tool-collapsed-preview:hover {
   opacity: 1;
 }
+/* 正在跑的工具 / 思考段：折叠条上的「◌ 运行中」 */
+.tool-running-indicator {
+  flex: none;
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
+  color: #58a6ff;
+  font-size: 11px;
+}
+.tool-running-spinner {
+  width: 9px;
+  height: 9px;
+  border: 1.5px solid rgba(88, 166, 255, 0.25);
+  border-top-color: #58a6ff;
+  border-radius: 50%;
+  animation: history-spin 0.9s linear infinite;
+}
 .md-link {
   color: #6cb6ff;
   text-decoration: none;
