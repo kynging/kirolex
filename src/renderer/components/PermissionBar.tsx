@@ -61,6 +61,10 @@ export const PermissionBar: React.FC<PermissionBarProps> = ({
           {request.description && request.description !== request.toolTitle && (
             <code title={request.description}>{request.description}</code>
           )}
+          {/* 同一会话同时来了好几个请求：一次显示一个，答完接着显示下一个 */}
+          {!!request.queuedBehind && request.queuedBehind > 0 && (
+            <span className="permission-bar-queued">{t('{n} more waiting for approval', { n: request.queuedBehind })}</span>
+          )}
         </div>
         {request.plan && (
           <div className={`permission-plan${planOpen ? '' : ' collapsed'}`}>

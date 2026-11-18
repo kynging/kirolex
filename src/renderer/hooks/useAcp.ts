@@ -52,7 +52,7 @@ import { planTextOf } from '../permissionButtons.ts';
 import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
 import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
-import { withoutPermissionCard } from '../permissionCards';
+import { withoutPermissionCard, enqueuePermission, currentPermissions, settlePermission, allowAllPermissions, permissionToolKey } from '../permissionCards';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -80,6 +80,10 @@ export interface PermissionRequest {
   options: PermissionOption[];
   /** 批准计划（Claude Code 的 ExitPlanMode）时的计划正文，Markdown（审计 2b，`permissionButtons.planTextOf`） */
   plan?: string;
+  /** 「同一工具」的判据（`permissionCards.permissionToolKey`）：选「始终」时连带答复同工具的其它请求 */
+  toolKey?: string;
+  /** 这条会话里排在它后面、还在等批准的请求数（界面上「还有 N 个待批准」） */
+  queuedBehind?: number;
 }
 
 /** A running turn that has gone quiet, re-sent by main on every watchdog tick.
@@ -529,7 +533,20 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   // a cold chat never flashes an empty/"no messages" view before the transcript
   // lands (message bodies are not mirrored into localStorage any more).
   const [historyLoadingIds, setHistoryLoadingIds] = useState<string[]>([]);
-  const [permissionRequests, setPermissionRequests] = useState<Record<string, PermissionRequest>>({});
+  /* 每个会话一个待批准队列（按 requestId，见 permissionCards.ts）：同时来两个请求不能互相覆盖。
+     ref 是权威那份（答复时要同步算出连带答复的请求），state 只为重渲染。 */
+  const [permissionQueues, setPermissionQueues] = useState<Record<string, PermissionRequest[]>>({});
+  const permissionQueuesRef = useRef<Record<string, PermissionRequest[]>>({});
+  const setPermissionRequests = (
+    update: (current: Record<string, PermissionRequest[]>) => Record<string, PermissionRequest[]>,
+  ) => {
+    const next = update(permissionQueuesRef.current);
+    if (next === permissionQueuesRef.current) return;
+    permissionQueuesRef.current = next;
+    setPermissionQueues(next);
+  };
+  /** 每条会话当前显示的那一个（队首），带 `queuedBehind` */
+  const permissionRequests = useMemo(() => currentPermissions(permissionQueues), [permissionQueues]);
 
   // --- Split view: panes shown side-by-side with the focused session --------
   // Background sessions stream into `messagesCacheRef` ONLY. That is a ref, so
@@ -2723,17 +2740,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               })).filter((option: PermissionOption) => !!option.optionId)
             : [];
           const plan = planTextOf(update.toolCall);
-          setPermissionRequests((current) => ({
-            ...current,
-            [requestSessionId]: {
-              requestId: update.requestId,
-              sessionId: requestSessionId,
-              toolTitle,
-              /* 计划正文单独显示：同一份不要再塞进 description 那一行 code 里 */
-              description: plan && description === plan ? undefined : description,
-              options,
-              ...(plan ? { plan } : {}),
-            },
+          /* 排进这条会话的队列：一次并行两个工具调用时第二个不能把第一个盖掉（被盖掉的那个没人答，会话卡死） */
+          setPermissionRequests((current) => enqueuePermission(current, {
+            requestId: update.requestId,
+            sessionId: requestSessionId,
+            toolTitle,
+            toolKey: permissionToolKey(update, toolTitle),
+            /* 计划正文单独显示：同一份不要再塞进 description 那一行 code 里 */
+            description: plan && description === plan ? undefined : description,
+            options,
+            ...(plan ? { plan } : {}),
           }));
           break;
         }
@@ -5424,6 +5440,16 @@ ${text}`,
     if (!sessionId || sessionId.startsWith('pending_')) return;
     try {
       const result = await window.kiroApi.switchPermissionMode(sessionId, permissionMode);
+      /* 切到「自动」：已经挂着的请求主进程不会回头去答 —— 这里按允许全部答掉（这一轮还在跑、切换登记成 pending 时也要答，
+         不然这一轮就停在这些请求上、永远跑不完） */
+      if (result?.ok && permissionMode === 'auto-approve') {
+        const { queues, answers } = allowAllPermissions(permissionQueuesRef.current, sessionId);
+        setPermissionRequests(() => queues);
+        for (const answer of answers) {
+          window.kiroApi.respondPermission(answer.requestId, answer.optionId, sessionId)
+            .catch((err: any) => console.warn('[permission] auto-approve answer failed:', err?.message || err));
+        }
+      }
       if (result?.ok && !result.pending) {
         setSessions((prev) => prev.map((session) => (
           session.id === sessionId
@@ -5703,12 +5729,15 @@ ${text}`,
       optionId,
       request.sessionId,
     );
-    setPermissionRequests((current) => {
-      if (current[request.sessionId]?.requestId !== request.requestId) return current;
-      const next = { ...current };
-      delete next[request.sessionId];
-      return next;
-    });
+    /* 收掉答了的这个，队列里下一个接着显示；选的是「始终」时同一工具的其它请求按同一选项一并答复 */
+    const { queues, alsoAnswer } = settlePermission(
+      permissionQueuesRef.current, request.sessionId, request.requestId, optionId,
+    );
+    setPermissionRequests(() => queues);
+    for (const also of alsoAnswer) {
+      window.kiroApi.respondPermission(also.requestId, also.optionId, request.sessionId)
+        .catch((err: any) => console.warn('[permission] follow-up answer failed:', err?.message || err));
+    }
   }, [permissionRequest]);
 
   // Derived: current view is streaming if the current session is in the streaming set

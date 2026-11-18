@@ -291,6 +291,7 @@ const ZH_BASE: Record<string, string> = {
   'Tool permission required': '需要工具授权',
   'Allow once': '允许一次',
   'Always allow': '总是允许',
+  '{n} more waiting for approval': '还有 {n} 个待批准',
   'Reject': '拒绝',
   'No context has been injected into this chat yet': '这个会话还没有注入过上下文',
   '⚙︎ Hand-edited context (pinned) · the next message sends this verbatim instead of the auto snapshot':

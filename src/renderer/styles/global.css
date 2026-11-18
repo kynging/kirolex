@@ -10133,3 +10133,13 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .safeguard-card[data-kind="manual"] .kirolex-message-card { border-color: var(--accent); }
 .safeguard-option, .safeguard-option-body, .safeguard-option-body .bedrock-card-actions { min-width: 0; }
 .safeguard-option-body .safeguard-model-select { max-width: 100%; min-width: 0; text-overflow: ellipsis; }
+
+/* 同一会话还排着的权限请求数（PermissionBar「还有 N 个待批准」） */
+.permission-bar-queued {
+  align-self: flex-start;
+  padding: 1px 6px;
+  border-radius: 8px;
+  background: var(--accent-soft);
+  color: var(--text-secondary);
+  font-size: 11px;
+}
