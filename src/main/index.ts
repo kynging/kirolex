@@ -134,6 +134,7 @@ import { SessionMountLock, mountDrift, adoptRecordFields, MountDriftError } from
 import { trackReplySegments, type ReplySegments } from './replySegments.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
 import { createCreationGate } from './creationGate.ts';
+import { CreationSwitchBook, applyBeforeStart, settleOnCreated, type CreationSwitch } from './creationSwitches.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
 import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from './toolTrace.ts';
 import { forkPointMeta, mainlineAcpMessageId, planEditFork, supportsForkPoint } from './editFork.ts';
@@ -5021,6 +5022,8 @@ const creations = createCreationGate({
     emitSessionBusy(info.sessionId);
   },
 });
+/** 正在新建时选的权限 / 模型 / agent —— 建好时应用，不被新建流程开始时那份 profile 盖掉（`creationSwitches.ts`） */
+const creationSwitches = new CreationSwitchBook();
 // Soft cap on ATTACHED executors (design §8). Dormant sessions are unbounded.
 // Default is a fixed 10 (「默认会话数设为 10」). It used to be auto-sized from RAM/CPU
 // into [4, 16], which on most machines simply meant 16 -- more kiro-cli processes
@@ -5683,7 +5686,9 @@ function emitPendingSwitches(sessionId: string): void {
  */
 function queueSwitchWhileBusy(
   sessionId: string, kind: PendingKind, value: any, label: string, fromPending?: boolean,
-): { ok: true; pending: true } | null {
+): { ok: true; pending?: true; creating?: true } | null {
+  /* 还在新建（也算占用）：权限 / 模型 / agent 记进 creationSwitches，新建流程建好时应用 */
+  { const creating = switchWhileCreating(sessionId, kind, value, label); if (creating) return creating; }
   /* 后端自己起的那一轮（autonomousTurn.ts）在跑也算忙：现在换执行器会截断正在输出的回复，收尾时 kick 再切 */
   const autonomousRunning = !!sessionClients.get(sessionId)?.autonomous && !fromPending;
   if (!shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending }) && !autonomousRunning) return null;
@@ -5702,6 +5707,35 @@ function queueSwitchWhileBusy(
       undefined, PENDING_SWITCH_NOTE_GROUP);
   }
   return { ok: true, pending: true };
+}
+/**
+ * **还在新建的会话**（没有执行器、`creations` 里在建；远程要几十秒）切权限 / 模型 / agent ——
+ * 不能走「休眠只写记录」那条：新建流程最后会用它开始时那份 profile 把记录整份写回去，建出来的客户端也是旧值
+ * （实测切到自动后照样等批准 457 秒）。记进 `creationSwitches`，新建流程建好时应用（`creationSwitches.ts`）；
+ * 记录也写上（新建途中重启时 attach 照它起）。不在建、或不是这三类返回 null。
+ * 模型 / agent 只归 kiro 管：别的引擎返回 null，照原来的路报错。
+ */
+function switchWhileCreating(sessionId: string, kind: PendingKind, value: any, label: string): { ok: true; creating: true } | null {
+  if (sessionClients.get(sessionId) || !creations.creating(sessionId)) return null;
+  const patch: CreationSwitch | null = kind === 'permission' ? { permissionMode: value?.permissionMode === 'auto-approve' ? 'auto-approve' : 'ask' }
+    : kind === 'model' ? { model: String(value?.model || '') }
+      : kind === 'agent' ? { kiroAgent: String(value?.agentName || '') }
+        : null;
+  if (!patch) return null;
+  const rec = store.readRecord(sessionId);
+  if (kind !== 'permission' && rec && engineOf(rec.profile) !== 'kiro') return null;
+  creationSwitches.set(sessionId, patch);
+  if (rec) {
+    rec.profile = {
+      ...rec.profile,
+      ...(patch.permissionMode ? { permissionMode: patch.permissionMode } : {}),
+      ...(patch.model !== undefined ? { model: patch.model, preferredModel: patch.model } : {}),
+      ...(patch.kiroAgent !== undefined ? { kiroAgent: patch.kiroAgent || undefined } : {}),
+    };
+    store.writeRecord(rec);
+  }
+  logger.info('acp', `${kind} -> ${label} while session ${sessionId} is still being created —— 建好时生效`);
+  return { ok: true, creating: true };
 }
 /** 每一类切换在提示里怎么称呼 */
 function pendingKindName(kind: PendingKind): string {
@@ -10640,6 +10674,7 @@ ${hint}` : ''}` };
     /* 先记下选了什么：下面任何一步失败，这条会话都没有记录，右键切换时靠它补（`coldRecordFor`） */
     newSessionIntents.set(kiroLexId, { engine, remoteId: remoteId || undefined, projectId: projectId ?? null });
     newSessionArgs.set(kiroLexId, { cwd, model, projectId: projectId || undefined, kiroAgent: kiroAgent || undefined, remoteId: remoteId || undefined, engine });
+    creationSwitches.delete(kiroLexId);   // 上一次没建成时留下的不算（那之后的选择已经走休眠那条路写进记录）
     { const advRefused = refuseAdvancedProject(projectId, 'new-session'); if (advRefused) throw new Error(advRefused); }
     if (!ensureExecutorCapacity()) {
       throw new Error(tr('All live sessions are busy; cannot start another right now.'));
@@ -10709,6 +10744,7 @@ ${hint}` : ''}` };
     */
     {
       const early = store.readRecord(kiroLexId);
+      const chosenPermission = early?.profile?.permissionMode;
       if (!early) {
         const pre = store.createSession(kiroLexId, profile);
         pre.localDir = profile.remote?.sshHost ? localDirOrSessionDir(kiroLexId, resolvedCwd) : resolvedCwd;
@@ -10716,6 +10752,8 @@ ${hint}` : ''}` };
       } else if (!early.cliSessionId) {
         /* 失败后重试 / 改成本机再建：机器和引擎按这一次的 */
         early.profile = { ...profile };
+        /* 权限按记录里的：上一次建的途中 / 失败后用户切过的（界面按钮显示的就是它），不让重试按默认值盖掉 */
+        if (chosenPermission === 'auto-approve' || chosenPermission === 'ask') profile.permissionMode = early.profile.permissionMode = chosenPermission;
         early.localDir = profile.remote?.sshHost ? localDirOrSessionDir(kiroLexId, resolvedCwd) : resolvedCwd;
         store.writeRecord(early);
       }
@@ -10742,6 +10780,8 @@ ${hint}` : ''}` };
       }
     }
     creations.stage(kiroLexId, 'check');
+    /* 远端预检那几十秒里切的权限 / agent：起执行器（和远端的本地工具配置）之前并进 profile */
+    applyBeforeStart(profile, creationSwitches.peek(kiroLexId));
     const startLocalTools = profile.remote?.sshHost
       ? await ensureLocalTools(kiroLexId, profile, resolvedCwd)
       /* 本地：新会话也可能一建出来就带组合（新会话默认组合），组合里的 MCP 要在 session/new 时就交出去 —— 和重连那条路（`ensureLocalTools`）一样 */
@@ -10781,6 +10821,8 @@ ${hint}` : ''}` };
     })) {
       throw new Error(tr('This session has been deleted'));
     }
+    /* 起执行器之后才选的：权限当场设上；模型 / agent 要换执行器，建好后接着切（下面登记成 pending） */
+    const later = settleOnCreated(profile, client, creationSwitches.take(kiroLexId));
     const entry: SessionEntry = { client, cliSessionId, profile, cwd: cliCwd, localDir: resolvedCwd, assistantBuf: '', assistantMsgId: null, fileChanges: [], lastUsedAt: Date.now() };
     sessionClients.set(kiroLexId, entry);
     /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
@@ -10801,6 +10843,13 @@ ${hint}` : ''}` };
     modelFallback.commit(kiroLexId);
     /* 远端适配器探测攒下的那几句（登录 shell 看不到适配器 / 那家 CLI 没登录）同理 */
     adapterNotes.commit(kiroLexId);
+    if (later.model !== undefined) pendingSwitches.set(kiroLexId, { kind: 'model', value: { model: later.model }, label: later.model });
+    if (later.kiroAgent !== undefined) pendingSwitches.set(kiroLexId, { kind: 'agent', value: { agentName: later.kiroAgent }, label: later.kiroAgent || 'kiro_default' });
+    if (later.model !== undefined || later.kiroAgent !== undefined) {
+      emitPendingSwitches(kiroLexId);
+      /* 新建一结束就切（第一条消息发送前 pendingSwitchRunner.settle 也会等它） */
+      void creations.settle(kiroLexId).then(() => pendingSwitchRunner.kick(kiroLexId));
+    }
     mainWindow?.webContents.send('session:ready-for-first-prompt', { sessionId: kiroLexId, projectId: profile.projectId });
     return { sessionId: kiroLexId };
   }));
@@ -14342,11 +14391,16 @@ ${hint}` : ''}` };
     fromPending?: boolean,
   ): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-permission-mode'); if (advRefused) throw new Error(advRefused); }
-    const entry = sessionClients.get(sessionId);
     const normalizedMode = permissionMode === 'auto-approve' ? 'auto-approve' : 'ask';
+    /* 同换模型：先等挂载锁，再判断连没连着（还在新建的不等：下面 queueSwitchWhileBusy 记下来，建好时设上） */
+    if (!creations.creating(sessionId)) await mountLock.settle(sessionId);
+    const entry = sessionClients.get(sessionId);
+    /* 一轮在跑也当场生效（不换执行器）：排到这一轮结束的话，挂着的权限请求正等着这一下 —— 互相等 */
+    const appliesNow = !!entry && !fromPending && !pendingSwitchRunner.isApplying(sessionId) && !reconfiguringSessions.has(sessionId);
+    if (appliesNow && pendingSwitches.cancel(sessionId, 'permission')) emitPendingSwitches(sessionId);
     /* 忙、或者上一批 pending 正在应用（那次重连会先把执行器拿掉）：先登记，别掉进下面"没连着只写记录"那条路 ——
        那样写下的记录会被正在进行的那次重连用旧 profile 盖掉。登记的这一次在那一批落定后接着应用。 */
-    { const queued = queueSwitchWhileBusy(sessionId, 'permission', { permissionMode: normalizedMode }, normalizedMode, fromPending); if (queued) return { ...queued, permissionMode: normalizedMode }; }
+    if (!appliesNow) { const queued = queueSwitchWhileBusy(sessionId, 'permission', { permissionMode: normalizedMode }, normalizedMode, fromPending); if (queued) return { ...queued, permissionMode: normalizedMode }; }
     /* 休眠：写记录就够了 —— 下次挂起时按记录起（见 `setDormantProfile`） */
     if (!entry) {
       return {
@@ -14355,7 +14409,12 @@ ${hint}` : ''}` };
       };
     }
 
-    entry.client.setPermissionMode(normalizedMode);
+    /* 切到自动：已经挂着没回答的那几条客户端当场按允许答了（acp-client `setPermissionMode`）—— 记一笔 */
+    for (const a of entry.client.setPermissionMode(normalizedMode)) {
+      const key = permissionWaitKey(sessionId, String(a.requestId ?? ''));
+      eventLog.appendEvent(sessionId, { ts: Date.now(), type: 'permission_response', turn: entry.currentUserMessageId, optionId: a.optionId, detail: key });
+      logger.info('permission', `answered by auto-approve switch sessionId=${sessionId} id=${String(a.requestId)} option=${a.optionId ?? '(cancelled)'}`);
+    }
     entry.profile.permissionMode = normalizedMode;
 
     const rec = store.readRecord(sessionId)
@@ -14378,8 +14437,10 @@ ${hint}` : ''}` };
   // receives the normal layered-memory injection on its next prompt.
   const switchKiroAgentImpl = async (sessionId: string, agentName: string, fromPending?: boolean): Promise<any> => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'switch-agent'); if (advRefused) throw new Error(advRefused); }
-    const oldEntry = sessionClients.get(sessionId);
     const normalizedAgent = agentName.trim() || undefined;
+    /* 同换模型：先等挂载锁，再判断连没连着（还在新建的不等：下面 queueSwitchWhileBusy 记下来） */
+    if (!creations.creating(sessionId)) await mountLock.settle(sessionId);
+    const oldEntry = sessionClients.get(sessionId);
     /* 忙、或者上一批 pending 正在应用（那次重连会先把执行器拿掉）：先登记，别掉进下面"没连着只写记录"那条路 ——
        那样写下的记录会被正在进行的那次重连用旧 profile 盖掉。登记的这一次在那一批落定后接着应用。 */
     { const queued = queueSwitchWhileBusy(sessionId, 'agent', { agentName: normalizedAgent || '' }, normalizedAgent || 'kiro_default', fromPending); if (queued) return { ...queued, kiroAgent: normalizedAgent || '' }; }

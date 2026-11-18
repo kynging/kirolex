@@ -635,9 +635,21 @@ export class AcpClient extends EventEmitter {
    * the executor. KiroLex deliberately starts kiro-cli without
    * --trust-all-tools so both Auto and Ask remain reversible at runtime.
    */
-  setPermissionMode(mode: PermissionMode) {
-    if (this.engine !== 'kiro') return;   // 见构造函数：那两家按它们自己的 mode
+  setPermissionMode(mode: PermissionMode): Array<{ requestId: JsonRpcId; optionId?: string }> {
+    if (this.engine !== 'kiro') return [];   // 见构造函数：那两家按它们自己的 mode
     this.permissionMode = mode;
+    if (mode !== 'auto-approve') return [];
+    /* 切到自动时已经挂着、没人回答的那几条也按允许答 —— 不答的话那一轮一直等着（实测等了 457 秒） */
+    const answered: Array<{ requestId: JsonRpcId; optionId?: string }> = [];
+    for (const [id, options] of [...this.pendingPermissions]) {
+      this.pendingPermissions.delete(id);
+      const allow = pickPermissionOption(options, true);
+      try {
+        this.send({ jsonrpc: '2.0', id, result: allow ? { outcome: { outcome: 'selected', optionId: allow.optionId } } : { outcome: { outcome: 'cancelled' } } });
+      } catch { /* 进程已经没了 */ }
+      answered.push({ requestId: id, optionId: allow?.optionId });
+    }
+    return answered;
   }
 
   getPermissionMode(): PermissionMode {

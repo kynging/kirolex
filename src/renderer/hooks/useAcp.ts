@@ -5456,6 +5456,8 @@ ${text}`,
             ? { ...session, permissionMode: result.permissionMode }
             : session
         )));
+        /* 切到自动：挂着的那条权限请求主进程已经按允许答了 —— 卡片收掉，别再让人点一个已经答过的 */
+        if (result.permissionMode === 'auto-approve') setPermissionRequests((current) => withoutPermissionCard(current, sessionId));
       }
     } catch (err: any) {
       noteError(sessionId, err?.message || t('Failed to change tool permission mode'));
