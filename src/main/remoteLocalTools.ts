@@ -144,6 +144,14 @@ export function mcpUrl(remotePort: number, urlPath: string): string {
  * 命令行：agent 名和 URL 都会进 shell，拼字符串迟早在引号上出事。程序里一个单引号都不用，
  * 这样它整段可以安全地待在 `'…'` 里。
  */
+/**
+ * 会话专用 agent 里**预先放行**（进 `allowedTools`）的 kiro-cli 内置工具。新会话默认「先问」之后，
+ * 不在这里的工具每次都走 session/request_permission —— 连搜网页、取网页都要用户手动批。
+ * 只放只读的网络工具：它们不碰远端文件、也不碰用户本机（写文件 / 跑命令 / use_aws / local_* /
+ * 转发的本机 MCP 一律不许进来）。只放行、不扩权：底子 `tools` 没列它们时不会因此加进 `tools`。
+ */
+export const REMOTE_PREALLOWED_TOOLS = ['web_search', 'web_fetch'] as const;
+
 export function remoteAgentScript(
   sessionAgent: string,
   baseAgent: string | undefined,
@@ -230,6 +238,11 @@ export function remoteAgentScript(
     '    server = str(t).split("/", 1)[0]',
     '    return any(str(t) == g or fnmatch.fnmatchcase(g, server) for g in tags)',
     'allowed = [t for t in (src.get("allowedTools") or []) if kept(t) and not trusts_write(t) and not trusts_local(t)]',
+    /* 两道过滤之后才并进去（过滤本身不放宽），整体去重；见 `REMOTE_PREALLOWED_TOOLS` */
+    'pre = ' + JSON.stringify(REMOTE_PREALLOWED_TOOLS),
+    'for t in pre:',
+    '    allowed.append(t)',
+    'allowed = [t for i, t in enumerate(allowed) if t not in allowed[:i]]',
     'cfg["allowedTools"] = allowed',
     /*
       **0600 写** —— 文件里的 url 带着 `/mcp/<token>`，而反向隧道在远端是 127.0.0.1，那台机器上谁都连得上；

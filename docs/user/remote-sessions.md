@@ -33,6 +33,9 @@ What this means for you:
   safety boundary is the same as for a local agent, so review its actions the same way.
 - These tools are never pre-approved: every call follows the chat's **Auto / Ask** toggle (see
   [Tool approval](chat.md#tool-approval)). New chats start in **Ask**, so you confirm each call.
+- In remote **kiro** chats, the read-only web tools `web_search` and `web_fetch` no longer ask: they
+  are pre-approved because they only read the web and touch neither the remote files nor your
+  computer. Nothing else changes.
 - When the remote agent changes one of your files, the chat says so: 📝 远端那条会话改了你本机的 …
   (*The remote chat changed … on your machine*).
 - The remote machine only keeps a throw-away scratch folder per chat, under `~/.cache/kirolex/`

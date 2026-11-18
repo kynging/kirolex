@@ -268,7 +268,7 @@ describe('接线层：agent 配置一条会话一份，端口不撞', () => {
     assert.deepEqual(Object.keys(hit.json.mcpServers).sort(), ['local_only', MCP_SERVER_NAME].sort());
     assert.deepEqual(hit.json.tools, ['fs_read', `@${MCP_SERVER_NAME}`]);
     /* 本机工具进 tools（能调），但不进 allowedTools（不预先放行，每次走权限请求） */
-    assert.deepEqual(hit.json.allowedTools, ['fs_read']);
+    assert.deepEqual(hit.json.allowedTools, ['fs_read', 'web_search', 'web_fetch']);
     /* ② 远端没有 → 默认 agent + 只有本地工具，而且 tools 必须显式 `["*"]`
           （缺这个字段等于一个工具都不给 —— 实测过） */
     const miss = run('nope-agent');
@@ -560,7 +560,7 @@ describe('把本机的 MCP 转发给远端会话', () => {
     const j = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'out.json'), 'utf8'));
     assert.deepEqual(Object.keys(j.mcpServers).sort(), [MCP_SERVER_NAME, 'playwright'].sort());
     assert.deepEqual(j.tools, ['fs_read', `@${MCP_SERVER_NAME}`, '@playwright']);
-    assert.deepEqual(j.allowedTools, ['fs_read']);
+    assert.deepEqual(j.allowedTools, ['fs_read', 'web_search', 'web_fetch']);
   });
 
   test('接线：按会话登记代理，并在注入里说清"这些作用在用户机器上"', async () => {

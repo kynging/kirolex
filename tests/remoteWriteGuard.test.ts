@@ -273,7 +273,7 @@ describe('接线：远端会话 agent 不预先信任自带的写文件工具', 
       }));
       execFileSync('bash', ['-lc', remoteAgentScript('out', 'a', 'http://127.0.0.1:1/mcp/t')], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
       const j = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'out.json'), 'utf8'));
-      assert.deepEqual(j.allowedTools, ['fs_read', 'execute_bash']);
+      assert.deepEqual(j.allowedTools, ['fs_read', 'execute_bash', 'web_search', 'web_fetch']);
       assert.deepEqual(Object.keys(j.toolsSettings), ['execute_bash']);
     } finally {
       fs.rmSync(home, { recursive: true, force: true });

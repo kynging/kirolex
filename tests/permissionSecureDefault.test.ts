@@ -137,7 +137,7 @@ test('真跑一遍（POSIX 且有 python3 时）：底子里用精确名 / 服�
     }));
     execFileSync('bash', ['-lc', remoteAgentScript('out', 'a', 'http://127.0.0.1:1/mcp/t', [{ name: 'playwright', url: 'http://127.0.0.1:1/mcp/t/playwright' }])], { env: { ...process.env, HOME: home }, encoding: 'utf8' });
     const j = JSON.parse(fs.readFileSync(path.join(home, '.kiro', 'agents', 'out.json'), 'utf8'));
-    assert.deepEqual(j.allowedTools, ['fs_read', '@remote-db/query', '@kirolex-local-other/x']);
+    assert.deepEqual(j.allowedTools, ['fs_read', '@remote-db/query', '@kirolex-local-other/x', 'web_search', 'web_fetch']);
     assert.ok(j.tools.includes('@kirolex-local'), '工具本身还在，能调（要经过权限请求）');
   } finally {
     fs.rmSync(home, { recursive: true, force: true });
