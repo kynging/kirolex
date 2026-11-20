@@ -43,7 +43,7 @@ import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts'
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 import { dismissNotice, isMuted, isNoticeHidden, muteKeyOf, muteNotice, muteScope, noticeHideStore, CONNECT_FAILURE_GROUP, SESSION_ERROR_GROUP, STARTUP_FAILED_GROUP } from '../noticeDismiss.ts';
 import { usageChip, type UsageView } from '../usageChip.ts';
-import { segmentFoldState, toggleSegmentFold, type SegmentFoldOverride } from '../segmentFold.ts';
+import { segmentFoldState, showsRunningIndicator, toggleSegmentFold, type SegmentFoldOverride } from '../segmentFold.ts';
 
 import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
@@ -1616,10 +1616,11 @@ const MessageItem = memo<{
     [parts, segments],
   );
   // Tool / thinking segments fold to a chip; the user expands them on demand.
-  // With auto-fold on, the actively-streaming segment is folded too (the chip
+  // With auto-fold tools on, the actively-streaming tool segment is folded too (the chip
   // shows its command line + a running indicator; expanding shows live output).
   // Clicks are remembered per segment together with whether it was running, so
-  // a click made while running expires once it finishes (`segmentFold.ts`).
+  // a click made while a tool runs expires once it finishes (thinking clicks
+  // always stick; `segmentFold.ts`).
   const [foldOverrides, setFoldOverrides] = useState<Map<string, SegmentFoldOverride>>(new Map());
   const toggleTool = useCallback((segId: string, cur: { open: boolean; live: boolean }) => {
     setFoldOverrides((prev) => new Map(prev).set(segId, toggleSegmentFold(cur)));
@@ -1658,14 +1659,17 @@ const MessageItem = memo<{
           }
           const streamThis = isStreaming && isLastAssistant && idx === parts.length - 1;
           const isCollapsible = p.variant === 'tool' || p.variant === 'thinking';
-          // When the matching auto-fold setting is ON, a thinking/tool segment is
-          // folded by default even while it streams (the chip names what is
-          // running); it can be expanded to watch live output. When OFF, the
-          // segment stays open for the whole running turn (legacy behavior).
-          // Either way it folds once it finishes, unless the user opens it again.
+          // Tool segments: with auto-fold ON they are folded by default even while
+          // they stream (the chip names what is running); they can be expanded to
+          // watch live output. When OFF, they stay open for the whole running turn
+          // (legacy behavior). Either way they fold once they finish.
+          // Thinking segments stay open while running and show no running
+          // indicator; they fold on finish only when auto-fold thinking is ON, and
+          // the user's clicks always stick (`segmentFold.ts`).
           const running = isStreaming && isLastAssistant;
           const fold = p.variant === 'thinking' ? foldThinking : p.variant === 'tool' ? foldTools : false;
-          const foldState = segmentFoldState({ collapsible: isCollapsible, fold, streamThis, running }, foldOverrides.get(p.id));
+          const foldInput = { kind: p.variant === 'thinking' ? 'thinking' as const : 'tool' as const, collapsible: isCollapsible, fold, streamThis, running };
+          const foldState = segmentFoldState(foldInput, foldOverrides.get(p.id));
           const { open } = foldState;
           const firstLine = isCollapsible ? (p.body.split('\n').find((l) => l.trim()) || '').trim() : '';
           const hasMore = isCollapsible && p.body.trim().length > firstLine.length;
@@ -1681,7 +1685,7 @@ const MessageItem = memo<{
                   >
                     {open ? '▾' : '▸'} {chipLabel}
                   </button>
-                  {streamThis && (
+                  {showsRunningIndicator(foldInput) && (
                     <span className="tool-running-indicator" title={t('Running')}>
                       <span className="tool-running-spinner" aria-hidden="true" />
                       {t('Running')}
