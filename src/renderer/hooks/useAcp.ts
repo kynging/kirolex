@@ -5,6 +5,7 @@ import { uiGet, uiSet, uiRemove } from '../uiStore';
 import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
 import { remoteWarmCut, sessionsToWarm } from '../projectActivity';
 import { attachedFromMain } from '../attachedSync';
+import { outputProvesAttached, runPerMachine, withThrottleRetry } from '../warmAttach';
 import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
 import { messageVariants, normalizeLang, pinShown, t as translate, type Lang } from '../i18n';
@@ -516,11 +517,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
    * 缺的是第三种：**试过、失败了**。那台 EC2 连不上的时候（`Connection timed out during banner
    * exchange`），每条远程会话都是灰的 —— 和"还没打开"一模一样，于是你只能靠翻日志才知道它坏了。
    * 所以只有**真的失败过**才进这个集合；attach 成功、或者开始跑一轮，就从里面摘掉。
+   * **最近一次尝试说了算**：任何路径确认连上（`addAttached`）都摘掉它；这一次失败了就不算连着（摘掉 attached）。
    */
   const failedRef = useRef<Set<string>>(new Set());
   const [failedSessionIds, setFailedSessionIds] = useState<string[]>([]);
   const markFailed = (sid: string | null) => {
     if (!sid) return;
+    removeAttached(sid);
     if (!failedRef.current.has(sid)) {
       failedRef.current.add(sid);
       setFailedSessionIds(Array.from(failedRef.current));
@@ -1144,6 +1147,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (!sid) return;
     /* 连上了（不管经哪条路）：启动失败的横幅收掉，排队的才能发（`settleStageOnAttach`） */
     setCreateStages((prev) => settleStageOnAttach(prev, sid, creatingRef.current.has(sid)));
+    /* 之前失败过、现在连上了：不再红（「为什么 agent board 会话现在显示的是红的」） */
+    clearFailed(sid);
     if (!attachedIdsRef.current.has(sid)) {
       attachedIdsRef.current.add(sid);
       setAttachedSessionIds(Array.from(attachedIdsRef.current));
@@ -2152,7 +2157,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     // Declared outside the try: chosen inside it (before reveal) and consumed
     // after it, once the window is already visible.
     let cap = EXECUTOR_CAP_FALLBACK;
-    let toAttach: Array<{ id: string }> = [];
+    let toAttach: Array<{ id: string; remoteId?: string; remoteHost?: string }> = [];
     (async () => {
       // REVEAL FIRST, CONNECT AFTER. The splash only covers reading session
       // history from disk; no executor start is allowed to hold the window back.
@@ -2221,11 +2226,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // starts in the same wave (not ahead of the others) -- it is already
       // interactive, and sending a message attaches on demand anyway.
       if (toAttach.length === 0) return;
-      await Promise.all(
-        toAttach.map(async (s) => {
+      /*
+        **同一台远程机器的一条接一条，撞上限流再试一两次**（warmAttach.ts）——「为什么 agent board 会话现在显示的是红的」：
+        同一台 EC2 的几条一起连，每条都推一次临时公钥，SendSSHPublicKey 报 ThrottlingException 就标红了。
+        第一条建好的 ssh 主连接后面的直接复用；本机会话和别的机器照旧一起连。
+      */
+      await runPerMachine(
+        toAttach,
+        (s) => s.remoteId || s.remoteHost,
+        async (s) => {
           if (cancelled || attachedIdsRef.current.has(s.id)) { clearConnecting(s.id); return; }
           try {
-            await window.kiroApi.loadSession(s.id, attachCwdFor(s.id), modelForSession(s.id));
+            /* 等重试的这段时间里别的路（点开、主进程通知）已经连上了：不再自己连 */
+            await withThrottleRetry(async () => {
+              if (!attachedIdsRef.current.has(s.id)) await window.kiroApi.loadSession(s.id, attachCwdFor(s.id), modelForSession(s.id));
+            });
             addAttached(s.id);
             clearFailed(s.id);
           } catch {
@@ -2234,12 +2249,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               会话留在灰色（和"还没打开"一模一样），于是那台机器连不上时你只能翻日志才知道。
               注意"到上限了"也会走到这里 —— 那不算坏，但表现一样是"这条现在用不了"，
               标出来比装作正常好；attach 成功会立刻摘掉。
+              这一次连的期间别的路已经确认连上了（重试要等好几秒）：那次成功更新，不标红。
             */
-            markFailed(s.id);
+            if (!attachedIdsRef.current.has(s.id)) markFailed(s.id);
           } finally {
             clearConnecting(s.id);
           }
-        })
+        },
       );
     })();
     return () => { cancelled = true; };
@@ -2579,6 +2595,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // Output resumed, so the turn is demonstrably alive again and the stall
       // warning (with its countdown) must go with it.
       setSessionStall(targetSid, null);
+      /* 这条会话在流出模型输出 / 工具调用：执行器显然连着（只认带了 sessionId 的，不猜） */
+      if (sessionId && outputProvesAttached(update.sessionUpdate)
+        && (!attachedIdsRef.current.has(sessionId) || failedRef.current.has(sessionId))
+        && !sessionsRef.current.find((s) => s.id === sessionId)?.archived) {
+        addAttached(sessionId);
+      }
 
       switch (update.sessionUpdate) {
         case 'agent_message_chunk': {
@@ -4446,12 +4468,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const turnToken = beginStreamingTurn(sid!);
     /* 你又发了一条：之前按过的「停止」不再代表"别替我重试"（原来那个标记一直留到重建上下文为止） */
     recoveryCancelledRef.current.delete(sid!);
-    addAttached(sid!); // first use -> live
+    /*
+      **发出去之前不标「已连上」** —— 原来这里先 `addAttached`（first use -> live）：之前连不上标红的会话一点发送就变绿，
+      后面重连仍失败（限流、超时）也不改回来。现在只在确认连上之后标：prompt 成功、重连的 loadSession 成功，
+      或者这一轮流出了输出（onUpdate 那段）。这一轮进行中圆点本来就是「输出中」，不靠 attached。
+    */
     lastPromptedSessionRef.current = sid;
     setSessionActivity(sid, t('Sent, waiting for {engine} to respond…', { engine: engineLabel(sessionsRef.current.find((s) => s.id === sid)?.engine) }));
 
     try {
       const res = await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });
+      addAttached(sid!);   // 这一轮跑完了：执行器确实连着
       const notice = noticeForStopReason((res as any)?.stopReason, res) || noticeForEmptyTurn(res);
       // No focus condition any more: the notice is stored against the chat it
       // describes, so it shows in that chat's pane whether or not it has focus.
@@ -4486,11 +4513,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           setSessionActivity(sid, t('⏳ The connection dropped mid-turn; reconnecting and resending this turn…'));
           return;
         }
+        /* 重连那一下成没成：没成 = 连接失败，要标红（不管是缺适配器、限流还是超时） */
+        let reattached = false;
         try {
           /* 你刚按了停止就别替你重连重发 */
           if (recoveryCancelledRef.current.has(sid!)) throw err;
           setSessionActivity(sid, t('Reconnecting to chat…'));
           await window.kiroApi.loadSession(sid, attachCwdFor(sid), activeModel);
+          reattached = true;
+          addAttached(sid!);
           setSessionActivity(sid, t('Reconnected, resending…'));
           await window.kiroApi.prompt(sid, prompt, activeModel, projectForSession(sid), { messageId: userMessageId, displayText: textContent, attachments, pastes });
         } catch (retryErr: any) {
@@ -4513,6 +4544,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             mutateSessionMessages(sid!, (prev) => replaceConnectFailureNotices(prev, connectFailureNotice(String(retryErr?.message || retryErr), undefined, uiLangNow())));
             return;
           }
+          /* 重连本身就没成（限流、网络超时 …）：这条会话没连上 —— 保持 / 恢复红点（按了停止的那次没去连，不算） */
+          if (!reattached && !recoveryCancelledRef.current.has(sid!)) markFailed(sid!);
           /* 写进**这条**会话：await 期间焦点可能已经换了，分屏里发的也常常不是焦点那一格 */
           const errTs = Date.now();
           /* 只留我们自己的那句：Electron 包的「Error invoking remote method 'acp:load-session': Error: 」不给人看 */

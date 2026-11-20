@@ -1635,12 +1635,15 @@ describe('连不上要显眼', () => {
   });
 
   test('`statusFor` 在 dormant 之前返回 alert，而且判的是"失败过"不是"没连"', () => {
-    assert.match(SB, /if \(failedSessionIds\?\.includes\(id\)\) return 'alert';/);
-    const alertAt = SB.indexOf("return 'alert';");
-    const dormantAt = SB.lastIndexOf("return 'dormant';");
+    /* 判定搬到了 sessionDot.ts（Sidebar 的 statusFor 调它）；失败之后又连上了不再红（已连上 > 失败） */
+    const DOT = fs.readFileSync(path.join(process.cwd(), 'src/renderer/sessionDot.ts'), 'utf8');
+    assert.match(SB, /failed: !!failedSessionIds\?\.includes\(id\),/);
+    assert.match(DOT, /if \(d\.failed && !attached\) return 'alert';/);
+    const alertAt = DOT.indexOf("return 'alert';");
+    const dormantAt = DOT.lastIndexOf("return 'dormant';");
     assert.ok(alertAt > 0 && alertAt < dormantAt, 'alert 要排在 dormant 兜底之前');
     /* 原来那条规则要留着 —— 没打开过的会话仍然是灰的 */
-    assert.match(SB, /pending_'\)\) return 'dormant'/);
+    assert.match(DOT, /pending_'\)\) return 'dormant'/);
   });
 
   test('颜色是红的（橙色读起来像"稍等一下"）', () => {

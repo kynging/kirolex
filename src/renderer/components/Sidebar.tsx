@@ -38,8 +38,9 @@ import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
 import { engineCliName, engineLabel } from '../engineLabel';
 import { accentEngine } from '../engineTheme.ts';
 import { offloadTooltip } from '../offloadView.ts';
+import { sessionDotStatus, type SessionStatus as DotStatus } from '../sessionDot.ts';
 
-type SessionStatus = 'idle' | 'streaming' | 'unread' | 'dormant' | 'connecting' | 'warm' | 'alert' | 'rebuilding';
+type SessionStatus = DotStatus;
 
 
 /**
@@ -835,44 +836,18 @@ export const Sidebar: React.FC<SidebarProps> = ({
     if (creatingProject) newProjectRef.current?.focus();
   }, [creatingProject]);
 
-  // Per-session dot priority: streaming (working, any session) > connecting >
-  // unread (finished in background) > live (ONLY the current session, and only
-  // once its executor is attached) > dormant. Solid green never lingers on an
-  // unselected chat — background activity shows as streaming/unread instead.
+  // Per-session dot priority lives in `sessionDot.ts` (已连上 > 失败 > 未连接).
   const busyFor = (id: string): string | null => busyBySession?.[id] || null;
-  const statusFor = (id: string): SessionStatus => {
-    const busy = busyBySession?.[id];
-    // Rebuild states are checked FIRST and get their own light. Two reasons:
-    // 'prime-pending' used to fall through to idle/warm, i.e. a STATIC GREEN dot
-    // on a chat that is actually locked and owes a rebuild -- the one state that
-    // must never look "connected and idle". And 'priming' previously borrowed the
-    // normal turn animation, so a rebuild was indistinguishable from a reply.
-    if (busy === 'priming' || busy === 'prime-pending') return 'rebuilding';
-    if (streamingSessionIds.includes(id)) return 'streaming';
-    // Backend occupancy reported by main: the dot must show it even when this
-    // renderer has no local streaming/connecting state for that session.
-    if (busy === 'turn') return 'streaming';
-    if (busy === 'reconfiguring' || busy === 'attaching' || busy === 'creating') return 'connecting';
-    if (connectingSessionIds.includes(id)) return 'connecting';
-    /*
-      **连不上 → 红**（在 unread/dormant 之前判）。下面那段注释说的"还没 attach 不该报警"仍然成立 ——
-      这里判的不是"没连"，是"连过、失败了"（`failedSessionIds` 只在真的抛错时才加，成功就摘）。
-    */
-    if (failedSessionIds?.includes(id)) return 'alert';
-    if (unreadSessionIds.includes(id)) return 'unread';
-    const attached = attachedSessionIds.includes(id);
-    if (id === currentSessionId && attached) return 'idle';   // focused + live
-    if (attached) return 'warm';                              // background, live/ready
-    // Not attached: an archived chat is deliberately inert (neutral). A pending
-    // fork/new chat has no backend executor until its first message — that is
-    // expected, not an error, so show it neutral (dormant) rather than red alert.
-    if (String(id).startsWith('pending_')) return 'dormant';
-    // Any other not-yet-attached chat is a NORMAL idle state: it attaches on open
-    // (or via background eager-warm), so it must not look broken. Show it neutral
-    // (dormant/grey), never the alarming orange 'alert' — attached chats are the
-    // only ones that go green (warm/idle).
-    return 'dormant';
-  };
+  const statusFor = (id: string): SessionStatus => sessionDotStatus({
+    id,
+    currentSessionId,
+    busy: busyBySession?.[id],
+    streaming: streamingSessionIds.includes(id),
+    connecting: connectingSessionIds.includes(id),
+    failed: !!failedSessionIds?.includes(id),
+    unread: unreadSessionIds.includes(id),
+    attached: attachedSessionIds.includes(id),
+  });
 
   /**
    * **换机器** ——「AI角色扮演这个应该是远程的」。
