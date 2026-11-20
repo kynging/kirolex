@@ -4,6 +4,7 @@ import { type SubagentRow } from '../../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
 import { remoteWarmCut, sessionsToWarm } from '../projectActivity';
+import { attachedFromMain } from '../attachedSync';
 import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
 import { messageVariants, normalizeLang, pinShown, t as translate, type Lang } from '../i18n';
@@ -2168,6 +2169,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         }
         if (cancelled) return;
         await window.kiroApi.splashStatus?.(t('Loading session history…'));
+        /*
+          **主进程里还连着的先认下来** ——「窗口刷新后连着的会话显示成灰点」：控制入口 /reload、⌘R 只刷新渲染层，
+          执行器都还活着，可这里的 attached 集合是从空开始的。并进来的下面既不标连接中、也不再 loadSession。
+        */
+        try {
+          for (const id of attachedFromMain(attachedIdsRef.current, await window.kiroApi.listAttached?.())) addAttached(id);
+        } catch {}
         // Decide the warm set and mark it connecting BEFORE the window shows,
         // otherwise the first painted frame has every dot grey ("not connected")
         // and the UI looks broken for a moment. getExecutorCap is a cheap
@@ -3312,6 +3320,13 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       addAttached(sid);
       setSessionActivity(sid, null);
     });
+    /* 主进程自己发起的 attach 成功了（定时唤醒、控制入口 /send …）：渲染层没参与，标成连着（归档的不认，见断线恢复那段） */
+    const removeAttachedEvt = window.kiroApi.onAttached?.((data) => {
+      const sid = data?.sessionId;
+      if (!sid || sessionsRef.current.find((s) => s.id === sid)?.archived) return;
+      clearConnecting(sid);
+      addAttached(sid);
+    });
 
     /* 窗口重载时还挂着的提问（主进程那边还在等回答）：补回来 */
     window.kiroApi.pendingQuestions?.().then((cards) => {
@@ -3324,6 +3339,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
 
     return () => {
       removeReattached?.();
+      removeAttachedEvt?.();
       removeUpdate();
       removeError();
       removeNotice?.();

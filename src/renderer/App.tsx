@@ -246,6 +246,8 @@ declare global {
       archiveSession: (sessionId: string, archived: boolean) => Promise<{ sessionId: string; archived: boolean }>;
       sessionInfo: (sessionId: string) => Promise<{ ok: boolean; error?: string; info?: import('./sessionInfo').SessionInfo }>;
       getExecutorCap: () => Promise<number>;
+      listAttached?: () => Promise<string[]>;
+      onAttached?: (callback: (data: { sessionId: string }) => void) => () => void;
       getExecutorCapInfo: () => Promise<{ cap: number; auto: number; overridden: boolean }>;
       prepareImageAttachment?: (filePath: string) => Promise<{ path: string; downscaled?: boolean; from?: string; to?: string }>;
       getFeatures?: () => Promise<{ flags: Record<string, boolean>; defaults: Record<string, boolean> }>;

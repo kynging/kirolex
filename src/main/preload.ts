@@ -252,6 +252,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 「会话信息」：会话 id / 后端会话 id / 运行位置 / 引擎 / 会话目录，排查时一次拿全 */
   sessionInfo: (sessionId: string) => ipcRenderer.invoke('acp:session-info', sessionId),
   getExecutorCap: () => ipcRenderer.invoke('acp:get-executor-cap'),
+  /** 主进程里当前已连接的执行器（会话 id）—— 窗口刷新后水化时并进 attached 集合 */
+  listAttached: () => ipcRenderer.invoke('acp:list-attached'),
   reveal: () => ipcRenderer.invoke('acp:reveal'),
   /** 无边框窗口的三个按钮 —— 'minimize' | 'toggle-maximize' | 'close' */
   windowControl: (action: 'minimize' | 'toggle-maximize' | 'close') => ipcRenderer.invoke('window:control', action),
@@ -962,6 +964,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:reattached', handler);
     return () => ipcRenderer.removeListener('acp:reattached', handler);
+  },
+  /** 主进程自己发起的 attach 成功了（定时唤醒、控制入口 /send …，都走 `ensureAttached`）：同上，标成"连着"。 */
+  onAttached: (callback: (data: { sessionId: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:attached', handler);
+    return () => ipcRenderer.removeListener('acp:attached', handler);
   },
   onSessionReady: (callback: (data: { sessionId: string; projectId?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

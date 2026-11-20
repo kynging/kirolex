@@ -84,6 +84,7 @@ import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
 import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectChange } from './advancedOnly.ts';
+import { listAttachedSessionIds } from './attachedList.ts';
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
@@ -16796,7 +16797,9 @@ ${hint}` : ''}` };
     } catch (err: any) {
       logger.warn('revise', `按需挂起失败 sessionId=${sid}: ${err?.message || err}`);
     }
-    return !!sessionClients.get(sid);
+    /* 主进程自己挂上的（定时唤醒、控制入口 /send …）渲染层不知道：告诉它，侧栏圆点才不会停在灰色 */
+    if (sessionClients.get(sid)) { mainWindow?.webContents.send('acp:attached', { sessionId: sid }); return true; }
+    return false;
   };
   /* 断线恢复（`remoteRecovery`）在模块级，它要用的就是这一份挂载实现 */
   reattachSession = ensureAttached;
@@ -18165,6 +18168,11 @@ ${hint}` : ''}` };
   // Expose the auto-sized executor cap so the renderer warms the right number
   // of sessions at startup (instead of a hardcoded count).
   ipcMain.handle('acp:get-executor-cap', async () => MAX_CONCURRENT_SESSIONS);
+  /* 窗口刷新后渲染层的 attached 集合是空的：水化时取这一份并进去，侧栏圆点才和真实连接一致（attachedList.ts） */
+  ipcMain.handle('acp:list-attached', () => listAttachedSessionIds(sessionClients.keys(), {
+    connecting: (id) => attachingSessions.has(id) || attachInFlight.has(id),
+    isProtected: store.isAdvancedOnlySession,
+  }));
 
   // Helper (background chore) models: chat titles + prompt suggestions. Exposed in
   // Settings so a throttled/retired helper model can be swapped without a rebuild.
