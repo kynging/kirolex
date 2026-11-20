@@ -1922,6 +1922,40 @@ button, input, select, textarea {
   border-radius: 50%;
   animation: history-spin 0.9s linear infinite;
 }
+/* 折叠态里「正在运行的那一个」：完整显示、自动换行（最多 5 行由 previewLines 截），不再单行省略号 */
+.tool-toggle-row.run {
+  align-items: flex-start;
+}
+.run-preview {
+  flex: 1 1 auto;
+  min-width: 0;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: baseline;
+  gap: 4px 8px;
+  cursor: pointer;
+  font-size: 11px;
+  color: var(--text-muted);
+}
+.turn-panel > .run-preview {
+  padding: 0 12px 8px 28px;
+}
+.run-preview-text {
+  flex: 1 1 260px;
+  min-width: 0;
+  font-family: var(--mono-font, ui-monospace, SFMono-Regular, Menlo, monospace);
+  color: var(--text-secondary);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
+.run-preview-more,
+.run-preview-done {
+  flex: none;
+  opacity: 0.8;
+}
+.run-preview .tool-running-indicator {
+  align-self: flex-start;
+}
 .md-link {
   color: #6cb6ff;
   text-decoration: none;

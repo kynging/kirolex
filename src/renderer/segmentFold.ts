@@ -54,3 +54,31 @@ export function showsRunningIndicator(s: SegmentFoldInput): boolean {
 export function toggleSegmentFold(cur: { open: boolean; live: boolean }): SegmentFoldOverride {
   return { open: !cur.open, live: cur.live };
 }
+
+/**
+ * 回复下面的「⚡ 执行的命令」/「🔧 用过的工具」面板（2026-11-20 第 3 轮）：和工具段同一套规则 ——
+ * autoFoldTools 开 → 运行中也折叠；关 → 运行中展开（旧行为）；这一轮结束一律折叠。
+ * 用户的点击 pin 住，但运行中的点击在这一轮结束后作废（跑完即折）。
+ */
+export function panelFoldState(autoFold: boolean, live: boolean, pin?: SegmentFoldOverride): { open: boolean; live: boolean } {
+  return segmentFoldState({ kind: 'tool', collapsible: true, fold: autoFold, streamThis: live, running: live }, pin);
+}
+
+/** 折叠态显示「正在运行的那一个」：最后一个仍在运行的，没有就最后一个；`done` = 不在运行的条数 */
+export function pickCurrent<T>(items: T[], isRunning: (item: T) => boolean): { current: T | undefined; running: boolean; done: number } {
+  let current: T | undefined;
+  let done = 0;
+  for (const item of items) {
+    if (isRunning(item)) current = item; else done++;
+  }
+  if (current !== undefined) return { current, running: true, done };
+  return { current: items[items.length - 1], running: false, done };
+}
+
+/** 折叠态预览的文本：去掉首尾空行，最多 `max` 行，`more` = 没显示的行数（界面上是「+N 行」） */
+export function previewLines(text: string, max = 5): { lines: string[]; more: number } {
+  const all = String(text || '').split(/\r?\n/);
+  while (all.length && !all[0].trim()) all.shift();
+  while (all.length && !all[all.length - 1].trim()) all.pop();
+  return { lines: all.slice(0, max), more: Math.max(0, all.length - max) };
+}

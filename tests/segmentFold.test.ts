@@ -4,7 +4,7 @@
  */
 import test, { describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { segmentFoldState, showsRunningIndicator, toggleSegmentFold } from '../src/renderer/segmentFold.ts';
+import { panelFoldState, pickCurrent, previewLines, segmentFoldState, showsRunningIndicator, toggleSegmentFold } from '../src/renderer/segmentFold.ts';
 
 const base = { kind: 'tool' as const, collapsible: true, fold: true, streamThis: false, running: false };
 
@@ -91,5 +91,68 @@ describe('showsRunningIndicator', () => {
     assert.equal(showsRunningIndicator({ ...base, fold: false, running: true, streamThis: true }), true);
     assert.equal(showsRunningIndicator({ ...base, running: true }), false);
     assert.equal(showsRunningIndicator(base), false);
+  });
+});
+
+// 2026-11-20 第 3 轮：回复下面的「⚡ 执行的命令」面板跟随 autoFoldTools；折叠态显示「正在运行的那一个」
+describe('panelFoldState（CommandsPanel / ToolsPanel）', () => {
+  test('autoFoldTools 开：运行中 / 结束都折叠', () => {
+    assert.equal(panelFoldState(true, true).open, false);
+    assert.equal(panelFoldState(true, false).open, false);
+  });
+  test('autoFoldTools 关：运行中展开（旧行为），结束折叠', () => {
+    assert.equal(panelFoldState(false, true).open, true);
+    assert.equal(panelFoldState(false, false).open, false);
+  });
+  test('开 + 运行中点开 → 展开；这一轮结束后点击作废 → 折叠', () => {
+    const pin = toggleSegmentFold(panelFoldState(true, true));
+    assert.equal(panelFoldState(true, true, pin).open, true);
+    assert.equal(panelFoldState(true, false, pin).open, false);
+  });
+  test('关 + 运行中点收起 → 折叠；结束后照旧折叠', () => {
+    const pin = toggleSegmentFold(panelFoldState(false, true));
+    assert.equal(panelFoldState(false, true, pin).open, false);
+    assert.equal(panelFoldState(false, false, pin).open, false);
+  });
+  test('结束后点开 → 一直展开（开 / 关都一样）', () => {
+    for (const fold of [true, false]) {
+      const pin = toggleSegmentFold(panelFoldState(fold, false));
+      assert.equal(panelFoldState(fold, false, pin).open, true);
+    }
+  });
+});
+
+describe('pickCurrent', () => {
+  const run = (s: string) => s.startsWith('run');
+  test('多条里选最后一个运行中的；已完成数 = 不在运行的条数', () => {
+    assert.deepEqual(pickCurrent(['done1', 'run1', 'done2', 'run2', 'done3'], run), { current: 'run2', running: true, done: 3 });
+  });
+  test('3 条命令，第 3 条在跑 → 第 3 条，已完成 2 条', () => {
+    assert.deepEqual(pickCurrent(['a', 'b', 'run-c'], run), { current: 'run-c', running: true, done: 2 });
+  });
+  test('没有运行中的 → 最后一个', () => {
+    assert.deepEqual(pickCurrent(['a', 'b', 'c'], run), { current: 'c', running: false, done: 3 });
+  });
+  test('空列表', () => {
+    assert.deepEqual(pickCurrent([], run), { current: undefined, running: false, done: 0 });
+  });
+});
+
+describe('previewLines', () => {
+  test('不超过 5 行：全显示，没有 +N', () => {
+    assert.deepEqual(previewLines('a\nb\nc'), { lines: ['a', 'b', 'c'], more: 0 });
+    assert.deepEqual(previewLines('1\n2\n3\n4\n5'), { lines: ['1', '2', '3', '4', '5'], more: 0 });
+  });
+  test('超过 5 行：前 5 行 + 剩下的行数', () => {
+    assert.deepEqual(previewLines('1\n2\n3\n4\n5\n6\n7\n8'), { lines: ['1', '2', '3', '4', '5'], more: 3 });
+  });
+  test('首尾空行不算，\r\n 也认', () => {
+    assert.deepEqual(previewLines('\n\n  cmd one\r\ncmd two\n\n'), { lines: ['  cmd one', 'cmd two'], more: 0 });
+  });
+  test('空文本', () => {
+    assert.deepEqual(previewLines(''), { lines: [], more: 0 });
+  });
+  test('上限可调', () => {
+    assert.deepEqual(previewLines('1\n2\n3', 2), { lines: ['1', '2'], more: 1 });
   });
 });

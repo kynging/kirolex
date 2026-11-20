@@ -18,23 +18,33 @@ describe('the commands panel folds itself when the turn ends', () => {
   const panel = src.slice(src.indexOf('const CommandsPanel = memo'));
   const body = panel.slice(0, panel.indexOf('\nconst FileChangesPanel'));
 
-  test('open while the turn runs, closed once it is over', () => {
+  test('follows autoFoldTools while the turn runs, closed once it is over', () => {
     // A pure function of `live`, not an effect syncing state: an effect can fall out of
-    // step with the turn it is meant to follow, this cannot.
-    assert.match(body, /const \[pinned, setPinned\] = useState<boolean \| null>\(null\);/);
-    assert.match(body, /const collapsed = pinned \?\? !live;/);
+    // step with the turn it is meant to follow, this cannot. autoFoldTools ON folds it
+    // even while running; OFF keeps it open while running (panelFoldState, unit-tested
+    // in segmentFold.test.ts).
+    assert.match(body, /const \[pinned, setPinned\] = useState<SegmentFoldOverride \| null>\(null\);/);
+    assert.match(body, /const foldState = panelFoldState\(autoFold, !!live, pinned \?\? undefined\);/);
+    assert.match(body, /const collapsed = !foldState\.open;/);
     // A click pins THIS panel's choice and stops the automatic rule fighting the user.
-    assert.match(body, /onClick=\{\(\) => setPinned\(!collapsed\)\}/);
+    assert.match(body, /const toggle = \(\) => setPinned\(toggleSegmentFold\(foldState\)\);/);
+    assert.match(body, /<button className="turn-panel-head" onClick=\{toggle\}>/);
+    assert.match(src, /<CommandsPanel [^>]*autoFold=\{foldTools\}/);
     // `live` must mean "this turn is the running one", not "some turn is running".
     /* 只钉 `live=` 那一段，别把整行 JSX 写死 —— 后来加 `remoteHost`（工具跑在哪台机器上）
        就把这条测试撞坏了，而它想守的其实只有 live 的含义。 */
     assert.match(src, /<CommandsPanel fileChanges=\{turnFileChanges\} live=\{isStreaming && isLastAssistant\}/);
   });
 
-  test('collapsed shows exactly one line: the first line of the first command', () => {
-    assert.match(body, /const preview = commandFirstLine\(cmds\[0\]\.title\);/);
-    assert.match(body, /\{collapsed && \(\s*\n\s*<span className="commands-preview"/);
-    assert.match(body, /\{cmds\.length > 1 \? ` … \+\$\{cmds\.length - 1\}` : ''\}/);
+  test('collapsed shows the command running now, in full (up to 5 lines)', () => {
+    // 2026-11-20: the first line of the FIRST command, clipped, did not say what was
+    // running. Now: the last still-running command (else the last one), wrapped.
+    assert.match(body, /const cur = pickCurrent\(cmds, \(c\) => commandStillRunning\(c\.status\)\);/);
+    assert.match(body, /\{collapsed && cur\.current && \(\s*\n\s*<RunPreview/);
+    assert.match(body, /running=\{!!live && cur\.running\}/);
+    assert.match(body, /done=\{live \? cur\.done : 0\}/);
+    assert.match(src, /const \{ lines, more \} = previewLines\(text\);/);
+    assert.match(css, /\.run-preview-text \{[\s\S]*?white-space: pre-wrap;[\s\S]*?\}/);
   });
 
   test('an entry is one line by default, and the whole command stays reachable', () => {

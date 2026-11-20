@@ -81,7 +81,7 @@ describe('3a / 3b / 12 接线：只对 Claude Code / Codex，kiro 不变', () =>
   });
   test('界面：工具面板挂在回合面板里；命令面板只列主线；diff 只对非 kiro 换成按行显示', () => {
     /* 只给非 kiro：kiro 也落盘带 locations 的 Read（老判据），不能让它们在 kiro 会话里冒出一块新面板 */
-    assert.match(C, /\{!!engine && engine !== 'kiro' && <ToolsPanel calls=\{turnFileChanges\} live=\{isStreaming && isLastAssistant\} \/>\}/);
+    assert.match(C, /\{!!engine && engine !== 'kiro' && <ToolsPanel calls=\{turnFileChanges\} live=\{isStreaming && isLastAssistant\} autoFold=\{foldTools\} \/>\}/);
     assert.match(C, /const cmds = useMemo\(\(\) => mainlineCommands\(fileChanges\), \[fileChanges\]\);/);
     assert.match(C, /<FileChangesPanel fileChanges=\{turnFileChanges\} remoteHost=\{remoteHost\} engine=\{engine\} \/>/);
     assert.match(C, /const lineDiff = nonKiro && !!f\.diffs\?\.length;/);

@@ -43,7 +43,7 @@ import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts'
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 import { dismissNotice, isMuted, isNoticeHidden, muteKeyOf, muteNotice, muteScope, noticeHideStore, CONNECT_FAILURE_GROUP, SESSION_ERROR_GROUP, STARTUP_FAILED_GROUP } from '../noticeDismiss.ts';
 import { usageChip, type UsageView } from '../usageChip.ts';
-import { segmentFoldState, showsRunningIndicator, toggleSegmentFold, type SegmentFoldOverride } from '../segmentFold.ts';
+import { panelFoldState, pickCurrent, previewLines, segmentFoldState, showsRunningIndicator, toggleSegmentFold, type SegmentFoldOverride } from '../segmentFold.ts';
 
 import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
 import 'highlight.js/styles/github-dark.css';
@@ -1674,10 +1674,14 @@ const MessageItem = memo<{
           const firstLine = isCollapsible ? (p.body.split('\n').find((l) => l.trim()) || '').trim() : '';
           const hasMore = isCollapsible && p.body.trim().length > firstLine.length;
           const chipLabel = p.variant === 'thinking' ? t('💭 Thinking') : t('🔧 Tools');
+          /* 🔧 段折叠时显示「正在运行的那一个」：这一段里最后一个还在跑的工具调用（没有就最后一个），
+             没挂调用就显示这段正文；都完整换行显示，最多 5 行（RunPreview） */
+          const segCalls = p.variant === 'tool' ? segments[idx]?.toolCalls || [] : [];
+          const segCur = segCalls.length ? pickCurrent(segCalls, (c) => commandStillRunning(c.status)) : null;
           return (
             <div key={p.id} className={`turn-segment${p.variant ? ` variant-${p.variant}` : ''}`}>
               {isCollapsible ? (
-                <div className="tool-toggle-row">
+                <div className={`tool-toggle-row${p.variant === 'tool' && !open ? ' run' : ''}`}>
                   <button
                     className={`msg-variant-badge ${p.variant} as-toggle`}
                     onClick={() => toggleTool(p.id, foldState)}
@@ -1691,7 +1695,15 @@ const MessageItem = memo<{
                       {t('Running')}
                     </span>
                   )}
-                  {!open && (
+                  {!open && p.variant === 'tool' && (
+                    <RunPreview
+                      text={segCur?.current ? commandLabel(segCur.current.title) : p.body}
+                      running={false}
+                      done={streamThis && segCur ? segCur.done : 0}
+                      onOpen={() => toggleTool(p.id, foldState)}
+                    />
+                  )}
+                  {!open && p.variant !== 'tool' && (
                     <span className="tool-collapsed-preview" onClick={() => toggleTool(p.id, foldState)} title={t('Expand')}>
                       {firstLine}{hasMore ? ' …' : ''}
                     </span>
@@ -1721,10 +1733,10 @@ const MessageItem = memo<{
             {/* `live` = this turn is the one still running. The panel is open while it
                 runs and closes itself when it ends, so a finished turn does not leave a
                 wall of shell text in the transcript. */}
-            <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} remoteHost={remoteHost} />
+            <CommandsPanel fileChanges={turnFileChanges} live={isStreaming && isLastAssistant} remoteHost={remoteHost} autoFold={foldTools} />
             <BrowserPanel fileChanges={turnFileChanges} />
             {/* Claude Code / Codex：只读的调用（Read / Grep / WebFetch …）和子代理（Task 下面挂它的调用）。只给非 kiro：kiro 也落盘带 locations 的 Read，不能让它们冒出一块新面板 */}
-            {!!engine && engine !== 'kiro' && <ToolsPanel calls={turnFileChanges} live={isStreaming && isLastAssistant} />}
+            {!!engine && engine !== 'kiro' && <ToolsPanel calls={turnFileChanges} live={isStreaming && isLastAssistant} autoFold={foldTools} />}
           </div>
         )}
         {/* 还挂着的提问（等你选 / 填）永远画在这一轮的最下面：正文、工具块都在它上面，不会把它挤出视野（`splitTurnAsks`） */}
@@ -3392,25 +3404,50 @@ function commandFirstLine(title: string): { head: string; more: number } {
   return { head: text.slice(0, nl), more: text.slice(nl + 1).split('\n').filter((l) => l.trim()).length };
 }
 
-const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost?: string }>(({ fileChanges, live, remoteHost }) => {
+/** 折叠态里「正在运行的那一个」（2026-11-20 第 3 轮）：完整显示、自动换行，最多 5 行，超出给「+N 行」；
+ *  前面带「◌ 运行中」（只在它真的在跑时），后面标「已完成 N 条」（N 为 0 时不显示）。点一下展开看全量。 */
+const RunPreview: React.FC<{ text: string; running: boolean; done: number; onOpen: () => void }> = ({ text, running, done, onOpen }) => {
+  const t = useT();
+  const { lines, more } = previewLines(text);
+  return (
+    <div className="run-preview" onClick={onOpen} title={t('Expand')}>
+      {running && (
+        <span className="tool-running-indicator">
+          <span className="tool-running-spinner" aria-hidden="true" />
+          {t('Running')}
+        </span>
+      )}
+      <span className="run-preview-text">{lines.join('\n')}</span>
+      {more > 0 && <span className="run-preview-more">{t('+{n} lines', { n: more })}</span>}
+      {done > 0 && <span className="run-preview-done">{t('{n} completed', { n: done })}</span>}
+    </div>
+  );
+};
+
+const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost?: string; autoFold?: boolean }>(({ fileChanges, live, remoteHost, autoFold = false }) => {
   const t = useT();
   /** null = follow the turn; a click pins this panel's own choice.
    *
-   *  Open while the turn is RUNNING (watching commands go by is the point of it) and
-   *  closed once it has finished, which is also how an older turn's panel starts. No
-   *  effect and no ref: the rule is a pure function of `live`, so it cannot get out of
-   *  step with the turn the way a state-syncing effect can. */
-  const [pinned, setPinned] = useState<boolean | null>(null);
-  const collapsed = pinned ?? !live;
+   *  With autoFoldTools ON the panel is folded even while the turn runs (the folded
+   *  head shows the command that is running now); OFF keeps the old rule: open while
+   *  the turn is RUNNING and closed once it has finished, which is also how an older
+   *  turn's panel starts. A click made while the turn runs expires when it ends
+   *  (`panelFoldState`). No effect and no ref: the rule is a pure function of `live`,
+   *  so it cannot get out of step with the turn the way a state-syncing effect can. */
+  const [pinned, setPinned] = useState<SegmentFoldOverride | null>(null);
+  const foldState = panelFoldState(autoFold, !!live, pinned ?? undefined);
+  const collapsed = !foldState.open;
   /** Multi-line commands the user asked to see in full, by tool-call id. */
   const [expandedIds, setExpandedIds] = useState<Set<string>>(new Set());
   /* 子代理（Task）里跑的命令挂在它的 Task 行下面（ToolsPanel），不混进主线；kiro 没有父调用，结果和原来一样 */
   const cmds = useMemo(() => mainlineCommands(fileChanges), [fileChanges]);
   if (!cmds.length) return null;
-  const preview = commandFirstLine(cmds[0].title);
+  /* 折叠时预览「正在运行的那一个」：最后一条还在跑的命令，没有就最后一条；跑完的这一轮不带运行指示 */
+  const cur = pickCurrent(cmds, (c) => commandStillRunning(c.status));
+  const toggle = () => setPinned(toggleSegmentFold(foldState));
   return (
     <div className="turn-panel commands-panel">
-      <button className="turn-panel-head" onClick={() => setPinned(!collapsed)}>
+      <button className="turn-panel-head" onClick={toggle}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
         {/* A span, not a bare text node: as an anonymous flex item it competes with the
             preview for width and wraps instead of letting the preview clip. */}
@@ -3423,15 +3460,15 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
             🌐 {remoteHost}
           </span>
         )}
-        {/* Collapsed is ONE line in total: the first line of the first command, clipped.
-            Enough to recognise what ran without the panel taking over the turn. */}
-        {collapsed && (
-          <span className="commands-preview" title={cmds[0].title}>
-            {preview.head}
-            {cmds.length > 1 ? ` … +${cmds.length - 1}` : ''}
-          </span>
-        )}
       </button>
+      {collapsed && cur.current && (
+        <RunPreview
+          text={commandLabel(cur.current.title)}
+          running={!!live && cur.running}
+          done={live ? cur.done : 0}
+          onOpen={toggle}
+        />
+      )}
       {!collapsed && (
         <ul className="files-list">
           {cmds.map((c) => {
@@ -3614,9 +3651,9 @@ const toolRowTitle = (c: ToolCall): string => commandFirstLine(c.title).head;
  * 行的样式和「运行的命令」同一套（files-item-row + kind 徽章）；失败标红。只给非 kiro 会话画（kiro 也落盘带 locations 的 Read，见 MessageItem 那一处判断）。
  */
 /** 「用过的工具」你点开（true）/ 收起（false）过的那些，按消息记（键见 ToolsPanel 里的 memoKey）；只在这次运行里记 */
-const toolsPanelOpen = new Map<string, boolean>();
+const toolsPanelOpen = new Map<string, SegmentFoldOverride>();
 
-const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live }) => {
+const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean; autoFold?: boolean }>(({ calls, live, autoFold = true }) => {
   const t = useT();
   const rows = useMemo(() => toolRowsOf(calls), [calls]);
   /*
@@ -3624,10 +3661,13 @@ const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live })
     点开 / 收起过就按你的，按消息记（键 = 这一轮第一条工具调用的 id）：消息组件在新一段到达时会重新挂载，组件里的 state 留不住。
   */
   const memoKey = rows[0]?.call.toolCallId || '';
-  const [pinned, setPinnedState] = useState<boolean | null>(() => toolsPanelOpen.get(memoKey) ?? null);
-  const setPinned = (open: boolean) => { if (memoKey) toolsPanelOpen.set(memoKey, open); setPinnedState(open); };
-  const collapsed = !(pinned ?? false);
+  const [pinned, setPinnedState] = useState<SegmentFoldOverride | null>(() => toolsPanelOpen.get(memoKey) ?? null);
+  /* 跟随 autoFoldTools（和「运行的命令」同一条规则）：开 → 跑着也折叠；关 → 跑着展开；这一轮结束折叠。跑着时点的，这一轮结束后作废（panelFoldState） */
+  const foldState = panelFoldState(autoFold, !!live, pinned ?? undefined);
+  const collapsed = !foldState.open;
+  const togglePanel = () => { const next = toggleSegmentFold(foldState); if (memoKey) toolsPanelOpen.set(memoKey, next); setPinnedState(next); };
   const summary = toolsSummaryOf(rows);
+  const cur = pickCurrent(rows.flatMap((r) => [r.call, ...r.children]), (c) => toolState(c.status) === 'running');
   const [openIds, setOpenIds] = useState<Set<string>>(new Set());
   const anyRunning = rows.some((r) => toolState(r.call.status) === 'running' || r.children.some((c) => toolState(c.status) === 'running'));
   const [now, setNow] = useState(() => Date.now());
@@ -3651,7 +3691,7 @@ const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live })
   };
   return (
     <div className="turn-panel tools-panel">
-      <button className="turn-panel-head" onClick={() => setPinned(collapsed)} aria-expanded={!collapsed}>
+      <button className="turn-panel-head" onClick={togglePanel} aria-expanded={!collapsed}>
         <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
         <span className="turn-panel-label">
           {summary.subagents > 0
@@ -3659,12 +3699,16 @@ const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean }>(({ calls, live })
             : t('🔧 Used {n} tools', { n: summary.tools })}
         </span>
         {failed > 0 && <span className="tools-failed-count">{t('{n} failed', { n: failed })}</span>}
-        {collapsed && live && summary.running && (
-          <span className="commands-preview" title={summary.running.title}>
-            {t('Running: {tool}', { tool: toolRowTitle(summary.running) })}
-          </span>
-        )}
       </button>
+      {/* 折叠时预览「正在运行的那一个」（跑着时就是 summary.running）：最后一条还在跑的调用，没有就最后一条 */}
+      {collapsed && cur.current && (
+        <RunPreview
+          text={commandLabel(cur.current.title)}
+          running={!!live && cur.running}
+          done={live ? cur.done : 0}
+          onOpen={togglePanel}
+        />
+      )}
       {!collapsed && (
         <ul className="files-list">
           {rows.map(({ call, children }) => {

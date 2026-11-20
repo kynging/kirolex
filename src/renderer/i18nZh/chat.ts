@@ -147,6 +147,7 @@ export const ZH_CHAT: Record<string, string> = {
   "Permission mode (this engine's own): whether to ask you before acting": '权限模式（这个引擎自己的）：要不要先问你再动手',
   'These commands run on {host} (not your Mac)': '这些命令跑在 {host} 上（不是你的 Mac）',
   '+{n} lines': '+{n} 行',
+  '{n} completed': '已完成 {n} 条',
   'The file no longer exists and cannot be opened: {path}\n(It may have been renamed or deleted after this turn; the diff below still shows what changed)': '文件已不存在，无法打开：{path}\n（可能在这一轮之后被改名或删除；下方 diff 仍可查看改了什么）',
   'Open {path} in KiroLex': '在 KiroLex 内打开 {path}',
   'Changed on {host}; this opens the copy already synced back locally': '在 {host} 上改的；这里打开的是已同步回本地的那一份',

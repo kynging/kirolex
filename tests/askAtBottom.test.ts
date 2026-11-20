@@ -102,13 +102,17 @@ describe('ChatArea 接线', () => {
     assert.ok(flow > 0 && panels > flow, '工具块要在正文后面');
     assert.ok(asks > panels && card > asks, '提问卡片要在工具块后面');
   });
-  test('ToolsPanel 默认折叠，跑着的这一轮也不自动展开；展开过的按消息记', () => {
+  test('ToolsPanel 跟随自动折叠工具（开：跑着也折叠；关：跑着展开）；展开过的按消息记', () => {
     const panel = CHAT.slice(CHAT.indexOf('const ToolsPanel = memo<'), CHAT.indexOf('const FileChangesPanel = memo<'));
-    assert.match(panel, /const collapsed = !\(pinned \?\? false\)/);
+    /* 折叠规则走 panelFoldState，用传进来的 autoFoldTools（2026-11-20 第 3 轮） */
+    assert.match(panel, /const ToolsPanel = memo<\{ calls: ToolCall\[\]; live\?: boolean; autoFold\?: boolean \}>/);
+    assert.match(panel, /const foldState = panelFoldState\(autoFold, !!live, pinned \?\? undefined\);/);
+    assert.match(panel, /const collapsed = !foldState\.open;/);
     assert.doesNotMatch(panel, /pinned \?\? !live/);
     assert.match(panel, /toolsPanelOpen\.(get|set)\(/, '展开 / 收起记在模块级的表里，消息重新挂载也还在');
     assert.match(panel, /toolsSummaryOf\(/);
-    assert.match(panel, /summary\.running/, '跑着的这一轮在摘要里带最近一条在跑的工具');
+    assert.match(panel, /pickCurrent\(rows\.flatMap\(\(r\) => \[r\.call, \.\.\.r\.children\]\), \(c\) => toolState\(c\.status\) === 'running'\)/, '折叠时带最近一条在跑的工具（没有就最后一条）');
+    assert.match(panel, /running=\{!!live && cur\.running\}/);
   });
   test('出现挂着的提问：在底部就滚过去，往上翻着就显示浮标', () => {
     const effect = CHAT.slice(CHAT.indexOf('const pendingAsk = '), CHAT.indexOf('const pendingAsk = ') + 1600);
