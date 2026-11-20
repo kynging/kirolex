@@ -9185,6 +9185,21 @@ button, input, select, textarea {
   border-radius: 5px;
 }
 .backup-proj-row:hover { background: var(--bg-hover); }
+/* 项目关着时组内每行不给灰开关，写明「跟随『项目』：不同步」；点它跳到项目组、组开关闪一下 */
+.backup-follow {
+  font-size: 11px;
+  padding: 1px 8px;
+  border-radius: 999px;
+  border: 1px dashed var(--border);
+  background: transparent;
+  color: var(--text-muted);
+  white-space: nowrap;
+  flex: 0 0 auto;
+  cursor: pointer;
+}
+.backup-follow:hover { color: var(--text); border-color: var(--accent, var(--border)); }
+.backup-proj-switch { display: inline-flex; border-radius: 999px; }
+.backup-proj-switch.flash { box-shadow: 0 0 0 2px var(--accent, #4a90e2); }
 
 /*
   恢复那一页按项目分组。组头可以收起来 —— 33 条会话平铺时"这条是哪摊活的"要靠标题猜,

@@ -148,6 +148,44 @@ export function groupSyncProjects<
 
 type Pickable = { id: string; busy?: boolean; missing?: boolean };
 
+/**
+ * 同步页每行右边显示什么。规则不变：一条会话同步与否 = 它在本机所属项目的开关 + 单条开关
+ * （「已归档」组里的也按原项目算）。原项目关着时单条开关点不动，与其给个灰开关让人猜，
+ * 不如直接写明「跟随『项目』：不同步」（`follow`，点它跳到那个项目组的开关）；原项目开着才给开关。
+ */
+export type SyncRowControl = { kind: 'toggle'; on: boolean } | { kind: 'follow'; project: string };
+
+export function syncRowControl(
+  x: { project: string; excluded?: boolean },
+  projectExcluded: (project: string) => boolean,
+): SyncRowControl {
+  return projectExcluded(x.project) ? { kind: 'follow', project: x.project } : { kind: 'toggle', on: !x.excluded };
+}
+
+export interface ArchivedSyncCounts { synced: number; followOff: number; sessionOff: number }
+
+/** 「已归档」组头的汇总：几条同步、几条跟着原项目不同步、几条单独关了。 */
+export function archivedSyncSummary(
+  rows: Array<{ project: string; excluded?: boolean }>,
+  projectExcluded: (project: string) => boolean,
+): ArchivedSyncCounts {
+  const n: ArchivedSyncCounts = { synced: 0, followOff: 0, sessionOff: 0 };
+  for (const x of rows) {
+    const c = syncRowControl(x, projectExcluded);
+    if (c.kind === 'follow') n.followOff += 1; else if (c.on) n.synced += 1; else n.sessionOff += 1;
+  }
+  return n;
+}
+
+/** 汇总文案，数字为 0 的段不显示（全 0 时是空串）。 */
+export function archivedSyncSummaryText(n: ArchivedSyncCounts, lang: Lang = 'zh'): string {
+  return [
+    n.synced ? t(lang, '{n} syncing', { n: n.synced }) : '',
+    n.followOff ? t(lang, '{n} off with its project', { n: n.followOff }) : '',
+    n.sessionOff ? t(lang, '{n} turned off individually', { n: n.sessionOff }) : '',
+  ].filter(Boolean).join(' · ');
+}
+
 /** 能勾的行：正在跑的（busy）和桶里已经没有文件的（missing）都不能勾。 */
 export const isPickable = (e: Pickable): boolean => !e.busy && !e.missing;
 

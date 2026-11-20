@@ -1123,8 +1123,9 @@ describe('单条会话的同步与否 ——「我是说单独会话级别的同
     assert.match(MI, /excluded: sessionExcluded\(cfg, rec\.id\),/);
     assert.match(UI, /onChange=\{\(next\) => void toggleSession\(x\.id, next\)\}/);
     assert.match(UI, /saveS3Config\?\.\(\{ excludeSessions: next \}\)/);
-    /* 项目关着时整组都不传，单条的开关就不给按（按了也没意义） */
-    assert.match(UI, /disabled=\{!!busy \|\| p\.excluded\}/);
+    /* 项目关着时整组都不传，单条不给灰开关，改成「跟随『项目』：不同步」标签（判定见 backupSyncRowControl.test.ts） */
+    assert.match(UI, /ctl\.kind === 'follow'/);
+    assert.match(UI, /onClick=\{\(\) => jumpToProject\(ctl\.project\)\}/);
   });
 
   test('「删除备份」在恢复那一页，不在同步那一页', () => {

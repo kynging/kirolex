@@ -27,7 +27,7 @@ import { ToggleButton } from './ToggleButton.tsx';
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
 import { BackupSettings, CrossDeviceList, Field } from './BackupSettings.tsx';
 import { cleanupSentence, backupConfigured } from '../backupGroups.ts';
-import { groupBackups, groupSyncProjects, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
+import { groupBackups, groupSyncProjects, syncRowControl, archivedSyncSummary, archivedSyncSummaryText, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
 interface Backup {
@@ -259,6 +259,28 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     () => new Map(syncGroups.filter((g) => g.row).map((g) => [g.project as string, g.row as ProjectRow])),
     [syncGroups],
   );
+  /* 这条会话所属的项目关没关 —— 「已归档」组里的也按原项目的开关算（规则见 syncRowControl） */
+  const projectOff = useCallback(
+    (project: string): boolean => (syncRowByProject.get(project) || { excluded: excluded.includes(project) }).excluded,
+    [syncRowByProject, excluded],
+  );
+  /* 点「跟随『项目』：不同步」→ 展开、滚到那个项目组，闪一下它的组开关 */
+  const [flashGroup, setFlashGroup] = useState<string | null>(null);
+  const jumpToProject = (project: string): void => {
+    setOpenProjects((prev) => new Set(prev).add(project));
+    setFlashGroup(project);
+    requestAnimationFrame(() => {
+      const el = Array.from(document.querySelectorAll<HTMLElement>('[data-sync-group]')).find((x) => x.dataset.syncGroup === project);
+      /* 只滚这张列表自己（不用 scrollIntoView：它会把外面所有能滚的祖先一起滚走） */
+      const list = el?.closest<HTMLElement>('.backup-restore-list');
+      if (el && list) list.scrollTop += el.getBoundingClientRect().top - list.getBoundingClientRect().top;
+    });
+  };
+  useEffect(() => {
+    if (flashGroup === null) return;
+    const id = setTimeout(() => setFlashGroup(null), 1600);
+    return () => clearTimeout(id);
+  }, [flashGroup]);
 
   /* ---------- 恢复：按云上分组（云上归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
   const groups = useMemo(() => groupBackups(entries || [], lang), [entries, lang]);
@@ -495,21 +517,21 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                     const behind = g.sessions.filter((x) => x.state !== 'synced').length;
                     const row = g.row;
                     return (
-                      <div key={g.archived ? g.key : (g.project || '__none__')} className="backup-group">
+                      <div key={g.archived ? g.key : (g.project || '__none__')} className="backup-group" data-sync-group={g.archived ? undefined : g.key}>
                         <div className="backup-proj-row">
                           <button className="backup-group-toggle" onClick={() => setOpenProjects((prev) => {
                             const next = new Set(prev);
                             if (next.has(g.key)) next.delete(g.key); else next.add(g.key);
                             return next;
                           })}>{shut ? '▸' : '▾'} {g.name}</button>
-                          <span className="backup-restore-meta">
+                          {/* 「已归档」组：汇总几条同步 / 跟随项目不同步 / 单独关闭；规则那句放进悬停提示，组头不再挤 */}
+                          <span className="backup-restore-meta"
+                            title={g.archived ? t('Archived on this machine · syncing follows the original project and per-session settings') : undefined}>
                             {t('{n} sessions', { n: g.sessions.length })}{g.bytes ? ` · ${kb(g.bytes)}` : ''}
                             {behind ? ` · ${t('{behind} waiting to sync', { behind })}` : ''}
                             {g.archivedCount ? ` · ${t('{n} more in "Archived"', { n: g.archivedCount })}` : ''}
+                            {g.archived && g.sessions.length ? ` · ${archivedSyncSummaryText(archivedSyncSummary(g.sessions, projectOff), lang)}` : ''}
                           </span>
-                          {g.archived && (
-                            <span className="settings-hint">{t('Archived on this machine · syncing follows the original project and per-session settings')}</span>
-                          )}
                           {/* 项目记忆 ——「project 上面也得显示到底 project memory 是否同步了、最新时间是什么时候」 */}
                           {row?.memory && (() => {
                             const p = row as ProjectRow & { memory: NonNullable<ProjectRow['memory']> };
@@ -525,6 +547,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                 </span>;
                           })()}
                           {row && (
+                            <span className={`backup-proj-switch${flashGroup === g.key ? ' flash' : ''}`}>
                             <ToggleButton
                               on={!row.excluded}
                               labels={[t('Sync'), t("Don't sync")]}
@@ -532,13 +555,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               disabled={!!busy}
                               onChange={(next) => void toggleProject(row.project, next)}
                             />
+                            </span>
                           )}
                           {/* 「删除备份」在「恢复」那一页 ——「这个删除备份的按钮不应该在备份这个界面，而是恢复界面」：
                               这一页管"以后传不传"，删桶里已有的是另一件事，挨着开关放太容易点错 */}
                         </div>
                         {!shut && g.sessions.map((x) => {
-                          /* 这条会话在本机所属的项目 —— 「已归档」组里的也按原项目的开关算 */
-                          const p = syncRowByProject.get(x.project) || { excluded: excluded.includes(x.project) };
+                          const ctl = syncRowControl(x, projectOff);
                           return (
                           <div key={x.id} className="backup-restore-row" title={x.id}>
                             <span className="backup-restore-title">{x.title}</span>
@@ -548,14 +571,21 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               : x.state === 'pending'
                                 ? <span className="backup-tag over">{t('Changes waiting to sync')}</span>
                                 : <span className="backup-tag new">{t('Synced')}</span>}
-                            {/* 单条会话也能关 ——「我现在还是不能选择是否备份会话」。项目关着时整组都不传，这里就不给按 */}
-                            <ToggleButton
-                              on={!p.excluded && !x.excluded}
-                              labels={[t('Sync'), t("Don't sync")]}
-                              ariaLabel={t('Sync {name}?', { name: x.title })}
-                              disabled={!!busy || p.excluded}
-                              onChange={(next) => void toggleSession(x.id, next)}
-                            />
+                            {/* 单条会话也能关 ——「我现在还是不能选择是否备份会话」。项目关着时整组都不传：
+                                不给灰开关（看不出为什么点不动），写明跟随哪个项目，点它跳到那个项目的开关 */}
+                            {ctl.kind === 'follow'
+                              ? <button type="button" className="backup-follow"
+                                  title={t('This project is set to not sync, so this session is not synced either. Click to jump to the project switch.')}
+                                  onClick={() => jumpToProject(ctl.project)}>
+                                  {t('Follows "{project}": not synced', { project: projectLabel(ctl.project, t) })}
+                                </button>
+                              : <ToggleButton
+                                  on={ctl.on}
+                                  labels={[t('Sync'), t("Don't sync")]}
+                                  ariaLabel={t('Sync {name}?', { name: x.title })}
+                                  disabled={!!busy}
+                                  onChange={(next) => void toggleSession(x.id, next)}
+                                />}
                             <span className="backup-restore-meta">
                               {/*
                                 `synced` 但没有时间 = 传过、但那次上传发生在这张表存在之前
