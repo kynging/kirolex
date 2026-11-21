@@ -166,6 +166,7 @@ import { parseWhoami, loginEnv, normalizeKiroLoginChoice, kiroLoginArgs, remoteK
 import { expandHome, listRemoteTargets, findRemoteTarget, saveRemoteTarget, deleteRemoteTarget, validateTarget, ssmFieldsOf, labelForHost, localBins, saveLocalBins, localWorkdir, localWorkdirSetting, saveLocalWorkdir, binHistory, rememberBinSuccess, readRemoteTargets, resolveSessionRemote, refreshedSnapshot, deriveLabel, type RemoteTargetInput, type SessionRemoteResolution } from './remoteTargets.ts';
 import { createAdapterNotes } from './adapterNotes.ts';
 import { isKirolexNote, modelFacing, stripKirolexNotes, KIROLEX_NOTE_OPENINGS, NOTE_DETAIL_SEP, splitNoteDetail, noteAlreadyInTranscript } from './kirolexNote.ts';
+import { pickTitleBackfills, displayTitleFor } from './titleBackfill.ts';
 import { newQuestionCard, closeQuestionCard, buildAcceptContent, elicitationResult, questionTailText, type QuestionCard, type QuestionStatus, type QuestionValue } from './elicitation.ts';
 import { ReviewedPaths, remoteReviewKey, pickReviewTarget, writeTextVia, reviewBackupPrefix, reviewBackupsToPrune, type ReviewTarget } from './reviewAccess.ts';
 import { parseRevised, keepHeading, settlePatchRevision, patchWritten,reviseInSessionPrompt, replyUsable, reviseSlideTextPrompt, parseSlideEdits } from './reviseBlock.ts';
@@ -6990,6 +6991,34 @@ function refuseAdvancedProject(projectId: string | null | undefined, what: strin
   return tr('This project belongs to KiroLex Advanced; the standard edition does not modify it.');
 }
 
+/** 备份 catalog / 备份列表显示的标题：record.title 还是空 / New Chat 时用第一条用户消息兜底（只显示，不写回记录）。 */
+function backupDisplayTitle(rec: { id: string; title?: string }): string {
+  return displayTitleFor(rec.title, () => store.readTranscript(rec.id));
+}
+
+/**
+ * **把侧栏已有的标题补进磁盘记录**（每次启动跑一遍，幂等）—— 见 titleBackfill.ts。
+ * 标题落盘（`acp:rename-session`）之前起 / 改的标题只在 ui-state 的 `kirolex-sessions` 里，record.json 一直是 New Chat，
+ * 备份 catalog、别的电脑的恢复页就都显示 New Chat。不动 updatedAt（不改排序）；record.json 变了，下一轮同步会连 catalog 条目一起传上去。
+ */
+function backfillRecordTitlesFromSidebar(): void {
+  const raw = uiState()['kirolex-sessions'];
+  if (!raw) return;
+  let sidebar: unknown;
+  try { sidebar = JSON.parse(raw); } catch { return; }
+  const picks = pickTitleBackfills(store.listSessions().filter((r) => !deletedSessionIds.has(r.id)), sidebar);
+  let n = 0;
+  for (const { id, title } of picks) {
+    if (refuseAdvancedOnly(id, 'title-backfill')) continue;
+    const rec = store.readRecord(id);
+    if (!rec) continue;
+    try { if (store.writeRecordKeepUpdatedAt({ ...rec, id, title })) n += 1; } catch (err: any) {
+      logger.warn('session', `title backfill ${id} failed: ${err?.message || err}`);
+    }
+  }
+  if (n) logger.info('session', `把侧栏标题补进了 ${n} 条会话的磁盘记录（原来是 New Chat）`);
+}
+
 function catalogEntriesFor(
   sessions: Array<{ id: string; title?: string; updatedAt?: number; profile?: any; archived?: boolean; placementChangedAt?: number; crossDevice?: boolean; crossDeviceChangedAt?: number }>,
   machine: string,
@@ -6997,7 +7026,7 @@ function catalogEntriesFor(
   const now = Date.now();
   return sessions.map((r) => ({
     id: r.id,
-    title: r.title || 'New Chat',
+    title: backupDisplayTitle(r),
     /* 分组用 —— 恢复列表是一次 GET 拿整张 catalog，不该为了分组再去下几十个 record.json */
     project: projectOf(r) || undefined,
     updatedAt: r.updatedAt || 0,
@@ -9628,6 +9657,9 @@ app.whenReady().then(async () => {
         + ` -> ${err ? `could not move it to trash yet (${err}); tombstoned, will retry at next start` : 'moved to trash'}, not attaching`);
     }
   } catch (err: any) { logger.warn('delete-session', `resurrected-shell sweep failed: ${err?.message || err}`); }
+  /* 老会话的标题只在侧栏（ui-state）里、磁盘记录还是 New Chat：补进记录，备份 / 恢复页才显示对的名字。
+     放在删除收尾之后：复活的空壳（也叫 New Chat）先被认出来收走，不会被改了名留下 */
+  try { backfillRecordTitlesFromSidebar(); } catch {}
 
   // Sweep leftovers nothing else owns:
   //   *.bak / *.bak.<ts>  — one-off backups from past migrations/scripts. Nothing in
@@ -9968,7 +10000,7 @@ app.whenReady().then(async () => {
       */
       cur.sessions.push({
         id: rec.id,
-        title: rec.title || 'New Chat',
+        title: backupDisplayTitle(rec),
         updatedAt: rec.updatedAt || 0,
         bytes,
         syncedAt: marks[rec.id]?.at || 0,
