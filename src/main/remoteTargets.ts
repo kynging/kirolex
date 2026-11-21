@@ -23,7 +23,7 @@ import os from 'os';
 import path from 'path';
 import type { ExecutorBins, RemoteTarget } from './config';
 import { rememberBin, type BinHistoryMap, type ToolId } from './binDetect.ts';
-import { validJump, ssmFieldError } from './sshProxy.ts';
+import { validJump, ssmFieldError, unsafeSshHost } from './sshProxy.ts';
 import { tr } from './uiText.ts';
 
 export interface RemoteTargetEntry extends RemoteTarget {
@@ -65,7 +65,7 @@ export function deriveLabel(sshHost: string): string {
 function normalize(raw: any, fallbackId: string, home: string): RemoteTargetEntry | undefined {
   const sshHost = typeof raw?.sshHost === 'string' ? raw.sshHost.trim() : '';
   if (!sshHost) return undefined;   // 没有 host 就不是一个能用的目标，不要放进列表
-  if (sshHost.startsWith('-')) return undefined;   // 会被 ssh 当成选项 —— 配置可能是从 S3 恢复回来的，按不可信处理
+  if (sshHost.startsWith('-') || unsafeSshHost(sshHost)) return undefined;   // 会被 ssh 当成选项 —— 配置可能是从 S3 恢复回来的，按不可信处理
   const port = Number(raw?.sshPort);
   return {
     id: String(raw?.id || fallbackId),
@@ -315,6 +315,8 @@ export function validateTarget(input: RemoteTargetInput): string | null {
   if (/\s/.test(host)) return tr('The IP address cannot contain spaces.');
   /* 以 `-` 开头会被 ssh 当成选项（`-oProxyCommand=…` = 在本机执行命令），见 sshProxy.ts unsafeSshHost */
   if (host.startsWith('-')) return tr('The IP address cannot start with `-`.');
+  /* 配了跳板时 host 会被代进交给 shell 跑的 ProxyCommand（`%h`），见 sshProxy.ts unsafeSshHost */
+  if (unsafeSshHost(host)) return tr('The IP address can only contain letters, digits, `@ . - _ :` and IPv6 brackets.');
   const port = input.sshPort === undefined || input.sshPort === null || (input.sshPort as any) === '' ? 22 : Number(input.sshPort);
   if (!Number.isFinite(port) || port <= 0 || port > 65535) return tr('The port must be a number between 1 and 65535.');
   const jump = String(input?.proxyJump || '').trim();

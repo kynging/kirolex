@@ -74,10 +74,19 @@ export function validJump(jump: string): boolean {
  * 会话记录里也存着一份 remote 快照，所以拼参数的地方再拦一次，不只靠保存时的校验。
  */
 export function unsafeSshHost(host: string | undefined): boolean {
-  return /^\s*-/.test(String(host || ''));
+  const h = String(host || '');
+  if (/^\s*-/.test(h)) return true;
+  /*
+    **字符也走白名单**（和 `validJump` 同一类）：配了跳板时 ssh 会把 host 原样代进
+    `ProxyCommand` 的 `%h`，而那串东西由本机 shell 跑 —— `x$(…)` / 反引号 / `;` 就是在本机执行命令。
+    空串不算危险（"没配 host" 由别处处理）。
+  */
+  return h !== '' && !/^[A-Za-z0-9._@:[\]-]+$/.test(h);
 }
 export function assertSafeSshHost(host: string | undefined): void {
-  if (unsafeSshHost(host)) throw new Error(tr('The SSH address cannot start with `-` ({host}). Refusing to put it into an ssh command.', { host: String(host).slice(0, 40) }));
+  if (!unsafeSshHost(host)) return;
+  if (/^\s*-/.test(String(host || ''))) throw new Error(tr('The SSH address cannot start with `-` ({host}). Refusing to put it into an ssh command.', { host: String(host).slice(0, 40) }));
+  throw new Error(tr('The SSH address contains characters that are not allowed ({host}). Refusing to put it into an ssh command.', { host: String(host).slice(0, 40) }));
 }
 
 export function proxyArgs(remote: Pick<RemoteTarget, 'proxyJump' | 'identityFile'>): string[] {

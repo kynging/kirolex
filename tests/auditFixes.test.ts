@@ -21,6 +21,21 @@ describe('sshHost 不许被 ssh 当成选项', () => {
     assert.throws(() => buildSshArgs({ sshHost: '-oProxyCommand=x' } as any, 'true'));
     assert.throws(() => masterArgs({ sshHost: '-oX=y', socket: 's', remotePort: 1, localPort: 2 }));
   });
+  test('sshHost 里不许有 shell 元字符（跳板时 %h 被原样拼进交给 /bin/sh 跑的 ProxyCommand）', () => {
+    const bad = ['x$(touch /tmp/pwned)', 'x$(id)', 'h`id`', 'h;id', 'h|id', 'h&id', "h'x", 'h"x', 'h>x', 'h<x', 'h(x)', 'h\\x', 'h\nid', 'h x'];
+    for (const h of bad) {
+      assert.equal(unsafeSshHost(h), true, h);
+      assert.notEqual(validateTarget({ sshHost: h } as any), null, h);
+      assert.throws(() => buildSshArgs({ sshHost: h, proxyJump: 'bastion.example.com' } as any, 'true'), h);
+      assert.throws(() => masterArgs({ sshHost: h, proxyJump: 'bastion.example.com', socket: 's', remotePort: 1, localPort: 2 } as any), h);
+    }
+    assert.equal(parseRemoteTargets({ remotes: [{ sshHost: 'x$(id)', proxyJump: 'bastion' }] }).length, 0);
+    for (const h of ['ec2-user@1.2.3.4', 'my_box', 'host.example.com', 'user@[::1]', '[fe80::1]', 'i-0abc123']) {
+      assert.equal(unsafeSshHost(h), false, h);
+      assert.equal(validateTarget({ sshHost: h } as any), null, h);
+    }
+    assert.ok(buildSshArgs({ sshHost: 'ec2-user@1.2.3.4', proxyJump: 'bastion' } as any, 'true').length > 0);
+  });
   test('跳板也不许以 - 开头', () => {
     assert.equal(validJump('-oProxyCommand=x'), false);
     assert.equal(validJump('ec2-user@bastion:2222'), true);

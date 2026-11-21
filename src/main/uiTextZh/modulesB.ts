@@ -198,6 +198,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   'The IP address cannot be empty.': 'IP 地址不能为空。',
   'The IP address cannot contain spaces.': 'IP 地址里不能有空格。',
   'The IP address cannot start with `-`.': 'IP 地址不能以 `-` 开头。',
+  'The IP address can only contain letters, digits, `@ . - _ :` and IPv6 brackets.': 'IP 地址只能包含字母、数字、`@ . - _ :` 和 IPv6 方括号。',
   'The port must be a number between 1 and 65535.': '端口要是 1–65535 之间的数字。',
   'The jump host must be `user@host` or `user@host:port` (letters, digits, `@ . - _ :` and IPv6 brackets).': '跳板地址只能是 `用户@主机` 或 `用户@主机:端口`（字母、数字、`@ . - _ :` 和 IPv6 的方括号）。',
   'The working directory must be an absolute path (starting with `/` or `~`).': '工作目录要写绝对路径（以 `/` 或 `~` 开头）。',
@@ -249,6 +250,7 @@ export const ZH_MODULES_B: Record<string, string> = {
   'This directory does not exist': '这个目录不存在',
   // ── sshProxy.ts ──
   'The SSH address cannot start with `-` ({host}). Refusing to put it into an ssh command.': 'SSH 地址不能以 `-` 开头（{host}）—— 拒绝拼进 ssh 命令。',
+  'The SSH address contains characters that are not allowed ({host}). Refusing to put it into an ssh command.': 'SSH 地址里有不允许的字符（{host}）—— 拒绝拼进 ssh 命令。',
   // ── sessionStore.ts ──
   'Invalid session id: {id}. Only letters, digits, underscores and hyphens are allowed': '会话 id 不合法：{id} —— 只允许字母、数字、下划线和短横',
   'Message {id} was not found in the saved transcript.': '保存的对话记录里找不到消息 {id}。',
