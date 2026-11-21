@@ -105,11 +105,11 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   '{n} more in "Archived"': '另有 {n} 条在「已归档」',
   'Archived on this machine · syncing follows the original project and per-session settings': '本机归档的 · 同步与否按原项目和单条的设置',
   '{n} syncing': '{n} 条同步',
-  '{n} off with its project': '{n} 条跟随项目不同步',
-  '{n} turned off individually': '{n} 条单独关闭',
-  'Follows "{project}": not synced': '跟随『{project}』：不同步',
-  'This project is set to not sync, so this session is not synced either. Click to jump to the project switch.':
-    '这个项目设成了不同步，所以这条也不同步。点这里跳到项目的开关。',
+  '{n} not syncing': '{n} 条不同步',
+  'Set individually': '单独设置',
+  'This session is turned on or off on its own; it no longer follows the project switch.':
+    '这条单独开过 / 关过，不再跟着项目的开关走。',
+  '{n} of them are turned on individually and still sync': '其中 {n} 条单独开着，仍会同步',
   'This project has no memory file yet': '这个项目还没有记忆文件',
   'Memory: none yet': '记忆：还没有',
   'Last modified locally {at}': '本地最后修改 {at}',

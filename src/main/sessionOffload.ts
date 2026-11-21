@@ -101,10 +101,8 @@ export interface OffloadFacts {
   pinned: boolean | null;
   /** advanced 专属（flow / skill）—— 一律不移 */
   advancedOnly: boolean | null;
-  /** 所在项目设成了不备份 */
-  excludedProject: boolean | null;
-  /** 这条会话单独设成了不备份 */
-  excludedSession: boolean | null;
+  /** 这条会话不备份（按 shouldSyncSession：项目关着又没单独打开，或者单独关掉了）—— 云上那份不会再更新，不移 */
+  notSynced: boolean | null;
   /** 用户选了「保留在本机，不再自动移走」 */
   keepLocal: boolean | null;
   /** 已经移到云端了 */
@@ -129,14 +127,14 @@ export function lastActivityAt(updatedAt: number | null, lastMessageAt: number |
 export function decideOffload(f: OffloadFacts, opts: { now: number; idleDays: number }): OffloadVerdict {
   const no = (reason: OffloadSkipReason): OffloadVerdict => ({ offload: false, reason });
   const flags = [f.inCatalog, f.filesClean, f.open, f.busy, f.queued, f.scheduled, f.looping, f.bgJobs, f.pendingSteers,
-    f.pinned, f.advancedOnly, f.excludedProject, f.excludedSession, f.keepLocal, f.offloaded];
+    f.pinned, f.advancedOnly, f.notSynced, f.keepLocal, f.offloaded];
   if (flags.some((x) => typeof x !== 'boolean')) return no('unknown');
   if (!validTime(f.updatedAt, opts.now) || !validTime(f.lastMessageAt, opts.now)) return no('unknown');
   if (f.mark === null) return no('unknown');
   if (!(opts.idleDays > 0)) return no('disabled');
   if (f.offloaded) return no('offloaded');
   if (f.advancedOnly) return no('advanced');
-  if (f.excludedProject || f.excludedSession) return no('excluded');
+  if (f.notSynced) return no('excluded');
   if (f.keepLocal) return no('keep-local');
   if (f.pinned) return no('pinned');
   if (f.open) return no('open');

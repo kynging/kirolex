@@ -137,10 +137,15 @@ contextBridge.exposeInMainWorld('kiroApi', {
         syncedAt: number; state: 'never' | 'pending' | 'synced';
         /** 这条会话单独设成了不同步。 */
         excluded?: boolean;
+        /** 这条会话单独打开了（项目关着也传）。 */
+        included?: boolean;
+        /** 按 shouldSyncSession 算，这条现在传不传。 */
+        syncing?: boolean;
       }>;
     }>;
     excludeProjects: string[];
     excludeSessions?: string[];
+    includeSessions?: string[];
   }> => ipcRenderer.invoke('s3:projects'),
   /**
    * **删掉一个项目在桶里的备份**（不动本地）。不可逆，所以 `confirm` 必须原样是项目名 ——

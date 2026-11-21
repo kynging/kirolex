@@ -11,6 +11,7 @@
  */
 
 import { t, type Lang } from './i18n.ts';
+import { shouldSyncSession, type SessionSyncLists } from '../main/syncChoice.ts';
 
 /** 「已归档」组的 key —— 不和任何项目名撞（项目名也可能就叫「已归档」）。 */
 export const ARCHIVED_GROUP = '\u0000archived';
@@ -149,41 +150,46 @@ export function groupSyncProjects<
 type Pickable = { id: string; busy?: boolean; missing?: boolean };
 
 /**
- * 同步页每行右边显示什么。规则不变：一条会话同步与否 = 它在本机所属项目的开关 + 单条开关
- * （「已归档」组里的也按原项目算）。原项目关着时单条开关点不动，与其给个灰开关让人猜，
- * 不如直接写明「跟随『项目』：不同步」（`follow`，点它跳到那个项目组的开关）；原项目开着才给开关。
+ * 同步页每行的开关 ——「项目不开备份时，会话也能单独打开」。判据和主进程同一份（`shouldSyncSession`，单条优先于项目）：
+ * 项目关着时组内每条照常给开关（默认关，可单独打开）；「已归档」组里的按它原来那个项目算默认值。
+ * `custom`：这条单独开 / 关过（在 includeSessions 或 excludeSessions 里），行内标「单独设置」。
  */
-export type SyncRowControl = { kind: 'toggle'; on: boolean } | { kind: 'follow'; project: string };
-
-export function syncRowControl(
-  x: { project: string; excluded?: boolean },
-  projectExcluded: (project: string) => boolean,
-): SyncRowControl {
-  return projectExcluded(x.project) ? { kind: 'follow', project: x.project } : { kind: 'toggle', on: !x.excluded };
+export function syncRowState(
+  x: { id: string; project: string },
+  lists: SessionSyncLists,
+): { on: boolean; custom: boolean } {
+  const inList = (l: string[] | null | undefined): boolean => Array.isArray(l) && l.includes(x.id);
+  return { on: shouldSyncSession(lists, x.id, x.project), custom: inList(lists.includeSessions) || inList(lists.excludeSessions) };
 }
 
-export interface ArchivedSyncCounts { synced: number; followOff: number; sessionOff: number }
+export interface SyncCounts { synced: number; notSynced: number }
 
-/** 「已归档」组头的汇总：几条同步、几条跟着原项目不同步、几条单独关了。 */
-export function archivedSyncSummary(
-  rows: Array<{ project: string; excluded?: boolean }>,
-  projectExcluded: (project: string) => boolean,
-): ArchivedSyncCounts {
-  const n: ArchivedSyncCounts = { synced: 0, followOff: 0, sessionOff: 0 };
-  for (const x of rows) {
-    const c = syncRowControl(x, projectExcluded);
-    if (c.kind === 'follow') n.followOff += 1; else if (c.on) n.synced += 1; else n.sessionOff += 1;
-  }
+/** 组头的汇总：几条同步、几条不同步。 */
+export function syncSummary(rows: Array<{ id: string; project: string }>, lists: SessionSyncLists): SyncCounts {
+  const n: SyncCounts = { synced: 0, notSynced: 0 };
+  for (const x of rows) if (syncRowState(x, lists).on) n.synced += 1; else n.notSynced += 1;
   return n;
 }
 
 /** 汇总文案，数字为 0 的段不显示（全 0 时是空串）。 */
-export function archivedSyncSummaryText(n: ArchivedSyncCounts, lang: Lang = 'zh'): string {
+export function syncSummaryText(n: SyncCounts, lang: Lang = 'zh'): string {
   return [
     n.synced ? t(lang, '{n} syncing', { n: n.synced }) : '',
-    n.followOff ? t(lang, '{n} off with its project', { n: n.followOff }) : '',
-    n.sessionOff ? t(lang, '{n} turned off individually', { n: n.sessionOff }) : '',
+    n.notSynced ? t(lang, '{n} not syncing', { n: n.notSynced }) : '',
   ].filter(Boolean).join(' · ');
+}
+
+/**
+ * 关着的项目里还有几条单独打开、照样同步的（含已归档的）—— 项目开关旁提示「其中 K 条单独开着，仍会同步」。
+ * 项目开着时是 0（那时它们本来就同步，不用提示）。
+ */
+export function includedWhileProjectOff(
+  project: string,
+  sessions: Array<{ id: string; project: string }>,
+  lists: SessionSyncLists,
+): number {
+  if (!(lists.excludeProjects || []).includes(project)) return 0;
+  return sessions.filter((x) => x.project === project && shouldSyncSession(lists, x.id, x.project)).length;
 }
 
 /** 能勾的行：正在跑的（busy）和桶里已经没有文件的（missing）都不能勾。 */

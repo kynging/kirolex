@@ -249,8 +249,7 @@ describe('index.ts 里的接线', () => {
   test('跟随：不同步的项目/会话不参与、写日志、通知渲染端、忙着的推迟重置', () => {
     const at = M.indexOf('function followBucketPlacements(');
     const body = M.slice(at, M.indexOf('\n}\n', at));
-    assert.match(body, /projectExcluded\(/);
-    assert.match(body, /sessionExcluded\(/);
+    assert.match(body, /if \(!syncsSession\(cfg, r\)\) continue;/);
     assert.match(body, /logger\.info\('s3'/);
     assert.match(body, /session:placement-changed/);
     assert.match(body, /pendingProjectReset\.add\(/);

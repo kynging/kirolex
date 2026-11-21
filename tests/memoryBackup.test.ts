@@ -47,7 +47,10 @@ describe('备份：记忆跟着会话 / 项目走', () => {
   test('接线：同步按"不同步的项目"筛记忆', () => {
     const M = fs.readFileSync('src/main/index.ts', 'utf8');
     assert.match(M, /planUpload\(KIROLEX_HOME, ids, state, \{ projects: memoryProjects \}\)/);
-    assert.match(M, /\.filter\(\(p\) => !projectExcluded\(cfg, p\)\)/);
+    assert.match(M, /\.filter\(projectMemorySynced\)/);
+    /* 项目关着、但里面有单独打开的会话 → 项目记忆也传（恢复那条会话时记忆得在） */
+    assert.match(M, /const syncedProjects = new Set\(syncable\.map\(\(r\) => projectOf\(r\)\)\);/);
+    assert.match(M, /const projectMemorySynced = \(p: string\): boolean => !projectExcluded\(cfg, p\) \|\| syncedProjects\.has\(p\);/);
   });
 });
 

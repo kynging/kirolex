@@ -30,7 +30,7 @@ const base = (over: Partial<OffloadFacts> = {}): OffloadFacts => ({
   mark: { at: OLD + 1000, updatedAt: OLD },
   filesClean: true,
   open: false, busy: false, queued: false, scheduled: false, looping: false, bgJobs: false, pendingSteers: false,
-  pinned: false, advancedOnly: false, excludedProject: false, excludedSession: false, keepLocal: false, offloaded: false,
+  pinned: false, advancedOnly: false, notSynced: false, keepLocal: false, offloaded: false,
   ...over,
 });
 const decide = (f: OffloadFacts, idleDays = 30) => decideOffload(f, { now: NOW, idleDays });
@@ -73,7 +73,7 @@ describe('decideOffload：每一条都满足才移', () => {
   const flags: Array<[keyof OffloadFacts, string]> = [
     ['open', 'open'], ['busy', 'busy'], ['queued', 'queued'], ['scheduled', 'scheduled'], ['looping', 'looping'],
     ['bgJobs', 'bg-jobs'], ['pendingSteers', 'pending-steers'], ['pinned', 'pinned'], ['advancedOnly', 'advanced'],
-    ['excludedProject', 'excluded'], ['excludedSession', 'excluded'], ['keepLocal', 'keep-local'], ['offloaded', 'offloaded'],
+    ['notSynced', 'excluded'], ['keepLocal', 'keep-local'], ['offloaded', 'offloaded'],
   ];
   for (const [k, reason] of flags) {
     test(`${String(k)} → 不移（${reason}）`, () => {
@@ -86,7 +86,7 @@ describe('decideOffload：每一条都满足才移', () => {
   test('任何一项判断不了（null）→ 不移', () => {
     const unknowns: Array<keyof OffloadFacts> = [
       'updatedAt', 'lastMessageAt', 'inCatalog', 'filesClean', 'open', 'busy', 'queued', 'scheduled', 'looping',
-      'bgJobs', 'pendingSteers', 'pinned', 'advancedOnly', 'excludedProject', 'excludedSession', 'keepLocal', 'offloaded',
+      'bgJobs', 'pendingSteers', 'pinned', 'advancedOnly', 'notSynced', 'keepLocal', 'offloaded',
     ];
     for (const k of unknowns) {
       const r = decide(base({ [k]: null } as any));

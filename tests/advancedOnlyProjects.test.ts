@@ -299,8 +299,8 @@ describe('index.ts: project entries refuse advanced-only projects before touchin
   });
 
   test('S3: their project memory is neither uploaded nor pulled, and not shown on the restore page', () => {
-    assert.match(main, /const memoryProjects = memoryProjectDirs\.filter\(\(p\) => !advancedProjects\.has\(p\)\)\s*\.filter\(\(p\) => !projectExcluded\(cfg, p\)\);/);
-    assert.match(main, /if \(parts\[1\] === 'projects'\) return !projectExcluded\(cfg, parts\[2\]\) && !store\.isAdvancedOnlyProjectName\(parts\[2\]\);/);
+    assert.match(main, /const memoryProjects = memoryProjectDirs\.filter\(\(p\) => !advancedProjects\.has\(p\)\)\s*\.filter\(projectMemorySynced\);/);
+    assert.match(main, /if \(parts\[1\] === 'projects'\) return projectMemorySynced\(parts\[2\]\) && !store\.isAdvancedOnlyProjectName\(parts\[2\]\);/);
     assert.match(handler("ipcMain.handle('s3:list-backups'"), /for \(const p of store\.advancedOnlyProjectsAmong\(Object\.keys\(memoryByProject\)\)\) delete memoryByProject\[p\];/);
   });
 });

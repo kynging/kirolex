@@ -27,7 +27,8 @@ import { ToggleButton } from './ToggleButton.tsx';
 import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
 import { BackupSettings, CrossDeviceList, Field } from './BackupSettings.tsx';
 import { cleanupSentence, backupConfigured } from '../backupGroups.ts';
-import { groupBackups, groupSyncProjects, syncRowControl, archivedSyncSummary, archivedSyncSummaryText, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
+import { setSessionSync } from '../../main/syncChoice.ts';
+import { groupBackups, groupSyncProjects, syncRowState, syncSummary, syncSummaryText, includedWhileProjectOff, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
 interface Backup {
@@ -127,6 +128,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   const [excluded, setExcluded] = useState<string[]>([]);
   /** 单独设成不同步的会话 id。 */
   const [excludedSessions, setExcludedSessions] = useState<string[]>([]);
+  /* 单独打开的会话（项目关着也传）—— 和 excludedSessions 一起，按 shouldSyncSession 判 */
+  const [includedSessions, setIncludedSessions] = useState<string[]>([]);
   /* 默认收起：一上来看的是"哪些项目在备份"，展开才是"这个项目里每条会话什么时候同步的" */
   const [openProjects, setOpenProjects] = useState<Set<string>>(new Set());
 
@@ -162,6 +165,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
       setProjects(r?.projects || []);
       setExcluded(r?.excludeProjects || []);
       setExcludedSessions(r?.excludeSessions || []);
+      setIncludedSessions(r?.includeSessions || []);
     } catch { setProjects([]); }
   }, []);
 
@@ -207,16 +211,15 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
   /**
    * 改**一条会话**的"要不要同步" ——「我现在还是不能选择是否备份会话」。和项目那个开关同一套：
-   * 立刻存盘、存的是排除表、关掉不删已有备份。
+   * 立刻存盘、关掉不删已有备份。单条优先于项目：项目关着也能单独打开（includeSessions）；
+   * 以最后一次操作为准 —— 开 = 从排除表删、加进包含表，关反之（setSessionSync）。
    */
   const toggleSession = async (id: string, sync: boolean): Promise<void> => {
-    const next = sync ? excludedSessions.filter((x) => x !== id) : [...excludedSessions, id];
-    setExcludedSessions(next);
-    setProjects((prev) => (prev || []).map((p) => ({
-      ...p, sessions: p.sessions.map((x) => (x.id === id ? { ...x, excluded: !sync } : x)),
-    })));
+    const next = setSessionSync({ excludeSessions: excludedSessions, includeSessions: includedSessions }, id, sync);
+    setExcludedSessions(next.excludeSessions);
+    setIncludedSessions(next.includeSessions);
     try {
-      await api()?.saveS3Config?.({ excludeSessions: next });
+      await api()?.saveS3Config?.(next);
     } catch (e: any) {
       setMsg({ kind: 'bad', text: String(e?.message || e) });
       await loadProjects();
@@ -255,32 +258,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   const syncGroups = useMemo(() => groupSyncProjects<SessionRow, ProjectRow>(projects || [], () => ({
     project: '', sessions: [], bytes: 0, updatedAt: 0, excluded: excluded.includes(''),
   }), lang), [projects, excluded, lang]);
-  const syncRowByProject = useMemo(
-    () => new Map(syncGroups.filter((g) => g.row).map((g) => [g.project as string, g.row as ProjectRow])),
-    [syncGroups],
+  /* 判每条传不传的三张表（规则见 shouldSyncSession：单条优先于项目；「已归档」组里的按原项目算） */
+  const syncLists = useMemo(
+    () => ({ excludeProjects: excluded, excludeSessions: excludedSessions, includeSessions: includedSessions }),
+    [excluded, excludedSessions, includedSessions],
   );
-  /* 这条会话所属的项目关没关 —— 「已归档」组里的也按原项目的开关算（规则见 syncRowControl） */
-  const projectOff = useCallback(
-    (project: string): boolean => (syncRowByProject.get(project) || { excluded: excluded.includes(project) }).excluded,
-    [syncRowByProject, excluded],
-  );
-  /* 点「跟随『项目』：不同步」→ 展开、滚到那个项目组，闪一下它的组开关 */
-  const [flashGroup, setFlashGroup] = useState<string | null>(null);
-  const jumpToProject = (project: string): void => {
-    setOpenProjects((prev) => new Set(prev).add(project));
-    setFlashGroup(project);
-    requestAnimationFrame(() => {
-      const el = Array.from(document.querySelectorAll<HTMLElement>('[data-sync-group]')).find((x) => x.dataset.syncGroup === project);
-      /* 只滚这张列表自己（不用 scrollIntoView：它会把外面所有能滚的祖先一起滚走） */
-      const list = el?.closest<HTMLElement>('.backup-restore-list');
-      if (el && list) list.scrollTop += el.getBoundingClientRect().top - list.getBoundingClientRect().top;
-    });
-  };
-  useEffect(() => {
-    if (flashGroup === null) return;
-    const id = setTimeout(() => setFlashGroup(null), 1600);
-    return () => clearTimeout(id);
-  }, [flashGroup]);
+  const allSyncRows = useMemo(() => syncGroups.flatMap((g) => g.sessions), [syncGroups]);
 
   /* ---------- 恢复：按云上分组（云上归档的单独一组，放最后 —— 见 backupGroups.ts） ---------- */
   const groups = useMemo(() => groupBackups(entries || [], lang), [entries, lang]);
@@ -514,23 +497,26 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                   {syncGroups.map((g) => {
                     const shut = !openProjects.has(g.key);
                     /* 这一组里有几条还没备份 —— 收起来的时候也要看得见 */
-                    const behind = g.sessions.filter((x) => x.state !== 'synced').length;
+                    const behind = g.sessions.filter((x) => x.state !== 'synced' && syncRowState(x, syncLists).on).length;
                     const row = g.row;
+                    const sum = syncSummary(g.sessions, syncLists);
+                    /* 关着的项目里单独打开、仍会同步的（含已归档的）—— 关项目不清空它们，旁边说一声 */
+                    const stillOn = row ? includedWhileProjectOff(row.project, allSyncRows, syncLists) : 0;
                     return (
-                      <div key={g.archived ? g.key : (g.project || '__none__')} className="backup-group" data-sync-group={g.archived ? undefined : g.key}>
+                      <div key={g.archived ? g.key : (g.project || '__none__')} className="backup-group">
                         <div className="backup-proj-row">
                           <button className="backup-group-toggle" onClick={() => setOpenProjects((prev) => {
                             const next = new Set(prev);
                             if (next.has(g.key)) next.delete(g.key); else next.add(g.key);
                             return next;
                           })}>{shut ? '▸' : '▾'} {g.name}</button>
-                          {/* 「已归档」组：汇总几条同步 / 跟随项目不同步 / 单独关闭；规则那句放进悬停提示，组头不再挤 */}
+                          {/* 汇总「N 条同步 · M 条不同步」：「已归档」组总是显示，普通组只在有开有关时显示；规则那句放进悬停提示 */}
                           <span className="backup-restore-meta"
                             title={g.archived ? t('Archived on this machine · syncing follows the original project and per-session settings') : undefined}>
                             {t('{n} sessions', { n: g.sessions.length })}{g.bytes ? ` · ${kb(g.bytes)}` : ''}
                             {behind ? ` · ${t('{behind} waiting to sync', { behind })}` : ''}
                             {g.archivedCount ? ` · ${t('{n} more in "Archived"', { n: g.archivedCount })}` : ''}
-                            {g.archived && g.sessions.length ? ` · ${archivedSyncSummaryText(archivedSyncSummary(g.sessions, projectOff), lang)}` : ''}
+                            {(g.archived ? g.sessions.length : sum.synced && sum.notSynced) ? ` · ${syncSummaryText(sum, lang)}` : ''}
                           </span>
                           {/* 项目记忆 ——「project 上面也得显示到底 project memory 是否同步了、最新时间是什么时候」 */}
                           {row?.memory && (() => {
@@ -546,8 +532,10 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                     : p.memory.state === 'pending' ? t('Changes waiting to sync') : t('Never backed up')}
                                 </span>;
                           })()}
+                          {stillOn > 0 && (
+                            <span className="settings-hint">{t('{n} of them are turned on individually and still sync', { n: stillOn })}</span>
+                          )}
                           {row && (
-                            <span className={`backup-proj-switch${flashGroup === g.key ? ' flash' : ''}`}>
                             <ToggleButton
                               on={!row.excluded}
                               labels={[t('Sync'), t("Don't sync")]}
@@ -555,13 +543,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               disabled={!!busy}
                               onChange={(next) => void toggleProject(row.project, next)}
                             />
-                            </span>
                           )}
                           {/* 「删除备份」在「恢复」那一页 ——「这个删除备份的按钮不应该在备份这个界面，而是恢复界面」：
                               这一页管"以后传不传"，删桶里已有的是另一件事，挨着开关放太容易点错 */}
                         </div>
                         {!shut && g.sessions.map((x) => {
-                          const ctl = syncRowControl(x, projectOff);
+                          const st = syncRowState(x, syncLists);
                           return (
                           <div key={x.id} className="backup-restore-row" title={x.id}>
                             <span className="backup-restore-title">{x.title}</span>
@@ -571,21 +558,17 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               : x.state === 'pending'
                                 ? <span className="backup-tag over">{t('Changes waiting to sync')}</span>
                                 : <span className="backup-tag new">{t('Synced')}</span>}
-                            {/* 单条会话也能关 ——「我现在还是不能选择是否备份会话」。项目关着时整组都不传：
-                                不给灰开关（看不出为什么点不动），写明跟随哪个项目，点它跳到那个项目的开关 */}
-                            {ctl.kind === 'follow'
-                              ? <button type="button" className="backup-follow"
-                                  title={t('This project is set to not sync, so this session is not synced either. Click to jump to the project switch.')}
-                                  onClick={() => jumpToProject(ctl.project)}>
-                                  {t('Follows "{project}": not synced', { project: projectLabel(ctl.project, t) })}
-                                </button>
-                              : <ToggleButton
-                                  on={ctl.on}
-                                  labels={[t('Sync'), t("Don't sync")]}
-                                  ariaLabel={t('Sync {name}?', { name: x.title })}
-                                  disabled={!!busy}
-                                  onChange={(next) => void toggleSession(x.id, next)}
-                                />}
+                            {/* 单条会话也能关 / 开 ——「项目不开备份时，会话也能单独打开」。项目关着时照常给开关，默认关 */}
+                            {st.custom && (
+                              <span className="backup-tag" title={t('This session is turned on or off on its own; it no longer follows the project switch.')}>{t('Set individually')}</span>
+                            )}
+                            <ToggleButton
+                              on={st.on}
+                              labels={[t('Sync'), t("Don't sync")]}
+                              ariaLabel={t('Sync {name}?', { name: x.title })}
+                              disabled={!!busy}
+                              onChange={(next) => void toggleSession(x.id, next)}
+                            />
                             <span className="backup-restore-meta">
                               {/*
                                 `synced` 但没有时间 = 传过、但那次上传发生在这张表存在之前

@@ -83,6 +83,7 @@ import { AgentProfile, DEFAULT_MODEL, MODEL_FALLBACK_ORDER, deriveProjectId, can
 import * as loopVerify from './loopVerify';
 import * as eventLog from './eventLog';
 import * as store from './sessionStore';
+import { shouldSyncSession } from './syncChoice.ts';
 import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectChange } from './advancedOnly.ts';
 import { listAttachedSessionIds } from './attachedList.ts';
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
@@ -6884,9 +6885,12 @@ function projectExcluded(cfg: SyncConfig, project: string): boolean {
   return list.includes(project);
 }
 
-/** 这条会话要不要同步 ——「我现在还是不能选择是否备份会话」。项目关着的话整组都不传，这里是再细一层。 */
-function sessionExcluded(cfg: SyncConfig, sessionId: string): boolean {
-  return Array.isArray(cfg.excludeSessions) && cfg.excludeSessions.includes(sessionId);
+/**
+ * **这条会话要不要传** —— 判据只有一份（`shouldSyncSession`，单条优先于项目：单独打开的项目关着也传，
+ * 单独关掉的项目开着也不传）。上传、catalog、位置 / 跨电脑跟随、本地自动清理、同步页列表都按它。
+ */
+function syncsSession(cfg: SyncConfig, r: store.SessionRecord): boolean {
+  return shouldSyncSession(cfg, r.id, projectOf(r), { advancedOnly: isAdvancedOnly(r) });
 }
 
 /**
@@ -7018,7 +7022,7 @@ function catalogEntriesFor(
 function followBucketCrossDevice(cfg: SyncConfig, catalog: Catalog | null, sessions: store.SessionRecord[]): void {
   const byId = new Map((catalog?.entries || []).map((e) => [e.id, e]));
   for (const r of sessions) {
-    if (projectExcluded(cfg, projectOf(r)) || sessionExcluded(cfg, r.id)) continue;
+    if (!syncsSession(cfg, r)) continue;
     const theirs = byId.get(r.id);
     if (!crossDeviceToFollow(r, theirs)) continue;
     const cur = store.readRecord(r.id);
@@ -7049,7 +7053,7 @@ function followBucketPlacements(cfg: SyncConfig, catalog: Catalog | null, sessio
   const byId = new Map((catalog?.entries || []).map((e) => [e.id, e]));
   const changed: string[] = [];
   for (const r of sessions) {
-    if (projectExcluded(cfg, projectOf(r)) || sessionExcluded(cfg, r.id)) continue;
+    if (!syncsSession(cfg, r)) continue;
     const theirs = byId.get(r.id);
     /* 不跟进 KiroLex Advanced 专属的 flow 项目：保持本机的位置（见 placementToFollow） */
     if (!placementToFollow(r, theirs, store.isAdvancedOnlyProjectName)) continue;
@@ -7562,8 +7566,7 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
       pendingSteers: has(steers, r.id),
       pinned: !!r.pinned,
       advancedOnly: isAdvancedOnly(r),
-      excludedProject: projectExcluded(cfgNow, projectOf(r)),
-      excludedSession: sessionExcluded(cfgNow, r.id),
+      notSynced: !syncsSession(cfgNow, r),
       keepLocal: has(keep, r.id),
       offloaded: off ? !!off.offloaded[r.id] : null,
     }));
@@ -7648,7 +7651,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     followBucketPlacements(cfg, oldCatalog, store.listSessions());   // 侧栏按 session:placement-changed 逐条改
     followBucketCrossDevice(cfg, oldCatalog, store.listSessions());  // 「在其他电脑上同步」开关同样谁后改听谁
     const allSessions = store.listSessions();
-    const syncable = allSessions.filter((r) => !projectExcluded(cfg, projectOf(r)) && !sessionExcluded(cfg, r.id));
+    const syncable = allSessions.filter((r) => syncsSession(cfg, r));
     /*
       **删掉的云端备份不再被重新传上去**（判据见 catalogStore.deletedSessionPlan）—— 所有电脑一样：
       有删除记录、而会话的最后修改时间不晚于删除时刻 → 这一轮不传、不进 catalog（恢复页不显示）；
@@ -7664,18 +7667,21 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     const excludedCount = allSessions.length - syncable.length;
     if (excludedCount) {
       logger.info('s3', `跳过 ${excludedCount} 条会话（项目设成了不同步：`
-        + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、') || '无'}；单独设成不同步的会话 ${(cfg.excludeSessions || []).length} 条）`);
+        + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、') || '无'}；单独设成不同步的会话 ${(cfg.excludeSessions || []).length} 条；单独打开的不算在内）`);
     }
     const ids = sessions.map((r) => r.id);
     /*
       **记忆按同一个口径筛** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
-      项目：本地所有有记忆的项目里，没被设成不同步的那些（一个项目底下暂时没有会话，它的记忆也该在）。
+      项目：本地所有有记忆的项目里，没被设成不同步的那些（一个项目底下暂时没有会话，它的记忆也该在），
+      再加上项目关着、但里面有单独打开的会话的那些（`syncedProjects`）—— 恢复那条会话时项目记忆也得在。
     */
+    const syncedProjects = new Set(syncable.map((r) => projectOf(r)));
+    const projectMemorySynced = (p: string): boolean => !projectExcluded(cfg, p) || syncedProjects.has(p);
     const memoryProjectDirs = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'));
     /* advanced 专属的项目（flow 项目）的记忆：不传、也不从桶里拉回来写 —— 由 advanced 自己同步 */
     const advancedProjects = store.advancedOnlyProjectsAmong(memoryProjectDirs);
     const memoryProjects = memoryProjectDirs.filter((p) => !advancedProjects.has(p))
-      .filter((p) => !projectExcluded(cfg, p));
+      .filter(projectMemorySynced);
     const plan = planUpload(KIROLEX_HOME, ids, state, { projects: memoryProjects });
     let freshEntries = catalogEntriesFor(sessions, thisMachine);
     /*
@@ -7770,7 +7776,7 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       const parts = rel.split(path.sep);
       if (parts[0] !== 'memory' || !rel.endsWith('.md')) return false;
       if (parts.length === 2) return true;                                   // global.md 那一层
-      if (parts[1] === 'projects') return !projectExcluded(cfg, parts[2]) && !store.isAdvancedOnlyProjectName(parts[2]);   // 别的机器建的项目也拉
+      if (parts[1] === 'projects') return projectMemorySynced(parts[2]) && !store.isAdvancedOnlyProjectName(parts[2]);   // 别的机器建的项目也拉
       if (parts[1] === 'sessions') return ids.includes(parts[2]);            // 只管本机有的会话
       return false;
     };
@@ -9831,6 +9837,14 @@ app.whenReady().then(async () => {
             .filter((v, i, a) => a.indexOf(v) === i),
         }
         : null),
+      /* 单独打开的会话（项目关着也传）：同一套清洗 */
+      ...(Array.isArray(input?.includeSessions)
+        ? {
+          includeSessions: (input.includeSessions as unknown[])
+            .filter((v): v is string => typeof v === 'string' && !!v)
+            .filter((v, i, a) => a.indexOf(v) === i),
+        }
+        : null),
       ...(input?.accessKeyId !== undefined ? { accessKeyId: String(input.accessKeyId).trim() } : null),
     };
     if (typeof input?.secretAccessKey === 'string' && input.secretAccessKey.trim()) {
@@ -9959,7 +9973,10 @@ app.whenReady().then(async () => {
         bytes,
         syncedAt: marks[rec.id]?.at || 0,
         state: sessionSyncState(marks[rec.id], rec.updatedAt || 0, uploadedIds.has(rec.id)),
-        excluded: sessionExcluded(cfg, rec.id),
+        /* 单独关掉 / 单独打开（同一条只会在一张表里）；最后传不传是 syncing（shouldSyncSession） */
+        excluded: (cfg.excludeSessions || []).includes(rec.id),
+        included: (cfg.includeSessions || []).includes(rec.id),
+        syncing: syncsSession(cfg, rec),
         /* 本机归档的 —— 同步页把它放进「已归档」组（同步与否仍按它这个项目 / 它自己的设置） */
         archived: !!rec.archived,
       });
@@ -10001,7 +10018,7 @@ app.whenReady().then(async () => {
       }))
       /* 未分组排最后，其余按最近动过的排 —— 你要找的通常是刚用过的那个 */
       .sort((a, b) => (a.project ? 0 : 1) - (b.project ? 0 : 1) || b.updatedAt - a.updatedAt);
-    return { projects, excludeProjects: cfg.excludeProjects || [], excludeSessions: cfg.excludeSessions || [] };
+    return { projects, excludeProjects: cfg.excludeProjects || [], excludeSessions: cfg.excludeSessions || [], includeSessions: cfg.includeSessions || [] };
   });
 
   ipcMain.handle('s3:list-backups', async () => {

@@ -84,6 +84,11 @@ export interface SyncConfig {
    */
   excludeSessions?: string[];
   /**
+   * **单独打开的会话**（按会话 id）——「项目不开备份时，会话也能单独打开」。它所在的项目关着也照样传；
+   * 判定见 `syncChoice.ts` 的 `shouldSyncSession`（单条优先于项目）。老 config 没有这个字段或是 null = 空表。
+   */
+  includeSessions?: string[] | null;
+  /**
    * **云端自动清理**（见 `cloudTrash.ts`）：所有活跃设备上都没有了的会话移进云端回收站，到期彻底删除。
    * 缺省 = 开；活跃设备 = 最近 `activeDeviceDays`（缺省 90）天同步过的；回收站保留 `cloudTrashDays`（缺省 30）天。
    */

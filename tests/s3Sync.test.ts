@@ -899,8 +899,8 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
     const at = M5.indexOf('async function runS3Sync');
     /* 到函数尾 —— 中间加了「删掉的备份不重传」那一段（见 deletedNoReupload.test.ts） */
     const body = M5.slice(at, M5.indexOf('function rescheduleS3Sync', at));
-    /* 先按项目、再按单条会话（「我是说单独会话级别的同步与否」） */
-    assert.match(body, /const syncable = allSessions\.filter\(\(r\) => !projectExcluded\(cfg, projectOf\(r\)\) && !sessionExcluded\(cfg, r\.id\)\);/);
+    /* 单条优先于项目（「项目不开备份时，会话也能单独打开」，判据 shouldSyncSession） */
+    assert.match(body, /const syncable = allSessions\.filter\(\(r\) => syncsSession\(cfg, r\)\);/);
     assert.match(body, /const excludedCount = allSessions\.length - syncable\.length;/);
     /* "少备份了一些东西"必须能解释，否则那是静默的数据缺失 */
     assert.match(body, /跳过 \$\{excludedCount\} 条会话/);
@@ -1117,15 +1117,18 @@ describe('单条会话的同步与否 ——「我是说单独会话级别的同
   const MI = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
   const UI = fs.readFileSync(path.join(process.cwd(), 'src/renderer/components/BackupDialog.tsx'), 'utf8');
 
-  test('排除表按会话 id 存、能存能读，界面每行一个开关', () => {
-    assert.match(MI, /function sessionExcluded\(cfg: SyncConfig, sessionId: string\): boolean/);
+  test('排除表 / 包含表按会话 id 存、能存能读，界面每行一个开关', () => {
+    assert.match(MI, /function syncsSession\(cfg: SyncConfig, r: store\.SessionRecord\): boolean/);
     assert.match(MI, /excludeSessions: \(input\.excludeSessions as unknown\[\]\)/);
-    assert.match(MI, /excluded: sessionExcluded\(cfg, rec\.id\),/);
+    assert.match(MI, /includeSessions: \(input\.includeSessions as unknown\[\]\)/);
+    assert.match(MI, /excluded: \(cfg\.excludeSessions \|\| \[\]\)\.includes\(rec\.id\),/);
+    assert.match(MI, /included: \(cfg\.includeSessions \|\| \[\]\)\.includes\(rec\.id\),/);
+    assert.match(MI, /includeSessions: cfg\.includeSessions \|\| \[\] \};/);
     assert.match(UI, /onChange=\{\(next\) => void toggleSession\(x\.id, next\)\}/);
-    assert.match(UI, /saveS3Config\?\.\(\{ excludeSessions: next \}\)/);
-    /* 项目关着时整组都不传，单条不给灰开关，改成「跟随『项目』：不同步」标签（判定见 backupSyncRowControl.test.ts） */
-    assert.match(UI, /ctl\.kind === 'follow'/);
-    assert.match(UI, /onClick=\{\(\) => jumpToProject\(ctl\.project\)\}/);
+    assert.match(UI, /saveS3Config\?\.\(next\)/);
+    /* 项目关着时组内每条照常给开关（默认关，可单独打开），不再是「跟随项目」标签（判定见 backupSyncRowControl.test.ts） */
+    assert.match(UI, /on=\{st\.on\}/);
+    assert.doesNotMatch(UI, /jumpToProject|backup-follow/);
   });
 
   test('「删除备份」在恢复那一页，不在同步那一页', () => {
