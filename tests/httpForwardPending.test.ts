@@ -46,7 +46,8 @@ async function freePort(): Promise<number> {
   await u.close();
   return u.port;
 }
-async function until(cond: () => boolean, ms = 10_000): Promise<void> {
+/* 上限按看板机高负载给足（真起 HTTP 上游、探测带 2 秒超时）；只是「等多久算卡住」，不是被测行为 */
+async function until(cond: () => boolean, ms = 60_000): Promise<void> {
   const t0 = Date.now();
   while (!cond()) {
     if (Date.now() - t0 > ms) throw new Error('等不到条件成立');
@@ -133,13 +134,17 @@ describe('上游慢启动 / 先失败后恢复：会话先起，稍后自动挂�
     let calls = 0;
     let alive = true;
     const seen: boolean[] = [];
+    const timers = { scheduled: 0, fired: 0 };
     probeUntilOk({
       probe: async () => { calls++; if (calls === 2) alive = false; return { ok: false }; },
       alive: () => alive,
       onResult: (r) => seen.push(r.ok),
-      setTimer: fast,
+      setTimer: (fn) => { timers.scheduled++; setTimeout(() => { timers.fired++; fn(); }, 20); },
     });
-    await new Promise((r) => setTimeout(r, 200));
+    /* 按条件等：第二次探测跑完；再让它的结果处理完（setImmediate 在 Promise 回调之后），这时不该再排下一次 */
+    await until(() => calls === 2 && timers.fired === timers.scheduled);
+    await new Promise((r) => setImmediate(r));
+    assert.equal(timers.fired, timers.scheduled, '不活了：不再排下一次探测');
     assert.equal(calls, 2);
     assert.deepEqual(seen, [false], '第二次拿到结果时已经不活了：不报');
   });

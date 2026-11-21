@@ -54,6 +54,23 @@ async function statefulUpstream(opts: { ttlMs: number; body?: string }): Promise
   };
 }
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+/** 轮询直到条件成立（上限给足看板机高负载；只是「等多久算卡住」，不是被测行为）。 */
+async function until(cond: () => boolean, what: string, ms = 60_000): Promise<void> {
+  const t0 = Date.now();
+  while (!cond()) {
+    if (Date.now() - t0 > ms) assert.fail(`等不到：${what}`);
+    await sleep(5);
+  }
+}
+/** 模拟计时器：推进模拟时钟、下一拍执行；记下排了几个、跑了几个（全跑完 = 没有还没探的下一次）。 */
+function fakeTimers() {
+  const c = { t: 0, scheduled: 0, fired: 0 };
+  return {
+    c,
+    now: () => c.t,
+    setTimer: (fn: () => void, ms: number) => { c.t += ms; c.scheduled++; setTimeout(() => { c.fired++; fn(); }, 0); },
+  };
+}
 
 describe('上游会话过期（400「session 失效」）：转发层透明重建，引擎和用户无感', () => {
   test('经本机转发：会话过期后的那次调用 → 自动重新 initialize、换新 session id、重放成功；不触发 onProxyFail', async () => {
@@ -185,7 +202,7 @@ describe('提示限频：同一 MCP 短时间失败又恢复，不插提示', ()
   test(`挂着的上游失败、${HTTP_FLAP_QUIET_MS / 1000} 秒内恢复：不说「连不上」、不说「已恢复可用」、不重连`, async () => {
     let n = 0;
     const st = { failed: 0, back: 0, reconnects: 0, fresh: [] as boolean[] };
-    let t = 0;
+    const clock = fakeTimers();
     watchHttpForward({
       probe: async () => ({ ok: ++n >= 3 }),       // 失败两次，第三次通过
       alive: () => true,
@@ -196,12 +213,13 @@ describe('提示限频：同一 MCP 短时间失败又恢复，不插提示', ()
       noticeFailed: () => { st.failed++; },
       noticeBack: () => { st.back++; },
       reconnect: () => { st.reconnects++; },
-      now: () => t,
-      setTimer: (fn, ms) => { t += ms; setTimeout(fn, 0); },
+      now: clock.now,
+      setTimer: clock.setTimer,
     });
-    await sleep(50);
+    await until(() => st.fresh.length === 3, '第三次探测通过');
     assert.equal(n, 3);
-    assert.ok(t < HTTP_FLAP_QUIET_MS, '模拟时间里不到静默窗口');
+    assert.equal(clock.c.fired, clock.c.scheduled, '通过之后不再排下一次探测');
+    assert.ok(clock.c.t < HTTP_FLAP_QUIET_MS, '模拟时间里不到静默窗口');
     assert.deepEqual([st.failed, st.back, st.reconnects], [0, 0, 0]);
     assert.deepEqual(st.fresh, [false, false, true], '状态照记（新鲜度、不可用），只是不插提示');
   });
@@ -209,7 +227,7 @@ describe('提示限频：同一 MCP 短时间失败又恢复，不插提示', ()
   test('一直连不上超过静默窗口：说一次「连不上」；之后恢复：说「已恢复可用」并重连', async () => {
     let n = 0;
     const st = { failed: 0, back: 0, reconnects: 0 };
-    let t = 0;
+    const clock = fakeTimers();
     watchHttpForward({
       probe: async () => ({ ok: ++n >= 7 }),
       alive: () => true,
@@ -220,11 +238,14 @@ describe('提示限频：同一 MCP 短时间失败又恢复，不插提示', ()
       noticeFailed: () => { st.failed++; },
       noticeBack: () => { st.back++; },
       reconnect: () => { st.reconnects++; },
-      now: () => t,
-      setTimer: (fn, ms) => { t += ms; setTimeout(fn, 0); },
+      now: clock.now,
+      setTimer: clock.setTimer,
     });
-    await sleep(80);
+    /* 按条件等（不按墙钟）：第 7 次探通后重连 */
+    await until(() => st.reconnects >= 1, '恢复后重连');
     assert.equal(n, 7);
+    assert.equal(clock.c.fired, clock.c.scheduled, '通过之后不再排下一次探测');
+    assert.ok(clock.c.t >= HTTP_FLAP_QUIET_MS, '模拟时间里越过了静默窗口');
     assert.deepEqual([st.failed, st.back, st.reconnects], [1, 1, 1]);
   });
 
@@ -241,7 +262,7 @@ describe('提示限频：同一 MCP 短时间失败又恢复，不插提示', ()
       noticeBack: () => { st.back++; },
       reconnect: () => { st.reconnects++; },
     });
-    await sleep(20);
+    await until(() => st.reconnects >= 1, '一探就通后重连');
     assert.deepEqual([st.back, st.reconnects], [0, 1]);
   });
 });

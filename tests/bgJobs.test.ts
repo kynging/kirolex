@@ -97,11 +97,15 @@ const pidFileFor = () => path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgp
 describe('bg_run', () => {
   test('立即返回 jobId；退出时唤醒，带退出码和输出', async () => {
     const h = harness();
-    const t0 = Date.now();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("setTimeout(()=>{console.log('done');process.exit(3)},300)"), label: '等一下', cwd, timeoutMs: LONG_JOB_MS });
+    /* 「立即返回」不按墙钟量（看板机上光起进程就要好几秒）：命令要等到 start 返回之后测试才放下的标记文件才退出 ——
+       start 要是等命令结束，就永远返回不了 */
+    const flag = path.join(fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgflag-')), 'go');
+    const command = `${NODE} -e "const t=setInterval(()=>{if(require('fs').existsSync(process.argv[1])){clearInterval(t);console.log('done');process.exit(3)}},50)" "${flag}"`;
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command, label: '等一下', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok, JSON.stringify(r));
-    assert.ok(Date.now() - t0 < 1000, 'start 必须立即返回');
-    assert.equal(h.m.list('s1')[0].state, 'running');
+    assert.equal(h.m.list('s1')[0].state, 'running', 'start 返回时命令还在跑');
+    assert.equal(h.wakes.length, 0);
+    fs.writeFileSync(flag, '');
     await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
     assert.match(h.wakes[0].text, /等一下/);
     assert.match(h.wakes[0].text, /3/);

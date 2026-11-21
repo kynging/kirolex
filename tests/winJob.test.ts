@@ -3,7 +3,7 @@ import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { spawn } from 'node:child_process';
+import { spawn, type ChildProcess } from 'node:child_process';
 import { WinJobHost } from '../src/main/winJob.ts';
 
 /**
@@ -14,13 +14,18 @@ import { WinJobHost } from '../src/main/winJob.ts';
 
 const win = process.platform === 'win32';
 const alive = (pid: number) => { try { process.kill(pid, 0); return true; } catch { return false; } };
-async function waitFor(cond: () => boolean, what: string, timeoutMs = 20_000): Promise<void> {
+/* 等待上限按看板机高负载给足（起 PowerShell / node 在那里要好几秒到十几秒）；只是「等多久算真卡住」，不是被测行为 */
+async function waitFor(cond: () => boolean, what: string, timeoutMs = 60_000): Promise<void> {
   const start = Date.now();
   while (!cond()) {
-    if (Date.now() - start > timeoutMs) assert.fail(`等不到：${what}`);
+    if (Date.now() - start > timeoutMs) assert.fail(`等不到：${what}（等了 ${Date.now() - start} ms）`);
     await new Promise((r) => setTimeout(r, 20));
   }
 }
+
+/** 当前那个辅助进程（私有字段，只用来等它的 exit 事件，不改它）。 */
+const helperProc = (h: WinJobHost) => (h as unknown as { proc: ChildProcess | null }).proc;
+const helperExitSeen = (p: ChildProcess | null) => !!p && (p.exitCode !== null || p.signalCode !== null);
 
 /** 起一个进程，**收到 go 之后**再起一个脱离的孙进程（写下 pid），然后两个都一直活着（go 之前放进作业，同闸门）。 */
 function parentWithDetachedChild(): { pid: number; childPidFile: string; go: () => void } {
@@ -106,8 +111,11 @@ describe('WinJobHost', { skip: !win }, () => {
       for (const [i, k] of kids.entries()) assert.equal(await h.assign(`r${i}`, k.pid!), true);
       assert.equal(h.starts, 1, '第 2、3 个不该再起辅助进程');
       /* 模拟它挂了：作业句柄随之关闭，作业里的进程由系统结束 */
+      const oldHelper = helperProc(h);
       process.kill(h.helperPid!);
       await waitFor(() => kids.every((k) => !alive(k.pid!)), '辅助进程没了，作业里的进程都结束');
+      /* 「下一次」= 主进程已经看到它退出之后（exit 事件）；在那之前往它的 stdin 写会 EPIPE，那是还没发现它挂了，不是重起的场景 */
+      await waitFor(() => helperExitSeen(oldHelper), '主进程看到辅助进程退出');
       const again = spawn(process.execPath, ['-e', 'setInterval(()=>{},1000)'], { stdio: 'ignore' });
       try {
         assert.equal(await h.assign('r4', again.pid!), true, '下一次自动重起辅助进程');
