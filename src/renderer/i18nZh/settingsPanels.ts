@@ -85,14 +85,16 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   ', put in "Unassigned" (was in "{project}")': '，放进「未分组」（原来在「{project}」）',
   ', still runs on {machine}': '，仍在 {machine} 上跑',
   ', now runs on this machine': '，改成在本机跑',
-  'Restored sessions go back into their original project if a project with that name exists on this machine; otherwise into "Unassigned".':
-    '恢复的会话：本机有同名项目的放回原项目，没有的放进「未分组」。',
+  'Restored sessions go back into the original project recorded in the cloud; if this machine does not have that project, it is created.':
+    '恢复的会话放回云端记录的原项目，本机没有的项目会新建。',
+  ', put in "{project}"': '，放进「{project}」',
+  ' (it did not exist on this machine, so it was created)': '（本机原来没有，已新建这个项目）',
   'Restored sessions go into "Unassigned", including ones that already exist locally (tick "Put back into original project" to keep their project).':
     '恢复的会话一律放进「未分组」，本机已有的也一样（要放回原项目，勾上「放回原项目」）。',
   ', moved to "{to}"{toArchived}': '，放进「{to}」{toArchived}',
   'Put back into original project': '放回原项目',
-  'Only when a project with the same name exists on this machine. Off: restored sessions go into "Unassigned".':
-    '只在本机有同名项目时放回去。不勾：恢复的会话放进「未分组」。',
+  'Put back into the original project recorded in the cloud; if this machine does not have it, it is created. Off: restored sessions go into "Unassigned".':
+    '放回云端记录的原项目，本机没有就新建。不勾：恢复的会话放进「未分组」。',
   '{n} failed:': '有 {n} 条没成：',
   'No bucket configured yet': '还没配桶',
   'Go to settings': '去设置',

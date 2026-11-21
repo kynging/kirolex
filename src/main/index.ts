@@ -50,7 +50,7 @@ import {
 } from './s3Sync.ts';
 import {
   offloadSettings, offloadBlocked, planOffloadRound, offloadSession, finishOffloadRestore, readOffloadState, readOffloadStateStrict, setKeepLocal, strictSessionRefs, scheduleRefs, loopRefs, offloadedIdsInTrash,
-  manifestSessionsWithOffloaded, filesMatchSyncState, offloadedPasteRefs, lastMessageTs, idsWithItems, restoreOffloadedSession, OFFLOAD_STATE_FILE,
+  manifestSessionsWithOffloaded, filesMatchSyncState, offloadedPasteRefs, lastMessageTs, idsWithItems, restoreOffloadedSession, OFFLOAD_STATE_FILE, prefixFromCloudKey,
   type OffloadFacts,
 } from './sessionOffload.ts';
 import {
@@ -66,7 +66,8 @@ import {
 import { mergeTranscripts, mergeRecords, guardMergedPlacement, vetRestoredRecord } from './transcriptMerge.ts';
 import { attachCheckpoint, resumeOrFresh, AttachCancelled, type AttachLiveness } from './attachCancel.ts';
 import { lateEventGate, adoptUnlessDeleted } from './lateSessionEvents.ts';
-import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restoreRemote } from './restoreArchive.ts';
+import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restoreRemote, validRestoreProject } from './restoreArchive.ts';
+import { pullProjectMemory } from './projectMemoryPull.ts';
 import { knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from './projectSanity.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
@@ -3831,6 +3832,26 @@ function localKnownProjects(): Set<string> | null {
 }
 
 /**
+ * **在本机建一个项目** ——「勾了『放回原项目』，本机没有 Blog，结果项目没建出来、会话进了未分组」。
+ * 项目就是 ui-state `kirolex-projects` 里的一个名字：追加进去，再通知渲染层（`projects:added`）把它并进自己的列表 ——
+ * 渲染层会把它那份列表整份写回这个键，不通知的话下一次写回就把新项目抹掉，侧栏也要重启才看得见。
+ * 已经有了就什么都不做（同一批恢复多条同项目只建一次）。返回这次是不是新建的。
+ */
+function ensureLocalProject(name: string, via: string): boolean {
+  const p = String(name || '').trim();
+  if (!p) return false;
+  const raw = uiState()['kirolex-projects'];
+  let list: unknown = [];
+  if (raw) { try { list = JSON.parse(raw); } catch { list = null; } }
+  if (Array.isArray(list) && list.includes(p)) return false;
+  /* 列表坏了不去覆盖它（那会丢掉别的项目）：只通知渲染层，由它把自己那份连同新项目写回 */
+  if (Array.isArray(list)) setUiStateKey('kirolex-projects', JSON.stringify([...list, p]));
+  mainWindow?.webContents.send('projects:added', { names: [p] });
+  logger.info('session', `${via}: 本机没有项目「${p}」，已新建`);
+  return true;
+}
+
+/**
  * 记录里的 projectId 不是真项目（`bogusProjectReason`）→ 改成未分组写回，活着的执行器一起改。
  * 不动 updatedAt / placementChangedAt：这不是用户的挪动，侧栏排序不该变，别的设备也不该跟着挪。
  * 返回纠正后的记录（没问题就原样返回）。
@@ -7503,6 +7524,7 @@ async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Pro
       }
     }
     let origin: string | undefined;
+    let createdProject: string | undefined;
     const placedRec = store.readRecord(id);
     if (placedRec) {
       /*
@@ -7514,20 +7536,52 @@ async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Pro
       const rt = placeholderPlacement(placedRec, placeholder,
         knownProjects(uiState()['kirolex-projects']) || new Set<string>(), store.isAdvancedOnlyProjectName);
       origin = rt.origin;
+      /*
+        恢复对话框里勾了「放回原项目」、本机没有那个项目 → 新建它并放进去（和 s3:restore 的 \`createProject\` 一样）。
+        侧栏点开 / 「下载回本机」不带 putBack，仍按上面 placeholderPlacement 的规则。
+      */
+      if (opts?.putBack && rt.unassigned && origin && validRestoreProject(origin, store.isAdvancedOnlyProjectName)) {
+        if (ensureLocalProject(origin, `下载回本机 ${id}`)) createdProject = origin;
+        rt.placement = { ...rt.placement, projectId: origin };
+        rt.unassigned = false;
+      }
       const next = applyPlacement(placedRec, rt.placement);
       if (rt.unassigned) next.profile = { ...next.profile, unassigned: true };
       else if (next.profile?.unassigned) { const { unassigned: _u, ...rest } = next.profile; next.profile = rest; }
       if (JSON.stringify(next) !== JSON.stringify(placedRec)) store.writeRecordKeepUpdatedAt({ ...next, id });
       logger.info('offload', `${id}：放进「${rt.placement.projectId || '未分组'}」${rt.placement.archived ? '（已归档：只读，不连接后端）' : ''}`
+        + `${createdProject ? '（本机原来没有，已新建这个项目）' : ''}`
         + `${origin && origin !== rt.placement.projectId ? `（原来在「${origin}」，本机没有这个项目）` : ''}`);
     }
     const placedNow = store.readRecord(id);
+    /*
+      **勾了「放回原项目」：按恢复后的项目把云端的项目记忆也拉回来**（和 s3:restore 同一条规则，`pullProjectMemory`）——
+      占位那条只下载 sessions/<id>/，不拉的话 Blog 建出来了、Blog 的记忆却没回来。云端前缀用占位记下的那一个。
+    */
+    let memoryFiles = 0;
+    const placedProject = String(placedNow?.profile?.projectId || '').trim();
+    if (opts?.putBack && placedProject && !store.isAdvancedOnlyProjectName(placedProject)) {
+      const memPrefix = prefixFromCloudKey(placeholder.cloudKey, id);
+      if (memPrefix === null) logger.warn('offload', `${id}：认不出占位记下的云端前缀（${placeholder.cloudKey}），项目「${placedProject}」的记忆没拉`);
+      else {
+        try {
+          memoryFiles = await pullProjectMemory({
+            ops: bucketOps(creds!), home: KIROLEX_HOME, prefix: memPrefix, project: placedProject,
+            trashDir: path.join(trashDirFor(KIROLEX_HOME, id), '__memory'),
+          });
+          if (memoryFiles) logger.info('offload', `${id}：项目「${placedProject}」的记忆拉回 ${memoryFiles} 个文件（合并，本机原有的不丢）`);
+        } catch (err: any) {
+          logger.warn('offload', `${id}：项目「${placedProject}」的记忆没拉成（${err?.message || err}），会话本身已经恢复`);
+        }
+      }
+    }
     forgetDeletion(S3_DELETED_AT_PATH, id);
     logger.info('offload', `已从云端下载回本机 ${id}：${r.alreadyLocal ? '上次已经下完，只补了收尾' : `${r.files} 个文件 / ${(r.bytes / 1024 / 1024).toFixed(1)} MB`}，占位删掉，最后活动重新计时`);
     mainWindow?.webContents.send('offload:changed', {});
     return {
-      ok: true, restored: r.files, backedUp: null, memoryFiles: 0, madeLocal, keptRemote, projectId: placedNow?.profile?.projectId || undefined,
+      ok: true, restored: r.files, backedUp: null, memoryFiles, madeLocal, keptRemote, projectId: placedNow?.profile?.projectId || undefined,
       ...(origin ? { origin } : {}),
+      ...(createdProject ? { createdProject } : {}),
     };
   } finally {
     restore.end();
@@ -10470,6 +10524,8 @@ ${hint}` : ''}` };
         localProjects: knownProjects(uiState()['kirolex-projects']) || new Set<string>(),
         refuseProject: store.isAdvancedOnlyProjectName,   // 不跟进 advanced 专属项目
       }) : null;
+      /* 勾了「放回原项目」而本机没有：先建项目（写记录之前 —— 水化时不在项目列表里的会被当成假项目纠正掉） */
+      const createdProject = rt?.createProject && ensureLocalProject(rt.createProject, `恢复 ${sessionId}`) ? rt.createProject : undefined;
       if (rt && recAfter) {
         const cur = placementOf(recAfter);
         const want = rt.placement;
@@ -10589,12 +10645,14 @@ ${hint}` : ''}` };
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
         + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}${keptRemote ? `，仍在 ${keptRemote} 上跑` : ''}`
-        + `${!localBefore && rt ? `，放进${describePlacement(rt.placement.projectId || undefined, rt.placement.archived)}${rt.origin && rt.origin !== rt.placement.projectId ? `（原来在「${rt.origin}」${opts?.putBack ? '，本机没有这个项目' : '，没勾「放回原项目」'}）` : ''}` : ''}`
+        + `${!localBefore && rt ? `，放进${describePlacement(rt.placement.projectId || undefined, rt.placement.archived)}${createdProject ? '（本机原来没有，已新建这个项目）' : ''}${rt.origin && rt.origin !== rt.placement.projectId ? `（原来在「${rt.origin}」${opts?.putBack ? '，项目名不能用' : '，没勾「放回原项目」'}）` : ''}` : ''}`
         + `${placement ? `，位置改成${describePlacement(placement.projectId, placement.archived)}`
-          + `（原来${describePlacement(placement.fromProjectId, placement.fromArchived)}）` : ''}`
+          + `（原来${describePlacement(placement.fromProjectId, placement.fromArchived)}）${createdProject ? '（本机原来没有，已新建这个项目）' : ''}` : ''}`
         + `${backedUp ? `（本地那份已挪到 ${backedUp}）` : ''}` + '，开启「在其他电脑上同步」');
       return {
         ok: true, restored, backedUp, merged, memoryFiles, madeLocal, keptRemote, projectId: project || undefined, placement,
+        /* 勾了「放回原项目」、本机原来没有、这次新建的项目（界面上说一声） */
+        ...(createdProject ? { createdProject } : {}),
         /* 新恢复：云上 / 备份里原来的项目（放进未分组时界面上说一声原来在哪） */
         ...(!localBefore && rt?.origin ? { origin: rt.origin } : {}),
       };

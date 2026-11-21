@@ -2014,6 +2014,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
 
+  /* 恢复时主进程新建了项目（勾了「放回原项目」、本机原来没有）：侧栏立刻出现，并进这份列表（它会整份写回 kirolex-projects） */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onProjectsAdded?.((d: { names?: string[] }) => {
+      const names = (Array.isArray(d?.names) ? d.names : []).filter((n) => typeof n === 'string' && n.trim() && !looksLikeSessionId(n));
+      if (names.length) setProjects((prev) => Array.from(new Set([...prev, ...names])));
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
   const reconnectAfterRetargetRef = useRef<((sid: string) => Promise<void>) | null>(null);
   useEffect(() => {
     const off = (window as any).kiroApi?.onTargetsChanged?.((d: { sessionId: string; remoteHost: string | null; remoteId?: string | null; localDir?: string }) => {

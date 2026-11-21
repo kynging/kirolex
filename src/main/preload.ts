@@ -124,6 +124,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('session:placement-changed', handler);
     return () => ipcRenderer.removeListener('session:placement-changed', handler);
   },
+  /** 主进程在本机新建了项目（恢复时勾了「放回原项目」而本机没有）：并进侧栏的项目列表 */
+  onProjectsAdded: (callback: (d: { names: string[] }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('projects:added', handler);
+    return () => ipcRenderer.removeListener('projects:added', handler);
+  },
   /**
    * 有哪些项目、各多少条会话、哪些设成了不同步（「你得按 project 整理，有些project可以选择不同步」）。
    * 从会话记录现算 —— 这一页要回答的是"同步会覆盖到哪些东西"。

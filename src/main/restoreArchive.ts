@@ -54,10 +54,10 @@ export function catalogProject(
  * 现场：恢复 s_1790502638964_in82ze 之后它落进了 Blog（备份里那份记录 / catalog 里是别的设备上的项目）。
  * 规则：
  *   · 本机原来**没有**这条（新恢复）→ 一律未分组，不继承 catalog / 备份记录里的项目；
- *     只有用户在恢复对话框里勾了「放回原项目」、并且本机有同名项目时才放回去。
+ *     只有用户在恢复对话框里勾了「放回原项目」才放回去；本机没有那个项目就新建（`createProject`）。
  *     未分组要标 `unassigned`（`acp:move-session` 移出项目也是这么标的），否则 attach 时又会按目录反推出一个项目。
  *   · 本机**有**这条（合并）→ 同样一律未分组（归档状态保持本机的）；勾了「放回原项目」就放回云上的原项目，
- *     不看时间戳谁新（勾选是明确的指示），那个项目本机也得有，没有就进未分组（标 unassigned）。
+ *     不看时间戳谁新（勾选是明确的指示），本机没有就新建；项目名不合法（像会话 id / advanced 专属 / 带路径）才进未分组。
  *
  * `placementChangedAt` 新恢复时取备份记录和 catalog 里较新的那个，**不取现在**：取现在就比别的设备新，
  * 那边下一次同步会跟着把它也挪进未分组（只是在这台机器上恢复了一份，不该改别的设备上的分组）；
@@ -89,11 +89,21 @@ export interface RestoreTarget {
   changed: boolean;
   /** 合并之前本机的位置（新恢复没有） */
   before?: Placement;
+  /** 勾了「放回原项目」而本机没有这个项目：调用方要在本机建它（追加进 `kirolex-projects`） */
+  createProject?: string;
+}
+
+/**
+ * 「放回原项目」能不能放进 / 新建这个项目：非空、不像会话 id、不是 advanced 专属、
+ * 不含路径分隔符和 `..`（项目名会拼进 `memory/projects/<名>`）。
+ */
+export function validRestoreProject(name: string | null | undefined, refuseProject?: (projectId: string) => boolean): boolean {
+  const p = String(name || '').trim();
+  return !!p && !looksLikeSessionId(p) && !refuseProject?.(p) && !/[\\/]/.test(p) && !p.includes('..');
 }
 
 export function restoreTarget(i: RestoreTargetInput): RestoreTarget {
-  const okProject = (p: string): boolean =>
-    !!p && i.localProjects.has(p) && !looksLikeSessionId(p) && !i.refuseProject?.(p);
+  const validProject = (p: string): boolean => validRestoreProject(p, i.refuseProject);
   const before = i.localBefore ? placementOf(i.localBefore) : undefined;
   const b = placementOf(i.backup);
   /* 原项目 = 云上的（catalog 新格式说了算，老条目才看备份记录） */
@@ -102,11 +112,13 @@ export function restoreTarget(i: RestoreTargetInput): RestoreTarget {
   /* 归档状态：合并的保持本机的，新恢复的用备份里的 */
   const archived = before ? before.archived : b.archived;
   /* 勾了就放回原项目，**不再拿时间戳挡**（先默认恢复到未分组、再勾着恢复一次，两边时间戳一样，也要能放回去） */
-  const projectId = i.putBack && origin && okProject(origin) ? origin : '';
+  /* 本机没有这个项目就新建（`createProject`）——「勾了放回原项目，项目却没建出来」 */
+  const projectId = i.putBack && origin && validProject(origin) ? origin : '';
   return {
     placement: { projectId, archived, placementChangedAt: at },
     unassigned: !projectId, origin,
     changed: !!before && before.projectId !== projectId, before,
+    ...(projectId && !i.localProjects.has(projectId) ? { createProject: projectId } : {}),
   };
 }
 

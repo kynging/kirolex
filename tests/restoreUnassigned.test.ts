@@ -17,7 +17,7 @@ import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
 import fs from 'node:fs';
 import path from 'node:path';
-import { restoreTarget, restoreRunPlan } from '../src/main/restoreArchive.ts';
+import { restoreTarget, restoreRunPlan, validRestoreProject } from '../src/main/restoreArchive.ts';
 import { looksLikeSessionId, knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from '../src/main/projectSanity.ts';
 import { resolveSessionRemote } from '../src/main/remoteTargets.ts';
 
@@ -50,15 +50,40 @@ describe('A. 从云端恢复的会话放在哪儿（restoreTarget）', () => {
     assert.equal(r.unassigned, false);
   });
 
-  test('勾了但本机没有那个项目 → 还是未分组', () => {
+  test('勾了但本机没有那个项目 → 放回原项目，并标 createProject 让调用方新建', () => {
     const r = restoreTarget({
       localBefore: null,
       backup: { profile: { projectId: 'Ops' }, placementChangedAt: 10 },
       entry: entry({ project: 'Ops', archived: false, placementChangedAt: 10 }),
       putBack: true, localProjects: local,
     });
+    assert.equal(r.placement.projectId, 'Ops');
+    assert.equal(r.unassigned, false);
+    assert.equal(r.createProject, 'Ops');
+  });
+
+  test('勾了、本机已有那个项目 → 放回，不建', () => {
+    const r = restoreTarget({ localBefore: null, backup: { profile: { projectId: 'Blog' } }, entry: entry({ project: 'Blog', archived: false, placementChangedAt: 1 }), putBack: true, localProjects: local });
+    assert.equal(r.placement.projectId, 'Blog');
+    assert.equal(r.createProject, undefined);
+  });
+
+  test('不勾、本机没有那个项目 → 仍是未分组、不建', () => {
+    const r = restoreTarget({ localBefore: null, backup: { profile: { projectId: 'Ops' } }, entry: entry({ project: 'Ops', archived: false, placementChangedAt: 1 }), putBack: false, localProjects: local });
     assert.equal(r.placement.projectId, '');
     assert.equal(r.unassigned, true);
+    assert.equal(r.createProject, undefined);
+  });
+
+  test('勾了但原项目名不能用（像会话 id / advanced 专属 / 含路径分隔符或 ..）→ 未分组、不建', () => {
+    for (const bad of [SID, 's_test', 'Flow', 'a/b', 'a\\b', '..', 'x..y']) {
+      const r = restoreTarget({ localBefore: null, backup: { profile: { projectId: bad } }, entry: undefined, putBack: true, localProjects: new Set<string>(), refuseProject: (p) => p === 'Flow' });
+      assert.equal(r.placement.projectId, '', bad);
+      assert.equal(r.unassigned, true, bad);
+      assert.equal(r.createProject, undefined, bad);
+    }
+    assert.equal(validRestoreProject('Blog'), true);
+    assert.equal(validRestoreProject('a\\b'), false);
   });
 
   test('原项目形如会话 id / 是 advanced 专属 → 勾了也不放回', () => {
@@ -113,8 +138,9 @@ describe('A. 从云端恢复的会话放在哪儿（restoreTarget）', () => {
       entry: entry({ project: 'Ops', archived: false, placementChangedAt: 20 }),
       putBack: true, localProjects: local,
     });
-    assert.equal(stay.placement.projectId, '', '云上那个项目本机没有：进未分组，不留在本机原来的 Dev');
-    assert.equal(stay.unassigned, true);
+    assert.equal(stay.placement.projectId, 'Ops', '云上那个项目本机没有：新建并放回，不留在本机原来的 Dev');
+    assert.equal(stay.createProject, 'Ops');
+    assert.equal(stay.unassigned, false);
     assert.equal(stay.changed, true, '从 Dev 挪出来了');
     const none = restoreTarget({
       localBefore: { profile: { projectId: 'Gone' }, placementChangedAt: 10 },
@@ -122,8 +148,8 @@ describe('A. 从云端恢复的会话放在哪儿（restoreTarget）', () => {
       entry: entry({ project: 'Ops', archived: false, placementChangedAt: 20 }),
       putBack: true, localProjects: local,
     });
-    assert.equal(none.placement.projectId, '', '两边的项目本机都没有：未分组');
-    assert.equal(none.unassigned, true);
+    assert.equal(none.placement.projectId, 'Ops', '两边的项目本机都没有：按云上的新建');
+    assert.equal(none.createProject, 'Ops');
   });
 });
 
@@ -433,10 +459,11 @@ describe('先默认恢复到未分组，再勾「放回原项目」恢复同一�
     assert.equal(second.changed, true);
   });
 
-  test('第二次勾选但本机没有 Blog：仍是未分组', () => {
+  test('第二次勾选但本机没有 Blog：新建 Blog 并放进去', () => {
     const second = restoreTarget({ localBefore: onDisk, backup: cloud, entry: cat, putBack: true, localProjects: new Set(['Dev']) });
-    assert.equal(second.placement.projectId, '');
-    assert.equal(second.unassigned, true);
+    assert.equal(second.placement.projectId, 'Blog');
+    assert.equal(second.createProject, 'Blog');
+    assert.equal(second.unassigned, false);
   });
 
   test('接线：合并时「原项目」看桶里那份 record.json（不是合并结果）', () => {
@@ -508,5 +535,50 @@ describe('本机已有这条（合并恢复）：运行位置按本机原来的�
   test('新恢复（本机没有）：候选是备份里的', () => {
     const rr = restoreRemote(null, { profile: { remote: { id: 'tokyo-arm', sshHost: 'x' } } }, resolve, label);
     assert.deepEqual(rr.plan, { kind: 'keep', label: 'tokyo-graviton' });
+  });
+});
+
+describe('勾「放回原项目」、本机没有那个项目：建项目、拉它的项目记忆（接线）', () => {
+  const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
+  const P = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'preload.ts'), 'utf8');
+  const H = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'hooks', 'useAcp.ts'), 'utf8');
+  const D = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'renderer', 'components', 'BackupDialog.tsx'), 'utf8');
+  const at = M.indexOf("ipcMain.handle('s3:restore'");
+  const restore = M.slice(at, M.indexOf("ipcMain.handle('offload:list'", at));
+
+  test('ensureLocalProject：追加进 kirolex-projects、通知渲染层；已有就不再建（同一批只建一次）', () => {
+    const f = M.indexOf('function ensureLocalProject(');
+    const fn = M.slice(f, M.indexOf('\n}\n', f));
+    assert.match(fn, /if \(Array\.isArray\(list\) && list\.includes\(p\)\) return false;/);
+    assert.match(fn, /setUiStateKey\('kirolex-projects', JSON\.stringify\(\[\.\.\.list, p\]\)\)/);
+    assert.match(fn, /mainWindow\?\.webContents\.send\('projects:added', \{ names: \[p\] \}\)/);
+  });
+
+  test('s3:restore：拿到 createProject 先建项目（写记录之前、拉记忆之前），记忆按新项目拉', () => {
+    const create = restore.indexOf('rt?.createProject && ensureLocalProject(rt.createProject');
+    assert.ok(create > 0);
+    assert.ok(create < restore.indexOf('store.writeRecordKeepUpdatedAt({ ...next, id: sessionId })'), '先建项目再写记录');
+    const mem = restore.indexOf("path.join('memory', 'projects', project)");
+    assert.ok(create < mem, '建完再拉项目记忆');
+    assert.ok(restore.indexOf('recAfter = store.readRecord(sessionId) || next;') < restore.indexOf('const project = typeof recAfter'), 'project 取的是写完位置之后的记录 —— 新项目');
+    assert.ok(restore.includes("createdProject ? '（本机原来没有，已新建这个项目）' : ''"));
+    assert.ok(restore.includes('...(createdProject ? { createdProject } : {})'));
+  });
+
+  test('☁ 占位那条（offloadRestoreImpl）：勾了 putBack 也建项目放进去', () => {
+    const o = M.indexOf('async function offloadRestoreImpl(');
+    const body = M.slice(o, M.indexOf('\n}\n', o));
+    assert.ok(body.includes('if (opts?.putBack && rt.unassigned && origin && validRestoreProject(origin, store.isAdvancedOnlyProjectName))'));
+    assert.ok(body.includes('ensureLocalProject(origin,'));
+    assert.ok(body.includes('...(createdProject ? { createdProject } : {})'));
+  });
+
+  test('渲染层收到 projects:added 就并进项目列表（侧栏立刻出现）；恢复结果说「已新建」', () => {
+    assert.ok(P.includes("ipcRenderer.on('projects:added', handler)"));
+    assert.ok(H.includes('onProjectsAdded?.('));
+    assert.ok(H.includes('setProjects((prev) => Array.from(new Set([...prev, ...names])))'));
+    assert.ok(D.includes('r.createdProject'));
+    assert.ok(D.includes("t(' (it did not exist on this machine, so it was created)')"));
+    assert.ok(D.includes('if this machine does not have it, it is created'));
   });
 });

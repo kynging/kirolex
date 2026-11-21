@@ -335,7 +335,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
     const lines = [
       t('About to restore {n} sessions.', { n: chosen.length }),
       '', putBack
-        ? t('Restored sessions go back into their original project if a project with that name exists on this machine; otherwise into "Unassigned".')
+        ? t('Restored sessions go back into the original project recorded in the cloud; if this machine does not have that project, it is created.')
         : t('Restored sessions go into "Unassigned", including ones that already exist locally (tick "Put back into original project" to keep their project).'),
       ...(moving.length
         ? ['', t('{n} of them will move to another project or change archive state to match the cloud (it was moved there more recently).', { n: moving.length })]
@@ -372,10 +372,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                 ? t(', moved to "{to}"{toArchived} to match the cloud', { to: projectLabel(r.placement.projectId, t), toArchived: r.placement.archived ? t(' (archived)') : '' })
                 : t(', moved to "{to}"{toArchived}', { to: projectLabel(r.placement.projectId, t), toArchived: r.placement.archived ? t(' (archived)') : '' }))
                 + t(' (was in "{from}"{fromArchived})', { from: projectLabel(r.placement.fromProjectId, t), fromArchived: r.placement.fromArchived ? t(', archived') : '' })
+                + (r.createdProject ? t(' (it did not exist on this machine, so it was created)') : '')
               : '')
             /* 新恢复的放在哪儿、在哪儿跑 —— 和主进程实际做的一致（见 s3:restore） */
             + (!e.existsLocally
-              ? (r.projectId
+              ? (r.createdProject
+                ? t(', put in "{project}"', { project: r.createdProject }) + t(' (it did not exist on this machine, so it was created)')
+                : r.projectId
                 ? t(', put back into "{project}"', { project: r.projectId })
                 : r.origin ? t(', put in "Unassigned" (was in "{project}")', { project: r.origin }) : '')
               : '')
@@ -619,7 +622,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                         onClick={() => void restore()}>
                   {busy === 'restore' ? t('Restoring…') : chosen.length ? t('Restore {n} selected', { n: chosen.length }) : t('Restore selected')}
                 </button>
-                <label className="settings-hint" title={t('Only when a project with the same name exists on this machine. Off: restored sessions go into "Unassigned".')}>
+                <label className="settings-hint" title={t('Put back into the original project recorded in the cloud; if this machine does not have it, it is created. Off: restored sessions go into "Unassigned".')}>
                   <input type="checkbox" checked={putBack} disabled={!!busy} onChange={(ev) => setPutBack(ev.target.checked)} />
                   {' '}{t('Put back into original project')}
                 </label>
