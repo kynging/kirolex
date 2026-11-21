@@ -26,14 +26,31 @@ const globalPath = path.join(baseDir, 'global.md');
 // 阈值和提示词在 `memoryPolicy.ts`（不引 node 内置模块，渲染进程也要用同一份）。
 
 
+/**
+ * 项目名 / 会话 id 拼进路径前必须是**一个路径段**：不能空、不能是 `.` / `..`、不能带 `/` `\` 或 NUL，
+ * 拼完还要确实落在 `memory/<kind>/` 的正下方。不合格直接抛 —— 不然 `../../..` 就能让
+ * `deleteProjectMemory` 递归删掉任意目录、`writeMemory` 往任意路径写 `memory.md`
+ * （项目名来自渲染层 IPC，也来自 S3 同步回来的 `record.json` 里的 `profile.projectId`）。
+ * 判据和 `s3Sync.memoryRelsFor` 一致：带分隔符的名字本来就不进备份。
+ */
+function layerDir(kind: 'projects' | 'sessions', id: string): string {
+  const s = String(id ?? '');
+  const parent = path.resolve(baseDir, kind);
+  const dir = path.resolve(parent, s);
+  if (!s || s === '.' || s === '..' || /[\\/\0]/.test(s) || path.dirname(dir) !== parent) {
+    throw new Error(`Invalid memory ${kind === 'projects' ? 'project' : 'session'} id: ${JSON.stringify(s.slice(0, 80))}`);
+  }
+  return dir;
+}
+
 function projectDir(projectId: string): string {
-  return path.join(baseDir, 'projects', projectId);
+  return layerDir('projects', projectId);
 }
 function projectPath(projectId: string): string {
   return path.join(projectDir(projectId), 'memory.md');
 }
 function sessionDir(sessionId: string): string {
-  return path.join(baseDir, 'sessions', sessionId);
+  return layerDir('sessions', sessionId);
 }
 function sessionPath(sessionId: string): string {
   return path.join(sessionDir(sessionId), 'memory.md');
@@ -87,10 +104,12 @@ function bytesOf(p: string): number {
 export function memoryLayerBytes(projectId?: string, sessionId?: string): {
   global: number; project: number; session: number;
 } {
+  /* 非法 id（见 `layerDir`）按 0 算：这个数每轮都要取，不该因为一个坏名字把发消息打断 */
+  const size = (p: () => string): number => { try { return bytesOf(p()); } catch { return 0; } };
   return {
     global: bytesOf(globalPath),
-    project: projectId ? bytesOf(projectPath(projectId)) : 0,
-    session: sessionId ? bytesOf(sessionPath(sessionId)) : 0,
+    project: projectId ? size(() => projectPath(projectId)) : 0,
+    session: sessionId ? size(() => sessionPath(sessionId)) : 0,
   };
 }
 
