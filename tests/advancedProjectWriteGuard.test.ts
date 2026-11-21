@@ -129,7 +129,7 @@ describe('index.ts: every session-record write goes through the guarded store wr
     const body = fnBody(main, "ipcMain.handle('s3:restore'", '\n  });');
     assert.match(body, /const isRecord = abs === path\.join\(localDir, 'record\.json'\);/);
     assert.match(body, /if \(isRecord\) store\.writeRecordKeepUpdatedAt\(\{ \.\.\.mergeRecords\(mine, theirs\), id: sessionId \}\);/);
-    assert.match(body, /if \(rec && typeof rec === 'object'\) store\.writeRecordKeepUpdatedAt\(\{ \.\.\.rec, id: sessionId \}\);/);
+    assert.match(body, /if \(rec && typeof rec === 'object'\) store\.writeRecordKeepUpdatedAt\(\{ \.\.\.vetRestoredRecord\(rec\), id: sessionId \}\);/);
     assert.match(body, /store\.writeRecordKeepUpdatedAt\(\{ \.\.\.next, id: sessionId \}\);/);
     assert.match(body, /store\.writeRecordKeepUpdatedAt\(\{ \.\.\.recAfter, id: sessionId \}\);/);
     assert.doesNotMatch(body, /fs\.writeFileSync\(recordPath|fs\.renameSync\(tmp, recordPath\)|JSON\.stringify\((next|recAfter), null, 2\)/);

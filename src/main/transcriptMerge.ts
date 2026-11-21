@@ -96,6 +96,17 @@ export function mergeTranscripts(localText: string, remoteText: string): MergeRe
 }
 
 /**
+ * **本机没有可比的那份、直接从云上落盘的记录**（恢复一条本机没有的会话）：云上那份同样不可信（见 `mergeRecords`
+ * 里「权限只许合并得更严」那段），而本机从没同意过让这条会话自动批准 —— 明确写着 auto-approve 的一律改成 ask。
+ * 没写 / 别的值本来就按「先问」（attach、AcpClient 都只认明确的 auto-approve），不动；别的字段也原样不动。
+ */
+export function vetRestoredRecord(rec: any): any {
+  if (!rec || typeof rec !== 'object' || !rec.profile || typeof rec.profile !== 'object') return rec;
+  if (rec.profile.permissionMode !== 'auto-approve') return rec;
+  return { ...rec, profile: { ...rec.profile, permissionMode: 'ask' } };
+}
+
+/**
  * 合并 `record.json`。
  *
  * 策略：**`updatedAt` 新的那份赢**（标题、模型、profile 这些"最后一次是什么样"的字段），
@@ -112,7 +123,7 @@ export function mergeTranscripts(localText: string, remoteText: string): MergeRe
  * 把另一台的 id 抄过来会让下一次 attach 去 load 一个这里不存在的 session。
  */
 export function mergeRecords(local: any, remote: any): any {
-  if (!local) return remote;
+  if (!local) return vetRestoredRecord(remote);   // 本机那份读不出来：等于直接落云上那份，同样过权限那道关
   if (!remote) return local;
   const localNewer = (Number(local.updatedAt) || 0) >= (Number(remote.updatedAt) || 0);
   const winner = localNewer ? local : remote;

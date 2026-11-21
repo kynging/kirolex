@@ -63,7 +63,7 @@ import {
   pruneDeletionMarks, deletionsFromTrashNames, loadOrCreateDeviceId, cleanupVersionPolicy,
   type BucketOps, type CleanupResult,
 } from './cloudTrash.ts';
-import { mergeTranscripts, mergeRecords, guardMergedPlacement } from './transcriptMerge.ts';
+import { mergeTranscripts, mergeRecords, guardMergedPlacement, vetRestoredRecord } from './transcriptMerge.ts';
 import { attachCheckpoint, resumeOrFresh, AttachCancelled, type AttachLiveness } from './attachCancel.ts';
 import { lateEventGate, adoptUnlessDeleted } from './lateSessionEvents.ts';
 import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restoreRemote } from './restoreArchive.ts';
@@ -10384,7 +10384,7 @@ ${hint}` : ''}` };
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         let rec: any;
         if (isRecord) { try { rec = JSON.parse(body.toString('utf-8')); } catch { rec = undefined; } }
-        if (rec && typeof rec === 'object') store.writeRecordKeepUpdatedAt({ ...rec, id: sessionId });
+        if (rec && typeof rec === 'object') store.writeRecordKeepUpdatedAt({ ...vetRestoredRecord(rec), id: sessionId });
         else fs.writeFileSync(abs, body);   // 读不出来的记录带不了项目（vetBackupRecord 也已拒掉这种备份）
         restored += 1;
       }
