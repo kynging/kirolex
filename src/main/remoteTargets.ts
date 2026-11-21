@@ -492,7 +492,7 @@ export function labelForHost(configPath: string, sshHost: string | undefined, ho
 
 /**
  * 读配置里的机器列表；**读不了 / 解析不了返回 null**（和"读到了、一台都没有"分开）——
- * `resolveSessionRemote` 靠这个区分"机器被删了"和"配置这会儿读不了，只能先用快照"。
+ * `resolveSessionRemote` 两种都拒连（快照不可信，核对不了就不连）。
  */
 export function readRemoteTargets(configPath: string, home = os.homedir()): RemoteTargetEntry[] | null {
   try {
@@ -507,7 +507,7 @@ export interface SessionRemoteResolution {
   remote?: RemoteTarget & { id?: string; label?: string };
   /** `config` = 设置里现在的那台；`snapshot` = 只能用会话记录里那份 */
   source?: 'config' | 'snapshot';
-  /** 记录里的 id 在设置里已经没有了（机器被删了）—— 调用方要明说，**不许**拿快照去连旧地址 */
+  /** 设置里认不出记录里这台（机器被删了 / 快照不可信）—— 调用方要明说，**不许**拿快照去连旧地址 */
   deleted?: true;
 }
 
@@ -522,8 +522,8 @@ const portOf = (p: unknown): number => (Number(p) > 0 ? Number(p) : 22);
  *
  *   · 有 id：设置里有它（或被 host:port 去重成了另一条，`resolveId`）→ 整份用设置里的（连接字段一个不留快照的）；
  *     设置里读到了、但没有这个 id → **被删了**（`deleted`），不按地址换成另一台同地址的目标（那是另一份配置）。
- *   · 没 id 的老记录：按 sshHost + 端口认回设置里那台；认不出就用快照（判断不了是不是删了，维持原来的行为）。
- *   · 配置读不了（`targets` 为 null）：只能用快照。
+ *   · 没 id 的老记录：按 sshHost + 端口认回设置里那台；认不出也当成删了（`deleted`）—— 快照不可信，见下面。
+ *   · 配置读不了 / 不存在（`targets` 为 null）：核对不了，同样当成删了 —— 认不出就是不让连，不拿"读不了"当放行。
  */
 export function resolveSessionRemote(
   snapshot: (RemoteTarget & { id?: string }) | null | undefined,
@@ -532,7 +532,7 @@ export function resolveSessionRemote(
 ): SessionRemoteResolution {
   const host = String(snapshot?.sshHost || '').trim();
   if (!snapshot || !host) return {};
-  if (!targets) return { remote: snapshot, source: 'snapshot' };
+  if (!targets) return { remote: snapshot, source: 'snapshot', deleted: true };
   const id = typeof snapshot.id === 'string' && snapshot.id ? snapshot.id : '';
   const live = id
     ? (targets.find((t) => t.id === id) || resolveId?.(id))
@@ -541,7 +541,12 @@ export function resolveSessionRemote(
     const { droppedLegacy: _d, ...rest } = live;
     return { remote: rest, source: 'config' };
   }
-  return id ? { remote: snapshot, source: 'snapshot', deleted: true } : { remote: snapshot, source: 'snapshot' };
+  /*
+    设置里读到了、却认不出这台：有 id / 没 id 一样当成删了，**不拿快照去连**。快照所在的 record.json 会随 S3 同步 /
+    恢复回来（config.json 不同步），桶里能写的人就能往里塞一台自己的 sshHost —— 连上去还会把本机 MCP 反向隧道和
+    token 一起送过去（remoteLocalTools）。所以能连的只有本机设置里有的机器。
+  */
+  return { remote: snapshot, source: 'snapshot', deleted: true };
 }
 
 /**

@@ -1235,7 +1235,10 @@ async function engineOwnSuggestions(sessionId: string | null | undefined, convo:
 async function codexExecSuggestions(sessionId: string, convo: string, profile: AgentProfile): Promise<{ suggestions: string[]; skipped?: string; error?: string }> {
   const entry = sessionClients.get(sessionId);
   const model = entry?.client.modelOptions?.current || profile.engineModels?.codex || undefined;
-  const remote = sessionRemote(entry?.profile.remote || profile.remote).remote;
+  const resolvedRemote = sessionRemote(entry?.profile.remote || profile.remote);
+  /* 设置里认不出这台（删了 / 快照不可信）：不拿记录里的快照去 ssh */
+  if (resolvedRemote.deleted) return { suggestions: [], error: deletedMachineMessage(resolvedRemote.remote) };
+  const remote = resolvedRemote.remote;
   const prompt = suggestionsPrompt(convo);
   const started = Date.now();
   try {

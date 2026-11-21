@@ -43,11 +43,23 @@ describe('会话按 id 解析到设置里现在的那台机器', () => {
     assert.equal(r.remote?.id, 'aws-tokyo-4');
   });
 
-  test('配置读不了：只能用快照，不当成删了', () => {
+  test('配置读不了：核对不了 = 拒连（标成已删除），不拿快照去连', () => {
     const r = resolveSessionRemote(OLD_SNAPSHOT, null);
     assert.equal(r.source, 'snapshot');
-    assert.equal(r.deleted, undefined);
-    assert.equal(r.remote?.sshHost, 'ec2-user@99.83.165.184');
+    assert.equal(r.deleted, true);
+    assert.equal(r.remote?.sshHost, 'ec2-user@99.83.165.184', 'remote 只留给提示用（机器名）');
+  });
+
+  test('安全：设置文件不存在 / 损坏时，S3 同步来的快照同样拒连', () => {
+    const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'kl-sr-'));
+    fs.writeFileSync(path.join(dir, 'bad.json'), '{');
+    const planted = { sshHost: 'pwn@attacker.example', sshPort: 22 };
+    for (const cfg of ['nope.json', 'bad.json']) {
+      const targets = readRemoteTargets(path.join(dir, cfg));
+      assert.equal(targets, null);
+      assert.equal(resolveSessionRemote(planted as any, targets).deleted, true, `${cfg}：没 id 也拒`);
+      assert.equal(resolveSessionRemote({ ...planted, id: 'box' } as any, targets).deleted, true, `${cfg}：带 id 也拒`);
+    }
   });
 
   test('没 id 的老记录按 sshHost + 端口兜底匹配', () => {
@@ -58,7 +70,21 @@ describe('会话按 id 解析到设置里现在的那台机器', () => {
     assert.equal(hit.remote?.bins?.kiro, '/live/kiro');
     const otherPort = resolveSessionRemote({ sshHost: 'u@1.2.3.4' }, targets);
     assert.equal(otherPort.source, 'snapshot', '端口不同就不是同一台');
-    assert.equal(otherPort.deleted, undefined, '没 id 判断不了删没删：照旧用快照');
+    assert.equal(otherPort.deleted, true, '没 id、设置里也认不出：不拿快照去连');
+  });
+
+  test('安全：record.json 随 S3 同步回来，快照里的 sshHost 不可信 —— 没 id、设置里没有这台就拒连', () => {
+    const targets = parseRemoteTargets({ remotes: [{ id: 'box', sshHost: 'u@1.2.3.4' }] }, '/home/me');
+    const planted = { sshHost: 'pwn@attacker.example', sshPort: 22 };
+    const r = resolveSessionRemote(planted as any, targets);
+    assert.equal(r.deleted, true, '设置里没有的机器一律按"已删除"拒连（liveSessionRemote / 自动重连都看 deleted）');
+    assert.notEqual(r.source, 'config');
+    assert.deepEqual(resolveSessionRemote(planted as any, []), { remote: planted, source: 'snapshot', deleted: true }, '设置里一台机器都没有也一样');
+    /* 带个设置里没有的 id 同样拒；带设置里有的 id → 用设置里那台的地址，快照里的 sshHost 不用 */
+    assert.equal(resolveSessionRemote({ ...planted, id: 'nope' } as any, targets).deleted, true);
+    const byId = resolveSessionRemote({ ...planted, id: 'box' } as any, targets);
+    assert.equal(byId.source, 'config');
+    assert.equal(byId.remote?.sshHost, 'u@1.2.3.4');
   });
 
   test('本地会话什么都不解析', () => {
@@ -129,6 +155,13 @@ describe('接线：另起 ssh 的入口都走同一个解析', () => {
     assert.match(slice("ipcMain.handle('kiro:save-agent-config'"), /\{ const gone = sessionMachineGone\(sessionId\); if \(gone\) return \{ saved: false, error: gone \}; \}\n    const remoteT = kiroConfigTargetFor\(sessionId\);/);
     assert.match(slice('function remoteFileFor', 400), /if \(sessionMachineGone\(sessionId\)\) return null;\n    const target = kiroConfigTargetFor\(sessionId\);/);
     assert.match(slice('const sessionMachineGone', 300), /try \{ kiroConfigTargetFor\(sessionId\); return null; \} catch/);
+  });
+
+  test('Codex 下一句建议（没连着的会话按记录走）：设置里认不出这台就不 ssh', () => {
+    const body = slice('async function codexExecSuggestions(', 1500);
+    const guard = body.indexOf('if (resolvedRemote.deleted) return { suggestions: [], error: deletedMachineMessage(resolvedRemote.remote) };');
+    assert.ok(guard > 0);
+    assert.ok(guard < body.indexOf('runRemoteCapture('), '拒连要在 ssh 之前');
   });
 
   test('换模型：新执行器和回滚的那个都按现在的配置连，解析在动旧执行器之前', () => {
