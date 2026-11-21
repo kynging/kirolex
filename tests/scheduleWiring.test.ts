@@ -312,3 +312,26 @@ describe('setting a schedule does not wait for the current turn', () => {
     assert.match(CHAT.slice(at, at + 400), /!combinedText\.trim\(\)/);
   });
 });
+
+describe('a deleted session\'s schedules stop running shell on the host', () => {
+  test('purgeSession removes the session\'s schedules, like its bg jobs and loops', () => {
+    const start = MAIN.indexOf('const purgeSession = async');
+    assert.ok(start >= 0);
+    const body = MAIN.slice(start, MAIN.indexOf('addSessionTombstone(sessionId)', start));
+    assert.match(body, /bgJobs\.stopSession\(sessionId\)/);
+    assert.match(body, /scheduleStore\.removeSessionSchedules\(sessionId,/);
+  });
+
+  test('runScheduledJob checks the owning session BEFORE running checkCommand', () => {
+    const start = MAIN.indexOf('async function runScheduledJob(');
+    assert.ok(start >= 0);
+    const body = MAIN.slice(start, MAIN.indexOf('function runScheduleCheck(', start));
+    const gate = body.indexOf('if (!scheduleOwnerAllows(id, state.sessionId)) return;');
+    const check = body.indexOf('runScheduleCheck(id, state)');
+    assert.ok(gate >= 0 && check > gate, 'owner gate must come before the check command');
+    const helper = MAIN.slice(MAIN.indexOf('function scheduleOwnerAllows('), start);
+    assert.match(helper, /scheduleOwnerGate\(\{ deleted: sessionDeleted\(owner\), exists: !!rec, archived: !!rec\?\.archived \}\)/);
+    assert.match(helper, /if \(gate === 'remove'\) dropScheduleOfDeletedSession\(id, owner\)/);
+    assert.match(helper, /return gate === 'run';/);
+  });
+});

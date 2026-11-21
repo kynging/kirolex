@@ -80,3 +80,14 @@ export function removeSchedule(id: string, home: string, isProtected?: Protected
   if (isProtected?.(readSchedule(id, home)?.state.sessionId ?? '')) return;
   try { fs.rmSync(scheduleFile(id, home), { force: true }); } catch { /* already gone */ }
 }
+
+/**
+ * 删会话时把它的定时任务一起删掉（同 `bgJobs.stopSession`）：不然任务文件留着，定时器照样到点跑它的
+ * `checkCommand`（本机 shell），会话没了界面上也看不见。返回删掉的那几条；受保护的（advanced）不碰。
+ */
+export function removeSessionSchedules(sessionId: string, home: string, isProtected?: Protected): StoredSchedule[] {
+  if (!sessionId) return [];
+  const doomed = listSchedules(home, isProtected).filter((job) => job.state.sessionId === sessionId);
+  for (const job of doomed) removeSchedule(job.id, home, isProtected);
+  return doomed;
+}

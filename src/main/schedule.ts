@@ -261,6 +261,16 @@ export function scheduleDeliveryBlocker(state: ScheduleState | null, now: number
   return null;
 }
 
+/**
+ * 定时任务跑之前（**先于** `checkCommand`）看它属于的会话：删了（删除集合 / 墓碑）→ `remove`，任务一起删掉；
+ * 记录找不到 / 已归档 → `skip`，这一次什么都不跑（不删：记录可能还会回来、可能取消归档）；正常的 → `run`。
+ */
+export function scheduleOwnerGate(owner: { deleted: boolean; exists: boolean; archived: boolean }): 'run' | 'remove' | 'skip' {
+  if (owner.deleted) return 'remove';
+  if (!owner.exists || owner.archived) return 'skip';
+  return 'run';
+}
+
 /** 记了账却没发出去（排着的时候被取消 / 暂停）：把那一次退回去 —— 没跑的不该占预算。 */
 export function refundRun(current: ScheduleState, beforeCharge: ScheduleState): ScheduleState {
   return { ...current, runs: Math.max(0, current.runs - 1), lastRunAt: beforeCharge.lastRunAt };

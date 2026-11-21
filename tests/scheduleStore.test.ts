@@ -4,7 +4,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { createSchedule, recordRun, type ScheduleSpec } from '../src/main/schedule.ts';
-import { listSchedules, readSchedule, removeSchedule, scheduleDir, writeSchedule } from '../src/main/scheduleStore.ts';
+import { listSchedules, readSchedule, removeSchedule, removeSessionSchedules, scheduleDir, writeSchedule } from '../src/main/scheduleStore.ts';
 
 const HOMES: string[] = [];
 function tempHome(): string {
@@ -79,5 +79,32 @@ describe('a schedule outlives the window that created it', () => {
     removeSchedule('job-a', home);
     assert.equal(readSchedule('job-a', home), null);
     assert.deepEqual(listSchedules(home), []);
+  });
+});
+
+describe('deleting a session takes its schedules with it', () => {
+  test('removeSessionSchedules drops only that session\'s jobs and returns them', () => {
+    const home = tempHome();
+    writeSchedule('job-a', createSchedule('sess-doomed', { ...SPEC, checkCommand: 'echo hi' } as ScheduleSpec, 1000), home);
+    writeSchedule('job-b', createSchedule('sess-doomed', SPEC, 2000), home);
+    writeSchedule('job-c', createSchedule('sess-other', SPEC, 3000), home);
+    const removed = removeSessionSchedules('sess-doomed', home);
+    assert.deepEqual(removed.map((j) => j.id).sort(), ['job-a', 'job-b']);
+    assert.deepEqual(listSchedules(home).map((j) => j.id), ['job-c']);
+  });
+
+  test('protected (advanced) sessions are left untouched', () => {
+    const home = tempHome();
+    writeSchedule('job-a', createSchedule('sess-adv', SPEC, 1000), home);
+    const removed = removeSessionSchedules('sess-adv', home, (sid) => sid === 'sess-adv');
+    assert.deepEqual(removed, []);
+    assert.ok(readSchedule('job-a', home));
+  });
+
+  test('an empty session id removes nothing', () => {
+    const home = tempHome();
+    writeSchedule('job-a', createSchedule('sess-1', SPEC, 1000), home);
+    assert.deepEqual(removeSessionSchedules('', home), []);
+    assert.ok(readSchedule('job-a', home));
   });
 });

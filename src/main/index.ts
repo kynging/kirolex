@@ -90,7 +90,7 @@ import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from '.
 import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
-import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
+import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleOwnerGate, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
 import { scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
@@ -12688,10 +12688,31 @@ ${hint}` : ''}` };
   const SCHEDULE_TICK_MS = 20_000;
   /* Jobs currently mid-run (`schedulesInFlight`, module level), so a slow turn is never re-entered by the next tick. */
 
+  /** 删掉的会话留下的定时任务：文件已删（或在这里删），排着的那次作废，界面上去掉。 */
+  function dropScheduleOfDeletedSession(id: string, sessionId: string): void {
+    scheduleStore.removeSchedule(id, os.homedir(), store.isAdvancedOnlySession);
+    wakeDispatcher.dropRef(id, 'session deleted');
+    logger.info('schedule', `removed id=${id}: session ${sessionId} deleted`);
+    mainWindow?.webContents.send('schedule:changed', { id, state: null });
+  }
+
+  /**
+   * 定时任务这一次能不能跑（**先于** `checkCommand`）：会话删了 → 任务一起删（也清掉删除前留下的孤儿任务）；
+   * 记录找不到 / 已归档 → 这一次不跑。原来只在 `wakeDeliver` 里拦，那时检查命令已经在本机跑完了。
+   */
+  function scheduleOwnerAllows(id: string, owner: string): boolean {
+    const rec = store.readRecord(owner);
+    const gate = scheduleOwnerGate({ deleted: sessionDeleted(owner), exists: !!rec, archived: !!rec?.archived });
+    if (gate === 'remove') dropScheduleOfDeletedSession(id, owner);
+    return gate === 'run';
+  }
+
   async function runScheduledJob(job: scheduleStore.StoredSchedule): Promise<void> {
     const { id } = job;
     let state = job.state;
     if (schedulesInFlight.has(id)) return;
+    /* 先看会话还在不在，再跑任何东西（`checkCommand` 是本机 shell），见 `scheduleOwnerAllows` */
+    if (!scheduleOwnerAllows(id, state.sessionId)) return;
     schedulesInFlight.set(id, state.sessionId);
     try {
       const at = nextRunAt(state) ?? Date.now();
@@ -13396,6 +13417,10 @@ ${hint}` : ''}` };
     loopDriver?.stop(sessionId, 'discarded');
     /* 它发出去、还在等回复的那几条不再等（对方那边由 ReplyWatcher 自己发现「对方被删了」） */
     replyWatcher.dropFrom(sessionId);
+    /* 它的定时任务一起删掉：不然任务文件留着，定时器照样到点在本机跑它的 checkCommand */
+    for (const job of scheduleStore.removeSessionSchedules(sessionId, os.homedir(), store.isAdvancedOnlySession)) {
+      dropScheduleOfDeletedSession(job.id, sessionId);
+    }
     // Durable tombstone FIRST: `deletedSessionIds` is in-memory only, so if the
     // directory cannot be removed right now (kiro-cli may still hold the
     // transcript open — disconnect is asynchronous) the chat used to come back on
