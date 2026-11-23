@@ -150,7 +150,7 @@ describe('远端端口：还活着的旧 ssh 占着的也要避开', () => {
 });
 
 describe('Claude Code / Codex：effort 和权限模式', () => {
-  test('引擎名那一格换成 effort；顶上 Auto/Ask 换成它们自己的 mode（Claude 默认 bypass）', () => {
+  test('引擎名那一格换成 effort；顶上 Auto/Ask 换成它们自己的 mode（Claude 默认 default=逐次询问）', () => {
     const ca = read('src', 'renderer', 'components', 'ChatArea.tsx');
     assert.doesNotMatch(ca, /className="composer-engine"/, '「改成 effort 吧」');
     /* 「组合」（MCP 配置）下拉还在；effort 是模型下拉左边单独一个下拉（2026-10-26，见 engineEffort.test.ts） */
@@ -159,7 +159,8 @@ describe('Claude Code / Codex：effort 和权限模式', () => {
     assert.match(ca, /engineMode=\{nonKiro \? \{/);
     assert.match(ca, /\{engineMode \? \(\s*<select/);
     const M = read('src', 'main', 'index.ts');
-    assert.match(M, /const DEFAULT_ENGINE_MODE: Partial<Record<'claude' \| 'codex', string>> = \{ claude: 'bypassPermissions' \};/);
+    assert.match(M, /const DEFAULT_ENGINE_MODE: Partial<Record<'claude' \| 'codex', string>> = \{ claude: 'default' \};/);
+    assert.doesNotMatch(M, /DEFAULT_ENGINE_MODE[^\n]*bypassPermissions/, '默认不能是跳过所有确认（secure by default）');
     assert.match(M, /if \(category !== 'thought_level' && category !== 'mode'\) throw/);
     /* attach 按白名单重建 profile —— 漏了这两个，手选的值一重连就丢 */
     assert.match(M, /\.\.\.\(existing\?\.profile\.engineModels \? \{ engineModels: existing\.profile\.engineModels \} : \{\}\),/);

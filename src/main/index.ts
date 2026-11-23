@@ -8372,11 +8372,11 @@ function engineModelsPayload(sessionId: string, entry: SessionEntry) {
 }
 
 /**
- * **没选过权限模式时用哪个** ——「默认是 bypass 就好」。只给 Claude Code 定：它的适配器起来时报什么取决于
- * 那台机器的 settings（`permissions.defaultMode`），而 KiroLex 里 kiro 会话默认就是自动批准，两边该一致。
+ * **没选过权限模式时用哪个** —— 安全默认：Claude Code 起手就是 `default`（每次工具调用都问）。
+ * 跳过所有确认的 `bypassPermissions` 必须由用户在顶上的模式按钮里明确选（secure by default，同 kiro 的 'ask'）。
  * Codex 的那几档同时管着沙箱（read-only / workspace-write …），不替人选，用它自己的默认。
  */
-const DEFAULT_ENGINE_MODE: Partial<Record<'claude' | 'codex', string>> = { claude: 'bypassPermissions' };
+const DEFAULT_ENGINE_MODE: Partial<Record<'claude' | 'codex', string>> = { claude: 'default' };
 
 /** 这条会话记着的那几个值（模型 / effort / 模式），按"先模型后 effort"的顺序 —— 换模型可能会换掉 effort 的可选值。 */
 function wantedEngineOptions(profile: AgentProfile): Array<[EngineOptionCategory, string]> {
