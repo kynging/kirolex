@@ -35,19 +35,33 @@ export type SteerFailureRoute = 'send-now' | 'after-rebuild' | 'queue' | 'handof
  *   · `steer`   插进正在跑的这一轮（kiro 的 `_session/steer` / 适配器的 `_session/steering`）；
  *   · `handoff` 交给适配器排在这一轮后面（只声明了 promptQueueing：主进程 `acp:handoff-prompt`）；
  *   · `queue`   KiroLex 自己的队列。
- * `busyEnter` 是主进程按能力声明算好的（`AcpClient.busyEnter`）；还没拿到时按引擎兜底（kiro 能 steer，另外两家排队）。
+ * `busyEnter` 是主进程按能力声明算好的（`AcpClient.busyEnter`）；问不到（没连着）时按引擎兜底（kiro 能 steer，另外两家排队）。
+ * `unknown`（执行器连着、initialize 结果还没存好 —— 现问过一次仍是它）**不是「不支持」**：先试 steer，由主进程 `acp:steer`
+ * 按那一刻的能力声明决定（真插不进去回 `unsupported` → KiroLex 队列，不标红）。
  */
 export function busyEnterKind(engine?: string | null, busyEnter?: string | null): 'steer' | 'handoff' | 'queue' {
   if (busyEnter === 'prompt-queue') return 'handoff';
+  if (busyEnter === 'unknown') return 'steer';
   return engineCanSteer(engine, busyEnter) ? 'steer' : 'queue';
 }
 
 /** 这条会话能不能往正在跑的一轮里追加（steer）。`busyEnter` 是主进程按能力声明算好的（`AcpClient.busyEnter`，
  *  和 `supportsSteer` 同一个判据）：`steer`（kiro）/ `steering` 能；`prompt-queue` / `queue` 不能。
- *  还没拿到能力声明时按引擎兜底：没有 engine 字段的老会话就是 kiro。 */
+ *  还没拿到能力声明（没有 / `unknown`）时按引擎兜底：没有 engine 字段的老会话就是 kiro。 */
 export function engineCanSteer(engine?: string | null, busyEnter?: string | null): boolean {
-  if (busyEnter) return busyEnter === 'steer' || busyEnter === 'steering';
+  if (busyEnter && busyEnter !== 'unknown') return busyEnter === 'steer' || busyEnter === 'steering';
   return !engine || engine === 'kiro';
+}
+
+/** 渲染端能缓存的 `busyEnter`：只缓存明确的能力（`steer` / `steering` / `prompt-queue` / `queue`）。
+ *  `unknown`（initialize 还没到）和空值不缓存 —— 以前 `queue` 在能力未知时也被算出来、被缓存，Claude Code 忙时 Enter 就一直进 KiroLex 队列。 */
+export function cacheableBusyEnter(busyEnter?: string | null): string | undefined {
+  return busyEnter === 'steer' || busyEnter === 'steering' || busyEnter === 'prompt-queue' || busyEnter === 'queue' ? busyEnter : undefined;
+}
+
+/** 忙时 Enter 日志里的 `mode=`：渲染端缓存着的明确能力；没有时 kiro 就是 steer，另外两家记 `unknown`（能力未知，不是不支持）。 */
+export function busyEnterLogMode(engine?: string | null, cached?: string | null): string {
+  return cacheableBusyEnter(cached) || (engineCanSteer(engine) ? 'steer' : 'unknown');
 }
 
 /** `acp:steer` 拒绝之后怎么办。 */

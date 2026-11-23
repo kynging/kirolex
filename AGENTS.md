@@ -287,6 +287,7 @@ docs/            设计文档（§1）
   （`queuesBySessionRef.current[sessionId]`，不能用跟着焦点走的 `currentQueue`——曾经导致输入文字静默消失）。
 - 排空时要跳过：正在流式 / 后端被占（含重建历史）/ 被循环占用 / 正在发送 / 自动恢复中 / 正在换模型或 agent / 等待退出中。
 - 忙时 Enter 能不能插进当前这一轮按执行器 initialize 的能力声明定（`busyEnterCaps.ts`、`AcpClient.busyEnter`）：kiro 走 `_session/steer`；声明了 `_meta.steering.supported` 的适配器（Claude Code / Codex）走 `_session/steering`；只声明 `promptQueueing` 的再发一个 `session/prompt` 交给 CLI 排（`followUpTurns.ts`）；都没有的直接进 KiroLex 队列。
+  initialize 结果还没到是 `unknown`（**能力未知 ≠ 不支持**）：渲染端不缓存它、忙时 Enter 现问；`wireSession` 末尾必推一次 `session:engine-models`，窗口刷新后渲染端挂好监听再发 `acp:engine-models-ready`，主进程给连着的会话各推一次。steering 只在明确 -32601 时降级，换后端会话 / 重新 initialize 清零。每次忙时 Enter 记 `[prompt] busy-enter …`（`tests/busyEnterUnknown.test.ts`）。
 - 队列落盘在 ui-state 的 `kirolex-queues`，未消费 steer 在 `kirolex-pending-steers`；重启后恢复（恢复的排队项带 `restored: true`）。
   控制入口把 `queued` 报为"忙"但**不挡退出**，正因为它已经落盘。
 

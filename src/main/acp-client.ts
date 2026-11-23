@@ -551,6 +551,7 @@ export class AcpClient extends EventEmitter {
           /* 适配器声明了什么（`sessionCapabilities.fork` 等）—— 编辑重发要不要分叉看它（`editFork.ts`） */
           this.agentCapabilities = result?.agentCapabilities;
           this.initializeResult = result;
+          this.resetSteering();
           resolve(result);
         } catch (err) {
           reject(err);
@@ -685,6 +686,7 @@ export class AcpClient extends EventEmitter {
       mcpServers: this.mcpServers,
     });
     this.noteConfigOptions(r?.configOptions);
+    this.resetSteering();   // 新的后端会话：按能力声明重新判断
     return r;
   }
 
@@ -715,6 +717,7 @@ export class AcpClient extends EventEmitter {
       mcpServers: this.mcpServers,
     });
     this.noteConfigOptions(r?.configOptions);
+    this.resetSteering();   // 换了后端会话：按能力声明重新判断
     return r;
   }
 
@@ -913,7 +916,7 @@ export class AcpClient extends EventEmitter {
    *     -32601 之后这个执行器不再试。
    * 从不抛。`detail` 只给日志用。
    */
-  async steering(sessionId: string, message: string): Promise<{ steered: boolean; reason?: string; detail?: string }> {
+  async steering(sessionId: string, message: string): Promise<{ steered: boolean; reason?: string; detail?: string; code?: number | string; outcome?: string; degraded?: boolean }> {
     const text = (message || '').trim();
     if (!text) return { steered: false, reason: 'write-failed' };
     let result: any;
@@ -931,12 +934,28 @@ export class AcpClient extends EventEmitter {
     /* 这一轮刚好结束、适配器自己起了一轮（Codex）：消息已经在它手里，不再重发；那一轮由主进程认成这条消息的一轮 */
     if (verdict === 'detached') return { steered: false, reason: 'handed-off', detail: `outcome=${result?.outcome}` };
     if (verdict === 'prompt-required') return { steered: false, reason: 'idle' };
+    /* 只有明确的 -32601 才降级（超时 / 断线 / 内部错误只是这一次没成，下一次照样试 steering） */
+    let degraded = false;
     if (error && isMethodNotFound(error) && !this.steeringUnavailable) {
       this.steeringUnavailable = true;
+      degraded = true;
       this.emit('config-options');   // 界面重拿 engine-models，里面的 busyEnter 已经退了一档
     }
-    /* 退到下一档：声明了 promptQueueing 的交给 CLI 排（`handoff`），否则 KiroLex 队列（`unsupported`） */
-    return { steered: false, reason: this.supportsPromptQueueing ? 'handoff' : 'unsupported', detail: error ? String(error?.message || error) : `outcome=${result?.outcome}` };
+    /* 退到下一档：声明了 promptQueueing 的交给 CLI 排（`handoff`），否则 KiroLex 队列（`unsupported`）。
+       code / outcome / degraded 给主进程记日志（`busyEnterCaps.steeringFailureLogLine` / `steeringDegradedLogLine`） */
+    return {
+      steered: false,
+      reason: this.supportsPromptQueueing ? 'handoff' : 'unsupported',
+      detail: error ? String(error?.message || error) : `outcome=${result?.outcome}`,
+      ...(error?.code !== undefined ? { code: error.code } : {}),
+      ...(!error ? { outcome: String(result?.outcome ?? '') } : {}),
+      ...(degraded ? { degraded: true } : {}),
+    };
+  }
+
+  /** 换了后端会话 / 重新 initialize：steering 降级清零，按新的能力声明重新判断（降级只对回过 -32601 的那个后端算数）。 */
+  private resetSteering(): void {
+    this.steeringUnavailable = false;
   }
 
   /** OS pid of the kiro-cli child, or undefined once it has exited. Used to bind

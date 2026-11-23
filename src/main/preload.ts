@@ -181,6 +181,10 @@ contextBridge.exposeInMainWorld('kiroApi', {
   switchKiroAgent: (sessionId: string, agentName: string) => ipcRenderer.invoke('acp:switch-kiro-agent', sessionId, agentName),
   switchModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:switch-model', sessionId, model),
   engineModels: (sessionId: string) => ipcRenderer.invoke('acp:engine-models', sessionId),
+  /* 忙时 Enter 走了哪条路，进主进程日志（`[prompt] busy-enter …`） */
+  logBusyEnter: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => ipcRenderer.send('acp:busy-enter-log', d),
+  /* 渲染端挂好 session:engine-models 监听了（窗口刷新后）：请主进程把连着的会话的能力各推一次 */
+  engineModelsReady: () => ipcRenderer.send('acp:engine-models-ready'),
   setEngineModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:set-engine-model', sessionId, model),
   setEngineOption: (sessionId: string, category: 'thought_level' | 'mode' | 'collaboration_mode', value: string) => ipcRenderer.invoke('acp:set-engine-option', sessionId, category, value),
   onEngineModels: (cb: (d: { sessionId: string; current: string; options: Array<{ value: string; name: string }>; effort?: any; mode?: any; busyEnter?: string }) => void) => {

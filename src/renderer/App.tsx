@@ -40,7 +40,7 @@ import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
-import { busyEnterKind, busyEnterRoute, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
 import { carryControlMark, controlMessageId, isControlMessageId, type MarkOrigin } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
 import { newChatModel } from '../main/engineModelPick.ts';
@@ -307,6 +307,10 @@ declare global {
       /** Claude Code / Codex 的下拉清单 + 忙时 Enter 交给谁（`busyEnter`，main/busyEnterCaps.ts）；kiro 会话回 null */
       engineModels?: (sessionId: string) => Promise<{ sessionId: string; busyEnter?: string } | null>;
       onEngineModels?: (cb: (d: { sessionId: string; busyEnter?: string }) => void) => () => void;
+      /** 忙时 Enter 走了哪条路，进主进程日志（`acp:busy-enter-log`） */
+      logBusyEnter?: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => void;
+      /** 挂好 session:engine-models 监听后握手：主进程把连着的会话的能力各推一次（`acp:engine-models-ready`） */
+      engineModelsReady?: () => void;
       /** Persist a CONSUMED steer into the durable transcript (its only writer:
        *  steers never go through `prompt`). Merges into the turn's base user
        *  message, which is also how it is rendered. */
@@ -3553,17 +3557,28 @@ const App: React.FC = () => {
   /*
     **忙时 Enter 交给谁** —— 主进程按执行器 initialize 的能力声明算好（`main/busyEnterCaps.ts`），随 `session:engine-models`
     推过来（`busyEnter`）。kiro 不用问；Claude Code / Codex 还没收到时现问一次（`acp:engine-models`），问不到就按引擎名兜底。
+    **能力未知 ≠ 不支持**：`unknown`（执行器的 initialize 结果还没存好）不缓存（`cacheableBusyEnter`），推过来的 unknown 还要把旧值清掉 ——
+    下一次忙时 Enter 现问。主进程每次挂上执行器都会推一份明确的（`wireSession`）。
   */
   const busyEnterRef = useRef<Record<string, string>>({});
-  useEffect(() => window.kiroApi.onEngineModels?.((d) => {
-    if (d?.sessionId && d.busyEnter) busyEnterRef.current[d.sessionId] = d.busyEnter;
-  }), []);
+  useEffect(() => {
+    const off = window.kiroApi.onEngineModels?.((d) => {
+      if (!d?.sessionId) return;
+      const v = cacheableBusyEnter(d.busyEnter);
+      if (v) busyEnterRef.current[d.sessionId] = v;
+      else if (d.busyEnter === 'unknown') delete busyEnterRef.current[d.sessionId];
+    });
+    /* 监听挂好了再握手（窗口刷新后这里的缓存是空的）：主进程把连着的会话的能力各推一次（`acp:engine-models-ready`） */
+    window.kiroApi.engineModelsReady?.();
+    return off;
+  }, []);
   const busyEnterFor = useCallback(async (sid: string, engine?: string): Promise<string | undefined> => {
     const known = busyEnterRef.current[sid];
     if (known || engineCanSteer(engine)) return known;
     try {
       const d = await window.kiroApi.engineModels?.(sid);
-      if (d?.busyEnter) busyEnterRef.current[sid] = d.busyEnter;
+      const v = cacheableBusyEnter(d?.busyEnter);
+      if (v) busyEnterRef.current[sid] = v;
       return d?.busyEnter;
     } catch { return undefined; }
   }, []);
@@ -3684,10 +3699,19 @@ const App: React.FC = () => {
     if ((!content && attachments.length === 0) || !sessionId) return;
     if (!ctl) clearAttachments(sessionId);
 
+    /* 每次忙时 Enter 记一行：`[prompt] busy-enter sessionId=… engine=… mode=… route=… reason=…`（主进程 `busyEnterCaps.busyEnterLogLine`）。
+       `busyReason` 跟着下面的判断改：能力声明（caps-<mode>）/ 重建历史 / steer 或交给适配器没成的原因。 */
+    let busyReason = 'caps';
+    const logBusyEnter = (route: 'steered' | 'handoff' | 'kirolex-queue' | 'after-rebuild' | 'sent-as-new' | 'failed') => {
+      const engine = sessions.find((s) => s.id === sessionId)?.engine;
+      window.kiroApi.logBusyEnter?.({ sessionId, engine: engine || 'kiro', mode: busyEnterLogMode(engine, busyEnterRef.current[sessionId]), route, reason: busyReason });
+    };
+
     // A history rebuild is a LOCKED task: it is a hidden turn whose whole purpose
     // is to restore the context, so steering into it would be answered without
     // that context and would never be visible. Park it as "send after rebuild".
     const parkUntilRebuilt = () => {
+      logBusyEnter('after-rebuild');
       const parkedId = ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       ctl?.report({ routed: 'queued', messageId: parkedId });
       setQueuesBySession((prev) => ({
@@ -3705,6 +3729,7 @@ const App: React.FC = () => {
     // 执行器没法把消息插进正在跑的一轮（能力声明里没有 steering，见 main/busyEnterCaps.ts）：忙时 Enter 就是排队 ——
     // 和 ⌘/Ctrl+Enter 同一种卡片，排在队尾，这一轮结束后自动作为下一条发出。不先试 steer、不标红。
     const queueAsNext = () => {
+      logBusyEnter('kirolex-queue');
       const queuedId = ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`;
       ctl?.report({ routed: 'queued', messageId: queuedId });
       setQueuesBySession((prev) => ({
@@ -3735,9 +3760,11 @@ const App: React.FC = () => {
         }],
       }));
       const r = await handOffMessage(sessionId, content, { attachments, msgId: handoffId, ...(pastes?.length ? { displayText: shown, pastes } : {}) });
-      if (r.accepted) { ctl?.report({ routed: 'queued', messageId: handoffId }); return; }
+      if (r.accepted) { logBusyEnter('handoff'); ctl?.report({ routed: 'queued', messageId: handoffId }); return; }
       dropHandoff(sessionId, handoffId);
+      busyReason = `handoff-${r.reason || 'failed'}`;
       if (r.reason === 'idle') {
+        logBusyEnter('sent-as-new');
         noteSessionLocally(sessionId, tRef.current('This turn had already ended, so your message was sent as a new one.'));
         await sendNowOrNext(sessionId, content, attachments, pastes?.length ? { displayText: shown, pastes } : undefined, ctl);
         return;
@@ -3748,20 +3775,24 @@ const App: React.FC = () => {
     const enterKind = busyEnterKind(steerEngine, await busyEnterFor(sessionId, steerEngine));
     const canSteer = enterKind !== 'queue';
     const busyRoute = busyEnterRoute({ busy: busyBySessionRef.current[sessionId], canSteer });
+    busyReason = busyRoute === 'after-rebuild' ? 'rebuilding' : `caps-${busyEnterLogMode(steerEngine, busyEnterRef.current[sessionId])}`;
     if (busyRoute === 'after-rebuild') { parkUntilRebuilt(); return; }
     if (busyRoute === 'queue') { queueAsNext(); return; }
     if (enterKind === 'handoff') { await handOff(); return; }
 
     const steerId = ctl ? controlMessageId('steer', undefined, ctl.origin) : undefined;
     const res = await steerMessage(content, sessionId, { attachments, sendText: steerPayload(content, attachments), msgId: steerId });
-    if (res.steered) { if (ctl) ctl.report({ routed: 'steer', messageId: steerId! }); return; }
+    if (res.steered) { logBusyEnter('steered'); if (ctl) ctl.report({ routed: 'steer', messageId: steerId! }); return; }
     const route = steerFailureRoute(res.reason);
+    busyReason = `steer-${res.reason || 'failed'}`;
     if (route === 'after-rebuild') { parkUntilRebuilt(); return; }
     if (route === 'queue') { queueAsNext(); return; }
     if (route === 'handoff') { await handOff(); return; }
     // 这一轮刚好结束、适配器自己起了一轮（Codex）：主进程把那一轮认成这条消息的（acp:main-turn 会把它插进对话）
+    if (route === 'handed-off') logBusyEnter('handoff');
     if (route === 'handed-off') { if (ctl && res.messageId) ctl.report({ routed: 'sent', messageId: res.messageId }); return; }
     if (route === 'send-now') {
+      logBusyEnter('sent-as-new');
       // The turn already ended: there is no "current turn" to add to, so this IS
       // the next message. Sent straight away unless a queued item is already on
       // its way out — then it goes right behind that one (head of the queue).
@@ -3770,6 +3801,7 @@ const App: React.FC = () => {
       return;
     }
     // Anything else: never silently queue. Mark it red on the turn and let the user choose.
+    logBusyEnter('failed');
     const failedId = addFailedSteer(sessionId, content, attachments, res.reason, ctl ? controlMessageId('steer', undefined, ctl.origin) : undefined);
     ctl?.report({ routed: 'steer', messageId: failedId, steerFailed: res.reason || 'unknown' });
   }, [currentSessionId, sessions, busyEnterFor, attachedFor, clearAttachments, focusSession, steerMessage, handOffMessage, dropHandoff, loopingIds, sendNowOrNext, addFailedSteer]);

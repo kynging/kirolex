@@ -74,9 +74,9 @@ describe('能力声明 → 忙时普通 Enter 的路由', () => {
   test('只声明了 promptQueueing → 直接再发 session/prompt（prompt-queue）', () => {
     assert.equal(busyEnterMode('claude', QUEUEING_ONLY), 'prompt-queue');
   });
-  test('都没有（或还没 initialize）→ KiroLex 自己的队列', () => {
+  test('都没有 → KiroLex 自己的队列；还没 initialize → unknown（能力未知 ≠ 不支持，见 tests/busyEnterUnknown.test.ts）', () => {
     assert.equal(busyEnterMode('claude', NOTHING), 'queue');
-    assert.equal(busyEnterMode('codex', undefined), 'queue');
+    assert.equal(busyEnterMode('codex', undefined), 'unknown');
     assert.equal(busyEnterMode('claude', { _meta: { steering: { supported: 'yes' } } }), 'queue', '只认 === true');
   });
   test('steering 不可用了往下退一档', () => {

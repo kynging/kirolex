@@ -30,7 +30,7 @@ import { createRemoteInstructionFs, listInstructionFiles, localInstructionFs, wr
 import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
-import { detachedTurnEnded, steerDisplay, steeringPromptBlocks } from './busyEnterCaps';
+import { busyEnterLogLine, detachedTurnEnded, steerDisplay, steeringDegradedLogLine, steeringFailureLogLine, steeringPromptBlocks } from './busyEnterCaps';
 import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persistThenRelease, readPendingHandoffs, recoverableHandoffs, removePendingHandoff, restoreStartedHandoffs, restoredUserMessage, type PendingHandoff } from './pendingHandoffs';
 import { isReplayOutsideTurn, outsideTurnVerdict } from './replayGuard';
 import { autonomousFrame, beginAutonomousTurn, endAutonomousTurn, type AutonomousDeps, type AutonomousTurn } from './autonomousTurn';
@@ -8993,6 +8993,12 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       else f.abort(new Error(tr('Session not connected')));
     }
   });
+  /*
+    **挂上就推一次能力**（含 `busyEnter`）—— attach / 重连 / 换后端会话 / 换模型换机器都经过这里，执行器此时已经 initialize 过。
+    渲染端在等它：没收到之前它只有「未知」（不缓存，忙时 Enter 现问），以前拿到过的旧值也要被新执行器的这一份盖掉。
+    `applyEngineModel` 末尾还会再推一次（模型清单设好之后），这一次不等它。
+  */
+  if (!superseded()) pushEngineModels(sessionId);
 }
 
 /** Flush the accumulated assistant message to the durable transcript (called on
@@ -12694,14 +12700,17 @@ ${hint}` : ''}` };
         settled = true;
         entry.steeringInFlight = Math.max(0, (entry.steeringInFlight || 1) - 1);
       };
-      let res: { steered: boolean; reason?: string; detail?: string };
+      let res: { steered: boolean; reason?: string; detail?: string; code?: number | string; outcome?: string; degraded?: boolean };
       try {
         res = await entry.client.steering(entry.cliSessionId, capped);
       } catch (err: any) {
-        res = { steered: false, reason: 'unsupported', detail: String(err?.message || err) };
+        res = { steered: false, reason: 'unsupported', detail: String(err?.message || err), ...(err?.code !== undefined ? { code: err.code } : {}) };
       }
       if (res.reason !== 'handed-off') settle();
       if (!res.steered || res.detail) logger.info('prompt', `_session/steering sessionId=${sessionId} steered=${res.steered} reason=${res.reason || '-'} ${res.detail || ''}`);
+      /* 请求失败（报错 / outcome 不认识）退到下一档、降级（-32601，steeringUnavailable 置位）各记一行，带错误码 / outcome */
+      if (!res.steered && (res.reason === 'handoff' || res.reason === 'unsupported')) logger.warn('prompt', steeringFailureLogLine(sessionId, res));
+      if (res.degraded) logger.warn('prompt', steeringDegradedLogLine(sessionId, engineOf(entry.profile), res.code, entry.client.busyEnter));
       if (res.reason === 'handed-off') {
         /*
           **这一轮刚好结束，适配器自己起了一轮**（Codex 的 `startedNewTurn`）：把那一轮认成这条消息的正常一轮 ——
@@ -14483,6 +14492,20 @@ ${hint}` : ''}` };
   ipcMain.handle('acp:engine-models', (_event, sessionId: string) => {
     const entry = sessionClients.get(sessionId);
     return entry && engineOf(entry.profile) !== 'kiro' ? engineModelsPayload(sessionId, entry) : null;
+  });
+
+  /** 每次忙时 Enter 走完路由，渲染端报一行（`[prompt] busy-enter … mode=… route=… reason=…`，`busyEnterCaps.busyEnterLogLine`）。
+   *  以前「为什么进了 KiroLex 队列」在日志里一个字都没有。 */
+  ipcMain.on('acp:busy-enter-log', (_event, d: { sessionId?: string; engine?: string; mode?: string; route?: string; reason?: string }) => {
+    logger.info('prompt', busyEnterLogLine(d || {}));
+  });
+
+  /** **窗口刷新后的握手**：渲染端挂好 `session:engine-models` 监听之后发这一声，主进程把所有连着的会话的能力（含 `busyEnter`）
+   *  各推一次。不在 did-finish-load 推 —— 那时监听可能还没挂上，推了也丢。 */
+  ipcMain.on('acp:engine-models-ready', () => {
+    let pushed = 0;
+    for (const sessionId of sessionClients.keys()) if (pushEngineModels(sessionId)) pushed++;
+    logger.info('prompt', `engine-models ready from renderer -> pushed busyEnter for ${pushed} session(s)`);
   });
 
   /**
