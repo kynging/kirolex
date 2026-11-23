@@ -5,6 +5,7 @@ import { RemoteSettings } from './RemoteSettings';
 import { AgentProfileSettings } from './AgentProfileSettings';
 import { ForwardMcpSettings } from './ForwardMcpSettings';
 import { LocalBrowserSettings } from './LocalBrowserSettings';
+import { ThemeColorControls, ThemeFileControls } from './ThemeSettings.tsx';
 import { useT } from '../hooks/useLang';
 import { fontSelectOptions } from '../fontOptions';
 import { defaultComboOptions, type DefaultComboInfo } from '../comboPick';
@@ -504,6 +505,14 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
 
           </div>
           )}
+
+          {/* 外观那一页的第二栏：主题 / 文字对比度 / 强调色；下面整行是 theme.json 和外观同步（ThemeSettings.tsx） */}
+          {tab === 'appearance' && (
+          <div className="settings-col">
+            <ThemeColorControls settings={settings} onChange={onChange} />
+          </div>
+          )}
+          {tab === 'appearance' && <ThemeFileControls settings={settings} onChange={onChange} />}
 
           {/* 会话那一页：分屏、并发、卡死判定、辅助模型 —— 都是「会话怎么跑」的旋钮 */}
           {tab === 'session' && (

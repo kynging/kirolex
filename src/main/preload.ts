@@ -284,6 +284,21 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('app:ui-zoom-key', handler);
     return () => ipcRenderer.removeListener('app:ui-zoom-key', handler);
   },
+  /** 外观：~/.kirolex/theme.json 的颜色覆盖（主进程 watch，改了推 app:theme-config）和外观跨电脑同步（见 themeConfig.ts / appearanceSync.ts） */
+  getThemeConfig: () => ipcRenderer.invoke('app:theme-config-get'),
+  openThemeConfig: () => ipcRenderer.invoke('app:theme-config-open'),
+  resetThemeConfig: () => ipcRenderer.invoke('app:theme-config-reset'),
+  onThemeConfig: (callback: (state: any) => void) => {
+    const handler = (_event: any, state: any) => callback(state);
+    ipcRenderer.on('app:theme-config', handler);
+    return () => ipcRenderer.removeListener('app:theme-config', handler);
+  },
+  appearanceSyncStatus: () => ipcRenderer.invoke('app:appearance-sync-status'),
+  onAppearanceSynced: (callback: (settings: any) => void) => {
+    const handler = (_event: any, settings: any) => callback(settings);
+    ipcRenderer.on('app:appearance-synced', handler);
+    return () => ipcRenderer.removeListener('app:appearance-synced', handler);
+  },
   splashStatus: (text: string) => ipcRenderer.invoke('acp:splash-status', text),
   deleteProjectMemory: (projectId: string) => ipcRenderer.invoke('acp:delete-project-memory', projectId),
   readMemory: (projectId?: string, sessionId?: string) => ipcRenderer.invoke('acp:read-memory', projectId, sessionId),

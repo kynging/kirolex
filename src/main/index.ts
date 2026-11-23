@@ -71,6 +71,8 @@ import { pullProjectMemory } from './projectMemoryPull.ts';
 import { knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from './projectSanity.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
 import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
+import { APPEARANCE_REL, MAX_THEME_JSON_CHARS, appearanceSyncEnabled, applySyncedSettings, makePayload, noteLocalAppearance, parseSnapshot, runAppearanceSync, type AppearancePayload, type AppearanceSnapshot } from './appearanceSync.ts';
+import { THEME_FILE, ensureThemeFile, readThemeFile, resetThemeFile, themeFilePath, writeSyncedThemeFile, type ThemeFileState } from './themeFileStore.ts';
 import { McpComboWatcher, comboFingerprint, remountExclusive, COMBO_FILE_BROKEN } from './mcpComboWatch.ts';
 import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
@@ -5321,6 +5323,8 @@ function setUiStateKey(key: string, value: string | null): void {
   if (value === null) delete state[key];
   else state[key] = String(value);
   if (key === 'kirolex-settings') syncUiLangFromSettings();
+  /* 外观设置（主题 / 对比度 / 强调色 / 字体 / 字号）变了 → 记下本机修改时刻，稍后传到桶里（appearanceSync.ts） */
+  if (key === 'kirolex-settings') noteAppearanceChange();
   // Coalesced: widths and drafts can change on every mouse move.
   if (uiStateFlush) clearTimeout(uiStateFlush);
   uiStateFlush = setTimeout(flushUiStateNow, 400);
@@ -7396,6 +7400,175 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
   }
 }
 
+/*
+  ── 外观：~/.kirolex/theme.json 颜色覆盖 + 外观配置跨电脑同步 ──
+  校验 / 合并在 themeConfig.ts，文件读写在 themeFileStore.ts，同步判据在 appearanceSync.ts；这里只收集状态、读写、推给渲染端。
+*/
+/** 本机外观快照（最后一次修改的时刻 + 内容），只在本机、不上传。 */
+const APPEARANCE_SNAPSHOT_PATH = path.join(KIROLEX_HOME, 'appearance-sync.json');
+let themeFileState: ThemeFileState | null = null;
+let themeWatchStarted = false;
+let themeReloadTimer: NodeJS.Timeout | null = null;
+/** undefined = 还没记过快照；null = 还没从盘上读 */
+let appearanceSnapshot: AppearanceSnapshot | undefined | null = null;
+let appearancePushTimer: NodeJS.Timeout | null = null;
+let appearanceLast: { at?: number; error?: string } = {};
+
+/** 读一次 theme.json；状态变了推给渲染端（坏 JSON：覆盖保留上一次有效的，带上错误）。 */
+function reloadThemeFile(): void {
+  const r = readThemeFile(os.homedir(), themeFileState);
+  const before = JSON.stringify(themeFileState);
+  themeFileState = r.state;
+  if (JSON.stringify(r.state) !== before) {
+    if (r.state.error) logger.warn('theme', `theme.json 不是合法的 JSON，继续用上一次的有效配置：${r.state.error}`);
+    else logger.info('theme', `theme.json ${r.state.exists ? `已读取（忽略 ${r.state.ignored.length} 项）` : '不存在，用默认颜色'}`);
+    mainWindow?.webContents.send('app:theme-config', r.state);
+  }
+  noteAppearanceChange();
+}
+
+function scheduleThemeReload(): void {
+  if (themeReloadTimer) clearTimeout(themeReloadTimer);
+  themeReloadTimer = setTimeout(() => { themeReloadTimer = null; reloadThemeFile(); }, 150);
+}
+
+/**
+ * 盯着 theme.json：改了实时生效。watch 的是**目录**（编辑器保存常是「写临时文件 + 改名」，盯文件本身会跟丢），
+ * 再加一个 2 秒的 stat 轮询兜底（Windows 上 fs.watch 偶尔丢事件，见 AGENTS.md §5.1）。
+ * 同时起外观同步的定时拉取（每 5 分钟一次，只 GET 一个小文件；没开 S3 / 开关关着就什么都不做）。
+ */
+function startThemeWatch(): void {
+  if (themeWatchStarted) return;
+  themeWatchStarted = true;
+  try { fs.mkdirSync(KIROLEX_HOME, { recursive: true }); } catch { /* 下面 watch 会报 */ }
+  try {
+    const w = fs.watch(KIROLEX_HOME, (_ev, name) => { if (!name || String(name) === THEME_FILE) scheduleThemeReload(); });
+    w.on('error', (err) => logger.warn('theme', `watch ~/.kirolex 出错（还有轮询兜底）：${err?.message || err}`));
+  } catch (err: any) {
+    logger.warn('theme', `watch ~/.kirolex 失败（还有轮询兜底）：${err?.message || err}`);
+  }
+  fs.watchFile(themeFilePath(os.homedir()), { interval: 2000 }, () => scheduleThemeReload());
+  reloadThemeFile();
+  setInterval(() => { void syncAppearanceNow(false); }, 5 * 60_000);
+}
+
+function readUiSettings(): Record<string, unknown> {
+  try {
+    const v = JSON.parse(uiState()['kirolex-settings'] || '{}');
+    return v && typeof v === 'object' && !Array.isArray(v) ? v : {};
+  } catch { return {}; }
+}
+
+function readThemeText(): string | null {
+  try { return fs.readFileSync(themeFilePath(os.homedir()), 'utf-8'); } catch { return null; }
+}
+
+/** 本机此刻的外观载荷：只有同步的那几项设置（makePayload 挑）+ theme.json 原文。 */
+function currentAppearancePayload(): AppearancePayload {
+  return makePayload(readUiSettings(), readThemeText());
+}
+
+function loadAppearanceSnapshot(): AppearanceSnapshot | undefined {
+  if (appearanceSnapshot === null) {
+    try { appearanceSnapshot = parseSnapshot(fs.readFileSync(APPEARANCE_SNAPSHOT_PATH, 'utf-8')); } catch { appearanceSnapshot = undefined; }
+  }
+  return appearanceSnapshot;
+}
+
+function saveAppearanceSnapshot(s: AppearanceSnapshot): void {
+  appearanceSnapshot = s;
+  try {
+    const tmp = `${APPEARANCE_SNAPSHOT_PATH}.${process.pid}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(s));
+    fs.renameSync(tmp, APPEARANCE_SNAPSHOT_PATH);
+  } catch (err: any) {
+    logger.warn('theme', `外观快照存不上：${err?.message || err}`);
+  }
+}
+
+/** 设置保存了 / theme.json 变了：和快照比，变了就记下修改时刻，并在 15 秒后传一次（开了 S3 时）。 */
+function noteAppearanceChange(): void {
+  try {
+    const prev = loadAppearanceSnapshot();
+    /* theme.json 的实际修改时刻：应用关着时编辑、启动才发现的，按文件 mtime 记，不按启动时刻（noteLocalAppearance） */
+    let mtime: number | undefined;
+    try { mtime = Math.round(fs.statSync(themeFilePath(os.homedir())).mtimeMs); } catch { /* 没有 theme.json */ }
+    const r = noteLocalAppearance(prev, currentAppearancePayload(), Date.now(), mtime ?? 0, mtime);
+    if (!r.changed) return;
+    saveAppearanceSnapshot(r.snapshot);
+    if (prev) scheduleAppearancePush();
+  } catch (err: any) {
+    logger.warn('theme', `记外观改动失败：${err?.message || err}`);
+  }
+}
+
+function scheduleAppearancePush(): void {
+  if (!loadSyncConfig().enabled) return;
+  if (appearancePushTimer) clearTimeout(appearancePushTimer);
+  appearancePushTimer = setTimeout(() => { appearancePushTimer = null; void syncAppearanceNow(true); }, 15_000);
+}
+
+/** 只同步外观这一项（本机改了之后 / 定时拉取）。和整轮同步共用一把锁；锁被占着时本机改动稍后再试（拉取就等下一次）。 */
+async function syncAppearanceNow(retryIfBusy: boolean): Promise<void> {
+  if (!loadSyncConfig().enabled) return;
+  if (!appearanceSyncEnabled(readUiSettings())) return;
+  const resolved = await lockThenResolve(syncLock, resolveSyncCredsNow);
+  if (!resolved) { if (retryIfBusy) scheduleAppearancePush(); return; }
+  try {
+    if (resolved.problem || !resolved.creds) return;
+    await syncAppearanceWithBucket(resolved.creds, resolved.cfg.prefix);
+  } finally {
+    if (resolved.creds) syncRunning = false;
+  }
+}
+
+/** 桶里的外观更新：先记快照（之后本机看到的就是「没变」，不会当成本机改动再传回去），再写 theme.json、改设置、推给渲染端。 */
+function applyRemoteAppearance(payload: AppearancePayload, updatedAt: number): void {
+  saveAppearanceSnapshot({ updatedAt, payload });
+  const fileChanged = writeSyncedThemeFile(os.homedir(), payload.themeJson, new Date());
+  setUiStateKey('kirolex-settings', JSON.stringify(applySyncedSettings(readUiSettings(), payload.settings)));
+  mainWindow?.webContents.send('app:appearance-synced', payload.settings);
+  if (fileChanged) scheduleThemeReload();
+}
+
+/**
+ * **外观配置和桶里那份对一下**（`<prefix>/v1/appearance.json`，判据在 `appearanceSync.ts` 的 `planAppearanceSync`）——
+ * 整份按最后一次修改的时刻取新的；只差空白不互传；「在其他电脑上同步外观」关着就不传也不应用。
+ * 载荷只有外观那几项设置 + theme.json 原文：**uiZoom 和 config.json 里的一切都不进来**。返回传了几个文件（0 / 1）。
+ */
+async function syncAppearanceWithBucket(creds: S3Creds, prefix: string | undefined): Promise<number> {
+  const key = keyFor(prefix, APPEARANCE_REL);
+  try {
+    noteAppearanceChange();
+    if (!appearanceSyncEnabled(readUiSettings())) return 0;
+    const themeText = readThemeText();
+    if (themeText && themeText.length > MAX_THEME_JSON_CHARS) {
+      logger.warn('s3', `theme.json 超过 ${MAX_THEME_JSON_CHARS} 字符，外观这一轮不同步`);
+      return 0;
+    }
+    /* 开关在读桶之前、读桶回来之后各看一次（runAppearanceSync）：等网络的这几秒里关掉了就不传也不应用 */
+    const r = await runAppearanceSync({
+      isEnabled: () => appearanceSyncEnabled(readUiSettings()),
+      local: () => loadAppearanceSnapshot(),
+      getRemote: async () => { const raw = await getObjectIfExists(creds, key); return raw ? raw.toString('utf-8') : null; },
+      put: (text) => putObject(creds, key, Buffer.from(text, 'utf-8'), 'application/json'),
+      apply: (payload, updatedAt, from) => {
+        applyRemoteAppearance(payload, updatedAt);
+        logger.info('s3', `外观配置：用了桶里更新的那份（来自 ${from || '另一台电脑'}）`);
+      },
+      machine: machineTag(os.hostname()),
+    });
+    appearanceLast = { at: Date.now() };
+    if (r.uploaded) logger.info('s3', '外观配置：本机的更新，已上传');
+    if (r.plan.action === 'none' && r.plan.reason === 'disabled') logger.info('s3', '外观配置：同步开关关着（等桶的时候被关掉了），这一轮不传也不应用');
+    return r.uploaded ? 1 : 0;
+  } catch (err: any) {
+    appearanceLast = { at: Date.now(), error: String(err?.message || err) };
+    logger.warn('s3', `外观配置同步没成功（这一轮不传）：${err?.message || err}`);
+    return 0;
+  }
+}
+
 /**
  * **`~/.kirolex/agent-profiles/` 和桶里那份对一下**（判据在 `agentProfileSync.ts` 的 `syncProfileFiles`）——
  * 远程机器的 AI 工具配置跨电脑共用，和组合文件一样。两边都改过 → 不覆盖：桶里那份存成 `.conflicts/<时间>/…`。
@@ -7988,6 +8161,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     }
     /* 组合文件（mcp-combos.json）：多台电脑共用一份，两边都改过时合并、不静默覆盖 */
     uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix);
+    /* 外观配置（appearance.json：主题 / 对比度 / 强调色 / 字体 / 字号 + theme.json）：整份谁新用谁，uiZoom 不同步 */
+    uploaded += await syncAppearanceWithBucket(creds!, cfg.prefix);
     /* 远程机器的 AI 工具配置（agent-profiles/）：同样跨电脑共用，两边都改过时留冲突副本、不静默覆盖 */
     uploaded += await syncAgentProfilesWithBucket(creds!, cfg.prefix);
     /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
@@ -15559,6 +15734,44 @@ ${hint}` : ''}` };
       logger.error('open-logs', 'failed to reveal log file', error);
       return { ok: false, error: error?.message || String(error) };
     }
+  });
+
+  /* 外观 → theme.json：读状态（顺带开始盯文件）/ 打开（不存在先生成带注释的示例）/ 恢复默认（改名 .bak-<时间>，不删） */
+  ipcMain.handle('app:theme-config-get', () => {
+    startThemeWatch();
+    return themeFileState;
+  });
+  ipcMain.handle('app:theme-config-open', async () => {
+    try {
+      const r = ensureThemeFile(os.homedir());
+      if (r.created) logger.info('theme', `生成了示例 ${r.path}`);
+      reloadThemeFile();
+      const err = await shell.openPath(r.path);
+      if (!err) return { ok: true, path: r.path, created: r.created };
+      /* .json 没有关联的程序时退回系统自带的文本编辑器 */
+      logger.warn('theme', `用默认程序打开 theme.json 失败（${err}），改用文本编辑器`);
+      if (process.platform === 'win32') spawn('notepad.exe', [r.path], { detached: true, stdio: 'ignore' }).unref();
+      else if (process.platform === 'darwin') spawn('open', ['-t', r.path], { detached: true, stdio: 'ignore' }).unref();
+      else return { ok: false, path: r.path, error: err };
+      return { ok: true, path: r.path, created: r.created };
+    } catch (error: any) {
+      return { ok: false, path: themeFilePath(os.homedir()), error: error?.message || String(error) };
+    }
+  });
+  ipcMain.handle('app:theme-config-reset', () => {
+    try {
+      const backup = resetThemeFile(os.homedir(), new Date());
+      if (backup) logger.info('theme', `theme.json 恢复默认：旧文件改名为 ${backup}`);
+      reloadThemeFile();
+      return { ok: true, backup };
+    } catch (error: any) {
+      return { ok: false, backup: null, error: error?.message || String(error) };
+    }
+  });
+  /* 外观同步那一块显不显示：没配 S3 备份的机器显示「未启用」 */
+  ipcMain.handle('app:appearance-sync-status', () => {
+    const cfg = loadSyncConfig();
+    return { s3Enabled: !!cfg.enabled && !!cfg.bucket, lastAt: appearanceLast.at, lastError: appearanceLast.error };
   });
 
   const WORKSPACE_PREVIEW_MAX_BYTES = 512 * 1024;

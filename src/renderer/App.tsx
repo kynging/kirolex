@@ -53,6 +53,9 @@ import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserVie
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
 import { engineLabel, engineCliName } from './engineLabel';
 import { accentEngine, engineAccentCss } from './engineTheme.ts';
+import { emptyOverrides, normalizeAccent, normalizeContrast, normalizeThemeChoice, sanitizeOverrides, type ThemeOverrides } from '../main/themeConfig.ts';
+import { applySyncedSettings } from '../main/appearanceSync.ts';
+import { applyTheme } from './themeApply.ts';
 import type { QuestionCard } from '../main/elicitation.ts';
 import { EngineStatusPanel } from './components/EngineStatusPanel';
 import { placeholderRows, offloadSummary, offloadFailureText, type OffloadPlaceholderRow, type OffloadedMark } from './offloadView.ts';
@@ -323,6 +326,12 @@ declare global {
       getHomeDir: () => Promise<string>;
       getLogs: (maxLines?: number) => Promise<{ text: string; path: string }>;
       openLogs: () => Promise<{ ok: boolean; error?: string }>;
+      getThemeConfig?: () => Promise<import('../main/themeConfig').ThemeFileState | null>;
+      openThemeConfig?: () => Promise<{ ok: boolean; path: string; created?: boolean; error?: string }>;
+      resetThemeConfig?: () => Promise<{ ok: boolean; backup: string | null; error?: string }>;
+      onThemeConfig?: (cb: (state: import('../main/themeConfig').ThemeFileState) => void) => () => void;
+      appearanceSyncStatus?: () => Promise<{ s3Enabled: boolean; lastAt?: number; lastError?: string }>;
+      onAppearanceSynced?: (cb: (settings: import('../main/appearanceSync').SyncedSettings) => void) => () => void;
       diagSessionView?: (event: string, detail: Record<string, unknown>) => void;
       openExternal: (target: string, sessionId?: string) => Promise<{ ok: boolean; error?: string }>;
       savePasteText: (text: string) => Promise<{ path: string; lines: number; chars: number; preview: string } | null>;
@@ -674,6 +683,14 @@ export interface Settings {
   fontFamily: string;
   /** Font stack for code blocks and file paths. Empty = built-in mono stack. */
   monoFontFamily: string;
+  /** 主题：深色 / 浅色 / 跟随系统（prefers-color-scheme）。缺省 = 深色（和以前一样）。见 `main/themeConfig.ts`。 */
+  theme?: 'dark' | 'light' | 'system';
+  /** 文字对比度：标准 / 高（次要那三档文字提亮或加深）。 */
+  contrast?: 'standard' | 'high';
+  /** 强调色（#rrggbb），空 = 主题默认。只换 --accent / --accent-hover / --accent-soft，不动引擎色和权限风险色。 */
+  accentColor?: string;
+  /** 「在其他电脑上同步外观」（主题 / 对比度 / 强调色 / 字体 / 字号 + theme.json；uiZoom 不同步）。缺省开。 */
+  syncAppearance?: boolean;
   mergeQueuedMessages: boolean;
   /** After a restart, automatically RESEND an unanswered prompt when its chat is opened. */
   recoverInterruptedTurns: boolean;
@@ -713,7 +730,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', mergeQueuedMessages: false, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', syncAppearance: true, mergeQueuedMessages: false, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -908,6 +925,10 @@ function loadSettings(): Settings {
       merged.language = normalizeLang(merged.language);
       // 存量 settings 里没有 uiZoom → 100%；坏值 / 越界的也规整回范围（见 normalizeUiZoom）
       merged.uiZoom = normalizeUiZoom(merged.uiZoom);
+      // 外观三项：坏值退回默认（见 themeConfig.ts）
+      merged.theme = normalizeThemeChoice(merged.theme);
+      merged.contrast = normalizeContrast(merged.contrast);
+      merged.accentColor = normalizeAccent(merged.accentColor);
       return merged;
     }
   } catch {}
@@ -3018,6 +3039,34 @@ const App: React.FC = () => {
     if (settings.monoFontFamily.trim()) root.setProperty('--mono-font', settings.monoFontFamily);
     else root.removeProperty('--mono-font');
   }, [settings.fontFamily, settings.monoFontFamily]);
+
+  /*
+    外观：主题（含跟随系统，系统切换时实时跟随）+ 文字对比度 + 强调色 + ~/.kirolex/theme.json 覆盖（主进程 watch，改了推过来）。
+    优先级：global.css 默认 < 设置 < theme.json（computeThemeVars）。别的电脑同步来的外观设置经 app:appearance-synced 并进来。
+  */
+  const [systemPrefersDark, setSystemPrefersDark] = useState(() => {
+    try { return window.matchMedia('(prefers-color-scheme: dark)').matches; } catch { return true; }
+  });
+  useEffect(() => {
+    let mq: MediaQueryList | null = null;
+    try { mq = window.matchMedia('(prefers-color-scheme: dark)'); } catch { return; }
+    const onChange = (e: MediaQueryListEvent) => setSystemPrefersDark(e.matches);
+    mq.addEventListener('change', onChange);
+    return () => mq?.removeEventListener('change', onChange);
+  }, []);
+  const [themeOverrides, setThemeOverrides] = useState<ThemeOverrides>(() => emptyOverrides());
+  useEffect(() => {
+    const api = (window as any).kiroApi;
+    let alive = true;
+    void api?.getThemeConfig?.().then((st: any) => { if (alive && st) setThemeOverrides(sanitizeOverrides(st.overrides)); }).catch(() => {});
+    const off = api?.onThemeConfig?.((st: any) => setThemeOverrides(sanitizeOverrides(st?.overrides)));
+    const offSync = api?.onAppearanceSynced?.((synced: any) => setSettings((cur) => applySyncedSettings(cur as any, synced) as Settings));
+    return () => { alive = false; try { off?.(); offSync?.(); } catch { /* 卸载 */ } };
+  }, []);
+  const themeVarKeysRef = useRef<string[]>([]);
+  useEffect(() => {
+    themeVarKeysRef.current = applyTheme(document.documentElement, settings, themeOverrides, systemPrefersDark, themeVarKeysRef.current);
+  }, [settings.theme, settings.contrast, settings.accentColor, themeOverrides, systemPrefersDark]);
 
   // Persist from EVERY path, not just the dialog. Split view raises/clears
   // splitGrid internally (entering and leaving split mode), and those changes

@@ -38,7 +38,9 @@ describe('no CSS variable is used without being defined', () => {
 
   test('the four that were missing are defined now, at the right level', () => {
     // 第三级灰和 --text-muted 同一档：它们语义相同，只是历史上有两个名字。
-    assert.match(css, /--text-tertiary:\s*#666/);
+    // 原来是 #666：对 --bg-secondary 只有 2.7:1，提到 #767676（≥ 3:1），仍和 --text-muted 同一档
+    assert.match(css, /--text-tertiary:\s*#767676/);
+    assert.match(css, /--text-muted:\s*#767676/);
     assert.match(css, /--accent-soft:\s*rgba\(124, 111, 224/);
     assert.match(css, /--border-strong:\s*#4a4a4a/);
     assert.match(css, /--text:\s*#e8e8e8/);

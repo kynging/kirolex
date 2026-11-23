@@ -5,7 +5,8 @@
   --bg-hover: #353535;
   --text-primary: #e8e8e8;
   --text-secondary: #a0a0a0;
-  --text-muted: #666;
+  /* #666 → #767676：#666 对 --bg-secondary 只有 2.7:1（「次要文字太暗看不清」），#767676 对三档底色都 ≥ 3:1 */
+  --text-muted: #767676;
   /*
     以下四个**一直在被使用，却从来没有定义过** —— 「文字有的紫色有的灰的，你也没修好」。
 
@@ -19,7 +20,7 @@
     `--accent-soft` 全部用在 focus 光圈和浅底(9 处)，所以是 accent 的低透明度版本；`--border-strong` 是
     比 `--border` 更实的一档；`--text` 只在一处当色块背景用，明显是 `--text-primary` 的手误。
   */
-  --text-tertiary: #666;
+  --text-tertiary: #767676;
   --accent-soft: rgba(124, 111, 224, 0.22);
   --border-strong: #4a4a4a;
   --text: #e8e8e8;
@@ -51,8 +52,33 @@
   --mono-font: 'SF Mono', 'Fira Code', 'JetBrains Mono', ui-monospace, SFMono-Regular, Menlo, monospace;
 }
 
-/* 权限风险色的亮色那组（和 engineTheme 一样先配好，将来有亮色主题时直接生效） */
+/*
+  浅色主题（设置 → 外观 → 主题；App 在 <html> 上挂 data-theme="light"）。覆盖 :root 里全部颜色变量。
+  底色就是 engineTheme.ts 的 THEME_SURFACES.light；正文 / 次要文字对 bg-primary / bg-secondary ≥ 4.5:1，
+  muted / tertiary ≥ 3:1（tests/themeConfig.test.ts 按 WCAG 公式算）。强调色就是 UNIFIED_ACCENT.light。
+  权限风险色那组和 permissionTone.ts 的 TONE_COLORS.light 一致（测试核对），语义不变、只调明度。
+*/
 [data-theme="light"] {
+  color-scheme: light;
+  --bg-primary: #ffffff;
+  --bg-secondary: #f5f5f5;
+  --bg-tertiary: #ebebeb;
+  --bg-hover: #e4e4e4;
+  --text-primary: #1f1f1f;
+  --text-secondary: #555555;
+  --text-muted: #6e6e6e;
+  --text-tertiary: #6e6e6e;
+  --accent-soft: rgba(107, 95, 212, 0.22);
+  --border-strong: #b8b8b8;
+  --text: #1f1f1f;
+  --border: #d6d6d6;
+  --accent: #6b5fd4;
+  --accent-hover: #5a4fc0;
+  --success: #2e7d32;
+  --error: #c62828;
+  --warning: #a35a00;
+  --info: #1565c0;
+  --input-bg: #f0f0f0;
   --perm-danger: #a51d17;
   --perm-danger-border: #c62828;
   --perm-danger-bg: rgba(198, 40, 40, 0.12);
@@ -10174,3 +10200,199 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
   color: var(--text-secondary);
   font-size: 11px;
 }
+
+/* 设置 → 外观：强调色色块 / 取色器、theme.json 的提示（ThemeSettings.tsx） */
+.theme-accent-row { gap: 8px; flex-wrap: wrap; }
+.theme-accent-swatch {
+  width: 22px;
+  height: 22px;
+  border-radius: 50%;
+  border: 2px solid var(--border);
+  cursor: pointer;
+  padding: 0;
+}
+.theme-accent-swatch:hover { border-color: var(--text-secondary); }
+.theme-accent-swatch.on { border-color: var(--text-primary); box-shadow: 0 0 0 2px var(--accent-soft); }
+.theme-accent-picker {
+  width: 30px;
+  height: 26px;
+  padding: 0 2px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--bg-tertiary);
+  cursor: pointer;
+}
+.theme-file-note { margin-top: 6px; }
+.theme-file-error {
+  margin-top: 6px;
+  font-size: 12px;
+  color: var(--error);
+  line-height: 1.4;
+}
+.theme-file-ignored {
+  margin: 6px 0 0 18px;
+  font-size: 12px;
+  color: var(--warning);
+  line-height: 1.5;
+}
+
+/*
+  ── 浅色主题下写死的颜色 ──
+  深色界面里有一批文字色直接写成了浅色值（状态色、徽标、文件查看器的语法色、设置里的说明文字……），
+  落在浅色底上看不清。逐条按「同色相、只降亮度，直到对 #ebebeb（bg-tertiary）≥ 4.5:1」换成深一档的值；
+  白字（都在强调色 / 彩色按钮上）、自己带深色底的那几条（.fs-problems、.reg-note、流程图端口……）不动。
+  用 :where() 包住主题选择器：特异度和原规则一样，放在文件末尾靠顺序胜出，
+  同一元素更具体的 :hover / .active 规则（例如强调色底上的白字）照样赢。
+  另外几处：深色代码块（#0d1117 底）在浅色下没有自己的字色会继承到深色正文，给它固定浅色字；
+  .kx-toast 用的 --bg-elevated 没有定义、会退回深色底，浅色下改用 --bg-secondary；
+  rgba(255,255,255,x) 的浅色叠层 / 细边在白底上看不见，换成同透明度的黑。
+*/
+:where([data-theme="light"]) .user-code-body,
+:where([data-theme="light"]) .message.assistant .message-content pre,
+:where([data-theme="light"]) .skill-source pre { color: #e6edf3; }
+:where([data-theme="light"]) .kx-toast { background: var(--bg-secondary); }
+:where([data-theme="light"]) .fg-dep-role.read,
+:where([data-theme="light"]) .fg-panel-section-title.input { color: #0062e3; }
+:where([data-theme="light"]) .tool-running-indicator { color: #0065d7; }
+:where([data-theme="light"]) .msg-variant-badge.tool,
+:where([data-theme="light"]) .md-link,
+:where([data-theme="light"]) .md-file-link,
+:where([data-theme="light"]) .files-item-kind,
+:where([data-theme="light"]) .files-item-path,
+:where([data-theme="light"]) .skill-badge.fan,
+:where([data-theme="light"]) .skill-node-status.status-running,
+:where([data-theme="light"]) .skill-node-status.status-verifying { color: #0067cd; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-attr,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-attribute,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-selector-attr,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-variable,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-template-variable,
+:where([data-theme="light"]) .json-code-editor-highlight .hljs-attr { color: #006faa; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-type,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-built_in,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-class .hljs-title { color: #006fab; }
+:where([data-theme="light"]) .skill-badge.verify,
+:where([data-theme="light"]) .skill-node-status.status-done { color: #11791a; }
+:where([data-theme="light"]) .workspace-viewer-path { color: #1d6bb8; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-title,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-section,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-name { color: #1e7463; }
+:where([data-theme="light"]) .message.user .message-content p.steer-paragraph .steer-side-label,
+:where([data-theme="light"]) .message.user .message-actions .steer-tag,
+:where([data-theme="light"]) .steer-badge.pending { color: #1e776b; }
+:where([data-theme="light"]) .fg-panel-section-title.output,
+:where([data-theme="light"]) .rv-result.done .rv-result-status,
+:where([data-theme="light"]) .rv-result-file-link > span,
+:where([data-theme="light"]) .fg-need.filled,
+:where([data-theme="light"]) .fg-tool-line.verdict,
+:where([data-theme="light"]) .fg-task.completed .fg-task-mark { color: #207934; }
+:where([data-theme="light"]) .json-code-editor-highlight .hljs-literal,
+:where([data-theme="light"]) .json-code-editor-highlight .hljs-keyword { color: #216caa; }
+:where([data-theme="light"]) .plan-item.status-completed .plan-item-icon,
+:where([data-theme="light"]) .files-item-stat .stat-add,
+:where([data-theme="light"]) .diff-line.diff-add,
+:where([data-theme="light"]) .files-item-new { color: #2f7655; }
+:where([data-theme="light"]) .session-from-chip { color: #3369b4; }
+:where([data-theme="light"]) .fs-ok,
+:where([data-theme="light"]) .sb-status.confirmed,
+:where([data-theme="light"]) .rv-step.done .rv-step-meta { color: #337644; }
+:where([data-theme="light"]) .fg-art.file,
+:where([data-theme="light"]) .fg-dep.file,
+:where([data-theme="light"]) .fg-art-warn.file,
+:where([data-theme="light"]) .rv-result-file-link,
+:where([data-theme="light"]) .fg-node.done .fg-name { color: #367742; }
+:where([data-theme="light"]) .sr-origin.kirolex,
+:where([data-theme="light"]) .fg-dep.mcp,
+:where([data-theme="light"]) .fg-art-warn.ext-in { color: #3968b6; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-number,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-bullet,
+:where([data-theme="light"]) .json-code-editor-highlight .hljs-number { color: #4f723d; }
+:where([data-theme="light"]) .fg-panel-section-title.parameters { color: #5e4aff; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-comment,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-quote,
+:where([data-theme="light"]) .json-code-editor-highlight .hljs-comment { color: #606b77; }
+:where([data-theme="light"]) .pw-arrow.split .pw-arrow-head,
+:where([data-theme="light"]) .pw-arrow.join .pw-arrow-head { color: #6454e2; }
+:where([data-theme="light"]) .fg-trigger { color: #6646ff; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-meta,
+:where([data-theme="light"]) .settings-hint,
+:where([data-theme="light"]) .remote-key-path.empty { color: #686868; }
+:where([data-theme="light"]) .remote-field-label { color: #6a6a6a; }
+:where([data-theme="light"]) .control-tag { color: #826517; }
+:where([data-theme="light"]) .sr-origin.kiro,
+:where([data-theme="light"]) .fg-art.ext,
+:where([data-theme="light"]) .fg-meta.warn,
+:where([data-theme="light"]) .fs-cons.warn,
+:where([data-theme="light"]) .fg-dep.ext,
+:where([data-theme="light"]) .fg-dep.external { color: #836522; }
+:where([data-theme="light"]) .fg-run-launch > span.blocked,
+:where([data-theme="light"]) .fs-plain.want,
+:where([data-theme="light"]) .fg-read.warn,
+:where([data-theme="light"]) .rv-source-warning,
+:where([data-theme="light"]) .rv-result-action.skip:hover,
+:where([data-theme="light"]) .sb-refusal,
+:where([data-theme="light"]) .rv-stuck,
+:where([data-theme="light"]) .fg-node.waiting .fg-name,
+:where([data-theme="light"]) .fg-gate.waiting .fg-gate-name { color: #856417; }
+:where([data-theme="light"]) .skill-badge.unverified,
+:where([data-theme="light"]) .skill-node-status.status-awaiting-approval,
+:where([data-theme="light"]) .skill-detail-warn,
+:where([data-theme="light"]) .skill-badge.pause,
+:where([data-theme="light"]) .skill-rules-note { color: #886103; }
+:where([data-theme="light"]) .rv-cost-list li.heavy .rv-cost-num,
+:where([data-theme="light"]) .fg-cost.heavy { color: #886110; }
+:where([data-theme="light"]) .composer-combo-select[data-missing] { color: #8a6215; }
+:where([data-theme="light"]) .loop-dialog-level.level-0 { color: #8b5f1a; }
+:where([data-theme="light"]) .fg-ctx.mid,
+:where([data-theme="light"]) .rv-project-stage.waiting .rv-stage-status { color: #8c6017; }
+:where([data-theme="light"]) .msg-variant-badge.thinking { color: #90601f; }
+:where([data-theme="light"]) .msg-variant-badge.subagent,
+:where([data-theme="light"]) .skill-badge.produces { color: #931afe; }
+:where([data-theme="light"]) .rv-line-no { color: #955c15; }
+:where([data-theme="light"]) .remote-badge-ssm { color: #995c00; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-keyword,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-selector-tag,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-literal,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-doctag { color: #9f4698; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-string,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-regexp,
+:where([data-theme="light"]) .workspace-viewer-content .hljs-addition,
+:where([data-theme="light"]) .json-code-editor-highlight .hljs-string { color: #a25434; }
+:where([data-theme="light"]) .plan-item-pri.pri-high { color: #ae4c05; }
+:where([data-theme="light"]) .sb-config-why,
+:where([data-theme="light"]) .rv-add-error { color: #b6431f; }
+:where([data-theme="light"]) .rv-result-error { color: #cb261e; }
+:where([data-theme="light"]) .skill-dialog-errors,
+:where([data-theme="light"]) .skill-detail-error { color: #cb2700; }
+:where([data-theme="light"]) .workspace-viewer-content .hljs-deletion { color: #cb2706; }
+:where([data-theme="light"]) .fs-in-warn,
+:where([data-theme="light"]) .fg-art.lost,
+:where([data-theme="light"]) .fg-node.failed .fg-name { color: #cd2020; }
+:where([data-theme="light"]) .loop-dialog-problems { color: #ce222f; }
+:where([data-theme="light"]) .settings-warn { color: #cf1b1b; }
+:where([data-theme="light"]) .files-item-stat .stat-del,
+:where([data-theme="light"]) .chat-main[data-engine] .files-item-row > .stat-del,
+:where([data-theme="light"]) .tools-failed-count,
+:where([data-theme="light"]) .tool-row[data-state="failed"] > .files-item-row .tool-row-title { color: #cf1e14; }
+:where([data-theme="light"]) .rv-results-attention,
+:where([data-theme="light"]) .rv-result.failed .rv-result-status,
+:where([data-theme="light"]) .rv-result-why-title,
+:where([data-theme="light"]) .rv-reset:hover:not(:disabled) { color: #d11812; }
+:where([data-theme="light"]) .skill-badge.write,
+:where([data-theme="light"]) .skill-node-status.status-failed,
+:where([data-theme="light"]) .skill-node-status.status-rejected { color: #d40400; }
+:where([data-theme="light"]) .sr-attach-x:hover,
+:where([data-theme="light"]) .fg-dep-role.write,
+:where([data-theme="light"]) .rv-stage-remove:hover,
+:where([data-theme="light"]) .rv-remove-flow button.rv-remove-go,
+:where([data-theme="light"]) .rv-reset-run button.rv-reset-go,
+:where([data-theme="light"]) .context-menu-item .context-menu-x:hover { color: #d50d09; }
+:where([data-theme="light"]) .mcp-combos-unavailable-row button { border: 1px solid rgba(0, 0, 0,0.28); }
+:where([data-theme="light"]) .startup-banner-btn:hover { background: rgba(0, 0, 0, 0.06); }
+:where([data-theme="light"]) .schedule-banner-pause:hover,
+:where([data-theme="light"]) .schedule-banner-extend:hover,
+:where([data-theme="light"]) .schedule-banner-cancel:hover { background: rgba(0, 0, 0, 0.06); }
+:where([data-theme="light"]) .fg-phase { background: rgba(0, 0, 0,0.02); }
+:where([data-theme="light"]) .fg-hand-row { border: 1px solid var(--border-subtle, rgba(0, 0, 0,.09)); }
+:where([data-theme="light"]) .fg-hand-body { border-top: 1px solid rgba(0, 0, 0,.06); }
+:where([data-theme="light"]) .fg-tool-line code { background: rgba(0, 0, 0,.06); }
