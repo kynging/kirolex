@@ -957,24 +957,6 @@ button, input, select, textarea {
   color: var(--text-primary);
 }
 
-/* "New chat in project" child row */
-.project-newchat {
-  display: flex;
-  align-items: center;
-  gap: 8px;
-  padding: 7px 10px;
-  border-radius: 6px;
-  cursor: pointer;
-  font-size: 13px;
-  color: var(--text-muted);
-  transition: background 0.15s, color 0.15s;
-}
-
-.project-newchat:hover {
-  background: var(--bg-hover);
-  color: var(--text-secondary);
-}
-
 .project-icon {
   font-size: 10px;
   flex-shrink: 0;
