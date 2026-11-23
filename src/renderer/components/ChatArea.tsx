@@ -4793,7 +4793,6 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     } catch {}
     return 140;
   });
-  const [inputCollapsed, setInputCollapsed] = useState(false);
   const chatMessagesRef = useRef<HTMLDivElement>(null);
 
   /*
@@ -5991,41 +5990,32 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
 
       {!readOnly && (
       <div className="input-resize-area">
-        {!inputCollapsed && (
-          <div
-            className="input-resize-handle"
-            onMouseDown={handleInputResizeStart}
-            onDoubleClick={() => setInputHeight(140)}
-            onKeyDown={(event) => {
-              if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
-              event.preventDefault();
-              const delta = event.key === 'ArrowUp' ? 16 : -16;
-              const maxHeight = Math.max(180, Math.floor(window.innerHeight * 0.7));
-              setInputHeight((height) => Math.max(96, Math.min(maxHeight, height + delta)));
-            }}
-            role="separator"
-            aria-label={t('Resize message composer')}
-            aria-orientation="horizontal"
-            aria-valuemin={96}
-            aria-valuemax={Math.max(180, Math.floor(window.innerHeight * 0.7))}
-            aria-valuenow={inputHeight}
-            tabIndex={0}
-            title={t('Drag upward to enlarge · Double-click to reset')}
-          >
-            <span className="input-resize-grip" />
-          </div>
-        )}
-        <button
-          className="input-collapse-btn"
-          onClick={() => setInputCollapsed(!inputCollapsed)}
-          title={inputCollapsed ? t('Show input') : t('Hide input')}
+        <div
+          className="input-resize-handle"
+          onMouseDown={handleInputResizeStart}
+          onDoubleClick={() => setInputHeight(140)}
+          onKeyDown={(event) => {
+            if (event.key !== 'ArrowUp' && event.key !== 'ArrowDown') return;
+            event.preventDefault();
+            const delta = event.key === 'ArrowUp' ? 16 : -16;
+            const maxHeight = Math.max(180, Math.floor(window.innerHeight * 0.7));
+            setInputHeight((height) => Math.max(96, Math.min(maxHeight, height + delta)));
+          }}
+          role="separator"
+          aria-label={t('Resize message composer')}
+          aria-orientation="horizontal"
+          aria-valuemin={96}
+          aria-valuemax={Math.max(180, Math.floor(window.innerHeight * 0.7))}
+          aria-valuenow={inputHeight}
+          tabIndex={0}
+          title={t('Drag upward to enlarge · Double-click to reset')}
         >
-          {inputCollapsed ? '▲' : '▼'}
-        </button>
+          <span className="input-resize-grip" />
+        </div>
       </div>
       )}
 
-      {!readOnly && !inputCollapsed && (
+      {!readOnly && (
         <div
           className="chat-input-area"
           // minHeight, NOT height: in a narrow pane the belowbar wraps to two

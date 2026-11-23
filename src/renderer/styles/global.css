@@ -2915,37 +2915,6 @@ button, input, select, textarea {
   box-shadow: 0 0 0 3px var(--accent-soft);
 }
 
-.input-collapse-btn {
-  position: absolute;
-  right: 10px;
-  top: 1px;
-  width: 28px;
-  height: 12px;
-  background: var(--bg-tertiary);
-  border: 1px solid var(--border);
-  border-radius: 3px 3px 0 0;
-  color: var(--text-muted);
-  font-size: 7px;
-  cursor: pointer;
-  display: flex;
-  align-items: center;
-  justify-content: center;
-  z-index: 11;
-  opacity: 0;
-  transition: opacity 0.2s;
-  padding: 0;
-}
-
-.input-resize-area:hover .input-collapse-btn {
-  opacity: 1;
-}
-
-.input-collapse-btn:hover {
-  background: var(--bg-hover);
-  color: var(--text-primary);
-  border-color: var(--accent);
-}
-
 .attached-files-bar {
   padding: 0 48px;
   margin-bottom: -7px;

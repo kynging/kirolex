@@ -264,8 +264,6 @@ export const ZH_CHAT: Record<string, string> = {
   "Connecting...": "连接中…",
   "Resize message composer": "调整输入框高度",
   "Drag upward to enlarge · Double-click to reset": "向上拖动放大 · 双击还原",
-  "Show input": "显示输入框",
-  "Hide input": "隐藏输入框",
   "📥 This chat is archived — unarchive it to continue chatting.": "📥 这条会话已归档 —— 取消归档后才能继续聊。",
   "♻️ Unarchive": "♻️ 取消归档",
   "Agent (switching restarts this chat's executor with the selected Kiro agent)": "Agent（切换后会用选中的 Kiro agent 重启这条会话的执行器）",
