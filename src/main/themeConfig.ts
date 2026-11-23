@@ -179,6 +179,240 @@ export function accentVars(accent: string): Record<'--accent' | '--accent-hover'
   return { '--accent': hex, '--accent-hover': hover, '--accent-soft': `rgba(${r}, ${g}, ${b}, 0.22)` };
 }
 
+// ── 主题预设 ─────────────────────────────────────────────────
+
+/**
+ * **可以切换的主题** ——「应该给 KiroLex 设计一些可以切换的 theme」。
+ *
+ * 一个主题 = **一整套颜色变量**（`THEME_COLOR_VARS` 的全部取值），不是只换强调色。`base` 决定 `<html data-theme>`：
+ * 浅色底的主题挂 `light`，于是 global.css 里浅色那批写死颜色的修正、引擎强调色的浅色那组都跟着生效。
+ *
+ * 每个内置主题都要满足（`tests/themePresets.test.ts` 逐个算）：
+ *   · --text-primary / --text-secondary 对 --bg-primary / --bg-secondary ≥ 4.5:1，--text-muted / --text-tertiary ≥ 3:1；
+ *   · 引擎色（engineTheme.ts，Kiro 紫 / Claude 橙 / Codex 青绿）和权限风险色（红 / 琥珀 / 绿）语义不变：
+ *     权限色就用同 base 的那一组（`PERM_VARS`，只按明暗分），引擎色同样按 base 取 —— 测试核对它们落在这些底色上仍然可读；
+ *   · 强调色底上画白字（按钮）≥ 3:1。
+ * 配色参考各主题公开色板（Nord、Solarized、GitHub Primer、Dracula、One Dark），为了过上面的对比度，
+ * 次要文字 / 强调色等个别值在原色相上调了明度。
+ */
+export interface ThemePreset {
+  id: string;
+  name: { zh: string; en: string };
+  base: EffectiveTheme;
+  vars: Record<ThemeColorVar, string>;
+  /** 自定义主题（来自 theme.json 的 "themes"）。 */
+  custom?: boolean;
+}
+
+/** 权限风险色：和 global.css / permissionTone.ts 的 TONE_COLORS 一致（测试核对），只按明暗分两组。 */
+export const PERM_VARS: Record<EffectiveTheme, Pick<Record<ThemeColorVar, string>,
+  '--perm-danger' | '--perm-danger-border' | '--perm-danger-bg' | '--perm-caution' | '--perm-caution-border' | '--perm-caution-bg'
+  | '--perm-safe' | '--perm-safe-border' | '--perm-safe-bg' | '--perm-neutral'>> = {
+  dark: {
+    '--perm-danger': '#ff8f8a', '--perm-danger-border': '#ef5350', '--perm-danger-bg': 'rgba(239, 83, 80, 0.12)',
+    '--perm-caution': '#e8b85a', '--perm-caution-border': '#d9a441', '--perm-caution-bg': 'rgba(217, 164, 65, 0.12)',
+    '--perm-safe': '#8fd16a', '--perm-safe-border': '#5cb85c', '--perm-safe-bg': 'rgba(92, 184, 92, 0.12)',
+    '--perm-neutral': '#a8a8a8',
+  },
+  light: {
+    '--perm-danger': '#a51d17', '--perm-danger-border': '#c62828', '--perm-danger-bg': 'rgba(198, 40, 40, 0.12)',
+    '--perm-caution': '#7a5000', '--perm-caution-border': '#a06a00', '--perm-caution-bg': 'rgba(160, 106, 0, 0.12)',
+    '--perm-safe': '#2b6312', '--perm-safe-border': '#4a8a1c', '--perm-safe-bg': 'rgba(74, 138, 28, 0.12)',
+    '--perm-neutral': '#555555',
+  },
+};
+
+interface Palette {
+  /** bg-primary / bg-secondary / bg-tertiary / bg-hover / input-bg */
+  bg: [string, string, string, string, string];
+  /** text-primary / text-secondary / text-muted（text-tertiary 和 muted 同一档） */
+  text: [string, string, string];
+  accent: string;
+  /** 不给就由 accent 派生（`accentVars`） */
+  accentHover?: string;
+  /** border / border-strong */
+  border: [string, string];
+  success: string; error: string; warning: string; info: string;
+}
+
+function presetVars(base: EffectiveTheme, p: Palette): Record<ThemeColorVar, string> {
+  const acc = accentVars(p.accent)!;
+  return {
+    '--bg-primary': p.bg[0], '--bg-secondary': p.bg[1], '--bg-tertiary': p.bg[2], '--bg-hover': p.bg[3], '--input-bg': p.bg[4],
+    '--text-primary': p.text[0], '--text-secondary': p.text[1], '--text-muted': p.text[2], '--text-tertiary': p.text[2], '--text': p.text[0],
+    '--accent': acc['--accent'], '--accent-hover': p.accentHover || acc['--accent-hover'], '--accent-soft': acc['--accent-soft'],
+    '--border': p.border[0], '--border-strong': p.border[1],
+    '--success': p.success, '--error': p.error, '--warning': p.warning, '--info': p.info,
+    ...PERM_VARS[base],
+  };
+}
+
+const preset = (id: string, zh: string, en: string, base: EffectiveTheme, p: Palette): ThemePreset => ({ id, name: { zh, en }, base, vars: presetVars(base, p) });
+
+export const DEFAULT_THEME_ID: Record<EffectiveTheme, string> = { dark: 'kirolex-dark', light: 'kirolex-light' };
+
+/** 内置主题。前两个就是 global.css `:root` / `[data-theme="light"]` 里的值（测试核对），选它们时界面和以前完全一样。 */
+export const THEME_PRESETS: ThemePreset[] = [
+  preset('kirolex-dark', 'KiroLex 深色', 'KiroLex Dark', 'dark', {
+    bg: ['#1a1a1a', '#242424', '#2d2d2d', '#353535', '#2a2a2a'], text: ['#e8e8e8', '#a0a0a0', '#767676'],
+    accent: '#7c6fe0', accentHover: '#6b5fd4', border: ['#333333', '#4a4a4a'],
+    success: '#4caf50', error: '#ef5350', warning: '#ff9800', info: '#4f9fe0',
+  }),
+  preset('kirolex-light', 'KiroLex 浅色', 'KiroLex Light', 'light', {
+    bg: ['#ffffff', '#f5f5f5', '#ebebeb', '#e4e4e4', '#f0f0f0'], text: ['#1f1f1f', '#555555', '#6e6e6e'],
+    accent: '#6b5fd4', accentHover: '#5a4fc0', border: ['#d6d6d6', '#b8b8b8'],
+    success: '#2e7d32', error: '#c62828', warning: '#a35a00', info: '#1565c0',
+  }),
+  /* Nord：Polar Night 底（bg-secondary 取 nord0 / nord1 之间，nord1 上 Claude 橙文字只有 4.4:1） + Snow Storm 字 + Frost 强调（nord10 #5e81ac，白字才看得清）；muted 在 nord4 / nord3 之间取 */
+  preset('nord', 'Nord', 'Nord', 'dark', {
+    bg: ['#2e3440', '#353c4a', '#3b4252', '#434c5e', '#323946'], text: ['#eceff4', '#d8dee9', '#a3adbf'],
+    accent: '#5e81ac', border: ['#434c5e', '#4c566a'],
+    success: '#a3be8c', error: '#e57f88', warning: '#ebcb8b', info: '#88c0d0',
+  }),
+  /* Solarized Dark：base03 / base02 底，base2 / base1 字；base01 太暗，muted 提亮到 #7f9399 */
+  preset('solarized-dark', 'Solarized 深色', 'Solarized Dark', 'dark', {
+    bg: ['#002b36', '#073642', '#0d404d', '#124a58', '#04313c'], text: ['#eee8d5', '#a8b4b4', '#7f9399'],
+    accent: '#2075c7', border: ['#1a4c58', '#2b5f6b'],
+    success: '#9bb300', error: '#f2615e', warning: '#d6a400', info: '#2aa198',
+  }),
+  /* Solarized Light：base3 / base2 底，base02 / base01 字 */
+  preset('solarized-light', 'Solarized 浅色', 'Solarized Light', 'light', {
+    bg: ['#fdf6e3', '#eee8d5', '#e6dfc6', '#ddd5bb', '#f5eedb'], text: ['#073642', '#4f6268', '#657b83'],
+    accent: '#1f6fb5', border: ['#d9d2bb', '#bfb79f'],
+    success: '#566e00', error: '#c1302c', warning: '#7f5f00', info: '#1d7770',
+  }),
+  /* GitHub Light（Primer）：canvas default / subtle，fg default / muted，accent.fg */
+  preset('github-light', 'GitHub 浅色', 'GitHub Light', 'light', {
+    bg: ['#ffffff', '#f6f8fa', '#eaeef2', '#e3e8ee', '#f6f8fa'], text: ['#1f2328', '#59636e', '#6e7781'],
+    accent: '#0969da', border: ['#d0d7de', '#afb8c1'],
+    success: '#1a7f37', error: '#cf222e', warning: '#9a6700', info: '#0969da',
+  }),
+  /* Dracula：Background / Current Line 底，Foreground 字；Comment #6272a4 太暗，次要文字往 Foreground 提；强调色取紫但压暗到白字可读 */
+  preset('dracula', 'Dracula', 'Dracula', 'dark', {
+    bg: ['#282a36', '#21222c', '#343746', '#44475a', '#2b2d3a'], text: ['#f8f8f2', '#c3c6d9', '#8c95bb'],
+    accent: '#8457e8', border: ['#3a3d4f', '#4f5370'],
+    success: '#50fa7b', error: '#ff5555', warning: '#ffb86c', info: '#8be9fd',
+  }),
+  /* One Dark（Atom）：#282c34 底，#abb2bf 字；强调色取蓝但压暗到白字可读 */
+  preset('one-dark', 'One Dark', 'One Dark', 'dark', {
+    bg: ['#282c34', '#21252b', '#2c313a', '#3a3f4b', '#1e2227'], text: ['#dcdfe4', '#abb2bf', '#7f8896'],
+    accent: '#3d6fd1', border: ['#3a3f4b', '#4b5263'],
+    success: '#98c379', error: '#e06c75', warning: '#e5c07b', info: '#61afef',
+  }),
+  /* 高对比深色：纯黑底、纯白字，边框也更实 */
+  preset('high-contrast-dark', '高对比深色', 'High Contrast Dark', 'dark', {
+    bg: ['#000000', '#0d0d0d', '#1a1a1a', '#262626', '#121212'], text: ['#ffffff', '#e6e6e6', '#b3b3b3'],
+    accent: '#6b5fd4', border: ['#8a8a8a', '#c4c4c4'],
+    success: '#6fe07a', error: '#ff7b72', warning: '#ffc14d', info: '#6cb6ff',
+  }),
+];
+
+const BUILTIN_BY_ID = new Map(THEME_PRESETS.map((t) => [t.id, t]));
+export function builtinTheme(id: string): ThemePreset | undefined {
+  return BUILTIN_BY_ID.get(id);
+}
+
+/** 主题 id：小写字母 / 数字开头，只有小写字母、数字、- 和 _，最长 40。 */
+export const THEME_ID_RE = /^[a-z0-9][a-z0-9_-]{0,39}$/;
+export function normalizeThemeId(v: unknown, base: EffectiveTheme): string {
+  return typeof v === 'string' && THEME_ID_RE.test(v) ? v : DEFAULT_THEME_ID[base];
+}
+
+/** theme.json 里 "themes" 的一条（校验过、还没展开 extends）。 */
+export interface CustomThemeDef {
+  id: string;
+  name: string;
+  base?: EffectiveTheme;
+  extends?: string;
+  vars: Partial<Record<ThemeColorVar, string>>;
+}
+
+/**
+ * 把自定义主题展开成完整主题：先找 `extends`（内置或另一个自定义，可以一层层继承；没写 = 同 base 的 KiroLex 默认），
+ * 再盖上自己的 `vars`。`base` 没写就跟着被继承的那个。继承链断了（指向不存在的）或成环 → 这一条不要（`problems` 里说）。
+ * 和内置 id 重名的在校验时就挡掉了。
+ */
+export function resolveCustomThemes(defs: CustomThemeDef[]): { themes: ThemePreset[]; problems: Array<{ id: string; reason: 'unknown-extends' | 'extends-cycle' }> } {
+  const byId = new Map(defs.map((d) => [d.id, d]));
+  const done = new Map<string, ThemePreset>();
+  const problems: Array<{ id: string; reason: 'unknown-extends' | 'extends-cycle' }> = [];
+  const resolve = (id: string, seen: Set<string>): ThemePreset | null => {
+    const b = builtinTheme(id);
+    if (b) return b;
+    if (done.has(id)) return done.get(id)!;
+    const d = byId.get(id);
+    if (!d) return null;
+    if (seen.has(id)) return null;
+    seen.add(id);
+    const parentId = d.extends || DEFAULT_THEME_ID[d.base || 'dark'];
+    const parent = resolve(parentId, seen);
+    if (!parent) return null;
+    const base = d.base || parent.base;
+    const t: ThemePreset = { id: d.id, name: { zh: d.name, en: d.name }, base, vars: { ...parent.vars, ...d.vars }, custom: true };
+    done.set(id, t);
+    return t;
+  };
+  for (const d of defs) {
+    const seen = new Set<string>();
+    if (resolve(d.id, seen)) continue;
+    const parentId = d.extends || DEFAULT_THEME_ID[d.base || 'dark'];
+    problems.push({ id: d.id, reason: builtinTheme(parentId) || byId.has(parentId) ? 'extends-cycle' : 'unknown-extends' });
+  }
+  return { themes: defs.map((d) => done.get(d.id)).filter((t): t is ThemePreset => !!t), problems };
+}
+
+/** 下拉里能选的全部主题：内置在前，自定义在后。 */
+export function allThemes(defs: CustomThemeDef[]): ThemePreset[] {
+  return [...THEME_PRESETS, ...resolveCustomThemes(defs).themes];
+}
+
+/**
+ * 现在用哪个主题：模式（深 / 浅 / 跟随系统）选出用哪一格（「深色时用」/「浅色时用」），再按 id 找。
+ * 找不到（另一台电脑同步来的自定义主题，这台的 theme.json 里没有）→ 回退到**这一格**的 KiroLex 默认，`missing` 带上原 id 给设置页提示。
+ * `preview`：设置页下拉里悬停 / 选中时临时预览的 id，优先于设置。
+ */
+export function pickTheme(input: {
+  mode: ThemeChoice;
+  systemPrefersDark: boolean;
+  themeDark?: unknown;
+  themeLight?: unknown;
+  preview?: string | null;
+  custom: CustomThemeDef[];
+}): { theme: ThemePreset; slot: EffectiveTheme; missing?: string } {
+  const slot = effectiveTheme(input.mode, input.systemPrefersDark);
+  const list = allThemes(input.custom);
+  const find = (id: string) => list.find((t) => t.id === id);
+  if (input.preview) {
+    const p = find(input.preview);
+    if (p) return { theme: p, slot };
+  }
+  const id = normalizeThemeId(slot === 'dark' ? input.themeDark : input.themeLight, slot);
+  const t = find(id);
+  if (t) return { theme: t, slot };
+  return { theme: builtinTheme(DEFAULT_THEME_ID[slot])!, slot, missing: id };
+}
+
+/** 「高」对比度：KiroLex 自己的两套用原来那组值；别的主题把次要文字往正文色靠（同色相，不换成灰）。 */
+export function highContrastVars(t: ThemePreset): Partial<Record<ThemeColorVar, string>> {
+  if (t.id === DEFAULT_THEME_ID.dark || t.id === DEFAULT_THEME_ID.light) return CONTRAST_HIGH[t.base];
+  const sec = mixHex(t.vars['--text-secondary'], t.vars['--text-primary'], 0.5);
+  const muted = mixHex(t.vars['--text-muted'], t.vars['--text-primary'], 0.45);
+  if (!sec || !muted) return CONTRAST_HIGH[t.base];
+  return { '--text-secondary': sec, '--text-muted': muted, '--text-tertiary': muted };
+}
+
+/** a 和 b 按 t（0 = a，1 = b）混色；只认 hex。 */
+export function mixHex(a: string, b: string, t: number): string | null {
+  const x = parseHex(a), y = parseHex(b);
+  if (!x || !y) return null;
+  return toHex(x[0] + (y[0] - x[0]) * t, x[1] + (y[1] - x[1]) * t, x[2] + (y[2] - x[2]) * t);
+}
+
+/** 下拉每一项的色块预览：背景、正文、次要文字、强调色。 */
+export function themeSwatches(t: ThemePreset): string[] {
+  return [t.vars['--bg-primary'], t.vars['--text-primary'], t.vars['--text-secondary'], t.vars['--accent']];
+}
+
 // ── theme.json ─────────────────────────────────────────────
 
 export type ThemeSection = 'dark' | 'light' | 'common';
@@ -195,13 +429,15 @@ export interface IgnoredItem {
   n: number;
   /** 这一项在文件里的位置，例如 `dark."--text-muted"` / `"fonts"`。 */
   where: string;
-  reason: 'unknown-var' | 'bad-value' | 'unknown-section' | 'bad-section' | 'bad-version';
+  reason: 'unknown-var' | 'bad-value' | 'unknown-section' | 'bad-section' | 'bad-version'
+    /* "themes" 里的自定义主题 */
+    | 'bad-theme' | 'bad-theme-id' | 'builtin-theme-id' | 'bad-theme-name' | 'bad-base' | 'unknown-theme-key' | 'unknown-extends' | 'extends-cycle';
   /** 原值（截短），给人看。 */
   value?: string;
 }
 
 export type ThemeParse =
-  | { ok: true; overrides: ThemeOverrides; ignored: IgnoredItem[] }
+  | { ok: true; overrides: ThemeOverrides; themes: CustomThemeDef[]; ignored: IgnoredItem[] }
   | { ok: false; error: string };
 
 /** 去掉 `//` 行注释和 `/* *\/` 块注释（字符串里的不动），让 JSON.parse 能读带说明的示例文件。 */
@@ -261,11 +497,52 @@ export function parseThemeFile(text: string): ThemeParse {
   if (!isObj(raw)) return { ok: false, error: 'top level must be an object { ... }' };
   const overrides = emptyOverrides();
   const ignored: IgnoredItem[] = [];
+  const themes: CustomThemeDef[] = [];
+  /** 每个自定义主题本身是第几项（extends 断了 / 成环时报在这一项上） */
+  const themeItemN = new Map<string, number>();
   let n = 0;
   const allowed = new Set<string>(THEME_COLOR_VARS);
   for (const [key, val] of Object.entries(raw)) {
     if (key === 'version') {
       if (val !== 1) ignored.push({ n: ++n, where: 'version', reason: 'bad-version', value: short(val) });
+      continue;
+    }
+    if (key === 'themes') {
+      if (!isObj(val)) { ignored.push({ n: ++n, where: 'themes', reason: 'bad-section', value: short(val) }); continue; }
+      for (const [id, def] of Object.entries(val)) {
+        const tn = ++n;
+        const where = `themes.${JSON.stringify(id)}`;
+        if (!THEME_ID_RE.test(id)) { ignored.push({ n: tn, where, reason: 'bad-theme-id' }); continue; }
+        if (builtinTheme(id)) { ignored.push({ n: tn, where, reason: 'builtin-theme-id' }); continue; }
+        if (!isObj(def)) { ignored.push({ n: tn, where, reason: 'bad-theme', value: short(def) }); continue; }
+        const d: CustomThemeDef = { id, name: id, vars: {} };
+        themeItemN.set(id, tn);
+        for (const [k, v] of Object.entries(def)) {
+          const w = `${where}.${k}`;
+          if (k === 'name') {
+            if (typeof v === 'string' && v.trim() && v.trim().length <= 40) d.name = v.trim();
+            else ignored.push({ n: ++n, where: w, reason: 'bad-theme-name', value: short(v) });
+          } else if (k === 'base') {
+            if (v === 'dark' || v === 'light') d.base = v;
+            else ignored.push({ n: ++n, where: w, reason: 'bad-base', value: short(v) });
+          } else if (k === 'extends') {
+            if (typeof v === 'string' && THEME_ID_RE.test(v)) d.extends = v;
+            else ignored.push({ n: ++n, where: w, reason: 'unknown-extends', value: short(v) });
+          } else if (k === 'vars') {
+            if (!isObj(v)) { ignored.push({ n: ++n, where: w, reason: 'bad-section', value: short(v) }); continue; }
+            for (const [name, color] of Object.entries(v)) {
+              n += 1;
+              const wv = `${w}.${JSON.stringify(name)}`;
+              if (!allowed.has(name)) { ignored.push({ n, where: wv, reason: 'unknown-var' }); continue; }
+              if (!isCssColor(color)) { ignored.push({ n, where: wv, reason: 'bad-value', value: short(color) }); continue; }
+              d.vars[name as ThemeColorVar] = color.trim();
+            }
+          } else {
+            ignored.push({ n: ++n, where: w, reason: 'unknown-theme-key' });
+          }
+        }
+        themes.push(d);
+      }
       continue;
     }
     if (!(THEME_SECTIONS as string[]).includes(key)) {
@@ -284,7 +561,31 @@ export function parseThemeFile(text: string): ThemeParse {
       overrides[key as ThemeSection][name as ThemeColorVar] = color.trim();
     }
   }
-  return { ok: true, overrides, ignored };
+  /* extends 指向不存在的主题 / 成环 → 这个主题不要，报在它自己那一项上 */
+  const { problems } = resolveCustomThemes(themes);
+  const dropped = new Set<string>();
+  for (const pr of problems) {
+    dropped.add(pr.id);
+    ignored.push({ n: themeItemN.get(pr.id) ?? 0, where: `themes.${JSON.stringify(pr.id)}`, reason: pr.reason });
+  }
+  ignored.sort((a, b) => a.n - b.n);
+  return { ok: true, overrides, themes: themes.filter((t) => !dropped.has(t.id)), ignored };
+}
+
+/** IPC 传过来的自定义主题再校验一遍（只留合法 id / base / extends 和合法颜色）。 */
+export function sanitizeThemeDefs(v: unknown): CustomThemeDef[] {
+  if (!Array.isArray(v)) return [];
+  const allowed = new Set<string>(THEME_COLOR_VARS);
+  const out: CustomThemeDef[] = [];
+  for (const d of v) {
+    if (!isObj(d) || typeof d.id !== 'string' || !THEME_ID_RE.test(d.id) || builtinTheme(d.id)) continue;
+    const def: CustomThemeDef = { id: d.id, name: typeof d.name === 'string' && d.name.trim() ? d.name.trim().slice(0, 40) : d.id, vars: {} };
+    if (d.base === 'dark' || d.base === 'light') def.base = d.base;
+    if (typeof d.extends === 'string' && THEME_ID_RE.test(d.extends)) def.extends = d.extends;
+    if (isObj(d.vars)) for (const [k, c] of Object.entries(d.vars)) if (allowed.has(k) && isCssColor(c)) def.vars[k as ThemeColorVar] = c.trim();
+    out.push(def);
+  }
+  return out;
 }
 
 /** 重新校验一遍（IPC 传过来的对象不直接信）：只留合法键、合法值。 */
@@ -305,29 +606,45 @@ export interface ThemeFileState {
   path: string;
   exists: boolean;
   overrides: ThemeOverrides;
+  /** theme.json 的 "themes"（自定义主题，校验过）。老文件没有 → 空。 */
+  themes: CustomThemeDef[];
   ignored: IgnoredItem[];
   error?: string;
 }
 
 export interface ThemeInputs {
+  /** 没给 `preset` 时用这个 base 的 KiroLex 默认主题。 */
   theme: EffectiveTheme;
+  /** 当前主题（`pickTheme` 选出来的）。 */
+  preset?: ThemePreset;
   contrast: ContrastChoice;
-  /** 设置里的强调色，空 = 主题默认。 */
+  /** 设置里的强调色，空 = 主题自带的 --accent。 */
   accent: string;
   overrides: ThemeOverrides;
 }
 
+const normColor = (c: string): string => {
+  const h = parseHex(c);
+  return h && h[3] === 1 ? toHex(h[0], h[1], h[2]) : c.trim().toLowerCase().replace(/\s+/g, '');
+};
+
 /**
- * 要写到 `<html>` 上的内联变量（盖过 global.css）。默认值不在这里 —— 它们在样式表里，由 `data-theme` 选。
- * 后写的赢：对比度 → 强调色 → theme.json common → theme.json 当前主题。
+ * 要写到 `<html>` 上的内联变量（盖过 global.css）。后写的赢：
+ *   预设主题 → 对比度「高」→ 强调色设置（没设 = 主题自带的 --accent）→ theme.json common → theme.json 当前 base 那组。
+ * 和同 base 的 KiroLex 默认（就是 global.css 里由 `data-theme` 选中的那组）一样的值不写 —— 样式表里已经是它，
+ * 默认主题 + 什么都不改时一个内联变量都没有，和以前完全一样。
  */
 export function computeThemeVars(input: ThemeInputs): Record<string, string> {
-  const vars: Record<string, string> = {};
-  if (input.contrast === 'high') Object.assign(vars, CONTRAST_HIGH[input.theme]);
+  const t = input.preset || builtinTheme(DEFAULT_THEME_ID[input.theme])!;
+  const base = t.base;
+  const vars: Record<string, string> = { ...t.vars };
+  if (input.contrast === 'high') Object.assign(vars, highContrastVars(t));
   const acc = accentVars(input.accent);
   if (acc) Object.assign(vars, acc);
   const o = sanitizeOverrides(input.overrides);
-  Object.assign(vars, o.common, o[input.theme]);
+  Object.assign(vars, o.common, o[base]);
+  const def = builtinTheme(DEFAULT_THEME_ID[base])!.vars as Record<string, string>;
+  for (const k of Object.keys(vars)) if (def[k] !== undefined && normColor(def[k]) === normColor(vars[k])) delete vars[k];
   return vars;
 }
 
@@ -340,7 +657,7 @@ export function themeBackupName(now: Date): string {
 /** 「打开配置文件」时文件不存在就生成的示例：带注释说明，覆盖项都是注释掉的（生成出来不改变任何颜色）。 */
 export function themeSampleText(): string {
   return `// KiroLex 颜色覆盖 / color overrides —— 保存后立即生效，不用重启。
-// 优先级 / precedence：默认值 < 设置里的「主题 + 文字对比度 + 强调色」 < 这个文件。
+// 优先级 / precedence：主题（设置里选的预设 / 下面 "themes" 里的自定义主题）< 文字对比度「高」< 强调色 < 这个文件的 dark / light / common 覆盖。
 //
 // · "dark" 只在深色主题下生效，"light" 只在浅色主题下生效，"common" 两套都生效（同名时 dark / light 优先）。
 // · 只能覆盖颜色变量：${THEME_COLOR_VARS.join(' ')}
@@ -348,6 +665,10 @@ export function themeSampleText(): string {
 // · 其他键和值会被忽略，设置 → 外观里会显示「第 N 项被忽略：原因」。
 // · 文件写坏了（不是合法 JSON）会继续用上一次的有效配置，并在设置页提示。
 // · 「恢复默认」会把这个文件改名为 theme.json.bak-<时间>，不会删除。
+// · 可选 "themes"：自定义主题，会出现在设置里「深色时用 / 浅色时用」的下拉里：
+//     "<id>": { "name": "名字", "base": "dark" 或 "light", "extends": "已有主题的 id", "vars": { "颜色变量": "颜色" } }
+//   id 只能用小写字母、数字、- 和 _；不写 extends = 同 base 的 KiroLex 默认；vars 的规则和上面一样。
+//   内置主题 id：${THEME_PRESETS.map((t) => t.id).join(' ')}
 // 把下面某一行前面的 // 去掉就能生效，例如让次要文字更亮：
 {
   "version": 1,
@@ -360,6 +681,9 @@ export function themeSampleText(): string {
   },
   "common": {
     // "--accent": "#3b82f6"
+  },
+  "themes": {
+    // "my-nord": { "name": "我的 Nord", "base": "dark", "extends": "nord", "vars": { "--accent": "#4c6f9a" } }
   }
 }
 `;

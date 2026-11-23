@@ -53,7 +53,7 @@ import type { BrowserDomainAsk, LocalBrowserStatusView } from './localBrowserVie
 import { BrowserDomainPrompt } from './components/BrowserDomainPrompt';
 import { engineLabel, engineCliName } from './engineLabel';
 import { accentEngine, engineAccentCss } from './engineTheme.ts';
-import { emptyOverrides, normalizeAccent, normalizeContrast, normalizeThemeChoice, sanitizeOverrides, type ThemeOverrides } from '../main/themeConfig.ts';
+import { emptyOverrides, normalizeAccent, normalizeContrast, normalizeThemeChoice, normalizeThemeId, sanitizeOverrides, sanitizeThemeDefs, type CustomThemeDef, type ThemeOverrides } from '../main/themeConfig.ts';
 import { applySyncedSettings } from '../main/appearanceSync.ts';
 import { applyTheme } from './themeApply.ts';
 import type { QuestionCard } from '../main/elicitation.ts';
@@ -685,6 +685,9 @@ export interface Settings {
   monoFontFamily: string;
   /** 主题：深色 / 浅色 / 跟随系统（prefers-color-scheme）。缺省 = 深色（和以前一样）。见 `main/themeConfig.ts`。 */
   theme?: 'dark' | 'light' | 'system';
+  /** 深色时 / 浅色时用哪个主题（内置预设或 theme.json 里的自定义主题 id，见 `main/themeConfig.ts` 的 THEME_PRESETS）。缺省 = KiroLex 深色 / 浅色。 */
+  themeDark?: string;
+  themeLight?: string;
   /** 文字对比度：标准 / 高（次要那三档文字提亮或加深）。 */
   contrast?: 'standard' | 'high';
   /** 强调色（#rrggbb），空 = 主题默认。只换 --accent / --accent-hover / --accent-soft，不动引擎色和权限风险色。 */
@@ -730,7 +733,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', syncAppearance: true, mergeQueuedMessages: false, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -927,6 +930,8 @@ function loadSettings(): Settings {
       merged.uiZoom = normalizeUiZoom(merged.uiZoom);
       // 外观三项：坏值退回默认（见 themeConfig.ts）
       merged.theme = normalizeThemeChoice(merged.theme);
+      merged.themeDark = normalizeThemeId(merged.themeDark, 'dark');
+      merged.themeLight = normalizeThemeId(merged.themeLight, 'light');
       merged.contrast = normalizeContrast(merged.contrast);
       merged.accentColor = normalizeAccent(merged.accentColor);
       return merged;
@@ -3055,18 +3060,22 @@ const App: React.FC = () => {
     return () => mq?.removeEventListener('change', onChange);
   }, []);
   const [themeOverrides, setThemeOverrides] = useState<ThemeOverrides>(() => emptyOverrides());
+  /** theme.json 里的自定义主题（"themes"） */
+  const [customThemes, setCustomThemes] = useState<CustomThemeDef[]>([]);
+  /** 设置页主题下拉里悬停 / 选中时临时预览的主题 id；关掉下拉 / 对话框时回到 null（恢复） */
+  const [themePreview, setThemePreview] = useState<string | null>(null);
   useEffect(() => {
     const api = (window as any).kiroApi;
     let alive = true;
-    void api?.getThemeConfig?.().then((st: any) => { if (alive && st) setThemeOverrides(sanitizeOverrides(st.overrides)); }).catch(() => {});
-    const off = api?.onThemeConfig?.((st: any) => setThemeOverrides(sanitizeOverrides(st?.overrides)));
+    void api?.getThemeConfig?.().then((st: any) => { if (alive && st) { setThemeOverrides(sanitizeOverrides(st.overrides)); setCustomThemes(sanitizeThemeDefs(st.themes)); } }).catch(() => {});
+    const off = api?.onThemeConfig?.((st: any) => { setThemeOverrides(sanitizeOverrides(st?.overrides)); setCustomThemes(sanitizeThemeDefs(st?.themes)); });
     const offSync = api?.onAppearanceSynced?.((synced: any) => setSettings((cur) => applySyncedSettings(cur as any, synced) as Settings));
     return () => { alive = false; try { off?.(); offSync?.(); } catch { /* 卸载 */ } };
   }, []);
   const themeVarKeysRef = useRef<string[]>([]);
   useEffect(() => {
-    themeVarKeysRef.current = applyTheme(document.documentElement, settings, themeOverrides, systemPrefersDark, themeVarKeysRef.current);
-  }, [settings.theme, settings.contrast, settings.accentColor, themeOverrides, systemPrefersDark]);
+    themeVarKeysRef.current = applyTheme(document.documentElement, settings, { overrides: themeOverrides, themes: customThemes }, systemPrefersDark, themeVarKeysRef.current, themePreview);
+  }, [settings.theme, settings.themeDark, settings.themeLight, settings.contrast, settings.accentColor, themeOverrides, customThemes, systemPrefersDark, themePreview]);
 
   // Persist from EVERY path, not just the dialog. Split view raises/clears
   // splitGrid internally (entering and leaving split mode), and those changes
@@ -5045,7 +5054,8 @@ const App: React.FC = () => {
           startNewMachine={settingsNewMachine}
           settings={settings}
           onChange={handleSettingsChange}
-          onClose={() => setShowSettings(false)}
+          onClose={() => { setThemePreview(null); setShowSettings(false); }}
+          onPreviewTheme={setThemePreview}
           confirmDeletes={!skipDeleteConfirm}
           onConfirmDeletesChange={(value) => {
             const skip = !value;

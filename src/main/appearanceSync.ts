@@ -3,7 +3,7 @@
  *
  * 同步的**只有**这些（`SYNCED_SETTING_KEYS` + theme.json 原文），打成一份 `appearance.json` 放在桶里
  * （`<prefix>/v1/appearance.json`，和会话同一个桶、同一套凭证，不需要新的 IAM 权限）：
- *   · 设置里的 主题 / 文字对比度 / 强调色 / 界面字体 / 等宽字体 / 聊天字号；
+ *   · 设置里的 主题模式 / 深色和浅色各用哪个主题（id）/ 文字对比度 / 强调色 / 界面字体 / 等宽字体 / 聊天字号；
  *   · `~/.kirolex/theme.json` 的原文（没有 = null）。
  * **不同步**：界面缩放 uiZoom（每台屏幕 / 远程桌面分辨率不同）、语言、以及机器 / 路径 / 远端 / 权限等一切别的设置
  * （`config.json` 照旧完全不同步）。
@@ -14,12 +14,13 @@
  *
  * 纯逻辑，不碰 fs / 网络 / electron；`index.ts` 收集状态后调用。
  */
+import { THEME_ID_RE } from './themeConfig.ts';
 
 /** 桶里那份的相对路径（S3 key 里 `v1/` 之后那段）。 */
 export const APPEARANCE_REL = 'appearance.json';
 
 /** 跟着同步的设置字段。**没有 uiZoom**（留在本机）。 */
-export const SYNCED_SETTING_KEYS = ['theme', 'contrast', 'accentColor', 'fontFamily', 'monoFontFamily', 'fontSize'] as const;
+export const SYNCED_SETTING_KEYS = ['theme', 'themeDark', 'themeLight', 'contrast', 'accentColor', 'fontFamily', 'monoFontFamily', 'fontSize'] as const;
 export type SyncedSettingKey = typeof SYNCED_SETTING_KEYS[number];
 
 export interface SyncedSettings {
@@ -28,6 +29,9 @@ export interface SyncedSettings {
   accentColor?: string;
   fontFamily?: string;
   monoFontFamily?: string;
+  /** 「深色时用 / 浅色时用」的主题 id（内置预设或 theme.json 里的自定义主题，见 themeConfig.ts 的 THEME_PRESETS）。 */
+  themeDark?: string;
+  themeLight?: string;
   fontSize?: number;
 }
 
@@ -66,6 +70,8 @@ export function pickSyncedSettings(settings: unknown): SyncedSettings {
   if (typeof s.accentColor === 'string' && (s.accentColor === '' || /^#[0-9a-fA-F]{6}$/.test(s.accentColor))) out.accentColor = s.accentColor.toLowerCase();
   if (typeof s.fontFamily === 'string' && s.fontFamily.length <= 300) out.fontFamily = s.fontFamily;
   if (typeof s.monoFontFamily === 'string' && s.monoFontFamily.length <= 300) out.monoFontFamily = s.monoFontFamily;
+  if (typeof s.themeDark === 'string' && THEME_ID_RE.test(s.themeDark)) out.themeDark = s.themeDark;
+  if (typeof s.themeLight === 'string' && THEME_ID_RE.test(s.themeLight)) out.themeLight = s.themeLight;
   if (typeof s.fontSize === 'number' && Number.isInteger(s.fontSize) && s.fontSize >= 10 && s.fontSize <= 22) out.fontSize = s.fontSize;
   return out;
 }
@@ -76,7 +82,7 @@ export function pickSyncedSettings(settings: unknown): SyncedSettings {
  * 否则这次自动保存会被当成「刚刚的真实修改」，首次同步就把默认值传上去、盖掉别的电脑上设好的外观。
  */
 export const SYNCED_DEFAULTS: Required<SyncedSettings> = {
-  theme: 'dark', contrast: 'standard', accentColor: '', fontFamily: '', monoFontFamily: '', fontSize: 12,
+  theme: 'dark', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', contrast: 'standard', accentColor: '', fontFamily: '', monoFontFamily: '', fontSize: 12,
 };
 
 export function makePayload(settings: unknown, themeJson: string | null | undefined): AppearancePayload {

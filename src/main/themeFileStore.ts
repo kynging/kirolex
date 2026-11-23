@@ -23,15 +23,15 @@ export function readThemeFile(home: string, last: ThemeFileState | null): { stat
   const file = themeFilePath(home);
   let text: string | null = null;
   try { text = fs.readFileSync(file, 'utf-8'); } catch { text = null; }
-  if (text === null) return { state: { path: file, exists: false, overrides: emptyOverrides(), ignored: [] }, text };
+  if (text === null) return { state: { path: file, exists: false, overrides: emptyOverrides(), themes: [], ignored: [] }, text };
   const r = parseThemeFile(text);
   if (!r.ok) {
     return {
-      state: { path: file, exists: true, overrides: last?.overrides || emptyOverrides(), ignored: last?.ignored || [], error: r.error },
+      state: { path: file, exists: true, overrides: last?.overrides || emptyOverrides(), themes: last?.themes || [], ignored: last?.ignored || [], error: r.error },
       text,
     };
   }
-  return { state: { path: file, exists: true, overrides: r.overrides, ignored: r.ignored }, text };
+  return { state: { path: file, exists: true, overrides: r.overrides, themes: r.themes, ignored: r.ignored }, text };
 }
 
 function writeAtomic(file: string, text: string): void {

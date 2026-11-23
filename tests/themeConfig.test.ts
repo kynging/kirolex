@@ -286,7 +286,7 @@ describe('接线（源码扫描）', () => {
     const app = read('renderer', 'App.tsx');
     assert.match(app, /matchMedia\('\(prefers-color-scheme: dark\)'\)/);
     assert.match(app, /addEventListener\('change', onChange\)/);
-    assert.match(app, /applyTheme\(document\.documentElement, settings, themeOverrides, systemPrefersDark/);
+    assert.match(app, /applyTheme\(document\.documentElement, settings, \{ overrides: themeOverrides, themes: customThemes \}, systemPrefersDark/);
     assert.match(app, /onThemeConfig\?\.\(/);
     assert.match(app, /onAppearanceSynced\?\.\(\(synced: any\) => setSettings\(\(cur\) => applySyncedSettings\(/);
   });

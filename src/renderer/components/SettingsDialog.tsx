@@ -24,6 +24,8 @@ interface SettingsDialogProps {
   settings: Settings;
   onChange: (settings: Settings) => void;
   onClose: () => void;
+  /** 外观页主题下拉的悬停 / 选中即时预览（null = 恢复）。 */
+  onPreviewTheme?: (id: string | null) => void;
   confirmDeletes: boolean;
   onConfirmDeletesChange: (value: boolean) => void;
 }
@@ -148,6 +150,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
   settings,
   onChange,
   onClose,
+  onPreviewTheme,
   confirmDeletes,
   onConfirmDeletesChange,
 }) => {
@@ -509,7 +512,7 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
           {/* 外观那一页的第二栏：主题 / 文字对比度 / 强调色；下面整行是 theme.json 和外观同步（ThemeSettings.tsx） */}
           {tab === 'appearance' && (
           <div className="settings-col">
-            <ThemeColorControls settings={settings} onChange={onChange} />
+            <ThemeColorControls settings={settings} onChange={onChange} onPreviewTheme={onPreviewTheme} />
           </div>
           )}
           {tab === 'appearance' && <ThemeFileControls settings={settings} onChange={onChange} />}
