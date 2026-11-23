@@ -29,6 +29,8 @@
   --success: #4caf50;
   --error: #ef5350;
   --warning: #ff9800;
+  /* 信息蓝（恢复页「本机较新」）：不用紫色 --accent，免得和 Kiro 引擎色（色相 255–275°）混；对 --bg-primary 约 6.1:1、--bg-secondary 约 5.4:1，过 WCAG AA */
+  --info: #4f9fe0;
   --input-bg: #2a2a2a;
   /* 权限风险色（src/renderer/permissionTone.ts 的 TONE_COLORS，测试核对两边一致）：不随引擎变色 */
   --perm-danger: #ff8f8a;
@@ -9065,7 +9067,6 @@ button, input, select, textarea {
   white-space: nowrap;
   flex: 0 0 auto;
 }
-.backup-tag.new { color: var(--text-muted); }
 /* 会覆盖：这是这一页里唯一有破坏性的那种，要显眼 */
 .backup-tag.over {
   color: var(--warning, #d9a23b);
@@ -9074,6 +9075,23 @@ button, input, select, textarea {
 .backup-tag.warn {
   color: var(--error, #d9534f);
   border-color: color-mix(in srgb, var(--error, #d9534f) 55%, transparent);
+}
+/* 恢复页的新旧对比（freshnessClass）：四种各一种颜色，只用主题变量 */
+.backup-tag.fresh-same {
+  color: var(--success);
+  border-color: color-mix(in srgb, var(--success) 55%, transparent);
+}
+.backup-tag.fresh-cloud {
+  color: var(--warning);
+  border-color: color-mix(in srgb, var(--warning) 55%, transparent);
+}
+.backup-tag.fresh-local {
+  color: var(--info);
+  border-color: color-mix(in srgb, var(--info) 55%, transparent);
+}
+.backup-tag.fresh-missing {
+  color: var(--text-secondary);
+  border-color: color-mix(in srgb, var(--text-secondary) 55%, transparent);
 }
 
 /* 配置那一页（设置里）：纵向排，和这一页共用 `.backup-field` 那套对齐 */

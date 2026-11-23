@@ -79,6 +79,19 @@ export const FRESHNESS_LABEL: Record<Freshness, string> = {
   missing: '本地没有',
 };
 
+/**
+ * 新旧对比标签的颜色（global.css 里 `.backup-tag.fresh-*`）：四种各一种，一眼分得出——
+ * 两边一样 = 绿（恢复不会带来任何变化）、云上较新 = 琥珀（会把云端的新内容并进来）、
+ * 本机较新 = 蓝（--info）、本地没有 = 中性（恢复只是新增一条）。
+ */
+const FRESHNESS_CLASS: Record<Freshness, string> = {
+  same: 'fresh-same',
+  'cloud-newer': 'fresh-cloud',
+  'local-newer': 'fresh-local',
+  missing: 'fresh-missing',
+};
+export const freshnessClass = (f: Freshness): string => FRESHNESS_CLASS[f];
+
 /** 按界面语言给新旧对比的标签（中文和上面的 `FRESHNESS_LABEL` 一致）。 */
 export function freshnessLabel(f: Freshness, lang: Lang = 'zh'): string {
   switch (f) {

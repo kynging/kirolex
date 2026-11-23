@@ -28,7 +28,7 @@ import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
 import { BackupSettings, CrossDeviceList, Field } from './BackupSettings.tsx';
 import { cleanupSentence, backupConfigured } from '../backupGroups.ts';
 import { setSessionSync } from '../../main/syncChoice.ts';
-import { groupBackups, groupSyncProjects, syncRowState, syncSummary, syncSummaryText, includedWhileProjectOff, compareFreshness, freshnessLabel, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
+import { groupBackups, groupSyncProjects, syncRowState, syncSummary, syncSummaryText, includedWhileProjectOff, compareFreshness, freshnessLabel, freshnessClass, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
 import { useLang, useT } from '../hooks/useLang';
 
 interface Backup {
@@ -560,7 +560,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               ? <span className="backup-tag warn">{t('Never backed up')}</span>
                               : x.state === 'pending'
                                 ? <span className="backup-tag over">{t('Changes waiting to sync')}</span>
-                                : <span className="backup-tag new">{t('Synced')}</span>}
+                                : <span className={`backup-tag ${freshnessClass('same')}`}>{t('Synced')}</span>}
                             {/* 单条会话也能关 / 开 ——「项目不开备份时，会话也能单独打开」。项目关着时照常给开关，默认关 */}
                             {st.custom && (
                               <span className="backup-tag" title={t('This session is turned on or off on its own; it no longer follows the project switch.')}>{t('Set individually')}</span>
@@ -733,7 +733,7 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                             )}
                             {/* 新旧对比：本机记录的 updatedAt 和云上那份比 */}
                             {!e.missing && <span
-                              className={`backup-tag ${fresh === 'cloud-newer' ? 'over' : 'new'}`}
+                              className={`backup-tag ${freshnessClass(fresh)}`}
                               title={fresh === 'missing'
                                 ? t('Not on this machine; restoring simply adds it')
                                 : t('This machine {local} · cloud {cloud}', { local: when(e.localUpdatedAt), cloud: when(e.updatedAt) }) + '\n' + t('Restoring merges it with the local copy (deduplicated by message id, sorted by time)')}
