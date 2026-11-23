@@ -1,4 +1,5 @@
 import { contextBridge, ipcRenderer, webFrame } from 'electron';
+import type { TurnUsage } from './turnUsage.ts';
 
 /** Shared UI state (project groups, split layout, settings, widths…).
  *
@@ -940,6 +941,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  adopt a turn that never stopped, instead of resending the question and billing it twice. */
   peekTurn: (sessionId: string): Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }> =>
     ipcRenderer.invoke('acp:peek-turn', sessionId),
+  /** 一轮结束时这一轮的真实消耗（`main/turnUsage.ts`，和落盘的同一份）—— 没有正文的那一轮也发 */
+  onTurnUsage: (callback: (data: { sessionId: string; messageId: string; turnUsage: TurnUsage; turnStart?: string }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:turn-usage', handler);
+    return () => ipcRenderer.removeListener('acp:turn-usage', handler);
+  },
   /** Authoritative full assistant text at turn end (heals dropped chunks). */
   onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true; segmentBreaks?: number[] }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

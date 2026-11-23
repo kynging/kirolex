@@ -43,6 +43,7 @@ import { splitTextToolCall, foldTextToolCall } from '../../main/textToolCall.ts'
 import { bannerText, collapseAdjacent, noticeKey, repeatBadge } from '../noticeMerge.ts';
 import { dismissNotice, isMuted, isNoticeHidden, muteKeyOf, muteNotice, muteScope, noticeHideStore, CONNECT_FAILURE_GROUP, SESSION_ERROR_GROUP, STARTUP_FAILED_GROUP } from '../noticeDismiss.ts';
 import { usageChip, type UsageView } from '../usageChip.ts';
+import { combineTurnUsage, sessionTurnStats, sessionTurnTotals, turnUsageLabel } from '../turnUsageView.ts';
 import { panelFoldState, pickCurrent, previewLines, segmentFoldState, showsRunningIndicator, toggleSegmentFold, type SegmentFoldOverride } from '../segmentFold.ts';
 
 import { useSessionNotice, noteSessionLocally } from '../hooks/useSessionNotice';
@@ -1586,7 +1587,9 @@ const MessageItem = memo<{
   remoteHost?: string;
   /** 这条会话的引擎：Claude Code / Codex 的工具行、diff 显示和 kiro 分开（kiro 的面板不变） */
   engine?: string;
-}>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools, remoteHost, engine }) => {
+  /** 本会话到这一轮为止的累计（`sessionTurnTotals`）—— 本轮消耗的悬停明细用 */
+  soFar?: { credits: number; cost: number };
+}>(({ segments, questionContent, isLastAssistant, isStreaming, onFork, foldThinking, foldTools, remoteHost, engine, soFar }) => {
   const t = useT();
   const [copied, setCopied] = useState(false);
   const actionLocked = isLastAssistant && isStreaming;
@@ -1636,6 +1639,9 @@ const MessageItem = memo<{
   const estimatedTokens = !actionLocked
     ? estimateVisibleTokens(`${questionContent || ''}\n${combinedText}`)
     : null;
+  /* 这一轮的真实消耗（主进程一轮结束时记在助手消息上，`turnUsageView.ts`）；拿不到才回退到上面的估算，并标明是估算 */
+  const turnUsage = useMemo(() => combineTurnUsage(segments.map((s) => s.turnUsage)), [segments]);
+  const turnCost = actionLocked ? null : turnUsageLabel(turnUsage, estimatedTokens, t, soFar);
 
   const copyMessage = useCallback(async () => {
     await navigator.clipboard.writeText(combinedText);
@@ -1754,12 +1760,12 @@ const MessageItem = memo<{
         >
           {formatMessageTime(last.timestamp)}
         </time>
-        {estimatedTokens !== null && (
+        {turnCost && (
           <span
-            className="message-token-count"
-            title={t('Estimated from the visible question and answer; the engine does not report exact per-turn token counts.')}
+            className={`message-token-count${turnCost.estimated ? '' : ' message-turn-cost'}`}
+            title={turnCost.title}
           >
-            · ≈ {estimatedTokens.toLocaleString()} {t('tokens')}
+            · {turnCost.text}
           </span>
         )}
         <button
@@ -4226,7 +4232,11 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const noteMachineId = remoteId || (remoteHost ? undefined : 'local');
   const nonKiro = !!engine && engine !== 'kiro';
   /* 用量栏右边那一格（非 kiro）：本会话花费 / token / 不显示 —— kiro 的 credits 按钮另走 */
-  const usageChipNow = nonKiro ? usageChip(engine, usage, t) : null;
+  /* 每条回复后面的本轮消耗：本会话到那一轮为止的累计；用量栏悬停加「本会话共 N 轮，平均每轮 X」（`turnUsageView.ts`） */
+  const turnTotals = useMemo(() => sessionTurnTotals(messages), [messages]);
+  const turnStats = useMemo(() => sessionTurnStats(messages, engine, t), [messages, engine, t]);
+  const usageChipBase = nonKiro ? usageChip(engine, usage, t) : null;
+  const usageChipNow = usageChipBase && turnStats ? { ...usageChipBase, title: `${usageChipBase.title}\n${turnStats}` } : usageChipBase;
   const engineLabel = engine === 'claude' ? 'Claude Code' : engine === 'codex' ? 'Codex' : 'Kiro';
   const [isDragOver, setIsDragOver] = useState(false);
   // Conversation-aware prompt suggestions: regenerate a few contextual follow-up
@@ -5780,6 +5790,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               onFork={onForkMessage}
               foldThinking={autoFoldThinking}
               foldTools={autoFoldTools}
+              soFar={turnTotals.get([...group.segments].reverse().find((m) => m.turnUsage)?.id ?? '')}
             />
           )}
           {group.kind === 'assistant' && group.segments.filter(isConnectFailureNotice).slice(-1).map((m) => (
@@ -6300,7 +6311,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                           className="composer-credits composer-usage-action"
                           onClick={onResetCredits}
                           disabled={!currentSessionId || isStreaming}
-                          title={t("Reset this session's local Credits counter")}
+                          title={turnStats ? `${t("Reset this session's local Credits counter")}\n${turnStats}` : t("Reset this session's local Credits counter")}
                         >
                           {usage.credits.toFixed(2)} {t('credits')}
                         </button>

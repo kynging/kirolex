@@ -25,6 +25,7 @@ import type { BgJobRow } from '../bgJobsView';
 import { asSteerParts, toStoredUserLines } from '../steerSplit';
 import { carryControlMark, viaFor } from '../../main/controlSessions';
 import type { UsageView } from '../usageChip.ts';
+import { asTurnUsage, attachTurnUsage } from '../turnUsageView.ts';
 import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
 import { decideTurnRecovery, adoptedMessages, isReviseRequest, findRecoveryTarget, consumedSteersText, steerInsertIndex, type TurnPeek } from '../turnRecovery';
 import { insertOptimistic, isDuplicateMessageError, removeOptimistic } from '../queueRetry';
@@ -355,8 +356,15 @@ function messageFromStored(raw: any): Message {
     ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
     ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
     ...questionOf(m),
+    ...turnUsageOf(m),
     timestamp: m.ts,
   };
+}
+
+/** 这一轮的真实消耗（主进程一轮结束时记的，`main/turnUsage.ts`）—— 读盘的每一处都带上，重启 / 切会话 / 翻历史都看得到。 */
+function turnUsageOf(m: any): { turnUsage?: Message['turnUsage'] } {
+  const u = m?.role === 'assistant' ? asTurnUsage(m.turnUsage) : undefined;
+  return u ? { turnUsage: u } : {};
 }
 
 /** 提问卡片（问了什么、答了什么）—— 读盘的每一处都要带上，重启后显示成只读摘要。 */
@@ -395,6 +403,8 @@ function toStoredTranscript(messages: Message[]) {
       ...(m.steerParts ? { steerParts: m.steerParts } : {}),
       /* 提问卡片：整份重写时原样写回去 */
       ...(m.question ? { question: m.question } : {}),
+      /* 这一轮的真实消耗：整份重写时原样写回去 */
+      ...(m.turnUsage ? { turnUsage: m.turnUsage } : {}),
       // 经控制入口发的（id 带标记）：整份重写时显式来源照样写回去
       ...viaFor(m.id),
     }));
@@ -2082,6 +2092,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
           ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
           ...questionOf(m),
+          ...turnUsageOf(m),
           timestamp: m.ts,
         }));
         // 还没处理的失败 steer 挂回这一轮（标红 + 两个按钮），不进队列
@@ -2114,6 +2125,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...replyMarksOf(m),
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...questionOf(m),
+            ...turnUsageOf(m),
           }));
           const msgsWithFailed = withFailed(sid, msgs);
           messagesCacheRef.current.set(sid, msgsWithFailed);
@@ -3112,6 +3124,19 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (cached) messagesCacheRef.current.set(sid, patch(cached));
       if (sid === currentSessionRef.current) setMessages((prev) => patch(prev));
     });
+    /*
+      这一轮的真实消耗（主进程落盘的同一份，`main/turnUsage.ts`）：挂到这一轮的回复上，message-actions 马上换掉「≈ N tokens」估算。
+      单独一个事件：只调了工具、没有正文的那一轮没有 assistant-final，消耗也要到界面（挂哪一条见 `attachTurnUsage`）。
+    */
+    const removeTurnUsage = window.kiroApi.onTurnUsage?.(({ sessionId: sid, messageId, turnUsage, turnStart }) => {
+      const usage = asTurnUsage(turnUsage);
+      if (!sid || !usage) return;
+      /* 这一轮界面上一条助手消息都没有：补上主进程刚落盘的那条空回复（同一个 id），消耗挂在它上面 */
+      const make = (): Message => ({ id: messageId, role: 'assistant', content: '', timestamp: Date.now() });
+      const cached = messagesCacheRef.current.get(sid);
+      if (cached) messagesCacheRef.current.set(sid, attachTurnUsage(cached, messageId, usage, make, turnStart));
+      if (sid === currentSessionRef.current) setMessages((prev) => attachTurnUsage(prev, messageId, usage, make, turnStart));
+    });
 
     // The session's REAL model, pushed by main after a connect-time or
     // prompt-time fallback. Keeps the composer selector honest: before this, the
@@ -3375,6 +3400,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       removeError();
       removeNotice?.();
       removeAssistantFinal?.();
+      removeTurnUsage?.();
       removeMainTurn?.();
       removeSessionModel?.();
       removeTurnRestart?.();
@@ -3685,6 +3711,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             ...questionOf(m),
+            ...turnUsageOf(m),
             timestamp: m.ts,
           }));
           // Only fill if nothing has been written to the fork meanwhile.
@@ -3856,6 +3883,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             ...questionOf(m),
+            ...turnUsageOf(m),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(id) || [];

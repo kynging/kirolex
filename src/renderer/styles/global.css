@@ -1594,6 +1594,11 @@ button, input, select, textarea {
   line-height: 20px;
 }
 
+/* 这一轮的真实消耗（引擎报的 credits / 花费 / 上下文增量）：比估算醒目一档；估算照旧跟着 message-actions 的弱色 */
+.message-token-count.message-turn-cost {
+  color: var(--text-secondary);
+}
+
 .message-action-btn {
   width: 22px;
   height: 22px;

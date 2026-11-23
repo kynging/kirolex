@@ -35,6 +35,7 @@ import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persi
 import { isReplayOutsideTurn, outsideTurnVerdict } from './replayGuard';
 import { autonomousFrame, beginAutonomousTurn, endAutonomousTurn, type AutonomousDeps, type AutonomousTurn } from './autonomousTurn';
 import { costOfUpdate, foldSessionCost, type SessionCost } from './sessionCost.ts';
+import { foldTurnFrame, finishTurnUsage, type TurnUsageAcc } from './turnUsage.ts';
 import { hasPendingClaudeCron, noteClaudeCronTool, type ClaudeCronTrack } from './claudeCron';
 import { parseModelList, parseModelListJson, pickAvailableModel, pinAgentModel, firstWantedModel, remoteStartCandidates } from './modelAvailability.ts';
 import { planHelperRoute, remoteLiteScript, parseRemoteLiteOutput, LOCAL_MACHINE as HELPER_LOCAL_MACHINE, type MachineModelList } from './helperModels.ts';
@@ -385,6 +386,12 @@ interface SessionEntry {
   autonomous?: AutonomousTurn;
   /** 本会话花费（`sessionCost.ts`）的内存副本 —— 记录也存一份；这份比别处"读-改-写"记录时手里那份新 */
   sessionCost?: SessionCost;
+  /** 这一轮攒着的真实消耗（`turnUsage.ts`）：每帧累加，`flushAssistant` 收尾落盘后清掉 */
+  turnUsageAcc?: TurnUsageAcc;
+  /** 后端自己起的那一轮的来源标记 id（`AutonomousTurn.noteId`）—— 本轮消耗告诉界面这一轮从哪开始 */
+  autonomousNoteId?: string;
+  /** 上一轮结束时的上下文 used —— 算这一轮的增量（执行器新起时从会话记录的 `lastTurnContextUsed` 取） */
+  lastTurnContextUsed?: number;
   /** 上一帧花费是哪个后端会话报的 —— 和 `cliSessionId` 不同（这个执行器里第一次 / 换了后端会话）就是新计数器，从 0 数起 */
   costCounterFor?: string;
   /** 这个后端里 Claude 自己定的 cron（`claudeCron.ts`）：LRU 驱逐时提示一句 */
@@ -8907,8 +8914,6 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     const childSessionId = originAcpSessionId && entry.cliSessionId && originAcpSessionId !== entry.cliSessionId
       ? originAcpSessionId
       : undefined;
-    /* 后端自己起的那一轮：见到结束信号（带 cost 的 usage_update / Codex idle）就收尾落盘，否则重新计时（`autonomousTurn.ts`） */
-    if (entry.autonomous) autonomousFrame(entry, data?.update, autonomousDeps(sessionId, entry));
     /*
       本会话花费（审计 F3）：Claude Code 的 `usage_update.cost` 是**这个适配器进程**的累计值，进程一换就从 0 数起 ——
       在这里跨进程累计、落进会话记录（`sessionCost.ts`），渲染层直接显示 `kirolexCost`。kiro 不发这个，照旧走 credits。
@@ -8927,6 +8932,16 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       try { store.patchRecord(sessionId, { sessionCost: next }); } catch (e: any) { logger.warn('session', `sessionCost 落盘失败 sessionId=${sessionId}: ${e?.message || e}`); }
       data = { ...data, update: { ...data.update, kirolexCost: { total: next.total, turn: next.turn, currency: next.currency } } };
     }
+    /*
+      这一轮的真实消耗（`turnUsage.ts`）：kiro 的 credits 按帧累加、Claude 的本轮花费（上面 fold 出来的 turn）、上下文 used ——
+      一轮结束时 `flushAssistant` 收尾挂到助手消息上落盘。只记一轮之内的帧（含后端自己起的那一轮）。
+      要在下面 autonomousFrame 之前：带 cost 的那一帧会把自发轮收掉，先记上才不漏。
+    */
+    if (entry.busy || entry.autonomous) {
+      entry.turnUsageAcc = foldTurnFrame(entry.turnUsageAcc, data?.update, data?.update?.kirolexCost ?? null);
+    }
+    /* 后端自己起的那一轮：见到结束信号（带 cost 的 usage_update / Codex idle）就收尾落盘，否则重新计时（`autonomousTurn.ts`） */
+    if (entry.autonomous) autonomousFrame(entry, data?.update, autonomousDeps(sessionId, entry));
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
   entry.replayUpdates = (list) => { for (const d of list) onUpdate(d, true); };
@@ -9001,6 +9016,26 @@ function wireSession(sessionId: string, entry: SessionEntry) {
   if (!superseded()) pushEngineModels(sessionId);
 }
 
+/**
+ * 这一轮的真实消耗收尾（`turnUsage.ts`）：`flushAssistant` 把它挂到落盘的那条助手消息上 ——
+ * 用户发的轮、定时 / 后台命令 / 监视 / 自发轮都在那一处收。Codex 的上下文增量对着上一轮结束时的 used 算，
+ * 执行器新起时内存里没有，从会话记录的 `lastTurnContextUsed` 取（只有这一轮报了 used 才去读）。
+ * 有真实消耗但没有正文、也没有被记录的工具（例如 kiro 只跑了 search / fetch）：flushAssistant 照样落一条空回复挂着它，
+ * 重载后看得到；发给模型的历史跳过这种空回复（`kirolexNote.modelFacing`）。
+ */
+function settleTurnUsage(sessionId: string, entry: SessionEntry, acc: TurnUsageAcc | undefined) {
+  const turnUsage = finishTurnUsage(acc, {
+    engine: engineOf(entry.profile),
+    model: entry.profile.model,
+    prevContextUsed: acc?.contextUsed === undefined ? undefined : entry.lastTurnContextUsed ?? store.readRecord(sessionId)?.lastTurnContextUsed,
+  });
+  if (turnUsage?.contextUsed !== undefined) {
+    entry.lastTurnContextUsed = turnUsage.contextUsed;
+    try { store.patchRecord(sessionId, { lastTurnContextUsed: turnUsage.contextUsed }); } catch (e: any) { logger.warn('session', `lastTurnContextUsed 落盘失败 sessionId=${sessionId}: ${e?.message || e}`); }
+  }
+  return turnUsage;
+}
+
 /** Flush the accumulated assistant message to the durable transcript (called on
  *  turn completion). No-op if nothing accumulated. */
 /*  `autonomous`：后端自己起的那一轮（`autonomousTurn.ts`）—— 带来源标记 `origin: 'autonomous'`。
@@ -9011,9 +9046,13 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   const completedFor = entry?.completedReplyTo;
   if (entry) entry.completedReplyTo = undefined;
   const replyTo = entry?.currentUserMessageId;
+  /* 本轮真实消耗（`settleTurnUsage`）：先取出来清掉；有它也要落一条（见那边） */
+  const turnUsageAcc = entry?.turnUsageAcc;
+  if (entry) entry.turnUsageAcc = undefined;
+  const turnUsage = entry ? settleTurnUsage(sessionId, entry, turnUsageAcc) : null;
   // A wedge note alone is enough to persist: a turn cut before it produced
   // anything still owes the user an explanation for why it stopped.
-  if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote)) {
+  if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote && !turnUsage)) {
     if (entry) entry.lastAcpMessageId = undefined;   // 这一轮没落盘的东西：锚点也别留给下一轮
     return;
   }
@@ -9035,6 +9074,8 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
     /* 分叉锚点（编辑重发用，`editFork.ts`）：这一轮主线最后一个 ACP messageId + 当时的后端会话 */
     ...(entry.lastAcpMessageId ? { acpMessageId: entry.lastAcpMessageId, acpSessionId: entry.cliSessionId } : {}),
     /* 后端自己起的那一轮：来源标记（这一轮没有用户消息，`currentUserMessageId` 在 autonomousDeps 里摘掉了，上面两项不会有） */
+    /* 这一轮的真实消耗：重启、切会话、翻历史都还看得到（引擎一个值都没报就没有，界面回退到估算） */
+    ...(turnUsage ? { turnUsage } : {}),
     ...(opts?.autonomous ? { origin: 'autonomous' as const } : {}),
   });
   // Keep the rendered history.md in step with the conversation, so the path the
@@ -9059,6 +9100,15 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
       /* 界面按段对上权威正文（中间漏收的也补回来，不重复）：每段的起点（`replySegments.ts`） */
       ...(segmentBreaks.length ? { segmentBreaks } : {}),
     });
+  }
+  /*
+    这一轮的真实消耗（和上面落盘的同一份）单独推给界面：message-actions 马上换掉「≈ N tokens」估算。
+    不挂在 assistant-final 上 —— 只调了工具、没有正文的那一轮不发 assistant-final，消耗也要到界面。
+  */
+  if (turnUsage && !entry.priming) {
+    /* turnStart：这一轮从哪条消息开始（回的那条用户消息 / 后台纠正的 KiroLex 提示 / 自发轮的来源标记）—— 界面只在它之后找这一轮的回复，不会挂到上一轮 */
+    const turnStart = replyTo ?? (opts?.autonomous ? entry.autonomousNoteId : undefined);
+    mainWindow?.webContents.send('acp:turn-usage', { sessionId, messageId: finalId, turnUsage, ...(turnStart ? { turnStart } : {}) });
   }
   entry.replySegments = undefined;
   entry.assistantBuf = '';
@@ -9170,6 +9220,7 @@ function autonomousDeps(sessionId: string, entry: SessionEntry): AutonomousDeps 
       logger.info('acp', `autonomous turn BEGIN sessionId=${sessionId} backend=${entry.cliSessionId} —— 后端自己起了一轮（cron 到点 / 后台任务跟进），按正常的一轮显示、落盘`);
       autonomousPrevUser.set(entry, entry.currentUserMessageId);
       entry.currentUserMessageId = undefined;
+      entry.autonomousNoteId = turn.noteId;   // 这一轮从哪条开始（本轮消耗挂到这之后，见 flushAssistant 的 acp:turn-usage）
       if (!entry.assistantBuf) { entry.assistantMsgId = null; entry.bufAtLastTool = 0; }
       const text = tr('⏰ Background trigger: {engine} started this turn on its own (a scheduled task it set itself, or a background-task follow-up)', { engine: ENGINE_LABEL[engineOf(entry.profile)] });
       const v = textVariants(text);

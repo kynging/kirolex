@@ -86,9 +86,11 @@ export function normalizeLegacyNote<T extends MaybeNote>(m: T): T {
  * 除了 KiroLex 自己的通知，还挡掉助手的 `💭 ` 思考行 —— 它本来也不是对话内容。
  * （这两条判据原来在 `src/main/index.ts` 里，语义一个字没改，只是搬到了共享的一处。）
  */
-export function modelFacing(m: { role?: string; content?: string; kirolex?: true | boolean }): boolean {
+export function modelFacing(m: { role?: string; content?: string; kirolex?: true | boolean; question?: unknown; toolCalls?: unknown[] }): boolean {
   if (!m) return false;
   if (isKirolexNote(m)) return false;
+  /* 只为挂这一轮真实消耗（`turnUsage`）落的那条空回复：没有正文、提问卡片、工具记录 —— 对模型什么都没说，不发（否则历史里多一行空的 Assistant:） */
+  if (m.role === 'assistant' && !String(m.content || '').trim() && !m.question && !m.toolCalls?.length) return false;
   return !(m.role === 'assistant' && String(m.content || '').startsWith('💭 '));
 }
 

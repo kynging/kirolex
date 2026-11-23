@@ -57,6 +57,7 @@ import { emptyOverrides, normalizeAccent, normalizeContrast, normalizeThemeChoic
 import { applySyncedSettings } from '../main/appearanceSync.ts';
 import { applyTheme } from './themeApply.ts';
 import type { QuestionCard } from '../main/elicitation.ts';
+import type { TurnUsage } from '../main/turnUsage.ts';
 import { EngineStatusPanel } from './components/EngineStatusPanel';
 import { placeholderRows, offloadSummary, offloadFailureText, type OffloadPlaceholderRow, type OffloadedMark } from './offloadView.ts';
 
@@ -458,6 +459,7 @@ declare global {
       onError: (callback: (error: any) => void) => () => void;
       onNotice?: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => () => void;
       onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true; segmentBreaks?: number[] }) => void) => () => void;
+      onTurnUsage?: (callback: (data: { sessionId: string; messageId: string; turnUsage: TurnUsage; turnStart?: string }) => void) => () => void;
       onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
@@ -516,6 +518,8 @@ export interface Message {
   replyComplete?: true;
   /** 模型向用户的一次提问（提问卡片，`main/elicitation.ts`）。这种消息正文是空的，在这一轮的回复气泡里画成卡片。 */
   question?: QuestionCard;
+  /** 助手消息：这一轮的真实消耗（主进程一轮结束时记的，`main/turnUsage.ts`）—— 没有就回退到估算 */
+  turnUsage?: TurnUsage;
   /** 只活在界面里：排队那条发出去时这一次插进来的气泡的记号 —— 发送失败只撤它，不撤原来就在的同 id 历史（`queueRetry.removeOptimistic`）。 */
   sendToken?: string;
 }

@@ -11,6 +11,7 @@ import { carryReplyMarks, completedReplyInText, messageIdStatusInText, type Mess
 import { carryBackendAnchors, remapAnchorsToFork } from './editFork.ts';
 import type { QuestionCard } from './elicitation.ts';
 import type { SessionCost } from './sessionCost.ts';
+import type { TurnUsage } from './turnUsage.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -118,6 +119,8 @@ export interface StoredMessage {
   /** 模型向用户的一次提问（`elicitation.ts` 的卡片，含状态和答案）。这种消息正文是空的，卡片关掉（答了 / 跳过 /
    *  取消 / 超时 / 撤回）时由主进程追加 —— 那时它才是完整的（§7 的 durability）。 */
   question?: QuestionCard;
+  /** 助手消息：这一轮的真实消耗（kiro credits / Claude 本轮花费 / 上下文 used 与增量，`turnUsage.ts`）—— 一轮结束时主进程记上 */
+  turnUsage?: TurnUsage;
   // additive: future fields (model, etc.) may be appended safely
 }
 
@@ -242,6 +245,8 @@ export interface SessionRecord {
   primeMode?: 'snapshot' | 'full';
   /** Claude Code / Codex 会话的累计花费（`sessionCost.ts`）—— 换后端 / 重开会话不清零。kiro 会话没有。 */
   sessionCost?: SessionCost;
+  /** 上一轮结束时的上下文 used（token）—— 每条回复后面「上下文 +N tokens」的增量从它算（`turnUsage.ts`） */
+  lastTurnContextUsed?: number;
 }
 
 const baseDir = path.join(os.homedir(), '.kirolex', 'sessions');
