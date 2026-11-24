@@ -12,7 +12,7 @@ import { autoFoldPanels, filePanelMax } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
 import { endedElsewhereSummary, schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
-import { runningBgJobs, type BgJobRow } from './bgJobsView';
+import { bannerBgJobs, type BgJobRow } from './bgJobsView';
 import { startupBlocksSend } from './createStages';
 // 给主会话的交底 —— 它原本对流程一无所知，连执行会话都不知道
 import { consumeHandoff } from './handoffDraft';
@@ -136,6 +136,8 @@ declare global {
       /** 模型起的后台命令 / 监视（进程在 main 里）。 */
       bgList?: () => Promise<BgJobRow[]>;
       bgStop?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
+      bgRequestStop?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
+      bgRerunHere?: (jobId: string, hash: string) => Promise<{ ok: boolean; error?: string; jobId?: string }>;
       onBgChanged?: (cb: () => void) => () => void;
       /** 主进程自己发起的一轮（定时到点 / 后台命令退出 / 监视事件）。 */
       onMainTurn?: (cb: (data: { sessionId: string; messageId: string; content: string; ts: number; kirolex?: true; handoff?: true; attachments?: any[] }) => void) => () => void;
@@ -1109,6 +1111,8 @@ const App: React.FC = () => {
     takeOverSchedule,
     bgJobs,
     stopBgJob,
+    requestStopBgJob,
+    rerunBgJobHere,
     stopLoop,
     restoredInputDraft,
     consumeRestoredInputDraft,
@@ -1643,12 +1647,12 @@ const App: React.FC = () => {
     };
   }, [schedules, scheduleSummaryFor, settings.language]);
 
-  /** 每条会话还在跑的后台命令 / 监视（按会话缓存：没变就是同一个数组，ChatArea 的 memo 不白算）。 */
+  /** 每条会话还在跑的后台命令 / 监视 + 别的电脑上的（跨电脑同步来的，只读）（按会话缓存：没变就是同一个数组，ChatArea 的 memo 不白算）。 */
   const bgJobsFor = useMemo(() => {
     const cache = new Map<string, BgJobRow[]>();
     return (sid: string | null): BgJobRow[] => {
       const key = sid || '';
-      if (!cache.has(key)) cache.set(key, runningBgJobs(bgJobs, sid));
+      if (!cache.has(key)) cache.set(key, bannerBgJobs(bgJobs, sid));
       return cache.get(key)!;
     };
   }, [bgJobs]);
@@ -4498,6 +4502,8 @@ const App: React.FC = () => {
         startup={sid ? createStages[sid] || null : null}
         onRetryStartup={(local) => { if (sid) void retryCreateSession(sid, { local }); }}
         onStopBgJob={(jobId) => void stopBgJob(jobId)}
+        onRequestStopBgJob={(jobId) => requestStopBgJob(jobId)}
+        onRerunBgJob={(jobId, hash) => rerunBgJobHere(jobId, hash)}
         onStopLoop={() => { if (sid) void stopLoop(sid); }}
       />
     );

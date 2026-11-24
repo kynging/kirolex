@@ -2720,6 +2720,71 @@ button, input, select, textarea {
   opacity: 0.8;
 }
 .bg-job-stop:hover { opacity: 1; color: var(--error); border-color: rgba(239, 83, 80, 0.55); }
+/* 别的电脑上的后台任务（跨电脑同步，只读）：一行 + 在哪台 / 失联 + 可展开的命令和输出末尾 */
+.bg-job-remote {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+}
+.bg-job-remote > .bg-job-row { background: rgba(124, 111, 224, 0.08); border-color: rgba(124, 111, 224, 0.3); }
+.bg-job-remote.ended > .bg-job-row { background: transparent; border-color: var(--border); }
+.bg-job-remote.lost > .bg-job-row { border-color: rgba(255, 167, 38, 0.55); }
+.bg-job-stop:disabled { opacity: 0.5; cursor: default; }
+.bg-job-rerun {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--warning, #ffa726);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.bg-job-rerun:hover { background: rgba(255, 167, 38, 0.14); }
+.bg-job-runner { padding-left: 34px; font-size: 11px; color: var(--text-secondary); }
+.bg-job-runner.offline { color: var(--warning, #ffa726); }
+.bg-job-details { padding-left: 34px; font-size: 11px; color: var(--text-muted); }
+.bg-job-details summary { cursor: pointer; }
+.bg-job-command,
+.bg-job-tail {
+  margin: 4px 0;
+  padding: 6px 8px;
+  max-height: 180px;
+  overflow: auto;
+  border-radius: 6px;
+  background: var(--bg-secondary, rgba(0, 0, 0, 0.2));
+  color: var(--text);
+  white-space: pre-wrap;
+  word-break: break-all;
+  font-size: 11px;
+}
+.bg-job-cwd { word-break: break-all; }
+/* 确认框里要逐字核对的全文（ConfirmDialog 的 detail）：弹窗限高，全文区可滚动、会换行，按钮始终在下面看得见 */
+.permission-dialog.has-detail {
+  display: flex;
+  flex-direction: column;
+  max-height: 85vh;
+  max-width: 640px;
+  box-sizing: border-box;
+}
+.permission-dialog.has-detail > p { flex-shrink: 0; }
+.permission-dialog.has-detail > .actions { flex-shrink: 0; }
+.confirm-dialog-detail {
+  flex: 1 1 auto;
+  min-height: 60px;
+  margin: 0 0 16px;
+  padding: 8px 10px;
+  overflow: auto;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: var(--bg-tertiary, rgba(0, 0, 0, 0.2));
+  color: var(--text);
+  font-size: 12px;
+  line-height: 1.5;
+  white-space: pre-wrap;
+  word-break: break-all;
+  overflow-wrap: anywhere;
+}
 
 /* Chat error banner: surfaces connectionError even when the chat has messages
    (the empty-state placeholder shows it otherwise). */

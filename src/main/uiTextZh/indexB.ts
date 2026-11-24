@@ -295,4 +295,9 @@ export const ZH_INDEX_B: Record<string, string> = {
   'Rollback was undone because the chat could not be cut back or its saved context snapshot could not be set aside ({reason}). The chat is unchanged and the backend was not switched.': '没能截短这条会话、或没能停用手动保存的上下文快照（{reason}），所以回滚已经撤回：会话原样没动，也没有换后端。',
   'Rollback failed ({reason}) and the chat could not be put back automatically. The full chat before the rollback is in the KiroLex trash: {dir}': '回滚失败了（{reason}），而且没能自动放回原样。回滚前的完整会话在 KiroLex 回收站里：{dir}',
   'The context snapshot you had saved by hand was set aside too (it is in the same backup), so the new backend gets context only up to that message.': '你之前手动保存的上下文快照也一并停用了（同样在这份备份里），新的后端只拿到到那一条为止的上下文。',
+  'The command was too long to sync in full, so it cannot be re-run here.': '命令太长，没能完整同步，不能在本机重跑。',
+  'This background task was already re-run on {machine}.': '这个后台任务已经在 {machine} 上重跑过了。',
+  '{machine} is still updating this task. Stop it there instead of running it twice.': '{machine} 还在更新这个任务的状态，不要两台都跑：要停就在那边停。',
+  'This background task changed after it was shown. Check it again before running it here.': '这个后台任务在显示之后变了，请重新看一遍再在本机运行。',
+  '🔁 Background task "{label}" ({id}) was re-run on this computer as {newId} because {machine} lost contact': '🔁 {machine} 失联，后台任务「{label}」（{id}）已在本机重新运行，新的是 {newId}',
 };

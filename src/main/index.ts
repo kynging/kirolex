@@ -103,7 +103,8 @@ import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeIt
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { canRetrySame, decidePromptDedupe, DUPLICATE_MESSAGE, DUPLICATE_STARTED, InFlightPrompts, reviseMessageId, turnCompletedNormally } from './promptDedupe.ts';
-import { BG_DEFAULT_TIMEOUT_SEC, BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
+import { BG_DEFAULT_TIMEOUT_SEC, BG_MAX_TIMEOUT_SEC, WATCH_MAX_TIMEOUT_SEC, BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
+import { BG_JOBS_REL, applyFetchedState, bgObjectRel, bgRunnerLost, bgStateBody, bgTombstoneBody, collectBucketBgJobs, forgetBgSession, parseRemoteBgState, parseRerunMark, parseStopRequest, planBgSync, planStopRequests, readBgLedger, rerunBody, rerunHash, stopRequestBody, writeBgLedger, type BgStopRequest, type BgSyncLedger } from './bgJobSync.ts';
 import { adapterScheduleNote, callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
@@ -6273,6 +6274,8 @@ const bgJobs = new BgJobManager({
     /* 只记标签和命令前 80 字（见 bgJobs.ts）—— 重启后据此补一句「已中断」 */
     try { writeRunningJobs(os.homedir(), running); } catch (err: any) { logger.warn('bg', `bg-jobs.json 写不进去: ${err?.message || err}`); }
     mainWindow?.webContents.send('bg:changed');
+    /* 跨电脑同步：起 / 停 / 结束了，稍后把状态传上去（只传「在同步」的会话的，见 syncBgJobsWithBucket） */
+    scheduleBgPush();
   },
   log: (m) => logger.info('bg', m),
 });
@@ -7604,6 +7607,190 @@ async function syncSchedulesNow(): Promise<void> {
 }
 
 /*
+  ── 后台任务（bg_run / watch）跨电脑同步：状态只读显示，只在跑它的那台执行 ──
+  判据全在 bgJobSync.ts；这里只收集状态、读写桶。同步来的任务只进 `bg-sync.json` 的 foreign 账（只显示），
+  **绝不进本机进程表（bgJobs）、绝不在本机起进程、绝不叫醒会话** —— 唯一在本机起进程的路是 `bg:rerun-here`（本机用户确认过全文）。
+*/
+let bgLedgerCache: BgSyncLedger | null = null;
+function bgLedger(): BgSyncLedger {
+  if (!bgLedgerCache) bgLedgerCache = readBgLedger(os.homedir());
+  return bgLedgerCache;
+}
+/** 改账永远基于**此刻**的那本（同步中间有 await，期间界面上点的停止 / 重跑不能被一份旧账盖掉）。 */
+function updateBgLedger(fn: (l: BgSyncLedger) => BgSyncLedger): void {
+  bgLedgerCache = fn(bgLedger());
+  try { writeBgLedger(os.homedir(), bgLedgerCache); } catch (err: any) { logger.warn('bg', `bg-sync.json 写不进去: ${err?.message || err}`); }
+}
+/** 失联阈值：约 2 个同步周期（同定时任务的「多久没同步」）。 */
+function bgSyncStaleAfterMs(): number {
+  return 2 * Math.max(5, Number(loadSyncConfig().intervalMinutes) || DEFAULT_INTERVAL_MINUTES) * 60_000;
+}
+/** 同步范围同定时任务：这条会话本身在同步（`syncsSession`），本机有、没删、不是 advanced。 */
+function bgSessionInScope(cfg: SyncConfig, sid: string): boolean {
+  if (!sid || !store.isValidSessionId(sid) || store.isAdvancedOnlySession(sid) || deletedSessionIds.has(sid)) return false;
+  const rec = store.readRecord(sid);
+  return !!rec && syncsSession(cfg, rec);
+}
+/** 在本机重跑时用的 cwd：和本机 bg_run / checkCommand 同一个取法（这条会话的本地工作目录）。 */
+function bgLocalCwd(sid: string): string {
+  return wakeHost.cwdFor(sid, os.homedir());
+}
+
+/**
+ * **后台任务和桶里对一下**（`<prefix>/v1/bg-jobs/<sessionId>/<jobId>(.stop|.rerun|.deleted).json`）：
+ *   1. 给本机任务的停止请求先处理 —— 只对本机表里在跑的、这条会话自己的调 `bgJobs.stop`（只结束它自己起的进程）；
+ *   2. 本机的任务传状态（变了 / 心跳），本机清理掉的写删除标记；
+ *   3. 别的电脑的任务只下载进 foreign 账，本机点的停止请求 / 重跑标记传上去。
+ * 返回传了几个文件。
+ */
+async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined): Promise<number> {
+  const me = scheduleMachine();
+  const cfg = loadSyncConfig();
+  const inScope = (sid: string) => bgSessionInScope(cfg, sid);
+  const objKey = (rel: string) => keyFor(prefix, rel.split('/').join(path.sep));
+  const heartbeatMs = Math.max(5, Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES) * 60_000;
+  let uploaded = 0;
+  let uiChanged = false;
+  try {
+    const objects = await listObjects(creds, `${keyFor(prefix, BG_JOBS_REL)}/`);
+    const entries: Array<{ rel: string; etag?: string }> = [];
+    for (const o of objects) {
+      const rel = relFor(prefix, o.key);
+      if (rel) entries.push({ rel: rel.split(path.sep).join('/'), ...(o.etag ? { etag: o.etag } : {}) });
+    }
+    const bucket = collectBucketBgJobs(entries);
+    const plan = () => planBgSync({ me, now: Date.now(), heartbeatMs, own: bgJobs.listForSync(), ledger: bgLedger(), bucket, inScope });
+    /* 1. 停止请求：只停不改 —— 解析只留 jobId / 会话，停的只能是本机表里在跑的那条 */
+    const requests: BgStopRequest[] = [];
+    for (const a of plan()) {
+      if (a.op !== 'fetch-stop') continue;
+      const body = await getObjectIfExists(creds, objKey(a.rel));
+      const req = body ? parseStopRequest(body.toString('utf-8'), a.jobId, a.sessionId) : null;
+      if (body && !req) logger.warn('bg', `sync: 桶里的停止请求 ${a.rel} 认不出，不理`);
+      if (req) requests.push(req);
+    }
+    for (const s of planStopRequests(requests, bgJobs.listForSync())) {
+      const from = requests.find((r) => r.jobId === s.jobId)?.by ?? '?';
+      logger.info('bg', `sync: 别的电脑（${from}）请求停止 ${s.jobId} session=${s.sessionId}，本机停掉它自己起的进程`);
+      await bgJobs.stop(s.jobId, 'user', s.sessionId);
+      try { await deleteObject(creds, objKey(bgObjectRel(s.sessionId, s.jobId, 'stop'))); } catch { /* 停过了，下一轮看到它也不会再停一次 */ }
+    }
+    /* 2 / 3. 停完重新算一次：停掉的那条这一轮就把「已停止」传回去 */
+    const tombstone = async (jobId: string, sessionId: string, at: number, extra: string[]) => {
+      await putObject(creds, objKey(bgObjectRel(sessionId, jobId, 'deleted')), Buffer.from(bgTombstoneBody(jobId, sessionId, at, me.id), 'utf-8'), 'application/json');
+      uploaded += 1;
+      for (const rel of extra) { try { await deleteObject(creds, objKey(rel)); } catch { /* 删除标记已经在了，它胜 */ } }
+      updateBgLedger((l) => {
+        const published = { ...l.published }; delete published[jobId];
+        const foreign = { ...l.foreign }; delete foreign[jobId];
+        const ownReruns = { ...l.ownReruns }; delete ownReruns[jobId];
+        return { published, foreign, ownReruns, tombstones: { ...l.tombstones, [jobId]: { sessionId, at, pushed: true } } };
+      });
+    };
+    for (const a of plan()) {
+      if (a.op === 'put') {
+        await putObject(creds, objKey(bgObjectRel(a.sessionId, a.jobId, 'state')), Buffer.from(bgStateBody(a.state), 'utf-8'), 'application/json');
+        uploaded += 1;
+        updateBgLedger((l) => ({ ...l, published: { ...l.published, [a.jobId]: { sessionId: a.sessionId, hash: a.hash, putAt: a.state.updatedAt } } }));
+      } else if (a.op === 'put-tombstone') {
+        await tombstone(a.jobId, a.sessionId, a.at, a.extra);
+        logger.info('bg', `sync: ${a.jobId} session=${a.sessionId} 写删除标记（本机清理了 / 会话不同步了 / 删了）`);
+        uiChanged = true;
+      } else if (a.op === 'fetch-state') {
+        const body = await getObjectIfExists(creds, objKey(a.rel));
+        const parsed = body ? parseRemoteBgState(body.toString('utf-8'), a.jobId, a.sessionId) : null;
+        if (body && !parsed) logger.warn('bg', `sync: 桶里的 ${a.rel} 认不出（格式不对 / 没有 runner），不显示`);
+        const ownIds = new Set(bgJobs.listForSync().map((j) => j.jobId));
+        let needsTombstone = false;
+        updateBgLedger((l) => { const r = applyFetchedState(l, a.jobId, parsed, a.etag, me.id, ownIds); needsTombstone = r.tombstone; return r.ledger; });
+        if (needsTombstone) {
+          logger.info('bg', `sync: 桶里的 ${a.jobId} 说是本机跑的，本机表里没有（清理过的 / 不是本机写的）：写删除标记，不当成本机的`);
+          await tombstone(a.jobId, a.sessionId, Date.now(), [a.rel]);
+        } else if (bgLedger().foreign[a.jobId]) uiChanged = true;
+      } else if (a.op === 'fetch-rerun') {
+        const body = await getObjectIfExists(creds, objKey(a.rel));
+        const mark = body ? parseRerunMark(body.toString('utf-8'), a.jobId, a.sessionId) : null;
+        if (mark && bgJobs.listForSync().some((j) => j.jobId === a.jobId)) {
+          /* 本机的任务被别的电脑在那边重跑了：只记下来显示，本机的进程照旧（不自动停） */
+          logger.info('bg', `sync: 本机的 ${a.jobId} 已被 ${mark.byName} 在那边重跑为 ${mark.newJobId}（本机进程照旧，要停就点停止）`);
+          updateBgLedger((l) => ({ ...l, ownReruns: { ...l.ownReruns, [a.jobId]: mark } }));
+          uiChanged = true;
+        } else if (mark) {
+          updateBgLedger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], rerun: mark, rerunPushed: true } } } : l));
+          uiChanged = true;
+        }
+      } else if (a.op === 'put-stop') {
+        await putObject(creds, objKey(bgObjectRel(a.sessionId, a.jobId, 'stop')), Buffer.from(stopRequestBody({ jobId: a.jobId, sessionId: a.sessionId, at: a.at, by: me.id }), 'utf-8'), 'application/json');
+        uploaded += 1;
+        updateBgLedger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], stopPushed: true } } } : l));
+      } else if (a.op === 'put-rerun') {
+        await putObject(creds, objKey(bgObjectRel(a.sessionId, a.jobId, 'rerun')), Buffer.from(rerunBody(a.jobId, a.sessionId, a.mark), 'utf-8'), 'application/json');
+        uploaded += 1;
+        updateBgLedger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], rerunPushed: true } } } : l));
+      } else if (a.op === 'forget') {
+        updateBgLedger((l) => {
+          const published = { ...l.published }; delete published[a.jobId];
+          const foreign = { ...l.foreign }; delete foreign[a.jobId];
+          const tombstones = a.tombstone && !l.tombstones[a.jobId] ? { ...l.tombstones, [a.jobId]: { sessionId: a.sessionId, at: Date.now(), pushed: true } } : l.tombstones;
+          const ownReruns = { ...l.ownReruns }; delete ownReruns[a.jobId];
+          return { published, foreign, ownReruns, tombstones };
+        });
+        uiChanged = true;
+      }
+    }
+    if (uiChanged) mainWindow?.webContents.send('bg:changed');
+    return uploaded;
+  } catch (err: any) {
+    logger.warn('s3', `后台任务同步没成功（这一轮先不管）：${err?.message || err}`);
+    if (uiChanged) mainWindow?.webContents.send('bg:changed');
+    return uploaded;
+  }
+}
+
+let bgPushTimer: NodeJS.Timeout | null = null;
+/** 本机的后台任务起 / 停 / 结束了，或者界面上点了停止 / 重跑：稍后只把后台任务这一项和桶对一下。 */
+function scheduleBgPush(delayMs = 5_000): void {
+  if (!loadSyncConfig().enabled) return;
+  if (bgPushTimer) clearTimeout(bgPushTimer);
+  bgPushTimer = setTimeout(() => { bgPushTimer = null; void syncBgJobsNow(); }, delayMs);
+}
+
+/** 只同步后台任务这一项。和整轮同步共用一把锁；锁被占着就稍后再试。 */
+async function syncBgJobsNow(): Promise<void> {
+  if (!loadSyncConfig().enabled) return;
+  const resolved = await lockThenResolve(syncLock, resolveSyncCredsNow);
+  if (!resolved) { scheduleBgPush(15_000); return; }
+  try {
+    if (resolved.problem || !resolved.creds) return;
+    await syncBgJobsWithBucket(resolved.creds, resolved.cfg.prefix);
+  } finally {
+    if (resolved.creds) syncRunning = false;
+  }
+}
+
+/** 界面上的一行（别的电脑上的后台任务，只读）：在哪台、多久没更新、本机重跑会用的 cwd 和确认摘要。 */
+function foreignBgRows(): any[] {
+  const cfg = loadSyncConfig();
+  const me = scheduleMachine().id;
+  const staleAfterMs = bgSyncStaleAfterMs();
+  return Object.entries(bgLedger().foreign)
+    .filter(([, f]) => bgSessionInScope(cfg, f.state.sessionId))
+    .map(([jobId, f]) => {
+      const localCwd = bgLocalCwd(f.state.sessionId);
+      return {
+        jobId, sessionId: f.state.sessionId, kind: f.state.kind, label: f.state.label, command: f.state.command,
+        state: f.state.state, startedAt: f.state.startedAt, endedAt: f.state.endedAt, exitCode: f.state.exitCode, pid: null, events: f.state.events,
+        elsewhere: {
+          runnerName: f.state.runnerName, updatedAt: f.state.updatedAt, staleAfterMs, cwd: f.state.cwd, tail: f.state.tail,
+          timeoutMs: f.state.timeoutMs, stopRequested: f.stopRequestedAt !== undefined, commandTruncated: !!f.state.commandTruncated,
+          rerun: f.rerun ? { byName: f.rerun.byName, here: f.rerun.by === me, newJobId: f.rerun.newJobId } : null,
+          localCwd, rerunHash: rerunHash(f.state, localCwd),
+        },
+      };
+    });
+}
+
+/*
   ── 外观：~/.kirolex/theme.json 颜色覆盖 + 外观配置跨电脑同步 ──
   校验 / 合并在 themeConfig.ts，文件读写在 themeFileStore.ts，同步判据在 appearanceSync.ts；这里只收集状态、读写、推给渲染端。
 */
@@ -8377,6 +8564,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     /* 定时任务（schedules/<会话>/<id>.json）：只管在同步的会话；运行状态只认 runner，定义 runner 本机不收远端改的（scheduleSync.ts） */
     noteScheduleDevices(oldCatalog);
     uploaded += await syncSchedulesWithBucket(creds!, cfg.prefix, { upload: true });
+    /* 后台任务（bg-jobs/<会话>/<jobId>.json）：只同步状态，别的电脑只显示；停止请求由跑它的那台执行（bgJobSync.ts） */
+    uploaded += await syncBgJobsWithBucket(creds!, cfg.prefix);
     /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
     const uploadList = [
       ...plan.upload.filter((r) => !isMemoryRel(r)),
@@ -13463,8 +13652,75 @@ ${hint}` : ''}` };
   /* Windows：启动后稍等一下（别和窗口抢）就把作业对象辅助进程起好，第一个 bg_run / watch 不再白等 PowerShell 启动 + 编译 */
   setTimeout(() => { try { bgJobs.warmUp(); } catch (err: any) { logger.warn('bg', `job helper warm-up failed: ${err?.message || err}`); } }, 3000).unref?.();
 
-  ipcMain.handle('bg:list', () => bgJobs.list());
+  /* 本机进程表里的 + 别的电脑上的（跨电脑同步来的，只读，带 `elsewhere`）—— 后者只是显示，不进 bgJobs */
+  ipcMain.handle('bg:list', () => {
+    /* 本机的任务被别的电脑在那边重跑过的，带上 `rerunElsewhere`（只显示） */
+    const reruns = bgLedger().ownReruns ?? {};
+    const own = bgJobs.list().map((j) => (reruns[j.jobId] ? { ...j, rerunElsewhere: { byName: reruns[j.jobId].byName, newJobId: reruns[j.jobId].newJobId } } : j));
+    return [...own, ...foreignBgRows()];
+  });
   ipcMain.handle('bg:stop', (_event, jobId: string) => bgJobs.stop(String(jobId || ''), 'user'));
+
+  /**
+   * **别的电脑上的后台任务：请求停止**。只记一个停止请求（jobId + 会话 + 时刻，传上去时就这些），跑它的那台拉到后
+   * 停掉它自己起的进程，状态再同步回来。请求只能停，不能改命令或参数；本机不碰任何进程。
+   */
+  ipcMain.handle('bg:request-stop', (_event, jobId: string) => {
+    const id = String(jobId || '');
+    const f = bgLedger().foreign[id];
+    if (!f) return { ok: false, error: tr('No such background task: {id}', { id }) };
+    if (f.state.state !== 'running') return { ok: true };
+    updateBgLedger((l) => (l.foreign[id] ? { ...l, foreign: { ...l.foreign, [id]: { ...l.foreign[id], stopRequestedAt: Date.now(), stopPushed: false } } } : l));
+    logger.info('bg', `request-stop ${id} session=${f.state.sessionId}: 记下停止请求，等 ${f.state.runnerName} 拉到后执行 runner=${f.state.runner}`);
+    mainWindow?.webContents.send('bg:changed');
+    scheduleBgPush(1_000);
+    return { ok: true };
+  });
+
+  /**
+   * **在本机重新运行**（跑它的那台失联了才给）：界面先弹窗把命令全文和本机 cwd 给人看，确认了才调这个。
+   * `hash` = 弹窗里给人看的那份（命令 / cwd / 种类 / 超时）的摘要 —— 期间被同步改过 / cwd 变了就拒（人确认的不是现在这份）。
+   * 在本机**新起**一个后台任务（新 jobId，结束时照本机规则叫醒会话）；旧的标成「已在别处重跑」。绝不自动重跑。
+   */
+  ipcMain.handle('bg:rerun-here', (_event, jobId: string, hash: string) => {
+    const id = String(jobId || '');
+    const f = bgLedger().foreign[id];
+    if (!f) return { ok: false, error: tr('No such background task: {id}', { id }) };
+    const sid = f.state.sessionId;
+    { const advRefused = refuseAdvancedOnly(sid, 'bg:rerun-here'); if (advRefused) return { ok: false, error: advRefused }; }
+    if (!store.readRecord(sid) || deletedSessionIds.has(sid)) return { ok: false, error: tr('Session not found') };
+    if (f.rerun) return { ok: false, error: tr('This background task was already re-run on {machine}.', { machine: f.rerun.byName }) };
+    /* 命令太长没能完整同步：不能执行一个截断了的命令 */
+    if (f.state.commandTruncated) return { ok: false, error: tr('The command was too long to sync in full, so it cannot be re-run here.') };
+    if (!bgRunnerLost(f.state, Date.now(), bgSyncStaleAfterMs())) {
+      return { ok: false, error: tr('{machine} is still updating this task. Stop it there instead of running it twice.', { machine: f.state.runnerName }) };
+    }
+    const cwd = bgLocalCwd(sid);
+    if (rerunHash(f.state, cwd) !== String(hash || '')) return { ok: false, error: tr('This background task changed after it was shown. Check it again before running it here.') };
+    const maxMs = (f.state.kind === 'watch' ? WATCH_MAX_TIMEOUT_SEC : BG_MAX_TIMEOUT_SEC) * 1000;
+    const r = bgJobs.start({ sessionId: sid, kind: f.state.kind, command: f.state.command, label: f.state.label, cwd, timeoutMs: Math.min(maxMs, f.state.timeoutMs) });
+    if (!r.ok) return { ok: false, error: r.error };
+    const me = scheduleMachine();
+    const mark = { at: Date.now(), by: me.id, byName: me.name, newJobId: r.job.jobId };
+    updateBgLedger((l) => (l.foreign[id] ? { ...l, foreign: { ...l.foreign, [id]: { ...l.foreign[id], rerun: mark, rerunPushed: false } } } : l));
+    logger.info('bg', `rerun-here ${id} → ${r.job.jobId} session=${sid}: 用户确认后在本机重新运行（原来在 ${f.state.runnerName} 上，失联）runner=${f.state.runner}`);
+    noteInSession(sid, tr('🔁 Background task "{label}" ({id}) was re-run on this computer as {newId} because {machine} lost contact', { label: f.state.label, id, newId: r.job.jobId, machine: f.state.runnerName }));
+    mainWindow?.webContents.send('bg:changed');
+    scheduleBgPush(1_000);
+    return { ok: true, jobId: r.job.jobId };
+  });
+
+  /*
+    跨电脑同步的后台任务：本机有在跑的（要心跳、要看停止请求）或者在显示别的电脑上在跑的（要看它的最新状态）时，
+    每分钟只把这一项和桶对一下；都没有就什么都不做。整轮同步照旧也会带上它。
+  */
+  setInterval(() => {
+    const cfg = loadSyncConfig();
+    if (!cfg.enabled || quitPending) return;
+    const ownLive = bgJobs.running().some((j) => bgSessionInScope(cfg, j.sessionId));
+    const foreignLive = Object.values(bgLedger().foreign).some((f) => f.state.state === 'running');   // 重跑过的旧任务还在跑也照样拉它的状态
+    if (ownLive || foreignLive) void syncBgJobsNow();
+  }, 60_000).unref?.();
   /* 正在跑的同步要跟着死 —— 不掐的话它会被 launchd 收养（ppid=1）继续推，没人读结果还吃光上行 */
   /*
     **退出时也要收掉远端的执行器** —— 实测同一条会话在远端留了两个 kiro-cli：
@@ -13996,6 +14252,9 @@ ${hint}` : ''}` };
     pendingSwitches.cancel(sessionId); // 删掉的会话不再应用欠着的切换
     /* 它的后台命令 / 监视一起停掉，排着没发的唤醒作废 */
     void bgJobs.stopSession(sessionId);
+    /* 跨电脑同步的那份也删：本机传过的、别的电脑的都写删除标记，不会再被补回（bgJobSync.forgetBgSession） */
+    updateBgLedger((l) => forgetBgSession(l, sessionId, Date.now()));
+    scheduleBgPush();
     wakeDispatcher.drop(sessionId, 'session deleted');
     /* 它身上的循环一起结束（discarded：记录删掉，不往要删的会话里写） */
     loopDriver?.stop(sessionId, 'discarded');

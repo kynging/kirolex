@@ -59,7 +59,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
 import { takeOverDetails, type ScheduleSummary } from '../scheduleView';
 import { ScheduleExpiryPopover, type ScheduleExpiryChange } from './ScheduleExpiryPopover';
-import { bgElapsedText, type BgJobRow } from '../bgJobsView';
+import { bgElapsedText, bgEndedText, bgRerunDetails, bgRunnerLost, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
 import { EngineIcon, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
@@ -3988,7 +3988,7 @@ interface ChatAreaProps {
    *  empty chip still reads as "scheduled". Liveness and wording are decided in that helper,
    *  so this component neither filters jobs nor formats a countdown. */
   scheduleSummary?: ScheduleSummary | null;
-  /** 模型起的、**还在跑**的后台命令 / 监视（`runningBgJobs` 过滤好的）。空数组 = 那一行不出现。 */
+  /** 模型起的、**还在跑**的后台命令 / 监视 + 别的电脑上的（`bannerBgJobs` 过滤好的，后者带 `elsewhere`、只读）。空数组 = 那一行不出现。 */
   bgJobs?: BgJobRow[];
   /** 新建的会话正在启动 / 启动失败 / 刚就绪（`createStages.ts`）—— 没有 = 那一条不出现 */
   startup?: CreateStageInfo | null;
@@ -3996,6 +3996,10 @@ interface ChatAreaProps {
   onRetryStartup?: (local: boolean) => void;
   /** 停掉一个（主进程只结束它自己起的那个进程，并在会话里说一声）。 */
   onStopBgJob?: (jobId: string) => void;
+  /** 别的电脑上的后台任务：请求停止（跑它的那台拉到后执行）。 */
+  onRequestStopBgJob?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
+  /** 别的电脑失联时「在本机重新运行」：先弹确认（命令全文 + cwd），确认了才调；`hash` 交回 main 核对。 */
+  onRerunBgJob?: (jobId: string, hash: string) => Promise<{ ok: boolean; error?: string }>;
 
   /** The project this chat belongs to, or null when it is unassigned. The flow rail is offered
    *  ONLY when there is one: a flow is a property of a project, so a "流程" entry on an
@@ -4129,6 +4133,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   scheduleSummary,
   bgJobs,
   onStopBgJob,
+  onRequestStopBgJob,
+  onRerunBgJob,
   startup,
   onRetryStartup,
   projectName,
@@ -4363,6 +4369,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const cancelArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
   /** 接管没成功（定义刚被同步改过 / 找不到了）的原因，就地显示在横幅上。 */
   const [takeOverError, setTakeOverError] = useState<string | null>(null);
+  /** 别的电脑上的后台任务：请求停止 / 在本机重跑没成功的原因（jobId → 原因），就地显示在那一行下面。 */
+  const [bgRemoteError, setBgRemoteError] = useState<Record<string, string>>({});
   useEffect(() => () => { if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current); }, []);
   /** 后台任务那一行的「运行了多久」用的钟：只在有任务在跑时走，粒度跟显示一致（第一分钟里按秒，之后按分钟）。 */
   const [bgNow, setBgNow] = useState(() => Date.now());
@@ -5687,13 +5695,88 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           只列还在跑的（结束的结果已经作为一条消息回到会话里了）。 */}
       {bgJobs && bgJobs.length > 0 && (
         <div className="bg-jobs-banner">
-          {bgJobs.map((job) => (
+          {bgJobs.map((job) => job.elsewhere ? (() => {
+            /* 跨电脑同步来的：跑在别的电脑上，只读。停止 = 写停止请求；那台失联才给「在本机重新运行」（先确认全文） */
+            const e = job.elsewhere;
+            const running = job.state === 'running';
+            const lost = bgRunnerLost(job, bgNow);
+            return (
+              <div key={job.jobId} className={`bg-job-remote${lost ? ' lost' : ''}${running ? '' : ' ended'}`}>
+                <div className="bg-job-row" title={job.command}>
+                  <span className="bg-job-icon">{job.kind === 'watch' ? '👀' : '⚙️'}</span>
+                  <span className="bg-job-kind">{job.kind === 'watch' ? t('Watching') : t('Background command')}</span>
+                  <span className="bg-job-label">{job.label}</span>
+                  <span className="bg-job-elapsed">{running
+                    ? t('running for {time}', { time: bgElapsedText(job.startedAt, bgNow, findLang) })
+                    : `${bgEndedText(job, findLang)} · ${t('ran {time}', { time: bgElapsedText(job.startedAt, job.endedAt ?? job.startedAt, findLang) })}`}</span>
+                  {job.kind === 'watch' && job.events > 0 && <span className="bg-job-events">{t('{n} event(s)', { n: job.events })}</span>}
+                  {running && !e.rerun && lost && !e.commandTruncated && onRerunBgJob && (
+                    <button
+                      className="bg-job-rerun"
+                      onClick={() => {
+                        setBgRemoteError((m) => { const { [job.jobId]: _drop, ...rest } = m; return rest; });
+                        setConfirm({
+                          title: t('Run this background task again on this computer?'),
+                          message: t('{machine} lost contact, so this status may be out of date. This starts a NEW background task on this computer (new job id); the old one is marked as re-run elsewhere. If {machine} is in fact still running it, both will run.', { machine: e.runnerName }),
+                          /* 命令全文放进可滚动、会换行的区域：再长、再多行，确认 / 取消按钮也始终看得见 */
+                          detail: bgRerunDetails(job, findLang),
+                          confirmLabel: t('Run it on this computer'),
+                          onConfirm: () => {
+                            void onRerunBgJob(job.jobId, e.rerunHash).then((r) => {
+                              if (!r.ok) setBgRemoteError((m) => ({ ...m, [job.jobId]: r.error || t('Could not run it on this computer') }));
+                            });
+                          },
+                        });
+                      }}
+                      title={t('Shows the full command and working directory first; nothing runs until you confirm')}
+                    >{t('🔁 Run here')}</button>
+                  )}
+                  {/* 重跑过也照样能请求停止：重跑不会停掉那台上的旧进程，重跑标记只禁止再重跑一次 */}
+                  {running && onRequestStopBgJob && (
+                    <button
+                      className="bg-job-stop"
+                      disabled={e.stopRequested}
+                      onClick={() => {
+                        void onRequestStopBgJob(job.jobId).then((r) => {
+                          if (!r.ok) setBgRemoteError((m) => ({ ...m, [job.jobId]: r.error || t('Could not send the stop request') }));
+                        });
+                      }}
+                      title={t('Sends a stop request; {machine} stops it (only the process it started) when it syncs', { machine: e.runnerName })}
+                    >{e.stopRequested ? t('Stop requested') : t('⏹️ Stop')}</button>
+                  )}
+                </div>
+                <div className={`bg-job-runner${lost ? ' offline' : ''}`}>
+                  {e.rerun
+                    ? (e.rerun.here ? t('🔁 Re-run on this computer as {id}', { id: e.rerun.newJobId }) : t('🔁 Re-run elsewhere ({machine})', { machine: e.rerun.byName }))
+                    : lost
+                      ? t('🖥️ {machine} lost contact; this status may be out of date', { machine: e.runnerName })
+                      : running ? t('🖥️ Runs on {machine}', { machine: e.runnerName }) : t('🖥️ Ran on {machine}', { machine: e.runnerName })}
+                  {' · '}{t('started {time}', { time: new Date(job.startedAt).toLocaleString() })}
+                  {running && e.stopRequested && ` · ${t('stop requested; waits for {machine} to sync', { machine: e.runnerName })}`}
+                </div>
+                {e.commandTruncated && <div className="bg-job-runner offline">{t('The command was too long to sync in full; only its beginning is shown and it cannot be re-run here.')}</div>}
+                {bgRemoteError[job.jobId] && <div className="bg-job-runner offline">{bgRemoteError[job.jobId]}</div>}
+                <details className="bg-job-details">
+                  <summary>{running ? t('Command') : t('Command and last output')}</summary>
+                  <pre className="bg-job-command">{job.command}</pre>
+                  <div className="bg-job-cwd">{t('Working directory on {machine}:', { machine: e.runnerName })} {e.cwd}</div>
+                  {!running && <pre className="bg-job-tail">{e.tail || t('(no output)')}</pre>}
+                </details>
+              </div>
+            );
+          })() : (
             <div key={job.jobId} className="bg-job-row" title={job.command}>
               <span className="bg-job-icon">{job.kind === 'watch' ? '👀' : '⚙️'}</span>
               <span className="bg-job-kind">{job.kind === 'watch' ? t('Watching') : t('Background command')}</span>
               <span className="bg-job-label">{job.label}</span>
               <span className="bg-job-elapsed">{t('running for {time}', { time: bgElapsedText(job.startedAt, bgNow, findLang) })}</span>
               {job.kind === 'watch' && job.events > 0 && <span className="bg-job-events">{t('{n} event(s)', { n: job.events })}</span>}
+              {/* 本机失联期间被别的电脑在那边重跑了：标出来（本机进程照旧，要停就点停止） */}
+              {job.rerunElsewhere && (
+                <span className="bg-job-events" title={t('This computer lost contact while it ran, so {machine} started it again as {id}. This one keeps running here until you stop it.', { machine: job.rerunElsewhere.byName, id: job.rerunElsewhere.newJobId })}>
+                  {t('🔁 Re-run elsewhere ({machine})', { machine: job.rerunElsewhere.byName })}
+                </span>
+              )}
               <button
                 className="bg-job-stop"
                 onClick={() => onStopBgJob?.(job.jobId)}

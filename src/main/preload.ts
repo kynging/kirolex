@@ -467,6 +467,9 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /* ── 模型起的后台命令 / 监视（bg_run / watch，进程在 MAIN 里）—— 这里只列出来、给一个停止按钮 ── */
   bgList: () => ipcRenderer.invoke('bg:list'),
   bgStop: (jobId: string) => ipcRenderer.invoke('bg:stop', jobId),
+  /* 别的电脑上的（跨电脑同步来的，只读）：停止 = 写一个停止请求，由跑它的那台执行；失联时确认全文后在本机重新运行 */
+  bgRequestStop: (jobId: string) => ipcRenderer.invoke('bg:request-stop', jobId),
+  bgRerunHere: (jobId: string, hash: string) => ipcRenderer.invoke('bg:rerun-here', jobId, hash),
   onBgChanged: (cb: () => void) => {
     const handler = () => cb();
     ipcRenderer.on('bg:changed', handler);

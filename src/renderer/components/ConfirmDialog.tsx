@@ -27,6 +27,11 @@ export interface ConfirmRequest {
   title: string;
   /** Body text. Newlines are preserved, so a consequence can go on its own line. */
   message: string;
+  /**
+   * 要人逐字核对的全文（例如要在本机执行的命令）：放进一个可滚动、会换行的等宽区域，弹窗限高，
+   * 再长按钮也始终看得见。不给 = 和原来一样。
+   */
+  detail?: string;
   /** Label of the button that performs the action. Defaults to '确定'. */
   confirmLabel?: string;
   /** Label of the dismissing button. Defaults to '取消'. */
@@ -78,10 +83,11 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ request, onClose }
   return (
     <>
       <div className="overlay" onClick={onClose} />
-      <div className="permission-dialog" role="dialog" aria-modal="true" aria-label={request.title}>
+      <div className={`permission-dialog${request.detail ? ' has-detail' : ''}`} role="dialog" aria-modal="true" aria-label={request.title}>
         <h3>{request.title}</h3>
         {/* pre-wrap so the caller can put the consequence on its own line. */}
         <p style={{ whiteSpace: 'pre-wrap' }}>{request.message}</p>
+        {request.detail && <pre className="confirm-dialog-detail">{request.detail}</pre>}
         <div className="actions">
           <button className="btn deny" onClick={onClose}>
             {request.cancelLabel || t('Cancel')}

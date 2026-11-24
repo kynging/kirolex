@@ -28,6 +28,7 @@ import path from 'path';
 import { WinJobHost, type JobHost } from './winJob.ts';
 import { trIn, uiLang, type UiLang } from './uiText.ts';
 import { decodeLocalOutput } from './winShell.ts';
+import type { OwnBgJob } from './bgJobSync.ts';
 
 /** `check`：定时任务的 `checkCommand`（`runCheck`）—— 结果交回调用方，不唤醒会话、不进列表 / 登记 / 名额。 */
 export type BgKind = 'run' | 'watch' | 'check';
@@ -115,6 +116,9 @@ export interface BgStartInput {
 }
 
 interface Job extends BgJobView {
+  /** 完整命令和工作目录：只给跨电脑同步（`listForSync`）用 —— 日志 / 登记 / 界面列表照旧只有前 80 字。 */
+  fullCommand: string;
+  cwd: string;
   /** 已经在收尾（清它留下的进程、然后宣布结束）—— close 和「管道不关」那条路只走一次。 */
   ending?: boolean;
   child: ChildProcess | null;
@@ -198,7 +202,7 @@ export class BgJobManager {
     const job: Job = {
       jobId, sessionId: input.sessionId, kind: input.kind,
       label: String(input.label || '').trim() || head(command).slice(0, 40),
-      command: head(command), state: 'running', startedAt: Date.now(), endedAt: null, exitCode: null, pid: null, events: 0,
+      command: head(command), fullCommand: command, cwd: input.cwd, state: 'running', startedAt: Date.now(), endedAt: null, exitCode: null, pid: null, events: 0,
       child: null, out: Buffer.alloc(0), pendingLines: [], partial: '', partialBytes: Buffer.alloc(0), flushTimer: null, timeoutTimer: null, eventTimes: [],
       timeoutMs: input.timeoutMs,
       ...(input.kind === 'check' ? { hash: createHash('sha256'), wsTail: Buffer.alloc(0) } : {}),
@@ -292,6 +296,19 @@ export class BgJobManager {
       .filter((j) => j.kind !== 'check' && (!sessionId || j.sessionId === sessionId))
       .sort((a, b) => a.startedAt - b.startedAt)
       .map((j) => this.view(j));
+  }
+
+  /**
+   * 跨电脑同步要传的那份（`bgJobSync.ts`）：完整命令、cwd、超时；结束了的带输出末尾（同唤醒消息的截断，`BG_TAIL_BYTES`）。
+   * 只读，不改任何任务的状态。
+   */
+  listForSync(): OwnBgJob[] {
+    const lang = this.lang();
+    return [...this.jobs.values()].filter((j) => j.kind === 'run' || j.kind === 'watch').map((j) => ({
+      jobId: j.jobId, sessionId: j.sessionId, kind: j.kind as 'run' | 'watch', label: j.label, command: j.fullCommand, cwd: j.cwd,
+      timeoutMs: j.timeoutMs, state: j.state, startedAt: j.startedAt, endedAt: j.endedAt, exitCode: j.exitCode, events: j.events,
+      tail: j.state === 'running' ? null : outputTail(j.out, BG_TAIL_BYTES, lang),
+    }));
   }
 
   running(): BgJobRecord[] {

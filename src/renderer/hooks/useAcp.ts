@@ -4656,6 +4656,16 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     if (!jobId) return;
     try { await window.kiroApi.bgStop?.(jobId); } catch {}
   }, []);
+  /** 别的电脑上的后台任务（跨电脑同步来的，只读）：停止 = 写一个停止请求，跑它的那台拉到后执行。 */
+  const requestStopBgJob = useCallback(async (jobId: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!jobId) return { ok: false };
+    try { return (await window.kiroApi.bgRequestStop?.(jobId)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+  }, []);
+  /** 跑它的那台失联：确认弹窗（命令全文 + cwd）之后才调；main 核对摘要再在本机新起一个。错误交回卡片就地显示。 */
+  const rerunBgJobHere = useCallback(async (jobId: string, hash: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!jobId) return { ok: false };
+    try { return (await window.kiroApi.bgRerunHere?.(jobId, hash)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+  }, []);
 
   /**
    * Create a TIME-TRIGGERED TASK. Replaces `startLoop`.
@@ -5992,6 +6002,8 @@ ${text}`,
     takeOverSchedule,
     bgJobs,
     stopBgJob,
+    requestStopBgJob,
+    rerunBgJobHere,
     stopLoop,
     restoredInputDraft,
     /**
