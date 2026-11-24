@@ -2637,6 +2637,37 @@ button, input, select, textarea {
   white-space: nowrap;
   font-weight: 600;
 }
+/* 跨电脑同步：在别的电脑上跑的任务 —— 标出在哪台上跑；那台很久没同步了变成提示色 */
+.schedule-banner.elsewhere { flex-wrap: wrap; row-gap: 2px; }
+.schedule-banner.ended {
+  background: rgba(128, 128, 128, 0.10);
+  border-color: var(--border);
+  color: var(--text-secondary);
+}
+.schedule-banner-runner {
+  order: 2;
+  flex: 0 0 100%;
+  min-width: 0;
+  padding-left: 26px;
+  box-sizing: border-box;
+  color: var(--text-secondary);
+  font-size: 11px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.schedule-banner-runner.offline { color: var(--warning, #ffa726); }
+.schedule-banner-takeover {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--accent);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+}
+.schedule-banner-takeover:hover { background: rgba(124, 111, 224, 0.16); }
 /* 「由模型创建」：一个小标签，让人一眼看出这不是自己设的 */
 .schedule-banner-by-model {
   flex-shrink: 0;

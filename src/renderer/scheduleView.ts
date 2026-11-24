@@ -37,6 +37,58 @@ export interface ScheduleView {
   /** 目标型任务的目标（文字）。 */
   until?: string | null;
   checkCommand?: string | null;
+  /* 跨电脑同步（main 的 scheduleSync.ts）：只有执行者那台跑。老的 main 不给这些字段 = 本机跑。 */
+  /** 本机就是执行者（而且定义在本机确认过）。`false` = 本机只显示，不跑。 */
+  runsHere?: boolean;
+  /** 结束了的话：结束原因 + 跑了几次的那一句（main 的 `scheduleEndedText`，和执行者那台写进会话的一样）。没结束 = null。 */
+  endedText?: string | null;
+  /** 上一次检查的结果（执行者那台写的，跟着同步过来）：时刻、结论、退出码、输出末尾一小段。 */
+  lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null;
+  /** 不在本机跑时：在哪台上跑（主机名）。 */
+  runnerName?: string | null;
+  /** 执行者写着本机、但定义没在本机确认过（恢复会话拉回来的）：同样要接管确认才跑。 */
+  needsConfirm?: boolean;
+  /** 执行者那台最后一次同步的时刻（不知道 = null）。 */
+  runnerSeenAt?: number | null;
+  /** 超过多久没同步就提示「可能关机了」（约 2 个同步周期）。 */
+  staleAfterMs?: number;
+  /** 定义的摘要：接管时交回 main 核对「确认的就是这份」。 */
+  defHash?: string;
+}
+
+/**
+ * 执行者那台多久没同步了：超过 `staleAfterMs` 给小时数（至少 1），界面提示「可能关机了，可以接管到本机」；
+ * 没超过 / 不知道它什么时候同步过 → null。
+ */
+export function runnerOfflineHours(seenAt: number | null | undefined, now: number, staleAfterMs: number | undefined): number | null {
+  if (typeof seenAt !== 'number' || !Number.isFinite(seenAt) || !(typeof staleAfterMs === 'number' && staleAfterMs > 0)) return null;
+  const gap = now - seenAt;
+  if (gap <= staleAfterMs) return null;
+  return Math.max(1, Math.floor(gap / 3600_000));
+}
+
+/** 「上次检查」那一行：时刻 + 结论（+ 退出码）+ 输出末尾；没有检查过 = null。 */
+export function lastCheckText(c: ScheduleView['lastCheck'], lang: Lang = 'zh'): string | null {
+  if (!c || typeof c.at !== 'number') return null;
+  const when = new Date(c.at).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  const verdict = c.result === 'achieved' ? t(lang, 'goal reached (exit 0)')
+    : c.result === 'unchanged' ? t(lang, 'not reached yet, output unchanged (exit 1)')
+    : c.result === 'changed' ? t(lang, 'not reached yet, output changed (exit 1)')
+    : c.code === null ? t(lang, 'failed (did not finish)') : t(lang, 'failed (exit {code})', { code: c.code });
+  const out = String(c.output || '').replace(/\s+/g, ' ').trim();
+  return t(lang, '🔎 Last check {when}: {verdict}', { when, verdict }) + (out ? ` · ${out}` : '');
+}
+
+/** 接管确认弹窗里的全文：prompt、checkCommand、目标、周期一条不省。 */
+export function takeOverDetails(job: ScheduleView, lang: Lang = 'zh'): string {
+  const lines = [
+    t(lang, 'Schedule: {schedule}', { schedule: job.describe }),
+    t(lang, 'Message sent each time:'),
+    job.prompt,
+  ];
+  if (job.until) lines.push('', t(lang, 'Goal (until): {goal}', { goal: job.until }));
+  if (job.checkCommand) lines.push('', t(lang, 'Check command (runs in a shell on this computer):'), job.checkCommand);
+  return lines.join('\n');
 }
 
 export interface ScheduleSummary {
@@ -56,6 +108,10 @@ export interface ScheduleSummary {
   goal: string | null;
   /** `next` 的过期时间；有它横幅才给「延长 / 不过期」。 */
   expiresAt: number | null;
+  /** `next` 不在本机跑：在哪台上跑、是否只差本机确认、那台多久没同步了（小时，没超时 = null）。在本机跑 = null。 */
+  elsewhere: { name: string; needsConfirm: boolean; offlineHours: number | null; lastCheck: string | null } | null;
+  /** 已经结束的任务（只在不跑它的那台上保留这张卡，`endedElsewhereSummary`）：结束那一句。还在跑 = 没有 / null。 */
+  ended?: string | null;
 }
 
 /**
@@ -124,6 +180,10 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
   if (expiresAt !== null) {
     parts.push(t(lang, 'Expires {when}', { when: new Date(expiresAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }));
   }
+  /* 不在本机跑：本机看不到它什么时候跑过，把执行者那台上次运行的时刻也写上 */
+  if (next && next.runsHere === false && typeof next.lastRunAt === 'number') {
+    parts.push(t(lang, 'Last run {when}', { when: new Date(next.lastRunAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }));
+  }
   if (live.length > 1) parts.push(t(lang, '{n} jobs in total', { n: live.length }));
   // The error goes LAST but is never dropped: a daily job that has failed every morning
   // must not read the same as one that has been working.
@@ -142,6 +202,37 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
     byModel: next?.createdBy === 'model',
     goal: next?.until?.trim() || null,
     expiresAt,
+    elsewhere: next && next.runsHere === false
+      ? { name: next.runnerName || '?', needsConfirm: !!next.needsConfirm, offlineHours: next.needsConfirm ? null : runnerOfflineHours(next.runnerSeenAt, now, next.staleAfterMs), lastCheck: lastCheckText(next.lastCheck, lang) }
+      : null,
+  };
+}
+
+/**
+ * **在别的电脑上跑完了的任务**（跨电脑同步）：执行者那台结束时会在会话里说一声，这边却只有任务记录 ——
+ * 还在跑的一个都没有时，留一张「已结束」卡：在哪台上跑的、结束原因和跑了几次、最后一次检查的结果。
+ * 只认不在本机跑的（本机跑的结束时，结局那一句就在本机的会话里）。几条都结束了取最后跑的那条。没有 = null。
+ */
+export function endedElsewhereSummary(jobs: ScheduleView[], lang: Lang = 'zh'): ScheduleSummary | null {
+  const ended = jobs.filter((job) => job.runsHere === false && !isLive(job));
+  if (!ended.length) return null;
+  const last = ended.reduce((a, b) => ((b.lastRunAt ?? 0) > (a.lastRunAt ?? 0) ? b : a));
+  const ranText = t(lang, 'Ended · ran {n} time(s)', { n: last.runs });
+  const endedText = last.endedText || ranText;
+  const parts = [endedText];
+  if (last.lastError) parts.push(t(lang, 'Last failure: {error}', { error: String(last.lastError) }));
+  return {
+    count: 0,
+    text: parts.join(' · '),
+    short: t(lang, 'Ended'),
+    paused: false,
+    hasError: !!last.lastError,
+    next: last,
+    byModel: last.createdBy === 'model',
+    goal: last.until?.trim() || null,
+    expiresAt: null,
+    elsewhere: { name: last.runnerName || '?', needsConfirm: false, offlineHours: null, lastCheck: lastCheckText(last.lastCheck, lang) },
+    ended: endedText,
   };
 }
 

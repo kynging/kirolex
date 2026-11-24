@@ -11,7 +11,7 @@ import { activeSplitSizes, computePaneFlex, putSplitSizes, resetSplitSizes, Spli
 import { autoFoldPanels, filePanelMax } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
-import { schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
+import { endedElsewhereSummary, schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
 import { runningBgJobs, type BgJobRow } from './bgJobsView';
 import { startupBlocksSend } from './createStages';
 // 给主会话的交底 —— 它原本对流程一无所知，连执行会话都不知道
@@ -127,9 +127,10 @@ declare global {
       onLoopChanged?: (cb: (payload: { sessionId: string; run: any | null }) => void) => () => void;
       /** SCHEDULED TASKS. The ticker is in main, so a job fires with no window open. */
       scheduleCreate?: (sessionId: string, spec: any) => Promise<{ ok: boolean; id?: string; error?: string; nextRunAt?: number | null; describe?: string }>;
-      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null }>>;
+      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null; runsHere?: boolean; endedText?: string | null; lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null; runnerName?: string | null; needsConfirm?: boolean; runnerSeenAt?: number | null; staleAfterMs?: number; defHash?: string }>>;
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
+      scheduleTakeOver?: (id: string, defHash: string) => Promise<{ ok: boolean; error?: string }>;
       scheduleSetExpiry?: (id: string, change: { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' }) => Promise<{ ok: boolean; error?: string; expiresAt?: number | null }>;
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
       /** 模型起的后台命令 / 监视（进程在 main 里）。 */
@@ -1105,6 +1106,7 @@ const App: React.FC = () => {
     pauseSchedule,
     cancelSchedule,
     setScheduleExpiry,
+    takeOverSchedule,
     bgJobs,
     stopBgJob,
     stopLoop,
@@ -1628,6 +1630,18 @@ const App: React.FC = () => {
       return cache.get(sid) ?? null;
     };
   }, [schedules, scheduleNow, settings.language]);
+
+  /**
+   * 聊天顶部那张卡：还在跑的照旧；**一个都不跑了**、而其中有在别的电脑上跑完的（跨电脑同步），留一张「已结束」卡 ——
+   * 不然执行者那台一结束，这边的卡就没了，看不到最后结果和结束原因。侧栏徽标不变（只管还在跑的）。
+   */
+  const scheduleBannerFor = useMemo(() => {
+    const byId = schedulesBySession(schedules);
+    return (sid: string | null): ScheduleSummary | null => {
+      if (!sid) return null;
+      return scheduleSummaryFor(sid) ?? endedElsewhereSummary(byId.get(sid) || [], settings.language);
+    };
+  }, [schedules, scheduleSummaryFor, settings.language]);
 
   /** 每条会话还在跑的后台命令 / 监视（按会话缓存：没变就是同一个数组，ChatArea 的 memo 不白算）。 */
   const bgJobsFor = useMemo(() => {
@@ -4475,10 +4489,11 @@ const App: React.FC = () => {
         onToggleContextSource={(sourceId) => toggleContextSource(sourceId, sid || undefined)}
         isLooping={!!sid && loopingIds.includes(sid)}
         onStartSchedule={(spec) => { if (sid) void createSchedule(sid, spec); }}
-        scheduleSummary={scheduleSummaryFor(sid)}
+        scheduleSummary={scheduleBannerFor(sid)}
         onPauseSchedule={(id, paused) => void pauseSchedule(id, paused)}
         onCancelSchedule={(id) => void cancelSchedule(id)}
         onSetScheduleExpiry={(id, change) => setScheduleExpiry(id, change)}
+        onTakeOverSchedule={(id, defHash) => takeOverSchedule(id, defHash)}
         bgJobs={bgJobsFor(sid)}
         startup={sid ? createStages[sid] || null : null}
         onRetryStartup={(local) => { if (sid) void retryCreateSession(sid, { local }); }}

@@ -4705,6 +4705,12 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     try { return (await window.kiroApi.scheduleSetExpiry?.(id, change)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
   }, []);
 
+  /** 「接管到本机」：确认弹窗之后才调；main 核对定义摘要（弹窗里给人看的那份）再改执行者。错误交回横幅就地显示。 */
+  const takeOverSchedule = useCallback(async (id: string, defHash: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!id) return { ok: false };
+    try { return (await window.kiroApi.scheduleTakeOver?.(id, defHash)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+  }, []);
+
   const cancelSchedule = useCallback(async (id: string) => {
     if (!id) return;
     try { await window.kiroApi.scheduleRemove?.(id); } catch {}
@@ -5983,6 +5989,7 @@ ${text}`,
     pauseSchedule,
     cancelSchedule,
     setScheduleExpiry,
+    takeOverSchedule,
     bgJobs,
     stopBgJob,
     stopLoop,

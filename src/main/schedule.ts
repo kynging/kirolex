@@ -26,6 +26,7 @@
  * off; Warp's scheduled agents open a fresh session per run for the same reason. Feeding
  * the last result back is exactly what makes a scheduled job report the same thing every
  * morning. So this state records THAT a run happened and when — never its output.
+ * （`lastCheck` 留的检查输出末尾只给界面显示「上次检查」，从不拼进发给模型的消息。）
  *
  * Wall-clock kinds (`daily` / `weekly`) are not sugar over an interval: an every-86400s
  * job drifts by however long each run took, so a 9am report slides later every day.
@@ -93,9 +94,46 @@ export interface ScheduleState {
   lastCheckHash?: string | null;
   /** `checkCommand` 连续出错几次了；到 `CHECK_ERROR_LIMIT` 自动暂停。 */
   checkErrors?: number;
+  /**
+   * 上一次检查的结果（跨电脑同步时，不跑它的那台据此显示「上次检查」）：时刻、结论、退出码、输出**末尾一小段**
+   * （`CHECK_OUTPUT_KEEP` 字）。这段输出本来就会作为叫醒消息进会话记录；只是不叫醒（输出没变）的那次，它和上一次一样。
+   */
+  lastCheck?: LastCheck | null;
   /** `'check-errors'`：是检查命令连续出错自动暂停的（不是用户按的）—— 那一次的错误汇报照发给模型（见 `scheduleDeliveryBlocker`）。
    *  用户暂停 / 继续时清掉。 */
   pausedBy?: 'check-errors' | null;
+  /*
+    跨电脑同步（`scheduleSync.ts`）：只有执行者（runner）那台跑这条任务。老文件没有这些字段 = 本机建的（启动时补成本机）。
+  */
+  /** 执行者：设备 ID（`thisDeviceId()`）。只有 runner 那台排定时器、跑 checkCommand、叫醒会话。 */
+  runner?: string;
+  /** 执行者的主机名（只用来显示「在 <机器名> 上运行」）。 */
+  runnerName?: string;
+  /** runner 最后一次改的时刻（建任务 / 接管）—— 两台同时接管时后者胜。 */
+  runnerChangedAt?: number;
+  /** 接管的时刻：接管后的第一次运行从这一刻算，不补跑错过的（见 `timingState`）。没接管过 = 没有。 */
+  takenOverAt?: number | null;
+  /** 运行状态（runs / lastRunAt / lastError / 检查结果 / terminal）最后一次是哪台、什么时候写的。合并时只认 runner 写的。 */
+  statusBy?: string;
+  statusAt?: number;
+  /** 控制操作最后一次的时刻：暂停 / 继续、改过期时间。任何一台都能改，按时间后者胜。 */
+  pausedChangedAt?: number;
+  expiryChangedAt?: number;
+}
+
+/** 上一次检查：`achieved` 退出码 0；`unchanged` 退出码 1、输出没变（没叫醒）；`changed` 退出码 1、输出变了；`error` 其他（超时 / 起不来 / 别的退出码）。 */
+export interface LastCheck {
+  at: number;
+  result: 'achieved' | 'unchanged' | 'changed' | 'error';
+  code: number | null;
+  output: string;
+}
+
+/** `lastCheck.output` 留多少字（末尾）。 */
+export const CHECK_OUTPUT_KEEP = 300;
+
+function lastCheckOf(at: number, result: LastCheck['result'], code: number | null, output: string): LastCheck {
+  return { at, result, code, output: output.length > CHECK_OUTPUT_KEEP ? `…${output.slice(-CHECK_OUTPUT_KEEP)}` : output };
 }
 
 /** Floor on the interval, matching KiroCrew's cron. Every run costs a model turn, so a
@@ -387,21 +425,21 @@ export function planScheduleCheck(state: ScheduleState, result: ScheduleCheckRes
   if (result.status === 'exited' && result.code === 0) {
     return {
       action: 'achieved',
-      state: { ...state, lastRunAt: now, checkErrors: 0, terminal: 'achieved' },
+      state: { ...state, lastRunAt: now, checkErrors: 0, terminal: 'achieved', lastCheck: lastCheckOf(now, 'achieved', 0, output) },
       text: `${trIn(lang, '✅ The check command exited with 0: the goal is reached and this scheduled task has ended. Give the final report.')}\n${shown}`,
     };
   }
   if (result.status === 'exited' && result.code === 1) {
     const hash = result.fingerprint || outputFingerprint(output);
     const checked = { ...state, lastRunAt: now, checkErrors: 0, lastCheckHash: hash };
-    if (state.lastCheckHash === hash) return { action: 'skip', state: checked, text: '' };
-    return { action: 'wake', state: checked, text: `${trIn(lang, '🔎 The check command exited with 1 (not reached yet), and its output changed:')}\n${shown}` };
+    if (state.lastCheckHash === hash) return { action: 'skip', state: { ...checked, lastCheck: lastCheckOf(now, 'unchanged', 1, output) }, text: '' };
+    return { action: 'wake', state: { ...checked, lastCheck: lastCheckOf(now, 'changed', 1, output) }, text: `${trIn(lang, '🔎 The check command exited with 1 (not reached yet), and its output changed:')}\n${shown}` };
   }
   const errors = (state.checkErrors ?? 0) + 1;
   const why = result.status === 'timeout' ? trIn(lang, 'timed out')
     : result.status === 'failed' ? trIn(lang, 'could not run')
     : trIn(lang, 'exit code {code}', { code: result.code ?? '?' });
-  const failed = { ...state, lastRunAt: now, checkErrors: errors };
+  const failed = { ...state, lastRunAt: now, checkErrors: errors, lastCheck: lastCheckOf(now, 'error', result.status === 'exited' ? result.code : null, output) };
   if (errors >= CHECK_ERROR_LIMIT) {
     return {
       action: 'paused',

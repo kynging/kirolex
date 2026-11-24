@@ -96,6 +96,7 @@ import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleOwnerGate, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
+import { SCHEDULES_REL, canRunHere, collectBucketSchedules, definitionHash, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
 import { scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
@@ -6119,7 +6120,7 @@ const wakeDispatcher = new WakeDispatcher({
   },
   /* 定时任务那一次排着的时候被删 / 暂停 / 过期了就不发（盘上的状态为准，见 `scheduleDeliveryBlocker`） */
   isStale: (item) => (item.source === 'schedule' && item.ref
-    ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now())
+    ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now()) ?? scheduleNotRunnerHere(item.ref)
     : item.source === 'nudge' ? textToolNudgeStale(item) : null),
   /* 不看报错文字（tr() 出来的，中文界面下是中文）：看错误码，或者此刻会话是不是真的在忙 */
   isBusyError: (err, item) => isWakeBusyError(err, quitPending || !!busyReasonFor(item.sessionId)),
@@ -6399,6 +6400,7 @@ const wakeHost: WakeHost = {
       return { ok: false, error: String(err?.message || err) };
     }
     logger.info('schedule', `created by model id=${id} session=${sessionId} ${describeSchedule(spec)} maxRuns=${spec.maxRuns} expiresAt=${expiresAt ?? 'none'}`);
+    scheduleSchedulePush();
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true, id, describe: describeSchedule(spec), nextRunAt: nextRunAt(state) };
   },
@@ -6417,6 +6419,7 @@ const wakeHost: WakeHost = {
     wakeDispatcher.dropRef(id, 'removed');
     noteScheduleRemoved(job);
     logger.info('schedule', `removed by model id=${id}`);
+    scheduleSchedulePush();
     mainWindow?.webContents.send('schedule:changed', { id, state: null });
     return { ok: true };
   },
@@ -7430,6 +7433,176 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
   }
 }
 
+/** 本机是哪台：定时任务的 runner 值（设备 ID，同云端清理的设备清单）+ 显示用的主机名。 */
+let scheduleMachineCache: ScheduleMachine | null = null;
+function scheduleMachine(): ScheduleMachine {
+  if (!scheduleMachineCache) scheduleMachineCache = { id: thisDeviceId(), name: machineTag(os.hostname()) };
+  return scheduleMachineCache;
+}
+/* 本机的每次写都盖戳（新建的 runner = 本机、控制操作 / 运行状态记时刻），删除留删除标记 —— 见 scheduleStore.writeSchedule */
+scheduleStore.setLocalScheduleMachine(scheduleMachine());
+
+/** 「不是本机执行」已经记过日志的：id → 原因（原因变了才再记一行，不然 20 秒一跳刷屏）。 */
+const scheduleSkipLogged = new Map<string, string>();
+/**
+ * **本机能不能跑这条**：runner 是本机，并且定义是本机确认过的（本机建的 / 接管时确认的，`canRunHere`）。
+ * 调度器排定时器、跑 checkCommand、叫醒会话之前都先过这一道。
+ */
+function scheduleRunsHere(job: scheduleStore.StoredSchedule): boolean {
+  const me = scheduleMachine().id;
+  if (canRunHere(job.state, me, scheduleStore.readApprovedHash(job.id, os.homedir()))) { scheduleSkipLogged.delete(job.id); return true; }
+  const why = job.state.runner === me ? 'unconfirmed' : `runner=${job.state.runner ?? '?'}`;
+  if (scheduleSkipLogged.get(job.id) !== why) {
+    scheduleSkipLogged.set(job.id, why);
+    logger.info('schedule', `skip id=${job.id}: 不是本机执行（${job.state.runner === me ? '本机是 runner，但定义没在本机确认过，要接管确认' : `在 ${job.state.runnerName || '?'} 上运行`}），不排定时器 runner=${job.state.runner ?? '?'}`);
+  }
+  return false;
+}
+
+/**
+ * 排着的定时唤醒（会话忙，等它空下来）**真正发出去之前**再判一次执行权：同步进来别的电脑接管了 / 定义没在本机确认过
+ * → `'not-runner'`，不发。删了 / 暂停 / 结束 / 过期照旧由 `scheduleDeliveryBlocker` 判。
+ */
+function scheduleNotRunnerHere(id: string): string | null {
+  const job = scheduleStore.readSchedule(id, os.homedir());
+  return job && !scheduleRunsHere(job) ? 'not-runner' : null;
+}
+
+/** 两道一起：删了 / 暂停 / 结束 / 过期（`scheduleDeliveryBlocker`），或者本机已不是执行者（`scheduleNotRunnerHere`）。 */
+function scheduleWakeBlocked(id: string): string | null {
+  return scheduleDeliveryBlocker(scheduleStore.readSchedule(id, os.homedir())?.state ?? null, Date.now()) ?? scheduleNotRunnerHere(id);
+}
+
+/** 各台电脑最后一次同步的时刻（每轮从 catalog 的设备清单抄下来）—— 非 runner 那台据此提示「<机器名> 已 N 小时没同步」。 */
+const SCHEDULE_DEVICES_PATH = path.join(KIROLEX_HOME, 's3-schedule-devices.json');
+function readScheduleDevices(): Record<string, { syncedAt: number; host?: string }> {
+  try {
+    const o = JSON.parse(fs.readFileSync(SCHEDULE_DEVICES_PATH, 'utf-8'));
+    return o && typeof o === 'object' ? o : {};
+  } catch { return {}; }
+}
+function noteScheduleDevices(catalog: Catalog | null): void {
+  const devices = catalog?.devices;
+  if (!devices || typeof devices !== 'object') return;
+  const out: Record<string, { syncedAt: number; host?: string }> = {};
+  for (const [id, m] of Object.entries(devices)) {
+    if (m && typeof m.syncedAt === 'number') out[id] = { syncedAt: m.syncedAt, ...(typeof m.host === 'string' ? { host: m.host } : {}) };
+  }
+  try {
+    const tmp = `${SCHEDULE_DEVICES_PATH}.tmp`;
+    fs.writeFileSync(tmp, JSON.stringify(out, null, 2));
+    fs.renameSync(tmp, SCHEDULE_DEVICES_PATH);
+  } catch { /* 只影响「多久没同步」的提示 */ }
+}
+
+/**
+ * **定时任务和桶里对一下**（`<prefix>/v1/schedules/<sessionId>/<id>.json`，判据全在 `scheduleSync.ts`）——
+ * 只管「这条会话本身在同步」的任务（`syncsSession`，advanced 的不碰）；`only` = 只看这一条会话（恢复会话时，`upload: false` 只拉不传）。
+ * 桶里的内容不可信：解析只挑认得的字段，合并时远端不能把 runner 改成本机、runner 本机不收远端改的定义；
+ * 拉下来的任务原样写（不记成本机确认过），runner 是别的电脑的只显示、不跑。返回传了几个文件。
+ */
+async function syncSchedulesWithBucket(creds: S3Creds, prefix: string | undefined, opts: { only?: string; upload: boolean }): Promise<number> {
+  const home = os.homedir();
+  const me = scheduleMachine();
+  const cfg = loadSyncConfig();
+  const inScope = (sid: string): boolean => {
+    if (!sid || store.isAdvancedOnlySession(sid)) return false;
+    if (opts.only) return sid === opts.only && !!store.readRecord(sid);
+    const rec = store.readRecord(sid);
+    return !!rec && !deletedSessionIds.has(sid) && syncsSession(cfg, rec);
+  };
+  try {
+    const root = opts.only ? path.join(SCHEDULES_REL, opts.only) : SCHEDULES_REL;
+    const objects = await listObjects(creds, `${keyFor(prefix, root)}/`);
+    const tombs = scheduleStore.readScheduleTombstones(home);
+    const localIds = new Set(scheduleStore.listSchedules(home, store.isAdvancedOnlySession).map((j) => j.id));
+    const remote = new Map<string, { sessionId: string; parsed: RemoteSchedule | null }>();
+    /* 删除标记是单独的对象（`<id>.deleted.json`）：活任务的上传盖不掉它；有它就是删了，活的那份不再下载 */
+    const listed = collectBucketSchedules(objects.map((o) => relFor(prefix, o.key)).filter((r): r is string => !!r).map((r) => r.split(path.sep).join('/')));
+    const usable = (sid: string) => store.isValidSessionId(sid) && !store.isAdvancedOnlySession(sid);
+    for (const [id, d] of listed.deleted) {
+      if (usable(d.sessionId)) remote.set(id, { sessionId: d.sessionId, parsed: { kind: 'deleted', at: tombs[id]?.at ?? Date.now() } });
+    }
+    for (const [id, l] of listed.live) {
+      const sid = l.sessionId;
+      if (!usable(sid)) continue;
+      if (!inScope(sid) && !tombs[id] && !localIds.has(id)) continue;   // 不在同步范围、本机也没有：不下载
+      const body = await getObjectIfExists(creds, keyFor(prefix, l.rel.split('/').join(path.sep)));
+      const parsed = body ? parseRemoteSchedule(body.toString('utf-8'), id, sid) : null;
+      if (body && !parsed) logger.warn('schedule', `sync: 桶里的 ${l.rel} 认不出（格式不对 / 定义不合法 / 没有 runner），两边都不动`);
+      remote.set(id, { sessionId: sid, parsed });
+    }
+    /* 网络都等完了才读本机：下面到写盘之间没有 await，期间不会有一次运行的记账被这份合并盖掉 */
+    const plan = planScheduleSync({
+      me: me.id, local: scheduleStore.listSchedules(home, store.isAdvancedOnlySession),
+      tombstones: scheduleStore.readScheduleTombstones(home), remote, inScope, upload: opts.upload,
+    });
+    const puts: Array<{ id: string; key: string; body: string; tombstone?: { sessionId: string; at: number } }> = [];
+    const objKey = (sid: string, id: string, deleted = false) => keyFor(prefix, scheduleObjectRel(sid, id, deleted).split('/').join(path.sep));
+    for (const a of plan) {
+      if (a.op === 'write') {
+        scheduleStore.writeScheduleRaw(a.id, a.state, home);
+        const who = a.state.runnerName || a.state.runner;
+        if (a.adopted) logger.info('schedule', `sync: 从桶里拉下 id=${a.id} session=${a.state.sessionId} runner=${a.state.runner}（${a.state.runner === me.id ? '本机，但定义没在本机确认过：只显示，接管确认后才跑' : '别的电脑：本机只显示、不跑'}）`);
+        if (a.notes.refusedAssign) logger.warn('schedule', `sync: 桶里那份想把 id=${a.id} 的 runner 改成本机，没收（只有本机的接管能改）runner=${a.state.runner}`);
+        if (a.notes.defRejected) logger.warn('schedule', `sync: 桶里那份改了 id=${a.id} 的定义（prompt / checkCommand / 目标 / 周期），本机是 runner，没收 runner=${a.state.runner}`);
+        if (a.notes.lostTo) {
+          wakeDispatcher.dropRef(a.id, 'handed over');   // 排着等会话空下来的那一次也撤掉
+          logger.info('schedule', `handover: id=${a.id} 被 ${who} 接管，本机停掉它的定时器（文件留着）runner=${a.notes.lostTo}`);
+          sessionNotice(a.state.sessionId, tr('⏰ This scheduled task is now run by {machine}; this computer stopped running it.', { machine: who || '?' }));
+        }
+        if (a.notes.ranAfterHandover) logger.info('schedule', `handover: id=${a.id} 本机在被接管之后、拉到之前又跑了一次（同步延迟）runner=${a.notes.lostTo}`);
+        if (a.notes.ignoredRunBy) logger.info('schedule', `sync: id=${a.id} 旧 runner ${a.notes.ignoredRunBy} 在接管之后又写了运行状态，不认（本机是 runner）runner=${me.id}`);
+        mainWindow?.webContents.send('schedule:changed', { id: a.id, state: a.state });
+      } else if (a.op === 'delete') {
+        scheduleStore.removeSchedule(a.id, home, store.isAdvancedOnlySession);
+        if (remote.get(a.id)?.parsed?.kind === 'deleted') scheduleStore.addScheduleTombstone(a.id, a.sessionId, Date.now(), home, true);
+        wakeDispatcher.dropRef(a.id, 'removed');
+        logger.info('schedule', `sync: id=${a.id} session=${a.sessionId} 在别的电脑上删了（或本机删过），删掉本机这份`);
+        mainWindow?.webContents.send('schedule:changed', { id: a.id, state: null });
+      } else if (a.op === 'remember-deleted') {
+        scheduleStore.addScheduleTombstone(a.id, a.sessionId, a.at, home, true);
+      } else if (a.op === 'put') {
+        puts.push({ id: a.id, key: objKey(a.sessionId, a.id), body: remoteBody(a.id, a.state, Date.now()) });
+      } else if (a.op === 'put-tombstone') {
+        puts.push({ id: a.id, key: objKey(a.sessionId, a.id, true), body: tombstoneBody(a.id, a.sessionId, a.at, me.id), tombstone: { sessionId: a.sessionId, at: a.at } });
+      }
+    }
+    let uploaded = 0;
+    for (const u of puts) {
+      await putObject(creds, u.key, Buffer.from(u.body, 'utf-8'), 'application/json');
+      if (u.tombstone) scheduleStore.addScheduleTombstone(u.id, u.tombstone.sessionId, u.tombstone.at, home, true);
+      uploaded += 1;
+    }
+    if (plan.length) logger.info('s3', `定时任务：${plan.filter((a) => a.op === 'write').length} 条按桶里更新，${plan.filter((a) => a.op === 'delete').length} 条删掉，传了 ${uploaded} 个`);
+    return uploaded;
+  } catch (err: any) {
+    logger.warn('s3', `定时任务同步没成功（这一轮不传）：${err?.message || err}`);
+    return 0;
+  }
+}
+
+let schedulePushTimer: NodeJS.Timeout | null = null;
+/** 本机改了定时任务（建 / 暂停 / 删 / 延长 / 接管）：稍后只把定时任务这一项和桶对一下，不等下一轮整体同步。 */
+function scheduleSchedulePush(): void {
+  if (!loadSyncConfig().enabled) return;
+  if (schedulePushTimer) clearTimeout(schedulePushTimer);
+  schedulePushTimer = setTimeout(() => { schedulePushTimer = null; void syncSchedulesNow(); }, 15_000);
+}
+
+/** 只同步定时任务这一项。和整轮同步共用一把锁；锁被占着就稍后再试。 */
+async function syncSchedulesNow(): Promise<void> {
+  if (!loadSyncConfig().enabled) return;
+  const resolved = await lockThenResolve(syncLock, resolveSyncCredsNow);
+  if (!resolved) { scheduleSchedulePush(); return; }
+  try {
+    if (resolved.problem || !resolved.creds) return;
+    await syncSchedulesWithBucket(resolved.creds, resolved.cfg.prefix, { upload: true });
+  } finally {
+    if (resolved.creds) syncRunning = false;
+  }
+}
+
 /*
   ── 外观：~/.kirolex/theme.json 颜色覆盖 + 外观配置跨电脑同步 ──
   校验 / 合并在 themeConfig.ts，文件读写在 themeFileStore.ts，同步判据在 appearanceSync.ts；这里只收集状态、读写、推给渲染端。
@@ -7778,6 +7951,8 @@ async function offloadRestoreImpl(id: string, opts?: { putBack?: boolean }): Pro
         }
       }
     }
+    /* 它的定时任务一起拉回来（只拉不传，同 s3:restore）—— 前缀用占位记下的那一个 */
+    if (!restore.cancelled()) await syncSchedulesWithBucket(creds!, prefixFromCloudKey(placeholder.cloudKey, id) ?? loadSyncConfig().prefix, { only: id, upload: false });
     forgetDeletion(S3_DELETED_AT_PATH, id);
     logger.info('offload', `已从云端下载回本机 ${id}：${r.alreadyLocal ? '上次已经下完，只补了收尾' : `${r.files} 个文件 / ${(r.bytes / 1024 / 1024).toFixed(1)} MB`}，占位删掉，最后活动重新计时`);
     mainWindow?.webContents.send('offload:changed', {});
@@ -8199,6 +8374,9 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     uploaded += await syncAppearanceWithBucket(creds!, cfg.prefix);
     /* 远程机器的 AI 工具配置（agent-profiles/）：同样跨电脑共用，两边都改过时留冲突副本、不静默覆盖 */
     uploaded += await syncAgentProfilesWithBucket(creds!, cfg.prefix);
+    /* 定时任务（schedules/<会话>/<id>.json）：只管在同步的会话；运行状态只认 runner，定义 runner 本机不收远端改的（scheduleSync.ts） */
+    noteScheduleDevices(oldCatalog);
+    uploaded += await syncSchedulesWithBucket(creds!, cfg.prefix, { upload: true });
     /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
     const uploadList = [
       ...plan.upload.filter((r) => !isMemoryRel(r)),
@@ -10901,6 +11079,9 @@ ${hint}` : ''}` };
         }
       }
 
+      /* 这条会话的定时任务一起拉回来（只拉不传）：runner 是别的电脑、或定义没在本机确认过的只显示，接管确认后才跑 */
+      restore.check();
+      await syncSchedulesWithBucket(creds!, cfg.prefix, { only: sessionId, upload: false });
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
         + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}${keptRemote ? `，仍在 ${keptRemote} 上跑` : ''}`
@@ -13019,6 +13200,14 @@ ${hint}` : ''}` };
    * stateless mode to switch it off, because carrying the last result forward is what makes
    * a scheduled job report the same thing every morning. */
   const SCHEDULE_TICK_MS = 20_000;
+  /* 老文件（跨电脑同步之前建的，没有 runner）都是本机建的：补上 runner = 本机，并记成本机确认过 */
+  for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)) {
+    if (job.state.runner) continue;
+    try {
+      scheduleStore.writeSchedule(job.id, job.state, os.homedir(), store.isAdvancedOnlySession);
+      logger.info('schedule', `migrate id=${job.id}: 老任务补上执行者 = 本机 runner=${scheduleMachine().id}`);
+    } catch (err: any) { logger.warn('schedule', `migrate id=${job.id} 失败：${err?.message || err}`); }
+  }
   /* Jobs currently mid-run (`schedulesInFlight`, module level), so a slow turn is never re-entered by the next tick. */
 
   /** 删掉的会话留下的定时任务：文件已删（或在这里删），排着的那次作废，界面上去掉。 */
@@ -13044,11 +13233,16 @@ ${hint}` : ''}` };
     const { id } = job;
     let state = job.state;
     if (schedulesInFlight.has(id)) return;
+    /*
+      **只有 runner 那台跑**：按盘上最新的再判一次（接管 / 交出可能刚同步进来）；接管之后的第一次从接管那一刻算（`timingState`），不补跑错过的
+    */
+    { const fresh = scheduleStore.readSchedule(id, os.homedir());
+      if (!fresh || !scheduleRunsHere(fresh) || !isDue(timingState(fresh.state), Date.now())) return; }
     /* 先看会话还在不在，再跑任何东西（`checkCommand` 是本机 shell），见 `scheduleOwnerAllows` */
     if (!scheduleOwnerAllows(id, state.sessionId)) return;
     schedulesInFlight.set(id, state.sessionId);
     try {
-      const at = nextRunAt(state) ?? Date.now();
+      const at = nextRunAt(timingState(state)) ?? Date.now();
       /* 目标型任务的 `checkCommand`：先在本机跑一次检查，没变化就到此为止（不花模型）；要叫醒的话把检查结果附在消息里 */
       let check = '';
       if (state.spec.checkCommand) {
@@ -13057,6 +13251,12 @@ ${hint}` : ''}` };
         state = checked.state;
         check = checked.text;
       }
+      /* 检查命令跑的这段时间里执行权可能交出去了（同步进来别的电脑接管）：不记账、不叫醒会话 */
+      { const latestJob = scheduleStore.readSchedule(id, os.homedir());
+        if (!latestJob || !scheduleRunsHere(latestJob)) {
+          logger.info('schedule', `handover: id=${id} 要叫醒会话时本机已不是执行者，这一次不记账、不叫醒 runner=${latestJob?.state.runner ?? '?'}`);
+          return;
+        } }
       // CHARGE THE RUN FIRST, and flush it. Recording only on completion means a process
       // killed mid-run forgets it paid -- the shape of a job that bills a turn per restart.
       const charged = recordRun(state, Date.now());
@@ -13127,6 +13327,7 @@ ${hint}` : ''}` };
       changed: (jobId, s) => mainWindow?.webContents.send('schedule:changed', { id: jobId, state: s }),
       noteUser: (sid, text) => { noteInSession(sid, text, undefined, scheduleEndGroup(id)); sessionNotice(sid, text); },
       log: (m) => logger.info('schedule', m),
+      stillRunsHere: (jobId) => { const j = scheduleStore.readSchedule(jobId, os.homedir()); return !!j && scheduleRunsHere(j); },
     });
   }
 
@@ -13135,7 +13336,7 @@ ${hint}` : ''}` };
     if (quitPending) return;
     const now = Date.now();
     /* advanced 会话（flow / skill）的定时任务不跑、不记账 —— 它们归 advanced 自己 */
-    for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)) {
+    for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter(scheduleRunsHere)) {
       if (expireSchedule(job, now)) continue;
       if (isDue(job.state, now)) void runScheduledJob(job);
     }
@@ -13168,7 +13369,7 @@ ${hint}` : ''}` };
     if (!sessionClients.get(sid)) throw new Error(tr('Session not connected'));
     /* 挂执行器那段时间里任务可能已经被暂停 / 删除：再看一次（sendPromptOnce 里提交之前还会再看一次） */
     const stillWanted = () => (item.source === 'schedule' && item.ref
-      ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now())
+      ? scheduleWakeBlocked(item.ref)
       : item.source === 'nudge' ? textToolNudgeStale(item) : null);
     { const blocked = stillWanted(); if (blocked) throw new WakeSkipped(blocked); }
     /* 后台输出要进会话了：先记下来，之后这条会话的故障诊断包都不抄会话内容 */
@@ -13293,6 +13494,7 @@ ${hint}` : ''}` };
     const state = newSchedule(sessionId, spec, Date.now());
     scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
     logger.info('schedule', `created id=${id} session=${sessionId} ${describeSchedule(spec)} maxRuns=${spec.maxRuns}`);
+    scheduleSchedulePush();
     // Announced like every other mutation: the window that created the job learns of it the
     // same way as any other, so its banner appears without a reload. The end of a RUN used to
     // be the only broadcast, which left create/pause/remove invisible until the next reload.
@@ -13300,7 +13502,19 @@ ${hint}` : ''}` };
     return { ok: true, id, nextRunAt: nextRunAt(state), describe: describeSchedule(spec) };
   });
 
-  ipcMain.handle('schedule:list', () => scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).map((job) => ({
+  ipcMain.handle('schedule:list', () => {
+    const me = scheduleMachine().id;
+    const devices = readScheduleDevices();
+    /* runner 那台超过 2 个同步周期没同步 → 非 runner 那台提示「可能关机了，可以接管」 */
+    const staleAfterMs = 2 * Math.max(5, Number(loadSyncConfig().intervalMinutes) || DEFAULT_INTERVAL_MINUTES) * 60_000;
+    return scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).map((job) => scheduleListRow(job, me, devices, staleAfterMs));
+  });
+
+  /** 列表里的一行（聊天顶部 ⏰ 卡 / 侧栏）。非 runner 那台：标「在 <机器名> 上运行」、可以接管（`defHash`：接管时核对给人看的就是这份定义）。 */
+  function scheduleListRow(job: scheduleStore.StoredSchedule, me: string, devices: Record<string, { syncedAt: number; host?: string }>, staleAfterMs: number) {
+    const runsHere = scheduleRunsHere(job);
+    const runner = job.state.runner ?? me;
+    return {
     id: job.id,
     sessionId: job.state.sessionId,
     prompt: job.state.spec.prompt,
@@ -13311,12 +13525,46 @@ ${hint}` : ''}` };
     terminal: job.state.terminal,
     lastRunAt: job.state.lastRunAt,
     lastError: job.state.lastError,
-    nextRunAt: nextRunAt(job.state),
+    nextRunAt: nextRunAt(timingState(job.state)),
     createdBy: job.state.createdBy ?? null,
     expiresAt: job.state.expiresAt ?? null,
     until: job.state.spec.until ?? null,
     checkCommand: job.state.spec.checkCommand ?? null,
-  })));
+    runsHere,
+    lastCheck: job.state.lastCheck ?? null,
+    /* 结束了（达成 / 次数用完 / 过期 / 取消）：一句话说清结束原因和跑了几次 —— 不跑它的那台据此保留一张「已结束」卡片 */
+    endedText: (() => { const ended = scheduleTerminal(job.state); return ended ? scheduleEndedText(job.state, ended) : null; })(),
+    runnerName: runsHere ? null : (job.state.runnerName || devices[runner]?.host || runner),
+    /* runner 写着本机、定义却没在本机确认过（恢复会话拉回来的）：一样只读，接管确认后才跑 */
+    needsConfirm: !runsHere && runner === me,
+    runnerSeenAt: runsHere || runner === me ? null : (devices[runner]?.syncedAt ?? null),
+    staleAfterMs,
+    defHash: definitionHash(job.state),
+    };
+  }
+
+  /**
+   * **接管到本机**：界面先弹窗把 prompt / checkCommand / 目标 / 周期**全文**给人看，确认了才调这个。
+   * `defHash` = 弹窗里给人看的那份定义的摘要 —— 期间被同步改过就拒（人确认的不是现在这份）。
+   * runner 改成本机、runnerChangedAt = takenOverAt = now，定义记成本机确认过；第一次运行从现在算（`timingState`），不补跑。
+   * 原 runner 那台下次拉到后停掉自己的定时器（只停，不删文件）。
+   */
+  ipcMain.handle('schedule:take-over', (_event, id: string, defHash: string) => {
+    const job = scheduleStore.readSchedule(id, os.homedir());
+    if (!job) return { ok: false, error: tr('This scheduled task was not found') };
+    { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:take-over'); if (advRefused) return { ok: false, error: advRefused }; }
+    if (definitionHash(job.state) !== defHash) return { ok: false, error: tr('This scheduled task changed after it was shown. Check it again before taking it over.') };
+    const me = scheduleMachine();
+    const from = job.state.runner ?? '?';
+    const state = takeOver(job.state, me, Date.now());
+    scheduleStore.approveSchedule(id, definitionHash(state), os.homedir());
+    scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
+    scheduleSkipLogged.delete(id);
+    logger.info('schedule', `takeover id=${id} session=${state.sessionId}: 接管到本机（原来在 ${job.state.runnerName || from} 上），第一次运行从现在算 runner=${me.id} from=${from}`);
+    mainWindow?.webContents.send('schedule:changed', { id, state });
+    scheduleSchedulePush();
+    return { ok: true };
+  });
 
   ipcMain.handle('schedule:pause', (_event, id: string, paused: boolean) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
@@ -13328,6 +13576,7 @@ ${hint}` : ''}` };
     /* 正排着等会话空下来的那一次也撤掉 */
     if (paused) wakeDispatcher.dropRef(id, 'paused');
     logger.info('schedule', `${paused ? 'paused' : 'resumed'} id=${id}`);
+    scheduleSchedulePush();
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true };
   });
@@ -13346,6 +13595,7 @@ ${hint}` : ''}` };
     const state = { ...job.state, expiresAt };
     scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
     logger.info('schedule', `expiry ${String((change as any)?.mode)} id=${id} expiresAt=${expiresAt ?? 'never'}`);
+    scheduleSchedulePush();
     mainWindow?.webContents.send('schedule:changed', { id, state });
     return { ok: true, expiresAt };
   });
@@ -13358,6 +13608,7 @@ ${hint}` : ''}` };
     wakeDispatcher.dropRef(id, 'removed');
     noteScheduleRemoved(removing);
     logger.info('schedule', `removed id=${id}`);
+    scheduleSchedulePush();
     // `state: null` says GONE. The renderer re-reads the list either way, but a payload that
     // omitted the outcome would make "removed" indistinguishable from "changed somehow".
     mainWindow?.webContents.send('schedule:changed', { id, state: null });

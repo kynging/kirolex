@@ -57,7 +57,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
 // imports the same module rather than keeping a second copy of the rules.
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
-import type { ScheduleSummary } from '../scheduleView';
+import { takeOverDetails, type ScheduleSummary } from '../scheduleView';
 import { ScheduleExpiryPopover, type ScheduleExpiryChange } from './ScheduleExpiryPopover';
 import { bgElapsedText, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
@@ -4008,6 +4008,8 @@ interface ChatAreaProps {
   onCancelSchedule?: (id: string) => void;
   /** 聊天顶部那条定时任务上的「⏳ 延长…」弹层：延长多久 / 到期时间 / 不过期由用户定（只有用户能设成不过期）。 */
   onSetScheduleExpiry?: (id: string, change: ScheduleExpiryChange) => Promise<{ ok: boolean; error?: string }>;
+  /** 「接管到本机」（任务在别的电脑上跑时才有）：先弹确认（prompt / checkCommand / 目标 / 周期全文），确认了才调；`defHash` 交回 main 核对。 */
+  onTakeOverSchedule?: (id: string, defHash: string) => Promise<{ ok: boolean; error?: string }>;
   /** Stop whatever automation currently owns this session. */
   onStopLoop: () => void;
   /** Split-pane monitor mode: transcript + live indicators + permission bar,
@@ -4133,6 +4135,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onPauseSchedule,
   onCancelSchedule,
   onSetScheduleExpiry,
+  onTakeOverSchedule,
   onStopLoop,
   readOnly = false,
   paneFocused = true,
@@ -4358,6 +4361,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
    *  waiting to delete tomorrow's run. */
   const [cancelArmed, setCancelArmed] = useState(false);
   const cancelArmTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  /** 接管没成功（定义刚被同步改过 / 找不到了）的原因，就地显示在横幅上。 */
+  const [takeOverError, setTakeOverError] = useState<string | null>(null);
   useEffect(() => () => { if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current); }, []);
   /** 后台任务那一行的「运行了多久」用的钟：只在有任务在跑时走，粒度跟显示一致（第一分钟里按秒，之后按分钟）。 */
   const [bgNow, setBgNow] = useState(() => Date.now());
@@ -5580,10 +5585,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           read history — including when the composer is collapsed. */}
       {scheduleSummary && (
         <div
-          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}${scheduleSummary.goal ? ' has-goal' : ''}`}
+          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}${scheduleSummary.goal ? ' has-goal' : ''}${scheduleSummary.elsewhere || takeOverError ? ' elsewhere' : ''}${scheduleSummary.ended ? ' ended' : ''}`}
           title={scheduleSummary.text}
         >
-          <span className="schedule-banner-icon">{scheduleSummary.paused ? '⏸️' : '⏰'}</span>
+          <span className="schedule-banner-icon">{scheduleSummary.ended ? '🏁' : scheduleSummary.paused ? '⏸️' : '⏰'}</span>
           {scheduleSummary.byModel && (
             <span className="schedule-banner-by-model" title={t('The model in this chat set this up itself (schedule_create). Pause or cancel it like any other job.')}>{t('🤖 Created by the model')}</span>
           )}
@@ -5593,17 +5598,63 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </span>
           )}
           <span className="schedule-banner-text">{scheduleSummary.text}</span>
+          {/* 不在本机跑（跨电脑同步）：标出在哪台上跑；那台很久没同步了就提示可以接管。暂停 / 删除照样能点（会同步过去） */}
+          {scheduleSummary.elsewhere && (
+            <span
+              className={`schedule-banner-runner${scheduleSummary.elsewhere.offlineHours !== null ? ' offline' : ''}`}
+              title={scheduleSummary.elsewhere.needsConfirm
+                ? t('This task came back from the cloud and has not been confirmed on this computer, so it does not run here until you take it over.')
+                : t('Only one computer runs a scheduled task. This computer shows it but does not run it.')}
+            >
+              {scheduleSummary.elsewhere.needsConfirm
+                ? t('🖥️ Not confirmed on this computer')
+                : scheduleSummary.elsewhere.offlineHours !== null
+                  ? t('🖥️ {machine} has not synced for {n} h and may be off. You can take it over to this computer.', { machine: scheduleSummary.elsewhere.name, n: scheduleSummary.elsewhere.offlineHours })
+                  : scheduleSummary.ended ? t('🖥️ Ran on {machine}', { machine: scheduleSummary.elsewhere.name }) : t('🖥️ Runs on {machine}', { machine: scheduleSummary.elsewhere.name })}
+            </span>
+          )}
+          {scheduleSummary.elsewhere?.lastCheck && (
+            <span className="schedule-banner-runner" title={scheduleSummary.elsewhere.lastCheck}>{scheduleSummary.elsewhere.lastCheck}</span>
+          )}
+          {takeOverError && <span className="schedule-banner-runner offline">{takeOverError}</span>}
           {scheduleSummary.next && (
             <>
+              {/* 接管到本机：先弹窗把要在本机跑的东西全文给人看（checkCommand 是本机 shell），确认了才改执行者 */}
+              {scheduleSummary.elsewhere && !scheduleSummary.ended && onTakeOverSchedule && (
+                <button
+                  className="schedule-banner-takeover"
+                  onClick={() => {
+                    const job = scheduleSummary.next!;
+                    const from = scheduleSummary.elsewhere!.needsConfirm ? null : scheduleSummary.elsewhere!.name;
+                    setTakeOverError(null);
+                    setConfirm({
+                      title: t('Take over this scheduled task to this computer?'),
+                      message: `${from
+                        ? t('From now on it runs on this computer; {machine} stops running it once it syncs. Missed runs are not made up: the next run is counted from now.', { machine: from })
+                        : t('From now on it runs on this computer. Missed runs are not made up: the next run is counted from now.')}\n\n${takeOverDetails(job, findLang)}`,
+                      confirmLabel: t('Take over and run here'),
+                      onConfirm: () => {
+                        void onTakeOverSchedule(job.id, job.defHash || '').then((r) => {
+                          if (!r.ok) setTakeOverError(r.error || t('Could not take over this scheduled task'));
+                        });
+                      },
+                    });
+                  }}
+                  title={t('Run this scheduled task on this computer instead (shows the full task first)')}
+                >{t('🖥️ Take over')}</button>
+              )}
               {/* Pause is REVERSIBLE, so one click. It is also the honest way to stop a job you
                   might want back — cancelling loses the prompt and the remaining budget. */}
+              {/* 已结束的任务（别的电脑上跑完的）没有暂停 / 延长 / 接管可言，只能删掉这条记录 */}
+              {!scheduleSummary.ended && (
               <button
                 className="schedule-banner-pause"
                 onClick={() => onPauseSchedule?.(scheduleSummary.next!.id, !scheduleSummary.paused)}
                 title={scheduleSummary.paused ? t('Resume: keep running on the original schedule') : t('Pause: keep the job, stop it firing')}
               >{scheduleSummary.paused ? t('▶️ Resume') : t('⏸️ Pause')}</button>
+              )}
               {/* 过期时间：「⏳ 延长…」弹层里由用户定延长多久 / 到期时间 / 不过期 —— 只有带过期时间的（模型建的循环任务）才有 */}
-              {scheduleSummary.expiresAt !== null && (
+              {scheduleSummary.expiresAt !== null && !scheduleSummary.ended && (
                 <ScheduleExpiryPopover
                   expiresAt={scheduleSummary.expiresAt}
                   onApply={(change) => onSetScheduleExpiry?.(scheduleSummary.next!.id, change) ?? Promise.resolve({ ok: false })}
@@ -5626,7 +5677,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   onCancelSchedule?.(scheduleSummary.next!.id);
                 }}
                 title={cancelArmed ? t('Click again to confirm cancellation (cannot be undone)') : t('Cancel this scheduled job')}
-              >{cancelArmed ? t('Confirm cancel?') : t('🗑️ Cancel')}</button>
+              >{cancelArmed ? t('Confirm cancel?') : scheduleSummary.ended ? t('🗑️ Delete') : t('🗑️ Cancel')}</button>
             </>
           )}
         </div>

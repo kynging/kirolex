@@ -23,6 +23,9 @@ export interface ScheduleCheckDeps {
   /** 在会话里给用户留一句（不叫醒模型）。 */
   noteUser(sessionId: string, text: string): void;
   log(message: string): void;
+  /** 本机现在还是不是它的执行者（跨电脑同步，`scheduleSync.ts`）。检查命令跑的这段时间里可能被别的电脑接管了：
+   *  是 false 就丢掉这次结果 —— 不落盘、不广播、不提示，免得把别人的任务写成「已达成」/ 自动暂停。不给 = 总是本机。 */
+  stillRunsHere?(id: string, state: ScheduleState): boolean;
   lang?: UiLang;
 }
 
@@ -36,6 +39,11 @@ export async function runScheduleCheck(id: string, state: ScheduleState, deps: S
   /* 检查期间被删 / 暂停 / 结束了：以盘上为准，什么都不做 */
   const latest = deps.read(id);
   if (!latest || latest.paused || latest.terminal) return null;
+  /* 检查期间执行权交给了别的电脑：这次的结果不算数（新执行者自己会检查） */
+  if (deps.stillRunsHere && !deps.stillRunsHere(id, latest)) {
+    deps.log(`handover: check id=${id} session=${state.sessionId} 跑完时本机已不是执行者，结果丢弃（不落盘、不叫醒）runner=${latest.runner ?? '?'}`);
+    return null;
+  }
   const plan = planScheduleCheck(latest, result, startedAt, deps.lang);
   deps.write(id, plan.state);
   deps.log(`check id=${id} session=${state.sessionId} status=${result.status}${result.status === 'exited' ? ` exit=${result.code}` : ''} → ${plan.action}`);

@@ -13,6 +13,7 @@
 import fs from 'fs';
 import path from 'path';
 import type { ScheduleState } from './schedule.ts';
+import { definitionHash, stampLocalWrite, type ScheduleMachine, type ScheduleTombstones } from './scheduleSync.ts';
 
 export interface StoredSchedule {
   id: string;
@@ -35,12 +36,31 @@ function scheduleFile(id: string, home: string): string {
   return path.join(scheduleDir(home), `${encodeURIComponent(id)}.json`);
 }
 
+/**
+ * 本机是哪台（跨电脑同步，见 `scheduleSync.ts`）。index.ts 启动时设；不设（单测）= 老行为：写盘不盖戳。
+ * 设了之后本机的每次写都经 `stampLocalWrite`：新建的 runner = 本机并记成「本机确认过」；控制操作 / 运行状态记下时刻。
+ */
+let localMachine: ScheduleMachine | null = null;
+export function setLocalScheduleMachine(m: ScheduleMachine | null): void { localMachine = m; }
+
 /** Atomic: temp + rename. A partially written job could otherwise read back with a lower
  *  run count and hand itself budget it had already spent. */
 export function writeSchedule(id: string, state: ScheduleState, home: string, isProtected?: Protected): void {
-  if (isProtected && (isProtected(state.sessionId) || isProtected(readSchedule(id, home)?.state.sessionId ?? ''))) {
+  const prev = readSchedule(id, home);
+  if (isProtected && (isProtected(state.sessionId) || isProtected(prev?.state.sessionId ?? ''))) {
     throw new Error('This session belongs to KiroLex Advanced; the standard edition does not modify it.');
   }
+  if (!localMachine) { writeScheduleRaw(id, state, home); return; }
+  /* 删过的不再写回来（删除期间还在跑的那一次最后会写一下）—— 删除标记永远胜 */
+  if (readScheduleTombstones(home)[id]) return;
+  const stamped = stampLocalWrite(prev?.state ?? null, state, localMachine, Date.now());
+  /* 本机建的（或老文件第一次补上 runner）：定义记成本机确认过 —— 调度器只跑确认过的（`canRunHere`） */
+  if (!prev?.state.runner && !state.runner && stamped.runner === localMachine.id) approveSchedule(id, definitionHash(stamped), home);
+  writeScheduleRaw(id, stamped, home);
+}
+
+/** 原样写（不盖戳、不看删除标记）：同步合并的结果 / 从桶里拉下来的用它。 */
+export function writeScheduleRaw(id: string, state: ScheduleState, home: string): void {
   const dir = scheduleDir(home);
   fs.mkdirSync(dir, { recursive: true });
   const file = scheduleFile(id, home);
@@ -77,8 +97,67 @@ export function listSchedules(home: string, isProtected?: Protected): StoredSche
 }
 
 export function removeSchedule(id: string, home: string, isProtected?: Protected): void {
-  if (isProtected?.(readSchedule(id, home)?.state.sessionId ?? '')) return;
+  const existing = readSchedule(id, home);
+  if (isProtected?.(existing?.state.sessionId ?? '')) return;
+  /* 删除标记（跨电脑同步）：别的电脑拉到后删掉它们那份，本机也不会再被补回来 */
+  if (existing && localMachine) addScheduleTombstone(id, existing.state.sessionId, Date.now(), home);
   try { fs.rmSync(scheduleFile(id, home), { force: true }); } catch { /* already gone */ }
+  forgetApproval(id, home);
+}
+
+/* ── 跨电脑同步的两本本地账（都不同步）：删除标记、本机确认过的定义 ── */
+
+function tombstonesFile(home: string): string { return path.join(home, '.kirolex', 'schedule-tombstones.json'); }
+function approvalsFile(home: string): string { return path.join(home, '.kirolex', 'schedule-approved.json'); }
+
+function readJsonMap(file: string): Record<string, any> {
+  try {
+    const o = JSON.parse(fs.readFileSync(file, 'utf-8'));
+    return o && typeof o === 'object' && !Array.isArray(o) ? o : {};
+  } catch { return {}; }
+}
+
+function writeJsonMap(file: string, map: Record<string, unknown>): void {
+  fs.mkdirSync(path.dirname(file), { recursive: true });
+  const tmp = `${file}.tmp`;
+  fs.writeFileSync(tmp, JSON.stringify(map, null, 2), 'utf-8');
+  fs.renameSync(tmp, file);
+}
+
+/** 本机删过的任务：id → 删除时刻 + 会话；`pushed` = 桶里那份已经是删除标记了（以后不用再去看）。 */
+export function readScheduleTombstones(home: string): ScheduleTombstones {
+  const out: ScheduleTombstones = {};
+  for (const [id, v] of Object.entries(readJsonMap(tombstonesFile(home)))) {
+    if (v && typeof v.at === 'number' && typeof v.sessionId === 'string') out[id] = { at: v.at, sessionId: v.sessionId, ...(v.pushed ? { pushed: true } : {}) };
+  }
+  return out;
+}
+
+export function addScheduleTombstone(id: string, sessionId: string, at: number, home: string, pushed = false): void {
+  const map = readScheduleTombstones(home);
+  if (map[id] && (map[id].pushed || !pushed)) return;
+  map[id] = { at: map[id]?.at ?? at, sessionId: map[id]?.sessionId ?? sessionId, ...(pushed ? { pushed: true } : {}) };
+  writeJsonMap(tombstonesFile(home), map);
+}
+
+/** 本机确认过的定义摘要（`definitionHash`）。 */
+export function readApprovedHash(id: string, home: string): string | undefined {
+  const v = readJsonMap(approvalsFile(home))[id];
+  return typeof v === 'string' ? v : undefined;
+}
+
+export function approveSchedule(id: string, hash: string, home: string): void {
+  const map = readJsonMap(approvalsFile(home));
+  if (map[id] === hash) return;
+  map[id] = hash;
+  writeJsonMap(approvalsFile(home), map);
+}
+
+function forgetApproval(id: string, home: string): void {
+  const map = readJsonMap(approvalsFile(home));
+  if (!(id in map)) return;
+  delete map[id];
+  try { writeJsonMap(approvalsFile(home), map); } catch { /* 下次再清 */ }
 }
 
 /**

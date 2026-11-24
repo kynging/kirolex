@@ -26,6 +26,8 @@ export const ZH_INDEX_B: Record<string, string> = {
   'The previous check has not finished yet': '上一次校验尚未结束',
   'Scheduled task ended: {why} ({schedule}, ran {n} time(s))': '定时任务结束：{why}（{schedule}，共运行 {n} 次）',
   'This scheduled task was not found': '找不到这个定时任务',
+  '⏰ This scheduled task is now run by {machine}; this computer stopped running it.': '⏰ 这个定时任务已由 {machine} 接管运行，本机不再运行它。',
+  'This scheduled task changed after it was shown. Check it again before taking it over.': '这个定时任务在显示之后被改过了，请重新查看后再接管。',
   'This scheduled task has no expiry to change': '这个定时任务没有可以改的过期时间',
   'The extension must be a positive length of time': '延长的时长必须是正数',
   'Choose a valid expiry time': '请选一个有效的到期时间',
