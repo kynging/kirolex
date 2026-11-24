@@ -136,7 +136,7 @@ describe('同步计划', () => {
     const root = mk();
     const { upload } = planUpload(root, ['s_1'], {});
     assert.ok(upload.includes(path.join('sessions', 's_1', 'record.json')));
-    assert.ok(upload.includes(path.join('memory', 'global.md')));
+    assert.equal(upload.includes(path.join('memory', 'global.md')), false, '全局记忆不同步（2026-11-24）');
     assert.equal(upload.some((r) => r.includes('config.json')), false, 'config.json 里是这台机器的路径和远端主机');
     assert.equal(upload.some((r) => r.startsWith('logs')), false);
     /* 会话目录里也只拿那三个文件 —— events.jsonl / last-injection.md 恢复时不需要 */
@@ -157,8 +157,8 @@ describe('同步计划', () => {
     assert.equal(second.skippedUnchanged, first.upload.length);
 
     /* 改了内容（大小变了）就要重传 */
-    fs.writeFileSync(path.join(root, 'memory', 'global.md'), 'much longer content');
-    assert.ok(planUpload(root, ['s_1'], state).upload.includes(path.join('memory', 'global.md')));
+    fs.writeFileSync(path.join(root, 'sessions', 's_1', 'record.json'), 'much longer content');
+    assert.ok(planUpload(root, ['s_1'], state).upload.includes(path.join('sessions', 's_1', 'record.json')));
     fs.rmSync(root, { recursive: true, force: true });
   });
 

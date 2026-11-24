@@ -24,12 +24,11 @@ function fixture(): string {
 }
 
 describe('备份：记忆跟着会话 / 项目走', () => {
-  test('只传全局 + 要备份的项目 + 要备份的会话那几份', () => {
+  test('只传要备份的项目 + 要备份的会话那几份（全局记忆不同步）', () => {
     const root = fixture();
     const { upload } = planUpload(root, ['s_in'], {}, { projects: ['Keep'] });
     const mem = upload.filter((r) => r.startsWith('memory')).sort();
     assert.deepEqual(mem, [
-      path.join('memory', 'global.md'),
       path.join('memory', 'projects', 'Keep', 'memory.md'),
       path.join('memory', 'sessions', 's_in', 'memory.md'),
     ].sort());
@@ -39,7 +38,6 @@ describe('备份：记忆跟着会话 / 项目走', () => {
   test('id 里带路径分隔符的不认（不能借它跳出目录）', () => {
     const root = fixture();
     assert.deepEqual(memoryRelsFor(root, ['../x', 's_in'], ['..', 'a/b']).sort(), [
-      path.join('memory', 'global.md'),
       path.join('memory', 'sessions', 's_in', 'memory.md'),
     ].sort());
   });
@@ -66,13 +64,14 @@ describe('恢复：记忆合并，不覆盖', () => {
     assert.equal(mergeMemoryText('  \n', '- a\n'), '- a\n');
     assert.equal(mergeMemoryText('- a\r\n', '- a\n'), '- a\r\n');
   });
-  test('接线：会话 / 项目 / 全局三份都拉，合并前先进 trash', () => {
+  test('接线：会话 / 项目两份都拉、全局不拉，合并前先进 trash', () => {
     const M = fs.readFileSync('src/main/index.ts', 'utf8');
     const at = M.indexOf("ipcMain.handle('s3:restore'");
     const body = M.slice(at, at + 12000);
     assert.match(body, /path\.join\('memory', 'sessions', sessionId\)/);
     assert.match(body, /path\.join\('memory', 'projects', project\)/);
-    assert.match(body, /path\.join\('memory', 'global\.md'\)/);
+    assert.doesNotMatch(body, /path\.join\('memory', 'global\.md'\)/);
+    assert.match(body, /if \(isGlobalMemoryRel\(rel\)\) continue;/);
     assert.match(body, /mergeMemoryText\(local, body\.toString\('utf-8'\)\)/);
     assert.match(body, /fs\.copyFileSync\(abs, dest\);/);
   });

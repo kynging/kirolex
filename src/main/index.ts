@@ -47,7 +47,7 @@ import {
   planUpload, keyFor, relFor, catalogKey, contentTypeFor, readState, writeState, walk,
   maskKeyId, machineTag, trashDirFor, conflictKeyFor, backoffMultiplier,
   readSessionMarks, writeSessionMarks, sessionSyncState, sessionIdOfRel, sessionChangedAt, mergeMemoryText, SESSION_FILES_DIR, projectMemoryMarkKey, walkSessionFiles, conflictPrefixFor,
-  decideMemory, memorySyncStep, writeMemoryBase, readMemoryBase, memoryRelsFor, placementOf, placementToFollow, applyPlacement,
+  decideMemory, memorySyncStep, writeMemoryBase, readMemoryBase, memoryRelsFor, memorySyncInScope, isGlobalMemoryRel, placementOf, placementToFollow, applyPlacement,
 } from './s3Sync.ts';
 import {
   offloadSettings, offloadBlocked, planOffloadRound, offloadSession, finishOffloadRestore, readOffloadState, readOffloadStateStrict, setKeepLocal, strictSessionRefs, scheduleRefs, loopRefs, offloadedIdsInTrash,
@@ -7878,6 +7878,9 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
   return { moved, bytes, days };
 }
 
+/** 「全局记忆不再同步」那一行只在启动后第一次同步时记一次。 */
+let globalMemoryNoSyncLogged = false;
+
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
   if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
@@ -8038,14 +8041,15 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
     } catch (err: any) {
       logger.warn('s3', `读不到桶里的记忆列表，这一轮记忆不传也不拉：${err?.message || err}`);
     }
-    const memScope = (rel: string): boolean => {
-      const parts = rel.split(path.sep);
-      if (parts[0] !== 'memory' || !rel.endsWith('.md')) return false;
-      if (parts.length === 2) return true;                                   // global.md 那一层
-      if (parts[1] === 'projects') return projectMemorySynced(parts[2]) && !store.isAdvancedOnlyProjectName(parts[2]);   // 别的机器建的项目也拉
-      if (parts[1] === 'sessions') return ids.includes(parts[2]);            // 只管本机有的会话
-      return false;
-    };
+    /* 全局记忆 global.md 不在范围里（「全局记忆不应该同步」）—— 不传、不拉、不三方合并，桶里 / s3-memory-base 里那份不删也不读 */
+    const memScope = (rel: string): boolean => memorySyncInScope(rel, {
+      projectSynced: (p) => projectMemorySynced(p) && !store.isAdvancedOnlyProjectName(p),   // 别的机器建的项目也拉
+      sessionIds: ids,                                                       // 只管本机有的会话
+    });
+    if (!globalMemoryNoSyncLogged) {
+      globalMemoryNoSyncLogged = true;
+      logger.info('s3', '全局记忆不再同步（本机各自一份）：memory/global.md 不上传、不拉取、恢复时不合并');
+    }
     const memUpload = new Set<string>();
     if (memListed) {
       const candidates = new Set<string>([
@@ -10794,11 +10798,12 @@ ${hint}` : ''}` };
       */
       /*
         后来定成 ——「恢复也增加这些，就默认自带不必在界面上有单独入口」：
-          · 会话记忆、项目记忆、全局记忆都跟着回来，**一律合并**（`mergeMemoryText`：本地原样保留，
+          · 会话记忆、项目记忆跟着回来，**一律合并**（`mergeMemoryText`：本地原样保留，
             备份里多出来的行补在后面）。以前会话那份是直接覆盖的 —— 本机后来教它的会被一份旧备份盖掉；
             项目那份本地有就不拉 —— 备份里多的那几条就回不来。
           · `.bak` 之类的别的文件：本地没有才写。
           · 动之前把本地那几份记忆也挪进同一个 trash 目录。
+          · 全局记忆不拉（「全局记忆不应该同步」2026-11-24：每台电脑各用各的 global.md，`isGlobalMemoryRel`）。
       */
       let memoryFiles = 0;
       const project = typeof recAfter?.profile?.projectId === 'string' ? recAfter.profile.projectId : '';
@@ -10806,13 +10811,12 @@ ${hint}` : ''}` };
       const memPrefixes = [
         `${keyFor(cfg.prefix, path.join('memory', 'sessions', sessionId))}/`,
         ...(project && !/[\\/]|\.\./.test(project) && !store.isAdvancedOnlyProjectName(project) ? [`${keyFor(cfg.prefix, path.join('memory', 'projects', project))}/`] : []),
-        keyFor(cfg.prefix, path.join('memory', 'global.md')),
       ];
       for (const pfx of memPrefixes) {
         for (const obj of await listObjects(creds!, pfx)) {
           const rel = relFor(cfg.prefix, obj.key);
           if (!rel) continue;
-          if (pfx.endsWith('.md') && obj.key !== pfx) continue;   // global.md 那个前缀别带出 global.md.xxx
+          if (isGlobalMemoryRel(rel)) continue;                   // 全局记忆不同步，恢复也不合并
           const abs = path.join(KIROLEX_HOME, rel);
           const body = await getObject(creds!, obj.key);
           restore.check();

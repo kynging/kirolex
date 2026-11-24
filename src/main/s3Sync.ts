@@ -297,7 +297,8 @@ export function planUpload(
   state: SyncState,
   /**
    * **记忆跟着会话 / 项目走** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
-   * 给了这个参数，`memory/` 就不再整棵传：只传 `global.md`、**要备份的**项目那几份、**要备份的**会话那几份。
+   * 给了这个参数，`memory/` 就不再整棵传：只传**要备份的**项目那几份、**要备份的**会话那几份。
+   * 全局记忆 `global.md` 两种情况都不传（`isGlobalMemoryRel`）。
    * 以前整棵传的结果是：设成不同步的项目（和它下面的会话）的记忆照样上了桶。
    * 不给 = 老行为（整棵传），只为了老调用方。
    */
@@ -325,16 +326,40 @@ export function planUpload(
     for (const rel of memoryRelsFor(root, sessionIds, memory.projects)) consider(rel);
     for (const dir of SHARED_DIRS) if (dir !== 'memory') for (const rel of walk(root, dir)) consider(rel);
   } else {
-    for (const dir of SHARED_DIRS) for (const rel of walk(root, dir)) consider(rel);
+    for (const dir of SHARED_DIRS) for (const rel of walk(root, dir)) if (!isGlobalMemoryRel(rel)) consider(rel);
   }
   return { upload, skippedUnchanged, skippedTooBig };
 }
 
-/** 只属于这几条会话、这几个项目的记忆文件（加上全局那一份）。项目 / 会话 id 里带路径分隔符的不认。 */
+/**
+ * **全局记忆不同步** ——「全局记忆不应该同步」（2026-11-24）：每台电脑各用各的 `~/.kirolex/memory/global.md`。
+ * 上传、定期拉取 / 三方合并、手动恢复都用它排除；桶里已有的那份和本机 `s3-memory-base/` 里的基准不删，只是不再读写。
+ * `/` 和 `\` 分隔都认（rel 可能来自桶里的 key，也可能是本机 path.join 出来的）。
+ */
+export function isGlobalMemoryRel(rel: string): boolean {
+  const parts = rel.split(/[\\/]+/).filter((x) => x && x !== '.');
+  return parts.length === 2 && parts[0] === 'memory' && parts[1] === 'global.md';
+}
+
+/**
+ * 定期同步时哪些记忆文件要管（拉 / 传 / 三方合并）：要同步的项目的记忆（别的机器建的项目也拉）、
+ * 本机有的会话的记忆。全局记忆不管（`isGlobalMemoryRel`）。
+ */
+export function memorySyncInScope(rel: string, o: { projectSynced: (project: string) => boolean; sessionIds: string[] }): boolean {
+  if (isGlobalMemoryRel(rel)) return false;
+  const parts = rel.split(/[\\/]+/);
+  if (parts[0] !== 'memory' || !rel.endsWith('.md')) return false;
+  if (parts.length === 2) return true;                                     // memory/ 顶层别的 .md（global.md 上面已经排除）
+  if (parts[1] === 'projects') return !!parts[2] && o.projectSynced(parts[2]);
+  if (parts[1] === 'sessions') return o.sessionIds.includes(parts[2]);
+  return false;
+}
+
+/** 只属于这几条会话、这几个项目的记忆文件（全局那一份不算 —— 它不同步）。项目 / 会话 id 里带路径分隔符的不认。 */
 export function memoryRelsFor(root: string, sessionIds: string[], projects: string[]): string[] {
   const safe = (x: string): boolean => !!x && !/[\\/]|\.\./.test(x);
   return [
-    ...walk(root, 'memory').filter((rel) => path.dirname(rel) === 'memory'),
+    ...walk(root, 'memory').filter((rel) => path.dirname(rel) === 'memory' && !isGlobalMemoryRel(rel)),
     ...projects.filter(safe).flatMap((p) => walk(root, path.join('memory', 'projects', p))),
     ...sessionIds.filter(safe).flatMap((id) => walk(root, path.join('memory', 'sessions', id))),
   ];
