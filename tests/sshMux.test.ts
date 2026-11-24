@@ -414,7 +414,7 @@ describe('纯远程工程：别把它往本机引', () => {
       hasLocalProject: false,
     });
     assert.match(noProject, /这条会话没有本地工程/);
-    assert.match(noProject, /别拿 `local_glob` \/ `local_grep` 去搜用户的 Mac/);
+    assert.match(noProject, /别拿 `local_glob` \/ `local_grep` 去搜用户的 (Windows|macOS|Linux) 电脑/);
     /* 那两条会把人引到错的机器上的规则必须消失 */
     assert.equal(/在\*\*他的工程\*\*上跑构建/.test(noProject), false);
     assert.equal(/工具链都在那边/.test(noProject), false);

@@ -126,6 +126,7 @@ import { bundleOmitsSessionContent, diagnosticPromptText, writeFailureBundle } f
 import { hostFor, loadTimeoutFor, type HostOps } from './hostOps.ts';
 import { judgePreflight, preflightScript, ssmPreflight, MODEL_PROBE, parseModels, remoteExecutorCap, REMOTE_MB_PER_SESSION, REMOTE_LOW_MEM_MB, remoteHeadroom, isOlderVersion } from './remotePreflight.ts';
 import { remoteContextBlock } from './remoteContext.ts';
+import { localMachineInfo, machineInfoBlock, readGitCommit, type LocalMachineInfo } from './localMachine.ts';
 import { remoteWriteVerdict, strayRemoteDeliverables, blockedWriteNotice, strayWriteNotice, saveRemoteCopy, captureBufferFor } from './remoteWriteGuard.ts';
 import { LOCAL_MARKER, MAX_LOCAL_ACTIONS_PER_TURN, parseLocalActions } from './localAction.ts';
 import { detectScript, detectWindows, whichAll, PROBE_TIMEOUT_SEC, testScript, parseDetect, parseTest, mergeHistory, type ToolId } from './binDetect.ts';
@@ -3780,6 +3781,8 @@ function remoteContextFor(sessionId: string, entry: SessionEntry): string {
   const workdir = resolveRemoteWorkdir(remote.remoteWorkdir, remote.sshHost);
   return remoteContextBlock({
     hostLabel: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost,
+    /* 用户机器 = 跑 KiroLex 的这台：按它的真实系统称呼、给命令语法提示 */
+    localPlatform: process.platform,
     remoteDir: entry.cwd,
     /* `local_*` 真正的工作目录（会话的 files/）；项目目录另外说（`projectDir`） */
     localDir: localProjectDirOf(sessionId, entry),
@@ -6751,6 +6754,26 @@ const OFFLOAD_STATE_PATH = path.join(KIROLEX_HOME, OFFLOAD_STATE_FILE);
 const S3_BUCKET_SEEN_PATH = path.join(KIROLEX_HOME, BUCKET_SEEN_FILE);
 function thisDeviceId(): string {
   return loadOrCreateDeviceId(DEVICE_ID_PATH, machineTag(os.hostname()), () => crypto.randomUUID().replace(/-/g, '').slice(0, 16));
+}
+
+/** 构建 commit 只读一次（读 `.git`，打包后没有就是空串）。 */
+let buildCommitCache: string | undefined;
+
+/**
+ * 每轮注入的「[本机] …」用的这台电脑的信息 —— 永远现取**这台**的，不从会话记录里读（会话可能是别的电脑同步来的）。
+ * edition：Advanced 的构建里有 `flowTools.js`，标准版没有。
+ */
+function currentMachineInfo(): LocalMachineInfo {
+  if (buildCommitCache === undefined) buildCommitCache = readGitCommit(app.getAppPath());
+  let deviceId = '';
+  try { deviceId = thisDeviceId(); } catch { /* 数据目录不可写也照样注入 */ }
+  return localMachineInfo({
+    kirolexHome: KIROLEX_HOME,
+    deviceId,
+    advanced: fs.existsSync(path.join(__dirname, 'flowTools.js')),
+    version: app.getVersion(),
+    commit: buildCommitCache,
+  });
 }
 
 /** 云端清理用的 S3 操作（`cloudTrash.ts` 的 `BucketOps`）。 */
@@ -11700,6 +11723,19 @@ ${hint}` : ''}` };
     // does pass displayText, so nothing was corrupted; this removes the trap
     // instead of relying on all future call sites remembering.
     if (rideAlongBlock) prompt = [{ type: 'text', text: rideAlongBlock }, ...prompt];
+    /*
+      **「[本机] …」—— 这台电脑是谁**（机器名 / 系统 / 用户 / KiroLex 版本 / 数据目录）。在记忆块和历史快照**之后**
+      prepend → 不管这一轮带不带历史，它都是注入内容的第一行（同样在用户消息落盘之后，不会进 transcript）。
+      本地、远程会话都发；不受 memoryInjection 开关管（它不是记忆，也不写进任何 memory.md、不进同步）。
+      会话可能是别的电脑同步来的：说的永远是**现在这台**（`currentMachineInfo`）。
+    */
+    try {
+      const remote = entry.profile.remote;
+      const mi = machineInfoBlock(currentMachineInfo(), {
+        remoteLabel: remote?.sshHost ? (labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost) || remote.sshHost) : undefined,
+      });
+      if (mi) prompt = [{ type: 'text', text: mi }, ...prompt];
+    } catch {}
     // History rebuild already happened above (awaited, chunked, retried) before
     // this message was accepted, so there is nothing to inject inline here. The
     // old inline path prepended the ENTIRE transcript onto the user's own prompt

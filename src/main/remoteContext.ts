@@ -17,6 +17,7 @@
 import { localActionHelp } from './localAction.ts';
 import { localToolsHelp } from './remoteLocalTools.ts';
 import { forwardHelp, forwardHttpHelp, unavailableForwardHelp, type ForwardUnavailable } from './forwardMcp.ts';
+import { userMachineName } from './localMachine.ts';
 
 export interface RemoteContextInput {
   /** 给人看的机器名（设置里的 label）。 */
@@ -65,6 +66,19 @@ export interface RemoteContextInput {
    * 重试成功后主进程会清掉它，下一轮注入就恢复。
    */
   unavailable?: ForwardUnavailable[];
+  /**
+   * 用户机器（跑 KiroLex 的这台）的 `process.platform` —— 「不是用户的 Mac」以前是写死的，
+   * 用户换到 Windows 机后模型据此误判本机系统。不给就取本进程的。
+   */
+  localPlatform?: string;
+}
+
+/** `local_bash` 在用户机器上用什么 shell 跑（和 `localMcp.ts` 里的实现一致）。 */
+function localShellHelp(platform: string): string {
+  return platform === 'win32'
+    ? '· `local_bash` 在他的 Windows 电脑上默认用 **cmd.exe** 跑（cmd 语法）；要用 PowerShell 就传 `shell: "powershell"`。'
+      + '你所在的这台远端上的命令照旧按它自己的 shell 写。'
+    : '· `local_bash` 在他电脑上用 **bash**（`bash -lc`）跑，按 bash 语法写。';
 }
 
 /**
@@ -77,9 +91,11 @@ export function remoteContextBlock(input: RemoteContextInput): string {
   if (!host || !remoteDir) return '';
   const down = new Set((input.unavailable || []).map((u) => u.name));
   const usable = (names?: string[]) => (names || []).filter((n) => !down.has(n));
+  const platform = String(input.localPlatform || process.platform);
+  const userBox = userMachineName(platform);
   return [
     '[运行环境：远程]',
-    `你现在跑在远端机器 ${host} 上，不是用户的 Mac。你的工具（读写文件、执行命令）都在这台机器上生效。`,
+    `你现在跑在远端机器 ${host} 上，不是${userBox}。你的工具（读写文件、执行命令）都在这台机器上生效。`,
     /*
       **文件不再被复制到这台机器上** —— 镜像去掉了（`registerRemoteSync` 那段）。
       用户的项目在他自己机器上，这条会话通过反向隧道调本地工具去读写它。
@@ -93,7 +109,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     input.hasLocalProject === false
       ? `· **这条会话没有本地工程** —— 用户没给它挑本机目录，所以"项目"就在**你这台机器上**`
         + `（当前目录 \`${remoteDir}\` 是缓存目录，交付物不放这里）。要找文件、找代码、跑命令，都在这里找，`
-        + `**别拿 \`local_glob\` / \`local_grep\` 去搜用户的 Mac** —— 那边没有这个工程，`
+        + `**别拿 \`local_glob\` / \`local_grep\` 去搜${userBox}** —— 那边没有这个工程，`
         + `\`local_*\` 的默认目录是这条会话在他机器上的文件夹${input.filesDir ? `（\`${input.filesDir}\`）` : ''}，`
         + `里面只有这条会话自己的产出，不是工程。`
         + `\`local_*\` 留着是为了两件事：用户**明确指给你**的本机路径（他会把路径写出来），`
@@ -177,6 +193,7 @@ export function remoteContextBlock(input: RemoteContextInput): string {
     */
     '· 用户的浏览器在**他自己的机器**上，不在这里。'
       + '只在这台机器的 localhost 上监听的服务他打不开，那就明说端口号。',
+    localShellHelp(platform),
     localActionHelp(),
     localMachineHelp([...usable(input.forwarded), ...usable(input.forwardedHttp)]),
     forwardHelp(usable(input.forwarded)),
