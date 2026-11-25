@@ -53,6 +53,39 @@ export function engineCanSteer(engine?: string | null, busyEnter?: string | null
   return !engine || engine === 'kiro';
 }
 
+/**
+ * **忙时 Enter 按哪个引擎走** —— 主进程给的引擎优先，不用渲染层列表里的（那份可能是 ui-state 的旧快照：
+ * 实测列表写着 claude、实际是 kiro，于是 `caps-unknown` 进了 KiroLex 队列，而不是 kiro 的 `_session/steer`）。
+ *   · `mainEngine`：主进程推过的（`session:engine-changed` / `session:profile-sync` / 上次问到的）；
+ *   · `cached`：主进程推过的明确能力（`cacheableBusyEnter`）；
+ *   · 两样都不够用时（不知道主进程的引擎，或者引擎不能 steer、又没有能力声明）现问一次 `ask`（`acp:session-engine`，kiro 也回引擎）。
+ * 问不到才退回列表里的引擎。
+ */
+export async function resolveBusyEnter(o: {
+  listEngine?: string | null;
+  mainEngine?: string | null;
+  cached?: string | null;
+  ask: () => Promise<{ engine?: string | null; busyEnter?: string | null } | null | undefined>;
+}): Promise<{ engine: string; busyEnter?: string; kind: 'steer' | 'handoff' | 'queue'; asked: boolean; fromMain: boolean }> {
+  let engine = o.mainEngine || undefined;
+  let busyEnter = o.cached || undefined;
+  let asked = false;
+  if (!busyEnter && !(engine && engineCanSteer(engine))) {
+    asked = true;
+    try {
+      const r = await o.ask();
+      if (r?.engine) engine = r.engine;
+      if (r?.busyEnter) busyEnter = r.busyEnter;
+    } catch { /* 问不到：按列表里的兜底 */ }
+  }
+  const fromMain = !!engine;
+  const eng = engine || o.listEngine || 'kiro';
+  /* 引擎是主进程给的、又没有能力声明（kiro 不推 / 没连着）：按那个引擎的能力补上 —— 调用方拿它和列表里的（可能过期的）engine 一起
+     交给 busyEnterKind 时，也按主进程的引擎走 */
+  if (!busyEnter && fromMain) busyEnter = engineCanSteer(eng) ? 'steer' : 'queue';
+  return { engine: eng, busyEnter, kind: busyEnterKind(eng, busyEnter), asked, fromMain };
+}
+
 /** 渲染端能缓存的 `busyEnter`：只缓存明确的能力（`steer` / `steering` / `prompt-queue` / `queue`）。
  *  `unknown`（initialize 还没到）和空值不缓存 —— 以前 `queue` 在能力未知时也被算出来、被缓存，Claude Code 忙时 Enter 就一直进 KiroLex 队列。 */
 export function cacheableBusyEnter(busyEnter?: string | null): string | undefined {

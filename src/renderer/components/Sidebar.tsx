@@ -5,6 +5,7 @@ const COLLAPSED_KEY = 'kirolex-sidebar-collapsed';
 import { kiroTraceOn, setKiroTrace } from '../hooks/useFeatureFlags';
 import { useRemoteTargets } from '../hooks/useRemoteTargets';
 import { searchSessions, firstShown } from '../sessionSearch';
+import { noteEngineSwitchResult } from '../engineSwitch';
 import { requestRecovery } from '../recoveryRequest';
 import { sessionInfoRows, sessionInfoText, type SessionInfo } from '../sessionInfo';
 import { placeMenu, placeSubmenu } from '../menuPlacement';
@@ -860,6 +861,8 @@ export const Sidebar: React.FC<SidebarProps> = ({
     if (!api?.switchEngine) return;
     /* 带上项目 / 引擎 / 机器：还没连上过的新会话没有记录，主进程要给它建一份（见 coldHintFor） */
     const r = await api.switchEngine(sessionId, engine, coldHintFor(sessionId)).catch((e: any) => ({ ok: false, error: e?.message || String(e) }));
+    /* 返回里生效的引擎（含 unchanged「已经是它」）也写回列表 —— 界面的快照可能是旧的 */
+    noteEngineSwitchResult(sessionId, r);
     /* 这一轮还在跑：主进程记下来了，跑完再换（会话输入框下面那一排标「⏳」；等待时不弹"跑完再切"之类的话） */
     if (r?.pending) return;
     if (!r?.ok) showToast(t('✗ Could not switch engine: {reason}', { reason: String(r?.error || t('reason unknown')).replace(/^Error invoking remote method '[^']+': (Error: )?/, '') }));

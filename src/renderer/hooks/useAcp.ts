@@ -59,6 +59,8 @@ import { commandTraceFields, isCommandCall, mergeToolTrace, shouldRecordToolCall
 import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
 import { withoutPermissionCard, enqueuePermission, currentPermissions, settlePermission, allowAllPermissions, permissionToolKey } from '../permissionCards';
+import { alignSessions, applyProfileEntry, profileSyncEntryFromDiskRow, type ProfileSyncEntry } from '../../main/profileSync.ts';
+import { onEngineSwitchResult } from '../engineSwitch';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
@@ -2105,13 +2107,36 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
 
-  /* 换了引擎（「现有会话也能切换 agent 运行类型」）：侧栏 tag、模型/agent 下拉都看 `session.engine`，当场改 */
+  /* 换了引擎（「现有会话也能切换 agent 运行类型」）：侧栏 tag、模型/agent 下拉都看 `session.engine`，当场改。
+     换引擎那次 IPC 的返回（含 unchanged「已经是它」）也一样（`engineSwitch.ts`）—— 界面的快照可能是旧的 */
   useEffect(() => {
+    const setEngine = (sessionId: string, engine: 'kiro' | 'claude' | 'codex') => {
+      setSessions((prev) => prev.map((s) => (s.id === sessionId
+        ? { ...s, engine: engine === 'kiro' ? undefined : engine }
+        : s)));
+    };
     const off = (window as any).kiroApi?.onEngineChanged?.((d: { sessionId: string; engine: 'kiro' | 'claude' | 'codex' }) => {
       if (!d?.sessionId) return;
-      setSessions((prev) => prev.map((s) => (s.id === d.sessionId
-        ? { ...s, engine: d.engine === 'kiro' ? undefined : d.engine }
-        : s)));
+      setEngine(d.sessionId, d.engine);
+    });
+    const offResult = onEngineSwitchResult(setEngine);
+    return () => { try { off?.(); offResult(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
+  /*
+    **记录里由主进程决定的字段以记录为准**（`session:profile-sync`，main/profileSync.ts）：启动 / 窗口刷新 / attach 成功 /
+    S3 合并或恢复之后主进程推过来。列表里不一样的按它改（改完由持久化那个 effect 写回 ui-state）。
+  */
+  useEffect(() => {
+    const off = (window as any).kiroApi?.onProfileSync?.((d: { sessions?: ProfileSyncEntry[]; why?: string }) => {
+      const entries = Array.isArray(d?.sessions) ? d.sessions.filter((e) => e && typeof e.id === 'string') : [];
+      if (!entries.length) return;
+      for (const e of entries) if (e.model && e.model !== 'auto') sessionModelRef.current.set(e.id, e.model);
+      setSessions((prev) => {
+        const r = alignSessions(prev, entries);
+        if (r.changed) console.info(`[profile-sync] ${d?.why || ''}: ${r.fixes.map((x) => `${x.sessionId}.${x.field} ${x.ui || '(none)'} -> ${x.record || '(none)'}`).join(', ')}`);
+        return r.sessions;
+      });
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
@@ -2521,6 +2546,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
                 timestamp: rec.updatedAt,
               });
             }
+          }
+          /*
+            **记录决定的那几个字段（引擎 / 模型 / 权限 / 运行位置 / 工作目录 / 项目 / agent）以记录为准，连"记录里没有"也是**
+            （main/profileSync.ts）。上面那几处 `记录 ?? 快照` 遇到"记录里没有这个字段"（kiro 老记录没写 engine、本机会话没有 remote）
+            就退回快照里的旧值 —— 实测一份 Mac 时代的快照（engine: claude、localDir: /Users/...）一直纠正不过来。
+          */
+          for (const rec of disk) {
+            const cur = byId.get(rec.id);
+            if (cur && rec?.id) byId.set(rec.id, applyProfileEntry(cur, profileSyncEntryFromDiskRow(rec)));
           }
           // DISK IS AUTHORITATIVE. This merge used to be a pure union, so a chat
           // that localStorage still listed but the disk no longer had (deleted,

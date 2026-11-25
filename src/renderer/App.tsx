@@ -41,7 +41,8 @@ import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
-import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, engineCanSteer, enterRoute, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, enterRoute, resolveBusyEnter, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
+import { type ProfileSyncEntry } from '../main/profileSync.ts';
 import { carryControlMark, controlMessageId, isControlMessageId, type MarkOrigin } from '../main/controlSessions';
 import { isKirolexNote } from '../main/kirolexNote.ts';
 import { newChatModel } from '../main/engineModelPick.ts';
@@ -314,6 +315,10 @@ declare global {
       /** Claude Code / Codex 的下拉清单 + 忙时 Enter 交给谁（`busyEnter`，main/busyEnterCaps.ts）；kiro 会话回 null */
       engineModels?: (sessionId: string) => Promise<{ sessionId: string; busyEnter?: string } | null>;
       onEngineModels?: (cb: (d: { sessionId: string; busyEnter?: string }) => void) => () => void;
+      /** 这条会话实际用哪个引擎（主进程：连着 = 在跑的那个，没连着 = 记录）+ 连着时的 busyEnter；kiro 也回（`acp:session-engine`） */
+      sessionEngine?: (sessionId: string) => Promise<{ sessionId: string; engine: 'kiro' | 'claude' | 'codex'; busyEnter?: string } | null>;
+      /** 记录里由主进程决定的会话字段（`session:profile-sync`，main/profileSync.ts） */
+      onProfileSync?: (cb: (d: { sessions: ProfileSyncEntry[]; why?: string }) => void) => () => void;
       /** 忙时 Enter 走了哪条路，进主进程日志（`acp:busy-enter-log`） */
       logBusyEnter?: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => void;
       /** 挂好 session:engine-models 监听后握手：主进程把连着的会话的能力各推一次（`acp:engine-models-ready`） */
@@ -3662,15 +3667,38 @@ const App: React.FC = () => {
     window.kiroApi.engineModelsReady?.();
     return off;
   }, []);
+  /*
+    **主进程说的引擎**（`session:engine-changed` / `session:profile-sync` / 现问到的）：忙时 Enter 按它路由，不按列表里的
+    `session.engine` —— 列表可能是 ui-state 的旧快照（实测列表 claude、实际 kiro，忙时 Enter 进了 KiroLex 队列）。
+    引擎变了，缓存的能力就不作数了（那是旧引擎的），下一次忙时 Enter 现问。
+  */
+  const mainEngineRef = useRef<Record<string, string>>({});
+  useEffect(() => {
+    const note = (sid: string, engine: string) => {
+      /* 之前不知道（undefined）时不清：那份缓存就是主进程按现在的执行器推的 */
+      const prev = mainEngineRef.current[sid];
+      if (prev && prev !== engine) delete busyEnterRef.current[sid];
+      mainEngineRef.current[sid] = engine;
+    };
+    const offEngine = (window.kiroApi as any).onEngineChanged?.((d: { sessionId: string; engine: string }) => { if (d?.sessionId && d.engine) note(d.sessionId, d.engine); });
+    const offSync = window.kiroApi.onProfileSync?.((d) => {
+      for (const e of Array.isArray(d?.sessions) ? d.sessions : []) if (e?.id && e.engine) note(e.id, e.engine);
+    });
+    return () => { try { offEngine?.(); offSync?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+  /* 返回的是按**主进程的引擎**算好的能力（`resolveBusyEnter`）：列表里的 engine 过期了，busyEnterKind 照样按它走对 */
   const busyEnterFor = useCallback(async (sid: string, engine?: string): Promise<string | undefined> => {
-    const known = busyEnterRef.current[sid];
-    if (known || engineCanSteer(engine)) return known;
-    try {
-      const d = await window.kiroApi.engineModels?.(sid);
-      const v = cacheableBusyEnter(d?.busyEnter);
-      if (v) busyEnterRef.current[sid] = v;
-      return d?.busyEnter;
-    } catch { return undefined; }
+    const r = await resolveBusyEnter({
+      listEngine: engine, mainEngine: mainEngineRef.current[sid], cached: busyEnterRef.current[sid],
+      ask: async () => {
+        const d = await window.kiroApi.sessionEngine?.(sid);
+        if (d?.engine) mainEngineRef.current[sid] = d.engine;
+        const v = cacheableBusyEnter(d?.busyEnter);
+        if (v) busyEnterRef.current[sid] = v;
+        return d ?? null;
+      },
+    });
+    return r.busyEnter;
   }, []);
 
   /*
@@ -3793,7 +3821,8 @@ const App: React.FC = () => {
        `busyReason` 跟着下面的判断改：能力声明（caps-<mode>）/ 重建历史 / steer 或交给适配器没成的原因。 */
     let busyReason = 'caps';
     const logBusyEnter = (route: 'steered' | 'handoff' | 'kirolex-queue' | 'after-rebuild' | 'sent-as-new' | 'failed') => {
-      const engine = sessions.find((s) => s.id === sessionId)?.engine;
+      /* 记路由实际用的引擎（主进程给的，见 `busyEnterFor`）；还没问到才是列表里的 */
+      const engine = mainEngineRef.current[sessionId] || sessions.find((s) => s.id === sessionId)?.engine;
       window.kiroApi.logBusyEnter?.({ sessionId, engine: engine || 'kiro', mode: busyEnterLogMode(engine, busyEnterRef.current[sessionId]), route, reason: busyReason });
     };
 
@@ -3865,7 +3894,7 @@ const App: React.FC = () => {
     const enterKind = busyEnterKind(steerEngine, await busyEnterFor(sessionId, steerEngine));
     const canSteer = enterKind !== 'queue';
     const busyRoute = busyEnterRoute({ busy: busyBySessionRef.current[sessionId], canSteer });
-    busyReason = busyRoute === 'after-rebuild' ? 'rebuilding' : `caps-${busyEnterLogMode(steerEngine, busyEnterRef.current[sessionId])}`;
+    busyReason = busyRoute === 'after-rebuild' ? 'rebuilding' : `caps-${busyEnterLogMode(mainEngineRef.current[sessionId] || steerEngine, busyEnterRef.current[sessionId])}`;
     if (busyRoute === 'after-rebuild') { parkUntilRebuilt(); return; }
     if (busyRoute === 'queue') { queueAsNext(); return; }
     if (enterKind === 'handoff') { await handOff(); return; }

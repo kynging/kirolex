@@ -20,6 +20,7 @@ import { useLang, useT } from '../hooks/useLang';
 import { displayTitle, shownIn } from '../i18n';
 import { pickVariant } from '../../main/uiText.ts';
 import { engineCanSteer, steerFailureReasonKey } from '../steerRoute';
+import { noteEngineSwitchResult } from '../engineSwitch';
 // 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
 import { shouldApplyHandoff } from '../handoffDraft';
 import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
@@ -1389,6 +1390,7 @@ export const SafeguardCard = memo<{
     setEngineSwitch({ phase: 'working' });
     try {
       const r = await (window as any).kiroApi?.switchEngine?.(sessionId, targetEngine);
+      noteEngineSwitchResult(sessionId, r);   // 生效的引擎（含 unchanged）写回列表
       setEngineSwitch(r?.pending ? { phase: 'pending' } : r?.ok ? { phase: 'done' } : { phase: 'failed', error: cleanIpcError(r?.error || '') });
     } catch (err) {
       setEngineSwitch({ phase: 'failed', error: cleanIpcError(err) });

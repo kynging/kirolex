@@ -182,6 +182,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   switchKiroAgent: (sessionId: string, agentName: string) => ipcRenderer.invoke('acp:switch-kiro-agent', sessionId, agentName),
   switchModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:switch-model', sessionId, model),
   engineModels: (sessionId: string) => ipcRenderer.invoke('acp:engine-models', sessionId),
+  /* 忙时 Enter 按哪个引擎路由：主进程说了算（连着 = 实际在跑的；没连着 = 记录），kiro 也回 */
+  sessionEngine: (sessionId: string) => ipcRenderer.invoke('acp:session-engine', sessionId),
   /* 忙时 Enter 走了哪条路，进主进程日志（`[prompt] busy-enter …`） */
   logBusyEnter: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => ipcRenderer.send('acp:busy-enter-log', d),
   /* 渲染端挂好 session:engine-models 监听了（窗口刷新后）：请主进程把连着的会话的能力各推一次 */
@@ -871,6 +873,12 @@ contextBridge.exposeInMainWorld('kiroApi', {
     const handler = (_event: any, d: any) => callback(d);
     ipcRenderer.on('session:engine-changed', handler);
     return () => ipcRenderer.removeListener('session:engine-changed', handler);
+  },
+  /** 记录里的引擎 / 模型 / 权限 / 运行位置 / 工作目录 / 项目 / agent（`session:profile-sync`，main/profileSync.ts）：渲染层以它为准改列表 */
+  onProfileSync: (callback: (d: { sessions: any[]; why?: string }) => void) => {
+    const handler = (_event: any, d: any) => callback(d);
+    ipcRenderer.on('session:profile-sync', handler);
+    return () => ipcRenderer.removeListener('session:profile-sync', handler);
   },
   onTargetsChanged: (callback: (d: { sessionId: string; remoteHost: string | null; remoteId?: string | null; localDir?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

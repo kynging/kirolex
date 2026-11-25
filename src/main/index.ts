@@ -143,6 +143,7 @@ import { SessionMountLock, mountDrift, adoptRecordFields, MountDriftError } from
 import { profileAfterReconnect, recordPermission } from './reconnectRecord.ts';
 import { trackReplySegments, type ReplySegments } from './replySegments.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
+import { alignUiStateSessions, profileSyncFieldsOf, profileSyncLogLine, type ProfileSyncEntry } from './profileSync.ts';
 import { createCreationGate } from './creationGate.ts';
 import { CreationSwitchBook, applyBeforeStart, settleOnCreated, type CreationSwitch } from './creationSwitches.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
@@ -8685,6 +8686,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
         mergedIds.push(c.id);
         logger.info('s3', `自动合并 ${c.id}（桶里那份来自 ${c.from}，${seenAt} 上传）：并进 ${r.added} 条消息${r.pulledFiles ? `、拉下 ${r.pulledFiles} 个文件` : ''}`);
         mainWindow?.webContents.send('session:history-changed', { sessionId: c.id });
+        /* 合并改了记录：以合并后的记录为准推给界面 */
+        pushProfileSync([c.id], 's3-merge');
       } catch (err: any) {
         conflictIds.add(c.id);
         logger.warn('s3', `自动合并 ${c.id} 失败，这一轮本机这份传到 conflicts/：${err?.message || err}`);
@@ -9248,6 +9251,49 @@ async function applyEngineModel(sessionId: string, entry: SessionEntry): Promise
  * 挂上后（`applyEngineModel` 末尾）和断线自动恢复接回来时（`remoteRecovery` 的 `recovered`）都推一次 ——
  * 渲染层在重连 / 切换期间清掉了清单（`setEngineModels(null)`），不推它就一直停在「连接中…」。
  */
+/**
+ * **会话列表里由记录决定的字段，以记录为准推给渲染层**（`session:profile-sync`，`profileSync.ts`）——
+ * 「界面显示是 Claude Code，记录是 kiro」：渲染层的列表是 ui-state 里的旧快照，以前从没按记录校正过。
+ * 连着执行器的会话，引擎用它实际在跑的那个。
+ */
+function profileSyncEntryOf(rec: store.SessionRecord, targets = listRemoteTargets(KIROLEX_CONFIG_PATH)): ProfileSyncEntry {
+  const remote = rec.profile?.remote as any;
+  const remoteView = remote?.sshHost
+    ? { remoteHost: labelForHost(KIROLEX_CONFIG_PATH, remote.sshHost), ...durableRemoteId(remote, targets, (id) => findRemoteTarget(KIROLEX_CONFIG_PATH, id)) }
+    : {};
+  const live = sessionClients.get(rec.id);
+  return profileSyncFieldsOf(rec, remoteView, live ? { engine: engineOf(live.profile), model: live.profile.model } : undefined);
+}
+/**
+ * ui-state 里的会话列表和记录对一遍：不一致的按记录改（写回 ui-state），每个字段记一行
+ * `[profile-sync] fixed sessionId=… field=engine ui=claude record=kiro`。启动水化（一次性迁移）和每次推送都过这里；
+ * 渲染层收到推送 / 水化时按同一套规则改自己内存里那份并写回（它的写入随后到，内容一样）。
+ */
+function reconcileUiStateProfiles(entries: ProfileSyncEntry[], why: string): void {
+  try {
+    const r = alignUiStateSessions(uiState()['kirolex-sessions'], entries);
+    if (!r.raw) return;
+    for (const fix of r.fixes) logger.info('profile-sync', `${profileSyncLogLine(fix)} via=${why}`);
+    setUiStateKey('kirolex-sessions', r.raw);
+  } catch (err: any) {
+    logger.warn('profile-sync', `ui-state 对齐失败（${why}）：${err?.message || err}`);
+  }
+}
+function pushProfileSync(ids: string[] | 'all', why: string): void {
+  try {
+    const tombstoned = new Set([...loadSessionTombstones(), ...deletedSessionIds]);
+    const recs = (ids === 'all' ? store.listSessions() : ids.map((id) => store.readRecord(id)).filter(Boolean) as store.SessionRecord[])
+      .filter((rec) => !tombstoned.has(rec.id));
+    if (!recs.length) return;
+    const targets = listRemoteTargets(KIROLEX_CONFIG_PATH);
+    const sessions = recs.map((rec) => profileSyncEntryOf(rec, targets));
+    reconcileUiStateProfiles(sessions, why);
+    if (mainWindow && !mainWindow.isDestroyed()) mainWindow.webContents.send('session:profile-sync', { sessions, why });
+  } catch (err: any) {
+    logger.warn('profile-sync', `推送失败（${why}）：${err?.message || err}`);
+  }
+}
+
 function pushEngineModels(sessionId: string): boolean {
   const entry = sessionClients.get(sessionId);
   if (!entry || engineOf(entry.profile) === 'kiro') return false;
@@ -10394,6 +10440,9 @@ function createWindow() {
   mainWindow.webContents.on('did-start-loading', () => startupMark('renderer: did-start-loading'));
   mainWindow.webContents.on('dom-ready', () => startupMark('renderer: dom-ready'));
   mainWindow.webContents.on('did-finish-load', () => startupMark('renderer: did-finish-load'));
+  /* 启动 / 窗口刷新（含控制入口 /reload）：把记录里的引擎、模型、权限、运行位置等推给渲染层（`session:profile-sync`）。
+     监听这时可能还没挂上 —— 渲染层水化时从 list-durable-sessions 按同一套规则再对一遍，丢了也不要紧 */
+  mainWindow.webContents.on('did-finish-load', () => pushProfileSync('all', 'did-finish-load'));
   /**
    * **加载失败要自己重来，不能留一个白屏** ——「现在根本看不到东西」。
    *
@@ -11624,6 +11673,8 @@ ${hint}` : ''}` };
       /* 这条会话的定时任务一起拉回来（只拉不传）：runner 是别的电脑、或定义没在本机确认过的只显示，接管确认后才跑 */
       restore.check();
       await syncSchedulesWithBucket(creds!, cfg.prefix, { only: sessionId, upload: false });
+      /* 恢复 / 合并改了记录：以恢复后的记录为准推给界面 */
+      pushProfileSync([sessionId], 's3-restore');
       logger.info('s3', `${merged ? '合并' : '恢复'} ${sessionId}：${restored} 个文件`
         + `${merged ? `（并进 ${merged.added} 条${merged.clashed ? `，${merged.clashed} 条同 id 冲突保留本地` : ''}）` : ''}`
         + `${memoryFiles ? `，记忆 ${memoryFiles} 个文件` : ''}${madeLocal ? '，改成在本机跑' : ''}${keptRemote ? `，仍在 ${keptRemote} 上跑` : ''}`
@@ -15539,6 +15590,14 @@ ${hint}` : ''}` };
     const entry = sessionClients.get(sessionId);
     return entry && engineOf(entry.profile) !== 'kiro' ? engineModelsPayload(sessionId, entry) : null;
   });
+  /** **忙时 Enter 按哪个引擎路由** —— 主进程说了算（连着就是实际在跑的那个，没连着看记录）。渲染层列表里的 `engine` 可能是
+   *  ui-state 的旧快照（实测：列表 claude、实际 kiro → 进了 KiroLex 队列而不是 steer）；`acp:engine-models` 对 kiro 回 null，引擎要另给。 */
+  ipcMain.handle('acp:session-engine', (_event, sessionId: string) => {
+    const entry = sessionClients.get(sessionId);
+    if (entry) return { sessionId, engine: engineOf(entry.profile), busyEnter: entry.client.busyEnter };
+    const rec = store.readRecord(sessionId);
+    return rec ? { sessionId, engine: engineOf(rec.profile) } : null;
+  });
 
   /** 每次忙时 Enter 走完路由，渲染端报一行（`[prompt] busy-enter … mode=… route=… reason=…`，`busyEnterCaps.busyEnterLogLine`）。
    *  以前「为什么进了 KiroLex 队列」在日志里一个字都没有。 */
@@ -15918,7 +15977,13 @@ ${hint}` : ''}` };
     /* 没连着、也还没有记录的新会话：先建一份（见 coldRecordFor） */
     const rec0 = oldEntry ? store.readRecord(sessionId) : coldRecordFor(sessionId, hint);
     const before = engineOf(oldEntry?.profile || rec0?.profile);
-    if (before === engine) return { ok: true, unchanged: true, engine };
+    if (before === engine) {
+      /* 已经是这个引擎：照样把当前值告诉界面 —— 界面的快照可能是旧的（显示 Claude Code、实际是 kiro），不广播就永远纠正不过来 */
+      mainWindow?.webContents.send('session:engine-changed', { sessionId, engine });
+      sessionNotice(sessionId, tr('ℹ️ This session is already on {engine}.', { engine: label }));
+      logger.info('engine', `切换引擎 sessionId=${sessionId} 已经是 ${label}（unchanged，照样广播 engine-changed）`);
+      return { ok: true, unchanged: true, engine };
+    }
     const reshape = (p: AgentProfile): AgentProfile => reshapeForEngine(p, engine);
 
     if (!oldEntry) {
@@ -18022,6 +18087,8 @@ ${hint}` : ''}` };
         try {
           /* 阶段标记（mainLag.ts）：这段时间里主进程卡住的话，那一行 [mainlag] 带上「attach <id>」 */
           const result = await lagPhases.run(`attach ${sessionId}`, attachOnce);
+          /* 挂上了：记录（和实际在跑的引擎）推给界面，ui-state 里的旧快照以它为准（`session:profile-sync`） */
+          pushProfileSync([sessionId], 'attach');
           if (attempt > 0) {
             const live = sessionClients.get(sessionId);
             if (live) mainWindow?.webContents.send('session:engine-changed', { sessionId, engine: engineOf(live.profile) });
@@ -19958,7 +20025,10 @@ ${hint}` : ''}` };
     const remoteTargetsNow = listRemoteTargets(KIROLEX_CONFIG_PATH);
     /* 项目不是真项目的（会话 id 形状 / 本机不认识）读的时候就纠正成未分组并写回（`fixBogusProject`） */
     const known = localKnownProjects();
-    return store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((r) => fixBogusProject(r, known, 'hydrate')).map((rec) => ({
+    const recs = store.listSessions().filter((rec) => !tombstoned.has(rec.id)).map((r) => fixBogusProject(r, known, 'hydrate'));
+    /* **一次性迁移**：ui-state 里那份会话列表（渲染层启动时读的快照）和记录不一致的字段，以记录为准改掉并记日志（`profileSync.ts`） */
+    reconcileUiStateProfiles(recs.map((rec) => profileSyncEntryOf(rec, remoteTargetsNow)), 'hydrate');
+    return recs.map((rec) => ({
       id: rec.id,
       title: rec.title,
       projectId: rec.profile?.projectId,
@@ -19982,6 +20052,8 @@ ${hint}` : ''}` };
       ...(rec.profile?.kiroAgent ? { kiroAgent: rec.profile.kiroAgent } : null),
       /* 哪个引擎（Claude Code / Codex）—— 侧栏 tag 和"藏掉 kiro 的模型/agent 下拉"都靠它 */
       ...(rec.profile?.engine ? { engine: rec.profile.engine } : null),
+      /* 工具权限（没写 = 先问）：和引擎一样归记录所有，水化时以它为准（`profileSync.ts`） */
+      ...(rec.profile?.permissionMode ? { permissionMode: rec.profile.permissionMode } : null),
       /**
        * **这条会话跑在哪台机器上** —— 远程会话（`docs/DESIGN_remote_sessions.md`）。
        *
