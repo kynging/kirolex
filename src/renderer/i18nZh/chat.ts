@@ -588,4 +588,11 @@ export const ZH_CHAT: Record<string, string> = {
   'No tool calls yet': '还没调用工具',
   'Task': '任务',
   'Its reply': '它的回复',
+  /* 别的会话发来的消息：发起方顶部的等回复标记、排队卡片（foreignMessages.ts / sessionCalls.replyWaitBadges） */
+  '⏳ Waiting for a reply from "{title}" ({n} min so far)': '⏳ 等「{title}」回复（已等 {n} 分钟）',
+  'Stop waiting: its reply (if any) will not be sent to this chat': '不等了：它之后的回复不会再发到这条会话',
+  'Stop waiting': '不等了',
+  'This message came from another session; after you edit it, that session still matches the reply to its original call.': '这是别的会话发来的，编辑后发起方仍按原 call 认回复。',
+  'Cancel this one: it will not be processed, and the session that sent it is told': '取消这条：不处理它，并告诉发来它的那条会话',
+  'Cancel this message': '取消这条消息',
 };

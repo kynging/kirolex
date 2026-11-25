@@ -245,33 +245,101 @@ type Msg = TranscriptLike & { kirolex?: boolean; steerParts?: Array<{ content: s
 /** 往前多少毫秒也算（发出去和落盘之间的时钟差） */
 const SINCE_SLACK_MS = 5000;
 
+/** 一段文字里有没有别的会话发来的来源标记（任何一行；合并排队消息时可能落在中间） */
+export function hasSessionHeader(text: unknown): boolean {
+  return String(text ?? '').split('\n').some((line) => line.startsWith('📨') && TOKEN_RE.test(line));
+}
+
+/**
+ * 这段文字是不是发出去的那一条：整段原文还在；或者正文被改过（排队卡片里编辑过、编辑后重跑），
+ * 但来源那一行的**调用编号**（同一发起方）还在 —— 编号每次调用都不一样，认它就够了。
+ */
+export function carriesPayload(text: unknown, payload: string): boolean {
+  const s = String(text ?? '');
+  if (s.includes(payload)) return true;
+  const h = parseHeader(payload);
+  if (!h?.callId) return false;
+  return s.split('\n').some((line) => {
+    if (!line.startsWith('📨')) return false;
+    const m = TOKEN_RE.exec(line);
+    return !!m && m[1] === h.sessionId && m[3] === h.callId && !m[4];
+  });
+}
+
+/**
+ * 「合并排队消息」那一条的第一行（App.tsx 用 `joinQueuedBatch` + `'[{n} queued messages merged]'`，中文表里是「【已合并 {n} 条排队消息】」），
+ * 两种语言都认；`n` = 合进来的非空卡片数。
+ */
+const MERGED_BATCH_RE = /^(?:\[(\d{1,3}) queued messages merged\]|【已合并 (\d{1,3}) 条排队消息】)\s*$/;
+
+/**
+ * 合并的一批里有没有**对方的用户自己排的**卡片：合进来 n 张，带来源标记（📨）的只有 m 张，n > m 就有。
+ * 不能按段落切：别的会话发来的正文里也可能有空行，和下一张卡片之间的分隔分不出来；张数是准的。
+ */
+export function mergedBatchHasOwnItems(text: unknown): boolean {
+  const lines = String(text ?? '').split('\n');
+  const m = MERGED_BATCH_RE.exec(lines[0] || '');
+  if (!m) return false;
+  const n = Number(m[1] ?? m[2]) || 0;
+  const foreign = lines.filter((line) => line.startsWith('📨') && TOKEN_RE.test(line)).length;
+  return n > foreign;
+}
+
+/** 带来源标记的消息 id（别的会话 / 控制入口 / 定时 / 后台唤醒 / 循环 / nudge）—— 不是对方的用户自己打的 */
+const SOURCED_ID_RE = /^(?:(?:user|steer|queue)_(?:xs|ctl)_|sched_|wake_|loop_|nudge_)/;
+
+/** 对方记录里发出去的那条在哪（最近的那条；重跑过的话就是重跑那条） */
+function locatePayload(list: Msg[], payload: string, since: number): number {
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m.role !== 'user' || m.kirolex) continue;
+    const viaSteer = Array.isArray(m.steerParts) && m.steerParts.some((p) => carriesPayload(p.content, payload) && Number(p.ts) >= since - SINCE_SLACK_MS);
+    if (viaSteer || (carriesPayload(m.content, payload) && Number(m.ts) >= since - SINCE_SLACK_MS)) return i;
+  }
+  return -1;
+}
+
 /**
  * 对方记录里那条消息在哪、之后的回复是什么。认的是**发出去的原文**（第一行的来源标记让它独一无二），
  * 发出去之后的 —— 直接发的、追加进那一轮的（折叠在 `steerParts` 里）、排队合并进一条的都认得。
  * `reply`：那条之后、下一条用户消息之前的助手消息正文；KiroLex 提示不算。
  * KiroLex 替这一轮发的续写（`isAutoContinueMessageId`，停止并切换之后的「接着做」）也不算下一条用户消息：它后面的回复同样是这一轮的。
  */
-export function findReply(transcript: TranscriptLike[], payload: string, since: number): { found: boolean; reply: string; followedByUser: boolean } {
+export function findReply(transcript: TranscriptLike[], payload: string, since: number): {
+  found: boolean; reply: string; followedByUser: boolean;
+  /** 这一轮里对方的用户自己也插了话（Enter 追加进这一轮，或者那条本来是用户的、📨 是追加进去的） */
+  interjected?: boolean;
+  /** 下一条用户消息是对方的用户自己发的（排队 / 新打的）—— 那是另起的一轮，不算这条的回复 */
+  nextByUser?: boolean;
+} {
   const list = transcript as Msg[];
-  let idx = -1;
-  for (let i = list.length - 1; i >= 0; i--) {
-    const m = list[i];
-    if (m.role !== 'user' || m.kirolex) continue;
-    const viaSteer = Array.isArray(m.steerParts) && m.steerParts.some((p) => p.content === payload && Number(p.ts) >= since - SINCE_SLACK_MS);
-    if (viaSteer || (String(m.content || '').includes(payload) && Number(m.ts) >= since - SINCE_SLACK_MS)) { idx = i; break; }
-  }
+  const idx = locatePayload(list, payload, since);
   if (idx < 0) return { found: false, reply: '', followedByUser: false };
+  const base = list[idx];
+  const parts = [String(base.content || ''), ...(Array.isArray(base.steerParts) ? base.steerParts.map((p) => String(p.content || '')) : [])];
+  const ownPart = (p: string) => !!p.trim() && !carriesPayload(p, payload) && !hasSessionHeader(p);
+  /* 合并排队消息时这条和用户自己排的拼成了一条 content（整段含着原文，ownPart 认不出来）：按张数认 */
+  let interjected = parts.some(ownPart) || mergedBatchHasOwnItems(base.content);
   const out: string[] = [];
   let followedByUser = false;
+  let nextByUser = false;
   for (let i = idx + 1; i < list.length; i++) {
     const m = list[i];
     if (m.kirolex) continue;
-    if (m.role === 'user' && isAutoContinueMessageId(m.id)) continue;
-    if (m.role === 'user') { followedByUser = true; break; }
+    if (m.role === 'user' && isAutoContinueMessageId(m.id)) {
+      /* 续写那条（KiroLex 发的「接着做」）是这一轮的后半段：它本身不算插话，但续写期间用户 Enter 追加进去的（steerParts）算 */
+      if (Array.isArray(m.steerParts) && m.steerParts.some((p) => ownPart(String(p.content || '')))) interjected = true;
+      continue;
+    }
+    if (m.role === 'user') {
+      followedByUser = true;
+      nextByUser = !SOURCED_ID_RE.test(String(m.id || '')) && !hasSessionHeader(m.content);
+      break;
+    }
     const body = String(m.content || '').replace(/<hidden>[\s\S]*?<\/hidden>/g, '').trim();
     if (body) out.push(body);
   }
-  return { found: true, reply: out.join('\n\n'), followedByUser };
+  return { found: true, reply: out.join('\n\n'), followedByUser, ...(interjected ? { interjected } : {}), ...(nextByUser ? { nextByUser } : {}) };
 }
 
 /** 「这条消息上次已经开始执行…中途断了…没有自动再发」那条 KiroLex 提示的 `noteGroup` 前缀（index.ts `promptDedupeFor`） */
@@ -284,13 +352,7 @@ export const STARTED_NOT_RESENT_GROUP = 'started-not-resent:';
  */
 export function replyProgress(transcript: TranscriptLike[], payload: string, since: number): { reply: string; cutOff: boolean } {
   const list = transcript as Array<Msg & { noteGroup?: string }>;
-  let idx = -1;
-  for (let i = list.length - 1; i >= 0; i--) {
-    const m = list[i];
-    if (m.role !== 'user' || m.kirolex) continue;
-    const viaSteer = Array.isArray(m.steerParts) && m.steerParts.some((p) => p.content === payload && Number(p.ts) >= since - SINCE_SLACK_MS);
-    if (viaSteer || (String(m.content || '').includes(payload) && Number(m.ts) >= since - SINCE_SLACK_MS)) { idx = i; break; }
-  }
+  const idx = locatePayload(list, payload, since);
   if (idx < 0) return { reply: '', cutOff: false };
   const out: string[] = [];
   let cutOff = false;
@@ -399,6 +461,12 @@ export interface ReplyWatch {
   idleTicks?: number;
   /** 对方那一轮被打断、已经给发起方发过说明的时刻（落盘）—— 之后接着等它真正的回复 */
   interruptedAt?: number;
+  /**
+   * 打断的原因是「停止并立即切换」（落盘）：这一轮在新模型上由 KiroLex 的续写（`user_kcont_`）/ 同 id 重发接着做，
+   * 中间没有用户消息 —— 所以回复只取到下一条真正的用户消息为止（`findReply`），用户另起的那一轮不算；
+   * 断线那条路（没有它）照旧跨着「继续」/ 重跑取。
+   */
+  interruptCause?: 'switch';
 }
 
 export interface ReplyWatcherDeps {
@@ -455,6 +523,68 @@ export class ReplyWatcher {
     if (changed) this.save();
   }
 
+  /**
+   * 对方这一轮被**停下**了（index.ts：用户按停止 `acp:cancel` 带 `user`；「停止并立即切换」报切换结果 `acp:reply-turn-switched`）。
+   * 只管停的就是那条所在的那一轮的（那条已进记录、后面没有另起一轮）；还排着没处理的不管。
+   *   · `user`：告诉发起方「对方的用户停止了这一轮」+ 已产出的部分，等待结束；
+   *   · `switch`：告诉发起方「对方因切换模型中断，已在新模型上继续」，等待保留到原期限（`interruptedAt`：之后只认真正做完的那一轮）。
+   */
+  turnStopped(to: string, cause: 'user' | 'switch'): number {
+    const now = this.deps.now();
+    let n = 0;
+    for (const [id, w] of this.watches) {
+      if (w.to !== to || !this.deps.exists(w.from)) continue;
+      const transcript = this.deps.transcript(to);
+      const r = findReply(transcript, w.payload, w.since);
+      /* 断线中断过的那条路跨着「继续」/ 重跑等，后面有用户消息也还是它；没中断过的、切换中断的到下一条用户消息为止 */
+      const acrossUsers = w.interruptedAt !== undefined && w.interruptCause !== 'switch';
+      if (!r.found || (r.followedByUser && !acrossUsers)) continue;
+      const partialText = acrossUsers ? replyProgress(transcript, w.payload, w.since).reply : r.reply;
+      const title = this.deps.title(to) || w.toTitle;
+      const head = replyHeader(title, to, w.depth + 1);
+      const partial = partialText ? clipReply(partialText) : tr('(nothing yet)');
+      n += 1;
+      if (cause === 'user') {
+        this.watches.delete(id);
+        this.deps.log?.(`reply watch ${id} ${w.from} ← ${to}: stopped by its user`);
+        this.deps.deliver(w.from, `${head}\n${tr('⏹️ The user of session "{title}" stopped this turn; it did not finish. Output so far: {partial}', { title: oneLine(title), partial })}\n${tr('KiroLex is no longer waiting for this reply.')}`, w);
+      } else {
+        w.interruptedAt = now;
+        w.interruptCause = 'switch';
+        w.idleTicks = 0;
+        this.deps.log?.(`reply watch ${id} ${w.from} ← ${to}: interrupted to switch, continuing（接着等到期限）`);
+        this.deps.deliver(w.from, `${head}\n${tr('🔀 Session "{title}" interrupted this turn to switch model and is continuing it on the new model. Output so far: {partial}', { title: oneLine(title), partial })}\n${tr('Its reply will be sent here once it finishes (KiroLex keeps waiting until the original deadline, {dur} after sending).', { dur: formatDuration(w.timeoutSec) })}`, w);
+      }
+    }
+    if (n) this.save();
+    return n;
+  }
+
+  /** 对方的用户在排队卡片里删掉了别的会话发来的这条（还没处理）：告诉发起方、等待结束。按调用编号认（卡片里编辑过也认得）。 */
+  withdrawn(to: string, text: string): number {
+    let n = 0;
+    for (const [id, w] of this.watches) {
+      if (w.to !== to || !carriesPayload(text, w.payload)) continue;
+      this.watches.delete(id);
+      n += 1;
+      const title = this.deps.title(to) || w.toTitle;
+      this.deps.log?.(`reply watch ${id} ${w.from} ← ${to}: withdrawn from its queue`);
+      if (this.deps.exists(w.from)) this.deps.deliver(w.from, `${replyHeader(title, to, w.depth + 1)}\n${tr('🗑️ The user of session "{title}" cancelled this message from its queue; it was not processed. KiroLex is no longer waiting for a reply.', { title: oneLine(title) })}`, w);
+    }
+    if (n) this.save();
+    return n;
+  }
+
+  /** 发起方的用户点了「不等了」：结束这条等待，不再唤醒。返回被结束的那条（没有就是 null）。 */
+  cancel(id: string): ReplyWatch | null {
+    const w = this.watches.get(id);
+    if (!w) return null;
+    this.watches.delete(id);
+    this.save();
+    const { idleTicks: _i, ...rest } = w;
+    return rest;
+  }
+
   tick(): void {
     const now = this.deps.now();
     let changed = false;
@@ -477,7 +607,9 @@ export class ReplyWatcher {
       const progress = replyProgress(transcript, w.payload, w.since);
       const idle = !this.deps.isBusy(w.to) && !this.deps.connectionLost?.(w.to);
       w.idleTicks = r.found && idle ? (w.idleTicks || 0) + 1 : 0;
-      const verdict = replyVerdict({
+      /* 切换中断后在新模型上接着做的：后面来了真正的用户消息（用户排队的另起一轮）= 原调用这一轮已经做完了，不用等用户那一轮 */
+      const switched = w.interruptCause === 'switch';
+      const verdict = switched && r.found && r.followedByUser ? 'replied' : replyVerdict({
         found: r.found, followedByUser: r.followedByUser, idleTicks: w.idleTicks, cutOff: progress.cutOff,
         outcome: this.deps.lastTurn?.(w.to) ?? null, since: w.since, interruptedAt: w.interruptedAt,
       });
@@ -493,9 +625,16 @@ export class ReplyWatcher {
           })}\n${tr('KiroLex keeps waiting for its reply until the original deadline ({dur} after sending); if it finishes later, the reply will be sent here.', { dur: formatDuration(w.timeoutSec) })}`, w);
         }
       } else if (verdict === 'replied') {
-        /* 中断过的：真正的回复可能在后面那几条用户消息（「继续」/ 重跑）之后，取那条之后的全部助手正文 */
-        const text = w.interruptedAt !== undefined ? progress.reply : r.reply;
-        done(`${head}\n${text ? clipReply(text) : tr('(That turn ended without any reply text.)')}`, 'replied');
+        /* 断线中断过的：真正的回复可能在后面那几条用户消息（「继续」/ 重跑）之后，取那条之后的全部助手正文；
+           切换中断的：续写不算用户消息（findReply 跳过它），到用户另起的那一轮为止 */
+        const acrossUsers = w.interruptedAt !== undefined && !switched;
+        const text = acrossUsers ? progress.reply : r.reply;
+        /* 对方的用户插了话：说一声（回复里可能也有对那些话的回答）；用户另起的下一轮不算进来（中断过的那条路本来就跨着「继续」取） */
+        const notes = [
+          ...(r.interjected ? [tr('(During this turn the user of session "{title}" also added message(s) of their own; the reply may also answer those.)', { title: oneLine(title) })] : []),
+          ...(r.nextByUser && !acrossUsers ? [tr('(The user of session "{title}" sent another message after this turn; that next turn is not included here.)', { title: oneLine(title) })] : []),
+        ];
+        done(`${head}\n${notes.length ? `${notes.join('\n')}\n` : ''}${text ? clipReply(text) : tr('(That turn ended without any reply text.)')}`, 'replied');
         continue;
       }
       if (now >= w.deadline) {
@@ -508,6 +647,13 @@ export class ReplyWatcher {
   private save(): void {
     try { this.deps.changed?.(this.list()); } catch { /* 落盘失败不挡唤醒 */ }
   }
+}
+
+/** 发起方会话顶部「⏳ 等「X」回复（已等 N 分钟）」那几个标记：就是 watch 列表里这条会话发出的（落盘的那份，重启后照旧） */
+export interface ReplyWaitBadge { id: string; to: string; toTitle: string; minutes: number; deadline: number }
+export function replyWaitBadges(list: readonly ReplyWatch[], sessionId: string, now: number): ReplyWaitBadge[] {
+  return list.filter((w) => w.from === sessionId)
+    .map((w) => ({ id: w.id, to: w.to, toTitle: w.toTitle, minutes: Math.max(0, Math.floor((now - w.since) / 60_000)), deadline: w.deadline }));
 }
 
 /* ───────────────────────── 工具 ───────────────────────── */

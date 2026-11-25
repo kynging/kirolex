@@ -20,6 +20,21 @@ export const ZH_SESSION_CALLS: Record<string, string> = {
   '(nothing yet)': '没有',
   'KiroLex keeps waiting for its reply until the original deadline ({dur} after sending); if it finishes later, the reply will be sent here.':
     'KiroLex 会接着等它的回复，直到原来的期限（发出后 {dur}）；它之后处理完了，回复会发回这里。',
+  // ── 对方的用户停止 / 切换模型中断 / 撤回排队 / 插话（sessionCalls.ts ReplyWatcher） ──
+  '⏹️ The user of session "{title}" stopped this turn; it did not finish. Output so far: {partial}':
+    '⏹️ 对方的用户停止了这一轮（会话「{title}」），没有做完。已产出的部分：{partial}',
+  'KiroLex is no longer waiting for this reply.': 'KiroLex 不再等这条的回复。',
+  '🔀 Session "{title}" interrupted this turn to switch model and is continuing it on the new model. Output so far: {partial}':
+    '🔀 会话「{title}」因切换模型中断了这一轮，已在新模型上继续。已产出的部分：{partial}',
+  'Its reply will be sent here once it finishes (KiroLex keeps waiting until the original deadline, {dur} after sending).':
+    '之后的回复会再发给你（KiroLex 接着等到原来的期限：发出后 {dur}）。',
+  '🗑️ The user of session "{title}" cancelled this message from its queue; it was not processed. KiroLex is no longer waiting for a reply.':
+    '🗑️ 对方的用户取消了这条消息，没有处理（会话「{title}」，从排队里删掉了）。KiroLex 不再等回复。',
+  '(During this turn the user of session "{title}" also added message(s) of their own; the reply may also answer those.)':
+    '（这一轮对方的用户插入了消息（会话「{title}」），回复里可能也有对那些消息的回答。）',
+  '(The user of session "{title}" sent another message after this turn; that next turn is not included here.)':
+    '（会话「{title}」的用户在这一轮之后又发了消息，另起的那一轮没有算进来。）',
+  'Stopped waiting for the reply from session "{title}"; if it replies later, the reply will not be sent here.': '不再等会话「{title}」的回复了；它之后回复也不会再发到这里。',
   '{label} has arrived; it will be sent to the model once this session is connected again.': '{label}已到，等这条会话连上后发给模型。',
   '⏳ A background result has arrived; it will be sent to the model once this session is connected again: {text}': '⏳ 后台结果已到，等这条会话连上后发给模型：{text}',
   '⚠️ This session stayed disconnected for 24 hours, so KiroLex gave up delivering this message to the model: {text}': '⚠️ 这条会话 24 小时都没连上，KiroLex 放弃了，这条没有发给模型：{text}',

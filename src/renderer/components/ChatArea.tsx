@@ -51,7 +51,8 @@ import 'highlight.js/styles/github-dark.css';
 import type { Message, AttachedFile, QueuedMessage, ToolCall, PlanEntry, FileDiff, McpUnavailableView } from '../App';
 import { userTurnBubbles } from '../steerSplit';
 import { isControlMessageId } from '../../main/controlSessions';
-import { sessionSegments } from '../../main/sessionCalls';
+import { sessionSegments, type ReplyWaitBadge } from '../../main/sessionCalls';
+import { foreignDraftText, queueCardView } from '../foreignMessages';
 import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // Scheduling replaced loop mode. `schedule.ts` lives under src/main because the DRIVER
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
@@ -2229,9 +2230,12 @@ const UserGroupItem = memo<{
             <button type="button" className="steer-failed-btn primary" onClick={() => onFailedSteer?.(steer.id, 'send-next')}>
               {t('Send as the next message')}
             </button>
-            <button type="button" className="steer-failed-btn" onClick={() => onFailedSteer?.(steer.id, 'restore')}>
-              {t('Put back in the input box')}
-            </button>
+            {/* 别的会话发来的不放回输入框（那不是你的草稿） */}
+            {!foreignDraftText(steer.content) && (
+              <button type="button" className="steer-failed-btn" onClick={() => onFailedSteer?.(steer.id, 'restore')}>
+                {t('Put back in the input box')}
+              </button>
+            )}
           </div>
         </div>
       ))}
@@ -2481,8 +2485,11 @@ const QueueStack = memo<{
           </span>
           <span>{queuedMessages.length}</span>
         </div>
-        {queuedMessages.map((item, index) => (
-          <div key={item.id} className="queue-card">
+        {queuedMessages.map((item, index) => {
+          /* 别的会话发来的（📨）：显示来源标签 + 正文，不露原始来源标记；编辑只改正文，保存时 App 把来源那一行原样接回去（`rejoinQueueEdit`） */
+          const view = queueCardView(item.content);
+          return (
+          <div key={item.id} className={`queue-card${view.from ? ' from-session' : ''}`}>
             <span className="queue-card-order">{index + 1}</span>
             <div className="queue-card-body">
               {editingQueueId === item.id ? (
@@ -2503,7 +2510,21 @@ const QueueStack = memo<{
                   }}
                 />
               ) : (
-                <span className="queue-card-text" title={item.content}>{item.content}</span>
+                <>
+                  {view.from && (
+                    /* 「📨 来自会话「X」」：点了跳到那条会话（同气泡上的 SessionFromChip，卡片窄，整个标签就是按钮） */
+                    <button
+                      type="button"
+                      className="queue-card-from"
+                      title={t('Open that session')}
+                      onClick={() => window.dispatchEvent(new CustomEvent('kirolex:open-session', { detail: { sessionId: view.from!.sessionId } }))}
+                    >{view.from.label}</button>
+                  )}
+                  <span className="queue-card-text" title={view.body}>{view.body}</span>
+                </>
+              )}
+              {editingQueueId === item.id && view.from && (
+                <span className="queue-card-edit-hint">{t('This message came from another session; after you edit it, that session still matches the reply to its original call.')}</span>
               )}
               {item.attachments.length > 0 && (
                 <span className="queue-card-attachments">📎 {item.attachments.length}</span>
@@ -2541,20 +2562,30 @@ const QueueStack = memo<{
                     type="button"
                     onClick={() => {
                       setEditingQueueId(item.id);
-                      setEditingQueueText(item.content);
+                      setEditingQueueText(view.body);
                     }}
                     title={t('Edit this queued message')}
                   >✎</button>
-                  <button
-                    type="button"
-                    onClick={() => onCancelQueuedMessage(item.id)}
-                    title={t('Withdraw this one (its text goes back to the input box)')}
-                  >✕</button>
+                  {view.from ? (
+                    /* 别的会话发来的：撤回 = 不处理，不放回输入框，告诉发起方 */
+                    <button
+                      type="button"
+                      onClick={() => onCancelQueuedMessage(item.id)}
+                      title={t('Cancel this one: it will not be processed, and the session that sent it is told')}
+                    >✕</button>
+                  ) : (
+                    <button
+                      type="button"
+                      onClick={() => onCancelQueuedMessage(item.id)}
+                      title={t('Withdraw this one (its text goes back to the input box)')}
+                    >✕</button>
+                  )}
                 </>
               )}
             </div>
           </div>
-        ))}
+          );
+        })}
       </div>
     </div>
   );
@@ -2578,12 +2609,16 @@ const composerDrafts: Record<string, string> = (() => {
     // draft used to be lost on every switch between `npm start` and `npm run dev:hot`.
     const raw = uiGet(COMPOSER_DRAFTS_KEY);
     const parsed = raw ? JSON.parse(raw) : {};
-    return parsed && typeof parsed === 'object' ? parsed : {};
+    if (!parsed || typeof parsed !== 'object') return {};
+    /* 别的会话发来的（带 📨 来源标记）不是你的草稿：以前存进去的，读回来时丢掉 */
+    for (const [sid, text] of Object.entries(parsed)) if (typeof text !== 'string' || foreignDraftText(text)) delete parsed[sid];
+    return parsed;
   } catch { return {}; }
 })();
 function stashComposerDraft(sessionId: string | null, text: string) {
   if (!sessionId) return;
-  if (text.trim()) composerDrafts[sessionId] = text;
+  /* 别的会话发来的内容不当草稿存（切会话 / 刷新 / 重启都不放回来） */
+  if (text.trim() && !foreignDraftText(text)) composerDrafts[sessionId] = text;
   else delete composerDrafts[sessionId];
   try { uiSet(COMPOSER_DRAFTS_KEY, JSON.stringify(composerDrafts)); } catch {}
 }
@@ -2815,6 +2850,8 @@ const ChatInputBox = memo<{
    */
   useEffect(() => {
     if (!shouldApplyHandoff(restoredDraft, sessionId)) return;
+    /* 别的会话发来的内容不进输入框：交接作废（清掉，免得每次挂载重放） */
+    if (foreignDraftText(restoredDraft!.text)) { onConsumeRestoredDraft?.(restoredDraft!.id); return; }
     setInput(restoredDraft!.text);
     onConsumeRestoredDraft?.(restoredDraft!.id);
     requestAnimationFrame(() => textareaRef.current?.focus());
@@ -2822,6 +2859,7 @@ const ChatInputBox = memo<{
 
   useEffect(() => {
     if (!shouldApplyHandoff(restoredInputDraft, sessionId)) return;
+    if (foreignDraftText(restoredInputDraft!.text)) { onConsumeRestoredInputDraft?.(restoredInputDraft!.id); return; }
     setInput(restoredInputDraft!.text);
     onConsumeRestoredInputDraft?.(restoredInputDraft!.id);
     requestAnimationFrame(() => textareaRef.current?.focus());
@@ -4173,6 +4211,10 @@ interface ChatAreaProps {
   onRetryStartup?: (local: boolean) => void;
   /** 停掉一个（主进程只结束它自己起的那个进程，并在会话里说一声）。 */
   onStopBgJob?: (jobId: string) => void;
+  /** 这条会话发出去、还在等对方回复的（session_send waitReply，`replyWaitBadges`）。空数组 = 那一行不出现。 */
+  replyWaits?: ReplyWaitBadge[];
+  /** 「不等了」：结束这条等待，不再唤醒 */
+  onStopReplyWait?: (id: string) => void;
   /** 别的电脑上的后台任务：请求停止（跑它的那台拉到后执行）。 */
   onRequestStopBgJob?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
   /** 别的电脑失联时「在本机重新运行」：先弹确认（命令全文 + cwd），确认了才调；`hash` 交回 main 核对。 */
@@ -4311,6 +4353,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onStartSchedule,
   scheduleSummary,
   bgJobs,
+  replyWaits,
+  onStopReplyWait,
   onStopBgJob,
   onRequestStopBgJob,
   onRerunBgJob,
@@ -5967,6 +6011,30 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
         </div>
       )}
 
+      {/* 这条会话在等别的会话回复（session_send waitReply）：看得见、点得进去、可以不等了。等待结束就没了。 */}
+      {replyWaits && replyWaits.length > 0 && (
+        <div className="reply-wait-banner" role="status">
+          {replyWaits.map((w) => (
+            <div key={w.id} className="reply-wait-row">
+              <button
+                type="button"
+                className="reply-wait-open"
+                title={t('Open that session')}
+                onClick={() => window.dispatchEvent(new CustomEvent('kirolex:open-session', { detail: { sessionId: w.to } }))}
+              >{t('⏳ Waiting for a reply from "{title}" ({n} min so far)', { title: w.toTitle, n: w.minutes })}</button>
+              {onStopReplyWait && (
+                <button
+                  type="button"
+                  className="reply-wait-stop"
+                  onClick={() => onStopReplyWait(w.id)}
+                  title={t('Stop waiting: its reply (if any) will not be sent to this chat')}
+                >{t('Stop waiting')}</button>
+              )}
+            </div>
+          ))}
+        </div>
+      )}
+
       <div
         className="chat-messages"
         ref={chatMessagesRef}
@@ -6246,7 +6314,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               <span className="rebuild-pending-label">{t('Rebuilding history — sends when it finishes')}</span>
               <span className="rebuild-pending-text">{item.content || item.attachments.map((f) => f.name).join(' · ')}</span>
               <button type="button" className="rebuild-pending-btn" onClick={() => onCancelQueuedMessage(item.id)}>
-                {t('Put back in the input box')}
+                {foreignDraftText(item.content) ? t('Cancel this message') : t('Put back in the input box')}
               </button>
             </div>
           ))}

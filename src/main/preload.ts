@@ -333,8 +333,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
 
   // Chat
   prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => ipcRenderer.invoke('acp:prompt', sessionId, prompt, model, projectId, display),
-  cancel: (sessionId: string, model: string, suppressInterruptionNotice = false) =>
-    ipcRenderer.invoke('acp:cancel', sessionId, model, suppressInterruptionNotice),
+  cancel: (sessionId: string, model: string, suppressInterruptionNotice = false, reason?: 'user') =>
+    ipcRenderer.invoke('acp:cancel', sessionId, model, suppressInterruptionNotice, reason),
   // Mid-turn steer: inject text into the running turn (kiro-cli _session/steer).
   // Resolves to { steered, reason } — the renderer falls back to the queue when
   // steered is false so the message is never dropped.
@@ -711,6 +711,19 @@ contextBridge.exposeInMainWorld('kiroApi', {
   sessionNote: (sessionId: string, text: string, variants?: { zh: string; en: string }) => ipcRenderer.invoke('session:note', sessionId, text, variants),
   /** 「停止并立即切换」接着做这一轮期间：等这条会话回复的别把它当成已经结束（main `turnRecoveryHolds`） */
   holdTurnRecovery: (sessionId: string, on: boolean) => ipcRenderer.invoke('acp:hold-turn-recovery', sessionId, on),
+  /** 「停止并立即切换」的结局告诉等这条会话回复的发起方（main `replyWatcher.turnStopped`）：continued = 切换成了、接着做 */
+  replyTurnSwitched: (sessionId: string, continued: boolean) => ipcRenderer.invoke('acp:reply-turn-switched', sessionId, continued),
+  /** 排队卡片里删掉了别的会话发来的那条：告诉发起方、结束等待 */
+  replyWithdrawn: (sessionId: string, text: string) => ipcRenderer.invoke('acp:reply-withdrawn', sessionId, text),
+  /** 正在等别的会话回复的登记（发起方顶部的「⏳ 等回复」标记） */
+  replyWatches: () => ipcRenderer.invoke('acp:reply-watches'),
+  /** 「不等了」 */
+  replyWatchCancel: (id: string) => ipcRenderer.invoke('acp:reply-watch-cancel', id),
+  onReplyWatchesChanged: (cb: () => void) => {
+    const handler = () => cb();
+    ipcRenderer.on('acp:reply-watches-changed', handler);
+    return () => ipcRenderer.removeListener('acp:reply-watches-changed', handler);
+  },
   /** Watch exactly these files for on-disk edits, replacing any previous set.
    *  Main watches their parent directories (a save is usually write+rename, which a
    *  per-file watcher stops following), and reports each change once, debounced. */

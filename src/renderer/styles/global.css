@@ -10561,3 +10561,77 @@ body.rv-col-resizing .rv-pdf-grip { background: var(--accent); }
 .theme-picker-option.on { font-weight: 600; }
 .theme-picker-check { color: var(--accent); }
 .theme-missing-hint { margin-top: 6px; color: var(--warning); }
+
+/* 这条会话在等别的会话回复（session_send waitReply）：顶部一行，点了跳过去；「不等了」结束等待 */
+.reply-wait-banner {
+  margin: 6px 48px 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+.reply-wait-row {
+  padding: 3px 6px 3px 4px;
+  border-radius: 8px;
+  background: rgba(70, 130, 210, 0.10);
+  border: 1px solid rgba(70, 130, 210, 0.30);
+  font-size: 12px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+.reply-wait-open {
+  flex: 1;
+  min-width: 0;
+  text-align: left;
+  border: none;
+  background: transparent;
+  color: #3b6fb6;
+  font-size: 12px;
+  cursor: pointer;
+  padding: 1px 6px;
+  border-radius: 6px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.reply-wait-open:hover { background: rgba(70, 130, 210, 0.18); }
+.reply-wait-stop {
+  flex: none;
+  border: 1px solid var(--border, rgba(127, 127, 127, 0.35));
+  background: transparent;
+  color: var(--text-secondary);
+  font-size: 11px;
+  cursor: pointer;
+  padding: 1px 8px;
+  border-radius: 6px;
+}
+.reply-wait-stop:hover { color: var(--text); }
+:where([data-theme="light"]) .reply-wait-open { color: #3369b4; }
+
+/* 排队卡片里别的会话发来的那条：「📨 来自会话「X」」标签（点了跳过去）和正文同一行，标签不撑满 */
+.queue-card-from {
+  flex: 0 1 auto;
+  min-width: 0;
+  max-width: 55%;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  padding: 0 6px;
+  border-radius: 6px;
+  font-size: 11px;
+  line-height: 18px;
+  color: #3b6fb6;
+  background: rgba(70, 130, 210, 0.12);
+  border: 1px solid rgba(70, 130, 210, 0.32);
+  cursor: pointer;
+}
+.queue-card-from:hover { background: rgba(70, 130, 210, 0.22); }
+:where([data-theme="light"]) .queue-card-from { color: #3369b4; }
+.queue-card.from-session .queue-card-text { flex: 1; min-width: 0; }
+.queue-card-edit-hint {
+  flex: 0 1 auto;
+  max-width: 50%;
+  color: var(--text-muted);
+  font-size: 10px;
+  line-height: 1.3;
+}

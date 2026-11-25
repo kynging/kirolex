@@ -58,6 +58,8 @@ import { applySyncedSettings } from '../main/appearanceSync.ts';
 import { applyTheme } from './themeApply.ts';
 import type { QuestionCard } from '../main/elicitation.ts';
 import type { TurnUsage } from '../main/turnUsage.ts';
+import { replyWaitBadges, type ReplyWatch } from '../main/sessionCalls.ts';
+import { foreignDraftText, rejoinQueueEdit } from './foreignMessages.ts';
 import { EngineStatusPanel } from './components/EngineStatusPanel';
 import { placeholderRows, offloadSummary, offloadFailureText, type OffloadPlaceholderRow, type OffloadedMark } from './offloadView.ts';
 
@@ -300,7 +302,7 @@ declare global {
       backupMemory: (scope: 'global' | 'project' | 'session', projectId?: string, sessionId?: string) => Promise<{ ok: boolean; at: string | null }>;
       onMemoryBytes: (callback: (data: { sessionId: string; projectId: string | null; global: number; project: number; session: number }) => void) => () => void;
       prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => Promise<any>;
-      cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean) => Promise<void>;
+      cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean, reason?: 'user') => Promise<void>;
       steer: (sessionId: string, message: string, msgId?: string) => Promise<{ steered: boolean; reason?: string; messageId?: string }>;
       /** 忙时 Enter 交给适配器排队（promptQueueing，主进程 acp:handoff-prompt） */
       handoffPrompt?: (sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; attachments?: any[]; pastes?: any[] }) => Promise<{ accepted: boolean; reason?: string; error?: string }>;
@@ -446,6 +448,15 @@ declare global {
       sessionNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
       /** 「停止并立即切换」接着做这一轮期间：等这条会话回复的别当成已经结束（main `turnRecoveryHolds`） */
       holdTurnRecovery?: (sessionId: string, on: boolean) => Promise<{ ok: boolean }>;
+      /** 「停止并立即切换」的结局告诉等这条会话回复的发起方：continued = 切换成了、接着做（main `replyWatcher.turnStopped`） */
+      replyTurnSwitched?: (sessionId: string, continued: boolean) => Promise<{ ok: boolean; told?: number }>;
+      /** 排队卡片里删掉了别的会话发来的那条：告诉发起方「取消了、没有处理」，结束等待 */
+      replyWithdrawn?: (sessionId: string, text: string) => Promise<{ ok: boolean; told?: number }>;
+      /** 正在等别的会话回复的登记（main `replyWatcher.list()`） */
+      replyWatches?: () => Promise<ReplyWatch[]>;
+      /** 「不等了」：结束等待，不再唤醒 */
+      replyWatchCancel?: (id: string) => Promise<{ ok: boolean }>;
+      onReplyWatchesChanged?: (cb: () => void) => () => void;
       /** 循环的一轮被「停止并立即切换」：交给 driver 在切换后接着做（loopDriver.holdForSwitch） */
       loopHoldForSwitch?: (sessionId: string) => Promise<{ ok: boolean }>;
       /** Watch exactly these files for on-disk edits, replacing the previous set. */
@@ -1670,6 +1681,32 @@ const App: React.FC = () => {
       return cache.get(key)!;
     };
   }, [bgJobs]);
+
+  /*
+    **发起方顶部的「⏳ 等「X」回复（已等 N 分钟）」**：数据就是主进程的等待登记（session-calls.json，重启后照旧）；
+    登记一变主进程就推一声，这里再取一遍。等待结束（回复 / 超时 / 取消 / 不等了）它就从列表里没了，标记跟着消失。
+  */
+  const [replyWatches, setReplyWatches] = useState<ReplyWatch[]>([]);
+  const [replyNow, setReplyNow] = useState(() => Date.now());
+  useEffect(() => {
+    const load = () => {
+      void window.kiroApi.replyWatches?.()
+        .then((list) => { setReplyWatches(Array.isArray(list) ? list : []); setReplyNow(Date.now()); })
+        .catch(() => { /* 取不到就不显示 */ });
+    };
+    load();
+    const off = window.kiroApi.onReplyWatchesChanged?.(load);
+    return () => { off?.(); };
+  }, []);
+  useEffect(() => {
+    if (!replyWatches.length) return;
+    const timer = setInterval(() => setReplyNow(Date.now()), 30_000);
+    return () => clearInterval(timer);
+  }, [replyWatches.length]);
+  const replyWaitsFor = useMemo(() => {
+    const titles = new Map(sessions.map((s) => [s.id, s.title]));
+    return (sid: string | null) => (sid ? replyWaitBadges(replyWatches, sid, replyNow).map((b) => ({ ...b, toTitle: titles.get(b.to) || b.toTitle })) : []);
+  }, [replyWatches, replyNow, sessions]);
 
   // --- Split view (1x1 … 3x3) -----------------------------------------------
   // The user CHECKS sessions in the sidebar; every checked session gets its own
@@ -3922,7 +3959,13 @@ const App: React.FC = () => {
     const sid = paneSid || currentSessionId;
     if (!sid) return;
     const item = (queuesBySessionRef.current[sid] || []).find((candidate) => candidate.id === queueId);
-    if (item) {
+    /*
+      **别的会话发来的（📨）不放回输入框**：那不是你的草稿（放回去一按 Enter 就以你的名义带着来源标记重发）。
+      撤回 = 不处理它：告诉发起方「对方的用户取消了这条消息，没有处理」，结束它的等待（main `replyWatcher.withdrawn`）。
+    */
+    if (item && foreignDraftText(item.content)) {
+      void window.kiroApi.replyWithdrawn?.(sid, item.content);
+    } else if (item) {
       addAttachments(sid, item.attachments);
       setRestoredQueueDraft({ id: Date.now(), text: item.content, sessionId: sid });
     }
@@ -3942,7 +3985,8 @@ const App: React.FC = () => {
     if (!sid) return;
     const hit = takeFailedSteer(sid, msgId);
     if (!hit) return;
-    if (action === 'restore') {
+    /* 别的会话发来的不放回输入框（界面上也不给这个按钮）：只能作为下一条发送 */
+    if (action === 'restore' && !foreignDraftText(hit.content)) {
       addAttachments(sid, hit.attachments);
       setRestoredQueueDraft({ id: Date.now(), text: hit.content, sessionId: sid });
       return;
@@ -3965,6 +4009,9 @@ const App: React.FC = () => {
   const handleEditQueuedMessage = useCallback((queueId: string, content: string, paneSid?: string) => {
     const sid = paneSid || currentSessionId;
     if (!sid || !content.trim()) return;
+    /* 别的会话发来的那张（📨）：卡片上编辑的只是正文，来源那一行（带 call 编号）原样接回去 —— 发起方照样按编号认回复 */
+    const editing = (queuesBySessionRef.current[sid] || []).find((q) => q.id === queueId);
+    if (editing) content = rejoinQueueEdit(editing.content, content);
     setQueuesBySession((prev) => ({
       ...prev,
       /* 改的是一张已经试着发过的卡片：那是另一次提交 —— 换新 id（保留控制入口标记）、整批去掉 retryBatch（`editQueuedItem`） */
@@ -4515,6 +4562,8 @@ const App: React.FC = () => {
         onSetScheduleExpiry={(id, change) => setScheduleExpiry(id, change)}
         onTakeOverSchedule={(id, defHash) => takeOverSchedule(id, defHash)}
         bgJobs={bgJobsFor(sid)}
+        replyWaits={replyWaitsFor(sid)}
+        onStopReplyWait={(id) => { void window.kiroApi.replyWatchCancel?.(id); }}
         startup={sid ? createStages[sid] || null : null}
         onRetryStartup={(local) => { if (sid) void retryCreateSession(sid, { local }); }}
         onStopBgJob={(jobId) => void stopBgJob(jobId)}

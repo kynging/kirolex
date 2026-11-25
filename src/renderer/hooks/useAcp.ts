@@ -11,6 +11,7 @@ import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
 import { messageVariants, normalizeLang, noteVariants, pinShown, t as translate, type Lang } from '../i18n';
 import { decideStopSwitchFollowUp, interruptPlanFor, rerunIdFor, SWITCH_CONTINUE_PROMPT, turnBaseIndex, turnOriginOf, turnProduced } from '../stopSwitchFollowUp';
+import { rerunKeepId } from '../foreignMessages';
 import { toSlashCommands, type SlashCommand } from '../slashCommands';
 import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
@@ -4955,7 +4956,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       // 自动重发经控制入口发的那条：新消息的 id 照样带标记（气泡标签、记录里的 via 都跟着它）
       const carried = override?.carryMark ? carryControlMark(target.id, 'user') : undefined;
       /* 「停止并切换」的重发用原来那条的 id（sameId）；中断条的「重跑」用保留来源标记的新 id（messageId） */
-      const sentId = override?.sameId ? target.id : override?.messageId || carried;
+      /* 消息上的「重跑」（没有 override）：别的会话 / 唤醒发来的原样重跑保留来源标记，发起方照样认这一条的回复（`rerunKeepId`） */
+      const sentId = override?.sameId ? target.id : override?.messageId || carried || (!override ? rerunKeepId(target.id, String(target.content || ''), text) : undefined);
       const rerunPrompt: any[] = [];
       if (keptAttachments?.length) {
         // Same hidden file-ref block the normal send path uses, so the backend can
@@ -5232,10 +5234,12 @@ ${text}`,
       // immediately scheduled the next one, so the loop looked unstoppable.
       endLoop(sessionForCancel, 'aborted');
       turnOutcomeRef.current.set(sessionForCancel, { kind: 'cancelled' });
+      /* `user`：这一轮要是别的会话发来、在等回复的，主进程告诉发起方「对方的用户停止了这一轮」 */
       await window.kiroApi.cancel(
         sessionForCancel,
         modelForSession(sessionForCancel),
         options?.suppressInterruptionNotice,
+        'user',
       );
       removeStreaming(sessionForCancel);
       dropPermissionCardIfEnded(sessionForCancel);
@@ -5259,7 +5263,7 @@ ${text}`,
     setStreamingIds([]);
     // Try to cancel current turn
     if (currentSessionId) {
-      try { await window.kiroApi.cancel(currentSessionId, modelForSession(currentSessionId)); } catch {}
+      try { await window.kiroApi.cancel(currentSessionId, modelForSession(currentSessionId), false, 'user'); } catch {}
     }
     // Kill all kiro-cli processes (interrupts all in-flight output)
     setStatus('connecting');
@@ -5604,6 +5608,11 @@ ${text}`,
       /* 等它落盘再往下：重发那条路要在这些提示之后发（不截记录，见 rerunFromMessage 的 sameId） */
       const note = async (text: string) => { try { await window.kiroApi.sessionNote?.(sid, text, noteVariants(text)); } catch { /* 提示写不进去不挡接着做 */ } };
       if (plan.action === 'driver') return;
+      /*
+        等这一轮回复的发起方（别的会话 session_send）：切换成了、接着做 →「因切换模型中断，已在新模型上继续」，接着等；
+        没成 →「对方的用户停止了这一轮」。要在重发 / 续写**之前**说（main `replyWatcher.turnStopped`）。
+      */
+      try { await window.kiroApi.replyTurnSwitched?.(sid, plan.action !== 'none'); } catch { /* 说不上不挡接着做 */ }
       if (plan.action === 'none') {
         /* 切换没成（原因主进程已经写进会话）：按普通中断，但别处来的那条不放回输入框（plan.prefill / offerRerun） */
         if (plan.markInterrupted || plan.offerRerun) markTurnInterrupted(sid, { prefill: plan.prefill });

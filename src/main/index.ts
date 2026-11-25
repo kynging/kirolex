@@ -6480,6 +6480,8 @@ const replyWatcher = new ReplyWatcher({
   changed: (list) => {
     try {
       fs.mkdirSync(path.dirname(SESSION_CALLS_FILE), { recursive: true });
+      /* 发起方顶部的「⏳ 等回复」标记跟着变（界面再来取 `acp:reply-watches`） */
+      mainWindow?.webContents.send('acp:reply-watches-changed');
       if (!list.length) { fs.rmSync(SESSION_CALLS_FILE, { force: true }); return; }
       const tmp = `${SESSION_CALLS_FILE}.tmp`;
       fs.writeFileSync(tmp, JSON.stringify({ watches: list }, null, 2));
@@ -13115,6 +13117,8 @@ ${hint}` : ''}` };
     sessionId: string,
     _model?: string,
     suppressInterruptionNotice = false,
+    /** `user`：用户按的停止（Stop / /stop / 停循环）—— 等这一轮回复的发起方要被告知（重跑、停止并切换不带它） */
+    reason?: 'user',
   ) => {
     const entry = sessionClients.get(sessionId);
     if (!entry) return { idle: true };
@@ -13164,6 +13168,8 @@ ${hint}` : ''}` };
       }
       if (entry.busy) throw new Error(tr('Timed out waiting for the active turn to stop.'));
       flushAssistant(sessionId); // preserve partial output produced before cancel
+      /* 这一轮是别的会话发来、在等回复的：告诉发起方「对方的用户停止了这一轮」+ 已产出的部分，不再等（sessionCalls.ts turnStopped） */
+      if (reason === 'user') replyWatcher.turnStopped(sessionId, 'user');
       return { idle: true };
     } finally {
       entry.suppressCancellationChunks = false;
@@ -13794,6 +13800,8 @@ ${hint}` : ''}` };
   try {
     const saved = JSON.parse(fs.readFileSync(SESSION_CALLS_FILE, 'utf-8'));
     if (Array.isArray(saved?.watches)) replyWatcher.restore(saved.watches as ReplyWatch[]);
+    /* 界面可能已经先取过一次（那时还是空的）：发起方顶部的「⏳ 等回复」标记再取一遍 */
+    mainWindow?.webContents.send('acp:reply-watches-changed');
   } catch { /* 没有文件 = 没有在等的 */ }
   /*
     重启前还没发出去的会话间唤醒（多半是发起方没连着）：接着等、连上再发。退出时正在发的那一条
@@ -18343,6 +18351,32 @@ ${hint}` : ''}` };
   ipcMain.handle('acp:hold-turn-recovery', (_event, sessionId: string, on: boolean) => {
     if (typeof sessionId !== 'string' || !sessionId) return { ok: false };
     if (on) turnRecoveryHolds.set(sessionId, Date.now()); else turnRecoveryHolds.delete(sessionId);
+    return { ok: true };
+  });
+
+  /*
+    **「停止并立即切换」的结局**，告诉等这条会话回复的发起方（sessionCalls.ts `turnStopped`）：
+    切换成了、接着做（`continued`）→「因切换模型中断，已在新模型上继续」，等待保留；停下那一刻后端给的「正常结束」不算数（清掉，只认新模型上做完的那一轮）。
+    切换没成、这一轮就停在那 →「对方的用户停止了这一轮」，等待结束。渲染端在重发 / 续写**之前**调。
+  */
+  ipcMain.handle('acp:reply-turn-switched', (_event, sessionId: string, continued: boolean) => {
+    if (typeof sessionId !== 'string' || !sessionId) return { ok: false };
+    if (continued) turnOutcomes.delete(sessionId);
+    return { ok: true, told: replyWatcher.turnStopped(sessionId, continued ? 'switch' : 'user') };
+  });
+  /** 用户在排队卡片里删掉了别的会话发来的那条（没处理）：告诉发起方、结束等待 */
+  ipcMain.handle('acp:reply-withdrawn', (_event, sessionId: string, text: string) => {
+    if (typeof sessionId !== 'string' || !sessionId || typeof text !== 'string') return { ok: false };
+    return { ok: true, told: replyWatcher.withdrawn(sessionId, text) };
+  });
+  /** 发起方顶部「⏳ 等「X」回复」的数据：正在等的全部（落盘的那份，重启后照旧）；变了推 `acp:reply-watches-changed` */
+  ipcMain.handle('acp:reply-watches', () => replyWatcher.list());
+  /** 「不等了」：结束这条等待、不再唤醒；在发起方会话里留一行（不发给模型） */
+  ipcMain.handle('acp:reply-watch-cancel', (_event, id: string) => {
+    const w = typeof id === 'string' && id ? replyWatcher.cancel(id) : null;
+    if (!w) return { ok: false };
+    logger.info('sessions', `reply watch ${w.id} ${w.from} ← ${w.to}: cancelled by the user (不等了)`);
+    noteInSession(w.from, tr('Stopped waiting for the reply from session "{title}"; if it replies later, the reply will not be sent here.', { title: w.toTitle }));
     return { ok: true };
   });
 

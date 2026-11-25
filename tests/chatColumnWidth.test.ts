@@ -203,6 +203,7 @@ const PANE_STRIPS: Record<string, string> = {
   'chat-error-banner': '连接出错，消息列表上方整格横条',
   'schedule-banner': '正在跑的定时任务，消息列表上方整格横条',
   'bg-jobs-banner': '正在跑的后台命令 / 监视，消息列表上方整格横条',
+  'reply-wait-banner': '在等别的会话回复（session_send waitReply），消息列表上方整格横条',
   'memory-warn-bar': '内存告警，消息列表上方整格横条',
   'chat-crew-bar': '子代理一览，消息列表上方整格横条',
   'composer-usage-bar': '输入框工具栏里的上下文用量小进度条，不是卡片',
