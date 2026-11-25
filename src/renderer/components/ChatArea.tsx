@@ -90,6 +90,7 @@ import { bedrockCheckStore } from '../bedrockCheckStore.ts';
 import { PolicyBox, WebSearchToggle } from './BedrockIam';
 import { accentEngine } from '../engineTheme.ts';
 import { modeTone, permissionIcon, toneClass, type PermissionTone } from '../permissionTone';
+import { turnOriginOf, type TurnOrigin } from '../stopSwitchFollowUp';
 
 // U+2318 has no glyph in the Windows/Linux font stack and renders as a tofu box,
 // so name the modifier for the actual platform instead of showing both.
@@ -2617,6 +2618,19 @@ function PendingSwitchBadge({ target, onCancel }: { target: string; onCancel?: (
  * 「停止这一轮并立即切换」= 按停止（这一轮一结束，记下的切换就应用）；「取消切换」= 不切了。
  * 有排队消息时说清它们会在切换完成后发出（忙时按 Enter 的插话进的是**这一轮**，不在此列）。
  */
+/** 中断条上说「这一轮是哪来的」 */
+function originForPeople(origin: TurnOrigin, t: (key: string) => string): string {
+  switch (origin) {
+    case 'session': return t('another chat');
+    case 'control': return t('the control entry');
+    case 'schedule': return t('a schedule');
+    case 'bg': return t('a background job');
+    case 'watch': return t('a watch');
+    case 'loop': return t('a loop');
+    default: return t('KiroLex');
+  }
+}
+
 function PendingSwitchCard({ since, target, queued, onStopNow, onCancel }: {
   since: number; target: string; queued: number; onStopNow?: () => void; onCancel?: () => void;
 }) {
@@ -4106,6 +4120,10 @@ interface ChatAreaProps {
   /** 恢复卡上的「回滚到某条消息」（useAcp 的 rollbackToMessage） */
   onRollbackToMessage?: (sessionId: string, messageId: string) => Promise<{ ok: boolean; removed?: number; error?: string }>;
   turnInterrupted?: boolean;
+  /** 被中断的那一轮不是你打的（别的会话 / 定时 / 后台唤醒…）：那条消息的 id 和中断条上的「重跑」（useAcp.rerunInterruptedTurn） */
+  interruptedRerun?: { messageId: string; onRerun: () => void } | null;
+  /** 提示卡上的「停止这一轮并立即切换」（useAcp.stopAndSwitchNow）—— 不是普通 Stop：切完在新设置上接着做 */
+  onStopAndSwitch?: (target: string) => void;
   onSend: (text: string, pastes?: PastedBlock[]) => void;
   onSteerMessage: (text: string, pastes?: PastedBlock[]) => void;
   /** 没能追加到这一轮的 steer 上那两个按钮（App `handleFailedSteer`）。 */
@@ -4262,6 +4280,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onRerunMessage,
   onRollbackToMessage,
   turnInterrupted,
+  interruptedRerun,
+  onStopAndSwitch,
   onSend,
   onSteerMessage,
   onCancel,
@@ -5412,11 +5432,12 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   const livePendingId = useMemo(() => (hasPendingSwitch
     ? livePendingNoteId(orderedMessages.map((m) => ({ id: m.id, kirolex: m.role === 'user' && isKirolexNote(m), noteGroup: m.noteGroup, timestamp: m.timestamp })), pendingSwitchSince ?? Date.now())
     : null), [hasPendingSwitch, orderedMessages, pendingSwitchSince]);
+  const pendingTarget = hasPendingSwitch ? pendingTargetForPeople(pendingSwitch!) : '';
   const pendingCard = hasPendingSwitch ? {
     since: pendingSwitchSince ?? Date.now(),
-    target: pendingTargetForPeople(pendingSwitch!),
+    target: pendingTarget,
     queued: queuedMessages.length,
-    onStopNow: onCancel,
+    onStopNow: onStopAndSwitch ? () => onStopAndSwitch(pendingTarget) : undefined,
     onCancel: () => onCancelPendingSwitch?.(),
   } : null;
   /** 切会话回到原位置用的锚点 id。回复组取**第一段**：流式输出只往后追加段，第一段的 id 不会变。 */
@@ -6261,6 +6282,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           Enter OVERWRITES instead of appending, so that is what the sentence says;
           the disabled Rerun button explains itself in its own tooltip, and "this
           notice will disappear by itself" does not need saying -- it just does. */}
+      {/* 被停那一轮是别处发来的：没放回输入框，这里给「重跑」原样再发（保留来源标记、call 编号） */}
+      {interruptedRerun && !turnInterrupted && !isStreaming && (
+        <div className="interrupted-bar" role="region" aria-live="polite">
+          <span className="interrupted-bar-icon" aria-hidden="true">↩</span>
+          <div className="interrupted-bar-copy">
+            <strong>{t('The previous turn was interrupted')}</strong>
+            <span>{t('This turn came from {source}, so it was not put back in the composer. Rerun sends it again as it was.', { source: originForPeople(turnOriginOf(messages.find((m) => m.id === interruptedRerun.messageId)), t) })}</span>
+          </div>
+          <button type="button" className="interrupted-bar-rerun" onClick={interruptedRerun.onRerun}>{t('Rerun')}</button>
+        </div>
+      )}
       {turnInterrupted && !isStreaming && (
         <div className="interrupted-bar" role="region" aria-live="polite">
           <span className="interrupted-bar-icon" aria-hidden="true">↩</span>

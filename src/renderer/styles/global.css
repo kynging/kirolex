@@ -4269,6 +4269,20 @@ button, input, select, textarea {
 }
 
 .interrupted-bar-copy strong { color: var(--text-primary); }
+/* 别处来的那一轮被中断：「重跑」原样再发（ChatArea 的 interruptedRerun） */
+.interrupted-bar-rerun {
+  flex-shrink: 0;
+  align-self: center;
+  padding: 4px 12px;
+  border: 1px solid var(--accent);
+  border-radius: 8px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 12px;
+  font-weight: 600;
+  cursor: pointer;
+}
+.interrupted-bar-rerun:hover { filter: brightness(1.1); }
 
 .permission-bar-main {
   display: flex;

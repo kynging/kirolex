@@ -108,7 +108,9 @@ describe('会话里的提示卡：插入 / 活卡片 / 停止并立即切换 / �
     assert.ok(card.includes("t('{n} queued message(s) will be sent once the switch finishes.', { n: queued })"));
     const at = C.indexOf('const pendingCard = hasPendingSwitch ? {');
     const wiring = C.slice(at, C.indexOf('} : null;', at));
-    assert.ok(wiring.includes('onStopNow: onCancel,'), '停止 = 这一格自己的停止按钮那条路');
+    /* 负责人反馈 2026-11-25：「停止并立即切换」是独立动作（切完在新设置上接着做），不再等于普通停止 */
+    assert.ok(wiring.includes('onStopNow: onStopAndSwitch ? () => onStopAndSwitch(pendingTarget) : undefined,'), '停止并立即切换 = 独立动作（useAcp.stopAndSwitchNow），不是普通停止');
+    assert.ok(!wiring.includes('onStopNow: onCancel'), '不能再直接等于普通停止');
     assert.ok(wiring.includes('onCancel: () => onCancelPendingSwitch?.(),'), '不带 kind = 整段取消');
     assert.ok(wiring.includes('queued: queuedMessages.length,'));
     assert.ok(C.includes("group.kind === 'kirolex' && group.message.id === livePendingId && pendingCard ? ("));

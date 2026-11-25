@@ -51,6 +51,7 @@ import { dueAt, type ScheduleSpec } from './schedule.ts';
 import { type MessageIdStatus } from './promptDedupe.ts';
 import { trIn, uiLang, type UiLang } from './uiText.ts';
 import { withNoteDetail } from './kirolexNote.ts';
+import { SWITCH_CONTINUE_PROMPT } from './controlSessions.ts';
 
 /** A main-driven run as it is stored: the machine's `LoopRun` plus the driver's fields. */
 export type DriverRun = LoopRun & {
@@ -101,6 +102,11 @@ export interface LoopDriverDeps {
   changed(sessionId: string, run: DriverRun | null): void;
   /** Withdraw a round that is still waiting in the send queue. */
   dropPending?(messageId: string): void;
+  /**
+   * 「停止这一轮并立即切换」：这条会话忙时记下的切换，在 `since` 之后应用成功了没有（等它应用完；取消了 / 失败 / 超时 = false）。
+   * 没给就当没切成 —— 照原来的规则停下并说明。
+   */
+  awaitSwitch?(sessionId: string, since: number): Promise<boolean>;
   isProtected?(sessionId: string): boolean;
   lang?(): UiLang;
   log?(message: string): void;
@@ -115,6 +121,11 @@ export class LoopDriver {
   /** Sessions whose step is in progress in THIS process. Not persisted, by design: after a
    *  restart nothing is active, which is exactly how an orphaned `inFlight` is recognized. */
   private readonly active = new Set<string>();
+  /**
+   * 「停止这一轮并立即切换」挂上的会话 → 挂上的时刻。这一轮停下后 driver 不按「没完整回复 / 在半截」停掉循环，
+   * 而是等切换应用完再接着做（`resumeAfterSwitch`）。只在内存里：重启后没有了，照账本原来的规则判。
+   */
+  private readonly switchHolds = new Map<string, number>();
 
   constructor(deps: LoopDriverDeps) {
     this.deps = deps;
@@ -190,6 +201,18 @@ export class LoopDriver {
   }
 
   /**
+   * 「停止这一轮并立即切换」停的是循环正在跑的这一轮：先挂上，再由渲染端去停它（index.ts `loop:hold-for-switch`）。
+   * 没有在跑的轮次就不挂（返回 false），渲染端按普通停止处理。
+   */
+  holdForSwitch(sessionId: string): boolean {
+    const run = this.read(sessionId);
+    if (!run || run.terminal || !run.inFlight) return false;
+    this.switchHolds.set(sessionId, this.deps.now());
+    this.log(`hold-for-switch session=${sessionId} iteration=${run.inFlight.iteration}`);
+    return true;
+  }
+
+  /**
    * One pass over every live loop: start whatever is due, resolve orphaned rounds.
    * Resolves when every step it started has finished -- index.ts does not await it (a step
    * spans a whole model turn); tests do.
@@ -246,7 +269,8 @@ export class LoopDriver {
   /** An in-flight round this process did not send (or no longer remembers sending). */
   private async resolveInFlight(run: DriverRun): Promise<void> {
     const open = run.inFlight!;
-    const status = this.deps.messageStatus(run.sessionId, open.messageId);
+    /* 有续写那条时按它认（见 LoopInFlight.continueId） */
+    const status = this.deps.messageStatus(run.sessionId, open.continueId ?? open.messageId);
     this.log(`ledger session=${run.sessionId} iteration=${open.iteration} message=${open.messageId} status=${status}`);
     if (status === 'answered') {
       const msg = (l: UiLang) => trIn(l, '⏳ Round {i} of the loop had already finished before the restart, so it was not sent again; continuing with its check.', { i: open.iteration });
@@ -263,8 +287,10 @@ export class LoopDriver {
 
   private async sendRound(run: DriverRun, open: LoopInFlight): Promise<void> {
     const sid = run.sessionId;
-    const result = await this.deps.send(sid, nextPromptText(run), open.messageId);
-    const latest = this.mine(sid, run.startedAt);
+    /* 这一轮在续写（停止并切换之后）：发的是续写那句、用续写那条的 id，落没落地也按它认 */
+    const sendId = open.continueId ?? open.messageId;
+    const result = await this.deps.send(sid, open.continueId ? SWITCH_CONTINUE_PROMPT : nextPromptText(run), sendId);
+    let latest = this.mine(sid, run.startedAt);
     if (!latest || latest.inFlight?.messageId !== open.messageId) return;   // stopped / replaced meanwhile
     if (result.skipped) return;   // withdrawn before it was sent: the ledger re-decides next tick
     /*
@@ -275,11 +301,23 @@ export class LoopDriver {
       committing it would verify half-done work and start the next round on top of side effects
       nobody saw finish. Only `answered` is committed; `started` is in doubt, as after a crash.
     */
-    const status = this.deps.messageStatus(sid, open.messageId);
+    const status = this.deps.messageStatus(sid, sendId);
     if (status === 'answered') {
       const committed = this.commit(latest, open);
       if (committed) await this.verifyRound(committed);
       return;
+    }
+    /*
+      **被「停止这一轮并立即切换」停下的**（holdForSwitch）：等切换应用完，成功就接着做这一轮 —— 不停循环。
+      切换没成（失败 / 取消 / 等不到）就照下面原来的规则停下并说明。
+    */
+    const hold = this.switchHolds.get(sid);
+    if (hold !== undefined) {
+      this.switchHolds.delete(sid);
+      const switched = await (this.deps.awaitSwitch?.(sid, hold) ?? Promise.resolve(false)).catch(() => false);
+      latest = this.mine(sid, run.startedAt);
+      if (!latest || latest.inFlight?.messageId !== open.messageId) return;   // stopped / replaced meanwhile
+      if (switched) return this.resumeAfterSwitch(latest, latest.inFlight, status);
     }
     if (status === 'started') return this.inDoubt(latest, open);
     const msg = result.ok
@@ -288,6 +326,29 @@ export class LoopDriver {
       : (l: UiLang) => trIn(l, '⚠️ Round {i} of the loop could not be sent: {err}', { i: open.iteration, err: String(result.error || 'send failed').slice(0, 200) });
     this.deps.note(sid, msg(this.lang()), this.both(msg));
     this.finish({ ...latest, inFlight: null }, 'blocked');
+  }
+
+  /**
+   * 切换之后接着做这一轮，**还在账本里**：
+   *   · 这一轮（或它的续写）还没开始做 → 同一个 id 再发，不另扣轮数（同重启后 absent / unanswered 那条规则）；
+   *   · 已经开始做了 → 记下续写那条的 id（和 inFlight 一起落盘）再发续写：这一轮按续写那条答完才提交，重启后也按它判。
+   */
+  private async resumeAfterSwitch(run: DriverRun, open: LoopInFlight, status: MessageIdStatus): Promise<void> {
+    const sid = run.sessionId;
+    if (status === 'started') {
+      const next: LoopInFlight = { ...open, continueId: `${open.messageId}_c${this.deps.now()}` };
+      const updated = { ...run, inFlight: next } as DriverRun;
+      this.write(updated);
+      this.broadcast(sid, updated);
+      const msg = (l: UiLang) => trIn(l, 'Round {i} of the loop was stopped for a switch; continuing it on the new setting.', { i: open.iteration });
+      this.deps.note(sid, msg(this.lang()), this.both(msg));
+      this.log(`resume-after-switch session=${sid} iteration=${open.iteration} continue=${next.continueId}`);
+      return this.sendRound(updated, next);
+    }
+    const msg = (l: UiLang) => trIn(l, 'Round {i} of the loop was stopped for a switch before it did anything; sent it again on the new setting (not charged as a new round).', { i: open.iteration });
+    this.deps.note(sid, msg(this.lang()), this.both(msg));
+    this.log(`resend-after-switch session=${sid} iteration=${open.iteration} message=${open.continueId ?? open.messageId}`);
+    return this.sendRound(run, open);
   }
 
   private async verifyRound(run: DriverRun): Promise<void> {
@@ -416,7 +477,7 @@ export function loopRoundBlocker(home: string, sessionId: string, messageId: str
   const run = loopStore.readLoop(sessionId, home) as unknown as DriverRun | null;
   if (!run || run.driver !== 'main') return 'loop gone';
   if (run.terminal) return `loop ended (${run.terminal})`;
-  if (!messageId || run.inFlight?.messageId !== messageId) return 'not the round in flight';
+  if (!messageId || (run.inFlight?.messageId !== messageId && run.inFlight?.continueId !== messageId)) return 'not the round in flight';
   return null;
 }
 

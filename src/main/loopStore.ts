@@ -147,6 +147,11 @@ export interface LoopInFlight {
   iteration: number;
   messageId: string;
   at: number;
+  /**
+   * 这一轮被「停止这一轮并立即切换」停在半截（已经开始做了）、切换之后 driver 替它发的续写那条的 id（`<轮次 id>_c<时间>`）。
+   * 有它时这一轮落没落地按**续写那条**认（答完了才提交），重启后同样按它判 —— 和轮次 id 一样落盘、幂等。
+   */
+  continueId?: string;
 }
 
 /** The message id round `iteration` of this run is sent under. DETERMINISTIC on purpose:

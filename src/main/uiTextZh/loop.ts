@@ -50,5 +50,7 @@ export const ZH_LOOP: Record<string, string> = {
   '⚠️ Round {i} of the loop started running (it produced output or ran tools) but did not finish, so KiroLex did not send it again: its effects may already have happened, and sending it again could do them twice. The loop has stopped; check what that round did, then start the loop again if needed.': '⚠️ 循环第 {i} 轮已经开始执行（出过字或跑过工具）但没有跑完，所以 KiroLex 没有重发：它的效果可能已经发生，重发可能做两遍。循环已停止；先看一下那一轮做了什么，需要的话再重新启动循环。',
   '⚠️ Round {i} of the loop ended without a complete reply, so the loop has stopped.': '⚠️ 循环第 {i} 轮没有完整回复就结束了，循环已停止。',
   '⚠️ Round {i} of the loop could not be sent: {err}': '⚠️ 循环第 {i} 轮没能发出去：{err}',
+  'Round {i} of the loop was stopped for a switch before it did anything; sent it again on the new setting (not charged as a new round).': '循环第 {i} 轮还没开始做就被停下来切换了：已在新的设置上重发这一轮（不另算一轮）。',
+  'Round {i} of the loop was stopped for a switch; continuing it on the new setting.': '循环第 {i} 轮被停下来切换了：已切好，在新的设置上接着做这一轮。',
   '⏳ Round {i} of the loop had already finished before the restart, so it was not sent again; continuing with its check.': '⏳ 循环第 {i} 轮在重启前已经跑完，不再重发；接着做它的校验。',
 };

@@ -42,6 +42,21 @@ export function isControlMessageId(id: unknown): boolean {
   return typeof id === 'string' && CONTROL_ID_RE.test(id);
 }
 
+/**
+ * **KiroLex 替这一轮发的续写**（「停止这一轮并立即切换」之后的「接着做」，见渲染端 stopSwitchFollowUp.ts）的消息 id。
+ * 它是同一次任务的后半段，不是又来了一条用户消息 —— 等回复的（sessionCalls.findReply）跳过它接着收后面的回复，不当成「这一轮结束了」。
+ */
+export const AUTO_CONTINUE_ID_PREFIX = 'user_kcont_';
+export function autoContinueMessageId(now = Date.now()): string {
+  return `${AUTO_CONTINUE_ID_PREFIX}${now}_${Math.random().toString(36).slice(2, 8)}`;
+}
+/** 「停止这一轮并立即切换」之后、这一轮已有产出时发的续写（只叫它接着做，不重复原问题）—— 渲染端和循环 driver 共用 */
+export const SWITCH_CONTINUE_PROMPT = '上一轮被用户停下来切换了模型 / 引擎 / agent 等设置，现在已经切换好了。'
+  + '已经做完的步骤不要重做，从中断的地方接着把这一轮做完。';
+export function isAutoContinueMessageId(id: unknown): boolean {
+  return typeof id === 'string' && id.startsWith(AUTO_CONTINUE_ID_PREFIX);
+}
+
 export function isSessionMessageId(id: unknown): boolean {
   return typeof id === 'string' && SESSION_ID_RE.test(id);
 }

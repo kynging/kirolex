@@ -418,6 +418,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   loopStart: (sessionId: string, spec: any) => ipcRenderer.invoke('loop:start', sessionId, spec),
   /** The user stopped it (Stop, /stop, force-stop). */
   loopStop: (sessionId: string) => ipcRenderer.invoke('loop:stop', sessionId, 'aborted'),
+  /** 「停止这一轮并立即切换」停的是循环这一轮：交给 driver 在切换后接着做（loopDriver.holdForSwitch） */
+  loopHoldForSwitch: (sessionId: string) => ipcRenderer.invoke('loop:hold-for-switch', sessionId),
   /** A loop started, advanced or ended: re-read `loopListLive`. */
   onLoopChanged: (cb: (payload: any) => void) => {
     const handler = (_e: any, payload: any) => cb(payload);
@@ -707,6 +709,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.invoke('deck:write-slide-text', sessionId, filePath, page, edits),
   /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）。 */
   sessionNote: (sessionId: string, text: string, variants?: { zh: string; en: string }) => ipcRenderer.invoke('session:note', sessionId, text, variants),
+  /** 「停止并立即切换」接着做这一轮期间：等这条会话回复的别把它当成已经结束（main `turnRecoveryHolds`） */
+  holdTurnRecovery: (sessionId: string, on: boolean) => ipcRenderer.invoke('acp:hold-turn-recovery', sessionId, on),
   /** Watch exactly these files for on-disk edits, replacing any previous set.
    *  Main watches their parent directories (a save is usually write+rename, which a
    *  per-file watcher stops following), and reports each change once, debounced. */

@@ -444,6 +444,10 @@ declare global {
         => Promise<{ ok: boolean; changed?: number; error?: string }>;
       /** 在某条会话里留一行 KiroLex 自己说的话（显示，但不发给模型）—— 改写落盘之后报一句。 */
       sessionNote?: (sessionId: string, text: string, variants?: { zh: string; en: string }) => Promise<{ ok: boolean; error?: string }>;
+      /** 「停止并立即切换」接着做这一轮期间：等这条会话回复的别当成已经结束（main `turnRecoveryHolds`） */
+      holdTurnRecovery?: (sessionId: string, on: boolean) => Promise<{ ok: boolean }>;
+      /** 循环的一轮被「停止并立即切换」：交给 driver 在切换后接着做（loopDriver.holdForSwitch） */
+      loopHoldForSwitch?: (sessionId: string) => Promise<{ ok: boolean }>;
       /** Watch exactly these files for on-disk edits, replacing the previous set. */
       workspaceWatchFiles?: (sessionId: string | null | undefined, paths: string[]) => Promise<{ ok: boolean; watching: number; dirs: number }>;
       onWorkspaceFileChanged?: (callback: (data: { path: string; exists: boolean; mtimeMs: number }) => void) => () => void;
@@ -1045,6 +1049,9 @@ const App: React.FC = () => {
     recoveringIds,
     turnOutcomeOf,
     interruptedSessionIds,
+    rerunOffers,
+    rerunInterruptedTurn,
+    stopAndSwitchNow,
     connectingSessionIds,
     failedSessionIds,
     historyLoadingIds,
@@ -4401,6 +4408,8 @@ const App: React.FC = () => {
         connectionError={(sid ? errorBySession[sid] : errorBySession[APP_ERROR_KEY]) || null}
         onDismissError={() => clearSessionError(sid)}
         turnInterrupted={!!sid && interruptedSessionIds.includes(sid)}
+        interruptedRerun={sid && rerunOffers[sid] ? { messageId: rerunOffers[sid], onRerun: () => { void rerunInterruptedTurn(sid, rerunOffers[sid]); } } : null}
+        onStopAndSwitch={(target) => { if (sid) void stopAndSwitchNow(sid, target); }}
         attachedFiles={attachedFor(sid)}
         models={modelsFor(session)}
         selectedModel={paneModel}

@@ -5721,6 +5721,36 @@ const pendingSwitchRunner = new PendingSwitchRunner(pendingSwitches, {
   isBusy: (sessionId) => { const e = sessionClients.get(sessionId); return !!e?.busy || !!e?.autonomous; },
   apply: (sessionId, entries) => applyPendingSwitchBatch(sessionId, entries),
 });
+/**
+ * **每条会话最近一批 pending 切换的结果**（applyPendingSwitchBatch 收尾时记；整段取消时记成没切成）——
+ * 循环 driver 的「停止并立即切换」等它（`awaitPendingSwitchResult`）：切成了才在新设置上接着做这一轮。
+ */
+const pendingSwitchOutcomes = new Map<string, { at: number; ok: boolean }>();
+const pendingSwitchOutcomeWaiters = new Map<string, Set<() => void>>();
+function notePendingSwitchOutcome(sessionId: string, ok: boolean): void {
+  pendingSwitchOutcomes.set(sessionId, { at: Date.now(), ok });
+  const set = pendingSwitchOutcomeWaiters.get(sessionId);
+  pendingSwitchOutcomeWaiters.delete(sessionId);
+  for (const fn of set || []) fn();
+}
+/** `since` 之后这条会话的切换应用成功了没有；没有欠着的切换、取消了、失败或者 3 分钟等不到 → false */
+function awaitPendingSwitchResult(sessionId: string, since: number, timeoutMs = 180_000): Promise<boolean> {
+  return new Promise((resolve) => {
+    const check = (): boolean => {
+      const last = pendingSwitchOutcomes.get(sessionId);
+      if (last && last.at >= since) { resolve(last.ok); return true; }
+      if (!pendingSwitches.has(sessionId) && !pendingSwitchRunner.isApplying(sessionId)) { resolve(false); return true; }
+      return false;
+    };
+    if (check()) return;
+    let timer: ReturnType<typeof setTimeout>;
+    const onOutcome = () => { clearTimeout(timer); if (!check()) resolve(false); };
+    timer = setTimeout(() => { pendingSwitchOutcomeWaiters.get(sessionId)?.delete(onOutcome); resolve(false); }, timeoutMs);
+    const set = pendingSwitchOutcomeWaiters.get(sessionId) || new Set();
+    set.add(onOutcome);
+    pendingSwitchOutcomeWaiters.set(sessionId, set);
+  });
+}
 function emitPendingSwitches(sessionId: string): void {
   /* `since`：这段等待的开始时刻 —— 会话里那张卡片的「已等 N 秒」从它算 */
   mainWindow?.webContents.send('acp:pending-switches', { sessionId, pending: pendingSwitches.view(sessionId), since: pendingSwitches.sinceOf(sessionId) ?? null });
@@ -6423,11 +6453,24 @@ const sessionMcpTools = {
 
 /** 等对方回复的登记落在这里（重启后接着等）。tmp + rename 写。 */
 const SESSION_CALLS_FILE = path.join(os.homedir(), '.kirolex', 'session-calls.json');
+/**
+ * **「停止这一轮并立即切换」正在把这一轮接着做下去**（渲染端 useAcp.stopAndSwitchNow 挂上、做完摘掉）：停掉 → 应用切换 → 重发 / 续写。
+ * 这期间等这条会话回复的（会话间 session_send）不能把「停下那一刻空着」当成这一轮结束，回传半截。值是挂上的时刻；窗口重载没摘掉的，过 15 分钟不再算。
+ */
+const turnRecoveryHolds = new Map<string, number>();
+const TURN_RECOVERY_HOLD_MAX_MS = 15 * 60_000;
+function heldForTurnRecovery(sessionId: string): boolean {
+  const at = turnRecoveryHolds.get(sessionId);
+  if (at === undefined) return false;
+  if (Date.now() - at < TURN_RECOVERY_HOLD_MAX_MS) return true;
+  turnRecoveryHolds.delete(sessionId);
+  return false;
+}
 const replyWatcher = new ReplyWatcher({
   now: () => Date.now(),
   transcript: (id) => store.readTranscript(id),
   /* 还在跑一轮 / 换执行器 / 重建历史，或者唤醒队列里还有要发给它的 —— 都还没「这一轮结束」 */
-  isBusy: (id) => !!busyReasonFor(id) || wakeDispatcher.pending(id).length > 0,
+  isBusy: (id) => !!busyReasonFor(id) || wakeDispatcher.pending(id).length > 0 || heldForTurnRecovery(id),
   exists: (id) => !!controlVisibleRecord(id),
   title: (id) => store.readRecord(id)?.title || null,
   deliver: (sid, text, w) => {
@@ -14050,6 +14093,7 @@ ${hint}` : ''}` };
     now: () => Date.now(),
     canStart: (sid) => !quitPending && !deletedSessionIds.has(sid) && !store.readRecord(sid)?.archived && !!store.readRecord(sid),
     send: (sid, text, messageId) => wakeDispatcher.enqueue({ sessionId: sid, text, at: Date.now(), source: 'loop', ref: messageId }),
+    awaitSwitch: (sid, since) => awaitPendingSwitchResult(sid, since),
     verify: (sid, command, timeoutSec) => {
       const rejected = loopVerify.rejectRequest(command, timeoutSec);
       if (rejected) return Promise.resolve({ ran: false, exitCode: null, output: '', error: rejected });
@@ -14090,6 +14134,8 @@ ${hint}` : ''}` };
     if (terminal !== undefined && terminal !== 'aborted') return { ok: false, error: 'bad terminal' };
     return { ok: loopDriver!.stop(sessionId, 'aborted') };
   });
+  /* 「停止这一轮并立即切换」停的是循环这一轮：driver 先挂上，切换应用完在新设置上接着做（loopDriver.holdForSwitch） */
+  ipcMain.handle('loop:hold-for-switch', (_event, sessionId: string) => ({ ok: !!sessionId && loopDriver!.holdForSwitch(sessionId) }));
   /* 只列主进程在驱动的（旧版本留下的记录不续跑，也就不该显示成"被循环占着"）；advanced 会话的不在里面 */
   ipcMain.handle('loop:list-live', () => loopDriver!.list().filter((r) => !store.isAdvancedOnlySession(r.sessionId)));
   ipcMain.handle('loop:clear', (_event, sessionId: string) => {
@@ -16165,6 +16211,7 @@ ${hint}` : ''}` };
       sessionNotice(sessionId, failText); // 状态行同样以结果收尾（失败优先）
       logger.warn('pending-switch', `应用失败 sessionId=${sessionId} ${list}`);
     }
+    notePendingSwitchOutcome(sessionId, report.failed.length === 0);
     mainWindow?.webContents.send('acp:pending-switch-result', {
       sessionId,
       applied: report.applied,
@@ -16198,6 +16245,7 @@ ${hint}` : ''}` };
     /* 这一段等待整个取消了：卡片退回成普通提示，下面接一句结果 */
     if (cancelled && !pendingSwitches.has(sessionId)) {
       noteInSession(sessionId, tr('Switch cancelled; this session keeps its current setting.'), undefined, 'pending-switch-cancelled');
+      notePendingSwitchOutcome(sessionId, false);
     }
     return { ok: true, cancelled, pending: pendingSwitches.view(sessionId) };
   });
@@ -18292,6 +18340,12 @@ ${hint}` : ''}` };
   });
 
   /** 在某条会话里留一行 **KiroLex 自己说的话**（改写落盘之后报一句"写进去了"）—— 不发给模型，见 `noteInSession`。 */
+  ipcMain.handle('acp:hold-turn-recovery', (_event, sessionId: string, on: boolean) => {
+    if (typeof sessionId !== 'string' || !sessionId) return { ok: false };
+    if (on) turnRecoveryHolds.set(sessionId, Date.now()); else turnRecoveryHolds.delete(sessionId);
+    return { ok: true };
+  });
+
   ipcMain.handle('session:note', async (_event, sessionId: string, text: string, variants?: unknown) => {
     return noteInSession(sessionId, text, asVariants(variants)) ? { ok: true } : { ok: false };
   });

@@ -9,7 +9,8 @@ import { attachedFromMain } from '../attachedSync';
 import { outputProvesAttached, runPerMachine, withThrottleRetry } from '../warmAttach';
 import type { TurnOutcome } from '../idleNotify';
 import { classifyDeleteResult } from '../deleteOutcome';
-import { messageVariants, normalizeLang, pinShown, t as translate, type Lang } from '../i18n';
+import { messageVariants, normalizeLang, noteVariants, pinShown, t as translate, type Lang } from '../i18n';
+import { decideStopSwitchFollowUp, interruptPlanFor, rerunIdFor, SWITCH_CONTINUE_PROMPT, turnBaseIndex, turnOriginOf, turnProduced } from '../stopSwitchFollowUp';
 import { toSlashCommands, type SlashCommand } from '../slashCommands';
 import { showToast } from '../components/Toasts';
 import type { Message, ToolCall, Session, SessionFolder, AttachedFile, FileDiff, PlanEntry } from '../App';
@@ -24,7 +25,7 @@ import type { BgJobRow } from '../bgJobsView';
 // "The previous turn is still wrapping up" -- decided in a pure module, because every wrong
 // branch either bills a duplicate turn or leaves a question permanently unanswered.
 import { asSteerParts, toStoredUserLines } from '../steerSplit';
-import { carryControlMark, viaFor } from '../../main/controlSessions';
+import { autoContinueMessageId, carryControlMark, viaFor } from '../../main/controlSessions';
 import type { UsageView } from '../usageChip.ts';
 import { asTurnUsage, attachTurnUsage } from '../turnUsageView.ts';
 import { matchConsumedSteers, parseFailedSteers, settleAtTurnEnd, settleIpcResult, turnBaseId, withFailedSteers, type FailedSteerRecord, type PendingSteer } from '../steerPending';
@@ -195,6 +196,9 @@ type RerunOverride = {
   prompt?: any[]; attachments?: any[]; pastes?: any[]; displayText?: string;
   /** 被重发的那条是经控制入口发的，新的那条也带标记（`carryControlMark`）。自动重发用；你手动「编辑重跑」不带 */
   carryMark?: boolean;
+  /** 新那条的 id：`sameId` 就用被重发那条自己的 id（那一轮什么都没产出；和 carryMark 一起给，不分叉后端）；`messageId` 用给定的（例如保留来源标记的 `rerunIdFor`） */
+  sameId?: boolean;
+  messageId?: string;
 };
 
 /** How many times an interrupted prompt may be auto-resent before KiroLex stops
@@ -228,6 +232,8 @@ const t = (key: string, vars?: Record<string, string | number>): string => trans
 export const WEDGE_CONTINUE_PROMPT = '上一轮被 KiroLex 判定"静默太久"自动中断了（很可能是一次性构思了很长的输出，期间没有任何工具调用）。'
   + '已经做完的不用重做，从中断的地方接着做完。长内容请分段写、每写完一段就保存一次（例如每节一次 local_write / 文件写入），'
   + '不要把整篇憋在一次输出里。';
+/** KiroLex 自动续写发的那几句 —— 被停的一轮是它们的话不算你打的（`turnOriginOf`） */
+const AUTO_CONTINUE_PROMPTS = [WEDGE_CONTINUE_PROMPT, SWITCH_CONTINUE_PROMPT];
 
 const PENDING_STEERS_KEY = 'kirolex-pending-steers';
 /** 没能追加到这一轮、还在等用户选的 steer（见 `addFailedSteer`）。重启后**仍是标红的失败消息**（带原因、附件和两个按钮），
@@ -1258,6 +1264,25 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   const clearInterrupted = (sid: string) => {
     overwriteTargetRef.current.delete(sid);
     setInterruptedSessionIds((prev) => (prev.includes(sid) ? prev.filter((id) => id !== sid) : prev));
+    clearRerunOffer(sid);
+  };
+  /**
+   * 被中断的那一轮不是你打的（别的会话 / 定时 / 后台唤醒…）：中断条上的「重跑」原样重发它（`rerunInterruptedTurn`）。
+   * `{ [sessionId]: 那条基础消息的 id }`；新的一轮开始（`clearInterrupted`）就收掉。
+   */
+  const [rerunOffers, setRerunOffers] = useState<Record<string, string>>({});
+  /** 同上的同步镜像：自动重发（recoverInterruptedTurn）见到它就不动 —— 同 overwriteTargetRef 的「already flagged」 */
+  const rerunOfferRef = useRef<Set<string>>(new Set());
+  const offerRerun = (sid: string, msgId: string) => {
+    rerunOfferRef.current.add(sid);
+    setRerunOffers((prev) => (prev[sid] === msgId ? prev : { ...prev, [sid]: msgId }));
+  };
+  const clearRerunOffer = (sid: string) => {
+    rerunOfferRef.current.delete(sid);
+    setRerunOffers((prev) => {
+      if (!(sid in prev)) return prev;
+      const next = { ...prev }; delete next[sid]; return next;
+    });
   };
 
   /** Record that this chat's last turn was CUT SHORT, and offer its prompt back.
@@ -1284,9 +1309,20 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     for (let i = msgs.length - 1; i >= 0; i--) {
       if (msgs[i].role === 'user' && !msgs[i].steer && !isKirolexNote(msgs[i])) { idx = i; break; }
     }
+    /* nudge 那条显示成 KiroLex 提示，可它就是这一轮的提问（`turnBaseIndex`） */
+    idx = Math.max(idx, turnBaseIndex(msgs));
     if (idx < 0) return;
+    /*
+      **不是你在输入框打的那条不放回输入框**（📨 别的会话、⏰ 定时、后台任务 / 监视唤醒、循环、nudge、自动续写，见 `stopSwitchFollowUp.ts`）：
+      放回去的是带来源标记的原文，一按 Enter 就以你的名义重发。也不标「下一条覆盖」—— 你接着打的是新的一条；中断条给「重跑」，原样重发。
+    */
+    const plan = interruptPlanFor(turnOriginOf(msgs[idx], AUTO_CONTINUE_PROMPTS));
+    if (!plan.markInterrupted) {
+      if (plan.offerRerun) offerRerun(sid, msgs[idx].id);
+      return;
+    }
     markInterrupted(sid, msgs[idx].id);
-    if (opts?.prefill === false) return;
+    if (opts?.prefill === false || !plan.prefill) return;
     /* 连同这一轮已经吃进去的 steer 一起放回去（原来只放基础那条，steer 跟着被覆盖掉了） */
     const text = withConsumedSteers(msgs, idx);
     if (text.trim()) {
@@ -1456,6 +1492,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     } catch { /* default: enabled */ }
     if (streamingIdsRef.current.has(sid)) return;      // still running — not interrupted
     if (overwriteTargetRef.current.has(sid)) return;   // already flagged
+    if (rerunOfferRef.current.has(sid)) return;        // 别处来的那一轮被停了，等你点「重跑」
     // A loop owns this chat (main drives its rounds): never re-send here -- see below.
     const loopOwned = loopingIdsRef.current.has(sid);
     if (sessionsRef.current.find((s) => s.id === sid)?.archived) return; // archived chats are inert
@@ -4864,7 +4901,11 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       if (!override?.carryMark && wantsEditFork(sessionsRef.current.find((s) => s.id === sid)?.engine)) {
         try { await window.kiroApi.forkBackendForEdit?.(sid, storedRetained.map((m) => m.id)); } catch { /* 主进程不抛；IPC 本身失败也照常重发 */ }
       }
-      await window.kiroApi.rewriteTranscript(sid, storedRetained);
+      /*
+        **同一个 id 原样重发（sameId，「停止并切换」那一轮还没产出）不截记录**：盘上那条还在、还没回复，主进程照发、不再追加一条（promptDedupe 的 unanswered）。
+        截了的话这条之后的提示 ——「✅ 已切到 X」「已切到 X，重发了这条消息」—— 跟着被删掉；发不出去时那条用户消息也丢了。
+      */
+      if (!override?.sameId) await window.kiroApi.rewriteTranscript(sid, storedRetained);
 
       /*
         **还没被吃的 steer 不扔** —— 原来这里直接 `delete`，于是重跑（包括自动重发）把它们丢了。
@@ -4884,7 +4925,9 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         原来是 `setMessages(retained)`：焦点那条的界面被换成了这条的历史，归属还记成焦点会话（见 messagesOwner），
         缓存 effect 再把它存成焦点会话的。
       */
-      mutateSessionMessages(sid, () => retained);
+      /* sameId：界面上那条挪到这之后的提示后面重新发（见上：记录不截） */
+      if (override?.sameId) mutateSessionMessages(sid, () => [...retained, ...current.slice(targetIndex + 1).filter((m) => isKirolexNote(m))]);
+      else mutateSessionMessages(sid, () => retained);
       // CARRY THE ORIGINAL ATTACHMENTS. A rerun edits the TEXT; the images/files
       // that came with that message are still part of it. Dropping them meant the
       // model lost the picture you were asking about, the chips disappeared, and
@@ -4911,6 +4954,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       const keptPastes = (target as any).pastes?.length ? (target as any).pastes : undefined;
       // 自动重发经控制入口发的那条：新消息的 id 照样带标记（气泡标签、记录里的 via 都跟着它）
       const carried = override?.carryMark ? carryControlMark(target.id, 'user') : undefined;
+      /* 「停止并切换」的重发用原来那条的 id（sameId）；中断条的「重跑」用保留来源标记的新 id（messageId） */
+      const sentId = override?.sameId ? target.id : override?.messageId || carried;
       const rerunPrompt: any[] = [];
       if (keptAttachments?.length) {
         // Same hidden file-ref block the normal send path uses, so the backend can
@@ -4940,8 +4985,8 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         undefined,
         keptAttachments,
         modelForSession(sid),
-        (keptPastes || carried)
-          ? { text, ...(keptPastes ? { pastes: keptPastes } : {}), ...(carried ? { messageId: carried } : {}) }
+        (keptPastes || sentId)
+          ? { text, ...(keptPastes ? { pastes: keptPastes } : {}), ...(carried ? { messageId: carried } : {}), ...(sentId !== carried ? { messageId: sentId } : {}) }
           : undefined,
         sid, // same chat that was truncated above; see sendMessage's targetSid
       );
@@ -5443,6 +5488,29 @@ ${text}`,
    * 内存态在主进程，窗口重载后从 `getPendingSwitches` 补。
    */
   const [pendingSwitches, setPendingSwitches] = useState<Record<string, Record<string, string>>>({});
+  /** 「停止这一轮并立即切换」在等的那一批的结果（`acp:pending-switch-result`）；你取消了切换就带 null 叫醒（见 `waitPendingSwitchResult`） */
+  const pendingSwitchWaitersRef = useRef<Map<string, Set<(r: { failed: unknown[] } | null) => void>>>(new Map());
+  const wakePendingSwitchWaiters = (sid: string, r: { failed: unknown[] } | null) => {
+    const set = pendingSwitchWaitersRef.current.get(sid);
+    if (!set) return;
+    pendingSwitchWaitersRef.current.delete(sid);
+    for (const fn of set) fn(r);
+  };
+  /** 等这条会话下一批 pending 切换应用完：`{ failed }`；你取消了切换、或者等超时 → null（按没切成算） */
+  const waitPendingSwitchResult = (sid: string, timeoutMs: number): Promise<{ failed: unknown[] } | null> => new Promise((resolve) => {
+    let done = false;
+    const finish = (r: { failed: unknown[] } | null) => {
+      if (done) return;
+      done = true;
+      clearTimeout(timer);
+      pendingSwitchWaitersRef.current.get(sid)?.delete(finish);
+      resolve(r);
+    };
+    const timer = setTimeout(() => finish(null), timeoutMs);
+    const set = pendingSwitchWaitersRef.current.get(sid) || new Set();
+    set.add(finish);
+    pendingSwitchWaitersRef.current.set(sid, set);
+  });
   /** 每条会话这段等待从什么时候开始（主进程记的）—— 会话里那张卡片的「已等 N 秒」 */
   const [pendingSwitchSince, setPendingSwitchSince] = useState<Record<string, number>>({});
   useEffect(() => {
@@ -5461,6 +5529,7 @@ ${text}`,
     const offResult = api?.onPendingSwitchResult?.((d: { sessionId: string; profile: any; pending: Record<string, string>; since?: number | null }) => {
       setPendingSwitches((prev) => ({ ...prev, [d.sessionId]: d.pending || {} }));
       noteSince(d.sessionId, d.since);
+      wakePendingSwitchWaiters(d.sessionId, { failed: Array.isArray((d as any).failed) ? (d as any).failed : [] });
       const prof = d.profile;
       if (!prof) return;
       /* 实际生效的值回填（失败的那几类就是原来的值，界面跟着回退） */
@@ -5480,9 +5549,95 @@ ${text}`,
     try {
       const r = await (window.kiroApi as any).cancelPendingSwitch(sessionId, kind);
       setPendingSwitches((prev) => ({ ...prev, [sessionId]: r?.pending || {} }));
+      /* 整段等待都取消了：「停止并切换」那边别再等一个不会来的结果 */
+      if (!r?.pending || Object.keys(r.pending).length === 0) wakePendingSwitchWaiters(sessionId, null);
     } catch (err: any) {
       noteError(sessionId, err?.message || String(err));
     }
+  }, []);
+
+  /**
+   * **「停止这一轮并立即切换」** —— 不是普通 Stop（负责人反馈 2026-11-25：停了就该在新模型上接着做，不该把消息塞回输入框）。
+   *
+   * 中断这一轮（不放回输入框、不标「下一条覆盖」）→ 等主进程把忙时记下的切换应用完（这一轮一结束它就应用，见 pendingSwitch.ts）→
+   * 切换成功就接着做：这一轮**还没产出**就原样重发那条（同一个 id、附件、paste ref，见 `rerunFromMessage` 的 `sameId`），
+   * **已有产出**就发一句续写提示（同 WEDGE_CONTINUE_PROMPT 那条机制）。切换失败不续写：按普通中断处理（`decideStopSwitchFollowUp`）。
+   * 这期间队列不抢跑（`markRecovering`）：续写 / 重发先发，排队卡片里的之后照旧按顺序发。
+   *
+   * @param target 切到什么（给人看的，卡片上那句），写进会话里那行提示。
+   */
+  const stopAndSwitchNow = useCallback(async (targetSid?: string | null, target?: string) => {
+    const sid = targetSid || currentSessionRef.current;
+    /* 这一轮已经自己结束了：切换在它结束时就应用了，没什么可停的 */
+    if (!sid || !streamingIdsRef.current.has(sid)) return;
+    const result = waitPendingSwitchResult(sid, 180_000);
+    markRecovering(sid, true);
+    /* 等这条会话回复的（会话间 session_send）在这期间别把它当成已经结束、回传半截（main `turnRecoveryHolds`） */
+    void window.kiroApi.holdTurnRecovery?.(sid, true);
+    /*
+      **循环的一轮**：不停循环，交给主进程的 driver 接着做 —— 轮次归它的账本（loopDriver.ts `holdForSwitch`）：
+      没产出就同一个 id 重发这一轮（不另扣轮数），有产出就在账本里记下续写那条的 id 再发续写；切换没成照旧停下并说明。
+    */
+    let looping = false;
+    if (loopingIdsRef.current.has(sid)) {
+      /* 挂不上（这一刻没有在跑的轮次）就按普通停止：停掉循环 */
+      try { looping = !!(await window.kiroApi.loopHoldForSwitch?.(sid))?.ok; } catch { looping = false; }
+    }
+    try {
+      if (!looping) endLoop(sid, 'aborted');
+      turnOutcomeRef.current.set(sid, { kind: 'cancelled' });
+      /* 不要取消后的那段提示文字：没产出的一轮要原样重发，多出来的字会让主进程当成「已经开始做了」 */
+      try { await window.kiroApi.cancel(sid, modelForSession(sid), true); } catch { /* 照样等切换结果 */ }
+      removeStreaming(sid);
+      dropPermissionCardIfEnded(sid);
+      const res = await result;
+      const msgs = messagesCacheRef.current.get(sid) || [];
+      const idx = turnBaseIndex(msgs);
+      if (idx < 0) return;
+      const base = msgs[idx];
+      const plan = decideStopSwitchFollowUp({
+        produced: turnProduced(msgs, idx),
+        origin: turnOriginOf(base, AUTO_CONTINUE_PROMPTS),
+        switched: res && res.failed.length === 0 ? 'ok' : 'failed',
+      });
+      const what = target || t('the new setting');
+      /* 等它落盘再往下：重发那条路要在这些提示之后发（不截记录，见 rerunFromMessage 的 sameId） */
+      const note = async (text: string) => { try { await window.kiroApi.sessionNote?.(sid, text, noteVariants(text)); } catch { /* 提示写不进去不挡接着做 */ } };
+      if (plan.action === 'driver') return;
+      if (plan.action === 'none') {
+        /* 切换没成（原因主进程已经写进会话）：按普通中断，但别处来的那条不放回输入框（plan.prefill / offerRerun） */
+        if (plan.markInterrupted || plan.offerRerun) markTurnInterrupted(sid, { prefill: plan.prefill });
+        if (res) await note(t('The switch did not go through, so this turn stays stopped and was not continued automatically.'));
+        return;
+      }
+      if (plan.action === 'resend') {
+        await note(t('Switched to {target} and resent this message.', { target: what }));
+        await rerunFromMessageRef.current?.(base.id, withConsumedSteers(msgs, idx), { carryMark: true, sameId: true }, sid);
+        return;
+      }
+      await note(t('Stopped this turn; switched to {target} and continuing from where it left off.', { target: what }));
+      autoContinueInFlightRef.current.add(sid);
+      try {
+        /* 续写那条带 `user_kcont_` id：它是这一轮的后半段，等回复的跳过它接着收（sessionCalls.findReply） */
+        await sendMessageRef.current([{ type: 'text', text: SWITCH_CONTINUE_PROMPT }], undefined, undefined, undefined,
+          { text: SWITCH_CONTINUE_PROMPT, messageId: autoContinueMessageId() }, sid);
+      } catch (err: any) {
+        autoContinueInFlightRef.current.delete(sid);
+        noteError(sid, err?.message || String(err));
+      }
+    } finally {
+      markRecovering(sid, false);
+      void window.kiroApi.holdTurnRecovery?.(sid, false);
+    }
+  }, []);
+
+  /** 中断条上的「重跑」（被停那一轮不是你打的）：原样重发，保留来源标记（`rerunIdFor`）和正文里的 call 编号 */
+  const rerunInterruptedTurn = useCallback(async (sid: string, msgId: string) => {
+    const msgs = messagesCacheRef.current.get(sid) || [];
+    const idx = msgs.findIndex((m) => m.id === msgId);
+    clearRerunOffer(sid);
+    if (idx < 0) { noteError(sid, t('Could not find the message to rerun (this chat has no user message that can be rerun).')); return; }
+    await rerunFromMessageRef.current?.(msgId, withConsumedSteers(msgs, idx), { messageId: rerunIdFor(msgId) }, sid);
   }, []);
 
   // Switch the named kiro-cli agent for one session. The main process starts a
@@ -5984,6 +6139,9 @@ ${text}`,
       return res || { ok: false, error: 'no ipc' };
     },
     interruptedSessionIds,
+    rerunOffers,
+    rerunInterruptedTurn,
+    stopAndSwitchNow,
     connectingSessionIds,
     failedSessionIds,
     historyLoadingIds,

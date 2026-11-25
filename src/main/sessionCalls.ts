@@ -16,7 +16,7 @@
  */
 
 import { searchSessions } from './sessionSearch.ts';
-import { CONTROL_SEND_MAX, CONTROL_TAIL_DEFAULT, CONTROL_TAIL_MAX, CONTROL_TEXT_MAX, tailEntries, type ControlRouted, type ControlSendMode, type TranscriptLike } from './controlSessions.ts';
+import { CONTROL_SEND_MAX, CONTROL_TAIL_DEFAULT, CONTROL_TAIL_MAX, CONTROL_TEXT_MAX, isAutoContinueMessageId, tailEntries, type ControlRouted, type ControlSendMode, type TranscriptLike } from './controlSessions.ts';
 import { tr } from './uiText.ts';
 
 /** A→B→A… 的链最多几层 */
@@ -249,6 +249,7 @@ const SINCE_SLACK_MS = 5000;
  * 对方记录里那条消息在哪、之后的回复是什么。认的是**发出去的原文**（第一行的来源标记让它独一无二），
  * 发出去之后的 —— 直接发的、追加进那一轮的（折叠在 `steerParts` 里）、排队合并进一条的都认得。
  * `reply`：那条之后、下一条用户消息之前的助手消息正文；KiroLex 提示不算。
+ * KiroLex 替这一轮发的续写（`isAutoContinueMessageId`，停止并切换之后的「接着做」）也不算下一条用户消息：它后面的回复同样是这一轮的。
  */
 export function findReply(transcript: TranscriptLike[], payload: string, since: number): { found: boolean; reply: string; followedByUser: boolean } {
   const list = transcript as Msg[];
@@ -265,6 +266,7 @@ export function findReply(transcript: TranscriptLike[], payload: string, since: 
   for (let i = idx + 1; i < list.length; i++) {
     const m = list[i];
     if (m.kirolex) continue;
+    if (m.role === 'user' && isAutoContinueMessageId(m.id)) continue;
     if (m.role === 'user') { followedByUser = true; break; }
     const body = String(m.content || '').replace(/<hidden>[\s\S]*?<\/hidden>/g, '').trim();
     if (body) out.push(body);
