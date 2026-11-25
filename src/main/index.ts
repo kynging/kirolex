@@ -140,6 +140,7 @@ import { controlMessageId, isControlMessageId, isSessionMessageId, tailEntries, 
 import { PairRateLimiter, ReplyWatcher, callSessionTool, splitSessionHeader, type ReplyWatch, type SessionCallsHost, type SessionInfo, TurnOutcomeStore } from './sessionCalls.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { SessionMountLock, mountDrift, adoptRecordFields, MountDriftError } from './attachGate.ts';
+import { profileAfterReconnect, recordPermission } from './reconnectRecord.ts';
 import { trackReplySegments, type ReplySegments } from './replySegments.ts';
 import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHint, type NewSessionIntent } from './coldRecord.ts';
 import { createCreationGate } from './creationGate.ts';
@@ -202,7 +203,7 @@ import {
   mcpUnavailableNotice, mcpUnavailableLabel, notForwardedItem, missingCommandItem, failedItem, skippedItem,
   planMcpNotice, mcpNoticeScope, readMcpNoticeSeen, writeMcpNoticeSeen, splitQuietMcpItems, type McpUnavailable,
 } from './mcpUnavailable.ts';
-import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
+import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, settlingSource, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
 
 // Silence Electron's dev-only "Insecure Content-Security-Policy" console warning.
 // It fires because the Vite dev server is served without a CSP (a strict CSP would
@@ -570,6 +571,18 @@ async function awaitReconfigureIdle(sessionId: string, timeoutMs = 30000): Promi
   }
   logger.info('session', `attach resuming after model/Agent switch sessionId=${sessionId}`);
 }
+/**
+ * **新执行器按最新记录设权限** —— 重连 / 挂载是按开始时那份 profile 起的；期间记录里的权限被改过
+ * （例如重连途中切了「自动」）的话，以记录为准设到客户端上（切到自动时已经挂着的批准请求当场放行，见 acp-client）。
+ */
+function adoptRecordPermission(sessionId: string, entry: SessionEntry, recProfile: AgentProfile | undefined): void {
+  if (!recProfile) return;
+  const want = recordPermission(recProfile);
+  if (want === recordPermission(entry.profile)) return;
+  entry.profile.permissionMode = want;
+  entry.client.setPermissionMode(want);
+  logger.info('permission', `新执行器按最新记录设权限 -> ${want} sessionId=${sessionId}`);
+}
 /** Start an executor for `profile`, falling back through MODEL_FALLBACK_ORDER
  *  when the requested model cannot start (unavailable / retired / throttled).
  *  Returns the live client plus the model that actually worked, so the caller can
@@ -930,6 +943,8 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
     界面本来就认得这个状态（用户手动换模型走的是同一条）。`finally` 里清，否则一次失败的
     换模型会把这条会话永久钉在「切换中」——`awaitReconfigureIdle` 会等 30 秒然后抛错。
   */
+  /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
+  const startedRec = store.readRecord(sessionId)?.profile;
   reconfiguringSessions.add(sessionId);
   sessionClients.delete(sessionId);               // release single-process ownership
   try { await entry.client.disconnect(); } catch {}
@@ -976,10 +991,13 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
       wireSession(sessionId, next);
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       /* 项目归属以盘上为准：这一轮中途移出项目时 entry 里还是旧项目，整份写回就把移出撤销了 */
+      const onDisk = rec.profile;
       rec.profile = keepRecordPlacement(profile, rec.profile);
+      rec.profile = profileAfterReconnect(onDisk, startedRec, rec.profile);   // 再以盘上那份为底，只改这次改了的字段
       rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
+      adoptRecordPermission(sessionId, next, rec.profile);
       logger.warn('model', `${label}: '${failedModel}' unavailable at prompt time -> switched to '${model}'`
         + (stillListed
           ? `（但那台机器的模型清单里还有 '${failedModel}' —— 当作一时抖动：偏好留着，下次连上回到它）`
@@ -5902,11 +5920,24 @@ function queueSwitchWhileBusy(
   { const creating = switchWhileCreating(sessionId, kind, value, label); if (creating) return creating; }
   /* 后端自己起的那一轮（autonomousTurn.ts）在跑也算忙：现在换执行器会截断正在输出的回复，收尾时 kick 再切 */
   const autonomousRunning = !!sessionClients.get(sessionId)?.autonomous && !fromPending;
-  if (!shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending }) && !autonomousRunning) return null;
+  /* 正在重连（换模型 / agent / 机器 / 引擎 / 后端会话，执行器可能已经拿掉）/ 正在挂载：也先登记，落定后立即应用 ——
+     不登记就掉进「没连着只写记录」，被那次重连用它开始时的 profile 盖掉（frp 会话：切的「自动」被盖回「先问」） */
+  const settling = settlingSource({
+    reconfiguring: reconfiguringSessions.has(sessionId),
+    attaching: attachingSessions.has(sessionId) || mountLock.busy(sessionId),
+    fromPending,
+  });
+  if (!settling && !shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending }) && !autonomousRunning) return null;
+  /* 一轮在跑 / 上一批 pending 正在应用：照旧等它收尾；否则只是在等重连 / 挂载 */
+  const turnBusy = !!sessionClients.get(sessionId)?.busy || pendingSwitchRunner.isApplying(sessionId) || autonomousRunning;
   const firstOfThisWait = !pendingSwitches.has(sessionId);
-  pendingSwitches.set(sessionId, { kind, value, label });
-  logger.info('pending-switch', `忙时切换先记下 sessionId=${sessionId} ${kind} -> ${label}（这一轮跑完再切）`);
+  pendingSwitches.set(sessionId, { kind, value, label, ...(turnBusy || !settling ? {} : { source: settling }) });
+  logger.info('pending-switch', turnBusy
+    ? `忙时切换先记下 sessionId=${sessionId} ${kind} -> ${label}（这一轮跑完再切）`
+    : `重连 / 挂载中切换先记下 sessionId=${sessionId} ${kind} -> ${label} source=${settling}（落定后立即应用）`);
   emitPendingSwitches(sessionId);
+  /* 只是在等重连 / 挂载（没有一轮在跑）：落定就应用，不说「这一轮还在跑」 */
+  if (!turnBusy) { kickPendingWhenSettled(sessionId); return { ok: true, pending: true }; }
   /*
     **立刻在会话里说一声在等什么** ——「切换到本地 Claude Code 的时候不知为什么被拒绝或失败？也可能是后台让我在等，
     但会话没有提示」（实测那一轮又跑了 66 秒，期间只有输入框下方一个很小的 ⏳）。
@@ -5918,6 +5949,29 @@ function queueSwitchWhileBusy(
       undefined, PENDING_SWITCH_NOTE_GROUP);
   }
   return { ok: true, pending: true };
+}
+/** 已经在等这条会话的重连 / 挂载落定的（同一段等待只等一次） */
+const settleKicks = new Set<string>();
+/**
+ * 重连 / 挂载中登记的切换：等它落定（`reconfiguringSessions` 清掉、挂载锁空）就 kick —— 不等下一轮。
+ * 一轮恰好在跑的话 kick 什么都不做，那一轮结束时照常 kick。上限 10 分钟：卡死的重连不让这里永远挂着。
+ */
+function kickPendingWhenSettled(sessionId: string): void {
+  if (settleKicks.has(sessionId)) return;
+  settleKicks.add(sessionId);
+  void (async () => {
+    const deadline = Date.now() + 10 * 60_000;
+    try {
+      while (Date.now() < deadline && (reconfiguringSessions.has(sessionId) || attachingSessions.has(sessionId) || mountLock.busy(sessionId))) {
+        if (mountLock.busy(sessionId)) await mountLock.settle(sessionId);
+        else await new Promise((r) => setTimeout(r, 200));
+      }
+    } finally {
+      settleKicks.delete(sessionId);
+    }
+    logger.info('pending-switch', `重连 / 挂载落定，应用登记的切换 sessionId=${sessionId}`);
+    void pendingSwitchRunner.kick(sessionId);
+  })();
 }
 /**
  * **还在新建的会话**（没有执行器、`creations` 里在建；远程要几十秒）切权限 / 模型 / agent ——
@@ -15371,6 +15425,8 @@ ${hint}` : ''}` };
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
     const profile: AgentProfile = { ...oldEntry.profile, remote: target ? { ...target } : undefined };
+    /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
+    const startedRec = store.readRecord(sessionId)?.profile;
     adapterNotes.forgetPinned(sessionId);   // 旧机器的起法说明不再是现状；新机器要的话下面的探测重新钉上
     try {
       if (target) {
@@ -15414,11 +15470,12 @@ ${hint}` : ''}` };
         if (!target && oldEntry.profile.remote?.sshHost) releaseLocalTools(sessionId, oldEntry.profile.remote, { keepToken: true });
 
         const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-        rec.profile = profile;
+        rec.profile = profileAfterReconnect(rec.profile, startedRec, profile);
         rec.cliSessionId = made.sessionId; stampCliSessionOwner(rec, rec.profile);
         rec.localDir = nextLocalDir;
         rec.executorState = 'attached';
         store.writeRecord(rec);
+        adoptRecordPermission(sessionId, nextEntry, rec.profile);
         clearContextEstablished(sessionId);
         markContextOwedIfUnverified(sessionId, 'switch-remote-target');
         restoreContextAfterExecutorSwap(sessionId, 'switch-remote-target');
@@ -15661,6 +15718,8 @@ ${hint}` : ''}` };
       }
     };
 
+    /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
+    const startedRec = store.readRecord(sessionId)?.profile;
     sessionClients.delete(sessionId); // release the slot + ownership claim
     try { await retireExecutor(oldEntry.client); } catch {}
 
@@ -15684,10 +15743,11 @@ ${hint}` : ''}` };
       wireSession(sessionId, nextEntry);
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-      rec.profile = profile;
+      rec.profile = profileAfterReconnect(rec.profile, startedRec, profile);
       rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
+      adoptRecordPermission(sessionId, nextEntry, rec.profile);
       // A model switch means a NEW kiro-cli process, i.e. a blank backend even
       // though the session id is unchanged. In snapshot mode the snapshot rides
       // along with the next message (nothing to do here); only verbatim mode owes
@@ -15787,6 +15847,8 @@ ${hint}` : ''}` };
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
     const profile: AgentProfile = { ...oldEntry.profile, kiroAgent: normalizedAgent, remote: live.remote };
+    /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
+    const startedRec = store.readRecord(sessionId)?.profile;
     /* 换执行器 = 换 ssh = 换隧道：本地工具要重新备一次（token 和端口都跟着这次启动） */
     const localTools = await ensureLocalTools(sessionId, profile, localProjectDirOf(sessionId, oldEntry));
     const client = new AcpClient(profile.model, shellEnv, profile.kiroAgent, profile.permissionMode, profile.remote, localTools, engineOf(profile));
@@ -15808,10 +15870,11 @@ ${hint}` : ''}` };
       try { await retireExecutor(oldEntry.client); } catch {}
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-      rec.profile = profile;
+      rec.profile = profileAfterReconnect(rec.profile, startedRec, profile);
       rec.cliSessionId = created.sessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
+      adoptRecordPermission(sessionId, nextEntry, rec.profile);
       mainWindow?.webContents.send('session:ready-for-first-prompt', {
         sessionId,
         projectId: profile.projectId,
@@ -15879,6 +15942,8 @@ ${hint}` : ''}` };
     reconfiguringSessions.add(sessionId);
     emitSessionBusy(sessionId);
     const profile = reshape({ ...oldEntry.profile, remote: live.remote });
+    /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
+    const startedRec = store.readRecord(sessionId)?.profile;
     let client: AcpClient | undefined;
     let remoteModels: string[] | undefined;
     /* 旧引擎那句钉住的起法说明撤掉；新引擎要的话下面的探测重新钉上 */
@@ -15913,10 +15978,11 @@ ${hint}` : ''}` };
       wireSession(sessionId, nextEntry);
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-      rec.profile = profile;
+      rec.profile = profileAfterReconnect(rec.profile, startedRec, profile);
       rec.cliSessionId = created.sessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
+      adoptRecordPermission(sessionId, nextEntry, rec.profile);
       clearContextEstablished(sessionId);
       markContextOwedIfUnverified(sessionId, 'switch-engine');
       restoreContextAfterExecutorSwap(sessionId, 'switch-engine');
@@ -16112,6 +16178,8 @@ ${hint}` : ''}` };
     /* 远程会话：ensureLocalTools 会换掉这条会话的 token、停掉旧的中转 —— 旧执行器手里那个隧道地址从这一刻起就失效了 */
     let toolsSwapped = false;
     const prevFp = mountedComboFp.get(sessionId);
+    /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
+    const startedRec = store.readRecord(sessionId)?.profile;
     try {
       /* 按设置里现在的那台连（机器被删了就在这里抛，旧执行器和工具通道都还没动） */
       const live = liveRemountTarget(sessionId, { ...oldEntry, profile });
@@ -16139,10 +16207,11 @@ ${hint}` : ''}` };
       wireSession(sessionId, nextEntry);
 
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
-      rec.profile = profile;
+      rec.profile = profileAfterReconnect(rec.profile, startedRec, profile);
       rec.cliSessionId = created.sessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';
       store.writeRecord(rec);
+      adoptRecordPermission(sessionId, nextEntry, rec.profile);
       clearContextEstablished(sessionId);
       markContextOwedIfUnverified(sessionId, trigger);
       restoreContextAfterExecutorSwap(sessionId, trigger);
@@ -16332,7 +16401,7 @@ ${hint}` : ''}` };
     if (deletedSessionIds.has(sessionId)) { emitPendingSwitches(sessionId); return; }
     /* 用户刚点的一次立即切换可能还没落定 —— 等它，别撞上「另一个切换还没完成」 */
     try { await awaitReconfigureIdle(sessionId); } catch { /* 等不到就照试，失败会报出来 */ }
-    logger.info('pending-switch', `本轮结束，应用忙时记下的切换 sessionId=${sessionId} ${entries.map((e) => `${e.kind}->${e.label}`).join(', ')}`);
+    logger.info('pending-switch', `本轮结束，应用忙时记下的切换 sessionId=${sessionId} ${entries.map((e) => `${e.kind}->${e.label}${e.source ? ` source=${e.source}` : ''}`).join(', ')}`);
     /*
       **切换真正执行时的几个阶段也要看得见**：「正在启动本机 Claude Code…」→「正在把对话历史交给新后端…」→「✅ 已切到本机」。
       实测那次从这一轮结束到能发下一条之间有 8 秒，会话里一句话都没有。只换权限这类即时项没有"启动"这一步，直接说结果。
@@ -17853,6 +17922,7 @@ ${hint}` : ''}` };
       sessionClients.set(sessionId, entry);   // 删了没有：上面 'before mount' 检查点刚查过（attachLive.deleted），之间没有 await
       /* 远程会话：两份镜像（项目目录 + 会话目录）登记进同步编排 */
       wireSession(sessionId, entry);
+      adoptRecordPermission(sessionId, entry, latestProfile);   // 挂载途中记录里的权限改过：以记录为准（不用重起）
       const rec = store.readRecord(sessionId) || store.createSession(sessionId, profile);
       rec.cliSessionId = cliSessionId; stampCliSessionOwner(rec, rec.profile);
       rec.executorState = 'attached';

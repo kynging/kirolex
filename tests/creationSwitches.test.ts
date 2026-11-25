@@ -206,7 +206,7 @@ describe('接线', () => {
       const q = body.indexOf('queueSwitchWhileBusy(sessionId');
       assert.ok(q > 0 && q < body.indexOf(dormant), anchor);
     }
-    const queue = sliceFrom('function queueSwitchWhileBusy(', 600);
+    const queue = sliceFrom('function queueSwitchWhileBusy(', 1500);
     const c = queue.indexOf('switchWhileCreating(sessionId, kind, value, label)');
     assert.ok(c > 0 && c < queue.indexOf('shouldQueueSwitch('), '先看在不在建，再看忙不忙');
     const helper = sliceFrom('function switchWhileCreating(', 1600);

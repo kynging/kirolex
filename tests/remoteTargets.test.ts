@@ -1086,7 +1086,8 @@ describe('切换一条已有会话的机器', () => {
     assert.match(body, /markContextOwedIfUnverified\(sessionId, 'switch-remote-target'\)/);
     /* 目录和目标都要落盘，否则下次 attach 又回到老样子 */
     assert.match(body, /rec\.localDir = nextLocalDir;/);
-    assert.match(body, /rec\.profile = profile;/);
+    /* 以写盘那一刻的记录为底、只改这次换机器改了的字段（目标照写；重连途中别处写进记录的权限等不被盖掉，见 reconnectPending.test.ts） */
+    assert.match(body, /rec\.profile = profileAfterReconnect\(rec\.profile, startedRec, profile\);/);
   });
 
   test('要在会话里说清换到哪、以及"对话记录不变"（短的一句，放在详情里）', () => {

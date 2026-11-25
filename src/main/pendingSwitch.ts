@@ -27,6 +27,8 @@ export interface PendingSwitch {
   value: any;
   /** 给界面 / 提示看的那个新值（agent 名、模型 id、机器名……） */
   label: string;
+  /** 为什么先登记：没有 = 一轮在跑；'reconfiguring' / 'attaching' = 正在重连 / 挂载（落定后立即应用，见 `settlingSource`） */
+  source?: SettlingSource;
 }
 
 const ORDER: readonly PendingKind[] = [...RECONNECT_ORDER, ...INSTANT_ORDER];
@@ -277,6 +279,19 @@ export function withEngineOption<P extends EngineOptionFields>(profile: P, engin
  * （换模型先放锁再加载）—— 这时再选一次，看起来像"没连着"，只写记录的话，正在进行的那次重连完成时
  * 会用它手里的旧 profile 把记录盖掉，最后一次选择就丢了。所以"有执行器吗"不参与这个判断。
  */
+/**
+ * **正在重连 / 挂载也要先登记** ——「frp 那个会话还是有之前权限审批的 bug」：换机器重连期间（执行器已经拿掉、
+ * 还没起新的）切权限，`shouldQueueSwitch` 看不到忙，于是掉进「没连着只写记录」，被正在进行的重连用旧 profile 盖掉。
+ * 返回登记的来源；不在重连 / 挂载（或者就是应用 pending 的那次调用）返回 null。
+ */
+export type SettlingSource = 'reconfiguring' | 'attaching';
+export function settlingSource(s: { reconfiguring: boolean; attaching: boolean; fromPending?: boolean }): SettlingSource | null {
+  if (s.fromPending) return null;
+  if (s.reconfiguring) return 'reconfiguring';
+  if (s.attaching) return 'attaching';
+  return null;
+}
+
 export function shouldQueueSwitch(s: { busy: boolean; applying: boolean; fromPending?: boolean }): boolean {
   if (s.fromPending) return false; // 正在应用 pending 的那一次调用自己，不能再记回去
   return s.busy || s.applying;
