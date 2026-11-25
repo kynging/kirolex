@@ -5,8 +5,8 @@ import path from 'node:path';
 import {
   CHAIN_MAX_DEPTH, IDLE_CONFIRM_TICKS, PAIR_RATE, REPLY_DEFAULT_TIMEOUT_SEC, REPLY_MAX_TIMEOUT_SEC,
   PairRateLimiter, ReplyWatcher, callSessionTool, chainDepth, checkSendArgs, findReply, fromHeader, maxHeaderDepth, parseHeader,
-  readCount, replyHeader, sessionSegments, sessionToolDefs, splitSessionHeader,
-  type ReplyWatch, type SessionCallsHost, type SessionInfo,
+  readCount, replyHeader, replyVerdict, sessionSegments, sessionToolDefs, splitSessionHeader, TurnOutcomeStore, TURN_OUTCOME_KEEP_MS,
+  type ReplyWatch, type SessionCallsHost, type SessionInfo, type TurnOutcome,
 } from '../src/main/sessionCalls.ts';
 import { CONTROL_SEND_MAX, CONTROL_TEXT_MAX, carryControlMark, controlMessageId, isControlMessageId, isSessionMessageId, markOrigin, viaFor } from '../src/main/controlSessions.ts';
 import { callTool, toolDefs, type LocalMcpDeps } from '../src/main/localMcp.ts';
@@ -500,6 +500,20 @@ describe('接线（主进程 / 界面）', () => {
     assert.match(main, /controlSessionAccess: false,/);
   });
 
+  test('断线接线：跑着一轮时断开记成 interrupted、正常结束记 completed；挂不上抛带错误码的「没连着」；会话间唤醒落盘、启动读回；挂上就 kick', () => {
+    assert.match(main, /if \(entry\.busy\) turnOutcomes\.set\(sessionId, \{ state: 'interrupted', at: Date\.now\(\) \}\);/);
+    assert.match(main, /turnOutcomes\.set\(sessionId, \{ state: 'completed', at: Date\.now\(\) \}\);/);
+    assert.match(main, /connectionLost: \(id\) => remoteRecovery\.has\(id\)/);
+    assert.match(main, /lastTurn: \(id\) => turnOutcomes\.get\(id\) \?\? null/);
+    assert.match(main, /const turnOutcomes = new TurnOutcomeStore\(/, '收场记录落盘（重启后还要用）');
+    const wake = main.slice(main.indexOf('  wakeDeliver = async (item) => {'), main.indexOf('  loopDeliver = async (item) => {'));
+    assert.match(wake, /await ensureAttached\(sid\);\s*\/\*[^*]*\*\/\s*if \(!sessionClients\.get\(sid\)\) throw Object\.assign\(new Error\(tr\('Session not connected'\)\), \{ code: SESSION_NOT_CONNECTED \}\);/);
+    assert.match(main, /persist: \(item\) => item\.source === 'session'/);
+    assert.match(main, /wakeDispatcher\.restore\(fresh,/);
+    assert.match(main, /!wakeAlreadyDelivered\(store\.readTranscript\(it\.sessionId\), it\)/);
+    assert.match(main, /setTimeout\(\(\) => wakeDispatcher\.kick\(sessionId\), 0\)/);
+  });
+
   test('回复经 wakeDispatcher 唤醒发起方；登记落盘、启动时读回、每 2 秒看一遍；删会话时不再等', () => {
     assert.match(main, /deliver: \(sid, text, w\) => \{\s*void wakeDispatcher\.enqueue\(\{ sessionId: sid, text, at: Date\.now\(\), source: 'session', ref: w\.id \}\)/);
     assert.match(main, /replyWatcher\.restore\(saved\.watches as ReplyWatch\[\]\)/);
@@ -582,6 +596,180 @@ describe('界面：合并后的一条气泡里，每条别的会话发来的消�
     // 普通消息不拆；只在行首以 📨 开头的才算（正文中间提到的不算）
     assert.equal(sessionSegments('普通的话'), null);
     assert.equal(sessionSegments(`前言 ${fromHeader('A', 's_a', 1, false)}`), null);
+  });
+});
+
+describe('对方这一轮被断线 / 执行器退出打断：不算回复完了', () => {
+  function fixture() {
+    let now = 7_000_000;
+    const tx: Record<string, Tx> = { s_a: [], s_b: [] };
+    const busy = new Set<string>();
+    const lost = new Set<string>();
+    let lastTurn: TurnOutcome | null = null;
+    const delivered: Array<{ sid: string; text: string }> = [];
+    let saved: ReplyWatch[] = [];
+    const watcher = new ReplyWatcher({
+      now: () => now,
+      transcript: (id) => tx[id] || [],
+      isBusy: (id) => busy.has(id),
+      exists: () => true,
+      title: (id) => (id === 's_b' ? 'agent-board' : 'frp'),
+      deliver: (sid, text) => { delivered.push({ sid, text }); },
+      changed: (list) => { saved = list; },
+      connectionLost: (id) => lost.has(id),
+      lastTurn: () => lastTurn,
+    });
+    const payload = `${fromHeader('frp', 's_a', 1, true)}\n把需求转给你`;
+    const w: ReplyWatch = { id: 'w1', from: 's_a', to: 's_b', toTitle: 'agent-board', payload, since: now, deadline: now + 1800_000, timeoutSec: 1800, depth: 1 };
+    const ticks = (n: number) => { for (let i = 0; i < n; i++) watcher.tick(); };
+    return {
+      watcher, tx, busy, lost, delivered, saved: () => saved, payload, w, ticks,
+      setLastTurn: (t: TurnOutcome | null) => { lastTurn = t; }, advance: (ms: number) => { now += ms; }, now: () => now,
+    };
+  }
+
+  test('这一轮被标为中断：tick() 不报 replied，给发起方发「中断」说明（带已产出的部分），等待保留；之后对方完成回复，再发回复', () => {
+    const x = fixture();
+    x.watcher.add(x.w);
+    x.tx.s_b.push({ id: 'u1', role: 'user', content: x.payload, ts: x.w.since + 10 });
+    x.tx.s_b.push({ id: 'a1', role: 'assistant', content: '先看了 README', ts: x.w.since + 20 });
+    x.setLastTurn({ state: 'interrupted', at: x.w.since + 30 });
+    x.ticks(IDLE_CONFIRM_TICKS + 3);
+    assert.equal(x.delivered.length, 1, '只发一次中断说明');
+    assert.equal(parseHeader(x.delivered[0].text)?.reply, true);
+    assert.match(x.delivered[0].text, /connection dropped|连接断开/);
+    assert.match(x.delivered[0].text, /先看了 README/);
+    assert.doesNotMatch(x.delivered[0].text, /That turn ended without any reply text|没有回复文字/);
+    assert.equal(x.watcher.list().length, 1, '等待保留到原期限');
+    assert.equal(typeof x.saved()[0]?.interruptedAt, 'number', '发过中断说明这件事落盘');
+
+    // 对方重新连上，用户说「继续」，对方这一轮正常结束
+    x.tx.s_b.push({ id: 'n1', role: 'user', content: '⚠️ 这条消息上次已经开始执行…中途断了', ts: x.w.since + 40, kirolex: true });
+    x.tx.s_b.push({ id: 'u2', role: 'user', content: '网络恢复了，继续吧', ts: x.w.since + 50 });
+    x.busy.add('s_b');
+    x.ticks(3);
+    assert.equal(x.delivered.length, 1, '对方还在跑：不因为「后面来了用户消息」就抢跑');
+    x.tx.s_b.push({ id: 'a2', role: 'assistant', content: '需求已改好', ts: x.w.since + 60 });
+    x.busy.delete('s_b');
+    x.setLastTurn({ state: 'completed', at: x.w.since + 70 });
+    x.ticks(IDLE_CONFIRM_TICKS);
+    assert.equal(x.delivered.length, 2);
+    assert.match(x.delivered[1].text, /需求已改好/);
+    assert.equal(x.watcher.list().length, 0);
+  });
+
+  test('没有已产出的部分：说明里写「没有」', () => {
+    const x = fixture();
+    x.watcher.add(x.w);
+    x.tx.s_b.push({ id: 'u1', role: 'user', content: x.payload, ts: x.w.since + 10 });
+    x.setLastTurn({ state: 'interrupted', at: x.w.since + 30 });
+    x.ticks(1);
+    assert.equal(x.delivered.length, 1);
+    assert.match(x.delivered[0].text, /Output so far: \(none\)|已产出的部分：没有/);
+  });
+
+  test('重启后（没有收场记录）：认对方记录里那条「中途断了、没有自动再发」提示；对方之后确实做完了才算回复', () => {
+    const x = fixture();
+    x.watcher.restore([x.w]);
+    x.tx.s_b.push({ id: 'u1', role: 'user', content: x.payload, ts: x.w.since + 10 });
+    x.tx.s_b.push({ id: 'n1', role: 'user', content: '⚠️ 中途断了', ts: x.w.since + 40, kirolex: true, noteGroup: 'started-not-resent:u1' } as any);
+    x.ticks(IDLE_CONFIRM_TICKS + 2);
+    assert.equal(x.delivered.length, 1);
+    assert.match(x.delivered[0].text, /connection dropped|连接断开/);
+    x.advance(1000);
+    x.tx.s_b.push({ id: 'a2', role: 'assistant', content: '重跑完了', ts: x.w.since + 60 });
+    x.ticks(IDLE_CONFIRM_TICKS + 2);
+    assert.equal(x.delivered.length, 1, '出了字但还没有「正常结束」的记录：不算');
+    x.setLastTurn({ state: 'completed', at: x.now() });
+    x.ticks(IDLE_CONFIRM_TICKS);
+    assert.equal(x.delivered.length, 2);
+    assert.match(x.delivered[1].text, /重跑完了/);
+  });
+
+  test('重启恢复一条已发过中断说明的等待：没有收场记录、记录里也没有「中途断了」提示 —— 光空着不算回复，等到确实做完或原期限', () => {
+    for (const lostToo of [false, true]) {
+      const x = fixture();
+      x.watcher.restore([{ ...x.w, interruptedAt: x.w.since + 30 }]);
+      x.tx.s_b.push({ id: 'u1', role: 'user', content: x.payload, ts: x.w.since + 10 });
+      if (lostToo) x.lost.add('s_b');
+      x.ticks(IDLE_CONFIRM_TICKS + 5);
+      assert.equal(x.delivered.length, 0, `不能判 replied（lost=${lostToo}）`);
+      assert.equal(x.watcher.list().length, 1, '等待还在');
+      x.lost.delete('s_b');
+      x.advance(1000);
+      x.tx.s_b.push({ id: 'a2', role: 'assistant', content: '终于答了', ts: x.now() });
+      x.setLastTurn({ state: 'completed', at: x.now() });
+      x.ticks(IDLE_CONFIRM_TICKS);
+      assert.equal(x.delivered.length, 1);
+      assert.match(x.delivered[0].text, /终于答了/);
+      assert.equal(x.watcher.list().length, 0);
+    }
+    const y = fixture();
+    y.watcher.restore([{ ...y.w, interruptedAt: y.w.since + 30 }]);
+    y.tx.s_b.push({ id: 'u1', role: 'user', content: y.payload, ts: y.w.since + 10 });
+    y.ticks(3);
+    y.advance(1800_000);
+    y.ticks(1);
+    assert.equal(y.delivered.length, 1);
+    assert.match(y.delivered[0].text, /No reply|没有回复/, '一直没做完：到原期限发「没等到」');
+  });
+
+  test('收场记录落盘：新建实例读回来照样认得；太旧的丢掉', () => {
+    let disk: any = null;
+    let now = 50_000_000;
+    const deps = { now: () => now, write: (all: any) => { disk = JSON.parse(JSON.stringify(all)); } };
+    const a = new TurnOutcomeStore(deps);
+    a.set('s_b', { state: 'interrupted', at: now });
+    a.set('s_c', { state: 'completed', at: now });
+    a.delete('s_c');
+    const b = new TurnOutcomeStore(deps, disk);
+    assert.deepEqual(b.get('s_b'), { state: 'interrupted', at: now });
+    assert.equal(b.get('s_c'), undefined);
+    now += TURN_OUTCOME_KEEP_MS;
+    assert.equal(new TurnOutcomeStore(deps, disk).get('s_b'), undefined);
+    assert.equal(new TurnOutcomeStore(deps, { s_x: { state: 'bogus', at: now } }).get('s_x'), undefined);
+  });
+
+  test('断线中的对方（没连着）不累计 idleTicks：连上之后再确认几拍才算结束', () => {
+    const x = fixture();
+    x.watcher.add(x.w);
+    x.tx.s_b.push({ id: 'u1', role: 'user', content: x.payload, ts: x.w.since + 10 });
+    x.tx.s_b.push({ id: 'a1', role: 'assistant', content: '答到一半', ts: x.w.since + 20 });
+    x.lost.add('s_b');
+    x.ticks(IDLE_CONFIRM_TICKS + 5);
+    assert.equal(x.delivered.length, 0, '没连着不算空着');
+    x.lost.delete('s_b');
+    x.setLastTurn({ state: 'completed', at: x.w.since + 30 });
+    x.ticks(IDLE_CONFIRM_TICKS - 1);
+    assert.equal(x.delivered.length, 0, '连上后从头确认');
+    x.ticks(1);
+    assert.equal(x.delivered.length, 1);
+    assert.match(x.delivered[0].text, /答到一半/);
+  });
+
+  test('中断后一直没回：到原期限照常发「没等到」', () => {
+    const x = fixture();
+    x.watcher.add(x.w);
+    x.tx.s_b.push({ id: 'u1', role: 'user', content: x.payload, ts: x.w.since + 10 });
+    x.setLastTurn({ state: 'interrupted', at: x.w.since + 30 });
+    x.ticks(1);
+    x.advance(1800_000);
+    x.ticks(1);
+    assert.equal(x.delivered.length, 2);
+    assert.match(x.delivered[1].text, /No reply|没有回复/);
+    assert.equal(x.watcher.list().length, 0);
+  });
+
+  test('replyVerdict（纯函数）', () => {
+    const base = { found: true, followedByUser: false, idleTicks: 0, cutOff: false, outcome: null, since: 100_000 };
+    assert.equal(replyVerdict({ ...base, found: false }), 'wait');
+    assert.equal(replyVerdict({ ...base, idleTicks: IDLE_CONFIRM_TICKS }), 'replied');
+    assert.equal(replyVerdict({ ...base, followedByUser: true }), 'replied');
+    assert.equal(replyVerdict({ ...base, idleTicks: 9, outcome: { state: 'interrupted', at: 100_500 } }), 'interrupted');
+    assert.equal(replyVerdict({ ...base, idleTicks: 9, outcome: { state: 'interrupted', at: 10_000 } }), 'replied', '发出去之前的那次断线不算');
+    assert.equal(replyVerdict({ ...base, idleTicks: 9, cutOff: true }), 'interrupted');
+    assert.equal(replyVerdict({ ...base, idleTicks: 9, cutOff: true, outcome: { state: 'completed', at: 100_800 } }), 'replied', '之后正常结束过一轮');
+    assert.equal(replyVerdict({ ...base, followedByUser: true, interruptedAt: 100_500 }), 'wait', '中断过：要等对方空下来，不因为后面有用户消息就抢跑');
   });
 });
 

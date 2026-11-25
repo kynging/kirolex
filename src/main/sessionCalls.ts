@@ -272,6 +272,103 @@ export function findReply(transcript: TranscriptLike[], payload: string, since: 
   return { found: true, reply: out.join('\n\n'), followedByUser };
 }
 
+/** 「这条消息上次已经开始执行…中途断了…没有自动再发」那条 KiroLex 提示的 `noteGroup` 前缀（index.ts `promptDedupeFor`） */
+export const STARTED_NOT_RESENT_GROUP = 'started-not-resent:';
+
+/**
+ * 那条消息之后（跨过后面的用户消息）的全部助手正文，以及这一轮是不是**断在半截**：
+ * 那条之后有「中途断了、没有自动再发」的提示，而且提示之后对方还没出过字。
+ * 重启后主进程内存里的断线记录没了，靠的就是这条落了盘的提示。
+ */
+export function replyProgress(transcript: TranscriptLike[], payload: string, since: number): { reply: string; cutOff: boolean } {
+  const list = transcript as Array<Msg & { noteGroup?: string }>;
+  let idx = -1;
+  for (let i = list.length - 1; i >= 0; i--) {
+    const m = list[i];
+    if (m.role !== 'user' || m.kirolex) continue;
+    const viaSteer = Array.isArray(m.steerParts) && m.steerParts.some((p) => p.content === payload && Number(p.ts) >= since - SINCE_SLACK_MS);
+    if (viaSteer || (String(m.content || '').includes(payload) && Number(m.ts) >= since - SINCE_SLACK_MS)) { idx = i; break; }
+  }
+  if (idx < 0) return { reply: '', cutOff: false };
+  const out: string[] = [];
+  let cutOff = false;
+  for (let i = idx + 1; i < list.length; i++) {
+    const m = list[i];
+    if (m.kirolex) {
+      if (String(m.noteGroup || '').startsWith(STARTED_NOT_RESENT_GROUP)) cutOff = true;
+      continue;
+    }
+    if (m.role === 'user') continue;
+    const body = String(m.content || '').replace(/<hidden>[\s\S]*?<\/hidden>/g, '').trim();
+    if (body) { out.push(body); cutOff = false; }
+  }
+  return { reply: out.join('\n\n'), cutOff };
+}
+
+/** 对方最近一轮是怎么收场的（主进程记的、落盘）：正常结束 / 被断线或执行器退出打断（断开那一刻它还在跑这一轮） */
+export interface TurnOutcome { state: 'completed' | 'interrupted'; at: number }
+
+/** 收场记录留多久：等回复最长 2 小时，再多留一些（重启前后的时间差） */
+export const TURN_OUTCOME_KEEP_MS = REPLY_MAX_TIMEOUT_SEC * 1000 + 60 * 60_000;
+
+/**
+ * 每条会话最近一轮的收场记录，**落盘**（重启后等回复的那边还要靠它分「被打断」和「做完了」）。
+ * 接口和 Map 一样（get / set / delete）；每次改都整份写出去，读回时丢掉太旧的。
+ */
+export class TurnOutcomeStore {
+  private readonly map = new Map<string, TurnOutcome>();
+  private readonly deps: { now(): number; write(all: Record<string, TurnOutcome>): void };
+  constructor(deps: { now(): number; write(all: Record<string, TurnOutcome>): void }, saved?: unknown) {
+    this.deps = deps;
+    const now = deps.now();
+    if (saved && typeof saved === 'object') {
+      for (const [id, o] of Object.entries(saved as Record<string, any>)) {
+        if ((o?.state === 'completed' || o?.state === 'interrupted') && Number.isFinite(o.at) && now - o.at < TURN_OUTCOME_KEEP_MS) this.map.set(id, { state: o.state, at: o.at });
+      }
+    }
+  }
+  get(id: string): TurnOutcome | undefined { return this.map.get(id); }
+  set(id: string, o: TurnOutcome): void { this.map.set(id, o); this.save(); }
+  delete(id: string): void { if (this.map.delete(id)) this.save(); }
+  private save(): void {
+    const now = this.deps.now();
+    for (const [id, o] of this.map) if (now - o.at >= TURN_OUTCOME_KEEP_MS) this.map.delete(id);
+    try { this.deps.write(Object.fromEntries(this.map)); } catch { /* 落盘失败不挡 */ }
+  }
+}
+
+/**
+ * **这一次等待现在该怎么判**（纯函数）：
+ *   · `interrupted` —— 那条消息已经在对方记录里，但对方这一轮被打断了：发起方之后最近一次收场是「打断」，
+ *     或者（重启后没有内存记录时）记录里那条消息之后是「中途断了」的提示、提示之后对方没再出字；
+ *   · `replied` —— 这一轮正常结束了：连续空着几拍，或者后面又来了一条用户消息（中断过的不认这一条，要等对方真的空下来）；
+ *   · `wait` —— 接着等。
+ */
+export function replyVerdict(i: {
+  found: boolean;
+  followedByUser: boolean;
+  idleTicks: number;
+  cutOff: boolean;
+  outcome: TurnOutcome | null;
+  since: number;
+  /** 已经给发起方发过「中断」说明的时刻 */
+  interruptedAt?: number;
+}): 'wait' | 'replied' | 'interrupted' {
+  if (!i.found) return 'wait';
+  const recent = i.outcome && i.outcome.at >= i.since - SINCE_SLACK_MS ? i.outcome : null;
+  const interrupted = recent ? recent.state === 'interrupted' : i.cutOff;
+  if (interrupted) return 'interrupted';
+  /*
+    已知中断过的：只认**确实做完了**的那一轮（中断之后记下的「正常结束」），光是空着不算 ——
+    重启后、断线中，对方空着可能只是因为它还没被接回来、没人让它重跑。
+  */
+  if (i.interruptedAt !== undefined) {
+    return recent?.state === 'completed' && recent.at >= i.interruptedAt - SINCE_SLACK_MS && i.idleTicks >= IDLE_CONFIRM_TICKS ? 'replied' : 'wait';
+  }
+  if (i.followedByUser) return 'replied';
+  return i.idleTicks >= IDLE_CONFIRM_TICKS ? 'replied' : 'wait';
+}
+
 function clipReply(text: string): string {
   if (text.length <= REPLY_TEXT_MAX) return text;
   return `${text.slice(0, REPLY_TEXT_MAX)}\n${tr('…[cut: the reply is {n} characters, only the first {max} are here — use session_read to see the rest]', { n: text.length, max: REPLY_TEXT_MAX })}`;
@@ -298,6 +395,8 @@ export interface ReplyWatch {
   depth: number;
   /** 看到对方空着的连续拍数（不落盘） */
   idleTicks?: number;
+  /** 对方那一轮被打断、已经给发起方发过说明的时刻（落盘）—— 之后接着等它真正的回复 */
+  interruptedAt?: number;
 }
 
 export interface ReplyWatcherDeps {
@@ -313,11 +412,16 @@ export interface ReplyWatcherDeps {
   /** 登记变了（落盘） */
   changed?(list: ReplyWatch[]): void;
   log?(message: string): void;
+  /** 对方断线了、还没接回来（断线恢复在跑 / 跑着一轮时执行器没了）—— 这期间不算「空着」 */
+  connectionLost?(id: string): boolean;
+  /** 对方最近一轮是怎么收场的（没有记录 = null，例如重启后） */
+  lastTurn?(id: string): TurnOutcome | null;
 }
 
 /**
  * 等对方回复的那几条登记。每拍（index.ts 里一个计时器）看一遍：
- *   · 对方记录里出现了那条、而且对方**连续空着**几拍 → 这一轮结束了，把回复唤醒发起方；
+ *   · 对方记录里出现了那条、而且对方**连续空着**几拍 → 这一轮结束了，把回复唤醒发起方（断线没接回来的不算空着）；
+ *   · 对方这一轮被断线 / 执行器退出打断了 → 不算回复完：告诉发起方中断了、已产出的部分，接着等到原期限（`replyVerdict`）；
  *   · 过了期限 → 唤醒发起方说「没等到」；
  *   · 对方被删了 → 唤醒发起方说一声；发起方被删了 → 不再等。
  */
@@ -366,11 +470,30 @@ export class ReplyWatcher {
         done(`${head}\n${tr('⚠️ Session "{title}" was deleted before it replied.', { title: oneLine(title) })}`, 'target deleted');
         continue;
       }
-      const r = findReply(this.deps.transcript(w.to), w.payload, w.since);
-      const idle = !this.deps.isBusy(w.to);
+      const transcript = this.deps.transcript(w.to);
+      const r = findReply(transcript, w.payload, w.since);
+      const progress = replyProgress(transcript, w.payload, w.since);
+      const idle = !this.deps.isBusy(w.to) && !this.deps.connectionLost?.(w.to);
       w.idleTicks = r.found && idle ? (w.idleTicks || 0) + 1 : 0;
-      if (r.found && (r.followedByUser || w.idleTicks >= IDLE_CONFIRM_TICKS)) {
-        done(`${head}\n${r.reply ? clipReply(r.reply) : tr('(That turn ended without any reply text.)')}`, 'replied');
+      const verdict = replyVerdict({
+        found: r.found, followedByUser: r.followedByUser, idleTicks: w.idleTicks, cutOff: progress.cutOff,
+        outcome: this.deps.lastTurn?.(w.to) ?? null, since: w.since, interruptedAt: w.interruptedAt,
+      });
+      if (verdict === 'interrupted') {
+        /* 中断着：空着的拍数不算（接回来、重跑完了要从头确认） */
+        w.idleTicks = 0;
+        if (w.interruptedAt === undefined) {
+          w.interruptedAt = now;
+          changed = true;
+          this.deps.log?.(`reply watch ${id} ${w.from} ← ${w.to}: interrupted（接着等到期限）`);
+          this.deps.deliver(w.from, `${head}\n${tr('⚠️ The turn in session "{title}" was cut off because its connection dropped (or its executor exited); it did not finish. Output so far: {partial}', {
+            title: oneLine(title), partial: progress.reply ? clipReply(progress.reply) : tr('(nothing yet)'),
+          })}\n${tr('KiroLex keeps waiting for its reply until the original deadline ({dur} after sending); if it finishes later, the reply will be sent here.', { dur: formatDuration(w.timeoutSec) })}`, w);
+        }
+      } else if (verdict === 'replied') {
+        /* 中断过的：真正的回复可能在后面那几条用户消息（「继续」/ 重跑）之后，取那条之后的全部助手正文 */
+        const text = w.interruptedAt !== undefined ? progress.reply : r.reply;
+        done(`${head}\n${text ? clipReply(text) : tr('(That turn ended without any reply text.)')}`, 'replied');
         continue;
       }
       if (now >= w.deadline) {

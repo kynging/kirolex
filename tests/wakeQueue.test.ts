@@ -1,6 +1,6 @@
 import { test, describe } from 'node:test';
 import assert from 'node:assert/strict';
-import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from '../src/main/wakeQueue.ts';
+import { SESSION_BUSY, SESSION_NOT_CONNECTED, WakeDispatcher, WakeSkipped, connRetryDelay, isWakeBusyError, isWakeConnectionError, wakeAlreadyDelivered, type WakeItem } from '../src/main/wakeQueue.ts';
 
 /**
  * 后台唤醒的投递（定时到点 / 后台命令退出 / 监视事件）。
@@ -210,5 +210,137 @@ describe('撞上忙的判据不看界面语言', () => {
     assert.equal(r.ok, true);
     assert.equal(attempts, 2);
     assert.deepEqual(sent, ['🔔 后台命令结束']);
+  });
+});
+
+describe('会话没连着（断网 / ssh 断开 / 凭证拿不到）：不丢，等连上再发', () => {
+  const notConnected = () => Object.assign(new Error('会话没连着'), { code: SESSION_NOT_CONNECTED });
+
+  function connHarness(opts: { giveUpMs?: number; firstMs?: number; maxMs?: number } = {}) {
+    let now = 1_000_000;
+    let connected = false;
+    let attempts = 0;
+    const sent: WakeItem[] = [];
+    const waiting: WakeItem[] = [];
+    const gaveUp: Array<{ item: WakeItem; error: string }> = [];
+    let saved: WakeItem[] = [];
+    const deps = {
+      isBusy: () => false,
+      deliver: async (it: WakeItem) => {
+        attempts += 1;
+        if (!connected) throw notConnected();
+        sent.push(it);
+      },
+      now: () => now,
+      connRetry: { firstMs: opts.firstMs ?? 5, maxMs: opts.maxMs ?? 20, giveUpMs: opts.giveUpMs ?? 24 * 3600_000 },
+      waitingForConnection: (it: WakeItem) => { waiting.push(it); },
+      gaveUp: (it: WakeItem, error: string) => { gaveUp.push({ item: it, error }); },
+      persist: (it: WakeItem) => it.source === 'session',
+      changed: (list: WakeItem[]) => { saved = list; },
+      pollMs: 5,
+    };
+    const d = new WakeDispatcher(deps);
+    return {
+      d, deps, sent, waiting, gaveUp, saved: () => saved, attempts: () => attempts,
+      connect: () => { connected = true; }, advance: (ms: number) => { now += ms; },
+    };
+  }
+
+  test('错误码判断，不看文字', () => {
+    assert.equal(isWakeConnectionError(notConnected()), true);
+    assert.equal(isWakeConnectionError(new Error('Session not connected')), false, '没有错误码的不算');
+    assert.equal(isWakeConnectionError(Object.assign(new Error('x'), { code: SESSION_BUSY })), false);
+  });
+
+  test('退避：15s → 30s → … 最多 5 分钟一次', () => {
+    assert.deepEqual([0, 1, 2, 3, 4, 5, 9].map((n) => connRetryDelay(n)), [15_000, 30_000, 60_000, 120_000, 240_000, 300_000, 300_000]);
+  });
+
+  test('deliver 抛连接类错误：条目仍在 pending()，发起方会话里提示一次；连上后发出、只发一次', async () => {
+    const h = connHarness();
+    let result: any = null;
+    void h.d.enqueue({ sessionId: 's_a', text: '📨 回复', at: 1, source: 'session', ref: 'reply_1' }).then((r) => { result = r; });
+    await waitFor(() => h.attempts() >= 3, '退避重试几次');
+    assert.equal(result, null, '还没放弃');
+    assert.deepEqual(h.d.pending('s_a').map((x) => x.text), ['📨 回复']);
+    assert.equal(h.waiting.length, 1, '等连接的提示只说一次');
+    assert.equal(h.sent.length, 0);
+    h.connect();
+    await waitFor(() => result !== null, '连上后发出');
+    assert.equal(result.ok, true);
+    assert.equal(h.sent.length, 1);
+    await new Promise((r) => setTimeout(r, 40));
+    assert.equal(h.sent.length, 1, '只发一次');
+    assert.equal(h.waiting.length, 1, '发出后不再提示');
+    assert.deepEqual(h.d.pending('s_a'), []);
+  });
+
+  test('有「连上了」的事件就不用等退避：kick 立刻再试', async () => {
+    const h = connHarness({ firstMs: 60_000, maxMs: 60_000 });
+    const p = h.d.enqueue({ sessionId: 's_a', text: 'x', at: 1, source: 'bg', ref: 'bg_1' });
+    await waitFor(() => h.attempts() === 1, '第一次失败');
+    await new Promise((r) => setTimeout(r, 10));
+    h.connect();
+    h.d.kick('s_a');
+    const r = await p;
+    assert.equal(r.ok, true);
+    assert.equal(h.attempts(), 2);
+  });
+
+  test('超过上限才放弃：resolve(ok:false)，并交给 gaveUp 在会话里留提示', async () => {
+    const h = connHarness({ giveUpMs: 1000 });
+    let result: any = null;
+    void h.d.enqueue({ sessionId: 's_a', text: '📨 回复', at: 1, source: 'session', ref: 'r' }).then((r) => { result = r; });
+    await waitFor(() => h.attempts() >= 2, '重试');
+    assert.equal(result, null, '没到上限不放弃');
+    h.advance(1000);
+    await waitFor(() => result !== null, '放弃');
+    assert.equal(result.ok, false);
+    assert.equal(h.gaveUp.length, 1);
+    assert.equal(h.gaveUp[0].item.text, '📨 回复');
+    assert.deepEqual(h.d.pending('s_a'), []);
+    assert.deepEqual(h.saved(), [], '放弃后盘上也不留');
+  });
+
+  test('等连接期间照样先过 isStale：定时任务被暂停了就不发', async () => {
+    let stale = false;
+    const h = connHarness();
+    const d = new WakeDispatcher({ ...h.deps, isStale: () => (stale ? 'paused' : null) });
+    const p = d.enqueue({ sessionId: 's_a', text: 'sched', at: 1, source: 'schedule', ref: 'sched_1' });
+    await waitFor(() => h.attempts() >= 2, '重试');
+    stale = true;
+    const r = await p;
+    assert.equal(r.skipped, true);
+    assert.equal(h.sent.length, 0);
+  });
+
+  test('等连接期间落盘；重启（新建实例 + restore）后接着等、连上后发出', async () => {
+    const h = connHarness();
+    void h.d.enqueue({ sessionId: 's_a', text: '📨 回复', at: 1, source: 'session', ref: 'reply_1' });
+    void h.d.enqueue({ sessionId: 's_a', text: 'bg 输出', at: 2, source: 'bg', ref: 'bg_1' });
+    await waitFor(() => h.saved().length === 1 && h.saved()[0].waitingSince !== undefined, '落盘');
+    assert.equal(h.saved()[0].text, '📨 回复', '只落 session 回复');
+    assert.equal(h.saved()[0].waitNoted, true);
+    const onDisk = JSON.parse(JSON.stringify(h.saved()));
+    h.d.drop('s_a', 'test over');
+
+    const h2 = connHarness();
+    const results: any[] = [];
+    h2.d.restore(onDisk, (_it, r) => { results.push(r); });
+    await waitFor(() => h2.attempts() >= 2, '重启后接着试');
+    assert.equal(h2.waiting.length, 0, '重启前已经提示过，不再提示');
+    h2.connect();
+    await waitFor(() => results.length === 1, '连上后发出');
+    assert.equal(results[0].ok, true);
+    assert.deepEqual(h2.sent.map((x) => x.text), ['📨 回复']);
+    assert.deepEqual(h2.saved(), []);
+  });
+
+  test('wakeAlreadyDelivered：重启前已经发进会话的不再发', () => {
+    const it: WakeItem = { id: 'w', sessionId: 's', text: '📨 回复\n答', at: 100_000, source: 'session' };
+    assert.equal(wakeAlreadyDelivered([{ id: 'u', role: 'user', content: '📨 回复\n答', ts: 100_200 }], it), true);
+    assert.equal(wakeAlreadyDelivered([{ id: 'u', role: 'user', content: '📨 回复\n答', ts: 100_200, kirolex: true }], it), false, 'KiroLex 提示不算');
+    assert.equal(wakeAlreadyDelivered([{ id: 'u', role: 'user', content: '别的', ts: 100_200 }], it), false);
+    assert.equal(wakeAlreadyDelivered([{ id: 'u', role: 'user', content: '📨 回复\n答', ts: 1 }], it), false, '更早的同样文字不算');
   });
 });

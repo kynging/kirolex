@@ -99,7 +99,7 @@ import * as scheduleStore from './scheduleStore.ts';
 import { SCHEDULES_REL, canRunHere, collectBucketSchedules, definitionHash, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
 import { scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
-import { SESSION_BUSY, WakeDispatcher, WakeSkipped, isWakeBusyError, type WakeItem } from './wakeQueue.ts';
+import { SESSION_BUSY, SESSION_NOT_CONNECTED, WakeDispatcher, WakeSkipped, isWakeBusyError, isWakeConnectionError, wakeAlreadyDelivered, type WakeItem } from './wakeQueue.ts';
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { canRetrySame, decidePromptDedupe, DUPLICATE_MESSAGE, DUPLICATE_STARTED, InFlightPrompts, reviseMessageId, turnCompletedNormally } from './promptDedupe.ts';
@@ -137,7 +137,7 @@ import { LocalBrowserHost, browserActionTitle, createQuitGuard } from './localBr
 import { isBrowserKind, type BrowserAction } from './localBrowser.ts';
 import { createControlServer, type ControlServer, type ControlSessionAccess, type ControlSendResult } from './controlServer.ts';
 import { controlMessageId, isControlMessageId, isSessionMessageId, tailEntries, type MarkOrigin } from './controlSessions.ts';
-import { PairRateLimiter, ReplyWatcher, callSessionTool, type ReplyWatch, type SessionCallsHost, type SessionInfo } from './sessionCalls.ts';
+import { PairRateLimiter, ReplyWatcher, callSessionTool, splitSessionHeader, type ReplyWatch, type SessionCallsHost, type SessionInfo, TurnOutcomeStore } from './sessionCalls.ts';
 import { blocksQuit, collectBusySessions, queueCounts, type BusySession } from './busySessions.ts';
 import { SessionMountLock, mountDrift, adoptRecordFields, MountDriftError } from './attachGate.ts';
 import { trackReplySegments, type ReplySegments } from './replySegments.ts';
@@ -6125,8 +6125,65 @@ const wakeDispatcher = new WakeDispatcher({
     : item.source === 'nudge' ? textToolNudgeStale(item) : null),
   /* 不看报错文字（tr() 出来的，中文界面下是中文）：看错误码，或者此刻会话是不是真的在忙 */
   isBusyError: (err, item) => isWakeBusyError(err, quitPending || !!busyReasonFor(item.sessionId)),
+  /*
+    **会话没连着**（`SESSION_NOT_CONNECTED`：挂执行器失败 —— ssh 断开、DNS、AWS 凭证拿不到…… —— 或提交前执行器不在）：
+    留在队头，连上（`wakeDispatcher.kick`）或退避到点再发，24 小时后才放弃。等着的时候在会话里说一句（落盘、不发给模型）。
+  */
+  /* 循环的一轮不在此列：循环 driver 有自己的账本和收场（loopDriver.ts） */
+  isConnectionError: (err, item) => item.source !== 'loop' && isWakeConnectionError(err),
+  waitingForConnection: (item) => { noteInSession(item.sessionId, wakeWaitingNote(item)); },
+  gaveUp: (item) => {
+    noteInSession(item.sessionId, tr('⚠️ This session stayed disconnected for 24 hours, so KiroLex gave up delivering this message to the model: {text}', { text: wakeExcerpt(item) }));
+  },
+  /* 别的会话的回复 / 等回复超时 / 界面没就绪时转发的那条：落盘，重启后接着等（同 session-calls.json） */
+  persist: (item) => item.source === 'session',
+  changed: (list) => {
+    try {
+      fs.mkdirSync(path.dirname(WAKE_PENDING_FILE), { recursive: true });
+      if (!list.length) { fs.rmSync(WAKE_PENDING_FILE, { force: true }); return; }
+      const tmp = `${WAKE_PENDING_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify({ wakes: list }, null, 2));
+      fs.renameSync(tmp, WAKE_PENDING_FILE);
+    } catch (err: any) {
+      logger.warn('wake', `wake-pending.json 写不进去: ${err?.message || err}`);
+    }
+  },
   log: (m) => logger.info('wake', m),
 });
+/** 唤醒队列里要落盘的那几条（会话间的回复）。tmp + rename 写。 */
+const WAKE_PENDING_FILE = path.join(os.homedir(), '.kirolex', 'wake-pending.json');
+/** 提示里引用的那条（第一行之外的正文，一行、最多 120 字） */
+function wakeExcerpt(item: WakeItem): string {
+  const split = splitSessionHeader(item.text);
+  const body = String(split ? `${split.label} ${split.rest}` : item.text).replace(/\s+/g, ' ').trim();
+  return body.length > 120 ? `${body.slice(0, 120)}…` : body;
+}
+/** 「到了，等连上再发」那一行：会话间的说是谁的回复（第一行的「📨 会话「X」的回复」，发的时候已按界面语言写好） */
+function wakeWaitingNote(item: WakeItem): string {
+  const split = item.source === 'session' ? splitSessionHeader(item.text) : null;
+  if (split) return tr('{label} has arrived; it will be sent to the model once this session is connected again.', { label: split.label });
+  return tr('⏳ A background result has arrived; it will be sent to the model once this session is connected again: {text}', { text: wakeExcerpt(item) });
+}
+
+/**
+ * 每条会话最近一轮是怎么收场的（等回复的 `replyWatcher` 用，判据见 sessionCalls.ts `replyVerdict`）：
+ * 跑着一轮时执行器断开（断网 / ssh 断开 / 执行器退出）= `interrupted`；这一轮拿到了后端的结束响应 = `completed`；
+ * 开始新的一轮就清掉。落盘（`turn-outcomes.json`，tmp + rename）：重启后等回复的那边照样分得清「被打断」和「做完了」。
+ */
+const TURN_OUTCOMES_FILE = path.join(os.homedir(), '.kirolex', 'turn-outcomes.json');
+const turnOutcomes = new TurnOutcomeStore({
+  now: () => Date.now(),
+  write: (all) => {
+    try {
+      fs.mkdirSync(path.dirname(TURN_OUTCOMES_FILE), { recursive: true });
+      const tmp = `${TURN_OUTCOMES_FILE}.tmp`;
+      fs.writeFileSync(tmp, JSON.stringify(all));
+      fs.renameSync(tmp, TURN_OUTCOMES_FILE);
+    } catch (err: any) {
+      logger.warn('sessions', `turn-outcomes.json 写不进去: ${err?.message || err}`);
+    }
+  },
+}, (() => { try { return JSON.parse(fs.readFileSync(TURN_OUTCOMES_FILE, 'utf-8')); } catch { return null; } })());
 
 /**
  * **换新的后端会话**（同一个执行器进程里 `session/new`）—— EmptyResponse / 连续拒绝、「写成文字」反复发作、
@@ -6387,6 +6444,9 @@ const replyWatcher = new ReplyWatcher({
     }
   },
   log: (m) => logger.info('sessions', m),
+  /* 断线恢复在跑，或者跑着一轮时执行器没了、还没挂回来：不算「空着」 */
+  connectionLost: (id) => remoteRecovery.has(id) || (turnOutcomes.get(id)?.state === 'interrupted' && !sessionClients.has(id)),
+  lastTurn: (id) => turnOutcomes.get(id) ?? null,
 });
 
 /** kirolex-local 上那组工具的落地：定时任务就是现有的定时任务（同一个存储、同一个计时器）。 */
@@ -9382,6 +9442,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // map now holds a DIFFERENT entry — this stale event must not delete it or
     // spuriously notify the renderer.
     if (sessionClients.get(sessionId) !== entry || retiringClients.has(client)) return;
+    /* 跑着一轮时断的：这一轮没完成 —— 等它回复的那边不能当成「回复完了」（`replyWatcher` / `replyVerdict`） */
+    if (entry.busy) turnOutcomes.set(sessionId, { state: 'interrupted', at: Date.now() });
     sessionClients.delete(sessionId);
     const rec = store.readRecord(sessionId);
     if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
@@ -11706,7 +11768,10 @@ ${hint}` : ''}` };
     // `let`, not `const`: a mid-flight model swap (retired model) replaces this
     // session's executor, and the rest of the turn must continue on the new one.
     let entry = sessionClients.get(sessionId);
-    if (!entry) throw new Error(tr('Session not connected'));
+    /* 还没提交：带「没连着」的错误码，唤醒队列据此等连上再发（`wakeQueue.ts`） */
+    if (!entry) throw Object.assign(new Error(tr('Session not connected')), { code: SESSION_NOT_CONNECTED });
+    /* 开始新的一轮：上一轮怎么收场的不再算数（`turnOutcomes`） */
+    if (attempt === 0) turnOutcomes.delete(sessionId);
     /*
       **交给适配器、排在当前这一轮后面的那一轮**（`followUpTurns.ts`）：不拒绝「正忙」，而是登记成下一轮，
       等前一轮收尾时同步交棒，再像普通的一轮那样跑完（落盘、看门狗、自动重发、收尾都归这一条）。只在第一次发送时生效。
@@ -11753,7 +11818,7 @@ ${hint}` : ''}` };
     // installs a NEW executor for the same session.
     await awaitReconfigureIdle(sessionId);
     const afterSwitch = sessionClients.get(sessionId);
-    if (!afterSwitch) throw new Error(tr('Session not connected'));
+    if (!afterSwitch) throw Object.assign(new Error(tr('Session not connected')), { code: SESSION_NOT_CONNECTED });
     entry = afterSwitch;
     // The backend was rebuilt from scratch (resume failed) and its context has NOT
     // been restored yet -> WAIT for the rebuild, then send. Sending now would hand
@@ -12443,6 +12508,8 @@ ${hint}` : ''}` };
             if (turnCompletedNormally({ stopReason: result?.stopReason, wedged: !!entry.wedgeNote })) entry.completedReplyTo = userMessageId;
             flushAssistant(sessionId); // turn complete -> persist the full assistant msg
             if (askReply) settleAsk(sessionId, askReply);
+            /* 后端给了这一轮的结束响应（含你按停）：不是被断线打断的 */
+            turnOutcomes.set(sessionId, { state: 'completed', at: Date.now() });
             if (textTool && textTool.action !== 'none') handleTextToolCall(sessionId, textTool, textToolBuf);
             // The request was accepted and answered, so the snapshot it carried IS
             // in this backend now: the claim written before the send is confirmed.
@@ -13556,7 +13623,8 @@ ${hint}` : ''}` };
     if (refuseAdvancedOnly(sid, 'wake')) throw new Error(tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.'));
     if (store.readRecord(sid)?.archived) throw new Error(tr('This session is archived. Unarchive it to keep chatting.'));
     await ensureAttached(sid);
-    if (!sessionClients.get(sid)) throw new Error(tr('Session not connected'));
+    /* 挂不上（ssh 断开 / DNS / 凭证拿不到……ensureAttached 吞掉了原因，日志里有）：还没提交，等连上再发 */
+    if (!sessionClients.get(sid)) throw Object.assign(new Error(tr('Session not connected')), { code: SESSION_NOT_CONNECTED });
     /* 挂执行器那段时间里任务可能已经被暂停 / 删除：再看一次（sendPromptOnce 里提交之前还会再看一次） */
     const stillWanted = () => (item.source === 'schedule' && item.ref
       ? scheduleWakeBlocked(item.ref)
@@ -13637,6 +13705,18 @@ ${hint}` : ''}` };
     const saved = JSON.parse(fs.readFileSync(SESSION_CALLS_FILE, 'utf-8'));
     if (Array.isArray(saved?.watches)) replyWatcher.restore(saved.watches as ReplyWatch[]);
   } catch { /* 没有文件 = 没有在等的 */ }
+  /*
+    重启前还没发出去的会话间唤醒（多半是发起方没连着）：接着等、连上再发。退出时正在发的那一条
+    如果其实已经进了会话（记录里有一样的用户消息）就不再发第二遍。
+  */
+  try {
+    const saved = JSON.parse(fs.readFileSync(WAKE_PENDING_FILE, 'utf-8'));
+    const items = (Array.isArray(saved?.wakes) ? saved.wakes : []) as WakeItem[];
+    const fresh = items.filter((it) => it && it.sessionId && !wakeAlreadyDelivered(store.readTranscript(it.sessionId), it));
+    if (items.length) logger.info('wake', `restored ${fresh.length}/${items.length} pending session wakes`);
+    if (!fresh.length) fs.rmSync(WAKE_PENDING_FILE, { force: true });
+    wakeDispatcher.restore(fresh, (it, r) => { if (!r.ok) logger.warn('sessions', `重启前排着的唤醒没发出去 ${it.id} session=${it.sessionId}: ${r.error}`); });
+  } catch { /* 没有文件 = 没有排着的 */ }
   const replyTicker = setInterval(() => {
     try { replyWatcher.tick(); } catch (err: any) { logger.warn('sessions', `reply watcher tick failed: ${err?.message || err}`); }
   }, 2000);
@@ -17583,6 +17663,8 @@ ${hint}` : ''}` };
       return result;
     } finally {
       attachInFlight.delete(sessionId);
+      /* 挂上了（你点开的、断线恢复接回来的、主进程自己挂的）：等着连上再发的唤醒立刻再试，不等退避到点 */
+      if (sessionClients.has(sessionId)) setTimeout(() => wakeDispatcher.kick(sessionId), 0);
     }
   };
   ipcMain.handle('acp:load-session', async (_event, sessionId: string, cwd: string, model: string) =>
