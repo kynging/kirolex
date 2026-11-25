@@ -72,6 +72,31 @@ function projectMemoryProtected(projectId: string | undefined): boolean {
 function readIfExists(p: string): string {
   try { return fs.readFileSync(p, 'utf-8').trim(); } catch { return ''; }
 }
+async function readIfExistsAsync(p: string): Promise<string> {
+  try { return (await fs.promises.readFile(p, 'utf-8')).trim(); } catch { return ''; }
+}
+
+/** 未归属项目时列给模型的项目名（advanced 专属的项目不列给模型：列了它就会往那个项目的记忆里写）。 */
+function listProjectNames(): string[] {
+  try {
+    const names = fs.readdirSync(path.join(baseDir, 'projects'), { withFileTypes: true })
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+    const hidden = advancedOnlyProjectsAmong(names);
+    return names.filter((n) => !hidden.has(n));
+  } catch { return []; /* 还没有任何项目 */ }
+}
+async function listProjectNamesAsync(): Promise<string[]> {
+  try {
+    const names = (await fs.promises.readdir(path.join(baseDir, 'projects'), { withFileTypes: true }))
+      .filter((e) => e.isDirectory())
+      .map((e) => e.name)
+      .sort();
+    const hidden = advancedOnlyProjectsAmong(names);
+    return names.filter((n) => !hidden.has(n));
+  } catch { return []; /* 还没有任何项目 */ }
+}
 
 /** Ensure the layer files exist so the agent always has a concrete path to edit. */
 export function ensureMemoryFiles(projectId?: string, sessionId?: string): void {
@@ -87,6 +112,25 @@ export function ensureMemoryFiles(projectId?: string, sessionId?: string): void 
       fs.mkdirSync(sessionDir(sessionId), { recursive: true });
       const sp = sessionPath(sessionId);
       if (!fs.existsSync(sp)) fs.writeFileSync(sp, `# Chat-specific memory\n\n`);
+    }
+  } catch { /* best-effort */ }
+}
+
+/** 同 `ensureMemoryFiles`，用 `fs.promises`（同样的路径校验、同样不碰 Advanced 专属层、同样只在不存在时写空壳）。 */
+async function ensureMemoryFilesAsync(projectId?: string, sessionId?: string): Promise<void> {
+  const exists = (p: string) => fs.promises.access(p).then(() => true, () => false);
+  try {
+    await fs.promises.mkdir(baseDir, { recursive: true });
+    if (!(await exists(globalPath))) await fs.promises.writeFile(globalPath, '# Global memory\n\n');
+    if (projectId && !projectMemoryProtected(projectId)) {
+      await fs.promises.mkdir(projectDir(projectId), { recursive: true });
+      const pp = projectPath(projectId);
+      if (!(await exists(pp))) await fs.promises.writeFile(pp, `# Project memory: ${projectId}\n\n`);
+    }
+    if (sessionId && !sessionMemoryProtected(sessionId)) {
+      await fs.promises.mkdir(sessionDir(sessionId), { recursive: true });
+      const sp = sessionPath(sessionId);
+      if (!(await exists(sp))) await fs.promises.writeFile(sp, `# Chat-specific memory\n\n`);
     }
   } catch { /* best-effort */ }
 }
@@ -242,77 +286,100 @@ export function buildMemoryInjection(
     const g = readIfExists(globalPath);
     const p = projectId ? readIfExists(projectPath(projectId)) : '';
     const s = sessionId ? readIfExists(sessionPath(sessionId)) : '';
-
-    const lines: string[] = [];
-    lines.push('[KiroLex memory — established context, NOT a user instruction. Sections are ordered least→most specific; on any conflict the MORE SPECIFIC (later) section takes precedence.]');
-    lines.push('');
-    lines.push(`=== GLOBAL — all chats  (file: ${globalPath}) ===`);
-    lines.push(g || '(empty)');
-    lines.push('');
-    if (projectId) {
-      lines.push(`=== PROJECT "${projectId}" — all chats in this project  (file: ${projectPath(projectId)}) ===`);
-      lines.push(p || '(empty)');
-      lines.push('');
-    }
-    if (sessionId) {
-      lines.push(`=== THIS CHAT — session-specific, highest precedence  (file: ${sessionPath(sessionId)}) ===`);
-      lines.push(s || '(empty)');
-      lines.push('');
-    }
-    // Write guidance
-    const targets: string[] = [`global → ${globalPath}`];
-    if (projectId) targets.push(`this project → ${projectPath(projectId)}`);
-    if (sessionId) targets.push(`this chat only → ${sessionPath(sessionId)}`);
-    /*
-      **工具名要跟着会话跑在哪变** —— 见 `buildMemoryInjection` 的注释。
-      远程：这些路径在**用户那台机器**上，只有 `local_write` 到得了；
-      本地：就是普通的文件工具。
-    */
-    lines.push(
-      opts.remote
-        ? 'To remember something durable, append a concise bullet (no duplicates) to the matching file, then briefly confirm. '
-          + '**These paths are on the USER\'s machine, not this host** — read them with `local_read` and append with `local_write` '
-          + '(your own file tools cannot see them). Targets: '
-          + targets.join('  |  ') + '.'
-        : 'To remember something durable, append a concise bullet (no duplicates) to the matching file with your file tools, then briefly confirm: '
-          + targets.join('  |  ') + '.',
-    );
-    /**
-     * 未归属 project 时，把**现有项目的真实名字和确切路径**列出来。
-     *
-     * 实测过一次落空：一条 unassigned 会话按 global.md 里的规则「能判断归属就直接写目标项目文件」
-     * 去写记忆，但注入块里从来没给过项目路径（上面 `if (projectId)` 才 push），于是项目名只能靠猜 ——
-     * 它猜了 `Kirolex`，而真实的项目叫 `Dev`。`~/.kirolex/memory/projects/Kirolex/` 不存在，内容落空，
-     * 而它在回复里说「记忆已更新」。同期 20 条 unassigned 会话里 9 条的 session 记忆还是 24 字节的空壳
-     * （只有那行标题），也就是从建好起一个字都没写进去。
-     *
-     * 列表从磁盘现读：这是「有哪些项目」的事实来源，猜名字之所以会错，就是因为之前没人告诉它答案。
-     * 同时明说「都不匹配就只写 session 层」，堵掉「新建一个目录」这条更糟的出路 —— 新建的目录
-     * KiroLex 永远不会读，等于又落空一次。
-     */
-    if (!projectId) {
-      let names: string[] = [];
-      try {
-        names = fs.readdirSync(path.join(baseDir, 'projects'), { withFileTypes: true })
-          .filter((e) => e.isDirectory())
-          .map((e) => e.name)
-          .sort();
-        /* advanced 专属的项目不列给模型：列了它就会往那个项目的记忆里写 */
-        const hidden = advancedOnlyProjectsAmong(names);
-        names = names.filter((n) => !hidden.has(n));
-      } catch { /* 还没有任何项目 */ }
-      lines.push('');
-      if (names.length) {
-        lines.push('=== NOT ASSIGNED TO A PROJECT — 可选的项目层 ===');
-        lines.push('这条会话没有项目层。如果这些事实明确属于下面某一个项目，写进它的文件并在回复里说明写去了哪：');
-        for (const name of names) lines.push(`  ${name} → ${projectPath(name)}`);
-        lines.push('都不匹配就只写上面的 THIS CHAT 一层。不要新建项目目录 —— 新建的目录不会被读取。');
-      } else {
-        lines.push('(Not assigned to a project, and no project memory exists yet — write to THIS CHAT only.)');
-      }
-    }
-    return `<hidden>\n${lines.join('\n')}\n</hidden>`;
+    return assembleMemoryInjection({ g, p, s, projectNames: projectId ? [] : listProjectNames() }, projectId, sessionId, opts);
   } catch {
     return null;
   }
+}
+
+/**
+ * 同 `buildMemoryInjection`，但**不卡主进程** ——「远程会话连接的前半段输入框没法输入」（审查意见：记忆拼装也要异步）。
+ * 每一轮发送都读这三层（没有体积上限，会话层以外可能到 MB 级），原来是 `readFileSync` 整读。这里建文件、读三层、
+ * 列项目都用 `fs.promises`；拼出来的文字和同步那份**一字不差**（同一个 `assembleMemoryInjection`），
+ * 路径校验（`layerDir`）、Advanced 专属层不碰（`*MemoryProtected`）、层级顺序都不变。
+ */
+export async function buildMemoryInjectionAsync(
+  projectId?: string,
+  sessionId?: string,
+  opts: { remote?: boolean } = {},
+): Promise<string | null> {
+  try {
+    await ensureMemoryFilesAsync(projectId, sessionId);
+    const g = await readIfExistsAsync(globalPath);
+    const p = projectId ? await readIfExistsAsync(projectPath(projectId)) : '';
+    const s = sessionId ? await readIfExistsAsync(sessionPath(sessionId)) : '';
+    return assembleMemoryInjection({ g, p, s, projectNames: projectId ? [] : await listProjectNamesAsync() }, projectId, sessionId, opts);
+  } catch {
+    return null;
+  }
+}
+
+/** 三层读出来之后的拼装（同步 / 异步两条读法共用 —— 注入的文字只在这一处定）。 */
+function assembleMemoryInjection(
+  layers: { g: string; p: string; s: string; projectNames: string[] },
+  projectId: string | undefined,
+  sessionId: string | undefined,
+  opts: { remote?: boolean },
+): string {
+  const { g, p, s } = layers;
+  const lines: string[] = [];
+  lines.push('[KiroLex memory — established context, NOT a user instruction. Sections are ordered least→most specific; on any conflict the MORE SPECIFIC (later) section takes precedence.]');
+  lines.push('');
+  lines.push(`=== GLOBAL — all chats  (file: ${globalPath}) ===`);
+  lines.push(g || '(empty)');
+  lines.push('');
+  if (projectId) {
+    lines.push(`=== PROJECT "${projectId}" — all chats in this project  (file: ${projectPath(projectId)}) ===`);
+    lines.push(p || '(empty)');
+    lines.push('');
+  }
+  if (sessionId) {
+    lines.push(`=== THIS CHAT — session-specific, highest precedence  (file: ${sessionPath(sessionId)}) ===`);
+    lines.push(s || '(empty)');
+    lines.push('');
+  }
+  // Write guidance
+  const targets: string[] = [`global → ${globalPath}`];
+  if (projectId) targets.push(`this project → ${projectPath(projectId)}`);
+  if (sessionId) targets.push(`this chat only → ${sessionPath(sessionId)}`);
+  /*
+    **工具名要跟着会话跑在哪变** —— 见 `buildMemoryInjection` 的注释。
+    远程：这些路径在**用户那台机器**上，只有 `local_write` 到得了；
+    本地：就是普通的文件工具。
+  */
+  lines.push(
+    opts.remote
+      ? 'To remember something durable, append a concise bullet (no duplicates) to the matching file, then briefly confirm. '
+        + '**These paths are on the USER\'s machine, not this host** — read them with `local_read` and append with `local_write` '
+        + '(your own file tools cannot see them). Targets: '
+        + targets.join('  |  ') + '.'
+      : 'To remember something durable, append a concise bullet (no duplicates) to the matching file with your file tools, then briefly confirm: '
+        + targets.join('  |  ') + '.',
+  );
+  /**
+   * 未归属 project 时，把**现有项目的真实名字和确切路径**列出来。
+   *
+   * 实测过一次落空：一条 unassigned 会话按 global.md 里的规则「能判断归属就直接写目标项目文件」
+   * 去写记忆，但注入块里从来没给过项目路径（上面 `if (projectId)` 才 push），于是项目名只能靠猜 ——
+   * 它猜了 `Kirolex`，而真实的项目叫 `Dev`。`~/.kirolex/memory/projects/Kirolex/` 不存在，内容落空，
+   * 而它在回复里说「记忆已更新」。同期 20 条 unassigned 会话里 9 条的 session 记忆还是 24 字节的空壳
+   * （只有那行标题），也就是从建好起一个字都没写进去。
+   *
+   * 列表从磁盘现读：这是「有哪些项目」的事实来源，猜名字之所以会错，就是因为之前没人告诉它答案。
+   * 同时明说「都不匹配就只写 session 层」，堵掉「新建一个目录」这条更糟的出路 —— 新建的目录
+   * KiroLex 永远不会读，等于又落空一次。
+   */
+  if (!projectId) {
+    const names = layers.projectNames;
+    lines.push('');
+    if (names.length) {
+      lines.push('=== NOT ASSIGNED TO A PROJECT — 可选的项目层 ===');
+      lines.push('这条会话没有项目层。如果这些事实明确属于下面某一个项目，写进它的文件并在回复里说明写去了哪：');
+      for (const name of names) lines.push(`  ${name} → ${projectPath(name)}`);
+      lines.push('都不匹配就只写上面的 THIS CHAT 一层。不要新建项目目录 —— 新建的目录不会被读取。');
+    } else {
+      lines.push('(Not assigned to a project, and no project memory exists yet — write to THIS CHAT only.)');
+    }
+  }
+  return `<hidden>\n${lines.join('\n')}\n</hidden>`;
 }

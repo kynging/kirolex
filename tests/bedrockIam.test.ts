@@ -866,7 +866,8 @@ describe('接线（源码断言）', () => {
     assert.match(M, /return \{ ok: true, statuses: withBedrockStatuses\(key, await engineStatusesFor\(key, !!opts\?\.force\)\) \};/);
     assert.match(M, /if \(engine === 'codex' && sessionId\) precheckCodexBedrock\(sessionId, profile\.remote\?\.sshHost \? profile\.remote : undefined\);/);
     const pre = M.slice(M.indexOf('function precheckCodexBedrock('), M.indexOf('async function noteBedrockDenied('));
-    assert.match(pre, /store\.readTranscript\(sessionId\)\.some\(\(m: any\) => m\?\.kirolex && m\.noteGroup === group\)\) return;/);
+    /* 去重照旧按记录里同组的提示判；读记录改成异步分片（连上 Codex 会话时走到这里，不同步整读 transcript） */
+    assert.match(pre, /await heavyLane\(\(\) => store\.readTranscriptAsync\(sessionId\)\)\)\.some\(\(m: any\) => m\?\.kirolex && m\.noteGroup === group\)\) return;/);
     assert.match(pre, /noteInSession\(sessionId, trConcat\(main, NOTE_DETAIL_SEP, detail\), undefined, group\);/);
     const P = read('src', 'renderer', 'components', 'EngineStatusPanel.tsx');
     assert.match(P, /\{e === 'codex' && s\?\.bedrock && <BedrockLine b=\{s\.bedrock\} \/>\}/);

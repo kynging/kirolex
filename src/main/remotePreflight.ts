@@ -11,7 +11,7 @@
 import type { RemoteTarget } from './config';
 import { tr, trList } from './uiText.ts';
 import { userInfo } from 'node:os';
-import { isSsm, ssmKeyPushFailure, usesSsmTempKey, ssmKeyUnusable, ensureSsmKey, sendKeyArgs } from './sshProxy.ts';
+import { isSsm, ssmKeyPushFailure, usesSsmTempKey, ssmKeyUnusable, prepareSsmKey, sendKeyArgs } from './sshProxy.ts';
 
 export type PreflightCode = 'ok' | 'unreachable' | 'missing-tools' | 'not-logged-in';
 
@@ -565,7 +565,7 @@ export async function ssmPreflight(remote: RemoteTarget, tools: SsmTools, run: S
   */
   if (usesSsmTempKey(remote)) {
     let args: string[];
-    try { args = sendKeyArgs(remote, ensureSsmKey(remote).publicKey); } catch (err: any) {
+    try { args = sendKeyArgs(remote, (await prepareSsmKey(remote)).publicKey); } catch (err: any) {
       return fail(tr('the temporary SSH key could not be prepared ({err})', { err: String(err?.message || err) }), tr('Or, under Advanced, choose "Use my own private key (no temporary key)".'));
     }
     const sent = await run(tools.aws, args);

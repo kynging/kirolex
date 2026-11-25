@@ -115,7 +115,9 @@ describe('3. 「还没登录」同一个原因只记一条', () => {
     const M = read('src', 'main', 'index.ts');
     const at = M.indexOf('const adapterNotes = (() => {');
     const body = M.slice(at, at + 2500);
-    assert.match(body, /noteAlreadyInTranscript\(store\.readTranscript\(sid\), group,/);
+    /* 读 transcript 改成异步分片（attach 路径上不同步整读），去重照旧按盘上的记录判 */
+    assert.match(body, /heavyLane\(\(\) => store\.readTranscriptAsync\(sid\)\)\.then\(\(transcript\) => \{\s*if \(noteAlreadyInTranscript\(transcript, group,/);
+    assert.doesNotMatch(body.slice(0, body.indexOf('createAdapterNotes(')), /store\.readTranscript\(/);
   });
 
   test('第一次启动：提示到的时候这条会话的列表还是空的 → 读回盘上的历史（提示已经落盘，自然在里面）', () => {

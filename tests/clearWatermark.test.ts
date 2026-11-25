@@ -38,8 +38,11 @@ describe('/clear 的历史水位线', () => {
     const body = readTranscriptBody();
     assert.match(body, /readRecord\(id\)\?\.clearedAt/);
     assert.match(body, /Number\(\(m as any\)\.ts\) > at/, '只留水位线之后的');
-    assert.match(MAIN, /function renderHistoryFile[\s\S]{0,200}store\.readTranscript\(sessionId\)/);
-    assert.match(MAIN, /ipcMain\.handle\('acp:read-transcript'[\s\S]{0,120}store\.readTranscript\(sessionId\)/);
+    /* history.md 改成异步分片读（renderHistoryFileAsync / 快照里的 writeHistoryFromLines 用同一份已过滤的历史），同一个水位线过滤 */
+    assert.match(MAIN, /function renderHistoryFileAsync[\s\S]{0,600}store\.readTranscriptAsync\(sessionId\)/);
+    /* 视图那条（hydrate）走异步分片版 readTranscriptAsync —— 同一个水位线过滤（afterClearedAt），见 transcriptParseChunked.test.ts */
+    assert.match(MAIN, /ipcMain\.handle\('acp:read-transcript'[\s\S]{0,260}store\.readTranscriptAsync\(sessionId\)/);
+    assert.match(readTranscriptBody(), /export async function readTranscriptAsync[\s\S]*afterClearedAt\(id, /);
   });
 
   test('没有 ts 的行留着 —— 不确定就不隐藏用户的记录', () => {

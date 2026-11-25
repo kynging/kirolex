@@ -77,7 +77,8 @@ describe('渲染端拼进 <hidden> 历史块（复制会话 / 编辑重跑 / 跨
 });
 
 describe('主进程发给模型 / 写进记忆的几条路：都先过 modelFacing', () => {
-  for (const name of ['maybeConsolidateSessionMemory', 'renderHistoryFile', 'buildHistoryRideAlong', 'primeHistoryNow']) {
+  /* history.md 刷新是 renderHistoryFileAsync；重建历史读 transcript 的那一半拆成了 primeHistoryPlanned（primeHistoryNow 只做闸门和登记） */
+  for (const name of ['maybeConsolidateSessionMemory', 'renderHistoryFileAsync', 'buildHistoryRideAlong', 'primeHistoryPlanned']) {
     test(`${name}`, () => {
       assert.match(fnBody(M, name), /\.filter\(modelFacing\)/);
     });
@@ -86,7 +87,8 @@ describe('主进程发给模型 / 写进记忆的几条路：都先过 modelFaci
 
 describe('追加指令拆分 / 合并：不会并进一条提示', () => {
   test('落盘的追加指令按 id 并回那条用户消息时，目标是提示就不并（单独留一条，文字不丢）', () => {
-    const S = read('src', 'main', 'sessionStore.ts');
+    /* 逐行合并在 transcriptParse.ts（sessionStore 的同步 / 异步两条读法共用） */
+    const S = read('src', 'main', 'transcriptParse.ts');
     assert.match(S, /if \(target\?\.role === 'user' && !isKirolexNote\(target\)\) \{/);
   });
   test('渲染端找追加指令挂靠的那条用户消息时跳过提示', () => {

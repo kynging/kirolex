@@ -31,6 +31,7 @@ import hljs from 'highlight.js';
 import { isFeatureOn, useFeatureFlags } from '../hooks/useFeatureFlags';
 import { isKirolexNote } from '../../main/kirolexNote.ts';
 import { isConnectFailureNotice } from '../connectFailure.ts';
+import { draftAfterSessionSwap } from '../connectingSend.ts';
 import { adapterInstallOffer, engineLoginOffer } from '../adapterInstallOffer.ts';
 import { kiroLoginOffer } from '../kiroLoginView.ts';
 import { KiroLoginCard } from './KiroLoginCard';
@@ -2461,7 +2462,9 @@ const QueueStack = memo<{
   mergeQueued: boolean;
   /** 新建的会话引擎还没就绪：标题换成「排队中，<引擎> 就绪后自动发出」（引擎名） */
   waitingForEngine?: string;
-}>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued, waitingForEngine }) => {
+  /** 还在连（应用连后端 / 这条会话挂执行器）：标题换成「已排队，连上后发送」（connectingSend.ts） */
+  waitingForConnection?: boolean;
+}>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued, waitingForEngine, waitingForConnection }) => {
   const t = useT();
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = useState('');
@@ -2470,7 +2473,7 @@ const QueueStack = memo<{
     <div className="queue-row">
       <div className="queue-stack">
         <div className="queue-stack-header">
-          <span>{waitingForEngine ? t('Queued — sends automatically once {engine} is ready', { engine: waitingForEngine }) : t('Queued follow-ups')}</span>
+          <span>{waitingForEngine ? t('Queued — sends automatically once {engine} is ready', { engine: waitingForEngine }) : waitingForConnection ? t('Queued — sends once connected') : t('Queued follow-ups')}</span>
           {/* The merge setting CHANGES the meaning of this queue (one turn vs N
               turns), so it has to be visible right here — not only in Settings. */}
           <span
@@ -2786,7 +2789,8 @@ const ChatInputBox = memo<{
     if (previous === sessionId) return;
     stashComposerDraft(previous, inputRef.current);
     draftSessionRef.current = sessionId;
-    const restored = sessionId ? composerDrafts[sessionId] || '' : '';
+    /* 从「还没有 id」换到一个 id（新会话建好 / 连上）：已经打的字带过去，不清空（connectingSend.ts） */
+    const restored = draftAfterSessionSwap(previous, sessionId, inputRef.current, sessionId ? composerDrafts[sessionId] : undefined);
     inputRef.current = restored;
     setInput(restored);
   }, [sessionId]);
@@ -3217,7 +3221,8 @@ const ChatInputBox = memo<{
             className="composer-icon-btn"
             onClick={handleFilePick}
             title={t('Attach files')}
-            disabled={isLooping || status !== 'connected'}
+            /* 连接中也能加附件：Enter 先排队，附件跟着那一条走（connectingSend.ts） */
+            disabled={isLooping}
           >
             <IconPaperclip />
           </button>
@@ -3300,7 +3305,8 @@ const ChatInputBox = memo<{
             className="composer-icon-btn"
             onClick={handleQueue}
             title={t('Queue message ({key}+Enter)', { key: MOD_KEY })}
-            disabled={isLooping || status !== 'connected'}
+            /* 连接中也能排队：排着的等连上再发 */
+            disabled={isLooping}
           >
             <IconQueue />
           </button>
@@ -3347,7 +3353,8 @@ const ChatInputBox = memo<{
             onClick={handleActionClick}
             // Same reasoning as the queue button: empty content is a no-op, not a
             // reason to grey out. handleSend/handleQueue drop a truly empty message.
-            disabled={status !== 'connected'}
+            // 连接中也不灰：和 Enter 一样，先进这条会话的队列，连上后发（connectingSend.ts）
+            disabled={false}
             title={queueModifierHeld
               ? t('Add a new queued message ({key}+Enter)', { key: MOD_KEY })
               : isStreaming && !canSteer
@@ -4087,6 +4094,8 @@ interface ChatAreaProps {
   isStreaming: boolean;
   status: 'disconnected' | 'connecting' | 'connected';
   sessionConnected: boolean;
+  /** 这条会话还在连（connectingSend.ts 的 waitsForConnection）：排队卡片标题写「已排队，连上后发送」 */
+  waitingForConnection?: boolean;
   /** 所有「执行器挂着、不在连接中」的会话（不只这一格这条）—— 后台恢复的会话也要清掉它的切换失败 ✗ */
   readySessionIds?: readonly string[];
   connectionError: string | null;
@@ -4281,6 +4290,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   isStreaming,
   status,
   sessionConnected,
+  waitingForConnection = false,
   readySessionIds,
   connectionError,
   onDismissError,
@@ -6331,6 +6341,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           onMoveQueuedMessage={onMoveQueuedMessage}
           mergeQueued={mergeQueuedMessages}
           waitingForEngine={startup && startup.stage !== 'ready' ? engineDisplayName(startup.engine) : undefined}
+          waitingForConnection={waitingForConnection}
         />
       )}
 

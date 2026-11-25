@@ -121,7 +121,9 @@ describe('带附件的 steer 被吃掉后，附件跟着落盘', () => {
   });
 
   test('读记录时合并事件的附件并到这一轮的用户消息上（以前只并文字）', () => {
-    const raw = slice(STORE, 'function readTranscriptRaw', '\n}');
+    /* 逐行合并从 sessionStore 的 readTranscriptRaw 抽到了 transcriptParse.ts（同步 / 异步分片两条读法共用） */
+    assert.match(slice(STORE, 'function readTranscriptRaw', '\n}'), /parseTranscriptText\(/);
+    const raw = slice(read('main', 'transcriptParse.ts'), 'export function parseTranscriptLine', '\n}');
     assert.match(raw, /if \(message\.attachments\?\.length\) target\.attachments = \[\.\.\.\(target\.attachments \|\| \[\]\), \.\.\.message\.attachments\];/);
   });
 });

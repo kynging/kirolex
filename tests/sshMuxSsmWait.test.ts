@@ -12,7 +12,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import { SshMux, masterWaitMs, MASTER_WAIT_MS, SSM_MASTER_WAIT_MS } from '../src/main/sshMux.ts';
-import { execTimeoutFor, setSsmKeyRoot } from '../src/main/sshProxy.ts';
+import { execTimeoutFor, setSsmKeyRoot, prepareSsmKey } from '../src/main/sshProxy.ts';
 
 /* SSM 默认推临时公钥，会生成密钥 —— 放进临时目录，不碰真的 ~/.kirolex */
 setSsmKeyRoot(fs.mkdtempSync(path.join(os.tmpdir(), 'ssm-keys-')));
@@ -52,6 +52,8 @@ async function advance(ms: number): Promise<void> {
 }
 
 const SSM = { sshHost: 'ec2-user@i-0123456789abcdef0', connectVia: 'ssm' as const, ssmInstanceId: 'i-0123456789abcdef0', ssmRegion: 'ap-northeast-1' };
+/* 和真连接一样：起 ssh 之前先异步备好临时密钥（prepareSshFor / prepareSsmTunnel 做的就是这个；Windows 上收紧 ACL 是异步的），buildSshArgs 只读备好的那把 */
+await prepareSsmKey(SSM);
 const SSH = { sshHost: 'ec2-user@192.0.2.10' };
 
 afterEach(() => mock.timers.reset());

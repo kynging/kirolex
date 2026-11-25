@@ -90,8 +90,9 @@ describe('丢了要说出来', () => {
 describe('接线', () => {
   const MAIN = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
 
-  test('renderHistoryFile 走预算，而且丢了会记日志', () => {
-    const fn = MAIN.slice(MAIN.indexOf('function renderHistoryFile'));
+  /* 写 history.md 的那一段从同步的 renderHistoryFile 挪到了异步的 writeHistoryFromLines（快照和轮末刷新共用） */
+  test('writeHistoryFromLines 走预算，而且丢了会记日志', () => {
+    const fn = MAIN.slice(MAIN.indexOf('async function writeHistoryFromLines'));
     const body = fn.slice(0, fn.indexOf('} catch'));
     assert.match(body, /fitHistory\(/);
     assert.match(body, /historyTrimNote\(/);
@@ -100,8 +101,11 @@ describe('接线', () => {
 
   test('返回的 count 是**带上的**条数，不是总条数', () => {
     // 日志里那句 `messages=N` 是用来对账"模型拿到了多少"的，写总数就等于骗自己
-    const fn = MAIN.slice(MAIN.indexOf('function renderHistoryFile'));
+    const fn = MAIN.slice(MAIN.indexOf('async function writeHistoryFromLines'));
     assert.match(fn.slice(0, 2200), /count: fitted\.kept\.length/);
+    /* 轮末刷新和快照都经它写：不会有一条路自己另写一份不走预算的 */
+    assert.match(MAIN, /return await writeHistoryFromLines\(sessionId, lines\);/);
+    assert.match(MAIN, /heavyLane\(\(\) => writeHistoryFromLines\(sessionId, lines\)\)/);
   });
 });
 

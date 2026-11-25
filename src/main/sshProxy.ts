@@ -17,7 +17,7 @@
  * 跳板可以带端口：`ec2-user@1.2.3.4:2222`。
  */
 
-import { execFile, execFileSync } from 'child_process';
+import { execFile } from 'child_process';
 import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
@@ -25,6 +25,7 @@ import path from 'path';
 import type { RemoteTarget } from './config';
 import { tr, trConcat } from './uiText.ts';
 import { logger } from './logger.ts';
+import { lagPhases } from './mainLag.ts';
 
 /**
  * 包一层单引号给 `/bin/sh` —— `ProxyCommand` 的值是交给 shell 跑的，
@@ -468,20 +469,28 @@ export function generateEd25519(comment = 'kirolex-ssm'): { pem: string; pub: st
 export interface SsmKeyDeps {
   platform: NodeJS.Platform;
   env: NodeJS.ProcessEnv;
-  /** 同步跑一条命令，返回 stdout；失败就抛（`ensureSsmKey` 是同步的 —— `buildSshArgs` 是同步的）。 */
-  execFileSync: (file: string, args: string[]) => string;
+  /**
+   * 跑一条命令，返回 stdout；失败就 reject。**异步** ——「远程会话连接的前半段输入框没法输入」：
+   * 原来是 execFileSync（whoami / icacls，各最多 15 秒），连接路径上主进程整个停住，Windows 上窗口跟着不响应键盘。
+   */
+  execFile: (file: string, args: string[]) => Promise<string>;
   log: (message: string) => void;
 }
 const DEFAULT_KEY_DEPS: SsmKeyDeps = {
   platform: process.platform,
   env: process.env,
-  execFileSync: (file, args) => String(execFileSync(file, args, { encoding: 'utf8', windowsHide: true, timeout: 15_000 })),
+  execFile: (file, args) => new Promise((resolve, reject) => {
+    execFile(file, args, { encoding: 'utf8', windowsHide: true, timeout: 15_000 }, (err, stdout) => (err ? reject(err) : resolve(String(stdout || ''))));
+  }),
   log: (message) => logger.warn('remote', message),
 };
 let keyDeps: SsmKeyDeps = DEFAULT_KEY_DEPS;
 /** 已经收紧过 ACL 的私钥（这个进程里每把只做一次）。 */
 const aclTightened = new Set<string>();
 let userSidCache: string | undefined;
+/** 正在准备的（同一台机器同时只备一把）、上一次准备失败的原因（同步那条路照实报出去） */
+const keyInFlight = new Map<string, Promise<SsmKey>>();
+const keyFailure = new Map<string, Error>();
 
 /** 测试用：换掉平台 / 跑命令 / 写日志（不传 = 恢复默认）。 */
 export function setSsmKeyDeps(d?: Partial<SsmKeyDeps>): void {
@@ -489,6 +498,8 @@ export function setSsmKeyDeps(d?: Partial<SsmKeyDeps>): void {
   aclTightened.clear();
   userSidCache = undefined;
   keyCache.clear();
+  keyInFlight.clear();
+  keyFailure.clear();
 }
 
 function system32(name: string): string {
@@ -497,10 +508,10 @@ function system32(name: string): string {
 }
 
 /** `icacls` 里的"当前用户"：`*<SID>`，问不到 SID 时 `<域>\<用户名>`。 */
-function currentUserPrincipal(): string {
+async function currentUserPrincipal(): Promise<string> {
   if (!userSidCache) {
     try {
-      const out = keyDeps.execFileSync(system32('whoami.exe'), ['/user', '/fo', 'csv', '/nh']);
+      const out = await keyDeps.execFile(system32('whoami.exe'), ['/user', '/fo', 'csv', '/nh']);
       userSidCache = /S-1-5-[0-9-]+/.exec(out)?.[0];
     } catch { /* 退回用户名 */ }
   }
@@ -511,76 +522,144 @@ function currentUserPrincipal(): string {
 
 /**
  * 把一个文件的 ACL 收紧成"只有当前用户（+ SYSTEM、Administrators）完全控制、不继承"。
- * 非 win32 什么都不做（那边靠 0600）。失败就抛。
+ * 非 win32 什么都不做（那边靠 0600）。失败就 reject。
  */
-export function tightenKeyAcl(file: string): void {
+export async function tightenKeyAcl(file: string): Promise<void> {
   if (keyDeps.platform !== 'win32') return;
-  keyDeps.execFileSync(system32('icacls.exe'), [
+  await keyDeps.execFile(system32('icacls.exe'), [
     file, '/inheritance:r',
-    '/grant:r', `${currentUserPrincipal()}:F`, '*S-1-5-18:F', '*S-1-5-32-544:F',
+    '/grant:r', `${await currentUserPrincipal()}:F`, '*S-1-5-18:F', '*S-1-5-32-544:F',
   ]);
   aclTightened.add(file);
 }
 
-/** 写一把新私钥：win32 下先建空文件、收紧 ACL，再写内容。收紧失败就抛（调用方删掉它）。 */
-function writePrivateKey(file: string, pem: string): void {
+/** 写一把新私钥：win32 下先建空文件、收紧 ACL，再写内容。收紧失败就 reject（调用方删掉它）。 */
+async function writePrivateKey(file: string, pem: string): Promise<void> {
   if (keyDeps.platform !== 'win32') {
-    fs.writeFileSync(file, pem, { mode: 0o600 });
-    try { fs.chmodSync(file, 0o600); } catch { /* 只认只读位的文件系统 */ }
+    await fs.promises.writeFile(file, pem, { mode: 0o600 });
+    try { await fs.promises.chmod(file, 0o600); } catch { /* 只认只读位的文件系统 */ }
     return;
   }
-  fs.writeFileSync(file, '', { flag: 'wx' });
-  tightenKeyAcl(file);
+  await fs.promises.writeFile(file, '', { flag: 'wx' });
+  await tightenKeyAcl(file);
   /* `r+`：打开已有文件写入，不重建 —— ACL 保持刚收紧的样子 */
-  fs.writeFileSync(file, pem, { flag: 'r+' });
+  await fs.promises.writeFile(file, pem, { flag: 'r+' });
 }
 
+const exists = (p: string): Promise<boolean> => fs.promises.access(p).then(() => true, () => false);
+
 /**
- * 这台机器的临时密钥：12 小时内复用同一把，过期（或文件不见了）就换一把。
+ * 这台机器的临时密钥：12 小时内复用同一把，过期（或文件不见了）就换一把。**异步**，连 ssh 之前 await 它
+ * （`prepareSshFor`、主进程的 `prepareSsmTunnel`、预检、推公钥都先等它）；同步的 `ensureSsmKey` 之后只读这里备好的。
  *
  * 目录 0700、私钥 0600（ssh 对太宽的私钥权限直接拒用）；Windows 上 0600 无效，改用 ACL（见上面 `tightenKeyAcl`）——
  * 复用期内的旧私钥也先收紧一次（老版本写出来的那几把就是继承了宽 ACL 的），收紧失败就换一把新的并写日志。
  * **文件名带时间戳、换钥匙不覆盖旧文件**：一条连接的 ProxyCommand 推的公钥和它 `-i` 读的私钥必须是同一把，
  * 原地覆盖的话换钥匙那一瞬正在建的连接会对不上。旧文件过了两个周期再删。私钥内容不进日志、不进 config.json。
  */
-export function ensureSsmKey(remote: KeyFields, now = Date.now()): SsmKey {
+export function prepareSsmKey(remote: KeyFields, now = Date.now()): Promise<SsmKey> {
   const dir = ssmKeyDir(remote);
   const cached = keyCache.get(dir);
-  if (cached && now - cached.createdAt < SSM_KEY_TTL_MS && fs.existsSync(cached.privateKey)) return cached;
-  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  if (cached && now - cached.createdAt < SSM_KEY_TTL_MS && fs.existsSync(cached.privateKey)) return Promise.resolve(cached);
+  const running = keyInFlight.get(dir);
+  if (running) return running;
+  const job = lagPhases.run(`ensureSsmKey ${path.basename(dir)}`, () => prepareSsmKeyNow(dir, now)).then(
+    (key) => { keyFailure.delete(dir); return key; },
+    (err) => { keyFailure.set(dir, err instanceof Error ? err : new Error(String(err))); throw err; },
+  ).finally(() => { keyInFlight.delete(dir); });
+  keyInFlight.set(dir, job);
+  return job;
+}
+
+async function prepareSsmKeyNow(dir: string, now: number): Promise<SsmKey> {
+  await fs.promises.mkdir(dir, { recursive: true, mode: 0o700 });
   /* mkdir 的 mode 受 umask 影响、对已存在的目录不生效，所以再 chmod 一次 */
-  try { fs.chmodSync(ssmKeyRoot, 0o700); fs.chmodSync(dir, 0o700); } catch { /* Windows 上 chmod 只认只读位 */ }
+  try { await fs.promises.chmod(ssmKeyRoot, 0o700); await fs.promises.chmod(dir, 0o700); } catch { /* Windows 上 chmod 只认只读位 */ }
   let names: string[] = [];
-  try { names = fs.readdirSync(dir); } catch { /* 刚建的空目录 */ }
+  try { names = await fs.promises.readdir(dir); } catch { /* 刚建的空目录 */ }
   const stamps = names.map((n) => /^k-(\d+)$/.exec(n)).filter(Boolean).map((m) => Number(m![1])).sort((a, b) => b - a);
   /* 重启之后接着用盘上那把还没过期的 */
-  const fresh = stamps.find((t) => t <= now && now - t < SSM_KEY_TTL_MS && fs.existsSync(path.join(dir, `k-${t}.pub`)));
+  let fresh: number | undefined;
+  for (const t of stamps) {
+    if (t <= now && now - t < SSM_KEY_TTL_MS && await exists(path.join(dir, `k-${t}.pub`))) { fresh = t; break; }
+  }
   let key: SsmKey | undefined;
   if (fresh !== undefined) {
     const privateKey = path.join(dir, `k-${fresh}`);
     let usable = true;
     if (keyDeps.platform === 'win32' && !aclTightened.has(privateKey)) {
-      try { tightenKeyAcl(privateKey); } catch (err: any) {
+      try { await tightenKeyAcl(privateKey); } catch (err: any) {
         usable = false;
         keyDeps.log(`SSM 临时私钥 ${privateKey} 的权限收紧失败（${String(err?.message || err).trim().slice(0, 200)}）—— 换一把新的`);
       }
     }
-    if (usable) key = { privateKey, publicKey: fs.readFileSync(`${privateKey}.pub`, 'utf8').trim(), createdAt: fresh };
+    if (usable) key = { privateKey, publicKey: (await fs.promises.readFile(`${privateKey}.pub`, 'utf8')).trim(), createdAt: fresh };
   }
   if (!key) {
     const { pem, pub } = generateEd25519();
     /* 刚收紧失败换钥匙时，同一毫秒的文件名可能就是那把旧的 —— 往后挪到一个没人用的 */
     let at = now;
-    while (fs.existsSync(path.join(dir, `k-${at}`))) at += 1;
+    while (await exists(path.join(dir, `k-${at}`))) at += 1;
     const privateKey = path.join(dir, `k-${at}`);
     try {
-      writePrivateKey(privateKey, pem);
+      await writePrivateKey(privateKey, pem);
     } catch (err: any) {
       /* 新的也收紧不了：别留一把权限宽的私钥在盘上，照实报出去（ssh 反正会拒用它） */
-      try { fs.rmSync(privateKey, { force: true }); } catch { /* 删不掉也只能这样 */ }
+      try { await fs.promises.rm(privateKey, { force: true }); } catch { /* 删不掉也只能这样 */ }
       keyDeps.log(`SSM 临时私钥 ${privateKey} 的权限收紧失败：${String(err?.message || err).trim().slice(0, 200)}`);
       throw new Error(tr('Could not restrict the permissions of the temporary SSH key {file} ({err}).', { file: privateKey, err: String(err?.message || err).trim().slice(0, 200) }));
     }
+    await fs.promises.writeFile(`${privateKey}.pub`, `${pub}\n`, { mode: 0o600 });
+    key = { privateKey, publicKey: pub, createdAt: at };
+  }
+  for (const t of stamps) {
+    if (now - t >= 2 * SSM_KEY_TTL_MS) {
+      for (const f of [`k-${t}`, `k-${t}.pub`]) { try { await fs.promises.rm(path.join(dir, f), { force: true }); } catch { /* 删不掉下次再删 */ } }
+    }
+  }
+  keyCache.set(dir, key);
+  return key;
+}
+
+/**
+ * **同步**取这台机器的临时密钥（`buildSshArgs` 是同步的，二十几个调用点）。**不起任何子进程**：
+ *   - 备好的（`prepareSsmKey`）还新鲜 → 直接用；
+ *   - 非 win32：不需要收紧 ACL（靠 0600），就地备一把（几个小文件，没有子进程）；
+ *   - win32：收紧 ACL 要跑 icacls，只能异步 —— 后台开始备一把；手上有一把已经收紧过、只是过了复用期的（文件还在，
+ *     两个周期后才删）就先用它；一把都没有（连 ssh 之前没走 `prepareSshFor`）就抛：上一次备失败了报那个原因，否则说「还在准备」。
+ *     **不会**给出一把没收紧过的私钥。
+ */
+export function ensureSsmKey(remote: KeyFields, now = Date.now()): SsmKey {
+  const dir = ssmKeyDir(remote);
+  const cached = keyCache.get(dir);
+  if (cached && now - cached.createdAt < SSM_KEY_TTL_MS && fs.existsSync(cached.privateKey)) return cached;
+  if (keyDeps.platform !== 'win32') return ensureSsmKeyPosix(dir, now);
+  const failed = keyFailure.get(dir);
+  void prepareSsmKey(remote, now).catch(() => { /* 原因记在 keyFailure，下次同步取的时候报 */ });
+  if (cached && aclTightened.has(cached.privateKey) && fs.existsSync(cached.privateKey)) return cached;
+  if (failed) throw failed;
+  throw new Error(tr('The temporary SSH key for this machine is still being prepared. Try again in a moment.'));
+}
+
+/** 非 win32 的同步备钥匙（同 `prepareSsmKeyNow`，少了 ACL 那一步：这边靠 0600） */
+function ensureSsmKeyPosix(dir: string, now: number): SsmKey {
+  fs.mkdirSync(dir, { recursive: true, mode: 0o700 });
+  try { fs.chmodSync(ssmKeyRoot, 0o700); fs.chmodSync(dir, 0o700); } catch { /* 只认只读位的文件系统 */ }
+  let names: string[] = [];
+  try { names = fs.readdirSync(dir); } catch { /* 刚建的空目录 */ }
+  const stamps = names.map((n) => /^k-(\d+)$/.exec(n)).filter(Boolean).map((m) => Number(m![1])).sort((a, b) => b - a);
+  const fresh = stamps.find((t) => t <= now && now - t < SSM_KEY_TTL_MS && fs.existsSync(path.join(dir, `k-${t}.pub`)));
+  let key: SsmKey;
+  if (fresh !== undefined) {
+    const privateKey = path.join(dir, `k-${fresh}`);
+    key = { privateKey, publicKey: fs.readFileSync(`${privateKey}.pub`, 'utf8').trim(), createdAt: fresh };
+  } else {
+    const { pem, pub } = generateEd25519();
+    let at = now;
+    while (fs.existsSync(path.join(dir, `k-${at}`))) at += 1;
+    const privateKey = path.join(dir, `k-${at}`);
+    fs.writeFileSync(privateKey, pem, { mode: 0o600 });
+    try { fs.chmodSync(privateKey, 0o600); } catch { /* 只认只读位的文件系统 */ }
     fs.writeFileSync(`${privateKey}.pub`, `${pub}\n`, { mode: 0o600 });
     key = { privateKey, publicKey: pub, createdAt: at };
   }
@@ -743,6 +822,10 @@ export function setSshPrepareHook(fn?: (remote: RemoteTarget) => Promise<unknown
  * acp-client（connect / 断开时清理）、hostOps（诊断取证）、loopVerify（校验）都走它。
  */
 export function prepareSshFor(remote: RemoteTarget | undefined): Promise<void> {
-  if (!remote?.sshHost || !sshPrepareHook) return Promise.resolve();
-  return sshPrepareHook(remote).then(() => undefined, () => undefined);
+  if (!remote?.sshHost) return Promise.resolve();
+  /* 临时密钥先备好（异步，Windows 上要跑 icacls）—— 下面同步的 `buildSshArgs` → `ensureSsmKey` 只读备好的那把 */
+  const key = usesSsmTempKey(remote) ? prepareSsmKey(remote).then(() => undefined, () => undefined) : Promise.resolve();
+  if (!sshPrepareHook) return key;
+  const hook = sshPrepareHook;
+  return key.then(() => hook(remote)).then(() => undefined, () => undefined);
 }

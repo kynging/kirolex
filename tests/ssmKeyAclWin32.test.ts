@@ -12,7 +12,7 @@ import { spawnSync } from 'node:child_process';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { setSsmKeyRoot, setSsmKeyDeps, ensureSsmKey, tightenKeyAcl } from '../src/main/sshProxy.ts';
+import { setSsmKeyRoot, setSsmKeyDeps, ensureSsmKey, prepareSsmKey, tightenKeyAcl } from '../src/main/sshProxy.ts';
 import { judgePreflight, ssmPreflight } from '../src/main/remotePreflight.ts';
 import { setUiLang } from '../src/main/uiText.ts';
 
@@ -29,14 +29,14 @@ function freshRoot(): string {
   return root;
 }
 
-/** 记下每一次 execFileSync；`icacls` 那一次顺手记下当时私钥文件有多大（必须是 0：内容还没写）。 */
+/** 记下每一次 execFile（异步，不再是 execFileSync —— 见 sshProxy `SsmKeyDeps.execFile`）；`icacls` 那一次顺手记下当时私钥文件有多大（必须是 0：内容还没写）。 */
 function stub(opts: { failIcacls?: (file: string) => boolean; failWhoami?: boolean } = {}) {
   const calls: { file: string; args: string[]; sizeAtCall?: number }[] = [];
   const logs: string[] = [];
   setSsmKeyDeps({
     platform: 'win32',
     env: WIN_ENV,
-    execFileSync: (file, args) => {
+    execFile: async (file, args) => {
       const c: { file: string; args: string[]; sizeAtCall?: number } = { file, args };
       calls.push(c);
       if (/whoami\.exe$/.test(file)) {
@@ -56,10 +56,10 @@ function stub(opts: { failIcacls?: (file: string) => boolean; failWhoami?: boole
 
 test.afterEach(() => setSsmKeyDeps());
 
-test('win32：新私钥先建空文件、icacls 去继承只给当前用户 SID / SYSTEM / Administrators，再写内容', () => {
+test('win32：新私钥先建空文件、icacls 去继承只给当前用户 SID / SYSTEM / Administrators，再写内容', async () => {
   freshRoot();
   const s = stub();
-  const k = ensureSsmKey(SSM);
+  const k = await prepareSsmKey(SSM);
   const [ic] = s.icacls();
   assert.ok(ic, '调了 icacls');
   assert.equal(ic.file, 'C:\\Windows\\System32\\icacls.exe', '%SystemRoot% 下的绝对路径');
@@ -67,44 +67,46 @@ test('win32：新私钥先建空文件、icacls 去继承只给当前用户 SID 
   assert.equal(ic.sizeAtCall, 0, '收紧 ACL 时私钥还是空的 —— 没有"内容已写、ACL 还宽"的窗口');
   assert.match(fs.readFileSync(k.privateKey, 'utf8'), /^-----BEGIN OPENSSH PRIVATE KEY-----/);
   assert.equal(s.calls.find((c) => /whoami\.exe$/.test(c.file))?.file, 'C:\\Windows\\System32\\whoami.exe');
-  /* 同一把再要一次：不重复收紧 */
-  ensureSsmKey(SSM);
+  /* 同一把再要一次（异步、同步各一次）：不重复收紧，同步那次拿到的就是备好的那把 */
+  await prepareSsmKey(SSM);
+  assert.equal(ensureSsmKey(SSM).privateKey, k.privateKey);
   assert.equal(s.icacls().length, 1);
 });
 
-test('win32：问不到 SID 时退回 %USERDOMAIN%\\%USERNAME%', () => {
+test('win32：问不到 SID 时退回 %USERDOMAIN%\\%USERNAME%', async () => {
   freshRoot();
   const s = stub({ failWhoami: true });
-  ensureSsmKey(SSM);
+  await prepareSsmKey(SSM);
   assert.equal(s.icacls()[0].args[3], 'KYN-DESKTOP\\kyn06:F');
 });
 
-test('非 win32：不调 icacls / whoami', () => {
+test('非 win32：不调 icacls / whoami', async () => {
   freshRoot();
   const calls: string[] = [];
-  setSsmKeyDeps({ platform: 'linux', execFileSync: (f) => { calls.push(f); return ''; } });
+  setSsmKeyDeps({ platform: 'linux', execFile: async (f) => { calls.push(f); return ''; } });
   ensureSsmKey(SSM);
+  await prepareSsmKey(SSM);
   assert.deepEqual(calls, []);
-  assert.doesNotThrow(() => tightenKeyAcl('/nowhere'));
+  await assert.doesNotReject(() => tightenKeyAcl('/nowhere'));
   assert.deepEqual(calls, []);
 });
 
-test('win32：复用期内的旧私钥（老版本写的，ACL 是继承来的）也先收紧一次', () => {
+test('win32：复用期内的旧私钥（老版本写的，ACL 是继承来的）也先收紧一次', async () => {
   freshRoot();
   setSsmKeyDeps({ platform: 'linux' });
   const old = ensureSsmKey(SSM);
   const s = stub();   // 模拟升级后重启：缓存清空，换成 win32
-  const k = ensureSsmKey(SSM);
+  const k = await prepareSsmKey(SSM);
   assert.equal(k.privateKey, old.privateKey, '还是复用那一把');
   assert.deepEqual(s.icacls().map((c) => c.args[0]), [old.privateKey]);
 });
 
-test('win32：旧私钥收紧失败 → 换一把新的、新的也收紧，并写日志', () => {
+test('win32：旧私钥收紧失败 → 换一把新的、新的也收紧，并写日志', async () => {
   freshRoot();
   setSsmKeyDeps({ platform: 'linux' });
   const old = ensureSsmKey(SSM);
   const s = stub({ failIcacls: (f) => f === old.privateKey });
-  const k = ensureSsmKey(SSM);
+  const k = await prepareSsmKey(SSM);
   assert.notEqual(k.privateKey, old.privateKey);
   assert.notEqual(k.publicKey, old.publicKey);
   assert.deepEqual(s.icacls().map((c) => c.args[0]), [old.privateKey, k.privateKey]);
@@ -113,18 +115,44 @@ test('win32：旧私钥收紧失败 → 换一把新的、新的也收紧，并�
   assert.doesNotMatch(s.logs.join('\n'), /PRIVATE KEY/, '日志里没有私钥内容');
 });
 
-test('win32：新私钥也收紧不了 → 删掉它、抛出说人话的错误，不留一把权限宽的私钥', () => {
+test('win32：新私钥也收紧不了 → 删掉它、抛出说人话的错误，不留一把权限宽的私钥', async () => {
   const root = freshRoot();
   const s = stub({ failIcacls: () => true });
-  assert.throws(() => ensureSsmKey(SSM), /Could not restrict the permissions of the temporary SSH key/);
+  await assert.rejects(() => prepareSsmKey(SSM), /Could not restrict the permissions of the temporary SSH key/);
   assert.deepEqual(fs.readdirSync(path.join(root, 'aws-tokyo-4')), []);
   assert.equal(s.logs.length, 1);
+  /* 同步那条路（buildSshArgs）照实报同一个原因，也不给出私钥 */
+  assert.throws(() => ensureSsmKey(SSM), /Could not restrict the permissions of the temporary SSH key/);
+  /* 同步取那一下在后台又开始备一把：等它结束（照样失败、照样删掉），别漏到下一个测试 */
+  await assert.rejects(() => prepareSsmKey(SSM), /Could not restrict/);
+  assert.deepEqual(fs.readdirSync(path.join(root, 'aws-tokyo-4')), []);
 });
 
-test('本机实跑 icacls：收紧后没有继承来的 ACE，只剩自己 / SYSTEM / Administrators', { skip: process.platform !== 'win32' && '只有 Windows 有 icacls' }, () => {
+test('win32：没备过就同步取（连 ssh 之前没 await prepareSsmKey）→ 不跑子进程、不给没收紧的私钥，说「还在准备」；后台备好之后同步取得到', async () => {
+  freshRoot();
+  const s = stub();
+  assert.throws(() => ensureSsmKey(SSM), /still being prepared/);
+  const k = await prepareSsmKey(SSM);   // 和后台那次是同一个任务
+  assert.equal(s.icacls().length, 1, '只收紧了一次（并发去重）');
+  assert.equal(ensureSsmKey(SSM).privateKey, k.privateKey);
+});
+
+test('win32：过了复用期、缓存里那把已经收紧过 → 同步取先用它（不抛），后台换新的', async () => {
+  freshRoot();
+  const s = stub();
+  const t0 = Date.now();
+  const k = await prepareSsmKey(SSM, t0);
+  const later = t0 + 12 * 60 * 60_000 + 1;
+  assert.equal(ensureSsmKey(SSM, later).privateKey, k.privateKey);
+  const next = await prepareSsmKey(SSM, later);
+  assert.notEqual(next.privateKey, k.privateKey);
+  assert.equal(s.icacls().length, 2);
+});
+
+test('本机实跑 icacls：收紧后没有继承来的 ACE，只剩自己 / SYSTEM / Administrators', { skip: process.platform !== 'win32' && '只有 Windows 有 icacls' }, async () => {
   freshRoot();
   setSsmKeyDeps();
-  const k = ensureSsmKey(SSM);
+  const k = await prepareSsmKey(SSM);
   const out = spawnSync(`${process.env.SystemRoot || 'C:\\Windows'}\\System32\\icacls.exe`, [k.privateKey], { encoding: 'utf8' }).stdout;
   const sid = /S-1-5-[0-9-]+/.exec(spawnSync(`${process.env.SystemRoot || 'C:\\Windows'}\\System32\\whoami.exe`, ['/user', '/fo', 'csv', '/nh'], { encoding: 'utf8' }).stdout)![0];
   assert.doesNotMatch(out, /\(I\)/, `没有继承的：${out}`);

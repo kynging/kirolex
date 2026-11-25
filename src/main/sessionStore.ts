@@ -6,7 +6,8 @@ import { tr } from './uiText.ts';
 import { isAdvancedOnly, isAdvancedOnlyProject } from './advancedOnly.ts';
 import { projectDirName } from './projectStore.ts';
 import { logger } from './logger.ts';
-import { isKirolexNote } from './kirolexNote.ts';
+import { lagPhases, yieldToLoop } from './mainLag.ts';
+import { parseTranscriptText, parseTranscriptTextChunked } from './transcriptParse.ts';
 import { carryReplyMarks, completedReplyInText, messageIdStatusInText, type MessageIdStatus } from './promptDedupe.ts';
 import { carryBackendAnchors, remapAnchorsToFork } from './editFork.ts';
 import type { QuestionCard } from './elicitation.ts';
@@ -323,6 +324,21 @@ export function writeHistoryFile(id: string, text: string): string {
   const tmp = `${target}.tmp`;
   fs.writeFileSync(tmp, text, 'utf-8');
   fs.renameSync(tmp, target);
+  return target;
+}
+/** 同 `writeHistoryFile`，异步（MB 级的 history.md 不卡主进程）。临时文件名各自独立，不和同步那条撞同一个 `.tmp`。 */
+export async function writeHistoryFileAsync(id: string, text: string): Promise<string> {
+  refuseAdvancedOnlyWrite(id);
+  const target = historyFilePath(id);
+  ensureDir(id);
+  const tmp = `${target}.${process.pid}-${Math.random().toString(36).slice(2, 8)}.tmp`;
+  try {
+    await fs.promises.writeFile(tmp, text, 'utf-8');
+    await fs.promises.rename(tmp, target);
+  } catch (err) {
+    try { await fs.promises.rm(tmp, { force: true }); } catch { /* 下次启动的 .tmp 清扫会收 */ }
+    throw err;
+  }
   return target;
 }
 
@@ -793,41 +809,33 @@ export function completedReplyOnDisk(id: string, messageId: string): string | nu
  * 没有 `ts` 的行留着（不确定就不隐藏你的记录）。`opts.raw` 给真要全量的调用方（例如粘贴文件的引用清扫）。
  */
 export function readTranscript(id: string, opts?: { raw?: boolean }): StoredMessage[] {
-  const all = readTranscriptRaw(id);
+  return afterClearedAt(id, readTranscriptRaw(id), opts);
+}
+
+function afterClearedAt(id: string, all: StoredMessage[], opts?: { raw?: boolean }): StoredMessage[] {
   if (opts?.raw) return all;
   const at = Number(readRecord(id)?.clearedAt);
   if (!Number.isFinite(at) || at <= 0) return all;
   return all.filter((m) => !Number.isFinite(Number((m as any).ts)) || Number((m as any).ts) > at);
 }
 
+/**
+ * 同 `readTranscript`，但**不卡主进程** ——「远程会话连接的前半段输入框没法输入」：transcript.jsonl 实测 2–4.5 MB，
+ * 同步整读 + 逐行 JSON.parse 在 attach / hydrate 时叠加（一次 attach 8 条），主进程停住、Windows 上窗口不响应键盘。
+ * 这里 `fs.promises` 读、分片解析（`transcriptParse.ts`），每片之后让出事件循环。结果和 `readTranscript` 完全一样。
+ */
+export async function readTranscriptAsync(id: string, opts?: { raw?: boolean }): Promise<StoredMessage[]> {
+  return lagPhases.run(`transcript read ${id}`, async () => {
+    let raw: string;
+    try { raw = await fs.promises.readFile(transcriptPath(id), 'utf-8'); } catch { return []; }
+    return afterClearedAt(id, await parseTranscriptTextChunked(raw, { yieldFn: yieldToLoop }), opts);
+  });
+}
+
 /** Read the full transcript (tolerant of unknown fields + partial last line). */
 function readTranscriptRaw(id: string): StoredMessage[] {
   try {
-    const raw = fs.readFileSync(transcriptPath(id), 'utf-8');
-    const out: StoredMessage[] = [];
-    for (const line of raw.split('\n')) {
-      const t = line.trim();
-      if (!t) continue;
-      try {
-        const message = JSON.parse(t) as StoredMessage;
-        if (message.mergeIntoMessageId) {
-          const target = out.find((candidate) => candidate.id === message.mergeIntoMessageId);
-          /* 目标是 KiroLex 的提示（也是 role:'user'）就不并：追加指令单独留一条，文字不丢 */
-          if (target?.role === 'user' && !isKirolexNote(target)) {
-            if (message.content) target.content = `${target.content}
-${message.content}`;
-            // 带附件的 steer：附件并到这一轮那条用户消息上（气泡里本来就是这么显示的）
-            if (message.attachments?.length) target.attachments = [...(target.attachments || []), ...message.attachments];
-            /* 记下这一段从哪开始 —— 界面按它把追加指令拆回独立的几条显示（content 照旧是合并后的）。
-               只有附件、没有文字的那段没有接进 content，也就不记边界（否则拆分对不上） */
-            if (message.content) (target.steerParts ||= []).push({ id: message.id, content: message.content, ts: message.ts });
-            continue;
-          }
-        }
-        out.push(message);
-      } catch { /* skip a torn final line */ }
-    }
-    return out;
+    return parseTranscriptText(fs.readFileSync(transcriptPath(id), 'utf-8'));
   } catch {
     return [];
   }

@@ -14,7 +14,7 @@ import os from 'node:os';
 import path from 'node:path';
 import {
   setSsmKeyRoot, setProxyFlavorOverride, sshFlavor, winProxyCommand, winCmdPath, ssmProxyCommand, transportArgs,
-  findLocalTool, ensureSsmKey, pluginDirIfOffPath, localToolSpawn, runLocalTool,
+  findLocalTool, ensureSsmKey, prepareSsmKey, pluginDirIfOffPath, localToolSpawn, runLocalTool,
 } from '../src/main/sshProxy.ts';
 import { buildSshArgs } from '../src/main/acp-client.ts';
 import { ssmPreflight } from '../src/main/remotePreflight.ts';
@@ -83,8 +83,18 @@ test('ssmProxyCommand（win32，不推临时公钥）：带 / 不带 profile', (
   assert.throws(() => ssmProxyCommand({ ...SSM, ssmRegion: 'x&calc' }, { aws: AWS, flavor: 'win32' }), '白名单照旧');
 });
 
-test('transportArgs（win32，临时公钥）：先推公钥（file://<pub>），>NUL，&& 再 start-session；没有 exec / 9> / env / 单引号', () => {
+test('transportArgs（win32，临时公钥）：先推公钥（file://<pub>），>NUL，&& 再 start-session；没有 exec / 9> / env / 单引号', async () => {
+  /* 和真连接一样：起 ssh 之前先备好临时密钥（prepareSshFor），Windows 上收紧 ACL 是异步的 */
+  await prepareSsmKey(SSM);
   setProxyFlavorOverride('win32');
+  /*
+    这条断言的是「plugin 在 PATH 上（或没装）」时的命令形状。跑测试的这台机器要是装了 session-manager-plugin 却不在 PATH 上，
+    命令前面会多一段 `set "PATH=<plugin 目录>;%PATH%"`（那一支由下面 pluginDirIfOffPath / ssmProxyCommand 那条测试单独守着）——
+    这里先把那个目录临时放进 PATH，按原样断言，结束后还原。
+  */
+  const savedPath = process.env.PATH;
+  const offPathPluginDir = pluginDirIfOffPath();
+  if (offPathPluginDir) process.env.PATH = `${offPathPluginDir};${savedPath || ''}`;
   try {
     const args = transportArgs(SSM);
     const proxy = proxyOf(args);
@@ -110,6 +120,7 @@ test('transportArgs（win32，临时公钥）：先推公钥（file://<pub>）�
     assert.ok(proxyOf(buildSshArgs(SSM as any, 'true')).includes('/d /s /c "'));
   } finally {
     setProxyFlavorOverride();
+    if (offPathPluginDir) process.env.PATH = savedPath;
   }
 });
 
@@ -133,7 +144,8 @@ test('session-manager-plugin 不在 PATH 上（win32）：用 set "PATH=…;%PAT
  * 要看的是 CreateProcessW 起得来、两步按顺序跑、推送失败时不 start-session。
  */
 const WIN_SSH = 'C:\\Windows\\System32\\OpenSSH\\ssh.exe';
-test('Win32-OpenSSH 实跑：先推公钥再 start-session；推送失败就不连', { skip: !(process.platform === 'win32' && fs.existsSync(WIN_SSH)) && '需要 Windows 自带的 OpenSSH' }, () => {
+test('Win32-OpenSSH 实跑：先推公钥再 start-session；推送失败就不连', { skip: !(process.platform === 'win32' && fs.existsSync(WIN_SSH)) && '需要 Windows 自带的 OpenSSH' }, async () => {
+  await prepareSsmKey(SSM);
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'fake aws 100%x%-'));
   const log = path.join(bin, 'calls.log');
   fs.writeFileSync(path.join(bin, 'aws.cmd'), [

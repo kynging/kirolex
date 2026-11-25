@@ -14,6 +14,7 @@ import { autoFoldPanels, filePanelMax } from './panelFit';
 import { endedElsewhereSummary, schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
 import { bannerBgJobs, type BgJobRow } from './bgJobsView';
 import { startupBlocksSend } from './createStages';
+import { queueUntilConnected, queueableMessage, waitsForConnection, type ConnectingFacts } from './connectingSend.ts';
 // 给主会话的交底 —— 它原本对流程一无所知，连执行会话都不知道
 import { consumeHandoff } from './handoffDraft';
 // 哪几步共用一条会话 —— 和画布同源（草稿声明的泳道），驱动器不再各算一套
@@ -3294,6 +3295,13 @@ const App: React.FC = () => {
 
   focusSessionRef.current = focusSession;
 
+  /** 这条会话此刻「还在连」的那几样事实（connectingSend.ts）：Enter 先排队、排空先等，用的是同一组 */
+  const connectingFactsFor = (sid: string): ConnectingFacts => ({
+    appStatus: status,
+    sessionConnecting: connectingSessionIds.includes(sid),
+    startupPending: startupBlocksSend(createStages[sid]),
+  });
+
   const handleSendMessage = useCallback(async (text: string, pastes?: PastedBlock[], paneSid?: string) => {
     const sid = paneSid || currentSessionId;
     // A loop OWNS its session: it is already resending on a timer, so anything else
@@ -3326,6 +3334,15 @@ const App: React.FC = () => {
       // Via ref: handleQueueMessage is declared BELOW this callback, and a
       // later-declared const in a dependency array is evaluated during render and
       // would hit TDZ, crashing the whole tree.
+      queueMessageRef.current?.(text, pastes, sid);
+      return;
+    }
+    /*
+      **连接中按 Enter = 先进这条会话的队列，连上后自动发出** ——「远程会话连接的前半段输入框没法输入」。
+      应用还在连后端 / 这条会话还在挂执行器：不把消息直接扔进还没连上的会话，排着；下面排空队列那一段等连上再发
+      （输入框上方显示「已排队，连上后发送」，卡片上可取消）。斜杠命令和「这一轮在跑」不在这里截（connectingSend.ts）。
+    */
+    if (sid && queueUntilConnected({ ...connectingFactsFor(sid), text, busy: busyBySession[sid] })) {
       queueMessageRef.current?.(text, pastes, sid);
       return;
     }
@@ -3418,7 +3435,7 @@ const App: React.FC = () => {
       // focused -- see its own comment on why that is wrong in split view.
       sid || undefined,
     );
-  }, [attachedFor, clearAttachments, focusSession, sendMessage, currentSessionId, forceStop, selectedModel, discardUnconsumedSteers, clearConversation, busyBySession, createStages, loopingIds, streamingIds, cancelAutoResend]);
+  }, [attachedFor, clearAttachments, focusSession, sendMessage, currentSessionId, forceStop, selectedModel, discardUnconsumedSteers, clearConversation, busyBySession, createStages, loopingIds, streamingIds, cancelAutoResend, status, connectingSessionIds]);
 
   // Explicit user Stop (composer stop button). Discard this session's un-consumed
   // steers FIRST so the turn-end reconcile finds nothing to re-queue (no phantom
@@ -3882,7 +3899,10 @@ const App: React.FC = () => {
   const handleQueueMessage = useCallback((text: string, pastes?: PastedBlock[], paneSid?: string, ctl?: ControlSendCtx) => {
     const content = text.trim();
     const sessionId = paneSid || currentSessionId;
-    if (!content || !sessionId) return;
+    if (!sessionId) return;
+    /* 只有附件、没有文字也是一条消息（和输入框 / 直接发送同一条规则）：连接中按 Enter 排进来的就常是这种 —— 不能丢。
+       控制入口发来的不带走输入框里的附件，所以它没文字就是空的 */
+    if (!queueableMessage(content, ctl ? 0 : attachedFor(sessionId).length)) return;
     if (loopingIds.includes(sessionId)) return;   // loop owns the session
     const item: QueuedMessage = {
       id: ctl ? controlMessageId('queue', undefined, ctl.origin) : `queue_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`,
@@ -4063,6 +4083,8 @@ const App: React.FC = () => {
         isBackendOccupied(busyBySession[sessionId]) ||
         /* 新建的会话还没就绪（或启动失败）：就绪后自动发；失败了等你点「重试 / 改成本机运行」 */
         startupBlocksSend(createStages[sessionId]) ||
+        /* 还在连（应用连后端 / 这条会话挂执行器）：连上再发（connectingSend.ts，和 Enter 先排队同一个判据） */
+        waitsForConnection(connectingFactsFor(sessionId)) ||
         // A loop owns its session, and it is idle BETWEEN iterations — exactly when
         // this drain would fire and slip a queued message between two loop turns.
         loopingIds.includes(sessionId) ||
@@ -4161,6 +4183,8 @@ const App: React.FC = () => {
     busyBySession,
     createStages,
     createStagesLoaded,
+    status,
+    connectingSessionIds,
     settings.mergeQueuedMessages,
     sendQueuedMessage,
     currentSessionId,
@@ -4445,6 +4469,7 @@ const App: React.FC = () => {
         isStreaming={!!sid && composerRunning(streamingIds.includes(sid), busyBySession[sid])}
         status={status}
         sessionConnected={!!sid && attachedSessionIds.includes(sid) && !connectingSessionIds.includes(sid)}
+        waitingForConnection={!!sid && waitsForConnection(connectingFactsFor(sid))}
         readySessionIds={readySessionIds}
         // Per CHAT, not per focus. Previously this was one app-wide string shown only
         // in the focused pane, so a failure in chat A appeared over chat B once focus

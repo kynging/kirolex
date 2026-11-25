@@ -510,6 +510,7 @@ export const ZH_CHAT: Record<string, string> = {
   'Run on this machine instead': '改成本机运行',
   'Create this chat again on this machine instead of the remote one': '不用远端了，在本机重新建这条会话',
   'Queued — sends automatically once {engine} is ready': '排队中，{engine} 引擎就绪后自动发出',
+  'Queued — sends once connected': '已排队，连上后发送',
   'Busy: starting the engine; messages queue until it is ready': '占用中：正在启动引擎，消息先排队、就绪后自动发出',
   "Identity": "身份",
   "Missing": "缺的权限",

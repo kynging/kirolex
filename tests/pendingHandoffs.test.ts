@@ -333,7 +333,8 @@ describe('确认失败 → 放回的那条从队列发出去了 → 重启不再
     const persist = M.indexOf('...(fromHandoffIds.length ? { fromHandoff: fromHandoffIds } : {}),');
     const drop = M.indexOf('for (const hid of fromHandoffIds) { try { removePendingHandoff(store.sessionDirPath(sessionId), hid); }', persist);
     assert.ok(persist > 0 && drop > persist, '先落盘 transcript，再摘记录');
-    assert.ok(M.includes('const known = handoffFacts(store.readTranscript(id, { raw: true }) || []);'));
+    /* 窗口起来时的恢复改成异步分片读 transcript（hydrate 路径上不同步整读），判据照旧是 handoffFacts */
+    assert.ok(M.includes('const known = handoffFacts(await store.readTranscriptAsync(id, { raw: true }) || []);'));
   });
 });
 

@@ -12,28 +12,40 @@ export type AdapterNoteHow = 'note' | 'status';
 export function createAdapterNotes(deps: {
   /** 这条会话的记录落盘了没有 */
   hasRecord: (sid: string) => boolean;
-  /** 真正说出去；返回 false = 没说成（下次再说） */
-  emit: (sid: string, how: AdapterNoteHow, text: string, group: string) => boolean;
+  /**
+   * 真正说出去；返回 false = 没说成（下次再说）。可以返回 Promise ——「进记录的那句」要先读 transcript 去重，
+   * 那一步是异步的（attach 路径上不同步整读 MB 级 transcript）；等它的这段时间里同一件事不会再说第二遍（`pending`）。
+   */
+  emit: (sid: string, how: AdapterNoteHow, text: string, group: string) => boolean | Promise<boolean>;
   /** 撤掉这条会话 group 以 `prefix` 开头的钉住提示 */
   unpin: (sid: string, prefix: string) => void;
 }) {
   const said = new Set<string>();
+  /** 正在说（emit 返回了还没落定的 Promise）的那几件 */
+  const pending = new Set<string>();
   const staged = new Map<string, Array<{ how: AdapterNoteHow; text: string; group: string }>>();
+  const emitOnce = (sid: string, how: AdapterNoteHow, text: string, group: string): void => {
+    const key = `${sid}|${group}`;
+    const r = deps.emit(sid, how, text, group);
+    if (typeof r === 'boolean') { if (r) said.add(key); return; }
+    pending.add(key);
+    r.then((ok) => { if (ok) said.add(key); }, () => { /* 没说成：下次再说 */ }).finally(() => pending.delete(key));
+  };
   return {
     say(sid: string, how: AdapterNoteHow, text: string, group: string): void {
       const key = `${sid}|${group}`;
-      if (said.has(key)) return;
+      if (said.has(key) || pending.has(key)) return;
       if (!deps.hasRecord(sid)) {
         const list = (staged.get(sid) || []).filter((x) => x.group !== group);
         staged.set(sid, [...list, { how, text, group }]);
         return;
       }
-      if (deps.emit(sid, how, text, group)) said.add(key);
+      emitOnce(sid, how, text, group);
     },
     commit(sid: string): void {
       const list = staged.get(sid) || [];
       staged.delete(sid);
-      for (const x of list) if (deps.emit(sid, x.how, x.text, x.group)) said.add(`${sid}|${x.group}`);
+      for (const x of list) if (!pending.has(`${sid}|${x.group}`)) emitOnce(sid, x.how, x.text, x.group);
     },
     forgetPinned(sid: string): void {
       const mine = `${sid}|${ADAPTER_HIDDEN_PREFIX}`;

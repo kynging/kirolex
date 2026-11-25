@@ -7,7 +7,7 @@ import test from 'node:test';
 import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
-import { ssmProxyCommand, transportArgs, findLocalTool, ssmFieldError, setSsmKeyRoot, setProxyFlavorOverride } from '../src/main/sshProxy.ts';
+import { ssmProxyCommand, transportArgs, findLocalTool, ssmFieldError, setSsmKeyRoot, setProxyFlavorOverride, prepareSsmKey } from '../src/main/sshProxy.ts';
 import { buildSshArgs } from '../src/main/acp-client.ts';
 import { masterArgs } from '../src/main/sshMux.ts';
 import { validateTarget, saveRemoteTarget, parseRemoteTargets } from '../src/main/remoteTargets.ts';
@@ -27,6 +27,8 @@ const SSM = {
   ssmInstanceId: 'i-0123456789abcdef0',
   ssmRegion: 'ap-northeast-1',
 };
+/* 和真连接一样：起 ssh 之前先异步备好临时密钥（prepareSshFor / prepareSsmTunnel 做的就是这个；Windows 上收紧 ACL 是异步的），buildSshArgs 只读备好的那把 */
+await prepareSsmKey(SSM);
 
 test('ssmProxyCommand：不带 profile', () => {
   assert.equal(

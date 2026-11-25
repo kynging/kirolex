@@ -650,7 +650,8 @@ describe('远程会话要告诉模型它在哪台机器上', () => {
       `{ remote }`（远程会话的 memory 文件在用户机器上，只有 `local_write` 到得了），
       写死实参会让这条在加参数时假失败 —— 而它要守的是**顺序**，跟实参无关。
     */
-    const memAt = M.indexOf('buildMemoryInjection(effectiveProjectId, sessionId');
+    /* memory 块现在在忙闸之前异步读好（buildMemoryInjectionAsync），插进 prompt 的位置是这里 */
+    const memAt = M.indexOf('memoryBlockFor(memoryPrefetch, effectiveProjectId');
     assert.ok(memAt > 0, '找不到 memory 注入的调用');
     assert.ok(
       M.indexOf('const rc = remoteContextFor(sessionId, entry);') < memAt,

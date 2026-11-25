@@ -17,7 +17,7 @@ import path from 'node:path';
 import {
   normalizeKiroLoginChoice, kiroLoginArgs, remoteKiroLoginCommand, withTty, kiroLoginDefaults, readKiroLoginChoices,
 } from '../src/main/kiroLogin.ts';
-import { setSsmKeyRoot, setProxyFlavorOverride } from '../src/main/sshProxy.ts';
+import { setSsmKeyRoot, setProxyFlavorOverride, prepareSsmKey } from '../src/main/sshProxy.ts';
 import { buildSshArgs } from '../src/main/acp-client.ts';
 import { judgePreflight } from '../src/main/remotePreflight.ts';
 import { setUiLang } from '../src/main/uiText.ts';
@@ -36,6 +36,8 @@ const SSM = {
   ssmInstanceId: 'i-03b396ce3b8546b90',
   ssmRegion: 'ap-northeast-1',
 };
+/* 和真连接一样：起 ssh 之前先异步备好临时密钥（prepareSshFor / prepareSsmTunnel 做的就是这个；Windows 上收紧 ACL 是异步的），buildSshArgs 只读备好的那把 */
+await prepareSsmKey(SSM);
 
 describe('登录参数', () => {
   test('free / pro；pro 带 start URL / 区；远端一定带 --use-device-flow', () => {

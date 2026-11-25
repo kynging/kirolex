@@ -106,6 +106,9 @@ while ($true) {
 }
 `;
 
+/** 辅助进程脚本的文件名（按内容哈希：脚本一改就是新文件）。 */
+const PS_NAME = `winjob-${createHash('sha256').update(PS).digest('hex').slice(0, 16)}.ps1`;
+
 /** 进程归属的接口（bgJobs 用）：放进作业 / 结束作业 / 退出时全部结束。 */
 export interface JobHost {
   /** 把 pid 放进一个新作业。false = 没放进去（调用方退回「只结束自己握着句柄的那个进程」）。 */
@@ -147,6 +150,25 @@ export class WinJobHost implements JobHost {
     void this.ensure();
   }
 
+  /** 辅助进程的脚本文件（按内容哈希命名，写一次）；写不了返回 null（调用方退回 `-EncodedCommand`）。 */
+  private scriptFile(): string | null {
+    try {
+      const dir = this.cacheDir || os.tmpdir();
+      fs.mkdirSync(dir, { recursive: true });
+      const file = path.join(dir, PS_NAME);
+      if (!fs.existsSync(file)) {
+        /* 带 BOM：Windows PowerShell 5.1 按 BOM 认 UTF-8 */
+        const tmp = `${file}.${process.pid}.tmp`;
+        fs.writeFileSync(tmp, `\uFEFF${PS}`, 'utf8');
+        try { fs.renameSync(tmp, file); } catch { try { fs.rmSync(tmp, { force: true }); } catch { /* 下次再清 */ } }
+      }
+      return fs.existsSync(file) ? file : null;
+    } catch (err: any) {
+      this.log(`job helper script file unavailable: ${err?.message || err}`);
+      return null;
+    }
+  }
+
   private ensure(): Promise<boolean> {
     if (this.ready && this.proc && this.proc.exitCode === null && this.proc.signalCode === null) return this.ready;
     /* 起过但没起成功（超时）还活着的那个：收掉，重起一个 */
@@ -162,13 +184,20 @@ export class WinJobHost implements JobHost {
         for (const f of fs.readdirSync(this.cacheDir)) if (/^winjob-[0-9a-f]+\.\d+\.tmp\.dll$/.test(f)) { try { fs.unlinkSync(path.join(this.cacheDir, f)); } catch { /* 占着 */ } }
       } catch { /* 读不了目录就算了 */ }
     }
-    const encoded = Buffer.from(PS, 'utf16le').toString('base64');
+    /*
+      **脚本走 `-File`，不走 `-EncodedCommand`** ——「远程会话连接的前半段输入框没法输入」：主进程延迟监控（mainLag.ts）
+      抓到启动后第 3 秒（`warm()`）主进程整整卡了 ~1 秒，CPU 剖析落在这一个 `spawn` 上。实测（Windows Server）：带一段**新的**
+      `-EncodedCommand` 起 powershell.exe，`spawn` 本身同步要 0.8–1.2 秒（系统在建进程时检查编码过的命令行），`-File <脚本>` 只要 ~10ms。
+      脚本按内容哈希命名写一次（tmp + rename），写不了才退回原来的 `-EncodedCommand`。
+    */
+    const script = this.scriptFile();
+    const scriptArgs = script ? ['-File', script] : ['-EncodedCommand', Buffer.from(PS, 'utf16le').toString('base64')];
     let proc: ChildProcess;
     try {
       /* cwd 放到临时目录：PowerShell 找不到本地 AppData 时会把模块缓存写进当前目录 —— 别写进 KiroLex 碰巧所在的地方 */
       /* 绝对路径：按 PATH 找 powershell.exe 的第一次 spawn 会同步卡好几秒 */
       const exe = process.env.SystemRoot ? path.join(process.env.SystemRoot, 'System32', 'WindowsPowerShell', 'v1.0', 'powershell.exe') : 'powershell.exe';
-      proc = spawn(exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', '-EncodedCommand', encoded], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], cwd: os.tmpdir(), env: { ...process.env, KX_JOB_DLL: dll } });
+      proc = spawn(exe, ['-NoProfile', '-NonInteractive', '-ExecutionPolicy', 'Bypass', ...scriptArgs], { windowsHide: true, stdio: ['pipe', 'pipe', 'pipe'], cwd: os.tmpdir(), env: { ...process.env, KX_JOB_DLL: dll } });
       this.starts += 1;
     } catch (err: any) {
       this.log(`job helper spawn failed: ${err?.message || err}`);

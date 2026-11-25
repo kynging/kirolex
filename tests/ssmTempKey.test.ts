@@ -15,7 +15,7 @@ import fs from 'node:fs';
 import os from 'node:os';
 import path from 'node:path';
 import {
-  setSsmKeyRoot, ensureSsmKey, ssmKeyDir, transportArgs, identityArgs, usesSsmTempKey, ssmKeyPushFailure,
+  setSsmKeyRoot, setSsmKeyDeps, ensureSsmKey, prepareSsmKey, ssmKeyDir, transportArgs, identityArgs, usesSsmTempKey, ssmKeyPushFailure,
   generateEd25519, SSM_KEY_TTL_MS, setProxyFlavorOverride,
 } from '../src/main/sshProxy.ts';
 import { buildSshArgs } from '../src/main/acp-client.ts';
@@ -43,7 +43,9 @@ const SSM = {
 const proxyOf = (args: string[]): string => args.find((a) => String(a).startsWith('ProxyCommand=')) || '';
 const POSIX = { skip: process.platform === 'win32' && 'Windows 上 chmod 只认只读位，权限位只在 POSIX 上有意义' };
 
-test('临时公钥模式：ssh 参数带 -i <~/.kirolex/ssm-keys/...> 和 IdentitiesOnly=yes，不带配置里的 identityFile', () => {
+test('临时公钥模式：ssh 参数带 -i <~/.kirolex/ssm-keys/...> 和 IdentitiesOnly=yes，不带配置里的 identityFile', async () => {
+  /* 和真连接一样：起 ssh 之前先备好临时密钥（prepareSshFor），Windows 上收紧 ACL 是异步的 */
+  await prepareSsmKey(SSM);
   for (const args of [
     buildSshArgs(SSM as any, 'true', { remotePort: 39100, localPort: 5000 }),
     masterArgs({ ...SSM, socket: '/tmp/s', remotePort: 0, localPort: 5000 }),
@@ -56,7 +58,8 @@ test('临时公钥模式：ssh 参数带 -i <~/.kirolex/ssm-keys/...> 和 Identi
   }
 });
 
-test('建立主连接之前先推公钥：ProxyCommand 里 send-ssh-public-key 在 start-session 之前，参数带 instance-id / os-user / region / profile', () => {
+test('建立主连接之前先推公钥：ProxyCommand 里 send-ssh-public-key 在 start-session 之前，参数带 instance-id / os-user / region / profile', async () => {
+  await prepareSsmKey(SSM);
   const args = masterArgs({ ...SSM, sshHost: `ubuntu@${ID}`, socket: '/tmp/s', remotePort: 0, localPort: 5000 });
   const proxy = proxyOf(args);
   const push = proxy.indexOf('ec2-instance-connect');
@@ -73,7 +76,8 @@ test('建立主连接之前先推公钥：ProxyCommand 里 send-ssh-public-key �
   assert.match(proxy, /&& exec .*ssm start-session --target i-0123456789abcdef0 --document-name AWS-StartSSHSession .*--profile work$/);
 });
 
-test('ProxyCommand 真的按顺序跑：先推公钥（成功才继续），再 start-session；推送失败就不连', { skip: !fs.existsSync('/bin/sh') && process.platform !== 'win32' && 'no /bin/sh' }, () => {
+test('ProxyCommand 真的按顺序跑：先推公钥（成功才继续），再 start-session；推送失败就不连', { skip: !fs.existsSync('/bin/sh') && process.platform !== 'win32' && 'no /bin/sh' }, async () => {
+  await prepareSsmKey(SSM);
   const sh = spawnSync('sh', ['-c', 'echo ok'], { encoding: 'utf8' });
   if (sh.status !== 0) return;   // 没有 sh 的环境（ssh 本来也是用 sh 跑 ProxyCommand 的）
   const bin = fs.mkdtempSync(path.join(os.tmpdir(), 'fake-aws-'));
@@ -142,23 +146,30 @@ test('临时密钥：目录 0700、私钥 0600', POSIX, () => {
   assert.equal(fs.statSync(ROOT).mode & 0o777, 0o700);
 });
 
-test('临时密钥：12 小时内复用同一把（重启后也接着用盘上的），过期换一把，旧文件不原地覆盖', () => {
+/* 异步（`prepareSsmKey`，连 ssh 之前 await 的那条，Windows 上会收紧 ACL）和同步（`ensureSsmKey`，非 win32 就地备）同一套规则 */
+for (const [how, get] of [
+  ['prepareSsmKey', (r: any, t: number) => prepareSsmKey(r, t)],
+  ['ensureSsmKey（非 win32 同步）', async (r: any, t: number) => ensureSsmKey(r, t)],
+] as const) test(`临时密钥（${how}）：12 小时内复用同一把（重启后也接着用盘上的），过期换一把，旧文件不原地覆盖`, async () => {
   setSsmKeyRoot(ROOT);   // 清内存缓存
-  const r = { ...SSM, id: 'reuse' };
+  if (how !== 'prepareSsmKey') setSsmKeyDeps({ platform: 'linux' });
+  try {
+  const r = { ...SSM, id: `reuse-${how.length}` };
   const t0 = 1_800_000_000_000;
-  const a = ensureSsmKey(r, t0);
-  assert.equal(ensureSsmKey(r, t0 + 60_000).privateKey, a.privateKey);
+  const a = await get(r, t0);
+  assert.equal((await get(r, t0 + 60_000)).privateKey, a.privateKey);
   setSsmKeyRoot(ROOT);   // 模拟重启：内存缓存没了
-  assert.equal(ensureSsmKey(r, t0 + 3600_000).privateKey, a.privateKey);
-  const b = ensureSsmKey(r, t0 + SSM_KEY_TTL_MS + 1);
+  assert.equal((await get(r, t0 + 3600_000)).privateKey, a.privateKey);
+  const b = await get(r, t0 + SSM_KEY_TTL_MS + 1);
   assert.notEqual(b.privateKey, a.privateKey);
   assert.notEqual(b.publicKey, a.publicKey);
   assert.ok(fs.existsSync(a.privateKey), '旧的那把还在（正在建的连接可能还要读它）');
-  ensureSsmKey({ ...r, id: 'reuse' }, t0 + 3 * SSM_KEY_TTL_MS);
+  await get({ ...r }, t0 + 3 * SSM_KEY_TTL_MS);
   assert.equal(fs.existsSync(a.privateKey), false, '过了两个周期删掉');
   assert.equal(path.dirname(a.privateKey), ssmKeyDir(r));
   /* 会话里的老快照没有 id：按实例 ID 分目录 */
   assert.equal(path.basename(ssmKeyDir({ ...SSM, id: undefined })), ID);
+  } finally { if (how !== 'prepareSsmKey') setSsmKeyDeps(); }
 });
 
 test('生成的私钥是 ssh 认得的 OpenSSH 格式（ssh-keygen -y 推得出同一把公钥）', { skip: spawnSync('ssh-keygen', ['-?']).error ? 'no ssh-keygen' : false }, () => {

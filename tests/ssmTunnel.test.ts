@@ -10,7 +10,7 @@ import os from 'node:os';
 import path from 'node:path';
 import { SsmTunnels, tunnelArgs, tunnelKey, tunnelApplies, sharedTunnelEnabled, type TunnelDeps, type TunnelTarget } from '../src/main/ssmTunnel.ts';
 import { buildSshArgs, setSsmTunnelResolver, setMuxSocketResolver } from '../src/main/acp-client.ts';
-import { setSsmKeyRoot } from '../src/main/sshProxy.ts';
+import { setSsmKeyRoot, prepareSsmKey } from '../src/main/sshProxy.ts';
 
 setSsmKeyRoot(fs.mkdtempSync(path.join(os.tmpdir(), 'ssm-keys-')));
 
@@ -127,7 +127,8 @@ test('隧道死掉 → 有会话在用就按退避重建，新 ssh 用新端口'
   const live = h.tunnels.liveFor(A);
   assert.ok(live);
   assert.notEqual(live!.port, first!.port);
-  /* buildSshArgs 跟着新端口走 */
+  /* buildSshArgs 跟着新端口走（和真连接一样，起 ssh 之前先备好临时密钥：prepareSshFor） */
+  await prepareSsmKey(A as any);
   setSsmTunnelResolver((r) => h.tunnels.liveFor(r as any));
   try {
     const args = buildSshArgs(A as any, 'true');

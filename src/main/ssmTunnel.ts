@@ -26,7 +26,7 @@ import { spawn } from 'child_process';
 import net from 'net';
 import type { RemoteTarget } from './config';
 import { taskkillTree } from './procTree.ts';
-import { findLocalTool, localToolSpawn, pluginDirIfOffPath, runLocalTool, sendKeyArgs, ensureSsmKey, usesSsmTempKey, ssmOsUser } from './sshProxy.ts';
+import { findLocalTool, localToolSpawn, pluginDirIfOffPath, runLocalTool, sendKeyArgs, ensureSsmKey, prepareSsmKey, usesSsmTempKey, ssmOsUser } from './sshProxy.ts';
 
 export type TunnelTarget = Pick<RemoteTarget, 'sshHost' | 'sshPort' | 'connectVia' | 'ssmInstanceId' | 'ssmRegion' | 'ssmProfile' | 'ssmUseOwnKey'> & { id?: string };
 
@@ -494,7 +494,7 @@ export function defaultTunnelDeps(log: TunnelDeps['log']): TunnelDeps {
       sock.once('error', () => done(false));
     }),
     pushKey: async (t) => {
-      const r = await runLocalTool(awsPath(), sendKeyArgs(t, ensureSsmKey(t).publicKey), 30_000);
+      const r = await runLocalTool(awsPath(), sendKeyArgs(t, (await prepareSsmKey(t)).publicKey), 30_000);
       /* 只看退出码：Roles Anywhere 的 credential_process 会在 stderr 打「could not parse PEM data」之类的噪音 */
       if (r.code !== 0) throw new Error(r.stderr.trim() || `exit ${r.code}`);
     },

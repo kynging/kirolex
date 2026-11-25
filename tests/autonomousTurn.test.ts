@@ -337,7 +337,9 @@ test('接线：自发轮 = 界面上的「一轮」（busy 报 turn、不被 LRU
   const br = MAIN.slice(MAIN.indexOf('function busyReasonFor(sessionId: string): BusyReason {'), MAIN.indexOf('function emitSessionBusy(sessionId: string) {'));
   assert.match(br, /if \(entry\?\.busy \|\| entry\?\.autonomous\) return 'turn';/);
   const cap = MAIN.slice(MAIN.indexOf('function ensureExecutorCapacity('), MAIN.indexOf('const gotSingleInstanceLock'));
-  assert.match(cap, /if \(id === excludeId \|\| e\.busy \|\| e\.autonomous\) continue;/);
+  /* 回收判据抽到了 sendPrep.canEvict（多了「正在准备发送的不收」）：自发轮照旧不收 */
+  assert.match(cap, /if \(!canEvict\(id, e, excludeId, sendPrepHolds\)\) continue;/);
+  assert.match(fs.readFileSync(new URL('../src/main/sendPrep.ts', import.meta.url), 'utf8'), /return id !== excludeId && !e\.busy && !e\.autonomous && !holds\.has\(id\);/);
   const cancel = MAIN.slice(MAIN.indexOf("ipcMain.handle('acp:cancel'"), MAIN.indexOf("ipcMain.handle('acp:cap-steer-text'"));
   assert.match(cancel, /if \(entry\.autonomous\) endAutonomousTurn\(entry, autonomousDeps\(sessionId, entry\), 'cancelled'\);/);
   const deps = MAIN.slice(MAIN.indexOf('function autonomousDeps('), MAIN.indexOf('function autonomousDeps(') + 2500);

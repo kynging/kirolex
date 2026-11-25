@@ -62,8 +62,12 @@ test('两种情况都要给出完整路径 —— 猜项目名是另一个已经
 
 test('调用处把会话跑在哪传进去了 —— 不传的话这个分支永远走不到', () => {
   const src = fs.readFileSync(new URL('../src/main/index.ts', import.meta.url), 'utf8');
+  /* 发送路径改成忙闸之前异步读（buildMemoryInjectionAsync）：远程与否由 memoryTargetFor 按执行器算出来传进去 */
   assert.match(
     src,
-    /buildMemoryInjection\(effectiveProjectId, sessionId, \{ remote: !!entry\.profile\.remote\?\.sshHost \}\)/,
+    /buildMemoryInjectionAsync\(target\.projectId, sessionId, \{ remote: target\.remote \}\)/,
   );
+  assert.match(src, /function memoryTargetFor\([\s\S]{0,700}remote: !!entry\.profile\.remote\?\.sshHost \}/);
+  /* 用的时候也按这一轮执行器的机器比对 */
+  assert.match(src, /memoryBlockFor\(memoryPrefetch, effectiveProjectId, !!entry\.profile\.remote\?\.sshHost, sessionId\)/);
 });

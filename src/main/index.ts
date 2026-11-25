@@ -3,10 +3,10 @@ import path from 'path';
 import fs from 'fs';
 import os from 'os';
 import { createHash } from 'crypto';
-import { execSync, execFileSync, execFile, spawn, type ChildProcess } from 'child_process';
+import { execSync, execFile, spawn, type ChildProcess } from 'child_process';
 import { AcpClient, type EngineOptionCategory, resolveKiroCli, buildSshArgs, shellQuote, kiroTraceEnabled, setLocalKiroBin, setRemoteBinResolver, setMuxSocketResolver, setSsmTunnelResolver, kiroBinProblem, remoteKiroBin, buildRemoteAdapterCommand, parseRemotePid, remoteKillTree, setMuxSessionsFullHandler } from './acp-client';
 import { setPasswordDecryptor, sshEnv } from './sshAuth.ts';
-import { isSsm, findLocalTool, runLocalTool as runSsmTool, execTimeoutFor } from './sshProxy.ts';
+import { isSsm, findLocalTool, runLocalTool as runSsmTool, execTimeoutFor, usesSsmTempKey, prepareSsmKey } from './sshProxy.ts';
 import { noticesFromStderr, noticeLabel } from './stderrNotice.ts';
 import { acpAvailableCommands } from './acpCommands.ts';
 import { ENGINE_LABEL, REMOTE_ADAPTER_BIN, backendHeldAtTurnStart, backendPersistsSessions, contextMarkerHolds, engineOf, liteHelperSkipReason, findAdapterEntry, forgetAdapterCache, adapterMissingMessage, adapterAuthMessage, type Engine } from './engines.ts';
@@ -107,7 +107,7 @@ import { BG_DEFAULT_TIMEOUT_SEC, BG_MAX_TIMEOUT_SEC, WATCH_MAX_TIMEOUT_SEC, BgJo
 import { BG_JOBS_REL, applyFetchedState, bgObjectRel, bgRunnerLost, bgStateBody, bgTombstoneBody, collectBucketBgJobs, forgetBgSession, parseRemoteBgState, parseRerunMark, parseStopRequest, planBgSync, planStopRequests, readBgLedger, rerunBody, rerunHash, stopRequestBody, writeBgLedger, type BgStopRequest, type BgSyncLedger } from './bgJobSync.ts';
 import { adapterScheduleNote, callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
-import { backupMemoryLayer, buildMemoryInjection, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
+import { backupMemoryLayer, buildMemoryInjectionAsync, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
 import type { MemoryScope } from './memoryPolicy.ts';
 import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { PromptSuggestionStore, SuggestionTurnLedger, parseSuggestionLines, suggestionSourceFor, suggestionsPrompt, type SuggestionSource } from './promptSuggestions.ts';
@@ -186,6 +186,9 @@ import {
 } from './deckPreview.ts';
 import { ConvertOnce, LO_PROFILE_DIR, userInstallationArg } from './convertOnce.ts';
 import { logger } from './logger';
+import { createLagMonitor, createSerialLane, lagPhases, yieldToLoop } from './mainLag';
+import { PrepHolds, canEvict, prepOnExecutor, queuedHandoffRefusal } from './sendPrep.ts';
+import { execFileText, execShellText } from './asyncExec';
 import { applyDockIcon, dockIconPath } from './dockIcon';
 import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
@@ -241,6 +244,17 @@ const STARTUP_T0 = Date.now();
 function startupMark(phase: string, extra?: string): void {
   logger.info('startup', `+${((Date.now() - STARTUP_T0) / 1000).toFixed(2)}s ${phase}${extra ? ' ' + extra : ''}`);
 }
+/*
+  **主进程事件循环延迟监控**（mainLag.ts）——「远程会话连接的前半段输入框没法输入」：Windows 上窗口的键盘输入要经过主进程，
+  主进程被同步调用卡住时整个窗口不响应输入，而原来没有任何日志能说明是哪一段。卡 ≥ 300ms 记一行
+  `[mainlag] blocked=<ms> phase=<当时在做的阶段>`（阶段由 attach / preflight / sweep / ensureSsmKey / transcript 读取 / history 重建处的
+  `lagPhases` 标记给出）。默认开着：每 50ms 比一次时间，定时器 unref。
+*/
+createLagMonitor({ log: (line) => logger.warn('mainlag', line) }).start();
+/** MB 级的读 transcript / 重建 history.md 排成一条队：多条会话同时 attach 时一个接一个（每个自己分片让出），不一次叠满 */
+const heavyLane = createSerialLane();
+/** 正在准备发送（异步读历史 / 记忆）的会话：空闲回收不收它们（sendPrep.ts） */
+const sendPrepHolds = new PrepHolds();
 
 // PER-SESSION executors (design §3): exactly one AcpClient process per session,
 // keyed by sessionId. Replaces the previous per-model pooling. This gives
@@ -1797,22 +1811,38 @@ function restoreContextAfterExecutorSwap(sessionId: string, trigger: string): vo
  *  would read a file that OMITS everything since, while its own header claimed
  *  "全部 N 条消息，未删减". A stale-but-authoritative-looking history is exactly
  *  the failure mode this machinery exists to prevent. */
-function renderHistoryFile(sessionId: string): { path: string; count: number } | null {
+/**
+ * **给模型看的历史，异步分片读** ——「远程会话连接的前半段输入框没法输入」（审查意见 1）：重建历史（`primeHistoryNow`）、
+ * ride-along 快照（`buildHistoryRideAlong`）、history.md 刷新原来都同步整读 MB 级 transcript、逐条渲染，主进程停住。
+ * 调用方 `readTranscriptAsync`（分片解析）读、各自 `.filter(modelFacing)`，这里逐条渲染、每片让出事件循环；
+ * 内容和原来同步那份一模一样（同一个 `historyLine`）。**自己不进 heavyLane**（lane 里的活不能再等 lane，会互相等死）。
+ */
+async function historyLinesOf(stored: any[]): Promise<string[]> {
+  const lines: string[] = [];
+  let sliceAt = Date.now();
+  for (const m of stored) {
+    lines.push(historyLine(m));
+    if (Date.now() - sliceAt >= 8) { await yieldToLoop(); sliceAt = Date.now(); }
+  }
+  return lines;
+}
+
+/**
+ * 把已经渲染好的历史行写成 `history.md`（异步 tmp + rename），返回路径和实际写进去的条数；没有内容 / 写失败返回 null。
+ * 预算和截断说明照旧：实测 696 KB 的 history.md 让后端只回一句笼统的 `Internal error`。
+ * 判据和"丢了要说出来"都在 `historyBudget.ts`；丢掉的部分不静默 —— 顶部那句说明给模型看，日志那句给人对账。
+ * 同样**自己不进 heavyLane**。
+ */
+async function writeHistoryFromLines(sessionId: string, lines: string[]): Promise<{ path: string; count: number } | null> {
   try {
-    const stored = store.readTranscript(sessionId)
-      .filter(modelFacing);
-    const lines = stored.map((m) => historyLine(m));
     if (!lines.join('').trim()) return null;
-    /* 有预算，不再整份全渲：实测 696 KB 的 history.md 让后端只回一句笼统的 `Internal error`。
-       判据和"丢了要说出来"都在 `historyBudget.ts`；丢掉的部分不静默 —— 顶部那句说明给模型看，
-       日志那句给人对账。 */
     const fitted = fitHistory(lines.map((line) => ({ line })));
     const note = historyTrimNote(fitted.dropped, lines.length);
     if (fitted.dropped) {
       logger.warn('prime', `history trimmed sessionId=${sessionId} kept=${fitted.kept.length}/${lines.length}`
         + ` bytes=${fitted.bytes} (budget ${HISTORY_BUDGET_BYTES})`);
     }
-    const path = store.writeHistoryFile(
+    const path = await store.writeHistoryFileAsync(
       sessionId,
       `# ${sessionId} — 对话历史（由 KiroLex 从自身记录渲染）\n`
       + `# 渲染时间 ${new Date().toISOString()}，共 ${lines.length} 条消息，`
@@ -1873,7 +1903,8 @@ function stripArchiveHeader(text: string): string {
 /** The snapshot, worded to ride along with the user's own message rather than to
  *  be a standalone priming turn (so: no "reply OK", and it explicitly hands off to
  *  the real message that follows it). */
-function buildHistoryRideAlong(sessionId: string): string {
+async function buildHistoryRideAlong(sessionId: string): Promise<string> {
+  const endPhase = lagPhases.enter(`ride-along ${sessionId}`);
   try {
     // A HAND-EDITED block wins over the generated one, and is used VERBATIM: what the
     // user sees in the Snapshot tab is what goes out, which is the only predictable
@@ -1891,14 +1922,17 @@ function buildHistoryRideAlong(sessionId: string): string {
       logger.info('prime', `context OVERRIDE (hand-edited) sessionId=${sessionId} chars=${text.length}`);
       return text;
     }
-    const stored = store.readTranscript(sessionId)
+    /* 异步分片读 + 排进 heavyLane（审查意见 1：原来同步整读 MB 级 transcript 再渲染） */
+    const stored = (await heavyLane(() => store.readTranscriptAsync(sessionId)))
       .filter(modelFacing);
-    const lines = stored.map((m) => historyLine(m));
+    const lines = await historyLinesOf(stored);
     if (!lines.join('').trim()) return '';
-    return `${buildSnapshot(sessionId, stored, lines, { rideAlong: true })}${RIDE_ALONG_HANDOFF}`;
+    return `${await buildSnapshot(sessionId, stored, lines, { rideAlong: true })}${RIDE_ALONG_HANDOFF}`;
   } catch (err: any) {
     logger.info('prime', `ride-along build FAILED sessionId=${sessionId} err=${err?.message}`);
     return '';
+  } finally {
+    endPhase();
   }
 }
 
@@ -1918,12 +1952,47 @@ function buildHistoryRideAlong(sessionId: string): string {
 function refreshHistoryFile(sessionId: string): void {
   if (!isFeatureEnabled('historyFileRefresh')) return;
   if (!store.hasHistoryFile(sessionId)) return;
-  const res = renderHistoryFile(sessionId);
-  if (res) logger.info('prime', `history file refreshed sessionId=${sessionId} messages=${res.count}`);
+  /*
+    **异步、排队** ——「远程会话连接的前半段输入框没法输入」：同步整读 MB 级 transcript + 渲染 + 写盘会让主进程停住，
+    多条会话的轮次一起结束 / 合并时叠加。现在走 heavyLane（一个接一个），读和渲染分片让出事件循环。
+  */
+  void heavyLane(() => renderHistoryFileAsync(sessionId)).then((res) => {
+    if (res) logger.info('prime', `history file refreshed sessionId=${sessionId} messages=${res.count}`);
+  });
 }
 
-function buildSnapshot(sessionId: string, stored: any[], lines: string[], opts?: { rideAlong?: boolean }): string {
-  const rendered = renderHistoryFile(sessionId);
+/**
+ * `renderHistoryFile` 的异步版（turn end 刷新用）：同样的内容、同样的预算和截断说明，同样 tmp + rename 写。
+ * 读到渲染完之间 transcript 被改了（编辑后重跑截短 / `/clear` 改了水位线 / 又追加了一条）就按新的再渲一次，
+ * 不把过期的内容写回去（最多三次，之后照旧交给下一次刷新）。
+ */
+async function renderHistoryFileAsync(sessionId: string): Promise<{ path: string; count: number } | null> {
+  return lagPhases.run(`history rebuild ${sessionId}`, async () => {
+    try {
+      for (let attempt = 0; attempt < 3; attempt++) {
+        const stamp = () => `${store.transcriptFileSize(sessionId)}|${store.readRecord(sessionId)?.clearedAt ?? ''}`;
+        const before = stamp();
+        const stored = (await store.readTranscriptAsync(sessionId))
+          .filter(modelFacing);
+        const lines = await historyLinesOf(stored);
+        if (!lines.join('').trim()) return null;
+        if (stamp() !== before) continue;   // 渲染期间 transcript 变了：按新的再来一次
+        return await writeHistoryFromLines(sessionId, lines);
+      }
+      return null;
+    } catch (err: any) {
+      logger.info('prime', `render history FAILED sessionId=${sessionId} err=${err?.message}`);
+      return null;
+    }
+  });
+}
+
+/**
+ * 历史快照（ride-along / 重建都用）。history.md 按**这同一份**历史行写 —— 原来是 `renderHistoryFile` 再同步整读一遍 transcript
+ * 重渲，内容一样；现在异步写、排进 heavyLane。调用方不能在 heavyLane 的活里调它（会等自己）。
+ */
+async function buildSnapshot(sessionId: string, stored: any[], lines: string[], opts?: { rideAlong?: boolean }): Promise<string> {
+  const rendered = await heavyLane(() => writeHistoryFromLines(sessionId, lines));
   const historyPath = rendered?.path || store.historyFilePath(sessionId);
   const recent: string[] = [];
   let acc = 0;
@@ -2064,15 +2133,41 @@ async function primeHistoryNow(
     return { ok: true, queued: true } as any;
   }
 
+  /*
+    读历史 + 做计划要等（异步分片，审查意见 1）：**在第一个 await 之前**就登记成「进行中」——
+    原来同步读完才登记 `primePromise`，中间没人插得进来；现在这段时间里进来的调用按上面那句 JOIN 同一次，不重建两遍。
+  */
+  const planning = primeHistoryPlanned(sessionId, entry);
+  entry.primePromise = planning;
+  void planning.finally(() => { if (entry.primePromise === planning) entry.primePromise = undefined; }).catch(() => {});
+  return planning;
+}
+
+/** `primeHistoryNow` 的后半段（读历史、定计划、逐段发）—— 拆出来只为在它开始等之前先登记 `primePromise`。 */
+async function primeHistoryPlanned(sessionId: string, entry: SessionEntry): Promise<{ ok: boolean; error?: string; skipped?: boolean }> {
   let stored: any[] = [];
   let lines: string[];
   try {
-    stored = store.readTranscript(sessionId)
+    stored = (await heavyLane(() => store.readTranscriptAsync(sessionId)))
       .filter(modelFacing);
-    lines = stored.map((m) => historyLine(m));
+    lines = await historyLinesOf(stored);
   } catch (err: any) {
     logger.info('prime', `read transcript FAILED sessionId=${sessionId} err=${err?.message}`);
     return { ok: false, error: 'read transcript failed' };
+  }
+  /* 读的这段时间里情况变了：和上面那几道闸一样处理（执行器换了 → 新执行器自己重建；你点了停止 → 不建；一轮开始了 → 下一条之前再建） */
+  if (sessionClients.get(sessionId) !== entry) {
+    logger.info('prime', `ABORT sessionId=${sessionId} reason=executor-replaced while reading history`);
+    return { ok: false, error: tr('The session reconnected; rebuilding history will start over.') };
+  }
+  if (entry.primeAbandoned) {
+    logger.info('prime', `SKIP sessionId=${sessionId} reason=user-abandoned (while reading history)`);
+    return { ok: true, skipped: true };
+  }
+  if (entry.busy) {
+    emitSessionBusy(sessionId);
+    logger.info('prime', `QUEUED sessionId=${sessionId} reason=backend-busy (while reading history; will rebuild before next message)`);
+    return { ok: true, queued: true } as any;
   }
   if (!lines.join('').trim()) {
     entry.needsHistoryPrime = false;
@@ -2094,7 +2189,7 @@ async function primeHistoryNow(
     ? entry.primeChunks                      // retry: replay byte-identical content
     : mode === 'full'
       ? fullChunks
-      : splitHistory([buildSnapshot(sessionId, stored, lines)], PRIME_CHUNK_CHARS);
+      : splitHistory([await buildSnapshot(sessionId, stored, lines)], PRIME_CHUNK_CHARS);
   if (!entry.primeChunks) {
     // Full replay prepends the artifact manifest (never a substitute for the
     // history): "which files exist and where" is the fact that gets lost first,
@@ -3380,7 +3475,7 @@ function remotePortRearm(sessionId: string, profile: AgentProfile, localDir: str
  * 杀本机这一端就够：远端那个 kiro-cli 失去 sshd 之后会被 reparent 到 1，
  * 下一次 `orphanSweepScript` 顺手收掉（或者它自己退出）。
  */
-function sweepStrayLocalSsh(): void {
+async function sweepStrayLocalSsh(): Promise<void> {
   /*
     **Windows 上 `ps` 和 PPID==1 两个都不成立** ——「看一下有没有 windows 上不能跑的东西」。
 
@@ -3394,9 +3489,9 @@ function sweepStrayLocalSsh(): void {
     Unix 上父进程死了会 reparent 到 1，Windows 上 pid 直接变成一个不存在的进程。
     （Unix 上不改判据：PPID==1 更便宜，而且那条路是实测过的。）
   */
-  if (process.platform === 'win32') { sweepStrayLocalSshWindows(); return; }
+  if (process.platform === 'win32') { await sweepStrayLocalSshWindows(); return; }
   try {
-    const out = execFileSync('ps', ['-eo', 'pid=,ppid=,command='], { encoding: 'utf8', maxBuffer: 8 * 1024 * 1024 });
+    const out = await execFileText('ps', ['-eo', 'pid=,ppid=,command='], { maxBuffer: 8 * 1024 * 1024 });
     const victims: number[] = [];
     for (const line of out.split('\n')) {
       if (!line.includes(SESSION_AGENT_PREFIX) && !line.includes(`${MUX_DIR}/`)) continue;
@@ -3430,12 +3525,13 @@ function sweepStrayLocalSsh(): void {
  *
  * 同样要带 KiroLex 的印记（agent 名或 `kirolex-mux/`），这样不碰用户自己开的 ssh。
  */
-function sweepStrayLocalSshWindows(): void {
+async function sweepStrayLocalSshWindows(): Promise<void> {
   try {
     const ps = 'Get-CimInstance Win32_Process -Filter "Name=\'ssh.exe\'" | '
       + 'ForEach-Object { "$($_.ProcessId)`t$($_.ParentProcessId)`t$($_.CommandLine)" }';
-    const out = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
-      encoding: 'utf8', maxBuffer: 8 * 1024 * 1024, windowsHide: true,
+    /* 异步（execFile）：PowerShell 冷启动在 Windows 上常要几秒，原来 execFileSync 让整个主进程停住、窗口不响应输入 */
+    const out = await execFileText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command', ps], {
+      maxBuffer: 8 * 1024 * 1024, windowsHide: true,
     });
     const rows: Array<{ pid: number; ppid: number; cmd: string }> = [];
     for (const line of String(out).split(/\r?\n/)) {
@@ -3450,9 +3546,9 @@ function sweepStrayLocalSshWindows(): void {
        所以这里只能判断"父 pid 不在我们看到的任何进程里"时才算孤儿，于是再查一次全量 pid。 */
     const alive = new Set<number>();
     try {
-      const all = execFileSync('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
+      const all = await execFileText('powershell.exe', ['-NoProfile', '-NonInteractive', '-Command',
         'Get-CimInstance Win32_Process | ForEach-Object { $_.ProcessId }'], {
-        encoding: 'utf8', maxBuffer: 16 * 1024 * 1024, windowsHide: true,
+        maxBuffer: 16 * 1024 * 1024, windowsHide: true,
       });
       for (const l of String(all).split(/\r?\n/)) {
         const n = Number(l.trim());
@@ -3480,7 +3576,8 @@ function sweepStrayLocalSshWindows(): void {
 
 async function sweepRemoteSessionAgents(): Promise<void> {
   /* 先杀本机这一端：远端那些失去 sshd 之后才会变成 PPID==1，下面那一轮才认得出来 */
-  sweepStrayLocalSsh();
+  const endSweep = lagPhases.enter('sweep local ssh');   // 阶段标记，见 mainLag.ts
+  try { await sweepStrayLocalSsh(); } finally { endSweep(); }
   for (const target of listRemoteTargets(KIROLEX_CONFIG_PATH)) {
     if (!target.sshHost) continue;
     try {
@@ -4190,8 +4287,10 @@ function ssmTunnelApplies(remote: RemoteTarget | undefined): boolean {
 }
 /** 要连这台机器之前：Windows 上的 SSM 机器先把共享隧道拉起来、推好公钥；别的什么都不做。失败不抛（照旧走 ProxyCommand）。 */
 function prepareSsmTunnel(remote: RemoteTarget | undefined): Promise<unknown> {
-  if (!remote || !ssmTunnelApplies(remote)) return Promise.resolve();
-  return ssmTunnels.ensure(remote).catch(() => undefined);
+  /* 临时密钥先异步备好（Windows 上要跑 icacls，原来是同步的，连接时整个主进程停住）—— 下面同步拼的 ssh 参数只读备好的那把 */
+  const key = remote && usesSsmTempKey(remote) ? prepareSsmKey(remote).catch(() => undefined) : Promise.resolve();
+  if (!remote || !ssmTunnelApplies(remote)) return key;
+  return key.then(() => ssmTunnels.ensure(remote)).catch(() => undefined);
 }
 setSsmTunnelResolver(
   (remote) => (ssmTunnelApplies(remote) ? ssmTunnels.liveFor(remote) : undefined),
@@ -4328,6 +4427,39 @@ async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'code
 }
 
 /**
+ * **发送时的记忆块在忙闸之前异步读好**（三层记忆没有体积上限，原来拼的时候 readFileSync 整读）。必须在「这一轮在跑吗」那道闸之前：
+ * 闸到 `entry.busy = true` 之间一个 await 都没有（并发的两次发送不会都过闸），在那段里 await 就会让两轮同时开跑。
+ * 读的时候占住此刻的执行器（sendPrep.ts，重建之后 entry 可能已经指到新的那个）；读完按这里再算一次项目 / 机器，变了就重读，
+ * 之后到真正用它之间不再有 await，所以用的时候对得上是必然的。
+ *
+ * 这一轮的记忆按哪个项目注入、按哪台机器措辞 —— 和 sendPromptOnce 里落定 `effectiveProjectId` 那段同一条规则：
+ * 渲染层带来的项目是假项目（会话 id 形状 / 本机不认识）就当没带；执行器上记的项目是假项目就当未分组；
+ * 结果是「带来的 ?? 执行器上的」。只读不写（那段负责把纠正写回记录）。
+ */
+function memoryTargetFor(projectId: string | undefined, sessionId: string, entry: SessionEntry): { projectId: string | undefined; remote: boolean } {
+  const known = localKnownProjects();
+  const asked = projectId !== undefined && !bogusProjectReason(projectId, sessionId, known) ? projectId : undefined;
+  const held = bogusProjectReason(entry.profile.projectId, sessionId, known) ? undefined : entry.profile.projectId;
+  return { projectId: asked ?? held, remote: !!entry.profile.remote?.sshHost };
+}
+
+/**
+ * 发送时用的记忆块：忙闸之前异步读好的那份。项目 / 机器和落定的对不上（照规则不会发生：读完到这里没有 await）
+ * 就这一轮不注入并记一条错误 —— 不按错的项目注入，也不退回同步整读。
+ */
+function memoryBlockFor(
+  prefetch: { projectId: string | undefined; remote: boolean; block: string | null } | undefined,
+  effectiveProjectId: string | undefined,
+  remote: boolean,
+  sessionId: string,
+): string | null {
+  if (prefetch && prefetch.projectId === effectiveProjectId && prefetch.remote === remote) return prefetch.block;
+  logger.error('memory', `memory prefetch does not match this turn sessionId=${sessionId} prefetched=${prefetch ? `${prefetch.projectId || '(none)'}/${prefetch.remote}` : 'none'} `
+    + `effective=${effectiveProjectId || '(none)'}/${remote} -> no memory block this turn (memoryTargetFor 和 effectiveProjectId 的规则对不上了)`);
+  return null;
+}
+
+/**
  * `remoteAdapterCheck` 要说的话。同一条会话同一件事只说一次（每次重连 / 换组合都会走到）；
  * 新建会话时记录还没落盘（`noteInSession` 写不进），先攒着，`acp:new-session` 写好记录后 `commit`。
  *
@@ -4336,11 +4468,14 @@ async function remoteAdapterCheck(remote: RemoteTarget, engine: 'claude' | 'code
  * 进记录的那句（「还没登录」）重启后 `said` 是空的：记录里同组最新那条已经是这句就不再追加（`noteAlreadyInTranscript`）。
  */
 const adapterNotes = (() => {
-  const emit = (sid: string, how: 'note' | 'status', text: string, group: string): boolean => {
+  const emit = (sid: string, how: 'note' | 'status', text: string, group: string): boolean | Promise<boolean> => {
     if (how === 'status') { stickySessionNotice(sid, text, group, { pinned: true }); return true; }
     const v = textVariants(text);
-    if (noteAlreadyInTranscript(store.readTranscript(sid), group, [text, v?.zh || '', v?.en || ''])) return true;
-    return noteInSession(sid, text, undefined, group);
+    /* 去重要读整条 transcript（attach → remoteAdapterCheck 走到这里）：异步分片读、排进 heavyLane，不在连接路径上同步整读 */
+    return heavyLane(() => store.readTranscriptAsync(sid)).then((transcript) => {
+      if (noteAlreadyInTranscript(transcript, group, [text, v?.zh || '', v?.en || ''])) return true;
+      return noteInSession(sid, text, undefined, group);
+    });
   };
   /* 记账（说过了 / 攒着 / 换机器换引擎时 `forgetPinned` 撤掉旧机器那句钉住提示）在 adapterNotes.ts */
   return createAdapterNotes({ hasRecord: (sid) => !!store.readRecord(sid), emit, unpin: (sid, prefix) => unpinSessionNotice(sid, prefix) });
@@ -4782,7 +4917,8 @@ function remotePreflight(remote: RemoteTarget, opts?: { force?: boolean }): Prom
       + `（并发探测会把 sshd 的 MaxStartups 队列撑满，那正是"连不上"的成因之一）`);
     return running;
   }
-  const p = runPreflight(remote, opts).finally(() => { preflightInFlight.delete(host); });
+  /* 阶段标记（mainLag.ts）：预检期间主进程卡住的话，[mainlag] 那一行带上「preflight <机器>」 */
+  const p = lagPhases.run(`preflight ${host}`, () => runPreflight(remote, opts)).finally(() => { preflightInFlight.delete(host); });
   preflightInFlight.set(host, p);
   return p;
 }
@@ -5979,8 +6115,10 @@ function ensureBedrockCheck(remote: RemoteTarget | undefined, force = false): Pr
  * （哪台机器、身份、缺的动作、最小策略、关网页搜索），而不是等到一轮断掉才知道。
  * 同一条会话里同一张卡（同机器同动作）只放一次；网页搜索已经在那台机器上关掉的，只缺网页搜索时不说。
  */
+/** 正在查「这句权限提示记过没有」的那几条（会话 + 组）：读记录是异步的，等的时候同一句不再说第二遍 */
+const bedrockNoteChecking = new Set<string>();
 function precheckCodexBedrock(sessionId: string, remote: RemoteTarget | undefined): void {
-  void ensureBedrockCheck(remote).then((check) => {
+  void ensureBedrockCheck(remote).then(async (check) => {
     if (check.notBedrock || !check.missing.length) return;
     const modelMissing = check.model === 'denied';
     if (!modelMissing && check.webSearchDisabled) return;
@@ -5992,7 +6130,12 @@ function precheckCodexBedrock(sessionId: string, remote: RemoteTarget | undefine
       卡上必须记着机器，界面才能在换机器时撤掉它（bedrockNoteActive）。
     */
     const group = deniedNoteGroup({ machineId: remote ? (target?.id || key) : 'local', region: check.region, actions: check.missing, ...(check.resource ? { resource: check.resource } : {}) });
-    if (store.readTranscript(sessionId).some((m: any) => m?.kirolex && m.noteGroup === group)) return;
+    /* 连上 Codex 会话时走到这里：去重读整条 transcript，异步分片读、排进 heavyLane（不在连接路径上同步整读） */
+    const checkKey = `${sessionId}|${group}`;
+    if (bedrockNoteChecking.has(checkKey)) return;
+    bedrockNoteChecking.add(checkKey);
+    try {
+    if ((await heavyLane(() => store.readTranscriptAsync(sessionId))).some((m: any) => m?.kirolex && m.noteGroup === group)) return;
     const machine = remote ? (target?.label || remote.sshHost) : tr('this computer');
     const actions = check.missing.join(', ');
     const main = modelMissing
@@ -6002,6 +6145,7 @@ function precheckCodexBedrock(sessionId: string, remote: RemoteTarget | undefine
       arn: check.roleArn || check.identity || tr('unknown (run `aws sts get-caller-identity` on that machine)'),
     });
     noteInSession(sessionId, trConcat(main, NOTE_DETAIL_SEP, detail), undefined, group);
+    } finally { bedrockNoteChecking.delete(checkKey); }   // 记完（或判定不记）才放开：并发的那次读到的已经是记过的
   }).catch((err: any) => {
     logger.warn('ai-login', `Codex Bedrock 权限预检没跑成（${remote?.sshHost || '本机'}）：${err?.message || err}`);
   });
@@ -9856,7 +10000,8 @@ function ensureExecutorCapacity(excludeId?: string): boolean {
     let victim: string | null = null;
     let best: { cost: number; used: number } | null = null;
     for (const [id, e] of sessionClients) {
-      if (id === excludeId || e.busy || e.autonomous) continue;
+      /* 正在跑的、后端自己起的一轮、正在准备发送的（异步读历史 / 记忆，busy 还没置上）都不收 */
+      if (!canEvict(id, e, excludeId, sendPrepHolds)) continue;
       const candidate = { cost: evictionCost(id), used: e.lastUsedAt ?? 0 };
       if (!best || candidate.cost < best.cost || (candidate.cost === best.cost && candidate.used < best.used)) {
         best = candidate;
@@ -11827,6 +11972,38 @@ ${hint}` : ''}` };
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
   type PromptDisplay = { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean; handoff?: HandoffSpec; fromHandoff?: string[] };
+  /** 发送前的异步准备（读历史快照 / 记忆）核对执行器用的（sendPrep.ts）：「正在切换」= 正在换执行器 / 正在应用待切换 */
+  const prepDeps = {
+    current: (id: string) => sessionClients.get(id),
+    switching: (id: string) => reconfiguringSessions.has(id) || pendingSwitchRunner.isApplying(id),
+    holds: sendPrepHolds,
+  };
+  /**
+   * 准备期间执行器动过（换了 / 没了 / 正在换）：收回这次标的「已带上下文」（没发出去），等切换落定，按**当前**执行器从头重走这一条
+   * （和重建期间切换的那次重走同一个做法：到这里什么都还没落盘）。还没换完就照开头那道闸报错，不在这里打转。
+   */
+  async function rerunOnSwitchedExecutor(sessionId: string, markedOn: SessionEntry | undefined, where: string, why: 'replaced' | 'gone' | 'switching', again: () => Promise<any>): Promise<any> {
+    if (markedOn?.rideAlongUnconfirmed) { markedOn.rideAlongUnconfirmed = false; clearContextEstablished(sessionId); }
+    logger.info('prompt', `执行器在${where}期间${why === 'gone' ? '没了' : why === 'replaced' ? '被换了' : '正在切换'} —— 等切换落定，按当前执行器重走这一条 sessionId=${sessionId}`);
+    if (reconfiguringSessions.has(sessionId)) { try { await awaitReconfigureIdle(sessionId); } catch { /* 下面再看一眼 */ } }
+    if (pendingSwitchRunner.isApplying(sessionId)) await pendingSwitchRunner.settle(sessionId);
+    if (reconfiguringSessions.has(sessionId)) throw new Error(tr('Another switch (model / agent / machine) has not finished yet.'));
+    return again();
+  }
+
+  /**
+   * 交给适配器排（queued handoff）之前**再过一遍**开头那道闸 —— 读记忆要等，等的时候这一轮可能结束了、可能新登记了待切换
+   * （忙时选的机器 / 模型 / agent 只记成 pending，不会马上进入 applying / reconfiguring，prepOnExecutor 看不出来）。
+   * 有就照原逻辑退回：待切换 / 不能排 → `unsupported`（进 KiroLex 队列，切换完再发），这一轮已结束 → `idle`（按普通消息发）。
+   * 从这里到交出去之间没有 await。
+   */
+  function regateQueuedHandoff(sessionId: string, entry: SessionEntry): void {
+    const why = queuedHandoffRefusal({ autonomous: !!entry.autonomous, busy: !!entry.busy, turnRunning: !!entry.turnRunning,
+      supportsPromptQueueing: !!entry.client.supportsPromptQueueing, switchOwed: pendingSwitches.has(sessionId) || pendingSwitchRunner.isApplying(sessionId) });
+    if (why === 'switch-owed') logger.info('pending-switch', `读记忆期间有了待切换，这条不交给适配器排、退回 KiroLex 队列（切换完再发）sessionId=${sessionId}`);
+    if (why) throw new HandoffRefused(why === 'switch-owed' ? 'unsupported' : why);
+  }
+
   async function sendPromptOnce(sessionId: string, prompt: any[], projectId?: string, display?: PromptDisplay, _model?: string, attempt = 0): Promise<any> {
     /* 同一次提交只发一次（`promptDedupeFor`） */
     const dedupe = promptDedupeFor(sessionId, display?.messageId, attempt);
@@ -11972,8 +12149,20 @@ ${hint}` : ''}` };
     // Built and MARKED here, but not prepended until after the user message has
     // been persisted -- see the deferred prepend below for why the order matters.
     let rideAlongBlock = '';
+    /* 异步准备（读历史快照 / 记忆）期间执行器不能悄悄换掉：占住、做完核对，动过就按当前执行器重走（见 sendPrep.ts） */
+    let rideAlongMarkedOn: SessionEntry | undefined;
+    const rerunOnCurrentExecutor = (where: string, why: 'replaced' | 'gone' | 'switching'): Promise<any> => rerunOnSwitchedExecutor(
+      sessionId, rideAlongMarkedOn, where, why, () => sendPromptOnce(sessionId, prompt, projectId, display, _model, attempt));
     if (rideAlong) {
-      rideAlongBlock = buildHistoryRideAlong(sessionId);
+      const read = await prepOnExecutor(sessionId, entry, prepDeps, () => buildHistoryRideAlong(sessionId));
+      if (read.moved) return rerunOnCurrentExecutor('读历史快照', read.why);
+      rideAlongBlock = read.value;
+      /* 等的时候并发的另一次已经带上了 / 开始了重建：不带（和「判的时候已经是这样」一样处理） */
+      if (rideAlongBlock && (contextEstablished(sessionId, entry)
+        || entry.priming || entry.needsHistoryPrime || entry.primeAbandoned)) {
+        logger.info('prime', `ride-along dropped after read sessionId=${sessionId} (context already established / rebuild started meanwhile)`);
+        rideAlongBlock = '';
+      }
       if (rideAlongBlock) {
         sentContextSnapshot = rideAlongBlock;
         // Marked here, before the bytes go out, so a crash mid-turn does not
@@ -11984,6 +12173,7 @@ ${hint}` : ''}` };
         // streaming try block, which is how the busy rejection used to strand it).
         markContextEstablished(sessionId, entry);
         entry.rideAlongUnconfirmed = true;
+        rideAlongMarkedOn = entry;
         logger.info('prime', `context RIDE-ALONG sessionId=${sessionId} chars=${rideAlongBlock.length} cli=${entry.cliSessionId} pid=${entry.client.pid} (no rebuild turn)`);
       }
     }
@@ -12059,6 +12249,20 @@ ${hint}` : ''}` };
       while (!handoff && entry.busy && Date.now() < waitUntil) await new Promise((r) => setTimeout(r, 200));
       logger.info('prompt', `waited for wedged turn to release sessionId=${sessionId} busy=${entry.busy}`);
     }
+    /* 记忆块在忙闸**之前**异步读好（闸到 busy=true 之间不能有 await），读完复核项目 / 机器、变了重读 —— 见 memoryTargetFor */
+    let memoryPrefetch: { projectId: string | undefined; remote: boolean; block: string | null } | undefined;
+    if (isFeatureEnabled('memoryInjection') && (!entry.busy || handoff)) {
+      for (let want = memoryTargetFor(projectId, sessionId, entry); ;) {
+        const target = want;
+        const read = await prepOnExecutor(sessionId, entry, prepDeps, () => heavyLane(() => buildMemoryInjectionAsync(target.projectId, sessionId, { remote: target.remote })));
+        if (read.moved) return rerunOnCurrentExecutor('读记忆', read.why);
+        const block = read.value;
+        want = memoryTargetFor(projectId, sessionId, entry);
+        if (want.projectId === target.projectId && want.remote === target.remote) { memoryPrefetch = { ...target, block }; break; }
+        logger.info('memory', `project / machine changed while reading memory sessionId=${sessionId} (${target.projectId || '(none)'} → ${want.projectId || '(none)'}) -> read again`);
+      }
+    }
+    if (handoff?.kind === 'queued') regateQueuedHandoff(sessionId, entry);   // 读记忆期间可能变了：交出去之前再过一遍闸
     if (entry.busy && !handoff) {
       /* 带错误码：后台唤醒据此判「撞上忙、空了再发」，不靠这句随界面语言变的文字 */
       throw Object.assign(new Error(tr('Wait for the active turn (including context compaction) to finish before sending the queued message.')), { code: SESSION_BUSY });
@@ -12213,8 +12417,9 @@ ${hint}` : ''}` };
     } catch {}
     try {
       const block = isFeatureEnabled('memoryInjection')
-        /* 远程会话的 memory 文件在**用户机器**上，只有 `local_write` 到得了（见 memory.ts） */
-        ? buildMemoryInjection(effectiveProjectId, sessionId, { remote: !!entry.profile.remote?.sshHost })
+        /* 远程会话的 memory 文件在**用户机器**上，只有 `local_write` 到得了（见 memory.ts）；
+           用的是上面忙闸之前异步读好的那份（memoryPrefetch），不在这里同步读 */
+        ? memoryBlockFor(memoryPrefetch, effectiveProjectId, !!entry.profile.remote?.sshHost, sessionId)
         : '';
       if (block) {
         prompt = [{ type: 'text', text: block }, ...prompt];
@@ -13250,7 +13455,7 @@ ${hint}` : ''}` };
     } catch { return { ok: false }; }
   });
 
-  ipcMain.handle('acp:take-pending-handoffs', () => {
+  ipcMain.handle('acp:take-pending-handoffs', async () => {
     const out: Record<string, PendingHandoff[]> = {};
     /* 主进程还排着的（只是窗口刷新了）：交回去让窗口把「已交给 …」卡片画回来 */
     const liveCards: Record<string, PendingHandoff[]> = {};
@@ -13265,7 +13470,8 @@ ${hint}` : ''}` };
       try {
         /* 已经发过的：transcript 里的消息 id，加上放回队列后发出去的那条带着的原 handoff id（`fromHandoff`，合并发送可以有几条） */
         /* 分开判：用户消息在盘上了（可以摘） / 执行过了（不能重发）—— 有回复却没有用户消息的，补写原文 */
-        const known = handoffFacts(store.readTranscript(id, { raw: true }) || []);
+        /* 窗口起来时调：只读有 pending-handoffs.json 的那几条，异步分片读（hydrate 路径上不同步整读 transcript） */
+        const known = handoffFacts(await store.readTranscriptAsync(id, { raw: true }) || []);
         /* 交棒过、用户消息没写上的：补写进对话记录（原来的 id），不自动重发 —— 要不要重跑你来定 */
         /* 和 persistUserMessage 同一个形状（原文、附件、粘贴块），见 pendingHandoffs.restoredUserMessage */
         const restored = restoreStartedHandoffs(dir, known, live, (h) => store.appendMessage(id, {
@@ -17475,7 +17681,7 @@ ${hint}` : ''}` };
           profile.model = pickRemoteModel(sessionId, firstWantedModel(profile, machineKeyOf(profile), MODEL_FALLBACK_ORDER), remoteModels, profile.remote.sshHost || '');
         }
         attachCheckpoint(attachLive, sessionId, 'remote preflight');
-        localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
+        localTools = await lagPhases.run('local tools', () => ensureLocalTools(sessionId, profile, resolvedCwd));
       } else {
         /* 本地 Claude Code / Codex：所选「组合」里的 MCP（kiro 会话返回 undefined，见 `localComboTools`） */
         localTools = await ensureLocalTools(sessionId, profile, resolvedCwd);
@@ -17744,7 +17950,8 @@ ${hint}` : ''}` };
     const attachPromise = (async () => {
       for (let attempt = 0; ; attempt++) {
         try {
-          const result = await attachOnce();
+          /* 阶段标记（mainLag.ts）：这段时间里主进程卡住的话，那一行 [mainlag] 带上「attach <id>」 */
+          const result = await lagPhases.run(`attach ${sessionId}`, attachOnce);
           if (attempt > 0) {
             const live = sessionClients.get(sessionId);
             if (live) mainWindow?.webContents.send('session:engine-changed', { sessionId, engine: engineOf(live.profile) });
@@ -18733,12 +18940,13 @@ ${hint}` : ''}` };
    * 这台机器上的 LibreOffice —— PATH（Windows 用 `where`，别处 `command -v`）优先，其次固定安装位置。
    * 每次现找（几十毫秒）：装完回来点刷新就该能用，不能要求重启。
    */
-  const findSoffice = (): { bin: string | null; looked: string[] } => {
+  const findSoffice = async (): Promise<{ bin: string | null; looked: string[] }> => {
     const looked: string[] = [];
     for (const name of SOFFICE_PATH_NAMES) {
       looked.push(tr('{name} on PATH ({cmd})', { name, cmd: process.platform === 'win32' ? 'where' : 'command -v' }));
       try {
-        const out = execSync(pathProbeCommand(name, process.platform), { stdio: ['ignore', 'pipe', 'ignore'], windowsHide: true });
+        /* 异步：同步的 execSync 在探测期间让整个主进程停住（窗口不响应输入） */
+        const out = await execShellText(pathProbeCommand(name, process.platform), { windowsHide: true });
         const hit = firstProbeHit(String(out || ''));
         if (hit) return { bin: sofficeBinary(hit, (p) => fs.existsSync(p)), looked };
       } catch { /* 没找到 —— `where` 找不到时退出码非零 */ }
@@ -18821,7 +19029,7 @@ ${hint}` : ''}` };
       fs.rmSync(outDir, { recursive: true, force: true });
     }
 
-    const { bin: soffice, looked } = findSoffice();
+    const { bin: soffice, looked } = await findSoffice();
     if (!pickConverter({ soffice: !!soffice }) || !soffice) {
       logger.warn('preview', `no converter for ${file} (looked: ${looked.join(' | ')})`);
       /* `install` 单独给 —— 界面配一个一键复制，而不是让人从一段话里选中命令 */
@@ -19588,7 +19796,8 @@ ${hint}` : ''}` };
   });
 
   ipcMain.handle('acp:read-transcript', async (_event, sessionId: string) => {
-    return store.readTranscript(sessionId);
+    /* hydrate / attach 读整条历史（MB 级）：异步分片读，多条会话一起来时排成一条队（heavyLane），不一次把主进程叠满 */
+    return heavyLane(() => store.readTranscriptAsync(sessionId));
   });
 
   ipcMain.handle('acp:truncate-transcript-before', async (
@@ -20069,7 +20278,8 @@ ${hint}` : ''}` };
         `execFileSync` 不经过 shell：参数按数组传，两个平台都不需要引号。
         （下面那个 `loginEnvStr` 仍然用 `shellQuote` —— 它是拼给**远端 bash** 的，那是对的。）
       */
-      const who = execFileSync(cli, ['whoami'], { encoding: 'utf8', timeout: 20_000 });
+      /* 异步（同样不经 shell、同样 20 秒超时）：execFileSync 会让整个主进程停住最多 20 秒 */
+      const who = await execFileText(cli, ['whoami'], { timeout: 20_000 });
       const env = loginEnv(parseWhoami(who));
       loginEnvStr = Object.entries(env).map(([k, v]) => `${k}=${shellQuote(v)} `).join('');
       if (loginEnvStr) logger.info('remote', `bootstrap 会带上登录参数（${env.KIRO_LOGIN_PROVIDER}）`);
