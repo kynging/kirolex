@@ -39,7 +39,7 @@ test('本地工具通道带上浏览器工具；本地会话（新建 + 重连�
 test('浏览器操作作为 kind=browser 的工具调用落盘、进回合面板', () => {
   /* 落盘判据搬进了 toolTrace.shouldRecordToolCall（kiro 分支一字不改，仍认 browser）；渲染层实时那一侧用同一个 */
   assert.match(M, /if \(shouldRecordToolCall\(engineOf\(entry\.profile\), next\)\) \{/);
-  assert.match(src('main', 'toolTrace.ts'), /RUN_KINDS\.has\(kind\) \|\| kind === 'browser'\);/);
+  assert.match(src('main', 'toolTrace.ts'), /isCommandCall\(call\) \|\| kind === 'browser'\);/);
   assert.match(M, /kind: 'browser', status/);
   const acp = src('renderer', 'hooks', 'useAcp.ts');
   assert.match(acp, /if \(shouldRecordToolCall\(traceEngine, tc\)\) attachFileChangeToLatestTurn/);

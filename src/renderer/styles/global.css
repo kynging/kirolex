@@ -1965,6 +1965,17 @@ button, input, select, textarea {
   flex: none;
   color: var(--text-secondary);
 }
+/* 命令类 MCP 工具的「本机 / 后台 / 监视」标签（远程会话里把本机跑的和远端的 Bash 分开） */
+.run-preview-tag {
+  flex: none;
+  align-self: flex-start;
+  padding: 0 6px;
+  border: 1px solid var(--border-strong);
+  border-radius: 4px;
+  color: var(--text-secondary);
+  font-size: 11px;
+  line-height: 16px;
+}
 .run-preview .tool-running-indicator {
   align-self: flex-start;
 }

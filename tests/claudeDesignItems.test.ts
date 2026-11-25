@@ -72,12 +72,14 @@ describe('3a / 3b / 12 接线：只对 Claude Code / Codex，kiro 不变', () =>
   test('主进程：每条都记（判据换成 shouldRecordToolCall，kiro 分支和原来等价），追踪字段只给非 kiro', () => {
     assert.match(M, /if \(shouldRecordToolCall\(engineOf\(entry\.profile\), next\)\) \{/);
     assert.doesNotMatch(M, /if \(next\.locations\?\.length \|\| next\.diffs\?\.length \|\| ranSomething \|\| kindLower === 'browser'\) \{/);
-    assert.match(M, /\.\.\.\(engineOf\(entry\.profile\) !== 'kiro'\n\s+\? \{ \.\.\.mergeToolTrace\(previous, toolTraceFields\(u\)\), \.\.\.toolTimes\(previous, status, Date\.now\(\)\) \}\n\s+: \{\}\),/);
+    assert.match(M, /\.\.\.\(engineOf\(entry\.profile\) !== 'kiro'\n\s+\? \{ \.\.\.mergeToolTrace\(previous, toolTraceFields\(u, previous\)\), \.\.\.toolTimes\(previous, status, Date\.now\(\)\) \}\n\s+: mergeToolTrace\(previous, commandTraceFields\(u, previous\)\)\),/, 'kiro 只多带命令类 MCP 工具的完整命令 / label');
   });
   test('渲染层实时那一侧：同一个判据；kiro 的 update 判据原样保留', () => {
     assert.match(A, /if \(shouldRecordToolCall\(traceEngine, tc\)\) attachFileChangeToLatestTurn\(targetSid, tc, isActiveSession\);/);
-    assert.match(A, /if \(traceEngine && traceEngine !== 'kiro' \? true : \(existing\.locations\?\.length \|\| existing\.diffs\?\.length\n\s+\|\| RUN_KINDS\.has\(\(existing\.kind \|\| ''\)\.toLowerCase\(\)\)\)\) \{/);
-    assert.match(A, /\.\.\.\(traced \? \{ \.\.\.toolTraceFields\(update\), \.\.\.toolTimes\(undefined, update\.status, Date\.now\(\)\) \} : \{\}\),/);
+    assert.match(A, /if \(traceEngine && traceEngine !== 'kiro' \? true : \(existing\.locations\?\.length \|\| existing\.diffs\?\.length\n\s+\|\| isCommandCall\(existing\)\)\) \{/, 'kiro 判据：执行类 kind 之外也收命令类 MCP 工具（local_bash / bg_run / watch）');
+    assert.match(A, /\.\.\.\(traced \? \{ \.\.\.toolTraceFields\(update\), \.\.\.toolTimes\(undefined, update\.status, Date\.now\(\)\) \} : commandTraceFields\(update\)\),/);
+    /* update 分支用上一条识别工具：首帧带工具名、后续帧只带 rawInput 时也能存下完整命令 */
+    assert.match(A, /Object\.assign\(existing, mergeToolTrace\(existing, toolTraceFields\(update, existing\)\), toolTimes\(/);
   });
   test('界面：工具面板挂在回合面板里；命令面板只列主线；diff 只对非 kiro 换成按行显示', () => {
     /* 只给非 kiro：kiro 也落盘带 locations 的 Read（老判据），不能让它们在 kiro 会话里冒出一块新面板 */

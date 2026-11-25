@@ -70,6 +70,7 @@ export const ZH_CHAT: Record<string, string> = {
   'By model': '模型建',
   'The model in this chat set this up itself (schedule_create). Pause or cancel it like any other job.': '这是这条会话里的模型自己建的（schedule_create）。和别的定时任务一样可以暂停或取消。',
   'Watching': '监视',
+  'Background': '后台',
   'Background command': '后台命令',
   'running for {time}': '已运行 {time}',
   '{n} event(s)': '{n} 个事件',

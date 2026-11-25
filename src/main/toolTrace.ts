@@ -8,7 +8,7 @@
  *   · Task（工具名 `Agent`）派出去的子代理，它的每个调用都在**同一个** ACP sessionId 下发来，只靠
  *     `_meta.claudeCode.parentToolUseId` 指回那一条 Task。
  *
- * 所以：非 kiro 的会话**每个调用都记**，带上工具名、入参摘要、父调用、起止时间；kiro 照旧（判据一字不改）。
+ * 所以：非 kiro 的会话**每个调用都记**，带上工具名、入参摘要、父调用、起止时间；kiro 照旧，只多收命令类 MCP 工具（local_bash / bg_run / watch）。
  * 纯函数，不 import electron；渲染层也用（同一套判据，实时和重启后看到的一样）。
  */
 import type { Engine } from './engines.ts';
@@ -23,6 +23,10 @@ export interface ToolTraceFields {
   input?: string;
   /** 子代理里的调用：派它出去的那条 Task 的 toolCallId */
   parentToolCallId?: string;
+  /** 命令类 MCP 工具（local_bash / bg_run / watch）的完整命令（`COMMAND_MAX` 以内，换行保留）—— 显示用，入参摘要只有 80 字 */
+  command?: string;
+  /** bg_run / watch 给人看的名字 */
+  label?: string;
 }
 
 const INPUT_MAX = 200;
@@ -57,8 +61,67 @@ export function summarizeToolInput(raw: unknown, max = INPUT_MAX): string | unde
   return json && json !== '{}' ? clip(oneLine(json), max) : undefined;
 }
 
-/** 一条 tool_call / tool_call_update 里的工具名、入参摘要、父调用 —— 字段没有就不带 */
-export function toolTraceFields(u: any): ToolTraceFields {
+/**
+ * **工具名去掉各家的 MCP 前缀**（2026-11-25 第 6 轮）：
+ * Claude Code `mcp__kirolex-local__local_bash`、kiro `@kirolex-local/local_bash` / `Running local_bash from kirolex-local`、
+ * Codex `kirolex-local.local_bash` / `kirolex-local/local_bash` → `local_bash`；本来就没前缀的（`Read`）原样。
+ * 带空格的描述性标题（`Read src/x.ts`、kiro 的 `Running: ls`）不是工具名 → undefined。
+ */
+export function bareToolName(name: unknown): string | undefined {
+  if (typeof name !== 'string') return undefined;
+  const t = name.trim().replace(/^Tool:\s*/, '');
+  const from = /^Running\s+([\w.-]+)\s+from\s+\S+$/.exec(t);
+  if (from) return from[1];
+  if (!t || /\s/.test(t)) return undefined;
+  const m = /^mcp__.+?__(.+)$/.exec(t) || /^@[^/]+\/(.+)$/.exec(t) || /^[\w-]+[./]([\w-]+)$/.exec(t);
+  return m ? m[1] : t;
+}
+
+/** 「跑命令」的那几个 MCP 工具：本机 shell / 后台任务 / 监视 —— 它们是命令，进「⚡ 执行的命令」 */
+export type CommandToolKind = 'local' | 'background' | 'watch';
+const COMMAND_TOOLS: Record<string, CommandToolKind> = { local_bash: 'local', bg_run: 'background', watch: 'watch' };
+
+/** 这条调用是不是命令类 MCP 工具（看工具名，没有就看标题）；执行类 kind 本身就是命令，不算这一类 */
+export function commandToolKind(call: { kind?: string; title?: string; toolName?: string }): CommandToolKind | null {
+  if (RUN_KINDS.has((call.kind || '').toLowerCase())) return null;
+  for (const n of [call.toolName, call.title]) {
+    const bare = bareToolName(n);
+    if (bare && Object.prototype.hasOwnProperty.call(COMMAND_TOOLS, bare)) return COMMAND_TOOLS[bare];
+  }
+  return null;
+}
+
+/** 算不算「执行的命令」：执行类 kind，或者命令类 MCP 工具 */
+export function isCommandCall(call: { kind?: string; title?: string; toolName?: string }): boolean {
+  return RUN_KINDS.has((call.kind || '').toLowerCase()) || !!commandToolKind(call);
+}
+
+const COMMAND_MAX = 4000;
+
+/**
+ * 命令类 MCP 工具的完整命令 / label（`rawInput.command` / `rawInput.label`）。三个引擎都取（kiro 的记录也带上这两个字段）。
+ * update 常常不带标题 / 工具名，用 `prev` 的判断是不是这一类；不是 → {}。
+ */
+export function commandTraceFields(u: any, prev?: { title?: string; toolName?: string; kind?: string }): { command?: string; label?: string } {
+  const meta = u?._meta?.claudeCode;
+  const call = {
+    kind: u?.kind || prev?.kind,
+    title: u?.title || prev?.title,
+    toolName: (typeof meta?.toolName === 'string' && meta.toolName) || (typeof u?.name === 'string' && u.name) || prev?.toolName,
+  };
+  if (!commandToolKind(call)) return {};
+  const raw = u?.rawInput;
+  const command = raw && typeof raw.command === 'string' && raw.command.trim() ? clip(raw.command.trim(), COMMAND_MAX) : undefined;
+  const label = raw && typeof raw.label === 'string' && raw.label.trim() ? clip(oneLine(raw.label), 80) : undefined;
+  return { ...(command ? { command } : {}), ...(label ? { label } : {}) };
+}
+
+/**
+ * 一条 tool_call / tool_call_update 里的工具名、入参摘要、父调用 —— 字段没有就不带。
+ * `prev` = 这个调用之前记下的那条：Claude / Codex 分批发参数（首帧有工具名、rawInput 是 {}，后面的帧只带 rawInput），
+ * 后面的帧要靠它认出是命令类工具，才能存下完整命令。
+ */
+export function toolTraceFields(u: any, prev?: { title?: string; toolName?: string; kind?: string }): ToolTraceFields {
   const meta = u?._meta?.claudeCode;
   const toolName = typeof meta?.toolName === 'string' && meta.toolName ? meta.toolName
     : typeof u?.name === 'string' && u.name ? u.name : undefined;
@@ -69,6 +132,7 @@ export function toolTraceFields(u: any): ToolTraceFields {
     ...(toolName ? { toolName } : {}),
     ...(input ? { input } : {}),
     ...(parent ? { parentToolCallId: parent } : {}),
+    ...commandTraceFields(u, prev),
   };
 }
 
@@ -79,11 +143,12 @@ export function toolTraceFields(u: any): ToolTraceFields {
  */
 export function shouldRecordToolCall(
   engine: Engine | undefined,
-  call: { kind?: string; locations?: unknown[]; diffs?: unknown[] },
+  call: { kind?: string; title?: string; toolName?: string; locations?: unknown[]; diffs?: unknown[] },
 ): boolean {
   if (engine && engine !== 'kiro') return true;
   const kind = (call.kind || '').toLowerCase();
-  return !!(call.locations?.length || call.diffs?.length || RUN_KINDS.has(kind) || kind === 'browser');
+  /* 命令类 MCP 工具（kind 是 other）也是「跑过东西」：原来 kiro 的 local_bash 整个不记，「执行的命令」里看不到它 */
+  return !!(call.locations?.length || call.diffs?.length || isCommandCall(call) || kind === 'browser');
 }
 
 /** 起止时间：第一次见到记 startedAt；第一次进入 completed / failed 记 endedAt（之后不再改） */
@@ -102,9 +167,13 @@ export function mergeToolTrace<T extends ToolTraceFields>(prev: T | undefined, n
   const toolName = next.toolName || prev?.toolName;
   const input = next.input || prev?.input;
   const parentToolCallId = next.parentToolCallId || prev?.parentToolCallId;
+  const command = next.command || prev?.command;
+  const label = next.label || prev?.label;
   return {
     ...(toolName ? { toolName } : {}),
     ...(input ? { input } : {}),
     ...(parentToolCallId ? { parentToolCallId } : {}),
+    ...(command ? { command } : {}),
+    ...(label ? { label } : {}),
   };
 }

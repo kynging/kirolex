@@ -50,7 +50,9 @@ describe('the commands panel folds itself when the turn ends', () => {
   test('an entry is one line by default, and the whole command stays reachable', () => {
     // Measured live on a real 29-command turn: every row 1 line, 23 of them multi-line
     // underneath (heredocs), so the old pre-wrap rendering made the panel enormous.
-    assert.match(body, /\{open \? commandLabel\(c\.title\) : head\}/);
+    /* 显示的是命令本身（命令类 MCP 工具的标题只是工具名，2026-11-25 第 6 轮）：callPreview 给出文字 */
+    assert.match(body, /const shown = callPreview\(c\);\s*\n\s*const \{ head, more \} = commandFirstLine\(shown\.text\);/);
+    assert.match(body, /\{open \? commandLabel\(shown\.text\) : head\}/);
     assert.match(body, /\{open \? t\('Collapse'\) : t\('\+\{n\} lines', \{ n: more \}\)\}/,
       'a multi-line command must offer its remaining lines, not hide them in a tooltip');
     assert.match(src, /function commandFirstLine\(title: string\): \{ head: string; more: number \}/);
@@ -78,7 +80,7 @@ describe('a recorded command does not claim to be running', () => {
     // Reached through commandFirstLine (collapsed / first-line form) and directly in the
     // expanded form -- what matters is that no display path shows the raw title.
     assert.match(src, /function commandFirstLine\(title: string\)[\s\S]*?const text = commandLabel\(title\);/);
-    assert.match(src, /\{open \? commandLabel\(c\.title\) : head\}/, 'the panel must render the cleaned label');
+    assert.match(src, /\{open \? commandLabel\(shown\.text\) : head\}/, 'the panel must render the cleaned label');
   });
 
   test('live state comes from the status, not from the title text', () => {

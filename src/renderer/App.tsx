@@ -544,6 +544,9 @@ export interface ToolCall {
   parentToolCallId?: string;
   startedAt?: number;
   endedAt?: number;
+  /** 命令类 MCP 工具的完整命令 / label（`main/toolTrace.ts` 的 commandTraceFields，kiro 也带） */
+  command?: string;
+  label?: string;
 }
 
 export interface FileDiff {

@@ -76,7 +76,8 @@ import { runSessionRequest, setErr, statusFor, dismissErr, clearErrOnReady, swit
 import { comboSelectView, type ComboListView } from '../comboPick.ts';
 import { effortPickerView } from '../effortPick.ts';
 import { engineModelPlaceholder, engineModelsReaskDelay, shouldReaskEngineModels } from '../engineModelView.ts';
-import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall, toolsSummaryOf } from '../toolRows.ts';
+import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall, toolsSummaryOf, callPreview } from '../toolRows.ts';
+import type { CommandToolKind } from '../../main/toolTrace.ts';
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
@@ -1703,7 +1704,8 @@ const MessageItem = memo<{
                   )}
                   {!open && p.variant === 'tool' && (
                     <RunPreview
-                      text={segCur?.current ? commandLabel(segCur.current.title) : p.body}
+                      text={segCur?.current ? callPreview(segCur.current).text : p.body}
+                      tag={segCur?.current ? callPreview(segCur.current).tag : null}
                       running={false}
                       done={streamThis && segCur ? segCur.done : 0}
                       onOpen={() => toggleTool(p.id, foldState)}
@@ -3410,11 +3412,17 @@ function commandFirstLine(title: string): { head: string; more: number } {
   return { head: text.slice(0, nl), more: text.slice(nl + 1).split('\n').filter((l) => l.trim()).length };
 }
 
+/** 命令类 MCP 工具的标签：本机（local_bash，远程会话里区分于远端的 Bash）/ 后台（bg_run）/ 监视（watch） */
+function commandTagLabel(t: (k: string) => string, tag: CommandToolKind): string {
+  return tag === 'local' ? t('This machine') : tag === 'background' ? t('Background') : t('Watching');
+}
+
 /** 折叠态里「正在运行的那一个」（2026-11-20 第 3 轮）：完整显示、自动换行，最多 5 行，超出给「+N 行」；
  *  前面带「◌ 运行中」（只在它真的在跑时），后面标「已完成 N 条」（N 为 0 时不显示）。点一下展开看全量。 */
-const RunPreview: React.FC<{ text: string; running: boolean; done: number; onOpen: () => void }> = ({ text, running, done, onOpen }) => {
+const RunPreview: React.FC<{ text: string; tag?: CommandToolKind | null; running: boolean; done: number; onOpen: () => void }> = ({ text, tag, running, done, onOpen }) => {
   const t = useT();
   const { lines, more } = previewLines(text);
+  const tagText = tag ? commandTagLabel(t, tag) : '';
   return (
     <div className="run-preview" onClick={onOpen} title={t('Expand')}>
       {running && (
@@ -3423,6 +3431,7 @@ const RunPreview: React.FC<{ text: string; running: boolean; done: number; onOpe
           {t('Running')}
         </span>
       )}
+      {tagText && <span className="run-preview-tag">{tagText}</span>}
       <span className="run-preview-text">{lines.join('\n')}</span>
       {more > 0 && <span className="run-preview-more">{t('+{n} lines', { n: more })}</span>}
       {done > 0 && <span className="run-preview-done">{t('{n} completed', { n: done })}</span>}
@@ -3469,7 +3478,8 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
       </button>
       {collapsed && cur.current && (
         <RunPreview
-          text={commandLabel(cur.current.title)}
+          text={callPreview(cur.current).text}
+          tag={callPreview(cur.current).tag}
           running={!!live && cur.running}
           done={live ? cur.done : 0}
           onOpen={toggle}
@@ -3478,20 +3488,22 @@ const CommandsPanel = memo<{ fileChanges: ToolCall[]; live?: boolean; remoteHost
       {!collapsed && (
         <ul className="files-list">
           {cmds.map((c) => {
-            const { head, more } = commandFirstLine(c.title);
+            /* 显示的是命令本身：命令类 MCP 工具（local_bash / bg_run / watch）的标题只是工具名（callPreview） */
+            const shown = callPreview(c);
+            const { head, more } = commandFirstLine(shown.text);
             const open = expandedIds.has(c.toolCallId);
             return (
               <li key={c.toolCallId} className="files-item">
                 <div className="files-item-row">
-                  <span className="files-item-kind">{c.kind}</span>
+                  <span className="files-item-kind">{shown.tag ? commandTagLabel(t, shown.tag) : c.kind}</span>
                   {/* First line by default, whole thing on click -- never only a
                       tooltip: a command is the record of what actually ran, so it has
                       to stay readable and selectable. */}
                   <span
                     className={`commands-item-title${open ? ' full' : ''}`}
-                    title={c.title}
+                    title={shown.text}
                   >
-                    {open ? commandLabel(c.title) : head}
+                    {open ? commandLabel(shown.text) : head}
                   </span>
                   {more > 0 && (
                     <button
@@ -3709,7 +3721,8 @@ const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean; autoFold?: boolean 
       {/* 折叠时预览「正在运行的那一个」（跑着时就是 summary.running）：最后一条还在跑的调用，没有就最后一条 */}
       {collapsed && cur.current && (
         <RunPreview
-          text={commandLabel(cur.current.title)}
+          text={callPreview(cur.current).text}
+          tag={callPreview(cur.current).tag}
           running={!!live && cur.running}
           done={live ? cur.done : 0}
           onOpen={togglePanel}

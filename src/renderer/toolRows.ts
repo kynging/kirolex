@@ -7,7 +7,7 @@
  *   · 子代理里跑的命令归到 Task 下面，不再混进主线的「运行的命令」（改的文件仍然进「改动的文件」—— 那块是按文件汇总的）。
  * 只给 Claude Code / Codex 会话画（ChatArea 按引擎判）：kiro 的老判据也会落盘带 locations 的 Read，不能让它们在 kiro 会话里冒出这一块。
  */
-import { RUN_KINDS } from '../main/toolTrace.ts';
+import { bareToolName, commandToolKind, isCommandCall, type CommandToolKind } from '../main/toolTrace.ts';
 
 export interface ToolCallLike {
   toolCallId: string;
@@ -22,6 +22,9 @@ export interface ToolCallLike {
   parentToolCallId?: string;
   startedAt?: number;
   endedAt?: number;
+  /** 命令类 MCP 工具的完整命令 / label（`toolTrace.ts` 的 commandTraceFields） */
+  command?: string;
+  label?: string;
 }
 
 export interface ToolRow<T extends ToolCallLike = ToolCallLike> {
@@ -42,7 +45,8 @@ export function nestedToolIds(calls: ToolCallLike[]): Set<string> {
 /** 已经在别的面板里有一行的（命令 / 改文件 / 浏览器） */
 function ownPanel(c: ToolCallLike): boolean {
   const kind = (c.kind || '').toLowerCase();
-  return RUN_KINDS.has(kind) || kind === 'browser' || MUTATING.has(kind) || !!c.diffs?.length;
+  /* 命令类 MCP 工具（local_bash / bg_run / watch）也算命令，在「运行的命令」里 */
+  return isCommandCall(c) || kind === 'browser' || MUTATING.has(kind) || !!c.diffs?.length;
 }
 
 /** 是不是派子代理的那种调用（Claude Code 的 Task 工具名是 `Agent`，老版本 `Task`） */
@@ -81,7 +85,7 @@ export function mainlineCommands<T extends ToolCallLike>(calls: T[]): T[] {
   const nested = nestedToolIds(calls);
   const byId = new Map<string, T>();
   for (const c of calls) {
-    if (RUN_KINDS.has((c.kind || '').toLowerCase()) && !nested.has(c.toolCallId)) byId.set(c.toolCallId, c);
+    if (isCommandCall(c) && !nested.has(c.toolCallId)) byId.set(c.toolCallId, c);
   }
   return Array.from(byId.values());
 }
@@ -130,4 +134,50 @@ export function toolsSummaryOf<T extends ToolCallLike>(rows: ToolRow<T>[]): { to
     for (const c of [call, ...children]) if (toolState(c.status) === 'running') running = c;
   }
   return { tools, subagents, running };
+}
+
+/** 去掉后端「Running: …」那种前缀（同 ChatArea 的 commandLabel） */
+const stripRunning = (title: string): string => String(title || '').replace(/^\s*(?:running|executing|running command)\s*:\s*/i, '');
+
+/**
+ * 从入参摘要（`summarizeToolInput` 的 `键=值` 那一行，或截短的 JSON）里取一个值。
+ * 带引号的值是 JSON 字符串；被 200 字截断、没有收尾引号的，取到行尾（末尾那个「…」留着）。
+ */
+function inputValue(input: string | undefined, key?: string): string | undefined {
+  if (!input) return undefined;
+  const k = key ? key.replace(/[^\w]/g, '') : '\\w+';
+  const m = new RegExp(`(?:^|\\s)${k}=("(?:[^"\\\\]|\\\\.)*"|"[^]*$|\\S+)`).exec(input);
+  if (m) {
+    const v = m[1];
+    if (!v.startsWith('"')) return v;
+    try { return JSON.parse(v); } catch { return v.slice(1); }
+  }
+  /* 认不得的键时摘要是整份 JSON（session_send 的 {"id":…}）：取会话 id / 名字这类主要参数 */
+  if (!key) {
+    const j = /"(?:id|sessionId|session_id|label|name)"\s*:\s*"([^"]*)"/.exec(input);
+    if (j) return j[1];
+  }
+  return undefined;
+}
+
+/**
+ * **折叠态 / 面板里一条调用显示什么**（2026-11-25 第 6 轮：「折叠后看不出到底在跑什么」）：
+ *   · 命令类 MCP 工具（local_bash / bg_run / watch）→ 命令本身（bg_run / watch 先一行 label），`tag` 标本机 / 后台 / 监视；
+ *     旧记录没有完整命令就用入参摘要里截断的那段（带「…」），再没有就短工具名；
+ *   · 自带的 shell（执行类 kind）→ 标题就是命令，去掉「Running:」；
+ *   · 其他工具 → 短工具名（去掉 `mcp__xxx__` 前缀）+ 主要参数（`Read src/x.ts`、`session_send → s_…`）；
+ *     没有入参时：标题本来就是描述（带空格）就用标题，否则只给短工具名。
+ */
+export function callPreview(c: ToolCallLike): { text: string; tag: CommandToolKind | null } {
+  const tag = commandToolKind(c);
+  const short = bareToolName(c.toolName) || bareToolName(c.title);
+  if (tag) {
+    const command = c.command || inputValue(c.input, 'command') || short || stripRunning(c.title);
+    return { text: c.label && tag !== 'local' ? `${c.label}\n${command}` : command, tag };
+  }
+  if (isCommandCall(c)) return { text: stripRunning(c.title), tag: null };
+  const arg = inputValue(c.input);
+  if (short && arg) return { text: /^session_/.test(short) ? `${short} → ${arg}` : `${short} ${arg}`, tag: null };
+  const title = stripRunning(c.title);
+  return { text: /\s/.test(title.trim()) ? title : short || title, tag: null };
 }

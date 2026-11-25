@@ -52,18 +52,13 @@ import { looksLikeSessionId } from '../../main/projectSanity.ts';
 import { initialProjects, initialSessions, seedProjectsFromSessions } from '../projectSeed.ts';
 import { wantsEditFork } from '../../main/editFork.ts';
 import { planTextOf } from '../permissionButtons.ts';
-import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
+import { commandTraceFields, isCommandCall, mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
 import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
 import { withoutPermissionCard, enqueuePermission, currentPermissions, settlePermission, allowAllPermissions, permissionToolKey } from '../permissionCards';
 
 export type { LoopSpec } from '../loopMachine';
 export type { ScheduleSpec } from '../../main/schedule';
-
-/** Tool kinds that RUN something rather than touch a file. Mirrors RUN_KINDS in the
- *  main process: a command carries neither locations nor diffs, so without this it is
- *  dropped and the turn shows a script being created but never run. */
-const RUN_KINDS = new Set(['execute', 'run', 'bash', 'shell', 'command', 'terminal']);
 
 type ConnectionStatus = 'disconnected' | 'connecting' | 'connected';
 
@@ -2691,7 +2686,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             locations,
             diffs,
             content: extractToolOutput(update) || undefined,
-            ...(traced ? { ...toolTraceFields(update), ...toolTimes(undefined, update.status, Date.now()) } : {}),
+            ...(traced ? { ...toolTraceFields(update), ...toolTimes(undefined, update.status, Date.now()) } : commandTraceFields(update)),
           };
           toolCallsRef.current.set(update.toolCallId, tc);
           // Track per session so it is cleared even if you switch away mid-tool
@@ -2724,12 +2719,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             if (output) existing.content = output;
             const traceEngine = sessionsRef.current.find((s) => s.id === targetSid)?.engine;
             if (traceEngine && traceEngine !== 'kiro') {
-              Object.assign(existing, mergeToolTrace(existing, toolTraceFields(update)), toolTimes(existing, existing.status, Date.now()));
+              Object.assign(existing, mergeToolTrace(existing, toolTraceFields(update, existing)), toolTimes(existing, existing.status, Date.now()));
+            } else {
+              /* kiro：命令类 MCP 工具带上完整命令 / label（和主进程落盘同一个判据） */
+              Object.assign(existing, mergeToolTrace(existing, commandTraceFields(update, existing)));
             }
             toolCallsRef.current.set(update.toolCallId, existing);
             /* kiro：原来的判据（动过文件 / 跑过东西）；Claude Code / Codex：每条都挂（审计 3a） */
             if (traceEngine && traceEngine !== 'kiro' ? true : (existing.locations?.length || existing.diffs?.length
-                || RUN_KINDS.has((existing.kind || '').toLowerCase()))) {
+                || isCommandCall(existing))) {
               attachFileChangeToLatestTurn(targetSid, existing, isActiveSession);
             }
 

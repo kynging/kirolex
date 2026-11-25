@@ -145,7 +145,7 @@ import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHin
 import { createCreationGate } from './creationGate.ts';
 import { CreationSwitchBook, applyBeforeStart, settleOnCreated, type CreationSwitch } from './creationSwitches.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
-import { mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from './toolTrace.ts';
+import { commandTraceFields, mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from './toolTrace.ts';
 import { forkPointMeta, mainlineAcpMessageId, planEditFork, supportsForkPoint } from './editFork.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
@@ -9151,10 +9151,11 @@ function wireSession(sessionId: string, entry: SessionEntry) {
           locations: locations.length > 0 ? locations : previous?.locations,
           diffs: diffs.length > 0 ? diffs : previous?.diffs,
           content: output ? clampToolOutput(output) : previous?.content,
-          /* Claude Code / Codex：工具名、入参摘要、父调用（子代理）、起止时间（`toolTrace.ts`）；kiro 的记录形状不变 */
+          /* Claude Code / Codex：工具名、入参摘要、父调用（子代理）、起止时间（`toolTrace.ts`）；kiro 的记录形状不变，
+             只有命令类 MCP 工具（local_bash / bg_run / watch）多带完整命令 / label */
           ...(engineOf(entry.profile) !== 'kiro'
-            ? { ...mergeToolTrace(previous, toolTraceFields(u)), ...toolTimes(previous, status, Date.now()) }
-            : {}),
+            ? { ...mergeToolTrace(previous, toolTraceFields(u, previous)), ...toolTimes(previous, status, Date.now()) }
+            : mergeToolTrace(previous, commandTraceFields(u, previous))),
         };
         /* 远程会话：这次写已经落在远端缓存以外（没经过权限闸）—— 说出来，给「复制到本机」。每个调用只说一次。 */
         if (remoteHost && status === 'completed') {

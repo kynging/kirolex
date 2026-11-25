@@ -55,6 +55,9 @@ export interface StoredToolCall {
   parentToolCallId?: string;
   startedAt?: number;
   endedAt?: number;
+  /** 命令类 MCP 工具（local_bash / bg_run / watch）的完整命令和 label —— 三个引擎都带（kiro 也是），显示用 */
+  command?: string;
+  label?: string;
 }
 
 export interface StoredMessage {
