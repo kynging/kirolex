@@ -10,7 +10,7 @@ import { formatJsonOnOpen, formatJsonText } from '../jsonText.ts';
 import ReactMarkdown from 'react-markdown';
 import { mdText } from '../mdText';
 // 「这段文字是不是路径」的判据 —— 抽出来是为了能被 node:test 测到（.tsx 跑不了测试）
-import { FILE_TOKEN_RE, PATH_RE } from '../filePaths';
+import { FILE_TOKEN_RE, PATH_RE, hrefToLocalPath } from '../filePaths';
 // 清空上下文那条分界线：默认视图收到它之后，并在原位画出来（判据见那个模块）
 import { sinceLastClear, isClearCommand, clearNoteText } from '../clearBoundary';
 // 这一格自己的会话内搜索：命中算术（纯，可测）+ 高亮（Range/CSS.highlights，不动 DOM）
@@ -248,7 +248,8 @@ const MD_COMPONENTS = {
       );
     }
     if (!href) return <span>{children}</span>;
-    return <FileRef path={href} as="a">{children}</FileRef>;
+    // href 被 normalizeUri 百分号编码过（中文文件名、空格…），还原成真实路径再查存在 / 打开。
+    return <FileRef path={hrefToLocalPath(href)} as="a">{children}</FileRef>;
   },
   // A table gets a scrolling wrapper. `table-layout: fixed` divides the pane between
   // the columns, which keeps a table inside its box but cannot make 5 columns readable

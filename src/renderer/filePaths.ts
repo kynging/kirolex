@@ -24,3 +24,20 @@ export const FILE_TOKEN_RE = /^(?:[A-Za-z]:\\[^\n\r\t<>|?*]+|~?\/[^\n\r\t<>|?*]+
  * 句子里的斜杠链接化。
  */
 export const PATH_RE = /(?:[A-Za-z]:\\[^\s"'`)]+|\/(?:Users|home|tmp|var|etc|opt|usr|private|Applications|mnt|srv|root)\/[^\n\r\t<>|"'`]*?\.[A-Za-z0-9]{1,8}(?=[\s)"'`,，。；;：]|$)|(?:\/[\p{L}\p{N}._\-]+)+\.[A-Za-z0-9]{1,8})/gu;
+
+/**
+ * **markdown 链接的 href → 本机路径**（`MD_COMPONENTS.a` 交给 FileRef 之前用它）。
+ *
+ * mdast-util-to-hast 生成 href 时走 `normalizeUri`，会把非 ASCII（中文文件名）、空格、反斜杠等
+ * 百分号编码 —— `…/files/阿里云….md` 变成 `…/files/%E9%98%BF….md`，存在检查就查不到了。
+ * 所以非 URL 的 href 先 `decodeURI` 还原；编码畸形（`%E9%9`）解不开就用原值，不抛错。
+ * 真实 URL（http/https/mailto/tel）原样返回，不解码。
+ */
+export function hrefToLocalPath(href: string): string {
+  if (/^(https?:|mailto:|tel:)/i.test(href)) return href;
+  try {
+    return decodeURI(href);
+  } catch {
+    return href;
+  }
+}
