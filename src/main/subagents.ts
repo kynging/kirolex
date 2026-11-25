@@ -106,3 +106,134 @@ export function subagentTag(rows: SubagentRow[] | undefined, lang: UiLang = 'zh'
 export function mergeSubagentList(_previous: SubagentRow[] | undefined, next: SubagentRow[]): SubagentRow[] {
   return next;
 }
+
+/**
+ * **这一轮里的子代理，落盘用**（2026-11-25「能看到子代理在跑，但看不到子代理都在干啥」）。
+ *
+ * 名单（`SubagentRow`）是进程级的整份替换，只够侧栏的标记用；聊天里要的是「这一轮派了谁、给了什么任务、
+ * 它自己说了什么」，而且重启后还要看得到 —— 所以每轮攒一份，`flushAssistant` 挂到助手消息的 `subagents` 上。
+ * 主进程（落盘）和渲染层（实时）用同一套折叠，两边看到的一样。
+ */
+export interface TurnSubagent {
+  /** 子代理自己的 ACP session id —— 它的工具调用带的 `childSessionId` 就是这个 */
+  sessionId: string;
+  /** 名单还没到时是空串（只见过它的调用 / 输出），名单到了补上 */
+  name: string;
+  agentName: string;
+  task: string;
+  /** 名单没到时是 `unknown` */
+  statusType: string;
+  statusMessage?: string;
+  group?: string;
+  /** kiro 报的创建时间（执行器那台机器的钟，远程会话可能和本机差一点） */
+  createdAtMs?: number;
+  /** 本机第一次见到它（名单 / 调用 / 输出）—— 用时从这里算 */
+  seenAtMs?: number;
+  /** 本机第一次见到它 terminated */
+  endedAtMs?: number;
+  /** 子代理自己的正文 / 思考（不拼进父回复），太长只留最后 `SUBAGENT_OUTPUT_MAX` 字 */
+  text?: string;
+  thinking?: string;
+}
+
+export const SUBAGENT_OUTPUT_MAX = 20_000;
+
+function placeholder(sessionId: string, now: number): TurnSubagent {
+  return { sessionId, name: '', agentName: '', task: '', statusType: 'unknown', seenAtMs: now };
+}
+
+function withRow(cur: TurnSubagent | undefined, row: SubagentRow, now: number): TurnSubagent {
+  const ended = row.statusType === 'terminated';
+  const next: TurnSubagent = {
+    ...(cur || {}),
+    sessionId: row.sessionId,
+    name: row.name,
+    agentName: row.agentName,
+    task: row.task || cur?.task || '',
+    statusType: row.statusType,
+    seenAtMs: cur?.seenAtMs ?? now,
+  };
+  /* 状态说明跟着这一份名单走：terminated 那份不带 message，留着上一份的「Running」就错了 */
+  if (row.statusMessage) next.statusMessage = row.statusMessage; else delete next.statusMessage;
+  if (row.group) next.group = row.group;
+  if (row.createdAtMs !== undefined) next.createdAtMs = row.createdAtMs;
+  if (ended) next.endedAtMs = cur?.endedAtMs ?? now; else delete next.endedAtMs;
+  return next;
+}
+
+/**
+ * 把一份名单折进这一轮。名单是进程级的，上一轮早就结束的子代理还会留在里面 —— 只收：
+ * 已经在这一轮里的、这一轮见过它调用 / 输出的（`knownIds`）、还在跑的、或者在这一轮开始之后创建的。
+ * 这一轮里有过、这份名单里没有的，留着（它做过的事是这一轮的一部分）。
+ */
+export function foldTurnRoster(
+  prev: TurnSubagent[] | undefined,
+  rows: SubagentRow[],
+  opts: { turnStartedAt: number; now: number; knownIds?: Iterable<string> },
+): TurnSubagent[] {
+  const out = (prev || []).slice();
+  const at = new Map(out.map((s, i) => [s.sessionId, i] as const));
+  const known = new Set(opts.knownIds || []);
+  for (const row of rows) {
+    const i = at.get(row.sessionId);
+    if (i !== undefined) { out[i] = withRow(out[i], row, opts.now); continue; }
+    const fresh = known.has(row.sessionId) || row.statusType !== 'terminated'
+      || (row.createdAtMs !== undefined && row.createdAtMs >= opts.turnStartedAt);
+    if (!fresh) continue;
+    at.set(row.sessionId, out.length);
+    out.push(withRow(undefined, row, opts.now));
+  }
+  return out;
+}
+
+/** 见到一个子代理的调用：名单还没到就先按 id 占一行 */
+export function noteSubagent(prev: TurnSubagent[] | undefined, childSessionId: string, now: number): TurnSubagent[] {
+  const list = prev || [];
+  if (!childSessionId || list.some((s) => s.sessionId === childSessionId)) return list;
+  return [...list, placeholder(childSessionId, now)];
+}
+
+/** 子代理的一段正文 / 思考，接到它自己那一行上 */
+export function appendSubagentOutput(
+  prev: TurnSubagent[] | undefined,
+  childSessionId: string,
+  kind: 'text' | 'thinking',
+  chunk: string,
+  now: number,
+  max = SUBAGENT_OUTPUT_MAX,
+): TurnSubagent[] {
+  if (!childSessionId || !chunk) return prev || [];
+  const list = noteSubagent(prev, childSessionId, now);
+  return list.map((s) => {
+    if (s.sessionId !== childSessionId) return s;
+    let joined = (s[kind] || '') + chunk;
+    if (joined.length > max) joined = `…${joined.slice(joined.length - max + 1)}`;
+    return { ...s, [kind]: joined };
+  });
+}
+
+/** 读盘 / IPC 来的 `subagents` 字段：认得的留下，形状不对的丢掉（读者容忍未知字段） */
+export function asTurnSubagents(raw: unknown): TurnSubagent[] | undefined {
+  if (!Array.isArray(raw)) return undefined;
+  const out: TurnSubagent[] = [];
+  for (const item of raw) {
+    const sessionId = typeof item?.sessionId === 'string' ? item.sessionId.trim() : '';
+    if (!sessionId) continue;
+    const str = (v: unknown) => (typeof v === 'string' ? v : '');
+    const num = (v: unknown) => (typeof v === 'number' && Number.isFinite(v) ? v : undefined);
+    const s: TurnSubagent = {
+      sessionId,
+      name: str(item.name),
+      agentName: str(item.agentName),
+      task: str(item.task),
+      statusType: str(item.statusType) || 'unknown',
+    };
+    if (str(item.statusMessage)) s.statusMessage = item.statusMessage;
+    if (str(item.group)) s.group = item.group;
+    for (const k of ['createdAtMs', 'seenAtMs', 'endedAtMs'] as const) { const n = num(item[k]); if (n !== undefined) s[k] = n; }
+    if (str(item.text)) s.text = item.text;
+    if (str(item.thinking)) s.thinking = item.thinking;
+    out.push(s);
+  }
+  return out.length ? out : undefined;
+}

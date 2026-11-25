@@ -2978,6 +2978,22 @@ button, input, select, textarea {
   border-left: 2px solid color-mix(in srgb, var(--accent) 35%, transparent);
   display: flex; flex-direction: column; gap: 1px;
 }
+/* 「🤖 子代理」卡片（kiro 原生子代理，ChatArea SubagentsPanel）：行样式沿用「用过的工具」 */
+.subagent-title { font-weight: 600; color: var(--text-primary); flex: 0 1 auto; }
+.subagent-status { flex: 0 1 auto; min-width: 0; display: inline-flex; align-items: baseline; gap: 4px; font-size: 11px; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+.subagent-status-msg { overflow: hidden; text-overflow: ellipsis; }
+.subagent-head-running { flex: none; font-size: 11px; color: var(--accent); }
+.subagent-task {
+  margin: 0 4px 4px 22px; font-size: 12px; line-height: 1.45; color: var(--text-secondary);
+  white-space: pre-wrap; overflow-wrap: anywhere; cursor: pointer;
+  display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; overflow: hidden;
+}
+.subagent-task.full { display: block; -webkit-line-clamp: unset; }
+.subagent-row > .run-preview { padding: 0 4px 4px 22px; }
+.subagent-run-line { display: flex; align-items: baseline; gap: 8px; padding: 0 12px 6px 28px; font-size: 12px; }
+.subagent-run-line .subagent-name { flex: none; color: var(--text-primary); font-weight: 600; }
+.subagent-output > summary { cursor: pointer; font-size: 11px; color: var(--text-muted); }
+.subagent-reply { font-size: 12px; padding: 2px 8px; border-left: 2px solid var(--border); }
 
 /* Input area */
 .chat-input-area {

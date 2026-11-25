@@ -91,7 +91,7 @@ import { shouldSyncSession } from './syncChoice.ts';
 import { isAdvancedOnly, findAdvancedBackups, vetBackupRecord, refusesProjectChange } from './advancedOnly.ts';
 import { listAttachedSessionIds } from './attachedList.ts';
 import { parseSkillDoc, describeSkill, kiroSkillTarget, backupsToPrune } from './skillDoc.ts';
-import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, type SubagentRow } from './subagents.ts';
+import { isSubagentListUpdate, parseSubagentList, mergeSubagentList, activeSubagents, foldTurnRoster, noteSubagent, appendSubagentOutput, type SubagentRow, type TurnSubagent } from './subagents.ts';
 import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleOwnerGate, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
@@ -145,7 +145,7 @@ import { attachFailureLine, coldProfileBits, durableRemoteId, type ColdRecordHin
 import { createCreationGate } from './creationGate.ts';
 import { CreationSwitchBook, applyBeforeStart, settleOnCreated, type CreationSwitch } from './creationSwitches.ts';
 import { settleCancelledToolCalls } from './cancelSettle.ts';
-import { commandTraceFields, mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from './toolTrace.ts';
+import { commandTraceFields, mergeToolTrace, shouldRecordToolCall, subagentTraceFields, toolTimes, toolTraceFields } from './toolTrace.ts';
 import { forkPointMeta, mainlineAcpMessageId, planEditFork, supportsForkPoint } from './editFork.ts';
 import { windowIsActive } from './idleNotice.ts';
 import { moveDirToTrash, scheduleBackgroundRetries, waitAtMost } from './sessionPurge.ts';
@@ -347,6 +347,8 @@ interface SessionEntry {
   /** kiro's native subagents for THIS chat, as last reported by `_kiro.dev/subagent/list_update`.
    *  Kept so the left rail can carry a tag for as long as one is still running. */
   subagents?: SubagentRow[];
+  /** 这一轮派出去的子代理（名字 / 任务 / 状态 / 它自己的正文和思考，`foldTurnRoster`）—— `flushAssistant` 挂到助手消息的 `subagents` 上落盘 */
+  turnSubagents?: TurnSubagent[];
   /**
    * 这条会话能用的斜杠命令（`/clear`、`/agent`、`/model`…），后端在 `_kiro.dev/commands/available`
    * 里推过来的**原样**那一份。
@@ -9141,7 +9143,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     // turn end (never the in-flight partial, §7). The ACP session/update
     // payload is { sessionId, update: { sessionUpdate, content: { text } } }.
     try {
-      const u = data?.update;
+      const u = ownUpdate(data);
       if (
         entry.suppressCancellationChunks &&
         u?.sessionUpdate === 'agent_message_chunk'
@@ -9228,6 +9230,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
             sessionNotice(sessionId, strayWriteNotice(labelForHost(KIROLEX_CONFIG_PATH, remoteHost) || remoteHost, stray), { copyRemote: stray });
           }
         }
+        /* kiro 原生子代理的调用多记：谁做的（childSessionId）、工具名 + 主要参数、起止时间（`subagentCallFields`） */
+        Object.assign(next, subagentCallFields(entry, data, previous, status));
         // Outstanding-tool bookkeeping for wedge detection (see openToolCalls).
         // `lastUpdate` is rewritten on every update, so it measures STALENESS, not
         // age: a tool that keeps reporting keeps its session protected. `startedAt`
@@ -9364,11 +9368,14 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       const live = activeSubagents(entry.subagents);
       logger.info('subagent', `sessionId=${sessionId} roster=${roster.length} 运行中=${live.length}`);
       mainWindow?.webContents.send('acp:subagents', { sessionId, subagents: entry.subagents });
+      /* 这一轮的那份（落盘用，`foldTurnRoster`）：只在一轮之内收 —— 名单是进程级的，上一轮的子代理还会留在里面 */
+      if (entry.busy || entry.autonomous) {
+        const now = Date.now();
+        const knownIds = entry.fileChanges.map((c) => c.childSessionId).filter((id): id is string => !!id);
+        entry.turnSubagents = foldTurnRoster(entry.turnSubagents, roster, { turnStartedAt: entry.turnStartedAt ?? now, now, knownIds });
+      }
     }
-    const originAcpSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
-    const childSessionId = originAcpSessionId && entry.cliSessionId && originAcpSessionId !== entry.cliSessionId
-      ? originAcpSessionId
-      : undefined;
+    const childSessionId = childSessionOf(data, entry);
     /*
       本会话花费（审计 F3）：Claude Code 的 `usage_update.cost` 是**这个适配器进程**的累计值，进程一换就从 0 数起 ——
       在这里跨进程累计、落进会话记录（`sessionCost.ts`），渲染层直接显示 `kirolexCost`。kiro 不发这个，照旧走 credits。
@@ -9400,6 +9407,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
   entry.replayUpdates = (list) => { for (const d of list) onUpdate(d, true); };
+  /** onUpdate 里父回复的记账读的 update：kiro 原生子代理自己的正文 / 思考在这里被吃掉（归到它那一行，`takeSubagentOutput`），不拼进父回复 */
+  function ownUpdate(d: any): any { return takeSubagentOutput(sessionId, entry, d); }
   /*
     后端 stderr 里**值得看的那几行**送到界面上（判据在 `stderrNotice`）—— 原来这里只进日志，
     渲染层的 `onError` 只 `console.error`，于是 MCP server 起不来时界面上什么都没说。
@@ -9493,6 +9502,39 @@ function settleTurnUsage(sessionId: string, entry: SessionEntry, acc: TurnUsageA
   return turnUsage;
 }
 
+/** 这条 update 是不是子代理发来的：发它的 ACP session 不是这条会话当前的后端会话 —— 是就返回子代理自己的 session id（见 NATIVE SUBAGENTS） */
+function childSessionOf(data: any, entry: SessionEntry): string | undefined {
+  const originAcpSessionId = typeof data?.sessionId === 'string' ? data.sessionId : '';
+  return originAcpSessionId && entry.cliSessionId && originAcpSessionId !== entry.cliSessionId ? originAcpSessionId : undefined;
+}
+
+/**
+ * kiro 原生子代理自己的正文 / 思考：接到它那一行（`turnSubagents`），**不拼进父回复**、不切父回复的段 ——
+ * 吃掉了就返回 undefined（onUpdate 里父回复的记账就都看不到它），否则原样返回 update。
+ * "出过文字"照旧算（自动重发的判据，`promptRetry.ts`）。
+ */
+function takeSubagentOutput(sessionId: string, entry: SessionEntry, data: any): any {
+  const u = data?.update;
+  const child = engineOf(entry.profile) === 'kiro' ? childSessionOf(data, entry) : undefined;
+  const kind = u?.sessionUpdate === 'agent_message_chunk' ? 'text' as const : u?.sessionUpdate === 'agent_thought_chunk' ? 'thinking' as const : null;
+  if (!child || !kind) return u;
+  const text = String(u?.content?.text || '');
+  if (text) {
+    entry.turnSubagents = appendSubagentOutput(entry.turnSubagents, child, kind, text, Date.now());
+    if (kind === 'text') { entry.textThisTurn = true; noteTurnStarted(sessionId, entry); }
+  }
+  return undefined;
+}
+
+/** kiro 原生子代理的调用多记的：谁做的（childSessionId）、工具名 + 主要参数、起止时间 —— 归到那个子代理名下显示；主线的调用 → {} */
+function subagentCallFields(entry: SessionEntry, data: any, previous: store.StoredToolCall | undefined, status: string): Partial<store.StoredToolCall> {
+  const u = data?.update;
+  const childSessionId = engineOf(entry.profile) === 'kiro' ? childSessionOf(data, entry) || previous?.childSessionId : undefined;
+  if (!childSessionId) return {};
+  entry.turnSubagents = noteSubagent(entry.turnSubagents, childSessionId, Date.now());
+  return { ...subagentTraceFields(u, previous), ...toolTimes(previous, status, Date.now()), childSessionId };
+}
+
 /** Flush the accumulated assistant message to the durable transcript (called on
  *  turn completion). No-op if nothing accumulated. */
 /*  `autonomous`：后端自己起的那一轮（`autonomousTurn.ts`）—— 带来源标记 `origin: 'autonomous'`。
@@ -9509,7 +9551,8 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   const turnUsage = entry ? settleTurnUsage(sessionId, entry, turnUsageAcc) : null;
   // A wedge note alone is enough to persist: a turn cut before it produced
   // anything still owes the user an explanation for why it stopped.
-  if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote && !turnUsage)) {
+  /* 只有子代理说过话 / 名单到过的一轮也要落：它们做了什么是这一轮的一部分（turnSubagents） */
+  if (!entry || (!entry.assistantBuf && entry.fileChanges.length === 0 && !entry.wedgeNote && !turnUsage && !entry.turnSubagents?.length)) {
     if (entry) entry.lastAcpMessageId = undefined;   // 这一轮没落盘的东西：锚点也别留给下一轮
     return;
   }
@@ -9533,6 +9576,8 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
     /* 后端自己起的那一轮：来源标记（这一轮没有用户消息，`currentUserMessageId` 在 autonomousDeps 里摘掉了，上面两项不会有） */
     /* 这一轮的真实消耗：重启、切会话、翻历史都还看得到（引擎一个值都没报就没有，界面回退到估算） */
     ...(turnUsage ? { turnUsage } : {}),
+    /* kiro 原生子代理：谁、做什么、说了什么（它们的调用在 toolCalls 里按 childSessionId 对上） */
+    ...(entry.turnSubagents?.length ? { subagents: entry.turnSubagents } : {}),
     ...(opts?.autonomous ? { origin: 'autonomous' as const } : {}),
   });
   // Keep the rendered history.md in step with the conversation, so the path the
@@ -9572,6 +9617,7 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   entry.assistantMsgId = null;
   entry.lastAcpMessageId = undefined;
   entry.fileChanges = [];
+  entry.turnSubagents = undefined;
   entry.wedgeNote = undefined;
 }
 
@@ -12243,6 +12289,7 @@ ${hint}` : ''}` };
       /* KiroLex 发起的第一轮开始了：回放窗口关（`replayGuard.outsideTurnVerdict`）—— 之后一轮之外的正文是后端自己起的一轮 */
       entry.replayWindow = false;
       entry.turnRunning = true;
+      entry.turnSubagents = undefined;   // 这一轮的子代理从头记（上一轮没落盘的不带过来）
       entry.turnStartedAt = Date.now();   // 控制入口 `GET /sessions/:id/status` 的 turnStartedAt
       emitSessionBusy(sessionId);
       // Tag this turn so a *rejected duplicate* invocation can never clear the

@@ -23,7 +23,7 @@ import { engineCanSteer, steerFailureReasonKey } from '../steerRoute';
 // 往输入框交接文本的语义：取走一次就清（见那个模块开头那段）
 import { shouldApplyHandoff } from '../handoffDraft';
 import { formatMemoryBytes, type MemoryScope, type MemoryWarning } from '../../main/memoryPolicy';
-import { activeSubagents, type SubagentRow } from '../../main/subagents';
+import { activeSubagents, type SubagentRow, type TurnSubagent } from '../../main/subagents';
 import { fixedSuggestionFallback, planSuggestionLookup } from '../../main/promptSuggestions.ts';
 import remarkGfm from 'remark-gfm';
 import rehypeHighlight from 'rehype-highlight';
@@ -77,6 +77,7 @@ import { comboSelectView, type ComboListView } from '../comboPick.ts';
 import { effortPickerView } from '../effortPick.ts';
 import { engineModelPlaceholder, engineModelsReaskDelay, shouldReaskEngineModels } from '../engineModelView.ts';
 import { toolRowsOf, mainlineCommands, toolState, toolDuration, toolResultSummary, childProgress, isSubagentCall, toolsSummaryOf, callPreview } from '../toolRows.ts';
+import { subagentGroups, mergeTurnSubagents, currentStep, type SubagentGroup } from '../subagentGroups.ts';
 import type { CommandToolKind } from '../../main/toolTrace.ts';
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
@@ -1638,6 +1639,8 @@ const MessageItem = memo<{
     }
     return Array.from(byId.values());
   }, [segments]);
+  /* 这一轮派出去的 kiro 原生子代理（几段各自带的合成一份，`subagentGroups.ts`） */
+  const turnSubagents = useMemo(() => mergeTurnSubagents(segments.map((s) => s.subagents)), [segments]);
   const estimatedTokens = !actionLocked
     ? estimateVisibleTokens(`${questionContent || ''}\n${combinedText}`)
     : null;
@@ -1736,8 +1739,10 @@ const MessageItem = memo<{
             </div>
           );
         })}
-        {turnFileChanges.length > 0 && (
+        {(turnFileChanges.length > 0 || turnSubagents.length > 0) && (
           <div className="message-turn-panels">
+            {/* kiro 原生子代理：谁、做什么任务、它的调用和回复（带 childSessionId 的调用不进下面主线的面板） */}
+            <SubagentsPanel calls={turnFileChanges} roster={turnSubagents} live={isStreaming && isLastAssistant} autoFold={foldTools} />
             <FileChangesPanel fileChanges={turnFileChanges} remoteHost={remoteHost} engine={engine} />
             {/* `live` = this turn is the one still running. The panel is open while it
                 runs and closes itself when it ends, so a finished turn does not leave a
@@ -3780,6 +3785,146 @@ const ToolsPanel = memo<{ calls: ToolCall[]; live?: boolean; autoFold?: boolean 
                           );
                         })}
                       </ul>
+                    )}
+                  </div>
+                )}
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+});
+
+/**
+ * 「🤖 子代理」卡片 —— kiro 原生子代理（`Spawning agent crew`）这一轮派了谁、给了什么任务、做了什么（`subagentGroups.ts`）。
+ * 每个子代理一行：名字 + agent、状态（运行中 / 已结束 + statusMessage）、用时、调用了几次工具；任务折叠时最多 2 行，点开全文。
+ * 点开一行：它的每个调用（工具名 + 主要参数 + 结果摘要 + 用时）、它自己的回复和思考（折叠）。改的文件照旧在「改动的文件」里。
+ * 折叠规则和「运行的命令」同一条（`panelFoldState`）；折叠着、这一轮还在跑时，照样列出正在跑的子代理和它正在做的那一步。
+ */
+const SubagentsPanel = memo<{ calls: ToolCall[]; roster: TurnSubagent[]; live?: boolean; autoFold?: boolean }>(({ calls, roster, live, autoFold = false }) => {
+  const t = useT();
+  const groups = useMemo(() => subagentGroups(calls, roster, !!live), [calls, roster, live]);
+  const [pinned, setPinned] = useState<SegmentFoldOverride | null>(null);
+  const foldState = panelFoldState(autoFold, !!live, pinned ?? undefined);
+  const collapsed = !foldState.open;
+  const togglePanel = () => setPinned(toggleSegmentFold(foldState));
+  const [openIds, setOpenIds] = useState<Set<string>>(new Set());
+  const [fullTask, setFullTask] = useState<Set<string>>(new Set());
+  const anyRunning = groups.some((g) => g.running);
+  const [now, setNow] = useState(() => Date.now());
+  /* 有子代理在跑：用时每秒走一下（跑完就停） */
+  useEffect(() => {
+    if (!live || !anyRunning) return;
+    const id = window.setInterval(() => setNow(Date.now()), 1000);
+    return () => window.clearInterval(id);
+  }, [live, anyRunning]);
+  if (!groups.length) return null;
+  const flip = (set: React.Dispatch<React.SetStateAction<Set<string>>>, id: string) => set((prev) => {
+    const next = new Set(prev);
+    if (next.has(id)) next.delete(id); else next.add(id);
+    return next;
+  });
+  const totalCalls = groups.reduce((n, g) => n + g.calls.length, 0);
+  const running = groups.filter((g) => g.running);
+  const status = (g: SubagentGroup<ToolCall>) => (
+    <span className={`subagent-status${g.running ? ' running' : ''}`}>
+      {g.running
+        ? <span className="tool-running-indicator"><span className="tool-running-spinner" aria-hidden="true" />{t('Running')}</span>
+        : t('Ended')}
+      {g.statusMessage && <span className="subagent-status-msg">· {g.statusMessage}</span>}
+    </span>
+  );
+  return (
+    <div className="turn-panel subagents-panel">
+      <button className="turn-panel-head" onClick={togglePanel} aria-expanded={!collapsed}>
+        <span className="turn-panel-caret">{collapsed ? '▸' : '▾'}</span>
+        <span className="turn-panel-label">{t('🤖 Subagents')}</span>
+        <span className="turn-panel-count">{groups.length}</span>
+        {running.length > 0 && <span className="subagent-head-running">{t('{n} running', { n: running.length })}</span>}
+        <span className="tool-row-sub">{t('{n} tool calls', { n: totalCalls })}</span>
+        {collapsed && !running.length && <span className="commands-preview">{groups.map((g) => g.name).join(' · ')}</span>}
+      </button>
+      {/* 折叠着、这一轮还在跑：正在跑的子代理 + 它正在做的那一步（同「正在运行的那一个」口径） */}
+      {collapsed && running.map((g) => {
+        const step = currentStep(g);
+        return (
+          <div key={g.sessionId} className="subagent-run-line">
+            <b className="subagent-name">{g.name}</b>
+            <RunPreview
+              text={step ? callPreview(step).text : (g.task || t('No tool calls yet'))}
+              tag={step ? callPreview(step).tag : null}
+              running={!!step && toolState(step.status) === 'running'}
+              done={g.calls.filter((c) => toolState(c.status) !== 'running').length}
+              onOpen={togglePanel}
+            />
+          </div>
+        );
+      })}
+      {!collapsed && (
+        <ul className="files-list">
+          {groups.map((g) => {
+            const open = openIds.has(g.sessionId);
+            const took = toolDuration({ startedAt: g.startedAt, endedAt: g.endedAt }, now);
+            const step = g.running ? currentStep(g) : undefined;
+            return (
+              <li key={g.sessionId} className="files-item tool-row subagent-row" data-state={g.running ? 'running' : 'completed'}>
+                <div className="files-item-row">
+                  {g.agentName && <span className="files-item-kind">{g.agentName}</span>}
+                  <button type="button" className="tool-row-title subagent-title" title={g.sessionId} onClick={() => flip(setOpenIds, g.sessionId)}>
+                    <span className="turn-panel-caret">{open ? '▾' : '▸'}</span>{g.name}
+                  </button>
+                  {status(g)}
+                  {took && <span className="tool-row-time">{took}</span>}
+                  <span className="tool-row-sub">🔧 {t('{n} tool calls', { n: g.calls.length })}</span>
+                </div>
+                {g.task && (
+                  <div
+                    className={`subagent-task${fullTask.has(g.sessionId) ? ' full' : ''}`}
+                    title={fullTask.has(g.sessionId) ? t('Collapse') : t('Expand')}
+                    onClick={() => flip(setFullTask, g.sessionId)}
+                  >
+                    <span className="tool-row-field-label">{t('Task')}</span> {g.task}
+                  </div>
+                )}
+                {step && !open && (
+                  <RunPreview text={callPreview(step).text} tag={callPreview(step).tag} running={toolState(step.status) === 'running'} done={0} onOpen={() => flip(setOpenIds, g.sessionId)} />
+                )}
+                {open && (
+                  <div className="tool-row-detail">
+                    {g.calls.length > 0 ? (
+                      <ul className="tool-row-children">
+                        {g.calls.map((c) => {
+                          const shown = callPreview(c);
+                          const cSummary = toolState(c.status) === 'running' ? '' : toolResultSummary(c.content);
+                          const cTook = toolDuration(c, now);
+                          return (
+                            <li key={c.toolCallId} className="tool-row tool-row-child" data-state={toolState(c.status)}>
+                              <div className="files-item-row">
+                                <span className="files-item-kind">{c.toolName || c.kind || t('tool')}</span>
+                                <span className="tool-row-title" title={shown.text}>{commandFirstLine(shown.text).head}</span>
+                                {cSummary && <span className="tool-row-result" title={c.content}>→ {cSummary}</span>}
+                                {cTook && <span className="tool-row-time">{cTook}</span>}
+                                {toolState(c.status) === 'failed' ? <span className="stat-del">{t('Failed')}</span>
+                                  : toolState(c.status) === 'running' ? <span className="stat-add">{t('Running')}</span> : null}
+                              </div>
+                            </li>
+                          );
+                        })}
+                      </ul>
+                    ) : <span className="tool-row-sub">{t('No tool calls yet')}</span>}
+                    {g.thinking && (
+                      <details className="subagent-output">
+                        <summary>{t('💭 Thinking')}</summary>
+                        <pre className="tool-row-output">{g.thinking}</pre>
+                      </details>
+                    )}
+                    {g.text && (
+                      <details className="subagent-output">
+                        <summary>{t('Its reply')}</summary>
+                        <div className="subagent-reply"><MarkdownView content={g.text} /></div>
+                      </details>
                     )}
                   </div>
                 )}

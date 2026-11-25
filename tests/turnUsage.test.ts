@@ -283,7 +283,7 @@ describe('接线（源码扫描）', () => {
     assert.ok(start > 0);
     assert.match(body, /const turnUsage = entry \? settleTurnUsage\(sessionId, entry, turnUsageAcc\) : null;/);
     /* 没有正文、没有被记录的工具，但引擎报了真实消耗：不提前 return，照样落一条（消耗挂在它上面） */
-    assert.match(body, /if \(!entry \|\| \(!entry\.assistantBuf && entry\.fileChanges\.length === 0 && !entry\.wedgeNote && !turnUsage\)\) \{/);
+    assert.match(body, /if \(!entry \|\| \(!entry\.assistantBuf && entry\.fileChanges\.length === 0 && !entry\.wedgeNote && !turnUsage && !entry\.turnSubagents\?\.length\)\) \{/);
     assert.ok(body.indexOf('const turnUsage = entry ? settleTurnUsage(') < body.indexOf('!entry.wedgeNote && !turnUsage'), '先收尾消耗，再判要不要提前 return');
     const settle = M.slice(M.indexOf('function settleTurnUsage('), start);
     assert.match(settle, /finishTurnUsage\(acc, \{/);

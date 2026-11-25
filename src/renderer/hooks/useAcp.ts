@@ -1,6 +1,7 @@
 import { useState, useCallback, useEffect, useMemo, useRef } from 'react';
 import { consumeHandoff } from '../handoffDraft';
-import { type SubagentRow } from '../../main/subagents.ts';
+import { type SubagentRow, type TurnSubagent, asTurnSubagents, appendSubagentOutput, foldTurnRoster, noteSubagent } from '../../main/subagents.ts';
+import { withTurnSubagents } from '../subagentGroups.ts';
 import { uiGet, uiSet, uiRemove } from '../uiStore';
 import { TASK_LISTS_KEY, normalizeTaskList, parseTaskLists, serializeTaskLists, updateTaskLists, type TaskLists } from '../taskList';
 import { remoteWarmCut, sessionsToWarm } from '../projectActivity';
@@ -52,7 +53,7 @@ import { looksLikeSessionId } from '../../main/projectSanity.ts';
 import { initialProjects, initialSessions, seedProjectsFromSessions } from '../projectSeed.ts';
 import { wantsEditFork } from '../../main/editFork.ts';
 import { planTextOf } from '../permissionButtons.ts';
-import { commandTraceFields, isCommandCall, mergeToolTrace, shouldRecordToolCall, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
+import { commandTraceFields, isCommandCall, mergeToolTrace, shouldRecordToolCall, subagentTraceFields, toolTimes, toolTraceFields } from '../../main/toolTrace.ts';
 import { isQuestionMessage, leftScreen, LEAVE_CONFIRM_MS, shouldCancelOnLeave, upsertQuestionCard } from '../questionCards';
 import { applyCreateStage, clearCreateStage, retryCreateArgs, settleStageOnAttach, type CreateArgs, type CreateStageInfo } from '../createStages';
 import { withoutPermissionCard, enqueuePermission, currentPermissions, settlePermission, allowAllPermissions, permissionToolKey } from '../permissionCards';
@@ -352,8 +353,15 @@ function messageFromStored(raw: any): Message {
     ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
     ...questionOf(m),
     ...turnUsageOf(m),
+    ...turnSubagentsOf(m),
     timestamp: m.ts,
   };
+}
+
+/** 这一轮派出去的 kiro 原生子代理（主进程一轮结束时记的，`main/subagents.ts`）—— 读盘的每一处都带上，重启 / 重开会话后照样看得到每个子代理做了什么。 */
+function turnSubagentsOf(m: any): { subagents?: TurnSubagent[] } {
+  const list = m?.role === 'assistant' ? asTurnSubagents(m.subagents) : undefined;
+  return list ? { subagents: list } : {};
 }
 
 /** 这一轮的真实消耗（主进程一轮结束时记的，`main/turnUsage.ts`）—— 读盘的每一处都带上，重启 / 切会话 / 翻历史都看得到。 */
@@ -400,6 +408,8 @@ function toStoredTranscript(messages: Message[]) {
       ...(m.question ? { question: m.question } : {}),
       /* 这一轮的真实消耗：整份重写时原样写回去 */
       ...(m.turnUsage ? { turnUsage: m.turnUsage } : {}),
+      /* 这一轮的子代理：整份重写时原样写回去 */
+      ...(m.subagents?.length ? { subagents: m.subagents } : {}),
       // 经控制入口发的（id 带标记）：整份重写时显式来源照样写回去
       ...viaFor(m.id),
     }));
@@ -1784,6 +1794,21 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     });
   }, [mutateSessionMessages, upsertFileChange]);
 
+  /** kiro 原生子代理（名单 / 它自己的正文和思考）挂到这一轮上 —— 实时那一份；落盘那份主进程一轮结束时写（`subagentGroups.withTurnSubagents`） */
+  const attachSubagentsToLatestTurn = useCallback((
+    sid: string,
+    apply: (prev: TurnSubagent[] | undefined, ctx: { turnStartedAt: number; knownIds: Set<string> }) => TurnSubagent[],
+    allowCreate: boolean,
+  ) => {
+    mutateSessionMessages(sid, (current) => withTurnSubagents(
+      current,
+      (m) => m.role === 'user' && !isKirolexNote(m),
+      (m) => !isQuestionMessage(m),
+      apply,
+      allowCreate ? () => ({ id: `tool_turn_${Date.now()}_${Math.random().toString(36).slice(2, 8)}`, role: 'assistant' as const, content: '', toolCalls: [], timestamp: Date.now() }) : null,
+    ));
+  }, [mutateSessionMessages]);
+
   // Inject a mid-turn steer into the running turn via _session/steer. Shows the
   // message optimistically with a 'pending' badge, fires the (text-only) steer,
   // and returns { steered }. On a false result the optimistic message is rolled
@@ -2088,6 +2113,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
           ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
           ...questionOf(m),
           ...turnUsageOf(m),
+          ...turnSubagentsOf(m),
           timestamp: m.ts,
         }));
         // 还没处理的失败 steer 挂回这一轮（标红 + 两个按钮），不进队列
@@ -2121,6 +2147,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asVariants((m as any).variants) ? { variants: asVariants((m as any).variants) } : {}),
             ...questionOf(m),
             ...turnUsageOf(m),
+            ...turnSubagentsOf(m),
           }));
           const msgsWithFailed = withFailed(sid, msgs);
           messagesCacheRef.current.set(sid, msgsWithFailed);
@@ -2618,6 +2645,20 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
         addAttached(sessionId);
       }
 
+      /*
+        kiro 原生子代理发来的（主进程带 `childSessionId`）：它的正文 / 思考归到它自己那一行（折叠），不拼进父回复；
+        它的调用下面照常进这一轮，带上 childSessionId，由子代理卡片归组（`subagentGroups.ts`）。
+      */
+      const childEngine = sessionsRef.current.find((s) => s.id === targetSid)?.engine;
+      const childSid = typeof data.childSessionId === 'string' && data.childSessionId && (!childEngine || childEngine === 'kiro')
+        ? data.childSessionId as string : undefined;
+      if (childSid && (update.sessionUpdate === 'agent_message_chunk' || update.sessionUpdate === 'agent_thought_chunk' || update.sessionUpdate === 'agent_reasoning_chunk')) {
+        const text = update.content?.text || '';
+        const kind = update.sessionUpdate === 'agent_message_chunk' ? 'text' as const : 'thinking' as const;
+        if (text) attachSubagentsToLatestTurn(targetSid, (prev) => appendSubagentOutput(prev, childSid, kind, text, Date.now()), streamingIdsRef.current.has(targetSid));
+        return;
+      }
+
       switch (update.sessionUpdate) {
         case 'agent_message_chunk': {
           const text = update.content?.text || '';
@@ -2687,12 +2728,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             diffs,
             content: extractToolOutput(update) || undefined,
             ...(traced ? { ...toolTraceFields(update), ...toolTimes(undefined, update.status, Date.now()) } : commandTraceFields(update)),
+            /* kiro 原生子代理的调用：是谁做的 + 工具名 / 主要参数 + 起止时间（和主进程落盘同一个判据） */
+            ...(childSid ? { ...subagentTraceFields(update), ...toolTimes(undefined, update.status, Date.now()), childSessionId: childSid } : {}),
           };
           toolCallsRef.current.set(update.toolCallId, tc);
           // Track per session so it is cleared even if you switch away mid-tool
           setSessionActiveTool(targetSid, tc.title);
           /* `browser` = local_browser 的操作记录（主进程 `noteBrowserAction`）—— 进「🌐 浏览器操作」回合面板 */
           if (shouldRecordToolCall(traceEngine, tc)) attachFileChangeToLatestTurn(targetSid, tc, isActiveSession);
+          if (childSid) attachSubagentsToLatestTurn(targetSid, (prev) => noteSubagent(prev, childSid, Date.now()), false);
           break;
         }
 
@@ -2724,10 +2768,17 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
               /* kiro：命令类 MCP 工具带上完整命令 / label（和主进程落盘同一个判据） */
               Object.assign(existing, mergeToolTrace(existing, commandTraceFields(update, existing)));
             }
+            /* kiro 原生子代理的调用：是谁做的 + 工具名 / 主要参数 + 起止时间（和主进程落盘同一个判据） */
+            if (childSid || existing.childSessionId) {
+              Object.assign(existing, subagentTraceFields(update, existing), toolTimes(existing, existing.status, Date.now()), { childSessionId: existing.childSessionId || childSid });
+            }
             toolCallsRef.current.set(update.toolCallId, existing);
             /* kiro：原来的判据（动过文件 / 跑过东西）；Claude Code / Codex：每条都挂（审计 3a） */
             if (traceEngine && traceEngine !== 'kiro' ? true : (existing.locations?.length || existing.diffs?.length
                 || isCommandCall(existing))) {
+              attachFileChangeToLatestTurn(targetSid, existing, isActiveSession);
+            } else if (existing.childSessionId) {
+              /* kiro 原生子代理的调用每条都挂（归到它名下显示） */
               attachFileChangeToLatestTurn(targetSid, existing, isActiveSession);
             }
 
@@ -2978,6 +3029,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     const removeSubagents = window.kiroApi.onSubagents?.(({ sessionId: sid, subagents: rows }) => {
       if (!sid) return;
       setSubagents((cur) => ({ ...cur, [sid]: Array.isArray(rows) ? rows : [] }));
+      /* 这一轮的那份（聊天里的子代理卡片）：只在这一轮还在跑时收新的；跑完了只更新这一轮里已有的那几个 */
+      if (Array.isArray(rows) && rows.length) {
+        const live = streamingIdsRef.current.has(sid);
+        attachSubagentsToLatestTurn(sid, (prev, ctx) => {
+          if (!live && !prev?.length) return prev || [];
+          const pick = live ? rows : rows.filter((row) => prev!.some((s) => s.sessionId === row.sessionId));
+          return pick.length ? foldTurnRoster(prev, pick, { turnStartedAt: ctx.turnStartedAt, now: Date.now(), knownIds: ctx.knownIds }) : prev || [];
+        }, live);
+      }
     });
     /**
      * **主进程写进对话记录的 KiroLex 提示，当场显示** —— 原来没人听 `acp:user-message`，
@@ -3710,6 +3770,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asSteerParts(m.steerParts) ? { steerParts: asSteerParts(m.steerParts) } : {}),
             ...questionOf(m),
             ...turnUsageOf(m),
+            ...turnSubagentsOf(m),
             timestamp: m.ts,
           }));
           // Only fill if nothing has been written to the fork meanwhile.
@@ -3882,6 +3943,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
             ...(asSteerParts((m as any).steerParts) ? { steerParts: asSteerParts((m as any).steerParts) } : {}),
             ...questionOf(m),
             ...turnUsageOf(m),
+            ...turnSubagentsOf(m),
             timestamp: m.ts,
           }));
           const live = messagesCacheRef.current.get(id) || [];

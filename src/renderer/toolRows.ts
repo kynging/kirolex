@@ -25,6 +25,8 @@ export interface ToolCallLike {
   /** 命令类 MCP 工具的完整命令 / label（`toolTrace.ts` 的 commandTraceFields） */
   command?: string;
   label?: string;
+  /** kiro 原生子代理的调用：那个子代理自己的 ACP session id（`subagentGroups.ts` 按它归组） */
+  childSessionId?: string;
 }
 
 export interface ToolRow<T extends ToolCallLike = ToolCallLike> {
@@ -73,6 +75,8 @@ export function toolRowsOf<T extends ToolCallLike>(calls: T[]): ToolRow<T>[] {
   const rows: ToolRow<T>[] = [];
   for (const c of all) {
     if (nested.has(c.toolCallId)) continue;
+    /* kiro 原生子代理的调用在子代理卡片里（`subagentGroups.ts`），不进主线 */
+    if (c.childSessionId) continue;
     const children = kids.get(c.toolCallId) || [];
     if (!children.length && ownPanel(c)) continue;
     rows.push({ call: c, children });
@@ -80,12 +84,12 @@ export function toolRowsOf<T extends ToolCallLike>(calls: T[]): ToolRow<T>[] {
   return rows;
 }
 
-/** 「运行的命令」只列主线上的命令：子代理跑的命令在它的 Task 下面 */
+/** 「运行的命令」只列主线上的命令：子代理跑的命令在它的 Task 下面；kiro 原生子代理（带 childSessionId）的在子代理卡片里 */
 export function mainlineCommands<T extends ToolCallLike>(calls: T[]): T[] {
   const nested = nestedToolIds(calls);
   const byId = new Map<string, T>();
   for (const c of calls) {
-    if (isCommandCall(c) && !nested.has(c.toolCallId)) byId.set(c.toolCallId, c);
+    if (isCommandCall(c) && !nested.has(c.toolCallId) && !c.childSessionId) byId.set(c.toolCallId, c);
   }
   return Array.from(byId.values());
 }

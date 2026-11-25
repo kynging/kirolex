@@ -12,6 +12,7 @@ import { carryBackendAnchors, remapAnchorsToFork } from './editFork.ts';
 import type { QuestionCard } from './elicitation.ts';
 import type { SessionCost } from './sessionCost.ts';
 import type { TurnUsage } from './turnUsage.ts';
+import type { TurnSubagent } from './subagents.ts';
 
 /**
  * Durable session store (design §4, §7). Foundation contract — DO NOT break:
@@ -58,6 +59,8 @@ export interface StoredToolCall {
   /** 命令类 MCP 工具（local_bash / bg_run / watch）的完整命令和 label —— 三个引擎都带（kiro 也是），显示用 */
   command?: string;
   label?: string;
+  /** kiro 原生子代理的调用：那个子代理自己的 ACP session id（和消息上 `subagents` 的 sessionId 对得上）—— 主线的调用没有 */
+  childSessionId?: string;
 }
 
 export interface StoredMessage {
@@ -124,6 +127,9 @@ export interface StoredMessage {
   question?: QuestionCard;
   /** 助手消息：这一轮的真实消耗（kiro credits / Claude 本轮花费 / 上下文 used 与增量，`turnUsage.ts`）—— 一轮结束时主进程记上 */
   turnUsage?: TurnUsage;
+  /** 助手消息：这一轮派出去的 kiro 原生子代理（名字 / 任务 / 状态 / 它自己的正文和思考，`subagents.ts` 的 TurnSubagent）——
+   *  它们的调用在 toolCalls 里按 childSessionId 对上。重启、重开会话后照样看得到每个子代理做了什么 */
+  subagents?: TurnSubagent[];
   // additive: future fields (model, etc.) may be appended safely
 }
 

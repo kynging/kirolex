@@ -143,9 +143,11 @@ export function toolTraceFields(u: any, prev?: { title?: string; toolName?: stri
  */
 export function shouldRecordToolCall(
   engine: Engine | undefined,
-  call: { kind?: string; title?: string; toolName?: string; locations?: unknown[]; diffs?: unknown[] },
+  call: { kind?: string; title?: string; toolName?: string; locations?: unknown[]; diffs?: unknown[]; childSessionId?: string },
 ): boolean {
   if (engine && engine !== 'kiro') return true;
+  /* kiro 原生子代理的调用（带 childSessionId）每条都记：要归到那个子代理名下显示、重启后还看得到它做了什么 */
+  if (call.childSessionId) return true;
   const kind = (call.kind || '').toLowerCase();
   /* 命令类 MCP 工具（kind 是 other）也是「跑过东西」：原来 kiro 的 local_bash 整个不记，「执行的命令」里看不到它 */
   return !!(call.locations?.length || call.diffs?.length || isCommandCall(call) || kind === 'browser');
@@ -176,4 +178,18 @@ export function mergeToolTrace<T extends ToolTraceFields>(prev: T | undefined, n
     ...(command ? { command } : {}),
     ...(label ? { label } : {}),
   };
+}
+
+/**
+ * **kiro 原生子代理的调用**（带 `childSessionId`）多记的那几样：工具名、入参摘要（行上显示路径 / 命令这些主要参数）。
+ * kiro 的标题是 `Running: @kirolex-local/local_read` 这种，工具名从标题里剥出来（`bareToolName`）。
+ * 主线的 kiro 调用不走这里，记录形状不变。
+ */
+export function subagentTraceFields(u: any, prev?: ToolTraceFields & { title?: string; kind?: string }): ToolTraceFields {
+  const title = String(u?.title || prev?.title || '').replace(/^\s*(?:running|executing|running command)\s*:\s*/i, '');
+  const named = prev?.toolName || bareToolName(title);
+  /* 认命令类工具（local_bash 的完整命令）要靠工具名：标题带「Running: 」前缀时 commandTraceFields 自己认不出 */
+  const f = mergeToolTrace(prev, toolTraceFields(u, { ...prev, ...(named ? { toolName: named } : {}) }));
+  const toolName = f.toolName || named;
+  return { ...f, ...(toolName ? { toolName } : {}) };
 }

@@ -116,7 +116,7 @@ describe('界面', () => {
 
 describe('审查跟进 2：最后一次真实工具调用的位置一路带到界面和历史', () => {
   test('主进程落盘助手消息时记 toolTailFrom；history.md / 快照 / 重建历史 / 会话记忆都按它折叠', () => {
-    const f = slice(M, 'function flushAssistant(', 1500);
+    const f = slice(M, 'function flushAssistant(', 1700);
     assert.match(f, /\.\.\.\(entry\.bufAtLastTool \? \{ toolTailFrom: entry\.bufAtLastTool \} : \{\}\)/);
     assert.match(slice(M, 'function historyLine(', 4000), /foldTextToolCall\(m\.content, m\.toolTailFrom\)/);
     assert.match(M, /foldTextToolCall\(m\.content \|\| '', m\.toolTailFrom\)/);

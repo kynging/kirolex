@@ -1,6 +1,6 @@
 import React, { useState, useEffect, useCallback, useMemo, useRef } from 'react';
 import { baseName } from './pathBits.ts';
-import { type SubagentRow } from '../main/subagents.ts';
+import { type SubagentRow, type TurnSubagent } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
 import { restoreGet, restoreSet, restoreGetJson } from './uiRestore';
 import { displayTitle, normalizeLang, t as translate, type Lang } from './i18n';
@@ -523,6 +523,8 @@ export interface Message {
   question?: QuestionCard;
   /** 助手消息：这一轮的真实消耗（主进程一轮结束时记的，`main/turnUsage.ts`）—— 没有就回退到估算 */
   turnUsage?: TurnUsage;
+  /** 助手消息：这一轮派出去的 kiro 原生子代理（名字 / 任务 / 状态 / 它自己的正文和思考）—— 调用按 `childSessionId` 对上（`subagentGroups.ts`） */
+  subagents?: TurnSubagent[];
   /** 只活在界面里：排队那条发出去时这一次插进来的气泡的记号 —— 发送失败只撤它，不撤原来就在的同 id 历史（`queueRetry.removeOptimistic`）。 */
   sendToken?: string;
 }
@@ -547,6 +549,8 @@ export interface ToolCall {
   /** 命令类 MCP 工具的完整命令 / label（`main/toolTrace.ts` 的 commandTraceFields，kiro 也带） */
   command?: string;
   label?: string;
+  /** kiro 原生子代理的调用：那个子代理自己的 ACP session id（主进程 `acp:update` 带的 childSessionId） */
+  childSessionId?: string;
 }
 
 export interface FileDiff {

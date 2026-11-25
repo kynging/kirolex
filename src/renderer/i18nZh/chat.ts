@@ -569,4 +569,10 @@ export const ZH_CHAT: Record<string, string> = {
   'Messages after that point are removed from this chat (a full copy is kept in the KiroLex trash for 30 days); a new backend session continues with only the messages up to it.': '回滚点之后的对话会从这条会话里去掉（完整备份在 KiroLex 回收站保留 30 天）；新的后端会话只带上到这一条为止的内容。',
   'The chat history goes along to the new session. If the content of this chat itself is what fails (for example a safety filter), a new session may not help; switch models first.': '会话内容会带到新会话里。如果是上下文内容本身触发的（比如安全过滤），换会话未必能解，优先换模型。',
   'This chat is busy. Roll back when the current turn has finished.': '这条会话正在忙。等这一轮结束再回滚。',
+  // ── ChatArea SubagentsPanel（kiro 原生子代理卡片，subagentGroups.ts）──
+  '{n} running': '{n} 个运行中',
+  '{n} tool calls': '调用了 {n} 次工具',
+  'No tool calls yet': '还没调用工具',
+  'Task': '任务',
+  'Its reply': '它的回复',
 };
