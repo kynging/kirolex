@@ -283,7 +283,7 @@ describe('在界面上加/改/删一台远端', () => {
  * 装法不是猜的 —— 是从那台机器上实测出来的：bash 历史里就是
  *   curl … desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip
  * 解出来是 `kirocli/{install.sh,bin/}`，install.sh 把三个二进制装进 ~/.local/bin 再跑
- * `kiro-cli setup`（参数透传，所以给 --no-confirm）；claude-code / codex 是 fnm 下的 npm 全局包。
+ * `kiro-cli setup`（3.6 起不认 --no-confirm，不带参数跑）；claude-code / codex 是 fnm 下的 npm 全局包。
  */
 describe('一键装齐远端依赖', () => {
   const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
@@ -291,7 +291,9 @@ describe('一键装齐远端依赖', () => {
   test('脚本装的是这几样：kiro-cli / claude code / codex / node / git / unzip', () => {
     assert.match(SH, /kirocli-x86_64-linux\.zip/);
     assert.match(SH, /kirocli-aarch64-linux\.zip/, 'arm 的机器也要能装');
-    assert.match(SH, /install\.sh' --no-confirm|install\.sh" --no-confirm/);
+    /* kiro-cli 3.6 的 install.sh 不认 --no-confirm（报 Unknown argument 然后没装上），不带参数跑 */
+    assert.match(SH, /sh "\$tmp\/kirocli\/install\.sh" 2>&1/);
+    assert.equal(SH.includes('--no-confirm'), false);
     assert.match(SH, /@anthropic-ai\/claude-code/);
     assert.match(SH, /@openai\/codex/);
     /* KiroLex 走 ACP：远端 Claude Code / Codex 会话起的就是这两个命令（engines.ts 的 REMOTE_ADAPTER_BIN） */
@@ -302,6 +304,20 @@ describe('一键装齐远端依赖', () => {
     /* rsync 不再装：镜像和 agent 同步都没了，远端没有任何东西用它 */
     assert.equal(/for b in rsync/.test(SH), false);
     assert.match(SH, /fnm/, 'claude-code/codex 是 npm 包，发行版自带的 node 往往太老');
+  });
+
+  test('AL2023 上 node 26 要 libatomic：dnf / yum / apt 都装；node 装完自检，起不来就别拿它去 npm', () => {
+    const sys = SH.slice(SH.indexOf('step "系统包'), SH.indexOf('# ---------------------------------------------------------------- Node'));
+    assert.match(sys, /dnf\|yum\) LIBATOMIC=libatomic ;;/);
+    assert.match(sys, /apt-get\) LIBATOMIC=libatomic1 ;;/);
+    assert.match(sys, /sudo "\$PKG" install -y "\$LIBATOMIC"/);
+    assert.match(sys, /sudo apt-get install -y -qq "\$LIBATOMIC"/);
+    const node = SH.slice(SH.indexOf('step "Node'), SH.indexOf('step "PATH'));
+    assert.match(node, /node_v="\$\(node --version 2>&1 <\/dev\/null\)"/);
+    assert.match(node, /NODE_BROKEN=1/);
+    assert.match(node, /note_fail "node 起不来/);
+    const npmI = SH.slice(SH.indexOf('npm_i() {'), SH.indexOf('\n}\n', SH.indexOf('npm_i() {')));
+    assert.match(npmI, /if \[ "\$NODE_BROKEN" = 1 \]; then note_fail "node 起不来，跳过 \$pkg"; return 1; fi/);
   });
 
   test('幂等：已装的跳过，FORCE=1 才重装', () => {
@@ -918,6 +934,17 @@ describe('远端 kiro 登录', () => {
     /* 端点不写死在仓库里 */
     assert.equal(/awsapps\.com\/start/.test(SH), false);
     assert.match(SH, /自己 ssh 上去跑 kiro-cli login/, '读不到参数时要给人一条明确的出路');
+  });
+
+  test('登录走参数（--identity-provider / --region），不从 stdin 喂答案；每个候选区单独调一次，以 whoami 为准', () => {
+    const SH = fs.readFileSync(path.join(process.cwd(), 'scripts/remote-bootstrap.sh'), 'utf8');
+    const seg = SH.slice(SH.indexOf('step "kiro-cli 登录"'), SH.indexOf('# ---------------------------------------------------------------- 自检'));
+    /* kiro-cli 3.6 会把上一次的输入预填成默认值，新输入接在后面 → region 变成 us-east-1ap-northeast-1 */
+    assert.match(seg, /kiro-cli login --license pro --identity-provider \$\(printf %q "\$KIRO_LOGIN_PROVIDER"\) --region \$\(printf %q "\$reg"\) --use-device-flow/);
+    assert.equal(/login_in|stty -echo/.test(seg), false, '不再把答案写进文件喂给 stdin');
+    assert.doesNotMatch(seg, /\/dev\/null < "\$/, 'login 的 stdin 不从文件重定向');
+    assert.match(seg, /for reg in \$\{KIRO_LOGIN_REGION:-\} ap-northeast-1 us-east-1 us-west-2 eu-west-1; do/);
+    assert.match(seg, /kiro-cli whoami <\/dev\/null >\/dev\/null 2>&1 && \{ logged_in=1; break; \}/);
   });
 
   test('接线：bootstrap 把登录参数一起传过去', () => {

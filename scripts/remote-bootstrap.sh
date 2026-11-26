@@ -76,6 +76,30 @@ install_pkg() {
 }
 
 for b in git unzip tar; do install_pkg "$b"; done
+
+# libatomic：node 26 起动态链接 libatomic.so.1，AL2023 默认没装 —— 实测
+# `node: error while loading shared libraries: libatomic.so.1`，后面 npm 全挂。它是库不是命令，不能走 install_pkg 的 `have`。
+case "$PKG" in
+  dnf|yum) LIBATOMIC=libatomic ;;
+  apt-get) LIBATOMIC=libatomic1 ;;
+  *) LIBATOMIC="" ;;
+esac
+has_libatomic() { { ldconfig -p 2>/dev/null || /sbin/ldconfig -p 2>/dev/null; } | grep -q 'libatomic\.so\.1'; }
+# 只装 kiro-cli 时用不到 node，也就用不到它。没有包管理器时只提醒：真缺的话下面 node 自检会报出来。
+if [ "$ONLY" = kiro-cli ]; then
+  :
+elif has_libatomic && [ "$FORCE" != "1" ]; then
+  say "→ libatomic 已在"
+elif [ -z "$PKG" ]; then
+  say "→ 不认识这台机器的包管理器（没有 dnf/yum/apt-get），装不了 libatomic；node 起不来的话请手动装"
+else
+  say "→ 装 $LIBATOMIC（$PKG，node 要它）"
+  case "$PKG" in
+    dnf|yum) sudo "$PKG" install -y "$LIBATOMIC" >/dev/null 2>&1 ;;
+    apt-get) sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq "$LIBATOMIC" >/dev/null 2>&1 ;;
+  esac
+  has_libatomic || note_fail "$LIBATOMIC 装不上（权限？源？）—— node 可能起不来"
+fi
 fi
 
 # ---------------------------------------------------------------- Node
@@ -120,7 +144,18 @@ if [ -n "$FNM" ]; then
   load_fnm
 fi
 fi
-if have node; then say "→ 现在用的 node：$(node -v)（$(command -v node)）"; elif [ "$ONLY" != kiro-cli ]; then note_fail "node 没装上 —— claude-code / codex 都要它"; fi
+# 自检：`have node` 只说明命令在，不说明起得来（缺 libatomic.so.1 时就是"在、但一跑就报错"）。
+# 起不来就把真实错误打出来，并标记 NODE_BROKEN —— 后面 npm_i 不再拿坏掉的 node 去装。
+NODE_BROKEN=0
+if have node; then
+  if node_v="$(node --version 2>&1 </dev/null)"; then
+    say "→ 现在用的 node：$node_v（$(command -v node)）"
+  else
+    NODE_BROKEN=1
+    printf '%s\n' "$node_v" | tr -d '\r' | grep -v '^[[:space:]]*$' | head -5 | while IFS= read -r l; do say "   $l"; done
+    note_fail "node 起不来（$(command -v node)）—— 看上面的报错，多半缺系统库（如 libatomic）"
+  fi
+elif [ "$ONLY" != kiro-cli ]; then note_fail "node 没装上 —— claude-code / codex 都要它"; fi
 
 # ------------------------------------------- 以后的登录 shell 也要找得到 node / npm 全局命令
 # KiroLex 起远程会话用的是 `ssh … bash -lc '<命令>'`：一个**非交互的登录 shell**。fnm 是用 --skip-shell
@@ -151,7 +186,7 @@ fi
 # 装法是从这台机器上实测出来的（bash 历史里就是这一条 URL），不是猜的：
 #   curl … desktop-release.q.us-east-1.amazonaws.com/latest/kirocli-x86_64-linux.zip
 # 解出来是 kirocli/{install.sh,bin/}，install.sh 把三个二进制放进 ~/.local/bin 再跑
-# `kiro-cli setup`（参数透传，所以给 --no-confirm）。
+# `kiro-cli setup`。
 if want kiro-cli; then
 step "kiro-cli"
 if have kiro-cli && [ "$FORCE" != "1" ]; then
@@ -192,7 +227,9 @@ else
       if unzip -q -o "$tmp/kirocli.zip" -d "$tmp"; then
         # 不要把 install.sh 的输出丢掉：它**成功和失败都 exit 0**，
         # 唯一的线索就在 stdout 里（上面那条 glibc 提示就是这么被吞掉的）。
-        inst="$(sh "$tmp/kirocli/install.sh" --no-confirm 2>&1)" || true
+        # 不带参数：kiro-cli 3.6 的 install.sh 只认 --global / --no-modify-path，
+        # 给别的会 `[ERROR] Unknown argument` 然后什么都不装（实测 3.6.2 musl 版）。
+        inst="$(sh "$tmp/kirocli/install.sh" 2>&1)" || true
         printf '%s\n' "$inst" | grep -iE 'error|glibc|musl' | head -3 | while IFS= read -r l; do say "   $l"; done
       fi
     else
@@ -219,6 +256,7 @@ npm_i() {
   # `</dev/null`：有些工具（claude-code-acp 是 stdio 上的 ACP 服务）会读 stdin，
   # 而脚本若是从 stdin 喂进来的，它就会把剩下的脚本吃掉 —— 实测过，自检整段没跑而退出码还是 0。
   if have "$bin" && [ "$FORCE" != "1" ]; then say "→ $bin 已在 ($("$bin" --version </dev/null 2>/dev/null | head -1))"; return 0; fi
+  if [ "$NODE_BROKEN" = 1 ]; then note_fail "node 起不来，跳过 $pkg"; return 1; fi
   if ! have npm; then note_fail "没有 npm，装不了 $pkg"; return 1; fi
   # 系统自带的 node：全局目录要 root，`npm -g` 会 EACCES。改装到 ~/.local（bin 落在 ~/.local/bin，
   # 上面那份 ~/.kirolex-env.sh 已经把它放进以后登录 shell 的 PATH）。
@@ -429,15 +467,16 @@ elif [ -n "${KIRO_LOGIN_PROVIDER:-}" ]; then
   say "   provider ${KIRO_LOGIN_PROVIDER}${KIRO_LOGIN_REGION:+  region ${KIRO_LOGIN_REGION}}"
   say "   下面会打印一个链接和一串 code —— 打开链接、输入 code，这里就会继续。"
   #
-  # **`--identity-provider` / `--region` 这两个参数不生效** —— 在 kiro-cli 2.25.0 上实测。
-  # 不管有没有传，它照样交互式追问 Start URL 和 Region。而且：
+  # **用参数传 `--identity-provider` / `--region`，不从 stdin 喂答案** —— 在 kiro-cli 3.6.2 上实测。
   #
-  #   · 没有 TTY 时，那两个追问拿到**空串**（它自己会 warn `called input while stdout is
-  #     not a terminal`），于是 region="" → `region must be a valid host label`。
-  #     这就是原来这条命令 100% 失败的原因，而报错完全看不出是"追问没人答"。
-  #   · 所以必须给它一个真 pty（`script -qc`），再把答案从 stdin 喂进去。
-  #   · pty 上 stdin/stdout 是同一个终端，程序会读到自己的回显 → 值被拼两遍
-  #     （`us-east-1us-east-1`）。所以先 `stty -echo`。
+  #   · 以前（2.25.0）这两个参数不生效、照样交互追问，所以是用 `script -qc` 给个 pty、
+  #     把答案写进文件从 stdin 喂进去的。
+  #   · 3.6.2 会把**上一次的输入预填成默认值**，新输入接在后面：按候选区重试时 region 变成
+  #     `us-east-1ap-northeast-1`、`us-east-1ap-northeast-1us-east-1us-west-2`…，
+  #     请求 `https://oidc.us-east-1ap-northeast-1.amazonaws.com/client/register` 失败。
+  #   · 而直接走参数完全可用（region=ap-northeast-1 一次成功）。
+  #   · 仍然套一层 `script -qc` 给它一个 pty（没 TTY 时它会 warn `called input while stdout
+  #     is not a terminal`），但 stdin 是 /dev/null —— 不需要喂任何东西。
   #
   # Region 是 **Identity Center 实例所在的区**，不是 profile ARN 里那个区
   # （那份 ARN 写着 us-east-1，而 IdC 在 ap-northeast-1 —— 用 us-east-1 会
@@ -448,28 +487,19 @@ elif [ -n "${KIRO_LOGIN_PROVIDER:-}" ]; then
   # 那是 CodeWhisperer profile 的区，**不是** IdC 的区。拿它去登录会
   # `InvalidRequestException`（实测：IdC 在 ap-northeast-1，ARN 写着 us-east-1）。
   #
-  # 所以按候选逐个试：区不对时 `StartDeviceAuthorization` 会**秒失败**，
+  # 所以按候选逐个试，每个区单独调一次带参数的命令：区不对时 `StartDeviceAuthorization` 会**秒失败**，
   # 对的那个才会打印 URL + code 然后阻塞等你授权。KiroLex 传进来的那个排第一
-  # （它至少是个线索），后面跟上常见的几个。
-  login_in="$(mktemp)"
+  # （它至少是个线索），后面跟上常见的几个。登录成没成只看 `kiro-cli whoami`。
   logged_in=0
   for reg in ${KIRO_LOGIN_REGION:-} ap-northeast-1 us-east-1 us-west-2 eu-west-1; do
     kiro-cli whoami </dev/null >/dev/null 2>&1 && { logged_in=1; break; }
-    printf '%s\n%s\n' "$KIRO_LOGIN_PROVIDER" "$reg" > "$login_in"
-    #
-    # 必须给真 pty，而且要先关回显：
-    #   · 没 TTY 时那两个追问拿到空串（它自己 warn `called input while stdout is not
-    #     a terminal`）→ region="" → `must be a valid host label`。原来 100% 失败就是这个。
-    #   · pty 上 stdin/stdout 是同一个终端，程序会读到自己的回显 → 值被拼两遍
-    #     （`us-east-1us-east-1`）。所以 `stty -echo`。
-    # `--identity-provider` / `--region` 这两个参数在 2.25.0 上**不生效**，照样会追问。
-    script -qc "stty -echo; kiro-cli login --license pro --use-device-flow" /dev/null < "$login_in" 2>&1 \
+    login_cmd="kiro-cli login --license pro --identity-provider $(printf %q "$KIRO_LOGIN_PROVIDER") --region $(printf %q "$reg") --use-device-flow"
+    script -qc "$login_cmd" /dev/null </dev/null 2>&1 \
       | tr -d '\r' | sed 's/\x1b\[[0-9;]*[A-Za-z]//g;s/[▰▱]//g;s/Logging in\.\.\.//g' \
       | grep -vE '^[[:space:]]*$' || true
     kiro-cli whoami </dev/null >/dev/null 2>&1 && { logged_in=1; break; }
     say "   region $reg 不对，换一个再试"
   done
-  rm -f "$login_in"
   if [ "$logged_in" = "1" ]; then
     say "→ 登录完成  $(kiro-cli whoami </dev/null 2>/dev/null | head -1)"
   else
