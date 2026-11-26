@@ -1,4 +1,7 @@
 /**
+ * **不再使用（2026-11-26）**：MCP 组合只存本机、不再跟着 S3 同步（每台电脑各配各的），`index.ts` 已不调这里的任何东西；
+ * 桶里原有的 `mcp-combos.json` 不删也不读。留着只为老数据格式 / 以后要回头看。以下是当时的说明。
+ *
  * **`mcp-combos.json` 跟着 S3 同步** ——「组合那里明明写的投研，为什么显示是通用」：组合是在台式机上存的，
  * 这份文件以前不在同步白名单里，换一台电脑就只剩内置「通用」。
  *
@@ -7,7 +10,7 @@
  * 不是"谁新用谁"，而是**合并**（`mergeComboTexts`）—— 组合是一条一条的，按 id 并起来不丢东西；
  * 同一个 id 两边内容不同时两份都留（桶里那份换个 id 和名字），不静默覆盖任何一边。
  *
- * 纯逻辑，不碰 electron、不碰网络；`index.ts` 的 `syncMcpCombosWithBucket` 负责读写和上传。
+ * 纯逻辑，不碰 electron、不碰网络；（当时）`index.ts` 的 `syncMcpCombosWithBucket` 负责读写和上传，现已删掉。
  */
 import crypto from 'node:crypto';
 import fs from 'node:fs';

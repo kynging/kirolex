@@ -122,7 +122,7 @@ export const McpCombosPane: React.FC<{ onClose: () => void }> = ({ onClose }) =>
         <div className="agent-config-editor-body">
           <div className="agent-config-editor-selection">
             <strong>mcp-combos.json</strong>
-            <span className="kiro-config-ro-tag">{t('Shared by all sessions; with S3 sync on, also synced to your other computers')}</span>
+            <span className="kiro-config-ro-tag">{t('Shared by all sessions; stored only on this computer (not synced)')}</span>
             {path && <span className="agent-config-editor-path" title={path}>{path}</span>}
           </div>
           <div className="kiro-config-hint">

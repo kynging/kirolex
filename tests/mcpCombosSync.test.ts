@@ -379,23 +379,14 @@ describe('S3 同步接线', () => {
     assert.ok(body.includes("h['if-none-match'] = '*'"));
     assert.ok(body.includes("if (r.status === 412 || r.status === 409) return 'conflict';"));
   });
-  test('runS3Sync 里同步组合文件（自己传，不走按大小判断的上传循环）', () => {
+  /* 2026-11-26 起组合文件只存本机、不再同步（tests/mcpCombosLocalOnly.test.ts）：这里的纯逻辑留着，主进程不再调 */
+  test('runS3Sync 不再同步组合文件（不调 syncMcpCombosWithBucket，也不走按大小判断的上传循环）', () => {
     const at = M.indexOf('async function runS3Sync(');
-    const body = M.slice(at, M.indexOf('function rescheduleS3Sync', at));
-    assert.ok(body.includes("uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix)"));
-    assert.doesNotMatch(body, /rel === MCP_COMBOS_REL/);
-  });
-  test('按 planComboSync 执行：改写前把本机那份挪进 trash，写完通知下拉刷新，成功后才记摘要', () => {
-    const at = M.indexOf('async function syncMcpCombosWithBucket(');
     assert.ok(at > 0);
-    const body = M.slice(at, at + 4000);
-    assert.ok(body.includes('await syncComboFile({'));
-    assert.ok(body.includes('putObjectIf(creds, key,'), '上传必须是条件写入');
-    assert.ok(body.includes('getObjectWithEtag(creds, key)'));
-    assert.ok(body.includes('readComboMark(S3_COMBOS_MARK_PATH)'));
-    assert.match(body, /trash/);
-    assert.match(body, /acp:mcp-combos-changed/);
-    assert.ok(!/[^A-Za-z]putObject\(/.test(body), '组合文件不能用不带条件的 putObject');
+    const body = M.slice(at, M.indexOf('function rescheduleS3Sync', at));
+    assert.doesNotMatch(body, /syncMcpCombosWithBucket/);
+    assert.doesNotMatch(body, /rel === MCP_COMBOS_REL/);
+    assert.doesNotMatch(M, /syncComboFile\(/);
     assert.equal(MCP_COMBOS_REL, 'mcp-combos.json');
   });
 });

@@ -68,6 +68,17 @@ export function skippedItem(name: string, reason: string): McpUnavailable {
   return { name, kind: 'skipped', fingerprint: `skipped:${why}`, detail: tr('{name}: {reason}.', { name, reason: why }) };
 }
 
+/**
+ * 以前从别的电脑同步来、这台电脑上还没确认的那一个（`mcpComboTrust.ts`）：点名是哪个 MCP 配置里的，
+ * 不让人误读成「整条会话是别的电脑同步来的」。
+ */
+export function untrustedItem(name: string, combo: string): McpUnavailable {
+  return {
+    name, kind: 'skipped', fingerprint: 'skipped:untrusted',
+    detail: tr('The MCP "{name}" in MCP profile "{combo}" came from another computer and is not confirmed on this computer yet; review it in Settings → MCP profiles and save to use it', { name, combo }),
+  };
+}
+
 /** 主句里的那一串：同一原因的名字并在一起（按第一次出现的顺序），原因写在最后一个名字后面。 */
 function summaryList(items: McpUnavailable[]): string {
   const order: McpUnavailableKind[] = [];

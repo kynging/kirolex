@@ -11,8 +11,8 @@
  *   · `sessions/<id>/{record.json, transcript.jsonl, history.md}` —— 恢复一条会话的最小集合；
  *   · `memory/**` —— 三层记忆，不带的话恢复回来的会话"忘了你教过它的事"；
  *   · `attachments/**`、`pasted/**` —— 会话里引用的图片。
- *   · `mcp-combos.json` —— Claude Code / Codex 的「组合」，多台电脑共用一份（两边都改过时合并，见 `mcpCombosSync.ts`）。
- *   · `agent-profiles/**` —— 远程机器的 AI 工具配置，同样多台电脑共用（两边都改过时留冲突副本，见 `agentProfileSync.ts`）。
+ *   · ~~`mcp-combos.json`~~ —— Claude Code / Codex 的「组合」**只存本机、不再同步**（2026-11-26，每台电脑各配各的；桶里原有的那份不删也不读）。
+ *   · `agent-profiles/**` —— 远程机器的 AI 工具配置，多台电脑共用（两边都改过时留冲突副本，见 `agentProfileSync.ts`）。
  *   · `appearance.json` —— 只装外观：主题 / 对比度 / 强调色 / 字体 / 聊天字号 + `theme.json`（整份谁新用谁，uiZoom 不同步，见 `appearanceSync.ts`）。
  *
  * **不同步** `config.json`（里面是这台机器的路径、identityFile、远端主机），也不同步

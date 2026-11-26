@@ -1,5 +1,5 @@
 /**
- * **`~/.kirolex/agent-profiles/` 跟着 S3 同步** ——「这份配置也要进备份」，和 `mcp-combos.json` 一样跨电脑共用。
+ * **`~/.kirolex/agent-profiles/` 跟着 S3 同步** ——「这份配置也要进备份」，跨电脑共用（`mcp-combos.json` 以前也这样，2026-11-26 起只存本机）。
  *
  * 和会话同一个桶、同一个 key 布局（`<prefix>/v1/agent-profiles/<相对路径>`）。逐个文件按**内容摘要**判断谁动过
  * （同 `mcpCombosSync.ts` 的理由：大小相同、内容不同的文件按大小比会被当成没变）：

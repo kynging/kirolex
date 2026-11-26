@@ -165,11 +165,10 @@ describe('磁盘', () => {
 
 describe('接线：S3 同步那一轮包含 agent-profiles', () => {
   const M = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
-  test('runS3Sync 在组合文件旁边调了 syncAgentProfilesWithBucket', () => {
+  test('runS3Sync 调了 syncAgentProfilesWithBucket', () => {
     const at = M.indexOf('async function runS3Sync(');
     assert.ok(at > 0);
     const body = M.slice(at, at + 20000);
-    assert.ok(body.includes('syncMcpCombosWithBucket(creds!, cfg.prefix)'));
     assert.ok(body.includes('syncAgentProfilesWithBucket(creds!, cfg.prefix)'));
   });
   test('syncAgentProfilesWithBucket 用 syncProfileFiles，拉之前旧的进 trash，key 在 agent-profiles 下', () => {

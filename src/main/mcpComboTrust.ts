@@ -5,6 +5,7 @@
  * http MCP 的 headers 里还会展开本机的环境变量。同步拉回 / 合并进来的、这台电脑上原来没有的那些 MCP 配置，
  * 记进本机的 `~/.kirolex/mcp-combos-untrusted.json`（不进 S3），会话准备 MCP 时跳过它们（`withholdUntrusted`），
  * 直到用户在设置里看过并保存一次组合文件（`trustCombosText`）。本机手改 / 设置里保存的不受影响。
+ * 2026-11-26 起组合文件只存本机、不再同步：不会再有新的待确认项，以前同步来、还没确认的照旧拦着。
  *
  * 认的是**配置本身**（`serverTrustKey`：除了 `disabled` 之外整份，含 perMachine）—— 桶里改了某条 MCP 的命令 / 参数，
  * 那条也重新算没确认过。
@@ -12,7 +13,7 @@
 import crypto from 'node:crypto';
 import fs from 'node:fs';
 import path from 'node:path';
-import { parseMcpCombos, type McpCombo, type McpComboServer } from './mcpCombos.ts';
+import { parseMcpCombos, localizeCombo, type McpCombo, type McpComboServer, type MachineIdentity } from './mcpCombos.ts';
 
 function stable(v: unknown): unknown {
   if (Array.isArray(v)) return v.map(stable);
@@ -136,6 +137,26 @@ export function withholdUntrusted<T extends Pick<McpCombo, 'mcpServers'>>(
     if (!untrusted || untrusted.has(serverTrustKey(s))) withheld.push(name); else kept[name] = s;
   }
   return withheld.length ? { combo: { ...combo, mcpServers: kept }, withheld } : { combo, withheld };
+}
+
+/**
+ * 会话准备 MCP 用：先按这台电脑套 `perMachine`（`localizeCombo`），再去掉没确认过的 —— 本机已 disabled 的
+ * 本来就不挂，不算进 `withheld`、不提示。认不认仍按文件里原样那条（`withholdUntrusted` / `serverTrustKey`，不看本机覆盖）。
+ * 返回本机那份（去掉没确认的）和要提示的名字。
+ */
+export function withholdUntrustedLocal<T extends Pick<McpCombo, 'mcpServers'>>(
+  combo: T, untrusted: Set<string> | null, m: MachineIdentity,
+): { combo: T; withheld: string[] } {
+  const held = new Set(withholdUntrusted(combo, untrusted).withheld);
+  const localized = localizeCombo(combo, m);
+  if (!held.size) return { combo: localized, withheld: [] };
+  const withheld: string[] = [];
+  const kept: Record<string, McpComboServer> = {};
+  for (const [name, s] of Object.entries(localized.mcpServers)) {
+    if (!held.has(name)) kept[name] = s;
+    else if (!s?.disabled) withheld.push(name);
+  }
+  return { combo: { ...localized, mcpServers: kept }, withheld };
 }
 
 /** 文本里哪些 MCP 还没确认过（给设置面板看）：`[{ comboId, server }]`。 */

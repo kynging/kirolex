@@ -71,7 +71,6 @@ import { restorePlacement, catalogProject, restoreTarget, restoreRunPlan, restor
 import { pullProjectMemory } from './projectMemoryPull.ts';
 import { knownProjects, bogusProjectReason, sanitizeProjectId, derivableProjectDir } from './projectSanity.ts';
 import { fitHistory, historyTrimNote, HISTORY_BUDGET_BYTES } from './historyBudget.ts';
-import { MCP_COMBOS_REL, syncComboFile, readComboMark, writeComboMark } from './mcpCombosSync.ts';
 import { APPEARANCE_REL, MAX_THEME_JSON_CHARS, appearanceSyncEnabled, applySyncedSettings, makePayload, noteLocalAppearance, parseSnapshot, runAppearanceSync, type AppearancePayload, type AppearanceSnapshot } from './appearanceSync.ts';
 import { THEME_FILE, ensureThemeFile, readThemeFile, resetThemeFile, themeFilePath, writeSyncedThemeFile, type ThemeFileState } from './themeFileStore.ts';
 import { McpComboWatcher, comboFingerprint, remountExclusive, COMBO_FILE_BROKEN } from './mcpComboWatch.ts';
@@ -197,12 +196,12 @@ import { zoomKeyAction } from './zoomKeys.ts';
 import { primeVerdict, primeGiveUpNote } from './primeRetry.ts';
 import { setUiLang, uiLang, tr, trConcat, trList, bothLangs, textVariants, asVariants, type TextVariants } from './uiText.ts';
 import { defaultComboForNewSession, normalizeComboId, readGlobalDefaultCombo, writeGlobalDefaultCombo, resolveDefaultCombo } from './defaultCombo.ts';
-import { markPulledUntrusted, carryUntrusted, trustCombosText, readUntrusted, withholdUntrusted, untrustedInText } from './mcpComboTrust.ts';
-import { readMcpCombos, saveMcpCombos, writeMcpCombosText, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
+import { carryUntrusted, trustCombosText, readUntrusted, withholdUntrusted, withholdUntrustedLocal, untrustedInText } from './mcpComboTrust.ts';
+import { readMcpCombos, saveMcpCombos, pickCombo, findCombo, comboDisplayName, buildAcpMcpServers, maskAcpServers, mcpCombosPath, MCP_COMBOS_TEMPLATE, BUILTIN_COMBO_ID, localizeCombo, type McpCombo, type MachineIdentity } from './mcpCombos.ts';
 import { resolveCommand, commandMissingReason } from './commandResolve.ts';
 import { comboLocalAvailability, comboForwardStdio, setMachineOverride } from './comboAvailability.ts';
 import {
-  mcpUnavailableNotice, mcpUnavailableLabel, notForwardedItem, missingCommandItem, failedItem, skippedItem,
+  mcpUnavailableNotice, mcpUnavailableLabel, notForwardedItem, missingCommandItem, failedItem, skippedItem, untrustedItem,
   planMcpNotice, mcpNoticeScope, readMcpNoticeSeen, writeMcpNoticeSeen, splitQuietMcpItems, type McpUnavailable,
 } from './mcpUnavailable.ts';
 import { PendingSwitchBook, PendingSwitchRunner, runPendingSwitches, withEngineOption, shouldQueueSwitch, settlingSource, pendingTargetText, isReconnectKind, PENDING_SWITCH_NOTE_GROUP, type PendingSwitch, type PendingKind } from './pendingSwitch.ts';
@@ -3102,15 +3101,16 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   } else if (profile.mcpCombo && combo !== findCombo(combos, profile.mcpCombo)) {
     sessionNotice(sessionId, tr('⚠️ MCP profile "{wanted}" not found (it may have been deleted), so this time it starts as "{used}".', { wanted: profile.mcpCombo, used: comboDisplayName(combo) }));
   }
-  /* 从 S3 拉回来、这台电脑上还没确认过的 MCP 不交出去（`mcpComboTrust.ts`）：stdio 命令就是在本机 / 远端起进程 */
-  const trusted = withholdUntrusted(combo, readUntrusted(os.homedir()));
+  /*
+    先按这台电脑套上 `perMachine` 的覆盖（主机名 / 系统），再去掉以前从 S3 拉回来、这台电脑上还没确认过的 MCP（`mcpComboTrust.ts`）：
+    stdio 命令就是在本机 / 远端起进程。本机已 disabled 的本来就不挂，不算「没确认」、不提示。交出去的是本机那份。
+  */
+  const trusted = withholdUntrustedLocal(combo, readUntrusted(os.homedir()), thisMachine());
   if (trusted.withheld.length) {
-    withheldBySession.set(sessionId, trusted.withheld);
-    logger.warn('mcp-combo', `组合「${combo.name}」里从 S3 同步来、这台电脑上还没确认的 MCP 不挂：${trusted.withheld.join(', ')} sessionId=${sessionId}`);
+    withheldBySession.set(sessionId, { combo: comboDisplayName(combo), names: trusted.withheld });
+    logger.warn('mcp-combo', `组合「${combo.name}」里来自别的电脑、这台电脑上还没确认的 MCP 不挂：${trusted.withheld.join(', ')} sessionId=${sessionId}`);
   } else withheldBySession.delete(sessionId);
-  combo = trusted.combo;
-  /* 文件跟着 S3 同步到别的电脑：按这台电脑套上 `perMachine` 的覆盖（主机名 / 系统），交出去的是本机那份 */
-  const localized = localizeCombo(combo, thisMachine());
+  const localized = trusted.combo;
   /* 每次起执行器都经这里准备 MCP：记下这次交出去的那份，组合文件改了时据此判断要不要重挂（`McpComboWatcher`） */
   mountedComboFp.set(sessionId, comboFingerprint(localized));
   /* 挂好、空下来之后再和那时的文件对一次：挂的过程中文件又被改 / 撤回的，按当前文件纠正（`McpComboWatcher.noteMounted`） */
@@ -3118,10 +3118,12 @@ function sessionCombo(sessionId: string, profile: AgentProfile): McpCombo {
   return localized;
 }
 
-/** 上一次 `sessionCombo` 因为没确认过（S3 同步来的）而去掉的 MCP 名字 —— 准备 MCP 时并进「没带上的 MCP」一起说。 */
-const withheldBySession = new Map<string, string[]>();
-const withheldItems = (sessionId: string): McpUnavailable[] => (withheldBySession.get(sessionId) || []).map((name) => skippedItem(name,
-  tr('synced from another computer via S3 and not confirmed on this computer yet; review it in the MCP profile settings and click Save to use it')));
+/** 上一次 `sessionCombo` 因为没确认过（以前从 S3 同步来的）而去掉的 MCP：哪个组合、哪几个名字 —— 准备 MCP 时并进「没带上的 MCP」一起说。 */
+const withheldBySession = new Map<string, { combo: string; names: string[] }>();
+const withheldItems = (sessionId: string): McpUnavailable[] => {
+  const w = withheldBySession.get(sessionId);
+  return w ? w.names.map((name) => untrustedItem(name, w.combo)) : [];
+};
 
 /** 每条会话的执行器挂上时那份组合的指纹（`comboFingerprint`）—— 只在内存里，`sessionCombo` 每次准备 MCP 时更新。 */
 const mountedComboFp = new Map<string, string>();
@@ -7050,8 +7052,6 @@ const MODEL_META_PATH = path.join(KIROLEX_HOME, 'model-meta.json');
 const S3_STATE_PATH = path.join(KIROLEX_HOME, 's3-sync-state.json');
 /** 每条会话最后一次真的上传是什么时候（见 `readSessionMarks` 那段）。 */
 const S3_MARKS_PATH = path.join(KIROLEX_HOME, 's3-session-sync.json');
-/** 组合文件上次同步完两边的内容摘要（`mcpCombosSync.ts` 的 `ComboSyncMark`） */
-const S3_COMBOS_MARK_PATH = path.join(KIROLEX_HOME, 's3-combos-sync.json');
 /** agent-profiles 每个文件上次同步完两边的内容摘要（`agentProfileSync.ts` 的 `ProfileMarks`） */
 const S3_PROFILES_MARK_PATH = path.join(KIROLEX_HOME, 's3-agent-profiles-sync.json');
 /**
@@ -7703,55 +7703,6 @@ async function deleteBackupsOf(
 /** 记忆文件（`memory/` 下的 .md）—— 它们走"谁新用谁"那一套，见 `decideMemory`。 */
 function isMemoryRel(rel: string): boolean {
   return rel.startsWith(`memory${path.sep}`) && rel.endsWith('.md');
-}
-
-/**
- * **`mcp-combos.json` 和桶里那份对一下**（判据、校验、合并和"条件上传 + 冲突重试"都在 `mcpCombosSync.ts` 的 `syncComboFile`）——
- * 多台电脑共用同一份组合。文件很小，每轮整份拉下来按**内容摘要**判断谁变过；上传带 ETag 条件，
- * 下载之后别的电脑又传过 → 不覆盖，重新下载合并再试。
- * 拉 / 合并会改本机文件：改之前把本机那份挪进 trash，改完通知下拉刷新。出错：这一轮不传，摘要不更新。返回传了几个文件（0 / 1）。
- */
-async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefined): Promise<number> {
-  const rel = MCP_COMBOS_REL;
-  const key = keyFor(prefix, rel);
-  const abs = path.join(KIROLEX_HOME, rel);
-  try {
-    const r = await syncComboFile({
-      get: async () => { const g = await getObjectWithEtag(creds, key); return g ? { text: g.body.toString('utf-8'), etag: g.etag } : null; },
-      put: (text, cond) => putObjectIf(creds, key, Buffer.from(text, 'utf-8'), contentTypeFor(rel), cond),
-      readLocal: () => { try { return fs.readFileSync(abs, 'utf-8'); } catch { return undefined; } },
-      writeLocal: (text, plan) => {
-        checkLive(creds);   // 被看门狗放弃的那一轮不改本机（syncRound.ts）
-        /* 被换掉的那份先挪进 trash —— 拉 / 合并都是改写，改写之前留一份 */
-        if (fs.existsSync(abs)) {
-          const bak = path.join(KIROLEX_HOME, 'trash', `mcp-combos-sync-${Date.now()}`, rel);
-          fs.mkdirSync(path.dirname(bak), { recursive: true });
-          fs.copyFileSync(abs, bak);
-        }
-        /* 本机原来没有的 MCP 配置先记成「没确认过」（记不下来就抛，这一轮不改写）：确认之前不挂（`mcpComboTrust.ts`） */
-        const held = markPulledUntrusted(os.homedir(), fs.existsSync(abs) ? fs.readFileSync(abs, 'utf-8') : undefined, text);
-        if (held) logger.warn('s3', `组合文件：从桶里来了 ${held} 个这台电脑上没有的 MCP 配置，在设置里确认（保存）之前不挂`);
-        writeMcpCombosText(os.homedir(), text);
-        mainWindow?.webContents.send('acp:mcp-combos-changed');
-        mcpComboWatcher?.changed();
-        logger.info('s3', `组合文件：${plan.action === 'pull' ? '从桶里拉回（别的电脑改的 / 本机第一次同步）' : `按合并结果改写（从桶里并进 ${plan.added.length} 个组合）`}`);
-      },
-      readMark: () => readComboMark(S3_COMBOS_MARK_PATH),
-      writeMark: (m) => { checkLive(creds); writeComboMark(S3_COMBOS_MARK_PATH, m); },
-    });
-    for (const plan of r.plans) {
-      if (plan.action === 'skip') logger.warn('s3', `组合文件这一轮不同步，两边都不动：${plan.error}`);
-      if (plan.conflicts.length) {
-        logger.warn('s3', `组合文件两边改了同一个组合（${plan.conflicts.map((c) => `${c.id} → 桶里那份留成 ${c.keptAs}`).join('、')}），两份都留着，没有覆盖`);
-      }
-    }
-    if (r.plans.length > 1) logger.info('s3', `组合文件：上传时发现别的电脑刚传过，重新下载合并了 ${r.plans.length - 1} 次`);
-    if (r.gaveUp) logger.warn('s3', '组合文件：连着几次上传前都被别的电脑抢先改了，这一轮不传（没有覆盖对方），下一轮再合并');
-    return r.uploaded ? 1 : 0;
-  } catch (err: any) {
-    logger.warn('s3', `组合文件同步没成功（这一轮不传）：${err?.message || err}`);
-    return 0;
-  }
 }
 
 /** 本机是哪台：定时任务的 runner 值（设备 ID，同云端清理的设备清单）+ 显示用的主机名。 */
@@ -8611,6 +8562,8 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
 
 /** 「全局记忆不再同步」那一行只在启动后第一次同步时记一次。 */
 let globalMemoryNoSyncLogged = false;
+/** 「MCP 组合只存本机，不再同步」那一行同样只记一次。 */
+let mcpCombosNoSyncLogged = false;
 
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
   /* 上一轮还在跑：记日志（带它的开始时间和阶段），不静默 —— 静默正是「卡死 2.5 小时、日志里什么都没有」的那条路 */
@@ -8935,10 +8888,11 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
           }
         }
       }
-      /* 组合文件（mcp-combos.json）：多台电脑共用一份，两边都改过时合并、不静默覆盖 */
-      round.stage('同步组合文件');
-      uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix);
-      round.check();
+      /* 组合文件（mcp-combos.json）只存本机、不再同步（每台电脑各配各的）：不传、不拉、不合并，桶里那份不删也不读 */
+      if (!mcpCombosNoSyncLogged) {
+        mcpCombosNoSyncLogged = true;
+        logger.info('s3', 'MCP 组合只存本机，不再同步：mcp-combos.json 不上传、不拉取、不合并（桶里原有的那份不删）');
+      }
       /* 外观配置（appearance.json：主题 / 对比度 / 强调色 / 字体 / 字号 + theme.json）：整份谁新用谁，uiZoom 不同步 */
       round.stage('同步外观');
       uploaded += await syncAppearanceWithBucket(creds!, cfg.prefix);

@@ -437,8 +437,8 @@ describe('接线（index.ts 源码扫描）', () => {
     assert.match(M, /mcpComboWatcher\.prime\(\);/);
     const save = fnBody("ipcMain.handle('acp:save-mcp-combos'", '\n  });\n');
     assert.match(save, /mcpComboWatcher\?\.changed\(\)/);
-    const s3 = fnBody('async function syncMcpCombosWithBucket(');
-    assert.match(s3, /writeMcpCombosText\(os\.homedir\(\), text\);[\s\S]*?mcpComboWatcher\?\.changed\(\)/);
+    /* S3 不再改写组合文件（2026-11-26 起只存本机），没有那条路径了 */
+    assert.equal(M.indexOf('async function syncMcpCombosWithBucket('), -1);
     const busy = fnBody('function emitSessionBusy(');
     assert.match(busy, /mcpComboWatcher\?\.idle\(sessionId\)/);
   });

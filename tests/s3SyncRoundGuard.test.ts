@@ -160,10 +160,8 @@ describe('index.ts 接线：每一轮的凭证挂 live，子流程改本机之�
     assert.match(fn('async function runS3Sync('), /const creds = resolved\.creds \? \{ \.\.\.resolved\.creds, live: \(\) => round\.check\(\), progress: \(\) => round\.progress\(\) \} : undefined;/);
   });
 
-  test('组合文件 / 外观 / agent-profiles：写本机、写标记之前 checkLive(creds)', () => {
-    const combos = fn('async function syncMcpCombosWithBucket(');
-    assert.match(combos, /writeLocal: \(text, plan\) => \{\s*checkLive\(creds\);/);
-    assert.match(combos, /writeMark: \(m\) => \{ checkLive\(creds\);/);
+  test('外观 / agent-profiles：写本机、写标记之前 checkLive(creds)（组合文件 2026-11-26 起不再同步）', () => {
+    assert.doesNotMatch(M, /async function syncMcpCombosWithBucket\(/);
     assert.match(fn('async function syncAppearanceWithBucket('), /apply: \(payload, updatedAt, from\) => \{\s*checkLive\(creds\);/);
     const prof = fn('async function syncAgentProfilesWithBucket(');
     assert.match(prof, /writeLocal: \(rel, body\) => \{\s*checkLive\(creds\);/);

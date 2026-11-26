@@ -190,16 +190,14 @@ describe('审查意见：没有明确确认就不放行', () => {
 
 describe('接线：同步和保存都过这一道', () => {
   const src = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf-8');
-  test('同步改写本机组合文件之前先记待确认（记不下来就抛、不改写）', () => {
-    const at = src.indexOf('async function syncMcpCombosWithBucket(');
-    const body = src.slice(at, src.indexOf('\n}\n', at));
-    const mark = body.indexOf('markPulledUntrusted(');
-    assert.ok(mark > 0);
-    assert.ok(mark < body.indexOf('writeMcpCombosText('));
+  test('组合文件不再同步：主进程里没有从桶里改写本机组合文件的路径了（以前记下的待确认照旧生效）', () => {
+    assert.equal(src.indexOf('async function syncMcpCombosWithBucket('), -1);
+    assert.doesNotMatch(src, /writeMcpCombosText\(/);
+    assert.match(src, /readUntrusted\(os\.homedir\(\)\)/);
   });
   test('sessionCombo 去掉没确认过的再交出去；设置里保存 = 确认', () => {
     const at = src.indexOf('function sessionCombo(');
-    assert.ok(src.slice(at, src.indexOf('\n}\n', at)).includes('withholdUntrusted('));
+    assert.ok(src.slice(at, src.indexOf('\n}\n', at)).includes('withholdUntrustedLocal('));
     const save = src.indexOf("ipcMain.handle('acp:save-mcp-combos'");
     const body = src.slice(save, src.indexOf('\n  });\n', save));
     /* 只有明确点了保存才确认；自动保存先把待确认带过去，再写文件 */
