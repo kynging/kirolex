@@ -30,6 +30,24 @@ export interface S3Creds {
    * 参数是失败的那个 AccessKeyId —— 并发失败的请求只让缓存清一次。
    */
   refresh?: (failedKeyId: string) => Promise<{ accessKeyId: string; secretAccessKey: string; sessionToken?: string }>;
+  /**
+   * 这份凭证所属的那一轮同步还算不算数：被看门狗放弃了就抛（`syncRound.ts` 的 `RoundAbandoned`）。
+   * 每个请求**发出前、收到响应后**都调 —— 被放弃那一轮晚到的读取拿不到结果，之后的写 / 删也发不出去，
+   * 不管调用它的子流程里有没有自己的 try/catch。子流程改本机文件之前用 `checkLive` 再核对一次。
+   */
+  live?: () => void;
+  /** 真有数据在流动时调（上传分块交给系统后 / 下载每收到一块）—— 同步那一轮接到看门狗上：正常在传的大文件不算卡住。 */
+  progress?: () => void;
+}
+
+/** 这份凭证所属的那一轮同步被放弃了就抛（没挂 `live` 的凭证永远算数）。改本机文件 / 状态之前调。 */
+export function checkLive(creds: S3Creds): void {
+  creds.live?.();
+}
+
+/** 同 `checkLive`，不抛：还算数 → true。 */
+export function isLive(creds: S3Creds): boolean {
+  try { creds.live?.(); return true; } catch { return false; }
 }
 
 /** 这些错误码说明是凭证本身（过期 / 被换掉了），值得重取一次再试。 */
@@ -131,6 +149,9 @@ export function hostFor(creds: S3Creds): string {
 
 interface RawResult { status: number; body: Buffer; headers: Record<string, string | string[] | undefined> }
 
+/** 上传分块写的块大小（每块交给系统后报一次进展）。 */
+const UPLOAD_CHUNK_BYTES = 64 * 1024;
+
 /**
  * 发一个请求。临时凭证（有 `creds.refresh`）被 S3 以 ExpiredToken / InvalidToken / SignatureDoesNotMatch 拒掉时，
  * 重取一份凭证（写回 `creds`，同一轮后面的请求直接用新的）再发**一次**。AK/SK 没有 refresh，行为不变。
@@ -144,13 +165,16 @@ async function request(
   extraHeaders: Record<string, string> = {},
   timeoutMs = 120_000,
 ): Promise<RawResult> {
+  checkLive(creds);
   const r = await requestOnce(creds, method, path, query, payload, extraHeaders, timeoutMs);
+  checkLive(creds);
   if (!creds.refresh || !shouldRefreshCreds(r.status, r.body.toString('utf-8'))) return r;
   const fresh = await creds.refresh(creds.accessKeyId);
+  checkLive(creds);
   creds.accessKeyId = fresh.accessKeyId;
   creds.secretAccessKey = fresh.secretAccessKey;
   creds.sessionToken = fresh.sessionToken;
-  return requestOnce(creds, method, path, query, payload, extraHeaders, timeoutMs);
+  return requestOnce(creds, method, path, query, payload, extraHeaders, timeoutMs).then((again) => { checkLive(creds); return again; });
 }
 
 function requestOnce(
@@ -173,14 +197,48 @@ function requestOnce(
   const qs = Object.keys(query).length
     ? `?${Object.keys(query).sort().map((k) => `${encodeURIComponent(k)}=${encodeURIComponent(query[k])}`).join('&')}`
     : '';
-  return new Promise((resolve, reject) => {
+  return new Promise((resolve0, reject0) => {
+    /*
+      **到响应头为止的硬截止，按「没有进展」算**：`timeout` 只是 socket 空闲超时 —— DNS 解析 / 建连 / TLS 挂住时它来不来取决于
+      socket 的事件；看门狗只放锁、不取消请求，挂在 catalogQueue 里的一项会把后面的都堵住。所以从发请求开始另起一个计时器，
+      到点销毁请求、明确 reject：
+        · 建连之前写不出任何东西 → DNS / 建连 / TLS 挂住，从发请求起 timeoutMs 到点；
+        · 上传每一块真的写出去（write 回调）就续期 —— 慢网下持续在传的大文件不会被固定总时长掐断（审查意见 2026-11-26：
+          原来按 120s + 大小 / 32 KB/s 算，8 MB 以 16 KB/s 在传，第 376 秒被掐断、下一轮从头传）；停住不动 timeoutMs 到点；
+        · 最后一块写出去之后，等响应头最多 timeoutMs；
+        · 收到响应头就清掉 —— 正文阶段由 socket 空闲超时 + 下面的「收到一半断了」兜，不给正文设总时长。
+    */
+    let deadline: ReturnType<typeof setTimeout> | null = null;
+    let gotResponse = false;
+    const clearDeadline = (): void => { if (deadline) { clearTimeout(deadline); deadline = null; } };
+    const resolve = (v: RawResult): void => { clearDeadline(); resolve0(v); };
+    const reject = (e: unknown): void => { clearDeadline(); reject0(e); };
     const req = https.request({
       host, method, path: `${path.split('/').map(encodeURIComponent).join('/')}${qs}`, headers, timeout: timeoutMs,
     }, (res) => {
+      gotResponse = true;
+      clearDeadline();
       const chunks: Buffer[] = [];
-      res.on('data', (c) => chunks.push(c));
+      res.on('data', (c) => { chunks.push(c); creds.progress?.(); });
       res.on('end', () => resolve({ status: res.statusCode || 0, body: Buffer.concat(chunks), headers: res.headers }));
+      /*
+        **正文收到一半连接断了**（睡眠唤醒 / 换网时对面 RST）：req 不再报 'error'、res 也不会 'end'，
+        socket 已经销毁、空闲超时也不会再来 —— 不接住这里，这个 Promise 永远不结束，整轮同步占着 syncRunning 卡死（2026-11-26 Mac）。
+      */
+      res.on('error', reject);
+      res.on('close', () => { if (!res.complete) reject(new Error(tr('S3 connection closed before the response finished'))); });
     });
+    const armDeadline = (): void => {
+      if (gotResponse) return;
+      clearDeadline();
+      deadline = setTimeout(() => {
+        deadline = null;
+        const err = new Error(tr('S3 request got no response within {sec}s', { sec: timeoutMs / 1000 }));
+        req.destroy(err);
+        reject(err);
+      }, timeoutMs);
+    };
+    armDeadline();
     req.on('timeout', () => { req.destroy(new Error(tr('S3 request got no response within {sec}s', { sec: timeoutMs / 1000 }))); });
     /*
       **DNS 失败要说清它不是"网络坏了"** —— 实测用户拿到的是
@@ -195,8 +253,20 @@ function requestOnce(
       }
       reject(err);
     });
-    if (payload.length) req.write(payload);
-    req.end();
+    /*
+      分块写、每块交给系统之后报一次进展（`creds.progress`）：一整块 write 下去，慢网下传十几分钟期间整轮看门狗什么都收不到，
+      会把正常在传的大文件当成卡住。尊重背压（write 返回 false 就等 'drain'）。
+    */
+    let off = 0;
+    const pump = (): void => {
+      while (off < payload.length) {
+        const chunk = payload.subarray(off, off + UPLOAD_CHUNK_BYTES);
+        off += chunk.length;
+        if (!req.write(chunk, () => { armDeadline(); creds.progress?.(); })) { req.once('drain', pump); return; }
+      }
+      req.end();
+    };
+    pump();
   });
 }
 

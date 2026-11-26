@@ -411,7 +411,7 @@ describe('接线（index.ts）', () => {
     const call = body.indexOf('runOffloadRound(creds!, cfg, wrote.catalog)');
     assert.ok(call > body.indexOf('runCloudCleanup('), '要在云端清理之后');
     assert.ok(call < body.indexOf('syncFailures = 0;'), '要在成功路径上');
-    assert.ok(call < body.indexOf('} catch (err: any) {\n    const hint'), '不能在失败路径上');
+    assert.ok(call < body.indexOf('} catch (err: any) {\n      const hint'), '不能在失败路径上');
   });
   test('S3 没开 / 设置关掉时整个不跑；本机清单把占位当成仍持有', () => {
     const fn = M.slice(M.indexOf('async function runOffloadRound('), M.indexOf('async function runS3Sync('));

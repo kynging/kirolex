@@ -254,7 +254,7 @@ describe('paths that create the directory first are guarded too (review round 2)
     const got = pull.indexOf('await getObject(creds, p.key);');
     assert.ok(got > 0 && got < pull.indexOf('if (sessionDeleted(sessionId)) break;') && pull.indexOf('if (sessionDeleted(sessionId)) break;') < pull.indexOf('fs.mkdirSync('));
     assert.match(m, /isDeleted: \(\) => sessionDeleted\(sessionId\),/);
-    const loop = main.slice(main.indexOf('await mergeBucketSession(creds!, cfg.prefix, c.id)'));
+    const loop = main.slice(main.indexOf('await mergeBucketSession(creds!, cfg.prefix, c.id, round)'));
     assert.ok(loop.indexOf('if (r.gone)') < loop.indexOf('noteBucketSeen('), 'a gone merge is not noted as seen');
   });
 });

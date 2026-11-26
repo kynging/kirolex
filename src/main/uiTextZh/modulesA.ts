@@ -38,6 +38,7 @@ export const ZH_MODULES_A: Record<string, string> = {
   '· China regions (the `aws-cn` partition) use the domain suffix `.amazonaws.com.cn`. KiroLex already builds it that way (`{host}`); if you typed an address into the endpoint field next to "Key prefix", check that it is not missing `.cn`.': '· 中国区（`aws-cn` 分区）的域名后缀是 `.amazonaws.com.cn` —— KiroLex 已经按这个拼了（`{host}`），如果你在「Key 前缀」旁边那个 endpoint 里手填过地址，检查一下它是不是漏了 `.cn`。',
   '· If this bucket is in a **China region** (Beijing `cn-north-1` / Ningxia `cn-northwest-1`), the region must be one of those two. China is a separate partition with the domain suffix `.amazonaws.com.cn`; a non-China region produces a domain that does not exist.': '· 如果这个桶在**中国区**（北京 `cn-north-1` / 宁夏 `cn-northwest-1`），region 必须填成那两个之一 —— 中国区是独立分区，域名后缀是 `.amazonaws.com.cn`，填成海外的区就会拼出一个不存在的域名。',
   'S3 request got no response within {sec}s': 'S3 请求超过 {sec}s 没响应',
+  'S3 connection closed before the response finished': 'S3 连接在响应收完之前断开了',
   'Cannot reach {host} ({code})': '连不上 {host}（{code}）',
   '{what} failed ({status} {code})': '{what} 失败（{status} {code}）',
   'Upload {key}': '上传 {key}',

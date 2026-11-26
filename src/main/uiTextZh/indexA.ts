@@ -71,6 +71,7 @@ export const ZH_INDEX_A: Record<string, string> = {
     'S3 的 secret 解不开了 —— keychain 里那把密钥变了（换过机器/重装过？）。重新填一次。',
   '{key}: {error}': '{key}：{error}',
   'The previous sync is still running': '上一轮还在跑',
+  'The sync took too long and was abandoned (stuck at: {stage})': '同步太久没有进展，这一轮已放弃（卡在：{stage}）',
   'Backing off': '退避中',
   "What was read back doesn't match what was written. The bucket may have a policy that rewrites content.": '写进去又读回来的内容不一致 —— 桶上可能有改写内容的策略。',
   ' (the test object could not be deleted: {error}. {key} was left in the bucket; this key may lack s3:DeleteObject)':

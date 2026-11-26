@@ -201,7 +201,7 @@ describe('接线（源码）', () => {
     assert.ok(ran > 0 && pushed > ran, 'attachOnce 成功之后推');
   });
   test('S3 合并 / 恢复改了记录之后推', () => {
-    const merge = between(INDEX, 'const r = await mergeBucketSession(creds!, cfg.prefix, c.id);', '} catch (err: any) {');
+    const merge = between(INDEX, 'const r = await mergeBucketSession(creds!, cfg.prefix, c.id, round);', '} catch (err: any) {');
     assert.match(merge, /pushProfileSync\(\[c\.id\], 's3-merge'\);/);
     const restore = between(INDEX, "ipcMain.handle('s3:restore'", "ipcMain.handle('offload:list'");
     assert.match(restore, /pushProfileSync\(\[sessionId\], 's3-restore'\);/);

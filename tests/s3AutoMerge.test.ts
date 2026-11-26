@@ -13,8 +13,8 @@ test('冲突先自动合并；只有正在跑的、合并出错的才走旁路',
   const at = M.indexOf('const conflicts = planBucketMerges(');
   const body = M.slice(at, at + 3200);
   assert.match(body, /if \(live\?\.busy\) \{ conflictIds\.add\(c\.id\); continue; \}/);
-  assert.match(body, /await mergeBucketSession\(creds!, cfg\.prefix, c\.id\)/);
-  assert.match(body, /catch \(err: any\) \{\s*conflictIds\.add\(c\.id\)/);
+  assert.match(body, /await mergeBucketSession\(creds!, cfg\.prefix, c\.id, round\)/);
+  assert.match(body, /catch \(err: any\) \{\s*if \(err instanceof RoundAbandoned\) throw err;\s*conflictIds\.add\(c\.id\)/);
   /* 合并完要重新传、catalog 按合并后的记录 —— 不然下一轮又判冲突 */
   assert.match(body, /freshEntries = catalogEntriesFor\(/);
   assert.match(body, /session:history-changed/);

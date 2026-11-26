@@ -1,4 +1,4 @@
-import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification, screen, type WebContents } from 'electron';
+import { app, BrowserWindow, ipcMain, Tray, Menu, nativeImage, clipboard, dialog, shell, safeStorage, Notification, screen, powerMonitor, type WebContents } from 'electron';
 import path from 'path';
 import fs from 'fs';
 import os from 'os';
@@ -78,7 +78,8 @@ import { McpComboWatcher, comboFingerprint, remountExclusive, COMBO_FILE_BROKEN 
 import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfilesRoot, readProfileFile, saveProfileText, readLocalRules, parseClaudeProfile, parseCodexProfile, computeDiff, buildSyncPlan, planHasWork, probeScript, parseProbeOutput, runProfileSync, remotePinCommand, remoteApplyCommand, collectMarketplaceFiles, CLAUDE_PROFILE_TEMPLATE, CODEX_PROFILE_TEMPLATE, type ProfileEngine, type ProbeResult, type DiffItem, type SyncPlan, type ClaudeProfile, type CodexProfile } from './agentProfile.ts';
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
 import { AwsCredsResolver, resolveSyncSnapshot, lockThenResolve, type RunLock, syncConfigProblem, credentialSourceOf, credsLogLabel, validProfileName, type SyncCredsResult } from './awsProfileCreds.ts';
-import { S3Creds, S3Error, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
+import { SyncRounds, RoundAbandoned, type SyncRound } from './syncRound.ts';
+import { S3Creds, S3Error, checkLive, isLive, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
 import {
   serialQueue, catalogIO, updateCatalog, readCatalog, deleteSessionBackups, writeSyncCatalog, forgetMissingEntries,
   missingEntries, markMissing, sessionIdsFromPrefixes, sessionKeyPrefix, entryUploadedAt, syncMark, deletedSessionPlan, dropSessionState, type CatalogBucket,
@@ -7176,6 +7177,12 @@ async function resolveSyncCredsNow(): Promise<SyncCredsResult & { cfg: SyncConfi
 let syncRunning = false;
 /** 同步一次只跑一轮：`lockThenResolve` 经它占 / 放 `syncRunning`（取凭证之前就占住）。 */
 const syncLock: RunLock = { get held() { return syncRunning; }, set held(v: boolean) { syncRunning = v; } };
+/**
+ * **备份同步的看门狗**（syncRound.ts）：一轮在同一个阶段卡 15 分钟没有进展就放弃、放锁，下一轮照常跑 ——
+ * 「睡眠唤醒后定时同步卡死 2.5 小时、日志静默」（2026-11-26 Mac）。
+ */
+const SYNC_ROUND_STALL_MS = 15 * 60_000;
+const syncRounds = new SyncRounds({ limitMs: SYNC_ROUND_STALL_MS, log: (level, msg) => logger[level]('s3', msg) });
 
 /**
  * **本机对 catalog.json 的操作排成一队**（删除 / 同步写 catalog / 恢复时清目录 / 以本机为准 / 从目录里移除）——
@@ -7514,7 +7521,7 @@ function containedPath(base: string, rel: string): string | null {
  * **等网络期间变忙了就推迟**（`deferred: true`，顺序在 s3Pull.ts 的 `runBucketMerge`）：调用方进来前查过一次忙，
  * 但下载 / 列文件 / 拉文件都要等，这期间可能开始了新一轮 —— 断开执行器、改写之前紧挨着再查一次，忙了就不动，下一轮再合。
  */
-async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, sessionId: string): Promise<BucketMergeResult> {
+async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, sessionId: string, round?: SyncRound): Promise<BucketMergeResult> {
   /* 删掉的会话不合并（等网络期间删的，runBucketMerge 每次等完再问 —— isDeleted） */
   if (sessionDeleted(sessionId)) return { added: 0, pulledFiles: 0, gone: true };
   const sdir = getSessionDir(sessionId);
@@ -7546,14 +7553,18 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
     countNew: (theirs) => mergeTranscripts(readMine(), theirs).added,
     /* 正在跑一轮 / 后台自主轮 / 正在接上 / 正在换执行器：都不能断开、不能改写 */
     isBusy: () => !!sessionClients.get(sessionId)?.busy || !!sessionClients.get(sessionId)?.autonomous
-      || attachingSessions.has(sessionId) || reconfiguringSessions.has(sessionId),
+      || attachingSessions.has(sessionId) || reconfiguringSessions.has(sessionId)
+      /* 这一轮同步已经被看门狗放弃了：晚到的下载不再改写本机（当成忙，不断开、不合并） */
+      || !!round?.abandoned,
     isDeleted: () => sessionDeleted(sessionId),
     /* 只新增本机没有的文件，不碰 transcript / record —— 这一步等网络，之后还会再查一次忙不忙 */
     pullFiles: async () => {
       let pulled = 0;
       for (const p of toPull) {
         if (fs.existsSync(p.abs)) continue;
+        round?.stage(`合并 ${sessionId}：下载 ${p.key}`);
         const body = await getObject(creds, p.key);
+        if (round?.abandoned) break;
         /* 下载期间会话被删了：mkdir 会把 sessions/<id>/ 重新建出来 —— 停 */
         if (sessionDeleted(sessionId)) break;
         if (fs.existsSync(p.abs)) continue;
@@ -7710,6 +7721,7 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
       put: (text, cond) => putObjectIf(creds, key, Buffer.from(text, 'utf-8'), contentTypeFor(rel), cond),
       readLocal: () => { try { return fs.readFileSync(abs, 'utf-8'); } catch { return undefined; } },
       writeLocal: (text, plan) => {
+        checkLive(creds);   // 被看门狗放弃的那一轮不改本机（syncRound.ts）
         /* 被换掉的那份先挪进 trash —— 拉 / 合并都是改写，改写之前留一份 */
         if (fs.existsSync(abs)) {
           const bak = path.join(KIROLEX_HOME, 'trash', `mcp-combos-sync-${Date.now()}`, rel);
@@ -7725,7 +7737,7 @@ async function syncMcpCombosWithBucket(creds: S3Creds, prefix: string | undefine
         logger.info('s3', `组合文件：${plan.action === 'pull' ? '从桶里拉回（别的电脑改的 / 本机第一次同步）' : `按合并结果改写（从桶里并进 ${plan.added.length} 个组合）`}`);
       },
       readMark: () => readComboMark(S3_COMBOS_MARK_PATH),
-      writeMark: (m) => writeComboMark(S3_COMBOS_MARK_PATH, m),
+      writeMark: (m) => { checkLive(creds); writeComboMark(S3_COMBOS_MARK_PATH, m); },
     });
     for (const plan of r.plans) {
       if (plan.action === 'skip') logger.warn('s3', `组合文件这一轮不同步，两边都不动：${plan.error}`);
@@ -7842,6 +7854,7 @@ async function syncSchedulesWithBucket(creds: S3Creds, prefix: string | undefine
       remote.set(id, { sessionId: sid, parsed });
     }
     /* 网络都等完了才读本机：下面到写盘之间没有 await，期间不会有一次运行的记账被这份合并盖掉 */
+    checkLive(creds);   // 被看门狗放弃的那一轮不改本机的定时任务
     const plan = planScheduleSync({
       me: me.id, local: scheduleStore.listSchedules(home, store.isAdvancedOnlySession),
       tombstones: scheduleStore.readScheduleTombstones(home), remote, inScope, upload: opts.upload,
@@ -7957,6 +7970,8 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
   const heartbeatMs = Math.max(5, Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES) * 60_000;
   let uploaded = 0;
   let uiChanged = false;
+  /* 改账 / 停进程之前都核对这一轮还算数：被看门狗放弃的那一轮晚到的结果不改本机（syncRound.ts） */
+  const ledger = (fn: (l: BgSyncLedger) => BgSyncLedger): void => { checkLive(creds); updateBgLedger(fn); };
   try {
     const objects = await listObjects(creds, `${keyFor(prefix, BG_JOBS_REL)}/`);
     const entries: Array<{ rel: string; etag?: string }> = [];
@@ -7966,7 +7981,7 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
     }
     const bucket = collectBucketBgJobs(entries);
     /* 别的电脑上结束超过 7 天的：从本机账里拿掉（桶里不动），记进 pruned，下面就不会再下载回来 */
-    updateBgLedger((l) => pruneEndedForeign(l, Date.now(), FOREIGN_KEEP_MS, new Set(bucket.keys())));
+    ledger((l) => pruneEndedForeign(l, Date.now(), FOREIGN_KEEP_MS, new Set(bucket.keys())));
     const plan = () => planBgSync({ me, now: Date.now(), heartbeatMs, own: bgJobs.listForSync(), ledger: bgLedger(), bucket, inScope });
     /* 1. 停止请求：只停不改 —— 解析只留 jobId / 会话，停的只能是本机表里在跑的那条 */
     const requests: BgStopRequest[] = [];
@@ -7980,6 +7995,7 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
     for (const s of planStopRequests(requests, bgJobs.listForSync())) {
       const from = requests.find((r) => r.jobId === s.jobId)?.by ?? '?';
       logger.info('bg', `sync: 别的电脑（${from}）请求停止 ${s.jobId} session=${s.sessionId}，本机停掉它自己起的进程`);
+      checkLive(creds);
       await bgJobs.stop(s.jobId, 'user', s.sessionId);
       try { await deleteObject(creds, objKey(bgObjectRel(s.sessionId, s.jobId, 'stop'))); } catch { /* 停过了，下一轮看到它也不会再停一次 */ }
     }
@@ -7988,7 +8004,7 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
       await putObject(creds, objKey(bgObjectRel(sessionId, jobId, 'deleted')), Buffer.from(bgTombstoneBody(jobId, sessionId, at, me.id), 'utf-8'), 'application/json');
       uploaded += 1;
       for (const rel of extra) { try { await deleteObject(creds, objKey(rel)); } catch { /* 删除标记已经在了，它胜 */ } }
-      updateBgLedger((l) => {
+      ledger((l) => {
         const published = { ...l.published }; delete published[jobId];
         const foreign = { ...l.foreign }; delete foreign[jobId];
         const ownReruns = { ...l.ownReruns }; delete ownReruns[jobId];
@@ -7999,7 +8015,7 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
       if (a.op === 'put') {
         await putObject(creds, objKey(bgObjectRel(a.sessionId, a.jobId, 'state')), Buffer.from(bgStateBody(a.state), 'utf-8'), 'application/json');
         uploaded += 1;
-        updateBgLedger((l) => ({ ...l, published: { ...l.published, [a.jobId]: { sessionId: a.sessionId, hash: a.hash, putAt: a.state.updatedAt } } }));
+        ledger((l) => ({ ...l, published: { ...l.published, [a.jobId]: { sessionId: a.sessionId, hash: a.hash, putAt: a.state.updatedAt } } }));
       } else if (a.op === 'put-tombstone') {
         await tombstone(a.jobId, a.sessionId, a.at, a.extra);
         logger.info('bg', `sync: ${a.jobId} session=${a.sessionId} 写删除标记（本机清理了 / 会话不同步了 / 删了）`);
@@ -8010,7 +8026,7 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
         if (body && !parsed) logger.warn('bg', `sync: 桶里的 ${a.rel} 认不出（格式不对 / 没有 runner），不显示`);
         const ownIds = new Set(bgJobs.listForSync().map((j) => j.jobId));
         let needsTombstone = false;
-        updateBgLedger((l) => { const r = applyFetchedState(l, a.jobId, parsed, a.etag, me.id, ownIds); needsTombstone = r.tombstone; return r.ledger; });
+        ledger((l) => { const r = applyFetchedState(l, a.jobId, parsed, a.etag, me.id, ownIds); needsTombstone = r.tombstone; return r.ledger; });
         if (needsTombstone) {
           logger.info('bg', `sync: 桶里的 ${a.jobId} 说是本机跑的，本机表里没有（清理过的 / 不是本机写的）：写删除标记，不当成本机的`);
           await tombstone(a.jobId, a.sessionId, Date.now(), [a.rel]);
@@ -8021,22 +8037,22 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
         if (mark && bgJobs.listForSync().some((j) => j.jobId === a.jobId)) {
           /* 本机的任务被别的电脑在那边重跑了：只记下来显示，本机的进程照旧（不自动停） */
           logger.info('bg', `sync: 本机的 ${a.jobId} 已被 ${mark.byName} 在那边重跑为 ${mark.newJobId}（本机进程照旧，要停就点停止）`);
-          updateBgLedger((l) => ({ ...l, ownReruns: { ...l.ownReruns, [a.jobId]: mark } }));
+          ledger((l) => ({ ...l, ownReruns: { ...l.ownReruns, [a.jobId]: mark } }));
           uiChanged = true;
         } else if (mark) {
-          updateBgLedger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], rerun: mark, rerunPushed: true } } } : l));
+          ledger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], rerun: mark, rerunPushed: true } } } : l));
           uiChanged = true;
         }
       } else if (a.op === 'put-stop') {
         await putObject(creds, objKey(bgObjectRel(a.sessionId, a.jobId, 'stop')), Buffer.from(stopRequestBody({ jobId: a.jobId, sessionId: a.sessionId, at: a.at, by: me.id }), 'utf-8'), 'application/json');
         uploaded += 1;
-        updateBgLedger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], stopPushed: true } } } : l));
+        ledger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], stopPushed: true } } } : l));
       } else if (a.op === 'put-rerun') {
         await putObject(creds, objKey(bgObjectRel(a.sessionId, a.jobId, 'rerun')), Buffer.from(rerunBody(a.jobId, a.sessionId, a.mark), 'utf-8'), 'application/json');
         uploaded += 1;
-        updateBgLedger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], rerunPushed: true } } } : l));
+        ledger((l) => (l.foreign[a.jobId] ? { ...l, foreign: { ...l.foreign, [a.jobId]: { ...l.foreign[a.jobId], rerunPushed: true } } } : l));
       } else if (a.op === 'forget') {
-        updateBgLedger((l) => {
+        ledger((l) => {
           const published = { ...l.published }; delete published[a.jobId];
           const foreign = { ...l.foreign }; delete foreign[a.jobId];
           const tombstones = a.tombstone && !l.tombstones[a.jobId] ? { ...l.tombstones, [a.jobId]: { sessionId: a.sessionId, at: Date.now(), pushed: true } } : l.tombstones;
@@ -8269,6 +8285,7 @@ async function syncAppearanceWithBucket(creds: S3Creds, prefix: string | undefin
       getRemote: async () => { const raw = await getObjectIfExists(creds, key); return raw ? raw.toString('utf-8') : null; },
       put: (text) => putObject(creds, key, Buffer.from(text, 'utf-8'), 'application/json'),
       apply: (payload, updatedAt, from) => {
+        checkLive(creds);   // 被看门狗放弃的那一轮不改本机
         applyRemoteAppearance(payload, updatedAt);
         logger.info('s3', `外观配置：用了桶里更新的那份（来自 ${from || '另一台电脑'}）`);
       },
@@ -8310,6 +8327,7 @@ async function syncAgentProfilesWithBucket(creds: S3Creds, prefix: string | unde
       listLocal: () => listLocalProfileFiles(root),
       readLocal: (rel) => { const abs = absOf(rel); try { return abs ? fs.readFileSync(abs) : undefined; } catch { return undefined; } },
       writeLocal: (rel, body) => {
+        checkLive(creds);   // 被看门狗放弃的那一轮不改本机
         const abs = absOf(rel);
         if (!abs) return;
         if (fs.existsSync(abs)) {
@@ -8323,13 +8341,14 @@ async function syncAgentProfilesWithBucket(creds: S3Creds, prefix: string | unde
         fs.renameSync(tmp, abs);
       },
       writeConflictCopy: (rel, body) => {
+        checkLive(creds);
         const abs = path.join(root, PROFILE_CONFLICTS_DIR, stamp, ...rel.split('/'));
         fs.mkdirSync(path.dirname(abs), { recursive: true });
         fs.writeFileSync(abs, body);
         return abs;
       },
       readMarks: () => readProfileMarks(S3_PROFILES_MARK_PATH),
-      writeMarks: (m) => writeProfileMarks(S3_PROFILES_MARK_PATH, m),
+      writeMarks: (m) => { checkLive(creds); writeProfileMarks(S3_PROFILES_MARK_PATH, m); },
     });
     if (r.pulled.length) logger.info('s3', `AI 工具配置：从桶里拉回 ${r.pulled.join('、')}（别的电脑改的 / 本机第一次同步）`);
     if (r.uploaded.length) logger.info('s3', `AI 工具配置：传了 ${r.uploaded.join('、')}`);
@@ -8561,6 +8580,7 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
       remoteHost: sessionRemoteLabel(rec?.profile?.remote) || undefined,
       /* 核对要读文件、走网络，这段时间里可能被打开 / 开始跑 —— 挪目录之前最后再问一次 */
       recheck: () => {
+        if (!isLive(creds)) return 'the sync round was abandoned';   // 核对期间整轮被看门狗放弃了：不挪目录、不写占位
         if (sessionClients.has(p.id) || attachingSessions.has(p.id) || reconfiguringSessions.has(p.id)) return 'it was opened meanwhile';
         const u = uiState();
         if (u['kirolex-last-session'] === p.id || String(u['kirolex-split-session'] || '').includes(`"${p.id}"`)) return 'it was opened meanwhile';
@@ -8593,459 +8613,515 @@ async function runOffloadRound(creds: S3Creds, cfg: SyncConfig, catalog: Catalog
 let globalMemoryNoSyncLogged = false;
 
 async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
-  if (syncRunning) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
+  /* 上一轮还在跑：记日志（带它的开始时间和阶段），不静默 —— 静默正是「卡死 2.5 小时、日志里什么都没有」的那条路 */
+  if (syncRunning) return syncRounds.noteSkipped(reason, { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') });
   if (reason === '定时' && Date.now() < syncNextAllowedAt) {
     logger.info('s3', `跳过这一次定时同步（连续失败 ${syncFailures} 次，退避到 ${new Date(syncNextAllowedAt).toLocaleTimeString()}）`);
     return { ok: false, uploaded: 0, skipped: 0, error: tr('Backing off') };
   }
-  /* 取凭证（aws CLI，可能好几秒）之前就占住锁；没取到凭证时 lockThenResolve 自己放掉，取到了由下面整轮的 finally 放 */
-  const resolved = await lockThenResolve(syncLock, resolveSyncCredsNow);
-  if (!resolved) return { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
-  const { creds, problem, cfg } = resolved;
-  if (problem) return { ok: false, uploaded: 0, skipped: 0, error: problem };
-  const state = readState(S3_STATE_PATH);
-  const marks = readSessionMarks(S3_MARKS_PATH);
-  /** 这一轮真的传了文件的那些会话 —— 只给它们更新"最后同步时间"。 */
-  const touchedSessions = new Set<string>();
-  /** 这一轮每条会话最后一个文件真的传上去的时刻 —— catalog 条目的 `uploadedAt`（和删除记录比谁新）。 */
-  const uploadedAtBySession = new Map<string, number>();
-  const syncStartedAt = Date.now();
-  let uploaded = 0;
-  let bytes = 0;
-  try {
+  /*
+    取凭证（aws CLI，可能好几秒）之前就占住锁 —— `syncRounds.run` 同步地占住 syncLock，整轮跑完 / 抛错 / 被看门狗放弃都由它放
+    （只放一次：被放弃那一轮晚到的结果碰不到下一轮的锁）。被放弃那一轮之后每个 `round.check()` 都抛，不再写 state / catalog。
+  */
+  const r = await syncRounds.run(syncLock, reason, runS3SyncRound, (round) => {
+    lastSyncSummary = { at: Date.now(), uploaded: 0, skipped: 0, bytes: 0, error: tr('The sync took too long and was abandoned (stuck at: {stage})', { stage: round.currentStage }) };
+    mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
+    return { ok: false, uploaded: 0, skipped: 0, error: lastSyncSummary.error };
+  });
+  return r ?? { ok: false, uploaded: 0, skipped: 0, error: tr('The previous sync is still running') };
+
+  /** 一整轮（锁已经占着）。每个 await 之后、写 state / catalog / 本机文件之前 `round.check()`：被看门狗放弃了就停。 */
+  async function runS3SyncRound(round: SyncRound): Promise<{ ok: boolean; uploaded: number; skipped: number; error?: string; cloudTrashed?: number; cloudPurged?: number }> {
+    round.stage('取凭证');
+    const resolved = await resolveSyncCredsNow();
+    round.check();
+    const { problem, cfg } = resolved;
     /*
-      **按项目筛一遍** ——「有些project可以选择不同步」。筛在这里（枚举会话的地方）
-      而不是 `planUpload` 里面：那个函数只认"路径 + 上次的状态"，把项目概念塞进去
-      会让它同时对两件事负责。
+      这一轮自己的一份凭证，挂上「这一轮还算数」：每个 S3 请求发出前、收到响应后都核对（s3Client 的 request）——
+      子流程内部的等待期间被放弃，晚到的读取拿不到结果、之后的写 / 删发不出去；子流程改本机之前也 checkLive(creds)。
+      真有数据在流动（上传分块 / 下载收到一块）时报给看门狗：慢网下正常在传的大文件不算卡住
     */
-    const thisMachine = machineTag(os.hostname());
-    /*
-      **先看桶里有没有别人动过同一条会话**（参考 Tabby 插件的 `conflict detection` +
-      `safe conflict backups`）。catalog 要在上传**之前**读：读晚了就已经盖掉对方了。
-      也要在**列会话、做上传计划之前**读 —— 位置跟随（`followBucketPlacements`）得先把别的机器挪过的
-      项目 / 归档改到本机，后面的计划和 catalog 条目才是新位置，不会把旧位置再传上去。
-    */
-    const oldRaw0 = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
-    let oldCatalog: Catalog | null = null;
-    try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
-    followBucketPlacements(cfg, oldCatalog, store.listSessions());   // 侧栏按 session:placement-changed 逐条改
-    followBucketCrossDevice(cfg, oldCatalog, store.listSessions());  // 「在其他电脑上同步」开关同样谁后改听谁
-    const allSessions = store.listSessions();
-    const syncable = allSessions.filter((r) => syncsSession(cfg, r));
-    /*
-      **删掉的云端备份不再被重新传上去**（判据见 catalogStore.deletedSessionPlan）—— 所有电脑一样：
-      有删除记录、而会话的最后修改时间不晚于删除时刻 → 这一轮不传、不进 catalog（恢复页不显示）；
-      删除之后又有了新改动 → 整条重传（先清掉它在状态表里的记录，桶里那份已经没了）。
-    */
-    /** 每条会话的对话最后一次变的时刻 —— 开头按它筛，写 catalog 时再按最新的删除记录核对一遍（writeSyncCatalog） */
-    const changedAtById = new Map(syncable.map((r) => [r.id, sessionChangedAt(KIROLEX_HOME, r.id)]));
-    const deletedPlan = deletedSessionPlan(syncable.map((r) => ({ id: r.id, changedAt: changedAtById.get(r.id) })), oldCatalog);
-    dropSessionState(state, deletedPlan.reupload);
-    const sessions = syncable.filter((r) => !deletedPlan.skip.has(r.id));
-    if (deletedPlan.skip.size) logger.info('s3', `${deletedPlan.skip.size} 条会话的云端备份删掉之后没有新改动，不重新上传：${[...deletedPlan.skip].join('、')}`);
-    if (deletedPlan.reupload.size) logger.info('s3', `${deletedPlan.reupload.size} 条会话的云端备份删掉之后又有了新改动，整条重新上传：${[...deletedPlan.reupload].join('、')}`);
-    const excludedCount = allSessions.length - syncable.length;
-    if (excludedCount) {
-      logger.info('s3', `跳过 ${excludedCount} 条会话（项目设成了不同步：`
-        + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、') || '无'}；单独设成不同步的会话 ${(cfg.excludeSessions || []).length} 条；单独打开的不算在内）`);
-    }
-    const ids = sessions.map((r) => r.id);
-    /*
-      **记忆按同一个口径筛** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
-      项目：本地所有有记忆的项目里，没被设成不同步的那些（一个项目底下暂时没有会话，它的记忆也该在），
-      再加上项目关着、但里面有单独打开的会话的那些（`syncedProjects`）—— 恢复那条会话时项目记忆也得在。
-    */
-    const syncedProjects = new Set(syncable.map((r) => projectOf(r)));
-    const projectMemorySynced = (p: string): boolean => !projectExcluded(cfg, p) || syncedProjects.has(p);
-    const memoryProjectDirs = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'));
-    /* advanced 专属的项目（flow 项目）的记忆：不传、也不从桶里拉回来写 —— 由 advanced 自己同步 */
-    const advancedProjects = store.advancedOnlyProjectsAmong(memoryProjectDirs);
-    const memoryProjects = memoryProjectDirs.filter((p) => !advancedProjects.has(p))
-      .filter(projectMemorySynced);
-    const plan = planUpload(KIROLEX_HOME, ids, state, { projects: memoryProjects });
-    let freshEntries = catalogEntriesFor(sessions, thisMachine);
-    /*
-      **桶里有别的电脑新传的内容 → 并进本机**（判据见 s3Pull.ts 的 `bucketMergeVerdict`）：来自别的设备、而且它的
-      `uploadedAt`（那台真的上传文件的时刻）比本机上次从同一台设备合并时看到的新。不再拿 record.updatedAt 比 ——
-      执行器断开 / attach 这类状态记账也会把它改成现在，本机一刷新，别的电脑的新消息就判不出来了。
-    */
-    const bucketSeen = readBucketSeen(S3_BUCKET_SEEN_PATH);
-    /* 只合开了「在其他电脑上同步」的（本机这条开着、或桶里那条开着）；没开的只备份 */
-    const localFlags = new Map(sessions.map((r) => [r.id, { crossDevice: r.crossDevice, crossDeviceChangedAt: r.crossDeviceChangedAt }]));
-    const conflicts = planBucketMerges(oldCatalog, sessions.map((r) => r.id), thisMachine, bucketSeen, Date.now(), localFlags);
-    /*
-      **冲突自动合并** ——「这个不对，很显然应该自动合并」（见 `mergeBucketSession`）。
-      合并完本地那份就是两边的并集，照常传上去。只有两种情况退回旁路（conflicts/）：
-      正在跑一轮的（产出还没落盘，这时候动 transcript 会丢东西，下一轮再合），和合并出错的。
-      并进 0 条、也没拉到文件（`noop`）：本机什么都不动、不重传，只记下看到的这份 —— 下一轮不再对同一份合并。
-    */
-    const conflictIds = new Set<string>();
-    const mergedIds: string[] = [];
-    for (const c of conflicts) {
-      const live = sessionClients.get(c.id);
-      if (live?.busy) { conflictIds.add(c.id); continue; }
-      try {
-        const r = await mergeBucketSession(creds!, cfg.prefix, c.id);
-        if (r.gone) {
-          /* 合并期间（或之前）这条被删了：什么都没写；不记「看过了」、不走旁路 */
-          logger.info('delete-session', `late event for deleted session ${c.id} (s3 merge) ignored`);
-          continue;
-        }
-        if (r.deferred) {
-          /* 等网络期间开始了新一轮：没断开、没改写；不记「看过了」，和一开始就忙的一样走旁路、下一轮再合 */
-          conflictIds.add(c.id);
-          logger.info('s3', `${c.id}：下载桶里那份期间会话开始忙了，这一轮不合并、不断开执行器${r.pulledFiles ? `（只补了 ${r.pulledFiles} 个本机没有的文件）` : ''}，下一轮再合`);
-          continue;
-        }
-        noteBucketSeen(bucketSeen, c.id, c);
-        const seenAt = c.uploadedAt ? new Date(c.uploadedAt).toLocaleString() : '时间不详';
-        if (r.noop) {
-          logger.info('s3', `${c.id}：桶里那份（来自 ${c.from}，${seenAt} 上传）没有本机缺的消息或文件，本机不动、不重传；记下这份，下一轮不再合并`);
-          continue;
-        }
-        mergedIds.push(c.id);
-        logger.info('s3', `自动合并 ${c.id}（桶里那份来自 ${c.from}，${seenAt} 上传）：并进 ${r.added} 条消息${r.pulledFiles ? `、拉下 ${r.pulledFiles} 个文件` : ''}`);
-        mainWindow?.webContents.send('session:history-changed', { sessionId: c.id });
-        /* 合并改了记录：以合并后的记录为准推给界面 */
-        pushProfileSync([c.id], 's3-merge');
-      } catch (err: any) {
-        conflictIds.add(c.id);
-        logger.warn('s3', `自动合并 ${c.id} 失败，这一轮本机这份传到 conflicts/：${err?.message || err}`);
-      }
-    }
-    if (conflicts.length) writeBucketSeen(S3_BUCKET_SEEN_PATH, bucketSeen);
-    if (mergedIds.length) {
-      /* 合并改了本地的 record/transcript：这几条要重新传，catalog 条目也按合并后的记录来 */
-      for (const id of mergedIds) {
-        for (const f of SESSION_FILES) {
-          const rel = path.join('sessions', id, f);
-          if (!plan.upload.includes(rel) && fs.existsSync(path.join(KIROLEX_HOME, rel))) plan.upload.push(rel);
-        }
-      }
-      const reread = new Map(mergedIds.map((id) => [id, store.readRecord(id)]));
-      freshEntries = catalogEntriesFor(sessions.map((r) => reread.get(r.id) || r), thisMachine);
-    }
-    if (conflictIds.size) {
-      logger.warn('s3', `${conflictIds.size} 条会话这一轮没合并（${[...conflictIds].join('、')}）—— 本机这份传到 conflicts/，下一轮再合`);
-      mainWindow?.webContents.send('s3:conflicts', conflicts.filter((c) => conflictIds.has(c.id)));
-    }
-    logger.info('s3', `同步开始（${reason}）：${plan.upload.length} 个要传、${plan.skippedUnchanged} 个没变`
-      + `${plan.skippedTooBig.length ? `、${plan.skippedTooBig.length} 个太大跳过` : ''}`
-      + ` bucket=${cfg.bucket} ${credsLogLabel(cfg, maskKeyId)}`);
-    for (const rel of plan.skippedTooBig) {
-      logger.warn('s3', `跳过（超过 ${MAX_FILE_BYTES / 1024 / 1024}MB）：${rel}`);
-    }
-    const touchedProjectMemory = new Map<string, number>();
-    /*
-      **记忆：谁新用谁，本机第一次先拉；两边都改过就对着基准三方合并**（判据在 `decideMemory` / `memorySyncStep`）。planUpload 只看本地改没改，
-      而记忆还要看桶里那份是不是别的机器改过 —— 所以这里先把记忆从计划里拿出来单独决定。
-      桶里的列表读不到就**这一轮一份记忆都不传**：不知道桶里是什么就传，正是把真记忆盖成空壳的那条路。
-    */
-    let memoryPulled = 0;
-    const memRemote = new Map<string, { size: number; at: number }>();
-    let memListed = false;
+    const creds = resolved.creds ? { ...resolved.creds, live: () => round.check(), progress: () => round.progress() } : undefined;
+    if (problem) return { ok: false, uploaded: 0, skipped: 0, error: problem };
+    const state = readState(S3_STATE_PATH);
+    const marks = readSessionMarks(S3_MARKS_PATH);
+    /** 这一轮真的传了文件的那些会话 —— 只给它们更新"最后同步时间"。 */
+    const touchedSessions = new Set<string>();
+    /** 这一轮每条会话最后一个文件真的传上去的时刻 —— catalog 条目的 `uploadedAt`（和删除记录比谁新）。 */
+    const uploadedAtBySession = new Map<string, number>();
+    const syncStartedAt = Date.now();
+    let uploaded = 0;
+    let bytes = 0;
     try {
-      const mpfx = `${keyFor(cfg.prefix, 'memory')}/`;
-      for (const o of await listObjects(creds!, mpfx)) {
-        const rel = relFor(cfg.prefix, o.key);
-        if (rel) memRemote.set(path.join(...rel.split('/')), { size: o.size, at: Date.parse(o.lastModified) || 0 });
+      /*
+        **按项目筛一遍** ——「有些project可以选择不同步」。筛在这里（枚举会话的地方）
+        而不是 `planUpload` 里面：那个函数只认"路径 + 上次的状态"，把项目概念塞进去
+        会让它同时对两件事负责。
+      */
+      const thisMachine = machineTag(os.hostname());
+      /*
+        **先看桶里有没有别人动过同一条会话**（参考 Tabby 插件的 `conflict detection` +
+        `safe conflict backups`）。catalog 要在上传**之前**读：读晚了就已经盖掉对方了。
+        也要在**列会话、做上传计划之前**读 —— 位置跟随（`followBucketPlacements`）得先把别的机器挪过的
+        项目 / 归档改到本机，后面的计划和 catalog 条目才是新位置，不会把旧位置再传上去。
+      */
+      round.stage('读 catalog');
+      const oldRaw0 = await getObjectIfExists(creds!, catalogKey(cfg.prefix));
+      round.check();
+      let oldCatalog: Catalog | null = null;
+      try { oldCatalog = oldRaw0 ? JSON.parse(oldRaw0.toString('utf-8')) : null; } catch { oldCatalog = null; }
+      followBucketPlacements(cfg, oldCatalog, store.listSessions());   // 侧栏按 session:placement-changed 逐条改
+      followBucketCrossDevice(cfg, oldCatalog, store.listSessions());  // 「在其他电脑上同步」开关同样谁后改听谁
+      const allSessions = store.listSessions();
+      const syncable = allSessions.filter((r) => syncsSession(cfg, r));
+      /*
+        **删掉的云端备份不再被重新传上去**（判据见 catalogStore.deletedSessionPlan）—— 所有电脑一样：
+        有删除记录、而会话的最后修改时间不晚于删除时刻 → 这一轮不传、不进 catalog（恢复页不显示）；
+        删除之后又有了新改动 → 整条重传（先清掉它在状态表里的记录，桶里那份已经没了）。
+      */
+      /** 每条会话的对话最后一次变的时刻 —— 开头按它筛，写 catalog 时再按最新的删除记录核对一遍（writeSyncCatalog） */
+      const changedAtById = new Map(syncable.map((r) => [r.id, sessionChangedAt(KIROLEX_HOME, r.id)]));
+      const deletedPlan = deletedSessionPlan(syncable.map((r) => ({ id: r.id, changedAt: changedAtById.get(r.id) })), oldCatalog);
+      dropSessionState(state, deletedPlan.reupload);
+      const sessions = syncable.filter((r) => !deletedPlan.skip.has(r.id));
+      if (deletedPlan.skip.size) logger.info('s3', `${deletedPlan.skip.size} 条会话的云端备份删掉之后没有新改动，不重新上传：${[...deletedPlan.skip].join('、')}`);
+      if (deletedPlan.reupload.size) logger.info('s3', `${deletedPlan.reupload.size} 条会话的云端备份删掉之后又有了新改动，整条重新上传：${[...deletedPlan.reupload].join('、')}`);
+      const excludedCount = allSessions.length - syncable.length;
+      if (excludedCount) {
+        logger.info('s3', `跳过 ${excludedCount} 条会话（项目设成了不同步：`
+          + `${(cfg.excludeProjects || []).map((p) => p || '未分组').join('、') || '无'}；单独设成不同步的会话 ${(cfg.excludeSessions || []).length} 条；单独打开的不算在内）`);
       }
-      memListed = true;
-    } catch (err: any) {
-      logger.warn('s3', `读不到桶里的记忆列表，这一轮记忆不传也不拉：${err?.message || err}`);
-    }
-    /* 全局记忆 global.md 不在范围里（「全局记忆不应该同步」）—— 不传、不拉、不三方合并，桶里 / s3-memory-base 里那份不删也不读 */
-    const memScope = (rel: string): boolean => memorySyncInScope(rel, {
-      projectSynced: (p) => projectMemorySynced(p) && !store.isAdvancedOnlyProjectName(p),   // 别的机器建的项目也拉
-      sessionIds: ids,                                                       // 只管本机有的会话
-    });
-    if (!globalMemoryNoSyncLogged) {
-      globalMemoryNoSyncLogged = true;
-      logger.info('s3', '全局记忆不再同步（本机各自一份）：memory/global.md 不上传、不拉取、恢复时不合并');
-    }
-    const memUpload = new Set<string>();
-    if (memListed) {
-      const candidates = new Set<string>([
-        ...plan.upload.filter((r) => isMemoryRel(r)),
-        ...memoryRelsFor(KIROLEX_HOME, ids, memoryProjects).filter((r) => r.endsWith('.md')),
-        ...memRemote.keys(),
-      ]);
-      const memRoot = path.join(KIROLEX_HOME, 'memory');
-      for (const rel of candidates) {
-        if (!memScope(rel)) continue;
-        /* 记忆的路径可能来自桶里的列表 —— 只许落在 ~/.kirolex/memory 下 */
-        const abs = containedPath(memRoot, path.relative('memory', rel));
-        if (!abs) continue;
-        let local: { size: number; mtimeMs: number } | undefined;
-        try { const st = fs.statSync(abs); local = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* 本机没有 */ }
-        const remote = memRemote.get(rel);
-        const firstTime = !state[rel];
-        /* 本机原来那份先挪进 trash 再写 —— 拉 / 合并都是改本机文件，改之前留一份 */
-        const replaceLocalMemory = (data: Buffer | string): fs.Stats => {
-          if (local && local.size > 0) {
-            const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, rel);
-            fs.mkdirSync(path.dirname(bak), { recursive: true });
-            fs.copyFileSync(abs, bak);
-          }
-          fs.mkdirSync(path.dirname(abs), { recursive: true });
-          const tmp = `${abs}.kirolex-${process.pid}.tmp`;
-          fs.writeFileSync(tmp, data);
-          fs.renameSync(tmp, abs);
-          return fs.statSync(abs);
-        };
-        /*
-          **对着基准三方合并，不整份覆盖**（判据在 `memorySyncStep`）：只有一边动过就直接拿动过的那边；
-          第一次同步或两边都动过，就把桶里那份和基准（上次同步成功时存的，`s3-memory-base/`）拿来比 ——
-          本机删的不补回、别处删的本机也删、别处新加的补在后面，写回本机，再走下面的上传把合并结果传上去。
-          没有基准（某台电脑第一次跑新代码）不取并集，谁新用谁整份取，旧的那份进 trash；规范化后一样（只差空行 /
-          行尾空白）只记状态不传。每次同步成功（拉 / 传 / 一样）都把那一刻的内容存成新基准。
-        */
-        let step = memorySyncStep(local, remote, state[rel]);
-        let buf: Buffer | null = null;
+      const ids = sessions.map((r) => r.id);
+      /*
+        **记忆按同一个口径筛** ——「会话和 project 备份时把 project 和 session 的记忆也备份进去」。
+        项目：本地所有有记忆的项目里，没被设成不同步的那些（一个项目底下暂时没有会话，它的记忆也该在），
+        再加上项目关着、但里面有单独打开的会话的那些（`syncedProjects`）—— 恢复那条会话时项目记忆也得在。
+      */
+      const syncedProjects = new Set(syncable.map((r) => projectOf(r)));
+      const projectMemorySynced = (p: string): boolean => !projectExcluded(cfg, p) || syncedProjects.has(p);
+      const memoryProjectDirs = walkDirs(path.join(KIROLEX_HOME, 'memory', 'projects'));
+      /* advanced 专属的项目（flow 项目）的记忆：不传、也不从桶里拉回来写 —— 由 advanced 自己同步 */
+      const advancedProjects = store.advancedOnlyProjectsAmong(memoryProjectDirs);
+      const memoryProjects = memoryProjectDirs.filter((p) => !advancedProjects.has(p))
+        .filter(projectMemorySynced);
+      const plan = planUpload(KIROLEX_HOME, ids, state, { projects: memoryProjects });
+      let freshEntries = catalogEntriesFor(sessions, thisMachine);
+      /*
+        **桶里有别的电脑新传的内容 → 并进本机**（判据见 s3Pull.ts 的 `bucketMergeVerdict`）：来自别的设备、而且它的
+        `uploadedAt`（那台真的上传文件的时刻）比本机上次从同一台设备合并时看到的新。不再拿 record.updatedAt 比 ——
+        执行器断开 / attach 这类状态记账也会把它改成现在，本机一刷新，别的电脑的新消息就判不出来了。
+      */
+      const bucketSeen = readBucketSeen(S3_BUCKET_SEEN_PATH);
+      /* 只合开了「在其他电脑上同步」的（本机这条开着、或桶里那条开着）；没开的只备份 */
+      const localFlags = new Map(sessions.map((r) => [r.id, { crossDevice: r.crossDevice, crossDeviceChangedAt: r.crossDeviceChangedAt }]));
+      const conflicts = planBucketMerges(oldCatalog, sessions.map((r) => r.id), thisMachine, bucketSeen, Date.now(), localFlags);
+      /*
+        **冲突自动合并** ——「这个不对，很显然应该自动合并」（见 `mergeBucketSession`）。
+        合并完本地那份就是两边的并集，照常传上去。只有两种情况退回旁路（conflicts/）：
+        正在跑一轮的（产出还没落盘，这时候动 transcript 会丢东西，下一轮再合），和合并出错的。
+        并进 0 条、也没拉到文件（`noop`）：本机什么都不动、不重传，只记下看到的这份 —— 下一轮不再对同一份合并。
+      */
+      const conflictIds = new Set<string>();
+      const mergedIds: string[] = [];
+      for (const c of conflicts) {
+        const live = sessionClients.get(c.id);
+        if (live?.busy) { conflictIds.add(c.id); continue; }
+        round.stage(`合并 ${c.id}`);
         try {
+          const r = await mergeBucketSession(creds!, cfg.prefix, c.id, round);
+          round.check();
+          if (r.gone) {
+            /* 合并期间（或之前）这条被删了：什么都没写；不记「看过了」、不走旁路 */
+            logger.info('delete-session', `late event for deleted session ${c.id} (s3 merge) ignored`);
+            continue;
+          }
+          if (r.deferred) {
+            /* 等网络期间开始了新一轮：没断开、没改写；不记「看过了」，和一开始就忙的一样走旁路、下一轮再合 */
+            conflictIds.add(c.id);
+            logger.info('s3', `${c.id}：下载桶里那份期间会话开始忙了，这一轮不合并、不断开执行器${r.pulledFiles ? `（只补了 ${r.pulledFiles} 个本机没有的文件）` : ''}，下一轮再合`);
+            continue;
+          }
+          noteBucketSeen(bucketSeen, c.id, c);
+          const seenAt = c.uploadedAt ? new Date(c.uploadedAt).toLocaleString() : '时间不详';
+          if (r.noop) {
+            logger.info('s3', `${c.id}：桶里那份（来自 ${c.from}，${seenAt} 上传）没有本机缺的消息或文件，本机不动、不重传；记下这份，下一轮不再合并`);
+            continue;
+          }
+          mergedIds.push(c.id);
+          logger.info('s3', `自动合并 ${c.id}（桶里那份来自 ${c.from}，${seenAt} 上传）：并进 ${r.added} 条消息${r.pulledFiles ? `、拉下 ${r.pulledFiles} 个文件` : ''}`);
+          mainWindow?.webContents.send('session:history-changed', { sessionId: c.id });
+          /* 合并改了记录：以合并后的记录为准推给界面 */
+          pushProfileSync([c.id], 's3-merge');
+        } catch (err: any) {
+          if (err instanceof RoundAbandoned) throw err;
+          conflictIds.add(c.id);
+          logger.warn('s3', `自动合并 ${c.id} 失败，这一轮本机这份传到 conflicts/：${err?.message || err}`);
+        }
+      }
+      round.check();
+      if (conflicts.length) writeBucketSeen(S3_BUCKET_SEEN_PATH, bucketSeen);
+      if (mergedIds.length) {
+        /* 合并改了本地的 record/transcript：这几条要重新传，catalog 条目也按合并后的记录来 */
+        for (const id of mergedIds) {
+          for (const f of SESSION_FILES) {
+            const rel = path.join('sessions', id, f);
+            if (!plan.upload.includes(rel) && fs.existsSync(path.join(KIROLEX_HOME, rel))) plan.upload.push(rel);
+          }
+        }
+        const reread = new Map(mergedIds.map((id) => [id, store.readRecord(id)]));
+        freshEntries = catalogEntriesFor(sessions.map((r) => reread.get(r.id) || r), thisMachine);
+      }
+      if (conflictIds.size) {
+        logger.warn('s3', `${conflictIds.size} 条会话这一轮没合并（${[...conflictIds].join('、')}）—— 本机这份传到 conflicts/，下一轮再合`);
+        mainWindow?.webContents.send('s3:conflicts', conflicts.filter((c) => conflictIds.has(c.id)));
+      }
+      logger.info('s3', `同步开始（${reason}）：${plan.upload.length} 个要传、${plan.skippedUnchanged} 个没变`
+        + `${plan.skippedTooBig.length ? `、${plan.skippedTooBig.length} 个太大跳过` : ''}`
+        + ` bucket=${cfg.bucket} ${credsLogLabel(cfg, maskKeyId)}`);
+      for (const rel of plan.skippedTooBig) {
+        logger.warn('s3', `跳过（超过 ${MAX_FILE_BYTES / 1024 / 1024}MB）：${rel}`);
+      }
+      const touchedProjectMemory = new Map<string, number>();
+      /*
+        **记忆：谁新用谁，本机第一次先拉；两边都改过就对着基准三方合并**（判据在 `decideMemory` / `memorySyncStep`）。planUpload 只看本地改没改，
+        而记忆还要看桶里那份是不是别的机器改过 —— 所以这里先把记忆从计划里拿出来单独决定。
+        桶里的列表读不到就**这一轮一份记忆都不传**：不知道桶里是什么就传，正是把真记忆盖成空壳的那条路。
+      */
+      let memoryPulled = 0;
+      const memRemote = new Map<string, { size: number; at: number }>();
+      let memListed = false;
+      round.stage('列桶里的记忆');
+      try {
+        const mpfx = `${keyFor(cfg.prefix, 'memory')}/`;
+        for (const o of await listObjects(creds!, mpfx)) {
+          const rel = relFor(cfg.prefix, o.key);
+          if (rel) memRemote.set(path.join(...rel.split('/')), { size: o.size, at: Date.parse(o.lastModified) || 0 });
+        }
+        memListed = true;
+      } catch (err: any) {
+        if (err instanceof RoundAbandoned) throw err;
+        logger.warn('s3', `读不到桶里的记忆列表，这一轮记忆不传也不拉：${err?.message || err}`);
+      }
+      /* 全局记忆 global.md 不在范围里（「全局记忆不应该同步」）—— 不传、不拉、不三方合并，桶里 / s3-memory-base 里那份不删也不读 */
+      const memScope = (rel: string): boolean => memorySyncInScope(rel, {
+        projectSynced: (p) => projectMemorySynced(p) && !store.isAdvancedOnlyProjectName(p),   // 别的机器建的项目也拉
+        sessionIds: ids,                                                       // 只管本机有的会话
+      });
+      if (!globalMemoryNoSyncLogged) {
+        globalMemoryNoSyncLogged = true;
+        logger.info('s3', '全局记忆不再同步（本机各自一份）：memory/global.md 不上传、不拉取、恢复时不合并');
+      }
+      round.check();
+      const memUpload = new Set<string>();
+      if (memListed) {
+        round.stage('同步记忆');
+        const candidates = new Set<string>([
+          ...plan.upload.filter((r) => isMemoryRel(r)),
+          ...memoryRelsFor(KIROLEX_HOME, ids, memoryProjects).filter((r) => r.endsWith('.md')),
+          ...memRemote.keys(),
+        ]);
+        const memRoot = path.join(KIROLEX_HOME, 'memory');
+        for (const rel of candidates) {
+          if (!memScope(rel)) continue;
+          /* 记忆的路径可能来自桶里的列表 —— 只许落在 ~/.kirolex/memory 下 */
+          const abs = containedPath(memRoot, path.relative('memory', rel));
+          if (!abs) continue;
+          let local: { size: number; mtimeMs: number } | undefined;
+          try { const st = fs.statSync(abs); local = { size: st.size, mtimeMs: st.mtimeMs }; } catch { /* 本机没有 */ }
+          const remote = memRemote.get(rel);
+          const firstTime = !state[rel];
+          /* 本机原来那份先挪进 trash 再写 —— 拉 / 合并都是改本机文件，改之前留一份 */
+          const replaceLocalMemory = (data: Buffer | string): fs.Stats => {
+            if (local && local.size > 0) {
+              const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, rel);
+              fs.mkdirSync(path.dirname(bak), { recursive: true });
+              fs.copyFileSync(abs, bak);
+            }
+            fs.mkdirSync(path.dirname(abs), { recursive: true });
+            const tmp = `${abs}.kirolex-${process.pid}.tmp`;
+            fs.writeFileSync(tmp, data);
+            fs.renameSync(tmp, abs);
+            return fs.statSync(abs);
+          };
           /*
-            两边都有、这一轮要动：先给本机这份和基准（都在本地）—— 只差空白的不传；
-            还要桶里那份（第一次 / 两边都动过 / 拉之前核空白）才去拿
+            **对着基准三方合并，不整份覆盖**（判据在 `memorySyncStep`）：只有一边动过就直接拿动过的那边；
+            第一次同步或两边都动过，就把桶里那份和基准（上次同步成功时存的，`s3-memory-base/`）拿来比 ——
+            本机删的不补回、别处删的本机也删、别处新加的补在后面，写回本机，再走下面的上传把合并结果传上去。
+            没有基准（某台电脑第一次跑新代码）不取并集，谁新用谁整份取，旧的那份进 trash；规范化后一样（只差空行 /
+            行尾空白）只记状态不传。每次同步成功（拉 / 传 / 一样）都把那一刻的内容存成新基准。
           */
-          if (local && remote && (step.kind === 'fetch' || step.kind === 'upload' || step.kind === 'pull')) {
-            const texts = { local: fs.readFileSync(abs, 'utf-8'), base: readMemoryBase(KIROLEX_HOME, rel) };
-            step = memorySyncStep(local, remote, state[rel], texts);
-            if (step.kind === 'fetch') {
+          round.stage(`同步记忆 ${rel}`);
+          let step = memorySyncStep(local, remote, state[rel]);
+          let buf: Buffer | null = null;
+          try {
+            /*
+              两边都有、这一轮要动：先给本机这份和基准（都在本地）—— 只差空白的不传；
+              还要桶里那份（第一次 / 两边都动过 / 拉之前核空白）才去拿
+            */
+            if (local && remote && (step.kind === 'fetch' || step.kind === 'upload' || step.kind === 'pull')) {
+              const texts = { local: fs.readFileSync(abs, 'utf-8'), base: readMemoryBase(KIROLEX_HOME, rel) };
+              step = memorySyncStep(local, remote, state[rel], texts);
+              if (step.kind === 'fetch') {
+                buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
+                if (!buf) continue;
+                step = memorySyncStep(local, remote, state[rel], { ...texts, remote: buf.toString('utf-8') });
+              }
+            }
+            if (step.kind === 'pull' && !buf) {
               buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
               if (!buf) continue;
-              step = memorySyncStep(local, remote, state[rel], { ...texts, remote: buf.toString('utf-8') });
             }
-          }
-          if (step.kind === 'pull' && !buf) {
-            buf = await getObjectIfExists(creds!, keyFor(cfg.prefix, rel));
-            if (!buf) continue;
-          }
-        } catch (err: any) {
-          logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
-          continue;
-        }
-        if (step.kind === 'upload') {
-          /* 没有基准、本机那份更新：整份盖掉桶里的 —— 盖之前把桶里那份留进 trash */
-          if (step.keepRemote && buf) {
-            try {
-              const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, `${rel}.bucket`);
-              fs.mkdirSync(path.dirname(bak), { recursive: true });
-              fs.writeFileSync(bak, buf);
-              logger.info('s3', `记忆 ${rel}：没有基准，本机那份更新，整份传上去（本机 ${local!.size} B，桶里原来 ${remote!.size} B 留在 trash）`);
-            } catch (err: any) {
-              logger.warn('s3', `记忆 ${rel} 桶里那份留不进 trash，这一轮不传：${err?.message || err}`);
-              continue;
-            }
-          }
-          memUpload.add(rel);
-          continue;
-        }
-        if (step.kind === 'merge') {
-          try {
-            replaceLocalMemory(step.text);
-            memUpload.add(rel);
-            memoryPulled += 1;
-            logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B，补进 ${step.added} 行、按别处删除去掉 ${step.removed} 行 → ${Buffer.byteLength(step.text)} B（三方合并，桶里 ${remote!.size} B）`);
-          } catch (err: any) {
-            logger.warn('s3', `记忆 ${rel} 合并不了：${err?.message || err}`);
-          }
-          continue;
-        }
-        if (step.kind === 'same') {
-          /* 一样（规范化后只差空行 / 行尾空白也算）：只记下状态、不传；拿过桶里那份就以它为基准，没拿就沿用原来的基准 */
-          const st = fs.statSync(abs);
-          const baseHash = buf ? writeMemoryBase(KIROLEX_HOME, rel, buf) : state[rel]?.baseHash;
-          state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote!.at, remoteSize: remote!.size, baseHash };
-          continue;
-        }
-        if (step.kind === 'pull' && remote && buf) {
-          try {
-            const st = replaceLocalMemory(buf);
-            const baseHash = writeMemoryBase(KIROLEX_HOME, rel, buf);   // 拉成功：桶里这份就是下次三方合并的基准
-            state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote.at, remoteSize: remote.size, baseHash };
-            memoryPulled += 1;
-            logger.info('s3', `记忆 ${rel}：从桶里拉回（${firstTime ? '本机第一次同步，' : '桶里那份更新，'}桶里 ${remote.size} B，本机原来 ${local?.size ?? 0} B）`);
           } catch (err: any) {
             logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
+            continue;
           }
-          continue;
+          round.check();   // 下面要改本机的记忆文件 / 状态表
+          if (step.kind === 'upload') {
+            /* 没有基准、本机那份更新：整份盖掉桶里的 —— 盖之前把桶里那份留进 trash */
+            if (step.keepRemote && buf) {
+              try {
+                const bak = path.join(KIROLEX_HOME, 'trash', `memory-pull-${Date.now()}`, `${rel}.bucket`);
+                fs.mkdirSync(path.dirname(bak), { recursive: true });
+                fs.writeFileSync(bak, buf);
+                logger.info('s3', `记忆 ${rel}：没有基准，本机那份更新，整份传上去（本机 ${local!.size} B，桶里原来 ${remote!.size} B 留在 trash）`);
+              } catch (err: any) {
+                logger.warn('s3', `记忆 ${rel} 桶里那份留不进 trash，这一轮不传：${err?.message || err}`);
+                continue;
+              }
+            }
+            memUpload.add(rel);
+            continue;
+          }
+          if (step.kind === 'merge') {
+            try {
+              replaceLocalMemory(step.text);
+              memUpload.add(rel);
+              memoryPulled += 1;
+              logger.info('s3', `记忆 ${rel}：合并：本机 ${local!.size} B，补进 ${step.added} 行、按别处删除去掉 ${step.removed} 行 → ${Buffer.byteLength(step.text)} B（三方合并，桶里 ${remote!.size} B）`);
+            } catch (err: any) {
+              logger.warn('s3', `记忆 ${rel} 合并不了：${err?.message || err}`);
+            }
+            continue;
+          }
+          if (step.kind === 'same') {
+            /* 一样（规范化后只差空行 / 行尾空白也算）：只记下状态、不传；拿过桶里那份就以它为基准，没拿就沿用原来的基准 */
+            const st = fs.statSync(abs);
+            const baseHash = buf ? writeMemoryBase(KIROLEX_HOME, rel, buf) : state[rel]?.baseHash;
+            state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote!.at, remoteSize: remote!.size, baseHash };
+            continue;
+          }
+          if (step.kind === 'pull' && remote && buf) {
+            try {
+              const st = replaceLocalMemory(buf);
+              const baseHash = writeMemoryBase(KIROLEX_HOME, rel, buf);   // 拉成功：桶里这份就是下次三方合并的基准
+              state[rel] = { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: remote.at, remoteSize: remote.size, baseHash };
+              memoryPulled += 1;
+              logger.info('s3', `记忆 ${rel}：从桶里拉回（${firstTime ? '本机第一次同步，' : '桶里那份更新，'}桶里 ${remote.size} B，本机原来 ${local?.size ?? 0} B）`);
+            } catch (err: any) {
+              logger.warn('s3', `记忆 ${rel} 拉不下来：${err?.message || err}`);
+            }
+            continue;
+          }
+          /* 都没动：把刚传完那次还没读到的服务器时间补上，下一轮就按时间比 */
+          if (remote && state[rel] && !state[rel].remoteAt && remote.size === (state[rel].remoteSize ?? state[rel].size)) {
+            state[rel] = { ...state[rel], remoteAt: remote.at };
+          }
+          /*
+            老数据还没有基准：两边都没动 = 本机这份就是上次同步时两边一致的那份 —— 现在补存成基准，
+            以后两边都改过时就能三方合并，不必退回「谁新用谁」整份取。
+          */
+          if (local && remote && state[rel] && !state[rel].baseHash) {
+            try { state[rel] = { ...state[rel], baseHash: writeMemoryBase(KIROLEX_HOME, rel, fs.readFileSync(abs)) }; } catch { /* 读不到：下一轮再补 */ }
+          }
         }
-        /* 都没动：把刚传完那次还没读到的服务器时间补上，下一轮就按时间比 */
-        if (remote && state[rel] && !state[rel].remoteAt && remote.size === (state[rel].remoteSize ?? state[rel].size)) {
-          state[rel] = { ...state[rel], remoteAt: remote.at };
-        }
+      }
+      /* 组合文件（mcp-combos.json）：多台电脑共用一份，两边都改过时合并、不静默覆盖 */
+      round.stage('同步组合文件');
+      uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix);
+      round.check();
+      /* 外观配置（appearance.json：主题 / 对比度 / 强调色 / 字体 / 字号 + theme.json）：整份谁新用谁，uiZoom 不同步 */
+      round.stage('同步外观');
+      uploaded += await syncAppearanceWithBucket(creds!, cfg.prefix);
+      round.check();
+      /* 远程机器的 AI 工具配置（agent-profiles/）：同样跨电脑共用，两边都改过时留冲突副本、不静默覆盖 */
+      round.stage('同步 agent-profiles');
+      uploaded += await syncAgentProfilesWithBucket(creds!, cfg.prefix);
+      round.check();
+      /* 定时任务（schedules/<会话>/<id>.json）：只管在同步的会话；运行状态只认 runner，定义 runner 本机不收远端改的（scheduleSync.ts） */
+      noteScheduleDevices(oldCatalog);
+      round.stage('同步定时任务');
+      uploaded += await syncSchedulesWithBucket(creds!, cfg.prefix, { upload: true });
+      round.check();
+      /* 后台任务（bg-jobs/<会话>/<jobId>.json）：只同步状态，别的电脑只显示；停止请求由跑它的那台执行（bgJobSync.ts） */
+      round.stage('同步后台任务');
+      uploaded += await syncBgJobsWithBucket(creds!, cfg.prefix);
+      round.check();
+      /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
+      const uploadList = [
+        ...plan.upload.filter((r) => !isMemoryRel(r)),
+        ...memUpload,
+      ];
+      for (const rel of uploadList) {
+        const abs = path.join(KIROLEX_HOME, rel);
+        let body: Buffer;
+        let st: fs.Stats;
+        try { body = fs.readFileSync(abs); st = fs.statSync(abs); } catch { continue; }
+        const owner = rel.startsWith(`sessions${path.sep}`) ? rel.split(path.sep)[1] : '';
+        /* 这一轮开始之后本机删掉了它的备份：剩下的文件不再传（传上去也是没人认的旧文件，见 deletedSessionPlan） */
+        if (owner && (backupDeletedAt.get(owner) ?? 0) >= syncStartedAt) continue;
+        const key = owner && conflictIds.has(owner)
+          ? conflictKeyFor(cfg.prefix, owner, thisMachine, rel)
+          : keyFor(cfg.prefix, rel);
+        round.stage(`上传 ${rel}`);
+        round.check();
+        await putObject(creds!, key, body, contentTypeFor(rel));
+        state[rel] = isMemoryRel(rel)
+          /* remoteAt=0：刚传上去、服务器时间下一轮从列表里读（见 decideMemory）；传上去的这份就是下次三方合并的基准 */
+          ? { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: 0, remoteSize: st.size, baseHash: writeMemoryBase(KIROLEX_HOME, rel, body) }
+          : { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
+        uploaded += 1;
+        bytes += body.length;
         /*
-          老数据还没有基准：两边都没动 = 本机这份就是上次同步时两边一致的那份 —— 现在补存成基准，
-          以后两边都改过时就能三方合并，不必退回「谁新用谁」整份取。
+          **记下这条会话是什么时候真的传上去的** ——「每一个会话同步应该有最新同步到什么时间」。
+          不能用 catalog 的 `syncedAt` 回答：那个每一轮给所有条目盖同一个 now，
+          一条一周没动过的会话也会被说成"刚刚同步过"（见 `readSessionMarks` 那段）。
         */
-        if (local && remote && state[rel] && !state[rel].baseHash) {
-          try { state[rel] = { ...state[rel], baseHash: writeMemoryBase(KIROLEX_HOME, rel, fs.readFileSync(abs)) }; } catch { /* 读不到：下一轮再补 */ }
+        const sid = sessionIdOfRel(rel);
+        if (sid) { touchedSessions.add(sid); uploadedAtBySession.set(sid, Date.now()); }
+        /* 项目记忆也记一笔「什么时候真的传上去的」—— 备份/恢复界面的项目行要显示它 */
+        const pm = /^memory[\\/]projects[\\/]([^\\/]+)[\\/]memory\.md$/.exec(rel);
+        if (pm) touchedProjectMemory.set(pm[1], Math.floor(st.mtimeMs));
+      }
+      /*
+        catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西。
+        **冲突的那几条不进 catalog** —— 它们传到了 conflicts/ 下，让 catalog 指向它们
+        等于把"可恢复"这件事说错了。
+      */
+      /*
+        **写之前重读最新的再合并**（排队 + 条件写，见 catalogStore.ts）：开头读到的 oldCatalog 只用来做冲突检测 /
+        位置跟随，不再拿它整份写回 —— 那会把这一轮期间的删除、别的机器写的都盖掉。
+        `uploadedAt`：这一轮真传了文件的用这一轮的时刻，没传的用本机上次真传它的时刻（marks）——
+        这样删除记录之后没有重新上传的条目不会被这一轮复活。
+      */
+      const fresh = freshEntries.filter((e) => !conflictIds.has(e.id)).map((e) => {
+        const at = entryUploadedAt(e.id, uploadedAtBySession, marks);
+        return at ? { ...e, uploadedAt: at } : e;
+      });
+      /* 本机现存会话清单跟着同一次条件写一起写（云端自动清理的判据，见 cloudTrash.ts）—— 并进的是桶里现在那份 */
+      const manifest = thisDeviceManifest(thisDeviceId(), thisMachine, Date.now());
+      round.stage('写 catalog');
+      /* 排在队列里等的时候被放弃了：轮到它也不写 */
+      const wrote = await catalogQueue(() => (round.check(), writeSyncCatalog(catalogBucket(creds!, cfg.prefix), cfg.prefix, fresh, Date.now(),
+        (c) => withDeviceManifest(c, manifest), changedAtById)));
+      round.check();
+      if (wrote.blocked.length) {
+        logger.info('s3', `${wrote.blocked.length} 条会话的云端备份在这一轮同步期间被删掉了、之后没有新改动，不写回目录：${wrote.blocked.join('、')}`);
+      }
+      for (const r of wrote.removed) {
+        logger.warn('s3', `catalog 里「${r.title}」(${r.id}) 在桶里已经没有文件（${new Date(r.deletedAt).toLocaleString()} 删掉的），从目录里移除`);
+      }
+      if (wrote.attempts > 1) logger.info('s3', `catalog 写之前别处刚改过，重读合并了 ${wrote.attempts - 1} 次`);
+      /*
+        这一轮期间本机删掉的备份：开头读的状态表里还记着它们"传过了"，原样写回去就把删除那边清掉的记录盖回来了 ——
+        之后有了新改动时就少传文件。去掉它们，和不交错时一样：删除之后没改动就不传（deletedSessionPlan），有改动就整条重传。
+      */
+      for (const [id, at] of backupDeletedAt) {
+        if (at < syncStartedAt) continue;
+        for (const rel of Object.keys(state)) if (sessionIdOfRel(rel) === id) delete state[rel];
+        delete marks[id];
+        touchedSessions.delete(id);
+      }
+      round.check();
+      writeState(S3_STATE_PATH, state);
+      /*
+        **只更新这一轮真的传过的那些**。给所有会话盖一个 now 就又回到 catalog 那个毛病了：
+        "最后同步时间"会变成"最后跑过一轮的时间"，而那两句话的区别正是这张表存在的理由。
+        `updatedAt` 一起记下来 —— 之后本地再动过就能算出"有改动还没备份"。
+      */
+      if (touchedProjectMemory.size) {
+        const now = Date.now();
+        for (const [proj, mtime] of touchedProjectMemory) marks[projectMemoryMarkKey(proj)] = { at: now, updatedAt: mtime };
+        writeSessionMarks(S3_MARKS_PATH, marks);
+      }
+      if (touchedSessions.size) {
+        const now = Date.now();
+        const byId = new Map(sessions.map((r) => [r.id, r]));
+        for (const id of touchedSessions) {
+          marks[id] = syncMark(now, byId.get(id)?.updatedAt || 0, uploadedAtBySession.get(id));
+        }
+        writeSessionMarks(S3_MARKS_PATH, marks);
+      }
+      /*
+        **云端自动清理** —— 所有活跃设备上都没有了的会话移进云端回收站，到期的彻底删除（`cloudTrash.ts`）。
+        放在 catalog 写完之后：判定要用到本机这一轮的清单。出错不算同步失败，只写日志。
+      */
+      const clean = cleanupSettings(cfg);
+      round.check();
+      round.stage('云端清理');
+      let cleanup: CleanupResult | null = null;
+      if (clean.enabled) {
+        try {
+          cleanup = await runCloudCleanup(bucketOps(creds!), {
+            prefix: cfg.prefix, now: Date.now(), settings: clean, thisMachine, deviceId: thisDeviceId(),
+            spare: (cand) => cloudCleanupSpare(creds!, cfg.prefix, cand),
+            log: (level, msg) => logger[level]('s3', msg),
+            lastNotice: lastCloudCleanupNoticeKey,
+          });
+          /* 同样的权限问题上一轮已经说过（runCloudCleanup 也没再 warn）：这一句也不重复 */
+          if (cleanup.blocked && !(cleanup.notice && cleanup.notice.key === lastCloudCleanupNoticeKey)) logger.info('s3', `云端清理这一轮不移任何会话：${cleanup.blocked}`);
+          lastCloudCleanupNoticeKey = cleanup.notice?.key || '';
+        } catch (err: any) {
+          if (err instanceof RoundAbandoned) throw err;
+          logger.warn('s3', `云端清理没跑成（不影响备份）：${err?.message || err}`);
         }
       }
-    }
-    /* 组合文件（mcp-combos.json）：多台电脑共用一份，两边都改过时合并、不静默覆盖 */
-    uploaded += await syncMcpCombosWithBucket(creds!, cfg.prefix);
-    /* 外观配置（appearance.json：主题 / 对比度 / 强调色 / 字体 / 字号 + theme.json）：整份谁新用谁，uiZoom 不同步 */
-    uploaded += await syncAppearanceWithBucket(creds!, cfg.prefix);
-    /* 远程机器的 AI 工具配置（agent-profiles/）：同样跨电脑共用，两边都改过时留冲突副本、不静默覆盖 */
-    uploaded += await syncAgentProfilesWithBucket(creds!, cfg.prefix);
-    /* 定时任务（schedules/<会话>/<id>.json）：只管在同步的会话；运行状态只认 runner，定义 runner 本机不收远端改的（scheduleSync.ts） */
-    noteScheduleDevices(oldCatalog);
-    uploaded += await syncSchedulesWithBucket(creds!, cfg.prefix, { upload: true });
-    /* 后台任务（bg-jobs/<会话>/<jobId>.json）：只同步状态，别的电脑只显示；停止请求由跑它的那台执行（bgJobSync.ts） */
-    uploaded += await syncBgJobsWithBucket(creds!, cfg.prefix);
-    /* 计划里的记忆只留"决定要传"的那些；读不到桶里列表时一份都不留 */
-    const uploadList = [
-      ...plan.upload.filter((r) => !isMemoryRel(r)),
-      ...memUpload,
-    ];
-    for (const rel of uploadList) {
-      const abs = path.join(KIROLEX_HOME, rel);
-      let body: Buffer;
-      let st: fs.Stats;
-      try { body = fs.readFileSync(abs); st = fs.statSync(abs); } catch { continue; }
-      const owner = rel.startsWith(`sessions${path.sep}`) ? rel.split(path.sep)[1] : '';
-      /* 这一轮开始之后本机删掉了它的备份：剩下的文件不再传（传上去也是没人认的旧文件，见 deletedSessionPlan） */
-      if (owner && (backupDeletedAt.get(owner) ?? 0) >= syncStartedAt) continue;
-      const key = owner && conflictIds.has(owner)
-        ? conflictKeyFor(cfg.prefix, owner, thisMachine, rel)
-        : keyFor(cfg.prefix, rel);
-      await putObject(creds!, key, body, contentTypeFor(rel));
-      state[rel] = isMemoryRel(rel)
-        /* remoteAt=0：刚传上去、服务器时间下一轮从列表里读（见 decideMemory）；传上去的这份就是下次三方合并的基准 */
-        ? { size: st.size, mtimeMs: Math.floor(st.mtimeMs), remoteAt: 0, remoteSize: st.size, baseHash: writeMemoryBase(KIROLEX_HOME, rel, body) }
-        : { size: st.size, mtimeMs: Math.floor(st.mtimeMs) };
-      uploaded += 1;
-      bytes += body.length;
-      /*
-        **记下这条会话是什么时候真的传上去的** ——「每一个会话同步应该有最新同步到什么时间」。
-        不能用 catalog 的 `syncedAt` 回答：那个每一轮给所有条目盖同一个 now，
-        一条一周没动过的会话也会被说成"刚刚同步过"（见 `readSessionMarks` 那段）。
-      */
-      const sid = sessionIdOfRel(rel);
-      if (sid) { touchedSessions.add(sid); uploadedAtBySession.set(sid, Date.now()); }
-      /* 项目记忆也记一笔「什么时候真的传上去的」—— 备份/恢复界面的项目行要显示它 */
-      const pm = /^memory[\\/]projects[\\/]([^\\/]+)[\\/]memory\.md$/.exec(rel);
-      if (pm) touchedProjectMemory.set(pm[1], Math.floor(st.mtimeMs));
-    }
-    /*
-      catalog 最后传：它是"有哪些备份可恢复"的唯一入口，先传会指向还没上传完的东西。
-      **冲突的那几条不进 catalog** —— 它们传到了 conflicts/ 下，让 catalog 指向它们
-      等于把"可恢复"这件事说错了。
-    */
-    /*
-      **写之前重读最新的再合并**（排队 + 条件写，见 catalogStore.ts）：开头读到的 oldCatalog 只用来做冲突检测 /
-      位置跟随，不再拿它整份写回 —— 那会把这一轮期间的删除、别的机器写的都盖掉。
-      `uploadedAt`：这一轮真传了文件的用这一轮的时刻，没传的用本机上次真传它的时刻（marks）——
-      这样删除记录之后没有重新上传的条目不会被这一轮复活。
-    */
-    const fresh = freshEntries.filter((e) => !conflictIds.has(e.id)).map((e) => {
-      const at = entryUploadedAt(e.id, uploadedAtBySession, marks);
-      return at ? { ...e, uploadedAt: at } : e;
-    });
-    /* 本机现存会话清单跟着同一次条件写一起写（云端自动清理的判据，见 cloudTrash.ts）—— 并进的是桶里现在那份 */
-    const manifest = thisDeviceManifest(thisDeviceId(), thisMachine, Date.now());
-    const wrote = await catalogQueue(() => writeSyncCatalog(catalogBucket(creds!, cfg.prefix), cfg.prefix, fresh, Date.now(),
-      (c) => withDeviceManifest(c, manifest), changedAtById));
-    if (wrote.blocked.length) {
-      logger.info('s3', `${wrote.blocked.length} 条会话的云端备份在这一轮同步期间被删掉了、之后没有新改动，不写回目录：${wrote.blocked.join('、')}`);
-    }
-    for (const r of wrote.removed) {
-      logger.warn('s3', `catalog 里「${r.title}」(${r.id}) 在桶里已经没有文件（${new Date(r.deletedAt).toLocaleString()} 删掉的），从目录里移除`);
-    }
-    if (wrote.attempts > 1) logger.info('s3', `catalog 写之前别处刚改过，重读合并了 ${wrote.attempts - 1} 次`);
-    /*
-      这一轮期间本机删掉的备份：开头读的状态表里还记着它们"传过了"，原样写回去就把删除那边清掉的记录盖回来了 ——
-      之后有了新改动时就少传文件。去掉它们，和不交错时一样：删除之后没改动就不传（deletedSessionPlan），有改动就整条重传。
-    */
-    for (const [id, at] of backupDeletedAt) {
-      if (at < syncStartedAt) continue;
-      for (const rel of Object.keys(state)) if (sessionIdOfRel(rel) === id) delete state[rel];
-      delete marks[id];
-      touchedSessions.delete(id);
-    }
-    writeState(S3_STATE_PATH, state);
-    /*
-      **只更新这一轮真的传过的那些**。给所有会话盖一个 now 就又回到 catalog 那个毛病了：
-      "最后同步时间"会变成"最后跑过一轮的时间"，而那两句话的区别正是这张表存在的理由。
-      `updatedAt` 一起记下来 —— 之后本地再动过就能算出"有改动还没备份"。
-    */
-    if (touchedProjectMemory.size) {
-      const now = Date.now();
-      for (const [proj, mtime] of touchedProjectMemory) marks[projectMemoryMarkKey(proj)] = { at: now, updatedAt: mtime };
-      writeSessionMarks(S3_MARKS_PATH, marks);
-    }
-    if (touchedSessions.size) {
-      const now = Date.now();
-      const byId = new Map(sessions.map((r) => [r.id, r]));
-      for (const id of touchedSessions) {
-        marks[id] = syncMark(now, byId.get(id)?.updatedAt || 0, uploadedAtBySession.get(id));
-      }
-      writeSessionMarks(S3_MARKS_PATH, marks);
-    }
-    /*
-      **云端自动清理** —— 所有活跃设备上都没有了的会话移进云端回收站，到期的彻底删除（`cloudTrash.ts`）。
-      放在 catalog 写完之后：判定要用到本机这一轮的清单。出错不算同步失败，只写日志。
-    */
-    const clean = cleanupSettings(cfg);
-    let cleanup: CleanupResult | null = null;
-    if (clean.enabled) {
+      /* **久未使用的会话移到云端**（sessionOffload.ts）—— 同步成功才跑；判据用刚写完的 catalog 和状态表 */
+      round.check();
+      round.stage('移到云端');
+      let offloaded: Awaited<ReturnType<typeof runOffloadRound>> = null;
       try {
-        cleanup = await runCloudCleanup(bucketOps(creds!), {
-          prefix: cfg.prefix, now: Date.now(), settings: clean, thisMachine, deviceId: thisDeviceId(),
-          spare: (cand) => cloudCleanupSpare(creds!, cfg.prefix, cand),
-          log: (level, msg) => logger[level]('s3', msg),
-          lastNotice: lastCloudCleanupNoticeKey,
-        });
-        /* 同样的权限问题上一轮已经说过（runCloudCleanup 也没再 warn）：这一句也不重复 */
-        if (cleanup.blocked && !(cleanup.notice && cleanup.notice.key === lastCloudCleanupNoticeKey)) logger.info('s3', `云端清理这一轮不移任何会话：${cleanup.blocked}`);
-        lastCloudCleanupNoticeKey = cleanup.notice?.key || '';
+        offloaded = await runOffloadRound(creds!, cfg, wrote.catalog);
       } catch (err: any) {
-        logger.warn('s3', `云端清理没跑成（不影响备份）：${err?.message || err}`);
+        if (err instanceof RoundAbandoned) throw err;
+        logger.warn('offload', `没跑成（不影响备份）：${err?.message || err}`);
       }
-    }
-    /* **久未使用的会话移到云端**（sessionOffload.ts）—— 同步成功才跑；判据用刚写完的 catalog 和状态表 */
-    let offloaded: Awaited<ReturnType<typeof runOffloadRound>> = null;
-    try {
-      offloaded = await runOffloadRound(creds!, cfg, wrote.catalog);
+      round.check();
+      syncFailures = 0;
+      syncNextAllowedAt = 0;
+      lastSyncSummary = {
+        at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
+        ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
+        ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
+        ...(cleanup?.notice ? { cloudCleanupNotice: {
+          code: cleanup.notice.code, actions: cleanup.notice.actions, why: cleanup.notice.why,
+          policy: cleanupVersionPolicy(cfg.bucket || '', cfg.region || '', cfg.prefix),
+        } } : null),
+        ...(offloaded?.moved.length ? { offloaded: offloaded.moved.length, offloadedBytes: offloaded.bytes, offloadDays: offloaded.days } : null),
+      };
+      logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`
+        + `${memoryPulled ? `，从桶里拉回 / 合并 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步 / 两边都改过）` : ''}`
+        + `${cleanup ? `；这次有 ${cleanup.trashed.length} 条移进云端回收站、${cleanup.purged.length} 条到期清空` : ''}`);
+      mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
+      return {
+        ok: true, uploaded, skipped: plan.skippedUnchanged,
+        ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
+      };
     } catch (err: any) {
-      logger.warn('offload', `没跑成（不影响备份）：${err?.message || err}`);
+      const hint = err instanceof S3Error ? `\n${err.hint}` : '';
+      const message = `${err?.message || err}${hint}`;
+      /* 被看门狗放弃的那一轮：结果已经报过了（syncRounds.run），不写 state、不算失败次数 */
+      if (round.abandoned) return { ok: false, uploaded, skipped: 0, error: message };
+      /* 部分成功也把 state 写下来：已经传上去的下次不必再传 */
+      writeState(S3_STATE_PATH, state);
+      syncFailures += 1;
+      const minutes = Math.max(5, Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES);
+      syncNextAllowedAt = Date.now() + minutes * 60_000 * backoffMultiplier(syncFailures);
+      lastSyncSummary = { at: Date.now(), uploaded, skipped: 0, bytes, error: message };
+      logger.warn('s3', `同步失败（${reason}，连续第 ${syncFailures} 次）：${message}`
+        + ` —— 下一次定时同步不早于 ${new Date(syncNextAllowedAt).toLocaleTimeString()}`);
+      mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
+      return { ok: false, uploaded, skipped: 0, error: message };
     }
-    syncFailures = 0;
-    syncNextAllowedAt = 0;
-    lastSyncSummary = {
-      at: Date.now(), uploaded, skipped: plan.skippedUnchanged, bytes,
-      ...(conflictIds.size ? { conflicts: Array.from(conflictIds) } : null),
-      ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
-      ...(cleanup?.notice ? { cloudCleanupNotice: {
-        code: cleanup.notice.code, actions: cleanup.notice.actions, why: cleanup.notice.why,
-        policy: cleanupVersionPolicy(cfg.bucket || '', cfg.region || '', cfg.prefix),
-      } } : null),
-      ...(offloaded?.moved.length ? { offloaded: offloaded.moved.length, offloadedBytes: offloaded.bytes, offloadDays: offloaded.days } : null),
-    };
-    logger.info('s3', `同步完成：传了 ${uploaded} 个文件 / ${(bytes / 1024).toFixed(0)} KB`
-      + `${memoryPulled ? `，从桶里拉回 / 合并 ${memoryPulled} 份记忆（别的机器更新的 / 本机第一次同步 / 两边都改过）` : ''}`
-      + `${cleanup ? `；这次有 ${cleanup.trashed.length} 条移进云端回收站、${cleanup.purged.length} 条到期清空` : ''}`);
-    mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
-    return {
-      ok: true, uploaded, skipped: plan.skippedUnchanged,
-      ...(cleanup ? { cloudTrashed: cleanup.trashed.length, cloudPurged: cleanup.purged.length } : null),
-    };
-  } catch (err: any) {
-    const hint = err instanceof S3Error ? `\n${err.hint}` : '';
-    const message = `${err?.message || err}${hint}`;
-    /* 部分成功也把 state 写下来：已经传上去的下次不必再传 */
-    writeState(S3_STATE_PATH, state);
-    syncFailures += 1;
-    const minutes = Math.max(5, Number(cfg.intervalMinutes) || DEFAULT_INTERVAL_MINUTES);
-    syncNextAllowedAt = Date.now() + minutes * 60_000 * backoffMultiplier(syncFailures);
-    lastSyncSummary = { at: Date.now(), uploaded, skipped: 0, bytes, error: message };
-    logger.warn('s3', `同步失败（${reason}，连续第 ${syncFailures} 次）：${message}`
-      + ` —— 下一次定时同步不早于 ${new Date(syncNextAllowedAt).toLocaleTimeString()}`);
-    mainWindow?.webContents.send('s3:sync-done', lastSyncSummary);
-    return { ok: false, uploaded, skipped: 0, error: message };
-  } finally {
-    syncRunning = false;
   }
 }
 
@@ -11047,6 +11123,17 @@ app.whenReady().then(async () => {
   });
 
   ipcMain.handle('s3:sync-now', async () => runS3Sync('手动'));
+  /*
+    **睡眠唤醒后补一轮**（2026-11-26 Mac：睡着期间网断、凭证取不到，醒来后要等下一个 5 分钟甚至退避更久才再试）。
+    先按墙上时间看一眼上一轮：Mac 睡眠时单调时钟不走，看门狗的定时器要醒着再过满 15 分钟才到 —— 已经卡够了的现在就放弃。
+    等 30 秒再跑：刚醒时网络 / DNS 往往还没起来，马上跑只会多一次失败、多退避一档。
+  */
+  powerMonitor.on('resume', () => {
+    if (!loadSyncConfig().enabled) return;
+    syncRounds.reclaimIfStale();
+    logger.info('s3', '系统从睡眠中唤醒：30 秒后补跑一轮同步');
+    setTimeout(() => { void runS3Sync('睡眠唤醒后补一轮'); }, 30_000);
+  });
 
   /** 「AWS Profile」下拉的候选：~/.aws/config 和 ~/.aws/credentials 里的 profile 名（只读）。 */
   ipcMain.handle('s3:list-profiles', async () => ({ profiles: awsCreds.listProfiles(), cliFound: !!awsCreds.cliPath() }));

@@ -414,8 +414,9 @@ describe('取凭证期间的并发和配置变化', () => {
     const sync = M.slice(M.indexOf('async function runS3Sync('), M.indexOf('function rescheduleS3Sync('));
     const firstAwait = sync.indexOf('await ');
     assert.ok(firstAwait > 0);
-    assert.match(sync.slice(firstAwait - 40, firstAwait + 60), /await lockThenResolve\(syncLock, resolveSyncCredsNow\)/);
-    assert.match(sync, /finally \{\s*syncRunning = false;/);
+    /* syncRounds.run 同步地占住 syncLock 再调这一轮；这一轮的第一个 await 才是取凭证。放锁由 syncRounds.run 做（见 tests/s3SyncHang.test.ts） */
+    assert.match(sync.slice(firstAwait - 40, firstAwait + 80), /await syncRounds\.run\(syncLock, reason, runS3SyncRound/);
+    assert.match(sync, /async function runS3SyncRound\(round: SyncRound\)[^\n]*\{\s*round\.stage\('取凭证'\);\s*const resolved = await resolveSyncCredsNow\(\);/);
     /* lockThenResolve 占 / 放的就是 syncRunning 这把锁 */
     assert.match(M, /const syncLock: RunLock = \{ get held\(\) \{ return syncRunning; \}, set held\(v: boolean\) \{ syncRunning = v; \} \};/);
     /* 每个 `await resolveSyncCredsNow()` 到下一个 ipcMain.handle / 顶层函数之间，不能再 loadSyncConfig() 拿 cfg */
