@@ -97,6 +97,8 @@ export const ZH_CHAT: Record<string, string> = {
   'Could not send the stop request': '没能发出停止请求',
   'Sends a stop request; {machine} stops it (only the process it started) when it syncs': '发一个停止请求：{machine} 同步时拉到后停掉它（只结束它自己起的进程）',
   'Stop requested': '已请求停止',
+  'Hide this finished task here (only on this computer)': '收起这条已结束的任务（只在本机）',
+  '✕ Dismiss': '✕ 收起',
   '🔁 Re-run on this computer as {id}': '🔁 已在本机重跑（{id}）',
   '🔁 Re-run elsewhere ({machine})': '🔁 已在别处重跑（{machine}）',
   'This computer lost contact while it ran, so {machine} started it again as {id}. This one keeps running here until you stop it.': '本机跑它的时候失联了，{machine} 已经把它重新起成 {id}。本机这个照旧在跑，要停就点停止。',

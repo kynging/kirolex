@@ -45,7 +45,12 @@ export interface BgElsewhere {
   /** 在本机重新运行会用的 cwd + 确认摘要（交回 main 核对）。 */
   localCwd: string;
   rerunHash: string;
+  /** 结束了的：它的结束消息已经随会话记录同步到本机了（main 按 jobId 在 transcript 里查，`recordedBgJobIds`）。 */
+  endRecorded?: boolean;
 }
+
+/** 别的电脑上结束了的，结束后最多在会话顶部留这么久（结束消息一直没同步过来也一样）。 */
+export const ENDED_ELSEWHERE_SHOW_MS = 30 * 60_000;
 
 export function runningBgJobs(list: BgJobRow[], sessionId: string | null): BgJobRow[] {
   if (!sessionId) return [];
@@ -53,14 +58,41 @@ export function runningBgJobs(list: BgJobRow[], sessionId: string | null): BgJob
 }
 
 /**
- * 会话顶部那一块：本机的只列还在跑的（同 `runningBgJobs`）；别的电脑上的（跨电脑同步来的）结束了也列 ——
- * 本机的结果已经作为一条消息回到会话里了，别的电脑上的那条消息要等会话记录同步过来，卡片上先给退出码和输出末尾。
+ * 别的电脑上的这一条要不要放在会话顶部：还在跑的（含失联的）放；结束了的只在**结束消息还没同步到本机记录**、
+ * 结束不到 30 分钟、也没被收起时放 —— 结果一旦在记录里了，顶部再挂着只会让人以为它还在跑。
  */
-export function bannerBgJobs(list: BgJobRow[], sessionId: string | null): BgJobRow[] {
+export function showEndedElsewhere(row: BgJobRow, now: number, dismissed?: ReadonlySet<string>): boolean {
+  const e = row.elsewhere;
+  if (!e) return false;
+  if (row.state === 'running') return true;
+  if (e.endRecorded || dismissed?.has(row.jobId)) return false;
+  return now - (row.endedAt ?? e.updatedAt) <= ENDED_ELSEWHERE_SHOW_MS;
+}
+
+/**
+ * 会话顶部那一块：只放还在跑的 —— 本机的（同 `runningBgJobs`）和别的电脑上的一样；别的电脑上刚结束、结果消息还没同步过来的
+ * 暂时也放（`showEndedElsewhere`），卡片上先给退出码和输出末尾。
+ */
+export function bannerBgJobs(list: BgJobRow[], sessionId: string | null, opts: { now?: number; dismissed?: ReadonlySet<string> } = {}): BgJobRow[] {
   if (!sessionId) return [];
+  const now = opts.now ?? Date.now();
   const local = runningBgJobs(list.filter((j) => !j.elsewhere), sessionId);
-  const remote = list.filter((j) => j.elsewhere && j.sessionId === sessionId).sort((a, b) => a.startedAt - b.startedAt);
+  const remote = list.filter((j) => j.elsewhere && j.sessionId === sessionId && showEndedElsewhere(j, now, opts.dismissed))
+    .sort((a, b) => a.startedAt - b.startedAt);
   return [...local, ...remote];
+}
+
+/** 「✕ 收起」过的（本机 ui-state 里记一笔，不同步）：jobId → 收起的时刻。超过 7 天的不再记（那时它早就不会再出现了）。 */
+export const BG_DISMISSED_KEY = 'kirolex-bg-dismissed';
+export function parseBgDismissed(raw: string | null | undefined, now: number): Record<string, number> {
+  const out: Record<string, number> = {};
+  try {
+    const o = JSON.parse(raw || '{}');
+    if (o && typeof o === 'object' && !Array.isArray(o)) {
+      for (const [id, at] of Object.entries(o)) if (typeof at === 'number' && now - at <= 7 * 24 * 3600_000) out[id] = at;
+    }
+  } catch { /* 坏了：当作没收起过 */ }
+  return out;
 }
 
 /** 跑它的那台失联了：还在「运行中」，状态超过约 2 个同步周期没更新（同 main 的 `bgRunnerLost`）。 */

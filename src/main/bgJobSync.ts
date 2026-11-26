@@ -235,9 +235,14 @@ export interface BgSyncLedger {
   tombstones: Record<string, { sessionId: string; at: number; pushed?: boolean }>;
   /** 本机的任务被别的电脑「在那边重跑」了（桶里的重跑标记）：只显示，本机的进程照旧跑（要停就点停止）。 */
   ownReruns: Record<string, BgRerunMark>;
+  /**
+   * 别的电脑上结束超过 `FOREIGN_KEEP_MS` 的、已经从 foreign 账里拿掉的：只是本机的账，桶里不动；
+   * 记着它们，下一轮同步就不会再把桶里那份下载回来（桶里那份没了，这一笔也跟着清掉）。
+   */
+  pruned: Record<string, { sessionId: string; at: number }>;
 }
 
-export function emptyLedger(): BgSyncLedger { return { published: {}, foreign: {}, tombstones: {}, ownReruns: {} }; }
+export function emptyLedger(): BgSyncLedger { return { published: {}, foreign: {}, tombstones: {}, ownReruns: {}, pruned: {} }; }
 
 function ledgerFile(home: string): string { return path.join(home, '.kirolex', 'bg-sync.json'); }
 
@@ -245,7 +250,7 @@ export function readBgLedger(home: string): BgSyncLedger {
   try {
     const o = JSON.parse(fs.readFileSync(ledgerFile(home), 'utf-8'));
     const obj = (v: unknown) => (v && typeof v === 'object' && !Array.isArray(v) ? v as Record<string, any> : {});
-    return { published: obj(o?.published), foreign: obj(o?.foreign), tombstones: obj(o?.tombstones), ownReruns: obj(o?.ownReruns) } as BgSyncLedger;
+    return { published: obj(o?.published), foreign: obj(o?.foreign), tombstones: obj(o?.tombstones), ownReruns: obj(o?.ownReruns), pruned: obj(o?.pruned) } as BgSyncLedger;
   } catch { return emptyLedger(); }
 }
 
@@ -363,7 +368,7 @@ export function planBgSync(input: BgSyncPlanInput): BgSyncAction[] {
     说 runner 是本机、本机表里却没有的（上一次运行留下的 / 伪造的）：补删除标记，不当成本机的（）
   */
   for (const [jobId, b] of bucket) {
-    if (b.deleted || ownById.has(jobId) || ledger.published[jobId] || ledger.foreign[jobId] || ledger.tombstones[jobId] || !b.state) continue;
+    if (b.deleted || ownById.has(jobId) || ledger.published[jobId] || ledger.foreign[jobId] || ledger.tombstones[jobId] || ledger.pruned?.[jobId] || !b.state) continue;
     if (!input.inScope(b.sessionId)) continue;
     out.push({ op: 'fetch-state', jobId, sessionId: b.sessionId, rel: b.state.rel, ...(b.state.etag ? { etag: b.state.etag } : {}) });
   }
@@ -411,4 +416,56 @@ export function applyFetchedState(
 /** 删除标记（单独的对象 `<jobId>.deleted.json`）：只有 id / 会话 / 时刻 / 谁删的，不带任务内容。 */
 export function bgTombstoneBody(jobId: string, sessionId: string, at: number, by: string): string {
   return JSON.stringify({ v: 1, jobId, sessionId, deleted: { at, by } }, null, 2);
+}
+
+/* ------------------------------------------------------------------ 本机账的清理 */
+
+/** 别的电脑上结束了的，本机账里最多留这么久（之后从 foreign 账里拿掉，桶里不动）。 */
+export const FOREIGN_KEEP_MS = 7 * 24 * 3600_000;
+
+/**
+ * **foreign 账瘦身**：别的电脑上结束超过 `keepMs` 的从账里拿掉、记进 `pruned`（下一轮不再下载回来）；
+ * `bucketIds` = 这一轮桶里还有的 jobId —— 桶里已经没了的，`pruned` 那一笔也清掉。只动本机账，不碰桶。
+ */
+export function pruneEndedForeign(ledger: BgSyncLedger, now: number, keepMs: number, bucketIds?: Set<string>): BgSyncLedger {
+  const foreign = { ...ledger.foreign };
+  const pruned = { ...(ledger.pruned ?? {}) };
+  let changed = false;
+  for (const [id, f] of Object.entries(ledger.foreign)) {
+    if (f.state.state === 'running') continue;
+    if (now - (f.state.endedAt ?? f.state.updatedAt) <= keepMs) continue;
+    delete foreign[id];
+    pruned[id] = { sessionId: f.state.sessionId, at: now };
+    changed = true;
+  }
+  if (bucketIds) {
+    for (const id of Object.keys(pruned)) {
+      if (bucketIds.has(id)) continue;
+      delete pruned[id];
+      changed = true;
+    }
+  }
+  return changed ? { ...ledger, foreign, pruned } : ledger;
+}
+
+/**
+ * 会话记录里已经有哪些后台任务的结束消息：唤醒 / 说明消息的正文都带 `（jobId）` / `(jobId)`（bgJobs.ts 的文案），
+ * 按这个认。别的电脑上结束了的那条，结果的消息已经同步过来了 → 会话顶部不再置顶它。
+ */
+export function recordedBgJobIds(messages: Array<{ content?: unknown }>): Set<string> {
+  const out = new Set<string>();
+  /*
+    只认**结果**那几条（bgJobs.ts 的文案，第一行）：结束 / 没能运行 / 超时 / 限流停掉 / 用户停止 —— 都以 🔔 / 👀 / ⏹️ 开头、
+    第一行以「（jobId）」收尾；重启中断那条是「⚠️ …（jobId）已中断 / was interrupted」。
+    监视运行中的「👀 …（jobId）有新输出：/ new output:」jobId 后面还跟着字，不算 —— 不然结果还没同步过来卡片就先没了
+  */
+  const ended = /^(?:🔔|👀|⏹️|⏹)[^\n]*[(（]((?:bg|watch)_[A-Za-z0-9]+)[)）]$/u;
+  const interrupted = /^⚠️[^\n]*[(（]((?:bg|watch)_[A-Za-z0-9]+)[)）]\s*(?:was interrupted|已中断)/u;
+  for (const m of messages) {
+    if (typeof m?.content !== 'string' || !m.content.includes('_')) continue;
+    const first = m.content.split(/\r?\n/, 1)[0].trim();
+    const hit = first.match(ended) ?? first.match(interrupted);
+    if (hit) out.add(hit[1]);
+  }
+  return out;
 }

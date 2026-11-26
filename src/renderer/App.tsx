@@ -12,7 +12,7 @@ import { autoFoldPanels, filePanelMax } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
 import { endedElsewhereSummary, schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
-import { bannerBgJobs, type BgJobRow } from './bgJobsView';
+import { BG_DISMISSED_KEY, bannerBgJobs, parseBgDismissed, type BgJobRow } from './bgJobsView';
 import { startupBlocksSend } from './createStages';
 import { queueUntilConnected, queueableMessage, waitsForConnection, type ConnectingFacts } from './connectingSend.ts';
 // 给主会话的交底 —— 它原本对流程一无所知，连执行会话都不知道
@@ -1678,15 +1678,34 @@ const App: React.FC = () => {
     };
   }, [schedules, scheduleSummaryFor, settings.language]);
 
+  /** 别的电脑上结束了的卡片点过「✕ 收起」的（本机 ui-state，不同步）。 */
+  const [bgDismissed, setBgDismissed] = useState<Record<string, number>>(() => parseBgDismissed(uiGet(BG_DISMISSED_KEY), Date.now()));
+  const dismissBgJob = useCallback((jobId: string) => {
+    setBgDismissed((prev) => {
+      const next = { ...parseBgDismissed(JSON.stringify(prev), Date.now()), [jobId]: Date.now() };
+      uiSet(BG_DISMISSED_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
+  /** 别的电脑上结束了的卡片最多留 30 分钟：有这种卡片时每分钟重算一次顶部，到点自己消失。 */
+  const [bgBannerNow, setBgBannerNow] = useState(() => Date.now());
+  const hasEndedElsewhere = bgJobs.some((j) => j.elsewhere && j.state !== 'running');
+  useEffect(() => {
+    if (!hasEndedElsewhere) return;
+    setBgBannerNow(Date.now());
+    const timer = setInterval(() => setBgBannerNow(Date.now()), 60_000);
+    return () => clearInterval(timer);
+  }, [hasEndedElsewhere]);
   /** 每条会话还在跑的后台命令 / 监视 + 别的电脑上的（跨电脑同步来的，只读）（按会话缓存：没变就是同一个数组，ChatArea 的 memo 不白算）。 */
   const bgJobsFor = useMemo(() => {
     const cache = new Map<string, BgJobRow[]>();
+    const dismissed = new Set(Object.keys(bgDismissed));
     return (sid: string | null): BgJobRow[] => {
       const key = sid || '';
-      if (!cache.has(key)) cache.set(key, bannerBgJobs(bgJobs, sid));
+      if (!cache.has(key)) cache.set(key, bannerBgJobs(bgJobs, sid, { now: bgBannerNow, dismissed }));
       return cache.get(key)!;
     };
-  }, [bgJobs]);
+  }, [bgJobs, bgBannerNow, bgDismissed]);
 
   /*
     **发起方顶部的「⏳ 等「X」回复（已等 N 分钟）」**：数据就是主进程的等待登记（session-calls.json，重启后照旧）；
@@ -4623,6 +4642,7 @@ const App: React.FC = () => {
         onStopBgJob={(jobId) => void stopBgJob(jobId)}
         onRequestStopBgJob={(jobId) => requestStopBgJob(jobId)}
         onRerunBgJob={(jobId, hash) => rerunBgJobHere(jobId, hash)}
+        onDismissBgJob={dismissBgJob}
         onStopLoop={() => { if (sid) void stopLoop(sid); }}
       />
     );

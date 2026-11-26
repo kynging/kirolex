@@ -156,14 +156,14 @@ describe('会话顶部那一块', () => {
   const base = { sessionId: 's1', kind: 'run' as const, label: 'l', command: 'c', startedAt: 0, endedAt: null, exitCode: null, pid: null, events: 0 };
   const el = { runnerName: 'mac', updatedAt: 0, staleAfterMs: 60_000, cwd: '/x', tail: null, timeoutMs: 1, stopRequested: false, rerun: null, localCwd: '/y', rerunHash: 'h' };
 
-  test('本机的只列在跑的；别的电脑的结束了也列（带退出码 / 输出末尾）', () => {
+  test('本机的只列在跑的；别的电脑刚结束、结果消息还没同步过来的也列（带退出码 / 输出末尾）', () => {
     const list: BgJobRow[] = [
       { ...base, jobId: 'a', state: 'running' },
       { ...base, jobId: 'b', state: 'exited' },
-      { ...base, jobId: 'r1', state: 'exited', exitCode: 0, elsewhere: el },
+      { ...base, jobId: 'r1', state: 'exited', exitCode: 0, endedAt: 0, elsewhere: el },
       { ...base, jobId: 'r2', state: 'running', elsewhere: el, sessionId: 's2' },
     ];
-    assert.deepEqual(bannerBgJobs(list, 's1').map((j) => j.jobId), ['a', 'r1']);
+    assert.deepEqual(bannerBgJobs(list, 's1', { now: 60_000 }).map((j) => j.jobId), ['a', 'r1']);
   });
 
   test('失联 = 别的电脑上还在跑、超过阈值没更新；本机的永远不算', () => {
@@ -174,7 +174,7 @@ describe('会话顶部那一块', () => {
   });
 
   test('App 用 bannerBgJobs 喂会话顶部', () => {
-    assert.ok(APP.includes('cache.set(key, bannerBgJobs(bgJobs, sid));'));
+    assert.ok(APP.includes('cache.set(key, bannerBgJobs(bgJobs, sid, { now: bgBannerNow, dismissed }));'));
   });
 });
 

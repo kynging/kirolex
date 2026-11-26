@@ -4230,6 +4230,8 @@ interface ChatAreaProps {
   onRequestStopBgJob?: (jobId: string) => Promise<{ ok: boolean; error?: string }>;
   /** 别的电脑失联时「在本机重新运行」：先弹确认（命令全文 + cwd），确认了才调；`hash` 交回 main 核对。 */
   onRerunBgJob?: (jobId: string, hash: string) => Promise<{ ok: boolean; error?: string }>;
+  /** 别的电脑上结束了的那张卡「✕ 收起」：本机记一笔，这条不再出现（不同步、不动桶里的状态）。 */
+  onDismissBgJob?: (jobId: string) => void;
 
   /** The project this chat belongs to, or null when it is unassigned. The flow rail is offered
    *  ONLY when there is one: a flow is a property of a project, so a "流程" entry on an
@@ -4370,6 +4372,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onStopBgJob,
   onRequestStopBgJob,
   onRerunBgJob,
+  onDismissBgJob,
   startup,
   onRetryStartup,
   projectName,
@@ -5979,6 +5982,14 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                       }}
                       title={t('Sends a stop request; {machine} stops it (only the process it started) when it syncs', { machine: e.runnerName })}
                     >{e.stopRequested ? t('Stop requested') : t('⏹️ Stop')}</button>
+                  )}
+                  {/* 结束了的：结果消息还没同步过来时暂时挂着，可以自己收起（本机记一笔，不同步） */}
+                  {!running && onDismissBgJob && (
+                    <button
+                      className="bg-job-stop"
+                      onClick={() => onDismissBgJob(job.jobId)}
+                      title={t('Hide this finished task here (only on this computer)')}
+                    >{t('✕ Dismiss')}</button>
                   )}
                 </div>
                 <div className={`bg-job-runner${lost ? ' offline' : ''}`}>

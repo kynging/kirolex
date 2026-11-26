@@ -104,7 +104,7 @@ import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, fold
 import { SWAP_MAX, SWAP_WINDOW_MS, TEXT_TOOL_SWAP_ID_PREFIX, afterBackendSwap, afterUserMessage, decideTextToolRecovery, isUserTurnMessageId, recordAutoSwap, swapAbandoned, textToolWakeStale, type TextToolRecoveryState } from './textToolRecovery.ts';
 import { canRetrySame, decidePromptDedupe, DUPLICATE_MESSAGE, DUPLICATE_STARTED, InFlightPrompts, reviseMessageId, turnCompletedNormally } from './promptDedupe.ts';
 import { BG_DEFAULT_TIMEOUT_SEC, BG_MAX_TIMEOUT_SEC, WATCH_MAX_TIMEOUT_SEC, BgJobManager, interruptedNotice, takeInterruptedJobs, writeRunningJobs } from './bgJobs.ts';
-import { BG_JOBS_REL, applyFetchedState, bgObjectRel, bgRunnerLost, bgStateBody, bgTombstoneBody, collectBucketBgJobs, forgetBgSession, parseRemoteBgState, parseRerunMark, parseStopRequest, planBgSync, planStopRequests, readBgLedger, rerunBody, rerunHash, stopRequestBody, writeBgLedger, type BgStopRequest, type BgSyncLedger } from './bgJobSync.ts';
+import { BG_JOBS_REL, applyFetchedState, bgObjectRel, bgRunnerLost, bgStateBody, bgTombstoneBody, collectBucketBgJobs, FOREIGN_KEEP_MS, forgetBgSession, pruneEndedForeign, recordedBgJobIds, parseRemoteBgState, parseRerunMark, parseStopRequest, planBgSync, planStopRequests, readBgLedger, rerunBody, rerunHash, stopRequestBody, writeBgLedger, type BgStopRequest, type BgSyncLedger } from './bgJobSync.ts';
 import { adapterScheduleNote, callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryInjectionAsync, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
@@ -7965,6 +7965,8 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
       if (rel) entries.push({ rel: rel.split(path.sep).join('/'), ...(o.etag ? { etag: o.etag } : {}) });
     }
     const bucket = collectBucketBgJobs(entries);
+    /* 别的电脑上结束超过 7 天的：从本机账里拿掉（桶里不动），记进 pruned，下面就不会再下载回来 */
+    updateBgLedger((l) => pruneEndedForeign(l, Date.now(), FOREIGN_KEEP_MS, new Set(bucket.keys())));
     const plan = () => planBgSync({ me, now: Date.now(), heartbeatMs, own: bgJobs.listForSync(), ledger: bgLedger(), bucket, inScope });
     /* 1. 停止请求：只停不改 —— 解析只留 jobId / 会话，停的只能是本机表里在跑的那条 */
     const requests: BgStopRequest[] = [];
@@ -7990,7 +7992,7 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
         const published = { ...l.published }; delete published[jobId];
         const foreign = { ...l.foreign }; delete foreign[jobId];
         const ownReruns = { ...l.ownReruns }; delete ownReruns[jobId];
-        return { published, foreign, ownReruns, tombstones: { ...l.tombstones, [jobId]: { sessionId, at, pushed: true } } };
+        return { ...l, published, foreign, ownReruns, tombstones: { ...l.tombstones, [jobId]: { sessionId, at, pushed: true } } };
       });
     };
     for (const a of plan()) {
@@ -8039,11 +8041,13 @@ async function syncBgJobsWithBucket(creds: S3Creds, prefix: string | undefined):
           const foreign = { ...l.foreign }; delete foreign[a.jobId];
           const tombstones = a.tombstone && !l.tombstones[a.jobId] ? { ...l.tombstones, [a.jobId]: { sessionId: a.sessionId, at: Date.now(), pushed: true } } : l.tombstones;
           const ownReruns = { ...l.ownReruns }; delete ownReruns[a.jobId];
-          return { published, foreign, ownReruns, tombstones };
+          return { ...l, published, foreign, ownReruns, tombstones };
         });
         uiChanged = true;
       }
     }
+    /* 会话记录刚同步过来，结束消息可能已经在了：有结束了的就让界面重新问一遍（顶部据此不再置顶它） */
+    if (Object.values(bgLedger().foreign).some((f) => f.state.state !== 'running')) uiChanged = true;
     if (uiChanged) mainWindow?.webContents.send('bg:changed');
     return uploaded;
   } catch (err: any) {
@@ -8075,6 +8079,20 @@ async function syncBgJobsNow(): Promise<void> {
 }
 
 /** 界面上的一行（别的电脑上的后台任务，只读）：在哪台、多久没更新、本机重跑会用的 cwd 和确认摘要。 */
+/** 每条会话的记录里有哪些后台任务的结束消息（`recordedBgJobIds`），按记录文件大小缓存：没变就不重读。 */
+const bgRecordedCache = new Map<string, { size: number; ids: Set<string> }>();
+function bgEndRecorded(sessionId: string, jobId: string): boolean {
+  const size = store.transcriptFileSize(sessionId);
+  let hit = bgRecordedCache.get(sessionId);
+  if (!hit || hit.size !== size) {
+    let ids = new Set<string>();
+    try { ids = recordedBgJobIds(store.readTranscript(sessionId)); } catch { /* 读不到：当作还没同步过来 */ }
+    hit = { size, ids };
+    bgRecordedCache.set(sessionId, hit);
+  }
+  return hit.ids.has(jobId);
+}
+
 function foreignBgRows(): any[] {
   const cfg = loadSyncConfig();
   const me = scheduleMachine().id;
@@ -8083,6 +8101,8 @@ function foreignBgRows(): any[] {
     .filter(([, f]) => bgSessionInScope(cfg, f.state.sessionId))
     .map(([jobId, f]) => {
       const localCwd = bgLocalCwd(f.state.sessionId);
+      /* 结束了的：它的结束消息是不是已经随会话记录同步过来了（会话顶部据此不再置顶） */
+      const endRecorded = f.state.state !== 'running' && bgEndRecorded(f.state.sessionId, jobId);
       return {
         jobId, sessionId: f.state.sessionId, kind: f.state.kind, label: f.state.label, command: f.state.command,
         state: f.state.state, startedAt: f.state.startedAt, endedAt: f.state.endedAt, exitCode: f.state.exitCode, pid: null, events: f.state.events,
@@ -8090,7 +8110,7 @@ function foreignBgRows(): any[] {
           runnerName: f.state.runnerName, updatedAt: f.state.updatedAt, staleAfterMs, cwd: f.state.cwd, tail: f.state.tail,
           timeoutMs: f.state.timeoutMs, stopRequested: f.stopRequestedAt !== undefined, commandTruncated: !!f.state.commandTruncated,
           rerun: f.rerun ? { byName: f.rerun.byName, here: f.rerun.by === me, newJobId: f.rerun.newJobId } : null,
-          localCwd, rerunHash: rerunHash(f.state, localCwd),
+          localCwd, rerunHash: rerunHash(f.state, localCwd), endRecorded,
         },
       };
     });
