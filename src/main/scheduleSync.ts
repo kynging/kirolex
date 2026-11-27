@@ -21,7 +21,7 @@
  */
 
 import crypto from 'crypto';
-import { CHECK_OUTPUT_KEEP, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
+import { CHECK_OUTPUT_KEEP, MIN_INTERVAL_SEC, dueAt, isDue, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 
 /**
  * 桶里放定时任务的目录（相对布局根）：`schedules/<sessionId>/<id>.json` —— 按会话分，恢复一条会话时按前缀列出它的任务。
@@ -72,7 +72,7 @@ export function collectBucketSchedules(rels: string[]): {
 export interface ScheduleMachine { id: string; name: string }
 
 /** 运行状态：只有 runner 写。 */
-export const RUN_KEYS = ['runs', 'lastRunAt', 'lastError', 'lastCheckHash', 'lastCheck', 'checkErrors', 'terminal', 'statusBy', 'statusAt'] as const;
+export const RUN_KEYS = ['runs', 'lastRunAt', 'lastError', 'lastCheckHash', 'lastCheck', 'checkErrors', 'terminal', 'catchUpPending', 'catchUpDeclined', 'statusBy', 'statusAt'] as const;
 /** 执行者：按 `runnerChangedAt` 后者胜（远端不能改成本机）。 */
 export const RUNNER_KEYS = ['runner', 'runnerName', 'runnerChangedAt', 'takenOverAt'] as const;
 const PAUSE_KEYS = ['paused', 'pausedBy', 'pausedChangedAt'] as const;
@@ -115,14 +115,54 @@ export function canRunHere(state: ScheduleState, me: string, approvedHash: strin
 }
 
 /**
- * 算「下一次什么时候」用的那份：接管过的，锚点是接管那一刻 —— 接管后的第一次从现在算，不补跑错过的
- * （`once` 不受影响：它只看 `atEpoch`）。只用来判断到没到点 / 显示，**不写盘**。
+ * 算「下一次什么时候」用的那份。接管过、而且接管之后还没跑过的：
+ *   · 接管时已经到点、选了补跑（`catchUpPending`）→ 锚点照旧是原来的上次运行 —— 已经到点，调度器下一跳就补跑这一次；
+ *   · 否则（接管时还没到点 / 没勾补跑）→ 锚点是接管那一刻，第一次从接管时算。
+ * 跑过一次之后 `lastRunAt` ≥ 接管时刻，一切照常。`once` 不受影响（只看 `atEpoch`）。只用来判断到没到点 / 显示，**不写盘**。
  */
 export function timingState(state: ScheduleState): ScheduleState {
   const at = state.takenOverAt;
   if (typeof at !== 'number' || !Number.isFinite(at)) return state;
   if (state.lastRunAt !== null && state.lastRunAt >= at) return state;
-  return { ...state, lastRunAt: at };
+  /* 只有「接管时已经到点、用户取消了补跑」才改时间：循环的从接管那一刻算；一次性的那一次就不跑了（没有下一次） */
+  if (state.catchUpDeclined) {
+    if (state.spec.kind === 'once') return { ...state, spec: { ...state.spec, atEpoch: Number.POSITIVE_INFINITY } };
+    return { ...state, lastRunAt: at };
+  }
+  /* 选了补跑（catchUpPending）/ 接管时还没到点：时间照原样 —— 已经到点的这一跳就补跑，没到点的按原定的下一次 */
+  return state;
+}
+
+/** 接管这一刻在补跑中吗（接管时选了补跑、之后还没跑过）。 */
+export function isCatchUpRun(state: ScheduleState): boolean {
+  return typeof state.catchUpPending === 'number' && state.catchUpPending > 0
+    && typeof state.takenOverAt === 'number' && (state.lastRunAt === null || state.lastRunAt < state.takenOverAt);
+}
+
+/** 数错过的次数最多数到这里（一个每分钟的任务停了一年也不该把主进程数卡住）。 */
+const MISSED_COUNT_CAP = 10_000;
+
+/**
+ * **按接管之前的状态，现在已经到点了吗、错过了几次**（接管确认框 / 补跑用）。
+ * 不到点、暂停了、结束了、过期了（`expiresAt`）、次数用完了 → `missed: 0`（`isDue` 的判据，原样）。
+ * `lastRunAt`：上次运行；`firstMissedAt`：本应运行的第一次。只数，不改任何东西 —— 补跑也只补 1 次。
+ */
+export function missedRuns(state: ScheduleState, now: number): { missed: number; lastRunAt: number | null; firstMissedAt: number | null } {
+  const none = { missed: 0, lastRunAt: state.lastRunAt, firstMissedAt: null };
+  if (!isDue(state, now)) return none;
+  const spec = state.spec;
+  if (spec.kind === 'once') return { missed: 1, lastRunAt: state.lastRunAt, firstMissedAt: Number(spec.atEpoch ?? 0) };
+  if (spec.kind === 'interval') {
+    const period = Math.max(MIN_INTERVAL_SEC, spec.everySec) * 1000;
+    const first = state.lastRunAt === null ? state.createdAt : state.lastRunAt + period;
+    if (first > now) return { missed: 1, lastRunAt: state.lastRunAt, firstMissedAt: first };
+    return { missed: Math.min(MISSED_COUNT_CAP, Math.floor((now - first) / period) + 1), lastRunAt: state.lastRunAt, firstMissedAt: first };
+  }
+  const first = dueAt(spec, state.lastRunAt, state.createdAt);
+  let t = first;
+  let n = 0;
+  while (t <= now && n < MISSED_COUNT_CAP) { n += 1; t = dueAt(spec, t, state.createdAt); }
+  return { missed: Math.max(1, n), lastRunAt: state.lastRunAt, firstMissedAt: first };
 }
 
 /**
@@ -160,8 +200,17 @@ export function stampLocalWrite(prev: ScheduleState | null, next: ScheduleState,
  * **运行状态的基准也在这一刻立起来**：接管那一刻本机看到的运行状态记成「新执行者写的」（statusBy = 本机、statusAt = now）——
  * 之后合并只认它和新执行者后来写的，旧执行者在接管之后、拉到之前多跑的那次，哪台电脑都不收（`mergeSchedule`）。
  */
-export function takeOver(state: ScheduleState, me: ScheduleMachine, now: number): ScheduleState {
-  return { ...state, runner: me.id, runnerName: me.name, runnerChangedAt: now, takenOverAt: now, statusBy: me.id, statusAt: now };
+export function takeOver(state: ScheduleState, me: ScheduleMachine, now: number, opts: { catchUp?: boolean } = {}): ScheduleState {
+  /*
+    按接管之前的状态已经到点了吗：到点 + 选了补跑 → 记下错过几次，调度器下一跳补跑一次；到点 + 没选 → 记成「取消了补跑」，
+    从接管那一刻算（一次性的就不跑了）；没到点 → 两个都不记，按原定的下一次（`timingState`）
+  */
+  const missed = missedRuns(state, now).missed;
+  return {
+    ...state, runner: me.id, runnerName: me.name, runnerChangedAt: now, takenOverAt: now, statusBy: me.id, statusAt: now,
+    catchUpPending: missed > 0 && opts.catchUp ? missed : null,
+    catchUpDeclined: missed > 0 && !opts.catchUp ? true : null,
+  };
 }
 
 export interface MergeNotes {
@@ -319,6 +368,8 @@ export function parseRemoteSchedule(text: string, id: string, sessionId: string)
   }
   if (s.pausedBy === 'check-errors') state.pausedBy = 'check-errors';
   const took = numOrNull(s.takenOverAt); if (took !== undefined) state.takenOverAt = took;
+  if (num(s.catchUpPending) && s.catchUpPending > 0) state.catchUpPending = Math.floor(s.catchUpPending);
+  if (s.catchUpDeclined === true) state.catchUpDeclined = true;
   const by = str(s.statusBy); if (by) state.statusBy = by;
   for (const k of ['statusAt', 'pausedChangedAt', 'expiryChangedAt'] as const) if (num(s[k])) (state as any)[k] = s[k];
   return { kind: 'live', state };

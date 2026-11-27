@@ -2679,6 +2679,23 @@ button, input, select, textarea {
   cursor: pointer;
 }
 .schedule-banner-takeover:hover { background: rgba(124, 111, 224, 0.16); }
+/* 已逾期：接管按钮醒目一点（实心） */
+.schedule-banner-takeover.urgent { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
+.schedule-banner-takeover.urgent:hover { filter: brightness(1.1); background: var(--accent); }
+.schedule-banner-run-now {
+  flex-shrink: 0;
+  padding: 2px 8px;
+  border-radius: 6px;
+  border: 1px solid var(--border);
+  background: transparent;
+  color: inherit;
+  font-size: 11px;
+  cursor: pointer;
+  opacity: 0.75;
+}
+.schedule-banner-run-now:hover { opacity: 1; background: rgba(255, 255, 255, 0.06); }
+/* 确认框里的那一个复选框（接管定时任务的「立刻补跑一次」） */
+.confirm-dialog-check { display: flex; align-items: center; gap: 6px; margin: 4px 0 8px; cursor: pointer; }
 /* 「由模型创建」：一个小标签，让人一眼看出这不是自己设的 */
 .schedule-banner-by-model {
   flex-shrink: 0;

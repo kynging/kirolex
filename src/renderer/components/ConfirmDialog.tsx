@@ -1,4 +1,4 @@
-import React, { useCallback, useEffect, useRef } from 'react';
+import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { useT } from '../hooks/useLang';
 
 /**
@@ -38,8 +38,11 @@ export interface ConfirmRequest {
   cancelLabel?: string;
   /** Paint the confirm button red. Use for anything irreversible. */
   destructive?: boolean;
-  /** Run when confirmed. The dialog closes first, so this may itself open another. */
-  onConfirm: () => void;
+  /** 可选的一个复选框（例如接管定时任务时的「立刻补跑一次」）：勾没勾交给 `onConfirm`。不给就没有。 */
+  checkbox?: { label: string; defaultChecked?: boolean };
+  /** Run when confirmed. The dialog closes first, so this may itself open another.
+   *  `checked`: the checkbox state when there is one (otherwise false). */
+  onConfirm: (checked: boolean) => void;
 }
 
 interface ConfirmDialogProps {
@@ -52,14 +55,16 @@ interface ConfirmDialogProps {
 export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ request, onClose }) => {
   const confirmRef = useRef<HTMLButtonElement | null>(null);
   const t = useT();
+  const [checked, setChecked] = useState(false);
+  useEffect(() => { setChecked(!!request?.checkbox?.defaultChecked); }, [request]);
 
   const accept = useCallback(() => {
     const run = request?.onConfirm;
     // Close FIRST: the action may replace this dialog with another one, and it must
     // not be torn down by our own onClose afterwards.
     onClose();
-    run?.();
-  }, [request, onClose]);
+    run?.(!!request?.checkbox && checked);
+  }, [request, onClose, checked]);
 
   // Keyboard: Esc cancels, Enter confirms. Bound on the document because the dialog
   // is mounted next to the tree it interrupts, not inside it.
@@ -87,6 +92,12 @@ export const ConfirmDialog: React.FC<ConfirmDialogProps> = ({ request, onClose }
         <h3>{request.title}</h3>
         {/* pre-wrap so the caller can put the consequence on its own line. */}
         <p style={{ whiteSpace: 'pre-wrap' }}>{request.message}</p>
+        {request.checkbox && (
+          <label className="confirm-dialog-check">
+            <input type="checkbox" checked={checked} onChange={(e) => setChecked(e.target.checked)} />
+            {request.checkbox.label}
+          </label>
+        )}
         {request.detail && <pre className="confirm-dialog-detail">{request.detail}</pre>}
         <div className="actions">
           <button className="btn deny" onClick={onClose}>

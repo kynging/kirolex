@@ -96,7 +96,7 @@ import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleOwnerGate, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
-import { SCHEDULES_REL, canRunHere, collectBucketSchedules, definitionHash, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
+import { SCHEDULES_REL, canRunHere, collectBucketSchedules, definitionHash, isCatchUpRun, missedRuns, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
 import { scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, SESSION_NOT_CONNECTED, WakeDispatcher, WakeSkipped, isWakeBusyError, isWakeConnectionError, wakeAlreadyDelivered, type WakeItem } from './wakeQueue.ts';
@@ -13954,20 +13954,23 @@ ${hint}` : ''}` };
     return gate === 'run';
   }
 
-  async function runScheduledJob(job: scheduleStore.StoredSchedule): Promise<void> {
+  async function runScheduledJob(job: scheduleStore.StoredSchedule, opts: { manual?: boolean } = {}): Promise<void> {
     const { id } = job;
     let state = job.state;
     if (schedulesInFlight.has(id)) return;
     /*
-      **只有 runner 那台跑**：按盘上最新的再判一次（接管 / 交出可能刚同步进来）；接管之后的第一次从接管那一刻算（`timingState`），不补跑错过的
+      **只有 runner 那台跑**：按盘上最新的再判一次（接管 / 交出可能刚同步进来）。接管之后：接管时已经到点、选了补跑的，
+      锚点仍是原来的上次运行（这一次就是补跑）；否则第一次从接管那一刻算（`timingState`）。
+      「▶ 立即运行一次」（`manual`）不看到没到点 —— 暂停 / 结束 / 过期 / 次数用完由 `schedule:run-now` 先挡掉。
     */
     { const fresh = scheduleStore.readSchedule(id, os.homedir());
-      if (!fresh || !scheduleRunsHere(fresh) || !isDue(timingState(fresh.state), Date.now())) return; }
+      if (!fresh || !scheduleRunsHere(fresh) || (!opts.manual && !isDue(timingState(fresh.state), Date.now()))) return;
+      if (!opts.manual && isCatchUpRun(fresh.state)) logger.info('schedule', `schedule catch-up id=${id} missed=${fresh.state.catchUpPending} session=${fresh.state.sessionId}: 接管时已到点，补跑一次`); }
     /* 先看会话还在不在，再跑任何东西（`checkCommand` 是本机 shell），见 `scheduleOwnerAllows` */
     if (!scheduleOwnerAllows(id, state.sessionId)) return;
     schedulesInFlight.set(id, state.sessionId);
     try {
-      const at = nextRunAt(timingState(state)) ?? Date.now();
+      const at = opts.manual ? Date.now() : nextRunAt(timingState(state)) ?? Date.now();
       /* 目标型任务的 `checkCommand`：先在本机跑一次检查，没变化就到此为止（不花模型）；要叫醒的话把检查结果附在消息里 */
       let check = '';
       if (state.spec.checkCommand) {
@@ -14067,6 +14070,18 @@ ${hint}` : ''}` };
     }
   }, SCHEDULE_TICK_MS);
   app.on('before-quit', () => clearInterval(scheduleTicker));
+
+  /** 和上面那一跳同一套（只跑本机执行的、先判过期、到点就跑）：睡眠唤醒 / 刚接管时不必等下一个 20 秒。 */
+  function runDueSchedulesNow(why: string): void {
+    if (quitPending) return;
+    const now = Date.now();
+    const due = scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter(scheduleRunsHere)
+      .filter((job) => !expireSchedule(job, now) && isDue(job.state, now));
+    if (due.length) logger.info('schedule', `${why}：立刻查一次定时任务，${due.length} 个已到点`);
+    for (const job of due) void runScheduledJob(job);
+  }
+  /* 睡眠唤醒：睡着期间错过的（本机是执行者的）醒来立刻补一次，不等下一跳 */
+  powerMonitor.on('resume', () => runDueSchedulesNow('resume'));
 
   /** 模型建的循环任务过了 `expiresAt`（默认 7 天）：记成 `expired`、在会话里说一声。返回是否刚过期。 */
   function expireSchedule(job: scheduleStore.StoredSchedule, now: number): boolean {
@@ -14332,7 +14347,8 @@ ${hint}` : ''}` };
     terminal: job.state.terminal,
     lastRunAt: job.state.lastRunAt,
     lastError: job.state.lastError,
-    nextRunAt: nextRunAt(timingState(job.state)),
+    /* 取消了补跑的一次性任务没有下一次（timingState 给的是无穷远）：交给界面的是 null */
+    nextRunAt: (() => { const n = nextRunAt(timingState(job.state)); return n !== null && Number.isFinite(n) ? n : null; })(),
     createdBy: job.state.createdBy ?? null,
     expiresAt: job.state.expiresAt ?? null,
     until: job.state.spec.until ?? null,
@@ -14347,29 +14363,53 @@ ${hint}` : ''}` };
     runnerSeenAt: runsHere || runner === me ? null : (devices[runner]?.syncedAt ?? null),
     staleAfterMs,
     defHash: definitionHash(job.state),
+    /* 不在本机跑的：按接管之前的状态现在是不是已经到点、错过了几次 —— 接管确认框据此说明「接管后会立刻补跑一次」 */
+    catchUp: runsHere ? null : (() => { const m = missedRuns(job.state, Date.now()); return m.missed > 0 ? m : null; })(),
     };
   }
 
   /**
    * **接管到本机**：界面先弹窗把 prompt / checkCommand / 目标 / 周期**全文**给人看，确认了才调这个。
    * `defHash` = 弹窗里给人看的那份定义的摘要 —— 期间被同步改过就拒（人确认的不是现在这份）。
-   * runner 改成本机、runnerChangedAt = takenOverAt = now，定义记成本机确认过；第一次运行从现在算（`timingState`），不补跑。
-   * 原 runner 那台下次拉到后停掉自己的定时器（只停，不删文件）。
+   * runner 改成本机、runnerChangedAt = takenOverAt = now，定义记成本机确认过。
+   * `catchUp`（确认框里默认勾上的「立刻补跑一次」）：按接管之前的状态已经到点的，马上补跑**一次**，之后从这次往后排；
+   * 没勾 / 还没到点 → 照常（没勾的从接管时刻算）。原 runner 那台下次拉到后停掉自己的定时器（只停，不删文件）。
    */
-  ipcMain.handle('schedule:take-over', (_event, id: string, defHash: string) => {
+  ipcMain.handle('schedule:take-over', (_event, id: string, defHash: string, catchUp?: boolean) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
     if (!job) return { ok: false, error: tr('This scheduled task was not found') };
     { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:take-over'); if (advRefused) return { ok: false, error: advRefused }; }
     if (definitionHash(job.state) !== defHash) return { ok: false, error: tr('This scheduled task changed after it was shown. Check it again before taking it over.') };
     const me = scheduleMachine();
     const from = job.state.runner ?? '?';
-    const state = takeOver(job.state, me, Date.now());
+    const state = takeOver(job.state, me, Date.now(), { catchUp: catchUp === true });
     scheduleStore.approveSchedule(id, definitionHash(state), os.homedir());
     scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
     scheduleSkipLogged.delete(id);
-    logger.info('schedule', `takeover id=${id} session=${state.sessionId}: 接管到本机（原来在 ${job.state.runnerName || from} 上），第一次运行从现在算 runner=${me.id} from=${from}`);
+    const when = state.catchUpPending ? `已错过 ${state.catchUpPending} 次，马上补跑一次`
+      : state.catchUpDeclined ? (state.spec.kind === 'once' ? '已过点、没选补跑：这次一次性任务不跑了' : '已到点、没选补跑：第一次运行从现在算')
+      : '还没到点，按原定的下一次';
+    logger.info('schedule', `takeover id=${id} session=${state.sessionId}: 接管到本机（原来在 ${job.state.runnerName || from} 上），${when} runner=${me.id} from=${from}`);
     mainWindow?.webContents.send('schedule:changed', { id, state });
     scheduleSchedulePush();
+    if (state.catchUpPending) runDueSchedulesNow('接管后补跑');
+    return { ok: true };
+  });
+
+  /**
+   * 「▶ 立即运行一次」（执行者本机的卡片上）：算一次运行、照常记账，受次数上限 / 过期 / 暂停约束；有 checkCommand 的照常先跑检查。
+   * 之后的下一次从这次运行往后算。不在本机跑的不行（只有执行者跑）。
+   */
+  ipcMain.handle('schedule:run-now', (_event, id: string) => {
+    const job = scheduleStore.readSchedule(id, os.homedir());
+    if (!job) return { ok: false, error: tr('This scheduled task was not found') };
+    { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:run-now'); if (advRefused) return { ok: false, error: advRefused }; }
+    if (!scheduleRunsHere(job)) return { ok: false, error: tr('This scheduled task runs on another computer. Take it over first.') };
+    if (job.state.paused) return { ok: false, error: tr('This scheduled task is paused. Resume it first.') };
+    if (scheduleTerminal(job.state, Date.now())) return { ok: false, error: tr('This scheduled task has already ended') };
+    if (schedulesInFlight.has(id)) return { ok: false, error: tr('This scheduled task is already running') };
+    logger.info('schedule', `run-now id=${id} session=${job.state.sessionId}: 用户点了立即运行一次 runner=${job.state.runner ?? '?'}`);
+    void runScheduledJob(job, { manual: true });
     return { ok: true };
   });
 

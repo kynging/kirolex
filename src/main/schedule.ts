@@ -111,8 +111,13 @@ export interface ScheduleState {
   runnerName?: string;
   /** runner 最后一次改的时刻（建任务 / 接管）—— 两台同时接管时后者胜。 */
   runnerChangedAt?: number;
-  /** 接管的时刻：接管后的第一次运行从这一刻算，不补跑错过的（见 `timingState`）。没接管过 = 没有。 */
+  /** 接管的时刻（合并时分辨旧执行者交接之后写的状态）。接管时取消了补跑的，第一次从这一刻算（见 `timingState`）。没接管过 = 没有。 */
   takenOverAt?: number | null;
+  /** 接管时已经到点、用户选了补跑：错过了几次（只补 1 次）。有它时锚点仍按原来的上次运行算，调度器下一跳就跑；跑完锚点 = 这次运行。 */
+  catchUpPending?: number | null;
+  /** 接管时已经到点、用户**取消了**「立刻补跑一次」：循环任务的第一次从接管那一刻算，一次性任务那一次不跑了（见 `timingState`）。
+   *  接管时还没到点的不记它 —— 按原定的下一次。 */
+  catchUpDeclined?: boolean | null;
   /** 运行状态（runs / lastRunAt / lastError / 检查结果 / terminal）最后一次是哪台、什么时候写的。合并时只认 runner 写的。 */
   statusBy?: string;
   statusAt?: number;

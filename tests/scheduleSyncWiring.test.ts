@@ -45,7 +45,7 @@ describe('scheduler: only the runner runs it', () => {
     assert.ok(check > 0 && check < body.indexOf('takeOver(job.state'));
     assert.match(body, /scheduleStore\.approveSchedule\(id, definitionHash\(state\)/);
     assert.match(body, /logger\.info\('schedule', `takeover id=\$\{id\}[^`]*runner=/);
-    assert.match(PRELOAD, /scheduleTakeOver: \(id: string, defHash: string\) => ipcRenderer\.invoke\('schedule:take-over', id, defHash\)/);
+    assert.match(PRELOAD, /scheduleTakeOver: \(id: string, defHash: string, catchUp\?: boolean\) => ipcRenderer\.invoke\('schedule:take-over', id, defHash, catchUp\)/);
   });
 
   test('a queued wake is re-checked against the runner right before it is sent (dispatcher + deliver)', () => {
@@ -120,7 +120,7 @@ describe('s3: schedules are uploaded, pulled and restored', () => {
 
 describe('banner on a computer that does not run the job', () => {
   test('a take-over button that asks first, showing the full task, then calls onTakeOverSchedule', () => {
-    const at = CHAT.indexOf('className="schedule-banner-takeover"');
+    const at = CHAT.indexOf('className={`schedule-banner-takeover');
     assert.ok(at > 0, 'no take-over button');
     const btn = CHAT.slice(at, CHAT.indexOf('</button>', at));
     const ask = btn.indexOf('setConfirm(');
@@ -149,7 +149,7 @@ describe('banner on a computer that does not run the job', () => {
   test('summary: where it runs, and the offline hint after the stale window', () => {
     const now = 1_700_000_000_000 + 30 * 60_000;
     const fresh = sessionScheduleSummary([view()], now, 'en')!;
-    assert.deepEqual(fresh.elsewhere, { name: 'desk-b', needsConfirm: false, offlineHours: null, lastCheck: null });
+    assert.deepEqual(fresh.elsewhere, { name: 'desk-b', needsConfirm: false, offlineHours: null, lastCheck: null, overdue: null });
     assert.match(fresh.text, /Ran 3\/10/);
     assert.match(fresh.text, /Last run/);
     const later = sessionScheduleSummary([view()], 1_700_000_000_000 + 5 * 3600_000, 'en')!;

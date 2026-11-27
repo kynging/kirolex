@@ -131,10 +131,11 @@ declare global {
       onLoopChanged?: (cb: (payload: { sessionId: string; run: any | null }) => void) => () => void;
       /** SCHEDULED TASKS. The ticker is in main, so a job fires with no window open. */
       scheduleCreate?: (sessionId: string, spec: any) => Promise<{ ok: boolean; id?: string; error?: string; nextRunAt?: number | null; describe?: string }>;
-      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null; runsHere?: boolean; endedText?: string | null; lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null; runnerName?: string | null; needsConfirm?: boolean; runnerSeenAt?: number | null; staleAfterMs?: number; defHash?: string }>>;
+      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null; catchUp?: { missed: number; lastRunAt: number | null; firstMissedAt: number | null } | null; runsHere?: boolean; endedText?: string | null; lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null; runnerName?: string | null; needsConfirm?: boolean; runnerSeenAt?: number | null; staleAfterMs?: number; defHash?: string }>>;
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
-      scheduleTakeOver?: (id: string, defHash: string) => Promise<{ ok: boolean; error?: string }>;
+      scheduleTakeOver?: (id: string, defHash: string, catchUp?: boolean) => Promise<{ ok: boolean; error?: string }>;
+      scheduleRunNow?: (id: string) => Promise<{ ok: boolean; error?: string }>;
       scheduleSetExpiry?: (id: string, change: { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' }) => Promise<{ ok: boolean; error?: string; expiresAt?: number | null }>;
       onScheduleChanged?: (cb: (payload: any) => void) => () => void;
       /** 模型起的后台命令 / 监视（进程在 main 里）。 */
@@ -1140,6 +1141,7 @@ const App: React.FC = () => {
     cancelSchedule,
     setScheduleExpiry,
     takeOverSchedule,
+    runScheduleNow,
     bgJobs,
     stopBgJob,
     requestStopBgJob,
@@ -4633,7 +4635,8 @@ const App: React.FC = () => {
         onPauseSchedule={(id, paused) => void pauseSchedule(id, paused)}
         onCancelSchedule={(id) => void cancelSchedule(id)}
         onSetScheduleExpiry={(id, change) => setScheduleExpiry(id, change)}
-        onTakeOverSchedule={(id, defHash) => takeOverSchedule(id, defHash)}
+        onTakeOverSchedule={(id, defHash, catchUp) => takeOverSchedule(id, defHash, catchUp)}
+        onRunScheduleNow={(id) => runScheduleNow(id)}
         bgJobs={bgJobsFor(sid)}
         replyWaits={replyWaitsFor(sid)}
         onStopReplyWait={(id) => { void window.kiroApi.replyWatchCancel?.(id); }}

@@ -4848,9 +4848,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   }, []);
 
   /** 「接管到本机」：确认弹窗之后才调；main 核对定义摘要（弹窗里给人看的那份）再改执行者。错误交回横幅就地显示。 */
-  const takeOverSchedule = useCallback(async (id: string, defHash: string): Promise<{ ok: boolean; error?: string }> => {
+  const takeOverSchedule = useCallback(async (id: string, defHash: string, catchUp: boolean): Promise<{ ok: boolean; error?: string }> => {
     if (!id) return { ok: false };
-    try { return (await window.kiroApi.scheduleTakeOver?.(id, defHash)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+    try { return (await window.kiroApi.scheduleTakeOver?.(id, defHash, catchUp)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+  }, []);
+
+  /** 「▶ 立即运行一次」：交给 main（它判次数上限 / 过期 / 暂停、记账、照常先跑检查命令）；错误交回横幅就地显示。 */
+  const runScheduleNow = useCallback(async (id: string): Promise<{ ok: boolean; error?: string }> => {
+    if (!id) return { ok: false };
+    try { return (await window.kiroApi.scheduleRunNow?.(id)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
   }, []);
 
   const cancelSchedule = useCallback(async (id: string) => {
@@ -6261,6 +6267,7 @@ ${text}`,
     cancelSchedule,
     setScheduleExpiry,
     takeOverSchedule,
+    runScheduleNow,
     bgJobs,
     stopBgJob,
     requestStopBgJob,

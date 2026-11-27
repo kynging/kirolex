@@ -60,7 +60,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
 // imports the same module rather than keeping a second copy of the rules.
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
-import { takeOverDetails, type ScheduleSummary } from '../scheduleView';
+import { catchUpNotice, takeOverDetails, type ScheduleSummary } from '../scheduleView';
 import { ScheduleExpiryPopover, type ScheduleExpiryChange } from './ScheduleExpiryPopover';
 import { bgElapsedText, bgEndedText, bgRerunDetails, bgRunnerLost, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
@@ -4245,7 +4245,9 @@ interface ChatAreaProps {
   /** 聊天顶部那条定时任务上的「⏳ 延长…」弹层：延长多久 / 到期时间 / 不过期由用户定（只有用户能设成不过期）。 */
   onSetScheduleExpiry?: (id: string, change: ScheduleExpiryChange) => Promise<{ ok: boolean; error?: string }>;
   /** 「接管到本机」（任务在别的电脑上跑时才有）：先弹确认（prompt / checkCommand / 目标 / 周期全文），确认了才调；`defHash` 交回 main 核对。 */
-  onTakeOverSchedule?: (id: string, defHash: string) => Promise<{ ok: boolean; error?: string }>;
+  onTakeOverSchedule?: (id: string, defHash: string, catchUp: boolean) => Promise<{ ok: boolean; error?: string }>;
+  /** 「▶ 立即运行一次」（本机是执行者时）：算一次运行、照常记账；被次数上限 / 过期 / 暂停挡住时把原因交回来就地显示。 */
+  onRunScheduleNow?: (id: string) => Promise<{ ok: boolean; error?: string }>;
   /** Stop whatever automation currently owns this session. */
   onStopLoop: () => void;
   /** Split-pane monitor mode: transcript + live indicators + permission bar,
@@ -4380,6 +4382,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onCancelSchedule,
   onSetScheduleExpiry,
   onTakeOverSchedule,
+  onRunScheduleNow,
   onStopLoop,
   readOnly = false,
   paneFocused = true,
@@ -5848,13 +5851,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           {/* 不在本机跑（跨电脑同步）：标出在哪台上跑；那台很久没同步了就提示可以接管。暂停 / 删除照样能点（会同步过去） */}
           {scheduleSummary.elsewhere && (
             <span
-              className={`schedule-banner-runner${scheduleSummary.elsewhere.offlineHours !== null ? ' offline' : ''}`}
+              className={`schedule-banner-runner${scheduleSummary.elsewhere.offlineHours !== null || scheduleSummary.elsewhere.overdue ? ' offline' : ''}`}
               title={scheduleSummary.elsewhere.needsConfirm
                 ? t('This task came back from the cloud and has not been confirmed on this computer, so it does not run here until you take it over.')
                 : t('Only one computer runs a scheduled task. This computer shows it but does not run it.')}
             >
               {scheduleSummary.elsewhere.needsConfirm
                 ? t('🖥️ Not confirmed on this computer')
+                : scheduleSummary.elsewhere.overdue
+                  ? scheduleSummary.elsewhere.overdue
                 : scheduleSummary.elsewhere.offlineHours !== null
                   ? t('🖥️ {machine} has not synced for {n} h and may be off. You can take it over to this computer.', { machine: scheduleSummary.elsewhere.name, n: scheduleSummary.elsewhere.offlineHours })
                   : scheduleSummary.ended ? t('🖥️ Ran on {machine}', { machine: scheduleSummary.elsewhere.name }) : t('🖥️ Runs on {machine}', { machine: scheduleSummary.elsewhere.name })}
@@ -5869,19 +5874,23 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               {/* 接管到本机：先弹窗把要在本机跑的东西全文给人看（checkCommand 是本机 shell），确认了才改执行者 */}
               {scheduleSummary.elsewhere && !scheduleSummary.ended && onTakeOverSchedule && (
                 <button
-                  className="schedule-banner-takeover"
+                  className={`schedule-banner-takeover${scheduleSummary.elsewhere.overdue ? ' urgent' : ''}`}
                   onClick={() => {
                     const job = scheduleSummary.next!;
                     const from = scheduleSummary.elsewhere!.needsConfirm ? null : scheduleSummary.elsewhere!.name;
+                    /* 按接管之前的状态已经到点了：说明错过几次、接管后立刻补跑一次（默认勾上，取消勾选 = 从现在算） */
+                    const missed = catchUpNotice(job, findLang);
                     setTakeOverError(null);
                     setConfirm({
                       title: t('Take over this scheduled task to this computer?'),
                       message: `${from
-                        ? t('From now on it runs on this computer; {machine} stops running it once it syncs. Missed runs are not made up: the next run is counted from now.', { machine: from })
-                        : t('From now on it runs on this computer. Missed runs are not made up: the next run is counted from now.')}\n\n${takeOverDetails(job, findLang)}`,
+                        ? t('From now on it runs on this computer; {machine} stops running it once it syncs.', { machine: from })
+                        : t('From now on it runs on this computer.')}${missed ? `\n\n${missed}` : ''}\n\n${takeOverDetails(job, findLang)}`,
                       confirmLabel: t('Take over and run here'),
-                      onConfirm: () => {
-                        void onTakeOverSchedule(job.id, job.defHash || '').then((r) => {
+                      ...(missed ? { checkbox: { label: t('Run once right away'), defaultChecked: true } } : {}),
+                      /* 没错过（没有复选框）就照常：到点了才跑 —— 确认那一刻刚好到点的也算 */
+                      onConfirm: (checked) => {
+                        void onTakeOverSchedule(job.id, job.defHash || '', missed ? checked : true).then((r) => {
                           if (!r.ok) setTakeOverError(r.error || t('Could not take over this scheduled task'));
                         });
                       },
@@ -5889,6 +5898,17 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   }}
                   title={t('Run this scheduled task on this computer instead (shows the full task first)')}
                 >{t('🖥️ Take over')}</button>
+              )}
+              {/* 本机就是执行者：「▶ 立即运行一次」—— 算一次运行、照常记账，受次数上限 / 过期 / 暂停约束（main 那边判） */}
+              {!scheduleSummary.elsewhere && !scheduleSummary.ended && !scheduleSummary.paused && onRunScheduleNow && (
+                <button
+                  className="schedule-banner-run-now"
+                  onClick={() => {
+                    setTakeOverError(null);
+                    void onRunScheduleNow(scheduleSummary.next!.id).then((r) => { if (!r.ok) setTakeOverError(r.error || t('Could not run this scheduled task')); });
+                  }}
+                  title={t('Run this scheduled task once now (counts as a run; the next one is scheduled from it)')}
+                >{t('▶ Run once now')}</button>
               )}
               {/* Pause is REVERSIBLE, so one click. It is also the honest way to stop a job you
                   might want back — cancelling loses the prompt and the remaining budget. */}
