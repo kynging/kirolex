@@ -1132,6 +1132,7 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
        侧栏显示得好好的,磁盘记录里却还是 New Chat,重启后就认不出这条会话。 */
     const applyTitle = (title: string) => {
       setSessions((prev) => prev.map((s) => (s.id === sid ? { ...s, title } : s)));
+      /* 自动起的标题：不记「手动改名」的时刻（跨电脑合并时不能盖掉另一台手动改的名字） */
       void window.kiroApi.renameSessionOnDisk?.(sid, title);
     };
     const fallBackToTruncation = () => {
@@ -2060,6 +2061,15 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
       messagesCacheRef.current.delete(d.sessionId);
       removeAttached(d.sessionId);
       if (currentSessionRef.current === d.sessionId) void switchSessionRef.current?.(d.sessionId);
+    });
+    return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
+  }, []);
+
+  /* 同步时并进了另一台电脑改的名字（主进程只合并了记录）—— 侧栏标题马上跟着改 */
+  useEffect(() => {
+    const off = window.kiroApi?.onSessionTitleChanged?.((d) => {
+      if (!d?.sessionId || typeof d.title !== 'string' || !d.title) return;
+      setSessions((prev) => prev.map((s) => (s.id === d.sessionId && s.title !== d.title ? { ...s, title: d.title } : s)));
     });
     return () => { try { off?.(); } catch { /* 卸载时 preload 可能已经没了 */ } };
   }, []);
@@ -5488,6 +5498,8 @@ ${text}`,
      * 而主进程那边有日志。
      */
     void window.kiroApi.renameSessionOnDisk?.(sessionId, title);
+    /* 手动改名：记下时刻（跨电脑合并时标题按最后一次改名，transcriptMerge.ts）；开着同步的主进程稍后补一轮同步 */
+    void window.kiroApi.markSessionTitleChanged?.(sessionId);
   }, []);
 
   const reorderSessions = useCallback((newSessions: Session[]) => {

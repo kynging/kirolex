@@ -184,9 +184,56 @@ export interface BucketMergeIO {
   apply(): number;
   /** 这条会话已经删了（删除集合 / 墓碑）—— 删了的不拉文件、不改写，免得把 sessions/<id>/ 重新建出来。不给 = 不查 */
   isDeleted?(): boolean;
+  /**
+   * 对话和文件都没有新的时：桶里的 record.json 和本机的合并（mergeRecords）之后，「会同步的字段」里变了哪些（`recordSyncChanges`）。
+   * 空 = 记录也一样（真正的空合并）。不给 = 不看记录。
+   */
+  recordChanges?(): string[];
+  /** 只把合并后的记录写回本机（不断开执行器、不碰 transcript），同步完成 */
+  applyRecord?(): void;
 }
 
-export type BucketMergeResult = { added: number; pulledFiles: number; noop?: boolean; deferred?: boolean; gone?: boolean };
+export type BucketMergeResult = {
+  added: number; pulledFiles: number; noop?: boolean; deferred?: boolean; gone?: boolean;
+  /** 只合并了记录（对话和文件都没新的）：变了哪些字段 */
+  recordOnly?: string[];
+  /** 完整合并（有新消息 / 文件）时记录上一起变了的字段（例如改名和新消息一起拉回）—— 调用方据此把标题等推给界面 */
+  recordChanges?: string[];
+};
+
+/**
+ * 合并记录时**不算差别**的字段：每台电脑自己的设置（运行位置、agent、本机目录 —— mergeRecords 本来就保留本机的）、
+ * 只对这台后端进程成立的记账，以及合并本身会改的 updatedAt / executorState。
+ */
+export const RECORD_LOCAL_KEYS = ['updatedAt', 'executorState', 'cliSessionId', 'cliSessionOwner', 'localDir', 'contextEstablishedFor', 'contextEstablishedPid', 'lastExecutorError'];
+export const PROFILE_LOCAL_KEYS = ['remote', 'kiroAgent'];
+
+/**
+ * **合并后的记录和本机的比，「会同步的字段」里变了哪些**（标题、位置、tags、filesDirs、同步开关…）——
+ * 「在另一台电脑上重命名会话，本机不会跟着改名」：原来空合并只看消息和文件，别的电脑只改了记录时本机记下「看过了」，那份改动永远并不进来。
+ * profile 里的按 `profile.<名字>` 报。每台电脑自己的设置不算（`RECORD_LOCAL_KEYS` / `PROFILE_LOCAL_KEYS`）。
+ */
+export function recordSyncChanges(local: any, merged: any): string[] {
+  if (!merged) return [];
+  const a = local || {};
+  const same = (x: unknown, y: unknown): boolean => JSON.stringify(x ?? null) === JSON.stringify(y ?? null);
+  const out: string[] = [];
+  for (const k of [...new Set([...Object.keys(a), ...Object.keys(merged)])].sort()) {
+    if (RECORD_LOCAL_KEYS.includes(k)) continue;
+    if (k === 'profile') {
+      const pa = a.profile || {};
+      const pb = merged.profile || {};
+      for (const pk of [...new Set([...Object.keys(pa), ...Object.keys(pb)])].sort()) {
+        /* permissionMode 没写 = 先问（和 AcpClient 一样）：mergeRecords 把「没写」规整成 'ask' 不算改动 */
+        const norm = (v: unknown): unknown => (pk === 'permissionMode' ? (v ?? 'ask') : v);
+        if (!PROFILE_LOCAL_KEYS.includes(pk) && !same(norm(pa[pk]), norm(pb[pk]))) out.push(`profile.${pk}`);
+      }
+      continue;
+    }
+    if (!same(a[k], merged[k])) out.push(k);
+  }
+  return out;
+}
 
 /**
  * **合并一条会话的顺序**：下载 → 空合并就什么都不动（`noop`）→ 忙了就推迟（`deferred`）→ 拉文件 → **再问一次忙不忙** →
@@ -202,7 +249,18 @@ export async function runBucketMerge(io: BucketMergeIO): Promise<BucketMergeResu
   if (gone()) return { added: 0, pulledFiles: 0, gone: true };
   const got = await io.fetch();
   if (gone()) return { added: 0, pulledFiles: 0, gone: true };
-  if (!got.missingFiles && (got.transcript === null || io.countNew(got.transcript) === 0)) return { added: 0, pulledFiles: 0, noop: true };
+  if (!got.missingFiles && (got.transcript === null || io.countNew(got.transcript) === 0)) {
+    /*
+      **对话和文件都没新的，记录可能有**（别的电脑只改了名 / 挪了项目 / 改了标签）：记录有差别就只写回记录 ——
+      不断开执行器、不碰 transcript。记录也一样才是真正的空合并。
+    */
+    const changes = io.recordChanges?.() ?? [];
+    if (!changes.length || !io.applyRecord) return { added: 0, pulledFiles: 0, noop: true };
+    if (io.isBusy()) return { added: 0, pulledFiles: 0, deferred: true };
+    if (gone()) return { added: 0, pulledFiles: 0, gone: true };
+    io.applyRecord();
+    return { added: 0, pulledFiles: 0, recordOnly: changes };
+  }
   if (io.isBusy()) return { added: 0, pulledFiles: 0, deferred: true };
   const pulledFiles = got.missingFiles ? await io.pullFiles() : 0;
   if (gone()) return { added: 0, pulledFiles, gone: true };

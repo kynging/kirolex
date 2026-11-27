@@ -518,6 +518,14 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /** 把会话的角色写进记录（flow 主会话的删除保护靠它，必须活过重启） */
   /** 会话标题落盘 —— 不落盘的话一刷新就退回 `New Chat`（见 `acp:rename-session`） */
   renameSessionOnDisk: (sessionId: string, title: string) => ipcRenderer.invoke('acp:rename-session', sessionId, title),
+  /* 手动改名之后发：记下改名时刻（跨电脑合并时标题按它谁新用谁）；自动起的标题不发 */
+  markSessionTitleChanged: (sessionId: string) => ipcRenderer.invoke('acp:mark-title-changed', sessionId),
+  /* 同步时并进了另一台电脑改的名字（s3Pull.ts 的只合并记录）：侧栏标题跟着改 */
+  onSessionTitleChanged: (cb: (d: { sessionId: string; title: string }) => void) => {
+    const h = (_e: any, d: any) => cb(d);
+    ipcRenderer.on('session:title-changed', h);
+    return () => ipcRenderer.removeListener('session:title-changed', h);
+  },
   markSessionPurpose: (sessionId: string, purpose: string, flow?: string) =>
     ipcRenderer.invoke('acp:mark-session-purpose', sessionId, purpose, flow),
   /** 把一个 flow 从这个 project 移出（配置动作，历史不动） */

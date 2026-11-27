@@ -58,7 +58,7 @@ import {
   type OffloadFacts,
 } from './sessionOffload.ts';
 import {
-  planBucketMerges, noteBucketSeen, readBucketSeen, writeBucketSeen, clearRemotePlaceholders, isShared, crossDeviceToFollow, placeholderPlacement, withCrossDeviceOn, runBucketMerge, BUCKET_SEEN_FILE,
+  planBucketMerges, noteBucketSeen, readBucketSeen, writeBucketSeen, clearRemotePlaceholders, isShared, crossDeviceToFollow, placeholderPlacement, withCrossDeviceOn, runBucketMerge, recordSyncChanges, BUCKET_SEEN_FILE,
   type BucketMergeResult,
 } from './s3Pull.ts';
 import {
@@ -7652,6 +7652,40 @@ function containedPath(base: string, rel: string): string | null {
  * **等网络期间变忙了就推迟**（`deferred: true`，顺序在 s3Pull.ts 的 `runBucketMerge`）：调用方进来前查过一次忙，
  * 但下载 / 列文件 / 拉文件都要等，这期间可能开始了新一轮 —— 断开执行器、改写之前紧挨着再查一次，忙了就不动，下一轮再合。
  */
+/**
+ * **跨电脑同步的会话改了只在记录里的东西（改名）→ 稍后补一轮同步**，不等下一条消息 / 下一次定时。
+ * 去抖 15 秒（连着改几次只跑一轮）；S3 备份没开就什么都不做；正在同步的那一轮会被 runS3Sync 自己拒掉，过 15 秒再试一次。
+ */
+let crossDeviceSyncTimer: ReturnType<typeof setTimeout> | null = null;
+function requestCrossDeviceSync(why: string, attempt = 0): void {
+  if (!loadSyncConfig().enabled) return;
+  if (crossDeviceSyncTimer) clearTimeout(crossDeviceSyncTimer);
+  crossDeviceSyncTimer = setTimeout(() => {
+    crossDeviceSyncTimer = null;
+    void runS3Sync(why).then((r) => {
+      if (!r.ok && r.error === tr('The previous sync is still running') && attempt < 3) requestCrossDeviceSync(why, attempt + 1);
+    }).catch(() => { /* runS3Sync 自己写日志 */ });
+  }, 15_000);
+}
+
+/**
+ * 只合并了记录之后推给界面：标题（侧栏马上变）、位置（项目 / 归档）、同步开关，以及引擎 / 模型这些（profile-sync）。
+ * `changes` 是 recordSyncChanges 报的字段名。
+ */
+function notifyRecordMerged(sessionId: string, changes: string[], opts?: { withMessages?: boolean }): void {
+  logger.info('s3', opts?.withMessages
+    ? `${sessionId}：记录也一起合并了（${changes.join(' / ')}）`
+    : `${sessionId}：桶里那份只改了记录（${changes.join(' / ')}），已合并`);
+  const rec = store.readRecord(sessionId);
+  if (!rec || !mainWindow || mainWindow.isDestroyed()) return;
+  if (changes.includes('title')) mainWindow.webContents.send('session:title-changed', { sessionId, title: rec.title || 'New Chat' });
+  if (changes.includes('profile.projectId') || changes.includes('archived') || changes.includes('profile.unassigned')) {
+    mainWindow.webContents.send('session:placement-changed', { sessionId, projectId: projectOf(rec) || null, archived: !!rec.archived });
+  }
+  if (changes.includes('crossDevice')) mainWindow.webContents.send('session:cross-device-changed', { sessionId, crossDevice: isShared(rec) });
+  if (!opts?.withMessages && changes.some((c) => c.startsWith('profile.'))) pushProfileSync([sessionId], 's3-merge-record');   // 完整合并那条路已经推过
+}
+
 async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, sessionId: string, round?: SyncRound): Promise<BucketMergeResult> {
   /* 删掉的会话不合并（等网络期间删的，runBucketMerge 每次等完再问 —— isDeleted） */
   if (sessionDeleted(sessionId)) return { added: 0, pulledFiles: 0, gone: true };
@@ -7666,6 +7700,17 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
   let rt: Buffer | null = null;
   let rr: Buffer | null = null;
   const toPull: Array<{ key: string; abs: string }> = [];
+  /** 完整合并（apply）时记录上变了哪些字段 —— 改名和新消息一起拉回时，标题也要推给侧栏 */
+  let fullRecordChanges: string[] = [];
+  /** 桶里的 record.json 和本机的合并结果（读不懂任何一边 = null）—— 只改了记录的那种合并用（recordChanges / applyRecord） */
+  const mergedRecord = (): { mine: any; theirs: any; merged: any } | null => {
+    if (!rr) return null;
+    let mine: any; let theirs: any;
+    try { mine = JSON.parse(fs.readFileSync(rAbs, 'utf-8')); } catch { mine = undefined; }
+    try { theirs = JSON.parse((rr as Buffer).toString('utf-8')); } catch { theirs = undefined; }
+    if (!mine || typeof mine !== 'object' || !theirs || typeof theirs !== 'object') return null;
+    return { mine, theirs, merged: guardMergedPlacement(mergeRecords(mine, theirs), mine, store.isAdvancedOnlyProjectName) };
+  };
   const r = await runBucketMerge({
     fetch: async () => {
       [rt, rr] = await Promise.all([getObjectIfExists(creds, tKey), getObjectIfExists(creds, rKey)]);
@@ -7725,6 +7770,7 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
         try { theirs = JSON.parse(rr.toString('utf-8')); } catch { theirs = undefined; }
         /* 云上那份的位置要是 KiroLex Advanced 专属的 flow 项目，保留本机的位置（followBucketPlacements 同一条规则） */
         const merged = guardMergedPlacement(mergeRecords(mine, theirs), mine, store.isAdvancedOnlyProjectName);
+        fullRecordChanges = recordSyncChanges(mine, merged);
         /* 合并之后这一份就是"最新"的：updatedAt 取两边的较大者，不然下一轮又被判成冲突 */
         merged.updatedAt = Math.max(Number(mine?.updatedAt) || 0, Number(theirs?.updatedAt) || 0, Date.now());
         store.writeRecordKeepUpdatedAt({ ...merged, id: sessionId });   // 走写盘那道关（不进 advanced 专属项目），updatedAt 按上面算的
@@ -7732,7 +7778,22 @@ async function mergeBucketSession(creds: S3Creds, prefix: string | undefined, se
       try { refreshHistoryFile(sessionId); } catch { /* 下次打开时会重建 */ }
       return added;
     },
+    /* 对话和文件都没新的：记录在「会同步的字段」上有没有差别（别的电脑只改了名 / 位置 / 标签…；每台电脑自己的设置不算） */
+    recordChanges: () => { const m = mergedRecord(); return m ? recordSyncChanges(m.mine, m.merged) : []; },
+    /*
+      **只写回记录**：不断开执行器、不碰 transcript、不留备份目录。executorState 保留本机的（执行器还连着就还是连着）；
+      updatedAt 取两边较大的（不取现在 —— 这不是本机的一次新改动）。紧挨着上面那次「忙不忙」，中间不等任何东西。
+    */
+    applyRecord: () => {
+      const m = mergedRecord();
+      if (!m || !recordSyncChanges(m.mine, m.merged).length) return;
+      const next = { ...m.merged, id: sessionId, updatedAt: Math.max(Number(m.mine.updatedAt) || 0, Number(m.theirs.updatedAt) || 0) };
+      if (m.mine.executorState !== undefined) next.executorState = m.mine.executorState;
+      store.writeRecordKeepUpdatedAt(next);
+    },
   });
+  /* 完整合并成功（不是空合并 / 推迟 / 删了 / 只合了记录）：带上记录变了的字段 */
+  if (fullRecordChanges.length && !r.noop && !r.deferred && !r.gone && !r.recordOnly) return { ...r, recordChanges: fullRecordChanges };
   return r;
 }
 
@@ -8821,6 +8882,8 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
       */
       const conflictIds = new Set<string>();
       const mergedIds: string[] = [];
+      /** 只合并了记录的（transcript 没变）：这一轮只重传 record.json */
+      const recordOnlyIds: string[] = [];
       for (const c of conflicts) {
         const live = sessionClients.get(c.id);
         if (live?.busy) { conflictIds.add(c.id); continue; }
@@ -8845,11 +8908,14 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
             logger.info('s3', `${c.id}：桶里那份（来自 ${c.from}，${seenAt} 上传）没有本机缺的消息或文件，本机不动、不重传；记下这份，下一轮不再合并`);
             continue;
           }
+          /* 别的电脑只改了记录（改名 / 位置 / 标签…）：只写回了记录（执行器没断开、transcript 没动），这一轮重传 record.json */
+          if (r.recordOnly) { recordOnlyIds.push(c.id); notifyRecordMerged(c.id, r.recordOnly); continue; }
           mergedIds.push(c.id);
           logger.info('s3', `自动合并 ${c.id}（桶里那份来自 ${c.from}，${seenAt} 上传）：并进 ${r.added} 条消息${r.pulledFiles ? `、拉下 ${r.pulledFiles} 个文件` : ''}`);
           mainWindow?.webContents.send('session:history-changed', { sessionId: c.id });
-          /* 合并改了记录：以合并后的记录为准推给界面 */
+          /* 合并改了记录：以合并后的记录为准推给界面；改名 / 位置 / 同步开关一起拉回的也推（后台会话的侧栏标题跟着变） */
           pushProfileSync([c.id], 's3-merge');
+          if (r.recordChanges?.length) notifyRecordMerged(c.id, r.recordChanges, { withMessages: true });
         } catch (err: any) {
           if (err instanceof RoundAbandoned) throw err;
           conflictIds.add(c.id);
@@ -8867,6 +8933,15 @@ async function runS3Sync(reason: string): Promise<{ ok: boolean; uploaded: numbe
           }
         }
         const reread = new Map(mergedIds.map((id) => [id, store.readRecord(id)]));
+        freshEntries = catalogEntriesFor(sessions.map((r) => reread.get(r.id) || r), thisMachine);
+      }
+      if (recordOnlyIds.length) {
+        /* 只合并了记录的：只重传 record.json，catalog 条目按合并后的记录来 */
+        for (const id of recordOnlyIds) {
+          const rel = path.join('sessions', id, 'record.json');
+          if (!plan.upload.includes(rel) && fs.existsSync(path.join(KIROLEX_HOME, rel))) plan.upload.push(rel);
+        }
+        const reread = new Map([...mergedIds, ...recordOnlyIds].map((id) => [id, store.readRecord(id)]));
         freshEntries = catalogEntriesFor(sessions.map((r) => reread.get(r.id) || r), thisMachine);
       }
       if (conflictIds.size) {
@@ -20450,6 +20525,19 @@ ${hint}` : ''}` };
     if (!next) return { ok: false, error: 'empty title' };
     const where = store.patchRecord(sessionId, { title: next } as any);
     logger.info('session', `renamed ${sessionId} -> ${JSON.stringify(next)} (${where})`);
+    return { ok: true, deferred: where === 'pending' };
+  });
+
+  /**
+   * **手动改名**（侧栏重命名，紧跟在 acp:rename-session 之后发）：记下改名的时刻 titleChangedAt —— 跨电脑合并时标题按它谁新用谁
+   * （transcriptMerge.ts）。自动起的标题不发这个：它不能盖掉另一台上手动改的名字。
+   * 开了「在其他电脑上同步」的：不等下一条消息，稍后补一轮同步把 record.json 传上去。
+   */
+  ipcMain.handle('acp:mark-title-changed', async (_event, sessionId: string) => {
+    const id = String(sessionId || '');
+    if (!id || refuseAdvancedOnly(id, 'rename')) return { ok: false };
+    const where = store.patchRecord(id, { titleChangedAt: Date.now() } as any);
+    if (where === 'written' && store.readRecord(id)?.crossDevice === true) requestCrossDeviceSync(`改名 ${id}`);
     return { ok: true, deferred: where === 'pending' };
   });
 

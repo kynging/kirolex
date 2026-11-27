@@ -211,6 +211,8 @@ declare global {
       markSessionPurpose?: (sessionId: string, purpose: string, flow?: string) => Promise<{ ok: boolean; error?: string }>;
       /** 会话标题落盘 —— 不落盘的话一刷新就退回 `New Chat`（flow 起的会话全靠现取的名字） */
       renameSessionOnDisk?: (sessionId: string, title: string) => Promise<{ ok: boolean; deferred?: boolean; error?: string }>;
+      markSessionTitleChanged?: (sessionId: string) => Promise<{ ok: boolean; deferred?: boolean }>;
+      onSessionTitleChanged?: (cb: (d: { sessionId: string; title: string }) => void) => () => void;
       openRunWindow?: (project: string, id: string) => Promise<{ ok: boolean; focused?: boolean }>;
       onRunChanged?: (handler: (payload: { project: string; id: string }) => void) => (() => void);
       focusSession?: (sessionId: string) => Promise<{ ok: boolean; error?: string }>;

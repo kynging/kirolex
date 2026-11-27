@@ -174,6 +174,19 @@ export function mergeRecords(local: any, remote: any): any {
     out.placementChangedAt = src.placementChangedAt;
   }
 
+  /*
+    **标题按「最后一次改名」**（`titleChangedAt`，手动重命名时写；自动起的标题不写）——「在另一台电脑上重命名会话，本机不会跟着改名」。
+    不跟整份 updatedAt：A 改名之后 B 只是又聊了一句，按 updatedAt 就是 B 的旧标题盖回来。两边都没有这个时间 → 保持按 updatedAt；
+    只有一边有 → 有的那边（另一边从没手动改过名，自动起的名字不能盖掉手动改的）；一样新 → 本机的。
+  */
+  const titledA = Number(local.titleChangedAt) || 0;
+  const titledB = Number(remote.titleChangedAt) || 0;
+  if (titledA || titledB) {
+    const src = titledA >= titledB ? local : remote;
+    if (typeof src.title === 'string') out.title = src.title;
+    out.titleChangedAt = src.titleChangedAt;
+  }
+
   /* 「在其他电脑上同步」开关（s3Pull.ts）同样按它自己的改动时刻谁新用谁，不跟着 updatedAt 走；一样新时开着的赢 */
   const sharedA = Number(local.crossDeviceChangedAt) || 0;
   const sharedB = Number(remote.crossDeviceChangedAt) || 0;

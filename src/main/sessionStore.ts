@@ -152,6 +152,10 @@ export interface SessionRecord {
   createdAt: number;
   updatedAt: number;
   title: string;
+  /**
+   * 用户**手动**改名的时刻（`acp:rename-session`；自动起的标题不写）—— 跨电脑合并时标题按它谁新用谁，不跟整份 updatedAt（transcriptMerge.ts）。
+   */
+  titleChangedAt?: number;
   profile: AgentProfile;
   /** The kiro-cli-assigned session id for this KiroLex session's executor.
    *  KiroLex owns `id` (dir key); this maps to the backend session for resume.
