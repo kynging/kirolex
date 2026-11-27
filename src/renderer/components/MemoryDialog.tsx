@@ -1,6 +1,7 @@
 import React, { useEffect, useState } from 'react';
 import { useT } from '../hooks/useLang';
 import type { Settings } from '../App';
+import { PROTECTED_MARKERS } from '../../main/largeMemory.ts';
 import { MEMORY_FULL_INTERVAL_MAX, MEMORY_FULL_INTERVAL_MIN, MEMORY_RULES_MAX_CHARS, normalizeMemoryFullInterval } from '../../main/injectionCadence.ts';
 
 interface MemoryDialogProps {
@@ -30,6 +31,11 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
   const [loading, setLoading] = useState(true);
   const [injection, setInjection] = useState<InjectionInfo>(null);
   const [saved, setSaved] = useState<Scope | null>(null);
+  /** 盘上的内容（读 / 存之后更新）：「立即整理」整理的是盘上那份，编辑框里有没存的改动就先不整理 */
+  const [disk, setDisk] = useState<Record<Scope, string>>({ global: '', project: '', session: '' });
+  /** 「立即整理」（大份记忆整理，主进程 compactLargeMemoryLayer）的进度 / 结果 */
+  const [compacting, setCompacting] = useState<Scope | null>(null);
+  const [compactMsg, setCompactMsg] = useState<{ scope: Scope; ok: boolean; text: string } | null>(null);
   const [snapshot, setSnapshot] = useState<{
     text: string; at: number | null; path: string | null;
     override?: boolean; overridePath?: string | null; sentText?: string;
@@ -50,6 +56,7 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
     window.kiroApi.readMemory(projectId, sessionId).then((m) => {
       if (!alive) return;
       setText({ global: m.global, project: m.project, session: m.session });
+      setDisk({ global: m.global, project: m.project, session: m.session });
       setPaths({ global: m.globalPath, project: m.projectPath, session: m.sessionPath });
       setInjection(m.injection ?? null);
       setLoading(false);
@@ -96,8 +103,49 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
 
   const save = async (scope: Scope) => {
     await window.kiroApi.writeMemory(scope, projectId, sessionId, text[scope]);
+    setDisk((prev) => ({ ...prev, [scope]: text[scope] }));
     setSaved(scope);
     setTimeout(() => setSaved((s) => (s === scope ? null : s)), 1500);
+  };
+
+  /**
+   * 「立即整理」：和自动整理同一套（先备份成 memory.md.bak-…、合并重复 / 删已完成的过程记录 / 多行压一行、
+   * 含「用户口径」等的行原样保留、少于 40% 或丢了二级标题就作废），只是不看 32 KB 门槛和一天一次。全局层不整理。
+   */
+  /** 没整理成的原因：主进程回的是状态 + 英文日志原因（compactLargeMemoryLayer / runLargeCompaction），这里按状态翻成界面文案 */
+  const compactFailText = (status: string | undefined, error: string | undefined): string => {
+    if (status === 'unchanged') return t('there was nothing to compact (the result would not be smaller)');
+    if (status === 'busy') return t('this memory is already being compacted');
+    if (status === 'rejected') return t('the result was thrown away because it would drop protected entries or a level-2 heading, or keep less than 40% of the original; the memory file is unchanged');
+    if (status === 'skipped') {
+      if (error === 'memory is empty') return t('the memory is empty');
+      if (error === 'backup failed') return t('the backup could not be written, so nothing was changed');
+      return t('the memory changed while compacting, so nothing was written');
+    }
+    if (status === 'refused' && /^no (session|project)/.test(String(error || ''))) return t('this layer has no memory file');
+    /* 没有状态的是主进程按界面语言给的错误（tr），原样显示 */
+    return error || t('unknown reason');
+  };
+
+  const compactNow = async (scope: 'project' | 'session') => {
+    if (text[scope] !== disk[scope]) { setCompactMsg({ scope, ok: false, text: t('Save your changes first; compaction works on the saved file.') }); return; }
+    /* 整理期间这一层的编辑框只读、保存禁用（见下面 textarea）；这是开始时的内容，结果回来时编辑框不再是它就不覆盖 */
+    const started = text[scope];
+    setCompacting(scope);
+    setCompactMsg(null);
+    try {
+      const r = await window.kiroApi.compactMemoryNow?.(scope, projectId, sessionId);
+      if (r?.ok) {
+        const m = await window.kiroApi.readMemory(projectId, sessionId);
+        setText((prev) => (prev[scope] === started ? { ...prev, [scope]: m[scope] } : prev));
+        setDisk((prev) => ({ ...prev, [scope]: m[scope] }));
+        setCompactMsg({ scope, ok: true, text: t('Compacted: {before} → {after} bytes, backup at {path}', { before: r.beforeBytes ?? 0, after: r.afterBytes ?? 0, path: r.backupPath ?? '' }) });
+      } else {
+        setCompactMsg({ scope, ok: false, text: t('Not compacted: {why}', { why: compactFailText(r?.status, r?.error) }) });
+      }
+    } finally {
+      setCompacting(null);
+    }
   };
 
   const tabs: { scope: Tab; label: string; enabled: boolean; hint: string }[] = [
@@ -238,11 +286,21 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
                 className="memory-textarea"
                 value={text[tab]}
                 onChange={(e) => setText((prev) => ({ ...prev, [tab]: e.target.value }))}
+                readOnly={compacting === tab}
                 spellCheck={false}
               />
               <div style={{ display: 'flex', alignItems: 'center', gap: 10, marginTop: 8 }}>
-                <button className="rename-popup-btn confirm" onClick={() => save(tab)}>{t('Save')}</button>
+                <button className="rename-popup-btn confirm" disabled={compacting === tab} onClick={() => save(tab)}>{t('Save')}</button>
                 {saved === tab && <span style={{ color: '#3fb950', fontSize: 12 }}>{`${t('Saved')} ✓`}</span>}
+                {(tab === 'project' || tab === 'session') && (
+                  <button
+                    className="rename-popup-btn"
+                    disabled={compacting !== null}
+                    onClick={() => { void compactNow(tab); }}
+                    title={t('Back up to memory.md.bak-…, then merge duplicates, drop entries marked merged / done / expired, and fold multi-line entries into one line. Lines with {markers} are kept as is; a result under 40% of the original or missing a level-2 heading is thrown away.', { markers: PROTECTED_MARKERS.join(' / ') })}
+                  >{compacting === tab ? t('Compacting memory…') : t('Compact now')}</button>
+                )}
+                {compactMsg?.scope === tab && <span style={{ color: compactMsg.ok ? '#3fb950' : 'var(--error)', fontSize: 12, overflowWrap: 'anywhere' }}>{compactMsg.text}</span>}
                 <span style={{ marginLeft: 'auto', fontSize: 11, color: 'var(--text-muted)' }}>{paths[tab]}</span>
               </div>
             </div>

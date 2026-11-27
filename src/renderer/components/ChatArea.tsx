@@ -67,6 +67,8 @@ import { bgElapsedText, bgEndedText, bgRerunDetails, bgRunnerLost, type BgJobRow
 import { decidePaste } from '../pasteDecision';
 import { EngineIcon, IconCopy, IconEdit, IconFork, IconPaperclip, IconQueue, IconSteer } from './Icons';
 import { ConfirmDialog, ConfirmRequest } from './ConfirmDialog';
+import { MemoryCompactActions } from './MemoryCompactActions';
+import { parseMemoryCompactGroup } from '../../main/memoryCompactNote.ts';
 import { PermissionBar } from './PermissionBar';
 import { extractChoiceChips, type ChoiceChip } from '../choiceChips.ts';
 import { QuestionCardView } from './QuestionCard';
@@ -6191,7 +6193,10 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
               count={group.count}
               after={isConnectFailureNotice(group.message)
                 ? <AdapterInstallAction sessionId={currentSessionId} message={group.message} remote={!!remoteHostLabel} />
-                : undefined}
+                : parseMemoryCompactGroup(group.message.noteGroup)
+                  /* 「已整理 <层> 记忆」：查看差异 / 撤销（MemoryCompactActions） */
+                  ? <MemoryCompactActions backupPath={parseMemoryCompactGroup(group.message.noteGroup)!} />
+                  : undefined}
             />
           ) : group.kind === 'user' ? (
             <UserGroupItem

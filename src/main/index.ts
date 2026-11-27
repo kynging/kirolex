@@ -112,7 +112,10 @@ import { adapterScheduleNote, callWakeTool, switchCarryOverText, type WakeHost }
 import * as projectStore from './projectStore.ts';
 import { backupMemoryLayer, buildMemoryPartsAsync, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory, type MemoryParts } from './memory';
 import { contextPercentOf, markContextReset, normalizeMemoryFullInterval, noteContextUsage, planInjection, remoteBriefLine, type InjectCadence } from './injectionCadence';
-import type { MemoryScope } from './memoryPolicy.ts';
+import { formatMemoryBytes, type MemoryScope } from './memoryPolicy.ts';
+import { autoCompactDue, compactLedgerKey, gatedCompaction, localDay, runLargeCompaction, type CompactScope, type LargeCompactOutcome } from './largeMemory.ts';
+import { backupMemoryFile, memoryFileForBackup, readCompactLedger, recordCompactDay, restoreMemoryBackup } from './largeMemoryFiles.ts';
+import { memoryCompactGroup } from './memoryCompactNote.ts';
 import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { PromptSuggestionStore, SuggestionTurnLedger, parseSuggestionLines, suggestionSourceFor, suggestionsPrompt, type SuggestionSource } from './promptSuggestions.ts';
 import { CODEX_SUGGEST_TIMEOUT_MS, codexFinalMessage, codexToolAttempt, codexSuggestArgs, codexTopLevelString, localCodexLaunch, parseRemoteCodexOutput, remoteCodexSuggestScript } from './codexSuggestions.ts';
@@ -1114,14 +1117,15 @@ function helperRemoteModelLists(force: boolean): Promise<MachineModelList[]> {
  *    shell is involved and no quoting is needed.
  *  @param label Log tag, e.g. 'suggestions' or 'title'.
  *  @returns The model's stdout, trimmed by the caller. Throws only if EVERY
- *    model/agent combination failed; the last error is rethrown. */
-async function runLiteOneShot(prompt: string, label: string): Promise<string> {
+ *    model/agent combination failed; the last error is rethrown.
+ *  @param timeoutMs Per-attempt timeout (default 60 s; the large-memory compaction writes a few thousand characters back and needs longer). */
+async function runLiteOneShot(prompt: string, label: string, timeoutMs = 60000): Promise<string> {
   // Local requires: this predates the module-level imports and is left as-is because
   // execFile/promisify are needed nowhere else in this file's argv-array form.
   const { execFile } = require('child_process');
   const { promisify } = require('util');
   const run = promisify(execFile);
-  const opts = { env: shellEnv, timeout: 60000, maxBuffer: 1024 * 1024 };
+  const opts = { env: shellEnv, timeout: timeoutMs, maxBuffer: 1024 * 1024 };
   const { model, fallback } = loadHelperModels();
   const models = [model, fallback].filter((m, i, arr) => !!m && arr.indexOf(m) === i);
   /*
@@ -1154,7 +1158,7 @@ async function runLiteOneShot(prompt: string, label: string): Promise<string> {
         const bin = target ? remoteKiroBin(target) : undefined;
         if (!target?.sshHost || !bin) throw new Error(`找不到机器 ${attempt.machine} 或它没配 kiro 启动命令`);
         /* 和本机一样靠 agent JSON 钉模型（`--model` 不生效）；prompt 走 stdin */
-        const raw = await runRemoteCapture(target, remoteLiteScript(bin, LITE_AGENT, REMOTE_LITE_AGENT, m), 90_000, undefined, prompt);
+        const raw = await runRemoteCapture(target, remoteLiteScript(bin, LITE_AGENT, REMOTE_LITE_AGENT, m), Math.max(90_000, timeoutMs + 30_000), undefined, prompt);
         const out = parseRemoteLiteOutput(raw);
         if (out === null) throw new Error(`没有正常输出：${raw.trim().slice(0, 200) || '（空）'}`);
         logger.info(label, `辅助模型 '${m}' 本机没有 -> 在 ${target.label || target.sshHost} 上跑`);
@@ -1431,6 +1435,83 @@ async function maybeConsolidateSessionMemory(sessionId: string): Promise<void> {
     logger.warn('memory', `session ${sessionId}: consolidation failed (${err?.message || err})`);
   } finally {
     memoryConsolidating.delete(sessionId);
+  }
+}
+
+/**
+ * **大份记忆的整理**（token 优化 4/5，规则 / 校验在 `largeMemory.ts`）—— 会话 / 项目层超过 32 KB，会话空闲（一轮结束）时整理一次：
+ * 先备份成同目录 `memory.md.bak-<YYYYMMDD-HHmm>`，结果少于原文 40% 或丢了二级标题就作废；写成了在会话里留一条提示
+ * （「查看差异」「撤销」按 noteGroup 里的备份路径找，`memoryCompactNote.ts`）。
+ * 全局层不进这里（`autoCompactDue`）；一层一天最多自动一次（`MEMORY_COMPACT_LEDGER`）；设置里的 `largeMemoryCompact` 可关。
+ * 1200 字符以下那条旧的自动压缩（`maybeConsolidateSessionMemory`）不变。
+ */
+const MEMORY_COMPACT_LEDGER = path.join(os.homedir(), '.kirolex', 'memory-compact.json');
+const MEMORY_ROOT = path.join(os.homedir(), '.kirolex', 'memory');
+const largeMemoryCompacting = new Set<string>();
+
+async function compactLargeMemoryLayer(
+  scope: CompactScope, projectId: string | undefined, sessionId: string | undefined, noteSessionId: string | undefined,
+  /** 自动整理：拿到锁之后按现读的账本 / 大小再判一次（gatedCompaction）；手动的不看 */
+  auto: boolean,
+): Promise<LargeCompactOutcome | { status: 'busy' | 'refused' | 'not-due'; reason: string }> {
+  const id = scope === 'session' ? sessionId : projectId;
+  if (!id) return { status: 'refused', reason: `no ${scope}` };
+  const refused = scope === 'session' ? refuseAdvancedOnly(id, 'compact-memory') : refuseAdvancedProject(id, 'compact-memory');
+  if (refused) return { status: 'refused', reason: refused };
+  const key = compactLedgerKey(scope, id);
+  const m = readMemory(projectId, sessionId);
+  const file = scope === 'session' ? m.sessionPath : m.projectPath;
+  if (!file) return { status: 'refused', reason: `no ${scope} memory file` };
+  return gatedCompaction(scope, key, auto, {
+    inFlight: largeMemoryCompacting,
+    recheck: () => ({
+      lastDay: readCompactLedger(MEMORY_COMPACT_LEDGER)[key],
+      bytes: (() => { try { return fs.statSync(file).size; } catch { return 0; } })(),
+      enabled: isFeatureEnabled('largeMemoryCompact'),
+      today: localDay(new Date()),
+    }),
+    record: (day) => recordCompactDay(MEMORY_COMPACT_LEDGER, key, day),
+  }, async () => {
+    const read = () => { try { return fs.readFileSync(file, 'utf-8'); } catch { return ''; } };
+    const outcome = await runLargeCompaction(scope, {
+      read,
+      ask: async (prompt) => cleanLiteOutput(await runLiteOneShot(prompt, 'large-memory', 180_000)),
+      backup: () => backupMemoryFile(file, new Date()),
+      write: (text) => writeMemory(scope, projectId, sessionId, text),
+      log: (message) => logger.info('memory', `${key}: ${message}`),
+    });
+    logger.info('memory', `${key}: large compaction ${outcome.status}${'reason' in outcome ? ` (${outcome.reason})` : ` ${outcome.beforeBytes} -> ${outcome.afterBytes} bytes, backup ${outcome.backupPath}`}`);
+    if (outcome.status === 'written' && noteSessionId) {
+      const vars = { name: id, before: formatMemoryBytes(outcome.beforeBytes), after: formatMemoryBytes(outcome.afterBytes), path: outcome.backupPath };
+      noteInSession(noteSessionId, scope === 'session'
+        ? tr("Compacted this chat's memory: {before} → {after}, backup at {path}", vars)
+        : tr('Compacted project "{name}" memory: {before} → {after}, backup at {path}', vars), undefined, memoryCompactGroup(outcome.backupPath));
+    }
+    return outcome;
+  });
+}
+
+/** 一轮结束（会话空闲）时：这条会话的会话层、所属项目层各看一次要不要整理。 */
+async function maybeCompactLargeMemory(sessionId: string): Promise<void> {
+  try {
+    if (refuseAdvancedOnly(sessionId, 'compact-memory')) return;
+    const record = store.readRecord(sessionId);
+    if (!record) return;
+    const projectId = (record.profile as any)?.projectId || undefined;
+    const bytes = memoryLayerBytes(projectId, sessionId);
+    const ledger = readCompactLedger(MEMORY_COMPACT_LEDGER);
+    const today = localDay(new Date());
+    const enabled = isFeatureEnabled('largeMemoryCompact');
+    for (const scope of ['session', 'project'] as const) {
+      const id = scope === 'session' ? sessionId : projectId;
+      if (!id) continue;
+      if (autoCompactDue({ scope, bytes: bytes[scope], enabled, lastDay: ledger[compactLedgerKey(scope, id)], today })) continue;
+      /* Claude Code / Codex 会话：辅助小任务不跑（同 maybeConsolidateSessionMemory） */
+      if (skipLiteHelperFor(sessionId, 'large-memory')) return;
+      await compactLargeMemoryLayer(scope, projectId, sessionId, sessionId, true);
+    }
+  } catch (err: any) {
+    logger.warn('memory', `session ${sessionId}: large memory compaction failed (${err?.message || err})`);
   }
 }
 
@@ -5855,6 +5936,8 @@ const FEATURE_DEFAULTS: Record<string, boolean> = {
   smartTitle: true,
   /** 会话记忆自动维护：一轮结束、攒够新消息就压一次（`sessionMemory.ts`） */
   sessionMemory: true,
+  /** 大份记忆（会话 / 项目层 > 32 KB）一天一次自动整理，先备份（`largeMemory.ts`）；全局层从不自动整理 */
+  largeMemoryCompact: true,
   /*
     远程会话不再是开关（原来的 `remoteSessions`）：配一台机器本身就是选择要用它，一台没配时
     什么也不改变。表里没有这个键，老 config.json 里留着的 `features.remoteSessions: false` 也就不被认了。
@@ -13078,6 +13161,8 @@ ${hint}` : ''}` };
             });
             // 一轮结束就看看要不要压一次会话记忆 —— 不等它，也不让它影响这一轮的返回
             void maybeConsolidateSessionMemory(sessionId);
+            // 大份记忆（> 32 KB）一天一次的整理，同样不等它（largeMemory.ts）
+            void maybeCompactLargeMemory(sessionId);
             /*
               换项目 / 归档时欠下的执行器重置，在这里消化（那时它正忙，不能 detach）。
               **必须排在 flushAssistant 和上面的收尾之后**：detachExecutor 会立刻把 entry 从 sessionClients
@@ -21153,6 +21238,40 @@ ${hint}` : ''}` };
     if (at) logger.info('memory', `backed up ${scope} -> ${at}`);
     else logger.warn('memory', `nothing to back up for scope=${scope}`);
     return { ok: !!at, at };
+  });
+
+  /** 记忆对话框的「立即整理」：大份记忆整理（`compactLargeMemoryLayer`）手动跑一次，不看 32 KB 门槛和一天一次。全局层不整理。 */
+  ipcMain.handle('acp:memory-compact-now', async (_event, scope: MemoryScope, projectId?: string, sessionId?: string) => {
+    if (scope !== 'session' && scope !== 'project') return { ok: false, error: tr('Global memory is not compacted here.') };
+    const sid = memorySessionId(sessionId, 'memory-compact-now');
+    if (scope === 'session' && !sid) return { ok: false, error: tr('This session belongs to KiroLex Advanced; the standard edition does not modify it.') };
+    const r = await compactLargeMemoryLayer(scope, projectId, sid, sid, false);
+    return r.status === 'written'
+      ? { ok: true, status: r.status, beforeBytes: r.beforeBytes, afterBytes: r.afterBytes, backupPath: r.backupPath }
+      : { ok: false, status: r.status, error: r.reason };
+  });
+
+  /** 「已整理记忆」提示上的「查看差异」：备份（整理前）和现在的文件。只认 `memoryFileForBackup` 认得的备份路径。 */
+  ipcMain.handle('acp:memory-compact-diff', async (_event, backupPath: string) => {
+    const target = memoryFileForBackup(backupPath, MEMORY_ROOT);
+    if (!target) return { ok: false, error: tr('Not a memory backup.') };
+    try {
+      return { ok: true, before: fs.readFileSync(path.resolve(backupPath), 'utf-8'), after: (() => { try { return fs.readFileSync(target.file, 'utf-8'); } catch { return ''; } })() };
+    } catch {
+      return { ok: false, error: tr('The backup file is gone.') };
+    }
+  });
+
+  /** 「已整理记忆」提示上的「撤销」：用备份覆盖回去。 */
+  ipcMain.handle('acp:memory-compact-undo', async (_event, backupPath: string) => {
+    const target = memoryFileForBackup(backupPath, MEMORY_ROOT);
+    if (!target) return { ok: false, error: tr('Not a memory backup.') };
+    const refused = target.scope === 'session' ? refuseAdvancedOnly(target.id, 'memory-compact-undo') : refuseAdvancedProject(target.id, 'memory-compact-undo');
+    if (refused) return { ok: false, error: refused };
+    const r = restoreMemoryBackup(backupPath, MEMORY_ROOT);
+    if (!r.ok) return { ok: false, error: r.error === 'backup file is gone' ? tr('The backup file is gone.') : r.error };
+    logger.info('memory', `undid large compaction: ${backupPath} -> ${r.file}`);
+    return { ok: true };
   });
 });
 

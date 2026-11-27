@@ -93,4 +93,6 @@ export const ZH_INDEX_A: Record<string, string> = {
     '这条会话正在跑一轮 —— 等它跑完再恢复，不然这一轮还没落盘的内容会丢。',
   'This backup has already been deleted ({when}); the catalog had not been cleaned up. It has now been removed from the list.': '这条备份已经被删除（{when}），目录没清干净 —— 已经从列表里移除。',
   'time unknown': '时间不详',
+  "Compacted this chat's memory: {before} → {after}, backup at {path}": '已整理会话记忆：{before} → {after}，备份在 {path}',
+  'Compacted project "{name}" memory: {before} → {after}, backup at {path}': '已整理项目「{name}」记忆：{before} → {after}，备份在 {path}',
 };

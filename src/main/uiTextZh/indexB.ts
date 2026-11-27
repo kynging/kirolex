@@ -305,4 +305,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   '{machine} is still updating this task. Stop it there instead of running it twice.': '{machine} 还在更新这个任务的状态，不要两台都跑：要停就在那边停。',
   'This background task changed after it was shown. Check it again before running it here.': '这个后台任务在显示之后变了，请重新看一遍再在本机运行。',
   '🔁 Background task "{label}" ({id}) was re-run on this computer as {newId} because {machine} lost contact': '🔁 {machine} 失联，后台任务「{label}」（{id}）已在本机重新运行，新的是 {newId}',
+  'Global memory is not compacted here.': '全局记忆不在这里整理。',
+  'Not a memory backup.': '这不是记忆整理的备份。',
+  'The backup file is gone.': '备份文件已经不在了。',
 };

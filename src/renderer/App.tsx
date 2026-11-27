@@ -306,6 +306,9 @@ declare global {
       onRunAdvance?: (callback: (data: { project: string; id: string }) => void) => () => void;
       memoryBytes: (projectId?: string, sessionId?: string) => Promise<{ global: number; project: number; session: number }>;
       backupMemory: (scope: 'global' | 'project' | 'session', projectId?: string, sessionId?: string) => Promise<{ ok: boolean; at: string | null }>;
+      compactMemoryNow?: (scope: 'project' | 'session', projectId?: string, sessionId?: string) => Promise<{ ok: boolean; status?: string; beforeBytes?: number; afterBytes?: number; backupPath?: string; error?: string }>;
+      memoryCompactDiff?: (backupPath: string) => Promise<{ ok: boolean; before?: string; after?: string; error?: string }>;
+      memoryCompactUndo?: (backupPath: string) => Promise<{ ok: boolean; error?: string }>;
       onMemoryBytes: (callback: (data: { sessionId: string; projectId: string | null; global: number; project: number; session: number }) => void) => () => void;
       prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => Promise<any>;
       cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean, reason?: 'user') => Promise<void>;

@@ -334,6 +334,11 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  删会话时 memory 是硬删不进 trash，已经真实丢过一次。 */
   backupMemory: (scope: 'global' | 'project' | 'session', projectId?: string, sessionId?: string) =>
     ipcRenderer.invoke('acp:backup-memory', scope, projectId, sessionId),
+  /** 大份记忆整理（largeMemory.ts）：记忆对话框「立即整理」/ 提示上的「查看差异」「撤销」 */
+  compactMemoryNow: (scope: 'project' | 'session', projectId?: string, sessionId?: string) =>
+    ipcRenderer.invoke('acp:memory-compact-now', scope, projectId, sessionId),
+  memoryCompactDiff: (backupPath: string) => ipcRenderer.invoke('acp:memory-compact-diff', backupPath),
+  memoryCompactUndo: (backupPath: string) => ipcRenderer.invoke('acp:memory-compact-undo', backupPath),
 
   // Chat
   prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => ipcRenderer.invoke('acp:prompt', sessionId, prompt, model, projectId, display),

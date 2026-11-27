@@ -2224,6 +2224,9 @@ button, input, select, textarea {
   background: var(--accent); color: #fff; font-size: 11px; font-weight: 600; cursor: pointer;
 }
 .adapter-install-btn:disabled { opacity: .6; cursor: progress; }
+/* 「已整理记忆」提示的「查看差异」弹窗（MemoryCompactActions） */
+.memory-compact-diff-body { overflow: auto; max-height: 70vh; padding: 0 16px 16px; text-align: left; }
+.memory-compact-diff-body .diff-lines { font-size: 11.5px; }
 .adapter-install-status { color: var(--text-tertiary); font-size: 10.5px; }
 .adapter-install[data-phase="failed"] .adapter-install-status,
 .adapter-install[data-phase="reconnect-failed"] .adapter-install-status { color: var(--error, #d9534f); white-space: pre-wrap; }
