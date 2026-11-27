@@ -41,6 +41,7 @@ import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { TOOL_OUTPUT_DEFAULT_KB, normalizeToolOutputKb } from '../main/toolOutputLimits.ts';
+import { MEMORY_FULL_INTERVAL_DEFAULT, normalizeMemoryFullInterval } from '../main/injectionCadence.ts';
 import { AUTO_COMPACT_DEFAULT_PCT, compactCommandFor, normalizeAutoCompactPct, stepAutoCompact, type AutoCompactTrack } from '../main/contextReminder.ts';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
 import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, enterRoute, resolveBusyEnter, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
@@ -289,7 +290,7 @@ declare global {
       reveal: () => Promise<{ revealed: boolean }>;
       splashStatus: (text: string) => Promise<{ ok: boolean }>;
       deleteProjectMemory: (projectId: string) => Promise<{ projectId: string }>;
-      readMemory: (projectId?: string, sessionId?: string) => Promise<{ global: string; project: string; session: string; projectId: string | null; sessionId: string | null; globalPath: string; projectPath: string | null; sessionPath: string | null }>;
+      readMemory: (projectId?: string, sessionId?: string) => Promise<{ global: string; project: string; session: string; projectId: string | null; sessionId: string | null; globalPath: string; projectPath: string | null; sessionPath: string | null; injection?: { charCount: number; at: number; mode?: 'full' | 'rules'; turn?: number; lastFullTurn?: number } | null }>;
       readLastInjection: (sessionId?: string) => Promise<{
         text: string; at: number | null; path: string | null;
         /** A hand-edited block is pinned: `text` is that block, not the archive. */
@@ -751,6 +752,13 @@ export interface Settings {
    * 16–128，默认 24（`main/toolOutputLimits.ts`）。主进程从 ui-state 里直接读（`localMcp.ts` 的 `outputCapBytes`）。
    */
   toolOutputKb?: number;
+  /**
+   * 记忆设置「每轮都完整注入（旧行为）」：默认关 = 只在首轮 / 压缩后 / 记忆变了 / 每隔 N 轮完整注入，其余轮次只带规则部分。
+   * 主进程从 ui-state 里直接读（sendPromptOnce 的 planInjection，见 main/injectionCadence.ts）。
+   */
+  memoryFullEveryTurn?: boolean;
+  /** 每隔几轮完整注入一次记忆，4–20，默认 8（`MEMORY_FULL_INTERVAL_DEFAULT`）。 */
+  memoryFullInterval?: number;
   /** After a restart, automatically RESEND an unanswered prompt when its chat is opened. */
   recoverInterruptedTurns: boolean;
   /** 被非人为原因打断（执行器死了、重启、看门狗）的那一轮最多自动重发几次。0 = 不重发。默认 10。 */
@@ -789,7 +797,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoCompactContext: false, autoCompactPct: AUTO_COMPACT_DEFAULT_PCT, toolOutputKb: TOOL_OUTPUT_DEFAULT_KB, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoCompactContext: false, autoCompactPct: AUTO_COMPACT_DEFAULT_PCT, toolOutputKb: TOOL_OUTPUT_DEFAULT_KB, memoryFullEveryTurn: false, memoryFullInterval: MEMORY_FULL_INTERVAL_DEFAULT, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -993,6 +1001,8 @@ function loadSettings(): Settings {
       merged.autoCompactContext = merged.autoCompactContext === true;
       merged.autoCompactPct = normalizeAutoCompactPct(merged.autoCompactPct);
       merged.toolOutputKb = normalizeToolOutputKb(merged.toolOutputKb);
+      merged.memoryFullEveryTurn = merged.memoryFullEveryTurn === true;
+      merged.memoryFullInterval = normalizeMemoryFullInterval(merged.memoryFullInterval);
       return merged;
     }
   } catch {}
@@ -5493,6 +5503,8 @@ const App: React.FC = () => {
           projectId={memoryTarget ? memoryTarget.projectId : sessions.find((s) => s.id === currentSessionId)?.projectId}
           sessionId={memoryTarget ? memoryTarget.sessionId : (currentSessionId && !currentSessionId.startsWith('pending_') ? currentSessionId : undefined)}
           initialTab={memoryTarget?.scope}
+          settings={settings}
+          onSettingsChange={handleSettingsChange}
           onClose={() => { setShowMemory(false); setMemoryTarget(null); }}
         />
       )}

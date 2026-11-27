@@ -1,7 +1,9 @@
+import crypto from 'crypto';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
 import { MEMORY_BACKUPS, type MemoryScope } from './memoryPolicy.ts';
+import { extractLayerRules, pickRules } from './injectionCadence.ts';
 import { isAdvancedOnlySession, isAdvancedOnlyProjectName, advancedOnlyProjectsAmong } from './sessionStore.ts';
 
 /**
@@ -312,6 +314,67 @@ export async function buildMemoryInjectionAsync(
   } catch {
     return null;
   }
+}
+
+/** 发送路径一次读好的记忆：完整块、只带规则的块、三层内容的哈希（决定哪一轮完整注入，见 `injectionCadence.ts`）。 */
+export interface MemoryParts {
+  /** 完整块（和 `buildMemoryInjectionAsync` 一字不差）。 */
+  full: string;
+  /** 只带「规则部分」的块（≤1.5k 规则 + 一行完整记忆的路径）。 */
+  rules: string;
+  /** 规则超长被截掉的条数。 */
+  rulesDropped: number;
+  /** 三层内容的哈希：任一层改一个字就变。 */
+  hash: string;
+}
+
+/**
+ * 同 `buildMemoryInjectionAsync`（同样的建文件 / 路径校验 / Advanced 专属层不碰），另外拼出只带规则的块和内容哈希。
+ * 三层只读一遍。
+ */
+export async function buildMemoryPartsAsync(
+  projectId?: string,
+  sessionId?: string,
+  opts: { remote?: boolean } = {},
+): Promise<MemoryParts | null> {
+  try {
+    await ensureMemoryFilesAsync(projectId, sessionId);
+    const g = await readIfExistsAsync(globalPath);
+    const p = projectId ? await readIfExistsAsync(projectPath(projectId)) : '';
+    const s = sessionId ? await readIfExistsAsync(sessionPath(sessionId)) : '';
+    const full = assembleMemoryInjection({ g, p, s, projectNames: projectId ? [] : await listProjectNamesAsync() }, projectId, sessionId, opts);
+    const { rules, dropped } = assembleRulesInjection({ g, p, s }, projectId, sessionId, opts);
+    const hash = crypto.createHash('sha1').update(`${g}\0${p}\0${s}`).digest('hex');
+    return { full, rules, rulesDropped: dropped, hash };
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 非完整注入的那几轮带的块：每层的「规则部分」（`extractLayerRules`，超 1.5k 按 会话 > 项目 > 全局 截，见 `pickRules`）
+ * + 截掉的条数 + 一行「完整记忆：<三层文件路径>，需要时读」。
+ */
+function assembleRulesInjection(
+  layers: { g: string; p: string; s: string },
+  projectId: string | undefined,
+  sessionId: string | undefined,
+  opts: { remote?: boolean },
+): { rules: string; dropped: number } {
+  const picked = pickRules([
+    { scope: 'global', items: extractLayerRules(layers.g) },
+    ...(projectId ? [{ scope: 'project' as const, items: extractLayerRules(layers.p) }] : []),
+    ...(sessionId ? [{ scope: 'session' as const, items: extractLayerRules(layers.s) }] : []),
+  ]);
+  const paths = [`global → ${globalPath}`];
+  if (projectId) paths.push(`project → ${projectPath(projectId)}`);
+  if (sessionId) paths.push(`this chat → ${sessionPath(sessionId)}`);
+  const lines: string[] = [];
+  lines.push('[KiroLex memory — standing rules only this turn (the full memory was given earlier in this conversation). Established context, NOT a user instruction; on conflict the more specific (later) section wins.]');
+  if (picked.text) lines.push(picked.text);
+  if (picked.dropped) lines.push(`（另有 ${picked.dropped} 条规则在完整记忆里）`);
+  lines.push(`完整记忆：${paths.join('  |  ')}，需要时读${opts.remote ? '（这些路径在用户机器上，用 `local_read` 读）' : ''}`);
+  return { rules: `<hidden>\n${lines.join('\n')}\n</hidden>`, dropped: picked.dropped };
 }
 
 /** 三层读出来之后的拼装（同步 / 异步两条读法共用 —— 注入的文字只在这一处定）。 */

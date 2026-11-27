@@ -110,7 +110,8 @@ import { BG_DEFAULT_TIMEOUT_SEC, BG_MAX_TIMEOUT_SEC, WATCH_MAX_TIMEOUT_SEC, BgJo
 import { BG_JOBS_REL, applyFetchedState, bgObjectRel, bgRunnerLost, bgStateBody, bgTombstoneBody, collectBucketBgJobs, FOREIGN_KEEP_MS, forgetBgSession, pruneEndedForeign, recordedBgJobIds, parseRemoteBgState, parseRerunMark, parseStopRequest, planBgSync, planStopRequests, readBgLedger, rerunBody, rerunHash, stopRequestBody, writeBgLedger, type BgStopRequest, type BgSyncLedger } from './bgJobSync.ts';
 import { adapterScheduleNote, callWakeTool, switchCarryOverText, type WakeHost } from './wakeTools.ts';
 import * as projectStore from './projectStore.ts';
-import { backupMemoryLayer, buildMemoryInjectionAsync, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory } from './memory';
+import { backupMemoryLayer, buildMemoryPartsAsync, deleteProjectMemory, deleteSessionMemory, memoryLayerBytes, readMemory, writeMemory, type MemoryParts } from './memory';
+import { contextPercentOf, markContextReset, normalizeMemoryFullInterval, noteContextUsage, planInjection, remoteBriefLine, type InjectCadence } from './injectionCadence';
 import type { MemoryScope } from './memoryPolicy.ts';
 import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
 import { PromptSuggestionStore, SuggestionTurnLedger, parseSuggestionLines, suggestionSourceFor, suggestionsPrompt, type SuggestionSource } from './promptSuggestions.ts';
@@ -381,11 +382,11 @@ interface SessionEntry {
    * 走同一段解析，语义才一定一致。
    */
   commands?: any[];
-  /* No memory-injection bookkeeping here on purpose: the block goes out on EVERY
-     turn, so there is no "has it been sent yet / has it changed" decision to carry.
-     Three fields used to exist for that decision and were the reason a standing rule
-     was stated once and never repeated. The durable record of what was sent lives in
+  /* Memory goes out on EVERY turn -- in full on some turns, only its standing rules on
+     the rest (`injectionCadence.ts`). The durable record of what was sent lives in
      record.json (`lastMemoryInjection`) and in the [memory] log line. */
+  /** 这个执行器上记忆 / 远程环境说明的注入节奏（第几轮、上次完整注入、内容哈希）。新执行器 = 第一轮完整注入。 */
+  injectCadence?: InjectCadence;
   /** Set when a session is (re)attached onto a FRESH kiro-cli backend (resume
    *  failed, migrated session, or expired cli session). On the FIRST prompt,
    *  KiroLex rebuilds the full prior context from its OWN durable transcript and
@@ -2386,6 +2387,7 @@ async function primeHistoryPlanned(sessionId: string, entry: SessionEntry): Prom
       }
       // Success is the ONLY thing that clears the flag.
       entry.needsHistoryPrime = false;
+      markContextReset(entry.injectCadence);   // 历史重建（回放）完了：下一轮记忆 / 远程说明完整注入
       entry.primeChunks = undefined;
       primeModelsTried.delete(sessionId);
       // Persist WHICH backend holds the context -- id AND pid. `session/load`
@@ -4498,12 +4500,12 @@ function memoryTargetFor(projectId: string | undefined, sessionId: string, entry
  * 就这一轮不注入并记一条错误 —— 不按错的项目注入，也不退回同步整读。
  */
 function memoryBlockFor(
-  prefetch: { projectId: string | undefined; remote: boolean; block: string | null } | undefined,
+  prefetch: { projectId: string | undefined; remote: boolean; parts: MemoryParts | null } | undefined,
   effectiveProjectId: string | undefined,
   remote: boolean,
   sessionId: string,
-): string | null {
-  if (prefetch && prefetch.projectId === effectiveProjectId && prefetch.remote === remote) return prefetch.block;
+): MemoryParts | null {
+  if (prefetch && prefetch.projectId === effectiveProjectId && prefetch.remote === remote) return prefetch.parts;
   logger.error('memory', `memory prefetch does not match this turn sessionId=${sessionId} prefetched=${prefetch ? `${prefetch.projectId || '(none)'}/${prefetch.remote}` : 'none'} `
     + `effective=${effectiveProjectId || '(none)'}/${remote} -> no memory block this turn (memoryTargetFor 和 effectiveProjectId 的规则对不上了)`);
   return null;
@@ -6293,7 +6295,7 @@ async function noteBedrockDenied(sessionId: string, profile: AgentProfile, errTe
 
 /** 流式文字进来：记「出现过压缩状态提示」和这一轮文字的开头（报错收尾时判压缩失败那张卡，见 `turnTextHead`）。 */
 function noteTurnText(entry: SessionEntry, text: string): void {
-  if (isCompactionSignal(text)) entry.compactSignalThisTurn = true;
+  if (isCompactionSignal(text)) { entry.compactSignalThisTurn = true; markContextReset(entry.injectCadence); }   // 压缩过：下一轮记忆 / 远程说明完整注入
   if (entry.turnTextTruncated) return;
   const head = (entry.turnTextHead || '') + text;
   entry.turnTextTruncated = head.length > TURN_TEXT_HEAD_MAX;
@@ -9747,6 +9749,13 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     }
     const childSessionId = childSessionOf(data, entry);
     /*
+      **上下文占用大幅回落 = 压缩过了**（包括 Claude Code 静默的自动压缩：没有 /compact、也没有「正在压缩」那句）——
+      下一轮记忆 / 远程环境说明完整注入（`injectionCadence.noteContextUsage`）。子代理的帧不算（那是另一段上下文）。
+    */
+    if (!childSessionId && noteContextUsage(entry.injectCadence, contextPercentOf(data?.update))) {
+      logger.info('memory', `context usage dropped sharply (compacted) sessionId=${sessionId} pct=${Math.round(entry.injectCadence?.contextPct ?? 0)} -> next turn injects in full`);
+    }
+    /*
       本会话花费（审计 F3）：Claude Code 的 `usage_update.cost` 是**这个适配器进程**的累计值，进程一换就从 0 数起 ——
       在这里跨进程累计、落进会话记录（`sessionCost.ts`），渲染层直接显示 `kirolexCost`。kiro 不发这个，照旧走 credits。
     */
@@ -12449,15 +12458,15 @@ ${hint}` : ''}` };
       logger.info('prompt', `waited for wedged turn to release sessionId=${sessionId} busy=${entry.busy}`);
     }
     /* 记忆块在忙闸**之前**异步读好（闸到 busy=true 之间不能有 await），读完复核项目 / 机器、变了重读 —— 见 memoryTargetFor */
-    let memoryPrefetch: { projectId: string | undefined; remote: boolean; block: string | null } | undefined;
+    let memoryPrefetch: { projectId: string | undefined; remote: boolean; parts: MemoryParts | null } | undefined;
     if (isFeatureEnabled('memoryInjection') && (!entry.busy || handoff)) {
       for (let want = memoryTargetFor(projectId, sessionId, entry); ;) {
         const target = want;
-        const read = await prepOnExecutor(sessionId, entry, prepDeps, () => heavyLane(() => buildMemoryInjectionAsync(target.projectId, sessionId, { remote: target.remote })));
+        const read = await prepOnExecutor(sessionId, entry, prepDeps, () => heavyLane(() => buildMemoryPartsAsync(target.projectId, sessionId, { remote: target.remote })));
         if (read.moved) return rerunOnCurrentExecutor('读记忆', read.why);
-        const block = read.value;
+        const parts = read.value;
         want = memoryTargetFor(projectId, sessionId, entry);
-        if (want.projectId === target.projectId && want.remote === target.remote) { memoryPrefetch = { ...target, block }; break; }
+        if (want.projectId === target.projectId && want.remote === target.remote) { memoryPrefetch = { ...target, parts }; break; }
         logger.info('memory', `project / machine changed while reading memory sessionId=${sessionId} (${target.projectId || '(none)'} → ${want.projectId || '(none)'}) -> read again`);
       }
     }
@@ -12577,7 +12586,8 @@ ${hint}` : ''}` };
     return persisted;
     };
     if (!handoff) persistUserMessage();
-    // Inject layered memory (global ⊕ project ⊕ this chat) on EVERY turn.
+    // Inject layered memory (global ⊕ project ⊕ this chat) on EVERY turn -- but only the
+    // standing RULES on most turns (see the cadence block right below).
     //
     // It used to go out only when the block's CONTENT changed, which is right for
     // "background facts" and wrong for the rules people actually put in there. A rule
@@ -12588,13 +12598,37 @@ ${hint}` : ''}` };
     // restates it after a compaction either -- once it falls out of the live context it
     // is simply gone, invisibly.
     //
-    // Cost is small and bounded: this block is ~1.3k chars (~300 tokens) per turn.
     // Rebuilt from disk each time, so an edit takes effect on the next message.
     //
     // Prepended BEFORE the ride-along snapshot below, which means it ends up AFTER it in
     // the final array -- i.e. as close to the user's own text as possible. A standing
     // instruction buried in front of a 19k-char history dump is the position least likely
     // to be honoured.
+    /*
+      **完整的块不是每轮都带**（token 优化 3/5，`injectionCadence.ts`）—— 实测每轮的记忆块 21–25k 字符（最高 39k）、
+      远程环境说明 ~2.5k，大多每轮不变，却一直累积在上下文里。完整注入只在：后端会话的第一轮；压缩 / 换后端会话 / 回放之后；
+      任一层记忆内容变了（哈希）；距上次完整注入满 N 轮（设置 4–20，默认 8）；或设置「每轮都完整注入（旧行为）」打开。
+      其余轮次记忆只带「规则部分」（≤1.5k + 一行完整记忆的路径），远程说明只带一行。规则仍然每轮都在 —— 上面说的那条教训不变。
+    */
+    const memoryParts = isFeatureEnabled('memoryInjection')
+      /* 远程会话的 memory 文件在**用户机器**上，只有 `local_write` 到得了（见 memory.ts）；
+         用的是上面忙闸之前异步读好的那份（memoryPrefetch），不在这里同步读 */
+      ? memoryBlockFor(memoryPrefetch, effectiveProjectId, !!entry.profile.remote?.sshHost, sessionId)
+      : null;
+    let rc = '';
+    try { rc = remoteContextFor(sessionId, entry); } catch {}
+    const injectSettings = readUiSettings();
+    const { plan: injectPlan, next: injectNext } = planInjection(entry.injectCadence, {
+      backend: entry.cliSessionId || '',
+      memoryHash: memoryParts ? memoryParts.hash : null,
+      fullEveryTurn: injectSettings.memoryFullEveryTurn === true,
+      interval: normalizeMemoryFullInterval(injectSettings.memoryFullInterval),
+      replay: !!rideAlongBlock,
+      retry: attempt > 0,
+    });
+    entry.injectCadence = injectNext;
+    /* 这一轮就是 /compact（界面上的「压缩」按钮也是它）：压完之后的下一轮完整注入 */
+    if (isCompactCommand(display?.displayText ?? promptTextOf(prompt))) markContextReset(entry.injectCadence);
     /*
       **远程会话：先告诉它自己在哪台机器上** ——「你是不是应该给他一些提示词告诉他本地和远程目录的区别」。
       不说的话它会拿对话里的 `/Users/...` 去搜（那个路径在远端不存在），把"搜不到"当成"没有这个东西"。
@@ -12608,25 +12642,27 @@ ${hint}` : ''}` };
       if (sched) prompt = [{ type: 'text', text: sched }, ...prompt];
     } catch {}
     try {
-      const rc = remoteContextFor(sessionId, entry);
       if (rc) {
-        prompt = [{ type: 'text', text: rc }, ...prompt];
-        logger.info('remote', `注入运行环境说明 sessionId=${sessionId} chars=${rc.length}`);
+        /* 非首轮：一行「[运行环境：远程 · <机器名>]，详见首轮说明」 */
+        const remoteText = injectPlan.remote === 'full' ? rc
+          : remoteBriefLine(labelForHost(KIROLEX_CONFIG_PATH, entry.profile.remote?.sshHost) || entry.profile.remote?.sshHost || '');
+        prompt = [{ type: 'text', text: remoteText }, ...prompt];
+        logger.info('remote', `注入运行环境说明 sessionId=${sessionId} mode=${injectPlan.remote} chars=${remoteText.length} turn=${injectPlan.turn}`);
       }
     } catch {}
     try {
-      const block = isFeatureEnabled('memoryInjection')
-        /* 远程会话的 memory 文件在**用户机器**上，只有 `local_write` 到得了（见 memory.ts）；
-           用的是上面忙闸之前异步读好的那份（memoryPrefetch），不在这里同步读 */
-        ? memoryBlockFor(memoryPrefetch, effectiveProjectId, !!entry.profile.remote?.sshHost, sessionId)
-        : '';
+      const block = memoryParts ? (injectPlan.memory === 'full' ? memoryParts.full : memoryParts.rules) : '';
       if (block) {
         prompt = [{ type: 'text', text: block }, ...prompt];
         const rec = store.readRecord(sessionId);
-        if (rec) { rec.lastMemoryInjection = { charCount: block.length, at: Date.now() }; store.writeRecord(rec); }
+        if (rec) {
+          rec.lastMemoryInjection = { charCount: block.length, at: Date.now(), mode: injectPlan.memory, turn: injectPlan.turn, lastFullTurn: injectNext.lastFullTurn };
+          store.writeRecord(rec);
+        }
         // Logged per turn on purpose: without it "was the memory actually delivered?"
         // could only be answered by reading record.json, and only for the LAST turn.
-        logger.info('memory', `injected sessionId=${sessionId} chars=${block.length} project=${effectiveProjectId || '(none)'}`);
+        logger.info('memory', `injected sessionId=${sessionId} mode=${injectPlan.memory} chars=${block.length} turn=${injectPlan.turn} reason=${injectPlan.reason}`
+          + `${injectPlan.memory === 'rules' && memoryParts?.rulesDropped ? ` rulesDropped=${memoryParts.rulesDropped}` : ''} project=${effectiveProjectId || '(none)'}`);
       }
     } catch {}
     /**
@@ -21078,7 +21114,9 @@ ${hint}` : ''}` };
   const memorySessionId = (sessionId: string | undefined, what: string): string | undefined =>
     (sessionId && refuseAdvancedOnly(sessionId, what) ? undefined : sessionId);
   ipcMain.handle('acp:read-memory', async (_event, projectId?: string, sessionId?: string) => {
-    return readMemory(projectId, memorySessionId(sessionId, 'read-memory'));
+    /* 带上这条会话上次注入的情况（记忆对话框显示「上次完整注入是第几轮」） */
+    const injection = sessionId ? (store.readRecord(sessionId)?.lastMemoryInjection ?? null) : null;
+    return { ...readMemory(projectId, memorySessionId(sessionId, 'read-memory')), injection };
   });  ipcMain.handle('acp:write-memory', async (_event, scope: 'global' | 'project' | 'session', projectId: string | undefined, sessionId: string | undefined, content: string) => {
     const sid = memorySessionId(sessionId, 'write-memory');
     if (scope === 'session' && sessionId && !sid) {

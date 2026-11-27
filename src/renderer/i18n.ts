@@ -305,6 +305,15 @@ const ZH_BASE: Record<string, string> = {
   'Back to auto-generated': '已回到自动生成',
   'Restore auto-generated': '恢复自动生成',
   'Discard changes': '放弃修改',
+  'Size: global {g} · project {p} · this chat {s} chars': '大小：全局 {g} · 项目 {p} · 本会话 {s} 字符',
+  'Not injected into this chat yet': '这个会话还没有注入过记忆',
+  'Last full injection: turn {n} (this backend session is at turn {m})': '上次完整注入：第 {n} 轮（这个后端会话目前第 {m} 轮）',
+  'Last full injection: before this version (turn not recorded)': '上次完整注入：旧版本记录，没有轮次',
+  'Inject the full memory every turn (old behavior)': '每轮都完整注入（旧行为）',
+  'Full injection every': '每隔',
+  'turns (memory full injection)': '轮完整注入一次',
+  'The full memory goes out on the first turn of a backend session, after compaction / a new backend session / a history replay, after any layer changes, and every {n} turns ({min}–{max}). Other turns carry only the rules (up to {chars} chars) plus the file paths: paragraphs wrapped in <!-- always --> … <!-- /always -->, or, in a layer without markers, level-2 sections whose title contains {titles}.':
+    '完整记忆在这些时候发：后端会话的第一轮；压缩 / 换后端会话 / 回放历史之后；任一层内容改了之后；以及每隔 {n} 轮（可调 {min}–{max}）。其余轮次只带「规则部分」（最多 {chars} 字符）和三层文件的路径：用 <!-- always --> … <!-- /always --> 包住的段落；某一层没有标记时，取它标题含 {titles} 的二级节。',
   'Drop the hand-edited copy and go back to the snapshot generated from the current conversation.':
     '删掉手工编辑的这份，回到按当前对话自动生成的快照。',
   '(Nothing recorded yet: context is written when it is actually injected, so it appears after you send a message. You can also write one here — save it and the next message uses it.)':

@@ -496,6 +496,29 @@ button, input, select, textarea {
   opacity: 0.5;
   cursor: not-allowed;
 }
+/* 记忆怎么注入：每层大小 / 上次完整注入 / 两个设置（MemoryDialog） */
+.memory-inject-bar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 6px 16px;
+  padding: 8px 16px 0;
+  font-size: 12px;
+  color: var(--text-muted);
+}
+.memory-inject-toggle,
+.memory-inject-interval {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-primary);
+}
+.memory-inject-hint {
+  flex-basis: 100%;
+  margin: 0;
+  font-size: 11px;
+  line-height: 1.5;
+}
 /* The memory editor should use the dialog's height instead of a fixed 220px box that
    left most of a tall window empty. The item stretches, the textarea fills it. */
 .memory-dialog .settings-body { align-content: stretch; }

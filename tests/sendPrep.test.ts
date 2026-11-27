@@ -142,7 +142,7 @@ describe('接线（读源码）', () => {
 
   test('读历史快照、读记忆都经 prepOnExecutor；动过就等切换落定、按当前执行器从头重走', () => {
     assert.match(MAIN, /const read = await prepOnExecutor\(sessionId, entry, prepDeps, \(\) => buildHistoryRideAlong\(sessionId\)\);\s*if \(read\.moved\) return rerunOnCurrentExecutor\('读历史快照', read\.why\);/);
-    assert.match(MAIN, /const read = await prepOnExecutor\(sessionId, entry, prepDeps, \(\) => heavyLane\(\(\) => buildMemoryInjectionAsync\(target\.projectId, sessionId, \{ remote: target\.remote \}\)\)\);\s*if \(read\.moved\) return rerunOnCurrentExecutor\('读记忆', read\.why\);/);
+    assert.match(MAIN, /const read = await prepOnExecutor\(sessionId, entry, prepDeps, \(\) => heavyLane\(\(\) => buildMemoryPartsAsync\(target\.projectId, sessionId, \{ remote: target\.remote \}\)\)\);\s*if \(read\.moved\) return rerunOnCurrentExecutor\('读记忆', read\.why\);/);
     /* sendPromptOnce 里那一句把「整条重走」交给 rerunOnSwitchedExecutor，带上这次标过的 ride-along */
     assert.match(MAIN, /const rerunOnCurrentExecutor = \(where: string, why: 'replaced' \| 'gone' \| 'switching'\): Promise<any> => rerunOnSwitchedExecutor\(\s*sessionId, rideAlongMarkedOn, where, why, \(\) => sendPromptOnce\(sessionId, prompt, projectId, display, _model, attempt\)\);/);
     assert.match(MAIN, /rideAlongMarkedOn = entry;/);

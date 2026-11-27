@@ -180,7 +180,8 @@ export interface SessionRecord {
    */
   filesDirs?: string[];
   /** Memory injection bookkeeping (design §6.4). */
-  lastMemoryInjection?: { charCount: number; at: number };
+  /** `mode`：这一轮带的是完整记忆还是只带规则；`turn` / `lastFullTurn`：这个后端会话上的第几轮 / 上次完整注入是第几轮（见 injectionCadence.ts）。 */
+  lastMemoryInjection?: { charCount: number; at: number; mode?: 'full' | 'rules'; turn?: number; lastFullTurn?: number };
   /** Runtime lifecycle; on load, live states are treated as detached. */
   executorState: ExecutorState;
   lastExecutorError?: string;

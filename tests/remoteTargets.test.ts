@@ -659,18 +659,20 @@ describe('远程会话要告诉模型它在哪台机器上', () => {
 
   test('接线：每轮都注入，位置在 memory 块前面（= 最终数组里更靠近用户那句话）', () => {
     const M = fs.readFileSync(path.join(process.cwd(), 'src/main/index.ts'), 'utf8');
-    assert.match(M, /const rc = remoteContextFor\(sessionId, entry\);/);
-    assert.match(M, /prompt = \[\{ type: 'text', text: rc \}, \.\.\.prompt\];/);
+    /* 每轮都注入：首轮 / 压缩·回放后是完整说明，其余轮次一行简短的（injectionCadence.ts） */
+    assert.match(M, /try \{ rc = remoteContextFor\(sessionId, entry\); \} catch \{\}/);
+    assert.match(M, /const remoteText = injectPlan\.remote === 'full' \? rc\s*: remoteBriefLine\(/);
+    assert.match(M, /prompt = \[\{ type: 'text', text: remoteText \}, \.\.\.prompt\];/);
     /*
       **按调用名定位，不按完整实参定位**：`buildMemoryInjection` 现在还要传
       `{ remote }`（远程会话的 memory 文件在用户机器上，只有 `local_write` 到得了），
       写死实参会让这条在加参数时假失败 —— 而它要守的是**顺序**，跟实参无关。
     */
     /* memory 块现在在忙闸之前异步读好（buildMemoryInjectionAsync），插进 prompt 的位置是这里 */
-    const memAt = M.indexOf('memoryBlockFor(memoryPrefetch, effectiveProjectId');
+    const memAt = M.indexOf("prompt = [{ type: 'text', text: block }, ...prompt];");
     assert.ok(memAt > 0, '找不到 memory 注入的调用');
     assert.ok(
-      M.indexOf('const rc = remoteContextFor(sessionId, entry);') < memAt,
+      M.indexOf("prompt = [{ type: 'text', text: remoteText }, ...prompt];") < memAt,
       '先注入它，memory 块再压在它上面 —— 顺序决定谁更靠近用户那句话',
     );
     /* 两个路径都来自会话自己的记录，不是猜的 */

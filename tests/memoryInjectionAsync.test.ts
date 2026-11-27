@@ -92,10 +92,10 @@ describe('记忆拼装：异步那份和同步那份一字不差', () => {
   test('接线：发送路径在忙闸之前异步读好（heavyLane），读完复核项目 / 机器、变了就重读；之后只用读好的，没有同步退路', () => {
     const MAIN = fs.readFileSync(path.join(import.meta.dirname, '..', 'src', 'main', 'index.ts'), 'utf8');
     /* 读的时候占住执行器、读完核对执行器没动过（sendPrep.test.ts） */
-    const pre = MAIN.indexOf('const read = await prepOnExecutor(sessionId, entry, prepDeps, () => heavyLane(() => buildMemoryInjectionAsync(target.projectId, sessionId, { remote: target.remote })));');
+    const pre = MAIN.indexOf('const read = await prepOnExecutor(sessionId, entry, prepDeps, () => heavyLane(() => buildMemoryPartsAsync(target.projectId, sessionId, { remote: target.remote })));');
     const gate = MAIN.indexOf('if (entry.busy && !handoff) {', pre);
     const reserve = MAIN.indexOf('entry.busy = true; // in-flight turn', pre);
-    const use = MAIN.indexOf('const block = isFeatureEnabled(\'memoryInjection\')', pre);
+    const use = MAIN.indexOf('const memoryParts = isFeatureEnabled(\'memoryInjection\')', pre);
     assert.ok(pre > 0, '预读那一句');
     assert.ok(gate > pre, '预读在「这一轮在跑吗」那道闸之前（闸之后到占住这一轮之间不能有 await）');
     assert.ok(use > gate && reserve > use);
@@ -104,7 +104,7 @@ describe('记忆拼装：异步那份和同步那份一字不差', () => {
     /* 读完复核：项目 / 机器变了就按新的再读，对上了才收下 */
     const loop = MAIN.slice(pre - 400, gate);
     assert.match(loop, /for \(let want = memoryTargetFor\(projectId, sessionId, entry\); ;\) \{/);
-    assert.match(loop, /want = memoryTargetFor\(projectId, sessionId, entry\);\s*if \(want\.projectId === target\.projectId && want\.remote === target\.remote\) \{ memoryPrefetch = \{ \.\.\.target, block \}; break; \}/);
+    assert.match(loop, /want = memoryTargetFor\(projectId, sessionId, entry\);\s*if \(want\.projectId === target\.projectId && want\.remote === target\.remote\) \{ memoryPrefetch = \{ \.\.\.target, parts \}; break; \}/);
     /* 用的地方：只用读好的那份 */
     assert.match(MAIN.slice(use, use + 600), /\? memoryBlockFor\(memoryPrefetch, effectiveProjectId, !!entry\.profile\.remote\?\.sshHost, sessionId\)/);
     /* index.ts 里不再有同步的记忆拼装 */

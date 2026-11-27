@@ -1,25 +1,34 @@
 import React, { useEffect, useState } from 'react';
 import { useT } from '../hooks/useLang';
+import type { Settings } from '../App';
+import { MEMORY_FULL_INTERVAL_MAX, MEMORY_FULL_INTERVAL_MIN, MEMORY_RULES_MAX_CHARS, normalizeMemoryFullInterval } from '../../main/injectionCadence.ts';
 
 interface MemoryDialogProps {
   projectId?: string; // current session's project (undefined = unassigned)
   sessionId?: string; // current session (undefined = none open)
   /** 打开就落在哪一层 —— 记忆太大横幅的「编辑」用它直接打开那一层（不给就按原来：有项目开项目层，否则全局） */
   initialTab?: 'global' | 'project' | 'session';
+  /** 「每轮都完整注入（旧行为）」和完整注入的间隔存在设置里（主进程从 ui-state 读，见 main/injectionCadence.ts） */
+  settings: Settings;
+  onSettingsChange: (s: Settings) => void;
   onClose: () => void;
 }
+
+/** 这条会话上次注入的情况（record.json 的 lastMemoryInjection） */
+type InjectionInfo = { charCount: number; at: number; mode?: 'full' | 'rules'; turn?: number; lastFullTurn?: number } | null;
 
 type Scope = 'global' | 'project' | 'session';
 /** The editable scopes plus a read-only view of what the last send really carried. */
 type Tab = Scope | 'snapshot';
 
-export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId, initialTab, onClose }) => {
+export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId, initialTab, settings, onSettingsChange, onClose }) => {
   const t = useT();
   const defaultTab = (): Tab => initialTab || (projectId ? 'project' : 'global');
   const [tab, setTab] = useState<Tab>(defaultTab);
   const [text, setText] = useState<Record<Scope, string>>({ global: '', project: '', session: '' });
   const [paths, setPaths] = useState<Record<Scope, string | null>>({ global: '', project: null, session: null });
   const [loading, setLoading] = useState(true);
+  const [injection, setInjection] = useState<InjectionInfo>(null);
   const [saved, setSaved] = useState<Scope | null>(null);
   const [snapshot, setSnapshot] = useState<{
     text: string; at: number | null; path: string | null;
@@ -42,6 +51,7 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
       if (!alive) return;
       setText({ global: m.global, project: m.project, session: m.session });
       setPaths({ global: m.globalPath, project: m.projectPath, session: m.sessionPath });
+      setInjection(m.injection ?? null);
       setLoading(false);
     }).catch(() => setLoading(false));
     return () => { alive = false; };
@@ -104,6 +114,13 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
   ];
 
   const active = tabs.find((t) => t.scope === tab)!;
+  const fullEveryTurn = settings.memoryFullEveryTurn === true;
+  const interval = normalizeMemoryFullInterval(settings.memoryFullInterval);
+  const lastFullText = !sessionId ? ''
+    : !injection ? t('Not injected into this chat yet')
+    : typeof injection.lastFullTurn === 'number' && typeof injection.turn === 'number'
+      ? t('Last full injection: turn {n} (this backend session is at turn {m})', { n: injection.lastFullTurn, m: injection.turn })
+      : t('Last full injection: before this version (turn not recorded)');
 
   return (
     <>
@@ -116,6 +133,31 @@ export const MemoryDialog: React.FC<MemoryDialogProps> = ({ projectId, sessionId
         <div className="settings-header">
           <h3>{`🧠 ${t('Memory')}`}</h3>
           <button className="settings-close" onClick={onClose}>✕</button>
+        </div>
+
+        {/* 记忆怎么注入（token 优化 3/5）：每层多大、上次完整注入是第几轮、两个设置 */}
+        <div className="memory-inject-bar">
+          <span>{t('Size: global {g} · project {p} · this chat {s} chars', {
+            g: text.global.length,
+            p: projectId ? text.project.length : '—',
+            s: sessionId ? text.session.length : '—',
+          })}</span>
+          {lastFullText && <span>{lastFullText}</span>}
+          <label className="memory-inject-toggle">
+            <input type="checkbox" checked={fullEveryTurn}
+              onChange={(e) => onSettingsChange({ ...settings, memoryFullEveryTurn: e.target.checked })} />
+            {t('Inject the full memory every turn (old behavior)')}
+          </label>
+          <span className="memory-inject-interval" style={{ opacity: fullEveryTurn ? 0.5 : 1 }}>
+            {t('Full injection every')}
+            <button className="settings-btn" disabled={fullEveryTurn}
+              onClick={() => onSettingsChange({ ...settings, memoryFullInterval: normalizeMemoryFullInterval(interval - 1) })}>−</button>
+            <span className="settings-value">{interval}</span>
+            <button className="settings-btn" disabled={fullEveryTurn}
+              onClick={() => onSettingsChange({ ...settings, memoryFullInterval: normalizeMemoryFullInterval(interval + 1) })}>＋</button>
+            {t('turns (memory full injection)')}
+          </span>
+          <p className="memory-inject-hint">{t('The full memory goes out on the first turn of a backend session, after compaction / a new backend session / a history replay, after any layer changes, and every {n} turns ({min}–{max}). Other turns carry only the rules (up to {chars} chars) plus the file paths: paragraphs wrapped in <!-- always --> … <!-- /always -->, or, in a layer without markers, level-2 sections whose title contains {titles}.', { n: interval, min: MEMORY_FULL_INTERVAL_MIN, max: MEMORY_FULL_INTERVAL_MAX, chars: MEMORY_RULES_MAX_CHARS, titles: '硬规矩 / 规矩 / 口径 / 规则' })}</p>
         </div>
 
         <div style={{ display: 'flex', gap: 6, padding: '8px 16px 0' }}>
