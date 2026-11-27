@@ -229,7 +229,7 @@ test('接线：缓存被对账重载时把丢掉的 id 和它们在哪条会话�
 
 test('接线：追问建议在**发起时**按会话记一行（完成那行要隔几秒到几十秒，单看它不能当「新会话 messages 非空」的证据）', () => {
   const C = fs.readFileSync(new URL('../src/renderer/components/ChatArea.tsx', import.meta.url), 'utf8');
-  assert.match(C, /window\.kiroApi\.generateSuggestions\?\.\(recent, \{ sessionId: currentSessionId, messages: messages\.length, paneFocused \}\)/);
+  assert.match(C, /window\.kiroApi\.generateSuggestions\?\.\(recent, \{ sessionId: currentSessionId, messages: messages\.length, paneFocused, lastReply: last\.content\.slice\(-1500\), contextPercent: usage\?\.contextPercent \}\)/);
   const h = MAIN.slice(MAIN.indexOf("ipcMain.handle('app:generate-suggestions'"), MAIN.indexOf("ipcMain.handle('app:generate-suggestions'") + 1500);
   const req = h.indexOf("logger.info('suggestions', `requested sessionId=");
   assert.ok(req > 0, '没有发起时那一行');

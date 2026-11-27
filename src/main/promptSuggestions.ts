@@ -105,3 +105,67 @@ export function planSuggestionLookup(o: { engine?: string; cached?: string[]; tr
   if (o.tried) return { kind: 'skip' };
   return { kind: 'ask' };
 }
+
+/**
+ * **kiro 会话的追问建议少调几次**（token 优化 5/5）：每次都是一次辅助模型调用（远程会话还要在远端起一个 kiro-cli），
+ * 所以只在回复确实在等用户接话时才生成。Claude Code / Codex 走它们自己的（上面），不经过这里。
+ */
+export const SUGGESTION_CONTEXT_MAX_PCT = 70;
+
+/** 对话文字（`User: … \n\nAssistant: …`）里最后一条助手回复；没有就是空串。 */
+export function lastAssistantReplyOf(convo: string): string {
+  const s = String(convo || '');
+  const at = s.lastIndexOf('Assistant: ');
+  if (at < 0) return '';
+  const tail = s.slice(at + 'Assistant: '.length);
+  const nextUser = tail.indexOf('\n\nUser: ');
+  return (nextUser < 0 ? tail : tail.slice(0, nextUser)).trim();
+}
+
+/** 等用户拍板的说法（只看最后一段） */
+const DECISION_WORDS = /要不要|需不需要|是否需要|是否要|你定|您定|你决定|您决定|由你|看你|选哪|哪个更|哪一个|哪种|哪一种|你看呢|你觉得呢|您看|可以吗|行吗|好吗|请确认|确认一下|告诉我|let me know|would you like|do you want|should i\b|shall i\b|which (?:one|option|approach)|your call|you decide|prefer/i;
+/** 编号 / 字母 / 圈号选项：`1.` `2)` `A.` `b、` `①` */
+const NUMBERED_ITEM = /^\s*(?:\d{1,2}|[A-Za-z])[.)、:：]\s*\S|^\s*[①-⑩]\s*\S/;
+const BULLET_ITEM = /^\s*[-*•+]\s+\S/;
+const OPTION_INTRO = /选项|方案|做法|选择|选一|二选一|options?\b|choices?\b|alternatives?\b|either/i;
+
+/**
+ * 回复是不是在等用户接话：最后一段以问号结尾 / 末尾是一组编号选项（或「选项 / 方案」引出的列表）/ 最后一段明确在等用户决定。
+ * 普通的陈述、普通的变更清单都不算。
+ */
+export function replyInvitesFollowUp(reply: string): boolean {
+  const text = String(reply || '').replace(/```[\s\S]*?```/g, '').trim();
+  if (!text) return false;
+  const paras = text.split(/\n\s*\n/).map((p) => p.trim()).filter(Boolean);
+  const last = paras[paras.length - 1] || '';
+  /* 结尾的 markdown 标记 / 括号 / 引号 / emoji 不算 */
+  const bare = last.replace(/[\s*_`~)）\]】」』"'”’\p{Extended_Pictographic}️]+$/u, '');
+  if (/[?？]$/.test(bare)) return true;
+  if (DECISION_WORDS.test(last)) return true;
+  /* 末尾这一块是列表：编号的 ≥ 2 条就算选项；无序列表要有「选项 / 方案」之类引出（不然多半是变更清单） */
+  const lines = text.split('\n');
+  let i = lines.length - 1;
+  while (i >= 0 && !lines[i].trim()) i--;
+  let numbered = 0, bullets = 0;
+  for (; i >= 0; i--) {
+    const l = lines[i];
+    if (!l.trim()) continue;
+    if (NUMBERED_ITEM.test(l)) numbered++;
+    else if (BULLET_ITEM.test(l)) bullets++;
+    else if (/^\s{2,}\S/.test(l)) continue;   // 列表项的续行
+    else break;
+  }
+  if (numbered >= 2) return true;
+  if (bullets >= 2 && i >= 0 && OPTION_INTRO.test(lines[i])) return true;
+  return false;
+}
+
+export type SuggestionGate = { ok: true } | { ok: false; reason: 'off' | 'context-high' | 'not-a-question' };
+
+/** 要不要为这一轮生成（kiro）：设置里关了 → off；上下文 ≥ 70% → context-high；回复不是在等用户接话 → not-a-question。 */
+export function suggestionGate(o: { enabled: boolean; contextPct?: number | null; reply: string }): SuggestionGate {
+  if (!o.enabled) return { ok: false, reason: 'off' };
+  if (typeof o.contextPct === 'number' && Number.isFinite(o.contextPct) && o.contextPct >= SUGGESTION_CONTEXT_MAX_PCT) return { ok: false, reason: 'context-high' };
+  if (!replyInvitesFollowUp(o.reply)) return { ok: false, reason: 'not-a-question' };
+  return { ok: true };
+}

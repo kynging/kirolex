@@ -578,7 +578,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   listHelperModels: (opts?: { cachedOnly?: boolean }) => ipcRenderer.invoke('acp:list-helper-models', opts),
   getUsage: () => ipcRenderer.invoke('acp:get-usage'),
   generateTitle: (firstUser: string, firstAssistant?: string, sessionId?: string) => ipcRenderer.invoke('app:generate-title', firstUser, firstAssistant, sessionId),
-  generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),
+  generateSuggestions: (recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean; lastReply?: string; contextPercent?: number }) => ipcRenderer.invoke('app:generate-suggestions', recentConvo, meta),
   /** Claude Code 的下一句预测到了 / 清掉了（`suggestions: []`）—— 追问建议区跟着换 */
   onPromptSuggestions: (cb: (d: { sessionId: string; suggestions: string[] }) => void) => {
     const handler = (_e: any, d: any) => cb(d);

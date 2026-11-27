@@ -4561,7 +4561,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     let cancelled = false;
     const timer = setTimeout(() => {
       /* 带上是哪一格、哪条会话、几条消息：主进程在**发起时**记一行（「generated」那行要等几秒到几十秒，单看它分不出是谁触发的） */
-      window.kiroApi.generateSuggestions?.(recent, { sessionId: currentSessionId, messages: messages.length, paneFocused })
+      /* 最后一条回复的结尾（上面每条只截了开头 800 字）+ 上下文占用：主进程据此判断 kiro 这一轮要不要生成 */
+      window.kiroApi.generateSuggestions?.(recent, { sessionId: currentSessionId, messages: messages.length, paneFocused, lastReply: last.content.slice(-1500), contextPercent: usage?.contextPercent })
         .then((r) => {
           if (cancelled) return;
           if (r?.suggestions?.length) {
@@ -4573,6 +4574,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           else if (r?.source === 'native-claude') { suggestionCache.delete(key); setDynamicSuggestions({ key: null, items: [] }); return; }
           /* Codex 这一轮失败 / 超时：不再问（每轮只生成一次）。记在模块级：切走会话再切回来、分屏重新挂载也不再问 */
           else if (r?.source === 'codex-exec') { markSuggestionTried(key); return; }
+          /* kiro 这一轮按规则不生成（不是在问问题 / 上下文高 / 关了）：这一轮不再问，建议区不显示 */
+          else if (r?.skipped) { markSuggestionTried(key); return; }
           // Nothing came back (timeout / backend hiccup): release the per-turn
           // guard so the next turn tries again instead of staying empty forever.
           else suggestionsForRef.current = null;

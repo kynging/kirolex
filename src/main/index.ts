@@ -117,7 +117,7 @@ import { autoCompactDue, compactLedgerKey, gatedCompaction, localDay, runLargeCo
 import { backupMemoryFile, memoryFileForBackup, readCompactLedger, recordCompactDay, restoreMemoryBackup } from './largeMemoryFiles.ts';
 import { memoryCompactGroup } from './memoryCompactNote.ts';
 import { shouldConsolidate, buildConsolidationPrompt, autoConsolidationSkipReason, applyAutoConsolidation, CONSOLIDATE_EVERY } from './sessionMemory.ts';
-import { PromptSuggestionStore, SuggestionTurnLedger, parseSuggestionLines, suggestionSourceFor, suggestionsPrompt, type SuggestionSource } from './promptSuggestions.ts';
+import { PromptSuggestionStore, SuggestionTurnLedger, lastAssistantReplyOf, parseSuggestionLines, suggestionGate, suggestionSourceFor, suggestionsPrompt, type SuggestionGate, type SuggestionSource } from './promptSuggestions.ts';
 import { CODEX_SUGGEST_TIMEOUT_MS, codexFinalMessage, codexToolAttempt, codexSuggestArgs, codexTopLevelString, localCodexLaunch, parseRemoteCodexOutput, remoteCodexSuggestScript } from './codexSuggestions.ts';
 import { remoteAdapterLaunchFor } from './remoteAdapterProbe.ts';
 import { globalModuleRoots } from './engines.ts';
@@ -1285,6 +1285,21 @@ async function engineOwnSuggestions(sessionId: string | null | undefined, convo:
   const { result, reused } = codexSuggestTurns.run(sessionId, turn, () => codexExecSuggestions(sessionId, convo, profile!));
   if (reused) logger.info('suggestions', `skipped source=codex-exec sessionId=${sessionId} reason=already generated (or tried) for this turn —— 用记下的结果，不再起 codex`);
   return { ...(await result), source };
+}
+
+/**
+ * **kiro 会话的追问建议要不要生成**（token 优化 5/5，判据在 `promptSuggestions.ts` 的 `suggestionGate`）：设置里关了、
+ * 这条会话上下文 ≥ 70%、回复不是在等用户接话 —— 都不调辅助模型。上下文占用取渲染层带来的和主进程记下的里大的那个。
+ */
+type SuggestionMeta = { sessionId?: string | null; messages?: number; paneFocused?: boolean; lastReply?: string; contextPercent?: number };
+function kiroSuggestionGate(meta: SuggestionMeta | undefined, convo: string): SuggestionGate {
+  const pcts = [meta?.contextPercent, meta?.sessionId ? sessionClients.get(meta.sessionId)?.injectCadence?.contextPct : undefined]
+    .filter((p): p is number => typeof p === 'number' && Number.isFinite(p));
+  const contextPct = pcts.length ? Math.max(...pcts) : undefined;
+  const reply = typeof meta?.lastReply === 'string' && meta.lastReply.trim() ? meta.lastReply : lastAssistantReplyOf(convo);
+  const gate = suggestionGate({ enabled: isFeatureEnabled('promptSuggestions'), contextPct, reply });
+  if (!gate.ok) logger.info('suggestions', `skipped reason=${gate.reason} sessionId=${meta?.sessionId || '?'}${contextPct !== undefined ? ` pct=${Math.round(contextPct)}` : ''} —— 不调辅助模型`);
+  return gate;
 }
 
 /** Codex 会话：同一台机器上 `codex exec`，同一个 model / provider，effort low、只读、不联网（`codexSuggestions.ts`） */
@@ -17852,7 +17867,7 @@ ${hint}` : ''}` };
   // Dynamic, conversation-aware prompt suggestions: given the recent transcript,
   // produce a few short follow-up prompts the user is likely to want next. One-
   // shot kiro-cli via execFile (args array — the convo text can't shell-inject).
-  ipcMain.handle('app:generate-suggestions', async (_event, recentConvo: string, meta?: { sessionId?: string | null; messages?: number; paneFocused?: boolean }) => {
+  ipcMain.handle('app:generate-suggestions', async (_event, recentConvo: string, meta?: SuggestionMeta) => {
     /*
       **发起时记一行：哪条会话、几条消息** ——「新建会话 10:40:36，10:40:45 `[suggestions] generated 3`」被当成过
       「新会话那时 messages 已经非空」的证据，但「generated」是**完成**时记的，一次要排队 + 起 kiro-cli + 跑模型，
@@ -17869,6 +17884,9 @@ ${hint}` : ''}` };
     /* Claude Code / Codex 会话用它们自己的（原生预测 / codex exec），不交给 kiro（`engineOwnSuggestions`） */
     const own = await engineOwnSuggestions(meta?.sessionId, convo);
     if (own) return own;
+    /* kiro：不是在问问题 / 上下文 ≥ 70% / 关了 → 不调 */
+    const gate = kiroSuggestionGate(meta, convo);
+    if (!gate.ok) return { suggestions: [], skipped: gate.reason };
     const prompt = suggestionsPrompt(convo);
     try {
       const stdout = await runLiteOneShot(prompt, 'suggestions');
