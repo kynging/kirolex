@@ -49,6 +49,8 @@ import { isSessionTool, sessionToolDefs } from './sessionCalls.ts';
 import { CMD_UTF8_VAR, cmdUtf8Args, decodeLocalOutput, powershellArgs } from './winShell.ts';
 import { taskkillTree } from './procTree.ts';
 import { commandMissingReason, resolveCommand } from './commandResolve.ts';
+import { capToolOutput, countLines, sliceLines, utf8Head } from './toolOutputCap.ts';
+import { TOOL_OUTPUT_DEFAULT_KB, toolOutputSplit } from './toolOutputLimits.ts';
 
 /** MCP 协议版本：跟 kiro-cli 报的那个对齐（它不认就会在 initialize 上直接失败）。 */
 export const MCP_PROTOCOL_VERSION = '2025-06-18';
@@ -56,13 +58,27 @@ export const MCP_PROTOCOL_VERSION = '2025-06-18';
 /**
  * 单个文件读取上限 —— 再大就不该整份塞进上下文。
  *
- * **必须小于 `MAX_OUTPUT_BYTES`**：单测里踩到的一个真问题 —— 上限设成 256 KB 而总输出上限
+ * **合计上限（`MAX_READ_TOTAL_BYTES`）必须小于 `HARD_OUTPUT_BYTES`**：单测里踩到的一个真问题 —— 上限设成 256 KB 而总输出上限
  * 128 KB 时，"只读了前 N 字节"那句说明自己被总输出的截断切掉了，于是模型拿到的是
  * **一份看起来完整的半个文件**，而它会照着残缺内容改代码。
  */
 export const MAX_READ_BYTES = 64 * 1024;
-/** 一次调用总输出上限（grep 打爆上下文是真实发生的事）。 */
-export const MAX_OUTPUT_BYTES = 128 * 1024;
+/**
+ * `local_read` 一次调用多个文件的**合计**上限 —— 原来一次读 10 个文件就能塞 640KB 进上下文。
+ * 超出的文件不读，只说「未读：超过本次合计上限，单独再读」和文件大小。
+ */
+export const MAX_READ_TOTAL_BYTES = 96 * 1024;
+/**
+ * `local_bash` / `local_grep` / `local_glob` / `local_git` / 「过一会儿再看」那组工具交给模型的输出**默认**上限（设置里可调 16–128KB，
+ * 见 `LocalMcpDeps.outputCapBytes`、`toolOutputLimits.ts`）。超了留开头 1/3 + 结尾 2/3，完整输出落盘（`toolOutputCap.ts`）。
+ * 一轮 $64.86 的那条会话就是连着二十几次 local_* 调用、每次最多 128KB。
+ */
+export const MAX_OUTPUT_BYTES = TOOL_OUTPUT_DEFAULT_KB * 1024;
+/**
+ * 兜底的硬上限（浏览器 / 会话互调这些自己有上限的工具，和 `local_read` 的合计 96KB）。
+ * 已经按头 + 尾截过的结果（`callTool` 里的 `capped`）**不再**过它 —— 再从开头截一刀会把结尾切掉。
+ */
+export const HARD_OUTPUT_BYTES = 128 * 1024;
 /** `local_bash` 的默认超时。它跑在你机器上，卡住的是这一轮。 */
 export const BASH_TIMEOUT_MS = 120_000;
 
@@ -239,6 +255,10 @@ export interface LocalMcpDeps {
   forwardRetry?: ForwardRetry;
   /** 转发 stdio MCP 的 stderr 怎么解（默认 `decodeLocalOutput`：Windows 上按本机代码页兜底；测试换成指定代码页）。 */
   decodeStderr?: (buf: Buffer) => string;
+  /** 交给模型的工具输出上限（字节，设置里的「工具输出上限」）。不给 = `MAX_OUTPUT_BYTES`（24KB）。 */
+  outputCapBytes?(): number;
+  /** 截断时完整输出写到哪（会话的 files 目录，下面再建 `.kirolex-tool-output/`）。不给 = 这条会话的工作目录。 */
+  outputDir?(sessionId: string): string;
 }
 
 export interface ToolResult {
@@ -250,23 +270,39 @@ export interface ToolResult {
  * 工具清单 —— 给模型看的描述里要写清"这是用户那台机器"。
  * `browser`：总开关开着才把 `local_browser_*` 列进去；`browserOnly`：本地会话只列那几个。
  */
-export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean; wake?: boolean; sessions?: boolean } = {}): Array<{ name: string; description: string; inputSchema: any }> {
+export function toolDefs(opts: { browser?: boolean; browserOnly?: boolean; wake?: boolean; sessions?: boolean; outputCapBytes?: number } = {}): Array<{ name: string; description: string; inputSchema: any }> {
   const browser = opts.browser ? browserToolDefs() : [];
   const wake = opts.wake ? wakeToolDefs() : [];
   const sessions = opts.sessions ? sessionToolDefs() : [];
   if (opts.browserOnly) return [...browser, ...wake, ...sessions];
-  return [...fileToolDefs(), ...browser, ...wake, ...sessions];
+  return [...fileToolDefs(opts.outputCapBytes ?? MAX_OUTPUT_BYTES), ...browser, ...wake, ...sessions];
 }
 
-function fileToolDefs(): Array<{ name: string; description: string; inputSchema: any }> {
+/** 工具说明里的截断规则（跟着设置里的上限走）—— 模型得知道被截了、完整的在哪、怎么去读。 */
+const kb = (n: number): string => `${Math.round(n / 1024)}KB`;
+
+function capRule(cap: number): string {
+  const { head, tail } = toolOutputSplit(cap);
+  return `\n**输出上限 ${kb(cap)}**：超过时只返回开头 ${kb(head)} + 结尾 ${kb(tail)}，中间换成一行「…省略 N KB，完整输出在 <路径>…」，`
+    + '完整输出存在那个文件里 —— 需要中间部分时用 local_read 按 offset / limit（按行）去读，不要重跑命令。';
+}
+
+function fileToolDefs(cap: number): Array<{ name: string; description: string; inputSchema: any }> {
   return [
     {
       name: 'local_read',
       description: '读用户本机上的文件。**一次可以给多个路径**（每多一次调用就多一个往返，'
-        + '所以要读三个文件就一次给三个）。相对路径相对这条会话的工作目录。',
+        + '所以要读三个文件就一次给三个）。相对路径相对这条会话的工作目录。'
+        + `\n**上限**：单个文件最多 ${kb(MAX_READ_BYTES)}，一次调用所有文件合计最多 ${kb(MAX_READ_TOTAL_BYTES)} —— `
+        + '超出合计的文件不读，只标「未读：超过本次合计上限，单独再读」和文件大小。'
+        + '大文件用 offset（从第几行开始，1 起）/ limit（读几行）读一段；工具输出被截断时给的完整输出文件也这样读。',
       inputSchema: {
         type: 'object',
-        properties: { paths: { type: 'array', items: { type: 'string' }, description: '文件路径，可多个' } },
+        properties: {
+          paths: { type: 'array', items: { type: 'string' }, description: '文件路径，可多个' },
+          offset: { type: 'number', description: '从第几行开始读（1 起，对每个路径都生效）' },
+          limit: { type: 'number', description: '读几行（不给 = 读到结尾，仍受单文件上限）' },
+        },
         required: ['paths'],
       },
     },
@@ -295,7 +331,7 @@ function fileToolDefs(): Array<{ name: string; description: string; inputSchema:
     {
       name: 'local_grep',
       description: '在用户本机上搜内容（ripgrep，没有就退回 grep -rn）。在本地跑完，只回匹配行。'
-        + '不给 `dir` 就搜这条会话的**全部**目录。',
+        + '不给 `dir` 就搜这条会话的**全部**目录。' + capRule(cap),
       inputSchema: {
         type: 'object',
         properties: {
@@ -323,7 +359,8 @@ function fileToolDefs(): Array<{ name: string; description: string; inputSchema:
         + (process.platform === 'win32'
           ? '\n这台是 **Windows**：默认用 cmd.exe 跑（cmd 语法，代码页已设成 UTF-8）；'
             + '要用 PowerShell 就传 shell: "powershell"（-NoProfile -NonInteractive，输出同样是 UTF-8，命令原样交给它、不用另外转义引号）。'
-          : ''),
+          : '')
+        + capRule(cap),
       inputSchema: {
         type: 'object',
         properties: {
@@ -375,10 +412,10 @@ export function gitArgsProblem(argv: string[]): string | null {
   return null;
 }
 
-function clip(s: string, max = MAX_OUTPUT_BYTES): string {
+function clip(s: string, max = HARD_OUTPUT_BYTES): string {
   const b = Buffer.from(s, 'utf8');
   if (b.length <= max) return s;
-  return `${b.subarray(0, max).toString('utf8')}\n…（输出被截断：共 ${b.length} 字节，上限 ${max}）`;
+  return `${utf8Head(b, max).toString('utf8')}\n…（输出被截断：共 ${b.length} 字节，上限 ${max}）`;
 }
 
 function text(t: string, isError = false): ToolResult {
@@ -435,6 +472,14 @@ export async function callTool(
 ): Promise<ToolResult> {
   const cwd = session.workdir;
   const abs = (p: string): string => (path.isAbsolute(p) ? p : path.resolve(cwd, p));
+  /* 交给模型的那份按设置截断（头 + 一行提示 + 尾），完整的落到会话 files 目录 —— 见 `toolOutputCap.ts` */
+  const capped = (t: string, isError = false): ToolResult => {
+    const cap = outputCap(deps);
+    let dir = session.workdir;
+    try { dir = deps.outputDir?.(session.sessionId) || session.workdir; } catch { /* 同上 */ }
+    /* 不再过 `text()` 的 128KB 硬上限：设置成 128KB 时头 + 尾 + 提示必然超过它，再从开头截一刀就把结尾（结果 / 报错）切掉了 */
+    return { content: [{ type: 'text', text: capToolOutput(t, { maxBytes: cap, dir }).text }], isError: isError || undefined };
+  };
   if (isBrowserTool(name)) {
     if (!deps.browser?.enabled()) return text('local_browser 没开：请用户在 KiroLex 设置 → 开关 → 本地浏览器 里打开总开关。', true);
     const r = await deps.browser.call(name, args, session.sessionId);
@@ -443,7 +488,7 @@ export async function callTool(
   if (isWakeTool(name)) {
     if (!deps.wake) return text(`没有这个工具：${name}`, true);
     const r = await deps.wake.call(name, args, session.sessionId, session.workdir);
-    return text(r.text, !!r.isError);
+    return capped(r.text, !!r.isError);
   }
   if (isSessionTool(name)) {
     if (!deps.sessions) return text(`没有这个工具：${name}`, true);
@@ -455,18 +500,42 @@ export async function callTool(
     case 'local_read': {
       const paths: string[] = Array.isArray(args?.paths) ? args.paths : [args?.path].filter(Boolean);
       if (!paths.length) return text('local_read 需要 paths', true);
+      /* offset / limit（按行）对每个路径都生效 —— 读大文件的一段、读截断时落盘的完整输出 */
+      const offset = Number(args?.offset) > 0 ? Number(args.offset) : undefined;
+      const limit = Number(args?.limit) > 0 ? Number(args.limit) : undefined;
+      const ranged = offset !== undefined || limit !== undefined;
       const parts: string[] = [];
+      /* 这次调用已经交出去的字节数：合计超过 MAX_READ_TOTAL_BYTES 的文件不读（一次读 10 个文件 = 640KB 那件事） */
+      let used = 0;
       for (const p of paths) {
         const f = abs(String(p));
         try {
           const st = fs.statSync(f);
           if (st.isDirectory()) { parts.push(`=== ${f} ===\n（这是一个目录，用 local_glob）`); continue; }
-          const buf = fs.readFileSync(f);
+          const whole = fs.readFileSync(f).toString('utf8');
+          const sl = ranged ? sliceLines(whole, offset, limit) : null;
+          const body = Buffer.from(sl ? sl.text : whole, 'utf8');
+          const firstLine = sl ? sl.from : 1;
+          const totalLines = sl ? sl.total : countLines(whole);
           /* 截断的说明放在**开头**：放结尾的话它会被总输出的截断切掉，
-             而"没有说明的半个文件"比拿不到文件更危险（它会照着残缺内容改代码）。 */
-          const cut = buf.length > MAX_READ_BYTES;
-          const head = cut ? `=== ${f} ===（**只有前 ${MAX_READ_BYTES} 字节，全文 ${buf.length} 字节** —— 需要后面的部分就用 local_bash 里的 sed/awk 取）` : `=== ${f} ===`;
-          parts.push(`${head}\n${(cut ? buf.subarray(0, MAX_READ_BYTES) : buf).toString('utf8')}`);
+             而"没有说明的半个文件"比拿不到文件更危险（它会照着残缺内容改代码）。
+             切在最后一个整行后面（没有换行就切在字的边界上），这样 offset 能接着读、中文不会切出半个字。 */
+          let shown: Buffer = body;
+          let head = sl ? `=== ${f} ===（第 ${sl.from}–${sl.to} 行，共 ${sl.total} 行）` : `=== ${f} ===`;
+          if (body.length > MAX_READ_BYTES) {
+            shown = utf8Head(body, MAX_READ_BYTES);
+            const nl = shown.lastIndexOf(0x0a);
+            if (nl > 0) shown = shown.subarray(0, nl);
+            const lastLine = firstLine + countLines(shown.toString('utf8')) - 1;
+            const next = nl > 0 ? `后面的部分用 offset=${lastLine + 1} 接着读` : '这一行超过单文件上限，后面的部分用 local_bash（head -c / sed）取';
+            head = `=== ${f} ===（**只有前 ${shown.length} 字节**（第 ${firstLine}–${lastLine} 行），全文 ${st.size} 字节 / ${totalLines} 行 —— ${next}）`;
+          }
+          if (used + shown.length > MAX_READ_TOTAL_BYTES) {
+            parts.push(`=== ${f} ===\n（未读：超过本次合计上限 ${kb(MAX_READ_TOTAL_BYTES)}，单独再读；文件大小 ${st.size} 字节）`);
+            continue;
+          }
+          used += shown.length;
+          parts.push(`${head}\n${shown.toString('utf8')}`);
         } catch (err: any) {
           parts.push(`=== ${f} ===\n（读不到：${err?.message || err}）`);
         }
@@ -502,11 +571,11 @@ export async function callTool(
       */
       if (process.platform === 'win32') {
         const hits = globNative(roots, pattern);
-        return text(hits.length ? hits.join('\n') : '（没有匹配的文件）');
+        return capped(hits.length ? hits.join('\n') : '（没有匹配的文件）');
       }
       const spec = pattern.includes('/') ? ['-path', `*${pattern.replace(/\*\*/g, '*')}`] : ['-name', pattern];
       const r = await run('find', [...roots, '-type', 'f', ...spec, '-not', '-path', '*/node_modules/*', '-not', '-path', '*/.git/*'], cwd, 30_000);
-      return text(r.out.trim() || '（没有匹配的文件）');
+      return capped(r.out.trim() || '（没有匹配的文件）');
     }
     case 'local_grep': {
       const roots = args?.dir ? [abs(String(args.dir))] : sessionRoots(session);
@@ -514,17 +583,17 @@ export async function callTool(
       if (!q) return text('local_grep 需要 query', true);
       const rg = await run('rg', ['-n', '--no-heading', ...(args?.glob ? ['-g', String(args.glob)] : []), '--', q, ...roots], cwd, 60_000);
       /* `spawnFailed` = 没装 ripgrep（不是"没搜到"）—— 那就退回 grep，见 `run` 那段 */
-      if (!rg.spawnFailed && (rg.code === 0 || rg.code === 1)) return text(rg.out.trim() || '（没有匹配）');
+      if (!rg.spawnFailed && (rg.code === 0 || rg.code === 1)) return capped(rg.out.trim() || '（没有匹配）');
       /*
         ripgrep 没有时的兜底。Windows 上没有 `grep`，所以那边用 Node 自己搜 ——
         慢一些，但"慢"和"这个工具根本不工作"不是一个量级的问题。
       */
       if (process.platform === 'win32') {
         const hits = grepNative(roots, q, args?.glob ? String(args.glob) : undefined);
-        return text(hits.length ? hits.join('\n') : '（没有匹配）');
+        return capped(hits.length ? hits.join('\n') : '（没有匹配）');
       }
       const g = await run('grep', ['-rn', '--exclude-dir=node_modules', '--exclude-dir=.git', '--', q, ...roots], cwd, 60_000);
-      return text(g.out.trim() || '（没有匹配）');
+      return capped(g.out.trim() || '（没有匹配）');
     }
     case 'local_git': {
       const argv: string[] = Array.isArray(args?.args) ? args.args.map(String) : [];
@@ -535,7 +604,7 @@ export async function callTool(
           + '那条路会留痕。', true);
       }
       const r = await run('git', argv, cwd, 60_000);
-      return text(r.out.trim() || '（没有输出）');
+      return capped(r.out.trim() || '（没有输出）');
     }
     case 'local_bash': {
       const command = String(args?.command || '');
@@ -559,7 +628,7 @@ export async function callTool(
         : args?.shell === 'powershell'
           ? await run('powershell.exe', powershellArgs(command), cwd, timeoutMs)
           : await run(process.env.ComSpec || 'cmd.exe', cmdUtf8Args(), cwd, timeoutMs, true, { ...process.env, [CMD_UTF8_VAR]: command }, true);
-      return text(`[exit ${r.code}]\n${r.out.trim()}`);
+      return capped(`[exit ${r.code}]\n${r.out.trim()}`);
     }
     default:
       return text(`没有这个工具：${name}`, true);
@@ -567,6 +636,10 @@ export async function callTool(
 }
 
 /* ------------------------------------------------------------- JSON-RPC */
+
+function outputCap(deps: LocalMcpDeps): number {
+  try { return deps.outputCapBytes?.() || MAX_OUTPUT_BYTES; } catch { return MAX_OUTPUT_BYTES; }
+}
 
 /** 处理一条 JSON-RPC 消息。返回 `null` = 这是通知，不该回包。 */
 export async function handleRpc(
@@ -588,7 +661,7 @@ export async function handleRpc(
     case 'notifications/cancelled':
       return null;
     case 'tools/list':
-      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly, wake: !!deps.wake, sessions: !!deps.sessions }) });
+      return reply({ tools: toolDefs({ browser: !!deps.browser?.enabled(), browserOnly: session.browserOnly, wake: !!deps.wake, sessions: !!deps.sessions, outputCapBytes: outputCap(deps) }) });
     case 'tools/call': {
       const r = await callTool(String(msg?.params?.name || ''), msg?.params?.arguments || {}, session, deps);
       return reply(r);

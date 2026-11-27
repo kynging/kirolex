@@ -14,6 +14,7 @@ import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
 import { AUTO_COMPACT_DEFAULT_PCT, AUTO_COMPACT_MAX_PCT, AUTO_COMPACT_MIN_PCT, normalizeAutoCompactPct } from '../../main/contextReminder.ts';
+import { TOOL_OUTPUT_DEFAULT_KB, TOOL_OUTPUT_MAX_KB, TOOL_OUTPUT_MIN_KB, normalizeToolOutputKb } from '../../main/toolOutputLimits.ts';
 
 type SettingsTab = 'appearance' | 'session' | 'switches' | 'machines';
 
@@ -565,6 +566,18 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   onClick={() => onChange({ ...settings, autoCompactPct: normalizeAutoCompactPct((settings.autoCompactPct ?? AUTO_COMPACT_DEFAULT_PCT) + 5) })}>＋</button>
               </div>
               <p className="settings-hint">{t('Every turn costs more as the context fills up. When on, KiroLex sends the engine’s compact command once a turn ends and the chat is idle, and leaves a KiroLex note in the chat. Range {min}–{max}%, default {def}%. Codex has no compact command, so it is skipped. Off by default.', { min: AUTO_COMPACT_MIN_PCT, max: AUTO_COMPACT_MAX_PCT, def: AUTO_COMPACT_DEFAULT_PCT })}</p>
+            </div>
+            {/* 本机工具交给模型的输出上限（16–128KB，默认 24）—— 截断和落盘在 main/toolOutputCap.ts */}
+            <div className="settings-item">
+              <label className="settings-label">{t('Local tool output limit')}</label>
+              <div className="settings-control">
+                <button className="settings-btn"
+                  onClick={() => onChange({ ...settings, toolOutputKb: normalizeToolOutputKb(normalizeToolOutputKb(settings.toolOutputKb) - 8) })}>−</button>
+                <span className="settings-value">{normalizeToolOutputKb(settings.toolOutputKb)} KB</span>
+                <button className="settings-btn"
+                  onClick={() => onChange({ ...settings, toolOutputKb: normalizeToolOutputKb(normalizeToolOutputKb(settings.toolOutputKb) + 8) })}>＋</button>
+              </div>
+              <p className="settings-hint">{t('Output of local_bash and the other local tools that goes back to the model is cut to this size: the first third and the last two thirds are kept, the full output is saved under the chat’s files folder (kept 7 days) and the model is told where to read it. What you see in the chat is not cut. Range {min}–{max} KB, default {def} KB.', { min: TOOL_OUTPUT_MIN_KB, max: TOOL_OUTPUT_MAX_KB, def: TOOL_OUTPUT_DEFAULT_KB })}</p>
             </div>
             <div className="settings-item">
               <label className="settings-label">{t('Split grid (click a chat in the sidebar to add it; every pane has its own composer)')}</label>

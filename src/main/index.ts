@@ -31,6 +31,8 @@ import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
 import { contextLogLine } from './contextReminder';
+import { normalizeToolOutputKb } from './toolOutputLimits';
+import { TOOL_OUTPUT_DIR, expandToolOutputForDisplay } from './toolOutputCap';
 import { busyEnterLogLine, detachedTurnEnded, steerDisplay, steeringDegradedLogLine, steeringFailureLogLine, steeringPromptBlocks } from './busyEnterCaps';
 import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persistThenRelease, readPendingHandoffs, recoverableHandoffs, removePendingHandoff, restoreStartedHandoffs, restoredUserMessage, type PendingHandoff } from './pendingHandoffs';
 import { isReplayOutsideTurn, outsideTurnVerdict } from './replayGuard';
@@ -1479,6 +1481,28 @@ function extractToolOutput(blocks: unknown): string {
     .filter(Boolean)
     .join('\n')
     .trim();
+}
+
+/**
+ * **界面上显示完整的工具输出** ——「输出截断只影响交给模型的那份，界面里的完整输出照旧」。
+ * `local_bash` 等的结果超过上限时，交给模型（也就是执行器转回来的这份）是头 + 一行「完整输出在 <路径>」+ 尾；
+ * 发给界面之前把它换回那个文件里的完整输出（只认这条会话 files 目录下的 `.kirolex-tool-output/`，见 `toolOutputCap.ts`）。
+ * 只改发给界面的这一份：`data` 本身（执行器、模型、落盘那条路）不动。
+ */
+function toolOutputForDisplay(data: any, sessionId: string): any {
+  const u = data?.update;
+  if ((u?.sessionUpdate !== 'tool_call' && u?.sessionUpdate !== 'tool_call_update') || !Array.isArray(u.content)) return data;
+  if (!u.content.some((b: any) => typeof b?.content?.text === 'string' && b.content.text.includes('完整输出在 '))) return data;
+  const dir = path.join(getSessionDir(sessionId), SESSION_FILES_DIR, TOOL_OUTPUT_DIR);
+  let changed = false;
+  const content = u.content.map((b: any) => {
+    if (typeof b?.content?.text !== 'string' || !b.content.text.includes('完整输出在 ')) return b;
+    const text = expandToolOutputForDisplay(b.content.text, dir);
+    if (text === b.content.text) return b;
+    changed = true;
+    return { ...b, content: { ...b.content, text } };
+  });
+  return changed ? { ...data, update: { ...u, content } } : data;
 }
 
 /** Strip kiro-cli's DECORATION from a one-shot answer so the text can be used as
@@ -2970,6 +2994,9 @@ function ensureLocalMcpServer(): Promise<LocalMcpServer> {
     },
     wake: wakeMcpTools,   /* schedule_* / bg_* / watch（见 wakeTools.ts） */
     sessions: sessionMcpTools,
+    /* 交给模型的工具输出上限（设置 → 会话「本机工具输出上限」，默认 24KB）；截断时完整输出落到会话 files 目录（toolOutputCap.ts） */
+    outputCapBytes: () => normalizeToolOutputKb(readUiSettings().toolOutputKb) * 1024,
+    outputDir: (sid) => sessionFilesDir(sid),
     onProxyOk: forwardRecovered,
     onProxyFail: httpForwardFailed,
     onProxyState: forwardProxyState,
@@ -6570,6 +6597,9 @@ const bgJobs = new BgJobManager({
     scheduleBgPush();
   },
   log: (m) => logger.info('bg', m),
+  /* bg_run 退出 / watch 事件 / checkCommand 交给模型的输出：同 kirolex-local 的上限（设置「本机工具输出上限」），截断时完整输出落到会话 files 目录 */
+  outputCapBytes: () => normalizeToolOutputKb(readUiSettings().toolOutputKb) * 1024,
+  outputDir: (sid) => sessionFilesDir(sid),
 });
 
 /** 这条会话见过后台命令 / 监视的输出（唤醒里带着、或 bg_status 读到）：持久记下，之后的诊断包 / 上下文快照都不留会话内容。 */
@@ -9744,6 +9774,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     }
     /* 后端自己起的那一轮：见到结束信号（带 cost 的 usage_update / Codex idle）就收尾落盘，否则重新计时（`autonomousTurn.ts`） */
     if (entry.autonomous) autonomousFrame(entry, data?.update, autonomousDeps(sessionId, entry));
+    /* 工具输出被截断过（交给模型的头 + 尾）：发给界面的这份换回完整输出（`toolOutputForDisplay`） */
+    data = toolOutputForDisplay(data, sessionId);   // 这之后 data 只用来发给界面
     mainWindow?.webContents.send('acp:update', { ...data, sessionId, ...(childSessionId ? { childSessionId } : null) });
   });
   entry.replayUpdates = (list) => { for (const d of list) onUpdate(d, true); };

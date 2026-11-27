@@ -40,6 +40,7 @@ import { IconClose, IconLogs, EngineIcon } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
+import { TOOL_OUTPUT_DEFAULT_KB, normalizeToolOutputKb } from '../main/toolOutputLimits.ts';
 import { AUTO_COMPACT_DEFAULT_PCT, compactCommandFor, normalizeAutoCompactPct, stepAutoCompact, type AutoCompactTrack } from '../main/contextReminder.ts';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
 import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, enterRoute, resolveBusyEnter, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
@@ -745,6 +746,11 @@ export interface Settings {
   autoCompactContext?: boolean;
   /** 自动压缩阈值（%），50–90，默认 75（`AUTO_COMPACT_DEFAULT_PCT`）。 */
   autoCompactPct?: number;
+  /**
+   * 「本机工具输出上限」（KB，设置 → 会话）：local_bash 等交给模型的输出超过它就截成头 + 尾，完整的落盘。
+   * 16–128，默认 24（`main/toolOutputLimits.ts`）。主进程从 ui-state 里直接读（`localMcp.ts` 的 `outputCapBytes`）。
+   */
+  toolOutputKb?: number;
   /** After a restart, automatically RESEND an unanswered prompt when its chat is opened. */
   recoverInterruptedTurns: boolean;
   /** 被非人为原因打断（执行器死了、重启、看门狗）的那一轮最多自动重发几次。0 = 不重发。默认 10。 */
@@ -783,7 +789,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoCompactContext: false, autoCompactPct: AUTO_COMPACT_DEFAULT_PCT, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoCompactContext: false, autoCompactPct: AUTO_COMPACT_DEFAULT_PCT, toolOutputKb: TOOL_OUTPUT_DEFAULT_KB, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -986,6 +992,7 @@ function loadSettings(): Settings {
       merged.accentColor = normalizeAccent(merged.accentColor);
       merged.autoCompactContext = merged.autoCompactContext === true;
       merged.autoCompactPct = normalizeAutoCompactPct(merged.autoCompactPct);
+      merged.toolOutputKb = normalizeToolOutputKb(merged.toolOutputKb);
       return merged;
     }
   } catch {}

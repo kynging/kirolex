@@ -20,7 +20,7 @@ import { WinJobHost } from '../src/main/winJob.ts';
 /**
  * 后台命令（`bg_run`）和监视（`watch`）—— 真起进程跑（用本机这个 node），不 mock。
  *
- * 守的是：立即返回、退出时把「退出码 + 输出末尾（4KB 截断）」作为一条唤醒发回会话；
+ * 守的是：立即返回、退出时把「退出码 + 输出（超过上限截成头 + 尾，完整的落盘）」作为一条唤醒发回会话；
  * 监视每行一个事件、200ms 内合并、刷屏被限流停掉并说明；超时；用户停掉只杀自己起的进程；
  * 单会话上限；重启后补「已中断」；日志只记 jobId、命令前 80 字、退出码。
  */
@@ -115,15 +115,53 @@ describe('bg_run', () => {
     assert.equal(h.m.status('s1', r.job.jobId)?.exitCode, 3);
   });
 
-  test('输出末尾截到 4KB，保留的是**最后**那段', async () => {
-    const h = harness();
-    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("process.stdout.write('A'.repeat(20000)+'TAILEND')"), label: '大输出', cwd, timeoutMs: LONG_JOB_MS });
+  /* token 优化 2/5：原来只给末尾 4KB；现在按「本机工具输出上限」（默认 24KB）给头 + 尾，完整输出落盘 */
+  test('没超上限（20KB < 24KB）：输出整份给，不落盘', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const h = harness({ outputDir: () => files });
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd("process.stdout.write('HEADSTART'+'A'.repeat(20000)+'TAILEND')"), label: '大输出', cwd, timeoutMs: LONG_JOB_MS });
     assert.ok(r.ok);
     await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
+    assert.match(h.wakes[0].text, /HEADSTART/);
     assert.match(h.wakes[0].text, /TAILEND/);
-    const as = (h.wakes[0].text.match(/A/g) || []).length;
-    assert.ok(as <= BG_TAIL_BYTES, `A 有 ${as} 个，超过 4KB`);
-    assert.ok(as > BG_TAIL_BYTES - 100, '截断不该截掉太多');
+    assert.equal((h.wakes[0].text.match(/A/g) || []).length >= 20000, true);
+    assert.equal(fs.existsSync(path.join(files, '.kirolex-tool-output')), false);
+  });
+
+  test('超上限：开头 8KB + 一行「完整输出在 <路径>」+ 结尾 16KB，完整输出落在 outputDir(sessionId) 下', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const seen: string[] = [];
+    const h = harness({ outputDir: (sid) => { seen.push(sid); return files; } });
+    const js = "process.stdout.write('HEADSTART'+'B'.repeat(200000)+'TAILEND');process.exit(4)";
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd(js), label: '很大的输出', cwd, timeoutMs: LONG_JOB_MS });
+    assert.ok(r.ok);
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
+    const t = h.wakes[0].text;
+    assert.match(t, /4/);
+    assert.match(t, /HEADSTART/);
+    assert.match(t, /TAILEND/);
+    assert.ok(Buffer.byteLength(t) < 24 * 1024 + 1024, `唤醒 ${Buffer.byteLength(t)} 字节`);
+    const m = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(m, t.slice(8000, 8800));
+    assert.ok(m![1].startsWith(path.join(files, '.kirolex-tool-output')));
+    assert.ok(seen.includes('s1'));
+    assert.equal(fs.readFileSync(m![1], 'utf8'), 'HEADSTART' + 'B'.repeat(200000) + 'TAILEND');
+    assert.equal(h.m.status('s1', r.job.jobId)?.exitCode, 4, '退出码不变');
+  });
+
+  test('很长的输出（超过内存里留的量）边跑边落盘：文件是完整的，交给模型的照样是头 + 尾', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const h = harness({ outputDir: () => files, outputCapBytes: () => 16 * 1024 });
+    const js = "let i=0;const t=setInterval(()=>{process.stdout.write('C'.repeat(50000));if(++i===20){clearInterval(t);process.stdout.write('TAILEND')}},5)";
+    const r = h.m.start({ sessionId: 's1', kind: 'run', command: nodeCmd(js), label: '1MB', cwd, timeoutMs: LONG_JOB_MS });
+    assert.ok(r.ok);
+    await waitFor(() => h.wakes.length === 1, '退出唤醒', undefined, () => h.m.status('s1', r.job.jobId));
+    const t = h.wakes[0].text;
+    assert.match(t, /TAILEND/);
+    assert.ok(Buffer.byteLength(t) < 16 * 1024 + 1024, `上限读设置：${Buffer.byteLength(t)} 字节`);
+    const m = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(m);
+    assert.equal(fs.statSync(m![1]).size, 20 * 50000 + 'TAILEND'.length);
   });
 
   test('超时：结束进程并唤醒说明超时', async () => {
@@ -253,6 +291,119 @@ describe('watch：结束 / 超时那一刻的最后一批输出恰好触发限�
   });
 });
 
+describe('watch：一个事件也按上限截', () => {
+  test('一批输出超过上限：事件是头 + 一行「完整输出在 <路径>」+ 尾，完整的落盘', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const h = harness({ coalesceMs: 2000, outputDir: () => files });
+    /* 40 行、每行 400 个汉字（1200 字节）= 48KB，一个合并窗口里到齐 */
+    const js = "for(let i=0;i<40;i++)console.log('L'+i+' '+'中'.repeat(400));setInterval(()=>{},1000)";
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '大事件', cwd, timeoutMs: LONG_JOB_MS });
+    assert.ok(r.ok);
+    await waitFor(() => h.wakes.length >= 1, '第一个事件');
+    const t = h.wakes[0].text;
+    assert.ok(Buffer.byteLength(t) < 24 * 1024 + 1024, `事件 ${Buffer.byteLength(t)} 字节`);
+    assert.equal(t.includes('�'), false, '中文没被切坏');
+    assert.match(t, /L39 /);
+    const m = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(m, t.slice(0, 300));
+    assert.match(fs.readFileSync(m![1], 'utf8'), /L20 中/);
+    await h.m.stop(r.job.jobId, 'model');
+  });
+});
+
+describe('watch：完整内容在按行 / 按窗口裁剪之前就收好', () => {
+  /* 审查复现：长半行按 4096 个 UTF-16 单元分段，切在代理对（😀 / 𠮷）中间 → 永久变成两个替换字符 */
+  test('长半行分段不切开代理对（😀 / 𠮷）：事件内容和保存的文件都和原文一致', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const wakes: string[] = [];
+    const m = new BgJobManager({ wake: (_s, text) => { wakes.push(text); }, note: () => {}, changed: () => {}, log: () => {}, coalesceMs: 5, outputDir: () => files, outputCapBytes: () => 16 * 1024 });
+    managers.push(m);
+    const job: any = { jobId: 'watch_sp', sessionId: 's1', kind: 'watch', label: 't', command: 't', fullCommand: 't', cwd, state: 'running', startedAt: Date.now(), endedAt: null, exitCode: null, pid: null, events: 0,
+      child: null, out: Buffer.alloc(0), pendingLines: [], partial: '', partialBytes: Buffer.alloc(0), flushTimer: null, timeoutTimer: null, eventTimes: [], timeoutMs: LONG_JOB_MS };
+    (m as any).jobs.set(job.jobId, job);
+    /* 'a' 打头：每个 4096 单元的边界都落在一个代理对中间 */
+    const original = 'a' + '😀'.repeat(3000) + 'MID' + '𠮷'.repeat(3000);
+    (m as any).onOutput(job, Buffer.from(original, 'utf8'), true);
+    (m as any).onOutput(job, Buffer.from('\n'), true);
+    await waitFor(() => wakes.length >= 1, '事件');
+    const t = wakes[0];
+    assert.equal(t.includes('�'), false, '没有替换字符');
+    assert.ok(t.includes('😀'.repeat(200)));
+    assert.ok(t.includes('𠮷'.repeat(200)));
+    const mm = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(mm, t.slice(0, 300));
+    assert.equal(fs.readFileSync(mm![1], 'utf8').replace(/\n$/, ''), original);
+    job.state = 'stopped';
+  });
+
+  /* 审查复现：长半行被整块解码时，数据块末尾落在一个汉字中间 → 整块被当成「不是 UTF-8」按代码页解，完整输出里全是乱码 */
+  test('中文长半行跨数据块（切在字中间）：事件内容和保存的文件都和原文一致', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const wakes: string[] = [];
+    const m = new BgJobManager({ wake: (_s, text) => { wakes.push(text); }, note: () => {}, changed: () => {}, log: () => {}, coalesceMs: 5, outputDir: () => files, outputCapBytes: () => 16 * 1024 });
+    managers.push(m);
+    /* 不起进程：直接喂字节（和审查的复现一样），只测分块 / 解码 */
+    const job: any = { jobId: 'watch_t', sessionId: 's1', kind: 'watch', label: 't', command: 't', fullCommand: 't', cwd, state: 'running', startedAt: Date.now(), endedAt: null, exitCode: null, pid: null, events: 0,
+      child: null, out: Buffer.alloc(0), pendingLines: [], partial: '', partialBytes: Buffer.alloc(0), flushTimer: null, timeoutTimer: null, eventTimes: [], timeoutMs: LONG_JOB_MS };
+    (m as any).jobs.set(job.jobId, job);
+    const original = '中'.repeat(3000) + 'END' + '文'.repeat(3000);
+    const buf = Buffer.from(`${original}\n`, 'utf8');
+    for (const cut of [[0, 5000], [5000, 13001], [13001, buf.length]]) (m as any).onOutput(job, buf.subarray(cut[0], cut[1]), true);
+    await waitFor(() => wakes.length >= 1, '事件');
+    const t = wakes[0];
+    assert.equal(t.includes('�'), false, '没有替换字符');
+    /* Windows 上按代码页解坏的不是替换字符而是别的字：直接看开头 / 结尾是不是原来的字 */
+    assert.ok(t.includes('中'.repeat(500)), t.slice(0, 200));
+    assert.ok(t.includes('文'.repeat(500)), t.slice(-200));
+    const mm = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(mm, t.slice(0, 300));
+    assert.equal(fs.readFileSync(mm![1], 'utf8').replace(/\n$/, ''), original);
+    job.state = 'stopped';
+  });
+
+  /* 审查复现：约 200KB 的一行，原来只回约 4KB、TAILMARK 没了、也没有完整输出路径 */
+  test('超长的一行：事件里首尾标记都在，完整文件一字不差', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const h = harness({ coalesceMs: 2000, outputDir: () => files });
+    const js = "process.stdout.write('HEADMARK'+'x'.repeat(200000)+'TAILMARK\\n');setInterval(()=>{},1000)";
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '一长行', cwd, timeoutMs: LONG_JOB_MS });
+    assert.ok(r.ok);
+    await waitFor(() => h.wakes.length >= 1, '第一个事件');
+    const t = h.wakes[0].text;
+    assert.match(t, /HEADMARK/);
+    assert.match(t, /TAILMARK/);
+    assert.ok(Buffer.byteLength(t) < 24 * 1024 + 1024, `事件 ${Buffer.byteLength(t)} 字节`);
+    const m = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(m, t.slice(8000, 8800));
+    assert.equal(fs.readFileSync(m![1], 'utf8').trim(), 'HEADMARK' + 'x'.repeat(200000) + 'TAILMARK');
+    await h.m.stop(r.job.jobId, 'model');
+  });
+
+  test('合并窗口超过 WATCH_MAX_PENDING_CHARS：最早的行（HEADMARK）照样在事件开头和完整文件里', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const h = harness({ coalesceMs: 2000, outputDir: () => files });
+    /* 100 行 × 1000 字 = 100K 字，远超窗口里留的 16K 字 */
+    const js = "let o='HEADMARK\\n';for(let i=0;i<100;i++)o+='row'+i+' '+'y'.repeat(1000)+'\\n';o+='TAILMARK\\n';process.stdout.write(o);setInterval(()=>{},1000)";
+    const r = h.m.start({ sessionId: 's1', kind: 'watch', command: nodeCmd(js), label: '一大批', cwd, timeoutMs: LONG_JOB_MS });
+    assert.ok(r.ok);
+    await waitFor(() => h.wakes.length >= 1, '第一个事件');
+    const t = h.wakes[0].text;
+    assert.match(t, /HEADMARK/);
+    assert.match(t, /TAILMARK/);
+    assert.ok(Buffer.byteLength(t) < 24 * 1024 + 1024, `事件 ${Buffer.byteLength(t)} 字节`);
+    const m = t.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(m);
+    const full = fs.readFileSync(m![1], 'utf8');
+    assert.ok(full.startsWith('HEADMARK\n'));
+    for (let i = 0; i < 100; i++) assert.ok(full.includes(`row${i} `), `第 ${i} 行在完整文件里`);
+    assert.ok(full.trimEnd().endsWith('TAILMARK'));
+    /* 内存里那份照旧有上限 */
+    const job = (h.m as any).jobs.get(r.job.jobId);
+    assert.ok(job.pendingLines.join('').length <= WATCH_MAX_PENDING_CHARS);
+    await h.m.stop(r.job.jobId, 'model');
+  });
+});
+
 describe('watch：一直输出但不换行', () => {
   test('半行到上限就截成一个事件（每个事件不超过 4KB 多一点），照样走限流、内存不无限涨', async () => {
     const h = harness({ coalesceMs: 5, rateLimit: { events: 3, windowMs: 60_000 } });
@@ -262,7 +413,8 @@ describe('watch：一直输出但不换行', () => {
     await waitFor(() => h.m.status('s1', r.job.jobId)?.state === 'rate-limited', '不换行的刷屏也被限流停掉');
     const events = h.wakes.filter((w) => /x{100}/.test(w.text));
     assert.ok(events.length >= 1 && events.length <= 3, `事件数 ${events.length}`);
-    for (const e of events) assert.ok(Buffer.byteLength(e.text) < BG_TAIL_BYTES + 1024, `事件 ${Buffer.byteLength(e.text)} 字节`);
+    /* 每个事件按「本机工具输出上限」（默认 24KB）截 —— 原来是末尾 4KB */
+    for (const e of events) assert.ok(Buffer.byteLength(e.text) < 24 * 1024 + 1024, `事件 ${Buffer.byteLength(e.text)} 字节`);
     const job = (h.m as any).jobs.get(r.job.jobId);
     assert.ok(job.partial.length <= WATCH_MAX_LINE_CHARS, `半行留了 ${job.partial.length}`);
     assert.ok(job.pendingLines.join('').length <= WATCH_MAX_PENDING_CHARS, '攒着的行也有上限');
@@ -540,6 +692,24 @@ describe('runCheck（定时任务的检查命令）', () => {
     assert.equal(r.status, 'exited');
     assert.equal(r.status === 'exited' && r.code, 1);
     assert.match(r.output, /2 open/);
+    assert.equal(h.wakes.length, 0);
+  });
+
+  test('输出超上限：交回的是头 + 一行「完整输出在 <路径>」+ 尾，完整输出落盘；指纹照旧按完整输出算', async () => {
+    const files = fs.mkdtempSync(path.join(os.tmpdir(), 'kx-bgout-'));
+    const h = harness({ outputDir: () => files });
+    const cmd = nodeCmd("process.stdout.write('HEADSTART'+'D'.repeat(100000)+'TAILEND');process.exit(1)");
+    const r = await h.m.runCheck({ sessionId: 's1', command: cmd, cwd, timeoutMs: LONG_JOB_MS });
+    assert.equal(r.status, 'exited');
+    assert.equal(r.status === 'exited' && r.code, 1);
+    assert.match(r.output, /^HEADSTART/);
+    assert.match(r.output, /TAILEND$/);
+    assert.ok(Buffer.byteLength(r.output) < 24 * 1024 + 1024);
+    const m = r.output.match(/完整输出在 (.+?\.txt)/);
+    assert.ok(m);
+    assert.equal(fs.readFileSync(m![1], 'utf8'), 'HEADSTART' + 'D'.repeat(100000) + 'TAILEND');
+    const again = await h.m.runCheck({ sessionId: 's1', command: cmd, cwd, timeoutMs: LONG_JOB_MS });
+    assert.equal(again.status === 'exited' && again.fingerprint, r.status === 'exited' && r.fingerprint);
     assert.equal(h.wakes.length, 0);
   });
 

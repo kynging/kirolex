@@ -4,14 +4,16 @@
  * 以前模型只能用 `local_bash` 起一个 `nohup` 循环：输出回不到聊天，也没有东西唤醒会话，于是它要么
  * 在一轮里 sleep 轮询（占着这一轮、超时就断），要么让用户自己盯着。这里把"等"交给主进程：
  *
- *   · `bg_run`：立刻返回 jobId；命令**退出时**把「退出码 + 输出末尾（截到 4KB）」作为一条唤醒发回会话；
+ *   · `bg_run`：立刻返回 jobId；命令**退出时**把「退出码 + 输出」作为一条唤醒发回会话（输出超过设置里的上限 —— 默认 24KB ——
+ *     就截成开头 1/3 + 一行「完整输出在 <路径>」+ 结尾 2/3，见 `toolOutputCap.ts`）；
  *   · `watch`：长期运行的命令，**每行 stdout 一个事件**（200ms 内的行合并成一条）；
  *     事件太多（默认 1 分钟超过 20 条）自动停掉并说明；超时（默认 30 分钟、上限 2 小时）结束并通知。
  *
  * 唤醒怎么发（忙时等这一轮结束、不进排队卡片）不归这里管 —— 这里只调 `deps.wake`，
  * index.ts 把它接到 `WakeDispatcher`。
  *
- * **凭证安全**：输出只在内存里、原样交给会话，不落盘；日志里只记 jobId、命令前 80 字和退出码。
+ * **凭证安全**：输出原样交给会话；只有**超过上限被截断**的那份完整输出落盘（会话自己的 files 目录下 `.kirolex-tool-output/`，
+ * 7 天后清掉，跨电脑同步 / 备份跳过点开头的目录）—— 不截断的输出照旧只在内存里。日志里只记 jobId、命令前 80 字和退出码。
  * 重启登记（`bg-jobs.json`）里也只有标签和命令前 80 字 —— 它只为了重启后能说一句「已中断」。
  *
  * **只结束自己起的进程**：POSIX 上命令起在自己的进程组里（`detached`），按组发信号；Windows 上命令起在一个专属的
@@ -28,6 +30,8 @@ import path from 'path';
 import { WinJobHost, type JobHost } from './winJob.ts';
 import { trIn, uiLang, type UiLang } from './uiText.ts';
 import { decodeLocalOutput } from './winShell.ts';
+import { OutputSpool, capToolOutput, incompleteUtf8Tail } from './toolOutputCap.ts';
+import { TOOL_OUTPUT_DEFAULT_KB } from './toolOutputLimits.ts';
 import type { OwnBgJob } from './bgJobSync.ts';
 
 /** `check`：定时任务的 `checkCommand`（`runCheck`）—— 结果交回调用方，不唤醒会话、不进列表 / 登记 / 名额。 */
@@ -96,6 +100,10 @@ export interface BgJobDeps {
   rateLimit?: { events: number; windowMs: number };
   /** Windows 作业对象（测试可以换掉；不给就用常驻的 PowerShell 辅助进程，见 winJob.ts）。 */
   jobHost?: JobHost;
+  /** 交给模型的输出上限（字节，设置里的「本机工具输出上限」）。不给 = 24KB。 */
+  outputCapBytes?(): number;
+  /** 截断时完整输出写到哪（会话的 files 目录）。不给 = 命令的工作目录。 */
+  outputDir?(sessionId: string): string;
 }
 
 /** `runCheck` 的结果（同 schedule.ts 的 `ScheduleCheckResult`）。`stopped`：退出 KiroLex / 删会话时被结束了。 */
@@ -141,6 +149,13 @@ interface Job extends BgJobView {
   hash?: Hash;
   /** `check`：还没喂进指纹的末尾空白（输出末尾多一个换行不算变化）。 */
   wsTail?: Buffer;
+  /** `run` / `check`：完整输出（大了落盘），结束时按上限截成头 + 尾交给模型（`toolOutputCap.ts`）。 */
+  spool?: OutputSpool;
+  /**
+   * `watch`：**这一个事件**的完整内容（每行原样，不受 `WATCH_MAX_LINE_CHARS` / `WATCH_MAX_PENDING_CHARS` 的裁剪），
+   * 发事件时按上限截成头 + 尾、完整的落盘，然后换一个新的。`pendingLines` 只用来触发合并 / 限流、给内存设上限。
+   */
+  eventSpool?: OutputSpool;
 }
 
 /** 末尾空白最多压着这么多字节不喂进指纹，超过就照算（一直只输出空白的命令不能让它无限涨）。 */
@@ -171,6 +186,12 @@ export function outputTail(buf: Buffer, max: number, lang: UiLang = uiLang()): s
   return `${trIn(lang, '…(earlier output omitted, showing the last {n} bytes)', { n: max })}\n${body}`;
 }
 
+/** 在 `n` 处切字符串时往前让一位，避开 UTF-16 代理对的中间。 */
+export function safeCut(s: string, n: number): number {
+  const c = s.charCodeAt(n - 1);
+  return n > 1 && c >= 0xd800 && c <= 0xdbff ? n - 1 : n;
+}
+
 export class BgJobManager {
   private readonly jobs = new Map<string, Job>();
   /** `check` 任务结束时把结果交给谁（`runCheck` 的 Promise）。 */
@@ -183,6 +204,20 @@ export class BgJobManager {
   }
 
   private lang(): UiLang { return this.deps.lang?.() ?? uiLang(); }
+
+  private outputCap(): number {
+    try { return this.deps.outputCapBytes?.() || TOOL_OUTPUT_DEFAULT_KB * 1024; } catch { return TOOL_OUTPUT_DEFAULT_KB * 1024; }
+  }
+
+  private outputDir(job: { sessionId: string; cwd: string }): string {
+    try { return this.deps.outputDir?.(job.sessionId) || job.cwd; } catch { return job.cwd; }
+  }
+
+  /** 交给模型的输出（`run` 的退出 / 超时、`check` 的结果）：按上限截成头 + 尾，完整的落盘。 */
+  private modelOutput(job: Job): string {
+    if (!job.spool) return outputTail(job.out, BG_TAIL_BYTES, this.lang());
+    return job.spool.render(this.outputCap()).text;
+  }
 
   start(input: BgStartInput): { ok: true; job: BgJobView } | { ok: false; error: string } {
     const lang = this.lang();
@@ -207,6 +242,8 @@ export class BgJobManager {
       timeoutMs: input.timeoutMs,
       ...(input.kind === 'check' ? { hash: createHash('sha256'), wsTail: Buffer.alloc(0) } : {}),
     };
+    /* 按本机输出的解码规则（Windows 上 UTF-8 / 本机代码页按行判断）转成 UTF-8 再存：完整输出文件要能用 local_read 读 */
+    if (input.kind !== 'watch') job.spool = new OutputSpool({ dir: () => this.outputDir(job), id: jobId, decode: decodeLocalOutput });
     let started: { child: ChildProcess; owner: ProcessOwner };
     try {
       started = process.platform === 'win32'
@@ -380,6 +417,7 @@ export class BgJobManager {
 
   private onOutput(job: Job, chunk: Buffer, isStdout: boolean): void {
     if (job.kind === 'check' && job.hash) this.feedFingerprint(job, chunk);
+    if (job.state === 'running') job.spool?.write(chunk);
     job.out = Buffer.concat([job.out, chunk]);
     if (job.out.length > KEEP_BYTES) job.out = job.out.subarray(job.out.length - KEEP_BYTES);
     if (job.kind !== 'watch' || !isStdout || job.state !== 'running') return;
@@ -388,26 +426,43 @@ export class BgJobManager {
     let whole = bytes.subarray(0, bytes.lastIndexOf(0x0a) + 1);
     let rest = bytes.subarray(whole.length);
     /* 半行太长（字节数超过字数上限）：整块交给下面按字数截的那段 */
-    if (rest.length > WATCH_MAX_LINE_CHARS) { whole = bytes; rest = Buffer.alloc(0); }
+    if (rest.length > WATCH_MAX_LINE_CHARS) {
+      /* 但末尾那个没收全的 UTF-8 字留到下一块：切在字中间的话整块会被当成「不是 UTF-8」按代码页解成乱码（完整输出也跟着坏） */
+      const keep = incompleteUtf8Tail(bytes);
+      whole = bytes.subarray(0, bytes.length - keep);
+      rest = bytes.subarray(bytes.length - keep);
+    }
     job.partialBytes = Buffer.from(rest);
     const text = job.partial + decodeLocalOutput(whole);
     const lines = text.split(/\r?\n/);
     job.partial = lines.pop() ?? '';
+    /* 先把整行**原样**收进这个事件的完整内容（下面的按字数截、丢最老的行只影响内存里那份） */
+    for (const l of lines) if (l.trim() !== '') this.eventWrite(job, `${l}\n`);
     /*
       **一直输出却不换行**（进度条、二进制、单行 JSON 流）：半行不能无限攒 —— 那样内存一直涨，
       而且永远不成事件、连限流都轮不到。到上限就把它当成一行截下来发，后面的接着算下一行。
     */
     while (job.partial.length > WATCH_MAX_LINE_CHARS) {
-      lines.push(job.partial.slice(0, WATCH_MAX_LINE_CHARS));
-      job.partial = job.partial.slice(WATCH_MAX_LINE_CHARS);
+      /* 分段点不落在代理对（😀 / 𠮷）中间：切开的两半各自转 UTF-8 会永久变成两个替换字符 */
+      const piece = job.partial.slice(0, safeCut(job.partial, WATCH_MAX_LINE_CHARS));
+      lines.push(piece);
+      /* 同一行的前一段：不加换行，后面的接着写 */
+      this.eventWrite(job, piece);
+      job.partial = job.partial.slice(piece.length);
     }
-    const fresh = lines.filter((l) => l.trim() !== '').map((l) => (l.length > WATCH_MAX_LINE_CHARS ? l.slice(0, WATCH_MAX_LINE_CHARS) : l));
+    const fresh = lines.filter((l) => l.trim() !== '').map((l) => (l.length > WATCH_MAX_LINE_CHARS ? l.slice(0, safeCut(l, WATCH_MAX_LINE_CHARS)) : l));
     if (!fresh.length) return;
     job.pendingLines.push(...fresh);
-    /* 合并窗口里攒着的也有上限：只留最新的那些（反正一个事件只发末尾 4KB） */
+    /* 合并窗口里攒着的也有上限：只留最新的那些（事件的内容取自 `eventSpool`，这里只管内存和触发） */
     let pending = job.pendingLines.reduce((n, l) => n + l.length, 0);
     while (pending > WATCH_MAX_PENDING_CHARS && job.pendingLines.length > 1) pending -= job.pendingLines.shift()!.length;
     if (!job.flushTimer) job.flushTimer = setTimeout(() => this.flushWatch(job), this.deps.coalesceMs ?? WATCH_COALESCE_MS);
+  }
+
+  /** 收进当前这个事件的完整内容（没有就新开一个）。 */
+  private eventWrite(job: Job, s: string): void {
+    if (!job.eventSpool) job.eventSpool = new OutputSpool({ dir: () => this.outputDir(job), id: `${job.jobId}-e${job.events + 1}` });
+    job.eventSpool.write(Buffer.from(s, 'utf8'));
   }
 
   /** 把攒着的几行作为一个事件发出去；先过限流。 */
@@ -415,17 +470,23 @@ export class BgJobManager {
     if (job.flushTimer) { clearTimeout(job.flushTimer); job.flushTimer = null; }
     if (job.state !== 'running' || !job.pendingLines.length) return;
     const lines = job.pendingLines.splice(0);
+    const spool = job.eventSpool;
+    job.eventSpool = undefined;
     const limit = this.deps.rateLimit ?? WATCH_RATE_LIMIT;
     const now = Date.now();
     job.eventTimes = job.eventTimes.filter((t) => now - t < limit.windowMs);
     if (job.eventTimes.length >= limit.events) {
+      spool?.close();
       void this.terminate(job, 'rate-limited');
       return;
     }
     job.eventTimes.push(now);
     job.events += 1;
     const lang = this.lang();
-    const body = outputTail(Buffer.from(lines.join('\n'), 'utf8'), BG_TAIL_BYTES, lang);
+    /* 一个事件也按上限截（头 + 尾，完整的落盘）：内容取自 `eventSpool`（没被按行 / 按窗口裁剪过的那份） */
+    const body = spool
+      ? spool.render(this.outputCap()).text
+      : capToolOutput(lines.join('\n').replace(/\s+$/, ''), { maxBytes: this.outputCap(), dir: this.outputDir(job), id: `${job.jobId}-${job.events}` }).text;
     this.deps.wake(job.sessionId, `${trIn(lang, '👀 Watch "{label}" ({id}) new output:', { label: job.label, id: job.jobId })}\n${body}`, this.view(job));
   }
 
@@ -445,7 +506,7 @@ export class BgJobManager {
     const lang = this.lang();
     if (job.kind === 'check') {
       await killAndWait(job);
-      this.settleCheck(job, { status: why === 'timeout' ? 'timeout' : 'stopped', output: outputTail(job.out, BG_TAIL_BYTES, lang) });
+      this.settleCheck(job, { status: why === 'timeout' ? 'timeout' : 'stopped', output: this.modelOutput(job) });
       return;
     }
     const dur = formatDuration(job.endedAt - job.startedAt, lang);
@@ -464,7 +525,7 @@ export class BgJobManager {
   }
 
   private tailBlock(job: Job, lang: UiLang): string {
-    const tail = outputTail(job.out, BG_TAIL_BYTES, lang);
+    const tail = this.modelOutput(job);
     return tail ? `${trIn(lang, 'Last output:')}\n${tail}` : trIn(lang, '(no output)');
   }
 
@@ -473,7 +534,7 @@ export class BgJobManager {
     if (job.state !== 'running') return;
     if (job.kind === 'watch') {
       if (job.partialBytes.length) { job.partial += decodeLocalOutput(job.partialBytes); job.partialBytes = Buffer.alloc(0); }
-      if (job.partial.trim()) { job.pendingLines.push(job.partial); job.partial = ''; }
+      if (job.partial.trim()) { job.pendingLines.push(job.partial); this.eventWrite(job, job.partial); job.partial = ''; }
       this.flushWatch(job);
       /* 同上：最后一批触发了限流就以限流为准，只通知那一次 */
       if (job.state !== 'running') return;
@@ -486,7 +547,7 @@ export class BgJobManager {
     this.announce();
     const lang = this.lang();
     if (job.kind === 'check') {
-      const output = state === 'failed' ? String(error || '') : outputTail(job.out, BG_TAIL_BYTES, lang);
+      const output = state === 'failed' ? String(error || '') : this.modelOutput(job);
       this.settleCheck(job, state === 'failed' ? { status: 'failed', output } : { status: 'exited', code, output, fingerprint: `sha256:${job.hash!.digest('hex')}` });
       return;
     }
@@ -503,6 +564,8 @@ export class BgJobManager {
   }
 
   private clearTimers(job: Job): void {
+    job.spool?.close();
+    job.eventSpool?.close();
     if (job.timeoutTimer) { clearTimeout(job.timeoutTimer); job.timeoutTimer = null; }
     if (job.flushTimer) { clearTimeout(job.flushTimer); job.flushTimer = null; }
   }
