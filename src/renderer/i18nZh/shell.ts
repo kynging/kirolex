@@ -257,4 +257,7 @@ export const ZH_SHELL: Record<string, string> = {
   /* 侧栏会话菜单：主动调出恢复选择器（recoveryRequest.ts） */
   'Recover this chat…': '恢复这条会话…',
   'Stuck or blocked? Switch model or engine, roll back to an earlier message, or start a new backend session.': '卡住了或被拦了？换模型或引擎、回滚到之前的某条消息，或者换一个后端会话。',
+  // ── SettingsDialog 会话页：自动压缩 ──
+  'Auto-compact when context reaches X%': '上下文到 X% 时自动压缩',
+  'Every turn costs more as the context fills up. When on, KiroLex sends the engine’s compact command once a turn ends and the chat is idle, and leaves a KiroLex note in the chat. Range {min}–{max}%, default {def}%. Codex has no compact command, so it is skipped. Off by default.': '上下文越满，每轮越贵。开着时，一轮结束、会话空闲后 KiroLex 发引擎自己的压缩命令，并在会话里留一条 KiroLex 提示。范围 {min}–{max}%，默认 {def}%。Codex 没有压缩命令，跳过。默认关。',
 };

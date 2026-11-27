@@ -186,6 +186,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
   sessionEngine: (sessionId: string) => ipcRenderer.invoke('acp:session-engine', sessionId),
   /* 忙时 Enter 走了哪条路，进主进程日志（`[prompt] busy-enter …`） */
   logBusyEnter: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => ipcRenderer.send('acp:busy-enter-log', d),
+  /* 上下文占用提醒 / 压缩进主进程日志（`[context] remind|compact sessionId=… pct=…`） */
+  logContext: (d: { kind: 'remind' | 'compact'; sessionId: string; pct: number; via?: string }) => ipcRenderer.send('acp:context-log', d),
   /* 渲染端挂好 session:engine-models 监听了（窗口刷新后）：请主进程把连着的会话的能力各推一次 */
   engineModelsReady: () => ipcRenderer.send('acp:engine-models-ready'),
   setEngineModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:set-engine-model', sessionId, model),

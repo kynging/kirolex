@@ -607,4 +607,15 @@ export const ZH_CHAT: Record<string, string> = {
   'This message came from another session; after you edit it, that session still matches the reply to its original call.': '这是别的会话发来的，编辑后发起方仍按原 call 认回复。',
   'Cancel this one: it will not be processed, and the session that sent it is told': '取消这条：不处理它，并告诉发来它的那条会话',
   'Cancel this message': '取消这条消息',
+  // ── ContextReminder.tsx / App 自动压缩 ──
+  'Context is {pct}% used; every turn from here costs more.': '上下文已用 {pct}%，后面每轮会更贵。',
+  'Compact after this turn ends': '这一轮结束后再压',
+  'Resend the stopped turn from the composer first; compacting now would replace it': '先在输入框重发刚停下的那一轮再压（现在压会把它顶掉）',
+  'Have the engine summarize older context in this backend session': '让引擎在当前后端会话里把较早的上下文压成摘要',
+  'Compact context': '压缩上下文',
+  'Start a fresh backend session; the conversation goes along with the next message': '换一个新的后端会话，对话内容跟着下一条带过去',
+  'New backend session with summary': '换后端会话并带摘要',
+  'Failed': '失败',
+  '🗜️ Context was at {pct}%, so KiroLex compacted it automatically (Settings → Chats → auto-compact).': '🗜️ 上下文到了 {pct}%，KiroLex 已自动压缩（设置 → 会话 → 自动压缩）。',
+  '⚠️ Context was at {pct}%; KiroLex tried to compact it automatically, but that did not succeed.': '⚠️ 上下文到了 {pct}%，KiroLex 自动压缩没有成功。',
 };

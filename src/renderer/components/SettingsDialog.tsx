@@ -13,6 +13,7 @@ import { mergeHelperModelLists, planHelperRoute, helperChoiceText, LOCAL_MACHINE
 import React from 'react';
 import { useEffect, useState } from 'react';
 import type { Settings } from '../App';
+import { AUTO_COMPACT_DEFAULT_PCT, AUTO_COMPACT_MAX_PCT, AUTO_COMPACT_MIN_PCT, normalizeAutoCompactPct } from '../../main/contextReminder.ts';
 
 type SettingsTab = 'appearance' | 'session' | 'switches' | 'machines';
 
@@ -547,6 +548,23 @@ export const SettingsDialog: React.FC<SettingsDialogProps> = ({
                   onClick={() => onChange({ ...settings, autoRetryMax: Math.min(50, (settings.autoRetryMax ?? 10) + 1) })}>＋</button>
               </div>
               <p className="settings-hint">{t('After the executor drops mid-turn, restarts, or is interrupted by the watchdog, the turn is resent automatically, up to this many times (with backoff between retries). 0 = never resend automatically. Turns you stopped yourself don’t count.')}</p>
+            </div>
+            {/* 上下文越满每轮越贵：到阈值时自动压缩（默认关，阈值 75，50–90）—— 判据 main/contextReminder.ts */}
+            <div className="settings-item">
+              <label className="settings-label">{t('Auto-compact when context reaches X%')}</label>
+              <div className="settings-control">
+                <ToggleButton
+                  on={settings.autoCompactContext === true}
+                  onChange={(next) => onChange({ ...settings, autoCompactContext: next, autoCompactPct: normalizeAutoCompactPct(settings.autoCompactPct ?? AUTO_COMPACT_DEFAULT_PCT) })}
+                  ariaLabel={t('Auto-compact when context reaches X%')}
+                />
+                <button className="settings-btn" disabled={settings.autoCompactContext !== true}
+                  onClick={() => onChange({ ...settings, autoCompactPct: normalizeAutoCompactPct((settings.autoCompactPct ?? AUTO_COMPACT_DEFAULT_PCT) - 5) })}>−</button>
+                <span className="settings-value">{normalizeAutoCompactPct(settings.autoCompactPct)}%</span>
+                <button className="settings-btn" disabled={settings.autoCompactContext !== true}
+                  onClick={() => onChange({ ...settings, autoCompactPct: normalizeAutoCompactPct((settings.autoCompactPct ?? AUTO_COMPACT_DEFAULT_PCT) + 5) })}>＋</button>
+              </div>
+              <p className="settings-hint">{t('Every turn costs more as the context fills up. When on, KiroLex sends the engine’s compact command once a turn ends and the chat is idle, and leaves a KiroLex note in the chat. Range {min}–{max}%, default {def}%. Codex has no compact command, so it is skipped. Off by default.', { min: AUTO_COMPACT_MIN_PCT, max: AUTO_COMPACT_MAX_PCT, def: AUTO_COMPACT_DEFAULT_PCT })}</p>
             </div>
             <div className="settings-item">
               <label className="settings-label">{t('Split grid (click a chat in the sidebar to add it; every pane has its own composer)')}</label>

@@ -3,7 +3,7 @@ import { baseName } from './pathBits.ts';
 import { type SubagentRow, type TurnSubagent } from '../main/subagents.ts';
 import { uiGet, uiSet, uiRemove } from './uiStore';
 import { restoreGet, restoreSet, restoreGetJson } from './uiRestore';
-import { displayTitle, normalizeLang, t as translate, type Lang } from './i18n';
+import { displayTitle, normalizeLang, noteVariants, t as translate, type Lang } from './i18n';
 import { normalizeUiZoom, stepUiZoom, UI_ZOOM_DEFAULT } from './uiZoom';
 import { LangProvider } from './hooks/useLang';
 import { useRemoteTargets } from './hooks/useRemoteTargets';
@@ -40,6 +40,7 @@ import { IconClose, IconLogs, EngineIcon } from './components/Icons';
 import { Toasts, showToast } from './components/Toasts';
 import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
+import { AUTO_COMPACT_DEFAULT_PCT, compactCommandFor, normalizeAutoCompactPct, stepAutoCompact, type AutoCompactTrack } from '../main/contextReminder.ts';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
 import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, enterRoute, resolveBusyEnter, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
 import { type ProfileSyncEntry } from '../main/profileSync.ts';
@@ -322,6 +323,8 @@ declare global {
       onProfileSync?: (cb: (d: { sessions: ProfileSyncEntry[]; why?: string }) => void) => () => void;
       /** 忙时 Enter 走了哪条路，进主进程日志（`acp:busy-enter-log`） */
       logBusyEnter?: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => void;
+      /** 上下文占用提醒 / 压缩进主进程日志（`acp:context-log`） */
+      logContext?: (d: { kind: 'remind' | 'compact'; sessionId: string; pct: number; via?: string }) => void;
       /** 挂好 session:engine-models 监听后握手：主进程把连着的会话的能力各推一次（`acp:engine-models-ready`） */
       engineModelsReady?: () => void;
       /** Persist a CONSUMED steer into the durable transcript (its only writer:
@@ -735,6 +738,13 @@ export interface Settings {
   /** 「在其他电脑上同步外观」（主题 / 对比度 / 强调色 / 字体 / 字号 + theme.json；uiZoom 不同步）。缺省开。 */
   syncAppearance?: boolean;
   mergeQueuedMessages: boolean;
+  /**
+   * 「上下文到 X% 时自动压缩」（设置 → 会话）。默认关；开着时只在一轮结束、会话空闲时发引擎的压缩命令
+   * （`main/contextReminder.ts` 的 `stepAutoCompact`），做完在会话里留一条 KiroLex 提示。
+   */
+  autoCompactContext?: boolean;
+  /** 自动压缩阈值（%），50–90，默认 75（`AUTO_COMPACT_DEFAULT_PCT`）。 */
+  autoCompactPct?: number;
   /** After a restart, automatically RESEND an unanswered prompt when its chat is opened. */
   recoverInterruptedTurns: boolean;
   /** 被非人为原因打断（执行器死了、重启、看门狗）的那一轮最多自动重发几次。0 = 不重发。默认 10。 */
@@ -773,7 +783,7 @@ export const SPLIT_GRIDS: Record<SplitGrid, { rows: number; cols: number; capaci
   // grids fall back to 2x2 (see loadSettings).
 };
 
-const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
+const DEFAULT_SETTINGS: Settings = { fontSize: 12, uiZoom: UI_ZOOM_DEFAULT, fontFamily: '', monoFontFamily: '', theme: 'dark', contrast: 'standard', accentColor: '', themeDark: 'kirolex-dark', themeLight: 'kirolex-light', syncAppearance: true, mergeQueuedMessages: false, autoCompactContext: false, autoCompactPct: AUTO_COMPACT_DEFAULT_PCT, autoFoldThinking: false, autoFoldTools: true, recoverInterruptedTurns: true, autoRetryMax: 10, restoreUiState: true, engineAccents: true, splitGrid: '1x2', language: 'zh' };
 
 /** One open file in the viewer. Content and view state live PER TAB so switching
  *  back restores exactly what you were looking at. */
@@ -974,6 +984,8 @@ function loadSettings(): Settings {
       merged.themeLight = normalizeThemeId(merged.themeLight, 'light');
       merged.contrast = normalizeContrast(merged.contrast);
       merged.accentColor = normalizeAccent(merged.accentColor);
+      merged.autoCompactContext = merged.autoCompactContext === true;
+      merged.autoCompactPct = normalizeAutoCompactPct(merged.autoCompactPct);
       return merged;
     }
   } catch {}
@@ -4298,6 +4310,104 @@ const App: React.FC = () => {
   }, [sessions, streamingIds, queuesBySession, busyBySession, recoveringIds, loopingIds, permissionRequests]);
   useEffect(() => () => { if (idleTimerRef.current) clearTimeout(idleTimerRef.current); }, []);
 
+  /*
+    **上下文占用：提醒条上的两颗按钮 + 自动压缩**（判据都在 `main/contextReminder.ts`）。
+    压缩 = 引擎现有的压缩命令（kiro / Claude Code 的 `/compact`，和「管理上下文 → 压缩」同一条）；Codex 没有，只给换后端会话。
+    换后端会话 = `acp:new-backend-session`（同 SafeguardCard 那颗，上下文跟着下一条带过去）。都按这一格自己的会话。
+  */
+  const autoCompactTracksRef = useRef<Map<string, AutoCompactTrack>>(new Map());
+  /** 手动压了一次：读数降到阈值以下之前，自动压缩不跟着再压一次（压缩那一轮结束也算「一轮结束」）。 */
+  const disarmAutoCompact = useCallback((sid: string) => {
+    const cur = autoCompactTracksRef.current.get(sid);
+    autoCompactTracksRef.current.set(sid, { wasRunning: cur?.wasRunning ?? false, turnEnded: cur?.turnEnded ?? false, armed: false });
+  }, []);
+  const handleContextCompact = useCallback(async (sid: string | null, pct: number): Promise<{ ok: boolean; error?: string }> => {
+    const session = sid ? sessions.find((s) => s.id === sid) : undefined;
+    const command = compactCommandFor(session?.engine);
+    if (!sid || !command) return { ok: false };
+    if (composerRunning(streamingIds.includes(sid), busyBySession[sid])
+      || isBackendOccupied(busyBySession[sid]) || loopingIds.includes(sid) || queueSendingRef.current.has(sid)) {
+      return { ok: false, error: tRef.current('Compact after this turn ends') };
+    }
+    /* 在等你重发被停下的那一轮：/compact 会被当成那次重发、截掉停下的消息和半截回复 —— 不发（按钮也是灰的） */
+    if (interruptedSessionIds.includes(sid)) return { ok: false, error: tRef.current('Resend the stopped turn from the composer first; compacting now would replace it') };
+    window.kiroApi.logContext?.({ kind: 'compact', sessionId: sid, pct, via: 'remind' });
+    disarmAutoCompact(sid);
+    /*
+      **不走输入框那条发送**（handleSendMessage）：那条会把输入框里还没发的附件一起带上、发完清空，
+      附件就跟着 /compact 走了。这里和自动压缩同一条：按目标会话发、不带附件、不动草稿、不抢焦点；
+      maintenance 再兜一道 —— 会话在等你重发被停下的那一轮时不发（不吃覆盖标记、不截记录）。
+    */
+    queueSendingRef.current.add(sid);
+    try {
+      if (await sendQueuedMessage(sid, command, [], { maintenance: true }) === 'skipped') {
+        window.kiroApi.logContext?.({ kind: 'compact', sessionId: sid, pct, via: 'remind-skipped' });
+        return { ok: false, error: tRef.current('Resend the stopped turn from the composer first; compacting now would replace it') };
+      }
+      return turnOutcomeOf(sid).kind === 'ok' ? { ok: true } : { ok: false };
+    } catch (err: any) {
+      return { ok: false, error: String(err?.message || err || '') };
+    } finally {
+      queueSendingRef.current.delete(sid);
+    }
+  }, [sessions, streamingIds, busyBySession, loopingIds, interruptedSessionIds, sendQueuedMessage, disarmAutoCompact, turnOutcomeOf]);
+  const handleContextNewBackend = useCallback(async (sid: string | null, pct: number) => {
+    if (!sid) return { ok: false };
+    window.kiroApi.logContext?.({ kind: 'compact', sessionId: sid, pct, via: 'new-backend' });
+    const r = await window.kiroApi.newBackendSession?.(sid);
+    return r ? { ok: !!r.ok, error: r.error } : { ok: false };
+  }, []);
+  /*
+    自动压缩：每次会话状态 / 读数变化走一步 `stepAutoCompact`。只在一轮结束、会话空闲（不在跑、后端没被占、没有排队、
+    没在发、没在循环 / 自动重发 / 换模型、没在等权限、没在等待退出）且读数到了阈值时发；发了之后读数没降到阈值以下就不再发。
+    发的时候占住 `queueSendingRef`，排空队列那边这期间不往同一条会话里发。
+  */
+  useEffect(() => {
+    const enabled = settings.autoCompactContext === true;
+    const thresholdPct = normalizeAutoCompactPct(settings.autoCompactPct);
+    for (const session of sessions) {
+      const sid = session.id;
+      if (!sid || sid.startsWith('pending_') || session.archived) continue;
+      const running = composerRunning(streamingIds.includes(sid), busyBySession[sid]);
+      const idle = !running
+        && !quitPending
+        && attachedSessionIds.includes(sid)
+        && !connectingSessionIds.includes(sid)
+        && !isBackendOccupied(busyBySession[sid])
+        && (queuesBySessionRef.current[sid]?.length ?? 0) === 0
+        && !queueSendingRef.current.has(sid)
+        && !recoveringIds.includes(sid)
+        && !loopingIds.includes(sid)
+        && !permissionRequests[sid]
+        && !(sid === currentSessionId && (switchingModel || switchingAgent));
+      const pct = usageOf(sid)?.contextPercent ?? NaN;
+      /* 停止 / 打断 / 出错结束的那一轮不算（在等你重发，下一条会覆盖它）—— outcome 是 ref，停止时同步就记上了，比 interruptedSessionIds 早 */
+      const interrupted = interruptedSessionIds.includes(sid) || turnOutcomeOf(sid).kind !== 'ok';
+      const step = stepAutoCompact(autoCompactTracksRef.current.get(sid), { running, idle, pct, enabled, thresholdPct, engine: session.engine, interrupted });
+      autoCompactTracksRef.current.set(sid, step.track);
+      if (!step.command) continue;
+      const command = step.command;
+      window.kiroApi.logContext?.({ kind: 'compact', sessionId: sid, pct, via: 'auto' });
+      queueSendingRef.current.add(sid);
+      void (async () => {
+        let ok = false;
+        try {
+          /* maintenance：会话在等你重发被打断的那一轮时不发（不吃覆盖标记、不截记录） */
+          if (await sendQueuedMessage(sid, command, [], { maintenance: true }) === 'skipped') {
+            window.kiroApi.logContext?.({ kind: 'compact', sessionId: sid, pct, via: 'auto-skipped' });
+            return;
+          }
+          ok = turnOutcomeOf(sid).kind === 'ok';
+        } catch { ok = false; }
+        finally { queueSendingRef.current.delete(sid); }
+        const text = ok
+          ? tRef.current('🗜️ Context was at {pct}%, so KiroLex compacted it automatically (Settings → Chats → auto-compact).', { pct: Math.round(pct) })
+          : tRef.current('⚠️ Context was at {pct}%; KiroLex tried to compact it automatically, but that did not succeed.', { pct: Math.round(pct) });
+        try { await window.kiroApi.sessionNote?.(sid, text, noteVariants(text)); } catch { /* 提示写不进去不挡别的 */ }
+      })();
+    }
+  }, [sessions, streamingIds, busyBySession, usageBySession, queuesBySession, attachedSessionIds, connectingSessionIds, recoveringIds, loopingIds, permissionRequests, currentSessionId, switchingModel, switchingAgent, quitPending, interruptedSessionIds, settings.autoCompactContext, settings.autoCompactPct, sendQueuedMessage, usageOf, turnOutcomeOf]);
+
   // Drop queues whose sessions were deleted or archived.
   useEffect(() => {
     const liveIds = new Set(sessions.filter((session) => !session.archived).map((session) => session.id));
@@ -4548,6 +4658,8 @@ const App: React.FC = () => {
         autoFoldThinking={settings.autoFoldThinking}
         autoFoldTools={settings.autoFoldTools}
         onManageContext={() => setUsageActionConfirm('contextMenu')}
+        onCompactContext={(pct) => handleContextCompact(sid, pct)}
+        onNewBackendContext={(pct) => handleContextNewBackend(sid, pct)}
         onResetCredits={() => setUsageActionConfirm('resetCredits')}
         commands={focused ? commands : EMPTY_COMMANDS}
         onModelChange={(model) => { void handleModelChange(model, sid || undefined); }}

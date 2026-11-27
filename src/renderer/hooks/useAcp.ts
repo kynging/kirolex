@@ -5070,10 +5070,14 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
     attachments: any[] = [],
     options?: { mergeIntoMessageId?: string; onStarted?: () => void; displayText?: string; pastes?: any[]; /** 调用方指定的用户消息 id（控制入口发的带标记） */ messageId?: string;
       /** 这一批里放回队列的 handoff 原来的 id（App 排空时从排队条目的 fromHandoff 收的）—— 落盘时记上，重启恢复据此不再放回 */
-      fromHandoff?: string[] },
-  ) => {
+      fromHandoff?: string[];
+      /** KiroLex 自己发的维护命令（自动压缩的 /compact）：这条会话在等你重发被打断的那一轮时**不发**、返回 'skipped' ——
+       *  不能吃掉下面的覆盖标记、把停下的那一轮从记录里截掉（见 App 的自动压缩）。 */
+      maintenance?: boolean },
+  ): Promise<'skipped' | void> => {
     const session = sessionsRef.current.find((candidate) => candidate.id === sessionId);
     if (!session || session.archived || sessionId.startsWith('pending_')) return;
+    if (options?.maintenance && overwriteTargetRef.current.has(sessionId)) return 'skipped';
 
     // Cancel/interrupt overwrite: if this session was interrupted (cancel or
     // mid-turn death set overwriteTargetRef), the NEXT queued item OVERWRITES

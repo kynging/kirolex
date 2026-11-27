@@ -17,6 +17,7 @@ import { sinceLastClear, isClearCommand, clearNoteText } from '../clearBoundary'
 import { findDebounceDelay, findLabel, matchOffsets, shouldExpandForFind, shouldSearch, stepIndex } from '../paneFind';
 import { clearPane, rangesIn, setActive, setPaneRanges, textOf } from '../findHighlight';
 import { useLang, useT } from '../hooks/useLang';
+import { ContextReminder } from './ContextReminder.tsx';
 import { displayTitle, shownIn } from '../i18n';
 import { pickVariant } from '../../main/uiText.ts';
 import { engineCanSteer, steerFailureReasonKey } from '../steerRoute';
@@ -4140,6 +4141,9 @@ interface ChatAreaProps {
   autoFoldThinking: boolean;
   autoFoldTools: boolean;
   onManageContext: () => void;
+  /** 上下文到 60% 的提醒条上的两颗按钮（`ContextReminder`）：压缩 / 换后端会话并带摘要。都按**这一格**的会话。 */
+  onCompactContext?: (pct: number) => Promise<{ ok: boolean; error?: string }>;
+  onNewBackendContext?: (pct: number) => Promise<{ ok: boolean; error?: string }>;
   onResetCredits: () => void;
   commands: SlashCommand[];
   onModelChange: (model: string) => void;
@@ -4315,6 +4319,8 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onOpenMemory,
   usage,
   onManageContext,
+  onCompactContext,
+  onNewBackendContext,
   plan,
   onResetCredits,
   autoFoldThinking,
@@ -6499,6 +6505,18 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   </span>
                   <button className="session-notice-close" onClick={dismissNotice} title={t('Close notice')}>✕</button>
                 </div>
+              )}
+              {/* 上下文到 60% 起：提醒一次，给压缩 / 换后端会话两个动作（关掉后到下一个 10% 档再提醒） */}
+              {onCompactContext && onNewBackendContext && (
+                <ContextReminder
+                  sessionId={currentSessionId || null}
+                  pct={usage?.contextPercent}
+                  engine={engine}
+                  isStreaming={isStreaming}
+                  turnInterrupted={!!turnInterrupted}
+                  onCompact={onCompactContext}
+                  onNewBackend={onNewBackendContext}
+                />
               )}
               <McpUnavailableBadge sessionId={currentSessionId || null} />
               <ChatInputBox

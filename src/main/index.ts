@@ -30,6 +30,7 @@ import { createRemoteInstructionFs, listInstructionFiles, localInstructionFs, wr
 import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
+import { contextLogLine } from './contextReminder';
 import { busyEnterLogLine, detachedTurnEnded, steerDisplay, steeringDegradedLogLine, steeringFailureLogLine, steeringPromptBlocks } from './busyEnterCaps';
 import { ackRequeued, addPendingHandoff, handoffFacts, markHandoffStarted, persistThenRelease, readPendingHandoffs, recoverableHandoffs, removePendingHandoff, restoreStartedHandoffs, restoredUserMessage, type PendingHandoff } from './pendingHandoffs';
 import { isReplayOutsideTurn, outsideTurnVerdict } from './replayGuard';
@@ -15704,6 +15705,11 @@ ${hint}` : ''}` };
    *  以前「为什么进了 KiroLex 队列」在日志里一个字都没有。 */
   ipcMain.on('acp:busy-enter-log', (_event, d: { sessionId?: string; engine?: string; mode?: string; route?: string; reason?: string }) => {
     logger.info('prompt', busyEnterLogLine(d || {}));
+  });
+
+  /** 上下文占用提醒 / 压缩（输入框上方那条提示、设置里的自动压缩），渲染端报一行：`[context] remind|compact sessionId=… pct=…`（`contextReminder.contextLogLine`）。 */
+  ipcMain.on('acp:context-log', (_event, d: { kind?: string; sessionId?: string; pct?: number; via?: string }) => {
+    logger.info('context', contextLogLine(d || {}));
   });
 
   /** **窗口刷新后的握手**：渲染端挂好 `session:engine-models` 监听之后发这一声，主进程把所有连着的会话的能力（含 `busyEnter`）
