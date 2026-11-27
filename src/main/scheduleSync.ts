@@ -21,7 +21,7 @@
  */
 
 import crypto from 'crypto';
-import { CHECK_OUTPUT_KEEP, MIN_INTERVAL_SEC, dueAt, isDue, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
+import { CHECK_OUTPUT_KEEP, MIN_INTERVAL_SEC, dueAt, isDue, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState, type ScheduleTerminal } from './schedule.ts';
 
 /**
  * 桶里放定时任务的目录（相对布局根）：`schedules/<sessionId>/<id>.json` —— 按会话分，恢复一条会话时按前缀列出它的任务。
@@ -72,7 +72,7 @@ export function collectBucketSchedules(rels: string[]): {
 export interface ScheduleMachine { id: string; name: string }
 
 /** 运行状态：只有 runner 写。 */
-export const RUN_KEYS = ['runs', 'lastRunAt', 'lastError', 'lastCheckHash', 'lastCheck', 'checkErrors', 'terminal', 'catchUpPending', 'catchUpDeclined', 'statusBy', 'statusAt'] as const;
+export const RUN_KEYS = ['runs', 'lastRunAt', 'lastError', 'lastCheckHash', 'lastCheck', 'checkErrors', 'terminal', 'catchUpPending', 'catchUpDeclined', 'endedAt', 'statusBy', 'statusAt'] as const;
 /** 执行者：按 `runnerChangedAt` 后者胜（远端不能改成本机）。 */
 export const RUNNER_KEYS = ['runner', 'runnerName', 'runnerChangedAt', 'takenOverAt'] as const;
 const PAUSE_KEYS = ['paused', 'pausedBy', 'pausedChangedAt'] as const;
@@ -179,6 +179,8 @@ export function stampLocalWrite(prev: ScheduleState | null, next: ScheduleState,
     out.runnerName = prev?.runner ? prev.runnerName : me.name;
     out.runnerChangedAt = prev?.runner ? prev.runnerChangedAt : (out.createdAt || now);
   }
+  /* 这一次写把它变成了终态：记下结束的时刻（结束满 7 天自动清理按它算） */
+  if (out.terminal && !prev?.terminal && typeof out.endedAt !== 'number') out.endedAt = now;
   if (!prev) {
     if (out.statusAt === undefined) { out.statusBy = me.id; out.statusAt = now; }
     return out;
@@ -370,6 +372,7 @@ export function parseRemoteSchedule(text: string, id: string, sessionId: string)
   const took = numOrNull(s.takenOverAt); if (took !== undefined) state.takenOverAt = took;
   if (num(s.catchUpPending) && s.catchUpPending > 0) state.catchUpPending = Math.floor(s.catchUpPending);
   if (s.catchUpDeclined === true) state.catchUpDeclined = true;
+  if (num(s.endedAt)) state.endedAt = s.endedAt;
   const by = str(s.statusBy); if (by) state.statusBy = by;
   for (const k of ['statusAt', 'pausedChangedAt', 'expiryChangedAt'] as const) if (num(s[k])) (state as any)[k] = s[k];
   return { kind: 'live', state };
@@ -386,7 +389,7 @@ export function tombstoneBody(id: string, sessionId: string, at: number, by: str
 }
 
 /** 本机删过的任务（删除标记，不同步的本地账）。 */
-export type ScheduleTombstones = Record<string, { at: number; sessionId: string; pushed?: boolean }>;
+export type ScheduleTombstones = Record<string, { at: number; sessionId: string; pushed?: boolean; localOnly?: boolean }>;
 
 export type SyncAction =
   /** 本机这份改成合并结果 / 新拉下来的（不盖戳的原样写）。 */
@@ -433,7 +436,8 @@ export function planScheduleSync(input: SyncPlanInput): SyncAction[] {
         桶里还没有删除标记就传（桶里这一轮没列到活任务也传）：另一台电脑可能正要上传它读到的旧任务，
         标记是单独的对象，先到后到都盖不掉它。只有 id / 会话 / 时刻，不带任务内容。
       */
-      if (remote?.kind !== 'deleted' && input.upload) out.push({ op: 'put-tombstone', id, sessionId, at: tomb.at });
+      /* 只删了本机副本的（自动清理时执行者失联，`localOnly`）：不往桶里传删除标记，但也不再从桶里拉回来 */
+      if (!tomb.localOnly && remote?.kind !== 'deleted' && input.upload) out.push({ op: 'put-tombstone', id, sessionId, at: tomb.at });
       continue;
     }
     if (remote?.kind === 'deleted') {
@@ -459,3 +463,37 @@ export function planScheduleSync(input: SyncPlanInput): SyncAction[] {
   return out;
 }
 
+
+/** 进入终态多久之后自动清理（任务文件删掉）。 */
+export const ENDED_PRUNE_AFTER_MS = 7 * 24 * 3600_000;
+
+/**
+ * **这条任务是什么时候结束的**：没结束 = null。有 `endedAt` 用它；老文件没有就按 lastRunAt → expiresAt → createdAt 推算
+ * （过期的那种结束在到期那一刻，所以 expiresAt 排在 lastRunAt 后面只作兜底）。
+ */
+export function scheduleEndedAt(state: ScheduleState): number | null {
+  if (!scheduleTerminal(state)) return null;
+  for (const v of [state.endedAt, state.lastRunAt, state.expiresAt, state.createdAt]) {
+    if (typeof v === 'number' && Number.isFinite(v)) return v;
+  }
+  return null;
+}
+
+/**
+ * **结束满 7 天的任务自动清理**：执行者那台删任务文件并照常写删除标记（同步出去，别的电脑也删）；
+ * 不是执行者的那台只在执行者失联时删本机副本（`tombstone: false` —— 不传删除标记，交给执行者自己清）。
+ * 还会再跑的、没结束满 7 天的不动。
+ */
+export function planScheduleAutoPrune(
+  jobs: Array<{ id: string; state: ScheduleState }>, me: string, now: number, runnerLost: (state: ScheduleState) => boolean,
+): Array<{ id: string; sessionId: string; tombstone: boolean; terminal: ScheduleTerminal; endedAt: number }> {
+  const out: Array<{ id: string; sessionId: string; tombstone: boolean; terminal: ScheduleTerminal; endedAt: number }> = [];
+  for (const job of jobs) {
+    const terminal = scheduleTerminal(job.state);
+    const endedAt = scheduleEndedAt(job.state);
+    if (!terminal || endedAt === null || now - endedAt < ENDED_PRUNE_AFTER_MS) continue;
+    if (isRunnerHere(job.state, me)) out.push({ id: job.id, sessionId: job.state.sessionId, tombstone: true, terminal, endedAt });
+    else if (runnerLost(job.state)) out.push({ id: job.id, sessionId: job.state.sessionId, tombstone: false, terminal, endedAt });
+  }
+  return out;
+}

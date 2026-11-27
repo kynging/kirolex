@@ -75,6 +75,16 @@ export function scheduleEndGroup(id: string): string {
   return `${SCHEDULE_END_GROUP}${id}`;
 }
 
+/** 会话记录里已经有哪些定时任务的结局那一句（`noteGroup: schedule-end:<id>`）—— 结局同步过来了，「已结束」卡就不必再挂着。 */
+export function recordedScheduleEndIds(messages: Array<{ noteGroup?: unknown }>): Set<string> {
+  const out = new Set<string>();
+  for (const m of messages) {
+    const g = m?.noteGroup;
+    if (typeof g === 'string' && g.startsWith(SCHEDULE_END_GROUP) && g.length > SCHEDULE_END_GROUP.length) out.add(g.slice(SCHEDULE_END_GROUP.length));
+  }
+  return out;
+}
+
 /** 定时唤醒那条用户消息的 id：`sched_<定时 id>_r<第几次>_<时间>`（没给次数就没有 `_r` 段，同旧写法）。 */
 export function scheduleWakeMessageId(ref: string | undefined, run: number | undefined, now: number): string {
   return `sched_${ref}${run ? `_r${run}` : ''}_${now}`;

@@ -42,6 +42,10 @@ export interface ScheduleView {
   runsHere?: boolean;
   /** 不在本机跑的：按接管之前的状态已经到点了 —— 错过几次、上次运行、本应运行的第一次（接管确认框说明「会立刻补跑一次」）。没错过 = null。 */
   catchUp?: { missed: number; lastRunAt: number | null; firstMissedAt: number | null } | null;
+  /** 结束的时刻（main 的 `scheduleEndedAt`：老文件按 lastRunAt 推算）。没结束 = null。 */
+  endedAt?: number | null;
+  /** 结局那一句已经随会话记录同步到本机了 —— 「已结束」卡不必再挂着。 */
+  endRecorded?: boolean;
   /** 结束了的话：结束原因 + 跑了几次的那一句（main 的 `scheduleEndedText`，和执行者那台写进会话的一样）。没结束 = null。 */
   endedText?: string | null;
   /** 上一次检查的结果（执行者那台写的，跟着同步过来）：时刻、结论、退出码、输出末尾一小段。 */
@@ -143,6 +147,8 @@ export interface ScheduleSummary {
   elsewhere: { name: string; needsConfirm: boolean; offlineHours: number | null; lastCheck: string | null; overdue: string | null } | null;
   /** 已经结束的任务（只在不跑它的那台上保留这张卡，`endedElsewhereSummary`）：结束那一句。还在跑 = 没有 / null。 */
   ended?: string | null;
+  /** 「已结束」卡代表的**全部**已结束任务（删除 / 收起作用于它们全部）；卡上写「另有 N 条已结束」。 */
+  endedIds?: string[];
 }
 
 /**
@@ -245,18 +251,31 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
   };
 }
 
+/** 「已结束」卡只是结束后的短暂提示：结束后最多留这么久（同后台任务的 `ENDED_ELSEWHERE_SHOW_MS`）。 */
+export const ENDED_SCHEDULE_SHOW_MS = 30 * 60_000;
+
+/** 「✕ 收起」过的已结束定时任务（本机 ui-state，不同步）：id → 收起的时刻。 */
+export const SCHEDULE_DISMISSED_KEY = 'kirolex-schedule-dismissed';
+
 /**
- * **在别的电脑上跑完了的任务**（跨电脑同步）：执行者那台结束时会在会话里说一声，这边却只有任务记录 ——
- * 还在跑的一个都没有时，留一张「已结束」卡：在哪台上跑的、结束原因和跑了几次、最后一次检查的结果。
- * 只认不在本机跑的（本机跑的结束时，结局那一句就在本机的会话里）。几条都结束了取最后跑的那条。没有 = null。
+ * **在别的电脑上刚跑完的任务**（跨电脑同步）：执行者那台结束时会在会话里说一声，结局那一句同步过来之前这边只有任务记录 ——
+ * 还在跑的一个都没有时，短暂留一张「已结束」卡：在哪台上跑的、结束原因和跑了几次、最后一次检查的结果。
+ * 只认：不在本机跑的、结束不到 30 分钟的、结局那一句还没进本机记录的、没被收起的。几条都符合时**只出一张**
+ * （最后结束的那条），写明「另有 N 条已结束」，删除 / 收起作用于全部（`endedIds`）。没有 = null。
  */
-export function endedElsewhereSummary(jobs: ScheduleView[], lang: Lang = 'zh'): ScheduleSummary | null {
-  const ended = jobs.filter((job) => job.runsHere === false && !isLive(job));
+export function endedElsewhereSummary(
+  jobs: ScheduleView[], lang: Lang = 'zh', opts: { now?: number; dismissed?: ReadonlySet<string> } = {},
+): ScheduleSummary | null {
+  const now = opts.now ?? Date.now();
+  const ended = jobs.filter((job) => job.runsHere === false && !isLive(job)
+    && !job.endRecorded && !opts.dismissed?.has(job.id)
+    && typeof job.endedAt === 'number' && now - job.endedAt <= ENDED_SCHEDULE_SHOW_MS);
   if (!ended.length) return null;
-  const last = ended.reduce((a, b) => ((b.lastRunAt ?? 0) > (a.lastRunAt ?? 0) ? b : a));
+  const last = ended.reduce((a, b) => ((b.endedAt ?? 0) > (a.endedAt ?? 0) ? b : a));
   const ranText = t(lang, 'Ended · ran {n} time(s)', { n: last.runs });
   const endedText = last.endedText || ranText;
   const parts = [endedText];
+  if (ended.length > 1) parts.push(t(lang, '{n} more ended', { n: ended.length - 1 }));
   if (last.lastError) parts.push(t(lang, 'Last failure: {error}', { error: String(last.lastError) }));
   return {
     count: 0,
@@ -270,6 +289,7 @@ export function endedElsewhereSummary(jobs: ScheduleView[], lang: Lang = 'zh'): 
     expiresAt: null,
     elsewhere: { name: last.runnerName || '?', needsConfirm: false, offlineHours: null, lastCheck: lastCheckText(last.lastCheck, lang), overdue: null },
     ended: endedText,
+    endedIds: ended.map((job) => job.id),
   };
 }
 

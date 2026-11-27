@@ -118,6 +118,9 @@ export interface ScheduleState {
   /** 接管时已经到点、用户**取消了**「立刻补跑一次」：循环任务的第一次从接管那一刻算，一次性任务那一次不跑了（见 `timingState`）。
    *  接管时还没到点的不记它 —— 按原定的下一次。 */
   catchUpDeclined?: boolean | null;
+  /** 进入终态（completed / exhausted / cancelled / achieved / expired）的时刻 —— 结束满 7 天自动清理按它算（`scheduleEndedAt`）。
+   *  老文件没有：按 lastRunAt → expiresAt → createdAt 推算。 */
+  endedAt?: number | null;
   /** 运行状态（runs / lastRunAt / lastError / 检查结果 / terminal）最后一次是哪台、什么时候写的。合并时只认 runner 写的。 */
   statusBy?: string;
   statusAt?: number;

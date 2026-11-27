@@ -99,8 +99,8 @@ import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleOwnerGate, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
-import { SCHEDULES_REL, canRunHere, collectBucketSchedules, definitionHash, isCatchUpRun, missedRuns, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
-import { scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
+import { SCHEDULES_REL, ENDED_PRUNE_AFTER_MS, planScheduleAutoPrune, scheduleEndedAt, canRunHere, collectBucketSchedules, definitionHash, isCatchUpRun, missedRuns, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
+import { recordedScheduleEndIds, scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, SESSION_NOT_CONNECTED, WakeDispatcher, WakeSkipped, isWakeBusyError, isWakeConnectionError, wakeAlreadyDelivered, type WakeItem } from './wakeQueue.ts';
 import { TEXT_TOOL_NUDGE_ID_PREFIX, isTextToolNudgeId, textToolCallVerdict, foldTextToolCall, stripTextToolCalls, type TextToolAction, type TextToolCall } from './textToolCall.ts';
@@ -8177,6 +8177,20 @@ async function syncBgJobsNow(): Promise<void> {
 }
 
 /** 界面上的一行（别的电脑上的后台任务，只读）：在哪台、多久没更新、本机重跑会用的 cwd 和确认摘要。 */
+/** 每条会话的记录里有哪些定时任务的结局那一句（`recordedScheduleEndIds`），同样按记录文件大小缓存。 */
+const scheduleEndRecordedCache = new Map<string, { size: number; ids: Set<string> }>();
+function scheduleEndRecorded(sessionId: string, id: string): boolean {
+  const size = store.transcriptFileSize(sessionId);
+  let hit = scheduleEndRecordedCache.get(sessionId);
+  if (!hit || hit.size !== size) {
+    let ids = new Set<string>();
+    try { ids = recordedScheduleEndIds(store.readTranscript(sessionId)); } catch { /* 读不到：当作还没同步过来 */ }
+    hit = { size, ids };
+    scheduleEndRecordedCache.set(sessionId, hit);
+  }
+  return hit.ids.has(id);
+}
+
 /** 每条会话的记录里有哪些后台任务的结束消息（`recordedBgJobIds`），按记录文件大小缓存：没变就不重读。 */
 const bgRecordedCache = new Map<string, { size: number; ids: Set<string> }>();
 function bgEndRecorded(sessionId: string, jobId: string): boolean {
@@ -14240,6 +14254,31 @@ ${hint}` : ''}` };
   }, SCHEDULE_TICK_MS);
   app.on('before-quit', () => clearInterval(scheduleTicker));
 
+  /**
+   * **结束满 7 天的任务自动清理**（判据 `planScheduleAutoPrune`）：本机是执行者 → 删任务文件、照常写删除标记同步出去；
+   * 不是执行者 → 只在执行者失联（超过约 2 个同步周期没同步）时删本机副本，不写删除标记。启动时一次，之后每小时一次。
+   */
+  function pruneEndedSchedules(): void {
+    const now = Date.now();
+    const devices = readScheduleDevices();
+    const staleAfterMs = 2 * Math.max(5, Number(loadSyncConfig().intervalMinutes) || DEFAULT_INTERVAL_MINUTES) * 60_000;
+    /* 不知道它什么时候同步过 = 不算失联（交给执行者自己清，宁可多留几天） */
+    const runnerLost = (s: ScheduleState) => { const seen = s.runner ? devices[s.runner]?.syncedAt : undefined; return typeof seen === 'number' && now - seen > staleAfterMs; };
+    const jobs = scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter((j) => !schedulesInFlight.has(j.id));
+    for (const p of planScheduleAutoPrune(jobs, scheduleMachine().id, now, runnerLost)) {
+      try {
+        if (p.tombstone) scheduleStore.removeSchedule(p.id, os.homedir(), store.isAdvancedOnlySession);
+        else scheduleStore.removeScheduleLocalOnly(p.id, os.homedir(), store.isAdvancedOnlySession);
+      } catch (err: any) { logger.warn('schedule', `auto-prune id=${p.id} 删不掉：${err?.message || err}`); continue; }
+      wakeDispatcher.dropRef(p.id, 'removed');
+      logger.info('schedule', `auto-prune id=${p.id} terminal=${p.terminal} endedAt=${new Date(p.endedAt).toISOString()} session=${p.sessionId}${p.tombstone ? '' : ' (执行者失联：只删本机副本，不写删除标记)'}`);
+      mainWindow?.webContents.send('schedule:changed', { id: p.id, state: null });
+    }
+  }
+  pruneEndedSchedules();
+  const schedulePruneTimer = setInterval(pruneEndedSchedules, Math.min(ENDED_PRUNE_AFTER_MS, 3600_000));
+  app.on('before-quit', () => clearInterval(schedulePruneTimer));
+
   /** 和上面那一跳同一套（只跑本机执行的、先判过期、到点就跑）：睡眠唤醒 / 刚接管时不必等下一个 20 秒。 */
   function runDueSchedulesNow(why: string): void {
     if (quitPending) return;
@@ -14526,6 +14565,9 @@ ${hint}` : ''}` };
     lastCheck: job.state.lastCheck ?? null,
     /* 结束了（达成 / 次数用完 / 过期 / 取消）：一句话说清结束原因和跑了几次 —— 不跑它的那台据此保留一张「已结束」卡片 */
     endedText: (() => { const ended = scheduleTerminal(job.state); return ended ? scheduleEndedText(job.state, ended) : null; })(),
+    /* 什么时候结束的（老文件按 lastRunAt 推算）、结局那一句是不是已经同步进本机的会话记录了 —— 「已结束」卡只是结束后的短暂提示 */
+    endedAt: scheduleEndedAt(job.state),
+    endRecorded: scheduleTerminal(job.state) && !runsHere ? scheduleEndRecorded(job.state.sessionId, job.id) : false,
     runnerName: runsHere ? null : (job.state.runnerName || devices[runner]?.host || runner),
     /* runner 写着本机、定义却没在本机确认过（恢复会话拉回来的）：一样只读，接管确认后才跑 */
     needsConfirm: !runsHere && runner === me,

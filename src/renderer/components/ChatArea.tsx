@@ -4254,6 +4254,8 @@ interface ChatAreaProps {
   onTakeOverSchedule?: (id: string, defHash: string, catchUp: boolean) => Promise<{ ok: boolean; error?: string }>;
   /** 「▶ 立即运行一次」（本机是执行者时）：算一次运行、照常记账；被次数上限 / 过期 / 暂停挡住时把原因交回来就地显示。 */
   onRunScheduleNow?: (id: string) => Promise<{ ok: boolean; error?: string }>;
+  /** 「已结束」卡的「✕ 收起」：只隐藏卡片（本机记一笔），不删任务；作用于这张卡代表的全部已结束任务。 */
+  onDismissEndedSchedules?: (ids: string[]) => void;
   /** Stop whatever automation currently owns this session. */
   onStopLoop: () => void;
   /** Split-pane monitor mode: transcript + live indicators + permission bar,
@@ -4391,6 +4393,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onSetScheduleExpiry,
   onTakeOverSchedule,
   onRunScheduleNow,
+  onDismissEndedSchedules,
   onStopLoop,
   readOnly = false,
   paneFocused = true,
@@ -5952,10 +5955,21 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   }
                   if (cancelArmTimer.current) clearTimeout(cancelArmTimer.current);
                   setCancelArmed(false);
-                  onCancelSchedule?.(scheduleSummary.next!.id);
+                  /* 「已结束」卡代表的是这几条已结束的全部（不一条删完换下一条），一次删掉 */
+                  for (const id of scheduleSummary.ended && scheduleSummary.endedIds?.length ? scheduleSummary.endedIds : [scheduleSummary.next!.id]) onCancelSchedule?.(id);
                 }}
-                title={cancelArmed ? t('Click again to confirm cancellation (cannot be undone)') : t('Cancel this scheduled job')}
+                title={cancelArmed ? t('Click again to confirm cancellation (cannot be undone)')
+                  : scheduleSummary.ended && (scheduleSummary.endedIds?.length ?? 0) > 1 ? t('Delete all {n} ended tasks', { n: scheduleSummary.endedIds!.length })
+                  : t('Cancel this scheduled job')}
               >{cancelArmed ? t('Confirm cancel?') : scheduleSummary.ended ? t('🗑️ Delete') : t('🗑️ Cancel')}</button>
+              {/* 「已结束」卡只是短暂提示：「✕ 收起」只隐藏卡片，任务记录不删（结束满 7 天后会自动清理） */}
+              {scheduleSummary.ended && onDismissEndedSchedules && (
+                <button
+                  className="schedule-banner-dismiss"
+                  onClick={() => onDismissEndedSchedules(scheduleSummary.endedIds?.length ? scheduleSummary.endedIds : [scheduleSummary.next!.id])}
+                  title={t('Hide this card (the tasks are kept)')}
+                >{t('✕ Dismiss')}</button>
+              )}
             </>
           )}
         </div>

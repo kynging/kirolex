@@ -187,18 +187,21 @@ describe('last check result: stored by the runner, synced, shown on the other co
   });
 });
 
-describe('a job that ended on another computer keeps a card here', () => {
+describe('a job that ended on another computer keeps a card here (for 30 min after it ended)', () => {
+  /* 第 11 轮起「已结束」卡只是结束后 30 分钟内的短暂提示：这几条都是刚结束 1 分钟时的样子 */
+  const SOON = { now: 1_700_000_000_000 + 60_000 };
   const base: ScheduleView = {
     id: 'j1', sessionId: 's1', prompt: 'p', describe: 'Every 1 h', runs: 5, maxRuns: null, paused: false,
     lastRunAt: 1_700_000_000_000, lastError: null, nextRunAt: null, until: 'green', checkCommand: 'node c.js',
     runsHere: false, runnerName: 'desk-b', runnerSeenAt: null, staleAfterMs: 3600_000, defHash: 'h',
     terminal: 'achieved', endedText: 'Scheduled task ended: goal reached (Every 1 h, ran 5 time(s))',
     lastCheck: { at: 1_700_000_000_000, result: 'achieved', code: 0, output: 'all green' },
+    endedAt: 1_700_000_000_000,
   };
 
   test('achieved on the runner: the live summary is gone, the ended card shows machine, runs, reason and final check', () => {
     assert.equal(sessionScheduleSummary([base], 1_700_000_000_000, 'en'), null, 'not live any more');
-    const s = endedElsewhereSummary([base], 'en')!;
+    const s = endedElsewhereSummary([base], 'en', SOON)!;
     assert.ok(s, 'the card stays');
     assert.equal(s.ended, base.endedText);
     assert.match(s.text, /goal reached .*ran 5 time/);
@@ -208,10 +211,10 @@ describe('a job that ended on another computer keeps a card here', () => {
   });
 
   test('expired / exhausted also stay; ended jobs that ran HERE do not get the card; a live job takes precedence', () => {
-    assert.ok(endedElsewhereSummary([{ ...base, terminal: 'expired', endedText: 'ended: expired' }], 'en'));
-    assert.ok(endedElsewhereSummary([{ ...base, terminal: null, maxRuns: 5, runs: 5, endedText: null }], 'en')?.ended, 'run cap reached');
-    assert.equal(endedElsewhereSummary([{ ...base, runsHere: true }], 'en'), null);
-    assert.equal(endedElsewhereSummary([{ ...base, terminal: null, endedText: null }], 'en'), null, 'still live: not an ended card');
+    assert.ok(endedElsewhereSummary([{ ...base, terminal: 'expired', endedText: 'ended: expired' }], 'en', SOON));
+    assert.ok(endedElsewhereSummary([{ ...base, terminal: null, maxRuns: 5, runs: 5, endedText: null }], 'en', SOON)?.ended, 'run cap reached');
+    assert.equal(endedElsewhereSummary([{ ...base, runsHere: true }], 'en', SOON), null);
+    assert.equal(endedElsewhereSummary([{ ...base, terminal: null, endedText: null }], 'en', SOON), null, 'still live: not an ended card');
   });
 
   test('wired: main sends the ended sentence; the banner falls back to it; run controls are hidden on an ended card', () => {

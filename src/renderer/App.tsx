@@ -11,7 +11,7 @@ import { activeSplitSizes, computePaneFlex, putSplitSizes, resetSplitSizes, Spli
 import { autoFoldPanels, filePanelMax } from './panelFit';
 // A scheduled chat must SAY it is scheduled, in the transcript header and on its sidebar row.
 // Both lines come from this one pure module so they cannot word the same job differently.
-import { endedElsewhereSummary, schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
+import { SCHEDULE_DISMISSED_KEY, endedElsewhereSummary, schedulesBySession, sessionScheduleSummary, type ScheduleSummary } from './scheduleView';
 import { BG_DISMISSED_KEY, bannerBgJobs, parseBgDismissed, type BgJobRow } from './bgJobsView';
 import { startupBlocksSend } from './createStages';
 import { queueUntilConnected, queueableMessage, waitsForConnection, type ConnectingFacts } from './connectingSend.ts';
@@ -134,7 +134,7 @@ declare global {
       onLoopChanged?: (cb: (payload: { sessionId: string; run: any | null }) => void) => () => void;
       /** SCHEDULED TASKS. The ticker is in main, so a job fires with no window open. */
       scheduleCreate?: (sessionId: string, spec: any) => Promise<{ ok: boolean; id?: string; error?: string; nextRunAt?: number | null; describe?: string }>;
-      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null; catchUp?: { missed: number; lastRunAt: number | null; firstMissedAt: number | null } | null; runsHere?: boolean; endedText?: string | null; lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null; runnerName?: string | null; needsConfirm?: boolean; runnerSeenAt?: number | null; staleAfterMs?: number; defHash?: string }>>;
+      scheduleList?: () => Promise<Array<{ id: string; sessionId: string; prompt: string; describe: string; runs: number; maxRuns: number | null; paused: boolean; terminal?: string | null; lastRunAt: number | null; lastError: string | null; nextRunAt: number | null; createdBy?: string | null; expiresAt?: number | null; until?: string | null; checkCommand?: string | null; endedAt?: number | null; endRecorded?: boolean; catchUp?: { missed: number; lastRunAt: number | null; firstMissedAt: number | null } | null; runsHere?: boolean; endedText?: string | null; lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null; runnerName?: string | null; needsConfirm?: boolean; runnerSeenAt?: number | null; staleAfterMs?: number; defHash?: string }>>;
       schedulePause?: (id: string, paused: boolean) => Promise<{ ok: boolean; error?: string }>;
       scheduleRemove?: (id: string) => Promise<{ ok: boolean }>;
       scheduleTakeOver?: (id: string, defHash: string, catchUp?: boolean) => Promise<{ ok: boolean; error?: string }>;
@@ -1704,13 +1704,26 @@ const App: React.FC = () => {
    * 聊天顶部那张卡：还在跑的照旧；**一个都不跑了**、而其中有在别的电脑上跑完的（跨电脑同步），留一张「已结束」卡 ——
    * 不然执行者那台一结束，这边的卡就没了，看不到最后结果和结束原因。侧栏徽标不变（只管还在跑的）。
    */
+  /** 「已结束」卡点过「✕ 收起」的（本机 ui-state，不同步；只隐藏卡片，不删任务）。 */
+  const [scheduleDismissed, setScheduleDismissed] = useState<Record<string, number>>(() => parseBgDismissed(uiGet(SCHEDULE_DISMISSED_KEY), Date.now()));
+  const dismissEndedSchedules = useCallback((ids: string[]) => {
+    setScheduleDismissed((prev) => {
+      const at = Date.now();
+      const next = { ...parseBgDismissed(JSON.stringify(prev), at) };
+      for (const id of ids) next[id] = at;
+      uiSet(SCHEDULE_DISMISSED_KEY, JSON.stringify(next));
+      return next;
+    });
+  }, []);
   const scheduleBannerFor = useMemo(() => {
     const byId = schedulesBySession(schedules);
+    const dismissed = new Set(Object.keys(scheduleDismissed));
     return (sid: string | null): ScheduleSummary | null => {
       if (!sid) return null;
-      return scheduleSummaryFor(sid) ?? endedElsewhereSummary(byId.get(sid) || [], settings.language);
+      /* 「已结束」卡只在结束后 30 分钟内（按 20 秒一跳的 scheduleNow 重算，到点自己消失） */
+      return scheduleSummaryFor(sid) ?? endedElsewhereSummary(byId.get(sid) || [], settings.language, { now: scheduleNow, dismissed });
     };
-  }, [schedules, scheduleSummaryFor, settings.language]);
+  }, [schedules, scheduleSummaryFor, settings.language, scheduleNow, scheduleDismissed]);
 
   /** 别的电脑上结束了的卡片点过「✕ 收起」的（本机 ui-state，不同步）。 */
   const [bgDismissed, setBgDismissed] = useState<Record<string, number>>(() => parseBgDismissed(uiGet(BG_DISMISSED_KEY), Date.now()));
@@ -4769,6 +4782,7 @@ const App: React.FC = () => {
         onSetScheduleExpiry={(id, change) => setScheduleExpiry(id, change)}
         onTakeOverSchedule={(id, defHash, catchUp) => takeOverSchedule(id, defHash, catchUp)}
         onRunScheduleNow={(id) => runScheduleNow(id)}
+        onDismissEndedSchedules={dismissEndedSchedules}
         bgJobs={bgJobsFor(sid)}
         replyWaits={replyWaitsFor(sid)}
         onStopReplyWait={(id) => { void window.kiroApi.replyWatchCancel?.(id); }}

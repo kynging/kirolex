@@ -105,6 +105,22 @@ export function removeSchedule(id: string, home: string, isProtected?: Protected
   forgetApproval(id, home);
 }
 
+/**
+ * **只删本机副本**（结束满 7 天自动清理、而执行者那台失联时）：本地账上记一笔 `localOnly` 删除 ——
+ * 不往桶里传删除标记（执行者回来后自己清），但同步也不会再把它拉回来。
+ */
+export function removeScheduleLocalOnly(id: string, home: string, isProtected?: Protected): void {
+  const existing = readSchedule(id, home);
+  if (!existing || isProtected?.(existing.state.sessionId)) return;
+  const map = readScheduleTombstones(home);
+  if (!map[id]) {
+    map[id] = { at: Date.now(), sessionId: existing.state.sessionId, localOnly: true };
+    writeJsonMap(tombstonesFile(home), map);
+  }
+  try { fs.rmSync(scheduleFile(id, home), { force: true }); } catch { /* already gone */ }
+  forgetApproval(id, home);
+}
+
 /* ── 跨电脑同步的两本本地账（都不同步）：删除标记、本机确认过的定义 ── */
 
 function tombstonesFile(home: string): string { return path.join(home, '.kirolex', 'schedule-tombstones.json'); }
@@ -128,7 +144,7 @@ function writeJsonMap(file: string, map: Record<string, unknown>): void {
 export function readScheduleTombstones(home: string): ScheduleTombstones {
   const out: ScheduleTombstones = {};
   for (const [id, v] of Object.entries(readJsonMap(tombstonesFile(home)))) {
-    if (v && typeof v.at === 'number' && typeof v.sessionId === 'string') out[id] = { at: v.at, sessionId: v.sessionId, ...(v.pushed ? { pushed: true } : {}) };
+    if (v && typeof v.at === 'number' && typeof v.sessionId === 'string') out[id] = { at: v.at, sessionId: v.sessionId, ...(v.pushed ? { pushed: true } : {}), ...(v.localOnly ? { localOnly: true } : {}) };
   }
   return out;
 }
