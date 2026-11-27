@@ -106,6 +106,30 @@ export const ZH_SETTINGS_PANELS: Record<string, string> = {
   '{behind} waiting to sync': '{behind} 条待同步',
   '{n} more in "Archived"': '另有 {n} 条在「已归档」',
   'Archived on this machine · syncing follows the original project and per-session settings': '本机归档的 · 同步与否按原项目和单条的设置',
+  '{total} in the cloud: {notLocal} not on this machine, {local} already here': '云上 {total} 条：本机没有 {notLocal} 条，已在本机 {local} 条',
+  ' ({n} without auto-sync)': '（其中 {n} 条没开自动同步）',
+  '✓ On this machine': '✓ 已在本机',
+  'Already on this machine. Usually you do not need to restore it; turning on auto-sync is enough.':
+    '这台电脑上已经有这条会话。通常不用恢复，开自动同步就行。',
+  'Auto-sync: on': '自动同步：开',
+  'Auto-sync: off': '自动同步：关',
+  'Auto-sync = "Sync to other computers": new messages from your other computers are merged in automatically.':
+    '自动同步 = 侧栏右键「在其他电脑上同步」：自动并进你其他电脑上同一条会话的新消息。',
+  'Turn on auto-sync': '开启自动同步',
+  'Same as right-clicking the chat in the sidebar → "Sync to other computers". Does not restore or merge anything now.':
+    '和侧栏右键「在其他电脑上同步」一样。现在不恢复、不合并。',
+  'Turn on auto-sync for all': '全部开启自动同步',
+  'Turn on auto-sync for the {n} sessions that are already on this machine but do not have it yet? Same as right-clicking each one → "Sync to other computers"; nothing is restored or merged now.':
+    '给已在本机、还没开自动同步的 {n} 条会话都打开自动同步？和逐条在侧栏右键「在其他电脑上同步」一样，现在不恢复、不合并。',
+  'Turn on': '开启',
+  'Turning on…': '正在开启…',
+  'Select / deselect every selectable session in this group that is not on this machine yet (except running ones)':
+    '勾选 / 取消这一组里本机还没有的会话（正在跑的除外）。已在本机的可以单独勾。',
+  'Turned on auto-sync for {n} sessions.': '已给 {n} 条会话开启自动同步。',
+  '{n} failed: {list}': '{n} 条没开成：{list}',
+  'On this machine ({n})': '已在本机 {n} 条',
+  'These already exist on this machine. Usually they only need auto-sync; tick one to restore (merge) it anyway.':
+    '这些这台电脑上已经有了，通常只需要开自动同步；想立即合并云上的内容，也可以单独勾上恢复。',
   '{n} syncing': '{n} 条同步',
   '{n} not syncing': '{n} 条不同步',
   'Set individually': '单独设置',

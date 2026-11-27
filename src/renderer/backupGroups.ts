@@ -31,10 +31,22 @@ export interface BackupGroup<T> {
   archived: boolean;
   /** 这一组对应的项目（未分组是 ''；「已归档」组混着好几个项目，没有） */
   project?: string;
+  /** 整组：本机没有的在前，已在本机的在后（`[...notLocal, ...local]`） */
   rows: T[];
+  /** 本机没有的 —— 真正要恢复的那些，排在前面；组头「全选」只勾这些 */
+  notLocal: T[];
+  /** 已经在这台电脑上的 —— 通常不用恢复、只要开自动同步；收进组末尾的「已在本机 N 条」子段 */
+  local: T[];
 }
 
-export function groupBackups<T extends { project?: string; updatedAt?: number; archived?: boolean }>(
+/** 拆成本机没有 / 已在本机两段，各自保持原来的顺序 */
+const splitLocal = <T extends { existsLocally?: boolean }>(rows: T[]): { rows: T[]; notLocal: T[]; local: T[] } => {
+  const notLocal = rows.filter((e) => !e.existsLocally);
+  const local = rows.filter((e) => !!e.existsLocally);
+  return { rows: [...notLocal, ...local], notLocal, local };
+};
+
+export function groupBackups<T extends { project?: string; updatedAt?: number; archived?: boolean; existsLocally?: boolean }>(
   entries: T[],
   lang: Lang = 'zh',
 ): BackupGroup<T>[] {
@@ -55,8 +67,8 @@ export function groupBackups<T extends { project?: string; updatedAt?: number; a
       if ((a[0] === '未分组') !== (b[0] === '未分组')) return a[0] === '未分组' ? 1 : -1;
       return (b[1][0]?.updatedAt || 0) - (a[1][0]?.updatedAt || 0);
     })
-    .map(([name, rows]) => ({ key: name, name: displayName(name, lang), archived: false, project: name === UNGROUPED ? '' : name, rows }));
-  groups.push({ key: ARCHIVED_GROUP, name: t(lang, 'Archived'), archived: true, rows: archived });
+    .map(([name, rows]) => ({ key: name, name: displayName(name, lang), archived: false, project: name === UNGROUPED ? '' : name, ...splitLocal(rows) }));
+  groups.push({ key: ARCHIVED_GROUP, name: t(lang, 'Archived'), archived: true, ...splitLocal(archived) });
   return groups;
 }
 
@@ -250,4 +262,39 @@ export function backupConfigured(cfg: {
   if (!cfg) return false;
   const keysOk = (cfg.credentialSource || 'keys') !== 'keys' || !!(cfg.accessKeyId && cfg.hasSecret);
   return !!(cfg.bucket && cfg.region && keysOk) && !cfg.credsProblem;
+}
+
+/**
+ * 恢复页组头的全选框 —— 只管**本机没有的**那几条（已在本机的通常不用恢复）。
+ * 已在本机的仍然可以单独勾来恢复（比如云上较新、想立即合并），不影响组头的状态；组头的删除仍按整组勾了的算。
+ */
+export function groupHeadPick<T extends Pickable>(g: { notLocal: T[] }, picked: ReadonlySet<string>) {
+  return groupPickState(g.notLocal, picked);
+}
+export function toggleGroupHeadPick<T extends Pickable>(picked: ReadonlySet<string>, g: { notLocal: T[] }): Set<string> {
+  return toggleGroupPick(picked, g.notLocal);
+}
+
+export interface RestoreCounts {
+  /** 云上一共几条 */
+  total: number;
+  /** 本机没有 */
+  notLocal: number;
+  /** 已在本机 */
+  local: number;
+  /** 已在本机、但没开自动同步（「在其他电脑上同步」） */
+  localNoSync: number;
+  localNoSyncIds: string[];
+}
+
+/** 恢复页顶部那行计数：「云上 N 条：本机没有 A 条，已在本机 B 条（其中 C 条没开自动同步）」 */
+export function restoreCounts(entries: Array<{ id: string; existsLocally?: boolean; crossDevice?: boolean }>): RestoreCounts {
+  const local = entries.filter((e) => e.existsLocally);
+  const noSync = local.filter((e) => !e.crossDevice);
+  return { total: entries.length, notLocal: entries.length - local.length, local: local.length, localNoSync: noSync.length, localNoSyncIds: noSync.map((e) => e.id) };
+}
+
+export function restoreCountsText(c: RestoreCounts, lang: Lang = 'zh'): string {
+  const head = t(lang, '{total} in the cloud: {notLocal} not on this machine, {local} already here', { total: c.total, notLocal: c.notLocal, local: c.local });
+  return c.localNoSync ? head + t(lang, ' ({n} without auto-sync)', { n: c.localNoSync }) : head;
 }

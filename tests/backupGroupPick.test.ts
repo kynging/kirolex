@@ -60,7 +60,8 @@ describe('BackupDialog 恢复页组头', () => {
     assert.doesNotMatch(UI, /s3DeleteProject/);
   });
   test('组头有全选框（含半选），删除只传这一组勾选的 id，两次点击确认', () => {
-    assert.match(restorePart, /toggleGroupPick\(prev, rows\)/);
+    /* 全选只勾本机没有的（已在本机的可单独勾，见 restoreOnMachine.test.ts） */
+    assert.match(restorePart, /toggleGroupHeadPick\(prev, g\)/);
     assert.match(restorePart, /\.indeterminate = /);
     assert.match(UI, /deleteS3Sessions\?\.\(ids\)/);
     /* 文案进了字典（i18nZh/settingsPanels.ts），源码里是 t('英文', { n }) */

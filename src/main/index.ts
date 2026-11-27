@@ -11400,6 +11400,8 @@ app.whenReady().then(async () => {
           ...e,
           project: catalogProject(e, projectById.get(e.id)),
           existsLocally: local.has(e.id),
+          /* 本机这条开没开「在其他电脑上同步」（恢复页的「自动同步：开 / 关」；本机没有 = false） */
+          crossDevice: isShared(recById.get(e.id)),
           /* 新旧对比用（本机较新 / 云上较新 / 两边一样） */
           localUpdatedAt: recById.get(e.id)?.updatedAt || 0,
           /* 恢复后位置会不会按云上的改（谁后挪用谁，见 `s3:restore`）—— 确认框里要说出来 */

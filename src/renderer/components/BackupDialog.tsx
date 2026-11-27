@@ -28,7 +28,8 @@ import { ConfirmDialog, type ConfirmRequest } from './ConfirmDialog';
 import { BackupSettings, CrossDeviceList, Field } from './BackupSettings.tsx';
 import { cleanupSentence, backupConfigured } from '../backupGroups.ts';
 import { setSessionSync } from '../../main/syncChoice.ts';
-import { groupBackups, groupSyncProjects, syncRowState, syncSummary, syncSummaryText, includedWhileProjectOff, compareFreshness, freshnessLabel, freshnessClass, groupPickState, toggleGroupPick, isPickable } from '../backupGroups.ts';
+import { groupBackups, groupSyncProjects, syncRowState, syncSummary, syncSummaryText, includedWhileProjectOff, compareFreshness, freshnessLabel, freshnessClass, groupPickState, groupHeadPick, toggleGroupHeadPick, restoreCounts, restoreCountsText, isPickable } from '../backupGroups.ts';
+import { uiGet, uiSet } from '../uiStore';
 import { useLang, useT } from '../hooks/useLang';
 
 interface Backup {
@@ -45,6 +46,8 @@ interface Backup {
   busy?: boolean;
   /** 云上这份是不是归档的（catalog 的 archived）—— 放进「已归档」组。 */
   archived?: boolean;
+  /** 本机这条开没开「在其他电脑上同步」（= 恢复页的「自动同步」；本机没有是 false）。 */
+  crossDevice?: boolean;
   /** 本机这条记录的 updatedAt（本机没有是 0）—— 新旧对比用。 */
   localUpdatedAt?: number;
   /** 恢复后会按云上的位置改到别的项目 / 改变归档状态（谁后挪用谁，主进程算的）。 */
@@ -109,6 +112,12 @@ const projectLabel = (p: string | undefined, t: (k: string) => string): string =
 
 const api = (): any => (window as any).kiroApi;
 
+/** 恢复页每组末尾「已在本机 N 条」子段**展开了**的组（默认收起），记在本机的 UI 存储里 */
+const LOCAL_OPEN_KEY = 'kirolex-backup-restore-local-open';
+const readLocalOpen = (): Set<string> => {
+  try { const v = JSON.parse(uiGet(LOCAL_OPEN_KEY) || '[]'); return new Set(Array.isArray(v) ? v.filter((x) => typeof x === 'string') : []); } catch { return new Set(); }
+};
+
 const when = (ms?: number): string => (ms ? new Date(ms).toLocaleString() : '—');
 const kb = (n: number): string => (n >= 1024 * 1024 ? `${(n / 1024 / 1024).toFixed(1)} MB` : `${Math.max(1, Math.round(n / 1024))} KB`);
 
@@ -142,6 +151,13 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   /** 「放回原项目」—— 默认不勾：从云端恢复的一律进「未分组」（本机有同名项目、勾了才放回去，见主进程 `restoreTarget`） */
   const [putBack, setPutBack] = useState(false);
   const [collapsed, setCollapsed] = useState<Set<string>>(new Set());
+  const [localOpen, setLocalOpen] = useState<Set<string>>(readLocalOpen);
+  const toggleLocalOpen = (key: string): void => setLocalOpen((prev) => {
+    const next = new Set(prev);
+    if (next.has(key)) next.delete(key); else next.add(key);
+    try { uiSet(LOCAL_OPEN_KEY, JSON.stringify([...next])); } catch { /* 记不住就只是下次又收起 */ }
+    return next;
+  });
 
   /* --- 云端回收站 tab --- */
   const [trash, setTrash] = useState<TrashRow[] | null>(null);
@@ -271,6 +287,54 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
   const selectable = useMemo(() => (entries || []).filter(isPickable), [entries]);
   const chosen = useMemo(() => selectable.filter((e) => picked.has(e.id)), [selectable, picked]);
   const merging = useMemo(() => chosen.filter((e) => e.existsLocally), [chosen]);
+
+  /* 顶部那行计数：云上 N 条：本机没有 A 条，已在本机 B 条（其中 C 条没开自动同步） */
+  const counts = useMemo(() => restoreCounts(entries || []), [entries]);
+
+  /**
+   * **开启自动同步**（已在本机、还没开的那几条）——和侧栏右键「在其他电脑上同步」打开一样：同一个 IPC
+   * （`acp:set-cross-device`），主进程会发 `session:cross-device-changed` 让侧栏跟着亮 🔗。
+   * 不恢复、不合并、不断开执行器。返回没开成的那几条的原因。
+   */
+  const enableAutoSync = async (ids: string[]): Promise<string[]> => {
+    const failed: string[] = [];
+    const done = new Set<string>();
+    for (const id of ids) {
+      try {
+        const r = await api()?.setCrossDevice?.(id, true);
+        if (r?.ok) done.add(id); else failed.push(`${id}${t(': ')}${r?.error || t('Failed')}`);
+      } catch (x: any) { failed.push(`${id}${t(': ')}${x?.message || x}`); }
+    }
+    if (done.size) setEntries((prev) => (prev || []).map((e) => (done.has(e.id) ? { ...e, crossDevice: true } : e)));
+    return failed;
+  };
+  const enableOne = async (id: string): Promise<void> => {
+    setBusy(`autosync:${id}`); setMsg(null);
+    try {
+      const failed = await enableAutoSync([id]);
+      if (failed.length) setMsg({ kind: 'bad', text: failed.join('\n') });
+    } finally { setBusy(null); }
+  };
+  /* 「全部开启自动同步」：二次确认后逐条开 */
+  const askEnableAll = (): void => {
+    const ids = counts.localNoSyncIds;
+    if (!ids.length) return;
+    setConfirm({
+      title: t('Turn on auto-sync for all'),
+      message: t('Turn on auto-sync for the {n} sessions that are already on this machine but do not have it yet? Same as right-clicking each one → "Sync to other computers"; nothing is restored or merged now.', { n: ids.length }),
+      confirmLabel: t('Turn on'),
+      onConfirm: () => { void (async () => {
+        setBusy('autosync'); setMsg(null);
+        try {
+          const failed = await enableAutoSync(ids);
+          const ok = ids.length - failed.length;
+          setMsg(failed.length
+            ? { kind: 'bad', text: [ok ? t('Turned on auto-sync for {n} sessions.', { n: ok }) : '', t('{n} failed: {list}', { n: failed.length, list: failed.slice(0, 3).join(t('; ')) })].filter(Boolean).join('\n') }
+            : { kind: 'ok', text: t('Turned on auto-sync for {n} sessions.', { n: ok }) });
+        } finally { setBusy(null); }
+      })(); },
+    });
+  };
 
   const toggle = (id: string): void => setPicked((prev) => {
     const next = new Set(prev);
@@ -633,15 +697,30 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
 
               {err && <div className="settings-warn backup-note" style={{ whiteSpace: 'pre-wrap' }}>{err}</div>}
 
+              {!!entries?.length && (
+                <div className="backup-actions backup-restore-counts">
+                  <span className="settings-hint">{restoreCountsText(counts, lang)}</span>
+                  {counts.localNoSync > 0 && (
+                    <button className="remote-btn" disabled={!!busy} onClick={askEnableAll}>
+                      {busy === 'autosync' ? t('Turning on…') : t('Turn on auto-sync for all')}
+                    </button>
+                  )}
+                </div>
+              )}
+
               {entries && !entries.length && !err && (
                 <div className="settings-hint backup-note">{t('No backups in the bucket yet. Click "Sync now" on the Sync tab first.')}</div>
               )}
 
               {!!entries && (entries.length > 0 || !err) && (
                 <div className="backup-restore-list">
-                  {groups.map(({ key, name, archived, project: proj = '', rows }) => {
+                  {groups.map((g) => {
+                    const { key, name, archived, project: proj = '', rows } = g;
                     const shut = collapsed.has(key);
+                    /* 删除按整组勾了的算（已在本机的单独勾着也删）；组头全选框只管本机没有的 */
                     const gp = groupPickState(rows, picked);
+                    const head = groupHeadPick(g, picked);
+                    const localShut = !localOpen.has(key);
                     const armed = armGroup === key;
                     return (
                       <div key={key} className="backup-group">
@@ -674,12 +753,12 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               </span>
                             );
                           })()}
-                          <label className="backup-group-all" title={t('Select / deselect every selectable session in this group (except running ones)')}>
+                          <label className="backup-group-all" title={t('Select / deselect every selectable session in this group that is not on this machine yet (except running ones)')}>
                             <input type="checkbox"
-                                   checked={gp.state === 'all'}
-                                   ref={(el) => { if (el) el.indeterminate = gp.state === 'some'; }}
-                                   disabled={!!busy || !gp.selectable}
-                                   onChange={() => setPicked((prev) => toggleGroupPick(prev, rows))} />
+                                   checked={head.state === 'all'}
+                                   ref={(el) => { if (el) el.indeterminate = head.state === 'some'; }}
+                                   disabled={!!busy || !head.selectable}
+                                   onChange={() => setPicked((prev) => toggleGroupHeadPick(prev, g))} />
                             {t('Select all')}
                           </label>
                           {/*
@@ -697,7 +776,8 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                               : t('Delete {n} selected', { n: gp.pickedIds.length })}
                           </button>
                         </div>
-                        {!shut && rows.map((e) => {
+                        {(() => {
+                          const renderRow = (e: Backup) => {
                           const fresh = compareFreshness(e);
                           return (
                           <label
@@ -731,6 +811,10 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                 {busy === `forget:${e.id}` ? t('Removing…') : t('Remove from list')}
                               </button>
                             )}
+                            {/* 已在本机的写明「✓ 已在本机」，后面接新旧对比和自动同步开没开 */}
+                            {e.existsLocally && (
+                              <span className="backup-tag on-machine" title={t('Already on this machine. Usually you do not need to restore it; turning on auto-sync is enough.')}>{t('✓ On this machine')}</span>
+                            )}
                             {/* 新旧对比：本机记录的 updatedAt 和云上那份比 */}
                             {!e.missing && <span
                               className={`backup-tag ${freshnessClass(fresh)}`}
@@ -738,10 +822,38 @@ export const BackupDialog: React.FC<{ onClose: () => void }> = ({ onClose }) => 
                                 ? t('Not on this machine; restoring simply adds it')
                                 : t('This machine {local} · cloud {cloud}', { local: when(e.localUpdatedAt), cloud: when(e.updatedAt) }) + '\n' + t('Restoring merges it with the local copy (deduplicated by message id, sorted by time)')}
                             >{freshnessLabel(fresh, lang)}</span>}
+                            {e.existsLocally && (
+                              <span className="backup-restore-meta" title={t('Auto-sync = "Sync to other computers": new messages from your other computers are merged in automatically.')}>
+                                {e.crossDevice ? t('Auto-sync: on') : t('Auto-sync: off')}
+                              </span>
+                            )}
+                            {e.existsLocally && !e.crossDevice && (
+                              <button className="remote-btn backup-autosync" disabled={!!busy}
+                                      title={t('Same as right-clicking the chat in the sidebar → "Sync to other computers". Does not restore or merge anything now.')}
+                                      onClick={(ev) => { ev.preventDefault(); ev.stopPropagation(); void enableOne(e.id); }}>
+                                {busy === `autosync:${e.id}` ? t('Turning on…') : t('Turn on auto-sync')}
+                              </button>
+                            )}
                             <span className="backup-restore-meta">{kb(e.bytes)} · {when(e.updatedAt)}</span>
                           </label>
                           );
-                        })}
+                          };
+                          if (shut) return null;
+                          return (
+                            <>
+                              {g.notLocal.map(renderRow)}
+                              {/* 已在本机的收进组末尾的子段，默认收起（展开了哪些组记在本机） */}
+                              {!!g.local.length && (
+                                <button className="backup-group-toggle backup-local-toggle"
+                                        title={t('These already exist on this machine. Usually they only need auto-sync; tick one to restore (merge) it anyway.')}
+                                        onClick={() => toggleLocalOpen(key)}>
+                                  {localShut ? '▸' : '▾'} {t('On this machine ({n})', { n: g.local.length })}
+                                </button>
+                              )}
+                              {!localShut && g.local.map(renderRow)}
+                            </>
+                          );
+                        })()}
                       </div>
                     );
                   })}

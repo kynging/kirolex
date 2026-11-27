@@ -507,7 +507,7 @@ describe('备份：配置、同步、恢复都在 ☁️ 对话框里', () => {
   test('多选 + 一颗恢复按钮', () => {
     assert.match(UI, /const \[picked, setPicked\] = useState<Set<string>>/);
     /* 组头的全选框又加回来了（用户明确要的）—— 行为见 backupGroupPick.test.ts */
-    assert.match(UI, /toggleGroupPick\(prev, rows\)/);
+    assert.match(UI, /toggleGroupHeadPick\(prev, g\)/);
     assert.match(UI, /t\('Restore \{n\} selected', \{ n: chosen\.length \}\)/);
     assert.match(ZHP, /'Restore \{n\} selected': '恢复选中的 \{n\} 条'/);
     /* 一条一条恢复：并发会同时写 trash 和 sessions，而失败要说清是哪一条 */
@@ -971,7 +971,7 @@ describe('按项目整理 + 同步/恢复两个 tab', () => {
       组头的删除只删这一组里勾选的，全选方便一次勾一整组。
     */
     assert.match(UI5, /className="backup-group-all"/);
-    assert.match(UI5, /toggleGroupPick\(prev, rows\)/);
+    assert.match(UI5, /toggleGroupHeadPick\(prev, g\)/);
     /* 滚到一半时"我在看哪个项目"不该需要往上翻 */
     const at = CSS5.indexOf('.backup-group-head {');
     assert.ok(at > 0);

@@ -9443,6 +9443,17 @@ button, input, select, textarea {
   text-align: left;
 }
 .backup-group-toggle:hover { color: var(--accent); }
+/* 恢复页组末尾「已在本机 N 条」子段的开关：比组头轻一档，缩进和行对齐 */
+.backup-local-toggle {
+  flex: 0 0 auto;
+  align-self: flex-start;
+  margin: 4px 0 2px 22px;
+  font-weight: 500;
+  color: var(--text-secondary);
+}
+/* 「✓ 已在本机」：中性，不和新旧对比的四种颜色抢 */
+.backup-tag.on-machine { color: var(--text-primary); }
+.backup-autosync { font-size: 11px; padding: 1px 8px; flex: 0 0 auto; }
 /* 组内的行缩进一点，和组头分得开 */
 .backup-group .backup-restore-row { margin-left: 10px; }
 
