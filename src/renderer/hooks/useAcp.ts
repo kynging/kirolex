@@ -5288,14 +5288,23 @@ ${text}`,
       // else (/stop, a background pane) cancelled the current iteration and the loop
       // immediately scheduled the next one, so the loop looked unstoppable.
       endLoop(sessionForCancel, 'aborted');
+      const outcomeBefore = turnOutcomeRef.current.get(sessionForCancel);
       turnOutcomeRef.current.set(sessionForCancel, { kind: 'cancelled' });
       /* `user`：这一轮要是别的会话发来、在等回复的，主进程告诉发起方「对方的用户停止了这一轮」 */
-      await window.kiroApi.cancel(
+      const res = await window.kiroApi.cancel(
         sessionForCancel,
         modelForSession(sessionForCancel),
         options?.suppressInterruptionNotice,
         'user',
       );
+      /*
+        压缩中（/compact 那一轮早就结束了）按停止 = 只是放弃等压缩：没有被打断的一轮，不把 /compact 放回输入框、
+        也不改那一轮的结果（主进程 `stoppedCompact`，排队的消息随即照常发出）。
+      */
+      if (res?.stoppedCompact) {
+        if (outcomeBefore) turnOutcomeRef.current.set(sessionForCancel, outcomeBefore); else turnOutcomeRef.current.delete(sessionForCancel);
+        return;
+      }
       removeStreaming(sessionForCancel);
       dropPermissionCardIfEnded(sessionForCancel);
       // Put the interrupted turn's prompt back in the composer (including any

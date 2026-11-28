@@ -46,8 +46,8 @@ export interface CompactWait {
   pctAfter?: number;
   /** 压缩那一轮还没结束就已经看到骤降了（同步压完）。 */
   droppedDuringTurn?: boolean;
-  /** 完成了（或超时、出错放行了）。之后不再挡消息。notice = kiro 自己报了压缩完成（`_kiro.dev/compaction/status`）。 */
-  finished?: { at: number; by: 'drop' | 'notice' | 'sync' | 'timeout' | 'error' };
+  /** 完成了（或超时、出错放行了）。之后不再挡消息。notice = kiro 自己报了压缩完成（`_kiro.dev/compaction/status`）；stopped = 你按了停止（放弃等待，见 `stopCompactWait`）。 */
+  finished?: { at: number; by: 'drop' | 'notice' | 'sync' | 'timeout' | 'error' | 'stopped' };
   /**
    * **花费归属关上了**：之后的帧不再算压缩的。不按时间窗口关 —— 按协议：kiro 一轮的计量在**那一轮的结尾**才报
    * （kiro-cli 里 `EndTurn: backend context usage` → turn metadata），压缩的计量是它自己那一帧（`metadata after compaction`）。
@@ -76,6 +76,20 @@ export function isCompactDrop(pctBefore: number | null, pct: number): boolean {
 /** 还在挡新消息（压缩中）。 */
 export function compactHolds(w: CompactWait | undefined | null): boolean {
   return !!w && !w.finished;
+}
+
+/**
+ * **压缩中按停止**（/compact 那一轮已经结束、压缩还在后台跑）：放弃等待 —— 照常放行排队的消息（同超时）。
+ * 那一轮还在跑的交给普通的停止（一轮被停 → `noteCompactTurnEnd` ok=false）；已经压完的不动。
+ */
+export function stopCompactWait(w: CompactWait, now: number): CompactWait {
+  if (!compactHolds(w) || !w.turnEnded) return w;
+  return { ...w, finished: { at: now, by: 'stopped' } };
+}
+
+/** 没等到压完就放行了（超时 / 你按了停止）：压缩可能还在后台跑，之后迟到的骤降照样会来。 */
+export function releasedBeforeDone(by: CompactFinishedBy | null | undefined): boolean {
+  return by === 'timeout' || by === 'stopped';
 }
 
 /**
@@ -192,6 +206,7 @@ export function compactFinishedLine(sessionId: string, w: CompactWait): string {
   const b = typeof w.pctAfter === 'number' ? String(Math.round(w.pctAfter)) : '?';
   const secs = Math.round(((w.finished?.at ?? w.startedAt) - w.startedAt) / 1000);
   const by = w.finished?.by ?? 'drop';
+  if (by === 'stopped') return `compacting sessionId=${sessionId} stopped by user after ${secs}s (pct=${a}->${b}) — releasing queued prompts`;
   return by === 'timeout'
     ? `compacting sessionId=${sessionId} timed out after ${secs}s without a completion signal (pct=${a}->${b}) — releasing queued prompts`
     : `compacting sessionId=${sessionId} finished pct=${a}->${b} after ${secs}s${by === 'drop' ? '' : ` (${by})`}`;
@@ -207,11 +222,14 @@ export function compactUsagePatch(messageId: string, turnUsage: object, now: num
 
 /**
  * 自动压缩做完在会话里留哪一句（渲染端 App 的自动压缩）：**只有主进程确认压完了**（骤降 / 同步引擎一轮结束）才说「已压缩」；
- * 3 分钟没等到完成信号说「没确认完成、排着的消息照常发了」；/compact 那一轮出错、或者一直没收到结果，说没成功。
+ * 3 分钟没等到完成信号说「没确认完成、排着的消息照常发了」；/compact 那一轮出错、或者一直没收到结果，说没成功；
+ * 你按停止放弃了等待（stopped）不留话。
  */
 export type CompactFinishedBy = NonNullable<CompactWait['finished']>['by'];
-export function autoCompactNoteKind(finishedBy: CompactFinishedBy | null | undefined, turnOk: boolean): 'done' | 'unconfirmed' | 'failed' {
+export function autoCompactNoteKind(finishedBy: CompactFinishedBy | null | undefined, turnOk: boolean): 'done' | 'unconfirmed' | 'failed' | 'stopped' {
   if (!turnOk) return 'failed';
+  /* 你自己按停止放弃了等待：不说已压缩、也不说失败 */
+  if (finishedBy === 'stopped') return 'stopped';
   if (finishedBy === 'drop' || finishedBy === 'notice' || finishedBy === 'sync') return 'done';
   if (finishedBy === 'timeout') return 'unconfirmed';
   return 'failed';

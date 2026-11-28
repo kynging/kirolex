@@ -992,8 +992,8 @@ contextBridge.exposeInMainWorld('kiroApi', {
     ipcRenderer.on('acp:compacting', handler);
     return () => ipcRenderer.removeListener('acp:compacting', handler);
   },
-  /** 压缩中结束了（`main/compactWait.ts`）：by = drop（占用骤降，压完了）/ sync（同步引擎一轮结束）/ timeout（3 分钟没等到）/ error */
-  onCompactFinished: (callback: (data: { sessionId: string; by: 'drop' | 'sync' | 'timeout' | 'error'; pctBefore: number | null; pctAfter: number | null }) => void) => {
+  /** 压缩中结束了（`main/compactWait.ts`）：by = drop（占用骤降，压完了）/ sync（同步引擎一轮结束）/ timeout（3 分钟没等到）/ error / stopped（你按了停止，放弃等待）/ notice */
+  onCompactFinished: (callback: (data: { sessionId: string; by: 'drop' | 'notice' | 'sync' | 'timeout' | 'error' | 'stopped'; pctBefore: number | null; pctAfter: number | null }) => void) => {
     const handler = (_event: any, data: any) => callback(data);
     ipcRenderer.on('acp:compact-finished', handler);
     return () => ipcRenderer.removeListener('acp:compact-finished', handler);

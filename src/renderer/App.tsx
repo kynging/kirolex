@@ -314,7 +314,7 @@ declare global {
       memoryCompactUndo?: (backupPath: string) => Promise<{ ok: boolean; error?: string }>;
       onMemoryBytes: (callback: (data: { sessionId: string; projectId: string | null; global: number; project: number; session: number }) => void) => () => void;
       prompt: (sessionId: string, prompt: any[], model: string, projectId?: string, display?: { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; fromHandoff?: string[] }) => Promise<any>;
-      cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean, reason?: 'user') => Promise<void>;
+      cancel: (sessionId: string, model: string, suppressInterruptionNotice?: boolean, reason?: 'user') => Promise<{ idle?: boolean; stoppedCompact?: boolean; abandonedPrime?: boolean } | undefined>;
       steer: (sessionId: string, message: string, msgId?: string) => Promise<{ steered: boolean; reason?: string; messageId?: string }>;
       /** 忙时 Enter 交给适配器排队（promptQueueing，主进程 acp:handoff-prompt） */
       handoffPrompt?: (sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; attachments?: any[]; pastes?: any[] }) => Promise<{ accepted: boolean; reason?: string; error?: string }>;
@@ -3600,11 +3600,18 @@ const App: React.FC = () => {
     所以单独推一份：这期间 Enter / 插话 / 控制入口发来的都进 KiroLex 队列，不交给正在压缩的引擎。ref 给发送路径同步读。
   */
   const [compactingIds, setCompactingIds] = useState<string[]>([]);
+  /* 从什么时候开始压的（聊天区底部「正在压缩上下文… N 秒」）：主进程发出 /compact 时同步发 acp:compacting，收到的那一刻就是开始 */
+  const [compactingSince, setCompactingSince] = useState<Record<string, number>>({});
   const compactingRef = useRef<Set<string>>(new Set());
   useEffect(() => window.kiroApi.onCompacting?.(({ sessionId, compacting }) => {
     if (!sessionId) return;
     if (compacting) compactingRef.current.add(sessionId); else compactingRef.current.delete(sessionId);
     setCompactingIds(Array.from(compactingRef.current));
+    setCompactingSince((prev) => {
+      const next = { ...prev };
+      if (compacting) next[sessionId] = Date.now(); else delete next[sessionId];
+      return next;
+    });
   }), []);
   queuesBySessionRef.current = queuesBySession;
   /* 队列一变就落盘。空队列删掉键，免得 ui-state 里留一堆 `sid: []` */
@@ -4484,6 +4491,7 @@ const App: React.FC = () => {
         finally { queueSendingRef.current.delete(sid); }
         /* 那一轮成了也还要等主进程确认压完（kiro 的压缩在 end_turn 之后才真正做完）；出错的不等 */
         const kind = autoCompactNoteKind(ok ? await finished : null, ok);
+        if (kind === 'stopped') return;
         const text = kind === 'done'
           ? tRef.current('🗜️ Context was at {pct}%, so KiroLex compacted it automatically (Settings → Chats → auto-compact).', { pct: Math.round(pct) })
           : kind === 'unconfirmed'
@@ -4717,6 +4725,7 @@ const App: React.FC = () => {
         sessionConnected={!!sid && attachedSessionIds.includes(sid) && !connectingSessionIds.includes(sid)}
         waitingForConnection={!!sid && waitsForConnection(connectingFactsFor(sid))}
         compacting={!!sid && (busyBySession[sid] === 'compacting' || compactingIds.includes(sid))}
+        compactingSince={sid ? compactingSince[sid] : undefined}
         readySessionIds={readySessionIds}
         // Per CHAT, not per focus. Previously this was one app-wide string shown only
         // in the focused pane, so a failure in chat A appeared over chat B once focus

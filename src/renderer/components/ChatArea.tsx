@@ -87,6 +87,7 @@ import { subagentGroups, mergeTurnSubagents, currentStep, type SubagentGroup } f
 import type { CommandToolKind } from '../../main/toolTrace.ts';
 import { diffView, sumDiffStats } from '../diffView.ts';
 import { startupSteps, startupElapsedSeconds, type CreateStageInfo } from '../createStages.ts';
+import { compactingElapsedSeconds } from '../compactingIndicator.ts';
 import { engineLabel as engineDisplayName } from '../engineLabel.ts';
 import { parseDeniedNoteGroup, deniedRoleArn, deniedCardPolicy, bedrockNoteActive } from '../../main/bedrockIam.ts';
 import { isSafeguardNoteGroup, safeguardModelChoices, cyberVerificationUrl, type ModelChoice } from '../../main/safeguardError.ts';
@@ -3354,8 +3355,9 @@ const ChatInputBox = memo<{
           <button className="composer-send stop" onClick={onStopLoop} title={t('Stop looping')}>
             <span className="stop-btn-square" />
           </button>
-        ) : isStreaming && !canSend ? (
-          <button className="composer-send stop" onClick={onCancel} title={t('Stop')}>
+        ) : (isStreaming || compacting) && !canSend ? (
+          /* 压缩中也给停止：停 = 放弃等压缩，排队的消息照常发出（主进程 acp:cancel → stopCompactWait） */
+          <button className="composer-send stop" onClick={onCancel} title={compacting && !isStreaming ? t('Stop waiting for compaction; queued messages send now') : t('Stop')}>
             <span className="stop-btn-square" />
           </button>
         ) : (
@@ -4117,6 +4119,8 @@ interface ChatAreaProps {
   waitingForConnection?: boolean;
   /** 压缩还在后台跑（/compact 那一轮结束了、主进程还报 compacting）：输入框上方说「正在压缩上下文，完成后自动发送」，发的消息进排队 */
   compacting?: boolean;
+  /** 从什么时候开始压的（收到 `acp:compacting` 的时刻）：底部「正在压缩上下文… N 秒」 */
+  compactingSince?: number;
   /** 所有「执行器挂着、不在连接中」的会话（不只这一格这条）—— 后台恢复的会话也要清掉它的切换失败 ✗ */
   readySessionIds?: readonly string[];
   connectionError: string | null;
@@ -4322,6 +4326,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   sessionConnected,
   waitingForConnection = false,
   compacting = false,
+  compactingSince,
   readySessionIds,
   connectionError,
   onDismissError,
@@ -4653,6 +4658,22 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     const timer = setInterval(() => setBgNow(Date.now()), 5000);
     return () => clearInterval(timer);
   }, [hasBgJobs]);
+
+  /*
+    **压缩中按「在工作」显示**：/compact 那一轮结束之后 kiro 还要在后台压 ~45 秒，底部照样一格运行指示 +「正在压缩上下文… N 秒」。
+    不知道开始时间（窗口刷新后只拿到 busy=compacting）就从这里第一次看到压缩中算。
+  */
+  const [compactingNow, setCompactingNow] = useState(() => Date.now());
+  const compactingSeenRef = useRef<number | null>(null);
+  if (!compacting) compactingSeenRef.current = null;
+  else if (compactingSeenRef.current === null) compactingSeenRef.current = Date.now();
+  const compactingFrom = compactingSince ?? compactingSeenRef.current ?? undefined;
+  useEffect(() => {
+    if (!compacting) return;
+    setCompactingNow(Date.now());
+    const timer = setInterval(() => setCompactingNow(Date.now()), 1000);
+    return () => clearInterval(timer);
+  }, [compacting]);
 
   const draftSchedule = useMemo<ScheduleSpec>(() => ({
     prompt: scheduleSetup?.text || '',
@@ -6306,6 +6327,15 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 ? t('🤖 Subagent running · {tool}', { tool: activeToolCall })
                 : t('⚙️ Running · {tool}', { tool: activeToolCall })}
             </span>
+          </div>
+        ) : compacting && !isStreaming ? (
+          <div className="message assistant compacting-indicator" role="status">
+            <div className="message-content">
+              <div className="thinking-dots">
+                <span /><span /><span />
+              </div>
+              <span className="activity-status-text">{t('Compacting the context… {n}s', { n: compactingElapsedSeconds(compactingFrom, compactingNow) })}</span>
+            </div>
           </div>
         ) : (activityStatus || (isStreaming && messages.length > 0)) ? (
           <div className="message assistant">

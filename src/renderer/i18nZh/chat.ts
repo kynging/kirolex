@@ -628,4 +628,6 @@ export const ZH_CHAT: Record<string, string> = {
   'Enter queue (sends after compaction) · Shift+Enter newline': 'Enter 排队（压完后发送）· Shift+Enter 换行',
   'Queue to send after compaction (Enter)': '排队，压完后发送（Enter）',
   '⏳ Compacting the context; will switch to {target} once it finishes (waited {n}s).': '⏳ 正在压缩上下文，压完后切到 {target}（已等 {n} 秒）',
+  'Compacting the context… {n}s': '正在压缩上下文… 已用 {n} 秒',
+  'Stop waiting for compaction; queued messages send now': '停止等待压缩，排队的消息马上发出',
 };

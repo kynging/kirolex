@@ -31,7 +31,7 @@ import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
 import { contextLogLine } from './contextReminder';
-import { armCompactTimeout, compactOnExecutorGone, compactCostOf, compactionStatusOf, routeCompactFrame, compactFinishedLine, compactHolds, compactStartedLine, compactUsagePatch, noteCompactTurnEnd, noteCompactUsage, settleCompactWait, startCompactWait, type CompactWait } from './compactWait.ts';
+import { armCompactTimeout, compactOnExecutorGone, compactCostOf, compactionStatusOf, routeCompactFrame, compactFinishedLine, compactHolds, compactStartedLine, compactUsagePatch, noteCompactTurnEnd, noteCompactUsage, releasedBeforeDone, settleCompactWait, startCompactWait, stopCompactWait, type CompactWait } from './compactWait.ts';
 import { normalizeToolOutputKb } from './toolOutputLimits';
 import { TOOL_OUTPUT_DIR, expandToolOutputForDisplay } from './toolOutputCap';
 import { busyEnterLogLine, detachedTurnEnded, steerDisplay, steeringDegradedLogLine, steeringFailureLogLine, steeringPromptBlocks } from './busyEnterCaps';
@@ -1709,7 +1709,7 @@ function finishCompactWait(sessionId: string, entry: SessionEntry): void {
   if (!w?.finished) return;
   clearTimeout(entry.compactWaitTimer);
   entry.compactWaitTimer = undefined;
-  if (w.finished.by === 'timeout') logger.warn('context', compactFinishedLine(sessionId, w));
+  if (releasedBeforeDone(w.finished.by)) logger.warn('context', compactFinishedLine(sessionId, w));
   else logger.info('context', compactFinishedLine(sessionId, w));
   /*
     放行之前先把到此为止的花费补记到压缩那条上；之后（下一轮出输出之前）再到的计量照样算压缩的、再更新一次 ——
@@ -10116,8 +10116,8 @@ function wireSession(sessionId: string, entry: SessionEntry) {
         正常情况（压完才放行）下，/compact 和这次骤降只是把同一个「下一轮完整注入」标记置上，放行的那一条注入一次。
       */
       /* 只认超时后 10 分钟内的第一次骤降：再往后的是另一回压缩（例如引擎自己的自动压缩），照常完整注入 */
-      const late = entry.compactWait?.finished?.by === 'timeout' && !!entry.compactWait.fullSentAfterTimeout
-        && Date.now() - entry.compactWait.finished.at < 10 * 60_000;
+      const late = releasedBeforeDone(entry.compactWait?.finished?.by) && !!entry.compactWait?.fullSentAfterTimeout
+        && Date.now() - entry.compactWait!.finished!.at < 10 * 60_000;
       if (entry.compactWait?.fullSentAfterTimeout) entry.compactWait = { ...entry.compactWait, fullSentAfterTimeout: false };
       if (late && entry.injectCadence) entry.injectCadence.reset = false;
       logger.info('memory', `context usage dropped sharply (compacted) sessionId=${sessionId} pct=${Math.round(entry.injectCadence?.contextPct ?? 0)} -> ${late ? 'already injected in full after the compact timeout' : 'next turn injects in full'}`);
@@ -13019,7 +13019,7 @@ ${hint}` : ''}` };
     });
     entry.injectCadence = injectNext;
     /* 超时放行后的这一条完整注入了记忆：迟到的骤降不再要求再注入一次（见 wireSession 那边） */
-    if (entry.compactWait?.finished?.by === 'timeout' && injectPlan.memory === 'full') entry.compactWait = { ...entry.compactWait, fullSentAfterTimeout: true };
+    if (releasedBeforeDone(entry.compactWait?.finished?.by) && injectPlan.memory === 'full') entry.compactWait = { ...entry.compactWait!, fullSentAfterTimeout: true };
     /* 这一轮就是 /compact（界面上的「压缩」按钮也是它）：压完之后的下一轮完整注入；进「压缩中」，压完之前不放下一条 */
     if (isCompactCommand(display?.displayText ?? promptTextOf(prompt))) markContextReset(entry.injectCadence);
     if (isCompactCommand(display?.displayText ?? promptTextOf(prompt))) beginCompactWait(sessionId, entry);
@@ -13989,6 +13989,15 @@ ${hint}` : ''}` };
   ) => {
     const entry = sessionClients.get(sessionId);
     if (!entry) return { idle: true };
+    /*
+      **压缩中按停止 = 放弃等待**（/compact 那一轮已经结束，kiro 还在后台压，`compactWait.ts` `stopCompactWait`）：
+      照常放行排队的消息、界面恢复空闲。没有一轮在跑，不发 cancel、也不算打断了一轮（渲染端看 `stoppedCompact`）。
+    */
+    if (!entry.busy && !entry.autonomous && entry.compactWait?.turnEnded && compactHolds(entry.compactWait)) {
+      entry.compactWait = stopCompactWait(entry.compactWait, Date.now());
+      finishCompactWait(sessionId, entry);
+      return { idle: true, stoppedCompact: true };
+    }
     /*
       **Stop 也要把正在跑的同步掐掉** ——「为啥远程会话一直没有响应」那次，卡住的不是模型，
       是一个还在跑的 rsync（上限 10 分钟）。不掐它，按了 Stop 也得干等到它自己结束 ——
