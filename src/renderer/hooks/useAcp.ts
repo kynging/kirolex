@@ -146,7 +146,8 @@ export const APP_ERROR_KEY = '__app__';
  *  would otherwise answer from nothing, so new messages QUEUE behind the rebuild.
  *  The rebuild has no attempt limit, so the ONLY releases are the user pressing
  *  Stop (abandon) or clearing the history. */
-export const OCCUPYING_BUSY_REASONS = new Set(['turn', 'reconfiguring', 'attaching', 'priming', 'prime-pending', 'creating']);
+/* 'compacting'：/compact 那一轮结束了、压缩还在后台跑（主进程 `compactWait.ts`）—— 这时发的一条会被 kiro 吞掉，排着等压完 */
+export const OCCUPYING_BUSY_REASONS = new Set(['turn', 'reconfiguring', 'attaching', 'priming', 'prime-pending', 'creating', 'compacting']);
 export function isBackendOccupied(reason: string | null | undefined): boolean {
   return !!reason && OCCUPYING_BUSY_REASONS.has(reason);
 }

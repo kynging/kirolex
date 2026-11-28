@@ -31,6 +31,7 @@ import { rewriteImagePaths } from './imagePaths';
 import { steerRefusal } from './steerGate';
 import { HandoffRefused, detachedTurnMessageId, dropFollowUp, enlistFollowUp as enlistFollowUpTurn, handOverTurn as handOverFollowUp, holdTarget, keepsBusy, type FollowUp, type FollowUpDeps, type HandoffSpec } from './followUpTurns';
 import { contextLogLine } from './contextReminder';
+import { armCompactTimeout, compactOnExecutorGone, compactCostOf, compactionStatusOf, routeCompactFrame, compactFinishedLine, compactHolds, compactStartedLine, compactUsagePatch, noteCompactTurnEnd, noteCompactUsage, settleCompactWait, startCompactWait, type CompactWait } from './compactWait.ts';
 import { normalizeToolOutputKb } from './toolOutputLimits';
 import { TOOL_OUTPUT_DIR, expandToolOutputForDisplay } from './toolOutputCap';
 import { busyEnterLogLine, detachedTurnEnded, steerDisplay, steeringDegradedLogLine, steeringFailureLogLine, steeringPromptBlocks } from './busyEnterCaps';
@@ -416,6 +417,14 @@ interface SessionEntry {
   sessionCost?: SessionCost;
   /** 这一轮攒着的真实消耗（`turnUsage.ts`）：每帧累加，`flushAssistant` 收尾落盘后清掉 */
   turnUsageAcc?: TurnUsageAcc;
+  /**
+   * **压缩中**（`compactWait.ts`）：发出 /compact 之后到看到压缩完成（占用骤降 / 3 分钟超时）之前，会话报 `compacting`、
+   * 新消息不交给引擎。kiro 的 /compact 回一句 "Compacting conversation..." 就 end_turn，压缩本身还在后台跑。
+   */
+  compactWait?: CompactWait;
+  compactWaitTimer?: NodeJS.Timeout;
+  /** 最近一次 `flushAssistant` 落盘的那条助手消息 id（/compact 那一轮的花费补记要用）。 */
+  lastFlushedAssistantId?: string;
   /** 后端自己起的那一轮的来源标记 id（`AutonomousTurn.noteId`）—— 本轮消耗告诉界面这一轮从哪开始 */
   autonomousNoteId?: string;
   /** 上一轮结束时的上下文 used —— 算这一轮的增量（执行器新起时从会话记录的 `lastTurnContextUsed` 取） */
@@ -954,6 +963,7 @@ async function swapSessionModel(sessionId: string, failedModel: string, label: s
   /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
   const startedRec = store.readRecord(sessionId)?.profile;
   reconfiguringSessions.add(sessionId);
+  endCompactWaitForExecutor(sessionId, entry, 'reconnect');
   sessionClients.delete(sessionId);               // release single-process ownership
   try { await entry.client.disconnect(); } catch {}
   try {
@@ -1621,7 +1631,7 @@ function cleanLiteOutput(stdout: string): string {
 /** Why a session's backend is currently occupied (null = free). The renderer
  *  renders this so an occupied session is VISIBLE up front instead of only
  *  surfacing as a "still in progress" / "Internal error" banner afterwards. */
-type BusyReason = 'creating' | 'turn' | 'reconfiguring' | 'attaching' | 'priming' | 'prime-pending' | null;
+type BusyReason = 'creating' | 'turn' | 'reconfiguring' | 'attaching' | 'priming' | 'prime-pending' | 'compacting' | null;
 function busyReasonFor(sessionId: string): BusyReason {
   /* 还在新建（执行器没起来）：占用 —— 这时发的消息进排队，就绪后自动发出 */
   if (creations.creating(sessionId)) return 'creating';
@@ -1631,6 +1641,8 @@ function busyReasonFor(sessionId: string): BusyReason {
   if (entry?.priming) return 'priming';
   /* 后端自己起的那一轮（autonomousTurn.ts）界面上也是一轮：渲染端接管它的流，结束信号就是这里不再报 turn */
   if (entry?.busy || entry?.autonomous) return 'turn';
+  /* /compact 那一轮结束了、压缩本身还在后台跑（`compactWait.ts`）：占用 —— 新消息进排队，压完再发 */
+  if (compactHolds(entry?.compactWait)) return 'compacting';
   // Context owed. This OCCUPIES the session on purpose: a chat whose backend has
   // no history must not accept a new message that would be answered from nothing.
   // New messages queue behind the rebuild instead.
@@ -1658,6 +1670,124 @@ function emitSessionBusy(sessionId: string) {
     `schedulePrime` 本身是幂等的(已在队列或在跑就直接返回),所以不会堆叠。
   */
   if (reason === 'prime-pending') schedulePrime(sessionId);
+}
+
+/* ─────────────── 压缩中（`compactWait.ts`）─────────────── */
+
+/** 在等压缩完成的发送（定时任务 / 唤醒 / 控制入口 / 斜杠命令…；输入框的消息在渲染端排队，到不了这里）。 */
+const compactWaiters = new Map<string, Array<() => void>>();
+
+/** 发出 /compact：进「压缩中」，排好 3 分钟超时。 */
+function beginCompactWait(sessionId: string, entry: SessionEntry): void {
+  if (entry.compactWait && !entry.compactWait.settled) settleCompactUsage(sessionId, entry);
+  clearTimeout(entry.compactWaitTimer);
+  entry.compactWait = startCompactWait(Date.now(), entry.injectCadence?.contextPct ?? null);
+  logger.info('context', compactStartedLine(sessionId));
+  /* 从发出 /compact 起界面就算「压缩中」（这一轮自己还在跑时 busy 仍报 turn）：Enter / 插话都进 KiroLex 队列，不交给正在压缩的引擎 */
+  mainWindow?.webContents.send('acp:compacting', { sessionId, compacting: true });
+  /*
+    认批次号、对到点时的当前状态做超时（状态每变一次都是新对象，见 `armCompactTimeout`）。
+    **按会话读此刻挂着的执行器**，不认发 /compact 时那个 entry 对象（审查：换模型失败回滚时 entry 被整份复制成新对象，
+    定时器改的是旧对象，新执行器永远报 compacting）。换了执行器的那一刻压缩已经作废（`adoptExecutor` → `abandonCompactWait`）。
+  */
+  entry.compactWaitTimer = armCompactTimeout({
+    batch: entry.compactWait.batch,
+    startedAt: entry.compactWait.startedAt,
+    get: () => sessionClients.get(sessionId)?.compactWait,
+    set: (w) => { const live = sessionClients.get(sessionId); if (live) live.compactWait = w; },
+    onExpired: () => { const live = sessionClients.get(sessionId); if (live) finishCompactWait(sessionId, live); },
+    /* 兜底：执行器没了 / 换了而状态没被收掉 —— 到点照样放行（不然界面一直压缩中、在等的发送永远挂着） */
+    onGone: () => { if (compactWaiters.has(sessionId)) abandonCompactWait(sessionId, 'timer found no executor'); },
+    now: Date.now,
+    setTimer: (fn, ms) => setTimeout(fn, ms),
+  });
+}
+
+/** 压缩完成 / 超时 / 出错：放行在等的发送、告诉界面不忙了（排队的消息据此发出）。花费归属不在这里关（见 `CompactWait.settled`）。 */
+function finishCompactWait(sessionId: string, entry: SessionEntry): void {
+  const w = entry.compactWait;
+  if (!w?.finished) return;
+  clearTimeout(entry.compactWaitTimer);
+  entry.compactWaitTimer = undefined;
+  if (w.finished.by === 'timeout') logger.warn('context', compactFinishedLine(sessionId, w));
+  else logger.info('context', compactFinishedLine(sessionId, w));
+  /*
+    放行之前先把到此为止的花费补记到压缩那条上；之后（下一轮出输出之前）再到的计量照样算压缩的、再更新一次 ——
+    不靠时间窗口（审查：3 秒之后才到的 11.5 会串到下一条）。出错的没什么可等的，直接关。
+  */
+  if (w.finished.by === 'error') settleCompactUsage(sessionId, entry);
+  else writeCompactUsage(sessionId, entry);
+  const waiters = compactWaiters.get(sessionId) || [];
+  compactWaiters.delete(sessionId);
+  for (const go of waiters) go();
+  /* 怎么结束的告诉界面：自动压缩只在真压完了（drop / sync）才在会话里说「已压缩」 */
+  mainWindow?.webContents.send('acp:compact-finished', { sessionId, by: w.finished.by, pctBefore: w.pctBefore, pctAfter: w.pctAfter ?? null });
+  mainWindow?.webContents.send('acp:compacting', { sessionId, compacting: false });
+  emitSessionBusy(sessionId);
+  /* 压缩中记下的切换（模型 / agent / 引擎…，见 `queueSwitchWhileBusy`）现在应用 */
+  void pendingSwitchRunner.kick(sessionId);
+}
+
+/**
+ * **执行器换了（`adoptExecutor`）：这次压缩作废** —— 压缩是在旧进程里跑的，新进程（换模型 / 回滚 / 重连起的都是新进程）
+ * 不会再报它的完成、也不会报它的花费。不放行的话排着的消息一直等（审查：换模型失败回滚后新执行器永远报 compacting）。
+ * 放行在等的发送、告诉界面不再压缩中、记一行。
+ */
+function abandonCompactWait(sessionId: string, why: string): void {
+  logger.warn('context', `compacting sessionId=${sessionId} abandoned (${why}) — releasing queued prompts`);
+  const waiters = compactWaiters.get(sessionId) || [];
+  compactWaiters.delete(sessionId);
+  for (const go of waiters) go();
+  mainWindow?.webContents.send('acp:compact-finished', { sessionId, by: 'error', pctBefore: null, pctAfter: null });
+  mainWindow?.webContents.send('acp:compacting', { sessionId, compacting: false });
+}
+
+/**
+ * **执行器要摘掉了**（断线、detach、换模型 / 重连前先拿下）：它身上没完成的压缩跟着作废 —— 停掉超时定时器、清掉状态、
+ * 放行在等的发送（它们接着走「没连着」那条现成的恢复路）、告诉界面不再压缩中（审查：断线后界面一直压缩中、按钮一直灰）。
+ * 已经压完的只停定时器、清状态。
+ */
+function endCompactWaitForExecutor(sessionId: string, entry: SessionEntry | undefined, why: string): void {
+  const plan = compactOnExecutorGone(entry?.compactWait, compactWaiters.has(sessionId));
+  if (plan.clear && entry) { clearTimeout(entry.compactWaitTimer); entry.compactWaitTimer = undefined; entry.compactWait = undefined; }
+  if (plan.abandon) abandonCompactWait(sessionId, why);
+}
+
+/**
+ * 把压缩到此为止攒下的用量补记到压缩那一条助手消息上（transcript 只追加，见 `compactUsagePatch`；读的时候取最后一行补记），
+ * 界面同步换掉那一格。和上次写的一样就不再写。
+ */
+function writeCompactUsage(sessionId: string, entry: SessionEntry): void {
+  const w = entry.compactWait;
+  if (!w || !w.turnEnded || !w.messageId) return;
+  const cost = compactCostOf(w.acc);
+  if (w.writtenCost !== undefined && w.writtenCost === cost) return;
+  const turnUsage = finishTurnUsage(w.acc, { engine: engineOf(entry.profile), model: entry.profile.model });
+  if (!turnUsage) return;
+  entry.compactWait = { ...w, writtenCost: cost };
+  try { store.appendMessage(sessionId, compactUsagePatch(w.messageId, turnUsage, Date.now()) as any); } catch (e: any) { logger.warn('context', `压缩花费补记失败 sessionId=${sessionId}: ${e?.message || e}`); }
+  mainWindow?.webContents.send('acp:turn-usage', { sessionId, messageId: w.messageId, turnUsage, ...(w.replyTo ? { turnStart: w.replyTo } : {}) });
+}
+
+/** 关上压缩的花费归属（下一轮出了输出 / 下一轮结束 / 又发了 /compact）：最后补记一次，之后的帧都是新一轮的。 */
+function settleCompactUsage(sessionId: string, entry: SessionEntry): void {
+  const w = entry.compactWait;
+  if (!w || w.settled || !w.turnEnded) return;
+  writeCompactUsage(sessionId, entry);
+  entry.compactWait = settleCompactWait(entry.compactWait!).wait;
+}
+
+/** 发送前：还在压缩中就等它完成（最多到那 3 分钟超时）。输入框的消息在渲染端就排队了，这里兜其他入口。 */
+async function awaitCompactRelease(sessionId: string): Promise<boolean> {
+  const entry = sessionClients.get(sessionId);
+  if (!entry || !compactHolds(entry.compactWait)) return false;
+  logger.info('context', `queued prompt while compacting sessionId=${sessionId}`);
+  await new Promise<void>((resolve) => {
+    const list = compactWaiters.get(sessionId) || [];
+    list.push(() => resolve());
+    compactWaiters.set(sessionId, list);
+  });
+  return true;
 }
 
 /**
@@ -5311,7 +5441,14 @@ class SessionDeletedError extends Error {}
 function adoptExecutor(sessionId: string, entry: SessionEntry, what: string): void {
   if (sessionDeleted(sessionId)) deletedSessionIds.add(sessionId);
   const adopted = adoptUnlessDeleted(lateEvents, sessionId, what, {
-    register: () => { sessionClients.set(sessionId, entry); },
+    register: () => {
+      /* 压缩状态不跟着换执行器（`{ ...oldEntry }` 复制过来的那份）：还在压缩中就作废、放行（`abandonCompactWait`） */
+      const carried = entry.compactWait;
+      entry.compactWait = undefined;
+      entry.compactWaitTimer = undefined;
+      sessionClients.set(sessionId, entry);
+      if (compactHolds(carried) || compactWaiters.has(sessionId)) abandonCompactWait(sessionId, what);
+    },
     discard: () => {
       void entry.client.disconnect().catch(() => { /* 已经没了 */ });
       releaseLocalTools(sessionId, entry.profile.remote);
@@ -6005,6 +6142,8 @@ let applyPendingSwitchBatch: (sessionId: string, entries: PendingSwitch[]) => Pr
 const pendingSwitchRunner = new PendingSwitchRunner(pendingSwitches, {
   /* 后端自己起的那一轮（autonomousTurn.ts）也算：切换等它收尾（收尾时 kick，见 autonomousDeps.finish） */
   isBusy: (sessionId) => { const e = sessionClients.get(sessionId); return !!e?.busy || !!e?.autonomous; },
+  /* 压缩中（/compact 回了 end_turn、压缩还在这个进程里跑）也先不切：换执行器会把压缩打断，压完（finishCompactWait 里 kick）再切 */
+  isHeld: (sessionId) => compactHolds(sessionClients.get(sessionId)?.compactWait),
   apply: (sessionId, entries) => applyPendingSwitchBatch(sessionId, entries),
 });
 /**
@@ -6059,6 +6198,8 @@ function queueSwitchWhileBusy(
     attaching: attachingSessions.has(sessionId) || mountLock.busy(sessionId),
     fromPending,
   });
+  /* 压缩中：先记下，压完再切（`queueSwitchWhileCompacting`） */
+  if (!settling && !fromPending) { const held = queueSwitchWhileCompacting(sessionId, kind, value, label); if (held) return held; }
   if (!settling && !shouldQueueSwitch({ busy: !!sessionClients.get(sessionId)?.busy, applying: pendingSwitchRunner.isApplying(sessionId), fromPending }) && !autonomousRunning) return null;
   /* 一轮在跑 / 上一批 pending 正在应用：照旧等它收尾；否则只是在等重连 / 挂载 */
   const turnBusy = !!sessionClients.get(sessionId)?.busy || pendingSwitchRunner.isApplying(sessionId) || autonomousRunning;
@@ -6078,6 +6219,24 @@ function queueSwitchWhileBusy(
   */
   if (firstOfThisWait) {
     noteInSession(sessionId, tr('⏳ This turn is still running; will switch to {target} once it finishes.', { target: pendingTargetForPeople(sessionId) }),
+      undefined, PENDING_SWITCH_NOTE_GROUP);
+  }
+  return { ok: true, pending: true };
+}
+/**
+ * **压缩中的切换**（/compact 回了 end_turn，压缩还在这个进程里跑，`compactWait.ts`）：先记下，压完再切（`finishCompactWait` 里 kick）——
+ * 现在换执行器会把压缩打断；换模型失败回滚还会把没完成的压缩状态复制给新执行器（审查意见）。会话里说一句在等什么。
+ * 一轮在跑时不管（走原来「这一轮跑完再切」那条）。不在压缩中返回 null。
+ */
+function queueSwitchWhileCompacting(sessionId: string, kind: PendingKind, value: any, label: string): { ok: true; pending: true } | null {
+  const e = sessionClients.get(sessionId);
+  if (!e || e.busy || !compactHolds(e.compactWait)) return null;
+  const firstWait = !pendingSwitches.has(sessionId);
+  pendingSwitches.set(sessionId, { kind, value, label });
+  logger.info('pending-switch', `压缩中切换先记下 sessionId=${sessionId} ${kind} -> ${label}（压完再切）`);
+  emitPendingSwitches(sessionId);
+  if (firstWait) {
+    noteInSession(sessionId, tr('⏳ Compacting the context; will switch to {target} once it finishes.', { target: pendingTargetForPeople(sessionId) }),
       undefined, PENDING_SWITCH_NOTE_GROUP);
   }
   return { ok: true, pending: true };
@@ -9936,11 +10095,32 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     }
     const childSessionId = childSessionOf(data, entry);
     /*
+      压缩的花费归属（`compactWait.ts` 的 `settled`）：放行之后下一轮一出输出（正文 / 工具调用）就关上 —— kiro 一轮的计量在那一轮结尾才报，
+      所以下一轮出输出之前到的计量只能是压缩的；这一帧本身算新一轮的。
+    */
+    const compactRoute = childSessionId ? null : routeCompactFrame(entry.compactWait, {
+      inTurn: !!entry.busy || !!entry.autonomous,
+      update: data?.update,
+      pct: contextPercentOf(data?.update),
+      now: Date.now(),
+      costFold: data?.update?.kirolexCost ?? null,
+    });
+    if (compactRoute?.close) settleCompactUsage(sessionId, entry);
+    /*
       **上下文占用大幅回落 = 压缩过了**（包括 Claude Code 静默的自动压缩：没有 /compact、也没有「正在压缩」那句）——
       下一轮记忆 / 远程环境说明完整注入（`injectionCadence.noteContextUsage`）。子代理的帧不算（那是另一段上下文）。
     */
     if (!childSessionId && noteContextUsage(entry.injectCadence, contextPercentOf(data?.update))) {
-      logger.info('memory', `context usage dropped sharply (compacted) sessionId=${sessionId} pct=${Math.round(entry.injectCadence?.contextPct ?? 0)} -> next turn injects in full`);
+      /*
+        超时放行之后发出去的那一条已经完整注入过记忆：迟到的骤降不再要求再完整注入一次（「压缩前一次、压缩后再一次」）。
+        正常情况（压完才放行）下，/compact 和这次骤降只是把同一个「下一轮完整注入」标记置上，放行的那一条注入一次。
+      */
+      /* 只认超时后 10 分钟内的第一次骤降：再往后的是另一回压缩（例如引擎自己的自动压缩），照常完整注入 */
+      const late = entry.compactWait?.finished?.by === 'timeout' && !!entry.compactWait.fullSentAfterTimeout
+        && Date.now() - entry.compactWait.finished.at < 10 * 60_000;
+      if (entry.compactWait?.fullSentAfterTimeout) entry.compactWait = { ...entry.compactWait, fullSentAfterTimeout: false };
+      if (late && entry.injectCadence) entry.injectCadence.reset = false;
+      logger.info('memory', `context usage dropped sharply (compacted) sessionId=${sessionId} pct=${Math.round(entry.injectCadence?.contextPct ?? 0)} -> ${late ? 'already injected in full after the compact timeout' : 'next turn injects in full'}`);
     }
     /*
       本会话花费（审计 F3）：Claude Code 的 `usage_update.cost` 是**这个适配器进程**的累计值，进程一换就从 0 数起 ——
@@ -9965,7 +10145,19 @@ function wireSession(sessionId: string, entry: SessionEntry) {
       一轮结束时 `flushAssistant` 收尾挂到助手消息上落盘。只记一轮之内的帧（含后端自己起的那一轮）。
       要在下面 autonomousFrame 之前：带 cost 的那一帧会把自发轮收掉，先记上才不漏。
     */
-    if (entry.busy || entry.autonomous) {
+    if (compactRoute?.wait) {
+      /* kiro 自己报的压缩状态（`_kiro.dev/compaction/status`，完成和骤降一样放行）记一行，看得出它到底发了什么 */
+      const notice = compactionStatusOf(data?.update);
+      if (notice || data?.update?.method === '_kiro.dev/compaction/status') logger.info('context', `compaction/status sessionId=${sessionId} status=${notice ?? 'unrecognized'} ${JSON.stringify(data?.update).slice(0, 300)}`);
+      entry.compactWait = compactRoute.wait;
+      if (compactRoute.released) finishCompactWait(sessionId, entry);
+      /* 放行之后（下一轮出输出之前）又到了压缩的花费：更新压缩那条上的补记 */
+      else if (compactRoute.costGrew) writeCompactUsage(sessionId, entry);
+      /* 压缩那一笔花费到了：记上、关上归属 —— 之后的计量都是下一轮自己的 */
+      if (compactRoute.settleAfter) settleCompactUsage(sessionId, entry);
+    }
+    /* 记在压缩那一条上的帧（/compact 那一轮结束之后、归属关上之前）不再算进正在跑的那一轮 */
+    if ((entry.busy || entry.autonomous) && !compactRoute?.toCompact) {
       entry.turnUsageAcc = foldTurnFrame(entry.turnUsageAcc, data?.update, data?.update?.kirolexCost ?? null);
     }
     /* 后端自己起的那一轮：见到结束信号（带 cost 的 usage_update / Codex idle）就收尾落盘，否则重新计时（`autonomousTurn.ts`） */
@@ -10021,6 +10213,7 @@ function wireSession(sessionId: string, entry: SessionEntry) {
     if (sessionClients.get(sessionId) !== entry || retiringClients.has(client)) return;
     /* 跑着一轮时断的：这一轮没完成 —— 等它回复的那边不能当成「回复完了」（`replyWatcher` / `replyVerdict`） */
     if (entry.busy) turnOutcomes.set(sessionId, { state: 'interrupted', at: Date.now() });
+    endCompactWaitForExecutor(sessionId, entry, 'executor disconnected');
     sessionClients.delete(sessionId);
     const rec = store.readRecord(sessionId);
     if (rec) { rec.executorState = 'detached'; store.writeRecord(rec); }
@@ -10187,6 +10380,8 @@ function flushAssistant(sessionId: string, opts?: { autonomous?: boolean; entry?
   entry.fileChanges = [];
   entry.turnSubagents = undefined;
   entry.wedgeNote = undefined;
+  /* 这一次落盘的那条（/compact 那一轮的花费补记要用；调用方落盘前先清掉，什么都没落就还是空的） */
+  entry.lastFlushedAssistantId = finalId;
 }
 
 /* ───────────── 模型向用户提问（ACP elicitation，见 elicitation.ts） ─────────────
@@ -10332,6 +10527,7 @@ function autonomousDeps(sessionId: string, entry: SessionEntry): AutonomousDeps 
 function detachExecutor(sessionId: string, opts: { killTree?: boolean } = {}): Promise<void> {
   const entry = sessionClients.get(sessionId);
   if (!entry) return Promise.resolve();
+  endCompactWaitForExecutor(sessionId, entry, 'executor detached');
   sessionClients.delete(sessionId); // free the slot synchronously
   let disconnected: Promise<void> = Promise.resolve();
   try {
@@ -12413,6 +12609,12 @@ ${hint}` : ''}` };
       sessionNotice(sessionId, tr('⏳ This message will be sent once the switch finishes.'));
     }
     if (attempt === 0) await pendingSwitchRunner.settle(sessionId);
+    /*
+      **压缩中不发**（`compactWait.ts`）—— kiro 的 /compact 回 end_turn 时压缩还在后台跑，这时发的一条会被吞掉（实测卡死 15 分钟）。
+      输入框的消息在渲染端就进了排队；这里兜定时任务 / 唤醒 / 控制入口 / 斜杠命令：等压完（最多 3 分钟）再发。
+    */
+    /* 等过压缩：压缩中记下的切换（finishCompactWait 里已经 kick）先落定，这一条用切换后的执行器发 */
+    if (attempt === 0 && await awaitCompactRelease(sessionId)) await pendingSwitchRunner.settle(sessionId);
     /* 上一轮的下一句预测到这里就过时了（这一轮结束后 Claude Code 会再给新的） */
     if (attempt === 0) nativeSuggestions.clear(sessionId);
     /* 开过几轮（纠正那一轮不算）—— 排着的「写成文字」纠正据此判过时，见 `textToolNudgeStale` */
@@ -12816,8 +13018,11 @@ ${hint}` : ''}` };
       retry: attempt > 0,
     });
     entry.injectCadence = injectNext;
-    /* 这一轮就是 /compact（界面上的「压缩」按钮也是它）：压完之后的下一轮完整注入 */
+    /* 超时放行后的这一条完整注入了记忆：迟到的骤降不再要求再注入一次（见 wireSession 那边） */
+    if (entry.compactWait?.finished?.by === 'timeout' && injectPlan.memory === 'full') entry.compactWait = { ...entry.compactWait, fullSentAfterTimeout: true };
+    /* 这一轮就是 /compact（界面上的「压缩」按钮也是它）：压完之后的下一轮完整注入；进「压缩中」，压完之前不放下一条 */
     if (isCompactCommand(display?.displayText ?? promptTextOf(prompt))) markContextReset(entry.injectCadence);
+    if (isCompactCommand(display?.displayText ?? promptTextOf(prompt))) beginCompactWait(sessionId, entry);
     /*
       **远程会话：先告诉它自己在哪台机器上** ——「你是不是应该给他一些提示词告诉他本地和远程目录的区别」。
       不说的话它会拿对话里的 `/Users/...` 去搜（那个路径在远端不存在），把"搜不到"当成"没有这个东西"。
@@ -13203,6 +13408,25 @@ ${hint}` : ''}` };
               }
             }
             /*
+              **发 /compact 的那一轮结束了**（`compactWait.ts`）：Claude Code / Codex 同步压完 → 完成；kiro 回一句 "Compacting conversation..."
+              就 end_turn、压缩还在后台跑 → 继续算压缩中。没压完时这一轮攒的花费先挪到压缩那边，压完再一起补记到这条上。
+            */
+            const compactTurnEnd = entry.compactWait && !entry.compactWait.turnEnded ? entry.compactWait : null;
+            if (compactTurnEnd) {
+              const ended = noteCompactTurnEnd(compactTurnEnd, {
+                engine: engineOf(entry.profile),
+                ok: turnCompletedNormally({ stopReason: result?.stopReason, wedged: !!entry.wedgeNote }),
+                now: Date.now(),
+                replyTo: userMessageId,
+              });
+              entry.compactWait = ended.finished ? { ...ended, settled: true } : { ...ended, acc: entry.turnUsageAcc };
+              if (!ended.finished) entry.turnUsageAcc = undefined;
+              entry.lastFlushedAssistantId = undefined;   // 下面落盘后读它：什么都没落就是空的，不会拿到上一轮那条
+            } else if (entry.compactWait && !entry.compactWait.settled && entry.compactWait.turnEnded) {
+              /* 压缩之后的下一轮结束了（一直没出输出，例如被吞掉的那种）：压缩的花费归属到此关上 */
+              settleCompactUsage(sessionId, entry);
+            }
+            /*
               侧栏 review 的「✓ 确认」在等这一轮的完整回复（见 `askWaiters`）—— 在 flush 清空之前取，
               只取模型自己写的那部分（`wedgeNote` 是 KiroLex 加的说明，不是正文）。
               priming 那一轮不算：那是在补历史，不是对这条改写的回答。
@@ -13232,6 +13456,11 @@ ${hint}` : ''}` };
             /* 后端给了这一轮的结束响应（含你按停）：不是被断线打断的 */
             turnOutcomes.set(sessionId, { state: 'completed', at: Date.now() });
             if (textTool && textTool.action !== 'none') handleTextToolCall(sessionId, textTool, textToolBuf);
+            if (compactTurnEnd && entry.compactWait) {
+              if (entry.lastFlushedAssistantId) entry.compactWait = { ...entry.compactWait, messageId: entry.lastFlushedAssistantId };
+              if (entry.compactWait.finished) finishCompactWait(sessionId, entry);
+              else logger.info('context', `compacting sessionId=${sessionId} turn ended (${String(result?.stopReason ?? 'n/a')}) — still compacting, holding new prompts`);
+            }
             // The request was accepted and answered, so the snapshot it carried IS
             // in this backend now: the claim written before the send is confirmed.
             // Re-marked against the CURRENT entry rather than just clearing the
@@ -13438,6 +13667,13 @@ ${hint}` : ''}` };
       }
     } catch (err: any) {
       flushAssistant(sessionId); // persist whatever completed before the error
+      /* 压缩之后的下一轮出错了：压缩的花费归属到此关上 */
+      if (entry.compactWait && !entry.compactWait.settled && entry.compactWait.turnEnded) settleCompactUsage(sessionId, entry);
+      /* /compact 那一轮出错了：不再等它压完（`compactWait.ts`） */
+      if (entry.compactWait && !entry.compactWait.turnEnded) {
+        entry.compactWait = { ...noteCompactTurnEnd(entry.compactWait, { engine: engineOf(entry.profile), ok: false, now: Date.now() }), settled: true };
+        finishCompactWait(sessionId, entry);
+      }
       // Surface WHY: kiro-cli returns a bare JSON-RPC -32603 "Internal error"
       // for many backend faults (bad session state, stale lock, concurrent
       // prompt). Log the full error + any JSON-RPC `data` detail so it is
@@ -13838,6 +14074,11 @@ ${hint}` : ''}` };
   ipcMain.handle('acp:handoff-prompt', async (_event, sessionId: string, prompt: any[], model?: string, projectId?: string, display?: { messageId?: string; displayText?: string; attachments?: any[]; pastes?: any[] }) => {
     { const advRefused = refuseAdvancedOnly(sessionId, 'prompt'); if (advRefused) return { accepted: false, reason: 'refused', error: advRefused }; }
     if (deletedSessionIds.has(sessionId) || store.readRecord(sessionId)?.archived) return { accepted: false, reason: 'refused' };
+    /* 压缩中：不交给适配器排在后面（那就到了正在压缩的引擎手里）—— 渲染端改排 KiroLex 队列，压完自动发 */
+    if (compactHolds(sessionClients.get(sessionId)?.compactWait)) {
+      logger.info('context', `queued prompt while compacting sessionId=${sessionId} (handoff refused)`);
+      return { accepted: false, reason: 'compacting' };
+    }
     return await new Promise<{ accepted: boolean; reason?: string; error?: string }>((resolve) => {
       let answered = false;
       const answer = (r: { accepted: boolean; reason?: string; error?: string }) => { if (!answered) { answered = true; resolve(r); } };
@@ -13926,6 +14167,8 @@ ${hint}` : ''}` };
       也没有用户消息可并进去 —— 排进 KiroLex 队列（`unsupported` → 渲染端 queue），它收尾后发。
     */
     if (entry?.autonomous) return { steered: false, reason: 'unsupported' };
+    /* 压缩中（含 /compact 那一轮还在跑时）不插进去：unsupported → 渲染端排进 KiroLex 队列（compactWait.ts） */
+    if (compactHolds(entry?.compactWait)) { logger.info('context', `queued prompt while compacting sessionId=${sessionId}`); return { steered: false, reason: 'unsupported' }; }
     // Order matters (see steerGate.ts): a history rebuild is a LOCKED task, not a
     // conversational turn -- steering into it would inject the user's text into a
     // hidden priming turn, so the renderer parks it until the rebuild finishes.
@@ -16173,6 +16416,7 @@ ${hint}` : ''}` };
 
     /* 重连开始时盘上那份：写盘时只覆盖这次改了的字段（`profileAfterReconnect`） */
     const startedRec = store.readRecord(sessionId)?.profile;
+    endCompactWaitForExecutor(sessionId, oldEntry, 'model switch');
     sessionClients.delete(sessionId); // release the slot + ownership claim
     try { await retireExecutor(oldEntry.client); } catch {}
 

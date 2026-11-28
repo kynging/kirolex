@@ -206,6 +206,8 @@ export async function runPendingSwitches(entries: PendingSwitch[], hooks: ApplyH
 export interface RunnerDeps {
   /** 这条会话现在是不是有一轮在跑（在跑就不应用，等它结束） */
   isBusy(sessionId: string): boolean;
+  /** 不是一轮在跑、但现在也不能换执行器（例如压缩还在后台跑，`compactWait.ts`）：先不应用，放开时再 kick。可选。 */
+  isHeld?(sessionId: string): boolean;
   apply(sessionId: string, entries: PendingSwitch[]): Promise<unknown>;
 }
 
@@ -230,7 +232,7 @@ export class PendingSwitchRunner {
   kick(sessionId: string): Promise<void> | undefined {
     const running = this.inFlight.get(sessionId);
     if (running) return running;
-    if (!this.book.has(sessionId) || this.deps.isBusy(sessionId)) return undefined;
+    if (!this.book.has(sessionId) || this.deps.isBusy(sessionId) || this.deps.isHeld?.(sessionId)) return undefined;
     const entries = this.book.takeForApply(sessionId);
     const p = Promise.resolve()
       .then(() => this.deps.apply(sessionId, entries))

@@ -15,6 +15,12 @@ export function parseTranscriptLine(line: string, out: StoredMessage[]): void {
   if (!t) return;
   try {
     const message = JSON.parse(t) as StoredMessage;
+    /* 补记的本轮消耗（压缩那一条的花费在压缩真正完成时才到，见 `compactWait.compactUsagePatch`）：并进目标那条，不单独成一条 */
+    if (message.usageForMessageId) {
+      const target = out.find((candidate) => candidate.id === message.usageForMessageId);
+      if (target && message.turnUsage) target.turnUsage = message.turnUsage;
+      return;
+    }
     if (message.mergeIntoMessageId) {
       const target = out.find((candidate) => candidate.id === message.mergeIntoMessageId);
       /* 目标是 KiroLex 的提示（也是 role:'user'）就不并：追加指令单独留一条，文字不丢 */

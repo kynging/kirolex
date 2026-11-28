@@ -321,6 +321,7 @@ const SessionItem: React.FC<{
     : busyReason === 'priming' ? t('Busy: rebuilding history (press Stop to give up)')
     : busyReason === 'prime-pending' ? t('Busy: history missing, about to rebuild it; new messages wait')
     : busyReason === 'turn' ? t('Busy: turn in progress…')
+    : busyReason === 'compacting' ? t('Busy: compacting the context; new messages send when it finishes')
     : sessionStatus === 'streaming' ? t('Working…')
     : sessionStatus === 'connecting' ? t('Connecting…')
     : sessionStatus === 'unread' ? t('Unread reply')

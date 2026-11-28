@@ -32,6 +32,8 @@ export function sessionDotStatus(d: DotInputs): SessionStatus {
   // Backend occupancy reported by main: the dot must show it even when this
   // renderer has no local streaming/connecting state for that session.
   if (busy === 'turn') return 'streaming';
+  /* 压缩还在后台跑（/compact 那一轮已经结束）：照样是在干活 */
+  if (busy === 'compacting') return 'streaming';
   if (busy === 'reconfiguring' || busy === 'attaching' || busy === 'creating') return 'connecting';
   if (d.connecting) return 'connecting';
   const attached = d.attached;

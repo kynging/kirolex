@@ -621,4 +621,11 @@ export const ZH_CHAT: Record<string, string> = {
   'Failed': '失败',
   '🗜️ Context was at {pct}%, so KiroLex compacted it automatically (Settings → Chats → auto-compact).': '🗜️ 上下文到了 {pct}%，KiroLex 已自动压缩（设置 → 会话 → 自动压缩）。',
   '⚠️ Context was at {pct}%; KiroLex tried to compact it automatically, but that did not succeed.': '⚠️ 上下文到了 {pct}%，KiroLex 自动压缩没有成功。',
+  // ── 压缩中（主进程 compactWait.ts）──
+  'Compacting the context — messages send automatically when it finishes': '正在压缩上下文，完成后自动发送',
+  '⚠️ Context was at {pct}%; KiroLex sent /compact automatically but saw no sign it finished within 3 minutes, so queued messages went out anyway.': '⚠️ 上下文到了 {pct}%，KiroLex 自动发了 /compact，但 3 分钟内没看到压缩完成的信号，排着的消息已照常发出。',
+  'Compacting the context — Enter queues the message; it sends once compaction finishes': '正在压缩上下文 —— Enter 排队，压完后自动发送',
+  'Enter queue (sends after compaction) · Shift+Enter newline': 'Enter 排队（压完后发送）· Shift+Enter 换行',
+  'Queue to send after compaction (Enter)': '排队，压完后发送（Enter）',
+  '⏳ Compacting the context; will switch to {target} once it finishes (waited {n}s).': '⏳ 正在压缩上下文，压完后切到 {target}（已等 {n} 秒）',
 };

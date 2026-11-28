@@ -2469,7 +2469,9 @@ const QueueStack = memo<{
   waitingForEngine?: string;
   /** 还在连（应用连后端 / 这条会话挂执行器）：标题换成「已排队，连上后发送」（connectingSend.ts） */
   waitingForConnection?: boolean;
-}>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued, waitingForEngine, waitingForConnection }) => {
+  /** 压缩还在后台跑（主进程 compactWait.ts）：标题换成「正在压缩上下文，完成后自动发送」 */
+  compacting?: boolean;
+}>(({ queuedMessages, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, mergeQueued, waitingForEngine, waitingForConnection, compacting }) => {
   const t = useT();
   const [editingQueueId, setEditingQueueId] = useState<string | null>(null);
   const [editingQueueText, setEditingQueueText] = useState('');
@@ -2478,7 +2480,7 @@ const QueueStack = memo<{
     <div className="queue-row">
       <div className="queue-stack">
         <div className="queue-stack-header">
-          <span>{waitingForEngine ? t('Queued — sends automatically once {engine} is ready', { engine: waitingForEngine }) : waitingForConnection ? t('Queued — sends once connected') : t('Queued follow-ups')}</span>
+          <span>{waitingForEngine ? t('Queued — sends automatically once {engine} is ready', { engine: waitingForEngine }) : waitingForConnection ? t('Queued — sends once connected') : compacting ? t('Compacting the context — messages send automatically when it finishes') : t('Queued follow-ups')}</span>
           {/* The merge setting CHANGES the meaning of this queue (one turn vs N
               turns), so it has to be visible right here — not only in Settings. */}
           <span
@@ -2674,8 +2676,10 @@ function originForPeople(origin: TurnOrigin, t: (key: string) => string): string
   }
 }
 
-function PendingSwitchCard({ since, target, queued, onStopNow, onCancel }: {
+function PendingSwitchCard({ since, target, queued, onStopNow, onCancel, compacting }: {
   since: number; target: string; queued: number; onStopNow?: () => void; onCancel?: () => void;
+  /** 在等的是压缩（主进程 compactWait.ts），不是一轮：这么说，也不给「停止这一轮」（没有一轮可停） */
+  compacting?: boolean;
 }) {
   const t = useT();
   const [now, setNow] = useState(() => Date.now());
@@ -2690,13 +2694,15 @@ function PendingSwitchCard({ since, target, queued, onStopNow, onCancel }: {
         <span className="kirolex-message-label">KiroLex</span>
         <span className="kirolex-message-body">
           <span className="pending-switch-text">
-            {t('⏳ This turn is still running; will switch to {target} once it finishes (waited {n}s).', { target, n: waited })}
+            {compacting
+              ? t('⏳ Compacting the context; will switch to {target} once it finishes (waited {n}s).', { target, n: waited })
+              : t('⏳ This turn is still running; will switch to {target} once it finishes (waited {n}s).', { target, n: waited })}
           </span>
           {queued > 0 && (
             <span className="pending-switch-queued">{t('{n} queued message(s) will be sent once the switch finishes.', { n: queued })}</span>
           )}
           <span className="pending-switch-actions">
-            {onStopNow && <button type="button" className="pending-switch-stop-now" onClick={onStopNow}>{t('Stop this turn and switch now')}</button>}
+            {onStopNow && !compacting && <button type="button" className="pending-switch-stop-now" onClick={onStopNow}>{t('Stop this turn and switch now')}</button>}
             {onCancel && <button type="button" className="pending-switch-cancel-all" onClick={onCancel}>{t('Cancel switch')}</button>}
           </span>
         </span>
@@ -2730,6 +2736,8 @@ const ChatInputBox = memo<{
   onSteer: (text: string, pastes?: PastedBlock[]) => void;
   /** 能不能追加到正在跑的一轮（`engineCanSteer`，按执行器的能力声明）。不能：忙时 Enter 是排队，文案也说排队 */
   canSteer: boolean;
+  /** 压缩中（主进程 compactWait.ts，从发出 /compact 起）：Enter 是进 KiroLex 排队、压完后发 —— 提示照这个写，不说「追加到这一轮」 */
+  compacting?: boolean;
   onCancel: () => void;
   onStopLoop: () => void;
   onQueueCommand: (text: string, pastes?: PastedBlock[]) => void;
@@ -2756,7 +2764,7 @@ const ChatInputBox = memo<{
    * 只有 `session/request_permission`），所以这些只能从回复文字里认。
    */
   choiceChips: ChoiceChip[];
-}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, enginePlan, permissionPending, onSend, onSteer, canSteer, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
+}>(({ sessionId, isStreaming, isLooping, status, sessionConnected, permissionMode, onPermissionModeChange, engineMode, enginePlan, permissionPending, onSend, onSteer, canSteer, compacting, onCancel, onStopLoop, onQueueCommand, queuedMessages, restoredDraft, restoredInputDraft, onConsumeRestoredDraft, onConsumeRestoredInputDraft, onCancelQueuedMessage, onEditQueuedMessage, onMoveQueuedMessage, commands, suggestions, onDropFiles, onRemoveFile, attachedFiles, choiceChips, onSlashPicker }) => {
   const t = useT();
   /* 权限模式的风险档和悬停提示（permissionTone.ts）：只管颜色 / 图标 / 提示，不碰模式本身 */
   const currentModeTone = engineMode ? modeTone(engineMode.engine, engineMode.current, engineMode.options.find((o) => o.value === engineMode.current)?.name) : 'normal';
@@ -3200,6 +3208,8 @@ const ChatInputBox = memo<{
             ? t('Looping this message — click Stop to end it')
             : status !== 'connected'
             ? t('Connecting... (type /stop to force reconnect)')
+            : compacting
+            ? t('Compacting the context — Enter queues the message; it sends once compaction finishes')
             : isStreaming && !canSteer
             ? t('Agent is working — Enter queues it to send after this turn')
             : isStreaming
@@ -3322,6 +3332,8 @@ const ChatInputBox = memo<{
             <span className="composer-shortcut-full">
               {isLooping
                 ? t('Loop running · Stop to end it')
+                : compacting
+                ? t('Enter queue (sends after compaction) · Shift+Enter newline')
                 : isStreaming && !canSteer
                 ? t('Enter queue (sends after this turn) · Shift+Enter newline')
                 : isStreaming
@@ -3349,7 +3361,7 @@ const ChatInputBox = memo<{
         ) : (
           <button
             className={`composer-send${
-              queueModifierHeld || (isStreaming && !canSteer)
+              queueModifierHeld || compacting || (isStreaming && !canSteer)
                 ? ' queue'
                 : isStreaming
                 ? ' steer'
@@ -3362,13 +3374,15 @@ const ChatInputBox = memo<{
             disabled={false}
             title={queueModifierHeld
               ? t('Add a new queued message ({key}+Enter)', { key: MOD_KEY })
+              : compacting
+              ? t('Queue to send after compaction (Enter)')
               : isStreaming && !canSteer
               ? t('Queue to send after this turn (Enter)')
               : isStreaming
               ? t('Steer the running turn (Enter)')
               : t('Send (Enter)')}
           >
-            {queueModifierHeld || (isStreaming && !canSteer) ? (
+            {queueModifierHeld || compacting || (isStreaming && !canSteer) ? (
               <IconQueue size={17} />
             ) : isStreaming ? (
               <IconSteer size={17} />
@@ -4101,6 +4115,8 @@ interface ChatAreaProps {
   sessionConnected: boolean;
   /** 这条会话还在连（connectingSend.ts 的 waitsForConnection）：排队卡片标题写「已排队，连上后发送」 */
   waitingForConnection?: boolean;
+  /** 压缩还在后台跑（/compact 那一轮结束了、主进程还报 compacting）：输入框上方说「正在压缩上下文，完成后自动发送」，发的消息进排队 */
+  compacting?: boolean;
   /** 所有「执行器挂着、不在连接中」的会话（不只这一格这条）—— 后台恢复的会话也要清掉它的切换失败 ✗ */
   readySessionIds?: readonly string[];
   connectionError: string | null;
@@ -4305,6 +4321,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   status,
   sessionConnected,
   waitingForConnection = false,
+  compacting = false,
   readySessionIds,
   connectionError,
   onDismissError,
@@ -5515,6 +5532,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
     queued: queuedMessages.length,
     onStopNow: onStopAndSwitch ? () => onStopAndSwitch(pendingTarget) : undefined,
     onCancel: () => onCancelPendingSwitch?.(),
+    compacting,
   } : null;
   /** 切会话回到原位置用的锚点 id。回复组取**第一段**：流式输出只往后追加段，第一段的 id 不会变。 */
   const groupAnchorId = (g: RenderGroup): string =>
@@ -6403,6 +6421,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           mergeQueued={mergeQueuedMessages}
           waitingForEngine={startup && startup.stage !== 'ready' ? engineDisplayName(startup.engine) : undefined}
           waitingForConnection={waitingForConnection}
+          compacting={compacting}
         />
       )}
 
@@ -6528,13 +6547,19 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                   <button className="session-notice-close" onClick={dismissNotice} title={t('Close notice')}>✕</button>
                 </div>
               )}
+              {/* 压缩还在后台跑：这时发的消息进 KiroLex 排队，压完自动发（主进程 compactWait.ts） */}
+              {compacting && (
+                <div className="session-notice" role="status">
+                  <span className="session-notice-text">🗜️ {t('Compacting the context — messages send automatically when it finishes')}</span>
+                </div>
+              )}
               {/* 上下文到 60% 起：提醒一次，给压缩 / 换后端会话两个动作（关掉后到下一个 10% 档再提醒） */}
               {onCompactContext && onNewBackendContext && (
                 <ContextReminder
                   sessionId={currentSessionId || null}
                   pct={usage?.contextPercent}
                   engine={engine}
-                  isStreaming={isStreaming}
+                  isStreaming={isStreaming || compacting}
                   turnInterrupted={!!turnInterrupted}
                   onCompact={onCompactContext}
                   onNewBackend={onNewBackendContext}
@@ -6575,6 +6600,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
                 onSend={onSend}
                 onSteer={onSteerMessage}
                 canSteer={engineCanSteer(engine, engineModels?.busyEnter)}
+                compacting={compacting}
                 onCancel={onCancel}
                 onStopLoop={onStopLoop}
                 onQueueCommand={onQueueMessage}

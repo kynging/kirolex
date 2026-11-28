@@ -8,6 +8,7 @@
  *     → 等完再看一眼（`prepOnExecutor`），变了就告诉调用方「执行器动过」，由它等切换落定、按**当前**执行器从头重走这一条。
  * 纯模块，不 import electron；index.ts 注入「当前执行器是谁」「是不是正在切换」。
  */
+import { compactHolds, type CompactWait } from './compactWait.ts';
 
 /** 正在为哪几条会话准备发送（同一条可以有几次并发的准备，按次数算） */
 export class PrepHolds {
@@ -25,8 +26,12 @@ export class PrepHolds {
   has(sessionId: string): boolean { return this.n.has(sessionId); }
 }
 
-/** 空闲回收能不能收这一条：正在跑的、后端自己起的一轮、**正在准备发送的**都不收 */
-export function canEvict(id: string, e: { busy?: boolean; autonomous?: unknown }, excludeId: string | undefined, holds: PrepHolds): boolean {
+/**
+ * 空闲回收能不能收这一条：正在跑的、后端自己起的一轮、**正在准备发送的**、**还在压缩的**都不收。
+ * 压缩中：kiro 的 /compact 回了 end_turn（busy 清掉了），压缩本身还在这个进程里跑 —— 收掉就打断压缩、丢掉完成信号和花费帧（`compactWait.ts`）。
+ */
+export function canEvict(id: string, e: { busy?: boolean; autonomous?: unknown; compactWait?: CompactWait }, excludeId: string | undefined, holds: PrepHolds): boolean {
+  if (compactHolds(e.compactWait)) return false;
   return id !== excludeId && !e.busy && !e.autonomous && !holds.has(id);
 }
 

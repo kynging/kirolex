@@ -14,7 +14,7 @@ test('提醒组件接在 ChatArea 的输入框上方，按这一格的会话 / �
   assert.match(block, /sessionId=\{currentSessionId \|\| null\}/);
   assert.match(block, /pct=\{usage\?\.contextPercent\}/);
   assert.match(block, /engine=\{engine\}/);
-  assert.match(block, /isStreaming=\{isStreaming\}/);
+  assert.ok(block.includes('isStreaming={isStreaming || compacting}'), '跑着一轮或压缩还在后台跑：按钮都置灰');
   assert.ok(at < C.indexOf('<ChatInputBox', at), '在输入框前面（上方）');
 });
 
@@ -32,7 +32,7 @@ test('App 把两颗按钮按格子的 sid 接上：压缩走 compactCommandFor�
 
 test('自动压缩：走 stepAutoCompact、按目标会话发（不抢焦点）、做完留 KiroLex 提示', () => {
   const A = src('renderer', 'App.tsx');
-  const e = A.slice(A.indexOf('const autoCompactTracksRef'), A.indexOf('const autoCompactTracksRef') + 6000);
+  const e = A.slice(A.indexOf('const autoCompactTracksRef'), A.indexOf('// Drop queues whose sessions were deleted or archived.'));
   assert.match(e, /stepAutoCompact\(/);
   assert.match(e, /sendQueuedMessage\(sid, command, \[\], \{ maintenance: true \}\)/);
   assert.match(e, /sessionNote\?\.\(sid, text/);
@@ -60,7 +60,7 @@ test('日志通道：acp:context-log → [context] 行', () => {
 
 test('自动压缩不碰等待重发的中断会话：判中断用 interruptedSessionIds + 轮次结果；发送用 maintenance，先于覆盖 / 截记录就返回', () => {
   const A = src('renderer', 'App.tsx');
-  const e = A.slice(A.indexOf('const autoCompactTracksRef'), A.indexOf('const autoCompactTracksRef') + 7000);
+  const e = A.slice(A.indexOf('const autoCompactTracksRef'), A.indexOf('// Drop queues whose sessions were deleted or archived.'));
   assert.match(e, /const interrupted = interruptedSessionIds\.includes\(sid\) \|\| turnOutcomeOf\(sid\)\.kind !== 'ok';/);
   assert.match(e, /stepAutoCompact\([^;]*interrupted \}\)/);
   assert.match(e, /sendQueuedMessage\(sid, command, \[\], \{ maintenance: true \}\) === 'skipped'/);

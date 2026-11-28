@@ -243,6 +243,7 @@ export const ZH_INDEX_B: Record<string, string> = {
   "Looking for kiro-cli on {host}…": "在 {host} 上找 kiro-cli…",
   /* 忙时选的切换：等待时、执行时、结果都说清楚（负责人反馈 2026-10-23） */
   '⏳ This turn is still running; will switch to {target} once it finishes.': '⏳ 这一轮还在跑，跑完后切到 {target}',
+  '⏳ Compacting the context; will switch to {target} once it finishes.': '⏳ 正在压缩上下文，压完后切到 {target}',
   'Restarting the executor for {target}…': '正在为 {target} 重启执行器…',
   '{engine} adapter': '{engine} 适配器',
   'Starting {engine} on this computer…': '正在启动本机 {engine}…',

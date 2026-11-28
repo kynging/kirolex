@@ -42,6 +42,7 @@ import { useAcp, isBackendOccupied, APP_ERROR_KEY } from './hooks/useAcp';
 import { idleNoticeBody, stepIdle, type IdleTrack } from './idleNotify';
 import { TOOL_OUTPUT_DEFAULT_KB, normalizeToolOutputKb } from '../main/toolOutputLimits.ts';
 import { MEMORY_FULL_INTERVAL_DEFAULT, normalizeMemoryFullInterval } from '../main/injectionCadence.ts';
+import { autoCompactNoteKind, COMPACT_WAIT_MAX_MS, type CompactFinishedBy } from '../main/compactWait.ts';
 import { AUTO_COMPACT_DEFAULT_PCT, compactCommandFor, normalizeAutoCompactPct, stepAutoCompact, type AutoCompactTrack } from '../main/contextReminder.ts';
 import { recoverPendingHandoffs, requeueFailedHandoff } from './handoffRequeue';
 import { busyEnterKind, busyEnterLogMode, busyEnterRoute, cacheableBusyEnter, composerRunning, enterRoute, resolveBusyEnter, steerFailureRoute, steerPayload, withAfterRebuild } from './steerRoute';
@@ -331,7 +332,7 @@ declare global {
       /** 忙时 Enter 走了哪条路，进主进程日志（`acp:busy-enter-log`） */
       logBusyEnter?: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => void;
       /** 上下文占用提醒 / 压缩进主进程日志（`acp:context-log`） */
-      logContext?: (d: { kind: 'remind' | 'compact'; sessionId: string; pct: number; via?: string }) => void;
+      logContext?: (d: { kind: 'remind' | 'compact' | 'queued'; sessionId: string; pct?: number; via?: string }) => void;
       /** 挂好 session:engine-models 监听后握手：主进程把连着的会话的能力各推一次（`acp:engine-models-ready`） */
       engineModelsReady?: () => void;
       /** Persist a CONSUMED steer into the durable transcript (its only writer:
@@ -495,6 +496,10 @@ declare global {
       onNotice?: (callback: (n: { sessionId: string; level: string; kind: string; label: string; text: string }) => void) => () => void;
       onAssistantFinal: (callback: (data: { sessionId: string; messageId: string; text: string; toolTailFrom?: number; replyTo?: string; replyComplete?: true; segmentBreaks?: number[] }) => void) => () => void;
       onTurnUsage?: (callback: (data: { sessionId: string; messageId: string; turnUsage: TurnUsage; turnStart?: string }) => void) => () => void;
+      /** 压缩中开始 / 结束（主进程 compactWait.ts）：从发出 /compact 起就算 */
+      onCompacting?: (callback: (data: { sessionId: string; compacting: boolean }) => void) => () => void;
+      /** 压缩中结束了（主进程 compactWait.ts）—— 自动压缩据此决定会话里那句怎么说 */
+      onCompactFinished?: (callback: (data: { sessionId: string; by: CompactFinishedBy; pctBefore: number | null; pctAfter: number | null }) => void) => () => void;
       onSessionBusy: (callback: (data: { sessionId: string; reason: string | null; detail?: string; detailVariants?: { zh: string; en: string } }) => void) => () => void;
       /** kiro 原生子代理名单（整份替换）—— 左栏那面 tag 靠它，直到全部 terminated */
       onSubagents?: (callback: (data: { sessionId: string; subagents: SubagentRow[] }) => void) => () => void;
@@ -3403,11 +3408,13 @@ const App: React.FC = () => {
     // leaves on its own the moment the switch completes.
     /* 新建的会话引擎还没就绪（或启动失败、还没重试）：同样进排队，界面上显示「排队中，引擎就绪后自动发出」 */
     if (sid && !text.trim().startsWith('/') && ((isBackendOccupied(busyBySession[sid])
-        && busyBySession[sid] !== 'turn') || startupBlocksSend(createStages[sid]))) {
+        && busyBySession[sid] !== 'turn') || compactingRef.current.has(sid) || startupBlocksSend(createStages[sid]))) {
       // Via ref: handleQueueMessage is declared BELOW this callback, and a
       // later-declared const in a dependency array is evaluated during render and
       // would hit TDZ, crashing the whole tree.
       queueMessageRef.current?.(text, pastes, sid);
+      /* 压缩还在后台跑（主进程 compactWait.ts）：进了排队，压完自动发 —— 记一行 `[context] queued prompt while compacting` */
+      if (busyBySession[sid] === 'compacting' || compactingRef.current.has(sid)) window.kiroApi.logContext?.({ kind: 'queued', sessionId: sid });
       return;
     }
     /*
@@ -3588,6 +3595,17 @@ const App: React.FC = () => {
   // Mirror so a pane's queue action can read ITS queue without depending on the
   // focused session's snapshot.
   const queuesBySessionRef = useRef<Record<string, QueuedMessage[]>>({});
+  /*
+    **压缩中的会话**（主进程 `acp:compacting`，从发出 /compact 起到压完 / 超时）—— /compact 自己那一轮还在跑时主进程报的仍是 turn，
+    所以单独推一份：这期间 Enter / 插话 / 控制入口发来的都进 KiroLex 队列，不交给正在压缩的引擎。ref 给发送路径同步读。
+  */
+  const [compactingIds, setCompactingIds] = useState<string[]>([]);
+  const compactingRef = useRef<Set<string>>(new Set());
+  useEffect(() => window.kiroApi.onCompacting?.(({ sessionId, compacting }) => {
+    if (!sessionId) return;
+    if (compacting) compactingRef.current.add(sessionId); else compactingRef.current.delete(sessionId);
+    setCompactingIds(Array.from(compactingRef.current));
+  }), []);
   queuesBySessionRef.current = queuesBySession;
   /* 队列一变就落盘。空队列删掉键，免得 ui-state 里留一堆 `sid: []` */
   useEffect(() => {
@@ -3958,6 +3976,13 @@ const App: React.FC = () => {
       }
       queueAsNext();
     };
+    /* 压缩中（从发出 /compact 起，主进程 compactWait.ts）：不插进那一轮、不交给适配器 —— 进 KiroLex 队列，压完自动发 */
+    if (compactingRef.current.has(sessionId) || busyBySessionRef.current[sessionId] === 'compacting') {
+      busyReason = 'compacting';
+      window.kiroApi.logContext?.({ kind: 'queued', sessionId });
+      queueAsNext();
+      return;
+    }
     const steerEngine = sessions.find((s) => s.id === sessionId)?.engine;
     const enterKind = busyEnterKind(steerEngine, await busyEnterFor(sessionId, steerEngine));
     const canSteer = enterKind !== 'queue';
@@ -4351,6 +4376,26 @@ const App: React.FC = () => {
     换后端会话 = `acp:new-backend-session`（同 SafeguardCard 那颗，上下文跟着下一条带过去）。都按这一格自己的会话。
   */
   const autoCompactTracksRef = useRef<Map<string, AutoCompactTrack>>(new Map());
+  /*
+    **等主进程说压完了**（`acp:compact-finished`）：kiro 的 /compact 回 end_turn 时压缩还在后台跑，那一刻说「已压缩」是假的。
+    发 /compact **之前**先登记（同步引擎在这一轮结束前就报完了），兜底等到 3 分钟超时之后再多 30 秒。
+  */
+  const compactFinishWaitersRef = useRef<Map<string, Array<(by: CompactFinishedBy | null) => void>>>(new Map());
+  useEffect(() => window.kiroApi.onCompactFinished?.(({ sessionId, by }) => {
+    const list = compactFinishWaitersRef.current.get(sessionId);
+    compactFinishWaitersRef.current.delete(sessionId);
+    for (const go of list || []) go(by);
+  }), []);
+  const waitCompactFinished = useCallback((sid: string): Promise<CompactFinishedBy | null> => new Promise((resolve) => {
+    let done = false;
+    const go = (by: CompactFinishedBy | null) => { if (!done) { done = true; clearTimeout(timer); resolve(by); } };
+    const timer = setTimeout(() => {
+      const list = compactFinishWaitersRef.current.get(sid)?.filter((f) => f !== go);
+      if (list?.length) compactFinishWaitersRef.current.set(sid, list); else compactFinishWaitersRef.current.delete(sid);
+      go(null);
+    }, COMPACT_WAIT_MAX_MS + 30_000);
+    compactFinishWaitersRef.current.set(sid, [...(compactFinishWaitersRef.current.get(sid) || []), go]);
+  }), []);
   /** 手动压了一次：读数降到阈值以下之前，自动压缩不跟着再压一次（压缩那一轮结束也算「一轮结束」）。 */
   const disarmAutoCompact = useCallback((sid: string) => {
     const cur = autoCompactTracksRef.current.get(sid);
@@ -4426,6 +4471,8 @@ const App: React.FC = () => {
       queueSendingRef.current.add(sid);
       void (async () => {
         let ok = false;
+        /* 先登记再发：同步引擎在这一轮结束前就报完了 */
+        const finished = waitCompactFinished(sid);
         try {
           /* maintenance：会话在等你重发被打断的那一轮时不发（不吃覆盖标记、不截记录） */
           if (await sendQueuedMessage(sid, command, [], { maintenance: true }) === 'skipped') {
@@ -4435,13 +4482,17 @@ const App: React.FC = () => {
           ok = turnOutcomeOf(sid).kind === 'ok';
         } catch { ok = false; }
         finally { queueSendingRef.current.delete(sid); }
-        const text = ok
+        /* 那一轮成了也还要等主进程确认压完（kiro 的压缩在 end_turn 之后才真正做完）；出错的不等 */
+        const kind = autoCompactNoteKind(ok ? await finished : null, ok);
+        const text = kind === 'done'
           ? tRef.current('🗜️ Context was at {pct}%, so KiroLex compacted it automatically (Settings → Chats → auto-compact).', { pct: Math.round(pct) })
+          : kind === 'unconfirmed'
+          ? tRef.current('⚠️ Context was at {pct}%; KiroLex sent /compact automatically but saw no sign it finished within 3 minutes, so queued messages went out anyway.', { pct: Math.round(pct) })
           : tRef.current('⚠️ Context was at {pct}%; KiroLex tried to compact it automatically, but that did not succeed.', { pct: Math.round(pct) });
         try { await window.kiroApi.sessionNote?.(sid, text, noteVariants(text)); } catch { /* 提示写不进去不挡别的 */ }
       })();
     }
-  }, [sessions, streamingIds, busyBySession, usageBySession, queuesBySession, attachedSessionIds, connectingSessionIds, recoveringIds, loopingIds, permissionRequests, currentSessionId, switchingModel, switchingAgent, quitPending, interruptedSessionIds, settings.autoCompactContext, settings.autoCompactPct, sendQueuedMessage, usageOf, turnOutcomeOf]);
+  }, [sessions, streamingIds, busyBySession, usageBySession, queuesBySession, attachedSessionIds, connectingSessionIds, recoveringIds, loopingIds, permissionRequests, currentSessionId, switchingModel, switchingAgent, quitPending, interruptedSessionIds, settings.autoCompactContext, settings.autoCompactPct, sendQueuedMessage, usageOf, turnOutcomeOf, waitCompactFinished]);
 
   // Drop queues whose sessions were deleted or archived.
   useEffect(() => {
@@ -4665,6 +4716,7 @@ const App: React.FC = () => {
         status={status}
         sessionConnected={!!sid && attachedSessionIds.includes(sid) && !connectingSessionIds.includes(sid)}
         waitingForConnection={!!sid && waitsForConnection(connectingFactsFor(sid))}
+        compacting={!!sid && (busyBySession[sid] === 'compacting' || compactingIds.includes(sid))}
         readySessionIds={readySessionIds}
         // Per CHAT, not per focus. Previously this was one app-wide string shown only
         // in the focused pane, so a failure in chat A appeared over chat B once focus

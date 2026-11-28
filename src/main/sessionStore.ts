@@ -71,6 +71,8 @@ export interface StoredMessage {
   ts: number;
   /** Append-only event: materialize this text into an earlier user message. */
   mergeIntoMessageId?: string;
+  /** Append-only event：把 `turnUsage` 补记到前面那条助手消息上（压缩的花费，见 `compactWait.compactUsagePatch`）。读时并进去，本身不显示。 */
+  usageForMessageId?: string;
   /** 这条用户消息发出去的是哪几条「交给了适配器却没轮到、放回 KiroLex 队列」的消息（原来的 id，合并发送时可以有几条）——
    *  重启恢复（pendingHandoffs）据此认出它们已经发过了，不再放回第二遍。 */
   fromHandoff?: string[];

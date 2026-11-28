@@ -191,9 +191,19 @@ export function attachTurnUsage<T extends { id: string; role: string; turnUsage?
   let idx = list.findIndex((m) => m.id === messageId);
   if (idx < 0) {
     const startAt = turnStart ? list.findIndex((m) => m.id === turnStart) : -1;
-    if (!turnStart || startAt >= 0) {
+    if (startAt >= 0) {
+      /*
+        从这一轮的开头往后找、碰到你的下一条消息就停：这一轮之内最后一条助手消息。刚结束的那一轮和原来从末尾往回找一样；
+        **晚到的那一份**（压缩的花费在压缩真正完成时才到，那时你的下一条已经在界面上了，`main/compactWait.ts`）也挂得对 ——
+        从末尾往回找会先撞上那条新消息、找不到，补一条空回复挂到最后。
+      */
+      for (let i = startAt + 1; i < list.length; i++) {
+        if (list[i].role === 'user' && !list[i].kirolex) break;
+        if (list[i].role === 'assistant') idx = i;
+      }
+    } else if (!turnStart) {
       for (let i = list.length - 1; i > startAt; i--) {
-        if (list[i].role === 'user' && (startAt < 0 || !list[i].kirolex)) break;
+        if (list[i].role === 'user') break;
         if (list[i].role === 'assistant') { idx = i; break; }
       }
     }

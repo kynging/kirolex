@@ -262,4 +262,5 @@ export const ZH_SHELL: Record<string, string> = {
   'Local tool output limit': '本机工具输出上限',
   'Output of local_bash and the other local tools that goes back to the model is cut to this size: the first third and the last two thirds are kept, the full output is saved under the chat’s files folder (kept 7 days) and the model is told where to read it. What you see in the chat is not cut. Range {min}–{max} KB, default {def} KB.': 'local_bash 等本机工具交给模型的输出超过这个大小就截断：留开头 1/3 和结尾 2/3，完整输出存在会话的 files 文件夹里（保留 7 天），并告诉模型去哪儿读。聊天里你看到的输出不截。范围 {min}–{max} KB，默认 {def} KB。',
   'Every turn costs more as the context fills up. When on, KiroLex sends the engine’s compact command once a turn ends and the chat is idle, and leaves a KiroLex note in the chat. Range {min}–{max}%, default {def}%. Codex has no compact command, so it is skipped. Off by default.': '上下文越满，每轮越贵。开着时，一轮结束、会话空闲后 KiroLex 发引擎自己的压缩命令，并在会话里留一条 KiroLex 提示。范围 {min}–{max}%，默认 {def}%。Codex 没有压缩命令，跳过。默认关。',
+  'Busy: compacting the context; new messages send when it finishes': '忙：正在压缩上下文，新消息压完后发送',
 };

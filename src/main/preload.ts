@@ -187,7 +187,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   /* 忙时 Enter 走了哪条路，进主进程日志（`[prompt] busy-enter …`） */
   logBusyEnter: (d: { sessionId: string; engine?: string; mode?: string; route: string; reason?: string }) => ipcRenderer.send('acp:busy-enter-log', d),
   /* 上下文占用提醒 / 压缩进主进程日志（`[context] remind|compact sessionId=… pct=…`） */
-  logContext: (d: { kind: 'remind' | 'compact'; sessionId: string; pct: number; via?: string }) => ipcRenderer.send('acp:context-log', d),
+  logContext: (d: { kind: 'remind' | 'compact' | 'queued'; sessionId: string; pct?: number; via?: string }) => ipcRenderer.send('acp:context-log', d),
   /* 渲染端挂好 session:engine-models 监听了（窗口刷新后）：请主进程把连着的会话的能力各推一次 */
   engineModelsReady: () => ipcRenderer.send('acp:engine-models-ready'),
   setEngineModel: (sessionId: string, model: string) => ipcRenderer.invoke('acp:set-engine-model', sessionId, model),
@@ -986,6 +986,18 @@ contextBridge.exposeInMainWorld('kiroApi', {
    *  adopt a turn that never stopped, instead of resending the question and billing it twice. */
   peekTurn: (sessionId: string): Promise<{ live: boolean; messageId: string | null; text: string; startedAt: number | null }> =>
     ipcRenderer.invoke('acp:peek-turn', sessionId),
+  /** 压缩中开始 / 结束（`main/compactWait.ts`）：从发出 /compact 起就算，它自己那一轮还在跑时 busy 仍报 turn */
+  onCompacting: (callback: (data: { sessionId: string; compacting: boolean }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:compacting', handler);
+    return () => ipcRenderer.removeListener('acp:compacting', handler);
+  },
+  /** 压缩中结束了（`main/compactWait.ts`）：by = drop（占用骤降，压完了）/ sync（同步引擎一轮结束）/ timeout（3 分钟没等到）/ error */
+  onCompactFinished: (callback: (data: { sessionId: string; by: 'drop' | 'sync' | 'timeout' | 'error'; pctBefore: number | null; pctAfter: number | null }) => void) => {
+    const handler = (_event: any, data: any) => callback(data);
+    ipcRenderer.on('acp:compact-finished', handler);
+    return () => ipcRenderer.removeListener('acp:compact-finished', handler);
+  },
   /** 一轮结束时这一轮的真实消耗（`main/turnUsage.ts`，和落盘的同一份）—— 没有正文的那一轮也发 */
   onTurnUsage: (callback: (data: { sessionId: string; messageId: string; turnUsage: TurnUsage; turnStart?: string }) => void) => {
     const handler = (_event: any, data: any) => callback(data);

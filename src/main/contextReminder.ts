@@ -82,6 +82,8 @@ export function decideAutoCompact(f: AutoCompactFacts): AutoCompactDecision {
 
 /** 主进程日志里那一行（scope 是 `context`，整行 `[context] remind|compact sessionId=… pct=…`）。 */
 export function contextLogLine(d: { kind?: string; sessionId?: string; pct?: number; via?: string }): string {
+  /* 压缩中按 Enter 的那一条进了 KiroLex 排队（渲染端报）：`[context] queued prompt while compacting sessionId=…` */
+  if (d.kind === 'queued') return `queued prompt while compacting sessionId=${String(d.sessionId ?? '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120) || '?'}`;
   const kind = d.kind === 'compact' ? 'compact' : 'remind';
   const sid = String(d.sessionId ?? '').replace(/[^A-Za-z0-9_-]/g, '_').slice(0, 120) || '?';
   const pct = typeof d.pct === 'number' && Number.isFinite(d.pct) ? String(Math.round(d.pct)) : '?';
