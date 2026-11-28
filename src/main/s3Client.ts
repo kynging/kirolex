@@ -415,6 +415,20 @@ export async function putObjectIf(
   return 'ok';
 }
 
+/** 同 `putObjectIf`，成功时带回新对象的 ETag（定时任务的租约续约要 If-Match 它，见 scheduleLease.ts）。 */
+export async function putObjectIfEtag(
+  creds: S3Creds, key: string, body: Buffer, contentType: string,
+  cond: { ifMatch: string } | { ifNoneMatch: '*' },
+): Promise<{ ok: true; etag: string } | { ok: false }> {
+  const h: Record<string, string> = { 'content-type': contentType };
+  if ('ifMatch' in cond) h['if-match'] = cond.ifMatch; else h['if-none-match'] = '*';
+  const r = await request(creds, 'PUT', `/${key}`, {}, body, h);
+  if (r.status === 412 || r.status === 409) return { ok: false };
+  const ok = check(r, tr('Upload {key}', { key }));
+  const etag = ok.headers.etag;
+  return { ok: true, etag: String(Array.isArray(etag) ? etag[0] : etag || '') };
+}
+
 export interface S3Entry { key: string; size: number; lastModified: string; /** 对象的 ETag（带引号，和 GET 回的一样）。 */ etag?: string }
 
 /** 列一个前缀下的所有对象（自动翻页 —— 一页 1000 个，超了不翻就是静默少数据）。 */

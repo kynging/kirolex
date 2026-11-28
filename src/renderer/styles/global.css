@@ -2694,20 +2694,19 @@ button, input, select, textarea {
   text-overflow: ellipsis;
 }
 .schedule-banner-runner.offline { color: var(--warning, #ffa726); }
-.schedule-banner-takeover {
+/* 「✅ 确认」（这份定义本机还没确认）：比别的按钮醒目一点 —— 确认之前这台电脑不会运行它 */
+.schedule-banner-confirm {
   flex-shrink: 0;
   padding: 2px 8px;
   border-radius: 6px;
   border: 1px solid var(--accent);
-  background: transparent;
-  color: inherit;
+  background: var(--accent);
+  color: #fff;
   font-size: 11px;
+  font-weight: 600;
   cursor: pointer;
 }
-.schedule-banner-takeover:hover { background: rgba(124, 111, 224, 0.16); }
-/* 已逾期：接管按钮醒目一点（实心） */
-.schedule-banner-takeover.urgent { background: var(--accent); border-color: var(--accent); color: #fff; font-weight: 600; }
-.schedule-banner-takeover.urgent:hover { filter: brightness(1.1); background: var(--accent); }
+.schedule-banner-confirm:hover { filter: brightness(1.1); }
 .schedule-banner-run-now {
   flex-shrink: 0;
   padding: 2px 8px;

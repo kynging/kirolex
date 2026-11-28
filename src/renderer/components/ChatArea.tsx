@@ -61,7 +61,7 @@ import type { SlashCommand, PermissionRequest } from '../hooks/useAcp';
 // runs there (a schedule has to fire with no window open); it is pure, so the renderer
 // imports the same module rather than keeping a second copy of the rules.
 import { validateSchedule, describeSchedule, DEFAULT_MAX_RUNS, MIN_INTERVAL_SEC, type ScheduleSpec } from '../../main/schedule';
-import { catchUpNotice, takeOverDetails, type ScheduleSummary } from '../scheduleView';
+import { takeOverDetails, type ScheduleSummary } from '../scheduleView';
 import { ScheduleExpiryPopover, type ScheduleExpiryChange } from './ScheduleExpiryPopover';
 import { bgElapsedText, bgEndedText, bgRerunDetails, bgRunnerLost, type BgJobRow } from '../bgJobsView';
 import { decidePaste } from '../pasteDecision';
@@ -4271,7 +4271,8 @@ interface ChatAreaProps {
   /** 聊天顶部那条定时任务上的「⏳ 延长…」弹层：延长多久 / 到期时间 / 不过期由用户定（只有用户能设成不过期）。 */
   onSetScheduleExpiry?: (id: string, change: ScheduleExpiryChange) => Promise<{ ok: boolean; error?: string }>;
   /** 「接管到本机」（任务在别的电脑上跑时才有）：先弹确认（prompt / checkCommand / 目标 / 周期全文），确认了才调；`defHash` 交回 main 核对。 */
-  onTakeOverSchedule?: (id: string, defHash: string, catchUp: boolean) => Promise<{ ok: boolean; error?: string }>;
+  /** 「确认」（这份定义本机还没确认时才有）：先弹窗显示 prompt / checkCommand / 目标 / 周期全文，确认了才调；`defHash` 交回 main 核对。 */
+  onApproveSchedule?: (id: string, defHash: string) => Promise<{ ok: boolean; error?: string }>;
   /** 「▶ 立即运行一次」（本机是执行者时）：算一次运行、照常记账；被次数上限 / 过期 / 暂停挡住时把原因交回来就地显示。 */
   onRunScheduleNow?: (id: string) => Promise<{ ok: boolean; error?: string }>;
   /** 「已结束」卡的「✕ 收起」：只隐藏卡片（本机记一笔），不删任务；作用于这张卡代表的全部已结束任务。 */
@@ -4413,7 +4414,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
   onPauseSchedule,
   onCancelSchedule,
   onSetScheduleExpiry,
-  onTakeOverSchedule,
+  onApproveSchedule,
   onRunScheduleNow,
   onDismissEndedSchedules,
   onStopLoop,
@@ -5888,7 +5889,7 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
           read history — including when the composer is collapsed. */}
       {scheduleSummary && (
         <div
-          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}${scheduleSummary.goal ? ' has-goal' : ''}${scheduleSummary.elsewhere || takeOverError ? ' elsewhere' : ''}${scheduleSummary.ended ? ' ended' : ''}`}
+          className={`schedule-banner${scheduleSummary.paused ? ' paused' : ''}${scheduleSummary.hasError ? ' failing' : ''}${scheduleSummary.goal ? ' has-goal' : ''}${scheduleSummary.elsewhere || scheduleSummary.live?.needsConfirm || scheduleSummary.live?.runningOn || scheduleSummary.live?.overdue || scheduleSummary.live?.lastRunBy || scheduleSummary.live?.lastCheck || takeOverError ? ' elsewhere' : ''}${scheduleSummary.ended ? ' ended' : ''}`}
           title={scheduleSummary.text}
         >
           <span className="schedule-banner-icon">{scheduleSummary.ended ? '🏁' : scheduleSummary.paused ? '⏸️' : '⏰'}</span>
@@ -5901,59 +5902,59 @@ export const ChatArea: React.FC<ChatAreaProps> = ({
             </span>
           )}
           <span className="schedule-banner-text">{scheduleSummary.text}</span>
-          {/* 不在本机跑（跨电脑同步）：标出在哪台上跑；那台很久没同步了就提示可以接管。暂停 / 删除照样能点（会同步过去） */}
+          {/* 「已结束」卡：上次在哪台上跑的（还在跑的任务看下面的 live 那几行） */}
           {scheduleSummary.elsewhere && (
-            <span
-              className={`schedule-banner-runner${scheduleSummary.elsewhere.offlineHours !== null || scheduleSummary.elsewhere.overdue ? ' offline' : ''}`}
-              title={scheduleSummary.elsewhere.needsConfirm
-                ? t('This task came back from the cloud and has not been confirmed on this computer, so it does not run here until you take it over.')
-                : t('Only one computer runs a scheduled task. This computer shows it but does not run it.')}
-            >
-              {scheduleSummary.elsewhere.needsConfirm
-                ? t('🖥️ Not confirmed on this computer')
-                : scheduleSummary.elsewhere.overdue
-                  ? scheduleSummary.elsewhere.overdue
-                : scheduleSummary.elsewhere.offlineHours !== null
-                  ? t('🖥️ {machine} has not synced for {n} h and may be off. You can take it over to this computer.', { machine: scheduleSummary.elsewhere.name, n: scheduleSummary.elsewhere.offlineHours })
-                  : scheduleSummary.ended ? t('🖥️ Ran on {machine}', { machine: scheduleSummary.elsewhere.name }) : t('🖥️ Runs on {machine}', { machine: scheduleSummary.elsewhere.name })}
-            </span>
+            <span className="schedule-banner-runner">{t('🖥️ Ran on {machine}', { machine: scheduleSummary.elsewhere.name })}</span>
           )}
           {scheduleSummary.elsewhere?.lastCheck && (
             <span className="schedule-banner-runner" title={scheduleSummary.elsewhere.lastCheck}>{scheduleSummary.elsewhere.lastCheck}</span>
           )}
+          {/*
+            哪台在线就由哪台跑（跨电脑同步）：本机还没确认这份定义 → 不在这里运行、给「确认」；正在哪台上跑 / 逾期了没有在线的电脑能跑；
+            上次由哪台运行；最后一次检查。暂停 / 删除照样能点（会同步过去）
+          */}
+          {scheduleSummary.live?.needsConfirm && (
+            <span className="schedule-banner-runner offline" title={t('This task came from another computer (or its definition changed there). Confirm the full task once and this computer can run it too.')}>
+              {t('🖥️ This computer has not confirmed this task, so it does not run here')}
+            </span>
+          )}
+          {scheduleSummary.live && (scheduleSummary.live.runningOn || scheduleSummary.live.overdue) && (
+            <span className={`schedule-banner-runner${scheduleSummary.live.runningOn ? '' : ' offline'}`}>
+              {scheduleSummary.live.runningOn ? t('🖥️ Running on {machine}', { machine: scheduleSummary.live.runningOn }) : scheduleSummary.live.overdue}
+            </span>
+          )}
+          {scheduleSummary.live?.lastRunBy && (
+            <span className="schedule-banner-runner">{scheduleSummary.live.lastRunBy}</span>
+          )}
+          {scheduleSummary.live?.lastCheck && (
+            <span className="schedule-banner-runner" title={scheduleSummary.live.lastCheck}>{scheduleSummary.live.lastCheck}</span>
+          )}
           {takeOverError && <span className="schedule-banner-runner offline">{takeOverError}</span>}
           {scheduleSummary.next && (
             <>
-              {/* 接管到本机：先弹窗把要在本机跑的东西全文给人看（checkCommand 是本机 shell），确认了才改执行者 */}
-              {scheduleSummary.elsewhere && !scheduleSummary.ended && onTakeOverSchedule && (
+              {/* 确认这份定义：先弹窗把要在本机跑的东西全文给人看（checkCommand 是本机 shell），确认了本机才参与运行 */}
+              {scheduleSummary.live?.needsConfirm && !scheduleSummary.ended && onApproveSchedule && (
                 <button
-                  className={`schedule-banner-takeover${scheduleSummary.elsewhere.overdue ? ' urgent' : ''}`}
+                  className="schedule-banner-confirm"
                   onClick={() => {
                     const job = scheduleSummary.next!;
-                    const from = scheduleSummary.elsewhere!.needsConfirm ? null : scheduleSummary.elsewhere!.name;
-                    /* 按接管之前的状态已经到点了：说明错过几次、接管后立刻补跑一次（默认勾上，取消勾选 = 从现在算） */
-                    const missed = catchUpNotice(job, findLang);
                     setTakeOverError(null);
                     setConfirm({
-                      title: t('Take over this scheduled task to this computer?'),
-                      message: `${from
-                        ? t('From now on it runs on this computer; {machine} stops running it once it syncs.', { machine: from })
-                        : t('From now on it runs on this computer.')}${missed ? `\n\n${missed}` : ''}\n\n${takeOverDetails(job, findLang)}`,
-                      confirmLabel: t('Take over and run here'),
-                      ...(missed ? { checkbox: { label: t('Run once right away'), defaultChecked: true } } : {}),
-                      /* 没错过（没有复选框）就照常：到点了才跑 —— 确认那一刻刚好到点的也算 */
-                      onConfirm: (checked) => {
-                        void onTakeOverSchedule(job.id, job.defHash || '', missed ? checked : true).then((r) => {
-                          if (!r.ok) setTakeOverError(r.error || t('Could not take over this scheduled task'));
+                      title: t('Let this computer run this scheduled task too?'),
+                      message: `${t('Scheduled tasks run on whichever computer is online. Once you confirm, this computer can run this one too (it runs on this computer\'s shell). Check the full task:')}\n\n${takeOverDetails(job, findLang)}`,
+                      confirmLabel: t('Confirm'),
+                      onConfirm: () => {
+                        void onApproveSchedule(job.id, job.defHash || '').then((r) => {
+                          if (!r.ok) setTakeOverError(r.error || t('Could not confirm this scheduled task'));
                         });
                       },
                     });
                   }}
-                  title={t('Run this scheduled task on this computer instead (shows the full task first)')}
-                >{t('🖥️ Take over')}</button>
+                  title={t('Show the full task and confirm it on this computer')}
+                >{t('✅ Confirm')}</button>
               )}
-              {/* 本机就是执行者：「▶ 立即运行一次」—— 算一次运行、照常记账，受次数上限 / 过期 / 暂停约束（main 那边判） */}
-              {!scheduleSummary.elsewhere && !scheduleSummary.ended && !scheduleSummary.paused && onRunScheduleNow && (
+              {/* 「▶ 立即运行一次」：任何有资格的电脑上都有（同样走租约）—— 算一次运行、照常记账，受次数上限 / 过期 / 暂停约束（main 那边判） */}
+              {!scheduleSummary.ended && !scheduleSummary.paused && (scheduleSummary.live?.canRun ?? !scheduleSummary.elsewhere) && onRunScheduleNow && (
                 <button
                   className="schedule-banner-run-now"
                   onClick={() => {

@@ -26,6 +26,11 @@ export interface ScheduleCheckDeps {
   /** 本机现在还是不是它的执行者（跨电脑同步，`scheduleSync.ts`）。检查命令跑的这段时间里可能被别的电脑接管了：
    *  是 false 就丢掉这次结果 —— 不落盘、不广播、不提示，免得把别人的任务写成「已达成」/ 自动暂停。不给 = 总是本机。 */
   stillRunsHere?(id: string, state: ScheduleState): boolean;
+  /**
+   * 检查跑完了、输出没变、这一次不叫醒（`skip`）：这一次也算「跑过了」—— 跨电脑同步时记上计划时刻和「上次由本机运行」并传上去，
+   * 别的电脑抢到租约后就知道不用再跑一遍检查命令。返回之前要做完（之后租约就放开了）。不给 = 老行为。
+   */
+  recordSkip?(id: string, state: ScheduleState): Promise<void> | void;
   lang?: UiLang;
 }
 
@@ -48,7 +53,7 @@ export async function runScheduleCheck(id: string, state: ScheduleState, deps: S
   deps.write(id, plan.state);
   deps.log(`check id=${id} session=${state.sessionId} status=${result.status}${result.status === 'exited' ? ` exit=${result.code}` : ''} → ${plan.action}`);
   deps.changed(id, plan.state);
-  if (plan.action === 'skip') return null;
+  if (plan.action === 'skip') { await deps.recordSkip?.(id, plan.state); return null; }
   if (plan.action === 'paused' && plan.note) deps.noteUser(state.sessionId, plan.note);
   return { state: plan.state, text: plan.text };
 }

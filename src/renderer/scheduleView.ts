@@ -37,11 +37,15 @@ export interface ScheduleView {
   /** 目标型任务的目标（文字）。 */
   until?: string | null;
   checkCommand?: string | null;
-  /* 跨电脑同步（main 的 scheduleSync.ts）：只有执行者那台跑。老的 main 不给这些字段 = 本机跑。 */
-  /** 本机就是执行者（而且定义在本机确认过）。`false` = 本机只显示，不跑。 */
+  /* 跨电脑同步（main 的 scheduleSync.ts / scheduleLease.ts）：哪台在线就由哪台跑（到点抢租约）。老的 main 不给这些字段 = 本机跑。 */
+  /** 上次是本机跑的（还没跑过 = 本机建的）。`false` = 上次在别的电脑上跑（已结束卡沿用）。 */
   runsHere?: boolean;
-  /** 不在本机跑的：按接管之前的状态已经到点了 —— 错过几次、上次运行、本应运行的第一次（接管确认框说明「会立刻补跑一次」）。没错过 = null。 */
-  catchUp?: { missed: number; lastRunAt: number | null; firstMissedAt: number | null } | null;
+  /** 本机有资格跑它（会去抢租约、能「立即运行一次」）。老的 main 不给 = 按 `runsHere`。 */
+  canRun?: boolean;
+  /** 正在哪台上跑（本机 = 本机的主机名）。没在跑 = null。 */
+  runningOn?: string | null;
+  /** 上次由哪台运行：`here` = 本机。还没跑过 = null。 */
+  lastRunBy?: { name: string; here: boolean } | null;
   /** 结束的时刻（main 的 `scheduleEndedAt`：老文件按 lastRunAt 推算）。没结束 = null。 */
   endedAt?: number | null;
   /** 结局那一句已经随会话记录同步到本机了 —— 「已结束」卡不必再挂着。 */
@@ -50,56 +54,38 @@ export interface ScheduleView {
   endedText?: string | null;
   /** 上一次检查的结果（执行者那台写的，跟着同步过来）：时刻、结论、退出码、输出末尾一小段。 */
   lastCheck?: { at: number; result: 'achieved' | 'unchanged' | 'changed' | 'error'; code: number | null; output: string } | null;
-  /** 不在本机跑时：在哪台上跑（主机名）。 */
+  /** 上次在别的电脑上跑时：那台的主机名（已结束卡用）。 */
   runnerName?: string | null;
-  /** 执行者写着本机、但定义没在本机确认过（恢复会话拉回来的）：同样要接管确认才跑。 */
+  /** 会话在本机，但这份定义本机还没确认（桶里来的 / 别的电脑上改过）：不在这里运行，卡片上给「确认」。 */
   needsConfirm?: boolean;
-  /** 执行者那台最后一次同步的时刻（不知道 = null）。 */
-  runnerSeenAt?: number | null;
-  /** 超过多久没同步就提示「可能关机了」（约 2 个同步周期）。 */
-  staleAfterMs?: number;
-  /** 定义的摘要：接管时交回 main 核对「确认的就是这份」。 */
+  /** 定义的摘要：确认时交回 main 核对「确认的就是这份」。 */
   defHash?: string;
-}
-
-/**
- * 执行者那台多久没同步了：超过 `staleAfterMs` 给小时数（至少 1），界面提示「可能关机了，可以接管到本机」；
- * 没超过 / 不知道它什么时候同步过 → null。
- */
-export function runnerOfflineHours(seenAt: number | null | undefined, now: number, staleAfterMs: number | undefined): number | null {
-  if (typeof seenAt !== 'number' || !Number.isFinite(seenAt) || !(typeof staleAfterMs === 'number' && staleAfterMs > 0)) return null;
-  const gap = now - seenAt;
-  if (gap <= staleAfterMs) return null;
-  return Math.max(1, Math.floor(gap / 3600_000));
 }
 
 /** 到点后超过这么久还没运行，才算「已逾期」（调度器 20 秒一跳，同步也有延迟）。 */
 export const OVERDUE_AFTER_MS = 10 * 60_000;
 
 /**
- * 不在本机跑的任务**已经逾期**了吗：下一次运行时间过去超过 `OVERDUE_AFTER_MS` 还没跑（执行者那台多半关机了）→
- * 「已逾期 N 小时没运行（<机器名> 可能关机了）」；没逾期 / 暂停着 / 在本机跑 → null。
+ * **已经逾期**了吗：下一次运行时间过去超过 `OVERDUE_AFTER_MS`、而且现在没有哪台在跑它 —— 有资格的电脑都不在线（或者都没确认）
+ * → 「已逾期 N 小时，没有在线的电脑可以运行」；没逾期 / 暂停着 / 正在跑 → null。
  */
 export function overdueText(job: ScheduleView, now: number, lang: Lang = 'zh'): string | null {
-  if (job.runsHere !== false || job.paused || !isLive(job)) return null;
+  if (job.paused || !isLive(job) || job.runningOn) return null;
   const at = job.nextRunAt;
   if (typeof at !== 'number' || !Number.isFinite(at)) return null;
   const gap = now - at;
   if (gap <= OVERDUE_AFTER_MS) return null;
-  const machine = job.runnerName || '?';
-  if (gap < 3600_000) return t(lang, '🖥️ Overdue by {n} min without running ({machine} may be off)', { n: Math.floor(gap / 60_000), machine });
-  return t(lang, '🖥️ Overdue by {n} h without running ({machine} may be off)', { n: Math.floor(gap / 3600_000), machine });
+  if (gap < 3600_000) return t(lang, '🖥️ Overdue by {n} min; no online computer can run it', { n: Math.floor(gap / 60_000) });
+  return t(lang, '🖥️ Overdue by {n} h; no online computer can run it', { n: Math.floor(gap / 3600_000) });
 }
 
-/** 接管确认框里「已错过 N 次（上次运行 X，本应在 Y 运行）。接管后会立刻补跑一次」那一段；没错过 = null。 */
-export function catchUpNotice(job: ScheduleView, lang: Lang = 'zh'): string | null {
-  const c = job.catchUp;
-  if (!c || !(c.missed > 0)) return null;
-  const fmt = (ms: number | null) => (typeof ms === 'number' && Number.isFinite(ms)
-    ? new Date(ms).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' })
-    : t(lang, 'never'));
-  return t(lang, 'Missed {n} time(s) (last run {last}, it should have run at {due}). After the takeover it runs once right away.',
-    { n: c.missed, last: fmt(c.lastRunAt), due: fmt(c.firstMissedAt) });
+/** 「上次由 X 运行（时间）」；还没跑过 = null。 */
+export function lastRunByText(job: ScheduleView, lang: Lang = 'zh'): string | null {
+  if (!job.lastRunBy || typeof job.lastRunAt !== 'number') return null;
+  const when = new Date(job.lastRunAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' });
+  return job.lastRunBy.here
+    ? t(lang, '🖥️ Last run on this computer ({when})', { when })
+    : t(lang, '🖥️ Last run by {machine} ({when})', { machine: job.lastRunBy.name, when });
 }
 
 /** 「上次检查」那一行：时刻 + 结论（+ 退出码）+ 输出末尾；没有检查过 = null。 */
@@ -143,8 +129,13 @@ export interface ScheduleSummary {
   goal: string | null;
   /** `next` 的过期时间；有它横幅才给「延长 / 不过期」。 */
   expiresAt: number | null;
-  /** `next` 不在本机跑：在哪台上跑、是否只差本机确认、那台多久没同步了（小时，没超时 = null）。在本机跑 = null。 */
+  /** 「已结束」卡（`endedElsewhereSummary`）：上次在哪台上跑的、最后一次检查。还在跑的任务 = null（看 `live`）。 */
   elsewhere: { name: string; needsConfirm: boolean; offlineHours: number | null; lastCheck: string | null; overdue: string | null } | null;
+  /**
+   * 还在跑的任务（`next`）在几台电脑之间的情况：本机能不能跑（「▶ 立即运行一次」）、要不要先确认、正在哪台上跑、
+   * 上次由哪台运行、是否逾期、最后一次检查。已结束卡 = 没有。
+   */
+  live?: { canRun: boolean; needsConfirm: boolean; runningOn: string | null; lastRunBy: string | null; overdue: string | null; lastCheck: string | null } | null;
   /** 已经结束的任务（只在不跑它的那台上保留这张卡，`endedElsewhereSummary`）：结束那一句。还在跑 = 没有 / null。 */
   ended?: string | null;
   /** 「已结束」卡代表的**全部**已结束任务（删除 / 收起作用于它们全部）；卡上写「另有 N 条已结束」。 */
@@ -223,10 +214,6 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
   if (expiresAt !== null) {
     parts.push(t(lang, 'Expires {when}', { when: new Date(expiresAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }));
   }
-  /* 不在本机跑：本机看不到它什么时候跑过，把执行者那台上次运行的时刻也写上 */
-  if (next && next.runsHere === false && typeof next.lastRunAt === 'number') {
-    parts.push(t(lang, 'Last run {when}', { when: new Date(next.lastRunAt).toLocaleString(undefined, { month: 'numeric', day: 'numeric', hour: '2-digit', minute: '2-digit' }) }));
-  }
   if (live.length > 1) parts.push(t(lang, '{n} jobs in total', { n: live.length }));
   // The error goes LAST but is never dropped: a daily job that has failed every morning
   // must not read the same as one that has been working.
@@ -245,9 +232,15 @@ export function sessionScheduleSummary(jobs: ScheduleView[], now: number, lang: 
     byModel: next?.createdBy === 'model',
     goal: next?.until?.trim() || null,
     expiresAt,
-    elsewhere: next && next.runsHere === false
-      ? { name: next.runnerName || '?', needsConfirm: !!next.needsConfirm, offlineHours: next.needsConfirm ? null : runnerOfflineHours(next.runnerSeenAt, now, next.staleAfterMs), lastCheck: lastCheckText(next.lastCheck, lang), overdue: overdueText(next, now, lang) }
-      : null,
+    elsewhere: null,
+    live: next ? {
+      canRun: next.canRun ?? next.runsHere !== false,
+      needsConfirm: !!next.needsConfirm,
+      runningOn: next.runningOn || null,
+      lastRunBy: lastRunByText(next, lang),
+      overdue: overdueText(next, now, lang),
+      lastCheck: lastCheckText(next.lastCheck, lang),
+    } : null,
   };
 }
 

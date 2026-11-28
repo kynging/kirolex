@@ -4859,9 +4859,10 @@ export function useAcp() {  const [status, setStatus] = useState<ConnectionStatu
   }, []);
 
   /** 「接管到本机」：确认弹窗之后才调；main 核对定义摘要（弹窗里给人看的那份）再改执行者。错误交回横幅就地显示。 */
-  const takeOverSchedule = useCallback(async (id: string, defHash: string, catchUp: boolean): Promise<{ ok: boolean; error?: string }> => {
+  /** 「确认」：这份定义本机确认过之后，本机参与运行（哪台在线就由哪台跑）。main 核对摘要（弹窗里给人看的那份）。 */
+  const approveSchedule = useCallback(async (id: string, defHash: string): Promise<{ ok: boolean; error?: string }> => {
     if (!id) return { ok: false };
-    try { return (await window.kiroApi.scheduleTakeOver?.(id, defHash, catchUp)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
+    try { return (await window.kiroApi.scheduleApprove?.(id, defHash)) ?? { ok: false }; } catch (err: any) { return { ok: false, error: String(err?.message || err) }; }
   }, []);
 
   /** 「▶ 立即运行一次」：交给 main（它判次数上限 / 过期 / 暂停、记账、照常先跑检查命令）；错误交回横幅就地显示。 */
@@ -6292,7 +6293,7 @@ ${text}`,
     pauseSchedule,
     cancelSchedule,
     setScheduleExpiry,
-    takeOverSchedule,
+    approveSchedule,
     runScheduleNow,
     bgJobs,
     stopBgJob,

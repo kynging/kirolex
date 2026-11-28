@@ -82,7 +82,7 @@ import { AGENT_PROFILES_REL, PROFILE_CONFLICTS_DIR, PROFILE_ENGINES, agentProfil
 import { syncProfileFiles, listLocalProfileFiles, listConflictCopies, readProfileMarks, writeProfileMarks } from './agentProfileSync.ts';
 import { AwsCredsResolver, resolveSyncSnapshot, lockThenResolve, type RunLock, syncConfigProblem, credentialSourceOf, credsLogLabel, validProfileName, type SyncCredsResult } from './awsProfileCreds.ts';
 import { SyncRounds, RoundAbandoned, type SyncRound } from './syncRound.ts';
-import { S3Creds, S3Error, checkLive, isLive, putObject, putObjectIf, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
+import { S3Creds, S3Error, checkLive, isLive, putObject, putObjectIf, putObjectIfEtag, deleteObject, deleteObjectIf, deleteObjectVersion, listObjectVersions, listVersionedKeys, getObject, getObjectIfExists, getObjectWithEtag, listObjects, listCommonPrefixes, prefixDeletedAt } from './s3Client.ts';
 import {
   serialQueue, catalogIO, updateCatalog, readCatalog, deleteSessionBackups, writeSyncCatalog, forgetMissingEntries,
   missingEntries, markMissing, sessionIdsFromPrefixes, sessionKeyPrefix, entryUploadedAt, syncMark, deletedSessionPlan, dropSessionState, type CatalogBucket,
@@ -100,7 +100,8 @@ import * as loopStore from './loopStore.ts';
 import { LoopDriver, loopRoundBlocker, type StopReason as LoopStopReason } from './loopDriver.ts';
 import { createSchedule as newSchedule, describeSchedule, isDue, nextRunAt, recordRun, refundRun, computeScheduleExpiry, scheduleDeliveryBlocker, scheduleEndedText, scheduleGoalSuffix, scheduleOwnerGate, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState } from './schedule.ts';
 import * as scheduleStore from './scheduleStore.ts';
-import { SCHEDULES_REL, ENDED_PRUNE_AFTER_MS, planScheduleAutoPrune, scheduleEndedAt, canRunHere, collectBucketSchedules, definitionHash, isCatchUpRun, missedRuns, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, takeOver, timingState, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
+import { SCHEDULES_REL, ENDED_PRUNE_AFTER_MS, planScheduleAutoPrune, scheduleEndedAt, collectBucketSchedules, definitionApproved, definitionHash, isRunnerHere, markRunBy, mergeSchedule, parseRemoteSchedule, planScheduleSync, remoteBody, scheduleObjectRel, tombstoneBody, type RemoteSchedule, type ScheduleMachine } from './scheduleSync.ts';
+import { attemptScheduleRun, commitCharge, CHARGE_KEYS, MARK_KEYS, markPendingRun, markSent, pendingStale, restorePending, undoCharge, creatorOf, leaseActive, leaseRel, parseLease, parseLeaseRel, type Lease, type LeaseBucket } from './scheduleLease.ts';
 import { recordedScheduleEndIds, scheduleEndGroup, scheduleWakeMessageId } from './scheduleWakeView.ts';
 import { runScheduleCheck as runScheduleCheckWith } from './scheduleCheckRun.ts';
 import { SESSION_BUSY, SESSION_NOT_CONNECTED, WakeDispatcher, WakeSkipped, isWakeBusyError, isWakeConnectionError, wakeAlreadyDelivered, type WakeItem } from './wakeQueue.ts';
@@ -6642,7 +6643,7 @@ const wakeDispatcher = new WakeDispatcher({
   },
   /* 定时任务那一次排着的时候被删 / 暂停 / 过期了就不发（盘上的状态为准，见 `scheduleDeliveryBlocker`） */
   isStale: (item) => (item.source === 'schedule' && item.ref
-    ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now()) ?? scheduleNotRunnerHere(item.ref)
+    ? scheduleDeliveryBlocker(scheduleStore.readSchedule(item.ref, os.homedir())?.state ?? null, Date.now()) ?? scheduleNotEligibleHere(item.ref)
     : item.source === 'nudge' ? textToolNudgeStale(item) : null),
   /* 不看报错文字（tr() 出来的，中文界面下是中文）：看错误码，或者此刻会话是不是真的在忙 */
   isBusyError: (err, item) => isWakeBusyError(err, quitPending || !!busyReasonFor(item.sessionId)),
@@ -8065,35 +8066,151 @@ function scheduleMachine(): ScheduleMachine {
 /* 本机的每次写都盖戳（新建的 runner = 本机、控制操作 / 运行状态记时刻），删除留删除标记 —— 见 scheduleStore.writeSchedule */
 scheduleStore.setLocalScheduleMachine(scheduleMachine());
 
-/** 「不是本机执行」已经记过日志的：id → 原因（原因变了才再记一行，不然 20 秒一跳刷屏）。 */
+/** 「本机不参与」已经记过日志的：id → 原因（原因变了才再记一行，不然 20 秒一跳刷屏）。 */
 const scheduleSkipLogged = new Map<string, string>();
+
 /**
- * **本机能不能跑这条**：runner 是本机，并且定义是本机确认过的（本机建的 / 接管时确认的，`canRunHere`）。
- * 调度器排定时器、跑 checkCommand、叫醒会话之前都先过这一道。
+ * **本机有没有资格跑这条**（哪台在线就由哪台跑，`scheduleLease.ts`）：会话在本机、开了跨电脑同步（或者本机就是建它的那台），
+ * **并且这份定义本机确认过**（本机建的 / 用户在本机确认过全文，`schedule-approved.json`）。没资格的不参与抢租约。
  */
-function scheduleRunsHere(job: scheduleStore.StoredSchedule): boolean {
-  const me = scheduleMachine().id;
-  if (canRunHere(job.state, me, scheduleStore.readApprovedHash(job.id, os.homedir()))) { scheduleSkipLogged.delete(job.id); return true; }
-  const why = job.state.runner === me ? 'unconfirmed' : `runner=${job.state.runner ?? '?'}`;
+function scheduleEligibleHere(job: scheduleStore.StoredSchedule): boolean {
+  const why = scheduleIneligibleReason(job);
+  if (!why) { scheduleSkipLogged.delete(job.id); return true; }
   if (scheduleSkipLogged.get(job.id) !== why) {
     scheduleSkipLogged.set(job.id, why);
-    logger.info('schedule', `skip id=${job.id}: 不是本机执行（${job.state.runner === me ? '本机是 runner，但定义没在本机确认过，要接管确认' : `在 ${job.state.runnerName || '?'} 上运行`}），不排定时器 runner=${job.state.runner ?? '?'}`);
+    logger.info('schedule', `skip id=${job.id}: 本机不参与运行（${why}）creator=${creatorOf(job.state) ?? '?'}`);
   }
   return false;
 }
 
-/**
- * 排着的定时唤醒（会话忙，等它空下来）**真正发出去之前**再判一次执行权：同步进来别的电脑接管了 / 定义没在本机确认过
- * → `'not-runner'`，不发。删了 / 暂停 / 结束 / 过期照旧由 `scheduleDeliveryBlocker` 判。
- */
-function scheduleNotRunnerHere(id: string): string | null {
-  const job = scheduleStore.readSchedule(id, os.homedir());
-  return job && !scheduleRunsHere(job) ? 'not-runner' : null;
+function scheduleIneligibleReason(job: scheduleStore.StoredSchedule): string | null {
+  const rec = store.readRecord(job.state.sessionId);
+  if (!rec) return '会话不在本机';
+  if (!definitionApproved(job.state, scheduleStore.readApprovedHash(job.id, os.homedir()))) return '这份定义本机还没确认';
+  if (creatorOf(job.state) !== scheduleMachine().id && !isShared(rec)) return '会话没开跨电脑同步，只在建它的电脑上跑';
+  return null;
 }
 
-/** 两道一起：删了 / 暂停 / 结束 / 过期（`scheduleDeliveryBlocker`），或者本机已不是执行者（`scheduleNotRunnerHere`）。 */
+/**
+ * 排着的定时唤醒（会话忙，等它空下来）**真正发出去之前**再判一次资格：期间同步进来的定义变了、本机还没确认 → 不发。
+ * 删了 / 暂停 / 结束 / 过期照旧由 `scheduleDeliveryBlocker` 判。
+ */
+function scheduleNotEligibleHere(id: string): string | null {
+  /* 排着等会话空下来的这段时间里，这一次的租约丢了（被覆盖 / 续约一直失败、过期）：不发 */
+  if (scheduleLeaseLost.get(id)?.()) return 'lease-lost';
+  const job = scheduleStore.readSchedule(id, os.homedir());
+  return job && !scheduleEligibleHere(job) ? 'not-eligible' : null;
+}
+
+/** 两道一起：删了 / 暂停 / 结束 / 过期（`scheduleDeliveryBlocker`），或者本机已没资格（`scheduleNotEligibleHere`）。 */
 function scheduleWakeBlocked(id: string): string | null {
-  return scheduleDeliveryBlocker(scheduleStore.readSchedule(id, os.homedir())?.state ?? null, Date.now()) ?? scheduleNotRunnerHere(id);
+  return scheduleDeliveryBlocker(scheduleStore.readSchedule(id, os.homedir())?.state ?? null, Date.now()) ?? scheduleNotEligibleHere(id);
+}
+
+/**
+ * 这一次没抢到 / 离线不归本机跑的任务，多久之后再试（id → 时刻）：别的电脑正在跑时，本机这份要等它跑完、状态同步过来才不再「到点」，
+ * 不按 20 秒一跳反复取凭证、读租约、记日志。「▶ 立即运行一次」不受它限制。
+ */
+const scheduleRetryAfter = new Map<string, number>();
+const SCHEDULE_RETRY_HELD_MS = 60_000;
+const SCHEDULE_RETRY_OFFLINE_MS = 5 * 60_000;
+
+/** 最近看到的各任务租约（抢租约时 / 每轮同步时读到的）：界面据此显示「正在 X 上运行」。 */
+const scheduleLeaseSeen = new Map<string, Lease>();
+/** 正在跑的那一次续约失败了（被别的电脑覆盖 / 续约一直失败租约过期）：id → 查询函数。检查命令跑完、叫醒会话之前看一眼。 */
+const scheduleLeaseLost = new Map<string, () => boolean>();
+/** 正在抢着租约跑的那一次：计划时刻 + 桶（真的交给会话之前先传「已提交」，见 `scheduleMarkSent`）。离线兜底 = ctx 为 null。 */
+const scheduleActiveRun = new Map<string, { runFor: number; ctx: { creds: S3Creds; prefix: string | undefined } | null }>();
+
+/**
+ * **真的把这一次交给会话之前**（`sendPromptOnce` 落盘用户消息之前那一刻）：把「已经提交执行」传到桶里（`pendingRun.sent`）。
+ * 传上去了才发 —— 之后哪怕最后的确认没传上去、或者本机崩了，接手的电脑也知道这一次已经交出去了，不会再发一遍；
+ * 传不上去 / 租约丢了就不发（返回原因），桶里还是「记了账、没提交」，接手的电脑撤销它、自己跑。离线兜底 / 不用桶的不管。
+ */
+async function scheduleMarkSent(id: string): Promise<string | null> {
+  const run = scheduleActiveRun.get(id);
+  if (!run?.ctx) return null;
+  if (scheduleLeaseLost.get(id)?.()) return 'lease-lost';
+  const home = os.homedir();
+  const cur = scheduleStore.readSchedule(id, home)?.state;
+  if (!cur?.pendingRun) return null;
+  const sent = markSent(cur, scheduleMachine(), Date.now());   // 新的状态版本（statusAt），别的电脑合并时认得出
+  scheduleStore.writeScheduleRaw(id, sent, home);
+  if (!(await publishScheduleState(run.ctx, id, sent)) || scheduleLeaseLost.get(id)?.()) {
+    const now = scheduleStore.readSchedule(id, home)?.state;
+    if (now?.pendingRun) scheduleStore.writeScheduleRaw(id, { ...now, pendingRun: { ...now.pendingRun, sent: false } }, home);
+    logger.warn('schedule', `run id=${id} run=${run.runFor}: 「已提交执行」没能传到桶里 / 租约丢了，这一次不发`);
+    return 'not-confirmed';
+  }
+  return null;
+}
+/**
+ * `sendPromptOnce` 里**真的交出去之前**那一步（定时任务才有 `onSend`）：先按同样的判据看一眼还该不该发（暂停 / 删除 / 租约丢了），
+ * 再把「已提交执行」传到桶里（`scheduleMarkSent`）；传不上去就不发（抛 `WakeSkipped`）。放在「再过一遍闸」之前 —— 那之后到交出去之间不能有 await。
+ * `bounce`：这一次会撞忙、稍后重发 —— 这一次不标。
+ */
+async function onSendGate(display: { onSend?: () => Promise<string | null>; stillWanted?: () => string | null } | undefined, bounce: boolean): Promise<void> {
+  if (!display?.onSend || bounce) return;
+  const pre = display.stillWanted?.();
+  if (pre) throw new WakeSkipped(pre);
+  const blocked = await display.onSend();
+  if (blocked) throw new WakeSkipped(blocked);
+}
+
+/** 定时任务那一条的 `onSend`（真的交出去之前，其他来源没有）。 */
+function sentHook(item: { source: string; ref?: string }): (() => Promise<string | null>) | undefined {
+  return item.source === 'schedule' && item.ref ? () => scheduleMarkSent(item.ref!) : undefined;
+}
+
+/** 正在跑的那一次：计划时刻 + 桶（检查命令「输出没变、不叫醒」时也要记上计划时刻、传上去，见 `recordSkip`）。 */
+const scheduleRunNow = new Map<string, { runFor: number; ctx: { creds: S3Creds; prefix: string | undefined } | null }>();
+
+/** 桶里任务 / 删除标记 / 租约对象的 key。 */
+function scheduleBucketKey(prefix: string | undefined, rel: string): string {
+  return keyFor(prefix, rel.split('/').join(path.sep));
+}
+
+/** 租约用的条件写入（S3 If-Match / If-None-Match，412 = 别人抢到了）。 */
+function scheduleLeaseBucket(creds: S3Creds): LeaseBucket {
+  return {
+    get: async (key) => { const g = await getObjectWithEtag(creds, key); return g ? { body: g.body.toString('utf-8'), etag: g.etag } : null; },
+    putIf: (key, body, cond) => putObjectIfEtag(creds, key, Buffer.from(body, 'utf-8'), 'application/json', cond),
+    del: async (key, etag) => {
+      const r = await deleteObjectIf(creds, key, etag);
+      /* 不支持条件删除的桶：写一份已过期的租约（还是 If-Match，不盖别人的） */
+      if (r === 'unsupported') await putObjectIf(creds, key, Buffer.from(JSON.stringify({ holder: '', name: '', expiresAt: 0, run: 0 }), 'utf-8'), 'application/json', { ifMatch: etag });
+    },
+  };
+}
+
+/**
+ * 这条任务能不能用桶抢租约：S3 开着、会话开了跨电脑同步并且在同步范围里、凭证取得到。不能 = null（`attemptScheduleRun` 按离线：只有建它的那台跑）。
+ */
+async function scheduleLeaseContext(state: ScheduleState): Promise<{ creds: S3Creds; prefix: string | undefined } | null> {
+  const cfg = loadSyncConfig();
+  if (!cfg.enabled || !cfg.bucket) return null;
+  const rec = store.readRecord(state.sessionId);
+  if (!rec || !isShared(rec) || !syncsSession(cfg, rec)) return null;
+  try {
+    const r = await resolveSyncCredsNow();
+    if (r.problem || !r.creds) return null;
+    return { creds: r.creds, prefix: r.cfg.prefix };
+  } catch { return null; }
+}
+
+/**
+ * 记账之后马上把这条任务的状态传上去（别的电脑抢到租约后据此知道「这一次已经跑过」）。返回传没传成功（离线 / 没用桶 = 成功，没什么可传）——
+ * 「这一次跑过了」**没传上去之前不能当成功**：调用方据此决定叫不叫醒会话（见 `runScheduledJob`）。
+ */
+async function publishScheduleState(ctx: { creds: S3Creds; prefix: string | undefined } | null, id: string, state: ScheduleState): Promise<boolean> {
+  if (!ctx) return true;
+  try {
+    await putObject(ctx.creds, scheduleBucketKey(ctx.prefix, scheduleObjectRel(state.sessionId, id)), Buffer.from(remoteBody(id, state, Date.now()), 'utf-8'), 'application/json');
+    return true;
+  } catch (err: any) {
+    logger.warn('schedule', `run id=${id}: 状态没传上去（${err?.message || err}）`);
+    return false;
+  }
 }
 
 /** 各台电脑最后一次同步的时刻（每轮从 catalog 的设备清单抄下来）—— 非 runner 那台据此提示「<机器名> 已 N 小时没同步」。 */
@@ -8140,6 +8257,8 @@ async function syncSchedulesWithBucket(creds: S3Creds, prefix: string | undefine
     const tombs = scheduleStore.readScheduleTombstones(home);
     const localIds = new Set(scheduleStore.listSchedules(home, store.isAdvancedOnlySession).map((j) => j.id));
     const remote = new Map<string, { sessionId: string; parsed: RemoteSchedule | null }>();
+    /* 读到时的 ETag：上传按它条件写（期间别的电脑刚传过就这一轮不传，下一轮再合）—— 不拿旧的运行状态盖掉刚跑完的那台写的 */
+    const remoteEtag = new Map<string, string>();
     /* 删除标记是单独的对象（`<id>.deleted.json`）：活任务的上传盖不掉它；有它就是删了，活的那份不再下载 */
     const listed = collectBucketSchedules(objects.map((o) => relFor(prefix, o.key)).filter((r): r is string => !!r).map((r) => r.split(path.sep).join('/')));
     const usable = (sid: string) => store.isValidSessionId(sid) && !store.isAdvancedOnlySession(sid);
@@ -8150,10 +8269,23 @@ async function syncSchedulesWithBucket(creds: S3Creds, prefix: string | undefine
       const sid = l.sessionId;
       if (!usable(sid)) continue;
       if (!inScope(sid) && !tombs[id] && !localIds.has(id)) continue;   // 不在同步范围、本机也没有：不下载
-      const body = await getObjectIfExists(creds, keyFor(prefix, l.rel.split('/').join(path.sep)));
+      const got = await getObjectWithEtag(creds, keyFor(prefix, l.rel.split('/').join(path.sep)));
+      const body = got?.body ?? null;
+      if (got) remoteEtag.set(id, got.etag);
       const parsed = body ? parseRemoteSchedule(body.toString('utf-8'), id, sid) : null;
       if (body && !parsed) logger.warn('schedule', `sync: 桶里的 ${l.rel} 认不出（格式不对 / 定义不合法 / 没有 runner），两边都不动`);
       remote.set(id, { sessionId: sid, parsed });
+    }
+    /* 租约（`<id>.lease.json`）：只用来显示「正在 X 上运行」 */
+    for (const o of objects) {
+      const rel = relFor(prefix, o.key);
+      const k = rel ? parseLeaseRel(rel.split(path.sep).join('/')) : null;
+      if (!k || !usable(k.sessionId) || !localIds.has(k.id)) continue;
+      try {
+        const g = await getObjectIfExists(creds, o.key);
+        const lease = g ? parseLease(g.toString('utf-8')) : null;
+        if (lease) scheduleLeaseSeen.set(k.id, lease); else scheduleLeaseSeen.delete(k.id);
+      } catch { /* 只影响显示 */ }
     }
     /* 网络都等完了才读本机：下面到写盘之间没有 await，期间不会有一次运行的记账被这份合并盖掉 */
     checkLive(creds);   // 被看门狗放弃的那一轮不改本机的定时任务
@@ -8161,22 +8293,14 @@ async function syncSchedulesWithBucket(creds: S3Creds, prefix: string | undefine
       me: me.id, local: scheduleStore.listSchedules(home, store.isAdvancedOnlySession),
       tombstones: scheduleStore.readScheduleTombstones(home), remote, inScope, upload: opts.upload,
     });
-    const puts: Array<{ id: string; key: string; body: string; tombstone?: { sessionId: string; at: number } }> = [];
+    const puts: Array<{ id: string; key: string; body: string; etag?: string | null; tombstone?: { sessionId: string; at: number } }> = [];
     const objKey = (sid: string, id: string, deleted = false) => keyFor(prefix, scheduleObjectRel(sid, id, deleted).split('/').join(path.sep));
     for (const a of plan) {
       if (a.op === 'write') {
         scheduleStore.writeScheduleRaw(a.id, a.state, home);
-        const who = a.state.runnerName || a.state.runner;
-        if (a.adopted) logger.info('schedule', `sync: 从桶里拉下 id=${a.id} session=${a.state.sessionId} runner=${a.state.runner}（${a.state.runner === me.id ? '本机，但定义没在本机确认过：只显示，接管确认后才跑' : '别的电脑：本机只显示、不跑'}）`);
-        if (a.notes.refusedAssign) logger.warn('schedule', `sync: 桶里那份想把 id=${a.id} 的 runner 改成本机，没收（只有本机的接管能改）runner=${a.state.runner}`);
-        if (a.notes.defRejected) logger.warn('schedule', `sync: 桶里那份改了 id=${a.id} 的定义（prompt / checkCommand / 目标 / 周期），本机是 runner，没收 runner=${a.state.runner}`);
-        if (a.notes.lostTo) {
-          wakeDispatcher.dropRef(a.id, 'handed over');   // 排着等会话空下来的那一次也撤掉
-          logger.info('schedule', `handover: id=${a.id} 被 ${who} 接管，本机停掉它的定时器（文件留着）runner=${a.notes.lostTo}`);
-          sessionNotice(a.state.sessionId, tr('⏰ This scheduled task is now run by {machine}; this computer stopped running it.', { machine: who || '?' }));
-        }
-        if (a.notes.ranAfterHandover) logger.info('schedule', `handover: id=${a.id} 本机在被接管之后、拉到之前又跑了一次（同步延迟）runner=${a.notes.lostTo}`);
-        if (a.notes.ignoredRunBy) logger.info('schedule', `sync: id=${a.id} 旧 runner ${a.notes.ignoredRunBy} 在接管之后又写了运行状态，不认（本机是 runner）runner=${me.id}`);
+        const approved = definitionApproved(a.state, scheduleStore.readApprovedHash(a.id, home));
+        if (a.adopted) logger.info('schedule', `sync: 从桶里拉下 id=${a.id} session=${a.state.sessionId}（${approved ? '定义本机确认过' : '定义本机还没确认：确认之前不在本机运行'}）`);
+        if (a.notes.defChanged) logger.warn('schedule', `sync: id=${a.id} 的定义（prompt / checkCommand / 目标 / 周期）在别的电脑上变了，用了桶里那份${approved ? '' : '，本机要重新确认才会在这里运行'}`);
         mainWindow?.webContents.send('schedule:changed', { id: a.id, state: a.state });
       } else if (a.op === 'delete') {
         scheduleStore.removeSchedule(a.id, home, store.isAdvancedOnlySession);
@@ -8187,13 +8311,20 @@ async function syncSchedulesWithBucket(creds: S3Creds, prefix: string | undefine
       } else if (a.op === 'remember-deleted') {
         scheduleStore.addScheduleTombstone(a.id, a.sessionId, a.at, home, true);
       } else if (a.op === 'put') {
-        puts.push({ id: a.id, key: objKey(a.sessionId, a.id), body: remoteBody(a.id, a.state, Date.now()) });
+        puts.push({ id: a.id, key: objKey(a.sessionId, a.id), body: remoteBody(a.id, a.state, Date.now()), etag: remoteEtag.get(a.id) ?? null });
       } else if (a.op === 'put-tombstone') {
         puts.push({ id: a.id, key: objKey(a.sessionId, a.id, true), body: tombstoneBody(a.id, a.sessionId, a.at, me.id), tombstone: { sessionId: a.sessionId, at: a.at } });
       }
     }
     let uploaded = 0;
     for (const u of puts) {
+      if (!u.tombstone) {
+        /* 任务本身：条件写（读到的那一版还在才写；本来没有就只在还没有时写）—— 删除标记照旧直接写 */
+        const r = await putObjectIf(creds, u.key, Buffer.from(u.body, 'utf-8'), 'application/json', u.etag ? { ifMatch: u.etag } : { ifNoneMatch: '*' });
+        if (r === 'conflict') { logger.info('schedule', `sync: id=${u.id} 桶里那份刚被别的电脑改过，这一轮不传，下一轮再合`); continue; }
+        uploaded += 1;
+        continue;
+      }
       await putObject(creds, u.key, Buffer.from(u.body, 'utf-8'), 'application/json');
       if (u.tombstone) scheduleStore.addScheduleTombstone(u.id, u.tombstone.sessionId, u.tombstone.at, home, true);
       uploaded += 1;
@@ -12564,7 +12695,7 @@ ${hint}` : ''}` };
 
   /** One send attempt. Kept as a named function (rather than an inline handler) so
    *  the failure classification below stays readable. */
-  type PromptDisplay = { messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean; handoff?: HandoffSpec; fromHandoff?: string[] };
+  type PromptDisplay = { onSend?: () => Promise<string | null>; messageId?: string; displayText?: string; mergeIntoMessageId?: string; attachments?: any[]; pastes?: any[]; announce?: boolean; bgOutput?: boolean; stillWanted?: () => string | null; kirolexNote?: boolean; handoff?: HandoffSpec; fromHandoff?: string[] };
   /** 发送前的异步准备（读历史快照 / 记忆）核对执行器用的（sendPrep.ts）：「正在切换」= 正在换执行器 / 正在应用待切换 */
   const prepDeps = {
     current: (id: string) => sessionClients.get(id),
@@ -12861,6 +12992,7 @@ ${hint}` : ''}` };
         logger.info('memory', `project / machine changed while reading memory sessionId=${sessionId} (${target.projectId || '(none)'} → ${want.projectId || '(none)'}) -> read again`);
       }
     }
+    if (!attempt) await onSendGate(display, !!((entry.busy || entry.autonomous) && !handoff));
     if (handoff?.kind === 'queued') regateQueuedHandoff(sessionId, entry);   // 读记忆期间可能变了：交出去之前再过一遍闸
     if (entry.busy && !handoff) {
       /* 带错误码：后台唤醒据此判「撞上忙、空了再发」，不靠这句随界面语言变的文字 */
@@ -14437,12 +14569,15 @@ ${hint}` : ''}` };
    * stateless mode to switch it off, because carrying the last result forward is what makes
    * a scheduled job report the same thing every morning. */
   const SCHEDULE_TICK_MS = 20_000;
-  /* 老文件（跨电脑同步之前建的，没有 runner）都是本机建的：补上 runner = 本机，并记成本机确认过 */
+  /*
+    老文件：跨电脑同步之前建的（没有 runner）都是本机建的 —— 补上 creator = 本机，并记成本机确认过；
+    有 runner 没有 creator 的（「只有 runner 跑」那一版）：原来的 runner 当 creator，只用于离线兜底；确认过的定义照旧有效
+  */
   for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession)) {
-    if (job.state.runner) continue;
+    if (job.state.runner && job.state.creator) continue;
     try {
       scheduleStore.writeSchedule(job.id, job.state, os.homedir(), store.isAdvancedOnlySession);
-      logger.info('schedule', `migrate id=${job.id}: 老任务补上执行者 = 本机 runner=${scheduleMachine().id}`);
+      logger.info('schedule', `migrate id=${job.id}: 老任务补上建它的电脑 creator=${job.state.creator || job.state.runner || scheduleMachine().id}`);
     } catch (err: any) { logger.warn('schedule', `migrate id=${job.id} 失败：${err?.message || err}`); }
   }
   /* Jobs currently mid-run (`schedulesInFlight`, module level), so a slow turn is never re-entered by the next tick. */
@@ -14466,41 +14601,117 @@ ${hint}` : ''}` };
     return gate === 'run';
   }
 
-  async function runScheduledJob(job: scheduleStore.StoredSchedule, opts: { manual?: boolean } = {}): Promise<void> {
+  /**
+   * **到点了（或「▶ 立即运行一次」），本机试着跑这一次**：先看会话还在不在，再经 `attemptScheduleRun` 抢桶里的租约 ——
+   * 抢到、这一次还没人跑过、定义本机确认过，才真的跑（`runScheduledJob`）。拿不到 S3 时只有建它的那台跑。
+   */
+  async function attemptScheduledJob(job: scheduleStore.StoredSchedule, opts: { manual?: boolean } = {}): Promise<void> {
+    const { id } = job;
+    if (schedulesInFlight.has(id)) return;
+    if (!opts.manual && Date.now() < (scheduleRetryAfter.get(id) ?? 0)) return;
+    /* 先看会话还在不在，再碰租约 / 跑任何东西（会话删了 → 任务一起删） */
+    if (!scheduleOwnerAllows(id, job.state.sessionId)) return;
+    schedulesInFlight.set(id, job.state.sessionId);
+    const me = scheduleMachine();
+    const home = os.homedir();
+    try {
+      const ctx = await scheduleLeaseContext(job.state);
+      const leaseKey = ctx ? scheduleBucketKey(ctx.prefix, leaseRel(job.state.sessionId, id)) : '';
+      const result = await attemptScheduleRun(id, {
+        me, now: () => Date.now(), bucket: ctx ? scheduleLeaseBucket(ctx.creds) : null, leaseKey,
+        eligible: (st) => !scheduleIneligibleReason({ id, state: st, updatedAt: 0 }),
+        readLocal: () => scheduleStore.readSchedule(id, home)?.state ?? null,
+        fetchRemote: async () => {
+          if (!ctx) return null;
+          /* 别的电脑删了它：本机也删，这一次不跑 */
+          const del = await getObjectIfExists(ctx.creds, scheduleBucketKey(ctx.prefix, scheduleObjectRel(job.state.sessionId, id, true)));
+          if (del) {
+            const cur = scheduleStore.readSchedule(id, home);
+            scheduleStore.removeSchedule(id, home, store.isAdvancedOnlySession);
+            scheduleStore.addScheduleTombstone(id, job.state.sessionId, Date.now(), home, true);
+            mainWindow?.webContents.send('schedule:changed', { id, state: null });
+            logger.info('schedule', `skip id=${id}: 已在别的电脑上删了，本机也删掉`);
+            return cur ? { ...cur.state, terminal: 'cancelled' as const } : null;
+          }
+          const body = await getObjectIfExists(ctx.creds, scheduleBucketKey(ctx.prefix, scheduleObjectRel(job.state.sessionId, id)));
+          const parsed = body ? parseRemoteSchedule(body.toString('utf-8'), id, job.state.sessionId) : null;
+          return parsed?.kind === 'live' ? parsed.state : null;
+        },
+        /* 删掉了的（文件没了 / 有删除标记）绝不写回 —— 不把删掉的任务又建出来 */
+        persist: (st) => {
+          if (!scheduleStore.readSchedule(id, home) || scheduleStore.readScheduleTombstones(home)[id]) return;
+          scheduleStore.writeScheduleRaw(id, st, home); mainWindow?.webContents.send('schedule:changed', { id, state: st });
+        },
+        adopt: (remote) => {
+          const cur = scheduleStore.readSchedule(id, home)?.state;
+          /* 本机这份没了（刚发现别的电脑删了它）：不写回，原样交回去（它带着 cancelled，这一次不跑） */
+          if (!cur) return remote;
+          const merged = mergeSchedule(cur, remote).state;
+          scheduleStore.writeScheduleRaw(id, merged, home);
+          mainWindow?.webContents.send('schedule:changed', { id, state: merged });
+          return merged;
+        },
+        run: async (st, runFor, lease) => {
+          scheduleLeaseLost.set(id, lease.lost);
+          scheduleActiveRun.set(id, { runFor, ctx: lease.offline ? null : ctx });
+          /* 断网兜底（只有建它的那台在跑）：不用桶 —— 本机记账就算数，不要求把「跑过了」传上去 */
+          try { await runScheduledJob({ id, state: st, updatedAt: Date.now() }, { manual: opts.manual, runFor, ctx: lease.offline ? null : ctx }); }
+          finally { scheduleLeaseLost.delete(id); scheduleActiveRun.delete(id); }
+        },
+        every: (ms, fn) => { const t = setInterval(fn, ms); return () => clearInterval(t); },
+        log: (m) => logger.info('schedule', m),
+        manual: opts.manual,
+      });
+      if (result === 'ran' || result === 'offline-ran') scheduleLeaseSeen.delete(id);
+      if (result === 'held') scheduleRetryAfter.set(id, Date.now() + SCHEDULE_RETRY_HELD_MS);
+      else if (result === 'offline-not-creator') scheduleRetryAfter.set(id, Date.now() + SCHEDULE_RETRY_OFFLINE_MS);
+      else scheduleRetryAfter.delete(id);
+      mainWindow?.webContents.send('schedule:changed', { id, state: scheduleStore.readSchedule(id, home)?.state ?? null });
+    } catch (err: any) {
+      logger.warn('schedule', `run id=${id} 没跑成：${err?.message || err}`);
+    } finally {
+      schedulesInFlight.delete(id);
+    }
+  }
+
+  /**
+   * **真的跑这一次**（租约已经抢到 / 离线时本机是建它的那台，见 `attemptScheduledJob`）：检查命令 → 记账（带计划时刻、「上次由本机运行」）
+   * → 先把状态传上去 → 叫醒会话。检查命令跑的期间租约丢了（被别的电脑覆盖）就不记账、不叫醒。
+   */
+  async function runScheduledJob(job: scheduleStore.StoredSchedule, opts: { manual?: boolean; runFor: number; ctx: { creds: S3Creds; prefix: string | undefined } | null }): Promise<void> {
     const { id } = job;
     let state = job.state;
-    if (schedulesInFlight.has(id)) return;
-    /*
-      **只有 runner 那台跑**：按盘上最新的再判一次（接管 / 交出可能刚同步进来）。接管之后：接管时已经到点、选了补跑的，
-      锚点仍是原来的上次运行（这一次就是补跑）；否则第一次从接管那一刻算（`timingState`）。
-      「▶ 立即运行一次」（`manual`）不看到没到点 —— 暂停 / 结束 / 过期 / 次数用完由 `schedule:run-now` 先挡掉。
-    */
-    { const fresh = scheduleStore.readSchedule(id, os.homedir());
-      if (!fresh || !scheduleRunsHere(fresh) || (!opts.manual && !isDue(timingState(fresh.state), Date.now()))) return;
-      if (!opts.manual && isCatchUpRun(fresh.state)) logger.info('schedule', `schedule catch-up id=${id} missed=${fresh.state.catchUpPending} session=${fresh.state.sessionId}: 接管时已到点，补跑一次`); }
     /* 先看会话还在不在，再跑任何东西（`checkCommand` 是本机 shell），见 `scheduleOwnerAllows` */
     if (!scheduleOwnerAllows(id, state.sessionId)) return;
-    schedulesInFlight.set(id, state.sessionId);
-    try {
-      const at = opts.manual ? Date.now() : nextRunAt(timingState(state)) ?? Date.now();
+    {
+      const at = opts.manual ? Date.now() : opts.runFor;
       /* 目标型任务的 `checkCommand`：先在本机跑一次检查，没变化就到此为止（不花模型）；要叫醒的话把检查结果附在消息里 */
       let check = '';
+      const preCheck = scheduleStore.readSchedule(id, os.homedir())?.state ?? state;   // 检查之前（接手时撤销用）
       if (state.spec.checkCommand) {
-        const checked = await runScheduleCheck(id, state);
+        state = markCheckPending(id, state, preCheck, opts);
+        scheduleRunNow.set(id, { runFor: opts.runFor, ctx: opts.ctx });
+        const checked = await runScheduleCheck(id, state).finally(() => scheduleRunNow.delete(id));
         if (!checked) return;
         state = checked.state;
         check = checked.text;
       }
-      /* 检查命令跑的这段时间里执行权可能交出去了（同步进来别的电脑接管）：不记账、不叫醒会话 */
+      /* 检查命令跑的这段时间里租约丢了（续约时发现被别的电脑覆盖了）/ 本机没资格了：不记账、不叫醒会话 */
       { const latestJob = scheduleStore.readSchedule(id, os.homedir());
-        if (!latestJob || !scheduleRunsHere(latestJob)) {
-          logger.info('schedule', `handover: id=${id} 要叫醒会话时本机已不是执行者，这一次不记账、不叫醒 runner=${latestJob?.state.runner ?? '?'}`);
+        if (!latestJob || scheduleLeaseLost.get(id)?.() || !scheduleEligibleHere(latestJob)) {
+          logger.info('schedule', `lease lost id=${id} run=${opts.runFor}: 要叫醒会话时本机已经不持有这一次，不记账、不叫醒`);
           return;
         } }
+      /* 计划时刻 + 「上次由本机运行」；记账之前那一份留着（传不上去时退回） */
+      const beforeCharge = scheduleStore.readSchedule(id, os.homedir())?.state ?? state;
+      state = markRunBy(state, opts.runFor, scheduleMachine(), Date.now());
+      if (opts.ctx) state = markPendingRun(state, beforeCharge, opts.runFor, scheduleMachine(), Date.now(), preCheck);   // 送达前：「记了账、没确认送达」
       // CHARGE THE RUN FIRST, and flush it. Recording only on completion means a process
       // killed mid-run forgets it paid -- the shape of a job that bills a turn per restart.
       const charged = recordRun(state, Date.now());
       scheduleStore.writeSchedule(id, charged, os.homedir(), store.isAdvancedOnlySession);
+      /* 「这一次跑过了」传到桶里才叫醒会话；传不上去 / 租约丢了 = 记账退回、不叫醒（`commitScheduleCharge`） */
+      if (!(await commitScheduleCharge(id, beforeCharge, charged, opts))) return;
 
       /*
         **经 `wakeDispatcher` 发**：会话正忙就等这一轮结束再发（原来直接 `sendPromptOnce`，撞上忙就报错、
@@ -14511,14 +14722,15 @@ ${hint}` : ''}` };
       });
       // Re-read: the user may have paused or removed the job during the turn.
       const latest = scheduleStore.readSchedule(id, os.homedir());
+      if (await scheduleLeaseLostAfterWake(id, opts, !!delivered.skipped, beforeCharge)) return;
       if (delivered.skipped) {
         /* 排着等会话空下来的时候被删 / 暂停 / 过期了：这一次没发，记的账退回去（删掉的就什么都不用写） */
         logger.info('schedule', `run skipped id=${id} session=${state.sessionId}: ${delivered.error}`);
         if (latest) {
           /* 带检查结果的那一次没发出去：检查的结论也退回去（不然同样的输出下次会被当成「没变化」跳过，「已达成」也不会再报） */
           const back = check
-            ? { ...refundRun(latest.state, state), lastCheckHash: job.state.lastCheckHash ?? null, terminal: job.state.terminal }
-            : refundRun(latest.state, state);
+            ? { ...refundRun(latest.state, state), lastCheckHash: job.state.lastCheckHash ?? null, terminal: job.state.terminal, lastRunFor: beforeCharge.lastRunFor ?? null, pendingRun: null }
+            : { ...refundRun(latest.state, state), lastRunFor: beforeCharge.lastRunFor ?? null, pendingRun: null };
           scheduleStore.writeSchedule(id, back, os.homedir(), store.isAdvancedOnlySession);
           mainWindow?.webContents.send('schedule:changed', { id, state: back });
         }
@@ -14526,7 +14738,7 @@ ${hint}` : ''}` };
       }
       const failure: string | undefined = delivered.ok ? undefined : (delivered.error || tr('Send failed'));
       if (!latest) return;
-      const settled = { ...latest.state, lastError: failure ?? null };
+      const settled = { ...latest.state, lastError: failure ?? null, pendingRun: null };   // 发出去了：确认送达
       const terminal = scheduleTerminal(settled, Date.now());
       const final = terminal ? { ...settled, terminal } : settled;
       scheduleStore.writeSchedule(id, final, os.homedir(), store.isAdvancedOnlySession);
@@ -14544,9 +14756,69 @@ ${hint}` : ''}` };
         }, scheduleEndGroup(id));
       }
       mainWindow?.webContents.send('schedule:changed', { id, state: final });
-    } finally {
-      schedulesInFlight.delete(id);
+      await publishScheduleState(opts.ctx, id, scheduleStore.readSchedule(id, os.homedir())?.state ?? final);
     }
+  }
+
+  /**
+   * 记账之后、叫醒会话之前：把「这一次跑过了」传到桶里。传不上去（或者这期间租约丢了）就不算跑过 —— 本机的记账原样退回、
+   * 返回 false（调用方不叫醒会话），这一次留给下一次尝试（本机或别的电脑）。离线 / 不用桶的直接算成功。
+   */
+  /**
+   * **检查命令开始之前**就挂上「记了账、没确认送达」（计划时刻 + 检查之前的状态）：检查一开始就会写检查时刻，期间同步出去的那份
+   * 在别的电脑看来已经「不到点」了 —— 本机要是在检查中途失联，没有这个标记就没人接手，这一次就漏了。有了它，租约过期后
+   * 接手的电脑撤销这次检查、自己跑（`restorePending`）。离线兜底（不用桶）不挂。返回带标记的状态（检查从它开始）。
+   */
+  function markCheckPending(id: string, state: ScheduleState, preCheck: ScheduleState, opts: { runFor: number; ctx: { creds: S3Creds; prefix: string | undefined } | null }): ScheduleState {
+    if (!opts.ctx) return state;
+    const marked = markPendingRun(state, preCheck, opts.runFor, scheduleMachine(), Date.now(), preCheck);
+    scheduleStore.writeScheduleRaw(id, marked, os.homedir());
+    return marked;
+  }
+
+  async function commitScheduleCharge(id: string, beforeCharge: ScheduleState, charged: ScheduleState, opts: { runFor: number; ctx: { creds: S3Creds; prefix: string | undefined } | null }, keys?: readonly string[]): Promise<boolean> {
+    return commitCharge(beforeCharge, {
+      offline: !opts.ctx,
+      lost: () => !!scheduleLeaseLost.get(id)?.(),
+      publish: () => publishScheduleState(opts.ctx, id, scheduleStore.readSchedule(id, os.homedir())?.state ?? charged),
+      readCurrent: () => scheduleStore.readSchedule(id, os.homedir())?.state ?? null,
+      deleted: () => !!scheduleStore.readScheduleTombstones(os.homedir())[id],
+      writeRaw: (s) => { scheduleStore.writeScheduleRaw(id, s, os.homedir()); mainWindow?.webContents.send('schedule:changed', { id, state: s }); },
+      log: (m) => logger.warn('schedule', `run id=${id} run=${opts.runFor}: ${m}`),
+    }, keys);
+  }
+
+  /**
+   * 叫醒会话的这段时间里（排着等会话空下来 / 发送中）租约丢了吗。丢了：
+   *   · **没发出去**（发之前被挡下）→ 只撤销本机这份的记账；桶里那份留着「记了账、没确认送达」，下一台抢到租约时撤销它、自己跑这一次；
+   *   · **发出去了** → 本机这份清掉「没确认送达」；桶里那份只在**还是本机记的那一份**时才条件写清掉（别的电脑已经接手改过的不碰）。
+   * 都不再写别的状态。没丢 = false，调用方照常往下走。
+   */
+  async function scheduleLeaseLostAfterWake(id: string, opts: { runFor: number; ctx: { creds: S3Creds; prefix: string | undefined } | null }, skipped: boolean, beforeCharge: ScheduleState): Promise<boolean> {
+    if (!scheduleLeaseLost.get(id)?.()) return false;
+    const home = os.homedir();
+    const cur = scheduleStore.readSchedule(id, home)?.state;
+    const deleted = !!scheduleStore.readScheduleTombstones(home)[id];
+    if (skipped) {
+      /* 本机这份带着「没确认送达」：和接手的电脑同一个撤销（连这一次检查的结论一起退回，期间用户的暂停不动）；没带（离线）就只退记账 */
+      if (cur && !deleted) scheduleStore.writeScheduleRaw(id, cur.pendingRun ? restorePending(cur) : undoCharge(cur, beforeCharge, CHARGE_KEYS), home);
+      logger.info('schedule', `lease lost id=${id} run=${opts.runFor}: 排着等会话的时候租约丢了，这一次没发出去 —— 本机撤销记账，桶里那份留着「没确认送达」，由下一台抢到租约的电脑接手`);
+      return true;
+    }
+    if (cur && !deleted) scheduleStore.writeScheduleRaw(id, { ...cur, pendingRun: null }, home);
+    if (opts.ctx) {
+      const key = scheduleBucketKey(opts.ctx.prefix, scheduleObjectRel(beforeCharge.sessionId, id));
+      try {
+        const got = await getObjectWithEtag(opts.ctx.creds, key);
+        const parsed = got ? parseRemoteSchedule(got.body.toString('utf-8'), id, beforeCharge.sessionId) : null;
+        const p = parsed?.kind === 'live' ? parsed.state.pendingRun : null;
+        if (got && parsed?.kind === 'live' && p && p.by === scheduleMachine().id && p.runFor === opts.runFor) {
+          await putObjectIf(opts.ctx.creds, key, Buffer.from(remoteBody(id, { ...parsed.state, pendingRun: null }, Date.now()), 'utf-8'), 'application/json', { ifMatch: got.etag });
+        }
+      } catch (err: any) { logger.warn('schedule', `run id=${id}: 发出去之后没能确认送达（${err?.message || err}）`); }
+    }
+    logger.info('schedule', `lease lost id=${id} run=${opts.runFor}: 发出去之后租约丢了，只确认这一次已送达，不再写别的状态`);
+    return true;
   }
 
   /**
@@ -14554,6 +14826,14 @@ ${hint}` : ''}` };
    * 流程在 `scheduleCheckRun.ts`（有测试）：跳过的那次也广播；连续出错自动暂停时提示用户、同时照样把错误汇报交回来叫醒模型。
    */
   function runScheduleCheck(id: string, state: ScheduleState): Promise<{ state: ScheduleState; text: string } | null> {
+    /*
+      checkCommand 是本机 shell：跑之前按盘上最新的那份再判一次 —— 删了 / 本机没资格（定义没确认）/ 要跑的不是盘上这份定义，就不跑
+    */
+    const disk = scheduleStore.readSchedule(id, os.homedir());
+    if (!disk || !scheduleEligibleHere(disk) || definitionHash(disk.state) !== definitionHash(state)) {
+      logger.warn('schedule', `check id=${id}: 要跑检查命令时任务已删 / 定义变了 / 本机没确认最新的定义，不跑`);
+      return Promise.resolve(null);
+    }
     return runScheduleCheckWith(id, state, {
       now: () => Date.now(),
       read: (jobId) => scheduleStore.readSchedule(jobId, os.homedir())?.state ?? null,
@@ -14567,7 +14847,18 @@ ${hint}` : ''}` };
       changed: (jobId, s) => mainWindow?.webContents.send('schedule:changed', { id: jobId, state: s }),
       noteUser: (sid, text) => { noteInSession(sid, text, undefined, scheduleEndGroup(id)); sessionNotice(sid, text); },
       log: (m) => logger.info('schedule', m),
-      stillRunsHere: (jobId) => { const j = scheduleStore.readSchedule(jobId, os.homedir()); return !!j && scheduleRunsHere(j); },
+      stillRunsHere: (jobId) => { const j = scheduleStore.readSchedule(jobId, os.homedir()); return !!j && !scheduleLeaseLost.get(jobId)?.() && scheduleEligibleHere(j); },
+      /* 输出没变、不叫醒：这一次也算跑过 —— 记上计划时刻和「上次由本机运行」，传上去之后才放开租约（不加运行次数） */
+      recordSkip: async (jobId, s) => {
+        const cur = scheduleRunNow.get(jobId);
+        if (!cur || scheduleLeaseLost.get(jobId)?.()) return;
+        const before = scheduleStore.readSchedule(jobId, os.homedir())?.state ?? s;
+        /* 检查完了、不叫醒：这一次就算跑完了 —— 检查开始前挂上的「没确认送达」一起清掉 */
+        const marked = { ...markRunBy(s, cur.runFor, scheduleMachine(), Date.now()), pendingRun: null };
+        scheduleStore.writeSchedule(jobId, marked, os.homedir(), store.isAdvancedOnlySession);
+        /* 传不上去就不算「这一次检查过了」：只把计划时刻 / 上次由谁跑退回去（期间的暂停 / 删除留着），这一次留给下一次尝试 */
+        await commitScheduleCharge(jobId, before, marked, cur, MARK_KEYS);
+      },
     });
   }
 
@@ -14576,9 +14867,10 @@ ${hint}` : ''}` };
     if (quitPending) return;
     const now = Date.now();
     /* advanced 会话（flow / skill）的定时任务不跑、不记账 —— 它们归 advanced 自己 */
-    for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter(scheduleRunsHere)) {
+    for (const job of scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter(scheduleEligibleHere)) {
       if (expireSchedule(job, now)) continue;
-      if (isDue(job.state, now)) void runScheduledJob(job);
+      if (isDue(job.state, now)) void attemptScheduledJob(job);
+      else if (pendingStale(job.state, now)) void attemptScheduledJob(job);   // 记了账、没确认送达挂太久：去抢一次，抢到就由本机接手
     }
   }, SCHEDULE_TICK_MS);
   app.on('before-quit', () => clearInterval(scheduleTicker));
@@ -14608,21 +14900,28 @@ ${hint}` : ''}` };
   const schedulePruneTimer = setInterval(pruneEndedSchedules, Math.min(ENDED_PRUNE_AFTER_MS, 3600_000));
   app.on('before-quit', () => clearInterval(schedulePruneTimer));
 
-  /** 和上面那一跳同一套（只跑本机执行的、先判过期、到点就跑）：睡眠唤醒 / 刚接管时不必等下一个 20 秒。 */
+  /**
+   * 和上面那一跳同一套（本机有资格的、先判过期、到点就去抢租约）：开机 / 睡眠唤醒 / 刚确认定义时不必等下一个 20 秒。
+   * 错过的（没人跑过的）就是「已经到点」，抢到租约补跑**一次**（计划时刻取最近应跑的那一次，`plannedRunFor`）。
+   */
   function runDueSchedulesNow(why: string): void {
     if (quitPending) return;
     const now = Date.now();
-    const due = scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter(scheduleRunsHere)
-      .filter((job) => !expireSchedule(job, now) && isDue(job.state, now));
-    if (due.length) logger.info('schedule', `${why}：立刻查一次定时任务，${due.length} 个已到点`);
-    for (const job of due) void runScheduledJob(job);
+    const due = scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).filter(scheduleEligibleHere)
+      .filter((job) => !expireSchedule(job, now) && (isDue(job.state, now) || pendingStale(job.state, now)));
+    if (due.length) logger.info('schedule', `${why}：立刻查一次定时任务，${due.length} 个已到点（错过的补一次）`);
+    for (const job of due) void attemptScheduledJob(job);
   }
-  /* 睡眠唤醒：睡着期间错过的（本机是执行者的）醒来立刻补一次，不等下一跳 */
+  /* 睡眠唤醒：睡着期间错过的醒来立刻去抢一次，不等下一跳 */
   powerMonitor.on('resume', () => runDueSchedulesNow('resume'));
+  /* 开机：等同步把别的电脑的运行状态拉回来一会儿再查（免得刚开机就按旧状态去抢）；没开同步的照样查 */
+  setTimeout(() => runDueSchedulesNow('startup'), 30_000);
 
   /** 模型建的循环任务过了 `expiresAt`（默认 7 天）：记成 `expired`、在会话里说一声。返回是否刚过期。 */
   function expireSchedule(job: scheduleStore.StoredSchedule, now: number): boolean {
     if (job.state.terminal || schedulesInFlight.has(job.id) || scheduleTerminal(job.state, now) !== 'expired') return false;
+    /* 过期的那一句只由上次跑它的那台写（几台都有资格时不各写一遍）；别的电脑等同步把结局带过来 */
+    if (!isRunnerHere(job.state, scheduleMachine().id)) return false;
     const final = { ...job.state, terminal: 'expired' as const };
     try { scheduleStore.writeSchedule(job.id, final, os.homedir(), store.isAdvancedOnlySession); } catch { return false; }
     logger.info('schedule', `expired id=${job.id} session=${job.state.sessionId} runs=${final.runs}/${final.spec.maxRuns ?? 'goal'}`);
@@ -14677,7 +14976,7 @@ ${hint}` : ''}` };
       announce: true,
       bgOutput: item.source !== 'schedule' && !nudge,
       ...(nudge ? { kirolexNote: true } : {}),
-      stillWanted,
+      onSend: sentHook(item), stillWanted,
     }).then(() => { textToolSwapDone.delete(item.id); }, (err) => {
       if (!isWakeBusyError(err, quitPending || !!busyReasonFor(sid))) textToolSwapDone.delete(item.id);
       /* 同 acp:prompt 那层兜底：没发出去就把随行快照的标记收回，下一条照常带上历史 */
@@ -14869,10 +15168,18 @@ ${hint}` : ''}` };
     return scheduleStore.listSchedules(os.homedir(), store.isAdvancedOnlySession).map((job) => scheduleListRow(job, me, devices, staleAfterMs));
   });
 
-  /** 列表里的一行（聊天顶部 ⏰ 卡 / 侧栏）。非 runner 那台：标「在 <机器名> 上运行」、可以接管（`defHash`：接管时核对给人看的就是这份定义）。 */
-  function scheduleListRow(job: scheduleStore.StoredSchedule, me: string, devices: Record<string, { syncedAt: number; host?: string }>, staleAfterMs: number) {
-    const runsHere = scheduleRunsHere(job);
+  /**
+   * 列表里的一行（聊天顶部 ⏰ 卡 / 侧栏）。哪台在线就由哪台跑：`canRun` = 本机有资格（会去抢租约、能「立即运行一次」）；
+   * `needsConfirm` = 会话在本机、但这份定义本机还没确认（显示「确认」按钮）；`runningOn` = 正在哪台上跑；
+   * `runsHere` = 上次是本机跑的（已结束卡 / 结局同步判断沿用）。
+   */
+  function scheduleListRow(job: scheduleStore.StoredSchedule, me: string, devices: Record<string, { syncedAt: number; host?: string }>, _staleAfterMs: number) {
+    const runsHere = isRunnerHere(job.state, me);
     const runner = job.state.runner ?? me;
+    const approved = definitionApproved(job.state, scheduleStore.readApprovedHash(job.id, os.homedir()));
+    const lease = scheduleLeaseSeen.get(job.id);
+    const runningOn = schedulesInFlight.has(job.id) ? scheduleMachine().name
+      : leaseActive(lease, Date.now()) ? (lease.holder === me ? scheduleMachine().name : (lease.name || lease.holder)) : null;
     return {
     id: job.id,
     sessionId: job.state.sessionId,
@@ -14884,13 +15191,17 @@ ${hint}` : ''}` };
     terminal: job.state.terminal,
     lastRunAt: job.state.lastRunAt,
     lastError: job.state.lastError,
-    /* 取消了补跑的一次性任务没有下一次（timingState 给的是无穷远）：交给界面的是 null */
-    nextRunAt: (() => { const n = nextRunAt(timingState(job.state)); return n !== null && Number.isFinite(n) ? n : null; })(),
+    nextRunAt: nextRunAt(job.state),
     createdBy: job.state.createdBy ?? null,
     expiresAt: job.state.expiresAt ?? null,
     until: job.state.spec.until ?? null,
     checkCommand: job.state.spec.checkCommand ?? null,
     runsHere,
+    canRun: scheduleEligibleHere(job),
+    needsConfirm: !approved && !!store.readRecord(job.state.sessionId),
+    runningOn,
+    /* 上次由哪台运行（本机 = 本机的主机名，界面写「本机」） */
+    lastRunBy: job.state.lastRunAt === null ? null : { name: runsHere ? scheduleMachine().name : (job.state.runnerName || devices[runner]?.host || runner), here: runsHere },
     lastCheck: job.state.lastCheck ?? null,
     /* 结束了（达成 / 次数用完 / 过期 / 取消）：一句话说清结束原因和跑了几次 —— 不跑它的那台据此保留一张「已结束」卡片 */
     endedText: (() => { const ended = scheduleTerminal(job.state); return ended ? scheduleEndedText(job.state, ended) : null; })(),
@@ -14898,58 +15209,42 @@ ${hint}` : ''}` };
     endedAt: scheduleEndedAt(job.state),
     endRecorded: scheduleTerminal(job.state) && !runsHere ? scheduleEndRecorded(job.state.sessionId, job.id) : false,
     runnerName: runsHere ? null : (job.state.runnerName || devices[runner]?.host || runner),
-    /* runner 写着本机、定义却没在本机确认过（恢复会话拉回来的）：一样只读，接管确认后才跑 */
-    needsConfirm: !runsHere && runner === me,
-    runnerSeenAt: runsHere || runner === me ? null : (devices[runner]?.syncedAt ?? null),
-    staleAfterMs,
     defHash: definitionHash(job.state),
-    /* 不在本机跑的：按接管之前的状态现在是不是已经到点、错过了几次 —— 接管确认框据此说明「接管后会立刻补跑一次」 */
-    catchUp: runsHere ? null : (() => { const m = missedRuns(job.state, Date.now()); return m.missed > 0 ? m : null; })(),
     };
   }
 
   /**
-   * **接管到本机**：界面先弹窗把 prompt / checkCommand / 目标 / 周期**全文**给人看，确认了才调这个。
-   * `defHash` = 弹窗里给人看的那份定义的摘要 —— 期间被同步改过就拒（人确认的不是现在这份）。
-   * runner 改成本机、runnerChangedAt = takenOverAt = now，定义记成本机确认过。
-   * `catchUp`（确认框里默认勾上的「立刻补跑一次」）：按接管之前的状态已经到点的，马上补跑**一次**，之后从这次往后排；
-   * 没勾 / 还没到点 → 照常（没勾的从接管时刻算）。原 runner 那台下次拉到后停掉自己的定时器（只停，不删文件）。
+   * **确认这份定义**（「这台电脑还没确认，不会在这里运行」旁边的「确认」）：界面先弹窗把 prompt / checkCommand / 目标 / 周期**全文**给人看，
+   * 确认了才调这个。`defHash` = 弹窗里给人看的那份的摘要 —— 期间被同步改过就拒（人确认的不是现在这份）。
+   * 确认后记进 `schedule-approved.json`，本机从此参与抢租约（已经到点的马上去抢一次）。
    */
-  ipcMain.handle('schedule:take-over', (_event, id: string, defHash: string, catchUp?: boolean) => {
+  ipcMain.handle('schedule:approve', (_event, id: string, defHash: string) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
     if (!job) return { ok: false, error: tr('This scheduled task was not found') };
-    { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:take-over'); if (advRefused) return { ok: false, error: advRefused }; }
-    if (definitionHash(job.state) !== defHash) return { ok: false, error: tr('This scheduled task changed after it was shown. Check it again before taking it over.') };
-    const me = scheduleMachine();
-    const from = job.state.runner ?? '?';
-    const state = takeOver(job.state, me, Date.now(), { catchUp: catchUp === true });
-    scheduleStore.approveSchedule(id, definitionHash(state), os.homedir());
-    scheduleStore.writeSchedule(id, state, os.homedir(), store.isAdvancedOnlySession);
+    { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:approve'); if (advRefused) return { ok: false, error: advRefused }; }
+    if (definitionHash(job.state) !== defHash) return { ok: false, error: tr('This scheduled task changed after it was shown. Check it again before confirming it.') };
+    scheduleStore.approveSchedule(id, defHash, os.homedir());
     scheduleSkipLogged.delete(id);
-    const when = state.catchUpPending ? `已错过 ${state.catchUpPending} 次，马上补跑一次`
-      : state.catchUpDeclined ? (state.spec.kind === 'once' ? '已过点、没选补跑：这次一次性任务不跑了' : '已到点、没选补跑：第一次运行从现在算')
-      : '还没到点，按原定的下一次';
-    logger.info('schedule', `takeover id=${id} session=${state.sessionId}: 接管到本机（原来在 ${job.state.runnerName || from} 上），${when} runner=${me.id} from=${from}`);
-    mainWindow?.webContents.send('schedule:changed', { id, state });
-    scheduleSchedulePush();
-    if (state.catchUpPending) runDueSchedulesNow('接管后补跑');
+    logger.info('schedule', `approve id=${id} session=${job.state.sessionId}: 用户在本机确认了这份定义，本机参与运行 creator=${creatorOf(job.state) ?? '?'}`);
+    mainWindow?.webContents.send('schedule:changed', { id, state: job.state });
+    runDueSchedulesNow('确认后');
     return { ok: true };
   });
 
   /**
-   * 「▶ 立即运行一次」（执行者本机的卡片上）：算一次运行、照常记账，受次数上限 / 过期 / 暂停约束；有 checkCommand 的照常先跑检查。
-   * 之后的下一次从这次运行往后算。不在本机跑的不行（只有执行者跑）。
+   * 「▶ 立即运行一次」（任何有资格的电脑上都有）：同样走租约（别的电脑正在跑就不跑），算一次运行、照常记账，
+   * 受次数上限 / 过期 / 暂停约束；有 checkCommand 的照常先跑检查。之后的下一次从这次运行往后算。
    */
   ipcMain.handle('schedule:run-now', (_event, id: string) => {
     const job = scheduleStore.readSchedule(id, os.homedir());
     if (!job) return { ok: false, error: tr('This scheduled task was not found') };
     { const advRefused = refuseAdvancedOnly(job.state.sessionId, 'schedule:run-now'); if (advRefused) return { ok: false, error: advRefused }; }
-    if (!scheduleRunsHere(job)) return { ok: false, error: tr('This scheduled task runs on another computer. Take it over first.') };
+    if (!scheduleEligibleHere(job)) return { ok: false, error: tr('This computer has not confirmed this scheduled task, so it does not run here.') };
     if (job.state.paused) return { ok: false, error: tr('This scheduled task is paused. Resume it first.') };
     if (scheduleTerminal(job.state, Date.now())) return { ok: false, error: tr('This scheduled task has already ended') };
     if (schedulesInFlight.has(id)) return { ok: false, error: tr('This scheduled task is already running') };
     logger.info('schedule', `run-now id=${id} session=${job.state.sessionId}: 用户点了立即运行一次 runner=${job.state.runner ?? '?'}`);
-    void runScheduledJob(job, { manual: true });
+    void attemptScheduledJob(job, { manual: true });
     return { ok: true };
   });
 

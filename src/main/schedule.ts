@@ -103,30 +103,49 @@ export interface ScheduleState {
    *  用户暂停 / 继续时清掉。 */
   pausedBy?: 'check-errors' | null;
   /*
-    跨电脑同步（`scheduleSync.ts`）：只有执行者（runner）那台跑这条任务。老文件没有这些字段 = 本机建的（启动时补成本机）。
+    跨电脑同步（`scheduleSync.ts` / `scheduleLease.ts`）：**哪台在线就由哪台跑**，到点时抢桶里的租约，抢到的那台跑这一次。
   */
-  /** 执行者：设备 ID（`thisDeviceId()`）。只有 runner 那台排定时器、跑 checkCommand、叫醒会话。 */
+  /** 建任务的那台（设备 ID）：离线（拿不到 S3）时只有它在本机跑。老任务没有：用原来的 `runner` 当它。 */
+  creator?: string;
+  creatorName?: string;
+  /** **上一次是哪台跑的**（设备 ID）—— 只用来显示「上次由 X 运行」、结束满 7 天由它清理。还没跑过 = 建它的那台。 */
   runner?: string;
-  /** 执行者的主机名（只用来显示「在 <机器名> 上运行」）。 */
   runnerName?: string;
-  /** runner 最后一次改的时刻（建任务 / 接管）—— 两台同时接管时后者胜。 */
+  /** `runner` 最后一次变的时刻（跑了一次）。 */
   runnerChangedAt?: number;
-  /** 接管的时刻（合并时分辨旧执行者交接之后写的状态）。接管时取消了补跑的，第一次从这一刻算（见 `timingState`）。没接管过 = 没有。 */
-  takenOverAt?: number | null;
-  /** 接管时已经到点、用户选了补跑：错过了几次（只补 1 次）。有它时锚点仍按原来的上次运行算，调度器下一跳就跑；跑完锚点 = 这次运行。 */
-  catchUpPending?: number | null;
-  /** 接管时已经到点、用户**取消了**「立刻补跑一次」：循环任务的第一次从接管那一刻算，一次性任务那一次不跑了（见 `timingState`）。
-   *  接管时还没到点的不记它 —— 按原定的下一次。 */
-  catchUpDeclined?: boolean | null;
+  /** 上一次跑的是**哪一个计划时刻**（不是实际开始的时刻）—— 同一个计划时刻只跑一次（`attemptScheduleRun`）。 */
+  lastRunFor?: number | null;
+  /**
+   * **记了账、还没确认送达**（跨电脑同步，`scheduleLease.ts`）：叫醒会话之前传上去的那份带着它，真的发出去之后才清掉。
+   * 跑它的那台在发出去之前租约丢了（会话一直忙、期间续约失败）→ 它一直留着；下一台抢到租约时据此撤销那次记账（`prev`），由自己跑这一次。
+   * `sent`：**真的交给会话之前**先传上去的第二步 —— 有它就是「已经提交执行了」（之后确认没传上去 / 那台崩了也一样），接手的电脑不再重发，只清掉标记。
+   */
+  pendingRun?: { runFor: number; by: string; at: number; prev: PendingRunPrev; sent?: boolean } | null;
   /** 进入终态（completed / exhausted / cancelled / achieved / expired）的时刻 —— 结束满 7 天自动清理按它算（`scheduleEndedAt`）。
    *  老文件没有：按 lastRunAt → expiresAt → createdAt 推算。 */
   endedAt?: number | null;
-  /** 运行状态（runs / lastRunAt / lastError / 检查结果 / terminal）最后一次是哪台、什么时候写的。合并时只认 runner 写的。 */
+  /** 运行状态（runs / lastRunAt / lastError / 检查结果 / terminal）最后一次是哪台、什么时候写的。合并时按 lastRunFor、再按它取新的。 */
   statusBy?: string;
   statusAt?: number;
   /** 控制操作最后一次的时刻：暂停 / 继续、改过期时间。任何一台都能改，按时间后者胜。 */
   pausedChangedAt?: number;
   expiryChangedAt?: number;
+}
+
+/**
+ * 「记了账、没确认送达」那一次**之前**的状态（检查命令跑之前就记下）：接手的电脑撤销那次记账时，连这一次检查的结论
+ * （检查时刻、输出指纹、最后一次检查、连续出错次数、达成目标的终态、检查出错自动暂停）一起退回去 —— 不然它会被这一次自己的检查挡住。
+ */
+export interface PendingRunPrev {
+  runs: number;
+  lastRunAt: number | null;
+  lastRunFor: number | null;
+  lastCheckHash?: string | null;
+  lastCheck?: LastCheck | null;
+  checkErrors?: number;
+  terminal?: ScheduleTerminal | null;
+  /** 这一次的检查连续出错到上限、自动暂停了（撤销时只在它还是那个自动暂停时解除；用户后来按的暂停不动）。 */
+  autoPaused?: boolean;
 }
 
 /** 上一次检查：`achieved` 退出码 0；`unchanged` 退出码 1、输出没变（没叫醒）；`changed` 退出码 1、输出变了；`error` 其他（超时 / 起不来 / 别的退出码）。 */

@@ -451,7 +451,7 @@ contextBridge.exposeInMainWorld('kiroApi', {
   scheduleList: () => ipcRenderer.invoke('schedule:list'),
   schedulePause: (id: string, paused: boolean) => ipcRenderer.invoke('schedule:pause', id, paused),
   scheduleRemove: (id: string) => ipcRenderer.invoke('schedule:remove', id),
-  scheduleTakeOver: (id: string, defHash: string, catchUp?: boolean) => ipcRenderer.invoke('schedule:take-over', id, defHash, catchUp),
+  scheduleApprove: (id: string, defHash: string) => ipcRenderer.invoke('schedule:approve', id, defHash),
   scheduleRunNow: (id: string) => ipcRenderer.invoke('schedule:run-now', id),
   /* 聊天顶部那条定时任务上的「⏳ 延长…」弹层：{ mode:'extend', ms } / { mode:'until', at } / { mode:'never' }（只有用户能设成不过期） */
   scheduleSetExpiry: (id: string, change: { mode: 'extend'; ms: number } | { mode: 'until'; at: number } | { mode: 'never' }) => ipcRenderer.invoke('schedule:set-expiry', id, change),

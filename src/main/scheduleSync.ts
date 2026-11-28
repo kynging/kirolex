@@ -21,7 +21,7 @@
  */
 
 import crypto from 'crypto';
-import { CHECK_OUTPUT_KEEP, MIN_INTERVAL_SEC, dueAt, isDue, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState, type ScheduleTerminal } from './schedule.ts';
+import { CHECK_OUTPUT_KEEP, recordRun, scheduleTerminal, validateSchedule, type ScheduleSpec, type ScheduleState, type ScheduleTerminal } from './schedule.ts';
 
 /**
  * 桶里放定时任务的目录（相对布局根）：`schedules/<sessionId>/<id>.json` —— 按会话分，恢复一条会话时按前缀列出它的任务。
@@ -40,6 +40,8 @@ export function scheduleObjectRel(sessionId: string, id: string, deleted = false
 export function parseScheduleObjectRel(rel: string): { sessionId: string; id: string; deleted: boolean } | null {
   const parts = rel.split('/');
   if (parts.length !== 3 || parts[0] !== SCHEDULES_REL || !parts[1] || !parts[2].endsWith('.json')) return null;
+  /* 租约对象（`<id>.lease.json`，scheduleLease.ts）不是任务 */
+  if (parts[2].endsWith('.lease.json')) return null;
   const deleted = parts[2].endsWith(DELETED_SUFFIX);
   const raw = parts[2].slice(0, -(deleted ? DELETED_SUFFIX : '.json').length);
   let id: string;
@@ -68,13 +70,13 @@ export function collectBucketSchedules(rels: string[]): {
   return { deleted, live };
 }
 
-/** 本机这台：设备 ID（runner 的值）+ 主机名（只用来显示）。 */
+/** 本机这台：设备 ID + 主机名（只用来显示）。 */
 export interface ScheduleMachine { id: string; name: string }
 
-/** 运行状态：只有 runner 写。 */
-export const RUN_KEYS = ['runs', 'lastRunAt', 'lastError', 'lastCheckHash', 'lastCheck', 'checkErrors', 'terminal', 'catchUpPending', 'catchUpDeclined', 'endedAt', 'statusBy', 'statusAt'] as const;
-/** 执行者：按 `runnerChangedAt` 后者胜（远端不能改成本机）。 */
-export const RUNNER_KEYS = ['runner', 'runnerName', 'runnerChangedAt', 'takenOverAt'] as const;
+/** 「上次是哪台跑的」：跟着运行状态走（谁的运行状态新就用谁的）。 */
+export const RUNNER_KEYS = ['runner', 'runnerName', 'runnerChangedAt'] as const;
+/** 运行状态：哪台跑的就是哪台写的；两份按 \`lastRunFor\`（计划时刻）、再按 \`statusAt\` 取新的。 */
+export const RUN_KEYS = ['runs', 'lastRunAt', 'lastRunFor', 'pendingRun', 'lastError', 'lastCheckHash', 'lastCheck', 'checkErrors', 'terminal', 'endedAt', 'statusBy', 'statusAt'] as const;
 const PAUSE_KEYS = ['paused', 'pausedBy', 'pausedChangedAt'] as const;
 const EXPIRY_KEYS = ['expiresAt', 'expiryChangedAt'] as const;
 
@@ -104,79 +106,33 @@ export function definitionHash(state: Pick<ScheduleState, 'spec' | 'sessionId'>)
   return crypto.createHash('sha256').update(stableStringify({ sessionId: state.sessionId, spec: state.spec })).digest('hex');
 }
 
-/** runner 是本机吗（只看字段，不看确认过没有）。老文件没有 runner = 本机建的。 */
+/** 上一次是本机跑的吗（还没跑过 = 本机建的）。只用于显示和结束满 7 天的清理（由最后跑它的那台清）。老文件没有 runner = 本机建的。 */
 export function isRunnerHere(state: ScheduleState, me: string): boolean {
   return !state.runner || state.runner === me;
 }
 
-/** 本机能不能跑它：runner 是本机，而且定义是本机确认过的（本机建的 / 接管时确认的）。 */
-export function canRunHere(state: ScheduleState, me: string, approvedHash: string | undefined): boolean {
-  return state.runner === me && !!approvedHash && approvedHash === definitionHash(state);
-}
-
-/**
- * 算「下一次什么时候」用的那份。接管过、而且接管之后还没跑过的：
- *   · 接管时已经到点、选了补跑（`catchUpPending`）→ 锚点照旧是原来的上次运行 —— 已经到点，调度器下一跳就补跑这一次；
- *   · 否则（接管时还没到点 / 没勾补跑）→ 锚点是接管那一刻，第一次从接管时算。
- * 跑过一次之后 `lastRunAt` ≥ 接管时刻，一切照常。`once` 不受影响（只看 `atEpoch`）。只用来判断到没到点 / 显示，**不写盘**。
- */
-export function timingState(state: ScheduleState): ScheduleState {
-  const at = state.takenOverAt;
-  if (typeof at !== 'number' || !Number.isFinite(at)) return state;
-  if (state.lastRunAt !== null && state.lastRunAt >= at) return state;
-  /* 只有「接管时已经到点、用户取消了补跑」才改时间：循环的从接管那一刻算；一次性的那一次就不跑了（没有下一次） */
-  if (state.catchUpDeclined) {
-    if (state.spec.kind === 'once') return { ...state, spec: { ...state.spec, atEpoch: Number.POSITIVE_INFINITY } };
-    return { ...state, lastRunAt: at };
-  }
-  /* 选了补跑（catchUpPending）/ 接管时还没到点：时间照原样 —— 已经到点的这一跳就补跑，没到点的按原定的下一次 */
-  return state;
-}
-
-/** 接管这一刻在补跑中吗（接管时选了补跑、之后还没跑过）。 */
-export function isCatchUpRun(state: ScheduleState): boolean {
-  return typeof state.catchUpPending === 'number' && state.catchUpPending > 0
-    && typeof state.takenOverAt === 'number' && (state.lastRunAt === null || state.lastRunAt < state.takenOverAt);
-}
-
-/** 数错过的次数最多数到这里（一个每分钟的任务停了一年也不该把主进程数卡住）。 */
-const MISSED_COUNT_CAP = 10_000;
-
-/**
- * **按接管之前的状态，现在已经到点了吗、错过了几次**（接管确认框 / 补跑用）。
- * 不到点、暂停了、结束了、过期了（`expiresAt`）、次数用完了 → `missed: 0`（`isDue` 的判据，原样）。
- * `lastRunAt`：上次运行；`firstMissedAt`：本应运行的第一次。只数，不改任何东西 —— 补跑也只补 1 次。
- */
-export function missedRuns(state: ScheduleState, now: number): { missed: number; lastRunAt: number | null; firstMissedAt: number | null } {
-  const none = { missed: 0, lastRunAt: state.lastRunAt, firstMissedAt: null };
-  if (!isDue(state, now)) return none;
-  const spec = state.spec;
-  if (spec.kind === 'once') return { missed: 1, lastRunAt: state.lastRunAt, firstMissedAt: Number(spec.atEpoch ?? 0) };
-  if (spec.kind === 'interval') {
-    const period = Math.max(MIN_INTERVAL_SEC, spec.everySec) * 1000;
-    const first = state.lastRunAt === null ? state.createdAt : state.lastRunAt + period;
-    if (first > now) return { missed: 1, lastRunAt: state.lastRunAt, firstMissedAt: first };
-    return { missed: Math.min(MISSED_COUNT_CAP, Math.floor((now - first) / period) + 1), lastRunAt: state.lastRunAt, firstMissedAt: first };
-  }
-  const first = dueAt(spec, state.lastRunAt, state.createdAt);
-  let t = first;
-  let n = 0;
-  while (t <= now && n < MISSED_COUNT_CAP) { n += 1; t = dueAt(spec, t, state.createdAt); }
-  return { missed: Math.max(1, n), lastRunAt: state.lastRunAt, firstMissedAt: first };
+/** 这份定义本机确认过吗（本机建的 / 用户在本机确认过全文的）。没确认的电脑不参与抢租约。 */
+export function definitionApproved(state: ScheduleState, approvedHash: string | undefined): boolean {
+  return !!approvedHash && approvedHash === definitionHash(state);
 }
 
 /**
  * **本机写盘前盖戳**（`scheduleStore.writeSchedule` 调）：
- *   · 新建的、老文件没有 runner 的 → runner = 本机（建任务的电脑是初始 runner）；
- *   · 盘上的 runner / 暂停 / 过期比这次要写的新（这次的 state 是更早读的，期间同步或接管改过）→ 保留盘上的，不倒回去；
+ *   · 新建的、老文件没有 creator 的 → creator = 本机（老任务原来的 runner 当 creator）；还没跑过的「上次由谁跑」= creator；
+ *   · 盘上的「上次由谁跑」/ 暂停 / 过期比这次要写的新（这次的 state 是更早读的，期间同步改过）→ 保留盘上的，不倒回去；
  *   · 暂停 / 过期真的变了 → 记下这次操作的时刻（控制操作按时间后者胜）；
  *   · 运行状态变了 → 记下是本机、什么时候写的。
  */
 export function stampLocalWrite(prev: ScheduleState | null, next: ScheduleState, me: ScheduleMachine, now: number): ScheduleState {
   const out: any = { ...next };
+  if (!out.creator) {
+    const legacy = prev?.creator || prev?.runner || out.runner;
+    out.creator = legacy || me.id;
+    out.creatorName = legacy ? (prev?.creatorName || prev?.runnerName || out.runnerName) : me.name;
+  }
   if (!out.runner) {
-    out.runner = prev?.runner || me.id;
-    out.runnerName = prev?.runner ? prev.runnerName : me.name;
+    out.runner = prev?.runner || out.creator;
+    out.runnerName = prev?.runner ? prev.runnerName : out.creatorName;
     out.runnerChangedAt = prev?.runner ? prev.runnerChangedAt : (out.createdAt || now);
   }
   /* 这一次写把它变成了终态：记下结束的时刻（结束满 7 天自动清理按它算） */
@@ -197,107 +153,68 @@ export function stampLocalWrite(prev: ScheduleState | null, next: ScheduleState,
   return out;
 }
 
-/**
- * 接管到本机：runner 改成本机、`runnerChangedAt` = `takenOverAt` = now。第一次运行从 now 算（`timingState`）。
- * **运行状态的基准也在这一刻立起来**：接管那一刻本机看到的运行状态记成「新执行者写的」（statusBy = 本机、statusAt = now）——
- * 之后合并只认它和新执行者后来写的，旧执行者在接管之后、拉到之前多跑的那次，哪台电脑都不收（`mergeSchedule`）。
- */
-export function takeOver(state: ScheduleState, me: ScheduleMachine, now: number, opts: { catchUp?: boolean } = {}): ScheduleState {
-  /*
-    按接管之前的状态已经到点了吗：到点 + 选了补跑 → 记下错过几次，调度器下一跳补跑一次；到点 + 没选 → 记成「取消了补跑」，
-    从接管那一刻算（一次性的就不跑了）；没到点 → 两个都不记，按原定的下一次（`timingState`）
-  */
-  const missed = missedRuns(state, now).missed;
+/** 这一次由本机跑：记上**计划时刻**（同一个计划时刻只跑一次）和「上次由本机运行」。记账（次数 / 时刻）照旧是 `recordRun`。 */
+export function markRunBy(state: ScheduleState, runFor: number, me: ScheduleMachine, now: number): ScheduleState {
   return {
-    ...state, runner: me.id, runnerName: me.name, runnerChangedAt: now, takenOverAt: now, statusBy: me.id, statusAt: now,
-    catchUpPending: missed > 0 && opts.catchUp ? missed : null,
-    catchUpDeclined: missed > 0 && !opts.catchUp ? true : null,
+    ...state, lastRunFor: Math.max(runFor, state.lastRunFor ?? Number.NEGATIVE_INFINITY),
+    runner: me.id, runnerName: me.name, runnerChangedAt: now,
   };
 }
 
+/** `markRunBy` + `recordRun`：这一次跑了。先于叫醒会话写盘、传桶（见 `attemptScheduleRun`）。 */
+export function chargeRun(state: ScheduleState, runFor: number, me: ScheduleMachine, now: number): ScheduleState {
+  return recordRun(markRunBy(state, runFor, me, now), now);
+}
+
 export interface MergeNotes {
-  /** 远端想把 runner 改成本机（只有本机的接管能改）：没收。 */
-  refusedAssign?: boolean;
-  /** 本机是 runner，远端改了定义：没收（本机这份不变）。 */
-  defRejected?: boolean;
-  /** 本机原来是 runner，被别的电脑接管了（`runnerChangedAt` 后者胜）：本机停掉它的定时器。值 = 新 runner。 */
-  lostTo?: string;
-  /** 交出执行权之前（接管时刻之后）本机又跑过一次 —— 同步延迟期间可以接受，记一行日志。 */
-  ranAfterHandover?: boolean;
-  /** 本机是 runner，远端那份是旧 runner 在接管之后又写的运行状态：不认（只认本机的）。值 = 那台的设备 ID。 */
-  ignoredRunBy?: string;
+  /** 桶里那份的定义（prompt / checkCommand / 目标 / 周期）和本机的不一样：用了桶里的 —— 本机要重新确认才会参与运行。 */
+  defChanged?: boolean;
+}
+
+/** 运行状态谁新：先比计划时刻（lastRunFor），一样再比写的时刻（statusAt）。 */
+function runStateNewer(a: ScheduleState, b: ScheduleState): boolean {
+  const fa = a.lastRunFor ?? Number.NEGATIVE_INFINITY;
+  const fb = b.lastRunFor ?? Number.NEGATIVE_INFINITY;
+  if (fa !== fb) return fa > fb;
+  /*
+    同一个计划时刻：「已经交给会话了」（pendingRun.sent）永远比「记了账、还没交出去」新 —— 不能被一份早先缓存的未发送版本合并回去
+    （那样接手的电脑会撤销记账、再发一遍）
+  */
+  const sa = sentStage(a, fa);
+  const sb = sentStage(b, fb);
+  if (sa !== sb) return sa > sb;
+  return (a.statusAt ?? 0) > (b.statusAt ?? 0);
+}
+
+/** 这一个计划时刻走到哪一步了：1 = 已交给会话（有 sent 标记，或者标记已清掉 = 确认送达）；0 = 记了账、还没交出去。 */
+function sentStage(s: ScheduleState, runFor: number): number {
+  const p = s.pendingRun;
+  if (!p || p.runFor !== runFor) return 1;
+  return p.sent ? 1 : 0;
 }
 
 /**
- * **两份合成一份**（本机那份 + 桶里那份）。`me` = 本机设备 ID。规则见文件头。sessionId 永远用本机的。
+ * **两份合成一份**（本机那份 + 桶里那份）。sessionId 永远用本机的。
+ *   · 运行状态（含「上次由谁跑」）：计划时刻新的那份；一样就按写的时刻；
+ *   · 暂停 / 继续、过期时间：各按各的时刻，后者胜（任何一台都能改）；
+ *   · 定义：和本机的不一样就用桶里的（\`defChanged\`）—— 本机确认过的是旧的摘要，所以在本机重新确认之前它不会在这里跑；
+ *   · 建它的那台：本机记着的优先（老任务的 runner 当它）。
  */
-export function mergeSchedule(local: ScheduleState, remote: ScheduleState, me: string): { state: ScheduleState; notes: MergeNotes } {
+export function mergeSchedule(local: ScheduleState, remote: ScheduleState, _me?: string): { state: ScheduleState; notes: MergeNotes } {
   const out: any = { ...local };
   const notes: MergeNotes = {};
-  const localRunner = local.runner || me;
-  if (!local.runner) { out.runner = me; }
-  /* 1. 执行者：runnerChangedAt 后者胜；远端不能把它改成本机 */
-  const lt = local.runnerChangedAt ?? 0;
-  const rt = remote.runnerChangedAt ?? 0;
-  /*
-    后者胜；**同一毫秒**（两台几乎同时接管）按设备 ID 定一个唯一的胜者（字符串大的那个）——
-    两边各自合并都得到同一个 runner，不会两台都认为是自己、一直各跑各的
-  */
-  const remoteWinsTie = rt === lt && !!remote.runner && remote.runner !== localRunner && remote.runner > localRunner;
-  const remoteNewer = rt > lt || remoteWinsTie;
-  if (remoteNewer && remote.runner && remote.runner !== localRunner) {
-    if (remote.runner === me) notes.refusedAssign = true;
-    else {
-      copyKeys(out, remote, RUNNER_KEYS);
-      if (localRunner === me) notes.lostTo = remote.runner;
-    }
-  } else if (remoteNewer && remote.runner === localRunner && localRunner !== me) {
-    copyKeys(out, remote, RUNNER_KEYS);   // 同一个 runner，名字 / 接管时刻跟它自己写的
-  }
-  const runnerNow: string = out.runner;
-  /* 2. 定义：本机是（原来的）runner → 留本机的；否则跟桶里的（只是显示，要跑得先接管确认） */
-  if (localRunner === me) {
-    if (stableStringify(remote.spec) !== stableStringify(local.spec)) notes.defRejected = true;
-  } else {
-    out.spec = remote.spec;
-    out.createdAt = remote.createdAt;
-    if (remote.createdBy === undefined) delete out.createdBy; else out.createdBy = remote.createdBy;
-  }
-  /* 3. 运行状态：只认 runner 写的 */
-  if (runnerNow === me) {
-    const since = local.takenOverAt ?? 0;
-    if (since && remote.statusBy && remote.statusBy !== me && (remote.statusAt ?? 0) > since
-      && !sameKeys(local, remote, RUN_KEYS)) notes.ignoredRunBy = remote.statusBy;
-  } else {
-    /*
-      只认现在的执行者写的；两份都不是它写的（比如老数据），只收**执行权交接之前**写的那份 ——
-      交接之后别的电脑写的运行状态（旧执行者没拉到接管又跑了一次）一律不收，两份都是那样就保留本机原来的
-    */
-    const handoverAt = out.runnerChangedAt ?? 0;
-    const byRunner = [local, remote].filter((s) => s.statusBy === runnerNow);
-    const beforeHandover = [local, remote].filter((s) => (s.statusAt ?? 0) <= handoverAt);
-    const pool = byRunner.length ? byRunner : beforeHandover;
-    if (pool.length) {
-      const pick = pool.reduce((a, b) => ((b.statusAt ?? 0) > (a.statusAt ?? 0) ? b : a));
-      copyKeys(out, pick, RUN_KEYS);
-    }
-    if (notes.lostTo && local.statusBy === me && (local.statusAt ?? 0) > (out.runnerChangedAt ?? 0)) notes.ranAfterHandover = true;
-  }
-  /* 4. 控制操作：各按各的时刻，后者胜 */
-  /*
-    暂停 / 继续：按时刻后者胜 —— 但「检查命令连续出错自动暂停」（pausedBy: 'check-errors'）是**运行结果**，不是用户操作：
-    只认现在的执行者写的，或者是交接之前就有的；旧执行者在交接之后（还没拉到接管时）自动暂停的不算数。
-    两份都不算数 → 不暂停（新执行者自己检查，出错它自己会停）。用户在任何一台上按的暂停 / 继续照旧都认。
-  */
-  const pauseHandoverAt = out.runnerChangedAt ?? 0;
-  const pauseCounts = (x: ScheduleState) => x.pausedBy !== 'check-errors' || x.statusBy === runnerNow || (x.pausedChangedAt ?? 0) <= pauseHandoverAt;
-  const pauses = [local, remote].filter(pauseCounts);
-  if (!pauses.length) { out.paused = false; out.pausedBy = null; }
-  else {
-    const pick = pauses.reduce((a, b) => ((b.pausedChangedAt ?? 0) > (a.pausedChangedAt ?? 0) ? b : a));
-    copyKeys(out, pick, PAUSE_KEYS);
-  }
+  if (runStateNewer(remote, local)) { copyKeys(out, remote, RUN_KEYS); copyKeys(out, remote, RUNNER_KEYS); }
+  if ((remote.pausedChangedAt ?? 0) > (local.pausedChangedAt ?? 0)) copyKeys(out, remote, PAUSE_KEYS);
   if ((remote.expiryChangedAt ?? 0) > (local.expiryChangedAt ?? 0)) copyKeys(out, remote, EXPIRY_KEYS);
+  if (stableStringify(remote.spec) !== stableStringify(local.spec)) {
+    out.spec = remote.spec;
+    notes.defChanged = true;
+  }
+  /* 本机记着的优先；本机没有才用桶里的（老文件补 creator 是启动时盖戳做的，这里不凭空造 —— 不然没变的任务每轮都要写回去） */
+  if (!local.creator && remote.creator) {
+    out.creator = remote.creator;
+    if (remote.creatorName) out.creatorName = remote.creatorName;
+  }
   out.sessionId = local.sessionId;
   return { state: out, notes };
 }
@@ -369,10 +286,25 @@ export function parseRemoteSchedule(text: string, id: string, sessionId: string)
     state.lastCheck = { at: lc.at, result: lc.result, code: lc.code, output: lc.output.slice(-(CHECK_OUTPUT_KEEP + 1)) };
   }
   if (s.pausedBy === 'check-errors') state.pausedBy = 'check-errors';
-  const took = numOrNull(s.takenOverAt); if (took !== undefined) state.takenOverAt = took;
-  if (num(s.catchUpPending) && s.catchUpPending > 0) state.catchUpPending = Math.floor(s.catchUpPending);
-  if (s.catchUpDeclined === true) state.catchUpDeclined = true;
   if (num(s.endedAt)) state.endedAt = s.endedAt;
+  const runFor = numOrNull(s.lastRunFor); if (runFor !== undefined) state.lastRunFor = runFor;
+  const creator = str(s.creator); if (creator) state.creator = creator;
+  const pr = s.pendingRun;
+  if (pr && typeof pr === 'object' && num(pr.runFor) && str(pr.by) && num(pr.at) && pr.prev && typeof pr.prev === 'object' && num(pr.prev.runs)
+    && pr.prev.runs >= 0 && numOrNull(pr.prev.lastRunAt) !== undefined && numOrNull(pr.prev.lastRunFor) !== undefined) {
+    const prev: NonNullable<ScheduleState['pendingRun']>['prev'] = { runs: pr.prev.runs, lastRunAt: pr.prev.lastRunAt, lastRunFor: pr.prev.lastRunFor };
+    if (pr.prev.lastCheckHash === null || (typeof pr.prev.lastCheckHash === 'string' && pr.prev.lastCheckHash.length <= 200)) prev.lastCheckHash = pr.prev.lastCheckHash;
+    const plc = pr.prev.lastCheck;
+    if (plc === null) prev.lastCheck = null;
+    else if (plc && typeof plc === 'object' && num(plc.at) && ['achieved', 'unchanged', 'changed', 'error'].includes(plc.result) && (plc.code === null || num(plc.code)) && typeof plc.output === 'string') {
+      prev.lastCheck = { at: plc.at, result: plc.result, code: plc.code, output: plc.output.slice(-(CHECK_OUTPUT_KEEP + 1)) };
+    }
+    if (num(pr.prev.checkErrors) && pr.prev.checkErrors >= 0) prev.checkErrors = pr.prev.checkErrors;
+    if (pr.prev.terminal === null || TERMINALS.includes(pr.prev.terminal)) prev.terminal = pr.prev.terminal;
+    if (pr.prev.autoPaused === true) prev.autoPaused = true;
+    state.pendingRun = { runFor: pr.runFor, by: pr.by, at: pr.at, prev, ...(pr.sent === true ? { sent: true } : {}) };
+  }
+  const creatorName = str(s.creatorName); if (creatorName) state.creatorName = creatorName;
   const by = str(s.statusBy); if (by) state.statusBy = by;
   for (const k of ['statusAt', 'pausedChangedAt', 'expiryChangedAt'] as const) if (num(s[k])) (state as any)[k] = s[k];
   return { kind: 'live', state };
